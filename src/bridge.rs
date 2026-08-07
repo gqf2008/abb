@@ -1,6 +1,6 @@
 //! 桥 —— 事件过滤 + 粘性后端路由 + per-chat 串行 + 表情生命周期。
-//! 通道无关：通过 `Messenger` trait 收发（飞书 / 微信），飞书事件解析在 on_payload，
-//! 微信消息在 on_weixin。零 regex（路由/@_user_ 手工解析）。
+//! 通道无关：通过 `Messenger` trait 收发（飞书 / 微信 / 钉钉），飞书事件解析在 on_payload，
+//! 微信消息在 on_weixin，钉钉消息在 on_dingtalk。零 regex（路由/@_user_ 手工解析）。
 
 use crate::agent::{self, Backend};
 use crate::config::{BotConfig, Config};
@@ -346,6 +346,48 @@ impl Bridge {
         };
         self.handle(ev).await;
     }
+
+    /// 钉钉入站消息入口（service 的钉钉 Stream 循环调用）。
+    /// msg=解析好的机器人消息；先记群聊最近发送者（回复时 @），过滤后走统一 handle。
+    pub async fn on_dingtalk(&self, msg: crate::dingtalk::DingtalkMessage) {
+        // should_respond：钉钉 owner 判据是允许的 staffId（ding_user_id；空=不设限）
+        let owner = self.bot.ding_owner();
+        if !owner.is_empty() && msg.sender_staff_id != owner {
+            crate::log!(
+                "[dingtalk] 忽略非 owner 消息 from={}",
+                &msg.sender_staff_id[..msg.sender_staff_id.len().min(10)]
+            );
+            return;
+        }
+        // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理
+        if msg.is_group() && !msg.mentioned {
+            crate::log!(
+                "[dingtalk] 忽略群聊未 @ 机器人的消息 chat={}",
+                &msg.chat_id()[..msg.chat_id().len().min(10)]
+            );
+            return;
+        }
+        let chat_id = msg.chat_id();
+        if chat_id.is_empty() || msg.mid.is_empty() {
+            return;
+        }
+        // 群聊回复需要 @ 提问者 → 记最近 sender（单聊 chat_id==sender，无意义但无害）
+        self.msgr.note_sender(&chat_id, &msg.sender_staff_id);
+
+        // 剥群聊文本里的 "@机器人名" 前缀（钉钉推给机器人的内容会带上），只剥一次
+        let is_group = msg.is_group();
+        let mut text = msg.text;
+        if is_group {
+            text = strip_bot_mention(&text, &self.bot.bot_name);
+        }
+        let ev = Ev {
+            mid: msg.mid,
+            chat_id,
+            chat_type: if is_group { "group".to_string() } else { "dm".to_string() },
+            text,
+        };
+        self.handle(ev).await;
+    }
 }
 
 /// 剥掉 "@_user_<数字>" 提及标签（等价 Python 的 re.sub(r"@_user_\d+", "", ...)）。
@@ -377,6 +419,21 @@ pub fn strip_mentions(s: &str) -> String {
     out
 }
 
+/// 剥掉钉钉群聊文本开头的 "@机器人名"（钉钉推给机器人的群消息 content 会带 @ 前缀；
+/// 机器人名未知/没匹配到则原样返回）。只剥一次，避免误伤正文里的同名 @。
+pub fn strip_bot_mention(text: &str, bot_name: &str) -> String {
+    if bot_name.is_empty() {
+        return text.to_string();
+    }
+    let t = text.trim_start();
+    let mention = format!("@{bot_name}");
+    if let Some(rest) = t.strip_prefix(mention.as_str()) {
+        // 剥掉后面可能跟的空格（钉钉常见 " @机器人名 内容"）
+        return rest.trim_start().to_string();
+    }
+    text.to_string()
+}
+
 /// 识别「打断」关键词（整句精确匹配，大小写不敏感）。仅当该 chat 有任务在跑时才生效
 /// （由 handle 判断）；否则原样透传给 agent，避免误吞用户正常词汇。
 fn is_cancel_keyword(text: &str) -> bool {
@@ -395,6 +452,17 @@ mod tests {
         assert_eq!(strip_mentions("@_user_123@_user_456 hi"), " hi");
         assert_eq!(strip_mentions("没有提及"), "没有提及");
         assert_eq!(strip_mentions("@_user_ 不完整"), "@_user_ 不完整");
+    }
+
+    #[test]
+    fn strip_bot_mention_works() {
+        assert_eq!(strip_bot_mention("@庆小丰 你好", "庆小丰"), "你好");
+        assert_eq!(strip_bot_mention("  @庆小丰  你好", "庆小丰"), "你好");
+        // 名字未知/没匹配 → 原样
+        assert_eq!(strip_bot_mention("@别人 你好", "庆小丰"), "@别人 你好");
+        assert_eq!(strip_bot_mention("@庆小丰 你好", ""), "@庆小丰 你好");
+        // 正文中间的同名 @ 不剥
+        assert_eq!(strip_bot_mention("你好 @庆小丰", "庆小丰"), "你好 @庆小丰");
     }
 
     #[test]

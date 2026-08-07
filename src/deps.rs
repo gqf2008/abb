@@ -1,4 +1,4 @@
-//! 依赖检测与安装 —— claude / codex / nodejs / python3 / lark-cli。
+//! 依赖检测与安装 —— claude / codex / nodejs / python3 / lark-cli / dingtalk-cli。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
 //! 安装命令按平台出（mac 用 brew/npm/curl 安装器，win 用 winget/npm，linux 用 apt/dnf/npm）。
 //! 本轮只验证 mac 路径；win/linux 编译可用、不行则给「请手动安装」文案。
@@ -112,7 +112,7 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// 单个依赖的检测结果。
 #[derive(Debug, Clone)]
 pub struct DepStatus {
-    /// 机器键：claude | codex | node | python3 | lark-cli
+    /// 机器键：claude | codex | node | python3 | lark-cli | dingtalk-cli
     pub id: &'static str,
     /// 展示名。
     pub label: &'static str,
@@ -149,6 +149,8 @@ pub fn detect_all() -> Vec<DepStatus> {
         probe("node", "Node.js", &["node"]),
         probe("python3", "Python 3", &["python3", "python"]),
         probe("lark-cli", "lark-cli", &["lark-cli"]),
+        // 钉钉 CLI（dingtalk-workspace-cli，命令名 dws）：接入钉钉 bot 后让 agent 调钉钉能力
+        probe("dingtalk-cli", "dingtalk-cli (dws)", &["dws"]),
     ]
 }
 
@@ -203,6 +205,19 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
             "node" => vec![InstallStep::exec("brew", &["install", "node"])],
             "python3" => vec![InstallStep::exec("brew", &["install", "python"])],
             "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
+            // 钉钉 CLI：npm 为主，回落 brew tap + install（官方同样提供 curl 一行安装器）
+            "dingtalk-cli" => vec![
+                InstallStep::exec("npm", &["install", "-g", "dingtalk-workspace-cli"]),
+                InstallStep::exec(
+                    "brew",
+                    &[
+                        "tap",
+                        "DingTalk-Real-AI/dingtalk-workspace-cli",
+                        "https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli.git",
+                    ],
+                ),
+                InstallStep::exec("brew", &["install", "dingtalk-workspace-cli"]),
+            ],
             other => return Err(format!("未知依赖：{other}")),
         };
         return Ok(plan);
@@ -218,6 +233,10 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
             "node" => vec![InstallStep::exec("winget", &["install", "OpenJS.NodeJS"])],
             "python3" => vec![InstallStep::exec("winget", &["install", "Python.Python.3.12"])],
             "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
+            "dingtalk-cli" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "dingtalk-workspace-cli"],
+            )],
             other => return Err(format!("未知依赖：{other}")),
         };
         return Ok(plan);
@@ -246,6 +265,10 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 ),
             ],
             "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
+            "dingtalk-cli" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "dingtalk-workspace-cli"],
+            )],
             other => return Err(format!("未知依赖：{other}")),
         };
         return Ok(plan);
@@ -688,11 +711,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_all_covers_five() {
+    fn detect_all_covers_six() {
         let all = detect_all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
-        for want in ["claude", "codex", "node", "python3", "lark-cli"] {
+        for want in ["claude", "codex", "node", "python3", "lark-cli", "dingtalk-cli"] {
             assert!(ids.contains(&want), "缺 {want}");
         }
     }
@@ -704,6 +727,7 @@ mod tests {
         assert!(install_plan("node").is_ok());
         assert!(install_plan("python3").is_ok());
         assert!(install_plan("lark-cli").is_ok());
+        assert!(install_plan("dingtalk-cli").is_ok());
         assert!(install_plan("nope").is_err());
     }
 

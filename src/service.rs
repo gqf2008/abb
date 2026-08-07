@@ -47,8 +47,8 @@ pub async fn run() {
     let cfg = Arc::new(cfg);
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
-    // fire-and-forget：装不上只 log 警告，不影响本进程。
-    if cfg.bots.iter().any(|b| b.enabled && !b.is_wechat()) {
+    // fire-and-forget：装不上只 log 警告，不影响本进程。只对飞书 bot 触发（微信/钉钉不需要）。
+    if cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
         tokio::spawn(async { crate::larkskills::ensure_lark_setup().await });
     }
 
@@ -185,7 +185,12 @@ async fn run_bot(bot: crate::config::BotConfig, cfg: Arc<Config>, stop_rx: watch
     }
 
     // 事件循环：按通道分派
-    if bot.is_wechat() {
+    if bot.is_dingtalk() {
+        crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop_rx)
+            .await;
+        crate::botstatus::clear(&key);
+        crate::log!("[bot:{key}] 钉钉 Stream 循环退出");
+    } else if bot.is_wechat() {
         weixin_loop(bot, bridge, stop_rx).await; // weixin_loop 退出时已 clear
         crate::log!("[bot:{key}] 微信长轮询循环退出");
     } else {
