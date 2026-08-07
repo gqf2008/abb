@@ -554,11 +554,19 @@ pub fn run_gui() -> Result<()> {
         let model = bots_model.clone();
         let sw = settings.as_weak();
         settings.on_add_bot(move || {
+            // 新 bot 默认类型跟随当前选中的 bot（没有选中则用 feishu 默认），
+            // 避免旧默认 wechat 让用户以为新加的 bot 是微信（参数区显示微信登录框）。
+            let sel = sw.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
             let mut b = work.borrow_mut();
             let n = b.len() + 1;
+            let kind = if sel >= 0 && (sel as usize) < b.len() {
+                b[sel as usize].kind.clone()
+            } else {
+                crate::config::default_kind()
+            };
             b.push(BotConfig {
                 name: format!("bot{n}"), // 占位名；微信扫码登录成功后自动改成 wxN
-                kind: "wechat".into(),   // 默认微信：扫码即走，无 app_id/secret
+                kind,
                 ..Default::default()
             });
             let idx = b.len() as i32 - 1;
@@ -593,33 +601,52 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let work = work.clone();
+        let model = bots_model.clone();
         // 按字段回写（slint 侧只传被改的那一个字段）：杜绝「未改字段从过期 model 读回」
         // 导致的连改两字段互相回滚（旧 bot-edited 的 CRITICAL bug）。
         settings.on_bot_field_edited(move |idx, field, value| {
-            let mut b = work.borrow_mut();
-            if let Some(bot) = b.get_mut(idx as usize) {
-                match field.as_str() {
-                    "name" => bot.name = value.to_string(),
-                    "kind" => bot.kind = value.to_string(),
-                    "backend" => bot.backend = value.to_string(),
-                    "provider" => bot.provider = value.to_string(),
-                    "owner" => bot.owner_open_id = value.trim().to_string(),
-                    "app_id" => bot.app_id = value.trim().to_string(),
-                    "app_secret" => bot.app_secret = value.trim().to_string(),
-                    "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
-                    "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
-                    _ => {}
+            let mut refresh = false;
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    match field.as_str() {
+                        "name" => bot.name = value.to_string(),
+                        "kind" => {
+                            bot.kind = value.to_string();
+                            // kind 决定编辑区显示哪套字段（slint 的 if 条件绑 model）；
+                            // 不回写 model 的话，改类型后右侧仍显示旧类型的表单（如改「钉钉」还显示微信登录框）
+                            refresh = true;
+                        }
+                        "backend" => bot.backend = value.to_string(),
+                        "provider" => bot.provider = value.to_string(),
+                        "owner" => bot.owner_open_id = value.trim().to_string(),
+                        "app_id" => bot.app_id = value.trim().to_string(),
+                        "app_secret" => bot.app_secret = value.trim().to_string(),
+                        "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
+                        "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
+                        _ => {}
+                    }
                 }
+            }
+            if refresh {
+                let b = work.borrow();
+                sync_model(&model, &b);
             }
         });
     }
     {
         let work = work.clone();
+        let model = bots_model.clone();
         settings.on_set_bot_enabled(move |idx, enabled| {
-            let mut b = work.borrow_mut();
-            if let Some(bot) = b.get_mut(idx as usize) {
-                bot.enabled = enabled;
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.enabled = enabled;
+                }
             }
+            // 同步回写 model：列表的 ⚪/停用 前缀与勾选框状态都绑 model，不刷新会显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
         });
     }
     {
