@@ -3,7 +3,7 @@
 #define MyAppName "ABB"
 #define MyAppVersion "2.0.0"
 #define MyAppPublisher "SQB"
-#define MyAppExeName "ABB.exe"
+#define MyAppExeName "agent-bridge.exe"
 
 [Setup]
 AppId={{0EEFF4CA-5184-4FBB-81D7-EEB910AB0FE7}

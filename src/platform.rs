@@ -301,7 +301,8 @@ fn login_item_plist() -> PathBuf {
 }
 
 // ── Windows：登录自启 = HKCU Run 键 ──
-// 值名 ABB，值 = "C:\...\ABB.exe"（带引号）。GUI 每次刷新读 Run 键决定菜单显「开/关」。
+// 值名 ABB，值 = "C:\...\agent-bridge.exe"（带引号；文件名由 current_exe() 决定）。
+// GUI 每次刷新读 Run 键决定菜单显「开/关」。
 #[cfg(target_os = "windows")]
 const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(target_os = "windows")]
