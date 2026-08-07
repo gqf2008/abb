@@ -1,0 +1,21 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+*.app/
+
+# 敏感信息（config.json 含 App Secret，不入库）
+config.json
+*.secret
+
+# 日志
+logs/
+*.log
+
+# 临时文件
+*.tmp
+*.swp
+*~
