@@ -1,10 +1,10 @@
 # Repository Guidelines
 
-Contributor guide for **agent-bridge (ABB)**, a Rust + Slint menu-bar app that bridges Feishu/WeChat messages to local Claude/Codex agents. It runs as a tray controller (default) or a headless bridge daemon (`--service`).
+Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that bridges Feishu/WeChat/DingTalk messages to local Claude/Codex agents. It runs as a tray controller (default) or a headless bridge daemon (`--service`).
 
 ## Project Structure & Module Organization
 
-- `src/` — Rust source; one module per concern (`agent`, `bridge`, `wechat`, `feishu`, `schedule`, `ws`, …). Unit tests live inline at the bottom of each file.
+- `src/` — Rust source; one module per concern (`agent`, `bridge`, `wechat`, `feishu`, `dingtalk`, `schedule`, `ws`, …). Unit tests live inline at the bottom of each file.
 - `ui/app.slint` — Slint UI definition, compiled at build time via `build.rs`.
 - `app-assets/` — macOS bundle assets (`Info.plist`, `AppIcon.icns`, tray icons).
 - `scripts/` — macOS helpers: `build.sh` (bundle + sign + install), `sign.sh` (re-sign), `make-certs.sh` (dev cert).

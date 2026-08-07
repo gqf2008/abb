@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 pub async fn run() {
-    crate::log!("=== Agent Bridge 启动（Rust 内置 WS 版 · 多 bot）===");
+    crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
     let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
