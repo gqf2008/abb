@@ -5,6 +5,8 @@ fn main() {
     // 用 installer/ABB.ico（由 app-assets/icon-1024.png 生成的多尺寸 ico）。
     #[cfg(target_os = "windows")]
     {
+        // 图标文件变化时强制重编（winres 在构建期读它）
+        println!("cargo:rerun-if-changed=installer/ABB.ico");
         if std::path::Path::new("installer/ABB.ico").exists() {
             let mut res = winres::WindowsResource::new();
             res.set_icon("installer/ABB.ico");
