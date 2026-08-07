@@ -90,7 +90,7 @@ impl Default for BotConfig {
     }
 }
 
-fn default_kind() -> String {
+pub(crate) fn default_kind() -> String {
     "feishu".to_string()
 }
 
