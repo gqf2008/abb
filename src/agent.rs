@@ -40,9 +40,9 @@ impl Backend {
 /// 关键：告诉 agent 定时/周期需求要用 `agent-bridge job` CLI 建任务后**立即退出**，
 /// 别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。幂等：已存在则不覆盖（用户可自定义）。
 fn ensure_workspace_guide(workspace: &std::path::Path) {
-    let guide = "# Agent Bridge 工作区
+    let guide = "# ABB 工作区
 
-你在飞书/微信 bot 的工作区里。用户消息从飞书/微信转来；你的 stdout 末尾会作为回复发回给用户。
+你在飞书/微信/钉钉 bot 的工作区里。用户消息从飞书/微信/钉钉转来；你的 stdout 末尾会作为回复发回给用户。
 
 ## 定时 / 周期 / 延迟任务 → 用 job CLI，建完即退出
 

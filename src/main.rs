@@ -1,4 +1,4 @@
-// Agent Bridge — Rust + Slint 单二进制双模式
+// ABB — Rust + Slint 单二进制双模式
 //   agent-bridge            → 托盘控制器（Slint GUI）
 //   agent-bridge --service  → 无头桥守护进程（纯 tokio，LaunchAgent 跑）
 
