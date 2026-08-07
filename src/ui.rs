@@ -35,7 +35,7 @@ enum UiCmd {
         idx: i32,
         bot_key: String,
     },
-    /// 安装某个依赖（claude/codex/node/python3/lark-cli）。结果经 dep_rx 回主线程。
+    /// 安装某个依赖（claude/codex/node/python3/lark-cli/dingtalk-cli）。结果经 dep_rx 回主线程。
     InstallDep(String),
     /// 测试某个供应商连通性（快照里 api_key 已就绪）。结果经 prov_rx 回主线程。
     TestProvider {
@@ -56,12 +56,22 @@ enum WxEvt {
     Failed(String),
 }
 
+/// 通道类型的中文显示名（托盘/设置窗概览行；原始 kind 值对内，展示用中文）。
+fn kind_label(kind: &str) -> String {
+    match kind {
+        "feishu" => "飞书".to_string(),
+        "wechat" => "微信".to_string(),
+        "dingtalk" => "钉钉".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// 把已查好的服务状态写进 Tray 属性。主线程调用（status 由调用方查，避免重复 fork ps）。
 /// 托盘菜单里 bot 的显示名：空名回落通道类型；过长（如微信「微信 {完整 ilink user_id}」）
 /// 截断加省略号，否则会把原生 NSMenu 撑得过宽。完整名仍在设置窗/配置里。
 fn display_name(name: &str, kind: &str) -> String {
     const MAX: usize = 16;
-    let base = if name.is_empty() { kind.to_string() } else { name.to_string() };
+    let base = if name.is_empty() { kind_label(kind) } else { name.to_string() };
     let chars: Vec<char> = base.chars().collect();
     if chars.len() <= MAX {
         base
@@ -85,7 +95,7 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
                 _ => "🔴", // 会话过期 / 离线 / 其它
             };
             let label = display_name(&b.name, &b.kind);
-            format!("{icon} {label} · {} · {}", b.conn, b.kind).into()
+            format!("{icon} {label} · {} · {}", b.conn, kind_label(&b.kind)).into()
         })
         .collect();
     tray.set_bots_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(list))));
@@ -187,6 +197,8 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         bot_open_id: b.bot_open_id.clone().into(),
         // per-bot 供应商名（""=跟随全局默认），直接显示原值（下拉第一项是 ""）
         provider: b.provider.clone().into(),
+        ding_user_id: b.ding_user_id.clone().into(),
+        ding_robot_code: b.ding_robot_code.clone().into(),
     }
 }
 
@@ -216,7 +228,7 @@ fn sync_providers_model(
     );
 }
 
-/// 跑一次依赖检测并把全部 5 项状态回填到设置窗（claude/codex/node/python3/lark-cli）。
+/// 跑一次依赖检测并把全部 6 项状态回填到设置窗（claude/codex/node/python3/lark-cli/dingtalk-cli）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
     let get = |id: &str| all.iter().find(|d| d.id == id).map(|d| d.found).unwrap_or(false);
@@ -225,6 +237,7 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_node_installed(get("node"));
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
+    w.set_dingtalk_installed(get("dingtalk-cli"));
 }
 
 /// 把系统权限状态回填到设置窗（0=未授权 1=被拒绝 2=已授权）。
@@ -427,8 +440,8 @@ pub fn run_gui() -> Result<()> {
                             install::svc_restart();
                         }
                         // 接入飞书 bot → 后台自动装 lark-cli + lark 技能（幂等/best-effort）。
-                        // GUI 路径免等 service 重启；装不上只 log 警告。
-                        if res.is_ok() && cfg.bots.iter().any(|b| b.enabled && !b.is_wechat()) {
+                        // GUI 路径免等 service 重启；装不上只 log 警告。只对飞书 bot 触发。
+                        if res.is_ok() && cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
                             tokio::spawn(async { crate::larkskills::ensure_lark_setup().await });
                         }
                         let tw = tray_weak_bg.clone();
@@ -541,11 +554,19 @@ pub fn run_gui() -> Result<()> {
         let model = bots_model.clone();
         let sw = settings.as_weak();
         settings.on_add_bot(move || {
+            // 新 bot 默认类型跟随当前选中的 bot（没有选中则用 feishu 默认），
+            // 避免旧默认 wechat 让用户以为新加的 bot 是微信（参数区显示微信登录框）。
+            let sel = sw.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
             let mut b = work.borrow_mut();
             let n = b.len() + 1;
+            let kind = if sel >= 0 && (sel as usize) < b.len() {
+                b[sel as usize].kind.clone()
+            } else {
+                crate::config::default_kind()
+            };
             b.push(BotConfig {
                 name: format!("bot{n}"), // 占位名；微信扫码登录成功后自动改成 wxN
-                kind: "wechat".into(),   // 默认微信：扫码即走，无 app_id/secret
+                kind,
                 ..Default::default()
             });
             let idx = b.len() as i32 - 1;
@@ -584,33 +605,48 @@ pub fn run_gui() -> Result<()> {
         // 按字段回写（slint 侧只传被改的那一个字段）：杜绝「未改字段从过期 model 读回」
         // 导致的连改两字段互相回滚（旧 bot-edited 的 CRITICAL bug）。
         settings.on_bot_field_edited(move |idx, field, value| {
-            let mut b = work.borrow_mut();
-            if let Some(bot) = b.get_mut(idx as usize) {
-                match field.as_str() {
-                    "name" => bot.name = value.to_string(),
-                    "kind" => {
-                        bot.kind = value.to_string();
-                        // 关键：表单字段显隐（if kind == "feishu" / "wechat"）读的是 Slint 模型，
-                        // 不回写则切类型后仍显示旧类型的配置项（选飞书却看到微信字段）。
-                        sync_model(&model, &b);
+            let mut refresh = false;
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    match field.as_str() {
+                        "name" => bot.name = value.to_string(),
+                        "kind" => {
+                            bot.kind = value.to_string();
+                            // kind 决定编辑区显示哪套字段（slint 的 if 条件绑 model）；
+                            // 不回写 model 的话，改类型后右侧仍显示旧类型的表单（如改「钉钉」还显示微信登录框）
+                            refresh = true;
+                        }
+                        "backend" => bot.backend = value.to_string(),
+                        "provider" => bot.provider = value.to_string(),
+                        "owner" => bot.owner_open_id = value.trim().to_string(),
+                        "app_id" => bot.app_id = value.trim().to_string(),
+                        "app_secret" => bot.app_secret = value.trim().to_string(),
+                        "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
+                        "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
+                        _ => {}
                     }
-                    "backend" => bot.backend = value.to_string(),
-                    "provider" => bot.provider = value.to_string(),
-                    "owner" => bot.owner_open_id = value.trim().to_string(),
-                    "app_id" => bot.app_id = value.trim().to_string(),
-                    "app_secret" => bot.app_secret = value.trim().to_string(),
-                    _ => {}
                 }
+            }
+            if refresh {
+                let b = work.borrow();
+                sync_model(&model, &b);
             }
         });
     }
     {
         let work = work.clone();
+        let model = bots_model.clone();
         settings.on_set_bot_enabled(move |idx, enabled| {
-            let mut b = work.borrow_mut();
-            if let Some(bot) = b.get_mut(idx as usize) {
-                bot.enabled = enabled;
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.enabled = enabled;
+                }
             }
+            // 同步回写 model：列表的 ⚪/停用 前缀与勾选框状态都绑 model，不刷新会显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
         });
     }
     {

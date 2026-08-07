@@ -11,6 +11,7 @@ mod bridge;
 mod ccswitch;
 mod config;
 mod deps;
+mod dingtalk;
 mod feishu;
 mod install;
 mod larkskills;

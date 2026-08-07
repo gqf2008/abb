@@ -1,8 +1,9 @@
-//! Messenger 抽象 —— 统一飞书 / 微信的发送接口。
-//! `send_text` 是唯一必须实现；表情（Typing/DONE）飞书有、微信没有（默认空实现）。
+//! Messenger 抽象 —— 统一飞书 / 微信 / 钉钉的发送接口。
+//! `send_text` 是唯一必须实现；表情（Typing/DONE）飞书有、微信/钉钉没有（默认空实现）。
 //! Bridge 持 `Arc<dyn Messenger>`，按 bot.kind 注入具体实现。
 
 use crate::config::BotConfig;
+use crate::dingtalk::DingTalkClient;
 use crate::feishu::FeishuClient;
 use crate::wechat::WeixinClient;
 use anyhow::Result;
@@ -25,6 +26,9 @@ pub trait Messenger: Send + Sync {
 
     /// 记录某会话的回复上下文（微信 context_token）。飞书不需要，默认无操作。
     fn note_context(&self, _chat_id: &str, _context_token: &str) {}
+
+    /// 记录某会话最近一个发送者（钉钉群聊回复时 @ 对方用）。其它通道不需要，默认无操作。
+    fn note_sender(&self, _chat_id: &str, _sender_id: &str) {}
 }
 
 /// 飞书实现：委托 FeishuClient，表情走 reactions。
@@ -115,8 +119,62 @@ impl Messenger for WeixinMessenger {
     }
 }
 
+/// 钉钉实现：send_text 按会话标识分发（cid 开头=群聊 → groupMessages/send，否则单聊 →
+/// oToMessages/batchSend）。群聊回复需要 @ 提问者，故用一张 per-chat 表记最近 sender
+/// （入站时 bridge.on_dingtalk 调 note_sender 刷新；job 等非对话路径照常发，只是不 @）。
+pub struct DingTalkMessenger {
+    pub dt: DingTalkClient,
+    robot_code: String,
+    last_sender: Mutex<HashMap<String, String>>,
+}
+
+impl DingTalkMessenger {
+    pub fn new(dt: DingTalkClient, robot_code: String) -> DingTalkMessenger {
+        DingTalkMessenger {
+            dt,
+            robot_code,
+            last_sender: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Messenger for DingTalkMessenger {
+    async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
+        // 群聊回复 @ 最近提问者（单聊 chat_id=对方 staffId，无需 @）
+        let at = if crate::dingtalk::is_group_chat(chat_id) {
+            self.last_sender.lock().unwrap().get(chat_id).cloned()
+        } else {
+            None
+        };
+        // 超长分段（与飞书同一套按字符贪心逻辑）
+        for chunk in crate::feishu::split_text(text, crate::dingtalk::DINGTALK_MSG_LIMIT) {
+            self.dt
+                .send_text(chat_id, &self.robot_code, &chunk, at.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+    // 钉钉无表情：typing/done 用默认空实现
+
+    fn note_sender(&self, chat_id: &str, sender_id: &str) {
+        if !chat_id.is_empty() && !sender_id.is_empty() {
+            self.last_sender
+                .lock()
+                .unwrap()
+                .insert(chat_id.to_string(), sender_id.to_string());
+        }
+    }
+}
+
 /// 按 bot 配置构造对应 Messenger。
 pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
+    if bot.is_dingtalk() {
+        return Ok(std::sync::Arc::new(DingTalkMessenger::new(
+            DingTalkClient::new(&bot.app_id, &bot.app_secret),
+            bot.ding_robot_code().to_string(),
+        )));
+    }
     if bot.is_wechat() {
         let base = if bot.wx_base_url.is_empty() {
             crate::wechat::FIXED_BASE_URL
