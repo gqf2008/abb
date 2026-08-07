@@ -2,6 +2,9 @@
 //   agent-bridge            → 托盘控制器（Slint GUI）
 //   agent-bridge --service  → 无头桥守护进程（纯 tokio，LaunchAgent 跑）
 
+// Windows：托盘 GUI 程序，不带控制台窗口（stdout/stderr 仍可被重定向到文件/管道）。
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod agent;
 mod botstatus;
 mod bridge;
@@ -47,7 +50,12 @@ pub fn atomic_write_text(path: &std::path::Path, text: &str) -> std::io::Result<
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
-        println!("[{}] {}", $crate::chrono_lite::now(), format!($($arg)*));
+        // windows_subsystem=windows 下无控制台时 stdout 句柄无效：println! 会 panic，
+        // 这里用 write_fmt + 忽略错误，日志在无控制台时静默丢弃，重定向时照常落盘。
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stdout(),
+            format_args!("[{}] {}\n", $crate::chrono_lite::now(), format!($($arg)*)),
+        );
     }};
 }
 
@@ -145,7 +153,7 @@ fn main() {
         let _guard = match single_instance::SingleInstance::acquire("service") {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("{e:#}");
+                crate::log!("{e:#}");
                 std::process::exit(0); // 优雅退出，不报错（避免 launchd KeepAlive 刷屏重试日志）
             }
         };
@@ -255,7 +263,7 @@ fn main() {
     let _gui_guard = match single_instance::SingleInstance::acquire("gui") {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("{e:#}");
+            crate::log!("{e:#}");
             std::process::exit(0);
         }
     };
