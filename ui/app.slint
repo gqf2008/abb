@@ -1,0 +1,831 @@
+// Agent Bridge — Slint 托盘 + 设置窗（macOS 菜单栏 accessory 应用）。
+// 托盘模式对齐 ../brewfs（同为 Slint 1.17 SystemTrayIcon 的可用工程）：图标 @image-url、
+// 托盘常驻、设置窗 show/hide。
+// 注意（Slint 1.17 实测坑，勿改回 enabled 绑定）：托盘菜单项的 `enabled` 标量绑定在属性
+//   变化后**不会**重建原生 NSMenu（PropertyTracker 依赖注册不全，首次求值后冻结；title 会变
+//   但 enabled 不变）。可靠做法是**结构性** `if cond: MenuItem{...}`——条件翻转触发菜单重建
+//   （appkit.rs 对 if/for 结构变化会 detach+重建 NSMenu，已实测生效）。故启停按钮用互斥 if。
+import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, GroupBox, ListView, Palette, TabWidget } from "std-widgets.slint";
+
+// 托盘：SystemTrayIcon 是内置元素（macOS → NSStatusItem）。
+export component Tray inherits SystemTrayIcon {
+    icon: @image-url("tray-dark.png");
+    tooltip: "ABB";
+
+    in-out property <[string]> bots-list: [];   // 逐 bot 状态行（主菜单直接铺）
+    in-out property <bool> service-running: false;
+    in-out property <bool> configured: false;
+    in-out property <bool> autostart: false;
+
+    callback start-service();
+    callback stop-service();
+    callback restart-service();
+    callback open-settings();
+    callback open-logs();
+    callback open-folder();
+    callback toggle-autostart(bool);
+    callback quit-app();
+
+    // 左键点图标 = 打开设置（对齐 brewfs：clicked → show-window）
+    clicked => { root.open-settings(); }
+
+    Menu {
+        // Bot 状态：分区标题（仅在有 bot 时出现）+ 逐 bot 行直接铺在主菜单（不嵌套子菜单）。
+        if root.bots-list.length > 0: MenuItem { title: "Bot 状态"; enabled: false; }
+        for st in root.bots-list: MenuItem { title: st; enabled: false; }
+        if root.bots-list.length > 0: MenuSeparator {}
+        // 启停互斥（结构性，见文件头注释：enabled 绑定不可靠，用 if 翻转重建）
+        if !root.service-running: MenuItem { title: "启动"; activated => { root.start-service(); } }
+        if root.service-running: MenuItem { title: "停止"; activated => { root.stop-service(); } }
+        if root.service-running: MenuItem { title: "重启"; activated => { root.restart-service(); } }
+        MenuSeparator {}
+        MenuItem { title: "设置…"; activated => { root.open-settings(); } }
+        MenuItem { title: "打开日志"; activated => { root.open-logs(); } }
+        MenuItem { title: "打开桥目录"; activated => { root.open-folder(); } }
+        MenuSeparator {}
+        // 开机自启：结构性 if（同启停，enabled/checkbox 绑定不可靠），点一下切换
+        if !root.autostart: MenuItem { title: "开机自动启动：关"; activated => { root.toggle-autostart(true); } }
+        if root.autostart: MenuItem { title: "开机自动启动：开"; activated => { root.toggle-autostart(false); } }
+        MenuSeparator {}
+        MenuItem { title: "退出"; activated => { root.quit-app(); } }
+    }
+}
+
+// 单个 bot 行的数据（与 Rust 侧 BotRow 对应）
+export struct BotRow {
+    name: string,        // 显示名
+    kind: string,        // feishu | wechat
+    enabled: bool,       // 是否启用（false 则 service 不启动此 bot）
+    backend: string,     // 该 bot 的默认后端 claude | codex（跟着 bot 走，不是全局）
+    provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
+    owner-open-id: string, // 飞书：只响应这个 owner（ou_xxx）；微信 bot 不用
+    app-id: string,
+    app-secret: string,
+    bot-name: string,    // 运行时获取的 bot 名
+    bot-open-id: string,
+}
+
+// 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
+export struct ProviderRow {
+    name: string,        // 唯一键
+    kind: string,        // anthropic | openai-chat | openai-responses
+    base-url: string,
+    api-key: string,     // 密码框、加载后留空（编辑时重输=覆盖，留空=保留旧值）
+    model: string,
+    is-default: bool,    // 是否为全局默认供应商
+}
+
+// 微信扫码登录二维码弹窗：直接在 GUI 里显示二维码，避免依赖系统看图。
+export component QrDialog inherits Window {
+    title: "微信扫码登录";
+    width: 360px;
+    height: 440px;
+    preferred-width: 360px;
+    preferred-height: 440px;
+    background: Palette.background;
+    in-out property <image> qr-image;
+    in-out property <string> tip: "请用微信扫描二维码";
+    callback close-clicked();
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+        alignment: center;
+        Text { text: root.tip; font-weight: 600; horizontal-alignment: center; wrap: word-wrap; }
+        Rectangle {
+            background: white;
+            border-radius: 8px;
+            min-height: 300px;
+            Image {
+                source: root.qr-image;
+                width: 300px;
+                height: 300px;
+                image-fit: contain;
+            }
+        }
+        Text { text: "扫不上就点「取消」重新获取"; font-size: 11px; color: #888; horizontal-alignment: center; }
+        HorizontalBox {
+            alignment: center;
+            Button { text: "取消"; clicked => { root.close-clicked(); } }
+        }
+    }
+}
+
+// 设置窗：三个 Tab —— 机器人配置 / 环境配置 / 模型供应商配置。底部共享状态行 + 保存/取消。
+export component SettingsWindow inherits Window {
+    // 打开时由 Rust 侧提升为 regular 策略（带 dock 图标 + 置前聚焦），关掉降回 accessory。
+    // 不用 always-on-top：那会浮在别的 app 之上却没焦点，别扭。标题带实时 bot 数。
+    title: root.window-title;
+    // 窗口 + Dock 图标（提升为 regular 后 Dock 用）。1024px 源，macOS 自动缩放。
+    icon: @image-url("../app-assets/icon-1024.png");
+    // 显式 width/height（固定尺寸）：Window 若不显式给尺寸，会用内容 preferred 算，
+    // 而设置窗初始 bots 为空、selected=-1 时内容高度算成 0 → 窗口塌成标题栏。
+    // （不能同时写 width 和 min-width，Slint 报冲突；固定尺寸已是最小值。）
+    width: 680px;
+    height: 700px;
+    background: Palette.background;
+
+    in-out property <string> window-title: "ABB 设置";
+    in-out property <string> running-line: "";   // 顶部运行概览（N 个 bot 在线…），空则隐藏
+    in-out property <[BotRow]> bots: [];
+    in-out property <int> selected: -1;   // 当前选中的 bot 下标，-1=无
+    in-out property <string> status-line;
+    in-out property <bool> status-is-error: true;   // true=红（报错）/ false=绿（成功/信息）
+
+    // 环境配置（依赖检测）：五项是否在本机可执行路径上
+    in-out property <bool> claude-installed: false;
+    in-out property <bool> codex-installed: false;
+    in-out property <bool> node-installed: false;
+    in-out property <bool> python-installed: false;
+    in-out property <bool> lark-installed: false;
+    // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
+    in-out property <string> dep-busy: "";
+
+    // 系统权限（仅 macOS）：完全磁盘/辅助功能/屏幕录制/自动化/摄像头/麦克风。0=未授权 1=被拒绝 2=已授权
+    in-out property <int> perm-full-disk: 0;
+    in-out property <int> perm-accessibility: 0;
+    in-out property <int> perm-screen: 0;
+    in-out property <int> perm-automation: 0;
+    in-out property <int> perm-camera: 0;
+    in-out property <int> perm-microphone: 0;
+    // Windows 专用：是否以管理员身份运行（0=否 2=是）
+    in-out property <int> perm-admin: 0;
+    // 平台：macos | windows | linux（决定权限区显示什么）
+    in-out property <string> platform: "macos";
+    // 权限请求子进程是否在跑（防连点；同时给个进度提示）
+    in-out property <bool> perm-busy: false;
+    // 是否为 macOS（非 mac 不显示系统权限区，显示「仅 macOS 需要」）
+    in-out property <bool> perms-supported: false;
+
+    // 模型供应商配置
+    in-out property <[ProviderRow]> providers: [];
+    in-out property <int> provider-selected: -1;
+    in-out property <[string]> provider-names: [];   // 供 bot Tab 的供应商下拉（[""] + 各 name）
+
+    callback save-clicked();
+    callback cancel-clicked();
+    callback fetch-bot-info(int);          // 对某个 bot 拉 name/open_id（飞书）
+    callback wx-login(int);                // 对某个 bot 微信扫码登录
+    callback add-bot();
+    callback remove-bot(int);
+    callback selection-changed(int);   // 切中别的 bot：让 Rust 侧重建 model 强制刷新编辑区（ComboBox current-value 不随 model 变，需 model 变更通知）
+
+    // 编辑区变更时回写 bots[selected]。**只回写被改的那一个字段**（field+value）——
+    // 旧版 bot-edited 一次传全部字段、未改字段从 model 读，而 model 在编辑后不同步（过期），
+    // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
+    callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
+    callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
+    callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
+    callback recheck-deps();            // 重新检测依赖是否已装
+    callback install-dep(string);       // 安装某个依赖（claude/codex/node/python3/lark-cli）
+    callback open-perm-settings(string); // 打开某项系统权限对应的设置面板（full-disk/accessibility/screen/automation）
+    callback request-perms();           // 触发屏幕录制/摄像头/麦克风授权弹框（拉起子进程逐项请求）
+    callback restart-service-request(); // 环境 Tab 授权后一键重启服务（权限对运行中进程不实时刷新）
+    callback relaunch-as-admin();       // Windows：以管理员身份重启（弹 UAC）
+
+    // 供应商编辑（同样 per-field 回写纪律，禁止整行回写）
+    callback provider-field-edited(int, string, string); // idx, field(name/kind/base_url/api_key/model), value
+    callback provider-selection-changed(int);
+    callback add-provider();
+    callback remove-provider(int);
+    callback set-default-provider(int);
+    callback test-provider(int);
+
+    // 关键：内容必须包在一个显式铺满窗口的根 Rectangle 里。
+    // 直接把 HorizontalBox 当 Window 子元素时，在某些路径下其尺寸算成 0 → 整个内容区不渲染（黑/空），
+    // 只剩系统画的标题栏。根 Rectangle width/height:100% 强制铺满，布局才有确定容器。
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Palette.background;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        // 顶部运行概览：当前几个 bot 在线（service 心跳上报）。空则不占位。
+        if root.running-line != "": Text {
+            text: root.running-line;
+            color: #2a7d2f;
+            font-weight: 600;
+            wrap: word-wrap;
+            vertical-stretch: 0;
+        }
+
+        TabWidget {
+            vertical-stretch: 1;
+
+            // ═══════════ Tab 1：机器人配置 ═══════════
+            Tab {
+                title: "机器人配置";
+                HorizontalBox {
+                    padding: 8px;
+                    spacing: 12px;
+
+                    // ── 左：bot 列表 ──
+                    VerticalBox {
+                        spacing: 8px;
+                        width: 160px;
+                        Rectangle {
+                            background: #00000010;
+                            border-radius: 6px;
+                            vertical-stretch: 1;
+                            ListView {
+                                for bot[idx] in root.bots: Rectangle {
+                                    height: 40px;
+                                    background: idx == root.selected ? #3a7bd5 : transparent;
+                                    border-radius: 4px;
+                                    TouchArea {
+                                        clicked => { root.selected = idx; root.selection-changed(idx); }
+                                        VerticalBox {
+                                            padding-left: 8px;
+                                            spacing: 2px;
+                                            Text {
+                                                // 停用的 bot 前缀 ⚪ 并显灰，一眼可辨（启用的维持原色）
+                                                text: (bot.enabled ? "" : "⚪ ") + (bot.name == "" ? "(未命名)" : bot.name);
+                                                color: idx == root.selected ? white : (bot.enabled ? black : #aaa);
+                                                font-weight: 600;
+                                            }
+                                            Text {
+                                                text: bot.kind + (bot.enabled ? "" : " · 停用");
+                                                font-size: 11px;
+                                                color: idx == root.selected ? #dde : #888;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalBox {
+                            spacing: 8px;
+                            Button { text: "＋ 添加"; clicked => { root.add-bot(); } }
+                            Button {
+                                text: "－ 删除";
+                                enabled: root.selected >= 0;
+                                clicked => { root.remove-bot(root.selected); }
+                            }
+                        }
+                    }
+
+                    // ── 右：编辑选中 bot ──
+                    VerticalBox {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+
+                        ScrollView {
+                            vertical-stretch: 1;
+                            VerticalBox {
+                                spacing: 10px;
+                                alignment: start;
+
+                                // 整列表单：GridBox 让标签列自动等宽对齐、行距统一。
+                                // 标签列固定 88px，输入框列拉伸；行距 6px 紧凑。
+                                GridBox {
+                                    spacing: 6px;
+                                    vertical-stretch: 0;
+
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Rectangle { width: 88px; }
+                                        CheckBox {
+                                            text: "启用此 bot";
+                                            checked: root.bots[root.selected].enabled;
+                                            toggled => { root.set-bot-enabled(root.selected, self.checked); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "名称"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].name;
+                                            placeholder-text: "如：庆小丰（隔离目录名）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "name", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "类型"; width: 88px; vertical-alignment: center; }
+                                        ComboBox {
+                                            model: ["feishu", "wechat"];
+                                            current-value: root.bots[root.selected].kind;
+                                            horizontal-stretch: 1;
+                                            selected => { root.bot-field-edited(root.selected, "kind", self.current-value); }
+                                        }
+                                    }
+                                    // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "默认后端"; width: 88px; vertical-alignment: center; }
+                                        ComboBox {
+                                            model: ["claude", "codex"];
+                                            current-value: root.bots[root.selected].backend;
+                                            horizontal-stretch: 1;
+                                            selected => { root.bot-field-edited(root.selected, "backend", self.current-value); }
+                                        }
+                                    }
+                                    // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "模型供应商"; width: 88px; vertical-alignment: center; }
+                                        ComboBox {
+                                            model: root.provider-names;
+                                            current-value: root.bots[root.selected].provider;
+                                            horizontal-stretch: 1;
+                                            selected => { root.bot-field-edited(root.selected, "provider", self.current-value); }
+                                        }
+                                    }
+
+                                    // ── 飞书字段 ──
+                                    // Owner 是飞书概念（只响应这个 ou_xxx），跟着飞书 bot 走；微信 bot 不显示此栏
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
+                                        Text { text: "Owner"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].owner-open-id;
+                                            placeholder-text: "ou_xxx（只响应这个人）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "owner", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
+                                        Text { text: "App ID"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].app-id;
+                                            placeholder-text: "cli_xxxxxxxx";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
+                                        Text { text: "App Secret"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].app-secret;
+                                            input-type: password;
+                                            placeholder-text: "飞书应用密钥";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
+                                        Rectangle { width: 88px; }
+                                        HorizontalBox {
+                                            spacing: 8px;
+                                            Text { text: "bot：" + root.bots[root.selected].bot-name + "  " + root.bots[root.selected].bot-open-id; font-size: 11px; color: #666; vertical-alignment: center; wrap: word-wrap; }
+                                            Button { text: "自动获取"; clicked => { root.fetch-bot-info(root.selected); } }
+                                        }
+                                    }
+
+                                    // ── 微信字段（扫码登录，无需 app_id/secret）──
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
+                                        Rectangle { width: 88px; }
+                                        Text {
+                                            text: root.bots[root.selected].bot-name == ""
+                                                ? "未登录。点下方按钮，用微信扫码登录。"
+                                                : "已登录：" + root.bots[root.selected].bot-name;
+                                            wrap: word-wrap;
+                                            color: root.bots[root.selected].bot-name == "" ? #888 : #060;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
+                                        Rectangle { width: 88px; }
+                                        Button { text: "📱 扫码登录微信"; clicked => { root.wx-login(root.selected); } }
+                                    }
+                                }
+
+                                if root.selected < 0: Text { text: "← 选择或添加一个机器人"; color: #888; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ═══════════ Tab 2：环境配置 ═══════════
+            Tab {
+                title: "环境配置";
+                ScrollView {
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 10px;
+                        alignment: start;
+
+                        HorizontalBox {
+                            spacing: 8px;
+                            vertical-stretch: 0;
+                            Text { text: "依赖（本机 agent 运行环境）"; font-weight: 700; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button { text: "重新检测"; clicked => { root.recheck-deps(); } }
+                        }
+                        // 安装进行中提示（dep-busy 非空时显示）
+                        if root.dep-busy != "": Text {
+                            text: "⏳ 正在安装 " + root.dep-busy + " …（可能要几分钟，期间请勿重复点）";
+                            color: #b80;
+                            wrap: word-wrap;
+                            vertical-stretch: 0;
+                        }
+
+                        GridBox {
+                            spacing: 6px;
+                            vertical-stretch: 0;
+
+                            // claude
+                            Row {
+                                Text { text: "Claude Code"; width: 96px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: root.claude-installed ? "🟢 已安装" : "🔴 未安装"; vertical-alignment: center; horizontal-stretch: 1; }
+                                    if !root.claude-installed: Button {
+                                        text: "安装";
+                                        enabled: root.dep-busy == "";
+                                        clicked => { root.install-dep("claude"); }
+                                    }
+                                    if !root.claude-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://docs.claude.com/en/docs/claude-code/setup"); } }
+                                }
+                            }
+                            if !root.claude-installed: Row {
+                                Rectangle { width: 96px; }
+                                LineEdit { text: "curl -fsSL https://claude.ai/install.sh | bash"; read-only: true; horizontal-stretch: 1; }
+                            }
+
+                            // codex
+                            Row {
+                                Text { text: "Codex CLI"; width: 96px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: root.codex-installed ? "🟢 已安装" : "🔴 未安装"; vertical-alignment: center; horizontal-stretch: 1; }
+                                    if !root.codex-installed: Button {
+                                        text: "安装";
+                                        enabled: root.dep-busy == "";
+                                        clicked => { root.install-dep("codex"); }
+                                    }
+                                    if !root.codex-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://github.com/openai/codex"); } }
+                                }
+                            }
+                            if !root.codex-installed: Row {
+                                Rectangle { width: 96px; }
+                                LineEdit { text: "npm install -g @openai/codex"; read-only: true; horizontal-stretch: 1; }
+                            }
+
+                            // nodejs
+                            Row {
+                                Text { text: "Node.js"; width: 96px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: root.node-installed ? "🟢 已安装" : "🔴 未安装"; vertical-alignment: center; horizontal-stretch: 1; }
+                                    if !root.node-installed: Button {
+                                        text: "安装";
+                                        enabled: root.dep-busy == "";
+                                        clicked => { root.install-dep("node"); }
+                                    }
+                                }
+                            }
+                            if !root.node-installed: Row {
+                                Rectangle { width: 96px; }
+                                LineEdit { text: "brew install node"; read-only: true; horizontal-stretch: 1; }
+                            }
+
+                            // python3
+                            Row {
+                                Text { text: "Python 3"; width: 96px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: root.python-installed ? "🟢 已安装" : "🔴 未安装"; vertical-alignment: center; horizontal-stretch: 1; }
+                                    if !root.python-installed: Button {
+                                        text: "安装";
+                                        enabled: root.dep-busy == "";
+                                        clicked => { root.install-dep("python3"); }
+                                    }
+                                }
+                            }
+                            if !root.python-installed: Row {
+                                Rectangle { width: 96px; }
+                                LineEdit { text: "brew install python"; read-only: true; horizontal-stretch: 1; }
+                            }
+
+                            // lark-cli（接入飞书 bot 用，装 lark 技能给 claude 用）
+                            Row {
+                                Text { text: "lark-cli"; width: 96px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: root.lark-installed ? "🟢 已安装" : "🔴 未安装"; vertical-alignment: center; horizontal-stretch: 1; }
+                                    if !root.lark-installed: Button {
+                                        text: "安装";
+                                        enabled: root.dep-busy == "";
+                                        clicked => { root.install-dep("lark-cli"); }
+                                    }
+                                }
+                            }
+                            if !root.lark-installed: Row {
+                                Rectangle { width: 96px; }
+                                LineEdit { text: "npm install -g @larksuite/cli"; read-only: true; horizontal-stretch: 1; }
+                            }
+                        }
+
+                        // ── 系统权限（仅 macOS）：完全控制这台主机所需 ──
+                        if root.perms-supported && root.platform == "macos": HorizontalBox {
+                            spacing: 8px;
+                            vertical-stretch: 0;
+                            Text { text: "系统权限（让 agent 完全控制本机）"; font-weight: 700; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: root.perm-busy ? "⏳ 请求中…" : "📹 请求摄像头/麦克风/录屏";
+                                enabled: !root.perm-busy;
+                                clicked => { root.request-perms(); }
+                            }
+                        }
+                        if root.perms-supported && root.platform == "macos" && root.perm-busy: Text {
+                            text: "⏳ 正在逐项弹系统授权框（屏幕录制→摄像头→麦克风），请在弹框里点「允许」。完成后点「重新检测」刷新。";
+                            font-size: 11px; color: #b80; wrap: word-wrap; vertical-stretch: 0;
+                        }
+                        // ── Windows：管理员身份 ──
+                        if root.perms-supported && root.platform == "windows": HorizontalBox {
+                            spacing: 8px;
+                            vertical-stretch: 0;
+                            Text { text: "运行权限（让 agent 完全控制本机）"; font-weight: 700; vertical-alignment: center; }
+                        }
+                        if root.perms-supported && root.platform == "windows": GridBox {
+                            spacing: 6px;
+                            vertical-stretch: 0;
+                            Row {
+                                Text { text: "管理员身份"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-admin == 2 ? "🟢 已提权" : "🔴 未提权（当前为普通用户）";
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-admin != 2: Button { text: "以管理员重启"; clicked => { root.relaunch-as-admin(); } }
+                                }
+                            }
+                            if root.perm-admin != 2: Text {
+                                text: "Windows 无需逐项授权；以管理员身份运行即可完全控制本机（文件/鼠标键盘/屏幕/摄像头/麦克风）。点击下方按钮会弹 UAC 确认框。";
+                                font-size: 11px; color: #888; wrap: word-wrap; vertical-stretch: 0;
+                            }
+                        }
+                        // ── macOS 六项权限 ──
+                        if root.perms-supported && root.platform == "macos": GridBox {
+                            spacing: 6px;
+                            vertical-stretch: 0;
+
+                            // 完全磁盘访问
+                            Row {
+                                Text { text: "完全磁盘访问"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-full-disk == 2 ? "🟢 已授权" : (root.perm-full-disk == 1 ? "🟡 被拒绝·需手动开" : "🔴 未授权");
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-full-disk != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("full-disk"); } }
+                                }
+                            }
+                            // 辅助功能
+                            Row {
+                                Text { text: "辅助功能"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-accessibility == 2 ? "🟢 已授权" : (root.perm-accessibility == 1 ? "🟡 被拒绝·需手动开" : "🔴 未授权");
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-accessibility != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("accessibility"); } }
+                                }
+                            }
+                            // 屏幕录制
+                            Row {
+                                Text { text: "屏幕录制"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-screen == 2 ? "🟢 已授权" : (root.perm-screen == 1 ? "🟡 被拒绝·需手动开" : "🔴 未授权");
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-screen != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("screen"); } }
+                                }
+                            }
+                            // 自动化（AppleEvents）
+                            Row {
+                                Text { text: "自动化"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-automation == 2 ? "🟢 已授权" : (root.perm-automation == 1 ? "🟡 被拒绝·需手动开" : "🔴 未授权");
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-automation != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("automation"); } }
+                                }
+                            }
+                            // 摄像头（需先请求才出现在设置列表）
+                            Row {
+                                Text { text: "摄像头"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-camera == 2 ? "🟢 已授权" : (root.perm-camera == 1 ? "🟡 被拒绝·需手动开" : "🔴 未授权");
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-camera != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("camera"); } }
+                                }
+                            }
+                            // 麦克风
+                            Row {
+                                Text { text: "麦克风"; width: 130px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.perm-microphone == 2 ? "🟢 已授权" : (root.perm-microphone == 1 ? "🟡 被拒绝·需手动开" : "🔴 未授权");
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if root.perm-microphone != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("microphone"); } }
+                                }
+                            }
+                        }
+                        if root.perms-supported && (root.perm-full-disk != 2 || root.perm-screen != 2 || root.perm-camera != 2 || root.perm-microphone != 2): Text {
+                            text: "💡 未授权项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。改完可能需要重启服务生效。";
+                            font-size: 11px;
+                            color: #b80;
+                            wrap: word-wrap;
+                            vertical-stretch: 0;
+                        }
+                        if root.perms-supported: HorizontalBox {
+                            spacing: 8px;
+                            vertical-stretch: 0;
+                            Text {
+                                text: "授权/改权限后，运行中的服务要重启才认：";
+                                font-size: 11px; color: #888; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1;
+                            }
+                            Button { text: "🔁 重启服务生效"; clicked => { root.restart-service-request(); } }
+                        }
+                        if !root.perms-supported: Text {
+                            text: "系统权限检测仅 macOS 需要（本机为其它系统）。";
+                            font-size: 11px;
+                            color: #888;
+                            wrap: word-wrap;
+                            vertical-stretch: 0;
+                        }
+
+                        Text {
+                            text: "说明：claude/codex 由「模型供应商配置」提供凭证，不再在运行期弹授权。nodejs 是 codex/lark-cli 的前置；接入飞书 bot 时会自动装 lark 技能。";
+                            font-size: 11px;
+                            color: #888;
+                            wrap: word-wrap;
+                            vertical-stretch: 0;
+                        }
+                    }
+                }
+            }
+
+            // ═══════════ Tab 3：模型供应商配置 ═══════════
+            Tab {
+                title: "模型供应商配置";
+                HorizontalBox {
+                    padding: 8px;
+                    spacing: 12px;
+
+                    // ── 左：供应商列表 ──
+                    VerticalBox {
+                        spacing: 8px;
+                        width: 160px;
+                        Rectangle {
+                            background: #00000010;
+                            border-radius: 6px;
+                            vertical-stretch: 1;
+                            ListView {
+                                for p[idx] in root.providers: Rectangle {
+                                    height: 40px;
+                                    background: idx == root.provider-selected ? #3a7bd5 : transparent;
+                                    border-radius: 4px;
+                                    TouchArea {
+                                        clicked => { root.provider-selected = idx; root.provider-selection-changed(idx); }
+                                        VerticalBox {
+                                            padding-left: 8px;
+                                            spacing: 2px;
+                                            Text {
+                                                text: (p.is-default ? "★ " : "") + (p.name == "" ? "(未命名)" : p.name);
+                                                color: idx == root.provider-selected ? white : black;
+                                                font-weight: 600;
+                                            }
+                                            Text {
+                                                text: p.kind + (p.is-default ? " · 默认" : "");
+                                                font-size: 11px;
+                                                color: idx == root.provider-selected ? #dde : #888;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalBox {
+                            spacing: 8px;
+                            Button { text: "＋ 添加"; clicked => { root.add-provider(); } }
+                            Button {
+                                text: "－ 删除";
+                                enabled: root.provider-selected >= 0;
+                                clicked => { root.remove-provider(root.provider-selected); }
+                            }
+                        }
+                    }
+
+                    // ── 右：编辑选中供应商 ──
+                    VerticalBox {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        ScrollView {
+                            vertical-stretch: 1;
+                            VerticalBox {
+                                spacing: 10px;
+                                alignment: start;
+                                GridBox {
+                                    spacing: 6px;
+                                    vertical-stretch: 0;
+
+                                    if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                        Text { text: "名称"; width: 96px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.providers[root.provider-selected].name;
+                                            placeholder-text: "唯一键，如 my-claude";
+                                            horizontal-stretch: 1;
+                                            edited => { root.provider-field-edited(root.provider-selected, "name", self.text); }
+                                        }
+                                    }
+                                    if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                        Text { text: "类型"; width: 96px; vertical-alignment: center; }
+                                        ComboBox {
+                                            model: ["anthropic", "openai-chat", "openai-responses"];
+                                            current-value: root.providers[root.provider-selected].kind;
+                                            horizontal-stretch: 1;
+                                            selected => { root.provider-field-edited(root.provider-selected, "kind", self.current-value); }
+                                        }
+                                    }
+                                    if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                        Text { text: "Base URL"; width: 96px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.providers[root.provider-selected].base-url;
+                                            placeholder-text: "如 https://api.anthropic.com 或 https://api.openai.com/v1";
+                                            horizontal-stretch: 1;
+                                            edited => { root.provider-field-edited(root.provider-selected, "base_url", self.text); }
+                                        }
+                                    }
+                                    if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                        Text { text: "API Key"; width: 96px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.providers[root.provider-selected].api-key;
+                                            input-type: password;
+                                            placeholder-text: "sk-...（留空=保留已存密钥）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.provider-field-edited(root.provider-selected, "api_key", self.text); }
+                                        }
+                                    }
+                                    if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                        Text { text: "模型"; width: 96px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.providers[root.provider-selected].model;
+                                            placeholder-text: "如 claude-sonnet-4-5 / gpt-5（空=后端默认）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.provider-field-edited(root.provider-selected, "model", self.text); }
+                                        }
+                                    }
+                                    if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                        Rectangle { width: 96px; }
+                                        HorizontalBox {
+                                            spacing: 8px;
+                                            Button {
+                                                text: root.providers[root.provider-selected].is-default ? "★ 已是默认" : "设为默认";
+                                                enabled: !root.providers[root.provider-selected].is-default;
+                                                clicked => { root.set-default-provider(root.provider-selected); }
+                                            }
+                                            Button { text: "测试连接"; clicked => { root.test-provider(root.provider-selected); } }
+                                        }
+                                    }
+                                }
+                                if root.provider-selected < 0: Text { text: "← 选择或添加一个供应商"; color: #888; }
+
+                                Text {
+                                    text: "只支持 Anthropic 原生（claude）与 OpenAI 兼容（codex：chat / responses 两种接口）。claude 后端需 anthropic 型，codex 后端需 openai 型。桥内配置优先于 CC Switch。";
+                                    font-size: 11px;
+                                    color: #888;
+                                    wrap: word-wrap;
+                                    vertical-stretch: 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 底部共享：状态行 + 保存/取消（钉底，三个 Tab 共用）──
+        Text { text: root.status-line; color: root.status-is-error ? #c00 : #2a7d2f; wrap: word-wrap; vertical-stretch: 0; }
+
+        HorizontalBox {
+            vertical-stretch: 0;
+            spacing: 8px;
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "取消"; clicked => { root.cancel-clicked(); } }
+            Button { text: "保存"; primary: true; clicked => { root.save-clicked(); } }
+        }
+    }
+    }   // 关闭根 Rectangle（包内容防塌缩）
+}
