@@ -6,6 +6,11 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// 进程内 config.json 写锁：save_owner/save_primary_chat 都是「读-改-写」整份文件，
+/// 多 bot/多消息并发时旧快照会互相覆盖（A 的 owner 被 B 覆盖 → 消息被静默丢弃）。
+/// 高频写方（service 内多个消息任务）先串行化；GUI 是独立进程，跨进程仍有极小竞态。
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::PathBuf;
 
@@ -378,6 +383,7 @@ impl Config {
         if chat_id.is_empty() {
             return;
         }
+        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
         if let Ok(mut c) = Config::load() {
             if let Some(b) = c.bots.iter_mut().find(|b| b.key() == bot_key) {
                 if b.primary_chat_id != chat_id {
@@ -395,6 +401,7 @@ impl Config {
         if owner.is_empty() {
             return;
         }
+        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
         if let Ok(mut c) = Config::load() {
             if let Some(b) = c.bots.iter_mut().find(|b| b.key() == bot_key) {
                 if b.owner_open_id != owner {

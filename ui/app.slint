@@ -7,6 +7,12 @@
 //   （appkit.rs 对 if/for 结构变化会 detach+重建 NSMenu，已实测生效）。故启停按钮用互斥 if。
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, GroupBox, ListView, Palette, TabWidget } from "std-widgets.slint";
 
+// 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
+export struct BotMenuRow {
+    title: string,
+    icon: image,
+}
+
 // 托盘：SystemTrayIcon 是内置元素（macOS → NSStatusItem）。
 export component Tray inherits SystemTrayIcon {
     // 托盘图标随整体状态变色：online=绿 / connecting=黄 / offline=红 / none=原灰白
@@ -17,7 +23,11 @@ export component Tray inherits SystemTrayIcon {
           @image-url("tray-dark.png");
     tooltip: "ABB";
 
-    in-out property <[string]> bots-list: [];   // 逐 bot 状态行（主菜单直接铺）
+    in-out property <[BotMenuRow]> bots-menu: [];  // 逐 bot 状态行（文字 + 状态图标）
+    in-out property <image> icon-online: @image-url("tray-green.png");
+    in-out property <image> icon-connecting: @image-url("tray-yellow.png");
+    in-out property <image> icon-offline: @image-url("tray-red.png");
+    in-out property <image> icon-disabled: @image-url("tray-gray.png");
     in-out property <bool> service-running: false;
     in-out property <bool> configured: false;
     in-out property <bool> autostart: false;
@@ -36,9 +46,9 @@ export component Tray inherits SystemTrayIcon {
 
     Menu {
         // Bot 状态：分区标题（仅在有 bot 时出现）+ 逐 bot 行直接铺在主菜单（不嵌套子菜单）。
-        if root.bots-list.length > 0: MenuItem { title: "Bot 状态"; enabled: false; }
-        for st in root.bots-list: MenuItem { title: st; enabled: false; }
-        if root.bots-list.length > 0: MenuSeparator {}
+        if root.bots-menu.length > 0: MenuItem { title: "Bot 状态"; enabled: false; }
+        for st in root.bots-menu: MenuItem { title: st.title; icon: st.icon; enabled: false; }
+        if root.bots-menu.length > 0: MenuSeparator {}
         // 启停互斥（结构性，见文件头注释：enabled 绑定不可靠，用 if 翻转重建）
         if !root.service-running: MenuItem { title: "启动"; activated => { root.start-service(); } }
         if root.service-running: MenuItem { title: "停止"; activated => { root.stop-service(); } }

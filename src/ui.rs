@@ -84,21 +84,24 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
     tray.set_service_running(st.running);
     // 各 bot 运行态（来自 service 心跳）
     let bots = crate::botstatus::snapshot();
-    // 逐 bot 状态（子菜单行）：带状态 emoji + 通道类型
-    let list: Vec<slint::SharedString> = bots
+    // 逐 bot 状态（子菜单行）：状态小圆点图标（与托盘图标同款配色）+ 通道类型
+    let rows: Vec<BotMenuRow> = bots
         .iter()
         .map(|b| {
             let icon = match b.conn.as_str() {
-                "在线" => "🟢",
-                "重连中" | "连接中" => "🟡",
-                "已停用" => "⚪", // 用户主动停用（非故障，不显红）
-                _ => "🔴", // 会话过期 / 离线 / 其它
+                "在线" => tray.get_icon_online(),
+                "重连中" | "连接中" => tray.get_icon_connecting(),
+                "已停用" => tray.get_icon_disabled(), // 用户主动停用（非故障，灰）
+                _ => tray.get_icon_offline(), // 会话过期 / 离线 / 其它
             };
             let label = display_name(&b.name, &b.kind);
-            format!("{icon} {label} · {} · {}", b.conn, kind_label(&b.kind)).into()
+            BotMenuRow {
+                title: format!("{label} · {} · {}", b.conn, kind_label(&b.kind)).into(),
+                icon,
+            }
         })
         .collect();
-    tray.set_bots_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(list))));
+    tray.set_bots_menu(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
     tray.set_configured(configured_cached());
     tray.set_autostart(platform::autostart_enabled());
 

@@ -141,10 +141,31 @@ impl Bridge {
                 crate::config::Config::save_owner(&self.bot.key(), sender_id);
             }
             if sender_id != *owner {
+                if !owner.is_empty() {
+                    crate::log!(
+                        "[bridge] 忽略非 owner 消息（bot={} sender={} chat_type={}）",
+                        self.bot.key(),
+                        sender_id,
+                        chat_type
+                    );
+                } else if chat_type != "p2p" {
+                    crate::log!(
+                        "[bridge] owner 未配置且非私聊，忽略（bot={} chat_type={} sender={}）；请先私聊 bot 自动设置 owner",
+                        self.bot.key(),
+                        chat_type,
+                        sender_id
+                    );
+                }
                 return;
             }
         }
         if chat_type == "group" && !self.bot_is_mentioned(&mentions) {
+            crate::log!(
+                "[bridge] 群聊未 @ 机器人，忽略（bot={} chat={} sender={}）",
+                self.bot.key(),
+                message["chat_id"].as_str().unwrap_or(""),
+                sender_id
+            );
             return;
         }
 
@@ -156,6 +177,11 @@ impl Bridge {
             .unwrap_or_else(|| raw.to_string());
         let text = text.trim().to_string();
         if text.is_empty() {
+            crate::log!(
+                "[bridge] 收到非文本消息，忽略（bot={} chat_type={}）",
+                self.bot.key(),
+                chat_type
+            );
             return;
         }
 
@@ -166,16 +192,34 @@ impl Bridge {
             text,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
+            crate::log!(
+                "[bridge] 消息缺 mid/chat_id，忽略（bot={} mid={} chat={}）",
+                self.bot.key(),
+                ev.mid,
+                ev.chat_id
+            );
             return;
         }
         self.handle(ev).await;
     }
 
     async fn handle(&self, ev: Ev) {
+        let t0 = std::time::Instant::now();
+        crate::log!(
+            "[bridge] 收到消息 bot={} chat={} mid={} text={:?}",
+            self.bot.key(),
+            &ev.chat_id[..ev.chat_id.len().min(12)],
+            &ev.mid[..ev.mid.len().min(12)],
+            crate::agent::truncate(&ev.text, 40)
+        );
         // mid 去重
         {
             let mut seen = self.seen.lock().unwrap();
             if seen.contains(&ev.mid) {
+                crate::log!(
+                    "[bridge] 重复消息跳过（mid={}）",
+                    &ev.mid[..ev.mid.len().min(12)]
+                );
                 return;
             }
             seen.insert(ev.mid.clone());
@@ -225,6 +269,14 @@ impl Bridge {
         // 先从 std Mutex 取出该 chat 的锁 Arc（短持 std 锁），再 await 异步锁。
         let chat_lock = self.chat_lock(&ev.chat_id);
         let _serial_guard = chat_lock.lock().await;
+        if t0.elapsed().as_millis() > 50 {
+            crate::log!(
+                "[bridge] 排队等待处理 {}ms（bot={} chat={}）",
+                t0.elapsed().as_millis(),
+                self.bot.key(),
+                &ev.chat_id[..ev.chat_id.len().min(12)]
+            );
+        }
 
         // 会话快照必须在**拿到锁之后**取：锁外取的话，首轮 agent 还在跑时到达的第二条消息
         // 会读到过期的 started=false —— claude 侧对同一 UUID 再 --session-id 报「already in use」，
