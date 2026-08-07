@@ -1,6 +1,6 @@
 //! 配置 —— 读写 ~/.agent-bridge/config.json（0600）。多 bot 结构。
 //!
-//! 新 schema：{owner_open_id, default_backend, bots:[{name, kind, enabled, backend, app_id, app_secret, bot_name, bot_open_id, primary_chat_id, wx_*}]}
+//! 新 schema：{owner_open_id, default_backend, bots:[{name, kind, enabled, backend, app_id, app_secret, bot_name, bot_open_id, primary_chat_id, wx_*, ding_*}]}
 //! backend 是 per-bot 默认后端（空=跟随全局 default_backend）。
 //! 兼容：load() 自动把旧单 bot 字段（顶层 app_id/app_secret/bot_name/bot_open_id）迁移成 bots[0]。
 
@@ -15,7 +15,7 @@ pub struct BotConfig {
     /// 隔离名（目录名）。空则用 app_id 尾 6 位兜底，保证唯一且文件系统安全。
     #[serde(default)]
     pub name: String,
-    /// bot 类型：feishu（默认）| wechat
+    /// bot 类型：feishu（默认）| wechat | dingtalk
     #[serde(default = "default_kind")]
     pub kind: String,
     /// 是否启用。false 时 service 不启动此 bot（仍在设置窗显示，可重新启用）。
@@ -51,6 +51,14 @@ pub struct BotConfig {
     /// 微信：登录拿到的 ilink_user_id（owner 的微信标识；微信侧 should_respond 判据）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wx_user_id: String,
+    /// 钉钉：允许响应的用户 staffId（owner 过滤；空 = 响应所有发来消息的人）。
+    /// 与飞书 owner_open_id、微信 wx_user_id 同职责，只是钉钉的用户标识格式。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ding_user_id: String,
+    /// 钉钉：机器人编码（RobotCode）。企业内部应用机器人通常 = AppKey，个别后台单独展示时填它。
+    /// 空 = 发送时用 app_id 兜底（对绝大多数企业内部应用机器人成立）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ding_robot_code: String,
     /// 该 bot 的模型供应商名（指向 Config.providers[].name）。空 = 跟随全局 default_provider。
     /// per-bot 独立：不同 bot 可走不同 key/模型（如飞书用官方 key、微信用 deepseek）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -75,6 +83,8 @@ impl Default for BotConfig {
             wx_token: String::new(),
             wx_base_url: String::new(),
             wx_user_id: String::new(),
+            ding_user_id: String::new(),
+            ding_robot_code: String::new(),
             provider: String::new(),
         }
     }
@@ -108,8 +118,14 @@ impl BotConfig {
         self.kind == "wechat"
     }
 
+    /// 是否钉钉通道。
+    pub fn is_dingtalk(&self) -> bool {
+        self.kind == "dingtalk"
+    }
+
     /// 凭证是否齐备可跑（单一事实源：service 启动门槛 + Config::missing 都用它）。
-    /// 飞书要 app_id+app_secret；微信要 wx_token+wx_user_id（扫码登录拿到）。
+    /// 飞书要 app_id+app_secret；微信要 wx_token+wx_user_id（扫码登录拿到）；
+    /// 钉钉要 app_id（AppKey）+app_secret（AppSecret）。
     pub fn credentials_ready(&self) -> bool {
         if self.is_wechat() {
             !self.wx_token.is_empty() && !self.wx_user_id.is_empty()
@@ -128,6 +144,13 @@ impl BotConfig {
             if self.wx_user_id.is_empty() {
                 v.push("wx_user_id（微信需先扫码登录）".to_string());
             }
+        } else if self.is_dingtalk() {
+            if self.app_id.is_empty() {
+                v.push("app_id（钉钉 AppKey）".to_string());
+            }
+            if self.app_secret.is_empty() {
+                v.push("app_secret（钉钉 AppSecret）".to_string());
+            }
         } else {
             if self.app_id.is_empty() {
                 v.push("app_id".to_string());
@@ -142,6 +165,21 @@ impl BotConfig {
     /// 微信侧的 owner 判据：微信登录拿到的 ilink_user_id（should_respond 用它比对 from_user_id）。
     pub fn wx_owner(&self) -> &str {
         &self.wx_user_id
+    }
+
+    /// 钉钉侧的 owner 判据：允许响应的用户 staffId（should_respond 用它比对 senderStaffId）。
+    /// 空 = 不设限（响应所有能发消息给机器人的人）。
+    pub fn ding_owner(&self) -> &str {
+        &self.ding_user_id
+    }
+
+    /// 钉钉发送用的机器人编码：显式配置优先，否则回落 AppKey（企业内部应用机器人默认相同）。
+    pub fn ding_robot_code(&self) -> &str {
+        if self.ding_robot_code.is_empty() {
+            &self.app_id
+        } else {
+            &self.ding_robot_code
+        }
     }
 
     /// 该 bot 的生效后端：自身 backend 非空用之，否则回落全局默认。返回值保证是 claude/codex。
@@ -301,7 +339,7 @@ impl Config {
                     continue; // 停用的 bot 不参与就绪判断（可能正因凭证不齐而停用）
                 }
                 any_enabled = true;
-                if !b.is_wechat() {
+                if b.kind == "feishu" {
                     has_feishu = true;
                 }
                 for f in b.missing_fields() {
@@ -318,7 +356,7 @@ impl Config {
             let feishu_owner_missing = self
                 .bots
                 .iter()
-                .filter(|b| b.enabled && !b.is_wechat())
+                .filter(|b| b.enabled && b.kind == "feishu")
                 .any(|b| b.effective_owner(&self.owner_open_id).is_empty());
             if feishu_owner_missing {
                 v.push("owner_open_id（飞书 bot 需配 owner）".to_string());
@@ -438,10 +476,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(c3
-            .missing()
-            .iter()
-            .any(|m| m.contains("owner_open_id")));
+        assert!(c3.missing().iter().any(|m| m.contains("owner_open_id")));
         // 纯微信 bot：不需要飞书 owner_open_id，但要 wx_token + wx_user_id
         let c4 = Config {
             bots: vec![BotConfig {
@@ -462,6 +497,79 @@ mod tests {
             ..Default::default()
         };
         assert!(c5.missing().iter().any(|s| s.contains("wx_token")));
+    }
+
+    #[test]
+    fn dingtalk_config() {
+        // 钉钉 bot：app_id/app_secret 齐了就 configured；不强制飞书 owner_open_id
+        let c = Config {
+            bots: vec![BotConfig {
+                kind: "dingtalk".into(),
+                app_id: "dingappkey".into(),
+                app_secret: "sec".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(c.is_configured(), "纯钉钉 bot 不应要求飞书字段");
+        assert!(c.bots[0].is_dingtalk());
+        assert!(c.bots[0].credentials_ready());
+
+        // 缺 secret → 不 configured，错误信息点名 app_secret
+        let c2 = Config {
+            bots: vec![BotConfig {
+                kind: "dingtalk".into(),
+                app_id: "dingappkey".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(c2.missing().iter().any(|m| m.contains("app_secret")));
+
+        // robotCode 回落 AppKey；显式配置优先
+        let b = BotConfig {
+            kind: "dingtalk".into(),
+            app_id: "dingappkey".into(),
+            ..Default::default()
+        };
+        assert_eq!(b.ding_robot_code(), "dingappkey");
+        let b2 = BotConfig {
+            kind: "dingtalk".into(),
+            app_id: "dingappkey".into(),
+            ding_robot_code: "dingrobot".into(),
+            ..Default::default()
+        };
+        assert_eq!(b2.ding_robot_code(), "dingrobot");
+
+        // 混合配置：飞书 bot 有 owner + 钉钉 bot 无 owner → 仍 configured（owner 要求只落在飞书 bot 上）
+        let mixed = Config {
+            owner_open_id: "ou_owner".into(),
+            bots: vec![
+                BotConfig {
+                    kind: "feishu".into(),
+                    app_id: "a".into(),
+                    app_secret: "s".into(),
+                    ..Default::default()
+                },
+                BotConfig {
+                    kind: "dingtalk".into(),
+                    app_id: "dingappkey".into(),
+                    app_secret: "sec".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(mixed.is_configured());
+
+        // ding_user_id 缺省空 = 不设限
+        let b3: BotConfig = serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x"}"#).unwrap();
+        assert_eq!(b3.ding_owner(), "");
+        // 序列化兼容：新字段不写旧 config 不报错
+        let b4: BotConfig =
+            serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x","app_secret":"s"}"#).unwrap();
+        assert!(b4.ding_user_id.is_empty());
+        assert!(b4.ding_robot_code.is_empty());
     }
 
     #[test]
