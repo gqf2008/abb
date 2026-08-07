@@ -35,7 +35,7 @@ enum UiCmd {
         idx: i32,
         bot_key: String,
     },
-    /// 安装某个依赖（claude/codex/node/python3/lark-cli）。结果经 dep_rx 回主线程。
+    /// 安装某个依赖（claude/codex/node/python3/lark-cli/dingtalk-cli）。结果经 dep_rx 回主线程。
     InstallDep(String),
     /// 测试某个供应商连通性（快照里 api_key 已就绪）。结果经 prov_rx 回主线程。
     TestProvider {
@@ -228,7 +228,7 @@ fn sync_providers_model(
     );
 }
 
-/// 跑一次依赖检测并把全部 5 项状态回填到设置窗（claude/codex/node/python3/lark-cli）。
+/// 跑一次依赖检测并把全部 6 项状态回填到设置窗（claude/codex/node/python3/lark-cli/dingtalk-cli）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
     let get = |id: &str| all.iter().find(|d| d.id == id).map(|d| d.found).unwrap_or(false);
@@ -237,6 +237,7 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_node_installed(get("node"));
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
+    w.set_dingtalk_installed(get("dingtalk-cli"));
 }
 
 /// 把系统权限状态回填到设置窗（0=未授权 1=被拒绝 2=已授权）。
