@@ -290,18 +290,22 @@ async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receive
     }
 }
 
-/// 执行一个到点任务：跑 claude（全新会话，不带聊天上下文）→ 回发飞书；once 任务执行后删除。
+/// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发飞书；once 任务执行后删除。
 /// 回发优先发任务原会话；若该会话已失效（群解散/bot 被移出等），回落到主会话（私聊，必存在）。
 async fn run_job(bridge: Arc<Bridge>, job: crate::schedule::Job) {
     let bot_key = bridge.bot.key();
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
+    // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
+    // 与聊天消息同一后端，避免「聊天走 codex、定时任务却跑 claude」的割裂。
+    let backend = crate::agent::Backend::parse(&bridge.default_backend);
     crate::log!(
-        "[bot:{bot_key}] 触发任务 {} → {}",
+        "[bot:{bot_key}] 触发任务 {} → {}（backend: {}）",
         &job.id[..8],
-        prompt_preview
+        prompt_preview,
+        backend.name()
     );
     let reply = match crate::agent::run(
-        crate::agent::Backend::Claude,
+        backend,
         &job.prompt,
         &uuid::Uuid::new_v4().to_string(), // 每次全新 session，不带聊天上下文
         false,
