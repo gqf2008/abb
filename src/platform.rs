@@ -29,9 +29,12 @@ pub fn open_url(url: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        // start 把首个带引号参数当窗口标题，故先给空标题再给 url
+        use std::os::windows::process::CommandExt;
+        // start 把首个带引号参数当窗口标题，故先给空标题再给 url；
+        // CREATE_NO_WINDOW 避免 cmd 闪控制台。
         let _ = std::process::Command::new("cmd")
             .args(["/c", "start", "", url])
+            .creation_flags(0x0800_0000)
             .spawn();
     }
     #[cfg(target_os = "linux")]
@@ -297,14 +300,48 @@ fn login_item_plist() -> PathBuf {
         .join("Library/LaunchAgents/com.sqb.agent-bridge.gui.plist")
 }
 
-// ── Windows / Linux stub（跨平台占位，后续实现）──
+// ── Windows：登录自启 = HKCU Run 键 ──
+// 值名 ABB，值 = "C:\...\ABB.exe"（带引号）。GUI 每次刷新读 Run 键决定菜单显「开/关」。
+#[cfg(target_os = "windows")]
+const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
+const AUTOSTART_VALUE: &str = "ABB";
+
+/// 跑 reg.exe（CREATE_NO_WINDOW：GUI 进程 spawn 控制台程序不弹窗）。
+#[cfg(target_os = "windows")]
+fn run_reg(args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("reg")
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .output()
+}
+
 #[cfg(target_os = "windows")]
 pub fn autostart_enabled() -> bool {
-    false // TODO: 注册表 HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+    run_reg(&["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
+
 #[cfg(target_os = "windows")]
-pub fn set_autostart(_enable: bool) -> Result<()> {
-    anyhow::bail!("Windows 登录项自启尚未实现")
+pub fn set_autostart(enable: bool) -> Result<()> {
+    let exe = current_exe()?;
+    let out = if enable {
+        let val = format!("\"{}\"", exe.display());
+        run_reg(&[
+            "add", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/t", "REG_SZ", "/d", &val, "/f",
+        ])
+    } else {
+        run_reg(&["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
+    }
+    .context("reg 命令执行失败")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("设置开机自启失败: {}", msg.trim())
+    }
 }
 #[cfg(target_os = "linux")]
 pub fn autostart_enabled() -> bool {

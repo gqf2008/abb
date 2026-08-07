@@ -17,7 +17,7 @@ pub struct Bridge {
     /// 本 bot 的配置（app_id/bot_name/bot_open_id/primary_chat_id/wx_*…）
     pub bot: BotConfig,
     /// 全局：只响应这个 owner（飞书 open_id）
-    pub owner_open_id: String,
+    pub owner_open_id: Mutex<String>,
     /// 全局：默认后端（SessionStore 已按它初始化；字段保留以便将来逐 bot 覆盖）
     #[allow(dead_code)]
     pub default_backend: String,
@@ -50,7 +50,7 @@ impl Bridge {
             sessions,
             jobs: JobStore::new(&bot.key()),
             // owner 也是 per-bot（飞书 bot 各自配，微信用 wx_user_id 不走这）；空则回落全局 owner_open_id。
-            owner_open_id: bot.effective_owner(&cfg.owner_open_id).to_string(),
+            owner_open_id: Mutex::new(bot.effective_owner(&cfg.owner_open_id).to_string()),
             default_backend: effective,
             bot,
             seen: Mutex::new(HashSet::new()),
@@ -127,9 +127,22 @@ impl Bridge {
             crate::log!("[群] bot@={}", self.bot_is_mentioned(&mentions));
         }
 
-        // should_respond
-        if sender_id != self.owner_open_id {
-            return;
+        // should_respond：owner 未配置时，把第一条私聊（p2p）的发送者自动设为 owner 并落盘，
+        // 之后只响应 ta（群聊不自动学习，避免随便一个群成员认领）。
+        {
+            let mut owner = self.owner_open_id.lock().unwrap();
+            if owner.is_empty() && chat_type == "p2p" && !sender_id.is_empty() {
+                *owner = sender_id.to_string();
+                crate::log!(
+                    "[bridge] 未配置 owner，自动把首个私聊用户设为 owner（bot={}）: {}",
+                    self.bot.key(),
+                    sender_id
+                );
+                crate::config::Config::save_owner(&self.bot.key(), sender_id);
+            }
+            if sender_id != *owner {
+                return;
+            }
         }
         if chat_type == "group" && !self.bot_is_mentioned(&mentions) {
             return;

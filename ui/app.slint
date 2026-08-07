@@ -9,7 +9,12 @@ import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, Horizont
 
 // 托盘：SystemTrayIcon 是内置元素（macOS → NSStatusItem）。
 export component Tray inherits SystemTrayIcon {
-    icon: @image-url("tray-dark.png");
+    // 托盘图标随整体状态变色：online=绿 / connecting=黄 / offline=红 / none=原灰白
+    in-out property <string> tray-status: "none";
+    icon: root.tray-status == "online" ? @image-url("tray-green.png") :
+          root.tray-status == "connecting" ? @image-url("tray-yellow.png") :
+          root.tray-status == "offline" ? @image-url("tray-red.png") :
+          @image-url("tray-dark.png");
     tooltip: "ABB";
 
     in-out property <[string]> bots-list: [];   // 逐 bot 状态行（主菜单直接铺）
@@ -340,7 +345,7 @@ export component SettingsWindow inherits Window {
                                         Text { text: "Owner"; width: 88px; vertical-alignment: center; }
                                         LineEdit {
                                             text: root.bots[root.selected].owner-open-id;
-                                            placeholder-text: "ou_xxx（只响应这个人）";
+                                            placeholder-text: "ou_xxx（留空=首个私聊自动设置）";
                                             horizontal-stretch: 1;
                                             edited => { root.bot-field-edited(root.selected, "owner", self.text); }
                                         }

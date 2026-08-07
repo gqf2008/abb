@@ -329,7 +329,6 @@ impl Config {
     /// 缺哪些必填项（缺则服务不能跑）。
     pub fn missing(&self) -> Vec<String> {
         let mut v = Vec::new();
-        let mut has_feishu = false;
         let mut any_enabled = false;
         if self.bots.is_empty() {
             v.push("bots（至少配一个）".to_string());
@@ -339,9 +338,6 @@ impl Config {
                     continue; // 停用的 bot 不参与就绪判断（可能正因凭证不齐而停用）
                 }
                 any_enabled = true;
-                if b.kind == "feishu" {
-                    has_feishu = true;
-                }
                 for f in b.missing_fields() {
                     v.push(format!("bots[{i}].{f}"));
                 }
@@ -350,18 +346,8 @@ impl Config {
                 v.push("bots（至少启用一个）".to_string());
             }
         }
-        // owner_open_id 是飞书概念；只要求「启用的飞书 bot」的生效 owner 非空（per-bot 优先，回落全局）。
-        // 微信 bot 不看这个（用各自 wx_user_id）。
-        if has_feishu {
-            let feishu_owner_missing = self
-                .bots
-                .iter()
-                .filter(|b| b.enabled && b.kind == "feishu")
-                .any(|b| b.effective_owner(&self.owner_open_id).is_empty());
-            if feishu_owner_missing {
-                v.push("owner_open_id（飞书 bot 需配 owner）".to_string());
-            }
-        }
+        // owner_open_id 不再作为启动门槛：缺省时桥在收到第一条私聊后自动学习并落盘
+        // （bridge::on_payload）。飞书之外的通道（微信/钉钉）用各自身份，不看这个。
         v
     }
 
@@ -399,6 +385,29 @@ impl Config {
                     if let Err(e) = c.save() {
                         crate::log!("[config] 保存 primary_chat_id 失败: {e:#}");
                     }
+                }
+            }
+        }
+    }
+
+    /// 自动学习 owner：收到第一条私聊时，把发送者 open_id 存为该 bot 的 owner（变化才落盘）。
+    pub fn save_owner(bot_key: &str, owner: &str) {
+        if owner.is_empty() {
+            return;
+        }
+        if let Ok(mut c) = Config::load() {
+            if let Some(b) = c.bots.iter_mut().find(|b| b.key() == bot_key) {
+                if b.owner_open_id != owner {
+                    b.owner_open_id = owner.to_string();
+                    if let Err(e) = c.save() {
+                        crate::log!("[config] 保存 owner_open_id 失败: {e:#}");
+                    }
+                }
+            } else if c.owner_open_id != owner {
+                // 找不到 bot（理论上不会）→ 回落全局
+                c.owner_open_id = owner.to_string();
+                if let Err(e) = c.save() {
+                    crate::log!("[config] 保存全局 owner_open_id 失败: {e:#}");
                 }
             }
         }
@@ -453,7 +462,7 @@ mod tests {
 
     #[test]
     fn missing_detection() {
-        // 空配置：缺 bot；owner_open_id 只在有飞书 bot 时才强制
+        // 空配置：缺 bot
         let c = Config::default();
         assert!(c.missing().iter().any(|s| s.starts_with("bots")));
         // 飞书 bot：app_id/secret/owner_open_id 齐了就 configured
@@ -467,7 +476,7 @@ mod tests {
             ..Default::default()
         };
         assert!(c2.is_configured());
-        // 飞书 bot 缺 owner_open_id → 不 configured
+        // 飞书 bot 缺 owner_open_id → 仍 configured（owner 由首个私聊自动学习）
         let c3 = Config {
             bots: vec![BotConfig {
                 app_id: "a".into(),
@@ -476,7 +485,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(c3.missing().iter().any(|m| m.contains("owner_open_id")));
+        assert!(c3.is_configured(), "缺 owner 不应阻止启动");
         // 纯微信 bot：不需要飞书 owner_open_id，但要 wx_token + wx_user_id
         let c4 = Config {
             bots: vec![BotConfig {
