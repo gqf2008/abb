@@ -126,9 +126,9 @@ fn push_settings_status(settings: &SettingsWindow, st: &install::ServiceStatus) 
     let bots = crate::botstatus::snapshot();
     let online = bots.iter().filter(|b| b.conn == "在线").count();
     let title = if bots.is_empty() {
-        "Agent Bridge 设置".to_string()
+        "ABB 设置".to_string()
     } else {
-        format!("Agent Bridge 设置 — {} 个 bot · {} 在线", bots.len(), online)
+        format!("ABB 设置 — {} 个 bot · {} 在线", bots.len(), online)
     };
     settings.set_window_title(title.into());
     let line = if !st.running {
