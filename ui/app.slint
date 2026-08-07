@@ -140,6 +140,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> node-installed: false;
     in-out property <bool> python-installed: false;
     in-out property <bool> lark-installed: false;
+    in-out property <bool> dingtalk-installed: false; // dingtalk-cli (dws)
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
 
@@ -179,7 +180,7 @@ export component SettingsWindow inherits Window {
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
     callback recheck-deps();            // 重新检测依赖是否已装
-    callback install-dep(string);       // 安装某个依赖（claude/codex/node/python3/lark-cli）
+    callback install-dep(string);       // 安装某个依赖（claude/codex/node/python3/lark-cli/dingtalk-cli）
     callback open-perm-settings(string); // 打开某项系统权限对应的设置面板（full-disk/accessibility/screen/automation）
     callback request-perms();           // 触发屏幕录制/摄像头/麦克风授权弹框（拉起子进程逐项请求）
     callback restart-service-request(); // 环境 Tab 授权后一键重启服务（权限对运行中进程不实时刷新）
@@ -564,6 +565,25 @@ export component SettingsWindow inherits Window {
                             if !root.lark-installed: Row {
                                 Rectangle { width: 96px; }
                                 LineEdit { text: "npm install -g @larksuite/cli"; read-only: true; horizontal-stretch: 1; }
+                            }
+
+                            // dingtalk-cli（接入钉钉 bot 用；命令名 dws = dingtalk-workspace-cli）
+                            Row {
+                                Text { text: "dingtalk-cli"; width: 96px; vertical-alignment: center; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: root.dingtalk-installed ? "🟢 已安装" : "🔴 未安装"; vertical-alignment: center; horizontal-stretch: 1; }
+                                    if !root.dingtalk-installed: Button {
+                                        text: "安装";
+                                        enabled: root.dep-busy == "";
+                                        clicked => { root.install-dep("dingtalk-cli"); }
+                                    }
+                                    if !root.dingtalk-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
+                                }
+                            }
+                            if !root.dingtalk-installed: Row {
+                                Rectangle { width: 96px; }
+                                LineEdit { text: "npm install -g dingtalk-workspace-cli"; read-only: true; horizontal-stretch: 1; }
                             }
                         }
 
