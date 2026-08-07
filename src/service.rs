@@ -14,6 +14,8 @@ pub async fn run() {
         Ok(c) => c,
         Err(e) => {
             crate::log!("[service] config.json 读取失败: {e:#}");
+            // 配置不可用 → 清「期望运行」标记，看门狗停止自动重拉（否则每 2s 拉起即退死循环）
+            crate::install::set_desired(false);
             std::process::exit(1);
         }
     };
@@ -24,6 +26,8 @@ pub async fn run() {
             missing.join(", "),
             Config::path().display()
         );
+        // 配置不可用 → 清「期望运行」标记，看门狗停止自动重拉
+        crate::install::set_desired(false);
         std::process::exit(1);
     }
     crate::log!(
@@ -51,13 +55,21 @@ pub async fn run() {
     // stop 信号通道：SIGTERM/SIGINT → true（所有 bot 共享）
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).ok();
-        let mut int = signal(SignalKind::interrupt()).ok();
-        tokio::select! {
-            _ = async { if let Some(t)=term.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
-            _ = async { if let Some(t)=int.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
-            _ = tokio::signal::ctrl_c() => {}
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).ok();
+            let mut int = signal(SignalKind::interrupt()).ok();
+            tokio::select! {
+                _ = async { if let Some(t)=term.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
+                _ = async { if let Some(t)=int.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 无 SIGTERM/SIGINT 语义：Ctrl+C/关闭控制台即优雅退出
+            let _ = tokio::signal::ctrl_c().await;
         }
         crate::log!("[service] 收到退出信号");
         let _ = stop_tx.send(true);
@@ -90,6 +102,8 @@ pub async fn run() {
     }
     if handles.is_empty() {
         crate::log!("[service] 没有可用 bot，退出");
+        // 无可跑 bot（全部停用/凭证不齐）→ 清「期望运行」标记，看门狗停止自动重拉
+        crate::install::set_desired(false);
         std::process::exit(1);
     }
     // 等所有 bot 循环结束（正常只有 stop 才会结束）
