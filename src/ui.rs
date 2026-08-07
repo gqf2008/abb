@@ -56,12 +56,22 @@ enum WxEvt {
     Failed(String),
 }
 
+/// 通道类型的中文显示名（托盘/设置窗概览行；原始 kind 值对内，展示用中文）。
+fn kind_label(kind: &str) -> String {
+    match kind {
+        "feishu" => "飞书".to_string(),
+        "wechat" => "微信".to_string(),
+        "dingtalk" => "钉钉".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// 把已查好的服务状态写进 Tray 属性。主线程调用（status 由调用方查，避免重复 fork ps）。
 /// 托盘菜单里 bot 的显示名：空名回落通道类型；过长（如微信「微信 {完整 ilink user_id}」）
 /// 截断加省略号，否则会把原生 NSMenu 撑得过宽。完整名仍在设置窗/配置里。
 fn display_name(name: &str, kind: &str) -> String {
     const MAX: usize = 16;
-    let base = if name.is_empty() { kind.to_string() } else { name.to_string() };
+    let base = if name.is_empty() { kind_label(kind) } else { name.to_string() };
     let chars: Vec<char> = base.chars().collect();
     if chars.len() <= MAX {
         base
@@ -85,7 +95,7 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
                 _ => "🔴", // 会话过期 / 离线 / 其它
             };
             let label = display_name(&b.name, &b.kind);
-            format!("{icon} {label} · {} · {}", b.conn, b.kind).into()
+            format!("{icon} {label} · {} · {}", b.conn, kind_label(&b.kind)).into()
         })
         .collect();
     tray.set_bots_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(list))));
@@ -187,6 +197,8 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         bot_open_id: b.bot_open_id.clone().into(),
         // per-bot 供应商名（""=跟随全局默认），直接显示原值（下拉第一项是 ""）
         provider: b.provider.clone().into(),
+        ding_user_id: b.ding_user_id.clone().into(),
+        ding_robot_code: b.ding_robot_code.clone().into(),
     }
 }
 
@@ -427,8 +439,8 @@ pub fn run_gui() -> Result<()> {
                             install::svc_restart();
                         }
                         // 接入飞书 bot → 后台自动装 lark-cli + lark 技能（幂等/best-effort）。
-                        // GUI 路径免等 service 重启；装不上只 log 警告。
-                        if res.is_ok() && cfg.bots.iter().any(|b| b.enabled && !b.is_wechat()) {
+                        // GUI 路径免等 service 重启；装不上只 log 警告。只对飞书 bot 触发。
+                        if res.is_ok() && cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
                             tokio::spawn(async { crate::larkskills::ensure_lark_setup().await });
                         }
                         let tw = tray_weak_bg.clone();
@@ -593,6 +605,8 @@ pub fn run_gui() -> Result<()> {
                     "owner" => bot.owner_open_id = value.trim().to_string(),
                     "app_id" => bot.app_id = value.trim().to_string(),
                     "app_secret" => bot.app_secret = value.trim().to_string(),
+                    "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
+                    "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
                     _ => {}
                 }
             }

@@ -54,7 +54,7 @@ export component Tray inherits SystemTrayIcon {
 // 单个 bot 行的数据（与 Rust 侧 BotRow 对应）
 export struct BotRow {
     name: string,        // 显示名
-    kind: string,        // feishu | wechat
+    kind: string,        // feishu | wechat | dingtalk
     enabled: bool,       // 是否启用（false 则 service 不启动此 bot）
     backend: string,     // 该 bot 的默认后端 claude | codex（跟着 bot 走，不是全局）
     provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
@@ -63,6 +63,8 @@ export struct BotRow {
     app-secret: string,
     bot-name: string,    // 运行时获取的 bot 名
     bot-open-id: string,
+    ding-user-id: string,    // 钉钉：只响应这个用户 staffId（空=不设限）
+    ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -304,7 +306,7 @@ export component SettingsWindow inherits Window {
                                     if root.selected >= 0 && root.selected < root.bots.length: Row {
                                         Text { text: "类型"; width: 88px; vertical-alignment: center; }
                                         ComboBox {
-                                            model: ["feishu", "wechat"];
+                                            model: ["feishu", "wechat", "dingtalk"];
                                             current-value: root.bots[root.selected].kind;
                                             horizontal-stretch: 1;
                                             selected => { root.bot-field-edited(root.selected, "kind", self.current-value); }
@@ -385,6 +387,55 @@ export component SettingsWindow inherits Window {
                                     if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
                                         Rectangle { width: 88px; }
                                         Button { text: "📱 扫码登录微信"; clicked => { root.wx-login(root.selected); } }
+                                    }
+
+                                    // ── 钉钉字段（企业内部应用机器人，Stream 模式长连接，无需公网地址）──
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                        Text { text: "App Key"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].app-id;
+                                            placeholder-text: "钉钉应用 AppKey（dingxxxx）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                        Text { text: "App Secret"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].app-secret;
+                                            input-type: password;
+                                            placeholder-text: "钉钉应用 AppSecret";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                        Text { text: "机器人编码"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].ding-robot-code;
+                                            placeholder-text: "留空=默认 AppKey（个别后台单独展示才填）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "ding_robot_code", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                        Text { text: "允许用户"; width: 88px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].ding-user-id;
+                                            placeholder-text: "钉钉用户 staffId（留空=响应所有人，建议填）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "ding_user_id", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                        Rectangle { width: 88px; }
+                                        Text {
+                                            text: "要求：企业自建应用已添加「机器人」能力，消息接收模式选 Stream 模式；群聊需 @ 机器人。";
+                                            font-size: 11px;
+                                            color: #888;
+                                            wrap: word-wrap;
+                                            vertical-alignment: center;
+                                        }
                                     }
                                 }
 
