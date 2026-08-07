@@ -442,6 +442,14 @@ async fn run_once(
         }
     };
 
+    // Windows：GUI 子系统进程 spawn 控制台子进程（claude/codex）会弹新控制台窗口，
+    // CREATE_NO_WINDOW 让子进程无窗口运行（stdout/stderr 仍走管道，功能不受影响）。
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.as_std_mut().creation_flags(0x0800_0000);
+    }
+
     // claude 和 codex 统一收进 ~/.agent-bridge/workspace（用户拍板 2026-08-05）：
     // 在飞书里不区分后端，哪个 agent 工作目录都该受控，而不是 codex 仍在 home。
     cmd.current_dir(workspace)

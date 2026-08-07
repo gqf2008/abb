@@ -217,6 +217,12 @@ async fn run(
 ) -> Result<String, String> {
     let path = crate::deps::find_in_path(prog).ok_or_else(|| format!("找不到 {prog}"))?;
     let mut cmd = tokio::process::Command::new(path);
+    // Windows：避免 npm/npx/git 子进程弹控制台窗口
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.as_std_mut().creation_flags(0x0800_0000);
+    }
     cmd.args(args)
         .env("PATH", crate::deps::composed_path())
         .env("CI", "1") // 双保险防交互

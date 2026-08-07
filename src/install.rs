@@ -181,9 +181,11 @@ fn terminate(pid: u32) {
     }
     #[cfg(not(unix))]
     {
-        // Windows：taskkill（stub）
+        // Windows：taskkill（stub）；CREATE_NO_WINDOW 避免停服务时闪控制台
+        use std::os::windows::process::CommandExt;
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
+            .creation_flags(0x0800_0000)
             .spawn();
     }
 }

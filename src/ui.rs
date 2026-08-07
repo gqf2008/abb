@@ -101,6 +101,23 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
     tray.set_bots_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(list))));
     tray.set_configured(configured_cached());
     tray.set_autostart(platform::autostart_enabled());
+
+    // 托盘图标整体状态：所有启用 bot 在线=绿；有在连/重连=黄；有离线/会话过期=红；
+    // 未跑服务、无 bot 或全部停用=原灰（不显红吓人）。
+    let active: Vec<&crate::botstatus::BotStatus> = bots
+        .iter()
+        .filter(|b| b.conn != "已停用")
+        .collect();
+    let status = if !st.running || active.is_empty() {
+        "none"
+    } else if active.iter().any(|b| b.conn == "连接中" || b.conn == "重连中") {
+        "connecting"
+    } else if active.iter().all(|b| b.conn == "在线") {
+        "online"
+    } else {
+        "offline"
+    };
+    tray.set_tray_status(status.into());
 }
 
 /// 把 service 状态同步到设置窗：动态标题（带 bot 数）+ 顶部运行概览行。
