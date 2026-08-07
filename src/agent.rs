@@ -37,23 +37,30 @@ impl Backend {
 }
 
 /// 在每个 bot 的 workspace 里放指引（claude 读 CLAUDE.md、codex 读 AGENTS.md）。
-/// 关键：告诉 agent 定时/周期需求要用 `agent-bridge job` CLI 建任务后**立即退出**，
-/// 别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。幂等：已存在则不覆盖（用户可自定义）。
+/// 关键：告诉 agent 定时/周期需求要用桥注入的 `$ABB_BIN`（本程序绝对路径）调 job CLI 建任务后
+/// **立即退出**，别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。
+/// 版本化（GUIDE_MARKER）：老工作区里无标记的旧模板（写死 `agent-bridge job`、实际在
+/// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
+const GUIDE_MARKER: &str = "abb-guide-v2";
+
 fn ensure_workspace_guide(workspace: &std::path::Path) {
-    let guide = "# ABB 工作区
+    let guide = format!(
+        "# ABB 工作区（{GUIDE_MARKER}）
 
 你在飞书/微信/钉钉 bot 的工作区里。用户消息从飞书/微信/钉钉转来；你的 stdout 末尾会作为回复发回给用户。
 
-## 定时 / 周期 / 延迟任务 → 用 job CLI，建完即退出
+## 定时任务 → 用 $ABB_BIN 建任务，建完即退出
 
 用户说「每天 X 点」「每 N 分钟」「到点提醒」「稍后」「工作日」等周期或延迟需求时，
-**用本机 `agent-bridge job` CLI 建定时任务，建完就结束**。绝不要自己写 sleep/while 循环
-去等待——那会一直占着这个聊天，期间用户发来的新消息全部排队收不到回复。
+**用桥注入的 `$ABB_BIN`（本程序绝对路径）调 job CLI 建定时任务，建完就结束**。绝不要自己写
+sleep/while 循环去等待——那会一直占着这个聊天，期间用户发来的新消息全部排队收不到回复。
 
-- 加：`agent-bridge job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"到点做什么\" [--note \"原句\"]`
+- 加：`\"$ABB_BIN\" job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"到点做什么\" [--note \"原句\"]`
   - cron 例：每分钟 `* * * * *`；每天 9:30 `30 9 * * *`；工作日 10 点 `0 10 * * 1-5`；每小时 `0 * * * *`
-- 列：`agent-bridge job list`
-- 删：`agent-bridge job del <id 前缀>`
+- 列：`\"$ABB_BIN\" job list`
+- 删：`\"$ABB_BIN\" job del <id 前缀>`
+- 不要用裸命令名 `agent-bridge` / `abb`：macOS 在 .app 内、Windows 在安装目录，都不在 PATH，
+  裸调用会 command not found。`ABB_BIN` 由桥 spawn 时注入，保证调的是当前安装的同一个程序。
 
 目标会话与 bot 已由桥通过环境变量注入：`AGENT_BRIDGE_CHAT_ID`、`AGENT_BRIDGE_BOT_KEY`，CLI 会自动取用，无需手填。
 
@@ -62,11 +69,22 @@ fn ensure_workspace_guide(workspace: &std::path::Path) {
 - 任务完成（产出最终回复）后**立即退出**，不要持续运行或等待。
 - 普通问答、查资料、改文件等直接做即可，做完输出结论。
 - 你只能读写本工作区；不要假设有公网入站（消息靠桥转）。
-";
+"
+    );
     for name in ["CLAUDE.md", "AGENTS.md"] {
         let p = workspace.join(name);
-        if !p.exists() {
-            let _ = std::fs::write(&p, guide);
+        // 已存在但无版本标记（旧模板）→ 覆盖升级；已含标记 → 不动（幂等）。
+        // 代价：用户自定义但没加标记的文件也会被覆盖一次——权衡后接受，
+        // 旧命令在 mac/win 的 agent 环境里都不可用，宁可升级。
+        let need_write = if p.exists() {
+            std::fs::read_to_string(&p)
+                .map(|t| !t.contains(GUIDE_MARKER))
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if need_write {
+            let _ = std::fs::write(&p, &guide);
         }
     }
 }
@@ -333,7 +351,11 @@ fn process_line(
             Some("item.completed") => {
                 let item = &v["item"];
                 if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
-                    let t = item.get("text").and_then(|t| t.as_str())?.trim().to_string();
+                    let t = item
+                        .get("text")
+                        .and_then(|t| t.as_str())?
+                        .trim()
+                        .to_string();
                     if !t.is_empty() {
                         return pending.replace(t); // 挤出上一条作进度
                     }
@@ -364,7 +386,11 @@ fn process_line(
                     }
                 }
                 let txt = txt.trim().to_string();
-                if txt.is_empty() { None } else { pending.replace(txt) }
+                if txt.is_empty() {
+                    None
+                } else {
+                    pending.replace(txt)
+                }
             }
             // 结束事件：result 字段是权威最终回复，is_error 标记失败
             Some("result") => {
@@ -461,6 +487,11 @@ async fn run_once(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // 注入本程序绝对路径：agent 调 job CLI 用 $ABB_BIN，保证是当前安装/当前版本，
+    // 不依赖 PATH（macOS 在 .app 内、Windows 在安装目录，裸命令名都调不到）。
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("ABB_BIN", exe);
+    }
 
     // 供应商 / CC Switch env（含 claude 的 ANTHROPIC_*、codex 的 AGENT_BRIDGE_MODEL_KEY）。
     // 永不进日志（env 不由桥打印；argv 里也没有 key）。
@@ -488,12 +519,14 @@ async fn run_once(
         // drop stdin → 关管道，agent 读到 EOF
     }
 
-    let stdout = child.stdout.take().ok_or_else(|| {
-        AttemptErr::Failed(format!("⚠️ {} 无法读取输出管道", backend.name()))
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        AttemptErr::Failed(format!("⚠️ {} 无法读取错误管道", backend.name()))
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AttemptErr::Failed(format!("⚠️ {} 无法读取输出管道", backend.name())))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AttemptErr::Failed(format!("⚠️ {} 无法读取错误管道", backend.name())))?;
 
     // stderr 后台并行收（进程退出后用于报错归因；session_lost 判定也靠它）
     let stderr_task = tokio::spawn(async move {
@@ -511,7 +544,11 @@ async fn run_once(
 
     // 流式读取：每行即时解析；无输出时也每 CANCEL_POLL_MS 检查一次打断
     loop {
-        if cancel.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        if cancel
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
             let _ = child.kill().await;
             let _ = child.wait().await;
             crate::log!("[agent] {} 被用户打断（kill）", backend.name());
@@ -525,9 +562,13 @@ async fn run_once(
         {
             Err(_) => continue, // 超时无输出 → 回去查 cancel
             Ok(Ok(Some(l))) => {
-                if let Some(p) =
-                    process_line(backend, &l, &mut thread_id, &mut pending, &mut claude_result)
-                {
+                if let Some(p) = process_line(
+                    backend,
+                    &l,
+                    &mut thread_id,
+                    &mut pending,
+                    &mut claude_result,
+                ) {
                     if let Some(tx) = &progress {
                         let _ = tx.send(p);
                     }
@@ -586,10 +627,7 @@ async fn run_once(
                 }
             } else {
                 pending.take().filter(|s| !s.is_empty()).ok_or_else(|| {
-                    AttemptErr::Failed(format!(
-                        "⚠️ claude 没有输出。{}",
-                        stderr_tail(&stderr_text)
-                    ))
+                    AttemptErr::Failed(format!("⚠️ claude 没有输出。{}", stderr_tail(&stderr_text)))
                 })?
             }
         }
@@ -602,7 +640,10 @@ async fn run_once(
 mod tests {
     use super::*;
 
-    fn run_lines(backend: Backend, lines: &[&str]) -> (Option<String>, Option<String>, Option<(bool, String)>) {
+    fn run_lines(
+        backend: Backend,
+        lines: &[&str],
+    ) -> (Option<String>, Option<String>, Option<(bool, String)>) {
         let mut tid = None;
         let mut pending = None;
         let mut res = None;
@@ -778,5 +819,35 @@ mod tests {
         let inj = build_injection(Backend::Codex, None).unwrap();
         assert!(inj.env.is_none());
         assert!(inj.codex_cfg_args.is_empty());
+    }
+
+    #[test]
+    fn workspace_guide_upgrades_old_template() {
+        // 旧模板（无版本标记、写死 agent-bridge job）→ 覆盖升级为 $ABB_BIN 版
+        let dir = std::env::temp_dir().join(format!("abb-guide-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = "# ABB 工作区\n\n## 定时 / 周期 / 延迟任务 → 用 job CLI\n\n用本机 `agent-bridge job` CLI 建定时任务…\n";
+        std::fs::write(dir.join("CLAUDE.md"), old).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), old).unwrap();
+
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains(GUIDE_MARKER), "{name} 应含版本标记");
+            assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
+            assert!(
+                !text.contains("`agent-bridge job`"),
+                "{name} 不应再写死裸命令名"
+            );
+        }
+
+        // 已是最新 → 不重写（mtime 不变，幂等）
+        let m = |n: &str| std::fs::metadata(dir.join(n)).unwrap().modified().unwrap();
+        let before = (m("CLAUDE.md"), m("AGENTS.md"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ensure_workspace_guide(&dir);
+        assert_eq!(before, (m("CLAUDE.md"), m("AGENTS.md")));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
