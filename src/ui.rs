@@ -580,6 +580,7 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let work = work.clone();
+        let model = bots_model.clone();
         // 按字段回写（slint 侧只传被改的那一个字段）：杜绝「未改字段从过期 model 读回」
         // 导致的连改两字段互相回滚（旧 bot-edited 的 CRITICAL bug）。
         settings.on_bot_field_edited(move |idx, field, value| {
@@ -587,7 +588,12 @@ pub fn run_gui() -> Result<()> {
             if let Some(bot) = b.get_mut(idx as usize) {
                 match field.as_str() {
                     "name" => bot.name = value.to_string(),
-                    "kind" => bot.kind = value.to_string(),
+                    "kind" => {
+                        bot.kind = value.to_string();
+                        // 关键：表单字段显隐（if kind == "feishu" / "wechat"）读的是 Slint 模型，
+                        // 不回写则切类型后仍显示旧类型的配置项（选飞书却看到微信字段）。
+                        sync_model(&model, &b);
+                    }
                     "backend" => bot.backend = value.to_string(),
                     "provider" => bot.provider = value.to_string(),
                     "owner" => bot.owner_open_id = value.trim().to_string(),
