@@ -52,7 +52,29 @@ fn pid_alive(pid: u32) -> bool {
         // 存在但可能是 zombie → 查 /proc（Linux）或用 sysctl（macOS）判 state
         !is_zombie(pid)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(
+                dwDesiredAccess: u32,
+                bInheritHandle: i32,
+                dwProcessId: u32,
+            ) -> *mut c_void;
+            fn CloseHandle(hObject: *mut c_void) -> i32;
+        }
+        // 只查存活：PROCESS_QUERY_LIMITED_INFORMATION 足够；句柄有效 = 进程在跑。
+        // 已退出/不存在的 pid → OpenProcess 返回 NULL（Windows 无 zombie 概念）。
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            return false;
+        }
+        unsafe { CloseHandle(h) };
+        true
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
