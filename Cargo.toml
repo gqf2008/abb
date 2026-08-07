@@ -34,6 +34,9 @@ libc = "0.2"
 [build-dependencies]
 slint-build = "1.17"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
