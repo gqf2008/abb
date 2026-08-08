@@ -1,7 +1,7 @@
 ; ABB (Agent Bridge Bar) - Windows installer script
 ; Build: ISCC.exe installer\ABB.iss
 #define MyAppName "ABB"
-#define MyAppVersion "2.0.2"
+#define MyAppVersion "2.0.3"
 #define MyAppPublisher "SQB"
 #define MyAppExeName "agent-bridge.exe"
 

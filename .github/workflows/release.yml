@@ -53,7 +53,7 @@ jobs:
           codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
 
-      - name: Notarize + staple + zip
+      - name: Notarize + staple app
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -63,13 +63,30 @@ jobs:
           xcrun notarytool submit /tmp/ABB-notarize.zip \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple ABB.app
-          ditto -c -k --keepParent ABB.app "ABB-$VERSION-notarized.zip"
           spctl --assess --type execute --verbose=4 ABB.app || true
+
+      - name: Package DMG (drag to Applications) + sign + notarize + staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          # 标准拖拽安装盘：ABB.app + Applications 快捷方式
+          mkdir -p dmg-staging
+          cp -R ABB.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "ABB" -srcfolder dmg-staging -ov -format UDZO "ABB-$VERSION.dmg"
+          # DMG 也要签名 + 公证（只公证 app 不够，分发的盘片本身要过 Gatekeeper）
+          codesign --force --sign "$IDENTITY" --timestamp "ABB-$VERSION.dmg"
+          xcrun notarytool submit "ABB-$VERSION.dmg" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "ABB-$VERSION.dmg"
+          spctl --assess --type open --context context:primary-signature -v "ABB-$VERSION.dmg" || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dist
-          path: ABB-*.zip
+          path: ABB-*.dmg
           if-no-files-found: error
 
   # ─────────────────────────── Windows（x64 + Inno Setup）───────────────────────────

@@ -33,7 +33,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 ## 一分钟上手
 
 1. **下载**：去 [Releases](https://github.com/gqf2008/abb/releases) 拿对应平台的安装包
-   - macOS：解压 `ABB-*.zip`，把 `ABB.app` 拖进「应用程序」，打开即可
+   - macOS：打开 `ABB-*.dmg`，把 `ABB.app` 拖进「应用程序」，打开即可
    - Windows：运行 `ABB-Setup-*.exe` 安装，开始菜单点「ABB」启动
 2. **接上你的 bot**：点菜单栏的 ABB 图标 → 设置 → 按提示添加飞书 / 微信 / 钉钉机器人
    （微信扫码登录即可，全程无需命令行）
