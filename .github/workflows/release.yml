@@ -99,14 +99,18 @@ jobs:
           Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
           & ISCC.exe /DMyAppVersion=$version installer\ABB.iss
 
-      # Windows 代码签名：有证书时启用（Azure Trusted Signing 或 EV），否则跳过
+      # Windows 代码签名：有证书时启用（Azure Trusted Signing 或 EV），否则跳过。
+      # 注意：secrets 不能出现在 if 条件里（workflow 会解析失败），所以运行时判断。
       - name: Sign installer (optional)
-        if: ${{ secrets.WIN_SIGN_PFX != '' }}
         shell: pwsh
         env:
           WIN_SIGN_PFX: ${{ secrets.WIN_SIGN_PFX }}
           WIN_SIGN_PASSWORD: ${{ secrets.WIN_SIGN_PASSWORD }}
         run: |
+          if ([string]::IsNullOrEmpty($env:WIN_SIGN_PFX)) {
+            Write-Host "未配置 WIN_SIGN_PFX，跳过 Windows 代码签名"
+            exit 0
+          }
           $pfx = [IO.File]::WriteAllBytes("$env:TEMP\cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
           & signtool sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
             (Get-ChildItem installer\Output\ABB-Setup-*.exe | Select-Object -First 1).FullName
