@@ -90,6 +90,11 @@ jobs:
           if (-not $iscc) {
             choco install innosetup -y --no-progress
           }
+          # choco 的 innosetup 包可能缺中文语言文件，缺就从官方 issrc 补
+          $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
+          if (-not (Test-Path "$langDir\ChineseSimplified.isl")) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile "$langDir\ChineseSimplified.isl"
+          }
           Write-Host "ISCC found: $((Get-Command ISCC.exe).Source)"
 
       - name: Build installer
