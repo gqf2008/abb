@@ -154,8 +154,17 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Prepare release notes (auto-generated + 架构提示)
+        shell: bash
+        run: |
+          # 先用 GitHub API 生成基于提交历史的 release notes，再在开头插入架构说明
+          gh api -X POST "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" -f target_commitish="${{ github.sha }}" \
+            -q '.body' > /tmp/notes-generated.md
+          printf '%s\n' '> ⚠️ **macOS 版仅支持 Apple Silicon（M 系列，arm64）**；Intel Mac 请勿下载。' | cat - /tmp/notes-generated.md > /tmp/notes-final.md
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: /tmp/notes-final.md
           fail_on_unmatched_files: true

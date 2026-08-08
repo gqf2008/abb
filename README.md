@@ -33,7 +33,8 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 ## 一分钟上手
 
 1. **下载**：去 [Releases](https://github.com/gqf2008/abb/releases) 拿对应平台的安装包
-   - macOS：打开 `ABB-*.dmg`，把 `ABB.app` 拖进「应用程序」，打开即可
+   - macOS（**仅 Apple Silicon**，arm64）：打开 `ABB-*.dmg`，把 `ABB.app` 拖进「应用程序」，打开即可
+     > Intel Mac 暂不支持，请勿下载（arm64 包在 Intel 上无法启动）
    - Windows：运行 `ABB-Setup-*.exe` 安装，开始菜单点「ABB」启动
 2. **接上你的 bot**：点菜单栏的 ABB 图标 → 设置 → 按提示添加飞书 / 微信 / 钉钉机器人
    （微信扫码登录即可，全程无需命令行）
@@ -59,6 +60,9 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 **不会上传到任何 ABB 服务器**——ABB 自己根本没有服务器。
 
 ## 常见问题
+
+- **Q：支持 Intel Mac 吗？**
+  A：暂不支持。当前 macOS 版仅提供 Apple Silicon（M 系列芯片，arm64）安装包；Intel Mac 上无法运行。
 
 - **Q：支持哪些模型？**
   A：本机装了 Claude 或 Codex 就能用；也可以在设置里加任意 OpenAI 兼容供应商（DeepSeek、Kimi、通义等）。
