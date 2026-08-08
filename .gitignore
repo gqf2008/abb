@@ -22,3 +22,6 @@ logs/
 
 # 开发脚本不入库（本地自用，避免公开仓库暴露内部工具链）
 scripts/
+
+# CI 生成的安装包，不入库
+installer/Output/
