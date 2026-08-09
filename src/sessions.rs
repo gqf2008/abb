@@ -149,6 +149,20 @@ impl SessionStore {
         }
     }
 
+    /// 会话重建：换新 UUID 且复位 started=false，返回新 session_id。
+    /// claude 用（#6/#7）：jsonl 残留 already in use / 启动挂起后，旧 UUID 槽位永久不可用，
+    /// 必须换新（started=false → 下轮走 --session-id 新 UUID）；resume 槽位也一并复位。
+    pub fn reset_session(&self, chat_id: &str) -> String {
+        let mut data = self.data.lock().unwrap();
+        let entry = data.entry(chat_id.to_string()).or_default();
+        let slot = Self::slot_mut(entry, &self.current_backend);
+        let sid = uuid::Uuid::new_v4().to_string();
+        slot.session_id = sid.clone();
+        slot.started = false;
+        self.save_locked(&data);
+        sid
+    }
+
     /// 覆盖该 chat 当前后端的 session_id（codex 用：首轮 exec 抓到真实 thread_id 后回存，供后续 resume）。
     pub fn set_session_id(&self, chat_id: &str, session_id: &str) {
         let mut data = self.data.lock().unwrap();
@@ -207,5 +221,30 @@ mod tests {
         let e = &m["c"];
         assert_eq!(e.claude.session_id, "claude-uuid");
         assert!(e.codex.session_id.is_empty());
+    }
+
+    #[test]
+    fn reset_session_swaps_uuid_and_clears_started() {
+        let dir = std::env::temp_dir().join(format!("abb-sessions-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore {
+            path: path.clone(),
+            data: Mutex::new(HashMap::new()),
+            current_backend: "claude".into(),
+        };
+        let old = store.ensure_session("oc_x");
+        store.mark_started("oc_x"); // 模拟已开过首轮（resume 槽位）
+        assert!(store.is_started("oc_x"));
+
+        let new = store.reset_session("oc_x");
+        assert_ne!(old, new, "换新 UUID 不应复用旧 id");
+        assert!(!store.is_started("oc_x"), "reset 后 started 必须复位 false");
+
+        // 落盘可重载且写入的是新 UUID
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&new));
+        assert!(text.contains("\"started\": false"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

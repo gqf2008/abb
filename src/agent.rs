@@ -267,7 +267,7 @@ pub async fn run(
     let provider = crate::config::Config::provider_for_bot_key(bot_key);
     let inject = build_injection(backend, provider.as_ref())?;
 
-    let sid = session_id.to_string();
+    let mut sid = session_id.to_string();
     let mut is_resume = resume;
     for attempt in 0..2 {
         match run_once(
@@ -309,6 +309,22 @@ pub async fn run(
                         "[agent] {} resume 失败（会话已不存在），回退全新会话重建",
                         backend.name()
                     );
+                    is_resume = false;
+                    continue;
+                }
+                // #6/#7：claude 会话槽位被 jsonl 残留占用（already in use）或启动挂起被终止 →
+                // 同 UUID 重试必然再失败，换新 UUID（started 复位 false）重建一次。
+                if backend == Backend::Claude && attempt == 0 && claude_needs_fresh_session(&e) {
+                    let new_sid = if let Some(store) = sessions {
+                        store.reset_session(chat_id)
+                    } else {
+                        uuid::Uuid::new_v4().to_string()
+                    };
+                    crate::log!(
+                        "[agent] claude 会话重建（already in use / 启动挂起），换新 UUID {}",
+                        &new_sid[..new_sid.len().min(8)]
+                    );
+                    sid = new_sid;
                     is_resume = false;
                     continue;
                 }
@@ -417,6 +433,33 @@ fn stderr_tail(stderr: &str) -> String {
     }
 }
 
+/// claude 命令行构造（拆出便于单测参数组合与 env 注入）。
+fn claude_command(resume: bool, session_id: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("claude");
+    c.arg("-p").arg("--dangerously-skip-permissions");
+    c.arg("--verbose").arg("--output-format").arg("stream-json");
+    c.arg(if resume { "--resume" } else { "--session-id" })
+        .arg(session_id);
+    // #7（2026-08-08 实测）：claude 2.x 启动会连 api.anthropic.com / datadoghq.com 遥测，
+    // 无超时，走代理节点抖动即永久挂起（卡在启动早期，jsonl 都不创建）。注入该 env 关闭
+    // 非必要流量（API 请求不受影响）；配合 run_once 的 60s 启动健康检查兜底。
+    c.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    c
+}
+
+/// #6/#7：claude 旧会话槽位不可用，需要换新 UUID 全新会话重建一次。
+/// - "already in use"：jsonl 残留——claude 对 `--session-id` 判定「占用」是看 jsonl 文件
+///   是否存在（源码 statSync(session.jsonl)），不是真进程占用；同 UUID 重试必然再失败。
+/// - "启动挂起"：run_once 启动健康检查终止的标记（#7）；杀进程后旧 UUID 可能已留 jsonl，
+///   重建用新 UUID 更稳（与 #6 同一套换新逻辑）。
+fn claude_needs_fresh_session(e: &str) -> bool {
+    e.contains("already in use") || e.contains("启动挂起")
+}
+
+/// #7 启动健康检查窗口（秒）：claude 启动后该时间内无任何 stdout 产出即判定挂死并终止。
+/// 只覆盖启动阶段；一旦有产出（含长任务）不再有任何超时——保持「无执行超时」语义。
+const CLAUDE_STARTUP_GRACE_SECS: u64 = 60;
+
 /// 单轮执行一个后端：流式读输出（不等 EOF），中途消息经 progress 推出，支持 cancel 打断。
 #[allow(clippy::too_many_arguments)]
 async fn run_once(
@@ -459,12 +502,8 @@ async fn run_once(
         Backend::Claude => {
             // stream-json：逐事件流式输出（assistant/result…），配合逐行解析可实时推进度。
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
-            let mut c = Command::new("claude");
-            c.arg("-p").arg("--dangerously-skip-permissions");
-            c.arg("--verbose").arg("--output-format").arg("stream-json");
-            c.arg(if resume { "--resume" } else { "--session-id" })
-                .arg(session_id);
-            c
+            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）。
+            tokio::process::Command::from(claude_command(resume, session_id))
         }
     };
 
@@ -542,6 +581,18 @@ async fn run_once(
     let mut pending: Option<String> = None; // 滞后一位缓冲：最新候选回复
     let mut claude_result: Option<(bool, String)> = None; // (is_error, result)
 
+    // #7 启动健康检查（仅 claude）：关遥测后仍有启动早期网络风险，给 60s 启动窗口，
+    // 窗口内无任何 stdout 产出 → 判定启动挂死并终止（长任务也会有先行的流式事件，不受影响）。
+    let mut got_output = false;
+    let startup_deadline = if backend == Backend::Claude {
+        Some(
+            tokio::time::Instant::now()
+                + std::time::Duration::from_secs(CLAUDE_STARTUP_GRACE_SECS),
+        )
+    } else {
+        None
+    };
+
     // 流式读取：每行即时解析；无输出时也每 CANCEL_POLL_MS 检查一次打断
     loop {
         if cancel
@@ -560,8 +611,26 @@ async fn run_once(
         )
         .await
         {
-            Err(_) => continue, // 超时无输出 → 回去查 cancel
+            Err(_) => {
+                // 超时无输出 → 先查启动健康检查，再回去查 cancel
+                if let Some(deadline) = startup_deadline {
+                    if !got_output && tokio::time::Instant::now() >= deadline {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        crate::log!(
+                            "[agent] claude 启动 {}s 无输出（疑似启动遥测/网络阻塞），终止并自动重建",
+                            CLAUDE_STARTUP_GRACE_SECS
+                        );
+                        return Err(AttemptErr::Failed(format!(
+                            "⚠️ claude 启动挂起（{}s 无输出，疑似启动网络阻塞）。已自动终止并重建，请检查代理节点。",
+                            CLAUDE_STARTUP_GRACE_SECS
+                        )));
+                    }
+                }
+                continue;
+            }
             Ok(Ok(Some(l))) => {
+                got_output = true;
                 if let Some(p) = process_line(
                     backend,
                     &l,
@@ -849,5 +918,37 @@ mod tests {
         assert_eq!(before, (m("CLAUDE.md"), m("AGENTS.md")));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_command_injects_telemetry_disable() {
+        let c = claude_command(false, "sess-1");
+        let has_disable = c.get_envs().any(|(k, v)| {
+            k.to_str() == Some("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                && v == Some(std::ffi::OsStr::new("1"))
+        });
+        assert!(has_disable, "应注入 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
+        // 非 resume → --session-id；resume → --resume
+        assert!(c.get_args().any(|a| a == "--session-id"));
+        assert!(c.get_args().any(|a| a == "sess-1"));
+        let r = claude_command(true, "sess-2");
+        assert!(r.get_args().any(|a| a == "--resume"));
+        assert!(r.get_args().any(|a| a == "sess-2"));
+        assert!(!r.get_args().any(|a| a == "--session-id"));
+    }
+
+    #[test]
+    fn claude_needs_fresh_session_classifies() {
+        // #6：jsonl 残留 already in use → 换新 UUID
+        assert!(claude_needs_fresh_session(
+            "⚠️ claude 出错（exit 1）:\nError: Session ID abc-123 is already in use."
+        ));
+        // #7：启动健康检查终止标记 → 换新 UUID
+        assert!(claude_needs_fresh_session("⚠️ claude 启动挂起（60s 无输出，疑似启动网络阻塞）"));
+        // resume 会话丢失 / codex 错误 → 不走换新 UUID 分支（各自既有自愈路径）
+        assert!(!claude_needs_fresh_session(
+            "⚠️ claude 出错（exit 1）:\nNo conversation found"
+        ));
+        assert!(!claude_needs_fresh_session("⚠️ codex 出错（exit 1）:\nno rollout found"));
     }
 }
