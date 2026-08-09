@@ -9,6 +9,134 @@ use std::time::{Duration, Instant};
 const API_BASE: &str = "https://open.feishu.cn/open-apis";
 pub const FEISHU_MSG_LIMIT: usize = 3500; // 单条安全长度（按字符数，对齐 Python len()）
 
+/// 消息里的一条资源引用（图片/文件/音视频/富文本图片）。
+#[derive(Debug, Clone)]
+pub struct FeishuResource {
+    /// image | file | audio | video
+    pub kind: String,
+    /// 下载用的 file_key / image_key
+    pub file_key: String,
+    pub file_name: String,
+}
+
+/// 解析后的飞书消息内容：文本 + 可选资源。
+#[derive(Debug, Clone, Default)]
+pub struct FeishuParsed {
+    pub text: String,
+    pub resource: Option<FeishuResource>,
+}
+
+/// 从消息 content（JSON 字符串）解析文本与资源引用。
+/// - image：`{"image_key":"img_xxx"}`
+/// - file/audio/media：`{"file_key":"file_xxx","file_name":"..."[, "type":"audio|media"]}`
+/// - text：`{"text":"..."}`
+/// - post 富文本：`{"title":"...","content":[[{"tag":"text","text":"..."},{"tag":"a",...},{"tag":"img","image_key":"..."}]]}`
+///   抽 text/a 成纯文本，富文本里的首张图也作为资源（可下载）。
+pub fn parse_content(raw: &str) -> FeishuParsed {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return FeishuParsed::default();
+    };
+    if let Some(r) = resource_from_content(&v) {
+        return FeishuParsed {
+            text: String::new(),
+            resource: Some(r),
+        };
+    }
+    if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+        return FeishuParsed {
+            text: t.to_string(),
+            resource: None,
+        };
+    }
+    // post 富文本
+    let mut text = String::new();
+    let mut img_key = String::new();
+    if let Some(title) = v.get("title").and_then(|x| x.as_str()) {
+        if !title.is_empty() {
+            text.push_str(title);
+            text.push('\n');
+        }
+    }
+    if let Some(rows) = v.get("content").and_then(|x| x.as_array()) {
+        for row in rows {
+            let cells = row.as_array().cloned().unwrap_or_default();
+            for c in cells {
+                match c.get("tag").and_then(|x| x.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = c.get("text").and_then(|x| x.as_str()) {
+                            text.push_str(t);
+                        }
+                    }
+                    Some("a") => {
+                        if let Some(t) = c.get("text").and_then(|x| x.as_str()) {
+                            text.push_str(t);
+                        }
+                        if let Some(h) = c.get("href").and_then(|x| x.as_str()) {
+                            if !h.is_empty() {
+                                text.push(' ');
+                                text.push_str(h);
+                            }
+                        }
+                    }
+                    Some("img") if img_key.is_empty() => {
+                        img_key = c
+                            .get("image_key")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    _ => {}
+                }
+            }
+            text.push('\n');
+        }
+    }
+    let resource = if img_key.is_empty() {
+        None
+    } else {
+        Some(FeishuResource {
+            kind: "image".into(),
+            file_key: img_key,
+            file_name: String::new(),
+        })
+    };
+    FeishuParsed {
+        text: text.trim().to_string(),
+        resource,
+    }
+}
+
+fn resource_from_content(v: &serde_json::Value) -> Option<FeishuResource> {
+    if let Some(k) = v.get("image_key").and_then(|x| x.as_str()) {
+        if !k.is_empty() {
+            return Some(FeishuResource {
+                kind: "image".into(),
+                file_key: k.into(),
+                file_name: String::new(),
+            });
+        }
+    }
+    if let Some(k) = v.get("file_key").and_then(|x| x.as_str()) {
+        if !k.is_empty() {
+            let kind = match v.get("type").and_then(|x| x.as_str()) {
+                Some("audio") => "audio",
+                Some("media") | Some("video") => "video",
+                _ => "file",
+            };
+            return Some(FeishuResource {
+                kind: kind.into(),
+                file_key: k.into(),
+                file_name: v
+                    .get("file_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    None
+}
+
 pub struct FeishuClient {
     http: reqwest::Client,
     app_id: String,
@@ -137,6 +265,46 @@ impl FeishuClient {
             }
         }
         Ok(())
+    }
+
+    /// 下载消息内资源（图片/文件/音视频，≤100MB）。返回 (字节, Content-Type)。
+    /// `kind` 决定 query type：image → `type=image`；file/audio/video → `type=file`。
+    /// 错误码 234003 等会带进错误文案，便于排查（key 与 message 不匹配/权限缺失）。
+    pub async fn download_resource(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        kind: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        let token = self.tenant_token().await?;
+        let rtype = if kind == "image" { "image" } else { "file" };
+        let url =
+            format!("{API_BASE}/im/v1/messages/{message_id}/resources/{file_key}?type={rtype}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .context("飞书资源下载网络错误")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .map(|v| format!("code={:?} msg={:?}", v.get("code"), v.get("msg")))
+                .unwrap_or_else(|| body.chars().take(200).collect());
+            return Err(anyhow!("飞书资源下载失败 (HTTP {status}): {detail}"));
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = resp.bytes().await.context("读飞书资源响应失败")?.to_vec();
+        Ok((bytes, mime))
     }
 
     /// 加表情，返回 reaction_id（删除用）。失败 None。
@@ -279,5 +447,58 @@ mod tests {
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
         assert_eq!(content["text"], "你好");
+    }
+
+    #[test]
+    fn parse_content_text() {
+        let p = parse_content(r#"{"text":"你好"}"#);
+        assert_eq!(p.text, "你好");
+        assert!(p.resource.is_none());
+    }
+
+    #[test]
+    fn parse_content_image() {
+        let p = parse_content(r#"{"image_key":"img_abc"}"#);
+        assert_eq!(p.text, "");
+        let r = p.resource.expect("应解析出图片资源");
+        assert_eq!(r.kind, "image");
+        assert_eq!(r.file_key, "img_abc");
+    }
+
+    #[test]
+    fn parse_content_file() {
+        let p = parse_content(r#"{"file_key":"file_1","file_name":"报告.pdf"}"#);
+        let r = p.resource.unwrap();
+        assert_eq!(r.kind, "file");
+        assert_eq!(r.file_key, "file_1");
+        assert_eq!(r.file_name, "报告.pdf");
+    }
+
+    #[test]
+    fn parse_content_audio_video_kind() {
+        let a = parse_content(r#"{"file_key":"f1","file_name":"a.amr","type":"audio"}"#);
+        assert_eq!(a.resource.unwrap().kind, "audio");
+        let v = parse_content(r#"{"file_key":"f2","file_name":"b.mp4","type":"media"}"#);
+        assert_eq!(v.resource.unwrap().kind, "video");
+    }
+
+    #[test]
+    fn parse_content_post_rich_text() {
+        let p = parse_content(
+            r#"{"title":"标题","content":[[{"tag":"text","text":"你好 "},{"tag":"a","text":"链接","href":"https://example.com"}],[{"tag":"img","image_key":"img_pic"}]]}"#,
+        );
+        assert!(p.text.contains("标题"));
+        assert!(p.text.contains("你好"));
+        assert!(p.text.contains("https://example.com"));
+        let r = p.resource.expect("富文本图片应解析为资源");
+        assert_eq!(r.kind, "image");
+        assert_eq!(r.file_key, "img_pic");
+    }
+
+    #[test]
+    fn parse_content_empty_on_garbage() {
+        let p = parse_content("not json");
+        assert_eq!(p.text, "");
+        assert!(p.resource.is_none());
     }
 }

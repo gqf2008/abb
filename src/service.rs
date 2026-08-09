@@ -213,7 +213,12 @@ async fn weixin_loop(
     } else {
         bot.wx_base_url.as_str()
     };
-    let client = crate::wechat::WeixinClient::new(base, &bot.wx_token);
+    let cdn = if bot.wx_cdn_base_url.is_empty() {
+        crate::wechat::DEFAULT_CDN_BASE_URL
+    } else {
+        bot.wx_cdn_base_url.as_str()
+    };
+    let client = crate::wechat::WeixinClient::new(base, &bot.wx_token, cdn);
     let mut cursor = String::new();
     let mut timeout_ms: u64 = 35_000;
     crate::log!("[bot:{key}] 微信长轮询启动 base={base}");

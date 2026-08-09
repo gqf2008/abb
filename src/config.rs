@@ -56,6 +56,10 @@ pub struct BotConfig {
     /// 微信：登录拿到的 ilink_user_id（owner 的微信标识；微信侧 should_respond 判据）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wx_user_id: String,
+    /// 微信：媒体 CDN 根地址（默认 https://novac2c.cdn.weixin.qq.com/c2c）。
+    /// 入站图片/语音/文件下载解密用（#12 过渡能力）；空 = 客户端内置默认。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wx_cdn_base_url: String,
     /// 钉钉：允许响应的用户 staffId（owner 过滤；空 = 响应所有发来消息的人）。
     /// 与飞书 owner_open_id、微信 wx_user_id 同职责，只是钉钉的用户标识格式。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -88,6 +92,7 @@ impl Default for BotConfig {
             wx_token: String::new(),
             wx_base_url: String::new(),
             wx_user_id: String::new(),
+            wx_cdn_base_url: String::new(),
             ding_user_id: String::new(),
             ding_robot_code: String::new(),
             provider: String::new(),
