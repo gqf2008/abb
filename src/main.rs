@@ -16,6 +16,7 @@ mod feishu;
 mod install;
 mod larkskills;
 mod messenger;
+mod outbox;
 mod permreq;
 mod platform;
 mod proto;

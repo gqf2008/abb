@@ -5,6 +5,7 @@
 use crate::agent::{self, Backend};
 use crate::config::{BotConfig, Config};
 use crate::messenger::Messenger;
+use crate::outbox::{OutboxItem, OutboxStore};
 use crate::schedule::JobStore;
 use crate::sessions::SessionStore;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +30,9 @@ pub struct Bridge {
     /// 在跑任务的打断标志：chat_id → AtomicBool。「停止词」到达时置 true 叫停该 chat 正在跑的任务。
     /// （per-chat 同一时刻只有一个在跑任务，故每 chat 至多一个标志。）
     cancel_flags: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
+    /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
+    outbox: OutboxStore,
 }
 
 #[derive(Debug)]
@@ -44,7 +48,8 @@ impl Bridge {
     pub fn new(msgr: Arc<dyn Messenger>, bot: BotConfig, cfg: &Config) -> Bridge {
         // 后端跟着 bot 走：用该 bot 的生效后端（自身 backend 非空优先，否则回落全局默认）。
         let effective = bot.effective_backend(&cfg.default_backend).to_string();
-        let sessions = SessionStore::new(&effective, &bot.key());
+        let key = bot.key();
+        let sessions = SessionStore::new(&effective, &key);
         Bridge {
             msgr,
             sessions,
@@ -56,6 +61,7 @@ impl Bridge {
             seen: Mutex::new(HashSet::new()),
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
+            outbox: OutboxStore::new(&key),
         }
     }
 
@@ -66,6 +72,40 @@ impl Bridge {
             .entry(chat_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// 把一条待发消息落盘积压（仅微信：主动推送被拒时缓存，等下次入站补发）。
+    /// 其它通道主动推送不受 token 活跃度约束，继续走既有「失败回落主会话」路径，不入队。
+    pub fn queue_outbox(&self, chat_id: &str, text: &str, job_id: &str) {
+        if !self.bot.is_wechat() || chat_id.is_empty() || text.is_empty() {
+            return;
+        }
+        self.outbox.add(OutboxItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id: chat_id.to_string(),
+            text: text.to_string(),
+            created_at: crate::chrono_lite::unix_secs(),
+            attempts: 0,
+            job_id: job_id.to_string(),
+        });
+        crate::log!(
+            "[bot:{}] [outbox] 任务报告写入待发积压 chat={} 长度={}（当前积压 {} 条）",
+            self.bot.key(),
+            &chat_id[..chat_id.len().min(10)],
+            text.chars().count(),
+            self.outbox.len()
+        );
+    }
+
+    /// 微信入站刷新 context_token 后调用：把该 chat 的积压消息一次性补发。
+    /// 与 handle 共用 per-chat 串行锁，避免补发与消息处理交错；失败的项保留待下次入站再试。
+    pub async fn flush_outbox(&self, chat_id: &str) {
+        if !self.bot.is_wechat() {
+            return;
+        }
+        let lock = self.chat_lock(chat_id);
+        let _guard = lock.lock().await;
+        crate::outbox::flush_pending(self.msgr.as_ref(), &self.outbox, chat_id).await;
     }
 
     /// 群消息 mentions 里是否 @了本机器人（name/app_id/open_id 三重冗余）。
@@ -392,6 +432,8 @@ impl Bridge {
         }
         // 回复必须回显该用户最新 context_token
         self.msgr.note_context(&from, &msg.context_token);
+        // token 已刷新 → 顺带补发该会话积压的任务报告（主动推送曾被微信拒绝的，不静默丢失）
+        self.flush_outbox(&from).await;
         let text = msg.text().trim().to_string();
         if text.is_empty() {
             crate::log!("[weixin] 丢弃：text 为空（非文本消息）");
