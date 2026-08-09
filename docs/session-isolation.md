@@ -2,18 +2,20 @@
 
 > 结论日期：2026-08-09。对应 issue #5。
 > 本文说明 ABB 当前「群 / 话题 / 用户」三类会话是如何隔离的、存在哪些串线风险，
-> 以及话题隔离要不要做（结论：**要做飞书话题维度**，最小改动方案见文末）。
+> 以及话题隔离要不要做（结论：**要做飞书话题维度**，已实施，见文末 #14 方案）。
 
 ## 1. 当前隔离模型
 
-会话持久化在 `src/sessions.rs`，key 是 **chat_id 单维度**，按 bot + 后端分槽：
+会话持久化在 `src/sessions.rs`，key 按 bot + 后端分槽。非话题消息 key 是 **chat_id 单维度**；
+飞书话题消息（#14 起）key 是 **`{chat_id}:{thread_id}`**：
 
 ```
-sessions.json = { chat_id: { claude: {session_id, started}, codex: {session_id, started} } }
+sessions.json = { key: { claude: {session_id, started}, codex: {session_id, started} } }
+key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 ```
 
-并发控制 `bridge.rs::chat_lock`、打断标志 `cancel_flags` 同样按 chat_id 一把锁/一个标志。
-即：**同一个 chat_id 的所有消息共享同一个 agent 会话、串行排队、共享打断**。
+并发控制 `bridge.rs::chat_lock`、打断标志 `cancel_flags` 同样按 key 一把锁/一个标志。
+即：**同一个 key 的所有消息共享同一个 agent 会话、串行排队、共享打断；同一群不同话题互不串线**。
 
 ## 2. 三平台 chat_id 规则
 
@@ -35,7 +37,7 @@ sessions.json = { chat_id: { claude: {session_id, started}, codex: {session_id, 
 | 用户（跨私聊） | ✅ 隔离 | 每个用户的私聊是不同 chat_id，会话/锁互不串 |
 | 群（跨群） | ✅ 隔离 | 每个群是不同 chat_id |
 | 群内（同群多人） | ❌ 不隔离 | 群内所有成员共享同一 chat_id → 同一 agent 会话、同一把锁。A 的提问带着 B 的上下文；A 跑长任务时 B 的消息排队 |
-| 话题/线程（飞书） | ❌ 不隔离 | 群内不同 thread 共用群 chat_id → A 话题的提问带着 B 话题的上下文 |
+| 话题/线程（飞书） | ✅ 已隔离（#14） | 话题消息按 `chat_id:thread_id` 独立会话/锁/打断，回复走 reply 接口落在原话题 |
 | 微信群聊 | N/A | 当前按私聊处理（若平台推群消息会被当成 dm 会话） |
 
 补充观察：飞书群聊回复**不会 @ 提问者**（`FeishuMessenger.send_text` 无 @ 参数；
@@ -49,25 +51,28 @@ sessions.json = { chat_id: { claude: {session_id, started}, codex: {session_id, 
    影响有限；多用户场景需产品确认后再做。
 3. **微信无群聊维度**：当前不影响（微信 bot 只处理私聊消息），平台侧群消息能力确认后再补。
 
-## 5. 结论与最小改动方案
+## 5. 结论与实施方案（#14 已完成）
 
 **结论：飞书话题维度要做**（P2），方案（最小改动，不碰跨端架构）：
 
-1. **解析层**：`bridge.rs::on_payload` 从消息事件取 `root_id`（飞书话题消息字段），
-   `Ev` 增加 `thread_id: String`（空=非话题）。
-2. **会话 key**：话题消息用 `{chat_id}:{thread_id}` 作为 sessions/chat_lock/cancel_flags 的 key；
-   非话题消息保持原 chat_id，互不干扰。
-3. **发送层**：`FeishuClient.send_text` 增加可选 `thread_id` 参数，发话题消息时带
-   `reply_in_thread: true` + `thread_id`，回复落在原话题内。
+1. **解析层**：`bridge.rs::on_payload` 从消息事件取 `message["thread_id"]`（官方事件字段，`omt_`
+   开头，话题消息才有），`Ev` 增加 `thread_id: String`（空=非话题）。
+   ⚠️ 不用 `root_id`：它是根消息的 `message_id`（`om_` 开头），只表示回复树层级，不是话题标识。
+2. **会话 key**：话题消息用 `{chat_id}:{thread_id}` 作为 sessions/chat_lock/cancel_flags 的 key
+   （`Ev::key()`）；非话题消息保持原 chat_id，互不干扰。
+3. **发送层**：create 发送接口不支持 thread 参数，话题回复必须走
+   `POST /im/v1/messages/:message_id/reply`，body 带 `reply_in_thread: true`（显式置 true，
+   避免落到群根会话）。`FeishuClient` 新增 `reply_text(message_id, text)`（含分段），
+   `Messenger` 新增 `send_thread_reply(chat_id, message_id, text)`（其它通道默认回落 `send_text`）。
 4. **兼容**：老 sessions.json 键不变；话题 key 是新键，无迁移成本。
 5. **不做**（本轮）：群内按提问者拆会话（多用户场景待确认）、微信群聊维度（平台能力未确认）。
 
-风险点：飞书话题消息的事件字段与发送参数需按官方 API 文档核实（`root_id` / `thread_id` /
-`reply_in_thread`）；改动集中在 feishu 解析 + 会话 key + 发送参数三处，不回退现有行为。
+已核实（官方文档 2026-08-10）：事件字段 `event.message.thread_id`；回复接口
+`im/v1/messages/:message_id/reply` 请求体 `reply_in_thread`（boolean）；回复响应含 `thread_id`。
 
 ## 6. 相关代码索引
 
 - 会话持久化：`src/sessions.rs`（chat_id 单维度、per-backend 槽位）
 - 并发/打断：`src/bridge.rs`（`chat_lock` / `cancel_flags` / `handle`）
 - 各平台入站：`src/bridge.rs`（`on_payload` / `on_weixin` / `on_dingtalk`）、`src/dingtalk.rs`
-- 发送：`src/feishu.rs`（`send_text`）、`src/messenger.rs`（WeixinMessenger context_token）
+- 发送：`src/feishu.rs`（`send_text` / `reply_text`）、`src/messenger.rs`（`send_thread_reply`、WeixinMessenger context_token）

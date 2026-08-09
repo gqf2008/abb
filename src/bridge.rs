@@ -41,7 +41,22 @@ pub struct Ev {
     pub chat_id: String,
     /// 会话类型：飞书 p2p/group，微信 dm（主会话候选判定用）
     pub chat_type: String,
+    /// 飞书话题 ID（omt_ 开头）；空=非话题消息。微信/钉钉恒为空。
+    pub thread_id: String,
     pub text: String,
+}
+
+impl Ev {
+    /// 会话隔离 key：话题消息用 `{chat_id}:{thread_id}`（#14），非话题就是 chat_id。
+    /// sessions / chat_lock / cancel_flags 全部按这个 key 隔离——同一群不同话题
+    /// 各自独立 agent 会话、互不带上下文；老 sessions.json 键不变（话题是新键）。
+    pub fn key(&self) -> String {
+        if self.thread_id.is_empty() {
+            self.chat_id.clone()
+        } else {
+            format!("{}:{}", self.chat_id, self.thread_id)
+        }
+    }
 }
 
 impl Bridge {
@@ -72,6 +87,17 @@ impl Bridge {
             .entry(chat_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// 发一条回复：话题消息走 reply 接口（落在原话题），非话题走普通发送。
+    async fn send_reply(&self, ev: &Ev, text: &str) -> anyhow::Result<()> {
+        if ev.thread_id.is_empty() {
+            self.msgr.send_text(&ev.chat_id, text).await
+        } else {
+            self.msgr
+                .send_thread_reply(&ev.chat_id, &ev.mid, text)
+                .await
+        }
     }
 
     /// 把一条待发消息落盘积压（仅微信：主动推送被拒时缓存，等下次入站补发）。
@@ -229,6 +255,8 @@ impl Bridge {
             mid: message["message_id"].as_str().unwrap_or("").to_string(),
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
+            // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
+            thread_id: message["thread_id"].as_str().unwrap_or("").to_string(),
             text,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
@@ -279,15 +307,16 @@ impl Bridge {
             return;
         }
 
+        // 会话隔离 key：话题消息 = {chat_id}:{thread_id}，非话题 = chat_id（#14）。
+        // 打断/串行/会话/发送全部按 key 走——同一群不同话题互不串线。
+        let key = ev.key();
+
         // 打断拦截：停止词 → 叫停该 chat 正在跑的任务。必须在拿串行锁**之前**判断，
         // 否则会被排到运行中任务之后，等任务跑完才处理（那时打断就没意义了）。
         if is_cancel_keyword(&text) {
-            if let Some(flag) = self.cancel_flags.lock().unwrap().get(&ev.chat_id).cloned() {
+            if let Some(flag) = self.cancel_flags.lock().unwrap().get(&key).cloned() {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                crate::log!(
-                    "[bridge] 收到停止指令 chat={}",
-                    &ev.chat_id[..ev.chat_id.len().min(10)]
-                );
+                crate::log!("[bridge] 收到停止指令 chat={}", &key[..key.len().min(16)]);
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
@@ -305,9 +334,9 @@ impl Bridge {
         let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
         let prompt = text;
 
-        // per-chat 串行：同一 chat 的并发消息排队等前一条处理完（不丢弃）。
-        // 先从 std Mutex 取出该 chat 的锁 Arc（短持 std 锁），再 await 异步锁。
-        let chat_lock = self.chat_lock(&ev.chat_id);
+        // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
+        // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
+        let chat_lock = self.chat_lock(&key);
         let _serial_guard = chat_lock.lock().await;
         if t0.elapsed().as_millis() > 50 {
             crate::log!(
@@ -321,8 +350,8 @@ impl Bridge {
         // 会话快照必须在**拿到锁之后**取：锁外取的话，首轮 agent 还在跑时到达的第二条消息
         // 会读到过期的 started=false —— claude 侧对同一 UUID 再 --session-id 报「already in use」，
         // codex 侧新建 thread 覆盖掉首轮的 → 首轮上下文永久丢失。锁内取则前一轮必已 mark_started。
-        let session_id = self.sessions.ensure_session(&ev.chat_id);
-        let resume = self.sessions.is_started(&ev.chat_id);
+        let session_id = self.sessions.ensure_session(&key);
+        let resume = self.sessions.is_started(&key);
 
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
@@ -333,7 +362,7 @@ impl Bridge {
         self.cancel_flags
             .lock()
             .unwrap()
-            .insert(ev.chat_id.clone(), cancel_flag.clone());
+            .insert(key.clone(), cancel_flag.clone());
 
         let bot_key = self.bot.key();
         let run_fut = agent::run(
@@ -351,7 +380,7 @@ impl Bridge {
         let result = loop {
             tokio::select! {
                 Some(p) = prx.recv() => {
-                    if let Err(e) = self.msgr.send_text(&ev.chat_id, &p).await {
+                    if let Err(e) = self.send_reply(&ev, &p).await {
                         crate::log!(
                             "[bridge] ⚠️ 中途进度发送失败 chat={}: {e:#}",
                             &ev.chat_id[..ev.chat_id.len().min(10)]
@@ -362,14 +391,14 @@ impl Bridge {
             }
         };
         // 任务结束 → 摘掉打断标志（后续停止词将按普通消息处理）
-        self.cancel_flags.lock().unwrap().remove(&ev.chat_id);
+        self.cancel_flags.lock().unwrap().remove(&key);
 
         match result {
             Ok(agent::RunOutcome::Reply(reply)) => {
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）
-                self.sessions.mark_started(&ev.chat_id);
+                self.sessions.mark_started(&key);
                 // 发送结果必须留痕：回复丢了（token 失效/会话失效等）时不能谎报成功。
-                match self.msgr.send_text(&ev.chat_id, &reply).await {
+                match self.send_reply(&ev, &reply).await {
                     Ok(()) => crate::log!(
                         "[bridge] 已回复 chat={} 长度={}",
                         &ev.chat_id[..ev.chat_id.len().min(10)],
@@ -386,12 +415,12 @@ impl Bridge {
                     "[bridge] 任务被打断 chat={}",
                     &ev.chat_id[..ev.chat_id.len().min(10)]
                 );
-                let _ = self.msgr.send_text(&ev.chat_id, "⏹ 已停止").await;
+                let _ = self.send_reply(&ev, "⏹ 已停止").await;
                 // 不 mark_started：被打断的轮次不算完成
             }
             Err(e) => {
                 // 错误文案作为回复发出（用户可见原因），同样留痕
-                match self.msgr.send_text(&ev.chat_id, &e).await {
+                match self.send_reply(&ev, &e).await {
                     Ok(()) => crate::log!(
                         "[bridge] 已回复错误 chat={} 长度={}",
                         &ev.chat_id[..ev.chat_id.len().min(10)],
@@ -449,6 +478,7 @@ impl Bridge {
             mid,
             chat_id: from,               // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
+            thread_id: String::new(),    // 微信无话题
             text,
         };
         self.handle(ev).await;
@@ -491,6 +521,7 @@ impl Bridge {
             mid: msg.mid,
             chat_id,
             chat_type: if is_group { "group".to_string() } else { "dm".to_string() },
+            thread_id: String::new(), // 钉钉无话题
             text,
         };
         self.handle(ev).await;
@@ -570,6 +601,36 @@ mod tests {
         assert_eq!(strip_bot_mention("@庆小丰 你好", ""), "@庆小丰 你好");
         // 正文中间的同名 @ 不剥
         assert_eq!(strip_bot_mention("你好 @庆小丰", "庆小丰"), "你好 @庆小丰");
+    }
+
+    #[test]
+    fn ev_key_is_chat_id_for_non_thread() {
+        // 非话题消息：key 就是 chat_id（老行为不变，#14 兼容）
+        let ev = Ev {
+            mid: "om_1".into(),
+            chat_id: "oc_group".into(),
+            chat_type: "group".into(),
+            thread_id: String::new(),
+            text: "hi".into(),
+        };
+        assert_eq!(ev.key(), "oc_group");
+    }
+
+    #[test]
+    fn ev_key_isolates_threads() {
+        // 同一群两个不同话题 → 不同 key（各自独立会话/锁/打断）
+        let base = |thread: &str| Ev {
+            mid: "om_1".into(),
+            chat_id: "oc_group".into(),
+            chat_type: "group".into(),
+            thread_id: thread.into(),
+            text: "hi".into(),
+        };
+        let a = base("omt_aaa");
+        let b = base("omt_bbb");
+        assert_eq!(a.key(), "oc_group:omt_aaa");
+        assert_eq!(b.key(), "oc_group:omt_bbb");
+        assert_ne!(a.key(), b.key(), "不同话题必须不同 key");
     }
 
     #[test]
