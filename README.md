@@ -75,3 +75,9 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 
 新版本会发布在 [Releases](https://github.com/gqf2008/abb/releases)，macOS 包已签名并公证，
 Windows 包为免管理员安装。有问题欢迎提 [Issue](https://github.com/gqf2008/abb/issues)。
+
+---
+
+## 开发者文档
+
+- [会话隔离机制（群 / 话题 / 用户）](docs/session-isolation.md)：三平台 chat_id 规则、隔离矩阵、话题维度结论与最小改动方案。
