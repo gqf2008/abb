@@ -36,6 +36,18 @@ pub trait Messenger: Send + Sync {
 
     /// 记录某会话最近一个发送者（钉钉群聊回复时 @ 对方用）。其它通道不需要，默认无操作。
     fn note_sender(&self, _chat_id: &str, _sender_id: &str) {}
+
+    /// 下载入站附件并保存到工作区，返回元数据（#12；桥注入 agent prompt）。
+    /// 默认不支持（返回 None）；各平台实现覆盖。失败返回带 note 的占位元数据，不静默丢消息。
+    async fn download_attachment(
+        &self,
+        _bot_key: &str,
+        _mid: &str,
+        _seq: usize,
+        _desc: &crate::attachments::AttachmentDesc,
+    ) -> Option<crate::attachments::AttachmentMeta> {
+        None
+    }
 }
 
 /// 飞书实现：委托 FeishuClient，表情走 reactions。
@@ -50,6 +62,39 @@ impl Messenger for FeishuMessenger {
     }
     async fn send_thread_reply(&self, _chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         self.fs.reply_text(message_id, text).await
+    }
+    async fn download_attachment(
+        &self,
+        bot_key: &str,
+        mid: &str,
+        seq: usize,
+        desc: &crate::attachments::AttachmentDesc,
+    ) -> Option<crate::attachments::AttachmentMeta> {
+        let crate::attachments::AttachmentDesc::Feishu {
+            message_id,
+            file_key,
+            kind,
+            file_name,
+        } = desc
+        else {
+            return None;
+        };
+        match self.fs.download_resource(message_id, file_key, kind).await {
+            Ok((bytes, mime)) => crate::attachments::save_attachment(
+                bot_key, mid, seq, kind, "feishu", file_name, &mime, &bytes,
+            )
+            .map_err(|e| {
+                crate::log!("[feishu] 附件保存失败: {e:#}");
+                e
+            })
+            .ok(),
+            Err(e) => {
+                crate::log!("[feishu] 附件下载失败: {e:#}");
+                Some(crate::attachments::failed_meta(
+                    kind, "feishu", file_name, &e,
+                ))
+            }
+        }
     }
     async fn typing(&self, message_id: &str) -> Option<String> {
         self.fs.add_reaction(message_id, "Typing").await
@@ -120,6 +165,55 @@ impl Messenger for WeixinMessenger {
     }
     // 微信无表情：typing/done 用默认空实现
 
+    async fn download_attachment(
+        &self,
+        bot_key: &str,
+        mid: &str,
+        seq: usize,
+        desc: &crate::attachments::AttachmentDesc,
+    ) -> Option<crate::attachments::AttachmentMeta> {
+        let crate::attachments::AttachmentDesc::Wechat(media) = desc else {
+            return None;
+        };
+        match self.wx.download_media(media).await {
+            Ok(Some((bytes, mime, file_name, note))) => {
+                let mut meta = match crate::attachments::save_attachment(
+                    bot_key,
+                    mid,
+                    seq,
+                    &media.kind,
+                    "wechat",
+                    &file_name,
+                    &mime,
+                    &bytes,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        crate::log!("[wechat] 附件保存失败: {e:#}");
+                        return Some(crate::attachments::failed_meta(
+                            &media.kind,
+                            "wechat",
+                            &file_name,
+                            &e,
+                        ));
+                    }
+                };
+                meta.note = note;
+                Some(meta)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                crate::log!("[wechat] 附件下载失败: {e:#}");
+                Some(crate::attachments::failed_meta(
+                    &media.kind,
+                    "wechat",
+                    &media.file_name,
+                    &e,
+                ))
+            }
+        }
+    }
+
     fn note_context(&self, chat_id: &str, context_token: &str) {
         if !chat_id.is_empty() && !context_token.is_empty() {
             let mut m = self.ctx.lock().unwrap();
@@ -167,6 +261,54 @@ impl Messenger for DingTalkMessenger {
     }
     // 钉钉无表情：typing/done 用默认空实现
 
+    async fn download_attachment(
+        &self,
+        bot_key: &str,
+        mid: &str,
+        seq: usize,
+        desc: &crate::attachments::AttachmentDesc,
+    ) -> Option<crate::attachments::AttachmentMeta> {
+        let crate::attachments::AttachmentDesc::Dingtalk {
+            download_code,
+            robot_code,
+            kind,
+            file_name,
+            voice_text,
+        } = desc
+        else {
+            return None;
+        };
+        // robot_code 缺省回落到 messenger 配置（配置显式优先，回调值仅当非空才用）
+        let rc = if robot_code.is_empty() {
+            self.robot_code.as_str()
+        } else {
+            robot_code.as_str()
+        };
+        match self.dt.download_msg_file(download_code, rc).await {
+            Ok(bytes) => {
+                let mut meta = match crate::attachments::save_attachment(
+                    bot_key, mid, seq, kind, "dingtalk", file_name, "", &bytes,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        crate::log!("[dingtalk] 附件保存失败: {e:#}");
+                        return Some(crate::attachments::failed_meta(
+                            kind, "dingtalk", file_name, &e,
+                        ));
+                    }
+                };
+                meta.note = voice_text.clone();
+                Some(meta)
+            }
+            Err(e) => {
+                crate::log!("[dingtalk] 附件下载失败: {e:#}");
+                Some(crate::attachments::failed_meta(
+                    kind, "dingtalk", file_name, &e,
+                ))
+            }
+        }
+    }
+
     fn note_sender(&self, chat_id: &str, sender_id: &str) {
         if !chat_id.is_empty() && !sender_id.is_empty() {
             self.last_sender
@@ -191,8 +333,13 @@ pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
         } else {
             &bot.wx_base_url
         };
+        let cdn = if bot.wx_cdn_base_url.is_empty() {
+            crate::wechat::DEFAULT_CDN_BASE_URL
+        } else {
+            bot.wx_cdn_base_url.as_str()
+        };
         Ok(std::sync::Arc::new(WeixinMessenger::new(
-            WeixinClient::new(base, &bot.wx_token),
+            WeixinClient::new(base, &bot.wx_token, cdn),
             &bot.key(),
         )))
     } else {

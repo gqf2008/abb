@@ -175,6 +175,55 @@ impl DingTalkClient {
         }
     }
 
+    /// 下载机器人接收到的文件/图片/语音（downloadCode → downloadUrl → 二进制）。
+    /// 两步：POST /v1.0/robot/messageFiles/download 换 downloadUrl，再 GET 下载。
+    pub async fn download_msg_file(
+        &self,
+        download_code: &str,
+        robot_code: &str,
+    ) -> Result<Vec<u8>> {
+        let token = self.access_token().await?;
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/v1.0/robot/messageFiles/download"))
+            .header("x-acs-dingtalk-access-token", &token)
+            .json(&json!({
+                "downloadCode": download_code,
+                "robotCode": robot_code,
+            }))
+            .send()
+            .await
+            .context("messageFiles/download 网络错误")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        let v: Value =
+            serde_json::from_str(&text).context("messageFiles/download 响应不是 JSON")?;
+        let url = v
+            .get("downloadUrl")
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                v.get("data")
+                    .and_then(|d| d.get("downloadUrl"))
+                    .and_then(|x| x.as_str())
+            })
+            .context("messageFiles/download 响应缺 downloadUrl")?
+            .to_string();
+        let resp2 = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("钉钉文件下载网络错误")?;
+        if !resp2.status().is_success() {
+            return Err(anyhow!("钉钉文件下载失败 HTTP {}", resp2.status().as_u16()));
+        }
+        Ok(resp2.bytes().await.context("读钉钉文件响应失败")?.to_vec())
+    }
+
     /// 注册 Stream 长连接凭证（clientId/clientSecret 直接鉴权，无需先取 access_token）。
     /// 返回 (endpoint, ticket)；ticket 一次性、90s 有效。
     pub async fn open_connection(app_id: &str, app_secret: &str) -> Result<(String, String)> {
@@ -237,6 +286,17 @@ pub fn is_group_chat(chat_id: &str) -> bool {
     chat_id.starts_with("cid")
 }
 
+/// 一条待下载的钉钉附件引用（picture/file/audio/video/富文本图片）。
+#[derive(Debug, Clone)]
+pub struct DingtalkAttachment {
+    /// image | file | audio | video
+    pub kind: String,
+    pub download_code: String,
+    pub file_name: String,
+    /// 语音转写文本（audio 消息的 recognition），有则记进附件备注
+    pub voice_text: String,
+}
+
 /// 一条钉钉入站机器人消息（已从 CALLBACK 帧解析）。
 #[derive(Debug)]
 pub struct DingtalkMessage {
@@ -248,10 +308,14 @@ pub struct DingtalkMessage {
     pub conversation_id: String,
     /// "1"=单聊 "2"=群聊。
     pub conversation_type: String,
-    /// 文本内容（已 trim；群聊含 @机器人名 前缀，由 bridge 剥）。
+    /// 文本内容（已 trim；群聊含 @机器人名 前缀，由 bridge 剥）。纯附件消息为空。
     pub text: String,
     /// 是否在 @ 名单里（群聊判据）。
     pub mentioned: bool,
+    /// 回调里的 robotCode（下载附件必需；缺省回落到 app_id）。
+    pub robot_code: String,
+    /// 附件引用列表（富文本可能多张图；文本消息为空）。
+    pub attachments: Vec<DingtalkAttachment>,
 }
 
 impl DingtalkMessage {
@@ -274,33 +338,147 @@ impl DingtalkMessage {
     }
 }
 
-/// 解析一条 CALLBACK 帧 → 钉钉消息。非文本/缺关键字段返回 None（外层照常 ack）。
+/// 解析一条 CALLBACK 帧 → 钉钉消息。缺关键字段返回 None（外层照常 ack）。
+/// 支持文本/图片/文件/语音/视频/富文本；纯附件消息 text 为空但带 attachments。
 fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
     if frame["type"].as_str() != Some("CALLBACK") {
         return None;
     }
     let data = frame["data"].as_str()?;
     let p: Value = serde_json::from_str(data).ok()?;
-    if p["msgtype"].as_str() != Some("text") {
-        return None;
-    }
-    let text = p["text"]["content"].as_str()?.trim().to_string();
-    if text.is_empty() {
-        return None;
-    }
+    let msgtype = p["msgtype"].as_str()?;
     let mid = p["msgId"].as_str()?.to_string();
     let sender = p["senderStaffId"]
         .as_str()
         .or_else(|| p["senderId"].as_str())?
         .to_string();
-    Some(DingtalkMessage {
-        mid,
-        sender_staff_id: sender,
+    let base = |text: String, attachments: Vec<DingtalkAttachment>| DingtalkMessage {
+        mid: mid.clone(),
+        sender_staff_id: sender.clone(),
         conversation_id: p["conversationId"].as_str().unwrap_or("").to_string(),
         conversation_type: p["conversationType"].as_str().unwrap_or("").to_string(),
         text,
         mentioned: p["isInAtList"].as_bool().unwrap_or(false),
-    })
+        robot_code: p["robotCode"].as_str().unwrap_or("").to_string(),
+        attachments,
+    };
+
+    match msgtype {
+        "text" => {
+            let text = p["text"]["content"].as_str()?.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            Some(base(text, Vec::new()))
+        }
+        "picture" => {
+            let dc = p["content"]["downloadCode"].as_str()?.to_string();
+            if dc.is_empty() {
+                return None;
+            }
+            Some(base(
+                String::new(),
+                vec![DingtalkAttachment {
+                    kind: "image".into(),
+                    download_code: dc,
+                    file_name: String::new(),
+                    voice_text: String::new(),
+                }],
+            ))
+        }
+        "file" => {
+            let dc = p["content"]["downloadCode"].as_str()?.to_string();
+            let file_name = p["content"]["fileName"].as_str().unwrap_or("").to_string();
+            if dc.is_empty() {
+                return None;
+            }
+            Some(base(
+                String::new(),
+                vec![DingtalkAttachment {
+                    kind: "file".into(),
+                    download_code: dc,
+                    file_name,
+                    voice_text: String::new(),
+                }],
+            ))
+        }
+        "audio" | "voice" => {
+            let dc = p["content"]["downloadCode"].as_str()?.to_string();
+            let ext = p["content"]["fileExtension"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("amr");
+            let file_name = format!("voice.{ext}");
+            if dc.is_empty() {
+                return None;
+            }
+            Some(base(
+                String::new(),
+                vec![DingtalkAttachment {
+                    kind: "audio".into(),
+                    download_code: dc,
+                    file_name,
+                    voice_text: p["content"]["recognition"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                }],
+            ))
+        }
+        "video" => {
+            let dc = p["content"]["downloadCode"].as_str()?.to_string();
+            let file_name = p["content"]["fileName"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("video.mp4")
+                .to_string();
+            if dc.is_empty() {
+                return None;
+            }
+            Some(base(
+                String::new(),
+                vec![DingtalkAttachment {
+                    kind: "video".into(),
+                    download_code: dc,
+                    file_name,
+                    voice_text: String::new(),
+                }],
+            ))
+        }
+        "richText" => {
+            // content 可能是数组，也可能是 JSON 字符串（不同版本推送不一致，兼容两者）
+            let list: Vec<Value> = match p.get("content") {
+                Some(Value::Array(a)) => a.clone(),
+                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let mut text = String::new();
+            let mut attachments = Vec::new();
+            for c in list {
+                if let Some(t) = c.get("text").and_then(|x| x.as_str()) {
+                    text.push_str(t);
+                }
+                if c.get("type").and_then(|x| x.as_str()) == Some("picture") {
+                    if let Some(dc) = c.get("downloadCode").and_then(|x| x.as_str()) {
+                        if !dc.is_empty() {
+                            attachments.push(DingtalkAttachment {
+                                kind: "image".into(),
+                                download_code: dc.to_string(),
+                                file_name: String::new(),
+                                voice_text: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            let text = text.trim().to_string();
+            if text.is_empty() && attachments.is_empty() {
+                return None;
+            }
+            Some(base(text, attachments))
+        }
+        _ => None,
+    }
 }
 
 /// 构造 ack 帧（Text JSON）。data 是**已序列化**的 JSON 字符串（协议要求 data 字段为字符串）。
@@ -524,18 +702,69 @@ mod tests {
     }
 
     #[test]
-    fn parse_ignores_non_text() {
+    fn parse_picture_message() {
         let frame = json!({
             "type": "CALLBACK",
             "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
-            "data": r#"{"msgId":"msg1","senderStaffId":"u1","msgtype":"picture","content":{"downloadCode":"x"}}"#
+            "data": r#"{"msgId":"msg1","senderStaffId":"u1","robotCode":"ding123","msgtype":"picture","content":{"downloadCode":"dc1"}}"#
         });
-        assert!(parse_message(&frame).is_none());
-        // 空文本也丢弃
+        let m = parse_message(&frame).expect("图片消息应解析");
+        assert_eq!(m.text, "");
+        assert_eq!(m.robot_code, "ding123");
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].kind, "image");
+        assert_eq!(m.attachments[0].download_code, "dc1");
+    }
+
+    #[test]
+    fn parse_file_and_audio() {
+        let frame = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
+            "data": r#"{"msgId":"msg1","senderStaffId":"u1","msgtype":"file","content":{"downloadCode":"dcf","fileName":"合同.pdf"}}"#
+        });
+        let m = parse_message(&frame).unwrap();
+        assert_eq!(m.attachments[0].kind, "file");
+        assert_eq!(m.attachments[0].file_name, "合同.pdf");
+
         let frame2 = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m2"},
+            "data": r#"{"msgId":"msg2","senderStaffId":"u1","msgtype":"audio","content":{"downloadCode":"dca","recognition":"好的"}}"#
+        });
+        let m2 = parse_message(&frame2).unwrap();
+        assert_eq!(m2.attachments[0].kind, "audio");
+        assert_eq!(m2.attachments[0].voice_text, "好的");
+    }
+
+    #[test]
+    fn parse_rich_text_with_picture() {
+        let frame = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
+            "data": r#"{"msgId":"msg1","senderStaffId":"u1","msgtype":"richText","content":[{"text":"看图"},{"type":"picture","downloadCode":"dcp"}]}"#
+        });
+        let m = parse_message(&frame).unwrap();
+        assert_eq!(m.text, "看图");
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].kind, "image");
+        assert_eq!(m.attachments[0].download_code, "dcp");
+    }
+
+    #[test]
+    fn parse_ignores_empty_text() {
+        // 空文本仍丢弃
+        let frame = json!({
             "type": "CALLBACK",
             "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
             "data": r#"{"msgId":"msg1","senderStaffId":"u1","msgtype":"text","text":{"content":"   "}}"#
+        });
+        assert!(parse_message(&frame).is_none());
+        // 未知 msgtype 丢弃
+        let frame2 = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
+            "data": r#"{"msgId":"msg1","senderStaffId":"u1","msgtype":"unknown"}"#
         });
         assert!(parse_message(&frame2).is_none());
     }

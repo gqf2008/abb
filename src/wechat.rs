@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 /// 登录固定网关（扫码阶段连这里；登录后多数情况仍用它，除非响应带 redirect_host/baseurl）。
 pub const FIXED_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+/// 媒体 CDN 根地址（openclaw-weixin 默认；可通过 wx_cdn_base_url 配置覆盖）。
+pub const DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 const BOT_TYPE: &str = "3";
 const ILINK_APP_ID: &str = "bot";
 const ILINK_APP_CLIENT_VERSION: &str = "20301"; // 对应 2.3.1
@@ -50,7 +52,6 @@ mod b64 {
         }
     }
 
-    #[allow(dead_code)] // 解码：二维码内容若是 base64 图片时用（当前服务端返回 URL，保留备用）
     pub fn decode(s: &str) -> Option<Vec<u8>> {
         let bytes: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
         let mut out = Vec::new();
@@ -125,6 +126,9 @@ pub struct WeixinClient {
     http: reqwest::Client,
     base_url: String,
     token: String,
+    /// 媒体 CDN 根地址（默认 https://novac2c.cdn.weixin.qq.com/c2c）。
+    /// 入站图片/语音/文件通过它拼下载 URL + AES-128-ECB 解密（对齐 openclaw-weixin）。
+    cdn_base_url: String,
 }
 
 /// message_id 服务器有时返回整数、有时返回字符串（实测真实消息里是整数 7490...）。
@@ -179,12 +183,148 @@ pub struct MessageItem {
     pub item_type: i64,
     #[serde(default)]
     pub text_item: Option<TextItem>,
+    #[serde(default)]
+    pub image_item: Option<ImageItem>,
+    #[serde(default)]
+    pub voice_item: Option<VoiceItem>,
+    #[serde(default)]
+    pub file_item: Option<FileItem>,
+    #[serde(default)]
+    pub video_item: Option<VideoItem>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TextItem {
     #[serde(default)]
     pub text: String,
+}
+
+/// CDN 媒体引用（对齐 openclaw-weixin src/api/types.ts 的 CDNMedia）。
+/// aes_key 是 base64 字符串；图片优先用 ImageItem.aeskey（hex），文件/语音/视频用 media.aes_key。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CDNMedia {
+    #[serde(default)]
+    pub encrypt_query_param: String,
+    #[serde(default)]
+    pub aes_key: String,
+    #[serde(default)]
+    pub encrypt_type: Option<i64>,
+    /// 完整下载 URL（服务端直接返回时优先用它，无需拼接 CDN）。
+    #[serde(default)]
+    pub full_url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageItem {
+    #[serde(default)]
+    pub media: Option<CDNMedia>,
+    /// Raw AES-128 key，hex 字符串（16 字节）；入站解密优先于 media.aes_key。
+    #[serde(default)]
+    pub aeskey: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VoiceItem {
+    #[serde(default)]
+    pub media: Option<CDNMedia>,
+    /// 语音转文字内容（有则 agent 直接用，不必解音频）。
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileItem {
+    #[serde(default)]
+    pub media: Option<CDNMedia>,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub md5: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VideoItem {
+    #[serde(default)]
+    pub media: Option<CDNMedia>,
+    #[serde(default)]
+    pub thumb_media: Option<CDNMedia>,
+}
+
+/// 从 MessageItem 提取出的 CDN 媒体引用（跨模块给 messenger 下载用，避免携带整个 item）。
+#[derive(Debug, Clone, Default)]
+pub struct WechatMedia {
+    /// image | audio | video | file
+    pub kind: String,
+    pub file_name: String,
+    pub encrypt_query_param: String,
+    /// CDNMedia.aes_key（base64）
+    pub aes_key: String,
+    /// ImageItem.aeskey（hex 字符串，图片解密优先）
+    pub aeskey_hex: String,
+    pub full_url: String,
+    /// 语音转写文本（voice_item.text），有则记进附件备注
+    pub voice_text: String,
+}
+
+impl MessageItem {
+    /// 提取媒体引用（图片/语音/文件/视频；无则 None）。
+    /// 图片无 aes 时允许明文下载；语音/文件/视频必须带 media.aes_key 才能解密。
+    pub fn media(&self) -> Option<WechatMedia> {
+        if self.item_type == 2 {
+            let img = self.image_item.as_ref()?;
+            let empty = CDNMedia::default();
+            let m = img.media.as_ref().unwrap_or(&empty);
+            Some(WechatMedia {
+                kind: "image".into(),
+                file_name: String::new(),
+                encrypt_query_param: m.encrypt_query_param.clone(),
+                aes_key: m.aes_key.clone(),
+                aeskey_hex: img.aeskey.clone(),
+                full_url: m.full_url.clone(),
+                voice_text: String::new(),
+            })
+        } else if self.item_type == 3 {
+            let v = self.voice_item.as_ref()?;
+            let m = v.media.as_ref()?;
+            Some(WechatMedia {
+                kind: "audio".into(),
+                file_name: String::new(),
+                encrypt_query_param: m.encrypt_query_param.clone(),
+                aes_key: m.aes_key.clone(),
+                aeskey_hex: String::new(),
+                full_url: m.full_url.clone(),
+                voice_text: v.text.clone(),
+            })
+        } else if self.item_type == 4 {
+            let f = self.file_item.as_ref()?;
+            let m = f.media.as_ref()?;
+            Some(WechatMedia {
+                kind: "file".into(),
+                file_name: f.file_name.clone(),
+                encrypt_query_param: m.encrypt_query_param.clone(),
+                aes_key: m.aes_key.clone(),
+                aeskey_hex: String::new(),
+                full_url: m.full_url.clone(),
+                voice_text: String::new(),
+            })
+        } else if self.item_type == 5 {
+            let v = self.video_item.as_ref()?;
+            let m = v.media.as_ref()?;
+            Some(WechatMedia {
+                kind: "video".into(),
+                file_name: String::new(),
+                encrypt_query_param: m.encrypt_query_param.clone(),
+                aes_key: m.aes_key.clone(),
+                aeskey_hex: String::new(),
+                full_url: m.full_url.clone(),
+                voice_text: String::new(),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl WeixinMessage {
@@ -196,6 +336,11 @@ impl WeixinMessage {
             .and_then(|it| it.text_item.as_ref())
             .map(|t| t.text.clone())
             .unwrap_or_default()
+    }
+
+    /// 提取全部媒体引用（含文本消息旁的图片等）。
+    pub fn media_items(&self) -> Vec<WechatMedia> {
+        self.item_list.iter().filter_map(|it| it.media()).collect()
     }
 }
 
@@ -212,7 +357,7 @@ struct GetUpdatesResp {
 }
 
 impl WeixinClient {
-    pub fn new(base_url: &str, token: &str) -> WeixinClient {
+    pub fn new(base_url: &str, token: &str, cdn_base_url: &str) -> WeixinClient {
         // 单 client 复用连接池/TLS；长轮询用每请求超时覆盖默认总超时。
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -222,6 +367,7 @@ impl WeixinClient {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            cdn_base_url: cdn_base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -336,6 +482,151 @@ impl WeixinClient {
         }
         Ok(())
     }
+
+    /// 下载并解密一条 CDN 媒体（图片/语音/文件/视频），返回 (明文字节, 猜测 mime, 文件名, 备注)。
+    /// 下载失败返回 Err（由调用方转成附件「下载失败」备注，不丢消息）；非媒体 item 返回 Ok(None)。
+    pub async fn download_media(
+        &self,
+        media: &WechatMedia,
+    ) -> Result<Option<(Vec<u8>, String, String, String)>> {
+        // 既无 encrypt_query_param 也无 full_url → 无可下载内容
+        if media.encrypt_query_param.is_empty() && media.full_url.is_empty() {
+            return Ok(None);
+        }
+        let url = if !media.full_url.is_empty() {
+            media.full_url.clone()
+        } else if self.cdn_base_url.is_empty() {
+            anyhow::bail!("微信 CDN 未配置（wx_cdn_base_url 为空）且无 full_url");
+        } else {
+            format!(
+                "{}/download?encrypted_query_param={}",
+                self.cdn_base_url,
+                percent_encode_query(&media.encrypt_query_param)
+            )
+        };
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .with_context(|| format!("微信 CDN 下载网络错误 kind={}", media.kind))?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "微信 CDN 下载失败 HTTP {} kind={}",
+                resp.status().as_u16(),
+                media.kind
+            );
+        }
+        let encrypted = resp.bytes().await.context("微信 CDN 读响应失败")?;
+
+        // 图片：优先 ImageItem.aeskey（hex）→ media.aes_key（base64）；两者都无 = 明文 CDN。
+        // 语音/文件/视频：必须有 media.aes_key 才能解密。
+        let key = if !media.aeskey_hex.is_empty() {
+            Some(parse_aes_key_from_hex(&media.aeskey_hex)?)
+        } else if !media.aes_key.is_empty() {
+            Some(parse_aes_key_from_b64(&media.aes_key)?)
+        } else if media.kind == "image" {
+            None
+        } else {
+            anyhow::bail!("{} 媒体缺少 aes_key，无法解密", media.kind);
+        };
+
+        let bytes = match key {
+            Some(k) => aes_ecb_decrypt(&encrypted, &k)?,
+            None => encrypted.to_vec(),
+        };
+        let mime = crate::attachments::mime_from_name(&media.file_name, &media.kind);
+        let note = if media.voice_text.is_empty() {
+            String::new()
+        } else {
+            format!("语音转写={}", media.voice_text)
+        };
+        Ok(Some((bytes, mime, media.file_name.clone(), note)))
+    }
+}
+
+// ── CDN AES-128-ECB 解密（对齐 openclaw-weixin src/cdn）──
+
+/// 从 base64 的 aes_key 还原 16 字节密钥。两种形态：
+///   - base64(原始 16 字节)          → 图片（media.aes_key）
+///   - base64(16 字节的 hex 字符串)  → 文件/语音/视频（media.aes_key）
+fn parse_aes_key_from_b64(aes_key_b64: &str) -> Result<[u8; 16]> {
+    let decoded = b64::decode(aes_key_b64).context("aes_key base64 解码失败")?;
+    if decoded.len() == 16 {
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&decoded);
+        return Ok(key);
+    }
+    if decoded.len() == 32 {
+        if let Ok(hex) = std::str::from_utf8(&decoded) {
+            if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return parse_aes_key_from_hex(hex);
+            }
+        }
+    }
+    anyhow::bail!(
+        "aes_key 必须是 16 原始字节或 32 hex 字符的 base64，实际 {} 字节",
+        decoded.len()
+    )
+}
+
+/// 从 hex 字符串还原 16 字节密钥（ImageItem.aeskey 形态）。
+fn parse_aes_key_from_hex(hex: &str) -> Result<[u8; 16]> {
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "aeskey hex 必须是 32 个 hex 字符，实际 {:?}",
+            &hex[..hex.len().min(40)]
+        );
+    }
+    let mut key = [0u8; 16];
+    for (i, item) in key.iter_mut().enumerate() {
+        let hi = (hex.as_bytes()[i * 2] as char).to_digit(16).unwrap() as u8;
+        let lo = (hex.as_bytes()[i * 2 + 1] as char).to_digit(16).unwrap() as u8;
+        *item = (hi << 4) | lo;
+    }
+    Ok(key)
+}
+
+/// AES-128-ECB 解密（PKCS7 去填充）。密文长度必须是 16 的倍数。
+fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+        anyhow::bail!("CDN 密文长度 {} 不是 16 的倍数，解密失败", ciphertext.len());
+    }
+    let cipher = aes::Aes128::new_from_slice(key).context("AES key 初始化失败")?;
+    let mut buf = ciphertext.to_vec();
+    for chunk in buf.chunks_exact_mut(16) {
+        let block = GenericArray::from_mut_slice(chunk);
+        cipher.decrypt_block(block);
+    }
+    // PKCS7 去填充
+    let pad = *buf.last().unwrap() as usize;
+    if pad == 0 || pad > 16 || buf.len() < pad {
+        anyhow::bail!("CDN 明文 PKCS7 填充非法 (pad={pad})");
+    }
+    let end = buf.len() - pad;
+    if buf[end..].iter().any(|&b| b as usize != pad) {
+        anyhow::bail!("CDN 明文 PKCS7 填充校验失败 (pad={pad})");
+    }
+    buf.truncate(end);
+    Ok(buf)
+}
+
+/// query 参数百分号编码（encrypt_query_param 可能含 +/= 等 URL 特殊字符）。
+/// 对齐 openclaw-weixin 的 encodeURIComponent 语义：除保留字符外全部转义。
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ── 扫码登录 ──
@@ -521,9 +812,109 @@ mod tests {
             item_list: vec![MessageItem {
                 item_type: 2,
                 text_item: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
         assert_eq!(m2.text(), "");
+        assert!(m2.media_items().is_empty());
+    }
+
+    #[test]
+    fn message_media_extraction() {
+        // 图片：aeskey hex + media
+        let m = WeixinMessage {
+            item_list: vec![MessageItem {
+                item_type: 2,
+                image_item: Some(ImageItem {
+                    media: Some(CDNMedia {
+                        encrypt_query_param: "abc".into(),
+                        aes_key: "a2V5".into(),
+                        full_url: String::new(),
+                        ..Default::default()
+                    }),
+                    aeskey: "00112233445566778899aabbccddeeff".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let medias = m.media_items();
+        assert_eq!(medias.len(), 1);
+        assert_eq!(medias[0].kind, "image");
+        assert_eq!(medias[0].encrypt_query_param, "abc");
+        assert_eq!(medias[0].aeskey_hex, "00112233445566778899aabbccddeeff");
+
+        // 文件：file_name + aes_key
+        let m2 = WeixinMessage {
+            item_list: vec![MessageItem {
+                item_type: 4,
+                file_item: Some(FileItem {
+                    media: Some(CDNMedia {
+                        encrypt_query_param: "f1".into(),
+                        aes_key: "a2V5".into(),
+                        full_url: String::new(),
+                        ..Default::default()
+                    }),
+                    file_name: "报告.pdf".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let medias2 = m2.media_items();
+        assert_eq!(medias2.len(), 1);
+        assert_eq!(medias2[0].kind, "file");
+        assert_eq!(medias2[0].file_name, "报告.pdf");
+    }
+
+    #[test]
+    fn parse_aes_key_formats() {
+        // base64(16 原始字节) —— "0123456789abcdef" 的 base64
+        let b64 = b64::encode(b"0123456789abcdef");
+        let k1 = parse_aes_key_from_b64(&b64).unwrap();
+        assert_eq!(&k1, b"0123456789abcdef");
+        // base64(hex 字符串 32 字符)
+        let hex = "00112233445566778899aabbccddeeff";
+        let b64_hex = b64::encode(hex.as_bytes());
+        let k2 = parse_aes_key_from_b64(&b64_hex).unwrap();
+        assert_eq!(k2[0], 0x00);
+        assert_eq!(k2[15], 0xff);
+        // hex 直解（ImageItem.aeskey）
+        let k3 = parse_aes_key_from_hex(hex).unwrap();
+        assert_eq!(k2, k3);
+        // 非法
+        assert!(parse_aes_key_from_hex("xyz").is_err());
+        assert!(parse_aes_key_from_b64("AAAA").is_err());
+    }
+
+    #[test]
+    fn aes_ecb_decrypt_roundtrip() {
+        use aes::cipher::generic_array::GenericArray;
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        let key = *b"0123456789abcdef";
+        let plain = b"hello wechat media!";
+        // 自己加密（PKCS7 填充）再解密验证
+        let cipher = aes::Aes128::new_from_slice(&key).unwrap();
+        let pad = 16 - (plain.len() % 16);
+        let mut padded = plain.to_vec();
+        padded.extend(std::iter::repeat_n(pad as u8, pad));
+        let mut enc = padded.clone();
+        for chunk in enc.chunks_exact_mut(16) {
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.encrypt_block(block);
+        }
+        let dec = aes_ecb_decrypt(&enc, &key).unwrap();
+        assert_eq!(dec, plain);
+        // 长度非 16 倍数报错
+        assert!(aes_ecb_decrypt(&[1, 2, 3], &key).is_err());
+    }
+
+    #[test]
+    fn percent_encode_query_works() {
+        assert_eq!(percent_encode_query("a+b/c=="), "a%2Bb%2Fc%3D%3D");
+        assert_eq!(percent_encode_query("simple-._~"), "simple-._~");
     }
 }

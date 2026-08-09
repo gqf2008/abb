@@ -44,6 +44,8 @@ pub struct Ev {
     /// 飞书话题 ID（omt_ 开头）；空=非话题消息。微信/钉钉恒为空。
     pub thread_id: String,
     pub text: String,
+    /// 已下载到工作区的附件元数据（#12）。纯附件消息 text 为空但 attachments 非空。
+    pub attachments: Vec<crate::attachments::AttachmentMeta>,
 }
 
 impl Ev {
@@ -235,29 +237,37 @@ impl Bridge {
             return;
         }
 
-        // content 是 JSON 字符串，取 .text（失败回退原文）
+        // content 是 JSON 字符串：文本 / 图片 / 文件 / 音视频 / 富文本（#12）。
+        // 非文本消息解析出资源引用后下载附件，text 保持空（不再把 raw JSON 当文本透传）。
         let raw = message["content"].as_str().unwrap_or("");
-        let text = serde_json::from_str::<serde_json::Value>(raw)
-            .ok()
-            .and_then(|v| v["text"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| raw.to_string());
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            crate::log!(
-                "[bridge] 收到非文本消息，忽略（bot={} chat_type={}）",
-                self.bot.key(),
-                chat_type
-            );
-            return;
+        let parsed = crate::feishu::parse_content(raw);
+        let text = parsed.text.trim().to_string();
+        let mid = message["message_id"].as_str().unwrap_or("").to_string();
+        let mut attachments = Vec::new();
+        if let Some(res) = parsed.resource {
+            let desc = crate::attachments::AttachmentDesc::Feishu {
+                message_id: mid.clone(),
+                file_key: res.file_key,
+                kind: res.kind.clone(),
+                file_name: res.file_name,
+            };
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &mid, 0, &desc)
+                .await
+            {
+                attachments.push(meta);
+            }
         }
 
         let ev = Ev {
-            mid: message["message_id"].as_str().unwrap_or("").to_string(),
+            mid,
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
             // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
             thread_id: message["thread_id"].as_str().unwrap_or("").to_string(),
             text,
+            attachments,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
             crate::log!(
@@ -299,9 +309,10 @@ impl Bridge {
 
         // 剥群聊 @_user_N 提及标签
         let text = strip_mentions(&ev.text).trim().to_string();
-        if text.is_empty() {
+        // #12：纯附件消息（text 空但 attachments 非空）也进 agent，不丢
+        if text.is_empty() && ev.attachments.is_empty() {
             crate::log!(
-                "[bridge] chat {} 跳过空/非文本消息",
+                "[bridge] chat {} 跳过空消息",
                 &ev.chat_id[..ev.chat_id.len().min(10)]
             );
             return;
@@ -332,7 +343,29 @@ impl Bridge {
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
         // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
         let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let prompt = text;
+        // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
+        // 附件元数据行带路径/mime/sha256，agent 可直接读取工作区文件内容。
+        let has_text = !text.is_empty();
+        let urls = if has_text {
+            crate::attachments::extract_urls(&text)
+        } else {
+            Vec::new()
+        };
+        let mut prompt = text;
+        if !ev.attachments.is_empty() {
+            prompt.push_str("\n\n[附件]");
+            for a in &ev.attachments {
+                prompt.push('\n');
+                prompt.push_str(&a.to_prompt_line());
+            }
+        }
+        if !urls.is_empty() {
+            prompt.push_str("\n\n[链接]");
+            for u in urls {
+                prompt.push('\n');
+                prompt.push_str(&u);
+            }
+        }
 
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
@@ -464,22 +497,35 @@ impl Bridge {
         // token 已刷新 → 顺带补发该会话积压的任务报告（主动推送曾被微信拒绝的，不静默丢失）
         self.flush_outbox(&from).await;
         let text = msg.text().trim().to_string();
-        if text.is_empty() {
-            crate::log!("[weixin] 丢弃：text 为空（非文本消息）");
-            return; // 非文本（图片/语音/文件暂未实现）
-        }
+        // 微信 message_id 可能为空；用 session_id+时间戳凑一个去重键
         let mid = if msg.message_id.is_empty() {
-            // 微信 message_id 可能为空；用 session_id+时间戳凑一个去重键
             format!("{}:{}", msg.session_id, msg.create_time_ms)
         } else {
             msg.message_id.clone()
         };
+        // #12：图片/语音/文件/视频 → 下载保存（CDN AES 解密），纯附件消息 text 空也能进 agent
+        let mut attachments = Vec::new();
+        for (i, media) in msg.media_items().iter().enumerate() {
+            let desc = crate::attachments::AttachmentDesc::Wechat(media.clone());
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &mid, i, &desc)
+                .await
+            {
+                attachments.push(meta);
+            }
+        }
+        if text.is_empty() && attachments.is_empty() {
+            crate::log!("[weixin] 丢弃：text 为空且无附件");
+            return;
+        }
         let ev = Ev {
             mid,
             chat_id: from,               // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
             thread_id: String::new(),    // 微信无话题
             text,
+            attachments,
         };
         self.handle(ev).await;
     }
@@ -511,6 +557,25 @@ impl Bridge {
         // 群聊回复需要 @ 提问者 → 记最近 sender（单聊 chat_id==sender，无意义但无害）
         self.msgr.note_sender(&chat_id, &msg.sender_staff_id);
 
+        // #12：图片/文件/语音/视频（含富文本里的图）→ 下载保存；纯附件消息 text 空也能进 agent
+        let mut attachments = Vec::new();
+        for (i, a) in msg.attachments.iter().enumerate() {
+            let desc = crate::attachments::AttachmentDesc::Dingtalk {
+                download_code: a.download_code.clone(),
+                robot_code: msg.robot_code.clone(),
+                kind: a.kind.clone(),
+                file_name: a.file_name.clone(),
+                voice_text: a.voice_text.clone(),
+            };
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &msg.mid, i, &desc)
+                .await
+            {
+                attachments.push(meta);
+            }
+        }
+
         // 剥群聊文本里的 "@机器人名" 前缀（钉钉推给机器人的内容会带上），只剥一次
         let is_group = msg.is_group();
         let mut text = msg.text;
@@ -520,9 +585,14 @@ impl Bridge {
         let ev = Ev {
             mid: msg.mid,
             chat_id,
-            chat_type: if is_group { "group".to_string() } else { "dm".to_string() },
+            chat_type: if is_group {
+                "group".to_string()
+            } else {
+                "dm".to_string()
+            },
             thread_id: String::new(), // 钉钉无话题
             text,
+            attachments,
         };
         self.handle(ev).await;
     }
@@ -612,6 +682,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "hi".into(),
+            attachments: vec![],
         };
         assert_eq!(ev.key(), "oc_group");
     }
@@ -625,6 +696,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: thread.into(),
             text: "hi".into(),
+            attachments: vec![],
         };
         let a = base("omt_aaa");
         let b = base("omt_bbb");
