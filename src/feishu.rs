@@ -104,6 +104,41 @@ impl FeishuClient {
         Ok(())
     }
 
+    /// 回复指定消息（飞书话题消息回复走这里）：以 message_id 为回复目标，
+    /// `reply_in_thread: true` 保证回复落在原话题内（#14）。
+    /// 注意：create 发送接口不支持 thread 参数，话题回复必须走 reply 接口。
+    pub async fn reply_text(&self, message_id: &str, text: &str) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let chunks = split_text(text, FEISHU_MSG_LIMIT);
+        let n = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let body_text = if n > 1 {
+                format!("（{}/{n}）\n{}", i + 1, chunk)
+            } else {
+                chunk
+            };
+            let resp: serde_json::Value = self
+                .http
+                .post(format!("{API_BASE}/im/v1/messages/{message_id}/reply"))
+                .bearer_auth(&token)
+                .json(&reply_body(&body_text))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+                // API 级失败必须上报（同 send_text）：否则调用方以为回复成功，
+                // 用户在话题里收不到任何回复也无痕迹。
+                anyhow::bail!(
+                    "回复失败 code={:?} msg={:?}",
+                    resp.get("code"),
+                    resp.get("msg")
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// 加表情，返回 reaction_id（删除用）。失败 None。
     pub async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Option<String> {
         let token = self.tenant_token().await.ok()?;
@@ -170,6 +205,15 @@ impl FeishuClient {
     }
 }
 
+/// 构造回复消息请求体（纯函数，便于单测断言 reply_in_thread / content）。
+fn reply_body(body_text: &str) -> serde_json::Value {
+    json!({
+        "msg_type": "text",
+        "content": serde_json::to_string(&json!({"text": body_text})).unwrap_or_default(),
+        "reply_in_thread": true,
+    })
+}
+
 /// 按字符数（不是字节）逐行贪心分段，对齐 Python 的 len() 语义。
 pub fn split_text(text: &str, limit: usize) -> Vec<String> {
     let char_count = text.chars().count();
@@ -224,5 +268,16 @@ mod tests {
         let text = "a".repeat(8000); // 无换行的超长行
         let chunks = split_text(&text, 3500);
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn reply_body_uses_reply_in_thread() {
+        // 话题回复必须带 reply_in_thread: true，否则回复会落到群根会话（#14）
+        let body = reply_body("你好");
+        assert_eq!(body["msg_type"], "text");
+        assert_eq!(body["reply_in_thread"], true);
+        let content: serde_json::Value =
+            serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["text"], "你好");
     }
 }

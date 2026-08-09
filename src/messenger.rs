@@ -1,5 +1,6 @@
 //! Messenger 抽象 —— 统一飞书 / 微信 / 钉钉的发送接口。
-//! `send_text` 是唯一必须实现；表情（Typing/DONE）飞书有、微信/钉钉没有（默认空实现）。
+//! `send_text` 是唯一必须实现；话题回复 `send_thread_reply` 有默认回落（飞书覆盖为 reply 接口）；
+//! 表情（Typing/DONE）飞书有、微信/钉钉没有（默认空实现）。
 //! Bridge 持 `Arc<dyn Messenger>`，按 bot.kind 注入具体实现。
 
 use crate::config::BotConfig;
@@ -14,6 +15,12 @@ use std::sync::Mutex;
 pub trait Messenger: Send + Sync {
     /// 发文本到会话。chat_id：飞书=chat_id；微信=ilink_user_id。
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<()>;
+
+    /// 发送到会话内话题：飞书以 message_id 走回复接口（reply_in_thread: true），
+    /// 保证回复落在原话题内（#14）；其它通道没有话题，默认回落普通发送。
+    async fn send_thread_reply(&self, chat_id: &str, _message_id: &str, text: &str) -> Result<()> {
+        self.send_text(chat_id, text).await
+    }
 
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
     async fn typing(&self, _message_id: &str) -> Option<String> {
@@ -40,6 +47,9 @@ pub struct FeishuMessenger {
 impl Messenger for FeishuMessenger {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
         self.fs.send_text(chat_id, text).await
+    }
+    async fn send_thread_reply(&self, _chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        self.fs.reply_text(message_id, text).await
     }
     async fn typing(&self, message_id: &str) -> Option<String> {
         self.fs.add_reaction(message_id, "Typing").await
