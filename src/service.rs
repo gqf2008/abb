@@ -325,29 +325,55 @@ async fn run_job(bridge: Arc<Bridge>, job: crate::schedule::Job) {
         crate::schedule::JobKind::Once => "⏰ 定时提醒",
         crate::schedule::JobKind::Cron => "⏰ 定时任务",
     };
+    let text = format!("{header}\n\n{reply}");
     // 先发原会话
-    let sent = bridge
-        .msgr
-        .send_text(&job.chat_id, &format!("{header}\n\n{reply}"))
-        .await;
-    if let Err(e) = sent {
-        // 原会话失效 → 回落本 bot 主会话
-        let primary = crate::config::Config::primary_chat(&bot_key);
-        crate::log!(
-            "[bot:{bot_key}] 任务 {} 原会话 {} 发送失败（{}），回落主会话 {}",
+    match bridge.msgr.send_text(&job.chat_id, &text).await {
+        Ok(()) => crate::log!(
+            "[bot:{bot_key}] 任务 {} 发送成功 chat={} 长度={}",
             &job.id[..8],
             &job.chat_id[..job.chat_id.len().min(10)],
-            e,
-            &primary[..primary.len().min(10)]
-        );
-        if !primary.is_empty() && primary != job.chat_id {
-            let _ = bridge
-                .msgr
-                .send_text(
-                    &primary,
-                    &format!("{header}（原会话已失效，转发到主会话）\n\n{reply}"),
-                )
-                .await;
+            text.chars().count()
+        ),
+        Err(e) => {
+            crate::log!(
+                "[bot:{bot_key}] 任务 {} 原会话 {} 发送失败（{}）",
+                &job.id[..8],
+                &job.chat_id[..job.chat_id.len().min(10)],
+                e
+            );
+            // 微信：主动推送受会话活跃度约束（ret=-2 = context_token stale），同 token 重试
+            // 必然再失败 → 落盘积压，等用户下次发消息刷新 token 后补发，避免任务报告静默丢失。
+            if bridge.bot.is_wechat() {
+                bridge.queue_outbox(&job.chat_id, &text, &job.id);
+            }
+            // 原会话失效 → 回落本 bot 主会话（微信主会话==原会话时上面已积压，不再重复发）
+            let primary = crate::config::Config::primary_chat(&bot_key);
+            if !primary.is_empty() && primary != job.chat_id {
+                let fallback_text = format!("{header}（原会话已失效，转发到主会话）\n\n{reply}");
+                crate::log!(
+                    "[bot:{bot_key}] 任务 {} 回落主会话 {}",
+                    &job.id[..8],
+                    &primary[..primary.len().min(10)]
+                );
+                match bridge.msgr.send_text(&primary, &fallback_text).await {
+                    Ok(()) => crate::log!(
+                        "[bot:{bot_key}] 任务 {} 回落发送成功 chat={} 长度={}",
+                        &job.id[..8],
+                        &primary[..primary.len().min(10)],
+                        fallback_text.chars().count()
+                    ),
+                    Err(se) => {
+                        crate::log!(
+                            "[bot:{bot_key}] 任务 {} 回落发送也失败（{}）",
+                            &job.id[..8],
+                            se
+                        );
+                        if bridge.bot.is_wechat() {
+                            bridge.queue_outbox(&primary, &fallback_text, &job.id);
+                        }
+                    }
+                }
+            }
         }
     }
     if job.kind == crate::schedule::JobKind::Once {
