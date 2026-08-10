@@ -6,14 +6,14 @@
 //! 本模块只负责「落盘 + 元数据 + 摘要文本」；各平台下载在对应 client/messenger 里做。
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// 附件大小上限（字节）：飞书/微信参考实现均限 100MB，这里统一 200MB 兜底防异常超大文件打爆磁盘。
 pub const MAX_ATTACHMENT_BYTES: usize = 200 * 1024 * 1024;
 
 /// 一个已保存附件的元数据（也是给 agent 的摘要来源）。
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentMeta {
     /// 消息种类：image | audio | video | file。
     pub kind: String,
@@ -271,6 +271,23 @@ pub fn mime_from_name(file_name: &str, kind: &str) -> String {
     }
 }
 
+/// 从文件名猜附件种类（image/audio/video/file）。deliver CLI --file 转发附件元数据用。
+pub fn kind_from_name(file_name: &str) -> String {
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "svg" | "ico" => "image",
+        "mp3" | "wav" | "ogg" | "amr" | "silk" | "m4a" | "aac" | "flac" => "audio",
+        "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" => "video",
+        _ => "file",
+    }
+    .to_string()
+}
+
 /// SHA-256（hex）。附件完整性校验 + agent 引用标识。
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -373,6 +390,16 @@ mod tests {
         // 无 mime 映射回落 kind
         assert_eq!(ext_from("无后缀", "", "image"), ".img");
         assert_eq!(ext_from("", "", "file"), ".bin");
+    }
+
+    #[test]
+    fn kind_from_name_works() {
+        assert_eq!(kind_from_name("a.PNG"), "image");
+        assert_eq!(kind_from_name("photo.jpeg"), "image");
+        assert_eq!(kind_from_name("voice.mp3"), "audio");
+        assert_eq!(kind_from_name("clip.mp4"), "video");
+        assert_eq!(kind_from_name("report.pdf"), "file");
+        assert_eq!(kind_from_name("无后缀"), "file");
     }
 
     #[test]

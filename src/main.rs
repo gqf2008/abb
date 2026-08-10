@@ -367,6 +367,7 @@ fn run_job_cli(args: &[String]) -> i32 {
             let mut cron: Option<String> = None;
             let mut prompt: Option<String> = None;
             let mut note: Option<String> = None;
+            let mut targets: Vec<schedule::JobTarget> = Vec::new();
             let mut i = 1;
             while i < args.len() {
                 let flag = args[i].as_str();
@@ -386,6 +387,24 @@ fn run_job_cli(args: &[String]) -> i32 {
                     }
                     "--note" => {
                         note = val.map(|s| s.to_string());
+                        i += 2;
+                    }
+                    // 多投递目标（#21）：可重复，`bot_key:chat_id` 跨 bot，裸 `chat_id` 本 bot
+                    "--to" => {
+                        let raw = match val {
+                            Some(v) => v.to_string(),
+                            None => {
+                                eprintln!("--to 缺少值（格式：bot_key:chat_id 或 chat_id）");
+                                return 1;
+                            }
+                        };
+                        match schedule::parse_job_target(&raw) {
+                            Ok(t) => targets.push(t),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                return 1;
+                            }
+                        }
                         i += 2;
                     }
                     other => {
@@ -426,6 +445,7 @@ fn run_job_cli(args: &[String]) -> i32 {
                 &prompt,
                 &chat_id,
                 &note,
+                targets,
             ) {
                 Ok(job) => {
                     let desc = job.describe();
@@ -441,7 +461,7 @@ fn run_job_cli(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!(
-                "用法：\n  agent-bridge job list\n  agent-bridge job del <id前缀>\n  agent-bridge job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"做什么\" [--note \"原句\"]"
+                "用法：\n  agent-bridge job list\n  agent-bridge job del <id前缀>\n  agent-bridge job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"做什么\" [--note \"原句\"] [--to bot_key:chat_id]…（--to 可重复，跨 bot 多目标）"
             );
             1
         }
@@ -485,10 +505,15 @@ fn run_deliver_cli(args: &[String]) -> i32 {
     let item = match deliver::parse_deliver_args(args, &env_bot, &env_chat) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\"");
+            eprintln!("{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\" [--file <本地路径>]…");
             return 1;
         }
     };
+    // 自环防护（消息循环防护 #21）：同 bot 同会话转发给自己没有意义且是循环温床。
+    if deliver::is_self_loop(&item) {
+        eprintln!("不能投递回当前会话（来源与目标相同），已拒绝。");
+        return 1;
+    }
     // 目标 bot 必须真实存在（与 service 路由表同源：config.bots[].key()）
     if !cfg.bots.iter().any(|b| b.key() == item.target_bot) {
         let keys: Vec<String> = cfg.bots.iter().map(|b| b.key()).collect();

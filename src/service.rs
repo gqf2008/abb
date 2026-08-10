@@ -121,12 +121,12 @@ pub async fn run() {
         crate::install::set_desired(false);
         std::process::exit(1);
     }
-    let router = std::sync::Arc::new(crate::deliver::Router {
-        enabled: cfg.cross_delivery_enabled,
+    let router = std::sync::Arc::new(crate::deliver::Router::new(
+        cfg.cross_delivery_enabled,
         messengers,
-        bots: bot_cfgs,
-        outbox_dir: None,
-    });
+        bot_cfgs,
+        None,
+    ));
     // 跨会话投递消费循环（独立于 bot 循环，共享 stop）
     {
         let router = router.clone();
@@ -139,8 +139,9 @@ pub async fn run() {
     for (bot, msgr) in ready {
         let cfg = cfg.clone();
         let stop = stop_rx.clone();
+        let router = router.clone();
         handles.push(tokio::spawn(async move {
-            run_bot(bot, cfg, msgr, stop).await;
+            run_bot(bot, cfg, msgr, router, stop).await;
         }));
     }
     // 等所有 bot 循环结束（正常只有 stop 才会结束）
@@ -179,6 +180,7 @@ async fn run_bot(
     bot: crate::config::BotConfig,
     cfg: Arc<Config>,
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
+    router: std::sync::Arc<crate::deliver::Router>,
     stop_rx: watch::Receiver<bool>,
 ) {
     let key = bot.key();
@@ -231,10 +233,11 @@ async fn run_bot(
                         r.insert(job.id.clone());
                     }
                     let bridge = bridge.clone();
+                    let router = router.clone();
                     let running = running.clone();
                     let jid = job.id.clone();
                     tokio::spawn(async move {
-                        run_job(bridge, job).await;
+                        run_job(bridge, router, job).await;
                         running.lock().unwrap().remove(&jid);
                     });
                 }
@@ -354,9 +357,14 @@ async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receive
     }
 }
 
-/// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发飞书；once 任务执行后删除。
+/// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
 /// 回发优先发任务原会话；若该会话已失效（群解散/bot 被移出等），回落到主会话（私聊，必存在）。
-async fn run_job(bridge: Arc<Bridge>, job: crate::schedule::Job) {
+/// 多目标（#21）：job.targets 非空时向每个目标各投一份（可跨 bot，经路由表投递 + 失败兜底）。
+async fn run_job(
+    bridge: Arc<Bridge>,
+    router: std::sync::Arc<crate::deliver::Router>,
+    job: crate::schedule::Job,
+) {
     let bot_key = bridge.bot.key();
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
     // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
@@ -390,7 +398,17 @@ async fn run_job(bridge: Arc<Bridge>, job: crate::schedule::Job) {
         crate::schedule::JobKind::Cron => "⏰ 定时任务",
     };
     let text = format!("{header}\n\n{reply}");
-    // 先发原会话
+    // 多目标（#21）：每个目标各投一份（跨 bot 走路由表；失败由 Router 回源报错 + 微信 outbox 兜底）
+    if !job.targets.is_empty() {
+        for item in crate::deliver::job_target_items(&bot_key, &job.chat_id, &job.targets, &text) {
+            router.deliver(&item).await;
+        }
+        if job.kind == crate::schedule::JobKind::Once {
+            bridge.jobs.remove(&job.id);
+        }
+        return;
+    }
+    // 旧行为：先发原会话
     match bridge.msgr.send_text(&job.chat_id, &text).await {
         Ok(()) => crate::log!(
             "[bot:{bot_key}] 任务 {} 发送成功 chat={} 长度={}",
