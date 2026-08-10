@@ -514,11 +514,20 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         eprintln!("不能投递回当前会话（来源与目标相同），已拒绝。");
         return 1;
     }
-    // 目标 bot 必须真实存在（与 service 路由表同源：config.bots[].key()）
-    if !cfg.bots.iter().any(|b| b.key() == item.target_bot) {
-        let keys: Vec<String> = cfg.bots.iter().map(|b| b.key()).collect();
+    // 目标 bot 必须存在且启用、凭证就绪（与 service 路由表同源：config.bots[].key()）
+    let target_ok = cfg
+        .bots
+        .iter()
+        .any(|b| b.key() == item.target_bot && b.enabled && b.credentials_ready());
+    if !target_ok {
+        let keys: Vec<String> = cfg
+            .bots
+            .iter()
+            .filter(|b| b.enabled && b.credentials_ready())
+            .map(|b| b.key())
+            .collect();
         eprintln!(
-            "目标 bot「{}」不存在。当前 bot：{}",
+            "目标 bot「{}」不存在、已停用或凭证未就绪。当前可用 bot：{}",
             item.target_bot,
             if keys.is_empty() {
                 "（无）".to_string()

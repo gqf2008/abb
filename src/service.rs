@@ -166,9 +166,12 @@ async fn deliver_loop(
         if interruptible_sleep(std::time::Duration::from_secs(1), stop_rx).await {
             break;
         }
-        let items = store.take_all();
+        // at-least-once：先取（不移除）→ 投递（成功或已兜底）→ ack。
+        // 投递中崩溃/退出 → 未 ack 的项下次启动重投，Router 防循环去重兜底。
+        let items = store.pending();
         for item in items {
             router.deliver(&item).await;
+            store.ack(&[item.id]);
         }
     }
     crate::log!("[deliver] 投递循环退出");
@@ -400,7 +403,9 @@ async fn run_job(
     let text = format!("{header}\n\n{reply}");
     // 多目标（#21）：每个目标各投一份（跨 bot 走路由表；失败由 Router 回源报错 + 微信 outbox 兜底）
     if !job.targets.is_empty() {
-        for item in crate::deliver::job_target_items(&bot_key, &job.chat_id, &job.targets, &text) {
+        for item in
+            crate::deliver::job_target_items(&bot_key, &job.chat_id, &job.id, &job.targets, &text)
+        {
             router.deliver(&item).await;
         }
         if job.kind == crate::schedule::JobKind::Once {

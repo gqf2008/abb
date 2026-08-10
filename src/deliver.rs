@@ -1,8 +1,10 @@
 //! 跨会话投递（#21）—— agent 通过 `$ABB_BIN deliver` CLI 把消息投递到其它 bot 的会话。
 //!
 //! 进程模型：agent 是 bridge spawn 的子进程，拿不到 service 内存里的 Messenger；
-//! 因此 CLI 把投递请求落盘到 `~/.agent-bridge/deliveries.json`，service 侧轮询消费
-//! （mtime 热重载，与 JobStore 同一模式，避免 service 每次读盘）。投递目标 = bot_key + chat_id。
+//! 因此 CLI 把投递请求落盘到 `~/.agent-bridge/deliveries.json`，service 侧轮询消费。
+//! 文件极小，每次操作直接读盘（天然跨进程可见，无 mtime 竞态）；写盘持
+//! `deliveries.lock` 独占文件锁（fs2：Unix flock / Windows LockFileEx）+ 唯一 tmp rename，
+//! CLI 入队与 service ack 并发安全不丢项。投递目标 = bot_key + chat_id。
 //!
 //! 总开关：`Config.cross_delivery_enabled`（默认关）。CLI 提交前拒绝 + service 消费侧双保险，
 //! 防止开关在提交后被关掉仍把队列里的项发出去。
@@ -14,7 +16,6 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 /// 一条待投递消息。来源（source_bot/source_chat）用于投递失败时回源报错，不静默丢失。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,15 +39,24 @@ pub struct DeliveryItem {
     /// 附件元数据（#21 附件跨投递）：转发本地路径/元数据，接收端按能力处理。
     #[serde(default)]
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
+    /// 来源定时任务 id（#21）：非空 = 定时任务投递，跳过防循环去重（周期任务是合法重复），
+    /// 也豁免 Router 自环拒绝（任务回发本 bot 原会话是既有行为）。
+    #[serde(default)]
+    pub job_id: String,
 }
 
 /// 投递请求落盘队列（CLI 写、service 消费）。
+///
+/// 并发模型：不缓存、不加锁——每次操作直接读盘（文件极小）；写盘用 CAS：
+/// 先比对磁盘当前内容与自己读到的一致，再用**唯一 tmp 文件名** rename 替换。
+/// 内容不一致说明有并发写（另一进程），重读重试。这样 CLI add 与 service ack
+/// 并发时既不覆盖新项也不丢已投递项（at-least-once：崩溃未 ack → 下次重投，
+/// 由 Router 防循环去重兜底）。
 pub struct DeliveryStore {
+    /// deliveries.json（队列本体）。
     path: PathBuf,
-    data: Mutex<Vec<DeliveryItem>>,
-    /// 上次加载时的文件 mtime。CLI（codex）在另一进程写 deliveries.json，service 内存里这份
-    /// 不会自动看到 → 取队列前按 mtime 热重载，避免漏投（对齐 JobStore）。
-    loaded_mtime: Mutex<Option<SystemTime>>,
+    /// deliveries.lock（跨进程独占锁，永不复名——rename 队列文件不影响锁的 inode）。
+    lock_path: PathBuf,
 }
 
 impl DeliveryStore {
@@ -55,65 +65,104 @@ impl DeliveryStore {
     }
 
     fn new_at(path: PathBuf) -> DeliveryStore {
-        let data = fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        DeliveryStore {
-            path,
-            data: Mutex::new(data),
-            loaded_mtime: Mutex::new(mtime),
-        }
+        let lock_path = path.with_extension("lock");
+        DeliveryStore { path, lock_path }
     }
 
-    /// 若 deliveries.json 的 mtime 比上次加载新（CLI 在别的进程改了），重新读盘。
-    fn refresh(&self) {
-        let cur = fs::metadata(&self.path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let stale = { *self.loaded_mtime.lock().unwrap() != cur };
-        if !stale {
-            return;
+    /// 独占锁内执行闭包（CLI 入队 / service ack 读-改-写原子化）。
+    /// 锁获取失败（本地盘极罕见）时降级为不加锁执行——宁可偶发竞态也不静默丢请求。
+    fn with_exclusive<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        use fs2::FileExt;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock_path)
+            .expect("open deliveries.lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.lock_path, fs::Permissions::from_mode(0o600));
         }
-        if let Ok(text) = fs::read_to_string(&self.path) {
-            if let Ok(data) = serde_json::from_str::<Vec<DeliveryItem>>(&text) {
-                *self.data.lock().unwrap() = data;
+        match lock.lock_exclusive() {
+            Ok(()) => {
+                let out = f(self);
+                let _ = lock.unlock();
+                out
+            }
+            Err(e) => {
+                crate::log!("[deliver] 拿不到 deliveries.lock（{e:#}），降级不加锁执行");
+                f(self)
             }
         }
-        *self.loaded_mtime.lock().unwrap() = cur;
     }
 
-    fn persist_locked(&self, data: &[DeliveryItem]) {
-        if let Ok(text) = serde_json::to_string_pretty(data) {
-            let _ = crate::atomic_write_text(&self.path, &text);
-        }
-    }
-
-    /// 入队（幂等：同 id 已存在则跳过）。
-    pub fn add(&self, item: DeliveryItem) {
-        let mut d = self.data.lock().unwrap();
-        if d.iter().any(|x| x.id == item.id) {
+    /// 写盘：唯一 tmp（固定 tmp 名会被并发进程互相覆盖）+ rename 原子替换 + 0600。
+    fn write(&self, data: &[DeliveryItem]) {
+        let new_text = serde_json::to_string_pretty(data).unwrap_or_default();
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
+        if fs::write(&tmp, &new_text).is_err() {
+            let _ = fs::remove_file(&tmp);
             return;
         }
-        d.push(item);
-        self.persist_locked(&d);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 队列含消息文本/本地路径，随 config 同级落 0600（等同凭证文件）
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        if fs::rename(&tmp, &self.path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
     }
 
-    /// 取出全部待投递项并清空（service 消费循环用；失败项不回盘——回盘会死循环重投，
-    /// 失败已回源报错 + 微信目标落 outbox，不静默丢失）。
-    pub fn take_all(&self) -> Vec<DeliveryItem> {
-        self.refresh();
-        let mut d = self.data.lock().unwrap();
-        let taken = std::mem::take(&mut *d);
-        self.persist_locked(&d);
-        taken
+    fn read(&self) -> Vec<DeliveryItem> {
+        fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// 入队（幂等：同 id 已存在则跳过）。持锁读-改-写，不覆盖并发写入。
+    pub fn add(&self, item: DeliveryItem) {
+        self.with_exclusive(|me| {
+            let mut cur = me.read();
+            if cur.iter().any(|x| x.id == item.id) {
+                return; // 幂等
+            }
+            cur.push(item.clone());
+            me.write(&cur);
+        });
+    }
+
+    /// 取当前全部待投递项（不移除；投递完成后由 service 调 ack 逐项确认）。
+    pub fn pending(&self) -> Vec<DeliveryItem> {
+        self.read()
+    }
+
+    /// 投递完成后确认移除指定 id（持锁；同一批里已被并发 ack 的项直接跳过）。
+    pub fn ack(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.with_exclusive(|me| {
+            let cur = me.read();
+            let next: Vec<DeliveryItem> = cur
+                .iter()
+                .filter(|x| !ids.contains(&x.id))
+                .cloned()
+                .collect();
+            if next.len() != cur.len() {
+                me.write(&next);
+            }
+        });
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.refresh();
-        self.data.lock().unwrap().len()
+        self.read().len()
     }
 
     #[cfg(test)]
@@ -121,7 +170,6 @@ impl DeliveryStore {
         self.len() == 0
     }
 }
-
 /// 跨会话投递路由：service 启动时按所有已启用 bot 构建，投递循环持引用消费队列。
 pub struct Router {
     /// 总开关（Config.cross_delivery_enabled）。false 时任何投递直接拒绝（不发出）。
@@ -157,14 +205,20 @@ impl Router {
 
     /// 投递一条消息。成功只留日志；失败：微信目标落其 outbox 等下次入站补发，
     /// 同时回源 bot/会话报错（best-effort，不静默丢失）。未知目标/开关关闭也回源提示。
-    /// 防循环：同一 (来源, 目标, 文本) 在窗口内重复投递会跳过并回源提示。
+    /// 防循环：非定时任务的同指纹（来源/目标/文本+附件 sha256）在窗口内重复投递会跳过并回源提示；
+    /// 定时任务（job_id 非空）是合法重复，不走去重，也豁免自环拒绝（任务回发本 bot 原会话是既有行为）。
     pub async fn deliver(&self, item: &DeliveryItem) {
+        // 日志截断必须按字符（agent::truncate）：bot key/chat_id 可含中文，按字节切会 panic，
+        // 而 deliver_loop 在 tokio::spawn 里，panic = 投递消费线程静默死亡（#21 审查 Critical）。
+        let tb = crate::agent::truncate(&item.target_bot, 16);
+        let tc = crate::agent::truncate(&item.target_chat, 16);
+        let tid = &item.id[..item.id.len().min(8)]; // uuid 恒 ASCII，按字节切安全
         if !self.enabled {
             crate::log!(
                 "[deliver] 跳过投递：跨会话投递未开启（bot={} chat={} id={}）",
-                &item.target_bot[..item.target_bot.len().min(16)],
-                &item.target_chat[..item.target_chat.len().min(16)],
-                &item.id[..item.id.len().min(8)]
+                tb,
+                tc,
+                tid
             );
             self.notify_source(
                 item,
@@ -173,34 +227,26 @@ impl Router {
             .await;
             return;
         }
-        // 防循环（消息循环防护 #21）：同指纹窗口内重复 → 跳过 + 回源说明，不无限转发。
+        // 自环防护（Router 级兜底，防手改队列绕过 CLI）：来源==目标 且非定时任务 → 拒绝。
+        if item.job_id.is_empty() && is_self_loop(item) {
+            crate::log!(
+                "[deliver] 跳过投递：自环（来源==目标）bot={} chat={} id={}",
+                tb,
+                tc,
+                tid
+            );
+            self.notify_source(item, "⚠️ 跨会话投递失败：来源与目标相同（自环），已拒绝。")
+                .await;
+            return;
+        }
+        // 防循环（消息循环防护 #21）：非定时任务同指纹窗口内重复 → 跳过 + 回源说明。
         // 注意：MutexGuard 必须在任何 await 前 drop（std 锁不是 Send，跨 await 会编译失败）。
-        let dup_key = format!(
-            "{}|{}|{}|{}|{}",
-            item.source_bot, item.source_chat, item.target_bot, item.target_chat, item.text
-        );
-        let is_dup = {
-            let mut recent = self.recent.lock().unwrap();
-            let now = crate::chrono_lite::unix_secs();
-            while recent
-                .front()
-                .map(|(t, _)| *t + RECENT_WINDOW_SECS < now)
-                .unwrap_or(false)
-            {
-                recent.pop_front();
-            }
-            let dup = recent.iter().any(|(_, k)| k == &dup_key);
-            if !dup {
-                recent.push_back((now, dup_key));
-            }
-            dup
-        };
-        if is_dup {
+        if item.job_id.is_empty() && self.is_duplicate(item) {
             crate::log!(
                 "[deliver] 跳过重复投递（防循环）bot={} chat={} id={}",
-                item.target_bot,
-                &item.target_chat[..item.target_chat.len().min(16)],
-                &item.id[..item.id.len().min(8)]
+                tb,
+                tc,
+                tid
             );
             self.notify_source(
                 item,
@@ -236,7 +282,7 @@ impl Router {
                 crate::log!(
                     "[deliver] 附件投递失败 bot={} chat={} 文件名={}: {e:#}",
                     item.target_bot,
-                    &item.target_chat[..item.target_chat.len().min(16)],
+                    tc,
                     meta.file_name
                 );
                 self.notify_source(
@@ -253,11 +299,41 @@ impl Router {
         crate::log!(
             "[deliver] 已投递 bot={} chat={} id={} 文本长度={} 附件数={}",
             item.target_bot,
-            &item.target_chat[..item.target_chat.len().min(16)],
-            &item.id[..item.id.len().min(8)],
+            tc,
+            tid,
             item.text.chars().count(),
             item.attachments.len()
         );
+    }
+
+    /// 防循环去重：同（来源 bot/会话, 目标 bot/会话, 文本, 附件 sha256 列表）在窗口内只投一次。
+    /// 附件 sha256 进指纹：纯附件投递（文本为空）或同文本不同附件不应被误判重复。
+    fn is_duplicate(&self, item: &DeliveryItem) -> bool {
+        let mut sha: Vec<&str> = item.attachments.iter().map(|a| a.sha256.as_str()).collect();
+        sha.sort_unstable();
+        let dup_key = format!(
+            "{}|{}|{}|{}|{}|{}",
+            item.source_bot,
+            item.source_chat,
+            item.target_bot,
+            item.target_chat,
+            item.text,
+            sha.join(",")
+        );
+        let mut recent = self.recent.lock().unwrap();
+        let now = crate::chrono_lite::unix_secs();
+        while recent
+            .front()
+            .map(|(t, _)| *t + RECENT_WINDOW_SECS < now)
+            .unwrap_or(false)
+        {
+            recent.pop_front();
+        }
+        let dup = recent.iter().any(|(_, k)| k == &dup_key);
+        if !dup {
+            recent.push_back((now, dup_key));
+        }
+        dup
     }
 
     /// 文本投递失败：微信目标落其 outbox 等下次入站补发（#9 模式），同时回源报错。
@@ -265,7 +341,7 @@ impl Router {
         crate::log!(
             "[deliver] 投递失败 bot={} chat={} id={}: {e:#}",
             item.target_bot,
-            &item.target_chat[..item.target_chat.len().min(16)],
+            crate::agent::truncate(&item.target_chat, 16),
             &item.id[..item.id.len().min(8)]
         );
         if self
@@ -314,7 +390,7 @@ impl Router {
             crate::log!(
                 "[deliver] 回源报错发送失败 bot={} chat={}: {e:#}",
                 item.source_bot,
-                &item.source_chat[..item.source_chat.len().min(16)]
+                crate::agent::truncate(&item.source_chat, 16)
             );
         }
     }
@@ -366,8 +442,13 @@ pub fn parse_deliver_args(
     if text.trim().is_empty() && files.is_empty() {
         return Err("--text 和 --file 至少给一个".to_string());
     }
-    // 纯附件投递：空白 text 归一为空（避免给目标发一条空白消息）
-    let text = text.trim().to_string();
+    // 纯附件投递：全空白 text 归一为空（避免给目标发一条空白消息）；
+    // 非空白时保留原始文本（不 trim，避免吃掉代码块等有意义的首尾空白）。
+    let text = if text.trim().is_empty() {
+        String::new()
+    } else {
+        text
+    };
     let mut attachments = Vec::with_capacity(files.len());
     for f in &files {
         attachments.push(attachment_meta_from_path(f)?);
@@ -387,6 +468,7 @@ pub fn parse_deliver_args(
             .unwrap_or_default(),
         created_at: crate::chrono_lite::unix_secs(),
         attachments,
+        job_id: String::new(),
     })
 }
 
@@ -436,6 +518,7 @@ pub fn is_self_loop(item: &DeliveryItem) -> bool {
 pub fn job_target_items(
     job_bot: &str,
     job_chat: &str,
+    job_id: &str,
     targets: &[crate::schedule::JobTarget],
     text: &str,
 ) -> Vec<DeliveryItem> {
@@ -454,6 +537,7 @@ pub fn job_target_items(
             source_chat: job_chat.to_string(),
             created_at: crate::chrono_lite::unix_secs(),
             attachments: Vec::new(),
+            job_id: job_id.to_string(),
         })
         .collect()
 }
@@ -493,6 +577,7 @@ mod tests {
             source_chat: String::new(),
             created_at: 1,
             attachments: Vec::new(),
+            job_id: String::new(),
         }
     }
 
@@ -505,30 +590,74 @@ mod tests {
     }
 
     #[test]
-    fn store_take_all_clears() {
-        let (_d, store) = tmp_store("take");
+    fn store_pending_then_ack_removes_only_ids() {
+        let (_d, store) = tmp_store("ack");
         store.add(item("a", "wechat", "u1", "hi"));
         store.add(item("b", "feishu", "c2", "yo"));
-        let taken = store.take_all();
-        assert_eq!(taken.len(), 2);
+        let pending = store.pending();
+        assert_eq!(pending.len(), 2);
+        // ack 只移除指定 id
+        store.ack(&["a".to_string()]);
+        assert_eq!(store.pending().len(), 1);
+        assert_eq!(store.pending()[0].id, "b");
+        store.ack(&["b".to_string()]);
         assert!(store.is_empty());
     }
 
     #[test]
-    fn store_hot_reloads_external_write() {
+    fn store_pending_sees_external_write() {
         let (d, store) = tmp_store("reload");
         store.add(item("a", "wechat", "u1", "old"));
-        // 模拟 CLI 进程在另一个进程直接覆盖文件（mtime 变化 → 热重载）
+        // 模拟 CLI 进程在另一个进程直接覆盖文件（无缓存，天然可见）
         let path = d.0.join("deliveries.json");
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(
             &path,
             serde_json::to_string(&vec![item("b", "feishu", "c2", "new")]).unwrap(),
         )
         .unwrap();
-        let taken = store.take_all();
-        assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].id, "b");
+        let pending = store.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "b");
+    }
+
+    #[test]
+    fn store_concurrent_add_ack_no_loss() {
+        // 用多个独立 store 实例指向同一文件（模拟 CLI/service 跨进程 CAS），
+        // 并发 add 后 ack 一部分：不应丢任何未 ack 的项。
+        let dir = std::env::temp_dir().join(format!(
+            "abb-deliver-conc-{}",
+            crate::chrono_lite::unix_secs()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("deliveries.json");
+        let stores: Vec<DeliveryStore> = (0..4)
+            .map(|_| DeliveryStore::new_at(path.clone()))
+            .collect();
+        let mut handles = Vec::new();
+        for (i, st) in stores.into_iter().enumerate() {
+            handles.push(std::thread::spawn(move || {
+                for j in 0..10 {
+                    st.add(item(&format!("{i}-{j}"), "wechat", "u1", "hi"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let checker = DeliveryStore::new_at(path.clone());
+        assert_eq!(checker.pending().len(), 40);
+        let ids: Vec<String> = checker
+            .pending()
+            .iter()
+            .take(10)
+            .map(|x| x.id.clone())
+            .collect();
+        checker.ack(&ids);
+        assert_eq!(checker.pending().len(), 30);
+        let rest: Vec<String> = checker.pending().iter().map(|x| x.id.clone()).collect();
+        checker.ack(&rest);
+        assert!(checker.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -788,7 +917,7 @@ mod tests {
                 chat_id: "oc_feishu".into(),
             },
         ];
-        let items = job_target_items("wechat", "oc_src", &targets, "结果");
+        let items = job_target_items("wechat", "oc_src", "job-1", &targets, "结果");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].target_bot, "wechat"); // bot_key 空 → 本 bot
         assert_eq!(items[0].target_chat, "oc_own");
@@ -849,5 +978,83 @@ mod tests {
         router.deliver(&d1).await;
         router.deliver(&d2).await;
         assert_eq!(target.sent.lock().unwrap().len(), 2); // 不同来源不算重复
+    }
+
+    #[tokio::test]
+    async fn router_attachment_only_different_files_not_duplicate() {
+        // 纯附件投递（文本为空）：不同文件（sha256 不同）不应被防循环误判为重复
+        let (router, target, _source) = router_with(true, None);
+        let meta = |sha: &str| crate::attachments::AttachmentMeta {
+            kind: "image".into(),
+            source: "deliver".into(),
+            file_name: "a.png".into(),
+            mime: "image/png".into(),
+            size: 1,
+            path: "/tmp/a.png".into(),
+            sha256: sha.into(),
+            note: String::new(),
+        };
+        let mut d1 = item("a", "wechat", "u1", "");
+        d1.attachments.push(meta("sha1"));
+        let mut d2 = item("b", "wechat", "u1", "");
+        d2.attachments.push(meta("sha2"));
+        router.deliver(&d1).await;
+        router.deliver(&d2).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn router_job_items_skip_dedupe() {
+        // 定时任务（job_id 非空）：同文本重复投递是合法周期任务，不去重
+        let (router, target, source) = router_with(true, None);
+        let mut d1 = item("a", "wechat", "u1", "hi");
+        d1.job_id = "job-1".into();
+        d1.source_bot = "feishu".into();
+        d1.source_chat = "c1".into();
+        let mut d2 = item("b", "wechat", "u1", "hi");
+        d2.job_id = "job-1".into();
+        d2.source_bot = "feishu".into();
+        d2.source_chat = "c1".into();
+        router.deliver(&d1).await;
+        router.deliver(&d2).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 2);
+        assert!(source.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn router_rejects_self_loop_but_exempts_jobs() {
+        let (router, target, source) = router_with(true, None);
+        // 非定时任务自环 → Router 拒绝（防手改队列绕过 CLI）
+        let mut d = item("a", "wechat", "u1", "hi");
+        d.source_bot = "wechat".into();
+        d.source_chat = "u1".into();
+        router.deliver(&d).await;
+        // 自环拒绝：来源==目标 bot，回源提示会发到同一 messenger（wechat）
+        assert_eq!(target.sent.lock().unwrap().len(), 1);
+        assert!(target.sent.lock().unwrap()[0].1.contains("自环"));
+        assert!(source.sent.lock().unwrap().is_empty());
+        // 定时任务回发本 bot 原会话（既有行为）→ 豁免
+        let mut j = item("b", "wechat", "u1", "hi");
+        j.job_id = "job-1".into();
+        j.source_bot = "wechat".into();
+        j.source_chat = "u1".into();
+        router.deliver(&j).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn router_long_chinese_names_no_panic() {
+        // 审查 Critical：中文 bot key/chat 按字节切会 panic 杀死投递循环；这里回归验证
+        let (router, _target, source) = router_with(true, None);
+        let mut d = item(
+            "a",
+            "庆小丰的助手机器人",
+            "oc_中文会话标识很长很长很长",
+            "hi",
+        );
+        d.source_bot = "feishu".into();
+        d.source_chat = "c1".into();
+        router.deliver(&d).await; // 未知目标 → 回源提示，但绝不能 panic
+        assert_eq!(source.sent.lock().unwrap().len(), 1);
     }
 }

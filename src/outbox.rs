@@ -36,6 +36,8 @@ pub struct OutboxStore {
 
 impl OutboxStore {
     pub fn new(bot_key: &str) -> OutboxStore {
+        // 目标 bot 可能从未跑过 agent（workspace 目录不存在）→ 先建目录，否则落盘静默失败
+        let _ = fs::create_dir_all(crate::workspace_dir(bot_key));
         let path = crate::workspace_dir(bot_key).join("pending_outbox.json");
         let data = fs::read_to_string(&path)
             .ok()
