@@ -391,6 +391,8 @@ pub fn run_gui() -> Result<()> {
     let providers_model: Rc<slint::VecModel<ProviderRow>> = Rc::new(slint::VecModel::default());
     let providers_work: Rc<RefCell<Vec<ProviderConfig>>> = Rc::new(RefCell::new(Vec::new()));
     let default_provider_work: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    // 跨会话投递总开关工作副本（#21）
+    let cross_delivery_work: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     settings.set_providers(slint::ModelRc::from(providers_model.clone()));
 
     /// 供 bot Tab 的供应商下拉：第一项 ""（=跟随全局默认），后接各供应商 name。
@@ -412,12 +414,15 @@ pub fn run_gui() -> Result<()> {
         providers_work: &RefCell<Vec<ProviderConfig>>,
         providers_model: &slint::VecModel<ProviderRow>,
         default_provider_work: &RefCell<String>,
+        cross_delivery_work: &RefCell<bool>,
     ) {
         let c = Config::load().unwrap_or_default();
         *work.borrow_mut() = c.bots.clone();
         sync_model(model, &c.bots);
         *providers_work.borrow_mut() = c.providers.clone();
         *default_provider_work.borrow_mut() = c.default_provider.clone();
+        *cross_delivery_work.borrow_mut() = c.cross_delivery_enabled;
+        w.set_cross_delivery_enabled(c.cross_delivery_enabled);
         sync_providers_model(providers_model, &c.providers, &c.default_provider);
         w.set_provider_names(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             build_provider_names(&c.providers),
@@ -567,7 +572,15 @@ pub fn run_gui() -> Result<()> {
             let pwork = providers_work.clone();
             let pmodel = providers_model.clone();
             let dwork = default_provider_work.clone();
-            load_into(&settings, &work, &model, &pwork, &pmodel, &dwork);
+            load_into(
+                &settings,
+                &work,
+                &model,
+                &pwork,
+                &pmodel,
+                &dwork,
+                &cross_delivery_work,
+            );
             push_settings_status(&settings, &install::status());
             settings.set_status_line(
                 "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」Tab 安装依赖，否则机器人无法处理消息。"
@@ -584,9 +597,10 @@ pub fn run_gui() -> Result<()> {
         let pwork = providers_work.clone();
         let pmodel = providers_model.clone();
         let dwork = default_provider_work.clone();
+        let cdwork = cross_delivery_work.clone();
         tray.on_open_settings(move || {
             if let Some(w) = sw.upgrade() {
-                load_into(&w, &work, &model, &pwork, &pmodel, &dwork);
+                load_into(&w, &work, &model, &pwork, &pmodel, &dwork, &cdwork);
                 push_settings_status(&w, &install::status());
                 show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
             }
@@ -699,6 +713,12 @@ pub fn run_gui() -> Result<()> {
         });
     }
     {
+        let cdwork = cross_delivery_work.clone();
+        settings.on_set_cross_delivery(move |enabled| {
+            *cdwork.borrow_mut() = enabled;
+        });
+    }
+    {
         // 切中别的 bot：重建 model 强制编辑区刷新。Slint ComboBox 的 current-value 是命令式
         // 快照，不随 model 数据变（LineEdit 会刷新但 ComboBox 不会），不重建则下拉还显示上一个
         // bot 的后端，看起来像「改了一个另一个也跟着变」。set_vec 触发 model 变更通知，ComboBox 重求值。
@@ -741,6 +761,7 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let pwork = providers_work.clone();
         let dwork = default_provider_work.clone();
+        let cdwork = cross_delivery_work.clone();
         let sw = settings.as_weak();
         settings.on_save_clicked(move || {
             if let Some(w) = sw.upgrade() {
@@ -760,6 +781,9 @@ pub fn run_gui() -> Result<()> {
                     }
                 }
                 c.bots = newb;
+
+                // 跨会话投递总开关：全局生效（所有 bot 共享）
+                c.cross_delivery_enabled = *cdwork.borrow();
 
                 // 供应商：用工作副本替换，但 api_key 留空=保留旧值（密码框不回显，编辑其它字段不该清密钥）。
                 // 丢弃空 name 行（无效），并警告。
@@ -1075,6 +1099,7 @@ pub fn run_gui() -> Result<()> {
             &providers_work,
             &providers_model,
             &default_provider_work,
+            &cross_delivery_work,
         );
         settings.set_status_is_error(false);
         settings.set_status_line("请先添加一个飞书/微信机器人".into());

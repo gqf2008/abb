@@ -263,6 +263,10 @@ pub struct Config {
     pub owner_open_id: String,
     #[serde(default)]
     pub default_backend: String,
+    /// 跨会话投递总开关（#21）：默认关闭。开启后 agent 可通过 `$ABB_BIN deliver`
+    /// 把消息投递到其它 bot 的会话（服务侧路由投递 + 失败兜底）。
+    #[serde(default)]
+    pub cross_delivery_enabled: bool,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -703,5 +707,25 @@ mod tests {
         let c5 = Config::default();
         let s = serde_json::to_string(&c5).unwrap();
         assert!(!s.contains("default_provider"), "空 default_provider 不应序列化");
+    }
+
+    #[test]
+    fn cross_delivery_enabled_defaults_off_and_roundtrips() {
+        // 默认关闭：新功能不应改变旧行为
+        let c = Config::default();
+        assert!(!c.cross_delivery_enabled);
+        // 旧 config 无该字段 → 反序列化为 false，不报错
+        let text = r#"{"owner_open_id":"o","default_backend":"claude","bots":[]}"#;
+        let c2: Config = serde_json::from_str(text).unwrap();
+        assert!(!c2.cross_delivery_enabled);
+        // 显式打开 → 序列化/反序列化往返不丢
+        let c3 = Config {
+            cross_delivery_enabled: true,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c3).unwrap();
+        assert!(s.contains("\"cross_delivery_enabled\":true"));
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert!(back.cross_delivery_enabled);
     }
 }

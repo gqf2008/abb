@@ -47,8 +47,7 @@ impl OutboxStore {
         }
     }
 
-    #[cfg(test)]
-    fn new_at(path: PathBuf) -> OutboxStore {
+    pub(crate) fn new_at(path: PathBuf) -> OutboxStore {
         let data = fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())

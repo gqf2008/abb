@@ -41,7 +41,7 @@ impl Backend {
 /// **立即退出**，别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。
 /// 版本化（GUIDE_MARKER）：老工作区里无标记的旧模板（写死 `agent-bridge job`、实际在
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
-const GUIDE_MARKER: &str = "abb-guide-v2";
+const GUIDE_MARKER: &str = "abb-guide-v3";
 
 fn ensure_workspace_guide(workspace: &std::path::Path) {
     let guide = format!(
@@ -63,6 +63,16 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
   裸调用会 command not found。`ABB_BIN` 由桥 spawn 时注入，保证调的是当前安装的同一个程序。
 
 目标会话与 bot 已由桥通过环境变量注入：`AGENT_BRIDGE_CHAT_ID`、`AGENT_BRIDGE_BOT_KEY`，CLI 会自动取用，无需手填。
+
+## 跨会话投递（需在 ABB 设置里打开「跨会话投递」开关）
+
+用户说「把结果同步到 XX 群 / 发到另一个 bot」等跨会话需求时，用 `$ABB_BIN` 调 deliver CLI 把消息
+投递到**其它 bot 的会话**（跨平台路由，例如微信里的指令把结果发到飞书群）。目标 bot key 用设置里
+的 bot 名称，目标 chat_id 需用户提供；来源 bot/会话由环境变量注入，无需手填。
+
+- 投：`\"$ABB_BIN\" deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\"`
+- 投递是异步的：CLI 只入队，service 侧实际发送；失败会回源到当前会话报错，不会静默丢。
+- 开关关闭时 CLI 会直接报错——提示用户先去设置打开，不要反复重试。
 
 ## 其它
 

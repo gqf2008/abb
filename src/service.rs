@@ -75,8 +75,19 @@ pub async fn run() {
         let _ = stop_tx.send(true);
     });
 
-    // 每个 bot 一个事件循环 + Bridge + 定时调度，并行跑
-    let mut handles = Vec::new();
+    // 每个 bot 一个事件循环 + Bridge + 定时调度，并行跑。
+    // 第一遍先构建所有 Messenger 并登记到跨会话投递路由表（#21）：投递循环要能看到
+    // 全部已启用目标；Bridge 与路由表共享同一 Arc<dyn Messenger> 实例。
+    let mut messengers: std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn crate::messenger::Messenger>,
+    > = std::collections::HashMap::new();
+    let mut bot_cfgs: std::collections::HashMap<String, crate::config::BotConfig> =
+        std::collections::HashMap::new();
+    let mut ready: Vec<(
+        crate::config::BotConfig,
+        std::sync::Arc<dyn crate::messenger::Messenger>,
+    )> = Vec::new();
     for bot in &cfg.bots {
         // 用户停用的 bot：不启动，但上报「已停用」让托盘显灰，并保留在设置窗可重启用。
         if !bot.enabled {
@@ -93,18 +104,44 @@ pub async fn run() {
             );
             continue;
         }
-        let bot = bot.clone();
-        let cfg = cfg.clone();
-        let stop = stop_rx.clone();
-        handles.push(tokio::spawn(async move {
-            run_bot(bot, cfg, stop).await;
-        }));
+        let msgr = match messenger::build(bot) {
+            Ok(m) => m,
+            Err(e) => {
+                crate::log!("[bot:{}] 构造 messenger 失败: {e:#}", bot.key());
+                continue;
+            }
+        };
+        messengers.insert(bot.key(), msgr.clone());
+        bot_cfgs.insert(bot.key(), bot.clone());
+        ready.push((bot.clone(), msgr));
     }
-    if handles.is_empty() {
+    if ready.is_empty() {
         crate::log!("[service] 没有可用 bot，退出");
         // 无可跑 bot（全部停用/凭证不齐）→ 清「期望运行」标记，看门狗停止自动重拉
         crate::install::set_desired(false);
         std::process::exit(1);
+    }
+    let router = std::sync::Arc::new(crate::deliver::Router {
+        enabled: cfg.cross_delivery_enabled,
+        messengers,
+        bots: bot_cfgs,
+        outbox_dir: None,
+    });
+    // 跨会话投递消费循环（独立于 bot 循环，共享 stop）
+    {
+        let router = router.clone();
+        let mut stop = stop_rx.clone();
+        tokio::spawn(async move {
+            deliver_loop(router, &mut stop).await;
+        });
+    }
+    let mut handles = Vec::new();
+    for (bot, msgr) in ready {
+        let cfg = cfg.clone();
+        let stop = stop_rx.clone();
+        handles.push(tokio::spawn(async move {
+            run_bot(bot, cfg, msgr, stop).await;
+        }));
     }
     // 等所有 bot 循环结束（正常只有 stop 才会结束）
     for h in handles {
@@ -113,21 +150,43 @@ pub async fn run() {
     crate::log!("[service] 已退出");
 }
 
+/// 跨会话投递消费循环：轮询 deliveries.json（agent 的 deliver CLI 落盘），逐条经路由表投递。
+/// 失败项不回盘（避免死循环重投），由 Router 负责回源报错 / 微信 outbox 兜底。
+async fn deliver_loop(
+    router: std::sync::Arc<crate::deliver::Router>,
+    stop_rx: &mut watch::Receiver<bool>,
+) {
+    crate::log!(
+        "[deliver] 投递循环启动（跨会话投递开关={}）",
+        router.enabled
+    );
+    let store = crate::deliver::DeliveryStore::new();
+    loop {
+        if interruptible_sleep(std::time::Duration::from_secs(1), stop_rx).await {
+            break;
+        }
+        let items = store.take_all();
+        for item in items {
+            router.deliver(&item).await;
+        }
+    }
+    crate::log!("[deliver] 投递循环退出");
+}
+
 /// 单个 bot 的全套：事件循环（飞书 WS / 微信长轮询）+ 定时任务调度循环。
-async fn run_bot(bot: crate::config::BotConfig, cfg: Arc<Config>, stop_rx: watch::Receiver<bool>) {
+/// msgr 由 run() 构建并登记进跨会话投递路由表后传入（Bridge 与路由表共享同一实例）。
+async fn run_bot(
+    bot: crate::config::BotConfig,
+    cfg: Arc<Config>,
+    msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
+    stop_rx: watch::Receiver<bool>,
+) {
     let key = bot.key();
     crate::log!(
         "[bot:{key}] 启动（kind={} name={}）",
         bot.kind,
         bot.bot_name
     );
-    let msgr = match messenger::build(&bot) {
-        Ok(m) => m,
-        Err(e) => {
-            crate::log!("[bot:{key}] 构造 messenger 失败: {e:#}");
-            return;
-        }
-    };
     let bridge = Arc::new(Bridge::new(msgr, bot.clone(), &cfg));
 
     // 连接态初始上报：进入事件循环前是「连接中」；之后由各事件循环在状态迁移时更新。

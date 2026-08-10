@@ -11,6 +11,7 @@ mod botstatus;
 mod bridge;
 mod ccswitch;
 mod config;
+mod deliver;
 mod deps;
 mod dingtalk;
 mod feishu;
@@ -176,6 +177,14 @@ fn main() {
     // chat_id 从 AGENT_BRIDGE_CHAT_ID env 读（桥 spawn claude 时注入），缺省回落主会话。
     if args.len() >= 2 && args[1] == "job" {
         std::process::exit(run_job_cli(&args[2..]));
+    }
+
+    // 跨会话投递 CLI：供 claude 用 Bash 调用（也可人用）。
+    //   agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text "内容"
+    //   [--source-bot <来源bot key> --source-chat <来源chat_id>]（缺省取桥注入的 env）
+    // 总开关：Config.cross_delivery_enabled（设置 → 「跨会话投递」勾选），关闭时拒绝。
+    if args.len() >= 2 && args[1] == "deliver" {
+        std::process::exit(run_deliver_cli(&args[2..]));
     }
 
     // 隐藏调试 flag：--wx-qr-test（冒烟：真拉一次微信登录二维码，验证协议端点）
@@ -454,4 +463,49 @@ fn resolve_bot_key() -> Result<String, String> {
             "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请设该环境变量为某个 bot 的 name）"
         )),
     }
+}
+
+/// 跨会话投递 CLI（供 claude 用 Bash 调用，也可人用）。退出码 0=已入队 1=失败。
+/// 来源缺省取 AGENT_BRIDGE_BOT_KEY / AGENT_BRIDGE_CHAT_ID（桥 spawn agent 时注入）。
+/// 投递是异步的：CLI 只负责校验 + 入队，service 侧投递循环实际发送。
+fn run_deliver_cli(args: &[String]) -> i32 {
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("读 config 失败: {e:#}");
+            return 1;
+        }
+    };
+    if !cfg.cross_delivery_enabled {
+        eprintln!("跨会话投递未开启：请在 ABB 设置里勾选「跨会话投递」后重试（保存即重启服务）。");
+        return 1;
+    }
+    let env_bot = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
+    let env_chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+    let item = match deliver::parse_deliver_args(args, &env_bot, &env_chat) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\"");
+            return 1;
+        }
+    };
+    // 目标 bot 必须真实存在（与 service 路由表同源：config.bots[].key()）
+    if !cfg.bots.iter().any(|b| b.key() == item.target_bot) {
+        let keys: Vec<String> = cfg.bots.iter().map(|b| b.key()).collect();
+        eprintln!(
+            "目标 bot「{}」不存在。当前 bot：{}",
+            item.target_bot,
+            if keys.is_empty() {
+                "（无）".to_string()
+            } else {
+                keys.join(", ")
+            }
+        );
+        return 1;
+    }
+    let store = deliver::DeliveryStore::new();
+    store.add(item);
+    crate::log!("[deliver] CLI 已入队投递（service 异步发送）");
+    println!("✅ 已入队跨会话投递（由 service 异步发送）。");
+    0
 }
