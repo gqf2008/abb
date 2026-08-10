@@ -1,7 +1,11 @@
 ; ABB (Agent Bridge Bar) - Windows installer script
 ; Build: ISCC.exe installer\ABB.iss
 #define MyAppName "ABB"
-#define MyAppVersion "2.0.3"
+// 版本默认值；CI 用 /DMyAppVersion=<Cargo.toml 版本> 传入（#ifndef 让命令行定义生效，
+// 避免硬编码漂移——v2.1.0 曾因硬编码 2.0.3 覆盖 /D 导致安装包版本/文件名错误）。
+#ifndef MyAppVersion
+  #define MyAppVersion "2.0.3"
+#endif
 #define MyAppPublisher "SQB"
 #define MyAppExeName "agent-bridge.exe"
 
