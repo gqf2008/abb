@@ -156,6 +156,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> python-installed: false;
     in-out property <bool> lark-installed: false;
     in-out property <bool> dingtalk-installed: false; // dingtalk-cli (dws)
+    // claude/codex 任一未装 = true：环境配置 Tab 顶部显示醒目横幅（首次启动也据此自动弹出设置窗引导安装）。
+    in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
 
@@ -470,6 +472,27 @@ export component SettingsWindow inherits Window {
                         padding: 8px;
                         spacing: 10px;
                         alignment: start;
+
+                        // 未安装 agent 的醒目横幅（#8 M0 自动引导）：缺失 claude/codex 时置顶提示，
+                        // 避免用户只在「机器人怎么不回」时才发现没装。
+                        if root.missing-agent: Rectangle {
+                            vertical-stretch: 0;
+                            background: #fff3cd;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #e0a800;
+                            HorizontalBox {
+                                padding: 8px;
+                                spacing: 8px;
+                                Text {
+                                    text: "⚠️ 未检测到 Claude Code / Codex CLI：机器人收到消息后将无法处理。请安装下方依赖（装完点「重新检测」）。";
+                                    color: #664d03;
+                                    wrap: word-wrap;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
 
                         HorizontalBox {
                             spacing: 8px;
