@@ -48,6 +48,29 @@ pub trait Messenger: Send + Sync {
     ) -> Option<crate::attachments::AttachmentMeta> {
         None
     }
+
+    /// 发送一个已保存附件（#21 附件跨投递）。默认实现只发文本元数据——接收端按能力处理：
+    /// 跨 bot 同机运行时本地路径可读，接收端 agent/用户可按路径取用；各平台按能力覆盖为真图/真文件。
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        meta: &crate::attachments::AttachmentMeta,
+    ) -> Result<()> {
+        let mut s = format!(
+            "📎 [{}] 文件名={} mime={} 大小={}",
+            meta.kind, meta.file_name, meta.mime, meta.size
+        );
+        if !meta.path.is_empty() {
+            s.push_str(&format!(" 本地路径={}", meta.path));
+        }
+        if !meta.sha256.is_empty() {
+            s.push_str(&format!(" sha256={}", meta.sha256));
+        }
+        if !meta.note.is_empty() {
+            s.push_str(&format!(" 备注={}", meta.note));
+        }
+        self.send_text(chat_id, &s).await
+    }
 }
 
 /// 飞书实现：委托 FeishuClient，表情走 reactions。

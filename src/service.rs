@@ -75,8 +75,19 @@ pub async fn run() {
         let _ = stop_tx.send(true);
     });
 
-    // 每个 bot 一个事件循环 + Bridge + 定时调度，并行跑
-    let mut handles = Vec::new();
+    // 每个 bot 一个事件循环 + Bridge + 定时调度，并行跑。
+    // 第一遍先构建所有 Messenger 并登记到跨会话投递路由表（#21）：投递循环要能看到
+    // 全部已启用目标；Bridge 与路由表共享同一 Arc<dyn Messenger> 实例。
+    let mut messengers: std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn crate::messenger::Messenger>,
+    > = std::collections::HashMap::new();
+    let mut bot_cfgs: std::collections::HashMap<String, crate::config::BotConfig> =
+        std::collections::HashMap::new();
+    let mut ready: Vec<(
+        crate::config::BotConfig,
+        std::sync::Arc<dyn crate::messenger::Messenger>,
+    )> = Vec::new();
     for bot in &cfg.bots {
         // 用户停用的 bot：不启动，但上报「已停用」让托盘显灰，并保留在设置窗可重启用。
         if !bot.enabled {
@@ -93,18 +104,45 @@ pub async fn run() {
             );
             continue;
         }
-        let bot = bot.clone();
-        let cfg = cfg.clone();
-        let stop = stop_rx.clone();
-        handles.push(tokio::spawn(async move {
-            run_bot(bot, cfg, stop).await;
-        }));
+        let msgr = match messenger::build(bot) {
+            Ok(m) => m,
+            Err(e) => {
+                crate::log!("[bot:{}] 构造 messenger 失败: {e:#}", bot.key());
+                continue;
+            }
+        };
+        messengers.insert(bot.key(), msgr.clone());
+        bot_cfgs.insert(bot.key(), bot.clone());
+        ready.push((bot.clone(), msgr));
     }
-    if handles.is_empty() {
+    if ready.is_empty() {
         crate::log!("[service] 没有可用 bot，退出");
         // 无可跑 bot（全部停用/凭证不齐）→ 清「期望运行」标记，看门狗停止自动重拉
         crate::install::set_desired(false);
         std::process::exit(1);
+    }
+    let router = std::sync::Arc::new(crate::deliver::Router::new(
+        cfg.cross_delivery_enabled,
+        messengers,
+        bot_cfgs,
+        None,
+    ));
+    // 跨会话投递消费循环（独立于 bot 循环，共享 stop）
+    {
+        let router = router.clone();
+        let mut stop = stop_rx.clone();
+        tokio::spawn(async move {
+            deliver_loop(router, &mut stop).await;
+        });
+    }
+    let mut handles = Vec::new();
+    for (bot, msgr) in ready {
+        let cfg = cfg.clone();
+        let stop = stop_rx.clone();
+        let router = router.clone();
+        handles.push(tokio::spawn(async move {
+            run_bot(bot, cfg, msgr, router, stop).await;
+        }));
     }
     // 等所有 bot 循环结束（正常只有 stop 才会结束）
     for h in handles {
@@ -113,21 +151,47 @@ pub async fn run() {
     crate::log!("[service] 已退出");
 }
 
+/// 跨会话投递消费循环：轮询 deliveries.json（agent 的 deliver CLI 落盘），逐条经路由表投递。
+/// 失败项不回盘（避免死循环重投），由 Router 负责回源报错 / 微信 outbox 兜底。
+async fn deliver_loop(
+    router: std::sync::Arc<crate::deliver::Router>,
+    stop_rx: &mut watch::Receiver<bool>,
+) {
+    crate::log!(
+        "[deliver] 投递循环启动（跨会话投递开关={}）",
+        router.enabled
+    );
+    let store = crate::deliver::DeliveryStore::new();
+    loop {
+        if interruptible_sleep(std::time::Duration::from_secs(1), stop_rx).await {
+            break;
+        }
+        // at-least-once：先取（不移除）→ 投递（成功或已兜底）→ ack。
+        // 投递中崩溃/退出 → 未 ack 的项下次启动重投，Router 防循环去重兜底。
+        let items = store.pending();
+        for item in items {
+            router.deliver(&item).await;
+            store.ack(&[item.id]);
+        }
+    }
+    crate::log!("[deliver] 投递循环退出");
+}
+
 /// 单个 bot 的全套：事件循环（飞书 WS / 微信长轮询）+ 定时任务调度循环。
-async fn run_bot(bot: crate::config::BotConfig, cfg: Arc<Config>, stop_rx: watch::Receiver<bool>) {
+/// msgr 由 run() 构建并登记进跨会话投递路由表后传入（Bridge 与路由表共享同一实例）。
+async fn run_bot(
+    bot: crate::config::BotConfig,
+    cfg: Arc<Config>,
+    msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
+    router: std::sync::Arc<crate::deliver::Router>,
+    stop_rx: watch::Receiver<bool>,
+) {
     let key = bot.key();
     crate::log!(
         "[bot:{key}] 启动（kind={} name={}）",
         bot.kind,
         bot.bot_name
     );
-    let msgr = match messenger::build(&bot) {
-        Ok(m) => m,
-        Err(e) => {
-            crate::log!("[bot:{key}] 构造 messenger 失败: {e:#}");
-            return;
-        }
-    };
     let bridge = Arc::new(Bridge::new(msgr, bot.clone(), &cfg));
 
     // 连接态初始上报：进入事件循环前是「连接中」；之后由各事件循环在状态迁移时更新。
@@ -172,10 +236,11 @@ async fn run_bot(bot: crate::config::BotConfig, cfg: Arc<Config>, stop_rx: watch
                         r.insert(job.id.clone());
                     }
                     let bridge = bridge.clone();
+                    let router = router.clone();
                     let running = running.clone();
                     let jid = job.id.clone();
                     tokio::spawn(async move {
-                        run_job(bridge, job).await;
+                        run_job(bridge, router, job).await;
                         running.lock().unwrap().remove(&jid);
                     });
                 }
@@ -295,9 +360,14 @@ async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receive
     }
 }
 
-/// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发飞书；once 任务执行后删除。
+/// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
 /// 回发优先发任务原会话；若该会话已失效（群解散/bot 被移出等），回落到主会话（私聊，必存在）。
-async fn run_job(bridge: Arc<Bridge>, job: crate::schedule::Job) {
+/// 多目标（#21）：job.targets 非空时向每个目标各投一份（可跨 bot，经路由表投递 + 失败兜底）。
+async fn run_job(
+    bridge: Arc<Bridge>,
+    router: std::sync::Arc<crate::deliver::Router>,
+    job: crate::schedule::Job,
+) {
     let bot_key = bridge.bot.key();
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
     // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
@@ -331,7 +401,19 @@ async fn run_job(bridge: Arc<Bridge>, job: crate::schedule::Job) {
         crate::schedule::JobKind::Cron => "⏰ 定时任务",
     };
     let text = format!("{header}\n\n{reply}");
-    // 先发原会话
+    // 多目标（#21）：每个目标各投一份（跨 bot 走路由表；失败由 Router 回源报错 + 微信 outbox 兜底）
+    if !job.targets.is_empty() {
+        for item in
+            crate::deliver::job_target_items(&bot_key, &job.chat_id, &job.id, &job.targets, &text)
+        {
+            router.deliver(&item).await;
+        }
+        if job.kind == crate::schedule::JobKind::Once {
+            bridge.jobs.remove(&job.id);
+        }
+        return;
+    }
+    // 旧行为：先发原会话
     match bridge.msgr.send_text(&job.chat_id, &text).await {
         Ok(()) => crate::log!(
             "[bot:{bot_key}] 任务 {} 发送成功 chat={} 长度={}",

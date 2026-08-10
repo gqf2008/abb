@@ -41,7 +41,7 @@ impl Backend {
 /// **立即退出**，别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。
 /// 版本化（GUIDE_MARKER）：老工作区里无标记的旧模板（写死 `agent-bridge job`、实际在
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
-const GUIDE_MARKER: &str = "abb-guide-v2";
+const GUIDE_MARKER: &str = "abb-guide-v3";
 
 fn ensure_workspace_guide(workspace: &std::path::Path) {
     let guide = format!(
@@ -55,14 +55,27 @@ fn ensure_workspace_guide(workspace: &std::path::Path) {
 **用桥注入的 `$ABB_BIN`（本程序绝对路径）调 job CLI 建定时任务，建完就结束**。绝不要自己写
 sleep/while 循环去等待——那会一直占着这个聊天，期间用户发来的新消息全部排队收不到回复。
 
-- 加：`\"$ABB_BIN\" job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"到点做什么\" [--note \"原句\"]`
+- 加：`\"$ABB_BIN\" job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"到点做什么\" [--note \"原句\"] [--to bot_key:chat_id]…`
   - cron 例：每分钟 `* * * * *`；每天 9:30 `30 9 * * *`；工作日 10 点 `0 10 * * 1-5`；每小时 `0 * * * *`
+  - `--to` 可重复：任务结果同时投递多个会话（裸 `chat_id` = 本 bot；`bot_key:chat_id` = 跨 bot，如 `feishu:oc_xxx`）
 - 列：`\"$ABB_BIN\" job list`
 - 删：`\"$ABB_BIN\" job del <id 前缀>`
 - 不要用裸命令名 `agent-bridge` / `abb`：macOS 在 .app 内、Windows 在安装目录，都不在 PATH，
   裸调用会 command not found。`ABB_BIN` 由桥 spawn 时注入，保证调的是当前安装的同一个程序。
 
 目标会话与 bot 已由桥通过环境变量注入：`AGENT_BRIDGE_CHAT_ID`、`AGENT_BRIDGE_BOT_KEY`，CLI 会自动取用，无需手填。
+
+## 跨会话投递（需在 ABB 设置里打开「跨会话投递」开关）
+
+用户说「把结果同步到 XX 群 / 发到另一个 bot」等跨会话需求时，用 `$ABB_BIN` 调 deliver CLI 把消息
+投递到**其它 bot 的会话**（跨平台路由，例如微信里的指令把结果发到飞书群）。目标 bot key 用设置里
+的 bot 名称，目标 chat_id 需用户提供；来源 bot/会话由环境变量注入，无需手填。
+
+- 投：`\"$ABB_BIN\" deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\" [--file <本地路径>]…`
+  - `--file` 可重复：转发附件时带上本地路径元数据，接收端（同机）可按路径读取处理
+- 投递是异步的：CLI 只入队，service 侧实际发送；失败会回源到当前会话报错，不会静默丢。
+- 开关关闭时 CLI 会直接报错——提示用户先去设置打开，不要反复重试。
+- **防循环**：不要把收到的跨会话消息再原样转发回去（同一来源/目标/内容 10 分钟内会被 service 抑制并回源提示）。
 
 ## 其它
 

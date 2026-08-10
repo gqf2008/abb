@@ -53,6 +53,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 结果主动推送 | 任务到点自动把结果发回聊天，不用你盯着 |
 | 开机自启 | 托盘常驻，崩溃自动拉起 |
 | 多机器人 | 飞书、微信、钉钉同时在线，各自独立配置 |
+| 跨会话投递 | 设置里开启后，agent 可把消息/任务结果投递到其它 bot 的会话（`agent-bridge deliver --bot <key> --chat <id> --text ...`），支持附件元数据转发与定时任务多目标（`job add --to bot:chat`） |
 
 ## 隐私
 
@@ -81,3 +82,4 @@ Windows 包为免管理员安装。有问题欢迎提 [Issue](https://github.com
 ## 开发者文档
 
 - [会话隔离机制（群 / 话题 / 用户）](docs/session-isolation.md)：三平台 chat_id 规则、隔离矩阵、话题维度结论与最小改动方案。
+- 跨会话投递（issue #21）：开关 `config.json#cross_delivery_enabled`（设置窗可勾选，默认关）；agent 用 `$ABB_BIN deliver` 投递，CLI 入队 `~/.agent-bridge/deliveries.json`（0600），service 消费循环经路由表发送；微信目标失败落其 outbox 补发、其余失败回源报错；同来源/目标/文本（+附件 sha256）10 分钟防循环去重，定时任务（`job add --to`）豁免。

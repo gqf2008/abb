@@ -148,6 +148,8 @@ export component SettingsWindow inherits Window {
     in-out property <int> selected: -1;   // 当前选中的 bot 下标，-1=无
     in-out property <string> status-line;
     in-out property <bool> status-is-error: true;   // true=红（报错）/ false=绿（成功/信息）
+    // 跨会话投递总开关（#21）：打开后 agent 可用 `$ABB_BIN deliver` 投递到其它 bot 的会话。
+    in-out property <bool> cross-delivery-enabled: false;
 
     // 环境配置（依赖检测）：五项是否在本机可执行路径上
     in-out property <bool> claude-installed: false;
@@ -195,6 +197,7 @@ export component SettingsWindow inherits Window {
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
     callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
+    callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
     callback recheck-deps();            // 重新检测依赖是否已装
     callback install-dep(string);       // 安装某个依赖（claude/codex/node/python3/lark-cli/dingtalk-cli）
@@ -230,6 +233,13 @@ export component SettingsWindow inherits Window {
             font-weight: 600;
             wrap: word-wrap;
             vertical-stretch: 0;
+        }
+
+        // 跨会话投递总开关：全局生效（所有 bot 共享），保存重启服务后生效。
+        CheckBox {
+            text: "跨会话投递（允许 agent 投递到其它 bot 的会话）";
+            checked: root.cross-delivery-enabled;
+            toggled => { root.set-cross-delivery(self.checked); }
         }
 
         TabWidget {

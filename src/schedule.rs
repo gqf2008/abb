@@ -19,6 +19,14 @@ pub enum JobKind {
     Cron, // 周期：cron = "分 时 日 月 周"
 }
 
+/// 一个投递目标（#21 定时任务多目标）。bot_key 空 = 本 bot（创建任务的那个 bot）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobTarget {
+    #[serde(default)]
+    pub bot_key: String,
+    pub chat_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
@@ -30,6 +38,10 @@ pub struct Job {
     /// 创建时的原始自然语言（便于 /定时任务 列表展示）
     #[serde(default)]
     pub note: String,
+    /// 多投递目标（#21）：空 = 只发 chat_id（旧行为）；非空 = 结果向每个目标各发一份。
+    /// 目标 bot_key 空 = 本 bot；跨 bot 目标可把任务结果投到其它 bot 的会话。
+    #[serde(default)]
+    pub targets: Vec<JobTarget>,
 }
 
 pub struct JobStore {
@@ -212,13 +224,28 @@ impl Job {
             JobKind::Once => "一次性",
             JobKind::Cron => "周期",
         };
-        format!(
+        let mut s = format!(
             "[{}] {} {} → {}",
             &self.id[..self.id.len().min(8)],
             kind,
             self.schedule,
             self.prompt
-        )
+        );
+        if !self.targets.is_empty() {
+            let targets: Vec<String> = self
+                .targets
+                .iter()
+                .map(|t| {
+                    if t.bot_key.is_empty() {
+                        t.chat_id.clone()
+                    } else {
+                        format!("{}:{}", t.bot_key, t.chat_id)
+                    }
+                })
+                .collect();
+            s.push_str(&format!("（多目标：{}）", targets.join(", ")));
+        }
+        s
     }
 }
 
@@ -338,6 +365,7 @@ pub fn job_from_parsed(
     prompt: &str,
     chat_id: &str,
     note: &str,
+    targets: Vec<JobTarget>,
 ) -> Result<Job> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -363,7 +391,25 @@ pub fn job_from_parsed(
         prompt: prompt.to_string(),
         chat_id: chat_id.to_string(),
         note: note.to_string(),
+        targets,
     })
+}
+
+/// 解析 job add 的 --to 目标：`bot_key:chat_id`（跨 bot）或裸 `chat_id`（本 bot）。
+/// 校验 chat_id 非空；bot_key 可为空（= 本 bot，与 JobTarget 语义一致）。
+pub fn parse_job_target(s: &str) -> Result<JobTarget> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("--to 目标不能为空");
+    }
+    let (bot_key, chat_id) = match s.split_once(':') {
+        Some((b, c)) => (b.trim().to_string(), c.trim().to_string()),
+        None => (String::new(), s.to_string()),
+    };
+    if chat_id.is_empty() {
+        anyhow::bail!("--to 目标 chat_id 不能为空：{s}");
+    }
+    Ok(JobTarget { bot_key, chat_id })
 }
 
 #[cfg(test)]
@@ -447,6 +493,7 @@ mod tests {
             "看邮件",
             "oc_x",
             "原句",
+            Vec::new(),
         )
         .unwrap();
         assert!(!j.is_due(&dt(2026, 8, 5, 8, 59)));
@@ -456,11 +503,60 @@ mod tests {
 
     #[test]
     fn job_from_parsed_validates() {
-        assert!(job_from_parsed("cron", None, Some("0 9 * * *"), "提醒", "oc", "n").is_ok());
-        assert!(job_from_parsed("cron", None, Some("bad"), "提醒", "oc", "n").is_err());
-        assert!(job_from_parsed("once", None, None, "提醒", "oc", "n").is_err()); // 缺 time
-        assert!(job_from_parsed("x", None, None, "提醒", "oc", "n").is_err());
-        assert!(job_from_parsed("cron", None, Some("0 9 * * *"), "", "oc", "n").is_err());
+        assert!(job_from_parsed(
+            "cron",
+            None,
+            Some("0 9 * * *"),
+            "提醒",
+            "oc",
+            "n",
+            Vec::new()
+        )
+        .is_ok());
+        assert!(job_from_parsed("cron", None, Some("bad"), "提醒", "oc", "n", Vec::new()).is_err());
+        assert!(job_from_parsed("once", None, None, "提醒", "oc", "n", Vec::new()).is_err()); // 缺 time
+        assert!(job_from_parsed("x", None, None, "提醒", "oc", "n", Vec::new()).is_err());
+        assert!(
+            job_from_parsed("cron", None, Some("0 9 * * *"), "", "oc", "n", Vec::new()).is_err()
+        );
         // 空 prompt
+    }
+
+    #[test]
+    fn parse_job_target_forms() {
+        let t = parse_job_target("feishu:oc_123").unwrap();
+        assert_eq!(t.bot_key, "feishu");
+        assert_eq!(t.chat_id, "oc_123");
+        let t2 = parse_job_target("oc_456").unwrap();
+        assert_eq!(t2.bot_key, "");
+        assert_eq!(t2.chat_id, "oc_456");
+        assert!(parse_job_target("").is_err());
+        assert!(parse_job_target("bot:").is_err());
+        assert!(parse_job_target(":oc").is_ok()); // bot 可空
+    }
+
+    #[test]
+    fn job_targets_serde_backward_compat() {
+        // 旧 jobs.json 无 targets 字段 → 空，不报错
+        let text = r#"{"id":"a","kind":"cron","schedule":"0 9 * * *","prompt":"p","chat_id":"oc","note":"n"}"#;
+        let j: Job = serde_json::from_str(text).unwrap();
+        assert!(j.targets.is_empty());
+        // 有 targets 时往返不丢
+        let j2 = Job {
+            id: "a".into(),
+            kind: JobKind::Cron,
+            schedule: "0 9 * * *".into(),
+            prompt: "p".into(),
+            chat_id: "oc".into(),
+            note: "n".into(),
+            targets: vec![JobTarget {
+                bot_key: "feishu".into(),
+                chat_id: "oc_2".into(),
+            }],
+        };
+        let s = serde_json::to_string(&j2).unwrap();
+        let back: Job = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.targets.len(), 1);
+        assert_eq!(back.targets[0].bot_key, "feishu");
     }
 }

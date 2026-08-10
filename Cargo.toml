@@ -1,6 +1,6 @@
 [package]
 name = "agent-bridge"
-version = "2.0.3"
+version = "2.1.0"
 edition = "2021"
 build = "build.rs"
 
@@ -25,6 +25,8 @@ uuid = { version = "1", features = ["v4"] }
 fastrand = "2"
 anyhow = "1"
 async-trait = "0.1"
+# 跨进程文件锁（deliveries.lock）：CLI 入队 / service ack 并发安全，Unix flock + Windows LockFileEx
+fs2 = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg", "image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "6"
