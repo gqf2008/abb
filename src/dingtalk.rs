@@ -8,6 +8,11 @@
 //!      - SYSTEM disconnect → 不响应，等服务端 10s 后断开，重连；
 //!      - CALLBACK /v1.0/im/bot/messages/get → 回 ack + 交给 bridge.on_dingtalk；
 //!      - EVENT → 回 ack（data 带 status）。
+//!
+//! 保活（#19）：钉钉 Stream 平台**空闲时不主动推帧**，健康检查靠**客户端主动发 WebSocket
+//! Ping**（官方 Go/Python SDK 内部 8s keepalive，Rust SDK keep_alive 默认 8000ms）。
+//! 旧实现只被动等帧，空闲 180s 无帧被半开看门狗误杀健康连接——须客户端周期发 Ping，
+//! 平台回 Pong 即证明连接活着。
 //! 发：v1.0 新 OpenAPI，鉴权头 x-acs-dingtalk-access-token。
 //!    - 单聊：POST /v1.0/robot/oToMessages/batchSend（userIds=[对方 staffId]）
 //!    - 群聊：POST /v1.0/robot/groupMessages/send（openConversationId=cid…）
@@ -29,9 +34,12 @@ const API_BASE: &str = "https://api.dingtalk.com";
 /// 单条文本安全长度（按字符数）。钉钉文本消息上限约 2 万字节，这里保守取 8000 字符，
 /// 与飞书分段逻辑同一套（split_text 按字符逐行贪心）。
 pub const DINGTALK_MSG_LIMIT: usize = 8000;
-/// 半开连接看门狗阈值：超过该时长没收到任何入站帧即判定通道假死，主动重连。
-/// 钉钉服务端会周期性发 SYSTEM ping（健康检查），30s 内必有帧，180s 足够宽松。
+/// 半开连接看门狗阈值：超过该时长没收到任何入站帧（含 keepalive 的 Pong）即判定通道假死，主动重连。
+/// 平台空闲时不推帧（#19），健康判定依赖客户端 keepalive 的 Pong；180s ≈ 6 个 keepalive 周期，足够宽松。
 const STALL_AFTER: Duration = Duration::from_secs(180);
+/// 客户端 keepalive 间隔：周期发 WebSocket Ping，平台回 Pong。官方 SDK 默认 8s，
+/// 这里取 30s 已能可靠续命且省流量（看门狗 180s = 6 拍，容忍 5 拍连续丢 Pong）。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 钉钉客户端：access_token 缓存 + 收发消息 + 注册 Stream 连接。
 pub struct DingTalkClient {
@@ -560,9 +568,12 @@ async fn run_conn(
     );
     crate::log!("[dingtalk] 已连接，监听 /v1.0/im/bot/messages/get");
 
+    // 客户端 keepalive（#19）：平台空闲不推帧，须主动发 WebSocket Ping 换 Pong 续命。
     let mut last_rx = Instant::now();
     let mut watchdog = tokio::time::interval(Duration::from_secs(30));
     watchdog.tick().await; // 跳过第一拍
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.tick().await; // 跳过第一拍
 
     loop {
         tokio::select! {
@@ -570,6 +581,13 @@ async fn run_conn(
                 crate::log!("[dingtalk] 收到停止信号，关闭连接");
                 let _ = sink.send(Message::Close(None)).await;
                 return Ok(());
+            }
+            _ = keepalive.tick() => {
+                // 只发 Ping 不算「收到帧」：last_rx 仍只由入站刷新，
+                // 半开连接发 Ping 无 Pong → 看门狗照常兜底（不把假活当在线）。
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return Err(anyhow!("keepalive 发 Ping 失败，连接已不可写"));
+                }
             }
             _ = watchdog.tick() => {
                 if last_rx.elapsed() > STALL_AFTER {
