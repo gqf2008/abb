@@ -252,6 +252,8 @@ fn sync_providers_model(
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
     let get = |id: &str| all.iter().find(|d| d.id == id).map(|d| d.found).unwrap_or(false);
+    // #8 M0：claude/codex 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
+    w.set_missing_agent(!get("claude") || !get("codex"));
     w.set_claude_installed(get("claude"));
     w.set_codex_installed(get("codex"));
     w.set_node_installed(get("node"));
@@ -547,6 +549,33 @@ pub fn run_gui() -> Result<()> {
         tray.on_toggle_autostart(move |on| {
             let _ = platform::set_autostart(on);
         });
+    }
+    // #8 M0 自动引导：claude/codex 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
+    // （load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好 agent 的
+    // 开发者/朋友零打扰（条件不成立）；对新装用户这是「打开就能被引导」的关键一步。
+    {
+        let deps = crate::deps::detect_all();
+        let missing = |id: &str| {
+            deps.iter()
+                .find(|d| d.id == id)
+                .map(|d| !d.found)
+                .unwrap_or(true)
+        };
+        if missing("claude") || missing("codex") {
+            let work = work.clone();
+            let model = bots_model.clone();
+            let pwork = providers_work.clone();
+            let pmodel = providers_model.clone();
+            let dwork = default_provider_work.clone();
+            load_into(&settings, &work, &model, &pwork, &pmodel, &dwork);
+            push_settings_status(&settings, &install::status());
+            settings.set_status_line(
+                "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」Tab 安装依赖，否则机器人无法处理消息。"
+                    .into(),
+            );
+            settings.set_status_is_error(true);
+            show_window_and_focus(&settings);
+        }
     }
     {
         let sw = settings.as_weak();

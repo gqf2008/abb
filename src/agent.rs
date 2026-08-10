@@ -460,6 +460,14 @@ fn claude_needs_fresh_session(e: &str) -> bool {
 /// 只覆盖启动阶段；一旦有产出（含长任务）不再有任何超时——保持「无执行超时」语义。
 const CLAUDE_STARTUP_GRACE_SECS: u64 = 60;
 
+/// agent 可执行文件缺失/启动失败的用户可见文案（#8 M0：附安装指引，引导去设置窗装依赖）。
+fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
+    format!(
+        "⚠️ 找不到命令或启动失败（{}）: {err}（如未安装：请打开 ABB 设置 → 环境配置 → 依赖，点「安装」）",
+        backend.name()
+    )
+}
+
 /// 单轮执行一个后端：流式读输出（不等 EOF），中途消息经 progress 推出，支持 cancel 打断。
 #[allow(clippy::too_many_arguments)]
 async fn run_once(
@@ -546,12 +554,9 @@ async fn run_once(
         truncate(prompt, 60)
     );
 
-    let mut child = cmd.spawn().map_err(|e| {
-        AttemptErr::Failed(format!(
-            "⚠️ 找不到命令或启动失败（{}）: {e}",
-            backend.name()
-        ))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AttemptErr::Failed(agent_missing_msg(backend, &e)))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes()).await;
@@ -950,5 +955,18 @@ mod tests {
             "⚠️ claude 出错（exit 1）:\nNo conversation found"
         ));
         assert!(!claude_needs_fresh_session("⚠️ codex 出错（exit 1）:\nno rollout found"));
+    }
+
+    #[test]
+    fn agent_missing_msg_includes_install_hint() {
+        // #8 M0：agent 缺失时错误文案必须带安装指引，用户照着能去设置窗装依赖
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let m = agent_missing_msg(Backend::Claude, &err);
+        assert!(m.contains("找不到命令或启动失败（claude）"));
+        assert!(m.contains("环境配置"));
+        assert!(m.contains("安装"));
+        let m2 = agent_missing_msg(Backend::Codex, &err);
+        assert!(m2.contains("找不到命令或启动失败（codex）"));
+        assert!(m2.contains("安装"));
     }
 }
