@@ -587,11 +587,10 @@ fn run_session_cli(args: &[String]) -> i32 {
             };
             let store = sessions::SessionStore::new(&backend, &bot_key);
             let sid = store.reset_session(&chat);
+            // 打印完整 UUID：后续要拿它做 --session-id / resume 时截断会误导
             println!(
-                "✅ 已新建会话 bot={} chat={} session={}（service 热重载，无需重启）",
-                bot_key,
-                chat,
-                &sid[..sid.len().min(8)]
+                "✅ 已新建会话 bot={} chat={} session={sid}（service 热重载，无需重启）",
+                bot_key, chat
             );
             0
         }

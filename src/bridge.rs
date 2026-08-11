@@ -33,10 +33,6 @@ pub struct Bridge {
     /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
     /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
     outbox: OutboxStore,
-    /// /new 会话新建标记（#23）：key → 用户在该会话任务运行中发了 /new。
-    /// 任务结束 mark_started 前先看它：命中则跳过 mark，避免旧任务把新会话槽位置回
-    /// started=true（否则下一条会误 resume 一个从未运行的新 UUID）。
-    pending_new: Mutex<HashSet<String>>,
     /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
     /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
     agent_runner: Arc<dyn AgentRunner>,
@@ -97,7 +93,6 @@ impl Bridge {
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
-            pending_new: Mutex::new(HashSet::new()),
             agent_runner,
         }
     }
@@ -348,13 +343,20 @@ impl Bridge {
             // 无在跑任务 → 停止词当普通消息透传给 agent
         }
 
+        // 记录本 bot 主会话（私聊）：定时任务会话失效时的回落目标 + job CLI 缺省回发处
+        // 飞书私聊 chat_type="p2p"；微信私聊用 "dm"。放在 /new 分支之前——新用户首条
+        // 消息就是 /new 时主会话也要落盘（审查 Minor）。
+        if ev.chat_type == "p2p" || ev.chat_type == "dm" {
+            crate::config::Config::save_primary_chat(&self.bot.key(), &ev.chat_id);
+        }
+
         // /new 会话新建（#23）：拦截在透传 agent 之前、拿串行锁之前（不被运行中任务阻塞）。
         // reset 按会话隔离 key（话题=chat:thread，#14）执行，只影响目标会话。
+        // 运行中并发由 mark_started_if 兜底：旧任务完成时若槽位已被换走（/new 或 CLI reset），
+        // 不会把新槽位 mark 回 started=true（审查修复——替代原 pending_new 标记，后者
+        // 覆盖不了 CLI 跨进程 reset，且存在 insert 晚于 reset 的 TOCTOU）。
         if is_new_command(&text) {
             let new_sid = self.sessions.reset_session(&key);
-            // 若该 key 正在跑任务：挂标记，让任务结束后跳过 mark_started（防旧任务把
-            // 新槽位置回 started=true）；无任务时标记会在下一条消息进锁后清除。
-            self.pending_new.lock().unwrap().insert(key.clone());
             crate::log!(
                 "[bridge] /new 新建会话 bot={} key={} sid={}",
                 self.bot.key(),
@@ -368,12 +370,6 @@ impl Bridge {
                 crate::log!("[bridge] /new 确认发送失败: {e:#}");
             }
             return;
-        }
-
-        // 记录本 bot 主会话（私聊）：定时任务会话失效时的回落目标 + job CLI 缺省回发处
-        // 飞书私聊 chat_type="p2p"；微信私聊用 "dm"
-        if ev.chat_type == "p2p" || ev.chat_type == "dm" {
-            crate::config::Config::save_primary_chat(&self.bot.key(), &ev.chat_id);
         }
 
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
@@ -407,8 +403,6 @@ impl Bridge {
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
         let chat_lock = self.chat_lock(&key);
         let _serial_guard = chat_lock.lock().await;
-        // /new 发生在无任务运行期间 → 这里清掉过期标记（本次运行正常 mark_started）
-        self.pending_new.lock().unwrap().remove(&key);
         if t0.elapsed().as_millis() > 50 {
             crate::log!(
                 "[bridge] 排队等待处理 {}ms（bot={} chat={}）",
@@ -470,13 +464,11 @@ impl Bridge {
         self.cancel_flags.lock().unwrap().remove(&key);
 
         match result {
-            Ok(agent::RunOutcome::Reply(reply)) => {
+            Ok(agent::RunOutcome::Reply { reply, session_id }) => {
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
-                // #23：该轮期间用户若发过 /new（pending_new 命中），跳过 mark——
-                // 旧任务完成不应把新会话槽位置回 started=true。
-                if !self.pending_new.lock().unwrap().remove(&key) {
-                    self.sessions.mark_started(&key);
-                }
+                // #23：仅当当前槽位仍是本次任务的会话时才 mark——运行中被 /new 或
+                // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
+                self.sessions.mark_started_if(&key, &session_id);
                 // 发送结果必须留痕：回复丢了（token 失效/会话失效等）时不能谎报成功。
                 match self.send_reply(&ev, &reply).await {
                     Ok(()) => crate::log!(
@@ -847,7 +839,7 @@ mod tests {
             &self,
             _backend: Backend,
             _prompt: &str,
-            _session_id: &str,
+            session_id: &str,
             _resume: bool,
             _chat_id: &str,
             _bot_key: &str,
@@ -859,7 +851,11 @@ mod tests {
             if self.block {
                 self.release.notified().await;
             }
-            Ok(agent::RunOutcome::Reply(self.reply.clone()))
+            // 返回本次运行使用的 session_id——bridge 据此做 mark_started_if 身份校验
+            Ok(agent::RunOutcome::Reply {
+                reply: self.reply.clone(),
+                session_id: session_id.to_string(),
+            })
         }
     }
 
@@ -893,11 +889,15 @@ mod tests {
 
     #[tokio::test]
     async fn new_during_run_skips_mark_started() {
-        // #23 核心不变式：任务运行中发 /new → 旧任务完成时命中 pending_new → 跳过 mark_started，
+        // #23 核心不变式：任务运行中发 /new → 槽位换成新 UUID；旧任务完成时
+        // mark_started_if(旧 session_id) 与当前槽位不匹配 → 跳过 mark，
         // 新槽位 started 保持 false（否则下一条会误 resume 一个从未运行的新 UUID）。
-        // 若把 handle 里的 `if !pending_new.remove` 改回无条件 mark_started，此测试必红。
+        // 若把 handle 里的 mark_started_if 改回无条件 mark_started，此测试必红。
         let runner = Arc::new(MockAgentRunner::blocking("done"));
         let (bridge, _msgr) = build_test_bridge(runner.clone());
+
+        // 先建槽位拿到旧 session_id（任务本身会 ensure 同一槽位）
+        let sid_before = bridge.sessions.ensure_with_started("oc_x").0;
 
         // 普通消息触发 agent（挡板挂住等 release）
         let b1 = bridge.clone();
@@ -908,18 +908,50 @@ mod tests {
 
         // 任务运行中发 /new（在拿串行锁之前拦截，立即执行，不被运行中任务阻塞）
         bridge.handle(test_ev("m2", "oc_x", "/new")).await;
+        let sid_after = bridge.sessions.ensure_with_started("oc_x").0;
+        assert_ne!(
+            sid_before, sid_after,
+            "/new 必须真的换了新 UUID（防测试恒真）"
+        );
         assert!(
             !bridge.sessions.is_started("oc_x"),
-            "/new 后 started 应为 false（reset 已换新 UUID）"
+            "/new 后 started 应为 false"
         );
 
-        // 放行旧任务 → Ok(Reply) → 命中 pending_new → 跳过 mark_started
+        // 放行旧任务 → Ok(Reply) 带旧 session_id → mark_started_if 不匹配 → 跳过 mark
         runner.release.notify_one();
         task.await.unwrap();
 
         assert!(
             !bridge.sessions.is_started("oc_x"),
             "任务运行中发 /new：旧任务完成不得把新槽位 mark 回 started=true"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn cli_reset_during_run_skips_mark_started() {
+        // #23 审查修复：CLI `session reset`（跨进程，等效直接改 sessions.json）发生在任务
+        // 运行中 → 旧任务完成时 mark_started_if 不匹配 → 不得把新槽位 mark 回 started=true。
+        let runner = Arc::new(MockAgentRunner::blocking("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_r", "hello")).await });
+        runner.started.notified().await;
+        let sid_before = bridge.sessions.ensure_with_started("oc_r").0;
+
+        // 模拟 CLI 在另一进程 reset（服务内存不知道，但 refresh 会读到新文件；这里直接
+        // 调同款 reset_session 等价于外部写盘后的状态）
+        let sid_after = bridge.sessions.reset_session("oc_r");
+        assert_ne!(sid_before, sid_after);
+
+        runner.release.notify_one();
+        task.await.unwrap();
+
+        assert!(
+            !bridge.sessions.is_started("oc_r"),
+            "CLI reset 运行中：旧任务完成不得把新槽位 mark 回 started=true"
         );
         cleanup_bridge(&bridge);
     }
@@ -946,18 +978,18 @@ mod tests {
 
     #[tokio::test]
     async fn new_when_idle_does_not_break_next_mark() {
-        // /new 在无任务时发出 → 过期标记在下一条消息进串行锁时清除 → 该消息正常 mark_started。
-        // 验证 pending_new 清除路径，防「标记残留」误跳过后续正常 mark。
+        // /new 在无任务时发出 → 换新 UUID；下一条消息用新 session_id 跑 → 正常 mark_started
+        // （mark_started_if 按会话身份匹配，无需标记清理路径）。
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let (bridge, _msgr) = build_test_bridge(runner);
 
-        bridge.handle(test_ev("m1", "oc_z", "/new")).await; // 无任务 → insert pending_new
+        bridge.handle(test_ev("m1", "oc_z", "/new")).await; // 无任务 → reset 换新 UUID
         assert!(!bridge.sessions.is_started("oc_z"));
 
-        bridge.handle(test_ev("m2", "oc_z", "hello")).await; // 进锁清标记 → 跑 → mark
+        bridge.handle(test_ev("m2", "oc_z", "hello")).await; // 新会话 → 跑 → mark
         assert!(
             bridge.sessions.is_started("oc_z"),
-            "/new 过期标记应被下一条消息清除，正常 mark_started"
+            "新会话完成应正常 mark_started"
         );
         cleanup_bridge(&bridge);
     }

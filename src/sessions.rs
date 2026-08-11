@@ -109,9 +109,10 @@ impl SessionStore {
         if let Ok(text) = fs::read_to_string(&self.path) {
             if let Some(data) = Self::parse(&text) {
                 *self.data.lock().unwrap() = data;
+                // 只有解析成功才推进 sig：临时读失败/外部写了坏文件时不吞掉重试机会
+                *self.loaded_sig.lock().unwrap() = cur;
             }
         }
-        *self.loaded_sig.lock().unwrap() = cur;
     }
 
     /// 解析 sessions.json：先试新格式（按后端分槽），失败再按旧扁平格式迁移。
@@ -157,6 +158,10 @@ impl SessionStore {
             .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
         if let Ok(text) = serde_json::to_string_pretty(data) {
             if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
+                // 写完即推进 sig，避免下次公开方法再读盘（磁盘==内存）
+                *self.loaded_sig.lock().unwrap() = fs::metadata(&self.path)
+                    .ok()
+                    .and_then(|m| Some((m.modified().ok()?, m.len())));
                 return;
             }
         }
@@ -211,13 +216,23 @@ impl SessionStore {
         }
     }
 
-    pub fn mark_started(&self, chat_id: &str) {
+    /// 仅当该 chat 当前槽位的 session_id == expected 时置 started=true（#23 审查修复）：
+    /// 任务运行中若被 /new 或 CLI `session reset` 换走（当前槽位已不是本次任务的会话），
+    /// 旧任务完成不得把新槽位 mark 成 started——否则下一条会误 resume 一个从未运行的新 UUID。
+    /// 返回是否真的标记了（false = 槽位已被换走/不存在）。
+    pub fn mark_started_if(&self, chat_id: &str, expected_session_id: &str) -> bool {
         self.refresh();
         let mut data = self.data.lock().unwrap();
-        if let Some(entry) = data.get_mut(chat_id) {
-            Self::slot_mut(entry, &self.current_backend).started = true;
-            self.save_locked(&data);
+        let Some(entry) = data.get_mut(chat_id) else {
+            return false;
+        };
+        let slot = Self::slot_mut(entry, &self.current_backend);
+        if slot.session_id != expected_session_id {
+            return false;
         }
+        slot.started = true;
+        self.save_locked(&data);
+        true
     }
 
     /// 会话重建：换新 UUID 且复位 started=false，返回新 session_id。
@@ -307,8 +322,16 @@ mod tests {
         let path = dir.join("sessions.json");
         let store = SessionStore::new_at("claude", path.clone());
         let old = store.ensure_session("oc_x");
-        store.mark_started("oc_x"); // 模拟已开过首轮（resume 槽位）
+        assert!(store.mark_started_if("oc_x", &old)); // 模拟已开过首轮（resume 槽位）
         assert!(store.is_started("oc_x"));
+        // 槽位被换走（模拟运行中 reset）→ 不得 mark 新槽位
+        let fresh = store.reset_session("oc_x");
+        assert_ne!(fresh, old, "reset 应换新 UUID");
+        assert!(
+            !store.mark_started_if("oc_x", &old),
+            "旧任务不得 mark 新槽位"
+        );
+        assert!(!store.is_started("oc_x"));
 
         let new = store.reset_session("oc_x");
         assert_ne!(old, new, "换新 UUID 不应复用旧 id");
@@ -329,8 +352,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
         let store = SessionStore::new_at("claude", path.clone());
-        store.ensure_session("oc_a");
-        store.mark_started("oc_a");
+        let sid_a = store.ensure_session("oc_a");
+        assert!(store.mark_started_if("oc_a", &sid_a));
         assert!(store.is_started("oc_a"));
 
         // 模拟 CLI 在另一个进程直接覆盖文件（换一个 chat 的会话）

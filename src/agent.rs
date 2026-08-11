@@ -104,8 +104,11 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 
 /// 一次桥接执行的最终结果。
 pub enum RunOutcome {
-    /// 正常完成，附最终回复文本（bridge 负责回发 + mark_started）。
-    Reply(String),
+    /// 正常完成，附最终回复文本 + 本次运行结束时的 session_id
+    /// （codex 首轮回存真实 thread_id、claude 自愈/换新后都是最终值）。
+    /// bridge 用 session_id 做「mark 前校验当前槽位仍是本次会话」——运行中被
+    /// /new 或 CLI `session reset` 换走的旧任务，不得把新槽位 mark 成 started（#23 审查修复）。
+    Reply { reply: String, session_id: String },
     /// 被用户在聊天里打断（停止词）。无回复；bridge 自行发送停止提示，不 mark_started。
     Cancelled,
 }
@@ -354,7 +357,10 @@ pub async fn run(
                         }
                     }
                 }
-                return Ok(RunOutcome::Reply(out.reply));
+                return Ok(RunOutcome::Reply {
+                    reply: out.reply,
+                    session_id: sid,
+                });
             }
             Err(AttemptErr::Cancelled) => return Ok(RunOutcome::Cancelled),
             Err(AttemptErr::Failed(e)) => {

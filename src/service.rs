@@ -392,7 +392,7 @@ async fn run_job(
     )
     .await
     {
-        Ok(crate::agent::RunOutcome::Reply(r)) => r,
+        Ok(crate::agent::RunOutcome::Reply { reply, .. }) => reply,
         Ok(crate::agent::RunOutcome::Cancelled) => "⏰ 任务被中断".to_string(), // 定时任务不会触发
         Err(e) => format!("⏰ 定时任务执行失败：{e}"),
     };
