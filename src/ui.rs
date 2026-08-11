@@ -363,9 +363,29 @@ fn push_perms_to_window(w: &SettingsWindow) {
 
 /// 配置 winit 后端（须在创建任何组件前调用）。
 fn configure_backend() -> Result<()> {
-    // 注意：不要给窗口设 macOS 透明标题栏属性（titlebar_transparent / fullsize_content_view）。
-    // 这两个会让内容区延伸进标题栏且窗口变透明，若根元素没铺满背景就只剩 traffic-light
-    // 三个按钮、底下透出后面的窗口（即「整个窗口透明只剩按钮」的 bug）。Slint 默认窗口不透明。
+    // macOS：隐藏系统标题栏（对齐 ../aerodesk 的官方推荐做法）——winit 层
+    // titlebar_transparent + title_hidden + fullsize_content_view：
+    // 标题栏透明、标题文字隐藏、内容区铺满整窗，**保留原生红绿灯与原生拖动**。
+    // 注意（历史坑）：这两个属性会让内容延伸进标题栏；只要任何一个窗口的根元素
+    // 没铺满不透明背景，就会「整个窗口透明只剩红绿灯」。因此所有 Window
+    // （SettingsWindow / QrDialog / UnsavedDialog）的根都必须用铺满的 Rectangle
+    // 背景（app.slint 已保证），改窗口结构时别破坏这一点。
+    #[cfg(target_os = "macos")]
+    {
+        use i_slint_backend_winit::Backend;
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        let backend = Backend::builder()
+            .with_window_attributes_hook(|attrs| {
+                attrs
+                    .with_titlebar_transparent(true)
+                    .with_title_hidden(true)
+                    .with_fullsize_content_view(true)
+            })
+            .build()
+            .expect("slint winit backend");
+        slint::platform::set_platform(Box::new(backend)).expect("set slint platform");
+    }
+    #[cfg(not(target_os = "macos"))]
     slint::BackendSelector::new().select()?;
     Ok(())
 }

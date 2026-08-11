@@ -154,6 +154,7 @@ dependencies = [
  "fastrand",
  "fs2",
  "futures-util",
+ "i-slint-backend-winit",
  "image",
  "libc",
  "qrcode",
@@ -167,6 +168,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "winit",
  "winres",
 ]
 

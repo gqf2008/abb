@@ -104,10 +104,15 @@ export component QrDialog inherits Window {
     in-out property <string> tip: "请用微信扫描二维码";
     callback close-clicked();
 
-    VerticalBox {
-        padding: 16px;
-        spacing: 12px;
-        alignment: center;
+    // 根 Rectangle 铺满不透明背景：透明标题栏 + 内容铺满时防止「窗口透明只剩红绿灯」
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Palette.background;
+        VerticalBox {
+            padding-top: 40px; padding-right: 16px; padding-bottom: 16px; padding-left: 16px;
+            spacing: 12px;
+            alignment: center;
         Text { text: root.tip; font-weight: 600; horizontal-alignment: center; wrap: word-wrap; }
         Rectangle {
             background: white;
@@ -124,6 +129,7 @@ export component QrDialog inherits Window {
         HorizontalBox {
             alignment: center;
             Button { text: "取消"; clicked => { root.close-clicked(); } }
+            }
         }
     }
 }
@@ -273,9 +279,14 @@ export component UnsavedDialog inherits Window {
     callback discard-close(); // 次操作（不保存关闭 / 丢弃草稿）
     callback stay();          // 留在设置窗
 
-    VerticalBox {
-        padding: 20px;
-        spacing: 10px;
+    // 根 Rectangle 铺满不透明背景（同 QrDialog：透明标题栏 + 内容铺满防透明坑）
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Palette.background;
+        VerticalBox {
+            padding-top: 40px; padding-right: 20px; padding-bottom: 20px; padding-left: 20px;
+            spacing: 10px;
         Text {
             text: root.title-text;
             font-size: 15px;
@@ -297,6 +308,7 @@ export component UnsavedDialog inherits Window {
             Button { text: root.discard-text; clicked => { root.discard-close(); } }
             if root.show-stay: Button { text: root.stay-text; clicked => { root.stay(); } }
             Button { text: root.primary-text; primary: true; clicked => { root.save-close(); } }
+            }
         }
     }
 }
@@ -428,8 +440,9 @@ export component SettingsWindow inherits Window {
                 Rectangle {
                     width: 176px;
                     background: Palette.background;
+                    // 内容铺满标题栏后，左上角是红绿灯（x≈9-75, y≈9-23）：顶部留 34px 让位
                     VerticalBox {
-                        padding-top: 16px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
+                        padding-top: 34px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
                         spacing: 4px;
                         HorizontalBox {
                             padding-left: 8px;
