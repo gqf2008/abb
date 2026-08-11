@@ -39,6 +39,8 @@ sha2 = "0.10"
 [target.'cfg(target_os = "macos")'.dependencies]
 i-slint-backend-winit = "=1.17.1"
 winit = "0.30"
+# 取 NSWindow 原始指针（window_handle → AppKitHandle），设置标题栏条背景
+raw-window-handle = "0.6"
 
 [build-dependencies]
 slint-build = "1.17"

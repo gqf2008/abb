@@ -110,7 +110,7 @@ export component QrDialog inherits Window {
         height: 100%;
         background: Palette.background;
         VerticalBox {
-            padding-top: 40px; padding-right: 16px; padding-bottom: 16px; padding-left: 16px;
+            padding-top: 16px; padding-right: 16px; padding-bottom: 16px; padding-left: 16px;
             spacing: 12px;
             alignment: center;
         Text { text: root.tip; font-weight: 600; horizontal-alignment: center; wrap: word-wrap; }
@@ -285,7 +285,7 @@ export component UnsavedDialog inherits Window {
         height: 100%;
         background: Palette.background;
         VerticalBox {
-            padding-top: 40px; padding-right: 20px; padding-bottom: 20px; padding-left: 20px;
+            padding-top: 20px; padding-right: 20px; padding-bottom: 20px; padding-left: 20px;
             spacing: 10px;
         Text {
             text: root.title-text;
@@ -440,13 +440,14 @@ export component SettingsWindow inherits Window {
                 Rectangle {
                     width: 176px;
                     background: Palette.background;
-                    // 内容铺满标题栏后，左上角是红绿灯（x≈9-75, y≈9-23）：顶部留 34px 让位
+                    // 红绿灯在系统标题栏条内（内容不延伸到标题栏）；条的颜色已由
+                    // Rust 侧设成系统窗口底色融合，左栏紧贴条下沿，顶部只留 8px
                     VerticalBox {
-                        padding-top: 34px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
+                        padding-top: 8px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
                         spacing: 4px;
                         HorizontalBox {
                             padding-left: 8px;
-                            padding-bottom: 12px;
+                            padding-bottom: 10px;
                             spacing: 8px;
                             Rectangle {
                                 width: 28px;
@@ -490,7 +491,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 0: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 20px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 16px;
                         alignment: start;
 
@@ -652,7 +653,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 1: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 20px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 14px;
 
                         VerticalBox {
@@ -884,7 +885,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 2: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 20px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 14px;
 
                         VerticalBox {
@@ -1167,7 +1168,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 3: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 20px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 14px;
 
                         VerticalBox {

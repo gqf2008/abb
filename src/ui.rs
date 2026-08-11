@@ -178,6 +178,13 @@ fn bring_app_to_front() {
 fn show_window_and_focus<W: slint::ComponentHandle>(w: &W) {
     bring_app_to_front();
     let _ = w.show();
+    // macOS：透明标题栏条透出 NSWindow 背景，设成系统窗口底色避免顶部白条
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        w.window()
+            .with_winit_window(platform::set_ns_window_background_system);
+    }
     w.window().request_redraw();
 }
 
@@ -363,13 +370,10 @@ fn push_perms_to_window(w: &SettingsWindow) {
 
 /// 配置 winit 后端（须在创建任何组件前调用）。
 fn configure_backend() -> Result<()> {
-    // macOS：隐藏系统标题栏（对齐 ../aerodesk 的官方推荐做法）——winit 层
-    // titlebar_transparent + title_hidden + fullsize_content_view：
-    // 标题栏透明、标题文字隐藏、内容区铺满整窗，**保留原生红绿灯与原生拖动**。
-    // 注意（历史坑）：这两个属性会让内容延伸进标题栏；只要任何一个窗口的根元素
-    // 没铺满不透明背景，就会「整个窗口透明只剩红绿灯」。因此所有 Window
-    // （SettingsWindow / QrDialog / UnsavedDialog）的根都必须用铺满的 Rectangle
-    // 背景（app.slint 已保证），改窗口结构时别破坏这一点。
+    // macOS：隐藏系统标题栏——winit 层 titlebar_transparent + title_hidden：
+    // 标题栏透明（看不见横条）、标题文字隐藏，红绿灯保留在系统标题栏条内、内容区
+    // 在标题栏下方开始（不用 fullsize_content_view：那样内容会延伸进标题栏，
+    // 与左栏红绿灯重叠且顶部留白难控，实测观感差）。原生拖动由系统条提供。
     #[cfg(target_os = "macos")]
     {
         use i_slint_backend_winit::Backend;
@@ -379,7 +383,6 @@ fn configure_backend() -> Result<()> {
                 attrs
                     .with_titlebar_transparent(true)
                     .with_title_hidden(true)
-                    .with_fullsize_content_view(true)
             })
             .build()
             .expect("slint winit backend");
