@@ -11,7 +11,7 @@ use crate::feishu::FeishuClient;
 use crate::install;
 use crate::platform;
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
@@ -323,22 +323,36 @@ pub fn run_gui() -> Result<()> {
     let tray = Tray::new()?;
     let settings = SettingsWindow::new()?;
     let qr_dialog = QrDialog::new()?;
+    let unsaved_dialog = UnsavedDialog::new()?;
+    // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。
+    // 有未保存修改时，关闭/取消要先弹确认，避免静默丢编辑（红点/按钮都走这条保护）。
+    let dirty = Rc::new(Cell::new(false));
 
     use slint::ComponentHandle;
 
-    // 点窗口红点（traffic-light）关闭 → 降回 accessory，dock 图标消失。
-    // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦）
-    #[cfg(target_os = "macos")]
+    // 点窗口红点（traffic-light）关闭 → 有未保存修改先弹确认，否则降回 accessory / 直接隐藏。
+    // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦：CloseRequested 返回
+    //  PreventDefault 可阻止 Slint 默认 hide，跨平台生效）
     {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
-        settings.window().on_winit_window_event(|_w, ev| {
+        let dirty = dirty.clone();
+        let dlg = unsaved_dialog.as_weak();
+        settings.window().on_winit_window_event(move |_w, ev| {
             if matches!(ev, WindowEvent::CloseRequested) {
+                if dirty.get() {
+                    if let Some(d) = dlg.upgrade() {
+                        show_window_and_focus(&d);
+                    }
+                    return EventResult::PreventDefault; // 窗口不关，先让用户选保存/不保存
+                }
+                #[cfg(target_os = "macos")]
                 platform::hide_dock();
             }
             EventResult::Propagate // 让 Slint 照常把窗口 hide
         });
         qr_dialog.window().on_winit_window_event(|_w, ev| {
             if matches!(ev, WindowEvent::CloseRequested) {
+                #[cfg(target_os = "macos")]
                 platform::hide_dock();
             }
             EventResult::Propagate
@@ -586,6 +600,7 @@ pub fn run_gui() -> Result<()> {
                 &dwork,
                 &cross_delivery_work,
             );
+            dirty.set(false);
             push_settings_status(&settings, &install::status());
             settings.set_status_line(
                 "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
@@ -603,9 +618,11 @@ pub fn run_gui() -> Result<()> {
         let pmodel = providers_model.clone();
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
+        let dirty_open = dirty.clone();
         tray.on_open_settings(move || {
             if let Some(w) = sw.upgrade() {
                 load_into(&w, &work, &model, &pwork, &pmodel, &dwork, &cdwork);
+                dirty_open.set(false);
                 push_settings_status(&w, &install::status());
                 show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
             }
@@ -650,7 +667,9 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let sw = settings.as_weak();
+        let dirty = dirty.clone();
         settings.on_add_bot(move || {
+            dirty.set(true);
             // 新 bot 默认类型跟随当前选中的 bot（没有选中则用 feishu 默认），
             // 避免旧默认 wechat 让用户以为新加的 bot 是微信（参数区显示微信登录框）。
             let sel = sw.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
@@ -678,7 +697,9 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let sw = settings.as_weak();
+        let dirty = dirty.clone();
         settings.on_remove_bot(move |idx| {
+            dirty.set(true);
             let mut b = work.borrow_mut();
             let i = idx as usize;
             if i < b.len() {
@@ -701,7 +722,9 @@ pub fn run_gui() -> Result<()> {
         let model = bots_model.clone();
         // 按字段回写（slint 侧只传被改的那一个字段）：杜绝「未改字段从过期 model 读回」
         // 导致的连改两字段互相回滚（旧 bot-edited 的 CRITICAL bug）。
+        let dirty = dirty.clone();
         settings.on_bot_field_edited(move |idx, field, value| {
+            dirty.set(true);
             let mut refresh = false;
             {
                 let mut b = work.borrow_mut();
@@ -734,7 +757,9 @@ pub fn run_gui() -> Result<()> {
     {
         let work = work.clone();
         let model = bots_model.clone();
+        let dirty = dirty.clone();
         settings.on_set_bot_enabled(move |idx, enabled| {
+            dirty.set(true);
             {
                 let mut b = work.borrow_mut();
                 if let Some(bot) = b.get_mut(idx as usize) {
@@ -748,7 +773,9 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let cdwork = cross_delivery_work.clone();
+        let dirty = dirty.clone();
         settings.on_set_cross_delivery(move |enabled| {
+            dirty.set(true);
             *cdwork.borrow_mut() = enabled;
         });
     }
@@ -797,7 +824,9 @@ pub fn run_gui() -> Result<()> {
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
         let sw = settings.as_weak();
+        let dirty = dirty.clone();
         settings.on_save_clicked(move || {
+            dirty.set(false);
             if let Some(w) = sw.upgrade() {
                 let mut c = Config::load().unwrap_or_default();
                 // 用工作副本整体替换 bots（保留每个 bot 运行期的 primary_chat_id）
@@ -849,7 +878,7 @@ pub fn run_gui() -> Result<()> {
                 let _ = tx.send(UiCmd::Save(c));
                 // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
                 w.set_status_is_error(false);
-                let mut msg = "✅ 已保存。窗口可继续编辑，不用了点「取消」或红点关闭。".to_string();
+                let mut msg = "✅ 已保存。窗口可继续编辑，不用了点「关闭」或红点关闭。".to_string();
                 if dropped > 0 {
                     msg.push_str(&format!("（丢弃 {dropped} 个未命名供应商）"));
                 }
@@ -859,10 +888,60 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let sw = settings.as_weak();
+        let dlg = unsaved_dialog.as_weak();
+        let dirty = dirty.clone();
         settings.on_cancel_clicked(move || {
+            // 有未保存修改：先弹确认，别静默丢编辑（红点关闭走 winit 拦截，这里管「关闭」按钮）
+            if dirty.get() {
+                if let Some(d) = dlg.upgrade() {
+                    show_window_and_focus(&d);
+                }
+                return;
+            }
             if let Some(w) = sw.upgrade() {
                 let _ = w.hide();
                 platform::hide_dock();
+            }
+        });
+    }
+    // ── 未保存修改确认弹窗：保存并关闭 / 不保存 / 留在设置窗 ──
+    {
+        let sw = settings.as_weak();
+        let dw = unsaved_dialog.as_weak();
+        let dirty = dirty.clone();
+        unsaved_dialog.on_save_close(move || {
+            // 复用「保存」同一路径（汇总工作副本写盘 + 服务在跑则重启），随后关设置窗
+            if let Some(w) = sw.upgrade() {
+                w.invoke_save_clicked();
+                let _ = w.hide();
+                platform::hide_dock();
+            }
+            dirty.set(false);
+            if let Some(d) = dw.upgrade() {
+                let _ = d.hide();
+            }
+        });
+    }
+    {
+        let sw = settings.as_weak();
+        let dw = unsaved_dialog.as_weak();
+        let dirty = dirty.clone();
+        unsaved_dialog.on_discard_close(move || {
+            dirty.set(false); // 丢弃本次编辑，后续关闭不再提示
+            if let Some(w) = sw.upgrade() {
+                let _ = w.hide();
+                platform::hide_dock();
+            }
+            if let Some(d) = dw.upgrade() {
+                let _ = d.hide();
+            }
+        });
+    }
+    {
+        let dw = unsaved_dialog.as_weak();
+        unsaved_dialog.on_stay(move || {
+            if let Some(d) = dw.upgrade() {
+                let _ = d.hide();
             }
         });
     }
@@ -1009,7 +1088,9 @@ pub fn run_gui() -> Result<()> {
     // ── 供应商编辑回调（per-field 纪律与 bot 一致）──
     {
         let pwork = providers_work.clone();
+        let dirty = dirty.clone();
         settings.on_provider_field_edited(move |idx, field, value| {
+            dirty.set(true);
             let mut pv = pwork.borrow_mut();
             if let Some(p) = pv.get_mut(idx as usize) {
                 match field.as_str() {
@@ -1039,7 +1120,9 @@ pub fn run_gui() -> Result<()> {
         let pmodel = providers_model.clone();
         let dwork = default_provider_work.clone();
         let sw = settings.as_weak();
+        let dirty = dirty.clone();
         settings.on_add_provider(move || {
+            dirty.set(true);
             let mut pv = pwork.borrow_mut();
             let n = pv.len() + 1;
             pv.push(ProviderConfig {
@@ -1061,7 +1144,9 @@ pub fn run_gui() -> Result<()> {
         let pmodel = providers_model.clone();
         let dwork = default_provider_work.clone();
         let sw = settings.as_weak();
+        let dirty = dirty.clone();
         settings.on_remove_provider(move |idx| {
+            dirty.set(true);
             let mut pv = pwork.borrow_mut();
             let i = idx as usize;
             if i < pv.len() {
@@ -1086,7 +1171,9 @@ pub fn run_gui() -> Result<()> {
         let pwork = providers_work.clone();
         let pmodel = providers_model.clone();
         let dwork = default_provider_work.clone();
+        let dirty = dirty.clone();
         settings.on_set_default_provider(move |idx| {
+            dirty.set(true);
             let pv = pwork.borrow_mut();
             if let Some(p) = pv.get(idx as usize) {
                 if !p.name.is_empty() {
@@ -1149,6 +1236,7 @@ pub fn run_gui() -> Result<()> {
         let model = bots_model.clone();
         let tray_hold = tray;
         let tray_weak = tray_hold.as_weak();
+        let dirty = dirty.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -1205,6 +1293,7 @@ pub fn run_gui() -> Result<()> {
                     if let Some(w) = settings_weak.upgrade() {
                         match r {
                             Ok((name, oid)) => {
+                                dirty.set(true); // 自动获取回填了 bot 名/open_id，属于编辑
                                 let mut b = work.borrow_mut();
                                 if let Some(bot) = b.get_mut(idx as usize) {
                                     bot.bot_name = name.clone();
@@ -1242,6 +1331,7 @@ pub fn run_gui() -> Result<()> {
                         WxEvt::Confirmed(idx, login) => {
                             // 扫码完成：关掉二维码弹窗即可（设置窗保持打开、置前聚焦，
                             // 让用户看到「登录成功」并点保存——用户要求扫码后窗口不关）。
+                            dirty.set(true); // 扫码登录写回了 token/name，属于编辑
                             if let Some(d) = qr_weak.upgrade() {
                                 let _ = d.hide();
                             }
