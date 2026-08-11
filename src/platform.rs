@@ -65,58 +65,6 @@ pub fn set_dock_visible(visible: bool) {
     }
 }
 
-/// macOS：把 NSWindow 背景设为系统标准窗口背景色（随深/浅色自动切换）。
-/// 用途：透明标题栏 + 内容不铺满时，系统标题栏条透出的是 NSWindow 背景；
-/// 默认白底会形成一条白带。设成系统窗口底色后，标题栏条与页面同色系融合。
-/// 须在主线程（事件循环内）调；winit window 尚不存在时由调用方保证已存在。
-#[cfg(target_os = "macos")]
-pub fn set_ns_window_background_system(window: &winit::window::Window) {
-    #![allow(non_snake_case)]
-    use std::ffi::c_void;
-    use std::sync::OnceLock;
-
-    type Id = *mut c_void;
-    type Sel = *mut c_void;
-    unsafe extern "C" {
-        fn objc_getClass(name: *const std::ffi::c_char) -> Id;
-        fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
-        fn objc_msgSend();
-    }
-    // selector 缓存（usize 存原始指针；进程内全局常量地址，缓存安全）。
-    static SELS: OnceLock<(usize, usize, usize)> = OnceLock::new();
-    let (window_bg_color, set_bg, window_sel) = *SELS.get_or_init(|| unsafe {
-        (
-            sel_registerName(c"windowBackgroundColor".as_ptr()) as usize,
-            sel_registerName(c"setBackgroundColor:".as_ptr()) as usize,
-            sel_registerName(c"window".as_ptr()) as usize,
-        )
-    });
-    unsafe {
-        let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let msg1: unsafe extern "C" fn(Id, Sel, Id) =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        // [NSColor windowBackgroundColor]（类方法）
-        let color = msg0(objc_getClass(c"NSColor".as_ptr()), window_bg_color as Sel);
-        if !color.is_null() {
-            // [ns_window setBackgroundColor: color]；NSWindow 从 window_handle() 取
-            use raw_window_handle::HasWindowHandle;
-            if let Ok(handle) = window.window_handle() {
-                if let raw_window_handle::RawWindowHandle::AppKit(ah) = handle.as_raw() {
-                    let ns_view = ah.ns_view.as_ptr() as Id;
-                    if !ns_view.is_null() {
-                        // [view window] → NSWindow；再 [window setBackgroundColor: color]
-                        let ns_window = msg0(ns_view, window_sel as Sel);
-                        if !ns_window.is_null() {
-                            msg1(ns_window, set_bg as Sel, color);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// 把应用图标设到 NSApplication.applicationIconImage。
 /// 图标来源：优先 .app bundle 的 Resources/AppIcon.icns（打包后）；否则 app-assets/icon-1024.png（debug 源码树）。
 /// 手写 objc_msgSend FFI（零依赖原则，同 macos_activate）。须在主线程调。

@@ -158,7 +158,6 @@ dependencies = [
  "image",
  "libc",
  "qrcode",
- "raw-window-handle",
  "reqwest",
  "rusqlite",
  "serde",

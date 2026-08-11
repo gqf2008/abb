@@ -431,21 +431,27 @@ export component SettingsWindow inherits Window {
         background: Palette.alternate-background;
 
         VerticalBox {
+            // 关键：VerticalBox/HorizontalBox 自带 StyleMetrics.layout-padding（fluent=8px），
+            // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。全部归零，
+            // 由各分区自己的 padding 精确控制。
+            padding: 0;
             // ── 主体：左导航栏 + 页面区 ──
             HorizontalBox {
                 vertical-stretch: 1;
                 spacing: 0;
+                padding: 0;
 
                 // 左导航栏（PCM 侧边栏）：白底 + 右侧分隔线，首页/机器人/环境/供应商。
                 Rectangle {
-                    width: 176px;
+                    width: 160px;
                     background: Palette.background;
-                    // 红绿灯在系统标题栏条内（内容不延伸到标题栏）；条的颜色已由
-                    // Rust 侧设成系统窗口底色融合，左栏紧贴条下沿，顶部只留 8px
+                    // 内容铺满整窗（fullsize_content_view）：红绿灯浮在左栏左上角
+                    // （x≈8-56, y≈8-22），顶部留 34px 让位，Logo 紧接其下。
                     VerticalBox {
-                        padding-top: 8px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
+                        padding-top: 34px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
                         spacing: 4px;
                         HorizontalBox {
+                            padding-top: 0;
                             padding-left: 8px;
                             padding-bottom: 10px;
                             spacing: 8px;
@@ -491,7 +497,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 0: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 16px;
                         alignment: start;
 
@@ -653,7 +659,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 1: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 14px;
 
                         VerticalBox {
@@ -885,7 +891,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 2: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 14px;
 
                         VerticalBox {
@@ -1168,7 +1174,7 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 3: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 16px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                        padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                         spacing: 14px;
 
                         VerticalBox {
