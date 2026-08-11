@@ -33,6 +33,10 @@ pub struct Bridge {
     /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
     /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
     outbox: OutboxStore,
+    /// /new 会话新建标记（#23）：key → 用户在该会话任务运行中发了 /new。
+    /// 任务结束 mark_started 前先看它：命中则跳过 mark，避免旧任务把新会话槽位置回
+    /// started=true（否则下一条会误 resume 一个从未运行的新 UUID）。
+    pending_new: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug)]
@@ -79,6 +83,7 @@ impl Bridge {
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
+            pending_new: Mutex::new(HashSet::new()),
         }
     }
 
@@ -334,6 +339,28 @@ impl Bridge {
             // 无在跑任务 → 停止词当普通消息透传给 agent
         }
 
+        // /new 会话新建（#23）：拦截在透传 agent 之前、拿串行锁之前（不被运行中任务阻塞）。
+        // reset 按会话隔离 key（话题=chat:thread，#14）执行，只影响目标会话。
+        if is_new_command(&text) {
+            let new_sid = self.sessions.reset_session(&key);
+            // 若该 key 正在跑任务：挂标记，让任务结束后跳过 mark_started（防旧任务把
+            // 新槽位置回 started=true）；无任务时标记会在下一条消息进锁后清除。
+            self.pending_new.lock().unwrap().insert(key.clone());
+            crate::log!(
+                "[bridge] /new 新建会话 bot={} key={} sid={}",
+                self.bot.key(),
+                &key[..key.len().min(16)],
+                &new_sid[..new_sid.len().min(8)]
+            );
+            if let Err(e) = self
+                .send_reply(&ev, "✅ 已新建会话，下一条消息开始全新上下文。")
+                .await
+            {
+                crate::log!("[bridge] /new 确认发送失败: {e:#}");
+            }
+            return;
+        }
+
         // 记录本 bot 主会话（私聊）：定时任务会话失效时的回落目标 + job CLI 缺省回发处
         // 飞书私聊 chat_type="p2p"；微信私聊用 "dm"
         if ev.chat_type == "p2p" || ev.chat_type == "dm" {
@@ -371,6 +398,8 @@ impl Bridge {
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
         let chat_lock = self.chat_lock(&key);
         let _serial_guard = chat_lock.lock().await;
+        // /new 发生在无任务运行期间 → 这里清掉过期标记（本次运行正常 mark_started）
+        self.pending_new.lock().unwrap().remove(&key);
         if t0.elapsed().as_millis() > 50 {
             crate::log!(
                 "[bridge] 排队等待处理 {}ms（bot={} chat={}）",
@@ -428,8 +457,12 @@ impl Bridge {
 
         match result {
             Ok(agent::RunOutcome::Reply(reply)) => {
-                // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）
-                self.sessions.mark_started(&key);
+                // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
+                // #23：该轮期间用户若发过 /new（pending_new 命中），跳过 mark——
+                // 旧任务完成不应把新会话槽位置回 started=true。
+                if !self.pending_new.lock().unwrap().remove(&key) {
+                    self.sessions.mark_started(&key);
+                }
                 // 发送结果必须留痕：回复丢了（token 失效/会话失效等）时不能谎报成功。
                 match self.send_reply(&ev, &reply).await {
                     Ok(()) => crate::log!(
@@ -642,6 +675,12 @@ pub fn strip_bot_mention(text: &str, bot_name: &str) -> String {
     text.to_string()
 }
 
+/// 识别「/new」会话新建指令（#23）：trim 后精确匹配，大小写不敏感。
+/// 只在 handle 里拦截（在透传 agent 之前），其它斜杠命令仍原样透传。
+fn is_new_command(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("/new")
+}
+
 /// 识别「打断」关键词（整句精确匹配，大小写不敏感）。仅当该 chat 有任务在跑时才生效
 /// （由 handle 判断）；否则原样透传给 agent，避免误吞用户正常词汇。
 fn is_cancel_keyword(text: &str) -> bool {
@@ -703,6 +742,17 @@ mod tests {
         assert_eq!(a.key(), "oc_group:omt_aaa");
         assert_eq!(b.key(), "oc_group:omt_bbb");
         assert_ne!(a.key(), b.key(), "不同话题必须不同 key");
+    }
+
+    #[test]
+    fn new_command_matches_exactly() {
+        assert!(is_new_command("/new"));
+        assert!(is_new_command(" /new "));
+        assert!(is_new_command("/NEW"));
+        assert!(!is_new_command("/new 参数"));
+        assert!(!is_new_command("/news"));
+        assert!(!is_new_command("new"));
+        assert!(!is_new_command(""));
     }
 
     #[test]

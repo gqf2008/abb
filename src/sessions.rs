@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// 单个后端的会话槽位：session_id + 是否已开过首轮（决定下轮 --resume 还是新建）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -50,13 +51,20 @@ pub struct SessionStore {
     data: Mutex<HashMap<String, ChatEntry>>,
     /// 当前 bot 生效后端（"claude"/"codex"）——决定各方法读写哪个槽位。
     current_backend: String,
+    /// 上次加载时的文件 mtime。CLI/外部改 sessions.json 后按 mtime 热重载（#23），
+    /// 无需重启 service 即生效——复用 JobStore 的 refresh 模式。
+    loaded_mtime: Mutex<Option<SystemTime>>,
 }
 
 impl SessionStore {
     pub fn new(current_backend: &str, bot_key: &str) -> SessionStore {
         let dir = crate::bridge_dir().join("workspaces").join(bot_key);
         let _ = fs::create_dir_all(&dir);
-        let path = dir.join("sessions.json");
+        Self::at(current_backend, dir.join("sessions.json"))
+    }
+
+    /// 按指定路径构造（生产/测试共用）。
+    fn at(current_backend: &str, path: PathBuf) -> SessionStore {
         let data = if path.exists() {
             fs::read_to_string(&path)
                 .ok()
@@ -65,11 +73,36 @@ impl SessionStore {
         } else {
             HashMap::new()
         };
+        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         SessionStore {
             path,
             data: Mutex::new(data),
             current_backend: current_backend.to_string(),
+            loaded_mtime: Mutex::new(mtime),
         }
+    }
+
+    #[cfg(test)]
+    fn new_at(current_backend: &str, path: PathBuf) -> SessionStore {
+        Self::at(current_backend, path)
+    }
+
+    /// 若 sessions.json 的 mtime 比上次加载新（CLI/外部进程改了），重新读盘。
+    /// 每次公开方法前调用，保证「运行中改文件即时生效」。
+    fn refresh(&self) {
+        let cur = fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let stale = { *self.loaded_mtime.lock().unwrap() != cur };
+        if !stale {
+            return;
+        }
+        if let Ok(text) = fs::read_to_string(&self.path) {
+            if let Some(data) = Self::parse(&text) {
+                *self.data.lock().unwrap() = data;
+            }
+        }
+        *self.loaded_mtime.lock().unwrap() = cur;
     }
 
     /// 解析 sessions.json：先试新格式（按后端分槽），失败再按旧扁平格式迁移。
@@ -108,13 +141,17 @@ impl SessionStore {
     }
 
     fn save_locked(&self, data: &HashMap<String, ChatEntry>) {
-        // 原子写：tmp + rename（崩溃不留半截）
-        let tmp = self.path.with_extension("json.tmp");
+        // 原子写：唯一 tmp + rename（崩溃不留半截；唯一 tmp 避免 CLI reset 与 service
+        // 写盘并发时互相覆盖同一 tmp 文件）
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
         if let Ok(text) = serde_json::to_string_pretty(data) {
-            if fs::write(&tmp, text).is_ok() {
-                let _ = fs::rename(&tmp, &self.path);
+            if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
+                return;
             }
         }
+        let _ = fs::remove_file(&tmp);
     }
 
     /// 取当前后端槽位的可变引用（没有则建默认槽位）。
@@ -128,6 +165,7 @@ impl SessionStore {
 
     /// 返回该 chat 在当前后端的 session_id，没有则新建 UUID。
     pub fn ensure_session(&self, chat_id: &str) -> String {
+        self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
         let slot = Self::slot_mut(entry, &self.current_backend);
@@ -142,6 +180,7 @@ impl SessionStore {
     }
 
     pub fn mark_started(&self, chat_id: &str) {
+        self.refresh();
         let mut data = self.data.lock().unwrap();
         if let Some(entry) = data.get_mut(chat_id) {
             Self::slot_mut(entry, &self.current_backend).started = true;
@@ -153,6 +192,7 @@ impl SessionStore {
     /// claude 用（#6/#7）：jsonl 残留 already in use / 启动挂起后，旧 UUID 槽位永久不可用，
     /// 必须换新（started=false → 下轮走 --session-id 新 UUID）；resume 槽位也一并复位。
     pub fn reset_session(&self, chat_id: &str) -> String {
+        self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
         let slot = Self::slot_mut(entry, &self.current_backend);
@@ -165,6 +205,7 @@ impl SessionStore {
 
     /// 覆盖该 chat 当前后端的 session_id（codex 用：首轮 exec 抓到真实 thread_id 后回存，供后续 resume）。
     pub fn set_session_id(&self, chat_id: &str, session_id: &str) {
+        self.refresh();
         let mut data = self.data.lock().unwrap();
         if let Some(entry) = data.get_mut(chat_id) {
             let slot = Self::slot_mut(entry, &self.current_backend);
@@ -176,6 +217,7 @@ impl SessionStore {
     }
 
     pub fn is_started(&self, chat_id: &str) -> bool {
+        self.refresh();
         let data = self.data.lock().unwrap();
         data.get(chat_id)
             .map(|e| {
@@ -228,11 +270,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("abb-sessions-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
-        let store = SessionStore {
-            path: path.clone(),
-            data: Mutex::new(HashMap::new()),
-            current_backend: "claude".into(),
-        };
+        let store = SessionStore::new_at("claude", path.clone());
         let old = store.ensure_session("oc_x");
         store.mark_started("oc_x"); // 模拟已开过首轮（resume 槽位）
         assert!(store.is_started("oc_x"));
@@ -245,6 +283,35 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(&new));
         assert!(text.contains("\"started\": false"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hot_reload_picks_up_external_change() {
+        // #23：运行中外部（CLI）改 sessions.json → 下一次操作热重载，无需重启
+        let dir =
+            std::env::temp_dir().join(format!("abb-sessions-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("claude", path.clone());
+        store.ensure_session("oc_a");
+        store.mark_started("oc_a");
+        assert!(store.is_started("oc_a"));
+
+        // 模拟 CLI 在另一个进程直接覆盖文件（换一个 chat 的会话）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let text = r#"{"oc_b": {"claude": {"session_id": "ext-uuid", "started": true}}}"#;
+        std::fs::write(&path, text).unwrap();
+
+        // 下次操作即热重载：oc_a 消失、oc_b 可见
+        assert!(!store.is_started("oc_a"), "外部覆盖后应读到新文件");
+        assert!(store.is_started("oc_b"));
+
+        // 热重载后的写也要落盘（reset 换新 UUID）
+        let sid = store.reset_session("oc_b");
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(disk.contains(&sid));
+        assert!(disk.contains("\"started\": false"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

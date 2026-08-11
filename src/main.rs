@@ -187,6 +187,13 @@ fn main() {
         std::process::exit(run_deliver_cli(&args[2..]));
     }
 
+    // 会话管理 CLI（#23）：供 claude 用 Bash 调用（也可人用）。
+    //   agent-bridge session reset <chat_id>
+    // bot 从 AGENT_BRIDGE_BOT_KEY env（桥注入）解析；chat_id 缺省取 AGENT_BRIDGE_CHAT_ID。
+    if args.len() >= 2 && args[1] == "session" {
+        std::process::exit(run_session_cli(&args[2..]));
+    }
+
     // 隐藏调试 flag：--wx-qr-test（冒烟：真拉一次微信登录二维码，验证协议端点）
     if args.iter().any(|a| a == "--wx-qr-test") {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -542,4 +549,98 @@ fn run_deliver_cli(args: &[String]) -> i32 {
     crate::log!("[deliver] CLI 已入队投递（service 异步发送）");
     println!("✅ 已入队跨会话投递（由 service 异步发送）。");
     0
+}
+
+/// 会话管理 CLI（#23）。退出码 0=成功 1=失败。
+fn run_session_cli(args: &[String]) -> i32 {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "reset" => {
+            let bot_key = match resolve_bot_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            let cfg = match config::Config::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("读 config 失败: {e:#}");
+                    return 1;
+                }
+            };
+            // 后端跟 bot 走（与聊天/定时任务一致），决定 reset 哪个后端槽位
+            let backend = cfg
+                .bots
+                .iter()
+                .find(|b| b.key() == bot_key)
+                .map(|b| b.effective_backend(&cfg.default_backend).to_string())
+                .unwrap_or_else(|| cfg.default_backend.clone());
+            let env_chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+            let chat = match session_reset_chat_id(&args[1..], &env_chat) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            let store = sessions::SessionStore::new(&backend, &bot_key);
+            let sid = store.reset_session(&chat);
+            println!(
+                "✅ 已新建会话 bot={} chat={} session={}（service 热重载，无需重启）",
+                bot_key,
+                chat,
+                &sid[..sid.len().min(8)]
+            );
+            0
+        }
+        _ => {
+            eprintln!(
+                "用法：\n  agent-bridge session reset <chat_id>（bot 取 AGENT_BRIDGE_BOT_KEY，chat 缺省取 AGENT_BRIDGE_CHAT_ID）"
+            );
+            1
+        }
+    }
+}
+
+/// 解析 session reset 的目标 chat：显式参数优先，缺省回落 env（桥 spawn agent 时注入）。
+fn session_reset_chat_id(args: &[String], env_chat: &str) -> Result<String, String> {
+    if let Some(c) = args.first() {
+        let c = c.trim();
+        if !c.is_empty() {
+            return Ok(c.to_string());
+        }
+    }
+    if !env_chat.is_empty() {
+        return Ok(env_chat.to_string());
+    }
+    Err("缺 chat_id：agent-bridge session reset <chat_id>（或用 AGENT_BRIDGE_CHAT_ID env）".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_reset_chat_id;
+
+    #[test]
+    fn session_reset_chat_prefers_arg() {
+        assert_eq!(
+            session_reset_chat_id(&["oc_123".into()], "oc_env").unwrap(),
+            "oc_123"
+        );
+    }
+
+    #[test]
+    fn session_reset_chat_falls_back_to_env() {
+        assert_eq!(session_reset_chat_id(&[], "oc_env").unwrap(), "oc_env");
+        assert_eq!(
+            session_reset_chat_id(&["   ".into()], "oc_env").unwrap(),
+            "oc_env"
+        );
+    }
+
+    #[test]
+    fn session_reset_chat_requires_target() {
+        assert!(session_reset_chat_id(&[], "").is_err());
+    }
 }
