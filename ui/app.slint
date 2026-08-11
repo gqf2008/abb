@@ -240,8 +240,6 @@ component QuickCard inherits Rectangle {
     height: 122px;
     horizontal-stretch: 1;
     border-radius: 12px;
-    border-width: 1px;
-    border-color: Palette.border.with-alpha(0.25);
     background: Palette.background;
     TouchArea {
         clicked => { root.clicked(); }
@@ -556,9 +554,7 @@ export component SettingsWindow inherits Window {
                                         width: 140px;
                                         height: 32px;
                                         border-radius: 9px;
-                                        border-width: 1px;
-                                        border-color: Palette.accent-foreground.with-alpha(0.6);
-                                        background: transparent;
+                                        background: Palette.accent-foreground.with-alpha(0.15);
                                         TouchArea {
                                             clicked => { root.open-logs(); }
                                             Text { text: "打开日志"; color: Palette.accent-foreground; font-size: 12.5px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
@@ -572,8 +568,6 @@ export component SettingsWindow inherits Window {
                         if root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0: Rectangle {
                             border-radius: 12px;
                             background: #fff8e6;
-                            border-width: 1px;
-                            border-color: #e8c36a;
                             VerticalBox {
                                 padding-top: 12px; padding-right: 16px; padding-bottom: 10px; padding-left: 16px;
                                 spacing: 4px;
@@ -624,8 +618,6 @@ export component SettingsWindow inherits Window {
                                 height: 122px;
                                 horizontal-stretch: 1;
                                 border-radius: 12px;
-                                border-width: 1px;
-                                border-color: Palette.border.with-alpha(0.25);
                                 background: Palette.background;
                                 VerticalBox {
                                     padding: 14px;
@@ -659,8 +651,6 @@ export component SettingsWindow inherits Window {
                             vertical-stretch: 1;
                             border-radius: 12px;
                             background: Palette.background;
-                            border-width: 1px;
-                            border-color: Palette.border.with-alpha(0.25);
                             HorizontalBox {
                                 spacing: 0;
                                 // ── 左：bot 列表 ──
@@ -708,7 +698,6 @@ export component SettingsWindow inherits Window {
                                         }
                                     }
                                 }
-                                Rectangle { width: 1px; background: Palette.border; }
                                 // ── 右：编辑选中 bot ──
                                 VerticalBox {
                                     spacing: 6px;
@@ -901,8 +890,6 @@ export component SettingsWindow inherits Window {
                                     vertical-stretch: 0;
                                     background: #fff3cd;
                                     border-radius: 10px;
-                                    border-width: 1px;
-                                    border-color: #e0a800;
                                     HorizontalBox {
                                         padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
                                         spacing: 8px;
@@ -921,8 +908,6 @@ export component SettingsWindow inherits Window {
                                     vertical-stretch: 0;
                                     border-radius: 12px;
                                     background: Palette.background;
-                                    border-width: 1px;
-                                    border-color: Palette.border.with-alpha(0.25);
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
                                         spacing: 6px;
@@ -1032,8 +1017,6 @@ export component SettingsWindow inherits Window {
                                     vertical-stretch: 0;
                                     border-radius: 12px;
                                     background: Palette.background;
-                                    border-width: 1px;
-                                    border-color: Palette.border.with-alpha(0.25);
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
                                         spacing: 6px;
@@ -1183,8 +1166,6 @@ export component SettingsWindow inherits Window {
                             vertical-stretch: 1;
                             border-radius: 12px;
                             background: Palette.background;
-                            border-width: 1px;
-                            border-color: Palette.border.with-alpha(0.25);
                             HorizontalBox {
                                 spacing: 0;
                                 // ── 左：供应商列表 ──
@@ -1231,7 +1212,6 @@ export component SettingsWindow inherits Window {
                                         }
                                     }
                                 }
-                                Rectangle { width: 1px; background: Palette.border; }
                                 // ── 右：编辑选中供应商 ──
                                 VerticalBox {
                                     spacing: 6px;
