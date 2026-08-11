@@ -13,6 +13,8 @@ use crate::platform;
 use anyhow::Result;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -385,6 +387,10 @@ pub fn run_gui() -> Result<()> {
     // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。
     // 有未保存修改时，关闭/取消要先弹确认，避免静默丢编辑（红点/按钮都走这条保护）。
     let dirty = Rc::new(Cell::new(false));
+    // 启动路径（自动引导/半配置）是否已显式 show 设置窗：是则预热的「队列里 hide」要跳过，
+    // 否则窗口会在事件循环启动瞬间被隐藏（启动即显示变成黑窗/无窗）。
+    // 用 Arc<AtomicBool>：预热的 invoke_from_event_loop 闭包要求 Send，Rc 进不去。
+    let startup_shown = Arc::new(AtomicBool::new(false));
 
     use slint::ComponentHandle;
 
@@ -433,9 +439,13 @@ pub fn run_gui() -> Result<()> {
         let _ = settings.show();
         settings.window().request_redraw();
         let sw = settings.as_weak();
+        let startup_shown_pw = startup_shown.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(w) = sw.upgrade() {
-                let _ = w.hide();
+                // 启动路径已经 show 过（自动引导/半配置）→ 只复位位置，不 hide
+                if !startup_shown_pw.load(Ordering::Relaxed) {
+                    let _ = w.hide();
+                }
                 w.window().set_position(saved);
             }
         });
@@ -698,6 +708,7 @@ pub fn run_gui() -> Result<()> {
                     .into(),
             );
             settings.set_status_is_error(true);
+            startup_shown.store(true, Ordering::Relaxed);
             show_window_and_focus(&settings);
         }
     }
@@ -1269,7 +1280,7 @@ pub fn run_gui() -> Result<()> {
         // 覆盖 config，把磁盘上已有的 bots 全部抹掉（半配置状态：配了但 is_configured 为假）。
         // 此处仍在事件循环启动前的主线程设置阶段，直接调用即可（Rc 非 Send，
         // 不能塞进 invoke_from_event_loop）。
-        load_with_draft(
+        let restored = load_with_draft(
             &settings,
             &dirty,
             &work,
@@ -1279,8 +1290,12 @@ pub fn run_gui() -> Result<()> {
             &default_provider_work,
             &cross_delivery_work,
         );
-        settings.set_status_is_error(false);
-        settings.set_status_line("请先添加一个飞书/微信机器人".into());
+        // 已静默恢复草稿时保留恢复提示，别被「请先添加」覆盖
+        if !restored {
+            settings.set_status_is_error(false);
+            settings.set_status_line("请先添加一个飞书/微信机器人".into());
+        }
+        startup_shown.store(true, Ordering::Relaxed);
         show_window_and_focus(&settings);
     }
 
