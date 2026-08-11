@@ -110,6 +110,53 @@ pub enum RunOutcome {
     Cancelled,
 }
 
+/// Agent 执行抽象（#23 测试可测性）：bridge 持 `Arc<dyn AgentRunner>`，按 `Messenger`
+/// 同款注入模式。生产用 `RealAgentRunner`（转发下面的自由函数 `run`，spawn 真实 claude/codex
+/// 子进程）；测试注入挡板以驱动「任务运行中」时序——真实 `run` 在测试环境无 claude/codex
+/// 二进制只能走 Err 分支，覆盖不到 `Ok(Reply)` 路径上的 pending_new / mark_started 编排。
+#[async_trait::async_trait]
+pub trait AgentRunner: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        backend: Backend,
+        prompt: &str,
+        session_id: &str,
+        resume: bool,
+        chat_id: &str,
+        bot_key: &str,
+        sessions: Option<&crate::sessions::SessionStore>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<RunOutcome, String>;
+}
+
+/// 默认实现：原样转发本模块的自由函数 `run`（spawn 真实 claude/codex 子进程）。
+pub struct RealAgentRunner;
+
+#[async_trait::async_trait]
+impl AgentRunner for RealAgentRunner {
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        backend: Backend,
+        prompt: &str,
+        session_id: &str,
+        resume: bool,
+        chat_id: &str,
+        bot_key: &str,
+        sessions: Option<&crate::sessions::SessionStore>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<RunOutcome, String> {
+        // 裸函数调用解析到本模块的自由函数 run（trait method 必须经 `.` 调用，不会递归）。
+        run(
+            backend, prompt, session_id, resume, chat_id, bot_key, sessions, progress, cancel,
+        )
+        .await
+    }
+}
+
 /// 单次尝试（run_once）的错误：区分「用户打断」与「真实失败（用户可读文案）」。
 enum AttemptErr {
     Cancelled,

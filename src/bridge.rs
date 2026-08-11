@@ -2,7 +2,7 @@
 //! 通道无关：通过 `Messenger` trait 收发（飞书 / 微信 / 钉钉），飞书事件解析在 on_payload，
 //! 微信消息在 on_weixin，钉钉消息在 on_dingtalk。零 regex（路由/@_user_ 手工解析）。
 
-use crate::agent::{self, Backend};
+use crate::agent::{self, AgentRunner, Backend};
 use crate::config::{BotConfig, Config};
 use crate::messenger::Messenger;
 use crate::outbox::{OutboxItem, OutboxStore};
@@ -37,6 +37,9 @@ pub struct Bridge {
     /// 任务结束 mark_started 前先看它：命中则跳过 mark，避免旧任务把新会话槽位置回
     /// started=true（否则下一条会误 resume 一个从未运行的新 UUID）。
     pending_new: Mutex<HashSet<String>>,
+    /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
+    /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
+    agent_runner: Arc<dyn AgentRunner>,
 }
 
 #[derive(Debug)]
@@ -67,6 +70,17 @@ impl Ev {
 
 impl Bridge {
     pub fn new(msgr: Arc<dyn Messenger>, bot: BotConfig, cfg: &Config) -> Bridge {
+        Self::build(msgr, bot, cfg, Arc::new(agent::RealAgentRunner))
+    }
+
+    /// 实际构造器：生产（`new` 用真实 `RealAgentRunner`）与测试（注入挡板 `AgentRunner`
+    /// 驱动「任务运行中」时序）共用。字段初始化集中在此。
+    fn build(
+        msgr: Arc<dyn Messenger>,
+        bot: BotConfig,
+        cfg: &Config,
+        agent_runner: Arc<dyn AgentRunner>,
+    ) -> Bridge {
         // 后端跟着 bot 走：用该 bot 的生效后端（自身 backend 非空优先，否则回落全局默认）。
         let effective = bot.effective_backend(&cfg.default_backend).to_string();
         let key = bot.key();
@@ -84,6 +98,7 @@ impl Bridge {
             cancel_flags: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
             pending_new: Mutex::new(HashSet::new()),
+            agent_runner,
         }
     }
 
@@ -427,7 +442,11 @@ impl Bridge {
             .insert(key.clone(), cancel_flag.clone());
 
         let bot_key = self.bot.key();
-        let run_fut = agent::run(
+        // clone Arc 再调：async_trait 的 method future 会借用 receiver，先取出独立 runner
+        // 避免 future 跨 await 持有 `&self.agent_runner`，与 select 内 `&self` 的其它字段
+        // 借用冲突（保持原自由函数调用「future 只持有 &self.sessions」的借用形态）。
+        let runner = self.agent_runner.clone();
+        let run_fut = runner.run(
             backend,
             &prompt,
             &session_id,
@@ -763,5 +782,185 @@ mod tests {
         for k in ["停下来聊聊", "stop it", "别停", "/stopit", "取消订阅这个服务", ""] {
             assert!(!is_cancel_keyword(k), "不应为停止词: {k:?}");
         }
+    }
+
+    // ---- #23 pending_new 竞态测试 ----
+    // bridge 的 handle 编排（/new 拦截 + 任务结束跳过 mark_started）跨多个 await 点，
+    // 必须靠可注入的 AgentRunner 挡板才能驱动「任务运行中」时序。MockMessenger 收 send_text，
+    // MockAgentRunner 用 Notify 控制 run 何时返回。每个测试用唯一 bot key 隔离 ~/.agent-bridge
+    // 工作目录、末尾清理（不设 HOME：多测试并行 set_var 是 UB——见 LESSON）。
+
+    use async_trait::async_trait;
+    use tokio::sync::Notify;
+
+    /// 收集 send_text 调用，供断言回复内容（其余 Messenger 方法走 trait 默认空实现）。
+    struct MockMessenger {
+        sent: Mutex<Vec<String>>,
+    }
+    impl MockMessenger {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl Messenger for MockMessenger {
+        async fn send_text(&self, _chat_id: &str, text: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    /// 挡板 agent：run 进入即 `started.notify_one()`（让测试知道「任务在跑」）；
+    /// `block=true` 等 `release.notified()` 才返回（用于「任务运行中穿插 /new」），
+    /// `block=false` 立即返回（对照组）。
+    struct MockAgentRunner {
+        started: Notify,
+        release: Notify,
+        block: bool,
+        reply: String,
+    }
+    impl MockAgentRunner {
+        fn blocking(reply: &str) -> Self {
+            Self {
+                started: Notify::new(),
+                release: Notify::new(),
+                block: true,
+                reply: reply.into(),
+            }
+        }
+        fn immediate(reply: &str) -> Self {
+            Self {
+                started: Notify::new(),
+                release: Notify::new(),
+                block: false,
+                reply: reply.into(),
+            }
+        }
+    }
+    #[async_trait]
+    impl AgentRunner for MockAgentRunner {
+        #[allow(clippy::too_many_arguments)]
+        async fn run(
+            &self,
+            _backend: Backend,
+            _prompt: &str,
+            _session_id: &str,
+            _resume: bool,
+            _chat_id: &str,
+            _bot_key: &str,
+            _sessions: Option<&SessionStore>,
+            _progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+            _cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+        ) -> Result<agent::RunOutcome, String> {
+            self.started.notify_one();
+            if self.block {
+                self.release.notified().await;
+            }
+            Ok(agent::RunOutcome::Reply(self.reply.clone()))
+        }
+    }
+
+    fn test_ev(mid: &str, chat_id: &str, text: &str) -> Ev {
+        Ev {
+            mid: mid.into(),
+            chat_id: chat_id.into(),
+            chat_type: "group".into(), // 非 p2p/dm：跳过 save_primary_chat 写盘
+            thread_id: String::new(),
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// 构造带唯一 bot key 的 Bridge（隔离 ~/.agent-bridge/workspaces/<key>/），返回 bridge +
+    /// messenger 供断言。调用方负责 `cleanup_bridge(&bridge)`。
+    fn build_test_bridge(runner: Arc<dyn AgentRunner>) -> (Arc<Bridge>, Arc<MockMessenger>) {
+        let msgr = Arc::new(MockMessenger::new());
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let bridge = Arc::new(Bridge::build(msgr.clone(), bot, &Config::default(), runner));
+        (bridge, msgr)
+    }
+
+    fn cleanup_bridge(bridge: &Bridge) {
+        // 跑完删整个工作目录：sessions.json / jobs.json / outbox 一并清理
+        let _ = std::fs::remove_dir_all(crate::workspace_dir(&bridge.bot.key()));
+    }
+
+    #[tokio::test]
+    async fn new_during_run_skips_mark_started() {
+        // #23 核心不变式：任务运行中发 /new → 旧任务完成时命中 pending_new → 跳过 mark_started，
+        // 新槽位 started 保持 false（否则下一条会误 resume 一个从未运行的新 UUID）。
+        // 若把 handle 里的 `if !pending_new.remove` 改回无条件 mark_started，此测试必红。
+        let runner = Arc::new(MockAgentRunner::blocking("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+
+        // 普通消息触发 agent（挡板挂住等 release）
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_x", "hello")).await });
+
+        runner.started.notified().await; // agent 已进入「运行中」、持串行锁
+        assert!(!bridge.sessions.is_started("oc_x"), "首轮 agent 还没 mark");
+
+        // 任务运行中发 /new（在拿串行锁之前拦截，立即执行，不被运行中任务阻塞）
+        bridge.handle(test_ev("m2", "oc_x", "/new")).await;
+        assert!(
+            !bridge.sessions.is_started("oc_x"),
+            "/new 后 started 应为 false（reset 已换新 UUID）"
+        );
+
+        // 放行旧任务 → Ok(Reply) → 命中 pending_new → 跳过 mark_started
+        runner.release.notify_one();
+        task.await.unwrap();
+
+        assert!(
+            !bridge.sessions.is_started("oc_x"),
+            "任务运行中发 /new：旧任务完成不得把新槽位 mark 回 started=true"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn task_complete_without_new_marks_started() {
+        // 对照组：无 /new 时任务完成应正常 mark_started。验证挡板基础设施正确，
+        // 防 new_during_run_skips_mark_started 因别的原因恒真（RULE_修复规范：守卫要见过红）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, msgr) = build_test_bridge(runner);
+
+        bridge.handle(test_ev("m1", "oc_y", "hello")).await;
+
+        assert!(
+            bridge.sessions.is_started("oc_y"),
+            "无 /new 时任务完成应 mark_started"
+        );
+        assert!(
+            msgr.sent().iter().any(|t| t == "done"),
+            "agent 回复应经 Messenger 发出"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn new_when_idle_does_not_break_next_mark() {
+        // /new 在无任务时发出 → 过期标记在下一条消息进串行锁时清除 → 该消息正常 mark_started。
+        // 验证 pending_new 清除路径，防「标记残留」误跳过后续正常 mark。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner);
+
+        bridge.handle(test_ev("m1", "oc_z", "/new")).await; // 无任务 → insert pending_new
+        assert!(!bridge.sessions.is_started("oc_z"));
+
+        bridge.handle(test_ev("m2", "oc_z", "hello")).await; // 进锁清标记 → 跑 → mark
+        assert!(
+            bridge.sessions.is_started("oc_z"),
+            "/new 过期标记应被下一条消息清除，正常 mark_started"
+        );
+        cleanup_bridge(&bridge);
     }
 }
