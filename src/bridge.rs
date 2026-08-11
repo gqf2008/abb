@@ -139,7 +139,7 @@ impl Bridge {
         crate::log!(
             "[bot:{}] [outbox] 任务报告写入待发积压 chat={} 长度={}（当前积压 {} 条）",
             self.bot.key(),
-            &chat_id[..chat_id.len().min(10)],
+            trunc(chat_id, 10),
             text.chars().count(),
             self.outbox.len()
         );
@@ -306,18 +306,15 @@ impl Bridge {
         crate::log!(
             "[bridge] 收到消息 bot={} chat={} mid={} text={:?}",
             self.bot.key(),
-            &ev.chat_id[..ev.chat_id.len().min(12)],
-            &ev.mid[..ev.mid.len().min(12)],
+            trunc(&ev.chat_id, 12),
+            trunc(&ev.mid, 12),
             crate::agent::truncate(&ev.text, 40)
         );
         // mid 去重
         {
             let mut seen = self.seen.lock().unwrap();
             if seen.contains(&ev.mid) {
-                crate::log!(
-                    "[bridge] 重复消息跳过（mid={}）",
-                    &ev.mid[..ev.mid.len().min(12)]
-                );
+                crate::log!("[bridge] 重复消息跳过（mid={}）", trunc(&ev.mid, 12));
                 return;
             }
             seen.insert(ev.mid.clone());
@@ -331,10 +328,7 @@ impl Bridge {
         let text = strip_mentions(&ev.text).trim().to_string();
         // #12：纯附件消息（text 空但 attachments 非空）也进 agent，不丢
         if text.is_empty() && ev.attachments.is_empty() {
-            crate::log!(
-                "[bridge] chat {} 跳过空消息",
-                &ev.chat_id[..ev.chat_id.len().min(10)]
-            );
+            crate::log!("[bridge] chat {} 跳过空消息", trunc(&ev.chat_id, 10));
             return;
         }
 
@@ -347,7 +341,7 @@ impl Bridge {
         if is_cancel_keyword(&text) {
             if let Some(flag) = self.cancel_flags.lock().unwrap().get(&key).cloned() {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                crate::log!("[bridge] 收到停止指令 chat={}", &key[..key.len().min(16)]);
+                crate::log!("[bridge] 收到停止指令 chat={}", trunc(&key, 16));
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
@@ -364,8 +358,8 @@ impl Bridge {
             crate::log!(
                 "[bridge] /new 新建会话 bot={} key={} sid={}",
                 self.bot.key(),
-                &key[..key.len().min(16)],
-                &new_sid[..new_sid.len().min(8)]
+                trunc(&key, 16),
+                trunc(&new_sid, 8)
             );
             if let Err(e) = self
                 .send_reply(&ev, "✅ 已新建会话，下一条消息开始全新上下文。")
@@ -420,15 +414,16 @@ impl Bridge {
                 "[bridge] 排队等待处理 {}ms（bot={} chat={}）",
                 t0.elapsed().as_millis(),
                 self.bot.key(),
-                &ev.chat_id[..ev.chat_id.len().min(12)]
+                trunc(&ev.chat_id, 12)
             );
         }
 
         // 会话快照必须在**拿到锁之后**取：锁外取的话，首轮 agent 还在跑时到达的第二条消息
         // 会读到过期的 started=false —— claude 侧对同一 UUID 再 --session-id 报「already in use」，
         // codex 侧新建 thread 覆盖掉首轮的 → 首轮上下文永久丢失。锁内取则前一轮必已 mark_started。
-        let session_id = self.sessions.ensure_session(&key);
-        let resume = self.sessions.is_started(&key);
+        // 一次锁内原子取 session_id + started：避免 ensure_session 与 is_started 两次
+        // refresh 之间被外部改盘读到中间态（审查 P3-1a）。
+        let (session_id, resume) = self.sessions.ensure_with_started(&key);
 
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
@@ -464,7 +459,7 @@ impl Bridge {
                     if let Err(e) = self.send_reply(&ev, &p).await {
                         crate::log!(
                             "[bridge] ⚠️ 中途进度发送失败 chat={}: {e:#}",
-                            &ev.chat_id[..ev.chat_id.len().min(10)]
+                            trunc(&ev.chat_id, 10)
                         );
                     }
                 }
@@ -486,20 +481,17 @@ impl Bridge {
                 match self.send_reply(&ev, &reply).await {
                     Ok(()) => crate::log!(
                         "[bridge] 已回复 chat={} 长度={}",
-                        &ev.chat_id[..ev.chat_id.len().min(10)],
+                        trunc(&ev.chat_id, 10),
                         reply.chars().count()
                     ),
                     Err(e) => crate::log!(
                         "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
-                        &ev.chat_id[..ev.chat_id.len().min(10)]
+                        trunc(&ev.chat_id, 10)
                     ),
                 }
             }
             Ok(agent::RunOutcome::Cancelled) => {
-                crate::log!(
-                    "[bridge] 任务被打断 chat={}",
-                    &ev.chat_id[..ev.chat_id.len().min(10)]
-                );
+                crate::log!("[bridge] 任务被打断 chat={}", trunc(&ev.chat_id, 10));
                 let _ = self.send_reply(&ev, "⏹ 已停止").await;
                 // 不 mark_started：被打断的轮次不算完成
             }
@@ -508,12 +500,12 @@ impl Bridge {
                 match self.send_reply(&ev, &e).await {
                     Ok(()) => crate::log!(
                         "[bridge] 已回复错误 chat={} 长度={}",
-                        &ev.chat_id[..ev.chat_id.len().min(10)],
+                        trunc(&ev.chat_id, 10),
                         e.chars().count()
                     ),
                     Err(se) => crate::log!(
                         "[bridge] ⚠️ 错误回复发送失败 chat={}: {se:#}",
-                        &ev.chat_id[..ev.chat_id.len().min(10)]
+                        trunc(&ev.chat_id, 10)
                     ),
                 }
             }
@@ -538,10 +530,7 @@ impl Bridge {
         // should_respond：微信侧 owner 判据是登录拿到的 ilink_user_id（不是飞书 open_id）
         let owner = self.bot.wx_owner();
         if !owner.is_empty() && from != owner {
-            crate::log!(
-                "[weixin] 忽略非 owner 消息 from={}",
-                &from[..from.len().min(10)]
-            );
+            crate::log!("[weixin] 忽略非 owner 消息 from={}", trunc(from, 10));
             return;
         }
         // 回复必须回显该用户最新 context_token
@@ -590,7 +579,7 @@ impl Bridge {
         if !owner.is_empty() && msg.sender_staff_id != owner {
             crate::log!(
                 "[dingtalk] 忽略非 owner 消息 from={}",
-                &msg.sender_staff_id[..msg.sender_staff_id.len().min(10)]
+                trunc(&msg.sender_staff_id, 10)
             );
             return;
         }
@@ -598,7 +587,7 @@ impl Bridge {
         if msg.is_group() && !msg.mentioned {
             crate::log!(
                 "[dingtalk] 忽略群聊未 @ 机器人的消息 chat={}",
-                &msg.chat_id()[..msg.chat_id().len().min(10)]
+                trunc(msg.chat_id(), 10)
             );
             return;
         }
@@ -694,6 +683,12 @@ pub fn strip_bot_mention(text: &str, bot_name: &str) -> String {
     text.to_string()
 }
 
+/// 按字符截断（日志预览用）。`&s[..n]` 按字节切会在多字节 UTF-8 边界 panic——
+/// key/chat_id 可能含非 ASCII（话题、群名等），日志一律走字符级。
+fn trunc(s: impl AsRef<str>, n: usize) -> String {
+    s.as_ref().chars().take(n).collect()
+}
+
 /// 识别「/new」会话新建指令（#23）：trim 后精确匹配，大小写不敏感。
 /// 只在 handle 里拦截（在透传 agent 之前），其它斜杠命令仍原样透传。
 fn is_new_command(text: &str) -> bool {
@@ -768,6 +763,9 @@ mod tests {
         assert!(is_new_command("/new"));
         assert!(is_new_command(" /new "));
         assert!(is_new_command("/NEW"));
+        // 全角空格 U+3000 也属 Unicode White_Space，trim() 会去掉（审查 P4-2 复核：
+        // trim 已处理，撤回原先「/new 不识别全角空格」的判断）。
+        assert!(is_new_command("\u{3000}/new\u{3000}"));
         assert!(!is_new_command("/new 参数"));
         assert!(!is_new_command("/news"));
         assert!(!is_new_command("new"));

@@ -51,9 +51,10 @@ pub struct SessionStore {
     data: Mutex<HashMap<String, ChatEntry>>,
     /// 当前 bot 生效后端（"claude"/"codex"）——决定各方法读写哪个槽位。
     current_backend: String,
-    /// 上次加载时的文件 mtime。CLI/外部改 sessions.json 后按 mtime 热重载（#23），
-    /// 无需重启 service 即生效——复用 JobStore 的 refresh 模式。
-    loaded_mtime: Mutex<Option<SystemTime>>,
+    /// 上次加载时的文件签名 (mtime, size)。CLI/外部改 sessions.json 后按签名热重载
+    /// （#23），无需重启 service 即生效——复用 JobStore 的 refresh 模式；size 与 mtime
+    /// 双重判定以缓解同 tick 内 mtime 精度不足的漏检（审查 P3-2）。
+    loaded_sig: Mutex<Option<(SystemTime, u64)>>,
 }
 
 impl SessionStore {
@@ -73,12 +74,14 @@ impl SessionStore {
         } else {
             HashMap::new()
         };
-        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let sig = fs::metadata(&path)
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
         SessionStore {
             path,
             data: Mutex::new(data),
             current_backend: current_backend.to_string(),
-            loaded_mtime: Mutex::new(mtime),
+            loaded_sig: Mutex::new(sig),
         }
     }
 
@@ -87,13 +90,19 @@ impl SessionStore {
         Self::at(current_backend, path)
     }
 
-    /// 若 sessions.json 的 mtime 比上次加载新（CLI/外部进程改了），重新读盘。
-    /// 每次公开方法前调用，保证「运行中改文件即时生效」。
+    /// 若 sessions.json 的 (mtime, size) 比上次加载新（CLI/外部进程改了），重新读盘。
+    /// 每次公开方法前调用，保证「运行中改文件即时生效」。size 与 mtime 双重判定，
+    /// 缓解单 mtime 在同 tick 内精度不足的漏检（审查 P3-2）。
+    ///
+    /// 已知限制（审查 P3-1b）：mtime+size 是最终一致检测，非强一致——本进程在
+    /// 「refresh 读盘 → 改内存 → save 写盘」之间若另一进程改盘，本进程 save 会覆盖之
+    /// （lost update）。彻底修复需进程间文件锁（advisory lock），且 JobStore 同模式同问题，
+    /// 宜独立架构升级；reset 幂等（丢失可重试），实际窗口在毫秒级同步路径内。
     fn refresh(&self) {
         let cur = fs::metadata(&self.path)
             .ok()
-            .and_then(|m| m.modified().ok());
-        let stale = { *self.loaded_mtime.lock().unwrap() != cur };
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        let stale = { *self.loaded_sig.lock().unwrap() != cur };
         if !stale {
             return;
         }
@@ -102,7 +111,7 @@ impl SessionStore {
                 *self.data.lock().unwrap() = data;
             }
         }
-        *self.loaded_mtime.lock().unwrap() = cur;
+        *self.loaded_sig.lock().unwrap() = cur;
     }
 
     /// 解析 sessions.json：先试新格式（按后端分槽），失败再按旧扁平格式迁移。
@@ -164,6 +173,10 @@ impl SessionStore {
     }
 
     /// 返回该 chat 在当前后端的 session_id，没有则新建 UUID。
+    ///
+    /// 生产 bridge 已改用 `ensure_with_started` 合并快照（审查 P3-1a）；此方法保留作
+    /// 细粒度公共 API 与测试辅助。
+    #[allow(dead_code)]
     pub fn ensure_session(&self, chat_id: &str) -> String {
         self.refresh();
         let mut data = self.data.lock().unwrap();
@@ -177,6 +190,25 @@ impl SessionStore {
         slot.started = false;
         self.save_locked(&data);
         sid
+    }
+
+    /// 一次锁内原子取 session_id（空则建 UUID）+ started 状态。供 bridge 拿串行锁后
+    /// 单次快照，避免 ensure_session 与 is_started 两次 refresh 之间被外部改盘读到
+    /// 中间态（审查 P3-1a：service 取到旧 session_id、却读到新 started 的错位）。
+    pub fn ensure_with_started(&self, chat_id: &str) -> (String, bool) {
+        self.refresh();
+        let mut data = self.data.lock().unwrap();
+        let entry = data.entry(chat_id.to_string()).or_default();
+        let slot = Self::slot_mut(entry, &self.current_backend);
+        if slot.session_id.is_empty() {
+            let sid = uuid::Uuid::new_v4().to_string();
+            slot.session_id = sid.clone();
+            slot.started = false;
+            self.save_locked(&data);
+            (sid, false)
+        } else {
+            (slot.session_id.clone(), slot.started)
+        }
     }
 
     pub fn mark_started(&self, chat_id: &str) {
@@ -216,6 +248,9 @@ impl SessionStore {
         }
     }
 
+    /// 该 chat 当前后端是否已开过首轮（只读查询）。bridge 走合并快照，此方法保留作
+    /// 细粒度查询 API 与测试辅助（审查 P3-1a）。
+    #[allow(dead_code)]
     pub fn is_started(&self, chat_id: &str) -> bool {
         self.refresh();
         let data = self.data.lock().unwrap();
