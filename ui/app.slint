@@ -131,45 +131,38 @@ export component QrDialog inherits Window {
 // 设置窗：微软电脑管家式布局 —— 左侧导航 + 首页仪表盘 + 卡片化三个配置页。
 // 底部共享状态行 + 保存/取消。页面切换用 current-page 结构性 if（与托盘菜单同手法）。
 
-// ═══════════ PCM 风格复用小组件 ═══════════
+// ═══════════ 复用小组件（干净扁平：SVG 单色图标 + 1px 描边卡片，深浅色自适应） ═══════════
 
-// 图标块：浅色底 + 同色字形（克制，贴近 PCM 单色图标语言；深浅色随 Palette）。
-component IconTile inherits Rectangle {
-    in property <string> glyph: "·";
-    in property <brush> tile: Palette.accent-background.with-alpha(0.16);
-    in property <brush> glyph-color: Palette.accent-background;
-    width: 26px;
-    height: 26px;
-    border-radius: 8px;
-    background: root.tile;
-    Text {
-        text: root.glyph;
-        color: root.glyph-color;
-        font-size: 13px;
-        font-weight: 600;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        width: 100%;
-        height: 100%;
-    }
+// 单色 SVG 图标：颜色随 Palette 着色（colorize），避免 Unicode 字符在字体里缺字形渲染成方框。
+component ImageIcon inherits Image {
+    in property <image> icon;
+    in property <brush> tint: Palette.foreground.with-alpha(0.7);
+    source: root.icon;
+    colorize: root.tint;
+    width: 18px;
+    height: 18px;
+    image-fit: contain;
 }
 
-// 左侧导航项：图标 + 文字；选中态用 Palette 的 control-background + accent 文字，深浅色都跟系统。
+// 左侧导航项：SVG 图标 + 文字；选中态 = accent 淡底 + accent 文字。
 component NavItem inherits Rectangle {
     in property <string> label: "";
-    in property <string> glyph: "·";
+    in property <image> icon;
     in property <bool> selected: false;
     callback clicked();
-    height: 40px;
-    border-radius: 9px;
-    background: root.selected ? Palette.control-background : transparent;
+    height: 38px;
+    border-radius: 8px;
+    background: root.selected ? Palette.accent-background.with-alpha(0.12) : transparent;
     TouchArea {
         clicked => { root.clicked(); }
         HorizontalBox {
             padding-left: 10px;
             spacing: 10px;
             alignment: start;
-            IconTile { glyph: root.glyph; }
+            ImageIcon {
+                icon: root.icon;
+                tint: root.selected ? Palette.accent-background : Palette.foreground.with-alpha(0.65);
+            }
             Text {
                 text: root.label;
                 font-size: 13px;
@@ -181,15 +174,15 @@ component NavItem inherits Rectangle {
     }
 }
 
-// 状态小胶囊：ok=绿 / warn=黄 / 否则红。
+// 状态小胶囊：半透明底 + 语义色文字（比实底更柔和）。
 component StatusPill inherits Rectangle {
     in property <string> text: "";
     in property <bool> ok: false;
     in property <bool> warn: false;
-    width: 88px;
+    width: 84px;
     height: 22px;
     border-radius: 11px;
-    background: root.ok ? #e5f6ec : (root.warn ? #fff4e2 : #fdecec);
+    background: root.ok ? #0b8a3e22 : (root.warn ? #b86f0022 : #d1343822);
     Text {
         text: root.text;
         color: root.ok ? #0b8a3e : (root.warn ? #b86f00 : #d13438);
@@ -220,14 +213,14 @@ component ProblemRow inherits HorizontalBox {
         width: 84px;
         height: 24px;
         border-radius: 12px;
-        background: #fff1d6;
+        background: #b86f0018;
         TouchArea {
             clicked => { root.clicked(); }
             Text {
                 text: root.action;
                 font-size: 11px;
                 font-weight: 600;
-                color: #8a5a00;
+                color: #b86f00;
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 width: 100%;
@@ -237,29 +230,28 @@ component ProblemRow inherits HorizontalBox {
     }
 }
 
-// 首页快捷操作卡（PCM「全面体检/进程管理/…」同款）：图标 + 标题 + 说明 + 动作文案。
+// 首页快捷操作卡：SVG 图标 + 标题 + 说明 + 动作文案；1px 描边取代阴影，更干净。
 component QuickCard inherits Rectangle {
     in property <string> title: "";
     in property <string> desc: "";
-    in property <string> glyph: "·";
+    in property <image> icon;
     in property <string> action-label: "前往 ›";
     callback clicked();
-    height: 128px;
+    height: 122px;
     horizontal-stretch: 1;
     border-radius: 12px;
+    border-width: 1px;
+    border-color: Palette.border.with-alpha(0.25);
     background: Palette.background;
-    drop-shadow-color: #00000014;
-    drop-shadow-blur: 6px;
-    drop-shadow-offset-y: 2px;
     TouchArea {
         clicked => { root.clicked(); }
         VerticalBox {
             padding: 14px;
-            spacing: 7px;
-            IconTile { glyph: root.glyph; }
+            spacing: 6px;
+            ImageIcon { icon: root.icon; tint: Palette.accent-background; }
             Text { text: root.title; font-size: 13px; font-weight: 600; color: Palette.foreground; }
             Text { text: root.desc; font-size: 11px; color: Palette.foreground.with-alpha(0.55); wrap: word-wrap; }
-            Text { text: root.action-label; font-size: 11px; font-weight: 600; color: #0a6fc2; }
+            Text { text: root.action-label; font-size: 11px; font-weight: 600; color: Palette.accent-background; }
         }
     }
 }
@@ -454,22 +446,22 @@ export component SettingsWindow inherits Window {
                             }
                             Text { text: "ABB"; font-size: 15px; font-weight: 700; color: Palette.foreground; vertical-alignment: center; }
                         }
-                        NavItem { label: "首页"; glyph: "⌂"; selected: root.current-page == 0; clicked => { root.current-page = 0; } }
+                        NavItem { label: "首页"; icon: @image-url("icons/home.svg"); selected: root.current-page == 0; clicked => { root.current-page = 0; } }
                         NavItem {
                             label: "机器人配置";
-                            glyph: "◈";
+                            icon: @image-url("icons/bot.svg");
                             selected: root.current-page == 1;
                             clicked => { root.current-page = 1; }
                         }
                         NavItem {
                             label: "环境配置";
-                            glyph: "✓";
+                            icon: @image-url("icons/shield.svg");
                             selected: root.current-page == 2;
                             clicked => { root.current-page = 2; }
                         }
                         NavItem {
                             label: "模型供应商";
-                            glyph: "◆";
+                            icon: @image-url("icons/chip.svg");
                             selected: root.current-page == 3;
                             clicked => { root.current-page = 3; }
                         }
@@ -505,10 +497,7 @@ export component SettingsWindow inherits Window {
                         Rectangle {
                             height: 132px;
                             border-radius: 14px;
-                            background: @linear-gradient(120deg, #0a6fc2 0%, #168fd6 55%, #35b8e0 100%);
-                            drop-shadow-color: #0a6fc240;
-                            drop-shadow-blur: 12px;
-                            drop-shadow-offset-y: 4px;
+                            background: Palette.accent-background;
                             HorizontalBox {
                                 padding-top: 16px; padding-right: 24px; padding-bottom: 16px; padding-left: 24px;
                                 spacing: 16px;
@@ -521,22 +510,22 @@ export component SettingsWindow inherits Window {
                                             : "服务已停止";
                                         font-size: 19px;
                                         font-weight: 700;
-                                        color: white;
+                                        color: Palette.accent-foreground;
                                     }
                                     Text {
                                         text: root.service-running
                                             ? "飞书 / 微信 / 钉钉消息自动转给本地 Claude / Codex 处理"
                                             : "点右侧「启动服务」，或在托盘菜单点「启动」";
                                         font-size: 12.5px;
-                                        color: #dff0ff;
+                                        color: Palette.accent-foreground.with-alpha(0.75);
                                         wrap: word-wrap;
                                     }
-                                    // 状态点（Defender 式「一目了然」）：在线/离线一眼可见
+                                    // 状态点（Defender 式「一目了然」）：在线/离线一眼可见；用文字点而非胶囊，避免在 accent 底上发闷
                                     HorizontalBox {
-                                        spacing: 8px;
-                                        StatusPill { text: root.service-running ? "服务运行中" : "服务已停止"; ok: root.service-running; warn: !root.service-running; }
-                                        if root.online-count > 0: StatusPill { text: "" + root.online-count + " 在线"; ok: true; }
-                                        if root.bot-count - root.online-count > 0: StatusPill { text: "" + (root.bot-count - root.online-count) + " 离线"; warn: true; }
+                                        spacing: 12px;
+                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 11.5px; font-weight: 600; color: Palette.accent-foreground; vertical-alignment: center; }
+                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 11.5px; color: Palette.accent-foreground.with-alpha(0.85); vertical-alignment: center; }
+                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 11.5px; color: Palette.accent-foreground.with-alpha(0.85); vertical-alignment: center; }
                                     }
                                 }
                                 VerticalBox {
@@ -550,7 +539,7 @@ export component SettingsWindow inherits Window {
                                         background: white;
                                         TouchArea {
                                             clicked => { root.start-service(); }
-                                            Text { text: "启动服务"; color: #0a6fc2; font-weight: 700; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            Text { text: "启动服务"; color: #111; font-weight: 700; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         }
                                     }
                                     if root.service-running: Rectangle {
@@ -560,7 +549,7 @@ export component SettingsWindow inherits Window {
                                         background: white;
                                         TouchArea {
                                             clicked => { root.stop-service(); }
-                                            Text { text: "停止服务"; color: #0a6fc2; font-weight: 700; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            Text { text: "停止服务"; color: #111; font-weight: 700; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         }
                                     }
                                     Rectangle {
@@ -568,11 +557,11 @@ export component SettingsWindow inherits Window {
                                         height: 32px;
                                         border-radius: 9px;
                                         border-width: 1px;
-                                        border-color: #ffffff99;
+                                        border-color: Palette.accent-foreground.with-alpha(0.6);
                                         background: transparent;
                                         TouchArea {
                                             clicked => { root.open-logs(); }
-                                            Text { text: "打开日志"; color: white; font-size: 12.5px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            Text { text: "打开日志"; color: Palette.accent-foreground; font-size: 12.5px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         }
                                     }
                                 }
@@ -590,7 +579,7 @@ export component SettingsWindow inherits Window {
                                 spacing: 4px;
                                 HorizontalBox {
                                     spacing: 8px;
-                                    IconTile { glyph: "!"; tile: #fff1d6; glyph-color: #b86f00; width: 20px; height: 20px; border-radius: 6px; }
+                                    ImageIcon { icon: @image-url("icons/alert.svg"); tint: #b86f00; width: 18px; height: 18px; }
                                     Text { text: "待处理"; font-size: 13px; font-weight: 700; color: #8a5a00; vertical-alignment: center; }
                                 }
                                 if root.missing-deps > 0: ProblemRow {
@@ -614,35 +603,34 @@ export component SettingsWindow inherits Window {
                             QuickCard {
                                 title: "添加机器人";
                                 desc: "接入飞书 / 微信 / 钉钉，30 秒上手";
-                                glyph: "＋";
+                                icon: @image-url("icons/plus.svg");
                                 clicked => { root.current-page = 1; root.add-bot(); }
                             }
                             QuickCard {
                                 title: "环境体检";
                                 desc: "Claude Code / Codex / Node.js 依赖检测";
-                                glyph: "✓";
+                                icon: @image-url("icons/search.svg");
                                 clicked => { root.current-page = 2; root.recheck-deps(); }
                             }
                             QuickCard {
                                 title: "权限中心";
                                 desc: "磁盘 / 辅助功能 / 屏幕录制一键授权";
-                                glyph: "⚙";
+                                icon: @image-url("icons/lock.svg");
                                 action-label: "去授权 ›";
                                 clicked => { root.current-page = 2; }
                             }
                             // 跨会话投递是开关不是跳转，卡片内直接放 CheckBox
                             Rectangle {
-                                height: 128px;
+                                height: 122px;
                                 horizontal-stretch: 1;
                                 border-radius: 12px;
+                                border-width: 1px;
+                                border-color: Palette.border.with-alpha(0.25);
                                 background: Palette.background;
-                                drop-shadow-color: #00000014;
-                                drop-shadow-blur: 6px;
-                                drop-shadow-offset-y: 2px;
                                 VerticalBox {
                                     padding: 14px;
-                                    spacing: 7px;
-                                    IconTile { glyph: "⇄"; }
+                                    spacing: 6px;
+                                    ImageIcon { icon: @image-url("icons/switch.svg"); tint: Palette.accent-background; }
                                     CheckBox {
                                         text: "跨会话投递";
                                         checked: root.cross-delivery-enabled;
@@ -671,9 +659,8 @@ export component SettingsWindow inherits Window {
                             vertical-stretch: 1;
                             border-radius: 12px;
                             background: Palette.background;
-                            drop-shadow-color: #00000014;
-                            drop-shadow-blur: 6px;
-                            drop-shadow-offset-y: 2px;
+                            border-width: 1px;
+                            border-color: Palette.border.with-alpha(0.25);
                             HorizontalBox {
                                 spacing: 0;
                                 // ── 左：bot 列表 ──
@@ -934,9 +921,8 @@ export component SettingsWindow inherits Window {
                                     vertical-stretch: 0;
                                     border-radius: 12px;
                                     background: Palette.background;
-                                    drop-shadow-color: #00000014;
-                                    drop-shadow-blur: 6px;
-                                    drop-shadow-offset-y: 2px;
+                                    border-width: 1px;
+                                    border-color: Palette.border.with-alpha(0.25);
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
                                         spacing: 6px;
@@ -1046,9 +1032,8 @@ export component SettingsWindow inherits Window {
                                     vertical-stretch: 0;
                                     border-radius: 12px;
                                     background: Palette.background;
-                                    drop-shadow-color: #00000014;
-                                    drop-shadow-blur: 6px;
-                                    drop-shadow-offset-y: 2px;
+                                    border-width: 1px;
+                                    border-color: Palette.border.with-alpha(0.25);
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
                                         spacing: 6px;
@@ -1198,9 +1183,8 @@ export component SettingsWindow inherits Window {
                             vertical-stretch: 1;
                             border-radius: 12px;
                             background: Palette.background;
-                            drop-shadow-color: #00000014;
-                            drop-shadow-blur: 6px;
-                            drop-shadow-offset-y: 2px;
+                            border-width: 1px;
+                            border-color: Palette.border.with-alpha(0.25);
                             HorizontalBox {
                                 spacing: 0;
                                 // ── 左：供应商列表 ──
