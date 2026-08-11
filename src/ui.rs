@@ -123,7 +123,7 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
     tray.set_tray_status(status.into());
 }
 
-/// 把 service 状态同步到设置窗：动态标题（带 bot 数）+ 顶部运行概览行。
+/// 把 service 状态同步到设置窗：动态标题（带 bot 数）+ 首页 hero/状态卡的结构化状态 + 底部运行概览行。
 /// 设置窗隐藏时也更新（廉价），下次打开即是最新。
 fn push_settings_status(settings: &SettingsWindow, st: &install::ServiceStatus) {
     let bots = crate::botstatus::snapshot();
@@ -134,8 +134,13 @@ fn push_settings_status(settings: &SettingsWindow, st: &install::ServiceStatus) 
         format!("ABB 设置 — {} 个 bot · {} 在线", bots.len(), online)
     };
     settings.set_window_title(title.into());
+    // hero 大按钮 / 状态卡用的结构化字段（running-line 保留给底部状态行）
+    settings.set_service_running(st.running);
+    settings.set_autostart(platform::autostart_enabled());
+    settings.set_bot_count(bots.len() as i32);
+    settings.set_online_count(online as i32);
     let line = if !st.running {
-        "● 服务已停止 — 在托盘菜单点「启动」".to_string()
+        "● 服务已停止 — 点首页「启动服务」或托盘菜单「启动」".to_string()
     } else if bots.is_empty() {
         "● 服务运行中，暂无 bot 上报（稍候…）".to_string()
     } else {
@@ -583,7 +588,7 @@ pub fn run_gui() -> Result<()> {
             );
             push_settings_status(&settings, &install::status());
             settings.set_status_line(
-                "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」Tab 安装依赖，否则机器人无法处理消息。"
+                "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
                     .into(),
             );
             settings.set_status_is_error(true);
@@ -610,6 +615,35 @@ pub fn run_gui() -> Result<()> {
         install::svc_stop();
         let _ = slint::quit_event_loop();
     });
+
+    // ── 设置窗首页 hero：启动/停止/重启服务 + 打开日志，复用托盘同一套 UiCmd（后台线程串行执行）──
+    {
+        let txc = || tx.clone();
+        settings.on_start_service({
+            let tx = txc();
+            move || {
+                let _ = tx.send(UiCmd::Start);
+            }
+        });
+        settings.on_stop_service({
+            let tx = txc();
+            move || {
+                let _ = tx.send(UiCmd::Stop);
+            }
+        });
+        settings.on_restart_service({
+            let tx = txc();
+            move || {
+                let _ = tx.send(UiCmd::Restart);
+            }
+        });
+        settings.on_open_logs({
+            let tx = txc();
+            move || {
+                let _ = tx.send(UiCmd::OpenLogs);
+            }
+        });
+    }
 
     // ── 设置窗回调 ──
     {
