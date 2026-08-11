@@ -198,6 +198,15 @@ async fn run_bot(
     // （别用独立心跳任务只报「活着」——那测的是上报线程不是通道连通，会话死了托盘还在线。）
     crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "连接中");
 
+    // #25 重启恢复：上次崩溃/退出时未处理完的消息 → 自动续跑（异步进行，不阻塞事件循环
+    // 启动；per-chat 串行锁保证重放与实时消息不乱序）。
+    {
+        let bridge = bridge.clone();
+        tokio::spawn(async move {
+            bridge.recover_pending().await;
+        });
+    }
+
     // 定时任务调度循环（独立于事件循环，共享 stop）
     {
         let bridge = bridge.clone();

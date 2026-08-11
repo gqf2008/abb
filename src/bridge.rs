@@ -6,6 +6,7 @@ use crate::agent::{self, AgentRunner, Backend};
 use crate::config::{BotConfig, Config};
 use crate::messenger::Messenger;
 use crate::outbox::{OutboxItem, OutboxStore};
+use crate::pending::{PendingItem, PendingStore};
 use crate::schedule::JobStore;
 use crate::sessions::SessionStore;
 use std::collections::{HashMap, HashSet};
@@ -33,6 +34,9 @@ pub struct Bridge {
     /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
     /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
     outbox: OutboxStore,
+    /// 待处理消息持久化（#25 重启恢复）：进入 agent 前落盘、完成后删除；
+    /// service 重启后 recover_pending 自动重放，续跑上次未完成的消息/会话。
+    pending: PendingStore,
     /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
     /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
     agent_runner: Arc<dyn AgentRunner>,
@@ -93,6 +97,7 @@ impl Bridge {
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
+            pending: PendingStore::new(&key),
             agent_runner,
         }
     }
@@ -372,6 +377,19 @@ impl Bridge {
             return;
         }
 
+        // #25 重启恢复：进入 agent 处理前落盘 pending（已排除 /new、停止词等控制指令），
+        // service 崩溃/重启后由 recover_pending 自动重放续跑。重放时同 mid 再次 add
+        // 会按 mid 去重，不会产生重复条目。
+        self.pending.add(PendingItem {
+            mid: ev.mid.clone(),
+            chat_id: ev.chat_id.clone(),
+            chat_type: ev.chat_type.clone(),
+            thread_id: ev.thread_id.clone(),
+            text: text.clone(),
+            attachments: ev.attachments.clone(),
+            created_at: crate::chrono_lite::unix_secs(),
+        });
+
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
         // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
         let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
@@ -463,6 +481,10 @@ impl Bridge {
         // 任务结束 → 摘掉打断标志（后续停止词将按普通消息处理）
         self.cancel_flags.lock().unwrap().remove(&key);
 
+        // #25：agent 已返回（Reply/Cancelled/Err 均视为「任务完成」）→ 摘掉 pending，
+        // 避免重启后重复执行已完成的任务；回复发送失败仍走既有路径（日志/outbox），不重跑。
+        self.pending.remove(&ev.mid);
+
         match result {
             Ok(agent::RunOutcome::Reply { reply, session_id }) => {
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
@@ -506,6 +528,44 @@ impl Bridge {
         self.msgr.del_typing(&ev.mid, typing_rid).await;
         self.msgr.done(&ev.mid).await;
         // _serial_guard 在此函数末尾 drop，释放 per-chat 锁，排队的下一条开始处理。
+    }
+
+    /// 启动恢复（#25）：扫描 pending.json 残留（=上次崩溃/重启时未完成的消息），
+    /// 自动重放进 handle 续跑——sessions.json 已 mark_started 的会话会 resume 原上下文，
+    /// 未完成的重新执行；先清理孤儿 agent 子进程避免 resume 撞 already in use。
+    /// 恢复是异步任务，不阻塞事件循环启动（多 chat 并发由 per-chat 串行锁保证不乱序）。
+    pub async fn recover_pending(&self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let items = self.pending.snapshot();
+        crate::log!(
+            "[bot:{}] 检测到 {} 条上次未完成的消息，自动恢复续跑（先清理孤儿 agent 进程）",
+            self.bot.key(),
+            self.pending.len()
+        );
+        crate::agent::kill_stale_agents(&self.bot.key());
+        for item in items {
+            let ev = Ev {
+                mid: item.mid,
+                chat_id: item.chat_id,
+                chat_type: item.chat_type,
+                thread_id: item.thread_id,
+                text: item.text,
+                attachments: item.attachments,
+            };
+            crate::log!(
+                "[bot:{}] 恢复消息 chat={} mid={} text={:?}",
+                self.bot.key(),
+                trunc(&ev.chat_id, 12),
+                trunc(&ev.mid, 12),
+                crate::agent::truncate(&ev.text, 40)
+            );
+            let _ = self
+                .send_reply(&ev, "🔄 正在恢复上次中断的消息，请稍候…")
+                .await;
+            self.handle(ev).await;
+        }
     }
 
     /// 微信入站消息入口（service 的微信长轮询循环调用）。
@@ -813,6 +873,7 @@ mod tests {
         release: Notify,
         block: bool,
         reply: String,
+        prompts: Mutex<Vec<String>>,
     }
     impl MockAgentRunner {
         fn blocking(reply: &str) -> Self {
@@ -821,6 +882,7 @@ mod tests {
                 release: Notify::new(),
                 block: true,
                 reply: reply.into(),
+                prompts: Mutex::new(Vec::new()),
             }
         }
         fn immediate(reply: &str) -> Self {
@@ -829,7 +891,11 @@ mod tests {
                 release: Notify::new(),
                 block: false,
                 reply: reply.into(),
+                prompts: Mutex::new(Vec::new()),
             }
+        }
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
         }
     }
     #[async_trait]
@@ -838,7 +904,7 @@ mod tests {
         async fn run(
             &self,
             _backend: Backend,
-            _prompt: &str,
+            prompt: &str,
             session_id: &str,
             _resume: bool,
             _chat_id: &str,
@@ -847,6 +913,7 @@ mod tests {
             _progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
             _cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         ) -> Result<agent::RunOutcome, String> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
             self.started.notify_one();
             if self.block {
                 self.release.notified().await;
@@ -991,6 +1058,102 @@ mod tests {
             bridge.sessions.is_started("oc_z"),
             "新会话完成应正常 mark_started"
         );
+        cleanup_bridge(&bridge);
+    }
+
+    // ---- #25 重启恢复（in-flight 消息持久化 + 自动重放）----
+
+    #[tokio::test]
+    async fn handle_persists_pending_while_running_and_removes_after() {
+        // 消息进入 agent 处理时 pending.json 有该条；agent 返回后摘除（不重复执行）。
+        let runner = Arc::new(MockAgentRunner::blocking("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_p1", "hello")).await });
+        runner.started.notified().await; // agent 在跑 → pending 应已落盘
+        assert_eq!(bridge.pending.len(), 1, "任务运行中 pending 应有 1 条");
+        assert_eq!(bridge.pending.snapshot()[0].mid, "m1");
+
+        runner.release.notify_one();
+        task.await.unwrap();
+        assert!(bridge.pending.is_empty(), "任务完成 pending 应清空");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn control_commands_not_persisted() {
+        // /new 与停止词是即时控制指令，不落盘：崩溃后重放不会把停止词当普通消息透传。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner);
+
+        bridge.handle(test_ev("m1", "oc_p2", "/new")).await;
+        assert!(bridge.pending.is_empty(), "/new 不应落盘");
+
+        // 有任务在跑时发停止词 → 不新增 pending（原任务那条还在）
+        let runner2 = Arc::new(MockAgentRunner::blocking("done"));
+        let (bridge2, _msgr2) = build_test_bridge(runner2.clone());
+        let b1 = bridge2.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m2", "oc_p3", "hello")).await });
+        runner2.started.notified().await;
+        assert_eq!(bridge2.pending.len(), 1);
+        bridge2.handle(test_ev("m3", "oc_p3", "停止")).await;
+        assert_eq!(bridge2.pending.len(), 1, "停止词不应新增 pending");
+        runner2.release.notify_one();
+        task.await.unwrap();
+        assert!(bridge2.pending.is_empty());
+        cleanup_bridge(&bridge2);
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn recover_pending_replays_and_clears() {
+        // 模拟崩溃残留：pending.json 有两条未完成消息 → recover_pending 按时间顺序
+        // 重放进 handle 自动续跑（runner 收到两个 prompt、回复发出、pending 清空）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+        bridge.pending.add(crate::pending::PendingItem {
+            mid: "r1".into(),
+            chat_id: "oc_r1".into(),
+            chat_type: "group".into(),
+            thread_id: String::new(),
+            text: "第一条".into(),
+            attachments: Vec::new(),
+            created_at: 10,
+        });
+        bridge.pending.add(crate::pending::PendingItem {
+            mid: "r2".into(),
+            chat_id: "oc_r2".into(),
+            chat_type: "group".into(),
+            thread_id: String::new(),
+            text: "第二条".into(),
+            attachments: Vec::new(),
+            created_at: 20,
+        });
+
+        bridge.recover_pending().await;
+
+        assert_eq!(runner.prompts(), ["第一条", "第二条"], "应按入队顺序重放");
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("正在恢复")),
+            "重放前应发恢复提示"
+        );
+        assert_eq!(
+            msgr.sent().iter().filter(|t| *t == "done").count(),
+            2,
+            "两条消息都应重新处理并回复"
+        );
+        assert!(bridge.pending.is_empty(), "恢复完成后 pending 应清空");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn recover_pending_empty_is_noop() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+        bridge.recover_pending().await;
+        assert!(runner.prompts().is_empty(), "无残留不应触发 agent");
+        assert!(!msgr.sent().iter().any(|t| t.contains("正在恢复")));
         cleanup_bridge(&bridge);
     }
 }

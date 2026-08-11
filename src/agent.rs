@@ -6,6 +6,8 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::fs;
+use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -623,6 +625,15 @@ async fn run_once(
     let mut child = cmd
         .spawn()
         .map_err(|e| AttemptErr::Failed(agent_missing_msg(backend, &e)))?;
+    // 登记子进程 pid：重启恢复时清理孤儿用（guard 在 run_once 返回时 Drop → 自动移除，
+    // 覆盖 cancel/超时/错误所有返回路径）。spawn 成功但拿不到 pid 的极端情况跳过登记。
+    let _pid_guard = child.id().map(|pid| {
+        track_agent_pid(bot_key, pid);
+        AgentPidGuard {
+            bot_key: bot_key.to_string(),
+            pid,
+        }
+    });
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes()).await;
@@ -774,6 +785,121 @@ async fn run_once(
     };
 
     Ok(AgentOutput { reply, thread_id })
+}
+
+// ─────────────────────── agent 子进程 pid 跟踪（重启恢复配套）───────────────────────
+// service 崩溃/退出时，spawn 的 claude/codex 子进程可能残留为孤儿；下次启动恢复
+// pending 消息前先清掉，否则 resume 撞「already in use」/旧进程继续占用会话。
+// pid 落盘到 workspaces/<bot>/agent-pids.json（数组），任务结束（run_once 返回）移除。
+// 清理时用 ps 校验「存活且命令行是 claude/codex」再 kill，防 pid 被系统复用误杀。
+
+static AGENT_PID_LOCK: Mutex<()> = Mutex::new(());
+
+fn agent_pids_path(bot_key: &str) -> std::path::PathBuf {
+    crate::workspace_dir(bot_key).join("agent-pids.json")
+}
+
+fn read_agent_pids(bot_key: &str) -> Vec<u32> {
+    fs::read_to_string(agent_pids_path(bot_key))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn write_agent_pids(bot_key: &str, pids: &[u32]) {
+    let path = agent_pids_path(bot_key);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(pids) {
+        let _ = crate::atomic_write_text(&path, &text);
+    }
+}
+
+/// spawn 成功后登记子进程 pid（任务结束时由 AgentPidGuard drop 移除）。
+fn track_agent_pid(bot_key: &str, pid: u32) {
+    let _g = AGENT_PID_LOCK.lock().unwrap();
+    let mut pids = read_agent_pids(bot_key);
+    if !pids.contains(&pid) {
+        pids.push(pid);
+        write_agent_pids(bot_key, &pids);
+    }
+}
+
+fn untrack_agent_pid(bot_key: &str, pid: u32) {
+    let _g = AGENT_PID_LOCK.lock().unwrap();
+    let mut pids = read_agent_pids(bot_key);
+    let before = pids.len();
+    pids.retain(|p| *p != pid);
+    if pids.len() != before {
+        write_agent_pids(bot_key, &pids);
+    }
+}
+
+/// run_once 返回（含 cancel/超时/错误路径）时自动 untrack，避免遗漏。
+struct AgentPidGuard {
+    bot_key: String,
+    pid: u32,
+}
+impl Drop for AgentPidGuard {
+    fn drop(&mut self) {
+        untrack_agent_pid(&self.bot_key, self.pid);
+    }
+}
+
+/// 目标 pid 是否还是「本桥 spawn 的 agent」：存活且命令行匹配 claude/codex。
+/// Windows 无 ps 语义，直接信任 pid 文件（taskkill /F）。
+fn process_is_agent(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let cmd = String::from_utf8_lossy(&o.stdout);
+                cmd.contains("claude") || cmd.contains("codex")
+            }
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// 启动恢复前调用：把上次残留的 agent 子进程清掉（SIGTERM / taskkill），并清空 pid 文件。
+pub fn kill_stale_agents(bot_key: &str) {
+    let pids = {
+        let _g = AGENT_PID_LOCK.lock().unwrap();
+        let pids = read_agent_pids(bot_key);
+        write_agent_pids(bot_key, &[]); // 先清空：即使 kill 失败也不留旧账
+        pids
+    };
+    if pids.is_empty() {
+        return;
+    }
+    for pid in pids {
+        if process_is_agent(pid) {
+            crate::log!("[agent] 清理上次残留 agent 子进程 pid={pid}（bot={bot_key}）");
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .spawn();
+            }
+        } else {
+            crate::log!(
+                "[agent] 跳过 pid={pid}（已退出或非 agent 进程，防 pid 复用误杀，bot={bot_key}）"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1034,5 +1160,38 @@ mod tests {
         let m2 = agent_missing_msg(Backend::Codex, &err);
         assert!(m2.contains("找不到命令或启动失败（codex）"));
         assert!(m2.contains("安装"));
+    }
+
+    // ---- #25 重启恢复：agent 子进程 pid 跟踪 / 孤儿清理 ----
+
+    fn pid_temp_key(tag: &str) -> String {
+        format!("abb-agent-pid-{tag}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn track_untrack_pid_roundtrip() {
+        let key = pid_temp_key("roundtrip");
+        track_agent_pid(&key, 111);
+        track_agent_pid(&key, 222);
+        track_agent_pid(&key, 111); // 重复登记去重
+        let pids = read_agent_pids(&key);
+        assert_eq!(pids, vec![111, 222]);
+        untrack_agent_pid(&key, 111);
+        assert_eq!(read_agent_pids(&key), vec![222]);
+        untrack_agent_pid(&key, 222);
+        assert!(read_agent_pids(&key).is_empty());
+        let _ = std::fs::remove_dir_all(crate::workspace_dir(&key));
+    }
+
+    #[test]
+    fn kill_stale_agents_clears_file_and_skips_non_agent() {
+        let key = pid_temp_key("stale");
+        // 用不可能存在的 pid：ps 校验失败 → 不应误杀、文件清空、不 panic
+        track_agent_pid(&key, 999_999);
+        kill_stale_agents(&key);
+        assert!(read_agent_pids(&key).is_empty(), "清理后 pid 文件应清空");
+        // 空文件再次清理是 no-op
+        kill_stale_agents(&key);
+        let _ = std::fs::remove_dir_all(crate::workspace_dir(&key));
     }
 }

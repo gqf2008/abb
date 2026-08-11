@@ -19,6 +19,7 @@ mod install;
 mod larkskills;
 mod messenger;
 mod outbox;
+mod pending;
 mod permreq;
 mod platform;
 mod proto;
