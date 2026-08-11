@@ -104,10 +104,60 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 
 /// 一次桥接执行的最终结果。
 pub enum RunOutcome {
-    /// 正常完成，附最终回复文本（bridge 负责回发 + mark_started）。
-    Reply(String),
+    /// 正常完成，附最终回复文本 + 本次运行结束时的 session_id
+    /// （codex 首轮回存真实 thread_id、claude 自愈/换新后都是最终值）。
+    /// bridge 用 session_id 做「mark 前校验当前槽位仍是本次会话」——运行中被
+    /// /new 或 CLI `session reset` 换走的旧任务，不得把新槽位 mark 成 started（#23 审查修复）。
+    Reply { reply: String, session_id: String },
     /// 被用户在聊天里打断（停止词）。无回复；bridge 自行发送停止提示，不 mark_started。
     Cancelled,
+}
+
+/// Agent 执行抽象（#23 测试可测性）：bridge 持 `Arc<dyn AgentRunner>`，按 `Messenger`
+/// 同款注入模式。生产用 `RealAgentRunner`（转发下面的自由函数 `run`，spawn 真实 claude/codex
+/// 子进程）；测试注入挡板以驱动「任务运行中」时序——真实 `run` 在测试环境无 claude/codex
+/// 二进制只能走 Err 分支，覆盖不到 `Ok(Reply)` 路径上的 pending_new / mark_started 编排。
+#[async_trait::async_trait]
+pub trait AgentRunner: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        backend: Backend,
+        prompt: &str,
+        session_id: &str,
+        resume: bool,
+        chat_id: &str,
+        bot_key: &str,
+        sessions: Option<&crate::sessions::SessionStore>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<RunOutcome, String>;
+}
+
+/// 默认实现：原样转发本模块的自由函数 `run`（spawn 真实 claude/codex 子进程）。
+pub struct RealAgentRunner;
+
+#[async_trait::async_trait]
+impl AgentRunner for RealAgentRunner {
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        backend: Backend,
+        prompt: &str,
+        session_id: &str,
+        resume: bool,
+        chat_id: &str,
+        bot_key: &str,
+        sessions: Option<&crate::sessions::SessionStore>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<RunOutcome, String> {
+        // 裸函数调用解析到本模块的自由函数 run（trait method 必须经 `.` 调用，不会递归）。
+        run(
+            backend, prompt, session_id, resume, chat_id, bot_key, sessions, progress, cancel,
+        )
+        .await
+    }
 }
 
 /// 单次尝试（run_once）的错误：区分「用户打断」与「真实失败（用户可读文案）」。
@@ -307,7 +357,10 @@ pub async fn run(
                         }
                     }
                 }
-                return Ok(RunOutcome::Reply(out.reply));
+                return Ok(RunOutcome::Reply {
+                    reply: out.reply,
+                    session_id: sid,
+                });
             }
             Err(AttemptErr::Cancelled) => return Ok(RunOutcome::Cancelled),
             Err(AttemptErr::Failed(e)) => {
