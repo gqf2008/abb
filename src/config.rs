@@ -387,6 +387,62 @@ impl Config {
         Ok(())
     }
 
+    // ── 未保存草稿（自动保存 + 崩溃恢复）──
+
+    /// 草稿文件路径：与 config.json 同目录，保存成功后删除。
+    pub fn draft_path() -> PathBuf {
+        crate::bridge_dir().join("config.draft.json")
+    }
+
+    /// 读草稿（不存在/损坏 → None，不报错：草稿只是兜底，不该挡正常启动）。
+    pub fn load_draft() -> Option<Config> {
+        let p = Self::draft_path();
+        if !p.exists() {
+            return None;
+        }
+        let text = std::fs::read_to_string(&p).ok()?;
+        let mut cfg: Config = serde_json::from_str(&text).ok()?;
+        if cfg.default_backend.is_empty() {
+            cfg.default_backend = "claude".into();
+        }
+        cfg.migrate_legacy();
+        Some(cfg)
+    }
+
+    /// 草稿是否比正式配置新（mtime 比较；config.json 不存在时视作有新草稿）。
+    pub fn draft_is_newer() -> bool {
+        let dm = std::fs::metadata(Self::draft_path()).and_then(|m| m.modified());
+        let cm = std::fs::metadata(Self::path()).and_then(|m| m.modified());
+        match (dm, cm) {
+            (Ok(dm), Ok(cm)) => dm > cm,
+            (Ok(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// 写草稿：与 save 相同的原子写 + 0600（含密钥，权限必须收紧）。
+    pub fn save_draft(&self) -> Result<()> {
+        let p = Self::draft_path();
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = p.with_extension("draft.json.tmp");
+        let text = serde_json::to_string_pretty(self)?;
+        std::fs::write(&tmp, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &p)?;
+        Ok(())
+    }
+
+    /// 删除草稿（保存成功 / 用户选择丢弃时调用）。
+    pub fn remove_draft() {
+        let _ = std::fs::remove_file(Self::draft_path());
+    }
+
     /// 记录某 bot 的主会话（私聊 p2p）chat_id。收到私聊消息时调用；变化才落盘。
     pub fn save_primary_chat(bot_key: &str, chat_id: &str) {
         if chat_id.is_empty() {
@@ -727,5 +783,27 @@ mod tests {
         assert!(s.contains("\"cross_delivery_enabled\":true"));
         let back: Config = serde_json::from_str(&s).unwrap();
         assert!(back.cross_delivery_enabled);
+    }
+
+
+    #[test]
+    fn draft_roundtrip_and_newer_check() {
+        // 草稿读写 + mtime 判定（写完即删，避免污染真实草稿）
+        let mut c = Config::default();
+        c.bots.push(BotConfig {
+            name: "draft-test".into(),
+            kind: "feishu".into(),
+            ..Default::default()
+        });
+        c.save_draft().unwrap();
+        assert!(Config::draft_path().exists(), "草稿应已落盘");
+        assert!(Config::draft_is_newer(), "刚写的草稿应比正式配置新（或正式配置不存在）");
+        let loaded = Config::load_draft().expect("草稿应能读回");
+        assert_eq!(loaded.bots.len(), 1);
+        assert_eq!(loaded.bots[0].name, "draft-test");
+        Config::remove_draft();
+        assert!(!Config::draft_path().exists(), "删除后草稿不应存在");
+        assert!(Config::load_draft().is_none());
+        assert!(!Config::draft_is_newer());
     }
 }

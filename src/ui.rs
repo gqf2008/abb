@@ -179,6 +179,64 @@ fn show_window_and_focus<W: slint::ComponentHandle>(w: &W) {
     w.window().request_redraw();
 }
 
+/// 把设置窗四份工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
+/// 保证两种路径行为一致：bots 保留运行期字段、供应商密钥留空沿用旧值、默认供应商防悬空）。
+/// 返回 (Config, 丢弃的未命名供应商数)。
+fn snapshot_config(
+    work: &RefCell<Vec<BotConfig>>,
+    providers_work: &RefCell<Vec<ProviderConfig>>,
+    default_provider_work: &RefCell<String>,
+    cross_delivery_work: &RefCell<bool>,
+) -> (Config, usize) {
+    let mut c = Config::load().unwrap_or_default();
+    // 用工作副本整体替换 bots（保留每个 bot 运行期的 primary_chat_id）
+    let old = std::mem::take(&mut c.bots);
+    let mut newb = work.borrow().clone();
+    for nb in newb.iter_mut() {
+        if let Some(ob) = old.iter().find(|o| o.key() == nb.key()) {
+            nb.primary_chat_id = ob.primary_chat_id.clone();
+            if nb.bot_name.is_empty() {
+                nb.bot_name = ob.bot_name.clone();
+            }
+            if nb.bot_open_id.is_empty() {
+                nb.bot_open_id = ob.bot_open_id.clone();
+            }
+        }
+    }
+    c.bots = newb;
+
+    // 跨会话投递总开关：全局生效（所有 bot 共享）
+    c.cross_delivery_enabled = *cross_delivery_work.borrow();
+
+    // 供应商：用工作副本替换，但 api_key 留空=保留旧值（密码框不回显，编辑其它字段不该清密钥）。
+    // 丢弃空 name 行（无效），并计数。
+    let old_providers = std::mem::take(&mut c.providers);
+    let mut dropped = 0;
+    let mut newp: Vec<ProviderConfig> = Vec::new();
+    for mut p in providers_work.borrow().clone().into_iter() {
+        if p.name.trim().is_empty() {
+            dropped += 1;
+            continue;
+        }
+        if p.api_key.is_empty() {
+            // 留空 → 沿用同名旧供应商的密钥；没有同名旧供应商则保持空
+            if let Some(op) = old_providers.iter().find(|o| o.name == p.name) {
+                p.api_key = op.api_key.clone();
+            }
+        }
+        newp.push(p);
+    }
+    c.providers = newp;
+    let d = default_provider_work.borrow().clone();
+    // 默认供应商名若已不在列表里（被删/改名）→ 清空，避免悬空引用
+    c.default_provider = if !d.is_empty() && c.providers.iter().any(|p| p.name == d) {
+        d
+    } else {
+        String::new()
+    };
+    (c, dropped)
+}
+
 /// is_configured 的廉价缓存：按 config.json 的 mtime 失效，避免每 2s 全量读+解析。
 fn configured_cached() -> bool {
     use std::sync::Mutex;
@@ -426,8 +484,11 @@ pub fn run_gui() -> Result<()> {
     }
 
     // 打开设置窗时装载 config → 各工作副本 + model
+    // 设置窗装载涉及 Slint model + 四份工作副本，参数多；聚集成本高于收益，允许 lint。
+    #[allow(clippy::too_many_arguments)]
     fn load_into(
         w: &SettingsWindow,
+        c: &Config,
         work: &RefCell<Vec<BotConfig>>,
         model: &slint::VecModel<BotRow>,
         providers_work: &RefCell<Vec<ProviderConfig>>,
@@ -435,7 +496,6 @@ pub fn run_gui() -> Result<()> {
         default_provider_work: &RefCell<String>,
         cross_delivery_work: &RefCell<bool>,
     ) {
-        let c = Config::load().unwrap_or_default();
         *work.borrow_mut() = c.bots.clone();
         sync_model(model, &c.bots);
         *providers_work.borrow_mut() = c.providers.clone();
@@ -454,6 +514,34 @@ pub fn run_gui() -> Result<()> {
         push_deps_to_window(w);
         // 系统权限检测（macOS）：完全磁盘/辅助功能/屏幕录制/自动化。
         push_perms_to_window(w);
+    }
+
+    /// 装载设置窗：发现比正式配置新的草稿 → 静默恢复（返回 true，标记 dirty 并给一行提示）；
+    /// 否则按正式配置装载（返回 false）。「静默恢复」= 不弹选择框，直接把草稿当工作底稿。
+    #[allow(clippy::too_many_arguments)]
+    fn load_with_draft(
+        w: &SettingsWindow,
+        dirty: &Cell<bool>,
+        work: &RefCell<Vec<BotConfig>>,
+        model: &slint::VecModel<BotRow>,
+        providers_work: &RefCell<Vec<ProviderConfig>>,
+        providers_model: &slint::VecModel<ProviderRow>,
+        default_provider_work: &RefCell<String>,
+        cross_delivery_work: &RefCell<bool>,
+    ) -> bool {
+        if Config::draft_is_newer() {
+            let draft = Config::load_draft().unwrap_or_default();
+            load_into(w, &draft, work, model, providers_work, providers_model, default_provider_work, cross_delivery_work);
+            dirty.set(true);
+            w.set_status_is_error(false);
+            w.set_status_line("已恢复上次未保存的草稿（编辑后点「保存」写入配置）".into());
+            true
+        } else {
+            let cfg = Config::load().unwrap_or_default();
+            load_into(w, &cfg, work, model, providers_work, providers_model, default_provider_work, cross_delivery_work);
+            dirty.set(false);
+            false
+        }
     }
 
     // ── 后台 tokio 线程：处理慢操作（HTTP/起停），结果回主线程 ──
@@ -482,6 +570,9 @@ pub fn run_gui() -> Result<()> {
                     UiCmd::OpenFolder => platform::open_path(&crate::bridge_dir()),
                     UiCmd::Save(cfg) => {
                         let res = cfg.save();
+                        if res.is_ok() {
+                            Config::remove_draft(); // 正式配置已落盘，草稿作废
+                        }
                         if res.is_ok() && install::status().running {
                             install::svc_restart();
                         }
@@ -591,8 +682,9 @@ pub fn run_gui() -> Result<()> {
             let pwork = providers_work.clone();
             let pmodel = providers_model.clone();
             let dwork = default_provider_work.clone();
-            load_into(
+            load_with_draft(
                 &settings,
+                &dirty,
                 &work,
                 &model,
                 &pwork,
@@ -600,7 +692,6 @@ pub fn run_gui() -> Result<()> {
                 &dwork,
                 &cross_delivery_work,
             );
-            dirty.set(false);
             push_settings_status(&settings, &install::status());
             settings.set_status_line(
                 "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
@@ -621,8 +712,17 @@ pub fn run_gui() -> Result<()> {
         let dirty_open = dirty.clone();
         tray.on_open_settings(move || {
             if let Some(w) = sw.upgrade() {
-                load_into(&w, &work, &model, &pwork, &pmodel, &dwork, &cdwork);
-                dirty_open.set(false);
+                // 草稿比正式配置新（上次编辑没保存就退出/崩溃）→ 静默恢复为工作底稿
+                load_with_draft(
+                    &w,
+                    &dirty_open,
+                    &work,
+                    &model,
+                    &pwork,
+                    &pmodel,
+                    &dwork,
+                    &cdwork,
+                );
                 push_settings_status(&w, &install::status());
                 show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
             }
@@ -828,53 +928,7 @@ pub fn run_gui() -> Result<()> {
         settings.on_save_clicked(move || {
             dirty.set(false);
             if let Some(w) = sw.upgrade() {
-                let mut c = Config::load().unwrap_or_default();
-                // 用工作副本整体替换 bots（保留每个 bot 运行期的 primary_chat_id）
-                let old = std::mem::take(&mut c.bots);
-                let mut newb = work.borrow().clone();
-                for nb in newb.iter_mut() {
-                    if let Some(ob) = old.iter().find(|o| o.key() == nb.key()) {
-                        nb.primary_chat_id = ob.primary_chat_id.clone();
-                        if nb.bot_name.is_empty() {
-                            nb.bot_name = ob.bot_name.clone();
-                        }
-                        if nb.bot_open_id.is_empty() {
-                            nb.bot_open_id = ob.bot_open_id.clone();
-                        }
-                    }
-                }
-                c.bots = newb;
-
-                // 跨会话投递总开关：全局生效（所有 bot 共享）
-                c.cross_delivery_enabled = *cdwork.borrow();
-
-                // 供应商：用工作副本替换，但 api_key 留空=保留旧值（密码框不回显，编辑其它字段不该清密钥）。
-                // 丢弃空 name 行（无效），并警告。
-                let old_providers = std::mem::take(&mut c.providers);
-                let mut dropped = 0;
-                let mut newp: Vec<ProviderConfig> = Vec::new();
-                for mut p in pwork.borrow().clone().into_iter() {
-                    if p.name.trim().is_empty() {
-                        dropped += 1;
-                        continue;
-                    }
-                    if p.api_key.is_empty() {
-                        // 留空 → 沿用同名旧供应商的密钥；没有同名旧供应商则保持空
-                        if let Some(op) = old_providers.iter().find(|o| o.name == p.name) {
-                            p.api_key = op.api_key.clone();
-                        }
-                    }
-                    newp.push(p);
-                }
-                c.providers = newp;
-                let d = dwork.borrow().clone();
-                // 默认供应商名若已不在列表里（被删/改名）→ 清空，避免悬空引用
-                c.default_provider = if !d.is_empty() && c.providers.iter().any(|p| p.name == d) {
-                    d
-                } else {
-                    String::new()
-                };
-
+                let (c, dropped) = snapshot_config(&work, &pwork, &dwork, &cdwork);
                 let _ = tx.send(UiCmd::Save(c));
                 // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
                 w.set_status_is_error(false);
@@ -904,13 +958,13 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // ── 未保存修改确认弹窗：保存并关闭 / 不保存 / 留在设置窗 ──
+    // ── 通用确认弹窗（两种用途：① 未保存修改 → 保存/不保存；② 发现草稿 → 恢复/丢弃）──
     {
         let sw = settings.as_weak();
         let dw = unsaved_dialog.as_weak();
         let dirty = dirty.clone();
         unsaved_dialog.on_save_close(move || {
-            // 复用「保存」同一路径（汇总工作副本写盘 + 服务在跑则重启），随后关设置窗
+            // 未保存修改：复用「保存」同一路径（汇总工作副本写盘 + 服务在跑则重启），随后关设置窗
             if let Some(w) = sw.upgrade() {
                 w.invoke_save_clicked();
                 let _ = w.hide();
@@ -927,7 +981,9 @@ pub fn run_gui() -> Result<()> {
         let dw = unsaved_dialog.as_weak();
         let dirty = dirty.clone();
         unsaved_dialog.on_discard_close(move || {
-            dirty.set(false); // 丢弃本次编辑，后续关闭不再提示
+            // 不保存：丢弃本次编辑（同时删掉自动草稿，避免下次再提示）
+            dirty.set(false);
+            Config::remove_draft();
             if let Some(w) = sw.upgrade() {
                 let _ = w.hide();
                 platform::hide_dock();
@@ -1213,8 +1269,9 @@ pub fn run_gui() -> Result<()> {
         // 覆盖 config，把磁盘上已有的 bots 全部抹掉（半配置状态：配了但 is_configured 为假）。
         // 此处仍在事件循环启动前的主线程设置阶段，直接调用即可（Rc 非 Send，
         // 不能塞进 invoke_from_event_loop）。
-        load_into(
+        load_with_draft(
             &settings,
+            &dirty,
             &work,
             &bots_model,
             &providers_work,
@@ -1237,6 +1294,9 @@ pub fn run_gui() -> Result<()> {
         let tray_hold = tray;
         let tray_weak = tray_hold.as_weak();
         let dirty = dirty.clone();
+        let providers_work_t = providers_work.clone();
+        let default_provider_work_t = default_provider_work.clone();
+        let cross_delivery_work_t = cross_delivery_work.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -1255,6 +1315,18 @@ pub fn run_gui() -> Result<()> {
                 // 同步设置窗的动态标题 + 顶部运行概览（隐藏也更新，下次打开即最新）
                 if let Some(w) = settings_weak.upgrade() {
                     push_settings_status(&w, &st);
+                }
+                // 草稿自动保存：有未保存修改就每 tick 落盘一次（小文件 + 原子写，成本可忽略）
+                if dirty.get() {
+                    let (draft, _dropped) = snapshot_config(
+                        &work,
+                        &providers_work_t,
+                        &default_provider_work_t,
+                        &cross_delivery_work_t,
+                    );
+                    if let Err(e) = draft.save_draft() {
+                        crate::log!("[gui] 草稿自动保存失败: {e:#}");
+                    }
                 }
                 // 依赖安装结果：清 dep-busy，刷新检测状态，报结果
                 while let Ok((dep_id, r)) = dep_rx.try_recv() {
