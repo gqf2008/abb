@@ -398,6 +398,7 @@ fn parse_quoted_reply(p: &Value) -> (String, Vec<DingtalkAttachment>) {
             );
         }
         "audio" | "voice" => {
+            // 语音转写文本（recognition）记进 voice_text，与主消息路径一致
             push(
                 &mut atts,
                 "audio",
@@ -409,7 +410,7 @@ fn parse_quoted_reply(p: &Value) -> (String, Vec<DingtalkAttachment>) {
                         .filter(|s| !s.is_empty())
                         .unwrap_or("amr")
                 ),
-                String::new(),
+                content["recognition"].as_str().unwrap_or("").to_string(),
             );
         }
         "video" => {

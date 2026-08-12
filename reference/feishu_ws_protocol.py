@@ -510,6 +510,11 @@ def run_agent(backend: str, prompt: str, session_id: str, resume: bool) -> tuple
 
 # ── 桥 ─────────────────────────────────────────────────────────────
 class Bridge:
+    """历史协议样例（Rust 版 on_payload 的简化参照）。
+    注意：只同步了「应用/bot 消息过滤」，未同步 Rust 版的
+    「话题内回复免 @」与「引用/回复上下文（文本+附件）」——那些以 src/bridge.rs 为准。
+    """
+
     def __init__(self, fs: FeishuClient):
         self.fs = fs
         self.sessions = SessionStore(SESSIONS_FILE)

@@ -19,12 +19,10 @@ pub struct FeishuResource {
     pub file_name: String,
 }
 
-/// 解析后的飞书消息内容：文本 + 资源列表。
-/// `resource` 兼容旧字段（= resources 的第一项）；`resources` 含富文本里全部图片/资源。
+/// 解析后的飞书消息内容：文本 + 资源列表（含富文本里全部图片/资源）。
 #[derive(Debug, Clone, Default)]
 pub struct FeishuParsed {
     pub text: String,
-    pub resource: Option<FeishuResource>,
     pub resources: Vec<FeishuResource>,
 }
 
@@ -41,14 +39,12 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
     if let Some(r) = resource_from_content(&v) {
         return FeishuParsed {
             text: String::new(),
-            resource: Some(r.clone()),
             resources: vec![r],
         };
     }
     if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
         return FeishuParsed {
             text: t.to_string(),
-            resource: None,
             resources: Vec::new(),
         };
     }
@@ -99,10 +95,8 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
             text.push('\n');
         }
     }
-    let resource = imgs.first().cloned();
     FeishuParsed {
         text: text.trim().to_string(),
-        resource,
         resources: imgs,
     }
 }
@@ -289,6 +283,8 @@ impl FeishuClient {
                 resp.get("msg")
             );
         }
+        // serde_json 对越界/缺失索引返回 Null（不 panic）：items 为空 / data 缺失 /
+        // items 非数组时 item=Null → raw="" → parse_content 返回空 → 桥按「无引用内容」跳过。
         let item = &resp["data"]["items"][0];
         let raw = item["body"]["content"].as_str().unwrap_or("");
         Ok(parse_content(raw))
@@ -480,14 +476,14 @@ mod tests {
     fn parse_content_text() {
         let p = parse_content(r#"{"text":"你好"}"#);
         assert_eq!(p.text, "你好");
-        assert!(p.resource.is_none());
+        assert!(p.resources.is_empty());
     }
 
     #[test]
     fn parse_content_image() {
         let p = parse_content(r#"{"image_key":"img_abc"}"#);
         assert_eq!(p.text, "");
-        let r = p.resource.expect("应解析出图片资源");
+        let r = p.resources.first().expect("应解析出图片资源");
         assert_eq!(r.kind, "image");
         assert_eq!(r.file_key, "img_abc");
     }
@@ -495,7 +491,7 @@ mod tests {
     #[test]
     fn parse_content_file() {
         let p = parse_content(r#"{"file_key":"file_1","file_name":"报告.pdf"}"#);
-        let r = p.resource.unwrap();
+        let r = p.resources.first().unwrap();
         assert_eq!(r.kind, "file");
         assert_eq!(r.file_key, "file_1");
         assert_eq!(r.file_name, "报告.pdf");
@@ -504,9 +500,9 @@ mod tests {
     #[test]
     fn parse_content_audio_video_kind() {
         let a = parse_content(r#"{"file_key":"f1","file_name":"a.amr","type":"audio"}"#);
-        assert_eq!(a.resource.unwrap().kind, "audio");
+        assert_eq!(a.resources.first().unwrap().kind, "audio");
         let v = parse_content(r#"{"file_key":"f2","file_name":"b.mp4","type":"media"}"#);
-        assert_eq!(v.resource.unwrap().kind, "video");
+        assert_eq!(v.resources.first().unwrap().kind, "video");
     }
 
     #[test]
@@ -519,9 +515,9 @@ mod tests {
         assert_eq!(p.resources[0].file_key, "img_1");
         assert_eq!(p.resources[1].file_key, "img_2");
         assert_eq!(
-            p.resource.as_ref().unwrap().file_key,
+            p.resources.first().unwrap().file_key,
             "img_1",
-            "resource 兼容第一张"
+            "第一张图仍在最前"
         );
     }
 
@@ -533,7 +529,7 @@ mod tests {
         assert!(p.text.contains("标题"));
         assert!(p.text.contains("你好"));
         assert!(p.text.contains("https://example.com"));
-        let r = p.resource.expect("富文本图片应解析为资源");
+        let r = p.resources.first().expect("富文本图片应解析为资源");
         assert_eq!(r.kind, "image");
         assert_eq!(r.file_key, "img_pic");
     }
@@ -542,6 +538,6 @@ mod tests {
     fn parse_content_empty_on_garbage() {
         let p = parse_content("not json");
         assert_eq!(p.text, "");
-        assert!(p.resource.is_none());
+        assert!(p.resources.is_empty());
     }
 }

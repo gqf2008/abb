@@ -281,12 +281,13 @@ impl Bridge {
 
         // content 是 JSON 字符串：文本 / 图片 / 文件 / 音视频 / 富文本（#12）。
         // 非文本消息解析出资源引用后下载附件，text 保持空（不再把 raw JSON 当文本透传）。
+        // 富文本多图：下载全部图片（与引用路径一致，避免直接发 3 图只收 1 张的割裂）。
         let raw = message["content"].as_str().unwrap_or("");
         let parsed = crate::feishu::parse_content(raw);
         let text = parsed.text.trim().to_string();
         let mid = message["message_id"].as_str().unwrap_or("").to_string();
         let mut attachments = Vec::new();
-        if let Some(res) = parsed.resource {
+        for (i, res) in parsed.resources.into_iter().enumerate() {
             let desc = crate::attachments::AttachmentDesc::Feishu {
                 message_id: mid.clone(),
                 file_key: res.file_key,
@@ -295,7 +296,7 @@ impl Bridge {
             };
             if let Some(meta) = self
                 .msgr
-                .download_attachment(&self.bot.key(), &mid, 0, &desc)
+                .download_attachment(&self.bot.key(), &mid, i, &desc)
                 .await
             {
                 attachments.push(meta);
@@ -469,6 +470,9 @@ impl Bridge {
             prompt.push_str("[引用消息]\n");
             if !ev.quoted.text.is_empty() {
                 prompt.push_str(&ev.quoted.text);
+                if !ev.quoted.attachments.is_empty() {
+                    prompt.push('\n'); // 文本后跟附件时让 [引用附件] 独占一行（与 [附件] 约定一致）
+                }
             }
             if !ev.quoted.attachments.is_empty() {
                 prompt.push_str("[引用附件]");
@@ -1715,13 +1719,11 @@ mod tests {
         );
         bridge.on_payload(payload.as_bytes()).await;
 
-        let prompt = &runner.prompts()[0];
-        assert!(prompt.contains("[引用消息]"), "应有引用消息段");
-        assert!(prompt.contains("引用的文字"));
-        assert!(prompt.contains("[引用附件]"), "应有引用附件段");
-        assert!(prompt.contains("截图.png"), "附件元数据应带文件名");
-        assert!(prompt.contains("本地路径=/tmp/mock-attachment.bin"));
-        assert!(prompt.contains("回复内容"));
+        // 文本+附件同时存在：整段精确断言，钉死「[引用附件] 独占一行」的格式
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n引用的文字\n[引用附件]\n[image] 来源=mock 文件名=截图.png mime=application/octet-stream 大小=1 本地路径=/tmp/mock-attachment.bin sha256=abc\n\n回复内容"]
+        );
         cleanup_bridge(&bridge);
     }
 
@@ -1770,7 +1772,7 @@ mod tests {
 
         let prompt = &runner.prompts()[0];
         assert!(prompt.contains("[引用消息]"));
-        assert!(prompt.contains("[引用附件]"));
+        assert!(prompt.contains("\n[引用附件]"), "[引用附件] 应独占一行");
         assert!(prompt.contains("image"));
         assert!(prompt.contains("回复内容"));
         cleanup_bridge(&bridge);
@@ -1808,7 +1810,7 @@ mod tests {
 
         let prompt = &runner.prompts()[0];
         assert!(prompt.contains("[引用消息]"));
-        assert!(prompt.contains("[引用附件]"));
+        assert!(prompt.contains("\n[引用附件]"), "[引用附件] 应独占一行");
         assert!(prompt.contains("image"));
         assert!(prompt.contains("回复内容"));
         cleanup_bridge(&bridge);
