@@ -50,6 +50,9 @@ pub struct Ev {
     pub chat_type: String,
     /// 飞书话题 ID（omt_ 开头）；空=非话题消息。微信/钉钉恒为空。
     pub thread_id: String,
+    /// 被引用消息的文本（引用/回复场景：用户引用上一条消息再 @ bot 时，
+    /// 把被引用内容带进 agent prompt）。空=无引用。
+    pub quoted: String,
     pub text: String,
     /// 已下载到工作区的附件元数据（#12）。纯附件消息 text 为空但 attachments 非空。
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
@@ -299,12 +302,13 @@ impl Bridge {
             }
         }
 
-        let ev = Ev {
+        let mut ev = Ev {
             mid,
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
             // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
             thread_id: thread_id.to_string(),
+            quoted: String::new(),
             text,
             attachments,
         };
@@ -316,6 +320,26 @@ impl Bridge {
                 ev.chat_id
             );
             return;
+        }
+
+        // 引用/回复场景：parent_id 是被引用（回复）的消息 id。事件体不带被引用内容，
+        // 需按 id 拉取（飞书 API）；best-effort——拉取失败只记日志，不阻塞本条回复。
+        let parent_id = message["parent_id"].as_str().unwrap_or("");
+        if !parent_id.is_empty() && parent_id != ev.mid {
+            match self.msgr.get_message_text(parent_id).await {
+                Some(t) if !t.trim().is_empty() => {
+                    ev.quoted = t.trim().to_string();
+                    crate::log!(
+                        "[bridge] 引用消息 parent={} 内容长度={}",
+                        trunc(parent_id, 12),
+                        ev.quoted.chars().count()
+                    );
+                }
+                _ => crate::log!(
+                    "[bridge] 拉取引用消息失败/无内容 parent={}",
+                    trunc(parent_id, 12)
+                ),
+            }
         }
         self.handle(ev).await;
     }
@@ -405,6 +429,7 @@ impl Bridge {
             chat_type: ev.chat_type.clone(),
             thread_id: ev.thread_id.clone(),
             text: text.clone(),
+            quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
             created_at: crate::chrono_lite::unix_secs(),
         });
@@ -420,7 +445,14 @@ impl Bridge {
         } else {
             Vec::new()
         };
-        let mut prompt = text;
+        // 引用/回复上下文：把被引用消息内容放在用户文本之前，agent 先读到「上面被引用的内容」。
+        let mut prompt = String::new();
+        if !ev.quoted.is_empty() {
+            prompt.push_str("[引用消息]\n");
+            prompt.push_str(&ev.quoted);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(&text);
         if !ev.attachments.is_empty() {
             prompt.push_str("\n\n[附件]");
             for a in &ev.attachments {
@@ -570,6 +602,7 @@ impl Bridge {
                 chat_id: item.chat_id,
                 chat_type: item.chat_type,
                 thread_id: item.thread_id,
+                quoted: item.quoted,
                 text: item.text,
                 attachments: item.attachments,
             };
@@ -636,6 +669,7 @@ impl Bridge {
             chat_id: from,               // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
             thread_id: String::new(),    // 微信无话题
+            quoted: msg.quoted_text(),   // 引用/回复：ref_msg 里的被引用内容
             text,
             attachments,
         };
@@ -703,6 +737,7 @@ impl Bridge {
                 "dm".to_string()
             },
             thread_id: String::new(), // 钉钉无话题
+            quoted: msg.quoted_text,  // 引用/回复：repliedMsg 里的被引用内容
             text,
             attachments,
         };
@@ -805,6 +840,7 @@ mod tests {
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
             thread_id: String::new(),
+            quoted: String::new(),
             text: "hi".into(),
             attachments: vec![],
         };
@@ -819,6 +855,7 @@ mod tests {
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
             thread_id: thread.into(),
+            quoted: String::new(),
             text: "hi".into(),
             attachments: vec![],
         };
@@ -862,15 +899,24 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    /// 收集 send_text 调用，供断言回复内容（其余 Messenger 方法走 trait 默认空实现）。
+    /// 收集 send_text 调用，供断言回复内容；get_message_text 用 map 按 message_id 返回
+    /// 被引用内容（飞书引用/回复场景测试用）。
     struct MockMessenger {
         sent: Mutex<Vec<String>>,
+        quoted: Mutex<std::collections::HashMap<String, String>>,
     }
     impl MockMessenger {
         fn new() -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
+                quoted: Mutex::new(std::collections::HashMap::new()),
             }
+        }
+        fn set_quoted(&self, message_id: &str, text: &str) {
+            self.quoted
+                .lock()
+                .unwrap()
+                .insert(message_id.to_string(), text.to_string());
         }
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
@@ -881,6 +927,9 @@ mod tests {
         async fn send_text(&self, _chat_id: &str, text: &str) -> anyhow::Result<()> {
             self.sent.lock().unwrap().push(text.to_string());
             Ok(())
+        }
+        async fn get_message_text(&self, message_id: &str) -> Option<String> {
+            self.quoted.lock().unwrap().get(message_id).cloned()
         }
     }
 
@@ -951,6 +1000,7 @@ mod tests {
             chat_id: chat_id.into(),
             chat_type: "group".into(), // 非 p2p/dm：跳过 save_primary_chat 写盘
             thread_id: String::new(),
+            quoted: String::new(),
             text: text.into(),
             attachments: Vec::new(),
         }
@@ -984,6 +1034,7 @@ mod tests {
         chat_id: &str,
         chat_type: &str,
         thread_id: &str,
+        parent_id: &str,
         sender_type: &str,
         sender_id: &str,
         mentions: &[(&str, &str)], // (name, open_id)
@@ -1002,6 +1053,7 @@ mod tests {
                     "chat_id": chat_id,
                     "chat_type": chat_type,
                     "thread_id": thread_id,
+                    "parent_id": parent_id,
                     "content": content.to_string(),
                     "mentions": mentions.iter().map(|(name, open_id)| {
                         serde_json::json!({"name": name, "id": {"open_id": open_id}})
@@ -1181,6 +1233,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "第一条".into(),
+            quoted: String::new(),
             attachments: Vec::new(),
             created_at: 10,
         });
@@ -1190,6 +1243,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "第二条".into(),
+            quoted: String::new(),
             attachments: Vec::new(),
             created_at: 20,
         });
@@ -1243,6 +1297,7 @@ mod tests {
                 "oc_p2p",
                 "p2p",
                 "",
+                "",
                 sender_type,
                 "ou_app",
                 &[],
@@ -1276,6 +1331,7 @@ mod tests {
             "oc_p2p",
             "p2p",
             "",
+            "",
             "user", // 防御：sender_type 意外是 user 也要靠 open_id 拦住
             "ou_bot",
             &[],
@@ -1308,6 +1364,7 @@ mod tests {
             "oc_group",
             "group",
             "omt_abc",
+            "",
             "user",
             "ou_owner",
             &[], // 话题内回复不 @ 也能收到事件
@@ -1338,6 +1395,7 @@ mod tests {
             "om_top",
             "oc_group",
             "group",
+            "",
             "",
             "user",
             "ou_owner",
@@ -1373,6 +1431,7 @@ mod tests {
             "oc_p2p",
             "p2p",
             "",
+            "",
             "user",
             "ou_owner",
             &[],
@@ -1382,6 +1441,134 @@ mod tests {
 
         assert_eq!(runner.prompts(), ["在吗"], "owner 私聊消息应进 agent");
         assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    // ---- 引用/回复：被引用消息内容进 agent prompt ----
+
+    #[tokio::test]
+    async fn on_payload_fetches_quoted_parent() {
+        // 飞书引用/回复：事件带 parent_id，on_payload 按 id 拉取被引用内容并拼进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        msgr.set_quoted("om_parent", "上面那条被引用的消息");
+
+        let payload = feishu_payload(
+            "om_reply",
+            "oc_p2p",
+            "p2p",
+            "",
+            "om_parent", // parent_id = 被引用消息
+            "user",
+            "ou_owner",
+            &[],
+            "回复内容",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n上面那条被引用的消息\n\n回复内容"],
+            "prompt 应带引用上下文"
+        );
+        assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn handle_prompt_prepends_quoted() {
+        // 核心拼装：Ev.quoted 非空 → prompt = [引用消息]\n引用内容\n\n用户文本。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        let mut ev = test_ev("m1", "oc_q", "回复内容");
+        ev.quoted = "被引用的原消息".to_string();
+        bridge.handle(ev).await;
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n被引用的原消息\n\n回复内容"]
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_weixin_quoted_text_in_prompt() {
+        // 微信引用/回复：ref_msg 内容随事件携带，进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "wechat".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::wechat::WeixinMessage {
+            from_user_id: "u1".into(),
+            message_type: 1,
+            message_id: "7491".into(),
+            item_list: vec![crate::wechat::MessageItem {
+                item_type: 1,
+                text_item: Some(crate::wechat::TextItem {
+                    text: "回复内容".into(),
+                }),
+                ref_msg: Some(crate::wechat::RefMessage {
+                    title: "摘要".into(),
+                    message_item: Some(Box::new(crate::wechat::MessageItem {
+                        item_type: 1,
+                        text_item: Some(crate::wechat::TextItem {
+                            text: "被引用的原消息".into(),
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        bridge.on_weixin(msg).await;
+
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n摘要 | 被引用的原消息\n\n回复内容"]
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_dingtalk_quoted_text_in_prompt() {
+        // 钉钉引用/回复：repliedMsg 内容随事件携带，进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "dingtalk".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::dingtalk::DingtalkMessage {
+            mid: "msg1".into(),
+            sender_staff_id: "u1".into(),
+            conversation_id: "u1".into(), // 单聊：chat_id = sender
+            conversation_type: "1".into(),
+            text: "回复内容".into(),
+            mentioned: false,
+            robot_code: "r".into(),
+            quoted_text: "被引用的原消息".into(),
+            attachments: Vec::new(),
+        };
+        bridge.on_dingtalk(msg).await;
+
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n被引用的原消息\n\n回复内容"]
+        );
         cleanup_bridge(&bridge);
     }
 }

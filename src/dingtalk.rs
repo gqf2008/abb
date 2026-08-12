@@ -322,6 +322,9 @@ pub struct DingtalkMessage {
     pub mentioned: bool,
     /// 回调里的 robotCode（下载附件必需；缺省回落到 app_id）。
     pub robot_code: String,
+    /// 被引用消息的文本（引用/回复场景：`text.isReplyMsg` + `text.repliedMsg.content.text`；
+    /// 非文本引用或未引用为空）。
+    pub quoted_text: String,
     /// 附件引用列表（富文本可能多张图；文本消息为空）。
     pub attachments: Vec<DingtalkAttachment>,
 }
@@ -360,16 +363,30 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
         .as_str()
         .or_else(|| p["senderId"].as_str())?
         .to_string();
-    let base = |text: String, attachments: Vec<DingtalkAttachment>| DingtalkMessage {
-        mid: mid.clone(),
-        sender_staff_id: sender.clone(),
-        conversation_id: p["conversationId"].as_str().unwrap_or("").to_string(),
-        conversation_type: p["conversationType"].as_str().unwrap_or("").to_string(),
-        text,
-        mentioned: p["isInAtList"].as_bool().unwrap_or(false),
-        robot_code: p["robotCode"].as_str().unwrap_or("").to_string(),
-        attachments,
+    // 引用/回复场景：钉钉文本消息带 isReplyMsg + repliedMsg（被引用消息内容）。
+    // 只取文本引用；图片/文件等非文本引用无 text，返回空（agent 仍能看到本条回复）。
+    let quoted_text = if p["text"]["isReplyMsg"].as_bool().unwrap_or(false) {
+        p["text"]["repliedMsg"]["content"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        String::new()
     };
+
+    let base =
+        |text: String, quoted_text: String, attachments: Vec<DingtalkAttachment>| DingtalkMessage {
+            mid: mid.clone(),
+            sender_staff_id: sender.clone(),
+            conversation_id: p["conversationId"].as_str().unwrap_or("").to_string(),
+            conversation_type: p["conversationType"].as_str().unwrap_or("").to_string(),
+            text,
+            mentioned: p["isInAtList"].as_bool().unwrap_or(false),
+            robot_code: p["robotCode"].as_str().unwrap_or("").to_string(),
+            quoted_text,
+            attachments,
+        };
 
     match msgtype {
         "text" => {
@@ -377,7 +394,7 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             if text.is_empty() {
                 return None;
             }
-            Some(base(text, Vec::new()))
+            Some(base(text, quoted_text, Vec::new()))
         }
         "picture" => {
             let dc = p["content"]["downloadCode"].as_str()?.to_string();
@@ -385,6 +402,7 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
                 return None;
             }
             Some(base(
+                String::new(),
                 String::new(),
                 vec![DingtalkAttachment {
                     kind: "image".into(),
@@ -401,6 +419,7 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
                 return None;
             }
             Some(base(
+                String::new(),
                 String::new(),
                 vec![DingtalkAttachment {
                     kind: "file".into(),
@@ -421,6 +440,7 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
                 return None;
             }
             Some(base(
+                String::new(),
                 String::new(),
                 vec![DingtalkAttachment {
                     kind: "audio".into(),
@@ -444,6 +464,7 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
                 return None;
             }
             Some(base(
+                String::new(),
                 String::new(),
                 vec![DingtalkAttachment {
                     kind: "video".into(),
@@ -483,7 +504,9 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             if text.is_empty() && attachments.is_empty() {
                 return None;
             }
-            Some(base(text, attachments))
+            // 富文本引用：repliedMsg 结构复杂，文本引用内容可能散在 richText 里；
+            // 保持简单——只把顶层 text 里的引用文本带上（非文本引用留空）。
+            Some(base(text, quoted_text, attachments))
         }
         _ => None,
     }
@@ -704,6 +727,28 @@ mod tests {
         assert!(m.mentioned);
         assert!(m.is_group());
         assert_eq!(m.chat_id(), "cidAsXSBLnA==");
+    }
+
+    #[test]
+    fn parse_quote_reply_text() {
+        // 引用/回复：text.isReplyMsg=true + text.repliedMsg.content.text = 被引用内容
+        let frame = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
+            "data": r#"{"conversationId":"cid1","conversationType":"1","msgId":"msg1","senderStaffId":"u123","isInAtList":false,"text":{"content":"这是回复","isReplyMsg":true,"repliedMsg":{"msgType":"text","content":{"text":"被引用的原消息"},"msgId":"msg0","createdAt":1690362101894}},"msgtype":"text"}"#
+        });
+        let m = parse_message(&frame).expect("应解析出消息");
+        assert_eq!(m.text, "这是回复");
+        assert_eq!(m.quoted_text, "被引用的原消息");
+
+        // 未引用 → quoted_text 为空
+        let plain = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m2"},
+            "data": r#"{"conversationId":"cid1","conversationType":"1","msgId":"msg2","senderStaffId":"u123","isInAtList":false,"text":{"content":"普通消息"},"msgtype":"text"}"#
+        });
+        let m2 = parse_message(&plain).expect("应解析出消息");
+        assert_eq!(m2.quoted_text, "");
     }
 
     #[test]

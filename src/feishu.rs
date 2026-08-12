@@ -267,6 +267,32 @@ impl FeishuClient {
         Ok(())
     }
 
+    /// 拉取一条历史消息的文本（引用/回复场景：用户回复时 @ bot，bot 需要读到被引用
+    /// 的消息内容）。GET /im/v1/messages/:message_id 返回 `data.items[0]`，
+    /// `body.content` 是 JSON 字符串（text/post/…），复用 parse_content 抽取纯文本。
+    /// 失败返回 Err（调用方 best-effort：引用内容拿不到不阻塞回复，只记日志）。
+    pub async fn get_message_text(&self, message_id: &str) -> Result<String> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .get(format!("{API_BASE}/im/v1/messages/{message_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "拉取消息失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        let item = &resp["data"]["items"][0];
+        let raw = item["body"]["content"].as_str().unwrap_or("");
+        Ok(parse_content(raw).text)
+    }
+
     /// 下载消息内资源（图片/文件/音视频，≤100MB）。返回 (字节, Content-Type)。
     /// `kind` 决定 query type：image → `type=image`；file/audio/video → `type=file`。
     /// 错误码 234003 等会带进错误文案，便于排查（key 与 message 不匹配/权限缺失）。

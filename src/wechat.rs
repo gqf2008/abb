@@ -181,6 +181,10 @@ pub struct WeixinMessage {
 pub struct MessageItem {
     #[serde(default, rename = "type")]
     pub item_type: i64,
+    /// 引用/回复的原消息（ilink 协议：用户引用某条消息时，本条 item 带 ref_msg，
+    /// 内含原消息摘要 title + 原消息内容 message_item）。
+    #[serde(default)]
+    pub ref_msg: Option<RefMessage>,
     #[serde(default)]
     pub text_item: Option<TextItem>,
     #[serde(default)]
@@ -191,6 +195,16 @@ pub struct MessageItem {
     pub file_item: Option<FileItem>,
     #[serde(default)]
     pub video_item: Option<VideoItem>,
+}
+
+/// 微信引用消息（quote/reply）：title 是摘要，message_item 是被引用消息的完整内容
+/// （可为文本/图片/文件等，与入站 item 同构）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RefMessage {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub message_item: Option<Box<MessageItem>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -342,6 +356,55 @@ impl WeixinMessage {
     pub fn media_items(&self) -> Vec<WechatMedia> {
         self.item_list.iter().filter_map(|it| it.media()).collect()
     }
+
+    /// 提取被引用消息的文本（引用/回复场景）。协议里 ref_msg 带 title 摘要 +
+    /// message_item 原内容（原内容可为文本/媒体/再嵌套引用）；这里拼成
+    /// `摘要 | 原文本`，供 agent 读到「上面被引用的消息内容」。
+    pub fn quoted_text(&self) -> String {
+        for it in &self.item_list {
+            if let Some(ref_msg) = &it.ref_msg {
+                let mut parts: Vec<String> = Vec::new();
+                if !ref_msg.title.trim().is_empty() {
+                    parts.push(ref_msg.title.trim().to_string());
+                }
+                if let Some(mi) = &ref_msg.message_item {
+                    if let Some(t) = &mi.text_item {
+                        if !t.text.trim().is_empty() {
+                            parts.push(t.text.trim().to_string());
+                        }
+                    }
+                    // 原消息本身也是引用 → 递归带出最底层内容
+                    if let Some(nested) = quoted_text_of_item(mi) {
+                        parts.push(nested);
+                    }
+                }
+                if !parts.is_empty() {
+                    return parts.join(" | ");
+                }
+            }
+        }
+        String::new()
+    }
+}
+
+/// 递归提取某条 MessageItem 自身携带的引用文本（ref_msg.message_item 可能再嵌套）。
+fn quoted_text_of_item(item: &MessageItem) -> Option<String> {
+    let ref_msg = item.ref_msg.as_ref()?;
+    let mut parts: Vec<String> = Vec::new();
+    if !ref_msg.title.trim().is_empty() {
+        parts.push(ref_msg.title.trim().to_string());
+    }
+    if let Some(mi) = &ref_msg.message_item {
+        if let Some(t) = &mi.text_item {
+            if !t.text.trim().is_empty() {
+                parts.push(t.text.trim().to_string());
+            }
+        }
+        if let Some(nested) = quoted_text_of_item(mi) {
+            parts.push(nested);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
 #[derive(Debug, Deserialize)]
@@ -818,6 +881,66 @@ mod tests {
         };
         assert_eq!(m2.text(), "");
         assert!(m2.media_items().is_empty());
+    }
+
+    #[test]
+    fn quoted_text_extracts_ref_msg() {
+        // 引用/回复：item.ref_msg 带 title 摘要 + message_item 原文本
+        let m = WeixinMessage {
+            item_list: vec![MessageItem {
+                item_type: 1,
+                text_item: Some(TextItem {
+                    text: "这是回复".into(),
+                }),
+                ref_msg: Some(RefMessage {
+                    title: "摘要".into(),
+                    message_item: Some(Box::new(MessageItem {
+                        item_type: 1,
+                        text_item: Some(TextItem {
+                            text: "被引用的原消息".into(),
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(m.text(), "这是回复");
+        assert_eq!(m.quoted_text(), "摘要 | 被引用的原消息");
+
+        // 无 ref_msg → 空
+        let plain = WeixinMessage {
+            item_list: vec![MessageItem {
+                item_type: 1,
+                text_item: Some(TextItem {
+                    text: "普通消息".into(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(plain.quoted_text(), "");
+    }
+
+    #[test]
+    fn quoted_text_parses_from_json() {
+        // 反序列化路径：真实 getupdates 的引用消息
+        let j = serde_json::json!({
+            "message_id": 123,
+            "message_type": 1,
+            "item_list": [{
+                "type": 1,
+                "text_item": {"text": "回复内容"},
+                "ref_msg": {
+                    "title": "摘要",
+                    "message_item": {"type": 1, "text_item": {"text": "原消息内容"}}
+                }
+            }]
+        });
+        let m: WeixinMessage = serde_json::from_value(j).unwrap();
+        assert_eq!(m.text(), "回复内容");
+        assert_eq!(m.quoted_text(), "摘要 | 原消息内容");
     }
 
     #[test]

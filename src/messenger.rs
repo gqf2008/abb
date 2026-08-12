@@ -22,6 +22,12 @@ pub trait Messenger: Send + Sync {
         self.send_text(chat_id, text).await
     }
 
+    /// 拉取一条历史消息的文本（引用/回复场景：被引用消息内容进 agent prompt）。
+    /// 飞书覆盖（走消息 API）；微信/钉钉的引用内容随入站事件直接携带，默认无操作。
+    async fn get_message_text(&self, _message_id: &str) -> Option<String> {
+        None
+    }
+
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
     async fn typing(&self, _message_id: &str) -> Option<String> {
         None
@@ -85,6 +91,15 @@ impl Messenger for FeishuMessenger {
     }
     async fn send_thread_reply(&self, _chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         self.fs.reply_text(message_id, text).await
+    }
+    async fn get_message_text(&self, message_id: &str) -> Option<String> {
+        match self.fs.get_message_text(message_id).await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                crate::log!("[feishu] 拉取引用消息失败 mid={}: {e:#}", message_id);
+                None
+            }
+        }
     }
     async fn download_attachment(
         &self,
