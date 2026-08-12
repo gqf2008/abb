@@ -1815,4 +1815,82 @@ mod tests {
         assert!(prompt.contains("回复内容"));
         cleanup_bridge(&bridge);
     }
+
+    #[tokio::test]
+    async fn on_payload_multi_image_post_downloads_all() {
+        // 多图：飞书 post 多图经 on_payload 主路径应全部下载进 [附件]（#5 一致性）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let content = serde_json::json!({
+            "title": "多图",
+            "content": [[{"tag":"img","image_key":"img_1"}],[{"tag":"img","image_key":"img_2"}],[{"tag":"img","image_key":"img_3"}]]
+        });
+        let payload = serde_json::json!({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_type":"user","sender_id":{"open_id":"ou_owner"}},
+                "message": {"message_id":"om_multi","chat_id":"oc_p2p","chat_type":"p2p","content": content.to_string()}
+            }
+        })
+        .to_string();
+        bridge.on_payload(payload.as_bytes()).await;
+        assert_eq!(
+            runner.prompts()[0].matches("本地路径=").count(),
+            3,
+            "多图应全部下载"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn handle_multi_attachment_and_multilink() {
+        // 多附件 + 多链接 + 引用多附件：handle 拼装各段多件正确性。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        let att = |kind: &str, name: &str, path: &str| crate::attachments::AttachmentMeta {
+            kind: kind.into(),
+            source: "mock".into(),
+            file_name: name.into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            path: path.into(),
+            sha256: "h".into(),
+            note: String::new(),
+        };
+        let mut ev = test_ev("m1", "oc_q", "看这个 https://a.com/x 和 https://b.com/y 如何");
+        ev.attachments = vec![
+            att("image", "a.png", "/tmp/a.png"),
+            att("file", "报告.pdf", "/tmp/r.pdf"),
+            att("video", "v.mp4", "/tmp/v.mp4"),
+        ];
+        ev.quoted = crate::messenger::QuotedContent {
+            text: "被引用".into(),
+            attachments: vec![
+                att("image", "q1.png", "/tmp/q1.png"),
+                att("file", "q2.zip", "/tmp/q2.zip"),
+            ],
+        };
+        bridge.handle(ev).await;
+        let p = &runner.prompts()[0];
+        assert_eq!(
+            p.matches("本地路径=").count(),
+            5,
+            "引用 2 + 主 3 = 5 个附件行"
+        );
+        assert!(p.contains("[引用附件]
+"));
+        assert!(p.contains("报告.pdf") && p.contains("v.mp4"));
+        assert!(p.contains("[链接]
+https://a.com/x
+https://b.com/y"));
+        cleanup_bridge(&bridge);
+    }
 }
