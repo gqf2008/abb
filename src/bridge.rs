@@ -50,9 +50,9 @@ pub struct Ev {
     pub chat_type: String,
     /// 飞书话题 ID（omt_ 开头）；空=非话题消息。微信/钉钉恒为空。
     pub thread_id: String,
-    /// 被引用消息的文本（引用/回复场景：用户引用上一条消息再 @ bot 时，
-    /// 把被引用内容带进 agent prompt）。空=无引用。
-    pub quoted: String,
+    /// 被引用消息的内容（引用/回复场景：用户引用上一条消息再 @ bot 时，
+    /// 把被引用文本 + 附件带进 agent prompt）。空=无引用。
+    pub quoted: crate::messenger::QuotedContent,
     pub text: String,
     /// 已下载到工作区的附件元数据（#12）。纯附件消息 text 为空但 attachments 非空。
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
@@ -308,7 +308,7 @@ impl Bridge {
             chat_type: chat_type.to_string(),
             // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
             thread_id: thread_id.to_string(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             text,
             attachments,
         };
@@ -323,19 +323,36 @@ impl Bridge {
         }
 
         // 引用/回复场景：parent_id 是被引用（回复）的消息 id。事件体不带被引用内容，
-        // 需按 id 拉取（飞书 API）；best-effort——拉取失败只记日志，不阻塞本条回复。
+        // 需按 id 拉取（飞书 API，文本 + 资源引用），再下载引用附件；best-effort——
+        // 拉取/下载失败只记日志，不阻塞本条回复。
         let parent_id = message["parent_id"].as_str().unwrap_or("");
         if !parent_id.is_empty() && parent_id != ev.mid {
-            match self.msgr.get_message_text(parent_id).await {
-                Some(t) if !t.trim().is_empty() => {
-                    ev.quoted = t.trim().to_string();
-                    crate::log!(
-                        "[bridge] 引用消息 parent={} 内容长度={}",
-                        trunc(parent_id, 12),
-                        ev.quoted.chars().count()
-                    );
+            match self.msgr.get_quoted_message(parent_id).await {
+                Some(q) => {
+                    let mut quoted = crate::messenger::QuotedContent {
+                        text: q.text.trim().to_string(),
+                        attachments: Vec::new(),
+                    };
+                    for (i, desc) in q.attachments.into_iter().enumerate() {
+                        if let Some(meta) = self
+                            .msgr
+                            .download_attachment(&self.bot.key(), &ev.mid, 100 + i, &desc)
+                            .await
+                        {
+                            quoted.attachments.push(meta);
+                        }
+                    }
+                    if !quoted.text.is_empty() || !quoted.attachments.is_empty() {
+                        ev.quoted = quoted;
+                        crate::log!(
+                            "[bridge] 引用消息 parent={} 文本长度={} 附件数={}",
+                            trunc(parent_id, 12),
+                            ev.quoted.text.chars().count(),
+                            ev.quoted.attachments.len()
+                        );
+                    }
                 }
-                _ => crate::log!(
+                None => crate::log!(
                     "[bridge] 拉取引用消息失败/无内容 parent={}",
                     trunc(parent_id, 12)
                 ),
@@ -445,11 +462,21 @@ impl Bridge {
         } else {
             Vec::new()
         };
-        // 引用/回复上下文：把被引用消息内容放在用户文本之前，agent 先读到「上面被引用的内容」。
+        // 引用/回复上下文：把被引用消息内容（文本 + 附件）放在用户文本之前，
+        // agent 先读到「上面被引用的内容」。附件行格式与普通附件一致（本地路径/mime/sha）。
         let mut prompt = String::new();
-        if !ev.quoted.is_empty() {
+        if !ev.quoted.text.is_empty() || !ev.quoted.attachments.is_empty() {
             prompt.push_str("[引用消息]\n");
-            prompt.push_str(&ev.quoted);
+            if !ev.quoted.text.is_empty() {
+                prompt.push_str(&ev.quoted.text);
+            }
+            if !ev.quoted.attachments.is_empty() {
+                prompt.push_str("[引用附件]");
+                for a in &ev.quoted.attachments {
+                    prompt.push('\n');
+                    prompt.push_str(&a.to_prompt_line());
+                }
+            }
             prompt.push_str("\n\n");
         }
         prompt.push_str(&text);
@@ -664,12 +691,27 @@ impl Bridge {
             crate::log!("[weixin] 丢弃：text 为空且无附件");
             return;
         }
+        // 引用/回复：ref_msg 里的被引用文本 + 媒体（图片/文件/音视频）下载成附件元数据。
+        let mut quoted = crate::messenger::QuotedContent {
+            text: msg.quoted_text(),
+            attachments: Vec::new(),
+        };
+        for (i, media) in msg.quoted_media().into_iter().enumerate() {
+            let desc = crate::attachments::AttachmentDesc::Wechat(media);
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &mid, 100 + i, &desc)
+                .await
+            {
+                quoted.attachments.push(meta);
+            }
+        }
         let ev = Ev {
             mid,
             chat_id: from,               // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
             thread_id: String::new(),    // 微信无话题
-            quoted: msg.quoted_text(),   // 引用/回复：ref_msg 里的被引用内容
+            quoted,
             text,
             attachments,
         };
@@ -728,6 +770,27 @@ impl Bridge {
         if is_group {
             text = strip_bot_mention(&text, &self.bot.bot_name);
         }
+        // 引用/回复：repliedMsg 里的被引用文本 + 附件（图片/文件/音视频）下载成附件元数据。
+        let mut quoted = crate::messenger::QuotedContent {
+            text: msg.quoted_text,
+            attachments: Vec::new(),
+        };
+        for (i, a) in msg.quoted_attachments.iter().enumerate() {
+            let desc = crate::attachments::AttachmentDesc::Dingtalk {
+                download_code: a.download_code.clone(),
+                robot_code: msg.robot_code.clone(),
+                kind: a.kind.clone(),
+                file_name: a.file_name.clone(),
+                voice_text: a.voice_text.clone(),
+            };
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &msg.mid, 100 + i, &desc)
+                .await
+            {
+                quoted.attachments.push(meta);
+            }
+        }
         let ev = Ev {
             mid: msg.mid,
             chat_id,
@@ -737,7 +800,7 @@ impl Bridge {
                 "dm".to_string()
             },
             thread_id: String::new(), // 钉钉无话题
-            quoted: msg.quoted_text,  // 引用/回复：repliedMsg 里的被引用内容
+            quoted,
             text,
             attachments,
         };
@@ -840,7 +903,7 @@ mod tests {
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
             thread_id: String::new(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
         };
@@ -855,7 +918,7 @@ mod tests {
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
             thread_id: thread.into(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
         };
@@ -899,11 +962,12 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    /// 收集 send_text 调用，供断言回复内容；get_message_text 用 map 按 message_id 返回
-    /// 被引用内容（飞书引用/回复场景测试用）。
+    /// 收集 send_text 调用，供断言回复内容；get_quoted_message 用 map 按 message_id 返回
+    /// 被引用内容（飞书引用/回复场景测试用）；download_attachment 直接返回占位元数据
+    /// （不落盘，测试与工作区解耦）。
     struct MockMessenger {
         sent: Mutex<Vec<String>>,
-        quoted: Mutex<std::collections::HashMap<String, String>>,
+        quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
     }
     impl MockMessenger {
         fn new() -> Self {
@@ -913,10 +977,19 @@ mod tests {
             }
         }
         fn set_quoted(&self, message_id: &str, text: &str) {
+            self.quoted.lock().unwrap().insert(
+                message_id.to_string(),
+                crate::messenger::QuotedMessage {
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                },
+            );
+        }
+        fn set_quoted_msg(&self, message_id: &str, q: crate::messenger::QuotedMessage) {
             self.quoted
                 .lock()
                 .unwrap()
-                .insert(message_id.to_string(), text.to_string());
+                .insert(message_id.to_string(), q);
         }
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
@@ -928,8 +1001,35 @@ mod tests {
             self.sent.lock().unwrap().push(text.to_string());
             Ok(())
         }
-        async fn get_message_text(&self, message_id: &str) -> Option<String> {
+        async fn get_quoted_message(&self, message_id: &str) -> Option<crate::messenger::QuotedMessage> {
             self.quoted.lock().unwrap().get(message_id).cloned()
+        }
+        async fn download_attachment(
+            &self,
+            _bot_key: &str,
+            _mid: &str,
+            _seq: usize,
+            desc: &crate::attachments::AttachmentDesc,
+        ) -> Option<crate::attachments::AttachmentMeta> {
+            let (kind, file_name) = match desc {
+                crate::attachments::AttachmentDesc::Feishu { kind, file_name, .. } => {
+                    (kind.clone(), file_name.clone())
+                }
+                crate::attachments::AttachmentDesc::Dingtalk { kind, file_name, .. } => {
+                    (kind.clone(), file_name.clone())
+                }
+                crate::attachments::AttachmentDesc::Wechat(m) => (m.kind.clone(), m.file_name.clone()),
+            };
+            Some(crate::attachments::AttachmentMeta {
+                kind,
+                source: "mock".into(),
+                file_name,
+                mime: "application/octet-stream".into(),
+                size: 1,
+                path: "/tmp/mock-attachment.bin".into(),
+                sha256: "abc".into(),
+                note: String::new(),
+            })
         }
     }
 
@@ -1000,7 +1100,7 @@ mod tests {
             chat_id: chat_id.into(),
             chat_type: "group".into(), // 非 p2p/dm：跳过 save_primary_chat 写盘
             thread_id: String::new(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             text: text.into(),
             attachments: Vec::new(),
         }
@@ -1233,7 +1333,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "第一条".into(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             created_at: 10,
         });
@@ -1243,7 +1343,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "第二条".into(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             created_at: 20,
         });
@@ -1489,7 +1589,10 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let (bridge, _msgr) = build_test_bridge(runner.clone());
         let mut ev = test_ev("m1", "oc_q", "回复内容");
-        ev.quoted = "被引用的原消息".to_string();
+        ev.quoted = crate::messenger::QuotedContent {
+            text: "被引用的原消息".to_string(),
+            attachments: Vec::new(),
+        };
         bridge.handle(ev).await;
         assert_eq!(
             runner.prompts(),
@@ -1561,6 +1664,7 @@ mod tests {
             mentioned: false,
             robot_code: "r".into(),
             quoted_text: "被引用的原消息".into(),
+            quoted_attachments: Vec::new(),
             attachments: Vec::new(),
         };
         bridge.on_dingtalk(msg).await;
@@ -1569,6 +1673,144 @@ mod tests {
             runner.prompts(),
             ["[引用消息]\n被引用的原消息\n\n回复内容"]
         );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_fetches_quoted_attachment() {
+        // 飞书引用附件：get_quoted_message 返回资源 desc → 下载成元数据 → [引用附件] 进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        msgr.set_quoted_msg(
+            "om_parent",
+            crate::messenger::QuotedMessage {
+                text: "引用的文字".into(),
+                attachments: vec![crate::attachments::AttachmentDesc::Feishu {
+                    message_id: "om_parent".into(),
+                    file_key: "img_1".into(),
+                    kind: "image".into(),
+                    file_name: "截图.png".into(),
+                }],
+            },
+        );
+
+        let payload = feishu_payload(
+            "om_reply",
+            "oc_p2p",
+            "p2p",
+            "",
+            "om_parent",
+            "user",
+            "ou_owner",
+            &[],
+            "回复内容",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        let prompt = &runner.prompts()[0];
+        assert!(prompt.contains("[引用消息]"), "应有引用消息段");
+        assert!(prompt.contains("引用的文字"));
+        assert!(prompt.contains("[引用附件]"), "应有引用附件段");
+        assert!(prompt.contains("截图.png"), "附件元数据应带文件名");
+        assert!(prompt.contains("本地路径=/tmp/mock-attachment.bin"));
+        assert!(prompt.contains("回复内容"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_weixin_quoted_media_in_prompt() {
+        // 微信引用图片：ref_msg.message_item 媒体 → 下载 → [引用附件] 进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "wechat".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::wechat::WeixinMessage {
+            from_user_id: "u1".into(),
+            message_type: 1,
+            message_id: "7491".into(),
+            item_list: vec![crate::wechat::MessageItem {
+                item_type: 1,
+                text_item: Some(crate::wechat::TextItem {
+                    text: "回复内容".into(),
+                }),
+                ref_msg: Some(crate::wechat::RefMessage {
+                    title: "摘要".into(),
+                    message_item: Some(Box::new(crate::wechat::MessageItem {
+                        item_type: 2,
+                        image_item: Some(crate::wechat::ImageItem {
+                            media: Some(crate::wechat::CDNMedia {
+                                encrypt_query_param: "enc".into(),
+                                aes_key: "a2V5".into(),
+                                full_url: String::new(),
+                                ..Default::default()
+                            }),
+                            aeskey: "00112233445566778899aabbccddeeff".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        bridge.on_weixin(msg).await;
+
+        let prompt = &runner.prompts()[0];
+        assert!(prompt.contains("[引用消息]"));
+        assert!(prompt.contains("[引用附件]"));
+        assert!(prompt.contains("image"));
+        assert!(prompt.contains("回复内容"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_dingtalk_quoted_attachment_in_prompt() {
+        // 钉钉引用图片：repliedMsg 附件 → 下载 → [引用附件] 进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "dingtalk".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::dingtalk::DingtalkMessage {
+            mid: "msg1".into(),
+            sender_staff_id: "u1".into(),
+            conversation_id: "u1".into(),
+            conversation_type: "1".into(),
+            text: "回复内容".into(),
+            mentioned: false,
+            robot_code: "r".into(),
+            quoted_text: String::new(),
+            quoted_attachments: vec![crate::dingtalk::DingtalkAttachment {
+                kind: "image".into(),
+                download_code: "dc_pic".into(),
+                file_name: String::new(),
+                voice_text: String::new(),
+            }],
+            attachments: Vec::new(),
+        };
+        bridge.on_dingtalk(msg).await;
+
+        let prompt = &runner.prompts()[0];
+        assert!(prompt.contains("[引用消息]"));
+        assert!(prompt.contains("[引用附件]"));
+        assert!(prompt.contains("image"));
+        assert!(prompt.contains("回复内容"));
         cleanup_bridge(&bridge);
     }
 }

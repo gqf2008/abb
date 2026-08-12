@@ -26,9 +26,9 @@ pub struct PendingItem {
     pub thread_id: String,
     /// 已剥 @提及 的文本（重放时 `handle` 再剥一次是幂等安全的）。
     pub text: String,
-    /// 被引用消息的文本（引用/回复场景；空=无引用）。serde default 兼容旧 pending.json。
+    /// 被引用消息的内容（文本 + 已下载附件；引用/回复场景）。serde default 兼容旧 pending.json。
     #[serde(default)]
-    pub quoted: String,
+    pub quoted: crate::messenger::QuotedContent,
     pub attachments: Vec<AttachmentMeta>,
     /// 入队时间（unix 秒），启动重放按此排序保持原先后顺序。
     pub created_at: u64,
@@ -112,7 +112,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "hi".into(),
-            quoted: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             created_at: at,
         }
@@ -177,7 +177,11 @@ mod tests {
         let store = PendingStore::at(p.clone());
         assert_eq!(store.len(), 1);
         assert_eq!(store.snapshot()[0].mid, "m1");
-        assert_eq!(store.snapshot()[0].quoted, "", "旧文件缺 quoted 应默认空");
+        assert!(
+            store.snapshot()[0].quoted.text.is_empty()
+                && store.snapshot()[0].quoted.attachments.is_empty(),
+            "旧文件缺 quoted 应默认空"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

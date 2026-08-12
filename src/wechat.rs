@@ -357,6 +357,18 @@ impl WeixinMessage {
         self.item_list.iter().filter_map(|it| it.media()).collect()
     }
 
+    /// 提取被引用消息的媒体附件（图片/文件/音视频；引用/回复场景）。
+    /// ref_msg.message_item 与入站 item 同构，复用 media() 提取 CDN 引用，
+    /// 由桥下载成附件元数据进 prompt。
+    pub fn quoted_media(&self) -> Vec<WechatMedia> {
+        self.item_list
+            .iter()
+            .filter_map(|it| it.ref_msg.as_ref())
+            .filter_map(|r| r.message_item.as_ref())
+            .filter_map(|mi| mi.media())
+            .collect()
+    }
+
     /// 提取被引用消息的文本（引用/回复场景）。协议里 ref_msg 带 title 摘要 +
     /// message_item 原内容（原内容可为文本/媒体/再嵌套引用）；这里拼成
     /// `摘要 | 原文本`，供 agent 读到「上面被引用的消息内容」。
@@ -941,6 +953,55 @@ mod tests {
         let m: WeixinMessage = serde_json::from_value(j).unwrap();
         assert_eq!(m.text(), "回复内容");
         assert_eq!(m.quoted_text(), "摘要 | 原消息内容");
+    }
+
+    #[test]
+    fn quoted_media_extracts_ref_msg_media() {
+        // 引用/回复：ref_msg.message_item 里的图片/文件等媒体也要提取（下载进 prompt）
+        let m = WeixinMessage {
+            item_list: vec![MessageItem {
+                item_type: 1,
+                text_item: Some(TextItem {
+                    text: "回复内容".into(),
+                }),
+                ref_msg: Some(RefMessage {
+                    title: "摘要".into(),
+                    message_item: Some(Box::new(MessageItem {
+                        item_type: 2,
+                        image_item: Some(ImageItem {
+                            media: Some(CDNMedia {
+                                encrypt_query_param: "enc".into(),
+                                aes_key: "a2V5".into(),
+                                full_url: String::new(),
+                                ..Default::default()
+                            }),
+                            aeskey: "00112233445566778899aabbccddeeff".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let media = m.quoted_media();
+        assert_eq!(media.len(), 1, "引用图片应提取出媒体引用");
+        assert_eq!(media[0].kind, "image");
+        assert_eq!(media[0].aeskey_hex, "00112233445566778899aabbccddeeff");
+
+        // 无引用媒体 → 空
+        let plain = WeixinMessage {
+            item_list: vec![MessageItem {
+                item_type: 1,
+                text_item: Some(TextItem {
+                    text: "普通".into(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(plain.quoted_media().is_empty());
     }
 
     #[test]

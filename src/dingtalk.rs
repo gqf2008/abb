@@ -325,6 +325,8 @@ pub struct DingtalkMessage {
     /// 被引用消息的文本（引用/回复场景：`text.isReplyMsg` + `text.repliedMsg.content.text`；
     /// 非文本引用或未引用为空）。
     pub quoted_text: String,
+    /// 被引用消息的附件引用（图片/文件/音视频；来自 repliedMsg.content，下载由桥负责）。
+    pub quoted_attachments: Vec<DingtalkAttachment>,
     /// 附件引用列表（富文本可能多张图；文本消息为空）。
     pub attachments: Vec<DingtalkAttachment>,
 }
@@ -349,6 +351,118 @@ impl DingtalkMessage {
     }
 }
 
+/// 解析引用/回复内容（`text.isReplyMsg` + `text.repliedMsg`）：
+/// 返回 (被引用文本, 被引用附件引用)。非文本引用（图片/文件/音视频/富文本图片）
+/// 也提取 downloadCode，由桥下载成附件元数据进 prompt。
+fn parse_quoted_reply(p: &Value) -> (String, Vec<DingtalkAttachment>) {
+    if !p["text"]["isReplyMsg"].as_bool().unwrap_or(false) {
+        return (String::new(), Vec::new());
+    }
+    let replied = &p["text"]["repliedMsg"];
+    let content = &replied["content"];
+    let qtype = replied["msgType"].as_str().unwrap_or("");
+    let mut text = content["text"].as_str().unwrap_or("").trim().to_string();
+    let mut atts: Vec<DingtalkAttachment> = Vec::new();
+    let push = |atts: &mut Vec<DingtalkAttachment>,
+                kind: &str,
+                dc: &str,
+                file_name: String,
+                voice_text: String| {
+        if !dc.is_empty() {
+            atts.push(DingtalkAttachment {
+                kind: kind.into(),
+                download_code: dc.into(),
+                file_name,
+                voice_text,
+            });
+        }
+    };
+    match qtype {
+        "text" => {}
+        "picture" => {
+            push(
+                &mut atts,
+                "image",
+                content["downloadCode"].as_str().unwrap_or(""),
+                String::new(),
+                String::new(),
+            );
+        }
+        "file" => {
+            push(
+                &mut atts,
+                "file",
+                content["downloadCode"].as_str().unwrap_or(""),
+                content["fileName"].as_str().unwrap_or("").to_string(),
+                String::new(),
+            );
+        }
+        "audio" | "voice" => {
+            push(
+                &mut atts,
+                "audio",
+                content["downloadCode"].as_str().unwrap_or(""),
+                format!(
+                    "voice.{}",
+                    content["fileExtension"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("amr")
+                ),
+                String::new(),
+            );
+        }
+        "video" => {
+            push(
+                &mut atts,
+                "video",
+                content["downloadCode"].as_str().unwrap_or(""),
+                content["fileName"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("video.mp4")
+                    .to_string(),
+                String::new(),
+            );
+        }
+        "richText" => {
+            // 富文本引用：text 段落拼进 quoted_text，picture downloadCode 进附件列表
+            let list: Vec<Value> = match content.get("richText") {
+                Some(Value::Array(a)) => a.clone(),
+                Some(Value::String(sv)) => serde_json::from_str(sv).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for c in list {
+                match c.get("type").and_then(|x| x.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = c["text"].as_str() {
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    Some("picture") => {
+                        push(
+                            &mut atts,
+                            "image",
+                            c["downloadCode"].as_str().unwrap_or(""),
+                            String::new(),
+                            String::new(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    (text, atts)
+}
+
 /// 解析一条 CALLBACK 帧 → 钉钉消息。缺关键字段返回 None（外层照常 ack）。
 /// 支持文本/图片/文件/语音/视频/富文本；纯附件消息 text 为空但带 attachments。
 fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
@@ -364,29 +478,23 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
         .or_else(|| p["senderId"].as_str())?
         .to_string();
     // 引用/回复场景：钉钉文本消息带 isReplyMsg + repliedMsg（被引用消息内容）。
-    // 只取文本引用；图片/文件等非文本引用无 text，返回空（agent 仍能看到本条回复）。
-    let quoted_text = if p["text"]["isReplyMsg"].as_bool().unwrap_or(false) {
-        p["text"]["repliedMsg"]["content"]["text"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    } else {
-        String::new()
-    };
+    let (quoted_text, quoted_attachments) = parse_quoted_reply(&p);
 
-    let base =
-        |text: String, quoted_text: String, attachments: Vec<DingtalkAttachment>| DingtalkMessage {
-            mid: mid.clone(),
-            sender_staff_id: sender.clone(),
-            conversation_id: p["conversationId"].as_str().unwrap_or("").to_string(),
-            conversation_type: p["conversationType"].as_str().unwrap_or("").to_string(),
-            text,
-            mentioned: p["isInAtList"].as_bool().unwrap_or(false),
-            robot_code: p["robotCode"].as_str().unwrap_or("").to_string(),
-            quoted_text,
-            attachments,
-        };
+    let base = |text: String,
+                quoted_text: String,
+                quoted_attachments: Vec<DingtalkAttachment>,
+                attachments: Vec<DingtalkAttachment>| DingtalkMessage {
+        mid: mid.clone(),
+        sender_staff_id: sender.clone(),
+        conversation_id: p["conversationId"].as_str().unwrap_or("").to_string(),
+        conversation_type: p["conversationType"].as_str().unwrap_or("").to_string(),
+        text,
+        mentioned: p["isInAtList"].as_bool().unwrap_or(false),
+        robot_code: p["robotCode"].as_str().unwrap_or("").to_string(),
+        quoted_text,
+        quoted_attachments,
+        attachments,
+    };
 
     match msgtype {
         "text" => {
@@ -394,7 +502,12 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             if text.is_empty() {
                 return None;
             }
-            Some(base(text, quoted_text, Vec::new()))
+            Some(base(
+                text,
+                quoted_text,
+                quoted_attachments.clone(),
+                Vec::new(),
+            ))
         }
         "picture" => {
             let dc = p["content"]["downloadCode"].as_str()?.to_string();
@@ -403,7 +516,8 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             }
             Some(base(
                 String::new(),
-                String::new(),
+                quoted_text,
+                quoted_attachments.clone(),
                 vec![DingtalkAttachment {
                     kind: "image".into(),
                     download_code: dc,
@@ -420,7 +534,8 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             }
             Some(base(
                 String::new(),
-                String::new(),
+                quoted_text,
+                quoted_attachments.clone(),
                 vec![DingtalkAttachment {
                     kind: "file".into(),
                     download_code: dc,
@@ -441,7 +556,8 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             }
             Some(base(
                 String::new(),
-                String::new(),
+                quoted_text,
+                quoted_attachments.clone(),
                 vec![DingtalkAttachment {
                     kind: "audio".into(),
                     download_code: dc,
@@ -465,7 +581,8 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             }
             Some(base(
                 String::new(),
-                String::new(),
+                quoted_text,
+                quoted_attachments.clone(),
                 vec![DingtalkAttachment {
                     kind: "video".into(),
                     download_code: dc,
@@ -504,9 +621,12 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
             if text.is_empty() && attachments.is_empty() {
                 return None;
             }
-            // 富文本引用：repliedMsg 结构复杂，文本引用内容可能散在 richText 里；
-            // 保持简单——只把顶层 text 里的引用文本带上（非文本引用留空）。
-            Some(base(text, quoted_text, attachments))
+            Some(base(
+                text,
+                quoted_text,
+                quoted_attachments.clone(),
+                attachments,
+            ))
         }
         _ => None,
     }
@@ -749,6 +869,34 @@ mod tests {
         });
         let m2 = parse_message(&plain).expect("应解析出消息");
         assert_eq!(m2.quoted_text, "");
+    }
+
+    #[test]
+    fn parse_quote_reply_attachments() {
+        // 引用图片：repliedMsg.content.downloadCode → quoted_attachments
+        let frame = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
+            "data": r#"{"conversationId":"cid1","conversationType":"1","msgId":"msg1","senderStaffId":"u123","isInAtList":false,"text":{"content":"这是回复","isReplyMsg":true,"repliedMsg":{"msgType":"picture","content":{"downloadCode":"dc_pic"},"msgId":"msg0"}},"msgtype":"text"}"#
+        });
+        let m = parse_message(&frame).expect("应解析出消息");
+        assert_eq!(m.text, "这是回复");
+        assert_eq!(m.quoted_text, "");
+        assert_eq!(m.quoted_attachments.len(), 1);
+        assert_eq!(m.quoted_attachments[0].kind, "image");
+        assert_eq!(m.quoted_attachments[0].download_code, "dc_pic");
+
+        // 引用富文本（含文本 + 图片）：文本进 quoted_text，图片进 quoted_attachments
+        let frame2 = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m2"},
+            "data": r#"{"conversationId":"cid1","conversationType":"1","msgId":"msg2","senderStaffId":"u123","isInAtList":false,"text":{"content":"回复2","isReplyMsg":true,"repliedMsg":{"msgType":"richText","content":{"richText":[{"type":"text","text":"引用正文"},{"type":"picture","downloadCode":"dc_rich"}]},"msgId":"msg0"}},"msgtype":"text"}"#
+        });
+        let m2 = parse_message(&frame2).expect("应解析出消息");
+        assert_eq!(m2.quoted_text, "引用正文");
+        assert_eq!(m2.quoted_attachments.len(), 1);
+        assert_eq!(m2.quoted_attachments[0].kind, "image");
+        assert_eq!(m2.quoted_attachments[0].download_code, "dc_rich");
     }
 
     #[test]
