@@ -518,7 +518,11 @@ class Bridge:
         self._busy_lock = threading.Lock()
 
     def should_respond(self, ev: dict) -> bool:
-        if ev.get("sender_type") == "bot":
+        # 飞书事件里应用/bot 发的消息 sender_type 是 "app"（不是 "bot"），用户消息才是 "user"；
+        # 只判 "bot" 会把应用消息当用户输入透传（自回声死循环）。再按 open_id 双保险拦自己。
+        if ev.get("sender_type") in ("app", "bot"):
+            return False
+        if CFG.bot_open_id and ev.get("sender_id") == CFG.bot_open_id:
             return False
         if ev.get("sender_id") != CFG.owner_open_id:
             return False

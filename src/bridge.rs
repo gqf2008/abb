@@ -202,12 +202,28 @@ impl Bridge {
         let sender = &event["sender"];
         let message = &event["message"];
 
-        // 忽略机器人自己发的（防自我回复死循环）
-        if sender["sender_type"].as_str() == Some("bot") {
+        let sender_id = sender["sender_id"]["open_id"].as_str().unwrap_or("");
+        let sender_type = sender["sender_type"].as_str().unwrap_or("");
+
+        // 忽略机器人/应用发的消息（防自我回复死循环）：
+        // 飞书事件里应用（含本 bot）发的消息 sender_type="app"（不是 "bot"），用户消息才是 "user"；
+        // 只判 "bot" 会把 app 消息当用户输入透传——bot 自己的回复 echo 回来会再触发一轮 agent
+        // （自说自话），owner 未配置时还会把 app open_id 误设为 owner 导致真用户被忽略。
+        // 双保险：sender open_id 与本 bot 相同也一律丢弃（即使 sender_type 缺失/变化，见
+        // openclaw #90559/#90572 同类自回声问题）。
+        let is_self = !self.bot.bot_open_id.is_empty() && sender_id == self.bot.bot_open_id;
+        if matches!(sender_type, "app" | "bot") || is_self {
+            crate::log!(
+                "[bridge] 忽略应用/bot 消息（bot={} sender_type={:?} sender={} is_self={}）",
+                self.bot.key(),
+                sender_type,
+                trunc(sender_id, 12),
+                is_self
+            );
             return;
         }
-        let sender_id = sender["sender_id"]["open_id"].as_str().unwrap_or("");
         let chat_type = message["chat_type"].as_str().unwrap_or("");
+        let thread_id = message["thread_id"].as_str().unwrap_or("");
         let mentions: Vec<serde_json::Value> =
             message["mentions"].as_array().cloned().unwrap_or_default();
 
@@ -247,7 +263,10 @@ impl Bridge {
                 return;
             }
         }
-        if chat_type == "group" && !self.bot_is_mentioned(&mentions) {
+        // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
+        // 话题（thread）内用户回复机器人的消息不需要再次 @——这是「用户回复」的主流交互；
+        // 顶层群消息仍要求 @（避免整个群的消息都进 agent）。
+        if chat_type == "group" && thread_id.is_empty() && !self.bot_is_mentioned(&mentions) {
             crate::log!(
                 "[bridge] 群聊未 @ 机器人，忽略（bot={} chat={} sender={}）",
                 self.bot.key(),
@@ -285,7 +304,7 @@ impl Bridge {
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
             // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
-            thread_id: message["thread_id"].as_str().unwrap_or("").to_string(),
+            thread_id: thread_id.to_string(),
             text,
             attachments,
         };
@@ -940,13 +959,57 @@ mod tests {
     /// 构造带唯一 bot key 的 Bridge（隔离 ~/.agent-bridge/workspaces/<key>/），返回 bridge +
     /// messenger 供断言。调用方负责 `cleanup_bridge(&bridge)`。
     fn build_test_bridge(runner: Arc<dyn AgentRunner>) -> (Arc<Bridge>, Arc<MockMessenger>) {
-        let msgr = Arc::new(MockMessenger::new());
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
             ..Default::default()
         };
+        build_test_bridge_with_bot(runner, bot)
+    }
+
+    /// 构造带指定 BotConfig 的 Bridge（飞书 on_payload 测试需要 bot_name/bot_open_id/owner）。
+    fn build_test_bridge_with_bot(
+        runner: Arc<dyn AgentRunner>,
+        bot: BotConfig,
+    ) -> (Arc<Bridge>, Arc<MockMessenger>) {
+        let msgr = Arc::new(MockMessenger::new());
         let bridge = Arc::new(Bridge::build(msgr.clone(), bot, &Config::default(), runner));
         (bridge, msgr)
+    }
+
+    /// 构造飞书 receive_v1 事件 payload（content 按官方格式传 JSON 字符串）。
+    /// 测试 helper，参数多是构造 JSON 字段所需；与 MockAgentRunner::run 同类允许。
+    #[allow(clippy::too_many_arguments)]
+    fn feishu_payload(
+        mid: &str,
+        chat_id: &str,
+        chat_type: &str,
+        thread_id: &str,
+        sender_type: &str,
+        sender_id: &str,
+        mentions: &[(&str, &str)], // (name, open_id)
+        text: &str,
+    ) -> String {
+        let content = serde_json::json!({"text": text});
+        serde_json::json!({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {
+                    "sender_type": sender_type,
+                    "sender_id": {"open_id": sender_id}
+                },
+                "message": {
+                    "message_id": mid,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type,
+                    "thread_id": thread_id,
+                    "content": content.to_string(),
+                    "mentions": mentions.iter().map(|(name, open_id)| {
+                        serde_json::json!({"name": name, "id": {"open_id": open_id}})
+                    }).collect::<Vec<_>>()
+                }
+            }
+        })
+        .to_string()
     }
 
     fn cleanup_bridge(bridge: &Bridge) {
@@ -1154,6 +1217,171 @@ mod tests {
         bridge.recover_pending().await;
         assert!(runner.prompts().is_empty(), "无残留不应触发 agent");
         assert!(!msgr.sent().iter().any(|t| t.contains("正在恢复")));
+        cleanup_bridge(&bridge);
+    }
+
+    // ---- on_payload 过滤（飞书 receive_v1）----
+
+    #[tokio::test]
+    async fn on_payload_ignores_app_and_bot_senders() {
+        // 飞书事件里应用/bot 发的消息 sender_type 是 "app"/"bot"，不是用户——必须丢弃，
+        // 否则 bot 自己的回复 echo 会被当用户输入再跑一轮 agent（自说自话死循环）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        for sender_type in ["app", "bot"] {
+            let payload = feishu_payload(
+                &format!("om_app_{sender_type}"),
+                "oc_p2p",
+                "p2p",
+                "",
+                sender_type,
+                "ou_app",
+                &[],
+                "你好",
+            );
+            bridge.on_payload(payload.as_bytes()).await;
+        }
+
+        assert!(runner.prompts().is_empty(), "应用/bot 消息不应触发 agent");
+        assert!(msgr.sent().is_empty(), "应用/bot 消息不应有回复");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_ignores_self_open_id() {
+        // 双保险：即使 sender_type 不是 app/bot（缺失或变化），sender open_id 等于
+        // 本 bot 的 open_id 也一律丢弃（openclaw #90559/#90572 同类自回声问题）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_self",
+            "oc_p2p",
+            "p2p",
+            "",
+            "user", // 防御：sender_type 意外是 user 也要靠 open_id 拦住
+            "ou_bot",
+            &[],
+            "你好",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert!(runner.prompts().is_empty(), "自回声不应触发 agent");
+        assert!(msgr.sent().is_empty());
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_group_thread_reply_without_mention_is_handled() {
+        // 用户回复机器人的话题消息不需要再次 @：thread_id 非空时跳过群聊 @ 校验
+        // （顶层群消息仍要求 @，见下个测试）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_thread",
+            "oc_group",
+            "group",
+            "omt_abc",
+            "user",
+            "ou_owner",
+            &[], // 话题内回复不 @ 也能收到事件
+            "回复一下",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert_eq!(runner.prompts(), ["回复一下"], "话题内回复应进 agent");
+        assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_group_top_level_without_mention_is_ignored() {
+        // 顶层群消息不 @ 机器人仍忽略（老行为不变）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_top",
+            "oc_group",
+            "group",
+            "",
+            "user",
+            "ou_owner",
+            &[],
+            "在吗",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert!(
+            runner.prompts().is_empty(),
+            "未 @ 的顶层群消息不应触发 agent"
+        );
+        assert!(msgr.sent().is_empty());
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_p2p_user_message_is_handled() {
+        // 对照组：owner 私聊消息正常进 agent（on_payload 不应误伤用户消息）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_p2p",
+            "oc_p2p",
+            "p2p",
+            "",
+            "user",
+            "ou_owner",
+            &[],
+            "在吗",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert_eq!(runner.prompts(), ["在吗"], "owner 私聊消息应进 agent");
+        assert!(msgr.sent().iter().any(|t| t == "done"));
         cleanup_bridge(&bridge);
     }
 }
