@@ -19,11 +19,11 @@ pub struct FeishuResource {
     pub file_name: String,
 }
 
-/// 解析后的飞书消息内容：文本 + 可选资源。
+/// 解析后的飞书消息内容：文本 + 资源列表（含富文本里全部图片/资源）。
 #[derive(Debug, Clone, Default)]
 pub struct FeishuParsed {
     pub text: String,
-    pub resource: Option<FeishuResource>,
+    pub resources: Vec<FeishuResource>,
 }
 
 /// 从消息 content（JSON 字符串）解析文本与资源引用。
@@ -39,18 +39,18 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
     if let Some(r) = resource_from_content(&v) {
         return FeishuParsed {
             text: String::new(),
-            resource: Some(r),
+            resources: vec![r],
         };
     }
     if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
         return FeishuParsed {
             text: t.to_string(),
-            resource: None,
+            resources: Vec::new(),
         };
     }
     // post 富文本
     let mut text = String::new();
-    let mut img_key = String::new();
+    let mut imgs: Vec<FeishuResource> = Vec::new();
     if let Some(title) = v.get("title").and_then(|x| x.as_str()) {
         if !title.is_empty() {
             text.push_str(title);
@@ -78,12 +78,16 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
                             }
                         }
                     }
-                    Some("img") if img_key.is_empty() => {
-                        img_key = c
-                            .get("image_key")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                    Some("img") => {
+                        if let Some(k) = c.get("image_key").and_then(|x| x.as_str()) {
+                            if !k.is_empty() {
+                                imgs.push(FeishuResource {
+                                    kind: "image".into(),
+                                    file_key: k.to_string(),
+                                    file_name: String::new(),
+                                });
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -91,18 +95,9 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
             text.push('\n');
         }
     }
-    let resource = if img_key.is_empty() {
-        None
-    } else {
-        Some(FeishuResource {
-            kind: "image".into(),
-            file_key: img_key,
-            file_name: String::new(),
-        })
-    };
     FeishuParsed {
         text: text.trim().to_string(),
-        resource,
+        resources: imgs,
     }
 }
 
@@ -265,6 +260,34 @@ impl FeishuClient {
             }
         }
         Ok(())
+    }
+
+    /// 拉取一条历史消息的全文与资源（引用/回复场景：用户回复时 @ bot，bot 需要读到
+    /// 被引用消息的文本 + 图片/文件/音视频）。GET /im/v1/messages/:message_id 返回
+    /// `data.items[0]`，`body.content` 是 JSON 字符串（text/post/…），复用 parse_content
+    /// 抽取纯文本与全部资源引用。失败返回 Err（调用方 best-effort：拿不到不阻塞回复）。
+    pub async fn get_quoted_message(&self, message_id: &str) -> Result<FeishuParsed> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .get(format!("{API_BASE}/im/v1/messages/{message_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "拉取消息失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        // serde_json 对越界/缺失索引返回 Null（不 panic）：items 为空 / data 缺失 /
+        // items 非数组时 item=Null → raw="" → parse_content 返回空 → 桥按「无引用内容」跳过。
+        let item = &resp["data"]["items"][0];
+        let raw = item["body"]["content"].as_str().unwrap_or("");
+        Ok(parse_content(raw))
     }
 
     /// 下载消息内资源（图片/文件/音视频，≤100MB）。返回 (字节, Content-Type)。
@@ -453,14 +476,14 @@ mod tests {
     fn parse_content_text() {
         let p = parse_content(r#"{"text":"你好"}"#);
         assert_eq!(p.text, "你好");
-        assert!(p.resource.is_none());
+        assert!(p.resources.is_empty());
     }
 
     #[test]
     fn parse_content_image() {
         let p = parse_content(r#"{"image_key":"img_abc"}"#);
         assert_eq!(p.text, "");
-        let r = p.resource.expect("应解析出图片资源");
+        let r = p.resources.first().expect("应解析出图片资源");
         assert_eq!(r.kind, "image");
         assert_eq!(r.file_key, "img_abc");
     }
@@ -468,7 +491,7 @@ mod tests {
     #[test]
     fn parse_content_file() {
         let p = parse_content(r#"{"file_key":"file_1","file_name":"报告.pdf"}"#);
-        let r = p.resource.unwrap();
+        let r = p.resources.first().unwrap();
         assert_eq!(r.kind, "file");
         assert_eq!(r.file_key, "file_1");
         assert_eq!(r.file_name, "报告.pdf");
@@ -477,9 +500,25 @@ mod tests {
     #[test]
     fn parse_content_audio_video_kind() {
         let a = parse_content(r#"{"file_key":"f1","file_name":"a.amr","type":"audio"}"#);
-        assert_eq!(a.resource.unwrap().kind, "audio");
+        assert_eq!(a.resources.first().unwrap().kind, "audio");
         let v = parse_content(r#"{"file_key":"f2","file_name":"b.mp4","type":"media"}"#);
-        assert_eq!(v.resource.unwrap().kind, "video");
+        assert_eq!(v.resources.first().unwrap().kind, "video");
+    }
+
+    #[test]
+    fn parse_content_post_multiple_images() {
+        // 富文本多图：resources 收集全部（引用/回复场景要全部下载），resource 兼容第一张
+        let p = parse_content(
+            r#"{"title":"多图","content":[[{"tag":"img","image_key":"img_1"}],[{"tag":"img","image_key":"img_2"}]]}"#,
+        );
+        assert_eq!(p.resources.len(), 2, "富文本多图应全部收集");
+        assert_eq!(p.resources[0].file_key, "img_1");
+        assert_eq!(p.resources[1].file_key, "img_2");
+        assert_eq!(
+            p.resources.first().unwrap().file_key,
+            "img_1",
+            "第一张图仍在最前"
+        );
     }
 
     #[test]
@@ -490,7 +529,7 @@ mod tests {
         assert!(p.text.contains("标题"));
         assert!(p.text.contains("你好"));
         assert!(p.text.contains("https://example.com"));
-        let r = p.resource.expect("富文本图片应解析为资源");
+        let r = p.resources.first().expect("富文本图片应解析为资源");
         assert_eq!(r.kind, "image");
         assert_eq!(r.file_key, "img_pic");
     }
@@ -499,6 +538,6 @@ mod tests {
     fn parse_content_empty_on_garbage() {
         let p = parse_content("not json");
         assert_eq!(p.text, "");
-        assert!(p.resource.is_none());
+        assert!(p.resources.is_empty());
     }
 }

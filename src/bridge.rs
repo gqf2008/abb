@@ -50,6 +50,9 @@ pub struct Ev {
     pub chat_type: String,
     /// 飞书话题 ID（omt_ 开头）；空=非话题消息。微信/钉钉恒为空。
     pub thread_id: String,
+    /// 被引用消息的内容（引用/回复场景：用户引用上一条消息再 @ bot 时，
+    /// 把被引用文本 + 附件带进 agent prompt）。空=无引用。
+    pub quoted: crate::messenger::QuotedContent,
     pub text: String,
     /// 已下载到工作区的附件元数据（#12）。纯附件消息 text 为空但 attachments 非空。
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
@@ -202,12 +205,28 @@ impl Bridge {
         let sender = &event["sender"];
         let message = &event["message"];
 
-        // 忽略机器人自己发的（防自我回复死循环）
-        if sender["sender_type"].as_str() == Some("bot") {
+        let sender_id = sender["sender_id"]["open_id"].as_str().unwrap_or("");
+        let sender_type = sender["sender_type"].as_str().unwrap_or("");
+
+        // 忽略机器人/应用发的消息（防自我回复死循环）：
+        // 飞书事件里应用（含本 bot）发的消息 sender_type="app"（不是 "bot"），用户消息才是 "user"；
+        // 只判 "bot" 会把 app 消息当用户输入透传——bot 自己的回复 echo 回来会再触发一轮 agent
+        // （自说自话），owner 未配置时还会把 app open_id 误设为 owner 导致真用户被忽略。
+        // 双保险：sender open_id 与本 bot 相同也一律丢弃（即使 sender_type 缺失/变化，见
+        // openclaw #90559/#90572 同类自回声问题）。
+        let is_self = !self.bot.bot_open_id.is_empty() && sender_id == self.bot.bot_open_id;
+        if matches!(sender_type, "app" | "bot") || is_self {
+            crate::log!(
+                "[bridge] 忽略应用/bot 消息（bot={} sender_type={:?} sender={} is_self={}）",
+                self.bot.key(),
+                sender_type,
+                trunc(sender_id, 12),
+                is_self
+            );
             return;
         }
-        let sender_id = sender["sender_id"]["open_id"].as_str().unwrap_or("");
         let chat_type = message["chat_type"].as_str().unwrap_or("");
+        let thread_id = message["thread_id"].as_str().unwrap_or("");
         let mentions: Vec<serde_json::Value> =
             message["mentions"].as_array().cloned().unwrap_or_default();
 
@@ -247,7 +266,10 @@ impl Bridge {
                 return;
             }
         }
-        if chat_type == "group" && !self.bot_is_mentioned(&mentions) {
+        // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
+        // 话题（thread）内用户回复机器人的消息不需要再次 @——这是「用户回复」的主流交互；
+        // 顶层群消息仍要求 @（避免整个群的消息都进 agent）。
+        if chat_type == "group" && thread_id.is_empty() && !self.bot_is_mentioned(&mentions) {
             crate::log!(
                 "[bridge] 群聊未 @ 机器人，忽略（bot={} chat={} sender={}）",
                 self.bot.key(),
@@ -259,12 +281,13 @@ impl Bridge {
 
         // content 是 JSON 字符串：文本 / 图片 / 文件 / 音视频 / 富文本（#12）。
         // 非文本消息解析出资源引用后下载附件，text 保持空（不再把 raw JSON 当文本透传）。
+        // 富文本多图：下载全部图片（与引用路径一致，避免直接发 3 图只收 1 张的割裂）。
         let raw = message["content"].as_str().unwrap_or("");
         let parsed = crate::feishu::parse_content(raw);
         let text = parsed.text.trim().to_string();
         let mid = message["message_id"].as_str().unwrap_or("").to_string();
         let mut attachments = Vec::new();
-        if let Some(res) = parsed.resource {
+        for (i, res) in parsed.resources.into_iter().enumerate() {
             let desc = crate::attachments::AttachmentDesc::Feishu {
                 message_id: mid.clone(),
                 file_key: res.file_key,
@@ -273,19 +296,20 @@ impl Bridge {
             };
             if let Some(meta) = self
                 .msgr
-                .download_attachment(&self.bot.key(), &mid, 0, &desc)
+                .download_attachment(&self.bot.key(), &mid, i, &desc)
                 .await
             {
                 attachments.push(meta);
             }
         }
 
-        let ev = Ev {
+        let mut ev = Ev {
             mid,
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
             // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
-            thread_id: message["thread_id"].as_str().unwrap_or("").to_string(),
+            thread_id: thread_id.to_string(),
+            quoted: crate::messenger::QuotedContent::default(),
             text,
             attachments,
         };
@@ -297,6 +321,43 @@ impl Bridge {
                 ev.chat_id
             );
             return;
+        }
+
+        // 引用/回复场景：parent_id 是被引用（回复）的消息 id。事件体不带被引用内容，
+        // 需按 id 拉取（飞书 API，文本 + 资源引用），再下载引用附件；best-effort——
+        // 拉取/下载失败只记日志，不阻塞本条回复。
+        let parent_id = message["parent_id"].as_str().unwrap_or("");
+        if !parent_id.is_empty() && parent_id != ev.mid {
+            match self.msgr.get_quoted_message(parent_id).await {
+                Some(q) => {
+                    let mut quoted = crate::messenger::QuotedContent {
+                        text: q.text.trim().to_string(),
+                        attachments: Vec::new(),
+                    };
+                    for (i, desc) in q.attachments.into_iter().enumerate() {
+                        if let Some(meta) = self
+                            .msgr
+                            .download_attachment(&self.bot.key(), &ev.mid, 100 + i, &desc)
+                            .await
+                        {
+                            quoted.attachments.push(meta);
+                        }
+                    }
+                    if !quoted.text.is_empty() || !quoted.attachments.is_empty() {
+                        ev.quoted = quoted;
+                        crate::log!(
+                            "[bridge] 引用消息 parent={} 文本长度={} 附件数={}",
+                            trunc(parent_id, 12),
+                            ev.quoted.text.chars().count(),
+                            ev.quoted.attachments.len()
+                        );
+                    }
+                }
+                None => crate::log!(
+                    "[bridge] 拉取引用消息失败/无内容 parent={}",
+                    trunc(parent_id, 12)
+                ),
+            }
         }
         self.handle(ev).await;
     }
@@ -386,6 +447,7 @@ impl Bridge {
             chat_type: ev.chat_type.clone(),
             thread_id: ev.thread_id.clone(),
             text: text.clone(),
+            quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
             created_at: crate::chrono_lite::unix_secs(),
         });
@@ -401,7 +463,27 @@ impl Bridge {
         } else {
             Vec::new()
         };
-        let mut prompt = text;
+        // 引用/回复上下文：把被引用消息内容（文本 + 附件）放在用户文本之前，
+        // agent 先读到「上面被引用的内容」。附件行格式与普通附件一致（本地路径/mime/sha）。
+        let mut prompt = String::new();
+        if !ev.quoted.text.is_empty() || !ev.quoted.attachments.is_empty() {
+            prompt.push_str("[引用消息]\n");
+            if !ev.quoted.text.is_empty() {
+                prompt.push_str(&ev.quoted.text);
+                if !ev.quoted.attachments.is_empty() {
+                    prompt.push('\n'); // 文本后跟附件时让 [引用附件] 独占一行（与 [附件] 约定一致）
+                }
+            }
+            if !ev.quoted.attachments.is_empty() {
+                prompt.push_str("[引用附件]");
+                for a in &ev.quoted.attachments {
+                    prompt.push('\n');
+                    prompt.push_str(&a.to_prompt_line());
+                }
+            }
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(&text);
         if !ev.attachments.is_empty() {
             prompt.push_str("\n\n[附件]");
             for a in &ev.attachments {
@@ -551,6 +633,7 @@ impl Bridge {
                 chat_id: item.chat_id,
                 chat_type: item.chat_type,
                 thread_id: item.thread_id,
+                quoted: item.quoted,
                 text: item.text,
                 attachments: item.attachments,
             };
@@ -612,11 +695,27 @@ impl Bridge {
             crate::log!("[weixin] 丢弃：text 为空且无附件");
             return;
         }
+        // 引用/回复：ref_msg 里的被引用文本 + 媒体（图片/文件/音视频）下载成附件元数据。
+        let mut quoted = crate::messenger::QuotedContent {
+            text: msg.quoted_text(),
+            attachments: Vec::new(),
+        };
+        for (i, media) in msg.quoted_media().into_iter().enumerate() {
+            let desc = crate::attachments::AttachmentDesc::Wechat(media);
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &mid, 100 + i, &desc)
+                .await
+            {
+                quoted.attachments.push(meta);
+            }
+        }
         let ev = Ev {
             mid,
             chat_id: from,               // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
             thread_id: String::new(),    // 微信无话题
+            quoted,
             text,
             attachments,
         };
@@ -675,6 +774,27 @@ impl Bridge {
         if is_group {
             text = strip_bot_mention(&text, &self.bot.bot_name);
         }
+        // 引用/回复：repliedMsg 里的被引用文本 + 附件（图片/文件/音视频）下载成附件元数据。
+        let mut quoted = crate::messenger::QuotedContent {
+            text: msg.quoted_text,
+            attachments: Vec::new(),
+        };
+        for (i, a) in msg.quoted_attachments.iter().enumerate() {
+            let desc = crate::attachments::AttachmentDesc::Dingtalk {
+                download_code: a.download_code.clone(),
+                robot_code: msg.robot_code.clone(),
+                kind: a.kind.clone(),
+                file_name: a.file_name.clone(),
+                voice_text: a.voice_text.clone(),
+            };
+            if let Some(meta) = self
+                .msgr
+                .download_attachment(&self.bot.key(), &msg.mid, 100 + i, &desc)
+                .await
+            {
+                quoted.attachments.push(meta);
+            }
+        }
         let ev = Ev {
             mid: msg.mid,
             chat_id,
@@ -684,6 +804,7 @@ impl Bridge {
                 "dm".to_string()
             },
             thread_id: String::new(), // 钉钉无话题
+            quoted,
             text,
             attachments,
         };
@@ -786,6 +907,7 @@ mod tests {
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
             thread_id: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
         };
@@ -800,6 +922,7 @@ mod tests {
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
             thread_id: thread.into(),
+            quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
         };
@@ -843,15 +966,34 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    /// 收集 send_text 调用，供断言回复内容（其余 Messenger 方法走 trait 默认空实现）。
+    /// 收集 send_text 调用，供断言回复内容；get_quoted_message 用 map 按 message_id 返回
+    /// 被引用内容（飞书引用/回复场景测试用）；download_attachment 直接返回占位元数据
+    /// （不落盘，测试与工作区解耦）。
     struct MockMessenger {
         sent: Mutex<Vec<String>>,
+        quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
     }
     impl MockMessenger {
         fn new() -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
+                quoted: Mutex::new(std::collections::HashMap::new()),
             }
+        }
+        fn set_quoted(&self, message_id: &str, text: &str) {
+            self.quoted.lock().unwrap().insert(
+                message_id.to_string(),
+                crate::messenger::QuotedMessage {
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                },
+            );
+        }
+        fn set_quoted_msg(&self, message_id: &str, q: crate::messenger::QuotedMessage) {
+            self.quoted
+                .lock()
+                .unwrap()
+                .insert(message_id.to_string(), q);
         }
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
@@ -862,6 +1004,36 @@ mod tests {
         async fn send_text(&self, _chat_id: &str, text: &str) -> anyhow::Result<()> {
             self.sent.lock().unwrap().push(text.to_string());
             Ok(())
+        }
+        async fn get_quoted_message(&self, message_id: &str) -> Option<crate::messenger::QuotedMessage> {
+            self.quoted.lock().unwrap().get(message_id).cloned()
+        }
+        async fn download_attachment(
+            &self,
+            _bot_key: &str,
+            _mid: &str,
+            _seq: usize,
+            desc: &crate::attachments::AttachmentDesc,
+        ) -> Option<crate::attachments::AttachmentMeta> {
+            let (kind, file_name) = match desc {
+                crate::attachments::AttachmentDesc::Feishu { kind, file_name, .. } => {
+                    (kind.clone(), file_name.clone())
+                }
+                crate::attachments::AttachmentDesc::Dingtalk { kind, file_name, .. } => {
+                    (kind.clone(), file_name.clone())
+                }
+                crate::attachments::AttachmentDesc::Wechat(m) => (m.kind.clone(), m.file_name.clone()),
+            };
+            Some(crate::attachments::AttachmentMeta {
+                kind,
+                source: "mock".into(),
+                file_name,
+                mime: "application/octet-stream".into(),
+                size: 1,
+                path: "/tmp/mock-attachment.bin".into(),
+                sha256: "abc".into(),
+                note: String::new(),
+            })
         }
     }
 
@@ -932,6 +1104,7 @@ mod tests {
             chat_id: chat_id.into(),
             chat_type: "group".into(), // 非 p2p/dm：跳过 save_primary_chat 写盘
             thread_id: String::new(),
+            quoted: crate::messenger::QuotedContent::default(),
             text: text.into(),
             attachments: Vec::new(),
         }
@@ -940,13 +1113,59 @@ mod tests {
     /// 构造带唯一 bot key 的 Bridge（隔离 ~/.agent-bridge/workspaces/<key>/），返回 bridge +
     /// messenger 供断言。调用方负责 `cleanup_bridge(&bridge)`。
     fn build_test_bridge(runner: Arc<dyn AgentRunner>) -> (Arc<Bridge>, Arc<MockMessenger>) {
-        let msgr = Arc::new(MockMessenger::new());
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
             ..Default::default()
         };
+        build_test_bridge_with_bot(runner, bot)
+    }
+
+    /// 构造带指定 BotConfig 的 Bridge（飞书 on_payload 测试需要 bot_name/bot_open_id/owner）。
+    fn build_test_bridge_with_bot(
+        runner: Arc<dyn AgentRunner>,
+        bot: BotConfig,
+    ) -> (Arc<Bridge>, Arc<MockMessenger>) {
+        let msgr = Arc::new(MockMessenger::new());
         let bridge = Arc::new(Bridge::build(msgr.clone(), bot, &Config::default(), runner));
         (bridge, msgr)
+    }
+
+    /// 构造飞书 receive_v1 事件 payload（content 按官方格式传 JSON 字符串）。
+    /// 测试 helper，参数多是构造 JSON 字段所需；与 MockAgentRunner::run 同类允许。
+    #[allow(clippy::too_many_arguments)]
+    fn feishu_payload(
+        mid: &str,
+        chat_id: &str,
+        chat_type: &str,
+        thread_id: &str,
+        parent_id: &str,
+        sender_type: &str,
+        sender_id: &str,
+        mentions: &[(&str, &str)], // (name, open_id)
+        text: &str,
+    ) -> String {
+        let content = serde_json::json!({"text": text});
+        serde_json::json!({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {
+                    "sender_type": sender_type,
+                    "sender_id": {"open_id": sender_id}
+                },
+                "message": {
+                    "message_id": mid,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type,
+                    "thread_id": thread_id,
+                    "parent_id": parent_id,
+                    "content": content.to_string(),
+                    "mentions": mentions.iter().map(|(name, open_id)| {
+                        serde_json::json!({"name": name, "id": {"open_id": open_id}})
+                    }).collect::<Vec<_>>()
+                }
+            }
+        })
+        .to_string()
     }
 
     fn cleanup_bridge(bridge: &Bridge) {
@@ -1118,6 +1337,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "第一条".into(),
+            quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             created_at: 10,
         });
@@ -1127,6 +1347,7 @@ mod tests {
             chat_type: "group".into(),
             thread_id: String::new(),
             text: "第二条".into(),
+            quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             created_at: 20,
         });
@@ -1154,6 +1375,522 @@ mod tests {
         bridge.recover_pending().await;
         assert!(runner.prompts().is_empty(), "无残留不应触发 agent");
         assert!(!msgr.sent().iter().any(|t| t.contains("正在恢复")));
+        cleanup_bridge(&bridge);
+    }
+
+    // ---- on_payload 过滤（飞书 receive_v1）----
+
+    #[tokio::test]
+    async fn on_payload_ignores_app_and_bot_senders() {
+        // 飞书事件里应用/bot 发的消息 sender_type 是 "app"/"bot"，不是用户——必须丢弃，
+        // 否则 bot 自己的回复 echo 会被当用户输入再跑一轮 agent（自说自话死循环）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        for sender_type in ["app", "bot"] {
+            let payload = feishu_payload(
+                &format!("om_app_{sender_type}"),
+                "oc_p2p",
+                "p2p",
+                "",
+                "",
+                sender_type,
+                "ou_app",
+                &[],
+                "你好",
+            );
+            bridge.on_payload(payload.as_bytes()).await;
+        }
+
+        assert!(runner.prompts().is_empty(), "应用/bot 消息不应触发 agent");
+        assert!(msgr.sent().is_empty(), "应用/bot 消息不应有回复");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_ignores_self_open_id() {
+        // 双保险：即使 sender_type 不是 app/bot（缺失或变化），sender open_id 等于
+        // 本 bot 的 open_id 也一律丢弃（openclaw #90559/#90572 同类自回声问题）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_self",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user", // 防御：sender_type 意外是 user 也要靠 open_id 拦住
+            "ou_bot",
+            &[],
+            "你好",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert!(runner.prompts().is_empty(), "自回声不应触发 agent");
+        assert!(msgr.sent().is_empty());
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_group_thread_reply_without_mention_is_handled() {
+        // 用户回复机器人的话题消息不需要再次 @：thread_id 非空时跳过群聊 @ 校验
+        // （顶层群消息仍要求 @，见下个测试）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_thread",
+            "oc_group",
+            "group",
+            "omt_abc",
+            "",
+            "user",
+            "ou_owner",
+            &[], // 话题内回复不 @ 也能收到事件
+            "回复一下",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert_eq!(runner.prompts(), ["回复一下"], "话题内回复应进 agent");
+        assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_group_top_level_without_mention_is_ignored() {
+        // 顶层群消息不 @ 机器人仍忽略（老行为不变）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_top",
+            "oc_group",
+            "group",
+            "",
+            "",
+            "user",
+            "ou_owner",
+            &[],
+            "在吗",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert!(
+            runner.prompts().is_empty(),
+            "未 @ 的顶层群消息不应触发 agent"
+        );
+        assert!(msgr.sent().is_empty());
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_p2p_user_message_is_handled() {
+        // 对照组：owner 私聊消息正常进 agent（on_payload 不应误伤用户消息）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_p2p",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_owner",
+            &[],
+            "在吗",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert_eq!(runner.prompts(), ["在吗"], "owner 私聊消息应进 agent");
+        assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    // ---- 引用/回复：被引用消息内容进 agent prompt ----
+
+    #[tokio::test]
+    async fn on_payload_fetches_quoted_parent() {
+        // 飞书引用/回复：事件带 parent_id，on_payload 按 id 拉取被引用内容并拼进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        msgr.set_quoted("om_parent", "上面那条被引用的消息");
+
+        let payload = feishu_payload(
+            "om_reply",
+            "oc_p2p",
+            "p2p",
+            "",
+            "om_parent", // parent_id = 被引用消息
+            "user",
+            "ou_owner",
+            &[],
+            "回复内容",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n上面那条被引用的消息\n\n回复内容"],
+            "prompt 应带引用上下文"
+        );
+        assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn handle_prompt_prepends_quoted() {
+        // 核心拼装：Ev.quoted 非空 → prompt = [引用消息]\n引用内容\n\n用户文本。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        let mut ev = test_ev("m1", "oc_q", "回复内容");
+        ev.quoted = crate::messenger::QuotedContent {
+            text: "被引用的原消息".to_string(),
+            attachments: Vec::new(),
+        };
+        bridge.handle(ev).await;
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n被引用的原消息\n\n回复内容"]
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_weixin_quoted_text_in_prompt() {
+        // 微信引用/回复：ref_msg 内容随事件携带，进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "wechat".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::wechat::WeixinMessage {
+            from_user_id: "u1".into(),
+            message_type: 1,
+            message_id: "7491".into(),
+            item_list: vec![crate::wechat::MessageItem {
+                item_type: 1,
+                text_item: Some(crate::wechat::TextItem {
+                    text: "回复内容".into(),
+                }),
+                ref_msg: Some(crate::wechat::RefMessage {
+                    title: "摘要".into(),
+                    message_item: Some(Box::new(crate::wechat::MessageItem {
+                        item_type: 1,
+                        text_item: Some(crate::wechat::TextItem {
+                            text: "被引用的原消息".into(),
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        bridge.on_weixin(msg).await;
+
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n摘要 | 被引用的原消息\n\n回复内容"]
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_dingtalk_quoted_text_in_prompt() {
+        // 钉钉引用/回复：repliedMsg 内容随事件携带，进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "dingtalk".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::dingtalk::DingtalkMessage {
+            mid: "msg1".into(),
+            sender_staff_id: "u1".into(),
+            conversation_id: "u1".into(), // 单聊：chat_id = sender
+            conversation_type: "1".into(),
+            text: "回复内容".into(),
+            mentioned: false,
+            robot_code: "r".into(),
+            quoted_text: "被引用的原消息".into(),
+            quoted_attachments: Vec::new(),
+            attachments: Vec::new(),
+        };
+        bridge.on_dingtalk(msg).await;
+
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n被引用的原消息\n\n回复内容"]
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_fetches_quoted_attachment() {
+        // 飞书引用附件：get_quoted_message 返回资源 desc → 下载成元数据 → [引用附件] 进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        msgr.set_quoted_msg(
+            "om_parent",
+            crate::messenger::QuotedMessage {
+                text: "引用的文字".into(),
+                attachments: vec![crate::attachments::AttachmentDesc::Feishu {
+                    message_id: "om_parent".into(),
+                    file_key: "img_1".into(),
+                    kind: "image".into(),
+                    file_name: "截图.png".into(),
+                }],
+            },
+        );
+
+        let payload = feishu_payload(
+            "om_reply",
+            "oc_p2p",
+            "p2p",
+            "",
+            "om_parent",
+            "user",
+            "ou_owner",
+            &[],
+            "回复内容",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        // 文本+附件同时存在：整段精确断言，钉死「[引用附件] 独占一行」的格式
+        assert_eq!(
+            runner.prompts(),
+            ["[引用消息]\n引用的文字\n[引用附件]\n[image] 来源=mock 文件名=截图.png mime=application/octet-stream 大小=1 本地路径=/tmp/mock-attachment.bin sha256=abc\n\n回复内容"]
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_weixin_quoted_media_in_prompt() {
+        // 微信引用图片：ref_msg.message_item 媒体 → 下载 → [引用附件] 进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "wechat".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::wechat::WeixinMessage {
+            from_user_id: "u1".into(),
+            message_type: 1,
+            message_id: "7491".into(),
+            item_list: vec![crate::wechat::MessageItem {
+                item_type: 1,
+                text_item: Some(crate::wechat::TextItem {
+                    text: "回复内容".into(),
+                }),
+                ref_msg: Some(crate::wechat::RefMessage {
+                    title: "摘要".into(),
+                    message_item: Some(Box::new(crate::wechat::MessageItem {
+                        item_type: 2,
+                        image_item: Some(crate::wechat::ImageItem {
+                            media: Some(crate::wechat::CDNMedia {
+                                encrypt_query_param: "enc".into(),
+                                aes_key: "a2V5".into(),
+                                full_url: String::new(),
+                                ..Default::default()
+                            }),
+                            aeskey: "00112233445566778899aabbccddeeff".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        bridge.on_weixin(msg).await;
+
+        let prompt = &runner.prompts()[0];
+        assert!(prompt.contains("[引用消息]"));
+        assert!(prompt.contains("\n[引用附件]"), "[引用附件] 应独占一行");
+        assert!(prompt.contains("image"));
+        assert!(prompt.contains("回复内容"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_dingtalk_quoted_attachment_in_prompt() {
+        // 钉钉引用图片：repliedMsg 附件 → 下载 → [引用附件] 进 prompt。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "dingtalk".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let msg = crate::dingtalk::DingtalkMessage {
+            mid: "msg1".into(),
+            sender_staff_id: "u1".into(),
+            conversation_id: "u1".into(),
+            conversation_type: "1".into(),
+            text: "回复内容".into(),
+            mentioned: false,
+            robot_code: "r".into(),
+            quoted_text: String::new(),
+            quoted_attachments: vec![crate::dingtalk::DingtalkAttachment {
+                kind: "image".into(),
+                download_code: "dc_pic".into(),
+                file_name: String::new(),
+                voice_text: String::new(),
+            }],
+            attachments: Vec::new(),
+        };
+        bridge.on_dingtalk(msg).await;
+
+        let prompt = &runner.prompts()[0];
+        assert!(prompt.contains("[引用消息]"));
+        assert!(prompt.contains("\n[引用附件]"), "[引用附件] 应独占一行");
+        assert!(prompt.contains("image"));
+        assert!(prompt.contains("回复内容"));
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_multi_image_post_downloads_all() {
+        // 多图：飞书 post 多图经 on_payload 主路径应全部下载进 [附件]（#5 一致性）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let content = serde_json::json!({
+            "title": "多图",
+            "content": [[{"tag":"img","image_key":"img_1"}],[{"tag":"img","image_key":"img_2"}],[{"tag":"img","image_key":"img_3"}]]
+        });
+        let payload = serde_json::json!({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_type":"user","sender_id":{"open_id":"ou_owner"}},
+                "message": {"message_id":"om_multi","chat_id":"oc_p2p","chat_type":"p2p","content": content.to_string()}
+            }
+        })
+        .to_string();
+        bridge.on_payload(payload.as_bytes()).await;
+        assert_eq!(
+            runner.prompts()[0].matches("本地路径=").count(),
+            3,
+            "多图应全部下载"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn handle_multi_attachment_and_multilink() {
+        // 多附件 + 多链接 + 引用多附件：handle 拼装各段多件正确性。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        let att = |kind: &str, name: &str, path: &str| crate::attachments::AttachmentMeta {
+            kind: kind.into(),
+            source: "mock".into(),
+            file_name: name.into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            path: path.into(),
+            sha256: "h".into(),
+            note: String::new(),
+        };
+        let mut ev = test_ev("m1", "oc_q", "看这个 https://a.com/x 和 https://b.com/y 如何");
+        ev.attachments = vec![
+            att("image", "a.png", "/tmp/a.png"),
+            att("file", "报告.pdf", "/tmp/r.pdf"),
+            att("video", "v.mp4", "/tmp/v.mp4"),
+        ];
+        ev.quoted = crate::messenger::QuotedContent {
+            text: "被引用".into(),
+            attachments: vec![
+                att("image", "q1.png", "/tmp/q1.png"),
+                att("file", "q2.zip", "/tmp/q2.zip"),
+            ],
+        };
+        bridge.handle(ev).await;
+        let p = &runner.prompts()[0];
+        assert_eq!(
+            p.matches("本地路径=").count(),
+            5,
+            "引用 2 + 主 3 = 5 个附件行"
+        );
+        assert!(p.contains("[引用附件]
+"));
+        assert!(p.contains("报告.pdf") && p.contains("v.mp4"));
+        assert!(p.contains("[链接]
+https://a.com/x
+https://b.com/y"));
         cleanup_bridge(&bridge);
     }
 }

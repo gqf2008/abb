@@ -8,8 +8,25 @@ use crate::dingtalk::DingTalkClient;
 use crate::feishu::FeishuClient;
 use crate::wechat::WeixinClient;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// 引用消息的原始内容（附件尚未下载；`attachments` 是各通道的附件描述，供
+/// `download_attachment` 下载成元数据）。
+#[derive(Debug, Clone, Default)]
+pub struct QuotedMessage {
+    /// 被引用文本（含链接 URL；飞书 post 的 href 已拼进文本）。
+    pub text: String,
+    pub attachments: Vec<crate::attachments::AttachmentDesc>,
+}
+
+/// 引用消息内容（附件已下载为元数据）。随 `Ev` 进 handle / 随 pending.json 持久化。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotedContent {
+    pub text: String,
+    pub attachments: Vec<crate::attachments::AttachmentMeta>,
+}
 
 #[async_trait::async_trait]
 pub trait Messenger: Send + Sync {
@@ -20,6 +37,12 @@ pub trait Messenger: Send + Sync {
     /// 保证回复落在原话题内（#14）；其它通道没有话题，默认回落普通发送。
     async fn send_thread_reply(&self, chat_id: &str, _message_id: &str, text: &str) -> Result<()> {
         self.send_text(chat_id, text).await
+    }
+
+    /// 拉取一条历史消息的引用内容（文本 + 附件描述；被引用内容进 agent prompt）。
+    /// 飞书覆盖（走消息 API）；微信/钉钉的引用内容随入站事件直接携带，默认无操作。
+    async fn get_quoted_message(&self, _message_id: &str) -> Option<QuotedMessage> {
+        None
     }
 
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
@@ -85,6 +108,27 @@ impl Messenger for FeishuMessenger {
     }
     async fn send_thread_reply(&self, _chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         self.fs.reply_text(message_id, text).await
+    }
+    async fn get_quoted_message(&self, message_id: &str) -> Option<QuotedMessage> {
+        match self.fs.get_quoted_message(message_id).await {
+            Ok(parsed) => Some(QuotedMessage {
+                text: parsed.text,
+                attachments: parsed
+                    .resources
+                    .into_iter()
+                    .map(|r| crate::attachments::AttachmentDesc::Feishu {
+                        message_id: message_id.to_string(),
+                        file_key: r.file_key,
+                        kind: r.kind,
+                        file_name: r.file_name,
+                    })
+                    .collect(),
+            }),
+            Err(e) => {
+                crate::log!("[feishu] 拉取引用消息失败 mid={}: {e:#}", message_id);
+                None
+            }
+        }
     }
     async fn download_attachment(
         &self,

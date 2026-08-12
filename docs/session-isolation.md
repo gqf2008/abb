@@ -70,6 +70,17 @@ key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 已核实（官方文档 2026-08-10）：事件字段 `event.message.thread_id`；回复接口
 `im/v1/messages/:message_id/reply` 请求体 `reply_in_thread`（boolean）；回复响应含 `thread_id`。
 
+补充（2026-08-12）：
+- **话题内回复免 @**：群聊里 `thread_id` 非空的消息（用户在话题内回复 bot）不再要求 @
+  ——`on_payload` 只对顶层群消息做 @ 校验；话题内回复按 `chat_id:thread_id` 进原会话。
+- **应用/bot 消息过滤**：飞书事件中应用发的消息 `sender_type="app"`（不是 `"bot"`），
+  `on_payload` 现在丢弃 `app`/`bot` 及 sender open_id == 本 bot open_id 的消息，
+  防止 bot 自己的回复 echo 触发新一轮 agent（自说自话）。
+- **引用/回复上下文**：引用一条消息再 @ bot 时，被引用内容进 agent prompt——
+  飞书按事件 `parent_id` 调 `GET /im/v1/messages/:id` 拉取（best-effort，失败不阻塞回复）；
+  微信 `item.ref_msg`（title + message_item）、钉钉 `text.isReplyMsg/repliedMsg` 随事件直接携带。
+  `Ev.quoted` 随 pending.json 持久化，重启恢复不丢引用上下文。
+
 ## 6. 相关代码索引
 
 - 会话持久化：`src/sessions.rs`（chat_id 单维度、per-backend 槽位）

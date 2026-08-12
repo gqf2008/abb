@@ -510,6 +510,11 @@ def run_agent(backend: str, prompt: str, session_id: str, resume: bool) -> tuple
 
 # ── 桥 ─────────────────────────────────────────────────────────────
 class Bridge:
+    """历史协议样例（Rust 版 on_payload 的简化参照）。
+    注意：只同步了「应用/bot 消息过滤」，未同步 Rust 版的
+    「话题内回复免 @」与「引用/回复上下文（文本+附件）」——那些以 src/bridge.rs 为准。
+    """
+
     def __init__(self, fs: FeishuClient):
         self.fs = fs
         self.sessions = SessionStore(SESSIONS_FILE)
@@ -518,7 +523,11 @@ class Bridge:
         self._busy_lock = threading.Lock()
 
     def should_respond(self, ev: dict) -> bool:
-        if ev.get("sender_type") == "bot":
+        # 飞书事件里应用/bot 发的消息 sender_type 是 "app"（不是 "bot"），用户消息才是 "user"；
+        # 只判 "bot" 会把应用消息当用户输入透传（自回声死循环）。再按 open_id 双保险拦自己。
+        if ev.get("sender_type") in ("app", "bot"):
+            return False
+        if CFG.bot_open_id and ev.get("sender_id") == CFG.bot_open_id:
             return False
         if ev.get("sender_id") != CFG.owner_open_id:
             return False
