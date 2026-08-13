@@ -110,10 +110,15 @@ pub trait Messenger: Send + Sync {
     async fn stream_begin(&self, _chat_id: &str, _initial_text: &str) -> Option<String> {
         None
     }
-    /// 累积**全文**更新流式消息（平台自动算增量渲染打字机）。best-effort，失败只 log。
+    /// 累积**全文**更新流式消息（平台自动算增量渲染打字机）。best-effort，失败只 log——
+    /// 中间更新丢了没关系：下次 update / finalize 带的是累积全文，自然补齐。
     async fn stream_update(&self, _handle: &str, _full_text: &str) {}
     /// 最终全文 + 关流式。任务结束（Reply/Cancelled/Err）必调，防平台侧流式悬挂。
-    async fn stream_finalize(&self, _handle: &str, _full_text: &str) {}
+    /// 返回 true = 最终全文**已送达**卡片（调用方不再发独立消息）；false = 未送达
+    /// （调用方必须走逐条发送兜底——权威回复不能停在中途进度的「假完成」卡片里）。
+    async fn stream_finalize(&self, _handle: &str, _full_text: &str) -> bool {
+        false
+    }
 }
 
 /// 飞书实现：委托 FeishuClient，表情走 reactions。
@@ -219,6 +224,9 @@ impl Messenger for FeishuMessenger {
                 }
                 Err(e) => {
                     crate::log!("[feishu] 流式卡片发送失败，回落逐条发送: {e:#}");
+                    // 已创建的实体没发出去成孤儿（平台 10 分钟才自关）：best-effort 关掉。
+                    // 实体从未写过内容，首个写操作 sequence=1；失败无所谓（仅清理）。
+                    let _ = self.fs.card_close_streaming(&card_id, 1).await;
                     None
                 }
             },
@@ -236,17 +244,22 @@ impl Messenger for FeishuMessenger {
         }
     }
 
-    async fn stream_finalize(&self, handle: &str, full_text: &str) {
-        // 最终全文先更新（内容可能与上次 update 不同），再关流式；两步失败都只 log。
+    async fn stream_finalize(&self, handle: &str, full_text: &str) -> bool {
+        // 最终全文先更新（内容可能与上次 update 不同）；这步失败 = 权威回复未送达，
+        // 返回 false 让桥走逐条发送兜底——不能让用户看到停在中途的「假完成」卡片。
         let seq = self.next_seq(handle);
         if let Err(e) = self.fs.card_update_content(handle, full_text, seq).await {
             crate::log!("[feishu] 流式卡片最终更新失败: {e:#}");
+            self.stream_seq.lock().unwrap().remove(handle);
+            return false;
         }
+        // 关流式失败只是卡片停在流式态等平台 10 分钟自关（内容已是最终全文），不影响送达。
         let seq = self.next_seq(handle);
         if let Err(e) = self.fs.card_close_streaming(handle, seq).await {
             crate::log!("[feishu] 流式卡片关闭失败: {e:#}");
         }
         self.stream_seq.lock().unwrap().remove(handle);
+        true
     }
 }
 
@@ -509,10 +522,14 @@ impl Messenger for DingTalkMessenger {
         }
     }
 
-    async fn stream_finalize(&self, handle: &str, full_text: &str) {
+    async fn stream_finalize(&self, handle: &str, full_text: &str) -> bool {
+        // 单发（全文 + isFinalize=true）：失败 = 最终全文未送达且卡片停在「输入中」态，
+        // 返回 false 让桥走逐条发送兜底；卡片等平台 10 分钟自关，期间显示近终态内容。
         if let Err(e) = self.dt.card_streaming_update(handle, full_text, true).await {
             crate::log!("[dingtalk] 流式卡片收尾失败: {e:#}");
+            return false;
         }
+        true
     }
 }
 

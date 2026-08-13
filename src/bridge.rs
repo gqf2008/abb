@@ -207,8 +207,9 @@ impl Bridge {
     }
 
     /// 打字机收尾（#42）：Active 时把「累积中途 + 末段文本（最终回复/⏹ 已停止/错误）」
-    /// finalize 进流式消息并返回 true——调用方不再发独立消息；
-    /// Idle（无中途输出，未开局）/ Fallback（开局失败）返回 false，调用方走现状逐条发送。
+    /// finalize 进流式消息；**送达成功**返回 true——调用方不再发独立消息；
+    /// Idle（未开局）/ Fallback（开局失败）/ **finalize 未送达**（限流/网络/token）返回 false，
+    /// 调用方走逐条发送兜底——权威回复绝不能停在中途进度的「假完成」卡片里（PR#43 审查 M1）。
     async fn finalize_stream(&self, st: &StreamState, ev: &Ev, tail: &str) -> bool {
         let StreamMode::Active(h) = &st.mode else {
             return false;
@@ -218,13 +219,20 @@ impl Bridge {
             full.push_str("\n\n");
         }
         full.push_str(tail);
-        self.msgr.stream_finalize(h, &full).await;
-        crate::log!(
-            "[bridge] 流式消息收尾 chat={} 长度={}",
-            trunc(&ev.chat_id, 10),
-            full.chars().count()
-        );
-        true
+        if self.msgr.stream_finalize(h, &full).await {
+            crate::log!(
+                "[bridge] 流式消息收尾 chat={} 长度={}",
+                trunc(&ev.chat_id, 10),
+                full.chars().count()
+            );
+            true
+        } else {
+            crate::log!(
+                "[bridge] 流式收尾未送达 chat={}，回落逐条发送",
+                trunc(&ev.chat_id, 10)
+            );
+            false
+        }
     }
 
     /// 处理一条 agent 中途输出（#42 门控，select 循环与收尾排空共用）：
@@ -782,14 +790,8 @@ impl Bridge {
                 // 不 mark_started：被打断的轮次不算完成
             }
             Err(e) => {
-                // 错误文案作为回复发出（用户可见原因），同样留痕
-                if self.finalize_stream(&stream, &ev, &e).await {
-                    crate::log!(
-                        "[bridge] 已回复错误（流式卡片）chat={} 长度={}",
-                        trunc(&ev.chat_id, 10),
-                        e.chars().count()
-                    );
-                } else {
+                // 错误文案作为回复发出（用户可见原因），同样留痕（流式收尾日志见 finalize_stream）
+                if !self.finalize_stream(&stream, &ev, &e).await {
                     match self.send_reply(&ev, &e).await {
                         Ok(()) => crate::log!(
                             "[bridge] 已回复错误 chat={} 长度={}",
@@ -1214,6 +1216,8 @@ mod tests {
         sent: Mutex<Vec<String>>,
         quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
         stream_supported: bool,
+        /// false 时 stream_finalize 返回 false（模拟最终全文未送达，测回落兜底；PR#43 审查 M1）
+        finalize_ok: bool,
         stream_events: Mutex<Vec<String>>,
     }
     impl MockMessenger {
@@ -1222,6 +1226,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 quoted: Mutex::new(std::collections::HashMap::new()),
                 stream_supported: false,
+                finalize_ok: true,
                 stream_events: Mutex::new(Vec::new()),
             }
         }
@@ -1229,6 +1234,14 @@ mod tests {
         fn with_streaming() -> Self {
             Self {
                 stream_supported: true,
+                ..Self::new()
+            }
+        }
+        /// 流式可开局但收尾必败的挡板（限流/网络/token 导致最终全文未送达）。
+        fn with_finalize_failure() -> Self {
+            Self {
+                stream_supported: true,
+                finalize_ok: false,
                 ..Self::new()
             }
         }
@@ -1273,11 +1286,12 @@ mod tests {
                 .unwrap()
                 .push(format!("update:{full_text}"));
         }
-        async fn stream_finalize(&self, _handle: &str, full_text: &str) {
+        async fn stream_finalize(&self, _handle: &str, full_text: &str) -> bool {
             self.stream_events
                 .lock()
                 .unwrap()
                 .push(format!("final:{full_text}"));
+            self.finalize_ok
         }
         async fn get_quoted_message(&self, message_id: &str) -> Option<crate::messenger::QuotedMessage> {
             self.quoted.lock().unwrap().get(message_id).cloned()
@@ -1311,6 +1325,13 @@ mod tests {
         }
     }
 
+    /// run 的收尾形态（默认 Reply；#42 审查 m1：补 Cancel/Err 两态流式收尾覆盖）。
+    enum MockOutcome {
+        Reply,
+        Cancel,
+        Fail(String),
+    }
+
     /// 挡板 agent：run 进入即 `started.notify_one()`（让测试知道「任务在跑」）；
     /// `block=true` 等 `release.notified()` 才返回（用于「任务运行中穿插 /new」），
     /// `block=false` 立即返回（对照组）。
@@ -1321,6 +1342,7 @@ mod tests {
         reply: String,
         progress_msgs: Vec<String>,
         progress_gap: std::time::Duration,
+        outcome: MockOutcome,
         prompts: Mutex<Vec<String>>,
     }
     impl MockAgentRunner {
@@ -1332,6 +1354,7 @@ mod tests {
                 reply: reply.into(),
                 progress_msgs: Vec::new(),
                 progress_gap: std::time::Duration::ZERO,
+                outcome: MockOutcome::Reply,
                 prompts: Mutex::new(Vec::new()),
             }
         }
@@ -1349,6 +1372,33 @@ mod tests {
                 progress_msgs: progress.iter().map(|s| s.to_string()).collect(),
                 progress_gap: gap,
                 ..Self::blocking(reply)
+            }
+        }
+        /// #42 审查 m2：run 立即返回（block=false）+ 中途输出 —— 进度可能还压在通道里，
+        /// 强制走收尾排空（try_recv drain）路径。
+        fn with_progress_immediate(reply: &str, progress: &[&str]) -> Self {
+            Self {
+                progress_msgs: progress.iter().map(|s| s.to_string()).collect(),
+                block: false,
+                ..Self::blocking(reply)
+            }
+        }
+        /// #42 审查 m1：中途输出推完后以 Cancelled 收尾（模拟被打断）；block=false 不等 release。
+        fn with_progress_cancel(progress: &[&str]) -> Self {
+            Self {
+                progress_msgs: progress.iter().map(|s| s.to_string()).collect(),
+                outcome: MockOutcome::Cancel,
+                block: false,
+                ..Self::blocking("（不会用到）")
+            }
+        }
+        /// #42 审查 m1：中途输出推完后以 Err 收尾（模拟后端报错）；block=false 不等 release。
+        fn with_progress_error(progress: &[&str], err: &str) -> Self {
+            Self {
+                progress_msgs: progress.iter().map(|s| s.to_string()).collect(),
+                outcome: MockOutcome::Fail(err.into()),
+                block: false,
+                ..Self::blocking("（不会用到）")
             }
         }
         fn prompts(&self) -> Vec<String> {
@@ -1399,10 +1449,14 @@ mod tests {
                 }
             }
             // 返回本次运行使用的 session_id——bridge 据此做 mark_started_if 身份校验
-            Ok(agent::RunOutcome::Reply {
-                reply: self.reply.clone(),
-                session_id: session_id.to_string(),
-            })
+            match &self.outcome {
+                MockOutcome::Reply => Ok(agent::RunOutcome::Reply {
+                    reply: self.reply.clone(),
+                    session_id: session_id.to_string(),
+                }),
+                MockOutcome::Cancel => Ok(agent::RunOutcome::Cancelled),
+                MockOutcome::Fail(e) => Err(e.clone()),
+            }
         }
     }
 
@@ -2413,7 +2467,7 @@ https://b.com/y"));
         let runner = Arc::new(MockAgentRunner::with_progress(
             "最终",
             &["一", "二"],
-            std::time::Duration::from_millis(600), // 跨过 500ms 节流窗口
+            std::time::Duration::from_millis(800), // 跨过 500ms 节流窗口（余量放宽防 CI 高负载 flake）
         ));
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
@@ -2575,6 +2629,137 @@ https://b.com/y"));
 
         assert_eq!(msgr.sent(), vec!["中途输出", "最终结果"]);
         assert!(msgr.stream_events().is_empty(), "话题消息不得触碰流式接口");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #42 / PR#43 审查 M1：流式收尾未送达（限流/网络/token）→ 权威最终结果必须回落
+    /// 逐条发送，不能停在中途进度的「假完成」卡片里。
+    #[tokio::test]
+    async fn stream_finalize_failure_falls_back_to_send_reply() {
+        let runner = Arc::new(MockAgentRunner::with_progress(
+            "最终结果",
+            &["中途输出"],
+            std::time::Duration::ZERO,
+        ));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let msgr = Arc::new(MockMessenger::with_finalize_failure());
+        let bridge = Arc::new(Bridge::build(
+            msgr.clone(),
+            bot,
+            &Config::default(),
+            runner.clone(),
+        ));
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_ff", "hi")).await });
+        runner.started.notified().await;
+        runner.release.notify_one();
+        task.await.unwrap();
+
+        // 打字机开局 + 收尾尝试过（带完整全文），但平台侧未送达
+        let events = msgr.stream_events();
+        assert_eq!(events, vec!["begin:中途输出", "final:中途输出\n\n最终结果"]);
+        // 权威结果必须出现在逐条通道
+        assert_eq!(msgr.sent(), vec!["最终结果"]);
+        cleanup_bridge(&bridge);
+    }
+
+    /// #42 审查 m1：流式进行中任务被打断 → 卡片定格为「累积中途 + ⏹ 已停止」，不走 send_text。
+    #[tokio::test]
+    async fn stream_finalize_on_cancel_shows_stopped() {
+        let runner = Arc::new(MockAgentRunner::with_progress_cancel(&["已输出一半"]));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let msgr = Arc::new(MockMessenger::with_streaming());
+        let bridge = Arc::new(Bridge::build(
+            msgr.clone(),
+            bot,
+            &Config::default(),
+            runner.clone(),
+        ));
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_cx", "hi")).await });
+        task.await.unwrap(); // block=false，无需 release
+
+        let events = msgr.stream_events();
+        assert_eq!(
+            events,
+            vec!["begin:已输出一半", "final:已输出一半\n\n⏹ 已停止"]
+        );
+        assert!(msgr.sent().is_empty(), "打断收尾进卡片，不走 send_text");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #42 审查 m1：任务出错 → 卡片定格为「累积中途 + 错误文案」，不走 send_text。
+    #[tokio::test]
+    async fn stream_finalize_on_error_shows_error_text() {
+        let runner = Arc::new(MockAgentRunner::with_progress_error(
+            &["部分输出"],
+            "后端进程退出码 1",
+        ));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let msgr = Arc::new(MockMessenger::with_streaming());
+        let bridge = Arc::new(Bridge::build(
+            msgr.clone(),
+            bot,
+            &Config::default(),
+            runner.clone(),
+        ));
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_er", "hi")).await });
+        task.await.unwrap();
+
+        let events = msgr.stream_events();
+        assert_eq!(
+            events,
+            vec!["begin:部分输出", "final:部分输出\n\n后端进程退出码 1"]
+        );
+        assert!(msgr.sent().is_empty(), "错误收尾进卡片，不走 send_text");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #42 审查 m2：run 立即返回、进度可能还压在通道里 → 收尾排空（try_recv drain）必须
+    /// 把每轮输出都收进最终全文（select 双就绪随机 break 的竞态修复，新旧路径同享）。
+    /// 不论 select 先消费几条、drain 收几条，begin/final 文本都确定。
+    #[tokio::test]
+    async fn stream_drain_covers_progress_queued_at_run_end() {
+        let runner = Arc::new(MockAgentRunner::with_progress_immediate(
+            "最终回复",
+            &["第一轮", "第二轮", "第三轮"],
+        ));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let msgr = Arc::new(MockMessenger::with_streaming());
+        let bridge = Arc::new(Bridge::build(
+            msgr.clone(),
+            bot,
+            &Config::default(),
+            runner.clone(),
+        ));
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_dr", "hi")).await });
+        task.await.unwrap();
+
+        let events = msgr.stream_events();
+        assert_eq!(events[0], "begin:第一轮");
+        assert_eq!(
+            events.last().unwrap(),
+            "final:第一轮\n\n第二轮\n\n第三轮\n\n最终回复"
+        );
+        assert!(msgr.sent().is_empty());
         cleanup_bridge(&bridge);
     }
 }
