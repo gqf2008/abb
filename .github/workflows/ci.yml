@@ -1,0 +1,49 @@
+name: CI
+
+# PR / main 推送 / 手动触发：clippy -D warnings 门禁 + 全量测试（含 renderer-skia 编译）。
+# 仓库此前只有 release.yml（打 tag 发版），没有 PR 级门禁；本工作流补这个缺口。
+# 只跑 windows-latest：与开发主环境一致，且覆盖 skia 编译路径——windows runner 预装
+# LLVM/clang-cl，skia-bindings 可构建（macOS 侧由 release.yml 的发版构建覆盖）。
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # fmt 独立小 job：不编译，秒级反馈。
+  # 注意：仓库基线在现行 stable rustfmt 下有 68 处历史格式漂移（先于本工作流存在），
+  # 统一重排属单独议题；在此之前 continue-on-error 顾问运行（有注解，不卡合并）。
+  fmt:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # skia-bindings 的 C++ 构建要 ninja（runner 未预装；clang-cl runner 自带）
+      - name: Install ninja
+        run: choco install ninja -y --no-progress
+
+      # skia C++ 编译是大头（冷跑 ~30min 级），target 缓存必须保住
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy（-D warnings 门禁）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test（编译即验证 renderer-skia 全链路）
+        run: cargo test
