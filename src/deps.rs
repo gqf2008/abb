@@ -272,6 +272,8 @@ impl InstallStep {
             shell: None,
         }
     }
+    // 仅 macOS/Linux 的安装计划用到（curl | sh）；Windows 全是 exec 直装
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn shell(cmd: &str) -> InstallStep {
         InstallStep {
             program: String::new(),
@@ -522,6 +524,8 @@ pub enum PermState {
     /// 已授权（auth_value=2）
     Granted,
     /// 被拒绝过（auth_value=3）——TCC 不会再自动弹窗，只能去设置手动开
+    /// （仅 macOS/Linux 权限探测构造；Windows 提权检测只产 Granted/NotDetermined）
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Denied,
     /// 从未请求 / 未授权（auth_value=0 或无行）
     NotDetermined,
@@ -533,7 +537,6 @@ pub enum PermState {
 /// 检测当前进程是否以管理员/提升权限运行。
 #[cfg(target_os = "windows")]
 pub fn is_elevated() -> bool {
-    use std::ffi::c_void;
     // IsUserAnAdmin: shell32.dll，返回 BOOL（非 0 = 管理员组成员）
     #[link(name = "shell32")]
     unsafe extern "system" {
