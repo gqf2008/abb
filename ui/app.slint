@@ -66,6 +66,12 @@ export component Tray inherits SystemTrayIcon {
     }
 }
 
+// 一个已授权用户（owner_open_id 白名单是事实源，name 供展示）
+export struct OwnerRow {
+    name: string,        // 展示名（飞书反查；查不到=open_id）
+    open_id: string,     // 飞书 open_id（事实键）
+}
+
 // 单个 bot 行的数据（与 Rust 侧 BotRow 对应）
 export struct BotRow {
     name: string,        // 显示名
@@ -73,12 +79,18 @@ export struct BotRow {
     enabled: bool,       // 是否启用（false 则 service 不启动此 bot）
     backend: string,     // 该 bot 的默认后端 claude | codex（跟着 bot 走，不是全局）
     provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
-    owner-open-id: string, // 飞书：只响应这个 owner（ou_xxx）；微信 bot 不用
+    owner-open-id: string, // 飞书：owner（管理员）白名单（逗号分隔 open_id）；微信 bot 不用
+    owners: [OwnerRow],  // 飞书：owner 展示名（手填的没名字，列表备用；实际以输入框为准）
+    granted: [OwnerRow], // 飞书：授权者列表（授权码添加，名字 + open_id）
+    open-access: bool,   // 飞书：true=任何人都可以对话；false=仅授权用户（owner+授权者）
     app-id: string,
     app-secret: string,
     bot-name: string,    // 运行时获取的 bot 名
     bot-open-id: string,
-    ding-user-id: string,    // 钉钉：只响应这个用户 staffId（空=不设限）
+    ding-user-id: string,    // 钉钉：旧单值 owner staffId（迁移到 ding-owner-ids）
+    ding-owner-ids: string,  // 钉钉：owner（管理员）白名单（逗号分隔 staffId）
+    ding-granted: [OwnerRow], // 钉钉：授权者列表（授权码添加，名字 + staffId）
+    ding-open-access: bool,  // 钉钉：true=任何人都可以对话；false=仅授权用户
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
 }
 
@@ -375,6 +387,10 @@ export component SettingsWindow inherits Window {
     in-out property <[ProviderRow]> providers: [];
     in-out property <int> provider-selected: -1;
     in-out property <[string]> provider-names: [];   // 供 bot 页的供应商下拉（[""] + 各 name）
+    // 当前选中 bot 的未过期授权码展示：owner-code-info=管理员码行、grant-code-info=普通授权码行
+    // （"授权码：xxxx（剩 N 分钟）"；无则空）。生成后/热刷新更新。
+    in-out property <string> owner-code-info: "";
+    in-out property <string> grant-code-info: "";
 
     callback save-clicked();
     callback cancel-clicked();
@@ -392,6 +408,9 @@ export component SettingsWindow inherits Window {
     // 旧版 bot-edited 一次传全部字段、未改字段从 model 读，而 model 在编辑后不同步（过期），
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
     callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
+    callback generate-owner-code(int, string); // 生成授权码：bot idx + role（"owner"=管理员码 / "granted"=普通码），覆盖同类型旧码
+    callback copy-owner-code(string);          // 复制指定 role 的授权码到剪贴板
+    callback remove-granted(int, int); // 取消授权：bot idx + 授权者下标（从授权者白名单移除）
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
@@ -779,14 +798,105 @@ export component SettingsWindow inherits Window {
                                                         selected => { root.bot-field-edited(root.selected, "provider", self.current-value); }
                                                     }
                                                 }
-                                                // ── 飞书字段 ──
+                                                // ── 飞书字段（owner/授权者/对话权限）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Text { text: "Owner"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "对话权限"; width: 88px; vertical-alignment: center; }
+                                                    CheckBox {
+                                                        text: "仅授权用户（owner+授权者）";
+                                                        checked: !root.bots[root.selected].open-access;
+                                                        horizontal-stretch: 1;
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "open_access", "false"); } }
+                                                    }
+                                                    CheckBox {
+                                                        text: "任何人都可以对话";
+                                                        checked: root.bots[root.selected].open-access;
+                                                        horizontal-stretch: 1;
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "open_access", "true"); } }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
+                                                    Text { text: "Owner（管理员）"; width: 88px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].owner-open-id;
-                                                        placeholder-text: "ou_xxx（留空=首个私聊自动设置）";
+                                                        placeholder-text: "ou_xxx（管理员 open_id，逗号分隔多个）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "owner", self.text); }
+                                                    }
+                                                    Button {
+                                                        text: "生成管理员授权码";
+                                                        enabled: !root.bots[root.selected].open-access;
+                                                        clicked => { root.generate-owner-code(root.selected, "owner"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
+                                                    Text { text: "已授权用户"; width: 88px; vertical-alignment: center; }
+                                                    if root.bots[root.selected].granted.length == 0: Text {
+                                                        text: "暂无（点「生成授权码」邀请）";
+                                                        color: #888;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    if root.bots[root.selected].granted.length > 0: Text {
+                                                        text: "共 " + root.bots[root.selected].granted.length + " 人，逐一取消见下";
+                                                        color: #888;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "生成授权码";
+                                                        enabled: !root.bots[root.selected].open-access;
+                                                        clicked => { root.generate-owner-code(root.selected, "granted"); }
+                                                    }
+                                                }
+                                                for granted[gi] in root.bots[root.selected].granted: Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: granted.name + "（" + granted.open-id + "）";
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "取消授权";
+                                                        clicked => { root.remove-granted(root.selected, gi); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.owner-code-info != "": Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: root.owner-code-info;
+                                                        color: #b80;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "复制";
+                                                        clicked => { root.copy-owner-code("owner"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.grant-code-info != "": Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: root.grant-code-info;
+                                                        color: #b80;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "复制";
+                                                        clicked => { root.copy-owner-code("granted"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.bots[root.selected].open-access: Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
+                                                        color: #888;
+                                                        font-size: 11px;
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
@@ -862,12 +972,103 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "允许用户"; width: 88px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].ding-user-id;
-                                                        placeholder-text: "钉钉用户 staffId（留空=响应所有人，建议填）";
+                                                    Text { text: "对话权限"; width: 88px; vertical-alignment: center; }
+                                                    CheckBox {
+                                                        text: "仅授权用户（owner+授权者）";
+                                                        checked: !root.bots[root.selected].ding-open-access;
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "ding_user_id", self.text); }
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "ding_open_access", "false"); } }
+                                                    }
+                                                    CheckBox {
+                                                        text: "任何人都可以对话";
+                                                        checked: root.bots[root.selected].ding-open-access;
+                                                        horizontal-stretch: 1;
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "ding_open_access", "true"); } }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                                    Text { text: "Owner（管理员）"; width: 88px; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        text: root.bots[root.selected].ding-owner-ids;
+                                                        placeholder-text: "员工 staffId（管理员，逗号分隔多个）";
+                                                        horizontal-stretch: 1;
+                                                        edited => { root.bot-field-edited(root.selected, "ding_owner_ids", self.text); }
+                                                    }
+                                                    Button {
+                                                        text: "生成管理员授权码";
+                                                        enabled: !root.bots[root.selected].ding-open-access;
+                                                        clicked => { root.generate-owner-code(root.selected, "owner"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
+                                                    Text { text: "已授权用户"; width: 88px; vertical-alignment: center; }
+                                                    if root.bots[root.selected].ding-granted.length == 0: Text {
+                                                        text: "暂无（点「生成授权码」邀请）";
+                                                        color: #888;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    if root.bots[root.selected].ding-granted.length > 0: Text {
+                                                        text: "共 " + root.bots[root.selected].ding-granted.length + " 人，逐一取消见下";
+                                                        color: #888;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "生成授权码";
+                                                        enabled: !root.bots[root.selected].ding-open-access;
+                                                        clicked => { root.generate-owner-code(root.selected, "granted"); }
+                                                    }
+                                                }
+                                                for dg[gi] in root.bots[root.selected].ding-granted: Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: dg.name + "（" + dg.open-id + "）";
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "取消授权";
+                                                        clicked => { root.remove-granted(root.selected, gi); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.owner-code-info != "": Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: root.owner-code-info;
+                                                        color: #b80;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "复制";
+                                                        clicked => { root.copy-owner-code("owner"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.grant-code-info != "": Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: root.grant-code-info;
+                                                        color: #b80;
+                                                        font-size: 12px;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Button {
+                                                        text: "复制";
+                                                        clicked => { root.copy-owner-code("granted"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.bots[root.selected].ding-open-access: Row {
+                                                    Rectangle { width: 88px; }
+                                                    Text {
+                                                        text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
+                                                        color: #888;
+                                                        font-size: 11px;
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {

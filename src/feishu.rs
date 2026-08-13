@@ -190,9 +190,28 @@ impl FeishuClient {
         Ok(tok)
     }
 
+    /// 按 open_id 反查用户姓名（授权码消费后展示用）。best-effort：token/API 失败或
+    /// 用户不可见（如机器人/已离职）返回 None，调用方用 open_id 兜底显示。
+    pub async fn user_name(&self, open_id: &str) -> Option<String> {
+        let token = self.tenant_token().await.ok()?;
+        let url = format!("{API_BASE}/contact/v3/users/{open_id}");
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .query(&[("department_id_type", "open_department_id")])
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let name = resp["data"]["user"]["name"].as_str()?.to_string();
+        Some(name)
+    }
+
     /// 发文本到 chat，超长自动分段加（i/n）前缀。token 即 bot 身份。
-    pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
-        let token = self.tenant_token().await?;
+    pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {        let token = self.tenant_token().await?;
         let chunks = split_text(text, FEISHU_MSG_LIMIT);
         let n = chunks.len();
         for (i, chunk) in chunks.into_iter().enumerate() {

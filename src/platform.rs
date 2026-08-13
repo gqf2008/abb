@@ -43,6 +43,68 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// 复制文本到系统剪贴板（授权码等）。pbcopy / clip / wl-copy+xclip 尽力而为；失败返回 false。
+/// 命令失败（如无头环境无 xclip）只回 false 不 panic，调用方给用户提示。
+/// 注意：写完 stdin 必须关闭（drop）让子进程读到 EOF 才结束，否则 wait() 会死锁。
+pub fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::Stdio;
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("pbcopy");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new("clip");
+        c.creation_flags(0x0800_0000);
+        c
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        // Wayland 用 wl-copy，X11 用 xclip，都缺则失败
+        if std::process::Command::new("wl-copy")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            std::process::Command::new("wl-copy")
+        } else if std::process::Command::new("xclip")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            let mut c = std::process::Command::new("xclip");
+            c.args(["-selection", "clipboard"]);
+            c
+        } else {
+            return false;
+        }
+    };
+    let mut child = match cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => return false,
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin); // 关闭管道 → 子进程读到 EOF 才退出
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
 /// 当前可执行文件路径（GUI 本体）。
 pub fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("拿不到当前可执行文件路径")
