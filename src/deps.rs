@@ -27,10 +27,45 @@ pub fn composed_path() -> String {
         "/usr/sbin".to_string(),
         "/sbin".to_string(),
     ];
+    // 系统级持久 PATH 源：/etc/paths 与 /etc/paths.d/*（GUI/launchd 启动不读 shell rc，
+    // 但会读 /etc/paths.d——用户自定义安装目录常放在这）。
+    parts.extend(unix_etc_paths());
     if let Ok(existing) = std::env::var("PATH") {
         parts.push(existing);
     }
     parts.join(":")
+}
+
+/// macOS 系统级持久 PATH：/etc/paths（每行一个）+ /etc/paths.d/*（每行一个，`/usr/bin:/bin` 等）。
+/// GUI/登录项启动的进程继承 launchd PATH（不含 shell rc 的 export），但会读这些文件——
+/// 用户往 /etc/paths.d 加自定义目录后，本桥 launchd 环境也能找到（Docker 用户常踩：
+/// shell 里能 which，服务里找不到）。
+#[cfg(unix)]
+fn unix_etc_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    for f in ["/etc/paths"] {
+        if let Ok(text) = std::fs::read_to_string(f) {
+            for line in text.lines() {
+                let p = line.trim();
+                if !p.is_empty() && !p.starts_with('#') {
+                    out.push(p.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir("/etc/paths.d") {
+        for ent in rd.flatten() {
+            if let Ok(text) = std::fs::read_to_string(ent.path()) {
+                for line in text.lines() {
+                    let p = line.trim();
+                    if !p.is_empty() && !p.starts_with('#') {
+                        out.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -41,15 +76,65 @@ pub fn composed_path() -> String {
             parts.push(PathBuf::from(base).join(sub).to_string_lossy().into_owned());
         }
     };
-    push_env(&mut parts, "APPDATA", "npm"); // npm 全局 bin
+    push_env(&mut parts, "APPDATA", "npm"); // npm 全局 bin（claude.cmd/codex.cmd/pi.cmd）
     push_env(&mut parts, "LOCALAPPDATA", "Programs\\nodejs");
     push_env(&mut parts, "USERPROFILE", ".local\\bin");
     push_env(&mut parts, "USERPROFILE", ".cargo\\bin");
     push_env(&mut parts, "USERPROFILE", "AppData\\Local\\Microsoft\\WinGet\\Links");
+    push_env(&mut parts, "USERPROFILE", "scoop\\shims"); // scoop 安装的 cli shim
+    // nvm-windows：npm 全局 bin 落在 nvm 当前版本目录（NVM_HOME 或 %APPDATA%\nvm）
+    if let Ok(nvm) = std::env::var("NVM_HOME") {
+        parts.push(PathBuf::from(nvm).to_string_lossy().into_owned());
+    } else {
+        push_env(&mut parts, "APPDATA", "nvm");
+    }
+    // 注册表持久 PATH（用户 + 系统）：GUI 由登录项/任务计划启动时可能没继承 shell 级配置；
+    // 用户往「环境变量」里加的自定义目录（如 pi 装的自定义目录）在这里，显式合并。
+    parts.extend(windows_registry_paths());
+    // 当前进程 PATH（交互 shell 启动的 GUI/服务可能已带；桌面/开机自启场景精简则靠上面前缀）
     if let Ok(existing) = std::env::var("PATH") {
         parts.push(existing);
     }
     parts.join(";")
+}
+
+/// Windows 持久 PATH（注册表）：HKCU\Environment（用户级）与
+/// HKLM\...\Session Manager\Environment（系统级）的 Path 值，分号分隔。
+/// 通过 `reg query` 读取（零依赖；GUI 环境也能跑 reg.exe）。REG_EXPAND_SZ 里的
+/// %VAR% 不展开——多数是绝对路径，够用；展开交给 find_in_path 的逐段探测。
+#[cfg(windows)]
+fn windows_registry_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    for scope in [
+        "HKCU\\Environment",
+        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+    ] {
+        let Ok(o) = std::process::Command::new("reg")
+            .args(["query", scope, "/v", "Path"])
+            .output()
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&o.stdout);
+        // reg query 行格式：`    Path    REG_EXPAND_SZ    C:\a;C:\b`
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.contains("REG_") && l.contains("Path"))
+        {
+            if let Some(value) = line
+                .split_once("REG_")
+                .and_then(|(_, v)| v.split_once(' ').map(|(_, r)| r))
+            {
+                for part in value.split(';') {
+                    let p = part.trim();
+                    if !p.is_empty() {
+                        out.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 在 composed PATH 各目录里找可执行文件（等价 `which`，但不依赖外部 which——launchd 环境不一定有）。

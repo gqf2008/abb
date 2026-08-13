@@ -778,14 +778,29 @@ export component SettingsWindow inherits Window {
                                                         selected => { root.bot-field-edited(root.selected, "kind", self.current-value); }
                                                     }
                                                 }
-                                                // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot
+                                                // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot。
+                                                // 用互斥 CheckBox（非 ComboBox）：Slint ComboBox 的 current-value 是命令式快照，
+                                                // 切 bot 后下拉仍显示上一个 bot 的后端（set_vec 重建不可靠）——实测「改一个看着像
+                                                // 其它 bot 也被换掉」。CheckBox 是实时绑定，无此问题（与对话权限同款）。
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "默认后端"; width: 88px; vertical-alignment: center; }
-                                                    ComboBox {
-                                                        model: ["claude", "codex", "pi"];
-                                                        current-value: root.bots[root.selected].backend;
+                                                    CheckBox {
+                                                        text: "claude";
+                                                        checked: root.bots[root.selected].backend == "claude" || root.bots[root.selected].backend == "";
                                                         horizontal-stretch: 1;
-                                                        selected => { root.bot-field-edited(root.selected, "backend", self.current-value); }
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "backend", "claude"); } }
+                                                    }
+                                                    CheckBox {
+                                                        text: "codex";
+                                                        checked: root.bots[root.selected].backend == "codex";
+                                                        horizontal-stretch: 1;
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "backend", "codex"); } }
+                                                    }
+                                                    CheckBox {
+                                                        text: "pi";
+                                                        checked: root.bots[root.selected].backend == "pi";
+                                                        horizontal-stretch: 1;
+                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "backend", "pi"); } }
                                                     }
                                                 }
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names

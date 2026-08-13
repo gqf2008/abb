@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 /// 按**字符**截断（可能含中文，按字节切会落在 UTF-8 中间 panic）。日志/报错预览用。
 pub fn truncate(s: &str, max_chars: usize) -> String {
@@ -610,8 +609,31 @@ fn stderr_tail(stderr: &str) -> String {
 }
 
 /// claude 命令行构造（拆出便于单测参数组合与 env 注入）。
-fn claude_command(resume: bool, session_id: &str) -> std::process::Command {
-    let mut c = std::process::Command::new("claude");
+/// 构造子进程命令：Windows 下 npm 全局装的 claude/codex/pi 都是 `.cmd`/`.bat` shim，
+/// CreateProcess 不直接执行脚本（报 "program not found"）→ 必须经 `cmd.exe /c` 包装；
+/// 其它平台直接执行。program 传入 deps::find_in_path 解析出的真实路径（找不到才回落裸名）。
+fn shim_command(program: &std::path::Path) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let ext = program
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("cmd" | "bat")) {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/c").arg(program);
+            return c;
+        }
+    }
+    std::process::Command::new(program)
+}
+
+fn claude_command(
+    program: &std::path::Path,
+    resume: bool,
+    session_id: &str,
+) -> std::process::Command {
+    let mut c = shim_command(program);
     c.arg("-p").arg("--dangerously-skip-permissions");
     c.arg("--verbose").arg("--output-format").arg("stream-json");
     c.arg(if resume { "--resume" } else { "--session-id" })
@@ -662,13 +684,23 @@ async fn run_once(
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncBufReadExt;
 
+    // 解析可执行文件真实路径（Windows：npm shim 是 .cmd，CreateProcess 不执行脚本；
+    // mac：npm 全局 bin 是软链，find_in_path 跟随）。找不到才回落裸名（报错文案带安装指引）。
+    let program = match backend {
+        Backend::Pi => "pi",
+        Backend::Codex => "codex",
+        Backend::Claude => "claude",
+    };
+    let resolved =
+        crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
+
     let mut cmd = match backend {
         Backend::Codex => {
             // codex 多轮上下文（对齐 claude）：首轮 `codex exec`，后续轮 `codex exec resume <tid>`。
             // 关键坑（实测）：① 必须 `exec resume`（顶层 `codex resume` 是 TUI，stdin 非终端报错）；
             // ② codex 用自己的 thread_id（`thread.started` 事件），不是桥生成的 UUID —— 故加 --json
             //    从输出抓真实 tid 回存；③ resume 一个没建过的 tid 报 "no rollout found" → 上层回退 exec。
-            let mut c = Command::new("codex");
+            let mut c = tokio::process::Command::from(shim_command(&resolved));
             c.arg("exec");
             if resume {
                 c.arg("resume").arg(session_id);
@@ -687,7 +719,7 @@ async fn run_once(
             // stream-json：逐事件流式输出（assistant/result…），配合逐行解析可实时推进度。
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
             // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）。
-            tokio::process::Command::from(claude_command(resume, session_id))
+            tokio::process::Command::from(claude_command(&resolved, resume, session_id))
         }
         Backend::Pi => {
             // pi 非交互 print 模式：`pi -p --mode json --session-id <uuid>`。
@@ -699,7 +731,7 @@ async fn run_once(
             // ③ --session-dir 固定到本 bot 工作区：会话文件随 workspace 隔离，`session reset` 可整个清掉；
             // ④ --mode json 逐事件 JSONL 输出（message_end 是权威回复）；LLM 错误在 json 模式下
             //    进程仍 exit 0，错误信息在 message_end.stopReason/errorMessage——由 process_line 判错。
-            let mut c = Command::new("pi");
+            let mut c = tokio::process::Command::from(shim_command(&resolved));
             c.arg("-p")
                 .arg("--mode")
                 .arg("json")
@@ -1441,7 +1473,7 @@ mod tests {
 
     #[test]
     fn claude_command_injects_telemetry_disable() {
-        let c = claude_command(false, "sess-1");
+        let c = claude_command(std::path::Path::new("claude"), false, "sess-1");
         let has_disable = c.get_envs().any(|(k, v)| {
             k.to_str() == Some("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
                 && v == Some(std::ffi::OsStr::new("1"))
@@ -1450,10 +1482,23 @@ mod tests {
         // 非 resume → --session-id；resume → --resume
         assert!(c.get_args().any(|a| a == "--session-id"));
         assert!(c.get_args().any(|a| a == "sess-1"));
-        let r = claude_command(true, "sess-2");
+        let r = claude_command(std::path::Path::new("claude"), true, "sess-2");
         assert!(r.get_args().any(|a| a == "--resume"));
         assert!(r.get_args().any(|a| a == "sess-2"));
         assert!(!r.get_args().any(|a| a == "--session-id"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shim_command_wraps_cmd_shims_on_windows() {
+        // Windows：.cmd shim → cmd.exe /c 包装（CreateProcess 不执行脚本）
+        let c = shim_command(std::path::Path::new("C:\\Users\\x\\AppData\\Roaming\\npm\\pi.cmd"));
+        let prog = c.get_program().to_str().unwrap().to_string();
+        assert_eq!(prog.to_ascii_lowercase(), "cmd", "应经 cmd.exe 执行");
+        assert!(c.get_args().any(|a| a.to_str().map(|s| s.to_ascii_lowercase()) == Some("/c".into())));
+        // .exe 直接执行
+        let e = shim_command(std::path::Path::new("C:\\tools\\pi.exe"));
+        assert!(e.get_program().to_str().unwrap().ends_with("pi.exe"));
     }
 
     #[test]
