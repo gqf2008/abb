@@ -13,7 +13,11 @@ pub fn open_path(path: &std::path::Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .arg(path)
+            .creation_flags(0x0800_0000)
+            .spawn();
     }
     #[cfg(target_os = "linux")]
     {

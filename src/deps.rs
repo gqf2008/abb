@@ -10,6 +10,16 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+/// Windows：spawn 外部子进程时抑制控制台窗口（CREATE_NO_WINDOW）。
+/// 桥/服务是 GUI 子系统，spawn reg/npm/cmd/taskkill 等控制台程序默认会弹黑框——
+/// 所有「会 spawn 子进程」的地方统一调它（agent 子进程另在 run_once 里对 tokio Command
+/// 设置，此处管 std::process::Command 的零散调用）。
+#[cfg(windows)]
+pub fn apply_no_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000);
+}
+
 /// 组 PATH：claude 在 ~/.local/bin，codex/lark-cli 在 ~/.npm-global/bin；launchd 环境精简须显式带。
 /// 分平台：分隔符 win 用 `;`、unix 用 `:`；常见安装目录各平台不同。
 #[cfg(unix)]
@@ -109,9 +119,10 @@ fn windows_registry_paths() -> Vec<String> {
         "HKCU\\Environment",
         "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
     ] {
-        let Ok(o) = std::process::Command::new("reg")
-            .args(["query", scope, "/v", "Path"])
-            .output()
+        let mut reg = std::process::Command::new("reg");
+        reg.args(["query", scope, "/v", "Path"]);
+        apply_no_window(&mut reg);
+        let Ok(o) = reg.output()
         else {
             continue;
         };
@@ -444,6 +455,11 @@ async fn run_step(step: &InstallStep) -> Result<String, String> {
         c.args(&step.args);
         c
     };
+    // Windows：安装依赖（npm.cmd 等）也抑制控制台窗口，别在 GUI 里弹黑框
+    #[cfg(windows)]
+    {
+        apply_no_window(cmd.as_std_mut());
+    }
     cmd.env("PATH", composed_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
