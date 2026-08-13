@@ -313,14 +313,20 @@ fn sync_providers_model(
     );
 }
 
-/// 跑一次依赖检测并把全部 6 项状态回填到设置窗（claude/codex/node/python3/lark-cli/dingtalk-cli）。
+/// 跑一次依赖检测并把全部 7 项状态回填到设置窗（claude/codex/pi/node/python3/lark-cli/dingtalk-cli）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
-    let get = |id: &str| all.iter().find(|d| d.id == id).map(|d| d.found).unwrap_or(false);
-    // #8 M0：claude/codex 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
-    w.set_missing_agent(!get("claude") || !get("codex"));
+    let get = |id: &str| {
+        all.iter()
+            .find(|d| d.id == id)
+            .map(|d| d.found)
+            .unwrap_or(false)
+    };
+    // #8 M0：claude/codex/pi 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
+    w.set_missing_agent(!get("claude") || !get("codex") || !get("pi"));
     w.set_claude_installed(get("claude"));
     w.set_codex_installed(get("codex"));
+    w.set_pi_installed(get("pi"));
     w.set_node_installed(get("node"));
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
@@ -692,7 +698,7 @@ pub fn run_gui() -> Result<()> {
             let _ = platform::set_autostart(on);
         });
     }
-    // #8 M0 自动引导：claude/codex 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
+    // #8 M0 自动引导：claude/codex/pi 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
     // （load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好 agent 的
     // 开发者/朋友零打扰（条件不成立）；对新装用户这是「打开就能被引导」的关键一步。
     {
@@ -703,7 +709,7 @@ pub fn run_gui() -> Result<()> {
                 .map(|d| !d.found)
                 .unwrap_or(true)
         };
-        if missing("claude") || missing("codex") {
+        if missing("claude") || missing("codex") || missing("pi") {
             let work = work.clone();
             let model = bots_model.clone();
             let pwork = providers_work.clone();

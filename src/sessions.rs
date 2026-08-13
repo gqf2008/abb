@@ -1,6 +1,7 @@
 //! 会话持久化 —— ~/.agent-bridge/workspaces/<bot>/sessions.json。
-//! 会话按后端区分（claude 的 --resume UUID 与 codex 的 thread_id 互不通用，共用一个槽位切后端必串）：
-//! {chat_id: {claude: {session_id, started}, codex: {session_id, started}}}
+//! 会话按后端区分（claude 的 --resume UUID、codex 的 thread_id、pi 的 --session-id UUID 互不通用，
+//! 共用一个槽位切后端必串）：
+//! {chat_id: {claude: {session_id, started}, codex: {session_id, started}, pi: {session_id, started}}}
 //! 当前操作哪个后端的槽位由 SessionStore::new(current_backend, bot_key) 选定——即 per-bot 配置的后端。
 //! 旧扁平格式 {chat_id: {backend, session_id, started}} load 时自动迁移到对应后端的槽位。
 
@@ -27,6 +28,8 @@ pub struct ChatEntry {
     pub claude: Slot,
     #[serde(default, skip_serializing_if = "Slot::is_empty")]
     pub codex: Slot,
+    #[serde(default, skip_serializing_if = "Slot::is_empty")]
+    pub pi: Slot,
 }
 
 impl Slot {
@@ -121,9 +124,11 @@ impl SessionStore {
         // （backend/session_id/started 被当未知键忽略、claude/codex 缺省为空），结果全空、迁移分支走不到。
         // 故只有解析出非空槽位才采纳新格式，否则回退旧格式迁移。
         if let Ok(m) = serde_json::from_str::<HashMap<String, ChatEntry>>(text) {
-            let has_data = m
-                .values()
-                .any(|e| !e.claude.session_id.is_empty() || !e.codex.session_id.is_empty());
+            let has_data = m.values().any(|e| {
+                !e.claude.session_id.is_empty()
+                    || !e.codex.session_id.is_empty()
+                    || !e.pi.session_id.is_empty()
+            });
             if has_data || m.is_empty() {
                 return Some(m);
             }
@@ -142,6 +147,8 @@ impl SessionStore {
             let mut entry = ChatEntry::default();
             if e.backend.eq_ignore_ascii_case("codex") {
                 entry.codex = slot;
+            } else if e.backend.eq_ignore_ascii_case("pi") {
+                entry.pi = slot;
             } else {
                 entry.claude = slot; // 默认/旧值一律归 claude
             }
@@ -172,6 +179,8 @@ impl SessionStore {
     fn slot_mut<'a>(entry: &'a mut ChatEntry, backend: &str) -> &'a mut Slot {
         if backend.eq_ignore_ascii_case("codex") {
             &mut entry.codex
+        } else if backend.eq_ignore_ascii_case("pi") {
+            &mut entry.pi
         } else {
             &mut entry.claude
         }
@@ -273,6 +282,8 @@ impl SessionStore {
             .map(|e| {
                 if self.current_backend.eq_ignore_ascii_case("codex") {
                     e.codex.started
+                } else if self.current_backend.eq_ignore_ascii_case("pi") {
+                    e.pi.started
                 } else {
                     e.claude.started
                 }
@@ -294,25 +305,59 @@ mod tests {
         assert_eq!(e.codex.session_id, "tid-1");
         assert!(e.codex.started);
         assert!(e.claude.session_id.is_empty(), "claude 槽位应为空");
+        assert!(e.pi.session_id.is_empty(), "pi 槽位应为空");
+
+        // pi 后端的旧扁平记录 → 落到 pi 槽位
+        let legacy_pi = r#"{"oc_p": {"backend": "pi", "session_id": "p-uuid", "started": false}}"#;
+        let m2 = SessionStore::parse(legacy_pi).expect("pi 旧格式应可迁移");
+        assert_eq!(m2["oc_p"].pi.session_id, "p-uuid");
+        assert!(m2["oc_p"].claude.session_id.is_empty());
     }
 
     #[test]
     fn parses_per_backend_format() {
-        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}}}"#;
+        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}, "pi": {"session_id": "p-uuid", "started": true}}}"#;
         let m = SessionStore::parse(new).expect("新格式应解析");
         let e = &m["oc_xxx"];
         assert_eq!(e.claude.session_id, "c-uuid");
         assert_eq!(e.codex.session_id, "x-tid");
+        assert_eq!(e.pi.session_id, "p-uuid");
+        assert!(e.pi.started);
     }
 
     #[test]
     fn backends_are_independent() {
-        // 同一 chat 的 claude/codex 槽位互不干扰（切后端不串）
+        // 同一 chat 的 claude/codex/pi 槽位互不干扰（切后端不串）
         let new = r#"{"c": {"claude": {"session_id": "claude-uuid", "started": true}}}"#;
         let m = SessionStore::parse(new).unwrap();
         let e = &m["c"];
         assert_eq!(e.claude.session_id, "claude-uuid");
         assert!(e.codex.session_id.is_empty());
+        assert!(e.pi.session_id.is_empty());
+    }
+
+    #[test]
+    fn pi_slot_isolated_from_claude() {
+        // pi 槽位独立：claude 槽位有值不影响 pi 槽位的读写（切后端不串）
+        let dir = std::env::temp_dir().join(format!("abb-sessions-pi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        // 先写一个 claude 槽位有值的文件
+        std::fs::write(
+            &path,
+            r#"{"oc_x": {"claude": {"session_id": "c-uuid", "started": true}}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::new_at("pi", path.clone());
+        let (sid, started) = store.ensure_with_started("oc_x");
+        assert!(!started, "pi 槽位应是全新会话");
+        assert!(!sid.is_empty());
+        assert!(store.mark_started_if("oc_x", &sid));
+        // claude 槽位不受影响
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("c-uuid"));
+        assert!(text.contains(&sid));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
