@@ -72,6 +72,13 @@ export struct OwnerRow {
     open_id: string,     // 飞书 open_id（事实键）
 }
 
+// 互斥选项行（后端三选一 / 对话权限二选一）：checked 由 Rust 按选中 bot 重算后整体替换
+// model → for 循环重建 CheckBox 实例，绕开「用户交互移除 checked 绑定、状态残留到其它 bot」的坑。
+export struct OptionRow {
+    name: string,
+    checked: bool,
+}
+
 // 单个 bot 行的数据（与 Rust 侧 BotRow 对应）
 export struct BotRow {
     name: string,        // 显示名
@@ -391,6 +398,21 @@ export component SettingsWindow inherits Window {
     // （"授权码：xxxx（剩 N 分钟）"；无则空）。生成后/热刷新更新。
     in-out property <string> owner-code-info: "";
     in-out property <string> grant-code-info: "";
+    // 互斥 CheckBox 的勾选状态（Rust 侧按选中 bot 重算；slint 表达式绑定会被用户交互破坏——
+    // 点击后 in-out 属性绑定失效、状态残留到其它 bot，故用显式 property 驱动）
+    in-out property <[OptionRow]> backend-options: [
+        { name: "claude", checked: true },
+        { name: "codex", checked: false },
+        { name: "pi", checked: false },
+    ];
+    in-out property <[OptionRow]> access-options: [
+        { name: "仅授权用户（owner+授权者）", checked: true },
+        { name: "任何人都可以对话", checked: false },
+    ];
+    in-out property <[OptionRow]> ding-access-options: [
+        { name: "仅授权用户（owner+授权者）", checked: true },
+        { name: "任何人都可以对话", checked: false },
+    ];
 
     callback save-clicked();
     callback cancel-clicked();
@@ -408,6 +430,9 @@ export component SettingsWindow inherits Window {
     // 旧版 bot-edited 一次传全部字段、未改字段从 model 读，而 model 在编辑后不同步（过期），
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
     callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
+    callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi）
+    callback access-option-toggled(int);   // 飞书对话权限下标（0=仅授权 1=任何人）
+    callback ding-access-option-toggled(int); // 钉钉对话权限下标
     callback generate-owner-code(int, string); // 生成授权码：bot idx + role（"owner"=管理员码 / "granted"=普通码），覆盖同类型旧码
     callback copy-owner-code(string);          // 复制指定 role 的授权码到剪贴板
     callback remove-granted(int, int); // 取消授权：bot idx + 授权者下标（从授权者白名单移除）
@@ -779,28 +804,15 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot。
-                                                // 用互斥 CheckBox（非 ComboBox）：Slint ComboBox 的 current-value 是命令式快照，
-                                                // 切 bot 后下拉仍显示上一个 bot 的后端（set_vec 重建不可靠）——实测「改一个看着像
-                                                // 其它 bot 也被换掉」。CheckBox 是实时绑定，无此问题（与对话权限同款）。
+                                                // 勾选态由 backend-options model 驱动（for 循环重建实例），不依赖会被
+                                                // 用户交互破坏的 checked 绑定（实测「微信选 pi 飞书也选中」）。
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "默认后端"; width: 88px; vertical-alignment: center; }
-                                                    CheckBox {
-                                                        text: "claude";
-                                                        checked: root.bots[root.selected].backend == "claude" || root.bots[root.selected].backend == "";
+                                                    for opt[i] in root.backend-options: CheckBox {
+                                                        text: opt.name;
+                                                        checked: opt.checked;
                                                         horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "backend", "claude"); } }
-                                                    }
-                                                    CheckBox {
-                                                        text: "codex";
-                                                        checked: root.bots[root.selected].backend == "codex";
-                                                        horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "backend", "codex"); } }
-                                                    }
-                                                    CheckBox {
-                                                        text: "pi";
-                                                        checked: root.bots[root.selected].backend == "pi";
-                                                        horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "backend", "pi"); } }
+                                                        toggled => { root.backend-option-toggled(i); }
                                                     }
                                                 }
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
@@ -816,17 +828,11 @@ export component SettingsWindow inherits Window {
                                                 // ── 飞书字段（owner/授权者/对话权限）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "对话权限"; width: 88px; vertical-alignment: center; }
-                                                    CheckBox {
-                                                        text: "仅授权用户（owner+授权者）";
-                                                        checked: !root.bots[root.selected].open-access;
+                                                    for opt[i] in root.access-options: CheckBox {
+                                                        text: opt.name;
+                                                        checked: opt.checked;
                                                         horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "open_access", "false"); } }
-                                                    }
-                                                    CheckBox {
-                                                        text: "任何人都可以对话";
-                                                        checked: root.bots[root.selected].open-access;
-                                                        horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "open_access", "true"); } }
+                                                        toggled => { root.access-option-toggled(i); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
@@ -988,17 +994,11 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "对话权限"; width: 88px; vertical-alignment: center; }
-                                                    CheckBox {
-                                                        text: "仅授权用户（owner+授权者）";
-                                                        checked: !root.bots[root.selected].ding-open-access;
+                                                    for opt[i] in root.ding-access-options: CheckBox {
+                                                        text: opt.name;
+                                                        checked: opt.checked;
                                                         horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "ding_open_access", "false"); } }
-                                                    }
-                                                    CheckBox {
-                                                        text: "任何人都可以对话";
-                                                        checked: root.bots[root.selected].ding-open-access;
-                                                        horizontal-stretch: 1;
-                                                        toggled => { if self.checked { root.bot-field-edited(root.selected, "ding_open_access", "true"); } }
+                                                        toggled => { root.ding-access-option-toggled(i); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
