@@ -38,11 +38,13 @@ fn link_pi_skills() {
             }
             let link = pi_skills.join(&name);
             if std::fs::symlink_metadata(&link).is_err() {
+                // 相对路径软链仅 unix 用（Windows 直接链绝对路径 ent.path()）
+                #[cfg(unix)]
                 let rel = PathBuf::from("../../../.agents/skills").join(&name);
                 #[cfg(unix)]
                 let _ = std::os::unix::fs::symlink(&rel, &link);
                 #[cfg(windows)]
-                let _ = std::os::windows::fs::symlink_dir(&ent.path(), &link);
+                let _ = std::os::windows::fs::symlink_dir(ent.path(), &link);
                 linked += 1;
             }
         }
@@ -212,6 +214,8 @@ async fn install_via_git() {
             // 软链进 ~/.claude/skills（跳过已存在）
             let link = claude_skills.join(&name);
             if std::fs::symlink_metadata(&link).is_err() {
+                // 相对路径软链仅 unix 用（Windows 直接链绝对路径 dst）
+                #[cfg(unix)]
                 let rel = PathBuf::from("../../.agents/skills").join(&name);
                 #[cfg(unix)]
                 let _ = std::os::unix::fs::symlink(&rel, &link);
