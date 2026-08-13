@@ -453,6 +453,22 @@ impl Bridge {
 
         // 打断拦截：停止词 → 叫停该 chat 正在跑的任务。必须在拿串行锁**之前**判断，
         // 否则会被排到运行中任务之后，等任务跑完才处理（那时打断就没意义了）。
+        // 显式命令 /cancel /stop：有任务 → 打断；无任务 → 明确回复（不透传给 agent，避免
+        // 被当普通问题回答）。自然停止词（停/停止/取消/stop/cancel）→ 有任务打断、无任务透传
+        // （对话语境下不该硬拦，例如「别取消，先继续」）。
+        if is_cancel_command(&text) {
+            if let Some(flag) = self.cancel_flags.lock().unwrap().get(&key).cloned() {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::log!("[bridge] 收到停止指令 chat={}", trunc(&key, 16));
+                // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
+                return;
+            }
+            // 无在跑任务 → 命令化反馈，不喂给 agent
+            if let Err(e) = self.send_reply(&ev, "✅ 当前没有正在运行的任务。").await {
+                crate::log!("[bridge] /cancel 确认发送失败: {e:#}");
+            }
+            return;
+        }
         if is_cancel_keyword(&text) {
             if let Some(flag) = self.cancel_flags.lock().unwrap().get(&key).cloned() {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -948,6 +964,13 @@ fn is_cancel_keyword(text: &str) -> bool {
     KEYWORDS.iter().any(|k| *k == t)
 }
 
+/// 显式取消命令（/cancel、/stop）：与自然停止词不同——无任务在跑时也要明确回复、
+/// 不透传给 agent（避免被当普通问题回答）。
+fn is_cancel_command(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    t == "/cancel" || t == "/stop"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,6 +1040,23 @@ mod tests {
         assert!(!is_new_command("/news"));
         assert!(!is_new_command("new"));
         assert!(!is_new_command(""));
+    }
+
+    #[test]
+    fn cancel_command_is_exact_and_case_insensitive() {
+        // 显式取消命令：/cancel /stop 精确匹配（含大小写/首尾空白），带参数不算
+        for c in ["/cancel", "/stop", " /cancel ", "/CANCEL", "/Stop"] {
+            assert!(is_cancel_command(c), "{c:?} 应是取消命令");
+        }
+        assert!(!is_cancel_command("/cancel 全部"));
+        assert!(!is_cancel_command("/cancelled"));
+        assert!(!is_cancel_command("取消")); // 自然词不是命令（保持透传语义）
+        assert!(!is_cancel_command("stop"));
+        assert!(!is_cancel_command(""));
+        // 自然停止词仍是关键词（有任务时也能打断）
+        assert!(is_cancel_keyword("取消"));
+        assert!(is_cancel_keyword("/cancel"));
+        assert!(is_cancel_keyword("STOP"));
     }
 
     #[test]
@@ -1602,6 +1642,32 @@ mod tests {
         );
         bridge.on_payload(payload.as_bytes()).await;
         assert_eq!(runner.prompts(), vec!["你好"], "白名单成员应触发 agent");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_cancel_without_task_replies_and_no_agent() {
+        // /cancel 无任务在跑 → 明确回复「当前没有正在运行的任务」，不透传给 agent
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let payload = feishu_payload(
+            "om_cancel", "oc_p2p", "p2p", "", "", "user", "ou_owner", &[], "/cancel",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        assert!(runner.prompts().is_empty(), "/cancel 不应触发 agent");
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("当前没有正在运行的任务")),
+            "无任务时应给明确反馈"
+        );
         cleanup_bridge(&bridge);
     }
 
