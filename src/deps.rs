@@ -122,8 +122,7 @@ fn windows_registry_paths() -> Vec<String> {
         let mut reg = std::process::Command::new("reg");
         reg.args(["query", scope, "/v", "Path"]);
         apply_no_window(&mut reg);
-        let Ok(o) = reg.output()
-        else {
+        let Ok(o) = reg.output() else {
             continue;
         };
         let text = String::from_utf8_lossy(&o.stdout);
@@ -178,11 +177,10 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
             continue;
         }
         let base = PathBuf::from(dir);
-        // 先无扩展名（极少见），再按 PATHEXT 顺序试
-        let direct = base.join(name);
-        if direct.is_file() {
-            return Some(direct);
-        }
+        // 只按 PATHEXT 找 .com/.exe/.bat/.cmd，**不试无扩展名文件**：npm 在 Windows 会
+        // 同时生成 `pi.cmd`（cmd 用）与无扩展 `pi`（Git Bash 用 shell 脚本），若先命中
+        // 无扩展脚本直接 CreateProcess 会报 ERROR_BAD_EXE_FORMAT（193「不是有效的 Win32
+        // 应用程序」）。可执行按 PATHEXT 顺序（.exe 优先于 .cmd）。
         for ext in &pathext {
             let cand = base.join(format!("{name}{}", ext.to_lowercase()));
             if cand.is_file() {
