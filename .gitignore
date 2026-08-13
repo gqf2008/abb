@@ -24,4 +24,4 @@ logs/
 scripts/
 
 # CI 生成的安装包，不入库
-installer/Output/
+app-assets/Output/

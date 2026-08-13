@@ -119,7 +119,7 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & ISCC.exe /DMyAppVersion=$version installer\ABB.iss
+          & ISCC.exe /DMyAppVersion=$version app-assets\ABB.iss
 
       # Windows 代码签名：有证书时启用（Azure Trusted Signing 或 EV），否则跳过。
       # 注意：secrets 不能出现在 if 条件里（workflow 会解析失败），所以运行时判断。
@@ -135,12 +135,12 @@ jobs:
           }
           $pfx = [IO.File]::WriteAllBytes("$env:TEMP\cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
           & signtool sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
-            (Get-ChildItem installer\Output\ABB-Setup-*.exe | Select-Object -First 1).FullName
+            (Get-ChildItem app-assets\Output\ABB-Setup-*.exe | Select-Object -First 1).FullName
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-dist
-          path: installer/Output/ABB-Setup-*.exe
+          path: app-assets/Output/ABB-Setup-*.exe
           if-no-files-found: error
 
   # ─────────────────────────── 汇总发 Release ───────────────────────────
