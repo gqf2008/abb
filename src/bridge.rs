@@ -1195,12 +1195,26 @@ mod tests {
             _bot_key: &str,
             _sessions: Option<&SessionStore>,
             _progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-            _cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+            cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         ) -> Result<agent::RunOutcome, String> {
             self.prompts.lock().unwrap().push(prompt.to_string());
             self.started.notify_one();
             if self.block {
-                self.release.notified().await;
+                // 挂住期间响应 cancel（模拟真实 agent 被打断）：cancel 置 true → Cancelled
+                tokio::select! {
+                    _ = self.release.notified() => {}
+                    _ = async {
+                        let flag = cancel.clone().expect("blocking mock 需要 cancel flag");
+                        loop {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    } => {
+                        return Ok(agent::RunOutcome::Cancelled);
+                    }
+                }
             }
             // 返回本次运行使用的 session_id——bridge 据此做 mark_started_if 身份校验
             Ok(agent::RunOutcome::Reply {
@@ -1659,15 +1673,49 @@ mod tests {
         };
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
         let payload = feishu_payload(
-            "om_cancel", "oc_p2p", "p2p", "", "", "user", "ou_owner", &[], "/cancel",
+            "om_cancel",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_owner",
+            &[],
+            "/cancel",
         );
         bridge.on_payload(payload.as_bytes()).await;
 
         assert!(runner.prompts().is_empty(), "/cancel 不应触发 agent");
         assert!(
-            msgr.sent().iter().any(|t| t.contains("当前没有正在运行的任务")),
+            msgr.sent()
+                .iter()
+                .any(|t| t.contains("当前没有正在运行的任务")),
             "无任务时应给明确反馈"
         );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_cancel_interrupts_running_task() {
+        // /cancel 在任务运行中 → 打断（mock 返回 Cancelled）→ 回「⏹ 已停止」
+        let runner = Arc::new(MockAgentRunner::blocking("done"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+
+        // 普通消息触发 agent（挡板挂住等 release/cancel）
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_x", "hello")).await });
+        runner.started.notified().await; // agent 已进入「运行中」、cancel_flags 已注册
+
+        // 任务运行中发 /cancel → 打断
+        bridge.handle(test_ev("m2", "oc_x", "/cancel")).await;
+        task.await.unwrap();
+
+        assert!(
+            msgr.sent().iter().any(|t| t == "⏹ 已停止"),
+            "被打断的任务应回「⏹ 已停止」"
+        );
+        // 打断不算完成：started 不应被 mark（Cancelled 路径不 mark）
+        assert!(!bridge.sessions.is_started("oc_x"));
         cleanup_bridge(&bridge);
     }
 
