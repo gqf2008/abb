@@ -1,4 +1,4 @@
-//! 依赖检测与安装 —— claude / codex / nodejs / python3 / lark-cli / dingtalk-cli。
+//! 依赖检测与安装 —— claude / codex / pi / nodejs / python3 / lark-cli / dingtalk-cli。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
 //! 安装命令按平台出（mac 用 brew/npm/curl 安装器，win 用 winget/npm，linux 用 apt/dnf/npm）。
 //! 本轮只验证 mac 路径；win/linux 编译可用、不行则给「请手动安装」文案。
@@ -112,7 +112,7 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// 单个依赖的检测结果。
 #[derive(Debug, Clone)]
 pub struct DepStatus {
-    /// 机器键：claude | codex | node | python3 | lark-cli | dingtalk-cli
+    /// 机器键：claude | codex | pi | node | python3 | lark-cli | dingtalk-cli
     pub id: &'static str,
     /// 展示名。
     pub label: &'static str,
@@ -146,6 +146,8 @@ pub fn detect_all() -> Vec<DepStatus> {
     vec![
         probe("claude", "Claude Code", &["claude"]),
         probe("codex", "Codex CLI", &["codex"]),
+        // pi：npm 全局 bin（~/.npm-global/bin/pi，软链到 pi-coding-agent 的 cli.js）
+        probe("pi", "Pi (pi-coding-agent)", &["pi"]),
         probe("node", "Node.js", &["node"]),
         probe("python3", "Python 3", &["python3", "python"]),
         probe("lark-cli", "lark-cli", &["lark-cli"]),
@@ -202,6 +204,19 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 InstallStep::exec("npm", &["install", "-g", "@openai/codex"]),
                 InstallStep::exec("brew", &["install", "codex"]),
             ],
+            // pi：官方安装器（curl pi.dev/install.sh，无需 node）；回落 npm。
+            "pi" => vec![
+                InstallStep::shell("curl -fsSL https://pi.dev/install.sh | sh"),
+                InstallStep::exec(
+                    "npm",
+                    &[
+                        "install",
+                        "-g",
+                        "--ignore-scripts",
+                        "@earendil-works/pi-coding-agent",
+                    ],
+                ),
+            ],
             "node" => vec![InstallStep::exec("brew", &["install", "node"])],
             "python3" => vec![InstallStep::exec("brew", &["install", "python"])],
             "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
@@ -230,6 +245,15 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 &["install", "-g", "@anthropic-ai/claude-code"],
             )],
             "codex" => vec![InstallStep::exec("npm", &["install", "-g", "@openai/codex"])],
+            "pi" => vec![InstallStep::exec(
+                "npm",
+                &[
+                    "install",
+                    "-g",
+                    "--ignore-scripts",
+                    "@earendil-works/pi-coding-agent",
+                ],
+            )],
             "node" => vec![InstallStep::exec("winget", &["install", "OpenJS.NodeJS"])],
             "python3" => vec![InstallStep::exec("winget", &["install", "Python.Python.3.12"])],
             "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
@@ -249,6 +273,15 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
             ],
             "codex" => vec![InstallStep::exec("npm", &["install", "-g", "@openai/codex"])],
+            "pi" => vec![InstallStep::exec(
+                "npm",
+                &[
+                    "install",
+                    "-g",
+                    "--ignore-scripts",
+                    "@earendil-works/pi-coding-agent",
+                ],
+            )],
             // linux 包管理器按二进制探测：优先 apt-get，其次 dnf。
             "node" => vec![
                 InstallStep::shell(
@@ -711,11 +744,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_all_covers_six() {
+    fn detect_all_covers_seven() {
         let all = detect_all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
-        for want in ["claude", "codex", "node", "python3", "lark-cli", "dingtalk-cli"] {
+        for want in ["claude", "codex", "pi", "node", "python3", "lark-cli", "dingtalk-cli"] {
             assert!(ids.contains(&want), "缺 {want}");
         }
     }
@@ -724,6 +757,7 @@ mod tests {
     fn install_plan_known_unknown() {
         assert!(install_plan("claude").is_ok());
         assert!(install_plan("codex").is_ok());
+        assert!(install_plan("pi").is_ok());
         assert!(install_plan("node").is_ok());
         assert!(install_plan("python3").is_ok());
         assert!(install_plan("lark-cli").is_ok());

@@ -1,6 +1,9 @@
-//! 调本机 agent —— claude / codex，host 直跑。
+//! 调本机 agent —— claude / codex / pi，host 直跑。
 //! prompt 走 stdin（避免多行/-开头被 argparse 误判）；per-chat 串行由 bridge 保证；
-//! claude 注入 CC Switch 当前 provider 的 ANTHROPIC_* env。
+//! claude 注入 CC Switch 当前 provider 的 ANTHROPIC_* env；codex 走自己 ~/.codex 登录态；
+//! pi 走自己 ~/.pi 登录态（配了供应商则注入对应 API key env + --provider/--model）。
+//! pi 用法：`pi -p --mode json --session-id <uuid>`（--session-id 已存在即续聊、不存在即新建），
+//! prompt 走 stdin（pi 非交互模式会读管道 stdin 作首条消息，见 pi main.js readPipedStdin）。
 //! **无超时**：桥是推送模型——等 agent 跑完即回发，跑多久等多久（曾设 600s 上限，
 //! 会把合法的长任务拦腰杀掉，用户拍板去掉，2026-08-07）。
 
@@ -20,12 +23,15 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 pub enum Backend {
     Claude,
     Codex,
+    Pi,
 }
 
 impl Backend {
     pub fn parse(s: &str) -> Backend {
         if s.eq_ignore_ascii_case("codex") {
             Backend::Codex
+        } else if s.eq_ignore_ascii_case("pi") {
+            Backend::Pi
         } else {
             Backend::Claude
         }
@@ -34,11 +40,12 @@ impl Backend {
         match self {
             Backend::Claude => "claude",
             Backend::Codex => "codex",
+            Backend::Pi => "pi",
         }
     }
 }
 
-/// 在每个 bot 的 workspace 里放指引（claude 读 CLAUDE.md、codex 读 AGENTS.md）。
+/// 在每个 bot 的 workspace 里放指引（claude 读 CLAUDE.md、codex 读 AGENTS.md、pi 两者都读）。
 /// 关键：告诉 agent 定时/周期需求要用桥注入的 `$ABB_BIN`（本程序绝对路径）调 job CLI 建任务后
 /// **立即退出**，别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。
 /// 版本化（GUIDE_MARKER）：老工作区里无标记的旧模板（写死 `agent-bridge job`、实际在
@@ -168,12 +175,12 @@ enum AttemptErr {
     Failed(String),
 }
 
-/// 供应商解析产物：要注入子进程的 env，和仅 codex 用的 `-c key=value` 配置覆盖参数。
+/// 供应商解析产物：要注入子进程的 env，和仅 codex/pi 用的额外 CLI 参数。
 struct Injection {
     env: Option<HashMap<String, String>>,
-    /// 仅 codex：`-c model_provider=... -c model_providers.agent_bridge.*=...`。
-    /// claude 永远为空。
-    codex_cfg_args: Vec<String>,
+    /// codex：`-c model_provider=... -c model_providers.agent_bridge.*=...`；
+    /// pi：`--provider <名> --model <模型>`。claude 永远为空。
+    extra_args: Vec<String>,
 }
 
 /// codex 注入 api key 用的 env 变量名（经 `env_key` 引用，key 绝不进 argv / config.toml）。
@@ -227,11 +234,15 @@ fn build_injection(
         // ── 未配供应商：旧行为回落 ──
         (Backend::Claude, None) => Ok(Injection {
             env: Some(ccswitch_env_or_err()?),
-            codex_cfg_args: no_args,
+            extra_args: no_args,
         }),
         (Backend::Codex, None) => Ok(Injection {
             env: None, // codex 走自己 ~/.codex 的登录态，不注入
-            codex_cfg_args: no_args,
+            extra_args: no_args,
+        }),
+        (Backend::Pi, None) => Ok(Injection {
+            env: None, // pi 走自己 ~/.pi 的登录态/默认模型，不注入
+            extra_args: no_args,
         }),
 
         // ── anthropic 供应商 ──
@@ -246,7 +257,30 @@ fn build_injection(
             }
             Ok(Injection {
                 env: Some(env),
-                codex_cfg_args: no_args,
+                extra_args: no_args,
+            })
+        }
+        // ── pi + anthropic 供应商：注入 ANTHROPIC_API_KEY + --provider/--model。
+        // pi 内置 anthropic provider 固定官方端点，不读 ANTHROPIC_BASE_URL——配了 base_url
+        // 也照常打官方端点（日志警告，避免用户误以为走了自定义网关）；自定义端点需在
+        // ~/.pi/agent/models.json 配 custom provider（超出桥职责，文档提示即可）。
+        (Backend::Pi, Some(p)) if p.kind == "anthropic" => {
+            let mut env = HashMap::new();
+            env.insert("ANTHROPIC_API_KEY".into(), p.api_key.clone());
+            let mut args = vec!["--provider".to_string(), "anthropic".to_string()];
+            if !p.model.is_empty() {
+                args.push("--model".to_string());
+                args.push(p.model.clone());
+            }
+            if !p.base_url.is_empty() {
+                crate::log!(
+                    "[agent] pi 后端忽略 anthropic 供应商「{}」的 base_url（pi 内置 provider 固定官方端点；自定义端点请在 ~/.pi/agent/models.json 配）",
+                    p.name
+                );
+            }
+            Ok(Injection {
+                env: Some(env),
+                extra_args: args,
             })
         }
         (Backend::Codex, Some(p)) if p.kind == "anthropic" => Err(format!(
@@ -281,7 +315,29 @@ fn build_injection(
             env.insert(CODEX_KEY_ENV.into(), p.api_key.clone());
             Ok(Injection {
                 env: Some(env),
-                codex_cfg_args: args,
+                extra_args: args,
+            })
+        }
+        // ── pi + OpenAI 兼容供应商：注入 OPENAI_API_KEY + --provider openai + --model。
+        // pi 内置 openai provider 固定 api.openai.com；非官方端点同样需 models.json 自定义
+        // provider（见上 anthropic 分支注释）。wire_api（chat/responses）由 pi 侧决定，桥不干预。
+        (Backend::Pi, Some(p)) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
+            let mut env = HashMap::new();
+            env.insert("OPENAI_API_KEY".into(), p.api_key.clone());
+            let mut args = vec!["--provider".to_string(), "openai".to_string()];
+            if !p.model.is_empty() {
+                args.push("--model".to_string());
+                args.push(p.model.clone());
+            }
+            if !p.base_url.is_empty() {
+                crate::log!(
+                    "[agent] pi 后端忽略 OpenAI 兼容供应商「{}」的 base_url（pi 内置 provider 固定官方端点；自定义端点请在 ~/.pi/agent/models.json 配）",
+                    p.name
+                );
+            }
+            Ok(Injection {
+                env: Some(env),
+                extra_args: args,
             })
         }
         (Backend::Claude, Some(p)) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
@@ -344,7 +400,7 @@ pub async fn run(
             bot_key,
             &workspace,
             inject.env.as_ref(),
-            &inject.codex_cfg_args,
+            &inject.extra_args,
             progress.clone(),
             cancel.clone(),
         )
@@ -359,6 +415,7 @@ pub async fn run(
                         }
                     }
                 }
+                // pi 不用回存：--session-id 直接用桥的 UUID，首轮就固定（无需 thread_id）
                 return Ok(RunOutcome::Reply {
                     reply: out.reply,
                     session_id: sid,
@@ -369,6 +426,8 @@ pub async fn run(
                 // resume 失败（会话在对端已不存在）→ 回退全新会话重建一次，别让用户永久卡死。
                 // codex：thread 没了（no rollout found）；claude：transcript 被删/机器迁移
                 // （No conversation found）——两者都会让该聊天此后每轮必报错，无自愈路径。
+                // pi 无此问题：--session-id 对应的会话文件被删/损坏时 pi 会新建或用报错兜底，
+                // 不走该分支（首版不自动重建，用户可 `session reset` 换新 UUID）。
                 let session_lost = is_resume
                     && ((backend == Backend::Codex && e.contains("no rollout found"))
                         || (backend == Backend::Claude && e.contains("No conversation found")));
@@ -412,15 +471,38 @@ struct AgentOutput {
 /// 打断轮询间隔：无输出时也最多这么久就检查一次 cancel（卡死的进程也能被叫停）。
 const CANCEL_POLL_MS: u64 = 250;
 
+/// 从 pi 的 assistant message 里取纯文本（content[].type == "text" 块拼接）。
+/// 工具调用轮（只有 toolCall 块）返回空串——不产生进度候选。
+fn pi_message_text(v: &serde_json::Value) -> String {
+    let mut txt = String::new();
+    if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    if !txt.is_empty() {
+                        txt.push('\n');
+                    }
+                    txt.push_str(t);
+                }
+            }
+        }
+    }
+    txt.trim().to_string()
+}
+
 /// 处理一行流式 JSONL，更新解析状态；返回被「滞后一位」挤出的进度文本（若有）。
 /// 滞后一位（one-behind）：新候选回复到来时，把上一条候选作为进度推出，自己留下当最终回复——
-/// 这样无需预知哪条是最后一条，也不会把最终回复重复发两遍。codex/claude 通用。
+/// 这样无需预知哪条是最后一条，也不会把最终回复重复发两遍。codex/claude/pi 通用。
+/// pi 事件（--mode json）：message_end 是每条 assistant 消息的权威文本（含 stopReason/errorMessage），
+/// 用它做候选；中间 tool 轮无文本则跳过。LLM 错误（stopReason=error/aborted）记进 pi_error，
+/// 由 run_once 在 exit 0 时仍能判错（pi json 模式下进程对 LLM 错误 exit 0，见 pi print-mode.js）。
 fn process_line(
     backend: Backend,
     line: &str,
     thread_id: &mut Option<String>,
     pending: &mut Option<String>,
     claude_result: &mut Option<(bool, String)>,
+    pi_error: &mut Option<String>,
 ) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     match backend {
@@ -489,6 +571,32 @@ fn process_line(
             }
             _ => None, // system/init、thinking_tokens、user(tool_result) 等忽略
         },
+        Backend::Pi => match v.get("type").and_then(|t| t.as_str()) {
+            // 每条 assistant 消息结束：message 字段是权威文本；stopReason=error/aborted → 记错。
+            Some("message_end") => {
+                let msg = &v["message"];
+                if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                    return None;
+                }
+                let stop = msg.get("stopReason").and_then(|s| s.as_str()).unwrap_or("");
+                if stop == "error" || stop == "aborted" {
+                    *pi_error = Some(
+                        msg.get("errorMessage")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("（pi 未给出错误详情）")
+                            .to_string(),
+                    );
+                    return None;
+                }
+                let t = pi_message_text(msg);
+                if t.is_empty() {
+                    None
+                } else {
+                    pending.replace(t) // 挤出上一条作进度
+                }
+            }
+            _ => None, // session 头、message_start/update、tool_execution_*、agent_end 等忽略
+        },
     }
 }
 
@@ -547,7 +655,7 @@ async fn run_once(
     bot_key: &str,
     workspace: &std::path::Path,
     inject_env: Option<&HashMap<String, String>>,
-    codex_cfg_args: &[String],
+    extra_args: &[String],
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<AgentOutput, AttemptErr> {
@@ -570,7 +678,7 @@ async fn run_once(
                 .arg("--dangerously-bypass-approvals-and-sandbox");
             // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
             // 追加在固定参数后（flags-after-subcommand 对 exec / exec resume 都成立，实测）。
-            for a in codex_cfg_args {
+            for a in extra_args {
                 c.arg("-c").arg(a);
             }
             c
@@ -580,6 +688,30 @@ async fn run_once(
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
             // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）。
             tokio::process::Command::from(claude_command(resume, session_id))
+        }
+        Backend::Pi => {
+            // pi 非交互 print 模式：`pi -p --mode json --session-id <uuid>`。
+            // 关键点（对照 pi 源码）：
+            // ① prompt 走 stdin——pi 非交互时读管道 stdin 作为首条消息（main.js readPipedStdin），
+            //    与 claude/codex 同款，规避多行/-开头被 argparse 误判（pi 对 `-` 开头参数报 Unknown option）；
+            // ② --session-id 已存在即续聊（SessionManager.open）、不存在即新建（create with id），
+            //    首轮/后续轮同一参数，无需 --resume 分支；
+            // ③ --session-dir 固定到本 bot 工作区：会话文件随 workspace 隔离，`session reset` 可整个清掉；
+            // ④ --mode json 逐事件 JSONL 输出（message_end 是权威回复）；LLM 错误在 json 模式下
+            //    进程仍 exit 0，错误信息在 message_end.stopReason/errorMessage——由 process_line 判错。
+            let mut c = Command::new("pi");
+            c.arg("-p")
+                .arg("--mode")
+                .arg("json")
+                .arg("--session-id")
+                .arg(session_id)
+                .arg("--session-dir")
+                .arg(workspace.join(".pi-sessions"));
+            // 桥内供应商 → --provider/--model（api key 走 env，见 build_injection）
+            for a in extra_args {
+                c.arg(a);
+            }
+            c
         }
     };
 
@@ -662,6 +794,7 @@ async fn run_once(
     let mut thread_id: Option<String> = None;
     let mut pending: Option<String> = None; // 滞后一位缓冲：最新候选回复
     let mut claude_result: Option<(bool, String)> = None; // (is_error, result)
+    let mut pi_error: Option<String> = None; // pi：message_end.stopReason=error/aborted 的错误文案
 
     // #7 启动健康检查（仅 claude）：关遥测后仍有启动早期网络风险，给 60s 启动窗口，
     // 窗口内无任何 stdout 产出 → 判定启动挂死并终止（长任务也会有先行的流式事件，不受影响）。
@@ -719,6 +852,7 @@ async fn run_once(
                     &mut thread_id,
                     &mut pending,
                     &mut claude_result,
+                    &mut pi_error,
                 ) {
                     if let Some(tx) = &progress {
                         let _ = tx.send(p);
@@ -781,6 +915,19 @@ async fn run_once(
                     AttemptErr::Failed(format!("⚠️ claude 没有输出。{}", stderr_tail(&stderr_text)))
                 })?
             }
+        }
+        Backend::Pi => {
+            // pi json 模式对 LLM 错误也 exit 0：错误信息只能从事件流（message_end）判，
+            // 进程非零退出则走上面 status 分支；这里先查事件级错误，再取最后一条回复。
+            if let Some(err) = pi_error.take() {
+                return Err(AttemptErr::Failed(format!(
+                    "⚠️ pi 出错:\n{}",
+                    truncate(&err, 800)
+                )));
+            }
+            pending.take().filter(|s| !s.is_empty()).ok_or_else(|| {
+                AttemptErr::Failed(format!("⚠️ pi 没有输出。{}", stderr_tail(&stderr_text)))
+            })?
         }
     };
 
@@ -847,7 +994,7 @@ impl Drop for AgentPidGuard {
     }
 }
 
-/// 目标 pid 是否还是「本桥 spawn 的 agent」：存活且命令行匹配 claude/codex。
+/// 目标 pid 是否还是「本桥 spawn 的 agent」：存活且命令行匹配 claude/codex/pi。
 /// Windows 无 ps 语义，直接信任 pid 文件（taskkill /F）。
 fn process_is_agent(pid: u32) -> bool {
     #[cfg(unix)]
@@ -858,7 +1005,7 @@ fn process_is_agent(pid: u32) -> bool {
         match out {
             Ok(o) if o.status.success() => {
                 let cmd = String::from_utf8_lossy(&o.stdout);
-                cmd.contains("claude") || cmd.contains("codex")
+                cmd.contains("claude") || cmd.contains("codex") || pi_command_matches(&cmd)
             }
             _ => false,
         }
@@ -868,6 +1015,19 @@ fn process_is_agent(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+/// pi 进程命令行匹配：npm 全局 bin 的 `pi` 是指向 cli.js 的软链，ps 显示的是解析后的
+/// 解释器+脚本路径（如 `node …/pi-coding-agent/dist/cli.js`）。"pi" 子串太宽（login/pid 等
+/// 都会误中），按特征匹配：首 token 基名恰为 pi，或路径含 pi-coding-agent。
+#[cfg(unix)]
+fn pi_command_matches(cmd: &str) -> bool {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let base = std::path::Path::new(first)
+        .file_name()
+        .map(|b| b.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base == "pi" || cmd.contains("pi-coding-agent") || cmd.contains("@earendil-works/pi")
 }
 
 /// 启动恢复前调用：把上次残留的 agent 子进程清掉（SIGTERM / taskkill），并清空 pid 文件。
@@ -906,17 +1066,24 @@ pub fn kill_stale_agents(bot_key: &str) {
 mod tests {
     use super::*;
 
-    fn run_lines(
-        backend: Backend,
-        lines: &[&str],
-    ) -> (Option<String>, Option<String>, Option<(bool, String)>) {
+    // process_line 测试辅助的解析状态：
+    // (pending 候选, thread_id, claude_result, pi_error)
+    type LineState = (
+        Option<String>,
+        Option<String>,
+        Option<(bool, String)>,
+        Option<String>,
+    );
+
+    fn run_lines(backend: Backend, lines: &[&str]) -> LineState {
         let mut tid = None;
         let mut pending = None;
         let mut res = None;
+        let mut pi_err = None;
         for l in lines {
-            process_line(backend, l, &mut tid, &mut pending, &mut res);
+            process_line(backend, l, &mut tid, &mut pending, &mut res, &mut pi_err);
         }
-        (pending, tid, res)
+        (pending, tid, res, pi_err)
     }
 
     #[test]
@@ -932,7 +1099,14 @@ mod tests {
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"第二步"}}"#,
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"最终答案"}}"#,
         ] {
-            if let Some(p) = process_line(Backend::Codex, l, &mut tid, &mut pending, &mut res) {
+            if let Some(p) = process_line(
+                Backend::Codex,
+                l,
+                &mut tid,
+                &mut pending,
+                &mut res,
+                &mut None,
+            ) {
                 forwarded.push(p);
             }
         }
@@ -943,7 +1117,7 @@ mod tests {
 
     #[test]
     fn codex_single_message_no_progress() {
-        let (pending, tid, _) = run_lines(
+        let (pending, tid, _, _) = run_lines(
             Backend::Codex,
             &[
                 r#"{"type":"thread.started","thread_id":"t-1"}"#,
@@ -966,7 +1140,14 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}"#,
             r#"{"type":"result","is_error":false,"result":"OK"}"#,
         ] {
-            if let Some(p) = process_line(Backend::Claude, l, &mut tid, &mut pending, &mut res) {
+            if let Some(p) = process_line(
+                Backend::Claude,
+                l,
+                &mut tid,
+                &mut pending,
+                &mut res,
+                &mut None,
+            ) {
                 forwarded.push(p);
             }
         }
@@ -986,7 +1167,14 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"查到了，答案是42"}]}}"#,
             r#"{"type":"result","is_error":false,"result":"查到了，答案是42"}"#,
         ] {
-            if let Some(p) = process_line(Backend::Claude, l, &mut tid, &mut pending, &mut res) {
+            if let Some(p) = process_line(
+                Backend::Claude,
+                l,
+                &mut tid,
+                &mut pending,
+                &mut res,
+                &mut None,
+            ) {
                 forwarded.push(p);
             }
         }
@@ -997,7 +1185,7 @@ mod tests {
 
     #[test]
     fn claude_error_result_flagged() {
-        let (_, _, res) = run_lines(
+        let (_, _, res, _) = run_lines(
             Backend::Claude,
             &[r#"{"type":"result","is_error":true,"result":"boom"}"#],
         );
@@ -1031,14 +1219,14 @@ mod tests {
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://api.example.com/v1");
         assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "sk-secret");
         assert_eq!(env["ANTHROPIC_MODEL"], "some-model");
-        assert!(inj.codex_cfg_args.is_empty(), "claude 不产生 codex -c 参数");
+        assert!(inj.extra_args.is_empty(), "claude 不产生额外参数");
     }
 
     #[test]
     fn openai_chat_to_codex_args() {
         let p = prov("deepseek", "openai-chat");
         let inj = build_injection(Backend::Codex, Some(&p)).unwrap();
-        let args = &inj.codex_cfg_args;
+        let args = &inj.extra_args;
         assert!(args.iter().any(|a| a == "model_provider=\"agent_bridge\""));
         assert!(args
             .iter()
@@ -1060,23 +1248,26 @@ mod tests {
         let p = prov("local", "openai-responses");
         let inj = build_injection(Backend::Codex, Some(&p)).unwrap();
         assert!(inj
-            .codex_cfg_args
+            .extra_args
             .iter()
             .any(|a| a == "model_providers.agent_bridge.wire_api=\"responses\""));
     }
 
     #[test]
     fn kind_backend_mismatch_errors() {
-        // anthropic 供应商 + codex 后端 → 报错
+        // anthropic 供应商 + codex 后端 → 报错；+ pi 后端 → 可映射（env key + --provider/--model）
         let pa = prov("a", "anthropic");
         assert!(build_injection(Backend::Codex, Some(&pa)).is_err());
-        // openai 供应商 + claude 后端 → 报错
+        assert!(build_injection(Backend::Pi, Some(&pa)).is_ok());
+        // openai 供应商 + claude 后端 → 报错；+ pi 后端 → 可映射
         let po = prov("o", "openai-chat");
         assert!(build_injection(Backend::Codex, Some(&po)).is_ok());
         assert!(build_injection(Backend::Claude, Some(&po)).is_err());
-        // 未知 kind → 报错
+        assert!(build_injection(Backend::Pi, Some(&po)).is_ok());
+        // 未知 kind → 报错（三个后端一致）
         let px = prov("x", "gemini");
         assert!(build_injection(Backend::Claude, Some(&px)).is_err());
+        assert!(build_injection(Backend::Pi, Some(&px)).is_err());
     }
 
     #[test]
@@ -1084,7 +1275,138 @@ mod tests {
         // codex 未配供应商 → 不注入任何 env/参数（走自己 ~/.codex 登录态）
         let inj = build_injection(Backend::Codex, None).unwrap();
         assert!(inj.env.is_none());
-        assert!(inj.codex_cfg_args.is_empty());
+        assert!(inj.extra_args.is_empty());
+    }
+
+    #[test]
+    fn no_provider_pi_no_injection() {
+        // pi 未配供应商 → 不注入任何 env/参数（走自己 ~/.pi 登录态/默认模型）
+        let inj = build_injection(Backend::Pi, None).unwrap();
+        assert!(inj.env.is_none());
+        assert!(inj.extra_args.is_empty());
+    }
+
+    #[test]
+    fn anthropic_to_pi_env_and_args() {
+        let p = prov("mypi", "anthropic");
+        let inj = build_injection(Backend::Pi, Some(&p)).unwrap();
+        // api key 走 env（不进 argv），模型/provider 走参数
+        assert_eq!(inj.env.as_ref().unwrap()["ANTHROPIC_API_KEY"], "sk-secret");
+        assert!(!inj.env.as_ref().unwrap().contains_key("ANTHROPIC_BASE_URL"));
+        let args = &inj.extra_args;
+        assert!(args.iter().any(|a| a == "--provider"));
+        assert!(args.iter().any(|a| a == "anthropic"));
+        assert!(args.iter().any(|a| a == "--model"));
+        assert!(args.iter().any(|a| a == "some-model"));
+        assert!(
+            args.iter().all(|a| !a.contains("sk-secret")),
+            "key 绝不进 argv"
+        );
+    }
+
+    #[test]
+    fn openai_to_pi_env_and_args() {
+        let p = prov("deepseek", "openai-chat");
+        let inj = build_injection(Backend::Pi, Some(&p)).unwrap();
+        assert_eq!(inj.env.as_ref().unwrap()["OPENAI_API_KEY"], "sk-secret");
+        let args = &inj.extra_args;
+        assert!(args.iter().any(|a| a == "--provider"));
+        assert!(args.iter().any(|a| a == "openai"));
+        assert!(args.iter().any(|a| a == "some-model"));
+        assert!(
+            args.iter().all(|a| !a.contains("sk-secret")),
+            "key 绝不进 argv"
+        );
+    }
+
+    #[test]
+    fn pi_backend_parse() {
+        assert_eq!(Backend::parse("pi"), Backend::Pi);
+        assert_eq!(Backend::parse("PI"), Backend::Pi);
+        assert_eq!(Backend::parse("codex"), Backend::Codex);
+        assert_eq!(Backend::parse("claude"), Backend::Claude);
+        assert_eq!(Backend::parse(""), Backend::Claude);
+        assert_eq!(Backend::parse("weird"), Backend::Claude);
+        assert_eq!(Backend::Pi.name(), "pi");
+    }
+
+    // ── pi JSON 事件流解析（--mode json）──
+
+    #[test]
+    fn pi_message_end_one_behind() {
+        // 两条 assistant 消息（中间夹 tool 轮）：前一条被挤出为进度，后一条留作回复
+        let mut tid = None;
+        let mut pending = None;
+        let mut res = None;
+        let mut pi_err = None;
+        let mut forwarded = Vec::new();
+        for l in [
+            r#"{"type":"session","version":3,"id":"u-1","cwd":"/tmp"}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"我先查一下"}],"stopReason":"stop"}}"#,
+            r#"{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"ls 输出"}],"stopReason":"stop"}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"最终答案"}],"stopReason":"stop"}}"#,
+        ] {
+            if let Some(p) = process_line(
+                Backend::Pi,
+                l,
+                &mut tid,
+                &mut pending,
+                &mut res,
+                &mut pi_err,
+            ) {
+                forwarded.push(p);
+            }
+        }
+        assert_eq!(forwarded, vec!["我先查一下".to_string()]);
+        assert_eq!(pending.as_deref(), Some("最终答案"));
+        assert!(pi_err.is_none(), "正常完成不应有错误");
+    }
+
+    #[test]
+    fn pi_single_message_no_progress() {
+        let (pending, _, _, pi_err) = run_lines(
+            Backend::Pi,
+            &[
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"唯一回复"}],"stopReason":"stop"}}"#,
+            ],
+        );
+        assert_eq!(pending.as_deref(), Some("唯一回复"));
+        assert!(pi_err.is_none());
+    }
+
+    #[test]
+    fn pi_tool_only_turns_skip() {
+        // 只有 toolCall 块（无文本）的 assistant 消息不产生候选
+        let (pending, _, _, pi_err) = run_lines(
+            Backend::Pi,
+            &[
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{}}],"stopReason":"toolUse"}}"#,
+            ],
+        );
+        assert!(pending.is_none(), "纯工具轮不应成为回复候选");
+        assert!(pi_err.is_none());
+    }
+
+    #[test]
+    fn pi_error_message_end_flagged() {
+        let (_, _, _, pi_err) = run_lines(
+            Backend::Pi,
+            &[
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"stopReason":"error","errorMessage":"429 overloaded"}}"#,
+            ],
+        );
+        assert_eq!(pi_err.as_deref(), Some("429 overloaded"));
+    }
+
+    #[test]
+    fn pi_aborted_flagged() {
+        let (_, _, _, pi_err) = run_lines(
+            Backend::Pi,
+            &[
+                r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"aborted"}}"#,
+            ],
+        );
+        assert_eq!(pi_err.as_deref(), Some("（pi 未给出错误详情）"));
     }
 
     #[test]
@@ -1149,6 +1471,21 @@ mod tests {
         assert!(!claude_needs_fresh_session("⚠️ codex 出错（exit 1）:\nno rollout found"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pi_command_matches_npm_symlink_and_plain() {
+        // npm 全局软链：ps 显示解析后的 node + pi-coding-agent 路径
+        assert!(pi_command_matches(
+            "/usr/local/bin/node /Users/x/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js -p --mode json"
+        ));
+        // 首 token 基名恰为 pi（自定义安装/PATH 直装）
+        assert!(pi_command_matches("/Users/x/.local/bin/pi -p hi"));
+        assert!(!pi_command_matches("/usr/bin/login -p x")); // login 含 "pi" 子串但不匹配
+        assert!(!pi_command_matches("/bin/bash -c 'spid=1'")); // pid 之类含 "pi" 的无关进程
+        assert!(!pi_command_matches("/usr/bin/python3 x.py"));
+        assert!(!pi_command_matches("/sbin/init"));
+    }
+
     #[test]
     fn agent_missing_msg_includes_install_hint() {
         // #8 M0：agent 缺失时错误文案必须带安装指引，用户照着能去设置窗装依赖
@@ -1160,6 +1497,9 @@ mod tests {
         let m2 = agent_missing_msg(Backend::Codex, &err);
         assert!(m2.contains("找不到命令或启动失败（codex）"));
         assert!(m2.contains("安装"));
+        let m3 = agent_missing_msg(Backend::Pi, &err);
+        assert!(m3.contains("找不到命令或启动失败（pi）"));
+        assert!(m3.contains("安装"));
     }
 
     // ---- #25 重启恢复：agent 子进程 pid 跟踪 / 孤儿清理 ----

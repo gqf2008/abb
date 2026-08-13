@@ -395,7 +395,7 @@ async fn run_job(
         false,
         &job.chat_id,
         &bot_key,
-        None, // claude 无需回存 thread_id
+        None, // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
         None, // 定时任务不流式中间进度
         None, // 定时任务不可被聊天打断
     )

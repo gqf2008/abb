@@ -1,21 +1,55 @@
-//! lark-cli + lark-* 技能引导 —— 接入飞书 bot 时自动装，让飞书 bot 背后的 claude 能用 lark 技能。
+//! lark-cli + lark-* 技能引导 —— 接入飞书 bot 时自动装，让飞书 bot 背后的 claude/pi 能用 lark 技能。
 //!
 //! 机制：lark-cli 本体走 npm（`@larksuite/cli`）；技能走 vercel-labs 的 `skills` installer
-//! （`npx skills add larksuite/cli`，把 `~/.agents/skills/lark-*` 软链进 `~/.claude/skills/`）。
-//! 幂等、best-effort、绝不阻塞 bot 启动——装不上只 log 警告给手动命令。
+//! （`npx skills add larksuite/cli`，把 `~/.agents/skills/lark-*` 软链进 `~/.claude/skills/`），
+//! 再补一份软链到 `~/.pi/agent/skills/`（pi 后端从自己目录发现技能；npx 只认 claude agent，
+//! pi 目录靠桥补链）。幂等、best-effort、绝不阻塞 bot 启动——装不上只 log 警告给手动命令。
 //!
 //! 触发点：service 启动（非 GUI 路径）+ GUI 保存（GUI 路径），仅当存在「启用的飞书 bot」。
 
 use std::path::PathBuf;
 use std::process::Stdio;
 
-/// 技能就绪判据：~/.claude/skills/lark-im 能解析（fs::metadata 随软链到 ~/.agents/skills）。
-/// 取 lark-im 当代表（27 个 lark-* 同进同出，任一个在即在）。
+/// 技能就绪判据：claude 或 pi 任一目录里 ~/.claude/skills/lark-im 能解析（fs::metadata 随软链到
+/// ~/.agents/skills）。取 lark-im 当代表（27 个 lark-* 同进同出，任一个在即在）。
 fn skills_ready() -> bool {
-    let p = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claude/skills/lark-im");
-    std::fs::metadata(&p).is_ok()
+    let home = dirs::home_dir().unwrap_or_default();
+    std::fs::metadata(home.join(".claude/skills/lark-im")).is_ok()
+        || std::fs::metadata(home.join(".pi/agent/skills/lark-im")).is_ok()
+}
+
+/// 把 ~/.agents/skills/lark-* 补链进 pi 的技能目录（~/.pi/agent/skills/）。
+/// npx skills installer 只认 claude agent；pi 后端靠这里补。跳过已存在；无 pi 目录则创建
+/// （目录本身无害）。best-effort，失败只 log。
+fn link_pi_skills() {
+    let home = dirs::home_dir().unwrap_or_default();
+    let agents_skills = home.join(".agents/skills");
+    let pi_skills = home.join(".pi/agent/skills");
+    if !agents_skills.join("lark-im").exists() {
+        return; // 源不在（npx/git 都没成功），无从补链
+    }
+    let _ = std::fs::create_dir_all(&pi_skills);
+    if let Ok(rd) = std::fs::read_dir(&agents_skills) {
+        let mut linked = 0;
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("lark-") || !ent.path().is_dir() {
+                continue;
+            }
+            let link = pi_skills.join(&name);
+            if std::fs::symlink_metadata(&link).is_err() {
+                let rel = PathBuf::from("../../../.agents/skills").join(&name);
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&rel, &link);
+                #[cfg(windows)]
+                let _ = std::os::windows::fs::symlink_dir(&ent.path(), &link);
+                linked += 1;
+            }
+        }
+        if linked > 0 {
+            crate::log!("[lark] 已补链 {linked} 个 lark-* 技能到 ~/.pi/agent/skills（pi 后端）");
+        }
+    }
 }
 
 /// 失败节流 marker：~/.agent-bridge/logs/.lark-setup-attempt（内容 = unix 秒）。
@@ -105,6 +139,7 @@ pub async fn ensure_lark_setup() {
     match run("npx", &args, Some(std::time::Duration::from_secs(600))).await {
         Ok(_) if skills_ready() => {
             crate::log!("[lark] lark 技能安装成功（~/.claude/skills/lark-*）");
+            link_pi_skills();
             clear_marker();
         }
         Ok(_) => {
@@ -185,6 +220,8 @@ async fn install_via_git() {
             }
         }
     }
+    // pi 后端从 ~/.pi/agent/skills/ 发现技能：git 兜底同样补链
+    link_pi_skills();
     let _ = std::fs::remove_dir_all(&tmp);
     if skills_ready() {
         crate::log!("[lark] git 兜底成功：copy {copied} 个 lark-* 技能并软链进 ~/.claude/skills");
