@@ -100,11 +100,37 @@ pub trait Messenger: Send + Sync {
         }
         self.send_text(chat_id, &s).await
     }
+
+    /// 流式打字机（#42）：agent 中途输出累积进**同一条消息原地更新**。
+    /// 仅飞书（CardKit 流式卡片）/钉钉（AI 卡片流式）实现；微信等默认 None = 不支持，
+    /// 桥据此回落（逐条发送或只发最终结果）。
+    ///
+    /// begin：发出占位流式消息，返回会话句柄（飞书=card_id，钉钉=outTrackId）。
+    ///        失败（缺权限/模板）返回 None 并 log，不抛错——流式是增强，不能拖垮任务。
+    async fn stream_begin(&self, _chat_id: &str, _initial_text: &str) -> Option<String> {
+        None
+    }
+    /// 累积**全文**更新流式消息（平台自动算增量渲染打字机）。best-effort，失败只 log。
+    async fn stream_update(&self, _handle: &str, _full_text: &str) {}
+    /// 最终全文 + 关流式。任务结束（Reply/Cancelled/Err）必调，防平台侧流式悬挂。
+    async fn stream_finalize(&self, _handle: &str, _full_text: &str) {}
 }
 
 /// 飞书实现：委托 FeishuClient，表情走 reactions。
+/// stream_seq：CardKit 写接口要求 sequence 严格递增（#42），per-card 计数。
 pub struct FeishuMessenger {
     pub fs: FeishuClient,
+    stream_seq: Mutex<HashMap<String, u64>>,
+}
+
+impl FeishuMessenger {
+    /// 取下一 sequence（CardKit 乐观并发要求严格递增）。
+    fn next_seq(&self, handle: &str) -> u64 {
+        let mut m = self.stream_seq.lock().unwrap();
+        let s = m.entry(handle.to_string()).or_insert(0);
+        *s += 1;
+        *s
+    }
 }
 
 #[async_trait::async_trait]
@@ -182,6 +208,45 @@ impl Messenger for FeishuMessenger {
     }
     async fn done(&self, message_id: &str) {
         self.fs.add_reaction(message_id, "DONE").await;
+    }
+
+    async fn stream_begin(&self, chat_id: &str, initial_text: &str) -> Option<String> {
+        match self.fs.card_create_streaming(initial_text).await {
+            Ok(card_id) => match self.fs.card_send(chat_id, &card_id).await {
+                Ok(()) => {
+                    self.stream_seq.lock().unwrap().insert(card_id.clone(), 0);
+                    Some(card_id)
+                }
+                Err(e) => {
+                    crate::log!("[feishu] 流式卡片发送失败，回落逐条发送: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                crate::log!("[feishu] 流式卡片创建失败，回落逐条发送: {e:#}");
+                None
+            }
+        }
+    }
+
+    async fn stream_update(&self, handle: &str, full_text: &str) {
+        let seq = self.next_seq(handle);
+        if let Err(e) = self.fs.card_update_content(handle, full_text, seq).await {
+            crate::log!("[feishu] 流式卡片更新失败: {e:#}");
+        }
+    }
+
+    async fn stream_finalize(&self, handle: &str, full_text: &str) {
+        // 最终全文先更新（内容可能与上次 update 不同），再关流式；两步失败都只 log。
+        let seq = self.next_seq(handle);
+        if let Err(e) = self.fs.card_update_content(handle, full_text, seq).await {
+            crate::log!("[feishu] 流式卡片最终更新失败: {e:#}");
+        }
+        let seq = self.next_seq(handle);
+        if let Err(e) = self.fs.card_close_streaming(handle, seq).await {
+            crate::log!("[feishu] 流式卡片关闭失败: {e:#}");
+        }
+        self.stream_seq.lock().unwrap().remove(handle);
     }
 }
 
@@ -302,17 +367,24 @@ impl Messenger for WeixinMessenger {
 /// 钉钉实现：send_text 按会话标识分发（cid 开头=群聊 → groupMessages/send，否则单聊 →
 /// oToMessages/batchSend）。群聊回复需要 @ 提问者，故用一张 per-chat 表记最近 sender
 /// （入站时 bridge.on_dingtalk 调 note_sender 刷新；job 等非对话路径照常发，只是不 @）。
+/// card_template_id：#42 流式打字机的 AI 卡片模板 ID，空 = 流式不可用（回落逐条发送）。
 pub struct DingTalkMessenger {
     pub dt: DingTalkClient,
     robot_code: String,
+    card_template_id: String,
     last_sender: Mutex<HashMap<String, String>>,
 }
 
 impl DingTalkMessenger {
-    pub fn new(dt: DingTalkClient, robot_code: String) -> DingTalkMessenger {
+    pub fn new(
+        dt: DingTalkClient,
+        robot_code: String,
+        card_template_id: String,
+    ) -> DingTalkMessenger {
         DingTalkMessenger {
             dt,
             robot_code,
+            card_template_id,
             last_sender: Mutex::new(HashMap::new()),
         }
     }
@@ -401,6 +473,47 @@ impl Messenger for DingTalkMessenger {
                 .insert(chat_id.to_string(), sender_id.to_string());
         }
     }
+
+    async fn stream_begin(&self, chat_id: &str, initial_text: &str) -> Option<String> {
+        if self.card_template_id.is_empty() {
+            crate::log!(
+                "[dingtalk] 未配置卡片模板 ID（设置 → 钉钉卡片模板 ID），流式不可用，回落逐条发送"
+            );
+            return None;
+        }
+        match self
+            .dt
+            .card_create_and_deliver(
+                chat_id,
+                &self.robot_code,
+                &self.card_template_id,
+                initial_text,
+            )
+            .await
+        {
+            Ok(out_track_id) => Some(out_track_id),
+            Err(e) => {
+                crate::log!("[dingtalk] 流式卡片投递失败，回落逐条发送: {e:#}");
+                None
+            }
+        }
+    }
+
+    async fn stream_update(&self, handle: &str, full_text: &str) {
+        if let Err(e) = self
+            .dt
+            .card_streaming_update(handle, full_text, false)
+            .await
+        {
+            crate::log!("[dingtalk] 流式卡片更新失败: {e:#}");
+        }
+    }
+
+    async fn stream_finalize(&self, handle: &str, full_text: &str) {
+        if let Err(e) = self.dt.card_streaming_update(handle, full_text, true).await {
+            crate::log!("[dingtalk] 流式卡片收尾失败: {e:#}");
+        }
+    }
 }
 
 /// 按 bot 配置构造对应 Messenger。
@@ -409,6 +522,7 @@ pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
         return Ok(std::sync::Arc::new(DingTalkMessenger::new(
             DingTalkClient::new(&bot.app_id, &bot.app_secret),
             bot.ding_robot_code().to_string(),
+            bot.ding_card_template_id.clone(),
         )));
     }
     if bot.is_wechat() {
@@ -429,6 +543,7 @@ pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
     } else {
         Ok(std::sync::Arc::new(FeishuMessenger {
             fs: FeishuClient::new(&bot.app_id, &bot.app_secret),
+            stream_seq: Mutex::new(HashMap::new()),
         }))
     }
 }

@@ -318,6 +318,8 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_granted: slint::ModelRc::from(Rc::new(ding_granted)),
         ding_open_access: b.ding_open_access,
         ding_robot_code: b.ding_robot_code.clone().into(),
+        ding_card_template_id: b.ding_card_template_id.clone().into(),
+        stream_output: b.stream_output,
     }
 }
 
@@ -1058,6 +1060,9 @@ pub fn run_gui() -> Result<()> {
                             refresh = true; // 同 open_access：互斥显示靠 model 重建
                         }
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
+                        "ding_card_template_id" => {
+                            bot.ding_card_template_id = value.trim().to_string()
+                        }
                         _ => {}
                     }
                 }
@@ -1081,6 +1086,24 @@ pub fn run_gui() -> Result<()> {
                 }
             }
             // 同步回写 model：列表的 ⚪/停用 前缀与勾选框状态都绑 model，不刷新会显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
+        });
+    }
+    {
+        // #42 流式打字机开关（per-bot）：同 on_set_bot_enabled 的纪律——改 work 后 sync_model
+        // 重建 CheckBox 实例（绕开 slint 用户交互移除 checked 绑定的坑）。
+        let work = work.clone();
+        let model = bots_model.clone();
+        let dirty = dirty.clone();
+        settings.on_set_stream_output(move |idx, enabled| {
+            dirty.set(true);
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.stream_output = enabled;
+                }
+            }
             let b = work.borrow();
             sync_model(&model, &b);
         });

@@ -211,6 +211,82 @@ impl DingTalkClient {
         }
     }
 
+    // ── 流式打字机（#42）：钉钉 AI 卡片流式 ────────────────────────────────
+    // createAndDeliver 投放卡片实例（outTrackId 寻址）→ PUT /v1.0/card/streaming
+    // 累积全文更新（isFull=true）→ isFinalize=true 收尾。
+    // 需要卡片模板 ID（开放平台为本应用创建互动卡片模板，模板内含名为 content 的
+    // markdown 变量）；模板 ID 空 = 流式不可用，桥回落逐条发送。
+    // 平台侧限制：中间更新最小间隔 ~500ms（桥按 500ms 节流）。
+
+    /// ① 创建并投递 AI 卡片实例，返回 outTrackId（后续 streaming 更新按它寻址）。
+    pub async fn card_create_and_deliver(
+        &self,
+        chat_id: &str,
+        robot_code: &str,
+        template_id: &str,
+        initial_text: &str,
+    ) -> Result<String> {
+        let token = self.access_token().await?;
+        let out_track_id = uuid::Uuid::new_v4().to_string();
+        let body = card_deliver_body(
+            chat_id,
+            robot_code,
+            template_id,
+            &out_track_id,
+            initial_text,
+        );
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/v1.0/card/instances/createAndDeliver"))
+            .header("x-acs-dingtalk-access-token", &token)
+            .json(&body)
+            .send()
+            .await
+            .context("card createAndDeliver 网络错误")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        Ok(out_track_id)
+    }
+
+    /// ② 流式更新卡片内容（isFull 全量替换）。is_finalize=true 标记流式结束——
+    /// 任务结束必调，否则平台侧卡片停在流式态。
+    pub async fn card_streaming_update(
+        &self,
+        out_track_id: &str,
+        full_text: &str,
+        is_finalize: bool,
+    ) -> Result<()> {
+        let token = self.access_token().await?;
+        let body = json!({
+            "outTrackId": out_track_id,
+            // 每次调用一个 guid（平台按它幂等去重）
+            "guid": uuid::Uuid::new_v4().to_string(),
+            // 卡片模板里的 markdown 变量名（模板约定见模块文档）
+            "key": "content",
+            "content": full_text,
+            "isFull": true,
+            "isFinalize": is_finalize,
+            "isError": false,
+        });
+        let resp = self
+            .http
+            .put(format!("{API_BASE}/v1.0/card/streaming"))
+            .header("x-acs-dingtalk-access-token", &token)
+            .json(&body)
+            .send()
+            .await
+            .context("card streaming 网络错误")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        Ok(())
+    }
+
     /// 下载机器人接收到的文件/图片/语音（downloadCode → downloadUrl → 二进制）。
     /// 两步：POST /v1.0/robot/messageFiles/download 换 downloadUrl，再 GET 下载。
     pub async fn download_msg_file(
@@ -320,6 +396,44 @@ fn api_error(status: u16, body: &str) -> anyhow::Error {
 /// 群聊会话判定：钉钉群会话 ID 恒以 "cid" 开头；单聊我们用对方 staffId 当 chat_id。
 pub fn is_group_chat(chat_id: &str) -> bool {
     chat_id.starts_with("cid")
+}
+
+/// 构造 createAndDeliver 请求体（#42 纯函数便于单测）：
+/// 单聊 → IM_ROBOT 空间（openSpaceId 后缀 staffId）；群聊 → IM_GROUP（后缀 openConversationId）。
+/// cardParamMap.content 对应卡片模板里的 markdown 变量名（模板约定）。
+fn card_deliver_body(
+    chat_id: &str,
+    robot_code: &str,
+    template_id: &str,
+    out_track_id: &str,
+    initial_text: &str,
+) -> Value {
+    let mut body = json!({
+        "cardTemplateId": template_id,
+        "outTrackId": out_track_id,
+        "callbackType": "STREAM",
+        "userIdType": 1,
+        "cardData": {
+            "cardParamMap": {"content": initial_text},
+        },
+    });
+    if is_group_chat(chat_id) {
+        body["openSpaceId"] = json!(format!("dtv1.card//IM_GROUP.{chat_id}"));
+        body["imGroupOpenSpaceModel"] = json!({"supportForward": true});
+        body["imGroupOpenDeliverModel"] = json!({
+            "robotCode": robot_code,
+            "extension": {},
+        });
+    } else {
+        body["openSpaceId"] = json!(format!("dtv1.card//IM_ROBOT.{chat_id}"));
+        body["imRobotOpenSpaceModel"] = json!({"supportForward": true});
+        body["imRobotOpenDeliverModel"] = json!({
+            "robotCode": robot_code,
+            "spaceType": "IM_ROBOT",
+            "extension": {},
+        });
+    }
+    body
 }
 
 /// 一条待下载的钉钉附件引用（picture/file/audio/video/富文本图片）。
@@ -1032,5 +1146,24 @@ mod tests {
             "7724109a-ea43-4aa2-b803-87d82c5aaee6"
         );
         assert_eq!(percent_encode_query("a+b/c=="), "a%2Bb%2Fc%3D%3D");
+    }
+
+    #[test]
+    fn card_deliver_body_shapes() {
+        // #42 群聊：IM_GROUP 空间 + openConversationId
+        let g = card_deliver_body("cidAsXSBLnA==", "robot1", "tpl9", "ot1", "⏳ …");
+        assert_eq!(g["cardTemplateId"], "tpl9");
+        assert_eq!(g["outTrackId"], "ot1");
+        assert_eq!(g["callbackType"], "STREAM");
+        assert_eq!(g["cardData"]["cardParamMap"]["content"], "⏳ …");
+        assert_eq!(g["openSpaceId"], "dtv1.card//IM_GROUP.cidAsXSBLnA==");
+        assert_eq!(g["imGroupOpenDeliverModel"]["robotCode"], "robot1");
+        assert!(g.get("imRobotOpenDeliverModel").is_none());
+
+        // 单聊：IM_ROBOT 空间 + staffId + spaceType
+        let s = card_deliver_body("staff42", "robot1", "tpl9", "ot2", "hi");
+        assert_eq!(s["openSpaceId"], "dtv1.card//IM_ROBOT.staff42");
+        assert_eq!(s["imRobotOpenDeliverModel"]["spaceType"], "IM_ROBOT");
+        assert!(s.get("imGroupOpenDeliverModel").is_none());
     }
 }
