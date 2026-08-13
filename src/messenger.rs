@@ -54,6 +54,12 @@ pub trait Messenger: Send + Sync {
     /// 完成表情（可选）。默认无操作。
     async fn done(&self, _message_id: &str) {}
 
+    /// 反查用户展示名（授权码消费后记录「谁被授权了」）。飞书走联系人 API；其它通道无
+    /// 对应概念，默认返回 None（调用方用用户 id 兜底显示）。best-effort，失败不阻塞流程。
+    async fn user_display_name(&self, _user_id: &str) -> Option<String> {
+        None
+    }
+
     /// 记录某会话的回复上下文（微信 context_token）。飞书不需要，默认无操作。
     fn note_context(&self, _chat_id: &str, _context_token: &str) {}
 
@@ -105,6 +111,9 @@ pub struct FeishuMessenger {
 impl Messenger for FeishuMessenger {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
         self.fs.send_text(chat_id, text).await
+    }
+    async fn user_display_name(&self, user_id: &str) -> Option<String> {
+        self.fs.user_name(user_id).await
     }
     async fn send_thread_reply(&self, _chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         self.fs.reply_text(message_id, text).await
@@ -312,6 +321,14 @@ impl DingTalkMessenger {
 #[async_trait::async_trait]
 impl Messenger for DingTalkMessenger {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
+        self.dt
+            .send_text(chat_id, &self.robot_code, text, None)
+            .await
+    }
+    async fn user_display_name(&self, user_id: &str) -> Option<String> {
+        self.dt.user_name(user_id).await
+    }
+    async fn send_thread_reply(&self, chat_id: &str, _message_id: &str, text: &str) -> Result<()> {
         // 群聊回复 @ 最近提问者（单聊 chat_id=对方 staffId，无需 @）
         let at = if crate::dingtalk::is_group_chat(chat_id) {
             self.last_sender.lock().unwrap().get(chat_id).cloned()

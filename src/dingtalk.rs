@@ -93,6 +93,34 @@ impl DingTalkClient {
         Ok(tok)
     }
 
+    /// 按 staffId 反查用户姓名（授权码消费后展示用）。best-effort：token/API 失败或用户不可见
+    /// 返回 None，调用方用 staffId 兜底显示。
+    pub async fn user_name(&self, staff_id: &str) -> Option<String> {
+        let token = self.access_token().await.ok()?;
+        let url = format!("{API_BASE}/v1.0/contact/users/{staff_id}");
+        let resp: Value = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        // 钉钉用户对象：name / nick 字段（不同版本字段有差异，取第一个非空）
+        let obj = resp.get("result").or_else(|| resp.get("data"))?;
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let nick = obj
+            .get("nick")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        name.or(nick).map(|s| s.to_string())
+    }
+
     /// 发单聊文本（userIds 批量接口，单元素）。
     pub async fn send_single(&self, user_id: &str, robot_code: &str, text: &str) -> Result<()> {
         let token = self.access_token().await?;

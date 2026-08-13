@@ -264,6 +264,34 @@ fn sync_model(model: &slint::VecModel<BotRow>, bots: &[BotConfig]) {
 }
 
 fn bot_to_row(b: &BotConfig) -> BotRow {
+    let granted = slint::VecModel::from(
+        b.granted_infos
+            .iter()
+            .map(|i| OwnerRow {
+                name: (if i.name.is_empty() {
+                    i.open_id.clone()
+                } else {
+                    i.name.clone()
+                })
+                .into(),
+                open_id: i.open_id.clone().into(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let ding_granted = slint::VecModel::from(
+        b.ding_granted_infos
+            .iter()
+            .map(|i| OwnerRow {
+                name: (if i.name.is_empty() {
+                    i.open_id.clone()
+                } else {
+                    i.name.clone()
+                })
+                .into(),
+                open_id: i.open_id.clone().into(),
+            })
+            .collect::<Vec<_>>(),
+    );
     BotRow {
         name: b.name.clone().into(),
         kind: b.kind.clone().into(),
@@ -276,6 +304,9 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         })
         .into(),
         owner_open_id: b.owner_open_id.clone().into(),
+        owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
+        granted: slint::ModelRc::from(Rc::new(granted)),
+        open_access: b.open_access,
         app_id: b.app_id.clone().into(),
         app_secret: b.app_secret.clone().into(),
         bot_name: b.bot_name.clone().into(),
@@ -283,6 +314,9 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         // per-bot 供应商名（""=跟随全局默认），直接显示原值（下拉第一项是 ""）
         provider: b.provider.clone().into(),
         ding_user_id: b.ding_user_id.clone().into(),
+        ding_owner_ids: b.ding_owner_ids.clone().into(),
+        ding_granted: slint::ModelRc::from(Rc::new(ding_granted)),
+        ding_open_access: b.ding_open_access,
         ding_robot_code: b.ding_robot_code.clone().into(),
     }
 }
@@ -311,6 +345,67 @@ fn sync_providers_model(
             .map(|p| provider_to_row(p, default_name))
             .collect::<Vec<_>>(),
     );
+}
+
+/// config.json 签名（mtime, size）：检测外部（service 消费授权码等）改盘。
+fn config_sig() -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(crate::config::Config::path())
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())))
+}
+
+/// 检测 config.json 被外部改（service 消费授权码改 owner 白名单等）且当前无未保存编辑 →
+/// 重载 bots 区（保留 selected，不动状态行），让 Owner 白名单 / 授权码展示跟随实际授权状态，
+/// 也避免用户之后点「保存」用旧快照把 service 刚写入的授权覆盖掉（lost update）。
+/// dirty=true（正在编辑）→ 跳过重载，只推进签名（保存路径会 load_into 拉最新）。
+fn reload_bots_if_external_change(
+    w: &SettingsWindow,
+    work: &RefCell<Vec<BotConfig>>,
+    model: &slint::VecModel<BotRow>,
+    dirty: &Cell<bool>,
+    last_sig: &Cell<Option<(std::time::SystemTime, u64)>>,
+) {
+    let cur = config_sig();
+    if cur == last_sig.get() {
+        return;
+    }
+    last_sig.set(cur);
+    if dirty.get() {
+        return;
+    }
+    let cfg = match crate::config::Config::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let sel = w.get_selected();
+    *work.borrow_mut() = cfg.bots.clone();
+    sync_model(model, &cfg.bots);
+    w.set_selected(sel);
+    refresh_owner_code_info(w, work);
+}
+
+/// 刷新当前选中 bot 的授权码展示（切换 bot / 生成后调用）：管理员码与普通授权码分两行。
+fn refresh_owner_code_info(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let idx = w.get_selected() as usize;
+    let codes = work
+        .borrow()
+        .get(idx)
+        .map(|b| crate::config::Config::pending_owner_codes(&b.key()))
+        .unwrap_or_default();
+    let now = crate::chrono_lite::unix_secs();
+    let mut owner_line = String::new();
+    let mut grant_line = String::new();
+    for (role, code, expires) in codes {
+        let mins = expires.saturating_sub(now) / 60;
+        let line = format!("🔑 授权码：{code}（剩 {mins} 分钟）");
+        if role == "owner" {
+            owner_line = format!("👑 管理员{line}");
+        } else {
+            grant_line = line;
+        }
+    }
+    w.set_owner_code_info(owner_line.into());
+    w.set_grant_code_info(grant_line.into());
 }
 
 /// 跑一次依赖检测并把全部 7 项状态回填到设置窗（claude/codex/pi/node/python3/lark-cli/dingtalk-cli）。
@@ -497,6 +592,32 @@ pub fn run_gui() -> Result<()> {
     let bots_model: Rc<slint::VecModel<BotRow>> = Rc::new(slint::VecModel::default());
     let work: Rc<RefCell<Vec<BotConfig>>> = Rc::new(RefCell::new(Vec::new()));
     settings.set_bots(slint::ModelRc::from(bots_model.clone()));
+
+    // config.json 外部变化监控：service 侧消费授权码会改 owner 白名单/pending_codes（GUI 是独立
+    // 进程，读不到那份快照）。设置窗开着且无未保存编辑时，周期检测签名变化 → 热刷新 bots 区
+    // （Owner 白名单、授权码展示跟着实际授权状态走，避免「bot 已回复授权成功、GUI 还显示旧的」
+    // 以及后续保存把 service 写入覆盖掉）。Timer 在 run() 作用域持有，随事件循环存活。
+    let watch_sig = Rc::new(Cell::new(config_sig()));
+    let watch_w = settings.as_weak();
+    let watch_work = work.clone();
+    let watch_model = bots_model.clone();
+    let watch_dirty = dirty.clone();
+    let config_watch = slint::Timer::default();
+    config_watch.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(3000),
+        move || {
+            if let Some(w) = watch_w.upgrade() {
+                reload_bots_if_external_change(
+                    &w,
+                    &watch_work,
+                    &watch_model,
+                    &watch_dirty,
+                    &watch_sig,
+                );
+            }
+        },
+    );
     // 供应商工作副本 + model + 全局默认名工作副本
     let providers_model: Rc<slint::VecModel<ProviderRow>> = Rc::new(slint::VecModel::default());
     let providers_work: Rc<RefCell<Vec<ProviderConfig>>> = Rc::new(RefCell::new(Vec::new()));
@@ -542,6 +663,7 @@ pub fn run_gui() -> Result<()> {
         // 后端、Owner、供应商 都是 per-bot（bots[i].backend / .owner_open_id / .provider）
         w.set_selected(if c.bots.is_empty() { -1 } else { 0 });
         w.set_provider_selected(if c.providers.is_empty() { -1 } else { 0 });
+        refresh_owner_code_info(w, work);
         w.set_status_line("".into());
         // 依赖检测：claude/codex/node/python3/lark-cli 是否在本机可执行路径上。
         push_deps_to_window(w);
@@ -874,9 +996,12 @@ pub fn run_gui() -> Result<()> {
                         "backend" => bot.backend = value.to_string(),
                         "provider" => bot.provider = value.to_string(),
                         "owner" => bot.owner_open_id = value.trim().to_string(),
+                        "open_access" => bot.open_access = value.contains("任何人都可以对话"),
                         "app_id" => bot.app_id = value.trim().to_string(),
                         "app_secret" => bot.app_secret = value.trim().to_string(),
                         "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
+                        "ding_owner_ids" => bot.ding_owner_ids = value.trim().to_string(),
+                        "ding_open_access" => bot.ding_open_access = value.contains("任何人都可以对话"),
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
                         _ => {}
                     }
@@ -919,9 +1044,13 @@ pub fn run_gui() -> Result<()> {
         // bot 的后端，看起来像「改了一个另一个也跟着变」。set_vec 触发 model 变更通知，ComboBox 重求值。
         let work = work.clone();
         let model = bots_model.clone();
+        let sw = settings.as_weak();
         settings.on_selection_changed(move |_idx| {
             let b = work.borrow();
             sync_model(&model, &b);
+            if let Some(w) = sw.upgrade() {
+                refresh_owner_code_info(&w, &work);
+            }
         });
     }
     {
@@ -1172,6 +1301,111 @@ pub fn run_gui() -> Result<()> {
                 w.set_status_line(format!("⏳ 开始安装 {dep_id} …").into());
             }
             let _ = tx.send(UiCmd::InstallDep(dep_id.to_string()));
+        });
+    }
+
+    // 「生成授权码」：作废旧码、生成新码落盘，回填展示 + 状态行。role=owner 生成管理员码。
+    // 同步操作（config 本地读写）。
+    {
+        let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_generate_owner_code(move |idx, role| {
+            let Some(w) = sw.upgrade() else { return };
+            let Some(bot) = work.borrow().get(idx as usize).cloned() else { return };
+            let open = if bot.is_dingtalk() {
+                bot.ding_open_access
+            } else {
+                bot.open_access
+            };
+            if open {
+                // 公开模式无需授权（按钮已禁用，双保险防参数矛盾）
+                w.set_status_is_error(true);
+                w.set_status_line("❌ 公开模式下任何人都可对话，无需生成授权码（请先切回「仅授权用户」）".into());
+                return;
+            }
+            match crate::config::Config::generate_owner_code(&bot.key(), role.as_str()) {
+                Some((code, _expires)) => {
+                    let label = if role == "owner" { "管理员授权码" } else { "授权码" };
+                    w.set_status_is_error(false);
+                    w.set_status_line(
+                        format!("✅ 已生成{label} {code}：发给对方，由 ta 私聊发给本 bot 完成授权（同类型旧码已作废）").into(),
+                    );
+                    refresh_owner_code_info(&w, &work);
+                }
+                None => {
+                    w.set_status_is_error(true);
+                    w.set_status_line("❌ 生成授权码失败（config 写入失败）".into());
+                }
+            }
+        });
+    }
+
+    // 「复制授权码」：把指定 role 的未过期码写入系统剪贴板（pbcopy/clip/xclip）。
+    {
+        let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_copy_owner_code(move |role| {
+            let Some(w) = sw.upgrade() else { return };
+            let Some(bot) = work.borrow().get(w.get_selected() as usize).cloned() else {
+                return;
+            };
+            let code = crate::config::Config::pending_owner_codes(&bot.key())
+                .into_iter()
+                .find(|(r, _, _)| r == role.as_str())
+                .map(|(_, code, _)| code);
+            match code {
+                Some(code) if crate::platform::copy_to_clipboard(&code) => {
+                    w.set_status_is_error(false);
+                    w.set_status_line(format!("✅ 授权码 {code} 已复制到剪贴板").into());
+                }
+                Some(_) => {
+                    w.set_status_is_error(true);
+                    w.set_status_line("❌ 复制失败（系统剪贴板不可用）".into());
+                }
+                None => {
+                    w.set_status_is_error(true);
+                    w.set_status_line("❌ 没有有效授权码，请先生成".into());
+                }
+            }
+        });
+    }
+
+    // 「取消授权」：从该 bot 授权者列表移除某用户（config 落盘 + 刷新列表）。
+    {
+        let work = work.clone();
+        let model = bots_model.clone();
+        let sw = settings.as_weak();
+        settings.on_remove_granted(move |bot_idx, granted_idx| {
+            let Some(w) = sw.upgrade() else { return };
+            let Some(bot) = work.borrow().get(bot_idx as usize).cloned() else {
+                return;
+            };
+            // 授权者展示名列表按 bot kind 取（飞书 granted_infos / 钉钉 ding_granted_infos）
+            let open_id = if bot.is_dingtalk() {
+                bot.ding_granted_infos
+                    .get(granted_idx as usize)
+                    .map(|i| i.open_id.clone())
+            } else {
+                bot.granted_infos.get(granted_idx as usize).map(|i| i.open_id.clone())
+            }
+            .unwrap_or_default();
+            if open_id.is_empty() {
+                return;
+            }
+            if crate::config::Config::remove_granted(&bot.key(), &open_id) {
+                w.set_status_is_error(false);
+                w.set_status_line(format!("✅ 已取消授权 {open_id}").into());
+                // 同步更新工作副本 + model（列表即时消失）；config watch 也会兜底刷新
+                if let Some(b) = work.borrow_mut().get_mut(bot_idx as usize) {
+                    crate::config::remove_granted_from_bot(b, &open_id);
+                }
+                let bots = work.borrow().clone();
+                sync_model(&model, &bots);
+                w.set_selected(bot_idx);
+            } else {
+                w.set_status_is_error(true);
+                w.set_status_line("❌ 取消授权失败（config 写入失败）".into());
+            }
         });
     }
 

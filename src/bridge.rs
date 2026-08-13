@@ -16,10 +16,10 @@ pub struct Bridge {
     pub msgr: Arc<dyn Messenger>,
     pub sessions: SessionStore,
     pub jobs: JobStore,
-    /// 本 bot 的配置（app_id/bot_name/bot_open_id/primary_chat_id/wx_*…）
+    /// 本 bot 的配置（app_id/bot_name/bot_open_id/primary_chat_id/wx_*…）；
+    /// 访问控制（owner/授权者/对话权限）也以它为准——生产每次消息从 config.json 热读覆盖
+    /// 判断（授权/取消即时生效），config 读不到（单测）时用它当快照。
     pub bot: BotConfig,
-    /// 全局：只响应这个 owner（飞书 open_id）
-    pub owner_open_id: Mutex<String>,
     /// 全局：默认后端（SessionStore 已按它初始化；字段保留以便将来逐 bot 覆盖）
     #[allow(dead_code)]
     pub default_backend: String,
@@ -92,8 +92,6 @@ impl Bridge {
             msgr,
             sessions,
             jobs: JobStore::new(&bot.key()),
-            // owner 也是 per-bot（飞书 bot 各自配，微信用 wx_user_id 不走这）；空则回落全局 owner_open_id。
-            owner_open_id: Mutex::new(bot.effective_owner(&cfg.owner_open_id).to_string()),
             default_backend: effective,
             bot,
             seen: Mutex::new(HashSet::new()),
@@ -103,6 +101,59 @@ impl Bridge {
             pending: PendingStore::new(&key),
             agent_runner,
         }
+    }
+
+    /// config 读不到本 bot（单测注入）时，用构造时的访问控制快照判定放行。
+    /// 快照 = self.bot（build 时从 config 复制，含 kind 与全部访问字段）。
+    fn access_snapshot_allows(&self, sender_id: &str) -> bool {
+        self.bot.access_allows(sender_id)
+    }
+
+    /// 尝试把一条消息当作授权码处理（owner 生成后给到对方）。仅 p2p 接受（飞书 p2p / 钉钉单聊，
+    /// 群里发码太公开防抢注）；文本精确匹配 pending 码 → 消费并把发送者加入对应白名单
+    /// （管理员码→owner / 普通码→授权者，按 bot kind 落位到 open_id 或 staffId 字段）、回发结果。
+    /// 返回 true = 授权码消息已消费/回复，调用方应 return（不再进 agent）。
+    async fn try_consume_owner_code(
+        &self,
+        sender_id: &str,
+        chat_id: &str,
+        is_p2p: bool,
+        text: &str,
+    ) -> bool {
+        let text = text.trim();
+        if !is_p2p || text.is_empty() {
+            return false;
+        }
+        use crate::config::OwnerCodeResult as R;
+        // 先查发送者展示名（best-effort，查不到用 id 兜底）：随授权一起落盘，GUI 授权列表
+        // 能显示「谁」。查名放授权前：失败不阻塞授权。
+        let name = self
+            .msgr
+            .user_display_name(sender_id)
+            .await
+            .unwrap_or_default();
+        let r = crate::config::Config::consume_owner_code(&self.bot.key(), text, sender_id, &name);
+        let reply = match r {
+            R::Granted => Some("✅ 授权成功，你现在可以在这个 bot 里对话了。"),
+            R::Expired => Some("❌ 授权码已过期，请联系管理员重新生成。"),
+            R::NotFound => None, // 不是授权码 → 按未授权消息忽略
+        };
+        let Some(txt) = reply else {
+            return false;
+        };
+        if let Err(e) = self.msgr.send_text(chat_id, txt).await {
+            crate::log!(
+                "[bridge] 授权码回复发送失败 chat={}: {e:#}",
+                trunc(chat_id, 10)
+            );
+        }
+        crate::log!(
+            "[bridge] 授权码消息处理完成（bot={} sender={} result={:?}）",
+            self.bot.key(),
+            sender_id,
+            r
+        );
+        true
     }
 
     /// 取（或新建）某 chat 的串行锁 Arc。同一 chat 的并发任务拿同一把锁 → 排队等前一条处理完。
@@ -234,35 +285,38 @@ impl Bridge {
             crate::log!("[群] bot@={}", self.bot_is_mentioned(&mentions));
         }
 
-        // should_respond：owner 未配置时，把第一条私聊（p2p）的发送者自动设为 owner 并落盘，
-        // 之后只响应 ta（群聊不自动学习，避免随便一个群成员认领）。
+        // should_respond（访问控制，默认私有）：公开开关开 → 放行所有人；否则只放行 owner
+        // （管理员）∪ 授权者（授权码添加）白名单。未授权者只能通过授权码激活。
+        // 每次消息从 config.json 热读最新访问控制（授权/取消/改开关即时生效，不依赖启动快照）；
+        // config 读不到该 bot（单测注入）→ 回落构造时的快照。判定统一走 BotConfig::access_allows。
         {
-            let mut owner = self.owner_open_id.lock().unwrap();
-            if owner.is_empty() && chat_type == "p2p" && !sender_id.is_empty() {
-                *owner = sender_id.to_string();
-                crate::log!(
-                    "[bridge] 未配置 owner，自动把首个私聊用户设为 owner（bot={}）: {}",
-                    self.bot.key(),
-                    sender_id
-                );
-                crate::config::Config::save_owner(&self.bot.key(), sender_id);
-            }
-            if sender_id != *owner {
-                if !owner.is_empty() {
-                    crate::log!(
-                        "[bridge] 忽略非 owner 消息（bot={} sender={} chat_type={}）",
-                        self.bot.key(),
-                        sender_id,
-                        chat_type
-                    );
-                } else if chat_type != "p2p" {
-                    crate::log!(
-                        "[bridge] owner 未配置且非私聊，忽略（bot={} chat_type={} sender={}）；请先私聊 bot 自动设置 owner",
-                        self.bot.key(),
-                        chat_type,
-                        sender_id
-                    );
+            let allowed = match crate::config::Config::load() {
+                Ok(c) => c
+                    .bots
+                    .into_iter()
+                    .find(|b| b.key() == self.bot.key())
+                    .map(|b| b.access_allows(sender_id))
+                    .unwrap_or_else(|| self.access_snapshot_allows(sender_id)),
+                Err(_) => self.access_snapshot_allows(sender_id),
+            };
+            if !allowed {
+                // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
+                // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
+                // 不匹配 → 按未授权消息忽略（不进入 agent，含 /new 等指令）。
+                if chat_type == "p2p" {
+                    let raw = message["content"].as_str().unwrap_or("");
+                    let text = crate::feishu::parse_content(raw).text;
+                    let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
+                    if self.try_consume_owner_code(sender_id, &chat_id, true, &text).await {
+                        return;
+                    }
                 }
+                crate::log!(
+                    "[bridge] 忽略非 owner 消息（bot={} sender={} chat_type={}）",
+                    self.bot.key(),
+                    sender_id,
+                    chat_type
+                );
                 return;
             }
         }
@@ -725,9 +779,27 @@ impl Bridge {
     /// 钉钉入站消息入口（service 的钉钉 Stream 循环调用）。
     /// msg=解析好的机器人消息；先记群聊最近发送者（回复时 @），过滤后走统一 handle。
     pub async fn on_dingtalk(&self, msg: crate::dingtalk::DingtalkMessage) {
-        // should_respond：钉钉 owner 判据是允许的 staffId（ding_user_id；空=不设限）
-        let owner = self.bot.ding_owner();
-        if !owner.is_empty() && msg.sender_staff_id != owner {
+        // 访问控制（与飞书同套，staffId 标识）：公开开关开 → 放行所有人；否则只放行 owner ∪
+        // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
+        let allowed = match crate::config::Config::load() {
+            Ok(c) => c
+                .bots
+                .into_iter()
+                .find(|b| b.key() == self.bot.key())
+                .map(|b| b.access_allows(&msg.sender_staff_id))
+                .unwrap_or_else(|| self.access_snapshot_allows(&msg.sender_staff_id)),
+            Err(_) => self.access_snapshot_allows(&msg.sender_staff_id),
+        };
+        if !allowed {
+            // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
+            let chat_id = msg.chat_id().to_string();
+            let is_p2p = !chat_id.starts_with("cid");
+            if self
+                .try_consume_owner_code(&msg.sender_staff_id, &chat_id, is_p2p, &msg.text)
+                .await
+            {
+                return;
+            }
             crate::log!(
                 "[dingtalk] 忽略非 owner 消息 from={}",
                 trunc(&msg.sender_staff_id, 10)
@@ -1449,6 +1521,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn on_payload_unactivated_bot_ignores_commands_and_chat() {
+        // owner 空 = 未授权（默认封闭）：普通消息和 /new 等指令都不进 agent、无回复——
+        // 只有发匹配的授权码才能激活（授权码消费走真实 config，单测里 bot 不在 config → NotFound
+        // 静默忽略，故这里只验「未激活时所有非授权码消息都被拦」）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "新bot".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "".into(), // 未授权
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        for (mid, text) in [("om_c1", "你好"), ("om_c2", "/new")] {
+            let payload = feishu_payload(
+                mid,
+                "oc_p2p",
+                "p2p",
+                "",
+                "",
+                "user",
+                "ou_stranger",
+                &[],
+                text,
+            );
+            bridge.on_payload(payload.as_bytes()).await;
+        }
+
+        assert!(
+            runner.prompts().is_empty(),
+            "未授权消息（含 /new）不应触发 agent"
+        );
+        assert!(_msgr.sent().is_empty(), "未授权消息不应有回复");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_owner_whitelist_allows_members_only() {
+        // 多 owner 白名单（逗号分隔）：白名单内放行进 agent，名单外忽略
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss, ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        // 名单外 → 忽略
+        let payload = feishu_payload(
+            "om_out",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_stranger",
+            &[],
+            "你好",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+        assert!(runner.prompts().is_empty(), "名单外不应触发 agent");
+
+        // 名单内（第二个 open_id）→ 放行
+        let payload = feishu_payload(
+            "om_in",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_friend",
+            &[],
+            "你好",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+        assert_eq!(runner.prompts(), vec!["你好"], "白名单成员应触发 agent");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
     async fn on_payload_group_thread_reply_without_mention_is_handled() {
         // 用户回复机器人的话题消息不需要再次 @：thread_id 非空时跳过群聊 @ 校验
         // （顶层群消息仍要求 @，见下个测试）。
@@ -1655,6 +1812,7 @@ mod tests {
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
             kind: "dingtalk".into(),
+            ding_owner_ids: "u1".into(), // 私有模式 + owner=u1（测试 sender）
             ..Default::default()
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
@@ -1785,6 +1943,7 @@ mod tests {
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
             kind: "dingtalk".into(),
+            ding_owner_ids: "u1".into(), // 私有模式 + owner=u1（测试 sender）
             ..Default::default()
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
