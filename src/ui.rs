@@ -384,6 +384,48 @@ fn reload_bots_if_external_change(
     refresh_owner_code_info(w, work);
 }
 
+/// 按当前选中 bot 重算互斥 CheckBox 的勾选态（后端 + 对话权限）。
+/// 切 bot / 装载设置窗时调用。整体替换 option model → for 循环重建 CheckBox 实例，
+/// 绕开 slint「用户交互移除 checked 绑定、状态残留到其它 bot」的坑。
+fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let bot = work.borrow().get(w.get_selected() as usize).cloned();
+    let be = bot.as_ref().map(|b| b.backend.clone()).unwrap_or_default();
+    let mk_opts = |opts: &[(&str, &str)], sel: &str| -> Vec<OptionRow> {
+        opts.iter()
+            .map(|(name, val)| OptionRow {
+                name: (*name).into(),
+                checked: *val == sel,
+            })
+            .collect()
+    };
+    // 空 = 跟随全局 → claude 选中
+    let be_sel = if be.is_empty() { "claude" } else { be.as_str() };
+    w.set_backend_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(mk_opts(
+        &[("claude", "claude"), ("codex", "codex"), ("pi", "pi")],
+        be_sel,
+    )))));
+    let is_ding = bot.as_ref().map(|b| b.is_dingtalk()).unwrap_or(false);
+    let open = bot
+        .map(|b| {
+            if is_ding {
+                b.ding_open_access
+            } else {
+                b.open_access
+            }
+        })
+        .unwrap_or(false);
+    let access_sel = if open { "open" } else { "private" };
+    let access_model = slint::ModelRc::from(Rc::new(slint::VecModel::from(mk_opts(
+        &[
+            ("仅授权用户（owner+授权者）", "private"),
+            ("任何人都可以对话", "open"),
+        ],
+        access_sel,
+    ))));
+    w.set_access_options(access_model.clone());
+    w.set_ding_access_options(access_model);
+}
+
 /// 刷新当前选中 bot 的授权码展示（切换 bot / 生成后调用）：管理员码与普通授权码分两行。
 fn refresh_owner_code_info(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     let idx = w.get_selected() as usize;
@@ -664,6 +706,7 @@ pub fn run_gui() -> Result<()> {
         w.set_selected(if c.bots.is_empty() { -1 } else { 0 });
         w.set_provider_selected(if c.providers.is_empty() { -1 } else { 0 });
         refresh_owner_code_info(w, work);
+        refresh_exclusive_checks(w, work);
         w.set_status_line("".into());
         // 依赖检测：claude/codex/node/python3/lark-cli 是否在本机可执行路径上。
         push_deps_to_window(w);
@@ -993,15 +1036,27 @@ pub fn run_gui() -> Result<()> {
                             // 不回写 model 的话，改类型后右侧仍显示旧类型的表单（如改「钉钉」还显示微信登录框）
                             refresh = true;
                         }
-                        "backend" => bot.backend = value.to_string(),
+                        "backend" => {
+                            bot.backend = value.to_string();
+                            // 后端三选一 CheckBox：select-backend 已显式 set 勾选态，这里只回写
+                            // work；切 bot 时由 refresh_exclusive_checks 经 backend-ui property
+                            // 重新 set 勾选态（绕开用户交互会移除 checked 绑定的 slint 坑）。
+                            refresh = true;
+                        }
                         "provider" => bot.provider = value.to_string(),
                         "owner" => bot.owner_open_id = value.trim().to_string(),
-                        "open_access" => bot.open_access = value.contains("任何人都可以对话"),
+                        "open_access" => {
+                            bot.open_access = value.contains("任何人都可以对话");
+                            refresh = true; // 对话权限互斥 CheckBox 同样依赖 model 重求值
+                        }
                         "app_id" => bot.app_id = value.trim().to_string(),
                         "app_secret" => bot.app_secret = value.trim().to_string(),
                         "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
                         "ding_owner_ids" => bot.ding_owner_ids = value.trim().to_string(),
-                        "ding_open_access" => bot.ding_open_access = value.contains("任何人都可以对话"),
+                        "ding_open_access" => {
+                            bot.ding_open_access = value.contains("任何人都可以对话");
+                            refresh = true; // 同 open_access：互斥显示靠 model 重建
+                        }
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
                         _ => {}
                     }
@@ -1050,6 +1105,7 @@ pub fn run_gui() -> Result<()> {
             sync_model(&model, &b);
             if let Some(w) = sw.upgrade() {
                 refresh_owner_code_info(&w, &work);
+                refresh_exclusive_checks(&w, &work);
             }
         });
     }
@@ -1370,9 +1426,44 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
-    // 「取消授权」：从该 bot 授权者列表移除某用户（config 落盘 + 刷新列表）。
+    // 后端 / 对话权限互斥选项的勾选回调：写 work + 重算 option model（整体替换 → CheckBox 重建）。
     {
         let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_backend_option_toggled(move |i| {
+            let Some(w) = sw.upgrade() else { return };
+            let val = ["claude", "codex", "pi"][i as usize];
+            if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
+                bot.backend = val.to_string();
+            }
+            refresh_exclusive_checks(&w, &work);
+        });
+    }
+    {
+        let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_access_option_toggled(move |i| {
+            let Some(w) = sw.upgrade() else { return };
+            if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
+                bot.open_access = i == 1;
+            }
+            refresh_exclusive_checks(&w, &work);
+        });
+    }
+    {
+        let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_ding_access_option_toggled(move |i| {
+            let Some(w) = sw.upgrade() else { return };
+            if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
+                bot.ding_open_access = i == 1;
+            }
+            refresh_exclusive_checks(&w, &work);
+        });
+    }
+
+    // 「取消授权」：从该 bot 授权者列表移除某用户（config 落盘 + 刷新列表）。
+    {        let work = work.clone();
         let model = bots_model.clone();
         let sw = settings.as_weak();
         settings.on_remove_granted(move |bot_idx, granted_idx| {
