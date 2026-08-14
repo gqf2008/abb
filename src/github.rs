@@ -382,6 +382,14 @@ pub fn new_issues(issues: &[GhIssue], since: &str, seen: &[u64], echo_login: &st
     (fresh, new_since)
 }
 
+/// watch 通知失败后的重试游标：所有失败 issue 的 created_at 最小值（RFC3339 字典序 == 时间序）。
+/// 必须取最小值——若逐个覆盖取「最后一个失败者」的 created_at，created 早于它的失败 issue
+/// 下一轮会被 `created_at < since` 过滤（且 API updated 过滤直接不返回）而**永久丢失**。
+/// 无失败返回 None（调用方回落本轮推进的新游标）。
+pub fn retry_since(failed: &[&GhIssue]) -> Option<String> {
+    failed.iter().map(|i| i.created_at.as_str()).min().map(String::from)
+}
+
 /// 每仓库的增量游标（watch 循环持久化）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -771,6 +779,21 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].id, 2);
         assert_eq!(since, "2026-08-14T03:00:00Z");
+    }
+
+    #[test]
+    fn retry_since_takes_min_created_not_last_failed() {
+        // 同一窗口多个新 issue 通知全失败：游标必须退回 created 最早者。
+        // 若取「最后一个失败者」的 created，更早创建者会被 created_at 过滤永久丢弃。
+        let a = issue(1, 1, "alice", "2026-08-14T03:00:00Z", "2026-08-14T03:00:00Z");
+        let b = issue(2, 2, "bob", "2026-08-14T03:05:00Z", "2026-08-14T03:05:00Z");
+        let c = issue(3, 3, "carol", "2026-08-14T03:10:00Z", "2026-08-14T03:10:00Z");
+        assert_eq!(
+            retry_since(&[&a, &b, &c]),
+            Some("2026-08-14T03:00:00Z".to_string())
+        );
+        // 无失败 → None（调用方回落本轮新游标）
+        assert_eq!(retry_since(&[]), None);
     }
 
     #[test]

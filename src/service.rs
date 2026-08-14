@@ -425,9 +425,11 @@ async fn github_watch_loop(
                     let (fresh, new_since) =
                         crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
                     let mut seen_extra = Vec::new();
-                    // 通知失败不推进游标到该 issue 之后：retry_at 记下其 created_at，
-                    // 下一轮以它为 since 重新浮现（已通知的都在 seen 里，不会重复）。
-                    let mut retry_at: Option<String> = None;
+                    // 通知失败不推进游标到该 issue 之后：retry_at 记下**所有**失败 issue 的
+                    // created_at 最小值（逐个覆盖取最后失败者会丢 created 更早者，见
+                    // github::retry_since），下一轮以它为 since 重新浮现（已通知的都在 seen 里，
+                    // 不会重复）。
+                    let mut failed: Vec<&crate::github::GhIssue> = Vec::new();
                     for iss in &fresh {
                         let text = crate::github::notify_text(&repo, iss);
                         match bridge.msgr.send_text(&notify_chat, &text).await {
@@ -440,14 +442,15 @@ async fn github_watch_loop(
                                 );
                             }
                             Err(e) => {
-                                retry_at = Some(iss.created_at.clone());
+                                failed.push(iss);
                                 crate::log!(
                                     "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
                                 );
                             }
                         }
                     }
-                    let effective_since = retry_at.unwrap_or_else(|| new_since.clone());
+                    let effective_since =
+                        crate::github::retry_since(&failed).unwrap_or_else(|| new_since.clone());
                     cursor.update(&repo, &effective_since, seen_extra);
                 }
                 Err(e) => {

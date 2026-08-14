@@ -823,6 +823,8 @@ impl Bridge {
                 // pending 恢复语义一致，接受）。
                 if let Some(ctx) = &gh_ctx {
                     let full = format!("[agent-bridge 分析结果]\n\n{reply}");
+                    // 留档成败要如实反映到回执：失败时摘要明说「未留档」，不能假装成功。
+                    let mut archived = true;
                     match self.github_client.post_comment(&ctx.owner, &ctx.repo, ctx.number, &full).await {
                         Ok(()) => crate::log!(
                             "[bridge] 已把分析结果回写 {}/{}#{} 评论",
@@ -830,18 +832,28 @@ impl Bridge {
                             ctx.repo,
                             ctx.number
                         ),
-                        Err(e) => crate::log!(
-                            "[bridge] ⚠️ issue 评论回写失败 {}/{}#{}: {e:#}",
-                            ctx.owner,
-                            ctx.repo,
-                            ctx.number
-                        ),
+                        Err(e) => {
+                            archived = false;
+                            crate::log!(
+                                "[bridge] ⚠️ issue 评论回写失败 {}/{}#{}: {e:#}",
+                                ctx.owner,
+                                ctx.repo,
+                                ctx.number
+                            );
+                        }
                     }
                     let summary = crate::agent::truncate(&reply, 200);
-                    let text = format!(
-                        "📝 已分析 {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 issue 评论）",
-                        ctx.owner, ctx.repo, ctx.number, ctx.title, summary
-                    );
+                    let text = if archived {
+                        format!(
+                            "📝 已分析 {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 issue 评论）",
+                            ctx.owner, ctx.repo, ctx.number, ctx.title, summary
+                        )
+                    } else {
+                        format!(
+                            "📝 已分析 {}/{}#{}「{}」\n\n```\n{}\n```\n\n（⚠️ 评论留档失败，全文仅此可见，可稍后重发「分析」补档）",
+                            ctx.owner, ctx.repo, ctx.number, ctx.title, summary
+                        )
+                    };
                     match self.send_reply(&ev, &text).await {
                         Ok(()) => crate::log!(
                             "[bridge] 已回复 github 摘要 chat={} 长度={}",
@@ -1299,6 +1311,7 @@ mod tests {
         issue: Mutex<crate::github::GhIssue>,
         comments: Mutex<Vec<crate::github::GhComment>>,
         fail_fetch: bool,
+        fail_post: bool,
     }
     impl MockGithub {
         fn new() -> Self {
@@ -1320,6 +1333,7 @@ mod tests {
                     user: crate::github::GhUser { login: "bob".into() },
                 }]),
                 fail_fetch: false,
+                fail_post: false,
             }
         }
         fn calls(&self) -> Vec<String> {
@@ -1327,6 +1341,9 @@ mod tests {
         }
         fn set_fail_fetch(&mut self) {
             self.fail_fetch = true;
+        }
+        fn set_fail_post(&mut self) {
+            self.fail_post = true;
         }
     }
     #[async_trait]
@@ -1344,6 +1361,9 @@ mod tests {
         }
         async fn post_comment(&self, owner: &str, repo: &str, number: u64, body: &str) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("post:{owner}/{repo}/{number}:{}", crate::agent::truncate(body, 30)));
+            if self.fail_post {
+                anyhow::bail!("模拟回写失败");
+            }
             Ok(())
         }
         async fn close_issue(&self, owner: &str, repo: &str, number: u64) -> anyhow::Result<()> {
@@ -2749,6 +2769,31 @@ https://b.com/y"));
         task.await.unwrap();
         assert!(msgr.sent()[0].contains("拉取 issue 失败"));
         assert!(runner.prompts().is_empty(), "拉取失败不进 agent");
+        cleanup_bridge(&bridge);
+    }
+
+    /// GitHub 分析：评论回写失败 → 摘要如实提示「留档失败」，不假装已留档。
+    #[tokio::test]
+    async fn github_analyze_post_failure_receipt_is_honest() {
+        let runner = Arc::new(MockAgentRunner::immediate("根因是 token 缓存竞态。"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            gh_token: "ghp_x".into(),
+            gh_repos: "o/r".into(),
+            ..Default::default()
+        };
+        let mut gh = MockGithub::new();
+        gh.set_fail_post();
+        let gh = Arc::new(gh);
+        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move {
+            b1.handle(test_ev("m1", "oc_gh8", "分析 https://github.com/o/r/issues/42")).await
+        });
+        task.await.unwrap();
+        assert_eq!(msgr.sent().len(), 1);
+        assert!(msgr.sent()[0].contains("留档失败"), "摘要应提示留档失败: {}", msgr.sent()[0]);
+        assert!(!msgr.sent()[0].contains("已留档到"), "不得谎称已留档: {}", msgr.sent()[0]);
         cleanup_bridge(&bridge);
     }
 

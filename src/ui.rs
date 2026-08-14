@@ -321,6 +321,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         gh_token: b.gh_token.clone().into(),
         gh_repos: b.gh_repos.clone().into(),
         gh_notify_chat: b.gh_notify_chat.clone().into(),
+        gh_username: b.gh_username.clone().into(),
     }
 }
 
@@ -1066,6 +1067,7 @@ pub fn run_gui() -> Result<()> {
                         "gh_token" => bot.gh_token = value.trim().to_string(),
                         "gh_repos" => bot.gh_repos = value.trim().to_string(),
                         "gh_notify_chat" => bot.gh_notify_chat = value.trim().to_string(),
+                        "gh_username" => bot.gh_username = value.trim().to_string(),
                         _ => {}
                     }
                 }
