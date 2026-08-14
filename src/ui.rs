@@ -328,6 +328,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         gh_notify_chat: b.gh_notify_chat.clone().into(),
         gh_username: b.gh_username.clone().into(),
         gh_mention_map: b.gh_mention_map.clone().into(),
+        restrict_granted: b.restrict_granted_agent,
     }
 }
 
@@ -1115,6 +1116,25 @@ pub fn run_gui() -> Result<()> {
                 }
             }
             // 同步回写 model：列表的 ⚪/停用 前缀与勾选框状态都绑 model，不刷新会显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
+        });
+    }
+    // 「授权者 agent 隔离」开关（安全默认开启）：关闭=授权者与 owner 同权限（现状全权限）。
+    // 同 set_bot_enabled 的独立 bool callback 模式（避开 slint CheckBox checked 绑定坑）。
+    {
+        let work = work.clone();
+        let model = bots_model.clone();
+        let dirty = dirty.clone();
+        settings.on_set_restrict_granted(move |idx, enabled| {
+            dirty.set(true);
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.restrict_granted_agent = enabled;
+                }
+            }
+            // 同步回写 model：勾选框状态绑 model，不刷新会显示旧值
             let b = work.borrow();
             sync_model(&model, &b);
         });

@@ -104,6 +104,7 @@ export struct BotRow {
     gh-notify-chat: string, // 新 issue 通知目标会话（该 bot 自己的群/私聊 chat_id）
     gh-username: string,    // 自己的 GitHub login：新 issue 通知过滤「自问自答」回声
     gh-mention-map: string, // @提及映射：login:chat_id 对（评论 @提及 私信通知目标）
+    restrict-granted: bool, // 授权者 agent 会话隔离（true=受限模式，安全默认；false=与 owner 同权限）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -444,6 +445,7 @@ export component SettingsWindow inherits Window {
     callback copy-owner-code(string);          // 复制指定 role 的授权码到剪贴板
     callback remove-granted(int, int); // 取消授权：bot idx + 授权者下标（从授权者白名单移除）
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
+    callback set-restrict-granted(int, bool); // 授权者 agent 隔离开关（true=受限模式，保存后即时生效）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
     callback recheck-deps();            // 重新检测依赖是否已装
@@ -845,6 +847,24 @@ export component SettingsWindow inherits Window {
                                                         current-value: root.bots[root.selected].provider;
                                                         horizontal-stretch: 1;
                                                         selected => { root.bot-field-edited(root.selected, "provider", self.current-value); }
+                                                    }
+                                                }
+                                                // 授权者 agent 隔离（安全默认开启；三种 kind 都显示）：
+                                                // true=授权者会话只能读写本工作区、不能联网（受限模式）；
+                                                // false=授权者与 owner 同权限（信任团队成员时放宽）。
+                                                // 勾选态走独立 callback（同 set-bot-enabled 模式，避开 CheckBox
+                                                // checked 绑定被用户交互破坏的坑）。
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "授权者隔离"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        spacing: 12px;
+                                                        CheckBox {
+                                                            text: "授权者 agent 受限模式";
+                                                            checked: root.bots[root.selected].restrict-granted;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.set-restrict-granted(root.selected, self.checked); }
+                                                        }
                                                     }
                                                 }
                                                 // ── 飞书字段（owner/授权者/对话权限）──
