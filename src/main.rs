@@ -17,6 +17,7 @@ mod dingtalk;
 mod feishu;
 mod github;
 mod guard;
+mod history;
 mod install;
 mod larkskills;
 mod messenger;
