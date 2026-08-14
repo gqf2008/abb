@@ -918,9 +918,10 @@ impl Bridge {
 
         // #49 后端切换上下文迁移：新会话首轮（!resume）且历史尚未注入过该会话 →
         // 把最近几轮对话注入 prompt 开头（切后端/会话丢失后新后端由此接续上下文）。
-        // marker 按 session_id 判定：/new、CLI reset、agent 自愈换 UUID 都使 marker
-        // 自动失效（新会话允许再注入）。三层闸防重复注入：per-chat 串行锁（前一轮完整
-        // 结束才轮到本条）+ !resume（started=true 直接 resume 不注入）+ marker。
+        // marker 按 session_id 判定：/new、CLI reset 使 marker 失效或失配（新会话允许
+        // 再注入）。三层闸防重复注入：per-chat 串行锁（前一轮完整结束才轮到本条）+
+        // !resume（started=true 的正常消息直接 resume 不注入）+ marker。#54：自愈重建
+        // 会话带 pending 标记（同 sid）→ 无论 resume 与否放行一次注入。
         let hist = crate::history::History::open(&self.bot.key(), &key);
         // 代际锁（per-key，见 history_epochs 字段注释）：注入读 + 用户轮写盘在锁内与
         // /new 清盘互斥——新会话首轮不可能读到未清盘的旧历史（审查 I-2 读侧闭环）。
@@ -1050,7 +1051,7 @@ impl Bridge {
         match result {
             Ok(agent::RunOutcome::Reply {
                 reply,
-                session_id,
+                session_id: final_sid,
                 rebuilt,
             }) => {
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
@@ -1058,18 +1059,28 @@ impl Bridge {
                 // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
                 // #49：同一道闸决定历史落盘——换走后不写孤儿助手条目、不写迁移标记
                 // （历史已被 /new 清空，旧任务的回复不得写回去）。
-                let same_session = self.sessions.mark_started_if(&key, &session_id);
+                let same_session = self.sessions.mark_started_if(&key, &final_sid);
                 if same_session {
                     // 代际闸：/new 恰好落在 mark 与写盘之间（亚毫秒窗口）也不残留孤儿条目
                     let guard = hist_epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
                     if *guard == hist_epoch {
                         hist.append_assistant(&ev.mid, backend.name(), &reply);
-                        // #54：同 sid 自愈重建轮（rebuilt）没有带上下文 → 写 pending 标记，
-                        // 下一条消息注入历史；正常注入轮成功后回写非 pending。
+                        // #54 会话自愈后的历史补注入：
+                        // - 注入轮成功 → 写非 pending 标记（复位）
+                        // - 同 sid 重建轮（rebuilt）→ pending 标记，下一条注入
+                        // - claude already-in-use 自愈（run 内 reset_session 换 UUID，
+                        //   final_sid != 入口 session_id 且未注入）→ 同样 pending 标记：
+                        //   换 UUID 虽使旧 marker「失效」，但让失效生效的 !resume 闸
+                        //   永远不会再触发（started 已被 mark 回 true）——必须显式补
+                        //   pending，否则新会话与 #54 同症状永久无上下文（审查 Important）。
+                        // 注：pending 写入与 run 返回之间存在毫秒级崩溃窗口（pending.json
+                        // 已 remove 后、标记未写前）——崩溃则该会话永久无注入；窗口极小，
+                        // 与既有 at-least-once 语义同类，接受（写入后崩溃则标记已在盘上）。
                         if injected_rounds.is_some() {
-                            hist.set_marker(&session_id, backend.name(), false);
-                        } else if rebuilt {
-                            hist.set_marker(&session_id, backend.name(), true);
+                            hist.set_marker(&final_sid, backend.name(), false);
+                        } else if rebuilt || (backend == Backend::Claude && final_sid != session_id)
+                        {
+                            hist.set_marker(&final_sid, backend.name(), true);
                         }
                     }
                 }
@@ -1909,6 +1920,9 @@ mod tests {
         roles: Mutex<Vec<crate::config::SenderRole>>,
         /// 前 N 次 run 返回 rebuilt=true（#54 自愈重建轮），随后回 false。
         rebuilt_left: std::sync::atomic::AtomicUsize,
+        /// 一次性 claude already-in-use 自愈模拟：run 内把槽位 CAS 换成该 sid 并返回
+        /// 之（等价 reset_session 换 UUID + started 复位后再 mark 的最终状态）。
+        heal_to_sid: Mutex<Option<String>>,
     }
     impl MockAgentRunner {
         fn blocking(reply: &str) -> Self {
@@ -1922,11 +1936,15 @@ mod tests {
                 prompts: Mutex::new(Vec::new()),
                 roles: Mutex::new(Vec::new()),
                 rebuilt_left: std::sync::atomic::AtomicUsize::new(0),
+                heal_to_sid: Mutex::new(None),
             }
         }
         fn set_rebuilt_rounds(&self, n: usize) {
             self.rebuilt_left
                 .store(n, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn set_heal_sid(&self, sid: &str) {
+            *self.heal_to_sid.lock().unwrap() = Some(sid.to_string());
         }
         fn immediate(reply: &str) -> Self {
             Self {
@@ -1979,10 +1997,10 @@ mod tests {
             session_id: &str,
             _resume: bool,
             _chat_id: &str,
-            _session_key: &str,
+            session_key: &str,
             _bot_key: &str,
             role: crate::config::SenderRole,
-            _sessions: Option<&SessionStore>,
+            sessions: Option<&SessionStore>,
             progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
             cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         ) -> Result<agent::RunOutcome, String> {
@@ -2020,9 +2038,19 @@ mod tests {
                             .rebuilt_left
                             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
                             > 0;
+                    // 一次性 claude already-in-use 自愈模拟：槽位 CAS 换新 sid（等价 run 内
+                    // reset_session 的最终状态），返回新 sid——桥据此写 pending 标记（#54 审查）
+                    let final_sid = if let Some(new_sid) = self.heal_to_sid.lock().unwrap().take() {
+                        if let Some(store) = sessions {
+                            store.set_session_id_if(session_key, session_id, &new_sid);
+                        }
+                        new_sid
+                    } else {
+                        session_id.to_string()
+                    };
                     Ok(agent::RunOutcome::Reply {
                         reply: self.reply.clone(),
-                        session_id: session_id.to_string(),
+                        session_id: final_sid,
                         rebuilt,
                     })
                 }
@@ -2369,6 +2397,48 @@ mod tests {
             .unwrap();
         assert!(!runner.prompts()[2].contains("[历史上下文]"));
         assert!(!msgr.sent()[2].contains("已携带"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// 审查 Important（#54 同类缺口）：claude already-in-use 自愈在 run 内换 UUID——
+    /// 换 UUID 使旧 marker「失效」，但 !resume 闸永不触发（started 已被 mark 回 true）
+    /// → 必须由「final_sid != 入口 sid」判定补写 pending，下一条消息才注入。
+    #[tokio::test]
+    async fn claude_heal_sid_change_marks_pending() {
+        let runner = Arc::new(MockAgentRunner::immediate("自愈后的回复"));
+        runner.set_heal_sid("new-heal-sid"); // 一次性：run 内槽位 CAS 换新 sid
+        let bot = backend_bot("claude");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        // 既有会话：started=true + marker 匹配（旧 sid）
+        let sid = bridge.sessions.ensure_with_started("oc_x").0;
+        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
+        hist.append_user("old1", "claude", "旧背景");
+        hist.set_marker(&sid, "claude", false);
+
+        // 自愈轮：resume=true、marker 匹配且非 pending → 不注入；run 内换 UUID（rebuilt=false）
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "还在吗")).await })
+            .await
+            .unwrap();
+        assert!(
+            !runner.prompts()[0].contains("[历史上下文]"),
+            "自愈轮不注入"
+        );
+        let m = hist.marker().expect("换 UUID 自愈应写 pending 标记");
+        assert!(m.pending, "pending 标记");
+        assert_eq!(m.session_id, "new-heal-sid", "标记记最终 sid");
+        assert!(!msgr.sent()[0].contains("已携带"));
+
+        // 下一条：pending 命中（resume=true 也注入）→ 历史补上、标记复位
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        assert!(runner.prompts()[1].contains("[历史上下文]"), "下一条注入");
+        assert!(runner.prompts()[1].contains("旧背景"));
+        assert!(msgr.sent()[1].contains("已携带"));
+        assert!(!hist.marker().unwrap().pending, "注入后复位");
         cleanup_bridge(&bridge);
     }
 
