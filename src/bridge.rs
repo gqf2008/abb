@@ -201,6 +201,23 @@ impl Bridge {
     /// 执行一条 github 指令。白名单在每个动作前强制校验（写操作无一绕过）。
     async fn handle_github_cmd(&self, ev: &Ev, cmd: crate::github::GhCmd) -> GhOutcome {
         match cmd {
+            crate::github::GhCmd::ConfirmClose { owner, repo, number } => {
+                let repo_full = format!("{owner}/{repo}");
+                if !self.bot.gh_allows_repo(&repo_full) {
+                    return GhOutcome::Rejected(format!("❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"));
+                }
+                // 关闭是破坏性操作：先引导确认，用户回复「确认关闭 <链接>」才真正执行
+                // （防闲聊里的「别关闭/为什么关闭了 <链接>」误触发写操作）。
+                let _ = self
+                    .send_reply(
+                        ev,
+                        &format!(
+                            "⚠️ 关闭 {repo_full}#{number} 是破坏性操作。确认请回复：\n确认关闭 https://github.com/{repo_full}/issues/{number}"
+                        ),
+                    )
+                    .await;
+                GhOutcome::Consumed
+            }
             crate::github::GhCmd::Close { owner, repo, number } => {
                 let repo_full = format!("{owner}/{repo}");
                 if !self.bot.gh_allows_repo(&repo_full) {
@@ -224,8 +241,14 @@ impl Bridge {
                 let (owner, repo) = if repo.is_empty() {
                     let list = self.bot.gh_repo_list();
                     if list.len() == 1 {
-                        // 白名单单项：owner/repo 拆开（owner 与 repo 名分列，API 路径要分开）
+                        // 白名单单项：owner/repo 拆开（owner 与 repo 名分列，API 路径要分开）；
+                        // 通配项 o/* 不是具体仓库，无法据此创建
                         let (o, r) = list[0].split_once('/').unwrap_or(("", list[0].as_str()));
+                        if r == "*" {
+                            return GhOutcome::Rejected(
+                                "❌ 白名单是整组织通配（owner/*），创建 issue 请带上具体仓库：`建 issue owner/repo 标题`。".to_string(),
+                            );
+                        }
                         (o.to_string(), r.to_string())
                     } else {
                         return GhOutcome::Rejected(
@@ -618,13 +641,20 @@ impl Bridge {
         //    （issue 评论留档全文 + 群截断摘要）。
         // 访问控制不重复做：群 @ 过滤（on_payload）+ access_allows 已在进 handle 前把关；
         // 仓库白名单在 handle_github_cmd 里每个动作前强制校验（单一关卡）。
+        // Consumed/Rejected 分支调用 pending.remove 是**无操作兜底**：实时路径上这些
+        // 分支在 pending.add 之前就 return 了；但 pending 重放（#25）时条目已存在——
+        // 若重放时 fetch 瞬失败（限流/网络）导致 Consumed，不摘除会每次重启都重放刷屏。
         let mut gh_ctx: Option<crate::github::GhContext> = None;
         if self.bot.is_github_capable() {
             if let Some(cmd) = crate::github::parse_github_cmd(&text) {
                 match self.handle_github_cmd(&ev, cmd).await {
                     GhOutcome::Analyze(ctx) => gh_ctx = Some(ctx),
-                    GhOutcome::Consumed => return,
+                    GhOutcome::Consumed => {
+                        self.pending.remove(&ev.mid);
+                        return;
+                    }
                     GhOutcome::Rejected(msg) => {
+                        self.pending.remove(&ev.mid);
                         let _ = self.send_reply(&ev, &msg).await;
                         return;
                     }
@@ -809,7 +839,7 @@ impl Bridge {
                     }
                     let summary = crate::agent::truncate(&reply, 200);
                     let text = format!(
-                        "📝 已分析 {}/{}/#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 issue 评论）",
+                        "📝 已分析 {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 issue 评论）",
                         ctx.owner, ctx.repo, ctx.number, ctx.title, summary
                     );
                     match self.send_reply(&ev, &text).await {
@@ -2560,9 +2590,10 @@ https://b.com/y"));
         cleanup_bridge(&bridge);
     }
 
-    /// GitHub 指令门：关闭 → 直接 API（不进 agent、不进 pending），回执 ✅。
+    /// GitHub 指令门：关闭是破坏性操作——裸「关闭」只回确认引导（不调 API），
+    /// 「确认关闭」才真正执行（不进 agent、不进 pending），回执 ✅。
     #[tokio::test]
-    async fn github_close_direct_api_no_agent() {
+    async fn github_close_requires_confirmation_then_closes() {
         let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
@@ -2570,17 +2601,31 @@ https://b.com/y"));
             gh_repos: "o/r".into(),
             ..Default::default()
         };
+        // 第一句：裸「关闭」→ 确认引导，零 API 调用
         let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
+        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh.clone());
         let b1 = bridge.clone();
         let task = tokio::spawn(async move {
             b1.handle(test_ev("m1", "oc_gh", "关闭 https://github.com/o/r/issues/7")).await
         });
         task.await.unwrap();
-        assert_eq!(gh.calls(), vec!["close:o/r/7"]);
-        assert_eq!(msgr.sent(), vec!["✅ 已关闭 o/r#7。"]);
-        assert!(runner.prompts().is_empty(), "关闭不进 agent");
+        assert!(gh.calls().is_empty(), "裸关闭不得调 API");
+        assert!(msgr.sent()[0].contains("破坏性操作"));
+        assert!(msgr.sent()[0].contains("确认关闭"));
         cleanup_bridge(&bridge);
+
+        // 第二句：「确认关闭」→ 真正执行
+        let gh2 = Arc::new(MockGithub::new());
+        let (bridge2, msgr2) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh2.clone());
+        let b2 = bridge2.clone();
+        let task = tokio::spawn(async move {
+            b2.handle(test_ev("m1", "oc_gh", "确认关闭 https://github.com/o/r/issues/7")).await
+        });
+        task.await.unwrap();
+        assert_eq!(gh2.calls(), vec!["close:o/r/7"]);
+        assert_eq!(msgr2.sent(), vec!["✅ 已关闭 o/r#7。"]);
+        assert!(runner.prompts().is_empty(), "关闭不进 agent");
+        cleanup_bridge(&bridge2);
     }
 
     /// GitHub 指令门：创建 → 无仓库时按白名单单项解析；多项白名单省略仓库 → 明确拒绝。
@@ -2677,7 +2722,7 @@ https://b.com/y"));
         assert!(p.contains("复现了，见日志。"));
         // 群里只有截断摘要（≤200 字 + 📝 前缀），全文在 issue 评论
         assert_eq!(msgr.sent().len(), 1);
-        assert!(msgr.sent()[0].starts_with("📝 已分析 o/r/#42"));
+        assert!(msgr.sent()[0].starts_with("📝 已分析 o/r#42「登录偶发 401」"));
         assert!(msgr.sent()[0].contains("根因是 token 缓存竞态。"));
         assert!(msgr.sent()[0].chars().count() < 300);
         cleanup_bridge(&bridge);

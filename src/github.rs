@@ -49,6 +49,8 @@ pub enum GhCmd {
     Analyze { owner: String, repo: String, number: u64 },
     /// 直接关 issue（API 操作，不进 agent）。
     Close { owner: String, repo: String, number: u64 },
+    /// 关闭前的确认提示（「关闭」是破坏性操作：先回确认引导，用户回复「确认关闭 <链接>」才执行）。
+    ConfirmClose { owner: String, repo: String, number: u64 },
     /// 直接建 issue。owner/repo 为空 = 指令没带仓库，由桥按白名单解析。
     Create { owner: String, repo: String, title: String },
 }
@@ -59,17 +61,27 @@ const URL_TERMINATORS: &[char] = &[
     '！', '？', '【', '】', '《', '》', '“', '”', '‘', '’', '…',
 ];
 
-/// 解析 github 指令。优先级：关闭 > 创建 > 分析。
-/// 分析必须带 issue 链接——无链接的「分析/看看/处理」是普通消息，透传给 agent（透明）。
+/// 解析 github 指令。优先级：确认关闭 > 关闭 > 创建 > 分析。
+/// - 关闭是破坏性操作：裸「关闭 <链接>」只回确认引导（ConfirmClose），
+///   「确认关闭 <链接>」才真正执行——防闲聊里的「别关闭/为什么关闭了」误触发写操作；
+/// - 分析必须带 issue 链接——无链接的「分析/看看/处理」是普通消息，透传给 agent（透明）；
+/// - 「分析 <链接> 再建 issue」会被创建分支抢先（创建优先级高于分析）——命令语义以
+///   动词短语为准，混合意图请分两句发（有意识的设计取舍，见 parse 顺序）。
 pub fn parse_github_cmd(text: &str) -> Option<GhCmd> {
     let t = text.trim();
     if t.is_empty() {
         return None;
     }
-    // 关闭：动词 + issue 链接
-    if contains_verb(t, &["关闭", "close"]) {
+    // 确认关闭：动词短语 + issue 链接 → 真正执行关闭
+    if contains_verb(t, &["确认关闭", "confirm close", "confirmclose"]) {
         if let Some((o, r, n)) = parse_issue_url(t) {
             return Some(GhCmd::Close { owner: o, repo: r, number: n });
+        }
+    }
+    // 关闭：动词 + issue 链接 → 先确认（不直接执行）
+    if contains_verb(t, &["关闭", "close"]) {
+        if let Some((o, r, n)) = parse_issue_url(t) {
+            return Some(GhCmd::ConfirmClose { owner: o, repo: r, number: n });
         }
     }
     // 创建：动词短语 + 标题（可带 owner/repo 前缀）
@@ -80,9 +92,9 @@ pub fn parse_github_cmd(text: &str) -> Option<GhCmd> {
         }
         let (owner, repo, title) = match extract_repo_ref(t) {
             // 仓库引用可能在动词短语之前（「在 o/r 建 issue 标题」）；标题只从短语后取，
-            // 去掉标题里残留的仓库引用与「在」字。
+            // 去掉标题里残留的仓库引用（「在」只可能是句首介词，逐字替换会误删标题里的「在」）。
             Some((o, r)) => {
-                let t2 = rest.replace(&format!("{o}/{r}"), "").replace('在', "").trim().to_string();
+                let t2 = rest.replace(&format!("{o}/{r}"), "").trim().to_string();
                 (o, r, t2)
             }
             None => (String::new(), String::new(), rest.to_string()),
@@ -170,7 +182,8 @@ pub fn parse_issue_url(text: &str) -> Option<(String, String, u64)> {
                 j += 1;
             }
             let path: String = chars[start + host.len()..j].iter().collect();
-            let path = path.trim_end_matches(['.', ',', ')', ']', '}']);
+            // 容忍尾部脏字符：斜杠/标点/查询串
+            let path = path.trim_end_matches(['/', '.', ',', ')', ']', '}']);
             let mut parts = path.split('/');
             let owner = parts.next().filter(|s| !s.is_empty())?.to_string();
             let repo = parts.next().filter(|s| !s.is_empty())?.to_string();
@@ -212,8 +225,9 @@ pub fn parse_issue_url(text: &str) -> Option<(String, String, u64)> {
             continue;
         }
         let repo: String = chars[j..i].iter().collect();
+        // owner 回扫只收 ASCII 仓库字符（-_. 数字字母）；中文紧贴（在o/r#5）不算合法引用
         let mut k = j - 1;
-        while k > 0 && chars[k - 1] != '/' && !URL_TERMINATORS.contains(&chars[k - 1]) {
+        while k > 0 && is_repo_char(chars[k - 1]) {
             k -= 1;
         }
         let owner: String = chars[k..j - 1].iter().collect();
@@ -221,7 +235,7 @@ pub fn parse_issue_url(text: &str) -> Option<(String, String, u64)> {
             continue;
         }
         // owner 前不得紧贴字母数字（避免嵌在英文单词里）
-        if k > 0 && chars[k - 1].is_alphanumeric() {
+        if k > 0 && chars[k - 1].is_ascii_alphanumeric() {
             continue;
         }
         return Some((owner, repo, num));
@@ -277,7 +291,9 @@ pub fn repo_in_whitelist(repo: &str, whitelist: &str) -> bool {
         return true; // 空白名单 = 全部放行（用户没配时别锁死功能）
     }
     entries.iter().any(|w| {
-        *w == repo || (w.ends_with("/*") && w[..w.len() - 2].eq_ignore_ascii_case(owner))
+        // GitHub 的 owner/repo 大小写不敏感：精确匹配同样忽略大小写（与 owner/* 通配一致）
+        w.eq_ignore_ascii_case(repo)
+            || (w.ends_with("/*") && w[..w.len() - 2].eq_ignore_ascii_case(owner))
     })
 }
 
@@ -420,6 +436,24 @@ impl GhCursor {
     }
 }
 
+/// 白名单 → watch 循环的实际轮询项 (owner, name)。
+/// 跳过 `owner/*` 通配项（通配只对指令门白名单校验有意义；轮询需要具体仓库才能调
+/// GET /repos/{owner}/{repo}/issues，`*` 会 404），并跳过格式错误项。
+pub fn watch_entries(repos: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for repo in repos {
+        match repo.split_once('/') {
+            Some((o, name)) if name != "*" && !o.is_empty() && !name.is_empty() => {
+                out.push((o.to_string(), name.to_string()));
+            }
+            _ => {
+                crate::log!("[github] watch 跳过白名单项（通配/格式错误，需具体仓库）: {repo}");
+            }
+        }
+    }
+    out
+}
+
 /// GitHub API 抽象（仿 Messenger/AgentRunner 的 trait 注入）：桥与 watch 循环只依赖此 trait，
 /// 生产 = GithubClient（reqwest），测试 = MockGithub。
 #[async_trait::async_trait]
@@ -441,9 +475,11 @@ pub struct GithubClient {
 
 impl GithubClient {
     pub fn new(token: &str) -> GithubClient {
-        // rustls 静态证书（与 feishu/wechat 同款 builder）：本机无系统 CA 也能 HTTPS
+        // 30s 请求超时（对齐 feishu 30s / wechat 60s 的既有约定）：TCP 卡死不能挂住
+        // 调用方——指令门的消息任务与 watch 循环都在等它，超时兜底才有错误回执/重试。
         let http = reqwest::Client::builder()
             .user_agent("agent-bridge")
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest client");
         GithubClient { http, token: token.trim().to_string() }
@@ -639,13 +675,21 @@ mod tests {
             parse_github_cmd("analyze https://github.com/o/r/issues/3"),
             Some(GhCmd::Analyze { owner: "o".into(), repo: "r".into(), number: 3 })
         );
-        // 关闭
+        // 关闭：裸「关闭」→ 确认引导；「确认关闭」→ 真正执行
         assert_eq!(
             parse_github_cmd("关闭 https://github.com/o/r/issues/7"),
-            Some(GhCmd::Close { owner: "o".into(), repo: "r".into(), number: 7 })
+            Some(GhCmd::ConfirmClose { owner: "o".into(), repo: "r".into(), number: 7 })
         );
         assert_eq!(
             parse_github_cmd("close o/r#7"),
+            Some(GhCmd::ConfirmClose { owner: "o".into(), repo: "r".into(), number: 7 })
+        );
+        assert_eq!(
+            parse_github_cmd("确认关闭 https://github.com/o/r/issues/7"),
+            Some(GhCmd::Close { owner: "o".into(), repo: "r".into(), number: 7 })
+        );
+        assert_eq!(
+            parse_github_cmd("confirm close o/r#7"),
             Some(GhCmd::Close { owner: "o".into(), repo: "r".into(), number: 7 })
         );
         // 创建：无仓库（由桥按白名单解析）
@@ -662,10 +706,14 @@ mod tests {
             parse_github_cmd("create issue o/r 新增文档"),
             Some(GhCmd::Create { owner: "o".into(), repo: "r".into(), title: "新增文档".into() })
         );
-        // 优先级：关闭 > 创建 > 分析（同一句含多动词时关闭优先）
+        // 优先级：确认关闭 > 关闭 > 创建 > 分析（同一句含多动词时关闭优先）
+        assert_eq!(
+            parse_github_cmd("确认关闭 https://github.com/o/r/issues/7 再分析"),
+            Some(GhCmd::Close { owner: "o".into(), repo: "r".into(), number: 7 })
+        );
         assert_eq!(
             parse_github_cmd("关闭 https://github.com/o/r/issues/7 再分析"),
-            Some(GhCmd::Close { owner: "o".into(), repo: "r".into(), number: 7 })
+            Some(GhCmd::ConfirmClose { owner: "o".into(), repo: "r".into(), number: 7 })
         );
     }
 
@@ -681,8 +729,9 @@ mod tests {
 
     #[test]
     fn repo_in_whitelist_rules() {
-        // 精确匹配
-        assert!(repo_in_whitelist("o/r", "o/r"));
+        // 精确匹配（大小写不敏感，GitHub owner/repo 本身不区分大小写）
+        assert!(repo_in_whitelist("o/r", "O/R"));
+        assert!(repo_in_whitelist("O/R", "o/r"));
         // 组织通配 owner/*
         assert!(repo_in_whitelist("o/anything", "o/*"));
         assert!(!repo_in_whitelist("other/r", "o/*"));
@@ -694,6 +743,19 @@ mod tests {
         // 拒绝
         assert!(!repo_in_whitelist("o/r", "o/x"));
         assert!(!repo_in_whitelist("o/r", "x/*"));
+    }
+
+    #[test]
+    fn watch_entries_skips_wildcards() {
+        // 通配项与格式错误项跳过，具体仓库保留
+        let entries = watch_entries(&[
+            "o/r".to_string(),
+            "o/*".to_string(),
+            "bad".to_string(),
+            "o/a".to_string(),
+        ]);
+        assert_eq!(entries, vec![("o".to_string(), "r".to_string()), ("o".to_string(), "a".to_string())]);
+        assert!(watch_entries(&["o/*".to_string()]).is_empty());
     }
 
     #[test]

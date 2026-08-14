@@ -387,8 +387,8 @@ async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receive
 /// GitHub watch 循环（附挂能力，Phase 1）：每 60s 增量轮询白名单仓库的 open issues，
 /// 新 issue → 发「🔔 新 issue …」到 gh_notify_chat；自己（gh_username）发的不回显。
 /// 游标落盘 workspaces/<bot>/github_cursor.json（原子写）：崩溃/重启后增量续跑不重发。
-/// 状态上报与 IM 事件循环共用同一 bot key 槽位：只在状态迁移时写（在线 10s 节流 /
-/// 连续 3 轮失败→重连中），正常时槽位由 IM 态主导；退出不清 botstatus（槽位归 IM 循环）。
+/// 状态上报只写「重连中」迁移（连续 3 轮失败）——botstatus 槽位归 IM 事件循环，
+/// watch 循环不报在线（无条件写在线会覆盖 IM 的重连中迁移）；退出不清 botstatus。
 async fn github_watch_loop(
     bot: crate::config::BotConfig,
     bridge: Arc<Bridge>,
@@ -404,7 +404,6 @@ async fn github_watch_loop(
         if notify_chat.is_empty() { "（未配置通知群）" } else { "已配置" }
     );
     let mut cursor = crate::github::GhCursor::load(&key);
-    let mut last_online = std::time::Instant::now();
     let mut consec_errs = 0u32;
     loop {
         if interruptible_sleep(std::time::Duration::from_secs(60), stop_rx).await {
@@ -414,36 +413,42 @@ async fn github_watch_loop(
             continue; // 没配通知目标 → 轮询无意义（配置后重启生效）
         }
         let mut sweep_failed = false;
-        for repo in &repos {
-            let Some((owner, name)) = repo.split_once('/') else {
-                crate::log!("[bot:{key}] ⚠️ 白名单项格式错误（应 owner/repo）: {repo}");
-                continue;
-            };
-            let cur = cursor.repo_cursor(repo);
+        for (owner, name) in crate::github::watch_entries(&repos) {
+            let repo = format!("{owner}/{name}");
+            let cur = cursor.repo_cursor(&repo);
             match bridge
                 .github_client
-                .list_issues_since(owner, name, &cur.since)
+                .list_issues_since(&owner, &name, &cur.since)
                 .await
             {
                 Ok(issues) => {
                     let (fresh, new_since) =
                         crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
                     let mut seen_extra = Vec::new();
+                    // 通知失败不推进游标到该 issue 之后：retry_at 记下其 created_at，
+                    // 下一轮以它为 since 重新浮现（已通知的都在 seen 里，不会重复）。
+                    let mut retry_at: Option<String> = None;
                     for iss in &fresh {
-                        seen_extra.push(iss.id);
-                        let text = crate::github::notify_text(repo, iss);
+                        let text = crate::github::notify_text(&repo, iss);
                         match bridge.msgr.send_text(&notify_chat, &text).await {
-                            Ok(()) => crate::log!(
-                                "[bot:{key}] 新 issue 已通知 #{}({})",
-                                iss.number,
-                                repo
-                            ),
-                            Err(e) => crate::log!(
-                                "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
-                            ),
+                            Ok(()) => {
+                                seen_extra.push(iss.id);
+                                crate::log!(
+                                    "[bot:{key}] 新 issue 已通知 #{}({})",
+                                    iss.number,
+                                    repo
+                                );
+                            }
+                            Err(e) => {
+                                retry_at = Some(iss.created_at.clone());
+                                crate::log!(
+                                    "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
+                                );
+                            }
                         }
                     }
-                    cursor.update(repo, &new_since, seen_extra);
+                    let effective_since = retry_at.unwrap_or_else(|| new_since.clone());
+                    cursor.update(&repo, &effective_since, seen_extra);
                 }
                 Err(e) => {
                     sweep_failed = true;
@@ -452,7 +457,10 @@ async fn github_watch_loop(
             }
         }
         cursor.save(&key); // 每轮原子落盘（60s 一次小写盘，崩溃至多丢一个窗口）
-        // 状态上报（绑真实连通，同 weixin_loop 语义）：成功一轮 → 在线；连续 3 轮失败 → 重连中
+        // 状态上报：**不报在线**——botstatus 槽位归 IM 事件循环（它每 10s 上报一次在线），
+        // watch 循环无条件写在线会覆盖 IM 的「重连中」迁移（上次写者赢）。这里只在
+        // GitHub 侧连续 3 轮失败时标「重连中」（失败迁移也只会被 IM 循环的在线覆盖，
+        // 而 IM 在线是真实的——GitHub 故障期间 IM 正常时槽位显示在线属可接受偏差）。
         if sweep_failed {
             consec_errs += 1;
             if consec_errs == 3 {
@@ -460,10 +468,6 @@ async fn github_watch_loop(
             }
         } else {
             consec_errs = 0;
-            if last_online.elapsed() > std::time::Duration::from_secs(10) {
-                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
-                last_online = std::time::Instant::now();
-            }
         }
     }
     // 注意：这里不清 botstatus——槽位归 IM 事件循环（weixin_loop 退出时 clear），
