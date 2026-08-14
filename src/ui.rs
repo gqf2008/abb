@@ -419,7 +419,7 @@ fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) 
     let access_sel = if open { "open" } else { "private" };
     let access_model = slint::ModelRc::from(Rc::new(slint::VecModel::from(mk_opts(
         &[
-            ("仅授权用户（owner+授权者）", "private"),
+            ("仅授权用户", "private"),
             ("任何人都可以对话", "open"),
         ],
         access_sel,

@@ -408,11 +408,11 @@ export component SettingsWindow inherits Window {
         { name: "pi", checked: false },
     ];
     in-out property <[OptionRow]> access-options: [
-        { name: "仅授权用户（owner+授权者）", checked: true },
+        { name: "仅授权用户", checked: true },
         { name: "任何人都可以对话", checked: false },
     ];
     in-out property <[OptionRow]> ding-access-options: [
-        { name: "仅授权用户（owner+授权者）", checked: true },
+        { name: "仅授权用户", checked: true },
         { name: "任何人都可以对话", checked: false },
     ];
 
@@ -708,8 +708,8 @@ export component SettingsWindow inherits Window {
                     if root.current-page == 1: VerticalBox {
                         width: 100%;
                         height: 100%;
-                        padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
-                        spacing: 14px;
+                        padding-top: 20px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
+                        spacing: 10px;
 
                         VerticalBox {
                             Text { text: "机器人配置"; font-size: 18px; font-weight: 700; color: Palette.foreground; }
@@ -724,16 +724,16 @@ export component SettingsWindow inherits Window {
                                 spacing: 0;
                                 // ── 左：bot 列表 ──
                                 VerticalBox {
-                                    spacing: 8px;
-                                    width: 210px;
-                                    padding: 10px;
+                                    spacing: 6px;
+                                    width: 190px;
+                                    padding: 8px;
                                     Rectangle {
                                         background: Palette.alternate-background;
                                         border-radius: 10px;
                                         vertical-stretch: 1;
                                         ListView {
                                             for bot[idx] in root.bots: Rectangle {
-                                                height: 44px;
+                                                height: 38px;
                                                 background: idx == root.selected ? Palette.selection-background : transparent;
                                                 border-radius: 8px;
                                                 TouchArea {
@@ -769,19 +769,20 @@ export component SettingsWindow inherits Window {
                                 }
                                 // ── 右：编辑选中 bot ──
                                 VerticalBox {
-                                    spacing: 6px;
+                                    spacing: 5px;
                                     horizontal-stretch: 1;
-                                    padding-top: 12px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
+                                    padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
                                     ScrollView {
                                         vertical-stretch: 1;
                                         VerticalBox {
-                                            spacing: 10px;
+                                            width: 100%; // 钳制内容宽度=视口宽：禁止横向滚动，超宽行裁剪而不撑出滚动条
+                                            spacing: 8px;
                                             alignment: start;
                                             GridBox {
-                                                spacing: 6px;
+                                                spacing: 5px;
                                                 vertical-stretch: 0;
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     CheckBox {
                                                         text: "启用此 bot";
                                                         checked: root.bots[root.selected].enabled;
@@ -789,7 +790,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "名称"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "名称"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].name;
                                                         placeholder-text: "如：庆小丰（隔离目录名）";
@@ -798,7 +799,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "类型"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "类型"; width: 80px; vertical-alignment: center; }
                                                     ComboBox {
                                                         model: ["feishu", "wechat", "dingtalk"];
                                                         current-value: root.bots[root.selected].kind;
@@ -810,17 +811,23 @@ export component SettingsWindow inherits Window {
                                                 // 勾选态由 backend-options model 驱动（for 循环重建实例），不依赖会被
                                                 // 用户交互破坏的 checked 绑定（实测「微信选 pi 飞书也选中」）。
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "默认后端"; width: 88px; vertical-alignment: center; }
-                                                    for opt[i] in root.backend-options: CheckBox {
-                                                        text: opt.name;
-                                                        checked: opt.checked;
+                                                    Text { text: "默认后端"; width: 80px; vertical-alignment: center; }
+                                                    // 勾选框组必须包进 HorizontalBox 成一个格子：Row 的子元素是 GridBox
+                                                    // 共享列（label/字段/按钮），直接铺开会把 codex/pi 排进按钮列甚至面板外。
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        toggled => { root.backend-option-toggled(i); }
+                                                        spacing: 12px;
+                                                        for opt[i] in root.backend-options: CheckBox {
+                                                            text: opt.name;
+                                                            checked: opt.checked;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.backend-option-toggled(i); }
+                                                        }
                                                     }
                                                 }
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "模型供应商"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "模型供应商"; width: 80px; vertical-alignment: center; }
                                                     ComboBox {
                                                         model: root.provider-names;
                                                         current-value: root.bots[root.selected].provider;
@@ -832,25 +839,29 @@ export component SettingsWindow inherits Window {
                                                 // 勾选态回写走 set-stream-output（同「启用此 bot」：handler 里 sync_model 重建
                                                 // CheckBox 实例，绕开 slint 用户交互移除 checked 绑定的坑）。
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind != "wechat": Row {
-                                                    Text { text: "流式输出"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "流式输出"; width: 80px; vertical-alignment: center; }
                                                     CheckBox {
-                                                        text: "打字机模式：多轮输出原地更新同一条消息（关=只发最终结果）";
+                                                        text: "打字机模式：多轮输出原地更新（关=只发最终结果）";
                                                         checked: root.bots[root.selected].stream-output;
                                                         toggled => { root.set-stream-output(root.selected, self.checked); }
                                                     }
                                                 }
                                                 // ── 飞书字段（owner/授权者/对话权限）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Text { text: "对话权限"; width: 88px; vertical-alignment: center; }
-                                                    for opt[i] in root.access-options: CheckBox {
-                                                        text: opt.name;
-                                                        checked: opt.checked;
+                                                    Text { text: "对话权限"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        toggled => { root.access-option-toggled(i); }
+                                                        spacing: 12px;
+                                                        for opt[i] in root.access-options: CheckBox {
+                                                            text: opt.name;
+                                                            checked: opt.checked;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.access-option-toggled(i); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Text { text: "Owner（管理员）"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "Owner（管理员）"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].owner-open-id;
                                                         placeholder-text: "ou_xxx（管理员 open_id，逗号分隔多个）";
@@ -864,7 +875,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Text { text: "已授权用户"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "已授权用户"; width: 80px; vertical-alignment: center; }
                                                     if root.bots[root.selected].granted.length == 0: Text {
                                                         text: "暂无（点「生成授权码」邀请）";
                                                         color: #888;
@@ -886,7 +897,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 for granted[gi] in root.bots[root.selected].granted: Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: granted.name + "（" + granted.open-id + "）";
                                                         font-size: 12px;
@@ -899,7 +910,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.owner-code-info != "": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.owner-code-info;
                                                         color: #b80;
@@ -913,7 +924,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.grant-code-info != "": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.grant-code-info;
                                                         color: #b80;
@@ -927,7 +938,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.bots[root.selected].open-access: Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
                                                         color: #888;
@@ -935,7 +946,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Text { text: "App ID"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "App ID"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].app-id;
                                                         placeholder-text: "cli_xxxxxxxx";
@@ -944,7 +955,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Text { text: "App Secret"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "App Secret"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].app-secret;
                                                         input-type: password;
@@ -954,7 +965,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     HorizontalBox {
                                                         spacing: 8px;
                                                         Text { text: "bot：" + root.bots[root.selected].bot-name + "  " + root.bots[root.selected].bot-open-id; font-size: 11px; color: Palette.foreground.with-alpha(0.6); vertical-alignment: center; wrap: word-wrap; }
@@ -963,7 +974,7 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 // ── 微信字段（扫码登录，无需 app_id/secret）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.bots[root.selected].bot-name == ""
                                                             ? "未登录。点下方按钮，用微信扫码登录。"
@@ -974,12 +985,12 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Button { text: "📱 扫码登录微信"; clicked => { root.wx-login(root.selected); } }
                                                 }
                                                 // ── 钉钉字段（企业内部应用机器人，Stream 模式长连接，无需公网地址）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "App Key"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "App Key"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].app-id;
                                                         placeholder-text: "钉钉应用 AppKey（dingxxxx）";
@@ -988,7 +999,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "App Secret"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "App Secret"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].app-secret;
                                                         input-type: password;
@@ -998,7 +1009,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "机器人编码"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "机器人编码"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].ding-robot-code;
                                                         placeholder-text: "留空=默认 AppKey（个别后台单独展示才填）";
@@ -1009,7 +1020,7 @@ export component SettingsWindow inherits Window {
                                                 // #42 流式打字机用的 AI 卡片模板：需在钉钉开放平台为本应用创建互动卡片
                                                 // 模板（含名为 content 的 markdown 变量）；留空则流式不可用、回落逐条发送。
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "卡片模板 ID"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "卡片模板 ID"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].ding-card-template-id;
                                                         placeholder-text: "流式打字机用；留空=回落逐条发送";
@@ -1018,16 +1029,20 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "对话权限"; width: 88px; vertical-alignment: center; }
-                                                    for opt[i] in root.ding-access-options: CheckBox {
-                                                        text: opt.name;
-                                                        checked: opt.checked;
+                                                    Text { text: "对话权限"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        toggled => { root.ding-access-option-toggled(i); }
+                                                        spacing: 12px;
+                                                        for opt[i] in root.ding-access-options: CheckBox {
+                                                            text: opt.name;
+                                                            checked: opt.checked;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.ding-access-option-toggled(i); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "Owner（管理员）"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "Owner（管理员）"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].ding-owner-ids;
                                                         placeholder-text: "员工 staffId（管理员，逗号分隔多个）";
@@ -1041,7 +1056,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "已授权用户"; width: 88px; vertical-alignment: center; }
+                                                    Text { text: "已授权用户"; width: 80px; vertical-alignment: center; }
                                                     if root.bots[root.selected].ding-granted.length == 0: Text {
                                                         text: "暂无（点「生成授权码」邀请）";
                                                         color: #888;
@@ -1063,7 +1078,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 for dg[gi] in root.bots[root.selected].ding-granted: Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: dg.name + "（" + dg.open-id + "）";
                                                         font-size: 12px;
@@ -1076,7 +1091,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.owner-code-info != "": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.owner-code-info;
                                                         color: #b80;
@@ -1090,7 +1105,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.grant-code-info != "": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.grant-code-info;
                                                         color: #b80;
@@ -1104,7 +1119,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.bots[root.selected].ding-open-access: Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
                                                         color: #888;
@@ -1112,7 +1127,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Rectangle { width: 88px; }
+                                                    Rectangle { width: 80px; }
                                                     Text {
                                                         text: "要求：企业自建应用已添加「机器人」能力，消息接收模式选 Stream 模式；群聊需 @ 机器人。";
                                                         font-size: 11px;
