@@ -629,7 +629,7 @@ impl Bridge {
         self.handle(ev).await;
     }
 
-    pub async fn handle(&self, ev: Ev) {
+    pub(crate) async fn handle(&self, ev: Ev) {
         let t0 = std::time::Instant::now();
         crate::log!(
             "[bridge] 收到消息 bot={} chat={} mid={} text={:?}",
@@ -1415,8 +1415,9 @@ mod tests {
         comments: Mutex<Vec<crate::github::GhComment>>,
         fail_fetch: bool,
         fail_post: bool,
-        /// is_collaborator 返回值（默认 true=协作者）；fail_collab=true 时返回 Err。
-        collab: bool,
+        /// is_collaborator 返回值（默认 Some(true)=协作者；None=权限不足）；
+        /// fail_collab=true 时返回 Err。
+        collab: Option<bool>,
         fail_collab: bool,
     }
     impl MockGithub {
@@ -1449,7 +1450,7 @@ mod tests {
                 }]),
                 fail_fetch: false,
                 fail_post: false,
-                collab: true,
+                collab: Some(true),
                 fail_collab: false,
             }
         }
@@ -1463,7 +1464,10 @@ mod tests {
             self.fail_post = true;
         }
         fn set_collab(&mut self, v: bool) {
-            self.collab = v;
+            self.collab = Some(v);
+        }
+        fn set_collab_denied(&mut self) {
+            self.collab = None; // 模拟 token 缺 Administration: Read
         }
         fn set_fail_collab(&mut self) {
             self.fail_collab = true;
@@ -1562,7 +1566,7 @@ mod tests {
             owner: &str,
             repo: &str,
             login: &str,
-        ) -> anyhow::Result<bool> {
+        ) -> anyhow::Result<Option<bool>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -3225,6 +3229,7 @@ https://b.com/y"
             "bot",
             "o/r",
             "o",
+            "oc_gh",
         )
         .await;
         // 私信目标断言：@alice 的评论 1 与 5（代码块内不算，但块后真提及算）发到 oc_alice；
@@ -3254,6 +3259,7 @@ https://b.com/y"
             "bot",
             "o/r",
             "o",
+            "oc_gh",
         )
         .await;
         assert!(batch.seen_extra.is_empty());
@@ -3294,6 +3300,7 @@ https://b.com/y"
             "bot",
             "o/r",
             "o",
+            "oc_gh",
         )
         .await;
         assert_eq!(batch.seen_extra, vec![2], "成功评论进 seen");
@@ -3338,6 +3345,7 @@ https://b.com/y"
             "bot",
             "o/r",
             "o",
+            "oc_gh",
         )
         .await;
         assert_eq!(
@@ -3359,6 +3367,7 @@ https://b.com/y"
             "bot",
             "o/r",
             "o",
+            "oc_gh",
         )
         .await;
         assert!(batch2.triggers.is_empty(), "非协作者不触发");
@@ -3392,6 +3401,7 @@ https://b.com/y"
             "bot",
             "o/r",
             "o",
+            "oc_gh",
         )
         .await;
         assert!(batch.triggers.is_empty());
@@ -3446,5 +3456,83 @@ https://b.com/y"
         assert!(p.contains("[GitHub Issue]"));
         assert!(p.contains("不可信数据"));
         cleanup_bridge(&bridge);
+    }
+    /// 评审 I1：仅配置提及映射（不配通知群）时 @bot 触发不收集（合成 Ev chat_id 空会被
+    /// handle 丢弃），日志说明而非静默丢失。
+    #[tokio::test]
+    async fn comment_batch_no_notify_chat_skips_triggers() {
+        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
+            id,
+            body: body.into(),
+            user: crate::github::GhUser {
+                login: login.into(),
+            },
+            created_at: "2026-08-14T02:00:00Z".into(),
+            updated_at: "2026-08-14T02:05:00Z".into(),
+            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
+        };
+        let comments = vec![mk(1, "@bot 分析下", "alice")];
+        let msgr = Arc::new(MockMessenger::new());
+        let gh = Arc::new(MockGithub::new());
+        let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
+            msgr.as_ref(),
+            &comments,
+            &[],
+            &[],
+            "bot",
+            "o/r",
+            "o",
+            "", // notify_chat 空 = 仅映射配置
+        )
+        .await;
+        assert!(batch.triggers.is_empty(), "无通知群不收集触发");
+        assert_eq!(batch.seen_extra, vec![1], "评论仍算处理过");
+    }
+
+    /// 评审 M2：协作者检查权限不足（token 缺 Administration: Read）→ 跳过不重试（不进 failed）。
+    #[tokio::test]
+    async fn comment_batch_collab_denied_skips_without_rewind() {
+        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
+            id,
+            body: body.into(),
+            user: crate::github::GhUser {
+                login: login.into(),
+            },
+            created_at: "2026-08-14T02:00:00Z".into(),
+            updated_at: "2026-08-14T02:05:00Z".into(),
+            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
+        };
+        let comments = vec![mk(1, "@bot 分析", "alice")];
+        let msgr = Arc::new(MockMessenger::new());
+        let mut gh = MockGithub::new();
+        gh.set_collab_denied();
+        let gh = Arc::new(gh);
+        let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
+            msgr.as_ref(),
+            &comments,
+            &[],
+            &[],
+            "bot",
+            "o/r",
+            "o",
+            "oc_gh",
+        )
+        .await;
+        assert!(batch.triggers.is_empty());
+        assert!(batch.failed.is_empty(), "权限不足不重试");
+        assert_eq!(batch.seen_extra, vec![1]);
+    }
+
+    /// auto_ev 合成事件构造（评审 M3）：mid/chat_type/thread_id/text 字段契约。
+    #[test]
+    fn auto_ev_shape() {
+        let ev = crate::service::auto_ev("o/r", 42, 7, "oc_gh");
+        assert_eq!(ev.mid, "gh:o/r:42:7");
+        assert_eq!(ev.chat_id, "oc_gh");
+        assert_eq!(ev.chat_type, "group"); // 跳过 save_primary_chat
+        assert!(ev.thread_id.is_empty(), "thread_id 必须空（防假话题回复）");
+        assert_eq!(ev.text, "分析 https://github.com/o/r/issues/42");
     }
 }

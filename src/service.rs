@@ -408,6 +408,7 @@ pub(crate) async fn process_comment_batch(
     bot_login: &str,
     repo: &str,
     owner: &str,
+    notify_chat: &str,
 ) -> CommentBatch {
     let mut out = CommentBatch {
         seen_extra: Vec::new(),
@@ -441,15 +442,24 @@ pub(crate) async fn process_comment_batch(
                 }
             }
         }
-        // 2) @bot 自动处理触发（护栏 b：作者回声 + 词位已由 should_auto_process 把关）
-        if crate::github::should_auto_process(&c.body, &c.user.login, bot_login) {
+        // 2) @bot 自动处理触发（护栏 b：作者回声 + 词位已由 should_auto_process 把关）。
+        //    仅配置提及映射（不配通知群）时：合成 Ev 的 chat_id 会为空 → handle 直接丢弃，
+        //    触发将永久丢失且无痕迹（评审 I1）——此时不收集触发，日志说明。
+        if !notify_chat.is_empty()
+            && crate::github::should_auto_process(&c.body, &c.user.login, bot_login)
+        {
             match crate::github::comment_issue_ref(c) {
                 Some((_n, true)) => { /* PR 评论自动处理归批次 2.3 */ }
                 Some((number, false)) => {
                     match api.is_collaborator(owner, repo, &c.user.login).await {
-                        Ok(true) => out.triggers.push((number, c.id)),
-                        Ok(false) => crate::log!(
+                        Ok(Some(true)) => out.triggers.push((number, c.id)),
+                        Ok(Some(false)) => crate::log!(
                             "[github] 跳过 @bot 触发（{repo} 非协作者 @{}）",
+                            c.user.login
+                        ),
+                        // 权限不足（token 缺 Administration: Read）：永久性，跳过不重试
+                        Ok(None) => crate::log!(
+                            "[github] ⚠️ 协作者检查权限不足（token 需 Administration: Read），跳过 {repo} @{} 触发",
                             c.user.login
                         ),
                         Err(e) => {
@@ -480,7 +490,12 @@ pub(crate) async fn process_comment_batch(
 /// - text = "分析 <链接>"：命中既有门 → 白名单 → 拉取注入 → agent → 双写，零新机制。
 ///
 /// repo/number 由评论自身 html_url 推导（调用方传入），评论者无法重定向分析目标。
-fn auto_ev(repo: &str, number: u64, comment_id: u64, notify_chat: &str) -> crate::bridge::Ev {
+pub(crate) fn auto_ev(
+    repo: &str,
+    number: u64,
+    comment_id: u64,
+    notify_chat: &str,
+) -> crate::bridge::Ev {
     crate::bridge::Ev {
         mid: format!("gh:{repo}:{number}:{comment_id}"),
         chat_id: notify_chat.to_string(),
@@ -609,6 +624,7 @@ async fn github_watch_loop(
                             &echo,
                             &repo,
                             &owner,
+                            &notify_chat,
                         )
                         .await;
                         // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。
@@ -623,6 +639,9 @@ async fn github_watch_loop(
                         }
                         // @bot 自动处理：合成 Ev 走既有指令门（白名单→拉取→agent→双写）。
                         // 群 key 串行：与群消息共用通知群锁，长任务与手动「分析」同语义。
+                        // 崩溃窗口（已接受）：seen_extra 在上方先落盘、spawn 在下方——两者
+                        // 之间崩溃则触发丢失（评论已 seen、不重试，at-most-once）；
+                        // 反向窗口（spawn 后崩溃）由 pending 重放兜底（at-least-once 双发）。
                         for (number, comment_id) in batch.triggers {
                             let bridge = bridge.clone();
                             let ev = auto_ev(&repo, number, comment_id, &notify_chat);

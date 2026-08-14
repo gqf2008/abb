@@ -639,12 +639,50 @@ pub fn has_next_page(page_len: usize, page: u32, per_page: u32, max_pages: u32) 
 }
 
 /// 评论里是否以独立词位出现 @bot（大小写不敏感）。引用行/围栏代码块不算
-/// （复用 extract_mentions 的边界语义，护栏 b）。
+/// （与 extract_mentions 同边界语义，护栏 b）。
+/// 独立扫描：不受 MENTION_MAX=10 截断影响（前 10 个提及之后的 @bot 也必须命中，评审 M5）。
 pub fn comment_triggers_bot(body: &str, bot_login: &str) -> bool {
-    !bot_login.is_empty()
-        && extract_mentions(body, "")
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(bot_login))
+    if bot_login.is_empty() {
+        return false;
+    }
+    fn is_login_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-'
+    }
+    let mut in_fence = false;
+    for raw_line in body.lines() {
+        let line = raw_line.trim_start();
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || line.starts_with('>') {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '@' {
+                i += 1;
+                continue;
+            }
+            let before_ok = i == 0 || !is_login_char(chars[i - 1]);
+            let mut j = i + 1;
+            while j < chars.len() && is_login_char(chars[j]) {
+                j += 1;
+            }
+            if before_ok && j > i + 1 {
+                let after_ok = j >= chars.len() || !is_login_char(chars[j]);
+                if after_ok {
+                    let login: String = chars[i + 1..j].iter().collect();
+                    if login.eq_ignore_ascii_case(bot_login) {
+                        return true;
+                    }
+                }
+            }
+            i = j.max(i + 1);
+        }
+    }
+    false
 }
 
 /// 自动处理总判定（护栏 b）：作者不是 bot 自己 + 评论里独立词位 @bot。
@@ -834,9 +872,17 @@ pub trait GithubApi: Send + Sync {
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GhComment>>;
-    /// 评论者是否是仓库协作者：204 → true，404 → false，其余 → Err。@bot 触发的前置
-    /// 护栏（公开仓库任何人可评论 = 任何人可烧 agent 配额，仅协作者可触发）。
-    async fn is_collaborator(&self, owner: &str, repo: &str, login: &str) -> anyhow::Result<bool>;
+    /// 评论者协作者检查（@bot 触发前置护栏，公开仓库任何人可评论 = 任何人可烧配额）：
+    /// - Ok(Some(true/false))：204/404 的有效答案；
+    /// - Ok(None)：401/403 权限不足（token 缺 Administration: Read 等，永久性——
+    ///   调用方跳过+日志，不重试）；
+    /// - Err：网络/5xx 瞬态——调用方游标回退重试。
+    async fn is_collaborator(
+        &self,
+        owner: &str,
+        repo: &str,
+        login: &str,
+    ) -> anyhow::Result<Option<bool>>;
 }
 
 pub struct GithubClient {
@@ -1040,9 +1086,16 @@ impl GithubApi for GithubClient {
             .collect()
     }
 
-    async fn is_collaborator(&self, owner: &str, repo: &str, login: &str) -> anyhow::Result<bool> {
+    async fn is_collaborator(
+        &self,
+        owner: &str,
+        repo: &str,
+        login: &str,
+    ) -> anyhow::Result<Option<bool>> {
         // 绕过 send()（非 2xx 即 bail）：404 是有效答案（非协作者）。
         // GitHub login 只含 ASCII 字母数字与 '-'，无需 URL 编码。
+        // 注意：collaborators 端点要求 token 有 Administration: Read 权限（fine-grained
+        // PAT 默认没有）——401/403 返回 Ok(None)（永久性，调用方跳过不重试）。
         let resp = self
             .authed(
                 reqwest::Method::GET,
@@ -1052,8 +1105,9 @@ impl GithubApi for GithubClient {
             .await
             .context("github 网络错误")?;
         match resp.status().as_u16() {
-            204 => Ok(true),
-            404 => Ok(false),
+            204 => Ok(Some(true)),
+            404 => Ok(Some(false)),
+            401 | 403 => Ok(None),
             other => anyhow::bail!(
                 "github {other} 响应: {}",
                 crate::agent::truncate(&resp.text().await.unwrap_or_default(), 300)

@@ -41,7 +41,10 @@ ABB 与 GitHub/GitLab 协同处理问题的设计文档。实现见 `feat(github
 
 1. **Mention 通知回流**（评审建议插入，价值密度最高）：issue 后续评论里 @ 某人 → watch 增量（`updated_at` 数据已拉回）diff 出 mention → IM 私聊提醒 + 链接。严格符合「通知 + 链接，不承载内容」——否则「讨论留在 GitHub」的前提（有人盯着 GitHub）不成立
 2. **Issue 内 @bot 自动处理**：issue 评论里 `@bot 用户名` → agent 分析 → 评论回复。**上线前必须预置三道护栏**：
-   - (a) 权限门槛：公开仓库任何人可评论 = 任何人可烧 agent 配额 → 仅 collaborator/triage 以上触发或加速率限制
+   - (a) 权限门槛：公开仓库任何人可评论 = 任何人可烧 agent 配额 → 仅 **collaborator** 可触发
+     （已实现：is_collaborator 检查，204=是/404=否/401-403=权限不足跳过不重试/5xx=重试；
+     组织团队 triage 成员若非直接 collaborator 不触发——比「collaborator/triage 以上」
+     更严，按用户确认口径）
    - (b) 自触发死循环防护：触发判定要求评论作者 ≠ bot login，且 @bot 须是独立 token 而非引用文本子串（bot 回复里引用别人的「@bot 分析」不得自触发）
    - (c) 不可信数据包裹从建议升级为必须（见 S2，Phase 1 已落地）
 3. **PR 评论触发初步审查**：同模式，成本低
