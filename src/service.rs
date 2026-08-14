@@ -384,11 +384,13 @@ pub(crate) struct CommentBatch {
     pub seen_extra: Vec<u64>,
     /// 私信发送失败的评论 updated_at → 游标回退重试。
     pub failed: Vec<String>,
-    /// 本轮最新评论 updated_at（空批 → 调用方保持原游标）。
-    pub new_since: String,
+    /// 本轮最新评论 updated_at；**None = 空批 → 调用方必须保持原游标**
+    /// （写空串会把游标清掉，下一轮走静默基线 → 窗口内评论永久丢失，评审 C1）。
+    pub new_since: Option<String>,
 }
 
 /// 处理一批新评论（逻辑集中、可注入 msgr，可测）：@提及 私信通知。
+/// - 排除 bot 自身 login 与评论作者自提及（GitHub 自身也抑制自通知，评审 M1）；
 /// - 作者无过滤：bot 自己的回复常引用 @login，被引用者需要知道；私信不产生 GitHub
 ///   活动，无回环；且 @bot 触发判定（2.2）在作者回声处把关；
 /// - 无映射项 → 静默跳过（映射是 opt-in 门，不群发骚扰）；
@@ -398,12 +400,13 @@ pub(crate) async fn process_comment_batch(
     comments: &[crate::github::GhComment],
     seen: &[u64],
     mention_map: &[(String, String)],
+    bot_login: &str,
     repo: &str,
 ) -> CommentBatch {
     let mut out = CommentBatch {
         seen_extra: Vec::new(),
         failed: Vec::new(),
-        new_since: String::new(),
+        new_since: comments.last().map(|c| c.updated_at.clone()),
     };
     for c in comments {
         if seen.contains(&c.id) {
@@ -411,7 +414,11 @@ pub(crate) async fn process_comment_batch(
         }
         let mut ok = true;
         // @提及 私信：映射内 login 才发；评论 → issue/PR 号取自评论自身 html_url
-        for login in crate::github::extract_mentions(&c.body, "") {
+        let mentions = crate::github::extract_mentions(&c.body, bot_login)
+            .into_iter()
+            .filter(|l| !l.eq_ignore_ascii_case(&c.user.login)) // 自提及不通知（同 GitHub）
+            .collect::<Vec<_>>();
+        for login in mentions {
             if let Some((_, chat)) = mention_map
                 .iter()
                 .find(|(l, _)| l.eq_ignore_ascii_case(&login))
@@ -433,10 +440,6 @@ pub(crate) async fn process_comment_batch(
             out.failed.push(c.updated_at.clone());
         }
     }
-    out.new_since = comments
-        .last()
-        .map(|c| c.updated_at.clone())
-        .unwrap_or_default();
     out
 }
 
@@ -479,8 +482,10 @@ async fn github_watch_loop(
         if interruptible_sleep(std::time::Duration::from_secs(60), stop_rx).await {
             break;
         }
-        if notify_chat.is_empty() {
-            continue; // 没配通知目标 → 轮询无意义（配置后重启生效）
+        // 通知目标与提及映射都空 → 轮询无意义；两者任一配置即跑（评审 I1：
+        // 只配 gh_mention_map 的「仅私信不群发」配置不该被 notify_chat 拦截）。
+        if notify_chat.is_empty() && mention_map.is_empty() {
+            continue;
         }
         // 静默基线用当前时刻（评审 L2）：since 为空不调 API，游标直接置 now——
         // 否则 >100 条存量时游标落在列表中间，下一轮把中段存量误当新条目。
@@ -551,17 +556,20 @@ async fn github_watch_loop(
                             &comments,
                             &cur.comment_seen,
                             &mention_map,
+                            &echo,
                             &repo,
                         )
                         .await;
-                        // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）
-                        let effective = batch
-                            .failed
-                            .iter()
-                            .min()
-                            .cloned()
-                            .unwrap_or_else(|| batch.new_since.clone());
-                        cursor.comment_update(&repo, &effective, batch.seen_extra);
+                        // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。
+                        // 边界假设：GitHub since 按 updated_at **严格大于** 过滤（"updated after"），
+                        // updated_at == since 的失败评论不会自然重浮——评论被编辑或依赖
+                        // 后续重试窗口时才会重取；Phase 1 issue 侧同款假设（created_at 回退），
+                        // 已知取舍，注释声明（评审 M3）。
+                        // 空批（new_since=None）→ 保持原游标，绝不能写空串清掉（评审 C1）。
+                        let effective = batch.failed.iter().min().cloned().or(batch.new_since);
+                        if let Some(e) = effective {
+                            cursor.comment_update(&repo, &e, batch.seen_extra);
+                        }
                     }
                     Err(e) => {
                         sweep_failed = true;

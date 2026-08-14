@@ -524,6 +524,7 @@ const MENTION_MAX: usize = 10;
 /// - 词位边界：@ 前后都不得是 login 字符（GitHub 用户名 = ASCII 字母数字 + '-'）；
 ///   "xx@alice" / "email@alice.com" 不命中，"问@alice一下" 命中；
 /// - 跳过 '>' 开头行（GitHub 引用块——被引用的 @ 不算新提及）；
+/// - 跳过 ``` 围栏代码块（GitHub 不通知代码块内的提及，评审 M4）；
 /// - 排除 exclude（机器人自己的 login，@bot 归 2.2 自动处理）；
 /// - 去重保序；超 MENTION_MAX 截断；大小写保留原样（查映射时忽略大小写）。
 pub fn extract_mentions(body: &str, exclude: &str) -> Vec<String> {
@@ -531,8 +532,17 @@ pub fn extract_mentions(body: &str, exclude: &str) -> Vec<String> {
         c.is_ascii_alphanumeric() || c == '-'
     }
     let mut out: Vec<String> = Vec::new();
-    for line in body.lines() {
-        let line = line.trim_start();
+    let mut in_fence = false;
+    for raw_line in body.lines() {
+        let line = raw_line.trim_start();
+        // 围栏切换：``` 行（含语言标注）翻转状态；代码块内不提取
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if line.starts_with('>') {
             continue; // 引用行不算
         }
@@ -1484,6 +1494,15 @@ mod tests {
         assert_eq!(
             extract_mentions("> @quoted 引用不算\n@real 真提及", ""),
             vec!["real".to_string()]
+        );
+        // 围栏代码块跳过（评审 M4：GitHub 不通知代码块内提及）
+        assert_eq!(
+            extract_mentions("```rust\nlet s = \"@alice\";\n```\n@bob 真提及", ""),
+            vec!["bob".to_string()]
+        );
+        assert_eq!(
+            extract_mentions("文本 @a\n```\n@b 代码\n```\n@c", ""),
+            vec!["a".to_string(), "c".to_string()]
         );
         // 无提及
         assert_eq!(extract_mentions("普通讨论", ""), Vec::<String>::new());

@@ -1556,6 +1556,8 @@ mod tests {
         /// (chat_id, text) 全量记录：提及私信等按目标断言用（sent() 只留文本）。
         sent_chats: Mutex<Vec<(String, String)>>,
         quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
+        /// 设置后：发给该 chat 的消息返回 Err（失败注入，测游标回退链路）。
+        fail_chat: Mutex<Option<String>>,
     }
     impl MockMessenger {
         fn new() -> Self {
@@ -1563,6 +1565,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 sent_chats: Mutex::new(Vec::new()),
                 quoted: Mutex::new(std::collections::HashMap::new()),
+                fail_chat: Mutex::new(None),
             }
         }
         fn set_quoted(&self, message_id: &str, text: &str) {
@@ -1586,10 +1589,18 @@ mod tests {
         fn sent_chats(&self) -> Vec<(String, String)> {
             self.sent_chats.lock().unwrap().clone()
         }
+        fn set_fail_chat(&self, chat: &str) {
+            *self.fail_chat.lock().unwrap() = Some(chat.to_string());
+        }
     }
     #[async_trait]
     impl Messenger for MockMessenger {
         async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
+            if let Some(f) = self.fail_chat.lock().unwrap().clone() {
+                if f == chat_id {
+                    anyhow::bail!("模拟发送失败");
+                }
+            }
             self.sent.lock().unwrap().push(text.to_string());
             self.sent_chats
                 .lock()
@@ -3163,14 +3174,14 @@ https://b.com/y"
             html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
         };
         let comments = vec![
-            // 映射内 login → 私信；@bot 不私信（exclude 在调用方传 ""？—— process_comment_batch
-            // 传 ""，@bot 的过滤在 2.2 的触发判定；私信侧 bot 自身 login 若在映射里也会发，
-            // 但映射是配置者自选的，不构成回环）
-            mk(1, "@alice 看看这个", "bob"),
+            // 映射内 login → 私信；@bot 被 exclude（bot_login）排除
+            mk(1, "@alice 看看这个 @bot", "bob"),
             // 无映射 login → 静默跳过
             mk(2, "@nobody 你好", "bob"),
             // 引用行内的 @ 不算
             mk(3, "> @alice 旧讨论\n新讨论", "carol"),
+            // 围栏代码块内的 @ 不算（评审 M4）
+            mk(5, "```rust\nlet x = \"@alice\";\n```\n@alice 真提及", "dave"),
             // 已在 seen → 跳过
             mk(4, "@alice 已处理过", "bob"),
         ];
@@ -3179,17 +3190,74 @@ https://b.com/y"
             &comments,
             &[4],
             &[("alice".to_string(), "oc_alice".to_string())],
+            "bot",
             "o/r",
         )
         .await;
-        // 私信目标断言：@alice 的评论（1 与 3 的引用行不算 → 3 无提及）发到 oc_alice
+        // 私信目标断言：@alice 的评论 1 与 5（代码块内不算，但块后真提及算）发到 oc_alice；
+        // 评论 1 的 @bot 被 exclude 排除
         let sent = msgr.sent_chats();
-        assert_eq!(sent.len(), 1, "只有评论 1 触发私信: {sent:?}");
-        assert_eq!(sent[0].0, "oc_alice");
+        assert_eq!(sent.len(), 2, "评论 1 和 5 触发私信: {sent:?}");
+        assert!(sent.iter().all(|(c, _)| c == "oc_alice"));
         assert!(sent[0].1.contains("你在 o/r#42 被 @bob 提到了"));
-        // seen 推进：1/2/3 成功（3 无提及也算处理过），4 在 seen 里跳过
-        assert_eq!(batch.seen_extra, vec![1, 2, 3]);
+        assert!(sent[1].1.contains("你在 o/r#42 被 @dave 提到了"));
+        // seen 推进：1/2/3/5 成功，4 在 seen 里跳过
+        assert_eq!(batch.seen_extra, vec![1, 2, 3, 5]);
         assert!(batch.failed.is_empty());
-        assert_eq!(batch.new_since, "2026-08-14T02:05:00Z");
+        assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T02:05:00Z"));
+    }
+
+    /// 评审 C1：空批 → new_since=None（调用方保持原游标，不得写空串清掉）。
+    #[tokio::test]
+    async fn comment_batch_empty_keeps_cursor() {
+        let msgr = Arc::new(MockMessenger::new());
+        let batch = crate::service::process_comment_batch(
+            msgr.as_ref(),
+            &[],
+            &[],
+            &[],
+            "bot",
+            "o/r",
+        )
+        .await;
+        assert!(batch.seen_extra.is_empty());
+        assert!(batch.failed.is_empty());
+        assert_eq!(batch.new_since, None, "空批必须保持原游标");
+    }
+
+    /// 评审 M2：私信失败 → 该评论不进 seen、进 failed（游标回退重试）。
+    #[tokio::test]
+    async fn comment_batch_dm_failure_rewinds() {
+        let msgr = Arc::new(MockMessenger::new());
+        msgr.set_fail_chat("oc_alice"); // 对 alice 的私信失败
+        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
+            id,
+            body: body.into(),
+            user: crate::github::GhUser { login: login.into() },
+            created_at: "2026-08-14T02:00:00Z".into(),
+            updated_at: format!("2026-08-14T0{id}:05:00Z"),
+            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
+        };
+        let comments = vec![
+            mk(1, "@alice 失败", "bob"),        // updated 02:01:05 → failed
+            mk(2, "@carol 成功", "bob"),        // updated 02:02:05 → seen
+            mk(3, "@alice 再失败", "dave"),     // updated 02:03:05 → failed
+        ];
+        let batch = crate::service::process_comment_batch(
+            msgr.as_ref(),
+            &comments,
+            &[],
+            &[
+                ("alice".to_string(), "oc_alice".to_string()),
+                ("carol".to_string(), "oc_carol".to_string()),
+            ],
+            "bot",
+            "o/r",
+        )
+        .await;
+        assert_eq!(batch.seen_extra, vec![2], "成功评论进 seen");
+        // 回退到最早失败评论的 updated_at（评审：取 min 而非最后失败者）
+        assert_eq!(batch.failed, vec!["2026-08-14T01:05:00Z", "2026-08-14T03:05:00Z"]);
+        assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T03:05:00Z"));
     }
 }
