@@ -931,14 +931,28 @@ impl Bridge {
             let lock_ret = lock.clone(); // guard 借用 lock，返回值需独立 Arc
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let epoch = *guard;
-            // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）：
-            // resume 时直接短路，连 marker 都不读（省一次磁盘读）。
+            // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）。
+            // #54：自愈重建会话带 pending 标记（同 sid）→ 无论 resume 与否都放行
+            // 一次注入（重建轮没带上下文，下一条补上）。
             let injected_rounds = if !resume {
                 let not_yet_migrated = match hist.marker() {
                     Some(m) => m.session_id != session_id,
                     None => true,
                 };
                 if not_yet_migrated {
+                    let (block, n) =
+                        hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
+                    if n > 0 {
+                        prompt.insert_str(0, &block);
+                        Some(n)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if let Some(m) = hist.marker() {
+                if m.pending && m.session_id == session_id {
                     let (block, n) =
                         hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
                     if n > 0 {
@@ -1034,7 +1048,11 @@ impl Bridge {
 
         // 统一只发最终结果一条（中途进度已在 select 循环丢弃）。
         match result {
-            Ok(agent::RunOutcome::Reply { reply, session_id }) => {
+            Ok(agent::RunOutcome::Reply {
+                reply,
+                session_id,
+                rebuilt,
+            }) => {
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
                 // #23：仅当当前槽位仍是本次任务的会话时才 mark——运行中被 /new 或
                 // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
@@ -1046,8 +1064,12 @@ impl Bridge {
                     let guard = hist_epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
                     if *guard == hist_epoch {
                         hist.append_assistant(&ev.mid, backend.name(), &reply);
+                        // #54：同 sid 自愈重建轮（rebuilt）没有带上下文 → 写 pending 标记，
+                        // 下一条消息注入历史；正常注入轮成功后回写非 pending。
                         if injected_rounds.is_some() {
-                            hist.set_marker(&session_id, backend.name());
+                            hist.set_marker(&session_id, backend.name(), false);
+                        } else if rebuilt {
+                            hist.set_marker(&session_id, backend.name(), true);
                         }
                     }
                 }
@@ -1885,6 +1907,8 @@ mod tests {
         prompts: Mutex<Vec<String>>,
         /// 收到的发送者角色（授权者隔离断言用：granted → 受限分支）。
         roles: Mutex<Vec<crate::config::SenderRole>>,
+        /// 前 N 次 run 返回 rebuilt=true（#54 自愈重建轮），随后回 false。
+        rebuilt_left: std::sync::atomic::AtomicUsize,
     }
     impl MockAgentRunner {
         fn blocking(reply: &str) -> Self {
@@ -1897,7 +1921,12 @@ mod tests {
                 outcome: MockOutcome::Reply,
                 prompts: Mutex::new(Vec::new()),
                 roles: Mutex::new(Vec::new()),
+                rebuilt_left: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+        fn set_rebuilt_rounds(&self, n: usize) {
+            self.rebuilt_left
+                .store(n, std::sync::atomic::Ordering::SeqCst);
         }
         fn immediate(reply: &str) -> Self {
             Self {
@@ -1985,10 +2014,18 @@ mod tests {
             }
             // 返回本次运行使用的 session_id——bridge 据此做 mark_started_if 身份校验
             match &self.outcome {
-                MockOutcome::Reply => Ok(agent::RunOutcome::Reply {
-                    reply: self.reply.clone(),
-                    session_id: session_id.to_string(),
-                }),
+                MockOutcome::Reply => {
+                    let rebuilt = self.rebuilt_left.load(std::sync::atomic::Ordering::SeqCst) > 0
+                        && self
+                            .rebuilt_left
+                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                            > 0;
+                    Ok(agent::RunOutcome::Reply {
+                        reply: self.reply.clone(),
+                        session_id: session_id.to_string(),
+                        rebuilt,
+                    })
+                }
                 MockOutcome::Cancel => Ok(agent::RunOutcome::Cancelled),
                 MockOutcome::Fail(e) => Err(e.clone()),
             }
@@ -2275,6 +2312,63 @@ mod tests {
             "下一条重新注入"
         );
         let _ = msgr;
+        cleanup_bridge(&bridge);
+    }
+
+    /// #54：同 sid 会话自愈重建——重建轮本身无注入（判定发生在 run 前），但写 pending
+    /// 迁移标记；下一条消息（resume=true）被 pending 放行注入历史并复位标记；之后不注入。
+    #[tokio::test]
+    async fn rebuilt_round_marks_pending_then_next_injects() {
+        let runner = Arc::new(MockAgentRunner::immediate("重建后的回复"));
+        runner.set_rebuilt_rounds(1); // 第一次 run 返回 rebuilt=true（模拟自愈重建）
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        // 既有会话：started=true + marker 匹配（模拟已迁移过的会话，正常消息不注入）
+        let sid = bridge.sessions.ensure_with_started("oc_x").0;
+        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
+        hist.append_user("old1", "claude", "旧背景");
+        hist.set_marker(&sid, "claude", false);
+
+        // 重建轮（后端对端丢会话，agent 以同 sid 重建）→ 无注入、写 pending 标记
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "恢复试试")).await })
+            .await
+            .unwrap();
+        assert!(
+            !runner.prompts()[0].contains("[历史上下文]"),
+            "重建轮本身无注入（判定发生在 run 之前）"
+        );
+        let m = hist.marker().expect("重建轮应写 pending 标记");
+        assert!(m.pending, "标记 pending");
+        assert_eq!(m.session_id, sid, "同 sid 标记");
+        assert!(!msgr.sent()[0].contains("已携带"), "重建轮回复无提示");
+
+        // 下一条消息：pending 放行（resume=true 也注入）→ 历史补上，标记复位
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        assert!(
+            runner.prompts()[1].contains("[历史上下文]"),
+            "pending 放行注入: {}",
+            runner.prompts()[1]
+        );
+        assert!(runner.prompts()[1].contains("旧背景"), "历史内容注入");
+        assert!(
+            msgr.sent()[1].contains("已携带"),
+            "注入轮回复带提示: {}",
+            msgr.sent()[1]
+        );
+        assert!(!hist.marker().unwrap().pending, "注入后标记复位");
+
+        // 再下一条：恢复正常（不注入、无提示）
+        let b3 = bridge.clone();
+        tokio::spawn(async move { b3.handle(test_ev("m3", "oc_x", "再来")).await })
+            .await
+            .unwrap();
+        assert!(!runner.prompts()[2].contains("[历史上下文]"));
+        assert!(!msgr.sent()[2].contains("已携带"));
         cleanup_bridge(&bridge);
     }
 

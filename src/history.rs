@@ -49,6 +49,12 @@ pub struct MigratedMarker {
     pub backend: String,
     #[serde(default)]
     pub ts: u64,
+    /// #54 待注入：会话在同 sid 下被自愈重建（claude No conversation found /
+    /// codex no rollout found）——重建轮没有旧上下文，标记 pending 让**下一条消息**
+    /// 注入历史（此时 resume=true 但 pending 命中，闸放行）。注入成功后桥回写
+    /// pending=false。旧标记文件无此字段（serde default = false）。
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// 单条截断（agent::truncate 同款语义，历史是摘要非全文）。
@@ -185,11 +191,13 @@ impl History {
     }
 
     /// 记录「历史已注入到该会话」（bridge 在首轮成功后写，与 assistant 条目同点）。
-    pub fn set_marker(&self, session_id: &str, backend: &str) -> bool {
+    /// pending=true = 自愈重建会话，标记「下一条消息待注入」（#54）。
+    pub fn set_marker(&self, session_id: &str, backend: &str, pending: bool) -> bool {
         let m = MigratedMarker {
             session_id: session_id.to_string(),
             backend: backend.to_string(),
             ts: crate::chrono_lite::unix_secs(),
+            pending,
         };
         match serde_json::to_string(&m) {
             Ok(t) => match crate::atomic_write_sensitive(&self.marker_path, &t) {
@@ -396,11 +404,21 @@ mod tests {
         let h = temp_history("marker", "oc_x");
         assert!(h.marker().is_none());
         h.append_user("m1", "claude", "问");
-        assert!(h.set_marker("sid-1", "pi"));
+        assert!(h.set_marker("sid-1", "pi", false));
         let m = h.marker().unwrap();
         assert_eq!(m.session_id, "sid-1");
         assert_eq!(m.backend, "pi");
-        assert!(h.path.exists() && h.marker_path.exists());
+        assert!(!m.pending, "普通注入轮标记非 pending");
+        // #54：pending 往返（自愈重建轮标记）
+        assert!(h.set_marker("sid-1", "pi", true));
+        assert!(h.marker().unwrap().pending);
+        // 旧标记文件无 pending 字段 → serde default = false（向前兼容）
+        std::fs::write(
+            &h.marker_path,
+            r#"{"session_id":"old","backend":"claude","ts":1}"#,
+        )
+        .unwrap();
+        assert!(!h.marker().unwrap().pending);
         h.clear();
         assert!(h.marker().is_none());
         assert!(!h.path.exists() && !h.marker_path.exists());
