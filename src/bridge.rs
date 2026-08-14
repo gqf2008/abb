@@ -927,7 +927,7 @@ impl Bridge {
                         Err(e) => {
                             archived = false;
                             crate::log!(
-                                "[bridge] ⚠️ issue 评论回写失败 {}/{}#{}: {e:#}",
+                                "[bridge] ⚠️ 评论回写失败 {}/{}#{}: {e:#}",
                                 ctx.owner,
                                 ctx.repo,
                                 ctx.number
@@ -948,8 +948,15 @@ impl Bridge {
                             if ctx.is_pr { "PR" } else { "issue" }
                         )
                     } else {
+                        // 评审：PR 的自然 URL（/pull/N）不被 parse_issue_url 接受，补档提示
+                        // 必须给可达形态——owner/repo#N 简写对 PR 同样有效（共享编号空间）。
+                        let redrive = if ctx.is_pr {
+                            format!("分析 {}/{}#{}", ctx.owner, ctx.repo, ctx.number)
+                        } else {
+                            "分析".to_string()
+                        };
                         format!(
-                            "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（⚠️ 评论留档失败，全文仅此可见，可稍后重发「分析」补档）",
+                            "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（⚠️ 评论留档失败，全文仅此可见，可稍后重发「{redrive}」补档）",
                             ctx.owner, ctx.repo, ctx.number, ctx.title, summary
                         )
                     };
@@ -3322,7 +3329,7 @@ https://b.com/y"
         );
         assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T03:05:00Z"));
     }
-    /// 2.2 触发判定：协作者评论 @bot → triggers；非协作者 → 跳过；PR 评论 → 留 2.3；
+    /// 2.2 触发判定：协作者评论 @bot → triggers；非协作者 → 跳过；PR 评论 → 2.3 起同样触发；
     /// 作者 == bot（回声）→ 跳过。
     #[tokio::test]
     async fn comment_batch_trigger_and_collaborator_gate() {
@@ -3342,7 +3349,7 @@ https://b.com/y"
             mk(1, "@bot 分析下这个", "alice", issue_url), // 协作者（默认）→ 触发
             mk(2, "@BOT 再看看", "bob", issue_url),       // 大小写不敏感
             mk(3, "@bot 分析", "bot", issue_url),         // 作者回声 → 不触发
-            mk(4, "@bot 审查下 PR", "alice", pr_url),     // PR 评论 → 2.2 跳过
+            mk(4, "@bot 审查下 PR", "alice", pr_url),     // PR 评论 → 2.3 起同样触发
             mk(5, "xxbot 分析", "alice", issue_url),      // 词位不符 → 不触发
         ];
         let msgr = Arc::new(MockMessenger::new());
@@ -3498,6 +3505,11 @@ https://b.com/y"
         assert!(
             msgr.sent()[0].starts_with("🔀 PR 审查 o/r#42"),
             "PR 变体前缀，实际: {}",
+            msgr.sent()[0]
+        );
+        assert!(
+            msgr.sent()[0].contains("留档到 PR 评论"),
+            "留档尾注随 kind 切换，实际: {}",
             msgr.sent()[0]
         );
         assert!(

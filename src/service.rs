@@ -395,7 +395,7 @@ pub(crate) struct CommentBatch {
 /// - 私信侧：排除 bot 自身 login 与评论作者自提及（GitHub 自身也抑制自通知）；作者无
 ///   其他过滤——bot 自己的回复常引用 @login，被引用者需要知道；私信不产生 GitHub
 ///   活动，无回环；无映射项 → 静默跳过（映射是 opt-in 门，不群发骚扰）；
-/// - 触发侧（护栏 b）：作者 ≠ bot + 词位 @bot 才判定；PR 评论跳过（归批次 2.3）；
+/// - 触发侧（护栏 b）：作者 ≠ bot + 词位 @bot 才判定；issue 与 PR 评论均触发（2.3 起）；
 ///   is_collaborator（护栏 a）：true → triggers；false → 日志跳过；Err → failed 重试；
 /// - 私信失败/协作者校验失败 → 该评论进 failed（游标回退，下轮重试）。
 #[allow(clippy::too_many_arguments)] // 注入面全（api/msgr/评论/seen/映射/身份），与 MockAgentRunner::run 同款

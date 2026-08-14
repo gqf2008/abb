@@ -28,7 +28,8 @@ pub struct GhIssue {
     pub updated_at: String,
     pub user: GhUser,
     /// 非 None = 这是 PR 不是 issue（GitHub REST 的 issues 列表把 PR 也算进去，
-    /// 响应项带 pull_request 字段）——watch 通知与指令门都必须跳过。
+    /// 响应项带 pull_request 字段）——watch 新 issue 通知必须跳过（PR 不算新 issue）；
+    /// 指令门不跳过（批次 2.3 起 PR 走「PR 审查」变体）。
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
 }
@@ -597,7 +598,8 @@ pub fn parse_mention_map(s: &str) -> Vec<(String, String)> {
 
 /// 从评论 html_url 提取 (issue 号, 是否 PR)。
 /// 形态：issues → …/issues/42#issuecomment-…；PR → …/pull/5#… 或 /pulls/5#…。
-/// 解析失败 → None。提及私信对 PR 评论同样生效（PR 也是 issue）；@bot 触发按 is_pr 过滤。
+/// 解析失败 → None。提及私信与 @bot 触发对 PR 评论均生效（PR 也是 issue；
+/// PR 变体见 GhContext::is_pr，批次 2.3）。
 pub fn comment_issue_ref(c: &GhComment) -> Option<(u64, bool)> {
     let host = "github.com/";
     let pos = c.html_url.to_ascii_lowercase().find(host)?;
