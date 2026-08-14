@@ -258,6 +258,21 @@ async fn run_bot(
         });
     }
 
+    // GitHub watch 循环（附挂在既有 IM bot 上的能力，非新 bot kind）：
+    // 新 issue 只通知、不自动处理（自动分析留 Phase 2）；通知走该 bot 自己的 messenger。
+    // 与主事件循环并行：bot 的主循环仍是 IM 通道。
+    if bot.is_github_capable() {
+        let bot = bot.clone();
+        let bridge = bridge.clone();
+        let key = key.clone();
+        let mut stop = stop_rx.clone();
+        tokio::spawn(async move {
+            crate::log!("[bot:{key}] GitHub watch 任务启动");
+            github_watch_loop(bot, bridge, &mut stop).await;
+            crate::log!("[bot:{key}] GitHub watch 任务退出");
+        });
+    }
+
     // 事件循环：按通道分派
     if bot.is_dingtalk() {
         crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop_rx)
@@ -367,6 +382,92 @@ async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receive
         _ = tokio::time::sleep(dur) => false,
         _ = stop.changed() => true,
     }
+}
+
+/// GitHub watch 循环（附挂能力，Phase 1）：每 60s 增量轮询白名单仓库的 open issues，
+/// 新 issue → 发「🔔 新 issue …」到 gh_notify_chat；自己（gh_username）发的不回显。
+/// 游标落盘 workspaces/<bot>/github_cursor.json（原子写）：崩溃/重启后增量续跑不重发。
+/// 状态上报与 IM 事件循环共用同一 bot key 槽位：只在状态迁移时写（在线 10s 节流 /
+/// 连续 3 轮失败→重连中），正常时槽位由 IM 态主导；退出不清 botstatus（槽位归 IM 循环）。
+async fn github_watch_loop(
+    bot: crate::config::BotConfig,
+    bridge: Arc<Bridge>,
+    stop_rx: &mut watch::Receiver<bool>,
+) {
+    let key = bot.key();
+    let repos = bot.gh_repo_list();
+    let notify_chat = bot.gh_notify_chat.clone();
+    let echo = bot.gh_username.clone();
+    crate::log!(
+        "[bot:{key}] GitHub watch 循环启动 repos={} 通知={}",
+        repos.len(),
+        if notify_chat.is_empty() { "（未配置通知群）" } else { "已配置" }
+    );
+    let mut cursor = crate::github::GhCursor::load(&key);
+    let mut last_online = std::time::Instant::now();
+    let mut consec_errs = 0u32;
+    loop {
+        if interruptible_sleep(std::time::Duration::from_secs(60), stop_rx).await {
+            break;
+        }
+        if notify_chat.is_empty() {
+            continue; // 没配通知目标 → 轮询无意义（配置后重启生效）
+        }
+        let mut sweep_failed = false;
+        for repo in &repos {
+            let Some((owner, name)) = repo.split_once('/') else {
+                crate::log!("[bot:{key}] ⚠️ 白名单项格式错误（应 owner/repo）: {repo}");
+                continue;
+            };
+            let cur = cursor.repo_cursor(repo);
+            match bridge
+                .github_client
+                .list_issues_since(owner, name, &cur.since)
+                .await
+            {
+                Ok(issues) => {
+                    let (fresh, new_since) =
+                        crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
+                    let mut seen_extra = Vec::new();
+                    for iss in &fresh {
+                        seen_extra.push(iss.id);
+                        let text = crate::github::notify_text(repo, iss);
+                        match bridge.msgr.send_text(&notify_chat, &text).await {
+                            Ok(()) => crate::log!(
+                                "[bot:{key}] 新 issue 已通知 #{}({})",
+                                iss.number,
+                                repo
+                            ),
+                            Err(e) => crate::log!(
+                                "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
+                            ),
+                        }
+                    }
+                    cursor.update(repo, &new_since, seen_extra);
+                }
+                Err(e) => {
+                    sweep_failed = true;
+                    crate::log!("[bot:{key}] ⚠️ 拉取 {repo} issues 失败: {e:#}");
+                }
+            }
+        }
+        cursor.save(&key); // 每轮原子落盘（60s 一次小写盘，崩溃至多丢一个窗口）
+        // 状态上报（绑真实连通，同 weixin_loop 语义）：成功一轮 → 在线；连续 3 轮失败 → 重连中
+        if sweep_failed {
+            consec_errs += 1;
+            if consec_errs == 3 {
+                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "重连中");
+            }
+        } else {
+            consec_errs = 0;
+            if last_online.elapsed() > std::time::Duration::from_secs(10) {
+                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
+                last_online = std::time::Instant::now();
+            }
+        }
+    }
+    // 注意：这里不清 botstatus——槽位归 IM 事件循环（weixin_loop 退出时 clear），
+    // github 是附挂能力，退场不该把 IM 的状态一起抹掉。
 }
 
 /// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。

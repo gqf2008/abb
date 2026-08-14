@@ -15,6 +15,7 @@ mod deliver;
 mod deps;
 mod dingtalk;
 mod feishu;
+mod github;
 mod install;
 mod larkskills;
 mod messenger;

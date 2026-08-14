@@ -99,6 +99,9 @@ export struct BotRow {
     ding-granted: [OwnerRow], // 钉钉：授权者列表（授权码添加，名字 + staffId）
     ding-open-access: bool,  // 钉钉：true=任何人都可以对话；false=仅授权用户
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
+    gh-token: string,       // GitHub 能力：PAT token（空=不启用；附挂在任意 kind 的 bot 上）
+    gh-repos: string,       // 仓库白名单：owner/repo 或 owner/*，逗号分隔
+    gh-notify-chat: string, // 新 issue 通知目标会话（该 bot 自己的群/私聊 chat_id）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -1119,6 +1122,35 @@ export component SettingsWindow inherits Window {
                                                         color: #888;
                                                         wrap: word-wrap;
                                                         vertical-alignment: center;
+                                                    }
+                                                }
+                                                // ── GitHub 能力（附挂在任意 bot 上，非独立类型）──
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "GitHub Token"; width: 80px; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        text: root.bots[root.selected].gh-token;
+                                                        input-type: password;
+                                                        placeholder-text: "ghp_xxx（GitHub PAT，空=不启用）";
+                                                        horizontal-stretch: 1;
+                                                        edited => { root.bot-field-edited(root.selected, "gh_token", self.text); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "仓库白名单"; width: 80px; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        text: root.bots[root.selected].gh-repos;
+                                                        placeholder-text: "owner/repo 或 owner/*，逗号分隔（空=不限制）";
+                                                        horizontal-stretch: 1;
+                                                        edited => { root.bot-field-edited(root.selected, "gh_repos", self.text); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "通知群"; width: 80px; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        text: root.bots[root.selected].gh-notify-chat;
+                                                        placeholder-text: "新 issue 通知的群/私聊 chat_id";
+                                                        horizontal-stretch: 1;
+                                                        edited => { root.bot-field-edited(root.selected, "gh_notify_chat", self.text); }
                                                     }
                                                 }
                                             }

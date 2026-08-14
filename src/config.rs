@@ -92,6 +92,20 @@ pub struct BotConfig {
     /// 空 = 发送时用 app_id 兜底（对绝大多数企业内部应用机器人成立）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ding_robot_code: String,
+    /// GitHub 能力（附挂到任意 kind 的 IM bot，非独立 bot kind）：PAT token。
+    /// 空 = 不启用 github 指令/通知。注意：**不参与 credentials_ready 门槛**——github 是
+    /// IM bot 的附加能力，IM 凭证齐了 bot 就该跑，gh_token 缺失只是该项能力不可用。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gh_token: String,
+    /// 仓库白名单：逗号分隔 `owner/repo`，支持 `owner/*`（整组织）。空 = 不限制。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gh_repos: String,
+    /// 新 issue 通知目标会话（该 bot 自己的群/私聊 chat_id）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gh_notify_chat: String,
+    /// 自己的 GitHub login：watch 通知过滤「自问自答」回显（须与 token 对应账号精确一致）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gh_username: String,
     /// 该 bot 的模型供应商名（指向 Config.providers[].name）。空 = 跟随全局 default_provider。
     /// per-bot 独立：不同 bot 可走不同 key/模型（如飞书用官方 key、微信用 deepseek）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -130,6 +144,10 @@ impl Default for BotConfig {
             wx_cdn_base_url: String::new(),
             ding_user_id: String::new(),
             ding_robot_code: String::new(),
+            gh_token: String::new(),
+            gh_repos: String::new(),
+            gh_notify_chat: String::new(),
+            gh_username: String::new(),
             ding_owner_ids: String::new(),
             ding_granted_ids: String::new(),
             ding_open_access: false,
@@ -301,6 +319,27 @@ impl BotConfig {
     /// 是否钉钉通道。
     pub fn is_dingtalk(&self) -> bool {
         self.kind == "dingtalk"
+    }
+
+    /// GitHub 能力开关：token 非空即可（白名单/通知群是可选增强）。
+    /// 附挂在任意 kind 的 IM bot 上，不是独立通道——**不参与 credentials_ready 门槛**。
+    pub fn is_github_capable(&self) -> bool {
+        !self.gh_token.is_empty()
+    }
+
+    /// 白名单拆 Vec<owner/repo>（逗号/分号/空白分隔，与 is_owner_allowed 同款解析）。
+    pub fn gh_repo_list(&self) -> Vec<String> {
+        self.gh_repos
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 仓库是否放行（空白名单 = 全部放行，见 github::repo_in_whitelist）。
+    pub fn gh_allows_repo(&self, repo: &str) -> bool {
+        crate::github::repo_in_whitelist(repo, &self.gh_repos)
     }
 
     /// 凭证是否齐备可跑（单一事实源：service 启动门槛 + Config::missing 都用它）。
@@ -954,6 +993,28 @@ mod tests {
             serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x","app_secret":"s"}"#).unwrap();
         assert!(b4.ding_user_id.is_empty());
         assert!(b4.ding_robot_code.is_empty());
+    }
+
+    #[test]
+    fn github_fields_serde_default_and_capable() {
+        // 旧 config 无 gh_* 字段 → 空串、能力关
+        let b: BotConfig =
+            serde_json::from_str(r#"{"kind":"feishu","app_id":"x","app_secret":"s"}"#).unwrap();
+        assert!(!b.is_github_capable());
+        assert!(b.gh_repo_list().is_empty());
+
+        // 配了 token → 能力开；白名单解析 + 放行判断
+        let b: BotConfig = serde_json::from_str(
+            r#"{"kind":"feishu","app_id":"x","app_secret":"s","gh_token":"ghp_x","gh_repos":"o/a, o/*","gh_notify_chat":"oc_g","gh_username":"bot"}"#,
+        )
+        .unwrap();
+        assert!(b.is_github_capable());
+        assert_eq!(b.gh_repo_list(), vec!["o/a".to_string(), "o/*".to_string()]);
+        assert!(b.gh_allows_repo("o/a"));
+        assert!(b.gh_allows_repo("o/any"));
+        assert!(!b.gh_allows_repo("x/y"));
+        assert_eq!(b.gh_notify_chat, "oc_g");
+        assert_eq!(b.gh_username, "bot");
     }
 
     #[test]

@@ -691,7 +691,7 @@ fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
 
 /// query 参数百分号编码（encrypt_query_param 可能含 +/= 等 URL 特殊字符）。
 /// 对齐 openclaw-weixin 的 encodeURIComponent 语义：除保留字符外全部转义。
-fn percent_encode_query(s: &str) -> String {
+pub(crate) fn percent_encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {

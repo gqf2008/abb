@@ -47,6 +47,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 能力 | 说明 |
 |---|---|
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
+| GitHub 联动 | 群里 @ bot 分析 / 关闭 / 创建 GitHub issue（仓库白名单把关），新 issue 自动通知到群 |
 | 多模型后端 | Claude / Codex / Pi（pi-coding-agent），或任意 Anthropic / OpenAI 兼容供应商 |
 | 多轮会话 | 每个 bot 独立记忆，不会串味；任务进行中发 `/cancel`（或「停止」等自然词）立即取消，无任务时发 `/cancel` 会给明确提示；聊天发 `/new` 立即新建会话（清空上下文，无需重启） |
 | 引用/回复上下文 | 引用一条消息再 @ bot 时，自动读取被引用消息内容（飞书按 parent_id 拉取、微信 ref_msg、钉钉 repliedMsg）带进 agent，回复不会脱离上文 |

@@ -318,6 +318,9 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_granted: slint::ModelRc::from(Rc::new(ding_granted)),
         ding_open_access: b.ding_open_access,
         ding_robot_code: b.ding_robot_code.clone().into(),
+        gh_token: b.gh_token.clone().into(),
+        gh_repos: b.gh_repos.clone().into(),
+        gh_notify_chat: b.gh_notify_chat.clone().into(),
     }
 }
 
@@ -1060,6 +1063,9 @@ pub fn run_gui() -> Result<()> {
                             refresh = true; // 同 open_access：互斥显示靠 model 重建
                         }
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
+                        "gh_token" => bot.gh_token = value.trim().to_string(),
+                        "gh_repos" => bot.gh_repos = value.trim().to_string(),
+                        "gh_notify_chat" => bot.gh_notify_chat = value.trim().to_string(),
                         _ => {}
                     }
                 }
