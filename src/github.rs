@@ -559,16 +559,14 @@ pub fn extract_mentions(body: &str, exclude: &str) -> Vec<String> {
                 j += 1;
             }
             if before_ok && j > i + 1 {
-                let after_ok = j >= chars.len() || !is_login_char(chars[j]);
-                if after_ok {
-                    let login: String = chars[i + 1..j].iter().collect();
-                    if !login.eq_ignore_ascii_case(exclude)
-                        && !out.iter().any(|e| e.eq_ignore_ascii_case(&login))
-                    {
-                        out.push(login);
-                        if out.len() >= MENTION_MAX {
-                            return out;
-                        }
+                // j 出口已保证 chars[j] 非 login 字符或越界（while 条件），无需再判后边界
+                let login: String = chars[i + 1..j].iter().collect();
+                if !login.eq_ignore_ascii_case(exclude)
+                    && !out.iter().any(|e| e.eq_ignore_ascii_case(&login))
+                {
+                    out.push(login);
+                    if out.len() >= MENTION_MAX {
+                        return out;
                     }
                 }
             }
@@ -598,6 +596,11 @@ pub fn parse_mention_map(s: &str) -> Vec<(String, String)> {
 pub fn comment_issue_ref(c: &GhComment) -> Option<(u64, bool)> {
     let host = "github.com/";
     let pos = c.html_url.to_ascii_lowercase().find(host)?;
+    // 左边界：notgithub.com 不得命中（输入虽是 API 返回的 html_url，但与其他 URL
+    // 解析保持一致惯例，评审 L3）
+    if pos > 0 && c.html_url.as_bytes()[pos - 1] != b'/' {
+        return None;
+    }
     let mut parts = c.html_url[pos + host.len()..].split('/');
     parts.next().filter(|s| !s.is_empty())?; // owner
     parts.next().filter(|s| !s.is_empty())?; // repo
@@ -618,11 +621,8 @@ pub fn comment_issue_ref(c: &GhComment) -> Option<(u64, bool)> {
 
 /// 提及私信文案：谁在哪条评论提到你 + 原文摘录（200 字单行化）+ 评论链接。
 pub fn mention_notify_text(repo: &str, number: u64, c: &GhComment) -> String {
-    let url = if c.html_url.is_empty() {
-        format!("https://github.com/{repo}/issues/{number}")
-    } else {
-        c.html_url.clone()
-    };
+    // 调用方已用 comment_issue_ref 过滤空 html_url（拿不到 issue 号不发），url 恒非空
+    let url = c.html_url.clone();
     let excerpt: String = crate::agent::truncate(&c.body, 200)
         .chars()
         .map(|x| if x == '\n' || x == '\r' { ' ' } else { x })
@@ -671,12 +671,9 @@ pub fn comment_triggers_bot(body: &str, bot_login: &str) -> bool {
                 j += 1;
             }
             if before_ok && j > i + 1 {
-                let after_ok = j >= chars.len() || !is_login_char(chars[j]);
-                if after_ok {
-                    let login: String = chars[i + 1..j].iter().collect();
-                    if login.eq_ignore_ascii_case(bot_login) {
-                        return true;
-                    }
+                let login: String = chars[i + 1..j].iter().collect();
+                if login.eq_ignore_ascii_case(bot_login) {
+                    return true;
                 }
             }
             i = j.max(i + 1);
@@ -767,6 +764,10 @@ pub struct RepoCursor {
 #[serde(default)]
 pub struct GhCursor {
     pub by_repo: std::collections::BTreeMap<String, RepoCursor>,
+    /// 评论私信失败次数（评论 id → 次数）：失败重试上限用（评审 M2，≥上限放弃+告警）。
+    /// 成功处理/放弃后清除。
+    #[serde(default)]
+    pub comment_fails: std::collections::BTreeMap<u64, u32>,
 }
 
 impl GhCursor {
@@ -921,6 +922,10 @@ impl GithubClient {
 
     /// 分页 GET（评审 L2）：满页继续 page+1，直到不满页或达上限（防页漂无限拉）。
     async fn get_paged(&self, path: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        debug_assert!(
+            path.contains('?'),
+            "get_paged 要求 path 已含查询参数（page 拼接用 &）"
+        );
         const PER_PAGE: u32 = 100;
         const MAX_PAGES: u32 = 10; // 上限 1000 条/轮
         let mut all = Vec::new();

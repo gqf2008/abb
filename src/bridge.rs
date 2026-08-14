@@ -3283,7 +3283,7 @@ https://b.com/y"
             html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
         };
         let comments = vec![
-            mk(1, "@alice 失败", "bob"),    // updated 02:01:05 → failed
+            mk(1, "@alice 失败", "bob"),    // updated T01:05 → failed
             mk(2, "@carol 成功", "bob"),    // updated 02:02:05 → seen
             mk(3, "@alice 再失败", "dave"), // updated 02:03:05 → failed
         ];
@@ -3304,10 +3304,14 @@ https://b.com/y"
         )
         .await;
         assert_eq!(batch.seen_extra, vec![2], "成功评论进 seen");
-        // 回退到最早失败评论的 updated_at（评审：取 min 而非最后失败者）
+        // 回退到最早失败评论的 updated_at（评审：取 min 而非最后失败者）；
+        // failed 携带评论 id（供失败计数，评审 M2）
         assert_eq!(
             batch.failed,
-            vec!["2026-08-14T01:05:00Z", "2026-08-14T03:05:00Z"]
+            vec![
+                (1, "2026-08-14T01:05:00Z".to_string()),
+                (3, "2026-08-14T03:05:00Z".to_string())
+            ]
         );
         assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T03:05:00Z"));
     }
@@ -3408,7 +3412,7 @@ https://b.com/y"
         assert_eq!(batch.seen_extra, vec![2], "普通评论照常进 seen");
         assert_eq!(
             batch.failed,
-            vec!["2026-08-14T02:01:00Z"],
+            vec![(1, "2026-08-14T02:01:00Z".to_string())],
             "校验失败评论回退"
         );
     }

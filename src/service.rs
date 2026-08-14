@@ -382,8 +382,8 @@ async fn weixin_loop(
 pub(crate) struct CommentBatch {
     /// 成功处理（含无提及/无映射项）的评论 id → 进 seen。
     pub seen_extra: Vec<u64>,
-    /// 私信发送失败的评论 updated_at → 游标回退重试。
-    pub failed: Vec<String>,
+    /// 私信发送失败的 (评论 id, updated_at) → 游标回退重试（id 供失败计数，上限放弃）。
+    pub failed: Vec<(u64, String)>,
     /// 触发自动处理的 (issue 号, 评论 id)——调用方构造合成 Ev 交给 handle()。
     pub triggers: Vec<(u64, u64)>,
     /// 本轮最新评论 updated_at；**None = 空批 → 调用方必须保持原游标**
@@ -414,10 +414,15 @@ pub(crate) async fn process_comment_batch(
         seen_extra: Vec::new(),
         failed: Vec::new(),
         triggers: Vec::new(),
-        new_since: comments.last().map(|c| c.updated_at.clone()),
+        // 游标取全批 updated_at 最大值（评审 L1）：排序键（sort=created）与游标键
+        // （updated_at）不一致时，被编辑的老评论（created 早、updated 新）不会让
+        // 末位小于它 → 每轮重取。max 对排序不敏感，更稳。
+        new_since: comments.iter().map(|c| c.updated_at.clone()).max(),
     };
     for c in comments {
         if seen.contains(&c.id) {
+            // 已 seen 的评论被编辑后新增 @提及 不会通知（评审 L4）：编辑事件由 GitHub
+            // 触发二次通知，这里以「评论 id 已处理」为准跳过——有取舍，注释声明。
             continue;
         }
         let mut ok = true;
@@ -477,7 +482,7 @@ pub(crate) async fn process_comment_batch(
         if ok {
             out.seen_extra.push(c.id);
         } else {
-            out.failed.push(c.updated_at.clone());
+            out.failed.push((c.id, c.updated_at.clone()));
         }
     }
     out
@@ -506,6 +511,10 @@ pub(crate) fn auto_ev(
         attachments: Vec::new(),
     }
 }
+
+/// 评论私信失败重试上限（评审 M2）：超过即放弃该评论（进 seen + 告警），
+/// 防永久失败目标（chat_id 填错/用户退群）无限重试 + 已成功目标重复私信。
+const GH_RETRY_MAX: u32 = 5;
 
 /// 睡眠 dur，但可被 stop 信号打断。返回 true=收到停止信号（调用方应 break）。
 async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receiver<bool>) -> bool {
@@ -571,27 +580,34 @@ async fn github_watch_loop(
                         let (fresh, new_since) =
                             crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
                         let mut seen_extra = Vec::new();
-                        // 通知失败不推进游标到该 issue 之后：retry_at 记下**所有**失败 issue 的
-                        // created_at 最小值（逐个覆盖取最后失败者会丢 created 更早者，见
-                        // github::retry_since），下一轮以它为 since 重新浮现（已通知的都在 seen 里，
-                        // 不会重复）。
                         let mut failed: Vec<&crate::github::GhIssue> = Vec::new();
-                        for iss in &fresh {
-                            let text = crate::github::notify_text(&repo, iss);
-                            match bridge.msgr.send_text(&notify_chat, &text).await {
-                                Ok(()) => {
-                                    seen_extra.push(iss.id);
-                                    crate::log!(
-                                        "[bot:{key}] 新 issue 已通知 #{}({})",
-                                        iss.number,
-                                        repo
-                                    );
-                                }
-                                Err(e) => {
-                                    failed.push(iss);
-                                    crate::log!(
-                                        "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
-                                    );
+                        if notify_chat.is_empty() {
+                            // 仅映射配置（评审 I1/M1）：issue 通知无目标 → 静默模式——
+                            // fresh 全进 seen、游标正常推进。空 chat_id 发送必失败，
+                            // 若走失败回退会让游标永久卡死（每轮重试刷屏 + 新 issue 雪球）。
+                            seen_extra.extend(fresh.iter().map(|i| i.id));
+                        } else {
+                            // 通知失败不推进游标到该 issue 之后：retry_at 记下**所有**失败
+                            // issue 的 created_at 最小值（逐个覆盖取最后失败者会丢 created
+                            // 更早者，见 github::retry_since），下一轮以它为 since 重新浮现
+                            // （已通知的都在 seen 里，不会重复）。
+                            for iss in &fresh {
+                                let text = crate::github::notify_text(&repo, iss);
+                                match bridge.msgr.send_text(&notify_chat, &text).await {
+                                    Ok(()) => {
+                                        seen_extra.push(iss.id);
+                                        crate::log!(
+                                            "[bot:{key}] 新 issue 已通知 #{}({})",
+                                            iss.number,
+                                            repo
+                                        );
+                                    }
+                                    Err(e) => {
+                                        failed.push(iss);
+                                        crate::log!(
+                                            "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -628,14 +644,39 @@ async fn github_watch_loop(
                         )
                         .await;
                         // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。
-                        // 边界假设：GitHub since 按 updated_at **严格大于** 过滤（"updated after"），
-                        // updated_at == since 的失败评论不会自然重浮——评论被编辑或依赖
-                        // 后续重试窗口时才会重取；Phase 1 issue 侧同款假设（created_at 回退），
-                        // 已知取舍，注释声明（评审 M3）。
+                        // 边界假设：GitHub issues/comments 的 since 文档为 **"at or after"**（含
+                        // 边界）——失败评论若 updated_at == since 会自然重浮、重试可靠；按悲观
+                        // 方向（严格大于）声明，行为安全；Phase 1 issue 侧同款假设，注释对齐
+                        // 文档措辞（评审 M3 备注 3）。
+                        // 失败重试上限（评审 M2）：per-comment 失败计数 ≥ GH_RETRY_MAX 放弃
+                        // （进 seen + 告警），消解「永久失败目标无限重试 + 已成功目标每轮
+                        // 重复私信」的放大器（at-least-once 有界化）。
                         // 空批（new_since=None）→ 保持原游标，绝不能写空串清掉（评审 C1）。
-                        let effective = batch.failed.iter().min().cloned().or(batch.new_since);
+                        let mut rewind: Option<String> = None;
+                        let mut final_seen = batch.seen_extra.clone();
+                        for (cid, updated_at) in &batch.failed {
+                            let n = cursor.comment_fails.get(cid).copied().unwrap_or(0) + 1;
+                            if n >= GH_RETRY_MAX {
+                                crate::log!(
+                                    "[bot:{key}] ⚠️ 评论 {repo}#{cid} 私信连续失败 {n} 次，放弃重试（目标可能已失效）"
+                                );
+                                cursor.comment_fails.remove(cid);
+                                final_seen.push(*cid);
+                            } else {
+                                cursor.comment_fails.insert(*cid, n);
+                                rewind = Some(match rewind {
+                                    Some(r) => r.min(updated_at.clone()),
+                                    None => updated_at.clone(),
+                                });
+                            }
+                        }
+                        // 成功处理（含放弃）清除失败计数
+                        for id in &final_seen {
+                            cursor.comment_fails.remove(id);
+                        }
+                        let effective = rewind.or(batch.new_since);
                         if let Some(e) = effective {
-                            cursor.comment_update(&repo, &e, batch.seen_extra);
+                            cursor.comment_update(&repo, &e, final_seen);
                         }
                         // @bot 自动处理：合成 Ev 走既有指令门（白名单→拉取→agent→双写）。
                         // 群 key 串行：与群消息共用通知群锁，长任务与手动「分析」同语义。
