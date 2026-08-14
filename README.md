@@ -83,5 +83,6 @@ Windows 包为免管理员安装。有问题欢迎提 [Issue](https://github.com
 
 ## 开发者文档
 
+- [GitHub 协同模型](docs/github-collab.md)：issue 线程 = 唯一记录面、IM = 通知与指令入口；全员账号准入前提；Phase 1 已实现指令/通知与 Phase 2 范围（含「自动建群=伪需求」的评审结论）。
 - [会话隔离机制（群 / 话题 / 用户）](docs/session-isolation.md)：三平台 chat_id 规则、隔离矩阵、话题维度结论与最小改动方案。
 - 跨会话投递（issue #21）：开关 `config.json#cross_delivery_enabled`（设置窗可勾选，默认关）；agent 用 `$ABB_BIN deliver` 投递，CLI 入队 `~/.agent-bridge/deliveries.json`（0600），service 消费循环经路由表发送；微信目标失败落其 outbox 补发、其余失败回源报错；同来源/目标/文本（+附件 sha256）10 分钟防循环去重，定时任务（`job add --to`）豁免。
