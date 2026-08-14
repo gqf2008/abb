@@ -413,131 +413,6 @@ impl FeishuClient {
         let open_id = bot["open_id"].as_str().unwrap_or("").to_string();
         Ok((name, open_id))
     }
-
-    // ── 流式打字机（#42）：CardKit 流式卡片四步 ─────────────────────────────
-    // 创建实体（streaming_mode 开）→ im/v1/messages 发送 → PUT elements 累积更新 →
-    // PUT settings 关流式。需要机器人开通 cardkit:card:write 权限，未开通时 code!=0，
-    // 调用方（桥）回落逐条发送。注意：CardKit 写接口都要求 sequence 严格递增（乐观并发）。
-    //
-    // 平台侧限制：单卡片 10 次/s（桥按 500ms 节流）；流式闲置 10 分钟自动关闭
-    // （任务结束必须显式关，见 messenger::FeishuMessenger::stream_finalize）；
-    // 卡片实体仅可发送一次；流式卡片不可转发。
-
-    /// ① 创建流式卡片实体，返回 card_id。
-    pub async fn card_create_streaming(&self, initial_text: &str) -> Result<String> {
-        let token = self.tenant_token().await?;
-        let resp: serde_json::Value = self
-            .http
-            .post(format!("{API_BASE}/cardkit/v1/cards"))
-            .bearer_auth(&token)
-            .json(&json!({
-                "type": "card_json",
-                "data": serde_json::to_string(&streaming_card_json(initial_text))?,
-            }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            anyhow::bail!(
-                "cardkit 创建卡片失败 code={:?} msg={:?}（可能未开通 cardkit:card:write 权限）",
-                resp.get("code"),
-                resp.get("msg")
-            );
-        }
-        resp["data"]["card_id"]
-            .as_str()
-            .map(|s| s.to_string())
-            .context("cardkit 响应缺 card_id")
-    }
-
-    /// ② 把卡片实体发到会话（msg_type=interactive 引用 card_id；实体仅可发送一次）。
-    pub async fn card_send(&self, chat_id: &str, card_id: &str) -> Result<()> {
-        let token = self.tenant_token().await?;
-        let resp: serde_json::Value = self
-            .http
-            .post(format!("{API_BASE}/im/v1/messages?receive_id_type=chat_id"))
-            .bearer_auth(&token)
-            .json(&json!({
-                "receive_id": chat_id,
-                "msg_type": "interactive",
-                "content": serde_json::to_string(&json!({
-                    "type": "card",
-                    "data": {"card_id": card_id},
-                }))?,
-            }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            anyhow::bail!(
-                "卡片消息发送失败 code={:?} msg={:?}",
-                resp.get("code"),
-                resp.get("msg")
-            );
-        }
-        Ok(())
-    }
-
-    /// ③ 累积**全文**更新卡片 markdown 元素（平台自动算增量渲染打字机效果）。
-    pub async fn card_update_content(
-        &self,
-        card_id: &str,
-        full_text: &str,
-        sequence: u64,
-    ) -> Result<()> {
-        let token = self.tenant_token().await?;
-        let resp: serde_json::Value = self
-            .http
-            .put(format!(
-                "{API_BASE}/cardkit/v1/cards/{card_id}/elements/{STREAM_ELEMENT_ID}/content"
-            ))
-            .bearer_auth(&token)
-            .json(&json!({
-                "content": full_text,
-                "sequence": sequence,
-            }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            anyhow::bail!(
-                "卡片内容更新失败 code={:?} msg={:?}",
-                resp.get("code"),
-                resp.get("msg")
-            );
-        }
-        Ok(())
-    }
-
-    /// ④ 关流式（streaming_mode=false）。任务结束必调——否则平台侧 10 分钟才自动关。
-    pub async fn card_close_streaming(&self, card_id: &str, sequence: u64) -> Result<()> {
-        let token = self.tenant_token().await?;
-        let resp: serde_json::Value = self
-            .http
-            .put(format!("{API_BASE}/cardkit/v1/cards/{card_id}/settings"))
-            .bearer_auth(&token)
-            .json(&json!({
-                "settings": serde_json::to_string(&json!({
-                    "config": {"streaming_mode": false},
-                }))?,
-                "sequence": sequence,
-            }))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            anyhow::bail!(
-                "卡片关流式失败 code={:?} msg={:?}",
-                resp.get("code"),
-                resp.get("msg")
-            );
-        }
-        Ok(())
-    }
 }
 
 /// 构造回复消息请求体（纯函数，便于单测断言 reply_in_thread / content）。
@@ -546,32 +421,6 @@ fn reply_body(body_text: &str) -> serde_json::Value {
         "msg_type": "text",
         "content": serde_json::to_string(&json!({"text": body_text})).unwrap_or_default(),
         "reply_in_thread": true,
-    })
-}
-
-/// 流式卡片内 markdown 元素的 element_id（#42 更新内容时按它寻址）。
-pub const STREAM_ELEMENT_ID: &str = "stream_md";
-
-/// 构造流式卡片 JSON（card_json 2.0，纯函数便于单测）：
-/// streaming_mode 开 + 打字机渲染参数；内容全部落在唯一 markdown 元素上，
-/// 后续 PUT elements/{element_id}/content 以累积全文驱动原地滚动。
-fn streaming_card_json(text: &str) -> serde_json::Value {
-    json!({
-        "schema": "2.0",
-        "config": {
-            "streaming_mode": true,
-            "streaming_config": {
-                "print_frequency_ms": 70,
-                "print_step": 2,
-                "print_strategy": "fast",
-            },
-            "update_multi": true,
-        },
-        "body": {
-            "elements": [
-                {"tag": "markdown", "element_id": STREAM_ELEMENT_ID, "content": text},
-            ],
-        },
     })
 }
 
@@ -709,21 +558,5 @@ mod tests {
         let p = parse_content("not json");
         assert_eq!(p.text, "");
         assert!(p.resources.is_empty());
-    }
-
-    #[test]
-    fn streaming_card_json_shape() {
-        // #42：流式卡片结构 —— streaming_mode 开、唯一 markdown 元素带 element_id 供更新寻址
-        let c = streaming_card_json("⏳ 思考中…");
-        assert_eq!(c["schema"], "2.0");
-        assert_eq!(c["config"]["streaming_mode"], true);
-        let el = &c["body"]["elements"][0];
-        assert_eq!(el["tag"], "markdown");
-        assert_eq!(el["element_id"], STREAM_ELEMENT_ID);
-        assert_eq!(el["content"], "⏳ 思考中…");
-        // 序列化再反序列化不丢结构（create 时 data 是字符串内嵌 JSON）
-        let s = serde_json::to_string(&c).unwrap();
-        let back: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(back["config"]["streaming_mode"], true);
     }
 }

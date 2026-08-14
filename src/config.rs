@@ -43,12 +43,6 @@ pub struct BotConfig {
     /// per-bot 独立：改飞书 bot 的后端不会再动到微信 bot。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
-    /// 流式打字机输出开关（#42）：true = agent 中途输出累积进同一条消息原地更新
-    /// （飞书 CardKit / 钉钉 AI 卡片流式）；false = 任务完成后只发最终结果一条。
-    /// 仅飞书/钉钉有意义；微信恒为「只发最终结果」（见 stream_output_enabled）。
-    /// 默认 true：保持「能看到过程」的既有语义，形态升级为单条滚动。
-    #[serde(default = "default_true", skip_serializing_if = "is_stream_on")]
-    pub stream_output: bool,
     /// 飞书：**owner（管理员）** 白名单（逗号/分号/空白分隔多个 open_id）。负责管理 bot、
     /// 生成授权码。与「授权者」（granted_ids，授权码添加）分开。微信 bot 忽略。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -98,10 +92,6 @@ pub struct BotConfig {
     /// 空 = 发送时用 app_id 兜底（对绝大多数企业内部应用机器人成立）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ding_robot_code: String,
-    /// 钉钉：AI 卡片模板 ID（#42 流式打字机）。需在钉钉开放平台为本应用创建互动卡片模板后
-    /// 把模板 ID 填这里；空 = 流式不可用，回落逐条发送中途输出。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub ding_card_template_id: String,
     /// 该 bot 的模型供应商名（指向 Config.providers[].name）。空 = 跟随全局 default_provider。
     /// per-bot 独立：不同 bot 可走不同 key/模型（如飞书用官方 key、微信用 deepseek）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -140,7 +130,6 @@ impl Default for BotConfig {
             wx_cdn_base_url: String::new(),
             ding_user_id: String::new(),
             ding_robot_code: String::new(),
-            ding_card_template_id: String::new(),
             ding_owner_ids: String::new(),
             ding_granted_ids: String::new(),
             ding_open_access: false,
@@ -152,7 +141,6 @@ impl Default for BotConfig {
             granted_ids: String::new(),
             granted_infos: Vec::new(),
             open_access: false,
-            stream_output: true,
         }
     }
 }
@@ -164,11 +152,6 @@ pub(crate) fn default_kind() -> String {
 /// skip_serializing_if：false（默认私有）不落盘，旧 config 兼容。
 fn not_open(b: &bool) -> bool {
     !*b
-}
-
-/// skip_serializing_if：true（流式开=默认）不落盘，旧 config 兼容（#42）。
-fn is_stream_on(b: &bool) -> bool {
-    *b
 }
 
 /// 授权码有效期（秒）：30 分钟。过期码仍保留在 pending_codes 里直到被消费/重新生成，
@@ -318,12 +301,6 @@ impl BotConfig {
     /// 是否钉钉通道。
     pub fn is_dingtalk(&self) -> bool {
         self.kind == "dingtalk"
-    }
-
-    /// 流式打字机是否生效（#42，单一事实源）：开关开 **且** 通道支持（飞书/钉钉）。
-    /// 微信恒 false —— 无论开关怎么配，微信只发最终结果（需求方拍板）。
-    pub fn stream_output_enabled(&self) -> bool {
-        self.stream_output && !self.is_wechat()
     }
 
     /// 凭证是否齐备可跑（单一事实源：service 启动门槛 + Config::missing 都用它）。
@@ -977,40 +954,6 @@ mod tests {
             serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x","app_secret":"s"}"#).unwrap();
         assert!(b4.ding_user_id.is_empty());
         assert!(b4.ding_robot_code.is_empty());
-    }
-
-    #[test]
-    fn stream_output_config() {
-        // 旧 config（无 stream_output 字段）→ 默认开（#42 保持「能看到过程」的既有语义）
-        let b: BotConfig =
-            serde_json::from_str(r#"{"kind":"feishu","app_id":"x","app_secret":"s"}"#).unwrap();
-        assert!(b.stream_output);
-        assert!(b.stream_output_enabled());
-
-        // 显式关 → 只发最终结果
-        let off: BotConfig = serde_json::from_str(
-            r#"{"kind":"feishu","app_id":"x","app_secret":"s","stream_output":false}"#,
-        )
-        .unwrap();
-        assert!(!off.stream_output_enabled());
-
-        // 微信恒为「只发最终结果」——开关开也不生效（需求方拍板）
-        let wx: BotConfig =
-            serde_json::from_str(r#"{"kind":"wechat","wx_token":"t","wx_user_id":"u"}"#).unwrap();
-        assert!(wx.stream_output, "字段本身默认 true");
-        assert!(!wx.stream_output_enabled(), "微信必须抑制流式");
-
-        // 钉钉默认开；卡片模板 ID 旧 config 为空
-        let ding: BotConfig =
-            serde_json::from_str(r#"{"kind":"dingtalk","app_id":"k","app_secret":"s"}"#).unwrap();
-        assert!(ding.stream_output_enabled());
-        assert!(ding.ding_card_template_id.is_empty());
-
-        // 序列化：默认值（开）不落盘，显式关落盘（与 open_access 同款旧 config 兼容策略）
-        let json = serde_json::to_string(&BotConfig::default()).unwrap();
-        assert!(!json.contains("stream_output"), "默认开不应写盘");
-        let json_off = serde_json::to_string(&off).unwrap();
-        assert!(json_off.contains("\"stream_output\":false"));
     }
 
     #[test]

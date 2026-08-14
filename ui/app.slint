@@ -99,8 +99,6 @@ export struct BotRow {
     ding-granted: [OwnerRow], // 钉钉：授权者列表（授权码添加，名字 + staffId）
     ding-open-access: bool,  // 钉钉：true=任何人都可以对话；false=仅授权用户
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
-    ding-card-template-id: string, // 钉钉：AI 卡片模板 ID（#42 流式打字机；空=流式不可用）
-    stream-output: bool,     // #42 流式打字机输出开关（飞书/钉钉有意义；微信恒只发最终结果）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -439,7 +437,6 @@ export component SettingsWindow inherits Window {
     callback copy-owner-code(string);          // 复制指定 role 的授权码到剪贴板
     callback remove-granted(int, int); // 取消授权：bot idx + 授权者下标（从授权者白名单移除）
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
-    callback set-stream-output(int, bool); // #42 流式打字机输出开关（飞书/钉钉；保存重启后生效）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
     callback recheck-deps();            // 重新检测依赖是否已装
@@ -835,17 +832,6 @@ export component SettingsWindow inherits Window {
                                                         selected => { root.bot-field-edited(root.selected, "provider", self.current-value); }
                                                     }
                                                 }
-                                                // #42 流式打字机输出（仅飞书/钉钉有意义；微信恒只发最终结果，不显示此开关）。
-                                                // 勾选态回写走 set-stream-output（同「启用此 bot」：handler 里 sync_model 重建
-                                                // CheckBox 实例，绕开 slint 用户交互移除 checked 绑定的坑）。
-                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind != "wechat": Row {
-                                                    Text { text: "流式输出"; width: 80px; vertical-alignment: center; }
-                                                    CheckBox {
-                                                        text: "打字机模式：多轮输出原地更新（关=只发最终结果）";
-                                                        checked: root.bots[root.selected].stream-output;
-                                                        toggled => { root.set-stream-output(root.selected, self.checked); }
-                                                    }
-                                                }
                                                 // ── 飞书字段（owner/授权者/对话权限）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "对话权限"; width: 80px; vertical-alignment: center; }
@@ -1015,17 +1001,6 @@ export component SettingsWindow inherits Window {
                                                         placeholder-text: "留空=默认 AppKey（个别后台单独展示才填）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "ding_robot_code", self.text); }
-                                                    }
-                                                }
-                                                // #42 流式打字机用的 AI 卡片模板：需在钉钉开放平台为本应用创建互动卡片
-                                                // 模板（含名为 content 的 markdown 变量）；留空则流式不可用、回落逐条发送。
-                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
-                                                    Text { text: "卡片模板 ID"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].ding-card-template-id;
-                                                        placeholder-text: "流式打字机用；留空=回落逐条发送";
-                                                        horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "ding_card_template_id", self.text); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
