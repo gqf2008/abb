@@ -259,17 +259,28 @@ impl SessionStore {
         sid
     }
 
-    /// 覆盖该 chat 当前后端的 session_id（codex 用：首轮 exec 抓到真实 thread_id 后回存，供后续 resume）。
-    pub fn set_session_id(&self, chat_id: &str, session_id: &str) {
+    /// set_session_id 的 CAS 版本：仅当该 chat 当前槽位的 session_id == expected 时回存，
+    /// 返回是否真的回存。任务运行中槽位被 /new 或 CLI `session reset` 换走时（槽位已不是
+    /// 本次任务启动时的会话），不得把旧任务的 thread_id 写进新槽位——否则桥的
+    /// mark_started_if 会匹配旧 thread，把新会话标成旧线程的 started，下一条 resume
+    /// 旧线程、/new 失效（#49 审查：codex 首轮运行中 /new 的交错场景）。
+    /// （原无条件覆盖版 set_session_id 已被本方法取代：唯一调用方是 codex 首轮回存，
+    /// 该场景必须先验证槽位身份再写。）
+    pub fn set_session_id_if(&self, chat_id: &str, expected: &str, session_id: &str) -> bool {
         self.refresh();
         let mut data = self.data.lock().unwrap();
-        if let Some(entry) = data.get_mut(chat_id) {
-            let slot = Self::slot_mut(entry, &self.current_backend);
-            if slot.session_id != session_id {
-                slot.session_id = session_id.to_string();
-                self.save_locked(&data);
-            }
+        let Some(entry) = data.get_mut(chat_id) else {
+            return false;
+        };
+        let slot = Self::slot_mut(entry, &self.current_backend);
+        if slot.session_id != expected {
+            return false;
         }
+        if slot.session_id != session_id {
+            slot.session_id = session_id.to_string();
+            self.save_locked(&data);
+        }
+        true
     }
 
     /// 该 chat 当前后端是否已开过首轮（只读查询）。bridge 走合并快照，此方法保留作
@@ -415,6 +426,37 @@ mod tests {
         let disk = std::fs::read_to_string(&path).unwrap();
         assert!(disk.contains(&sid));
         assert!(disk.contains("\"started\": false"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_session_id_if_cas_guards_slot_identity() {
+        // #49 审查：codex 首轮回存必须 CAS——运行中槽位被 /new / CLI reset 换走时，
+        // 不得把旧任务 thread 写进新槽位（否则 mark_started_if 匹配旧 thread，
+        // 新会话 resume 旧线程、/new 失效）。
+        let dir = std::env::temp_dir().join(format!("abb-sessions-cas-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("codex", path.clone());
+
+        // 首轮回存：槽位仍是任务启动时的占位 UUID → CAS 成功
+        let placeholder = store.ensure_session("oc_x");
+        assert!(store.set_session_id_if("oc_x", &placeholder, "tid-real-1"));
+        let (cur, _) = store.ensure_with_started("oc_x");
+        assert_eq!(cur, "tid-real-1", "CAS 成功后槽位是真实 thread");
+
+        // 模拟运行中 /new：槽位被换走 → 旧任务（持占位快照）的回存必须被拒
+        let fresh = store.reset_session("oc_x");
+        assert_ne!(fresh, placeholder);
+        assert!(
+            !store.set_session_id_if("oc_x", &placeholder, "tid-stale"),
+            "槽位已换走，旧任务的回存必须被拒"
+        );
+        let (cur2, _) = store.ensure_with_started("oc_x");
+        assert_eq!(cur2, fresh, "新槽位 UUID 不被旧任务污染");
+
+        // 新会话（fresh）自己的回存正常
+        assert!(store.set_session_id_if("oc_x", &fresh, "tid-real-2"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

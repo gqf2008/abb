@@ -54,6 +54,28 @@ pub fn atomic_write_text(path: &std::path::Path, text: &str) -> std::io::Result<
     Ok(())
 }
 
+/// 原子写敏感文本文件：uuid 唯一 tmp + rename + 落盘前收紧 0o600（unix）。
+/// 与 `atomic_write_text` 的差异：唯一 tmp 防并发写方（如 CLI 与 service）互踩同一 tmp
+/// 文件；0o600 对齐 config.json 的敏感工件权限（历史/迁移标记等对话内容）。
+/// 失败时清理残留 tmp（历史.rs 的 write_entries/set_marker 与 sessions.rs save_locked
+/// 原先各自手写此模式，收敛为共享实现）。
+pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// 统一日志到 stdout（带时间戳，与 Python 版一致，落 logs/bridge.out）。
 #[macro_export]
 macro_rules! log {

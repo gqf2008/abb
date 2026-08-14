@@ -14,6 +14,8 @@
 //!   marker 按 session_id 判定，/new、CLI reset、agent 自愈换 UUID 都自动使 marker 失效，
 //!   无需额外清理路径。CLI `session reset` 不清历史（与 /new 不对称，有意：reset 后
 //!   注入续命恰是「会话丢失自愈」的目标语义）。
+//! - 定时任务（run_job）不经 handle、不走本日志（每次全新 session 是既定设计，
+//!   见 service.rs run_job 注释）——跨后端迁移只覆盖聊天轮次。
 //! - IO 失败一律只 log 警告：历史是增强能力，绝不阻塞聊天主链路。
 
 use std::path::PathBuf;
@@ -54,7 +56,7 @@ const ENTRY_MAX: usize = 300;
 /// 条数上限（唯一容量闸：50 条 × 300 字 = 上限约 1.5 万字符，单一闸完全可测；
 /// 原设计草案的「条数 + 字符」双闸在 300 字截断下数学冗余，收敛为单闸）。
 const ENTRIES_MAX: usize = 50;
-/// 注入 prompt 的字符预算（bridge 调 inject_block 时传参，这里只作文档默认值）。
+/// 注入 prompt 的字符预算（bridge 生产路径传参的默认值；可按需收紧）。
 pub const INJECT_CHARS_DEFAULT: usize = 6_000;
 
 /// 一个会话 key 的历史日志。无内存态（stateless 文件 API）：每次操作读盘→改→原子写回。
@@ -116,18 +118,15 @@ impl History {
             text.push_str(&serde_json::to_string(e).unwrap_or_default());
             text.push('\n');
         }
-        let tmp = self
-            .path
-            .with_extension(format!("jsonl.tmp.{}", uuid::Uuid::new_v4()));
-        let ok = std::fs::write(&tmp, text).is_ok() && {
-            set_private(&tmp);
-            std::fs::rename(&tmp, &self.path).is_ok()
-        };
-        if !ok {
-            let _ = std::fs::remove_file(&tmp);
-            crate::log!("[history] ⚠️ 历史写入失败 path={}", trunc_path(&self.path));
+        // uuid tmp + rename + 0o600：与 sessions.rs save_locked 同款语义，收敛为共享
+        // 实现 atomic_write_sensitive（审查：第四个手写副本不再新增）。
+        match crate::atomic_write_sensitive(&self.path, &text) {
+            Ok(()) => true,
+            Err(_) => {
+                crate::log!("[history] ⚠️ 历史写入失败 path={}", trunc_path(&self.path));
+                false
+            }
         }
-        ok
     }
 
     fn append(&self, mid: &str, user: bool, backend: &str, text: &str) -> bool {
@@ -161,11 +160,7 @@ impl History {
         self.append(mid, false, backend, text)
     }
 
-    pub fn has_entries(&self) -> bool {
-        !self.read_entries().is_empty()
-    }
-
-    /// 全量条目（端到端测试断言用；生产读取走 inject_block/has_entries）。
+    /// 全量条目（端到端测试断言用；生产读取走 inject_block）。
     #[allow(dead_code)] // 与 SessionStore::ensure_session 同款：仅测试使用
     pub fn entries(&self) -> Vec<HistoryEntry> {
         self.read_entries()
@@ -197,23 +192,16 @@ impl History {
             ts: crate::chrono_lite::unix_secs(),
         };
         match serde_json::to_string(&m) {
-            Ok(t) => {
-                let tmp = self
-                    .marker_path
-                    .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
-                let ok = std::fs::write(&tmp, t).is_ok() && {
-                    set_private(&tmp);
-                    std::fs::rename(&tmp, &self.marker_path).is_ok()
-                };
-                if !ok {
-                    let _ = std::fs::remove_file(&tmp);
+            Ok(t) => match crate::atomic_write_sensitive(&self.marker_path, &t) {
+                Ok(()) => true,
+                Err(_) => {
                     crate::log!(
                         "[history] ⚠️ 迁移标记写入失败 path={}",
                         trunc_path(&self.marker_path)
                     );
+                    false
                 }
-                ok
-            }
+            },
             Err(_) => false,
         }
     }
@@ -250,6 +238,17 @@ impl History {
             return (String::new(), 0);
         }
         window.reverse(); // 输出旧 → 新
+                          // 窗口不能以孤立的助手轮开头（其用户轮已被预算边界/条目淘汰切掉，见 append
+                          // 的奇数淘汰）——模型看到「无问之答」会困惑，宁可少一轮。
+        while let Some((e, _)) = window.first() {
+            if e.user {
+                break;
+            }
+            window.remove(0);
+        }
+        if window.is_empty() {
+            return (String::new(), 0);
+        }
         let rounds = window.iter().filter(|(e, _)| e.user).count();
         let mut block = String::from(
             "[历史上下文]\n（以下是本会话切换前/丢失前的最近对话记录，供衔接背景；请基于最新消息继续）\n\n",
@@ -267,7 +266,9 @@ impl History {
 /// 文件名转义：仅保留 [a-z0-9_-]（字母统一小写——APFS/NTFS 默认大小写不敏感，统一小写
 /// 使跨平台行为一致：仅大小写不同的 key 在这些卷上本来就会坍缩为同一文件），其余字节
 /// 按 %XX（大写十六进制）。':' → "%3A"。可逆且单射，无路径分隔符风险（Windows 安全）。
-/// Windows 保留设备名（CON/NUL/COM1-9/LPT1-9/AUX/PRN）加 "_" 前缀防吞文件（审查 M-1）。
+/// Windows 保留设备名（CON/NUL/COM1-9/LPT1-9/AUX/PRN）加 "%5F"（'_' 的转义形态）前缀
+/// 防吞文件（审查 M-1）——前缀必须取转义形态：若直接加 '_'，自然键 "_con"（'_' 在允许
+/// 集内原样保留）会与保留键 "con" 坍缩到同一文件，破坏单射（#49 审查）。
 fn escape_key(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for b in key.bytes() {
@@ -285,7 +286,7 @@ fn escape_key(key: &str) -> String {
         "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     ];
     if RESERVED.contains(&out.as_str()) {
-        out.insert(0, '_');
+        out.insert_str(0, "%5F");
     }
     out
 }
@@ -300,15 +301,6 @@ fn trunc_path(p: &std::path::Path) -> String {
         .rev()
         .collect()
 }
-
-/// 落盘前收紧到 0o600（unix）：对话历史与 config.json 同级的敏感工件（审查 M-2）。
-#[cfg(unix)]
-fn set_private(p: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn set_private(_p: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -440,9 +432,39 @@ mod tests {
         );
         // 大小写折叠：大小写不敏感卷（APFS/NTFS）行为跨平台一致（审查 M-1）
         assert_eq!(escape_key("OC_x"), "oc_x");
-        // Windows 保留设备名加前缀防吞文件
-        assert_eq!(escape_key("CON"), "_con");
-        assert_eq!(escape_key("com1"), "_com1");
-        assert_eq!(escape_key("aux"), "_aux");
+        // Windows 保留设备名加转义前缀防吞文件（%5F = '_' 的转义形态，不破坏单射）
+        assert_eq!(escape_key("CON"), "%5Fcon");
+        assert_eq!(escape_key("com1"), "%5Fcom1");
+        assert_eq!(escape_key("aux"), "%5Faux");
+        // 单射：保留名前缀不与自然键冲突（"_con" 的 '_' 原样保留，二者必须不同文件）
+        assert_ne!(
+            escape_key("con"),
+            escape_key("_con"),
+            "保留键与自然键不坍缩"
+        );
+        assert_ne!(escape_key("aux"), escape_key("_aux"));
+        assert_ne!(escape_key("CON"), escape_key("_con"));
+    }
+
+    #[test]
+    fn inject_window_never_starts_with_assistant() {
+        let h = temp_history("orphan", "oc_x");
+        // u1 超长（300 字截断），a1 中长，u2/a2 短。预算 220：装得下 a2+u2+a1
+        // （10+10+188），u1（308）装不下且剩余 <80 走 break → 窗口（旧→新）原会以
+        // 孤立的「助手: 答一」开头（其用户轮被预算切掉）——fix 后应弹出 a1。
+        h.append_user("u1", "claude", &"问一".repeat(300));
+        h.append_assistant("u1", "claude", &"答一".repeat(90));
+        h.append_user("u2", "claude", "问二");
+        h.append_assistant("u2", "claude", "答二");
+        let (block, n) = h.inject_block("", 220);
+        assert!(
+            !block.starts_with("助手: "),
+            "窗口不以孤立助手轮开头: {block}"
+        );
+        assert!(!block.contains("答一"), "孤立助手轮被弹出: {block}");
+        assert!(block.contains("问二"), "较新的用户轮保留: {block}");
+        assert!(block.contains("答二"), "配对助手轮保留: {block}");
+        assert_eq!(n, 1, "N=窗口内用户轮数");
+        h.clear();
     }
 }

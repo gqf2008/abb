@@ -135,6 +135,11 @@ pub trait AgentRunner: Send + Sync {
         session_id: &str,
         resume: bool,
         chat_id: &str,
+        // 会话隔离 key（话题消息 = "chat:thread"，#14）。session 存储按 key 记账
+        // （桥的 ensure_with_started/mark_started_if 都用 key）——回存真实 thread_id /
+        // claude 重建换 UUID 必须写同一 key 的槽位，否则话题消息永远 mark 不上、
+        // 且会把话题的 thread 写进主 chat 槽位（#49 审查：codex+话题）。
+        session_key: &str,
         bot_key: &str,
         role: crate::config::SenderRole,
         sessions: Option<&crate::sessions::SessionStore>,
@@ -156,6 +161,7 @@ impl AgentRunner for RealAgentRunner {
         session_id: &str,
         resume: bool,
         chat_id: &str,
+        session_key: &str,
         bot_key: &str,
         role: crate::config::SenderRole,
         sessions: Option<&crate::sessions::SessionStore>,
@@ -164,7 +170,17 @@ impl AgentRunner for RealAgentRunner {
     ) -> Result<RunOutcome, String> {
         // 裸函数调用解析到本模块的自由函数 run（trait method 必须经 `.` 调用，不会递归）。
         run(
-            backend, prompt, session_id, resume, chat_id, bot_key, role, sessions, progress, cancel,
+            backend,
+            prompt,
+            session_id,
+            resume,
+            chat_id,
+            session_key,
+            bot_key,
+            role,
+            sessions,
+            progress,
+            cancel,
         )
         .await
     }
@@ -370,6 +386,7 @@ pub async fn run(
     session_id: &str,
     resume: bool,
     chat_id: &str,
+    session_key: &str,
     bot_key: &str,
     role: crate::config::SenderRole,
     sessions: Option<&crate::sessions::SessionStore>,
@@ -435,11 +452,14 @@ pub async fn run(
                 // codex 首轮（或回退重建）抓到真实 thread_id → 回存，供后续轮 resume。
                 // sid 同步换成真实值：RunOutcome 返回的就是它——桥的 mark_started_if 按
                 // session_id 校验身份，返回旧占位 UUID 会让 codex 永远 mark 不上
-                // （started 恒 false → 每轮都当首轮新开 thread、上下文全丢；#49 审查 I-1）
+                // （started 恒 false → 每轮都当首轮新开 thread、上下文全丢；#49 审查 I-1）。
+                // 回存走 CAS（set_session_id_if）：仅当槽位仍是我们启动时的会话才写——
+                // 运行中被 /new 或 CLI reset 换走时不得把旧任务 thread 写进新槽位，
+                // 否则 mark_started_if 匹配旧 thread、新会话 resume 旧线程（#49 审查）。
                 if backend == Backend::Codex {
                     if let (Some(tid), Some(store)) = (&out.thread_id, sessions) {
                         if tid != &sid {
-                            store.set_session_id(chat_id, tid);
+                            store.set_session_id_if(session_key, &sid, tid);
                             sid = tid.clone();
                         }
                     }
@@ -470,9 +490,11 @@ pub async fn run(
                 }
                 // #6/#7：claude 会话槽位被 jsonl 残留占用（already in use）或启动挂起被终止 →
                 // 同 UUID 重试必然再失败，换新 UUID（started 复位 false）重建一次。
+                // reset 按 session_key（话题=chat:thread，#14）：与桥的 mark_started_if 同 key，
+                // 否则话题消息重建会换掉主 chat 的槽位（#49 审查）。
                 if backend == Backend::Claude && attempt == 0 && claude_needs_fresh_session(&e) {
                     let new_sid = if let Some(store) = sessions {
-                        store.reset_session(chat_id)
+                        store.reset_session(session_key)
                     } else {
                         uuid::Uuid::new_v4().to_string()
                     };
