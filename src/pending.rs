@@ -30,6 +30,10 @@ pub struct PendingItem {
     #[serde(default)]
     pub quoted: crate::messenger::QuotedContent,
     pub attachments: Vec<AttachmentMeta>,
+    /// 发送者角色（重放时按原角色走受限/全权限 agent 分支）。
+    /// serde default 兼容旧 pending.json（无角色时代 → Owner 全权限，与现状一致）。
+    #[serde(default)]
+    pub role: crate::config::SenderRole,
     /// 入队时间（unix 秒），启动重放按此排序保持原先后顺序。
     pub created_at: u64,
 }
@@ -114,6 +118,7 @@ mod tests {
             text: "hi".into(),
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
             created_at: at,
         }
     }
@@ -181,6 +186,11 @@ mod tests {
             store.snapshot()[0].quoted.text.is_empty()
                 && store.snapshot()[0].quoted.attachments.is_empty(),
             "旧文件缺 quoted 应默认空"
+        );
+        // 旧文件无 role 字段 → 默认 Owner（重放时走全权限，与现状一致）
+        assert_eq!(
+            store.snapshot()[0].role,
+            crate::config::SenderRole::Owner
         );
         let _ = std::fs::remove_file(&p);
     }

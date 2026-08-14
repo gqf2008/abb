@@ -42,6 +42,10 @@ pub struct Job {
     /// 目标 bot_key 空 = 本 bot；跨 bot 目标可把任务结果投到其它 bot 的会话。
     #[serde(default)]
     pub targets: Vec<JobTarget>,
+    /// 创建者角色：执行时按此走受限/全权限 agent 分支（授权者建的任务不得借 owner
+    /// 全权限执行）。serde default 兼容旧 jobs.json（无角色 → Owner，与现状一致）。
+    #[serde(default)]
+    pub role: crate::config::SenderRole,
 }
 
 pub struct JobStore {
@@ -358,6 +362,7 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Option<Field> {
 }
 
 /// claude 结构化输出的校验 + 归一成 Job（bridge.rs 调用）。
+#[allow(clippy::too_many_arguments)]
 pub fn job_from_parsed(
     kind: &str,
     time: Option<&str>,
@@ -366,6 +371,7 @@ pub fn job_from_parsed(
     chat_id: &str,
     note: &str,
     targets: Vec<JobTarget>,
+    role: crate::config::SenderRole,
 ) -> Result<Job> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -392,6 +398,7 @@ pub fn job_from_parsed(
         chat_id: chat_id.to_string(),
         note: note.to_string(),
         targets,
+        role,
     })
 }
 
@@ -494,6 +501,7 @@ mod tests {
             "oc_x",
             "原句",
             Vec::new(),
+            crate::config::SenderRole::Owner,
         )
         .unwrap();
         assert!(!j.is_due(&dt(2026, 8, 5, 8, 59)));
@@ -510,14 +518,15 @@ mod tests {
             "提醒",
             "oc",
             "n",
-            Vec::new()
+            Vec::new(),
+            crate::config::SenderRole::Granted,
         )
         .is_ok());
-        assert!(job_from_parsed("cron", None, Some("bad"), "提醒", "oc", "n", Vec::new()).is_err());
-        assert!(job_from_parsed("once", None, None, "提醒", "oc", "n", Vec::new()).is_err()); // 缺 time
-        assert!(job_from_parsed("x", None, None, "提醒", "oc", "n", Vec::new()).is_err());
+        assert!(job_from_parsed("cron", None, Some("bad"), "提醒", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err());
+        assert!(job_from_parsed("once", None, None, "提醒", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err()); // 缺 time
+        assert!(job_from_parsed("x", None, None, "提醒", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err());
         assert!(
-            job_from_parsed("cron", None, Some("0 9 * * *"), "", "oc", "n", Vec::new()).is_err()
+            job_from_parsed("cron", None, Some("0 9 * * *"), "", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err()
         );
         // 空 prompt
     }
@@ -541,6 +550,8 @@ mod tests {
         let text = r#"{"id":"a","kind":"cron","schedule":"0 9 * * *","prompt":"p","chat_id":"oc","note":"n"}"#;
         let j: Job = serde_json::from_str(text).unwrap();
         assert!(j.targets.is_empty());
+        // 旧文件无 role 字段 → 默认 Owner（执行时走全权限，与现状一致）
+        assert_eq!(j.role, crate::config::SenderRole::Owner);
         // 有 targets 时往返不丢
         let j2 = Job {
             id: "a".into(),
@@ -553,10 +564,13 @@ mod tests {
                 bot_key: "feishu".into(),
                 chat_id: "oc_2".into(),
             }],
+            role: crate::config::SenderRole::Granted,
         };
         let s = serde_json::to_string(&j2).unwrap();
         let back: Job = serde_json::from_str(&s).unwrap();
         assert_eq!(back.targets.len(), 1);
         assert_eq!(back.targets[0].bot_key, "feishu");
+        // role 往返保真（granted 任务执行时走受限分支）
+        assert_eq!(back.role, crate::config::SenderRole::Granted);
     }
 }

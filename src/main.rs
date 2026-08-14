@@ -454,6 +454,10 @@ fn run_job_cli(args: &[String]) -> i32 {
                 return 1;
             }
             let note = note.unwrap_or_else(|| prompt.clone());
+            // 创建者角色：agent 会话 spawn 时注入 env（桥 → claude/codex → $ABB_BIN）。
+            // 授权者建的任务落 granted，执行时走受限分支——否则可借 owner 全权限跑
+            // 「读敏感文件」任务绕过隔离。手动跑 CLI 无 env → Owner（与现状一致）。
+            let role = config::SenderRole::parse(&std::env::var("AGENT_BRIDGE_SENDER_ROLE").unwrap_or_default());
             match schedule::job_from_parsed(
                 kind,
                 time_arg.as_deref(),
@@ -462,6 +466,7 @@ fn run_job_cli(args: &[String]) -> i32 {
                 &chat_id,
                 &note,
                 targets,
+                role,
             ) {
                 Ok(job) => {
                     let desc = job.describe();

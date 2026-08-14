@@ -59,6 +59,9 @@ pub struct Ev {
     pub text: String,
     /// 已下载到工作区的附件元数据（#12）。纯附件消息 text 为空但 attachments 非空。
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
+    /// 发送者角色（owner=全权限 / granted=受限）：入口准入闸推导，agent 调用处
+    /// 按此选受限分支；pending 重放路径从 PendingItem.role 恢复。
+    pub role: crate::config::SenderRole,
 }
 
 impl Ev {
@@ -499,17 +502,25 @@ impl Bridge {
         // （管理员）∪ 授权者（授权码添加）白名单。未授权者只能通过授权码激活。
         // 每次消息从 config.json 热读最新访问控制（授权/取消/改开关即时生效，不依赖启动快照）；
         // config 读不到该 bot（单测注入）→ 回落构造时的快照。判定统一走 BotConfig::access_allows。
-        {
-            let allowed = match crate::config::Config::load() {
-                Ok(c) => c
-                    .bots
-                    .into_iter()
-                    .find(|b| b.key() == self.bot.key())
-                    .map(|b| b.access_allows(sender_id))
-                    .unwrap_or_else(|| self.access_snapshot_allows(sender_id)),
-                Err(_) => self.access_snapshot_allows(sender_id),
-            };
-            if !allowed {
+        // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent 调用处。
+        let (allowed, sender_role) = match crate::config::Config::load() {
+            Ok(c) => c
+                .bots
+                .into_iter()
+                .find(|b| b.key() == self.bot.key())
+                .map(|b| (b.access_allows(sender_id), b.sender_role(sender_id)))
+                .unwrap_or_else(|| {
+                    (
+                        self.access_snapshot_allows(sender_id),
+                        self.bot.sender_role(sender_id),
+                    )
+                }),
+            Err(_) => (
+                self.access_snapshot_allows(sender_id),
+                self.bot.sender_role(sender_id),
+            ),
+        };
+        if !allowed {
                 // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
                 // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
                 // 不匹配 → 按未授权消息忽略（不进入 agent，含 /new 等指令）。
@@ -532,7 +543,6 @@ impl Bridge {
                 );
                 return;
             }
-        }
         // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
         // 话题（thread）内用户回复机器人的消息不需要再次 @——这是「用户回复」的主流交互；
         // 顶层群消息仍要求 @（避免整个群的消息都进 agent）。
@@ -579,6 +589,7 @@ impl Bridge {
             quoted: crate::messenger::QuotedContent::default(),
             text,
             attachments,
+            role: sender_role,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
             crate::log!(
@@ -761,6 +772,7 @@ impl Bridge {
             text: text.clone(),
             quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
+            role: ev.role, // 落盘角色：重启重放时按原角色走受限/全权限分支
             created_at: crate::chrono_lite::unix_secs(),
         });
 
@@ -1024,6 +1036,7 @@ impl Bridge {
                 quoted: item.quoted,
                 text: item.text,
                 attachments: item.attachments,
+                role: item.role, // 重放按原角色走受限/全权限分支（PendingItem 落盘字段）
             };
             crate::log!(
                 "[bot:{}] 恢复消息 chat={} mid={} text={:?}",
@@ -1106,6 +1119,7 @@ impl Bridge {
             quoted,
             text,
             attachments,
+            role: crate::config::SenderRole::Owner, // 微信只有 owner（on_weixin 已按 wx_user_id 过滤）
         };
         self.handle(ev).await;
     }
@@ -1115,14 +1129,28 @@ impl Bridge {
     pub async fn on_dingtalk(&self, msg: crate::dingtalk::DingtalkMessage) {
         // 访问控制（与飞书同套，staffId 标识）：公开开关开 → 放行所有人；否则只放行 owner ∪
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
-        let allowed = match crate::config::Config::load() {
+        // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
+        let (allowed, sender_role) = match crate::config::Config::load() {
             Ok(c) => c
                 .bots
                 .into_iter()
                 .find(|b| b.key() == self.bot.key())
-                .map(|b| b.access_allows(&msg.sender_staff_id))
-                .unwrap_or_else(|| self.access_snapshot_allows(&msg.sender_staff_id)),
-            Err(_) => self.access_snapshot_allows(&msg.sender_staff_id),
+                .map(|b| {
+                    (
+                        b.access_allows(&msg.sender_staff_id),
+                        b.sender_role(&msg.sender_staff_id),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        self.access_snapshot_allows(&msg.sender_staff_id),
+                        self.bot.sender_role(&msg.sender_staff_id),
+                    )
+                }),
+            Err(_) => (
+                self.access_snapshot_allows(&msg.sender_staff_id),
+                self.bot.sender_role(&msg.sender_staff_id),
+            ),
         };
         if !allowed {
             // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
@@ -1213,6 +1241,7 @@ impl Bridge {
             quoted,
             text,
             attachments,
+            role: sender_role,
         };
         self.handle(ev).await;
     }
@@ -1325,6 +1354,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
+            role: crate::config::SenderRole::Owner,
         };
         assert_eq!(ev.key(), "oc_group");
     }
@@ -1340,6 +1370,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
+            role: crate::config::SenderRole::Owner,
         };
         let a = base("omt_aaa");
         let b = base("omt_bbb");
@@ -1804,6 +1835,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             text: text.into(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
         }
     }
 
@@ -2051,6 +2083,7 @@ mod tests {
             text: "第一条".into(),
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
             created_at: 10,
         });
         bridge.pending.add(crate::pending::PendingItem {
@@ -2061,6 +2094,7 @@ mod tests {
             text: "第二条".into(),
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Granted,
             created_at: 20,
         });
 
