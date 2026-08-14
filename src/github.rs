@@ -27,6 +27,10 @@ pub struct GhIssue {
     pub created_at: String,
     pub updated_at: String,
     pub user: GhUser,
+    /// 非 None = 这是 PR 不是 issue（GitHub REST 的 issues 列表把 PR 也算进去，
+    /// 响应项带 pull_request 字段）——watch 通知与指令门都必须跳过。
+    #[serde(default)]
+    pub pull_request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -53,6 +57,9 @@ pub enum GhCmd {
     ConfirmClose { owner: String, repo: String, number: u64 },
     /// 直接建 issue。owner/repo 为空 = 指令没带仓库，由桥按白名单解析。
     Create { owner: String, repo: String, title: String },
+    /// 建 issue 前的确认提示（创建是公开写操作且误报面大：「怎么建 issue 的流程」也会
+    /// 命中子串——先回预览引导，用户回复「确认建 issue <标题>」才执行）。
+    ConfirmCreate { owner: String, repo: String, title: String },
 }
 
 /// URL 边界字符（与 attachments::extract_urls 的终止集同款，中英标点都算）。
@@ -61,9 +68,11 @@ const URL_TERMINATORS: &[char] = &[
     '！', '？', '【', '】', '《', '》', '“', '”', '‘', '’', '…',
 ];
 
-/// 解析 github 指令。优先级：确认关闭 > 关闭 > 创建 > 分析。
+/// 解析 github 指令。优先级：确认关闭 > 关闭 > 确认建 issue > 建 issue > 分析。
 /// - 关闭是破坏性操作：裸「关闭 <链接>」只回确认引导（ConfirmClose），
 ///   「确认关闭 <链接>」才真正执行——防闲聊里的「别关闭/为什么关闭了」误触发写操作；
+/// - 建 issue 同理：子串「建 issue」误报面大（「怎么建 issue 的流程」），裸动词只回
+///   预览引导（ConfirmCreate），「确认建 issue <标题>」才真正创建；
 /// - 分析必须带 issue 链接——无链接的「分析/看看/处理」是普通消息，透传给 agent（透明）；
 /// - 「分析 <链接> 再建 issue」会被创建分支抢先（创建优先级高于分析）——命令语义以
 ///   动词短语为准，混合意图请分两句发（有意识的设计取舍，见 parse 顺序）。
@@ -84,25 +93,20 @@ pub fn parse_github_cmd(text: &str) -> Option<GhCmd> {
             return Some(GhCmd::ConfirmClose { owner: o, repo: r, number: n });
         }
     }
-    // 创建：动词短语 + 标题（可带 owner/repo 前缀）
+    // 确认建 issue：动词短语 + 标题 → 真正创建
+    if let Some(after) = after_confirm_create_verb(t) {
+        if let Some(cmd) = create_cmd_from_rest(t, after) {
+            return Some(cmd);
+        }
+    }
+    // 建 issue：动词短语 + 标题 → 先预览确认（不直接创建）
     if let Some(after) = after_create_verb(t) {
-        let rest = after.trim();
-        if rest.is_empty() {
-            return None;
+        if let Some(cmd) = create_cmd_from_rest(t, after) {
+            return Some(match cmd {
+                GhCmd::Create { owner, repo, title } => GhCmd::ConfirmCreate { owner, repo, title },
+                other => other,
+            });
         }
-        let (owner, repo, title) = match extract_repo_ref(t) {
-            // 仓库引用可能在动词短语之前（「在 o/r 建 issue 标题」）；标题只从短语后取，
-            // 去掉标题里残留的仓库引用（「在」只可能是句首介词，逐字替换会误删标题里的「在」）。
-            Some((o, r)) => {
-                let t2 = rest.replace(&format!("{o}/{r}"), "").trim().to_string();
-                (o, r, t2)
-            }
-            None => (String::new(), String::new(), rest.to_string()),
-        };
-        if title.is_empty() {
-            return None;
-        }
-        return Some(GhCmd::Create { owner, repo, title });
     }
     // 分析：动词 + issue 链接
     if contains_verb(t, &["分析", "看看", "处理", "analyze"]) {
@@ -111,6 +115,27 @@ pub fn parse_github_cmd(text: &str) -> Option<GhCmd> {
         }
     }
     None
+}
+
+/// 由「动词短语之后的文本」构造 Create 指令（owner/repo 缺省由桥按白名单解析）。
+fn create_cmd_from_rest(t: &str, after: &str) -> Option<GhCmd> {
+    let rest = after.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let (owner, repo, title) = match extract_repo_ref(t) {
+        // 仓库引用可能在动词短语之前（「在 o/r 建 issue 标题」）；标题只从短语后取，
+        // 去掉标题里残留的仓库引用（「在」只可能是句首介词，逐字替换会误删标题里的「在」）。
+        Some((o, r)) => {
+            let t2 = rest.replace(&format!("{o}/{r}"), "").trim().to_string();
+            (o, r, t2)
+        }
+        None => (String::new(), String::new(), rest.to_string()),
+    };
+    if title.is_empty() {
+        return None;
+    }
+    Some(GhCmd::Create { owner, repo, title })
 }
 
 /// 子串匹配：中文动词直接子串；ASCII 动词按词边界（避免 closure/processor 误触发）。
@@ -157,6 +182,31 @@ fn after_create_verb(text: &str) -> Option<&str> {
     found.then(|| &text[best_end.min(text.len())..])
 }
 
+/// 找「确认建 issue」动词短语（确认建 issue / 确认创建 issue / confirm create issue，
+/// 大小写不敏感），返回其后剩余文本。与 after_create_verb 同构，供确认分支使用。
+fn after_confirm_create_verb(text: &str) -> Option<&str> {
+    let lower = text.to_ascii_lowercase();
+    let mut best_end = 0usize;
+    let mut found = false;
+    for v in [
+        "确认建 issue",
+        "确认创建 issue",
+        "确认建issue",
+        "确认创建issue",
+        "confirm create issue",
+        "confirmcreateissue",
+    ] {
+        if let Some(i) = lower.find(&v.to_ascii_lowercase()) {
+            let end = i + v.len();
+            if end > best_end {
+                best_end = end;
+                found = true;
+            }
+        }
+    }
+    found.then(|| &text[best_end.min(text.len())..])
+}
+
 /// 从文本提取 GitHub issue 三元组 (owner, repo, number)。
 /// 形态一：github.com/owner/repo/issues/N（主机名大小写不敏感）；
 /// 形态二：owner/repo#N。
@@ -170,6 +220,10 @@ pub fn parse_issue_url(text: &str) -> Option<(String, String, u64)> {
             continue;
         }
         if chars.len() - start < host.len() {
+            continue;
+        }
+        // 左边界：前一个字符不得是字母数字/连字符（防 notgithub.com、xxgithub.com 命中）
+        if start > 0 && is_repo_char(chars[start - 1]) {
             continue;
         }
         if chars[start..start + host.len()]
@@ -346,16 +400,23 @@ impl GhContext {
 }
 
 /// 通知文案：「🔔 新 issue #N (title) by @author — url」
+/// 链接用响应自带的 html_url（PR 过滤后都是 issue，但避免任何硬编码 /issues/ 形态）。
 pub fn notify_text(repo: &str, iss: &GhIssue) -> String {
+    let url = if iss.html_url.is_empty() {
+        format!("https://github.com/{repo}/issues/{}", iss.number)
+    } else {
+        iss.html_url.clone()
+    };
     format!(
-        "🔔 新 issue #{} {} by @{}\nhttps://github.com/{}/issues/{}",
-        iss.number, iss.title, iss.user.login, repo, iss.number
+        "🔔 新 issue #{} {} by @{}\n{}",
+        iss.number, iss.title, iss.user.login, url
     )
 }
 
 /// 纯函数（可测）：从一页增量结果挑「新 issue」+ 计算新游标。
 /// - since 为空（首轮/游标丢失）→ 只推进游标不通知（静默基线，避免首刷把存量 open issues 全发一遍）；
 /// - 过滤 seen 里已有的 issue 全局 id（同秒多条/时间戳回拨防重）；
+/// - 过滤 pull_request 非空的（GitHub REST 把 PR 也算进 issues 列表，不是 issue 不通知）；
 /// - 过滤 created_at < since 的（旧 issue 被评论/编辑刷出增量窗口，不算新 issue）；
 /// - 过滤 echo_login 自己发的（自问自答不回显）。
 ///
@@ -363,6 +424,9 @@ pub fn notify_text(repo: &str, iss: &GhIssue) -> String {
 pub fn new_issues(issues: &[GhIssue], since: &str, seen: &[u64], echo_login: &str) -> (Vec<GhIssue>, String) {
     let mut fresh = Vec::new();
     for iss in issues {
+        if iss.pull_request.is_some() {
+            continue; // PR 不是 issue（审查 M1）
+        }
         if seen.contains(&iss.id) {
             continue;
         }
@@ -621,6 +685,7 @@ mod tests {
             created_at: created.into(),
             updated_at: updated.into(),
             user: GhUser { login: login.into() },
+            pull_request: None,
         }
     }
 
@@ -649,6 +714,13 @@ mod tests {
         // 简写嵌在中文里（前有标点边界）
         assert_eq!(
             parse_issue_url("（o/r#5）"),
+            Some(("o".into(), "r".into(), 5))
+        );
+        // 全 URL 形态左边界：notgithub.com / xxgithub.com 不得命中
+        assert_eq!(parse_issue_url("notgithub.com/o/r/issues/5"), None);
+        assert_eq!(parse_issue_url("xxgithub.com/o/r/issues/5"), None);
+        assert_eq!(
+            parse_issue_url("看 github.com/o/r/issues/5 这个"),
             Some(("o".into(), "r".into(), 5))
         );
     }
@@ -700,19 +772,32 @@ mod tests {
             parse_github_cmd("confirm close o/r#7"),
             Some(GhCmd::Close { owner: "o".into(), repo: "r".into(), number: 7 })
         );
-        // 创建：无仓库（由桥按白名单解析）
+        // 创建：裸动词 → 预览确认（不直接创建）；确认动词 → 真正创建
         assert_eq!(
             parse_github_cmd("建 issue 修复登录 401"),
-            Some(GhCmd::Create { owner: String::new(), repo: String::new(), title: "修复登录 401".into() })
+            Some(GhCmd::ConfirmCreate { owner: String::new(), repo: String::new(), title: "修复登录 401".into() })
         );
-        // 创建：带仓库，标题去掉仓库引用与「在」
         assert_eq!(
             parse_github_cmd("在 o/r 建 issue 修复 bug"),
-            Some(GhCmd::Create { owner: "o".into(), repo: "r".into(), title: "修复 bug".into() })
+            Some(GhCmd::ConfirmCreate { owner: "o".into(), repo: "r".into(), title: "修复 bug".into() })
         );
         assert_eq!(
             parse_github_cmd("create issue o/r 新增文档"),
-            Some(GhCmd::Create { owner: "o".into(), repo: "r".into(), title: "新增文档".into() })
+            Some(GhCmd::ConfirmCreate { owner: "o".into(), repo: "r".into(), title: "新增文档".into() })
+        );
+        // 疑问句误报面：裸动词只给预览，不会创建——由桥回确认引导
+        assert_eq!(
+            parse_github_cmd("怎么建 issue 的流程是什么"),
+            Some(GhCmd::ConfirmCreate { owner: String::new(), repo: String::new(), title: "的流程是什么".into() })
+        );
+        // 确认动词 → Create（真正执行）
+        assert_eq!(
+            parse_github_cmd("确认建 issue 修复登录 401"),
+            Some(GhCmd::Create { owner: String::new(), repo: String::new(), title: "修复登录 401".into() })
+        );
+        assert_eq!(
+            parse_github_cmd("确认创建 issue o/r 修复 bug"),
+            Some(GhCmd::Create { owner: "o".into(), repo: "r".into(), title: "修复 bug".into() })
         );
         // 优先级：确认关闭 > 关闭 > 创建 > 分析（同一句含多动词时关闭优先）
         assert_eq!(
@@ -811,6 +896,18 @@ mod tests {
         let (fresh, _) = new_issues(&iss, "2026-08-14T03:00:00Z", &[1], "bot");
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].id, 4);
+    }
+
+    #[test]
+    fn new_issues_filters_pull_requests() {
+        // GitHub REST 的 issues 列表把 PR 也算进去（带 pull_request 字段）——必须跳过
+        let mut iss = issue(1, 1, "alice", "2026-08-14T01:00:00Z", "2026-08-14T02:00:00Z");
+        iss.pull_request = Some(serde_json::json!({"url": "..."}));
+        let mut real = issue(2, 2, "bob", "2026-08-14T01:30:00Z", "2026-08-14T02:30:00Z");
+        real.pull_request = None;
+        let (fresh, _) = new_issues(&[iss, real], "2026-08-14T00:00:00Z", &[], "");
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, 2);
     }
 
     #[test]
