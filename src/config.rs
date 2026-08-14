@@ -596,6 +596,16 @@ impl SenderRole {
     }
 }
 
+/// 受限模式判定（agent::run 的 spawn 分支 / bridge prompt 注入 / run_job 定时任务
+/// 三处共用，防语义漂移）：role==Granted 且该 bot 的「授权者 agent 隔离」开关未放宽；
+/// 配置读不到按安全默认 true。每次热读（授权/关开关即时生效）。
+pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
+    role == SenderRole::Granted
+        && Config::bot_for_bot_key(bot_key)
+            .map(|b| b.restrict_granted_agent)
+            .unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]

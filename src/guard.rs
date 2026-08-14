@@ -146,8 +146,10 @@ fn resolve_workspace() -> Option<PathBuf> {
 /// 新建文件场景（canonicalize 失败）→ 规范化父目录 + 拼文件名再判。
 /// 相对路径按「相对工作区」解析；`..` 由 canonicalize 天然规范化。
 /// 无法静态确认的形态直接拒绝（fail-closed）：`~`（shell 会展开成主目录）、
-/// 任何含 `$` 的串（shell 会做变量展开，如 `$HOME`）、含反斜杠/冒号的串
-/// （Windows 盘符/UNC 路径，split_shell 会把反斜杠当转义吃掉）。
+/// 任何含 `$` 的串（shell 会做变量展开，如 `$HOME`）。
+/// Windows 盘符/UNC 形态（`C:\...`、`\\server\...`）不经此处显式拒绝——is_absolute
+/// 判定后 canonicalize 必然落到工作区外返回 false（行为正确）；调用方（is_path_arg /
+/// Bash 白名单）另有 `\\`/`:` 形态的显式拒绝兜底。
 /// 供 deliver CLI 自校验复用（纵深防御第二层）。
 pub fn canonical_in_workspace(p: &str, workspace: &Path) -> bool {
     let p = p.trim();
@@ -197,19 +199,15 @@ fn check_file_paths(tool: &str, input: &serde_json::Value, workspace: &Path) -> 
         _ => return Decision::Deny(format!("{tool} 缺 file_path")),
     }
     for p in paths {
-        // 桥状态文件（jobs.json / pending.json）虽在工作区内，但其中的 role 字段
-        // 是执行时信任的权限凭据——授权者改写它会把自己的定时任务/重放消息
-        // 翻成 owner 全权限执行，整个隔离形同虚设。只禁写不禁读（内容本就
-        // 属工作区可读范围）。
-        if tool == "Edit" || tool == "Write" {
-            if let Some(name) = std::path::Path::new(p).file_name() {
-                let name = name.to_string_lossy();
-                if name == "jobs.json" || name == "pending.json" {
-                    return Decision::Deny(format!(
-                        "{tool} 不能改写桥状态文件 {name}（role 凭据防伪造）"
-                    ));
-                }
-            }
+        // 桥状态/指令文件（H1 审查修复）：这些文件影响**之后更高权限会话**的执行行为
+        // ——CLAUDE.md/AGENTS.md 会被 owner 的全权限会话加载（注入恶意指令 = 等同 owner
+        // 的持久化提权）；.mcp.json 启动的项目 MCP server 以全权限执行、绕过 claude
+        // 权限系统；.claude/settings.json 的 hooks 以全权限执行；jobs.json/pending.json
+        // 的 role 字段是执行时信任的凭据（改写 = 把自己任务翻成 owner 执行）。
+        // 只禁写不禁读（内容本属工作区可读范围）。GRANTED.md 是受限会话专用记忆文件，
+        // 不在此清单（只被受限会话加载，不构成跨角色通道）。
+        if (tool == "Edit" || tool == "Write") && is_bridge_state_path(p) {
+            return Decision::Deny(format!("{tool} 不能改写桥状态/指令文件（已拒绝：{p}）"));
         }
         if !canonical_in_workspace(p, workspace) {
             return Decision::Deny(format!("{tool} 目标在工作区外（已拒绝：{p}）"));
@@ -218,17 +216,45 @@ fn check_file_paths(tool: &str, input: &serde_json::Value, workspace: &Path) -> 
     Decision::Allow
 }
 
-/// Glob/Grep：pattern 不得含 `..` 穿越、不得以 `/`（绝对）或 `~` 开头。
+/// 桥状态/指令文件判定（文件名 + 路径组件，大小写不敏感——macOS 文件系统不区分大小写）：
+/// - 文件名命中清单：jobs.json / pending.json / CLAUDE.md / AGENTS.md / .mcp.json
+///   （`sub/../jobs.json` 式穿越由 file_name 取最终文件名天然覆盖）
+/// - 任一路径组件为 `.claude`：settings.json / settings.local.json / hooks/… 全拒
+fn is_bridge_state_path(p: &str) -> bool {
+    let path = std::path::Path::new(p);
+    if let Some(name) = path.file_name() {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "jobs.json" | "pending.json" | "claude.md" | "agents.md" | ".mcp.json"
+        ) {
+            return true;
+        }
+    }
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".claude")
+    })
+}
+
+/// Glob/Grep：pattern 不得含 `..` 穿越、不得以 `/`（绝对）或 `~` 开头，
+/// 不得含 `:`/`\\`（Windows 盘符/UNC 形态，L1 审查修复——`C:/x` 不以 `/` 开头
+/// 会绕过上述判定）。
 /// Grep 另有 path/glob 输入字段（绝对路径/搜索根）——同样必须落在工作区内，
 /// 只查 pattern 会漏掉以 `path` 指定工作区外目录的内容搜索。
 fn check_patterns(tool: &str, input: &serde_json::Value, workspace: &Path) -> Decision {
     let Some(pattern) = input["pattern"].as_str() else {
         return Decision::Deny(format!("{tool} 缺 pattern"));
     };
-    if pattern.contains("..") {
-        return Decision::Deny(format!("{tool} pattern 含 .. 穿越（已拒绝：{pattern}）"));
-    }
-    if pattern.starts_with('/') || pattern.starts_with('~') {
+    let bad_pattern = |p: &str| -> bool {
+        p.contains("..")
+            || p.starts_with('/')
+            || p.starts_with('~')
+            || p.contains(':')
+            || p.contains('\\')
+    };
+    if bad_pattern(pattern) {
         return Decision::Deny(format!("{tool} pattern 指向工作区外（已拒绝：{pattern}）"));
     }
     // Grep 的 path 字段：搜索根（绝对/相对路径）——必须落在工作区内。
@@ -237,9 +263,9 @@ fn check_patterns(tool: &str, input: &serde_json::Value, workspace: &Path) -> De
             return Decision::Deny(format!("{tool} path 指向工作区外（已拒绝：{p}）"));
         }
     }
-    // Grep 的 glob 字段：文件过滤器——同样不得穿越/绝对。
+    // Grep 的 glob 字段：文件过滤器——同样不得穿越/绝对/盘符。
     if let Some(g) = input["glob"].as_str() {
-        if g.contains("..") || g.starts_with('/') || g.starts_with('~') {
+        if bad_pattern(g) {
             return Decision::Deny(format!("{tool} glob 指向工作区外（已拒绝：{g}）"));
         }
     }
@@ -269,6 +295,9 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
     match program {
         // 只读 git：代码仓库操作不越界（workspace 通常不是 git repo，防呆放行只读动词）。
         // --no-index 除外：git diff --no-index <a> <b> 在仓库外也可读任意文件全文。
+        // --output/-C/--git-dir/--work-tree 除外（M1 审查修复）：前者把输出写到工作区外
+        // 任意路径（git diff --output=/tmp/evil），后三者可重定向仓库/工作树（-C 还可
+        // 在任意目录执行 git 命令）——一律拒绝。
         "git" => {
             const READONLY: &[&str] = &[
                 "status",
@@ -285,8 +314,30 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
                 "help",
                 "version",
             ];
-            if rest.iter().any(|a| a == "--no-index") {
-                return Decision::Deny("git --no-index 可读任意文件（已拒绝）".into());
+            // --no-index/--output/--git-dir/--work-tree：任何位置都危险（读任意文件 /
+            // 写任意路径 / 重定向仓库），一律拒绝。`-C` 特殊：顶层 `git -C <dir>` 才是
+            // 目录重定向（必在 verb 前）；`git log -C`/`git diff -C` 是只读 copy 检测
+            //（-C 在 verb 后）——只拒 verb 前的形态。
+            const DENIED_FLAGS: &[&str] = &["--no-index", "--output", "--git-dir", "--work-tree"];
+            let denied: Vec<String> = rest
+                .iter()
+                .filter(|a| {
+                    DENIED_FLAGS
+                        .iter()
+                        .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
+                })
+                .cloned()
+                .collect();
+            let top_c = rest.first().map(|s| s.as_str()) == Some("-C");
+            if !denied.is_empty() || top_c {
+                let mut parts = denied;
+                if top_c {
+                    parts.push("-C".into());
+                }
+                return Decision::Deny(format!(
+                    "git 参数含受限 flag（可读写工作区外，已拒绝）：{}",
+                    parts.join(" ")
+                ));
             }
             let verb = rest.first().map(|s| s.as_str()).unwrap_or("");
             if READONLY.contains(&verb) {
@@ -599,6 +650,20 @@ mod tests {
         assert_eq!(decide("git log --oneline"), Decision::Allow);
         assert_ne!(decide("git push"), Decision::Allow);
         assert_ne!(decide("git checkout main"), Decision::Allow);
+        // M1：git 参数含受限 flag（读任意文件/写任意路径/重定向仓库）→ 拒绝；
+        // 只读 copy 检测形态（git log -C）不受影响
+        assert_ne!(
+            decide("git diff --output=/tmp/evil out.txt"),
+            Decision::Allow
+        );
+        assert_ne!(
+            decide("git diff --output /tmp/evil out.txt"),
+            Decision::Allow
+        );
+        assert_ne!(decide("git -C /tmp status"), Decision::Allow);
+        assert_ne!(decide("git --git-dir=/tmp/g status"), Decision::Allow);
+        assert_ne!(decide("git --work-tree=/tmp status"), Decision::Allow);
+        assert_eq!(decide("git log -C --oneline"), Decision::Allow);
         // 只读命令：工作区内路径放行、工作区外拒绝
         assert_eq!(decide("cat a.txt"), Decision::Allow);
         assert_eq!(decide("cat ./sub/b.txt"), Decision::Allow);
@@ -678,6 +743,15 @@ mod tests {
             decide(serde_json::json!({"pattern": "foo", "path": ".", "glob": "../*.json"})),
             Decision::Allow
         );
+        // L1：Windows 盘符/UNC 形态（C:/x 不以 / 开头、无 ..、不以 ~ 开头）
+        assert_ne!(
+            decide(serde_json::json!({"pattern": "C:/Users/x"})),
+            Decision::Allow
+        );
+        assert_ne!(
+            decide(serde_json::json!({"pattern": "foo", "path": ".", "glob": "C:\\x\\*.json"})),
+            Decision::Allow
+        );
         let _ = root;
     }
 
@@ -714,6 +788,63 @@ mod tests {
         // 普通工作区文件不受影响
         assert_eq!(
             check_file_paths("Write", &serde_json::json!({"file_path": "a.txt"}), &ws),
+            Decision::Allow
+        );
+        let _ = root;
+    }
+
+    #[test]
+    fn file_paths_deny_instruction_files() {
+        // H1 持久化提权：这些文件影响之后更高权限会话的执行行为，禁写
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        // CLAUDE.md / AGENTS.md：owner 全权限会话会加载同一份 → 注入指令 = 等同 owner
+        for f in ["CLAUDE.md", "AGENTS.md", "claude.md", "agents.md"] {
+            assert_ne!(
+                check_file_paths("Write", &serde_json::json!({"file_path": f}), &ws),
+                Decision::Allow,
+                "{f} 应禁写（owner 会话会加载）"
+            );
+        }
+        // .mcp.json：项目 MCP server 全权限执行、绕过 claude 权限系统
+        assert_ne!(
+            check_file_paths("Write", &serde_json::json!({"file_path": ".mcp.json"}), &ws),
+            Decision::Allow
+        );
+        // .claude/**：settings/hooks 全权限执行；组件级匹配（含子目录与穿越形态）
+        for p in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude/hooks/x.sh",
+            "sub/.claude/settings.json",
+            "sub/../.claude/settings.json",
+        ] {
+            assert_ne!(
+                check_file_paths("Edit", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p} 应禁写（.claude 段）"
+            );
+        }
+        // 读仍允许（内容本属工作区可读范围）
+        assert_eq!(
+            check_file_paths("Read", &serde_json::json!({"file_path": "CLAUDE.md"}), &ws),
+            Decision::Allow
+        );
+        // GRANTED.md：受限会话专用记忆文件，可读写（不构成跨角色通道）
+        assert_eq!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": "GRANTED.md"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            check_file_paths(
+                "Edit",
+                &serde_json::json!({"file_path": "./GRANTED.md"}),
+                &ws
+            ),
             Decision::Allow
         );
         let _ = root;

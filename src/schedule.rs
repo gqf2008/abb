@@ -363,7 +363,8 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Option<Field> {
     Some(Field { any: false, vals })
 }
 
-/// claude 结构化输出的校验 + 归一成 Job（bridge.rs 调用）。
+/// claude 结构化输出的校验 + 归一成 Job（唯一调用方：main.rs 的 job add CLI）。
+/// 创建者角色（role）由调用方从 AGENT_BRIDGE_SENDER_ROLE env 解析后传入。
 #[allow(clippy::too_many_arguments)]
 pub fn job_from_parsed(
     kind: &str,

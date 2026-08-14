@@ -841,14 +841,12 @@ impl Bridge {
         // 判定与 agent::run 的 restrict 一致（role==Granted && 开关热读）——owner 关掉
         // 隔离开关后，granted 会话实际是全权限，prompt 不得再谎称受限（否则模型自我设限、
         // 或把不存在的拦截声明当承诺）。读不到 config 按安全默认 true。
-        let restrict_prompt = ev.role == crate::config::SenderRole::Granted
-            && crate::config::Config::bot_for_bot_key(&self.bot.key())
-                .map(|b| b.restrict_granted_agent)
-                .unwrap_or(true);
+        let restrict_prompt = crate::config::restrict_granted(ev.role, &self.bot.key());
         if restrict_prompt {
             prompt.insert_str(
                 0,
                 "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
+你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
 可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git；不可联网、不可访问工作区外任何路径；\
 越界操作会被系统拦截并记录。\n\n",
             );
@@ -3582,6 +3580,7 @@ https://b.com/y"
             quoted: Default::default(),
             text: "分析 https://github.com/o/r/issues/42".into(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Granted, // 与 auto_ev 生产代码一致
         };
         // 同一评论 id 的合成 Ev 触发两次 → mid 去重只处理一次
         let b1 = bridge.clone();

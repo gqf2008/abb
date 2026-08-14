@@ -739,15 +739,12 @@ async fn run_job(
         backend.name()
     );
     // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明
-    //（否则模型不知道自己被闸着，越界被拒后瞎试）。与 agent::run 的 restrict
-    // 判定同条件（role==Granted && 开关热读）。
-    let prompt = if job.role == crate::config::SenderRole::Granted
-        && crate::config::Config::bot_for_bot_key(&bot_key)
-            .map(|b| b.restrict_granted_agent)
-            .unwrap_or(true)
-    {
+    //（否则模型不知道自己被闸着，越界被拒后瞎试）。与 agent::run 同源公共判定
+    // config::restrict_granted（role==Granted && 开关热读）。
+    let prompt = if crate::config::restrict_granted(job.role, &bot_key) {
         format!(
             "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
+你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
 可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git；不可联网、不可访问工作区外任何路径；\
 越界操作会被系统拦截并记录。\n\n{}",
             job.prompt

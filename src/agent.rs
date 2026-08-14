@@ -382,10 +382,8 @@ pub async fn run(
 
     // 受限模式判定：授权者会话且该 bot 的「授权者 agent 隔离」开关未放宽。
     // 每次热读 config（授权/关开关即时生效，与访问控制一致）；读不到按安全默认 true。
-    let restrict = role == crate::config::SenderRole::Granted
-        && crate::config::Config::bot_for_bot_key(bot_key)
-            .map(|b| b.restrict_granted_agent)
-            .unwrap_or(true);
+    // 公共判定见 config::restrict_granted（bridge prompt 注入 / run_job 同源）。
+    let restrict = crate::config::restrict_granted(role, bot_key);
     // pi 无任何权限/沙箱系统（非交互无审批），受限会话无法降级——直接拒绝，
     // 绝不让授权者静默获得全权限 agent。owner 可换后端或关掉隔离开关恢复。
     if restrict && backend == Backend::Pi {
