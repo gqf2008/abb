@@ -25,3 +25,4 @@ scripts/
 
 # CI 生成的安装包，不入库
 app-assets/Output/
+.claude/worktrees/
