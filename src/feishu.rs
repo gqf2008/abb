@@ -211,7 +211,8 @@ impl FeishuClient {
     }
 
     /// 发文本到 chat，超长自动分段加（i/n）前缀。token 即 bot 身份。
-    pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {        let token = self.tenant_token().await?;
+    pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
+        let token = self.tenant_token().await?;
         let chunks = split_text(text, FEISHU_MSG_LIMIT);
         let n = chunks.len();
         for (i, chunk) in chunks.into_iter().enumerate() {

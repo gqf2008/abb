@@ -747,8 +747,8 @@ async fn run_job(
         &bot_key,
         job.role, // 按创建者角色执行：授权者建的任务走受限分支
         None,     // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
-        None, // 定时任务不推中间进度（统一只发最终结果）
-        None, // 定时任务不可被聊天打断
+        None,     // 定时任务不推中间进度（统一只发最终结果）
+        None,     // 定时任务不可被聊天打断
     )
     .await
     {

@@ -113,7 +113,8 @@ fn request_one(sym: &std::ffi::CStr, name: &str) {
                 };
                 // 提到堆（completionHandler 异步回调时栈帧可能已不可用）
                 let heap_block = _Block_copy(&mut block as *mut StackBlock as *const c_void);
-                let req_sel = sel_registerName(c"requestAccessForMediaType:completionHandler:".as_ptr());
+                let req_sel =
+                    sel_registerName(c"requestAccessForMediaType:completionHandler:".as_ptr());
                 let req: unsafe extern "C" fn(Id, Sel, Id, *mut c_void) =
                     std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
                 req(cls, req_sel, media, heap_block);

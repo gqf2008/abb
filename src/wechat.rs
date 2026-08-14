@@ -538,7 +538,11 @@ impl WeixinClient {
         // 协议（github epiral/weixin-bot PROTOCOL.md）要求的外发 msg 字段，缺一会被服务器
         // 「先 ack（给 message_id）再丢弃」——消息不投递。message_state:2=FINISH 尤其关键，
         // 缺了被当「生成中」不渲染；from_user_id bot 外发留空；client_id 每条唯一。
-        let client_id = format!("fb_{}_{}", crate::chrono_lite::unix_secs(), fastrand::u64(..));
+        let client_id = format!(
+            "fb_{}_{}",
+            crate::chrono_lite::unix_secs(),
+            fastrand::u64(..)
+        );
         let body = serde_json::json!({
             "msg": {
                 "from_user_id": "",
