@@ -16,6 +16,7 @@ mod deps;
 mod dingtalk;
 mod feishu;
 mod github;
+mod guard;
 mod install;
 mod larkskills;
 mod messenger;
@@ -186,6 +187,12 @@ fn main() {
     // chat_id 从 AGENT_BRIDGE_CHAT_ID env 读（桥 spawn claude 时注入），缺省回落主会话。
     if args.len() >= 2 && args[1] == "job" {
         std::process::exit(run_job_cli(&args[2..]));
+    }
+
+    // guard-check：claude PreToolUse hook 的决策子进程（授权者受限会话的强制闸）。
+    // claude 以 `"$ABB_BIN" guard-check` 调用，stdin 收 hook 事件 JSON，stdout 出决策 JSON。
+    if args.len() >= 2 && args[1] == "guard-check" {
+        std::process::exit(guard::guard_check_main());
     }
 
     // 跨会话投递 CLI：供 claude 用 Bash 调用（也可人用）。
@@ -536,6 +543,20 @@ fn run_deliver_cli(args: &[String]) -> i32 {
     if deliver::is_self_loop(&item) {
         eprintln!("不能投递回当前会话（来源与目标相同），已拒绝。");
         return 1;
+    }
+    // 授权者（受限会话）纵深防御：--file 只能投递工作区内文件。
+    // guard hook 是第一道（已在调用链上校验命令），这里 CLI 侧再兜一层——
+    // 即使 hook 配置被绕过/误配，受限会话的 deliver 也投不出工作区外文件内容。
+    if config::SenderRole::parse(&std::env::var("AGENT_BRIDGE_SENDER_ROLE").unwrap_or_default())
+        == config::SenderRole::Granted
+    {
+        let ws = crate::workspace_dir(&env_bot);
+        for a in &item.attachments {
+            if !guard::canonical_in_workspace(&a.path, &ws) {
+                eprintln!("受限会话不能投递工作区外文件（已拒绝）：{}", a.path);
+                return 1;
+            }
+        }
     }
     // 目标 bot 必须存在且启用、凭证就绪（与 service 路由表同源：config.bots[].key()）
     let target_ok = cfg

@@ -395,6 +395,14 @@ pub async fn run(
         );
     }
 
+    // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
+    // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
+    //（返回用户可见错误，不静默降级成全权限）。
+    if restrict {
+        crate::guard::ensure_guard_files(bot_key)
+            .map_err(|e| format!("⚠️ 受限会话 guard 文件生成失败，已拒绝启动：{e:#}"))?;
+    }
+
     // 本 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）
     let workspace = crate::workspace_dir(bot_key);
     let _ = std::fs::create_dir_all(&workspace);
@@ -653,6 +661,7 @@ fn claude_command(
     resume: bool,
     session_id: &str,
     restricted: bool,
+    settings_path: &std::path::Path,
 ) -> std::process::Command {
     let mut c = shim_command(program);
     c.arg("-p");
@@ -661,8 +670,10 @@ fn claude_command(
         // dontAsk = 未预批准的工具调用直接拒绝（非交互下不挂起等输入）；
         // --allowedTools 只放行工作区相对路径的读/写/查工具（Read(./**) 等）。
         // Bash 不在 CLI 层放行：受限会话的 $ABB_BIN 命令由 guard hook 校验放行
-        //（Phase 3 挂 --settings）；WebFetch/MCP 等其余工具全被 dontAsk 拒绝。
+        //（--settings 指向工作区外的 settings.json，hook 是强制闸）；
+        // WebFetch/MCP 等其余工具全被 dontAsk 拒绝。
         c.arg("--permission-mode").arg("dontAsk");
+        c.arg("--settings").arg(settings_path);
         c.arg("--allowedTools")
             .arg("Read(./**)")
             .arg("Glob")
@@ -779,8 +790,12 @@ async fn run_once(
         Backend::Claude => {
             // stream-json：逐事件流式输出（assistant/result…），配合逐行解析可实时推进度。
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
-            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）与受限模式分支。
-            tokio::process::Command::from(claude_command(&resolved, resume, session_id, restrict))
+            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）与受限模式分支
+            //（受限时 --settings 指向工作区外的 guard settings.json）。
+            let settings = crate::guard::guard_settings_path(bot_key);
+            tokio::process::Command::from(claude_command(
+                &resolved, resume, session_id, restrict, &settings,
+            ))
         }
         Backend::Pi => {
             // pi 非交互 print 模式：`pi -p --mode json --session-id <uuid>`。
@@ -1536,7 +1551,13 @@ mod tests {
 
     #[test]
     fn claude_command_injects_telemetry_disable() {
-        let c = claude_command(std::path::Path::new("claude"), false, "sess-1", false);
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-1",
+            false,
+            std::path::Path::new("/tmp/abb-settings.json"),
+        );
         let has_disable = c.get_envs().any(|(k, v)| {
             k.to_str() == Some("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
                 && v == Some(std::ffi::OsStr::new("1"))
@@ -1552,7 +1573,13 @@ mod tests {
             c.get_args().any(|a| a == "--dangerously-skip-permissions"),
             "owner 会话保持全权限"
         );
-        let r = claude_command(std::path::Path::new("claude"), true, "sess-2", false);
+        let r = claude_command(
+            std::path::Path::new("claude"),
+            true,
+            "sess-2",
+            false,
+            std::path::Path::new("/tmp/abb-settings.json"),
+        );
         assert!(r.get_args().any(|a| a == "--resume"));
         assert!(r.get_args().any(|a| a == "sess-2"));
         assert!(!r.get_args().any(|a| a == "--session-id"));
@@ -1561,7 +1588,13 @@ mod tests {
     #[test]
     fn claude_command_restricted_drops_full_permissions() {
         // 受限模式（授权者会话）：去掉全权限旗标，改走 dontAsk + 工作区相对路径白名单
-        let c = claude_command(std::path::Path::new("claude"), false, "sess-1", true);
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-1",
+            true,
+            std::path::Path::new("/tmp/abb-settings.json"),
+        );
         let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
         assert!(
             !args.iter().any(|a| *a == "--dangerously-skip-permissions"),
