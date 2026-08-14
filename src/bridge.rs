@@ -220,10 +220,26 @@ impl Bridge {
         }
     }
 
+    /// 写操作的白名单前置闸（评审 S1）：空白名单 = 全部放行只适用于**读**（分析）；
+    /// 写操作（关闭/建）在未配置白名单时直接拒绝——token 授权范围可能覆盖用户所有
+    /// 仓库，空名单放行写操作等于群里任何能 @bot 的人可对任意授权仓库做写操作。
+    fn gh_write_guard(&self, action: &str) -> Option<String> {
+        if self.bot.gh_repo_list().is_empty() {
+            Some(format!(
+                "❌ 未配置仓库白名单，{action}已禁用。请先在设置窗「GitHub 能力 → 仓库白名单」配置。"
+            ))
+        } else {
+            None
+        }
+    }
+
     /// 执行一条 github 指令。白名单在每个动作前强制校验（写操作无一绕过）。
     async fn handle_github_cmd(&self, ev: &Ev, cmd: crate::github::GhCmd) -> GhOutcome {
         match cmd {
             crate::github::GhCmd::ConfirmClose { owner, repo, number } => {
+                if let Some(msg) = self.gh_write_guard("关闭") {
+                    return GhOutcome::Rejected(msg);
+                }
                 let repo_full = format!("{owner}/{repo}");
                 if !self.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!("❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"));
@@ -241,6 +257,9 @@ impl Bridge {
                 GhOutcome::Consumed
             }
             crate::github::GhCmd::Close { owner, repo, number } => {
+                if let Some(msg) = self.gh_write_guard("关闭") {
+                    return GhOutcome::Rejected(msg);
+                }
                 let repo_full = format!("{owner}/{repo}");
                 if !self.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!("❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"));
@@ -259,6 +278,9 @@ impl Bridge {
                 }
             }
             crate::github::GhCmd::ConfirmCreate { owner, repo, title } => {
+                if let Some(msg) = self.gh_write_guard("创建 issue") {
+                    return GhOutcome::Rejected(msg);
+                }
                 // 创建是公开写操作：先预览（仓库 + 标题），用户回复「确认建 issue <标题>」才执行。
                 // 解析缺省仓库与 Create 同逻辑（单项白名单/显式 owner/repo）。
                 let (owner, repo) = match self.resolve_create_repo(&owner, &repo) {
@@ -282,6 +304,9 @@ impl Bridge {
                 GhOutcome::Consumed
             }
             crate::github::GhCmd::Create { owner, repo, title } => {
+                if let Some(msg) = self.gh_write_guard("创建 issue") {
+                    return GhOutcome::Rejected(msg);
+                }
                 let (owner, repo) = match self.resolve_create_repo(&owner, &repo) {
                     Ok(v) => v,
                     Err(msg) => return GhOutcome::Rejected(msg),
@@ -2838,6 +2863,55 @@ https://b.com/y"));
         assert!(msgr.sent()[0].contains("留档失败"), "摘要应提示留档失败: {}", msgr.sent()[0]);
         assert!(!msgr.sent()[0].contains("已留档到"), "不得谎称已留档: {}", msgr.sent()[0]);
         cleanup_bridge(&bridge);
+    }
+
+    /// 评审 S1：空白名单 = 全放行只适用于读（分析）；写操作（关闭/建）未配置白名单时
+    /// 直接拒绝，且零 API 调用；分析维持放行。
+    #[tokio::test]
+    async fn github_empty_whitelist_blocks_writes_allows_analyze() {
+        let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            gh_token: "ghp_x".into(),
+            gh_repos: "".into(), // 空白名单
+            ..Default::default()
+        };
+        let gh = Arc::new(MockGithub::new());
+        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh.clone());
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move {
+            b1.handle(test_ev("m1", "oc_gh9", "确认关闭 https://github.com/o/r/issues/7")).await
+        });
+        task.await.unwrap();
+        assert!(gh.calls().is_empty(), "空名单写操作零 API 调用");
+        assert!(msgr.sent()[0].contains("未配置仓库白名单"));
+        cleanup_bridge(&bridge);
+
+        // 建 issue 同样拒绝
+        let gh2 = Arc::new(MockGithub::new());
+        let (bridge2, msgr2) = build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh2.clone());
+        let b2 = bridge2.clone();
+        let task = tokio::spawn(async move {
+            b2.handle(test_ev("m1", "oc_gh9", "确认建 issue 修复 bug")).await
+        });
+        task.await.unwrap();
+        assert!(gh2.calls().is_empty());
+        assert!(msgr2.sent()[0].contains("未配置仓库白名单"));
+        cleanup_bridge(&bridge2);
+
+        // 分析（读）维持放行：正常注入 + 双写（空名单 = 全放行，读不设限）
+        let runner2 = Arc::new(MockAgentRunner::immediate("根因分析。"));
+        let gh3 = Arc::new(MockGithub::new());
+        let (bridge3, msgr3) =
+            build_test_bridge_with_bot_gh(runner2.clone(), bot, gh3.clone());
+        let b3 = bridge3.clone();
+        let task = tokio::spawn(async move {
+            b3.handle(test_ev("m1", "oc_gh9", "分析 https://github.com/o/r/issues/42")).await
+        });
+        task.await.unwrap();
+        assert!(gh3.calls().iter().any(|c| c.starts_with("fetch:o/r/42")));
+        assert_eq!(msgr3.sent().len(), 1);
+        cleanup_bridge(&bridge3);
     }
 
     /// 未配置 github 能力：同样文本走普通 agent 流程（不注入、全文一次发送）。
