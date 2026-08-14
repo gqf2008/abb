@@ -134,6 +134,29 @@ impl Bridge {
         self.bot.access_allows(sender_id)
     }
 
+    /// 热读 config 推导（准入, 发送者角色）——on_payload / on_dingtalk 共用同一份
+    /// load+find+快照回落，避免两个入口各写一份导致准入与角色推导漂移
+    /// （同一发送者在不同通道被推导成不同角色 = 授权者拿到 owner 权限或反之）。
+    fn access_and_role(&self, sender_id: &str) -> (bool, crate::config::SenderRole) {
+        match crate::config::Config::load() {
+            Ok(c) => c
+                .bots
+                .into_iter()
+                .find(|b| b.key() == self.bot.key())
+                .map(|b| (b.access_allows(sender_id), b.sender_role(sender_id)))
+                .unwrap_or_else(|| {
+                    (
+                        self.access_snapshot_allows(sender_id),
+                        self.bot.sender_role(sender_id),
+                    )
+                }),
+            Err(_) => (
+                self.access_snapshot_allows(sender_id),
+                self.bot.sender_role(sender_id),
+            ),
+        }
+    }
+
     /// 尝试把一条消息当作授权码处理（owner 生成后给到对方）。仅 p2p 接受（飞书 p2p / 钉钉单聊，
     /// 群里发码太公开防抢注）；文本精确匹配 pending 码 → 消费并把发送者加入对应白名单
     /// （管理员码→owner / 普通码→授权者，按 bot kind 落位到 open_id 或 staffId 字段）、回发结果。
@@ -503,23 +526,7 @@ impl Bridge {
         // 每次消息从 config.json 热读最新访问控制（授权/取消/改开关即时生效，不依赖启动快照）；
         // config 读不到该 bot（单测注入）→ 回落构造时的快照。判定统一走 BotConfig::access_allows。
         // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent 调用处。
-        let (allowed, sender_role) = match crate::config::Config::load() {
-            Ok(c) => c
-                .bots
-                .into_iter()
-                .find(|b| b.key() == self.bot.key())
-                .map(|b| (b.access_allows(sender_id), b.sender_role(sender_id)))
-                .unwrap_or_else(|| {
-                    (
-                        self.access_snapshot_allows(sender_id),
-                        self.bot.sender_role(sender_id),
-                    )
-                }),
-            Err(_) => (
-                self.access_snapshot_allows(sender_id),
-                self.bot.sender_role(sender_id),
-            ),
-        };
+        let (allowed, sender_role) = self.access_and_role(sender_id);
         if !allowed {
             // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
             // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
@@ -831,7 +838,14 @@ impl Bridge {
 
         // 受限会话（授权者）：prompt 开头前置受限说明。CLAUDE.md 是 owner/授权者共享的
         // 同一份指引，不能靠它区分——prompt 注入才是按角色区分的正确载体（硬闸在 guard hook）。
-        if ev.role == crate::config::SenderRole::Granted {
+        // 判定与 agent::run 的 restrict 一致（role==Granted && 开关热读）——owner 关掉
+        // 隔离开关后，granted 会话实际是全权限，prompt 不得再谎称受限（否则模型自我设限、
+        // 或把不存在的拦截声明当承诺）。读不到 config 按安全默认 true。
+        let restrict_prompt = ev.role == crate::config::SenderRole::Granted
+            && crate::config::Config::bot_for_bot_key(&self.bot.key())
+                .map(|b| b.restrict_granted_agent)
+                .unwrap_or(true);
+        if restrict_prompt {
             prompt.insert_str(
                 0,
                 "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
@@ -1142,28 +1156,7 @@ impl Bridge {
         // 访问控制（与飞书同套，staffId 标识）：公开开关开 → 放行所有人；否则只放行 owner ∪
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
         // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
-        let (allowed, sender_role) = match crate::config::Config::load() {
-            Ok(c) => c
-                .bots
-                .into_iter()
-                .find(|b| b.key() == self.bot.key())
-                .map(|b| {
-                    (
-                        b.access_allows(&msg.sender_staff_id),
-                        b.sender_role(&msg.sender_staff_id),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        self.access_snapshot_allows(&msg.sender_staff_id),
-                        self.bot.sender_role(&msg.sender_staff_id),
-                    )
-                }),
-            Err(_) => (
-                self.access_snapshot_allows(&msg.sender_staff_id),
-                self.bot.sender_role(&msg.sender_staff_id),
-            ),
-        };
+        let (allowed, sender_role) = self.access_and_role(&msg.sender_staff_id);
         if !allowed {
             // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
             let chat_id = msg.chat_id().to_string();

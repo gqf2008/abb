@@ -455,8 +455,9 @@ impl BotConfig {
 
     /// 会话发送者角色推导（与 access_allows 同构，准入闸顺路区分 owner 与授权者）：
     /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）——
-    /// 公开模式（open_access）下的陌生人同样归 Granted。空 owner 白名单 = 不设限
-    /// （is_owner_allowed 对空串返回 true）→ 判 Owner，与现状一致。微信恒 Owner
+    /// 公开模式（open_access）下的陌生人同样归 Granted。注意：空 owner 白名单 → 一律
+    /// Granted（安全默认，不猜 Owner；is_owner_allowed 对空串返回 true 只管准入不管角色，
+    /// 若需 owner 全权限请先把自己加进白名单）。微信恒 Owner
     /// （wx_user_id 是唯一 owner 判据，on_weixin 已先过滤，无授权者概念）。
     pub fn sender_role(&self, sender_id: &str) -> SenderRole {
         if self.is_wechat() {
@@ -578,6 +579,12 @@ impl SenderRole {
         } else {
             SenderRole::Owner
         }
+    }
+
+    /// 从 AGENT_BRIDGE_SENDER_ROLE env 推导（桥 spawn agent 时注入；CLI/guard 共用，
+    /// 改名/新增取值只改这一处）。
+    pub fn from_env() -> SenderRole {
+        SenderRole::parse(&std::env::var("AGENT_BRIDGE_SENDER_ROLE").unwrap_or_default())
     }
 
     /// "owner" | "granted"（env 注入 / 日志用）。
