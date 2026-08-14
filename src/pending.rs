@@ -188,10 +188,7 @@ mod tests {
             "旧文件缺 quoted 应默认空"
         );
         // 旧文件无 role 字段 → 默认 Owner（重放时走全权限，与现状一致）
-        assert_eq!(
-            store.snapshot()[0].role,
-            crate::config::SenderRole::Owner
-        );
+        assert_eq!(store.snapshot()[0].role, crate::config::SenderRole::Owner);
         let _ = std::fs::remove_file(&p);
     }
 

@@ -509,6 +509,9 @@ pub(crate) fn auto_ev(
         quoted: Default::default(),
         text: format!("分析 https://github.com/{repo}/issues/{number}"),
         attachments: Vec::new(),
+        // GitHub 协作者触发 ≠ IM owner 白名单成员 → 安全默认 Granted（受限会话）；
+        // 分析类操作的 issue 上下文已注入 prompt，不需要工作区外能力。
+        role: crate::config::SenderRole::Granted,
     }
 }
 
@@ -742,7 +745,8 @@ async fn run_job(
         false,
         &job.chat_id,
         &bot_key,
-        None, // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
+        job.role, // 按创建者角色执行：授权者建的任务走受限分支
+        None,     // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
         None, // 定时任务不推中间进度（统一只发最终结果）
         None, // 定时任务不可被聊天打断
     )

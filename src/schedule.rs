@@ -79,7 +79,9 @@ impl JobStore {
 
     /// 若 jobs.json 的 mtime 比上次加载新（CLI 在别的进程改了），重新读盘。
     fn refresh(&self) {
-        let cur = fs::metadata(&self.path).ok().and_then(|m| m.modified().ok());
+        let cur = fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         let stale = { *self.loaded_mtime.lock().unwrap() != cur };
         if !stale {
             return;
@@ -522,12 +524,50 @@ mod tests {
             crate::config::SenderRole::Granted,
         )
         .is_ok());
-        assert!(job_from_parsed("cron", None, Some("bad"), "提醒", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err());
-        assert!(job_from_parsed("once", None, None, "提醒", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err()); // 缺 time
-        assert!(job_from_parsed("x", None, None, "提醒", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err());
-        assert!(
-            job_from_parsed("cron", None, Some("0 9 * * *"), "", "oc", "n", Vec::new(), crate::config::SenderRole::Owner).is_err()
-        );
+        assert!(job_from_parsed(
+            "cron",
+            None,
+            Some("bad"),
+            "提醒",
+            "oc",
+            "n",
+            Vec::new(),
+            crate::config::SenderRole::Owner
+        )
+        .is_err());
+        assert!(job_from_parsed(
+            "once",
+            None,
+            None,
+            "提醒",
+            "oc",
+            "n",
+            Vec::new(),
+            crate::config::SenderRole::Owner
+        )
+        .is_err()); // 缺 time
+        assert!(job_from_parsed(
+            "x",
+            None,
+            None,
+            "提醒",
+            "oc",
+            "n",
+            Vec::new(),
+            crate::config::SenderRole::Owner
+        )
+        .is_err());
+        assert!(job_from_parsed(
+            "cron",
+            None,
+            Some("0 9 * * *"),
+            "",
+            "oc",
+            "n",
+            Vec::new(),
+            crate::config::SenderRole::Owner
+        )
+        .is_err());
         // 空 prompt
     }
 
