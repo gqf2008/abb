@@ -12,7 +12,8 @@
 //!   编辑损坏不 panic）。
 //! - 注入闸在 bridge（串行锁内）：`!resume && marker.session_id != 当前会话`——
 //!   marker 按 session_id 判定，/new、CLI reset、agent 自愈换 UUID 都自动使 marker 失效，
-//!   无需额外清理路径。
+//!   无需额外清理路径。CLI `session reset` 不清历史（与 /new 不对称，有意：reset 后
+//!   注入续命恰是「会话丢失自愈」的目标语义）。
 //! - IO 失败一律只 log 警告：历史是增强能力，绝不阻塞聊天主链路。
 
 use std::path::PathBuf;
@@ -107,6 +108,8 @@ impl History {
     }
 
     /// 原子写全量条目（uuid tmp + rename，与 sessions.rs save_locked 同款）。
+    /// 0o600（unix）：历史是首个全量持久累积的对话内容工件，对齐 config.json 的
+    /// 敏感文件权限（审查 M-2；Windows 无对应语义，忽略）。
     fn write_entries(&self, entries: &[HistoryEntry]) -> bool {
         let mut text = String::new();
         for e in entries {
@@ -116,7 +119,10 @@ impl History {
         let tmp = self
             .path
             .with_extension(format!("jsonl.tmp.{}", uuid::Uuid::new_v4()));
-        let ok = std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &self.path).is_ok();
+        let ok = std::fs::write(&tmp, text).is_ok() && {
+            set_private(&tmp);
+            std::fs::rename(&tmp, &self.path).is_ok()
+        };
         if !ok {
             let _ = std::fs::remove_file(&tmp);
             crate::log!("[history] ⚠️ 历史写入失败 path={}", trunc_path(&self.path));
@@ -166,10 +172,11 @@ impl History {
     }
 
     /// 清空历史与迁移标记（/new：用户明确要求全新会话）。
+    /// 任一文件「仍存在却没删掉」才算失败（半删状态会泄漏旧历史进新会话，审查 M-3）。
     pub fn clear(&self) -> bool {
         let a = std::fs::remove_file(&self.path);
         let b = std::fs::remove_file(&self.marker_path);
-        let ok = a.is_ok() || b.is_ok() || (!self.path.exists() && !self.marker_path.exists());
+        let ok = (a.is_ok() || !self.path.exists()) && (b.is_ok() || !self.marker_path.exists());
         if !ok {
             crate::log!("[history] ⚠️ 清空失败 path={}", trunc_path(&self.path));
         }
@@ -194,8 +201,10 @@ impl History {
                 let tmp = self
                     .marker_path
                     .with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
-                let ok = std::fs::write(&tmp, t).is_ok()
-                    && std::fs::rename(&tmp, &self.marker_path).is_ok();
+                let ok = std::fs::write(&tmp, t).is_ok() && {
+                    set_private(&tmp);
+                    std::fs::rename(&tmp, &self.marker_path).is_ok()
+                };
                 if !ok {
                     let _ = std::fs::remove_file(&tmp);
                     crate::log!(
@@ -255,16 +264,28 @@ impl History {
     }
 }
 
-/// 文件名转义：仅保留 [A-Za-z0-9_-]，其余字节按 %XX（大写十六进制）。':' → "%3A"。
-/// 可逆且单射（'%' 本身也被转义），不同 key 必得不同文件名；无路径分隔符风险（Windows 安全）。
+/// 文件名转义：仅保留 [a-z0-9_-]（字母统一小写——APFS/NTFS 默认大小写不敏感，统一小写
+/// 使跨平台行为一致：仅大小写不同的 key 在这些卷上本来就会坍缩为同一文件），其余字节
+/// 按 %XX（大写十六进制）。':' → "%3A"。可逆且单射，无路径分隔符风险（Windows 安全）。
+/// Windows 保留设备名（CON/NUL/COM1-9/LPT1-9/AUX/PRN）加 "_" 前缀防吞文件（审查 M-1）。
 fn escape_key(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for b in key.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' {
             out.push(b as char);
+        } else if b.is_ascii_uppercase() {
+            out.push((b + 32) as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
         }
+    }
+    // 转义输出不含 '.'（被转成 %2E），整个名字即第一段——直接整串比对保留名
+    const RESERVED: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED.contains(&out.as_str()) {
+        out.insert(0, '_');
     }
     out
 }
@@ -279,6 +300,15 @@ fn trunc_path(p: &std::path::Path) -> String {
         .rev()
         .collect()
 }
+
+/// 落盘前收紧到 0o600（unix）：对话历史与 config.json 同级的敏感工件（审查 M-2）。
+#[cfg(unix)]
+fn set_private(p: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn set_private(_p: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -408,5 +438,11 @@ mod tests {
             escape_key("..").starts_with("%2E"),
             "'.' 也转义（防 .. 穿越）"
         );
+        // 大小写折叠：大小写不敏感卷（APFS/NTFS）行为跨平台一致（审查 M-1）
+        assert_eq!(escape_key("OC_x"), "oc_x");
+        // Windows 保留设备名加前缀防吞文件
+        assert_eq!(escape_key("CON"), "_con");
+        assert_eq!(escape_key("com1"), "_com1");
+        assert_eq!(escape_key("aux"), "_aux");
     }
 }

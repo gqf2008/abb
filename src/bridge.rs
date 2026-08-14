@@ -31,6 +31,11 @@ pub struct Bridge {
     /// 在跑任务的打断标志：chat_id → AtomicBool。「停止词」到达时置 true 叫停该 chat 正在跑的任务。
     /// （per-chat 同一时刻只有一个在跑任务，故每 chat 至多一个标志。）
     cancel_flags: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// #49 历史代际（per-key 计数）：/new 清历史与串行锁内历史写盘的互斥闸。
+    /// /new 不拿 per-chat 锁（不能被运行中任务阻塞），其 clear 与锁内写盘存在交错窗口
+    /// （审查 I-2）——写方持本 std 锁校验代际并写盘，/new 持同一 std 锁自增代际并清盘，
+    /// 二者互斥：旧代际的写盘要么发生在 clear 之前（被清掉）、要么被闸拦下，不会残留。
+    history_epochs: Mutex<HashMap<String, u64>>,
     /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
     /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
     outbox: OutboxStore,
@@ -121,6 +126,7 @@ impl Bridge {
             seen: Mutex::new(HashSet::new()),
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
+            history_epochs: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
@@ -211,6 +217,24 @@ impl Bridge {
             .entry(chat_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// #49：/new 的历史重置——自增代际 + 清历史/标记，在同一 std 锁内完成（与写方
+    /// 互斥，见 history_epochs 字段注释）。失败只 log（/new 主路径不受影响）。
+    fn history_reset(&self, key: &str) {
+        let mut epochs = self.history_epochs.lock().unwrap();
+        *epochs.entry(key.to_string()).or_insert(0) += 1;
+        crate::history::History::open(&self.bot.key(), key).clear();
+    }
+
+    /// #49：历史写闸——代际未变才执行写盘。返回 None = 本轮消息已被 /new 作废
+    ///（属于 /new 之前的旧对话，不落历史）。持有 std 锁期间执行写盘，与 /new 互斥。
+    fn history_write<R>(&self, key: &str, epoch: u64, write: impl FnOnce() -> R) -> Option<R> {
+        let epochs = self.history_epochs.lock().unwrap();
+        if epochs.get(key).copied().unwrap_or(0) != epoch {
+            return None;
+        }
+        Some(write())
     }
 
     /// 发一条回复：话题消息走 reply 接口（落在原话题），非话题走普通发送。
@@ -725,8 +749,9 @@ impl Bridge {
         if is_new_command(&text) {
             let new_sid = self.sessions.reset_session(&key);
             // #49：/new = 用户明确要求全新会话 → 连对话历史与迁移标记一起清
-            // （切换注入的历史随之失效，不会泄进新会话）。
-            crate::history::History::open(&self.bot.key(), &key).clear();
+            // （切换注入的历史随之失效，不会泄进新会话）。代际自增使交错窗口内
+            // 串行锁里的旧写盘全部失效（审查 I-2：clear 与锁内写无锁互斥的 TOCTOU）。
+            self.history_reset(&key);
             crate::log!(
                 "[bridge] /new 新建会话 bot={} key={} sid={}",
                 self.bot.key(),
@@ -873,6 +898,14 @@ impl Bridge {
         // 自动失效（新会话允许再注入）。三层闸防重复注入：per-chat 串行锁（前一轮完整
         // 结束才轮到本条）+ !resume（started=true 直接 resume 不注入）+ marker。
         let hist = crate::history::History::open(&self.bot.key(), &key);
+        // 代际快照（拿串行锁之后取：更早的 /new 已清完盘，此处起历史视角一致）
+        let hist_epoch = self
+            .history_epochs
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
         let not_yet_migrated = match hist.marker() {
             Some(m) => m.session_id != session_id,
             None => true,
@@ -899,8 +932,10 @@ impl Bridge {
             );
         }
         // 当前用户轮落历史（锁内，与助手轮严格按真实顺序交替；重放由 (mid,user) 去重兜底）。
-        // GitHub 合成 Ev 同样落历史——它是该通知群的 agent 轮次。
-        hist.append_user(&ev.mid, backend.name(), &history_user_text(&text, &ev));
+        // GitHub 合成 Ev 同样落历史——它是该通知群的 agent 轮次。代际闸拦 /new 交错窗口。
+        self.history_write(&key, hist_epoch, || {
+            hist.append_user(&ev.mid, backend.name(), &history_user_text(&text, &ev));
+        });
 
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
@@ -974,10 +1009,13 @@ impl Bridge {
                 // （历史已被 /new 清空，旧任务的回复不得写回去）。
                 let same_session = self.sessions.mark_started_if(&key, &session_id);
                 if same_session {
-                    hist.append_assistant(&ev.mid, backend.name(), &reply);
-                    if injected_rounds.is_some() {
-                        hist.set_marker(&session_id, backend.name());
-                    }
+                    // 代际闸：/new 恰好落在 mark 与写盘之间（亚毫秒窗口）也不残留孤儿条目
+                    self.history_write(&key, hist_epoch, || {
+                        hist.append_assistant(&ev.mid, backend.name(), &reply);
+                        if injected_rounds.is_some() {
+                            hist.set_marker(&session_id, backend.name());
+                        }
+                    });
                 }
                 // 注入提示随最终回复一条发出（不独立发消息，打字机已下线纪律）；
                 // GitHub 双写分支只附在群摘要，不写进 issue 评论留档。
@@ -1367,6 +1405,8 @@ fn trunc(s: impl AsRef<str>, n: usize) -> String {
 /// #49 历史条目的用户轮文本：用户文本 + （引用）被引用文本 + （附件）元数据行。
 /// 单条 300 字截断在 history 层做——这里只负责按重要性排布（用户文本最前，
 /// 截断丢的是尾巴=次要信息）。与 prompt 的 [引用消息]/[附件] 段同源同格式。
+/// 有意省略 [链接]/[GitHub Issue] 段（审查 M-4）：链接本身在用户文本里；
+/// 分析的 issue 内容太长，跨后端接续由配对的助手轮（分析结论）承载。
 fn history_user_text(text: &str, ev: &Ev) -> String {
     let mut t = String::from(text);
     if !ev.quoted.text.is_empty() {
@@ -2227,6 +2267,48 @@ mod tests {
         task.await.unwrap();
         assert!(hist.entries().is_empty(), "旧任务完成不得写孤儿助手条目");
         assert!(hist.marker().is_none(), "无孤儿 marker");
+        cleanup_bridge(&bridge);
+    }
+
+    /// 审查 I-2：/new 的 clear 与串行锁内历史写盘的交错窗口由代际闸互斥——
+    /// 快照旧代际的写盘在 /new 之后到达必须被拦（不残留 /new 前的旧对话）。
+    #[tokio::test]
+    async fn history_epoch_guard_blocks_stale_writes() {
+        let runner = Arc::new(MockAgentRunner::immediate("ok"));
+        let bot = backend_bot("pi");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+
+        // 旧代际写盘（模拟 m1 在锁内、/new 尚未到达的快照）
+        let epoch0 = 0;
+        assert!(
+            bridge
+                .history_write("oc_x", epoch0, || {
+                    hist.append_user("m1", "pi", "/new 之前的旧消息");
+                })
+                .is_some(),
+            "同代际放行"
+        );
+
+        // /new：代际自增 + 清盘
+        bridge.history_reset("oc_x");
+        assert!(hist.entries().is_empty(), "clear 清掉旧条目");
+
+        // 同一旧代际的写盘（clear 与写盘交错，写晚到）→ 必须被拦
+        assert!(
+            bridge
+                .history_write("oc_x", epoch0, || {
+                    hist.append_user("m1", "pi", "这条不得落盘");
+                })
+                .is_none(),
+            "旧代际写盘被闸拦"
+        );
+        assert!(hist.entries().is_empty(), "历史保持空");
+        // 新代际（/new 之后的新消息）恢复正常写
+        assert!(bridge
+            .history_write("oc_x", 1, || hist.append_user("m2", "pi", "新消息"))
+            .is_some());
+        assert_eq!(hist.entries().len(), 1);
         cleanup_bridge(&bridge);
     }
 

@@ -432,11 +432,15 @@ pub async fn run(
         .await
         {
             Ok(out) => {
-                // codex 首轮（或回退重建）抓到真实 thread_id → 回存，供后续轮 resume
+                // codex 首轮（或回退重建）抓到真实 thread_id → 回存，供后续轮 resume。
+                // sid 同步换成真实值：RunOutcome 返回的就是它——桥的 mark_started_if 按
+                // session_id 校验身份，返回旧占位 UUID 会让 codex 永远 mark 不上
+                // （started 恒 false → 每轮都当首轮新开 thread、上下文全丢；#49 审查 I-1）
                 if backend == Backend::Codex {
                     if let (Some(tid), Some(store)) = (&out.thread_id, sessions) {
                         if tid != &sid {
                             store.set_session_id(chat_id, tid);
+                            sid = tid.clone();
                         }
                     }
                 }
