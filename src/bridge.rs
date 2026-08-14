@@ -619,26 +619,28 @@ impl Bridge {
         );
         tokio::pin!(run_fut);
 
+        // 中途输出只计数不逐条留日志：编码 agent 一轮任务可推数百条进度，逐条写盘会让
+        // 日志量随任务时长无界增长（打字机路径原有 500ms 节流，微信/关停路径静默丢弃）。
+        // 统一只发最终结果：丢弃并计数，收尾汇总成一行日志，信息不减、日志量有界。
+        let mut dropped_progress = 0usize;
         let result = loop {
             tokio::select! {
-                Some(p) = prx.recv() => {
-                    // 中途处理过程消息不回（统一只发最终结果）：丢弃留日志。
-                    crate::log!(
-                        "[bridge] 丢弃中途进度 chat={} 长度={}",
-                        trunc(&ev.chat_id, 10),
-                        p.chars().count()
-                    );
+                Some(_p) = prx.recv() => {
+                    dropped_progress += 1;
                 }
                 r = &mut run_fut => { break r; }
             }
         };
         // run 完成时通道里可能还有刚入队未消费的中途输出（select 双就绪随机 break）——
         // 全部排空丢弃（agent 侧 unbounded send 不阻塞），不留残留。
-        while let Ok(p) = prx.try_recv() {
+        while let Ok(_p) = prx.try_recv() {
+            dropped_progress += 1;
+        }
+        if dropped_progress > 0 {
             crate::log!(
-                "[bridge] 丢弃中途进度(收尾排空) chat={} 长度={}",
-                trunc(&ev.chat_id, 10),
-                p.chars().count()
+                "[bridge] 丢弃中途进度 {} 条 chat={}（统一只发最终结果）",
+                dropped_progress,
+                trunc(&ev.chat_id, 10)
             );
         }
         // 任务结束 → 摘掉打断标志（后续停止词将按普通消息处理）
@@ -1162,9 +1164,10 @@ mod tests {
         }
     }
 
-    /// run 的收尾形态（默认 Reply；Err 模拟后端报错）。
+    /// run 的收尾形态（默认 Reply；Cancel 模拟被打断；Err 模拟后端报错）。
     enum MockOutcome {
         Reply,
+        Cancel,
         Fail(String),
     }
 
@@ -1177,7 +1180,6 @@ mod tests {
         block: bool,
         reply: String,
         progress_msgs: Vec<String>,
-        progress_gap: std::time::Duration,
         outcome: MockOutcome,
         prompts: Mutex<Vec<String>>,
     }
@@ -1189,7 +1191,6 @@ mod tests {
                 block: true,
                 reply: reply.into(),
                 progress_msgs: Vec::new(),
-                progress_gap: std::time::Duration::ZERO,
                 outcome: MockOutcome::Reply,
                 prompts: Mutex::new(Vec::new()),
             }
@@ -1218,6 +1219,15 @@ mod tests {
                 ..Self::blocking("（不会用到）")
             }
         }
+        /// 中途输出推完后以 Cancelled 收尾（模拟被打断）；block=false 不等 release。
+        fn with_progress_cancel(progress: &[&str]) -> Self {
+            Self {
+                progress_msgs: progress.iter().map(|s| s.to_string()).collect(),
+                outcome: MockOutcome::Cancel,
+                block: false,
+                ..Self::blocking("（不会用到）")
+            }
+        }
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().unwrap().clone()
         }
@@ -1239,12 +1249,9 @@ mod tests {
         ) -> Result<agent::RunOutcome, String> {
             self.prompts.lock().unwrap().push(prompt.to_string());
             self.started.notify_one();
-            // #42：先把中途输出推完（unbounded 即推即走），桥侧 select 循环逐条消费
+            // 先把中途输出推完（unbounded 即推即走），桥侧 select/收尾排空负责丢弃
             if let Some(tx) = &progress {
-                for (i, p) in self.progress_msgs.iter().enumerate() {
-                    if i > 0 && !self.progress_gap.is_zero() {
-                        tokio::time::sleep(self.progress_gap).await;
-                    }
+                for p in &self.progress_msgs {
                     let _ = tx.send(p.clone());
                 }
             }
@@ -1271,6 +1278,7 @@ mod tests {
                     reply: self.reply.clone(),
                     session_id: session_id.to_string(),
                 }),
+                MockOutcome::Cancel => Ok(agent::RunOutcome::Cancelled),
                 MockOutcome::Fail(e) => Err(e.clone()),
             }
         }
@@ -2272,6 +2280,34 @@ https://b.com/y"));
         task.await.unwrap();
 
         assert_eq!(msgr.sent(), vec!["后端进程退出码 1"]);
+        cleanup_bridge(&bridge);
+    }
+
+    /// 打字机下线：任务被打断时中途进度同样丢弃，只回「⏹ 已停止」一条。
+    #[tokio::test]
+    async fn cancel_drops_progress_sends_stopped_once() {
+        let runner = Arc::new(MockAgentRunner::with_progress_cancel(&["中途输出"]));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let msgr = Arc::new(MockMessenger::new());
+        let bridge = Arc::new(Bridge::build(
+            msgr.clone(),
+            bot,
+            &Config::default(),
+            runner.clone(),
+        ));
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_cx", "hi")).await });
+        task.await.unwrap(); // block=false，无需 release
+
+        assert_eq!(
+            msgr.sent(),
+            vec!["⏹ 已停止"],
+            "中途进度不得发送，只回「⏹ 已停止」一条"
+        );
         cleanup_bridge(&bridge);
     }
 }
