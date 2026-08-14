@@ -454,8 +454,9 @@ pub(crate) async fn process_comment_batch(
             && crate::github::should_auto_process(&c.body, &c.user.login, bot_login)
         {
             match crate::github::comment_issue_ref(c) {
-                Some((_n, true)) => { /* PR 评论自动处理归批次 2.3 */ }
-                Some((number, false)) => {
+                // 批次 2.3：PR 评论同样触发（合成 text 仍用 issues 形态——parse_github_cmd
+                // 要求，PR 也是 issue，fetch/post 同一套端点）
+                Some((number, _is_pr)) => {
                     match api.is_collaborator(owner, repo, &c.user.login).await {
                         Ok(Some(true)) => out.triggers.push((number, c.id)),
                         Ok(Some(false)) => crate::log!(

@@ -935,14 +935,21 @@ impl Bridge {
                         }
                     }
                     let summary = crate::agent::truncate(&reply, 200);
+                    // 批次 2.3：PR 评论触发的分析用「🔀 PR 审查」前缀（issue 用 📝）
+                    let prefix = if ctx.is_pr {
+                        "🔀 PR 审查"
+                    } else {
+                        "📝 已分析"
+                    };
                     let text = if archived {
                         format!(
-                            "📝 已分析 {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 issue 评论）",
-                            ctx.owner, ctx.repo, ctx.number, ctx.title, summary
+                            "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 {} 评论）",
+                            ctx.owner, ctx.repo, ctx.number, ctx.title, summary,
+                            if ctx.is_pr { "PR" } else { "issue" }
                         )
                     } else {
                         format!(
-                            "📝 已分析 {}/{}#{}「{}」\n\n```\n{}\n```\n\n（⚠️ 评论留档失败，全文仅此可见，可稍后重发「分析」补档）",
+                            "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（⚠️ 评论留档失败，全文仅此可见，可稍后重发「分析」补档）",
                             ctx.owner, ctx.repo, ctx.number, ctx.title, summary
                         )
                     };
@@ -3354,8 +3361,8 @@ https://b.com/y"
         .await;
         assert_eq!(
             batch.triggers,
-            vec![(42, 1), (42, 2)],
-            "评论 1/2 触发，3/4/5 不触发"
+            vec![(42, 1), (42, 2), (5, 4)],
+            "评论 1/2/4 触发（PR 评论 2.3 起同样触发），3/5 不触发"
         );
 
         // 非协作者 → 跳过
@@ -3458,6 +3465,47 @@ https://b.com/y"
         // prompt 注入 issue 内容（不可信包裹）
         let p = runner.prompts().join("\n");
         assert!(p.contains("[GitHub Issue]"));
+        assert!(p.contains("不可信数据"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// 批次 2.3：PR 评论触发的自动分析走「🔀 PR 审查」变体（mock issue 带 pull_request
+    /// 字段 = PR），留档文案与群摘要前缀随 is_pr 切换。
+    #[tokio::test]
+    async fn pr_comment_auto_process() {
+        let runner = Arc::new(MockAgentRunner::immediate("改动集中在锁粒度，建议收窄。"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            gh_token: "ghp_x".into(),
+            gh_repos: "o/r".into(),
+            gh_notify_chat: "oc_gh".into(),
+            ..Default::default()
+        };
+        let gh = MockGithub::new();
+        gh.issue.lock().unwrap().pull_request =
+            Some(serde_json::json!({"url": "https://api.github.com/repos/o/r/pulls/42"}));
+        let gh = Arc::new(gh);
+        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
+        // 合成 Ev 走 service::auto_ev（与 watch 循环实际构造一致）
+        let b = bridge.clone();
+        tokio::spawn(async move {
+            b.handle(crate::service::auto_ev("o/r", 42, 9, "oc_gh"))
+                .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(msgr.sent().len(), 1);
+        assert!(
+            msgr.sent()[0].starts_with("🔀 PR 审查 o/r#42"),
+            "PR 变体前缀，实际: {}",
+            msgr.sent()[0]
+        );
+        assert!(
+            gh.calls().iter().any(|c| c.starts_with("post:o/r/42:")),
+            "分析结果回写 PR 评论"
+        );
+        let p = runner.prompts().join("\n");
+        assert!(p.contains("来自 r PR #42"), "渲染头部带 PR 标识");
         assert!(p.contains("不可信数据"));
         cleanup_bridge(&bridge);
     }
