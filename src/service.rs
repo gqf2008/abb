@@ -378,34 +378,41 @@ async fn weixin_loop(
     crate::botstatus::clear(&key);
 }
 
-/// 一轮评论批处理结果：游标推进（+ 2.2 的自动处理触发点）。
+/// 一轮评论批处理结果：游标推进 + 自动处理触发点。
 pub(crate) struct CommentBatch {
     /// 成功处理（含无提及/无映射项）的评论 id → 进 seen。
     pub seen_extra: Vec<u64>,
     /// 私信发送失败的评论 updated_at → 游标回退重试。
     pub failed: Vec<String>,
+    /// 触发自动处理的 (issue 号, 评论 id)——调用方构造合成 Ev 交给 handle()。
+    pub triggers: Vec<(u64, u64)>,
     /// 本轮最新评论 updated_at；**None = 空批 → 调用方必须保持原游标**
     /// （写空串会把游标清掉，下一轮走静默基线 → 窗口内评论永久丢失，评审 C1）。
     pub new_since: Option<String>,
 }
 
-/// 处理一批新评论（逻辑集中、可注入 msgr，可测）：@提及 私信通知。
-/// - 排除 bot 自身 login 与评论作者自提及（GitHub 自身也抑制自通知，评审 M1）；
-/// - 作者无过滤：bot 自己的回复常引用 @login，被引用者需要知道；私信不产生 GitHub
-///   活动，无回环；且 @bot 触发判定（2.2）在作者回声处把关；
-/// - 无映射项 → 静默跳过（映射是 opt-in 门，不群发骚扰）；
-/// - 私信失败 → 该评论进 failed（游标回退，下轮重试）。
+/// 处理一批新评论（逻辑集中、可注入 api/msgr，可测）：@提及 私信 + @bot 触发判定。
+/// - 私信侧：排除 bot 自身 login 与评论作者自提及（GitHub 自身也抑制自通知）；作者无
+///   其他过滤——bot 自己的回复常引用 @login，被引用者需要知道；私信不产生 GitHub
+///   活动，无回环；无映射项 → 静默跳过（映射是 opt-in 门，不群发骚扰）；
+/// - 触发侧（护栏 b）：作者 ≠ bot + 词位 @bot 才判定；PR 评论跳过（归批次 2.3）；
+///   is_collaborator（护栏 a）：true → triggers；false → 日志跳过；Err → failed 重试；
+/// - 私信失败/协作者校验失败 → 该评论进 failed（游标回退，下轮重试）。
+#[allow(clippy::too_many_arguments)] // 注入面全（api/msgr/评论/seen/映射/身份），与 MockAgentRunner::run 同款
 pub(crate) async fn process_comment_batch(
+    api: &dyn crate::github::GithubApi,
     msgr: &dyn crate::messenger::Messenger,
     comments: &[crate::github::GhComment],
     seen: &[u64],
     mention_map: &[(String, String)],
     bot_login: &str,
     repo: &str,
+    owner: &str,
 ) -> CommentBatch {
     let mut out = CommentBatch {
         seen_extra: Vec::new(),
         failed: Vec::new(),
+        triggers: Vec::new(),
         new_since: comments.last().map(|c| c.updated_at.clone()),
     };
     for c in comments {
@@ -413,7 +420,7 @@ pub(crate) async fn process_comment_batch(
             continue;
         }
         let mut ok = true;
-        // @提及 私信：映射内 login 才发；评论 → issue/PR 号取自评论自身 html_url
+        // 1) @提及 私信：映射内 login 才发；评论 → issue/PR 号取自评论自身 html_url
         let mentions = crate::github::extract_mentions(&c.body, bot_login)
             .into_iter()
             .filter(|l| !l.eq_ignore_ascii_case(&c.user.login)) // 自提及不通知（同 GitHub）
@@ -434,6 +441,29 @@ pub(crate) async fn process_comment_batch(
                 }
             }
         }
+        // 2) @bot 自动处理触发（护栏 b：作者回声 + 词位已由 should_auto_process 把关）
+        if crate::github::should_auto_process(&c.body, &c.user.login, bot_login) {
+            match crate::github::comment_issue_ref(c) {
+                Some((_n, true)) => { /* PR 评论自动处理归批次 2.3 */ }
+                Some((number, false)) => {
+                    match api.is_collaborator(owner, repo, &c.user.login).await {
+                        Ok(true) => out.triggers.push((number, c.id)),
+                        Ok(false) => crate::log!(
+                            "[github] 跳过 @bot 触发（{repo} 非协作者 @{}）",
+                            c.user.login
+                        ),
+                        Err(e) => {
+                            crate::log!(
+                                "[github] ⚠️ 协作者校验失败 {repo} @{}: {e:#}",
+                                c.user.login
+                            );
+                            ok = false;
+                        }
+                    }
+                }
+                None => { /* 评论 URL 解析失败 → 不触发 */ }
+            }
+        }
         if ok {
             out.seen_extra.push(c.id);
         } else {
@@ -441,6 +471,25 @@ pub(crate) async fn process_comment_batch(
         }
     }
     out
+}
+
+/// 构造 @bot 自动处理的合成事件（复用 handle() 的指令门全套机制）：
+/// - mid "gh:{repo}:{issue}:{comment_id}"：天然唯一（去重 + pending 键）；
+/// - chat_id = 通知群、chat_type = "group"：不触发 save_primary_chat；
+/// - thread_id 留空：send_reply 走普通发送（非空会进 send_thread_reply 到假话题，必须空）；
+/// - text = "分析 <链接>"：命中既有门 → 白名单 → 拉取注入 → agent → 双写，零新机制。
+///
+/// repo/number 由评论自身 html_url 推导（调用方传入），评论者无法重定向分析目标。
+fn auto_ev(repo: &str, number: u64, comment_id: u64, notify_chat: &str) -> crate::bridge::Ev {
+    crate::bridge::Ev {
+        mid: format!("gh:{repo}:{number}:{comment_id}"),
+        chat_id: notify_chat.to_string(),
+        chat_type: "group".into(),
+        thread_id: String::new(),
+        quoted: Default::default(),
+        text: format!("分析 https://github.com/{repo}/issues/{number}"),
+        attachments: Vec::new(),
+    }
 }
 
 /// 睡眠 dur，但可被 stop 信号打断。返回 true=收到停止信号（调用方应 break）。
@@ -552,12 +601,14 @@ async fn github_watch_loop(
                 {
                     Ok(comments) => {
                         let batch = crate::service::process_comment_batch(
+                            bridge.github_client.as_ref(),
                             bridge.msgr.as_ref(),
                             &comments,
                             &cur.comment_seen,
                             &mention_map,
                             &echo,
                             &repo,
+                            &owner,
                         )
                         .await;
                         // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。
@@ -569,6 +620,15 @@ async fn github_watch_loop(
                         let effective = batch.failed.iter().min().cloned().or(batch.new_since);
                         if let Some(e) = effective {
                             cursor.comment_update(&repo, &e, batch.seen_extra);
+                        }
+                        // @bot 自动处理：合成 Ev 走既有指令门（白名单→拉取→agent→双写）。
+                        // 群 key 串行：与群消息共用通知群锁，长任务与手动「分析」同语义。
+                        for (number, comment_id) in batch.triggers {
+                            let bridge = bridge.clone();
+                            let ev = auto_ev(&repo, number, comment_id, &notify_chat);
+                            tokio::spawn(async move {
+                                bridge.handle(ev).await;
+                            });
                         }
                     }
                     Err(e) => {

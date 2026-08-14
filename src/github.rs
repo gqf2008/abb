@@ -638,6 +638,23 @@ pub fn has_next_page(page_len: usize, page: u32, per_page: u32, max_pages: u32) 
     page < max_pages && page_len as u32 >= per_page
 }
 
+/// 评论里是否以独立词位出现 @bot（大小写不敏感）。引用行/围栏代码块不算
+/// （复用 extract_mentions 的边界语义，护栏 b）。
+pub fn comment_triggers_bot(body: &str, bot_login: &str) -> bool {
+    !bot_login.is_empty()
+        && extract_mentions(body, "")
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(bot_login))
+}
+
+/// 自动处理总判定（护栏 b）：作者不是 bot 自己 + 评论里独立词位 @bot。
+/// bot 自己的回复常引用别人的「@bot 分析」文本——作者回声过滤防自触发死循环。
+pub fn should_auto_process(body: &str, author: &str, bot_login: &str) -> bool {
+    !bot_login.is_empty()
+        && !author.eq_ignore_ascii_case(bot_login)
+        && comment_triggers_bot(body, bot_login)
+}
+
 /// 纯函数（可测）：从一页增量结果挑「新 issue」+ 计算新游标。
 /// - since 为空（首轮/游标丢失）→ 只推进游标不通知（静默基线，避免首刷把存量 open issues 全发一遍）；
 /// - 过滤 seen 里已有的 issue 全局 id（同秒多条/时间戳回拨防重）；
@@ -817,6 +834,9 @@ pub trait GithubApi: Send + Sync {
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GhComment>>;
+    /// 评论者是否是仓库协作者：204 → true，404 → false，其余 → Err。@bot 触发的前置
+    /// 护栏（公开仓库任何人可评论 = 任何人可烧 agent 配额，仅协作者可触发）。
+    async fn is_collaborator(&self, owner: &str, repo: &str, login: &str) -> anyhow::Result<bool>;
 }
 
 pub struct GithubClient {
@@ -1018,6 +1038,27 @@ impl GithubApi for GithubClient {
             .into_iter()
             .map(|v| serde_json::from_value(v).context("评论项解析失败"))
             .collect()
+    }
+
+    async fn is_collaborator(&self, owner: &str, repo: &str, login: &str) -> anyhow::Result<bool> {
+        // 绕过 send()（非 2xx 即 bail）：404 是有效答案（非协作者）。
+        // GitHub login 只含 ASCII 字母数字与 '-'，无需 URL 编码。
+        let resp = self
+            .authed(
+                reqwest::Method::GET,
+                &format!("/repos/{owner}/{repo}/collaborators/{login}"),
+            )
+            .send()
+            .await
+            .context("github 网络错误")?;
+        match resp.status().as_u16() {
+            204 => Ok(true),
+            404 => Ok(false),
+            other => anyhow::bail!(
+                "github {other} 响应: {}",
+                crate::agent::truncate(&resp.text().await.unwrap_or_default(), 300)
+            ),
+        }
     }
 }
 
@@ -1506,6 +1547,37 @@ mod tests {
         );
         // 无提及
         assert_eq!(extract_mentions("普通讨论", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn comment_triggers_bot_rules() {
+        // 独立词位 @bot（大小写不敏感）；引用行/围栏内不算；@botbot/xxbot 不命中
+        assert!(comment_triggers_bot("@bot 分析下", "bot"));
+        assert!(comment_triggers_bot("请 @BOT 看看", "bot"));
+        assert!(!comment_triggers_bot("xxbot 分析", "bot"));
+        assert!(!comment_triggers_bot("@botbot 分析", "bot"));
+        assert!(!comment_triggers_bot("> @bot 引用不算", "bot"));
+        assert!(!comment_triggers_bot("```\n@bot 代码\n```", "bot"));
+        assert!(!comment_triggers_bot("", "bot"));
+        assert!(
+            !comment_triggers_bot("@bot 分析", ""),
+            "bot_login 空 = 不触发"
+        );
+    }
+
+    #[test]
+    fn should_auto_process_echo_skip() {
+        // 作者回声过滤（护栏 b）：bot 自己的回复引用「@bot 分析」不得自触发
+        assert!(should_auto_process("@bot 分析下", "alice", "bot"));
+        assert!(
+            !should_auto_process("@bot 分析下", "bot", "bot"),
+            "作者==bot 不触发"
+        );
+        assert!(
+            !should_auto_process("@bot 分析下", "BOT", "bot"),
+            "大小写同判"
+        );
+        assert!(!should_auto_process("普通讨论", "alice", "bot"));
     }
 
     #[test]

@@ -629,7 +629,7 @@ impl Bridge {
         self.handle(ev).await;
     }
 
-    async fn handle(&self, ev: Ev) {
+    pub async fn handle(&self, ev: Ev) {
         let t0 = std::time::Instant::now();
         crate::log!(
             "[bridge] 收到消息 bot={} chat={} mid={} text={:?}",
@@ -1415,6 +1415,9 @@ mod tests {
         comments: Mutex<Vec<crate::github::GhComment>>,
         fail_fetch: bool,
         fail_post: bool,
+        /// is_collaborator 返回值（默认 true=协作者）；fail_collab=true 时返回 Err。
+        collab: bool,
+        fail_collab: bool,
     }
     impl MockGithub {
         fn new() -> Self {
@@ -1446,6 +1449,8 @@ mod tests {
                 }]),
                 fail_fetch: false,
                 fail_post: false,
+                collab: true,
+                fail_collab: false,
             }
         }
         fn calls(&self) -> Vec<String> {
@@ -1456,6 +1461,12 @@ mod tests {
         }
         fn set_fail_post(&mut self) {
             self.fail_post = true;
+        }
+        fn set_collab(&mut self, v: bool) {
+            self.collab = v;
+        }
+        fn set_fail_collab(&mut self) {
+            self.fail_collab = true;
         }
     }
     #[async_trait]
@@ -1545,6 +1556,21 @@ mod tests {
                 .unwrap()
                 .push(format!("comments:{owner}/{repo}:{since}"));
             Ok(self.comments.lock().unwrap().clone())
+        }
+        async fn is_collaborator(
+            &self,
+            owner: &str,
+            repo: &str,
+            login: &str,
+        ) -> anyhow::Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("collab:{owner}/{repo}:{login}"));
+            if self.fail_collab {
+                anyhow::bail!("模拟协作者校验失败");
+            }
+            Ok(self.collab)
         }
     }
 
@@ -3181,17 +3207,24 @@ https://b.com/y"
             // 引用行内的 @ 不算
             mk(3, "> @alice 旧讨论\n新讨论", "carol"),
             // 围栏代码块内的 @ 不算（评审 M4）
-            mk(5, "```rust\nlet x = \"@alice\";\n```\n@alice 真提及", "dave"),
+            mk(
+                5,
+                "```rust\nlet x = \"@alice\";\n```\n@alice 真提及",
+                "dave",
+            ),
             // 已在 seen → 跳过
             mk(4, "@alice 已处理过", "bob"),
         ];
+        let gh = Arc::new(MockGithub::new());
         let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
             msgr.as_ref(),
             &comments,
             &[4],
             &[("alice".to_string(), "oc_alice".to_string())],
             "bot",
             "o/r",
+            "o",
         )
         .await;
         // 私信目标断言：@alice 的评论 1 与 5（代码块内不算，但块后真提及算）发到 oc_alice；
@@ -3211,13 +3244,16 @@ https://b.com/y"
     #[tokio::test]
     async fn comment_batch_empty_keeps_cursor() {
         let msgr = Arc::new(MockMessenger::new());
+        let gh = Arc::new(MockGithub::new());
         let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
             msgr.as_ref(),
             &[],
             &[],
             &[],
             "bot",
             "o/r",
+            "o",
         )
         .await;
         assert!(batch.seen_extra.is_empty());
@@ -3233,17 +3269,21 @@ https://b.com/y"
         let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
             id,
             body: body.into(),
-            user: crate::github::GhUser { login: login.into() },
+            user: crate::github::GhUser {
+                login: login.into(),
+            },
             created_at: "2026-08-14T02:00:00Z".into(),
             updated_at: format!("2026-08-14T0{id}:05:00Z"),
             html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
         };
         let comments = vec![
-            mk(1, "@alice 失败", "bob"),        // updated 02:01:05 → failed
-            mk(2, "@carol 成功", "bob"),        // updated 02:02:05 → seen
-            mk(3, "@alice 再失败", "dave"),     // updated 02:03:05 → failed
+            mk(1, "@alice 失败", "bob"),    // updated 02:01:05 → failed
+            mk(2, "@carol 成功", "bob"),    // updated 02:02:05 → seen
+            mk(3, "@alice 再失败", "dave"), // updated 02:03:05 → failed
         ];
+        let gh = Arc::new(MockGithub::new());
         let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
             msgr.as_ref(),
             &comments,
             &[],
@@ -3253,11 +3293,158 @@ https://b.com/y"
             ],
             "bot",
             "o/r",
+            "o",
         )
         .await;
         assert_eq!(batch.seen_extra, vec![2], "成功评论进 seen");
         // 回退到最早失败评论的 updated_at（评审：取 min 而非最后失败者）
-        assert_eq!(batch.failed, vec!["2026-08-14T01:05:00Z", "2026-08-14T03:05:00Z"]);
+        assert_eq!(
+            batch.failed,
+            vec!["2026-08-14T01:05:00Z", "2026-08-14T03:05:00Z"]
+        );
         assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T03:05:00Z"));
+    }
+    /// 2.2 触发判定：协作者评论 @bot → triggers；非协作者 → 跳过；PR 评论 → 留 2.3；
+    /// 作者 == bot（回声）→ 跳过。
+    #[tokio::test]
+    async fn comment_batch_trigger_and_collaborator_gate() {
+        let mk = |id: u64, body: &str, login: &str, url: &str| crate::github::GhComment {
+            id,
+            body: body.into(),
+            user: crate::github::GhUser {
+                login: login.into(),
+            },
+            created_at: "2026-08-14T02:00:00Z".into(),
+            updated_at: format!("2026-08-14T02:{id:02}:00Z"),
+            html_url: url.into(),
+        };
+        let issue_url = "https://github.com/o/r/issues/42#issuecomment-1";
+        let pr_url = "https://github.com/o/r/pull/5#issuecomment-1";
+        let comments = vec![
+            mk(1, "@bot 分析下这个", "alice", issue_url), // 协作者（默认）→ 触发
+            mk(2, "@BOT 再看看", "bob", issue_url),       // 大小写不敏感
+            mk(3, "@bot 分析", "bot", issue_url),         // 作者回声 → 不触发
+            mk(4, "@bot 审查下 PR", "alice", pr_url),     // PR 评论 → 2.2 跳过
+            mk(5, "xxbot 分析", "alice", issue_url),      // 词位不符 → 不触发
+        ];
+        let msgr = Arc::new(MockMessenger::new());
+        let gh = Arc::new(MockGithub::new());
+        let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
+            msgr.as_ref(),
+            &comments,
+            &[],
+            &[],
+            "bot",
+            "o/r",
+            "o",
+        )
+        .await;
+        assert_eq!(
+            batch.triggers,
+            vec![(42, 1), (42, 2)],
+            "评论 1/2 触发，3/4/5 不触发"
+        );
+
+        // 非协作者 → 跳过
+        let mut gh2 = MockGithub::new();
+        gh2.set_collab(false);
+        let gh2 = Arc::new(gh2);
+        let batch2 = crate::service::process_comment_batch(
+            gh2.as_ref(),
+            msgr.as_ref(),
+            &comments[..1],
+            &[],
+            &[],
+            "bot",
+            "o/r",
+            "o",
+        )
+        .await;
+        assert!(batch2.triggers.is_empty(), "非协作者不触发");
+        assert_eq!(batch2.seen_extra, vec![1], "仍算处理过（不重试）");
+    }
+
+    /// 2.2 协作者校验失败 → 评论进 failed（游标回退重试）。
+    #[tokio::test]
+    async fn comment_batch_collaborator_error_rewinds() {
+        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
+            id,
+            body: body.into(),
+            user: crate::github::GhUser {
+                login: login.into(),
+            },
+            created_at: "2026-08-14T02:00:00Z".into(),
+            updated_at: format!("2026-08-14T02:{id:02}:00Z"),
+            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
+        };
+        let comments = vec![mk(1, "@bot 分析", "alice"), mk(2, "普通讨论", "bob")];
+        let msgr = Arc::new(MockMessenger::new());
+        let mut gh = MockGithub::new();
+        gh.set_fail_collab();
+        let gh = Arc::new(gh);
+        let batch = crate::service::process_comment_batch(
+            gh.as_ref(),
+            msgr.as_ref(),
+            &comments,
+            &[],
+            &[],
+            "bot",
+            "o/r",
+            "o",
+        )
+        .await;
+        assert!(batch.triggers.is_empty());
+        assert_eq!(batch.seen_extra, vec![2], "普通评论照常进 seen");
+        assert_eq!(
+            batch.failed,
+            vec!["2026-08-14T02:01:00Z"],
+            "校验失败评论回退"
+        );
+    }
+
+    /// 2.2 合成 Ev 复用 handle()：同 mid 两次 handle 只 post 一次（去重）。
+    #[tokio::test]
+    async fn auto_process_reuses_handle_and_dedupe_mid() {
+        let runner = Arc::new(MockAgentRunner::immediate("根因是 token 缓存竞态。"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            gh_token: "ghp_x".into(),
+            gh_repos: "o/r".into(),
+            gh_notify_chat: "oc_gh".into(),
+            ..Default::default()
+        };
+        let gh = Arc::new(MockGithub::new());
+        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
+        let ev = |mid: &str| crate::bridge::Ev {
+            mid: mid.into(),
+            chat_id: "oc_gh".into(),
+            chat_type: "group".into(),
+            thread_id: String::new(),
+            quoted: Default::default(),
+            text: "分析 https://github.com/o/r/issues/42".into(),
+            attachments: Vec::new(),
+        };
+        // 同一评论 id 的合成 Ev 触发两次 → mid 去重只处理一次
+        let b1 = bridge.clone();
+        let t1 = tokio::spawn(async move { b1.handle(ev("gh:o/r:42:1")).await });
+        t1.await.unwrap();
+        let b2 = bridge.clone();
+        let t2 = tokio::spawn(async move { b2.handle(ev("gh:o/r:42:1")).await });
+        t2.await.unwrap();
+        let posts = gh
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("post:"))
+            .count();
+        assert_eq!(posts, 1, "同 mid 去重，只回写一次");
+        // 群摘要恰一条
+        assert_eq!(msgr.sent().len(), 1);
+        assert!(msgr.sent()[0].starts_with("📝 已分析 o/r#42"));
+        // prompt 注入 issue 内容（不可信包裹）
+        let p = runner.prompts().join("\n");
+        assert!(p.contains("[GitHub Issue]"));
+        assert!(p.contains("不可信数据"));
+        cleanup_bridge(&bridge);
     }
 }
