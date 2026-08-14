@@ -695,10 +695,13 @@ fn claude_command(
 
 /// codex 会话命令构造（exec / exec resume，含桥内供应商 -c 注入）。
 /// restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
-/// 但不可写任何文件）+ --approval-policy never（绝不询问，需要审批的操作直接失败）。
-/// 已知局限（尽力隔离，用户已确认接受）：read-only 沙箱可读全盘，防读靠 guard 生成的
-/// execpolicy forbid 敏感命令 + 网络默认受限；macOS 上 codex 网络隔离历史上不可靠，
-/// 需实测；read-only 下 $ABB_BIN 写 jobs.json（定时任务）与 outbox（投递）不可用。
+/// 但不可写任何文件）。审批策略不传额外参数：codex exec 非交互（stdin 管道 + EOF）
+/// 时需审批的操作被当作「用户拒绝」自动取消（openai/codex #24135 实测结论）。
+/// 已知局限（尽力隔离，2026-08-14 实测）：① read-only 沙箱可读全盘——敏感读只能靠
+/// 网络拦截兜底，无法 100% 防「读进回复」；② 网络拦截本机实测有效（curl DNS 失败），
+/// 但 macOS 上 codex 网络隔离历史上不可靠，需按环境复测；③ execpolicy 在 codex
+/// 0.147 上机制不明（文档与实测不符、写入 config.toml 会破坏登录态）→ 不生成；
+/// ④ read-only 下 $ABB_BIN 写 jobs.json（定时任务）与 outbox（投递）不可用。
 fn codex_command(
     program: &std::path::Path,
     resume: bool,
@@ -713,10 +716,7 @@ fn codex_command(
     }
     c.arg("--json").arg("--skip-git-repo-check");
     if restricted {
-        c.arg("--sandbox")
-            .arg("read-only")
-            .arg("--approval-policy")
-            .arg("never");
+        c.arg("--sandbox").arg("read-only");
     } else {
         c.arg("--dangerously-bypass-approvals-and-sandbox");
     }
@@ -1615,8 +1615,9 @@ mod tests {
 
     #[test]
     fn codex_command_restricted_uses_readonly_sandbox() {
-        // 受限模式：--sandbox read-only + --approval-policy never（绝不询问），
-        // 不带全权限旗标；-c 供应商注入两分支都保留
+        // 受限模式：--sandbox read-only（OS 级写禁；审批靠非交互 EOF 自动拒绝，
+        // codex 0.147 实测无 --approval-policy flag），不带全权限旗标；
+        // -c 供应商注入两分支都保留
         let extra = vec!["model_provider=abc".to_string()];
         let c = codex_command(std::path::Path::new("codex"), false, "tid-1", &extra, true);
         let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
@@ -1628,8 +1629,10 @@ mod tests {
         );
         assert!(args.iter().any(|a| *a == "--sandbox"));
         assert!(args.iter().any(|a| *a == "read-only"));
-        assert!(args.iter().any(|a| *a == "--approval-policy"));
-        assert!(args.iter().any(|a| *a == "never"));
+        assert!(
+            !args.iter().any(|a| *a == "--approval-policy"),
+            "codex 0.147 无该 flag（实测会报 unexpected argument）"
+        );
         assert!(args.iter().any(|a| *a == "-c"));
         assert!(args.iter().any(|a| *a == "model_provider=abc"));
         // resume 形态

@@ -2,12 +2,11 @@
 //!
 //! 威胁：授权者驱动 agent 时可访问 owner 机器上一切数据（config.json 凭证、
 //! `.ssh`、主目录）并外泄。claude 侧靠 PreToolUse hook 做最终硬闸（hook 在
-//! 全权限旗标与未信任目录下都执行）；codex 侧靠 OS 沙箱（read-only）+ execpolicy
-//! forbid 网络/代码执行命令（尽力隔离，局限见 agent.rs codex_command 注释）。
+//! 全权限旗标与未信任目录下都执行）；codex 侧靠 OS 沙箱（read-only）+ 网络
+//! 拦截（尽力隔离，局限见 agent.rs codex_command 注释）。
 //!
 //! 防篡改闭环：guard 文件（settings.json）放在工作区外 `~/.agent-bridge/guard/`，
-//! 受限 agent 的 Edit/Write/Bash 都够不着——agent 无法改写 hook 放行自己；
-//! execpolicy 在工作区内但受 read-only 沙箱保护（沙箱内不可写）。
+//! 受限 agent 的 Edit/Write/Bash 都够不着——agent 无法改写 hook 放行自己。
 //!
 //! hook 决策流程：`"$ABB_BIN" guard-check` 由 claude 以子进程执行，stdin 收
 //! hook 事件 JSON，stdout 输出决策 JSON（deny 时 claude 拒绝该工具调用并把
@@ -27,18 +26,17 @@ pub fn guard_settings_path(bot_key: &str) -> PathBuf {
 }
 
 /// 幂等生成受限会话的 guard 文件（受限 spawn 前调用；内容静态，直接覆盖重写最稳）：
-/// - settings.json：claude PreToolUse hook 指向 `"$ABB_BIN" guard-check`
-///   （ABB_BIN 绝对路径烘焙进 command，避免依赖 hook 子进程的 env 展开）
-/// - .codex/execpolicy/abb.rules：codex forbid 网络外发/代码执行类命令
-///   （read-only 沙箱下 agent 不可篡改）
+/// settings.json：claude PreToolUse hook 指向 `"$ABB_BIN" guard-check`
+/// （ABB_BIN 绝对路径烘焙进 command，避免依赖 hook 子进程的 env 展开）。
+/// 注：codex 侧不再生成 execpolicy——codex 0.147 实测其机制与文档不符
+/// （requirements.toml/prefix_rules 均未生效、写入 config.toml 会破坏登录态），
+/// codex 受限依赖 read-only 沙箱 + 网络拦截（实测有效），见 agent.rs codex_command 注释。
 pub fn ensure_guard_files(bot_key: &str) -> std::io::Result<()> {
-    let ws = crate::workspace_dir(bot_key);
-    let _ = std::fs::create_dir_all(&ws); // execpolicy 写入需要 workspace 存在（spawn 前已有，双保险）
-    ensure_guard_files_at(&guard_dir(bot_key), &ws, &std::env::current_exe()?)
+    ensure_guard_files_at(&guard_dir(bot_key), &std::env::current_exe()?)
 }
 
 /// ensure_guard_files 的内部实现（目录/可执行文件可注入，单测用）。
-fn ensure_guard_files_at(guard_dir: &Path, workspace: &Path, exe: &Path) -> std::io::Result<()> {
+fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(guard_dir)?;
     let exe_str = exe.to_string_lossy();
     let settings = serde_json::json!({
@@ -57,37 +55,6 @@ fn ensure_guard_files_at(guard_dir: &Path, workspace: &Path, exe: &Path) -> std:
         &guard_dir.join("settings.json"),
         &serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?,
     )?;
-    // codex execpolicy（Starlark）：forbid 网络外发与代码执行类命令。
-    // 注意 pattern 是「命令前缀」匹配；cat/grep 等读文件命令不 forbid
-    //（codex 无 Read 工具，读文件靠 Bash；防读靠网络隔离 + 读全盘局限已写文档）。
-    let ep_dir = workspace.join(".codex").join("execpolicy");
-    std::fs::create_dir_all(&ep_dir)?;
-    let rules = r#"// ABB 授权者受限会话：forbid 网络外发与代码执行类命令（尽力隔离第二道防线；
-// 主防线是 --sandbox read-only + --approval-policy never）。
-prefix_rule(pattern=["curl"], decision="forbidden")
-prefix_rule(pattern=["wget"], decision="forbidden")
-prefix_rule(pattern=["nc"], decision="forbidden")
-prefix_rule(pattern=["ncat"], decision="forbidden")
-prefix_rule(pattern=["telnet"], decision="forbidden")
-prefix_rule(pattern=["ssh"], decision="forbidden")
-prefix_rule(pattern=["scp"], decision="forbidden")
-prefix_rule(pattern=["sftp"], decision="forbidden")
-prefix_rule(pattern=["rsync"], decision="forbidden")
-prefix_rule(pattern=["python"], decision="forbidden")
-prefix_rule(pattern=["python3"], decision="forbidden")
-prefix_rule(pattern=["perl"], decision="forbidden")
-prefix_rule(pattern=["ruby"], decision="forbidden")
-prefix_rule(pattern=["node"], decision="forbidden")
-prefix_rule(pattern=["php"], decision="forbidden")
-prefix_rule(pattern=["base64"], decision="forbidden")
-prefix_rule(pattern=["xxd"], decision="forbidden")
-prefix_rule(pattern=["openssl"], decision="forbidden")
-prefix_rule(pattern=["plutil"], decision="forbidden")
-prefix_rule(pattern=["security"], decision="forbidden")
-prefix_rule(pattern=["sqlite3"], decision="forbidden")
-prefix_rule(pattern=["strings"], decision="forbidden")
-"#;
-    crate::atomic_write_text(&ep_dir.join("abb.rules"), rules)?;
     Ok(())
 }
 
@@ -564,11 +531,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_guard_files_writes_settings_and_rules() {
+    fn ensure_guard_files_writes_settings() {
         let (root, ws, guard) = temp_guard_env();
         ensure_guard_files_at(
             &guard,
-            &ws,
             Path::new("/Applications/ABB.app/Contents/MacOS/abb"),
         )
         .unwrap();
@@ -585,18 +551,13 @@ mod tests {
         );
         assert!(cmd.contains("guard-check"));
         assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "*");
-        // execpolicy：forbid 网络/代码执行命令
-        let rules = std::fs::read_to_string(ws.join(".codex").join("execpolicy").join("abb.rules"))
-            .unwrap();
-        assert!(rules.contains("prefix_rule(pattern=[\"curl\"], decision=\"forbidden\")"));
-        assert!(rules.contains("prefix_rule(pattern=[\"python3\"], decision=\"forbidden\")"));
         // 幂等：再写一次不报错
         ensure_guard_files_at(
             &guard,
-            &ws,
             Path::new("/Applications/ABB.app/Contents/MacOS/abb"),
         )
         .unwrap();
         let _ = root;
+        let _ = ws;
     }
 }
