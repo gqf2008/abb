@@ -173,20 +173,37 @@ fn set_app_icon() {
     // objc selector 缓存（usize 存储，原始指针非 Send/Sync；进程内全局常量地址，缓存安全）。
     type Sels = (usize, usize, usize, usize, usize, usize, usize, usize);
     static SELS: OnceLock<Sels> = OnceLock::new();
-    let (shared_app, alloc, init_with_data, data_with_file, init_with_file, set_size, set_app_icon, release) =
-        *SELS.get_or_init(|| unsafe {
-            (
-                sel_registerName(c"sharedApplication".as_ptr()) as usize,
-                sel_registerName(c"alloc".as_ptr()) as usize,
-                sel_registerName(c"initWithData:".as_ptr()) as usize,
-                sel_registerName(c"dataWithContentsOfFile:".as_ptr()) as usize,
-                sel_registerName(c"initWithContentsOfFile:".as_ptr()) as usize,
-                sel_registerName(c"setSize:".as_ptr()) as usize,
-                sel_registerName(c"setApplicationIconImage:".as_ptr()) as usize,
-                sel_registerName(c"release".as_ptr()) as usize,
-            )
-        });
-    let (shared_app, alloc, init_with_data, data_with_file, init_with_file, set_size, set_app_icon, release) = (
+    let (
+        shared_app,
+        alloc,
+        init_with_data,
+        data_with_file,
+        init_with_file,
+        set_size,
+        set_app_icon,
+        release,
+    ) = *SELS.get_or_init(|| unsafe {
+        (
+            sel_registerName(c"sharedApplication".as_ptr()) as usize,
+            sel_registerName(c"alloc".as_ptr()) as usize,
+            sel_registerName(c"initWithData:".as_ptr()) as usize,
+            sel_registerName(c"dataWithContentsOfFile:".as_ptr()) as usize,
+            sel_registerName(c"initWithContentsOfFile:".as_ptr()) as usize,
+            sel_registerName(c"setSize:".as_ptr()) as usize,
+            sel_registerName(c"setApplicationIconImage:".as_ptr()) as usize,
+            sel_registerName(c"release".as_ptr()) as usize,
+        )
+    });
+    let (
+        shared_app,
+        alloc,
+        init_with_data,
+        data_with_file,
+        init_with_file,
+        set_size,
+        set_app_icon,
+        release,
+    ) = (
         shared_app as Sel,
         alloc as Sel,
         init_with_data as Sel,
@@ -218,7 +235,11 @@ fn set_app_icon() {
             Err(_) => return,
         };
         let nsstring_cls = objc_getClass(c"NSString".as_ptr());
-        let path_str = msg1(nsstring_cls, sel_registerName(c"stringWithUTF8String:".as_ptr()), cpath.as_ptr() as Id);
+        let path_str = msg1(
+            nsstring_cls,
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            cpath.as_ptr() as Id,
+        );
         if path_str.is_null() {
             return;
         }
@@ -237,7 +258,14 @@ fn set_app_icon() {
             let img = msg1(msg0(nsimage_cls, alloc), init_with_data, data);
             if !img.is_null() {
                 // 不设 size 会按 PNG 像素(1024)当点尺寸画 → Dock 图标巨大。设成 Dock 标准点尺寸。
-                msg_size(img, set_size, NSSize { width: 512.0, height: 512.0 });
+                msg_size(
+                    img,
+                    set_size,
+                    NSSize {
+                        width: 512.0,
+                        height: 512.0,
+                    },
+                );
             }
             img
         };
@@ -397,7 +425,15 @@ pub fn set_autostart(enable: bool) -> Result<()> {
     let out = if enable {
         let val = format!("\"{}\"", exe.display());
         run_reg(&[
-            "add", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/t", "REG_SZ", "/d", &val, "/f",
+            "add",
+            AUTOSTART_RUN_KEY,
+            "/v",
+            AUTOSTART_VALUE,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &val,
+            "/f",
         ])
     } else {
         run_reg(&["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
@@ -500,14 +536,18 @@ pub fn migrate_to_agent_bridge() {
 /// ensure_workspace_guide 只在文件不存在时写，所以存量文件必须在这里就地改。
 /// 替换顺序：先换 FEISHU_* 全大写（与 feishu-bridge 无交集，防子串误伤），再换产品名。
 fn rewrite_workspace_guides(workspaces: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(workspaces) else { return };
+    let Ok(entries) = std::fs::read_dir(workspaces) else {
+        return;
+    };
     for ws in entries.flatten() {
         if !ws.path().is_dir() {
             continue;
         }
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let p = ws.path().join(name);
-            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             let new = text
                 .replace("FEISHU_CHAT_ID", "AGENT_BRIDGE_CHAT_ID")
                 .replace("FEISHU_BOT_KEY", "AGENT_BRIDGE_BOT_KEY")

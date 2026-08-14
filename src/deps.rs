@@ -90,9 +90,13 @@ pub fn composed_path() -> String {
     push_env(&mut parts, "LOCALAPPDATA", "Programs\\nodejs");
     push_env(&mut parts, "USERPROFILE", ".local\\bin");
     push_env(&mut parts, "USERPROFILE", ".cargo\\bin");
-    push_env(&mut parts, "USERPROFILE", "AppData\\Local\\Microsoft\\WinGet\\Links");
+    push_env(
+        &mut parts,
+        "USERPROFILE",
+        "AppData\\Local\\Microsoft\\WinGet\\Links",
+    );
     push_env(&mut parts, "USERPROFILE", "scoop\\shims"); // scoop 安装的 cli shim
-    // nvm-windows：npm 全局 bin 落在 nvm 当前版本目录（NVM_HOME 或 %APPDATA%\nvm）
+                                                         // nvm-windows：npm 全局 bin 落在 nvm 当前版本目录（NVM_HOME 或 %APPDATA%\nvm）
     if let Ok(nvm) = std::env::var("NVM_HOME") {
         parts.push(PathBuf::from(nvm).to_string_lossy().into_owned());
     } else {
@@ -315,7 +319,10 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
             ],
             "node" => vec![InstallStep::exec("brew", &["install", "node"])],
             "python3" => vec![InstallStep::exec("brew", &["install", "python"])],
-            "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
+            "lark-cli" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "@larksuite/cli"],
+            )],
             // 钉钉 CLI：npm 为主，回落 brew tap + install（官方同样提供 curl 一行安装器）
             "dingtalk-cli" => vec![
                 InstallStep::exec("npm", &["install", "-g", "dingtalk-workspace-cli"]),
@@ -340,7 +347,10 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 "npm",
                 &["install", "-g", "@anthropic-ai/claude-code"],
             )],
-            "codex" => vec![InstallStep::exec("npm", &["install", "-g", "@openai/codex"])],
+            "codex" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "@openai/codex"],
+            )],
             "pi" => vec![InstallStep::exec(
                 "npm",
                 &[
@@ -351,8 +361,14 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 ],
             )],
             "node" => vec![InstallStep::exec("winget", &["install", "OpenJS.NodeJS"])],
-            "python3" => vec![InstallStep::exec("winget", &["install", "Python.Python.3.12"])],
-            "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
+            "python3" => vec![InstallStep::exec(
+                "winget",
+                &["install", "Python.Python.3.12"],
+            )],
+            "lark-cli" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "@larksuite/cli"],
+            )],
             "dingtalk-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "dingtalk-workspace-cli"],
@@ -368,7 +384,10 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
             ],
-            "codex" => vec![InstallStep::exec("npm", &["install", "-g", "@openai/codex"])],
+            "codex" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "@openai/codex"],
+            )],
             "pi" => vec![InstallStep::exec(
                 "npm",
                 &[
@@ -379,21 +398,20 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 ],
             )],
             // linux 包管理器按二进制探测：优先 apt-get，其次 dnf。
-            "node" => vec![
-                InstallStep::shell(
-                    "if command -v apt-get >/dev/null; then sudo apt-get install -y nodejs npm; \
+            "node" => vec![InstallStep::shell(
+                "if command -v apt-get >/dev/null; then sudo apt-get install -y nodejs npm; \
                      elif command -v dnf >/dev/null; then sudo dnf install -y nodejs npm; \
                      else echo 'no-supported-pkg-mgr' >&2; exit 1; fi",
-                ),
-            ],
-            "python3" => vec![
-                InstallStep::shell(
-                    "if command -v apt-get >/dev/null; then sudo apt-get install -y python3; \
+            )],
+            "python3" => vec![InstallStep::shell(
+                "if command -v apt-get >/dev/null; then sudo apt-get install -y python3; \
                      elif command -v dnf >/dev/null; then sudo dnf install -y python3; \
                      else echo 'no-supported-pkg-mgr' >&2; exit 1; fi",
-                ),
-            ],
-            "lark-cli" => vec![InstallStep::exec("npm", &["install", "-g", "@larksuite/cli"])],
+            )],
+            "lark-cli" => vec![InstallStep::exec(
+                "npm",
+                &["install", "-g", "@larksuite/cli"],
+            )],
             "dingtalk-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "dingtalk-workspace-cli"],
@@ -430,8 +448,14 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
                     return Ok(tail);
                 }
-                last_err = format!("步骤{}跑完但未在 PATH 找到 {dep_id}（可能需重开终端/刷新 PATH）", i + 1);
-                crate::log!("[deps] {dep_id} 步骤{} 退出0但检测不到，尝试回落步骤", i + 1);
+                last_err = format!(
+                    "步骤{}跑完但未在 PATH 找到 {dep_id}（可能需重开终端/刷新 PATH）",
+                    i + 1
+                );
+                crate::log!(
+                    "[deps] {dep_id} 步骤{} 退出0但检测不到，尝试回落步骤",
+                    i + 1
+                );
             }
             Err(e) => {
                 crate::log!("[deps] {dep_id} 步骤{}失败：{}", i + 1, e);
@@ -466,9 +490,7 @@ async fn run_step(step: &InstallStep) -> Result<String, String> {
         // 防安装器交互卡住（npm/brew 遇到提示读 stdin 会 EOF 继续，不会死等）。
         .stdin(Stdio::null());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("启动失败：{e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("启动失败：{e}"))?;
     let out_tail = read_tail(child.stdout.take());
     let err_tail = read_tail(child.stderr.take());
     let status = child
@@ -651,17 +673,19 @@ fn tcc_auth(db: &std::path::Path, service: &str, client: &str) -> Option<i64> {
     let mut stmt = con
         .prepare("SELECT MAX(auth_value) FROM access WHERE service=?1 AND client=?2")
         .ok()?;
-    stmt.query_row(rusqlite::params![service, client], |r| r.get::<_, Option<i64>>(0))
-        .ok()
-        .flatten()
+    stmt.query_row(rusqlite::params![service, client], |r| {
+        r.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(target_os = "macos")]
 fn state_of(auth: Option<i64>) -> PermState {
     match auth {
-        Some(2) => PermState::Granted,       // allowed（含 user-intent 落库）
-        Some(3) => PermState::Denied,        // denied
-        _ => PermState::NotDetermined,       // 0 / 无行 / 其它
+        Some(2) => PermState::Granted, // allowed（含 user-intent 落库）
+        Some(3) => PermState::Denied,  // denied
+        _ => PermState::NotDetermined, // 0 / 无行 / 其它
     }
 }
 
@@ -697,7 +721,11 @@ fn av_state(sym: &std::ffi::CStr) -> PermState {
         }
         let f: unsafe extern "C" fn(Id, Sel, Id) -> i64 =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        match f(cls, sel_registerName(c"authorizationStatusForMediaType:".as_ptr()), media) {
+        match f(
+            cls,
+            sel_registerName(c"authorizationStatusForMediaType:".as_ptr()),
+            media,
+        ) {
             3 => PermState::Granted,
             2 => PermState::Denied,
             _ => PermState::NotDetermined, // 0 / 1
@@ -738,9 +766,7 @@ fn accessibility_state() -> PermState {
 /// 比读 TCC 库可靠（路径身份对 ad-hoc 二进制落库不稳，且 WAL 可能读到旧值）。
 #[cfg(target_os = "macos")]
 fn full_disk_state() -> PermState {
-    let probe = dirs::home_dir()
-        .unwrap_or_default()
-        .join("Library/Safari");
+    let probe = dirs::home_dir().unwrap_or_default().join("Library/Safari");
     match std::fs::read_dir(&probe) {
         Ok(_) => PermState::Granted,
         // 目录存在但读不到 = 明确无权限；目录本身不存在（全新机）无法判定，按未决定
@@ -800,25 +826,29 @@ pub fn detect_permissions() -> Vec<PermStatus> {
             id: "full-disk",
             label: "完全磁盘访问",
             state: full_disk_state(),
-            settings_url: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
         },
         PermStatus {
             id: "accessibility",
             label: "辅助功能（控制鼠标键盘）",
             state: accessibility_state(),
-            settings_url: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         },
         PermStatus {
             id: "screen",
             label: "屏幕录制",
             state: screen_state(),
-            settings_url: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
         },
         PermStatus {
             id: "automation",
             label: "自动化（AppleEvents）",
             state: automation_state(&client),
-            settings_url: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
         },
         PermStatus {
             id: "camera",
@@ -830,7 +860,8 @@ pub fn detect_permissions() -> Vec<PermStatus> {
             id: "microphone",
             label: "麦克风",
             state: av_state(c"AVMediaTypeAudio"),
-            settings_url: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
         },
     ]
 }
@@ -850,7 +881,15 @@ mod tests {
         let all = detect_all();
         assert_eq!(all.len(), 7);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
-        for want in ["claude", "codex", "pi", "node", "python3", "lark-cli", "dingtalk-cli"] {
+        for want in [
+            "claude",
+            "codex",
+            "pi",
+            "node",
+            "python3",
+            "lark-cli",
+            "dingtalk-cli",
+        ] {
             assert!(ids.contains(&want), "缺 {want}");
         }
     }
@@ -884,11 +923,20 @@ mod tests {
         {
             assert_eq!(perms.len(), 6);
             let ids: Vec<&str> = perms.iter().map(|p| p.id).collect();
-            for want in ["full-disk", "accessibility", "screen", "automation", "camera", "microphone"] {
+            for want in [
+                "full-disk",
+                "accessibility",
+                "screen",
+                "automation",
+                "camera",
+                "microphone",
+            ] {
                 assert!(ids.contains(&want), "缺 {want}");
             }
             // 每项都有可跳的设置面板 URL
-            assert!(perms.iter().all(|p| p.settings_url.starts_with("x-apple.systempreferences:")));
+            assert!(perms
+                .iter()
+                .all(|p| p.settings_url.starts_with("x-apple.systempreferences:")));
         }
         #[cfg(target_os = "windows")]
         {

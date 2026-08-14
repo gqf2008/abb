@@ -59,6 +59,9 @@ pub struct Ev {
     pub text: String,
     /// 已下载到工作区的附件元数据（#12）。纯附件消息 text 为空但 attachments 非空。
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
+    /// 发送者角色（owner=全权限 / granted=受限）：入口准入闸推导，agent 调用处
+    /// 按此选受限分支；pending 重放路径从 PendingItem.role 恢复。
+    pub role: crate::config::SenderRole,
 }
 
 impl Ev {
@@ -129,6 +132,29 @@ impl Bridge {
     /// 快照 = self.bot（build 时从 config 复制，含 kind 与全部访问字段）。
     fn access_snapshot_allows(&self, sender_id: &str) -> bool {
         self.bot.access_allows(sender_id)
+    }
+
+    /// 热读 config 推导（准入, 发送者角色）——on_payload / on_dingtalk 共用同一份
+    /// load+find+快照回落，避免两个入口各写一份导致准入与角色推导漂移
+    /// （同一发送者在不同通道被推导成不同角色 = 授权者拿到 owner 权限或反之）。
+    fn access_and_role(&self, sender_id: &str) -> (bool, crate::config::SenderRole) {
+        match crate::config::Config::load() {
+            Ok(c) => c
+                .bots
+                .into_iter()
+                .find(|b| b.key() == self.bot.key())
+                .map(|b| (b.access_allows(sender_id), b.sender_role(sender_id)))
+                .unwrap_or_else(|| {
+                    (
+                        self.access_snapshot_allows(sender_id),
+                        self.bot.sender_role(sender_id),
+                    )
+                }),
+            Err(_) => (
+                self.access_snapshot_allows(sender_id),
+                self.bot.sender_role(sender_id),
+            ),
+        }
     }
 
     /// 尝试把一条消息当作授权码处理（owner 生成后给到对方）。仅 p2p 接受（飞书 p2p / 钉钉单聊，
@@ -499,39 +525,30 @@ impl Bridge {
         // （管理员）∪ 授权者（授权码添加）白名单。未授权者只能通过授权码激活。
         // 每次消息从 config.json 热读最新访问控制（授权/取消/改开关即时生效，不依赖启动快照）；
         // config 读不到该 bot（单测注入）→ 回落构造时的快照。判定统一走 BotConfig::access_allows。
-        {
-            let allowed = match crate::config::Config::load() {
-                Ok(c) => c
-                    .bots
-                    .into_iter()
-                    .find(|b| b.key() == self.bot.key())
-                    .map(|b| b.access_allows(sender_id))
-                    .unwrap_or_else(|| self.access_snapshot_allows(sender_id)),
-                Err(_) => self.access_snapshot_allows(sender_id),
-            };
-            if !allowed {
-                // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
-                // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
-                // 不匹配 → 按未授权消息忽略（不进入 agent，含 /new 等指令）。
-                if chat_type == "p2p" {
-                    let raw = message["content"].as_str().unwrap_or("");
-                    let text = crate::feishu::parse_content(raw).text;
-                    let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
-                    if self
-                        .try_consume_owner_code(sender_id, &chat_id, true, &text)
-                        .await
-                    {
-                        return;
-                    }
+        // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent 调用处。
+        let (allowed, sender_role) = self.access_and_role(sender_id);
+        if !allowed {
+            // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
+            // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
+            // 不匹配 → 按未授权消息忽略（不进入 agent，含 /new 等指令）。
+            if chat_type == "p2p" {
+                let raw = message["content"].as_str().unwrap_or("");
+                let text = crate::feishu::parse_content(raw).text;
+                let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
+                if self
+                    .try_consume_owner_code(sender_id, &chat_id, true, &text)
+                    .await
+                {
+                    return;
                 }
-                crate::log!(
-                    "[bridge] 忽略非 owner 消息（bot={} sender={} chat_type={}）",
-                    self.bot.key(),
-                    sender_id,
-                    chat_type
-                );
-                return;
             }
+            crate::log!(
+                "[bridge] 忽略非 owner 消息（bot={} sender={} chat_type={}）",
+                self.bot.key(),
+                sender_id,
+                chat_type
+            );
+            return;
         }
         // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
         // 话题（thread）内用户回复机器人的消息不需要再次 @——这是「用户回复」的主流交互；
@@ -579,6 +596,7 @@ impl Bridge {
             quoted: crate::messenger::QuotedContent::default(),
             text,
             attachments,
+            role: sender_role,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
             crate::log!(
@@ -761,6 +779,7 @@ impl Bridge {
             text: text.clone(),
             quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
+            role: ev.role, // 落盘角色：重启重放时按原角色走受限/全权限分支
             created_at: crate::chrono_lite::unix_secs(),
         });
 
@@ -817,6 +836,22 @@ impl Bridge {
             prompt.push_str(&ctx.render);
         }
 
+        // 受限会话（授权者）：prompt 开头前置受限说明。CLAUDE.md 是 owner/授权者共享的
+        // 同一份指引，不能靠它区分——prompt 注入才是按角色区分的正确载体（硬闸在 guard hook）。
+        // 判定与 agent::run 的 restrict 一致（role==Granted && 开关热读）——owner 关掉
+        // 隔离开关后，granted 会话实际是全权限，prompt 不得再谎称受限（否则模型自我设限、
+        // 或把不存在的拦截声明当承诺）。读不到 config 按安全默认 true。
+        let restrict_prompt = crate::config::restrict_granted(ev.role, &self.bot.key());
+        if restrict_prompt {
+            prompt.insert_str(
+                0,
+                "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
+你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
+可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git；不可联网、不可访问工作区外任何路径；\
+越界操作会被系统拦截并记录。\n\n",
+            );
+        }
+
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
         let chat_lock = self.chat_lock(&key);
@@ -861,6 +896,7 @@ impl Bridge {
             resume,
             &ev.chat_id,
             &bot_key,
+            ev.role, // 发送者角色：granted 走受限分支（restrict 判定在 agent::run 内热读）
             Some(&self.sessions),
             Some(ptx),
             Some(cancel_flag.clone()),
@@ -1038,6 +1074,7 @@ impl Bridge {
                 quoted: item.quoted,
                 text: item.text,
                 attachments: item.attachments,
+                role: item.role, // 重放按原角色走受限/全权限分支（PendingItem 落盘字段）
             };
             crate::log!(
                 "[bot:{}] 恢复消息 chat={} mid={} text={:?}",
@@ -1120,6 +1157,7 @@ impl Bridge {
             quoted,
             text,
             attachments,
+            role: crate::config::SenderRole::Owner, // 微信只有 owner（on_weixin 已按 wx_user_id 过滤）
         };
         self.handle(ev).await;
     }
@@ -1129,15 +1167,8 @@ impl Bridge {
     pub async fn on_dingtalk(&self, msg: crate::dingtalk::DingtalkMessage) {
         // 访问控制（与飞书同套，staffId 标识）：公开开关开 → 放行所有人；否则只放行 owner ∪
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
-        let allowed = match crate::config::Config::load() {
-            Ok(c) => c
-                .bots
-                .into_iter()
-                .find(|b| b.key() == self.bot.key())
-                .map(|b| b.access_allows(&msg.sender_staff_id))
-                .unwrap_or_else(|| self.access_snapshot_allows(&msg.sender_staff_id)),
-            Err(_) => self.access_snapshot_allows(&msg.sender_staff_id),
-        };
+        // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
+        let (allowed, sender_role) = self.access_and_role(&msg.sender_staff_id);
         if !allowed {
             // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
             let chat_id = msg.chat_id().to_string();
@@ -1227,6 +1258,7 @@ impl Bridge {
             quoted,
             text,
             attachments,
+            role: sender_role,
         };
         self.handle(ev).await;
     }
@@ -1339,6 +1371,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
+            role: crate::config::SenderRole::Owner,
         };
         assert_eq!(ev.key(), "oc_group");
     }
@@ -1354,6 +1387,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
             attachments: vec![],
+            role: crate::config::SenderRole::Owner,
         };
         let a = base("omt_aaa");
         let b = base("omt_bbb");
@@ -1707,6 +1741,8 @@ mod tests {
         progress_msgs: Vec<String>,
         outcome: MockOutcome,
         prompts: Mutex<Vec<String>>,
+        /// 收到的发送者角色（授权者隔离断言用：granted → 受限分支）。
+        roles: Mutex<Vec<crate::config::SenderRole>>,
     }
     impl MockAgentRunner {
         fn blocking(reply: &str) -> Self {
@@ -1718,6 +1754,7 @@ mod tests {
                 progress_msgs: Vec::new(),
                 outcome: MockOutcome::Reply,
                 prompts: Mutex::new(Vec::new()),
+                roles: Mutex::new(Vec::new()),
             }
         }
         fn immediate(reply: &str) -> Self {
@@ -1756,6 +1793,10 @@ mod tests {
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().unwrap().clone()
         }
+
+        fn roles(&self) -> Vec<crate::config::SenderRole> {
+            self.roles.lock().unwrap().clone()
+        }
     }
     #[async_trait]
     impl AgentRunner for MockAgentRunner {
@@ -1768,11 +1809,13 @@ mod tests {
             _resume: bool,
             _chat_id: &str,
             _bot_key: &str,
+            role: crate::config::SenderRole,
             _sessions: Option<&SessionStore>,
             progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
             cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         ) -> Result<agent::RunOutcome, String> {
             self.prompts.lock().unwrap().push(prompt.to_string());
+            self.roles.lock().unwrap().push(role);
             self.started.notify_one();
             // 先把中途输出推完（unbounded 即推即走），桥侧 select/收尾排空负责丢弃
             if let Some(tx) = &progress {
@@ -1818,6 +1861,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             text: text.into(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
         }
     }
 
@@ -2065,6 +2109,7 @@ mod tests {
             text: "第一条".into(),
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
             created_at: 10,
         });
         bridge.pending.add(crate::pending::PendingItem {
@@ -2075,12 +2120,26 @@ mod tests {
             text: "第二条".into(),
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Granted,
             created_at: 20,
         });
 
         bridge.recover_pending().await;
 
-        assert_eq!(runner.prompts(), ["第一条", "第二条"], "应按入队顺序重放");
+        let prompts = runner.prompts();
+        assert_eq!(prompts.len(), 2, "应按入队顺序重放");
+        assert_eq!(prompts[0], "第一条");
+        // 第二条是 granted 角色：重放时按原角色走受限分支（prompt 前置受限说明）
+        assert!(prompts[1].contains("第二条"), "受限说明在前，原文在后");
+        assert!(prompts[1].starts_with("[受限模式]"));
+        assert_eq!(
+            runner.roles(),
+            [
+                crate::config::SenderRole::Owner,
+                crate::config::SenderRole::Granted
+            ],
+            "重放必须携带原角色（granted 不得被提升为 owner）"
+        );
         assert!(
             msgr.sent().iter().any(|t| t.contains("正在恢复")),
             "重放前应发恢复提示"
@@ -2256,6 +2315,89 @@ mod tests {
         );
         bridge.on_payload(payload.as_bytes()).await;
         assert_eq!(runner.prompts(), vec!["你好"], "白名单成员应触发 agent");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_granted_gets_restricted_session() {
+        // 授权者（granted_ids 成员）消息：角色=Granted 传给 agent（受限分支），
+        // prompt 前置受限说明（CLAUDE.md 共享，只能靠 prompt 区分角色）
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_g",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_friend",
+            &[],
+            "帮我分析附件",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        let prompts = runner.prompts();
+        assert_eq!(prompts.len(), 1, "授权者应触发 agent");
+        assert!(
+            prompts[0].starts_with("[受限模式]"),
+            "granted 会话 prompt 应前置受限说明"
+        );
+        assert!(prompts[0].contains("帮我分析附件"));
+        assert_eq!(
+            runner.roles(),
+            [crate::config::SenderRole::Granted],
+            "授权者消息必须以 Granted 角色进入 agent 调用"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn on_payload_owner_gets_full_session() {
+        // owner 消息：角色=Owner，prompt 不带受限说明（全权限会话不受影响）
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        let payload = feishu_payload(
+            "om_o",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_boss",
+            &[],
+            "随便聊聊",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        let prompts = runner.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0], "随便聊聊", "owner 会话 prompt 不应带受限说明");
+        assert_eq!(
+            runner.roles(),
+            [crate::config::SenderRole::Owner],
+            "owner 消息以 Owner 角色进入 agent 调用"
+        );
         cleanup_bridge(&bridge);
     }
 
@@ -3452,6 +3594,7 @@ https://b.com/y"
             quoted: Default::default(),
             text: "分析 https://github.com/o/r/issues/42".into(),
             attachments: Vec::new(),
+            role: crate::config::SenderRole::Granted, // 与 auto_ev 生产代码一致
         };
         // 同一评论 id 的合成 Ev 触发两次 → mid 去重只处理一次
         let b1 = bridge.clone();

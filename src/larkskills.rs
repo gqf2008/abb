@@ -159,7 +159,9 @@ pub async fn ensure_lark_setup() {
 /// 软链进 ~/.claude/skills/（跳过已存在）→ 清 tmp。git 也没有/失败 → 仅 log 手动命令。
 async fn install_via_git() {
     if crate::deps::find_in_path("git").is_none() {
-        crate::log!("[lark] ⚠️ 无 git。请手动执行：npx -y skills add larksuite/cli -g -a claude -s '*' -y");
+        crate::log!(
+            "[lark] ⚠️ 无 git。请手动执行：npx -y skills add larksuite/cli -g -a claude -s '*' -y"
+        );
         return;
     }
     let tmp = std::env::temp_dir().join(format!("agent-bridge-lark-{}", std::process::id()));
@@ -287,7 +289,11 @@ async fn run(
         if out.status.success() {
             Ok(tail)
         } else {
-            Err(format!("退出码 {:?}：{}", out.status.code(), crate::agent::truncate(&tail, 400)))
+            Err(format!(
+                "退出码 {:?}：{}",
+                out.status.code(),
+                crate::agent::truncate(&tail, 400)
+            ))
         }
     };
     match timeout {

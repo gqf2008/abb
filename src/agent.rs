@@ -136,6 +136,7 @@ pub trait AgentRunner: Send + Sync {
         resume: bool,
         chat_id: &str,
         bot_key: &str,
+        role: crate::config::SenderRole,
         sessions: Option<&crate::sessions::SessionStore>,
         progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -156,13 +157,14 @@ impl AgentRunner for RealAgentRunner {
         resume: bool,
         chat_id: &str,
         bot_key: &str,
+        role: crate::config::SenderRole,
         sessions: Option<&crate::sessions::SessionStore>,
         progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<RunOutcome, String> {
         // 裸函数调用解析到本模块的自由函数 run（trait method 必须经 `.` 调用，不会递归）。
         run(
-            backend, prompt, session_id, resume, chat_id, bot_key, sessions, progress, cancel,
+            backend, prompt, session_id, resume, chat_id, bot_key, role, sessions, progress, cancel,
         )
         .await
     }
@@ -369,12 +371,34 @@ pub async fn run(
     resume: bool,
     chat_id: &str,
     bot_key: &str,
+    role: crate::config::SenderRole,
     sessions: Option<&crate::sessions::SessionStore>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<RunOutcome, String> {
     if prompt.is_empty() {
         return Err("（空消息，没收到内容）".into());
+    }
+
+    // 受限模式判定：授权者会话且该 bot 的「授权者 agent 隔离」开关未放宽。
+    // 每次热读 config（授权/关开关即时生效，与访问控制一致）；读不到按安全默认 true。
+    // 公共判定见 config::restrict_granted（bridge prompt 注入 / run_job 同源）。
+    let restrict = crate::config::restrict_granted(role, bot_key);
+    // pi 无任何权限/沙箱系统（非交互无审批），受限会话无法降级——直接拒绝，
+    // 绝不让授权者静默获得全权限 agent。owner 可换后端或关掉隔离开关恢复。
+    if restrict && backend == Backend::Pi {
+        return Err(
+            "⚠️ 该 bot 的后端是 pi，不支持受限模式。授权者会话不可用：请 owner 在设置里给该 bot 换 claude/codex 后端，或关闭「授权者 agent 隔离」开关。"
+                .into(),
+        );
+    }
+
+    // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
+    // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
+    //（返回用户可见错误，不静默降级成全权限）。
+    if restrict {
+        crate::guard::ensure_guard_files(bot_key)
+            .map_err(|e| format!("⚠️ 受限会话 guard 文件生成失败，已拒绝启动：{e:#}"))?;
     }
 
     // 本 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）
@@ -402,6 +426,8 @@ pub async fn run(
             &inject.extra_args,
             progress.clone(),
             cancel.clone(),
+            role,
+            restrict,
         )
         .await
         {
@@ -632,9 +658,29 @@ fn claude_command(
     program: &std::path::Path,
     resume: bool,
     session_id: &str,
+    restricted: bool,
+    settings_path: &std::path::Path,
 ) -> std::process::Command {
     let mut c = shim_command(program);
-    c.arg("-p").arg("--dangerously-skip-permissions");
+    c.arg("-p");
+    if restricted {
+        // 受限模式（授权者会话）：去掉全权限旗标，改走「默认拒绝 + 白名单」。
+        // dontAsk = 未预批准的工具调用直接拒绝（非交互下不挂起等输入）；
+        // --allowedTools 只放行工作区相对路径的读/写/查工具（Read(./**) 等）。
+        // Bash 不在 CLI 层放行：受限会话的 $ABB_BIN 命令由 guard hook 校验放行
+        //（--settings 指向工作区外的 settings.json，hook 是强制闸）；
+        // WebFetch/MCP 等其余工具全被 dontAsk 拒绝。
+        c.arg("--permission-mode").arg("dontAsk");
+        c.arg("--settings").arg(settings_path);
+        c.arg("--allowedTools")
+            .arg("Read(./**)")
+            .arg("Glob")
+            .arg("Grep")
+            .arg("Edit(./**)")
+            .arg("Write(./**)");
+    } else {
+        c.arg("--dangerously-skip-permissions");
+    }
     c.arg("--verbose").arg("--output-format").arg("stream-json");
     c.arg(if resume { "--resume" } else { "--session-id" })
         .arg(session_id);
@@ -642,6 +688,41 @@ fn claude_command(
     // 无超时，走代理节点抖动即永久挂起（卡在启动早期，jsonl 都不创建）。注入该 env 关闭
     // 非必要流量（API 请求不受影响）；配合 run_once 的 60s 启动健康检查兜底。
     c.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    c
+}
+
+/// codex 会话命令构造（exec / exec resume，含桥内供应商 -c 注入）。
+/// restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
+/// 但不可写任何文件）。审批策略不传额外参数：codex exec 非交互（stdin 管道 + EOF）
+/// 时需审批的操作被当作「用户拒绝」自动取消（openai/codex #24135 实测结论）。
+/// 已知局限（尽力隔离，2026-08-14 实测）：① read-only 沙箱可读全盘——敏感读只能靠
+/// 网络拦截兜底，无法 100% 防「读进回复」；② 网络拦截本机实测有效（curl DNS 失败），
+/// 但 macOS 上 codex 网络隔离历史上不可靠，需按环境复测；③ execpolicy 在 codex
+/// 0.147 上机制不明（文档与实测不符、写入 config.toml 会破坏登录态）→ 不生成；
+/// ④ read-only 下 $ABB_BIN 写 jobs.json（定时任务）与 outbox（投递）不可用。
+fn codex_command(
+    program: &std::path::Path,
+    resume: bool,
+    session_id: &str,
+    extra_args: &[String],
+    restricted: bool,
+) -> tokio::process::Command {
+    let mut c = tokio::process::Command::from(shim_command(program));
+    c.arg("exec");
+    if resume {
+        c.arg("resume").arg(session_id);
+    }
+    c.arg("--json").arg("--skip-git-repo-check");
+    if restricted {
+        c.arg("--sandbox").arg("read-only");
+    } else {
+        c.arg("--dangerously-bypass-approvals-and-sandbox");
+    }
+    // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
+    // 追加在固定参数后（flags-after-subcommand 对 exec / exec resume 都成立，实测）。
+    for a in extra_args {
+        c.arg("-c").arg(a);
+    }
     c
 }
 
@@ -680,6 +761,8 @@ async fn run_once(
     extra_args: &[String],
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    role: crate::config::SenderRole,
+    restrict: bool,
 ) -> Result<AgentOutput, AttemptErr> {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncBufReadExt;
@@ -700,26 +783,17 @@ async fn run_once(
             // 关键坑（实测）：① 必须 `exec resume`（顶层 `codex resume` 是 TUI，stdin 非终端报错）；
             // ② codex 用自己的 thread_id（`thread.started` 事件），不是桥生成的 UUID —— 故加 --json
             //    从输出抓真实 tid 回存；③ resume 一个没建过的 tid 报 "no rollout found" → 上层回退 exec。
-            let mut c = tokio::process::Command::from(shim_command(&resolved));
-            c.arg("exec");
-            if resume {
-                c.arg("resume").arg(session_id);
-            }
-            c.arg("--json")
-                .arg("--skip-git-repo-check")
-                .arg("--dangerously-bypass-approvals-and-sandbox");
-            // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
-            // 追加在固定参数后（flags-after-subcommand 对 exec / exec resume 都成立，实测）。
-            for a in extra_args {
-                c.arg("-c").arg(a);
-            }
-            c
+            codex_command(&resolved, resume, session_id, extra_args, restrict)
         }
         Backend::Claude => {
             // stream-json：逐事件流式输出（assistant/result…），配合逐行解析可实时推进度。
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
-            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）。
-            tokio::process::Command::from(claude_command(&resolved, resume, session_id))
+            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）与受限模式分支
+            //（受限时 --settings 指向工作区外的 guard settings.json）。
+            let settings = crate::guard::guard_settings_path(bot_key);
+            tokio::process::Command::from(claude_command(
+                &resolved, resume, session_id, restrict, &settings,
+            ))
         }
         Backend::Pi => {
             // pi 非交互 print 模式：`pi -p --mode json --session-id <uuid>`。
@@ -762,6 +836,7 @@ async fn run_once(
         .env("LANG", "en_US.UTF-8")
         .env("AGENT_BRIDGE_CHAT_ID", chat_id)
         .env("AGENT_BRIDGE_BOT_KEY", bot_key)
+        .env("AGENT_BRIDGE_SENDER_ROLE", role.as_str())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -833,8 +908,7 @@ async fn run_once(
     let mut got_output = false;
     let startup_deadline = if backend == Backend::Claude {
         Some(
-            tokio::time::Instant::now()
-                + std::time::Duration::from_secs(CLAUDE_STARTUP_GRACE_SECS),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(CLAUDE_STARTUP_GRACE_SECS),
         )
     } else {
         None
@@ -1475,29 +1549,122 @@ mod tests {
 
     #[test]
     fn claude_command_injects_telemetry_disable() {
-        let c = claude_command(std::path::Path::new("claude"), false, "sess-1");
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-1",
+            false,
+            std::path::Path::new("/tmp/abb-settings.json"),
+        );
         let has_disable = c.get_envs().any(|(k, v)| {
             k.to_str() == Some("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
                 && v == Some(std::ffi::OsStr::new("1"))
         });
-        assert!(has_disable, "应注入 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
+        assert!(
+            has_disable,
+            "应注入 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+        );
         // 非 resume → --session-id；resume → --resume
         assert!(c.get_args().any(|a| a == "--session-id"));
         assert!(c.get_args().any(|a| a == "sess-1"));
-        let r = claude_command(std::path::Path::new("claude"), true, "sess-2");
+        assert!(
+            c.get_args().any(|a| a == "--dangerously-skip-permissions"),
+            "owner 会话保持全权限"
+        );
+        let r = claude_command(
+            std::path::Path::new("claude"),
+            true,
+            "sess-2",
+            false,
+            std::path::Path::new("/tmp/abb-settings.json"),
+        );
         assert!(r.get_args().any(|a| a == "--resume"));
         assert!(r.get_args().any(|a| a == "sess-2"));
         assert!(!r.get_args().any(|a| a == "--session-id"));
+    }
+
+    #[test]
+    fn claude_command_restricted_drops_full_permissions() {
+        // 受限模式（授权者会话）：去掉全权限旗标，改走 dontAsk + 工作区相对路径白名单
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-1",
+            true,
+            std::path::Path::new("/tmp/abb-settings.json"),
+        );
+        let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
+        assert!(
+            !args.iter().any(|a| *a == "--dangerously-skip-permissions"),
+            "受限模式绝不允许全权限旗标"
+        );
+        assert!(args.iter().any(|a| *a == "--permission-mode"));
+        assert!(args.iter().any(|a| *a == "dontAsk"));
+        for tool in ["Read(./**)", "Glob", "Grep", "Edit(./**)", "Write(./**)"] {
+            assert!(
+                args.iter().any(|a| a.to_str() == Some(tool)),
+                "受限模式应放行工作区相对路径工具 {tool}"
+            );
+        }
+        // 基础参数不受影响（会话 id / stream-json）
+        assert!(args.iter().any(|a| *a == "--session-id"));
+        assert!(args.iter().any(|a| *a == "sess-1"));
+    }
+
+    #[test]
+    fn codex_command_restricted_uses_readonly_sandbox() {
+        // 受限模式：--sandbox read-only（OS 级写禁；审批靠非交互 EOF 自动拒绝，
+        // codex 0.147 实测无 --approval-policy flag），不带全权限旗标；
+        // -c 供应商注入两分支都保留
+        let extra = vec!["model_provider=abc".to_string()];
+        let c = codex_command(std::path::Path::new("codex"), false, "tid-1", &extra, true);
+        let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
+        assert!(
+            !args
+                .iter()
+                .any(|a| *a == "--dangerously-bypass-approvals-and-sandbox"),
+            "受限模式绝不允许全权限旗标"
+        );
+        assert!(args.iter().any(|a| *a == "--sandbox"));
+        assert!(args.iter().any(|a| *a == "read-only"));
+        assert!(
+            !args.iter().any(|a| *a == "--approval-policy"),
+            "codex 0.147 无该 flag（实测会报 unexpected argument）"
+        );
+        assert!(args.iter().any(|a| *a == "-c"));
+        assert!(args.iter().any(|a| *a == "model_provider=abc"));
+        // resume 形态
+        let r = codex_command(std::path::Path::new("codex"), true, "tid-2", &[], true);
+        assert!(r.as_std().get_args().any(|a| a == "resume"));
+        assert!(r.as_std().get_args().any(|a| a == "tid-2"));
+    }
+
+    #[test]
+    fn codex_command_full_keeps_bypass_flag() {
+        // owner 会话：保持现状全权限旗标 + -c 注入
+        let extra = vec!["model=abc".to_string()];
+        let c = codex_command(std::path::Path::new("codex"), false, "tid-1", &extra, false);
+        let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
+        assert!(args
+            .iter()
+            .any(|a| *a == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!args.iter().any(|a| *a == "--sandbox"));
+        assert!(args.iter().any(|a| *a == "-c"));
+        assert!(args.iter().any(|a| *a == "model=abc"));
     }
 
     #[cfg(windows)]
     #[test]
     fn shim_command_wraps_cmd_shims_on_windows() {
         // Windows：.cmd shim → cmd.exe /c 包装（CreateProcess 不执行脚本）
-        let c = shim_command(std::path::Path::new("C:\\Users\\x\\AppData\\Roaming\\npm\\pi.cmd"));
+        let c = shim_command(std::path::Path::new(
+            "C:\\Users\\x\\AppData\\Roaming\\npm\\pi.cmd",
+        ));
         let prog = c.get_program().to_str().unwrap().to_string();
         assert_eq!(prog.to_ascii_lowercase(), "cmd", "应经 cmd.exe 执行");
-        assert!(c.get_args().any(|a| a.to_str().map(|s| s.to_ascii_lowercase()) == Some("/c".into())));
+        assert!(c
+            .get_args()
+            .any(|a| a.to_str().map(|s| s.to_ascii_lowercase()) == Some("/c".into())));
         // .exe 直接执行
         let e = shim_command(std::path::Path::new("C:\\tools\\pi.exe"));
         assert!(e.get_program().to_str().unwrap().ends_with("pi.exe"));
@@ -1510,12 +1677,16 @@ mod tests {
             "⚠️ claude 出错（exit 1）:\nError: Session ID abc-123 is already in use."
         ));
         // #7：启动健康检查终止标记 → 换新 UUID
-        assert!(claude_needs_fresh_session("⚠️ claude 启动挂起（60s 无输出，疑似启动网络阻塞）"));
+        assert!(claude_needs_fresh_session(
+            "⚠️ claude 启动挂起（60s 无输出，疑似启动网络阻塞）"
+        ));
         // resume 会话丢失 / codex 错误 → 不走换新 UUID 分支（各自既有自愈路径）
         assert!(!claude_needs_fresh_session(
             "⚠️ claude 出错（exit 1）:\nNo conversation found"
         ));
-        assert!(!claude_needs_fresh_session("⚠️ codex 出错（exit 1）:\nno rollout found"));
+        assert!(!claude_needs_fresh_session(
+            "⚠️ codex 出错（exit 1）:\nno rollout found"
+        ));
     }
 
     #[cfg(unix)]

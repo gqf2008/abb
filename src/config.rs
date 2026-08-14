@@ -125,6 +125,11 @@ pub struct BotConfig {
     /// 授权者展示信息（open_id + 名字）——授权码添加的普通授权用户。owner_infos 只管 owner。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub granted_infos: Vec<OwnerInfo>,
+    /// 授权者（granted_ids 成员）agent 会话是否隔离受限（安全默认 true）：
+    /// true=授权者驱动 agent 时走受限模式（仅工作区内读写 + $ABB_BIN 白名单，不能联网）；
+    /// false=授权者与 owner 同权限（现状全权限）。owner 会话不受此字段影响，恒全权限。
+    #[serde(default = "default_true", skip_serializing_if = "restrict_on")]
+    pub restrict_granted_agent: bool,
 }
 
 /// 手动 Default：enabled 默认 true（derive(Default) 对 bool 给 false，会把新/迁移 bot 误设成停用）。
@@ -164,6 +169,7 @@ impl Default for BotConfig {
             granted_ids: String::new(),
             granted_infos: Vec::new(),
             open_access: false,
+            restrict_granted_agent: true,
         }
     }
 }
@@ -175,6 +181,11 @@ pub(crate) fn default_kind() -> String {
 /// skip_serializing_if：false（默认私有）不落盘，旧 config 兼容。
 fn not_open(b: &bool) -> bool {
     !*b
+}
+
+/// skip_serializing_if：restrict_granted_agent 为 true（安全默认）不落盘，旧 config 兼容。
+fn restrict_on(b: &bool) -> bool {
+    *b
 }
 
 /// 授权码有效期（秒）：30 分钟。过期码仍保留在 pending_codes 里直到被消费/重新生成，
@@ -442,6 +453,28 @@ impl BotConfig {
         in_owner || in_granted
     }
 
+    /// 会话发送者角色推导（与 access_allows 同构，准入闸顺路区分 owner 与授权者）：
+    /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）——
+    /// 公开模式（open_access）下的陌生人同样归 Granted。注意：空 owner 白名单 → 一律
+    /// Granted（安全默认，不猜 Owner；is_owner_allowed 对空串返回 true 只管准入不管角色，
+    /// 若需 owner 全权限请先把自己加进白名单）。微信恒 Owner
+    /// （wx_user_id 是唯一 owner 判据，on_weixin 已先过滤，无授权者概念）。
+    pub fn sender_role(&self, sender_id: &str) -> SenderRole {
+        if self.is_wechat() {
+            return SenderRole::Owner;
+        }
+        let owner_ids = if self.is_dingtalk() {
+            &self.ding_owner_ids
+        } else {
+            &self.owner_open_id
+        };
+        if !owner_ids.is_empty() && is_owner_allowed(owner_ids, sender_id) {
+            SenderRole::Owner
+        } else {
+            SenderRole::Granted
+        }
+    }
+
     /// 按 kind 取（owner 白名单, owner 展示名, 授权者白名单, 授权者展示名）的可变引用，
     /// 授权码消费/取消授权按 bot 类型落位（飞书 open_id / 钉钉 staffId）。
     fn whitelists_mut(
@@ -525,6 +558,52 @@ pub fn is_owner_allowed(owner: &str, sender_id: &str) -> bool {
         .filter(|o| !o.is_empty())
         .collect();
     ids.is_empty() || ids.contains(&sender_id)
+}
+
+/// 会话发送者角色：owner（管理员，agent 全权限）/ granted（授权者，agent 受限）。
+/// PendingItem/Job 的 role 字段落盘为小写字符串；Default=Owner 兼容旧数据（无角色
+/// 时代的任务/待恢复消息按全权限处理，与现状一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SenderRole {
+    #[default]
+    Owner,
+    Granted,
+}
+
+impl SenderRole {
+    /// "granted"→Granted，其余（含空/未知）→Owner（旧数据与手动运行 CLI 兜底）。
+    pub fn parse(s: &str) -> SenderRole {
+        if s.eq_ignore_ascii_case("granted") {
+            SenderRole::Granted
+        } else {
+            SenderRole::Owner
+        }
+    }
+
+    /// 从 AGENT_BRIDGE_SENDER_ROLE env 推导（桥 spawn agent 时注入；CLI/guard 共用，
+    /// 改名/新增取值只改这一处）。
+    pub fn from_env() -> SenderRole {
+        SenderRole::parse(&std::env::var("AGENT_BRIDGE_SENDER_ROLE").unwrap_or_default())
+    }
+
+    /// "owner" | "granted"（env 注入 / 日志用）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SenderRole::Owner => "owner",
+            SenderRole::Granted => "granted",
+        }
+    }
+}
+
+/// 受限模式判定（agent::run 的 spawn 分支 / bridge prompt 注入 / run_job 定时任务
+/// 三处共用，防语义漂移）：role==Granted 且该 bot 的「授权者 agent 隔离」开关未放宽；
+/// 配置读不到按安全默认 true。每次热读（授权/关开关即时生效）。
+pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
+    role == SenderRole::Granted
+        && Config::bot_for_bot_key(bot_key)
+            .map(|b| b.restrict_granted_agent)
+            .unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -786,6 +865,14 @@ impl Config {
                 .find(|b| b.key() == bot_key)
                 .and_then(|b| c.resolve_provider(b).cloned())
         })
+    }
+
+    /// 按 bot_key 读 BotConfig（load + find，provider_for_bot_key 同款热读）。
+    /// agent.rs 每次受限判定调用，判定安全开关（restrict_granted_agent）跟随最新配置。
+    pub fn bot_for_bot_key(bot_key: &str) -> Option<BotConfig> {
+        Config::load()
+            .ok()
+            .and_then(|c| c.bots.into_iter().find(|b| b.key() == bot_key))
     }
 
     // ── 授权码（GUI 生成 / bridge 消费 / GUI 展示）──
@@ -1119,6 +1206,113 @@ mod tests {
         // 与自由函数一致（BotConfig 侧判定走 config::is_owner_allowed）
         assert!(is_owner_allowed("ou_x, ou_y", "ou_y"));
         assert!(!is_owner_allowed("ou_x, ou_y", "ou_z"));
+    }
+
+    // ── 发送者角色（owner=全权限 / granted=受限）──
+
+    #[test]
+    fn sender_role_owner_vs_granted() {
+        // 飞书：owner 白名单命中 → Owner；授权者 → Granted；公开模式陌生人 → Granted
+        let bot = BotConfig {
+            kind: "feishu".into(),
+            owner_open_id: "ou_boss, ou_admin".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        assert_eq!(bot.sender_role("ou_boss"), SenderRole::Owner);
+        assert_eq!(bot.sender_role("ou_admin"), SenderRole::Owner);
+        assert_eq!(bot.sender_role("ou_friend"), SenderRole::Granted);
+        assert_eq!(bot.sender_role("ou_stranger"), SenderRole::Granted);
+        // 公开模式：owner 命中 → Owner，陌生人 → Granted（受限）
+        let open = BotConfig {
+            kind: "feishu".into(),
+            owner_open_id: "ou_boss".into(),
+            open_access: true,
+            ..Default::default()
+        };
+        assert_eq!(open.sender_role("ou_boss"), SenderRole::Owner);
+        assert_eq!(open.sender_role("ou_stranger"), SenderRole::Granted);
+        // 空 owner 白名单：白名单里没有任何人 → 一律 Granted（安全默认，不猜 Owner）
+        let no_owner = BotConfig {
+            kind: "feishu".into(),
+            ..Default::default()
+        };
+        assert_eq!(no_owner.sender_role("ou_anyone"), SenderRole::Granted);
+    }
+
+    #[test]
+    fn sender_role_dingtalk_uses_staff_ids() {
+        let bot = BotConfig {
+            kind: "dingtalk".into(),
+            ding_owner_ids: "staff1, staff2".into(),
+            ding_granted_ids: "staff3".into(),
+            ..Default::default()
+        };
+        assert_eq!(bot.sender_role("staff1"), SenderRole::Owner);
+        assert_eq!(bot.sender_role("staff2"), SenderRole::Owner);
+        assert_eq!(bot.sender_role("staff3"), SenderRole::Granted);
+        assert_eq!(bot.sender_role("staff4"), SenderRole::Granted);
+        // 公开模式陌生人 → Granted
+        let open = BotConfig {
+            kind: "dingtalk".into(),
+            ding_owner_ids: "staff1".into(),
+            ding_open_access: true,
+            ..Default::default()
+        };
+        assert_eq!(open.sender_role("staff1"), SenderRole::Owner);
+        assert_eq!(open.sender_role("staff9"), SenderRole::Granted);
+    }
+
+    #[test]
+    fn sender_role_wechat_always_owner() {
+        // 微信只有 owner（wx_user_id 判据，on_weixin 先过滤），无授权者概念
+        let bot = BotConfig {
+            kind: "wechat".into(),
+            wx_user_id: "wx_owner".into(),
+            ..Default::default()
+        };
+        assert_eq!(bot.sender_role("wx_owner"), SenderRole::Owner);
+        assert_eq!(bot.sender_role("wx_anyone"), SenderRole::Owner);
+    }
+
+    #[test]
+    fn sender_role_parse_and_serde() {
+        assert_eq!(SenderRole::parse("granted"), SenderRole::Granted);
+        assert_eq!(SenderRole::parse("GRANTED"), SenderRole::Granted);
+        assert_eq!(SenderRole::parse("owner"), SenderRole::Owner);
+        assert_eq!(SenderRole::parse(""), SenderRole::Owner); // 旧数据/手动 CLI 兜底
+        assert_eq!(SenderRole::parse("未知"), SenderRole::Owner);
+        assert_eq!(SenderRole::Owner.as_str(), "owner");
+        assert_eq!(SenderRole::Granted.as_str(), "granted");
+        // 落盘 lowercase；round-trip 保真
+        let s = serde_json::to_string(&SenderRole::Granted).unwrap();
+        assert_eq!(s, "\"granted\"");
+        assert_eq!(
+            serde_json::from_str::<SenderRole>(&s).unwrap(),
+            SenderRole::Granted
+        );
+    }
+
+    #[test]
+    fn restrict_granted_agent_serde_compat() {
+        // 手动 Default 与旧 config 反序列化都落到安全默认 true
+        assert!(BotConfig::default().restrict_granted_agent);
+        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
+        assert!(bot.restrict_granted_agent);
+        // round-trip：默认 true 时字段不落盘（skip_serializing_if 保旧 config 兼容）
+        let s = serde_json::to_string(&bot).unwrap();
+        assert!(!s.contains("restrict_granted_agent"));
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert!(back.restrict_granted_agent);
+        // 显式关闭（GUI 放宽）→ 落盘并往返保真
+        let off = BotConfig {
+            restrict_granted_agent: false,
+            ..Default::default()
+        };
+        let s2 = serde_json::to_string(&off).unwrap();
+        assert!(s2.contains("\"restrict_granted_agent\":false"));
+        let back2: BotConfig = serde_json::from_str(&s2).unwrap();
+        assert!(!back2.restrict_granted_agent);
     }
 
     // ── 授权码（GUI 生成 / 对方发码给 bot 自动授权）──
