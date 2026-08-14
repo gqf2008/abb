@@ -31,6 +31,14 @@ pub struct Bridge {
     /// 在跑任务的打断标志：chat_id → AtomicBool。「停止词」到达时置 true 叫停该 chat 正在跑的任务。
     /// （per-chat 同一时刻只有一个在跑任务，故每 chat 至多一个标志。）
     cancel_flags: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// #49 历史代际（per-key 锁）：同一 key 的注入读、历史写盘、/new 清盘互斥。
+    /// /new 不拿 per-chat 锁（不能被运行中任务阻塞），其 clear 与锁内写盘存在交错窗口
+    /// （审查 I-2）——写方持本锁校验代际并写盘，/new 持同一锁自增代际并清盘，
+    /// 二者互斥：旧代际的写盘要么发生在 clear 之前（被清掉）、要么被闸拦下，不会残留。
+    /// per-key（原为全局单锁）：任一 chat 的磁盘写不再阻塞其它 chat 的 /new 与写盘
+    /// （审查：全局锁跨文件 I/O 是全 bot 的串行点）。锁内只有快速文件 I/O，
+    /// agent 运行期间不持锁（/new 不被运行中任务阻塞的语义保留）。
+    history_epochs: Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>,
     /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
     /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
     outbox: OutboxStore,
@@ -121,6 +129,7 @@ impl Bridge {
             seen: Mutex::new(HashSet::new()),
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
+            history_epochs: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
@@ -211,6 +220,32 @@ impl Bridge {
             .entry(chat_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// #49：取该 key 的历史代际锁（get-or-create）。同一 key 的注入读、用户轮写盘、
+    /// 助手轮写盘、/new 清盘全部持此锁串行；不同 key 互不阻塞（审查后收敛：原全局锁
+    /// 会让任一 chat 的磁盘写阻塞所有 chat 的 /new 与代际快照）。
+    fn history_lock(&self, key: &str) -> Arc<std::sync::Mutex<u64>> {
+        self.history_epochs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(0)))
+            .clone()
+    }
+
+    /// #49：/new 的历史重置——自增代际 + 清历史/标记，在 per-key 锁内完成（与注入读/写盘
+    /// 互斥，见 history_epochs 字段注释）。返回 clear 是否成功：失败时调用方必须中止会话
+    /// 重置——否则旧历史/标记文件仍在，新会话首轮注入会读到被用户要求清除的对话
+    /// （审查 I-2 读侧：clear 失败 + 注入读未按代际闸）。
+    fn history_reset(&self, key: &str) -> bool {
+        let lock = self.history_lock(key);
+        let mut epoch = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *epoch += 1;
+        // bump + clear 在同一锁持内：写方要么在 clear 前写完（被清掉）、要么在 clear 后
+        // 看到新代际被拦，不会残留（审查 I-2；清盘不放锁外，否则 post-/new 写盘会落进
+        // 尚未清掉的旧文件再被清掉——该轮历史静默丢失）。
+        crate::history::History::open(&self.bot.key(), key).clear()
     }
 
     /// 发一条回复：话题消息走 reply 接口（落在原话题），非话题走普通发送。
@@ -723,18 +758,35 @@ impl Bridge {
         // 不会把新槽位 mark 回 started=true（审查修复——替代原 pending_new 标记，后者
         // 覆盖不了 CLI 跨进程 reset，且存在 insert 晚于 reset 的 TOCTOU）。
         if is_new_command(&text) {
-            let new_sid = self.sessions.reset_session(&key);
-            crate::log!(
-                "[bridge] /new 新建会话 bot={} key={} sid={}",
-                self.bot.key(),
-                trunc(&key, 16),
-                trunc(&new_sid, 8)
-            );
-            if let Err(e) = self
-                .send_reply(&ev, "✅ 已新建会话，下一条消息开始全新上下文。")
-                .await
-            {
-                crate::log!("[bridge] /new 确认发送失败: {e:#}");
+            // #49：/new = 用户明确要求全新会话 → 连对话历史与迁移标记一起清
+            // （切换注入的历史随之失效，不会泄进新会话）。代际自增使交错窗口内
+            // 串行锁里的旧写盘全部失效（审查 I-2：clear 与锁内写无锁互斥的 TOCTOU）。
+            // 顺序：先清历史再换会话——clear 失败则中止重置（否则旧历史泄进新会话，
+            // 审查 I-2 读侧）；崩溃窗口从「新会话读到旧历史」变成「reset 未生效」
+            //（用户可见的失败，无静默泄漏）。
+            if self.history_reset(&key) {
+                let new_sid = self.sessions.reset_session(&key);
+                crate::log!(
+                    "[bridge] /new 新建会话 bot={} key={} sid={}",
+                    self.bot.key(),
+                    trunc(&key, 16),
+                    trunc(&new_sid, 8)
+                );
+                if let Err(e) = self
+                    .send_reply(&ev, "✅ 已新建会话，下一条消息开始全新上下文。")
+                    .await
+                {
+                    crate::log!("[bridge] /new 确认发送失败: {e:#}");
+                }
+            } else {
+                crate::log!(
+                    "[bridge] ⚠️ /new 历史清理失败，会话未重置 bot={} key={}",
+                    self.bot.key(),
+                    trunc(&key, 16)
+                );
+                let _ = self
+                    .send_reply(&ev, "⚠️ 新建会话失败：历史清理未完成，请稍后重试。")
+                    .await;
             }
             return;
         }
@@ -841,16 +893,8 @@ impl Bridge {
         // 判定与 agent::run 的 restrict 一致（role==Granted && 开关热读）——owner 关掉
         // 隔离开关后，granted 会话实际是全权限，prompt 不得再谎称受限（否则模型自我设限、
         // 或把不存在的拦截声明当承诺）。读不到 config 按安全默认 true。
+        // （insert 挪到锁内历史注入之后——受限说明必须保持最外层。）
         let restrict_prompt = crate::config::restrict_granted(ev.role, &self.bot.key());
-        if restrict_prompt {
-            prompt.insert_str(
-                0,
-                "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
-你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
-可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git；不可联网、不可访问工作区外任何路径；\
-越界操作会被系统拦截并记录。\n\n",
-            );
-        }
 
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
@@ -871,6 +915,59 @@ impl Bridge {
         // 一次锁内原子取 session_id + started：避免 ensure_session 与 is_started 两次
         // refresh 之间被外部改盘读到中间态（审查 P3-1a）。
         let (session_id, resume) = self.sessions.ensure_with_started(&key);
+
+        // #49 后端切换上下文迁移：新会话首轮（!resume）且历史尚未注入过该会话 →
+        // 把最近几轮对话注入 prompt 开头（切后端/会话丢失后新后端由此接续上下文）。
+        // marker 按 session_id 判定：/new、CLI reset、agent 自愈换 UUID 都使 marker
+        // 自动失效（新会话允许再注入）。三层闸防重复注入：per-chat 串行锁（前一轮完整
+        // 结束才轮到本条）+ !resume（started=true 直接 resume 不注入）+ marker。
+        let hist = crate::history::History::open(&self.bot.key(), &key);
+        // 代际锁（per-key，见 history_epochs 字段注释）：注入读 + 用户轮写盘在锁内与
+        // /new 清盘互斥——新会话首轮不可能读到未清盘的旧历史（审查 I-2 读侧闭环）。
+        // 锁持于块作用域内（std MutexGuard 非 Send 不能跨 await）：块结束即释放，
+        // agent 运行期间不持锁（/new 不被运行中任务阻塞）。
+        let (hist_epoch_lock, hist_epoch, injected_rounds) = {
+            let lock = self.history_lock(&key);
+            let lock_ret = lock.clone(); // guard 借用 lock，返回值需独立 Arc
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let epoch = *guard;
+            // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）：
+            // resume 时直接短路，连 marker 都不读（省一次磁盘读）。
+            let injected_rounds = if !resume {
+                let not_yet_migrated = match hist.marker() {
+                    Some(m) => m.session_id != session_id,
+                    None => true,
+                };
+                if not_yet_migrated {
+                    let (block, n) =
+                        hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
+                    if n > 0 {
+                        prompt.insert_str(0, &block);
+                        Some(n)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // 受限说明后插（insert_str(0) 后进者更靠前）→ 保持在最外层
+            if restrict_prompt {
+                prompt.insert_str(
+                    0,
+                    "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
+你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
+可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git；不可联网、不可访问工作区外任何路径；\
+越界操作会被系统拦截并记录。\n\n",
+                );
+            }
+            // 当前用户轮落历史（锁内，与助手轮严格按真实顺序交替；重放由 (mid,user) 去重兜底）。
+            // GitHub 合成 Ev 同样落历史——它是该通知群的 agent 轮次。锁内写与 /new 的 clear 互斥。
+            hist.append_user(&ev.mid, backend.name(), &history_user_text(&text, &ev));
+            (lock_ret, epoch, injected_rounds)
+        };
 
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
@@ -895,6 +992,7 @@ impl Bridge {
             &session_id,
             resume,
             &ev.chat_id,
+            &key, // 会话隔离 key（话题=chat:thread，#14）：session 存储按 key 记账，回存须同 key
             &bot_key,
             ev.role, // 发送者角色：granted 走受限分支（restrict 判定在 agent::run 内热读）
             Some(&self.sessions),
@@ -940,7 +1038,23 @@ impl Bridge {
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
                 // #23：仅当当前槽位仍是本次任务的会话时才 mark——运行中被 /new 或
                 // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
-                self.sessions.mark_started_if(&key, &session_id);
+                // #49：同一道闸决定历史落盘——换走后不写孤儿助手条目、不写迁移标记
+                // （历史已被 /new 清空，旧任务的回复不得写回去）。
+                let same_session = self.sessions.mark_started_if(&key, &session_id);
+                if same_session {
+                    // 代际闸：/new 恰好落在 mark 与写盘之间（亚毫秒窗口）也不残留孤儿条目
+                    let guard = hist_epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if *guard == hist_epoch {
+                        hist.append_assistant(&ev.mid, backend.name(), &reply);
+                        if injected_rounds.is_some() {
+                            hist.set_marker(&session_id, backend.name());
+                        }
+                    }
+                }
+                // 注入提示随最终回复一条发出（不独立发消息，打字机已下线纪律）；
+                // GitHub 双写分支只附在群摘要，不写进 issue 评论留档。
+                let history_note =
+                    injected_rounds.map(|n| format!("\n\n（已携带最近 {n} 轮上下文）"));
                 // GitHub 分析双写：全文回写 issue 评论留档，群聊只回截断摘要——
                 // 避免超长分析刷屏，完整内容去 issue 页看。
                 // 注：pending 重放是 at-least-once——崩溃窗口可能重跑并双发评论（与既有
@@ -977,7 +1091,7 @@ impl Bridge {
                     } else {
                         "📝 已分析"
                     };
-                    let text = if archived {
+                    let mut text = if archived {
                         format!(
                             "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 {} 评论）",
                             ctx.owner, ctx.repo, ctx.number, ctx.title, summary,
@@ -996,6 +1110,9 @@ impl Bridge {
                             ctx.owner, ctx.repo, ctx.number, ctx.title, summary
                         )
                     };
+                    if let Some(note) = &history_note {
+                        text.push_str(note); // 只附群摘要，不进 issue 评论留档
+                    }
                     match self.send_reply(&ev, &text).await {
                         Ok(()) => crate::log!(
                             "[bridge] 已回复 github 摘要 chat={} 长度={}",
@@ -1010,7 +1127,12 @@ impl Bridge {
                 } else {
                     // 原路径：普通回复全文发送。发送结果必须留痕：回复丢了
                     // （token 失效/会话失效等）时不能谎报成功。
-                    match self.send_reply(&ev, &reply).await {
+                    // #49：注入提示附在全文尾部（若本轮做过历史注入）。
+                    let sent_text = match &history_note {
+                        Some(note) => format!("{reply}{note}"),
+                        None => reply.clone(),
+                    };
+                    match self.send_reply(&ev, &sent_text).await {
                         Ok(()) => crate::log!(
                             "[bridge] 已回复 chat={} 长度={}",
                             trunc(&ev.chat_id, 10),
@@ -1312,6 +1434,26 @@ pub fn strip_bot_mention(text: &str, bot_name: &str) -> String {
 /// key/chat_id 可能含非 ASCII（话题、群名等），日志一律走字符级。
 fn trunc(s: impl AsRef<str>, n: usize) -> String {
     s.as_ref().chars().take(n).collect()
+}
+
+/// #49 历史条目的用户轮文本：用户文本 + （引用）被引用文本 + （附件）元数据行。
+/// 单条 300 字截断在 history 层做——这里只负责按重要性排布（用户文本最前，
+/// 截断丢的是尾巴=次要信息）。与 prompt 的 [引用消息]/[附件] 段同源同格式。
+/// 有意省略 [链接]/[GitHub Issue] 段（审查 M-4）：链接本身在用户文本里；
+/// 分析的 issue 内容太长，跨后端接续由配对的助手轮（分析结论）承载。
+fn history_user_text(text: &str, ev: &Ev) -> String {
+    let mut t = String::from(text);
+    if !ev.quoted.text.is_empty() {
+        t.push_str("\n（引用）");
+        t.push_str(&ev.quoted.text);
+    }
+    if !ev.attachments.is_empty() || !ev.quoted.attachments.is_empty() {
+        t.push_str("\n（附件）");
+        for a in ev.attachments.iter().chain(ev.quoted.attachments.iter()) {
+            t.push_str(&format!("\n{}", a.to_prompt_line()));
+        }
+    }
+    t
 }
 
 /// 识别「/new」会话新建指令（#23）：trim 后精确匹配，大小写不敏感。
@@ -1808,6 +1950,7 @@ mod tests {
             session_id: &str,
             _resume: bool,
             _chat_id: &str,
+            _session_key: &str,
             _bot_key: &str,
             role: crate::config::SenderRole,
             _sessions: Option<&SessionStore>,
@@ -1981,6 +2124,292 @@ mod tests {
         assert!(
             !bridge.sessions.is_started("oc_x"),
             "任务运行中发 /new：旧任务完成不得把新槽位 mark 回 started=true"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    // ─── #49 后端切换上下文迁移（历史日志 + 首轮注入）──────────────────────
+
+    /// 构造指定后端的 bot（随机 key 隔离工作目录）。
+    fn backend_bot(backend: &str) -> BotConfig {
+        BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            backend: backend.into(),
+            ..Default::default()
+        }
+    }
+
+    /// T1/T2：切后端首轮注入 [历史上下文]（旧→新、角色前缀、在当前消息之前）+
+    /// 回复尾部带提示；第二轮同会话 resume → 不重复注入、无提示。
+    #[tokio::test]
+    async fn backend_switch_injects_history_once() {
+        let runner = Arc::new(MockAgentRunner::immediate("pi 的回答"));
+        let bot = backend_bot("pi"); // bot 现在用 pi（历史里是 claude 的轮次）
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        // 预写 claude 历史（模拟切换前在该 chat 的 2 轮对话）
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        hist.append_user("old1", "claude", "项目背景是登录偶发 401");
+        hist.append_assistant("old1", "claude", "根因是 token 缓存竞态");
+        hist.append_user("old2", "claude", "先修缓存失效路径");
+
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "继续修")).await })
+            .await
+            .unwrap();
+
+        let p0 = &runner.prompts()[0];
+        assert!(p0.contains("[历史上下文]"), "首轮注入历史段: {p0}");
+        assert!(p0.contains("用户: 项目背景是登录偶发 401"));
+        assert!(p0.contains("助手: 根因是 token 缓存竞态"));
+        let hpos = p0.find("[历史上下文]").unwrap();
+        let mpos = p0.find("继续修").unwrap();
+        assert!(hpos < mpos, "历史段在当前消息之前");
+        assert_eq!(msgr.sent().len(), 1);
+        assert!(
+            msgr.sent()[0].ends_with("（已携带最近 2 轮上下文）"),
+            "回复带注入提示，实际: {}",
+            msgr.sent()[0]
+        );
+        // marker 已写（绑定该 session）；助手轮落历史
+        assert_eq!(hist.marker().map(|m| m.backend), Some("pi".into()));
+        assert!(hist
+            .entries()
+            .iter()
+            .any(|e| !e.user && e.text.contains("pi 的回答")));
+
+        // 第二条：同会话（started=true → resume）不重复注入、无提示
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "下一步")).await })
+            .await
+            .unwrap();
+        assert!(!runner.prompts()[1].contains("[历史上下文]"), "不重复注入");
+        assert!(!msgr.sent()[1].contains("已携带"), "第二轮无提示");
+        cleanup_bridge(&bridge);
+    }
+
+    /// T3：/new 清空历史与迁移标记——用户明确要全新会话，注入历史随之失效。
+    #[tokio::test]
+    async fn new_command_clears_history_and_marker() {
+        let runner = Arc::new(MockAgentRunner::immediate("ok"));
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        hist.append_user("old1", "claude", "旧背景");
+        // 先跑一轮让 marker 落上（模拟：切到 pi 已注入过）
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "hi")).await })
+            .await
+            .unwrap();
+        assert!(hist.marker().is_some(), "首轮注入后 marker 已写");
+
+        // /new → 历史与 marker 全清
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("n1", "oc_x", "/new")).await })
+            .await
+            .unwrap();
+        assert!(hist.entries().is_empty(), "历史已清空");
+        assert!(hist.marker().is_none(), "marker 已清");
+
+        // /new 后首条消息：全新会话、历史空 → 无注入
+        let b3 = bridge.clone();
+        tokio::spawn(async move { b3.handle(test_ev("m2", "oc_x", "重新开始")).await })
+            .await
+            .unwrap();
+        assert!(!runner.prompts()[1].contains("[历史上下文]"));
+        assert!(!msgr.sent()[1].contains("已携带"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// T4：会话已 started（切回旧后端场景）→ 直接 resume 原上下文，不注入。
+    #[tokio::test]
+    async fn resume_existing_session_skips_injection() {
+        let runner = Arc::new(MockAgentRunner::immediate("接续回答"));
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        // 预置：pi 槽位已有完整会话（started=true，可 resume 自己的上下文）
+        let sid = bridge.sessions.ensure_with_started("oc_x").0;
+        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
+        // 历史里最后是 claude 的轮次（marker 也对不上）——但 !resume 直接短路
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        hist.append_user("old1", "claude", "claude 时代的内容");
+
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        assert!(
+            !runner.prompts()[0].contains("[历史上下文]"),
+            "resume 不注入"
+        );
+        assert!(!msgr.sent()[0].contains("已携带"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// T5：首轮 agent 失败（未 mark、未写 marker）→ 重发/下一条重新注入
+    /// （上下文从未真正进入任何 session，重注入是对的）。
+    #[tokio::test]
+    async fn failed_round_reinjects_on_next_message() {
+        let runner = Arc::new(MockAgentRunner::with_progress_error(&[], "后端爆炸"));
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        hist.append_user("old1", "claude", "旧背景");
+
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "第一问")).await })
+            .await
+            .unwrap();
+        assert!(runner.prompts()[0].contains("[历史上下文]"), "首轮注入");
+        assert!(hist.marker().is_none(), "失败轮不写 marker");
+        assert!(
+            !hist.entries().iter().any(|e| !e.user),
+            "失败轮不写助手条目"
+        );
+
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "再试")).await })
+            .await
+            .unwrap();
+        assert!(
+            runner.prompts()[1].contains("[历史上下文]"),
+            "下一条重新注入"
+        );
+        let _ = msgr;
+        cleanup_bridge(&bridge);
+    }
+
+    /// T6：任务运行中 /new → 清历史后，旧任务完成不得写孤儿助手条目/标记
+    ///（mark_started_if 身份校验同一道闸）。
+    #[tokio::test]
+    async fn new_during_run_writes_no_orphan_history() {
+        let runner = Arc::new(MockAgentRunner::blocking("旧任务回复"));
+        let bot = backend_bot("pi");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+
+        let b1 = bridge.clone();
+        let task = tokio::spawn(async move { b1.handle(test_ev("m1", "oc_x", "hello")).await });
+        runner.started.notified().await; // 持锁运行中（用户条目已落）
+
+        // 运行中 /new：清历史（含 m1 的用户条目）
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("n1", "oc_x", "/new")).await })
+            .await
+            .unwrap();
+        assert!(hist.entries().is_empty(), "/new 已清历史");
+
+        runner.release.notify_one();
+        task.await.unwrap();
+        assert!(hist.entries().is_empty(), "旧任务完成不得写孤儿助手条目");
+        assert!(hist.marker().is_none(), "无孤儿 marker");
+        cleanup_bridge(&bridge);
+    }
+
+    /// 审查 I-2：/new 的 clear 与串行锁内历史写盘的交错窗口由代际闸互斥——
+    /// 快照旧代际的写盘在 /new 之后到达必须被拦（不残留 /new 前的旧对话）。
+    #[tokio::test]
+    async fn history_epoch_guard_blocks_stale_writes() {
+        let runner = Arc::new(MockAgentRunner::immediate("ok"));
+        let bot = backend_bot("pi");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+
+        // 旧代际写盘（模拟 m1 在锁内、/new 尚未到达的快照）
+        let lock = bridge.history_lock("oc_x");
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let epoch0 = *guard;
+        hist.append_user("m1", "pi", "/new 之前的旧消息");
+        drop(guard);
+        assert!(!hist.entries().is_empty(), "同代际写盘放行");
+
+        // /new：代际自增 + 清盘（同锁内原子完成）
+        assert!(bridge.history_reset("oc_x"), "clear 成功");
+        assert!(hist.entries().is_empty(), "clear 清掉旧条目");
+
+        // 旧代际（epoch0）的写盘在 /new 之后到达 → 代际不符必须被拦
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        assert_ne!(*guard, epoch0, "代际已自增");
+        assert!(*guard == epoch0 + 1);
+        drop(guard);
+        assert!(hist.entries().is_empty(), "历史保持空");
+
+        // 新代际（/new 之后的新消息）恢复正常写
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        hist.append_user("m2", "pi", "新消息");
+        drop(guard);
+        assert_eq!(hist.entries().len(), 1);
+        cleanup_bridge(&bridge);
+    }
+
+    /// T7：话题隔离——thread key（chat:thread）与主 chat 各自独立历史文件。
+    #[tokio::test]
+    async fn history_thread_isolation() {
+        let runner = Arc::new(MockAgentRunner::immediate("ok"));
+        let bot = backend_bot("pi");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let thread_key = format!("oc_x:{}", "omt_1");
+        let hist_thread = crate::history::History::open(&bot.key(), &thread_key);
+        hist_thread.append_user("old1", "claude", "话题里的旧背景");
+        let hist_main = crate::history::History::open(&bot.key(), "oc_x");
+        assert!(hist_main.entries().is_empty(), "主 chat 无历史");
+
+        // 话题消息 → 注入话题历史
+        let mut ev = test_ev("m1", "oc_x", "继续");
+        ev.thread_id = "omt_1".into();
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(ev).await })
+            .await
+            .unwrap();
+        assert!(runner.prompts()[0].contains("话题里的旧背景"), "话题注入");
+
+        // 主 chat 消息 → 无历史可注入
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "hi")).await })
+            .await
+            .unwrap();
+        assert!(
+            !runner.prompts()[1].contains("[历史上下文]"),
+            "主 chat 不串话题历史"
+        );
+        assert!(hist_thread.entries().len() >= 2, "话题历史独立累计");
+        cleanup_bridge(&bridge);
+    }
+
+    /// T8：GitHub 分析（含合成 Ev）同样落历史——它是该通知群的 agent 轮次，
+    /// 新后端能接续「刚才分析过什么」。助手条目记 reply 本体（300 字截断在
+    /// history 层，与群摘要的 200 字截断各自独立）。
+    #[tokio::test]
+    async fn github_analyze_recorded_in_history() {
+        let runner = Arc::new(MockAgentRunner::immediate("分析结论：竞态窗口需加锁。"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            gh_token: "ghp_x".into(),
+            gh_repos: "o/r".into(),
+            gh_notify_chat: "oc_gh".into(),
+            ..Default::default()
+        };
+        let gh = Arc::new(MockGithub::new());
+        let (bridge, _msgr) = build_test_bridge_with_bot_gh(runner, bot.clone(), gh);
+        let hist = crate::history::History::open(&bot.key(), "oc_gh");
+
+        let b = bridge.clone();
+        tokio::spawn(async move {
+            b.handle(crate::service::auto_ev("o/r", 42, 9, "oc_gh"))
+                .await
+        })
+        .await
+        .unwrap();
+
+        let entries = hist.entries();
+        assert!(
+            entries.iter().any(|e| e.user && e.text.contains("分析 ")),
+            "合成 Ev 用户轮落历史，实际: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| !e.user && e.text.contains("分析结论")),
+            "分析回复落历史"
         );
         cleanup_bridge(&bridge);
     }

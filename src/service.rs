@@ -759,6 +759,7 @@ async fn run_job(
         &uuid::Uuid::new_v4().to_string(), // 每次全新 session，不带聊天上下文
         false,
         &job.chat_id,
+        &job.chat_id, // session_key：sessions=None 时仅回存分支用不到，占位保持一致
         &bot_key,
         job.role, // 按创建者角色执行：授权者建的任务走受限分支
         None,     // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
