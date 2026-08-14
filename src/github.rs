@@ -42,8 +42,15 @@ pub struct GhUser {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct GhComment {
+    /// GitHub 全局评论 id（评论游标 seen 去重用）。
+    pub id: u64,
     pub body: String,
     pub user: GhUser,
+    /// RFC3339 UTC（评论游标 updated_at 比较用）。
+    pub created_at: String,
+    pub updated_at: String,
+    /// …/issues/42#issuecomment-… 或 …/pull/5#…（评论 → issue/PR 映射用）。
+    pub html_url: String,
 }
 
 /// IM → GitHub 指令的解析结果。
@@ -510,6 +517,117 @@ pub fn notify_text(repo: &str, iss: &GhIssue) -> String {
     )
 }
 
+/// 提及上限：单条评论最多取前 N 个独立 login（防超长评论刷爆 DM 配额）。
+const MENTION_MAX: usize = 10;
+
+/// 从评论正文提取 @login 提及（纯函数可测）。
+/// - 词位边界：@ 前后都不得是 login 字符（GitHub 用户名 = ASCII 字母数字 + '-'）；
+///   "xx@alice" / "email@alice.com" 不命中，"问@alice一下" 命中；
+/// - 跳过 '>' 开头行（GitHub 引用块——被引用的 @ 不算新提及）；
+/// - 排除 exclude（机器人自己的 login，@bot 归 2.2 自动处理）；
+/// - 去重保序；超 MENTION_MAX 截断；大小写保留原样（查映射时忽略大小写）。
+pub fn extract_mentions(body: &str, exclude: &str) -> Vec<String> {
+    fn is_login_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-'
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_start();
+        if line.starts_with('>') {
+            continue; // 引用行不算
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '@' {
+                i += 1;
+                continue;
+            }
+            let before_ok = i == 0 || !is_login_char(chars[i - 1]);
+            let mut j = i + 1;
+            while j < chars.len() && is_login_char(chars[j]) {
+                j += 1;
+            }
+            if before_ok && j > i + 1 {
+                let after_ok = j >= chars.len() || !is_login_char(chars[j]);
+                if after_ok {
+                    let login: String = chars[i + 1..j].iter().collect();
+                    if !login.eq_ignore_ascii_case(exclude)
+                        && !out.iter().any(|e| e.eq_ignore_ascii_case(&login))
+                    {
+                        out.push(login);
+                        if out.len() >= MENTION_MAX {
+                            return out;
+                        }
+                    }
+                }
+            }
+            i = j.max(i + 1);
+        }
+    }
+    out
+}
+
+/// 解析 @提及映射 "login:chat_id,login2:chat_id2"（逗号/分号/空白分隔）。
+/// 无 ':' 或任一侧空 → 跳过该项。split_once 只切第一处 ':'，chat_id 本身可含 ':'。
+pub fn parse_mention_map(s: &str) -> Vec<(String, String)> {
+    s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .filter_map(|e| {
+            let (login, chat) = e.split_once(':')?;
+            let (l, c) = (login.trim(), chat.trim());
+            (!l.is_empty() && !c.is_empty()).then(|| (l.to_string(), c.to_string()))
+        })
+        .collect()
+}
+
+/// 从评论 html_url 提取 (issue 号, 是否 PR)。
+/// 形态：issues → …/issues/42#issuecomment-…；PR → …/pull/5#… 或 /pulls/5#…。
+/// 解析失败 → None。提及私信对 PR 评论同样生效（PR 也是 issue）；@bot 触发按 is_pr 过滤。
+pub fn comment_issue_ref(c: &GhComment) -> Option<(u64, bool)> {
+    let host = "github.com/";
+    let pos = c.html_url.to_ascii_lowercase().find(host)?;
+    let mut parts = c.html_url[pos + host.len()..].split('/');
+    parts.next().filter(|s| !s.is_empty())?; // owner
+    parts.next().filter(|s| !s.is_empty())?; // repo
+    let kind = parts.next()?.to_ascii_lowercase();
+    let is_pr = kind == "pull" || kind == "pulls";
+    if kind != "issues" && !is_pr {
+        return None;
+    }
+    let num: u64 = parts
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((num, is_pr))
+}
+
+/// 提及私信文案：谁在哪条评论提到你 + 原文摘录（200 字单行化）+ 评论链接。
+pub fn mention_notify_text(repo: &str, number: u64, c: &GhComment) -> String {
+    let url = if c.html_url.is_empty() {
+        format!("https://github.com/{repo}/issues/{number}")
+    } else {
+        c.html_url.clone()
+    };
+    let excerpt: String = crate::agent::truncate(&c.body, 200)
+        .chars()
+        .map(|x| if x == '\n' || x == '\r' { ' ' } else { x })
+        .collect();
+    format!(
+        "📣 你在 {repo}#{number} 被 @{} 提到了：\n> {excerpt}\n{url}",
+        c.user.login
+    )
+}
+
+/// 分页推进判定（纯函数可测）：一页拉满（== per_page）且未到页数上限 → 还有下一页。
+pub fn has_next_page(page_len: usize, page: u32, per_page: u32, max_pages: u32) -> bool {
+    page < max_pages && page_len as u32 >= per_page
+}
+
 /// 纯函数（可测）：从一页增量结果挑「新 issue」+ 计算新游标。
 /// - since 为空（首轮/游标丢失）→ 只推进游标不通知（静默基线，避免首刷把存量 open issues 全发一遍）；
 /// - 过滤 seen 里已有的 issue 全局 id（同秒多条/时间戳回拨防重）；
@@ -567,10 +685,16 @@ pub fn retry_since(failed: &[&GhIssue]) -> Option<String> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepoCursor {
-    /// updated_at 游标（RFC3339）。
+    /// issue updated_at 游标（RFC3339）。
     pub since: String,
     /// 已通知的 issue 全局 id（上限 2000，超裁头）。
     pub seen: Vec<u64>,
+    /// 评论 updated_at 游标（RFC3339，Phase 2 评论增量轮询）。
+    #[serde(default)]
+    pub comment_since: String,
+    /// 已处理评论的全局 id（上限 2000，超裁头）。
+    #[serde(default)]
+    pub comment_seen: Vec<u64>,
 }
 
 /// watch 循环游标：按仓库分组，落盘 workspaces/<bot>/github_cursor.json。
@@ -606,14 +730,26 @@ impl GhCursor {
     pub fn update(&mut self, repo: &str, since: &str, seen_extra: Vec<u64>) {
         let cur = self.by_repo.entry(repo.to_string()).or_default();
         cur.since = since.to_string();
-        for id in seen_extra {
-            if !cur.seen.contains(&id) {
-                cur.seen.push(id);
-            }
+        push_dedup_cap(&mut cur.seen, seen_extra);
+    }
+
+    /// 评论游标更新（镜像 update：去重 + 2000 裁头）。
+    pub fn comment_update(&mut self, repo: &str, since: &str, seen_extra: Vec<u64>) {
+        let cur = self.by_repo.entry(repo.to_string()).or_default();
+        cur.comment_since = since.to_string();
+        push_dedup_cap(&mut cur.comment_seen, seen_extra);
+    }
+}
+
+/// seen 列表去重追加 + 上限裁头（issue 与评论共用）。
+fn push_dedup_cap(list: &mut Vec<u64>, extra: Vec<u64>) {
+    for id in extra {
+        if !list.contains(&id) {
+            list.push(id);
         }
-        if cur.seen.len() > 2000 {
-            cur.seen.drain(..cur.seen.len() - 2000);
-        }
+    }
+    if list.len() > 2000 {
+        list.drain(..list.len() - 2000);
     }
 }
 
@@ -663,6 +799,14 @@ pub trait GithubApi: Send + Sync {
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GhIssue>>;
+    /// 增量拉仓库级评论（覆盖 issue 与 PR 时间线评论——PR 也是 issue；不包含 diff 内联
+    /// review 评论，文档注明）。since=updated_at 游标，sort=created&direction=asc。
+    async fn list_comments_since(
+        &self,
+        owner: &str,
+        repo: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GhComment>>;
 }
 
 pub struct GithubClient {
@@ -697,6 +841,29 @@ impl GithubClient {
                 format!("Bearer {}", self.token),
             )
         }
+    }
+
+    /// 分页 GET（评审 L2）：满页继续 page+1，直到不满页或达上限（防页漂无限拉）。
+    async fn get_paged(&self, path: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        const PER_PAGE: u32 = 100;
+        const MAX_PAGES: u32 = 10; // 上限 1000 条/轮
+        let mut all = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let p = if page == 1 {
+                path.to_string()
+            } else {
+                format!("{path}&page={page}")
+            };
+            let v = self.send(self.authed(reqwest::Method::GET, &p)).await?;
+            let items: Vec<serde_json::Value> =
+                serde_json::from_value(v).context("github 分页响应非数组")?;
+            let n = items.len();
+            all.extend(items);
+            if !has_next_page(n, page, PER_PAGE, MAX_PAGES) {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     /// 统一响应处理（wechat get_updates 同款「先取文本再解析」）：非 2xx → Err 带 status+预览。
@@ -814,8 +981,33 @@ impl GithubApi for GithubClient {
             path.push_str("&since=");
             path.push_str(&crate::wechat::percent_encode_query(since));
         }
-        let v = self.send(self.authed(reqwest::Method::GET, &path)).await?;
-        Ok(serde_json::from_value(v)?)
+        let items = self.get_paged(&path).await?;
+        items
+            .into_iter()
+            .map(|v| serde_json::from_value(v).context("issue 项解析失败"))
+            .collect()
+    }
+
+    async fn list_comments_since(
+        &self,
+        owner: &str,
+        repo: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GhComment>> {
+        // 仓库级评论（issues/comments）覆盖 issue 与 PR 时间线；sort=created 升序 → 游标 =
+        // 最后一跳 updated_at。diff 内联 review 评论不在此端点（文档已知限制）。
+        let mut path = format!(
+            "/repos/{owner}/{repo}/issues/comments?sort=created&direction=asc&per_page=100"
+        );
+        if !since.is_empty() {
+            path.push_str("&since=");
+            path.push_str(&crate::wechat::percent_encode_query(since));
+        }
+        let items = self.get_paged(&path).await?;
+        items
+            .into_iter()
+            .map(|v| serde_json::from_value(v).context("评论项解析失败"))
+            .collect()
     }
 }
 
@@ -1266,5 +1458,179 @@ mod tests {
         assert!(ctx.render.contains("@alice"));
         assert!(ctx.render.contains("[评论]"));
         assert!(ctx.render.contains("@bob: 复现了，见日志。"));
+    }
+
+    #[test]
+    fn extract_mentions_word_boundaries() {
+        // 词位边界：@ 前后不得是 login 字符
+        assert_eq!(extract_mentions("xx@alice 你好", ""), Vec::<String>::new());
+        assert_eq!(
+            extract_mentions("email@alice.com", ""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            extract_mentions("问@alice一下", ""),
+            vec!["alice".to_string()]
+        );
+        assert_eq!(
+            extract_mentions("@alice 看看 @bob", ""),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        // 连字符 login
+        assert_eq!(extract_mentions("@x-1 修一下", ""), vec!["x-1".to_string()]);
+        // @a@b：第一个 @ 后是 login 字符 @ 前的判定…… 第二个 @ 前是 a（login 字符）不命中
+        assert_eq!(extract_mentions("@a@b", ""), vec!["a".to_string()]);
+        // 引用行跳过（GitHub 引用块）
+        assert_eq!(
+            extract_mentions("> @quoted 引用不算\n@real 真提及", ""),
+            vec!["real".to_string()]
+        );
+        // 无提及
+        assert_eq!(extract_mentions("普通讨论", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn extract_mentions_excludes_and_dedup() {
+        // exclude（bot login）排除 + 去重保序 + 大小写不敏感
+        assert_eq!(
+            extract_mentions("@BOT @bot @alice", "bot"),
+            vec!["alice".to_string()]
+        );
+        assert_eq!(
+            extract_mentions("@alice @alice @bob", ""),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_mention_map_rules() {
+        assert_eq!(parse_mention_map(""), Vec::<(String, String)>::new());
+        assert_eq!(
+            parse_mention_map("alice:oc_1,bob:oc_2"),
+            vec![
+                ("alice".to_string(), "oc_1".to_string()),
+                ("bob".to_string(), "oc_2".to_string())
+            ]
+        );
+        // 空白/分号分隔 + trim；无冒号/空侧跳过；chat_id 可含 ':'
+        assert_eq!(
+            parse_mention_map(" alice:oc_1 ; bob:oc_2 "),
+            vec![
+                ("alice".to_string(), "oc_1".to_string()),
+                ("bob".to_string(), "oc_2".to_string())
+            ]
+        );
+        assert_eq!(parse_mention_map("alice"), Vec::<(String, String)>::new());
+        assert_eq!(
+            parse_mention_map("alice:oc_1,bad"),
+            vec![("alice".to_string(), "oc_1".to_string())]
+        );
+        assert_eq!(
+            parse_mention_map("a:b:c"),
+            vec![("a".to_string(), "b:c".to_string())]
+        );
+    }
+
+    #[test]
+    fn comment_issue_ref_forms() {
+        let mk = |url: &str| GhComment {
+            id: 1,
+            body: String::new(),
+            user: GhUser { login: "x".into() },
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: url.into(),
+        };
+        // issues 形态 + #issuecomment 片段
+        assert_eq!(
+            comment_issue_ref(&mk("https://github.com/o/r/issues/42#issuecomment-123")),
+            Some((42, false))
+        );
+        // PR 形态 pull / pulls
+        assert_eq!(
+            comment_issue_ref(&mk("https://github.com/o/r/pull/5#issuecomment-9")),
+            Some((5, true))
+        );
+        assert_eq!(
+            comment_issue_ref(&mk("https://github.com/o/r/pulls/5#discussion_r1")),
+            Some((5, true))
+        );
+        // 负例
+        assert_eq!(
+            comment_issue_ref(&mk("https://github.com/o/r/releases/1")),
+            None
+        );
+        assert_eq!(comment_issue_ref(&mk("")), None);
+        assert_eq!(
+            comment_issue_ref(&mk("https://example.com/o/r/issues/1")),
+            None
+        );
+    }
+
+    #[test]
+    fn has_next_page_rules() {
+        // 满页 → 继续；不满页 → 停；页数上限 → 停
+        assert!(has_next_page(100, 1, 100, 10));
+        assert!(!has_next_page(99, 1, 100, 10));
+        assert!(!has_next_page(100, 10, 100, 10));
+    }
+
+    #[test]
+    fn mention_notify_text_format() {
+        let c = GhComment {
+            id: 1,
+            body: "第一行\n第二行".into(),
+            user: GhUser {
+                login: "alice".into(),
+            },
+            created_at: String::new(),
+            updated_at: String::new(),
+            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
+        };
+        let t = mention_notify_text("o/r", 42, &c);
+        assert!(t.contains("📣 你在 o/r#42 被 @alice 提到了"));
+        assert!(t.contains("> 第一行 第二行")); // 摘录单行化
+        assert!(t.contains("https://github.com/o/r/issues/42#issuecomment-1"));
+    }
+
+    #[test]
+    fn repo_cursor_comment_fields_roundtrip() {
+        // 旧 JSON（无评论字段）→ 兼容加载
+        let old = r#"{"by_repo":{"o/r":{"since":"2026-08-14T02:00:00Z","seen":[1]}}}"#;
+        let c: GhCursor = serde_json::from_str(old).unwrap();
+        let cur = c.repo_cursor("o/r");
+        assert_eq!(cur.since, "2026-08-14T02:00:00Z");
+        assert_eq!(cur.seen, vec![1]);
+        assert!(cur.comment_since.is_empty());
+        assert!(cur.comment_seen.is_empty());
+        // comment_update 往返 + 2000 裁头
+        let key = format!("abb-test-{}", uuid::Uuid::new_v4());
+        let dir = crate::workspace_dir(&key);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = c;
+        c.comment_update("o/r", "2026-08-14T03:00:00Z", vec![9, 9, 10]);
+        c.save(&key);
+        let c2 = GhCursor::load(&key);
+        let cur2 = c2.repo_cursor("o/r");
+        assert_eq!(cur2.comment_since, "2026-08-14T03:00:00Z");
+        assert_eq!(cur2.comment_seen, vec![9, 10]); // 去重
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gh_comment_new_fields_parse() {
+        let c: GhComment = serde_json::from_str(
+            r#"{"id":7,"body":"hello","user":{"login":"bob"},
+                "created_at":"2026-08-14T02:00:00Z","updated_at":"2026-08-14T02:05:00Z",
+                "html_url":"https://github.com/o/r/issues/42#issuecomment-7"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.id, 7);
+        assert_eq!(c.updated_at, "2026-08-14T02:05:00Z");
+        // 旧 fixture（无新字段）→ serde default 兼容
+        let c2: GhComment =
+            serde_json::from_str(r#"{"body":"old","user":{"login":"bob"}}"#).unwrap();
+        assert_eq!(c2.id, 0);
+        assert!(c2.html_url.is_empty());
     }
 }

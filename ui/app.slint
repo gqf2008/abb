@@ -103,6 +103,7 @@ export struct BotRow {
     gh-repos: string,       // 仓库白名单：owner/repo 或 owner/*，逗号分隔
     gh-notify-chat: string, // 新 issue 通知目标会话（该 bot 自己的群/私聊 chat_id）
     gh-username: string,    // 自己的 GitHub login：新 issue 通知过滤「自问自答」回声
+    gh-mention-map: string, // @提及映射：login:chat_id 对（评论 @提及 私信通知目标）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -1161,6 +1162,15 @@ export component SettingsWindow inherits Window {
                                                         placeholder-text: "自己的 GitHub login（通知过滤自问自答，须与 token 账号一致）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "gh_username", self.text); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "提及映射"; width: 80px; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        text: root.bots[root.selected].gh-mention-map;
+                                                        placeholder-text: "login:chat_id，逗号分隔（issue 评论 @提及 私信通知目标）";
+                                                        horizontal-stretch: 1;
+                                                        edited => { root.bot-field-edited(root.selected, "gh_mention_map", self.text); }
                                                     }
                                                 }
                                             }

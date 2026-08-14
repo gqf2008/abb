@@ -1435,10 +1435,14 @@ mod tests {
                     pull_request: None,
                 }),
                 comments: Mutex::new(vec![crate::github::GhComment {
+                    id: 101,
                     body: "复现了，见日志。".into(),
                     user: crate::github::GhUser {
                         login: "bob".into(),
                     },
+                    created_at: "2026-08-14T02:00:00Z".into(),
+                    updated_at: "2026-08-14T02:05:00Z".into(),
+                    html_url: "https://github.com/o/r/issues/42#issuecomment-101".into(),
                 }]),
                 fail_fetch: false,
                 fail_post: false,
@@ -1530,6 +1534,18 @@ mod tests {
                 .push(format!("list:{owner}/{repo}:{since}"));
             Ok(Vec::new())
         }
+        async fn list_comments_since(
+            &self,
+            owner: &str,
+            repo: &str,
+            since: &str,
+        ) -> anyhow::Result<Vec<crate::github::GhComment>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("comments:{owner}/{repo}:{since}"));
+            Ok(self.comments.lock().unwrap().clone())
+        }
     }
 
     /// 收集 send_text 调用，供断言回复内容；get_quoted_message 用 map 按 message_id 返回
@@ -1537,12 +1553,15 @@ mod tests {
     /// （不落盘，测试与工作区解耦）。
     struct MockMessenger {
         sent: Mutex<Vec<String>>,
+        /// (chat_id, text) 全量记录：提及私信等按目标断言用（sent() 只留文本）。
+        sent_chats: Mutex<Vec<(String, String)>>,
         quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
     }
     impl MockMessenger {
         fn new() -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
+                sent_chats: Mutex::new(Vec::new()),
                 quoted: Mutex::new(std::collections::HashMap::new()),
             }
         }
@@ -1564,11 +1583,18 @@ mod tests {
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
         }
+        fn sent_chats(&self) -> Vec<(String, String)> {
+            self.sent_chats.lock().unwrap().clone()
+        }
     }
     #[async_trait]
     impl Messenger for MockMessenger {
-        async fn send_text(&self, _chat_id: &str, text: &str) -> anyhow::Result<()> {
+        async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
             self.sent.lock().unwrap().push(text.to_string());
+            self.sent_chats
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
             Ok(())
         }
         async fn get_quoted_message(
@@ -3119,5 +3145,51 @@ https://b.com/y"
         let p = runner.prompts().join("\n");
         assert!(!p.contains("[GitHub Issue]"), "未配置不注入");
         cleanup_bridge(&bridge);
+    }
+
+    /// 评论批处理：@提及 私信通知（映射内 login → 对应 chat_id；无映射静默跳过；
+    /// bot login 不私信；失败评论进 failed 游标回退）。
+    #[tokio::test]
+    async fn comment_batch_mentions_dm_targets() {
+        let msgr = Arc::new(MockMessenger::new());
+        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
+            id,
+            body: body.into(),
+            user: crate::github::GhUser {
+                login: login.into(),
+            },
+            created_at: "2026-08-14T02:00:00Z".into(),
+            updated_at: "2026-08-14T02:05:00Z".into(),
+            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
+        };
+        let comments = vec![
+            // 映射内 login → 私信；@bot 不私信（exclude 在调用方传 ""？—— process_comment_batch
+            // 传 ""，@bot 的过滤在 2.2 的触发判定；私信侧 bot 自身 login 若在映射里也会发，
+            // 但映射是配置者自选的，不构成回环）
+            mk(1, "@alice 看看这个", "bob"),
+            // 无映射 login → 静默跳过
+            mk(2, "@nobody 你好", "bob"),
+            // 引用行内的 @ 不算
+            mk(3, "> @alice 旧讨论\n新讨论", "carol"),
+            // 已在 seen → 跳过
+            mk(4, "@alice 已处理过", "bob"),
+        ];
+        let batch = crate::service::process_comment_batch(
+            msgr.as_ref(),
+            &comments,
+            &[4],
+            &[("alice".to_string(), "oc_alice".to_string())],
+            "o/r",
+        )
+        .await;
+        // 私信目标断言：@alice 的评论（1 与 3 的引用行不算 → 3 无提及）发到 oc_alice
+        let sent = msgr.sent_chats();
+        assert_eq!(sent.len(), 1, "只有评论 1 触发私信: {sent:?}");
+        assert_eq!(sent[0].0, "oc_alice");
+        assert!(sent[0].1.contains("你在 o/r#42 被 @bob 提到了"));
+        // seen 推进：1/2/3 成功（3 无提及也算处理过），4 在 seen 里跳过
+        assert_eq!(batch.seen_extra, vec![1, 2, 3]);
+        assert!(batch.failed.is_empty());
+        assert_eq!(batch.new_since, "2026-08-14T02:05:00Z");
     }
 }

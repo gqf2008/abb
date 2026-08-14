@@ -14,8 +14,8 @@ use anyhow::Result;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -73,7 +73,11 @@ fn kind_label(kind: &str) -> String {
 /// 截断加省略号，否则会把原生 NSMenu 撑得过宽。完整名仍在设置窗/配置里。
 fn display_name(name: &str, kind: &str) -> String {
     const MAX: usize = 16;
-    let base = if name.is_empty() { kind_label(kind) } else { name.to_string() };
+    let base = if name.is_empty() {
+        kind_label(kind)
+    } else {
+        name.to_string()
+    };
     let chars: Vec<char> = base.chars().collect();
     if chars.len() <= MAX {
         base
@@ -94,7 +98,7 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
                 "在线" => tray.get_icon_online(),
                 "重连中" | "连接中" => tray.get_icon_connecting(),
                 "已停用" => tray.get_icon_disabled(), // 用户主动停用（非故障，灰）
-                _ => tray.get_icon_offline(), // 会话过期 / 离线 / 其它
+                _ => tray.get_icon_offline(),         // 会话过期 / 离线 / 其它
             };
             let label = display_name(&b.name, &b.kind);
             BotMenuRow {
@@ -109,13 +113,14 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
 
     // 托盘图标整体状态：所有启用 bot 在线=绿；有在连/重连=黄；有离线/会话过期=红；
     // 未跑服务、无 bot 或全部停用=原灰（不显红吓人）。
-    let active: Vec<&crate::botstatus::BotStatus> = bots
-        .iter()
-        .filter(|b| b.conn != "已停用")
-        .collect();
+    let active: Vec<&crate::botstatus::BotStatus> =
+        bots.iter().filter(|b| b.conn != "已停用").collect();
     let status = if !st.running || active.is_empty() {
         "none"
-    } else if active.iter().any(|b| b.conn == "连接中" || b.conn == "重连中") {
+    } else if active
+        .iter()
+        .any(|b| b.conn == "连接中" || b.conn == "重连中")
+    {
         "connecting"
     } else if active.iter().all(|b| b.conn == "在线") {
         "online"
@@ -322,6 +327,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         gh_repos: b.gh_repos.clone().into(),
         gh_notify_chat: b.gh_notify_chat.clone().into(),
         gh_username: b.gh_username.clone().into(),
+        gh_mention_map: b.gh_mention_map.clone().into(),
     }
 }
 
@@ -404,10 +410,12 @@ fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) 
     };
     // 空 = 跟随全局 → claude 选中
     let be_sel = if be.is_empty() { "claude" } else { be.as_str() };
-    w.set_backend_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(mk_opts(
-        &[("claude", "claude"), ("codex", "codex"), ("pi", "pi")],
-        be_sel,
-    )))));
+    w.set_backend_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        mk_opts(
+            &[("claude", "claude"), ("codex", "codex"), ("pi", "pi")],
+            be_sel,
+        ),
+    ))));
     let is_ding = bot.as_ref().map(|b| b.is_dingtalk()).unwrap_or(false);
     let open = bot
         .map(|b| {
@@ -420,10 +428,7 @@ fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) 
         .unwrap_or(false);
     let access_sel = if open { "open" } else { "private" };
     let access_model = slint::ModelRc::from(Rc::new(slint::VecModel::from(mk_opts(
-        &[
-            ("仅授权用户", "private"),
-            ("任何人都可以对话", "open"),
-        ],
+        &[("仅授权用户", "private"), ("任何人都可以对话", "open")],
         access_sel,
     ))));
     w.set_access_options(access_model.clone());
@@ -735,14 +740,32 @@ pub fn run_gui() -> Result<()> {
     ) -> bool {
         if Config::draft_is_newer() {
             let draft = Config::load_draft().unwrap_or_default();
-            load_into(w, &draft, work, model, providers_work, providers_model, default_provider_work, cross_delivery_work);
+            load_into(
+                w,
+                &draft,
+                work,
+                model,
+                providers_work,
+                providers_model,
+                default_provider_work,
+                cross_delivery_work,
+            );
             dirty.set(true);
             w.set_status_is_error(false);
             w.set_status_line("已恢复上次未保存的草稿（编辑后点「保存」写入配置）".into());
             true
         } else {
             let cfg = Config::load().unwrap_or_default();
-            load_into(w, &cfg, work, model, providers_work, providers_model, default_provider_work, cross_delivery_work);
+            load_into(
+                w,
+                &cfg,
+                work,
+                model,
+                providers_work,
+                providers_model,
+                default_provider_work,
+                cross_delivery_work,
+            );
             dirty.set(false);
             false
         }
@@ -1068,6 +1091,7 @@ pub fn run_gui() -> Result<()> {
                         "gh_repos" => bot.gh_repos = value.trim().to_string(),
                         "gh_notify_chat" => bot.gh_notify_chat = value.trim().to_string(),
                         "gh_username" => bot.gh_username = value.trim().to_string(),
+                        "gh_mention_map" => bot.gh_mention_map = value.trim().to_string(),
                         _ => {}
                     }
                 }
@@ -1237,12 +1261,22 @@ pub fn run_gui() -> Result<()> {
     // 「去授权」：跳到对应系统权限的设置面板（仅 macOS 有；面板 URL 与 deps.rs detect_permissions 一致）
     settings.on_open_perm_settings(|id| {
         let url = match id.as_str() {
-            "full-disk" => "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
-            "accessibility" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-            "screen" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-            "automation" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+            "full-disk" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+            }
+            "accessibility" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            }
+            "screen" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            }
+            "automation" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+            }
             "camera" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
-            "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            "microphone" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+            }
             _ => return,
         };
         platform::open_url(url);
@@ -1258,7 +1292,9 @@ pub fn run_gui() -> Result<()> {
                 }
                 w.set_perm_busy(true);
                 w.set_status_is_error(false);
-                w.set_status_line("⏳ 逐项弹系统授权框（屏幕录制→摄像头→麦克风），请点「允许」…".into());
+                w.set_status_line(
+                    "⏳ 逐项弹系统授权框（屏幕录制→摄像头→麦克风），请点「允许」…".into(),
+                );
             }
             let sw2 = sw.clone();
             std::thread::spawn(move || {
@@ -1473,7 +1509,8 @@ pub fn run_gui() -> Result<()> {
     }
 
     // 「取消授权」：从该 bot 授权者列表移除某用户（config 落盘 + 刷新列表）。
-    {        let work = work.clone();
+    {
+        let work = work.clone();
         let model = bots_model.clone();
         let sw = settings.as_weak();
         settings.on_remove_granted(move |bot_idx, granted_idx| {
@@ -1487,7 +1524,9 @@ pub fn run_gui() -> Result<()> {
                     .get(granted_idx as usize)
                     .map(|i| i.open_id.clone())
             } else {
-                bot.granted_infos.get(granted_idx as usize).map(|i| i.open_id.clone())
+                bot.granted_infos
+                    .get(granted_idx as usize)
+                    .map(|i| i.open_id.clone())
             }
             .unwrap_or_default();
             if open_id.is_empty() {
@@ -1855,7 +1894,9 @@ async fn test_provider(p: &ProviderConfig) -> std::result::Result<String, String
             } else if code == 401 || code == 403 {
                 Err(format!("{label} 认证失败（HTTP {code}），检查 API Key"))
             } else {
-                Err(format!("{label} 返回 HTTP {code}（能连上但响应异常，检查 Base URL/模型）"))
+                Err(format!(
+                    "{label} 返回 HTTP {code}（能连上但响应异常，检查 Base URL/模型）"
+                ))
             }
         }
         "anthropic" => {
@@ -1885,7 +1926,9 @@ async fn test_provider(p: &ProviderConfig) -> std::result::Result<String, String
                 Err(format!("{label} 认证失败（HTTP {code}），检查 API Key"))
             } else if code == 400 || code == 404 {
                 // 400/404：认证过了但请求体/模型名问题——连接本身是通的
-                Ok(format!("✅ {label} 可达（HTTP {code}：认证通过，检查模型名「{model}」）"))
+                Ok(format!(
+                    "✅ {label} 可达（HTTP {code}：认证通过，检查模型名「{model}」）"
+                ))
             } else {
                 Err(format!("{label} 返回 HTTP {code}"))
             }

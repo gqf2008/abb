@@ -106,6 +106,10 @@ pub struct BotConfig {
     /// 自己的 GitHub login：watch 通知过滤「自问自答」回显（须与 token 对应账号精确一致）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gh_username: String,
+    /// @提及映射：login:chat_id 对（逗号分隔），issue 评论 @提及 私信通知用。
+    /// 无映射项 → 静默跳过（不群发骚扰）。chat_id 为该 bot 自己通道的群/私聊会话。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gh_mention_map: String,
     /// 该 bot 的模型供应商名（指向 Config.providers[].name）。空 = 跟随全局 default_provider。
     /// per-bot 独立：不同 bot 可走不同 key/模型（如飞书用官方 key、微信用 deepseek）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -148,6 +152,7 @@ impl Default for BotConfig {
             gh_repos: String::new(),
             gh_notify_chat: String::new(),
             gh_username: String::new(),
+            gh_mention_map: String::new(),
             ding_owner_ids: String::new(),
             ding_granted_ids: String::new(),
             ding_open_access: false,
@@ -340,6 +345,11 @@ impl BotConfig {
     /// 仓库是否放行（空白名单 = 全部放行，见 github::repo_in_whitelist）。
     pub fn gh_allows_repo(&self, repo: &str) -> bool {
         crate::github::repo_in_whitelist(repo, &self.gh_repos)
+    }
+
+    /// @提及映射解析（login:chat_id 对，见 github::parse_mention_map）。
+    pub fn gh_mention_map_list(&self) -> Vec<(String, String)> {
+        crate::github::parse_mention_map(&self.gh_mention_map)
     }
 
     /// 凭证是否齐备可跑（单一事实源：service 启动门槛 + Config::missing 都用它）。
@@ -804,7 +814,12 @@ impl Config {
     /// 消费授权码（bridge 收到疑似授权码的私聊消息时调用）：
     /// Granted → sender 已加入该 bot owner 白名单（含展示名）并落盘；Expired/NotFound → 只反馈不落盘。
     /// 找不到 bot / 落盘失败 → NotFound（不误授权，也静默不打扰）。
-    pub fn consume_owner_code(bot_key: &str, code: &str, sender: &str, name: &str) -> OwnerCodeResult {
+    pub fn consume_owner_code(
+        bot_key: &str,
+        code: &str,
+        sender: &str,
+        name: &str,
+    ) -> OwnerCodeResult {
         let _g = CONFIG_WRITE_LOCK.lock().unwrap();
         let mut c = match Config::load() {
             Ok(c) => c,
@@ -983,11 +998,17 @@ mod tests {
         let b3: BotConfig = serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x"}"#).unwrap();
         assert_eq!(b3.ding_owner_ids, "");
         let mut c_mig = Config {
-            bots: vec![serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x","ding_user_id":"u9"}"#).unwrap()],
+            bots: vec![serde_json::from_str(
+                r#"{"kind":"dingtalk","app_id":"x","ding_user_id":"u9"}"#,
+            )
+            .unwrap()],
             ..Default::default()
         };
         c_mig.migrate_ding_owner();
-        assert_eq!(c_mig.bots[0].ding_owner_ids, "u9", "旧 ding_user_id 应迁移到管理员白名单");
+        assert_eq!(
+            c_mig.bots[0].ding_owner_ids, "u9",
+            "旧 ding_user_id 应迁移到管理员白名单"
+        );
         // 序列化兼容：新字段不写旧 config 不报错
         let b4: BotConfig =
             serde_json::from_str(r#"{"kind":"dingtalk","app_id":"x","app_secret":"s"}"#).unwrap();
@@ -1005,7 +1026,7 @@ mod tests {
 
         // 配了 token → 能力开；白名单解析 + 放行判断
         let b: BotConfig = serde_json::from_str(
-            r#"{"kind":"feishu","app_id":"x","app_secret":"s","gh_token":"ghp_x","gh_repos":"o/a, o/*","gh_notify_chat":"oc_g","gh_username":"bot"}"#,
+            r#"{"kind":"feishu","app_id":"x","app_secret":"s","gh_token":"ghp_x","gh_repos":"o/a, o/*","gh_notify_chat":"oc_g","gh_username":"bot","gh_mention_map":"alice:oc_1,bob:oc_2"}"#,
         )
         .unwrap();
         assert!(b.is_github_capable());
@@ -1015,6 +1036,13 @@ mod tests {
         assert!(!b.gh_allows_repo("x/y"));
         assert_eq!(b.gh_notify_chat, "oc_g");
         assert_eq!(b.gh_username, "bot");
+        assert_eq!(
+            b.gh_mention_map_list(),
+            vec![
+                ("alice".to_string(), "oc_1".to_string()),
+                ("bob".to_string(), "oc_2".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -1451,7 +1479,10 @@ mod tests {
         // 空 provider/default_provider 不落盘（skip_serializing_if）
         let c5 = Config::default();
         let s = serde_json::to_string(&c5).unwrap();
-        assert!(!s.contains("default_provider"), "空 default_provider 不应序列化");
+        assert!(
+            !s.contains("default_provider"),
+            "空 default_provider 不应序列化"
+        );
     }
 
     #[test]
@@ -1474,7 +1505,6 @@ mod tests {
         assert!(back.cross_delivery_enabled);
     }
 
-
     #[test]
     fn draft_roundtrip_and_newer_check() {
         // 草稿读写 + mtime 判定（写完即删，避免污染真实草稿）
@@ -1486,7 +1516,10 @@ mod tests {
         });
         c.save_draft().unwrap();
         assert!(Config::draft_path().exists(), "草稿应已落盘");
-        assert!(Config::draft_is_newer(), "刚写的草稿应比正式配置新（或正式配置不存在）");
+        assert!(
+            Config::draft_is_newer(),
+            "刚写的草稿应比正式配置新（或正式配置不存在）"
+        );
         let loaded = Config::load_draft().expect("草稿应能读回");
         assert_eq!(loaded.bots.len(), 1);
         assert_eq!(loaded.bots[0].name, "draft-test");

@@ -217,7 +217,9 @@ async fn run_bot(
             let mut last_min: Option<String> = None;
             // 在跑任务集合：cron 周期短于任务耗时时，跳过重叠的新一轮（防同任务并发堆积、
             // 多个 claude 抢同一资源/互相踩工作区）。
-            let running = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
+            let running = Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::<String>::new(),
+            ));
             loop {
                 if interruptible_sleep(std::time::Duration::from_secs(20), &mut stop).await {
                     break;
@@ -376,6 +378,68 @@ async fn weixin_loop(
     crate::botstatus::clear(&key);
 }
 
+/// 一轮评论批处理结果：游标推进（+ 2.2 的自动处理触发点）。
+pub(crate) struct CommentBatch {
+    /// 成功处理（含无提及/无映射项）的评论 id → 进 seen。
+    pub seen_extra: Vec<u64>,
+    /// 私信发送失败的评论 updated_at → 游标回退重试。
+    pub failed: Vec<String>,
+    /// 本轮最新评论 updated_at（空批 → 调用方保持原游标）。
+    pub new_since: String,
+}
+
+/// 处理一批新评论（逻辑集中、可注入 msgr，可测）：@提及 私信通知。
+/// - 作者无过滤：bot 自己的回复常引用 @login，被引用者需要知道；私信不产生 GitHub
+///   活动，无回环；且 @bot 触发判定（2.2）在作者回声处把关；
+/// - 无映射项 → 静默跳过（映射是 opt-in 门，不群发骚扰）；
+/// - 私信失败 → 该评论进 failed（游标回退，下轮重试）。
+pub(crate) async fn process_comment_batch(
+    msgr: &dyn crate::messenger::Messenger,
+    comments: &[crate::github::GhComment],
+    seen: &[u64],
+    mention_map: &[(String, String)],
+    repo: &str,
+) -> CommentBatch {
+    let mut out = CommentBatch {
+        seen_extra: Vec::new(),
+        failed: Vec::new(),
+        new_since: String::new(),
+    };
+    for c in comments {
+        if seen.contains(&c.id) {
+            continue;
+        }
+        let mut ok = true;
+        // @提及 私信：映射内 login 才发；评论 → issue/PR 号取自评论自身 html_url
+        for login in crate::github::extract_mentions(&c.body, "") {
+            if let Some((_, chat)) = mention_map
+                .iter()
+                .find(|(l, _)| l.eq_ignore_ascii_case(&login))
+            {
+                if let Some((number, _)) = crate::github::comment_issue_ref(c) {
+                    if let Err(e) = msgr
+                        .send_text(chat, &crate::github::mention_notify_text(repo, number, c))
+                        .await
+                    {
+                        crate::log!("[github] ⚠️ 提及私信失败 {repo} 目标={chat}: {e:#}");
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if ok {
+            out.seen_extra.push(c.id);
+        } else {
+            out.failed.push(c.updated_at.clone());
+        }
+    }
+    out.new_since = comments
+        .last()
+        .map(|c| c.updated_at.clone())
+        .unwrap_or_default();
+    out
+}
+
 /// 睡眠 dur，但可被 stop 信号打断。返回 true=收到停止信号（调用方应 break）。
 async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
@@ -398,10 +462,16 @@ async fn github_watch_loop(
     let repos = bot.gh_repo_list();
     let notify_chat = bot.gh_notify_chat.clone();
     let echo = bot.gh_username.clone();
+    let mention_map = bot.gh_mention_map_list();
     crate::log!(
-        "[bot:{key}] GitHub watch 循环启动 repos={} 通知={}",
+        "[bot:{key}] GitHub watch 循环启动 repos={} 通知={} 提及映射={}",
         repos.len(),
-        if notify_chat.is_empty() { "（未配置通知群）" } else { "已配置" }
+        if notify_chat.is_empty() {
+            "（未配置通知群）"
+        } else {
+            "已配置"
+        },
+        mention_map.len()
     );
     let mut cursor = crate::github::GhCursor::load(&key);
     let mut consec_errs = 0u32;
@@ -412,58 +482,99 @@ async fn github_watch_loop(
         if notify_chat.is_empty() {
             continue; // 没配通知目标 → 轮询无意义（配置后重启生效）
         }
+        // 静默基线用当前时刻（评审 L2）：since 为空不调 API，游标直接置 now——
+        // 否则 >100 条存量时游标落在列表中间，下一轮把中段存量误当新条目。
+        let now_rfc = crate::chrono_lite::rfc3339_now();
         let mut sweep_failed = false;
         for (owner, name) in crate::github::watch_entries(&repos) {
             let repo = format!("{owner}/{name}");
             let cur = cursor.repo_cursor(&repo);
-            match bridge
-                .github_client
-                .list_issues_since(&owner, &name, &cur.since)
-                .await
-            {
-                Ok(issues) => {
-                    let (fresh, new_since) =
-                        crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
-                    let mut seen_extra = Vec::new();
-                    // 通知失败不推进游标到该 issue 之后：retry_at 记下**所有**失败 issue 的
-                    // created_at 最小值（逐个覆盖取最后失败者会丢 created 更早者，见
-                    // github::retry_since），下一轮以它为 since 重新浮现（已通知的都在 seen 里，
-                    // 不会重复）。
-                    let mut failed: Vec<&crate::github::GhIssue> = Vec::new();
-                    for iss in &fresh {
-                        let text = crate::github::notify_text(&repo, iss);
-                        match bridge.msgr.send_text(&notify_chat, &text).await {
-                            Ok(()) => {
-                                seen_extra.push(iss.id);
-                                crate::log!(
-                                    "[bot:{key}] 新 issue 已通知 #{}({})",
-                                    iss.number,
-                                    repo
-                                );
-                            }
-                            Err(e) => {
-                                failed.push(iss);
-                                crate::log!(
-                                    "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
-                                );
+            // ── issue 侧：新 issue 通知（Phase 1）──
+            if cur.since.is_empty() {
+                cursor.update(&repo, &now_rfc, Vec::new()); // 静默基线
+            } else {
+                match bridge
+                    .github_client
+                    .list_issues_since(&owner, &name, &cur.since)
+                    .await
+                {
+                    Ok(issues) => {
+                        let (fresh, new_since) =
+                            crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
+                        let mut seen_extra = Vec::new();
+                        // 通知失败不推进游标到该 issue 之后：retry_at 记下**所有**失败 issue 的
+                        // created_at 最小值（逐个覆盖取最后失败者会丢 created 更早者，见
+                        // github::retry_since），下一轮以它为 since 重新浮现（已通知的都在 seen 里，
+                        // 不会重复）。
+                        let mut failed: Vec<&crate::github::GhIssue> = Vec::new();
+                        for iss in &fresh {
+                            let text = crate::github::notify_text(&repo, iss);
+                            match bridge.msgr.send_text(&notify_chat, &text).await {
+                                Ok(()) => {
+                                    seen_extra.push(iss.id);
+                                    crate::log!(
+                                        "[bot:{key}] 新 issue 已通知 #{}({})",
+                                        iss.number,
+                                        repo
+                                    );
+                                }
+                                Err(e) => {
+                                    failed.push(iss);
+                                    crate::log!(
+                                        "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
+                                    );
+                                }
                             }
                         }
+                        let effective_since = crate::github::retry_since(&failed)
+                            .unwrap_or_else(|| new_since.clone());
+                        cursor.update(&repo, &effective_since, seen_extra);
                     }
-                    let effective_since =
-                        crate::github::retry_since(&failed).unwrap_or_else(|| new_since.clone());
-                    cursor.update(&repo, &effective_since, seen_extra);
+                    Err(e) => {
+                        sweep_failed = true;
+                        crate::log!("[bot:{key}] ⚠️ 拉取 {repo} issues 失败: {e:#}");
+                    }
                 }
-                Err(e) => {
-                    sweep_failed = true;
-                    crate::log!("[bot:{key}] ⚠️ 拉取 {repo} issues 失败: {e:#}");
+            }
+            // ── 评论侧：@提及 私信（Phase 2 批次 2.1；@bot 触发在 2.2）──
+            if cur.comment_since.is_empty() {
+                cursor.comment_update(&repo, &now_rfc, Vec::new()); // 静默基线（存量评论不私信）
+            } else {
+                match bridge
+                    .github_client
+                    .list_comments_since(&owner, &name, &cur.comment_since)
+                    .await
+                {
+                    Ok(comments) => {
+                        let batch = crate::service::process_comment_batch(
+                            bridge.msgr.as_ref(),
+                            &comments,
+                            &cur.comment_seen,
+                            &mention_map,
+                            &repo,
+                        )
+                        .await;
+                        // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）
+                        let effective = batch
+                            .failed
+                            .iter()
+                            .min()
+                            .cloned()
+                            .unwrap_or_else(|| batch.new_since.clone());
+                        cursor.comment_update(&repo, &effective, batch.seen_extra);
+                    }
+                    Err(e) => {
+                        sweep_failed = true;
+                        crate::log!("[bot:{key}] ⚠️ 拉取 {repo} 评论失败: {e:#}");
+                    }
                 }
             }
         }
         cursor.save(&key); // 每轮原子落盘（60s 一次小写盘，崩溃至多丢一个窗口）
-        // 状态上报：**不报在线**——botstatus 槽位归 IM 事件循环（它每 10s 上报一次在线），
-        // watch 循环无条件写在线会覆盖 IM 的「重连中」迁移（上次写者赢）。这里只在
-        // GitHub 侧连续 3 轮失败时标「重连中」（失败迁移也只会被 IM 循环的在线覆盖，
-        // 而 IM 在线是真实的——GitHub 故障期间 IM 正常时槽位显示在线属可接受偏差）。
+                           // 状态上报：**不报在线**——botstatus 槽位归 IM 事件循环（它每 10s 上报一次在线），
+                           // watch 循环无条件写在线会覆盖 IM 的「重连中」迁移（上次写者赢）。这里只在
+                           // GitHub 侧连续 3 轮失败时标「重连中」（失败迁移也只会被 IM 循环的在线覆盖，
+                           // 而 IM 在线是真实的——GitHub 故障期间 IM 正常时槽位显示在线属可接受偏差）。
         if sweep_failed {
             consec_errs += 1;
             if consec_errs == 3 {
@@ -487,8 +598,8 @@ async fn run_job(
 ) {
     let bot_key = bridge.bot.key();
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
-    // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
-    // 与聊天消息同一后端，避免「聊天走 codex、定时任务却跑 claude」的割裂。
+                                                                  // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
+                                                                  // 与聊天消息同一后端，避免「聊天走 codex、定时任务却跑 claude」的割裂。
     let backend = crate::agent::Backend::parse(&bridge.default_backend);
     crate::log!(
         "[bot:{bot_key}] 触发任务 {} → {}（backend: {}）",

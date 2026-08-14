@@ -85,6 +85,13 @@ pub mod chrono_lite {
         let (y, mo, d, h, mi, s) = epoch_to_ymd(local);
         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
     }
+
+    /// 当前 UTC 时间的 RFC3339（GitHub 游标同款 "YYYY-MM-DDTHH:MM:SSZ" 形态，字典序可比较）。
+    /// 与 now() 不同：UTC 不加本地偏移（GitHub 时间戳是 UTC）。
+    pub fn rfc3339_now() -> String {
+        let (y, mo, d, h, mi, s) = epoch_to_ymd(unix_secs());
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    }
     fn epoch_to_ymd(t: u64) -> (u64, u64, u64, u64, u64, u64) {
         let s = t % 60;
         let mi = (t / 60) % 60;
@@ -622,6 +629,17 @@ fn session_reset_chat_id(args: &[String], env_chat: &str) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::session_reset_chat_id;
+
+    #[test]
+    fn rfc3339_now_utc_format() {
+        // GitHub 游标同款形态：UTC "YYYY-MM-DDTHH:MM:SSZ"，字典序可比较
+        let s = super::chrono_lite::rfc3339_now();
+        assert_eq!(s.len(), 20, "格式应为 YYYY-MM-DDTHH:MM:SSZ: {s}");
+        assert!(s.ends_with('Z'));
+        assert!(s.chars().nth(10) == Some('T'));
+        // 与本地 now() 至少同日（UTC vs UTC+8 可能跨日，这里只验证可解析性）
+        let _ = super::chrono_lite::unix_secs();
+    }
 
     #[test]
     fn session_reset_chat_prefers_arg() {
