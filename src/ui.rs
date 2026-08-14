@@ -542,6 +542,8 @@ pub fn run_gui() -> Result<()> {
 
     let tray = Tray::new()?;
     let settings = SettingsWindow::new()?;
+    // 版本号随编译注入（Cargo.toml 单一事实源），侧栏底部展示
+    settings.set_version(env!("CARGO_PKG_VERSION").into());
     let qr_dialog = QrDialog::new()?;
     let unsaved_dialog = UnsavedDialog::new()?;
     // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。

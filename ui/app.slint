@@ -346,6 +346,8 @@ export component SettingsWindow inherits Window {
     background: Palette.alternate-background;
 
     in-out property <string> window-title: "ABB 设置";
+    // 应用版本号（Rust 侧 env!("CARGO_PKG_VERSION") 注入；空 = 不显示）
+    in-out property <string> version: "";
     // 当前页：0=首页 1=机器人配置 2=环境配置 3=模型供应商
     in-out property <int> current-page: 0;
     // 首页 hero / 状态卡用的结构化状态（running-line 保留给底部状态行）
@@ -530,7 +532,15 @@ export component SettingsWindow inherits Window {
                             clicked => { root.current-page = 3; }
                         }
                         Rectangle { vertical-stretch: 1; }
-                        Text { text: "菜单栏常驻 · 本地 AI 桥"; font-size: 11px; color: Palette.foreground.with-alpha(0.45); }
+                        VerticalBox {
+                            spacing: 3px;
+                            Text { text: "菜单栏常驻 · 本地 AI 桥"; font-size: 11px; color: Palette.foreground.with-alpha(0.45); }
+                            if root.version != "": Text {
+                                text: "v" + root.version;
+                                font-size: 10px;
+                                color: Palette.foreground.with-alpha(0.35);
+                            }
+                        }
                     }
                 }
 
