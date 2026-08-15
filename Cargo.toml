@@ -6,11 +6,15 @@ build = "build.rs"
 
 [dependencies]
 # GUI：Slint 1.17 托盘应用。
-# 渲染器：必须显式开 renderer-skia。Slint 默认 feature 只有 femtovg+software（**不含 skia**，
-# 尽管旧注释误以为含）。FemtoVG(OpenGL) 在 macOS accessory 进程 + 先 hide 后 show 的窗口上
-# 会渲染成全黑（surface 没正常建立）；Skia(CoreGraphics) 稳定。software 渲染器则让托盘
-# image→NSImage 失败、图标不显示。故三选一用 skia。
-slint = { version = "1.17", features = ["unstable-winit-030", "renderer-skia"] }
+# 渲染器：用默认 femtovg（OpenGL）。历史：曾固定 renderer-skia——旧注释记录 femtovg 在
+# macOS accessory 进程 + 先 hide 后 show 的窗口上渲染全黑；2026-08-15 实测（slint 1.17.1 /
+# macOS 15.x）该症状不复现：femtovg 设置窗渲染正常、托盘图标正常。
+# （旧注释「software 让托盘图标不显示」经查为误诊：托盘图标转换走 Image::to_rgba8
+# 像素解码，与渲染器无关。）切换收益：去掉 skia-bindings 构建链——冷构建会联网尝试
+# 拉取预编译二进制（失败会回退源码编译而非构建失败，但 skia C++ 源码编译冷跑达
+# 30 分钟级）+ 二进制更小。software 渲染器仍在默认特性里，可用
+# SLINT_BACKEND=winit-software 兜底排查（BackendSelector 原生支持，全平台一致）。
+slint = { version = "1.17", features = ["unstable-winit-030"] }
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "process", "time", "sync", "io-util", "signal"] }
 # WS：关默认 native-tls，rustls + webpki 根证书 = 全静态
@@ -36,8 +40,10 @@ aes = "0.8"
 sha2 = "0.10"
 
 # macOS：透明标题栏 + 隐藏标题 + 内容铺满（对齐 ../aerodesk，保留红绿灯/原生拖动）。
+# 窗口属性钩子经 BackendSelector::with_winit_window_attributes_hook 注入（ui.rs
+# configure_backend），无需直接依赖 i-slint-backend-winit；winit 直接依赖仅为
+# 导入 WindowAttributesExtMacOS 扩展 trait。
 [target.'cfg(target_os = "macos")'.dependencies]
-i-slint-backend-winit = "=1.17.1"
 winit = "0.30"
 
 [build-dependencies]
