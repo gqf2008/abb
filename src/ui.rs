@@ -522,31 +522,19 @@ fn configure_backend() -> Result<()> {
     // 默认 layout-padding 要归零，否则顶部会透出根背景形成一条「标题栏白条」。
     #[cfg(target_os = "macos")]
     {
-        use i_slint_backend_winit::Backend;
         use winit::platform::macos::WindowAttributesExtMacOS;
-        let mut builder = Backend::builder();
-        // 渲染器：默认 femtovg（Cargo.toml 已去 skia）。SLINT_BACKEND 显式指定时
-        // 尊重之（如 winit-software 兜底排查渲染问题）。小写+trim 对齐非 macOS 侧
-        // BackendSelector 的 to_lowercase 行为（"software"/"winit-software" 等效）；
-        // 未识别取值静默走默认（与 selector 的 fallback 语义一致）。
-        if let Ok(name) = std::env::var("SLINT_BACKEND") {
-            let name = name.trim().to_lowercase();
-            if name == "winit-software" || name == "software" {
-                builder = builder.with_renderer_name("software");
-            } else if name == "winit-femtovg" || name == "femtovg" {
-                builder = builder.with_renderer_name("femtovg");
-            }
-        }
-        let backend = builder
-            .with_window_attributes_hook(|attrs| {
+        // 渲染器：默认 femtovg（Cargo.toml 已去 skia）。SLINT_BACKEND（如
+        // winit-software 兜底排查）由 BackendSelector 原生解析：含 "software"/"sw"
+        // 短形式与 winit-* 前缀，未知取值打印 warning 后回退默认——不要在
+        // 本路径自行复刻该解析（selector 不 trim，复刻必然漂移）。
+        slint::BackendSelector::new()
+            .with_winit_window_attributes_hook(|attrs| {
                 attrs
                     .with_titlebar_transparent(true)
                     .with_title_hidden(true)
                     .with_fullsize_content_view(true)
             })
-            .build()
-            .expect("slint winit backend");
-        slint::platform::set_platform(Box::new(backend)).expect("set slint platform");
+            .select()?;
     }
     #[cfg(not(target_os = "macos"))]
     slint::BackendSelector::new().select()?;
