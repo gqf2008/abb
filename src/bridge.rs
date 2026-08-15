@@ -921,7 +921,7 @@ impl Bridge {
         // marker 按 session_id 判定：/new、CLI reset 使 marker 失效或失配（新会话允许
         // 再注入）。三层闸防重复注入：per-chat 串行锁（前一轮完整结束才轮到本条）+
         // !resume（started=true 的正常消息直接 resume 不注入）+ marker。#54：自愈重建
-        // 会话带 pending 标记（同 sid）→ 无论 resume 与否放行一次注入。
+        // 会话带 pending 标记（同 sid）→ resume 轮也放行一次注入。
         let hist = crate::history::History::open(&self.bot.key(), &key);
         // 代际锁（per-key，见 history_epochs 字段注释）：注入读 + 用户轮写盘在锁内与
         // /new 清盘互斥——新会话首轮不可能读到未清盘的旧历史（审查 I-2 读侧闭环）。
@@ -932,36 +932,24 @@ impl Bridge {
             let lock_ret = lock.clone(); // guard 借用 lock，返回值需独立 Arc
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let epoch = *guard;
-            // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）。
-            // #54：自愈重建会话带 pending 标记（同 sid）→ 无论 resume 与否都放行
-            // 一次注入（重建轮没带上下文，下一条补上）。
-            let injected_rounds = if !resume {
-                let not_yet_migrated = match hist.marker() {
+            // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）：
+            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）；
+            // - resume（既有会话）：仅 pending 命中（#54 自愈重建/换 UUID 后待补注入）
+            //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）。
+            let marker = hist.marker();
+            let should_inject = if !resume {
+                match &marker {
                     Some(m) => m.session_id != session_id,
                     None => true,
-                };
-                if not_yet_migrated {
-                    let (block, n) =
-                        hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
-                    if n > 0 {
-                        prompt.insert_str(0, &block);
-                        Some(n)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
                 }
-            } else if let Some(m) = hist.marker() {
-                if m.pending && m.session_id == session_id {
-                    let (block, n) =
-                        hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
-                    if n > 0 {
-                        prompt.insert_str(0, &block);
-                        Some(n)
-                    } else {
-                        None
-                    }
+            } else {
+                matches!(&marker, Some(m) if m.pending && m.session_id == session_id)
+            };
+            let injected_rounds = if should_inject {
+                let (block, n) = hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
+                if n > 0 {
+                    prompt.insert_str(0, &block);
+                    Some(n)
                 } else {
                     None
                 }
@@ -1067,18 +1055,25 @@ impl Bridge {
                         hist.append_assistant(&ev.mid, backend.name(), &reply);
                         // #54 会话自愈后的历史补注入：
                         // - 注入轮成功 → 写非 pending 标记（复位）
-                        // - 同 sid 重建轮（rebuilt）→ pending 标记，下一条注入
+                        // - 同 sid 重建轮（rebuilt，必为 resume 轮）→ pending 标记，下一条注入
                         // - claude already-in-use 自愈（run 内 reset_session 换 UUID，
-                        //   final_sid != 入口 session_id 且未注入）→ 同样 pending 标记：
+                        //   final_sid != 入口 session_id 且本轮未注入）→ 同样 pending 标记：
                         //   换 UUID 虽使旧 marker「失效」，但让失效生效的 !resume 闸
                         //   永远不会再触发（started 已被 mark 回 true）——必须显式补
                         //   pending，否则新会话与 #54 同症状永久无上下文（审查 Important）。
-                        // 注：pending 写入与 run 返回之间存在毫秒级崩溃窗口（pending.json
+                        //   限定 resume 轮：!resume 轮的注入闸本轮已评估过（marker 失配
+                        //   即已注入），首轮治愈没有旧上下文可丢——再写 pending 只会让
+                        //   下一条把本轮自身重复注入一遍（新会话原生已含该轮）。
+                        // 注一：pending 写入与 run 返回之间存在毫秒级崩溃窗口（pending.json
                         // 已 remove 后、标记未写前）——崩溃则该会话永久无注入；窗口极小，
                         // 与既有 at-least-once 语义同类，接受（写入后崩溃则标记已在盘上）。
+                        // 注二：注入轮失败（Err/Cancelled）同样**不清** pending——下一条
+                        // 重注入。对「提示从未送达模型」的失败轮这是必要的兜底；代价是
+                        // 已送达但失败的轮次会在对端 transcript 里多一份注入块，可接受。
                         if injected_rounds.is_some() {
                             hist.set_marker(&final_sid, backend.name(), false);
-                        } else if rebuilt || (backend == Backend::Claude && final_sid != session_id)
+                        } else if rebuilt
+                            || (backend == Backend::Claude && resume && final_sid != session_id)
                         {
                             hist.set_marker(&final_sid, backend.name(), true);
                         }
@@ -2204,6 +2199,21 @@ mod tests {
         }
     }
 
+    /// 预置「已迁移过、可 resume」的既有会话槽位（started=true + marker 匹配同 sid）
+    /// 并写入一轮旧历史。#54 注入闸测试共用的前置（seed 变了只需改这一处）。
+    fn seed_migrated_session(
+        bridge: &Bridge,
+        bot: &BotConfig,
+        key: &str,
+    ) -> (crate::history::History, String) {
+        let sid = bridge.sessions.ensure_with_started(key).0;
+        assert!(bridge.sessions.mark_started_if(key, &sid));
+        let hist = crate::history::History::open(&bot.key(), key);
+        hist.append_user("old1", "claude", "旧背景");
+        hist.set_marker(&sid, "claude", false);
+        (hist, sid)
+    }
+
     /// T1/T2：切后端首轮注入 [历史上下文]（旧→新、角色前缀、在当前消息之前）+
     /// 回复尾部带提示；第二轮同会话 resume → 不重复注入、无提示。
     #[tokio::test]
@@ -2351,12 +2361,8 @@ mod tests {
         runner.set_rebuilt_rounds(1); // 第一次 run 返回 rebuilt=true（模拟自愈重建）
         let bot = backend_bot("pi");
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        let hist = crate::history::History::open(&bot.key(), "oc_x");
         // 既有会话：started=true + marker 匹配（模拟已迁移过的会话，正常消息不注入）
-        let sid = bridge.sessions.ensure_with_started("oc_x").0;
-        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
-        hist.append_user("old1", "claude", "旧背景");
-        hist.set_marker(&sid, "claude", false);
+        let (hist, sid) = seed_migrated_session(&bridge, &bot, "oc_x");
 
         // 重建轮（后端对端丢会话，agent 以同 sid 重建）→ 无注入、写 pending 标记
         let b = bridge.clone();
@@ -2409,12 +2415,8 @@ mod tests {
         runner.set_heal_sid("new-heal-sid"); // 一次性：run 内槽位 CAS 换新 sid
         let bot = backend_bot("claude");
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        let hist = crate::history::History::open(&bot.key(), "oc_x");
         // 既有会话：started=true + marker 匹配（旧 sid）
-        let sid = bridge.sessions.ensure_with_started("oc_x").0;
-        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
-        hist.append_user("old1", "claude", "旧背景");
-        hist.set_marker(&sid, "claude", false);
+        let (hist, _sid) = seed_migrated_session(&bridge, &bot, "oc_x");
 
         // 自愈轮：resume=true、marker 匹配且非 pending → 不注入；run 内换 UUID（rebuilt=false）
         let b = bridge.clone();
@@ -2439,6 +2441,44 @@ mod tests {
         assert!(runner.prompts()[1].contains("旧背景"));
         assert!(msgr.sent()[1].contains("已携带"));
         assert!(!hist.marker().unwrap().pending, "注入后复位");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #54 审查：claude 自愈换 UUID 发生在 !resume 首轮（空历史，没有旧上下文可丢）
+    /// 时不得写 pending——重试已把本轮完整 prompt 交给新会话，再写 pending 只会让
+    /// 下一条把本轮自身重复注入一遍（外加误导性的「已携带上下文」提示）。
+    #[tokio::test]
+    async fn claude_heal_on_first_round_writes_no_pending() {
+        let runner = Arc::new(MockAgentRunner::immediate("首轮回复"));
+        runner.set_heal_sid("new-heal-sid"); // 一次性：run 内槽位 CAS 换新 sid
+        let bot = backend_bot("claude");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        // 全新会话：无历史、无 marker、started=false（!resume 首轮）
+
+        // 首轮自愈换 UUID：空历史无注入 → 不写 pending
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "你好")).await })
+            .await
+            .unwrap();
+        assert!(
+            hist.marker().map(|m| !m.pending).unwrap_or(true),
+            "首轮自愈无上下文丢失，不得写 pending: {:?}",
+            hist.marker()
+        );
+
+        // 下一条（resume=true）：无 pending → 不注入、无提示（修复前会把 m1 这轮
+        // 重复注入进已原生含它的会话）
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        assert!(
+            !runner.prompts()[1].contains("[历史上下文]"),
+            "无 pending：下一条不注入: {}",
+            runner.prompts()[1]
+        );
+        assert!(!msgr.sent()[1].contains("已携带"));
         cleanup_bridge(&bridge);
     }
 

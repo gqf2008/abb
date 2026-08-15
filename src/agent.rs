@@ -437,8 +437,9 @@ pub async fn run(
 
     let mut sid = session_id.to_string();
     let mut is_resume = resume;
-    // #54：同 sid 会话自愈重建标志（claude already-in-use 换 UUID 路径不置位——
-    // sid 已变，marker 按 session_id 匹配自动失效，无需 pending）。
+    // #54：同 sid 会话自愈重建标志。claude already-in-use 换 UUID 路径不置位（sid 已
+    // 变）——但 marker 失效本身不会带来注入（started 被 mark 回 true 后 !resume 闸不再
+    // 开），bridge 按「Claude && resume && final_sid != 入口 sid」另行补写 pending。
     let mut rebuilt = false;
     for attempt in 0..2 {
         match run_once(
@@ -481,7 +482,18 @@ pub async fn run(
                     rebuilt,
                 });
             }
-            Err(AttemptErr::Cancelled) => return Ok(RunOutcome::Cancelled),
+            Err(AttemptErr::Cancelled) => {
+                // #54：重建轮被打断——半重建的同 sid 会话没有旧上下文，而槽位 started
+                // 仍为 true，下一条会 resume 这个空壳（claude 已落 jsonl 时能成功），
+                // 从此永久无注入。复位槽位（换新 UUID + started=false）让下一条走
+                // !resume 注入闸（marker 失配 → 注入），回到既有自愈路径。
+                if rebuilt {
+                    if let Some(store) = sessions {
+                        store.reset_session(session_key);
+                    }
+                }
+                return Ok(RunOutcome::Cancelled);
+            }
             Err(AttemptErr::Failed(e)) => {
                 // resume 失败（会话在对端已不存在）→ 回退全新会话重建一次，别让用户永久卡死。
                 // codex：thread 没了（no rollout found）；claude：transcript 被删/机器迁移
@@ -519,6 +531,13 @@ pub async fn run(
                     sid = new_sid;
                     is_resume = false;
                     continue;
+                }
+                // #54：重建轮失败——与 Cancelled 同理复位槽位，让下一条走 !resume
+                // 注入闸（否则 claude 半重建的同 sid 会话可被 resume，旧上下文永久丢）。
+                if rebuilt {
+                    if let Some(store) = sessions {
+                        store.reset_session(session_key);
+                    }
                 }
                 return Err(e);
             }
