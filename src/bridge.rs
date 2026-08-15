@@ -134,7 +134,15 @@ impl Bridge {
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             history_epochs: Mutex::new(HashMap::new()),
-            mention_snapshot: Mutex::new(HashMap::new()),
+            mention_snapshot: Mutex::new(
+                // I2：与 access 快照（self.bot）同源种子化——config 读失败/该 bot 从 config
+                // 消失时按「最后已知状态」fail-closed，而不是静默回落空快照（开关丢失）
+                cfg.bots
+                    .iter()
+                    .find(|b| b.key() == key)
+                    .map(|b| b.mention_modes.clone())
+                    .unwrap_or_default(),
+            ),
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
@@ -628,12 +636,12 @@ impl Bridge {
         // 话题（thread）内用户回复机器人的消息不需要再次 @——这是「用户回复」的主流交互；
         // 顶层群消息仍要求 @（避免整个群的消息都进 agent）。
         // #51：该群设了免 @（mention_modes off）则顶层消息也进 agent——热读即时生效。
+        // 顺序：已 @ 则短路不付这次 config 读（门槛读只对「未 @ 的顶层群消息」发生）。
         let chat_id = message["chat_id"].as_str().unwrap_or("");
-        let mention_off = self.mention_mode(chat_id).as_deref() == Some("off");
         if chat_type == "group"
             && thread_id.is_empty()
-            && !mention_off
             && !self.bot_is_mentioned(&mentions)
+            && self.mention_mode(chat_id).as_deref() != Some("off")
         {
             crate::log!(
                 "[bridge] 群聊未 @ 机器人，忽略（bot={} chat={} sender={}）",
@@ -862,7 +870,7 @@ impl Bridge {
                 match cmd {
                     MentionCmd::Show => {
                         if self.mention_mode(&key).as_deref() == Some("off") {
-                            "本群已开启免 @：所有消息都会进入 agent。\
+                            "本群已开启免 @：授权用户的消息无需 @ 直接进入 agent。\
 多用户群共享同一会话、可能有上下文串扰；/mention on 可恢复。"
                                 .to_string()
                         } else {
@@ -876,13 +884,14 @@ impl Bridge {
                     }
                     MentionCmd::Off => {
                         self.set_mention_mode(&key, Some("off"));
-                        "已开启免 @：本群所有消息都会进入 agent。\
+                        "已开启免 @：本群授权用户的消息无需 @ 直接进入 agent。\
 注意多用户群共享同一会话、可能有上下文串扰；/mention on 可恢复。"
                             .to_string()
                     }
                 }
             } else {
-                "⚠️ 免 @ 开关仅顶层群聊可用（私聊与话题内本就无需 @）。".to_string()
+                "⚠️ 免 @ 开关仅顶层群聊可用（私聊与话题内本就无需 @，本开关只影响顶层群消息）。"
+                    .to_string()
             };
             if let Err(e) = self.send_reply(&ev, &reply).await {
                 crate::log!("[bridge] /mention 确认发送失败: {e:#}");
@@ -1468,8 +1477,11 @@ impl Bridge {
         }
         // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理。
         // #51：该群设了免 @（mention_modes off）则无需 @ 也进 agent（与飞书同开关）。
-        let mention_off = self.mention_mode(&msg.chat_id()).as_deref() == Some("off");
-        if msg.is_group() && !mention_off && !msg.mentioned {
+        // 顺序：已 @ 则短路不付 config 读。
+        if msg.is_group()
+            && !msg.mentioned
+            && self.mention_mode(&msg.chat_id()).as_deref() != Some("off")
+        {
             crate::log!(
                 "[dingtalk] 忽略群聊未 @ 机器人的消息 chat={}",
                 trunc(msg.chat_id(), 10)
@@ -3084,11 +3096,11 @@ mod tests {
             Some(MentionCmd::Off)
         ));
         assert!(
-            matches!(parse_mention_cmd("/mention on!"), None),
+            parse_mention_cmd("/mention on!").is_none(),
             "非精确匹配透传"
         );
-        assert!(matches!(parse_mention_cmd("mention off"), None));
-        assert!(matches!(parse_mention_cmd("/mention x"), None));
+        assert!(parse_mention_cmd("mention off").is_none());
+        assert!(parse_mention_cmd("/mention x").is_none());
     }
 
     /// 群聊 @ 门槛端到端（验收核心）：/mention off 后未 @ 的顶层消息进 agent；
@@ -3263,6 +3275,83 @@ mod tests {
             )
             .await;
         assert_eq!(runner.prompts().len(), 1, "开关 per-群隔离");
+
+        // oc_other 独立开关往返（M7）：off 生效 → 显式 on 恢复要求 @
+        bridge.set_mention_mode("oc_other", Some("off"));
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m8",
+                    "oc_other",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "别的群开了免@",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(runner.prompts().len(), 2, "oc_other 独立 off 生效");
+        bridge.set_mention_mode("oc_other", Some("on"));
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m9",
+                    "oc_other",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "显式 on 又要求@",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(runner.prompts().len(), 2, "显式 on 条目仍要求 @");
+        cleanup_bridge(&bridge);
+    }
+
+    /// 最高优先级安全回归（审查 I1）：免 @ 只放宽 @ 过滤一层——off 状态下
+    /// 未授权用户仍在访问控制层被拒，绝不能进 agent。
+    #[tokio::test]
+    async fn mention_off_does_not_bypass_access_control() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        bridge.set_mention_mode("oc_g", Some("off"));
+        // 未授权 sender（非 owner/授权者、非公开模式）+ 免 @ 群 → 仍被拒
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m1",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_stranger",
+                    &[],
+                    "陌生人的消息",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert!(
+            runner.prompts().is_empty(),
+            "off 不绕过访问控制（未授权者被拒）"
+        );
         cleanup_bridge(&bridge);
     }
 

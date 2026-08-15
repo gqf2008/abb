@@ -868,17 +868,6 @@ impl Config {
         }
     }
 
-    /// #51：读某 bot 某群聊的 @ 门槛（热读，每次群消息门槛判定时调用）。
-    /// 返回 None = 无条目 = 需要 @（默认）。
-    pub fn mention_mode(bot_key: &str, chat_id: &str) -> Option<String> {
-        Config::load().ok().and_then(|c| {
-            c.bots
-                .into_iter()
-                .find(|b| b.key() == bot_key)
-                .and_then(|b| b.mention_modes.get(chat_id).cloned())
-        })
-    }
-
     /// 解析某 bot 的生效供应商：bot.provider（非空优先）→ 全局 default_provider → providers 里查名。
     /// 返回 None = 未配置供应商（走 CC Switch / codex 自认证的旧行为）；名不配位也 None + 警告。
     pub fn resolve_provider(&self, bot: &BotConfig) -> Option<&ProviderConfig> {
