@@ -526,11 +526,14 @@ fn configure_backend() -> Result<()> {
         use winit::platform::macos::WindowAttributesExtMacOS;
         let mut builder = Backend::builder();
         // 渲染器：默认 femtovg（Cargo.toml 已去 skia）。SLINT_BACKEND 显式指定时
-        // 尊重之（如 winit-software 兜底排查渲染问题）。
+        // 尊重之（如 winit-software 兜底排查渲染问题）。小写+trim 对齐非 macOS 侧
+        // BackendSelector 的 to_lowercase 行为（"software"/"winit-software" 等效）；
+        // 未识别取值静默走默认（与 selector 的 fallback 语义一致）。
         if let Ok(name) = std::env::var("SLINT_BACKEND") {
-            if name == "winit-software" {
+            let name = name.trim().to_lowercase();
+            if name == "winit-software" || name == "software" {
                 builder = builder.with_renderer_name("software");
-            } else if name == "winit-femtovg" {
+            } else if name == "winit-femtovg" || name == "femtovg" {
                 builder = builder.with_renderer_name("femtovg");
             }
         }
