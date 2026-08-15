@@ -796,19 +796,36 @@ fn claude_needs_fresh_session(e: &str) -> bool {
 
 /// #56：pi 会话文件存在性探查。pi 的 `--session-id` 语义是「存在即续聊、不存在即
 /// 新建」——文件被删/损坏时同 sid **静默**新建空会话（无错误可检测，rebuilt 恒 false）。
-/// 桥在注入闸里调用本函数：resume 轮（桥认为会话已建立）文件却不存在 = 会话已丢、
+/// 桥在注入闸里调用本函数：resume 轮（桥认为会话已建立）文件却不可续聊 = 会话已丢、
 /// 本轮 run 将静默重建 → 直接注入历史（比 pending 补注入早一轮：run 前即可探明）。
 /// 文件名实测形态 `<时间戳>_<sid>.jsonl`（--session-dir 固定在 workspace/.pi-sessions），
-/// 用包含匹配容忍前缀形态变化；目录不存在按不存在处理。
+/// 用包含匹配容忍前缀形态变化；目录列举失败按不存在处理。
+///
+/// 文件名命中 ≠ 可续聊：**损坏文件对 pi 而言 = "No project session found" 并静默新建**
+/// （实测 pi 0.84.1——文件仍在盘上、会话从头开始）——故再校验首行 session 记录的
+/// `"id":"<sid>"` 与 pi 自己的识别键对齐。读不到/格式不符按丢失处理（方向安全：
+/// 误判为丢失 → 过注入，可见噪音；反向把真丢失误判为存活才是静默无上下文）。
 pub fn pi_session_exists(bot_key: &str, session_id: &str) -> bool {
     let dir = crate::workspace_dir(bot_key).join(".pi-sessions");
-    std::fs::read_dir(&dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().contains(session_id))
-        })
-        .unwrap_or(false)
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return false, // 任何列举错误按不存在（同上：方向安全）
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.contains(session_id) {
+            continue;
+        }
+        if let Ok(f) = std::fs::File::open(e.path()) {
+            let mut first = String::new();
+            if std::io::BufRead::read_line(&mut std::io::BufReader::new(f), &mut first).is_ok()
+                && first.contains(&format!("\"id\":\"{session_id}\""))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// #7 启动健康检查窗口（秒）：claude 启动后该时间内无任何 stdout 产出即判定挂死并终止。
@@ -1402,12 +1419,25 @@ mod tests {
         let dir = crate::workspace_dir(&key).join(".pi-sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let sid = "674a1948-58d6-44f9-8107-86ee823c7b15";
+        // 损坏文件：文件名命中但内容不可识别 → 按丢失（实测 pi 0.84.1 静默新建）
         std::fs::write(
             dir.join(format!("2026-08-14T09-33-43-813Z_{sid}.jsonl")),
-            "{}",
+            "{\"garbage\": true",
         )
         .unwrap();
-        assert!(pi_session_exists(&key, sid), "时间戳前缀形态命中");
+        assert!(
+            !pi_session_exists(&key, sid),
+            "损坏文件按丢失（pi 会静默新建）"
+        );
+        // 好文件：首行 session 记录带 id（实测 pi 会话文件首行形态）
+        std::fs::write(
+            dir.join(format!("2026-08-14T10-33-43-813Z_{sid}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T10:33:43.813Z\"}}\n{{\"type\":\"message\"}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(pi_session_exists(&key, sid), "时间戳前缀 + 首行 id 命中");
         assert!(
             !pi_session_exists(&key, "00000000-0000-0000-0000-000000000000"),
             "sid 不存在"

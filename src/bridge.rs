@@ -936,12 +936,14 @@ impl Bridge {
             // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）；
             // - resume（既有会话）：pending 命中（#54 自愈重建/换 UUID 后待补注入）
             //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）；
-            //   或 pi 会话文件丢失（#56：pi 对不存在文件同 sid 静默新建空会话，无错误
-            //   可检）→ 本轮直接注入（run 前即可探明，比 pending 早一轮）。**不设
-            //   marker 防重复护栏**：pi run 成功必落会话文件（核心功能），文件持续
-            //   缺失 = 每轮都是新会话，重注入是正确行为；用「marker 匹配即已注入过」
-            //   拦截会把「迁移后文件才丢失」的真丢失误判为已注入（静默永久无上下文，
-            //   恰是本功能要杀的症状）——布局误报的代价是可见噪音，可接受。
+            //   或 pi 会话文件丢失/损坏（#56：pi 对不可续聊的文件同 sid 静默新建空会话
+            //   ——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入（run 前即可
+            //   探明，比 pending 早一轮）。**不设 marker 防重复护栏**：pi run 成功必落
+            //   会话文件（核心功能），文件持续不可续聊 = 每轮都是新会话，重注入是
+            //   正确行为；用「marker 匹配即已注入过」拦截会把「迁移后文件才丢失」的
+            //   真丢失误判为已注入（静默永久无上下文，恰是本功能要杀的症状）——布局
+            //   误报的代价是可见噪音（提示从首轮起可见；误报持续时注入块按轮累积进
+            //   pi transcript，每轮 ≤6000 字符），可接受。
             let marker = hist.marker();
             let should_inject = if !resume {
                 match &marker {
@@ -2053,13 +2055,16 @@ mod tests {
                     };
                     // #56：模拟 pi 的持久化——run 成功必落会话文件（真实 pi --session-dir
                     // 的核心行为）。桥的探针据此区分「会话存活」与「文件丢失」；缺这步
-                    // 所有 pi 测试的后续轮都会被误判为会话丢失而重注入。
+                    // 所有 pi 测试的后续轮都会被误判为会话丢失而重注入。首行须为
+                    // session 记录（探针按首行 id 校验，损坏/格式不符按丢失）。
                     if backend == Backend::Pi {
                         let dir = crate::workspace_dir(bot_key).join(".pi-sessions");
                         let _ = std::fs::create_dir_all(&dir);
                         let _ = std::fs::write(
                             dir.join(format!("2026-08-14T00-00-00-000Z_{final_sid}.jsonl")),
-                            "{}",
+                            format!(
+                                "{{\"type\":\"session\",\"version\":3,\"id\":\"{final_sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
+                            ),
                         );
                     }
                     Ok(agent::RunOutcome::Reply {
@@ -2329,10 +2334,13 @@ mod tests {
         std::fs::create_dir_all(&pi_dir).unwrap();
         std::fs::write(
             pi_dir.join(format!("2026-08-14T00-00-00-000Z_{sid}.jsonl")),
-            "{}",
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
+            ),
         )
         .unwrap();
-        // 历史里最后是 claude 的轮次（marker 也对不上）——但 !resume 直接短路
+        // 不注入的真正原因：pending 失配 + 探针命中文件（#56）——marker 是 None，
+        // 不是「对不上」；旧注释「!resume 直接短路」不成立（该轮 resume=true）。
         let hist = crate::history::History::open(&bot.key(), "oc_x");
         hist.append_user("old1", "claude", "claude 时代的内容");
 
