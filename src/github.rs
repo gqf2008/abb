@@ -978,6 +978,145 @@ impl GithubClient {
         }
         serde_json::from_str(&txt).context("github 响应非 JSON")
     }
+
+    /// #60-UX 设置窗「仓库动态」用：单请求拉某仓库最近更新的 issues（含 PR，由
+    /// gh_activity_rows 过滤）。state=all&sort=updated&direction=desc&per_page=100——
+    /// 服务端按最近更新时间倒序返回一页。与 list_issues_since 的增量升序游标语义
+    /// 不同：这里要「最新 N 条」，不翻页（get_paged 升序翻满 10 页才拿到最新，
+    /// 活跃仓库每刷一次 10 个串行请求）。
+    pub async fn list_recent_issues(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> anyhow::Result<Vec<GhIssue>> {
+        let rb = self.authed(
+            reqwest::Method::GET,
+            &format!(
+                "/repos/{owner}/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100"
+            ),
+        );
+        let v = self.send(rb).await?;
+        v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| serde_json::from_value(item).context("issue 项解析失败"))
+            .collect()
+    }
+}
+
+// ─── #60-UX GitHub 协同页纯函数（GUI 展示层，可测）──────────────────
+
+/// 白名单 → (具体 (owner,repo) 列表, 通配/格式错误项列表)。
+/// 具体项去重（忽略大小写）；owner/* 通配返回给调用方提示「暂不支持动态列表」
+/// （与 watch_entries 同口径）。
+pub fn gh_activity_targets(repos: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut targets: Vec<(String, String)> = Vec::new();
+    let mut wildcards: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in repos {
+        let r = raw.trim();
+        if r.is_empty() {
+            continue;
+        }
+        if r.ends_with("/*") {
+            wildcards.push(r.to_string());
+            continue;
+        }
+        let Some((o, n)) = r.split_once('/') else {
+            wildcards.push(r.to_string()); // 格式错误按通配提示处理（不影响其它项）
+            continue;
+        };
+        let key = format!("{}|{}", o.to_lowercase(), n.to_lowercase());
+        if seen.insert(key) {
+            targets.push((o.to_string(), n.to_string()));
+        }
+    }
+    (targets, wildcards)
+}
+
+/// 仓库动态展示行（GUI 侧结构；updated_at 保留 RFC3339，显示时经 gh_fmt_time）。
+pub struct GhActRow {
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub updated_at: String,
+    pub html_url: String,
+}
+
+/// 多仓库 issue 流 → 展示行：过滤 PR、每仓库取前 per_repo_limit（**输入序**——
+/// 调用方 list_recent_issues 返回 updated 倒序，即最新在前）、按 updated_at 字典序
+/// 倒序合并、全局截取 total_limit（单仓库霸屏时其它仓库仍可见）。
+pub fn gh_activity_rows(
+    per_repo: Vec<(String, Vec<GhIssue>)>,
+    per_repo_limit: usize,
+    total_limit: usize,
+) -> Vec<GhActRow> {
+    let mut rows: Vec<GhActRow> = Vec::new();
+    for (repo, issues) in per_repo {
+        for iss in issues
+            .into_iter()
+            .filter(|i| i.pull_request.is_none()) // PR 不是 issue 动态（与 new_issues 同口径）
+            .take(per_repo_limit)
+        {
+            rows.push(GhActRow {
+                repo: repo.clone(),
+                number: iss.number,
+                title: iss.title,
+                state: iss.state,
+                updated_at: iss.updated_at,
+                html_url: iss.html_url,
+            });
+        }
+    }
+    // updated_at 是 RFC3339 字符串（同秒内字典序=时间序），倒序 = 最新在前
+    rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    rows.truncate(total_limit);
+    rows
+}
+
+/// RFC3339 → "MM-DD HH:mm"（字符串切片零依赖）。Z 尾缀追加 " UTC"（不假装本地
+/// 时区）；带偏移或乱串原样返回（显示原始时间戳优于伪造）。
+pub fn gh_fmt_time(rfc3339: &str) -> String {
+    let s = rfc3339.trim();
+    // 期望形态：YYYY-MM-DDTHH:MM:SS(Z|+HH:MM)
+    let (main, suffix) = if let Some(stripped) = s.strip_suffix('Z') {
+        (stripped, " UTC")
+    } else if s.len() >= 19 && matches!(s.as_bytes().get(19), Some(b'+') | Some(b'-')) {
+        (&s[..19], "") // 带偏移：按原时钟显示（不追加 UTC）
+    } else if s.len() >= 16 {
+        (&s[..16], "")
+    } else {
+        return rfc3339.to_string();
+    };
+    let b = main.as_bytes();
+    if b.len() < 16
+        || b.get(4) != Some(&b'-')
+        || b.get(7) != Some(&b'-')
+        || b.get(10) != Some(&b'T')
+    {
+        return rfc3339.to_string();
+    }
+    format!(
+        "{}-{} {}:{}{}",
+        &main[5..7],
+        &main[8..10],
+        &main[11..13],
+        &main[14..16],
+        suffix
+    )
+}
+
+/// 错误串 → 用户友好文案：401 = Token 无效/过期；403 = 配额或权限；其它原样。
+pub fn gh_err_hint(e: &str) -> String {
+    if e.contains("401") {
+        "认证失败（401）：Token 无效或已过期".to_string()
+    } else if e.contains("403") {
+        "API 被拒（403）：配额用尽或无权访问该仓库".to_string()
+    } else {
+        e.to_string()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1805,5 +1944,108 @@ mod tests {
         assert!(ctx2.is_pr);
         assert!(ctx2.render.contains("来自 r PR #42"), "PR 形态头部");
         assert!(ctx2.render.contains("[不可信数据结束"));
+    }
+
+    // ─── #60-UX GitHub 协同页纯函数 ───
+
+    fn act_issue(number: u64, updated_at: &str, is_pr: bool) -> GhIssue {
+        GhIssue {
+            id: number,
+            number,
+            title: format!("标题 {number}"),
+            state: "open".into(),
+            html_url: format!("https://github.com/o/r/issues/{number}"),
+            body: String::new(),
+            created_at: "2026-08-16T00:00:00Z".into(),
+            updated_at: updated_at.into(),
+            user: GhUser {
+                login: "alice".into(),
+            },
+            pull_request: is_pr.then(|| serde_json::json!({"url": "x"})),
+        }
+    }
+
+    #[test]
+    fn gh_activity_targets_splits_wildcards_and_dedups() {
+        let repos = vec![
+            "o/r".to_string(),
+            " O/R ".to_string(),
+            "o/*".to_string(),
+            "bad-format".to_string(),
+            "".to_string(),
+            "p/q".to_string(),
+        ];
+        let (targets, wildcards) = gh_activity_targets(&repos);
+        assert_eq!(
+            targets,
+            vec![
+                ("o".to_string(), "r".to_string()),
+                ("p".to_string(), "q".to_string())
+            ],
+            "去重忽略大小写"
+        );
+        assert_eq!(wildcards, vec!["o/*".to_string(), "bad-format".to_string()]);
+        let (t2, w2) = gh_activity_targets(&[]);
+        assert!(t2.is_empty() && w2.is_empty(), "空输入双空");
+    }
+
+    #[test]
+    fn gh_activity_rows_filters_pr_sorts_truncates() {
+        let per_repo = vec![
+            (
+                "o/r".to_string(),
+                vec![
+                    act_issue(1, "2026-08-16T01:00:00Z", false),
+                    act_issue(2, "2026-08-16T03:00:00Z", true), // PR → 过滤
+                    act_issue(3, "2026-08-16T02:00:00Z", false),
+                ],
+            ),
+            (
+                "p/q".to_string(),
+                vec![act_issue(9, "2026-08-16T04:00:00Z", false)],
+            ),
+        ];
+        let rows = gh_activity_rows(per_repo, 10, 15);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].number, 9, "updated_at 倒序全局合并");
+        assert_eq!(rows[1].number, 3);
+        assert_eq!(rows[2].number, 1);
+        assert!(rows.iter().all(|r| r.number != 2), "PR 被过滤");
+        // 每仓限与全局限（take 在排序前：调用方（list_recent_issues 倒序返回）保证
+        // 输入最新在前；本测试升序输入 → 截到的最新是 4）
+        let many = vec![(
+            "o/r".to_string(),
+            (0..20)
+                .map(|i| act_issue(i, &format!("2026-08-16T00:{i:02}:00Z"), false))
+                .collect(),
+        )];
+        let rows2 = gh_activity_rows(many, 5, 3);
+        assert_eq!(rows2.len(), 3, "全局限截");
+        assert_eq!(rows2[0].number, 4, "每仓限内最新在前");
+    }
+
+    #[test]
+    fn gh_fmt_time_shapes() {
+        assert_eq!(gh_fmt_time("2026-08-16T09:30:00Z"), "08-16 09:30 UTC");
+        assert_eq!(
+            gh_fmt_time("2026-08-16T09:30:00+08:00"),
+            "08-16 09:30",
+            "带偏移不追加 UTC"
+        );
+        assert_eq!(gh_fmt_time("乱串"), "乱串", "乱串原样");
+        assert_eq!(gh_fmt_time("2026-08-16"), "2026-08-16", "过短原样");
+    }
+
+    #[test]
+    fn gh_err_hint_maps_status_codes() {
+        assert_eq!(
+            gh_err_hint("github 401 响应: bad credentials"),
+            "认证失败（401）：Token 无效或已过期"
+        );
+        assert_eq!(
+            gh_err_hint("github 403 响应: rate limit"),
+            "API 被拒（403）：配额用尽或无权访问该仓库"
+        );
+        assert_eq!(gh_err_hint("网络超时"), "网络超时");
     }
 }

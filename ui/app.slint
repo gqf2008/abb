@@ -117,6 +117,16 @@ export struct ProviderRow {
     is-default: bool,    // 是否为全局默认供应商
 }
 
+// #60-UX GitHub 协同页：单个仓库动态行（与 Rust 侧 github::GhActRow 对应）
+export struct GhActivityRow {
+    repo: string,        // owner/repo
+    number: int,         // issue 号
+    title: string,
+    state: string,       // open | closed
+    updated-at: string,  // 已格式化 "MM-DD HH:mm"（gh_fmt_time 产物）
+    html-url: string,    // 「打开」按钮用
+}
+
 // 微信扫码登录二维码弹窗：直接在 GUI 里显示二维码，避免依赖系统看图。
 export component QrDialog inherits Window {
     title: "微信扫码登录";
@@ -354,7 +364,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> window-title: "ABB 设置";
     // 应用版本号（Rust 侧 env!("CARGO_PKG_VERSION") 注入；空 = 不显示）
     in-out property <string> version: "";
-    // 当前页：0=首页 1=机器人配置 2=环境配置 3=模型供应商
+    // 当前页：0=首页 1=机器人配置 2=环境配置 3=模型供应商 4=GitHub 协同
     in-out property <int> current-page: 0;
     // 首页 hero / 状态卡用的结构化状态（running-line 保留给底部状态行）
     in-out property <bool> service-running: false;
@@ -421,6 +431,12 @@ export component SettingsWindow inherits Window {
         { name: "仅授权用户", checked: true },
         { name: "任何人都可以对话", checked: false },
     ];
+    // #60-UX GitHub 协同页（page 4）
+    in-out property <[GhActivityRow]> gh-activity: [];   // 仓库动态行
+    in-out property <bool> gh-busy: false;               // 拉取中（刷新钮 enabled 反绑）
+    in-out property <string> gh-status: "";              // 动态卡状态行（空=不显示）
+    in-out property <bool> gh-status-error: false;       // 状态行红色（401/403 等）
+    in-out property <string> gh-capability-line: "";     // 指令能力卡动态状态行（Rust 按选中 bot 算）
 
     callback save-clicked();
     callback cancel-clicked();
@@ -448,6 +464,8 @@ export component SettingsWindow inherits Window {
     callback set-restrict-granted(int, bool); // 授权者 agent 隔离开关（true=受限模式，保存后即时生效）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
+    callback fetch-gh-activity();     // #60-UX 刷新按钮：拉取仓库动态（Rust 侧进页/切 bot 也会触发）
+    callback open-gh-issue(string);   // #60-UX 动态行「打开」：html_url → platform::open_url
     callback recheck-deps();            // 重新检测依赖是否已装
     callback install-dep(string);       // 安装某个依赖（claude/codex/pi/node/python3/lark-cli/dingtalk-cli）
     callback open-perm-settings(string); // 打开某项系统权限对应的设置面板（full-disk/accessibility/screen/automation）
@@ -537,6 +555,12 @@ export component SettingsWindow inherits Window {
                             icon: @image-url("icons/chip.svg");
                             selected: root.current-page == 3;
                             clicked => { root.current-page = 3; }
+                        }
+                        NavItem {
+                            label: "GitHub";
+                            icon: @image-url("icons/github.svg");
+                            selected: root.current-page == 4;
+                            clicked => { root.current-page = 4; }
                         }
                         Rectangle { vertical-stretch: 1; }
                         VerticalBox {
@@ -1146,51 +1170,18 @@ export component SettingsWindow inherits Window {
                                                         vertical-alignment: center;
                                                     }
                                                 }
-                                                // ── GitHub 能力（附挂在任意 bot 上，非独立类型）──
+                                                // ── GitHub 协同：统一在左侧「GitHub」页配置（#60-UX 单一编辑面，
+                                                // 避免两处编辑分歧；存储形态不变，仍附挂在该 bot 上）──
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "GitHub Token"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].gh-token;
-                                                        input-type: password;
-                                                        placeholder-text: "ghp_xxx（GitHub PAT，空=不启用）";
-                                                        horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "gh_token", self.text); }
+                                                    Rectangle { width: 80px; }
+                                                    Text {
+                                                        text: "GitHub 协同（Token/仓库白名单/通知群/用户名/提及映射）已移至左侧「GitHub」页统一配置。";
+                                                        font-size: 11px; color: #888; wrap: word-wrap;
+                                                        horizontal-stretch: 1; vertical-alignment: center;
                                                     }
-                                                }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "仓库白名单"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].gh-repos;
-                                                        placeholder-text: "owner/repo 或 owner/*，逗号分隔（空=不限制）";
-                                                        horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "gh_repos", self.text); }
-                                                    }
-                                                }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "通知群"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].gh-notify-chat;
-                                                        placeholder-text: "新 issue 通知的群/私聊 chat_id";
-                                                        horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "gh_notify_chat", self.text); }
-                                                    }
-                                                }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "GitHub 用户名"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].gh-username;
-                                                        placeholder-text: "自己的 GitHub login（通知过滤自问自答，须与 token 账号一致）";
-                                                        horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "gh_username", self.text); }
-                                                    }
-                                                }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "提及映射"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
-                                                        text: root.bots[root.selected].gh-mention-map;
-                                                        placeholder-text: "login:chat_id，逗号分隔（issue 评论 @提及 私信通知目标）";
-                                                        horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "gh_mention_map", self.text); }
+                                                    Button {
+                                                        text: "前往 ›";
+                                                        clicked => { root.current-page = 4; }
                                                     }
                                                 }
                                             }
@@ -1642,6 +1633,204 @@ export component SettingsWindow inherits Window {
                                                 color: #888;
                                                 wrap: word-wrap;
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── #60-UX GitHub 协同页（current-page 4）：连接管理 + 指令能力 + 仓库动态 ──
+            if root.current-page == 4: VerticalBox {
+                padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                spacing: 14px;
+                VerticalBox {
+                    spacing: 4px;
+                    Text { text: "GitHub 协同"; font-size: 18px; font-weight: 700; color: Palette.foreground; }
+                    Text { text: "连接管理 · 指令能力 · 仓库动态（每 bot 独立；保存并重启服务后生效）"; font-size: 11px; color: #888; }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Palette.background;
+                    border-radius: 12px;
+                    HorizontalBox {
+                        padding: 12px;
+                        spacing: 14px;
+                        // ── 左：连接列表（复用 bots_model + 共享 selected；未配显示「未连接」）──
+                        VerticalBox {
+                            width: 200px;
+                            spacing: 6px;
+                            if root.bots.length == 0: VerticalBox {
+                                spacing: 8px;
+                                Text {
+                                    text: "还没有机器人。\nGitHub 协同是附挂在机器人上的能力，请先添加一个。";
+                                    color: #888; font-size: 11px; wrap: word-wrap;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                Button {
+                                    text: "前往机器人配置";
+                                    clicked => { root.current-page = 1; }
+                                }
+                            }
+                            for bot[idx] in root.bots: Rectangle {
+                                height: 46px;
+                                border-radius: 8px;
+                                background: idx == root.selected ? Palette.selection-background : #00000000;
+                                TouchArea {
+                                    clicked => { root.selected = idx; root.selection-changed(idx); }
+                                    VerticalBox {
+                                        padding-left: 10px; padding-right: 10px;
+                                        spacing: 2px;
+                                        Text {
+                                            text: (bot.enabled ? "" : "⚪ ") + bot.name;
+                                            color: Palette.foreground; font-size: 13px;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: bot.gh-token == "" ? "未连接"
+                                                : "已连接" + (bot.gh-username != "" ? " · " + bot.gh-username : "");
+                                            color: #888; font-size: 11px;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // ── 右：三卡竖排 ──
+                        VerticalBox {
+                            horizontal-stretch: 1;
+                            spacing: 12px;
+                            // 连接管理卡（选中 bot 的 5 个字段；bot 页已移除，这里是唯一编辑面）
+                            VerticalBox {
+                                spacing: 6px;
+                                Text { text: "连接管理"; font-size: 13px; font-weight: 600; color: Palette.foreground; }
+                                GridBox {
+                                    spacing: 6px;
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "载体 bot"; width: 80px; font-size: 11px; color: #888; vertical-alignment: center; }
+                                        Text {
+                                            text: root.bots[root.selected].name;
+                                            font-size: 12px; vertical-alignment: center;
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "GitHub Token"; width: 80px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].gh-token;
+                                            input-type: password;
+                                            placeholder-text: "ghp_xxx（GitHub PAT，空=不启用）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "gh_token", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "仓库白名单"; width: 80px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].gh-repos;
+                                            placeholder-text: "owner/repo 或 owner/*，逗号分隔（空=不限制）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "gh_repos", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "通知群"; width: 80px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].gh-notify-chat;
+                                            placeholder-text: "新 issue 通知的群/私聊 chat_id";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "gh_notify_chat", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "GitHub 用户名"; width: 80px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].gh-username;
+                                            placeholder-text: "自己的 GitHub login（通知过滤自问自答）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "gh_username", self.text); }
+                                        }
+                                    }
+                                    if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                        Text { text: "提及映射"; width: 80px; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: root.bots[root.selected].gh-mention-map;
+                                            placeholder-text: "login:chat_id，逗号分隔（@提及 私信通知目标）";
+                                            horizontal-stretch: 1;
+                                            edited => { root.bot-field-edited(root.selected, "gh_mention_map", self.text); }
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: "保存并重启服务后生效（Token/白名单/通知目标在服务启动时加载）。";
+                                    font-size: 11px; color: #888; wrap: word-wrap;
+                                }
+                            }
+                            // 指令能力卡（静态清单 + 一条动态状态行）
+                            VerticalBox {
+                                spacing: 4px;
+                                Text { text: "指令能力"; font-size: 13px; font-weight: 600; color: Palette.foreground; }
+                                Text { text: "· @bot 分析 <issue 链接>：agent 分析并双写（issue 评论留档 + 群摘要）"; font-size: 11px; color: #888; wrap: word-wrap; }
+                                Text { text: "· @bot 关闭 <链接> → 确认关闭 <链接>：两步确认后关闭"; font-size: 11px; color: #888; wrap: word-wrap; }
+                                Text { text: "· @bot 建 issue <标题> → 确认建 issue <标题>：预览后创建"; font-size: 11px; color: #888; wrap: word-wrap; }
+                                Text { text: "· 新 issue 通知：60s 增量轮询白名单仓库 → 通知群"; font-size: 11px; color: #888; wrap: word-wrap; }
+                                Text { text: "· issue 评论 @提及 → 按提及映射私聊提醒"; font-size: 11px; color: #888; wrap: word-wrap; }
+                                Text { text: "· 门槛：PR 不进新 issue 通知；@bot 自动处理仅协作者可触发"; font-size: 11px; color: #888; wrap: word-wrap; }
+                                Text {
+                                    text: root.gh-capability-line;
+                                    font-size: 11px; color: #b80; wrap: word-wrap;
+                                }
+                            }
+                            // 仓库动态卡
+                            VerticalBox {
+                                vertical-stretch: 1;
+                                spacing: 6px;
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: "仓库动态"; font-size: 13px; font-weight: 600; color: Palette.foreground; vertical-alignment: center; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Text {
+                                        text: root.gh-status;
+                                        font-size: 11px;
+                                        color: root.gh-status-error ? #d13438 : #888;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Button {
+                                        text: root.gh-busy ? "拉取中…" : "刷新";
+                                        enabled: !root.gh-busy;
+                                        clicked => { root.fetch-gh-activity(); }
+                                    }
+                                }
+                                if root.gh-activity.length == 0: Text {
+                                    text: root.gh-status == "" ? "暂无动态（选择左侧连接并刷新）" : root.gh-status;
+                                    font-size: 11px; color: #888; wrap: word-wrap;
+                                }
+                                for act in root.gh-activity: Rectangle {
+                                    height: 30px;
+                                    HorizontalBox {
+                                        padding-left: 6px; padding-right: 6px;
+                                        spacing: 8px;
+                                        Text {
+                                            text: act.repo + " #" + act.number + " " + act.title;
+                                            horizontal-stretch: 1;
+                                            vertical-alignment: center;
+                                            font-size: 12px; color: Palette.foreground;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: act.state == "open" ? "开启" : "已关闭";
+                                            font-size: 11px;
+                                            color: act.state == "open" ? #0b8a3e : #888;
+                                            vertical-alignment: center;
+                                        }
+                                        Text { text: act.updated-at; font-size: 11px; color: #888; vertical-alignment: center; }
+                                        Button {
+                                            text: "打开";
+                                            clicked => { root.open-gh-issue(act.html-url); }
                                         }
                                     }
                                 }

@@ -44,6 +44,12 @@ enum UiCmd {
         idx: i32,
         snapshot: ProviderConfig,
     },
+    /// #60-UX 拉取 GitHub 仓库动态（设置窗「GitHub 协同」页）。结果经 gh_act_rx 回主线程。
+    FetchGhActivity {
+        bot_key: String,
+        token: String,
+        repos: Vec<(String, String)>,
+    },
     OpenLogs,
     OpenFolder,
 }
@@ -393,6 +399,14 @@ fn reload_bots_if_external_change(
     sync_model(model, &cfg.bots);
     w.set_selected(sel);
     refresh_owner_code_info(w, work);
+    // #60-UX：外部变更（CLI/其它进程改 config）→ 清旧活动数据 + 重算能力行
+    w.set_gh_activity(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<
+        GhActivityRow,
+    >::new(
+    )))));
+    w.set_gh_status("".into());
+    w.set_gh_status_error(false);
+    update_gh_capability(w, work);
 }
 
 /// 按当前选中 bot 重算互斥 CheckBox 的勾选态（后端 + 对话权限）。
@@ -541,6 +555,115 @@ fn configure_backend() -> Result<()> {
     Ok(())
 }
 
+// ─── #60-UX GitHub 协同页 helper ─────────────────────────────────
+
+/// 拉取仓库动态的唯一入口。读 work 副本（未保存编辑也生效——与「测试连接」同语义，
+/// 改 Token 点刷新 = 验证新 Token）。token 空/白名单空不发网络请求，只给卡内提示。
+fn trigger_gh_fetch(
+    w: &SettingsWindow,
+    work: &RefCell<Vec<BotConfig>>,
+    tx: &tokio::sync::mpsc::UnboundedSender<UiCmd>,
+) {
+    let sel = w.get_selected();
+    let bot = work.borrow().get(sel as usize).cloned();
+    let Some(bot) = bot else {
+        w.set_gh_status("先选择一个连接".into());
+        return;
+    };
+    if bot.gh_token.trim().is_empty() {
+        w.set_gh_busy(false);
+        w.set_gh_status_error(false);
+        w.set_gh_status("未连接：请先在「连接管理」填写 Token 并保存".into());
+        return;
+    }
+    let (targets, wildcards) = crate::github::gh_activity_targets(&bot.gh_repo_list());
+    if targets.is_empty() {
+        w.set_gh_busy(false);
+        w.set_gh_status_error(false);
+        w.set_gh_status("仓库白名单为空，暂无仓库动态".into());
+        return;
+    }
+    w.set_gh_busy(true);
+    w.set_gh_status_error(false);
+    let mut status = "拉取中…".to_string();
+    if !wildcards.is_empty() {
+        status.push_str(&format!("（{} 个通配项暂不支持动态列表）", wildcards.len()));
+    }
+    w.set_gh_status(status.into());
+    let _ = tx.send(UiCmd::FetchGhActivity {
+        bot_key: bot.key(),
+        token: bot.gh_token,
+        repos: targets,
+    });
+}
+
+/// 指令能力卡动态状态行：写操作（空白名单=禁用）/分析范围/通知/提及私聊四状态。
+fn update_gh_capability(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let sel = w.get_selected();
+    let bot = work.borrow().get(sel as usize).cloned();
+    let line = match bot {
+        None => "未选择连接".to_string(),
+        Some(b) => {
+            if b.gh_token.trim().is_empty() {
+                "未连接：填写 Token 后以下能力生效".to_string()
+            } else {
+                let n = b.gh_repo_list().len();
+                let write_scope = if n == 0 {
+                    "写操作已禁用（需配置白名单）".to_string()
+                } else {
+                    format!("写操作限 {n} 仓库")
+                };
+                let read_scope = if n == 0 {
+                    "分析不限仓库".to_string()
+                } else {
+                    format!("分析限 {n} 仓库")
+                };
+                let notify = if b.gh_notify_chat.trim().is_empty() {
+                    "新 issue 通知未配置"
+                } else {
+                    "新 issue 通知已配置"
+                };
+                let dm = if b.gh_mention_map.trim().is_empty() {
+                    "提及私聊未配置"
+                } else {
+                    "提及私聊已配置"
+                };
+                format!("{write_scope} · {read_scope} · {notify} · {dm}")
+            }
+        }
+    };
+    w.set_gh_capability_line(line.into());
+}
+
+/// 清 GitHub 页脏态 + 重算能力行（装载/外部变更时调用）。
+fn reset_gh_pane(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    w.set_gh_activity(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<
+        GhActivityRow,
+    >::new(
+    )))));
+    w.set_gh_busy(false);
+    w.set_gh_status("".into());
+    w.set_gh_status_error(false);
+    update_gh_capability(w, work);
+}
+
+/// 动态卡状态行：无数据/共 N 条/部分仓库失败（前 2 个仓库名）。
+fn compose_gh_status(rows: &[crate::github::GhActRow], failed: &[String]) -> String {
+    if rows.is_empty() && failed.is_empty() {
+        return "暂无动态（白名单仓库还没有 issue）".to_string();
+    }
+    let mut s = format!("共 {} 条", rows.len());
+    if !failed.is_empty() {
+        let first: Vec<String> = failed.iter().take(2).cloned().collect();
+        s.push_str(&format!(
+            " · {} 个仓库失败：{}",
+            failed.len(),
+            first.join("、")
+        ));
+    }
+    s
+}
+
 pub fn run_gui() -> Result<()> {
     configure_backend()?;
 
@@ -642,6 +765,11 @@ pub fn run_gui() -> Result<()> {
     // 依赖安装 / 供应商测试结果（后台 → 主线程）
     let (dep_tx, dep_rx) = std_mpsc::channel::<(String, std::result::Result<String, String>)>();
     let (prov_tx, prov_rx) = std_mpsc::channel::<(i32, std::result::Result<String, String>)>();
+    // #60-UX GitHub 仓库动态拉取结果（后台 → 主线程）：bot_key 防过期结果串到别的连接
+    let (gh_act_tx, gh_act_rx) = std_mpsc::channel::<(
+        String,
+        std::result::Result<(Vec<crate::github::GhActRow>, Vec<String>), String>,
+    )>();
 
     // ── 设置窗工作副本 + 列表 model ──
     let bots_model: Rc<slint::VecModel<BotRow>> = Rc::new(slint::VecModel::default());
@@ -725,6 +853,8 @@ pub fn run_gui() -> Result<()> {
         push_deps_to_window(w);
         // 系统权限检测（macOS）：完全磁盘/辅助功能/屏幕录制/自动化。
         push_perms_to_window(w);
+        // #60-UX：GitHub 页清脏态 + 能力行按选中 bot 计算
+        reset_gh_pane(w, work);
     }
 
     /// 装载设置窗：发现比正式配置新的草稿 → 静默恢复（返回 true，标记 dirty 并给一行提示）；
@@ -837,6 +967,27 @@ pub fn run_gui() -> Result<()> {
                     UiCmd::InstallDep(dep_id) => {
                         let r = crate::deps::run_install(&dep_id).await;
                         let _ = dep_tx.send((dep_id, r));
+                    }
+                    UiCmd::FetchGhActivity {
+                        bot_key,
+                        token,
+                        repos,
+                    } => {
+                        // 串行逐仓库拉（仓库数通常 ≤5，顺带天然限流友好）
+                        let gh = crate::github::GithubClient::new(&token);
+                        let mut per_repo = Vec::new();
+                        let mut failed: Vec<String> = Vec::new();
+                        for (owner, name) in repos {
+                            match gh.list_recent_issues(&owner, &name).await {
+                                Ok(issues) => per_repo.push((format!("{owner}/{name}"), issues)),
+                                Err(e) => failed.push(format!(
+                                    "{owner}/{name}（{}）",
+                                    crate::github::gh_err_hint(&format!("{e:#}"))
+                                )),
+                            }
+                        }
+                        let rows = crate::github::gh_activity_rows(per_repo, 10, 15);
+                        let _ = gh_act_tx.send((bot_key, Ok((rows, failed))));
                     }
                     UiCmd::TestProvider { idx, snapshot } => {
                         let r = test_provider(&snapshot).await;
@@ -1053,8 +1204,11 @@ pub fn run_gui() -> Result<()> {
         // 按字段回写（slint 侧只传被改的那一个字段）：杜绝「未改字段从过期 model 读回」
         // 导致的连改两字段互相回滚（旧 bot-edited 的 CRITICAL bug）。
         let dirty = dirty.clone();
+        let sw = settings.as_weak();
         settings.on_bot_field_edited(move |idx, field, value| {
             dirty.set(true);
+            // #60-UX：gh_ 字段编辑 → 指令能力卡动态行重算（不做 model 重建防 LineEdit 失焦）
+            let gh_touched = field.as_str().starts_with("gh_");
             let mut refresh = false;
             {
                 let mut b = work.borrow_mut();
@@ -1101,6 +1255,11 @@ pub fn run_gui() -> Result<()> {
             if refresh {
                 let b = work.borrow();
                 sync_model(&model, &b);
+            }
+            if gh_touched {
+                if let Some(w) = sw.upgrade() {
+                    update_gh_capability(&w, &work);
+                }
             }
         });
     }
@@ -1155,12 +1314,18 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let sw = settings.as_weak();
+        let tx_sel = tx.clone();
         settings.on_selection_changed(move |_idx| {
             let b = work.borrow();
             sync_model(&model, &b);
             if let Some(w) = sw.upgrade() {
                 refresh_owner_code_info(&w, &work);
                 refresh_exclusive_checks(&w, &work);
+                update_gh_capability(&w, &work);
+                // 在 GitHub 页切连接 → 拉该连接的仓库动态
+                if w.get_current_page() == 4 {
+                    trigger_gh_fetch(&w, &work, &tx_sel);
+                }
             }
         });
     }
@@ -1414,6 +1579,10 @@ pub fn run_gui() -> Result<()> {
     {
         let tx = tx.clone();
         let sw = settings.as_weak();
+        // #60-UX 回调也要用 tx/sw/work——先克隆再进第一个闭包（move 语义）
+        let tx_gh = tx.clone();
+        let sw_gh = settings.as_weak();
+        let work_gh = work.clone();
         settings.on_install_dep(move |dep_id| {
             if let Some(w) = sw.upgrade() {
                 if !w.get_dep_busy().is_empty() {
@@ -1424,6 +1593,14 @@ pub fn run_gui() -> Result<()> {
                 w.set_status_line(format!("⏳ 开始安装 {dep_id} …").into());
             }
             let _ = tx.send(UiCmd::InstallDep(dep_id.to_string()));
+        });
+        // #60-UX GitHub 协同页：刷新仓库动态 / 打开 issue 链接
+        settings.on_fetch_gh_activity(move || {
+            let Some(w) = sw_gh.upgrade() else { return };
+            trigger_gh_fetch(&w, &work_gh, &tx_gh);
+        });
+        settings.on_open_gh_issue(|url| {
+            platform::open_url(url.as_str());
         });
     }
 
@@ -1730,6 +1907,8 @@ pub fn run_gui() -> Result<()> {
         let providers_work_t = providers_work.clone();
         let default_provider_work_t = default_provider_work.clone();
         let cross_delivery_work_t = cross_delivery_work.clone();
+        let gh_last_page = Rc::new(Cell::new(0));
+        let tx_tick = tx.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -1759,6 +1938,56 @@ pub fn run_gui() -> Result<()> {
                     );
                     if let Err(e) = draft.save_draft() {
                         crate::log!("[gui] 草稿自动保存失败: {e:#}");
+                    }
+                }
+                // #60-UX 进页自动拉：Slint 1.17.1 无 current-page 变化回调，
+                // 2s tick 轮询转换沿（与 config_watch/看门狗轮询同 idiom，延迟无感）
+                if let Some(w) = settings_weak.upgrade() {
+                    let page = w.get_current_page();
+                    if page == 4 && gh_last_page.get() != 4 {
+                        trigger_gh_fetch(&w, &work, &tx_tick);
+                    }
+                    gh_last_page.set(page);
+                }
+                // #60-UX 仓库动态结果：bot_key 与当前选中比对，防过期结果串到别的连接
+                while let Ok((key, r)) = gh_act_rx.try_recv() {
+                    if let Some(w) = settings_weak.upgrade() {
+                        let cur_key = work
+                            .borrow()
+                            .get(w.get_selected() as usize)
+                            .map(|b| b.key());
+                        if cur_key.as_deref() != Some(key.as_str()) {
+                            continue; // 期间切了连接：丢弃过期结果
+                        }
+                        w.set_gh_busy(false);
+                        match r {
+                            Ok((rows, failed)) => {
+                                let v: Vec<GhActivityRow> = rows
+                                    .iter()
+                                    .map(|r| GhActivityRow {
+                                        repo: r.repo.clone().into(),
+                                        number: r.number as i32,
+                                        title: r.title.clone().into(),
+                                        state: r.state.clone().into(),
+                                        updated_at: crate::github::gh_fmt_time(&r.updated_at)
+                                            .into(),
+                                        html_url: r.html_url.clone().into(),
+                                    })
+                                    .collect();
+                                w.set_gh_activity(slint::ModelRc::from(Rc::new(
+                                    slint::VecModel::from(v),
+                                )));
+                                let err = !failed.is_empty();
+                                w.set_gh_status_error(err);
+                                w.set_gh_status(compose_gh_status(&rows, &failed).into());
+                            }
+                            Err(e) => {
+                                w.set_gh_status_error(true);
+                                w.set_gh_status(
+                                    format!("拉取失败：{}", crate::github::gh_err_hint(&e)).into(),
+                                );
+                            }
+                        }
                     }
                 }
                 // 依赖安装结果：清 dep-busy，刷新检测状态，报结果
