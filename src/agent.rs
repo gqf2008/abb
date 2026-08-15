@@ -794,6 +794,23 @@ fn claude_needs_fresh_session(e: &str) -> bool {
     e.contains("already in use") || e.contains("启动挂起")
 }
 
+/// #56：pi 会话文件存在性探查。pi 的 `--session-id` 语义是「存在即续聊、不存在即
+/// 新建」——文件被删/损坏时同 sid **静默**新建空会话（无错误可检测，rebuilt 恒 false）。
+/// 桥在注入闸里调用本函数：resume 轮（桥认为会话已建立）文件却不存在 = 会话已丢、
+/// 本轮 run 将静默重建 → 直接注入历史（比 pending 补注入早一轮：run 前即可探明）。
+/// 文件名实测形态 `<时间戳>_<sid>.jsonl`（--session-dir 固定在 workspace/.pi-sessions），
+/// 用包含匹配容忍前缀形态变化；目录不存在按不存在处理。
+pub fn pi_session_exists(bot_key: &str, session_id: &str) -> bool {
+    let dir = crate::workspace_dir(bot_key).join(".pi-sessions");
+    std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(session_id))
+        })
+        .unwrap_or(false)
+}
+
 /// #7 启动健康检查窗口（秒）：claude 启动后该时间内无任何 stdout 产出即判定挂死并终止。
 /// 只覆盖启动阶段；一旦有产出（含长任务）不再有任何超时——保持「无执行超时」语义。
 const CLAUDE_STARTUP_GRACE_SECS: u64 = 60;
@@ -1376,6 +1393,30 @@ mod tests {
         assert_eq!(toml_str("plain"), "\"plain\"");
         assert_eq!(toml_str("https://x/v1"), "\"https://x/v1\"");
         assert_eq!(toml_str("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn pi_session_exists_matches_timestamp_prefixed_file() {
+        // #56：实测布局 <时间戳>_<sid>.jsonl（--session-dir 固定在 workspace/.pi-sessions）
+        let key = format!("abb-test-{}", uuid::Uuid::new_v4());
+        let dir = crate::workspace_dir(&key).join(".pi-sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "674a1948-58d6-44f9-8107-86ee823c7b15";
+        std::fs::write(
+            dir.join(format!("2026-08-14T09-33-43-813Z_{sid}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+        assert!(pi_session_exists(&key, sid), "时间戳前缀形态命中");
+        assert!(
+            !pi_session_exists(&key, "00000000-0000-0000-0000-000000000000"),
+            "sid 不存在"
+        );
+        assert!(
+            !pi_session_exists(&format!("{key}-nodir"), sid),
+            "目录缺失按不存在"
+        );
+        let _ = std::fs::remove_dir_all(crate::workspace_dir(&key));
     }
 
     #[test]
