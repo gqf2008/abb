@@ -1480,8 +1480,17 @@ pub fn run_gui() -> Result<()> {
                 }
                 w.set_dep_busy(format!("全部缺失组件（共 {} 项）", missing.len()).into());
                 w.set_status_is_error(false);
+                // 审查 Minor：node 不一定在缺失清单里（只缺 codex 时没有 node 步）——
+                // 文案按实际清单条件化
+                let head = if missing.iter().any(|id| id == "node") {
+                    "先装 Node.js…"
+                } else if crate::deps::find_in_path("npm").is_none() {
+                    "先补装 Node.js（npm 缺失）…"
+                } else {
+                    "按缺失顺序安装…"
+                };
                 w.set_status_line(
-                    format!("⏳ 一键安装开始：共 {} 项，先装 Node.js…", missing.len()).into(),
+                    format!("⏳ 一键安装开始：共 {} 项，{head}", missing.len()).into(),
                 );
             }
             let _ = tx2.send(UiCmd::InstallAllMissing);

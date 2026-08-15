@@ -488,7 +488,12 @@ async fn run_step(step: &InstallStep) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 防安装器交互卡住（npm/brew 遇到提示读 stdin 会 EOF 继续，不会死等）。
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        // #60 审查 Critical：一键装的 20 分钟超时靠 drop future 生效——必须设
+        // kill_on_drop（与 agent.rs/larkskills.rs 同款），否则超时只停止等待、
+        // 子进程成孤儿继续安装（与下一项并发 brew 锁互斥、跳过决策失真、
+        // Windows 孤儿 winget 随时弹 UAC）。正常完成路径不受影响。
+        .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| format!("启动失败：{e}"))?;
     let out_tail = read_tail(child.stdout.take());

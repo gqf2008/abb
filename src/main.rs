@@ -236,6 +236,11 @@ fn main() {
     // 一键安装全部缺失依赖（#60）：agent-bridge deps-install。
     // 终端/脚本可用；逐行进度 + 汇总，退出码 0=全部装好 1=有失败/跳过。
     if args.len() >= 2 && args[1] == "deps-install" {
+        // 审查 Minor：拒绝尾随参数（--help 等不该真跑安装）
+        if args.len() > 2 {
+            println!("用法：agent-bridge deps-install（无参数，安装全部缺失依赖）");
+            std::process::exit(2);
+        }
         std::process::exit(run_deps_install_cli());
     }
 
