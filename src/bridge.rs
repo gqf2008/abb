@@ -963,6 +963,13 @@ impl Bridge {
             //   真丢失误判为已注入（静默永久无上下文，恰是本功能要杀的症状）——布局
             //   误报的代价是可见噪音（提示从首轮起可见；误报持续时注入块按轮累积进
             //   pi transcript，每轮 ≤6000 字符），可接受。
+            //
+            // 架构判断（#56/#57 审查遗留的定论）：三后端的丢失检测**分层是本质而非债**
+            // ——claude/codex 有错误文本（no rollout found / No conversation found）只能
+            // 事后分类（agent.rs run），pi 无错误信号只能事前探查（本闸的探针），统一成
+            // 单一信号会让 pi 失去「本轮直接注入」的优势。重新审视本分层的触发条件：
+            // **接入第 4 个后端时**（届时若又是一种新形态，再考虑 RunOutcome 加统一
+            // context_lost 信号面）。
             let marker = hist.marker();
             let pi_lost = || {
                 backend == Backend::Pi
@@ -2043,6 +2050,14 @@ mod tests {
             self.prompts.lock().unwrap().push(prompt.to_string());
             self.roles.lock().unwrap().push(role);
             self.started.notify_one();
+            // #57 审查遗留修复：模拟 pi 的持久化时机——真实 pi 在**会话创建时**（run
+            // 开始、LLM 工作之前，SessionManager.open）即落盘，失败/被打断的轮次同样
+            // 留文件（文件里已有该轮的注入块与消息）；mock 原只在 Reply 写盘，导致
+            // 「失败后文件存在 → 不重复注入」的生产路径测试不可表达，T5 反而锁定了
+            // 与生产矛盾的语义。写在 run 入口 = 所有 outcome（Reply/Fail/Cancel）都留盘。
+            if backend == Backend::Pi {
+                let _ = write_pi_session_file(bot_key, session_id);
+            }
             // 先把中途输出推完（unbounded 即推即走），桥侧 select/收尾排空负责丢弃
             if let Some(tx) = &progress {
                 for p in &self.progress_msgs {
@@ -2084,16 +2099,8 @@ mod tests {
                     } else {
                         session_id.to_string()
                     };
-                    // #56：模拟 pi 的持久化——run 成功必落会话文件（真实 pi --session-dir
-                    // 的核心行为）。桥的探针据此区分「会话存活」与「文件丢失」；缺这步
-                    // 所有 pi 测试的后续轮都会被误判为会话丢失而重注入。首行须为
-                    // session 记录（探针按首行 id + 末行完整 JSON 校验，损坏/格式不符按丢失）。
-                    // 注：真实 pi 在会话创建时（run 开始）即落盘——失败/被打断的轮次也会
-                    // 留文件；mock 只在 Reply 写盘，失败的 pi 轮次路径在测试里不可表达
-                    // （取舍：Err 轮不写盘恰好对应「spawn 失败、会话从未创建」的形态）。
-                    if backend == Backend::Pi {
-                        let _ = write_pi_session_file(bot_key, &final_sid);
-                    }
+                    // pi 会话文件已在 run 入口写过（见上）；claude 换 UUID 自愈轮的
+                    // final_sid 若与入口 sid 不同——pi 不走 heal，无需补写。
                     Ok(agent::RunOutcome::Reply {
                         reply: self.reply.clone(),
                         session_id: final_sid,
@@ -2392,8 +2399,11 @@ mod tests {
     /// （上下文从未真正进入任何 session，重注入是对的）。
     #[tokio::test]
     async fn failed_round_reinjects_on_next_message() {
+        // #49 通用语义（失败轮不写 marker/started → 下一条重注入）。用 claude：pi 的
+        // 失败轮文件已在盘上（会话创建即落盘），下一条走的是「文件在 → 不重复注入」
+        // 的另一条路——见 pi_failed_round_keeps_file_no_reinject。
         let runner = Arc::new(MockAgentRunner::with_progress_error(&[], "后端爆炸"));
-        let bot = backend_bot("pi");
+        let bot = backend_bot("claude");
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
         let hist = crate::history::History::open(&bot.key(), "oc_x");
         hist.append_user("old1", "claude", "旧背景");
@@ -2418,6 +2428,41 @@ mod tests {
             "下一条重新注入"
         );
         let _ = msgr;
+        cleanup_bridge(&bridge);
+    }
+
+    /// #57 审查遗留修复：pi 失败轮的**生产语义**——真实 pi 在会话创建时（run 开始）
+    /// 即落盘，失败轮的文件里已含该轮注入块与消息 → 下一条探针判定存活、**不重复
+    /// 注入**（mock 原只在 Reply 写盘，把这条路径测试成了反面）。
+    #[tokio::test]
+    async fn pi_failed_round_keeps_file_no_reinject() {
+        let runner = Arc::new(MockAgentRunner::with_progress_error(&[], "pi LLM 报错"));
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        hist.append_user("old1", "claude", "旧背景");
+
+        // m1：fresh 首轮注入历史 → pi 失败（会话创建即落盘，注入块已在文件里）
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "第一问")).await })
+            .await
+            .unwrap();
+        assert!(runner.prompts()[0].contains("[历史上下文]"), "首轮注入");
+        assert!(hist.marker().is_none(), "失败轮不写 marker");
+
+        // m2：文件在（mock 于 run 入口落盘）→ 探针判存活 → 不重复注入
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "再试")).await })
+            .await
+            .unwrap();
+        assert!(
+            !runner.prompts()[1].contains("[历史上下文]"),
+            "失败轮文件已在（含注入块），不重复注入: {}",
+            runner.prompts()[1]
+        );
+        // Err 轮发送的是错误文案（非 Reply）——断言它锁「失败可见」而非恒真的
+        // 否定式「不含已携带」（Err 文案在任何实现下都不含该提示，审查 Minor）。
+        assert_eq!(msgr.sent()[1], "pi LLM 报错", "m2 走失败可见路径");
         cleanup_bridge(&bridge);
     }
 
