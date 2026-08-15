@@ -1644,6 +1644,7 @@ export component SettingsWindow inherits Window {
 
             // ── #60-UX GitHub 协同页（current-page 4）：连接管理 + 指令能力 + 仓库动态 ──
             if root.current-page == 4: VerticalBox {
+                width: 100%; height: 100%;
                 padding-top: 28px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
                 spacing: 14px;
                 VerticalBox {
@@ -1806,11 +1807,15 @@ export component SettingsWindow inherits Window {
                                     }
                                 }
                                 if root.gh-activity.length == 0: Text {
-                                    text: root.gh-status == "" ? "暂无动态（选择左侧连接并刷新）" : root.gh-status;
+                                    text: "暂无动态（选择左侧连接并刷新）";
                                     font-size: 11px; color: #888; wrap: word-wrap;
                                 }
-                                for act in root.gh-activity: Rectangle {
-                                    height: 30px;
+                                ScrollView {
+                                    vertical-stretch: 1;
+                                    VerticalBox {
+                                        width: 100%;
+                                        for act in root.gh-activity: Rectangle {
+                                            height: 30px;
                                     HorizontalBox {
                                         padding-left: 6px; padding-right: 6px;
                                         spacing: 8px;
@@ -1831,6 +1836,8 @@ export component SettingsWindow inherits Window {
                                         Button {
                                             text: "打开";
                                             clicked => { root.open-gh-issue(act.html-url); }
+                                        }
+                                            }
                                         }
                                     }
                                 }

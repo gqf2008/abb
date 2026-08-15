@@ -406,6 +406,7 @@ fn reload_bots_if_external_change(
     )))));
     w.set_gh_status("".into());
     w.set_gh_status_error(false);
+    w.set_gh_busy(false); // 在途结果的 key 比对会被换掉的 bot 丢弃，busy 必须一并清（否则刷新钮永久禁用）
     update_gh_capability(w, work);
 }
 
@@ -607,16 +608,23 @@ fn update_gh_capability(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
             if b.gh_token.trim().is_empty() {
                 "未连接：填写 Token 后以下能力生效".to_string()
             } else {
-                let n = b.gh_repo_list().len();
+                // 审查 Minor：白名单计数区分具体仓与 owner/* 通配（通配 = 该 owner 全部仓库）
+                let (targets, wildcards) = crate::github::gh_activity_targets(&b.gh_repo_list());
+                let n = targets.len() + wildcards.len();
+                let scope_suffix = if !wildcards.is_empty() {
+                    format!("（{} 项，含 {} 个 owner/* 通配）", n, wildcards.len())
+                } else {
+                    String::new()
+                };
                 let write_scope = if n == 0 {
                     "写操作已禁用（需配置白名单）".to_string()
                 } else {
-                    format!("写操作限 {n} 仓库")
+                    format!("写操作限 {n} 仓库{scope_suffix}")
                 };
                 let read_scope = if n == 0 {
                     "分析不限仓库".to_string()
                 } else {
-                    format!("分析限 {n} 仓库")
+                    format!("分析限 {n} 仓库{scope_suffix}")
                 };
                 let notify = if b.gh_notify_chat.trim().is_empty() {
                     "新 issue 通知未配置"

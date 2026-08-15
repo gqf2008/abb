@@ -1070,7 +1070,8 @@ pub fn gh_activity_rows(
             });
         }
     }
-    // updated_at 是 RFC3339 字符串（同秒内字典序=时间序），倒序 = 最新在前
+    // updated_at 是 RFC3339 字符串（字典序=时间序**仅对同偏移成立**——生产输入唯一来源
+    // 是 GitHub API 恒返回 Z 尾缀，此假设成立；混入带偏移来源需先归一化）
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     rows.truncate(total_limit);
     rows
