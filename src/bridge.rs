@@ -2460,7 +2460,9 @@ mod tests {
             "失败轮文件已在（含注入块），不重复注入: {}",
             runner.prompts()[1]
         );
-        assert!(!msgr.sent()[1].contains("已携带"));
+        // Err 轮发送的是错误文案（非 Reply）——断言它锁「失败可见」而非恒真的
+        // 否定式「不含已携带」（Err 文案在任何实现下都不含该提示，审查 Minor）。
+        assert_eq!(msgr.sent()[1], "pi LLM 报错", "m2 走失败可见路径");
         cleanup_bridge(&bridge);
     }
 
