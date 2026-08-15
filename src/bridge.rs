@@ -39,6 +39,10 @@ pub struct Bridge {
     /// （审查：全局锁跨文件 I/O 是全 bot 的串行点）。锁内只有快速文件 I/O，
     /// agent 运行期间不持锁（/new 不被运行中任务阻塞的语义保留）。
     history_epochs: Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>,
+    /// #51 免 @ 开关的测试快照：config.json 里有该 bot 时全走 config 热读/热写；
+    /// 读不到该 bot（单测随机 key）→ 回落此内存快照（仿 access_and_role 的
+    /// 「load+find+快照回落」模式，保证测试不碰真实 config.json）。
+    mention_snapshot: Mutex<HashMap<String, String>>,
     /// 微信待发积压（pending_outbox）：主动推送被微信拒绝（ret=-2 token stale）时落盘，
     /// 等用户下一条入站刷新 context_token 后补发。非微信 bot 空置。
     outbox: OutboxStore,
@@ -130,6 +134,7 @@ impl Bridge {
             chat_locks: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             history_epochs: Mutex::new(HashMap::new()),
+            mention_snapshot: Mutex::new(HashMap::new()),
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
@@ -141,6 +146,40 @@ impl Bridge {
     /// 快照 = self.bot（build 时从 config 复制，含 kind 与全部访问字段）。
     fn access_snapshot_allows(&self, sender_id: &str) -> bool {
         self.bot.access_allows(sender_id)
+    }
+
+    /// #51 免 @ 开关的「config 优先、快照回落」读写（见 mention_snapshot 字段注释）。
+    /// 判定键 = config.json 里有没有该 bot：有 → 生产路径（热读/热写，重启保持）；
+    /// 没有（单测随机 key）→ 内存快照（不碰真实 config.json）。
+    fn mention_mode(&self, chat_id: &str) -> Option<String> {
+        match crate::config::Config::load() {
+            Ok(c) if c.bots.iter().any(|b| b.key() == self.bot.key()) => c
+                .bots
+                .into_iter()
+                .find(|b| b.key() == self.bot.key())
+                .and_then(|b| b.mention_modes.get(chat_id).cloned()),
+            _ => self.mention_snapshot.lock().unwrap().get(chat_id).cloned(),
+        }
+    }
+
+    fn set_mention_mode(&self, chat_id: &str, mode: Option<&str>) {
+        match crate::config::Config::load() {
+            Ok(c) if c.bots.iter().any(|b| b.key() == self.bot.key()) => {
+                crate::config::Config::set_mention_mode(&self.bot.key(), chat_id, mode);
+                // 生产路径（桥内方法已判 config 有该 bot）
+            }
+            _ => {
+                let mut m = self.mention_snapshot.lock().unwrap();
+                match mode {
+                    Some(v) => {
+                        m.insert(chat_id.to_string(), v.to_string());
+                    }
+                    None => {
+                        m.remove(chat_id);
+                    }
+                }
+            }
+        }
     }
 
     /// 热读 config 推导（准入, 发送者角色）——on_payload / on_dingtalk 共用同一份
@@ -588,11 +627,18 @@ impl Bridge {
         // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
         // 话题（thread）内用户回复机器人的消息不需要再次 @——这是「用户回复」的主流交互；
         // 顶层群消息仍要求 @（避免整个群的消息都进 agent）。
-        if chat_type == "group" && thread_id.is_empty() && !self.bot_is_mentioned(&mentions) {
+        // #51：该群设了免 @（mention_modes off）则顶层消息也进 agent——热读即时生效。
+        let chat_id = message["chat_id"].as_str().unwrap_or("");
+        let mention_off = self.mention_mode(chat_id).as_deref() == Some("off");
+        if chat_type == "group"
+            && thread_id.is_empty()
+            && !mention_off
+            && !self.bot_is_mentioned(&mentions)
+        {
             crate::log!(
                 "[bridge] 群聊未 @ 机器人，忽略（bot={} chat={} sender={}）",
                 self.bot.key(),
-                message["chat_id"].as_str().unwrap_or(""),
+                chat_id,
                 sender_id
             );
             return;
@@ -803,6 +849,43 @@ impl Bridge {
                 let _ = self
                     .send_reply(&ev, "⚠️ 新建会话失败：历史清理未完成，请稍后重试。")
                     .await;
+            }
+            return;
+        }
+
+        // /mention 免 @ 群聊开关（#51）：位置在 /new 之后、GitHub 指令之前——与 /new 同为
+        // 即时控制指令，不进 agent、不落盘 pending。仅顶层群聊可切换（私聊无 @ 门槛，
+        // 话题内本就免 @——不落盘、只提示）；配置写入 config.json（热读即时生效，
+        // 重启保持）。飞书/钉钉群聊共用（钉钉 Ev 的 chat_type 同为 "group"）。
+        if let Some(cmd) = parse_mention_cmd(&text) {
+            let reply = if ev.chat_type == "group" && ev.thread_id.is_empty() {
+                match cmd {
+                    MentionCmd::Show => {
+                        if self.mention_mode(&key).as_deref() == Some("off") {
+                            "本群已开启免 @：所有消息都会进入 agent。\
+多用户群共享同一会话、可能有上下文串扰；/mention on 可恢复。"
+                                .to_string()
+                        } else {
+                            "本群需要 @ 本机器人 才会响应（默认）。/mention off 可开启免 @。"
+                                .to_string()
+                        }
+                    }
+                    MentionCmd::On => {
+                        self.set_mention_mode(&key, Some("on"));
+                        "已恢复：需要 @ 本机器人 才会响应。".to_string()
+                    }
+                    MentionCmd::Off => {
+                        self.set_mention_mode(&key, Some("off"));
+                        "已开启免 @：本群所有消息都会进入 agent。\
+注意多用户群共享同一会话、可能有上下文串扰；/mention on 可恢复。"
+                            .to_string()
+                    }
+                }
+            } else {
+                "⚠️ 免 @ 开关仅顶层群聊可用（私聊与话题内本就无需 @）。".to_string()
+            };
+            if let Err(e) = self.send_reply(&ev, &reply).await {
+                crate::log!("[bridge] /mention 确认发送失败: {e:#}");
             }
             return;
         }
@@ -1383,8 +1466,10 @@ impl Bridge {
             );
             return;
         }
-        // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理
-        if msg.is_group() && !msg.mentioned {
+        // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理。
+        // #51：该群设了免 @（mention_modes off）则无需 @ 也进 agent（与飞书同开关）。
+        let mention_off = self.mention_mode(&msg.chat_id()).as_deref() == Some("off");
+        if msg.is_group() && !mention_off && !msg.mentioned {
             crate::log!(
                 "[dingtalk] 忽略群聊未 @ 机器人的消息 chat={}",
                 trunc(msg.chat_id(), 10)
@@ -1536,6 +1621,29 @@ fn history_user_text(text: &str, ev: &Ev) -> String {
 /// 只在 handle 里拦截（在透传 agent 之前），其它斜杠命令仍原样透传。
 fn is_new_command(text: &str) -> bool {
     text.trim().eq_ignore_ascii_case("/new")
+}
+
+/// #51 免 @ 群聊开关指令。
+enum MentionCmd {
+    /// 无参：显示当前群状态
+    Show,
+    On,
+    Off,
+}
+
+/// 识别 /mention 指令（#51）：精确匹配 `/mention`、`/mention on`、`/mention off`
+/// （trim + 大小写不敏感，仿 /new）。返回 None = 不是该指令（原样透传 agent）。
+fn parse_mention_cmd(text: &str) -> Option<MentionCmd> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("/mention") {
+        Some(MentionCmd::Show)
+    } else if t.eq_ignore_ascii_case("/mention on") {
+        Some(MentionCmd::On)
+    } else if t.eq_ignore_ascii_case("/mention off") {
+        Some(MentionCmd::Off)
+    } else {
+        None
+    }
 }
 
 /// 识别「打断」关键词（整句精确匹配，大小写不敏感）。仅当该 chat 有任务在跑时才生效
@@ -2949,6 +3057,256 @@ mod tests {
     }
 
     // ---- on_payload 过滤（飞书 receive_v1）----
+
+    // ─── #51 免 @ 群聊开关 ─────────────────────────────────────────
+
+    /// /mention 指令解析表：精确匹配 + 大小写不敏感 + 非指令透传。
+    #[test]
+    fn parse_mention_cmd_table() {
+        assert!(matches!(
+            parse_mention_cmd("/mention"),
+            Some(MentionCmd::Show)
+        ));
+        assert!(matches!(
+            parse_mention_cmd(" /mention "),
+            Some(MentionCmd::Show)
+        ));
+        assert!(matches!(
+            parse_mention_cmd("/MENTION"),
+            Some(MentionCmd::Show)
+        ));
+        assert!(matches!(
+            parse_mention_cmd("/mention on"),
+            Some(MentionCmd::On)
+        ));
+        assert!(matches!(
+            parse_mention_cmd("/mention OFF"),
+            Some(MentionCmd::Off)
+        ));
+        assert!(
+            matches!(parse_mention_cmd("/mention on!"), None),
+            "非精确匹配透传"
+        );
+        assert!(matches!(parse_mention_cmd("mention off"), None));
+        assert!(matches!(parse_mention_cmd("/mention x"), None));
+    }
+
+    /// 群聊 @ 门槛端到端（验收核心）：/mention off 后未 @ 的顶层消息进 agent；
+    /// /mention on 恢复过滤；无参显示状态；per-群隔离。
+    #[tokio::test]
+    async fn mention_off_allows_unmentioned_then_on_restores() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+
+        // 基线：未 @ 的顶层群消息被过滤（不进 agent）
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m0",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "没@我",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert!(runner.prompts().is_empty(), "未 @ 默认忽略");
+
+        // @ 了 bot 发 /mention off → 确认回复 + 快照落 off
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m1",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[("庆小丰", "ou_bot")],
+                    "/mention off",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert!(
+            msgr.sent().iter().any(|s| s.contains("已开启免 @")),
+            "off 确认回复: {:?}",
+            msgr.sent()
+        );
+
+        // off 后：未 @ 的顶层消息进 agent
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m2",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "免 @ 的第一条",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(runner.prompts().len(), 1, "免 @ 后进 agent");
+        assert!(runner.prompts()[0].contains("免 @ 的第一条"));
+
+        // 无参显示状态
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m3",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[("庆小丰", "ou_bot")],
+                    "/mention",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert!(
+            msgr.sent().iter().any(|s| s.contains("已开启免 @")),
+            "无参显示免 @ 状态"
+        );
+
+        // /mention on 恢复：未 @ 消息再次被过滤
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m4",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[("庆小丰", "ou_bot")],
+                    "/mention on",
+                )
+                .as_bytes(),
+            )
+            .await;
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m5",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "又没@",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(
+            runner.prompts().len(),
+            1,
+            "on 后未 @ 消息不再进 agent（仍是免 @ 那一条）"
+        );
+
+        // per-群隔离：oc_g 的 off 不影响 oc_other
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m6",
+                    "oc_g",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[("庆小丰", "ou_bot")],
+                    "/mention off",
+                )
+                .as_bytes(),
+            )
+            .await;
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m7",
+                    "oc_other",
+                    "group",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "别的群没@",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(runner.prompts().len(), 1, "开关 per-群隔离");
+        cleanup_bridge(&bridge);
+    }
+
+    /// 私聊 /mention → 仅顶层群聊可用提示，不写开关。
+    #[tokio::test]
+    async fn mention_in_p2p_replies_group_only() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m1",
+                    "oc_p",
+                    "p2p",
+                    "",
+                    "",
+                    "user",
+                    "ou_owner",
+                    &[],
+                    "/mention off",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert!(
+            msgr.sent().iter().any(|s| s.contains("仅顶层群聊可用")),
+            "私聊提示: {:?}",
+            msgr.sent()
+        );
+        assert!(runner.prompts().is_empty(), "不进 agent");
+        assert!(
+            bridge.mention_mode("oc_p").is_none(),
+            "私聊不写开关（快照为空）"
+        );
+        cleanup_bridge(&bridge);
+    }
 
     #[tokio::test]
     async fn on_payload_ignores_app_and_bot_senders() {

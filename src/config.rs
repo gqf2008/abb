@@ -130,6 +130,11 @@ pub struct BotConfig {
     /// false=授权者与 owner 同权限（现状全权限）。owner 会话不受此字段影响，恒全权限。
     #[serde(default = "default_true", skip_serializing_if = "restrict_on")]
     pub restrict_granted_agent: bool,
+    /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
+    /// 缺省（无条目）= 需要 @（默认，向后兼容旧 config）。仅顶层群聊 chat_id 记录；
+    /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub mention_modes: std::collections::HashMap<String, String>,
 }
 
 /// 手动 Default：enabled 默认 true（derive(Default) 对 bool 给 false，会把新/迁移 bot 误设成停用）。
@@ -170,6 +175,7 @@ impl Default for BotConfig {
             granted_infos: Vec::new(),
             open_access: false,
             restrict_granted_agent: true,
+            mention_modes: std::collections::HashMap::new(),
         }
     }
 }
@@ -836,6 +842,41 @@ impl Config {
                     .map(|b| b.primary_chat_id)
             })
             .unwrap_or_default()
+    }
+
+    /// #51：设置某 bot 某群聊的 @ 门槛。mode: Some("on"/"off")；None = 删除条目恢复默认
+    /// （需要 @）。与 save_primary_chat 同款：写锁 + load + find + save。
+    pub fn set_mention_mode(bot_key: &str, chat_id: &str, mode: Option<&str>) {
+        if chat_id.is_empty() {
+            return;
+        }
+        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
+        if let Ok(mut c) = Config::load() {
+            if let Some(b) = c.bots.iter_mut().find(|b| b.key() == bot_key) {
+                match mode {
+                    Some(m) => {
+                        b.mention_modes.insert(chat_id.to_string(), m.to_string());
+                    }
+                    None => {
+                        b.mention_modes.remove(chat_id);
+                    }
+                }
+                if let Err(e) = c.save() {
+                    crate::log!("[config] 保存 mention_modes 失败: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// #51：读某 bot 某群聊的 @ 门槛（热读，每次群消息门槛判定时调用）。
+    /// 返回 None = 无条目 = 需要 @（默认）。
+    pub fn mention_mode(bot_key: &str, chat_id: &str) -> Option<String> {
+        Config::load().ok().and_then(|c| {
+            c.bots
+                .into_iter()
+                .find(|b| b.key() == bot_key)
+                .and_then(|b| b.mention_modes.get(chat_id).cloned())
+        })
     }
 
     /// 解析某 bot 的生效供应商：bot.provider（非空优先）→ 全局 default_provider → providers 里查名。
@@ -1721,5 +1762,40 @@ mod tests {
         assert!(!Config::draft_path().exists(), "删除后草稿不应存在");
         assert!(Config::load_draft().is_none());
         assert!(!Config::draft_is_newer());
+    }
+
+    #[test]
+    fn mention_modes_roundtrip_and_old_config_compat() {
+        // 新格式：mention_modes 序列化往返（含 per-群隔离的两把钥匙）
+        let mut c = Config::default();
+        c.bots.push(BotConfig {
+            name: "mm-test".into(),
+            kind: "feishu".into(),
+            mention_modes: [
+                ("oc_a".to_string(), "off".to_string()),
+                ("oc_b".to_string(), "on".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            back.bots[0].mention_modes.get("oc_a").map(String::as_str),
+            Some("off")
+        );
+        assert_eq!(
+            back.bots[0].mention_modes.get("oc_b").map(String::as_str),
+            Some("on")
+        );
+        // 空 map 不落盘（skip_serializing_if）
+        let empty = Config::default();
+        let s2 = serde_json::to_string(&empty).unwrap();
+        assert!(!s2.contains("mention_modes"), "空 map 不序列化");
+        // 旧 config 无该字段 → 反序列化按空 map（缺省 = 需要 @）
+        let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
+        let back_old: Config = serde_json::from_str(old).unwrap();
+        assert!(back_old.bots[0].mention_modes.is_empty(), "旧文件兼容缺省");
     }
 }
