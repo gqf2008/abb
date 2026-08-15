@@ -524,7 +524,17 @@ fn configure_backend() -> Result<()> {
     {
         use i_slint_backend_winit::Backend;
         use winit::platform::macos::WindowAttributesExtMacOS;
-        let backend = Backend::builder()
+        let mut builder = Backend::builder();
+        // 渲染器：默认 femtovg（Cargo.toml 已去 skia）。SLINT_BACKEND 显式指定时
+        // 尊重之（如 winit-software 兜底排查渲染问题）。
+        if let Ok(name) = std::env::var("SLINT_BACKEND") {
+            if name == "winit-software" {
+                builder = builder.with_renderer_name("software");
+            } else if name == "winit-femtovg" {
+                builder = builder.with_renderer_name("femtovg");
+            }
+        }
+        let backend = builder
             .with_window_attributes_hook(|attrs| {
                 attrs
                     .with_titlebar_transparent(true)

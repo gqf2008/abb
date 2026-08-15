@@ -6,11 +6,13 @@ build = "build.rs"
 
 [dependencies]
 # GUI：Slint 1.17 托盘应用。
-# 渲染器：必须显式开 renderer-skia。Slint 默认 feature 只有 femtovg+software（**不含 skia**，
-# 尽管旧注释误以为含）。FemtoVG(OpenGL) 在 macOS accessory 进程 + 先 hide 后 show 的窗口上
-# 会渲染成全黑（surface 没正常建立）；Skia(CoreGraphics) 稳定。software 渲染器则让托盘
-# image→NSImage 失败、图标不显示。故三选一用 skia。
-slint = { version = "1.17", features = ["unstable-winit-030", "renderer-skia"] }
+# 渲染器：用默认 femtovg（OpenGL）。历史：曾固定 renderer-skia——旧注释记录 femtovg 在
+# macOS accessory 进程 + 先 hide 后 show 的窗口上渲染全黑、software 让托盘图标不显示；
+# 2026-08-15 实测（slint 1.17.1 / macOS 15.x）两症状均不复现：femtovg 设置窗渲染正常、
+# 托盘图标正常。切换收益：去掉 skia-bindings 的预编译二进制下载（每次新 target 目录
+# 冷构建都要联网拉取，网络抖动即失败）+ 二进制更小。software 渲染器仍在默认特性里，
+# 可用 SLINT_BACKEND=winit-software 兜底排查（configure_backend 支持）。
+slint = { version = "1.17", features = ["unstable-winit-030"] }
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "process", "time", "sync", "io-util", "signal"] }
 # WS：关默认 native-tls，rustls + webpki 根证书 = 全静态
