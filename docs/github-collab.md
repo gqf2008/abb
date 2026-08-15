@@ -37,7 +37,7 @@ ABB 与 GitHub/GitLab 协同处理问题的设计文档。实现见 `feat(github
 - 架构：`GithubApi` trait 注入 Bridge；config 四字段（`gh_token`/`gh_repos`/`gh_notify_chat`/`gh_username`）；设置窗「GitHub 能力」区
 - 指令语法：`分析`/`看看`/`处理`/`analyze`、`关闭`→`确认关闭`、`建 issue`/`创建 issue`；支持完整链接与 `owner/repo#N` 简写
 
-## Phase 2 范围（修正版，吸收评审调整）
+## Phase 2（已实现，2.8.0 起；修正版，吸收评审调整）
 
 1. **Mention 通知回流**（评审建议插入，价值密度最高）：issue 后续评论里 @ 某人 → watch 增量（`updated_at` 数据已拉回）diff 出 mention → IM 私聊提醒 + 链接。严格符合「通知 + 链接，不承载内容」——否则「讨论留在 GitHub」的前提（有人盯着 GitHub）不成立
 2. **Issue 内 @bot 自动处理**：issue 评论里 `@bot 用户名` → agent 分析 → 评论回复。**上线前必须预置三道护栏**：
