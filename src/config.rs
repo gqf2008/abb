@@ -651,6 +651,16 @@ fn sanitize(s: &str) -> String {
         .collect::<String>()
 }
 
+/// #51：Config::set_mention_mode 的写入结果（三态：落盘 / bot 不在 config / 写失败）。
+pub enum MentionModeSave {
+    /// 已写入 config.json（或值未变化、无需写盘）
+    Saved,
+    /// config 里找不到该 bot（单测随机 key / bot 被改名）→ 调用方回落内存快照
+    BotNotFound,
+    /// 加载或保存失败，未生效（已记日志）→ 调用方如实回显失败
+    Failed,
+}
+
 impl Config {
     pub fn path() -> PathBuf {
         crate::bridge_dir().join("config.json")
@@ -846,24 +856,41 @@ impl Config {
 
     /// #51：设置某 bot 某群聊的 @ 门槛。mode: Some("on"/"off")；None = 删除条目恢复默认
     /// （需要 @）。与 save_primary_chat 同款：写锁 + load + find + save。
-    pub fn set_mention_mode(bot_key: &str, chat_id: &str, mode: Option<&str>) {
+    /// 返回：Saved=已落盘（或值未变化无需写）；BotNotFound=config 里没有该 bot
+    /// （调用方应回落内存快照）；Failed=加载/保存失败（未生效，已记日志）。
+    pub fn set_mention_mode(bot_key: &str, chat_id: &str, mode: Option<&str>) -> MentionModeSave {
         if chat_id.is_empty() {
-            return;
+            return MentionModeSave::BotNotFound;
         }
         let _g = CONFIG_WRITE_LOCK.lock().unwrap();
-        if let Ok(mut c) = Config::load() {
-            if let Some(b) = c.bots.iter_mut().find(|b| b.key() == bot_key) {
-                match mode {
-                    Some(m) => {
-                        b.mention_modes.insert(chat_id.to_string(), m.to_string());
-                    }
-                    None => {
-                        b.mention_modes.remove(chat_id);
-                    }
-                }
-                if let Err(e) = c.save() {
-                    crate::log!("[config] 保存 mention_modes 失败: {e:#}");
-                }
+        let Ok(mut c) = Config::load() else {
+            crate::log!("[config] 加载 config 失败，无法保存 mention_modes");
+            return MentionModeSave::Failed;
+        };
+        let Some(b) = c.bots.iter_mut().find(|b| b.key() == bot_key) else {
+            return MentionModeSave::BotNotFound;
+        };
+        // 值未变化不写盘（与 save_primary_chat 的 change-guard 同款，避免空转整份 config 重写）
+        let changed = match mode {
+            Some(m) => b.mention_modes.get(chat_id).map(String::as_str) != Some(m),
+            None => b.mention_modes.contains_key(chat_id),
+        };
+        if !changed {
+            return MentionModeSave::Saved;
+        }
+        match mode {
+            Some(m) => {
+                b.mention_modes.insert(chat_id.to_string(), m.to_string());
+            }
+            None => {
+                b.mention_modes.remove(chat_id);
+            }
+        }
+        match c.save() {
+            Ok(()) => MentionModeSave::Saved,
+            Err(e) => {
+                crate::log!("[config] 保存 mention_modes 失败: {e:#}");
+                MentionModeSave::Failed
             }
         }
     }
