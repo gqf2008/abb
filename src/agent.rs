@@ -794,6 +794,94 @@ fn claude_needs_fresh_session(e: &str) -> bool {
     e.contains("already in use") || e.contains("启动挂起")
 }
 
+/// #56：pi 会话文件存在性探查。pi 的 `--session-id` 语义是「存在即续聊、不存在即
+/// 新建」——文件被删/损坏时同 sid **静默**新建空会话（无错误可检测，rebuilt 恒 false）。
+/// 桥在注入闸里调用本函数：resume 轮（桥认为会话已建立）文件却不可续聊 = 会话已丢、
+/// 本轮 run 将静默重建 → 直接注入历史（比 pending 补注入早一轮：run 前即可探明）。
+/// 文件名实测形态 `<时间戳>_<sid>.jsonl`（--session-dir 固定在 workspace/.pi-sessions），
+/// 用包含匹配容忍前缀形态变化；目录列举失败按不存在处理。
+///
+/// 文件名命中 ≠ 可续聊：**损坏文件对 pi 而言 = "No project session found" 并静默新建**
+/// （实测 pi 0.84.1——文件仍在盘上、会话从头开始）——故再校验内容：
+/// - 首行 session 记录的 `"id":"<sid>"`（与 pi 自己的识别键对齐；用 JSON 解析取值，
+///   容忍空格/键序/前后空白等序列化漂移，不依赖精确子串）；
+/// - **末行必须是完整 JSON 记录**——追加式 JSONL 最常见的损坏形态是崩溃中断追加/磁盘
+///   满（首行完好、尾部截断），pi 全文件解析失败仍会静默重建空会话；只看首行会把
+///   这种文件误判为存活 → 静默无上下文，恰是本功能要杀的症状。末行校验有界（只读
+///   文件末尾至多 64KB）。
+///
+/// 读不到/格式不符按丢失处理（方向安全：误判为丢失 → 过注入，可见噪音；反向把真丢失
+/// 误判为存活才是静默无上下文）。同 sid 多文件（pi 每次会话重建都落新时间戳文件、
+/// 旧文件残留）只取 mtime 最新的：旧世代文件不得遮蔽新文件（新文件损坏而旧文件完好
+/// 时探针仍须判丢失）。
+pub fn pi_session_exists(workspace: &std::path::Path, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    let dir = workspace.join(".pi-sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false; // 任何列举错误按不存在（同上：方向安全）
+    };
+    // 只取该 sid 最新的文件（mtime 为主、文件名为辅——pi 文件名带会话创建时间戳，
+    // 同一 mtime 刻度下按名字序取更新的；防旧世代文件遮蔽新文件）
+    let mut newest: Option<(std::time::SystemTime, String, std::path::PathBuf)> = None;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.contains(session_id) {
+            continue;
+        }
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let replace = match &newest {
+            None => true,
+            Some((t, n, _)) => mtime > *t || (mtime == *t && name > *n),
+        };
+        if replace {
+            newest = Some((mtime, name, e.path()));
+        }
+    }
+    let Some((_, _, path)) = newest else {
+        return false;
+    };
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return false;
+    };
+    // 首行：session 记录含 "id":"<sid>"。有界读取（防损坏文件把整文件当首行读入——
+    // 只读 64KB 以内的首行，超长/无换行按丢失）。
+    let mut first = Vec::new();
+    let capped = std::io::Read::take(&mut f, 64 * 1024);
+    if std::io::BufRead::read_until(&mut std::io::BufReader::new(capped), b'\n', &mut first)
+        .is_err()
+        || first.len() >= 64 * 1024
+    {
+        return false;
+    }
+    let first = std::str::from_utf8(&first).unwrap_or("");
+    let first_id = serde_json::from_str::<serde_json::Value>(first.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_owned));
+    if first_id.as_deref() != Some(session_id) {
+        return false;
+    }
+    // 尾部：末行必须是完整 JSON 记录（截断检测）。只读文件末尾至多 64KB，代价有界。
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    const TAIL_MAX: u64 = 64 * 1024;
+    let start = len.saturating_sub(TAIL_MAX);
+    let mut tail = vec![0u8; (len - start) as usize];
+    if std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(start)).is_err()
+        || std::io::Read::read_exact(&mut f, &mut tail).is_err()
+    {
+        return false;
+    }
+    let last_line = std::str::from_utf8(&tail)
+        .ok()
+        .and_then(|s| s.rsplit('\n').find(|l| !l.is_empty()))
+        .unwrap_or("");
+    serde_json::from_str::<serde_json::Value>(last_line).is_ok()
+}
+
 /// #7 启动健康检查窗口（秒）：claude 启动后该时间内无任何 stdout 产出即判定挂死并终止。
 /// 只覆盖启动阶段；一旦有产出（含长任务）不再有任何超时——保持「无执行超时」语义。
 const CLAUDE_STARTUP_GRACE_SECS: u64 = 60;
@@ -861,7 +949,9 @@ async fn run_once(
             //    与 claude/codex 同款，规避多行/-开头被 argparse 误判（pi 对 `-` 开头参数报 Unknown option）；
             // ② --session-id 已存在即续聊（SessionManager.open）、不存在即新建（create with id），
             //    首轮/后续轮同一参数，无需 --resume 分支；
-            // ③ --session-dir 固定到本 bot 工作区：会话文件随 workspace 隔离，`session reset` 可整个清掉；
+            // ③ --session-dir 固定到本 bot 工作区：会话文件随 workspace 隔离；
+            //    注意 CLI `session reset` 只轮换 sid、**不删** .pi-sessions（旧文件按
+            //    mtime 由 #56 探针忽略；/new 会顺手清掉旧 sid 的文件——见 bridge.rs）。
             // ④ --mode json 逐事件 JSONL 输出（message_end 是权威回复）；LLM 错误在 json 模式下
             //    进程仍 exit 0，错误信息在 message_end.stopReason/errorMessage——由 process_line 判错。
             let mut c = tokio::process::Command::from(shim_command(&resolved));
@@ -1376,6 +1466,58 @@ mod tests {
         assert_eq!(toml_str("plain"), "\"plain\"");
         assert_eq!(toml_str("https://x/v1"), "\"https://x/v1\"");
         assert_eq!(toml_str("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn pi_session_exists_matches_timestamp_prefixed_file() {
+        // #56：实测布局 <时间戳>_<sid>.jsonl（--session-dir 固定在 workspace/.pi-sessions）
+        let key = format!("abb-test-{}", uuid::Uuid::new_v4());
+        let dir = crate::workspace_dir(&key).join(".pi-sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "674a1948-58d6-44f9-8107-86ee823c7b15";
+        let ws = crate::workspace_dir(&key);
+        // 损坏文件：文件名命中但内容不可识别 → 按丢失（实测 pi 0.84.1 静默新建）
+        std::fs::write(
+            dir.join(format!("2026-08-14T09-33-43-813Z_{sid}.jsonl")),
+            "{\"garbage\": true",
+        )
+        .unwrap();
+        assert!(
+            !pi_session_exists(&ws, sid),
+            "损坏文件按丢失（pi 会静默新建）"
+        );
+        // 好文件：首行 session 记录带 id（实测 pi 会话文件首行形态）
+        std::fs::write(
+            dir.join(format!("2026-08-14T10-33-43-813Z_{sid}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T10:33:43.813Z\"}}\n{{\"type\":\"message\"}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(pi_session_exists(&ws, sid), "时间戳前缀 + 首行 id 命中");
+        // #57 审查回归：首行完好 + 尾部截断（崩溃中断追加/磁盘满的常见形态）→ 按丢失
+        // （pi 全文件解析失败仍会静默重建空会话；只看首行会把它误判为存活——静默无上下文）
+        std::fs::write(
+            dir.join(format!("2026-08-14T11-33-43-813Z_{sid}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T11:33:43.813Z\"}}\n{{\"type\":\"message\""
+            ),
+        )
+        .unwrap();
+        assert!(
+            !pi_session_exists(&ws, sid),
+            "首行完好但尾部截断按丢失（截断检测）"
+        );
+        assert!(
+            !pi_session_exists(&ws, "00000000-0000-0000-0000-000000000000"),
+            "sid 不存在"
+        );
+        assert!(
+            !pi_session_exists(&crate::workspace_dir(&format!("{key}-nodir")), sid),
+            "目录缺失按不存在"
+        );
+        assert!(!pi_session_exists(&ws, ""), "空 sid 不放大为全目录扫描");
+        let _ = std::fs::remove_dir_all(crate::workspace_dir(&key));
     }
 
     #[test]

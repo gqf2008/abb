@@ -765,7 +765,23 @@ impl Bridge {
             // 审查 I-2 读侧）；崩溃窗口从「新会话读到旧历史」变成「reset 未生效」
             //（用户可见的失败，无静默泄漏）。
             if self.history_reset(&key) {
+                // #56/#57：/new 后旧 sid 的 pi 会话文件永久失效（pi 按 sid 续聊，新 sid
+                // 不再触碰旧文件）——顺手清掉：.pi-sessions 是 #56 探针的唯一信号源，
+                // 残留文件只增不减会拖慢每轮探针扫描并堆积磁盘。CLI `session reset`
+                // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
+                let old_sid = self.sessions.ensure_with_started(&key).0;
                 let new_sid = self.sessions.reset_session(&key);
+                if Backend::parse(self.bot.effective_backend(&self.default_backend)) == Backend::Pi
+                {
+                    let pi_dir = crate::workspace_dir(&self.bot.key()).join(".pi-sessions");
+                    if let Ok(entries) = std::fs::read_dir(&pi_dir) {
+                        for e in entries.flatten() {
+                            if e.file_name().to_string_lossy().contains(&old_sid) {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
                 crate::log!(
                     "[bridge] /new 新建会话 bot={} key={} sid={}",
                     self.bot.key(),
@@ -933,17 +949,42 @@ impl Bridge {
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let epoch = *guard;
             // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）：
-            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）；
-            // - resume（既有会话）：仅 pending 命中（#54 自愈重建/换 UUID 后待补注入）
-            //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）。
+            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）。
+            //   pi 例外（#56 同一探针，两个 !resume 臂都参与）：文件存在即续聊——被打断/
+            //   失败的 pi 轮次文件已在盘上（pi 会话创建即落盘），文件存在时再注入会把
+            //   同一历史块二次写进 pi transcript；文件缺失（且 marker 命中）才是真丢失。
+            // - resume（既有会话）：pending 命中（#54 自愈重建/换 UUID 后待补注入）
+            //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）；
+            //   或 pi 会话文件丢失/损坏（#56：pi 对不可续聊的文件同 sid 静默新建空会话
+            //   ——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入（run 前即可
+            //   探明，比 pending 早一轮）。**不设 marker 防重复护栏**：pi run 成功必落
+            //   会话文件（核心功能），文件持续不可续聊 = 每轮都是新会话，重注入是
+            //   正确行为；用「marker 匹配即已注入过」拦截会把「迁移后文件才丢失」的
+            //   真丢失误判为已注入（静默永久无上下文，恰是本功能要杀的症状）——布局
+            //   误报的代价是可见噪音（提示从首轮起可见；误报持续时注入块按轮累积进
+            //   pi transcript，每轮 ≤6000 字符），可接受。
             let marker = hist.marker();
+            let pi_lost = || {
+                backend == Backend::Pi
+                    && !crate::agent::pi_session_exists(
+                        &crate::workspace_dir(&self.bot.key()),
+                        &session_id,
+                    )
+            };
+            let pi_alive = || {
+                backend == Backend::Pi
+                    && crate::agent::pi_session_exists(
+                        &crate::workspace_dir(&self.bot.key()),
+                        &session_id,
+                    )
+            };
             let should_inject = if !resume {
                 match &marker {
-                    Some(m) => m.session_id != session_id,
-                    None => true,
+                    Some(m) => m.session_id != session_id || pi_lost(),
+                    None => !pi_alive(),
                 }
             } else {
-                matches!(&marker, Some(m) if m.pending && m.session_id == session_id)
+                matches!(&marker, Some(m) if m.pending && m.session_id == session_id) || pi_lost()
             };
             let injected_rounds = if should_inject {
                 let (block, n) = hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
@@ -1987,13 +2028,13 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         async fn run(
             &self,
-            _backend: Backend,
+            backend: Backend,
             prompt: &str,
             session_id: &str,
             _resume: bool,
             _chat_id: &str,
             session_key: &str,
-            _bot_key: &str,
+            bot_key: &str,
             role: crate::config::SenderRole,
             sessions: Option<&SessionStore>,
             progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -2043,6 +2084,16 @@ mod tests {
                     } else {
                         session_id.to_string()
                     };
+                    // #56：模拟 pi 的持久化——run 成功必落会话文件（真实 pi --session-dir
+                    // 的核心行为）。桥的探针据此区分「会话存活」与「文件丢失」；缺这步
+                    // 所有 pi 测试的后续轮都会被误判为会话丢失而重注入。首行须为
+                    // session 记录（探针按首行 id + 末行完整 JSON 校验，损坏/格式不符按丢失）。
+                    // 注：真实 pi 在会话创建时（run 开始）即落盘——失败/被打断的轮次也会
+                    // 留文件；mock 只在 Reply 写盘，失败的 pi 轮次路径在测试里不可表达
+                    // （取舍：Err 轮不写盘恰好对应「spawn 失败、会话从未创建」的形态）。
+                    if backend == Backend::Pi {
+                        let _ = write_pi_session_file(bot_key, &final_sid);
+                    }
                     Ok(agent::RunOutcome::Reply {
                         reply: self.reply.clone(),
                         session_id: final_sid,
@@ -2053,6 +2104,19 @@ mod tests {
                 MockOutcome::Fail(e) => Err(e.clone()),
             }
         }
+    }
+
+    /// #56/#57：写一个形态正确的 pi 会话文件（探针按「首行 session 记录 id + 末行
+    /// 完整 JSON」校验）。mock 与各 fixture 共用，格式契约只此一处。
+    fn write_pi_session_file(bot_key: &str, sid: &str) -> std::io::Result<()> {
+        let dir = crate::workspace_dir(bot_key).join(".pi-sessions");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join(format!("2026-08-14T00-00-00-000Z_{sid}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
+            ),
+        )
     }
 
     fn test_ev(mid: &str, chat_id: &str, text: &str) -> Ev {
@@ -2301,10 +2365,14 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("接续回答"));
         let bot = backend_bot("pi");
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        // 预置：pi 槽位已有完整会话（started=true，可 resume 自己的上下文）
+        // 预置：pi 槽位已有完整会话（started=true，可 resume 自己的上下文）。
+        // started=true 在真实世界必然伴随 pi 会话文件（run 成功即落盘）——fixture
+        // 补齐文件，否则 #56 探针会判定「会话丢失」而注入。
         let sid = bridge.sessions.ensure_with_started("oc_x").0;
         assert!(bridge.sessions.mark_started_if("oc_x", &sid));
-        // 历史里最后是 claude 的轮次（marker 也对不上）——但 !resume 直接短路
+        write_pi_session_file(&bot.key(), &sid).unwrap();
+        // 不注入的真正原因：pending 失配 + 探针命中文件（#56）——marker 是 None，
+        // 不是「对不上」；旧注释「!resume 直接短路」不成立（该轮 resume=true）。
         let hist = crate::history::History::open(&bot.key(), "oc_x");
         hist.append_user("old1", "claude", "claude 时代的内容");
 
@@ -2359,7 +2427,8 @@ mod tests {
     async fn rebuilt_round_marks_pending_then_next_injects() {
         let runner = Arc::new(MockAgentRunner::immediate("重建后的回复"));
         runner.set_rebuilt_rounds(1); // 第一次 run 返回 rebuilt=true（模拟自愈重建）
-        let bot = backend_bot("pi");
+                                      // claude/codex 的 rebuilt 语义（pi 的静默重建走 #56 探针直接注入，不走 pending）
+        let bot = backend_bot("claude");
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
         // 既有会话：started=true + marker 匹配（模拟已迁移过的会话，正常消息不注入）
         let (hist, sid) = seed_migrated_session(&bridge, &bot, "oc_x");
@@ -2478,6 +2547,44 @@ mod tests {
             "无 pending：下一条不注入: {}",
             runner.prompts()[1]
         );
+        assert!(!msgr.sent()[1].contains("已携带"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// #56：pi 会话文件丢失（对不存在文件同 sid 静默新建空会话，无错误可检）→
+    /// resume 轮**本轮直接注入**（run 前探明，比 pending 早一轮）；pi 落文件后
+    /// 恢复正常不注入。不设 marker 防重复护栏——真丢失不得被「已注入过」误拦
+    /// （见注入闸注释），文件持续缺失时每轮重注入是正确行为。
+    #[tokio::test]
+    async fn pi_session_loss_injects_directly() {
+        let runner = Arc::new(MockAgentRunner::immediate("重建轮的回复"));
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        // 既有会话（started=true + marker 匹配非 pending）+ 一轮旧历史；
+        // .pi-sessions 下无该 sid 文件 = 会话已丢失
+        let (hist, sid) = seed_migrated_session(&bridge, &bot, "oc_x");
+
+        // msg1：文件缺失 → 本轮直接注入 + 提示
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "还在吗")).await })
+            .await
+            .unwrap();
+        assert!(
+            runner.prompts()[0].contains("[历史上下文]"),
+            "文件丢失本轮直接注入: {}",
+            runner.prompts()[0]
+        );
+        assert!(runner.prompts()[0].contains("旧背景"));
+        assert!(msgr.sent()[0].contains("已携带"));
+        let m = hist.marker().unwrap();
+        assert!(!m.pending && m.session_id == sid, "注入后 marker 复位");
+
+        // msg2：mock 已模拟 pi 落盘（run 成功必写会话文件）→ 正常续聊不注入、无提示
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        assert!(!runner.prompts()[1].contains("[历史上下文]"));
         assert!(!msgr.sent()[1].contains("已携带"));
         cleanup_bridge(&bridge);
     }

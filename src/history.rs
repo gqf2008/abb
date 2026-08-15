@@ -12,9 +12,10 @@
 //!   编辑损坏不 panic）。
 //! - 注入闸在 bridge（串行锁内）：`!resume && marker.session_id != 当前会话`，或
 //!   `resume && marker.pending && marker.session_id == 当前会话`（#54：同 sid 自愈重建
-//!   或 claude 换 UUID 自愈后 pending 标记放行一次注入）——/new、CLI reset 使 marker
-//!   失效或失配，无需额外清理路径。CLI `session reset` 不清历史（与 /new 不对称，
-//!   有意：reset 后注入续命恰是「会话丢失自愈」的目标语义）。
+//!   或 claude 换 UUID 自愈后 pending 标记放行一次注入），或 pi 会话文件丢失/损坏
+//!   （#56：pi 对不可续聊文件同 sid 静默新建，无错误可检——run 前探针直接注入）——
+//!   /new、CLI reset 使 marker 失效或失配，无需额外清理路径。CLI `session reset`
+//!   不清历史（与 /new 不对称，有意：reset 后注入续命恰是「会话丢失自愈」的目标语义）。
 //! - 定时任务（run_job）不经 handle、不走本日志（每次全新 session 是既定设计，
 //!   见 service.rs run_job 注释）——跨后端迁移只覆盖聊天轮次。
 //! - IO 失败一律只 log 警告：历史是增强能力，绝不阻塞聊天主链路。
