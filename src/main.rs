@@ -233,6 +233,12 @@ fn main() {
         std::process::exit(run_session_cli(&args[2..]));
     }
 
+    // 一键安装全部缺失依赖（#60）：agent-bridge deps-install。
+    // 终端/脚本可用；逐行进度 + 汇总，退出码 0=全部装好 1=有失败/跳过。
+    if args.len() >= 2 && args[1] == "deps-install" {
+        std::process::exit(run_deps_install_cli());
+    }
+
     // 隐藏调试 flag：--wx-qr-test（冒烟：真拉一次微信登录二维码，验证协议端点）
     if args.iter().any(|a| a == "--wx-qr-test") {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -608,6 +614,37 @@ fn run_deliver_cli(args: &[String]) -> i32 {
     crate::log!("[deliver] CLI 已入队投递（service 异步发送）");
     println!("✅ 已入队跨会话投递（由 service 异步发送）。");
     0
+}
+
+/// #60 一键安装全部缺失依赖 CLI（deps-install）：逐行进度 + 如实汇总。
+/// 退出码 0=全部装好；1=有失败或跳过。
+fn run_deps_install_cli() -> i32 {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let outcome = rt.block_on(crate::deps::install_all_missing(|evt| {
+        println!("[deps] [{}/{}] 安装 {} …", evt.idx, evt.total, evt.label);
+    }));
+    for id in &outcome.ok {
+        println!("[deps] OK   {id}");
+    }
+    for (id, e) in &outcome.failed {
+        println!("[deps] FAIL {id}: {e}");
+    }
+    for (id, e) in &outcome.skipped {
+        println!("[deps] SKIP {id}: {e}");
+    }
+    println!("{}", crate::deps::format_all_summary(&outcome));
+    #[cfg(target_os = "windows")]
+    if !outcome.failed.is_empty() {
+        println!("（Windows：若为权限错误，可右键以管理员身份运行，或在 GUI 环境页点「以管理员重启」。）");
+    }
+    if outcome.failed.is_empty() && outcome.skipped.is_empty() {
+        0
+    } else {
+        1
+    }
 }
 
 /// 会话管理 CLI（#23）。退出码 0=成功 1=失败。

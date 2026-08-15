@@ -510,6 +510,149 @@ async fn run_step(step: &InstallStep) -> Result<String, String> {
     }
 }
 
+// ─── #60 一键安装全部缺失组件 ─────────────────────────────────────
+
+/// 一键安装进度事件（每开始一项发一次；label 用 DepStatus.label，如 "Claude Code"）。
+#[derive(Debug, Clone)]
+pub struct InstallEvt {
+    pub label: String,
+    /// 当前项序号（1-based）。
+    pub idx: usize,
+    pub total: usize,
+}
+
+/// 一键安装汇总（如实呈现：成功/失败/跳过三类，失败附尾因）。
+#[derive(Debug, Clone, Default)]
+pub struct AllInstallOutcome {
+    /// 安装成功的 dep_id（含「本来就在、重装幂等成功」的 node）。
+    pub ok: Vec<String>,
+    /// (dep_id, 失败尾因，已截断)。
+    pub failed: Vec<(String, String)>,
+    /// (dep_id, 跳过原因——node 未装好时「npm 首步」依赖不尝试)。
+    pub skipped: Vec<(String, String)>,
+}
+
+/// 单项目安装超时（#60）：run_step 无超时（winget 弹 UAC 等用户 / 网络挂起），
+/// 一键装 7 项串行会把「卡死一项」放大成全流程卡死——每项 20 分钟兜底。
+const ALL_INSTALL_DEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// 缺失清单：node 恒在最前（其它 npm 计划的前置），其余按 detect_all 顺序。纯函数。
+pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for d in deps {
+        if !d.found {
+            ids.push(d.id.to_string());
+        }
+    }
+    // node 移到最前（保持其余相对顺序稳定）
+    if let Some(pos) = ids.iter().position(|id| id == "node") {
+        if pos > 0 {
+            let n = ids.remove(pos);
+            ids.insert(0, n);
+        }
+    }
+    ids
+}
+
+/// 该依赖安装计划的第一步是否用 npm（win 的 claude/pi 首步是 npm；mac 的 claude/pi 是
+/// curl shell 不依赖 node）。纯函数（内部调 install_plan），供「node 失败 → 跳过」判定。
+fn first_step_uses_npm(dep_id: &str) -> bool {
+    install_plan(dep_id)
+        .ok()
+        .and_then(|steps| steps.into_iter().next())
+        .map(|s| s.program == "npm" && s.shell.is_none())
+        .unwrap_or(false)
+}
+
+/// 汇总文案（状态行用）：成功 N 项 / 失败 M 项（id: 尾因截断 100 字）/ 跳过 K 项。
+/// 空 outcome（全齐无缺失）= 「全部依赖均已安装」。
+pub fn format_all_summary(o: &AllInstallOutcome) -> String {
+    if o.ok.is_empty() && o.failed.is_empty() && o.skipped.is_empty() {
+        return "✅ 全部依赖均已安装".to_string();
+    }
+    let mut s = format!("一键安装完成：成功 {} 项", o.ok.len());
+    if !o.failed.is_empty() {
+        s.push_str(&format!("，失败 {} 项（", o.failed.len()));
+        let parts: Vec<String> = o
+            .failed
+            .iter()
+            .map(|(id, e)| format!("{id}: {}", crate::agent::truncate(e, 100)))
+            .collect();
+        s.push_str(&parts.join("；"));
+        s.push('）');
+    }
+    if !o.skipped.is_empty() {
+        let names: Vec<&str> = o.skipped.iter().map(|(id, _)| id.as_str()).collect();
+        s.push_str(&format!(
+            "，跳过 {} 项（{}）",
+            o.skipped.len(),
+            names.join("、")
+        ));
+    }
+    s
+}
+
+/// 一键安装全部缺失组件（#60）。on_evt 在每项开始前同步调用（非 async 闭包，await
+/// 间隙之间触发）。策略：继续不中断 + 如实汇总；node 失败后跳过「npm 首步」依赖
+/// （mac 的 claude/pi 走 curl 原生路径不受影响）；每项 20 分钟超时。
+pub async fn install_all_missing(mut on_evt: impl FnMut(InstallEvt) + Send) -> AllInstallOutcome {
+    let mut outcome = AllInstallOutcome::default();
+    let deps = detect_all();
+    let npm_ok = find_in_path("npm").is_some();
+    let mut ids = missing_dep_ids(&deps);
+    // node 在但 npm 不在 PATH（nvm 装法/裸二进制）→ 插入 node 步自愈（brew/winget
+    // 重装幂等）；node 缺时 missing_dep_ids 已把它放最前。
+    if !npm_ok && !ids.iter().any(|id| id == "node") {
+        ids.insert(0, "node".to_string());
+    }
+    if ids.is_empty() {
+        return outcome;
+    }
+    let total = ids.len();
+    let mut node_failed = false;
+    for (i, id) in ids.iter().enumerate() {
+        let label = deps
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.label.to_string())
+            .unwrap_or_else(|| id.clone());
+        on_evt(InstallEvt {
+            label,
+            idx: i + 1,
+            total,
+        });
+        // node 未装好 → 「npm 首步」依赖必然报「找不到 npm」，跳过而非制造失败噪音。
+        // node 恒在最前（i==0 不可能是跳过对象）。
+        if node_failed && !npm_ok && first_step_uses_npm(id) {
+            crate::log!("[deps] 一键装跳过 {id}（node/npm 未装好）");
+            outcome
+                .skipped
+                .push((id.clone(), "node/npm 未装好，跳过".to_string()));
+            continue;
+        }
+        crate::log!("[deps] 一键装 [{}/{}] {}", i + 1, total, id);
+        match tokio::time::timeout(ALL_INSTALL_DEP_TIMEOUT, run_install(id)).await {
+            Ok(Ok(_)) => outcome.ok.push(id.clone()),
+            Ok(Err(e)) => {
+                if id == "node" {
+                    node_failed = true;
+                }
+                outcome.failed.push((id.clone(), e));
+            }
+            Err(_) => {
+                if id == "node" {
+                    node_failed = true;
+                }
+                outcome.failed.push((
+                    id.clone(),
+                    "安装超时（20 分钟），可能卡在网络或系统弹窗".to_string(),
+                ));
+            }
+        }
+    }
+    outcome
+}
+
 /// 读流，只保留尾部约 800 字符（安装输出可能很长，状态行/日志只要结尾）。
 fn read_tail<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     r: Option<R>,
@@ -957,5 +1100,111 @@ mod tests {
         assert!(p.contains(".local/bin"));
         assert!(p.contains(".npm-global/bin"));
         assert!(p.contains('/'), "unix 用 / 分隔目录");
+    }
+
+    // ─── #60 一键安装纯函数 ───
+
+    fn dep(id: &'static str, found: bool) -> DepStatus {
+        DepStatus {
+            id,
+            label: id,
+            found,
+            path: String::new(),
+        }
+    }
+
+    #[test]
+    fn missing_dep_ids_order_and_empties() {
+        let all_ok = detect_all()
+            .into_iter()
+            .map(|d| dep(d.id, true))
+            .collect::<Vec<_>>();
+        assert!(missing_dep_ids(&all_ok).is_empty(), "全装 → 空清单");
+        let all_missing = detect_all()
+            .into_iter()
+            .map(|d| dep(d.id, false))
+            .collect::<Vec<_>>();
+        let ids = missing_dep_ids(&all_missing);
+        assert_eq!(ids.len(), 7, "全缺 → 7 项");
+        assert_eq!(ids[0], "node", "node 恒在最前");
+        // 部分缺保 detect 序（node 不在缺失集时不插队）
+        let partial = vec![
+            dep("claude", true),
+            dep("codex", false),
+            dep("pi", false),
+            dep("node", true),
+            dep("python3", false),
+            dep("lark-cli", true),
+            dep("dingtalk-cli", false),
+        ];
+        assert_eq!(
+            missing_dep_ids(&partial),
+            vec!["codex", "pi", "python3", "dingtalk-cli"]
+        );
+    }
+
+    #[test]
+    fn missing_dep_ids_node_first_even_mid_list() {
+        // 乱序输入里 node 缺失 → 恒提到首位，其余相对顺序稳定
+        let deps = vec![
+            dep("claude", false),
+            dep("codex", true),
+            dep("node", false),
+            dep("lark-cli", false),
+        ];
+        assert_eq!(missing_dep_ids(&deps), vec!["node", "claude", "lark-cli"]);
+    }
+
+    #[test]
+    fn first_step_uses_npm_per_platform() {
+        #[cfg(target_os = "macos")]
+        {
+            // mac：claude 首选 curl | bash（shell 步骤）→ false；codex 首选 npm → true
+            assert!(
+                !first_step_uses_npm("claude"),
+                "mac claude 走 curl 不依赖 node"
+            );
+            assert!(first_step_uses_npm("codex"), "mac codex 首选 npm");
+            assert!(!first_step_uses_npm("python3"), "mac python3 走 brew");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // win：claude/codex/pi 全 npm；python3 走 winget
+            assert!(first_step_uses_npm("claude"));
+            assert!(first_step_uses_npm("pi"));
+            assert!(!first_step_uses_npm("python3"), "win python3 走 winget");
+        }
+        // 未知 id：install_plan Err → false（不误跳过）
+        assert!(!first_step_uses_npm("no-such-dep"));
+    }
+
+    #[test]
+    fn format_all_summary_shapes() {
+        let empty = AllInstallOutcome::default();
+        assert_eq!(format_all_summary(&empty), "✅ 全部依赖均已安装");
+        let all_ok = AllInstallOutcome {
+            ok: vec!["node".into(), "claude".into()],
+            ..Default::default()
+        };
+        assert_eq!(format_all_summary(&all_ok), "一键安装完成：成功 2 项");
+        let mixed = AllInstallOutcome {
+            ok: vec!["node".into()],
+            failed: vec![("codex".into(), "找不到 npm（请先装它的前置依赖）".into())],
+            skipped: vec![("pi".into(), "node/npm 未装好，跳过".into())],
+        };
+        let s = format_all_summary(&mixed);
+        assert!(s.contains("成功 1 项"), "成功数: {s}");
+        assert!(s.contains("失败 1 项"), "失败数: {s}");
+        assert!(s.contains("codex:"), "失败项 id: {s}");
+        assert!(s.contains("跳过 1 项（pi）"), "跳过项: {s}");
+        // 尾因超 100 字截断
+        let long = AllInstallOutcome {
+            ok: vec![],
+            failed: vec![("x".into(), "长".repeat(200))],
+            skipped: vec![],
+        };
+        let s2 = format_all_summary(&long);
+        assert!(s2.contains(&"长".repeat(100)), "截断至 100 字");
+        assert!(!s2.contains(&"长".repeat(101)), "不超 100 字: {s2}");
     }
 }

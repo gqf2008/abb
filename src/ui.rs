@@ -39,6 +39,8 @@ enum UiCmd {
     },
     /// 安装某个依赖（claude/codex/node/python3/lark-cli/dingtalk-cli）。结果经 dep_rx 回主线程。
     InstallDep(String),
+    /// #60 一键安装全部缺失组件（node 前置自动装）。逐项进度/汇总经 dep_rx 回主线程。
+    InstallAllMissing,
     /// 测试某个供应商连通性（快照里 api_key 已就绪）。结果经 prov_rx 回主线程。
     TestProvider {
         idx: i32,
@@ -56,6 +58,23 @@ enum WxEvt {
     Confirmed(i32, crate::wechat::WeixinLogin),
     /// 失败/过期。
     Failed(String),
+}
+
+/// 依赖安装的结果事件（后台 → 主线程）。
+enum DepEvt {
+    /// 单项安装完成（dep_id + 结果）。
+    Done {
+        dep_id: String,
+        result: std::result::Result<String, String>,
+    },
+    /// #60 一键装：每开始一项发一次（label 为展示名，idx 1-based）。
+    AllProgress {
+        label: String,
+        idx: usize,
+        total: usize,
+    },
+    /// #60 一键装：全部结束的如实汇总。
+    AllDone(crate::deps::AllInstallOutcome),
 }
 
 /// 通道类型的中文显示名（托盘/设置窗概览行；原始 kind 值对内，展示用中文）。
@@ -639,7 +658,7 @@ pub fn run_gui() -> Result<()> {
         std_mpsc::channel::<(i32, std::result::Result<(String, String), String>)>();
     let (wx_tx, wx_rx) = std_mpsc::channel::<WxEvt>();
     // 依赖安装 / 供应商测试结果（后台 → 主线程）
-    let (dep_tx, dep_rx) = std_mpsc::channel::<(String, std::result::Result<String, String>)>();
+    let (dep_tx, dep_rx) = std_mpsc::channel::<DepEvt>();
     let (prov_tx, prov_rx) = std_mpsc::channel::<(i32, std::result::Result<String, String>)>();
 
     // ── 设置窗工作副本 + 列表 model ──
@@ -834,8 +853,27 @@ pub fn run_gui() -> Result<()> {
                         run_wx_login(idx, &bot_key, wx_tx.clone()).await;
                     }
                     UiCmd::InstallDep(dep_id) => {
-                        let r = crate::deps::run_install(&dep_id).await;
-                        let _ = dep_tx.send((dep_id, r));
+                        // #60：与一键装同款 spawn 解耦——recv 循环是单消费者串行处理所有
+                        // UiCmd，inline await 安装会把托盘 Start/Stop 阻塞数分钟。
+                        let dep_tx = dep_tx.clone();
+                        tokio::spawn(async move {
+                            let r = crate::deps::run_install(&dep_id).await;
+                            let _ = dep_tx.send(DepEvt::Done { dep_id, result: r });
+                        });
+                    }
+                    UiCmd::InstallAllMissing => {
+                        let dep_tx = dep_tx.clone();
+                        tokio::spawn(async move {
+                            let outcome = crate::deps::install_all_missing(|evt| {
+                                let _ = dep_tx.send(DepEvt::AllProgress {
+                                    label: evt.label,
+                                    idx: evt.idx,
+                                    total: evt.total,
+                                });
+                            })
+                            .await;
+                            let _ = dep_tx.send(DepEvt::AllDone(outcome));
+                        });
                     }
                     UiCmd::TestProvider { idx, snapshot } => {
                         let r = test_provider(&snapshot).await;
@@ -1413,6 +1451,9 @@ pub fn run_gui() -> Result<()> {
     {
         let tx = tx.clone();
         let sw = settings.as_weak();
+        // #60 的一键装回调也要用 tx/sw——先克隆再进第一个闭包（move 语义）
+        let sw2 = sw.clone();
+        let tx2 = tx.clone();
         settings.on_install_dep(move |dep_id| {
             if let Some(w) = sw.upgrade() {
                 if !w.get_dep_busy().is_empty() {
@@ -1423,6 +1464,27 @@ pub fn run_gui() -> Result<()> {
                 w.set_status_line(format!("⏳ 开始安装 {dep_id} …").into());
             }
             let _ = tx.send(UiCmd::InstallDep(dep_id.to_string()));
+        });
+        // #60 一键安装全部缺失组件：防连点 + 空清单提示 + 发后台任务；
+        // 逐项进度与汇总经 DepEvt 回主线程（tick 处处理）。
+        settings.on_install_all_missing(move || {
+            if let Some(w) = sw2.upgrade() {
+                if !w.get_dep_busy().is_empty() {
+                    return; // 已有安装在进行（单项或一键）
+                }
+                let missing = crate::deps::missing_dep_ids(&crate::deps::detect_all());
+                if missing.is_empty() {
+                    w.set_status_is_error(false);
+                    w.set_status_line("✅ 全部依赖均已安装".into());
+                    return;
+                }
+                w.set_dep_busy(format!("全部缺失组件（共 {} 项）", missing.len()).into());
+                w.set_status_is_error(false);
+                w.set_status_line(
+                    format!("⏳ 一键安装开始：共 {} 项，先装 Node.js…", missing.len()).into(),
+                );
+            }
+            let _ = tx2.send(UiCmd::InstallAllMissing);
         });
     }
 
@@ -1761,18 +1823,31 @@ pub fn run_gui() -> Result<()> {
                     }
                 }
                 // 依赖安装结果：清 dep-busy，刷新检测状态，报结果
-                while let Ok((dep_id, r)) = dep_rx.try_recv() {
+                while let Ok(evt) = dep_rx.try_recv() {
                     if let Some(w) = settings_weak.upgrade() {
-                        w.set_dep_busy("".into());
-                        push_deps_to_window(&w);
-                        match r {
-                            Ok(_) => {
-                                w.set_status_is_error(false);
-                                w.set_status_line(format!("✅ {dep_id} 安装完成").into());
+                        match evt {
+                            DepEvt::Done { dep_id, result } => {
+                                w.set_dep_busy("".into());
+                                push_deps_to_window(&w);
+                                match result {
+                                    Ok(_) => {
+                                        w.set_status_is_error(false);
+                                        w.set_status_line(format!("✅ {dep_id} 安装完成").into());
+                                    }
+                                    Err(e) => {
+                                        w.set_status_is_error(true);
+                                        w.set_status_line(format!("⚠️ {e}").into());
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                w.set_status_is_error(true);
-                                w.set_status_line(format!("⚠️ {e}").into());
+                            DepEvt::AllProgress { label, idx, total } => {
+                                w.set_dep_busy(format!("{label}（第 {idx}/{total} 项）").into());
+                            }
+                            DepEvt::AllDone(outcome) => {
+                                w.set_dep_busy("".into());
+                                push_deps_to_window(&w); // 重检测：卡片/横幅/首页计数自动刷新
+                                w.set_status_is_error(!outcome.failed.is_empty());
+                                w.set_status_line(crate::deps::format_all_summary(&outcome).into());
                             }
                         }
                     }
