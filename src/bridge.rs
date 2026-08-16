@@ -1630,7 +1630,10 @@ impl Bridge {
     /// 自动重放进 handle 续跑——sessions.json 已 mark_started 的会话会 resume 原上下文，
     /// 未完成的重新执行；先清理孤儿 agent 子进程避免 resume 撞 already in use。
     /// 恢复是异步任务，不阻塞事件循环启动（多 chat 并发由 per-chat 串行锁保证不乱序）。
-    pub async fn recover_pending(&self) {
+    /// 重启恢复重放。stop：关停广播后立即停止（未重放的条目留盘 pending.json，
+    /// 下次启动续跑——#69 审查 Important：恢复任务会跑完整 agent 管线，单条可达
+    /// 数分钟，不可让 shutdown_wait 无界等它）。
+    pub async fn recover_pending(&self, stop: &tokio_util::sync::CancellationToken) {
         if self.pending.is_empty() {
             return;
         }
@@ -1642,6 +1645,13 @@ impl Bridge {
         );
         crate::agent::kill_stale_agents(&self.bot.key());
         for item in items {
+            if stop.is_cancelled() {
+                crate::log!(
+                    "[bot:{}] 恢复重放被关停打断（剩余条目留盘，下次启动续跑）",
+                    self.bot.key()
+                );
+                break;
+            }
             // #51 审查跟进：/mention 是升级后新增的控制指令，实时路径在 pending.add 之前
             // 就被拦截，正常不会落盘；但升级前落盘的旧条目若文本恰为 /mention 系列，
             // 重放进 handle 会被当作开关指令静默执行——重放只续跑业务消息，控制指令跳过。
@@ -3465,7 +3475,8 @@ mod tests {
             created_at: 20,
         });
 
-        bridge.recover_pending().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_pending(&stop).await;
 
         let prompts = runner.prompts();
         assert_eq!(prompts.len(), 2, "应按入队顺序重放");
@@ -3498,9 +3509,47 @@ mod tests {
     async fn recover_pending_empty_is_noop() {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let (bridge, msgr) = build_test_bridge(runner.clone());
-        bridge.recover_pending().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_pending(&stop).await;
         assert!(runner.prompts().is_empty(), "无残留不应触发 agent");
         assert!(!msgr.sent().iter().any(|t| t.contains("正在恢复")));
+        cleanup_bridge(&bridge);
+    }
+
+    /// #69 审查 Important：关停广播后恢复重放立即停止，未重放条目留盘 pending.json
+    /// （下次启动续跑——恢复任务跑完整 agent 管线，不能让 shutdown_wait 无界等它）。
+    #[tokio::test]
+    async fn recover_pending_stops_on_cancel() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        for (i, mid) in ["r1", "r2"].iter().enumerate() {
+            bridge.pending.add(crate::pending::PendingItem {
+                mid: (*mid).into(),
+                chat_id: format!("oc_{mid}"),
+                chat_type: "group".into(),
+                thread_id: String::new(),
+                text: format!("第{i}条"),
+                quoted: crate::messenger::QuotedContent::default(),
+                attachments: Vec::new(),
+                role: crate::config::SenderRole::Owner,
+                backend_override: None,
+                gh_role: None,
+                created_at: i as u64,
+            });
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        bridge.recover_pending(&stop).await;
+        assert!(
+            runner.prompts().is_empty(),
+            "取消后不重放任何条目: {:?}",
+            runner.prompts()
+        );
+        assert_eq!(
+            bridge.pending.snapshot().len(),
+            2,
+            "未重放条目留盘，下次启动续跑"
+        );
         cleanup_bridge(&bridge);
     }
 
