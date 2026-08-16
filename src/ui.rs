@@ -64,6 +64,7 @@ fn kind_label(kind: &str) -> String {
         "feishu" => "飞书".to_string(),
         "wechat" => "微信".to_string(),
         "dingtalk" => "钉钉".to_string(),
+        "github" => "GitHub".to_string(),
         other => other.to_string(),
     }
 }
@@ -1066,6 +1067,15 @@ pub fn run_gui() -> Result<()> {
                             // kind 决定编辑区显示哪套字段（slint 的 if 条件绑 model）；
                             // 不回写 model 的话，改类型后右侧仍显示旧类型的表单（如改「钉钉」还显示微信登录框）
                             refresh = true;
+                            // #64：切出 github kind 时清空 gh 字段——防残留 token 在下次
+                            // 启动被迁移再拆出一个幽灵 github bot
+                            if bot.kind != "github" {
+                                bot.gh_token.clear();
+                                bot.gh_repos.clear();
+                                bot.gh_notify_chat.clear();
+                                bot.gh_username.clear();
+                                bot.gh_mention_map.clear();
+                            }
                         }
                         "backend" => {
                             bot.backend = value.to_string();

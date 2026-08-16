@@ -815,7 +815,7 @@ export component SettingsWindow inherits Window {
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "类型"; width: 80px; vertical-alignment: center; }
                                                     ComboBox {
-                                                        model: ["feishu", "wechat", "dingtalk"];
+                                                        model: ["feishu", "wechat", "dingtalk", "github"];
                                                         current-value: root.bots[root.selected].kind;
                                                         horizontal-stretch: 1;
                                                         selected => { root.bot-field-edited(root.selected, "kind", self.current-value); }
@@ -1147,7 +1147,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 // ── GitHub 能力（附挂在任意 bot 上，非独立类型）──
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
                                                     Text { text: "GitHub Token"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].gh-token;
@@ -1157,7 +1157,7 @@ export component SettingsWindow inherits Window {
                                                         edited => { root.bot-field-edited(root.selected, "gh_token", self.text); }
                                                     }
                                                 }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
                                                     Text { text: "仓库白名单"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].gh-repos;
@@ -1166,16 +1166,16 @@ export component SettingsWindow inherits Window {
                                                         edited => { root.bot-field-edited(root.selected, "gh_repos", self.text); }
                                                     }
                                                 }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
                                                     Text { text: "通知群"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].gh-notify-chat;
-                                                        placeholder-text: "新 issue 通知的群/私聊 chat_id";
+                                                        placeholder-text: "bot_key:chat_id（跨 bot 通知目标，如 mybot:oc_xxx）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "gh_notify_chat", self.text); }
                                                     }
                                                 }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
                                                     Text { text: "GitHub 用户名"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].gh-username;
@@ -1184,11 +1184,11 @@ export component SettingsWindow inherits Window {
                                                         edited => { root.bot-field-edited(root.selected, "gh_username", self.text); }
                                                     }
                                                 }
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
                                                     Text { text: "提及映射"; width: 80px; vertical-alignment: center; }
                                                     LineEdit {
                                                         text: root.bots[root.selected].gh-mention-map;
-                                                        placeholder-text: "login:chat_id，逗号分隔（issue 评论 @提及 私信通知目标）";
+                                                        placeholder-text: "login:bot_key:chat_id，逗号分隔（评论 @提及 私信通知目标）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "gh_mention_map", self.text); }
                                                     }

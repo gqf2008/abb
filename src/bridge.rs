@@ -55,6 +55,17 @@ pub struct Bridge {
     /// GitHub API（仿 agent_runner 的 trait 注入）：生产 = GithubClient（用 bot.gh_token），
     /// 测试 = MockGithub 挡板。handle 的 github 指令门与双写、watch 循环都走它。
     pub(crate) github_client: Arc<dyn crate::github::GithubApi>,
+    /// #64 渠道化：启动时的全量配置快照——指令门多账号路由用（找 kind=github 且白名单
+    /// 命中仓库的 bot）；config 热读优先、读失败回落本快照（与 access_and_role 同款）。
+    config_snapshot: Config,
+    /// #64 按账号缓存的 GithubClient（key="{bot_key}:{token}"，token 换值即时换 client）。
+    gh_clients: Mutex<HashMap<String, Arc<dyn crate::github::GithubApi>>>,
+}
+
+/// #64 指令门解析出的 GitHub 账号：配置 + 对应 API client。
+struct GhAccount {
+    bot: BotConfig,
+    client: Arc<dyn crate::github::GithubApi>,
 }
 
 #[derive(Debug)]
@@ -89,10 +100,28 @@ impl Ev {
     }
 }
 
+/// 指令涉及仓库的 full 形态（路由解析用）。Create 类缺省仓库时可能为空串。
+fn gh_cmd_repo(cmd: &crate::github::GhCmd) -> String {
+    match cmd {
+        crate::github::GhCmd::Analyze { owner, repo, .. }
+        | crate::github::GhCmd::Close { owner, repo, .. }
+        | crate::github::GhCmd::ConfirmClose { owner, repo, .. } => format!("{owner}/{repo}"),
+        crate::github::GhCmd::Create { owner, repo, .. }
+        | crate::github::GhCmd::ConfirmCreate { owner, repo, .. } => {
+            if repo.is_empty() {
+                String::new()
+            } else {
+                format!("{owner}/{repo}")
+            }
+        }
+    }
+}
+
 /// 一条 github 指令的处理结果。
 enum GhOutcome {
-    /// 注入 prompt 继续走 agent（最终回复双写）。
-    Analyze(crate::github::GhContext),
+    /// 注入 prompt 继续走 agent（最终回复双写）。client 随 ctx 携带，双写处不再重解析
+    /// （防 TOCTOU：解析与双写之间账号表变更）。
+    Analyze(crate::github::GhContext, Arc<dyn crate::github::GithubApi>),
     /// 直接 API 指令已完成并回复 → 调用方 return。
     Consumed,
     /// 白名单拒绝/参数不足，已带原因 → 调用方回复后 return。
@@ -142,6 +171,8 @@ impl Bridge {
             pending: PendingStore::new(&key),
             agent_runner,
             github_client,
+            config_snapshot: cfg.clone(),
+            gh_clients: Mutex::new(HashMap::new()),
         }
     }
 
@@ -344,11 +375,15 @@ impl Bridge {
 
     /// 解析建 issue 指令的缺省仓库：显式 owner/repo 直接用；未带仓库 → 白名单恰好
     /// 一项时用它（通配项 o/* 不是具体仓库，拒绝）；多项/空 → 明确拒绝（防猜错仓库）。
-    fn resolve_create_repo(&self, owner: &str, repo: &str) -> Result<(String, String), String> {
+    fn resolve_create_repo(
+        bot: &BotConfig,
+        owner: &str,
+        repo: &str,
+    ) -> Result<(String, String), String> {
         if !repo.is_empty() {
             return Ok((owner.to_string(), repo.to_string()));
         }
-        let list = self.bot.gh_repo_list();
+        let list = bot.gh_repo_list();
         if list.len() == 1 {
             let (o, r) = list[0].split_once('/').unwrap_or(("", list[0].as_str()));
             if r == "*" {
@@ -367,29 +402,117 @@ impl Bridge {
     /// 写操作的白名单前置闸（评审 S1）：空白名单 = 全部放行只适用于**读**（分析）；
     /// 写操作（关闭/建）在未配置白名单时直接拒绝——token 授权范围可能覆盖用户所有
     /// 仓库，空名单放行写操作等于群里任何能 @bot 的人可对任意授权仓库做写操作。
-    fn gh_write_guard(&self, action: &str) -> Option<String> {
-        if self.bot.gh_repo_list().is_empty() {
+    fn gh_write_guard(bot: &BotConfig, action: &str) -> Option<String> {
+        if bot.gh_repo_list().is_empty() {
             Some(format!(
-                "❌ 未配置仓库白名单，{action}已禁用。请先在设置窗「GitHub 能力 → 仓库白名单」配置。"
+                "❌ 未配置仓库白名单，{action}已禁用。请在对应 GitHub bot 的「仓库白名单」配置。"
             ))
         } else {
             None
         }
     }
 
-    /// 执行一条 github 指令。白名单在每个动作前强制校验（写操作无一绕过）。
-    async fn handle_github_cmd(&self, ev: &Ev, cmd: crate::github::GhCmd) -> GhOutcome {
+    /// #64 指令门账号解析：本 bot 路径（github kind 本体 / 未迁移旧式 / 测试注入）优先；
+    /// 否则全局找 kind=github && enabled && token 非空 && 白名单命中的 bot（config 热读
+    /// 优先、失败回落启动快照；多命中取配置顺序第一个 + log）。None = 无账号放行该仓库。
+    fn resolve_github(&self, repo: &str) -> Option<GhAccount> {
+        if self.bot.is_github_capable() && self.bot.gh_allows_repo(repo) {
+            return Some(GhAccount {
+                bot: self.bot.clone(),
+                client: self.github_client.clone(),
+            });
+        }
+        let cfg = crate::config::Config::load().unwrap_or_else(|_| self.config_snapshot.clone());
+        let hits: Vec<&BotConfig> = cfg
+            .bots
+            .iter()
+            .filter(|b| {
+                b.is_github_kind() && b.enabled && !b.gh_token.is_empty() && b.gh_allows_repo(repo)
+            })
+            .collect();
+        let bot = (*hits.first()?).clone();
+        if hits.len() > 1 {
+            crate::log!(
+                "[bridge] 仓库 {repo} 被 {} 个 github bot 白名单命中，按配置顺序取「{}」",
+                hits.len(),
+                bot.key()
+            );
+        }
+        Some(GhAccount {
+            client: self.gh_client_for(&bot.key(), &bot.gh_token),
+            bot,
+        })
+    }
+
+    /// 按账号缓存 GithubClient（key 含 token，换值即时换 client）。
+    fn gh_client_for(&self, bot_key: &str, token: &str) -> Arc<dyn crate::github::GithubApi> {
+        let key = format!("{bot_key}:{token}");
+        let mut m = self.gh_clients.lock().unwrap();
+        m.entry(key)
+            .or_insert_with(|| Arc::new(crate::github::GithubClient::new(token)))
+            .clone()
+    }
+
+    /// 缺省仓库的创建指令：候选账号（本 bot + 全局 github bot，按 key 去重）恰一个时
+    /// 自动推断；零个/多个 → None（调用方按「多账号歧义」拒绝）。
+    fn resolve_single_github_account(&self) -> Option<GhAccount> {
+        let mut cands: Vec<GhAccount> = Vec::new();
+        if self.bot.is_github_capable() {
+            cands.push(GhAccount {
+                bot: self.bot.clone(),
+                client: self.github_client.clone(),
+            });
+        }
+        let cfg = crate::config::Config::load().unwrap_or_else(|_| self.config_snapshot.clone());
+        for b in cfg.bots.iter() {
+            if b.is_github_kind()
+                && b.enabled
+                && !b.gh_token.is_empty()
+                && !cands.iter().any(|c| c.bot.key() == b.key())
+            {
+                cands.push(GhAccount {
+                    client: self.gh_client_for(&b.key(), &b.gh_token),
+                    bot: b.clone(),
+                });
+            }
+        }
+        match cands.len() {
+            1 => cands.pop(),
+            0 => None,
+            n => {
+                crate::log!("[bridge] 创建指令缺仓库且存在 {n} 个 GitHub 账号，拒绝自动推断");
+                None
+            }
+        }
+    }
+
+    /// 是否存在 kind=github 的账号体系（config 热读 + 快照回落；判定指令门是否启用）。
+    fn has_github_account_bots(&self) -> bool {
+        let cfg = crate::config::Config::load().unwrap_or_else(|_| self.config_snapshot.clone());
+        cfg.bots
+            .iter()
+            .any(|b| b.is_github_kind() && b.enabled && !b.gh_token.is_empty())
+    }
+
+    /// 执行一条 github 指令（#64：按 acc 指定的账号执行）。白名单在每个动作前强制校验
+    /// （写操作无一绕过）。
+    async fn handle_github_cmd(
+        &self,
+        ev: &Ev,
+        cmd: crate::github::GhCmd,
+        acc: &GhAccount,
+    ) -> GhOutcome {
         match cmd {
             crate::github::GhCmd::ConfirmClose {
                 owner,
                 repo,
                 number,
             } => {
-                if let Some(msg) = self.gh_write_guard("关闭") {
+                if let Some(msg) = Self::gh_write_guard(&acc.bot, "关闭") {
                     return GhOutcome::Rejected(msg);
                 }
                 let repo_full = format!("{owner}/{repo}");
-                if !self.bot.gh_allows_repo(&repo_full) {
+                if !acc.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!(
                         "❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"
                     ));
@@ -411,16 +534,16 @@ impl Bridge {
                 repo,
                 number,
             } => {
-                if let Some(msg) = self.gh_write_guard("关闭") {
+                if let Some(msg) = Self::gh_write_guard(&acc.bot, "关闭") {
                     return GhOutcome::Rejected(msg);
                 }
                 let repo_full = format!("{owner}/{repo}");
-                if !self.bot.gh_allows_repo(&repo_full) {
+                if !acc.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!(
                         "❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"
                     ));
                 }
-                match self.github_client.close_issue(&owner, &repo, number).await {
+                match acc.client.close_issue(&owner, &repo, number).await {
                     Ok(()) => {
                         crate::log!("[bridge] 已关闭 {owner}/{repo}#{number}");
                         let _ = self
@@ -436,17 +559,17 @@ impl Bridge {
                 }
             }
             crate::github::GhCmd::ConfirmCreate { owner, repo, title } => {
-                if let Some(msg) = self.gh_write_guard("创建 issue") {
+                if let Some(msg) = Self::gh_write_guard(&acc.bot, "创建 issue") {
                     return GhOutcome::Rejected(msg);
                 }
                 // 创建是公开写操作：先预览（仓库 + 标题），用户回复「确认建 issue <标题>」才执行。
                 // 解析缺省仓库与 Create 同逻辑（单项白名单/显式 owner/repo）。
-                let (owner, repo) = match self.resolve_create_repo(&owner, &repo) {
+                let (owner, repo) = match Self::resolve_create_repo(&acc.bot, &owner, &repo) {
                     Ok(v) => v,
                     Err(msg) => return GhOutcome::Rejected(msg),
                 };
                 let repo_full = format!("{owner}/{repo}");
-                if !self.bot.gh_allows_repo(&repo_full) {
+                if !acc.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!(
                         "❌ 仓库 {repo_full} 不在白名单内，已拒绝创建。"
                     ));
@@ -465,20 +588,20 @@ impl Bridge {
             }
 
             crate::github::GhCmd::Create { owner, repo, title } => {
-                if let Some(msg) = self.gh_write_guard("创建 issue") {
+                if let Some(msg) = Self::gh_write_guard(&acc.bot, "创建 issue") {
                     return GhOutcome::Rejected(msg);
                 }
-                let (owner, repo) = match self.resolve_create_repo(&owner, &repo) {
+                let (owner, repo) = match Self::resolve_create_repo(&acc.bot, &owner, &repo) {
                     Ok(v) => v,
                     Err(msg) => return GhOutcome::Rejected(msg),
                 };
                 let repo_full = format!("{owner}/{repo}");
-                if !self.bot.gh_allows_repo(&repo_full) {
+                if !acc.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!(
                         "❌ 仓库 {repo_full} 不在白名单内，已拒绝创建。"
                     ));
                 }
-                match self.github_client.create_issue(&owner, &repo, &title).await {
+                match acc.client.create_issue(&owner, &repo, &title).await {
                     Ok(url) => {
                         crate::log!(
                             "[bridge] 已创建 {owner}/{repo} issue「{}」",
@@ -500,15 +623,15 @@ impl Bridge {
                 number,
             } => {
                 let repo_full = format!("{owner}/{repo}");
-                if !self.bot.gh_allows_repo(&repo_full) {
+                if !acc.bot.gh_allows_repo(&repo_full) {
                     return GhOutcome::Rejected(format!(
                         "❌ 仓库 {repo_full} 不在白名单内，已拒绝分析。"
                     ));
                 }
                 // 并行拉 issue 详情 + 评论（独立请求，一次往返）
                 let (issue, comments) = match tokio::try_join!(
-                    self.github_client.fetch_issue(&owner, &repo, number),
-                    self.github_client.list_comments(&owner, &repo, number),
+                    acc.client.fetch_issue(&owner, &repo, number),
+                    acc.client.list_comments(&owner, &repo, number),
                 ) {
                     Ok(v) => v,
                     Err(e) => {
@@ -523,9 +646,10 @@ impl Bridge {
                     "[bridge] 分析指令 {owner}/{repo}#{number} 评论 {} 条",
                     comments.len()
                 );
-                GhOutcome::Analyze(crate::github::GhContext::new(
-                    owner, repo, number, issue, comments,
-                ))
+                GhOutcome::Analyze(
+                    crate::github::GhContext::new(owner, repo, number, issue, comments),
+                    acc.client.clone(),
+                )
             }
         }
     }
@@ -959,17 +1083,49 @@ impl Bridge {
         // Consumed/Rejected 分支调用 pending.remove 是**无操作兜底**：实时路径上这些
         // 分支在 pending.add 之前就 return 了；但 pending 重放（#25）时条目已存在——
         // 若重放时 fetch 瞬失败（限流/网络）导致 Consumed，不摘除会每次重启都重放刷屏。
-        let mut gh_ctx: Option<crate::github::GhContext> = None;
-        if self.bot.is_github_capable() {
+        let mut gh_ctx: Option<(crate::github::GhContext, Arc<dyn crate::github::GithubApi>)> =
+            None;
+        // #64 渠道化：本 bot（github kind 本体 / 未迁移旧式配置 / 测试注入）或全局
+        // kind=github 账号体系存在时才进指令门；完全无 github 配置的 IM bot 指令照旧
+        // 透传 agent（零回归）。
+        if self.bot.is_github_capable() || self.has_github_account_bots() {
             if let Some(cmd) = crate::github::parse_github_cmd(&text) {
-                match self.handle_github_cmd(&ev, cmd).await {
-                    GhOutcome::Analyze(ctx) => gh_ctx = Some(ctx),
-                    GhOutcome::Consumed => {
-                        self.pending.remove(&ev.mid);
-                        return;
+                let repo_full = gh_cmd_repo(&cmd);
+                // 缺省仓库的创建指令（repo 为空）无法按仓库路由：单账号时自动推断，
+                // 多账号歧义时拒绝（要求显式仓库）——否则永远路由不到账号
+                let account = match &cmd {
+                    crate::github::GhCmd::Create { repo, .. }
+                    | crate::github::GhCmd::ConfirmCreate { repo, .. }
+                        if repo.is_empty() =>
+                    {
+                        self.resolve_single_github_account()
                     }
-                    GhOutcome::Rejected(msg) => {
+                    _ => self.resolve_github(&repo_full),
+                };
+                match account {
+                    Some(acc) => match self.handle_github_cmd(&ev, cmd, &acc).await {
+                        GhOutcome::Analyze(ctx, client) => gh_ctx = Some((ctx, client)),
+                        GhOutcome::Consumed => {
+                            self.pending.remove(&ev.mid);
+                            return;
+                        }
+                        GhOutcome::Rejected(msg) => {
+                            self.pending.remove(&ev.mid);
+                            let _ = self.send_reply(&ev, &msg).await;
+                            return;
+                        }
+                    },
+                    None => {
+                        // 有账号体系但无一放行：仓库不在白名单 → 明确拒绝；
+                        // 创建指令缺仓库且多账号歧义 → 要求显式仓库。
                         self.pending.remove(&ev.mid);
+                        let msg = if repo_full.is_empty() {
+                            "❌ 创建 issue 请带上仓库：`建 issue owner/repo 标题`（存在多个 GitHub 账号，不能自动推断）。".to_string()
+                        } else {
+                            format!(
+                                "❌ 仓库 {repo_full} 不在白名单内（无任何 GitHub bot 放行），已拒绝。"
+                            )
+                        };
                         let _ = self.send_reply(&ev, &msg).await;
                         return;
                     }
@@ -1039,7 +1195,7 @@ impl Bridge {
             }
         }
         // GitHub 分析指令：issue 内容注入 prompt（原始链接已在 [链接] 段，这里带实际内容）
-        if let Some(ctx) = &gh_ctx {
+        if let Some((ctx, _client)) = &gh_ctx {
             prompt.push_str("\n\n[GitHub Issue]");
             prompt.push('\n');
             prompt.push_str(&ctx.render);
@@ -1276,12 +1432,11 @@ impl Bridge {
                 // 避免超长分析刷屏，完整内容去 issue 页看。
                 // 注：pending 重放是 at-least-once——崩溃窗口可能重跑并双发评论（与既有
                 // pending 恢复语义一致，接受）。
-                if let Some(ctx) = &gh_ctx {
+                if let Some((ctx, client)) = &gh_ctx {
                     let full = format!("[agent-bridge 分析结果]\n\n{reply}");
                     // 留档成败要如实反映到回执：失败时摘要明说「未留档」，不能假装成功。
                     let mut archived = true;
-                    match self
-                        .github_client
+                    match client
                         .post_comment(&ctx.owner, &ctx.repo, ctx.number, &full)
                         .await
                     {
