@@ -747,7 +747,9 @@ impl Config {
     }
 
     /// #64：旧裸 chat_id → "{botkey}:{chat_id}"（RoutedMessenger 跨 bot 目标格式）；
-    /// 已含 ':' 视为已是 bot:chat 形态原样返回；空 → 空。
+    /// 已含 ':' 视为已是 bot:chat 形态原样返回；空 → 空。contains(':') 判定的取舍：
+    /// 三通道 chat_id 均不含冒号（审查核实），含冒号大概率是已迁移/手填的新格式。
+    /// cursor best-effort 迁移与 worker 表归批次 B。
     fn rewrite_gh_notify(raw: &str, bot_key: &str) -> String {
         let v = raw.trim();
         if v.is_empty() || v.contains(':') {

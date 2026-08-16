@@ -427,7 +427,11 @@ impl Bridge {
             .bots
             .iter()
             .filter(|b| {
-                b.is_github_kind() && b.enabled && !b.gh_token.is_empty() && b.gh_allows_repo(repo)
+                b.is_github_kind()
+                    && b.enabled
+                    && !b.gh_token.is_empty()
+                    && !b.name.is_empty() // 与 credentials_ready 一致（空名 bot 服务侧已跳过）
+                    && b.gh_allows_repo(repo)
             })
             .collect();
         let bot = (*hits.first()?).clone();
@@ -468,6 +472,7 @@ impl Bridge {
             if b.is_github_kind()
                 && b.enabled
                 && !b.gh_token.is_empty()
+                && !b.name.is_empty()
                 && !cands.iter().any(|c| c.bot.key() == b.key())
             {
                 cands.push(GhAccount {

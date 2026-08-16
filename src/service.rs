@@ -279,7 +279,10 @@ async fn run_bot(
 
     // #64 GitHub watch 循环（kind=github 渠道 bot 的核心循环）：
     // 新 issue 只通知、不自动处理；通知经 RoutedMessenger 跨 bot 转发。
-    if bot.is_github_kind() && bot.is_github_capable() {
+    // 审查 Important：同名冲突跳过迁移时 IM bot 的 gh_token 保留——watch 不能静默停
+    //（新 issue 通知/@提及/@bot 自动处理都靠它）。用 is_github_capable（token 非空）：
+    // kind=github 或未迁移成功的附挂 bot 都覆盖；迁移成功清 token 后自然不跑。
+    if bot.is_github_capable() {
         let bot = bot.clone();
         let bridge = bridge.clone();
         let key = key.clone();
