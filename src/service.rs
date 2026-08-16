@@ -452,6 +452,7 @@ pub(crate) async fn process_comment_batch(
     repo: &str,
     owner: &str,
     notify_chat: &str,
+    workers: &[crate::config::GhWorker],
 ) -> CommentBatch {
     let mut out = CommentBatch {
         seen_extra: Vec::new(),
@@ -493,8 +494,11 @@ pub(crate) async fn process_comment_batch(
         // 2) @bot 自动处理触发（护栏 b：作者回声 + 词位已由 should_auto_process 把关）。
         //    仅配置提及映射（不配通知群）时：合成 Ev 的 chat_id 会为空 → handle 直接丢弃，
         //    触发将永久丢失且无痕迹（评审 I1）——此时不收集触发，日志说明。
+        // #64 批次 B：@bot 触发 或 关键词 worker 命中（均要求 collaborator 护栏与
+        // notify_chat 非空；关键词 worker 无需 @bot）
+        let kw_hit = !crate::github::match_workers(workers, repo, &c.body, false).is_empty();
         if !notify_chat.is_empty()
-            && crate::github::should_auto_process(&c.body, &c.user.login, bot_login)
+            && (crate::github::should_auto_process(&c.body, &c.user.login, bot_login) || kw_hit)
         {
             match crate::github::comment_issue_ref(c) {
                 // 批次 2.3：PR 评论同样触发（合成 text 仍用 issues 形态——parse_github_cmd
@@ -506,7 +510,7 @@ pub(crate) async fn process_comment_batch(
                         comment_id: c.id,
                         body: c.body.clone(),
                         repo: repo.to_string(),
-                        bot_triggered: true,
+                        bot_triggered: crate::github::should_auto_process(&c.body, &c.user.login, bot_login),
                     }),
                         Ok(Some(false)) => crate::log!(
                             "[github] 跳过 @bot 触发（{repo} 非协作者 @{}）",
@@ -731,6 +735,7 @@ async fn github_watch_loop(
                             &repo,
                             &owner,
                             &notify_chat,
+                            &bot.gh_workers,
                         )
                         .await;
                         // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。

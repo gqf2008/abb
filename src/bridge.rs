@@ -4938,6 +4938,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         // 私信目标断言：@alice 的评论 1 与 5（代码块内不算，但块后真提及算）发到 oc_alice；
@@ -4968,6 +4969,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         assert!(batch.seen_extra.is_empty());
@@ -5009,6 +5011,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         assert_eq!(batch.seen_extra, vec![2], "成功评论进 seen");
@@ -5058,6 +5061,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         assert_eq!(
@@ -5084,6 +5088,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         assert!(batch2.triggers.is_empty(), "非协作者不触发");
@@ -5118,6 +5123,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         assert!(batch.triggers.is_empty());
@@ -5249,6 +5255,7 @@ https://b.com/y"
             "o/r",
             "o",
             "", // notify_chat 空 = 仅映射配置
+            &[],
         )
         .await;
         assert!(batch.triggers.is_empty(), "无通知群不收集触发");
@@ -5283,6 +5290,7 @@ https://b.com/y"
             "o/r",
             "o",
             "oc_gh",
+            &[],
         )
         .await;
         assert!(batch.triggers.is_empty());

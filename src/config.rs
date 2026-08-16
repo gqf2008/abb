@@ -396,8 +396,10 @@ impl BotConfig {
     }
 
     /// 仓库是否放行（空白名单 = 全部放行，见 github::repo_in_whitelist）。
+    /// #64 批次 B：用 gh_repo_list()（worker 表推导，旧 gh_repos 回落）——迁移清空
+    /// gh_repos 后闸门必须以 worker 表为准，否则空白名单语义会把放行变成全放行（审查 C1）。
     pub fn gh_allows_repo(&self, repo: &str) -> bool {
-        crate::github::repo_in_whitelist(repo, &self.gh_repos)
+        crate::github::repo_in_whitelist(repo, &self.gh_repo_list().join(","))
     }
 
     /// @提及映射解析（login:chat_id 对，见 github::parse_mention_map）。
@@ -1304,6 +1306,21 @@ mod tests {
         assert_eq!(
             c.bots[0].gh_repo_list(),
             vec!["o/r".to_string(), "p/*".to_string()]
+        );
+    }
+
+    #[test]
+    fn migrate_gh_workers_keeps_whitelist_gate() {
+        // 审查 C1：迁移清空 gh_repos 后，gh_allows_repo 必须以 worker 表为准
+        let mut c = Config::default();
+        let mut b = gh_bot("gh", "github", "ghp_x", "claude");
+        b.gh_repos = "o/r".into();
+        c.bots.push(b);
+        assert!(c.migrate_gh_workers());
+        assert!(c.bots[0].gh_allows_repo("o/r"), "白名单内放行");
+        assert!(
+            !c.bots[0].gh_allows_repo("evil/x"),
+            "迁移后白名单外必须仍被拦（空白 gh_repos 不得变成全放行）"
         );
     }
 

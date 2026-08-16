@@ -1142,22 +1142,34 @@ pub fn match_workers<'a>(
     comment_body: &str,
     bot_triggered: bool,
 ) -> Vec<(usize, &'a crate::config::GhWorker)> {
-    workers
+    let lower = comment_body.to_lowercase();
+    let in_repo: Vec<(usize, &'a crate::config::GhWorker)> = workers
         .iter()
         .enumerate()
+        .filter(|(_, w)| repo_matches(&w.repo, repo_full))
+        .collect();
+    // 关键词 worker 优先（精确分派）；@bot 评论仅当**无任何关键词命中**时才落到默认 worker
+    let kw: Vec<(usize, &'a crate::config::GhWorker)> = in_repo
+        .iter()
         .filter(|(_, w)| {
-            if !repo_matches(&w.repo, repo_full) {
-                return false;
-            }
-            if w.triggers.trim().is_empty() {
-                return bot_triggered;
-            }
-            w.triggers.split([',', ';']).any(|t| {
-                let t = t.trim();
-                !t.is_empty() && comment_body.contains(t)
-            })
+            !w.triggers.trim().is_empty()
+                && w.triggers.split([',', ';']).any(|t| {
+                    let t = t.trim();
+                    !t.is_empty() && lower.contains(&t.to_lowercase())
+                })
         })
-        .collect()
+        .cloned()
+        .collect();
+    if !kw.is_empty() {
+        return kw;
+    }
+    if bot_triggered {
+        return in_repo
+            .into_iter()
+            .filter(|(_, w)| w.triggers.trim().is_empty())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// worker 仓库匹配：owner/* → 前缀匹配；具体 owner/repo → 忽略大小写全等。
@@ -1209,9 +1221,14 @@ mod workers_tests {
         let hits2 = match_workers(&ws, "o/r", "麻烦审查一下这个改动", false);
         assert_eq!(hits2.len(), 1);
         assert_eq!(hits2[0].0, 1);
-        // @bot + 关键词同时 → 两个都响应
+        // @bot + 关键词同时 → 关键词 worker 优先（默认 worker 不响应，防双发）
         let hits3 = match_workers(&ws, "o/r", "请审查", true);
-        assert_eq!(hits3.len(), 2);
+        assert_eq!(hits3.len(), 1);
+        assert_eq!(hits3[0].0, 1);
+        // 关键词大小写不敏感（M2）
+        let hits4 = match_workers(&ws, "o/r", "REVIEW THIS", false);
+        assert_eq!(hits4.len(), 1);
+        assert_eq!(hits4[0].0, 1);
         // 仓库不匹配永不响应
         assert!(match_workers(&ws, "x/y", "请审查", true).is_empty());
         // 空 worker 表 → 空
