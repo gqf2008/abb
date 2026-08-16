@@ -80,6 +80,14 @@ export struct OptionRow {
 }
 
 // 单个 bot 行的数据（与 Rust 侧 BotRow 对应）
+// #64 批次 B：仓库级 worker 行（github bot 的 worker 角色表）
+export struct GhWorkerRow {
+    repo: string,       // owner/repo 或 owner/*
+    backend: string,    // claude/codex/pi（覆盖 bot 默认后端）
+    role: string,       // 角色名（双写署名 + prompt 身份）
+    triggers: string,   // 触发关键词（逗号分隔；空 = @bot 默认触发）
+}
+
 export struct BotRow {
     name: string,        // 显示名
     kind: string,        // feishu | wechat | dingtalk
@@ -104,6 +112,7 @@ export struct BotRow {
     gh-notify-chat: string, // 新 issue 通知目标会话（该 bot 自己的群/私聊 chat_id）
     gh-username: string,    // 自己的 GitHub login：新 issue 通知过滤「自问自答」回声
     gh-mention-map: string, // @提及映射：login:chat_id 对（评论 @提及 私信通知目标）
+    gh-workers: [GhWorkerRow], // #64 批次 B：仓库级 worker 角色表
     restrict-granted: bool, // 授权者 agent 会话隔离（true=受限模式，安全默认；false=与 owner 同权限）
 }
 
@@ -455,6 +464,9 @@ export component SettingsWindow inherits Window {
     callback request-perms();           // 触发屏幕录制/摄像头/麦克风授权弹框（拉起子进程逐项请求）
     callback restart-service-request(); // 环境页授权后一键重启服务（权限对运行中进程不实时刷新）
     callback relaunch-as-admin();       // Windows：以管理员身份重启（弹 UAC）
+    callback gh-worker-edit(int, string, string); // #64 批次 B：worker 行字段编辑（idx/字段名/值）
+    callback gh-worker-add();            // #64 批次 B：添加 worker（空行）
+    callback gh-worker-del(int);         // #64 批次 B：删除 worker
 
     // 供应商编辑（同样 per-field 回写纪律，禁止整行回写）
     callback provider-field-edited(int, string, string); // idx, field(name/kind/base_url/api_key/model), value
@@ -1192,6 +1204,52 @@ export component SettingsWindow inherits Window {
                                                         placeholder-text: "login:bot_key:chat_id，逗号分隔（评论 @提及 私信通知目标）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "gh_mention_map", self.text); }
+                                                    }
+                                                }
+                                                // #64 批次 B：仓库级 worker 角色表（账号是账号、仓库是仓库、worker 跟着仓库走）
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
+                                                    Text { text: "仓库 worker"; width: 80px; font-size: 11px; color: #888; vertical-alignment: center; }
+                                                    VerticalBox {
+                                                        horizontal-stretch: 1;
+                                                        spacing: 4px;
+                                                        for w[i] in root.bots[root.selected].gh-workers: Rectangle {
+                                                            height: 32px;
+                                                            HorizontalBox {
+                                                                spacing: 4px;
+                                                                LineEdit {
+                                                                    text: w.repo;
+                                                                    placeholder-text: "owner/repo 或 owner/*";
+                                                                    width: 130px;
+                                                                    edited => { root.gh-worker-edit(i, "repo", self.text); }
+                                                                }
+                                                                ComboBox {
+                                                                    model: ["claude", "codex", "pi"];
+                                                                    current-value: w.backend;
+                                                                    selected => { root.gh-worker-edit(i, "backend", self.current-value); }
+                                                                }
+                                                                LineEdit {
+                                                                    text: w.role;
+                                                                    placeholder-text: "角色名";
+                                                                    width: 90px;
+                                                                    edited => { root.gh-worker-edit(i, "role", self.text); }
+                                                                }
+                                                                LineEdit {
+                                                                    text: w.triggers;
+                                                                    placeholder-text: "触发词（空=@bot）";
+                                                                    horizontal-stretch: 1;
+                                                                    edited => { root.gh-worker-edit(i, "triggers", self.text); }
+                                                                }
+                                                                Button {
+                                                                    text: "删";
+                                                                    clicked => { root.gh-worker-del(i); }
+                                                                }
+                                                            }
+                                                        }
+                                                        Button {
+                                                            text: "＋ 添加 worker（角色）";
+                                                            horizontal-stretch: 1;
+                                                            clicked => { root.gh-worker-add(); }
+                                                        }
                                                     }
                                                 }
                                             }

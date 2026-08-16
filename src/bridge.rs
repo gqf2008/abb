@@ -85,6 +85,10 @@ pub struct Ev {
     /// 发送者角色（owner=全权限 / granted=受限）：入口准入闸推导，agent 调用处
     /// 按此选受限分支；pending 重放路径从 PendingItem.role 恢复。
     pub role: crate::config::SenderRole,
+    /// #64 批次 B：worker 触发的后端覆盖（None = bot 默认后端）。
+    pub backend_override: Option<String>,
+    /// #64 批次 B：worker 角色名（双写署名与 prompt 身份）。
+    pub gh_role: Option<String>,
 }
 
 impl Ev {
@@ -852,6 +856,8 @@ impl Bridge {
             text,
             attachments,
             role: sender_role,
+            backend_override: None,
+            gh_role: None,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
             crate::log!(
@@ -1150,12 +1156,19 @@ impl Bridge {
             quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
             role: ev.role, // 落盘角色：重启重放时按原角色走受限/全权限分支
+            backend_override: ev.backend_override.clone(),
+            gh_role: ev.gh_role.clone(),
             created_at: crate::chrono_lite::unix_secs(),
         });
 
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
         // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
-        let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
+        // #64 批次 B：worker 触发的合成 Ev 带 backend_override（worker.backend 覆盖
+        // bot 默认）；否则回落 bot 生效后端。
+        let backend = match &ev.backend_override {
+            Some(b) if !b.trim().is_empty() => Backend::parse(b),
+            _ => Backend::parse(self.bot.effective_backend(&self.default_backend)),
+        };
         // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
         // 附件元数据行带路径/mime/sha256，agent 可直接读取工作区文件内容。
         let has_text = !text.is_empty();
@@ -1438,7 +1451,13 @@ impl Bridge {
                 // 注：pending 重放是 at-least-once——崩溃窗口可能重跑并双发评论（与既有
                 // pending 恢复语义一致，接受）。
                 if let Some((ctx, client)) = &gh_ctx {
-                    let full = format!("[agent-bridge 分析结果]\n\n{reply}");
+                    // #64 批次 B：worker 触发带角色名 → 评论署名；IM 指令（无角色）用原署名
+                    let full = match &ev.gh_role {
+                        Some(role) if !role.trim().is_empty() => {
+                            format!("[agent-bridge · {role} 分析结果]\n\n{reply}")
+                        }
+                        _ => format!("[agent-bridge 分析结果]\n\n{reply}"),
+                    };
                     // 留档成败要如实反映到回执：失败时摘要明说「未留档」，不能假装成功。
                     let mut archived = true;
                     match client
@@ -1586,6 +1605,8 @@ impl Bridge {
                 text: item.text,
                 attachments: item.attachments,
                 role: item.role, // 重放按原角色走受限/全权限分支（PendingItem 落盘字段）
+                backend_override: item.backend_override.clone(),
+                gh_role: item.gh_role.clone(),
             };
             crate::log!(
                 "[bot:{}] 恢复消息 chat={} mid={} text={:?}",
@@ -1669,6 +1690,8 @@ impl Bridge {
             text,
             attachments,
             role: crate::config::SenderRole::Owner, // 微信只有 owner（on_weixin 已按 wx_user_id 过滤）
+            backend_override: None,
+            gh_role: None,
         };
         self.handle(ev).await;
     }
@@ -1772,6 +1795,8 @@ impl Bridge {
             text,
             attachments,
             role: sender_role,
+            backend_override: None,
+            gh_role: None,
         };
         self.handle(ev).await;
     }
@@ -1936,6 +1961,8 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             role: crate::config::SenderRole::Owner,
+            backend_override: None,
+            gh_role: None,
         };
         assert_eq!(ev.key(), "oc_group");
     }
@@ -1952,6 +1979,8 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             role: crate::config::SenderRole::Owner,
+            backend_override: None,
+            gh_role: None,
         };
         let a = base("omt_aaa");
         let b = base("omt_bbb");
@@ -2482,6 +2511,8 @@ mod tests {
             text: text.into(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            backend_override: None,
+            gh_role: None,
         }
     }
 
@@ -3241,6 +3272,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            backend_override: None,
+            gh_role: None,
             created_at: 10,
         });
         bridge.pending.add(crate::pending::PendingItem {
@@ -3252,6 +3285,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Granted,
+            backend_override: None,
+            gh_role: None,
             created_at: 20,
         });
 
@@ -5026,7 +5061,11 @@ https://b.com/y"
         )
         .await;
         assert_eq!(
-            batch.triggers,
+            batch
+                .triggers
+                .iter()
+                .map(|t| (t.number, t.comment_id))
+                .collect::<Vec<_>>(),
             vec![(42, 1), (42, 2), (5, 4)],
             "评论 1/2/4 触发（PR 评论 2.3 起同样触发），3/5 不触发"
         );
@@ -5112,6 +5151,8 @@ https://b.com/y"
             text: "分析 https://github.com/o/r/issues/42".into(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Granted, // 与 auto_ev 生产代码一致
+            backend_override: None,
+            gh_role: None,
         };
         // 同一评论 id 的合成 Ev 触发两次 → mid 去重只处理一次
         let b1 = bridge.clone();
