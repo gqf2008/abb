@@ -10,7 +10,8 @@
 飞书话题消息（#14 起）key 是 **`{chat_id}:{thread_id}`**：
 
 ```
-sessions.json = { key: { claude: {session_id, started}, codex: {session_id, started} } }
+sessions.json = { key: { claude: {session_id, started}, codex: {session_id, started},
+                        pi: {session_id, started}, prime_agent: {session_id, started} } }
 key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 ```
 

@@ -1,9 +1,14 @@
-//! 调本机 agent —— claude / codex / pi，host 直跑。
+//! 调本机 agent —— claude / codex / pi / prime-agent，host 直跑。
 //! prompt 走 stdin（避免多行/-开头被 argparse 误判）；per-chat 串行由 bridge 保证；
 //! claude 注入 CC Switch 当前 provider 的 ANTHROPIC_* env；codex 走自己 ~/.codex 登录态；
-//! pi 走自己 ~/.pi 登录态（配了供应商则注入对应 API key env + --provider/--model）。
+//! pi 走自己 ~/.pi 登录态（配了供应商则注入对应 API key env + --provider/--model）；
+//! prime-agent 走自己 ~/.prime 登录态（auth.json / 环境变量，供应商注入与 pi 同构）。
 //! pi 用法：`pi -p --mode json --session-id <uuid>`（--session-id 已存在即续聊、不存在即新建），
 //! prompt 走 stdin（pi 非交互模式会读管道 stdin 作首条消息，见 pi main.js readPipedStdin）。
+//! prime-agent 用法：`prime-agent -p --mode json [--resume <id>]`——**无 --session-id**，
+//! 会话 id 由它自生成（stdout 首行 session 事件 `"id"` 字段），首轮抓到后回存槽位
+//! （codex 模式），后续轮 --resume <id> 续聊；--resume 目标不存在 → exit 1 + stderr
+//! "No session found matching"（同 codex no rollout found 形态，run() 回退重建）。
 //! **无超时**：桥是推送模型——等 agent 跑完即回发，跑多久等多久（曾设 600s 上限，
 //! 会把合法的长任务拦腰杀掉，用户拍板去掉，2026-08-07）。
 
@@ -23,6 +28,7 @@ pub enum Backend {
     Claude,
     Codex,
     Pi,
+    PrimeAgent,
 }
 
 impl Backend {
@@ -31,6 +37,8 @@ impl Backend {
             Backend::Codex
         } else if s.eq_ignore_ascii_case("pi") {
             Backend::Pi
+        } else if s.eq_ignore_ascii_case("prime-agent") || s.eq_ignore_ascii_case("prime") {
+            Backend::PrimeAgent
         } else {
             Backend::Claude
         }
@@ -40,6 +48,7 @@ impl Backend {
             Backend::Claude => "claude",
             Backend::Codex => "codex",
             Backend::Pi => "pi",
+            Backend::PrimeAgent => "prime-agent",
         }
     }
 }
@@ -268,6 +277,10 @@ fn build_injection(
             env: None, // pi 走自己 ~/.pi 的登录态/默认模型，不注入
             extra_args: no_args,
         }),
+        (Backend::PrimeAgent, None) => Ok(Injection {
+            env: None, // prime-agent 走自己 ~/.prime 的登录态（auth.json）/默认模型，不注入
+            extra_args: no_args,
+        }),
 
         // ── anthropic 供应商 ──
         (Backend::Claude, Some(p)) if p.kind == "anthropic" => {
@@ -284,11 +297,11 @@ fn build_injection(
                 extra_args: no_args,
             })
         }
-        // ── pi + anthropic 供应商：注入 ANTHROPIC_API_KEY + --provider/--model。
-        // pi 内置 anthropic provider 固定官方端点，不读 ANTHROPIC_BASE_URL——配了 base_url
+        // ── pi/prime-agent + anthropic 供应商：注入 ANTHROPIC_API_KEY + --provider/--model。
+        // 两者内置 anthropic provider 固定官方端点，不读 ANTHROPIC_BASE_URL——配了 base_url
         // 也照常打官方端点（日志警告，避免用户误以为走了自定义网关）；自定义端点需在
-        // ~/.pi/agent/models.json 配 custom provider（超出桥职责，文档提示即可）。
-        (Backend::Pi, Some(p)) if p.kind == "anthropic" => {
+        // ~/.pi/agent/models.json / ~/.prime/agent/ 自定义 provider（超出桥职责，文档提示即可）。
+        (Backend::Pi | Backend::PrimeAgent, Some(p)) if p.kind == "anthropic" => {
             let mut env = HashMap::new();
             env.insert("ANTHROPIC_API_KEY".into(), p.api_key.clone());
             let mut args = vec!["--provider".to_string(), "anthropic".to_string()];
@@ -298,7 +311,8 @@ fn build_injection(
             }
             if !p.base_url.is_empty() {
                 crate::log!(
-                    "[agent] pi 后端忽略 anthropic 供应商「{}」的 base_url（pi 内置 provider 固定官方端点；自定义端点请在 ~/.pi/agent/models.json 配）",
+                    "[agent] {} 后端忽略 anthropic 供应商「{}」的 base_url（内置 provider 固定官方端点；自定义端点请在 agent 侧配 custom provider）",
+                    backend.name(),
                     p.name
                 );
             }
@@ -342,10 +356,12 @@ fn build_injection(
                 extra_args: args,
             })
         }
-        // ── pi + OpenAI 兼容供应商：注入 OPENAI_API_KEY + --provider openai + --model。
-        // pi 内置 openai provider 固定 api.openai.com；非官方端点同样需 models.json 自定义
-        // provider（见上 anthropic 分支注释）。wire_api（chat/responses）由 pi 侧决定，桥不干预。
-        (Backend::Pi, Some(p)) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
+        // ── pi/prime-agent + OpenAI 兼容供应商：注入 OPENAI_API_KEY + --provider openai + --model。
+        // 两者内置 openai provider 固定 api.openai.com；非官方端点同样需 agent 侧自定义
+        // provider（见上 anthropic 分支注释）。wire_api（chat/responses）由 agent 侧决定，桥不干预。
+        (Backend::Pi | Backend::PrimeAgent, Some(p))
+            if p.kind == "openai-chat" || p.kind == "openai-responses" =>
+        {
             let mut env = HashMap::new();
             env.insert("OPENAI_API_KEY".into(), p.api_key.clone());
             let mut args = vec!["--provider".to_string(), "openai".to_string()];
@@ -355,7 +371,8 @@ fn build_injection(
             }
             if !p.base_url.is_empty() {
                 crate::log!(
-                    "[agent] pi 后端忽略 OpenAI 兼容供应商「{}」的 base_url（pi 内置 provider 固定官方端点；自定义端点请在 ~/.pi/agent/models.json 配）",
+                    "[agent] {} 后端忽略 OpenAI 兼容供应商「{}」的 base_url（内置 provider 固定官方端点；自定义端点请在 agent 侧配 custom provider）",
+                    backend.name(),
                     p.name
                 );
             }
@@ -408,13 +425,13 @@ pub async fn run(
     // 每次热读 config（授权/关开关即时生效，与访问控制一致）；读不到按安全默认 true。
     // 公共判定见 config::restrict_granted（bridge prompt 注入 / run_job 同源）。
     let restrict = crate::config::restrict_granted(role, bot_key);
-    // pi 无任何权限/沙箱系统（非交互无审批），受限会话无法降级——直接拒绝，
+    // pi / prime-agent 无任何权限/沙箱系统（非交互无审批），受限会话无法降级——直接拒绝，
     // 绝不让授权者静默获得全权限 agent。owner 可换后端或关掉隔离开关恢复。
-    if restrict && backend == Backend::Pi {
-        return Err(
-            "⚠️ 该 bot 的后端是 pi，不支持受限模式。授权者会话不可用：请 owner 在设置里给该 bot 换 claude/codex 后端，或关闭「授权者 agent 隔离」开关。"
-                .into(),
-        );
+    if restrict && matches!(backend, Backend::Pi | Backend::PrimeAgent) {
+        return Err(format!(
+            "⚠️ 该 bot 的后端是 {}，不支持受限模式。授权者会话不可用：请 owner 在设置里给该 bot 换 claude/codex 后端，或关闭「授权者 agent 隔离」开关。",
+            backend.name()
+        ));
     }
 
     // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
@@ -460,14 +477,14 @@ pub async fn run(
         .await
         {
             Ok(out) => {
-                // codex 首轮（或回退重建）抓到真实 thread_id → 回存，供后续轮 resume。
+                // codex / prime-agent 首轮（或回退重建）抓到对端真实会话 id → 回存，供后续轮 resume。
                 // sid 同步换成真实值：RunOutcome 返回的就是它——桥的 mark_started_if 按
-                // session_id 校验身份，返回旧占位 UUID 会让 codex 永远 mark 不上
-                // （started 恒 false → 每轮都当首轮新开 thread、上下文全丢；#49 审查 I-1）。
+                // session_id 校验身份，返回旧占位 UUID 会让它们永远 mark 不上
+                // （started 恒 false → 每轮都当首轮新开会话、上下文全丢；#49 审查 I-1）。
                 // 回存走 CAS（set_session_id_if）：仅当槽位仍是我们启动时的会话才写——
-                // 运行中被 /new 或 CLI reset 换走时不得把旧任务 thread 写进新槽位，
-                // 否则 mark_started_if 匹配旧 thread、新会话 resume 旧线程（#49 审查）。
-                if backend == Backend::Codex {
+                // 运行中被 /new 或 CLI reset 换走时不得把旧任务会话写进新槽位，
+                // 否则 mark_started_if 匹配旧会话、新会话 resume 旧会话（#49 审查）。
+                if matches!(backend, Backend::Codex | Backend::PrimeAgent) {
                     if let (Some(tid), Some(store)) = (&out.thread_id, sessions) {
                         if tid != &sid {
                             store.set_session_id_if(session_key, &sid, tid);
@@ -497,12 +514,16 @@ pub async fn run(
             Err(AttemptErr::Failed(e)) => {
                 // resume 失败（会话在对端已不存在）→ 回退全新会话重建一次，别让用户永久卡死。
                 // codex：thread 没了（no rollout found）；claude：transcript 被删/机器迁移
-                // （No conversation found）——两者都会让该聊天此后每轮必报错，无自愈路径。
+                // （No conversation found）；prime-agent：--resume 目标不存在/文件不可解析
+                // （No session found matching，实测 exit 1 + stderr）——都会让该聊天此后
+                // 每轮必报错，无自愈路径。重建轮（is_resume=false）prime 会自建新会话并
+                // 回存新 id（codex 模式），下一条消息经 rebuilt→pending 标记注入历史。
                 // pi 无此问题：--session-id 对应的会话文件被删/损坏时 pi 会新建或用报错兜底，
                 // 不走该分支（首版不自动重建，用户可 `session reset` 换新 UUID）。
                 let session_lost = is_resume
                     && ((backend == Backend::Codex && e.contains("no rollout found"))
-                        || (backend == Backend::Claude && e.contains("No conversation found")));
+                        || (backend == Backend::Claude && e.contains("No conversation found"))
+                        || (backend == Backend::PrimeAgent && e.contains("No session found")));
                 if session_lost && attempt == 0 {
                     crate::log!(
                         "[agent] {} resume 失败（会话已不存在），回退全新会话重建",
@@ -655,7 +676,14 @@ fn process_line(
             }
             _ => None, // system/init、thinking_tokens、user(tool_result) 等忽略
         },
-        Backend::Pi => match v.get("type").and_then(|t| t.as_str()) {
+        Backend::Pi | Backend::PrimeAgent => match v.get("type").and_then(|t| t.as_str()) {
+            // prime-agent 会话 id 自生成（无 --session-id 旗标）：stdout 首行 session 事件
+            // 的 "id" 是真实 id 的唯一来源——抓到后由 run() 回存槽位（codex 模式），
+            // 后续轮 --resume <id> 续聊。pi 的 session 头忽略（桥 UUID 即会话 id）。
+            Some("session") if backend == Backend::PrimeAgent => {
+                *thread_id = v.get("id").and_then(|t| t.as_str()).map(|s| s.to_string());
+                None
+            }
             // 每条 assistant 消息结束：message 字段是权威文本；stopReason=error/aborted → 记错。
             Some("message_end") => {
                 let msg = &v["message"];
@@ -679,7 +707,7 @@ fn process_line(
                     pending.replace(t) // 挤出上一条作进度
                 }
             }
-            _ => None, // session 头、message_start/update、tool_execution_*、agent_end 等忽略
+            _ => None, // pi 的 session 头、message_start/update、tool_execution_*、agent_end 等忽略
         },
     }
 }
@@ -845,27 +873,86 @@ pub fn pi_session_exists(workspace: &std::path::Path, session_id: &str) -> bool 
     let Some((_, _, path)) = newest else {
         return false;
     };
-    let Ok(mut f) = std::fs::File::open(&path) else {
+    // 首行 id 命中（选中最新的名字匹配文件后校验——若最新文件首行已损坏，不得
+    // 回落到旧世代完好文件判存活：pi 打开的是最新文件，会静默重建空会话）
+    if session_file_id(&path) != Some(session_id.to_string()) {
+        return false;
+    }
+    // 尾部截断检测（见 prime_session_exists 注释，两探针同规则）
+    jsonl_tail_intact(&path)
+}
+
+/// #67：prime-agent 会话文件存在性探查（语义同 pi_session_exists，差异见下）。
+/// prime 无 --session-id：会话文件经 --session-dir 固定在 workspace/.prime-sessions，
+/// 文件名是创建时生成的 ULID（`<ulid>.jsonl`，**不含会话 id**），真实 id 在首行
+/// session 事件的 `"id"` 字段——故不能像 pi 那样按文件名包含匹配，必须逐个文件读
+/// 首行比对 id（目录内文件很少，代价有界；选取规则 = 首行 id 命中者取 mtime 最新）。
+/// prime 对不可续聊的目标不像 pi 静默新建，而是 exit 1 + "No session found"（run()
+/// 的 session_lost 分支会重建）——探针的意义同 pi：resume 轮文件却不可续聊时，
+/// 本轮 run 前即可判定丢失并直接注入历史（比 run 失败后靠 pending 补注入早一轮）。
+pub fn prime_session_exists(workspace: &std::path::Path, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    let dir = workspace.join(".prime-sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false; // 任何列举错误按不存在（同上：方向安全）
+    };
+    // 文件名与 sid 无关：全部文件读首行比对 id，命中者取 mtime 最新（文件名作同 tick
+    // 次序）。首行读不到/超 64KB/无换行按不命中。
+    let mut newest: Option<(std::time::SystemTime, String, std::path::PathBuf)> = None;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if session_file_id(&e.path()) != Some(session_id.to_string()) {
+            continue;
+        }
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let replace = match &newest {
+            None => true,
+            Some((t, n, _)) => mtime > *t || (mtime == *t && name > *n),
+        };
+        if replace {
+            newest = Some((mtime, name, e.path()));
+        }
+    }
+    let Some((_, _, path)) = newest else {
         return false;
     };
-    // 首行：session 记录含 "id":"<sid>"。有界读取（防损坏文件把整文件当首行读入——
-    // 只读 64KB 以内的首行，超长/无换行按丢失）。
+    jsonl_tail_intact(&path)
+}
+
+/// 读会话文件首行 session 记录的 `"id"`（有界 64KB，超长/无换行/解析失败 → None）。
+/// 用 JSON 解析取值，容忍空格/键序/前后空白等序列化漂移，不依赖精确子串。
+/// 调用方：pi/prime 会话探针（存活判定）与 bridge 的 /new 清理（prime 文件名不含
+/// 会话 id，必须读内容判定归属）。
+pub fn session_file_id(path: &std::path::Path) -> Option<String> {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return None;
+    };
     let mut first = Vec::new();
     let capped = std::io::Read::take(&mut f, 64 * 1024);
     if std::io::BufRead::read_until(&mut std::io::BufReader::new(capped), b'\n', &mut first)
         .is_err()
         || first.len() >= 64 * 1024
     {
-        return false;
+        return None;
     }
     let first = std::str::from_utf8(&first).unwrap_or("");
-    let first_id = serde_json::from_str::<serde_json::Value>(first.trim_start_matches('\u{feff}'))
+    serde_json::from_str::<serde_json::Value>(first.trim_start_matches('\u{feff}'))
         .ok()
-        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_owned));
-    if first_id.as_deref() != Some(session_id) {
+        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_owned))
+}
+
+/// 末行必须是完整 JSON 记录（截断检测）。追加式 JSONL 最常见的损坏形态是崩溃中断
+/// 追加/磁盘满（首行完好、尾部截断）——对端全文件解析失败会重建会话，只看首行会把
+/// 这种文件误判为存活 → 静默无上下文。只读文件末尾至多 64KB，代价有界。
+fn jsonl_tail_intact(path: &std::path::Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
         return false;
-    }
-    // 尾部：末行必须是完整 JSON 记录（截断检测）。只读文件末尾至多 64KB，代价有界。
+    };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     const TAIL_MAX: u64 = 64 * 1024;
     let start = len.saturating_sub(TAIL_MAX);
@@ -920,6 +1007,7 @@ async fn run_once(
         Backend::Pi => "pi",
         Backend::Codex => "codex",
         Backend::Claude => "claude",
+        Backend::PrimeAgent => "prime-agent",
     };
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
@@ -968,6 +1056,36 @@ async fn run_once(
             }
             c
         }
+        Backend::PrimeAgent => {
+            // prime-agent 非交互 print 模式：`prime-agent -p --mode json [--resume <id>]`。
+            // 基于 pi、事件流同构（message_end 权威、LLM 错误 exit 0 + stopReason=error），
+            // 关键差异（实测 2026-08-16）：
+            // ① **无 --session-id**——会话 id 由 prime 自生成（stdout 首行 session 事件
+            //    "id"），首轮（resume=false）不带 --resume 全新创建，抓到 id 后回存槽位
+            //    （codex 模式），后续轮 --resume <id> 续聊（续聊追加写同一会话文件）；
+            // ② --resume 目标不存在/不可解析 → exit 1 + stderr "No session found matching"
+            //    ——由 run() 的 session_lost 分支回退全新重建；
+            // ③ --session-dir 固定到本 bot 工作区：会话文件随 workspace 隔离。注意工作区
+            //    不能落在 /tmp 类软链目录——prime 的 resume 扫描对同一文件经软链双路径
+            //    命中会误报 Ambiguous（实测 macOS /tmp→/private/tmp 触发）；桥工作区在
+            //    ~/.agent-bridge 下不受影响，仅作为排障知识记录；
+            // ④ 遥测默认开（settings.md：伪匿名指标）→ run_once 统一注入
+            //    PRIME_AGENT_TELEMETRY=0 关闭；
+            // ⑤ prompt 走 stdin（与 pi 同款 readPipedStdin 语义，实测 pipe 无 argv 消息
+            //    也能正常进入首条消息处理）。
+            let mut c = tokio::process::Command::from(shim_command(&resolved));
+            c.arg("-p").arg("--mode").arg("json");
+            if resume {
+                c.arg("--resume").arg(session_id);
+            }
+            c.arg("--session-dir")
+                .arg(workspace.join(".prime-sessions"));
+            // 桥内供应商 → --provider/--model（api key 走 env，见 build_injection）
+            for a in extra_args {
+                c.arg(a);
+            }
+            c
+        }
     };
 
     // Windows：GUI 子系统进程 spawn 控制台子进程（claude/codex）会弹新控制台窗口，
@@ -1000,6 +1118,11 @@ async fn run_once(
     // 永不进日志（env 不由桥打印；argv 里也没有 key）。
     if let Some(env) = inject_env {
         cmd.envs(env);
+    }
+    // prime-agent 遥测默认开（伪匿名指标上报官方端点，settings.md 文档化开关）——
+    // 桥内一律关闭（与 claude 的 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 同款考虑）。
+    if backend == Backend::PrimeAgent {
+        cmd.env("PRIME_AGENT_TELEMETRY", "0");
     }
 
     crate::log!(
@@ -1171,17 +1294,23 @@ async fn run_once(
                 })?
             }
         }
-        Backend::Pi => {
-            // pi json 模式对 LLM 错误也 exit 0：错误信息只能从事件流（message_end）判，
-            // 进程非零退出则走上面 status 分支；这里先查事件级错误，再取最后一条回复。
+        Backend::Pi | Backend::PrimeAgent => {
+            // pi/prime-agent json 模式对 LLM 错误也 exit 0：错误信息只能从事件流
+            // （message_end.stopReason=error）判，进程非零退出则走上面 status 分支
+            // （prime 的认证缺失即 exit 1 + stderr）；这里先查事件级错误，再取最后一条回复。
             if let Some(err) = pi_error.take() {
                 return Err(AttemptErr::Failed(format!(
-                    "⚠️ pi 出错:\n{}",
+                    "⚠️ {} 出错:\n{}",
+                    backend.name(),
                     truncate(&err, 800)
                 )));
             }
             pending.take().filter(|s| !s.is_empty()).ok_or_else(|| {
-                AttemptErr::Failed(format!("⚠️ pi 没有输出。{}", stderr_tail(&stderr_text)))
+                AttemptErr::Failed(format!(
+                    "⚠️ {} 没有输出。{}",
+                    backend.name(),
+                    stderr_tail(&stderr_text)
+                ))
             })?
         }
     };
@@ -1260,7 +1389,10 @@ fn process_is_agent(pid: u32) -> bool {
         match out {
             Ok(o) if o.status.success() => {
                 let cmd = String::from_utf8_lossy(&o.stdout);
-                cmd.contains("claude") || cmd.contains("codex") || pi_command_matches(&cmd)
+                cmd.contains("claude")
+                    || cmd.contains("codex")
+                    || pi_command_matches(&cmd)
+                    || prime_command_matches(&cmd)
             }
             _ => false,
         }
@@ -1283,6 +1415,19 @@ fn pi_command_matches(cmd: &str) -> bool {
         .map(|b| b.to_string_lossy().into_owned())
         .unwrap_or_default();
     base == "pi" || cmd.contains("pi-coding-agent") || cmd.contains("@earendil-works/pi")
+}
+
+/// prime-agent 进程命令行匹配：npm 全局 bin 的 `prime-agent` 是指向 cli.js 的软链，
+/// ps 显示解析后的解释器+脚本路径（如 `node …/node_modules/prime-agent/dist/bundle/cli.js`）。
+/// 按特征匹配：首 token 基名恰为 prime-agent，或路径含 prime-agent/。
+#[cfg(unix)]
+fn prime_command_matches(cmd: &str) -> bool {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let base = std::path::Path::new(first)
+        .file_name()
+        .map(|b| b.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base == "prime-agent" || cmd.contains("prime-agent/")
 }
 
 /// 启动恢复前调用：把上次残留的 agent 子进程清掉（SIGTERM / taskkill），并清空 pid 文件。
@@ -1564,19 +1709,22 @@ mod tests {
 
     #[test]
     fn kind_backend_mismatch_errors() {
-        // anthropic 供应商 + codex 后端 → 报错；+ pi 后端 → 可映射（env key + --provider/--model）
+        // anthropic 供应商 + codex 后端 → 报错；+ pi/prime-agent 后端 → 可映射（env key + --provider/--model）
         let pa = prov("a", "anthropic");
         assert!(build_injection(Backend::Codex, Some(&pa)).is_err());
         assert!(build_injection(Backend::Pi, Some(&pa)).is_ok());
-        // openai 供应商 + claude 后端 → 报错；+ pi 后端 → 可映射
+        assert!(build_injection(Backend::PrimeAgent, Some(&pa)).is_ok());
+        // openai 供应商 + claude 后端 → 报错；+ pi/prime-agent 后端 → 可映射
         let po = prov("o", "openai-chat");
         assert!(build_injection(Backend::Codex, Some(&po)).is_ok());
         assert!(build_injection(Backend::Claude, Some(&po)).is_err());
         assert!(build_injection(Backend::Pi, Some(&po)).is_ok());
-        // 未知 kind → 报错（三个后端一致）
+        assert!(build_injection(Backend::PrimeAgent, Some(&po)).is_ok());
+        // 未知 kind → 报错（四个后端一致）
         let px = prov("x", "gemini");
         assert!(build_injection(Backend::Claude, Some(&px)).is_err());
         assert!(build_injection(Backend::Pi, Some(&px)).is_err());
+        assert!(build_injection(Backend::PrimeAgent, Some(&px)).is_err());
     }
 
     #[test]
@@ -1628,15 +1776,171 @@ mod tests {
         );
     }
 
+    // ── prime-agent 注入与解析（#67，与 pi 同构 + codex 式会话 id 回存）──
+
     #[test]
-    fn pi_backend_parse() {
+    fn no_provider_prime_no_injection() {
+        // prime-agent 未配供应商 → 不注入任何 env/参数（走自己 ~/.prime 登录态）
+        let inj = build_injection(Backend::PrimeAgent, None).unwrap();
+        assert!(inj.env.is_none());
+        assert!(inj.extra_args.is_empty());
+    }
+
+    #[test]
+    fn anthropic_to_prime_env_and_args() {
+        let p = prov("mypa", "anthropic");
+        let inj = build_injection(Backend::PrimeAgent, Some(&p)).unwrap();
+        assert_eq!(inj.env.as_ref().unwrap()["ANTHROPIC_API_KEY"], "sk-secret");
+        assert!(!inj.env.as_ref().unwrap().contains_key("ANTHROPIC_BASE_URL"));
+        let args = &inj.extra_args;
+        assert!(args.iter().any(|a| a == "--provider"));
+        assert!(args.iter().any(|a| a == "anthropic"));
+        assert!(args.iter().any(|a| a == "--model"));
+        assert!(args.iter().any(|a| a == "some-model"));
+        assert!(args.iter().all(|a| !a.contains("sk-secret")));
+    }
+
+    #[test]
+    fn openai_to_prime_env_and_args() {
+        let p = prov("deepseek", "openai-chat");
+        let inj = build_injection(Backend::PrimeAgent, Some(&p)).unwrap();
+        assert_eq!(inj.env.as_ref().unwrap()["OPENAI_API_KEY"], "sk-secret");
+        let args = &inj.extra_args;
+        assert!(args.iter().any(|a| a == "--provider"));
+        assert!(args.iter().any(|a| a == "openai"));
+        assert!(args.iter().any(|a| a == "some-model"));
+    }
+
+    #[test]
+    fn prime_session_header_captures_id() {
+        // prime 无 --session-id：会话 id 自生成，唯一来源是 stdout 首行 session 事件
+        // ——process_line 必须抓到（codex 式回存的前提）；pi 的 session 头则忽略。
+        let mut tid = None;
+        let mut pending = None;
+        let mut res = None;
+        let mut pi_err = None;
+        process_line(
+            Backend::PrimeAgent,
+            r#"{"type":"session","version":3,"id":"01a00a5c-7708-77d5-aaf0-6aaea4a826e2","timestamp":"2026-08-16T11:37:07.080Z","cwd":"/tmp","rlmDepth":0}"#,
+            &mut tid,
+            &mut pending,
+            &mut res,
+            &mut pi_err,
+        );
+        assert_eq!(
+            tid.as_deref(),
+            Some("01a00a5c-7708-77d5-aaf0-6aaea4a826e2"),
+            "prime session 头必须抓到真实会话 id"
+        );
+        // pi 不抓（桥 UUID 即会话 id）
+        let mut tid2 = None;
+        process_line(
+            Backend::Pi,
+            r#"{"type":"session","version":3,"id":"u-1","timestamp":"2026-08-16T11:37:07.080Z","cwd":"/tmp"}"#,
+            &mut tid2,
+            &mut pending,
+            &mut res,
+            &mut pi_err,
+        );
+        assert_eq!(tid2, None, "pi session 头忽略（桥 UUID 即会话 id）");
+    }
+
+    #[test]
+    fn prime_message_end_one_behind_and_error() {
+        // prime 事件流与 pi 同构：message_end 权威、滞后一位；stopReason=error 记错
+        let mut tid = None;
+        let mut pending = None;
+        let mut res = None;
+        let mut pi_err = None;
+        let mut forwarded = Vec::new();
+        for l in [
+            r#"{"type":"session","version":3,"id":"p-1","timestamp":"2026-08-16T11:37:07.080Z","cwd":"/tmp"}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"我先查一下"}],"stopReason":"stop"}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"最终答案"}],"stopReason":"stop"}}"#,
+        ] {
+            if let Some(p) = process_line(
+                Backend::PrimeAgent,
+                l,
+                &mut tid,
+                &mut pending,
+                &mut res,
+                &mut pi_err,
+            ) {
+                forwarded.push(p);
+            }
+        }
+        assert_eq!(forwarded, vec!["我先查一下".to_string()]);
+        assert_eq!(pending.as_deref(), Some("最终答案"));
+        assert_eq!(tid.as_deref(), Some("p-1"));
+        assert!(pi_err.is_none());
+        // LLM 错误：stopReason=error → errorMessage 进 pi_error（exit 0 也能判错）
+        process_line(
+            Backend::PrimeAgent,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limit exceeded"}}"#,
+            &mut tid,
+            &mut pending,
+            &mut res,
+            &mut pi_err,
+        );
+        assert_eq!(pi_err.as_deref(), Some("rate limit exceeded"));
+    }
+
+    #[test]
+    fn prime_session_exists_matches_by_first_line_id() {
+        // prime 会话文件名为 ULID（不含会话 id），探针必须按首行 "id" 字段匹配；
+        // 尾部截断按丢失（prime 全文件解析失败 → resume 报 No session found → 重建）
+        let key = format!("abb-prime-test-{}", uuid::Uuid::new_v4());
+        let dir = crate::workspace_dir(&key).join(".prime-sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "01a00a5c-7708-77d5-aaf0-6aaea4a826e2";
+        let ws = crate::workspace_dir(&key);
+        // 坏文件（尾部截断）→ 丢失
+        std::fs::write(
+            dir.join("01a00a5d-fc0a-760e-b9dc-1255c8e5188b.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-16T11:37:07.080Z\"}}\n{{\"type\":\"message\""
+            ),
+        )
+        .unwrap();
+        assert!(!prime_session_exists(&ws, sid), "尾部截断按丢失");
+        // 好文件：文件名与 sid 无关、首行 id 命中 → 存在
+        std::fs::write(
+            dir.join("01a00a5e-6e88-74eb-9bb2-b66a9835f655.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-16T11:37:07.080Z\"}}\n{{\"type\":\"message\"}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            prime_session_exists(&ws, sid),
+            "首行 id 命中（文件名无 sid）"
+        );
+        // 其它 sid 的文件不干扰
+        assert!(
+            !prime_session_exists(&ws, "00000000-0000-0000-0000-000000000000"),
+            "sid 不存在"
+        );
+        assert!(
+            !prime_session_exists(&crate::workspace_dir(&format!("{key}-nodir")), sid),
+            "目录缺失按不存在"
+        );
+        assert!(!prime_session_exists(&ws, ""), "空 sid 不放大为全目录扫描");
+        let _ = std::fs::remove_dir_all(crate::workspace_dir(&key));
+    }
+
+    #[test]
+    fn backend_parse() {
         assert_eq!(Backend::parse("pi"), Backend::Pi);
         assert_eq!(Backend::parse("PI"), Backend::Pi);
         assert_eq!(Backend::parse("codex"), Backend::Codex);
         assert_eq!(Backend::parse("claude"), Backend::Claude);
+        assert_eq!(Backend::parse("prime-agent"), Backend::PrimeAgent);
+        assert_eq!(Backend::parse("PRIME-AGENT"), Backend::PrimeAgent);
+        assert_eq!(Backend::parse("prime"), Backend::PrimeAgent);
         assert_eq!(Backend::parse(""), Backend::Claude);
         assert_eq!(Backend::parse("weird"), Backend::Claude);
         assert_eq!(Backend::Pi.name(), "pi");
+        assert_eq!(Backend::PrimeAgent.name(), "prime-agent");
     }
 
     // ── pi JSON 事件流解析（--mode json）──
