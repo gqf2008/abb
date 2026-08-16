@@ -450,6 +450,7 @@ export component SettingsWindow inherits Window {
     callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
     callback recheck-deps();            // 重新检测依赖是否已装
     callback install-dep(string);       // 安装某个依赖（claude/codex/pi/node/python3/lark-cli/dingtalk-cli）
+    callback install-all-missing();     // #60 一键安装全部缺失组件（node 前置自动装）
     callback open-perm-settings(string); // 打开某项系统权限对应的设置面板（full-disk/accessibility/screen/automation）
     callback request-perms();           // 触发屏幕录制/摄像头/麦克风授权弹框（拉起子进程逐项请求）
     callback restart-service-request(); // 环境页授权后一键重启服务（权限对运行中进程不实时刷新）
@@ -1229,11 +1230,16 @@ export component SettingsWindow inherits Window {
                                         padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
                                         spacing: 8px;
                                         Text {
-                                            text: "⚠️ 未检测到 Claude Code / Codex CLI：机器人收到消息后将无法处理。请安装下方依赖（装完点「重新检测」）。";
+                                            text: "⚠️ 未检测到 Claude Code / Codex CLI：机器人收到消息后将无法处理。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
                                             color: #664d03;
                                             wrap: word-wrap;
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
+                                        }
+                                        if root.missing-deps > 0: Button {
+                                            text: "一键安装全部缺失（" + root.missing-deps + " 项）";
+                                            enabled: root.dep-busy == "";
+                                            clicked => { root.install-all-missing(); }
                                         }
                                     }
                                 }
@@ -1250,6 +1256,13 @@ export component SettingsWindow inherits Window {
                                             spacing: 8px;
                                             Text { text: "依赖（本机 agent 运行环境）"; font-weight: 700; color: Palette.foreground; vertical-alignment: center; }
                                             Rectangle { horizontal-stretch: 1; }
+                                            // #60：标题行入口——横幅只在 agent 缺失时可见，
+                                            // 只缺 node/lark 等也要有一键装入口
+                                            if root.missing-deps > 0: Button {
+                                                text: "一键安装缺失";
+                                                enabled: root.dep-busy == "";
+                                                clicked => { root.install-all-missing(); }
+                                            }
                                             Button { text: "重新检测"; clicked => { root.recheck-deps(); } }
                                         }
                                         if root.dep-busy != "": Text {
