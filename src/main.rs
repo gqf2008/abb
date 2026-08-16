@@ -30,6 +30,7 @@ mod schedule;
 mod service;
 mod sessions;
 mod single_instance;
+mod tasks;
 mod ui;
 mod wechat;
 mod ws;

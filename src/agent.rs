@@ -1161,6 +1161,7 @@ async fn run_once(
         .ok_or_else(|| AttemptErr::Failed(format!("⚠️ {} 无法读取错误管道", backend.name())))?;
 
     // stderr 后台并行收（进程退出后用于报错归因；session_lost 判定也靠它）
+    // #69 审计：短命、有 owner（run_once 末尾 await 收尾），不登记。
     let stderr_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();

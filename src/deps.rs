@@ -687,6 +687,7 @@ pub async fn install_all_missing(mut on_evt: impl FnMut(InstallEvt) + Send) -> A
 }
 
 /// 读流，只保留尾部约 800 字符（安装输出可能很长，状态行/日志只要结尾）。
+/// #69 审计：短命、有 owner（run_step 内 await 收尾），不登记。
 fn read_tail<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     r: Option<R>,
 ) -> tokio::task::JoinHandle<String> {

@@ -846,6 +846,8 @@ pub fn run_gui() -> Result<()> {
                         // 接入飞书 bot → 后台自动装 lark-cli + lark 技能（幂等/best-effort）。
                         // GUI 路径免等 service 重启；装不上只 log 警告。只对飞书 bot 触发。
                         if res.is_ok() && cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
+                            // #69 审计：GUI（托盘）进程侧短命任务（装完即收尾），
+                            // 与 service 进程不同生命周期，不登记。
                             tokio::spawn(async { crate::larkskills::ensure_lark_setup().await });
                         }
                         let tw = tray_weak_bg.clone();
@@ -878,6 +880,7 @@ pub fn run_gui() -> Result<()> {
                         // 鲁棒性（用户反馈）：panic 防护——安装内部异常也要回结果，
                         // 否则 dep-busy 永久卡死、安装按钮全部禁用至重启。
                         let dep_tx = dep_tx.clone();
+                        // #69 审计：GUI 进程侧短命任务（安装收尾经 DepEvt 回主线程），不登记。
                         tokio::spawn(async move {
                             let r = futures_util::FutureExt::catch_unwind(
                                 std::panic::AssertUnwindSafe(crate::deps::run_install(&dep_id)),
@@ -890,6 +893,7 @@ pub fn run_gui() -> Result<()> {
                     }
                     UiCmd::InstallAllMissing => {
                         let dep_tx = dep_tx.clone();
+                        // #69 审计：GUI 进程侧短命任务（AllDone 回主线程），不登记。
                         tokio::spawn(async move {
                             let outcome = futures_util::FutureExt::catch_unwind(
                                 std::panic::AssertUnwindSafe(crate::deps::install_all_missing(

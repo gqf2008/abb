@@ -6,8 +6,6 @@ use crate::bridge::Bridge;
 use crate::config::Config;
 use crate::messenger;
 use std::sync::Arc;
-use tokio::sync::watch;
-
 pub async fn run() {
     crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
     let cfg = match Config::load() {
@@ -47,14 +45,20 @@ pub async fn run() {
     let cfg = Arc::new(cfg);
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
-    // fire-and-forget：装不上只 log 警告，不影响本进程。只对飞书 bot 触发（微信/钉钉不需要）。
+    // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
     if cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
-        tokio::spawn(async { crate::larkskills::ensure_lark_setup().await });
+        crate::tasks::tasks().spawn("larkskills", async {
+            crate::larkskills::ensure_lark_setup().await;
+        });
     }
 
-    // stop 信号通道：SIGTERM/SIGINT → true（所有 bot 共享）
-    let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(async move {
+    // #69：退出信号 → 全局取消令牌广播（原 watch::channel(stop) 职责，统一进治理）。
+    // 长驻任务（活到关停），登记 spawn_forever——关停前意外退出会被计 errors_total。
+    // CancelOnShutdown 守卫：本任务任何提前退出路径（含 panic 被捕获）都补一次 cancel
+    // （幂等），保持原 watch 实现的 fail-open 语义（循环退出 → 进程优雅退出 → 看门狗重启），
+    // 绝不出现「signal 死了所有循环永久挂起」的 fail-closed 死挂。
+    crate::tasks::tasks().spawn_forever("signal", async {
+        let _cancel_guard = crate::tasks::CancelOnShutdown::default();
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -72,7 +76,7 @@ pub async fn run() {
             let _ = tokio::signal::ctrl_c().await;
         }
         crate::log!("[service] 收到退出信号");
-        let _ = stop_tx.send(true);
+        crate::tasks::shutdown_token().cancel();
     });
 
     // 每个 bot 一个事件循环 + Bridge + 定时调度，并行跑。
@@ -134,37 +138,44 @@ pub async fn run() {
         bot_cfgs,
         None,
     ));
-    // 跨会话投递消费循环（独立于 bot 循环，共享 stop）
+    // 跨会话投递消费循环（独立于 bot 循环，共享关停令牌）。#69：长驻，登记 spawn_forever。
     {
         let router = router.clone();
-        let mut stop = stop_rx.clone();
-        tokio::spawn(async move {
-            deliver_loop(router, &mut stop).await;
+        let stop = crate::tasks::shutdown_token();
+        crate::tasks::tasks().spawn_forever("deliver", async move {
+            deliver_loop(router, stop).await;
         });
     }
     let mut handles = Vec::new();
     for (bot, msgr) in ready {
         let cfg = cfg.clone();
-        let stop = stop_rx.clone();
+        let stop = crate::tasks::shutdown_token();
         let router = router.clone();
-        handles.push(tokio::spawn(async move {
+        // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
+        // errors/panic 告警可定位到具体 bot——审查 Minor 3）
+        let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
+        handles.push(crate::tasks::tasks().spawn_forever(name, async move {
             run_bot(bot, cfg, msgr, router, stop).await;
         }));
     }
     // #64：github bot 循环（RoutedMessenger 转发通知；无 IM 事件循环，只跑 watch）
     for bot in github_bots {
         let cfg = cfg.clone();
-        let stop = stop_rx.clone();
+        let stop = crate::tasks::shutdown_token();
         let router = router.clone();
         let msgr = std::sync::Arc::new(crate::messenger::RoutedMessenger::new(messengers.clone()));
-        handles.push(tokio::spawn(async move {
+        let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
+        handles.push(crate::tasks::tasks().spawn_forever(name, async move {
             run_bot(bot, cfg, msgr, router, stop).await;
         }));
     }
-    // 等所有 bot 循环结束（正常只有 stop 才会结束）
+    // 等所有 bot 循环结束（正常只有关停广播才会结束）
     for h in handles {
         let _ = h.await;
     }
+    // #69 优雅关闭：close（拒绝新登记）→ cancel（幂等，信号任务可能已广播）→ wait
+    // 等全部在册任务收尾；指标汇总一行日志（shutdown_wait_ms 等）。
+    let _ = crate::tasks::tasks().shutdown_wait().await;
     crate::log!("[service] 已退出");
 }
 
@@ -172,7 +183,7 @@ pub async fn run() {
 /// 失败项不回盘（避免死循环重投），由 Router 负责回源报错 / 微信 outbox 兜底。
 async fn deliver_loop(
     router: std::sync::Arc<crate::deliver::Router>,
-    stop_rx: &mut watch::Receiver<bool>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     crate::log!(
         "[deliver] 投递循环启动（跨会话投递开关={}）",
@@ -180,7 +191,7 @@ async fn deliver_loop(
     );
     let store = crate::deliver::DeliveryStore::new();
     loop {
-        if interruptible_sleep(std::time::Duration::from_secs(1), stop_rx).await {
+        if interruptible_sleep(std::time::Duration::from_secs(1), &stop).await {
             break;
         }
         // at-least-once：先取（不移除）→ 投递（成功或已兜底）→ ack。
@@ -201,7 +212,7 @@ async fn run_bot(
     cfg: Arc<Config>,
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
-    stop_rx: watch::Receiver<bool>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     let key = bot.key();
     crate::log!(
@@ -217,19 +228,25 @@ async fn run_bot(
 
     // #25 重启恢复：上次崩溃/退出时未处理完的消息 → 自动续跑（异步进行，不阻塞事件循环
     // 启动；per-chat 串行锁保证重放与实时消息不乱序）。
+    // #69 审计：短命任务，登记进治理，**token 逐条检查**（审查 Important）——恢复会跑
+    // 完整 agent 管线（单条可达数分钟），关停广播后立即停止重放（未重放条目留盘
+    // pending.json，下次启动续跑——正是 #25 的恢复语义），不让 shutdown_wait 无界等它。
     {
         let bridge = bridge.clone();
-        tokio::spawn(async move {
-            bridge.recover_pending().await;
+        let stop = stop.clone();
+        let name: &'static str = Box::leak(format!("recover:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn(name, async move {
+            bridge.recover_pending(&stop).await;
         });
     }
 
-    // 定时任务调度循环（独立于事件循环，共享 stop）
+    // 定时任务调度循环（独立于事件循环，共享关停令牌）。#69：长驻，登记 spawn_forever。
     {
         let bridge = bridge.clone();
         let key = key.clone();
-        let mut stop = stop_rx.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        let name: &'static str = Box::leak(format!("schedule:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn_forever(name, async move {
             crate::log!("[bot:{key}] 调度循环启动");
             let mut last_min: Option<String> = None;
             // 在跑任务集合：cron 周期短于任务耗时时，跳过重叠的新一轮（防同任务并发堆积、
@@ -238,7 +255,7 @@ async fn run_bot(
                 std::collections::HashSet::<String>::new(),
             ));
             loop {
-                if interruptible_sleep(std::time::Duration::from_secs(20), &mut stop).await {
+                if interruptible_sleep(std::time::Duration::from_secs(20), &stop).await {
                     break;
                 }
                 let now = crate::schedule::DateTime::now();
@@ -267,6 +284,9 @@ async fn run_bot(
                     let router = router.clone();
                     let running = running.clone();
                     let jid = job.id.clone();
+                    // #69 审计：中命任务（一次 agent 运行），有 owner（调度循环在跑集合 +
+                    // pending.json 重启恢复）。**不登记**：关停时等 agent 跑完会让「停止」
+                    // 语义退化成最长任务时长；进程退出兜底 + 下次启动 agent-pids 清理。
                     tokio::spawn(async move {
                         run_job(bridge, router, job).await;
                         running.lock().unwrap().remove(&jid);
@@ -286,38 +306,39 @@ async fn run_bot(
         let bot = bot.clone();
         let bridge = bridge.clone();
         let key = key.clone();
-        let mut stop = stop_rx.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        // #69：长驻，登记 spawn_forever。
+        let name: &'static str = Box::leak(format!("gh-watch:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn_forever(name, async move {
             crate::log!("[bot:{key}] GitHub watch 任务启动");
-            github_watch_loop(bot, bridge, &mut stop).await;
+            github_watch_loop(bot, bridge, &stop).await;
             crate::log!("[bot:{key}] GitHub watch 任务退出");
         });
     }
 
     // 事件循环：按通道分派
     if bot.is_github_kind() {
-        // #64：GitHub 不是 IM 通道——无事件循环，挂起等 stop；watch 循环照跑。
+        // #64：GitHub 不是 IM 通道——无事件循环，挂起等关停；watch 循环照跑。
         crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
         crate::log!("[bot:{key}] GitHub 渠道启动（无 IM 事件循环，仅 watch）");
-        let mut stop_rx = stop_rx;
         loop {
-            if *stop_rx.borrow() {
+            if stop.is_cancelled() {
                 break;
             }
-            let _ = stop_rx.changed().await;
+            stop.cancelled().await;
         }
         crate::botstatus::clear(&key);
         crate::log!("[bot:{key}] GitHub 循环退出");
     } else if bot.is_dingtalk() {
-        crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop_rx)
+        crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop)
             .await;
         crate::botstatus::clear(&key);
         crate::log!("[bot:{key}] 钉钉 Stream 循环退出");
     } else if bot.is_wechat() {
-        weixin_loop(bot, bridge, stop_rx).await; // weixin_loop 退出时已 clear
+        weixin_loop(bot, bridge, stop).await; // weixin_loop 退出时已 clear
         crate::log!("[bot:{key}] 微信长轮询循环退出");
     } else {
-        crate::ws::ws_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop_rx).await;
+        crate::ws::ws_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop).await;
         crate::botstatus::clear(&key);
         crate::log!("[bot:{key}] WS 循环退出");
     }
@@ -328,7 +349,7 @@ async fn run_bot(
 async fn weixin_loop(
     bot: crate::config::BotConfig,
     bridge: Arc<Bridge>,
-    mut stop_rx: watch::Receiver<bool>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     let key = bot.key();
     let base = if bot.wx_base_url.is_empty() {
@@ -351,12 +372,12 @@ async fn weixin_loop(
     // 半开假死（与 WS 看门狗同理：发得出去≠通，收得到才算通），降级「重连中」并留痕。
     let mut consec_timeouts = 0u32;
     loop {
-        if *stop_rx.borrow() {
+        if stop.is_cancelled() {
             break;
         }
         let next = client.get_updates(&cursor, timeout_ms);
         tokio::select! {
-            _ = stop_rx.changed() => { break; }
+            _ = stop.cancelled() => { break; }
             res = next => {
                 match res {
                     Ok((msgs, new_cursor, new_timeout)) => {
@@ -374,6 +395,8 @@ async fn weixin_loop(
                         // 每条消息 spawn 独立处理（对齐飞书 ws_loop）：per-chat 串行由 bridge 的
                         // chat_lock 保证，而「停止词」等控制消息须能与运行中的任务**并发**处理，
                         // 若在此串行 await，长任务会把它（及其后的新消息）全部堵到跑完为止。
+                        // #69 审计：短/中命、有 owner（bridge chat_lock + pending.json 恢复），
+                        // 不登记——关停语义靠进程退出兜底（见 tasks.rs 登记口径）。
                         for msg in msgs {
                             let b = bridge.clone();
                             tokio::spawn(async move {
@@ -399,7 +422,7 @@ async fn weixin_loop(
                     Err(e) => {
                         crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "重连中");
                         crate::log!("[bot:{key}] getupdates 出错，3s 后重试：{e}");
-                        if interruptible_sleep(std::time::Duration::from_secs(3), &mut stop_rx).await {
+                        if interruptible_sleep(std::time::Duration::from_secs(3), &stop).await {
                             break;
                         }
                     }
@@ -610,11 +633,14 @@ pub(crate) fn worker_ev(
 /// 防永久失败目标（chat_id 填错/用户退群）无限重试 + 已成功目标重复私信。
 const GH_RETRY_MAX: u32 = 5;
 
-/// 睡眠 dur，但可被 stop 信号打断。返回 true=收到停止信号（调用方应 break）。
-async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receiver<bool>) -> bool {
+/// 睡眠 dur，但可被关停令牌打断。返回 true=收到关停广播（调用方应 break）。
+async fn interruptible_sleep(
+    dur: std::time::Duration,
+    stop: &tokio_util::sync::CancellationToken,
+) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(dur) => false,
-        _ = stop.changed() => true,
+        _ = stop.cancelled() => true,
     }
 }
 
@@ -626,7 +652,7 @@ async fn interruptible_sleep(dur: std::time::Duration, stop: &mut watch::Receive
 async fn github_watch_loop(
     bot: crate::config::BotConfig,
     bridge: Arc<Bridge>,
-    stop_rx: &mut watch::Receiver<bool>,
+    stop: &tokio_util::sync::CancellationToken,
 ) {
     let key = bot.key();
     let repos = bot.gh_repo_list();
@@ -646,7 +672,7 @@ async fn github_watch_loop(
     let mut cursor = crate::github::GhCursor::load(&key);
     let mut consec_errs = 0u32;
     loop {
-        if interruptible_sleep(std::time::Duration::from_secs(60), stop_rx).await {
+        if interruptible_sleep(std::time::Duration::from_secs(60), stop).await {
             break;
         }
         // 通知目标与提及映射都空 → 轮询无意义；两者任一配置即跑（评审 I1：
@@ -797,6 +823,8 @@ async fn github_watch_loop(
                                     // 兼容：无 worker 表（未迁移旧配置）→ 原单触发行为
                                     let bridge = bridge.clone();
                                     let ev = auto_ev(&repo, t.number, t.comment_id, &notify_chat);
+                                    // #69 审计：短/中命、有 owner（bridge + pending 恢复），
+                                    // 不登记（见 tasks.rs 登记口径）。
                                     tokio::spawn(async move {
                                         bridge.handle(ev).await;
                                     });
@@ -807,6 +835,7 @@ async fn github_watch_loop(
                                 let bridge = bridge.clone();
                                 let ev =
                                     worker_ev(&repo, t.number, t.comment_id, &notify_chat, idx, w);
+                                // #69 审计：同上——worker 分析是独立 agent 运行，不登记。
                                 tokio::spawn(async move {
                                     bridge.handle(ev).await;
                                 });

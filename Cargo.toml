@@ -17,6 +17,8 @@ build = "build.rs"
 slint = { version = "1.17", features = ["unstable-winit-030"] }
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "process", "time", "sync", "io-util", "signal"] }
+# #69 后台任务治理：TaskTracker（rt 特性）+ CancellationToken 优雅关闭
+tokio-util = { version = "0.7", features = ["rt"] }
 # WS：关默认 native-tls，rustls + webpki 根证书 = 全静态
 tokio-tungstenite = { version = "0.26", default-features = false,
                       features = ["connect", "rustls-tls-webpki-roots"] }

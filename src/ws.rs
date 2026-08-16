@@ -8,7 +8,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -103,7 +102,7 @@ pub async fn ws_loop(
     app_id: String,
     app_secret: String,
     bridge: Arc<Bridge>,
-    mut stop: watch::Receiver<bool>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     let mut conf = WsConf::default();
     let mut fails: i64 = 0;
@@ -113,10 +112,10 @@ pub async fn ws_loop(
         bridge.bot.bot_name.clone(),
     );
     loop {
-        if *stop.borrow() {
+        if stop.is_cancelled() {
             return;
         }
-        match run_conn(&app_id, &app_secret, &bridge, &mut stop, &mut conf).await {
+        match run_conn(&app_id, &app_secret, &bridge, &stop, &mut conf).await {
             Ok(()) => return, // 只有 stop 才会 Ok
             Err(e) => {
                 fails += 1;
@@ -139,7 +138,7 @@ pub async fn ws_loop(
         crate::log!("[ws] {}s 后重连…", wait.as_secs());
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
-            _ = stop.changed() => return,
+            _ = stop.cancelled() => return,
         }
     }
 }
@@ -148,7 +147,7 @@ async fn run_conn(
     app_id: &str,
     app_secret: &str,
     bridge: &Arc<Bridge>,
-    stop: &mut watch::Receiver<bool>,
+    stop: &tokio_util::sync::CancellationToken,
     conf: &mut WsConf,
 ) -> Result<()> {
     let new_conf = handshake(app_id, app_secret).await?;
@@ -183,7 +182,7 @@ async fn run_conn(
 
     loop {
         tokio::select! {
-            _ = stop.changed() => {
+            _ = stop.cancelled() => {
                 crate::log!("[ws] 收到停止信号，关闭连接");
                 let _ = sink.send(Message::Close(None)).await;
                 return Ok(());
@@ -237,6 +236,8 @@ async fn run_conn(
                                         .context("回 ack 失败")?;
                                     let b = bridge.clone();
                                     let payload = f.payload.clone();
+                                    // #69 审计：短/中命、有 owner（bridge chat_lock +
+                                    // pending.json 恢复），不登记（见 tasks.rs 登记口径）。
                                     tokio::spawn(async move {
                                         b.on_payload(&payload).await;
                                     });
