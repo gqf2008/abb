@@ -67,7 +67,7 @@ ABB 与 GitHub/GitLab 协同处理问题的设计文档。实现见 `feat(github
 ## GitHub 渠道化（2.9.0 起）
 
 GitHub 是与飞书/微信/钉钉**同级的渠道**：bot 列表可添加 kind=github 的 bot，每个 =
-一个 GitHub 账号 + 一个 agent 后端（claude/codex/pi 真正干活），与 IM bot 零绑定。
+一个 GitHub 账号 + 一个 agent 后端（claude/codex/pi/prime-agent 真正干活），与 IM bot 零绑定。
 
 - 通知/提及/自动处理回执经 RoutedMessenger 按 `bot_key:chat_id` 目标跨 bot 直达任意
   IM 会话（通知群与提及映射的 chat 段升级为该格式；裸 chat_id 视为配置错误并重试提示）

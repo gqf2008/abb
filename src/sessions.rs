@@ -1,7 +1,7 @@
 //! 会话持久化 —— ~/.agent-bridge/workspaces/<bot>/sessions.json。
-//! 会话按后端区分（claude 的 --resume UUID、codex 的 thread_id、pi 的 --session-id UUID 互不通用，
-//! 共用一个槽位切后端必串）：
-//! {chat_id: {claude: {session_id, started}, codex: {session_id, started}, pi: {session_id, started}}}
+//! 会话按后端区分（claude 的 --resume UUID、codex 的 thread_id、pi 的 --session-id UUID、
+//! prime-agent 自生成的会话 id——四者互不通用，共用一个槽位切后端必串）：
+//! {chat_id: {claude: {session_id, started}, codex: {...}, pi: {...}, prime_agent: {...}}}
 //! 当前操作哪个后端的槽位由 SessionStore::new(current_backend, bot_key) 选定——即 per-bot 配置的后端。
 //! 旧扁平格式 {chat_id: {backend, session_id, started}} load 时自动迁移到对应后端的槽位。
 
@@ -30,6 +30,8 @@ pub struct ChatEntry {
     pub codex: Slot,
     #[serde(default, skip_serializing_if = "Slot::is_empty")]
     pub pi: Slot,
+    #[serde(default, skip_serializing_if = "Slot::is_empty")]
+    pub prime_agent: Slot,
 }
 
 impl Slot {
@@ -128,6 +130,7 @@ impl SessionStore {
                 !e.claude.session_id.is_empty()
                     || !e.codex.session_id.is_empty()
                     || !e.pi.session_id.is_empty()
+                    || !e.prime_agent.session_id.is_empty()
             });
             if has_data || m.is_empty() {
                 return Some(m);
@@ -149,6 +152,8 @@ impl SessionStore {
                 entry.codex = slot;
             } else if e.backend.eq_ignore_ascii_case("pi") {
                 entry.pi = slot;
+            } else if e.backend.eq_ignore_ascii_case("prime-agent") {
+                entry.prime_agent = slot;
             } else {
                 entry.claude = slot; // 默认/旧值一律归 claude
             }
@@ -181,6 +186,8 @@ impl SessionStore {
             &mut entry.codex
         } else if backend.eq_ignore_ascii_case("pi") {
             &mut entry.pi
+        } else if backend.eq_ignore_ascii_case("prime-agent") {
+            &mut entry.prime_agent
         } else {
             &mut entry.claude
         }
@@ -261,11 +268,11 @@ impl SessionStore {
 
     /// set_session_id 的 CAS 版本：仅当该 chat 当前槽位的 session_id == expected 时回存，
     /// 返回是否真的回存。任务运行中槽位被 /new 或 CLI `session reset` 换走时（槽位已不是
-    /// 本次任务启动时的会话），不得把旧任务的 thread_id 写进新槽位——否则桥的
-    /// mark_started_if 会匹配旧 thread，把新会话标成旧线程的 started，下一条 resume
-    /// 旧线程、/new 失效（#49 审查：codex 首轮运行中 /new 的交错场景）。
-    /// （原无条件覆盖版 set_session_id 已被本方法取代：唯一调用方是 codex 首轮回存，
-    /// 该场景必须先验证槽位身份再写。）
+    /// 本次任务启动时的会话），不得把旧任务的会话 id 写进新槽位——否则桥的
+    /// mark_started_if 会匹配旧会话，把新会话标成旧会话的 started，下一条 resume
+    /// 旧会话、/new 失效（#49 审查：codex/prime-agent 首轮运行中 /new 的交错场景）。
+    /// （原无条件覆盖版 set_session_id 已被本方法取代：调用方是 codex / prime-agent
+    /// 首轮回存——两者都用对端自生成的真实会话 id，必须先验证槽位身份再写。）
     pub fn set_session_id_if(&self, chat_id: &str, expected: &str, session_id: &str) -> bool {
         self.refresh();
         let mut data = self.data.lock().unwrap();
@@ -295,11 +302,37 @@ impl SessionStore {
                     e.codex.started
                 } else if self.current_backend.eq_ignore_ascii_case("pi") {
                     e.pi.started
+                } else if self.current_backend.eq_ignore_ascii_case("prime-agent") {
+                    e.prime_agent.started
                 } else {
                     e.claude.started
                 }
             })
             .unwrap_or(false)
+    }
+
+    /// 枚举指定后端**全部 chat** 存活槽位的 session_id（#67 /new 清理用）。
+    /// prime 会话目录是 per-bot、槽位是 per-chat——清理会话文件必须知道哪些 id
+    /// 仍被别的聊天占用（误删会让别的聊天静默丢上下文）。
+    pub fn live_session_ids(&self, backend: &str) -> Vec<String> {
+        self.refresh();
+        let data = self.data.lock().unwrap();
+        let mut ids = Vec::new();
+        for e in data.values() {
+            let sid = if backend.eq_ignore_ascii_case("codex") {
+                &e.codex.session_id
+            } else if backend.eq_ignore_ascii_case("pi") {
+                &e.pi.session_id
+            } else if backend.eq_ignore_ascii_case("prime-agent") {
+                &e.prime_agent.session_id
+            } else {
+                &e.claude.session_id
+            };
+            if !sid.is_empty() {
+                ids.push(sid.clone());
+            }
+        }
+        ids
     }
 }
 
@@ -323,28 +356,38 @@ mod tests {
         let m2 = SessionStore::parse(legacy_pi).expect("pi 旧格式应可迁移");
         assert_eq!(m2["oc_p"].pi.session_id, "p-uuid");
         assert!(m2["oc_p"].claude.session_id.is_empty());
+
+        // prime-agent 后端的旧扁平记录 → 落到 prime_agent 槽位
+        let legacy_pa =
+            r#"{"oc_q": {"backend": "prime-agent", "session_id": "q-uuid", "started": true}}"#;
+        let m3 = SessionStore::parse(legacy_pa).expect("prime-agent 旧格式应可迁移");
+        assert_eq!(m3["oc_q"].prime_agent.session_id, "q-uuid");
+        assert!(m3["oc_q"].claude.session_id.is_empty());
     }
 
     #[test]
     fn parses_per_backend_format() {
-        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}, "pi": {"session_id": "p-uuid", "started": true}}}"#;
+        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}, "pi": {"session_id": "p-uuid", "started": true}, "prime_agent": {"session_id": "q-uuid", "started": false}}}"#;
         let m = SessionStore::parse(new).expect("新格式应解析");
         let e = &m["oc_xxx"];
         assert_eq!(e.claude.session_id, "c-uuid");
         assert_eq!(e.codex.session_id, "x-tid");
         assert_eq!(e.pi.session_id, "p-uuid");
         assert!(e.pi.started);
+        assert_eq!(e.prime_agent.session_id, "q-uuid");
+        assert!(!e.prime_agent.started);
     }
 
     #[test]
     fn backends_are_independent() {
-        // 同一 chat 的 claude/codex/pi 槽位互不干扰（切后端不串）
+        // 同一 chat 的 claude/codex/pi/prime_agent 槽位互不干扰（切后端不串）
         let new = r#"{"c": {"claude": {"session_id": "claude-uuid", "started": true}}}"#;
         let m = SessionStore::parse(new).unwrap();
         let e = &m["c"];
         assert_eq!(e.claude.session_id, "claude-uuid");
         assert!(e.codex.session_id.is_empty());
         assert!(e.pi.session_id.is_empty());
+        assert!(e.prime_agent.session_id.is_empty());
     }
 
     #[test]
@@ -368,6 +411,65 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("c-uuid"));
         assert!(text.contains(&sid));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prime_slot_isolated_and_cas() {
+        // prime-agent 槽位独立（#67）：其它槽位有值不影响 prime 槽位读写；CAS 回存同 codex
+        let dir = std::env::temp_dir().join(format!("abb-sessions-prime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_x": {"claude": {"session_id": "c-uuid", "started": true}, "pi": {"session_id": "p-uuid", "started": true}}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::new_at("prime-agent", path.clone());
+        let (placeholder, started) = store.ensure_with_started("oc_x");
+        assert!(!started, "prime 槽位应是全新会话");
+        // 首轮回存真实会话 id（prime 自生成，codex 模式）
+        assert!(store.set_session_id_if("oc_x", &placeholder, "real-prime-id"));
+        let (cur, _) = store.ensure_with_started("oc_x");
+        assert_eq!(cur, "real-prime-id");
+        // 槽位被 /new 换走 → 旧任务回存被拒（CAS 身份校验）
+        let fresh = store.reset_session("oc_x");
+        assert!(
+            !store.set_session_id_if("oc_x", &placeholder, "stale"),
+            "槽位已换走，旧任务回存必须被拒"
+        );
+        let (cur2, _) = store.ensure_with_started("oc_x");
+        assert_eq!(cur2, fresh);
+        // 其它槽位不受影响
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("c-uuid"));
+        assert!(text.contains("p-uuid"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_session_ids_enumerates_all_chats() {
+        // #67：/new 清理 prime 会话文件按「存活槽位」判定——枚举必须跨全部 chat key
+        // 且只取指定后端（误删其它聊天/其它后端的会话都会静默丢上下文）
+        let dir = std::env::temp_dir().join(format!("abb-sessions-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("prime-agent", path.clone());
+        let a = store.ensure_with_started("oc_a").0;
+        let b = store.ensure_with_started("oc_b").0;
+        let mut ids = store.live_session_ids("prime-agent");
+        ids.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(ids, want, "跨全部 chat 枚举 prime 槽位");
+        // 其它后端的槽位不混入
+        let text = r#"{"oc_c": {"claude": {"session_id": "c-uuid", "started": true}}}"#;
+        std::fs::write(&path, text).unwrap();
+        assert!(
+            store.live_session_ids("prime-agent").is_empty(),
+            "claude 槽位不算 prime 存活会话"
+        );
+        assert_eq!(store.live_session_ids("claude"), vec!["c-uuid"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

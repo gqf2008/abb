@@ -48,7 +48,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 |---|---|
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
 | GitHub 联动 | 群里 @ bot 分析 / 关闭 / 创建 GitHub issue（仓库白名单把关），新 issue 自动通知到群 |
-| 多模型后端 | Claude / Codex / Pi（pi-coding-agent），或任意 Anthropic / OpenAI 兼容供应商 |
+| 多模型后端 | Claude / Codex / Pi（pi-coding-agent）/ prime-agent（Prime Intellect），或任意 Anthropic / OpenAI 兼容供应商 |
 | 多轮会话 | 每个 bot 独立记忆，不会串味；任务进行中发 `/cancel`（或「停止」等自然词）立即取消，无任务时发 `/cancel` 会给明确提示；聊天发 `/new` 立即新建会话（清空上下文，无需重启） |
 | 引用/回复上下文 | 引用一条消息再 @ bot 时，自动读取被引用消息内容（飞书按 parent_id 拉取、微信 ref_msg、钉钉 repliedMsg）带进 agent，回复不会脱离上文 |
 | 定时任务 | 自然语言创建：`每天 9 点`、`每 30 分钟`、`工作日 10 点`……中文 cron 全支持 |
@@ -77,8 +77,8 @@ owner 会话不受影响（保持本机全权限）；信任的团队成员可�
 （授权者恢复与 owner 同权限）。已知局限（2026-08-14 实测）：codex 后端为「尽力
 隔离」——read-only 沙箱（不可写任何文件）+ 网络拦截（本机实测 curl DNS 被拦），
 但沙箱可读全盘（敏感文件若被写进回复仍会外泄）、macOS 网络隔离历史上不可靠需
-按环境复测、read-only 下授权者的定时任务与跨会话投递不可用；pi 后端不支持受限
-模式（授权者会话被拒绝，换 claude/codex 后端即可）。
+按环境复测、read-only 下授权者的定时任务与跨会话投递不可用；pi / prime-agent
+后端不支持受限模式（授权者会话被拒绝，换 claude/codex 后端即可）。
 
 ## 常见问题
 

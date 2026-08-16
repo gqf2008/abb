@@ -997,16 +997,62 @@ impl Bridge {
                 // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
                 let old_sid = self.sessions.ensure_with_started(&key).0;
                 let new_sid = self.sessions.reset_session(&key);
-                if Backend::parse(self.bot.effective_backend(&self.default_backend)) == Backend::Pi
-                {
-                    let pi_dir = crate::workspace_dir(&self.bot.key()).join(".pi-sessions");
-                    if let Ok(entries) = std::fs::read_dir(&pi_dir) {
-                        for e in entries.flatten() {
-                            if e.file_name().to_string_lossy().contains(&old_sid) {
-                                let _ = std::fs::remove_file(e.path());
+                match Backend::parse(self.bot.effective_backend(&self.default_backend)) {
+                    // #56/#57：/new 后旧 sid 的 pi 会话文件永久失效（pi 按 sid 续聊，新 sid
+                    // 不再触碰旧文件）——顺手清掉：.pi-sessions 是 #56 探针的唯一信号源，
+                    // 残留文件只增不减会拖慢每轮探针扫描并堆积磁盘。CLI `session reset`
+                    // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
+                    Backend::Pi => {
+                        let pi_dir = crate::workspace_dir(&self.bot.key()).join(".pi-sessions");
+                        if let Ok(entries) = std::fs::read_dir(&pi_dir) {
+                            for e in entries.flatten() {
+                                if e.file_name().to_string_lossy().contains(&old_sid) {
+                                    let _ = std::fs::remove_file(e.path());
+                                }
                             }
                         }
                     }
+                    // #67：prime 会话文件名是 ULID（不含会话 id），无法按文件名过滤——
+                    // 按内容判定：删「首行 id 不属于任何存活槽位」的文件。
+                    // 覆盖三类：本聊天 reset 后的旧会话（出槽）、失败轮孤儿（id 从未
+                    // 回存进槽位）、损坏文件（首行 id 不可解析，不可能是存活会话）。
+                    // **不得**像 pi 那样简单清目录：.prime-sessions 是 per-bot 目录而
+                    // 槽位是 per-chat——直接清空会把同 bot 其它聊天的活跃会话连带删掉
+                    // （审查 Important）。10 分钟 mtime 护栏：另一个聊天正在跑的首轮
+                    // 任务（新会话 id 尚未回存进槽位）不属存活集，但文件正被追加写
+                    // （mtime 新鲜）——不得误删，留待下次 /new 时已过期回收。
+                    Backend::PrimeAgent => {
+                        let live: std::collections::HashSet<String> = self
+                            .sessions
+                            .live_session_ids("prime-agent")
+                            .into_iter()
+                            .collect();
+                        let dir = crate::workspace_dir(&self.bot.key()).join(".prime-sessions");
+                        let cutoff =
+                            std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for e in entries.flatten() {
+                                // 读不到 mtime 按新鲜处理——宁留不删（留的代价是孤儿
+                                // 堆积，删错是别人丢上下文）
+                                let fresh = e
+                                    .metadata()
+                                    .and_then(|m| m.modified())
+                                    .map(|t| t > cutoff)
+                                    .unwrap_or(true);
+                                if fresh {
+                                    continue;
+                                }
+                                let remove = match crate::agent::session_file_id(&e.path()) {
+                                    None => true,
+                                    Some(id) => !live.contains(&id),
+                                };
+                                if remove {
+                                    let _ = std::fs::remove_file(e.path());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 crate::log!(
                     "[bridge] /new 新建会话 bot={} key={} sid={}",
@@ -1270,43 +1316,55 @@ impl Bridge {
             //   同一历史块二次写进 pi transcript；文件缺失（且 marker 命中）才是真丢失。
             // - resume（既有会话）：pending 命中（#54 自愈重建/换 UUID 后待补注入）
             //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）；
-            //   或 pi 会话文件丢失/损坏（#56：pi 对不可续聊的文件同 sid 静默新建空会话
-            //   ——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入（run 前即可
-            //   探明，比 pending 早一轮）。**不设 marker 防重复护栏**：pi run 成功必落
-            //   会话文件（核心功能），文件持续不可续聊 = 每轮都是新会话，重注入是
+            //   或 pi/prime-agent 会话文件丢失/损坏（#56/#67：pi 对不可续聊的文件同 sid
+            //   静默新建空会话——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入
+            //   （run 前即可探明，比 pending 早一轮）。**不设 marker 防重复护栏**：pi run
+            //   成功必落会话文件（核心功能），文件持续不可续聊 = 每轮都是新会话，重注入是
             //   正确行为；用「marker 匹配即已注入过」拦截会把「迁移后文件才丢失」的
             //   真丢失误判为已注入（静默永久无上下文，恰是本功能要杀的症状）——布局
             //   误报的代价是可见噪音（提示从首轮起可见；误报持续时注入块按轮累积进
             //   pi transcript，每轮 ≤6000 字符），可接受。
             //
-            // 架构判断（#56/#57 审查遗留的定论）：三后端的丢失检测**分层是本质而非债**
-            // ——claude/codex 有错误文本（no rollout found / No conversation found）只能
-            // 事后分类（agent.rs run），pi 无错误信号只能事前探查（本闸的探针），统一成
-            // 单一信号会让 pi 失去「本轮直接注入」的优势。重新审视本分层的触发条件：
-            // **接入第 4 个后端时**（届时若又是一种新形态，再考虑 RunOutcome 加统一
-            // context_lost 信号面）。
+            // 架构（#56/#57/#67 定论）：丢失检测**分层是本质而非债**——
+            // - claude/codex 有错误文本（no rollout found / No conversation found），事后
+            //   分类（agent.rs run）→ rebuilt + pending 迁移标记补注入；
+            // - pi 无错误信号（静默新建），只能事前探查（本闸的探针）→ 本轮直接注入；
+            // - prime-agent 两种信号都有（--resume 不存在 → exit 1 + "No session found"，
+            //   可走后述重建；会话文件经 --session-dir 落盘，可走探针）——探针先行
+            //   （早一轮注入），run 失败后 run() 的 session_lost 分支兜底重建。
             let marker = hist.marker();
-            let pi_lost = || {
-                backend == Backend::Pi
+            let session_file_lost = || {
+                (backend == Backend::Pi
                     && !crate::agent::pi_session_exists(
                         &crate::workspace_dir(&self.bot.key()),
                         &session_id,
-                    )
+                    ))
+                    || (backend == Backend::PrimeAgent
+                        && !crate::agent::prime_session_exists(
+                            &crate::workspace_dir(&self.bot.key()),
+                            &session_id,
+                        ))
             };
-            let pi_alive = || {
-                backend == Backend::Pi
+            let session_file_alive = || {
+                (backend == Backend::Pi
                     && crate::agent::pi_session_exists(
                         &crate::workspace_dir(&self.bot.key()),
                         &session_id,
-                    )
+                    ))
+                    || (backend == Backend::PrimeAgent
+                        && crate::agent::prime_session_exists(
+                            &crate::workspace_dir(&self.bot.key()),
+                            &session_id,
+                        ))
             };
             let should_inject = if !resume {
                 match &marker {
-                    Some(m) => m.session_id != session_id || pi_lost(),
-                    None => !pi_alive(),
+                    Some(m) => m.session_id != session_id || session_file_lost(),
+                    None => !session_file_alive(),
                 }
             } else {
-                matches!(&marker, Some(m) if m.pending && m.session_id == session_id) || pi_lost()
+                matches!(&marker, Some(m) if m.pending && m.session_id == session_id)
+                    || session_file_lost()
             };
             let injected_rounds = if should_inject {
                 let (block, n) = hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
@@ -2430,8 +2488,15 @@ mod tests {
             // 留文件（文件里已有该轮的注入块与消息）；mock 原只在 Reply 写盘，导致
             // 「失败后文件存在 → 不重复注入」的生产路径测试不可表达，T5 反而锁定了
             // 与生产矛盾的语义。写在 run 入口 = 所有 outcome（Reply/Fail/Cancel）都留盘。
-            if backend == Backend::Pi {
-                let _ = write_pi_session_file(bot_key, session_id);
+            // prime 同 pi（#67）：会话创建即落盘，mock 同等对待。
+            match backend {
+                Backend::Pi => {
+                    let _ = write_pi_session_file(bot_key, session_id);
+                }
+                Backend::PrimeAgent => {
+                    let _ = write_prime_session_file(bot_key, session_id);
+                }
+                _ => {}
             }
             // 先把中途输出推完（unbounded 即推即走），桥侧 select/收尾排空负责丢弃
             if let Some(tx) = &progress {
@@ -2499,6 +2564,34 @@ mod tests {
                 "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
             ),
         )
+    }
+
+    /// #67：写一个形态正确的 prime 会话文件——与 pi 的差异仅在目录与文件名
+    /// （prime 文件名是 ULID，**不含**会话 id，探针按首行 id 匹配）。
+    /// 返回文件路径（/new 清理测试需要按文件断言存在性/拨旧 mtime）。
+    fn write_prime_session_file(bot_key: &str, sid: &str) -> std::io::Result<std::path::PathBuf> {
+        let dir = crate::workspace_dir(bot_key).join(".prime-sessions");
+        std::fs::create_dir_all(&dir)?;
+        let compact = sid.replace('-', "");
+        let stem = compact.get(..12).unwrap_or(&compact);
+        let path = dir.join(format!("01a00a5d-fc0a-760e-b9dc-{stem}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
+            ),
+        )?;
+        Ok(path)
+    }
+
+    /// 把文件 mtime 拨旧（1 小时前）——模拟不活跃会话/孤儿（/new 清理的 10 分钟护栏外）。
+    fn set_mtime_old(path: &std::path::Path) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)),
+        )
+        .unwrap();
     }
 
     fn test_ev(mid: &str, chat_id: &str, text: &str) -> Ev {
@@ -2740,6 +2833,52 @@ mod tests {
             .unwrap();
         assert!(!runner.prompts()[1].contains("[历史上下文]"));
         assert!(!msgr.sent()[1].contains("已携带"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// #67：/new 后 prime 会话文件清理（审查 Important 修复）：删「首行 id 不属于任何
+    /// 存活槽位且 mtime 已过期」的文件——本聊天旧会话与失败轮孤儿回收；同 bot 其它
+    /// 聊天的活跃会话与在途新会话（mtime 新鲜）不得误删。
+    #[tokio::test]
+    async fn new_clears_prime_session_files() {
+        let runner = Arc::new(MockAgentRunner::immediate("ok"));
+        let bot = backend_bot("prime-agent");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let dir = crate::workspace_dir(&bot.key()).join(".prime-sessions");
+
+        // 本聊天既有会话（mtime 拨旧 = 已不活跃）→ /new 后应删
+        let sid = bridge.sessions.ensure_with_started("oc_x").0;
+        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
+        let f_old = write_prime_session_file(&bot.key(), &sid).unwrap();
+        set_mtime_old(&f_old);
+        // 同 bot 其它聊天的活跃会话（存活槽位）→ 必须保留
+        let other_sid = bridge.sessions.ensure_with_started("oc_other").0;
+        let f_other = write_prime_session_file(&bot.key(), &other_sid).unwrap();
+        // 失败轮孤儿（id 不在任何槽位，mtime 旧）→ 应回收
+        let f_orphan = dir.join("01a00a5d-fc0a-760e-b9dc-orphan01.jsonl");
+        std::fs::write(
+            &f_orphan,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"orphan-dead-id\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}\n",
+        )
+        .unwrap();
+        set_mtime_old(&f_orphan);
+        // 在途新会话（id 未知、mtime 新鲜）→ 10 分钟护栏保留
+        let f_inflight = dir.join("01a00a5d-fc0a-760e-b9dc-inflight1.jsonl");
+        std::fs::write(
+            &f_inflight,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"inflight-unknown\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}\n",
+        )
+        .unwrap();
+
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("n1", "oc_x", "/new")).await })
+            .await
+            .unwrap();
+
+        assert!(!f_old.exists(), "本聊天旧会话文件已清");
+        assert!(f_other.exists(), "其它聊天活跃会话保留");
+        assert!(!f_orphan.exists(), "失败轮孤儿回收");
+        assert!(f_inflight.exists(), "在途（mtime 新鲜）不误删");
         cleanup_bridge(&bridge);
     }
 
@@ -3002,6 +3141,42 @@ mod tests {
         assert!(!m.pending && m.session_id == sid, "注入后 marker 复位");
 
         // msg2：mock 已模拟 pi 落盘（run 成功必写会话文件）→ 正常续聊不注入、无提示
+        let b2 = bridge.clone();
+        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        assert!(!runner.prompts()[1].contains("[历史上下文]"));
+        assert!(!msgr.sent()[1].contains("已携带"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// #67：prime-agent 会话文件丢失 → resume 轮本轮直接注入（与 pi 探针同语义；
+    /// 差异只在探针目录/文件名——prime 文件名不含 sid，按首行 id 匹配）。
+    /// prime 对不可续聊目标另有 exit 1 + "No session found" 错误信号（run 重建兜底），
+    /// 探针先行可早一轮注入，两者互补。
+    #[tokio::test]
+    async fn prime_session_loss_injects_directly() {
+        let runner = Arc::new(MockAgentRunner::immediate("重建轮的回复"));
+        let bot = backend_bot("prime-agent");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let (hist, sid) = seed_migrated_session(&bridge, &bot, "oc_x");
+
+        // msg1：.prime-sessions 下无该 sid 文件 = 会话已丢失 → 本轮直接注入 + 提示
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "还在吗")).await })
+            .await
+            .unwrap();
+        assert!(
+            runner.prompts()[0].contains("[历史上下文]"),
+            "文件丢失本轮直接注入: {}",
+            runner.prompts()[0]
+        );
+        assert!(runner.prompts()[0].contains("旧背景"));
+        assert!(msgr.sent()[0].contains("已携带"));
+        let m = hist.marker().unwrap();
+        assert!(!m.pending && m.session_id == sid, "注入后 marker 复位");
+
+        // msg2：mock 已模拟 prime 落盘（ULID 文件名、首行 id 命中）→ 正常续聊不注入
         let b2 = bridge.clone();
         tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
             .await
