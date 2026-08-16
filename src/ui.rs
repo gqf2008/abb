@@ -868,23 +868,43 @@ pub fn run_gui() -> Result<()> {
                     UiCmd::InstallDep(dep_id) => {
                         // #60：与一键装同款 spawn 解耦——recv 循环是单消费者串行处理所有
                         // UiCmd，inline await 安装会把托盘 Start/Stop 阻塞数分钟。
+                        // 鲁棒性（用户反馈）：panic 防护——安装内部异常也要回结果，
+                        // 否则 dep-busy 永久卡死、安装按钮全部禁用至重启。
                         let dep_tx = dep_tx.clone();
                         tokio::spawn(async move {
-                            let r = crate::deps::run_install(&dep_id).await;
+                            let r = futures_util::FutureExt::catch_unwind(
+                                std::panic::AssertUnwindSafe(crate::deps::run_install(&dep_id)),
+                            )
+                            .await
+                            .map_err(|_| "安装内部错误（异常中断）".to_string())
+                            .and_then(|r| r);
                             let _ = dep_tx.send(DepEvt::Done { dep_id, result: r });
                         });
                     }
                     UiCmd::InstallAllMissing => {
                         let dep_tx = dep_tx.clone();
                         tokio::spawn(async move {
-                            let outcome = crate::deps::install_all_missing(|evt| {
-                                let _ = dep_tx.send(DepEvt::AllProgress {
-                                    label: evt.label,
-                                    idx: evt.idx,
-                                    total: evt.total,
-                                });
-                            })
-                            .await;
+                            let outcome = futures_util::FutureExt::catch_unwind(
+                                std::panic::AssertUnwindSafe(crate::deps::install_all_missing(
+                                    |evt| {
+                                        let _ = dep_tx.send(DepEvt::AllProgress {
+                                            label: evt.label,
+                                            idx: evt.idx,
+                                            total: evt.total,
+                                        });
+                                    },
+                                )),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                // panic → 全失败单条汇总（如实呈现而非卡死）
+                                let mut o = crate::deps::AllInstallOutcome::default();
+                                o.failed.push((
+                                    "内部错误".to_string(),
+                                    "安装过程异常中断（已记录日志）".to_string(),
+                                ));
+                                o
+                            });
                             let _ = dep_tx.send(DepEvt::AllDone(outcome));
                         });
                     }
@@ -1920,12 +1940,18 @@ pub fn run_gui() -> Result<()> {
                                 push_deps_to_window(&w);
                                 match result {
                                     Ok(_) => {
+                                        w.set_dep_detail("".into());
                                         w.set_status_is_error(false);
                                         w.set_status_line(format!("✅ {dep_id} 安装完成").into());
                                     }
                                     Err(e) => {
+                                        // 完整错误进详情区（状态行单行截断，用户看不到长原因）
+                                        w.set_dep_detail(format!("{dep_id} 安装失败：\n{e}").into());
                                         w.set_status_is_error(true);
-                                        w.set_status_line(format!("⚠️ {e}").into());
+                                        w.set_status_line(format!(
+                                            "⚠️ {dep_id} 安装失败，详情见下方错误区"
+                                        )
+                                        .into());
                                     }
                                 }
                             }
@@ -1935,8 +1961,30 @@ pub fn run_gui() -> Result<()> {
                             DepEvt::AllDone(outcome) => {
                                 w.set_dep_busy("".into());
                                 push_deps_to_window(&w); // 重检测：卡片/横幅/首页计数自动刷新
-                                w.set_status_is_error(!outcome.failed.is_empty());
-                                w.set_status_line(crate::deps::format_all_summary(&outcome).into());
+                                let failed = !outcome.failed.is_empty();
+                                if failed {
+                                    // 完整失败详情逐条进详情区；状态行只给短摘要
+                                    let detail = outcome
+                                        .failed
+                                        .iter()
+                                        .map(|(id, e)| format!("{id}：{e}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n");
+                                    w.set_dep_detail(detail.into());
+                                    w.set_status_is_error(true);
+                                    w.set_status_line(format!(
+                                        "⚠️ 一键安装完成：成功 {} 项，失败 {} 项（详情见下方错误区）",
+                                        outcome.ok.len(),
+                                        outcome.failed.len()
+                                    )
+                                    .into());
+                                } else {
+                                    w.set_dep_detail("".into());
+                                    w.set_status_is_error(false);
+                                    w.set_status_line(
+                                        crate::deps::format_all_summary(&outcome).into(),
+                                    );
+                                }
                             }
                         }
                     }
