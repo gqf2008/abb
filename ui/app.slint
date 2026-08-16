@@ -390,6 +390,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
+    in-out property <string> dep-detail: ""; // 安装失败详情（多行完整原因；状态行只放短摘要）
 
     // 系统权限（仅 macOS）：完全磁盘/辅助功能/屏幕录制/自动化/摄像头/麦克风。0=未授权 1=被拒绝 2=已授权
     in-out property <int> perm-full-disk: 0;
@@ -1211,26 +1212,27 @@ export component SettingsWindow inherits Window {
                                                     Text { text: "仓库 worker"; width: 80px; font-size: 11px; color: #888; vertical-alignment: center; }
                                                     VerticalBox {
                                                         horizontal-stretch: 1;
-                                                        spacing: 4px;
+                                                        spacing: 3px;
                                                         for w[i] in root.bots[root.selected].gh-workers: Rectangle {
-                                                            height: 32px;
+                                                            height: 28px;
                                                             HorizontalBox {
-                                                                spacing: 4px;
+                                                                spacing: 3px;
                                                                 LineEdit {
                                                                     text: w.repo;
-                                                                    placeholder-text: "owner/repo 或 owner/*";
-                                                                    width: 130px;
+                                                                    placeholder-text: "owner/repo 或 *";
+                                                                    width: 96px;
                                                                     edited => { root.gh-worker-edit(i, "repo", self.text); }
                                                                 }
                                                                 ComboBox {
                                                                     model: ["claude", "codex", "pi"];
                                                                     current-value: w.backend;
+                                                                    width: 80px;
                                                                     selected => { root.gh-worker-edit(i, "backend", self.current-value); }
                                                                 }
                                                                 LineEdit {
                                                                     text: w.role;
-                                                                    placeholder-text: "角色名";
-                                                                    width: 90px;
+                                                                    placeholder-text: "角色";
+                                                                    width: 56px;
                                                                     edited => { root.gh-worker-edit(i, "role", self.text); }
                                                                 }
                                                                 LineEdit {
@@ -1240,7 +1242,8 @@ export component SettingsWindow inherits Window {
                                                                     edited => { root.gh-worker-edit(i, "triggers", self.text); }
                                                                 }
                                                                 Button {
-                                                                    text: "删";
+                                                                    text: "✕";
+                                                                    width: 26px;
                                                                     clicked => { root.gh-worker-del(i); }
                                                                 }
                                                             }
@@ -1327,6 +1330,20 @@ export component SettingsWindow inherits Window {
                                             text: "⏳ 正在安装 " + root.dep-busy + " …（可能要几分钟，期间请勿重复点）";
                                             color: #b80;
                                             wrap: word-wrap;
+                                        if root.dep-detail != "": Rectangle {
+                                            background: #fff1f0;
+                                            border-radius: 8px;
+                                            HorizontalBox {
+                                                padding: 8px;
+                                                Text {
+                                                    text: root.dep-detail;
+                                                    color: #d13438;
+                                                    font-size: 11px;
+                                                    wrap: word-wrap;
+                                                    horizontal-stretch: 1;
+                                                }
+                                            }
+                                        }
                                         }
                                         // claude
                                         HorizontalBox {
