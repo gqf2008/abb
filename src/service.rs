@@ -495,7 +495,11 @@ pub(crate) async fn process_comment_batch(
         //    仅配置提及映射（不配通知群）时：合成 Ev 的 chat_id 会为空 → handle 直接丢弃，
         //    触发将永久丢失且无痕迹（评审 I1）——此时不收集触发，日志说明。
         // #64 批次 B：@bot 触发 或 关键词 worker 命中（均要求 collaborator 护栏与
-        // notify_chat 非空；关键词 worker 无需 @bot）
+        // notify_chat 非空；关键词 worker 无需 @bot）。**作者回声过滤统一前置**——
+        // bot 自己的分析回复若含触发词，下一轮会自我触发无限循环烧配额。
+        if c.user.login == bot_login {
+            continue;
+        }
         let kw_hit = !crate::github::match_workers(workers, repo, &c.body, false).is_empty();
         if !notify_chat.is_empty()
             && (crate::github::should_auto_process(&c.body, &c.user.login, bot_login) || kw_hit)
