@@ -1128,6 +1128,114 @@ impl GithubApi for GithubClient {
     }
 }
 
+// ─── #64 批次 B：仓库级 worker 角色分派（纯函数）──────────────────
+
+/// worker 触发匹配。返回命中列表 (worker 下标, worker)。
+/// - repo 匹配：owner/* → 前缀匹配；具体 owner/repo → 忽略大小写全等
+///   （GitHub 仓库名大小写不敏感）；
+/// - triggers 空 = 默认 worker：@bot 全局触发（bot_triggered=true，should_auto_process
+///   与 collaborator 护栏已在外层判定）时响应；
+/// - triggers 非空 = 关键词 worker：任一关键词出现在评论正文即响应（无需 @bot）。
+pub fn match_workers<'a>(
+    workers: &'a [crate::config::GhWorker],
+    repo_full: &str,
+    comment_body: &str,
+    bot_triggered: bool,
+) -> Vec<(usize, &'a crate::config::GhWorker)> {
+    let lower = comment_body.to_lowercase();
+    let in_repo: Vec<(usize, &'a crate::config::GhWorker)> = workers
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| repo_matches(&w.repo, repo_full))
+        .collect();
+    // 关键词 worker 优先（精确分派）；@bot 评论仅当**无任何关键词命中**时才落到默认 worker
+    let kw: Vec<(usize, &'a crate::config::GhWorker)> = in_repo
+        .iter()
+        .filter(|(_, w)| {
+            !w.triggers.trim().is_empty()
+                && w.triggers.split([',', ';']).any(|t| {
+                    let t = t.trim();
+                    !t.is_empty() && lower.contains(&t.to_lowercase())
+                })
+        })
+        .cloned()
+        .collect();
+    if !kw.is_empty() {
+        return kw;
+    }
+    if bot_triggered {
+        return in_repo
+            .into_iter()
+            .filter(|(_, w)| w.triggers.trim().is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// worker 仓库匹配：owner/* → 前缀匹配；具体 owner/repo → 忽略大小写全等。
+fn repo_matches(pattern: &str, repo_full: &str) -> bool {
+    let p = pattern.trim();
+    if let Some(prefix) = p.strip_suffix("/*") {
+        repo_full.starts_with(&format!("{prefix}/"))
+    } else {
+        p.eq_ignore_ascii_case(repo_full)
+    }
+}
+
+#[cfg(test)]
+mod workers_tests {
+    use super::*;
+    use crate::config::GhWorker;
+
+    fn w(repo: &str, backend: &str, role: &str, triggers: &str) -> GhWorker {
+        GhWorker {
+            repo: repo.into(),
+            backend: backend.into(),
+            role: role.into(),
+            triggers: triggers.into(),
+        }
+    }
+
+    #[test]
+    fn repo_matches_shapes() {
+        assert!(repo_matches("o/r", "o/r"));
+        assert!(repo_matches("O/R", "o/r"), "忽略大小写");
+        assert!(repo_matches("o/*", "o/r"));
+        assert!(repo_matches("o/*", "o/deep/repo"));
+        assert!(!repo_matches("o/*", "p/r"), "通配不越界");
+        assert!(!repo_matches("o/r", "o/r2"), "不全等");
+    }
+
+    #[test]
+    fn match_workers_default_and_keyword() {
+        let ws = vec![
+            w("o/r", "claude", "", ""),              // 默认 worker
+            w("o/r", "pi", "审查员", "审查,review"), // 关键词 worker
+            w("p/q", "codex", "其它仓库", ""),       // 仓库不匹配
+        ];
+        // @bot 触发：默认 worker 响应（关键词 worker 不响应）
+        let hits = match_workers(&ws, "o/r", "随便说点什么", true);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 0);
+        // 关键词命中：关键词 worker 响应（无论 @bot）
+        let hits2 = match_workers(&ws, "o/r", "麻烦审查一下这个改动", false);
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(hits2[0].0, 1);
+        // @bot + 关键词同时 → 关键词 worker 优先（默认 worker 不响应，防双发）
+        let hits3 = match_workers(&ws, "o/r", "请审查", true);
+        assert_eq!(hits3.len(), 1);
+        assert_eq!(hits3[0].0, 1);
+        // 关键词大小写不敏感（M2）
+        let hits4 = match_workers(&ws, "o/r", "REVIEW THIS", false);
+        assert_eq!(hits4.len(), 1);
+        assert_eq!(hits4[0].0, 1);
+        // 仓库不匹配永不响应
+        assert!(match_workers(&ws, "x/y", "请审查", true).is_empty());
+        // 空 worker 表 → 空
+        assert!(match_workers(&[], "o/r", "x", true).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

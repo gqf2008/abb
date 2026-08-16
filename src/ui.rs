@@ -348,6 +348,17 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         gh_notify_chat: b.gh_notify_chat.clone().into(),
         gh_username: b.gh_username.clone().into(),
         gh_mention_map: b.gh_mention_map.clone().into(),
+        gh_workers: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            b.gh_workers
+                .iter()
+                .map(|w| GhWorkerRow {
+                    repo: w.repo.clone().into(),
+                    backend: w.backend.clone().into(),
+                    role: w.role.clone().into(),
+                    triggers: w.triggers.clone().into(),
+                })
+                .collect::<Vec<_>>(),
+        ))),
         restrict_granted: b.restrict_granted_agent,
     }
 }
@@ -1150,6 +1161,64 @@ pub fn run_gui() -> Result<()> {
                 let b = work.borrow();
                 sync_model(&model, &b);
             }
+        });
+    }
+    // #64 批次 B：worker 表编辑（直写 work 副本；add/del 才重建 model——编辑期间重建
+    // 会打断 LineEdit 输入，与 gh 字段同策略）
+    {
+        let work = work.clone();
+        let work2 = work.clone();
+        let work3 = work.clone();
+        let model = bots_model.clone();
+        let model2 = model.clone();
+        let model3 = model.clone();
+        let sw = settings.as_weak();
+        let sw2 = sw.clone();
+        let sw3 = sw.clone();
+        let dirty = dirty.clone();
+        let dirty2 = dirty.clone();
+        let dirty3 = dirty.clone();
+        settings.on_gh_worker_edit(move |idx, field, value| {
+            dirty.set(true);
+            let sel = sw.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
+            let mut b = work.borrow_mut();
+            if let Some(bot) = b.get_mut(sel as usize) {
+                if let Some(w) = bot.gh_workers.get_mut(idx as usize) {
+                    match field.as_str() {
+                        "repo" => w.repo = value.trim().to_string(),
+                        "backend" => w.backend = value.trim().to_string(),
+                        "role" => w.role = value.trim().to_string(),
+                        "triggers" => w.triggers = value.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+        });
+        settings.on_gh_worker_add(move || {
+            dirty2.set(true);
+            let sel = sw2.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
+            {
+                let mut b = work2.borrow_mut();
+                if let Some(bot) = b.get_mut(sel as usize) {
+                    bot.gh_workers.push(crate::config::GhWorker::default());
+                }
+            }
+            let b = work2.borrow();
+            sync_model(&model2, &b);
+        });
+        settings.on_gh_worker_del(move |idx| {
+            dirty3.set(true);
+            let sel = sw3.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
+            {
+                let mut b = work3.borrow_mut();
+                if let Some(bot) = b.get_mut(sel as usize) {
+                    if (idx as usize) < bot.gh_workers.len() {
+                        bot.gh_workers.remove(idx as usize);
+                    }
+                }
+            }
+            let b = work3.borrow();
+            sync_model(&model3, &b);
         });
     }
     {

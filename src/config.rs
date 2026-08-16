@@ -14,6 +14,22 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::PathBuf;
 
+/// #64 批次 B：仓库级 worker（账号是账号、仓库是仓库、worker 跟着仓库走）。
+/// 一个仓库可挂多个 worker = 不同 agent 角色（不同 backend/角色提示词/触发词）
+/// 分别处理不同需求；worker 表是白名单与处理分派的单一事实源（gh_repos 迁移后废弃）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct GhWorker {
+    /// 仓库匹配：owner/repo 或 owner/*（继承白名单语义）
+    pub repo: String,
+    /// agent 后端（覆盖 bot 默认 backend）
+    pub backend: String,
+    /// 角色名（双写评论署名 + 注入 prompt 的角色身份）
+    pub role: String,
+    /// 触发关键词（逗号分隔；空 = 默认 worker：@bot 全局触发时响应）
+    pub triggers: String,
+}
+
 /// 单个 bot 的配置。name 是隔离键（决定 workspace/jobs/sessions 子目录）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
@@ -110,6 +126,9 @@ pub struct BotConfig {
     /// 无映射项 → 静默跳过（不群发骚扰）。chat_id 为该 bot 自己通道的群/私聊会话。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gh_mention_map: String,
+    /// #64 批次 B：仓库级 worker 角色表（单一事实源；gh_repos 迁移后废弃为空）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gh_workers: Vec<GhWorker>,
     /// 该 bot 的模型供应商名（指向 Config.providers[].name）。空 = 跟随全局 default_provider。
     /// per-bot 独立：不同 bot 可走不同 key/模型（如飞书用官方 key、微信用 deepseek）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -176,6 +195,7 @@ impl Default for BotConfig {
             open_access: false,
             restrict_granted_agent: true,
             mention_modes: std::collections::HashMap::new(),
+            gh_workers: Vec::new(),
         }
     }
 }
@@ -354,8 +374,19 @@ impl BotConfig {
         !self.gh_token.is_empty()
     }
 
-    /// 白名单拆 Vec<owner/repo>（逗号/分号/空白分隔，与 is_owner_allowed 同款解析）。
+    /// 白名单/职责范围（#64 批次 B：由 worker 表推导，保序去重；worker 表为空时
+    /// 回落旧 gh_repos 解析——迁移过渡期兼容）。
     pub fn gh_repo_list(&self) -> Vec<String> {
+        if !self.gh_workers.is_empty() {
+            let mut out: Vec<String> = Vec::new();
+            for w in &self.gh_workers {
+                let r = w.repo.trim();
+                if !r.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(r)) {
+                    out.push(r.to_string());
+                }
+            }
+            return out;
+        }
         self.gh_repos
             .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
             .map(str::trim)
@@ -365,8 +396,10 @@ impl BotConfig {
     }
 
     /// 仓库是否放行（空白名单 = 全部放行，见 github::repo_in_whitelist）。
+    /// #64 批次 B：用 gh_repo_list()（worker 表推导，旧 gh_repos 回落）——迁移清空
+    /// gh_repos 后闸门必须以 worker 表为准，否则空白名单语义会把放行变成全放行（审查 C1）。
     pub fn gh_allows_repo(&self, repo: &str) -> bool {
-        crate::github::repo_in_whitelist(repo, &self.gh_repos)
+        crate::github::repo_in_whitelist(repo, &self.gh_repo_list().join(","))
     }
 
     /// @提及映射解析（login:chat_id 对，见 github::parse_mention_map）。
@@ -836,11 +869,43 @@ impl Config {
         let Ok(mut c) = Config::load() else {
             return;
         };
-        if c.split_gh_bots() {
+        let split = c.split_gh_bots();
+        let workers = c.migrate_gh_workers();
+        if split || workers {
             if let Err(e) = c.save() {
                 crate::log!("[config] gh 迁移保存失败: {e:#}");
             }
         }
+    }
+
+    /// #64 批次 B：旧 gh_repos 白名单 → 默认 worker 表（每仓库一个默认 worker，后端随
+    /// bot）。幂等：gh_workers 非空不动；生成后清空 gh_repos（单一事实源）。
+    /// 对附挂形态的 IM bot 同样生效（同名冲突跳过场景）。
+    fn migrate_gh_workers(&mut self) -> bool {
+        let mut changed = false;
+        for b in self.bots.iter_mut() {
+            if b.gh_workers.is_empty() && !b.gh_repos.trim().is_empty() {
+                let backend = b.backend.clone();
+                b.gh_workers = b
+                    .gh_repo_list()
+                    .into_iter()
+                    .map(|repo| GhWorker {
+                        repo,
+                        backend: backend.clone(),
+                        role: String::new(),
+                        triggers: String::new(),
+                    })
+                    .collect();
+                b.gh_repos.clear();
+                crate::log!(
+                    "[config] 已把「{}」的 gh_repos 迁移为 {} 个默认 worker",
+                    b.key(),
+                    b.gh_workers.len()
+                );
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// 缺哪些必填项（缺则服务不能跑）。
@@ -1218,6 +1283,44 @@ mod tests {
         assert_eq!(
             c.bots[1].name, "123456-github",
             "空名用 key 兜底（app_id 尾 6 位）"
+        );
+    }
+
+    #[test]
+    fn migrate_gh_workers_generates_defaults_and_clears() {
+        let mut c = Config::default();
+        let mut b = gh_bot("gh", "github", "ghp_x", "claude");
+        b.gh_repos = "o/r, p/*".into();
+        c.bots.push(b);
+        assert!(c.migrate_gh_workers(), "首次迁移有变更");
+        assert!(c.bots[0].gh_repos.is_empty(), "gh_repos 清空（单一事实源）");
+        assert_eq!(c.bots[0].gh_workers.len(), 2);
+        assert_eq!(c.bots[0].gh_workers[0].repo, "o/r");
+        assert_eq!(
+            c.bots[0].gh_workers[0].backend, "claude",
+            "默认 worker 后端随 bot"
+        );
+        assert_eq!(c.bots[0].gh_workers[1].repo, "p/*");
+        assert!(!c.migrate_gh_workers(), "幂等");
+        // gh_repo_list 由 worker 表推导（保序去重）
+        assert_eq!(
+            c.bots[0].gh_repo_list(),
+            vec!["o/r".to_string(), "p/*".to_string()]
+        );
+    }
+
+    #[test]
+    fn migrate_gh_workers_keeps_whitelist_gate() {
+        // 审查 C1：迁移清空 gh_repos 后，gh_allows_repo 必须以 worker 表为准
+        let mut c = Config::default();
+        let mut b = gh_bot("gh", "github", "ghp_x", "claude");
+        b.gh_repos = "o/r".into();
+        c.bots.push(b);
+        assert!(c.migrate_gh_workers());
+        assert!(c.bots[0].gh_allows_repo("o/r"), "白名单内放行");
+        assert!(
+            !c.bots[0].gh_allows_repo("evil/x"),
+            "迁移后白名单外必须仍被拦（空白 gh_repos 不得变成全放行）"
         );
     }
 

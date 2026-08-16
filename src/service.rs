@@ -416,11 +416,22 @@ pub(crate) struct CommentBatch {
     pub seen_extra: Vec<u64>,
     /// 私信发送失败的 (评论 id, updated_at) → 游标回退重试（id 供失败计数，上限放弃）。
     pub failed: Vec<(u64, String)>,
-    /// 触发自动处理的 (issue 号, 评论 id)——调用方构造合成 Ev 交给 handle()。
-    pub triggers: Vec<(u64, u64)>,
+    /// #64 批次 B：触发自动处理的评论（携带正文/仓库/触发形态，供 worker 分派）。
+    pub triggers: Vec<GhTrigger>,
     /// 本轮最新评论 updated_at；**None = 空批 → 调用方必须保持原游标**
     /// （写空串会把游标清掉，下一轮走静默基线 → 窗口内评论永久丢失，评审 C1）。
     pub new_since: Option<String>,
+}
+
+/// #64 批次 B：一条触发自动处理的评论（collaborator + @bot 护栏已过）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GhTrigger {
+    pub number: u64,
+    pub comment_id: u64,
+    pub body: String,
+    pub repo: String,
+    /// true = @bot 全局触发；false = worker 关键词触发（本字段目前恒 true，预留语义）
+    pub bot_triggered: bool,
 }
 
 /// 处理一批新评论（逻辑集中、可注入 api/msgr，可测）：@提及 私信 + @bot 触发判定。
@@ -441,6 +452,7 @@ pub(crate) async fn process_comment_batch(
     repo: &str,
     owner: &str,
     notify_chat: &str,
+    workers: &[crate::config::GhWorker],
 ) -> CommentBatch {
     let mut out = CommentBatch {
         seen_extra: Vec::new(),
@@ -482,15 +494,24 @@ pub(crate) async fn process_comment_batch(
         // 2) @bot 自动处理触发（护栏 b：作者回声 + 词位已由 should_auto_process 把关）。
         //    仅配置提及映射（不配通知群）时：合成 Ev 的 chat_id 会为空 → handle 直接丢弃，
         //    触发将永久丢失且无痕迹（评审 I1）——此时不收集触发，日志说明。
+        // #64 批次 B：@bot 触发 或 关键词 worker 命中（均要求 collaborator 护栏与
+        // notify_chat 非空；关键词 worker 无需 @bot）
+        let kw_hit = !crate::github::match_workers(workers, repo, &c.body, false).is_empty();
         if !notify_chat.is_empty()
-            && crate::github::should_auto_process(&c.body, &c.user.login, bot_login)
+            && (crate::github::should_auto_process(&c.body, &c.user.login, bot_login) || kw_hit)
         {
             match crate::github::comment_issue_ref(c) {
                 // 批次 2.3：PR 评论同样触发（合成 text 仍用 issues 形态——parse_github_cmd
                 // 要求，PR 也是 issue，fetch/post 同一套端点）
                 Some((number, _is_pr)) => {
                     match api.is_collaborator(owner, repo, &c.user.login).await {
-                        Ok(Some(true)) => out.triggers.push((number, c.id)),
+                        Ok(Some(true)) => out.triggers.push(GhTrigger {
+                        number,
+                        comment_id: c.id,
+                        body: c.body.clone(),
+                        repo: repo.to_string(),
+                        bot_triggered: crate::github::should_auto_process(&c.body, &c.user.login, bot_login),
+                    }),
                         Ok(Some(false)) => crate::log!(
                             "[github] 跳过 @bot 触发（{repo} 非协作者 @{}）",
                             c.user.login
@@ -545,6 +566,39 @@ pub(crate) fn auto_ev(
         // GitHub 协作者触发 ≠ IM owner 白名单成员 → 安全默认 Granted（受限会话）；
         // 分析类操作的 issue 上下文已注入 prompt，不需要工作区外能力。
         role: crate::config::SenderRole::Granted,
+        backend_override: None,
+        gh_role: None,
+    }
+}
+
+/// #64 批次 B：worker 触发的合成 Ev——thread_id 复用为 worker 会话隔离键
+/// （ghw:{repo}:{idx}：sessions/历史/锁自动隔离）；backend_override 覆盖 bot 默认；
+/// 角色名注入 prompt 前缀与双写署名。
+pub(crate) fn worker_ev(
+    repo: &str,
+    number: u64,
+    comment_id: u64,
+    notify_chat: &str,
+    idx: usize,
+    worker: &crate::config::GhWorker,
+) -> crate::bridge::Ev {
+    let role = worker.role.trim();
+    let role_prefix = if role.is_empty() {
+        String::new()
+    } else {
+        format!("[角色：{role}] 你以「{role}」的身份处理该问题。\n\n")
+    };
+    crate::bridge::Ev {
+        mid: format!("gh:{repo}:{number}:{comment_id}:w{idx}"),
+        chat_id: notify_chat.to_string(),
+        chat_type: "group".into(),
+        thread_id: format!("ghw:{repo}:{idx}"),
+        quoted: Default::default(),
+        text: format!("{role_prefix}分析 https://github.com/{repo}/issues/{number}"),
+        attachments: Vec::new(),
+        role: crate::config::SenderRole::Granted,
+        backend_override: Some(worker.backend.clone()),
+        gh_role: (!role.is_empty()).then(|| role.to_string()),
     }
 }
 
@@ -681,6 +735,7 @@ async fn github_watch_loop(
                             &repo,
                             &owner,
                             &notify_chat,
+                            &bot.gh_workers,
                         )
                         .await;
                         // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。
@@ -723,12 +778,35 @@ async fn github_watch_loop(
                         // 崩溃窗口（已接受）：seen_extra 在上方先落盘、spawn 在下方——两者
                         // 之间崩溃则触发丢失（评论已 seen、不重试，at-most-once）；
                         // 反向窗口（spawn 后崩溃）由 pending 重放兜底（at-least-once 双发）。
-                        for (number, comment_id) in batch.triggers {
-                            let bridge = bridge.clone();
-                            let ev = auto_ev(&repo, number, comment_id, &notify_chat);
-                            tokio::spawn(async move {
-                                bridge.handle(ev).await;
-                            });
+                        for t in batch.triggers {
+                            // #64 批次 B：worker 分派——默认 worker（triggers 空）响应
+                            // @bot 触发；关键词 worker 按评论内容命中；每个命中 worker
+                            // 独立会话/独立后端/独立双写（署名角色）。
+                            let hits = crate::github::match_workers(
+                                &bot.gh_workers,
+                                &t.repo,
+                                &t.body,
+                                t.bot_triggered,
+                            );
+                            if hits.is_empty() {
+                                if bot.gh_workers.is_empty() && t.bot_triggered {
+                                    // 兼容：无 worker 表（未迁移旧配置）→ 原单触发行为
+                                    let bridge = bridge.clone();
+                                    let ev = auto_ev(&repo, t.number, t.comment_id, &notify_chat);
+                                    tokio::spawn(async move {
+                                        bridge.handle(ev).await;
+                                    });
+                                }
+                                continue;
+                            }
+                            for (idx, w) in hits {
+                                let bridge = bridge.clone();
+                                let ev =
+                                    worker_ev(&repo, t.number, t.comment_id, &notify_chat, idx, w);
+                                tokio::spawn(async move {
+                                    bridge.handle(ev).await;
+                                });
+                            }
                         }
                     }
                     Err(e) => {
