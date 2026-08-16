@@ -88,6 +88,7 @@ pub async fn run() {
         crate::config::BotConfig,
         std::sync::Arc<dyn crate::messenger::Messenger>,
     )> = Vec::new();
+    let mut github_bots: Vec<crate::config::BotConfig> = Vec::new(); // #64 无 IM 通道的渠道 bot
     for bot in &cfg.bots {
         // 用户停用的 bot：不启动，但上报「已停用」让托盘显灰，并保留在设置窗可重启用。
         if !bot.enabled {
@@ -104,6 +105,12 @@ pub async fn run() {
             );
             continue;
         }
+        // #64 渠道化：kind=github 的 bot 不建 messenger（GitHub 不是 IM 通道），
+        // 单独收集；其 Bridge 用 RoutedMessenger 把通知/回执转发到目标 IM bot。
+        if bot.is_github_kind() {
+            github_bots.push(bot.clone());
+            continue;
+        }
         let msgr = match messenger::build(bot) {
             Ok(m) => m,
             Err(e) => {
@@ -115,7 +122,7 @@ pub async fn run() {
         bot_cfgs.insert(bot.key(), bot.clone());
         ready.push((bot.clone(), msgr));
     }
-    if ready.is_empty() {
+    if ready.is_empty() && github_bots.is_empty() {
         crate::log!("[service] 没有可用 bot，退出");
         // 无可跑 bot（全部停用/凭证不齐）→ 清「期望运行」标记，看门狗停止自动重拉
         crate::install::set_desired(false);
@@ -123,7 +130,7 @@ pub async fn run() {
     }
     let router = std::sync::Arc::new(crate::deliver::Router::new(
         cfg.cross_delivery_enabled,
-        messengers,
+        messengers.clone(), // #64：messengers 还要给 RoutedMessenger 用，先 clone
         bot_cfgs,
         None,
     ));
@@ -140,6 +147,16 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = stop_rx.clone();
         let router = router.clone();
+        handles.push(tokio::spawn(async move {
+            run_bot(bot, cfg, msgr, router, stop).await;
+        }));
+    }
+    // #64：github bot 循环（RoutedMessenger 转发通知；无 IM 事件循环，只跑 watch）
+    for bot in github_bots {
+        let cfg = cfg.clone();
+        let stop = stop_rx.clone();
+        let router = router.clone();
+        let msgr = std::sync::Arc::new(crate::messenger::RoutedMessenger::new(messengers.clone()));
         handles.push(tokio::spawn(async move {
             run_bot(bot, cfg, msgr, router, stop).await;
         }));
@@ -260,9 +277,11 @@ async fn run_bot(
         });
     }
 
-    // GitHub watch 循环（附挂在既有 IM bot 上的能力，非新 bot kind）：
-    // 新 issue 只通知、不自动处理（自动分析留 Phase 2）；通知走该 bot 自己的 messenger。
-    // 与主事件循环并行：bot 的主循环仍是 IM 通道。
+    // #64 GitHub watch 循环（kind=github 渠道 bot 的核心循环）：
+    // 新 issue 只通知、不自动处理；通知经 RoutedMessenger 跨 bot 转发。
+    // 审查 Important：同名冲突跳过迁移时 IM bot 的 gh_token 保留——watch 不能静默停
+    //（新 issue 通知/@提及/@bot 自动处理都靠它）。用 is_github_capable（token 非空）：
+    // kind=github 或未迁移成功的附挂 bot 都覆盖；迁移成功清 token 后自然不跑。
     if bot.is_github_capable() {
         let bot = bot.clone();
         let bridge = bridge.clone();
@@ -276,7 +295,20 @@ async fn run_bot(
     }
 
     // 事件循环：按通道分派
-    if bot.is_dingtalk() {
+    if bot.is_github_kind() {
+        // #64：GitHub 不是 IM 通道——无事件循环，挂起等 stop；watch 循环照跑。
+        crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
+        crate::log!("[bot:{key}] GitHub 渠道启动（无 IM 事件循环，仅 watch）");
+        let mut stop_rx = stop_rx;
+        loop {
+            if *stop_rx.borrow() {
+                break;
+            }
+            let _ = stop_rx.changed().await;
+        }
+        crate::botstatus::clear(&key);
+        crate::log!("[bot:{key}] GitHub 循环退出");
+    } else if bot.is_dingtalk() {
         crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop_rx)
             .await;
         crate::botstatus::clear(&key);
@@ -562,6 +594,10 @@ async fn github_watch_loop(
         // 通知目标与提及映射都空 → 轮询无意义；两者任一配置即跑（评审 I1：
         // 只配 gh_mention_map 的「仅私信不群发」配置不该被 notify_chat 拦截）。
         if notify_chat.is_empty() && mention_map.is_empty() {
+            // #64：github kind 的空配 bot 也要心跳续命（否则 180s 后托盘消失）
+            if bot.is_github_kind() {
+                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
+            }
             continue;
         }
         // 静默基线用当前时刻（评审 L2）：since 为空不调 API，游标直接置 now——
@@ -714,6 +750,11 @@ async fn github_watch_loop(
             }
         } else {
             consec_errs = 0;
+            // #64：kind=github 无 IM 事件循环，watch 成功轮就是它的「在线」心跳
+            // （≤60s < 180s 僵尸阈值）；IM 附挂 bot 不报在线（槽位归 IM 循环）。
+            if bot.is_github_kind() {
+                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
+            }
         }
     }
     // 注意：这里不清 botstatus——槽位归 IM 事件循环（weixin_loop 退出时 clear），

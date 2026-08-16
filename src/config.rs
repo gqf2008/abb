@@ -343,8 +343,13 @@ impl BotConfig {
         self.kind == "dingtalk"
     }
 
-    /// GitHub 能力开关：token 非空即可（白名单/通知群是可选增强）。
-    /// 附挂在任意 kind 的 IM bot 上，不是独立通道——**不参与 credentials_ready 门槛**。
+    /// #64 渠道化：kind == "github" 的独立渠道 bot（与 IM bot 零绑定；账号+agent 后端）。
+    pub fn is_github_kind(&self) -> bool {
+        self.kind == "github"
+    }
+
+    /// GitHub 能力开关：token 非空即可。kind=github 的 bot 凭它启动；
+    /// 旧式附挂配置（IM bot 带 gh_token）在 main() 迁移后不再存在（迁移幂等拆出独立 bot）。
     pub fn is_github_capable(&self) -> bool {
         !self.gh_token.is_empty()
     }
@@ -375,6 +380,10 @@ impl BotConfig {
     pub fn credentials_ready(&self) -> bool {
         if self.is_wechat() {
             !self.wx_token.is_empty() && !self.wx_user_id.is_empty()
+        } else if self.is_github_kind() {
+            // #64 渠道化：GitHub bot 的身份凭证是 PAT，不要求 IM 凭证；name 是它的
+            // 唯一身份键（无 app_id 兜底），空名会导致多个 github bot 撞 key="default"
+            !self.gh_token.is_empty() && !self.name.is_empty()
         } else {
             !self.app_id.is_empty() && !self.app_secret.is_empty()
         }
@@ -396,6 +405,13 @@ impl BotConfig {
             }
             if self.app_secret.is_empty() {
                 v.push("app_secret（钉钉 AppSecret）".to_string());
+            }
+        } else if self.is_github_kind() {
+            if self.gh_token.is_empty() {
+                v.push("gh_token（GitHub PAT）".to_string());
+            }
+            if self.name.is_empty() {
+                v.push("name（GitHub bot 需唯一名称）".to_string());
             }
         } else {
             if self.app_id.is_empty() {
@@ -711,12 +727,118 @@ impl Config {
         crate::log!("[config] 已迁移旧单 bot 配置 → bots[0]");
     }
 
+    /// #64：旧「login:chat_id」→「login:{botkey}:{chat_id}」（跨 bot 提及通知目标）。
+    /// 无冒号条目原样保留（无效项由 parse_mention_map 跳过）。
+    fn rewrite_gh_mention_map(s: &str, bot_key: &str) -> String {
+        s.split(',')
+            .map(|part| {
+                let p = part.trim();
+                if p.is_empty() {
+                    return String::new();
+                }
+                match p.split_once(':') {
+                    // login:chat_id → login:{botkey}:{chat_id}（chat 段可含 ':'，保真）
+                    Some((login, chat)) => format!("{login}:{bot_key}:{chat}"),
+                    None => p.to_string(), // 无冒号无效项原样保留（由 parse_mention_map 跳过）
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// #64：旧裸 chat_id → "{botkey}:{chat_id}"（RoutedMessenger 跨 bot 目标格式）；
+    /// 已含 ':' 视为已是 bot:chat 形态原样返回；空 → 空。contains(':') 判定的取舍：
+    /// 三通道 chat_id 均不含冒号（审查核实），含冒号大概率是已迁移/手填的新格式。
+    /// cursor best-effort 迁移与 worker 表归批次 B。
+    fn rewrite_gh_notify(raw: &str, bot_key: &str) -> String {
+        let v = raw.trim();
+        if v.is_empty() || v.contains(':') {
+            v.to_string()
+        } else {
+            format!("{bot_key}:{v}")
+        }
+    }
+
     /// 旧钉钉单值 owner（ding_user_id）→ 新管理员白名单（ding_owner_ids）。幂等：
     /// ding_owner_ids 已有值则不覆盖（手动填过的不动）。
     fn migrate_ding_owner(&mut self) {
         for b in self.bots.iter_mut() {
             if b.is_dingtalk() && !b.ding_user_id.is_empty() && b.ding_owner_ids.is_empty() {
                 b.ding_owner_ids = b.ding_user_id.clone();
+            }
+        }
+    }
+
+    /// #64 迁移：旧式附挂配置（IM bot 上的 gh_token）→ 独立 kind=github bot。
+    /// 纯逻辑（不落盘）；返回是否发生变更。幂等：拆完原 bot 的 gh_token 即空，不再触发。
+    /// 同名目标已存在 → 跳过该 bot（原字段不动，下次启动仍跳过，不循环）。
+    fn split_gh_bots(&mut self) -> bool {
+        let mut new_bots: Vec<BotConfig> = Vec::new();
+        let mut changed = false;
+        let existing: Vec<String> = self.bots.iter().map(|b| b.key()).collect();
+        for bot in self.bots.iter_mut() {
+            if bot.is_github_kind() || bot.gh_token.is_empty() {
+                continue;
+            }
+            let base = if bot.name.is_empty() {
+                bot.key()
+            } else {
+                sanitize(&bot.name)
+            };
+            let new_name = format!("{base}-github");
+            if existing.contains(&new_name) {
+                crate::log!(
+                    "[config] 跳过 gh 迁移「{}」：目标名 {new_name} 已存在",
+                    bot.key()
+                );
+                continue;
+            }
+            // 托盘显示名（botstatus 用 bot_name，空则无法区分 N 个 github bot）
+            let gh = BotConfig {
+                kind: "github".to_string(),
+                name: new_name.clone(),
+                bot_name: new_name.clone(),
+                enabled: bot.enabled,
+                backend: bot.backend.clone(), // 真正干活的 agent 后端随迁移走
+                provider: bot.provider.clone(),
+                restrict_granted_agent: bot.restrict_granted_agent,
+                gh_token: std::mem::take(&mut bot.gh_token),
+                gh_repos: std::mem::take(&mut bot.gh_repos),
+                gh_username: std::mem::take(&mut bot.gh_username),
+                gh_notify_chat: Self::rewrite_gh_notify(
+                    &std::mem::take(&mut bot.gh_notify_chat),
+                    &bot.key(),
+                ),
+                gh_mention_map: Self::rewrite_gh_mention_map(
+                    &std::mem::take(&mut bot.gh_mention_map),
+                    &bot.key(),
+                ),
+                ..Default::default()
+            };
+            crate::log!(
+                "[config] 已把「{}」的 GitHub 配置迁移为独立 bot「{new_name}」",
+                bot.key()
+            );
+            new_bots.push(gh);
+            changed = true;
+        }
+        if changed {
+            self.bots.extend(new_bots);
+        }
+        changed
+    }
+
+    /// 一次性迁移入口：锁 + load + 拆分 + 变更才 save。main() 最顶调用（GUI/service/CLI
+    /// 统一执行，谁先启动谁迁移；两进程并发时产出相同字节、原子写 last-writer-wins，无破坏）。
+    /// 无迁移标记文件——探测即「gh_token 非空 && kind != github」，拆完天然幂等。
+    pub fn migrate_gh_bots() {
+        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
+        let Ok(mut c) = Config::load() else {
+            return;
+        };
+        if c.split_gh_bots() {
+            if let Err(e) = c.save() {
+                crate::log!("[config] gh 迁移保存失败: {e:#}");
             }
         }
     }
@@ -1027,6 +1149,93 @@ impl Config {
 mod tests {
     use super::*;
 
+    // ─── #64 GitHub 渠道化 ───
+
+    fn gh_bot(name: &str, kind: &str, token: &str, backend: &str) -> BotConfig {
+        BotConfig {
+            name: name.into(),
+            kind: kind.into(),
+            gh_token: token.into(),
+            backend: backend.into(),
+            gh_repos: "o/r".into(),
+            gh_notify_chat: "oc_1".into(),
+            gh_username: "me".into(),
+            gh_mention_map: "alice:oc_2,bob:oc_3".into(),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn split_gh_bots_full_and_idempotent() {
+        let mut c = Config::default();
+        c.bots.push(gh_bot("im-bot", "feishu", "ghp_x", "claude"));
+        assert!(c.split_gh_bots(), "首次拆分有变更");
+        assert_eq!(c.bots.len(), 2);
+        let im = &c.bots[0];
+        let gh = &c.bots[1];
+        assert!(
+            im.gh_token.is_empty() && im.gh_repos.is_empty(),
+            "原 bot 字段清空"
+        );
+        assert_eq!(gh.kind, "github");
+        assert_eq!(gh.name, "im-bot-github");
+        assert_eq!(gh.backend, "claude", "agent 后端随迁移走");
+        assert_eq!(gh.gh_token, "ghp_x");
+        assert_eq!(gh.gh_repos, "o/r");
+        assert_eq!(gh.gh_username, "me");
+        assert_eq!(gh.gh_notify_chat, "im-bot:oc_1", "裸 chat_id 加 bot 前缀");
+        assert_eq!(gh.gh_mention_map, "alice:im-bot:oc_2,bob:im-bot:oc_3");
+        assert!(!c.split_gh_bots(), "幂等：二跑无变更");
+    }
+
+    #[test]
+    fn split_gh_bots_skips_github_kind_and_empty_token() {
+        let mut c = Config::default();
+        c.bots.push(gh_bot("already", "github", "ghp_a", "pi")); // kind 已是 github → 跳过
+        c.bots.push(gh_bot("no-token", "feishu", "", "claude")); // 空 token → 跳过
+        assert!(!c.split_gh_bots());
+        assert_eq!(c.bots.len(), 2, "不新增");
+    }
+
+    #[test]
+    fn split_gh_bots_name_conflict_skips() {
+        let mut c = Config::default();
+        c.bots.push(gh_bot("im-bot", "feishu", "ghp_x", "claude"));
+        c.bots
+            .push(gh_bot("im-bot-github", "github", "ghp_other", "pi")); // 目标名已存在
+        assert!(!c.split_gh_bots(), "同名冲突跳过");
+        assert!(!c.bots[0].gh_token.is_empty(), "原字段不动");
+    }
+
+    #[test]
+    fn split_gh_bots_empty_name_uses_key() {
+        let mut c = Config::default();
+        let mut b = gh_bot("", "feishu", "ghp_x", "claude");
+        b.app_id = "app-123456".into();
+        c.bots.push(b);
+        assert!(c.split_gh_bots());
+        assert_eq!(
+            c.bots[1].name, "123456-github",
+            "空名用 key 兜底（app_id 尾 6 位）"
+        );
+    }
+
+    #[test]
+    fn github_kind_credentials_and_missing() {
+        let ok = gh_bot("gh", "github", "ghp_x", "claude");
+        assert!(ok.credentials_ready());
+        assert!(ok.missing_fields().is_empty());
+        let no_token = gh_bot("gh", "github", "", "claude");
+        assert!(!no_token.credentials_ready());
+        assert!(no_token
+            .missing_fields()
+            .iter()
+            .any(|m| m.contains("gh_token")));
+        let no_name = gh_bot("", "github", "ghp_x", "claude");
+        assert!(!no_name.credentials_ready(), "空名也是缺失");
+        assert!(no_name.missing_fields().iter().any(|m| m.contains("name")));
+    }
     #[test]
     fn missing_detection() {
         // 空配置：缺 bot

@@ -166,6 +166,9 @@ fn main() {
     // 改名一次性迁移（feishu-bridge → agent-bridge，~/feishu-bridge → ~/.agent-bridge）。
     // 必须在最顶：args 解析、单实例加锁、job CLI 读 config/jobs 都依赖数据已在新位置。幂等。
     platform::migrate_to_agent_bridge();
+    // #64 GitHub 渠道化：旧式附挂 gh 配置 → 独立 kind=github bot（幂等；GUI/service/CLI
+    // 谁先启动谁迁移，两进程并发产出相同字节无破坏）
+    crate::config::Config::migrate_gh_bots();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -591,16 +594,16 @@ fn run_deliver_cli(args: &[String]) -> i32 {
             }
         }
     }
-    // 目标 bot 必须存在且启用、凭证就绪（与 service 路由表同源：config.bots[].key()）
-    let target_ok = cfg
-        .bots
-        .iter()
-        .any(|b| b.key() == item.target_bot && b.enabled && b.credentials_ready());
+    // 目标 bot 必须存在且启用、凭证就绪（与 service 路由表同源：config.bots[].key()）。
+    // #64：kind=github 的 bot 不是消息端点（无 messenger），跨会话投递目标排除之。
+    let target_ok = cfg.bots.iter().any(|b| {
+        b.key() == item.target_bot && b.enabled && b.credentials_ready() && !b.is_github_kind()
+    });
     if !target_ok {
         let keys: Vec<String> = cfg
             .bots
             .iter()
-            .filter(|b| b.enabled && b.credentials_ready())
+            .filter(|b| b.enabled && b.credentials_ready() && !b.is_github_kind())
             .map(|b| b.key())
             .collect();
         eprintln!(
