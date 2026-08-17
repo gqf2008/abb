@@ -7,9 +7,11 @@
 //!
 //! - 存储：`workspaces/<bot_key>/history/<escaped_key>.jsonl`（key 含 ':' 等字符需转义，
 //!   Windows 文件名安全）；每行一个 [`HistoryEntry`]，全字段 serde default 向前兼容。
-//! - 写入策略：读全文件 → (mid, user) 去重（pending 重放兜底）→ 单条截断 → 超上限丢
-//!   最旧 → tmp+rename 原子写。从不原地追加，文件永无半行；读取端仍容忍坏行（手工
-//!   编辑损坏不 panic）。
+//! - 写入策略：读全文件 → (mid, user) 去重（pending 重放兜底）→ **存储保真**（事件派生：
+//!   不截断正文，只设保险上限防异常巨型单条）→ 超条数上限丢最旧 → tmp+rename 原子写。
+//!   从不原地追加，文件永无半行；读取端仍容忍坏行（手工编辑损坏不 panic）。
+//!   注入时的精确切分在 inject_block（预算内完整、边界截断收编）——存储保真保证
+//!   预算内取到的永远是**完整内容**而非 300 字摘要（长代码块/详细背景不丢尾）。
 //! - 注入闸在 bridge（串行锁内）：`!resume && marker.session_id != 当前会话`，或
 //!   `resume && marker.pending && marker.session_id == 当前会话`（#54：同 sid 自愈重建
 //!   或 claude 换 UUID 自愈后 pending 标记放行一次注入），或 pi 会话文件丢失/损坏
@@ -59,10 +61,11 @@ pub struct MigratedMarker {
     pub pending: bool,
 }
 
-/// 单条截断（agent::truncate 同款语义，历史是摘要非全文）。
-const ENTRY_MAX: usize = 300;
-/// 条数上限（唯一容量闸：50 条 × 300 字 = 上限约 1.5 万字符，单一闸完全可测；
-/// 原设计草案的「条数 + 字符」双闸在 300 字截断下数学冗余，收敛为单闸）。
+/// 单条存储保险上限（字符）：事件派生后存储层**保真不截断**（注入时按预算精确切，
+/// 见 inject_block）——此上限只防异常巨型单条（恶意/意外粘贴撑爆文件），正常消息
+/// 全量落盘。50 条 × 2 万字符 = 文件上限约 100 万字符，读重写亚秒级可接受。
+const ENTRY_MAX: usize = 20_000;
+/// 条数上限：50 条封顶丢最旧（最近优先）。
 const ENTRIES_MAX: usize = 50;
 /// 注入 prompt 的字符预算（bridge 生产路径传参的默认值；可按需收紧）。
 pub const INJECT_CHARS_DEFAULT: usize = 6_000;
@@ -143,6 +146,8 @@ impl History {
         if entries.iter().any(|e| e.mid == mid && e.user == user) {
             return true; // 已记录视为成功
         }
+        // 事件派生：存储层保真（超保险上限才截断——异常巨型单条防撑爆文件），
+        // 注入时的精确切分交给 inject_block 的预算逻辑（预算内完整、边界截断收编）。
         entries.push(HistoryEntry {
             mid: mid.to_string(),
             user,
@@ -365,11 +370,56 @@ mod tests {
     }
 
     #[test]
-    fn single_entry_truncated() {
+    fn single_entry_stored_verbatim_and_capped() {
+        // 事件派生：普通长消息**存储保真**（注入按预算切，存储不截断）
         let h = temp_history("trunc", "oc_x");
         let long = "长".repeat(400);
         h.append_user("m1", "claude", &long);
-        assert_eq!(h.read_entries()[0].text.chars().count(), 300);
+        assert_eq!(
+            h.read_entries()[0].text.chars().count(),
+            400,
+            "400 字消息全量存储（原 300 截断已去除）"
+        );
+        // 超保险上限（异常巨型单条）才截断
+        let huge = "大".repeat(ENTRY_MAX + 100);
+        h.append_user("m2", "claude", &huge);
+        assert_eq!(
+            h.read_entries()[1].text.chars().count(),
+            ENTRY_MAX,
+            "超保险上限截断防撑爆文件"
+        );
+        h.clear();
+    }
+
+    #[test]
+    fn inject_keeps_long_entry_verbatim_within_budget() {
+        // 事件派生注入：预算内长条目**完整注入**（非 300 摘要）——历史接续不丢尾
+        let h = temp_history("verbatim", "oc_x");
+        let long = "详细背景".repeat(120); // 480 字，超旧 300 截断
+        h.append_user("u1", "claude", &long);
+        h.append_assistant("u1", "claude", "结论");
+        let (block, n) = h.inject_block("", 6000);
+        assert_eq!(n, 1, "一轮完整注入");
+        assert!(
+            block.contains(&long),
+            "预算内完整内容（原 300 截断会丢尾）: {}",
+            &block[..block.len().min(80)]
+        );
+        h.clear();
+    }
+
+    #[test]
+    fn inject_long_latest_entry_consumes_budget() {
+        // 最新条目超预算 → 预算内截断收编该条，更旧条目不注入（精确优先）
+        let h = temp_history("longfirst", "oc_x");
+        h.append_user("u1", "claude", "旧消息");
+        let huge = "大".repeat(8000); // 超 6000 预算
+        h.append_user("u2", "claude", &huge);
+        let (block, n) = h.inject_block("", 6000);
+        assert_eq!(n, 1, "只收最新一轮");
+        assert!(block.contains("大"), "最新长条目截断收编进预算");
+        assert!(!block.contains("旧消息"), "更旧条目不注入");
+        assert!(block.chars().count() <= 6100, "预算约束（含前缀/换行）");
         h.clear();
     }
 
