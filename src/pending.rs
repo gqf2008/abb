@@ -34,12 +34,6 @@ pub struct PendingItem {
     /// serde default 兼容旧 pending.json（无角色时代 → Owner 全权限，与现状一致）。
     #[serde(default)]
     pub role: crate::config::SenderRole,
-    /// #64 批次 B：worker 触发的后端覆盖（None = bot 默认后端）。serde default 兼容。
-    #[serde(default)]
-    pub backend_override: Option<String>,
-    /// #64 批次 B：worker 角色名（双写署名与 prompt 身份）。serde default 兼容。
-    #[serde(default)]
-    pub gh_role: Option<String>,
     /// 入队时间（unix 秒），启动重放按此排序保持原先后顺序。
     pub created_at: u64,
 }
@@ -125,8 +119,6 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
-            backend_override: None,
-            gh_role: None,
             created_at: at,
         }
     }

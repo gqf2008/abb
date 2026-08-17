@@ -83,7 +83,6 @@ fn kind_label(kind: &str) -> String {
         "feishu" => "飞书".to_string(),
         "wechat" => "微信".to_string(),
         "dingtalk" => "钉钉".to_string(),
-        "github" => "GitHub".to_string(),
         other => other.to_string(),
     }
 }
@@ -343,22 +342,6 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_granted: slint::ModelRc::from(Rc::new(ding_granted)),
         ding_open_access: b.ding_open_access,
         ding_robot_code: b.ding_robot_code.clone().into(),
-        gh_token: b.gh_token.clone().into(),
-        gh_repos: b.gh_repos.clone().into(),
-        gh_notify_chat: b.gh_notify_chat.clone().into(),
-        gh_username: b.gh_username.clone().into(),
-        gh_mention_map: b.gh_mention_map.clone().into(),
-        gh_workers: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-            b.gh_workers
-                .iter()
-                .map(|w| GhWorkerRow {
-                    repo: w.repo.clone().into(),
-                    backend: w.backend.clone().into(),
-                    role: w.role.clone().into(),
-                    triggers: w.triggers.clone().into(),
-                })
-                .collect::<Vec<_>>(),
-        ))),
         restrict_granted: b.restrict_granted_agent,
     }
 }
@@ -1147,15 +1130,6 @@ pub fn run_gui() -> Result<()> {
                             // kind 决定编辑区显示哪套字段（slint 的 if 条件绑 model）；
                             // 不回写 model 的话，改类型后右侧仍显示旧类型的表单（如改「钉钉」还显示微信登录框）
                             refresh = true;
-                            // #64：切出 github kind 时清空 gh 字段——防残留 token 在下次
-                            // 启动被迁移再拆出一个幽灵 github bot
-                            if bot.kind != "github" {
-                                bot.gh_token.clear();
-                                bot.gh_repos.clear();
-                                bot.gh_notify_chat.clear();
-                                bot.gh_username.clear();
-                                bot.gh_mention_map.clear();
-                            }
                         }
                         "backend" => {
                             bot.backend = value.to_string();
@@ -1179,11 +1153,6 @@ pub fn run_gui() -> Result<()> {
                             refresh = true; // 同 open_access：互斥显示靠 model 重建
                         }
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
-                        "gh_token" => bot.gh_token = value.trim().to_string(),
-                        "gh_repos" => bot.gh_repos = value.trim().to_string(),
-                        "gh_notify_chat" => bot.gh_notify_chat = value.trim().to_string(),
-                        "gh_username" => bot.gh_username = value.trim().to_string(),
-                        "gh_mention_map" => bot.gh_mention_map = value.trim().to_string(),
                         _ => {}
                     }
                 }
@@ -1192,64 +1161,6 @@ pub fn run_gui() -> Result<()> {
                 let b = work.borrow();
                 sync_model(&model, &b);
             }
-        });
-    }
-    // #64 批次 B：worker 表编辑（直写 work 副本；add/del 才重建 model——编辑期间重建
-    // 会打断 LineEdit 输入，与 gh 字段同策略）
-    {
-        let work = work.clone();
-        let work2 = work.clone();
-        let work3 = work.clone();
-        let model = bots_model.clone();
-        let model2 = model.clone();
-        let model3 = model.clone();
-        let sw = settings.as_weak();
-        let sw2 = sw.clone();
-        let sw3 = sw.clone();
-        let dirty = dirty.clone();
-        let dirty2 = dirty.clone();
-        let dirty3 = dirty.clone();
-        settings.on_gh_worker_edit(move |idx, field, value| {
-            dirty.set(true);
-            let sel = sw.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
-            let mut b = work.borrow_mut();
-            if let Some(bot) = b.get_mut(sel as usize) {
-                if let Some(w) = bot.gh_workers.get_mut(idx as usize) {
-                    match field.as_str() {
-                        "repo" => w.repo = value.trim().to_string(),
-                        "backend" => w.backend = value.trim().to_string(),
-                        "role" => w.role = value.trim().to_string(),
-                        "triggers" => w.triggers = value.trim().to_string(),
-                        _ => {}
-                    }
-                }
-            }
-        });
-        settings.on_gh_worker_add(move || {
-            dirty2.set(true);
-            let sel = sw2.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
-            {
-                let mut b = work2.borrow_mut();
-                if let Some(bot) = b.get_mut(sel as usize) {
-                    bot.gh_workers.push(crate::config::GhWorker::default());
-                }
-            }
-            let b = work2.borrow();
-            sync_model(&model2, &b);
-        });
-        settings.on_gh_worker_del(move |idx| {
-            dirty3.set(true);
-            let sel = sw3.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
-            {
-                let mut b = work3.borrow_mut();
-                if let Some(bot) = b.get_mut(sel as usize) {
-                    if (idx as usize) < bot.gh_workers.len() {
-                        bot.gh_workers.remove(idx as usize);
-                    }
-                }
-            }
-            let b = work3.borrow();
-            sync_model(&model3, &b);
         });
     }
     {

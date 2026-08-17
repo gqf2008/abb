@@ -47,7 +47,6 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 能力 | 说明 |
 |---|---|
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
-| GitHub 联动 | 群里 @ bot 分析 / 关闭 / 创建 GitHub issue（仓库白名单把关），新 issue 自动通知到群 |
 | 多模型后端 | Claude / Codex / Pi（pi-coding-agent）/ prime-agent（Prime Intellect），或任意 Anthropic / OpenAI 兼容供应商 |
 | 多轮会话 | 每个 bot 独立记忆，不会串味；任务进行中发 `/cancel`（或「停止」等自然词）立即取消，无任务时发 `/cancel` 会给明确提示；聊天发 `/new` 立即新建会话（清空上下文，无需重启） |
 | 引用/回复上下文 | 引用一条消息再 @ bot 时，自动读取被引用消息内容（飞书按 parent_id 拉取、微信 ref_msg、钉钉 repliedMsg）带进 agent，回复不会脱离上文 |
@@ -101,6 +100,5 @@ Windows 包为免管理员安装。有问题欢迎提 [Issue](https://github.com
 
 ## 开发者文档
 
-- [GitHub 协同模型](docs/github-collab.md)：issue 线程 = 唯一记录面、IM = 通知与指令入口；全员账号准入前提；Phase 1 已实现指令/通知与 Phase 2 范围（含「自动建群=伪需求」的评审结论）。
 - [会话隔离机制（群 / 话题 / 用户）](docs/session-isolation.md)：三平台 chat_id 规则、隔离矩阵、话题维度结论与最小改动方案。
 - 跨会话投递（issue #21）：开关 `config.json#cross_delivery_enabled`（设置窗可勾选，默认关）；agent 用 `$ABB_BIN deliver` 投递，CLI 入队 `~/.agent-bridge/deliveries.json`（0600），service 消费循环经路由表发送；微信目标失败落其 outbox 补发、其余失败回源报错；同来源/目标/文本（+附件 sha256）10 分钟防循环去重，定时任务（`job add --to`）豁免。

@@ -15,7 +15,6 @@ mod deliver;
 mod deps;
 mod dingtalk;
 mod feishu;
-mod github;
 mod guard;
 mod history;
 mod install;
@@ -111,8 +110,8 @@ pub mod chrono_lite {
         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
     }
 
-    /// 当前 UTC 时间的 RFC3339（GitHub 游标同款 "YYYY-MM-DDTHH:MM:SSZ" 形态，字典序可比较）。
-    /// 与 now() 不同：UTC 不加本地偏移（GitHub 时间戳是 UTC）。
+    /// 当前 UTC 时间的 RFC3339（"YYYY-MM-DDTHH:MM:SSZ" 形态，字典序可比较）。
+    /// 与 now() 不同：UTC 不加本地偏移。
     pub fn rfc3339_now() -> String {
         let (y, mo, d, h, mi, s) = epoch_to_ymd(unix_secs());
         format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
@@ -167,9 +166,9 @@ fn main() {
     // 改名一次性迁移（feishu-bridge → agent-bridge，~/feishu-bridge → ~/.agent-bridge）。
     // 必须在最顶：args 解析、单实例加锁、job CLI 读 config/jobs 都依赖数据已在新位置。幂等。
     platform::migrate_to_agent_bridge();
-    // #64 GitHub 渠道化：旧式附挂 gh 配置 → 独立 kind=github bot（幂等；GUI/service/CLI
-    // 谁先启动谁迁移，两进程并发产出相同字节无破坏）
-    crate::config::Config::migrate_gh_bots();
+    // 定位收敛（2026-08）：GitHub 协作整体迁出本产品——存量配置中的 kind=github
+    // bot 在此移除（幂等；GUI/service/CLI 谁先启动谁迁移，两进程并发原子写无破坏）。
+    crate::config::Config::migrate_strip_github();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -596,15 +595,15 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         }
     }
     // 目标 bot 必须存在且启用、凭证就绪（与 service 路由表同源：config.bots[].key()）。
-    // #64：kind=github 的 bot 不是消息端点（无 messenger），跨会话投递目标排除之。
-    let target_ok = cfg.bots.iter().any(|b| {
-        b.key() == item.target_bot && b.enabled && b.credentials_ready() && !b.is_github_kind()
-    });
+    let target_ok = cfg
+        .bots
+        .iter()
+        .any(|b| b.key() == item.target_bot && b.enabled && b.credentials_ready());
     if !target_ok {
         let keys: Vec<String> = cfg
             .bots
             .iter()
-            .filter(|b| b.enabled && b.credentials_ready() && !b.is_github_kind())
+            .filter(|b| b.enabled && b.credentials_ready())
             .map(|b| b.key())
             .collect();
         eprintln!(
@@ -728,7 +727,7 @@ mod tests {
 
     #[test]
     fn rfc3339_now_utc_format() {
-        // GitHub 游标同款形态：UTC "YYYY-MM-DDTHH:MM:SSZ"，字典序可比较
+        // UTC "YYYY-MM-DDTHH:MM:SSZ" 形态，字典序可比较
         let s = super::chrono_lite::rfc3339_now();
         assert_eq!(s.len(), 20, "格式应为 YYYY-MM-DDTHH:MM:SSZ: {s}");
         assert!(s.ends_with('Z'));
