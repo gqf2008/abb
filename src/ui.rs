@@ -499,6 +499,9 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
     w.set_dingtalk_installed(get("dingtalk-cli"));
+    // 主动重新检测/启动 = 新的开始：清掉上次一键安装的失败计数
+    //（失败详情 dep-detail 保留到下次安装；AllDone 分支在调用本函数后重新设回）
+    w.set_dep_failed_count(0);
 }
 
 /// 把系统权限状态回填到设置窗（0=未授权 1=被拒绝 2=已授权）。
@@ -1867,13 +1870,22 @@ pub fn run_gui() -> Result<()> {
                                         w.set_status_line(format!("✅ {dep_id} 安装完成").into());
                                     }
                                     Err(e) => {
-                                        // 完整错误进详情区（状态行单行截断，用户看不到长原因）
-                                        w.set_dep_detail(format!("{dep_id} 安装失败：\n{e}").into());
-                                        w.set_status_is_error(true);
-                                        w.set_status_line(format!(
-                                            "⚠️ {dep_id} 安装失败，详情见下方错误区"
+                                        // 分类 + 引导进详情区（普通用户可操作）；自动切到
+                                        // 环境配置页——失败即所见，不再让用户自己找错误区。
+                                        let f = crate::deps::classify_fail(&dep_id, &e);
+                                        w.set_dep_detail(format!(
+                                            "{}\n\n【怎么办】{}\n\n（原始错误：{}）",
+                                            f.id, f.advice, f.raw
                                         )
                                         .into());
+                                        w.set_status_is_error(true);
+                                        w.set_status_line(format!(
+                                            "⚠️ {dep_id} 安装失败：{}",
+                                            f.advice
+                                        )
+                                        .into());
+                                        w.set_dep_failed_count(1);
+                                        w.set_current_page(2);
                                     }
                                 }
                             }
@@ -1885,24 +1897,31 @@ pub fn run_gui() -> Result<()> {
                                 push_deps_to_window(&w); // 重检测：卡片/横幅/首页计数自动刷新
                                 let failed = !outcome.failed.is_empty();
                                 if failed {
-                                    // 完整失败详情逐条进详情区；状态行只给短摘要
+                                    // 逐项分类 + 引导进详情区（普通用户可操作）；
+                                    // 自动切到环境配置页——失败即所见。
                                     let detail = outcome
                                         .failed
                                         .iter()
-                                        .map(|(id, e)| format!("{id}：{e}"))
+                                        .map(|(id, e)| {
+                                            let f = crate::deps::classify_fail(id, e);
+                                            format!("{id}\n【怎么办】{}\n（原始错误：{}）", f.advice, f.raw)
+                                        })
                                         .collect::<Vec<_>>()
                                         .join("\n\n");
                                     w.set_dep_detail(detail.into());
                                     w.set_status_is_error(true);
                                     w.set_status_line(format!(
-                                        "⚠️ 一键安装完成：成功 {} 项，失败 {} 项（详情见下方错误区）",
+                                        "⚠️ 一键安装完成：成功 {} 项，失败 {} 项（点「重试」或按错误区指引处理）",
                                         outcome.ok.len(),
                                         outcome.failed.len()
                                     )
                                     .into());
+                                    w.set_dep_failed_count(outcome.failed.len() as i32);
+                                    w.set_current_page(2);
                                 } else {
                                     w.set_dep_detail("".into());
                                     w.set_status_is_error(false);
+                                    w.set_dep_failed_count(0);
                                     w.set_status_line(
                                         crate::deps::format_all_summary(&outcome).into(),
                                     );

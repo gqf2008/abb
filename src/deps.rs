@@ -559,6 +559,89 @@ pub struct AllInstallOutcome {
     pub skipped: Vec<(String, String)>,
 }
 
+/// 安装失败的分类（普通用户可操作的引导依据）。启发式从错误串识别，非精确判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// 权限不足（EACCES/denied/not permitted）——macOS 授权拦截 / Windows 未提权。
+    Permission,
+    /// 网络失败（curl 错误/连接超时/无法解析）。
+    Network,
+    /// 前置命令缺失（找不到 brew/npm 等）。
+    CommandMissing,
+    /// 安装超时（20 分钟兜底）。
+    Timeout,
+    /// 命令退出 0 但 PATH 检测不到。
+    Path,
+    /// 未识别。
+    Other,
+}
+
+impl FailKind {
+    /// 每类的「怎么办」引导（普通用户照做即可，GUI 语境不提终端概念）。
+    pub fn advice(self) -> &'static str {
+        match self {
+            FailKind::Permission => {
+                "权限不足。macOS：检查「系统设置 → 隐私与安全性」是否有安装拦截；\
+                 Windows：关闭 ABB 后右键「以管理员身份运行」再重试"
+            }
+            FailKind::Network => "网络连接失败。请检查网络或代理设置后重试",
+            FailKind::CommandMissing => "缺少前置依赖。重试一键安装即可（会自动先装 Node.js）",
+            FailKind::Timeout => {
+                "安装超时（可能卡在网络或系统弹窗）。请检查是否有弹窗等待确认后重试"
+            }
+            FailKind::Path => "已安装但未找到可执行文件。请重启 ABB 后重新检测",
+            FailKind::Other => "安装失败。可复制下方原始错误反馈",
+        }
+    }
+}
+
+/// 一条带分类与引导的安装失败（UI 渲染用；原始错误保留供复制/日志）。
+#[derive(Debug, Clone)]
+pub struct FailedItem {
+    pub id: String,
+    /// 分类（当前仅测试断言消费——advice 才是 UI 可操作内容；保留字段供未来
+    /// 按类定制 UI（如权限类给提权按钮））。
+    #[allow(dead_code)]
+    pub kind: FailKind,
+    pub advice: String,
+    pub raw: String,
+}
+
+/// 把失败尾因分类为可操作条目。启发式按序子串匹配（大小写不敏感）；
+/// 匹配不到归 Other（仍给通用引导 + 原始错误）。
+pub fn classify_fail(dep_id: &str, err: &str) -> FailedItem {
+    let lower = err.to_ascii_lowercase();
+    let kind = if lower.contains("denied")
+        || lower.contains("eacces")
+        || lower.contains("permission")
+        || lower.contains("not permitted")
+    {
+        FailKind::Permission
+    } else if lower.contains("curl:")
+        || lower.contains("network")
+        || lower.contains("etimedout")
+        || lower.contains("econnrefused")
+        || lower.contains("failed to connect")
+        || lower.contains("couldn't resolve")
+    {
+        FailKind::Network
+    } else if lower.contains("找不到") || lower.contains("command not found") {
+        FailKind::CommandMissing
+    } else if lower.contains("安装超时") {
+        FailKind::Timeout
+    } else if lower.contains("未在 path 找到") {
+        FailKind::Path
+    } else {
+        FailKind::Other
+    };
+    FailedItem {
+        id: dep_id.to_string(),
+        kind,
+        advice: kind.advice().to_string(),
+        raw: err.to_string(),
+    }
+}
+
 /// 单项目安装超时（#60）：run_step 无超时（winget 弹 UAC 等用户 / 网络挂起），
 /// 一键装 8 项串行会把「卡死一项」放大成全流程卡死——每项 20 分钟兜底。
 const ALL_INSTALL_DEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
@@ -1052,6 +1135,61 @@ pub fn detect_permissions() -> Vec<PermStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_fail_matrix() {
+        // 分类矩阵：每类构造代表性错误串 → 断言 kind + advice 非空
+        let cases = [
+            (
+                "codex",
+                "退出码 1：EACCES: permission denied",
+                FailKind::Permission,
+            ),
+            (
+                "codex",
+                "退出码 1：curl: (7) Failed to connect",
+                FailKind::Network,
+            ),
+            (
+                "lark-cli",
+                "退出码 127：npm: command not found",
+                FailKind::CommandMissing,
+            ),
+            (
+                "pi",
+                "找不到 npm（请先装它的前置依赖）",
+                FailKind::CommandMissing,
+            ),
+            (
+                "claude",
+                "安装超时（20 分钟），可能卡在网络或系统弹窗",
+                FailKind::Timeout,
+            ),
+            (
+                "codex",
+                "步骤1跑完但未在 PATH 找到 codex（可能需重开终端/刷新 PATH）",
+                FailKind::Path,
+            ),
+            ("pi", "退出码 2：some unknown error text", FailKind::Other),
+        ];
+        for (id, err, expect) in cases {
+            let f = classify_fail(id, err);
+            assert_eq!(f.kind, expect, "{id}: {err}");
+            assert!(!f.advice.is_empty(), "{id} advice 非空");
+            assert_eq!(f.raw, err, "原始错误保留");
+        }
+        // 大小写不敏感
+        assert_eq!(
+            classify_fail("x", "EACCES").kind,
+            FailKind::Permission,
+            "大写匹配"
+        );
+        assert_eq!(
+            classify_fail("x", "Failed to CONNECT").kind,
+            FailKind::Network,
+            "大小写不敏感"
+        );
+    }
 
     #[test]
     fn detect_all_covers_eight() {

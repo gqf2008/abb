@@ -377,7 +377,9 @@ export component SettingsWindow inherits Window {
     in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
-    in-out property <string> dep-detail: ""; // 安装失败详情（多行完整原因；状态行只放短摘要）
+    in-out property <string> dep-detail: ""; // 安装失败详情（分类 + 怎么办 + 原始错误）
+    // 最近一次一键安装的失败项数（>0 = 首页「待处理」卡显示安装失败行，点击切环境配置页）。
+    in-out property <int> dep-failed-count: 0;
 
     // 系统权限（仅 macOS）：完全磁盘/辅助功能/屏幕录制/自动化/摄像头/麦克风。0=未授权 1=被拒绝 2=已授权
     in-out property <int> perm-full-disk: 0;
@@ -658,6 +660,10 @@ export component SettingsWindow inherits Window {
                                     spacing: 8px;
                                     ImageIcon { icon: @image-url("icons/alert.svg"); tint: #b86f00; width: 18px; height: 18px; }
                                     Text { text: "待处理"; font-size: 13px; font-weight: 700; color: #8a5a00; vertical-alignment: center; }
+                                }
+                                if root.dep-failed-count > 0: ProblemRow {
+                                    text: "一键安装失败 " + root.dep-failed-count + " 项 — 点击查看详情与处理指引";
+                                    clicked => { root.current-page = 2; }
                                 }
                                 if root.missing-deps > 0: ProblemRow {
                                     text: "依赖未装齐（" + root.missing-deps + " 项）— 机器人将无法处理消息";
@@ -1223,14 +1229,25 @@ export component SettingsWindow inherits Window {
                                             color: #b80;
                                             wrap: word-wrap;
                                         if root.dep-detail != "": Rectangle {
+                                            // 安装失败详情区（置顶于依赖卡）：分类 + 怎么办 + 原始错误。
+                                            // 醒目样式：粗边框 + 大字号——失败即所见（ui.rs 失败时自动切到本页）。
+                                            border-width: 2px;
+                                            border-color: #d13438;
                                             background: #fff1f0;
                                             border-radius: 8px;
-                                            HorizontalBox {
-                                                padding: 8px;
+                                            VerticalBox {
+                                                padding: 10px;
+                                                spacing: 6px;
+                                                Text {
+                                                    text: "⚠️ 安装失败";
+                                                    font-size: 14px;
+                                                    font-weight: 700;
+                                                    color: #d13438;
+                                                }
                                                 Text {
                                                     text: root.dep-detail;
-                                                    color: #d13438;
-                                                    font-size: 11px;
+                                                    color: #b02a2a;
+                                                    font-size: 13px;
                                                     wrap: word-wrap;
                                                     horizontal-stretch: 1;
                                                 }
