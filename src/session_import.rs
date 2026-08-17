@@ -88,9 +88,10 @@ fn json_text_blocks(content: Option<&Value>) -> String {
 }
 
 /// claude jsonl：`type=="user"`（content 为 string）= 用户；`type=="assistant"`
-/// text blocks = 助手（同一 message.id 多事件，覆盖策略保留最后一个有 text 的 =
-/// 最终回复——轮中解说被其后的事件覆盖）；`isSidechain:true` 排除；
-/// `queue-operation`/`mode` 等独立 type 天然排除。
+/// text blocks = 助手（**注意**：真实文件中同一 message.id 通常只出现一次（每事件
+/// 一个 block），跨工具轮的多条 assistant 事件是不同 message.id——「覆盖」只对
+/// 罕见的多事件同 id 生效，轮中解说文本会被如实导入（行为无害，注释如实）；
+/// `isSidechain:true` 排除；`queue-operation`/`mode` 等独立 type 天然排除。
 fn extract_claude(path: &Path) -> Result<Vec<Msg>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
     let mut msgs: Vec<Msg> = Vec::new();
@@ -393,6 +394,19 @@ pub fn import_bot(bot_key: &str, dry_run: bool) -> ImportReport {
             imported: 0,
             skipped: Vec::new(),
         };
+        // 审查 C1 修复：每 chat 在槽位循环**前**计算一次去重基线（原实现在每个来源内
+        // 重读 history 首条——claude 先导入后截点被其最早消息占据，后续 pi 来源全部
+        // 「无更早消息」误丢且不 mark，重跑复现同一跳过 = 永久丢失）。
+        // 去重改为**内容级**（(user, text) 匹配，跨 ts 宽容）：同文本不重复导入——
+        // 既防 #49 后两端重叠（同轮次同文本），又允许已丢来源（C1 事故现场：pi 内容
+        // 与 history 零重叠）在重跑时无损恢复；同文本不同轮次的重复提问去重为一条，
+        // 注入场景可接受（重复文本无接续价值）。
+        let hist = crate::history::History::open(bot_key, &chat);
+        let existing: std::collections::HashSet<(bool, String)> = hist
+            .entries()
+            .iter()
+            .map(|e| (e.user, e.text.clone()))
+            .collect();
         let slots = [
             ("claude", &entry.claude),
             ("codex", &entry.codex),
@@ -404,7 +418,6 @@ pub fn import_bot(bot_key: &str, dry_run: bool) -> ImportReport {
                 continue; // 占位 UUID（未开首轮）无文件
             }
             let source = format!("{backend}:{}", slot.session_id);
-            let hist = crate::history::History::open(bot_key, &chat);
             if hist.imported_sources().contains(&source) {
                 continue; // 已导入（幂等）
             }
@@ -426,23 +439,27 @@ pub fn import_bot(bot_key: &str, dry_run: bool) -> ImportReport {
                 cr.skipped.push(format!("{backend}: 无可提取消息"));
                 continue;
             }
-            // 时间窗去重：#49 后两端都有 → 只导入早于现有 history 首条的消息
-            let first_ts = hist.entries().first().map(|e| e.ts);
-            let filtered: Vec<&Msg> = match first_ts {
-                Some(t0) => msgs.iter().filter(|m| m.ts < t0).collect(),
-                None => msgs.iter().collect(),
-            };
-            if filtered.is_empty() {
-                cr.skipped.push(format!("{backend}: 无早于现有历史的消息"));
+            // 内容级去重：跳过与现有 history 同 (user, text) 的消息（#49 后重叠防重复；
+            // ts 宽容——history 条目 ts 是实时写入秒、后端原 ts 是 ISO 秒，可能差 1 秒）
+            let fresh: Vec<&Msg> = msgs
+                .iter()
+                .filter(|m| !existing.contains(&(m.user, m.text.clone())))
+                .collect();
+            if fresh.is_empty() {
+                cr.skipped
+                    .push(format!("{backend}: 内容与现有历史全部重复"));
                 continue;
             }
-            let take = filtered.iter().take(MAX_PER_SOURCE).count();
+            // 审查 I1：取**最新** MAX_PER_SOURCE 条（靠近 #49 边界的内容对注入接续
+            // 更有价值；原 take 取最旧 200，丢的是最新端）
+            let take = fresh.iter().rev().take(MAX_PER_SOURCE).count();
             if dry_run {
                 cr.imported += take;
                 continue;
             }
-            let entries: Vec<HistoryEntry> = filtered
+            let entries: Vec<HistoryEntry> = fresh
                 .iter()
+                .rev()
                 .take(MAX_PER_SOURCE)
                 .enumerate()
                 .map(|(i, m)| HistoryEntry {

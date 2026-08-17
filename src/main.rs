@@ -700,7 +700,9 @@ fn run_session_import_cli(args: &[String]) -> i32 {
         None => cfg.bots.iter().map(|b| b.key()).collect(),
     };
     let mut any_issue = false;
+    let mut found = false;
     for key in keys {
+        found = true;
         let report = crate::session_import::import_bot(&key, dry_run);
         if dry_run {
             println!("[dry-run] bot={key}");
@@ -723,6 +725,12 @@ fn run_session_import_cli(args: &[String]) -> i32 {
             println!("  （无可导入的会话）");
         }
         any_issue |= report.chats.iter().any(|c| !c.skipped.is_empty());
+    }
+    if !found {
+        eprintln!(
+            "找不到该 bot（--bot 拼写？可用：agent-bridge session-import --dry-run 列出全部）"
+        );
+        return 2;
     }
     if dry_run {
         println!("（dry-run：未写入任何内容）");

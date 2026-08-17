@@ -196,7 +196,9 @@ impl History {
             }
             all.push(e);
         }
-        all.sort_by_key(|e| e.ts);
+        // 按 ts 升序（导入的更早消息排前，文件顺序 = 时间序）；
+        // ts=0（解析失败的消息）排最后——不污染时间序首条（审查 Minor）
+        all.sort_by_key(|e| (e.ts == 0, e.ts));
         self.write_entries(&all)
     }
 
