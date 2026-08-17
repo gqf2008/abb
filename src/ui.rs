@@ -1423,8 +1423,8 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 打开官方安装文档（缺失依赖时，点「安装文档」按钮 → 默认浏览器打开 url）
-    settings.on_open_install_docs(|url| {
+    // 打开外部链接（依赖文档/申请 token 等「点按钮 → 默认浏览器打开 url」）
+    settings.on_open_url(|url| {
         platform::open_url(url.as_str());
     });
     // 「去授权」：跳到对应系统权限的设置面板（仅 macOS 有；面板 URL 与 deps.rs detect_permissions 一致）
