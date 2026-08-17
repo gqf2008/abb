@@ -139,7 +139,7 @@ export component QrDialog inherits Window {
         Text { text: root.tip; font-weight: 600; horizontal-alignment: center; wrap: word-wrap; }
         Rectangle {
             background: white;
-            border-radius: 8px;
+            border-radius: 2px;
             min-height: 300px;
             Image {
                 source: root.qr-image;
@@ -173,15 +173,16 @@ component ImageIcon inherits Image {
     image-fit: contain;
 }
 
-// 左侧导航项：SVG 图标 + 文字；选中态 = accent 淡底 + accent 文字。
+// 左侧导航项：SVG 图标 + 文字；像素风选中态 = 黑底白字直角块。
 component NavItem inherits Rectangle {
     in property <string> label: "";
     in property <image> icon;
     in property <bool> selected: false;
     callback clicked();
     height: 38px;
-    border-radius: 8px;
-    background: root.selected ? PixelTheme.accent.with-alpha(0.12) : transparent;
+    border-radius: 0px;
+    // 像素风：选中 = 实黑块 + 白字（无半透明淡底）
+    background: root.selected ? PixelTheme.accent : transparent;
     TouchArea {
         clicked => { root.clicked(); }
         HorizontalBox {
@@ -190,13 +191,13 @@ component NavItem inherits Rectangle {
             alignment: start;
             ImageIcon {
                 icon: root.icon;
-                tint: root.selected ? PixelTheme.accent : PixelTheme.text.with-alpha(0.65);
+                tint: root.selected ? PixelTheme.bg : PixelTheme.text.with-alpha(0.65);
             }
             Text {
                 text: root.label;
                 font-size: 13px;
                 font-weight: root.selected ? 600 : 400;
-                color: root.selected ? PixelTheme.accent : PixelTheme.text;
+                color: root.selected ? PixelTheme.bg : PixelTheme.text;
                 vertical-alignment: center;
             }
         }
@@ -241,7 +242,7 @@ component ProblemRow inherits HorizontalBox {
     Rectangle {
         width: 84px;
         height: 24px;
-        border-radius: 12px;
+        border-radius: 4px;
         background: #b86f0018;
         TouchArea {
             clicked => { root.clicked(); }
@@ -268,7 +269,7 @@ component QuickCard inherits Rectangle {
     callback clicked();
     height: 122px;
     horizontal-stretch: 1;
-    border-radius: 12px;
+    border-radius: 4px;
     background: PixelTheme.bg;
     TouchArea {
         clicked => { root.clicked(); }
@@ -518,7 +519,7 @@ export component SettingsWindow inherits Window {
                             Rectangle {
                                 width: 28px;
                                 height: 28px;
-                                border-radius: 8px;
+                                border-radius: 2px;
                                 background: @linear-gradient(135deg, #0078d4, #00bcf2);
                                 Text { text: "A"; color: white; font-weight: 800; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                             }
@@ -654,7 +655,7 @@ export component SettingsWindow inherits Window {
 
                         // 待处理建议（火绒「主页建议」/ PCM「智能提醒」同款）：只有异常才出现，每行点一下直达对应页。
                         if root.dep-failed-count > 0 || root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0: Rectangle {
-                            border-radius: 12px;
+                            border-radius: 4px;
                             background: #fff8e6;
                             VerticalBox {
                                 padding-top: 12px; padding-right: 16px; padding-bottom: 10px; padding-left: 16px;
@@ -709,7 +710,7 @@ export component SettingsWindow inherits Window {
                             Rectangle {
                                 height: 122px;
                                 horizontal-stretch: 1;
-                                border-radius: 12px;
+                                border-radius: 4px;
                                 background: PixelTheme.bg;
                                 VerticalBox {
                                     padding: 14px;
@@ -741,7 +742,7 @@ export component SettingsWindow inherits Window {
 
                         Rectangle {
                             vertical-stretch: 1;
-                            border-radius: 12px;
+                            border-radius: 4px;
                             background: PixelTheme.bg;
                             HorizontalBox {
                                 spacing: 0;
@@ -752,13 +753,13 @@ export component SettingsWindow inherits Window {
                                     padding: 8px;
                                     Rectangle {
                                         background: PixelTheme.panel;
-                                        border-radius: 10px;
+                                        border-radius: 4px;
                                         vertical-stretch: 1;
                                         ListView {
                                             for bot[idx] in root.bots: Rectangle {
                                                 height: 38px;
-                                                background: idx == root.selected ? PixelTheme.hover : transparent;
-                                                border-radius: 8px;
+                                                background: idx == root.selected ? PixelTheme.accent : transparent;
+                                                border-radius: 0px;
                                                 TouchArea {
                                                     clicked => { root.selected = idx; root.selection-changed(idx); }
                                                     VerticalBox {
@@ -767,13 +768,13 @@ export component SettingsWindow inherits Window {
                                                         Text {
                                                             // 停用的 bot 前缀 ⚪ 并显灰，一眼可辨（启用的维持原色）
                                                             text: (bot.enabled ? "" : "⚪ ") + (bot.name == "" ? "(未命名)" : bot.name);
-                                                            color: idx == root.selected ? PixelTheme.text : (bot.enabled ? PixelTheme.text : #aaa);
+                                                            color: idx == root.selected ? PixelTheme.bg : (bot.enabled ? PixelTheme.text : #aaa);
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: bot.kind + (bot.enabled ? "" : " · 停用");
                                                             font-size: 11px;
-                                                            color: idx == root.selected ? PixelTheme.text.with-alpha(0.8) : #888;
+                                                            color: idx == root.selected ? PixelTheme.bg.with-alpha(0.85) : #888;
                                                         }
                                                     }
                                                 }
@@ -1189,7 +1190,7 @@ export component SettingsWindow inherits Window {
                                 if root.missing-agent: Rectangle {
                                     vertical-stretch: 0;
                                     background: #fff3cd;
-                                    border-radius: 10px;
+                                    border-radius: 4px;
                                     HorizontalBox {
                                         padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
                                         spacing: 8px;
@@ -1211,7 +1212,7 @@ export component SettingsWindow inherits Window {
                                 // ── 依赖卡片 ──
                                 Rectangle {
                                     vertical-stretch: 0;
-                                    border-radius: 12px;
+                                    border-radius: 4px;
                                     background: PixelTheme.bg;
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
@@ -1242,7 +1243,7 @@ export component SettingsWindow inherits Window {
                                             border-width: 2px;
                                             border-color: #d13438;
                                             background: #fff1f0;
-                                            border-radius: 8px;
+                                            border-radius: 2px;
                                             VerticalBox {
                                                 padding: 10px;
                                                 spacing: 6px;
@@ -1384,7 +1385,7 @@ export component SettingsWindow inherits Window {
                                 // ── 系统权限卡片（仅支持平台才显示）──
                                 if root.perms-supported: Rectangle {
                                     vertical-stretch: 0;
-                                    border-radius: 12px;
+                                    border-radius: 4px;
                                     background: PixelTheme.bg;
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
@@ -1533,7 +1534,7 @@ export component SettingsWindow inherits Window {
 
                         Rectangle {
                             vertical-stretch: 1;
-                            border-radius: 12px;
+                            border-radius: 4px;
                             background: PixelTheme.bg;
                             HorizontalBox {
                                 spacing: 0;
@@ -1544,13 +1545,13 @@ export component SettingsWindow inherits Window {
                                     padding: 10px;
                                     Rectangle {
                                         background: PixelTheme.panel;
-                                        border-radius: 10px;
+                                        border-radius: 4px;
                                         vertical-stretch: 1;
                                         ListView {
                                             for prov[idx] in root.providers: Rectangle {
                                                 height: 44px;
-                                                background: idx == root.provider-selected ? PixelTheme.hover : transparent;
-                                                border-radius: 8px;
+                                                background: idx == root.provider-selected ? PixelTheme.accent : transparent;
+                                                border-radius: 0px;
                                                 TouchArea {
                                                     clicked => { root.provider-selected = idx; root.provider-selection-changed(idx); }
                                                     VerticalBox {
@@ -1558,13 +1559,13 @@ export component SettingsWindow inherits Window {
                                                         spacing: 2px;
                                                         Text {
                                                             text: prov.name == "" ? "(未命名)" : prov.name;
-                                                            color: idx == root.provider-selected ? PixelTheme.text : PixelTheme.text;
+                                                            color: idx == root.provider-selected ? PixelTheme.bg : PixelTheme.text;
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: prov.kind + (prov.is-default ? " · 默认" : "");
                                                             font-size: 11px;
-                                                            color: idx == root.provider-selected ? PixelTheme.text.with-alpha(0.8) : #888;
+                                                            color: idx == root.provider-selected ? PixelTheme.bg.with-alpha(0.85) : #888;
                                                         }
                                                     }
                                                 }
