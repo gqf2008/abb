@@ -222,6 +222,35 @@ async fn run_bot(
         });
     }
 
+    // #33 历史会话迁移**自动触发**：每次启动把后端私有 session 里尚未导入的对话
+    // （claude/codex/pi/prime）导入 history.rs——老历史参与注入接续，无需手动跑
+    // `session-import`。幂等：imported.json 来源键标记，已导入来源秒跳过；追加式
+    // 写入不触碰现有 history。spawn_blocking（fs 密集：读后端文件 + 提取 + 写）；
+    // 失败仅 log 警告，绝不阻塞 bot 启动。
+    {
+        let key = key.clone();
+        let name: &'static str = Box::leak(format!("session-import:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn(name, async move {
+            let kb = key.clone(); // 闭包内另持一份（日志用）
+            let report =
+                tokio::task::spawn_blocking(move || crate::session_import::import_bot(&kb, false))
+                    .await
+                    .unwrap_or_default();
+            if report.total > 0 {
+                crate::log!(
+                    "[bot:{key}] 历史会话自动迁移完成：导入 {} 条（{} 个 chat）",
+                    report.total,
+                    report.chats.len()
+                );
+            } else if !report.chats.is_empty() {
+                crate::log!(
+                    "[bot:{key}] 历史会话迁移扫描完成：无新内容（{} 个 chat 有跳过项）",
+                    report.chats.len()
+                );
+            }
+        });
+    }
+
     // 定时任务调度循环（独立于事件循环，共享关停令牌）。#69：长驻，登记 spawn_forever。
     {
         let bridge = bridge.clone();
