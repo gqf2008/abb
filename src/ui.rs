@@ -21,6 +21,10 @@ use tokio::sync::mpsc;
 
 slint::include_modules!();
 
+// 像素自绘窗口接线：PixelTitleBar 的拖拽/最小化/最大化/关闭 → 系统窗口控制。
+// 关闭 = 隐藏窗口不退出（托盘应用惯例，install_title_bar_controls_no_quit）。
+slint_pixel::impl_title_bar_ui!(SettingsWindow);
+
 enum UiCmd {
     Start,
     Stop,
@@ -577,6 +581,8 @@ pub fn run_gui() -> Result<()> {
 
     let tray = Tray::new()?;
     let settings = SettingsWindow::new()?;
+    // 像素自绘窗口：PixelTitleBar 窗口控制接线（关闭=隐藏，托盘应用惯例）
+    slint_pixel::install_title_bar_controls_no_quit(&settings);
     // 版本号随编译注入（Cargo.toml 单一事实源），侧栏底部展示
     settings.set_version(env!("CARGO_PKG_VERSION").into());
     let qr_dialog = QrDialog::new()?;

@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelButton, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelTextInput, PixelTheme } from "@slint_pixel";
+import { PixelButton, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -342,6 +342,8 @@ export component UnsavedDialog inherits Window {
 
 // 设置窗主体。
 export component SettingsWindow inherits Window {
+    // 像素风自绘窗口：无系统边框/红绿灯，PixelTitleBar 自绘标题栏（拖拽/最小化/最大化/关闭）
+    no-frame: true;
     // 打开时由 Rust 侧提升为 regular 策略（带 dock 图标 + 置前聚焦），关掉降回 accessory。
     // 不用 always-on-top：那会浮在别的 app 之上却没焦点，别扭。标题带实时 bot 数。
     title: root.window-title;
@@ -458,6 +460,12 @@ export component SettingsWindow inherits Window {
     callback recheck-deps();            // 重新检测依赖是否已装
     callback install-dep(string);       // 安装某个依赖（claude/codex/pi/node/python3/lark-cli/dingtalk-cli）
     callback install-all-missing();     // #60 一键安装全部缺失组件（node 前置自动装）
+    // 像素自绘标题栏回调（Rust 侧 install_title_bar_controls_no_quit 接线：
+    // 关闭=隐藏窗口不退出——托盘应用惯例）
+    callback drag-start();
+    callback minimize();
+    callback toggle-maximize();
+    callback close-window();
     callback open-perm-settings(string); // 打开某项系统权限对应的设置面板（full-disk/accessibility/screen/automation）
     callback request-perms();           // 触发屏幕录制/摄像头/麦克风授权弹框（拉起子进程逐项请求）
     callback restart-service-request(); // 环境页授权后一键重启服务（权限对运行中进程不实时刷新）
@@ -499,6 +507,14 @@ export component SettingsWindow inherits Window {
             // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。全部归零，
             // 由各分区自己的 padding 精确控制。
             padding: 0;
+            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/最大化/关闭 ──
+            PixelTitleBar {
+                title: root.window-title;
+                drag-start => { root.drag-start(); }
+                minimize => { root.minimize(); }
+                toggle-maximize => { root.toggle-maximize(); }
+                close-window => { root.close-window(); }
+            }
             // ── 主体：左导航栏 + 页面区 ──
             HorizontalBox {
                 vertical-stretch: 1;
@@ -512,7 +528,7 @@ export component SettingsWindow inherits Window {
                     // 内容铺满整窗（fullsize_content_view）：红绿灯浮在左栏左上角
                     // （x≈8-56, y≈8-22），顶部留 34px 让位，Logo 紧接其下。
                     VerticalBox {
-                        padding-top: 34px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
+                        padding-top: 4px; padding-right: 10px; padding-bottom: 12px; padding-left: 10px;
                         spacing: 4px;
                         HorizontalBox {
                             padding-top: 0;
