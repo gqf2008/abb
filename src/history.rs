@@ -263,16 +263,29 @@ impl History {
                           // 窗口不能以孤立的助手轮开头（其用户轮已被预算边界/条目淘汰切掉）——
                           // 模型看到「无问之答」会困惑，宁可少一轮；配合上面助手轮不截断收编，
                           // 「最新一条孤立超长助手轮」不会触发空窗（预算流向其配对的用户轮）。
+                          // 审查 B1 兜底：剥光只剩孤立助手轮时（最新助手轮恰好装进预算、
+                          // 配对用户轮被预算切掉——去存储截断后单轮即可跨预算边界）——
+                          // 空注入 = 新后端零上下文（I-1 的症状），此时保留该轮截断收编，
+                          // 宁可有答无问，不可零上下文。
+        let mut stripped: Option<(&HistoryEntry, String)> = None;
         while let Some((e, _)) = window.first() {
             if e.user {
                 break;
             }
-            window.remove(0);
+            stripped = Some(window.remove(0));
         }
         if window.is_empty() {
-            return (String::new(), 0);
+            if let Some((e, _)) = stripped {
+                let cut = crate::agent::truncate(&e.text, max_chars.saturating_sub(8));
+                window.push((e, cut));
+            } else {
+                return (String::new(), 0);
+            }
         }
         let rounds = window.iter().filter(|(e, _)| e.user).count();
+        // 剥离兜底保留的孤立助手轮无配对用户轮（rounds 会数成 0 → bridge 的 n>0 闸
+        // 会静默跳过注入）——计为 1 轮，确保注入发生（其文本已截断收编进预算）。
+        let rounds = if rounds > 0 { rounds } else { 1 };
         let mut block = String::from(
             "[历史上下文]\n（以下是本会话切换前/丢失前的最近对话记录，供衔接背景；请基于最新消息继续）\n\n",
         );
@@ -444,6 +457,23 @@ mod tests {
         assert!(!block.is_empty(), "窗口不得为空（预算流向用户轮）");
         assert!(block.contains("问题"), "配对的用户轮注入");
         assert_eq!(n, 1);
+        h.clear();
+    }
+
+    #[test]
+    fn inject_just_fits_assistant_does_not_empty_window() {
+        // 审查 B1：镜像方向——最新助手轮恰好装进预算（need=5998 ≤ 6000），其配对
+        // 用户轮被预算切掉（remain=2 < 80 → break）→ 窗口剥成只剩孤立助手轮。
+        // 旧行为剥光返回空窗（空注入 = 新后端零上下文，I-1 的症状在镜像方向仍可达）；
+        // 兜底：保留该轮截断收编，宁可有答无问，不可零上下文。
+        let h = temp_history("justfits", "oc_x");
+        h.append_user("u1", "claude", "问题");
+        let a = "答".repeat(5990); // need = 5990+8 = 5998 ≤ 6000 恰好装下；remain=2 < 80
+        h.append_assistant("u1", "claude", &a);
+        let (block, n) = h.inject_block("", 6000);
+        assert!(!block.is_empty(), "窗口不得为空（B1 空注入回归）");
+        assert!(block.contains("答"), "孤立助手轮截断收编");
+        assert_eq!(n, 1, "计为 1 轮，bridge 的 n>0 闸放行注入");
         h.clear();
     }
 

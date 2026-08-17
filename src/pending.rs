@@ -64,12 +64,22 @@ impl PendingStore {
         Self::at(dir.join("pending.json"))
     }
 
-    /// 按指定路径构造（生产/测试共用）。
+    /// 按指定路径构造（生产/测试共用）。解析失败（半截写/手工编辑损坏）必须留痕：
+    /// 静默空置会让下一条 add/set_reply 覆盖损坏文件、全部残留（含已落盘的 reply）
+    /// 永久丢失——恢复路径的「补发不重跑」依赖这个文件，丢了就退化为静默丢消息。
     fn at(path: PathBuf) -> PendingStore {
-        let data = fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<PendingItem>>(&t).ok())
-            .unwrap_or_default();
+        let data = match fs::read_to_string(&path) {
+            Ok(t) => match serde_json::from_str::<Vec<PendingItem>>(&t) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::log!(
+                        "[pending] ⚠️ pending.json 解析失败，按空队列启动（下次写盘将覆盖原文件）: {e:#}"
+                    );
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
         PendingStore {
             path,
             data: Mutex::new(data),
@@ -119,10 +129,18 @@ impl PendingStore {
         self.len() == 0
     }
 
-    /// 原子写盘（tmp + rename），避免崩溃留半截 json。
+    /// 原子写盘（tmp + rename），避免崩溃留半截 json。失败必须留痕（审查：原先
+    /// 序列化/写盘错误全静默）——set_reply 的落盘是 W2「补发不重跑」的持久性依据：
+    /// 写盘失败时内存带 reply、盘上无 reply，崩溃后按 W1 重跑（副作用双发）且无日志
+    /// 线索；remove 的写盘失败则会让已确认发出的条目在盘上残留、每次重启重复补发。
     fn save(&self, data: &[PendingItem]) {
-        if let Ok(text) = serde_json::to_string_pretty(data) {
-            let _ = crate::atomic_write_text(&self.path, &text);
+        match serde_json::to_string_pretty(data) {
+            Ok(text) => {
+                if let Err(e) = crate::atomic_write_text(&self.path, &text) {
+                    crate::log!("[pending] ⚠️ 写盘失败 path={}: {e:#}", self.path.display());
+                }
+            }
+            Err(e) => crate::log!("[pending] ⚠️ 序列化失败: {e:#}"),
         }
     }
 }

@@ -1089,27 +1089,31 @@ impl Bridge {
                 };
                 // 阶段 1（W2 窗口修复）：回复产出后先把最终文本落盘到 pending 条目——
                 // 「发送前崩溃」的恢复据此**补发而非重跑**（原 remove 在发送前，
-                // 此窗口崩溃 = 回复静默丢失）。发送成功后才 remove（send 成功但
+                // 此窗口崩溃 = 回复静默丢失）。发送完成后才 remove（send 成功但
                 // remove 前崩溃 = 重启补发一条重复回复，at-least-once 仅重发文本，
-                // 严格优于重跑）。发送失败 → remove + 日志（用户在场可重发；恢复
-                // 路径的无人值守补发不适用此场景，避免重启后陈旧回复）。
-                self.pending.set_reply(&ev.mid, &sent_text);
-                match self.send_reply(&ev, &sent_text).await {
-                    Ok(()) => {
-                        self.pending.remove(&ev.mid);
-                        crate::log!(
-                            "[bridge] 已回复 chat={} 长度={}",
-                            trunc(&ev.chat_id, 10),
-                            reply.chars().count()
-                        );
-                    }
-                    Err(e) => {
-                        self.pending.remove(&ev.mid);
-                        crate::log!(
-                            "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
-                            trunc(&ev.chat_id, 10)
-                        );
-                    }
+                // 严格优于重跑；发送失败也 remove——用户在场可重发，恢复路径的无人
+                // 值守补发不适用此场景，避免重启后陈旧回复）。
+                // 审查跟进：same_session=false（运行中被 /new / CLI reset 换走）时
+                // **不落盘 reply**——该回复属于已作废会话，崩溃后补发会把旧答案送进
+                // 用户明确重置过的新会话（历史已清、提示已过期）；此窗口退回 W1 重跑，
+                // 与基线一致（mark_started/历史已被上方同闸跳过）。
+                if same_session {
+                    self.pending.set_reply(&ev.mid, &sent_text);
+                }
+                let send_result = self.send_reply(&ev, &sent_text).await;
+                // remove 统一一处（审查：原 Ok/Err 两臂各自复制——未来只改一臂会
+                // 破坏「发送后摘 pending」的 W2 不变式）
+                self.pending.remove(&ev.mid);
+                match send_result {
+                    Ok(()) => crate::log!(
+                        "[bridge] 已回复 chat={} 长度={}",
+                        trunc(&ev.chat_id, 10),
+                        reply.chars().count()
+                    ),
+                    Err(e) => crate::log!(
+                        "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    ),
                 }
             }
             Ok(agent::RunOutcome::Cancelled) => {
@@ -1118,8 +1122,14 @@ impl Bridge {
                 // remove 前」崩溃会让已叫停的任务以 reply=None 残留 → 重启被普通重放
                 // **续跑**，违背叫停语义；停止通知本身丢失可接受——用户已在场叫停）。
                 self.pending.remove(&ev.mid);
-                // 只发最终结果：「⏹ 已停止」一条。
-                let _ = self.send_reply(&ev, "⏹ 已停止").await;
+                // 只发最终结果：「⏹ 已停止」一条。失败也留痕（审查：原 `let _` 全静默——
+                // pending 已摘、无重试路径，连日志都没有，用户与运维都无从得知）。
+                if let Err(e) = self.send_reply(&ev, "⏹ 已停止").await {
+                    crate::log!(
+                        "[bridge] ⚠️ 停止通知发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    );
+                }
                 // 不 mark_started：被打断的轮次不算完成
             }
             Err(e) => {
@@ -1144,6 +1154,23 @@ impl Bridge {
         self.msgr.del_typing(&ev.mid, typing_rid).await;
         self.msgr.done(&ev.mid).await;
         // _serial_guard 在此函数末尾 drop，释放 per-chat 锁，排队的下一条开始处理。
+    }
+
+    /// 补发路径的 Ev 重建（崩溃残留 PendingItem → Ev）：quoted/attachments 已随原轮
+    /// 消费（原消息已被处理过），补发只重发文本，字段按 send_reply 所需最小集。
+    /// 与重放路径直接消费 item 字段不同（那里要带全上下文）——两处差异在此显式化，
+    /// 防止未来改一处漏一处（审查 R2）。
+    fn redeliver_ev(item: &PendingItem) -> Ev {
+        Ev {
+            mid: item.mid.clone(),
+            chat_id: item.chat_id.clone(),
+            chat_type: item.chat_type.clone(),
+            thread_id: item.thread_id.clone(),
+            quoted: crate::messenger::QuotedContent::default(),
+            text: item.text.clone(),
+            attachments: Vec::new(),
+            role: item.role,
+        }
     }
 
     /// 启动恢复（#25）：扫描 pending.json 残留（=上次崩溃/重启时未完成的消息），
@@ -1187,27 +1214,26 @@ impl Bridge {
             // 阶段 1（W2 窗口修复）：回复已产出但未确认发出（崩溃在 set_reply 与
             // remove 之间）→ **直接补发，不重跑 agent**（原语义此窗口回复静默丢失）。
             // 补发成功才 remove；失败留盘，下次启动再试（不重跑）。
-            // 注：与实时路径的 send_reply 一样无 per-chat 锁（recover 与事件循环并行，
-            // 与「🔄 正在恢复」提示同模式）——仅消息顺序可能交错，无正确性问题。
+            // 审查跟进：补发持与实时 handle 同款 per-chat 串行锁（key 与 Ev::key 一致），
+            // 避免与事件循环对新消息的应答交错（原实现无锁，顺序可能倒挂——IM 场景
+            // 顺序即可见正确性；flush_outbox 取锁先例）。
             if let Some(reply) = &item.reply {
-                let ev = Ev {
-                    mid: item.mid.clone(),
-                    chat_id: item.chat_id.clone(),
-                    chat_type: item.chat_type.clone(),
-                    thread_id: item.thread_id.clone(),
-                    quoted: crate::messenger::QuotedContent::default(),
-                    text: item.text.clone(),
-                    attachments: Vec::new(),
-                    role: item.role,
-                };
+                let ev = Self::redeliver_ev(&item);
                 crate::log!(
                     "[bot:{}] 补发上次已产出的回复 chat={} mid={}",
                     self.bot.key(),
                     trunc(&ev.chat_id, 12),
                     trunc(&ev.mid, 12)
                 );
+                let lock = self.chat_lock(&ev.key());
+                let _guard = lock.lock().await;
                 match self.send_reply(&ev, reply).await {
-                    Ok(()) => self.pending.remove(&item.mid),
+                    Ok(()) => {
+                        self.pending.remove(&item.mid);
+                        // 与实时路径一致：补发成功后给原消息补 DONE 回执（崩溃窗口里
+                        // handle 尾部的 del_typing/done 未执行——补发即补上）。
+                        self.msgr.done(&ev.mid).await;
+                    }
                     Err(e) => {
                         crate::log!("[bot:{}] 补发失败（留盘下次再试）: {e:#}", self.bot.key())
                     }
@@ -1665,6 +1691,8 @@ mod tests {
         quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
         /// 设置后：发给该 chat 的消息返回 Err（失败注入，测游标回退链路）。
         fail_chat: Mutex<Option<String>>,
+        /// done 回执收集（W2 补发补 DONE 断言用；实时路径 handle 尾部也会调）。
+        done: Mutex<Vec<String>>,
     }
     impl MockMessenger {
         fn new() -> Self {
@@ -1673,7 +1701,11 @@ mod tests {
                 sent_chats: Mutex::new(Vec::new()),
                 quoted: Mutex::new(std::collections::HashMap::new()),
                 fail_chat: Mutex::new(None),
+                done: Mutex::new(Vec::new()),
             }
+        }
+        fn done_calls(&self) -> Vec<String> {
+            self.done.lock().unwrap().clone()
         }
         fn set_quoted(&self, message_id: &str, text: &str) {
             self.quoted.lock().unwrap().insert(
@@ -1708,6 +1740,9 @@ mod tests {
                 .unwrap()
                 .push((chat_id.to_string(), text.to_string()));
             Ok(())
+        }
+        async fn done(&self, message_id: &str) {
+            self.done.lock().unwrap().push(message_id.to_string());
         }
         async fn get_quoted_message(
             &self,
@@ -2858,6 +2893,10 @@ mod tests {
                 .count(),
             1,
             "恰发一条（不重复）"
+        );
+        assert!(
+            msgr.done_calls().iter().any(|m| m == "w2"),
+            "补发成功后补 DONE 回执（崩溃窗口里 handle 尾部的 done 未执行）"
         );
         assert!(bridge.pending.is_empty(), "补发成功清盘");
         cleanup_bridge(&bridge);

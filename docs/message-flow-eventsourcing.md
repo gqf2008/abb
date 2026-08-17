@@ -18,7 +18,7 @@ add(pending) ── agent run ── set_reply(回复落盘) ── send ── 
 | 发送成功后 remove 前崩溃 | 回复已发（无窗口概念） | 重启补发一条重复回复（at-least-once 仅重发文本，严格优于重跑；用户可见双发，接受） |
 | Cancelled/Err 臂 | 先 remove 再发送（基线） | 同（恢复基线：先摘 pending——remove 若在发送后，崩溃会让已叫停任务被重启续跑，违背叫停不变式） |
 
-三臂时序：**Reply** = set_reply → send → Ok 才 remove；**Cancelled/Err** = remove → 发通知。
+三臂时序：**Reply** = set_reply → send → remove（发送成功或失败均摘：失败时用户在场可重发，恢复路径的无人值守补发不适用此场景）；**Cancelled/Err** = remove → 发通知。
 
 ## 阶段 2（GitHub 双写幂等）——不适用
 
@@ -41,3 +41,4 @@ dsh 式事件溯源（`msg/received` / `agent/started` / `agent/completed` / `de
 
 - 2026-08-17：阶段 1 完成并推送 main（`54821df` 实现 + `1d8d68f` 审查跟进；268 测试全绿，CI 绿）
 - 审查发现并修复：Cancelled 臂 remove 位置回归（叫停不变式）、发送失败/补发不对称判据注释、thread 补发测试、恰发一条断言
+- 全面审查跟进（2026-08-17）：B1 空注入镜像方向兜底（孤立助手轮截断收编，I-1 症状在「助手轮恰好装进预算」方向仍可达）、same_session 闸不落盘 reply（/new 换走会话不补发）、补发持 per-chat 锁 + 补 DONE 回执、pending 写盘/解析失败留痕、Cancelled 臂停止通知失败留痕；剩余接受项：补发无 TTL（at-least-once 语义）、助手轮超预算整条跳过（I-1 既有取舍）、ENTRY_MAX 写放大（存储保真取舍）
