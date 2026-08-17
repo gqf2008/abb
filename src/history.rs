@@ -63,7 +63,8 @@ pub struct MigratedMarker {
 
 /// 单条存储保险上限（字符）：事件派生后存储层**保真不截断**（注入时按预算精确切，
 /// 见 inject_block）——此上限只防异常巨型单条（恶意/意外粘贴撑爆文件），正常消息
-/// 全量落盘。50 条 × 2 万字符 = 文件上限约 100 万字符，读重写亚秒级可接受。
+/// 全量落盘。50 条 × 2 万字符 = 上限约 100 万字符（CJK 下字节 ×3 ≈ 3MB），
+/// 极端读重写约 25-75ms，per-chat 串行下不可感知。
 const ENTRY_MAX: usize = 20_000;
 /// 条数上限：50 条封顶丢最旧（最近优先）。
 const ENTRIES_MAX: usize = 50;
@@ -240,21 +241,28 @@ impl History {
             if used + need <= max_chars {
                 window.push((e, e.text.clone()));
                 used += need;
-            } else {
+            } else if e.user {
                 let remain = max_chars.saturating_sub(used);
                 if remain >= 80 {
+                    // 用户轮超预算：截断收编进剩余预算，收完即止（break）
                     let cut = crate::agent::truncate(&e.text, remain - 8);
                     window.push((e, cut));
                 }
                 break;
+            } else {
+                // 助手轮超预算：跳过（continue），预算流向更旧条目——否则「最新一条
+                // 超长助手轮 + 孤立弹出」会得到空窗口（审查 I-1：去存储截断后长 reply
+                // 可达，空注入 = 新后端零上下文）。
+                continue;
             }
         }
         if window.is_empty() {
             return (String::new(), 0);
         }
         window.reverse(); // 输出旧 → 新
-                          // 窗口不能以孤立的助手轮开头（其用户轮已被预算边界/条目淘汰切掉，见 append
-                          // 的奇数淘汰）——模型看到「无问之答」会困惑，宁可少一轮。
+                          // 窗口不能以孤立的助手轮开头（其用户轮已被预算边界/条目淘汰切掉）——
+                          // 模型看到「无问之答」会困惑，宁可少一轮；配合上面助手轮不截断收编，
+                          // 「最新一条孤立超长助手轮」不会触发空窗（预算流向其配对的用户轮）。
         while let Some((e, _)) = window.first() {
             if e.user {
                 break;
@@ -424,6 +432,22 @@ mod tests {
     }
 
     #[test]
+    fn inject_oversized_latest_assistant_does_not_empty_window() {
+        // 审查 I-1 回归：最新一条助手轮超预算（去存储截断后长 reply 可达）——
+        // 截断收编对助手轮跳过，预算流向其配对的用户轮，窗口不为空
+        // （旧行为：单条孤立助手轮 → 弹出 → 空注入 = 新后端零上下文）
+        let h = temp_history("longassist", "oc_x");
+        h.append_user("u1", "claude", "问题");
+        let huge = "答".repeat(8000); // 超 6000 预算的最新助手轮
+        h.append_assistant("u1", "claude", &huge);
+        let (block, n) = h.inject_block("", 6000);
+        assert!(!block.is_empty(), "窗口不得为空（预算流向用户轮）");
+        assert!(block.contains("问题"), "配对的用户轮注入");
+        assert_eq!(n, 1);
+        h.clear();
+    }
+
+    #[test]
     fn inject_block_order_budget_exclude() {
         let h = temp_history("inject", "oc_x");
         h.append_user("u1", "claude", "问一");
@@ -519,8 +543,8 @@ mod tests {
     #[test]
     fn inject_window_never_starts_with_assistant() {
         let h = temp_history("orphan", "oc_x");
-        // u1 超长（300 字截断），a1 中长，u2/a2 短。预算 220：装得下 a2+u2+a1
-        // （10+10+188），u1（308）装不下且剩余 <80 走 break → 窗口（旧→新）原会以
+        // u1 超长（600 字存储保真）、a1 中长，u2/a2 短。预算 220：装得下 a2+u2+a1
+        // （10+10+188），u1（608）装不下且剩余 <80 走 break → 窗口（旧→新）原会以
         // 孤立的「助手: 答一」开头（其用户轮被预算切掉）——fix 后应弹出 a1。
         h.append_user("u1", "claude", &"问一".repeat(300));
         h.append_assistant("u1", "claude", &"答一".repeat(90));
