@@ -68,8 +68,12 @@ pub struct MigratedMarker {
 pub const ENTRY_MAX: usize = 20_000;
 /// 条数上限：50 条封顶丢最旧（最近优先）。
 const ENTRIES_MAX: usize = 50;
-/// 注入 prompt 的字符预算（bridge 生产路径传参的默认值；可按需收紧）。
-pub const INJECT_CHARS_DEFAULT: usize = 6_000;
+/// 注入 prompt 的字符预算（bridge 生产路径传参的默认值）。
+/// 200K 字符 ≈ 100K tokens：覆盖绝大多数会话的**全部历史**（存储上限 50 条 × 20K
+/// = 1M 字符），1M 上下文窗口下仍留 80% 给当前任务；保留上限作防御（防异常巨型
+/// history 撑爆首轮）。原 6000 是摘要日志时代的残余（300 字/条 ≈ 19 轮摘要），
+/// 事件派生存储保真后只够 1-2 轮全文，与「接续全部历史」脱节——用户指出后上调。
+pub const INJECT_CHARS_DEFAULT: usize = 200_000;
 
 /// 一个会话 key 的历史日志。无内存态（stateless 文件 API）：每次操作读盘→改→原子写回。
 /// 同一 key 的写入点全在 bridge per-chat 串行锁内，天然串行无并发写。
