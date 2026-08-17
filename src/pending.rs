@@ -36,6 +36,12 @@ pub struct PendingItem {
     pub role: crate::config::SenderRole,
     /// 入队时间（unix 秒），启动重放按此排序保持原先后顺序。
     pub created_at: u64,
+    /// 已产出的最终回复（阶段 1：W2 崩溃窗口补发）。agent 返回后、发送前落盘——
+    /// 重启恢复时看到 Some = 「回复已产出但未确认发出」→ 直接补发，**不重跑 agent**
+    /// （原语义 remove 在发送前，此窗口崩溃 = 消息丢）。发送成功后 remove 条目。
+    /// serde default 兼容旧 pending.json（无此字段 = 未产出回复，恢复时重跑）。
+    #[serde(default)]
+    pub reply: Option<String>,
 }
 
 /// per-bot 的待处理队列（`workspaces/<bot>/pending.json`）。
@@ -82,6 +88,16 @@ impl PendingStore {
         }
     }
 
+    /// 记录该消息已产出的最终回复（agent 返回后、发送前调用）：条目保留在盘上，
+    /// 重启恢复时据此补发而非重跑。已移除（发送成功）时静默忽略。
+    pub fn set_reply(&self, mid: &str, reply: &str) {
+        let mut data = self.data.lock().unwrap();
+        if let Some(p) = data.iter_mut().find(|p| p.mid == mid) {
+            p.reply = Some(reply.to_string());
+            self.save(&data);
+        }
+    }
+
     /// 启动恢复用快照：按入队时间升序（同秒按原顺序）。
     pub fn snapshot(&self) -> Vec<PendingItem> {
         let mut items = self.data.lock().unwrap().clone();
@@ -120,6 +136,7 @@ mod tests {
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
             created_at: at,
+            reply: None,
         }
     }
 
@@ -159,6 +176,27 @@ mod tests {
     }
 
     #[test]
+    fn set_reply_persists_and_removed_silently_ignored() {
+        // 阶段 1：回复产出后落盘（W2 补发依据）——重读仍带 reply；已移除条目静默忽略。
+        let p = temp_path("reply");
+        let store = PendingStore::at(p.clone());
+        store.add(item("m1", 1));
+        store.set_reply("m1", "最终回复");
+        // 新实例重读（模拟重启）→ reply 仍在
+        let reloaded = PendingStore::at(p.clone());
+        assert_eq!(
+            reloaded.snapshot()[0].reply.as_deref(),
+            Some("最终回复"),
+            "reply 落盘往返"
+        );
+        // 已移除 → 静默忽略不 panic、不新建
+        reloaded.remove("m1");
+        reloaded.set_reply("m1", "不应落盘");
+        assert!(PendingStore::at(p.clone()).is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn snapshot_sorted_by_created_at() {
         let p = temp_path("sort");
         let store = PendingStore::at(p.clone());
@@ -186,6 +224,11 @@ mod tests {
             store.snapshot()[0].quoted.text.is_empty()
                 && store.snapshot()[0].quoted.attachments.is_empty(),
             "旧文件缺 quoted 应默认空"
+        );
+        // 旧文件无 reply 字段 → 默认 None（恢复时重跑，与阶段 1 前语义一致）
+        assert!(
+            store.snapshot()[0].reply.is_none(),
+            "旧文件缺 reply 应默认 None"
         );
         // 旧文件无 role 字段 → 默认 Owner（重放时走全权限，与现状一致）
         assert_eq!(store.snapshot()[0].role, crate::config::SenderRole::Owner);

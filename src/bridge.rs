@@ -797,6 +797,7 @@ impl Bridge {
             attachments: ev.attachments.clone(),
             role: ev.role, // 落盘角色：重启重放时按原角色走受限/全权限分支
             created_at: crate::chrono_lite::unix_secs(),
+            reply: None, // 回复产出后由 set_reply 落盘（阶段 1：W2 补发）
         });
 
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
@@ -1032,10 +1033,6 @@ impl Bridge {
         // 任务结束 → 摘掉打断标志（后续停止词将按普通消息处理）
         self.cancel_flags.lock().unwrap().remove(&key);
 
-        // #25：agent 已返回（Reply/Cancelled/Err 均视为「任务完成」）→ 摘掉 pending，
-        // 避免重启后重复执行已完成的任务；回复发送失败仍走既有路径（日志/outbox），不重跑。
-        self.pending.remove(&ev.mid);
-
         // 统一只发最终结果一条（中途进度已在 select 循环丢弃）。
         match result {
             Ok(agent::RunOutcome::Reply {
@@ -1090,16 +1087,28 @@ impl Bridge {
                     Some(note) => format!("{reply}{note}"),
                     None => reply.clone(),
                 };
+                // 阶段 1（W2 窗口修复）：回复产出后先把最终文本落盘到 pending 条目——
+                // 「发送前崩溃」的恢复据此**补发而非重跑**（原 remove 在发送前，
+                // 此窗口崩溃 = 回复静默丢失）。发送成功后才 remove；发送失败走
+                // 现状路径（日志提示，用户重发）并 remove——避免重启后与用户已
+                // 看到的错误重复补发。
+                self.pending.set_reply(&ev.mid, &sent_text);
                 match self.send_reply(&ev, &sent_text).await {
-                    Ok(()) => crate::log!(
-                        "[bridge] 已回复 chat={} 长度={}",
-                        trunc(&ev.chat_id, 10),
-                        reply.chars().count()
-                    ),
-                    Err(e) => crate::log!(
-                        "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
-                        trunc(&ev.chat_id, 10)
-                    ),
+                    Ok(()) => {
+                        self.pending.remove(&ev.mid);
+                        crate::log!(
+                            "[bridge] 已回复 chat={} 长度={}",
+                            trunc(&ev.chat_id, 10),
+                            reply.chars().count()
+                        );
+                    }
+                    Err(e) => {
+                        self.pending.remove(&ev.mid);
+                        crate::log!(
+                            "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
+                            trunc(&ev.chat_id, 10)
+                        );
+                    }
                 }
             }
             Ok(agent::RunOutcome::Cancelled) => {
@@ -1107,6 +1116,8 @@ impl Bridge {
                 // 只发最终结果：「⏹ 已停止」一条。
                 let _ = self.send_reply(&ev, "⏹ 已停止").await;
                 // 不 mark_started：被打断的轮次不算完成
+                // 无回复可补发 → 摘 pending（任务已结束）
+                self.pending.remove(&ev.mid);
             }
             Err(e) => {
                 // 错误文案作为最终回复发出（用户可见原因），同样留痕。
@@ -1121,6 +1132,8 @@ impl Bridge {
                         trunc(&ev.chat_id, 10)
                     ),
                 }
+                // 无回复可补发 → 摘 pending（任务已结束；错误文案发送失败不重跑）
+                self.pending.remove(&ev.mid);
             }
         }
 
@@ -1165,6 +1178,34 @@ impl Bridge {
                     trunc(&item.mid, 12)
                 );
                 self.pending.remove(&item.mid);
+                continue;
+            }
+            // 阶段 1（W2 窗口修复）：回复已产出但未确认发出（崩溃在 set_reply 与
+            // remove 之间）→ **直接补发，不重跑 agent**（原语义此窗口回复静默丢失）。
+            // 补发成功才 remove；失败留盘，下次启动再试（不重跑）。
+            if let Some(reply) = &item.reply {
+                let ev = Ev {
+                    mid: item.mid.clone(),
+                    chat_id: item.chat_id.clone(),
+                    chat_type: item.chat_type.clone(),
+                    thread_id: item.thread_id.clone(),
+                    quoted: crate::messenger::QuotedContent::default(),
+                    text: item.text.clone(),
+                    attachments: Vec::new(),
+                    role: item.role,
+                };
+                crate::log!(
+                    "[bot:{}] 补发上次已产出的回复 chat={} mid={}",
+                    self.bot.key(),
+                    trunc(&ev.chat_id, 12),
+                    trunc(&ev.mid, 12)
+                );
+                match self.send_reply(&ev, reply).await {
+                    Ok(()) => self.pending.remove(&item.mid),
+                    Err(e) => {
+                        crate::log!("[bot:{}] 补发失败（留盘下次再试）: {e:#}", self.bot.key())
+                    }
+                }
                 continue;
             }
             let ev = Ev {
@@ -2721,6 +2762,7 @@ mod tests {
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
             created_at: 10,
+            reply: None,
         });
         bridge.pending.add(crate::pending::PendingItem {
             mid: "r2".into(),
@@ -2732,6 +2774,7 @@ mod tests {
             attachments: Vec::new(),
             role: crate::config::SenderRole::Granted,
             created_at: 20,
+            reply: None,
         });
 
         let stop = tokio_util::sync::CancellationToken::new();
@@ -2761,6 +2804,82 @@ mod tests {
             "两条消息都应重新处理并回复"
         );
         assert!(bridge.pending.is_empty(), "恢复完成后 pending 应清空");
+        cleanup_bridge(&bridge);
+    }
+
+    /// 阶段 1（W2 窗口修复）：崩溃在「回复已产出、发送确认前」→ 重启恢复时
+    /// **直接补发回复，不重跑 agent**（runner 收到 0 个 prompt；原语义此窗口
+    /// 回复静默丢失）。补发成功清盘；失败留盘下次再试。
+    #[tokio::test]
+    async fn recover_redelivers_produced_reply_without_rerun() {
+        let runner = Arc::new(MockAgentRunner::immediate("不应被重跑"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+        // 模拟崩溃残留：回复已产出（set_reply 落盘）但发送确认前进程没了
+        bridge.pending.add(crate::pending::PendingItem {
+            mid: "w2".into(),
+            chat_id: "oc_w2".into(),
+            chat_type: "group".into(),
+            thread_id: String::new(),
+            text: "问题".into(),
+            quoted: crate::messenger::QuotedContent::default(),
+            attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+            created_at: 10,
+            reply: None,
+        });
+        bridge.pending.set_reply("w2", "已产出的最终回复");
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_pending(&stop).await;
+
+        assert!(
+            runner.prompts().is_empty(),
+            "有 reply 的条目不得重跑 agent（prompts 应为空）"
+        );
+        assert!(
+            msgr.sent().iter().any(|t| t == "已产出的最终回复"),
+            "直接补发已产出回复: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            !msgr.sent().iter().any(|t| t.contains("正在恢复")),
+            "补发不走重放提示（不是重跑）"
+        );
+        assert!(bridge.pending.is_empty(), "补发成功清盘");
+        cleanup_bridge(&bridge);
+    }
+
+    /// 阶段 1：补发失败（发送通道暂不可用）→ 条目留盘，下次启动再试（不重跑、不丢）。
+    #[tokio::test]
+    async fn recover_redeliver_failure_keeps_item() {
+        let runner = Arc::new(MockAgentRunner::immediate("不应被重跑"));
+        let bot = backend_bot("pi");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        *msgr.fail_chat.lock().unwrap() = Some("oc_w3".into()); // 发送通道故障
+        bridge.pending.add(crate::pending::PendingItem {
+            mid: "w3".into(),
+            chat_id: "oc_w3".into(),
+            chat_type: "group".into(),
+            thread_id: String::new(),
+            text: "问题".into(),
+            quoted: crate::messenger::QuotedContent::default(),
+            attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+            created_at: 10,
+            reply: None,
+        });
+        bridge.pending.set_reply("w3", "待补发的回复");
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_pending(&stop).await;
+
+        assert!(runner.prompts().is_empty(), "不重跑");
+        assert_eq!(bridge.pending.len(), 1, "补发失败留盘");
+        assert_eq!(
+            bridge.pending.snapshot()[0].reply.as_deref(),
+            Some("待补发的回复"),
+            "reply 保留供下次补发"
+        );
         cleanup_bridge(&bridge);
     }
 
@@ -4014,6 +4133,7 @@ https://b.com/y"
                 attachments: Vec::new(),
                 role: crate::config::SenderRole::Owner,
                 created_at: i as u64,
+                reply: None,
             });
         }
         let stop = tokio_util::sync::CancellationToken::new();
