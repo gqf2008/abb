@@ -1097,6 +1097,10 @@ impl Bridge {
                 // **不落盘 reply**——该回复属于已作废会话，崩溃后补发会把旧答案送进
                 // 用户明确重置过的新会话（历史已清、提示已过期）；此窗口退回 W1 重跑，
                 // 与基线一致（mark_started/历史已被上方同闸跳过）。
+                // 注（再审 Minor）：门控只覆盖「/new 在 Reply 臂评估前发生」的窗口——
+                // /new 绕过串行锁，可落在 mark_started_if=true 与 remove 之间（此时
+                // set_reply 已落盘），崩溃后仍会补发旧答案；该残余窗口属文档接受的
+                // at-least-once 语义，不额外处理。
                 if same_session {
                     self.pending.set_reply(&ev.mid, &sent_text);
                 }
@@ -1215,8 +1219,9 @@ impl Bridge {
             // remove 之间）→ **直接补发，不重跑 agent**（原语义此窗口回复静默丢失）。
             // 补发成功才 remove；失败留盘，下次启动再试（不重跑）。
             // 审查跟进：补发持与实时 handle 同款 per-chat 串行锁（key 与 Ev::key 一致），
-            // 避免与事件循环对新消息的应答交错（原实现无锁，顺序可能倒挂——IM 场景
-            // 顺序即可见正确性；flush_outbox 取锁先例）。
+            // 消除发送交错（原实现无锁，补发与事件循环的发送可中途交织）；锁消除了
+            // 交错但不保证先后——若事件循环先拿锁，新消息应答在前、陈旧补发在后
+            //（残余倒挂属「补发无 TTL」接受项，不额外处理；flush_outbox 取锁先例）。
             if let Some(reply) = &item.reply {
                 let ev = Self::redeliver_ev(&item);
                 crate::log!(
