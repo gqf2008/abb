@@ -6,6 +6,8 @@ build = "build.rs"
 
 [dependencies]
 # GUI：Slint 1.17 托盘应用。
+# 视觉改造（像素风）：slint-pixel 组件库（@slint_pixel 导入，Pixel* 控件）。
+slint-pixel = { path = "../slint-pixel/crates/slint-pixel" }
 # 渲染器：用默认 femtovg（OpenGL）。历史：曾固定 renderer-skia——旧注释记录 femtovg 在
 # macOS accessory 进程 + 先 hide 后 show 的窗口上渲染全黑；2026-08-15 实测（slint 1.17.1 /
 # macOS 15.x）该症状不复现：femtovg 设置窗渲染正常、托盘图标正常。
@@ -50,6 +52,7 @@ winit = "0.30"
 
 [build-dependencies]
 slint-build = "1.17"
+slint-pixel = { path = "../slint-pixel/crates/slint-pixel" }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

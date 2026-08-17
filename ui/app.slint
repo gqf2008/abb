@@ -6,6 +6,9 @@
 //   但 enabled 不变）。可靠做法是**结构性** `if cond: MenuItem{...}`——条件翻转触发菜单重建
 //   （appkit.rs 对 if/for 结构变化会 detach+重建 NSMenu，已实测生效）。故启停按钮用互斥 if。
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
+// 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
+// PixelScrollPanel），推广后逐步移除 std 控件。
+import { PixelButton, PixelScrollPanel, PixelTheme } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -1174,7 +1177,7 @@ export component SettingsWindow inherits Window {
                             Text { text: "依赖检测与系统权限"; font-size: 12px; color: Palette.foreground.with-alpha(0.55); }
                         }
 
-                        ScrollView {
+                        PixelScrollPanel {
                             vertical-stretch: 1;
                             VerticalBox {
                                 spacing: 14px;
@@ -1195,7 +1198,7 @@ export component SettingsWindow inherits Window {
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
                                         }
-                                        if root.missing-deps > 0: Button {
+                                        if root.missing-deps > 0: PixelButton {
                                             text: "一键安装全部缺失（" + root.missing-deps + " 项）";
                                             enabled: root.dep-busy == "";
                                             clicked => { root.install-all-missing(); }
@@ -1217,12 +1220,12 @@ export component SettingsWindow inherits Window {
                                             Rectangle { horizontal-stretch: 1; }
                                             // #60：标题行入口——横幅只在 agent 缺失时可见，
                                             // 只缺 node/lark 等也要有一键装入口
-                                            if root.missing-deps > 0: Button {
+                                            if root.missing-deps > 0: PixelButton {
                                                 text: "一键安装缺失";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-all-missing(); }
                                             }
-                                            Button { text: "重新检测"; clicked => { root.recheck-deps(); } }
+                                            PixelButton { text: "重新检测"; clicked => { root.recheck-deps(); } }
                                         }
                                         if root.dep-busy != "": Text {
                                             text: "⏳ 正在安装 " + root.dep-busy + " …（可能要几分钟，期间请勿重复点）";
@@ -1263,12 +1266,12 @@ export component SettingsWindow inherits Window {
                                             Text { text: "Claude Code"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.claude-installed ? "已安装" : "未安装"; ok: root.claude-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.claude-installed: Button {
+                                            if !root.claude-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("claude"); }
                                             }
-                                            if !root.claude-installed: Button { text: "文档"; clicked => { root.open-url("https://docs.claude.com/en/docs/claude-code/setup"); } }
+                                            if !root.claude-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://docs.claude.com/en/docs/claude-code/setup"); } }
                                         }
                                         if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // codex
@@ -1278,12 +1281,12 @@ export component SettingsWindow inherits Window {
                                             Text { text: "Codex CLI"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.codex-installed ? "已安装" : "未安装"; ok: root.codex-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.codex-installed: Button {
+                                            if !root.codex-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("codex"); }
                                             }
-                                            if !root.codex-installed: Button { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
+                                            if !root.codex-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
                                         }
                                         if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // pi
@@ -1293,12 +1296,12 @@ export component SettingsWindow inherits Window {
                                             Text { text: "Pi (pi-coding-agent)"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.pi-installed ? "已安装" : "未安装"; ok: root.pi-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.pi-installed: Button {
+                                            if !root.pi-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("pi"); }
                                             }
-                                            if !root.pi-installed: Button { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
+                                            if !root.pi-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
                                         }
                                         if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // prime-agent
@@ -1308,12 +1311,12 @@ export component SettingsWindow inherits Window {
                                             Text { text: "prime-agent"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.prime-agent-installed ? "已安装" : "未安装"; ok: root.prime-agent-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.prime-agent-installed: Button {
+                                            if !root.prime-agent-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("prime-agent"); }
                                             }
-                                            if !root.prime-agent-installed: Button { text: "文档"; clicked => { root.open-url("https://github.com/PrimeIntellect-ai/prime-agent"); } }
+                                            if !root.prime-agent-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/PrimeIntellect-ai/prime-agent"); } }
                                         }
                                         if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // nodejs
@@ -1323,7 +1326,7 @@ export component SettingsWindow inherits Window {
                                             Text { text: "Node.js"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.node-installed ? "已安装" : "未安装"; ok: root.node-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.node-installed: Button {
+                                            if !root.node-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("node"); }
@@ -1337,7 +1340,7 @@ export component SettingsWindow inherits Window {
                                             Text { text: "Python 3"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.python-installed ? "已安装" : "未安装"; ok: root.python-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.python-installed: Button {
+                                            if !root.python-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("python3"); }
@@ -1351,7 +1354,7 @@ export component SettingsWindow inherits Window {
                                             Text { text: "lark-cli"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.lark-installed ? "已安装" : "未安装"; ok: root.lark-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.lark-installed: Button {
+                                            if !root.lark-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("lark-cli"); }
@@ -1365,12 +1368,12 @@ export component SettingsWindow inherits Window {
                                             Text { text: "dingtalk-cli"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.dingtalk-installed ? "已安装" : "未安装"; ok: root.dingtalk-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.dingtalk-installed: Button {
+                                            if !root.dingtalk-installed: PixelButton {
                                                 text: "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("dingtalk-cli"); }
                                             }
-                                            if !root.dingtalk-installed: Button { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
+                                            if !root.dingtalk-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
                                         }
                                         if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                     }
@@ -1389,7 +1392,7 @@ export component SettingsWindow inherits Window {
                                             Text { text: "系统权限"; font-weight: 700; color: Palette.foreground; vertical-alignment: center; }
                                             Rectangle { horizontal-stretch: 1; }
                                             // 授权提示按钮只在 macOS 显示（Windows 走管理员重启）
-                                            if root.platform == "macos": Button { text: "📹 请求授权"; enabled: !root.perm-busy; clicked => { root.request-perms(); } }
+                                            if root.platform == "macos": PixelButton { text: "📹 请求授权"; enabled: !root.perm-busy; clicked => { root.request-perms(); } }
                                         }
                                         if root.perms-supported && root.platform == "macos" && root.perm-busy: Text {
                                             text: "⏳ 正在逐项弹系统授权框（屏幕录制→摄像头→麦克风），请在弹框里点「允许」。完成后点「重新检测」刷新。";
@@ -1402,7 +1405,7 @@ export component SettingsWindow inherits Window {
                                             Text { text: "管理员身份"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
                                             StatusPill { text: root.perm-admin == 2 ? "已提权" : "未提权"; ok: root.perm-admin == 2; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-admin != 2: Button { text: "以管理员重启"; clicked => { root.relaunch-as-admin(); } }
+                                            if root.perm-admin != 2: PixelButton { text: "以管理员重启"; clicked => { root.relaunch-as-admin(); } }
                                         }
                                         if root.perms-supported && root.platform == "windows" && root.perm-admin != 2: Text {
                                             text: "Windows 无需逐项授权；以管理员身份运行即可完全控制本机（文件/鼠标键盘/屏幕/摄像头/麦克风）。点击上方按钮会弹 UAC 确认框。";
@@ -1419,7 +1422,7 @@ export component SettingsWindow inherits Window {
                                                 warn: root.perm-full-disk == 1;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-full-disk != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("full-disk"); } }
+                                            if root.perm-full-disk != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("full-disk"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
@@ -1431,7 +1434,7 @@ export component SettingsWindow inherits Window {
                                                 warn: root.perm-accessibility == 1;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-accessibility != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("accessibility"); } }
+                                            if root.perm-accessibility != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("accessibility"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
@@ -1443,7 +1446,7 @@ export component SettingsWindow inherits Window {
                                                 warn: root.perm-screen == 1;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-screen != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("screen"); } }
+                                            if root.perm-screen != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("screen"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
@@ -1455,7 +1458,7 @@ export component SettingsWindow inherits Window {
                                                 warn: root.perm-automation == 1;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-automation != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("automation"); } }
+                                            if root.perm-automation != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("automation"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
@@ -1467,7 +1470,7 @@ export component SettingsWindow inherits Window {
                                                 warn: root.perm-camera == 1;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-camera != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("camera"); } }
+                                            if root.perm-camera != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("camera"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;

@@ -164,6 +164,7 @@ dependencies = [
  "sha2",
  "slint",
  "slint-build",
+ "slint-pixel",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -4977,6 +4978,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "spin_on",
+]
+
+[[package]]
+name = "slint-pixel"
+version = "0.2.1"
+dependencies = [
+ "image",
+ "raw-window-handle",
+ "slint",
+ "slint-build",
 ]
 
 [[package]]

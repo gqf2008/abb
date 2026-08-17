@@ -972,7 +972,10 @@ pub fn run_gui() -> Result<()> {
                 .map(|d| !d.found)
                 .unwrap_or(true)
         };
-        if missing("claude") || missing("codex") || missing("pi") || missing("prime-agent") {
+        if missing("claude") || missing("codex") || missing("pi") || missing("prime-agent")
+            || std::env::args().any(|a| a == "--show-settings")
+        {
+            let debug_show = std::env::args().any(|a| a == "--show-settings");
             let work = work.clone();
             let model = bots_model.clone();
             let pwork = providers_work.clone();
@@ -989,11 +992,14 @@ pub fn run_gui() -> Result<()> {
                 &cross_delivery_work,
             );
             push_settings_status(&settings, &install::status());
-            settings.set_status_line(
-                "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
-                    .into(),
-            );
-            settings.set_status_is_error(true);
+            // 调试参数（--show-settings）不设误导的「未检测到」状态行
+            if !debug_show {
+                settings.set_status_line(
+                    "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
+                        .into(),
+                );
+                settings.set_status_is_error(true);
+            }
             startup_shown.store(true, Ordering::Relaxed);
             show_window_and_focus(&settings);
         }
