@@ -27,6 +27,7 @@ mod platform;
 mod proto;
 mod schedule;
 mod service;
+mod session_import;
 mod sessions;
 mod single_instance;
 mod tasks;
@@ -234,6 +235,14 @@ fn main() {
     // bot 从 AGENT_BRIDGE_BOT_KEY env（桥注入）解析；chat_id 缺省取 AGENT_BRIDGE_CHAT_ID。
     if args.len() >= 2 && args[1] == "session" {
         std::process::exit(run_session_cli(&args[2..]));
+    }
+
+    // 历史会话迁移（#33）：agent-bridge session-import [--bot <key>] [--dry-run]。
+    // 把后端私有 session 文件（claude/codex/pi/prime）里的对话导入 ABB 的 history.rs，
+    // 让 #49 之前的老历史参与注入接续。幂等（已导入来源跳过），可重跑。
+    // --dry-run 只统计不写入；退出码 0=全部成功 1=有失败/跳过。
+    if args.len() >= 2 && args[1] == "session-import" {
+        std::process::exit(run_session_import_cli(&args[2..]));
     }
 
     // 一键安装全部缺失依赖（#60）：agent-bridge deps-install。
@@ -652,6 +661,76 @@ fn run_deps_install_cli() -> i32 {
         0
     } else {
         1
+    }
+}
+
+/// 历史会话迁移 CLI（#33）。退出码 0=全部成功 1=有失败/跳过。
+fn run_session_import_cli(args: &[String]) -> i32 {
+    let mut bot_key: Option<String> = None;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bot" => {
+                i += 1;
+                if i >= args.len() {
+                    println!("用法：agent-bridge session-import [--bot <key>] [--dry-run]");
+                    return 2;
+                }
+                bot_key = Some(args[i].clone());
+            }
+            "--dry-run" => dry_run = true,
+            other => {
+                println!("未知参数：{other}（用法：agent-bridge session-import [--bot <key>] [--dry-run]）");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    // 枚举 bot：--bot 指定单个；否则全部 enabled 的 bot
+    let cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("读 config 失败: {e:#}");
+            return 1;
+        }
+    };
+    let keys: Vec<String> = match &bot_key {
+        Some(k) => vec![k.clone()],
+        None => cfg.bots.iter().map(|b| b.key()).collect(),
+    };
+    let mut any_issue = false;
+    for key in keys {
+        let report = crate::session_import::import_bot(&key, dry_run);
+        if dry_run {
+            println!("[dry-run] bot={key}");
+        } else {
+            println!("bot={key}");
+        }
+        for cr in &report.chats {
+            println!(
+                "  chat={} 导入 {} 条{}",
+                cr.chat,
+                cr.imported,
+                if cr.skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!("；跳过: {}", cr.skipped.join("; "))
+                }
+            );
+        }
+        if report.chats.is_empty() {
+            println!("  （无可导入的会话）");
+        }
+        any_issue |= report.chats.iter().any(|c| !c.skipped.is_empty());
+    }
+    if dry_run {
+        println!("（dry-run：未写入任何内容）");
+    }
+    if any_issue {
+        1
+    } else {
+        0
     }
 }
 

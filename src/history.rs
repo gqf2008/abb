@@ -65,7 +65,7 @@ pub struct MigratedMarker {
 /// 见 inject_block）——此上限只防异常巨型单条（恶意/意外粘贴撑爆文件），正常消息
 /// 全量落盘。50 条 × 2 万字符 = 上限约 100 万字符（CJK 下字节 ×3 ≈ 3MB），
 /// 极端读重写约 25-75ms，per-chat 串行下不可感知。
-const ENTRY_MAX: usize = 20_000;
+pub const ENTRY_MAX: usize = 20_000;
 /// 条数上限：50 条封顶丢最旧（最近优先）。
 const ENTRIES_MAX: usize = 50;
 /// 注入 prompt 的字符预算（bridge 生产路径传参的默认值；可按需收紧）。
@@ -76,6 +76,8 @@ pub const INJECT_CHARS_DEFAULT: usize = 6_000;
 pub struct History {
     path: PathBuf,
     marker_path: PathBuf,
+    /// #33 已导入来源标记（`<key>.imported.json`）。
+    imported_path: PathBuf,
 }
 
 impl History {
@@ -90,6 +92,7 @@ impl History {
         History {
             path: dir.join(format!("{esc}.jsonl")),
             marker_path: dir.join(format!("{esc}.migrated.json")),
+            imported_path: dir.join(format!("{esc}.imported.json")),
         }
     }
 
@@ -178,6 +181,41 @@ impl History {
     #[allow(dead_code)] // 与 SessionStore::ensure_session 同款：仅测试使用
     pub fn entries(&self) -> Vec<HistoryEntry> {
         self.read_entries()
+    }
+
+    /// #33 历史迁移：批量导入（后端 session 提取的消息）。**绕过 ENTRIES_MAX 裁剪**——
+    /// 导入即「填充 #49 之前的老历史」，裁剪丢最旧违背目的；条数由调用方（每来源
+    /// MAX_PER_SOURCE）与单条 ENTRY_MAX 保险上限约束。保留 ts（原会话时间戳），
+    /// 合并后按 ts 升序（导入的更早消息排前，文件顺序 = 时间序）。
+    pub fn import_entries(&self, entries: Vec<HistoryEntry>) -> bool {
+        let mut all = self.read_entries();
+        // (mid, user) 去重（导入 mid 唯一，防御性）
+        for e in entries {
+            if all.iter().any(|x| x.mid == e.mid && x.user == e.user) {
+                continue;
+            }
+            all.push(e);
+        }
+        all.sort_by_key(|e| e.ts);
+        self.write_entries(&all)
+    }
+
+    /// #33 已导入来源（幂等标记）：`<key>.imported.json` = {"backend:sid": true, ...}。
+    pub fn imported_sources(&self) -> std::collections::HashSet<String> {
+        std::fs::read_to_string(&self.imported_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<std::collections::HashSet<String>>(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// #33 标记某来源已导入（合并写回，原子）。
+    pub fn mark_imported(&self, source: &str) -> bool {
+        let mut set = self.imported_sources();
+        set.insert(source.to_string());
+        match serde_json::to_string(&set) {
+            Ok(t) => crate::atomic_write_sensitive(&self.imported_path, &t).is_ok(),
+            Err(_) => false,
+        }
     }
 
     /// 清空历史与迁移标记（/new：用户明确要求全新会话）。
@@ -502,6 +540,49 @@ mod tests {
             "预算从新往旧收"
         );
         assert_eq!(n3, 1);
+        h.clear();
+    }
+
+    #[test]
+    fn import_entries_keeps_ts_and_bypasses_cap() {
+        // #33：导入保留原时间戳 + 绕过 50 条裁剪（填充老历史，裁剪丢最旧违背目的）
+        let h = temp_history("import", "oc_x");
+        // 预置 50 条（触顶）
+        for i in 0..50 {
+            h.append_user(&format!("m{i}"), "claude", &format!("消息{i}"));
+        }
+        assert_eq!(h.entries().len(), 50);
+        // 导入 60 条更早的消息（ts=1000 起）→ 全部保留（不被 50 条裁剪丢最旧）
+        let imported: Vec<HistoryEntry> = (0..60)
+            .map(|i| HistoryEntry {
+                mid: format!("imp-test-{i}"),
+                user: true,
+                backend: "claude".into(),
+                text: format!("老消息{i}"),
+                ts: 1000 + i,
+            })
+            .collect();
+        assert!(h.import_entries(imported));
+        let all = h.entries();
+        assert_eq!(all.len(), 110, "导入绕过 50 条裁剪");
+        assert_eq!(all[0].ts, 1000, "保留原时间戳");
+        assert!(all[0].text.starts_with("老消息"));
+        h.clear();
+    }
+
+    #[test]
+    fn imported_sources_roundtrip_and_idempotent() {
+        // #33：幂等标记往返
+        let h = temp_history("imported", "oc_x");
+        assert!(h.imported_sources().is_empty());
+        assert!(h.mark_imported("claude:abc123"));
+        assert!(h.mark_imported("pi:def456"));
+        let set = h.imported_sources();
+        assert!(set.contains("claude:abc123") && set.contains("pi:def456"));
+        // 合并写回：不覆盖已有
+        assert!(h.mark_imported("codex:xyz"));
+        let set2 = h.imported_sources();
+        assert_eq!(set2.len(), 3);
         h.clear();
     }
 
