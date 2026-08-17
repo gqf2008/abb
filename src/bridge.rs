@@ -52,20 +52,6 @@ pub struct Bridge {
     /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
     /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
     agent_runner: Arc<dyn AgentRunner>,
-    /// GitHub API（仿 agent_runner 的 trait 注入）：生产 = GithubClient（用 bot.gh_token），
-    /// 测试 = MockGithub 挡板。handle 的 github 指令门与双写、watch 循环都走它。
-    pub(crate) github_client: Arc<dyn crate::github::GithubApi>,
-    /// #64 渠道化：启动时的全量配置快照——指令门多账号路由用（找 kind=github 且白名单
-    /// 命中仓库的 bot）；config 热读优先、读失败回落本快照（与 access_and_role 同款）。
-    config_snapshot: Config,
-    /// #64 按账号缓存的 GithubClient（key="{bot_key}:{token}"，token 换值即时换 client）。
-    gh_clients: Mutex<HashMap<String, Arc<dyn crate::github::GithubApi>>>,
-}
-
-/// #64 指令门解析出的 GitHub 账号：配置 + 对应 API client。
-struct GhAccount {
-    bot: BotConfig,
-    client: Arc<dyn crate::github::GithubApi>,
 }
 
 #[derive(Debug)]
@@ -85,10 +71,6 @@ pub struct Ev {
     /// 发送者角色（owner=全权限 / granted=受限）：入口准入闸推导，agent 调用处
     /// 按此选受限分支；pending 重放路径从 PendingItem.role 恢复。
     pub role: crate::config::SenderRole,
-    /// #64 批次 B：worker 触发的后端覆盖（None = bot 默认后端）。
-    pub backend_override: Option<String>,
-    /// #64 批次 B：worker 角色名（双写署名与 prompt 身份）。
-    pub gh_role: Option<String>,
 }
 
 impl Ev {
@@ -104,54 +86,18 @@ impl Ev {
     }
 }
 
-/// 指令涉及仓库的 full 形态（路由解析用）。Create 类缺省仓库时可能为空串。
-fn gh_cmd_repo(cmd: &crate::github::GhCmd) -> String {
-    match cmd {
-        crate::github::GhCmd::Analyze { owner, repo, .. }
-        | crate::github::GhCmd::Close { owner, repo, .. }
-        | crate::github::GhCmd::ConfirmClose { owner, repo, .. } => format!("{owner}/{repo}"),
-        crate::github::GhCmd::Create { owner, repo, .. }
-        | crate::github::GhCmd::ConfirmCreate { owner, repo, .. } => {
-            if repo.is_empty() {
-                String::new()
-            } else {
-                format!("{owner}/{repo}")
-            }
-        }
-    }
-}
-
-/// 一条 github 指令的处理结果。
-enum GhOutcome {
-    /// 注入 prompt 继续走 agent（最终回复双写）。client 随 ctx 携带，双写处不再重解析
-    /// （防 TOCTOU：解析与双写之间账号表变更）。
-    Analyze(crate::github::GhContext, Arc<dyn crate::github::GithubApi>),
-    /// 直接 API 指令已完成并回复 → 调用方 return。
-    Consumed,
-    /// 白名单拒绝/参数不足，已带原因 → 调用方回复后 return。
-    Rejected(String),
-}
-
 impl Bridge {
     pub fn new(msgr: Arc<dyn Messenger>, bot: BotConfig, cfg: &Config) -> Bridge {
-        let gh_token = bot.gh_token.clone();
-        Self::build(
-            msgr,
-            bot,
-            cfg,
-            Arc::new(agent::RealAgentRunner),
-            Arc::new(crate::github::GithubClient::new(&gh_token)),
-        )
+        Self::build(msgr, bot, cfg, Arc::new(agent::RealAgentRunner))
     }
 
-    /// 实际构造器：生产（`new` 用真实 `RealAgentRunner` + `GithubClient`）与测试（注入挡板
-    /// `AgentRunner` / `GithubApi` 驱动时序）共用。字段初始化集中在此。
+    /// 实际构造器：生产（`new` 用真实 `RealAgentRunner`）与测试（注入 `AgentRunner` 挡板
+    /// 驱动时序）共用。字段初始化集中在此。
     fn build(
         msgr: Arc<dyn Messenger>,
         bot: BotConfig,
         cfg: &Config,
         agent_runner: Arc<dyn AgentRunner>,
-        github_client: Arc<dyn crate::github::GithubApi>,
     ) -> Bridge {
         // 后端跟着 bot 走：用该 bot 的生效后端（自身 backend 非空优先，否则回落全局默认）。
         let effective = bot.effective_backend(&cfg.default_backend).to_string();
@@ -174,9 +120,6 @@ impl Bridge {
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
-            github_client,
-            config_snapshot: cfg.clone(),
-            gh_clients: Mutex::new(HashMap::new()),
         }
     }
 
@@ -377,292 +320,6 @@ impl Bridge {
         }
     }
 
-    /// 解析建 issue 指令的缺省仓库：显式 owner/repo 直接用；未带仓库 → 白名单恰好
-    /// 一项时用它（通配项 o/* 不是具体仓库，拒绝）；多项/空 → 明确拒绝（防猜错仓库）。
-    fn resolve_create_repo(
-        bot: &BotConfig,
-        owner: &str,
-        repo: &str,
-    ) -> Result<(String, String), String> {
-        if !repo.is_empty() {
-            return Ok((owner.to_string(), repo.to_string()));
-        }
-        let list = bot.gh_repo_list();
-        if list.len() == 1 {
-            let (o, r) = list[0].split_once('/').unwrap_or(("", list[0].as_str()));
-            if r == "*" {
-                return Err(
-                    "❌ 白名单是整组织通配（owner/*），创建 issue 请带上具体仓库：`建 issue owner/repo 标题`。".to_string(),
-                );
-            }
-            Ok((o.to_string(), r.to_string()))
-        } else {
-            Err(
-                "❌ 创建 issue 请带上仓库：`建 issue owner/repo 标题`（白名单多于一项时不能省略）。".to_string(),
-            )
-        }
-    }
-
-    /// 写操作的白名单前置闸（评审 S1）：空白名单 = 全部放行只适用于**读**（分析）；
-    /// 写操作（关闭/建）在未配置白名单时直接拒绝——token 授权范围可能覆盖用户所有
-    /// 仓库，空名单放行写操作等于群里任何能 @bot 的人可对任意授权仓库做写操作。
-    fn gh_write_guard(bot: &BotConfig, action: &str) -> Option<String> {
-        if bot.gh_repo_list().is_empty() {
-            Some(format!(
-                "❌ 未配置仓库白名单，{action}已禁用。请在对应 GitHub bot 的「仓库白名单」配置。"
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// #64 指令门账号解析：本 bot 路径（github kind 本体 / 未迁移旧式 / 测试注入）优先；
-    /// 否则全局找 kind=github && enabled && token 非空 && 白名单命中的 bot（config 热读
-    /// 优先、失败回落启动快照；多命中取配置顺序第一个 + log）。None = 无账号放行该仓库。
-    fn resolve_github(&self, repo: &str) -> Option<GhAccount> {
-        if self.bot.is_github_capable() && self.bot.gh_allows_repo(repo) {
-            return Some(GhAccount {
-                bot: self.bot.clone(),
-                client: self.github_client.clone(),
-            });
-        }
-        let cfg = crate::config::Config::load().unwrap_or_else(|_| self.config_snapshot.clone());
-        let hits: Vec<&BotConfig> = cfg
-            .bots
-            .iter()
-            .filter(|b| {
-                b.is_github_kind()
-                    && b.enabled
-                    && !b.gh_token.is_empty()
-                    && !b.name.is_empty() // 与 credentials_ready 一致（空名 bot 服务侧已跳过）
-                    && b.gh_allows_repo(repo)
-            })
-            .collect();
-        let bot = (*hits.first()?).clone();
-        if hits.len() > 1 {
-            crate::log!(
-                "[bridge] 仓库 {repo} 被 {} 个 github bot 白名单命中，按配置顺序取「{}」",
-                hits.len(),
-                bot.key()
-            );
-        }
-        Some(GhAccount {
-            client: self.gh_client_for(&bot.key(), &bot.gh_token),
-            bot,
-        })
-    }
-
-    /// 按账号缓存 GithubClient（key 含 token，换值即时换 client）。
-    fn gh_client_for(&self, bot_key: &str, token: &str) -> Arc<dyn crate::github::GithubApi> {
-        let key = format!("{bot_key}:{token}");
-        let mut m = self.gh_clients.lock().unwrap();
-        m.entry(key)
-            .or_insert_with(|| Arc::new(crate::github::GithubClient::new(token)))
-            .clone()
-    }
-
-    /// 缺省仓库的创建指令：候选账号（本 bot + 全局 github bot，按 key 去重）恰一个时
-    /// 自动推断；零个/多个 → None（调用方按「多账号歧义」拒绝）。
-    fn resolve_single_github_account(&self) -> Option<GhAccount> {
-        let mut cands: Vec<GhAccount> = Vec::new();
-        if self.bot.is_github_capable() {
-            cands.push(GhAccount {
-                bot: self.bot.clone(),
-                client: self.github_client.clone(),
-            });
-        }
-        let cfg = crate::config::Config::load().unwrap_or_else(|_| self.config_snapshot.clone());
-        for b in cfg.bots.iter() {
-            if b.is_github_kind()
-                && b.enabled
-                && !b.gh_token.is_empty()
-                && !b.name.is_empty()
-                && !cands.iter().any(|c| c.bot.key() == b.key())
-            {
-                cands.push(GhAccount {
-                    client: self.gh_client_for(&b.key(), &b.gh_token),
-                    bot: b.clone(),
-                });
-            }
-        }
-        match cands.len() {
-            1 => cands.pop(),
-            0 => None,
-            n => {
-                crate::log!("[bridge] 创建指令缺仓库且存在 {n} 个 GitHub 账号，拒绝自动推断");
-                None
-            }
-        }
-    }
-
-    /// 是否存在 kind=github 的账号体系（config 热读 + 快照回落；判定指令门是否启用）。
-    fn has_github_account_bots(&self) -> bool {
-        let cfg = crate::config::Config::load().unwrap_or_else(|_| self.config_snapshot.clone());
-        cfg.bots
-            .iter()
-            .any(|b| b.is_github_kind() && b.enabled && !b.gh_token.is_empty())
-    }
-
-    /// 执行一条 github 指令（#64：按 acc 指定的账号执行）。白名单在每个动作前强制校验
-    /// （写操作无一绕过）。
-    async fn handle_github_cmd(
-        &self,
-        ev: &Ev,
-        cmd: crate::github::GhCmd,
-        acc: &GhAccount,
-    ) -> GhOutcome {
-        match cmd {
-            crate::github::GhCmd::ConfirmClose {
-                owner,
-                repo,
-                number,
-            } => {
-                if let Some(msg) = Self::gh_write_guard(&acc.bot, "关闭") {
-                    return GhOutcome::Rejected(msg);
-                }
-                let repo_full = format!("{owner}/{repo}");
-                if !acc.bot.gh_allows_repo(&repo_full) {
-                    return GhOutcome::Rejected(format!(
-                        "❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"
-                    ));
-                }
-                // 关闭是破坏性操作：先引导确认，用户回复「确认关闭 <链接>」才真正执行
-                // （防闲聊里的「别关闭/为什么关闭了 <链接>」误触发写操作）。
-                let _ = self
-                    .send_reply(
-                        ev,
-                        &format!(
-                            "⚠️ 关闭 {repo_full}#{number} 是破坏性操作。确认请回复：\n确认关闭 https://github.com/{repo_full}/issues/{number}"
-                        ),
-                    )
-                    .await;
-                GhOutcome::Consumed
-            }
-            crate::github::GhCmd::Close {
-                owner,
-                repo,
-                number,
-            } => {
-                if let Some(msg) = Self::gh_write_guard(&acc.bot, "关闭") {
-                    return GhOutcome::Rejected(msg);
-                }
-                let repo_full = format!("{owner}/{repo}");
-                if !acc.bot.gh_allows_repo(&repo_full) {
-                    return GhOutcome::Rejected(format!(
-                        "❌ 仓库 {repo_full} 不在白名单内，已拒绝关闭。"
-                    ));
-                }
-                match acc.client.close_issue(&owner, &repo, number).await {
-                    Ok(()) => {
-                        crate::log!("[bridge] 已关闭 {owner}/{repo}#{number}");
-                        let _ = self
-                            .send_reply(ev, &format!("✅ 已关闭 {owner}/{repo}#{number}。"))
-                            .await;
-                        GhOutcome::Consumed
-                    }
-                    Err(e) => {
-                        crate::log!("[bridge] ⚠️ 关闭 {owner}/{repo}#{number} 失败: {e:#}");
-                        let _ = self.send_reply(ev, &format!("❌ 关闭失败：{e:#}")).await;
-                        GhOutcome::Consumed
-                    }
-                }
-            }
-            crate::github::GhCmd::ConfirmCreate { owner, repo, title } => {
-                if let Some(msg) = Self::gh_write_guard(&acc.bot, "创建 issue") {
-                    return GhOutcome::Rejected(msg);
-                }
-                // 创建是公开写操作：先预览（仓库 + 标题），用户回复「确认建 issue <标题>」才执行。
-                // 解析缺省仓库与 Create 同逻辑（单项白名单/显式 owner/repo）。
-                let (owner, repo) = match Self::resolve_create_repo(&acc.bot, &owner, &repo) {
-                    Ok(v) => v,
-                    Err(msg) => return GhOutcome::Rejected(msg),
-                };
-                let repo_full = format!("{owner}/{repo}");
-                if !acc.bot.gh_allows_repo(&repo_full) {
-                    return GhOutcome::Rejected(format!(
-                        "❌ 仓库 {repo_full} 不在白名单内，已拒绝创建。"
-                    ));
-                }
-                let _ = self
-                    .send_reply(
-                        ev,
-                        &format!(
-                            "⚠️ 将创建 issue「{}」→ {repo_full}。确认请回复：\n确认建 issue {repo_full} {}",
-                            crate::agent::truncate(&title, 60),
-                            crate::agent::truncate(&title, 60)
-                        ),
-                    )
-                    .await;
-                GhOutcome::Consumed
-            }
-
-            crate::github::GhCmd::Create { owner, repo, title } => {
-                if let Some(msg) = Self::gh_write_guard(&acc.bot, "创建 issue") {
-                    return GhOutcome::Rejected(msg);
-                }
-                let (owner, repo) = match Self::resolve_create_repo(&acc.bot, &owner, &repo) {
-                    Ok(v) => v,
-                    Err(msg) => return GhOutcome::Rejected(msg),
-                };
-                let repo_full = format!("{owner}/{repo}");
-                if !acc.bot.gh_allows_repo(&repo_full) {
-                    return GhOutcome::Rejected(format!(
-                        "❌ 仓库 {repo_full} 不在白名单内，已拒绝创建。"
-                    ));
-                }
-                match acc.client.create_issue(&owner, &repo, &title).await {
-                    Ok(url) => {
-                        crate::log!(
-                            "[bridge] 已创建 {owner}/{repo} issue「{}」",
-                            crate::agent::truncate(&title, 20)
-                        );
-                        let _ = self.send_reply(ev, &format!("✅ 已创建：{url}")).await;
-                        GhOutcome::Consumed
-                    }
-                    Err(e) => {
-                        crate::log!("[bridge] ⚠️ 创建 issue 失败: {e:#}");
-                        let _ = self.send_reply(ev, &format!("❌ 创建失败：{e:#}")).await;
-                        GhOutcome::Consumed
-                    }
-                }
-            }
-            crate::github::GhCmd::Analyze {
-                owner,
-                repo,
-                number,
-            } => {
-                let repo_full = format!("{owner}/{repo}");
-                if !acc.bot.gh_allows_repo(&repo_full) {
-                    return GhOutcome::Rejected(format!(
-                        "❌ 仓库 {repo_full} 不在白名单内，已拒绝分析。"
-                    ));
-                }
-                // 并行拉 issue 详情 + 评论（独立请求，一次往返）
-                let (issue, comments) = match tokio::try_join!(
-                    acc.client.fetch_issue(&owner, &repo, number),
-                    acc.client.list_comments(&owner, &repo, number),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        crate::log!("[bridge] ⚠️ 拉取 {owner}/{repo}#{number} 失败: {e:#}");
-                        let _ = self
-                            .send_reply(ev, &format!("❌ 拉取 issue 失败：{e:#}"))
-                            .await;
-                        return GhOutcome::Consumed;
-                    }
-                };
-                crate::log!(
-                    "[bridge] 分析指令 {owner}/{repo}#{number} 评论 {} 条",
-                    comments.len()
-                );
-                GhOutcome::Analyze(
-                    crate::github::GhContext::new(owner, repo, number, issue, comments),
-                    acc.client.clone(),
-                )
-            }
-        }
-    }
-
     /// 把一条待发消息落盘积压（仅微信：主动推送被拒时缓存，等下次入站补发）。
     /// 其它通道主动推送不受 token 活跃度约束，继续走既有「失败回落主会话」路径，不入队。
     pub fn queue_outbox(&self, chat_id: &str, text: &str, job_id: &str) {
@@ -856,8 +513,6 @@ impl Bridge {
             text,
             attachments,
             role: sender_role,
-            backend_override: None,
-            gh_role: None,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
             crate::log!(
@@ -1129,67 +784,6 @@ impl Bridge {
             return;
         }
 
-        // GitHub 指令门（附挂在既有 IM bot 的能力，非新 bot kind）。
-        // 位置：/new 之后、pending 落盘之前。
-        //  - 直接 API 指令（关闭/建 issue）→ 就地执行回复后 return：不进 agent、不落盘 pending
-        //    （动作已完成，重启重放会重复操作）；
-        //  - 分析指令 → 只注入 issue 上下文到 prompt 继续走 agent，最终回复双写
-        //    （issue 评论留档全文 + 群截断摘要）。
-        // 访问控制不重复做：群 @ 过滤（on_payload）+ access_allows 已在进 handle 前把关；
-        // 仓库白名单在 handle_github_cmd 里每个动作前强制校验（单一关卡）。
-        // Consumed/Rejected 分支调用 pending.remove 是**无操作兜底**：实时路径上这些
-        // 分支在 pending.add 之前就 return 了；但 pending 重放（#25）时条目已存在——
-        // 若重放时 fetch 瞬失败（限流/网络）导致 Consumed，不摘除会每次重启都重放刷屏。
-        let mut gh_ctx: Option<(crate::github::GhContext, Arc<dyn crate::github::GithubApi>)> =
-            None;
-        // #64 渠道化：本 bot（github kind 本体 / 未迁移旧式配置 / 测试注入）或全局
-        // kind=github 账号体系存在时才进指令门；完全无 github 配置的 IM bot 指令照旧
-        // 透传 agent（零回归）。
-        if self.bot.is_github_capable() || self.has_github_account_bots() {
-            if let Some(cmd) = crate::github::parse_github_cmd(&text) {
-                let repo_full = gh_cmd_repo(&cmd);
-                // 缺省仓库的创建指令（repo 为空）无法按仓库路由：单账号时自动推断，
-                // 多账号歧义时拒绝（要求显式仓库）——否则永远路由不到账号
-                let account = match &cmd {
-                    crate::github::GhCmd::Create { repo, .. }
-                    | crate::github::GhCmd::ConfirmCreate { repo, .. }
-                        if repo.is_empty() =>
-                    {
-                        self.resolve_single_github_account()
-                    }
-                    _ => self.resolve_github(&repo_full),
-                };
-                match account {
-                    Some(acc) => match self.handle_github_cmd(&ev, cmd, &acc).await {
-                        GhOutcome::Analyze(ctx, client) => gh_ctx = Some((ctx, client)),
-                        GhOutcome::Consumed => {
-                            self.pending.remove(&ev.mid);
-                            return;
-                        }
-                        GhOutcome::Rejected(msg) => {
-                            self.pending.remove(&ev.mid);
-                            let _ = self.send_reply(&ev, &msg).await;
-                            return;
-                        }
-                    },
-                    None => {
-                        // 有账号体系但无一放行：仓库不在白名单 → 明确拒绝；
-                        // 创建指令缺仓库且多账号歧义 → 要求显式仓库。
-                        self.pending.remove(&ev.mid);
-                        let msg = if repo_full.is_empty() {
-                            "❌ 创建 issue 请带上仓库：`建 issue owner/repo 标题`（存在多个 GitHub 账号，不能自动推断）。".to_string()
-                        } else {
-                            format!(
-                                "❌ 仓库 {repo_full} 不在白名单内（无任何 GitHub bot 放行），已拒绝。"
-                            )
-                        };
-                        let _ = self.send_reply(&ev, &msg).await;
-                        return;
-                    }
-                }
-            }
-        }
-
         // #25 重启恢复：进入 agent 处理前落盘 pending（已排除 /new、停止词等控制指令），
         // service 崩溃/重启后由 recover_pending 自动重放续跑。重放时同 mid 再次 add
         // 会按 mid 去重，不会产生重复条目。
@@ -1202,19 +796,12 @@ impl Bridge {
             quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
             role: ev.role, // 落盘角色：重启重放时按原角色走受限/全权限分支
-            backend_override: ev.backend_override.clone(),
-            gh_role: ev.gh_role.clone(),
             created_at: crate::chrono_lite::unix_secs(),
         });
 
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
         // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
-        // #64 批次 B：worker 触发的合成 Ev 带 backend_override（worker.backend 覆盖
-        // bot 默认）；否则回落 bot 生效后端。
-        let backend = match &ev.backend_override {
-            Some(b) if !b.trim().is_empty() => Backend::parse(b),
-            _ => Backend::parse(self.bot.effective_backend(&self.default_backend)),
-        };
+        let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
         // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
         // 附件元数据行带路径/mime/sha256，agent 可直接读取工作区文件内容。
         let has_text = !text.is_empty();
@@ -1258,13 +845,6 @@ impl Bridge {
                 prompt.push_str(&u);
             }
         }
-        // GitHub 分析指令：issue 内容注入 prompt（原始链接已在 [链接] 段，这里带实际内容）
-        if let Some((ctx, _client)) = &gh_ctx {
-            prompt.push_str("\n\n[GitHub Issue]");
-            prompt.push('\n');
-            prompt.push_str(&ctx.render);
-        }
-
         // 受限会话（授权者）：prompt 开头前置受限说明。CLAUDE.md 是 owner/授权者共享的
         // 同一份指引，不能靠它区分——prompt 注入才是按角色区分的正确载体（硬闸在 guard hook）。
         // 判定与 agent::run 的 restrict 一致（role==Granted && 开关热读）——owner 关掉
@@ -1388,7 +968,7 @@ impl Bridge {
                 );
             }
             // 当前用户轮落历史（锁内，与助手轮严格按真实顺序交替；重放由 (mid,user) 去重兜底）。
-            // GitHub 合成 Ev 同样落历史——它是该通知群的 agent 轮次。锁内写与 /new 的 clear 互斥。
+            // 锁内写与 /new 的 clear 互斥。
             hist.append_user(&ev.mid, backend.name(), &history_user_text(&text, &ev));
             (lock_ret, epoch, injected_rounds)
         };
@@ -1500,103 +1080,26 @@ impl Bridge {
                         }
                     }
                 }
-                // 注入提示随最终回复一条发出（不独立发消息，打字机已下线纪律）；
-                // GitHub 双写分支只附在群摘要，不写进 issue 评论留档。
+                // 注入提示随最终回复一条发出（不独立发消息，打字机已下线纪律）。
                 let history_note =
                     injected_rounds.map(|n| format!("\n\n（已携带最近 {n} 轮上下文）"));
-                // GitHub 分析双写：全文回写 issue 评论留档，群聊只回截断摘要——
-                // 避免超长分析刷屏，完整内容去 issue 页看。
-                // 注：pending 重放是 at-least-once——崩溃窗口可能重跑并双发评论（与既有
-                // pending 恢复语义一致，接受）。
-                if let Some((ctx, client)) = &gh_ctx {
-                    // #64 批次 B：worker 触发带角色名 → 评论署名；IM 指令（无角色）用原署名
-                    let full = match &ev.gh_role {
-                        Some(role) if !role.trim().is_empty() => {
-                            format!("[agent-bridge · {role} 分析结果]\n\n{reply}")
-                        }
-                        _ => format!("[agent-bridge 分析结果]\n\n{reply}"),
-                    };
-                    // 留档成败要如实反映到回执：失败时摘要明说「未留档」，不能假装成功。
-                    let mut archived = true;
-                    match client
-                        .post_comment(&ctx.owner, &ctx.repo, ctx.number, &full)
-                        .await
-                    {
-                        Ok(()) => crate::log!(
-                            "[bridge] 已把分析结果回写 {}/{}#{} 评论",
-                            ctx.owner,
-                            ctx.repo,
-                            ctx.number
-                        ),
-                        Err(e) => {
-                            archived = false;
-                            crate::log!(
-                                "[bridge] ⚠️ 评论回写失败 {}/{}#{}: {e:#}",
-                                ctx.owner,
-                                ctx.repo,
-                                ctx.number
-                            );
-                        }
-                    }
-                    let summary = crate::agent::truncate(&reply, 200);
-                    // 批次 2.3：PR 评论触发的分析用「🔀 PR 审查」前缀（issue 用 📝）
-                    let prefix = if ctx.is_pr {
-                        "🔀 PR 审查"
-                    } else {
-                        "📝 已分析"
-                    };
-                    let mut text = if archived {
-                        format!(
-                            "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（完整结果已留档到 {} 评论）",
-                            ctx.owner, ctx.repo, ctx.number, ctx.title, summary,
-                            if ctx.is_pr { "PR" } else { "issue" }
-                        )
-                    } else {
-                        // 评审：PR 的自然 URL（/pull/N）不被 parse_issue_url 接受，补档提示
-                        // 必须给可达形态——owner/repo#N 简写对 PR 同样有效（共享编号空间）。
-                        let redrive = if ctx.is_pr {
-                            format!("分析 {}/{}#{}", ctx.owner, ctx.repo, ctx.number)
-                        } else {
-                            "分析".to_string()
-                        };
-                        format!(
-                            "{prefix} {}/{}#{}「{}」\n\n```\n{}\n```\n\n（⚠️ 评论留档失败，全文仅此可见，可稍后重发「{redrive}」补档）",
-                            ctx.owner, ctx.repo, ctx.number, ctx.title, summary
-                        )
-                    };
-                    if let Some(note) = &history_note {
-                        text.push_str(note); // 只附群摘要，不进 issue 评论留档
-                    }
-                    match self.send_reply(&ev, &text).await {
-                        Ok(()) => crate::log!(
-                            "[bridge] 已回复 github 摘要 chat={} 长度={}",
-                            trunc(&ev.chat_id, 10),
-                            text.chars().count()
-                        ),
-                        Err(e) => crate::log!(
-                            "[bridge] ⚠️ github 摘要发送失败 chat={}: {e:#}",
-                            trunc(&ev.chat_id, 10)
-                        ),
-                    }
-                } else {
-                    // 原路径：普通回复全文发送。发送结果必须留痕：回复丢了
-                    // （token 失效/会话失效等）时不能谎报成功。
-                    // #49：注入提示附在全文尾部（若本轮做过历史注入）。
-                    let sent_text = match &history_note {
-                        Some(note) => format!("{reply}{note}"),
-                        None => reply.clone(),
-                    };
-                    match self.send_reply(&ev, &sent_text).await {
-                        Ok(()) => crate::log!(
-                            "[bridge] 已回复 chat={} 长度={}",
-                            trunc(&ev.chat_id, 10),
-                            reply.chars().count()
-                        ),
-                        Err(e) => crate::log!(
-                            "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
-                            trunc(&ev.chat_id, 10)
-                        ),
-                    }
+                // 普通回复全文发送。发送结果必须留痕：回复丢了
+                // （token 失效/会话失效等）时不能谎报成功。
+                // #49：注入提示附在全文尾部（若本轮做过历史注入）。
+                let sent_text = match &history_note {
+                    Some(note) => format!("{reply}{note}"),
+                    None => reply.clone(),
+                };
+                match self.send_reply(&ev, &sent_text).await {
+                    Ok(()) => crate::log!(
+                        "[bridge] 已回复 chat={} 长度={}",
+                        trunc(&ev.chat_id, 10),
+                        reply.chars().count()
+                    ),
+                    Err(e) => crate::log!(
+                        "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    ),
                 }
             }
             Ok(agent::RunOutcome::Cancelled) => {
@@ -1673,8 +1176,6 @@ impl Bridge {
                 text: item.text,
                 attachments: item.attachments,
                 role: item.role, // 重放按原角色走受限/全权限分支（PendingItem 落盘字段）
-                backend_override: item.backend_override.clone(),
-                gh_role: item.gh_role.clone(),
             };
             crate::log!(
                 "[bot:{}] 恢复消息 chat={} mid={} text={:?}",
@@ -1758,8 +1259,6 @@ impl Bridge {
             text,
             attachments,
             role: crate::config::SenderRole::Owner, // 微信只有 owner（on_weixin 已按 wx_user_id 过滤）
-            backend_override: None,
-            gh_role: None,
         };
         self.handle(ev).await;
     }
@@ -1863,8 +1362,6 @@ impl Bridge {
             text,
             attachments,
             role: sender_role,
-            backend_override: None,
-            gh_role: None,
         };
         self.handle(ev).await;
     }
@@ -1923,8 +1420,7 @@ fn trunc(s: impl AsRef<str>, n: usize) -> String {
 /// #49 历史条目的用户轮文本：用户文本 + （引用）被引用文本 + （附件）元数据行。
 /// 单条 300 字截断在 history 层做——这里只负责按重要性排布（用户文本最前，
 /// 截断丢的是尾巴=次要信息）。与 prompt 的 [引用消息]/[附件] 段同源同格式。
-/// 有意省略 [链接]/[GitHub Issue] 段（审查 M-4）：链接本身在用户文本里；
-/// 分析的 issue 内容太长，跨后端接续由配对的助手轮（分析结论）承载。
+/// 有意省略 [链接] 段（审查 M-4）：链接本身就在用户文本里，无需重复落历史。
 fn history_user_text(text: &str, ev: &Ev) -> String {
     let mut t = String::from(text);
     if !ev.quoted.text.is_empty() {
@@ -2029,8 +1525,6 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             role: crate::config::SenderRole::Owner,
-            backend_override: None,
-            gh_role: None,
         };
         assert_eq!(ev.key(), "oc_group");
     }
@@ -2047,8 +1541,6 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             role: crate::config::SenderRole::Owner,
-            backend_override: None,
-            gh_role: None,
         };
         let a = base("omt_aaa");
         let b = base("omt_bbb");
@@ -2116,177 +1608,6 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    /// GitHub 挡板：记录调用序列（calls），fetch 结果可编程（默认成功）。用于驱动
-    /// 指令门时序——close/create 直接 API、analyze 注入 + 双写、白名单拒绝。
-    struct MockGithub {
-        calls: Mutex<Vec<String>>,
-        issue: Mutex<crate::github::GhIssue>,
-        comments: Mutex<Vec<crate::github::GhComment>>,
-        fail_fetch: bool,
-        fail_post: bool,
-        /// is_collaborator 返回值（默认 Some(true)=协作者；None=权限不足）；
-        /// fail_collab=true 时返回 Err。
-        collab: Option<bool>,
-        fail_collab: bool,
-    }
-    impl MockGithub {
-        fn new() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                issue: Mutex::new(crate::github::GhIssue {
-                    id: 1,
-                    number: 42,
-                    title: "登录偶发 401".into(),
-                    state: "open".into(),
-                    html_url: "https://github.com/o/r/issues/42".into(),
-                    body: "token 缓存竞态导致偶发 401。".into(),
-                    created_at: "2026-08-14T01:00:00Z".into(),
-                    updated_at: "2026-08-14T02:00:00Z".into(),
-                    user: crate::github::GhUser {
-                        login: "alice".into(),
-                    },
-                    pull_request: None,
-                }),
-                comments: Mutex::new(vec![crate::github::GhComment {
-                    id: 101,
-                    body: "复现了，见日志。".into(),
-                    user: crate::github::GhUser {
-                        login: "bob".into(),
-                    },
-                    created_at: "2026-08-14T02:00:00Z".into(),
-                    updated_at: "2026-08-14T02:05:00Z".into(),
-                    html_url: "https://github.com/o/r/issues/42#issuecomment-101".into(),
-                }]),
-                fail_fetch: false,
-                fail_post: false,
-                collab: Some(true),
-                fail_collab: false,
-            }
-        }
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
-        fn set_fail_fetch(&mut self) {
-            self.fail_fetch = true;
-        }
-        fn set_fail_post(&mut self) {
-            self.fail_post = true;
-        }
-        fn set_collab(&mut self, v: bool) {
-            self.collab = Some(v);
-        }
-        fn set_collab_denied(&mut self) {
-            self.collab = None; // 模拟 token 缺 Administration: Read
-        }
-        fn set_fail_collab(&mut self) {
-            self.fail_collab = true;
-        }
-    }
-    #[async_trait]
-    impl crate::github::GithubApi for MockGithub {
-        async fn fetch_issue(
-            &self,
-            owner: &str,
-            repo: &str,
-            number: u64,
-        ) -> anyhow::Result<crate::github::GhIssue> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("fetch:{owner}/{repo}/{number}"));
-            if self.fail_fetch {
-                anyhow::bail!("模拟拉取失败");
-            }
-            Ok(self.issue.lock().unwrap().clone())
-        }
-        async fn list_comments(
-            &self,
-            owner: &str,
-            repo: &str,
-            number: u64,
-        ) -> anyhow::Result<Vec<crate::github::GhComment>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("comments:{owner}/{repo}/{number}"));
-            Ok(self.comments.lock().unwrap().clone())
-        }
-        async fn post_comment(
-            &self,
-            owner: &str,
-            repo: &str,
-            number: u64,
-            body: &str,
-        ) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push(format!(
-                "post:{owner}/{repo}/{number}:{}",
-                crate::agent::truncate(body, 30)
-            ));
-            if self.fail_post {
-                anyhow::bail!("模拟回写失败");
-            }
-            Ok(())
-        }
-        async fn close_issue(&self, owner: &str, repo: &str, number: u64) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("close:{owner}/{repo}/{number}"));
-            Ok(())
-        }
-        async fn create_issue(
-            &self,
-            owner: &str,
-            repo: &str,
-            title: &str,
-        ) -> anyhow::Result<String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("create:{owner}/{repo}:{title}"));
-            Ok(format!("https://github.com/{owner}/{repo}/issues/1"))
-        }
-        async fn list_issues_since(
-            &self,
-            owner: &str,
-            repo: &str,
-            since: &str,
-        ) -> anyhow::Result<Vec<crate::github::GhIssue>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("list:{owner}/{repo}:{since}"));
-            Ok(Vec::new())
-        }
-        async fn list_comments_since(
-            &self,
-            owner: &str,
-            repo: &str,
-            since: &str,
-        ) -> anyhow::Result<Vec<crate::github::GhComment>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("comments:{owner}/{repo}:{since}"));
-            Ok(self.comments.lock().unwrap().clone())
-        }
-        async fn is_collaborator(
-            &self,
-            owner: &str,
-            repo: &str,
-            login: &str,
-        ) -> anyhow::Result<Option<bool>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("collab:{owner}/{repo}:{login}"));
-            if self.fail_collab {
-                anyhow::bail!("模拟协作者校验失败");
-            }
-            Ok(self.collab)
-        }
-    }
-
     /// 收集 send_text 调用，供断言回复内容；get_quoted_message 用 map 按 message_id 返回
     /// 被引用内容（飞书引用/回复场景测试用）；download_attachment 直接返回占位元数据
     /// （不落盘，测试与工作区解耦）。
@@ -2324,12 +1645,6 @@ mod tests {
         }
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
-        }
-        fn sent_chats(&self) -> Vec<(String, String)> {
-            self.sent_chats.lock().unwrap().clone()
-        }
-        fn set_fail_chat(&self, chat: &str) {
-            *self.fail_chat.lock().unwrap() = Some(chat.to_string());
         }
     }
     #[async_trait]
@@ -2614,8 +1929,6 @@ mod tests {
             text: text.into(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
-            backend_override: None,
-            gh_role: None,
         }
     }
 
@@ -2634,23 +1947,8 @@ mod tests {
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
-        build_test_bridge_with_bot_gh(runner, bot, Arc::new(MockGithub::new()))
-    }
-
-    /// 同 build_test_bridge_with_bot，但可注入 MockGithub（github 指令门测试用）。
-    fn build_test_bridge_with_bot_gh(
-        runner: Arc<dyn AgentRunner>,
-        bot: BotConfig,
-        gh: Arc<dyn crate::github::GithubApi>,
-    ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
-        let bridge = Arc::new(Bridge::build(
-            msgr.clone(),
-            bot,
-            &Config::default(),
-            runner,
-            gh,
-        ));
+        let bridge = Arc::new(Bridge::build(msgr.clone(), bot, &Config::default(), runner));
         (bridge, msgr)
     }
 
@@ -3296,41 +2594,6 @@ mod tests {
     /// T8：GitHub 分析（含合成 Ev）同样落历史——它是该通知群的 agent 轮次，
     /// 新后端能接续「刚才分析过什么」。助手条目记 reply 本体（300 字截断在
     /// history 层，与群摘要的 200 字截断各自独立）。
-    #[tokio::test]
-    async fn github_analyze_recorded_in_history() {
-        let runner = Arc::new(MockAgentRunner::immediate("分析结论：竞态窗口需加锁。"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            gh_notify_chat: "oc_gh".into(),
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, _msgr) = build_test_bridge_with_bot_gh(runner, bot.clone(), gh);
-        let hist = crate::history::History::open(&bot.key(), "oc_gh");
-
-        let b = bridge.clone();
-        tokio::spawn(async move {
-            b.handle(crate::service::auto_ev("o/r", 42, 9, "oc_gh"))
-                .await
-        })
-        .await
-        .unwrap();
-
-        let entries = hist.entries();
-        assert!(
-            entries.iter().any(|e| e.user && e.text.contains("分析 ")),
-            "合成 Ev 用户轮落历史，实际: {entries:?}"
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|e| !e.user && e.text.contains("分析结论")),
-            "分析回复落历史"
-        );
-        cleanup_bridge(&bridge);
-    }
 
     #[tokio::test]
     async fn cli_reset_during_run_skips_mark_started() {
@@ -3457,8 +2720,6 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
-            backend_override: None,
-            gh_role: None,
             created_at: 10,
         });
         bridge.pending.add(crate::pending::PendingItem {
@@ -3470,8 +2731,6 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Granted,
-            backend_override: None,
-            gh_role: None,
             created_at: 20,
         });
 
@@ -3513,43 +2772,6 @@ mod tests {
         bridge.recover_pending(&stop).await;
         assert!(runner.prompts().is_empty(), "无残留不应触发 agent");
         assert!(!msgr.sent().iter().any(|t| t.contains("正在恢复")));
-        cleanup_bridge(&bridge);
-    }
-
-    /// #69 审查 Important：关停广播后恢复重放立即停止，未重放条目留盘 pending.json
-    /// （下次启动续跑——恢复任务跑完整 agent 管线，不能让 shutdown_wait 无界等它）。
-    #[tokio::test]
-    async fn recover_pending_stops_on_cancel() {
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let (bridge, _msgr) = build_test_bridge(runner.clone());
-        for (i, mid) in ["r1", "r2"].iter().enumerate() {
-            bridge.pending.add(crate::pending::PendingItem {
-                mid: (*mid).into(),
-                chat_id: format!("oc_{mid}"),
-                chat_type: "group".into(),
-                thread_id: String::new(),
-                text: format!("第{i}条"),
-                quoted: crate::messenger::QuotedContent::default(),
-                attachments: Vec::new(),
-                role: crate::config::SenderRole::Owner,
-                backend_override: None,
-                gh_role: None,
-                created_at: i as u64,
-            });
-        }
-        let stop = tokio_util::sync::CancellationToken::new();
-        stop.cancel();
-        bridge.recover_pending(&stop).await;
-        assert!(
-            runner.prompts().is_empty(),
-            "取消后不重放任何条目: {:?}",
-            runner.prompts()
-        );
-        assert_eq!(
-            bridge.pending.snapshot().len(),
-            2,
-            "未重放条目留盘，下次启动续跑"
-        );
         cleanup_bridge(&bridge);
     }
 
@@ -4706,7 +3928,6 @@ https://b.com/y"
             bot,
             &Config::default(),
             runner.clone(),
-            Arc::new(MockGithub::new()),
         ));
 
         let b1 = bridge.clone();
@@ -4738,7 +3959,6 @@ https://b.com/y"
             bot,
             &Config::default(),
             runner.clone(),
-            Arc::new(MockGithub::new()),
         ));
 
         let b1 = bridge.clone();
@@ -4763,7 +3983,6 @@ https://b.com/y"
             bot,
             &Config::default(),
             runner.clone(),
-            Arc::new(MockGithub::new()),
         ));
 
         let b1 = bridge.clone();
@@ -4778,758 +3997,38 @@ https://b.com/y"
         cleanup_bridge(&bridge);
     }
 
-    /// GitHub 指令门：关闭是破坏性操作——裸「关闭」只回确认引导（不调 API），
-    /// 「确认关闭」才真正执行（不进 agent、不进 pending），回执 ✅。
+    /// #69 审查 Important：关停广播后恢复重放立即停止，未重放条目留盘 pending.json
+    /// （下次启动续跑——恢复任务跑完整 agent 管线，不能让 shutdown_wait 无界等它）。
     #[tokio::test]
-    async fn github_close_requires_confirmation_then_closes() {
-        let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            ..Default::default()
-        };
-        // 第一句：裸「关闭」→ 确认引导，零 API 调用
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh",
-                "关闭 https://github.com/o/r/issues/7",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert!(gh.calls().is_empty(), "裸关闭不得调 API");
-        assert!(msgr.sent()[0].contains("破坏性操作"));
-        assert!(msgr.sent()[0].contains("确认关闭"));
-        cleanup_bridge(&bridge);
-
-        // 第二句：「确认关闭」→ 真正执行
-        let gh2 = Arc::new(MockGithub::new());
-        let (bridge2, msgr2) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh2.clone());
-        let b2 = bridge2.clone();
-        let task = tokio::spawn(async move {
-            b2.handle(test_ev(
-                "m1",
-                "oc_gh",
-                "确认关闭 https://github.com/o/r/issues/7",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert_eq!(gh2.calls(), vec!["close:o/r/7"]);
-        assert_eq!(msgr2.sent(), vec!["✅ 已关闭 o/r#7。"]);
-        assert!(runner.prompts().is_empty(), "关闭不进 agent");
-        cleanup_bridge(&bridge2);
-    }
-
-    /// GitHub 指令门：创建是公开写操作——裸「建 issue」只回预览确认（不调 API），
-    /// 「确认建 issue」才真正创建；白名单单项可省略仓库，多项省略 → 明确拒绝。
-    #[tokio::test]
-    async fn github_create_requires_confirmation_then_creates() {
-        let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
-        // 第一句：裸「建 issue」→ 预览引导，零 API 调用
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev("m1", "oc_gh2", "建 issue 修复登录 401"))
-                .await
-        });
-        task.await.unwrap();
-        assert!(gh.calls().is_empty(), "裸建 issue 不得调 API");
-        assert!(msgr.sent()[0].contains("将创建 issue「修复登录 401」"));
-        assert!(msgr.sent()[0].contains("确认建 issue o/r 修复登录 401"));
-        cleanup_bridge(&bridge);
-
-        // 第二句：「确认建 issue」→ 真正创建
-        let gh2 = Arc::new(MockGithub::new());
-        let (bridge2, msgr2) =
-            build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh2.clone());
-        let b2 = bridge2.clone();
-        let task = tokio::spawn(async move {
-            b2.handle(test_ev("m1", "oc_gh2", "确认建 issue 修复登录 401"))
-                .await
-        });
-        task.await.unwrap();
-        assert_eq!(gh2.calls(), vec!["create:o/r:修复登录 401"]);
+    async fn recover_pending_stops_on_cancel() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        for (i, mid) in ["r1", "r2"].iter().enumerate() {
+            bridge.pending.add(crate::pending::PendingItem {
+                mid: (*mid).into(),
+                chat_id: format!("oc_{mid}"),
+                chat_type: "group".into(),
+                thread_id: String::new(),
+                text: format!("第{i}条"),
+                quoted: crate::messenger::QuotedContent::default(),
+                attachments: Vec::new(),
+                role: crate::config::SenderRole::Owner,
+                created_at: i as u64,
+            });
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        bridge.recover_pending(&stop).await;
+        assert!(
+            runner.prompts().is_empty(),
+            "取消后不重放任何条目: {:?}",
+            runner.prompts()
+        );
         assert_eq!(
-            msgr2.sent(),
-            vec!["✅ 已创建：https://github.com/o/r/issues/1"]
-        );
-        cleanup_bridge(&bridge2);
-
-        // 多项白名单 + 省略仓库 → 预览阶段就拒绝并提示带仓库
-        let bot3 = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/a, o/b".into(),
-            ..Default::default()
-        };
-        let gh3 = Arc::new(MockGithub::new());
-        let (bridge3, msgr3) = build_test_bridge_with_bot_gh(runner.clone(), bot3, gh3.clone());
-        let b3 = bridge3.clone();
-        let task = tokio::spawn(async move {
-            b3.handle(test_ev("m1", "oc_gh3", "建 issue 修复登录 401"))
-                .await
-        });
-        task.await.unwrap();
-        assert!(gh3.calls().is_empty(), "未调 API");
-        assert!(msgr3.sent()[0].contains("请带上仓库"));
-        cleanup_bridge(&bridge3);
-    }
-
-    /// GitHub 指令门：仓库不在白名单 → 拒绝回复，零 API 调用。
-    #[tokio::test]
-    async fn github_whitelist_rejected() {
-        let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh4",
-                "分析 https://github.com/x/y/issues/1",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert!(gh.calls().is_empty(), "白名单拒绝不得碰 API");
-        assert!(msgr.sent()[0].contains("不在白名单"));
-        assert!(runner.prompts().is_empty());
-        cleanup_bridge(&bridge);
-    }
-
-    /// GitHub 分析：issue 上下文注入 prompt，agent 回复双写（评论留档 + 群摘要）。
-    #[tokio::test]
-    async fn github_analyze_injects_context_and_double_writes() {
-        let runner = Arc::new(MockAgentRunner::immediate("根因是 token 缓存竞态。"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh5",
-                "分析 https://github.com/o/r/issues/42",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        // issue + 评论 拉取，回复全文回写评论
-        let calls = gh.calls();
-        assert!(
-            calls.iter().any(|c| c.starts_with("fetch:o/r/42")),
-            "calls={calls:?}"
-        );
-        assert!(
-            calls.iter().any(|c| c.starts_with("comments:o/r/42")),
-            "calls={calls:?}"
-        );
-        assert!(
-            calls.iter().any(|c| c.starts_with("post:o/r/42:")),
-            "calls={calls:?}"
-        );
-        // prompt 注入 issue 内容
-        let p = runner.prompts().join("\n");
-        assert!(p.contains("[GitHub Issue]"), "prompt 应含注入段");
-        assert!(p.contains("登录偶发 401"));
-        assert!(p.contains("token 缓存竞态导致偶发 401。"));
-        assert!(p.contains("复现了，见日志。"));
-        // 群里只有截断摘要（≤200 字 + 📝 前缀），全文在 issue 评论
-        assert_eq!(msgr.sent().len(), 1);
-        assert!(msgr.sent()[0].starts_with("📝 已分析 o/r#42「登录偶发 401」"));
-        assert!(msgr.sent()[0].contains("根因是 token 缓存竞态。"));
-        assert!(msgr.sent()[0].chars().count() < 300);
-        cleanup_bridge(&bridge);
-    }
-
-    /// GitHub 分析：拉取失败 → 回执 ❌，不进 agent。
-    #[tokio::test]
-    async fn github_analyze_fetch_error_replies() {
-        let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            ..Default::default()
-        };
-        let mut gh = MockGithub::new();
-        gh.set_fail_fetch();
-        let gh = Arc::new(gh);
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh6",
-                "分析 https://github.com/o/r/issues/42",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert!(msgr.sent()[0].contains("拉取 issue 失败"));
-        assert!(runner.prompts().is_empty(), "拉取失败不进 agent");
-        cleanup_bridge(&bridge);
-    }
-
-    /// GitHub 分析：评论回写失败 → 摘要如实提示「留档失败」，不假装已留档。
-    #[tokio::test]
-    async fn github_analyze_post_failure_receipt_is_honest() {
-        let runner = Arc::new(MockAgentRunner::immediate("根因是 token 缓存竞态。"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            ..Default::default()
-        };
-        let mut gh = MockGithub::new();
-        gh.set_fail_post();
-        let gh = Arc::new(gh);
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh8",
-                "分析 https://github.com/o/r/issues/42",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert_eq!(msgr.sent().len(), 1);
-        assert!(
-            msgr.sent()[0].contains("留档失败"),
-            "摘要应提示留档失败: {}",
-            msgr.sent()[0]
-        );
-        assert!(
-            !msgr.sent()[0].contains("已留档到"),
-            "不得谎称已留档: {}",
-            msgr.sent()[0]
+            bridge.pending.snapshot().len(),
+            2,
+            "未重放条目留盘，下次启动续跑"
         );
         cleanup_bridge(&bridge);
-    }
-
-    /// 评审 S1：空白名单 = 全放行只适用于读（分析）；写操作（关闭/建）未配置白名单时
-    /// 直接拒绝，且零 API 调用；分析维持放行。
-    #[tokio::test]
-    async fn github_empty_whitelist_blocks_writes_allows_analyze() {
-        let runner = Arc::new(MockAgentRunner::blocking("不会用到"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "".into(), // 空白名单
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh9",
-                "确认关闭 https://github.com/o/r/issues/7",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert!(gh.calls().is_empty(), "空名单写操作零 API 调用");
-        assert!(msgr.sent()[0].contains("未配置仓库白名单"));
-        cleanup_bridge(&bridge);
-
-        // 建 issue 同样拒绝
-        let gh2 = Arc::new(MockGithub::new());
-        let (bridge2, msgr2) =
-            build_test_bridge_with_bot_gh(runner.clone(), bot.clone(), gh2.clone());
-        let b2 = bridge2.clone();
-        let task = tokio::spawn(async move {
-            b2.handle(test_ev("m1", "oc_gh9", "确认建 issue 修复 bug"))
-                .await
-        });
-        task.await.unwrap();
-        assert!(gh2.calls().is_empty());
-        assert!(msgr2.sent()[0].contains("未配置仓库白名单"));
-        cleanup_bridge(&bridge2);
-
-        // 分析（读）维持放行：正常注入 + 双写（空名单 = 全放行，读不设限）
-        let runner2 = Arc::new(MockAgentRunner::immediate("根因分析。"));
-        let gh3 = Arc::new(MockGithub::new());
-        let (bridge3, msgr3) = build_test_bridge_with_bot_gh(runner2.clone(), bot, gh3.clone());
-        let b3 = bridge3.clone();
-        let task = tokio::spawn(async move {
-            b3.handle(test_ev(
-                "m1",
-                "oc_gh9",
-                "分析 https://github.com/o/r/issues/42",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert!(gh3.calls().iter().any(|c| c.starts_with("fetch:o/r/42")));
-        assert_eq!(msgr3.sent().len(), 1);
-        cleanup_bridge(&bridge3);
-    }
-
-    /// 未配置 github 能力：同样文本走普通 agent 流程（不注入、全文一次发送）。
-    #[tokio::test]
-    async fn github_not_capable_passthrough() {
-        let runner = Arc::new(MockAgentRunner::immediate("这是普通回复"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        let b1 = bridge.clone();
-        let task = tokio::spawn(async move {
-            b1.handle(test_ev(
-                "m1",
-                "oc_gh7",
-                "分析 https://github.com/o/r/issues/42",
-            ))
-            .await
-        });
-        task.await.unwrap();
-        assert!(gh.calls().is_empty(), "未配置能力不碰 GitHub API");
-        assert_eq!(msgr.sent(), vec!["这是普通回复"]);
-        let p = runner.prompts().join("\n");
-        assert!(!p.contains("[GitHub Issue]"), "未配置不注入");
-        cleanup_bridge(&bridge);
-    }
-
-    /// 评论批处理：@提及 私信通知（映射内 login → 对应 chat_id；无映射静默跳过；
-    /// bot login 不私信；失败评论进 failed 游标回退）。
-    #[tokio::test]
-    async fn comment_batch_mentions_dm_targets() {
-        let msgr = Arc::new(MockMessenger::new());
-        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
-            id,
-            body: body.into(),
-            user: crate::github::GhUser {
-                login: login.into(),
-            },
-            created_at: "2026-08-14T02:00:00Z".into(),
-            updated_at: "2026-08-14T02:05:00Z".into(),
-            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
-        };
-        let comments = vec![
-            // 映射内 login → 私信；@bot 被 exclude（bot_login）排除
-            mk(1, "@alice 看看这个 @bot", "bob"),
-            // 无映射 login → 静默跳过
-            mk(2, "@nobody 你好", "bob"),
-            // 引用行内的 @ 不算
-            mk(3, "> @alice 旧讨论\n新讨论", "carol"),
-            // 围栏代码块内的 @ 不算（评审 M4）
-            mk(
-                5,
-                "```rust\nlet x = \"@alice\";\n```\n@alice 真提及",
-                "dave",
-            ),
-            // 已在 seen → 跳过
-            mk(4, "@alice 已处理过", "bob"),
-        ];
-        let gh = Arc::new(MockGithub::new());
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &comments,
-            &[4],
-            &[("alice".to_string(), "oc_alice".to_string())],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        // 私信目标断言：@alice 的评论 1 与 5（代码块内不算，但块后真提及算）发到 oc_alice；
-        // 评论 1 的 @bot 被 exclude 排除
-        let sent = msgr.sent_chats();
-        assert_eq!(sent.len(), 2, "评论 1 和 5 触发私信: {sent:?}");
-        assert!(sent.iter().all(|(c, _)| c == "oc_alice"));
-        assert!(sent[0].1.contains("你在 o/r#42 被 @bob 提到了"));
-        assert!(sent[1].1.contains("你在 o/r#42 被 @dave 提到了"));
-        // seen 推进：1/2/3/5 成功，4 在 seen 里跳过
-        assert_eq!(batch.seen_extra, vec![1, 2, 3, 5]);
-        assert!(batch.failed.is_empty());
-        assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T02:05:00Z"));
-    }
-
-    /// 评审 C1：空批 → new_since=None（调用方保持原游标，不得写空串清掉）。
-    #[tokio::test]
-    async fn comment_batch_empty_keeps_cursor() {
-        let msgr = Arc::new(MockMessenger::new());
-        let gh = Arc::new(MockGithub::new());
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &[],
-            &[],
-            &[],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        assert!(batch.seen_extra.is_empty());
-        assert!(batch.failed.is_empty());
-        assert_eq!(batch.new_since, None, "空批必须保持原游标");
-    }
-
-    /// 评审 M2：私信失败 → 该评论不进 seen、进 failed（游标回退重试）。
-    #[tokio::test]
-    async fn comment_batch_dm_failure_rewinds() {
-        let msgr = Arc::new(MockMessenger::new());
-        msgr.set_fail_chat("oc_alice"); // 对 alice 的私信失败
-        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
-            id,
-            body: body.into(),
-            user: crate::github::GhUser {
-                login: login.into(),
-            },
-            created_at: "2026-08-14T02:00:00Z".into(),
-            updated_at: format!("2026-08-14T0{id}:05:00Z"),
-            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
-        };
-        let comments = vec![
-            mk(1, "@alice 失败", "bob"),    // updated T01:05 → failed
-            mk(2, "@carol 成功", "bob"),    // updated 02:02:05 → seen
-            mk(3, "@alice 再失败", "dave"), // updated 02:03:05 → failed
-        ];
-        let gh = Arc::new(MockGithub::new());
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &comments,
-            &[],
-            &[
-                ("alice".to_string(), "oc_alice".to_string()),
-                ("carol".to_string(), "oc_carol".to_string()),
-            ],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        assert_eq!(batch.seen_extra, vec![2], "成功评论进 seen");
-        // 回退到最早失败评论的 updated_at（评审：取 min 而非最后失败者）；
-        // failed 携带评论 id（供失败计数，评审 M2）
-        assert_eq!(
-            batch.failed,
-            vec![
-                (1, "2026-08-14T01:05:00Z".to_string()),
-                (3, "2026-08-14T03:05:00Z".to_string())
-            ]
-        );
-        assert_eq!(batch.new_since.as_deref(), Some("2026-08-14T03:05:00Z"));
-    }
-    /// 2.2 触发判定：协作者评论 @bot → triggers；非协作者 → 跳过；PR 评论 → 2.3 起同样触发；
-    /// 作者 == bot（回声）→ 跳过。
-    #[tokio::test]
-    async fn comment_batch_trigger_and_collaborator_gate() {
-        let mk = |id: u64, body: &str, login: &str, url: &str| crate::github::GhComment {
-            id,
-            body: body.into(),
-            user: crate::github::GhUser {
-                login: login.into(),
-            },
-            created_at: "2026-08-14T02:00:00Z".into(),
-            updated_at: format!("2026-08-14T02:{id:02}:00Z"),
-            html_url: url.into(),
-        };
-        let issue_url = "https://github.com/o/r/issues/42#issuecomment-1";
-        let pr_url = "https://github.com/o/r/pull/5#issuecomment-1";
-        let comments = vec![
-            mk(1, "@bot 分析下这个", "alice", issue_url), // 协作者（默认）→ 触发
-            mk(2, "@BOT 再看看", "bob", issue_url),       // 大小写不敏感
-            mk(3, "@bot 分析", "bot", issue_url),         // 作者回声 → 不触发
-            mk(4, "@bot 审查下 PR", "alice", pr_url),     // PR 评论 → 2.3 起同样触发
-            mk(5, "xxbot 分析", "alice", issue_url),      // 词位不符 → 不触发
-        ];
-        let msgr = Arc::new(MockMessenger::new());
-        let gh = Arc::new(MockGithub::new());
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &comments,
-            &[],
-            &[],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        assert_eq!(
-            batch
-                .triggers
-                .iter()
-                .map(|t| (t.number, t.comment_id))
-                .collect::<Vec<_>>(),
-            vec![(42, 1), (42, 2), (5, 4)],
-            "评论 1/2/4 触发（PR 评论 2.3 起同样触发），3/5 不触发"
-        );
-
-        // 非协作者 → 跳过
-        let mut gh2 = MockGithub::new();
-        gh2.set_collab(false);
-        let gh2 = Arc::new(gh2);
-        let batch2 = crate::service::process_comment_batch(
-            gh2.as_ref(),
-            msgr.as_ref(),
-            &comments[..1],
-            &[],
-            &[],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        assert!(batch2.triggers.is_empty(), "非协作者不触发");
-        assert_eq!(batch2.seen_extra, vec![1], "仍算处理过（不重试）");
-    }
-
-    /// 2.2 协作者校验失败 → 评论进 failed（游标回退重试）。
-    #[tokio::test]
-    async fn comment_batch_collaborator_error_rewinds() {
-        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
-            id,
-            body: body.into(),
-            user: crate::github::GhUser {
-                login: login.into(),
-            },
-            created_at: "2026-08-14T02:00:00Z".into(),
-            updated_at: format!("2026-08-14T02:{id:02}:00Z"),
-            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
-        };
-        let comments = vec![mk(1, "@bot 分析", "alice"), mk(2, "普通讨论", "bob")];
-        let msgr = Arc::new(MockMessenger::new());
-        let mut gh = MockGithub::new();
-        gh.set_fail_collab();
-        let gh = Arc::new(gh);
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &comments,
-            &[],
-            &[],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        assert!(batch.triggers.is_empty());
-        assert_eq!(batch.seen_extra, vec![2], "普通评论照常进 seen");
-        assert_eq!(
-            batch.failed,
-            vec![(1, "2026-08-14T02:01:00Z".to_string())],
-            "校验失败评论回退"
-        );
-    }
-
-    /// 2.2 合成 Ev 复用 handle()：同 mid 两次 handle 只 post 一次（去重）。
-    #[tokio::test]
-    async fn auto_process_reuses_handle_and_dedupe_mid() {
-        let runner = Arc::new(MockAgentRunner::immediate("根因是 token 缓存竞态。"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            gh_notify_chat: "oc_gh".into(),
-            ..Default::default()
-        };
-        let gh = Arc::new(MockGithub::new());
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        let ev = |mid: &str| crate::bridge::Ev {
-            mid: mid.into(),
-            chat_id: "oc_gh".into(),
-            chat_type: "group".into(),
-            thread_id: String::new(),
-            quoted: Default::default(),
-            text: "分析 https://github.com/o/r/issues/42".into(),
-            attachments: Vec::new(),
-            role: crate::config::SenderRole::Granted, // 与 auto_ev 生产代码一致
-            backend_override: None,
-            gh_role: None,
-        };
-        // 同一评论 id 的合成 Ev 触发两次 → mid 去重只处理一次
-        let b1 = bridge.clone();
-        let t1 = tokio::spawn(async move { b1.handle(ev("gh:o/r:42:1")).await });
-        t1.await.unwrap();
-        let b2 = bridge.clone();
-        let t2 = tokio::spawn(async move { b2.handle(ev("gh:o/r:42:1")).await });
-        t2.await.unwrap();
-        let posts = gh
-            .calls()
-            .into_iter()
-            .filter(|c| c.starts_with("post:"))
-            .count();
-        assert_eq!(posts, 1, "同 mid 去重，只回写一次");
-        // 群摘要恰一条
-        assert_eq!(msgr.sent().len(), 1);
-        assert!(msgr.sent()[0].starts_with("📝 已分析 o/r#42"));
-        // prompt 注入 issue 内容（不可信包裹）
-        let p = runner.prompts().join("\n");
-        assert!(p.contains("[GitHub Issue]"));
-        assert!(p.contains("不可信数据"));
-        cleanup_bridge(&bridge);
-    }
-
-    /// 批次 2.3：PR 评论触发的自动分析走「🔀 PR 审查」变体（mock issue 带 pull_request
-    /// 字段 = PR），留档文案与群摘要前缀随 is_pr 切换。
-    #[tokio::test]
-    async fn pr_comment_auto_process() {
-        let runner = Arc::new(MockAgentRunner::immediate("改动集中在锁粒度，建议收窄。"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            gh_token: "ghp_x".into(),
-            gh_repos: "o/r".into(),
-            gh_notify_chat: "oc_gh".into(),
-            ..Default::default()
-        };
-        let gh = MockGithub::new();
-        gh.issue.lock().unwrap().pull_request =
-            Some(serde_json::json!({"url": "https://api.github.com/repos/o/r/pulls/42"}));
-        let gh = Arc::new(gh);
-        let (bridge, msgr) = build_test_bridge_with_bot_gh(runner.clone(), bot, gh.clone());
-        // 合成 Ev 走 service::auto_ev（与 watch 循环实际构造一致）
-        let b = bridge.clone();
-        tokio::spawn(async move {
-            b.handle(crate::service::auto_ev("o/r", 42, 9, "oc_gh"))
-                .await
-        })
-        .await
-        .unwrap();
-        assert_eq!(msgr.sent().len(), 1);
-        assert!(
-            msgr.sent()[0].starts_with("🔀 PR 审查 o/r#42"),
-            "PR 变体前缀，实际: {}",
-            msgr.sent()[0]
-        );
-        assert!(
-            msgr.sent()[0].contains("留档到 PR 评论"),
-            "留档尾注随 kind 切换，实际: {}",
-            msgr.sent()[0]
-        );
-        assert!(
-            gh.calls().iter().any(|c| c.starts_with("post:o/r/42:")),
-            "分析结果回写 PR 评论"
-        );
-        let p = runner.prompts().join("\n");
-        assert!(p.contains("来自 r PR #42"), "渲染头部带 PR 标识");
-        assert!(p.contains("不可信数据"));
-        cleanup_bridge(&bridge);
-    }
-    /// 评审 I1：仅配置提及映射（不配通知群）时 @bot 触发不收集（合成 Ev chat_id 空会被
-    /// handle 丢弃），日志说明而非静默丢失。
-    #[tokio::test]
-    async fn comment_batch_no_notify_chat_skips_triggers() {
-        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
-            id,
-            body: body.into(),
-            user: crate::github::GhUser {
-                login: login.into(),
-            },
-            created_at: "2026-08-14T02:00:00Z".into(),
-            updated_at: "2026-08-14T02:05:00Z".into(),
-            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
-        };
-        let comments = vec![mk(1, "@bot 分析下", "alice")];
-        let msgr = Arc::new(MockMessenger::new());
-        let gh = Arc::new(MockGithub::new());
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &comments,
-            &[],
-            &[],
-            "bot",
-            "o/r",
-            "o",
-            "", // notify_chat 空 = 仅映射配置
-            &[],
-        )
-        .await;
-        assert!(batch.triggers.is_empty(), "无通知群不收集触发");
-        assert_eq!(batch.seen_extra, vec![1], "评论仍算处理过");
-    }
-
-    /// 评审 M2：协作者检查权限不足（token 缺 Administration: Read）→ 跳过不重试（不进 failed）。
-    #[tokio::test]
-    async fn comment_batch_collab_denied_skips_without_rewind() {
-        let mk = |id: u64, body: &str, login: &str| crate::github::GhComment {
-            id,
-            body: body.into(),
-            user: crate::github::GhUser {
-                login: login.into(),
-            },
-            created_at: "2026-08-14T02:00:00Z".into(),
-            updated_at: "2026-08-14T02:05:00Z".into(),
-            html_url: "https://github.com/o/r/issues/42#issuecomment-1".into(),
-        };
-        let comments = vec![mk(1, "@bot 分析", "alice")];
-        let msgr = Arc::new(MockMessenger::new());
-        let mut gh = MockGithub::new();
-        gh.set_collab_denied();
-        let gh = Arc::new(gh);
-        let batch = crate::service::process_comment_batch(
-            gh.as_ref(),
-            msgr.as_ref(),
-            &comments,
-            &[],
-            &[],
-            "bot",
-            "o/r",
-            "o",
-            "oc_gh",
-            &[],
-        )
-        .await;
-        assert!(batch.triggers.is_empty());
-        assert!(batch.failed.is_empty(), "权限不足不重试");
-        assert_eq!(batch.seen_extra, vec![1]);
-    }
-
-    /// auto_ev 合成事件构造（评审 M3）：mid/chat_type/thread_id/text 字段契约。
-    #[test]
-    fn auto_ev_shape() {
-        let ev = crate::service::auto_ev("o/r", 42, 7, "oc_gh");
-        assert_eq!(ev.mid, "gh:o/r:42:7");
-        assert_eq!(ev.chat_id, "oc_gh");
-        assert_eq!(ev.chat_type, "group"); // 跳过 save_primary_chat
-        assert!(ev.thread_id.is_empty(), "thread_id 必须空（防假话题回复）");
-        assert_eq!(ev.text, "分析 https://github.com/o/r/issues/42");
     }
 }

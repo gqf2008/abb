@@ -92,7 +92,6 @@ pub async fn run() {
         crate::config::BotConfig,
         std::sync::Arc<dyn crate::messenger::Messenger>,
     )> = Vec::new();
-    let mut github_bots: Vec<crate::config::BotConfig> = Vec::new(); // #64 无 IM 通道的渠道 bot
     for bot in &cfg.bots {
         // 用户停用的 bot：不启动，但上报「已停用」让托盘显灰，并保留在设置窗可重启用。
         if !bot.enabled {
@@ -109,12 +108,6 @@ pub async fn run() {
             );
             continue;
         }
-        // #64 渠道化：kind=github 的 bot 不建 messenger（GitHub 不是 IM 通道），
-        // 单独收集；其 Bridge 用 RoutedMessenger 把通知/回执转发到目标 IM bot。
-        if bot.is_github_kind() {
-            github_bots.push(bot.clone());
-            continue;
-        }
         let msgr = match messenger::build(bot) {
             Ok(m) => m,
             Err(e) => {
@@ -126,7 +119,7 @@ pub async fn run() {
         bot_cfgs.insert(bot.key(), bot.clone());
         ready.push((bot.clone(), msgr));
     }
-    if ready.is_empty() && github_bots.is_empty() {
+    if ready.is_empty() {
         crate::log!("[service] 没有可用 bot，退出");
         // 无可跑 bot（全部停用/凭证不齐）→ 清「期望运行」标记，看门狗停止自动重拉
         crate::install::set_desired(false);
@@ -134,7 +127,7 @@ pub async fn run() {
     }
     let router = std::sync::Arc::new(crate::deliver::Router::new(
         cfg.cross_delivery_enabled,
-        messengers.clone(), // #64：messengers 还要给 RoutedMessenger 用，先 clone
+        messengers, // 此后无其它消费方（github bot 循环已移除），直接 move
         bot_cfgs,
         None,
     ));
@@ -153,17 +146,6 @@ pub async fn run() {
         let router = router.clone();
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
-        let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
-        handles.push(crate::tasks::tasks().spawn_forever(name, async move {
-            run_bot(bot, cfg, msgr, router, stop).await;
-        }));
-    }
-    // #64：github bot 循环（RoutedMessenger 转发通知；无 IM 事件循环，只跑 watch）
-    for bot in github_bots {
-        let cfg = cfg.clone();
-        let stop = crate::tasks::shutdown_token();
-        let router = router.clone();
-        let msgr = std::sync::Arc::new(crate::messenger::RoutedMessenger::new(messengers.clone()));
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
         handles.push(crate::tasks::tasks().spawn_forever(name, async move {
             run_bot(bot, cfg, msgr, router, stop).await;
@@ -297,39 +279,8 @@ async fn run_bot(
         });
     }
 
-    // #64 GitHub watch 循环（kind=github 渠道 bot 的核心循环）：
-    // 新 issue 只通知、不自动处理；通知经 RoutedMessenger 跨 bot 转发。
-    // 审查 Important：同名冲突跳过迁移时 IM bot 的 gh_token 保留——watch 不能静默停
-    //（新 issue 通知/@提及/@bot 自动处理都靠它）。用 is_github_capable（token 非空）：
-    // kind=github 或未迁移成功的附挂 bot 都覆盖；迁移成功清 token 后自然不跑。
-    if bot.is_github_capable() {
-        let bot = bot.clone();
-        let bridge = bridge.clone();
-        let key = key.clone();
-        let stop = stop.clone();
-        // #69：长驻，登记 spawn_forever。
-        let name: &'static str = Box::leak(format!("gh-watch:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn_forever(name, async move {
-            crate::log!("[bot:{key}] GitHub watch 任务启动");
-            github_watch_loop(bot, bridge, &stop).await;
-            crate::log!("[bot:{key}] GitHub watch 任务退出");
-        });
-    }
-
     // 事件循环：按通道分派
-    if bot.is_github_kind() {
-        // #64：GitHub 不是 IM 通道——无事件循环，挂起等关停；watch 循环照跑。
-        crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
-        crate::log!("[bot:{key}] GitHub 渠道启动（无 IM 事件循环，仅 watch）");
-        loop {
-            if stop.is_cancelled() {
-                break;
-            }
-            stop.cancelled().await;
-        }
-        crate::botstatus::clear(&key);
-        crate::log!("[bot:{key}] GitHub 循环退出");
-    } else if bot.is_dingtalk() {
+    if bot.is_dingtalk() {
         crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop)
             .await;
         crate::botstatus::clear(&key);
@@ -432,207 +383,6 @@ async fn weixin_loop(
     }
     crate::botstatus::clear(&key);
 }
-
-/// 一轮评论批处理结果：游标推进 + 自动处理触发点。
-pub(crate) struct CommentBatch {
-    /// 成功处理（含无提及/无映射项）的评论 id → 进 seen。
-    pub seen_extra: Vec<u64>,
-    /// 私信发送失败的 (评论 id, updated_at) → 游标回退重试（id 供失败计数，上限放弃）。
-    pub failed: Vec<(u64, String)>,
-    /// #64 批次 B：触发自动处理的评论（携带正文/仓库/触发形态，供 worker 分派）。
-    pub triggers: Vec<GhTrigger>,
-    /// 本轮最新评论 updated_at；**None = 空批 → 调用方必须保持原游标**
-    /// （写空串会把游标清掉，下一轮走静默基线 → 窗口内评论永久丢失，评审 C1）。
-    pub new_since: Option<String>,
-}
-
-/// #64 批次 B：一条触发自动处理的评论（collaborator + @bot 护栏已过）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct GhTrigger {
-    pub number: u64,
-    pub comment_id: u64,
-    pub body: String,
-    pub repo: String,
-    /// true = @bot 全局触发；false = worker 关键词触发（本字段目前恒 true，预留语义）
-    pub bot_triggered: bool,
-}
-
-/// 处理一批新评论（逻辑集中、可注入 api/msgr，可测）：@提及 私信 + @bot 触发判定。
-/// - 私信侧：排除 bot 自身 login 与评论作者自提及（GitHub 自身也抑制自通知）；作者无
-///   其他过滤——bot 自己的回复常引用 @login，被引用者需要知道；私信不产生 GitHub
-///   活动，无回环；无映射项 → 静默跳过（映射是 opt-in 门，不群发骚扰）；
-/// - 触发侧（护栏 b）：作者 ≠ bot + 词位 @bot 才判定；issue 与 PR 评论均触发（2.3 起）；
-///   is_collaborator（护栏 a）：true → triggers；false → 日志跳过；Err → failed 重试；
-/// - 私信失败/协作者校验失败 → 该评论进 failed（游标回退，下轮重试）。
-#[allow(clippy::too_many_arguments)] // 注入面全（api/msgr/评论/seen/映射/身份），与 MockAgentRunner::run 同款
-pub(crate) async fn process_comment_batch(
-    api: &dyn crate::github::GithubApi,
-    msgr: &dyn crate::messenger::Messenger,
-    comments: &[crate::github::GhComment],
-    seen: &[u64],
-    mention_map: &[(String, String)],
-    bot_login: &str,
-    repo: &str,
-    owner: &str,
-    notify_chat: &str,
-    workers: &[crate::config::GhWorker],
-) -> CommentBatch {
-    let mut out = CommentBatch {
-        seen_extra: Vec::new(),
-        failed: Vec::new(),
-        triggers: Vec::new(),
-        // 游标取全批 updated_at 最大值（评审 L1）：排序键（sort=created）与游标键
-        // （updated_at）不一致时，被编辑的老评论（created 早、updated 新）不会让
-        // 末位小于它 → 每轮重取。max 对排序不敏感，更稳。
-        new_since: comments.iter().map(|c| c.updated_at.clone()).max(),
-    };
-    for c in comments {
-        if seen.contains(&c.id) {
-            // 已 seen 的评论被编辑后新增 @提及 不会通知（评审 L4）：编辑事件由 GitHub
-            // 触发二次通知，这里以「评论 id 已处理」为准跳过——有取舍，注释声明。
-            continue;
-        }
-        let mut ok = true;
-        // 1) @提及 私信：映射内 login 才发；评论 → issue/PR 号取自评论自身 html_url
-        let mentions = crate::github::extract_mentions(&c.body, bot_login)
-            .into_iter()
-            .filter(|l| !l.eq_ignore_ascii_case(&c.user.login)) // 自提及不通知（同 GitHub）
-            .collect::<Vec<_>>();
-        for login in mentions {
-            if let Some((_, chat)) = mention_map
-                .iter()
-                .find(|(l, _)| l.eq_ignore_ascii_case(&login))
-            {
-                if let Some((number, _)) = crate::github::comment_issue_ref(c) {
-                    if let Err(e) = msgr
-                        .send_text(chat, &crate::github::mention_notify_text(repo, number, c))
-                        .await
-                    {
-                        crate::log!("[github] ⚠️ 提及私信失败 {repo} 目标={chat}: {e:#}");
-                        ok = false;
-                    }
-                }
-            }
-        }
-        // 2) @bot 自动处理触发（护栏 b：作者回声 + 词位已由 should_auto_process 把关）。
-        //    仅配置提及映射（不配通知群）时：合成 Ev 的 chat_id 会为空 → handle 直接丢弃，
-        //    触发将永久丢失且无痕迹（评审 I1）——此时不收集触发，日志说明。
-        // #64 批次 B：@bot 触发 或 关键词 worker 命中（均要求 collaborator 护栏与
-        // notify_chat 非空；关键词 worker 无需 @bot）。**作者回声过滤统一前置**——
-        // bot 自己的分析回复若含触发词，下一轮会自我触发无限循环烧配额。
-        if c.user.login == bot_login {
-            continue;
-        }
-        let kw_hit = !crate::github::match_workers(workers, repo, &c.body, false).is_empty();
-        if !notify_chat.is_empty()
-            && (crate::github::should_auto_process(&c.body, &c.user.login, bot_login) || kw_hit)
-        {
-            match crate::github::comment_issue_ref(c) {
-                // 批次 2.3：PR 评论同样触发（合成 text 仍用 issues 形态——parse_github_cmd
-                // 要求，PR 也是 issue，fetch/post 同一套端点）
-                Some((number, _is_pr)) => {
-                    match api.is_collaborator(owner, repo, &c.user.login).await {
-                        Ok(Some(true)) => out.triggers.push(GhTrigger {
-                        number,
-                        comment_id: c.id,
-                        body: c.body.clone(),
-                        repo: repo.to_string(),
-                        bot_triggered: crate::github::should_auto_process(&c.body, &c.user.login, bot_login),
-                    }),
-                        Ok(Some(false)) => crate::log!(
-                            "[github] 跳过 @bot 触发（{repo} 非协作者 @{}）",
-                            c.user.login
-                        ),
-                        // 权限不足（token 缺 Administration: Read）：永久性，跳过不重试
-                        Ok(None) => crate::log!(
-                            "[github] ⚠️ 协作者检查权限不足（token 需 Administration: Read），跳过 {repo} @{} 触发",
-                            c.user.login
-                        ),
-                        Err(e) => {
-                            crate::log!(
-                                "[github] ⚠️ 协作者校验失败 {repo} @{}: {e:#}",
-                                c.user.login
-                            );
-                            ok = false;
-                        }
-                    }
-                }
-                None => { /* 评论 URL 解析失败 → 不触发 */ }
-            }
-        }
-        if ok {
-            out.seen_extra.push(c.id);
-        } else {
-            out.failed.push((c.id, c.updated_at.clone()));
-        }
-    }
-    out
-}
-
-/// 构造 @bot 自动处理的合成事件（复用 handle() 的指令门全套机制）：
-/// - mid "gh:{repo}:{issue}:{comment_id}"：天然唯一（去重 + pending 键）；
-/// - chat_id = 通知群、chat_type = "group"：不触发 save_primary_chat；
-/// - thread_id 留空：send_reply 走普通发送（非空会进 send_thread_reply 到假话题，必须空）；
-/// - text = "分析 <链接>"：命中既有门 → 白名单 → 拉取注入 → agent → 双写，零新机制。
-///
-/// repo/number 由评论自身 html_url 推导（调用方传入），评论者无法重定向分析目标。
-pub(crate) fn auto_ev(
-    repo: &str,
-    number: u64,
-    comment_id: u64,
-    notify_chat: &str,
-) -> crate::bridge::Ev {
-    crate::bridge::Ev {
-        mid: format!("gh:{repo}:{number}:{comment_id}"),
-        chat_id: notify_chat.to_string(),
-        chat_type: "group".into(),
-        thread_id: String::new(),
-        quoted: Default::default(),
-        text: format!("分析 https://github.com/{repo}/issues/{number}"),
-        attachments: Vec::new(),
-        // GitHub 协作者触发 ≠ IM owner 白名单成员 → 安全默认 Granted（受限会话）；
-        // 分析类操作的 issue 上下文已注入 prompt，不需要工作区外能力。
-        role: crate::config::SenderRole::Granted,
-        backend_override: None,
-        gh_role: None,
-    }
-}
-
-/// #64 批次 B：worker 触发的合成 Ev——thread_id 复用为 worker 会话隔离键
-/// （ghw:{repo}:{idx}：sessions/历史/锁自动隔离）；backend_override 覆盖 bot 默认；
-/// 角色名注入 prompt 前缀与双写署名。
-pub(crate) fn worker_ev(
-    repo: &str,
-    number: u64,
-    comment_id: u64,
-    notify_chat: &str,
-    idx: usize,
-    worker: &crate::config::GhWorker,
-) -> crate::bridge::Ev {
-    let role = worker.role.trim();
-    let role_prefix = if role.is_empty() {
-        String::new()
-    } else {
-        format!("[角色：{role}] 你以「{role}」的身份处理该问题。\n\n")
-    };
-    crate::bridge::Ev {
-        mid: format!("gh:{repo}:{number}:{comment_id}:w{idx}"),
-        chat_id: notify_chat.to_string(),
-        chat_type: "group".into(),
-        thread_id: format!("ghw:{repo}:{idx}"),
-        quoted: Default::default(),
-        text: format!("{role_prefix}分析 https://github.com/{repo}/issues/{number}"),
-        attachments: Vec::new(),
-        role: crate::config::SenderRole::Granted,
-        backend_override: Some(worker.backend.clone()),
-        gh_role: (!role.is_empty()).then(|| role.to_string()),
-    }
-}
-
-/// 评论私信失败重试上限（评审 M2）：超过即放弃该评论（进 seen + 告警），
-/// 防永久失败目标（chat_id 填错/用户退群）无限重试 + 已成功目标重复私信。
-const GH_RETRY_MAX: u32 = 5;
-
 /// 睡眠 dur，但可被关停令牌打断。返回 true=收到关停广播（调用方应 break）。
 async fn interruptible_sleep(
     dur: std::time::Duration,
@@ -642,234 +392,6 @@ async fn interruptible_sleep(
         _ = tokio::time::sleep(dur) => false,
         _ = stop.cancelled() => true,
     }
-}
-
-/// GitHub watch 循环（附挂能力，Phase 1）：每 60s 增量轮询白名单仓库的 open issues，
-/// 新 issue → 发「🔔 新 issue …」到 gh_notify_chat；自己（gh_username）发的不回显。
-/// 游标落盘 workspaces/<bot>/github_cursor.json（原子写）：崩溃/重启后增量续跑不重发。
-/// 状态上报只写「重连中」迁移（连续 3 轮失败）——botstatus 槽位归 IM 事件循环，
-/// watch 循环不报在线（无条件写在线会覆盖 IM 的重连中迁移）；退出不清 botstatus。
-async fn github_watch_loop(
-    bot: crate::config::BotConfig,
-    bridge: Arc<Bridge>,
-    stop: &tokio_util::sync::CancellationToken,
-) {
-    let key = bot.key();
-    let repos = bot.gh_repo_list();
-    let notify_chat = bot.gh_notify_chat.clone();
-    let echo = bot.gh_username.clone();
-    let mention_map = bot.gh_mention_map_list();
-    crate::log!(
-        "[bot:{key}] GitHub watch 循环启动 repos={} 通知={} 提及映射={}",
-        repos.len(),
-        if notify_chat.is_empty() {
-            "（未配置通知群）"
-        } else {
-            "已配置"
-        },
-        mention_map.len()
-    );
-    let mut cursor = crate::github::GhCursor::load(&key);
-    let mut consec_errs = 0u32;
-    loop {
-        if interruptible_sleep(std::time::Duration::from_secs(60), stop).await {
-            break;
-        }
-        // 通知目标与提及映射都空 → 轮询无意义；两者任一配置即跑（评审 I1：
-        // 只配 gh_mention_map 的「仅私信不群发」配置不该被 notify_chat 拦截）。
-        if notify_chat.is_empty() && mention_map.is_empty() {
-            // #64：github kind 的空配 bot 也要心跳续命（否则 180s 后托盘消失）
-            if bot.is_github_kind() {
-                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
-            }
-            continue;
-        }
-        // 静默基线用当前时刻（评审 L2）：since 为空不调 API，游标直接置 now——
-        // 否则 >100 条存量时游标落在列表中间，下一轮把中段存量误当新条目。
-        let now_rfc = crate::chrono_lite::rfc3339_now();
-        let mut sweep_failed = false;
-        for (owner, name) in crate::github::watch_entries(&repos) {
-            let repo = format!("{owner}/{name}");
-            let cur = cursor.repo_cursor(&repo);
-            // ── issue 侧：新 issue 通知（Phase 1）──
-            if cur.since.is_empty() {
-                cursor.update(&repo, &now_rfc, Vec::new()); // 静默基线
-            } else {
-                match bridge
-                    .github_client
-                    .list_issues_since(&owner, &name, &cur.since)
-                    .await
-                {
-                    Ok(issues) => {
-                        let (fresh, new_since) =
-                            crate::github::new_issues(&issues, &cur.since, &cur.seen, &echo);
-                        let mut seen_extra = Vec::new();
-                        let mut failed: Vec<&crate::github::GhIssue> = Vec::new();
-                        if notify_chat.is_empty() {
-                            // 仅映射配置（评审 I1/M1）：issue 通知无目标 → 静默模式——
-                            // fresh 全进 seen、游标正常推进。空 chat_id 发送必失败，
-                            // 若走失败回退会让游标永久卡死（每轮重试刷屏 + 新 issue 雪球）。
-                            seen_extra.extend(fresh.iter().map(|i| i.id));
-                        } else {
-                            // 通知失败不推进游标到该 issue 之后：retry_at 记下**所有**失败
-                            // issue 的 created_at 最小值（逐个覆盖取最后失败者会丢 created
-                            // 更早者，见 github::retry_since），下一轮以它为 since 重新浮现
-                            // （已通知的都在 seen 里，不会重复）。
-                            for iss in &fresh {
-                                let text = crate::github::notify_text(&repo, iss);
-                                match bridge.msgr.send_text(&notify_chat, &text).await {
-                                    Ok(()) => {
-                                        seen_extra.push(iss.id);
-                                        crate::log!(
-                                            "[bot:{key}] 新 issue 已通知 #{}({})",
-                                            iss.number,
-                                            repo
-                                        );
-                                    }
-                                    Err(e) => {
-                                        failed.push(iss);
-                                        crate::log!(
-                                            "[bot:{key}] ⚠️ 新 issue 通知失败 repo={repo}: {e:#}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        let effective_since = crate::github::retry_since(&failed)
-                            .unwrap_or_else(|| new_since.clone());
-                        cursor.update(&repo, &effective_since, seen_extra);
-                    }
-                    Err(e) => {
-                        sweep_failed = true;
-                        crate::log!("[bot:{key}] ⚠️ 拉取 {repo} issues 失败: {e:#}");
-                    }
-                }
-            }
-            // ── 评论侧：@提及 私信（Phase 2 批次 2.1；@bot 触发在 2.2）──
-            if cur.comment_since.is_empty() {
-                cursor.comment_update(&repo, &now_rfc, Vec::new()); // 静默基线（存量评论不私信）
-            } else {
-                match bridge
-                    .github_client
-                    .list_comments_since(&owner, &name, &cur.comment_since)
-                    .await
-                {
-                    Ok(comments) => {
-                        let batch = crate::service::process_comment_batch(
-                            bridge.github_client.as_ref(),
-                            bridge.msgr.as_ref(),
-                            &comments,
-                            &cur.comment_seen,
-                            &mention_map,
-                            &echo,
-                            &repo,
-                            &owner,
-                            &notify_chat,
-                            &bot.gh_workers,
-                        )
-                        .await;
-                        // 私信失败 → 游标回退到最早失败评论（同 retry_since 语义，下轮重试）。
-                        // 边界假设：GitHub issues/comments 的 since 文档为 **"at or after"**（含
-                        // 边界）——失败评论若 updated_at == since 会自然重浮、重试可靠；按悲观
-                        // 方向（严格大于）声明，行为安全；Phase 1 issue 侧同款假设，注释对齐
-                        // 文档措辞（评审 M3 备注 3）。
-                        // 失败重试上限（评审 M2）：per-comment 失败计数 ≥ GH_RETRY_MAX 放弃
-                        // （进 seen + 告警），消解「永久失败目标无限重试 + 已成功目标每轮
-                        // 重复私信」的放大器（at-least-once 有界化）。
-                        // 空批（new_since=None）→ 保持原游标，绝不能写空串清掉（评审 C1）。
-                        let mut rewind: Option<String> = None;
-                        let mut final_seen = batch.seen_extra.clone();
-                        for (cid, updated_at) in &batch.failed {
-                            let n = cursor.comment_fails.get(cid).copied().unwrap_or(0) + 1;
-                            if n >= GH_RETRY_MAX {
-                                crate::log!(
-                                    "[bot:{key}] ⚠️ 评论 {repo}#{cid} 私信连续失败 {n} 次，放弃重试（目标可能已失效）"
-                                );
-                                cursor.comment_fails.remove(cid);
-                                final_seen.push(*cid);
-                            } else {
-                                cursor.comment_fails.insert(*cid, n);
-                                rewind = Some(match rewind {
-                                    Some(r) => r.min(updated_at.clone()),
-                                    None => updated_at.clone(),
-                                });
-                            }
-                        }
-                        // 成功处理（含放弃）清除失败计数
-                        for id in &final_seen {
-                            cursor.comment_fails.remove(id);
-                        }
-                        let effective = rewind.or(batch.new_since);
-                        if let Some(e) = effective {
-                            cursor.comment_update(&repo, &e, final_seen);
-                        }
-                        // @bot 自动处理：合成 Ev 走既有指令门（白名单→拉取→agent→双写）。
-                        // 群 key 串行：与群消息共用通知群锁，长任务与手动「分析」同语义。
-                        // 崩溃窗口（已接受）：seen_extra 在上方先落盘、spawn 在下方——两者
-                        // 之间崩溃则触发丢失（评论已 seen、不重试，at-most-once）；
-                        // 反向窗口（spawn 后崩溃）由 pending 重放兜底（at-least-once 双发）。
-                        for t in batch.triggers {
-                            // #64 批次 B：worker 分派——默认 worker（triggers 空）响应
-                            // @bot 触发；关键词 worker 按评论内容命中；每个命中 worker
-                            // 独立会话/独立后端/独立双写（署名角色）。
-                            let hits = crate::github::match_workers(
-                                &bot.gh_workers,
-                                &t.repo,
-                                &t.body,
-                                t.bot_triggered,
-                            );
-                            if hits.is_empty() {
-                                if bot.gh_workers.is_empty() && t.bot_triggered {
-                                    // 兼容：无 worker 表（未迁移旧配置）→ 原单触发行为
-                                    let bridge = bridge.clone();
-                                    let ev = auto_ev(&repo, t.number, t.comment_id, &notify_chat);
-                                    // #69 审计：短/中命、有 owner（bridge + pending 恢复），
-                                    // 不登记（见 tasks.rs 登记口径）。
-                                    tokio::spawn(async move {
-                                        bridge.handle(ev).await;
-                                    });
-                                }
-                                continue;
-                            }
-                            for (idx, w) in hits {
-                                let bridge = bridge.clone();
-                                let ev =
-                                    worker_ev(&repo, t.number, t.comment_id, &notify_chat, idx, w);
-                                // #69 审计：同上——worker 分析是独立 agent 运行，不登记。
-                                tokio::spawn(async move {
-                                    bridge.handle(ev).await;
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        sweep_failed = true;
-                        crate::log!("[bot:{key}] ⚠️ 拉取 {repo} 评论失败: {e:#}");
-                    }
-                }
-            }
-        }
-        cursor.save(&key); // 每轮原子落盘（60s 一次小写盘，崩溃至多丢一个窗口）
-                           // 状态上报：**不报在线**——botstatus 槽位归 IM 事件循环（它每 10s 上报一次在线），
-                           // watch 循环无条件写在线会覆盖 IM 的「重连中」迁移（上次写者赢）。这里只在
-                           // GitHub 侧连续 3 轮失败时标「重连中」（失败迁移也只会被 IM 循环的在线覆盖，
-                           // 而 IM 在线是真实的——GitHub 故障期间 IM 正常时槽位显示在线属可接受偏差）。
-        if sweep_failed {
-            consec_errs += 1;
-            if consec_errs == 3 {
-                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "重连中");
-            }
-        } else {
-            consec_errs = 0;
-            // #64：kind=github 无 IM 事件循环，watch 成功轮就是它的「在线」心跳
-            // （≤60s < 180s 僵尸阈值）；IM 附挂 bot 不报在线（槽位归 IM 循环）。
-            if bot.is_github_kind() {
-                crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
-            }
-        }
-    }
-    // 注意：这里不清 botstatus——槽位归 IM 事件循环（weixin_loop 退出时 clear），
-    // github 是附挂能力，退场不该把 IM 的状态一起抹掉。
 }
 
 /// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
