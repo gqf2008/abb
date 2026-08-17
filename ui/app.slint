@@ -459,7 +459,7 @@ export component SettingsWindow inherits Window {
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
     callback set-restrict-granted(int, bool); // 授权者 agent 隔离开关（true=受限模式，保存后即时生效）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
-    callback open-install-docs(string); // 缺失依赖时打开官方安装文档（url）
+    callback open-url(string); // 打开外部链接（依赖文档 / 申请 token 等，默认浏览器）
     callback recheck-deps();            // 重新检测依赖是否已装
     callback install-dep(string);       // 安装某个依赖（claude/codex/pi/node/python3/lark-cli/dingtalk-cli）
     callback install-all-missing();     // #60 一键安装全部缺失组件（node 前置自动装）
@@ -1173,6 +1173,21 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "gh_token", self.text); }
                                                     }
+                                                    Button {
+                                                        text: "申请 token";
+                                                        clicked => { root.open-url("https://github.com/settings/tokens/new"); }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
+                                                    Text { text: ""; width: 80px; vertical-alignment: center; }
+                                                    Text {
+                                                        text: "权限需含 Issues 读写（经典 PAT 勾选 repo；fine-grained 勾 Issues: Read and write）。token 属谁，用户名就填谁的 login。";
+                                                        font-size: 11px;
+                                                        color: #888;
+                                                        wrap: word-wrap;
+                                                        horizontal-stretch: 1;
+                                                        vertical-alignment: center;
+                                                    }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "github": Row {
                                                     Text { text: "仓库白名单"; width: 80px; vertical-alignment: center; }
@@ -1360,7 +1375,7 @@ export component SettingsWindow inherits Window {
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("claude"); }
                                             }
-                                            if !root.claude-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://docs.claude.com/en/docs/claude-code/setup"); } }
+                                            if !root.claude-installed: Button { text: "文档"; clicked => { root.open-url("https://docs.claude.com/en/docs/claude-code/setup"); } }
                                         }
                                         if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // codex
@@ -1375,7 +1390,7 @@ export component SettingsWindow inherits Window {
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("codex"); }
                                             }
-                                            if !root.codex-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://github.com/openai/codex"); } }
+                                            if !root.codex-installed: Button { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
                                         }
                                         if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // pi
@@ -1390,7 +1405,7 @@ export component SettingsWindow inherits Window {
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("pi"); }
                                             }
-                                            if !root.pi-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://pi.dev"); } }
+                                            if !root.pi-installed: Button { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
                                         }
                                         if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // prime-agent
@@ -1405,7 +1420,7 @@ export component SettingsWindow inherits Window {
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("prime-agent"); }
                                             }
-                                            if !root.prime-agent-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://github.com/PrimeIntellect-ai/prime-agent"); } }
+                                            if !root.prime-agent-installed: Button { text: "文档"; clicked => { root.open-url("https://github.com/PrimeIntellect-ai/prime-agent"); } }
                                         }
                                         if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                         // nodejs
@@ -1462,7 +1477,7 @@ export component SettingsWindow inherits Window {
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("dingtalk-cli"); }
                                             }
-                                            if !root.dingtalk-installed: Button { text: "文档"; clicked => { root.open-install-docs("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
+                                            if !root.dingtalk-installed: Button { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
                                         }
                                         if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
                                     }

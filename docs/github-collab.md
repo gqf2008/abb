@@ -84,3 +84,12 @@ GitHub 是与飞书/微信/钉钉**同级的渠道**：bot 列表可添加 kind=
 - 处理永远由人触发（Phase 1）；机器不自动回复 issue
 - 破坏性操作（关闭）两步确认；仓库白名单单一关卡，写操作无一绕过
 - 讨论、状态、留档单面；IM 不承载记录
+
+## Token 配置（设置窗 GitHub 区）
+
+- 申请入口：设置窗「GitHub Token」行有「申请 token」按钮（https://github.com/settings/tokens/new）
+- 权限要求：Issues 读写（桥只读写 issue/PR 的标题/状态/评论）——经典 PAT 勾选 `repo`；
+  fine-grained PAT 勾「Issues: Read and write」（含评论）
+- token 与用户名必须同属一个账号：token 是 API 鉴权凭证，gh_username 是回声过滤/
+  @ 提及匹配/多账号路由的身份键——两者不一致会让 bot 自回复自己或漏响应
+- 安全建议：bot 专用 token（不与人共用），可配合仓库白名单把写操作限定在目标仓库
