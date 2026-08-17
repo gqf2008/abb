@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelButton, PixelScrollPanel, PixelTheme } from "@slint_pixel";
+import { PixelButton, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelTextInput, PixelTheme } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -122,7 +122,7 @@ export component QrDialog inherits Window {
     height: 440px;
     preferred-width: 360px;
     preferred-height: 440px;
-    background: Palette.background;
+    background: PixelTheme.bg;
     in-out property <image> qr-image;
     in-out property <string> tip: "请用微信扫描二维码";
     callback close-clicked();
@@ -131,7 +131,7 @@ export component QrDialog inherits Window {
     Rectangle {
         width: 100%;
         height: 100%;
-        background: Palette.background;
+        background: PixelTheme.bg;
         VerticalBox {
             padding-top: 16px; padding-right: 16px; padding-bottom: 16px; padding-left: 16px;
             spacing: 12px;
@@ -151,7 +151,7 @@ export component QrDialog inherits Window {
         Text { text: "扫不上就点「取消」重新获取"; font-size: 11px; color: #888; horizontal-alignment: center; }
         HorizontalBox {
             alignment: center;
-            Button { text: "取消"; clicked => { root.close-clicked(); } }
+            PixelButton { text: "取消"; clicked => { root.close-clicked(); } }
             }
         }
     }
@@ -165,7 +165,7 @@ export component QrDialog inherits Window {
 // 单色 SVG 图标：颜色随 Palette 着色（colorize），避免 Unicode 字符在字体里缺字形渲染成方框。
 component ImageIcon inherits Image {
     in property <image> icon;
-    in property <brush> tint: Palette.foreground.with-alpha(0.7);
+    in property <brush> tint: PixelTheme.text.with-alpha(0.7);
     source: root.icon;
     colorize: root.tint;
     width: 18px;
@@ -181,7 +181,7 @@ component NavItem inherits Rectangle {
     callback clicked();
     height: 38px;
     border-radius: 8px;
-    background: root.selected ? Palette.accent-background.with-alpha(0.12) : transparent;
+    background: root.selected ? PixelTheme.accent.with-alpha(0.12) : transparent;
     TouchArea {
         clicked => { root.clicked(); }
         HorizontalBox {
@@ -190,13 +190,13 @@ component NavItem inherits Rectangle {
             alignment: start;
             ImageIcon {
                 icon: root.icon;
-                tint: root.selected ? Palette.accent-background : Palette.foreground.with-alpha(0.65);
+                tint: root.selected ? PixelTheme.accent : PixelTheme.text.with-alpha(0.65);
             }
             Text {
                 text: root.label;
                 font-size: 13px;
                 font-weight: root.selected ? 600 : 400;
-                color: root.selected ? Palette.accent-background : Palette.foreground;
+                color: root.selected ? PixelTheme.accent : PixelTheme.text;
                 vertical-alignment: center;
             }
         }
@@ -234,7 +234,7 @@ component ProblemRow inherits HorizontalBox {
     Text {
         text: root.text;
         font-size: 12.5px;
-        color: Palette.foreground;
+        color: PixelTheme.text;
         vertical-alignment: center;
         horizontal-stretch: 1;
     }
@@ -269,16 +269,16 @@ component QuickCard inherits Rectangle {
     height: 122px;
     horizontal-stretch: 1;
     border-radius: 12px;
-    background: Palette.background;
+    background: PixelTheme.bg;
     TouchArea {
         clicked => { root.clicked(); }
         VerticalBox {
             padding: 14px;
             spacing: 6px;
-            ImageIcon { icon: root.icon; tint: Palette.accent-background; }
-            Text { text: root.title; font-size: 13px; font-weight: 600; color: Palette.foreground; }
-            Text { text: root.desc; font-size: 11px; color: Palette.foreground.with-alpha(0.55); wrap: word-wrap; }
-            Text { text: root.action-label; font-size: 11px; font-weight: 600; color: Palette.accent-background; }
+            ImageIcon { icon: root.icon; tint: PixelTheme.accent; }
+            Text { text: root.title; font-size: 13px; font-weight: 600; color: PixelTheme.text; }
+            Text { text: root.desc; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
+            Text { text: root.action-label; font-size: 11px; font-weight: 600; color: PixelTheme.accent; }
         }
     }
 }
@@ -291,7 +291,7 @@ export component UnsavedDialog inherits Window {
     height: 200px;
     preferred-width: 460px;
     preferred-height: 200px;
-    background: Palette.background;
+    background: PixelTheme.bg;
     in-out property <string> title-text: "未保存的修改";
     in-out property <string> message: "保存会写入配置，服务在跑时会重启使其生效。";
     in-out property <string> primary-text: "保存并关闭";
@@ -306,7 +306,7 @@ export component UnsavedDialog inherits Window {
     Rectangle {
         width: 100%;
         height: 100%;
-        background: Palette.background;
+        background: PixelTheme.bg;
         VerticalBox {
             padding-top: 20px; padding-right: 20px; padding-bottom: 20px; padding-left: 20px;
             spacing: 10px;
@@ -314,13 +314,13 @@ export component UnsavedDialog inherits Window {
             text: root.title-text;
             font-size: 15px;
             font-weight: 700;
-            color: Palette.foreground;
+            color: PixelTheme.text;
             horizontal-alignment: center;
         }
         Text {
             text: root.message;
             font-size: 12.5px;
-            color: Palette.foreground.with-alpha(0.7);
+            color: PixelTheme.text.with-alpha(0.7);
             wrap: word-wrap;
             horizontal-alignment: center;
         }
@@ -328,9 +328,9 @@ export component UnsavedDialog inherits Window {
         HorizontalBox {
             alignment: center;
             spacing: 10px;
-            Button { text: root.discard-text; clicked => { root.discard-close(); } }
-            if root.show-stay: Button { text: root.stay-text; clicked => { root.stay(); } }
-            Button { text: root.primary-text; primary: true; clicked => { root.save-close(); } }
+            PixelButton { text: root.discard-text; clicked => { root.discard-close(); } }
+            if root.show-stay: PixelButton { text: root.stay-text; clicked => { root.stay(); } }
+            PixelButton { text: root.primary-text; variant: "primary"; clicked => { root.save-close(); } }
             }
         }
     }
@@ -347,7 +347,7 @@ export component SettingsWindow inherits Window {
     // 而设置窗初始 bots 为空、selected=-1 时内容高度算成 0 → 窗口塌成标题栏。
     width: 980px;
     height: 680px;
-    background: Palette.alternate-background;
+    background: PixelTheme.panel;
 
     in-out property <string> window-title: "ABB 设置";
     // 应用版本号（Rust 侧 env!("CARGO_PKG_VERSION") 注入；空 = 不显示）
@@ -488,7 +488,7 @@ export component SettingsWindow inherits Window {
     Rectangle {
         width: 100%;
         height: 100%;
-        background: Palette.alternate-background;
+        background: PixelTheme.panel;
 
         VerticalBox {
             // 关键：VerticalBox/HorizontalBox 自带 StyleMetrics.layout-padding（fluent=8px），
@@ -504,7 +504,7 @@ export component SettingsWindow inherits Window {
                 // 左导航栏（PCM 侧边栏）：白底 + 右侧分隔线，首页/机器人/环境/供应商。
                 Rectangle {
                     width: 160px;
-                    background: Palette.background;
+                    background: PixelTheme.bg;
                     // 内容铺满整窗（fullsize_content_view）：红绿灯浮在左栏左上角
                     // （x≈8-56, y≈8-22），顶部留 34px 让位，Logo 紧接其下。
                     VerticalBox {
@@ -522,7 +522,7 @@ export component SettingsWindow inherits Window {
                                 background: @linear-gradient(135deg, #0078d4, #00bcf2);
                                 Text { text: "A"; color: white; font-weight: 800; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                             }
-                            Text { text: "ABB"; font-size: 15px; font-weight: 700; color: Palette.foreground; vertical-alignment: center; }
+                            Text { text: "ABB"; font-size: 15px; font-weight: 700; color: PixelTheme.text; vertical-alignment: center; }
                         }
                         NavItem { label: "首页"; icon: @image-url("icons/home.svg"); selected: root.current-page == 0; clicked => { root.current-page = 0; } }
                         NavItem {
@@ -546,11 +546,11 @@ export component SettingsWindow inherits Window {
                         Rectangle { vertical-stretch: 1; }
                         VerticalBox {
                             spacing: 3px;
-                            Text { text: "菜单栏常驻 · 本地 AI 桥"; font-size: 11px; color: Palette.foreground.with-alpha(0.45); }
+                            Text { text: "菜单栏常驻 · 本地 AI 桥"; font-size: 11px; color: PixelTheme.text.with-alpha(0.45); }
                             if root.version != "": Text {
                                 text: "v" + root.version;
                                 font-size: 10px;
-                                color: Palette.foreground.with-alpha(0.35);
+                                color: PixelTheme.text.with-alpha(0.35);
                             }
                         }
                     }
@@ -574,8 +574,8 @@ export component SettingsWindow inherits Window {
                             spacing: 8px;
                             VerticalBox {
                                 horizontal-stretch: 1;
-                                Text { text: "首页"; font-size: 18px; font-weight: 700; color: Palette.foreground; }
-                                Text { text: "你的 AI 助理管家 — 一眼看清运行状态"; font-size: 12px; color: Palette.foreground.with-alpha(0.55); }
+                                Text { text: "首页"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
+                                Text { text: "你的 AI 助理管家 — 一眼看清运行状态"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                             }
                         }
 
@@ -583,7 +583,7 @@ export component SettingsWindow inherits Window {
                         Rectangle {
                             height: 132px;
                             border-radius: 14px;
-                            background: Palette.accent-background;
+                            background: PixelTheme.accent;
                             HorizontalBox {
                                 padding-top: 16px; padding-right: 24px; padding-bottom: 16px; padding-left: 24px;
                                 spacing: 16px;
@@ -596,22 +596,22 @@ export component SettingsWindow inherits Window {
                                             : "服务已停止";
                                         font-size: 19px;
                                         font-weight: 700;
-                                        color: Palette.accent-foreground;
+                                        color: PixelTheme.bg;
                                     }
                                     Text {
                                         text: root.service-running
                                             ? "飞书 / 微信 / 钉钉消息自动转给本地 Claude / Codex 处理"
                                             : "点右侧「启动服务」，或在托盘菜单点「启动」";
                                         font-size: 12.5px;
-                                        color: Palette.accent-foreground.with-alpha(0.75);
+                                        color: PixelTheme.bg.with-alpha(0.75);
                                         wrap: word-wrap;
                                     }
                                     // 状态点（Defender 式「一目了然」）：在线/离线一眼可见；用文字点而非胶囊，避免在 accent 底上发闷
                                     HorizontalBox {
                                         spacing: 12px;
-                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 11.5px; font-weight: 600; color: Palette.accent-foreground; vertical-alignment: center; }
-                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 11.5px; color: Palette.accent-foreground.with-alpha(0.85); vertical-alignment: center; }
-                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 11.5px; color: Palette.accent-foreground.with-alpha(0.85); vertical-alignment: center; }
+                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 11.5px; font-weight: 600; color: PixelTheme.bg; vertical-alignment: center; }
+                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 11.5px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
+                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 11.5px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
                                     }
                                 }
                                 VerticalBox {
@@ -642,10 +642,10 @@ export component SettingsWindow inherits Window {
                                         width: 140px;
                                         height: 32px;
                                         border-radius: 9px;
-                                        background: Palette.accent-foreground.with-alpha(0.15);
+                                        background: PixelTheme.bg.with-alpha(0.15);
                                         TouchArea {
                                             clicked => { root.open-logs(); }
-                                            Text { text: "打开日志"; color: Palette.accent-foreground; font-size: 12.5px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            Text { text: "打开日志"; color: PixelTheme.bg; font-size: 12.5px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         }
                                     }
                                 }
@@ -710,17 +710,17 @@ export component SettingsWindow inherits Window {
                                 height: 122px;
                                 horizontal-stretch: 1;
                                 border-radius: 12px;
-                                background: Palette.background;
+                                background: PixelTheme.bg;
                                 VerticalBox {
                                     padding: 14px;
                                     spacing: 6px;
-                                    ImageIcon { icon: @image-url("icons/switch.svg"); tint: Palette.accent-background; }
-                                    CheckBox {
+                                    ImageIcon { icon: @image-url("icons/switch.svg"); tint: PixelTheme.accent; }
+                                    PixelCheckBox {
                                         text: "跨会话投递";
                                         checked: root.cross-delivery-enabled;
                                         toggled => { root.set-cross-delivery(self.checked); }
                                     }
-                                    Text { text: "允许 agent 把结果投递到其它 bot 的会话"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); wrap: word-wrap; }
+                                    Text { text: "允许 agent 把结果投递到其它 bot 的会话"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
                                     Text { text: root.cross-delivery-enabled ? "已开启" : "已关闭"; font-size: 11px; font-weight: 600; color: #0a6fc2; }
                                 }
                             }
@@ -735,14 +735,14 @@ export component SettingsWindow inherits Window {
                         spacing: 10px;
 
                         VerticalBox {
-                            Text { text: "机器人配置"; font-size: 18px; font-weight: 700; color: Palette.foreground; }
-                            Text { text: "管理接入的飞书 / 微信 / 钉钉机器人"; font-size: 12px; color: Palette.foreground.with-alpha(0.55); }
+                            Text { text: "机器人配置"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
+                            Text { text: "管理接入的飞书 / 微信 / 钉钉机器人"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                         }
 
                         Rectangle {
                             vertical-stretch: 1;
                             border-radius: 12px;
-                            background: Palette.background;
+                            background: PixelTheme.bg;
                             HorizontalBox {
                                 spacing: 0;
                                 // ── 左：bot 列表 ──
@@ -751,13 +751,13 @@ export component SettingsWindow inherits Window {
                                     width: 190px;
                                     padding: 8px;
                                     Rectangle {
-                                        background: Palette.alternate-background;
+                                        background: PixelTheme.panel;
                                         border-radius: 10px;
                                         vertical-stretch: 1;
                                         ListView {
                                             for bot[idx] in root.bots: Rectangle {
                                                 height: 38px;
-                                                background: idx == root.selected ? Palette.selection-background : transparent;
+                                                background: idx == root.selected ? PixelTheme.hover : transparent;
                                                 border-radius: 8px;
                                                 TouchArea {
                                                     clicked => { root.selected = idx; root.selection-changed(idx); }
@@ -767,13 +767,13 @@ export component SettingsWindow inherits Window {
                                                         Text {
                                                             // 停用的 bot 前缀 ⚪ 并显灰，一眼可辨（启用的维持原色）
                                                             text: (bot.enabled ? "" : "⚪ ") + (bot.name == "" ? "(未命名)" : bot.name);
-                                                            color: idx == root.selected ? Palette.selection-foreground : (bot.enabled ? Palette.foreground : #aaa);
+                                                            color: idx == root.selected ? PixelTheme.text : (bot.enabled ? PixelTheme.text : #aaa);
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: bot.kind + (bot.enabled ? "" : " · 停用");
                                                             font-size: 11px;
-                                                            color: idx == root.selected ? Palette.selection-foreground.with-alpha(0.8) : #888;
+                                                            color: idx == root.selected ? PixelTheme.text.with-alpha(0.8) : #888;
                                                         }
                                                     }
                                                 }
@@ -782,8 +782,8 @@ export component SettingsWindow inherits Window {
                                     }
                                     HorizontalBox {
                                         spacing: 8px;
-                                        Button { text: "＋ 添加"; clicked => { root.add-bot(); } }
-                                        Button {
+                                        PixelButton { text: "＋ 添加"; clicked => { root.add-bot(); } }
+                                        PixelButton {
                                             text: "－ 删除";
                                             enabled: root.selected >= 0;
                                             clicked => { root.remove-bot(root.selected); }
@@ -795,7 +795,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 5px;
                                     horizontal-stretch: 1;
                                     padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
-                                    ScrollView {
+                                    PixelScrollPanel {
                                         vertical-stretch: 1;
                                         VerticalBox {
                                             width: 100%; // 钳制内容宽度=视口宽：禁止横向滚动，超宽行裁剪而不撑出滚动条
@@ -806,7 +806,7 @@ export component SettingsWindow inherits Window {
                                                 vertical-stretch: 0;
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Rectangle { width: 80px; }
-                                                    CheckBox {
+                                                    PixelCheckBox {
                                                         text: "启用此 bot";
                                                         checked: root.bots[root.selected].enabled;
                                                         toggled => { root.set-bot-enabled(root.selected, self.checked); }
@@ -814,20 +814,20 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "名称"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].name;
-                                                        placeholder-text: "如：庆小丰（隔离目录名）";
+                                                        placeholder: "如：庆小丰（隔离目录名）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "name", self.text); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "类型"; width: 80px; vertical-alignment: center; }
-                                                    ComboBox {
+                                                    PixelComboBox {
                                                         model: ["feishu", "wechat", "dingtalk"];
-                                                        current-value: root.bots[root.selected].kind;
+                                                        index: root.bots[root.selected].kind == "feishu" ? 0 : root.bots[root.selected].kind == "wechat" ? 1 : 2;
                                                         horizontal-stretch: 1;
-                                                        selected => { root.bot-field-edited(root.selected, "kind", self.current-value); }
+                                                        selected(idx) => { root.bot-field-edited(root.selected, "kind", self.model[idx]); }
                                                     }
                                                 }
                                                 // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot。
@@ -840,7 +840,7 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         spacing: 12px;
-                                                        for opt[i] in root.backend-options: CheckBox {
+                                                        for opt[i] in root.backend-options: PixelCheckBox {
                                                             text: opt.name;
                                                             checked: opt.checked;
                                                             horizontal-stretch: 1;
@@ -851,6 +851,8 @@ export component SettingsWindow inherits Window {
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "模型供应商"; width: 80px; vertical-alignment: center; }
+                                                    // 动态 model（provider-names）：PixelComboBox 无 value→index
+                                                    // 映射（slint 数组无 indexOf），保留 std 下拉（试点暂缓）
                                                     ComboBox {
                                                         model: root.provider-names;
                                                         current-value: root.bots[root.selected].provider;
@@ -868,7 +870,7 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         spacing: 12px;
-                                                        CheckBox {
+                                                        PixelCheckBox {
                                                             text: "授权者 agent 受限模式";
                                                             checked: root.bots[root.selected].restrict-granted;
                                                             horizontal-stretch: 1;
@@ -882,7 +884,7 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         spacing: 12px;
-                                                        for opt[i] in root.access-options: CheckBox {
+                                                        for opt[i] in root.access-options: PixelCheckBox {
                                                             text: opt.name;
                                                             checked: opt.checked;
                                                             horizontal-stretch: 1;
@@ -892,13 +894,13 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "Owner（管理员）"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].owner-open-id;
-                                                        placeholder-text: "ou_xxx（管理员 open_id，逗号分隔多个）";
+                                                        placeholder: "ou_xxx（管理员 open_id，逗号分隔多个）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "owner", self.text); }
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "生成管理员授权码";
                                                         enabled: !root.bots[root.selected].open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "owner"); }
@@ -920,7 +922,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "生成授权码";
                                                         enabled: !root.bots[root.selected].open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "granted"); }
@@ -934,7 +936,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "取消授权";
                                                         clicked => { root.remove-granted(root.selected, gi); }
                                                     }
@@ -948,7 +950,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "复制";
                                                         clicked => { root.copy-owner-code("owner"); }
                                                     }
@@ -962,7 +964,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "复制";
                                                         clicked => { root.copy-owner-code("granted"); }
                                                     }
@@ -977,19 +979,19 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "App ID"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].app-id;
-                                                        placeholder-text: "cli_xxxxxxxx";
+                                                        placeholder: "cli_xxxxxxxx";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "App Secret"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].app-secret;
-                                                        input-type: password;
-                                                        placeholder-text: "飞书应用密钥";
+                                                        input-type: "password";
+                                                        placeholder: "飞书应用密钥";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
                                                     }
@@ -998,8 +1000,8 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     HorizontalBox {
                                                         spacing: 8px;
-                                                        Text { text: "bot：" + root.bots[root.selected].bot-name + "  " + root.bots[root.selected].bot-open-id; font-size: 11px; color: Palette.foreground.with-alpha(0.6); vertical-alignment: center; wrap: word-wrap; }
-                                                        Button { text: "自动获取"; clicked => { root.fetch-bot-info(root.selected); } }
+                                                        Text { text: "bot：" + root.bots[root.selected].bot-name + "  " + root.bots[root.selected].bot-open-id; font-size: 11px; color: PixelTheme.text.with-alpha(0.6); vertical-alignment: center; wrap: word-wrap; }
+                                                        PixelButton { text: "自动获取"; clicked => { root.fetch-bot-info(root.selected); } }
                                                     }
                                                 }
                                                 // ── 微信字段（扫码登录，无需 app_id/secret）──
@@ -1016,33 +1018,33 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
                                                     Rectangle { width: 80px; }
-                                                    Button { text: "📱 扫码登录微信"; clicked => { root.wx-login(root.selected); } }
+                                                    PixelButton { text: "📱 扫码登录微信"; clicked => { root.wx-login(root.selected); } }
                                                 }
                                                 // ── 钉钉字段（企业内部应用机器人，Stream 模式长连接，无需公网地址）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "App Key"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].app-id;
-                                                        placeholder-text: "钉钉应用 AppKey（dingxxxx）";
+                                                        placeholder: "钉钉应用 AppKey（dingxxxx）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "App Secret"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].app-secret;
-                                                        input-type: password;
-                                                        placeholder-text: "钉钉应用 AppSecret";
+                                                        input-type: "password";
+                                                        placeholder: "钉钉应用 AppSecret";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "机器人编码"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].ding-robot-code;
-                                                        placeholder-text: "留空=默认 AppKey（个别后台单独展示才填）";
+                                                        placeholder: "留空=默认 AppKey（个别后台单独展示才填）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "ding_robot_code", self.text); }
                                                     }
@@ -1052,7 +1054,7 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         spacing: 12px;
-                                                        for opt[i] in root.ding-access-options: CheckBox {
+                                                        for opt[i] in root.ding-access-options: PixelCheckBox {
                                                             text: opt.name;
                                                             checked: opt.checked;
                                                             horizontal-stretch: 1;
@@ -1062,13 +1064,13 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "Owner（管理员）"; width: 80px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.bots[root.selected].ding-owner-ids;
-                                                        placeholder-text: "员工 staffId（管理员，逗号分隔多个）";
+                                                        placeholder: "员工 staffId（管理员，逗号分隔多个）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.bot-field-edited(root.selected, "ding_owner_ids", self.text); }
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "生成管理员授权码";
                                                         enabled: !root.bots[root.selected].ding-open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "owner"); }
@@ -1090,7 +1092,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "生成授权码";
                                                         enabled: !root.bots[root.selected].ding-open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "granted"); }
@@ -1104,7 +1106,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "取消授权";
                                                         clicked => { root.remove-granted(root.selected, gi); }
                                                     }
@@ -1118,7 +1120,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "复制";
                                                         clicked => { root.copy-owner-code("owner"); }
                                                     }
@@ -1132,7 +1134,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    Button {
+                                                    PixelButton {
                                                         text: "复制";
                                                         clicked => { root.copy-owner-code("granted"); }
                                                     }
@@ -1173,8 +1175,8 @@ export component SettingsWindow inherits Window {
                         spacing: 14px;
 
                         VerticalBox {
-                            Text { text: "环境配置"; font-size: 18px; font-weight: 700; color: Palette.foreground; }
-                            Text { text: "依赖检测与系统权限"; font-size: 12px; color: Palette.foreground.with-alpha(0.55); }
+                            Text { text: "环境配置"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
+                            Text { text: "依赖检测与系统权限"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                         }
 
                         PixelScrollPanel {
@@ -1210,13 +1212,13 @@ export component SettingsWindow inherits Window {
                                 Rectangle {
                                     vertical-stretch: 0;
                                     border-radius: 12px;
-                                    background: Palette.background;
+                                    background: PixelTheme.bg;
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
                                         spacing: 6px;
                                         HorizontalBox {
                                             spacing: 8px;
-                                            Text { text: "依赖（本机 agent 运行环境）"; font-weight: 700; color: Palette.foreground; vertical-alignment: center; }
+                                            Text { text: "依赖（本机 agent 运行环境）"; font-weight: 700; color: PixelTheme.text; vertical-alignment: center; }
                                             Rectangle { horizontal-stretch: 1; }
                                             // #60：标题行入口——横幅只在 agent 缺失时可见，
                                             // 只缺 node/lark 等也要有一键装入口
@@ -1263,7 +1265,7 @@ export component SettingsWindow inherits Window {
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "Claude Code"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "Claude Code"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.claude-installed ? "已安装" : "未安装"; ok: root.claude-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.claude-installed: PixelButton {
@@ -1273,12 +1275,12 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.claude-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://docs.claude.com/en/docs/claude-code/setup"); } }
                                         }
-                                        if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // codex
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "Codex CLI"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "Codex CLI"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.codex-installed ? "已安装" : "未安装"; ok: root.codex-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.codex-installed: PixelButton {
@@ -1288,12 +1290,12 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.codex-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
                                         }
-                                        if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // pi
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "Pi (pi-coding-agent)"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "Pi (pi-coding-agent)"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.pi-installed ? "已安装" : "未安装"; ok: root.pi-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.pi-installed: PixelButton {
@@ -1303,12 +1305,12 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.pi-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
                                         }
-                                        if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // prime-agent
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "prime-agent"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "prime-agent"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.prime-agent-installed ? "已安装" : "未安装"; ok: root.prime-agent-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.prime-agent-installed: PixelButton {
@@ -1318,12 +1320,12 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.prime-agent-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/PrimeIntellect-ai/prime-agent"); } }
                                         }
-                                        if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // nodejs
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "Node.js"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "Node.js"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.node-installed ? "已安装" : "未安装"; ok: root.node-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.node-installed: PixelButton {
@@ -1332,12 +1334,12 @@ export component SettingsWindow inherits Window {
                                                 clicked => { root.install-dep("node"); }
                                             }
                                         }
-                                        if !root.node-installed: Text { text: "brew install node"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.node-installed: Text { text: "brew install node"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // python3
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "Python 3"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "Python 3"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.python-installed ? "已安装" : "未安装"; ok: root.python-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.python-installed: PixelButton {
@@ -1346,12 +1348,12 @@ export component SettingsWindow inherits Window {
                                                 clicked => { root.install-dep("python3"); }
                                             }
                                         }
-                                        if !root.python-installed: Text { text: "brew install python"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.python-installed: Text { text: "brew install python"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // lark-cli
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "lark-cli"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "lark-cli"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.lark-installed ? "已安装" : "未安装"; ok: root.lark-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.lark-installed: PixelButton {
@@ -1360,12 +1362,12 @@ export component SettingsWindow inherits Window {
                                                 clicked => { root.install-dep("lark-cli"); }
                                             }
                                         }
-                                        if !root.lark-installed: Text { text: "npm install -g @larksuite/cli"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.lark-installed: Text { text: "npm install -g @larksuite/cli"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // dingtalk-cli
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "dingtalk-cli"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "dingtalk-cli"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.dingtalk-installed ? "已安装" : "未安装"; ok: root.dingtalk-installed; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if !root.dingtalk-installed: PixelButton {
@@ -1375,7 +1377,7 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.dingtalk-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
                                         }
-                                        if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                                        if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                     }
                                 }
 
@@ -1383,13 +1385,13 @@ export component SettingsWindow inherits Window {
                                 if root.perms-supported: Rectangle {
                                     vertical-stretch: 0;
                                     border-radius: 12px;
-                                    background: Palette.background;
+                                    background: PixelTheme.bg;
                                     VerticalBox {
                                         padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
                                         spacing: 6px;
                                         HorizontalBox {
                                             spacing: 8px;
-                                            Text { text: "系统权限"; font-weight: 700; color: Palette.foreground; vertical-alignment: center; }
+                                            Text { text: "系统权限"; font-weight: 700; color: PixelTheme.text; vertical-alignment: center; }
                                             Rectangle { horizontal-stretch: 1; }
                                             // 授权提示按钮只在 macOS 显示（Windows 走管理员重启）
                                             if root.platform == "macos": PixelButton { text: "📹 请求授权"; enabled: !root.perm-busy; clicked => { root.request-perms(); } }
@@ -1402,7 +1404,7 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "windows": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "管理员身份"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "管理员身份"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.perm-admin == 2 ? "已提权" : "未提权"; ok: root.perm-admin == 2; }
                                             Rectangle { horizontal-stretch: 1; }
                                             if root.perm-admin != 2: PixelButton { text: "以管理员重启"; clicked => { root.relaunch-as-admin(); } }
@@ -1415,7 +1417,7 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "完全磁盘访问"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "完全磁盘访问"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
                                                 text: root.perm-full-disk == 2 ? "已授权" : (root.perm-full-disk == 1 ? "被拒绝" : "未授权");
                                                 ok: root.perm-full-disk == 2;
@@ -1427,7 +1429,7 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "辅助功能"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "辅助功能"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
                                                 text: root.perm-accessibility == 2 ? "已授权" : (root.perm-accessibility == 1 ? "被拒绝" : "未授权");
                                                 ok: root.perm-accessibility == 2;
@@ -1439,7 +1441,7 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "屏幕录制"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "屏幕录制"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
                                                 text: root.perm-screen == 2 ? "已授权" : (root.perm-screen == 1 ? "被拒绝" : "未授权");
                                                 ok: root.perm-screen == 2;
@@ -1451,7 +1453,7 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "自动化"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "自动化"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
                                                 text: root.perm-automation == 2 ? "已授权" : (root.perm-automation == 1 ? "被拒绝" : "未授权");
                                                 ok: root.perm-automation == 2;
@@ -1463,7 +1465,7 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "摄像头"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "摄像头"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
                                                 text: root.perm-camera == 2 ? "已授权" : (root.perm-camera == 1 ? "被拒绝" : "未授权");
                                                 ok: root.perm-camera == 2;
@@ -1475,14 +1477,14 @@ export component SettingsWindow inherits Window {
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
-                                            Text { text: "麦克风"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: Palette.foreground; }
+                                            Text { text: "麦克风"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
                                                 text: root.perm-microphone == 2 ? "已授权" : (root.perm-microphone == 1 ? "被拒绝" : "未授权");
                                                 ok: root.perm-microphone == 2;
                                                 warn: root.perm-microphone == 1;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-microphone != 2: Button { text: "去授权"; clicked => { root.open-perm-settings("microphone"); } }
+                                            if root.perm-microphone != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("microphone"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos" && (root.perm-full-disk != 2 || root.perm-screen != 2 || root.perm-camera != 2 || root.perm-microphone != 2): Text {
                                             text: "💡 未授权项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。改完可能需要重启服务生效。";
@@ -1496,7 +1498,7 @@ export component SettingsWindow inherits Window {
                                                 text: "授权/改权限后，运行中的服务要重启才认：";
                                                 font-size: 11px; color: #888; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1;
                                             }
-                                            Button { text: "🔁 重启服务生效"; clicked => { root.restart-service-request(); } }
+                                            PixelButton { text: "🔁 重启服务生效"; clicked => { root.restart-service-request(); } }
                                         }
                                     }
                                 }
@@ -1525,14 +1527,14 @@ export component SettingsWindow inherits Window {
                         spacing: 14px;
 
                         VerticalBox {
-                            Text { text: "模型供应商"; font-size: 18px; font-weight: 700; color: Palette.foreground; }
-                            Text { text: "Claude / Codex 或任意 OpenAI 兼容供应商"; font-size: 12px; color: Palette.foreground.with-alpha(0.55); }
+                            Text { text: "模型供应商"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
+                            Text { text: "Claude / Codex 或任意 OpenAI 兼容供应商"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                         }
 
                         Rectangle {
                             vertical-stretch: 1;
                             border-radius: 12px;
-                            background: Palette.background;
+                            background: PixelTheme.bg;
                             HorizontalBox {
                                 spacing: 0;
                                 // ── 左：供应商列表 ──
@@ -1541,13 +1543,13 @@ export component SettingsWindow inherits Window {
                                     width: 210px;
                                     padding: 10px;
                                     Rectangle {
-                                        background: Palette.alternate-background;
+                                        background: PixelTheme.panel;
                                         border-radius: 10px;
                                         vertical-stretch: 1;
                                         ListView {
                                             for prov[idx] in root.providers: Rectangle {
                                                 height: 44px;
-                                                background: idx == root.provider-selected ? Palette.selection-background : transparent;
+                                                background: idx == root.provider-selected ? PixelTheme.hover : transparent;
                                                 border-radius: 8px;
                                                 TouchArea {
                                                     clicked => { root.provider-selected = idx; root.provider-selection-changed(idx); }
@@ -1556,13 +1558,13 @@ export component SettingsWindow inherits Window {
                                                         spacing: 2px;
                                                         Text {
                                                             text: prov.name == "" ? "(未命名)" : prov.name;
-                                                            color: idx == root.provider-selected ? Palette.selection-foreground : Palette.foreground;
+                                                            color: idx == root.provider-selected ? PixelTheme.text : PixelTheme.text;
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: prov.kind + (prov.is-default ? " · 默认" : "");
                                                             font-size: 11px;
-                                                            color: idx == root.provider-selected ? Palette.selection-foreground.with-alpha(0.8) : #888;
+                                                            color: idx == root.provider-selected ? PixelTheme.text.with-alpha(0.8) : #888;
                                                         }
                                                     }
                                                 }
@@ -1571,8 +1573,8 @@ export component SettingsWindow inherits Window {
                                     }
                                     HorizontalBox {
                                         spacing: 8px;
-                                        Button { text: "＋ 添加"; clicked => { root.add-provider(); } }
-                                        Button {
+                                        PixelButton { text: "＋ 添加"; clicked => { root.add-provider(); } }
+                                        PixelButton {
                                             text: "－ 删除";
                                             enabled: root.provider-selected >= 0;
                                             clicked => { root.remove-provider(root.provider-selected); }
@@ -1584,7 +1586,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 6px;
                                     horizontal-stretch: 1;
                                     padding-top: 12px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
-                                    ScrollView {
+                                    PixelScrollPanel {
                                         vertical-stretch: 1;
                                         VerticalBox {
                                             spacing: 10px;
@@ -1594,46 +1596,46 @@ export component SettingsWindow inherits Window {
                                                 vertical-stretch: 0;
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Text { text: "名称"; width: 96px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.providers[root.provider-selected].name;
-                                                        placeholder-text: "唯一键，如 my-claude";
+                                                        placeholder: "唯一键，如 my-claude";
                                                         horizontal-stretch: 1;
                                                         edited => { root.provider-field-edited(root.provider-selected, "name", self.text); }
                                                     }
                                                 }
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Text { text: "类型"; width: 96px; vertical-alignment: center; }
-                                                    ComboBox {
+                                                    PixelComboBox {
                                                         model: ["anthropic", "openai-chat", "openai-responses"];
-                                                        current-value: root.providers[root.provider-selected].kind;
+                                                        index: root.providers[root.provider-selected].kind == "anthropic" ? 0 : root.providers[root.provider-selected].kind == "openai-chat" ? 1 : 2;
                                                         horizontal-stretch: 1;
-                                                        selected => { root.provider-field-edited(root.provider-selected, "kind", self.current-value); }
+                                                        selected(idx) => { root.provider-field-edited(root.provider-selected, "kind", self.model[idx]); }
                                                     }
                                                 }
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Text { text: "Base URL"; width: 96px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.providers[root.provider-selected].base-url;
-                                                        placeholder-text: "如 https://api.anthropic.com 或 https://api.openai.com/v1";
+                                                        placeholder: "如 https://api.anthropic.com 或 https://api.openai.com/v1";
                                                         horizontal-stretch: 1;
                                                         edited => { root.provider-field-edited(root.provider-selected, "base_url", self.text); }
                                                     }
                                                 }
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Text { text: "API Key"; width: 96px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.providers[root.provider-selected].api-key;
-                                                        input-type: password;
-                                                        placeholder-text: "sk-...（留空=保留已存密钥）";
+                                                        input-type: "password";
+                                                        placeholder: "sk-...（留空=保留已存密钥）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.provider-field-edited(root.provider-selected, "api_key", self.text); }
                                                     }
                                                 }
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Text { text: "模型"; width: 96px; vertical-alignment: center; }
-                                                    LineEdit {
+                                                    PixelTextInput {
                                                         text: root.providers[root.provider-selected].model;
-                                                        placeholder-text: "如 claude-sonnet-4-5 / gpt-5（空=后端默认）";
+                                                        placeholder: "如 claude-sonnet-4-5 / gpt-5（空=后端默认）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.provider-field-edited(root.provider-selected, "model", self.text); }
                                                     }
@@ -1642,12 +1644,12 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 96px; }
                                                     HorizontalBox {
                                                         spacing: 8px;
-                                                        Button {
+                                                        PixelButton {
                                                             text: root.providers[root.provider-selected].is-default ? "★ 已是默认" : "设为默认";
                                                             enabled: !root.providers[root.provider-selected].is-default;
                                                             clicked => { root.set-default-provider(root.provider-selected); }
                                                         }
-                                                        Button { text: "测试连接"; clicked => { root.test-provider(root.provider-selected); } }
+                                                        PixelButton { text: "测试连接"; clicked => { root.test-provider(root.provider-selected); } }
                                                     }
                                                 }
                                             }
@@ -1671,7 +1673,7 @@ export component SettingsWindow inherits Window {
             // ── 底部共享：状态行 + 保存/取消（钉底；首页无表单，保存/取消只出现在配置页）──
             Rectangle {
                 height: 46px;
-                background: Palette.background;
+                background: PixelTheme.bg;
                 HorizontalBox {
                     padding-left: 22px;
                     padding-right: 22px;
@@ -1684,10 +1686,10 @@ export component SettingsWindow inherits Window {
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
-                    if root.current-page != 0: Button { text: "关闭"; clicked => { root.cancel-clicked(); } }
-                    if root.current-page != 0: Button {
+                    if root.current-page != 0: PixelButton { text: "关闭"; clicked => { root.cancel-clicked(); } }
+                    if root.current-page != 0: PixelButton {
                         text: root.service-running ? "保存并重启服务" : "保存";
-                        primary: true;
+                        variant: "primary";
                         clicked => { root.save-clicked(); }
                     }
                 }
