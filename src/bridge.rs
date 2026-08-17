@@ -1089,9 +1089,10 @@ impl Bridge {
                 };
                 // 阶段 1（W2 窗口修复）：回复产出后先把最终文本落盘到 pending 条目——
                 // 「发送前崩溃」的恢复据此**补发而非重跑**（原 remove 在发送前，
-                // 此窗口崩溃 = 回复静默丢失）。发送成功后才 remove；发送失败走
-                // 现状路径（日志提示，用户重发）并 remove——避免重启后与用户已
-                // 看到的错误重复补发。
+                // 此窗口崩溃 = 回复静默丢失）。发送成功后才 remove（send 成功但
+                // remove 前崩溃 = 重启补发一条重复回复，at-least-once 仅重发文本，
+                // 严格优于重跑）。发送失败 → remove + 日志（用户在场可重发；恢复
+                // 路径的无人值守补发不适用此场景，避免重启后陈旧回复）。
                 self.pending.set_reply(&ev.mid, &sent_text);
                 match self.send_reply(&ev, &sent_text).await {
                     Ok(()) => {
@@ -1113,14 +1114,19 @@ impl Bridge {
             }
             Ok(agent::RunOutcome::Cancelled) => {
                 crate::log!("[bridge] 任务被打断 chat={}", trunc(&ev.chat_id, 10));
+                // 先摘 pending 再发停止通知（审查：remove 若在发送后，「发送期间/后
+                // remove 前」崩溃会让已叫停的任务以 reply=None 残留 → 重启被普通重放
+                // **续跑**，违背叫停语义；停止通知本身丢失可接受——用户已在场叫停）。
+                self.pending.remove(&ev.mid);
                 // 只发最终结果：「⏹ 已停止」一条。
                 let _ = self.send_reply(&ev, "⏹ 已停止").await;
                 // 不 mark_started：被打断的轮次不算完成
-                // 无回复可补发 → 摘 pending（任务已结束）
-                self.pending.remove(&ev.mid);
             }
             Err(e) => {
                 // 错误文案作为最终回复发出（用户可见原因），同样留痕。
+                // 先摘 pending（任务已结束；错误文案发送失败不重跑，与基线一致——
+                // remove 若在发送后，崩溃窗口会让失败任务被重启重放续跑）。
+                self.pending.remove(&ev.mid);
                 match self.send_reply(&ev, &e).await {
                     Ok(()) => crate::log!(
                         "[bridge] 已回复错误 chat={} 长度={}",
@@ -1132,8 +1138,6 @@ impl Bridge {
                         trunc(&ev.chat_id, 10)
                     ),
                 }
-                // 无回复可补发 → 摘 pending（任务已结束；错误文案发送失败不重跑）
-                self.pending.remove(&ev.mid);
             }
         }
 
@@ -1183,6 +1187,8 @@ impl Bridge {
             // 阶段 1（W2 窗口修复）：回复已产出但未确认发出（崩溃在 set_reply 与
             // remove 之间）→ **直接补发，不重跑 agent**（原语义此窗口回复静默丢失）。
             // 补发成功才 remove；失败留盘，下次启动再试（不重跑）。
+            // 注：与实时路径的 send_reply 一样无 per-chat 锁（recover 与事件循环并行，
+            // 与「🔄 正在恢复」提示同模式）——仅消息顺序可能交错，无正确性问题。
             if let Some(reply) = &item.reply {
                 let ev = Ev {
                     mid: item.mid.clone(),
@@ -2845,6 +2851,14 @@ mod tests {
             !msgr.sent().iter().any(|t| t.contains("正在恢复")),
             "补发不走重放提示（不是重跑）"
         );
+        assert_eq!(
+            msgr.sent()
+                .iter()
+                .filter(|t| *t == "已产出的最终回复")
+                .count(),
+            1,
+            "恰发一条（不重复）"
+        );
         assert!(bridge.pending.is_empty(), "补发成功清盘");
         cleanup_bridge(&bridge);
     }
@@ -2879,6 +2893,57 @@ mod tests {
             bridge.pending.snapshot()[0].reply.as_deref(),
             Some("待补发的回复"),
             "reply 保留供下次补发"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// 阶段 1：话题（thread）消息的补发走 send_thread_reply（mid 必须正确）。
+    #[tokio::test]
+    async fn recover_redeliver_thread_reply() {
+        let runner = Arc::new(MockAgentRunner::immediate("不应被重跑"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+        bridge.pending.add(crate::pending::PendingItem {
+            mid: "w4".into(),
+            chat_id: "oc_w4".into(),
+            chat_type: "group".into(),
+            thread_id: "omt_9".into(), // 话题消息：send_reply 走 thread 分支
+            text: "问题".into(),
+            quoted: crate::messenger::QuotedContent::default(),
+            attachments: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+            created_at: 10,
+            reply: None,
+        });
+        bridge.pending.set_reply("w4", "话题回复");
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_pending(&stop).await;
+
+        assert!(runner.prompts().is_empty(), "不重跑");
+        // MockMessenger 的 thread 回复路径：send_thread_reply 默认回落 send_text
+        assert!(
+            msgr.sent().iter().any(|t| t == "话题回复"),
+            "话题补发: {:?}",
+            msgr.sent()
+        );
+        assert!(bridge.pending.is_empty());
+        cleanup_bridge(&bridge);
+    }
+
+    /// 审查 Important：Cancelled 臂必须先摘 pending 再发停止通知——若 remove 在发送后，
+    /// 「发送期间崩溃」会让已叫停任务以 reply=None 残留 → 重启被普通重放续跑。
+    #[tokio::test]
+    async fn cancelled_arm_removes_pending_before_send() {
+        let runner = Arc::new(MockAgentRunner::with_progress_cancel(&[]));
+        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        // 任务跑到一半被打断（Cancelled）→ 返回后 pending 必须已摘（不残留可重放条目）
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_c", "跑起来")).await })
+            .await
+            .unwrap();
+        assert!(
+            bridge.pending.is_empty(),
+            "Cancelled 臂在发送前摘 pending（无 reply 残留）"
         );
         cleanup_bridge(&bridge);
     }
