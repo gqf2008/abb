@@ -650,7 +650,7 @@ export component SettingsWindow inherits Window {
                         }
 
                         // 待处理建议（火绒「主页建议」/ PCM「智能提醒」同款）：只有异常才出现，每行点一下直达对应页。
-                        if root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0: Rectangle {
+                        if root.dep-failed-count > 0 || root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0: Rectangle {
                             border-radius: 12px;
                             background: #fff8e6;
                             VerticalBox {
@@ -1228,9 +1228,12 @@ export component SettingsWindow inherits Window {
                                             text: "⏳ 正在安装 " + root.dep-busy + " …（可能要几分钟，期间请勿重复点）";
                                             color: #b80;
                                             wrap: word-wrap;
+                                        }
+                                        // 安装失败详情区（与 busy 提示为**兄弟**节点——失败路径先清
+                                        // busy 再设 detail，嵌套在 busy 内会让错误区永不渲染，审查 C1）
                                         if root.dep-detail != "": Rectangle {
-                                            // 安装失败详情区（置顶于依赖卡）：分类 + 怎么办 + 原始错误。
-                                            // 醒目样式：粗边框 + 大字号——失败即所见（ui.rs 失败时自动切到本页）。
+                                            // 分类 + 怎么办 + 原始错误。醒目样式：粗边框 + 大字号
+                                            // ——失败即所见（ui.rs 失败时自动切到本页）。
                                             border-width: 2px;
                                             border-color: #d13438;
                                             background: #fff1f0;
@@ -1252,7 +1255,6 @@ export component SettingsWindow inherits Window {
                                                     horizontal-stretch: 1;
                                                 }
                                             }
-                                        }
                                         }
                                         // claude
                                         HorizontalBox {

@@ -623,6 +623,9 @@ pub fn classify_fail(dep_id: &str, err: &str) -> FailedItem {
         || lower.contains("econnrefused")
         || lower.contains("failed to connect")
         || lower.contains("couldn't resolve")
+        || lower.contains("enotfound")
+        || lower.contains("eai_again")
+        || lower.contains("getaddrinfo")
     {
         FailKind::Network
     } else if lower.contains("找不到") || lower.contains("command not found") {

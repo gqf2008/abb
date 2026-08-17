@@ -1873,8 +1873,9 @@ pub fn run_gui() -> Result<()> {
                                         // 分类 + 引导进详情区（普通用户可操作）；自动切到
                                         // 环境配置页——失败即所见，不再让用户自己找错误区。
                                         let f = crate::deps::classify_fail(&dep_id, &e);
+                                        // 与 AllDone 分支同格式（审查 M5：两处渲染格式统一）
                                         w.set_dep_detail(format!(
-                                            "{}\n\n【怎么办】{}\n\n（原始错误：{}）",
+                                            "{}\n【怎么办】{}\n（原始错误：{}）",
                                             f.id, f.advice, f.raw
                                         )
                                         .into());
