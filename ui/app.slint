@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelButton, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelTabs, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -206,27 +206,15 @@ component NavItem inherits Rectangle {
 }
 
 // 状态小胶囊：半透明底 + 语义色文字（比实底更柔和）。
-component StatusPill inherits Rectangle {
-    in property <string> text: "";
+// 状态徽章：slint-pixel PixelBadge 外壳（像素阴影块 + 边框），ok/warn 语义色映射。
+component StatusPill inherits PixelBadge {
     in property <bool> ok: false;
     in property <bool> warn: false;
     width: 84px;
-    height: 22px;
-    // 像素风：直角 + 实色底 + 黑描边（原半透明胶囊）
-    border-radius: 0px;
-    border-width: 2px;
-    border-color: PixelTheme.edge;
-    background: root.ok ? #0b8a3e : (root.warn ? #b86f00 : #d13438);
-    Text {
-        text: root.text;
-        color: #ffffff;
-        font-size: 11px;
-        font-weight: 600;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        width: 100%;
-        height: 100%;
-    }
+    font-size: 11px;
+    face: root.ok ? #0b8a3e : (root.warn ? #b86f00 : #d13438);
+    text-color: #ffffff;
+    border: PixelTheme.edge;
 }
 
 // 待处理建议行：左文案 + 右侧「去处理」小按钮，点击跳对应页（火绒「主页建议」同款交互）。
@@ -264,7 +252,8 @@ component ProblemRow inherits HorizontalBox {
     }
 }
 
-// 首页快捷操作卡：SVG 图标 + 标题 + 说明 + 动作文案；1px 描边取代阴影，更干净。
+// 首页快捷操作卡：slint-pixel PixelCard 外壳（阴影块 + 硬边框像素观感），
+// 内容（icon/desc/action）在 PixelCard 插槽内自排；TouchArea 覆盖整卡响应点击。
 component QuickCard inherits Rectangle {
     in property <string> title: "";
     in property <string> desc: "";
@@ -273,18 +262,22 @@ component QuickCard inherits Rectangle {
     callback clicked();
     height: 122px;
     horizontal-stretch: 1;
-    border-radius: 4px;
-    background: PixelTheme.bg;
-    TouchArea {
-        clicked => { root.clicked(); }
-        VerticalBox {
-            padding: 14px;
+    PixelCard {
+        width: 100%;
+        height: 100%;
+        title: root.title;
+        title-color: PixelTheme.text;
+        VerticalLayout {
             spacing: 6px;
             ImageIcon { icon: root.icon; tint: PixelTheme.accent; }
-            Text { text: root.title; font-size: 13px; font-weight: 600; color: PixelTheme.text; }
             Text { text: root.desc; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
             Text { text: root.action-label; font-size: 11px; font-weight: 600; color: PixelTheme.accent; }
         }
+    }
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
     }
 }
 
@@ -687,14 +680,11 @@ export component SettingsWindow inherits Window {
                                 action-label: "去授权 ›";
                                 clicked => { root.current-page = 2; }
                             }
-                            // 跨会话投递是开关不是跳转，卡片内直接放 CheckBox
-                            Rectangle {
+                            // 跨会话投递是开关不是跳转，卡片内直接放 CheckBox（PixelCard 外壳）
+                            PixelCard {
                                 height: 122px;
                                 horizontal-stretch: 1;
-                                border-radius: 4px;
-                                background: PixelTheme.bg;
-                                VerticalBox {
-                                    padding: 14px;
+                                VerticalLayout {
                                     spacing: 6px;
                                     ImageIcon { icon: @image-url("icons/switch.svg"); tint: PixelTheme.accent; }
                                     PixelCheckBox {
@@ -736,8 +726,11 @@ export component SettingsWindow inherits Window {
                                         background: PixelTheme.panel;
                                         border-radius: 4px;
                                         vertical-stretch: 1;
-                                        ListView {
-                                            for bot[idx] in root.bots: Rectangle {
+                                        PixelScrollPanel {
+                                            vertical-stretch: 1;
+                                            VerticalBox {
+                                                spacing: 2px;
+                                                for bot[idx] in root.bots: Rectangle {
                                                 height: 38px;
                                                 background: idx == root.selected ? PixelTheme.accent : transparent;
                                                 border-radius: 0px;
@@ -760,6 +753,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                     HorizontalBox {
@@ -833,13 +827,12 @@ export component SettingsWindow inherits Window {
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "模型供应商"; width: 80px; vertical-alignment: center; }
-                                                    // 动态 model（provider-names）：PixelComboBox 无 value→index
-                                                    // 映射（slint 数组无 indexOf），保留 std 下拉（试点暂缓）
-                                                    ComboBox {
-                                                        model: root.provider-names;
-                                                        current-value: root.bots[root.selected].provider;
+                                                    // provider 下拉：PixelSelect（value 字符串驱动，动态 options）
+                                                    PixelSelect {
+                                                        options: root.provider-names;
+                                                        value: root.bots[root.selected].provider;
                                                         horizontal-stretch: 1;
-                                                        selected => { root.bot-field-edited(root.selected, "provider", self.current-value); }
+                                                        changed(v) => { root.bot-field-edited(root.selected, "provider", v); }
                                                     }
                                                 }
                                                 // 授权者 agent 隔离（安全默认开启；三种 kind 都显示）：
@@ -1528,8 +1521,11 @@ export component SettingsWindow inherits Window {
                                         background: PixelTheme.panel;
                                         border-radius: 4px;
                                         vertical-stretch: 1;
-                                        ListView {
-                                            for prov[idx] in root.providers: Rectangle {
+                                        PixelScrollPanel {
+                                            vertical-stretch: 1;
+                                            VerticalBox {
+                                                spacing: 2px;
+                                                for prov[idx] in root.providers: Rectangle {
                                                 height: 44px;
                                                 background: idx == root.provider-selected ? PixelTheme.accent : transparent;
                                                 border-radius: 0px;
@@ -1551,6 +1547,7 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                     HorizontalBox {
