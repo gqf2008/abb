@@ -1019,8 +1019,39 @@ pub fn run_gui() -> Result<()> {
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
         let dirty_open = dirty.clone();
+        // 供托盘「设置…」与 Dock 点击共用的显示逻辑：草稿恢复 + 显示置前。
+        // Dock 图标点击恢复窗口（no-frame 后系统标题栏窗口的默认 reopen 行为失效，
+        // 2026-08-18 回归修复）走同款路径。
+        let tray_sw = sw.clone();
+        #[cfg(target_os = "macos")]
+        {
+            let dock_sw = settings.as_weak();
+            let dock_work = work.clone();
+            let dock_model = bots_model.clone();
+            let dock_pwork = providers_work.clone();
+            let dock_pmodel = providers_model.clone();
+            let dock_dwork = default_provider_work.clone();
+            let dock_cdwork = cross_delivery_work.clone();
+            let dock_dirty = dirty.clone();
+            crate::platform::install_dock_reopen(Box::new(move || {
+                if let Some(w) = dock_sw.upgrade() {
+                    load_with_draft(
+                        &w,
+                        &dock_dirty,
+                        &dock_work,
+                        &dock_model,
+                        &dock_pwork,
+                        &dock_pmodel,
+                        &dock_dwork,
+                        &dock_cdwork,
+                    );
+                    push_settings_status(&w, &install::status());
+                    show_window_and_focus(&w);
+                }
+            }));
+        }
         tray.on_open_settings(move || {
-            if let Some(w) = sw.upgrade() {
+            if let Some(w) = tray_sw.upgrade() {
                 // 草稿比正式配置新（上次编辑没保存就退出/崩溃）→ 静默恢复为工作底稿
                 load_with_draft(
                     &w,

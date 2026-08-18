@@ -288,6 +288,115 @@ pub fn hide_dock() {
     macos_activate(false);
 }
 
+/// Dock 图标点击（applicationShouldHandleReopen）回调：重新显示主窗口。
+/// no-frame 自绘窗口后，系统标题栏窗口的「Dock 点击自动恢复」默认行为失效——
+/// 需实现 NSApplicationDelegate 的 shouldHandleReopen 手动恢复（2026-08-18 回归修复）。
+/// 手写 objc runtime FFI（零依赖原则，同 macos_activate）：动态类 ABBDockDelegate
+/// 挂到 NSApplication，reopen 时调用注册的回调（Rust 侧显示设置窗）。
+#[cfg(target_os = "macos")]
+pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> Id;
+        fn objc_msgSend();
+        fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
+        fn objc_allocateClassPair(superclass: Id, name: *const std::ffi::c_char, extraBytes: usize) -> Id;
+        fn objc_registerClassPair(cls: Id);
+        fn class_addMethod(cls: Id, sel: Sel, imp: *const c_void, types: *const std::ffi::c_char) -> bool;
+        fn imp_implementationWithBlock(block: *const c_void) -> *const c_void;
+    }
+
+    /// ObjC block 字面量（imp_implementationWithBlock 需要）。
+    #[repr(C)]
+    struct BlockLiteral {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: *const c_void,
+    }
+    extern "C" fn reopen_invoke(
+        _block: *const BlockLiteral,
+        _self: Id,
+        _cmd: Sel,
+        _app: Id,
+        _has_visible: bool,
+    ) -> bool {
+        if let Some(cb) = REOPEN_CB.get() {
+            cb.lock().unwrap().0();
+        }
+        true // 已处理（恢复窗口由回调做）
+    }
+    /// 全局回调（reopen 静态函数无法捕获闭包，走全局存取）。
+    /// AppKit delegate 回调恒在主线程执行——跨线程 Send 标记是安全的（unsafe impl
+    /// 只在主线程调用；Mutex 仅为 OnceLock 的 Sync 要求）。
+    struct MainThreadCb(Box<dyn Fn()>);
+    unsafe impl Send for MainThreadCb {}
+    static REOPEN_CB: OnceLock<std::sync::Mutex<MainThreadCb>> = OnceLock::new();
+    let _ = REOPEN_CB.set(std::sync::Mutex::new(MainThreadCb(on_reopen))); // 首次设置；重复调用幂等忽略
+
+    unsafe {
+        let app: Id = {
+            let shared = sel_registerName(c"sharedApplication".as_ptr());
+            let shared_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            shared_fn(objc_getClass(c"NSApplication".as_ptr()), shared)
+        };
+        if app.is_null() {
+            return;
+        }
+        // 动态类 ABBDockDelegate : NSObject，实现 applicationShouldHandleReopen:hasVisibleWindows:
+        let cls = objc_allocateClassPair(
+            objc_getClass(c"NSObject".as_ptr()),
+            c"ABBDockDelegate".as_ptr(),
+            0,
+        );
+        if cls.is_null() {
+            return;
+        }
+        // BlockLiteral 栈上存活仅到 imp_implementationWithBlock 调用结束（IMP 自持 block，
+        // 库会 copy 它——macOS 10.7+ 自动 copy；为稳妥用 Box 泄漏保活）。
+        let block = Box::leak(Box::new(BlockLiteral {
+            isa: &_NSConcreteStackBlock as *const _ as *const c_void,
+            flags: (1 << 25) | (1 << 28), // BLOCK_HAS_SIGNATURE | BLOCK_HAS_COPY_DISPOSE（含签名位，避免 runtime 校验失败）
+            reserved: 0,
+            invoke: reopen_invoke as *const c_void,
+        }));
+        extern "C" {
+            static _NSConcreteStackBlock: c_void;
+        }
+        let imp = imp_implementationWithBlock(block as *mut BlockLiteral as *const c_void);
+        class_addMethod(
+            cls,
+            sel_registerName(c"applicationShouldHandleReopen:hasVisibleWindows:".as_ptr()),
+            imp,
+            c"c@:@@".as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        // delegate 实例：alloc + init，全局泄漏保活（app 生命周期）
+        let alloc_sel = sel_registerName(c"alloc".as_ptr());
+        let init_sel = sel_registerName(c"init".as_ptr());
+        let alloc_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let init_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let delegate = init_fn(alloc_fn(cls, alloc_sel), init_sel);
+        let set_del_sel = sel_registerName(c"setDelegate:".as_ptr());
+        let set_del_fn: unsafe extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        set_del_fn(app, set_del_sel, delegate);
+        std::mem::forget(Box::from_raw(block)); // block 泄漏保活（IMP 引用它）
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_dock_reopen(_on_reopen: Box<dyn Fn()>) {}
+
 #[cfg(target_os = "macos")]
 fn macos_activate(front: bool) {
     #![allow(non_snake_case)]
