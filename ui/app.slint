@@ -1115,6 +1115,9 @@ export component SettingsWindow inherits Window {
                         PageHeader { title: "环境配置"; subtitle: "依赖检测与系统权限"; }
 
                         PixelScrollPanel {
+                            // 铺满父宽：Rectangle natural 宽=内容宽(~300)，不拉伸则 ScrollView
+                            // 视口窄，行右侧「去授权/安装」按钮被裁（width:100% 只等于内容宽）。
+                            horizontal-stretch: 1;
                             vertical-stretch: 1;
                             VerticalBox {
                                 // 钳制内容宽=视口（同机器人配置页）：否则内容宽=preferred(~300)，
