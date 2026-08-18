@@ -16,6 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # slint-pixel 是本地 path 依赖（../slint-pixel），CI 需一并拉取（public 仓库）
+      - name: Checkout slint-pixel (path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: gqf2008/slint-pixel
+          path: ../slint-pixel
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -94,6 +101,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      # slint-pixel 是本地 path 依赖（../slint-pixel），CI 需一并拉取（public 仓库）
+      - name: Checkout slint-pixel (path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: gqf2008/slint-pixel
+          path: ../slint-pixel
 
       - uses: dtolnay/rust-toolchain@stable
 
