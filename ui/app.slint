@@ -1117,6 +1117,10 @@ export component SettingsWindow inherits Window {
                         PixelScrollPanel {
                             vertical-stretch: 1;
                             VerticalBox {
+                                // 钳制内容宽=视口（同机器人配置页）：否则内容宽=preferred(~300)，
+                                // 权限卡行 Text+StatusPill+按钮(~324) 超宽 → 行右侧「去授权/安装」
+                                // 按钮被裁剪看不到（用户报「未授权也没有授权按钮」）。
+                                width: 100%;
                                 spacing: 14px;
                                 alignment: start;
 
