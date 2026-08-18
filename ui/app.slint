@@ -692,10 +692,9 @@ export component SettingsWindow inherits Window {
                             }
                         }
 
-                        // 快捷操作卡（2×2 四宫格平铺）：加机器人 / 环境体检 / 权限中心 / 跨会话投递。
-                        // （原单行 HorizontalBox 每卡 ~185px 太窄，desc 被压缩——改 GridBox 舒展）
-                        GridBox {
-                            spacing: 14px;
+                        // 快捷操作卡（一行 4 个平铺）：加机器人 / 环境体检 / 权限中心 / 跨会话投递。
+                        HorizontalBox {
+                            spacing: 12px;
                             QuickCard {
                                 title: "添加机器人";
                                 desc: "接入飞书 / 微信 / 钉钉，30 秒上手";

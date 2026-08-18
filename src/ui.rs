@@ -205,8 +205,26 @@ fn bring_app_to_front() {
 /// 综上顺序：`bring_app_to_front` → `show` → `request_redraw`。`QrDialog`/`SettingsWindow` 都走这个。
 fn show_window_and_focus<W: slint::ComponentHandle>(w: &W) {
     bring_app_to_front();
+    // 用户要求窗口居中（2026-08-18）：按当前 monitor 尺寸居中——no-frame 自绘窗口
+    // 无系统默认定位，Slint 首次 show 落在左上。show 前设置避免「左上闪现再居中」。
+    center_on_monitor(w);
     let _ = w.show();
     w.window().request_redraw();
+}
+
+/// 把窗口居中到当前显示器（winit monitor 尺寸 - 窗口尺寸）/ 2。
+fn center_on_monitor<W: slint::ComponentHandle>(w: &W) {
+    use slint::winit_030::WinitWindowAccessor;
+    w.window().with_winit_window(|win| {
+        if let Some(monitor) = win.current_monitor() {
+            let msize = monitor.size();
+            let wsize = win.outer_size();
+            let x = msize.width.saturating_sub(wsize.width) / 2;
+            let y = msize.height.saturating_sub(wsize.height) / 2;
+            use slint::winit_030::winit::dpi::PhysicalPosition;
+            let _ = win.set_outer_position(PhysicalPosition::new(x, y));
+        }
+    });
 }
 
 /// 把设置窗四份工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
