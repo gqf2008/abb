@@ -203,13 +203,21 @@ fn bring_app_to_front() {
 ///    肉眼可见「先出标题栏、后出内容」的闪烁。先激活（窗口此时还藏着，重排不闪）再 show，
 ///    就不会扰动一个已可见的窗口。
 /// 综上顺序：`bring_app_to_front` → `show` → `request_redraw`。`QrDialog`/`SettingsWindow` 都走这个。
-fn show_window_and_focus<W: slint::ComponentHandle>(w: &W) {
+fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     bring_app_to_front();
-    // 用户要求窗口居中（2026-08-18）：按当前 monitor 尺寸居中——no-frame 自绘窗口
-    // 无系统默认定位，Slint 首次 show 落在左上。show 前设置避免「左上闪现再居中」。
-    center_on_monitor(w);
     let _ = w.show();
     w.window().request_redraw();
+    // 窗口居中：winit 窗口在 show 后**异步创建**（with_winit_window 在创建前无效，
+    // 实测 show 时调用会被跳过——窗口落在左上）。延迟 100ms 等窗口就绪再居中。
+    let weak = w.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::SingleShot, Duration::from_millis(100), move || {
+        if let Some(w) = weak.upgrade() {
+            center_on_monitor(&w);
+        }
+    });
+    // Timer 需保活到触发：drop 会取消。泄漏（每次 show 一个小 Timer，约百字节级，可忽略）。
+    std::mem::forget(timer);
 }
 
 /// 把窗口居中到当前显示器（winit monitor 尺寸 - 窗口尺寸）/ 2。
@@ -217,12 +225,22 @@ fn center_on_monitor<W: slint::ComponentHandle>(w: &W) {
     use slint::winit_030::WinitWindowAccessor;
     w.window().with_winit_window(|win| {
         if let Some(monitor) = win.current_monitor() {
-            let msize = monitor.size();
-            let wsize = win.outer_size();
-            let x = msize.width.saturating_sub(wsize.width) / 2;
-            let y = msize.height.saturating_sub(wsize.height) / 2;
-            use slint::winit_030::winit::dpi::PhysicalPosition;
-            let _ = win.set_outer_position(PhysicalPosition::new(x, y));
+            // winit macOS 的 set_outer_position 坐标空间与 monitor.size() 不一致
+            //（实测位置减半）——改用 slint 层 set_position（逻辑点，与 CGWindowList
+            // 一致）：monitor 物理尺寸 / scale_factor = 逻辑尺寸，窗口尺寸用
+            // slint 逻辑 size。
+            let scale = monitor.scale_factor().max(1.0);
+            let mw = (monitor.size().width as f64 / scale) as i32;
+            let mh = (monitor.size().height as f64 / scale) as i32;
+            // slint Window::size() 是物理尺寸 → 除 scale 得逻辑
+            let size = w.window().size();
+            let ww = (size.width as f64 / scale) as i32;
+            let wh = (size.height as f64 / scale) as i32;
+            let x = ((mw - ww) / 2).max(0);
+            let y = ((mh - wh) / 2).max(0);
+
+            use slint::LogicalPosition;
+            w.window().set_position(LogicalPosition::new(x as f32, y as f32));
         }
     });
 }
