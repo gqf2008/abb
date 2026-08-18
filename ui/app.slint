@@ -526,18 +526,11 @@ export component SettingsWindow inherits Window {
                         padding-right: 10px;
                         spacing: 0px;
                         PixelTabs {
-                            // 显式 width 打破「root.width 内部计算 ↔ 布局」绑定循环
-                            width: 480px;
+                            // horizontal-stretch 占满整行：4 tab 均分窗口宽（tab 下面才是内容区）
+                            horizontal-stretch: 1;
                             tabs: ["首页", "机器人配置", "环境配置", "模型供应商"];
                             active: root.current-page;
                             changed(i) => { root.current-page = i; }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        if root.version != "": Text {
-                            vertical-alignment: center;
-                            text: "v" + root.version;
-                            font-size: 11px;
-                            color: PixelTheme.text.with-alpha(0.45);
                         }
                     }
                 }

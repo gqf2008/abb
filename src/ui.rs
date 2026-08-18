@@ -159,9 +159,14 @@ fn push_settings_status(settings: &SettingsWindow, st: &install::ServiceStatus) 
     let bots = crate::botstatus::snapshot();
     let online = bots.iter().filter(|b| b.conn == "在线").count();
     let title = if bots.is_empty() {
-        "ABB 设置".to_string()
+        format!("ABB 设置 v{}", env!("CARGO_PKG_VERSION"))
     } else {
-        format!("ABB 设置 — {} 个 bot · {} 在线", bots.len(), online)
+        format!(
+            "ABB 设置 v{} — {} 个 bot · {} 在线",
+            env!("CARGO_PKG_VERSION"),
+            bots.len(),
+            online
+        )
     };
     settings.set_window_title(title.into());
     // hero 大按钮 / 状态卡用的结构化字段（running-line 保留给底部状态行）
