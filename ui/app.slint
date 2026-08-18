@@ -511,29 +511,29 @@ export component SettingsWindow inherits Window {
                 toggle-maximize => { root.toggle-maximize(); }
                 close-window => { root.close-window(); }
             }
-            // ── 主体：左导航栏 + 页面区 ──
+            // ── 顶部 Tab 栏（菜单改 tab）：在 VerticalBox 层（titlebar 与主体之间），
+            // 占满整行——错误地放进主体 HorizontalBox 会与页面区并排（左侧列） ──
+            Rectangle {
+                height: 40px;
+                background: PixelTheme.bg;
+                HorizontalBox {
+                    padding-left: 6px;
+                    padding-right: 10px;
+                    spacing: 0px;
+                    PixelTabs {
+                        // horizontal-stretch 占满整行：4 tab 均分窗口宽（tab 下面才是内容区）
+                        horizontal-stretch: 1;
+                        tabs: ["首页", "机器人配置", "环境配置", "模型供应商"];
+                        active: root.current-page;
+                        changed(i) => { root.current-page = i; }
+                    }
+                }
+            }
+            // ── 主体：页面区 ──
             HorizontalBox {
                 vertical-stretch: 1;
                 spacing: 0;
                 padding: 0;
-
-                // 顶部 Tab 栏（菜单改 tab）：slint-pixel PixelTabs（数据驱动 + 激活下划线）
-                Rectangle {
-                    height: 40px;
-                    background: PixelTheme.bg;
-                    HorizontalBox {
-                        padding-left: 6px;
-                        padding-right: 10px;
-                        spacing: 0px;
-                        PixelTabs {
-                            // horizontal-stretch 占满整行：4 tab 均分窗口宽（tab 下面才是内容区）
-                            horizontal-stretch: 1;
-                            tabs: ["首页", "机器人配置", "环境配置", "模型供应商"];
-                            active: root.current-page;
-                            changed(i) => { root.current-page = i; }
-                        }
-                    }
-                }
 
                 // 页面区：结构性 if 切页（同托盘菜单手法，属性翻转会重建子树）。
                 Rectangle {
