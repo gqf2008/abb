@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelButton, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
+import { PixelButton, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelTabs, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -524,37 +524,24 @@ export component SettingsWindow inherits Window {
                 spacing: 0;
                 padding: 0;
 
-                // 顶部 Tab 栏（菜单改 tab）：横排导航 + 右侧版本
+                // 顶部 Tab 栏（菜单改 tab）：slint-pixel PixelTabs（数据驱动 + 激活下划线）
                 Rectangle {
                     height: 40px;
                     background: PixelTheme.bg;
                     HorizontalBox {
                         padding-left: 6px;
-                        spacing: 4px;
-                        alignment: start;
-                        NavItem { label: "首页"; icon: @image-url("icons/home.svg"); selected: root.current-page == 0; clicked => { root.current-page = 0; } }
-                        NavItem {
-                            label: "机器人配置";
-                            icon: @image-url("icons/bot.svg");
-                            selected: root.current-page == 1;
-                            clicked => { root.current-page = 1; }
-                        }
-                        NavItem {
-                            label: "环境配置";
-                            icon: @image-url("icons/shield.svg");
-                            selected: root.current-page == 2;
-                            clicked => { root.current-page = 2; }
-                        }
-                        NavItem {
-                            label: "模型供应商";
-                            icon: @image-url("icons/chip.svg");
-                            selected: root.current-page == 3;
-                            clicked => { root.current-page = 3; }
+                        padding-right: 10px;
+                        spacing: 0px;
+                        PixelTabs {
+                            // 显式 width 打破「root.width 内部计算 ↔ 布局」绑定循环
+                            width: 480px;
+                            tabs: ["首页", "机器人配置", "环境配置", "模型供应商"];
+                            active: root.current-page;
+                            changed(i) => { root.current-page = i; }
                         }
                         Rectangle { horizontal-stretch: 1; }
                         if root.version != "": Text {
                             vertical-alignment: center;
-                            padding-right: 10px;
                             text: "v" + root.version;
                             font-size: 11px;
                             color: PixelTheme.text.with-alpha(0.45);
