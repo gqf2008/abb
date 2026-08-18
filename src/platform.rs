@@ -362,7 +362,7 @@ pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
         // BlockLiteral 栈上存活仅到 imp_implementationWithBlock 调用结束（IMP 自持 block，
         // 库会 copy 它——macOS 10.7+ 自动 copy；为稳妥用 Box 泄漏保活）。
         let block = Box::leak(Box::new(BlockLiteral {
-            isa: &_NSConcreteStackBlock as *const _ as *const c_void,
+            isa: &_NSConcreteStackBlock as *const c_void,
             flags: (1 << 25) | (1 << 28), // BLOCK_HAS_SIGNATURE | BLOCK_HAS_COPY_DISPOSE（含签名位，避免 runtime 校验失败）
             reserved: 0,
             invoke: reopen_invoke as *const c_void,
