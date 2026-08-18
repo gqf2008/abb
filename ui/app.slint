@@ -545,17 +545,13 @@ export component SettingsWindow inherits Window {
                         width: 100%;
                         height: 100%;
                         padding: 20px;
-                        spacing: 16px;
-                        alignment: start;
+                        spacing: 14px;
 
-                        // 页头
-                        HorizontalBox {
-                            spacing: 8px;
-                            VerticalBox {
-                                horizontal-stretch: 1;
-                                Text { text: "首页"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
-                                Text { text: "你的 AI 助理管家 — 一眼看清运行状态"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                            }
+                        // 页头（与其他页同结构）
+                        VerticalBox {
+                            spacing: 4px;
+                            Text { text: "首页"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
+                            Text { text: "你的 AI 助理管家 — 一眼看清运行状态"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                         }
 
                         // hero：状态 + 大按钮（PCM「立即加速」同款）。未运行时可从这里直接启动（原来只能去托盘）。
