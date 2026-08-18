@@ -227,8 +227,11 @@ impl FeishuClient {
                 .bearer_auth(&token)
                 .json(&json!({
                     "receive_id": chat_id,
-                    "msg_type": "text",
-                    "content": serde_json::to_string(&json!({"text": body_text}))?,
+                    "msg_type": "interactive",
+                    // 卡片 markdown 元素：飞书渲染 markdown 成富文本（对齐微信原生渲染）
+                    "content": serde_json::to_string(&json!({
+                        "elements": [{"tag":"markdown","content": body_text}]
+                    }))?,
                 }))
                 .send()
                 .await?
@@ -264,7 +267,7 @@ impl FeishuClient {
                 .http
                 .post(format!("{API_BASE}/im/v1/messages/{message_id}/reply"))
                 .bearer_auth(&token)
-                .json(&reply_body(&body_text))
+                .json(&reply_markdown_body(&body_text))
                 .send()
                 .await?
                 .json()
@@ -416,16 +419,23 @@ impl FeishuClient {
     }
 }
 
-/// 构造回复消息请求体（纯函数，便于单测断言 reply_in_thread / content）。
-fn reply_body(body_text: &str) -> serde_json::Value {
+/// 构造话题回复请求体（纯函数，便于单测断言 msg_type/reply_in_thread/content）。
+/// 用卡片 markdown 元素承载：飞书把 markdown 渲染成富文本（对齐微信原生渲染，
+/// 而非纯文本显示原始 `##`/`**`/` ``` ` 符号）。content 是字符串化 JSON（飞书 API 要求）。
+fn reply_markdown_body(body_text: &str) -> serde_json::Value {
     json!({
-        "msg_type": "text",
-        "content": serde_json::to_string(&json!({"text": body_text})).unwrap_or_default(),
+        "msg_type": "interactive",
+        "content": serde_json::to_string(&json!({
+            "elements": [{"tag":"markdown","content": body_text}]
+        })).unwrap_or_default(),
         "reply_in_thread": true,
     })
 }
 
 /// 按字符数（不是字节）逐行贪心分段，对齐 Python 的 len() 语义。
+/// 代码块 fence（```）保护：超限时只在非代码块状态切，避免代码块跨段断裂
+/// （飞书/微信分段发多条时，代码块被切到两条会破坏渲染）。三端共用此分段
+/// （飞书/微信 3500、钉钉 8000），故保护对三端均生效。
 pub fn split_text(text: &str, limit: usize) -> Vec<String> {
     let char_count = text.chars().count();
     if char_count <= limit {
@@ -434,14 +444,19 @@ pub fn split_text(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
     let mut cur_len = 0usize;
+    let mut in_fence = false; // 是否在 ``` 代码块内（跨行跟踪）
     for line in text.split_inclusive('\n') {
         let l = line.chars().count();
-        if cur_len + l > limit && !cur.is_empty() {
+        if cur_len + l > limit && !cur.is_empty() && !in_fence {
             chunks.push(std::mem::take(&mut cur));
             cur_len = 0;
         }
         cur.push_str(line);
         cur_len += l;
+        // 本行 ``` 出现奇数次 → 切换 fence 状态（fence 行归当前块后再翻转）
+        if line.matches("```").count() % 2 == 1 {
+            in_fence = !in_fence;
+        }
     }
     if !cur.is_empty() {
         chunks.push(cur);
@@ -482,14 +497,28 @@ mod tests {
     }
 
     #[test]
-    fn reply_body_uses_reply_in_thread() {
-        // 话题回复必须带 reply_in_thread: true，否则回复会落到群根会话（#14）
-        let body = reply_body("你好");
-        assert_eq!(body["msg_type"], "text");
+    fn split_preserves_code_fence() {
+        // 含闭合代码块的长文本，分段后每段 fence 计数平衡（不在代码块中间切）
+        let unit = format!("前言{}：\n```\ncode\n```\n", "汉".repeat(200));
+        let text = unit.repeat(20); // 多段代码块，总长超 limit
+        let chunks = split_text(&text, 3500);
+        assert!(chunks.len() >= 2, "应分段");
+        for (i, c) in chunks.iter().enumerate() {
+            let n = c.matches("```").count();
+            assert_eq!(n % 2, 0, "第 {} 段 fence 未平衡（``` 出现 {} 次）", i, n);
+        }
+    }
+
+    #[test]
+    fn reply_markdown_body_uses_markdown_and_thread() {
+        // 话题回复用卡片 markdown 元素 + reply_in_thread: true（#14 + markdown 渲染）
+        let body = reply_markdown_body("你好");
+        assert_eq!(body["msg_type"], "interactive");
         assert_eq!(body["reply_in_thread"], true);
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-        assert_eq!(content["text"], "你好");
+        assert_eq!(content["elements"][0]["tag"], "markdown");
+        assert_eq!(content["elements"][0]["content"], "你好");
     }
 
     #[test]
