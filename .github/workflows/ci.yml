@@ -29,7 +29,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gqf2008/slint-pixel
-          path: ../slint-pixel
+          path: slint-pixel
+
+      # checkout 不允许 path 出 workspace（../slint-pixel 被拒），先落 workspace 内再移出
+      - name: Move slint-pixel to ../ (cargo path dep)
+        shell: bash
+        run: mv slint-pixel ../slint-pixel
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -45,7 +50,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gqf2008/slint-pixel
-          path: ../slint-pixel
+          path: slint-pixel
+
+      # checkout 不允许 path 出 workspace（../slint-pixel 被拒），先落 workspace 内再移出
+      - name: Move slint-pixel to ../ (cargo path dep)
+        shell: bash
+        run: mv slint-pixel ../slint-pixel
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -71,7 +81,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gqf2008/slint-pixel
-          path: ../slint-pixel
+          path: slint-pixel
+
+      # checkout 不允许 path 出 workspace（../slint-pixel 被拒），先落 workspace 内再移出
+      - name: Move slint-pixel to ../ (cargo path dep)
+        shell: bash
+        run: mv slint-pixel ../slint-pixel
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
