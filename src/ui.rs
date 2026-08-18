@@ -216,11 +216,15 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     // 实测 show 时调用会被跳过——窗口落在左上）。延迟 100ms 等窗口就绪再居中。
     let weak = w.as_weak();
     let timer = slint::Timer::default();
-    timer.start(slint::TimerMode::SingleShot, Duration::from_millis(100), move || {
-        if let Some(w) = weak.upgrade() {
-            center_on_monitor(&w);
-        }
-    });
+    timer.start(
+        slint::TimerMode::SingleShot,
+        Duration::from_millis(100),
+        move || {
+            if let Some(w) = weak.upgrade() {
+                center_on_monitor(&w);
+            }
+        },
+    );
     // Timer 需保活到触发：drop 会取消。泄漏（每次 show 一个小 Timer，约百字节级，可忽略）。
     std::mem::forget(timer);
 }
@@ -245,7 +249,8 @@ fn center_on_monitor<W: slint::ComponentHandle>(w: &W) {
             let y = ((mh - wh) / 2).max(0);
 
             use slint::LogicalPosition;
-            w.window().set_position(LogicalPosition::new(x as f32, y as f32));
+            w.window()
+                .set_position(LogicalPosition::new(x as f32, y as f32));
         }
     });
 }
@@ -266,6 +271,10 @@ fn snapshot_config(
     for nb in newb.iter_mut() {
         if let Some(ob) = old.iter().find(|o| o.key() == nb.key()) {
             nb.primary_chat_id = ob.primary_chat_id.clone();
+            // mention_modes 由运行期 /mention 命令直接写 config（不经 GUI work），
+            // work 可能是打开 GUI 时的旧快照、不含之后新增的免@开关——从最新 config 补回，
+            // 避免 GUI 保存其它字段时用旧 work 覆盖清空 mention_modes（重启后免@开关丢失）。
+            nb.mention_modes = ob.mention_modes.clone();
             if nb.bot_name.is_empty() {
                 nb.bot_name = ob.bot_name.clone();
             }
@@ -1019,7 +1028,10 @@ pub fn run_gui() -> Result<()> {
                 .map(|d| !d.found)
                 .unwrap_or(true)
         };
-        if missing("claude") || missing("codex") || missing("pi") || missing("prime-agent")
+        if missing("claude")
+            || missing("codex")
+            || missing("pi")
+            || missing("prime-agent")
             || std::env::args().any(|a| a == "--show-settings")
         {
             let debug_show = std::env::args().any(|a| a == "--show-settings");
