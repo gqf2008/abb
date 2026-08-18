@@ -173,36 +173,29 @@ component ImageIcon inherits Image {
     image-fit: contain;
 }
 
-// 顶部 Tab 项：SVG 图标 + 文字；像素风选中态 = 黑底白字直角块（横向 tab）。
-component NavItem inherits Rectangle {
-    in property <string> label: "";
-    in property <image> icon;
-    in property <bool> selected: false;
-    callback clicked();
-    height: 34px;
-    border-radius: 0px;
-    // 像素风：选中 = 实黑块 + 白字（无半透明淡底）
-    background: root.selected ? PixelTheme.accent : transparent;
-    TouchArea {
-        clicked => { root.clicked(); }
-        HorizontalBox {
-            padding-left: 14px;
-            padding-right: 14px;
-            spacing: 8px;
-            alignment: center;
-            ImageIcon {
-                icon: root.icon;
-                tint: root.selected ? PixelTheme.bg : PixelTheme.text.with-alpha(0.65);
-            }
-            Text {
-                text: root.label;
-                font-size: 13px;
-                font-weight: root.selected ? 600 : 400;
-                color: root.selected ? PixelTheme.bg : PixelTheme.text;
-                vertical-alignment: center;
-            }
-        }
-    }
+// ═══════════ 全局页面样式（所有 tab 页统一，改一处全生效） ═══════════
+// 页面根容器：padding 20 + spacing 14（各页切换视觉稳定）。
+// 不设 alignment：VerticalBox 默认让 vertical-stretch>0 的子元素（机器人/环境/供应商页
+// 的列表+编辑区）拉伸填满主体；首页内容少且全 fixed/无 stretch 时自然顶对齐 + 底留白
+// （靠 PageHeader 的 vertical-stretch:0 避免 PageHeader 被分配剩余空间把内容顶下去）。
+component PageContainer inherits VerticalBox {
+    width: 100%;
+    height: 100%;
+    padding: 20px;
+    spacing: 14px;
+    @children
+}
+
+// 页头：标题 + 副标题（统一字号/间距/颜色）
+// vertical-stretch: 0 —— 页头不参与剩余空间拉伸，保持 natural 高（标题+副标题），
+// 避免首页内容少时 PageHeader 被分配剩余空间撑高、把 hero/快捷卡顶到中下部。
+component PageHeader inherits VerticalBox {
+    in property <string> title: "";
+    in property <string> subtitle: "";
+    spacing: 4px;
+    vertical-stretch: 0;
+    Text { text: root.title; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
+    Text { text: root.subtitle; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
 }
 
 // 状态小胶囊：半透明底 + 语义色文字（比实底更柔和）。
@@ -541,18 +534,9 @@ export component SettingsWindow inherits Window {
                     vertical-stretch: 1;
 
                                         // ═══════════ 首页：hero + 待处理建议 + 快捷卡（PCM「首页/智能提醒」同款） ═══════════
-                    if root.current-page == 0: VerticalBox {
-                        width: 100%;
-                        height: 100%;
-                        padding: 20px;
-                        spacing: 14px;
-
+                    if root.current-page == 0: PageContainer {
                         // 页头（与其他页同结构）
-                        VerticalBox {
-                            spacing: 4px;
-                            Text { text: "首页"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
-                            Text { text: "你的 AI 助理管家 — 一眼看清运行状态"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                        }
+                        PageHeader { title: "首页"; subtitle: "你的 AI 助理管家 — 一眼看清运行状态"; }
 
                         // hero：状态 + 大按钮（PCM「立即加速」同款）。未运行时可从这里直接启动（原来只能去托盘）。
                         Rectangle {
@@ -686,20 +670,14 @@ export component SettingsWindow inherits Window {
                                 }
                             }
                         }
+                        // 占底部剩余空间：首页内容少（hero+快捷卡全 fixed）时把内容顶到上面，
+                        // 不被默认布局推到中下部；其它页有 vertical-stretch:1 列表填满，不需此 spacer。
+                        Rectangle { vertical-stretch: 1; }
                     }
 
 // ═══════════ 机器人配置：左列表 + 右编辑（卡片面板） ═══════════
-                    if root.current-page == 1: VerticalBox {
-                        width: 100%;
-                        height: 100%;
-                        padding: 20px;
-                        spacing: 14px;
-
-                        VerticalBox {
-                            spacing: 4px;
-                            Text { text: "机器人配置"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
-                            Text { text: "管理接入的飞书 / 微信 / 钉钉机器人"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                        }
+                    if root.current-page == 1: PageContainer {
+                        PageHeader { title: "机器人配置"; subtitle: "管理接入的飞书 / 微信 / 钉钉机器人"; }
 
                         Rectangle {
                             vertical-stretch: 1;
@@ -1133,17 +1111,8 @@ export component SettingsWindow inherits Window {
                     }
 
                     // ═══════════ 环境配置：依赖 + 权限（卡片化） ═══════════
-                    if root.current-page == 2: VerticalBox {
-                        width: 100%;
-                        height: 100%;
-                        padding: 20px;
-                        spacing: 14px;
-
-                        VerticalBox {
-                            spacing: 4px;
-                            Text { text: "环境配置"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
-                            Text { text: "依赖检测与系统权限"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                        }
+                    if root.current-page == 2: PageContainer {
+                        PageHeader { title: "环境配置"; subtitle: "依赖检测与系统权限"; }
 
                         PixelScrollPanel {
                             vertical-stretch: 1;
@@ -1486,17 +1455,8 @@ export component SettingsWindow inherits Window {
                     }
 
                     // ═══════════ 模型供应商：左列表 + 右编辑（卡片面板） ═══════════
-                    if root.current-page == 3: VerticalBox {
-                        width: 100%;
-                        height: 100%;
-                        padding: 20px;
-                        spacing: 14px;
-
-                        VerticalBox {
-                            spacing: 4px;
-                            Text { text: "模型供应商"; font-size: 18px; font-weight: 700; color: PixelTheme.text; }
-                            Text { text: "Claude / Codex 或任意 OpenAI 兼容供应商"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                        }
+                    if root.current-page == 3: PageContainer {
+                        PageHeader { title: "模型供应商"; subtitle: "Claude / Codex 或任意 OpenAI 兼容供应商"; }
 
                         Rectangle {
                             vertical-stretch: 1;

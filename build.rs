@@ -1,7 +1,7 @@
 fn main() {
     // 视觉改造（像素风）：注册 @slint_pixel 库路径（slint-pixel path dep 的 library_paths）
-    let config = slint_build::CompilerConfiguration::new()
-        .with_library_paths(slint_pixel::library_paths());
+    let config =
+        slint_build::CompilerConfiguration::new().with_library_paths(slint_pixel::library_paths());
     slint_build::compile_with_config("ui/app.slint", config).expect("slint compile failed");
 
     // Windows：把 ABB 图标内嵌进 exe（快捷方式/任务栏/窗口/资源管理器都显示图标）。

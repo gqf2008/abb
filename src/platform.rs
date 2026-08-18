@@ -306,9 +306,13 @@ pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
         fn objc_getClass(name: *const std::ffi::c_char) -> Id;
         fn objc_msgSend();
         fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
-        fn objc_allocateClassPair(superclass: Id, name: *const std::ffi::c_char, extraBytes: usize) -> Id;
-        fn objc_registerClassPair(cls: Id);
-        fn class_addMethod(cls: Id, sel: Sel, imp: *const c_void, types: *const std::ffi::c_char) -> bool;
+        fn object_getClass(obj: Id) -> Id;
+        fn class_addMethod(
+            cls: Id,
+            sel: Sel,
+            imp: *const c_void,
+            types: *const std::ffi::c_char,
+        ) -> bool;
         fn imp_implementationWithBlock(block: *const c_void) -> *const c_void;
     }
 
@@ -341,6 +345,10 @@ pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
     let _ = REOPEN_CB.set(std::sync::Mutex::new(MainThreadCb(on_reopen))); // 首次设置；重复调用幂等忽略
 
     unsafe {
+        // 拿 NSApp 当前 delegate（winit 注册的）——**不能 setDelegate 替换**（winit
+        // app_state.rs:182 一致性检查会 panic），改为给 winit delegate 的类动态添加
+        // applicationShouldHandleReopen:hasVisibleWindows:（类方法表添加，实例自动响应，
+        // delegate 指针不变）。
         let app: Id = {
             let shared = sel_registerName(c"sharedApplication".as_ptr());
             let shared_fn: unsafe extern "C" fn(Id, Sel) -> Id =
@@ -350,25 +358,26 @@ pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
         if app.is_null() {
             return;
         }
-        // 动态类 ABBDockDelegate : NSObject，实现 applicationShouldHandleReopen:hasVisibleWindows:
-        let cls = objc_allocateClassPair(
-            objc_getClass(c"NSObject".as_ptr()),
-            c"ABBDockDelegate".as_ptr(),
-            0,
-        );
+        let delegate_sel = sel_registerName(c"delegate".as_ptr());
+        let get_delegate_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let delegate = get_delegate_fn(app, delegate_sel);
+        if delegate.is_null() {
+            return;
+        }
+        let cls = object_getClass(delegate);
         if cls.is_null() {
             return;
         }
-        // BlockLiteral 栈上存活仅到 imp_implementationWithBlock 调用结束（IMP 自持 block，
-        // 库会 copy 它——macOS 10.7+ 自动 copy；为稳妥用 Box 泄漏保活）。
+        // 全局 block（BLOCK_IS_GLOBAL：runtime 不 copy，无 copy/dispose 需求）+ 泄漏保活
         let block = Box::leak(Box::new(BlockLiteral {
-            isa: &_NSConcreteStackBlock as *const c_void,
-            flags: (1 << 25) | (1 << 28), // BLOCK_HAS_SIGNATURE | BLOCK_HAS_COPY_DISPOSE（含签名位，避免 runtime 校验失败）
+            isa: &_NSConcreteGlobalBlock as *const c_void,
+            flags: 1 << 28, // BLOCK_IS_GLOBAL
             reserved: 0,
             invoke: reopen_invoke as *const c_void,
         }));
         extern "C" {
-            static _NSConcreteStackBlock: c_void;
+            static _NSConcreteGlobalBlock: c_void;
         }
         let imp = imp_implementationWithBlock(block as *mut BlockLiteral as *const c_void);
         class_addMethod(
@@ -377,19 +386,6 @@ pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
             imp,
             c"c@:@@".as_ptr(),
         );
-        objc_registerClassPair(cls);
-        // delegate 实例：alloc + init，全局泄漏保活（app 生命周期）
-        let alloc_sel = sel_registerName(c"alloc".as_ptr());
-        let init_sel = sel_registerName(c"init".as_ptr());
-        let alloc_fn: unsafe extern "C" fn(Id, Sel) -> Id =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let init_fn: unsafe extern "C" fn(Id, Sel) -> Id =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let delegate = init_fn(alloc_fn(cls, alloc_sel), init_sel);
-        let set_del_sel = sel_registerName(c"setDelegate:".as_ptr());
-        let set_del_fn: unsafe extern "C" fn(Id, Sel, Id) =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        set_del_fn(app, set_del_sel, delegate);
         std::mem::forget(Box::from_raw(block)); // block 泄漏保活（IMP 引用它）
     }
 }
