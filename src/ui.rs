@@ -213,8 +213,8 @@ fn bring_app_to_front() {
 ///    就不会扰动一个已可见的窗口。
 /// 综上顺序：`bring_app_to_front` → `show` → `request_redraw`。`QrDialog`/`SettingsWindow` 都走这个。
 fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
-    // 窗口位置交给系统默认（macOS 级联位）——曾做过"show 后 100ms 强行居中"，
-    // 用户能看到窗口从左上跳到中间，干脆不折腾。
+    // 窗口位置完全交给系统默认（macOS 级联位），代码不做任何移动：
+    // 曾做过"show 后 100ms 强行居中"（肉眼可见跳动）和启动预热（钉死 (0,0)），都已拆除。
     bring_app_to_front();
     let _ = w.show();
     w.window().request_redraw();
