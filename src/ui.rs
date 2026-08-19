@@ -13,9 +13,7 @@ use crate::platform;
 use anyhow::Result;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -215,50 +213,11 @@ fn bring_app_to_front() {
 ///    就不会扰动一个已可见的窗口。
 /// 综上顺序：`bring_app_to_front` → `show` → `request_redraw`。`QrDialog`/`SettingsWindow` 都走这个。
 fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
+    // 窗口位置交给系统默认（macOS 级联位）——曾做过"show 后 100ms 强行居中"，
+    // 用户能看到窗口从左上跳到中间，干脆不折腾。
     bring_app_to_front();
     let _ = w.show();
     w.window().request_redraw();
-    // 窗口居中：winit 窗口在 show 后**异步创建**（with_winit_window 在创建前无效，
-    // 实测 show 时调用会被跳过——窗口落在左上）。延迟 100ms 等窗口就绪再居中。
-    let weak = w.as_weak();
-    let timer = slint::Timer::default();
-    timer.start(
-        slint::TimerMode::SingleShot,
-        Duration::from_millis(100),
-        move || {
-            if let Some(w) = weak.upgrade() {
-                center_on_monitor(&w);
-            }
-        },
-    );
-    // Timer 需保活到触发：drop 会取消。泄漏（每次 show 一个小 Timer，约百字节级，可忽略）。
-    std::mem::forget(timer);
-}
-
-/// 把窗口居中到当前显示器（winit monitor 尺寸 - 窗口尺寸）/ 2。
-fn center_on_monitor<W: slint::ComponentHandle>(w: &W) {
-    use slint::winit_030::WinitWindowAccessor;
-    w.window().with_winit_window(|win| {
-        if let Some(monitor) = win.current_monitor() {
-            // winit macOS 的 set_outer_position 坐标空间与 monitor.size() 不一致
-            //（实测位置减半）——改用 slint 层 set_position（逻辑点，与 CGWindowList
-            // 一致）：monitor 物理尺寸 / scale_factor = 逻辑尺寸，窗口尺寸用
-            // slint 逻辑 size。
-            let scale = monitor.scale_factor().max(1.0);
-            let mw = (monitor.size().width as f64 / scale) as i32;
-            let mh = (monitor.size().height as f64 / scale) as i32;
-            // slint Window::size() 是物理尺寸 → 除 scale 得逻辑
-            let size = w.window().size();
-            let ww = (size.width as f64 / scale) as i32;
-            let wh = (size.height as f64 / scale) as i32;
-            let x = ((mw - ww) / 2).max(0);
-            let y = ((mh - wh) / 2).max(0);
-
-            use slint::LogicalPosition;
-            w.window()
-                .set_position(LogicalPosition::new(x as f32, y as f32));
-        }
-    });
 }
 
 /// 把设置窗四份工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
@@ -648,10 +607,6 @@ pub fn run_gui() -> Result<()> {
     // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。
     // 有未保存修改时，关闭/取消要先弹确认，避免静默丢编辑（红点/按钮都走这条保护）。
     let dirty = Rc::new(Cell::new(false));
-    // 启动路径（自动引导/半配置）是否已显式 show 设置窗：是则预热的「队列里 hide」要跳过，
-    // 否则窗口会在事件循环启动瞬间被隐藏（启动即显示变成黑窗/无窗）。
-    // 用 Arc<AtomicBool>：预热的 invoke_from_event_loop 闭包要求 Send，Rc 进不去。
-    let startup_shown = Arc::new(AtomicBool::new(false));
 
     use slint::ComponentHandle;
 
@@ -681,34 +636,6 @@ pub fn run_gui() -> Result<()> {
                 platform::hide_dock();
             }
             EventResult::Propagate
-        });
-    }
-
-    // 预热设置窗的 Metal layer，消除「每次启动后首次打开闪一帧」。
-    // 缘由：Slint 在 macOS Metal 下，窗口**首次** show 的预渲染帧是空的（surface 在窗口 map
-    // 前没就绪），内容要到下一个事件循环 tick 的 redraw 才补上 → 首次打开「先标题栏后内容」闪一下。
-    // 但 Metal layer 会**保留上一帧**（已实测：第二次打开不闪）。故启动时把窗口挪到屏外 show +
-    // redraw 一次（屏外不可见、无闪烁、无激活），让 layer 预先填上内容；下一帧再 hide 并复位位置。
-    // 此后用户首次「打开」走的是「非首次 show」路径，layer 已有预热内容 → 不闪。
-    // （二维码弹窗同理，但它只在微信登录时偶发，且每次内容不同，不值得预热，留作可接受的偶发闪烁。）
-    #[cfg(target_os = "macos")]
-    {
-        let saved = settings.window().position();
-        settings
-            .window()
-            .set_position(slint::PhysicalPosition::new(-16_000, -16_000));
-        let _ = settings.show();
-        settings.window().request_redraw();
-        let sw = settings.as_weak();
-        let startup_shown_pw = startup_shown.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(w) = sw.upgrade() {
-                // 启动路径已经 show 过（自动引导/半配置）→ 只复位位置，不 hide
-                if !startup_shown_pw.load(Ordering::Relaxed) {
-                    let _ = w.hide();
-                }
-                w.window().set_position(saved);
-            }
         });
     }
 
@@ -1252,7 +1179,6 @@ pub fn run_gui() -> Result<()> {
                 );
                 settings.set_status_is_error(true);
             }
-            startup_shown.store(true, Ordering::Relaxed);
             show_window_and_focus(&settings);
         }
     }
@@ -2097,7 +2023,6 @@ pub fn run_gui() -> Result<()> {
             settings.set_status_is_error(false);
             settings.set_status_line("请先添加一个飞书/微信机器人".into());
         }
-        startup_shown.store(true, Ordering::Relaxed);
         show_window_and_focus(&settings);
     }
 
