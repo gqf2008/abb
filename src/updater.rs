@@ -36,6 +36,8 @@ impl Updater {
         let client = reqwest::Client::builder()
             // GitHub API 没有 UA 直接 403
             .user_agent(concat!("abb-updater/", env!("CARGO_PKG_VERSION")))
+            // 死路由快速失败（默认等 OS TCP 超时 ~75s，重试全耗在等待上）
+            .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .context("构建 HTTP client 失败")?;
         Ok(Self { client })
@@ -92,18 +94,56 @@ impl Updater {
     }
 
     /// 流式下载到目标文件（逐块写盘，不把整个 dmg 堆进内存）。
-    pub async fn download_to(&self, url: &str, dest: &Path) -> Result<()> {
+    /// `on_progress(已下载字节, 总字节)`：总字节取 content-length，响应头没有时为 None。
+    /// GitHub 资产会 302 到下载 CDN，部分网络下 connect 抖动（实测连续超时后重试又能下完）：
+    /// 最多 3 次、递增退避；不做断点续传（包不大，整体重下简单可靠）。
+    pub async fn download_to(
+        &self,
+        url: &str,
+        dest: &Path,
+        on_progress: &(dyn Fn(u64, Option<u64>) + Send + Sync),
+    ) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 1..=3u32 {
+            match self.download_once(url, dest, on_progress).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    crate::log!("[update] 下载第 {attempt}/3 次失败：{e:#}");
+                    last_err = Some(e);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5 * u64::from(attempt)))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(last_err.expect("至少尝试过一次"))
+            .context("下载重试 3 次均失败：本机网络到 GitHub 下载 CDN 不通，可挂代理后重试，或到 release 页手动下载安装")
+    }
+
+    /// 单次下载尝试（download_to 的重试单元）。
+    async fn download_once(
+        &self,
+        url: &str,
+        dest: &Path,
+        on_progress: &(dyn Fn(u64, Option<u64>) + Send + Sync),
+    ) -> Result<()> {
         use futures_util::StreamExt;
         use std::io::Write;
         let resp = self.client.get(url).send().await.context("下载请求失败")?;
         if !resp.status().is_success() {
             bail!("下载返回 {}", resp.status());
         }
+        let total = resp.content_length();
         let mut file = std::fs::File::create(dest).context("创建临时文件失败")?;
         let mut stream = resp.bytes_stream();
+        let mut done: u64 = 0;
+        on_progress(0, total);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("下载流中断")?;
             file.write_all(&chunk).context("写临时文件失败")?;
+            done += chunk.len() as u64;
+            on_progress(done, total);
         }
         file.flush().ok();
         Ok(())

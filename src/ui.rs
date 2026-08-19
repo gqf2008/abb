@@ -1049,13 +1049,53 @@ pub fn run_gui() -> Result<()> {
                             let tw2 = tw.clone();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(t) = tw2.upgrade() {
+                                    t.set_update_progress("连接中…".into());
                                     t.set_update_state(4); // 下载安装中
                                 }
                             });
                             let dest = crate::updater::download_dest(&rel.version);
+                            // 进度回调：按整百分比（无总长则按整 MB）节流，变化才推给主线程重建菜单
+                            let last_tick =
+                                std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+                            let twp = tw.clone();
+                            let on_progress = move |done: u64, total: Option<u64>| {
+                                let (label, tick) = match total {
+                                    Some(t) if t > 0 => {
+                                        let pct = done.saturating_mul(100) / t;
+                                        (
+                                            format!(
+                                                "{pct}%（{:.1}/{:.1} MB）",
+                                                done as f64 / 1e6,
+                                                t as f64 / 1e6
+                                            ),
+                                            pct as i64,
+                                        )
+                                    }
+                                    _ => (
+                                        format!("已下载 {:.1} MB", done as f64 / 1e6),
+                                        (done / 1_000_000) as i64,
+                                    ),
+                                };
+                                if tick == last_tick.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+                                last_tick.store(tick, std::sync::atomic::Ordering::Relaxed);
+                                let tw3 = twp.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(t) = tw3.upgrade() {
+                                        t.set_update_progress(label.into());
+                                    }
+                                });
+                            };
                             let r = async {
                                 let up = crate::updater::Updater::new()?;
-                                up.download_to(&url, &dest).await?;
+                                up.download_to(&url, &dest, &on_progress).await?;
+                                let tw4 = tw.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(t) = tw4.upgrade() {
+                                        t.set_update_progress("正在安装…".into());
+                                    }
+                                });
                                 crate::updater::install_and_relaunch(&dest)
                             }
                             .await;
@@ -1074,7 +1114,8 @@ pub fn run_gui() -> Result<()> {
                                     crate::log!("[update] 安装失败：{e:#}");
                                     let _ = slint::invoke_from_event_loop(move || {
                                         if let Some(t) = tw.upgrade() {
-                                            t.set_update_state(3); // 回到可升级，允许重试
+                                            // 明确的失败态（不是退回"升级"，避免看起来像没发生过）
+                                            t.set_update_state(5);
                                         }
                                     });
                                 }

@@ -35,11 +35,12 @@ export component Tray inherits SystemTrayIcon {
     in-out property <bool> configured: false;
     in-out property <bool> autostart: false;
     in-out property <string> version: "";          // 当前版本号（Rust 启动时注入，菜单里常驻显示）
-    // 版本升级：0=未查 1=检查中 2=已最新 3=有新版本 4=下载安装中 6=检查失败
+    // 版本升级：0=未查 1=检查中 2=已最新 3=有新版本 4=下载安装中 5=下载/安装失败 6=检查失败
     // （结构性 if 重建菜单，见文件头注释：enabled 绑定不可靠）
     in-out property <int> update-state: 0;
     in-out property <string> update-version: "";   // 发现的新版本号（state=3/4 用）
     in-out property <bool> update-can-install: false; // 本机平台有安装包（Linux 无 → 只提示）
+    in-out property <string> update-progress: "";  // 下载安装中的进度文案（连接中…/45%（3.6/7.9 MB）/正在安装…）
 
     callback start-service();
     callback stop-service();
@@ -79,7 +80,8 @@ export component Tray inherits SystemTrayIcon {
         if root.update-state == 2: MenuItem { title: "版本 v" + root.version + " · 已是最新 ✓（点击重查）"; activated => { root.check-update(); } }
         if root.update-state == 3 && root.update-can-install: MenuItem { title: "⬆ 升级到新版本 v" + root.update-version + "（当前 v" + root.version + "）"; activated => { root.install-update(); } }
         if root.update-state == 3 && !root.update-can-install: MenuItem { title: "有新版本 v" + root.update-version + "（当前 v" + root.version + " · 请从源码更新，点击重查）"; activated => { root.check-update(); } }
-        if root.update-state == 4: MenuItem { title: "正在下载并安装 v" + root.update-version + "…（当前 v" + root.version + "）"; enabled: false; }
+        if root.update-state == 4: MenuItem { title: "正在下载安装 v" + root.update-version + "：" + root.update-progress; enabled: false; }
+        if root.update-state == 5: MenuItem { title: "下载/安装失败，点击重试 v" + root.update-version + "（当前 v" + root.version + "）"; activated => { root.install-update(); } }
         if root.update-state == 6: MenuItem { title: "版本 v" + root.version + " · 检查失败，点击重试"; activated => { root.check-update(); } }
         MenuSeparator {}
         MenuItem { title: "退出"; activated => { root.quit-app(); } }
