@@ -1,0 +1,342 @@
+//! 版本检测 + 自动升级安装（托盘菜单「检查更新」）。
+//!
+//! 链路：GitHub API 查 latest release → 与 CARGO_PKG_VERSION 比 semver →
+//! 有新版本则按平台选资产（macOS=dmg / Windows=Setup exe / Linux 无预编译包）→
+//! 下载到临时目录 → 平台安装：
+//! - macOS：hdiutil 挂载 dmg → 旧 bundle 改名留备份 → ditto 新 bundle 原位 →
+//!   分离式 sh 等本进程退出后 `open` 新实例（单实例锁随进程死亡释放，见 single_instance.rs）。
+//! - Windows：直接启动 Inno Setup 安装包（PrivilegesRequired=lowest 免 UAC），
+//!   安装器自己处理覆盖与装完重启；本进程随即退出让出文件锁。
+//! - Linux：CI 不出包，调用方拿到 asset_url=None，UI 提示手动构建。
+
+use anyhow::{anyhow, bail, Context, Result};
+use std::path::{Path, PathBuf};
+
+/// 当前版本（构建期锁定）。
+pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+const REPO: &str = "gqf2008/abb";
+
+/// 一次版本检查的结果。
+#[derive(Debug, Clone)]
+pub struct LatestRelease {
+    /// 去掉 v 前缀的版本号，如 "2.15.0"。
+    pub version: String,
+    /// 本机平台的资产下载 URL；该平台没有预编译包（Linux）时为 None。
+    pub asset_url: Option<String>,
+}
+
+/// 有状态的升级器：复用同一个 reqwest Client（连接池/rustls 配置）。
+pub struct Updater {
+    client: reqwest::Client,
+}
+
+impl Updater {
+    pub fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            // GitHub API 没有 UA 直接 403
+            .user_agent(concat!("abb-updater/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("构建 HTTP client 失败")?;
+        Ok(Self { client })
+    }
+
+    /// 查 GitHub latest release。只取 tag_name + 资产名/URL，不解析 body。
+    pub async fn check_latest(&self) -> Result<LatestRelease> {
+        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let resp = self
+            .client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .context("请求 GitHub releases 失败（网络/代理？）")?;
+        if !resp.status().is_success() {
+            bail!("GitHub API 返回 {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await.context("解析 release JSON 失败")?;
+        let tag = v
+            .get("tag_name")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| anyhow!("release 缺 tag_name"))?;
+        let version = tag.strip_prefix('v').unwrap_or(tag).to_string();
+        let names: Vec<String> = v
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let urls: Vec<String> = v
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        a.get("browser_download_url")
+                            .and_then(|n| n.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let asset_url = pick_asset(&names, &version).and_then(|picked| {
+            names
+                .iter()
+                .position(|n| *n == picked)
+                .and_then(|i| urls.get(i).cloned())
+        });
+        Ok(LatestRelease { version, asset_url })
+    }
+
+    /// 流式下载到目标文件（逐块写盘，不把整个 dmg 堆进内存）。
+    pub async fn download_to(&self, url: &str, dest: &Path) -> Result<()> {
+        use futures_util::StreamExt;
+        use std::io::Write;
+        let resp = self.client.get(url).send().await.context("下载请求失败")?;
+        if !resp.status().is_success() {
+            bail!("下载返回 {}", resp.status());
+        }
+        let mut file = std::fs::File::create(dest).context("创建临时文件失败")?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("下载流中断")?;
+            file.write_all(&chunk).context("写临时文件失败")?;
+        }
+        file.flush().ok();
+        Ok(())
+    }
+}
+
+/// 解析 "2.15.0" / "v2.15.0" / "2.15.0-beta1" 为 (2,15,0)。非数字段截断；缺段补 0。
+fn parse_semver(s: &str) -> (u32, u32, u32) {
+    let s = s.strip_prefix('v').unwrap_or(s);
+    let mut parts = s.split('.').map(|seg| {
+        let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().unwrap_or(0)
+    });
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+/// latest 是否比 current 新（纯 semver 元组比较）。
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    parse_semver(latest) > parse_semver(current)
+}
+
+/// 按平台从资产名列表里挑安装包（纯函数，便于单测）：
+/// macOS → ABB-x.y.z.dmg；Windows → ABB-Setup-x.y.z.exe；Linux → None。
+/// 先精确匹配版本号，再退后缀匹配（防 CI 命名微调）。
+pub fn pick_asset(names: &[String], version: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let exact = format!("ABB-{version}.dmg");
+        names
+            .iter()
+            .find(|n| **n == exact)
+            .or_else(|| names.iter().find(|n| n.ends_with(".dmg")))
+            .cloned()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let exact = format!("ABB-Setup-{version}.exe");
+        names
+            .iter()
+            .find(|n| **n == exact)
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|n| n.starts_with("ABB-Setup-") && n.ends_with(".exe"))
+            })
+            .cloned()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = (names, version);
+        None
+    }
+}
+
+/// 下载产物在本机的落点（临时目录，按版本命名防串）。
+pub fn download_dest(version: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let name = format!("ABB-{version}.dmg");
+    #[cfg(target_os = "windows")]
+    let name = format!("ABB-Setup-{version}.exe");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let name = format!("ABB-{version}.bin");
+    std::env::temp_dir().join(name)
+}
+
+/// 安装并重启。成功返回后**调用方负责退出本进程**（macOS 由分离 sh 等进程死后拉起新实例；
+/// Windows 安装器装完自己拉起）。Linux 不应被调用（无资产）。
+pub fn install_and_relaunch(file: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_install(file)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_install(file)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = file;
+        bail!("Linux 暂无预编译包，请 git pull && cargo build --release 手动升级")
+    }
+}
+
+/// macOS：dmg → 替换当前 bundle → 分离脚本等本进程死后 open 新实例。
+#[cfg(target_os = "macos")]
+fn macos_install(dmg: &Path) -> Result<()> {
+    use std::process::Command;
+    // 0. 当前必须跑在 .app 里（开发版 target/debug/... 直接拒，引导手动装）
+    let exe = std::env::current_exe().context("取当前 exe 路径失败")?;
+    // ABB.app/Contents/MacOS/agent-bridge → 上 3 级 = bundle
+    let bundle = exe
+        .ancestors()
+        .nth(3)
+        .filter(|p| p.extension().is_some_and(|e| e == "app"))
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| anyhow!("当前不是安装版（未在 .app 内运行），请从 release 页手动下载"))?;
+
+    // 1. 挂载 dmg 到独立挂载点（-nobrowse 不弹 Finder 窗）
+    let mnt = std::env::temp_dir().join(format!("abb-update-mnt-{}", std::process::id()));
+    let st = Command::new("hdiutil")
+        .arg("attach")
+        .arg("-nobrowse")
+        .arg("-readonly")
+        .arg("-mountpoint")
+        .arg(&mnt)
+        .arg(dmg)
+        .status()
+        .context("hdiutil attach 启动失败")?;
+    if !st.success() {
+        bail!("hdiutil attach 失败（dmg 损坏？）：{st}");
+    }
+    // 挂载后的一切失败都要尝试 detach，别留垃圾挂载
+    let r = macos_install_from_mnt(&mnt, &bundle);
+    let _ = Command::new("hdiutil")
+        .arg("detach")
+        .arg("-quiet")
+        .arg(&mnt)
+        .status();
+    r
+}
+
+#[cfg(target_os = "macos")]
+fn macos_install_from_mnt(mnt: &Path, bundle: &Path) -> Result<()> {
+    use std::process::Command;
+    let new_app = mnt.join("ABB.app");
+    if !new_app.exists() {
+        bail!("dmg 里没有 ABB.app（包内容变了？）");
+    }
+    // 2. 旧 bundle 改名留备份（同目录 rename，快；失败可回滚）
+    let backup = bundle.with_file_name(format!("ABB.old-{}.app", std::process::id()));
+    std::fs::rename(bundle, &backup).context("移走旧版失败（/Applications 无写权限？）")?;
+    // 3. ditto 新 bundle 到原位（保留签名/资源；cp -R 也行，ditto 更稳）
+    let st = Command::new("ditto")
+        .arg(&new_app)
+        .arg(bundle)
+        .status()
+        .context("ditto 启动失败")?;
+    if !st.success() {
+        // 回滚旧版
+        let _ = std::fs::remove_dir_all(bundle);
+        let _ = std::fs::rename(&backup, bundle);
+        bail!("ditto 拷新包失败：{st}（已回滚旧版）");
+    }
+    // 4. 删备份（尽力；失败留到下次清理也无碍）
+    let _ = std::fs::remove_dir_all(&backup);
+    // 5. 分离 sh：等本进程彻底退出（单实例锁释放）后再 open 新实例。
+    //    不用 -n：进程已死，普通 open 即可；万一 open 早于退出，重试兜底。
+    let pid = std::process::id();
+    let b = bundle.to_string_lossy();
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; sleep 0.3; open \"{b}\""
+        ))
+        .spawn()
+        .context("启动重启辅助脚本失败")?;
+    Ok(())
+}
+
+/// Windows：启动 Inno 安装包（per-user 安装免 UAC；安装器装完按其 [Run] 段拉起新实例）。
+#[cfg(target_os = "windows")]
+fn windows_install(setup: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    // start 把首个带引号参数当窗口标题，故先给空标题；CREATE_NO_WINDOW 避免闪控制台。
+    std::process::Command::new("cmd")
+        .arg("/c")
+        .arg("start")
+        .arg("")
+        .arg(setup)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .context("启动安装包失败")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semver_compare() {
+        assert!(is_newer("2.15.0", "2.14.2"));
+        assert!(is_newer("v2.15.0", "2.14.2")); // v 前缀容忍
+        assert!(is_newer("3.0.0", "2.99.99"));
+        assert!(!is_newer("2.14.2", "2.14.2")); // 同版不升级
+        assert!(!is_newer("2.14.1", "2.14.2")); // 旧版不升级
+        assert!(!is_newer("2.14", "2.14.2")); // 缺段补 0 → 2.14.0 < 2.14.2
+        assert!(is_newer("2.15.0-beta1", "2.14.9")); // 后缀截断按数字段比
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pick_asset_macos() {
+        let names = vec![
+            "ABB-2.15.0.dmg".to_string(),
+            "ABB-Setup-2.15.0.exe".to_string(),
+        ];
+        assert_eq!(
+            pick_asset(&names, "2.15.0"),
+            Some("ABB-2.15.0.dmg".to_string())
+        );
+        // 精确匹配失败时退后缀
+        let loose = vec!["ABB-2.15.0-arm64.dmg".to_string()];
+        assert_eq!(
+            pick_asset(&loose, "2.15.0"),
+            Some("ABB-2.15.0-arm64.dmg".to_string())
+        );
+        // 没有 dmg → None
+        let none = vec!["ABB-Setup-2.15.0.exe".to_string()];
+        assert_eq!(pick_asset(&none, "2.15.0"), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pick_asset_windows() {
+        let names = vec![
+            "ABB-2.15.0.dmg".to_string(),
+            "ABB-Setup-2.15.0.exe".to_string(),
+        ];
+        assert_eq!(
+            pick_asset(&names, "2.15.0"),
+            Some("ABB-Setup-2.15.0.exe".to_string())
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn pick_asset_linux_none() {
+        let names = vec!["ABB-2.15.0.dmg".to_string()];
+        assert_eq!(pick_asset(&names, "2.15.0"), None);
+    }
+}

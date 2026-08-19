@@ -32,6 +32,7 @@ mod sessions;
 mod single_instance;
 mod tasks;
 mod ui;
+mod updater;
 mod wechat;
 mod ws;
 

@@ -34,6 +34,12 @@ export component Tray inherits SystemTrayIcon {
     in-out property <bool> service-running: false;
     in-out property <bool> configured: false;
     in-out property <bool> autostart: false;
+    in-out property <string> version: "";          // 当前版本号（Rust 启动时注入，菜单里常驻显示）
+    // 版本升级：0=未查 1=检查中 2=已最新 3=有新版本 4=下载安装中 6=检查失败
+    // （结构性 if 重建菜单，见文件头注释：enabled 绑定不可靠）
+    in-out property <int> update-state: 0;
+    in-out property <string> update-version: "";   // 发现的新版本号（state=3/4 用）
+    in-out property <bool> update-can-install: false; // 本机平台有安装包（Linux 无 → 只提示）
 
     callback start-service();
     callback stop-service();
@@ -42,6 +48,8 @@ export component Tray inherits SystemTrayIcon {
     callback open-logs();
     callback open-folder();
     callback toggle-autostart(bool);
+    callback check-update();     // 手动检查更新（托盘菜单）
+    callback install-update();   // 点「升级」：下载+安装+重启
     callback quit-app();
 
     // 左键点图标 = 打开设置（对齐 brewfs：clicked → show-window）
@@ -64,6 +72,15 @@ export component Tray inherits SystemTrayIcon {
         // 开机自启：结构性 if（同启停，enabled/checkbox 绑定不可靠），点一下切换
         if !root.autostart: MenuItem { title: "开机自动启动：关"; activated => { root.toggle-autostart(true); } }
         if root.autostart: MenuItem { title: "开机自动启动：开"; activated => { root.toggle-autostart(false); } }
+        MenuSeparator {}
+        // ── 版本升级：永远只一项，标题常驻当前版本；可点的态点击即动作（结构性 if 重建，见文件头注释）──
+        if root.update-state == 0: MenuItem { title: "版本 v" + root.version + " · 检查更新…"; activated => { root.check-update(); } }
+        if root.update-state == 1: MenuItem { title: "版本 v" + root.version + " · 正在检查更新…"; enabled: false; }
+        if root.update-state == 2: MenuItem { title: "版本 v" + root.version + " · 已是最新 ✓（点击重查）"; activated => { root.check-update(); } }
+        if root.update-state == 3 && root.update-can-install: MenuItem { title: "⬆ 升级到新版本 v" + root.update-version + "（当前 v" + root.version + "）"; activated => { root.install-update(); } }
+        if root.update-state == 3 && !root.update-can-install: MenuItem { title: "有新版本 v" + root.update-version + "（当前 v" + root.version + " · 请从源码更新，点击重查）"; activated => { root.check-update(); } }
+        if root.update-state == 4: MenuItem { title: "正在下载并安装 v" + root.update-version + "…（当前 v" + root.version + "）"; enabled: false; }
+        if root.update-state == 6: MenuItem { title: "版本 v" + root.version + " · 检查失败，点击重试"; activated => { root.check-update(); } }
         MenuSeparator {}
         MenuItem { title: "退出"; activated => { root.quit-app(); } }
     }

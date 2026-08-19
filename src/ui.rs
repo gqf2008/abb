@@ -52,6 +52,12 @@ enum UiCmd {
     },
     OpenLogs,
     OpenFolder,
+    /// 版本升级：检查最新 release（silent=启动/周期自动检查，失败静默不打扰）。
+    CheckUpdate {
+        silent: bool,
+    },
+    /// 下载并安装已发现的新版本，成功安装后退出本进程（新版由分离脚本/安装器拉起）。
+    InstallUpdate,
 }
 
 /// 微信扫码登录的阶段结果（后台 → 主线程）。
@@ -635,6 +641,8 @@ pub fn run_gui() -> Result<()> {
     slint_pixel::install_title_bar_controls_no_quit(&settings);
     // 版本号随编译注入（Cargo.toml 单一事实源），侧栏底部展示
     settings.set_version(env!("CARGO_PKG_VERSION").into());
+    // 托盘菜单的版本项也常驻当前版本（updater::CURRENT 同源）
+    tray.set_version(env!("CARGO_PKG_VERSION").into());
     let qr_dialog = QrDialog::new()?;
     let unsaved_dialog = UnsavedDialog::new()?;
     // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。
@@ -855,6 +863,9 @@ pub fn run_gui() -> Result<()> {
 
     // ── 后台 tokio 线程：处理慢操作（HTTP/起停），结果回主线程 ──
     let tray_weak_bg = tray.as_weak();
+    // 版本升级：最近一次检查发现的可用新版本（CheckUpdate 写，InstallUpdate 读）
+    let latest_rel =
+        std::sync::Arc::new(std::sync::Mutex::new(None::<crate::updater::LatestRelease>));
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -965,6 +976,111 @@ pub fn run_gui() -> Result<()> {
                         let r = test_provider(&snapshot).await;
                         let _ = prov_tx.send((idx, r));
                     }
+                    // ── 版本升级：检查（GitHub latest release）──
+                    UiCmd::CheckUpdate { silent } => {
+                        let tw = tray_weak_bg.clone();
+                        let latest = latest_rel.clone();
+                        tokio::spawn(async move {
+                            if !silent {
+                                let tw2 = tw.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(t) = tw2.upgrade() {
+                                        t.set_update_state(1); // 检查中
+                                    }
+                                });
+                            }
+                            let res = async {
+                                let up = crate::updater::Updater::new()?;
+                                up.check_latest().await
+                            }
+                            .await;
+                            match res {
+                                Ok(rel) => {
+                                    let newer = crate::updater::is_newer(
+                                        &rel.version,
+                                        crate::updater::CURRENT,
+                                    );
+                                    if newer {
+                                        crate::log!(
+                                            "[update] 发现新版本 v{}（当前 v{}）",
+                                            rel.version,
+                                            crate::updater::CURRENT
+                                        );
+                                    }
+                                    let ver = rel.version.clone();
+                                    let can = rel.asset_url.is_some();
+                                    if newer {
+                                        *latest.lock().unwrap() = Some(rel);
+                                    }
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(t) = tw.upgrade() {
+                                            t.set_update_version(ver.into());
+                                            t.set_update_can_install(can);
+                                            t.set_update_state(if newer { 3 } else { 2 });
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    // 静默检查（启动/周期）失败不打扰：保持原状态
+                                    crate::log!(
+                                        "[update] 检查失败{}：{e:#}",
+                                        if silent { "（静默）" } else { "" }
+                                    );
+                                    if !silent {
+                                        let _ = slint::invoke_from_event_loop(move || {
+                                            if let Some(t) = tw.upgrade() {
+                                                t.set_update_state(6);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    // ── 版本升级：下载 + 安装 + 退出（新版由分离脚本/安装器拉起）──
+                    UiCmd::InstallUpdate => {
+                        let rel = latest_rel.lock().unwrap().clone();
+                        let tw = tray_weak_bg.clone();
+                        tokio::spawn(async move {
+                            let Some(rel) = rel else { return };
+                            let Some(url) = rel.asset_url.clone() else {
+                                return;
+                            };
+                            let tw2 = tw.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(t) = tw2.upgrade() {
+                                    t.set_update_state(4); // 下载安装中
+                                }
+                            });
+                            let dest = crate::updater::download_dest(&rel.version);
+                            let r = async {
+                                let up = crate::updater::Updater::new()?;
+                                up.download_to(&url, &dest).await?;
+                                crate::updater::install_and_relaunch(&dest)
+                            }
+                            .await;
+                            match r {
+                                Ok(()) => {
+                                    crate::log!(
+                                        "[update] v{} 安装完成，退出并重启到新版本",
+                                        rel.version
+                                    );
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        install::svc_stop();
+                                        let _ = slint::quit_event_loop();
+                                    });
+                                }
+                                Err(e) => {
+                                    crate::log!("[update] 安装失败：{e:#}");
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(t) = tw.upgrade() {
+                                            t.set_update_state(3); // 回到可升级，允许重试
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -1016,6 +1132,42 @@ pub fn run_gui() -> Result<()> {
         tray.on_toggle_autostart(move |on| {
             let _ = platform::set_autostart(on);
         });
+        tray.on_check_update({
+            let tx = txc();
+            move || {
+                let _ = tx.send(UiCmd::CheckUpdate { silent: false });
+            }
+        });
+        tray.on_install_update({
+            let tx = txc();
+            move || {
+                let _ = tx.send(UiCmd::InstallUpdate);
+            }
+        });
+    }
+    // 启动 20s 后静默检查一次更新，之后每 6h 复查（失败静默；有新版本时托盘菜单出现「升级」项）
+    {
+        let tx2 = tx.clone();
+        let t = slint::Timer::default();
+        t.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_secs(20),
+            move || {
+                let _ = tx2.send(UiCmd::CheckUpdate { silent: true });
+            },
+        );
+        // Timer 需保活到触发：drop 会取消（与 show_window_and_focus 同款泄漏处理，百字节级）
+        std::mem::forget(t);
+        let tx3 = tx.clone();
+        let t6 = slint::Timer::default();
+        t6.start(
+            slint::TimerMode::Repeated,
+            Duration::from_secs(6 * 3600),
+            move || {
+                let _ = tx3.send(UiCmd::CheckUpdate { silent: true });
+            },
+        );
+        std::mem::forget(t6);
     }
     // #8 M0 自动引导：claude/codex/pi/prime-agent 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
     // （load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好 agent 的
