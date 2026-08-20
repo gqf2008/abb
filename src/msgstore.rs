@@ -19,7 +19,11 @@ use std::path::PathBuf;
 pub struct MsgRow {
     pub id: i64,
     pub bot_key: String,
+    /// 会话 id（查询投影保留：per-chat 过滤/后续按会话分组用；当前 GUI 不展示）
+    #[allow(dead_code)]
     pub chat_id: String,
+    /// 消息 id（查询投影保留：去重/定位用；当前 GUI 不展示）
+    #[allow(dead_code)]
     pub mid: String,
     /// "user"=发送者消息 / "assistant"=bot 回复。
     pub direction: String,
@@ -45,6 +49,9 @@ impl MsgStore {
     }
 
     /// 按指定路径构造（测试注入临时路径，先例：DeliveryStore::new_at / PendingStore::at）。
+    /// cfg(test)：只有测试构建需要（bridge 测试注入隔离路径），非测试构建不编译，
+    /// 避免 dead_code。
+    #[cfg(test)]
     pub fn at(path: PathBuf) -> MsgStore {
         MsgStore { path }
     }
@@ -81,6 +88,7 @@ impl MsgStore {
 
     /// 落一条历史消息。返回是否真正插入（false = mid+direction 已存在，幂等忽略，或失败）。
     /// 调用方：bridge.handle（per-chat 串行锁内，见模块注释）。
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &self,
         bot_key: &str,
@@ -186,6 +194,7 @@ impl MsgStore {
 /// 原子写 + rename 保证整文件可见，故不读内容）：
 /// - `msg-clear.command`：清空全部历史 + 清空未读提醒（设置窗「手动清除」）
 /// - `msg-read.command`：清空未读提醒（提醒弹窗「弹出即已读」，弹窗展示后即落盘）
+///
 /// 由 service 的 history-gc 任务每 2s 轮询调用（service 是 unread.json 的唯一写方，
 /// 弹窗已读走命令文件而非 GUI 直写，避免与 service 的写竞争）。
 pub fn consume_commands() {
