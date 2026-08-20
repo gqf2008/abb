@@ -480,10 +480,12 @@ impl Bridge {
 
         // should_respond（访问控制，默认私有）：公开开关开 → 放行所有人；否则只放行 owner
         // （管理员）∪ 授权者（授权码添加）白名单。未授权者只能通过授权码激活。
-        // 每次消息从 config.json 热读最新访问控制（授权/取消/改开关即时生效，不依赖启动快照）；
-        // config 读不到该 bot（单测注入）→ 回落构造时的快照。判定统一走 BotConfig::access_allows。
-        // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent 调用处。
+        // **群聊豁免授权（8-20 用户决策）**：群聊不要求白名单——任何人 @ bot 都响应，
+        // 未授权者按 sender_role 已推导的 Granted（受限模式，隔离安全默认）处理；
+        // 授权白名单只管私聊。每次消息从 config.json 热读最新访问控制（授权/取消/改开关
+        // 即时生效，不依赖启动快照）；config 读不到该 bot（单测注入）→ 回落构造时的快照。
         let (allowed, sender_role, mention_map) = self.access_and_role(sender_id);
+        let allowed = allowed || chat_type == "group";
         if !allowed {
             // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
             // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
@@ -1612,6 +1614,8 @@ impl Bridge {
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
         // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
         let (allowed, sender_role, mention_map) = self.access_and_role(&msg.sender_staff_id);
+        // 群聊豁免授权（8-20 用户决策，与飞书一致）：群里 @ bot 就响应，授权只管私聊
+        let allowed = allowed || msg.is_group();
         if !allowed {
             // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
             let chat_id = msg.chat_id().to_string();
@@ -1621,6 +1625,25 @@ impl Bridge {
                 .await
             {
                 return;
+            }
+            // #74 扩展（8-20 用户反馈，与飞书对称）：未授权单聊也提醒 + 落历史；
+            // 钉钉事件无时间字段 → 当前秒；授权码消费成功（上面 return）的不提醒
+            if is_p2p && !msg.mid.is_empty() {
+                self.msgstore.insert(
+                    &self.bot.key(),
+                    &chat_id,
+                    &msg.mid,
+                    "user",
+                    &msg.sender_staff_id,
+                    &msg.text,
+                    crate::chrono_lite::unix_secs() as i64,
+                );
+                self.unread.report(
+                    &self.bot.key(),
+                    &msg.sender_staff_id,
+                    &crate::agent::truncate(&msg.text, 40),
+                    crate::chrono_lite::unix_secs() as i64,
+                );
             }
             crate::log!(
                 "[dingtalk] 忽略非 owner 消息 from={}",
@@ -3659,7 +3682,9 @@ mod tests {
     /// 最高优先级安全回归（审查 I1）：免 @ 只放宽 @ 过滤一层——off 状态下
     /// 未授权用户仍在访问控制层被拒，绝不能进 agent。
     #[tokio::test]
-    async fn mention_off_does_not_bypass_access_control() {
+    async fn group_access_exempt_but_private_still_gated() {
+        // 8-20 用户决策：群聊不要求授权（未授权者 @ bot 被服务，@ 门槛是唯一防洪闸）；
+        // 私聊授权仍生效（未授权私聊只提醒不触发 agent）
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
@@ -3671,7 +3696,7 @@ mod tests {
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
         bridge.set_mention_mode("oc_g", Some("off"));
-        // 未授权 sender（非 owner/授权者、非公开模式）+ 免 @ 群 → 仍被拒
+        // 未授权 sender + 免 @ 群 → 群聊豁免授权：被服务（受限角色）
         bridge
             .on_payload(
                 feishu_payload(
@@ -3689,8 +3714,30 @@ mod tests {
             )
             .await;
         assert!(
-            runner.prompts().is_empty(),
-            "off 不绕过访问控制（未授权者被拒）"
+            !runner.prompts().is_empty(),
+            "群聊豁免授权：未授权者被服务（@ 门槛才是防洪闸）"
+        );
+        // 未授权私聊 → 仍被拒（不触发 agent，只提醒/落历史）
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m2",
+                    "oc_p2p",
+                    "p2p",
+                    "",
+                    "",
+                    "user",
+                    "ou_stranger",
+                    &[],
+                    "私聊陌生人消息",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(
+            runner.prompts().len(),
+            1,
+            "私聊授权仍生效：未授权私聊不触发 agent"
         );
         cleanup_bridge(&bridge);
     }
