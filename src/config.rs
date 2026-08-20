@@ -295,6 +295,11 @@ fn default_true() -> bool {
     true
 }
 
+/// #74 消息历史保留期默认值（天）。
+fn default_history_retention_days() -> u32 {
+    30
+}
+
 impl BotConfig {
     /// 隔离键：name 优先，空则 app_id 尾 6 位；再空则 "default"。
     pub fn key(&self) -> String {
@@ -563,7 +568,7 @@ pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
             .unwrap_or(true)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub owner_open_id: String,
@@ -573,6 +578,15 @@ pub struct Config {
     /// 把消息投递到其它 bot 的会话（服务侧路由投递 + 失败兜底）。
     #[serde(default)]
     pub cross_delivery_enabled: bool,
+    /// 消息历史保留天数（#74）：messages.sqlite 里超过该天数的记录由 service 的
+    /// history-gc 任务周期清理（启动一次 + 每 24h）。serde default 30；
+    /// 0/缺失按 1 天兜底（gc 内部 max(1)）。
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u32,
+    /// 非 owner 私聊消息提醒总开关（#74）：false = 不弹提醒窗、不显示托盘红点
+    /// （历史记录仍照常落库，历史页不受影响）。默认 true。
+    #[serde(default = "default_true")]
+    pub notify_enabled: bool,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -598,6 +612,31 @@ pub struct Config {
     bot_open_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     primary_chat_id: String,
+}
+
+/// 手动 Default：derive(Default) 对 bool/u32 给 false/0，与 serde 默认（notify_enabled=true、
+/// history_retention_days=30）不一致——Config::default() 会被 load() 在「config.json 不存在」
+/// 时当作空配置返回，必须与反序列化缺省同口径（BotConfig 的 enabled 同款处理）。
+/// 不写盘/缺省即默认值，与 skip_serializing_if 语义一致。
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            owner_open_id: String::new(),
+            default_backend: String::new(),
+            cross_delivery_enabled: false,
+            history_retention_days: default_history_retention_days(),
+            notify_enabled: true,
+            bots: Vec::new(),
+            providers: Vec::new(),
+            default_provider: String::new(),
+            custom_roles: Vec::new(), // #75 自定义角色模板
+            app_id: String::new(),
+            app_secret: String::new(),
+            bot_name: String::new(),
+            bot_open_id: String::new(),
+            primary_chat_id: String::new(),
+        }
+    }
 }
 
 /// 文件名安全化：只留字母数字、-、_、中文等，去掉路径分隔与空白。
@@ -1729,6 +1768,30 @@ mod tests {
         assert!(s.contains("\"cross_delivery_enabled\":true"));
         let back: Config = serde_json::from_str(&s).unwrap();
         assert!(back.cross_delivery_enabled);
+    }
+
+    #[test]
+    fn history_settings_defaults_and_roundtrip() {
+        // #74：保留期默认 30 天、提醒开关默认开；旧 config 无字段 → 反序列化按默认
+        let c = Config::default();
+        assert_eq!(c.history_retention_days, 30);
+        assert!(c.notify_enabled);
+        let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
+        let back: Config = serde_json::from_str(old).unwrap();
+        assert_eq!(back.history_retention_days, 30, "旧文件兼容缺省");
+        assert!(back.notify_enabled, "旧文件兼容缺省");
+        // 显式值序列化/反序列化往返不丢
+        let c2 = Config {
+            history_retention_days: 90,
+            notify_enabled: false,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        assert!(s.contains("\"history_retention_days\":90"));
+        assert!(s.contains("\"notify_enabled\":false"));
+        let back2: Config = serde_json::from_str(&s).unwrap();
+        assert_eq!(back2.history_retention_days, 90);
+        assert!(!back2.notify_enabled);
     }
 
     #[test]
