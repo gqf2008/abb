@@ -494,6 +494,9 @@ export component ConfirmDialog inherits Window {
     // busy（8-20）：确认后转"执行中"（按钮禁用，防连点）；结果回来由 Rust 侧
     // 更新 message/按钮文案——成功即关，失败显示错误让用户看到（不再静默关窗）
     in-out property <bool> busy: false;
+    // failed（8-20）：操作失败态——主按钮变「重试」（action 保留可重发），
+    // 取消按钮禁用（成功才能正常关闭；红点 X 仍是放弃出口）
+    in-out property <bool> failed: false;
     callback confirmed();
     callback canceled();
 
@@ -522,7 +525,7 @@ export component ConfirmDialog inherits Window {
         HorizontalBox {
             alignment: center;
             spacing: 10px;
-            PixelButton { text: root.cancel-text; enabled: !root.busy; clicked => { root.canceled(); } }
+            PixelButton { text: root.cancel-text; enabled: !root.busy && !root.failed; clicked => { root.canceled(); } }
             PixelButton { text: root.confirm-text; variant: root.danger ? "danger" : "primary"; enabled: !root.busy; clicked => { root.confirmed(); } }
             }
         }

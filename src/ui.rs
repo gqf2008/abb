@@ -156,7 +156,9 @@ enum VirtualBotEvt {
 }
 
 /// 确认弹窗待执行的虚拟 Bot 操作（#75）：取消登记（轻确认）/ 解散群（红色强确认）。
-/// 主线程持有；弹确认窗前写入，确认回调里 take 并发送对应 UiCmd，取消/关闭时清空。
+/// 主线程持有；弹确认窗前写入，确认回调里 clone 并发送对应 UiCmd（失败态「重试」
+/// 保留原 action，成功才 take 清空），取消/红点关闭时清空。
+#[derive(Clone)]
 enum VbAction {
     /// 取消登记：平台群保留，只删 ABB 登记。
     Deregister { bot_key: String, chat_id: String },
@@ -1170,9 +1172,12 @@ pub fn run_gui() -> Result<()> {
         let tx = tx.clone();
         vb_confirm.on_confirmed(move || {
             crate::log!("[gui] 虚拟 Bot 确认弹窗：确认");
-            if let Some(a) = action.borrow_mut().take() {
+            // clone 而非 take（8-20 用户反馈：失败态「重试」需要保留 action 重发；
+            // 成功后在 Done 里 take 清空）
+            if let Some(a) = action.borrow().clone() {
                 if let Some(c) = cw.upgrade() {
                     c.set_busy(true);
+                    c.set_failed(false);
                     c.set_message("执行中…".into());
                 }
                 let _ = tx.send(match a {
@@ -3648,6 +3653,8 @@ pub fn run_gui() -> Result<()> {
         let notif_timer = notif_timer.clone();
         // 虚拟 Bot 确认弹窗 weak（#75：解散/取消登记结果回填——成功关窗/失败可见）
         let vb_confirm_weak = vb_confirm.as_weak();
+        // 确认弹窗待执行操作（失败重试时保留；成功才 take 清空）
+        let vb_action_t = vb_action.clone();
         // #74 历史记录列表 model（历史页打开时每 tick 刷新）
         let history_model = history_model.clone();
         timer.start(
@@ -3801,9 +3808,10 @@ pub fn run_gui() -> Result<()> {
                                     slint::VecModel::from(lines),
                                 )));
                             }
-                            // 确认弹窗执行中（解散/取消登记）→ 回填结果：成功/失败都**不自动
-                            // 关窗**（8-20 用户反馈：用户可能还要继续操作）——弹窗展示结果，
-                            // 点「知道了」手动关；action 已 take，再点走 None 分支只关窗。
+                            // 确认弹窗执行中（解散/取消登记）→ 回填结果（8-20 用户反馈）：
+                            // 成功 → 清 action + 弹窗显示成功（点「知道了」手动关）；
+                            // 失败 → **保留 action** + 主按钮变「重试」（再点重发同一操作），
+                            // 取消按钮禁用——成功才能正常关闭（红点 X 是放弃出口）。
                             if let Some(c) = vb_confirm_weak.upgrade() {
                                 if c.get_busy() {
                                     c.set_busy(false);
@@ -3815,15 +3823,19 @@ pub fn run_gui() -> Result<()> {
                                             Err(e) => format!("❌ {n}：{e}"),
                                         })
                                         .collect();
-                                    c.set_title_text(if all_ok {
-                                        "操作成功"
+                                    if all_ok {
+                                        vb_action_t.borrow_mut().take();
+                                        c.set_failed(false);
+                                        c.set_title_text("操作成功".into());
+                                        c.set_confirm_text("知道了".into());
+                                        c.set_cancel_text("关闭".into());
                                     } else {
-                                        "操作失败"
+                                        c.set_failed(true);
+                                        c.set_title_text("操作失败".into());
+                                        c.set_confirm_text("重试".into());
+                                        c.set_cancel_text("取消".into());
                                     }
-                                    .into());
                                     c.set_message(lines.join("\n").into());
-                                    c.set_confirm_text("知道了".into());
-                                    c.set_cancel_text("关闭".into());
                                 }
                             }
                             if let Some(w) = settings_weak.upgrade() {
