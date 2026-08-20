@@ -551,6 +551,12 @@ impl FeishuClient {
             .as_str()
             .unwrap_or("")
             .to_string();
+        // 已解散的群 API 不报错：返回 200 + chat_status="dissolved"（8-20 真机实测，
+        // 用户解散全部虚拟 Bot 群后逐个 GET 确认）。识别为错误——虚拟 Bot 手动刷新
+        // 据此移除登记+归档；注入路径 best-effort 失败也无害（dissolved 群无消息）。
+        if resp["data"]["chat_status"].as_str() == Some("dissolved") {
+            anyhow::bail!("群已解散（chat_status=dissolved）");
+        }
         Ok((name, desc))
     }
 
@@ -964,6 +970,24 @@ mod tests {
         assert_eq!(recs[1].method, "GET");
         assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
         assert_eq!(recs[1].auth, "Bearer mock-token");
+    }
+
+    #[tokio::test]
+    async fn get_chat_info_errors_on_dissolved_group() {
+        // 已解散的群 API 返回 200 + chat_status=dissolved（8-20 真机实测）——必须识别
+        // 为错误，虚拟 Bot 手动刷新据此移除登记+归档
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("GET".to_string(), "/im/v1/chats/oc_dead".to_string()),
+            json!({"code": 0, "data": {"chat_id": "oc_dead", "name": "后端开发", "chat_status": "dissolved"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let e = fs.get_chat_info("oc_dead").await.unwrap_err();
+        assert!(
+            e.to_string().contains("解散"),
+            "错误应含'解散': {e:#}"
+        );
     }
 
     #[tokio::test]
