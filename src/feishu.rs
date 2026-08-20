@@ -443,12 +443,16 @@ impl FeishuClient {
     }
 
     /// 创建群聊（虚拟 Bot #75）：POST /im/v1/chats。
-    /// - `owner_user_id`：把 bot 配置的 owner（open_id）设为群主并拉进群——**必须**：
-    ///   否则群里只有机器人，用户飞书客户端看不到群、无法使用（8-20 实测踩坑，
-    ///   创建"成功"但群不可见）；
-    /// - `set_bot_manager: true`：指定了 owner_id 时把机器人设为管理员——机器人是
-    ///   管理员才能收发群消息；且群主是用户，用户才可在飞书里直接改群名/群介绍
-    ///   （=改角色，平台为准的核心交互）；
+    /// 群主策略（8-20 用户决策，两次调整后的最终形态）：**群主 = 机器人**（不传
+    /// owner_id，创建者默认群主，管理权自持），**owner 用户为管理员 + 成员**：
+    /// - `user_id_list: [owner_user_id]`：把 owner 拉进群（否则用户飞书客户端看不到群，
+    ///   8-20 实测踩坑）——注意字段名是 `user_id_list` 不是旧文档的 user_ids（现网 schema，
+    ///   lark-cli dry-run + SDK 核实）；
+    /// - 创建后调 `add_managers` 把 owner 设为管理员（bot 是群主，有权限；管理员才能
+    ///   在飞书里改群名/群介绍 = 改角色）。best-effort：失败只 log 返回 Ok（owner 仍是
+    ///   成员可用，可手动在飞书设管理员）；
+    /// - 曾试过 owner_id=用户（PR #78）：转让后 bot 降级普通成员且"只有群主能加管理员"
+    ///   → bot 失去全部管理权、无法自助恢复——此路不通，弃用；
     /// - `uuid` 幂等：同 uuid 重复调用返回同一个群（网络重试/超时重发安全）；
     /// - `chat_mode: "group"`：显式普通群（与话题群 p2p 群区分）。
     ///
@@ -467,9 +471,7 @@ impl FeishuClient {
             .json(&json!({
                 "name": name,
                 "description": description,
-                "owner_id": owner_user_id,
-                "user_ids": [owner_user_id],
-                "set_bot_manager": true,
+                "user_id_list": [owner_user_id],
                 "uuid": uuid::Uuid::new_v4().to_string(),
                 "chat_mode": "group",
             }))
@@ -484,10 +486,45 @@ impl FeishuClient {
                 resp.get("msg")
             );
         }
-        resp["data"]["chat_id"]
+        let chat_id = resp["data"]["chat_id"]
             .as_str()
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("创建群响应缺 chat_id: {resp}"))
+            .ok_or_else(|| anyhow!("创建群响应缺 chat_id: {resp}"))?;
+        // 创建后把 owner 设为管理员（群主=bot 策略；只有群主能加管理员，创建瞬间
+        // bot 即群主，此处调用有权限）。best-effort：失败只 log 返回 Ok——owner 仍是
+        // 成员可用，可手动在飞书群设置里补设管理员。
+        if !owner_user_id.is_empty() {
+            if let Err(e) = self.add_managers(&chat_id, &[owner_user_id]).await {
+                crate::log!(
+                    "[feishu] 群 {chat_id} 已创建但设置 owner 管理员失败（可手动在飞书设置）: {e:#}"
+                );
+            }
+        }
+        Ok(chat_id)
+    }
+
+    /// 指定群管理员（虚拟 Bot：owner 当管理员，群主仍是 bot）。POST
+    /// /im/v1/chats/:chat_id/managers/add_managers（lark-cli dry-run 确认）。
+    /// 仅群主可调——bot 是创建者/群主，天然有权限。member_id_type 默认 open_id。
+    pub async fn add_managers(&self, chat_id: &str, manager_ids: &[&str]) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .post(self.url(&format!("/im/v1/chats/{chat_id}/managers/add_managers")))
+            .bearer_auth(&token)
+            .json(&json!({ "manager_ids": manager_ids }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "设置管理员失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        Ok(())
     }
 
     /// 群资料（虚拟 Bot 注入用）：(群名, 群介绍)。失败返回 Err——调用方 best-effort：
@@ -514,15 +551,24 @@ impl FeishuClient {
             .as_str()
             .unwrap_or("")
             .to_string();
+        // 已解散的群 API 不报错：返回 200 + chat_status="dissolved"（8-20 真机实测，
+        // 用户解散全部虚拟 Bot 群后逐个 GET 确认）。识别为错误——虚拟 Bot 手动刷新
+        // 据此移除登记+归档；注入路径 best-effort 失败也无害（dissolved 群无消息）。
+        if resp["data"]["chat_status"].as_str() == Some("dissolved") {
+            anyhow::bail!("群已解散（chat_status=dissolved）");
+        }
         Ok((name, desc))
     }
 
-    /// 改群资料（虚拟 Bot 编辑：群名=角色名、群介绍=system prompt，PATCH 即时生效）。
+    /// 改群资料（虚拟 Bot 编辑：群名=角色名、群介绍=system prompt，即时生效）。
+    /// ⚠️ 方法是 **PUT** 不是 PATCH（8-20 真机实测：PATCH /im/v1/chats/:id 返回
+    /// 404 page not found——mock 只验形状不验路由，假绿；lark-cli im.chats.update
+    /// dry-run 显示 PUT）。owner_id 字段可顺带转让群主（新群主必须在群里）。
     pub async fn update_chat(&self, chat_id: &str, name: &str, description: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
             .http
-            .patch(self.url(&format!("/im/v1/chats/{chat_id}")))
+            .put(self.url(&format!("/im/v1/chats/{chat_id}")))
             .bearer_auth(&token)
             .json(&json!({
                 "name": name,
@@ -543,6 +589,7 @@ impl FeishuClient {
     }
 
     /// 解散群（虚拟 Bot 解散：DELETE /im/v1/chats/:chat_id，不可恢复——GUI 侧强确认）。
+    /// 需要应用开通 im:chat 或 im:chat:delete 权限（99991672 权限拒绝见 scope_hint）。
     pub async fn delete_chat(&self, chat_id: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
@@ -562,6 +609,79 @@ impl FeishuClient {
         }
         Ok(())
     }
+
+    /// 按 open_id 给用户私聊发消息（receive_id_type=open_id）。
+    /// 用途：权限不足时给 owner 发授权指引（见 scope_hint）。与 send_text 同款
+    /// 卡片 markdown 分段，只是收件人从 chat_id 换成 open_id（不依赖 primary_chat
+    /// 是否可用）。
+    pub async fn send_text_to_user(&self, open_id: &str, text: &str) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let chunks = split_text(text, FEISHU_MSG_LIMIT);
+        let n = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let body_text = if n > 1 {
+                format!("（{}/{n}）\n{}", i + 1, chunk)
+            } else {
+                chunk
+            };
+            let resp: serde_json::Value = self
+                .http
+                .post(self.url("/im/v1/messages?receive_id_type=open_id"))
+                .bearer_auth(&token)
+                .json(&json!({
+                    "receive_id": open_id,
+                    "msg_type": "interactive",
+                    "content": serde_json::to_string(&json!({
+                        "elements": [{"tag":"markdown","content": body_text}]
+                    }))?,
+                }))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+                anyhow::bail!(
+                    "发给用户失败 code={:?} msg={:?}",
+                    resp.get("code"),
+                    resp.get("msg")
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 飞书权限不足错误识别（8-20 实测：code=99991672 Access denied，错误文本带 scope
+/// 列表与授权链接）。返回 (需要的 scope 摘要, 授权链接)。ABB 用它给 owner 发授权指引——
+/// 平台权限问题不该只躺在日志/状态行里，owner 需要可执行的下一步。
+/// 参数是任意 API 失败后的完整错误字符串（含 code=… msg=…，见各方法 bail 格式）；
+/// 检测「99991672 或 Access denied」出现才解析，避免误判其它错误码。
+pub fn scope_hint(err: &str) -> Option<(String, String)> {
+    if !err.contains("99991672") && !err.contains("Access denied") {
+        return None;
+    }
+    // msg 里的 scope 列表：[im:chat, im:chat:delete]（取 [] 内原文）
+    let scopes = err
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .unwrap_or("（详见授权链接）")
+        .to_string();
+    // msg 里的授权链接：https://open.feishu.cn/app/...——链接常紧跟在「即可：」等
+    // 中文标点后（同一 token 内），不能用 starts_with 匹配整个 token，改为 contains
+    // 定位后截断（实测错误串就是「…即可：https://…」形态，8-20 真机样例）。
+    // 无链接给不出则 None——调用方发不带链接的提示。
+    err.split_whitespace()
+        .find(|w| w.contains("https://open.feishu.cn/app/"))
+        .and_then(|w| {
+            w.find("https://open.feishu.cn/app/")
+                .map(|i| w[i..].to_string())
+        })
+        .map(|s| {
+            s.trim_end_matches(['，', '。', ',', '.', '"', '\''])
+                .to_string()
+        })
+        .map(|l| (scopes, l))
 }
 
 /// 构造话题回复请求体（纯函数，便于单测断言 msg_type/reply_in_thread/content）。
@@ -763,6 +883,13 @@ mod tests {
             ("POST".to_string(), "/im/v1/chats".to_string()),
             json!({"code": 0, "msg": "success", "data": {"chat_id": "oc_vb_new"}}),
         );
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/im/v1/chats/oc_vb_new/managers/add_managers".to_string(),
+            ),
+            json!({"code": 0, "msg": "success"}),
+        );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
         let chat_id = fs
@@ -772,8 +899,8 @@ mod tests {
         assert_eq!(chat_id, "oc_vb_new");
 
         let recs = server.requests.lock().unwrap().clone();
-        // 两次请求：token + 建群（顺序固定：token 先）
-        assert_eq!(recs.len(), 2);
+        // 三次请求：token + 建群 + 设 owner 为管理员（顺序固定：token 先）
+        assert_eq!(recs.len(), 3, "建群后应把 owner 设为管理员");
         assert_eq!(recs[0].method, "POST");
         assert!(recs[0].path.starts_with("/auth/v3/"));
         let create = &recs[1];
@@ -783,10 +910,18 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
         assert_eq!(body["name"], "后端开发");
         assert_eq!(body["description"], "你是后端工程师。");
-        assert_eq!(body["set_bot_manager"], true, "指定 owner 时 bot 设为管理员");
-        assert_eq!(body["owner_id"], "ou_boss", "群主必须是用户（否则用户看不到群）");
+        // 群主策略（8-20 用户决策最终版）：不传 owner_id/set_bot_manager（群主=bot，
+        // 创建者默认；传 owner_id 会导致转让后 bot 失去管理权无法恢复）
+        assert!(
+            body.get("owner_id").is_none(),
+            "群主必须是 bot（不传 owner_id）"
+        );
+        assert!(
+            body.get("set_bot_manager").is_none(),
+            "bot 默认群主，无需 set_bot_manager"
+        );
         assert_eq!(
-            body["user_ids"],
+            body["user_id_list"],
             json!(["ou_boss"]),
             "必须把用户拉进群（8-20 实测：群里只有 bot 时飞书客户端不可见）"
         );
@@ -798,6 +933,12 @@ mod tests {
                 .unwrap_or(false),
             "uuid 幂等键必须有"
         );
+        // 第二次调用：owner 设为管理员（bot 群主身份有权限）
+        let mgr = &recs[2];
+        assert_eq!(mgr.method, "POST");
+        assert_eq!(mgr.path, "/im/v1/chats/oc_vb_new/managers/add_managers");
+        let mb: serde_json::Value = serde_json::from_str(&mgr.body).unwrap();
+        assert_eq!(mb["manager_ids"], json!(["ou_boss"]), "owner 设为管理员");
     }
 
     #[tokio::test]
@@ -832,10 +973,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_chat_patches_name_and_description() {
+    async fn get_chat_info_errors_on_dissolved_group() {
+        // 已解散的群 API 返回 200 + chat_status=dissolved（8-20 真机实测）——必须识别
+        // 为错误，虚拟 Bot 手动刷新据此移除登记+归档
         let mut routes = std::collections::HashMap::new();
         routes.insert(
-            ("PATCH".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
+            ("GET".to_string(), "/im/v1/chats/oc_dead".to_string()),
+            json!({"code": 0, "data": {"chat_id": "oc_dead", "name": "后端开发", "chat_status": "dissolved"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let e = fs.get_chat_info("oc_dead").await.unwrap_err();
+        assert!(e.to_string().contains("解散"), "错误应含'解散': {e:#}");
+    }
+
+    #[tokio::test]
+    async fn update_chat_puts_name_and_description() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("PUT".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
             json!({"code": 0}),
         );
         let server = mock_server(routes).await;
@@ -844,7 +1000,7 @@ mod tests {
             .await
             .unwrap();
         let recs = server.requests.lock().unwrap().clone();
-        assert_eq!(recs[1].method, "PATCH");
+        assert_eq!(recs[1].method, "PUT");
         assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
         let body: serde_json::Value = serde_json::from_str(&recs[1].body).unwrap();
         assert_eq!(body["name"], "前端开发");
@@ -865,6 +1021,52 @@ mod tests {
         assert_eq!(recs[1].method, "DELETE");
         assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
         assert_eq!(recs[1].auth, "Bearer mock-token");
+    }
+
+    #[test]
+    fn scope_hint_parses_real_access_denied_error() {
+        // 8-20 真机实测的错误串（解散群被拒）：应解析出 scope 列表与授权链接
+        let err = "解散群失败 code=99991672 msg=\"Access denied. One of the following scopes is required: [im:chat, im:chat:delete].应用尚未开通所需的应用身份权限：[im:chat, im:chat:delete]，点击链接申请并开通任一权限即可：https://open.feishu.cn/app/cli_a75884b6c733900b/auth?q=im:chat,im:chat:delete&op_from=openapi&token_type=tenant\"";
+        let (scopes, link) = scope_hint(err).expect("应识别出权限不足");
+        assert_eq!(
+            scopes, "im:chat, im:chat:delete",
+            "scope 列表取自错误文本 []"
+        );
+        assert!(
+            link.starts_with("https://open.feishu.cn/app/"),
+            "授权链接应被提取: {link}"
+        );
+    }
+
+    #[test]
+    fn scope_hint_ignores_non_scope_errors() {
+        assert!(scope_hint("创建群失败 code=99992000 msg=unknown").is_none());
+        assert!(scope_hint("网络超时").is_none());
+        assert!(scope_hint("").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_text_to_user_uses_open_id_receive_type() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/messages".to_string()),
+            json!({"code": 0, "msg": "success", "data": {"message_id": "om_1"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        fs.send_text_to_user("ou_boss", "请开通权限：https://x")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs[1].method, "POST");
+        assert_eq!(recs[1].path, "/im/v1/messages");
+        assert_eq!(
+            recs[1].query, "receive_id_type=open_id",
+            "发给用户必须走 open_id 接收类型"
+        );
+        let body: serde_json::Value = serde_json::from_str(&recs[1].body).unwrap();
+        assert_eq!(body["receive_id"], "ou_boss");
+        assert_eq!(body["msg_type"], "interactive");
     }
 }
 

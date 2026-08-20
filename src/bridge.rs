@@ -66,6 +66,9 @@ pub struct Bridge {
     pub msgstore: crate::msgstore::MsgStore,
     /// #74 未读提醒队列（logs/unread.json 写句柄）。同上：测试注入临时路径。
     pub unread: crate::unread::UnreadStore,
+    /// 虚拟 Bot 登记表（#75）：事件驱动移除（im.chat.deleted_v1 群被解散）用它写；
+    /// 生产 = ~/.agent-bridge/virtual-bots.json，测试注入临时路径（同 msgstore/unread）。
+    pub vb_store: crate::virtualbot::VirtualBotStore,
 }
 
 #[derive(Debug)]
@@ -156,6 +159,7 @@ impl Bridge {
             chat_info_cache: crate::virtualbot::ChatInfoCache::new(),
             msgstore: crate::msgstore::MsgStore::production(),
             unread: crate::unread::UnreadStore::production(),
+            vb_store: crate::virtualbot::VirtualBotStore::new(),
         }
     }
 
@@ -206,6 +210,32 @@ impl Bridge {
             }
             crate::config::MentionModeSave::Failed => false,
         }
+    }
+
+    /// 发送者展示名解析（#74 历史/提醒展示用，8-20 用户反馈：显示名字不是 id）：
+    /// 本地授权者名单优先（授权时已反查过名字），未授权用户 API 反查（best-effort）。
+    /// 空 = 未查到（GUI 回落 id）。
+    async fn resolve_sender_name(&self, sender_id: &str) -> String {
+        // 本地名单名字先克隆（释放 &self 借用——跨 await 持有引用会让 future 非 Send）
+        let local = {
+            let infos = if self.bot.is_dingtalk() {
+                &self.bot.ding_granted_infos
+            } else {
+                &self.bot.granted_infos
+            };
+            infos
+                .iter()
+                .find(|i| i.open_id == sender_id)
+                .map(|i| i.name.clone())
+                .filter(|n| !n.is_empty())
+        };
+        if let Some(n) = local {
+            return n;
+        }
+        self.msgr
+            .user_display_name(sender_id)
+            .await
+            .unwrap_or_default()
     }
 
     /// 热读 config 推导（准入, 发送者角色）——on_payload / on_dingtalk 共用同一份
@@ -429,6 +459,12 @@ impl Bridge {
             Err(_) => return,
         };
         let event_type = body["header"]["event_type"].as_str().unwrap_or("");
+        if event_type == "im.chat.deleted_v1" {
+            // 虚拟 Bot：群被平台解散 → 自动移除登记（8-20 用户决策——ABB 不残留
+            // 幽灵登记：deliver @角色名不再指向死群、GUI 列表不再显示无效项）
+            self.on_chat_deleted(&body["event"]).await;
+            return;
+        }
         if event_type != "im.message.receive_v1" {
             return; // 只处理消息接收事件，其它（reaction/task…）忽略
         }
@@ -470,10 +506,12 @@ impl Bridge {
 
         // should_respond（访问控制，默认私有）：公开开关开 → 放行所有人；否则只放行 owner
         // （管理员）∪ 授权者（授权码添加）白名单。未授权者只能通过授权码激活。
-        // 每次消息从 config.json 热读最新访问控制（授权/取消/改开关即时生效，不依赖启动快照）；
-        // config 读不到该 bot（单测注入）→ 回落构造时的快照。判定统一走 BotConfig::access_allows。
-        // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent 调用处。
+        // **群聊豁免授权（8-20 用户决策）**：群聊不要求白名单——任何人 @ bot 都响应，
+        // 未授权者按 sender_role 已推导的 Granted（受限模式，隔离安全默认）处理；
+        // 授权白名单只管私聊。每次消息从 config.json 热读最新访问控制（授权/取消/改开关
+        // 即时生效，不依赖启动快照）；config 读不到该 bot（单测注入）→ 回落构造时的快照。
         let (allowed, sender_role, mention_map) = self.access_and_role(sender_id);
+        let allowed = allowed || chat_type == "group";
         if !allowed {
             // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
             // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
@@ -495,6 +533,51 @@ impl Bridge {
                 sender_id,
                 chat_type
             );
+            // #74 扩展（8-20 用户实测反馈）：**未授权私聊也提醒 + 落历史**——owner 能
+            // 看到谁在找 bot（决定是否授权）；群聊未授权保持忽略（提醒范围=私聊）。
+            // 授权码消费成功（上面 return）的不提醒——那是激活流程，owner 无需被打扰。
+            // mid/ts 主路径解析在 access 闸之后，这里分支内自取（事件字段同源）。
+            if chat_type == "p2p" {
+                let mid = message["message_id"].as_str().unwrap_or("").to_string();
+                let ts = body["header"]["create_time"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| body["header"]["create_time"].as_i64())
+                    .map(|ms| ms / 1000)
+                    .unwrap_or_else(|| crate::chrono_lite::unix_secs() as i64);
+                if !mid.is_empty() {
+                    let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
+                    let text =
+                        crate::feishu::parse_content(message["content"].as_str().unwrap_or(""))
+                            .text
+                            .trim()
+                            .to_string();
+                    // 展示名：未授权用户不在本地名单，API 反查（best-effort，8-20 用户
+                    // 反馈：提醒/历史要显示名字不是 open_id；失败空串由 GUI 回落 id）
+                    let uname = self
+                        .msgr
+                        .user_display_name(sender_id)
+                        .await
+                        .unwrap_or_default();
+                    self.msgstore.insert(
+                        &self.bot.key(),
+                        &chat_id,
+                        &mid,
+                        "user",
+                        sender_id,
+                        &uname,
+                        &text,
+                        ts,
+                    );
+                    self.unread.report(
+                        &self.bot.key(),
+                        sender_id,
+                        &uname,
+                        &crate::agent::truncate(&text, 40),
+                        ts,
+                    );
+                }
+            }
             return;
         }
         // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
@@ -639,6 +722,30 @@ impl Bridge {
         self.chat_info_cache
             .get(&ev.chat_id, self.msgr.as_ref())
             .await
+    }
+
+    /// 群被解散事件（im.chat.deleted_v1）：虚拟 Bot 登记自动移除——平台侧解散后 ABB
+    /// 不残留幽灵登记（deliver @角色名不再指向死群、GUI 列表不再显示无效项）。
+    /// 事件体 `{"chat_id": "oc_…"}`。写登记表与 GUI 并发的 last-writer-wins 取舍
+    /// 见 virtualbot.rs 模块注释（低频人工操作 + 事件驱动，原子重写读侧永远完整）。
+    async fn on_chat_deleted(&self, event: &serde_json::Value) {
+        let chat_id = event["chat_id"].as_str().unwrap_or("");
+        if chat_id.is_empty() {
+            return;
+        }
+        if self.vb_store.remove(&self.bot.key(), chat_id) {
+            crate::log!(
+                "[bridge] 群被解散（im.chat.deleted_v1），已自动移除虚拟 Bot 登记 chat={}",
+                trunc(chat_id, 12)
+            );
+            // 会话历史归档（用户决策：解散后不删除，移入工作区 archive/）
+            crate::virtualbot::VirtualBotStore::archive_chat_history(&self.bot.key(), chat_id);
+        } else {
+            crate::log!(
+                "[bridge] 群被解散 chat={}（非本 bot 的虚拟 Bot 登记，忽略）",
+                trunc(chat_id, 12)
+            );
+        }
     }
 
     /// 登记快照懒刷新：文件 (mtime, 长度) 变了才重读（GUI 登记/取消登记后下一条消息
@@ -974,6 +1081,14 @@ impl Bridge {
         // 提醒是纯本地 UI（托盘红点 + 弹窗），绝不主动向任何 IM 发消息（授权边界规则）。
         let record_granted = ev.role == crate::config::SenderRole::Granted
             && (ev.chat_type == "p2p" || ev.chat_type == "dm");
+        // 发送者展示名：**锁外解析**（API 反查是 await——在代际锁/串行锁内 await 会让
+        // std MutexGuard 跨 await → future 非 Send，见审查）。本地名单优先，未授权 API。
+        // 未授权私聊的名字在 on_payload 未授权分支解析（不走 handle），这里只管 granted。
+        let granted_uname = if record_granted {
+            self.resolve_sender_name(&ev.sender_id).await
+        } else {
+            String::new()
+        };
 
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
@@ -1099,21 +1214,25 @@ impl Bridge {
             // 重复提醒（弹窗/红点以「这条消息提醒过没」为准，不以收到几次为准）。
             if record_granted {
                 let user_text = history_user_text(&text, &ev);
+                // 展示名：锁外已解析（granted_uname；本地名单优先/API 反查）——
+                // 历史/提醒都显示名字（8-20 用户反馈，不显示 open_id）
                 let inserted = self.msgstore.insert(
                     &self.bot.key(),
                     &ev.chat_id,
                     &ev.mid,
                     "user",
                     &ev.sender_id,
+                    &granted_uname,
                     &user_text,
                     ev.ts,
                 );
                 if inserted {
-                    // 未读提醒：只记发送者 id + 摘要（40 字符预览），展示名由 GUI 经
-                    // config 授权者名单反查（授权时已反查过名字）。
+                    // 未读提醒：只记发送者 id + 名字 + 摘要（40 字符预览）。
+                    // insert 返回真正插入才提醒——重放同 mid 被 UNIQUE 挡住 → 不重复
                     self.unread.report(
                         &self.bot.key(),
                         &ev.sender_id,
+                        &granted_uname,
                         &crate::agent::truncate(&user_text, 40),
                         ev.ts,
                     );
@@ -1269,6 +1388,7 @@ impl Bridge {
                                 &ev.mid,
                                 "assistant",
                                 &ev.sender_id,
+                                "", // assistant 行 GUI 显示 bot 名（direction 区分）
                                 &reply,
                                 crate::chrono_lite::unix_secs() as i64,
                             );
@@ -1419,6 +1539,7 @@ impl Bridge {
                                 &item.mid,
                                 "assistant",
                                 &item.sender_id,
+                                "", // assistant 行 GUI 显示 bot 名
                                 reply,
                                 crate::chrono_lite::unix_secs() as i64,
                             );
@@ -1542,6 +1663,8 @@ impl Bridge {
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
         // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
         let (allowed, sender_role, mention_map) = self.access_and_role(&msg.sender_staff_id);
+        // 群聊豁免授权（8-20 用户决策，与飞书一致）：群里 @ bot 就响应，授权只管私聊
+        let allowed = allowed || msg.is_group();
         if !allowed {
             // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
             let chat_id = msg.chat_id().to_string();
@@ -1551,6 +1674,33 @@ impl Bridge {
                 .await
             {
                 return;
+            }
+            // #74 扩展（8-20 用户反馈，与飞书对称）：未授权单聊也提醒 + 落历史；
+            // 钉钉事件无时间字段 → 当前秒；授权码消费成功（上面 return）的不提醒
+            if is_p2p && !msg.mid.is_empty() {
+                // 展示名：未授权用户不在本地名单，API 反查（best-effort）
+                let uname = self
+                    .msgr
+                    .user_display_name(&msg.sender_staff_id)
+                    .await
+                    .unwrap_or_default();
+                self.msgstore.insert(
+                    &self.bot.key(),
+                    &chat_id,
+                    &msg.mid,
+                    "user",
+                    &msg.sender_staff_id,
+                    &uname,
+                    &msg.text,
+                    crate::chrono_lite::unix_secs() as i64,
+                );
+                self.unread.report(
+                    &self.bot.key(),
+                    &msg.sender_staff_id,
+                    &uname,
+                    &crate::agent::truncate(&msg.text, 40),
+                    crate::chrono_lite::unix_secs() as i64,
+                );
             }
             crate::log!(
                 "[dingtalk] 忽略非 owner 消息 from={}",
@@ -2265,6 +2415,9 @@ mod tests {
         bridge.unread = crate::unread::UnreadStore::at(
             std::env::temp_dir().join(format!("abb-unread-test-{key}")),
         );
+        bridge.vb_store = crate::virtualbot::VirtualBotStore::new_at(
+            std::env::temp_dir().join(format!("abb-vb-test-{key}.json")),
+        );
         (Arc::new(bridge), msgr)
     }
 
@@ -2317,6 +2470,7 @@ mod tests {
             ("abb-msgstore-test-", "-wal"),
             ("abb-msgstore-test-", "-shm"),
             ("abb-unread-test-", ""),
+            ("abb-vb-test-", ".json"),
         ] {
             let _ =
                 std::fs::remove_file(std::env::temp_dir().join(format!("{prefix}{key}{suffix}")));
@@ -3179,6 +3333,7 @@ mod tests {
                 mid,
                 "user",
                 "ou_friend",
+                "",
                 "帮我查一下",
                 1000
             ),
@@ -3225,6 +3380,7 @@ mod tests {
                 mid,
                 "assistant",
                 "ou_friend",
+                "",
                 "补发的回复",
                 2000
             ),
@@ -3585,7 +3741,9 @@ mod tests {
     /// 最高优先级安全回归（审查 I1）：免 @ 只放宽 @ 过滤一层——off 状态下
     /// 未授权用户仍在访问控制层被拒，绝不能进 agent。
     #[tokio::test]
-    async fn mention_off_does_not_bypass_access_control() {
+    async fn group_access_exempt_but_private_still_gated() {
+        // 8-20 用户决策：群聊不要求授权（未授权者 @ bot 被服务，@ 门槛是唯一防洪闸）；
+        // 私聊授权仍生效（未授权私聊只提醒不触发 agent）
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
@@ -3597,7 +3755,7 @@ mod tests {
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
         bridge.set_mention_mode("oc_g", Some("off"));
-        // 未授权 sender（非 owner/授权者、非公开模式）+ 免 @ 群 → 仍被拒
+        // 未授权 sender + 免 @ 群 → 群聊豁免授权：被服务（受限角色）
         bridge
             .on_payload(
                 feishu_payload(
@@ -3615,8 +3773,30 @@ mod tests {
             )
             .await;
         assert!(
-            runner.prompts().is_empty(),
-            "off 不绕过访问控制（未授权者被拒）"
+            !runner.prompts().is_empty(),
+            "群聊豁免授权：未授权者被服务（@ 门槛才是防洪闸）"
+        );
+        // 未授权私聊 → 仍被拒（不触发 agent，只提醒/落历史）
+        bridge
+            .on_payload(
+                feishu_payload(
+                    "m2",
+                    "oc_p2p",
+                    "p2p",
+                    "",
+                    "",
+                    "user",
+                    "ou_stranger",
+                    &[],
+                    "私聊陌生人消息",
+                )
+                .as_bytes(),
+            )
+            .await;
+        assert_eq!(
+            runner.prompts().len(),
+            1,
+            "私聊授权仍生效：未授权私聊不触发 agent"
         );
         cleanup_bridge(&bridge);
     }
@@ -4059,6 +4239,67 @@ mod tests {
         assert!(
             bridge.unread.snapshot().unwrap_or_default().is_empty(),
             "owner 消息不得产生未读"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_p2p_message_records_unread_and_history() {
+        // #74 扩展（8-20 用户实测反馈）：未授权用户私聊也提醒 + 落历史（owner 能看到
+        // 谁在找 bot）；授权码消费成功的不提醒（那是激活流程）
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        // 陌生人（非 owner 非授权者）私聊：应落 user 历史 + 未读提醒；agent 不被触发
+        let payload = feishu_payload(
+            "om_stranger",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_stranger",
+            &[],
+            "你好，我想用一下这个机器人",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+        let rows = bridge.msgstore.list_recent(10);
+        assert_eq!(rows.len(), 1, "未授权私聊应落 1 条 user 历史");
+        assert_eq!(rows[0].direction, "user");
+        assert_eq!(rows[0].sender_id, "ou_stranger");
+        assert_eq!(rows[0].text, "你好，我想用一下这个机器人");
+        let unread = bridge.unread.snapshot().unwrap();
+        assert_eq!(unread.len(), 1, "未授权私聊应产生未读提醒");
+        assert_eq!(unread[0].sender, "ou_stranger");
+        assert!(
+            msgr.sent().is_empty(),
+            "未授权消息不触发 agent、不回复（提醒是纯本地）"
+        );
+        // 未授权群聊：不提醒（提醒范围=私聊）
+        let payload2 = feishu_payload(
+            "om_stranger_g",
+            "oc_group",
+            "group",
+            "",
+            "",
+            "user",
+            "ou_stranger",
+            &[],
+            "@_user_1 你好",
+        );
+        bridge.on_payload(payload2.as_bytes()).await;
+        assert_eq!(
+            bridge.unread.snapshot().unwrap().len(),
+            1,
+            "未授权群聊不产生新提醒"
         );
         cleanup_bridge(&bridge);
     }
@@ -4857,6 +5098,45 @@ https://b.com/y"
         ev.chat_type = "dm".into();
         bridge.handle(ev).await;
         assert_eq!(runner.prompts()[1], "私聊你好");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn chat_deleted_event_removes_registration() {
+        // #75 事件驱动：im.chat.deleted_v1（平台解散群）→ 自动移除该群登记
+        let runner = Arc::new(MockAgentRunner::immediate("好的"));
+        let bot = backend_bot("claude");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        // 登记一条（写临时 vb_store）
+        bridge
+            .vb_store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: bridge.bot.key(),
+                chat_id: "oc_vb_del".into(),
+                role_name: "后端开发".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        // 模拟飞书推送群被解散事件
+        let payload = br#"{"schema":"2.0","header":{"event_type":"im.chat.deleted_v1"},"event":{"chat_id":"oc_vb_del"}}"#;
+        bridge.on_payload(payload).await;
+        assert!(
+            bridge.vb_store.load().is_empty(),
+            "群被解散后登记应自动移除"
+        );
+        // 未登记的群被解散：不报错、不动其它登记
+        bridge
+            .vb_store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: bridge.bot.key(),
+                chat_id: "oc_vb_keep".into(),
+                role_name: "产品经理".into(),
+                created_at: 2,
+            })
+            .unwrap();
+        let payload2 = br#"{"schema":"2.0","header":{"event_type":"im.chat.deleted_v1"},"event":{"chat_id":"oc_other"}}"#;
+        bridge.on_payload(payload2).await;
+        assert_eq!(bridge.vb_store.load().len(), 1, "未登记群不影响登记表");
         cleanup_bridge(&bridge);
     }
 }

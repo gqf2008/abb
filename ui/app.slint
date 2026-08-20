@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -233,75 +233,41 @@ export struct NotifyRow {
 }
 export component NotificationsWindow inherits Window {
     title: "新消息提醒";
-    width: 360px;
-    height: 470px;
-    preferred-width: 360px;
-    preferred-height: 470px;
+    width: 340px;
+    height: 88px;
+    preferred-width: 340px;
+    preferred-height: 88px;
     no-frame: true;
     background: PixelTheme.bg;
     in-out property <[NotifyRow]> items: [];
-    callback open-history();   // 点条目：打开设置窗历史记录页
+    callback open-history();   // 点面板：打开设置窗历史记录页（已读）
     callback dismiss();        // 手动收起（5s 自动收起在 Rust 侧走同一路径）
 
+    // 8-20 用户反馈：toast 是"小面板"——88px 高，标题行（含条数）+ 最新一条摘要，
+    // 整面板可点（点击 = 已读 + 跳历史页）；更多条数在标题里提示。
     Rectangle {
         width: 100%;
         height: 100%;
         background: PixelTheme.bg;
+        // 整面板点击热区（声明在底层，文字在上层可读）
+        TouchArea { clicked => { root.open-history(); } }
         VerticalBox {
-            padding: 12px;
-            spacing: 8px;
+            padding: 10px;
+            spacing: 4px;
             Text {
-                text: "🔔 新消息提醒";
-                font-size: 13px;
+                text: root.items.length > 1 ? "🔔 多条新消息" : "🔔 新消息提醒";
+                font-size: 12px;
                 font-weight: 700;
                 color: PixelTheme.text;
             }
-            PixelScrollPanel {
-                vertical-stretch: 1;
-                VerticalBox {
-                    spacing: 2px;
-                    for it in root.items: Rectangle {
-                        height: 46px;
-                        border-radius: 4px;
-                        background: PixelTheme.panel;
-                        TouchArea {
-                            clicked => { root.open-history(); }
-                            HorizontalBox {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 8px;
-                                VerticalBox {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    spacing: 2px;
-                                    Text {
-                                        text: it.sender + " · " + it.bot;
-                                        font-size: 12px;
-                                        font-weight: 600;
-                                        color: PixelTheme.text;
-                                    }
-                                    Text {
-                                        text: it.preview;
-                                        font-size: 11px;
-                                        overflow: elide;
-                                        width: 100%;
-                                        color: PixelTheme.text.with-alpha(0.6);
-                                    }
-                                }
-                                Text {
-                                    text: it.time;
-                                    font-size: 10.5px;
-                                    color: #888;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            HorizontalBox {
-                alignment: center;
-                PixelButton { text: "知道了"; clicked => { root.dismiss(); } }
+            Text {
+                text: root.items.length > 0
+                    ? root.items[0].sender + "：" + root.items[0].preview
+                    : "";
+                font-size: 12px;
+                overflow: elide;
+                width: 100%;
+                color: PixelTheme.text.with-alpha(0.85);
             }
         }
     }
@@ -491,6 +457,12 @@ export component ConfirmDialog inherits Window {
     in-out property <string> confirm-text: "确认";
     in-out property <string> cancel-text: "取消";
     in-out property <bool> danger: false;   // true=主按钮红色（强确认）
+    // busy（8-20）：确认后转"执行中"（按钮禁用，防连点）；结果回来由 Rust 侧
+    // 更新 message/按钮文案——成功即关，失败显示错误让用户看到（不再静默关窗）
+    in-out property <bool> busy: false;
+    // failed（8-20）：操作失败态——主按钮变「重试」（action 保留可重发），
+    // 取消按钮禁用（成功才能正常关闭；红点 X 仍是放弃出口）
+    in-out property <bool> failed: false;
     callback confirmed();
     callback canceled();
 
@@ -519,8 +491,8 @@ export component ConfirmDialog inherits Window {
         HorizontalBox {
             alignment: center;
             spacing: 10px;
-            PixelButton { text: root.cancel-text; clicked => { root.canceled(); } }
-            PixelButton { text: root.confirm-text; variant: root.danger ? "danger" : "primary"; clicked => { root.confirmed(); } }
+            PixelButton { text: root.cancel-text; enabled: !root.busy && !root.failed; clicked => { root.canceled(); } }
+            PixelButton { text: root.confirm-text; variant: root.danger ? "danger" : "primary"; enabled: !root.busy; clicked => { root.confirmed(); } }
             }
         }
     }
@@ -575,6 +547,7 @@ export component VirtualBotDialog inherits Window {
     callback mode-switched(int);
     callback name-edited();
     callback prompt-edited();
+    callback generate-prompt();       // ✨ 生成提示词（根据群名，LLM 生成群介绍）
     callback template-toggled(int);
     callback template-save-clicked();
     callback template-cancel-clicked();
@@ -632,18 +605,35 @@ export component VirtualBotDialog inherits Window {
                         edited => { root.name-input = self.text; root.name-edited(); }
                     }
                     Text { text: root.name-count + "/60"; font-size: 11px; color: root.name-count > 60 ? #d33 : #888; vertical-alignment: center; }
+                    // 「✨ 生成」：根据群名让 LLM 写系统提示词（≤100 字符，回填下方输入框）
+                    PixelButton {
+                        text: root.busy ? "生成中…" : "✨ 生成";
+                        size: "small";
+                        variant: "ghost";
+                        enabled: !root.busy && root.name-input != "";
+                        clicked => { root.generate-prompt(); }
+                    }
                 }
                 HorizontalBox {
                     spacing: 8px;
-                    Text { text: "提示词（群介绍）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
-                    PixelTextInput {
-                        text: root.prompt-input;
-                        placeholder: "system prompt，≤100 字符（如：你是后端开发工程师……）";
+                    Text { text: "提示词（群介绍）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: top; }
+                    VerticalBox {
                         horizontal-stretch: 1;
-                        enabled: !root.busy;
-                        edited => { root.prompt-input = self.text; root.prompt-edited(); }
+                        spacing: 4px;
+                        // 多行文本域（8-20 需求）：system prompt 通常是多行角色设定
+                        PixelTextArea {
+                            text: root.prompt-input;
+                            placeholder: "system prompt，≤100 字符（如：你是后端开发工程师……）";
+                            frame-height: 110px;
+                            enabled: !root.busy;
+                            edited => { root.prompt-input = self.text; root.prompt-edited(); }
+                        }
+                        Text {
+                            text: root.prompt-count + "/100";
+                            font-size: 11px;
+                            color: root.prompt-count > 100 ? #d33 : #888;
+                        }
                     }
-                    Text { text: root.prompt-count + "/100"; font-size: 11px; color: root.prompt-count > 100 ? #d33 : #888; vertical-alignment: center; }
                 }
                 if root.mode == 3: Text {
                     text: "保存 = 平台改群名/群介绍（PATCH）+ 本地登记同步。改名会改变 deliver 的 @角色名 寻址。";
@@ -852,10 +842,13 @@ export component SettingsWindow inherits Window {
     title: root.window-title;
     // 窗口 + Dock 图标（提升为 regular 后 Dock 用）。1024px 源，macOS 自动缩放。
     icon: @image-url("../app-assets/icon-1024.png");
-    // 显式 width/height（固定尺寸，PCM 同款不可缩放）：Window 若不显式给尺寸，会用内容 preferred 算，
-    // 而设置窗初始 bots 为空、selected=-1 时内容高度算成 0 → 窗口塌成标题栏。
-    width: 980px;
-    height: 680px;
+    // 可缩放窗口（8-20 用户实测决策）：不设固定 width/height 绑定——固定尺寸与
+    // set_maximized 冲突（最大化后被 size 拉回，视觉"越点越小"）。preferred-* 定初始
+    // 尺寸，min-* 防内容塌陷（初始 bots 为空时内容高度算 0 的坑由 min-height 兜住）。
+    preferred-width: 980px;
+    preferred-height: 680px;
+    min-width: 880px;
+    min-height: 620px;
     background: PixelTheme.panel;
 
     in-out property <string> window-title: "ABB 设置";
@@ -879,6 +872,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> notify-enabled: true;
     in-out property <int> history-retention-days: 30;
     in-out property <[HistoryRow]> history-rows: [];
+    // 虚拟 Bot 手动刷新进行中（#75）：禁用刷新按钮防连点 + 按钮文字"同步中"
+    in-out property <bool> vb-syncing: false;
     in-out property <int> history-selected: -1;
 
     // 环境配置（依赖检测）：各项是否在本机可执行路径上
@@ -996,6 +991,7 @@ export component SettingsWindow inherits Window {
     callback virtual-bot-edit(int);       // 编辑登记（预填弹窗 → PATCH + 登记同步）
     callback virtual-bot-deregister(int); // ⋯ 菜单：取消登记（轻确认）
     callback virtual-bot-disband(int);    // ⋯ 菜单：解散群（红色强确认，仅飞书）
+    callback virtual-bot-refresh();       // ⟳ 刷新：验证登记群存在性（平台解散兜底 + 历史归档）
     // #74 历史记录页
     callback history-selection-changed(int);   // 选中某条 → Rust 侧记录（详情在 slint 内由 model 直接取）
     callback clear-history();                  // 「清除全部历史」→ Rust 侧弹二次确认
@@ -1030,7 +1026,7 @@ export component SettingsWindow inherits Window {
             // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。全部归零，
             // 由各分区自己的 padding 精确控制。
             padding: 0;
-            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/最大化/关闭 ──
+            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/最大化/关闭（窗口可缩放，三按钮全开）──
             PixelTitleBar {
                 title: root.window-title;
                 logo: @image-url("../app-assets/icon-1024.png");
@@ -1643,7 +1639,20 @@ export component SettingsWindow inherits Window {
                                             // 仅飞书/钉钉显示（微信排除：虚拟 Bot 需要平台群概念）。
                                             if root.selected >= 0 && root.selected < root.bots.length && (root.bots[root.selected].kind == "feishu" || root.bots[root.selected].kind == "dingtalk"): VerticalBox {
                                                 spacing: 6px;
-                                                Text { text: "虚拟 Bot"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
+                                                HorizontalBox {
+                                                    Text { text: "虚拟 Bot"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
+                                                    Rectangle { horizontal-stretch: 1; }
+                                                    // 手动刷新：平台解散群的兜底（im.chat.deleted 事件未订阅/丢失时）——
+                                                    // 验证登记群存在性，已解散的移除登记并归档会话历史。
+                                                    // syncing 期间禁用防连点 + 文字变"同步中"（可视反馈）
+                                                    PixelButton {
+                                                        text: root.vb-syncing ? "⟳ 同步中…" : "⟳ 刷新";
+                                                        size: "small";
+                                                        variant: "ghost";
+                                                        enabled: !root.vb-syncing;
+                                                        clicked => { root.virtual-bot-refresh(); }
+                                                    }
+                                                }
                                                 Text {
                                                     text: "平台真实群 + ABB 登记：群名=角色名、群介绍=system prompt（改群介绍=改角色，即时生效）。群内 @ 机器人自动注入角色；AI 可用 deliver --bot <此 bot> --chat @角色名 寻址。";
                                                     font-size: 11px; color: #888; wrap: word-wrap;

@@ -12,7 +12,7 @@
 //! **无超时**：桥是推送模型——等 agent 跑完即回发，跑多久等多久（曾设 600s 上限，
 //! 会把合法的长任务拦腰杀掉，用户拍板去掉，2026-08-07）。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
@@ -979,6 +979,89 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
         "⚠️ 找不到命令或启动失败（{}）: {err}（如未安装：请打开 ABB 设置 → 环境配置 → 依赖，点「安装」）",
         backend.name()
     )
+}
+
+/// 虚拟 Bot「✨ 生成」提示词（8-20 需求）：根据角色/任务名让 LLM 写系统提示词
+/// （群介绍，≤100 字符）。轻量单轮 CLI 调用——无会话/无工作区/无受限模式，就是
+/// 一次 stdin 问答。claude（`claude -p --output-format text`）/ codex（`codex exec`）
+/// 支持；pi/prime-agent CLI 形态差异大，回落明确错误。输出：去空行 + 截断 100 字符
+/// （char 安全，truncate 语义）。
+pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
+    let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
+              系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
+              不要解释、不要引号、不要“角色名：”前缀。";
+    let full = format!("{sys}\n\n角色/任务名称：{role_name}");
+    let mut cmd = match backend {
+        Backend::Claude => {
+            let mut c = tokio::process::Command::new("claude");
+            c.arg("-p").arg("--output-format").arg("text");
+            c
+        }
+        Backend::Codex => {
+            let mut c = tokio::process::Command::new("codex");
+            c.arg("exec");
+            c
+        }
+        Backend::Pi => {
+            // pi 非交互 JSON 模式：stdin 读 prompt，stdout JSONL（message_end 权威文本，
+            // 解析同 run_once 的 process_line）。临时 uuid 会话（无状态一次性调用）。
+            let mut c = tokio::process::Command::new("pi");
+            c.arg("-p")
+                .arg("--mode")
+                .arg("json")
+                .arg("--session-id")
+                .arg(uuid::Uuid::new_v4().to_string());
+            c
+        }
+        Backend::PrimeAgent => {
+            anyhow::bail!("prime-agent 暂不支持提示词生成（请用 claude/codex/pi）")
+        }
+    };
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().context("启动后端 CLI 失败")?;
+    use tokio::io::AsyncWriteExt;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(full.as_bytes())
+            .await
+            .context("写入 prompt 失败")?;
+        drop(stdin); // EOF：触发后端非交互模式处理
+    }
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+        .await
+        .context("生成超时（60s）")??;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // pi：JSONL 里最后一条 message_end（assistant）的文本；claude/codex：stdout 直接是文本
+    let raw = if backend == Backend::Pi {
+        let mut last = String::new();
+        for line in stdout.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("message_end") {
+                    let msg = &v["message"];
+                    if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        let t = pi_message_text(msg);
+                        if !t.is_empty() {
+                            last = t;
+                        }
+                    }
+                }
+            }
+        }
+        last
+    } else {
+        stdout.to_string()
+    };
+    let text = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default();
+    if text.is_empty() {
+        anyhow::bail!("生成结果为空（后端无输出）");
+    }
+    Ok(truncate(&text, 100).to_string())
 }
 
 /// 单轮执行一个后端：流式读输出（不等 EOF），中途消息经 progress 推出，支持 cancel 打断。

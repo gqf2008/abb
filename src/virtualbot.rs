@@ -4,10 +4,11 @@
 //! 1. **登记表** `~/.agent-bridge/virtual-bots.json`：`[{bot_key, chat_id, role_name, created_at}]`。
 //!    进程间共享：service 注入判定（bridge 每次群消息查快照）、deliver CLI @角色名寻址、
 //!    GUI 管理都读它。并发模型：**只读 + 整文件原子重写**（`atomic_write_sensitive` 唯一
-//!    tmp + rename）。写方只有 GUI 进程；deliver CLI / service 只读。整文件重写没有锁，
-//!    并发写（极罕见、用户驱动）会丢更新（last-writer-wins）——与 deliveries.json 的
-//!    CAS 不同，这里不追求：登记增删是低频人工操作，原子 rename 保证读侧永远读到
-//!    完整文件（无半截）。
+//!    tmp + rename）。写方 = GUI 进程（创建/取消登记/解散）+ **service 事件驱动**
+//!    （im.chat.deleted_v1 群被解散自动移除，见 bridge.rs on_chat_deleted）；deliver CLI
+//!    只读。整文件重写没有锁，并发写（极罕见、用户驱动 + 事件驱动）会丢更新
+//!    （last-writer-wins）——与 deliveries.json 的 CAS 不同，这里不追求：登记增删是低频
+//!    人工操作，原子 rename 保证读侧永远读到完整文件（无半截）。
 //! 2. **角色模板库**：内置 10+ 角色（虚拟团队场景：一次建整套角色群）+ 自定义模板
 //!    （存 Config.custom_roles，见 config.rs）。模板 = 群名 + 提示词（≤100 字符，
 //!    对齐飞书群描述限制；钉钉暂同）。
@@ -124,6 +125,40 @@ impl VirtualBotStore {
             return false;
         }
         self.write(&next).is_ok()
+    }
+
+    /// 群解散后归档会话历史（8-20 用户决策）：把该 chat 的 history jsonl（+迁移/导入
+    /// 标记文件）从 `workspaces/<bot>/history/<key>.jsonl` 移到
+    /// `workspaces/<bot>/archive/<key>-<ts>.jsonl`——不删除（可追溯），移出活跃区。
+    /// 返回归档的文件数。调用方：im.chat.deleted_v1 事件 / GUI 手动刷新发现群不存在。
+    pub fn archive_chat_history(bot_key: &str, chat_id: &str) -> usize {
+        let hist_dir = crate::workspace_dir(bot_key).join("history");
+        let archive_dir = crate::workspace_dir(bot_key).join("archive");
+        let ts = crate::chrono_lite::unix_secs();
+        let mut moved = 0;
+        // history 文件名 = sanitize 后的会话 key（= chat_id，非话题场景；话题带 :thread
+        // 后缀——按 chat_id 前缀匹配归档该群的全部话题历史）
+        let prefix = crate::config::sanitize(chat_id);
+        let entries = match std::fs::read_dir(&hist_dir) {
+            Ok(e) => e.flatten().collect::<Vec<_>>(),
+            Err(_) => return 0,
+        };
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !(name.starts_with(&prefix) && (name.ends_with(".jsonl") || name.ends_with(".json")))
+            {
+                continue;
+            }
+            let _ = std::fs::create_dir_all(&archive_dir);
+            let dst = archive_dir.join(format!("{name}.archived-{ts}"));
+            if std::fs::rename(e.path(), &dst).is_ok() {
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            crate::log!("[virtualbot] 群 {chat_id} 已归档 {moved} 个历史文件 → archive/");
+        }
+        moved
     }
 
     /// 更新登记的角色名（GUI 编辑改名：平台群改名后同步登记；chat_id 不变）。

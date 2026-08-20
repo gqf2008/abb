@@ -522,6 +522,17 @@ pub fn is_owner_allowed(owner: &str, sender_id: &str) -> bool {
     ids.is_empty() || ids.contains(&sender_id)
 }
 
+/// 取 owner 白名单的第一个 id（虚拟 Bot 建群用：群主只能是一个人，白名单多 id 时取
+/// 第一个）。与 is_owner_allowed 同一套拆分/trim 语义，避免两处各拆一遍。空/纯分隔符
+/// = None（调用方据此明确报错，而不是把空串当群主发出去）。
+pub fn first_owner_id(owner: &str) -> Option<String> {
+    owner
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .find(|o| !o.is_empty())
+        .map(str::to_string)
+}
+
 /// 会话发送者角色：owner（管理员，agent 全权限）/ granted（授权者，agent 受限）。
 /// PendingItem/Job 的 role 字段落盘为小写字符串；Default=Owner 兼容旧数据（无角色
 /// 时代的任务/待恢复消息按全权限处理，与现状一致）。
@@ -640,7 +651,9 @@ impl Default for Config {
 }
 
 /// 文件名安全化：只留字母数字、-、_、中文等，去掉路径分隔与空白。
-fn sanitize(s: &str) -> String {
+/// pub(crate)：virtualbot.rs 归档历史文件时按会话 key 前缀匹配（history 文件名用
+/// 同款 sanitize）。
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .collect::<String>()
@@ -1309,6 +1322,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(no_owner.sender_role("ou_anyone"), SenderRole::Granted);
+    }
+
+    #[test]
+    fn first_owner_id_takes_first_trimmed_id() {
+        assert_eq!(first_owner_id("ou_boss, ou_admin"), Some("ou_boss".into()));
+        assert_eq!(
+            first_owner_id(" ou_boss ;ou_admin "),
+            Some("ou_boss".into())
+        );
+        assert_eq!(first_owner_id("ou_boss"), Some("ou_boss".into()));
+        assert_eq!(first_owner_id("  ,  "), None, "纯分隔符 = 无群主");
+        assert_eq!(first_owner_id(""), None, "空白名单 = 无群主");
     }
 
     #[test]

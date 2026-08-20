@@ -6,7 +6,7 @@
 //! 看门：GUI 启动拉起 service 子进程；托盘 Timer 周期探测，崩溃自动重拉（见 install.rs）。
 //! 打开日志/目录走 platform::open_path（跨平台）。
 
-use crate::config::{BotConfig, Config, ProviderConfig};
+use crate::config::{first_owner_id, BotConfig, Config, ProviderConfig};
 use crate::dingtalk::DingTalkClient;
 use crate::feishu::FeishuClient;
 use crate::install;
@@ -71,6 +71,8 @@ enum UiCmd {
         kind: String,
         app_id: String,
         app_secret: String,
+        /// 建群群主（飞书必填；点击时从工作副本 bot 解析，None = 未配置 owner）。
+        owner: Option<String>,
         items: Vec<(String, String)>,
     },
     /// 编辑保存：PATCH 平台群资料（改名/改介绍）+ 登记表角色名同步。
@@ -82,6 +84,8 @@ enum UiCmd {
         chat_id: String,
         name: String,
         prompt: String,
+        /// owner open_id（权限不足时发授权指引；None = 未配置则不提示）。
+        owner: Option<String>,
     },
     /// 手动登记（#75 降级路径）：只写登记表，不调平台 API（平台手动建群后登记）。
     VirtualBotRegister {
@@ -101,6 +105,8 @@ enum UiCmd {
         app_id: String,
         app_secret: String,
         chat_id: String,
+        /// owner open_id（权限不足时发授权指引；None = 未配置则不提示）。
+        owner: Option<String>,
     },
     /// 编辑预填：拉平台群资料（(群名, 群介绍)）→ 回填弹窗。
     VirtualBotFetchInfo {
@@ -108,6 +114,22 @@ enum UiCmd {
         app_id: String,
         app_secret: String,
         chat_id: String,
+    },
+    /// 手动刷新（虚拟 Bot section「⟳ 刷新」）：逐个登记群调 get_chat_info 验证存在性——
+    /// 平台解散群的兜底（im.chat.deleted 事件可能因未订阅/丢失不达）；确认已解散的群
+    /// 移除登记 + 归档会话历史。get_chat_info 失败但错误不像"群不存在"（网络/权限等）
+    /// 保留登记并提示，避免误删。
+    VirtualBotVerify {
+        bot_key: String,
+        kind: String,
+        app_id: String,
+        app_secret: String,
+    },
+    /// 「✨ 生成」提示词（8-20 需求）：根据角色名让 LLM 写系统提示词（≤100 字符），
+    /// 走该 bot 生效后端的一次性轻量 CLI 调用，结果回填弹窗。
+    GeneratePrompt {
+        bot_key: String,
+        name: String,
     },
 }
 
@@ -137,10 +159,17 @@ enum VirtualBotEvt {
         desc: String,
         error: Option<String>,
     },
+    /// 「✨ 生成」结果回填：text=生成成功的提示词；error=生成失败文案。
+    PromptGenerated {
+        text: Option<String>,
+        error: Option<String>,
+    },
 }
 
 /// 确认弹窗待执行的虚拟 Bot 操作（#75）：取消登记（轻确认）/ 解散群（红色强确认）。
-/// 主线程持有；弹确认窗前写入，确认回调里 take 并发送对应 UiCmd，取消/关闭时清空。
+/// 主线程持有；弹确认窗前写入，确认回调里 clone 并发送对应 UiCmd（失败态「重试」
+/// 保留原 action，成功才 take 清空），取消/红点关闭时清空。
+#[derive(Clone)]
 enum VbAction {
     /// 取消登记：平台群保留，只删 ABB 登记。
     Deregister { bot_key: String, chat_id: String },
@@ -151,6 +180,8 @@ enum VbAction {
         app_id: String,
         app_secret: String,
         chat_id: String,
+        /// owner open_id（权限不足时发授权指引给 owner；None = 未配置则不提示）。
+        owner: Option<String>,
     },
 }
 
@@ -301,6 +332,11 @@ fn bring_app_to_front() {
 fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     // 窗口位置完全交给系统默认（macOS 级联位），代码不做任何移动：
     // 曾做过"show 后 100ms 强行居中"（肉眼可见跳动）和启动预热（钉死 (0,0)），都已拆除。
+    // 最小化恢复：窗口被最小化（自绘标题栏黄点/macOS cmd+M）后 show() 不还原，
+    // 托盘点击会"没反应"（8-20 实测：必须点 Dock 才恢复）——显式还原最小化状态。
+    if w.window().is_minimized() {
+        w.window().set_minimized(false);
+    }
     bring_app_to_front();
     let _ = w.show();
     w.window().request_redraw();
@@ -638,8 +674,12 @@ fn history_to_row(r: &crate::msgstore::MsgRow, cfg: &Config) -> HistoryRow {
     let (bot_name, sender) = resolve_display(cfg, &r.bot_key, &r.sender_id);
     // 审查跟进：assistant 行（bot 回复）发送者列显示 bot 名——回复来自 bot 而非
     // 授权者，否则「授权者名 + 回复」标签语义错位。
+    // user 行优先落库时的 sender_name（未授权用户 API 反查的真实名字；8-20 用户
+    // 反馈：历史记录显示名字而不是 open_id），回落本地名单/id。
     let sender = if r.direction == "assistant" {
         bot_name.clone()
+    } else if !r.sender_name.is_empty() {
+        r.sender_name.clone()
     } else {
         sender
     };
@@ -680,6 +720,13 @@ fn notify_rows(items: &[crate::unread::UnreadItem], cfg: &Config) -> Vec<NotifyR
         .take(8)
         .map(|it| {
             let (bot_name, sender) = resolve_display(cfg, &it.bot_key, &it.sender);
+            // 展示名优先 items.name（bridge 反查：未授权用户 API 反查的真实名字；
+            // 授权者本地名单查）——8-20 用户反馈：提醒显示名字而不是 open_id
+            let sender = if !it.name.is_empty() {
+                it.name.clone()
+            } else {
+                sender
+            };
             NotifyRow {
                 sender: sender.into(),
                 bot: bot_name.into(),
@@ -1057,10 +1104,8 @@ pub fn run_gui() -> Result<()> {
             EventResult::Propagate // 让 Slint 照常把窗口 hide
         });
         qr_dialog.window().on_winit_window_event(|_w, ev| {
-            if matches!(ev, WindowEvent::CloseRequested) {
-                #[cfg(target_os = "macos")]
-                platform::hide_dock();
-            }
+            // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
+            let _ = ev;
             EventResult::Propagate
         });
         // 虚拟 Bot 弹窗/确认弹窗：红点关闭 = 隐藏（同 QrDialog；busy 时禁止关闭防半途退出）
@@ -1072,18 +1117,20 @@ pub fn run_gui() -> Result<()> {
                 {
                     return EventResult::PreventDefault; // 创建中：不让用户关掉弹窗丢进度
                 }
-                if matches!(ev, WindowEvent::CloseRequested) {
-                    #[cfg(target_os = "macos")]
-                    platform::hide_dock();
-                }
+                // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
                 EventResult::Propagate
             });
         }
-        vb_confirm.window().on_winit_window_event(|_w, ev| {
-            if matches!(ev, WindowEvent::CloseRequested) {
-                #[cfg(target_os = "macos")]
-                platform::hide_dock();
+        let vb_cw = vb_confirm.as_weak();
+        vb_confirm.window().on_winit_window_event(move |_w, ev| {
+            // 执行中（busy）禁止关闭：结果未返回前关掉弹窗会丢结果（8-20 用户反馈：
+            // "拿到解散结果并且成功后再关闭"）——与 vb_dialog 的 busy 拦截同款
+            if matches!(ev, WindowEvent::CloseRequested)
+                && vb_cw.upgrade().map(|c| c.get_busy()).unwrap_or(false)
+            {
+                return EventResult::PreventDefault;
             }
+            // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
             EventResult::Propagate
         });
     }
@@ -1093,8 +1140,8 @@ pub fn run_gui() -> Result<()> {
         let qw = qr_dialog.as_weak();
         qr_dialog.on_close_clicked(move || {
             if let Some(d) = qw.upgrade() {
+                // 子窗口关闭不动 dock（8-20 用户反馈）
                 let _ = d.hide();
-                platform::hide_dock();
             }
         });
     }
@@ -1105,8 +1152,8 @@ pub fn run_gui() -> Result<()> {
         vb_dialog.on_close_clicked(move || {
             if let Some(d) = dw.upgrade() {
                 if !d.get_busy() {
+                    // 子窗口关闭不动 dock（8-20 用户反馈）
                     let _ = d.hide();
-                    platform::hide_dock();
                 }
             }
         });
@@ -1133,18 +1180,31 @@ pub fn run_gui() -> Result<()> {
         vb_confirm.on_canceled(move || {
             action.borrow_mut().take();
             if let Some(c) = cw.upgrade() {
+                // 子窗口关闭不动 dock（8-20 用户反馈）
                 let _ = c.hide();
-                platform::hide_dock();
             }
         });
     }
-    // 确认弹窗：确认 = 执行待操作（按 VbAction 分发到后台线程）
+    // 确认弹窗：确认 = 执行待操作（按 VbAction 分发到后台线程）。
+    // 执行中不关窗（busy）：结果由 VirtualBotEvt::Done 回填——成功才关，失败在弹窗里
+    // 显示错误（8-20 用户反馈"点了窗口就关了但群还在"——失败必须可见，不能静默）。
     {
         let cw = vb_confirm.as_weak();
         let action = vb_action.clone();
         let tx = tx.clone();
         vb_confirm.on_confirmed(move || {
-            if let Some(a) = action.borrow_mut().take() {
+            crate::log!("[gui] 虚拟 Bot 确认弹窗：确认");
+            // clone 而非 take（8-20 用户反馈：失败态「重试」需要保留 action 重发；
+            // 成功后在 Done 里 take 清空）
+            if let Some(a) = action.borrow().clone() {
+                // 有 action：执行中（busy），**不关窗**——结果由 Done 回填（成功态
+                // 才可点「知道了」关闭；失败态「重试」保留 action）。曾残留旧 hide()
+                // 导致确认后立即关窗、结果回填到隐藏窗口（8-20 用户实测"还是立刻关了"）。
+                if let Some(c) = cw.upgrade() {
+                    c.set_busy(true);
+                    c.set_failed(false);
+                    c.set_message("执行中…".into());
+                }
                 let _ = tx.send(match a {
                     VbAction::Deregister { bot_key, chat_id } => {
                         UiCmd::VirtualBotDeregister { bot_key, chat_id }
@@ -1155,18 +1215,21 @@ pub fn run_gui() -> Result<()> {
                         app_id,
                         app_secret,
                         chat_id,
+                        owner,
                     } => UiCmd::VirtualBotDisband {
                         bot_key,
                         kind,
                         app_id,
                         app_secret,
                         chat_id,
+                        owner,
                     },
                 });
-            }
-            if let Some(c) = cw.upgrade() {
-                let _ = c.hide();
-                platform::hide_dock();
+            } else {
+                // 无 action（成功态点「知道了」）：关窗，不动 dock（8-20 用户反馈）
+                if let Some(c) = cw.upgrade() {
+                    let _ = c.hide();
+                }
             }
         });
     }
@@ -1599,12 +1662,17 @@ pub fn run_gui() -> Result<()> {
                         kind,
                         app_id,
                         app_secret,
+                        owner,
                         items,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
                             let total = items.len();
                             let mut results = Vec::with_capacity(total);
+                            // 客户端复用（tenant_token 是实例内缓存）：批量建群只取一次
+                            // token，不用每群现造。kind 已固定，非 dingtalk 才需要 feishu。
+                            let feishu =
+                                (kind != "dingtalk").then(|| FeishuClient::new(&app_id, &app_secret));
                             for (i, (name, prompt)) in items.into_iter().enumerate() {
                                 let _ = vb_tx.send(VirtualBotEvt::Progress { done: i, total });
                                 let r = async {
@@ -1618,15 +1686,21 @@ pub fn run_gui() -> Result<()> {
                                             // 客户端看不到群（8-20 实测）。owner 设为群主 +
                                             // bot 管理员（set_bot_manager），用户才有编辑
                                             // 群名/介绍权限（平台为准的核心交互）。
-                                            let owner = Config::load()
-                                                .ok()
-                                                .and_then(|c| {
-                                                    c.bots.into_iter().find(|b| b.key() == bot_key)
-                                                })
-                                                .map(|b| b.owner_open_id)
-                                                .unwrap_or_default();
-                                            FeishuClient::new(&app_id, &app_secret)
-                                                .create_chat(&name, &prompt, &owner)
+                                            // owner 在点击时已从工作副本解析（与 app_id/
+                                            // secret 同一 bot 快照）；缺失 = 配置未填 owner。
+                                            let owner = owner
+                                                .as_deref()
+                                                .ok_or_else(|| {
+                                                    "该 bot 未配置 owner_open_id（群主）：虚拟 Bot 建群"
+                                                        .to_string()
+                                                        + "必须有群主，否则群里只有机器人、用户飞书客户端看不到群。"
+                                                        + "请在 bot 设置里填写 owner 白名单后重试，"
+                                                        + "或手动建群后走「手动登记」。"
+                                                })?;
+                                            feishu
+                                                .as_ref()
+                                                .expect("非 dingtalk 分支必有 feishu client")
+                                                .create_chat(&name, &prompt, owner)
                                                 .await
                                                 .map_err(|e| format!("{e:#}"))
                                         }
@@ -1664,7 +1738,37 @@ pub fn run_gui() -> Result<()> {
                                         } else {
                                             e
                                         };
-                                        results.push((name, Err(e)));
+                                        // 飞书权限不足：给 owner 私聊发授权指引（可执行下一步）
+                                        let mut notified = false;
+                                        if kind == "feishu" {
+                                            if let (Some(owner), Some((scopes, link))) =
+                                                (&owner, crate::feishu::scope_hint(&e))
+                                            {
+                                                let fs =
+                                                    FeishuClient::new(&app_id, &app_secret);
+                                                let msg = format!(
+                                                    "⚠️ 虚拟 Bot 操作需要飞书授权\n\
+                                                     操作「创建虚拟 Bot」被拒绝：应用缺少权限 {scopes}\n\
+                                                     请点击开通（任选其一）：\n{link}\n\
+                                                     开通后重新操作即可。"
+                                                );
+                                                crate::log!(
+                                                    "[gui] 创建失败权限不足，向 owner 发送授权指引"
+                                                );
+                                                if fs.send_text_to_user(owner, &msg).await.is_ok()
+                                                {
+                                                    notified = true;
+                                                }
+                                            }
+                                        }
+                                        results.push((
+                                            name,
+                                            Err(if notified {
+                                                format!("{e}（已向 owner 发送授权指引）")
+                                            } else {
+                                                e
+                                            }),
+                                        ));
                                     }
                                 }
                             }
@@ -1679,6 +1783,7 @@ pub fn run_gui() -> Result<()> {
                         chat_id,
                         name,
                         prompt,
+                        owner,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
@@ -1695,7 +1800,7 @@ pub fn run_gui() -> Result<()> {
                                 }
                             }
                             .await;
-                            let result = match r {
+                            let mut result = match r {
                                 Ok(()) => match VirtualBotStore::new().update_role(
                                     &bot_key,
                                     &chat_id,
@@ -1706,6 +1811,31 @@ pub fn run_gui() -> Result<()> {
                                 },
                                 Err(e) => Err(e),
                             };
+                            // 权限不足（飞书 99991672）：给 owner 私聊发授权指引
+                            if let (Err(e), Some(owner)) = (&result, &owner) {
+                                if kind == "feishu" {
+                                    if let Some((scopes, link)) = crate::feishu::scope_hint(e) {
+                                        let fs = FeishuClient::new(&app_id, &app_secret);
+                                        let msg = format!(
+                                            "⚠️ 虚拟 Bot 操作需要飞书授权\n\
+                                             操作「编辑群资料」被拒绝：应用缺少权限 {scopes}\n\
+                                             请点击开通（任选其一）：\n{link}\n\
+                                             开通后重新操作即可。"
+                                        );
+                                        crate::log!("[gui] 编辑失败权限不足，向 owner 发送授权指引");
+                                        match fs.send_text_to_user(owner, &msg).await {
+                                            Ok(()) => {
+                                                result = Err(format!(
+                                                    "{e}（已向 owner 发送授权指引）"
+                                                ));
+                                            }
+                                            Err(se) => crate::log!(
+                                                "[gui] 向 owner 发送授权指引失败: {se:#}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
                             let _ = vb_tx.send(VirtualBotEvt::Done {
                                 results: vec![(name, result)],
                             });
@@ -1736,6 +1866,11 @@ pub fn run_gui() -> Result<()> {
                     UiCmd::VirtualBotDeregister { bot_key, chat_id } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
+                            crate::log!(
+                                "[gui] 取消登记 bot={} chat={}",
+                                bot_key,
+                                crate::agent::truncate(&chat_id, 12)
+                            );
                             let store = VirtualBotStore::new();
                             // 结果行的名字用角色名（比 chat_id 可读）；查不到才回落 id
                             let role = store
@@ -1750,6 +1885,10 @@ pub fn run_gui() -> Result<()> {
                             } else {
                                 Err("该群不在登记表里（可能已被移除）".to_string())
                             };
+                            crate::log!(
+                                "[gui] 取消登记结果: {}",
+                                if ok { "成功" } else { "失败（不在登记表）" }
+                            );
                             let _ = vb_tx.send(VirtualBotEvt::Done {
                                 results: vec![(role, result)],
                             });
@@ -1761,6 +1900,7 @@ pub fn run_gui() -> Result<()> {
                         app_id,
                         app_secret,
                         chat_id,
+                        owner,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
@@ -1772,6 +1912,12 @@ pub fn run_gui() -> Result<()> {
                                 .map(|v| v.role_name)
                                 .unwrap_or_else(|| chat_id.clone());
                             // 先解散平台群（不可恢复；确认弹窗已挡过一次），成功再移除登记
+                            crate::log!(
+                                "[gui] 解散群 bot={} kind={} chat={}",
+                                bot_key,
+                                kind,
+                                crate::agent::truncate(&chat_id, 12)
+                            );
                             let r = async {
                                 match kind.as_str() {
                                     "dingtalk" => Err("钉钉暂无解散群 API".to_string()),
@@ -1782,13 +1928,70 @@ pub fn run_gui() -> Result<()> {
                                 }
                             }
                             .await;
-                            let result = match r {
+                            let mut result = match r {
                                 Ok(()) => {
                                     store.remove(&bot_key, &chat_id);
-                                    Ok("群已解散，登记已移除".to_string())
+                                    // 解散成功同样归档会话历史（与事件/刷新路径一致——
+                                    // 8-20 用户追问后补：三路径统一，历史移入 archive/）
+                                    let archived =
+                                        VirtualBotStore::archive_chat_history(&bot_key, &chat_id);
+                                    Ok(if archived > 0 {
+                                        format!("群已解散，登记已移除，历史已归档（{archived} 个文件）")
+                                    } else {
+                                        "群已解散，登记已移除".to_string()
+                                    })
                                 }
-                                Err(e) => Err(format!("解散失败（登记保留）：{e}")),
+                                Err(e) => {
+                                    // 232017（操作者非群主/管理员）：8-20 实测——群主
+                                    // 转让给 owner 后 bot 降级普通成员，解散被拒。附可执行
+                                    // 指引（飞书里把机器人设为管理员，或把群主转回机器人）。
+                                    let es = e.to_string();
+                                    if es.contains("232017") {
+                                        Err(format!(
+                                            "解散失败（登记保留）：机器人不是该群群主/管理员。请在飞书群设置里把机器人设为管理员（或把群主转回机器人）后重试。{es}"
+                                        ))
+                                    } else {
+                                        Err(format!("解散失败（登记保留）：{e}"))
+                                    }
+                                }
                             };
+                            // 权限不足（飞书 99991672）：给 owner 私聊发授权指引——平台权限
+                            // 问题不该只躺在状态行/日志里，owner 需要可执行的下一步。
+                            if let Err(e) = &result {
+                                if let Some(owner) = &owner {
+                                    if kind == "feishu" {
+                                        if let Some((scopes, link)) =
+                                            crate::feishu::scope_hint(e)
+                                        {
+                                            let fs = FeishuClient::new(&app_id, &app_secret);
+                                            let msg = format!(
+                                                "⚠️ 虚拟 Bot 操作需要飞书授权\n\
+                                                 操作「解散群」被拒绝：应用缺少权限 {scopes}\n\
+                                                 请点击开通（任选其一）：\n{link}\n\
+                                                 开通后重新操作即可。"
+                                            );
+                                            crate::log!("[gui] 权限不足，向 owner 发送授权指引");
+                                            match fs.send_text_to_user(owner, &msg).await {
+                                                Ok(()) => {
+                                                    result = Err(format!(
+                                                        "解散失败（登记保留）：{e}（已向 owner 发送授权指引）"
+                                                    ));
+                                                }
+                                                Err(se) => crate::log!(
+                                                    "[gui] 向 owner 发送授权指引失败: {se:#}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::log!(
+                                "[gui] 解散群结果: {}",
+                                match &result {
+                                    Ok(s) => s,
+                                    Err(e) => e,
+                                }
+                            );
                             let _ = vb_tx.send(VirtualBotEvt::Done {
                                 results: vec![(role, result)],
                             });
@@ -1829,6 +2032,123 @@ pub fn run_gui() -> Result<()> {
                                         chat_id,
                                         name: String::new(),
                                         desc: String::new(),
+                                        error: Some(format!("{e:#}")),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    UiCmd::VirtualBotVerify {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            // 逐个登记群验证存在性（get_chat_info）——平台解散群的兜底
+                            // （im.chat.deleted 事件未订阅/丢失时）；确认已解散 → 移除
+                            // 登记 + 归档会话历史。失败但错误不像"群不存在"（网络/权限/
+                            // 频控）→ 保留登记并提示，避免误删。
+                            crate::log!(
+                                "[gui] 手动刷新虚拟 Bot 登记 bot={}",
+                                crate::agent::truncate(&bot_key, 12)
+                            );
+                            let regs = VirtualBotStore::new().load_for(&bot_key);
+                            let client = match kind.as_str() {
+                                "dingtalk" => None,
+                                _ => Some(FeishuClient::new(&app_id, &app_secret)),
+                            };
+                            let mut results: Vec<(String, Result<String, String>)> = Vec::new();
+                            for reg in &regs {
+                                let r = match &client {
+                                    Some(c) => c.get_chat_info(&reg.chat_id).await,
+                                    // 钉钉无群信息 API（无该能力）：跳过验证，登记保留
+                                    None => Err(anyhow::anyhow!("钉钉不支持群验证")),
+                                };
+                                match r {
+                                    Ok(_) => results.push((
+                                        reg.role_name.clone(),
+                                        Ok("正常".to_string()),
+                                    )),
+                                    Err(e) => {
+                                        let es = format!("{e:#}");
+                                        let gone = es.contains("不存在")
+                                            || es.contains("解散")
+                                            || es.contains("not found")
+                                            || es.contains("404");
+                                        if gone {
+                                            let removed =
+                                                VirtualBotStore::new().remove(&bot_key, &reg.chat_id);
+                                            let archived = VirtualBotStore::archive_chat_history(
+                                                &bot_key,
+                                                &reg.chat_id,
+                                            );
+                                            crate::log!(
+                                                "[gui] 刷新发现群已解散：{}（登记移除={}，归档文件={}）",
+                                                reg.role_name,
+                                                removed,
+                                                archived
+                                            );
+                                            results.push((
+                                                reg.role_name.clone(),
+                                                Err(format!(
+                                                    "群已解散：登记已移除，历史已归档（{archived} 个文件）"
+                                                )),
+                                            ));
+                                        } else {
+                                            crate::log!(
+                                                "[gui] 刷新验证失败（保留登记）：{}: {es}",
+                                                reg.role_name
+                                            );
+                                            results.push((
+                                                reg.role_name.clone(),
+                                                Err(format!("验证失败（登记保留）：{es}")),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if regs.is_empty() {
+                                results.push(("无".to_string(), Ok("暂无登记".to_string())));
+                            }
+                            let _ = vb_tx.send(VirtualBotEvt::Done { results });
+                        });
+                    }
+                    UiCmd::GeneratePrompt { bot_key, name } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            crate::log!(
+                                "[gui] 生成提示词 bot={} 角色={}",
+                                crate::agent::truncate(&bot_key, 12),
+                                crate::agent::truncate(&name, 20)
+                            );
+                            // 走该 bot 生效后端（bot.backend 优先，回落全局默认）
+                            let backend = Config::load()
+                                .ok()
+                                .and_then(|c| {
+                                    c.bots
+                                        .iter()
+                                        .find(|b| b.key() == bot_key)
+                                        .map(|b| b.effective_backend(&c.default_backend).to_string())
+                                })
+                                .unwrap_or_default();
+                            let r = match crate::agent::Backend::parse(&backend) {
+                                crate::agent::Backend::PrimeAgent => Err(anyhow::anyhow!(
+                                    "后端 {backend} 暂不支持提示词生成（请用 claude/codex/pi）"
+                                )),
+                                b => crate::agent::generate_role_prompt(b, &name).await,
+                            };
+                            match r {
+                                Ok(text) => {
+                                    let _ = vb_tx.send(VirtualBotEvt::PromptGenerated {
+                                        text: Some(text),
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = vb_tx.send(VirtualBotEvt::PromptGenerated {
+                                        text: None,
                                         error: Some(format!("{e:#}")),
                                     });
                                 }
@@ -2305,6 +2625,30 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // 「✨ 生成」提示词（8-20 需求）：根据群名走该 bot 生效后端生成系统提示词，
+    // 生成期间弹窗 busy（按钮文字"生成中…"防连点），结果 PromptGenerated 回填
+    {
+        let tx = tx.clone();
+        let ctx = vb_ctx.clone();
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_generate_prompt(move || {
+            let Some((_idx, bot_key, _kind)) = ctx.borrow().clone() else {
+                return;
+            };
+            let name = dlg
+                .upgrade()
+                .map(|d| d.get_name_input().to_string())
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                return;
+            }
+            if let Some(d) = dlg.upgrade() {
+                d.set_busy(true); // 复用 busy：禁用按钮/输入，生成中
+                vb_hint(&d, "", false);
+            }
+            let _ = tx.send(UiCmd::GeneratePrompt { bot_key, name });
+        });
+    }
     {
         let dlg = vb_dialog.as_weak();
         vb_dialog.on_template_toggled(move |idx| {
@@ -2447,11 +2791,18 @@ pub fn run_gui() -> Result<()> {
             let Some((idx, bot_key, kind)) = ctx.borrow().clone() else {
                 return;
             };
-            let (app_id, app_secret) = {
+            // app_id/secret/owner 都取工作副本最新（用户可能改了没保存，用旧值会建到旧
+            // 应用下；owner 同理：磁盘配置可能比工作副本旧，且按 key 匹配在改名后失效）。
+            let (app_id, app_secret, owner) = {
                 let b = work.borrow();
-                b.get(idx as usize)
-                    .map(|bot| (bot.app_id.clone(), bot.app_secret.clone()))
-                    .unwrap_or_default()
+                match b.get(idx as usize) {
+                    Some(bot) => (
+                        bot.app_id.clone(),
+                        bot.app_secret.clone(),
+                        first_owner_id(&bot.owner_open_id),
+                    ),
+                    None => (String::new(), String::new(), None),
+                }
             };
             let mode = d.get_mode();
             match mode {
@@ -2477,6 +2828,7 @@ pub fn run_gui() -> Result<()> {
                             kind,
                             app_id,
                             app_secret,
+                            owner: owner.clone(),
                             items: vec![(name, prompt)],
                         });
                     } else {
@@ -2489,6 +2841,7 @@ pub fn run_gui() -> Result<()> {
                             chat_id,
                             name,
                             prompt,
+                            owner: owner.clone(),
                         });
                     }
                 }
@@ -2529,6 +2882,7 @@ pub fn run_gui() -> Result<()> {
                         kind,
                         app_id,
                         app_secret,
+                        owner: owner.clone(),
                         items,
                     });
                 }
@@ -2581,6 +2935,32 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // 手动刷新：验证登记群存在性（平台解散兜底 + 历史归档），结果走状态行。
+    // 独立 block：不依赖上面的 block 变量（work/tx 已被 on_virtual_bot_create 闭包 move），
+    // 直接 clone 最外层作用域变量 + weak settings。
+    {
+        let tx = tx.clone();
+        let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_virtual_bot_refresh(move || {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            if let Some(bot) = b.get(sel as usize) {
+                if bot.kind == "wechat" {
+                    return;
+                }
+                // 同步中：禁用刷新按钮防连点（结果回来在 Done 里复位）
+                w.set_vb_syncing(true);
+                let _ = tx.send(UiCmd::VirtualBotVerify {
+                    bot_key: bot.key(),
+                    kind: bot.kind.clone(),
+                    app_id: bot.app_id.clone(),
+                    app_secret: bot.app_secret.clone(),
+                });
+            }
+        });
+    }
     {
         let tx = tx.clone();
         let sw = settings.as_weak();
@@ -2619,6 +2999,7 @@ pub fn run_gui() -> Result<()> {
         let action = vb_action.clone();
         let confirm = vb_confirm.as_weak();
         settings.on_virtual_bot_deregister(move |row| {
+            crate::log!("[gui] ⋯ 点击「取消登记」 row={row}");
             let Some(w) = sw.upgrade() else { return };
             let sel = w.get_selected();
             let b = work.borrow();
@@ -2651,6 +3032,7 @@ pub fn run_gui() -> Result<()> {
         let action = vb_action.clone();
         let confirm = vb_confirm.as_weak();
         settings.on_virtual_bot_disband(move |row| {
+            crate::log!("[gui] ⋯ 点击「解散群」 row={row}");
             let Some(w) = sw.upgrade() else { return };
             let sel = w.get_selected();
             let b = work.borrow();
@@ -2663,6 +3045,8 @@ pub fn run_gui() -> Result<()> {
                 app_id: bot.app_id.clone(),
                 app_secret: bot.app_secret.clone(),
                 chat_id: reg.chat_id.clone(),
+                // owner 用于权限不足时发授权指引（白名单取首个，None=未配置）
+                owner: crate::config::first_owner_id(&bot.owner_open_id),
             });
             if let Some(c) = confirm.upgrade() {
                 c.set_title_text("解散群（不可恢复）".into());
@@ -3357,6 +3741,10 @@ pub fn run_gui() -> Result<()> {
         let notif_weak = notifications.as_weak();
         let notif_showing = notif_showing.clone();
         let notif_timer = notif_timer.clone();
+        // 虚拟 Bot 确认弹窗 weak（#75：解散/取消登记结果回填——成功关窗/失败可见）
+        let vb_confirm_weak = vb_confirm.as_weak();
+        // 确认弹窗待执行操作（失败重试时保留；成功才 take 清空）
+        let vb_action_t = vb_action.clone();
         // #74 历史记录列表 model（历史页打开时每 tick 刷新）
         let history_model = history_model.clone();
         timer.start(
@@ -3510,7 +3898,39 @@ pub fn run_gui() -> Result<()> {
                                     slint::VecModel::from(lines),
                                 )));
                             }
+                            // 确认弹窗执行中（解散/取消登记）→ 回填结果（8-20 用户反馈）：
+                            // 成功 → 清 action + 弹窗显示成功（点「知道了」手动关）；
+                            // 失败 → **保留 action** + 主按钮变「重试」（再点重发同一操作），
+                            // 取消按钮禁用——成功才能正常关闭（红点 X 是放弃出口）。
+                            if let Some(c) = vb_confirm_weak.upgrade() {
+                                if c.get_busy() {
+                                    c.set_busy(false);
+                                    let all_ok = results.iter().all(|(_, r)| r.is_ok());
+                                    let lines: Vec<String> = results
+                                        .iter()
+                                        .map(|(n, r)| match r {
+                                            Ok(s) => format!("✅ {n}：{s}"),
+                                            Err(e) => format!("❌ {n}：{e}"),
+                                        })
+                                        .collect();
+                                    if all_ok {
+                                        vb_action_t.borrow_mut().take();
+                                        c.set_failed(false);
+                                        c.set_title_text("操作成功".into());
+                                        c.set_confirm_text("知道了".into());
+                                        c.set_cancel_text("关闭".into());
+                                    } else {
+                                        c.set_failed(true);
+                                        c.set_title_text("操作失败".into());
+                                        c.set_confirm_text("重试".into());
+                                        c.set_cancel_text("取消".into());
+                                    }
+                                    c.set_message(lines.join("\n").into());
+                                }
+                            }
                             if let Some(w) = settings_weak.upgrade() {
+                                // 刷新同步结束：复位按钮（刷新期间 vb-syncing=true）
+                                w.set_vb_syncing(false);
                                 let ok = results
                                     .iter()
                                     .filter(|(_, r)| r.is_ok())
@@ -3549,6 +3969,25 @@ pub fn run_gui() -> Result<()> {
                                         d.set_name_count(d.get_name_input().chars().count() as i32);
                                         d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
                                     }
+                                }
+                            }
+                        }
+                        VirtualBotEvt::PromptGenerated { text, error } => {
+                            // 「✨ 生成」结果回填：成功写 prompt-input + 更新计数；
+                            // 失败 hint 展示错误。恢复 busy（生成期间禁用创建/保存）
+                            if let Some(d) = vb_dialog_weak.upgrade() {
+                                d.set_busy(false);
+                                match text {
+                                    Some(t) => {
+                                        d.set_prompt_input(t.into());
+                                        d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
+                                        vb_hint(&d, "已生成提示词（可编辑后保存）", false);
+                                    }
+                                    None => vb_hint(
+                                        &d,
+                                        &format!("生成失败：{}", error.unwrap_or_default()),
+                                        true,
+                                    ),
                                 }
                             }
                         }
@@ -3629,8 +4068,8 @@ pub fn run_gui() -> Result<()> {
                         }
                         WxEvt::Failed(e) => {
                             if let Some(d) = qr_weak.upgrade() {
+                                // 子窗口关闭不动 dock（8-20 用户反馈）
                                 let _ = d.hide();
-                                platform::hide_dock();
                             }
                             if let Some(w) = settings_weak.upgrade() {
                                 w.set_status_line(format!("微信登录失败：{e}").into());
