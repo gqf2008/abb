@@ -66,6 +66,9 @@ pub struct Bridge {
     pub msgstore: crate::msgstore::MsgStore,
     /// #74 未读提醒队列（logs/unread.json 写句柄）。同上：测试注入临时路径。
     pub unread: crate::unread::UnreadStore,
+    /// 虚拟 Bot 登记表（#75）：事件驱动移除（im.chat.deleted_v1 群被解散）用它写；
+    /// 生产 = ~/.agent-bridge/virtual-bots.json，测试注入临时路径（同 msgstore/unread）。
+    pub vb_store: crate::virtualbot::VirtualBotStore,
 }
 
 #[derive(Debug)]
@@ -156,6 +159,7 @@ impl Bridge {
             chat_info_cache: crate::virtualbot::ChatInfoCache::new(),
             msgstore: crate::msgstore::MsgStore::production(),
             unread: crate::unread::UnreadStore::production(),
+            vb_store: crate::virtualbot::VirtualBotStore::new(),
         }
     }
 
@@ -429,6 +433,12 @@ impl Bridge {
             Err(_) => return,
         };
         let event_type = body["header"]["event_type"].as_str().unwrap_or("");
+        if event_type == "im.chat.deleted_v1" {
+            // 虚拟 Bot：群被平台解散 → 自动移除登记（8-20 用户决策——ABB 不残留
+            // 幽灵登记：deliver @角色名不再指向死群、GUI 列表不再显示无效项）
+            self.on_chat_deleted(&body["event"]).await;
+            return;
+        }
         if event_type != "im.message.receive_v1" {
             return; // 只处理消息接收事件，其它（reaction/task…）忽略
         }
@@ -639,6 +649,28 @@ impl Bridge {
         self.chat_info_cache
             .get(&ev.chat_id, self.msgr.as_ref())
             .await
+    }
+
+    /// 群被解散事件（im.chat.deleted_v1）：虚拟 Bot 登记自动移除——平台侧解散后 ABB
+    /// 不残留幽灵登记（deliver @角色名不再指向死群、GUI 列表不再显示无效项）。
+    /// 事件体 `{"chat_id": "oc_…"}`。写登记表与 GUI 并发的 last-writer-wins 取舍
+    /// 见 virtualbot.rs 模块注释（低频人工操作 + 事件驱动，原子重写读侧永远完整）。
+    async fn on_chat_deleted(&self, event: &serde_json::Value) {
+        let chat_id = event["chat_id"].as_str().unwrap_or("");
+        if chat_id.is_empty() {
+            return;
+        }
+        if self.vb_store.remove(&self.bot.key(), chat_id) {
+            crate::log!(
+                "[bridge] 群被解散（im.chat.deleted_v1），已自动移除虚拟 Bot 登记 chat={}",
+                trunc(chat_id, 12)
+            );
+        } else {
+            crate::log!(
+                "[bridge] 群被解散 chat={}（非本 bot 的虚拟 Bot 登记，忽略）",
+                trunc(chat_id, 12)
+            );
+        }
     }
 
     /// 登记快照懒刷新：文件 (mtime, 长度) 变了才重读（GUI 登记/取消登记后下一条消息
@@ -2265,6 +2297,9 @@ mod tests {
         bridge.unread = crate::unread::UnreadStore::at(
             std::env::temp_dir().join(format!("abb-unread-test-{key}")),
         );
+        bridge.vb_store = crate::virtualbot::VirtualBotStore::new_at(
+            std::env::temp_dir().join(format!("abb-vb-test-{key}.json")),
+        );
         (Arc::new(bridge), msgr)
     }
 
@@ -2317,6 +2352,7 @@ mod tests {
             ("abb-msgstore-test-", "-wal"),
             ("abb-msgstore-test-", "-shm"),
             ("abb-unread-test-", ""),
+            ("abb-vb-test-", ".json"),
         ] {
             let _ =
                 std::fs::remove_file(std::env::temp_dir().join(format!("{prefix}{key}{suffix}")));
@@ -4857,6 +4893,45 @@ https://b.com/y"
         ev.chat_type = "dm".into();
         bridge.handle(ev).await;
         assert_eq!(runner.prompts()[1], "私聊你好");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn chat_deleted_event_removes_registration() {
+        // #75 事件驱动：im.chat.deleted_v1（平台解散群）→ 自动移除该群登记
+        let runner = Arc::new(MockAgentRunner::immediate("好的"));
+        let bot = backend_bot("claude");
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        // 登记一条（写临时 vb_store）
+        bridge
+            .vb_store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: bridge.bot.key(),
+                chat_id: "oc_vb_del".into(),
+                role_name: "后端开发".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        // 模拟飞书推送群被解散事件
+        let payload = br#"{"schema":"2.0","header":{"event_type":"im.chat.deleted_v1"},"event":{"chat_id":"oc_vb_del"}}"#;
+        bridge.on_payload(payload).await;
+        assert!(
+            bridge.vb_store.load().is_empty(),
+            "群被解散后登记应自动移除"
+        );
+        // 未登记的群被解散：不报错、不动其它登记
+        bridge
+            .vb_store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: bridge.bot.key(),
+                chat_id: "oc_vb_keep".into(),
+                role_name: "产品经理".into(),
+                created_at: 2,
+            })
+            .unwrap();
+        let payload2 = br#"{"schema":"2.0","header":{"event_type":"im.chat.deleted_v1"},"event":{"chat_id":"oc_other"}}"#;
+        bridge.on_payload(payload2).await;
+        assert_eq!(bridge.vb_store.load().len(), 1, "未登记群不影响登记表");
         cleanup_bridge(&bridge);
     }
 }

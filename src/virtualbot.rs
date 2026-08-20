@@ -4,10 +4,11 @@
 //! 1. **登记表** `~/.agent-bridge/virtual-bots.json`：`[{bot_key, chat_id, role_name, created_at}]`。
 //!    进程间共享：service 注入判定（bridge 每次群消息查快照）、deliver CLI @角色名寻址、
 //!    GUI 管理都读它。并发模型：**只读 + 整文件原子重写**（`atomic_write_sensitive` 唯一
-//!    tmp + rename）。写方只有 GUI 进程；deliver CLI / service 只读。整文件重写没有锁，
-//!    并发写（极罕见、用户驱动）会丢更新（last-writer-wins）——与 deliveries.json 的
-//!    CAS 不同，这里不追求：登记增删是低频人工操作，原子 rename 保证读侧永远读到
-//!    完整文件（无半截）。
+//!    tmp + rename）。写方 = GUI 进程（创建/取消登记/解散）+ **service 事件驱动**
+//!    （im.chat.deleted_v1 群被解散自动移除，见 bridge.rs on_chat_deleted）；deliver CLI
+//!    只读。整文件重写没有锁，并发写（极罕见、用户驱动 + 事件驱动）会丢更新
+//!    （last-writer-wins）——与 deliveries.json 的 CAS 不同，这里不追求：登记增删是低频
+//!    人工操作，原子 rename 保证读侧永远读到完整文件（无半截）。
 //! 2. **角色模板库**：内置 10+ 角色（虚拟团队场景：一次建整套角色群）+ 自定义模板
 //!    （存 Config.custom_roles，见 config.rs）。模板 = 群名 + 提示词（≤100 字符，
 //!    对齐飞书群描述限制；钉钉暂同）。

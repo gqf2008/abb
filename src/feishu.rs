@@ -443,13 +443,16 @@ impl FeishuClient {
     }
 
     /// 创建群聊（虚拟 Bot #75）：POST /im/v1/chats。
-    /// - `owner_user_id`：把 bot 配置的 owner（open_id）设为群主并拉进群（请求体字段
-    ///   `owner_id` + `user_id_list`，官方当前 schema；旧文档的 user_ids 字段已不在现网
-    ///   文档，mock 断言按现网字段名）——**必须**：否则群里只有机器人，用户飞书客户端
-    ///   看不到群、无法使用（8-20 实测踩坑，创建"成功"但群不可见）；
-    /// - `set_bot_manager: true`：指定了 owner_id 时把机器人设为管理员——机器人是
-    ///   管理员才能收发群消息；且群主是用户，用户才可在飞书里直接改群名/群介绍
-    ///   （=改角色，平台为准的核心交互）；
+    /// 群主策略（8-20 用户决策，两次调整后的最终形态）：**群主 = 机器人**（不传
+    /// owner_id，创建者默认群主，管理权自持），**owner 用户为管理员 + 成员**：
+    /// - `user_id_list: [owner_user_id]`：把 owner 拉进群（否则用户飞书客户端看不到群，
+    ///   8-20 实测踩坑）——注意字段名是 `user_id_list` 不是旧文档的 user_ids（现网 schema，
+    ///   lark-cli dry-run + SDK 核实）；
+    /// - 创建后调 `add_managers` 把 owner 设为管理员（bot 是群主，有权限；管理员才能
+    ///   在飞书里改群名/群介绍 = 改角色）。best-effort：失败只 log 返回 Ok（owner 仍是
+    ///   成员可用，可手动在飞书设管理员）；
+    /// - 曾试过 owner_id=用户（PR #78）：转让后 bot 降级普通成员且"只有群主能加管理员"
+    ///   → bot 失去全部管理权、无法自助恢复——此路不通，弃用；
     /// - `uuid` 幂等：同 uuid 重复调用返回同一个群（网络重试/超时重发安全）；
     /// - `chat_mode: "group"`：显式普通群（与话题群 p2p 群区分）。
     ///
@@ -468,9 +471,7 @@ impl FeishuClient {
             .json(&json!({
                 "name": name,
                 "description": description,
-                "owner_id": owner_user_id,
                 "user_id_list": [owner_user_id],
-                "set_bot_manager": true,
                 "uuid": uuid::Uuid::new_v4().to_string(),
                 "chat_mode": "group",
             }))
@@ -485,10 +486,45 @@ impl FeishuClient {
                 resp.get("msg")
             );
         }
-        resp["data"]["chat_id"]
+        let chat_id = resp["data"]["chat_id"]
             .as_str()
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("创建群响应缺 chat_id: {resp}"))
+            .ok_or_else(|| anyhow!("创建群响应缺 chat_id: {resp}"))?;
+        // 创建后把 owner 设为管理员（群主=bot 策略；只有群主能加管理员，创建瞬间
+        // bot 即群主，此处调用有权限）。best-effort：失败只 log 返回 Ok——owner 仍是
+        // 成员可用，可手动在飞书群设置里补设管理员。
+        if !owner_user_id.is_empty() {
+            if let Err(e) = self.add_managers(&chat_id, &[owner_user_id]).await {
+                crate::log!(
+                    "[feishu] 群 {chat_id} 已创建但设置 owner 管理员失败（可手动在飞书设置）: {e:#}"
+                );
+            }
+        }
+        Ok(chat_id)
+    }
+
+    /// 指定群管理员（虚拟 Bot：owner 当管理员，群主仍是 bot）。POST
+    /// /im/v1/chats/:chat_id/managers/add_managers（lark-cli dry-run 确认）。
+    /// 仅群主可调——bot 是创建者/群主，天然有权限。member_id_type 默认 open_id。
+    pub async fn add_managers(&self, chat_id: &str, manager_ids: &[&str]) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .post(self.url(&format!("/im/v1/chats/{chat_id}/managers/add_managers")))
+            .bearer_auth(&token)
+            .json(&json!({ "manager_ids": manager_ids }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "设置管理员失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        Ok(())
     }
 
     /// 群资料（虚拟 Bot 注入用）：(群名, 群介绍)。失败返回 Err——调用方 best-effort：
@@ -841,6 +877,13 @@ mod tests {
             ("POST".to_string(), "/im/v1/chats".to_string()),
             json!({"code": 0, "msg": "success", "data": {"chat_id": "oc_vb_new"}}),
         );
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/im/v1/chats/oc_vb_new/managers/add_managers".to_string(),
+            ),
+            json!({"code": 0, "msg": "success"}),
+        );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
         let chat_id = fs
@@ -850,8 +893,8 @@ mod tests {
         assert_eq!(chat_id, "oc_vb_new");
 
         let recs = server.requests.lock().unwrap().clone();
-        // 两次请求：token + 建群（顺序固定：token 先）
-        assert_eq!(recs.len(), 2);
+        // 三次请求：token + 建群 + 设 owner 为管理员（顺序固定：token 先）
+        assert_eq!(recs.len(), 3, "建群后应把 owner 设为管理员");
         assert_eq!(recs[0].method, "POST");
         assert!(recs[0].path.starts_with("/auth/v3/"));
         let create = &recs[1];
@@ -861,13 +904,15 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
         assert_eq!(body["name"], "后端开发");
         assert_eq!(body["description"], "你是后端工程师。");
-        assert_eq!(
-            body["set_bot_manager"], true,
-            "指定 owner 时 bot 设为管理员"
+        // 群主策略（8-20 用户决策最终版）：不传 owner_id/set_bot_manager（群主=bot，
+        // 创建者默认；传 owner_id 会导致转让后 bot 失去管理权无法恢复）
+        assert!(
+            body.get("owner_id").is_none(),
+            "群主必须是 bot（不传 owner_id）"
         );
-        assert_eq!(
-            body["owner_id"], "ou_boss",
-            "群主必须是用户（否则用户看不到群）"
+        assert!(
+            body.get("set_bot_manager").is_none(),
+            "bot 默认群主，无需 set_bot_manager"
         );
         assert_eq!(
             body["user_id_list"],
@@ -882,6 +927,12 @@ mod tests {
                 .unwrap_or(false),
             "uuid 幂等键必须有"
         );
+        // 第二次调用：owner 设为管理员（bot 群主身份有权限）
+        let mgr = &recs[2];
+        assert_eq!(mgr.method, "POST");
+        assert_eq!(mgr.path, "/im/v1/chats/oc_vb_new/managers/add_managers");
+        let mb: serde_json::Value = serde_json::from_str(&mgr.body).unwrap();
+        assert_eq!(mb["manager_ids"], json!(["ou_boss"]), "owner 设为管理员");
     }
 
     #[tokio::test]

@@ -1030,11 +1030,12 @@ export component SettingsWindow inherits Window {
             // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。全部归零，
             // 由各分区自己的 padding 精确控制。
             padding: 0;
-            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/最大化/关闭 ──
+            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/关闭（设置窗固定尺寸，无最大化）──
             PixelTitleBar {
                 title: root.window-title;
                 logo: @image-url("../app-assets/icon-1024.png");
                 has-logo: true;
+                show-maximize: false; // 固定 980x680 窗口：最大化会与尺寸绑定冲突（8-20 实测"越点越小"）
                 drag-start => { root.drag-start(); }
                 minimize => { root.minimize(); }
                 toggle-maximize => { root.toggle-maximize(); }

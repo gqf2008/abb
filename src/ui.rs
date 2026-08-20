@@ -309,6 +309,11 @@ fn bring_app_to_front() {
 fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     // 窗口位置完全交给系统默认（macOS 级联位），代码不做任何移动：
     // 曾做过"show 后 100ms 强行居中"（肉眼可见跳动）和启动预热（钉死 (0,0)），都已拆除。
+    // 最小化恢复：窗口被最小化（自绘标题栏黄点/macOS cmd+M）后 show() 不还原，
+    // 托盘点击会"没反应"（8-20 实测：必须点 Dock 才恢复）——显式还原最小化状态。
+    if w.window().is_minimized() {
+        w.window().set_minimized(false);
+    }
     bring_app_to_front();
     let _ = w.show();
     w.window().request_redraw();
