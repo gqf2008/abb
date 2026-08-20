@@ -1900,7 +1900,15 @@ pub fn run_gui() -> Result<()> {
                             let mut result = match r {
                                 Ok(()) => {
                                     store.remove(&bot_key, &chat_id);
-                                    Ok("群已解散，登记已移除".to_string())
+                                    // 解散成功同样归档会话历史（与事件/刷新路径一致——
+                                    // 8-20 用户追问后补：三路径统一，历史移入 archive/）
+                                    let archived =
+                                        VirtualBotStore::archive_chat_history(&bot_key, &chat_id);
+                                    Ok(if archived > 0 {
+                                        format!("群已解散，登记已移除，历史已归档（{archived} 个文件）")
+                                    } else {
+                                        "群已解散，登记已移除".to_string()
+                                    })
                                 }
                                 Err(e) => {
                                     // 232017（操作者非群主/管理员）：8-20 实测——群主
