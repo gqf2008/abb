@@ -1006,9 +1006,12 @@ impl Bridge {
             hist.append_user(&ev.mid, backend.name(), &history_user_text(&text, &ev));
             // #74：授权者（granted）私聊消息 → 落消息库 + 未读提醒（条件见 record_granted）。
             // 与 hist 同处锁内写：插入快、失败只 log，不阻塞主链路。
+            // 落库与提醒联动（审查跟进）：insert 返回是否真正插入——重放（崩溃恢复
+            // 续跑 handle）同 mid 再插会被 UNIQUE(mid,direction) 挡住 → false → 不
+            // 重复提醒（弹窗/红点以「这条消息提醒过没」为准，不以收到几次为准）。
             if record_granted {
                 let user_text = history_user_text(&text, &ev);
-                self.msgstore.insert(
+                let inserted = self.msgstore.insert(
                     &self.bot.key(),
                     &ev.chat_id,
                     &ev.mid,
@@ -1017,14 +1020,16 @@ impl Bridge {
                     &user_text,
                     ev.ts,
                 );
-                // 未读提醒：只记发送者 id + 摘要（40 字符预览），展示名由 GUI 经
-                // config 授权者名单反查（授权时已反查过名字）。
-                self.unread.report(
-                    &self.bot.key(),
-                    &ev.sender_id,
-                    &crate::agent::truncate(&user_text, 40),
-                    ev.ts,
-                );
+                if inserted {
+                    // 未读提醒：只记发送者 id + 摘要（40 字符预览），展示名由 GUI 经
+                    // config 授权者名单反查（授权时已反查过名字）。
+                    self.unread.report(
+                        &self.bot.key(),
+                        &ev.sender_id,
+                        &crate::agent::truncate(&user_text, 40),
+                        ev.ts,
+                    );
+                }
             }
             (lock_ret, epoch, injected_rounds)
         };
@@ -1312,6 +1317,24 @@ impl Bridge {
                         // 与实时路径一致：补发成功后给原消息补 DONE 回执（崩溃窗口里
                         // handle 尾部的 del_typing/done 未执行——补发即补上）。
                         self.msgr.done(&ev.mid).await;
+                        // #74 审查跟进：补发成功也要落 assistant 历史——崩溃发生在
+                        // 「回复已产出、发送未确认」窗口，实时 handle 的发送成功分支
+                        // 没跑到，不补的话这条回复在历史页永久缺失（消息+回复不完整）。
+                        // 条件与 handle 的 record_granted 同款（granted 私聊）；
+                        // UNIQUE(mid,direction) 幂等，重复补发/重放安全。时间用发送时刻。
+                        if item.role == crate::config::SenderRole::Granted
+                            && (item.chat_type == "p2p" || item.chat_type == "dm")
+                        {
+                            self.msgstore.insert(
+                                &self.bot.key(),
+                                &item.chat_id,
+                                &item.mid,
+                                "assistant",
+                                &item.sender_id,
+                                reply,
+                                crate::chrono_lite::unix_secs() as i64,
+                            );
+                        }
                     }
                     Err(e) => {
                         crate::log!("[bot:{}] 补发失败（留盘下次再试）: {e:#}", self.bot.key())
@@ -3028,6 +3051,86 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
+    /// #74 审查跟进：W2 补发成功后落 assistant 历史（granted 私聊）——实时 handle 的
+    /// 发送成功分支没跑到，不补的话这条回复在历史页永久缺失（消息+回复不完整）。
+    #[tokio::test]
+    async fn recover_redelivery_records_assistant_history_for_granted_p2p() {
+        let runner = Arc::new(MockAgentRunner::immediate("不应被重跑"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        // 模拟崩溃残留：granted 私聊的用户轮已落库（原跑过 handle），回复已产出
+        // （set_reply 落盘）但发送确认前进程没了
+        let mid = "w2h";
+        assert!(
+            bridge.msgstore.insert(
+                &bridge.bot.key(),
+                "oc_p2p",
+                mid,
+                "user",
+                "ou_friend",
+                "帮我查一下",
+                1000
+            ),
+            "前置：用户轮应已落库"
+        );
+        bridge.pending.add(crate::pending::PendingItem {
+            mid: mid.into(),
+            chat_id: "oc_p2p".into(),
+            chat_type: "p2p".into(),
+            thread_id: String::new(),
+            text: "帮我查一下".into(),
+            quoted: crate::messenger::QuotedContent::default(),
+            attachments: Vec::new(),
+            role: crate::config::SenderRole::Granted,
+            sender_id: "ou_friend".into(),
+            ts: 1000,
+            created_at: 10,
+            reply: None,
+        });
+        bridge.pending.set_reply(mid, "补发的回复");
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_pending(&stop).await;
+
+        assert!(
+            runner.prompts().is_empty(),
+            "有 reply 的条目不得重跑 agent（prompts 应为空）"
+        );
+        assert!(
+            msgr.sent().iter().any(|t| t == "补发的回复"),
+            "直接补发已产出回复"
+        );
+        let rows = bridge.msgstore.list_recent(10);
+        assert_eq!(rows.len(), 2, "用户轮 + 补发的回复都要在历史库");
+        assert_eq!(rows[0].direction, "assistant", "最新是回复");
+        assert_eq!(rows[0].mid, mid, "回复复用用户轮 mid");
+        assert_eq!(rows[0].text, "补发的回复");
+        assert_eq!(rows[0].sender_id, "ou_friend");
+        // 幂等：同 mid 同 direction 再插被忽略（重复补发/重启重放安全）
+        assert!(
+            !bridge.msgstore.insert(
+                &bridge.bot.key(),
+                "oc_p2p",
+                mid,
+                "assistant",
+                "ou_friend",
+                "补发的回复",
+                2000
+            ),
+            "UNIQUE(mid,direction) 应挡住重复 assistant 行"
+        );
+        assert!(bridge.pending.is_empty(), "补发成功清盘");
+        cleanup_bridge(&bridge);
+    }
+
     /// 阶段 1：补发失败（发送通道暂不可用）→ 条目留盘，下次启动再试（不重跑、不丢）。
     #[tokio::test]
     async fn recover_redeliver_failure_keeps_item() {
@@ -3797,6 +3900,26 @@ mod tests {
         // 提醒是纯本地 UI：messenger 只发出 agent 回复，绝不主动向任何 IM 发提醒消息
         assert_eq!(msgr.sent().len(), 1, "外发只有 agent 回复一条");
         assert_eq!(msgr.sent()[0], "done");
+        // 审查跟进：重放同 mid（崩溃恢复续跑 handle；seen 去重是进程内的，重启后
+        // 清空）→ 落库被 UNIQUE(mid,direction) 幂等挡住、未读不得重复提醒
+        // （弹窗/红点以「这条消息提醒过没」为准，不以收到几次为准）。
+        bridge.seen.lock().unwrap().clear(); // 模拟重启后的全新进程
+        bridge.on_payload(payload.as_bytes()).await;
+        assert_eq!(
+            bridge.msgstore.list_recent(10).len(),
+            2,
+            "重放不重复落库（user+assistant 仍各一行）"
+        );
+        assert_eq!(
+            bridge.unread.snapshot().unwrap().len(),
+            1,
+            "重放同 mid 只提醒一次"
+        );
+        assert_eq!(
+            msgr.sent().iter().filter(|t| *t == "done").count(),
+            2,
+            "W1 重放语义：agent 重跑并再发一条回复（at-least-once）"
+        );
         cleanup_bridge(&bridge);
     }
 
