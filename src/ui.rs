@@ -125,6 +125,12 @@ enum UiCmd {
         app_id: String,
         app_secret: String,
     },
+    /// 「✨ 生成」提示词（8-20 需求）：根据角色名让 LLM 写系统提示词（≤100 字符），
+    /// 走该 bot 生效后端的一次性轻量 CLI 调用，结果回填弹窗。
+    GeneratePrompt {
+        bot_key: String,
+        name: String,
+    },
 }
 
 /// 微信扫码登录的阶段结果（后台 → 主线程）。
@@ -151,6 +157,11 @@ enum VirtualBotEvt {
         chat_id: String,
         name: String,
         desc: String,
+        error: Option<String>,
+    },
+    /// 「✨ 生成」结果回填：text=生成成功的提示词；error=生成失败文案。
+    PromptGenerated {
+        text: Option<String>,
         error: Option<String>,
     },
 }
@@ -2089,6 +2100,48 @@ pub fn run_gui() -> Result<()> {
                             let _ = vb_tx.send(VirtualBotEvt::Done { results });
                         });
                     }
+                    UiCmd::GeneratePrompt { bot_key, name } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            crate::log!(
+                                "[gui] 生成提示词 bot={} 角色={}",
+                                crate::agent::truncate(&bot_key, 12),
+                                crate::agent::truncate(&name, 20)
+                            );
+                            // 走该 bot 生效后端（bot.backend 优先，回落全局默认）
+                            let backend = Config::load()
+                                .ok()
+                                .and_then(|c| {
+                                    c.bots
+                                        .iter()
+                                        .find(|b| b.key() == bot_key)
+                                        .map(|b| b.effective_backend(&c.default_backend).to_string())
+                                })
+                                .unwrap_or_default();
+                            let r = match crate::agent::Backend::parse(&backend) {
+                                crate::agent::Backend::Pi | crate::agent::Backend::PrimeAgent => {
+                                    Err(anyhow::anyhow!(
+                                        "后端 {backend} 暂不支持提示词生成（请用 claude/codex）"
+                                    ))
+                                }
+                                b => crate::agent::generate_role_prompt(b, &name).await,
+                            };
+                            match r {
+                                Ok(text) => {
+                                    let _ = vb_tx.send(VirtualBotEvt::PromptGenerated {
+                                        text: Some(text),
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = vb_tx.send(VirtualBotEvt::PromptGenerated {
+                                        text: None,
+                                        error: Some(format!("{e:#}")),
+                                    });
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -2557,6 +2610,30 @@ pub fn run_gui() -> Result<()> {
             if let Some(d) = dlg.upgrade() {
                 d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
             }
+        });
+    }
+    // 「✨ 生成」提示词（8-20 需求）：根据群名走该 bot 生效后端生成系统提示词，
+    // 生成期间弹窗 busy（按钮文字"生成中…"防连点），结果 PromptGenerated 回填
+    {
+        let tx = tx.clone();
+        let ctx = vb_ctx.clone();
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_generate_prompt(move || {
+            let Some((_idx, bot_key, _kind)) = ctx.borrow().clone() else {
+                return;
+            };
+            let name = dlg
+                .upgrade()
+                .map(|d| d.get_name_input().to_string())
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                return;
+            }
+            if let Some(d) = dlg.upgrade() {
+                d.set_busy(true); // 复用 busy：禁用按钮/输入，生成中
+                vb_hint(&d, "", false);
+            }
+            let _ = tx.send(UiCmd::GeneratePrompt { bot_key, name });
         });
     }
     {
@@ -3879,6 +3956,25 @@ pub fn run_gui() -> Result<()> {
                                         d.set_name_count(d.get_name_input().chars().count() as i32);
                                         d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
                                     }
+                                }
+                            }
+                        }
+                        VirtualBotEvt::PromptGenerated { text, error } => {
+                            // 「✨ 生成」结果回填：成功写 prompt-input + 更新计数；
+                            // 失败 hint 展示错误。恢复 busy（生成期间禁用创建/保存）
+                            if let Some(d) = vb_dialog_weak.upgrade() {
+                                d.set_busy(false);
+                                match text {
+                                    Some(t) => {
+                                        d.set_prompt_input(t.into());
+                                        d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
+                                        vb_hint(&d, "已生成提示词（可编辑后保存）", false);
+                                    }
+                                    None => vb_hint(
+                                        &d,
+                                        &format!("生成失败：{}", error.unwrap_or_default()),
+                                        true,
+                                    ),
                                 }
                             }
                         }

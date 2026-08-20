@@ -581,6 +581,7 @@ export component VirtualBotDialog inherits Window {
     callback mode-switched(int);
     callback name-edited();
     callback prompt-edited();
+    callback generate-prompt();       // ✨ 生成提示词（根据群名，LLM 生成群介绍）
     callback template-toggled(int);
     callback template-save-clicked();
     callback template-cancel-clicked();
@@ -638,6 +639,14 @@ export component VirtualBotDialog inherits Window {
                         edited => { root.name-input = self.text; root.name-edited(); }
                     }
                     Text { text: root.name-count + "/60"; font-size: 11px; color: root.name-count > 60 ? #d33 : #888; vertical-alignment: center; }
+                    // 「✨ 生成」：根据群名让 LLM 写系统提示词（≤100 字符，回填下方输入框）
+                    PixelButton {
+                        text: root.busy ? "生成中…" : "✨ 生成";
+                        size: "small";
+                        variant: "ghost";
+                        enabled: !root.busy && root.name-input != "";
+                        clicked => { root.generate-prompt(); }
+                    }
                 }
                 HorizontalBox {
                     spacing: 8px;
