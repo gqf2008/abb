@@ -19,11 +19,27 @@ export struct BotMenuRow {
 // 托盘：SystemTrayIcon 是内置元素（macOS → NSStatusItem）。
 export component Tray inherits SystemTrayIcon {
     // 托盘图标随整体状态变色：online=绿 / connecting=黄 / offline=红 / none=原灰白
+    // #74 未读红点：unread-count>0 时换用 Rust 侧运行时合成的红点版图标
+    // （合成选型：托盘图标是 16-22px 小图，加 4 张红点版资产与运行时合成二选一——
+    // 运行时合成无新资产、不随源图配色漂移，且能复用既有 get_icon_online 等取图，
+    // 代价是一次性合成代码；这里走合成，见 ui.rs composite_tray_dot）。
+    in-out property <int> unread-count: 0;
     in-out property <string> tray-status: "none";
-    icon: root.tray-status == "online" ? @image-url("tray-green.png") :
-          root.tray-status == "connecting" ? @image-url("tray-yellow.png") :
-          root.tray-status == "offline" ? @image-url("tray-red.png") :
-          @image-url("tray-dark.png");
+    in-out property <image> icon-online-dot: @image-url("tray-green.png");
+    in-out property <image> icon-connecting-dot: @image-url("tray-yellow.png");
+    in-out property <image> icon-offline-dot: @image-url("tray-red.png");
+    in-out property <image> icon-dark-dot: @image-url("tray-dark.png");
+    // 属性驱动而非 Rust 侧直接 set_icon：icon 是 tray-status/unread-count 的绑定，
+    // 直接 set_icon 会破坏绑定（后续状态变化不再刷新图标）。
+    icon: root.unread-count > 0 ?
+        (root.tray-status == "online" ? root.icon-online-dot :
+         root.tray-status == "connecting" ? root.icon-connecting-dot :
+         root.tray-status == "offline" ? root.icon-offline-dot :
+         root.icon-dark-dot) :
+        (root.tray-status == "online" ? @image-url("tray-green.png") :
+         root.tray-status == "connecting" ? @image-url("tray-yellow.png") :
+         root.tray-status == "offline" ? @image-url("tray-red.png") :
+         @image-url("tray-dark.png"));
     tooltip: "ABB";
 
     in-out property <[BotMenuRow]> bots-menu: [];  // 逐 bot 状态行（文字 + 状态图标）
@@ -31,6 +47,7 @@ export component Tray inherits SystemTrayIcon {
     in-out property <image> icon-connecting: @image-url("tray-yellow.png");
     in-out property <image> icon-offline: @image-url("tray-red.png");
     in-out property <image> icon-disabled: @image-url("tray-gray.png");
+    in-out property <image> icon-dark: @image-url("tray-dark.png");
     in-out property <bool> service-running: false;
     in-out property <bool> configured: false;
     in-out property <bool> autostart: false;
@@ -171,6 +188,93 @@ export component QrDialog inherits Window {
         HorizontalBox {
             alignment: center;
             PixelButton { text: "取消"; clicked => { root.close-clicked(); } }
+            }
+        }
+    }
+}
+
+// #74 授权者私聊提醒弹窗（toast）：屏幕右上角弹出，展示 unread.json 里最近几条
+// （发送者/摘要/时间，最新在上，最多 8 条），约 5 秒自动收起；点条目 → 打开设置窗
+// 历史记录页（弹窗内容即「已读」，收起后 unread.json 已清）。
+// no-frame 无系统标题栏（toast 不该有标题栏）；根 Rectangle 铺满不透明背景防透明坑
+// （同 QrDialog 纪律）。
+export struct NotifyRow {
+    sender: string,   // 展示名（GUI 经 config 授权者名单反查，查不到用 id）
+    bot: string,      // bot 展示名（经 config 反查，查不到用 key）
+    preview: string,
+    time: string,     // MM-DD HH:MM
+}
+export component NotificationsWindow inherits Window {
+    title: "新消息提醒";
+    width: 360px;
+    height: 470px;
+    preferred-width: 360px;
+    preferred-height: 470px;
+    no-frame: true;
+    background: PixelTheme.bg;
+    in-out property <[NotifyRow]> items: [];
+    callback open-history();   // 点条目：打开设置窗历史记录页
+    callback dismiss();        // 手动收起（5s 自动收起在 Rust 侧走同一路径）
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: PixelTheme.bg;
+        VerticalBox {
+            padding: 12px;
+            spacing: 8px;
+            Text {
+                text: "🔔 新消息提醒";
+                font-size: 13px;
+                font-weight: 700;
+                color: PixelTheme.text;
+            }
+            PixelScrollPanel {
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 2px;
+                    for it in root.items: Rectangle {
+                        height: 46px;
+                        border-radius: 4px;
+                        background: PixelTheme.panel;
+                        TouchArea {
+                            clicked => { root.open-history(); }
+                            HorizontalBox {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                VerticalBox {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text {
+                                        text: it.sender + " · " + it.bot;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: PixelTheme.text;
+                                    }
+                                    Text {
+                                        text: it.preview;
+                                        font-size: 11px;
+                                        overflow: elide;
+                                        width: 100%;
+                                        color: PixelTheme.text.with-alpha(0.6);
+                                    }
+                                }
+                                Text {
+                                    text: it.time;
+                                    font-size: 10.5px;
+                                    color: #888;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalBox {
+                alignment: center;
+                PixelButton { text: "知道了"; clicked => { root.dismiss(); } }
             }
         }
     }

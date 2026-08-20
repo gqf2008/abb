@@ -120,7 +120,9 @@ pub mod chrono_lite {
         let (y, mo, d, h, mi, s) = epoch_to_ymd(unix_secs());
         format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
     }
-    fn epoch_to_ymd(t: u64) -> (u64, u64, u64, u64, u64, u64) {
+    /// 距 UNIX 纪元秒数的本地时区日历拆解（y, mo, d, h, mi, s）。
+    /// #74 历史页/提醒弹窗的时间显示（MM-DD HH:MM）复用同一套 UTC+8 口径。
+    pub fn epoch_to_ymd(t: u64) -> (u64, u64, u64, u64, u64, u64) {
         let s = t % 60;
         let mi = (t / 60) % 60;
         let h = (t / 3600) % 24;

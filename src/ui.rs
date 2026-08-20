@@ -391,6 +391,168 @@ fn sync_providers_model(
     );
 }
 
+// ─────────────── #74 未读提醒（展示名解析 / 弹窗显隐 / 托盘红点合成）───────────────
+
+/// #74 展示名解析：bot_key/sender_id → 人类可读名（config 反查，查不到用原始 id 兜底）。
+/// 发送者名字来自授权者名单（授权时已反查名字落盘，桥内无需再异步反查）。
+/// 返回 (bot 名, 发送者名)。
+fn resolve_display(cfg: &Config, bot_key: &str, sender_id: &str) -> (String, String) {
+    let bot = cfg.bots.iter().find(|b| b.key() == bot_key);
+    let bot_name = bot
+        .map(|b| {
+            if b.bot_name.is_empty() {
+                b.key()
+            } else {
+                b.bot_name.clone()
+            }
+        })
+        .unwrap_or_else(|| bot_key.to_string());
+    let sender = bot
+        .and_then(|b| {
+            let infos = if b.is_dingtalk() {
+                &b.ding_granted_infos
+            } else {
+                &b.granted_infos
+            };
+            infos
+                .iter()
+                .find(|i| i.open_id == sender_id)
+                .filter(|i| !i.name.is_empty())
+                .map(|i| i.name.clone())
+        })
+        .unwrap_or_else(|| sender_id.to_string());
+    (bot_name, sender)
+}
+
+/// #74 时间显示：unix 秒 → "MM-DD HH:MM"（本地时区，与 chrono_lite::now 同口径 UTC+8）。
+/// 消息都是保留期内（≤90 天）的近期记录，不显示年份（微信同款简写）。
+fn fmt_msg_time(ts: i64) -> String {
+    let t = ts.max(0) as u64 + 8 * 3600;
+    let (_y, mo, d, h, mi, _s) = crate::chrono_lite::epoch_to_ymd(t);
+    format!("{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// #74 未读项 → 弹窗行（最多 8 条：toast 高度有限，更早的看历史页）。
+fn notify_rows(items: &[crate::unread::UnreadItem], cfg: &Config) -> Vec<NotifyRow> {
+    items
+        .iter()
+        .take(8)
+        .map(|it| {
+            let (bot_name, sender) = resolve_display(cfg, &it.bot_key, &it.sender);
+            NotifyRow {
+                sender: sender.into(),
+                bot: bot_name.into(),
+                preview: it.preview.clone().into(),
+                time: fmt_msg_time(it.ts).into(),
+            }
+        })
+        .collect()
+}
+
+/// #74 显示提醒弹窗（toast）：显式定位屏幕右上角——与设置窗「位置零干预」的记忆决策
+/// 不冲突：那是主窗的日常摆放，toast 若走系统默认级联位会落在屏幕随机位置，违背 toast
+/// 的角落锚定语义（此处是唯一例外，注释留痕）。顺序同 show_window_and_focus：先激活
+/// （dock 图标）再 show——避免「先 show 后激活」的策略重排闪烁；show 后 set_position
+/// 发生在 macOS 窗口 map 之前（同步路径），无可见跳动。
+fn show_notifications_window(w: &NotificationsWindow) {
+    use slint::winit_030::WinitWindowAccessor;
+    bring_app_to_front();
+    let _ = w.show();
+    // 右上角：主屏宽 - 窗宽 - 边距；y 从菜单栏下方开始（macOS 菜单栏高约 24-28px）。
+    // primary_monitor 拿不到时回落 1920（旧 Mac 常见宽），定位失败只是位置偏移不致命。
+    let size = w.window().size();
+    let pos = w
+        .window()
+        .with_winit_window(|ww| {
+            let mw = ww.primary_monitor().map(|m| m.size().width).unwrap_or(1920);
+            let margin = 16i32;
+            slint::PhysicalPosition::new(mw as i32 - size.width as i32 - margin, 36)
+        })
+        .unwrap_or_else(|| slint::PhysicalPosition::new(0, 0));
+    w.window().set_position(pos);
+    w.window().request_redraw();
+}
+
+/// #74 收起提醒弹窗（5s 自动 / 点「知道了」/ 点条目跳转后共用）：
+/// 设置窗还开着（点条目跳历史页）时不动 dock——激活策略已归设置窗；
+/// 否则弹窗收起即降回 accessory（hide 先于 hide_dock，同 QrDialog 显隐时序，避免闪烁）。
+fn hide_notifications_window(
+    notif: &slint::Weak<NotificationsWindow>,
+    settings: &slint::Weak<SettingsWindow>,
+    showing: &Cell<bool>,
+) {
+    if let Some(n) = notif.upgrade() {
+        let _ = n.hide();
+    }
+    if let Some(s) = settings.upgrade() {
+        if !s.window().is_visible() {
+            platform::hide_dock();
+        }
+    }
+    showing.set(false);
+}
+
+/// #74 托盘红点合成（选型见 app.slint Tray 注释）：状态图标像素 → 右上角画红点
+/// （Apple 系统红 #FF3B30 + 1px 白描边保证任何底色可见）。启动时付一次合成代价
+/// （4 张 16-22px 小图）；失败静默回落原图（红点缺失只是少个提示，不影响功能）。
+fn composite_tray_dot(base: &slint::Image) -> slint::Image {
+    let fallback = base.clone();
+    let Some(buf) = base.to_rgba8() else {
+        return fallback;
+    };
+    let (w, h) = (buf.width(), buf.height());
+    let mut px: Vec<slint::Rgba8Pixel> = buf.as_slice().to_vec();
+    // 红点半径取短边 1/6（≥2px），内缩 margin≈半径/2——点落在图标右上角内
+    let r = ((w.min(h) / 6).max(2)) as i32;
+    let margin = (r / 2).max(1);
+    let (cx, cy) = (w as i32 - margin - r, margin + r);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let dist2 = dx * dx + dy * dy;
+            if dist2 > r * r {
+                continue;
+            }
+            let (x, y) = (cx + dx, cy + dy);
+            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                continue;
+            }
+            let idx = (y as u32 * w + x as u32) as usize;
+            px[idx] = if dist2 > (r - 1) * (r - 1) {
+                // 白描边（外圈约 1px）
+                slint::Rgba8Pixel {
+                    r: 0xff,
+                    g: 0xff,
+                    b: 0xff,
+                    a: 0xff,
+                }
+            } else {
+                slint::Rgba8Pixel {
+                    r: 0xff,
+                    g: 0x3b,
+                    b: 0x30,
+                    a: 0xff,
+                }
+            };
+        }
+    }
+    // AsPixels 无 RGBA→RGBA 恒等实现（只有 RGB→RGBA 加 alpha），改走
+    // 新建 + copy（make_mut_slice 直接写像素）。
+    let mut buf2 = slint::SharedPixelBuffer::new(w, h);
+    buf2.make_mut_slice().copy_from_slice(&px);
+    slint::Image::from_rgba8(buf2)
+}
+
+/// #74 落 GUI → service 命令文件（存在即消费，service 的 history-gc 轮询执行）：
+/// msg-read.command=弹窗已读、msg-clear.command=清除全部历史。
+/// 统一出口：GUI 侧不直写 unread.json/消息库（只读连接纪律），全部走命令文件。
+fn write_command_file(name: &str) {
+    let p = crate::bridge_dir().join("logs").join(name);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, "1");
+}
+
 /// config.json 签名（mtime, size）：检测外部（service 消费授权码等）改盘。
 fn config_sig() -> Option<(std::time::SystemTime, u64)> {
     std::fs::metadata(crate::config::Config::path())
@@ -595,6 +757,12 @@ pub fn run_gui() -> Result<()> {
     }
 
     let tray = Tray::new()?;
+    // #74 托盘红点合成（启动一次）：状态图 → 右上角红点版，供 Tray 的 unread-count>0
+    // 分支取用。合成失败静默回落原图（红点缺失只是少个提示）。
+    tray.set_icon_online_dot(composite_tray_dot(&tray.get_icon_online()));
+    tray.set_icon_connecting_dot(composite_tray_dot(&tray.get_icon_connecting()));
+    tray.set_icon_offline_dot(composite_tray_dot(&tray.get_icon_offline()));
+    tray.set_icon_dark_dot(composite_tray_dot(&tray.get_icon_dark()));
     let settings = SettingsWindow::new()?;
     // 像素自绘窗口：PixelTitleBar 窗口控制接线（关闭=隐藏，托盘应用惯例）
     slint_pixel::install_title_bar_controls_no_quit(&settings);
@@ -604,6 +772,12 @@ pub fn run_gui() -> Result<()> {
     tray.set_version(env!("CARGO_PKG_VERSION").into());
     let qr_dialog = QrDialog::new()?;
     let unsaved_dialog = UnsavedDialog::new()?;
+    // #74 提醒弹窗：授权者私聊 toast（右上角、5s 自动收起）；创建后一直隐藏，
+    // 2s 轮询发现未读时由 show_notifications_window 显示。
+    let notifications = NotificationsWindow::new()?;
+    // 弹窗是否正在显示（防重复弹）；5s 自动收起定时器（每次弹出 restart，见 tick 内）
+    let notif_showing = Rc::new(Cell::new(false));
+    let notif_timer = Rc::new(slint::Timer::default());
     // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。
     // 有未保存修改时，关闭/取消要先弹确认，避免静默丢编辑（红点/按钮都走这条保护）。
     let dirty = Rc::new(Cell::new(false));
@@ -1556,6 +1730,27 @@ pub fn run_gui() -> Result<()> {
     settings.on_open_url(|url| {
         platform::open_url(url.as_str());
     });
+    // ── #74 提醒弹窗：点条目 → 打开设置窗历史页；「知道了」/5s 自动收起 ──
+    {
+        let nw = notifications.as_weak();
+        let sw = settings.as_weak();
+        let showing = notif_showing.clone();
+        notifications.on_open_history(move || {
+            if let Some(w) = sw.upgrade() {
+                w.set_current_page(4);
+                show_window_and_focus(&w);
+            }
+            // 弹窗内容即已读（展示时已落 msg-read.command）：这里只收起，不 hide_dock
+            // ——设置窗已打开（dock 激活策略归它管）
+            hide_notifications_window(&nw, &sw, &showing);
+        });
+        notifications.on_dismiss({
+            let nw = notifications.as_weak();
+            let sw = settings.as_weak();
+            let showing = notif_showing.clone();
+            move || hide_notifications_window(&nw, &sw, &showing)
+        });
+    }
     // 「去授权」：跳到对应系统权限的设置面板（仅 macOS 有；面板 URL 与 deps.rs detect_permissions 一致）
     settings.on_open_perm_settings(|id| {
         let url = match id.as_str() {
@@ -2039,6 +2234,10 @@ pub fn run_gui() -> Result<()> {
         let providers_work_t = providers_work.clone();
         let default_provider_work_t = default_provider_work.clone();
         let cross_delivery_work_t = cross_delivery_work.clone();
+        // #74 未读提醒：弹窗句柄 + 防重弹标记 + 5s 自动收起定时器（每次弹出 restart）
+        let notif_weak = notifications.as_weak();
+        let notif_showing = notif_showing.clone();
+        let notif_timer = notif_timer.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -2244,6 +2443,41 @@ pub fn run_gui() -> Result<()> {
                         }
                     }
                 }
+                // #74 未读提醒（与托盘刷新同 tick）：读 unread.json →
+                // 有未读 → 托盘红点；提醒开关开且弹窗未在显示 → 弹窗展示最近几条
+                // （弹出即已读：落 msg-read.command 由 service 消费清空，消红点）。
+                if let Some(items) = crate::unread::UnreadStore::production().snapshot() {
+                    let cfg = Config::load().unwrap_or_default();
+                    if let Some(t) = tray_weak.upgrade() {
+                        t.set_unread_count(if cfg.notify_enabled {
+                            items.len() as i32
+                        } else {
+                            0 // 提醒关：不显红点（历史记录仍照常落库）
+                        });
+                    }
+                    if !items.is_empty() && cfg.notify_enabled && !notif_showing.get() {
+                        if let Some(n) = notif_weak.upgrade() {
+                            let rows = notify_rows(&items, &cfg);
+                            n.set_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                                rows,
+                            ))));
+                            show_notifications_window(&n);
+                            notif_showing.set(true);
+                            // 弹出即已读：命令文件由 service 消费（GUI 不直写 unread.json，
+                            // 保证 service 是唯一写方）
+                            write_command_file("msg-read.command");
+                            // 5s 自动收起（toast 惯例）：单次定时器每次弹出 restart
+                            let nw = notif_weak.clone();
+                            let sw = settings_weak.clone();
+                            let showing = notif_showing.clone();
+                            notif_timer.start(
+                                slint::TimerMode::SingleShot,
+                                Duration::from_secs(5),
+                                move || hide_notifications_window(&nw, &sw, &showing),
+                            );
+                        }
+                    }
+                }
             },
         );
     }
@@ -2352,5 +2586,55 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
     }
     if let Err(e) = attempt(idx, bot_key, &tx).await {
         let _ = tx.send(WxEvt::Failed(e));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #74 红点合成行为：右上角出现红点（含白描边），左下角像素保持原图不动。
+    /// 用真实托盘资产（CARGO_MANIFEST_DIR 相对路径，测试进程 cwd 无关）。
+    fn load_green() -> slint::Image {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/tray-green.png");
+        slint::Image::load_from_path(&p).expect("托盘资产应可加载")
+    }
+
+    #[test]
+    fn tray_dot_is_painted_at_top_right_and_preserves_rest() {
+        let base = load_green();
+        let original = base.to_rgba8().expect("rgba8 解码");
+        let (w, h) = (original.width(), original.height());
+        let dot = composite_tray_dot(&base)
+            .to_rgba8()
+            .expect("合成图应可解码");
+        assert_eq!((dot.width(), dot.height()), (w, h), "合成不改尺寸");
+
+        // SharedPixelBuffer 无 pixel() 访问器，用 as_slice 按行索引取像素
+        let at = |buf: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, x: u32, y: u32| {
+            buf.as_slice()[(y * w + x) as usize]
+        };
+        // 红点中心落在右上角内缩区域（与 composite_tray_dot 的半径/边距公式同源）
+        let r = ((w.min(h) / 6).max(2)) as i32;
+        let margin = (r / 2).max(1);
+        let (cx, cy) = (w as i32 - margin - r, margin + r);
+        let p = at(&dot, cx as u32, cy as u32);
+        assert!(
+            p.r > 0xE0 && p.g < 0x80 && p.b < 0x60,
+            "红点中心应为红色系，实际 {p:?}"
+        );
+        // 白描边：红点最外圈（dist² == r² 的轴上像素）应为白色
+        let ring = at(&dot, (cx + r) as u32, cy as u32);
+        assert!(
+            ring.r > 0xE0 && ring.g > 0xE0 && ring.b > 0xE0,
+            "红点外圈应为白描边，实际 {ring:?}"
+        );
+        // 左下角远离红点：像素必须保持原图（合成不能污染其余区域）
+        let bl = at(&dot, 1, h - 2);
+        let bl_orig = at(&original, 1, h - 2);
+        assert_eq!(
+            (bl.r, bl.g, bl.b, bl.a),
+            (bl_orig.r, bl_orig.g, bl_orig.b, bl_orig.a)
+        );
     }
 }
