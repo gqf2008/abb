@@ -607,6 +607,10 @@ impl Bridge {
         if !registered {
             return None;
         }
+        // 取舍留痕（审查跟进）：cache.get 在缓存过期时会在**per-chat 串行锁内**发起
+        // 异步网络拉群资料（仅登记群、每 5 分钟至多一次、reqwest 30s 超时）——最坏
+        // 阻塞同 chat 消息队列 30s。可接受：频率极低 + best-effort（失败只 log），
+        // 且把预取挪到锁外会引入「锁外异步态」的复杂度，收益不抵（不重构）。
         self.chat_info_cache
             .get(&ev.chat_id, self.msgr.as_ref())
             .await
