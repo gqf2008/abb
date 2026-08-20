@@ -2611,8 +2611,10 @@ pub fn run_gui() -> Result<()> {
                     }
                 }
                 // #74 未读提醒（与托盘刷新同 tick）：读 unread.json →
-                // 有未读 → 托盘红点；提醒开关开且弹窗未在显示 → 弹窗展示最近几条
-                // （弹出即已读：落 msg-read.command 由 service 消费清空，消红点）。
+                // 有未读 → 托盘红点；提醒开关开、服务在跑且弹窗未在显示 → 弹窗展示
+                // 最近几条（弹出即已读：落 msg-read.command 由 service 消费清空，消红点）。
+                // 服务停着时不弹：此时 msg-read.command 无人消费，弹窗会每 tick 反复弹出；
+                // 红点保留（unread.json 是数据事实），服务重启后首个 tick 消费命令清掉。
                 if let Some(items) = crate::unread::UnreadStore::production().snapshot() {
                     let cfg = Config::load().unwrap_or_default();
                     if let Some(t) = tray_weak.upgrade() {
@@ -2622,7 +2624,11 @@ pub fn run_gui() -> Result<()> {
                             0 // 提醒关：不显红点（历史记录仍照常落库）
                         });
                     }
-                    if !items.is_empty() && cfg.notify_enabled && !notif_showing.get() {
+                    if !items.is_empty()
+                        && cfg.notify_enabled
+                        && st.running
+                        && !notif_showing.get()
+                    {
                         if let Some(n) = notif_weak.upgrade() {
                             let rows = notify_rows(&items, &cfg);
                             n.set_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(
