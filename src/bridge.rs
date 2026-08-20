@@ -505,6 +505,42 @@ impl Bridge {
                 sender_id,
                 chat_type
             );
+            // #74 扩展（8-20 用户实测反馈）：**未授权私聊也提醒 + 落历史**——owner 能
+            // 看到谁在找 bot（决定是否授权）；群聊未授权保持忽略（提醒范围=私聊）。
+            // 授权码消费成功（上面 return）的不提醒——那是激活流程，owner 无需被打扰。
+            // mid/ts 主路径解析在 access 闸之后，这里分支内自取（事件字段同源）。
+            if chat_type == "p2p" {
+                let mid = message["message_id"].as_str().unwrap_or("").to_string();
+                let ts = body["header"]["create_time"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| body["header"]["create_time"].as_i64())
+                    .map(|ms| ms / 1000)
+                    .unwrap_or_else(|| crate::chrono_lite::unix_secs() as i64);
+                if !mid.is_empty() {
+                    let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
+                    let text =
+                        crate::feishu::parse_content(message["content"].as_str().unwrap_or(""))
+                            .text
+                            .trim()
+                            .to_string();
+                    self.msgstore.insert(
+                        &self.bot.key(),
+                        &chat_id,
+                        &mid,
+                        "user",
+                        sender_id,
+                        &text,
+                        ts,
+                    );
+                    self.unread.report(
+                        &self.bot.key(),
+                        sender_id,
+                        &crate::agent::truncate(&text, 40),
+                        ts,
+                    );
+                }
+            }
             return;
         }
         // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
@@ -4097,6 +4133,67 @@ mod tests {
         assert!(
             bridge.unread.snapshot().unwrap_or_default().is_empty(),
             "owner 消息不得产生未读"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_p2p_message_records_unread_and_history() {
+        // #74 扩展（8-20 用户实测反馈）：未授权用户私聊也提醒 + 落历史（owner 能看到
+        // 谁在找 bot）；授权码消费成功的不提醒（那是激活流程）
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        // 陌生人（非 owner 非授权者）私聊：应落 user 历史 + 未读提醒；agent 不被触发
+        let payload = feishu_payload(
+            "om_stranger",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_stranger",
+            &[],
+            "你好，我想用一下这个机器人",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+        let rows = bridge.msgstore.list_recent(10);
+        assert_eq!(rows.len(), 1, "未授权私聊应落 1 条 user 历史");
+        assert_eq!(rows[0].direction, "user");
+        assert_eq!(rows[0].sender_id, "ou_stranger");
+        assert_eq!(rows[0].text, "你好，我想用一下这个机器人");
+        let unread = bridge.unread.snapshot().unwrap();
+        assert_eq!(unread.len(), 1, "未授权私聊应产生未读提醒");
+        assert_eq!(unread[0].sender, "ou_stranger");
+        assert!(
+            msgr.sent().is_empty(),
+            "未授权消息不触发 agent、不回复（提醒是纯本地）"
+        );
+        // 未授权群聊：不提醒（提醒范围=私聊）
+        let payload2 = feishu_payload(
+            "om_stranger_g",
+            "oc_group",
+            "group",
+            "",
+            "",
+            "user",
+            "ou_stranger",
+            &[],
+            "@_user_1 你好",
+        );
+        bridge.on_payload(payload2.as_bytes()).await;
+        assert_eq!(
+            bridge.unread.snapshot().unwrap().len(),
+            1,
+            "未授权群聊不产生新提醒"
         );
         cleanup_bridge(&bridge);
     }
