@@ -52,6 +52,15 @@ pub struct Bridge {
     /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
     /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
     agent_runner: Arc<dyn AgentRunner>,
+    /// 虚拟 Bot 登记快照（#75）：启动时加载；注入判定前按文件 mtime 懒刷新
+    /// （GUI 登记/取消登记即时生效，无需重启 service）。读-改由 VirtualBotStore 原子
+    /// 整文件重写，这里只读快照——跨进程无锁安全。
+    virtual_bots: Mutex<Vec<crate::virtualbot::VirtualBot>>,
+    /// 登记表 (mtime, 长度) 签名（懒刷新判定：没变就不重读）。
+    virtual_bots_mtime: Mutex<Option<(std::time::SystemTime, u64)>>,
+    /// 群资料缓存（#75，5 分钟 TTL）：事件群名 + API 群介绍。「改群介绍即时生效」
+    /// 的载体——每次注入前查缓存，缓存过期自然刷新，不做变更推送。
+    chat_info_cache: crate::virtualbot::ChatInfoCache,
 }
 
 #[derive(Debug)]
@@ -120,6 +129,19 @@ impl Bridge {
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
+            // #75：启动即加载登记快照 + 记录文件签名（后续由 refresh_virtual_bots 懒刷新）
+            virtual_bots: Mutex::new(crate::virtualbot::VirtualBotStore::new().load()),
+            virtual_bots_mtime: Mutex::new(
+                std::fs::metadata(crate::bridge_dir().join("virtual-bots.json"))
+                    .ok()
+                    .map(|m| {
+                        (
+                            m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                            m.len(),
+                        )
+                    }),
+            ),
+            chat_info_cache: crate::virtualbot::ChatInfoCache::new(),
         }
     }
 
@@ -422,6 +444,9 @@ impl Bridge {
         }
         let chat_type = message["chat_type"].as_str().unwrap_or("");
         let thread_id = message["thread_id"].as_str().unwrap_or("");
+        // 虚拟 Bot #75：事件自带的群名（取不到为空）。比 API 查询新——平台改群名，
+        // 下一条消息注入的就是新名（入库见下方 chat_id 处，只对群聊记）。
+        let chat_name = message["chat_name"].as_str().unwrap_or("").to_string();
         let mentions: Vec<serde_json::Value> =
             message["mentions"].as_array().cloned().unwrap_or_default();
 
@@ -465,6 +490,10 @@ impl Bridge {
         // 门槛判定复用 access_and_role 同一次 config load（mention_off），
         // 已 @ 则短路不付门槛判定（已 @ 的消息本就无需门槛）。
         let chat_id = message["chat_id"].as_str().unwrap_or("");
+        // #75：事件群名入缓存（只对群聊；非群事件该字段恒空，note 内部过滤）
+        if chat_type == "group" {
+            self.chat_info_cache.note_event_name(chat_id, &chat_name);
+        }
         if chat_type == "group"
             && thread_id.is_empty()
             && !self.bot_is_mentioned(&mentions)
@@ -561,6 +590,40 @@ impl Bridge {
             }
         }
         self.handle(ev).await;
+    }
+
+    /// 虚拟 Bot 注入数据（#75）：仅登记过的群聊返回 (群名, 群介绍)。
+    /// 判定条件：chat_type=group + chat_id 在登记表（快照 mtime 懒刷新）。
+    async fn virtual_role_for(&self, ev: &Ev) -> Option<(String, String)> {
+        if ev.chat_type != "group" {
+            return None;
+        }
+        self.refresh_virtual_bots();
+        let registered = {
+            let bots = self.virtual_bots.lock().unwrap();
+            bots.iter()
+                .any(|v| v.bot_key == self.bot.key() && v.chat_id == ev.chat_id)
+        };
+        if !registered {
+            return None;
+        }
+        self.chat_info_cache.get(&ev.chat_id, self.msgr.as_ref()).await
+    }
+
+    /// 登记快照懒刷新：文件 (mtime, 长度) 变了才重读（GUI 登记/取消登记后下一条消息
+    /// 即生效；文件极小，未变时只付一次 stat 成本）。长度进签名：防同 mtime 粒度内
+    /// 两次连续写入（文件系统时间戳 tick 相同）漏刷新。
+    fn refresh_virtual_bots(&self) {
+        use std::time::SystemTime;
+        let sig = std::fs::metadata(crate::bridge_dir().join("virtual-bots.json"))
+            .ok()
+            .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
+        let mut cached = self.virtual_bots_mtime.lock().unwrap();
+        if *cached != sig {
+            *self.virtual_bots.lock().unwrap() =
+                crate::virtualbot::VirtualBotStore::new().load();
+            *cached = sig;
+        }
     }
 
     pub(crate) async fn handle(&self, ev: Ev) {
@@ -845,6 +908,26 @@ impl Bridge {
                 prompt.push('\n');
                 prompt.push_str(&u);
             }
+        }
+        // 虚拟 Bot 角色注入（#75）：登记过的群聊消息，在 prompt 前置 [群角色] 块——
+        // 群名=角色名、群介绍=system prompt（平台群资料为准，改群介绍即时生效：注入前
+        // 查 5 分钟缓存，缓存过期自然刷新）。判定：chat_type=group + chat_id 在登记表
+        // （mtime 懒刷新快照）。best-effort：群名/群介绍都拿不到（事件无群名 + API 查
+        // 不到）→ 跳过注入，只 log，不阻塞消息处理。群聊 @ 门槛保持不变（本条消息能
+        // 走到这里就已满足 @/话题/免 @ 之一，注入不改变准入语义）。
+        // 顺序说明：历史注入（下方 insert_str(0)）与受限说明（再下方 insert_str(0)）
+        // 都比这里后插入，最终顺序 = 受限说明 > 历史 > 群角色 > 用户文本——受限说明
+        // 必须保持最外层（它的注释是硬约束）；群角色紧随历史之后即可（角色=你是谁，
+        // 历史=之前聊过什么，都在用户新消息之前）。
+        if let Some((vb_name, vb_desc)) = self.virtual_role_for(&ev).await {
+            prompt.insert_str(0, &crate::virtualbot::role_block(&vb_name, &vb_desc));
+            crate::log!(
+                "[bridge] 注入群角色 bot={} chat={} 名={} 介绍长度={}",
+                self.bot.key(),
+                trunc(&ev.chat_id, 12),
+                vb_name.chars().count(),
+                vb_desc.chars().count()
+            );
         }
         // 受限会话（授权者）：prompt 开头前置受限说明。CLAUDE.md 是 owner/授权者共享的
         // 同一份指引，不能靠它区分——prompt 注入才是按角色区分的正确载体（硬闸在 guard hook）。
@@ -1377,6 +1460,12 @@ impl Bridge {
         let chat_id = msg.chat_id();
         if chat_id.is_empty() || msg.mid.is_empty() {
             return;
+        }
+        // 虚拟 Bot #75：事件群名（conversationTitle）入缓存——只对群聊；
+        // 单聊事件无该字段，note 内部过滤空名
+        if msg.is_group() {
+            self.chat_info_cache
+                .note_event_name(&chat_id, &msg.conversation_title);
         }
         // 群聊回复需要 @ 提问者 → 记最近 sender（单聊 chat_id==sender，无意义但无害）
         self.msgr.note_sender(&chat_id, &msg.sender_staff_id);
