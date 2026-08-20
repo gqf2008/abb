@@ -1080,10 +1080,8 @@ pub fn run_gui() -> Result<()> {
             EventResult::Propagate // 让 Slint 照常把窗口 hide
         });
         qr_dialog.window().on_winit_window_event(|_w, ev| {
-            if matches!(ev, WindowEvent::CloseRequested) {
-                #[cfg(target_os = "macos")]
-                platform::hide_dock();
-            }
+            // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
+            let _ = ev;
             EventResult::Propagate
         });
         // 虚拟 Bot 弹窗/确认弹窗：红点关闭 = 隐藏（同 QrDialog；busy 时禁止关闭防半途退出）
@@ -1095,18 +1093,13 @@ pub fn run_gui() -> Result<()> {
                 {
                     return EventResult::PreventDefault; // 创建中：不让用户关掉弹窗丢进度
                 }
-                if matches!(ev, WindowEvent::CloseRequested) {
-                    #[cfg(target_os = "macos")]
-                    platform::hide_dock();
-                }
+                // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
                 EventResult::Propagate
             });
         }
         vb_confirm.window().on_winit_window_event(|_w, ev| {
-            if matches!(ev, WindowEvent::CloseRequested) {
-                #[cfg(target_os = "macos")]
-                platform::hide_dock();
-            }
+            // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
+            let _ = ev;
             EventResult::Propagate
         });
     }
@@ -1116,8 +1109,8 @@ pub fn run_gui() -> Result<()> {
         let qw = qr_dialog.as_weak();
         qr_dialog.on_close_clicked(move || {
             if let Some(d) = qw.upgrade() {
+                // 子窗口关闭不动 dock（8-20 用户反馈）
                 let _ = d.hide();
-                platform::hide_dock();
             }
         });
     }
@@ -1128,8 +1121,8 @@ pub fn run_gui() -> Result<()> {
         vb_dialog.on_close_clicked(move || {
             if let Some(d) = dw.upgrade() {
                 if !d.get_busy() {
+                    // 子窗口关闭不动 dock（8-20 用户反馈）
                     let _ = d.hide();
-                    platform::hide_dock();
                 }
             }
         });
@@ -1156,8 +1149,8 @@ pub fn run_gui() -> Result<()> {
         vb_confirm.on_canceled(move || {
             action.borrow_mut().take();
             if let Some(c) = cw.upgrade() {
+                // 子窗口关闭不动 dock（8-20 用户反馈）
                 let _ = c.hide();
-                platform::hide_dock();
             }
         });
     }
@@ -1197,8 +1190,8 @@ pub fn run_gui() -> Result<()> {
                 });
             }
             if let Some(c) = cw.upgrade() {
+                // 子窗口关闭不动 dock（8-20 用户反馈）
                 let _ = c.hide();
-                platform::hide_dock();
             }
         });
     }
@@ -3947,8 +3940,8 @@ pub fn run_gui() -> Result<()> {
                         }
                         WxEvt::Failed(e) => {
                             if let Some(d) = qr_weak.upgrade() {
+                                // 子窗口关闭不动 dock（8-20 用户反馈）
                                 let _ = d.hide();
-                                platform::hide_dock();
                             }
                             if let Some(w) = settings_weak.upgrade() {
                                 w.set_status_line(format!("微信登录失败：{e}").into());
