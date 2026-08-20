@@ -1146,6 +1146,7 @@ pub fn run_gui() -> Result<()> {
         let action = vb_action.clone();
         let tx = tx.clone();
         vb_confirm.on_confirmed(move || {
+            crate::log!("[gui] 虚拟 Bot 确认弹窗：确认");
             if let Some(a) = action.borrow_mut().take() {
                 let _ = tx.send(match a {
                     VbAction::Deregister { bot_key, chat_id } => {
@@ -1749,6 +1750,11 @@ pub fn run_gui() -> Result<()> {
                     UiCmd::VirtualBotDeregister { bot_key, chat_id } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
+                            crate::log!(
+                                "[gui] 取消登记 bot={} chat={}",
+                                bot_key,
+                                crate::agent::truncate(&chat_id, 12)
+                            );
                             let store = VirtualBotStore::new();
                             // 结果行的名字用角色名（比 chat_id 可读）；查不到才回落 id
                             let role = store
@@ -1763,6 +1769,10 @@ pub fn run_gui() -> Result<()> {
                             } else {
                                 Err("该群不在登记表里（可能已被移除）".to_string())
                             };
+                            crate::log!(
+                                "[gui] 取消登记结果: {}",
+                                if ok { "成功" } else { "失败（不在登记表）" }
+                            );
                             let _ = vb_tx.send(VirtualBotEvt::Done {
                                 results: vec![(role, result)],
                             });
@@ -1785,6 +1795,12 @@ pub fn run_gui() -> Result<()> {
                                 .map(|v| v.role_name)
                                 .unwrap_or_else(|| chat_id.clone());
                             // 先解散平台群（不可恢复；确认弹窗已挡过一次），成功再移除登记
+                            crate::log!(
+                                "[gui] 解散群 bot={} kind={} chat={}",
+                                bot_key,
+                                kind,
+                                crate::agent::truncate(&chat_id, 12)
+                            );
                             let r = async {
                                 match kind.as_str() {
                                     "dingtalk" => Err("钉钉暂无解散群 API".to_string()),
@@ -1802,6 +1818,13 @@ pub fn run_gui() -> Result<()> {
                                 }
                                 Err(e) => Err(format!("解散失败（登记保留）：{e}")),
                             };
+                            crate::log!(
+                                "[gui] 解散群结果: {}",
+                                match &result {
+                                    Ok(s) => s,
+                                    Err(e) => e,
+                                }
+                            );
                             let _ = vb_tx.send(VirtualBotEvt::Done {
                                 results: vec![(role, result)],
                             });
@@ -2641,6 +2664,7 @@ pub fn run_gui() -> Result<()> {
         let action = vb_action.clone();
         let confirm = vb_confirm.as_weak();
         settings.on_virtual_bot_deregister(move |row| {
+            crate::log!("[gui] ⋯ 点击「取消登记」 row={row}");
             let Some(w) = sw.upgrade() else { return };
             let sel = w.get_selected();
             let b = work.borrow();
@@ -2673,6 +2697,7 @@ pub fn run_gui() -> Result<()> {
         let action = vb_action.clone();
         let confirm = vb_confirm.as_weak();
         settings.on_virtual_bot_disband(move |row| {
+            crate::log!("[gui] ⋯ 点击「解散群」 row={row}");
             let Some(w) = sw.upgrade() else { return };
             let sel = w.get_selected();
             let b = work.borrow();
