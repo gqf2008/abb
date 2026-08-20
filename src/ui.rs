@@ -1161,7 +1161,9 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 确认弹窗：确认 = 执行待操作（按 VbAction 分发到后台线程）
+    // 确认弹窗：确认 = 执行待操作（按 VbAction 分发到后台线程）。
+    // 执行中不关窗（busy）：结果由 VirtualBotEvt::Done 回填——成功才关，失败在弹窗里
+    // 显示错误（8-20 用户反馈"点了窗口就关了但群还在"——失败必须可见，不能静默）。
     {
         let cw = vb_confirm.as_weak();
         let action = vb_action.clone();
@@ -1169,6 +1171,10 @@ pub fn run_gui() -> Result<()> {
         vb_confirm.on_confirmed(move || {
             crate::log!("[gui] 虚拟 Bot 确认弹窗：确认");
             if let Some(a) = action.borrow_mut().take() {
+                if let Some(c) = cw.upgrade() {
+                    c.set_busy(true);
+                    c.set_message("执行中…".into());
+                }
                 let _ = tx.send(match a {
                     VbAction::Deregister { bot_key, chat_id } => {
                         UiCmd::VirtualBotDeregister { bot_key, chat_id }
@@ -1896,7 +1902,19 @@ pub fn run_gui() -> Result<()> {
                                     store.remove(&bot_key, &chat_id);
                                     Ok("群已解散，登记已移除".to_string())
                                 }
-                                Err(e) => Err(format!("解散失败（登记保留）：{e}")),
+                                Err(e) => {
+                                    // 232017（操作者非群主/管理员）：8-20 实测——群主
+                                    // 转让给 owner 后 bot 降级普通成员，解散被拒。附可执行
+                                    // 指引（飞书里把机器人设为管理员，或把群主转回机器人）。
+                                    let es = e.to_string();
+                                    if es.contains("232017") {
+                                        Err(format!(
+                                            "解散失败（登记保留）：机器人不是该群群主/管理员。请在飞书群设置里把机器人设为管理员（或把群主转回机器人）后重试。{es}"
+                                        ))
+                                    } else {
+                                        Err(format!("解散失败（登记保留）：{e}"))
+                                    }
+                                }
                             };
                             // 权限不足（飞书 99991672）：给 owner 私聊发授权指引——平台权限
                             // 问题不该只躺在状态行/日志里，owner 需要可执行的下一步。
@@ -3618,6 +3636,8 @@ pub fn run_gui() -> Result<()> {
         let notif_weak = notifications.as_weak();
         let notif_showing = notif_showing.clone();
         let notif_timer = notif_timer.clone();
+        // 虚拟 Bot 确认弹窗 weak（#75：解散/取消登记结果回填——成功关窗/失败可见）
+        let vb_confirm_weak = vb_confirm.as_weak();
         // #74 历史记录列表 model（历史页打开时每 tick 刷新）
         let history_model = history_model.clone();
         timer.start(
@@ -3770,6 +3790,32 @@ pub fn run_gui() -> Result<()> {
                                 d.set_results(slint::ModelRc::from(Rc::new(
                                     slint::VecModel::from(lines),
                                 )));
+                            }
+                            // 确认弹窗执行中（解散/取消登记）→ 回填结果：成功关窗；
+                            // 失败在弹窗里显示错误（"知道了"再关）——失败必须可见
+                            if let Some(c) = vb_confirm_weak.upgrade() {
+                                if c.get_busy() {
+                                    c.set_busy(false);
+                                    let all_ok = results.iter().all(|(_, r)| r.is_ok());
+                                    if all_ok {
+                                        let _ = c.hide();
+                                        platform::hide_dock();
+                                    } else {
+                                        let errs: Vec<String> = results
+                                            .iter()
+                                            .filter_map(|(n, r)| match r {
+                                                Ok(_) => None,
+                                                Err(e) => Some(format!("{n}：{e}")),
+                                            })
+                                            .collect();
+                                        c.set_title_text("操作失败".into());
+                                        c.set_message(errs.join("\n").into());
+                                        c.set_confirm_text("知道了".into());
+                                        c.set_cancel_text("".into());
+                                        // action 已 take：再点「知道了」走 on_confirmed
+                                        // 的 None 分支只关窗
+                                    }
+                                }
                             }
                             if let Some(w) = settings_weak.upgrade() {
                                 let ok = results

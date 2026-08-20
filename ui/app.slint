@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 export struct BotMenuRow {
@@ -491,6 +491,9 @@ export component ConfirmDialog inherits Window {
     in-out property <string> confirm-text: "确认";
     in-out property <string> cancel-text: "取消";
     in-out property <bool> danger: false;   // true=主按钮红色（强确认）
+    // busy（8-20）：确认后转"执行中"（按钮禁用，防连点）；结果回来由 Rust 侧
+    // 更新 message/按钮文案——成功即关，失败显示错误让用户看到（不再静默关窗）
+    in-out property <bool> busy: false;
     callback confirmed();
     callback canceled();
 
@@ -519,8 +522,8 @@ export component ConfirmDialog inherits Window {
         HorizontalBox {
             alignment: center;
             spacing: 10px;
-            PixelButton { text: root.cancel-text; clicked => { root.canceled(); } }
-            PixelButton { text: root.confirm-text; variant: root.danger ? "danger" : "primary"; clicked => { root.confirmed(); } }
+            PixelButton { text: root.cancel-text; enabled: !root.busy; clicked => { root.canceled(); } }
+            PixelButton { text: root.confirm-text; variant: root.danger ? "danger" : "primary"; enabled: !root.busy; clicked => { root.confirmed(); } }
             }
         }
     }
@@ -635,15 +638,24 @@ export component VirtualBotDialog inherits Window {
                 }
                 HorizontalBox {
                     spacing: 8px;
-                    Text { text: "提示词（群介绍）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
-                    PixelTextInput {
-                        text: root.prompt-input;
-                        placeholder: "system prompt，≤100 字符（如：你是后端开发工程师……）";
+                    Text { text: "提示词（群介绍）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: top; }
+                    VerticalBox {
                         horizontal-stretch: 1;
-                        enabled: !root.busy;
-                        edited => { root.prompt-input = self.text; root.prompt-edited(); }
+                        spacing: 4px;
+                        // 多行文本域（8-20 需求）：system prompt 通常是多行角色设定
+                        PixelTextArea {
+                            text: root.prompt-input;
+                            placeholder: "system prompt，≤100 字符（如：你是后端开发工程师……）";
+                            frame-height: 110px;
+                            enabled: !root.busy;
+                            edited => { root.prompt-input = self.text; root.prompt-edited(); }
+                        }
+                        Text {
+                            text: root.prompt-count + "/100";
+                            font-size: 11px;
+                            color: root.prompt-count > 100 ? #d33 : #888;
+                        }
                     }
-                    Text { text: root.prompt-count + "/100"; font-size: 11px; color: root.prompt-count > 100 ? #d33 : #888; vertical-alignment: center; }
                 }
                 if root.mode == 3: Text {
                     text: "保存 = 平台改群名/群介绍（PATCH）+ 本地登记同步。改名会改变 deliver 的 @角色名 寻址。";
