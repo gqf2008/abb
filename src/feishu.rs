@@ -443,16 +443,22 @@ impl FeishuClient {
     }
 
     /// 创建群聊（虚拟 Bot #75）：POST /im/v1/chats。
-    /// - 机器人自动入群：操作此接口的机器人（app）自动成为群成员；未指定 `owner_id`
-    ///   时机器人就是群主（创建即管理权，后续改名/解散都能操作）；
-    /// - `set_bot_manager: true`：仅在指定 `owner_id`（用户为群主）时把机器人设为
-    ///   管理员；本调用无 owner_id（默认 bot 为群主），此标志被忽略，保留仅为
-    ///   语义完整（lark-cli im +chat-create 说明）；
+    /// - `owner_user_id`：把 bot 配置的 owner（open_id）设为群主并拉进群——**必须**：
+    ///   否则群里只有机器人，用户飞书客户端看不到群、无法使用（8-20 实测踩坑，
+    ///   创建"成功"但群不可见）；
+    /// - `set_bot_manager: true`：指定了 owner_id 时把机器人设为管理员——机器人是
+    ///   管理员才能收发群消息；且群主是用户，用户才可在飞书里直接改群名/群介绍
+    ///   （=改角色，平台为准的核心交互）；
     /// - `uuid` 幂等：同 uuid 重复调用返回同一个群（网络重试/超时重发安全）；
     /// - `chat_mode: "group"`：显式普通群（与话题群 p2p 群区分）。
     ///
     /// 返回 chat_id。与 send_text 同款 token+bearer+code==0 模板。
-    pub async fn create_chat(&self, name: &str, description: &str) -> Result<String> {
+    pub async fn create_chat(
+        &self,
+        name: &str,
+        description: &str,
+        owner_user_id: &str,
+    ) -> Result<String> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
             .http
@@ -461,6 +467,8 @@ impl FeishuClient {
             .json(&json!({
                 "name": name,
                 "description": description,
+                "owner_id": owner_user_id,
+                "user_ids": [owner_user_id],
                 "set_bot_manager": true,
                 "uuid": uuid::Uuid::new_v4().to_string(),
                 "chat_mode": "group",
@@ -758,7 +766,7 @@ mod tests {
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
         let chat_id = fs
-            .create_chat("后端开发", "你是后端工程师。")
+            .create_chat("后端开发", "你是后端工程师。", "ou_boss")
             .await
             .unwrap();
         assert_eq!(chat_id, "oc_vb_new");
@@ -775,7 +783,13 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
         assert_eq!(body["name"], "后端开发");
         assert_eq!(body["description"], "你是后端工程师。");
-        assert_eq!(body["set_bot_manager"], true, "bot 自动入群并当群主");
+        assert_eq!(body["set_bot_manager"], true, "指定 owner 时 bot 设为管理员");
+        assert_eq!(body["owner_id"], "ou_boss", "群主必须是用户（否则用户看不到群）");
+        assert_eq!(
+            body["user_ids"],
+            json!(["ou_boss"]),
+            "必须把用户拉进群（8-20 实测：群里只有 bot 时飞书客户端不可见）"
+        );
         assert_eq!(body["chat_mode"], "group");
         assert!(
             body["uuid"]
@@ -795,7 +809,7 @@ mod tests {
         );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
-        let e = fs.create_chat("x", "y").await.unwrap_err();
+        let e = fs.create_chat("x", "y", "ou_boss").await.unwrap_err();
         assert!(e.to_string().contains("99991"), "错误码应进文案: {e:#}");
     }
 

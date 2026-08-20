@@ -1613,10 +1613,23 @@ pub fn run_gui() -> Result<()> {
                                             .create_chat(&name, &prompt)
                                             .await
                                             .map_err(|e| format!("{e:#}")),
-                                        _ => FeishuClient::new(&app_id, &app_secret)
-                                            .create_chat(&name, &prompt)
-                                            .await
-                                            .map_err(|e| format!("{e:#}")),
+                                        _ => {
+                                            // 建群必须带 owner：群里只有机器人时用户飞书
+                                            // 客户端看不到群（8-20 实测）。owner 设为群主 +
+                                            // bot 管理员（set_bot_manager），用户才有编辑
+                                            // 群名/介绍权限（平台为准的核心交互）。
+                                            let owner = Config::load()
+                                                .ok()
+                                                .and_then(|c| {
+                                                    c.bots.into_iter().find(|b| b.key() == bot_key)
+                                                })
+                                                .map(|b| b.owner_open_id)
+                                                .unwrap_or_default();
+                                            FeishuClient::new(&app_id, &app_secret)
+                                                .create_chat(&name, &prompt, &owner)
+                                                .await
+                                                .map_err(|e| format!("{e:#}"))
+                                        }
                                     }
                                 }
                                 .await;
