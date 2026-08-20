@@ -894,6 +894,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> notify-enabled: true;
     in-out property <int> history-retention-days: 30;
     in-out property <[HistoryRow]> history-rows: [];
+    // 虚拟 Bot 手动刷新进行中（#75）：禁用刷新按钮防连点 + 按钮文字"同步中"
+    in-out property <bool> vb-syncing: false;
     in-out property <int> history-selected: -1;
 
     // 环境配置（依赖检测）：各项是否在本机可执行路径上
@@ -1663,11 +1665,13 @@ export component SettingsWindow inherits Window {
                                                     Text { text: "虚拟 Bot"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
                                                     Rectangle { horizontal-stretch: 1; }
                                                     // 手动刷新：平台解散群的兜底（im.chat.deleted 事件未订阅/丢失时）——
-                                                    // 验证登记群存在性，已解散的移除登记并归档会话历史
+                                                    // 验证登记群存在性，已解散的移除登记并归档会话历史。
+                                                    // syncing 期间禁用防连点 + 文字变"同步中"（可视反馈）
                                                     PixelButton {
-                                                        text: "⟳ 刷新";
+                                                        text: root.vb-syncing ? "⟳ 同步中…" : "⟳ 刷新";
                                                         size: "small";
                                                         variant: "ghost";
+                                                        enabled: !root.vb-syncing;
                                                         clicked => { root.virtual-bot-refresh(); }
                                                     }
                                                 }

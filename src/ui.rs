@@ -2847,6 +2847,8 @@ pub fn run_gui() -> Result<()> {
                 if bot.kind == "wechat" {
                     return;
                 }
+                // 同步中：禁用刷新按钮防连点（结果回来在 Done 里复位）
+                w.set_vb_syncing(true);
                 let _ = tx.send(UiCmd::VirtualBotVerify {
                     bot_key: bot.key(),
                     kind: bot.kind.clone(),
@@ -3818,6 +3820,8 @@ pub fn run_gui() -> Result<()> {
                                 }
                             }
                             if let Some(w) = settings_weak.upgrade() {
+                                // 刷新同步结束：复位按钮（刷新期间 vb-syncing=true）
+                                w.set_vb_syncing(false);
                                 let ok = results
                                     .iter()
                                     .filter(|(_, r)| r.is_ok())
