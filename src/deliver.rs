@@ -472,6 +472,47 @@ pub fn parse_deliver_args(
     })
 }
 
+/// 解析 + 虚拟 Bot @角色名寻址（#75）：`--chat @角色名` 时查登记表
+/// （同 bot 上下文，role_name 匹配）→ 替换成 chat_id；找不到报错并列出可用角色。
+/// `roles` 参数化登记表：生产 = VirtualBotStore::new()（默认路径），单测注入临时 store，
+/// 不碰真实登记表。main.rs run_deliver_cli 用这个，旧 parse_deliver_args 保持纯解析。
+pub fn parse_deliver_args_with_store(
+    args: &[String],
+    env_bot: &str,
+    env_chat: &str,
+    roles: &crate::virtualbot::VirtualBotStore,
+) -> Result<DeliveryItem, String> {
+    let mut item = parse_deliver_args(args, env_bot, env_chat)?;
+    if let Some(role) = item.target_chat.strip_prefix('@') {
+        if role.is_empty() {
+            return Err("--chat 以 @ 开头时需跟角色名（如 --chat @后端开发）".to_string());
+        }
+        match roles.resolve(&item.target_bot, role) {
+            Some(chat_id) => item.target_chat = chat_id,
+            None => {
+                let available = roles.roles_for(&item.target_bot);
+                let list = if available.is_empty() {
+                    "该 bot 暂无已登记的虚拟 Bot（GUI 里「虚拟 Bot → ＋ 创建」）。".to_string()
+                } else {
+                    format!(
+                        "已登记角色：{}。",
+                        available
+                            .iter()
+                            .map(|r| format!("@{r}"))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    )
+                };
+                return Err(format!(
+                    "未找到虚拟 Bot「@{role}」（bot={}）。{list}",
+                    item.target_bot
+                ));
+            }
+        }
+    }
+    Ok(item)
+}
+
 /// 把本地文件转成附件元数据（deliver --file 用）。跨 bot 同机运行，接收端可直接读本地路径。
 pub fn attachment_meta_from_path(path: &str) -> Result<crate::attachments::AttachmentMeta, String> {
     let p = std::path::Path::new(path);
@@ -704,6 +745,117 @@ mod tests {
     fn parse_rejects_unknown_flag() {
         let args = vec!["--nope".to_string()];
         assert!(parse_deliver_args(&args, "wechat", "u1").is_err());
+    }
+
+    // ─── 虚拟 Bot @角色名寻址（#75）───
+
+    /// 临时登记表（不碰真实 ~/.agent-bridge/virtual-bots.json）。
+    fn tmp_roles(name: &str) -> (std::path::PathBuf, crate::virtualbot::VirtualBotStore) {
+        let dir = std::env::temp_dir().join(format!(
+            "abb-deliver-roles-{name}-{}",
+            crate::chrono_lite::unix_secs()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::virtualbot::VirtualBotStore::new_at(dir.join("virtual-bots.json"));
+        (dir, store)
+    }
+
+    fn role_args(chat: &str) -> Vec<String> {
+        vec![
+            "--bot".to_string(),
+            "feishu".to_string(),
+            "--chat".to_string(),
+            chat.to_string(),
+            "--text".to_string(),
+            "hello".to_string(),
+        ]
+    }
+
+    #[test]
+    fn parse_resolves_role_alias_to_chat_id() {
+        let (dir, store) = tmp_roles("resolve");
+        store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: "feishu".into(),
+                chat_id: "oc_vb_1".into(),
+                role_name: "后端开发".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        let item =
+            parse_deliver_args_with_store(&role_args("@后端开发"), "wechat", "u1", &store).unwrap();
+        assert_eq!(item.target_chat, "oc_vb_1", "@角色名 应解析成 chat_id");
+        assert_eq!(item.target_bot, "feishu");
+        // 非 @ 目标原样透传
+        let plain = parse_deliver_args_with_store(&role_args("oc_x"), "wechat", "u1", &store)
+            .unwrap();
+        assert_eq!(plain.target_chat, "oc_x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_role_unknown_lists_available_roles() {
+        let (dir, store) = tmp_roles("unknown");
+        store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: "feishu".into(),
+                chat_id: "oc_1".into(),
+                role_name: "后端开发".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: "feishu".into(),
+                chat_id: "oc_2".into(),
+                role_name: "产品经理".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        // 找不到的角色 → 报错 + 列出可用角色（寻址失败可见）
+        let e = parse_deliver_args_with_store(&role_args("@不存在"), "wechat", "u1", &store)
+            .unwrap_err();
+        assert!(e.contains("不存在"), "{e}");
+        assert!(e.contains("@后端开发"), "应列出可用角色: {e}");
+        assert!(e.contains("@产品经理"), "{e}");
+        // 空角色名 → 明确报错
+        let e2 = parse_deliver_args_with_store(&role_args("@"), "wechat", "u1", &store)
+            .unwrap_err();
+        assert!(e2.contains("@"), "{e2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_role_scoped_by_bot() {
+        let (dir, store) = tmp_roles("scoped");
+        store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: "feishu".into(),
+                chat_id: "oc_1".into(),
+                role_name: "后端开发".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        // 同角色名登记在别的 bot：寻址失败（同 bot 上下文匹配），报错列表也按 bot 过滤
+        let e = parse_deliver_args_with_store(
+            &vec![
+                "--bot".to_string(),
+                "dingtalk".to_string(),
+                "--chat".to_string(),
+                "@后端开发".to_string(),
+                "--text".to_string(),
+                "hi".to_string(),
+            ],
+            "wechat",
+            "u1",
+            &store,
+        )
+        .unwrap_err();
+        assert!(e.contains("未找到"), "{e}");
+        // 错误文案里会引用被查的角色名本身（「@后端开发」），所以不能断言「不含角色名」；
+        // 应断言没有进入「已登记角色列表」分支（列表按 bot 过滤，同 bot 无登记 → 提示空）
+        assert!(!e.contains("已登记角色"), "可用角色列表不该混入其它 bot: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 测试假 messenger：记录发送，可配置失败。

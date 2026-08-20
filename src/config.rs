@@ -581,6 +581,11 @@ pub struct Config {
     /// 全局默认供应商名（指向 providers[].name）。bot.provider 非空时优先于它。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_provider: String,
+    /// 虚拟 Bot #75：自定义角色模板（内置模板见 virtualbot::builtin_templates）。
+    /// 群名=角色名、提示词=群介绍（≤100 字符，对齐飞书群描述限制）。GUI 弹窗管理，
+    /// 与其它字段同走「保存」写盘。#[serde(default)] 兼容旧 config（无此字段）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_roles: Vec<crate::virtualbot::RoleTemplate>,
 
     // ── 旧单 bot 字段（仅用于自动迁移，迁移后清空）──
     #[serde(default, skip_serializing_if = "String::is_empty")]
