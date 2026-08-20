@@ -3793,30 +3793,29 @@ pub fn run_gui() -> Result<()> {
                                     slint::VecModel::from(lines),
                                 )));
                             }
-                            // 确认弹窗执行中（解散/取消登记）→ 回填结果：成功关窗；
-                            // 失败在弹窗里显示错误（"知道了"再关）——失败必须可见
+                            // 确认弹窗执行中（解散/取消登记）→ 回填结果：成功/失败都**不自动
+                            // 关窗**（8-20 用户反馈：用户可能还要继续操作）——弹窗展示结果，
+                            // 点「知道了」手动关；action 已 take，再点走 None 分支只关窗。
                             if let Some(c) = vb_confirm_weak.upgrade() {
                                 if c.get_busy() {
                                     c.set_busy(false);
                                     let all_ok = results.iter().all(|(_, r)| r.is_ok());
-                                    if all_ok {
-                                        let _ = c.hide();
-                                        platform::hide_dock();
+                                    let lines: Vec<String> = results
+                                        .iter()
+                                        .map(|(n, r)| match r {
+                                            Ok(s) => format!("✅ {n}：{s}"),
+                                            Err(e) => format!("❌ {n}：{e}"),
+                                        })
+                                        .collect();
+                                    c.set_title_text(if all_ok {
+                                        "操作成功"
                                     } else {
-                                        let errs: Vec<String> = results
-                                            .iter()
-                                            .filter_map(|(n, r)| match r {
-                                                Ok(_) => None,
-                                                Err(e) => Some(format!("{n}：{e}")),
-                                            })
-                                            .collect();
-                                        c.set_title_text("操作失败".into());
-                                        c.set_message(errs.join("\n").into());
-                                        c.set_confirm_text("知道了".into());
-                                        c.set_cancel_text("".into());
-                                        // action 已 take：再点「知道了」走 on_confirmed
-                                        // 的 None 分支只关窗
+                                        "操作失败"
                                     }
+                                    .into());
+                                    c.set_message(lines.join("\n").into());
+                                    c.set_confirm_text("知道了".into());
+                                    c.set_cancel_text("关闭".into());
                                 }
                             }
                             if let Some(w) = settings_weak.upgrade() {
