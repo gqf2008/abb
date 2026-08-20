@@ -3901,6 +3901,7 @@ mod tests {
             sender_staff_id: "u1".into(),
             conversation_id: "u1".into(), // 单聊：chat_id = sender
             conversation_type: "1".into(),
+            conversation_title: String::new(),
             text: "回复内容".into(),
             mentioned: false,
             robot_code: "r".into(),
@@ -4029,6 +4030,7 @@ mod tests {
             sender_staff_id: "u1".into(),
             conversation_id: "u1".into(),
             conversation_type: "1".into(),
+            conversation_title: String::new(),
             text: "回复内容".into(),
             mentioned: false,
             robot_code: "r".into(),

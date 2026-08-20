@@ -137,6 +137,8 @@ pub struct FeishuClient {
     app_id: String,
     app_secret: String,
     token: Mutex<Option<(String, Instant)>>,
+    /// API 基址（mock 单测注入本地服务器用；生产恒为 API_BASE）。
+    base: String,
 }
 
 impl FeishuClient {
@@ -150,7 +152,28 @@ impl FeishuClient {
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             token: Mutex::new(None),
+            base: API_BASE.to_string(),
         }
+    }
+
+    /// 测试用：基址指向本地 mock 服务器（请求形状断言）。与 new 的唯一差异是 base。
+    #[cfg(test)]
+    pub(crate) fn with_base(app_id: &str, app_secret: &str, base: &str) -> FeishuClient {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client");
+        FeishuClient {
+            http,
+            app_id: app_id.to_string(),
+            app_secret: app_secret.to_string(),
+            token: Mutex::new(None),
+            base: base.to_string(),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base, path)
     }
 
     /// 缓存复用 tenant_access_token，提前 60s 过期。
@@ -165,7 +188,7 @@ impl FeishuClient {
         }
         let resp: serde_json::Value = self
             .http
-            .post(format!("{API_BASE}/auth/v3/tenant_access_token/internal"))
+            .post(self.url("/auth/v3/tenant_access_token/internal"))
             .json(&json!({"app_id": self.app_id, "app_secret": self.app_secret}))
             .send()
             .await?
@@ -194,7 +217,7 @@ impl FeishuClient {
     /// 用户不可见（如机器人/已离职）返回 None，调用方用 open_id 兜底显示。
     pub async fn user_name(&self, open_id: &str) -> Option<String> {
         let token = self.tenant_token().await.ok()?;
-        let url = format!("{API_BASE}/contact/v3/users/{open_id}");
+        let url = self.url(&format!("/contact/v3/users/{open_id}"));
         let resp: serde_json::Value = self
             .http
             .get(&url)
@@ -223,7 +246,7 @@ impl FeishuClient {
             };
             let resp: serde_json::Value = self
                 .http
-                .post(format!("{API_BASE}/im/v1/messages?receive_id_type=chat_id"))
+                .post(self.url("/im/v1/messages?receive_id_type=chat_id"))
                 .bearer_auth(&token)
                 .json(&json!({
                     "receive_id": chat_id,
@@ -265,7 +288,7 @@ impl FeishuClient {
             };
             let resp: serde_json::Value = self
                 .http
-                .post(format!("{API_BASE}/im/v1/messages/{message_id}/reply"))
+                .post(self.url(&format!("/im/v1/messages/{message_id}/reply")))
                 .bearer_auth(&token)
                 .json(&reply_markdown_body(&body_text))
                 .send()
@@ -293,7 +316,7 @@ impl FeishuClient {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
             .http
-            .get(format!("{API_BASE}/im/v1/messages/{message_id}"))
+            .get(self.url(&format!("/im/v1/messages/{message_id}")))
             .bearer_auth(&token)
             .send()
             .await?
@@ -324,8 +347,9 @@ impl FeishuClient {
     ) -> Result<(Vec<u8>, String)> {
         let token = self.tenant_token().await?;
         let rtype = if kind == "image" { "image" } else { "file" };
-        let url =
-            format!("{API_BASE}/im/v1/messages/{message_id}/resources/{file_key}?type={rtype}");
+        let url = self.url(&format!(
+            "/im/v1/messages/{message_id}/resources/{file_key}?type={rtype}"
+        ));
         let resp = self
             .http
             .get(&url)
@@ -358,7 +382,9 @@ impl FeishuClient {
         let token = self.tenant_token().await.ok()?;
         let resp: serde_json::Value = self
             .http
-            .post(format!("{API_BASE}/im/v1/messages/{message_id}/reactions"))
+            .post(self.url(&format!(
+                "/im/v1/messages/{message_id}/reactions"
+            )))
             .bearer_auth(&token)
             .json(&json!({"reaction_type": {"emoji_type": emoji_type}}))
             .send()
@@ -385,9 +411,9 @@ impl FeishuClient {
         if let Ok(token) = self.tenant_token().await {
             let _ = self
                 .http
-                .delete(format!(
-                    "{API_BASE}/im/v1/messages/{message_id}/reactions/{reaction_id}"
-                ))
+                .delete(self.url(&format!(
+                    "/im/v1/messages/{message_id}/reactions/{reaction_id}"
+                )))
                 .bearer_auth(&token)
                 .send()
                 .await;
@@ -399,7 +425,7 @@ impl FeishuClient {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
             .http
-            .get(format!("{API_BASE}/bot/v3/info"))
+            .get(self.url("/bot/v3/info"))
             .bearer_auth(&token)
             .send()
             .await?
@@ -416,6 +442,115 @@ impl FeishuClient {
         let name = bot["app_name"].as_str().unwrap_or("").to_string();
         let open_id = bot["open_id"].as_str().unwrap_or("").to_string();
         Ok((name, open_id))
+    }
+
+    /// 创建群聊（虚拟 Bot #75）：POST /im/v1/chats。
+    /// - `set_bot_manager: true`：应用机器人自动入群并成为群主（创建即管理权，后续
+    ///   改名/解散都能操作；不设则 bot 不在群里，群建了也用不了）；
+    /// - `uuid` 幂等：同 uuid 重复调用返回同一个群（网络重试/超时重发安全）；
+    /// - `chat_mode: "group"`：显式普通群（与话题群 p2p 群区分）。
+    /// 返回 chat_id。与 send_text 同款 token+bearer+code==0 模板。
+    pub async fn create_chat(&self, name: &str, description: &str) -> Result<String> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .post(self.url("/im/v1/chats"))
+            .bearer_auth(&token)
+            .json(&json!({
+                "name": name,
+                "description": description,
+                "set_bot_manager": true,
+                "uuid": uuid::Uuid::new_v4().to_string(),
+                "chat_mode": "group",
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "创建群失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        resp["data"]["chat_id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("创建群响应缺 chat_id: {resp}"))
+    }
+
+    /// 群资料（虚拟 Bot 注入用）：(群名, 群介绍)。失败返回 Err——调用方 best-effort：
+    /// 拿不到只 log 不阻塞消息处理（对齐 get_quoted_message 的语义）。
+    pub async fn get_chat_info(&self, chat_id: &str) -> Result<(String, String)> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .get(self.url(&format!("/im/v1/chats/{chat_id}")))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "查询群资料失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        let name = resp["data"]["name"].as_str().unwrap_or("").to_string();
+        let desc = resp["data"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok((name, desc))
+    }
+
+    /// 改群资料（虚拟 Bot 编辑：群名=角色名、群介绍=system prompt，PATCH 即时生效）。
+    pub async fn update_chat(&self, chat_id: &str, name: &str, description: &str) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .patch(self.url(&format!("/im/v1/chats/{chat_id}")))
+            .bearer_auth(&token)
+            .json(&json!({
+                "name": name,
+                "description": description,
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "更新群资料失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        Ok(())
+    }
+
+    /// 解散群（虚拟 Bot 解散：DELETE /im/v1/chats/:chat_id，不可恢复——GUI 侧强确认）。
+    pub async fn delete_chat(&self, chat_id: &str) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .delete(self.url(&format!("/im/v1/chats/{chat_id}")))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "解散群失败 code={:?} msg={:?}",
+                resp.get("code"),
+                resp.get("msg")
+            );
+        }
+        Ok(())
     }
 }
 
@@ -588,5 +723,272 @@ mod tests {
         let p = parse_content("not json");
         assert_eq!(p.text, "");
         assert!(p.resources.is_empty());
+    }
+
+    // ─── 虚拟 Bot 群管理 API（#75）：mock HTTP 断言请求形状 ───
+    // 走本地 TCP mock（test_mock 模块）：token 端点到群端点全部落地断言，
+    // 不碰真实飞书 API（token/凭证全 mock）。
+
+    /// 起一个带 token 端点的 mock：返回 (server, 默认 token 路由)。
+    /// token 路由统一（/auth/v3/tenant_access_token/internal），各测试再补业务路由。
+    async fn mock_server(
+        routes: std::collections::HashMap<(String, String), serde_json::Value>,
+    ) -> super::test_mock::MockServer {
+        let mut all = std::collections::HashMap::new();
+        all.insert(
+            ("POST".to_string(), "/auth/v3/tenant_access_token/internal".to_string()),
+            json!({"code": 0, "tenant_access_token": "mock-token", "expire": 7200}),
+        );
+        all.extend(routes);
+        super::test_mock::MockServer::start(all).await
+    }
+
+    #[tokio::test]
+    async fn create_chat_sends_expected_shape_and_returns_chat_id() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/chats".to_string()),
+            json!({"code": 0, "msg": "success", "data": {"chat_id": "oc_vb_new"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let chat_id = fs.create_chat("后端开发", "你是后端工程师。").await.unwrap();
+        assert_eq!(chat_id, "oc_vb_new");
+
+        let recs = server.requests.lock().unwrap().clone();
+        // 两次请求：token + 建群（顺序固定：token 先）
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].method, "POST");
+        assert!(recs[0].path.starts_with("/auth/v3/"));
+        let create = &recs[1];
+        assert_eq!(create.method, "POST");
+        assert_eq!(create.path, "/im/v1/chats");
+        assert_eq!(create.auth, "Bearer mock-token", "应带 tenant token");
+        let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
+        assert_eq!(body["name"], "后端开发");
+        assert_eq!(body["description"], "你是后端工程师。");
+        assert_eq!(body["set_bot_manager"], true, "bot 自动入群并当群主");
+        assert_eq!(body["chat_mode"], "group");
+        assert!(
+            body["uuid"].as_str().map(|u| !u.is_empty()).unwrap_or(false),
+            "uuid 幂等键必须有"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_chat_errors_on_api_failure() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/chats".to_string()),
+            json!({"code": 99991, "msg": "permission denied"}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let e = fs.create_chat("x", "y").await.unwrap_err();
+        assert!(e.to_string().contains("99991"), "错误码应进文案: {e:#}");
+    }
+
+    #[tokio::test]
+    async fn get_chat_info_returns_name_and_description() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("GET".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
+            json!({"code": 0, "data": {"chat_id": "oc_vb_1", "name": "后端开发", "description": "你是后端工程师。"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let (name, desc) = fs.get_chat_info("oc_vb_1").await.unwrap();
+        assert_eq!(name, "后端开发");
+        assert_eq!(desc, "你是后端工程师。");
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs[1].method, "GET");
+        assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
+        assert_eq!(recs[1].auth, "Bearer mock-token");
+    }
+
+    #[tokio::test]
+    async fn update_chat_patches_name_and_description() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("PATCH".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
+            json!({"code": 0}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        fs.update_chat("oc_vb_1", "前端开发", "你是前端工程师。")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs[1].method, "PATCH");
+        assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
+        let body: serde_json::Value = serde_json::from_str(&recs[1].body).unwrap();
+        assert_eq!(body["name"], "前端开发");
+        assert_eq!(body["description"], "你是前端工程师。");
+    }
+
+    #[tokio::test]
+    async fn delete_chat_sends_delete_request() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("DELETE".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
+            json!({"code": 0}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        fs.delete_chat("oc_vb_1").await.unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs[1].method, "DELETE");
+        assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
+        assert_eq!(recs[1].auth, "Bearer mock-token");
+    }
+}
+
+/// mock HTTP 服务器（#75 群 API 单测共用；钉钉 tests 也引它）：
+/// 本地 TcpListener + 按 (method, path) 预置 JSON 响应 + 全量记录请求。
+/// 请求形状断言（方法/路径/鉴权头/body 字段）靠 Recorded 列表。
+#[cfg(test)]
+pub(crate) mod test_mock {
+    use serde_json::json;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 一次已记录的请求（断言请求形状用）。
+    #[derive(Debug, Clone)]
+    pub struct Recorded {
+        pub method: String,
+        /// 不含 query 的路径。
+        pub path: String,
+        /// query 字符串（原样；无 query 为空）。
+        pub query: String,
+        /// Authorization 头值（无则为空）。
+        pub auth: String,
+        /// 请求体（按 Content-Length 精确读）。
+        pub body: String,
+    }
+
+    /// 本地 mock HTTP 服务器：Drop 时中止服务任务。
+    pub struct MockServer {
+        pub base: String,
+        pub requests: Arc<Mutex<Vec<Recorded>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockServer {
+        /// 启动。routes: (HTTP 方法, 路径) → 响应 JSON（未命中的路由回 {"code": 404}，
+        /// 让客户端错误路径也能走到 code 判定分支，而不是连接层报错）。
+        pub async fn start(routes: HashMap<(String, String), Value>) -> MockServer {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+            let addr = listener.local_addr().expect("mock addr");
+            let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+            let reqs = requests.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let reqs = reqs.clone();
+                    let routes = routes.clone();
+                    tokio::spawn(async move {
+                        // 一条连接可承载多个请求（reqwest keep-alive）：循环读到 EOF
+                        loop {
+                            let mut buf = Vec::new();
+                            let mut tmp = [0u8; 4096];
+                            let header_end;
+                            loop {
+                                let n = stream.read(&mut tmp).await.unwrap_or(0);
+                                if n == 0 {
+                                    return; // 客户端关闭连接
+                                }
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_headers_end(&buf) {
+                                    header_end = pos;
+                                    break;
+                                }
+                                if buf.len() > 64 * 1024 {
+                                    return;
+                                }
+                            }
+                            // 关键：headers 与 body 可能同段到达——body 先从 buf 里取
+                            // （split_off 留 headers 部分做解析）。原实现把这段丢掉后
+                            // 补读永远等不到数据（客户端发完已等响应）→ 连接超时，踩过。
+                            let mut body = buf.split_off(header_end);
+                            let head = String::from_utf8_lossy(&buf).into_owned();
+                            let mut lines = head.split("\r\n");
+                            let req_line = lines.next().unwrap_or_default();
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let raw_path = parts.next().unwrap_or("").to_string();
+                            let (path, query) = match raw_path.split_once('?') {
+                                Some((p, q)) => (p.to_string(), q.to_string()),
+                                None => (raw_path, String::new()),
+                            };
+                            let mut content_length = 0usize;
+                            let mut auth = String::new();
+                            for l in lines {
+                                if let Some((k, v)) = l.split_once(": ") {
+                                    let k = k.to_ascii_lowercase();
+                                    if k == "content-length" {
+                                        content_length = v.trim().parse().unwrap_or(0);
+                                    } else if k == "authorization" {
+                                        auth = v.to_string();
+                                    }
+                                }
+                            }
+                            if body.len() < content_length {
+                                while body.len() < content_length {
+                                    let n = stream.read(&mut tmp).await.unwrap_or(0);
+                                    if n == 0 {
+                                        return;
+                                    }
+                                    body.extend_from_slice(&tmp[..n]);
+                                }
+                            }
+                            reqs.lock().unwrap().push(Recorded {
+                                method: method.clone(),
+                                path: path.clone(),
+                                query,
+                                auth,
+                                body: String::from_utf8_lossy(&body).into_owned(),
+                            });
+                            // 按 (method, path) 查预置响应；未命中 → 假 code=404，
+                            // 让客户端走到 code 判定分支而不是连接层报错。
+                            let resp = routes
+                                .get(&(method, path))
+                                .cloned()
+                                .unwrap_or_else(|| json!({"code": 404}));
+                            let resp_body = resp.to_string();
+                            let resp_head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                                resp_body.len()
+                            );
+                            if stream.write_all(resp_head.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if stream.write_all(resp_body.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            MockServer {
+                base: format!("http://{addr}"),
+                requests,
+                handle,
+            }
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    fn find_headers_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
     }
 }

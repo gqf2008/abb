@@ -30,6 +30,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const API_BASE: &str = "https://api.dingtalk.com";
+/// 旧网关（topapi 系列接口）：鉴权走 query 参数 `?access_token=`，不是 v1.0 的头鉴权。
+/// 虚拟 Bot 群管理（#75）走这里——「创建群会话 topapi/im/chat/create」等接口只在旧网关注册。
+const OAPI_BASE: &str = "https://oapi.dingtalk.com";
 /// 单条文本安全长度（按字符数）。钉钉文本消息上限约 2 万字节，这里保守取 8000 字符，
 /// 与飞书分段逻辑同一套（split_text 按字符逐行贪心）。
 pub const DINGTALK_MSG_LIMIT: usize = 8000;
@@ -46,6 +49,10 @@ pub struct DingTalkClient {
     app_id: String,
     app_secret: String,
     token: Mutex<Option<(String, Instant)>>,
+    /// v1.0 OpenAPI 基址（mock 单测注入本地服务器用；生产恒为 API_BASE）。
+    base: String,
+    /// 旧网关（topapi）基址（mock 单测同指向本地；生产恒为 OAPI_BASE）。
+    oapi_base: String,
 }
 
 impl DingTalkClient {
@@ -59,7 +66,34 @@ impl DingTalkClient {
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             token: Mutex::new(None),
+            base: API_BASE.to_string(),
+            oapi_base: OAPI_BASE.to_string(),
         }
+    }
+
+    /// 测试用：两个基址都指向本地 mock 服务器（请求形状断言）。与 new 的唯一差异。
+    #[cfg(test)]
+    pub(crate) fn with_base(app_id: &str, app_secret: &str, base: &str) -> DingTalkClient {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client");
+        DingTalkClient {
+            http,
+            app_id: app_id.to_string(),
+            app_secret: app_secret.to_string(),
+            token: Mutex::new(None),
+            base: base.to_string(),
+            oapi_base: base.to_string(),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base, path)
+    }
+
+    fn oapi_url(&self, path: &str, token: &str) -> String {
+        format!("{}{}?access_token={}", self.oapi_base, path, token)
     }
 
     /// 获取/缓存 app access_token（提前 60s 过期）。
@@ -74,7 +108,7 @@ impl DingTalkClient {
         }
         let resp: Value = self
             .http
-            .post(format!("{API_BASE}/v1.0/oauth2/accessToken"))
+            .post(self.url("/v1.0/oauth2/accessToken"))
             .json(&json!({"appKey": self.app_id, "appSecret": self.app_secret}))
             .send()
             .await?
@@ -96,7 +130,7 @@ impl DingTalkClient {
     /// 返回 None，调用方用 staffId 兜底显示。
     pub async fn user_name(&self, staff_id: &str) -> Option<String> {
         let token = self.access_token().await.ok()?;
-        let url = format!("{API_BASE}/v1.0/contact/users/{staff_id}");
+        let url = self.url(&format!("/v1.0/contact/users/{staff_id}"));
         let resp: Value = self
             .http
             .get(&url)
@@ -131,7 +165,7 @@ impl DingTalkClient {
         });
         let resp = self
             .http
-            .post(format!("{API_BASE}/v1.0/robot/oToMessages/batchSend"))
+            .post(self.url("/v1.0/robot/oToMessages/batchSend"))
             .header("x-acs-dingtalk-access-token", &token)
             .json(&body)
             .send()
@@ -182,7 +216,7 @@ impl DingTalkClient {
         }
         let resp = self
             .http
-            .post(format!("{API_BASE}/v1.0/robot/groupMessages/send"))
+            .post(self.url("/v1.0/robot/groupMessages/send"))
             .header("x-acs-dingtalk-access-token", &token)
             .json(&body)
             .send()
@@ -220,7 +254,7 @@ impl DingTalkClient {
         let token = self.access_token().await?;
         let resp = self
             .http
-            .post(format!("{API_BASE}/v1.0/robot/messageFiles/download"))
+            .post(self.url("/v1.0/robot/messageFiles/download"))
             .header("x-acs-dingtalk-access-token", &token)
             .json(&json!({
                 "downloadCode": download_code,
@@ -257,6 +291,104 @@ impl DingTalkClient {
             return Err(anyhow!("钉钉文件下载失败 HTTP {}", resp2.status().as_u16()));
         }
         Ok(resp2.bytes().await.context("读钉钉文件响应失败")?.to_vec())
+    }
+
+    /// 创建群会话（虚拟 Bot #75；topapi/im/chat/create 的文档形状）。
+    /// ⚠️ 能力边界（重要）：该接口需要 `owner`（群主员工 userid）+ `useridlist`
+    /// （至少一名成员），企业内部应用机器人拿不到这些 → **真实建群大概率失败**。
+    /// ABB 不做任何规避：失败由 GUI 走「登记制降级」——用户平台手动建群（群名=角色名），
+    /// 再用 GUI 的「手动登记」登记 chat_id（群消息事件里的 conversationId 即 chat_id）。
+    /// 真实建群/机器人入群需用户实测（见 PR #75 说明）。请求形状照文档，mock 单测锁定。
+    /// `description` 参数保留仅为对齐 FeishuClient 签名：钉钉群没有群介绍字段，忽略。
+    pub async fn create_chat(&self, name: &str, _description: &str) -> Result<String> {
+        let token = self.access_token().await?;
+        let resp = self
+            .http
+            .post(self.oapi_url("/topapi/im/chat/create", &token))
+            .json(&json!({
+                "name": name,
+                "owner": "",
+                "useridlist": [],
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        let v: Value =
+            serde_json::from_str(&text).context("topapi/im/chat/create 响应不是 JSON")?;
+        if v.get("errcode").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "钉钉创建群失败 errcode={:?} errmsg={:?}",
+                v.get("errcode"),
+                v.get("errmsg")
+            );
+        }
+        let chatid = v
+            .get("chatid")
+            .or_else(|| v.get("data").and_then(|d| d.get("chatid")))
+            .and_then(|c| c.as_str())
+            .context("topapi/im/chat/create 响应缺 chatid")?
+            .to_string();
+        Ok(chatid)
+    }
+
+    /// 群信息（topapi/im/chat/get 的文档形状）：返回 (群名, 群介绍)。
+    /// 钉钉群**没有**「群介绍」字段——desc 恒空（平台限制：虚拟 Bot 的 system prompt
+    /// 在钉钉上只能靠群名注入；如需完整提示词需平台支持，见模块注释与 PR 说明）。
+    /// best-effort 语义与飞书一致：失败返回 Err，调用方只 log 不阻塞。
+    pub async fn get_chat_info(&self, chat_id: &str) -> Result<(String, String)> {
+        let token = self.access_token().await?;
+        let resp = self
+            .http
+            .post(self.oapi_url("/topapi/im/chat/get", &token))
+            .json(&json!({"chatid": chat_id}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        let v: Value = serde_json::from_str(&text).context("topapi/im/chat/get 响应不是 JSON")?;
+        if v.get("errcode").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "钉钉查询群信息失败 errcode={:?} errmsg={:?}",
+                v.get("errcode"),
+                v.get("errmsg")
+            );
+        }
+        let name = v["chat_info"]["name"].as_str().unwrap_or("").to_string();
+        Ok((name, String::new()))
+    }
+
+    /// 改群名（topapi/im/chat/update）：钉钉可改的只有 name（无群介绍字段，desc 忽略）。
+    /// 与 create_chat 同需用户实测：机器人改群名权限取决于机器人权限配置。
+    pub async fn update_chat(&self, chat_id: &str, name: &str, _description: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let resp = self
+            .http
+            .post(self.oapi_url("/topapi/im/chat/update", &token))
+            .json(&json!({"chatid": chat_id, "name": name}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text));
+        }
+        let v: Value =
+            serde_json::from_str(&text).context("topapi/im/chat/update 响应不是 JSON")?;
+        if v.get("errcode").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "钉钉更新群失败 errcode={:?} errmsg={:?}",
+                v.get("errcode"),
+                v.get("errmsg")
+            );
+        }
+        Ok(())
     }
 
     /// 注册 Stream 长连接凭证（clientId/clientSecret 直接鉴权，无需先取 access_token）。
@@ -343,6 +475,9 @@ pub struct DingtalkMessage {
     pub conversation_id: String,
     /// "1"=单聊 "2"=群聊。
     pub conversation_type: String,
+    /// 群名（conversationTitle；单聊事件通常没有）。虚拟 Bot #75 注入用：
+    /// 群名=角色名，事件携带的群名比 API 查询更新（改群名即时生效）。
+    pub conversation_title: String,
     /// 文本内容（已 trim；群聊含 @机器人名 前缀，由 bridge 剥）。纯附件消息为空。
     pub text: String,
     /// 是否在 @ 名单里（群聊判据）。
@@ -516,6 +651,7 @@ fn parse_message(frame: &Value) -> Option<DingtalkMessage> {
         sender_staff_id: sender.clone(),
         conversation_id: p["conversationId"].as_str().unwrap_or("").to_string(),
         conversation_type: p["conversationType"].as_str().unwrap_or("").to_string(),
+        conversation_title: p["conversationTitle"].as_str().unwrap_or("").to_string(),
         text,
         mentioned: p["isInAtList"].as_bool().unwrap_or(false),
         robot_code: p["robotCode"].as_str().unwrap_or("").to_string(),
@@ -878,6 +1014,7 @@ mod tests {
         assert!(m.mentioned);
         assert!(m.is_group());
         assert_eq!(m.chat_id(), "cidAsXSBLnA==");
+        assert_eq!(m.conversation_title, "测试群");
     }
 
     #[test]
@@ -1034,5 +1171,126 @@ mod tests {
             "7724109a-ea43-4aa2-b803-87d82c5aaee6"
         );
         assert_eq!(percent_encode_query("a+b/c=="), "a%2Bb%2Fc%3D%3D");
+    }
+
+    // ─── 虚拟 Bot 群管理 API（#75）：mock HTTP 断言请求形状 ───
+    // 钉钉能力边界：**绝不创建真实群**（会污染用户企业环境）。单测只断言请求形状
+    // （方法/路径/query 鉴权/body），真实建群/机器人入群需用户实测。
+
+    /// 带 token 路由的 mock（token 走 v1.0 /v1.0/oauth2/accessToken）。
+    async fn dt_mock_server(
+        routes: std::collections::HashMap<(String, String), Value>,
+    ) -> crate::feishu::test_mock::MockServer {
+        let mut all = std::collections::HashMap::new();
+        all.insert(
+            ("POST".to_string(), "/v1.0/oauth2/accessToken".to_string()),
+            json!({"accessToken": "dt-mock-token", "expireIn": 7200}),
+        );
+        all.extend(routes);
+        crate::feishu::test_mock::MockServer::start(all).await
+    }
+
+    #[tokio::test]
+    async fn create_chat_posts_topapi_shape() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/topapi/im/chat/create".to_string()),
+            json!({"errcode": 0, "errmsg": "ok", "chatid": "chat123"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let chat_id = dt.create_chat("后端开发", "提示词").await.unwrap();
+        assert_eq!(chat_id, "chat123");
+
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].path, "/v1.0/oauth2/accessToken");
+        let create = &recs[1];
+        assert_eq!(create.method, "POST");
+        assert_eq!(create.path, "/topapi/im/chat/create");
+        assert_eq!(
+            create.query,
+            "access_token=dt-mock-token",
+            "topapi 鉴权走 query 参数（旧网关约定）"
+        );
+        let body: Value = serde_json::from_str(&create.body).unwrap();
+        assert_eq!(body["name"], "后端开发");
+        // 能力边界如实入参：owner/useridlist 需要真实员工，机器人拿不到——空参提交，
+        // 失败走登记制降级（见方法注释）。此处断言请求形状而非结果。
+        assert_eq!(body["owner"], "");
+        assert_eq!(body["useridlist"], Value::Array(vec![]));
+    }
+
+    #[tokio::test]
+    async fn create_chat_surfaces_errcode() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/topapi/im/chat/create".to_string()),
+            json!({"errcode": 40013, "errmsg": "缺少 owner"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let e = dt.create_chat("x", "y").await.unwrap_err();
+        assert!(e.to_string().contains("40013"), "errcode 应进文案: {e:#}");
+    }
+
+    #[tokio::test]
+    async fn get_chat_info_posts_topapi_shape_and_returns_name() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/topapi/im/chat/get".to_string()),
+            json!({"errcode": 0, "errmsg": "ok", "chat_info": {"chatid": "cid1", "name": "后端开发", "owner": "u1"}}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let (name, desc) = dt.get_chat_info("cid1").await.unwrap();
+        assert_eq!(name, "后端开发");
+        assert_eq!(desc, "", "钉钉群无「群介绍」字段，desc 恒空（平台限制）");
+        let recs = server.requests.lock().unwrap().clone();
+        let get = &recs[1];
+        assert_eq!(get.path, "/topapi/im/chat/get");
+        assert_eq!(get.query, "access_token=dt-mock-token");
+        let body: Value = serde_json::from_str(&get.body).unwrap();
+        assert_eq!(body["chatid"], "cid1");
+    }
+
+    #[tokio::test]
+    async fn update_chat_posts_topapi_shape() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/topapi/im/chat/update".to_string()),
+            json!({"errcode": 0, "errmsg": "ok"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        dt.update_chat("cid1", "前端开发", "提示词").await.unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        let upd = &recs[1];
+        assert_eq!(upd.path, "/topapi/im/chat/update");
+        let body: Value = serde_json::from_str(&upd.body).unwrap();
+        assert_eq!(body["chatid"], "cid1");
+        assert_eq!(body["name"], "前端开发");
+        // 钉钉无群介绍字段：请求体不含 description（与飞书 PATCH 的差异，注释说明）
+        assert!(body.get("description").is_none());
+    }
+
+    #[test]
+    fn parse_keeps_conversation_title() {
+        // fixture 与官方文档示例一致（conversationTitle="测试群"）
+        let frame = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m1"},
+            "data": r#"{"conversationId":"cid1","conversationType":"2","conversationTitle":"测试群","msgId":"msg1","senderStaffId":"u1","isInAtList":true,"text":{"content":"你好"},"msgtype":"text"}"#
+        });
+        let m = parse_message(&frame).unwrap();
+        assert_eq!(m.conversation_title, "测试群");
+        // 单聊事件无该字段 → 空（不 panic）
+        let frame2 = json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "m2"},
+            "data": r#"{"conversationId":"u1","conversationType":"1","msgId":"msg2","senderStaffId":"u1","text":{"content":"你好"},"msgtype":"text"}"#
+        });
+        let m2 = parse_message(&frame2).unwrap();
+        assert_eq!(m2.conversation_title, "");
     }
 }

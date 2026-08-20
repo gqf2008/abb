@@ -45,6 +45,13 @@ pub trait Messenger: Send + Sync {
         None
     }
 
+    /// 群资料查询（虚拟 Bot #75 注入用）：返回 (群名, 群介绍)。best-effort——
+    /// 失败/平台不支持返回 None，调用方只 log 不阻塞消息处理（完全照抄
+    /// get_quoted_message 的失败语义）。微信无群概念，默认 None。
+    async fn get_chat_info(&self, _chat_id: &str) -> Option<(String, String)> {
+        None
+    }
+
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
     async fn typing(&self, _message_id: &str) -> Option<String> {
         None
@@ -135,6 +142,16 @@ impl Messenger for FeishuMessenger {
             }),
             Err(e) => {
                 crate::log!("[feishu] 拉取引用消息失败 mid={}: {e:#}", message_id);
+                None
+            }
+        }
+    }
+    async fn get_chat_info(&self, chat_id: &str) -> Option<(String, String)> {
+        // best-effort：失败只 log（缓存层会自然降级为事件名/跳过注入），不阻塞消息
+        match self.fs.get_chat_info(chat_id).await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                crate::log!("[feishu] 查询群资料失败 chat={}: {e:#}", chat_id);
                 None
             }
         }
@@ -327,6 +344,10 @@ impl Messenger for DingTalkMessenger {
     }
     async fn user_display_name(&self, user_id: &str) -> Option<String> {
         self.dt.user_name(user_id).await
+    }
+    async fn get_chat_info(&self, chat_id: &str) -> Option<(String, String)> {
+        // 钉钉群信息接口无「群介绍」字段：desc 恒空（平台限制，见 dingtalk.rs 注释）
+        self.dt.get_chat_info(chat_id).await.ok()
     }
     async fn send_thread_reply(&self, chat_id: &str, _message_id: &str, text: &str) -> Result<()> {
         // 群聊回复 @ 最近提问者（单聊 chat_id=对方 staffId，无需 @）
