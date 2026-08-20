@@ -6,7 +6,7 @@
 //! 看门：GUI 启动拉起 service 子进程；托盘 Timer 周期探测，崩溃自动重拉（见 install.rs）。
 //! 打开日志/目录走 platform::open_path（跨平台）。
 
-use crate::config::{BotConfig, Config, ProviderConfig};
+use crate::config::{first_owner_id, BotConfig, Config, ProviderConfig};
 use crate::dingtalk::DingTalkClient;
 use crate::feishu::FeishuClient;
 use crate::install;
@@ -71,6 +71,8 @@ enum UiCmd {
         kind: String,
         app_id: String,
         app_secret: String,
+        /// 建群群主（飞书必填；点击时从工作副本 bot 解析，None = 未配置 owner）。
+        owner: Option<String>,
         items: Vec<(String, String)>,
     },
     /// 编辑保存：PATCH 平台群资料（改名/改介绍）+ 登记表角色名同步。
@@ -1599,12 +1601,17 @@ pub fn run_gui() -> Result<()> {
                         kind,
                         app_id,
                         app_secret,
+                        owner,
                         items,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
                             let total = items.len();
                             let mut results = Vec::with_capacity(total);
+                            // 客户端复用（tenant_token 是实例内缓存）：批量建群只取一次
+                            // token，不用每群现造。kind 已固定，非 dingtalk 才需要 feishu。
+                            let feishu =
+                                (kind != "dingtalk").then(|| FeishuClient::new(&app_id, &app_secret));
                             for (i, (name, prompt)) in items.into_iter().enumerate() {
                                 let _ = vb_tx.send(VirtualBotEvt::Progress { done: i, total });
                                 let r = async {
@@ -1618,15 +1625,21 @@ pub fn run_gui() -> Result<()> {
                                             // 客户端看不到群（8-20 实测）。owner 设为群主 +
                                             // bot 管理员（set_bot_manager），用户才有编辑
                                             // 群名/介绍权限（平台为准的核心交互）。
-                                            let owner = Config::load()
-                                                .ok()
-                                                .and_then(|c| {
-                                                    c.bots.into_iter().find(|b| b.key() == bot_key)
-                                                })
-                                                .map(|b| b.owner_open_id)
-                                                .unwrap_or_default();
-                                            FeishuClient::new(&app_id, &app_secret)
-                                                .create_chat(&name, &prompt, &owner)
+                                            // owner 在点击时已从工作副本解析（与 app_id/
+                                            // secret 同一 bot 快照）；缺失 = 配置未填 owner。
+                                            let owner = owner
+                                                .as_deref()
+                                                .ok_or_else(|| {
+                                                    "该 bot 未配置 owner_open_id（群主）：虚拟 Bot 建群"
+                                                        .to_string()
+                                                        + "必须有群主，否则群里只有机器人、用户飞书客户端看不到群。"
+                                                        + "请在 bot 设置里填写 owner 白名单后重试，"
+                                                        + "或手动建群后走「手动登记」。"
+                                                })?;
+                                            feishu
+                                                .as_ref()
+                                                .expect("非 dingtalk 分支必有 feishu client")
+                                                .create_chat(&name, &prompt, owner)
                                                 .await
                                                 .map_err(|e| format!("{e:#}"))
                                         }
@@ -2447,11 +2460,18 @@ pub fn run_gui() -> Result<()> {
             let Some((idx, bot_key, kind)) = ctx.borrow().clone() else {
                 return;
             };
-            let (app_id, app_secret) = {
+            // app_id/secret/owner 都取工作副本最新（用户可能改了没保存，用旧值会建到旧
+            // 应用下；owner 同理：磁盘配置可能比工作副本旧，且按 key 匹配在改名后失效）。
+            let (app_id, app_secret, owner) = {
                 let b = work.borrow();
-                b.get(idx as usize)
-                    .map(|bot| (bot.app_id.clone(), bot.app_secret.clone()))
-                    .unwrap_or_default()
+                match b.get(idx as usize) {
+                    Some(bot) => (
+                        bot.app_id.clone(),
+                        bot.app_secret.clone(),
+                        first_owner_id(&bot.owner_open_id),
+                    ),
+                    None => (String::new(), String::new(), None),
+                }
             };
             let mode = d.get_mode();
             match mode {
@@ -2477,6 +2497,7 @@ pub fn run_gui() -> Result<()> {
                             kind,
                             app_id,
                             app_secret,
+                            owner: owner.clone(),
                             items: vec![(name, prompt)],
                         });
                     } else {
@@ -2529,6 +2550,7 @@ pub fn run_gui() -> Result<()> {
                         kind,
                         app_id,
                         app_secret,
+                        owner: owner.clone(),
                         items,
                     });
                 }

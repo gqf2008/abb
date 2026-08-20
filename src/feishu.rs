@@ -443,9 +443,10 @@ impl FeishuClient {
     }
 
     /// 创建群聊（虚拟 Bot #75）：POST /im/v1/chats。
-    /// - `owner_user_id`：把 bot 配置的 owner（open_id）设为群主并拉进群——**必须**：
-    ///   否则群里只有机器人，用户飞书客户端看不到群、无法使用（8-20 实测踩坑，
-    ///   创建"成功"但群不可见）；
+    /// - `owner_user_id`：把 bot 配置的 owner（open_id）设为群主并拉进群（请求体字段
+    ///   `owner_id` + `user_id_list`，官方当前 schema；旧文档的 user_ids 字段已不在现网
+    ///   文档，mock 断言按现网字段名）——**必须**：否则群里只有机器人，用户飞书客户端
+    ///   看不到群、无法使用（8-20 实测踩坑，创建"成功"但群不可见）；
     /// - `set_bot_manager: true`：指定了 owner_id 时把机器人设为管理员——机器人是
     ///   管理员才能收发群消息；且群主是用户，用户才可在飞书里直接改群名/群介绍
     ///   （=改角色，平台为准的核心交互）；
@@ -468,7 +469,7 @@ impl FeishuClient {
                 "name": name,
                 "description": description,
                 "owner_id": owner_user_id,
-                "user_ids": [owner_user_id],
+                "user_id_list": [owner_user_id],
                 "set_bot_manager": true,
                 "uuid": uuid::Uuid::new_v4().to_string(),
                 "chat_mode": "group",
@@ -783,10 +784,16 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
         assert_eq!(body["name"], "后端开发");
         assert_eq!(body["description"], "你是后端工程师。");
-        assert_eq!(body["set_bot_manager"], true, "指定 owner 时 bot 设为管理员");
-        assert_eq!(body["owner_id"], "ou_boss", "群主必须是用户（否则用户看不到群）");
         assert_eq!(
-            body["user_ids"],
+            body["set_bot_manager"], true,
+            "指定 owner 时 bot 设为管理员"
+        );
+        assert_eq!(
+            body["owner_id"], "ou_boss",
+            "群主必须是用户（否则用户看不到群）"
+        );
+        assert_eq!(
+            body["user_id_list"],
             json!(["ou_boss"]),
             "必须把用户拉进群（8-20 实测：群里只有 bot 时飞书客户端不可见）"
         );
