@@ -139,6 +139,14 @@ pub async fn run() {
             deliver_loop(router, stop).await;
         });
     }
+    // #74 消息历史维护（长驻）：每 2s 消费 GUI 命令文件（手动清除 / 弹窗已读），
+    // 每 24h 按保留期清理 messages.sqlite（启动即跑一次）。
+    {
+        let stop = crate::tasks::shutdown_token();
+        crate::tasks::tasks().spawn_forever("history-gc", async move {
+            history_gc_loop(stop).await;
+        });
+    }
     let mut handles = Vec::new();
     for (bot, msgr) in ready {
         let cfg = cfg.clone();
@@ -421,6 +429,36 @@ async fn interruptible_sleep(
         _ = tokio::time::sleep(dur) => false,
         _ = stop.cancelled() => true,
     }
+}
+
+/// #74 历史维护循环：命令文件消费（2s 轮询）+ 保留期 GC（24h，启动也跑一次）。
+/// - 命令文件：GUI 跨进程写 msg-clear.command / msg-read.command（「手动清除」/
+///   「弹窗已读」），存在即消费（deliveries.json 队列先例，详见 msgstore::consume_commands）；
+///   2s 轮询保证手动清除的反馈延迟可感知地小（≈2s），不必等 24h 的 GC 周期。
+/// - GC：保留期热读 config（改配置保存重启即生效）；启动立即跑一次清掉积压过期记录。
+async fn history_gc_loop(stop: tokio_util::sync::CancellationToken) {
+    crate::log!("[history-gc] 历史维护循环启动（消息库保留期清理 + GUI 命令消费）");
+    let mut last_gc: Option<u64> = None;
+    loop {
+        if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
+            break;
+        }
+        crate::msgstore::consume_commands();
+        // 保留期 GC：启动即跑一次（last_gc=None → due），之后每 24h
+        let now = crate::chrono_lite::unix_secs();
+        let due = last_gc
+            .map(|t| now.saturating_sub(t) >= 24 * 3600)
+            .unwrap_or(true);
+        if due {
+            last_gc = Some(now);
+            let days = Config::load()
+                .map(|c| c.history_retention_days)
+                .unwrap_or(30);
+            let removed = crate::msgstore::MsgStore::production().gc(days);
+            crate::log!("[history-gc] 保留期 {days} 天，清理 {removed} 条过期历史");
+        }
+    }
+    crate::log!("[history-gc] 历史维护循环退出");
 }
 
 /// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
