@@ -35,6 +35,7 @@ mod tasks;
 mod ui;
 mod unread;
 mod updater;
+mod virtualbot;
 mod wechat;
 mod ws;
 
@@ -581,10 +582,13 @@ fn run_deliver_cli(args: &[String]) -> i32 {
     }
     let env_bot = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
     let env_chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
-    let item = match deliver::parse_deliver_args(args, &env_bot, &env_chat) {
+    // @角色名寻址（#75 虚拟 Bot）：--chat @后端开发 → 查登记表解析成 chat_id；
+    // 找不到报错并列出该 bot 可用角色。登记表与 service 注入判定共用同一份。
+    let roles = crate::virtualbot::VirtualBotStore::new();
+    let item = match deliver::parse_deliver_args_with_store(args, &env_bot, &env_chat, &roles) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\" [--file <本地路径>]…");
+            eprintln!("{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…");
             return 1;
         }
     };
