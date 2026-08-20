@@ -518,12 +518,15 @@ impl FeishuClient {
         Ok((name, desc))
     }
 
-    /// 改群资料（虚拟 Bot 编辑：群名=角色名、群介绍=system prompt，PATCH 即时生效）。
+    /// 改群资料（虚拟 Bot 编辑：群名=角色名、群介绍=system prompt，即时生效）。
+    /// ⚠️ 方法是 **PUT** 不是 PATCH（8-20 真机实测：PATCH /im/v1/chats/:id 返回
+    /// 404 page not found——mock 只验形状不验路由，假绿；lark-cli im.chats.update
+    /// dry-run 显示 PUT）。owner_id 字段可顺带转让群主（新群主必须在群里）。
     pub async fn update_chat(&self, chat_id: &str, name: &str, description: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
             .http
-            .patch(self.url(&format!("/im/v1/chats/{chat_id}")))
+            .put(self.url(&format!("/im/v1/chats/{chat_id}")))
             .bearer_auth(&token)
             .json(&json!({
                 "name": name,
@@ -913,10 +916,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_chat_patches_name_and_description() {
+    async fn update_chat_puts_name_and_description() {
         let mut routes = std::collections::HashMap::new();
         routes.insert(
-            ("PATCH".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
+            ("PUT".to_string(), "/im/v1/chats/oc_vb_1".to_string()),
             json!({"code": 0}),
         );
         let server = mock_server(routes).await;
@@ -925,7 +928,7 @@ mod tests {
             .await
             .unwrap();
         let recs = server.requests.lock().unwrap().clone();
-        assert_eq!(recs[1].method, "PATCH");
+        assert_eq!(recs[1].method, "PUT");
         assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
         let body: serde_json::Value = serde_json::from_str(&recs[1].body).unwrap();
         assert_eq!(body["name"], "前端开发");
