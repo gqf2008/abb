@@ -228,6 +228,8 @@ fn snapshot_config(
     providers_work: &RefCell<Vec<ProviderConfig>>,
     default_provider_work: &RefCell<String>,
     cross_delivery_work: &RefCell<bool>,
+    history_retention_work: &RefCell<u32>,
+    notify_work: &RefCell<bool>,
 ) -> (Config, usize) {
     let mut c = Config::load().unwrap_or_default();
     // 用工作副本整体替换 bots（保留每个 bot 运行期的 primary_chat_id）
@@ -252,6 +254,9 @@ fn snapshot_config(
 
     // 跨会话投递总开关：全局生效（所有 bot 共享）
     c.cross_delivery_enabled = *cross_delivery_work.borrow();
+    // #74 历史记录页：保留期 / 提醒开关（全局生效）
+    c.history_retention_days = *history_retention_work.borrow();
+    c.notify_enabled = *notify_work.borrow();
 
     // 供应商：用工作副本替换，但 api_key 留空=保留旧值（密码框不回显，编辑其它字段不该清密钥）。
     // 丢弃空 name 行（无效），并计数。
@@ -391,7 +396,7 @@ fn sync_providers_model(
     );
 }
 
-// ─────────────── #74 未读提醒（展示名解析 / 弹窗显隐 / 托盘红点合成）───────────────
+// ─────────────── #74 未读提醒 + 历史记录页（展示名解析 / 弹窗显隐 / 托盘红点合成）───────────────
 
 /// #74 展示名解析：bot_key/sender_id → 人类可读名（config 反查，查不到用原始 id 兜底）。
 /// 发送者名字来自授权者名单（授权时已反查名字落盘，桥内无需再异步反查）。
@@ -430,6 +435,41 @@ fn fmt_msg_time(ts: i64) -> String {
     let t = ts.max(0) as u64 + 8 * 3600;
     let (_y, mo, d, h, mi, _s) = crate::chrono_lite::epoch_to_ymd(t);
     format!("{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// #74 历史页列表行（消息库行 → 生成类型 HistoryRow）。
+fn history_to_row(r: &crate::msgstore::MsgRow, cfg: &Config) -> HistoryRow {
+    let bot = cfg.bots.iter().find(|b| b.key() == r.bot_key);
+    let kind = bot.map(|b| kind_label(&b.kind)).unwrap_or_default();
+    let (bot_name, sender) = resolve_display(cfg, &r.bot_key, &r.sender_id);
+    HistoryRow {
+        id: r.id as i32,
+        bot: bot_name.into(),
+        kind: kind.into(),
+        sender: sender.into(),
+        time: fmt_msg_time(r.ts).into(),
+        direction: (if r.direction == "assistant" {
+            "回复"
+        } else {
+            "用户"
+        })
+        .into(),
+        preview: crate::agent::truncate(&r.text, 60).into(),
+        text: r.text.clone().into(),
+    }
+}
+
+/// #74 历史列表 model 整体替换（2s 轮询刷新，ui.rs sync_model 同款手法）。
+fn sync_history_model(
+    model: &slint::VecModel<HistoryRow>,
+    rows: &[crate::msgstore::MsgRow],
+    cfg: &Config,
+) {
+    model.set_vec(
+        rows.iter()
+            .map(|r| history_to_row(r, cfg))
+            .collect::<Vec<_>>(),
+    );
 }
 
 /// #74 未读项 → 弹窗行（最多 8 条：toast 高度有限，更早的看历史页）。
@@ -775,6 +815,14 @@ pub fn run_gui() -> Result<()> {
     // #74 提醒弹窗：授权者私聊 toast（右上角、5s 自动收起）；创建后一直隐藏，
     // 2s 轮询发现未读时由 show_notifications_window 显示。
     let notifications = NotificationsWindow::new()?;
+    // #74 清除历史二次确认弹窗：复用 UnsavedDialog 组件（独立实例，不干扰
+    // 未保存修改那套对话框，各自接线）。
+    let clear_dialog = UnsavedDialog::new()?;
+    clear_dialog.set_title_text("清除历史记录".into());
+    clear_dialog.set_message("将删除全部历史消息记录与未读提醒，不可恢复。确定清除？".into());
+    clear_dialog.set_primary_text("清除".into());
+    clear_dialog.set_discard_text("取消".into());
+    clear_dialog.set_show_stay(false);
     // 弹窗是否正在显示（防重复弹）；5s 自动收起定时器（每次弹出 restart，见 tick 内）
     let notif_showing = Rc::new(Cell::new(false));
     let notif_timer = Rc::new(slint::Timer::default());
@@ -868,6 +916,12 @@ pub fn run_gui() -> Result<()> {
     let default_provider_work: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     // 跨会话投递总开关工作副本（#21）
     let cross_delivery_work: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    // #74 历史记录页工作副本（保留期/提醒开关）：随保存走既有「保存并重启服务」链路
+    let history_retention_work: Rc<RefCell<u32>> = Rc::new(RefCell::new(30));
+    let notify_work: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    // 历史记录列表 model：2s 轮询只读查询消息库 → set_vec 整体替换（ui.rs sync_history_model）
+    let history_model: Rc<slint::VecModel<HistoryRow>> = Rc::new(slint::VecModel::default());
+    settings.set_history_rows(slint::ModelRc::from(history_model.clone()));
     settings.set_providers(slint::ModelRc::from(providers_model.clone()));
 
     /// 供 bot Tab 的供应商下拉：第一项 ""（=跟随全局默认），后接各供应商 name。
@@ -893,6 +947,8 @@ pub fn run_gui() -> Result<()> {
         providers_model: &slint::VecModel<ProviderRow>,
         default_provider_work: &RefCell<String>,
         cross_delivery_work: &RefCell<bool>,
+        history_retention_work: &RefCell<u32>,
+        notify_work: &RefCell<bool>,
     ) {
         *work.borrow_mut() = c.bots.clone();
         sync_model(model, &c.bots);
@@ -900,6 +956,11 @@ pub fn run_gui() -> Result<()> {
         *default_provider_work.borrow_mut() = c.default_provider.clone();
         *cross_delivery_work.borrow_mut() = c.cross_delivery_enabled;
         w.set_cross_delivery_enabled(c.cross_delivery_enabled);
+        // #74 历史记录页工作副本（保留期/提醒开关，随保存走既有重启链路）
+        *history_retention_work.borrow_mut() = c.history_retention_days;
+        w.set_history_retention_days(c.history_retention_days as i32);
+        *notify_work.borrow_mut() = c.notify_enabled;
+        w.set_notify_enabled(c.notify_enabled);
         sync_providers_model(providers_model, &c.providers, &c.default_provider);
         w.set_provider_names(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             build_provider_names(&c.providers),
@@ -928,6 +989,8 @@ pub fn run_gui() -> Result<()> {
         providers_model: &slint::VecModel<ProviderRow>,
         default_provider_work: &RefCell<String>,
         cross_delivery_work: &RefCell<bool>,
+        history_retention_work: &RefCell<u32>,
+        notify_work: &RefCell<bool>,
     ) -> bool {
         if Config::draft_is_newer() {
             let draft = Config::load_draft().unwrap_or_default();
@@ -940,6 +1003,8 @@ pub fn run_gui() -> Result<()> {
                 providers_model,
                 default_provider_work,
                 cross_delivery_work,
+                history_retention_work,
+                notify_work,
             );
             dirty.set(true);
             w.set_status_is_error(false);
@@ -956,6 +1021,8 @@ pub fn run_gui() -> Result<()> {
                 providers_model,
                 default_provider_work,
                 cross_delivery_work,
+                history_retention_work,
+                notify_work,
             );
             dirty.set(false);
             false
@@ -1343,6 +1410,8 @@ pub fn run_gui() -> Result<()> {
                 &pmodel,
                 &dwork,
                 &cross_delivery_work,
+                &history_retention_work,
+                &notify_work,
             );
             push_settings_status(&settings, &install::status());
             // 调试参数（--show-settings）不设误导的「未检测到」状态行
@@ -1364,6 +1433,8 @@ pub fn run_gui() -> Result<()> {
         let pmodel = providers_model.clone();
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
+        let retention_work = history_retention_work.clone();
+        let notify_work = notify_work.clone();
         let dirty_open = dirty.clone();
         // 供托盘「设置…」与 Dock 点击共用的显示逻辑：草稿恢复 + 显示置前。
         // Dock 图标点击恢复窗口（no-frame 后系统标题栏窗口的默认 reopen 行为失效，
@@ -1378,6 +1449,8 @@ pub fn run_gui() -> Result<()> {
             let dock_pmodel = providers_model.clone();
             let dock_dwork = default_provider_work.clone();
             let dock_cdwork = cross_delivery_work.clone();
+            let dock_retention_work = history_retention_work.clone();
+            let dock_notify_work = notify_work.clone();
             let dock_dirty = dirty.clone();
             crate::platform::install_dock_reopen(Box::new(move || {
                 if let Some(w) = dock_sw.upgrade() {
@@ -1390,6 +1463,8 @@ pub fn run_gui() -> Result<()> {
                         &dock_pmodel,
                         &dock_dwork,
                         &dock_cdwork,
+                        &dock_retention_work,
+                        &dock_notify_work,
                     );
                     push_settings_status(&w, &install::status());
                     show_window_and_focus(&w);
@@ -1408,6 +1483,8 @@ pub fn run_gui() -> Result<()> {
                     &pmodel,
                     &dwork,
                     &cdwork,
+                    &retention_work,
+                    &notify_work,
                 );
                 push_settings_status(&w, &install::status());
                 show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
@@ -1648,12 +1725,21 @@ pub fn run_gui() -> Result<()> {
         let pwork = providers_work.clone();
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
+        let retention_work = history_retention_work.clone();
+        let notify_work = notify_work.clone();
         let sw = settings.as_weak();
         let dirty = dirty.clone();
         settings.on_save_clicked(move || {
             dirty.set(false);
             if let Some(w) = sw.upgrade() {
-                let (c, dropped) = snapshot_config(&work, &pwork, &dwork, &cdwork);
+                let (c, dropped) = snapshot_config(
+                    &work,
+                    &pwork,
+                    &dwork,
+                    &cdwork,
+                    &retention_work,
+                    &notify_work,
+                );
                 let _ = tx.send(UiCmd::Save(c));
                 // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
                 w.set_status_is_error(false);
@@ -1730,6 +1816,69 @@ pub fn run_gui() -> Result<()> {
     settings.on_open_url(|url| {
         platform::open_url(url.as_str());
     });
+    // ── #74 历史记录页控件 ──
+    // 提醒开关：写工作副本 + 标记 dirty（随保存写 config；保存走既有重启链路）
+    settings.on_set_notify_enabled({
+        let sw = settings.as_weak();
+        let work = notify_work.clone();
+        let dirty = dirty.clone();
+        move |on| {
+            *work.borrow_mut() = on;
+            dirty.set(true);
+            if let Some(w) = sw.upgrade() {
+                w.set_notify_enabled(on); // 回写属性：页面切换重建控件时保持选中态
+            }
+        }
+    });
+    // 保留期下拉（下标 0=7 天 1=30 天 2=90 天）：写工作副本 + 标记 dirty
+    settings.on_set_history_retention({
+        let sw = settings.as_weak();
+        let work = history_retention_work.clone();
+        let dirty = dirty.clone();
+        move |idx| {
+            let days = match idx {
+                0 => 7,
+                2 => 90,
+                _ => 30,
+            };
+            *work.borrow_mut() = days;
+            dirty.set(true);
+            if let Some(w) = sw.upgrade() {
+                w.set_history_retention_days(days as i32);
+            }
+        }
+    });
+    // 「清除全部历史」→ 二次确认弹窗（复用 UnsavedDialog 独立实例）
+    {
+        let dw = clear_dialog.as_weak();
+        settings.on_clear_history(move || {
+            if let Some(d) = dw.upgrade() {
+                show_window_and_focus(&d);
+            }
+        });
+    }
+    {
+        let dw = clear_dialog.as_weak();
+        clear_dialog.on_discard_close(move || {
+            if let Some(d) = dw.upgrade() {
+                let _ = d.hide(); // 取消：设置窗还开着，不动 dock
+            }
+        });
+    }
+    {
+        let dw = clear_dialog.as_weak();
+        let hm = history_model.clone();
+        clear_dialog.on_save_close(move || {
+            // 确认清除：GUI 只读连接不能写消息库 → 落命令文件，service 的 history-gc
+            // 消费执行（清空 messages.sqlite + unread.json）。这里先乐观清空列表，
+            // 服务端确认后下个 2s tick 自然对齐。
+            write_command_file("msg-clear.command");
+            hm.set_vec(Vec::new());
+            if let Some(d) = dw.upgrade() {
+                let _ = d.hide();
+            }
+        });
+    }
     // ── #74 提醒弹窗：点条目 → 打开设置窗历史页；「知道了」/5s 自动收起 ──
     {
         let nw = notifications.as_weak();
@@ -2212,6 +2361,8 @@ pub fn run_gui() -> Result<()> {
             &providers_model,
             &default_provider_work,
             &cross_delivery_work,
+            &history_retention_work,
+            &notify_work,
         );
         // 已静默恢复草稿时保留恢复提示，别被「请先添加」覆盖
         if !restored {
@@ -2234,10 +2385,14 @@ pub fn run_gui() -> Result<()> {
         let providers_work_t = providers_work.clone();
         let default_provider_work_t = default_provider_work.clone();
         let cross_delivery_work_t = cross_delivery_work.clone();
+        let history_retention_work_t = history_retention_work.clone();
+        let notify_work_t = notify_work.clone();
         // #74 未读提醒：弹窗句柄 + 防重弹标记 + 5s 自动收起定时器（每次弹出 restart）
         let notif_weak = notifications.as_weak();
         let notif_showing = notif_showing.clone();
         let notif_timer = notif_timer.clone();
+        // #74 历史记录列表 model（历史页打开时每 tick 刷新）
+        let history_model = history_model.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -2264,6 +2419,8 @@ pub fn run_gui() -> Result<()> {
                         &providers_work_t,
                         &default_provider_work_t,
                         &cross_delivery_work_t,
+                        &history_retention_work_t,
+                        &notify_work_t,
                     );
                     if let Err(e) = draft.save_draft() {
                         crate::log!("[gui] 草稿自动保存失败: {e:#}");
@@ -2441,6 +2598,16 @@ pub fn run_gui() -> Result<()> {
                                 w.set_status_line(format!("微信登录失败：{e}").into());
                             }
                         }
+                    }
+                }
+                // #74 历史记录页刷新（仅该页打开时）：只读查询消息库 → 整体替换 model。
+                // 与弹窗同 tick：点弹窗条目跳历史页后列表即时可见；清除命令执行后
+                // 列表在下个 tick 自然清空。
+                if let Some(w) = settings_weak.upgrade() {
+                    if w.get_current_page() == 4 {
+                        let rows = crate::msgstore::MsgStore::production().list_recent(1000);
+                        let cfg = Config::load().unwrap_or_default();
+                        sync_history_model(&history_model, &rows, &cfg);
                     }
                 }
                 // #74 未读提醒（与托盘刷新同 tick）：读 unread.json →

@@ -151,6 +151,18 @@ export struct ProviderRow {
     is-default: bool,    // 是否为全局默认供应商
 }
 
+// #74 历史记录页的单条消息（与 Rust 侧 HistoryRow 对应）
+export struct HistoryRow {
+    id: int,             // 消息库行 id（选中/详情定位用）
+    bot: string,         // bot 展示名（config 反查，查不到用 key）
+    kind: string,        // 平台（飞书/钉钉）
+    sender: string,      // 发送者展示名（config 授权名单反查，查不到用 id）
+    time: string,        // MM-DD HH:MM
+    direction: string,   // 用户 / 回复
+    preview: string,     // 摘要（列表行）
+    text: string,        // 完整文本（详情区）
+}
+
 // 微信扫码登录二维码弹窗：直接在 GUI 里显示二维码，避免依赖系统看图。
 export component QrDialog inherits Window {
     title: "微信扫码登录";
@@ -482,6 +494,11 @@ export component SettingsWindow inherits Window {
     in-out property <bool> status-is-error: true;   // true=红（报错）/ false=绿（成功/信息）
     // 跨会话投递总开关（#21）：打开后 agent 可用 `$ABB_BIN deliver` 投递到其它 bot 的会话。
     in-out property <bool> cross-delivery-enabled: false;
+    // #74 历史记录页：提醒总开关 / 保留期（天）/ 消息列表（Rust 侧整体替换 model 刷新）
+    in-out property <bool> notify-enabled: true;
+    in-out property <int> history-retention-days: 30;
+    in-out property <[HistoryRow]> history-rows: [];
+    in-out property <int> history-selected: -1;
 
     // 环境配置（依赖检测）：各项是否在本机可执行路径上
     in-out property <bool> claude-installed: false;
@@ -589,6 +606,12 @@ export component SettingsWindow inherits Window {
     callback set-default-provider(int);
     callback test-provider(int);
 
+    // #74 历史记录页
+    callback history-selection-changed(int);   // 选中某条 → Rust 侧记录（详情在 slint 内由 model 直接取）
+    callback clear-history();                  // 「清除全部历史」→ Rust 侧弹二次确认
+    callback set-notify-enabled(bool);         // 提醒开关 → Rust 侧写工作副本（保存时落盘）
+    callback set-history-retention(int);       // 保留期下拉下标（0=7天 1=30天 2=90天）
+
     // 首页「待处理」卡用到的统计（纯表达式，跟随各 *_installed / perm-* 属性自动更新）
     property <int> missing-deps: (root.claude-installed ? 0 : 1)
         + (root.codex-installed ? 0 : 1)
@@ -637,9 +660,9 @@ export component SettingsWindow inherits Window {
                     padding-right: 10px;
                     spacing: 0px;
                     PixelTabs {
-                        // horizontal-stretch 占满整行：4 tab 均分窗口宽（tab 下面才是内容区）
+                        // horizontal-stretch 占满整行：5 tab 均分窗口宽（tab 下面才是内容区）
                         horizontal-stretch: 1;
-                        tabs: ["首页", "机器人配置", "环境配置", "模型供应商"];
+                        tabs: ["首页", "机器人配置", "环境配置", "模型供应商", "历史记录"];
                         active: root.current-page;
                         changed(i) => { root.current-page = i; }
                     }
@@ -1722,6 +1745,133 @@ export component SettingsWindow inherits Window {
                                                 color: #888;
                                                 wrap: word-wrap;
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ═══════════ 历史记录：授权者私聊消息 + bot 回复（#74） ═══════════
+                if root.current-page == 4: PageContainer {
+                    PageHeader { title: "历史记录"; subtitle: "授权者私聊本机器人的消息与回复（默认保留 30 天，可手动清除）"; }
+
+                    // 顶部工具行：提醒开关 + 保留期下拉 + 手动清除
+                    Rectangle {
+                        vertical-stretch: 0;
+                        background: PixelTheme.bg;
+                        border-radius: 4px;
+                        HorizontalBox {
+                            padding: 10px;
+                            spacing: 12px;
+                            PixelCheckBox {
+                                text: "消息提醒";
+                                checked: root.notify-enabled;
+                                toggled => { root.notify-enabled = self.checked; root.set-notify-enabled(self.checked); }
+                            }
+                            Text {
+                                text: "保留期";
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                color: PixelTheme.text;
+                            }
+                            PixelComboBox {
+                                width: 110px;
+                                model: ["7 天", "30 天", "90 天"];
+                                index: root.history-retention-days == 7 ? 0 : root.history-retention-days == 90 ? 2 : 1;
+                                selected(idx) => { root.set-history-retention(idx); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            PixelButton {
+                                text: "🗑 清除全部历史";
+                                clicked => { root.clear-history(); }
+                            }
+                        }
+                    }
+                    // 主体：左列表 + 右详情（同供应商页布局）
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: PixelTheme.bg;
+                        border-radius: 4px;
+                        HorizontalBox {
+                            spacing: 0;
+                            // ── 左：消息列表（时间/平台/发送者/摘要）──
+                            VerticalBox {
+                                width: 300px;
+                                padding: 10px;
+                                spacing: 8px;
+                                Rectangle {
+                                    background: PixelTheme.panel;
+                                    border-radius: 4px;
+                                    vertical-stretch: 1;
+                                    PixelScrollPanel {
+                                        vertical-stretch: 1;
+                                        VerticalBox {
+                                            spacing: 2px;
+                                            for h[idx] in root.history-rows: Rectangle {
+                                                height: 46px;
+                                                background: idx == root.history-selected ? PixelTheme.accent : transparent;
+                                                TouchArea {
+                                                    clicked => { root.history-selected = idx; root.history-selection-changed(idx); }
+                                                    VerticalBox {
+                                                        padding-left: 10px;
+                                                        spacing: 2px;
+                                                        Text {
+                                                            text: h.time + "  " + h.sender + "  " + h.bot + "  " + h.kind + "  " + h.direction;
+                                                            font-size: 11.5px;
+                                                            font-weight: 600;
+                                                            overflow: elide;
+                                                            width: 100%;
+                                                            color: idx == root.history-selected ? PixelTheme.bg : PixelTheme.text;
+                                                        }
+                                                        Text {
+                                                            text: h.preview;
+                                                            font-size: 11px;
+                                                            overflow: elide;
+                                                            width: 100%;
+                                                            color: idx == root.history-selected ? PixelTheme.bg.with-alpha(0.85) : PixelTheme.text.with-alpha(0.6);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if root.history-rows.length == 0: Text {
+                                                text: "暂无记录：授权者私聊本机器人后，消息与回复会显示在这里";
+                                                font-size: 12px;
+                                                color: #888;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // ── 右：详情（完整文本）──
+                            VerticalBox {
+                                horizontal-stretch: 1;
+                                padding-top: 14px; padding-right: 14px; padding-bottom: 14px; padding-left: 14px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.history-selected >= 0 && root.history-selected < root.history-rows.length
+                                        ? root.history-rows[root.history-selected].time + " · " + root.history-rows[root.history-selected].bot
+                                            + " · " + root.history-rows[root.history-selected].sender
+                                            + " · " + root.history-rows[root.history-selected].direction
+                                        : "← 选择左侧一条消息查看完整内容";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: PixelTheme.text;
+                                }
+                                Rectangle {
+                                    background: PixelTheme.panel;
+                                    border-radius: 4px;
+                                    vertical-stretch: 1;
+                                    PixelScrollPanel {
+                                        vertical-stretch: 1;
+                                        Text {
+                                            text: root.history-selected >= 0 && root.history-selected < root.history-rows.length
+                                                ? root.history-rows[root.history-selected].text : "";
+                                            font-size: 12px;
+                                            color: PixelTheme.text;
+                                            wrap: word-wrap;
                                         }
                                     }
                                 }
