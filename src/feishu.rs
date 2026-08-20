@@ -984,10 +984,7 @@ mod tests {
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
         let e = fs.get_chat_info("oc_dead").await.unwrap_err();
-        assert!(
-            e.to_string().contains("解散"),
-            "错误应含'解散': {e:#}"
-        );
+        assert!(e.to_string().contains("解散"), "错误应含'解散': {e:#}");
     }
 
     #[tokio::test]
