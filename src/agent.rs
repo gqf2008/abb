@@ -1002,7 +1002,20 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
             c.arg("exec");
             c
         }
-        _ => anyhow::bail!("该后端暂不支持提示词生成（请用 claude/codex 后端）"),
+        Backend::Pi => {
+            // pi 非交互 JSON 模式：stdin 读 prompt，stdout JSONL（message_end 权威文本，
+            // 解析同 run_once 的 process_line）。临时 uuid 会话（无状态一次性调用）。
+            let mut c = tokio::process::Command::new("pi");
+            c.arg("-p")
+                .arg("--mode")
+                .arg("json")
+                .arg("--session-id")
+                .arg(uuid::Uuid::new_v4().to_string());
+            c
+        }
+        Backend::PrimeAgent => {
+            anyhow::bail!("prime-agent 暂不支持提示词生成（请用 claude/codex/pi）")
+        }
     };
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1019,8 +1032,28 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
         .await
         .context("生成超时（60s）")??;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // pi：JSONL 里最后一条 message_end（assistant）的文本；claude/codex：stdout 直接是文本
+    let raw = if backend == Backend::Pi {
+        let mut last = String::new();
+        for line in stdout.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("message_end") {
+                    let msg = &v["message"];
+                    if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        let t = pi_message_text(msg);
+                        if !t.is_empty() {
+                            last = t;
+                        }
+                    }
+                }
+            }
+        }
+        last
+    } else {
+        stdout.to_string()
+    };
+    let text = raw
         .lines()
         .find(|l| !l.trim().is_empty())
         .map(|l| l.trim().to_string())

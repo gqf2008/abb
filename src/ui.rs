@@ -1186,6 +1186,9 @@ pub fn run_gui() -> Result<()> {
             // clone 而非 take（8-20 用户反馈：失败态「重试」需要保留 action 重发；
             // 成功后在 Done 里 take 清空）
             if let Some(a) = action.borrow().clone() {
+                // 有 action：执行中（busy），**不关窗**——结果由 Done 回填（成功态
+                // 才可点「知道了」关闭；失败态「重试」保留 action）。曾残留旧 hide()
+                // 导致确认后立即关窗、结果回填到隐藏窗口（8-20 用户实测"还是立刻关了"）。
                 if let Some(c) = cw.upgrade() {
                     c.set_busy(true);
                     c.set_failed(false);
@@ -1211,10 +1214,11 @@ pub fn run_gui() -> Result<()> {
                         owner,
                     },
                 });
-            }
-            if let Some(c) = cw.upgrade() {
-                // 子窗口关闭不动 dock（8-20 用户反馈）
-                let _ = c.hide();
+            } else {
+                // 无 action（成功态点「知道了」）：关窗，不动 dock（8-20 用户反馈）
+                if let Some(c) = cw.upgrade() {
+                    let _ = c.hide();
+                }
             }
         });
     }
@@ -2119,11 +2123,9 @@ pub fn run_gui() -> Result<()> {
                                 })
                                 .unwrap_or_default();
                             let r = match crate::agent::Backend::parse(&backend) {
-                                crate::agent::Backend::Pi | crate::agent::Backend::PrimeAgent => {
-                                    Err(anyhow::anyhow!(
-                                        "后端 {backend} 暂不支持提示词生成（请用 claude/codex）"
-                                    ))
-                                }
+                                crate::agent::Backend::PrimeAgent => Err(anyhow::anyhow!(
+                                    "后端 {backend} 暂不支持提示词生成（请用 claude/codex/pi）"
+                                )),
                                 b => crate::agent::generate_role_prompt(b, &name).await,
                             };
                             match r {
