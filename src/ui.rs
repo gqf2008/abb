@@ -442,6 +442,13 @@ fn history_to_row(r: &crate::msgstore::MsgRow, cfg: &Config) -> HistoryRow {
     let bot = cfg.bots.iter().find(|b| b.key() == r.bot_key);
     let kind = bot.map(|b| kind_label(&b.kind)).unwrap_or_default();
     let (bot_name, sender) = resolve_display(cfg, &r.bot_key, &r.sender_id);
+    // 审查跟进：assistant 行（bot 回复）发送者列显示 bot 名——回复来自 bot 而非
+    // 授权者，否则「授权者名 + 回复」标签语义错位。
+    let sender = if r.direction == "assistant" {
+        bot_name.clone()
+    } else {
+        sender
+    };
     HistoryRow {
         id: r.id as i32,
         bot: bot_name.into(),
