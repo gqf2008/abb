@@ -716,6 +716,13 @@ fn notify_rows(items: &[crate::unread::UnreadItem], cfg: &Config) -> Vec<NotifyR
         .take(8)
         .map(|it| {
             let (bot_name, sender) = resolve_display(cfg, &it.bot_key, &it.sender);
+            // 展示名优先 items.name（bridge 反查：未授权用户 API 反查的真实名字；
+            // 授权者本地名单查）——8-20 用户反馈：提醒显示名字而不是 open_id
+            let sender = if !it.name.is_empty() {
+                it.name.clone()
+            } else {
+                sender
+            };
             NotifyRow {
                 sender: sender.into(),
                 bot: bot_name.into(),

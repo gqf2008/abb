@@ -233,75 +233,41 @@ export struct NotifyRow {
 }
 export component NotificationsWindow inherits Window {
     title: "新消息提醒";
-    width: 360px;
-    height: 470px;
-    preferred-width: 360px;
-    preferred-height: 470px;
+    width: 340px;
+    height: 88px;
+    preferred-width: 340px;
+    preferred-height: 88px;
     no-frame: true;
     background: PixelTheme.bg;
     in-out property <[NotifyRow]> items: [];
-    callback open-history();   // 点条目：打开设置窗历史记录页
+    callback open-history();   // 点面板：打开设置窗历史记录页（已读）
     callback dismiss();        // 手动收起（5s 自动收起在 Rust 侧走同一路径）
 
+    // 8-20 用户反馈：toast 是"小面板"——88px 高，标题行（含条数）+ 最新一条摘要，
+    // 整面板可点（点击 = 已读 + 跳历史页）；更多条数在标题里提示。
     Rectangle {
         width: 100%;
         height: 100%;
         background: PixelTheme.bg;
+        // 整面板点击热区（声明在底层，文字在上层可读）
+        TouchArea { clicked => { root.open-history(); } }
         VerticalBox {
-            padding: 12px;
-            spacing: 8px;
+            padding: 10px;
+            spacing: 4px;
             Text {
-                text: "🔔 新消息提醒";
-                font-size: 13px;
+                text: root.items.length > 1 ? "🔔 多条新消息" : "🔔 新消息提醒";
+                font-size: 12px;
                 font-weight: 700;
                 color: PixelTheme.text;
             }
-            PixelScrollPanel {
-                vertical-stretch: 1;
-                VerticalBox {
-                    spacing: 2px;
-                    for it in root.items: Rectangle {
-                        height: 46px;
-                        border-radius: 4px;
-                        background: PixelTheme.panel;
-                        TouchArea {
-                            clicked => { root.open-history(); }
-                            HorizontalBox {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 8px;
-                                VerticalBox {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    spacing: 2px;
-                                    Text {
-                                        text: it.sender + " · " + it.bot;
-                                        font-size: 12px;
-                                        font-weight: 600;
-                                        color: PixelTheme.text;
-                                    }
-                                    Text {
-                                        text: it.preview;
-                                        font-size: 11px;
-                                        overflow: elide;
-                                        width: 100%;
-                                        color: PixelTheme.text.with-alpha(0.6);
-                                    }
-                                }
-                                Text {
-                                    text: it.time;
-                                    font-size: 10.5px;
-                                    color: #888;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            HorizontalBox {
-                alignment: center;
-                PixelButton { text: "知道了"; clicked => { root.dismiss(); } }
+            Text {
+                text: root.items.length > 0
+                    ? root.items[0].sender + "：" + root.items[0].preview
+                    : "";
+                font-size: 12px;
+                overflow: elide;
+                width: 100%;
+                color: PixelTheme.text.with-alpha(0.85);
             }
         }
     }

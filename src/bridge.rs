@@ -535,9 +535,17 @@ impl Bridge {
                         &text,
                         ts,
                     );
+                    // 展示名：未授权用户不在本地名单，API 反查（best-effort，8-20 用户
+                    // 反馈：提醒要显示名字不是 open_id；失败空串由 GUI 回落 id）
+                    let uname = self
+                        .msgr
+                        .user_display_name(sender_id)
+                        .await
+                        .unwrap_or_default();
                     self.unread.report(
                         &self.bot.key(),
                         sender_id,
+                        &uname,
                         &crate::agent::truncate(&text, 40),
                         ts,
                     );
@@ -1181,11 +1189,12 @@ impl Bridge {
                     ev.ts,
                 );
                 if inserted {
-                    // 未读提醒：只记发送者 id + 摘要（40 字符预览），展示名由 GUI 经
-                    // config 授权者名单反查（授权时已反查过名字）。
+                    // 未读提醒：只记发送者 id + 摘要（40 字符预览）。展示名：授权者在
+                    // 本地名单（GUI 反查）；未授权者由入队处 API 反查带 name（见下）。
                     self.unread.report(
                         &self.bot.key(),
                         &ev.sender_id,
+                        "",
                         &crate::agent::truncate(&user_text, 40),
                         ev.ts,
                     );
@@ -1641,6 +1650,11 @@ impl Bridge {
                 self.unread.report(
                     &self.bot.key(),
                     &msg.sender_staff_id,
+                    &self
+                        .msgr
+                        .user_display_name(&msg.sender_staff_id)
+                        .await
+                        .unwrap_or_default(),
                     &crate::agent::truncate(&msg.text, 40),
                     crate::chrono_lite::unix_secs() as i64,
                 );

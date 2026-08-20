@@ -45,7 +45,7 @@ impl UnreadStore {
     /// 有新的授权者私聊消息：插到队首，超上限丢最旧，整文件原子写回。
     /// sender 传发送者 id（open_id/staffId）；展示名由 GUI 侧经 config 授权者名单反查
     /// （授权时已反查过名字，桥内再做一次异步反查不值——参考 botstatus 只传原始态）。
-    pub fn report(&self, bot_key: &str, sender: &str, preview: &str, ts: i64) {
+    pub fn report(&self, bot_key: &str, sender: &str, name: &str, preview: &str, ts: i64) {
         let _g = self.mu.lock().unwrap();
         let mut items: Vec<Value> = std::fs::read_to_string(&self.path)
             .ok()
@@ -54,7 +54,7 @@ impl UnreadStore {
             .unwrap_or_default();
         items.insert(
             0,
-            json!({"bot_key": bot_key, "sender": sender, "preview": preview, "ts": ts}),
+            json!({"bot_key": bot_key, "sender": sender, "name": name, "preview": preview, "ts": ts}),
         );
         items.truncate(MAX_ITEMS);
         self.write(&items);
@@ -88,6 +88,7 @@ impl UnreadStore {
                 .map(|e| UnreadItem {
                     bot_key: e["bot_key"].as_str().unwrap_or("").to_string(),
                     sender: e["sender"].as_str().unwrap_or("").to_string(),
+                    name: e["name"].as_str().unwrap_or("").to_string(),
                     preview: e["preview"].as_str().unwrap_or("").to_string(),
                     ts: e["ts"].as_i64().unwrap_or(0),
                 })
@@ -102,6 +103,9 @@ pub struct UnreadItem {
     pub bot_key: String,
     /// 发送者 id（open_id / staffId）。
     pub sender: String,
+    /// 发送者展示名（bridge 侧反查：授权者用本地名单名、未授权者 API 反查；
+    /// 空 = 未查到，GUI 回落 id/名单）。
+    pub name: String,
     pub preview: String,
     pub ts: i64,
 }
@@ -117,8 +121,8 @@ mod tests {
     #[test]
     fn report_inserts_newest_first_and_roundtrips() {
         let s = UnreadStore::at(temp_path("roundtrip"));
-        s.report("b1", "ou_1", "你好", 100);
-        s.report("b1", "ou_2", "在吗", 200);
+        s.report("b1", "ou_1", "王小明", "你好", 100);
+        s.report("b1", "ou_2", "", "在吗", 200);
         let items = s.snapshot().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].sender, "ou_2", "最新一条必须在最前");
@@ -131,7 +135,7 @@ mod tests {
     fn report_caps_at_max_items() {
         let s = UnreadStore::at(temp_path("cap"));
         for i in 0..(MAX_ITEMS + 5) {
-            s.report("b1", &format!("ou_{i}"), "x", i as i64);
+            s.report("b1", &format!("ou_{i}"), "", "x", i as i64);
         }
         let items = s.snapshot().unwrap();
         assert_eq!(items.len(), MAX_ITEMS);
@@ -144,7 +148,7 @@ mod tests {
     #[test]
     fn clear_writes_empty_state_and_count_zero() {
         let s = UnreadStore::at(temp_path("clear"));
-        s.report("b1", "ou_1", "x", 1);
+        s.report("b1", "ou_1", "小明", "x", 1);
         s.clear();
         let items = s.snapshot().unwrap();
         assert!(items.is_empty());
