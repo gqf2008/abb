@@ -665,6 +665,8 @@ impl Bridge {
                 "[bridge] 群被解散（im.chat.deleted_v1），已自动移除虚拟 Bot 登记 chat={}",
                 trunc(chat_id, 12)
             );
+            // 会话历史归档（用户决策：解散后不删除，移入工作区 archive/）
+            crate::virtualbot::VirtualBotStore::archive_chat_history(&self.bot.key(), chat_id);
         } else {
             crate::log!(
                 "[bridge] 群被解散 chat={}（非本 bot 的虚拟 Bot 登记，忽略）",

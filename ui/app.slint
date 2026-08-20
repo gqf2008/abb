@@ -852,10 +852,13 @@ export component SettingsWindow inherits Window {
     title: root.window-title;
     // 窗口 + Dock 图标（提升为 regular 后 Dock 用）。1024px 源，macOS 自动缩放。
     icon: @image-url("../app-assets/icon-1024.png");
-    // 显式 width/height（固定尺寸，PCM 同款不可缩放）：Window 若不显式给尺寸，会用内容 preferred 算，
-    // 而设置窗初始 bots 为空、selected=-1 时内容高度算成 0 → 窗口塌成标题栏。
-    width: 980px;
-    height: 680px;
+    // 可缩放窗口（8-20 用户实测决策）：不设固定 width/height 绑定——固定尺寸与
+    // set_maximized 冲突（最大化后被 size 拉回，视觉"越点越小"）。preferred-* 定初始
+    // 尺寸，min-* 防内容塌陷（初始 bots 为空时内容高度算 0 的坑由 min-height 兜住）。
+    preferred-width: 980px;
+    preferred-height: 680px;
+    min-width: 880px;
+    min-height: 620px;
     background: PixelTheme.panel;
 
     in-out property <string> window-title: "ABB 设置";
@@ -996,6 +999,7 @@ export component SettingsWindow inherits Window {
     callback virtual-bot-edit(int);       // 编辑登记（预填弹窗 → PATCH + 登记同步）
     callback virtual-bot-deregister(int); // ⋯ 菜单：取消登记（轻确认）
     callback virtual-bot-disband(int);    // ⋯ 菜单：解散群（红色强确认，仅飞书）
+    callback virtual-bot-refresh();       // ⟳ 刷新：验证登记群存在性（平台解散兜底 + 历史归档）
     // #74 历史记录页
     callback history-selection-changed(int);   // 选中某条 → Rust 侧记录（详情在 slint 内由 model 直接取）
     callback clear-history();                  // 「清除全部历史」→ Rust 侧弹二次确认
@@ -1030,12 +1034,11 @@ export component SettingsWindow inherits Window {
             // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。全部归零，
             // 由各分区自己的 padding 精确控制。
             padding: 0;
-            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/关闭（设置窗固定尺寸，无最大化）──
+            // ── 像素自绘标题栏（no-frame）：拖拽/最小化/最大化/关闭（窗口可缩放，三按钮全开）──
             PixelTitleBar {
                 title: root.window-title;
                 logo: @image-url("../app-assets/icon-1024.png");
                 has-logo: true;
-                show-maximize: false; // 固定 980x680 窗口：最大化会与尺寸绑定冲突（8-20 实测"越点越小"）
                 drag-start => { root.drag-start(); }
                 minimize => { root.minimize(); }
                 toggle-maximize => { root.toggle-maximize(); }
@@ -1644,7 +1647,18 @@ export component SettingsWindow inherits Window {
                                             // 仅飞书/钉钉显示（微信排除：虚拟 Bot 需要平台群概念）。
                                             if root.selected >= 0 && root.selected < root.bots.length && (root.bots[root.selected].kind == "feishu" || root.bots[root.selected].kind == "dingtalk"): VerticalBox {
                                                 spacing: 6px;
-                                                Text { text: "虚拟 Bot"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
+                                                HorizontalBox {
+                                                    Text { text: "虚拟 Bot"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
+                                                    Rectangle { horizontal-stretch: 1; }
+                                                    // 手动刷新：平台解散群的兜底（im.chat.deleted 事件未订阅/丢失时）——
+                                                    // 验证登记群存在性，已解散的移除登记并归档会话历史
+                                                    PixelButton {
+                                                        text: "⟳ 刷新";
+                                                        size: "small";
+                                                        variant: "ghost";
+                                                        clicked => { root.virtual-bot-refresh(); }
+                                                    }
+                                                }
                                                 Text {
                                                     text: "平台真实群 + ABB 登记：群名=角色名、群介绍=system prompt（改群介绍=改角色，即时生效）。群内 @ 机器人自动注入角色；AI 可用 deliver --bot <此 bot> --chat @角色名 寻址。";
                                                     font-size: 11px; color: #888; wrap: word-wrap;

@@ -651,7 +651,9 @@ impl Default for Config {
 }
 
 /// 文件名安全化：只留字母数字、-、_、中文等，去掉路径分隔与空白。
-fn sanitize(s: &str) -> String {
+/// pub(crate)：virtualbot.rs 归档历史文件时按会话 key 前缀匹配（history 文件名用
+/// 同款 sanitize）。
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .collect::<String>()

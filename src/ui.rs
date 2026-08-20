@@ -115,6 +115,16 @@ enum UiCmd {
         app_secret: String,
         chat_id: String,
     },
+    /// 手动刷新（虚拟 Bot section「⟳ 刷新」）：逐个登记群调 get_chat_info 验证存在性——
+    /// 平台解散群的兜底（im.chat.deleted 事件可能因未订阅/丢失不达）；确认已解散的群
+    /// 移除登记 + 归档会话历史。get_chat_info 失败但错误不像"群不存在"（网络/权限等）
+    /// 保留登记并提示，避免误删。
+    VirtualBotVerify {
+        bot_key: String,
+        kind: String,
+        app_id: String,
+        app_secret: String,
+    },
 }
 
 /// 微信扫码登录的阶段结果（后台 → 主线程）。
@@ -1971,6 +1981,83 @@ pub fn run_gui() -> Result<()> {
                             }
                         });
                     }
+                    UiCmd::VirtualBotVerify {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            // 逐个登记群验证存在性（get_chat_info）——平台解散群的兜底
+                            // （im.chat.deleted 事件未订阅/丢失时）；确认已解散 → 移除
+                            // 登记 + 归档会话历史。失败但错误不像"群不存在"（网络/权限/
+                            // 频控）→ 保留登记并提示，避免误删。
+                            crate::log!(
+                                "[gui] 手动刷新虚拟 Bot 登记 bot={}",
+                                crate::agent::truncate(&bot_key, 12)
+                            );
+                            let regs = VirtualBotStore::new().load_for(&bot_key);
+                            let client = match kind.as_str() {
+                                "dingtalk" => None,
+                                _ => Some(FeishuClient::new(&app_id, &app_secret)),
+                            };
+                            let mut results: Vec<(String, Result<String, String>)> = Vec::new();
+                            for reg in &regs {
+                                let r = match &client {
+                                    Some(c) => c.get_chat_info(&reg.chat_id).await,
+                                    // 钉钉无群信息 API（无该能力）：跳过验证，登记保留
+                                    None => Err(anyhow::anyhow!("钉钉不支持群验证")),
+                                };
+                                match r {
+                                    Ok(_) => results.push((
+                                        reg.role_name.clone(),
+                                        Ok("正常".to_string()),
+                                    )),
+                                    Err(e) => {
+                                        let es = format!("{e:#}");
+                                        let gone = es.contains("不存在")
+                                            || es.contains("解散")
+                                            || es.contains("not found")
+                                            || es.contains("404");
+                                        if gone {
+                                            let removed =
+                                                VirtualBotStore::new().remove(&bot_key, &reg.chat_id);
+                                            let archived = VirtualBotStore::archive_chat_history(
+                                                &bot_key,
+                                                &reg.chat_id,
+                                            );
+                                            crate::log!(
+                                                "[gui] 刷新发现群已解散：{}（登记移除={}，归档文件={}）",
+                                                reg.role_name,
+                                                removed,
+                                                archived
+                                            );
+                                            results.push((
+                                                reg.role_name.clone(),
+                                                Err(format!(
+                                                    "群已解散：登记已移除，历史已归档（{archived} 个文件）"
+                                                )),
+                                            ));
+                                        } else {
+                                            crate::log!(
+                                                "[gui] 刷新验证失败（保留登记）：{}: {es}",
+                                                reg.role_name
+                                            );
+                                            results.push((
+                                                reg.role_name.clone(),
+                                                Err(format!("验证失败（登记保留）：{es}")),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if regs.is_empty() {
+                                results.push(("无".to_string(), Ok("暂无登记".to_string())));
+                            }
+                            let _ = vb_tx.send(VirtualBotEvt::Done { results });
+                        });
+                    }
                 }
             }
         });
@@ -2724,6 +2811,30 @@ pub fn run_gui() -> Result<()> {
                     vb_open_dialog(&d, bot, 0, None, &twork);
                     show_window_and_focus(&d);
                 }
+            }
+        });
+    }
+    // 手动刷新：验证登记群存在性（平台解散兜底 + 历史归档），结果走状态行。
+    // 独立 block：不依赖上面的 block 变量（work/tx 已被 on_virtual_bot_create 闭包 move），
+    // 直接 clone 最外层作用域变量 + weak settings。
+    {
+        let tx = tx.clone();
+        let work = work.clone();
+        let sw = settings.as_weak();
+        settings.on_virtual_bot_refresh(move || {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            if let Some(bot) = b.get(sel as usize) {
+                if bot.kind == "wechat" {
+                    return;
+                }
+                let _ = tx.send(UiCmd::VirtualBotVerify {
+                    bot_key: bot.key(),
+                    kind: bot.kind.clone(),
+                    app_id: bot.app_id.clone(),
+                    app_secret: bot.app_secret.clone(),
+                });
             }
         });
     }
