@@ -40,6 +40,13 @@ pub struct PendingItem {
     /// serde default 兼容旧 pending.json（无角色时代 → Owner 全权限，与现状一致）。
     #[serde(default)]
     pub role: crate::config::SenderRole,
+    /// #74 发送者 id（重放落历史库/未读提醒时保持原标识）。
+    /// serde default 兼容旧 pending.json（无此字段 = 空，历史落库跳过该 bot 条目）。
+    #[serde(default)]
+    pub sender_id: String,
+    /// #74 消息事件时间（unix 秒；重放保持原事件时间，历史排序不乱）。
+    #[serde(default)]
+    pub ts: i64,
     /// 入队时间（unix 秒），启动重放按此排序保持原先后顺序。
     pub created_at: u64,
     /// 已产出的最终回复（阶段 1：W2 崩溃窗口补发）。agent 返回后、发送前落盘——
@@ -159,6 +166,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
             created_at: at,
             reply: None,
         }

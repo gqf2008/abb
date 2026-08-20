@@ -52,6 +52,11 @@ pub struct Bridge {
     /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
     /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
     agent_runner: Arc<dyn AgentRunner>,
+    /// #74 授权者私聊历史库。生产 = ~/.agent-bridge/messages.sqlite（MsgStore::production）；
+    /// 测试注入临时路径——handle 内的落库绝不能碰真实用户消息库。
+    pub msgstore: crate::msgstore::MsgStore,
+    /// #74 未读提醒队列（logs/unread.json 写句柄）。同上：测试注入临时路径。
+    pub unread: crate::unread::UnreadStore,
 }
 
 #[derive(Debug)]
@@ -71,6 +76,13 @@ pub struct Ev {
     /// 发送者角色（owner=全权限 / granted=受限）：入口准入闸推导，agent 调用处
     /// 按此选受限分支；pending 重放路径从 PendingItem.role 恢复。
     pub role: crate::config::SenderRole,
+    /// 发送者 id（飞书 open_id / 微信 ilink user_id / 钉钉 staffId）。
+    /// #74 历史记录（msgstore）与未读提醒（unread.json）的发送者标识。
+    pub sender_id: String,
+    /// 消息事件时间（unix 秒；#74 历史排序/提醒时间显示）。
+    /// 各平台事件时间：飞书 header.create_time（毫秒）、微信 create_time_ms；
+    /// 钉钉事件体无时间字段 → 当前时间（见各入口注释）。
+    pub ts: i64,
 }
 
 impl Ev {
@@ -120,6 +132,8 @@ impl Bridge {
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
             agent_runner,
+            msgstore: crate::msgstore::MsgStore::production(),
+            unread: crate::unread::UnreadStore::production(),
         }
     }
 
@@ -503,6 +517,15 @@ impl Bridge {
             }
         }
 
+        // #74 事件时间：飞书事件头 create_time 是毫秒字符串；缺失/解析失败回落当前时间
+        // （历史排序/提醒时间显示用，精确到秒足够）。
+        let ts = body["header"]["create_time"]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| body["header"]["create_time"].as_i64())
+            .map(|ms| ms / 1000)
+            .unwrap_or_else(|| crate::chrono_lite::unix_secs() as i64);
+
         let mut ev = Ev {
             mid,
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
@@ -513,6 +536,8 @@ impl Bridge {
             text,
             attachments,
             role: sender_role,
+            sender_id: sender_id.to_string(),
+            ts,
         };
         if ev.mid.is_empty() || ev.chat_id.is_empty() {
             crate::log!(
@@ -796,6 +821,8 @@ impl Bridge {
             quoted: ev.quoted.clone(),
             attachments: ev.attachments.clone(),
             role: ev.role, // 落盘角色：重启重放时按原角色走受限/全权限分支
+            sender_id: ev.sender_id.clone(), // #74 重放落库时保持原发送者标识
+            ts: ev.ts,     // #74 重放落库时保持原事件时间
             created_at: crate::chrono_lite::unix_secs(),
             reply: None, // 回复产出后由 set_reply 落盘（阶段 1：W2 补发）
         });
@@ -853,6 +880,12 @@ impl Bridge {
         // 或把不存在的拦截声明当承诺）。读不到 config 按安全默认 true。
         // （insert 挪到锁内历史注入之后——受限说明必须保持最外层。）
         let restrict_prompt = crate::config::restrict_granted(ev.role, &self.bot.key());
+
+        // #74：是否落历史库 + 未读提醒（granted 私聊）。覆盖飞书 p2p / 钉钉单聊(dm)；
+        // owner 自己（role==Owner）排除；微信无授权者概念（on_weixin 恒 Owner）自然排除。
+        // 提醒是纯本地 UI（托盘红点 + 弹窗），绝不主动向任何 IM 发消息（授权边界规则）。
+        let record_granted = ev.role == crate::config::SenderRole::Granted
+            && (ev.chat_type == "p2p" || ev.chat_type == "dm");
 
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
@@ -971,6 +1004,28 @@ impl Bridge {
             // 当前用户轮落历史（锁内，与助手轮严格按真实顺序交替；重放由 (mid,user) 去重兜底）。
             // 锁内写与 /new 的 clear 互斥。
             hist.append_user(&ev.mid, backend.name(), &history_user_text(&text, &ev));
+            // #74：授权者（granted）私聊消息 → 落消息库 + 未读提醒（条件见 record_granted）。
+            // 与 hist 同处锁内写：插入快、失败只 log，不阻塞主链路。
+            if record_granted {
+                let user_text = history_user_text(&text, &ev);
+                self.msgstore.insert(
+                    &self.bot.key(),
+                    &ev.chat_id,
+                    &ev.mid,
+                    "user",
+                    &ev.sender_id,
+                    &user_text,
+                    ev.ts,
+                );
+                // 未读提醒：只记发送者 id + 摘要（40 字符预览），展示名由 GUI 经
+                // config 授权者名单反查（授权时已反查过名字）。
+                self.unread.report(
+                    &self.bot.key(),
+                    &ev.sender_id,
+                    &crate::agent::truncate(&user_text, 40),
+                    ev.ts,
+                );
+            }
             (lock_ret, epoch, injected_rounds)
         };
 
@@ -1109,11 +1164,28 @@ impl Bridge {
                 // 破坏「发送后摘 pending」的 W2 不变式）
                 self.pending.remove(&ev.mid);
                 match send_result {
-                    Ok(()) => crate::log!(
-                        "[bridge] 已回复 chat={} 长度={}",
-                        trunc(&ev.chat_id, 10),
-                        reply.chars().count()
-                    ),
+                    Ok(()) => {
+                        // #74：bot 回复落历史库（与用户轮同条件：granted 私聊，见 record_granted）。
+                        // 回复 mid 复用用户轮 mid（history.rs 一消息一回复语义），由
+                        // UNIQUE(mid, direction) 幂等区分；时间用发送时刻。发的是纯回复
+                        // （不含注入提示 history_note——那是迁移期瞬态，不进历史）。
+                        if record_granted {
+                            self.msgstore.insert(
+                                &self.bot.key(),
+                                &ev.chat_id,
+                                &ev.mid,
+                                "assistant",
+                                &ev.sender_id,
+                                &reply,
+                                crate::chrono_lite::unix_secs() as i64,
+                            );
+                        }
+                        crate::log!(
+                            "[bridge] 已回复 chat={} 长度={}",
+                            trunc(&ev.chat_id, 10),
+                            reply.chars().count()
+                        )
+                    }
                     Err(e) => crate::log!(
                         "[bridge] ⚠️ 回复发送失败 chat={}: {e:#}",
                         trunc(&ev.chat_id, 10)
@@ -1174,6 +1246,8 @@ impl Bridge {
             text: item.text.clone(),
             attachments: Vec::new(),
             role: item.role,
+            sender_id: item.sender_id.clone(),
+            ts: item.ts,
         }
     }
 
@@ -1254,6 +1328,8 @@ impl Bridge {
                 text: item.text,
                 attachments: item.attachments,
                 role: item.role, // 重放按原角色走受限/全权限分支（PendingItem 落盘字段）
+                sender_id: item.sender_id, // #74 重放保持原发送者标识
+                ts: item.ts,     // #74 重放保持原事件时间
             };
             crate::log!(
                 "[bot:{}] 恢复消息 chat={} mid={} text={:?}",
@@ -1330,13 +1406,20 @@ impl Bridge {
         }
         let ev = Ev {
             mid,
-            chat_id: from,               // 微信会话标识 = 对方 ilink_user_id
+            chat_id: from.clone(),       // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
             thread_id: String::new(),    // 微信无话题
             quoted,
             text,
             attachments,
             role: crate::config::SenderRole::Owner, // 微信只有 owner（on_weixin 已按 wx_user_id 过滤）
+            sender_id: from,
+            // #74 事件时间：create_time_ms 是毫秒；缺失/为 0 回落当前时间
+            ts: if msg.create_time_ms > 0 {
+                msg.create_time_ms / 1000
+            } else {
+                crate::chrono_lite::unix_secs() as i64
+            },
         };
         self.handle(ev).await;
     }
@@ -1440,6 +1523,10 @@ impl Bridge {
             text,
             attachments,
             role: sender_role,
+            sender_id: msg.sender_staff_id,
+            // #74 事件时间：钉钉 Stream 事件体无时间字段 → 当前 unix 秒
+            // （历史排序/提醒时间显示够用）。
+            ts: crate::chrono_lite::unix_secs() as i64,
         };
         self.handle(ev).await;
     }
@@ -1603,6 +1690,8 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
         };
         assert_eq!(ev.key(), "oc_group");
     }
@@ -1619,6 +1708,8 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
         };
         let a = base("omt_aaa");
         let b = base("omt_bbb");
@@ -2016,6 +2107,8 @@ mod tests {
             text: text.into(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
         }
     }
 
@@ -2030,13 +2123,23 @@ mod tests {
     }
 
     /// 构造带指定 BotConfig 的 Bridge（飞书 on_payload 测试需要 bot_name/bot_open_id/owner）。
+    /// #74：msgstore/unread 注入临时路径——handle 内的落库/提醒测试不得碰真实
+    /// ~/.agent-bridge 数据（消息库是全局文件，不像 workspaces 可按 bot key 隔离）。
     fn build_test_bridge_with_bot(
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
-        let bridge = Arc::new(Bridge::build(msgr.clone(), bot, &Config::default(), runner));
-        (bridge, msgr)
+        let mut bridge = Bridge::build(msgr.clone(), bot, &Config::default(), runner);
+        // 按 bot key 命名（key 本身唯一），cleanup_bridge 可按 key 回收
+        let key = bridge.bot.key();
+        bridge.msgstore = crate::msgstore::MsgStore::at(
+            std::env::temp_dir().join(format!("abb-msgstore-test-{key}")),
+        );
+        bridge.unread = crate::unread::UnreadStore::at(
+            std::env::temp_dir().join(format!("abb-unread-test-{key}")),
+        );
+        (Arc::new(bridge), msgr)
     }
 
     /// 构造飞书 receive_v1 事件 payload（content 按官方格式传 JSON 字符串）。
@@ -2080,6 +2183,18 @@ mod tests {
     fn cleanup_bridge(bridge: &Bridge) {
         // 跑完删整个工作目录：sessions.json / jobs.json / outbox 一并清理
         let _ = std::fs::remove_dir_all(crate::workspace_dir(&bridge.bot.key()));
+        // #74：回收测试注入的临时消息库/未读文件（按 bot key 命名 + WAL 伴生文件，
+        // 见 build_test_bridge_with_bot）
+        let key = bridge.bot.key();
+        for (prefix, suffix) in [
+            ("abb-msgstore-test-", ""),
+            ("abb-msgstore-test-", "-wal"),
+            ("abb-msgstore-test-", "-shm"),
+            ("abb-unread-test-", ""),
+        ] {
+            let _ =
+                std::fs::remove_file(std::env::temp_dir().join(format!("{prefix}{key}{suffix}")));
+        }
     }
 
     #[tokio::test]
@@ -2807,6 +2922,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
             created_at: 10,
             reply: None,
         });
@@ -2819,6 +2936,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Granted,
+            sender_id: String::new(),
+            ts: 0,
             created_at: 20,
             reply: None,
         });
@@ -2870,6 +2989,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
             created_at: 10,
             reply: None,
         });
@@ -2923,6 +3044,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
             created_at: 10,
             reply: None,
         });
@@ -2955,6 +3078,8 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            sender_id: String::new(),
+            ts: 0,
             created_at: 10,
             reply: None,
         });
@@ -3628,6 +3753,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn granted_p2p_message_records_msgstore_and_unread() {
+        // #74：授权者私聊消息 → 落消息库（user 轮）+ 未读提醒；agent 回复发送成功后
+        // 再落 assistant 轮（同 mid，direction 区分，UNIQUE(mid,direction) 幂等）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let payload = feishu_payload(
+            "om_rec",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_friend",
+            &[],
+            "帮我写个周报",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+
+        let rows = bridge.msgstore.list_recent(10);
+        assert_eq!(rows.len(), 2, "granted 私聊应落 user + assistant 两条");
+        assert_eq!(rows[0].direction, "assistant", "最新是回复");
+        assert_eq!(rows[0].mid, "om_rec", "回复复用用户轮 mid");
+        assert_eq!(rows[0].sender_id, "ou_friend");
+        assert_eq!(rows[1].direction, "user");
+        assert_eq!(rows[1].text, "帮我写个周报");
+        assert_eq!(rows[1].sender_id, "ou_friend");
+
+        let unread = bridge.unread.snapshot().unwrap();
+        assert_eq!(unread.len(), 1, "未读提醒一条");
+        assert_eq!(unread[0].bot_key, bridge.bot.key());
+        assert_eq!(unread[0].sender, "ou_friend");
+        assert_eq!(unread[0].preview, "帮我写个周报");
+        // 提醒是纯本地 UI：messenger 只发出 agent 回复，绝不主动向任何 IM 发提醒消息
+        assert_eq!(msgr.sent().len(), 1, "外发只有 agent 回复一条");
+        assert_eq!(msgr.sent()[0], "done");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn owner_p2p_message_skips_msgstore_and_unread() {
+        // #74：owner 自己排除——owner 私聊不落历史库、不产生未读提醒
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let payload = feishu_payload(
+            "om_own",
+            "oc_p2p",
+            "p2p",
+            "",
+            "",
+            "user",
+            "ou_boss",
+            &[],
+            "在吗",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+        assert!(
+            bridge.msgstore.list_recent(10).is_empty(),
+            "owner 消息不得落库"
+        );
+        assert!(
+            bridge.unread.snapshot().unwrap_or_default().is_empty(),
+            "owner 消息不得产生未读"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn granted_group_message_skips_msgstore_and_unread() {
+        // #74：提醒/历史只覆盖私聊（p2p/dm）——群里授权者 @ 消息不落历史库、不提醒
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            granted_ids: "ou_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let payload = feishu_payload(
+            "om_g_grp",
+            "oc_grp",
+            "group",
+            "",
+            "",
+            "user",
+            "ou_friend",
+            &[("庆小丰", "ou_bot")],
+            "大家早",
+        );
+        bridge.on_payload(payload.as_bytes()).await;
+        assert!(bridge.msgstore.list_recent(10).is_empty(), "群消息不得落库");
+        assert!(
+            bridge.unread.snapshot().unwrap_or_default().is_empty(),
+            "群消息不得产生未读"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn dingtalk_granted_dm_records_msgstore_and_unread() {
+        // #74：钉钉授权者单聊（chat_type=dm）同样落库 + 提醒（dm 分支覆盖）
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "dingtalk".into(),
+            ding_owner_ids: "u_boss".into(),
+            ding_granted_ids: "u_friend".into(),
+            ..Default::default()
+        };
+        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        let msg = crate::dingtalk::DingtalkMessage {
+            mid: "dt1".into(),
+            sender_staff_id: "u_friend".into(),
+            conversation_id: "u_friend".into(), // 单聊：chat_id = sender
+            conversation_type: "1".into(),
+            text: "钉钉上找你".into(),
+            mentioned: false,
+            robot_code: "r".into(),
+            quoted_text: String::new(),
+            quoted_attachments: Vec::new(),
+            attachments: Vec::new(),
+        };
+        bridge.on_dingtalk(msg).await;
+
+        let rows = bridge.msgstore.list_recent(10);
+        assert_eq!(rows.len(), 2, "granted 钉钉单聊应落 user + assistant 两条");
+        assert_eq!(rows[0].direction, "assistant");
+        assert_eq!(rows[1].direction, "user");
+        assert_eq!(rows[1].text, "钉钉上找你");
+        assert_eq!(rows[1].sender_id, "u_friend");
+        let unread = bridge.unread.snapshot().unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].sender, "u_friend");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
     async fn on_payload_cancel_without_task_replies_and_no_agent() {
         // /cancel 无任务在跑 → 明确回复「当前没有正在运行的任务」，不透传给 agent
         let runner = Arc::new(MockAgentRunner::immediate("done"));
@@ -4241,6 +4523,8 @@ https://b.com/y"
                 quoted: crate::messenger::QuotedContent::default(),
                 attachments: Vec::new(),
                 role: crate::config::SenderRole::Owner,
+                sender_id: String::new(),
+                ts: 0,
                 created_at: i as u64,
                 reply: None,
             });
