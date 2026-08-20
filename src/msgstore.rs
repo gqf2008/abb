@@ -28,6 +28,8 @@ pub struct MsgRow {
     /// "user"=发送者消息 / "assistant"=bot 回复。
     pub direction: String,
     pub sender_id: String,
+    /// 发送者展示名（落库时反查：未授权 API / 授权者本地名单；空 = 未查到，GUI 回落）。
+    pub sender_name: String,
     pub text: String,
     /// 事件时间（unix 秒）。
     pub ts: i64,
@@ -70,6 +72,7 @@ impl MsgStore {
                 mid TEXT NOT NULL,
                 direction TEXT NOT NULL,
                 sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL DEFAULT '',
                 text TEXT NOT NULL,
                 ts INTEGER NOT NULL,
                 UNIQUE(mid, direction)
@@ -78,6 +81,21 @@ impl MsgStore {
             CREATE INDEX IF NOT EXISTS idx_messages_bot_chat_ts ON messages(bot_key, chat_id, ts);",
         )
         .ok()?;
+        // 老库迁移（8-20 加 sender_name 列）：PRAGMA 检查列存在，缺失则 ALTER 补列
+        // （CREATE TABLE IF NOT EXISTS 不补列；缺列会让 list_recent 的 SELECT 失败）
+        let has_col: bool = con
+            .prepare("PRAGMA table_info(messages)")
+            .ok()?
+            .query_map([], |r| r.get::<_, String>(1))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "sender_name");
+        if !has_col {
+            let _ = con.execute(
+                "ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -96,6 +114,7 @@ impl MsgStore {
         mid: &str,
         direction: &str,
         sender_id: &str,
+        sender_name: &str,
         text: &str,
         ts: i64,
     ) -> bool {
@@ -104,9 +123,9 @@ impl MsgStore {
             return false;
         };
         match con.execute(
-            "INSERT OR IGNORE INTO messages (bot_key, chat_id, mid, direction, sender_id, text, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![bot_key, chat_id, mid, direction, sender_id, text, ts],
+            "INSERT OR IGNORE INTO messages (bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts],
         ) {
             Ok(n) => n > 0,
             Err(e) => {
@@ -130,7 +149,7 @@ impl MsgStore {
             }
         };
         let mut stmt = match con.prepare(
-            "SELECT id, bot_key, chat_id, mid, direction, sender_id, text, ts
+            "SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts
              FROM messages ORDER BY ts DESC, id DESC LIMIT ?1",
         ) {
             Ok(s) => s,
@@ -147,8 +166,9 @@ impl MsgStore {
                 mid: r.get(3)?,
                 direction: r.get(4)?,
                 sender_id: r.get(5)?,
-                text: r.get(6)?,
-                ts: r.get(7)?,
+                sender_name: r.get(6)?,
+                text: r.get(7)?,
+                ts: r.get(8)?,
             })
         });
         rows.and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
@@ -226,9 +246,9 @@ mod tests {
     #[test]
     fn insert_then_list_roundtrip_newest_first() {
         let s = MsgStore::at(temp_path("roundtrip"));
-        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "你好", 100));
-        assert!(s.insert("b1", "c1", "m1", "assistant", "ou_1", "回复", 101));
-        assert!(s.insert("b1", "c2", "m2", "user", "ou_2", "另一条", 200));
+        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "", "你好", 100));
+        assert!(s.insert("b1", "c1", "m1", "assistant", "ou_1", "", "回复", 101));
+        assert!(s.insert("b1", "c2", "m2", "user", "ou_2", "", "另一条", 200));
         let rows = s.list_recent(10);
         assert_eq!(rows.len(), 3);
         // 最新在上：m2 最前；同 mid 的用户/助手对保留各自方向
@@ -244,11 +264,11 @@ mod tests {
     #[test]
     fn duplicate_mid_same_direction_is_ignored() {
         let s = MsgStore::at(temp_path("dedup"));
-        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "第一遍", 100));
+        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "", "第一遍", 100));
         // 同 mid 同方向（重放兜底）→ 幂等忽略
-        assert!(!s.insert("b1", "c1", "m1", "user", "ou_1", "第一遍", 100));
+        assert!(!s.insert("b1", "c1", "m1", "user", "ou_1", "", "第一遍", 100));
         // 同 mid 不同方向（bot 回复）→ 允许
-        assert!(s.insert("b1", "c1", "m1", "assistant", "ou_1", "回复", 101));
+        assert!(s.insert("b1", "c1", "m1", "assistant", "ou_1", "", "回复", 101));
         assert_eq!(s.list_recent(10).len(), 2);
         let _ = std::fs::remove_file(&s.path);
     }
@@ -257,7 +277,16 @@ mod tests {
     fn list_limits_to_requested_count() {
         let s = MsgStore::at(temp_path("limit"));
         for i in 0..5 {
-            s.insert("b1", "c1", &format!("m{i}"), "user", "ou_1", "x", i * 10);
+            s.insert(
+                "b1",
+                "c1",
+                &format!("m{i}"),
+                "user",
+                "ou_1",
+                "",
+                "x",
+                i * 10,
+            );
         }
         assert_eq!(s.list_recent(2).len(), 2);
         assert_eq!(s.list_recent(0).len(), 0);
@@ -274,8 +303,26 @@ mod tests {
     fn gc_deletes_only_expired_rows() {
         let s = MsgStore::at(temp_path("gc"));
         let now = crate::chrono_lite::unix_secs() as i64;
-        s.insert("b1", "c1", "m_old", "user", "ou_1", "旧", now - 31 * 86400);
-        s.insert("b1", "c1", "m_new", "user", "ou_1", "新", now - 29 * 86400);
+        s.insert(
+            "b1",
+            "c1",
+            "m_old",
+            "user",
+            "ou_1",
+            "",
+            "旧",
+            now - 31 * 86400,
+        );
+        s.insert(
+            "b1",
+            "c1",
+            "m_new",
+            "user",
+            "ou_1",
+            "",
+            "新",
+            now - 29 * 86400,
+        );
         // 保留 30 天：31 天前的删掉，29 天前的留下
         assert_eq!(s.gc(30), 1);
         let rows = s.list_recent(10);
@@ -288,7 +335,7 @@ mod tests {
     fn gc_with_zero_days_falls_back_to_one() {
         let s = MsgStore::at(temp_path("gc0"));
         let now = crate::chrono_lite::unix_secs() as i64;
-        s.insert("b1", "c1", "m1", "user", "ou_1", "x", now - 2 * 86400);
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", now - 2 * 86400);
         // retention 0（异常配置）→ 按 1 天兜底，2 天前的记录被删
         assert_eq!(s.gc(0), 1);
         assert!(s.list_recent(10).is_empty());
@@ -298,8 +345,8 @@ mod tests {
     #[test]
     fn clear_all_empties_table() {
         let s = MsgStore::at(temp_path("clear"));
-        s.insert("b1", "c1", "m1", "user", "ou_1", "x", 100);
-        s.insert("b2", "c2", "m2", "user", "ou_2", "y", 200);
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100);
+        s.insert("b2", "c2", "m2", "user", "ou_2", "", "y", 200);
         assert_eq!(s.clear_all(), 2);
         assert!(s.list_recent(10).is_empty());
         let _ = std::fs::remove_file(&s.path);

@@ -212,6 +212,32 @@ impl Bridge {
         }
     }
 
+    /// 发送者展示名解析（#74 历史/提醒展示用，8-20 用户反馈：显示名字不是 id）：
+    /// 本地授权者名单优先（授权时已反查过名字），未授权用户 API 反查（best-effort）。
+    /// 空 = 未查到（GUI 回落 id）。
+    async fn resolve_sender_name(&self, sender_id: &str) -> String {
+        // 本地名单名字先克隆（释放 &self 借用——跨 await 持有引用会让 future 非 Send）
+        let local = {
+            let infos = if self.bot.is_dingtalk() {
+                &self.bot.ding_granted_infos
+            } else {
+                &self.bot.granted_infos
+            };
+            infos
+                .iter()
+                .find(|i| i.open_id == sender_id)
+                .map(|i| i.name.clone())
+                .filter(|n| !n.is_empty())
+        };
+        if let Some(n) = local {
+            return n;
+        }
+        self.msgr
+            .user_display_name(sender_id)
+            .await
+            .unwrap_or_default()
+    }
+
     /// 热读 config 推导（准入, 发送者角色）——on_payload / on_dingtalk 共用同一份
     /// load+find+快照回落，避免两个入口各写一份导致准入与角色推导漂移
     /// （同一发送者在不同通道被推导成不同角色 = 授权者拿到 owner 权限或反之）。
@@ -526,22 +552,23 @@ impl Bridge {
                             .text
                             .trim()
                             .to_string();
+                    // 展示名：未授权用户不在本地名单，API 反查（best-effort，8-20 用户
+                    // 反馈：提醒/历史要显示名字不是 open_id；失败空串由 GUI 回落 id）
+                    let uname = self
+                        .msgr
+                        .user_display_name(sender_id)
+                        .await
+                        .unwrap_or_default();
                     self.msgstore.insert(
                         &self.bot.key(),
                         &chat_id,
                         &mid,
                         "user",
                         sender_id,
+                        &uname,
                         &text,
                         ts,
                     );
-                    // 展示名：未授权用户不在本地名单，API 反查（best-effort，8-20 用户
-                    // 反馈：提醒要显示名字不是 open_id；失败空串由 GUI 回落 id）
-                    let uname = self
-                        .msgr
-                        .user_display_name(sender_id)
-                        .await
-                        .unwrap_or_default();
                     self.unread.report(
                         &self.bot.key(),
                         sender_id,
@@ -1054,6 +1081,14 @@ impl Bridge {
         // 提醒是纯本地 UI（托盘红点 + 弹窗），绝不主动向任何 IM 发消息（授权边界规则）。
         let record_granted = ev.role == crate::config::SenderRole::Granted
             && (ev.chat_type == "p2p" || ev.chat_type == "dm");
+        // 发送者展示名：**锁外解析**（API 反查是 await——在代际锁/串行锁内 await 会让
+        // std MutexGuard 跨 await → future 非 Send，见审查）。本地名单优先，未授权 API。
+        // 未授权私聊的名字在 on_payload 未授权分支解析（不走 handle），这里只管 granted。
+        let granted_uname = if record_granted {
+            self.resolve_sender_name(&ev.sender_id).await
+        } else {
+            String::new()
+        };
 
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
@@ -1179,22 +1214,25 @@ impl Bridge {
             // 重复提醒（弹窗/红点以「这条消息提醒过没」为准，不以收到几次为准）。
             if record_granted {
                 let user_text = history_user_text(&text, &ev);
+                // 展示名：锁外已解析（granted_uname；本地名单优先/API 反查）——
+                // 历史/提醒都显示名字（8-20 用户反馈，不显示 open_id）
                 let inserted = self.msgstore.insert(
                     &self.bot.key(),
                     &ev.chat_id,
                     &ev.mid,
                     "user",
                     &ev.sender_id,
+                    &granted_uname,
                     &user_text,
                     ev.ts,
                 );
                 if inserted {
-                    // 未读提醒：只记发送者 id + 摘要（40 字符预览）。展示名：授权者在
-                    // 本地名单（GUI 反查）；未授权者由入队处 API 反查带 name（见下）。
+                    // 未读提醒：只记发送者 id + 名字 + 摘要（40 字符预览）。
+                    // insert 返回真正插入才提醒——重放同 mid 被 UNIQUE 挡住 → 不重复
                     self.unread.report(
                         &self.bot.key(),
                         &ev.sender_id,
-                        "",
+                        &granted_uname,
                         &crate::agent::truncate(&user_text, 40),
                         ev.ts,
                     );
@@ -1350,6 +1388,7 @@ impl Bridge {
                                 &ev.mid,
                                 "assistant",
                                 &ev.sender_id,
+                                "", // assistant 行 GUI 显示 bot 名（direction 区分）
                                 &reply,
                                 crate::chrono_lite::unix_secs() as i64,
                             );
@@ -1500,6 +1539,7 @@ impl Bridge {
                                 &item.mid,
                                 "assistant",
                                 &item.sender_id,
+                                "", // assistant 行 GUI 显示 bot 名
                                 reply,
                                 crate::chrono_lite::unix_secs() as i64,
                             );
@@ -1638,23 +1678,26 @@ impl Bridge {
             // #74 扩展（8-20 用户反馈，与飞书对称）：未授权单聊也提醒 + 落历史；
             // 钉钉事件无时间字段 → 当前秒；授权码消费成功（上面 return）的不提醒
             if is_p2p && !msg.mid.is_empty() {
+                // 展示名：未授权用户不在本地名单，API 反查（best-effort）
+                let uname = self
+                    .msgr
+                    .user_display_name(&msg.sender_staff_id)
+                    .await
+                    .unwrap_or_default();
                 self.msgstore.insert(
                     &self.bot.key(),
                     &chat_id,
                     &msg.mid,
                     "user",
                     &msg.sender_staff_id,
+                    &uname,
                     &msg.text,
                     crate::chrono_lite::unix_secs() as i64,
                 );
                 self.unread.report(
                     &self.bot.key(),
                     &msg.sender_staff_id,
-                    &self
-                        .msgr
-                        .user_display_name(&msg.sender_staff_id)
-                        .await
-                        .unwrap_or_default(),
+                    &uname,
                     &crate::agent::truncate(&msg.text, 40),
                     crate::chrono_lite::unix_secs() as i64,
                 );
@@ -3290,6 +3333,7 @@ mod tests {
                 mid,
                 "user",
                 "ou_friend",
+                "",
                 "帮我查一下",
                 1000
             ),
@@ -3336,6 +3380,7 @@ mod tests {
                 mid,
                 "assistant",
                 "ou_friend",
+                "",
                 "补发的回复",
                 2000
             ),

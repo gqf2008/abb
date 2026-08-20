@@ -674,8 +674,12 @@ fn history_to_row(r: &crate::msgstore::MsgRow, cfg: &Config) -> HistoryRow {
     let (bot_name, sender) = resolve_display(cfg, &r.bot_key, &r.sender_id);
     // 审查跟进：assistant 行（bot 回复）发送者列显示 bot 名——回复来自 bot 而非
     // 授权者，否则「授权者名 + 回复」标签语义错位。
+    // user 行优先落库时的 sender_name（未授权用户 API 反查的真实名字；8-20 用户
+    // 反馈：历史记录显示名字而不是 open_id），回落本地名单/id。
     let sender = if r.direction == "assistant" {
         bot_name.clone()
+    } else if !r.sender_name.is_empty() {
+        r.sender_name.clone()
     } else {
         sender
     };
