@@ -84,6 +84,8 @@ enum UiCmd {
         chat_id: String,
         name: String,
         prompt: String,
+        /// owner open_id（权限不足时发授权指引；None = 未配置则不提示）。
+        owner: Option<String>,
     },
     /// 手动登记（#75 降级路径）：只写登记表，不调平台 API（平台手动建群后登记）。
     VirtualBotRegister {
@@ -103,6 +105,8 @@ enum UiCmd {
         app_id: String,
         app_secret: String,
         chat_id: String,
+        /// owner open_id（权限不足时发授权指引；None = 未配置则不提示）。
+        owner: Option<String>,
     },
     /// 编辑预填：拉平台群资料（(群名, 群介绍)）→ 回填弹窗。
     VirtualBotFetchInfo {
@@ -153,6 +157,8 @@ enum VbAction {
         app_id: String,
         app_secret: String,
         chat_id: String,
+        /// owner open_id（权限不足时发授权指引给 owner；None = 未配置则不提示）。
+        owner: Option<String>,
     },
 }
 
@@ -1158,12 +1164,14 @@ pub fn run_gui() -> Result<()> {
                         app_id,
                         app_secret,
                         chat_id,
+                        owner,
                     } => UiCmd::VirtualBotDisband {
                         bot_key,
                         kind,
                         app_id,
                         app_secret,
                         chat_id,
+                        owner,
                     },
                 });
             }
@@ -1678,7 +1686,37 @@ pub fn run_gui() -> Result<()> {
                                         } else {
                                             e
                                         };
-                                        results.push((name, Err(e)));
+                                        // 飞书权限不足：给 owner 私聊发授权指引（可执行下一步）
+                                        let mut notified = false;
+                                        if kind == "feishu" {
+                                            if let (Some(owner), Some((scopes, link))) =
+                                                (&owner, crate::feishu::scope_hint(&e))
+                                            {
+                                                let fs =
+                                                    FeishuClient::new(&app_id, &app_secret);
+                                                let msg = format!(
+                                                    "⚠️ 虚拟 Bot 操作需要飞书授权\n\
+                                                     操作「创建虚拟 Bot」被拒绝：应用缺少权限 {scopes}\n\
+                                                     请点击开通（任选其一）：\n{link}\n\
+                                                     开通后重新操作即可。"
+                                                );
+                                                crate::log!(
+                                                    "[gui] 创建失败权限不足，向 owner 发送授权指引"
+                                                );
+                                                if fs.send_text_to_user(owner, &msg).await.is_ok()
+                                                {
+                                                    notified = true;
+                                                }
+                                            }
+                                        }
+                                        results.push((
+                                            name,
+                                            Err(if notified {
+                                                format!("{e}（已向 owner 发送授权指引）")
+                                            } else {
+                                                e
+                                            }),
+                                        ));
                                     }
                                 }
                             }
@@ -1693,6 +1731,7 @@ pub fn run_gui() -> Result<()> {
                         chat_id,
                         name,
                         prompt,
+                        owner,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
@@ -1709,7 +1748,7 @@ pub fn run_gui() -> Result<()> {
                                 }
                             }
                             .await;
-                            let result = match r {
+                            let mut result = match r {
                                 Ok(()) => match VirtualBotStore::new().update_role(
                                     &bot_key,
                                     &chat_id,
@@ -1720,6 +1759,31 @@ pub fn run_gui() -> Result<()> {
                                 },
                                 Err(e) => Err(e),
                             };
+                            // 权限不足（飞书 99991672）：给 owner 私聊发授权指引
+                            if let (Err(e), Some(owner)) = (&result, &owner) {
+                                if kind == "feishu" {
+                                    if let Some((scopes, link)) = crate::feishu::scope_hint(e) {
+                                        let fs = FeishuClient::new(&app_id, &app_secret);
+                                        let msg = format!(
+                                            "⚠️ 虚拟 Bot 操作需要飞书授权\n\
+                                             操作「编辑群资料」被拒绝：应用缺少权限 {scopes}\n\
+                                             请点击开通（任选其一）：\n{link}\n\
+                                             开通后重新操作即可。"
+                                        );
+                                        crate::log!("[gui] 编辑失败权限不足，向 owner 发送授权指引");
+                                        match fs.send_text_to_user(owner, &msg).await {
+                                            Ok(()) => {
+                                                result = Err(format!(
+                                                    "{e}（已向 owner 发送授权指引）"
+                                                ));
+                                            }
+                                            Err(se) => crate::log!(
+                                                "[gui] 向 owner 发送授权指引失败: {se:#}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
                             let _ = vb_tx.send(VirtualBotEvt::Done {
                                 results: vec![(name, result)],
                             });
@@ -1784,6 +1848,7 @@ pub fn run_gui() -> Result<()> {
                         app_id,
                         app_secret,
                         chat_id,
+                        owner,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
@@ -1811,13 +1876,43 @@ pub fn run_gui() -> Result<()> {
                                 }
                             }
                             .await;
-                            let result = match r {
+                            let mut result = match r {
                                 Ok(()) => {
                                     store.remove(&bot_key, &chat_id);
                                     Ok("群已解散，登记已移除".to_string())
                                 }
                                 Err(e) => Err(format!("解散失败（登记保留）：{e}")),
                             };
+                            // 权限不足（飞书 99991672）：给 owner 私聊发授权指引——平台权限
+                            // 问题不该只躺在状态行/日志里，owner 需要可执行的下一步。
+                            if let Err(e) = &result {
+                                if let Some(owner) = &owner {
+                                    if kind == "feishu" {
+                                        if let Some((scopes, link)) =
+                                            crate::feishu::scope_hint(e)
+                                        {
+                                            let fs = FeishuClient::new(&app_id, &app_secret);
+                                            let msg = format!(
+                                                "⚠️ 虚拟 Bot 操作需要飞书授权\n\
+                                                 操作「解散群」被拒绝：应用缺少权限 {scopes}\n\
+                                                 请点击开通（任选其一）：\n{link}\n\
+                                                 开通后重新操作即可。"
+                                            );
+                                            crate::log!("[gui] 权限不足，向 owner 发送授权指引");
+                                            match fs.send_text_to_user(owner, &msg).await {
+                                                Ok(()) => {
+                                                    result = Err(format!(
+                                                        "解散失败（登记保留）：{e}（已向 owner 发送授权指引）"
+                                                    ));
+                                                }
+                                                Err(se) => crate::log!(
+                                                    "[gui] 向 owner 发送授权指引失败: {se:#}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             crate::log!(
                                 "[gui] 解散群结果: {}",
                                 match &result {
@@ -2533,6 +2628,7 @@ pub fn run_gui() -> Result<()> {
                             chat_id,
                             name,
                             prompt,
+                            owner: owner.clone(),
                         });
                     }
                 }
@@ -2710,6 +2806,8 @@ pub fn run_gui() -> Result<()> {
                 app_id: bot.app_id.clone(),
                 app_secret: bot.app_secret.clone(),
                 chat_id: reg.chat_id.clone(),
+                // owner 用于权限不足时发授权指引（白名单取首个，None=未配置）
+                owner: crate::config::first_owner_id(&bot.owner_open_id),
             });
             if let Some(c) = confirm.upgrade() {
                 c.set_title_text("解散群（不可恢复）".into());

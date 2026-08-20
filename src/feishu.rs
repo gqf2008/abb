@@ -544,6 +544,7 @@ impl FeishuClient {
     }
 
     /// 解散群（虚拟 Bot 解散：DELETE /im/v1/chats/:chat_id，不可恢复——GUI 侧强确认）。
+    /// 需要应用开通 im:chat 或 im:chat:delete 权限（99991672 权限拒绝见 scope_hint）。
     pub async fn delete_chat(&self, chat_id: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
@@ -563,6 +564,79 @@ impl FeishuClient {
         }
         Ok(())
     }
+
+    /// 按 open_id 给用户私聊发消息（receive_id_type=open_id）。
+    /// 用途：权限不足时给 owner 发授权指引（见 scope_hint）。与 send_text 同款
+    /// 卡片 markdown 分段，只是收件人从 chat_id 换成 open_id（不依赖 primary_chat
+    /// 是否可用）。
+    pub async fn send_text_to_user(&self, open_id: &str, text: &str) -> Result<()> {
+        let token = self.tenant_token().await?;
+        let chunks = split_text(text, FEISHU_MSG_LIMIT);
+        let n = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let body_text = if n > 1 {
+                format!("（{}/{n}）\n{}", i + 1, chunk)
+            } else {
+                chunk
+            };
+            let resp: serde_json::Value = self
+                .http
+                .post(self.url("/im/v1/messages?receive_id_type=open_id"))
+                .bearer_auth(&token)
+                .json(&json!({
+                    "receive_id": open_id,
+                    "msg_type": "interactive",
+                    "content": serde_json::to_string(&json!({
+                        "elements": [{"tag":"markdown","content": body_text}]
+                    }))?,
+                }))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+                anyhow::bail!(
+                    "发给用户失败 code={:?} msg={:?}",
+                    resp.get("code"),
+                    resp.get("msg")
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 飞书权限不足错误识别（8-20 实测：code=99991672 Access denied，错误文本带 scope
+/// 列表与授权链接）。返回 (需要的 scope 摘要, 授权链接)。ABB 用它给 owner 发授权指引——
+/// 平台权限问题不该只躺在日志/状态行里，owner 需要可执行的下一步。
+/// 参数是任意 API 失败后的完整错误字符串（含 code=… msg=…，见各方法 bail 格式）；
+/// 检测「99991672 或 Access denied」出现才解析，避免误判其它错误码。
+pub fn scope_hint(err: &str) -> Option<(String, String)> {
+    if !err.contains("99991672") && !err.contains("Access denied") {
+        return None;
+    }
+    // msg 里的 scope 列表：[im:chat, im:chat:delete]（取 [] 内原文）
+    let scopes = err
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .unwrap_or("（详见授权链接）")
+        .to_string();
+    // msg 里的授权链接：https://open.feishu.cn/app/...——链接常紧跟在「即可：」等
+    // 中文标点后（同一 token 内），不能用 starts_with 匹配整个 token，改为 contains
+    // 定位后截断（实测错误串就是「…即可：https://…」形态，8-20 真机样例）。
+    // 无链接给不出则 None——调用方发不带链接的提示。
+    err.split_whitespace()
+        .find(|w| w.contains("https://open.feishu.cn/app/"))
+        .and_then(|w| {
+            w.find("https://open.feishu.cn/app/")
+                .map(|i| w[i..].to_string())
+        })
+        .map(|s| {
+            s.trim_end_matches(['，', '。', ',', '.', '"', '\''])
+                .to_string()
+        })
+        .map(|l| (scopes, l))
 }
 
 /// 构造话题回复请求体（纯函数，便于单测断言 msg_type/reply_in_thread/content）。
@@ -872,6 +946,52 @@ mod tests {
         assert_eq!(recs[1].method, "DELETE");
         assert_eq!(recs[1].path, "/im/v1/chats/oc_vb_1");
         assert_eq!(recs[1].auth, "Bearer mock-token");
+    }
+
+    #[test]
+    fn scope_hint_parses_real_access_denied_error() {
+        // 8-20 真机实测的错误串（解散群被拒）：应解析出 scope 列表与授权链接
+        let err = "解散群失败 code=99991672 msg=\"Access denied. One of the following scopes is required: [im:chat, im:chat:delete].应用尚未开通所需的应用身份权限：[im:chat, im:chat:delete]，点击链接申请并开通任一权限即可：https://open.feishu.cn/app/cli_a75884b6c733900b/auth?q=im:chat,im:chat:delete&op_from=openapi&token_type=tenant\"";
+        let (scopes, link) = scope_hint(err).expect("应识别出权限不足");
+        assert_eq!(
+            scopes, "im:chat, im:chat:delete",
+            "scope 列表取自错误文本 []"
+        );
+        assert!(
+            link.starts_with("https://open.feishu.cn/app/"),
+            "授权链接应被提取: {link}"
+        );
+    }
+
+    #[test]
+    fn scope_hint_ignores_non_scope_errors() {
+        assert!(scope_hint("创建群失败 code=99992000 msg=unknown").is_none());
+        assert!(scope_hint("网络超时").is_none());
+        assert!(scope_hint("").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_text_to_user_uses_open_id_receive_type() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/messages".to_string()),
+            json!({"code": 0, "msg": "success", "data": {"message_id": "om_1"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        fs.send_text_to_user("ou_boss", "请开通权限：https://x")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs[1].method, "POST");
+        assert_eq!(recs[1].path, "/im/v1/messages");
+        assert_eq!(
+            recs[1].query, "receive_id_type=open_id",
+            "发给用户必须走 open_id 接收类型"
+        );
+        let body: serde_json::Value = serde_json::from_str(&recs[1].body).unwrap();
+        assert_eq!(body["receive_id"], "ou_boss");
+        assert_eq!(body["msg_type"], "interactive");
     }
 }
 
