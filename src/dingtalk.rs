@@ -1209,8 +1209,7 @@ mod tests {
         assert_eq!(create.method, "POST");
         assert_eq!(create.path, "/topapi/im/chat/create");
         assert_eq!(
-            create.query,
-            "access_token=dt-mock-token",
+            create.query, "access_token=dt-mock-token",
             "topapi 鉴权走 query 参数（旧网关约定）"
         );
         let body: Value = serde_json::from_str(&create.body).unwrap();

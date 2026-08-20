@@ -7,10 +7,17 @@
 //! 打开日志/目录走 platform::open_path（跨平台）。
 
 use crate::config::{BotConfig, Config, ProviderConfig};
+use crate::dingtalk::DingTalkClient;
 use crate::feishu::FeishuClient;
 use crate::install;
 use crate::platform;
+use crate::virtualbot::{
+    builtin_templates, format_created, RoleTemplate, VirtualBot, VirtualBotStore, ROLE_NAME_MAX,
+    ROLE_PROMPT_MAX,
+};
 use anyhow::Result;
+// Model trait 导入：ModelRc 的方法（row_count/row_data/set_row_data）在 trait 上
+use slint::Model as _;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
@@ -56,6 +63,52 @@ enum UiCmd {
     },
     /// 下载并安装已发现的新版本，成功安装后退出本进程（新版由分离脚本/安装器拉起）。
     InstallUpdate,
+    /// 虚拟 Bot 批量创建（#75）：逐群调平台 API（现造 FeishuClient/DingTalkClient，
+    /// 与 FetchBotInfo 同路径——后台线程不依赖 service 进程）→ 成功后写登记表。
+    /// items = (角色名, 提示词)。
+    VirtualBotCreate {
+        bot_key: String,
+        kind: String,
+        app_id: String,
+        app_secret: String,
+        items: Vec<(String, String)>,
+    },
+    /// 编辑保存：PATCH 平台群资料（改名/改介绍）+ 登记表角色名同步。
+    VirtualBotUpdate {
+        bot_key: String,
+        kind: String,
+        app_id: String,
+        app_secret: String,
+        chat_id: String,
+        name: String,
+        prompt: String,
+    },
+    /// 手动登记（#75 降级路径）：只写登记表，不调平台 API（平台手动建群后登记）。
+    VirtualBotRegister {
+        bot_key: String,
+        name: String,
+        chat_id: String,
+    },
+    /// 取消登记（平台群保留，只删 ABB 登记）。
+    VirtualBotDeregister {
+        bot_key: String,
+        chat_id: String,
+    },
+    /// 解散群（红色强确认后）：调平台删除接口 + 移除登记。仅飞书有解散 API。
+    VirtualBotDisband {
+        bot_key: String,
+        kind: String,
+        app_id: String,
+        app_secret: String,
+        chat_id: String,
+    },
+    /// 编辑预填：拉平台群资料（(群名, 群介绍)）→ 回填弹窗。
+    VirtualBotFetchInfo {
+        kind: String,
+        app_id: String,
+        app_secret: String,
+        chat_id: String,
+    },
 }
 
 /// 微信扫码登录的阶段结果（后台 → 主线程）。
@@ -66,6 +119,39 @@ enum WxEvt {
     Confirmed(i32, crate::wechat::WeixinLogin),
     /// 失败/过期。
     Failed(String),
+}
+
+/// 虚拟 Bot 操作结果（#75，后台 → 主线程）：创建/编辑/登记/解散统一形状。
+/// 走 std mpsc（与 dep_rx/prov_rx 同模式：主线程 2s 定时器轮询，不阻塞事件循环）。
+enum VirtualBotEvt {
+    /// 批量创建进度：done=已完成数（0-based），total=总数。弹窗显示「创建中 N/total」。
+    Progress { done: usize, total: usize },
+    /// 全部结束：逐项结果（角色名 → Ok(摘要) / Err(错误文案)）。
+    Done {
+        results: Vec<(String, std::result::Result<String, String>)>,
+    },
+    /// 编辑预填：平台群资料已拉回（name/desc 回填弹窗；error=读取失败文案）。
+    Fetched {
+        chat_id: String,
+        name: String,
+        desc: String,
+        error: Option<String>,
+    },
+}
+
+/// 确认弹窗待执行的虚拟 Bot 操作（#75）：取消登记（轻确认）/ 解散群（红色强确认）。
+/// 主线程持有；弹确认窗前写入，确认回调里 take 并发送对应 UiCmd，取消/关闭时清空。
+enum VbAction {
+    /// 取消登记：平台群保留，只删 ABB 登记。
+    Deregister { bot_key: String, chat_id: String },
+    /// 解散群：调平台删除接口（仅飞书有）+ 移除登记，不可恢复。
+    Disband {
+        bot_key: String,
+        kind: String,
+        app_id: String,
+        app_secret: String,
+        chat_id: String,
+    },
 }
 
 /// 依赖安装的结果事件（后台 → 主线程）。
@@ -223,11 +309,13 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
 /// 把设置窗四份工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
 /// 保证两种路径行为一致：bots 保留运行期字段、供应商密钥留空沿用旧值、默认供应商防悬空）。
 /// 返回 (Config, 丢弃的未命名供应商数)。
+#[allow(clippy::too_many_arguments)]
 fn snapshot_config(
     work: &RefCell<Vec<BotConfig>>,
     providers_work: &RefCell<Vec<ProviderConfig>>,
     default_provider_work: &RefCell<String>,
     cross_delivery_work: &RefCell<bool>,
+    templates_work: &RefCell<Vec<RoleTemplate>>,
 ) -> (Config, usize) {
     let mut c = Config::load().unwrap_or_default();
     // 用工作副本整体替换 bots（保留每个 bot 运行期的 primary_chat_id）
@@ -279,7 +367,113 @@ fn snapshot_config(
     } else {
         String::new()
     };
+    // 虚拟 Bot 自定义角色模板（#75）：弹窗里管理的工作副本，随保存写盘
+    c.custom_roles = templates_work.borrow().clone();
     (c, dropped)
+}
+
+/// 虚拟 Bot 登记行（#75）：按 bot 读登记表 → slint 行。
+fn vb_rows_for(bot: &BotConfig) -> Vec<VirtualBotRow> {
+    VirtualBotStore::new()
+        .load_for(&bot.key())
+        .into_iter()
+        .map(|v| VirtualBotRow {
+            role_name: v.role_name.clone().into(),
+            platform: kind_label(&bot.kind).into(),
+            chat_id: v.chat_id.clone().into(),
+            created_at: format_created(v.created_at).into(),
+        })
+        .collect()
+}
+
+/// 刷新设置窗「虚拟 Bot」登记列表（选中 bot 维度；Rust 侧各操作完成后调用）。
+fn refresh_vb_rows(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let sel = w.get_selected();
+    if sel < 0 {
+        return;
+    }
+    if let Some(bot) = work.borrow().get(sel as usize) {
+        w.set_virtual_bots(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            vb_rows_for(bot),
+        ))));
+    }
+}
+
+/// 同步弹窗模板列表 = 内置（前 builtin-count 个，不可编辑）+ 自定义（工作副本）。
+fn sync_vb_templates(dlg: &VirtualBotDialog, templates_work: &RefCell<Vec<RoleTemplate>>) {
+    let mut rows: Vec<RoleTemplateRow> = builtin_templates()
+        .iter()
+        .map(|t| RoleTemplateRow {
+            name: t.name.clone().into(),
+            prompt: t.prompt.clone().into(),
+            checked: false,
+        })
+        .collect();
+    for t in templates_work.borrow().iter() {
+        rows.push(RoleTemplateRow {
+            name: t.name.clone().into(),
+            prompt: t.prompt.clone().into(),
+            checked: false,
+        });
+    }
+    dlg.set_templates(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+    dlg.set_builtin_count(builtin_templates().len() as i32);
+    dlg.set_selected_count(0);
+}
+
+/// 弹窗校验提示（hint-error=true 红色报错 / false 灰色说明）。
+fn vb_hint(dlg: &VirtualBotDialog, text: &str, is_error: bool) {
+    dlg.set_hint_text(text.into());
+    dlg.set_hint_error(is_error);
+}
+
+/// 打开虚拟 Bot 弹窗（#75）：按模式预填 + 清空上次操作的残留（结果/进度/提示）。
+/// 创建/登记模式由「＋ 创建虚拟 Bot」进入；编辑模式由列表项进入（预填来自登记 +
+/// 平台群资料，见 VirtualBotFetchInfo 回填）。
+#[allow(clippy::too_many_arguments)]
+fn vb_open_dialog(
+    dlg: &VirtualBotDialog,
+    bot: &BotConfig,
+    mode: i32,
+    edit: Option<(&VirtualBot, &str, &str)>, // 编辑模式：登记 + (群名, 群介绍) 预填
+    templates_work: &RefCell<Vec<RoleTemplate>>,
+) {
+    let (title, name, prompt) = match edit {
+        Some((_reg, n, p)) => ("编辑虚拟 Bot", n.to_string(), p.to_string()),
+        None => ("创建虚拟 Bot", String::new(), String::new()),
+    };
+    dlg.set_window_title(title.into());
+    dlg.set_bot_label(if bot.name.is_empty() {
+        format!("（{}）", kind_label(&bot.kind)).into()
+    } else {
+        bot.name.clone().into()
+    });
+    dlg.set_platform_label(kind_label(&bot.kind).into());
+    dlg.set_mode(mode);
+    dlg.set_name_input(name.as_str().into());
+    dlg.set_prompt_input(prompt.as_str().into());
+    dlg.set_prefix_input("".into());
+    dlg.set_register_chat_id("".into());
+    dlg.set_edit_chat_id(
+        edit.map(|(r, _, _)| r.chat_id.clone())
+            .unwrap_or_default()
+            .into(),
+    );
+    dlg.set_busy(false);
+    dlg.set_progress_text("".into());
+    dlg.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<
+        slint::SharedString,
+    >::new(
+    )))));
+    dlg.set_template_editing(false);
+    dlg.set_template_edit_idx(-1);
+    dlg.set_template_edit_name("".into());
+    dlg.set_template_edit_prompt("".into());
+    // 预填内容的字符计数（与编辑回调同口径：chars().count()，中文安全）
+    dlg.set_name_count(name.chars().count() as i32);
+    dlg.set_prompt_count(prompt.chars().count() as i32);
+    vb_hint(dlg, "", false);
+    sync_vb_templates(dlg, templates_work);
 }
 
 /// is_configured 的廉价缓存：按 config.json 的 mtime 失效，避免每 2s 全量读+解析。
@@ -604,6 +798,9 @@ pub fn run_gui() -> Result<()> {
     tray.set_version(env!("CARGO_PKG_VERSION").into());
     let qr_dialog = QrDialog::new()?;
     let unsaved_dialog = UnsavedDialog::new()?;
+    // 虚拟 Bot（#75）：创建/编辑/登记弹窗 + 取消登记/解散群确认弹窗
+    let vb_dialog = VirtualBotDialog::new()?;
+    let vb_confirm = ConfirmDialog::new()?;
     // 设置窗编辑脏标记：任何字段/开关被改过 → true；保存/重新加载 → false。
     // 有未保存修改时，关闭/取消要先弹确认，避免静默丢编辑（红点/按钮都走这条保护）。
     let dirty = Rc::new(Cell::new(false));
@@ -637,6 +834,29 @@ pub fn run_gui() -> Result<()> {
             }
             EventResult::Propagate
         });
+        // 虚拟 Bot 弹窗/确认弹窗：红点关闭 = 隐藏（同 QrDialog；busy 时禁止关闭防半途退出）
+        {
+            let vb_dw = vb_dialog.as_weak();
+            vb_dialog.window().on_winit_window_event(move |_w, ev| {
+                if matches!(ev, WindowEvent::CloseRequested)
+                    && vb_dw.upgrade().map(|d| d.get_busy()).unwrap_or(false)
+                {
+                    return EventResult::PreventDefault; // 创建中：不让用户关掉弹窗丢进度
+                }
+                if matches!(ev, WindowEvent::CloseRequested) {
+                    #[cfg(target_os = "macos")]
+                    platform::hide_dock();
+                }
+                EventResult::Propagate
+            });
+        }
+        vb_confirm.window().on_winit_window_event(|_w, ev| {
+            if matches!(ev, WindowEvent::CloseRequested) {
+                #[cfg(target_os = "macos")]
+                platform::hide_dock();
+            }
+            EventResult::Propagate
+        });
     }
 
     // 取消按钮：关掉二维码弹窗（登录轮询会自然超时结束）
@@ -650,6 +870,19 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
+    // 虚拟 Bot 弹窗关闭：busy 时禁用（创建中不能关，见窗口事件拦截）；关闭 = 隐藏
+    {
+        let dw = vb_dialog.as_weak();
+        vb_dialog.on_close_clicked(move || {
+            if let Some(d) = dw.upgrade() {
+                if !d.get_busy() {
+                    let _ = d.hide();
+                    platform::hide_dock();
+                }
+            }
+        });
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<UiCmd>();
     let (bot_tx, bot_rx) =
         std_mpsc::channel::<(i32, std::result::Result<(String, String), String>)>();
@@ -657,6 +890,57 @@ pub fn run_gui() -> Result<()> {
     // 依赖安装 / 供应商测试结果（后台 → 主线程）
     let (dep_tx, dep_rx) = std_mpsc::channel::<DepEvt>();
     let (prov_tx, prov_rx) = std_mpsc::channel::<(i32, std::result::Result<String, String>)>();
+    // 虚拟 Bot 操作结果（创建/编辑/登记/解散/预填）
+    let (vb_tx, vb_rx) = std_mpsc::channel::<VirtualBotEvt>();
+    // 虚拟 Bot 弹窗的归属 bot 上下文（bot 下标, bot_key, kind）——打开时记录，
+    // 点「创建」时按下标从工作副本取最新 app_id/app_secret（用户可能刚改过没保存）。
+    let vb_ctx: Rc<RefCell<Option<(i32, String, String)>>> = Rc::new(RefCell::new(None));
+    // 确认弹窗待执行操作（确认回调 take；取消/关闭清空）
+    let vb_action: Rc<RefCell<Option<VbAction>>> = Rc::new(RefCell::new(None));
+    // 确认弹窗：取消 = 清空待执行操作并隐藏
+    {
+        let cw = vb_confirm.as_weak();
+        let action = vb_action.clone();
+        vb_confirm.on_canceled(move || {
+            action.borrow_mut().take();
+            if let Some(c) = cw.upgrade() {
+                let _ = c.hide();
+                platform::hide_dock();
+            }
+        });
+    }
+    // 确认弹窗：确认 = 执行待操作（按 VbAction 分发到后台线程）
+    {
+        let cw = vb_confirm.as_weak();
+        let action = vb_action.clone();
+        let tx = tx.clone();
+        vb_confirm.on_confirmed(move || {
+            if let Some(a) = action.borrow_mut().take() {
+                let _ = tx.send(match a {
+                    VbAction::Deregister { bot_key, chat_id } => {
+                        UiCmd::VirtualBotDeregister { bot_key, chat_id }
+                    }
+                    VbAction::Disband {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                        chat_id,
+                    } => UiCmd::VirtualBotDisband {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                        chat_id,
+                    },
+                });
+            }
+            if let Some(c) = cw.upgrade() {
+                let _ = c.hide();
+                platform::hide_dock();
+            }
+        });
+    }
 
     // ── 设置窗工作副本 + 列表 model ──
     let bots_model: Rc<slint::VecModel<BotRow>> = Rc::new(slint::VecModel::default());
@@ -694,6 +978,8 @@ pub fn run_gui() -> Result<()> {
     let default_provider_work: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     // 跨会话投递总开关工作副本（#21）
     let cross_delivery_work: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    // 虚拟 Bot 自定义角色模板工作副本（#75）：弹窗内管理，随「保存」写盘
+    let templates_work: Rc<RefCell<Vec<RoleTemplate>>> = Rc::new(RefCell::new(Vec::new()));
     settings.set_providers(slint::ModelRc::from(providers_model.clone()));
 
     /// 供 bot Tab 的供应商下拉：第一项 ""（=跟随全局默认），后接各供应商 name。
@@ -719,6 +1005,7 @@ pub fn run_gui() -> Result<()> {
         providers_model: &slint::VecModel<ProviderRow>,
         default_provider_work: &RefCell<String>,
         cross_delivery_work: &RefCell<bool>,
+        templates_work: &RefCell<Vec<RoleTemplate>>,
     ) {
         *work.borrow_mut() = c.bots.clone();
         sync_model(model, &c.bots);
@@ -726,6 +1013,8 @@ pub fn run_gui() -> Result<()> {
         *default_provider_work.borrow_mut() = c.default_provider.clone();
         *cross_delivery_work.borrow_mut() = c.cross_delivery_enabled;
         w.set_cross_delivery_enabled(c.cross_delivery_enabled);
+        // 虚拟 Bot 自定义角色模板（#75）：工作副本装载；登记列表按选中 bot 刷新
+        *templates_work.borrow_mut() = c.custom_roles.clone();
         sync_providers_model(providers_model, &c.providers, &c.default_provider);
         w.set_provider_names(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             build_provider_names(&c.providers),
@@ -740,6 +1029,8 @@ pub fn run_gui() -> Result<()> {
         push_deps_to_window(w);
         // 系统权限检测（macOS）：完全磁盘/辅助功能/屏幕录制/自动化。
         push_perms_to_window(w);
+        // 虚拟 Bot 登记列表（#75）：按选中 bot 刷新
+        refresh_vb_rows(w, work);
     }
 
     /// 装载设置窗：发现比正式配置新的草稿 → 静默恢复（返回 true，标记 dirty 并给一行提示）；
@@ -754,6 +1045,7 @@ pub fn run_gui() -> Result<()> {
         providers_model: &slint::VecModel<ProviderRow>,
         default_provider_work: &RefCell<String>,
         cross_delivery_work: &RefCell<bool>,
+        templates_work: &RefCell<Vec<RoleTemplate>>,
     ) -> bool {
         if Config::draft_is_newer() {
             let draft = Config::load_draft().unwrap_or_default();
@@ -766,6 +1058,7 @@ pub fn run_gui() -> Result<()> {
                 providers_model,
                 default_provider_work,
                 cross_delivery_work,
+                templates_work,
             );
             dirty.set(true);
             w.set_status_is_error(false);
@@ -782,6 +1075,7 @@ pub fn run_gui() -> Result<()> {
                 providers_model,
                 default_provider_work,
                 cross_delivery_work,
+                templates_work,
             );
             dirty.set(false);
             false
@@ -1049,6 +1343,237 @@ pub fn run_gui() -> Result<()> {
                             }
                         });
                     }
+                    // ── 虚拟 Bot（#75）：群管理操作。后台现造平台客户端（与
+                    // FetchBotInfo 同路径：GUI 进程自己调 API，不依赖 service）。
+                    // 结果统一经 vb_tx 回主线程（进度 + 逐项汇总）。
+                    UiCmd::VirtualBotCreate {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                        items,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            let total = items.len();
+                            let mut results = Vec::with_capacity(total);
+                            for (i, (name, prompt)) in items.into_iter().enumerate() {
+                                let _ = vb_tx.send(VirtualBotEvt::Progress { done: i, total });
+                                let r = async {
+                                    match kind.as_str() {
+                                        "dingtalk" => DingTalkClient::new(&app_id, &app_secret)
+                                            .create_chat(&name, &prompt)
+                                            .await
+                                            .map_err(|e| format!("{e:#}")),
+                                        _ => FeishuClient::new(&app_id, &app_secret)
+                                            .create_chat(&name, &prompt)
+                                            .await
+                                            .map_err(|e| format!("{e:#}")),
+                                    }
+                                }
+                                .await;
+                                match r {
+                                    Ok(chat_id) => {
+                                        // 群已建 → 写登记表（群名=角色名）
+                                        let reg = VirtualBot {
+                                            bot_key: bot_key.clone(),
+                                            chat_id: chat_id.clone(),
+                                            role_name: name.clone(),
+                                            created_at: crate::chrono_lite::unix_secs(),
+                                        };
+                                        match VirtualBotStore::new().add(reg) {
+                                            Ok(()) => results.push((
+                                                name,
+                                                Ok("已创建并登记".to_string()),
+                                            )),
+                                            Err(e) => results.push((
+                                                name,
+                                                Err(format!(
+                                                    "群已创建（chat_id={chat_id}）但登记失败：{e}，请用「手动登记」补登"
+                                                )),
+                                            )),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // 钉钉建群大概率失败（能力边界）：错误里带降级提示
+                                        let e = if kind == "dingtalk" {
+                                            format!(
+                                                "{e}（钉钉建群能力待实测：可手动建群后走「手动登记」）"
+                                            )
+                                        } else {
+                                            e
+                                        };
+                                        results.push((name, Err(e)));
+                                    }
+                                }
+                            }
+                            let _ = vb_tx.send(VirtualBotEvt::Done { results });
+                        });
+                    }
+                    UiCmd::VirtualBotUpdate {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                        chat_id,
+                        name,
+                        prompt,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            let r = async {
+                                match kind.as_str() {
+                                    "dingtalk" => DingTalkClient::new(&app_id, &app_secret)
+                                        .update_chat(&chat_id, &name, &prompt)
+                                        .await
+                                        .map_err(|e| format!("{e:#}")),
+                                    _ => FeishuClient::new(&app_id, &app_secret)
+                                        .update_chat(&chat_id, &name, &prompt)
+                                        .await
+                                        .map_err(|e| format!("{e:#}")),
+                                }
+                            }
+                            .await;
+                            let result = match r {
+                                Ok(()) => match VirtualBotStore::new().update_role(
+                                    &bot_key,
+                                    &chat_id,
+                                    &name,
+                                ) {
+                                    Ok(()) => Ok("已更新（平台 + 登记同步）".to_string()),
+                                    Err(e) => Err(format!("平台已更新，登记同步失败：{e}")),
+                                },
+                                Err(e) => Err(e),
+                            };
+                            let _ = vb_tx.send(VirtualBotEvt::Done {
+                                results: vec![(name, result)],
+                            });
+                        });
+                    }
+                    UiCmd::VirtualBotRegister {
+                        bot_key,
+                        name,
+                        chat_id,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            let reg = VirtualBot {
+                                bot_key,
+                                chat_id: chat_id.clone(),
+                                role_name: name.clone(),
+                                created_at: crate::chrono_lite::unix_secs(),
+                            };
+                            let result = match VirtualBotStore::new().add(reg) {
+                                Ok(()) => Ok("已登记".to_string()),
+                                Err(e) => Err(e),
+                            };
+                            let _ = vb_tx.send(VirtualBotEvt::Done {
+                                results: vec![(name, result)],
+                            });
+                        });
+                    }
+                    UiCmd::VirtualBotDeregister { bot_key, chat_id } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            let store = VirtualBotStore::new();
+                            // 结果行的名字用角色名（比 chat_id 可读）；查不到才回落 id
+                            let role = store
+                                .load()
+                                .into_iter()
+                                .find(|v| v.bot_key == bot_key && v.chat_id == chat_id)
+                                .map(|v| v.role_name)
+                                .unwrap_or_else(|| chat_id.clone());
+                            let ok = store.remove(&bot_key, &chat_id);
+                            let result = if ok {
+                                Ok("已取消登记（群保留）".to_string())
+                            } else {
+                                Err("该群不在登记表里（可能已被移除）".to_string())
+                            };
+                            let _ = vb_tx.send(VirtualBotEvt::Done {
+                                results: vec![(role, result)],
+                            });
+                        });
+                    }
+                    UiCmd::VirtualBotDisband {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                        chat_id,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            let store = VirtualBotStore::new();
+                            let role = store
+                                .load()
+                                .into_iter()
+                                .find(|v| v.bot_key == bot_key && v.chat_id == chat_id)
+                                .map(|v| v.role_name)
+                                .unwrap_or_else(|| chat_id.clone());
+                            // 先解散平台群（不可恢复；确认弹窗已挡过一次），成功再移除登记
+                            let r = async {
+                                match kind.as_str() {
+                                    "dingtalk" => Err("钉钉暂无解散群 API".to_string()),
+                                    _ => FeishuClient::new(&app_id, &app_secret)
+                                        .delete_chat(&chat_id)
+                                        .await
+                                        .map_err(|e| format!("{e:#}")),
+                                }
+                            }
+                            .await;
+                            let result = match r {
+                                Ok(()) => {
+                                    store.remove(&bot_key, &chat_id);
+                                    Ok("群已解散，登记已移除".to_string())
+                                }
+                                Err(e) => Err(format!("解散失败（登记保留）：{e}")),
+                            };
+                            let _ = vb_tx.send(VirtualBotEvt::Done {
+                                results: vec![(role, result)],
+                            });
+                        });
+                    }
+                    UiCmd::VirtualBotFetchInfo {
+                        kind,
+                        app_id,
+                        app_secret,
+                        chat_id,
+                    } => {
+                        let vb_tx = vb_tx.clone();
+                        tokio::spawn(async move {
+                            let r = async {
+                                match kind.as_str() {
+                                    "dingtalk" => DingTalkClient::new(&app_id, &app_secret)
+                                        .get_chat_info(&chat_id)
+                                        .await
+                                        .map_err(|e| format!("{e:#}")),
+                                    _ => FeishuClient::new(&app_id, &app_secret)
+                                        .get_chat_info(&chat_id)
+                                        .await
+                                        .map_err(|e| format!("{e:#}")),
+                                }
+                            }
+                            .await;
+                            match r {
+                                Ok((name, desc)) => {
+                                    let _ = vb_tx.send(VirtualBotEvt::Fetched {
+                                        chat_id,
+                                        name,
+                                        desc,
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = vb_tx.send(VirtualBotEvt::Fetched {
+                                        chat_id,
+                                        name: String::new(),
+                                        desc: String::new(),
+                                        error: Some(format!("{e:#}")),
+                                    });
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -1169,6 +1694,7 @@ pub fn run_gui() -> Result<()> {
                 &pmodel,
                 &dwork,
                 &cross_delivery_work,
+                &templates_work,
             );
             push_settings_status(&settings, &install::status());
             // 调试参数（--show-settings）不设误导的「未检测到」状态行
@@ -1191,6 +1717,7 @@ pub fn run_gui() -> Result<()> {
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
         let dirty_open = dirty.clone();
+        let twork = templates_work.clone();
         // 供托盘「设置…」与 Dock 点击共用的显示逻辑：草稿恢复 + 显示置前。
         // Dock 图标点击恢复窗口（no-frame 后系统标题栏窗口的默认 reopen 行为失效，
         // 2026-08-18 回归修复）走同款路径。
@@ -1205,6 +1732,7 @@ pub fn run_gui() -> Result<()> {
             let dock_dwork = default_provider_work.clone();
             let dock_cdwork = cross_delivery_work.clone();
             let dock_dirty = dirty.clone();
+            let dock_twork = templates_work.clone();
             crate::platform::install_dock_reopen(Box::new(move || {
                 if let Some(w) = dock_sw.upgrade() {
                     load_with_draft(
@@ -1216,6 +1744,7 @@ pub fn run_gui() -> Result<()> {
                         &dock_pmodel,
                         &dock_dwork,
                         &dock_cdwork,
+                        &dock_twork,
                     );
                     push_settings_status(&w, &install::status());
                     show_window_and_focus(&w);
@@ -1234,6 +1763,7 @@ pub fn run_gui() -> Result<()> {
                     &pmodel,
                     &dwork,
                     &cdwork,
+                    &twork,
                 );
                 push_settings_status(&w, &install::status());
                 show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
@@ -1438,6 +1968,9 @@ pub fn run_gui() -> Result<()> {
             if let Some(w) = sw.upgrade() {
                 refresh_owner_code_info(&w, &work);
                 refresh_exclusive_checks(&w, &work);
+                // 虚拟 Bot 登记列表按选中 bot 刷新 + 收起 ⋯ 菜单（切 bot 残留展开态会串行）
+                refresh_vb_rows(&w, &work);
+                w.set_vb_menu_open(-1);
             }
         });
     }
@@ -1468,18 +2001,427 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // ── 虚拟 Bot 弹窗（#75）：交互接线 ──
+    {
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_mode_switched(move |_m| {
+            // 切模式：清掉上次操作的结果/进度/提示（残留会误导用户）
+            if let Some(d) = dlg.upgrade() {
+                d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<
+                    slint::SharedString,
+                >::new(
+                )))));
+                d.set_progress_text("".into());
+                d.set_busy(false);
+                vb_hint(&d, "", false);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_name_edited(move || {
+            if let Some(d) = dlg.upgrade() {
+                // 字符计数按 chars()（中文安全）；≤60 为飞书群名限制
+                d.set_name_count(d.get_name_input().chars().count() as i32);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_prompt_edited(move || {
+            if let Some(d) = dlg.upgrade() {
+                d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_template_toggled(move |idx| {
+            if let Some(d) = dlg.upgrade() {
+                let model = d.get_templates();
+                if idx >= 0 && (idx as usize) < model.row_count() {
+                    if let Some(mut row) = model.row_data(idx as usize) {
+                        row.checked = !row.checked;
+                        model.set_row_data(idx as usize, row);
+                    }
+                }
+                // 勾选数（summary「将创建 N 个群」）
+                let mut n = 0i32;
+                for i in 0..model.row_count() {
+                    if let Some(r) = model.row_data(i) {
+                        if r.checked {
+                            n += 1;
+                        }
+                    }
+                }
+                d.set_selected_count(n);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_template_edit_clicked(move |idx| {
+            if let Some(d) = dlg.upgrade() {
+                d.set_template_editing(true);
+                d.set_template_edit_idx(idx);
+                if idx >= 0 {
+                    let model = d.get_templates();
+                    if (idx as usize) < model.row_count() {
+                        if let Some(r) = model.row_data(idx as usize) {
+                            d.set_template_edit_name(r.name);
+                            d.set_template_edit_prompt(r.prompt);
+                        }
+                    }
+                } else {
+                    d.set_template_edit_name("".into());
+                    d.set_template_edit_prompt("".into());
+                }
+                vb_hint(&d, "", false);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        vb_dialog.on_template_cancel_clicked(move || {
+            if let Some(d) = dlg.upgrade() {
+                d.set_template_editing(false);
+                d.set_template_edit_idx(-1);
+                vb_hint(&d, "", false);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        let twork = templates_work.clone();
+        let dirty = dirty.clone();
+        vb_dialog.on_template_save_clicked(move || {
+            if let Some(d) = dlg.upgrade() {
+                let name = d.get_template_edit_name().trim().to_string();
+                let prompt = d.get_template_edit_prompt().trim().to_string();
+                let idx = d.get_template_edit_idx();
+                if name.is_empty() {
+                    vb_hint(&d, "模板名不能为空", true);
+                    return;
+                }
+                if name.chars().count() > ROLE_NAME_MAX {
+                    vb_hint(&d, &format!("模板名超长（≤{ROLE_NAME_MAX} 字符）"), true);
+                    return;
+                }
+                if prompt.is_empty() {
+                    vb_hint(&d, "提示词不能为空", true);
+                    return;
+                }
+                if prompt.chars().count() > ROLE_PROMPT_MAX {
+                    vb_hint(&d, &format!("提示词超长（≤{ROLE_PROMPT_MAX} 字符）"), true);
+                    return;
+                }
+                // 重名（内置 + 其它自定义）拒绝：模板按名寻址，重名无法区分
+                let dup = builtin_templates().iter().any(|t| t.name == name)
+                    || twork
+                        .borrow()
+                        .iter()
+                        .enumerate()
+                        .any(|(i, t)| t.name == name && i as i32 != idx);
+                if dup {
+                    vb_hint(&d, "该模板名已存在（内置或其它自定义模板）", true);
+                    return;
+                }
+                {
+                    let mut w = twork.borrow_mut();
+                    if idx < 0 {
+                        w.push(RoleTemplate { name, prompt });
+                    } else if (idx as usize) < w.len() {
+                        w[idx as usize] = RoleTemplate { name, prompt };
+                    }
+                }
+                dirty.set(true); // 模板改动随设置窗「保存」写盘
+                d.set_template_editing(false);
+                d.set_template_edit_idx(-1);
+                vb_hint(&d, "", false);
+                sync_vb_templates(&d, &twork);
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        let twork = templates_work.clone();
+        let dirty = dirty.clone();
+        vb_dialog.on_template_delete_clicked(move |idx| {
+            if let Some(d) = dlg.upgrade() {
+                let builtin = builtin_templates().len() as i32;
+                if idx < builtin {
+                    vb_hint(&d, "内置模板不可删除", true);
+                    return;
+                }
+                let ci = (idx - builtin) as usize;
+                let mut w = twork.borrow_mut();
+                if ci < w.len() {
+                    w.remove(ci);
+                    drop(w);
+                    dirty.set(true);
+                    sync_vb_templates(&d, &twork);
+                }
+            }
+        });
+    }
+    {
+        let dlg = vb_dialog.as_weak();
+        let tx = tx.clone();
+        let work = work.clone();
+        let ctx = vb_ctx.clone();
+        vb_dialog.on_create_clicked(move || {
+            let Some(d) = dlg.upgrade() else { return };
+            // 归属 bot 上下文（打开时记录；app_id/secret 点创建时从工作副本取最新——
+            // 用户可能改了没保存，用旧值会建到旧应用下）
+            let Some((idx, bot_key, kind)) = ctx.borrow().clone() else {
+                return;
+            };
+            let (app_id, app_secret) = {
+                let b = work.borrow();
+                b.get(idx as usize)
+                    .map(|bot| (bot.app_id.clone(), bot.app_secret.clone()))
+                    .unwrap_or_default()
+            };
+            let mode = d.get_mode();
+            match mode {
+                // 0=自定义创建 3=编辑
+                0 | 3 => {
+                    let name = d.get_name_input().trim().to_string();
+                    let prompt = d.get_prompt_input().trim().to_string();
+                    if name.is_empty() {
+                        vb_hint(&d, "群名不能为空", true);
+                        return;
+                    }
+                    if name.chars().count() > ROLE_NAME_MAX {
+                        vb_hint(&d, &format!("群名超长（≤{ROLE_NAME_MAX} 字符）"), true);
+                        return;
+                    }
+                    if prompt.chars().count() > ROLE_PROMPT_MAX {
+                        vb_hint(&d, &format!("提示词超长（≤{ROLE_PROMPT_MAX} 字符）"), true);
+                        return;
+                    }
+                    if mode == 0 {
+                        let _ = tx.send(UiCmd::VirtualBotCreate {
+                            bot_key,
+                            kind,
+                            app_id,
+                            app_secret,
+                            items: vec![(name, prompt)],
+                        });
+                    } else {
+                        let chat_id = d.get_edit_chat_id().to_string();
+                        let _ = tx.send(UiCmd::VirtualBotUpdate {
+                            bot_key,
+                            kind,
+                            app_id,
+                            app_secret,
+                            chat_id,
+                            name,
+                            prompt,
+                        });
+                    }
+                }
+                // 1=模板批量创建
+                1 => {
+                    let prefix = d.get_prefix_input().trim().to_string();
+                    let model = d.get_templates();
+                    let mut items: Vec<(String, String)> = Vec::new();
+                    for i in 0..model.row_count() {
+                        if let Some(r) = model.row_data(i) {
+                            if r.checked {
+                                let name = if prefix.is_empty() {
+                                    r.name.to_string()
+                                } else {
+                                    format!("{prefix}·{}", r.name)
+                                };
+                                items.push((name, r.prompt.to_string()));
+                            }
+                        }
+                    }
+                    if items.is_empty() {
+                        vb_hint(&d, "请至少勾选一个模板", true);
+                        return;
+                    }
+                    if let Some((n, _)) = items
+                        .iter()
+                        .find(|(n, _)| n.chars().count() > ROLE_NAME_MAX)
+                    {
+                        vb_hint(
+                            &d,
+                            &format!("群名超长（≤{ROLE_NAME_MAX} 字符）：{n}（前缀太长？）"),
+                            true,
+                        );
+                        return;
+                    }
+                    let _ = tx.send(UiCmd::VirtualBotCreate {
+                        bot_key,
+                        kind,
+                        app_id,
+                        app_secret,
+                        items,
+                    });
+                }
+                // 2=手动登记（降级路径）
+                _ => {
+                    let name = d.get_name_input().trim().to_string();
+                    let chat_id = d.get_register_chat_id().trim().to_string();
+                    if name.is_empty() {
+                        vb_hint(&d, "群名不能为空", true);
+                        return;
+                    }
+                    if name.chars().count() > ROLE_NAME_MAX {
+                        vb_hint(&d, &format!("群名超长（≤{ROLE_NAME_MAX} 字符）"), true);
+                        return;
+                    }
+                    if chat_id.is_empty() {
+                        vb_hint(&d, "chat_id 不能为空", true);
+                        return;
+                    }
+                    let _ = tx.send(UiCmd::VirtualBotRegister {
+                        bot_key,
+                        name,
+                        chat_id,
+                    });
+                }
+            }
+            // 提交后进 busy：进度/结果由 vb_rx 驱动（定时器轮询回填弹窗）
+            vb_hint(&d, "", false);
+            d.set_busy(true);
+            d.set_progress_text("处理中…".into());
+        });
+    }
+    // ── 设置窗虚拟 Bot 区（#75）：创建/编辑/取消登记/解散 ──
+    {
+        let work = work.clone();
+        let ctx = vb_ctx.clone();
+        let dlg = vb_dialog.as_weak();
+        let twork = templates_work.clone();
+        settings.on_virtual_bot_create(move |idx| {
+            let b = work.borrow();
+            if let Some(bot) = b.get(idx as usize) {
+                if bot.kind == "wechat" {
+                    return; // 微信排除（slint 已隐藏该区，这里双保险）
+                }
+                *ctx.borrow_mut() = Some((idx, bot.key(), bot.kind.clone()));
+                if let Some(d) = dlg.upgrade() {
+                    vb_open_dialog(&d, bot, 0, None, &twork);
+                    show_window_and_focus(&d);
+                }
+            }
+        });
+    }
+    {
+        let tx = tx.clone();
+        let sw = settings.as_weak();
+        let work = work.clone();
+        let ctx = vb_ctx.clone();
+        let dlg = vb_dialog.as_weak();
+        let twork = templates_work.clone();
+        settings.on_virtual_bot_edit(move |row| {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            let Some(bot) = b.get(sel as usize) else {
+                return;
+            };
+            let regs = VirtualBotStore::new().load_for(&bot.key());
+            let Some(reg) = regs.get(row as usize) else {
+                return;
+            };
+            *ctx.borrow_mut() = Some((sel, bot.key(), bot.kind.clone()));
+            // 先用登记的角色名立即打开（快速响应）；平台群资料（群介绍）异步拉回回填
+            if let Some(d) = dlg.upgrade() {
+                vb_open_dialog(&d, bot, 3, Some((reg, &reg.role_name, "")), &twork);
+                show_window_and_focus(&d);
+            }
+            let _ = tx.send(UiCmd::VirtualBotFetchInfo {
+                kind: bot.kind.clone(),
+                app_id: bot.app_id.clone(),
+                app_secret: bot.app_secret.clone(),
+                chat_id: reg.chat_id.clone(),
+            });
+        });
+    }
+    {
+        let sw = settings.as_weak();
+        let work = work.clone();
+        let action = vb_action.clone();
+        let confirm = vb_confirm.as_weak();
+        settings.on_virtual_bot_deregister(move |row| {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            let Some(bot) = b.get(sel as usize) else { return };
+            let regs = VirtualBotStore::new().load_for(&bot.key());
+            let Some(reg) = regs.get(row as usize) else { return };
+            *action.borrow_mut() = Some(VbAction::Deregister {
+                bot_key: bot.key(),
+                chat_id: reg.chat_id.clone(),
+            });
+            if let Some(c) = confirm.upgrade() {
+                c.set_title_text("取消登记".into());
+                c.set_message(
+                    format!(
+                        "仅取消 ABB 登记，平台群「{}」保留。群内 @ 机器人将不再注入角色，deliver @{} 寻址也会失效。",
+                        reg.role_name, reg.role_name
+                    )
+                    .into(),
+                );
+                c.set_confirm_text("取消登记".into());
+                c.set_cancel_text("再想想".into());
+                c.set_danger(false); // 轻确认
+                show_window_and_focus(&c);
+            }
+        });
+    }
+    {
+        let sw = settings.as_weak();
+        let work = work.clone();
+        let action = vb_action.clone();
+        let confirm = vb_confirm.as_weak();
+        settings.on_virtual_bot_disband(move |row| {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            let Some(bot) = b.get(sel as usize) else { return };
+            let regs = VirtualBotStore::new().load_for(&bot.key());
+            let Some(reg) = regs.get(row as usize) else { return };
+            *action.borrow_mut() = Some(VbAction::Disband {
+                bot_key: bot.key(),
+                kind: bot.kind.clone(),
+                app_id: bot.app_id.clone(),
+                app_secret: bot.app_secret.clone(),
+                chat_id: reg.chat_id.clone(),
+            });
+            if let Some(c) = confirm.upgrade() {
+                c.set_title_text("解散群（不可恢复）".into());
+                c.set_message(
+                    format!(
+                        "将解散平台群「{}」并删除群内全部消息，同时移除 ABB 登记。此操作不可恢复，确认继续？",
+                        reg.role_name
+                    )
+                    .into(),
+                );
+                c.set_confirm_text("解散群".into());
+                c.set_cancel_text("取消".into());
+                c.set_danger(true); // 红色强确认
+                show_window_and_focus(&c);
+            }
+        });
+    }
     {
         let tx = tx.clone();
         let work = work.clone();
         let pwork = providers_work.clone();
         let dwork = default_provider_work.clone();
         let cdwork = cross_delivery_work.clone();
+        let twork = templates_work.clone();
         let sw = settings.as_weak();
         let dirty = dirty.clone();
         settings.on_save_clicked(move || {
             dirty.set(false);
             if let Some(w) = sw.upgrade() {
-                let (c, dropped) = snapshot_config(&work, &pwork, &dwork, &cdwork);
+                let (c, dropped) = snapshot_config(&work, &pwork, &dwork, &cdwork, &twork);
                 let _ = tx.send(UiCmd::Save(c));
                 // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
                 w.set_status_is_error(false);
@@ -2017,6 +2959,7 @@ pub fn run_gui() -> Result<()> {
             &providers_model,
             &default_provider_work,
             &cross_delivery_work,
+            &templates_work,
         );
         // 已静默恢复草稿时保留恢复提示，别被「请先添加」覆盖
         if !restored {
@@ -2030,6 +2973,7 @@ pub fn run_gui() -> Result<()> {
     let timer = slint::Timer::default();
     {
         let settings_weak = settings.as_weak();
+        let vb_dialog_weak = vb_dialog.as_weak();
         let qr_weak = qr_dialog.as_weak();
         let work = work.clone();
         let model = bots_model.clone();
@@ -2039,6 +2983,7 @@ pub fn run_gui() -> Result<()> {
         let providers_work_t = providers_work.clone();
         let default_provider_work_t = default_provider_work.clone();
         let cross_delivery_work_t = cross_delivery_work.clone();
+        let templates_work_t = templates_work.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -2065,6 +3010,7 @@ pub fn run_gui() -> Result<()> {
                         &providers_work_t,
                         &default_provider_work_t,
                         &cross_delivery_work_t,
+                        &templates_work_t,
                     );
                     if let Err(e) = draft.save_draft() {
                         crate::log!("[gui] 草稿自动保存失败: {e:#}");
@@ -2156,6 +3102,77 @@ pub fn run_gui() -> Result<()> {
                             Err(e) => {
                                 w.set_status_is_error(true);
                                 w.set_status_line(e.into());
+                            }
+                        }
+                    }
+                }
+                // 虚拟 Bot 操作结果（#75）：进度 → 弹窗；结束 → 弹窗逐项汇总 + 刷新登记列表
+                while let Ok(evt) = vb_rx.try_recv() {
+                    match evt {
+                        VirtualBotEvt::Progress { done, total } => {
+                            if let Some(d) = vb_dialog_weak.upgrade() {
+                                d.set_busy(true);
+                                d.set_progress_text(
+                                    format!("创建中 {}/{}", done + 1, total).into(),
+                                );
+                            }
+                        }
+                        VirtualBotEvt::Done { results } => {
+                            if let Some(d) = vb_dialog_weak.upgrade() {
+                                d.set_busy(false);
+                                d.set_progress_text("".into());
+                                let mut lines: Vec<slint::SharedString> =
+                                    Vec::with_capacity(results.len());
+                                for (name, r) in &results {
+                                    match r {
+                                        Ok(s) => lines.push(format!("✅ {name}：{s}").into()),
+                                        Err(e) => lines.push(format!("❌ {name}：{e}").into()),
+                                    }
+                                }
+                                d.set_results(slint::ModelRc::from(Rc::new(
+                                    slint::VecModel::from(lines),
+                                )));
+                            }
+                            if let Some(w) = settings_weak.upgrade() {
+                                let ok = results
+                                    .iter()
+                                    .filter(|(_, r)| r.is_ok())
+                                    .count();
+                                let fail = results.len() - ok;
+                                w.set_status_is_error(fail > 0);
+                                w.set_status_line(
+                                    format!("虚拟 Bot：成功 {ok} 项，失败 {fail} 项").into(),
+                                );
+                                // 登记表已变（建群/登记/取消/解散都写文件）→ 刷新列表
+                                refresh_vb_rows(&w, &work);
+                            }
+                        }
+                        VirtualBotEvt::Fetched {
+                            chat_id,
+                            name,
+                            desc,
+                            error,
+                        } => {
+                            // 编辑预填：群资料异步拉回 → 回填弹窗（仍在编辑该群时）
+                            if let Some(d) = vb_dialog_weak.upgrade() {
+                                if d.get_mode() == 3 && d.get_edit_chat_id() == chat_id.as_str() {
+                                    if let Some(err) = error {
+                                        vb_hint(
+                                            &d,
+                                            &format!(
+                                                "读取群资料失败：{err}（提示词留空保存会清空群介绍）"
+                                            ),
+                                            true,
+                                        );
+                                    } else {
+                                        if !name.is_empty() {
+                                            d.set_name_input(name.into());
+                                        }
+                                        d.set_prompt_input(desc.into());
+                                        d.set_name_count(d.get_name_input().chars().count() as i32);
+                                        d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
+                                    }
+                                }
                             }
                         }
                     }

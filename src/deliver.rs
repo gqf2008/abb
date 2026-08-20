@@ -787,8 +787,8 @@ mod tests {
         assert_eq!(item.target_chat, "oc_vb_1", "@角色名 应解析成 chat_id");
         assert_eq!(item.target_bot, "feishu");
         // 非 @ 目标原样透传
-        let plain = parse_deliver_args_with_store(&role_args("oc_x"), "wechat", "u1", &store)
-            .unwrap();
+        let plain =
+            parse_deliver_args_with_store(&role_args("oc_x"), "wechat", "u1", &store).unwrap();
         assert_eq!(plain.target_chat, "oc_x");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -819,8 +819,8 @@ mod tests {
         assert!(e.contains("@后端开发"), "应列出可用角色: {e}");
         assert!(e.contains("@产品经理"), "{e}");
         // 空角色名 → 明确报错
-        let e2 = parse_deliver_args_with_store(&role_args("@"), "wechat", "u1", &store)
-            .unwrap_err();
+        let e2 =
+            parse_deliver_args_with_store(&role_args("@"), "wechat", "u1", &store).unwrap_err();
         assert!(e2.contains("@"), "{e2}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -838,7 +838,7 @@ mod tests {
             .unwrap();
         // 同角色名登记在别的 bot：寻址失败（同 bot 上下文匹配），报错列表也按 bot 过滤
         let e = parse_deliver_args_with_store(
-            &vec![
+            &[
                 "--bot".to_string(),
                 "dingtalk".to_string(),
                 "--chat".to_string(),
@@ -854,7 +854,10 @@ mod tests {
         assert!(e.contains("未找到"), "{e}");
         // 错误文案里会引用被查的角色名本身（「@后端开发」），所以不能断言「不含角色名」；
         // 应断言没有进入「已登记角色列表」分支（列表按 bot 过滤，同 bot 无登记 → 提示空）
-        assert!(!e.contains("已登记角色"), "可用角色列表不该混入其它 bot: {e}");
+        assert!(
+            !e.contains("已登记角色"),
+            "可用角色列表不该混入其它 bot: {e}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -382,9 +382,7 @@ impl FeishuClient {
         let token = self.tenant_token().await.ok()?;
         let resp: serde_json::Value = self
             .http
-            .post(self.url(&format!(
-                "/im/v1/messages/{message_id}/reactions"
-            )))
+            .post(self.url(&format!("/im/v1/messages/{message_id}/reactions")))
             .bearer_auth(&token)
             .json(&json!({"reaction_type": {"emoji_type": emoji_type}}))
             .send()
@@ -449,6 +447,7 @@ impl FeishuClient {
     ///   改名/解散都能操作；不设则 bot 不在群里，群建了也用不了）；
     /// - `uuid` 幂等：同 uuid 重复调用返回同一个群（网络重试/超时重发安全）；
     /// - `chat_mode: "group"`：显式普通群（与话题群 p2p 群区分）。
+    ///
     /// 返回 chat_id。与 send_text 同款 token+bearer+code==0 模板。
     pub async fn create_chat(&self, name: &str, description: &str) -> Result<String> {
         let token = self.tenant_token().await?;
@@ -736,7 +735,10 @@ mod tests {
     ) -> super::test_mock::MockServer {
         let mut all = std::collections::HashMap::new();
         all.insert(
-            ("POST".to_string(), "/auth/v3/tenant_access_token/internal".to_string()),
+            (
+                "POST".to_string(),
+                "/auth/v3/tenant_access_token/internal".to_string(),
+            ),
             json!({"code": 0, "tenant_access_token": "mock-token", "expire": 7200}),
         );
         all.extend(routes);
@@ -752,7 +754,10 @@ mod tests {
         );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
-        let chat_id = fs.create_chat("后端开发", "你是后端工程师。").await.unwrap();
+        let chat_id = fs
+            .create_chat("后端开发", "你是后端工程师。")
+            .await
+            .unwrap();
         assert_eq!(chat_id, "oc_vb_new");
 
         let recs = server.requests.lock().unwrap().clone();
@@ -770,7 +775,10 @@ mod tests {
         assert_eq!(body["set_bot_manager"], true, "bot 自动入群并当群主");
         assert_eq!(body["chat_mode"], "group");
         assert!(
-            body["uuid"].as_str().map(|u| !u.is_empty()).unwrap_or(false),
+            body["uuid"]
+                .as_str()
+                .map(|u| !u.is_empty())
+                .unwrap_or(false),
             "uuid 幂等键必须有"
         );
     }
@@ -880,7 +888,9 @@ pub(crate) mod test_mock {
         /// 启动。routes: (HTTP 方法, 路径) → 响应 JSON（未命中的路由回 {"code": 404}，
         /// 让客户端错误路径也能走到 code 判定分支，而不是连接层报错）。
         pub async fn start(routes: HashMap<(String, String), Value>) -> MockServer {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock server");
             let addr = listener.local_addr().expect("mock addr");
             let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
             let reqs = requests.clone();

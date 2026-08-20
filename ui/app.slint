@@ -134,6 +134,21 @@ export struct ProviderRow {
     is-default: bool,    // 是否为全局默认供应商
 }
 
+// 虚拟 Bot 登记行（#75，与 Rust 侧 VirtualBotRow 对应）
+export struct VirtualBotRow {
+    role-name: string,   // 角色名（=平台群名）
+    platform: string,    // 飞书 / 钉钉（微信排除）
+    chat-id: string,     // 平台群会话 id（编辑/解散用）
+    created-at: string,  // 登记时间（已格式化 YYYY-MM-DD HH:MM）
+}
+
+// 角色模板行（#75）：内置 + 自定义（前 builtin-count 个为内置，不可编辑/删除）
+export struct RoleTemplateRow {
+    name: string,
+    prompt: string,
+    checked: bool,   // 模板批量创建时是否勾选
+}
+
 // 微信扫码登录二维码弹窗：直接在 GUI 里显示二维码，避免依赖系统看图。
 export component QrDialog inherits Window {
     title: "微信扫码登录";
@@ -346,6 +361,372 @@ export component UnsavedDialog inherits Window {
     }
 }
 
+// 通用确认弹窗（#75）：取消登记（轻确认）/ 解散群（danger=红色主按钮强确认）复用。
+// 文案与按钮由 Rust 侧按场景设置（title-text/message/confirm-text/danger）。
+export component ConfirmDialog inherits Window {
+    title: root.title-text;
+    width: 460px;
+    height: 210px;
+    preferred-width: 460px;
+    preferred-height: 210px;
+    background: PixelTheme.bg;
+    in-out property <string> title-text: "确认操作";
+    in-out property <string> message: "";
+    in-out property <string> confirm-text: "确认";
+    in-out property <string> cancel-text: "取消";
+    in-out property <bool> danger: false;   // true=主按钮红色（强确认）
+    callback confirmed();
+    callback canceled();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: PixelTheme.bg;
+        VerticalBox {
+            padding-top: 20px; padding-right: 20px; padding-bottom: 20px; padding-left: 20px;
+            spacing: 10px;
+        Text {
+            text: root.title-text;
+            font-size: 15px;
+            font-weight: 700;
+            color: PixelTheme.text;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.message;
+            font-size: 12.5px;
+            color: PixelTheme.text.with-alpha(0.7);
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        Rectangle { vertical-stretch: 1; }
+        HorizontalBox {
+            alignment: center;
+            spacing: 10px;
+            PixelButton { text: root.cancel-text; clicked => { root.canceled(); } }
+            PixelButton { text: root.confirm-text; variant: root.danger ? "danger" : "primary"; clicked => { root.confirmed(); } }
+            }
+        }
+    }
+}
+
+// 虚拟 Bot 创建/编辑/登记弹窗（#75）。
+// 模式：0=自定义创建 1=模板批量创建 2=手动登记（降级路径） 3=编辑。
+// 数据流：Rust 侧读写 in-out 属性（预填/校验计数/进度/结果），slint 只负责布局与交互。
+// 群名 ≤60、提示词 ≤100 为飞书群名/群描述限制（钉钉暂同）——字符计数由 Rust 侧按
+// 字符数（非字节）计算后回填（slint 的 string.length 在中文上不可靠，双保险）。
+export component VirtualBotDialog inherits Window {
+    title: root.window-title;
+    width: 620px;
+    height: 680px;
+    preferred-width: 620px;
+    preferred-height: 680px;
+    background: PixelTheme.bg;
+
+    in-out property <string> window-title: "创建虚拟 Bot";
+    in-out property <string> bot-label: "";        // 归属 bot 展示名
+    in-out property <string> platform-label: "";   // 飞书 / 钉钉
+    // 模式：0=自定义创建 1=模板批量创建 2=手动登记 3=编辑
+    in-out property <int> mode: 0;
+    in-out property <string> name-input: "";
+    in-out property <string> prompt-input: "";
+    in-out property <string> prefix-input: "";     // 模板批量：群名前缀（可选）
+    in-out property <[RoleTemplateRow]> templates: [];
+    in-out property <int> builtin-count: 0;        // 前 N 个为内置模板（不可编辑/删除）
+    in-out property <int> selected-count: 0;       // 勾选模板数（Rust 维护，summary 用）
+    // 模板编辑内嵌表单（template-editing=true 时显示；idx=-1=新建）
+    in-out property <bool> template-editing: false;
+    in-out property <int> template-edit-idx: -1;
+    in-out property <string> template-edit-name: "";
+    in-out property <string> template-edit-prompt: "";
+    // 手动登记（降级路径）：chat_id 输入
+    in-out property <string> register-chat-id: "";
+    // 编辑模式：目标 chat_id（保存 = PATCH 平台 + 登记同步）
+    in-out property <string> edit-chat-id: "";
+    // 进度与结果（创建中 2/4 → 逐群汇总）
+    in-out property <bool> busy: false;
+    in-out property <string> progress-text: "";
+    in-out property <[string]> results: [];
+    // 字符计数（Rust 侧 chars().count() 回填；中文安全）
+    in-out property <int> name-count: 0;
+    in-out property <int> prompt-count: 0;
+    // 表单校验提示
+    in-out property <string> hint-text: "";
+    in-out property <bool> hint-error: false;
+
+    callback close-clicked();
+    callback create-clicked();        // Rust 按 mode 分发：创建/批量/登记/保存编辑
+    callback mode-switched(int);
+    callback name-edited();
+    callback prompt-edited();
+    callback template-toggled(int);
+    callback template-save-clicked();
+    callback template-cancel-clicked();
+    callback template-edit-clicked(int);
+    callback template-delete-clicked(int);
+
+    // 创建/保存按钮可用性（busy 时全部禁用防连点；字符计数由 Rust 回填，见 name-edited）
+    property <bool> create-ok: !root.busy && (
+        root.mode == 0 ? (root.name-count > 0 && root.name-count <= 60 && root.prompt-count <= 100)
+        : root.mode == 1 ? root.selected-count > 0
+        : root.mode == 2 ? (root.name-count > 0 && root.name-count <= 60 && root.register-chat-id != "")
+        : (root.name-count > 0 && root.name-count <= 60 && root.prompt-count <= 100));
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: PixelTheme.bg;
+        VerticalBox {
+            padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
+            spacing: 8px;
+
+            // ── 标题行：归属 bot + 平台 ──
+            HorizontalBox {
+                spacing: 8px;
+                ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                Text {
+                    text: root.window-title + "（" + root.bot-label + " · " + root.platform-label + "）";
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: PixelTheme.text;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ── 模式切换（编辑模式隐藏：固定为保存流） ──
+            if root.mode != 3: HorizontalBox {
+                spacing: 8px;
+                PixelButton { text: "自定义创建"; size: "small"; variant: root.mode == 0 ? "primary" : "default"; enabled: !root.busy; clicked => { root.mode = 0; root.mode-switched(0); } }
+                PixelButton { text: "从模板批量创建"; size: "small"; variant: root.mode == 1 ? "primary" : "default"; enabled: !root.busy; clicked => { root.mode = 1; root.mode-switched(1); } }
+                PixelButton { text: "手动登记"; size: "small"; variant: root.mode == 2 ? "primary" : "default"; enabled: !root.busy; clicked => { root.mode = 2; root.mode-switched(2); } }
+            }
+
+            // ── 模式 0/3：自定义创建 / 编辑 ──
+            if root.mode == 0 || root.mode == 3: VerticalBox {
+                spacing: 6px;
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "群名（角色名）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
+                    PixelTextInput {
+                        text: root.name-input;
+                        placeholder: "如：后端开发（≤60 字符）";
+                        horizontal-stretch: 1;
+                        enabled: !root.busy;
+                        edited => { root.name-input = self.text; root.name-edited(); }
+                    }
+                    Text { text: root.name-count + "/60"; font-size: 11px; color: root.name-count > 60 ? #d33 : #888; vertical-alignment: center; }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "提示词（群介绍）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
+                    PixelTextInput {
+                        text: root.prompt-input;
+                        placeholder: "system prompt，≤100 字符（如：你是后端开发工程师……）";
+                        horizontal-stretch: 1;
+                        enabled: !root.busy;
+                        edited => { root.prompt-input = self.text; root.prompt-edited(); }
+                    }
+                    Text { text: root.prompt-count + "/100"; font-size: 11px; color: root.prompt-count > 100 ? #d33 : #888; vertical-alignment: center; }
+                }
+                if root.mode == 3: Text {
+                    text: "保存 = 平台改群名/群介绍（PATCH）+ 本地登记同步。改名会改变 deliver 的 @角色名 寻址。";
+                    font-size: 11px; color: #b80; wrap: word-wrap;
+                }
+                // 预览卡：所见即所得（群资料卡样式）
+                Rectangle {
+                    border-radius: 4px;
+                    background: PixelTheme.panel;
+                    border-width: 1px;
+                    border-color: PixelTheme.edge;
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 6px;
+                        Text { text: "预览（群资料卡）"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                        HorizontalBox {
+                            spacing: 10px;
+                            Rectangle {
+                                width: 42px; height: 42px;
+                                border-radius: 21px;
+                                background: PixelTheme.accent;
+                                HorizontalBox {
+                                    width: 100%; height: 100%;
+                                    alignment: center;
+                                    ImageIcon { icon: @image-url("icons/bot.svg"); tint: #fff; }
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: root.name-input == "" ? "（群名）" : root.name-input; font-weight: 600; font-size: 13px; color: PixelTheme.text; }
+                                Text { text: root.prompt-input == "" ? "（群介绍）" : root.prompt-input; font-size: 11px; color: PixelTheme.text.with-alpha(0.6); wrap: word-wrap; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── 模式 1：模板批量创建 ──
+            if root.mode == 1: VerticalBox {
+                spacing: 6px;
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "群名前缀"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
+                    PixelTextInput {
+                        text: root.prefix-input;
+                        placeholder: "可选，如：智能硬件项目 → 群名「智能硬件项目·后端开发」";
+                        horizontal-stretch: 1;
+                        enabled: !root.busy;
+                        edited => { root.prefix-input = self.text; }
+                    }
+                }
+                Text { text: "勾选要创建的角色群（内置 + 自定义模板）："; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); }
+                // 模板列表：勾选 + 自定义模板的编辑/删除
+                Rectangle {
+                    height: 150px;
+                    border-radius: 4px;
+                    background: PixelTheme.panel;
+                    border-width: 1px;
+                    border-color: PixelTheme.edge;
+                    PixelScrollPanel {
+                        VerticalBox {
+                            width: 100%;
+                            spacing: 2px;
+                            for t[i] in root.templates: HorizontalBox {
+                                height: 30px;
+                                spacing: 8px;
+                                PixelCheckBox {
+                                    text: t.name;
+                                    checked: t.checked;
+                                    enabled: !root.busy;
+                                    toggled => { root.template-toggled(i); }
+                                }
+                                Text {
+                                    text: t.prompt;
+                                    font-size: 10px;
+                                    color: PixelTheme.text.with-alpha(0.5);
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                if i >= root.builtin-count: PixelButton { text: "编辑"; size: "small"; enabled: !root.busy; clicked => { root.template-edit-clicked(i); } }
+                                if i >= root.builtin-count: PixelButton { text: "删"; size: "small"; enabled: !root.busy; clicked => { root.template-delete-clicked(i); } }
+                            }
+                        }
+                    }
+                }
+                // 模板编辑内嵌表单（新建/编辑自定义模板）
+                if root.template-editing: Rectangle {
+                    border-radius: 4px;
+                    background: PixelTheme.bg;
+                    border-width: 1px;
+                    border-color: PixelTheme.accent;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 5px;
+                        Text { text: root.template-edit-idx < 0 ? "＋ 自定义模板" : "编辑自定义模板"; font-size: 12px; font-weight: 700; color: PixelTheme.text; }
+                        PixelTextInput {
+                            text: root.template-edit-name;
+                            placeholder: "模板名（≤60 字符，不可与内置/其它自定义重名）";
+                            edited => { root.template-edit-name = self.text; }
+                        }
+                        PixelTextInput {
+                            text: root.template-edit-prompt;
+                            placeholder: "提示词（≤100 字符）";
+                            edited => { root.template-edit-prompt = self.text; }
+                        }
+                        HorizontalBox {
+                            spacing: 8px;
+                            Rectangle { horizontal-stretch: 1; }
+                            PixelButton { text: "取消"; size: "small"; clicked => { root.template-cancel-clicked(); } }
+                            PixelButton { text: "保存模板"; size: "small"; variant: "primary"; clicked => { root.template-save-clicked(); } }
+                        }
+                    }
+                }
+                if !root.template-editing: PixelButton { text: "＋ 自定义模板"; size: "small"; variant: "ghost"; clicked => { root.template-edit-clicked(-1); } }
+                Text {
+                    text: "将创建 " + root.selected-count + " 个群" + (root.prefix-input == "" ? "" : "（前缀「" + root.prefix-input + "·」）");
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: root.selected-count > 0 ? #0a6fc2 : #888;
+                }
+            }
+
+            // ── 模式 2：手动登记（降级路径：平台手动建群后登记 chat_id） ──
+            if root.mode == 2: VerticalBox {
+                spacing: 6px;
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "群名（角色名）"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
+                    PixelTextInput {
+                        text: root.name-input;
+                        placeholder: "如：后端开发（≤60 字符）";
+                        horizontal-stretch: 1;
+                        enabled: !root.busy;
+                        edited => { root.name-input = self.text; root.name-edited(); }
+                    }
+                    Text { text: root.name-count + "/60"; font-size: 11px; color: root.name-count > 60 ? #d33 : #888; vertical-alignment: center; }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "群 chat_id"; width: 90px; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); vertical-alignment: center; }
+                    PixelTextInput {
+                        text: root.register-chat-id;
+                        placeholder: "飞书 oc_xxx / 钉钉 cidxxx（群消息日志里有）";
+                        horizontal-stretch: 1;
+                        enabled: !root.busy;
+                        edited => { root.register-chat-id = self.text; }
+                    }
+                }
+                Text {
+                    text: root.platform-label == "钉钉" ? "降级路径：机器人建群失败时，在钉钉手动建群（群名=角色名），把群内消息日志里的 chat_id 填这里。钉钉群无「群介绍」字段，角色提示词只能注入群名。" : "降级路径：API 建群失败时，平台手动建群（群名=角色名、群介绍=提示词），把 chat_id 填这里。";
+                    font-size: 11px; color: #b80; wrap: word-wrap;
+                }
+            }
+
+            // ── 校验提示 ──
+            if root.hint-text != "": Text {
+                text: root.hint-text;
+                font-size: 11px;
+                color: root.hint-error ? #d33 : #888;
+                wrap: word-wrap;
+            }
+
+            // ── 进度与结果（busy 或已有结果时显示） ──
+            if root.busy || root.results.length > 0: Rectangle {
+                border-radius: 4px;
+                background: PixelTheme.panel;
+                border-width: 1px;
+                border-color: PixelTheme.edge;
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 4px;
+                    if root.busy: Text { text: root.progress-text; font-size: 12px; font-weight: 600; color: #0a6fc2; }
+                    PixelScrollPanel {
+                        height: 110px;
+                        VerticalBox {
+                            width: 100%;
+                            spacing: 2px;
+                            for r[i] in root.results: Text { text: r; font-size: 11px; color: PixelTheme.text.with-alpha(0.8); wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+
+            // ── 底部按钮 ──
+            HorizontalBox {
+                alignment: center;
+                spacing: 10px;
+                PixelButton {
+                    text: root.mode == 0 ? "创建群" : (root.mode == 1 ? "批量创建" : (root.mode == 2 ? "登记" : "保存修改"));
+                    enabled: root.create-ok;
+                    clicked => { root.create-clicked(); }
+                }
+                PixelButton { text: "关闭"; variant: "ghost"; enabled: !root.busy; clicked => { root.close-clicked(); } }
+            }
+        }
+    }
+}
+
 // 设置窗主体。
 export component SettingsWindow inherits Window {
     // 像素风自绘窗口：无系统边框/红绿灯，PixelTitleBar 自绘标题栏（拖拽/最小化/最大化/关闭）
@@ -436,6 +817,10 @@ export component SettingsWindow inherits Window {
         { name: "仅授权用户", checked: true },
         { name: "任何人都可以对话", checked: false },
     ];
+    // 虚拟 Bot（#75）：当前选中 bot 的登记列表（Rust 按选中 bot 刷新）
+    in-out property <[VirtualBotRow]> virtual-bots: [];
+    // ⋯ 菜单展开的行下标（-1=收起；点击行内「⋯」切换）
+    in-out property <int> vb-menu-open: -1;
 
     callback save-clicked();
     callback cancel-clicked();
@@ -484,6 +869,12 @@ export component SettingsWindow inherits Window {
     callback remove-provider(int);
     callback set-default-provider(int);
     callback test-provider(int);
+
+    // 虚拟 Bot（#75）：登记列表操作（i=virtual-bots 行下标；create 用选中 bot 下标）
+    callback virtual-bot-create(int);     // 「＋ 创建虚拟 Bot」→ 弹窗（自定义/模板/登记）
+    callback virtual-bot-edit(int);       // 编辑登记（预填弹窗 → PATCH + 登记同步）
+    callback virtual-bot-deregister(int); // ⋯ 菜单：取消登记（轻确认）
+    callback virtual-bot-disband(int);    // ⋯ 菜单：解散群（红色强确认，仅飞书）
 
     // 首页「待处理」卡用到的统计（纯表达式，跟随各 *_installed / perm-* 属性自动更新）
     property <int> missing-deps: (root.claude-installed ? 0 : 1)
@@ -1120,6 +1511,48 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
 
+                                            }
+                                            // ── 虚拟 Bot 区（#75）：平台真实群 + ABB 登记 ──
+                                            // 群名=角色名、群介绍=system prompt（平台群资料为准，改群介绍=改角色即时生效）。
+                                            // 仅飞书/钉钉显示（微信排除：虚拟 Bot 需要平台群概念）。
+                                            if root.selected >= 0 && root.selected < root.bots.length && (root.bots[root.selected].kind == "feishu" || root.bots[root.selected].kind == "dingtalk"): VerticalBox {
+                                                spacing: 6px;
+                                                Text { text: "虚拟 Bot"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
+                                                Text {
+                                                    text: "平台真实群 + ABB 登记：群名=角色名、群介绍=system prompt（改群介绍=改角色，即时生效）。群内 @ 机器人自动注入角色；AI 可用 deliver --bot <此 bot> --chat @角色名 寻址。";
+                                                    font-size: 11px; color: #888; wrap: word-wrap;
+                                                }
+                                                for vb[i] in root.virtual-bots: Rectangle {
+                                                    background: PixelTheme.panel;
+                                                    border-radius: 4px;
+                                                    VerticalBox {
+                                                        padding-top: 8px; padding-right: 8px; padding-bottom: 8px; padding-left: 8px;
+                                                        spacing: 6px;
+                                                        HorizontalBox {
+                                                            spacing: 8px;
+                                                            ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                                                            Text { text: vb.role-name; font-weight: 600; font-size: 13px; color: PixelTheme.text; vertical-alignment: center; }
+                                                            Text { text: vb.platform; font-size: 11px; color: #888; vertical-alignment: center; }
+                                                            Rectangle { horizontal-stretch: 1; }
+                                                            Text { text: vb.created-at; font-size: 11px; color: #888; vertical-alignment: center; }
+                                                            PixelButton { text: "编辑"; size: "small"; clicked => { root.virtual-bot-edit(i); } }
+                                                            PixelButton { text: "⋯"; size: "small"; clicked => { root.vb-menu-open = root.vb-menu-open == i ? -1 : i; } }
+                                                        }
+                                                        // ⋯ 菜单（行内展开）：取消登记（轻确认）/ 解散群（强确认，仅飞书有解散 API）
+                                                        if root.vb-menu-open == i: HorizontalBox {
+                                                            spacing: 8px;
+                                                            Rectangle { horizontal-stretch: 1; }
+                                                            PixelButton { text: "取消登记"; size: "small"; variant: "ghost"; clicked => { root.virtual-bot-deregister(i); root.vb-menu-open = -1; } }
+                                                            if root.bots[root.selected].kind == "feishu": PixelButton { text: "解散群"; size: "small"; variant: "danger"; clicked => { root.virtual-bot-disband(i); root.vb-menu-open = -1; } }
+                                                        }
+                                                    }
+                                                }
+                                                if root.virtual-bots.length == 0: Text { text: "暂无登记。点下方按钮一键建群（平台 API 失败时手动建群后「手动登记」）。"; font-size: 11px; color: #888; }
+                                                PixelButton { text: "＋ 创建虚拟 Bot"; clicked => { root.virtual-bot-create(root.selected); } }
+                                                if root.bots[root.selected].kind == "dingtalk": Text {
+                                                    text: "钉钉提示：机器人建群能力待平台实测；失败时手动建群（群名=角色名）后走弹窗「手动登记」。钉钉群无「群介绍」字段，角色提示词只能注入群名。";
+                                                    font-size: 11px; color: #b80; wrap: word-wrap;
+                                                }
                                             }
                                             if root.selected < 0: Text { text: "← 选择或添加一个机器人"; color: #888; }
                                         }

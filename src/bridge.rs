@@ -607,7 +607,9 @@ impl Bridge {
         if !registered {
             return None;
         }
-        self.chat_info_cache.get(&ev.chat_id, self.msgr.as_ref()).await
+        self.chat_info_cache
+            .get(&ev.chat_id, self.msgr.as_ref())
+            .await
     }
 
     /// 登记快照懒刷新：文件 (mtime, 长度) 变了才重读（GUI 登记/取消登记后下一条消息
@@ -620,8 +622,7 @@ impl Bridge {
             .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
         let mut cached = self.virtual_bots_mtime.lock().unwrap();
         if *cached != sig {
-            *self.virtual_bots.lock().unwrap() =
-                crate::virtualbot::VirtualBotStore::new().load();
+            *self.virtual_bots.lock().unwrap() = crate::virtualbot::VirtualBotStore::new().load();
             *cached = sig;
         }
     }

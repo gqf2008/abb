@@ -142,7 +142,7 @@ impl VirtualBotStore {
         {
             return Err(format!("角色「{new_role}」已被其它群占用"));
         }
-        let mut next: Vec<VirtualBot> = cur
+        let next: Vec<VirtualBot> = cur
             .into_iter()
             .map(|mut v| {
                 if v.bot_key == bot_key && v.chat_id == chat_id {
@@ -152,7 +152,7 @@ impl VirtualBotStore {
             })
             .collect();
         // 未变（角色名相同）也照写：幂等
-        self.write(&mut next)
+        self.write(&next)
     }
 
     /// deliver 寻址：@角色名 → chat_id（同 bot 上下文；第一个匹配）。
@@ -174,8 +174,7 @@ impl VirtualBotStore {
     /// 整文件原子重写（唯一 tmp + rename；`atomic_write_sensitive` 语义同 config）。
     fn write(&self, entries: &[VirtualBot]) -> Result<(), String> {
         let text = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
-        crate::atomic_write_sensitive(&self.path, &text)
-            .map_err(|e| format!("写登记表失败: {e}"))
+        crate::atomic_write_sensitive(&self.path, &text).map_err(|e| format!("写登记表失败: {e}"))
     }
 }
 
@@ -349,7 +348,11 @@ pub fn format_created(secs: u64) -> String {
     let days = local / 86400;
     let rem = local % 86400;
     let (y, m, d) = days_to_ymd(days);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
 }
 
 /// 天数（自纪元）→ (年, 月, 日)：Howard Hinnant 的 civil_from_days 算法。
@@ -365,7 +368,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = (yoe as i64 + era * 400) + if m <= 2 { 1 } else { 0 };
-    (y as u64, m as u64, d as u64)
+    (y as u64, m, d)
 }
 
 #[cfg(test)]
@@ -434,8 +437,14 @@ mod tests {
         let (_d, store) = tmp_store("resolve");
         store.add(vb("feishu", "oc_1", "后端开发")).unwrap();
         store.add(vb("dingtalk", "cid1", "后端开发")).unwrap();
-        assert_eq!(store.resolve("feishu", "后端开发"), Some("oc_1".to_string()));
-        assert_eq!(store.resolve("dingtalk", "后端开发"), Some("cid1".to_string()));
+        assert_eq!(
+            store.resolve("feishu", "后端开发"),
+            Some("oc_1".to_string())
+        );
+        assert_eq!(
+            store.resolve("dingtalk", "后端开发"),
+            Some("cid1".to_string())
+        );
         assert_eq!(store.resolve("feishu", "不存在"), None);
         // 角色列表（寻址失败提示用）
         assert_eq!(store.roles_for("feishu"), vec!["后端开发".to_string()]);
@@ -505,10 +514,7 @@ mod tests {
             role_block("后端开发", "你是后端工程师。"),
             "[群角色]\n群名：后端开发\n群介绍：你是后端工程师。\n\n"
         );
-        assert_eq!(
-            role_block("运营", ""),
-            "[群角色]\n群名：运营\n群介绍：\n\n"
-        );
+        assert_eq!(role_block("运营", ""), "[群角色]\n群名：运营\n群介绍：\n\n");
     }
 
     /// 假 messenger：get_chat_info 可编程（返回固定资料或失败），记录调用次数。
@@ -595,7 +601,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let (name, desc) = cache.get("oc_5", &msgr).await.unwrap();
         assert_eq!(name, "后端开发");
-        assert_eq!(desc, "新介绍", "群介绍应在缓存过期后重新拉取（改群介绍即时生效）");
+        assert_eq!(
+            desc, "新介绍",
+            "群介绍应在缓存过期后重新拉取（改群介绍即时生效）"
+        );
         assert_eq!(msgr.calls.load(Ordering::Relaxed), 2);
     }
 
