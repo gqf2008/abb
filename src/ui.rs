@@ -1097,9 +1097,16 @@ pub fn run_gui() -> Result<()> {
                 EventResult::Propagate
             });
         }
-        vb_confirm.window().on_winit_window_event(|_w, ev| {
+        let vb_cw = vb_confirm.as_weak();
+        vb_confirm.window().on_winit_window_event(move |_w, ev| {
+            // 执行中（busy）禁止关闭：结果未返回前关掉弹窗会丢结果（8-20 用户反馈：
+            // "拿到解散结果并且成功后再关闭"）——与 vb_dialog 的 busy 拦截同款
+            if matches!(ev, WindowEvent::CloseRequested)
+                && vb_cw.upgrade().map(|c| c.get_busy()).unwrap_or(false)
+            {
+                return EventResult::PreventDefault;
+            }
             // 子窗口关闭不动 dock 状态（8-20 用户反馈：关闭子窗口不该影响主设置窗）
-            let _ = ev;
             EventResult::Propagate
         });
     }
