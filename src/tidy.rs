@@ -597,7 +597,14 @@ mod tests {
         let dirs = collect_empty_dirs(&ws);
         let rel: Vec<String> = dirs
             .iter()
-            .map(|p| p.strip_prefix(&ws).unwrap().to_string_lossy().to_string())
+            .map(|p| {
+                // 统一为 '/' 便于跨平台断言（windows 上 strip_prefix 产出反斜杠）
+                p.strip_prefix(&ws)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_string()
+            })
             .collect();
         // 深度降序（最深在前；同深度顺序不定——read_dir 顺序不保证）
         let pos = |r: &str| rel.iter().position(|x| x == r).unwrap();
