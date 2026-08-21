@@ -139,6 +139,7 @@ export struct BotRow {
     ding-open-access: bool,  // 钉钉：true=任何人都可以对话；false=仅授权用户
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
     restrict-granted: bool, // 授权者 agent 会话隔离（true=受限模式，安全默认；false=与 owner 同权限）
+    tidy-enabled: bool, // 每日工作目录整理（默认关：孤儿会话/临时文件/超期历史/文档归档 + git 留痕）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -871,6 +872,8 @@ export component SettingsWindow inherits Window {
     // #74 历史记录页：提醒总开关 / 保留期（天）/ 消息列表（Rust 侧整体替换 model 刷新）
     in-out property <bool> notify-enabled: true;
     in-out property <int> history-retention-days: 30;
+    in-out property <bool> session-gc-enabled: false;   // 每日会话归纳清理（#78，默认关）
+    in-out property <int> session-gc-days: 7;           // 过期判定天数（3/7/14/30）
     in-out property <[HistoryRow]> history-rows: [];
     // 虚拟 Bot 手动刷新进行中（#75）：禁用刷新按钮防连点 + 按钮文字"同步中"
     in-out property <bool> vb-syncing: false;
@@ -962,6 +965,7 @@ export component SettingsWindow inherits Window {
     callback remove-granted(int, int); // 取消授权：bot idx + 授权者下标（从授权者白名单移除）
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
     callback set-restrict-granted(int, bool); // 授权者 agent 隔离开关（true=受限模式，保存后即时生效）
+    callback set-tidy-enabled(int, bool); // 每日工作目录整理开关（默认关，保存后即时生效）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-url(string); // 打开外部链接（依赖文档 / 申请 token 等，默认浏览器）
     callback recheck-deps();            // 重新检测依赖是否已装
@@ -997,6 +1001,8 @@ export component SettingsWindow inherits Window {
     callback clear-history();                  // 「清除全部历史」→ Rust 侧弹二次确认
     callback set-notify-enabled(bool);         // 提醒开关 → Rust 侧写工作副本（保存时落盘）
     callback set-history-retention(int);       // 保留期下拉下标（0=7天 1=30天 2=90天）
+    callback set-session-gc-enabled(bool);     // 会话归纳清理开关（#78 默认关）
+    callback set-session-gc-days(int);         // 过期天数下拉下标（0=3 1=7 2=14 3=30）
 
     // 首页「待处理」卡用到的统计（纯表达式，跟随各 *_installed / perm-* 属性自动更新）
     property <int> missing-deps: (root.claude-installed ? 0 : 1)
@@ -1350,6 +1356,21 @@ export component SettingsWindow inherits Window {
                                                             checked: root.bots[root.selected].restrict-granted;
                                                             horizontal-stretch: 1;
                                                             toggled => { root.set-restrict-granted(root.selected, self.checked); }
+                                                        }
+                                                    }
+                                                }
+                                                // 每日工作目录整理（默认关）：孤儿会话文件/临时文件/超期历史截断/
+                                                // 文档归档 + git 留痕。同独立 callback 模式（避开 CheckBox 绑定坑）。
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "每日整理"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        spacing: 12px;
+                                                        PixelCheckBox {
+                                                            text: "每日工作目录整理（孤儿会话/临时文件/超期历史/文档归档 + git 留痕）";
+                                                            checked: root.bots[root.selected].tidy-enabled;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.set-tidy-enabled(root.selected, self.checked); }
                                                         }
                                                     }
                                                 }
@@ -2227,6 +2248,41 @@ export component SettingsWindow inherits Window {
                             PixelButton {
                                 text: "🗑 清除全部历史";
                                 clicked => { root.clear-history(); }
+                            }
+                        }
+                    }
+                    // 第二行：每日会话归纳清理（#78，全局开关默认关——破坏性 + 每会话一次 LLM 调用）
+                    Rectangle {
+                        vertical-stretch: 0;
+                        background: PixelTheme.bg;
+                        border-radius: 4px;
+                        HorizontalBox {
+                            padding: 10px;
+                            spacing: 12px;
+                            PixelCheckBox {
+                                text: "每日会话归纳清理";
+                                checked: root.session-gc-enabled;
+                                toggled => { root.session-gc-enabled = self.checked; root.set-session-gc-enabled(self.checked); }
+                            }
+                            Text {
+                                text: "过期判定";
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                color: PixelTheme.text;
+                            }
+                            PixelComboBox {
+                                width: 110px;
+                                model: ["3 天", "7 天", "14 天", "30 天"];
+                                index: root.session-gc-days == 3 ? 0 : root.session-gc-days == 14 ? 2 : root.session-gc-days == 30 ? 3 : 1;
+                                selected(idx) => { root.set-session-gc-days(idx); }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "超过该天数未活跃的会话，由 bot 后端 agent 归纳成摘要存档（summaries/）并清理工作区内的历史/会话文件；摘要下次会话自动注入衔接上下文。仅清理本 bot 工作区，不触碰后端私有目录。";
+                                font-size: 11px;
+                                color: #888;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
                             }
                         }
                     }

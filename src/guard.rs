@@ -217,24 +217,48 @@ fn check_file_paths(tool: &str, input: &serde_json::Value, workspace: &Path) -> 
 }
 
 /// 桥状态/指令文件判定（文件名 + 路径组件，大小写不敏感——macOS 文件系统不区分大小写）：
-/// - 文件名命中清单：jobs.json / pending.json / CLAUDE.md / AGENTS.md / .mcp.json
-///   （`sub/../jobs.json` 式穿越由 file_name 取最终文件名天然覆盖）
-/// - 任一路径组件为 `.claude`：settings.json / settings.local.json / hooks/… 全拒
+/// - 文件名命中清单：jobs.json / pending.json / sessions.json / CLAUDE.md / AGENTS.md /
+///   .mcp.json（`sub/../jobs.json` 式穿越由 file_name 取最终文件名天然覆盖）
+/// - 文件名后缀 `.agents.md` / `.claude.md`：会话级 AGENTS.md（`<escaped>.AGENTS.md`）会被
+///   注入每个会话 prompt（含 owner 全权限会话）——granted 能写 = 持久化提权，与裸
+///   AGENTS.md 同列；顺带覆盖任何 `x.agents.md` 形态（安全优先，改名即可）
+/// - 任一路径组件为 `.claude`：settings.json / settings.local.json / hooks/… 全拒；
+///   组件为 `summaries`：归纳摘要文件（session_gc）会被注入新会话 prompt，同属指令面；
+///   组件为 `history`：会话历史 jsonl（注入面——改写可向更高权限会话播种伪历史）；
+///   组件为 `.git`：tidy 的 git 留痕使工作区成为仓库——写 `.git/hooks/…` 可在下一次
+///   tidy commit 时以用户权限执行任意代码（沙箱逃逸），写 `.git/config` 可重定向
+///   仓库/远端，一并全拒（审查修复）。读侧仍按「只禁写不禁读」放行——.git/objects
+///   是压缩二进制、且 git 历史读动词（log/show/blame/diff 全文）已在 Bash 白名单封死
+/// - sessions.json 在清单内（顺手补漏）：槽位 role/session_id 是执行时信任状态，
+///   granted 改写槽位可把上下文导向他人会话
 fn is_bridge_state_path(p: &str) -> bool {
+    // APFS/NTFS 会剥离文件名/路径组件末尾的 '.' 与空格（`AGENTS.md.` 落盘即
+    // `AGENTS.md`）：判定前按同样规则剪掉尾部这些字符，否则受限会话写
+    // `AGENTS.md.` / `.claude.` 就能绕过名单完成持久化提权（审查发现）。
+    let trim_trail = |s: &str| -> String { s.trim_end_matches(['.', ' ', '\t', '\r']).to_string() };
     let path = std::path::Path::new(p);
     if let Some(name) = path.file_name() {
-        let name = name.to_string_lossy().to_ascii_lowercase();
+        let name = trim_trail(&name.to_string_lossy().to_ascii_lowercase());
         if matches!(
             name.as_str(),
-            "jobs.json" | "pending.json" | "claude.md" | "agents.md" | ".mcp.json"
-        ) {
+            "jobs.json"
+                | "pending.json"
+                | "sessions.json"
+                | "claude.md"
+                | "agents.md"
+                | ".mcp.json"
+        ) || name.ends_with(".agents.md")
+            || name.ends_with(".claude.md")
+        {
             return true;
         }
     }
     path.components().any(|c| {
-        c.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(".claude")
+        let s = trim_trail(&c.as_os_str().to_string_lossy());
+        s.eq_ignore_ascii_case(".claude")
+            || s.eq_ignore_ascii_case("summaries")
+            || s.eq_ignore_ascii_case("history")
+            || s.eq_ignore_ascii_case(".git")
     })
 }
 
@@ -293,7 +317,14 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
         return check_abb_bin(rest, workspace);
     }
     match program {
-        // 只读 git：代码仓库操作不越界（workspace 通常不是 git repo，防呆放行只读动词）。
+        // 只读 git：代码仓库操作不越界。**历史读动词（log/show/blame）一律拒绝**——
+        // tidy 的 git 留痕使工作区成为 git repo，授权者可用它们读已删除/归档文件的
+        // 旧版本（`git show HEAD:secret.md`），绕过「删了就是没了」的读边界（xhigh 审查）。
+        // 保留 status/diff（当前状态读）与 ls-files/branch 等（路径枚举，受文件校验约束）。
+        // diff 只许纯 flag 参数（--stat 等）：rev/路径/blob 参数同样输出已删/归档文件的
+        // 旧版本全文（`git diff HEAD~1 -- secret.md`、`git diff HEAD -- 已删文件`、blob
+        // 形态 `git diff HEAD~1:secret.md HEAD:secret.md`）——移除 log/show/blame 后
+        // diff 是同一漏洞的剩口子，一并封死（审查修复）。
         // --no-index 除外：git diff --no-index <a> <b> 在仓库外也可读任意文件全文。
         // --output/-C/--git-dir/--work-tree 除外（M1 审查修复）：前者把输出写到工作区外
         // 任意路径（git diff --output=/tmp/evil），后三者可重定向仓库/工作树（-C 还可
@@ -302,14 +333,11 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
             const READONLY: &[&str] = &[
                 "status",
                 "diff",
-                "log",
-                "show",
                 "ls-files",
                 "branch",
                 "remote",
                 "rev-parse",
                 "check-ignore",
-                "blame",
                 "describe",
                 "help",
                 "version",
@@ -340,7 +368,33 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
                 ));
             }
             let verb = rest.first().map(|s| s.as_str()).unwrap_or("");
-            if READONLY.contains(&verb) {
+            if verb == "diff" {
+                // diff 只许「无内容输出」的 flag 组合：rev（HEAD~1/哈希）、路径（含
+                // -- 后的）与 blob（rev:path）参数都会输出已删/归档文件的旧版本全文，
+                // 等同 log/show（审查修复）；而**裸 `git diff` / `git diff -C` 会输出
+                // 全部变更的全文补丁**——归档/截断后的删除项旧内容同样全文可见，一并
+                // 封死：必须带 --stat/--name-only 等摘要级 flag 才放行。
+                const SAFE_DIFF_FLAGS: &[&str] = &[
+                    "--stat",
+                    "--shortstat",
+                    "--numstat",
+                    "--name-only",
+                    "--name-status",
+                    "--dirstat",
+                    "--summary",
+                    "--raw",
+                ];
+                let args = &rest[1..];
+                let has_summary_flag = args
+                    .iter()
+                    .any(|a| SAFE_DIFF_FLAGS.iter().any(|f| a.starts_with(f)));
+                if !has_summary_flag || args.iter().any(|a| !a.starts_with('-')) {
+                    return Decision::Deny(
+                        "git diff 仅允许摘要级 flag（--stat/--name-only 等；其余形态会泄露已删除文件内容）".into(),
+                    );
+                }
+                Decision::Allow
+            } else if READONLY.contains(&verb) {
                 Decision::Allow
             } else {
                 Decision::Deny(format!("git {verb} 不在只读白名单"))
@@ -645,13 +699,16 @@ mod tests {
             Decision::Allow
         );
         assert_ne!(decide(r#"$ABB_BIN session nuke"#), Decision::Allow);
-        // git 只读
+        // git 只读：状态/差异放行；历史读（log/show/blame，可读已删文件旧版本）拒绝
         assert_eq!(decide("git status"), Decision::Allow);
-        assert_eq!(decide("git log --oneline"), Decision::Allow);
+        assert_eq!(decide("git diff --stat"), Decision::Allow);
+        assert_ne!(decide("git log --oneline"), Decision::Allow);
+        assert_ne!(decide("git show HEAD:secret.md"), Decision::Allow);
+        assert_ne!(decide("git blame a.txt"), Decision::Allow);
         assert_ne!(decide("git push"), Decision::Allow);
         assert_ne!(decide("git checkout main"), Decision::Allow);
         // M1：git 参数含受限 flag（读任意文件/写任意路径/重定向仓库）→ 拒绝；
-        // 只读 copy 检测形态（git log -C）不受影响
+        // verb 后 `-C` 是只读 copy 检测——但必须与摘要 flag 同用（裸 diff -C 仍是全文补丁）
         assert_ne!(
             decide("git diff --output=/tmp/evil out.txt"),
             Decision::Allow
@@ -663,7 +720,25 @@ mod tests {
         assert_ne!(decide("git -C /tmp status"), Decision::Allow);
         assert_ne!(decide("git --git-dir=/tmp/g status"), Decision::Allow);
         assert_ne!(decide("git --work-tree=/tmp status"), Decision::Allow);
-        assert_eq!(decide("git log -C --oneline"), Decision::Allow);
+        // diff 只许「摘要级 flag」：rev/路径/blob 参数输出已删/归档文件旧版本全文；
+        // 裸 `git diff`/`git diff -C`/`git diff --cached` 也输出全部变更全文（含删除项
+        // 旧内容）——移除 log/show/blame 后同一漏洞的剩口子，一并封死（审查修复）
+        assert_eq!(decide("git diff --stat"), Decision::Allow);
+        assert_eq!(decide("git diff -C --stat"), Decision::Allow);
+        assert_eq!(decide("git diff --stat --cached"), Decision::Allow);
+        assert_eq!(decide("git diff --name-only"), Decision::Allow);
+        assert_ne!(decide("git diff"), Decision::Allow);
+        assert_ne!(decide("git diff -C"), Decision::Allow);
+        assert_ne!(decide("git diff --cached"), Decision::Allow);
+        assert_ne!(decide("git diff HEAD~1 -- secret.md"), Decision::Allow);
+        assert_ne!(decide("git diff HEAD secret.md"), Decision::Allow);
+        assert_ne!(decide("git diff -- secret.md"), Decision::Allow);
+        assert_ne!(
+            decide("git diff HEAD~1:secret.md HEAD:secret.md"),
+            Decision::Allow
+        );
+        assert_ne!(decide("git diff abc1234 def5678"), Decision::Allow);
+        assert_ne!(decide("git diff --stat HEAD~1"), Decision::Allow);
         // 只读命令：工作区内路径放行、工作区外拒绝
         assert_eq!(decide("cat a.txt"), Decision::Allow);
         assert_eq!(decide("cat ./sub/b.txt"), Decision::Allow);
@@ -794,6 +869,83 @@ mod tests {
     }
 
     #[test]
+    fn file_paths_deny_trailing_dot_space_variants() {
+        // APFS/NTFS 剥离文件名/组件末尾的 '.' 与空格：`AGENTS.md.` 落盘即 AGENTS.md——
+        // 名单判定先按文件系统同规则剪尾，否则受限会话写 `AGENTS.md.` / `.claude.`
+        // 就绕过指令文件保护（持久化提权）
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        for p in [
+            "AGENTS.md.",
+            "AGENTS.md ",
+            "AGENTS.md\t",
+            "sub/AGENTS.md.",
+            ".claude./settings.json",
+            "summaries ./x.md",
+            "sessions/oc_1.AGENTS.md.",
+        ] {
+            assert_ne!(
+                check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p:?} 尾部字符变体应拒绝"
+            );
+        }
+        // 剪尾不误伤普通文件名
+        assert_eq!(
+            check_file_paths("Write", &serde_json::json!({"file_path": "a.txt"}), &ws),
+            Decision::Allow
+        );
+        let _ = root;
+    }
+
+    #[test]
+    fn file_paths_deny_history_and_git_components() {
+        // 审查修复：#80 的会话历史 jsonl（改写可在更高权限会话播种伪历史）与 .git
+        //（tidy 留痕仓库：写 hooks 可在下次 tidy commit 时以用户权限执行代码）同为
+        // 受限会话禁区。只禁写不禁读（与 jobs.json 等桥状态文件同 doctrine）。
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        // 借 temp_guard_env 可能已建 history/ 目录——判定不依赖存在性
+        for p in [
+            "history/oc_owner.jsonl",
+            "history/oc_1%3Athread.jsonl",
+            "history/oc_x.migrated.json",
+            ".git/config",
+            ".git/hooks/pre-commit",
+            "sub/.git/objects/ab/cdef",
+        ] {
+            assert_ne!(
+                check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p:?} 历史/git 组件写应拒绝"
+            );
+            assert_ne!(
+                check_file_paths("Edit", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p:?} 历史/git 组件编辑应拒绝"
+            );
+        }
+        // 组件名不误伤：普通文件 / 同名字段文件
+        assert_eq!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": "history.md"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": ".gitignore"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        let _ = root;
+    }
+
+    #[test]
     fn file_paths_deny_instruction_files() {
         // H1 持久化提权：这些文件影响之后更高权限会话的执行行为，禁写
         let (root, ws, _guard) = temp_guard_env();
@@ -825,6 +977,56 @@ mod tests {
                 "{p} 应禁写（.claude 段）"
             );
         }
+        // 会话级 AGENTS.md（<escaped>.AGENTS.md）与任何 x.agents.md/x.claude.md 形态：
+        // 注入每个会话 prompt（含 owner 全权限会话）→ 与裸 AGENTS.md 同列禁写
+        for p in [
+            "sessions/oc_1%3Aomt_2.AGENTS.md",
+            "notes.agents.md",
+            "sub/notes.claude.md",
+        ] {
+            assert_ne!(
+                check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p} 应禁写（指令面文件后缀）"
+            );
+        }
+        // 普通 .md 不受影响（后缀规则不误伤）
+        assert_eq!(
+            check_file_paths("Write", &serde_json::json!({"file_path": "notes.md"}), &ws),
+            Decision::Allow
+        );
+        // summaries/**：归纳摘要会被注入新会话 prompt，同属指令面（session_gc）
+        // （写禁断言走 Write 分支，无需目录存在；Read 断言先建目录——
+        // canonical_in_workspace 对不存在文件要求父目录可 canonicalize）
+        std::fs::create_dir_all(ws.join("summaries")).ok();
+        assert_ne!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": "summaries/oc_x.md"}),
+                &ws
+            ),
+            Decision::Allow,
+            "summaries/ 应禁写（摘要注入指令面）"
+        );
+        assert_eq!(
+            check_file_paths(
+                "Read",
+                &serde_json::json!({"file_path": "summaries/oc_x.md"}),
+                &ws
+            ),
+            Decision::Allow,
+            "摘要只禁写不禁读（内容属工作区可读范围）"
+        );
+        // sessions.json：槽位是执行时信任状态（顺手补漏），禁写
+        assert_ne!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": "sessions.json"}),
+                &ws
+            ),
+            Decision::Allow,
+            "sessions.json 应禁写（槽位信任状态）"
+        );
         // 读仍允许（内容本属工作区可读范围）
         assert_eq!(
             check_file_paths("Read", &serde_json::json!({"file_path": "CLAUDE.md"}), &ws),

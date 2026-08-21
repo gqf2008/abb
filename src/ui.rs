@@ -342,19 +342,30 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     w.window().request_redraw();
 }
 
-/// 把设置窗四份工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
+/// 设置窗工作副本聚合（#80 减重）：除 bots 外的全部 work 副本装进一个 Rc，
+/// load/snapshot 签名不再随字段增长；新增设置字段只改这里 + 声明处。
+/// bots 副本（`work`）单独保留——它在多个 handler 里被复用为其它字段的别名
+/// （如 `let work = notify_work.clone()`），统一进结构体会引入命名混乱。
+struct SettingsWork {
+    providers: Rc<RefCell<Vec<ProviderConfig>>>,
+    /// 默认供应商名（#21 跨会话投递依赖）。
+    default_provider: Rc<RefCell<String>>,
+    /// 跨会话投递总开关（#21）。
+    cross_delivery: Rc<RefCell<bool>>,
+    /// 虚拟 Bot 自定义角色模板（#75）：弹窗里管理，随「保存」写盘。
+    templates: Rc<RefCell<Vec<RoleTemplate>>>,
+    /// #74 历史记录页：保留期 / 提醒开关。
+    history_retention: Rc<RefCell<u32>>,
+    notify: Rc<RefCell<bool>>,
+    /// #78 会话归纳清理：全局开关（默认关）+ 过期天数（默认 7）。
+    session_gc: Rc<RefCell<bool>>,
+    session_gc_days: Rc<RefCell<u32>>,
+}
+
+/// 把设置窗工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
 /// 保证两种路径行为一致：bots 保留运行期字段、供应商密钥留空沿用旧值、默认供应商防悬空）。
 /// 返回 (Config, 丢弃的未命名供应商数)。
-#[allow(clippy::too_many_arguments)]
-fn snapshot_config(
-    work: &RefCell<Vec<BotConfig>>,
-    providers_work: &RefCell<Vec<ProviderConfig>>,
-    default_provider_work: &RefCell<String>,
-    cross_delivery_work: &RefCell<bool>,
-    templates_work: &RefCell<Vec<RoleTemplate>>,
-    history_retention_work: &RefCell<u32>,
-    notify_work: &RefCell<bool>,
-) -> (Config, usize) {
+fn snapshot_config(work: &RefCell<Vec<BotConfig>>, wk: &SettingsWork) -> (Config, usize) {
     let mut c = Config::load().unwrap_or_default();
     // 用工作副本整体替换 bots（保留每个 bot 运行期的 primary_chat_id）
     let old = std::mem::take(&mut c.bots);
@@ -377,17 +388,20 @@ fn snapshot_config(
     c.bots = newb;
 
     // 跨会话投递总开关：全局生效（所有 bot 共享）
-    c.cross_delivery_enabled = *cross_delivery_work.borrow();
+    c.cross_delivery_enabled = *wk.cross_delivery.borrow();
     // #74 历史记录页：保留期 / 提醒开关（全局生效）
-    c.history_retention_days = *history_retention_work.borrow();
-    c.notify_enabled = *notify_work.borrow();
+    c.history_retention_days = *wk.history_retention.borrow();
+    c.notify_enabled = *wk.notify.borrow();
+    // #78 会话归纳清理：全局开关 + 过期天数
+    c.session_gc_enabled = *wk.session_gc.borrow();
+    c.session_gc_days = *wk.session_gc_days.borrow();
 
     // 供应商：用工作副本替换，但 api_key 留空=保留旧值（密码框不回显，编辑其它字段不该清密钥）。
     // 丢弃空 name 行（无效），并计数。
     let old_providers = std::mem::take(&mut c.providers);
     let mut dropped = 0;
     let mut newp: Vec<ProviderConfig> = Vec::new();
-    for mut p in providers_work.borrow().clone().into_iter() {
+    for mut p in wk.providers.borrow().clone().into_iter() {
         if p.name.trim().is_empty() {
             dropped += 1;
             continue;
@@ -401,7 +415,7 @@ fn snapshot_config(
         newp.push(p);
     }
     c.providers = newp;
-    let d = default_provider_work.borrow().clone();
+    let d = wk.default_provider.borrow().clone();
     // 默认供应商名若已不在列表里（被删/改名）→ 清空，避免悬空引用
     c.default_provider = if !d.is_empty() && c.providers.iter().any(|p| p.name == d) {
         d
@@ -409,7 +423,7 @@ fn snapshot_config(
         String::new()
     };
     // 虚拟 Bot 自定义角色模板（#75）：弹窗里管理的工作副本，随保存写盘
-    c.custom_roles = templates_work.borrow().clone();
+    c.custom_roles = wk.templates.borrow().clone();
     (c, dropped)
 }
 
@@ -597,6 +611,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_open_access: b.ding_open_access,
         ding_robot_code: b.ding_robot_code.clone().into(),
         restrict_granted: b.restrict_granted_agent,
+        tidy_enabled: b.tidy_enabled,
     }
 }
 
@@ -1264,17 +1279,19 @@ pub fn run_gui() -> Result<()> {
             }
         },
     );
-    // 供应商工作副本 + model + 全局默认名工作副本
+    // 供应商工作副本 + model + 全局默认名工作副本（#80：除 bots 外的 work 全部
+    // 聚合进 SettingsWork，load/snapshot 签名不再随字段增长）
     let providers_model: Rc<slint::VecModel<ProviderRow>> = Rc::new(slint::VecModel::default());
-    let providers_work: Rc<RefCell<Vec<ProviderConfig>>> = Rc::new(RefCell::new(Vec::new()));
-    let default_provider_work: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-    // 跨会话投递总开关工作副本（#21）
-    let cross_delivery_work: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-    // 虚拟 Bot 自定义角色模板工作副本（#75）：弹窗内管理，随「保存」写盘
-    let templates_work: Rc<RefCell<Vec<RoleTemplate>>> = Rc::new(RefCell::new(Vec::new()));
-    // #74 历史记录页工作副本（保留期/提醒开关）：随保存走既有「保存并重启服务」链路
-    let history_retention_work: Rc<RefCell<u32>> = Rc::new(RefCell::new(30));
-    let notify_work: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let wk = Rc::new(SettingsWork {
+        providers: Rc::new(RefCell::new(Vec::new())),
+        default_provider: Rc::new(RefCell::new(String::new())),
+        cross_delivery: Rc::new(RefCell::new(false)),
+        templates: Rc::new(RefCell::new(Vec::new())),
+        history_retention: Rc::new(RefCell::new(30)),
+        notify: Rc::new(RefCell::new(true)),
+        session_gc: Rc::new(RefCell::new(false)),
+        session_gc_days: Rc::new(RefCell::new(7)),
+    });
     // 历史记录列表 model：2s 轮询只读查询消息库 → set_vec 整体替换（ui.rs sync_history_model）
     let history_model: Rc<slint::VecModel<HistoryRow>> = Rc::new(slint::VecModel::default());
     settings.set_history_rows(slint::ModelRc::from(history_model.clone()));
@@ -1291,35 +1308,33 @@ pub fn run_gui() -> Result<()> {
         v
     }
 
-    // 打开设置窗时装载 config → 各工作副本 + model
-    // 设置窗装载涉及 Slint model + 四份工作副本，参数多；聚集成本高于收益，允许 lint。
-    #[allow(clippy::too_many_arguments)]
+    // 打开设置窗时装载 config → 各工作副本 + model（#80：非 bots 副本聚合在 wk 内）
     fn load_into(
         w: &SettingsWindow,
         c: &Config,
         work: &RefCell<Vec<BotConfig>>,
         model: &slint::VecModel<BotRow>,
-        providers_work: &RefCell<Vec<ProviderConfig>>,
         providers_model: &slint::VecModel<ProviderRow>,
-        default_provider_work: &RefCell<String>,
-        cross_delivery_work: &RefCell<bool>,
-        templates_work: &RefCell<Vec<RoleTemplate>>,
-        history_retention_work: &RefCell<u32>,
-        notify_work: &RefCell<bool>,
+        wk: &SettingsWork,
     ) {
         *work.borrow_mut() = c.bots.clone();
         sync_model(model, &c.bots);
-        *providers_work.borrow_mut() = c.providers.clone();
-        *default_provider_work.borrow_mut() = c.default_provider.clone();
-        *cross_delivery_work.borrow_mut() = c.cross_delivery_enabled;
+        *wk.providers.borrow_mut() = c.providers.clone();
+        *wk.default_provider.borrow_mut() = c.default_provider.clone();
+        *wk.cross_delivery.borrow_mut() = c.cross_delivery_enabled;
         w.set_cross_delivery_enabled(c.cross_delivery_enabled);
         // 虚拟 Bot 自定义角色模板（#75）：工作副本装载；登记列表按选中 bot 刷新
-        *templates_work.borrow_mut() = c.custom_roles.clone();
+        *wk.templates.borrow_mut() = c.custom_roles.clone();
         // #74 历史记录页工作副本（保留期/提醒开关，随保存走既有重启链路）
-        *history_retention_work.borrow_mut() = c.history_retention_days;
+        *wk.history_retention.borrow_mut() = c.history_retention_days;
         w.set_history_retention_days(c.history_retention_days as i32);
-        *notify_work.borrow_mut() = c.notify_enabled;
+        *wk.notify.borrow_mut() = c.notify_enabled;
         w.set_notify_enabled(c.notify_enabled);
+        // #78 会话归纳清理：工作副本装载 + 控件状态回写
+        *wk.session_gc.borrow_mut() = c.session_gc_enabled;
+        w.set_session_gc_enabled(c.session_gc_enabled);
+        *wk.session_gc_days.borrow_mut() = c.session_gc_days;
+        w.set_session_gc_days(c.session_gc_days as i32);
         sync_providers_model(providers_model, &c.providers, &c.default_provider);
         w.set_provider_names(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             build_provider_names(&c.providers),
@@ -1340,54 +1355,24 @@ pub fn run_gui() -> Result<()> {
 
     /// 装载设置窗：发现比正式配置新的草稿 → 静默恢复（返回 true，标记 dirty 并给一行提示）；
     /// 否则按正式配置装载（返回 false）。「静默恢复」= 不弹选择框，直接把草稿当工作底稿。
-    #[allow(clippy::too_many_arguments)]
     fn load_with_draft(
         w: &SettingsWindow,
         dirty: &Cell<bool>,
         work: &RefCell<Vec<BotConfig>>,
         model: &slint::VecModel<BotRow>,
-        providers_work: &RefCell<Vec<ProviderConfig>>,
         providers_model: &slint::VecModel<ProviderRow>,
-        default_provider_work: &RefCell<String>,
-        cross_delivery_work: &RefCell<bool>,
-        templates_work: &RefCell<Vec<RoleTemplate>>,
-        history_retention_work: &RefCell<u32>,
-        notify_work: &RefCell<bool>,
+        wk: &SettingsWork,
     ) -> bool {
         if Config::draft_is_newer() {
             let draft = Config::load_draft().unwrap_or_default();
-            load_into(
-                w,
-                &draft,
-                work,
-                model,
-                providers_work,
-                providers_model,
-                default_provider_work,
-                cross_delivery_work,
-                templates_work,
-                history_retention_work,
-                notify_work,
-            );
+            load_into(w, &draft, work, model, providers_model, wk);
             dirty.set(true);
             w.set_status_is_error(false);
             w.set_status_line("已恢复上次未保存的草稿（编辑后点「保存」写入配置）".into());
             true
         } else {
             let cfg = Config::load().unwrap_or_default();
-            load_into(
-                w,
-                &cfg,
-                work,
-                model,
-                providers_work,
-                providers_model,
-                default_provider_work,
-                cross_delivery_work,
-                templates_work,
-                history_retention_work,
-                notify_work,
-            );
+            load_into(w, &cfg, work, model, providers_model, wk);
             dirty.set(false);
             false
         }
@@ -2263,22 +2248,8 @@ pub fn run_gui() -> Result<()> {
             let debug_show = std::env::args().any(|a| a == "--show-settings");
             let work = work.clone();
             let model = bots_model.clone();
-            let pwork = providers_work.clone();
             let pmodel = providers_model.clone();
-            let dwork = default_provider_work.clone();
-            load_with_draft(
-                &settings,
-                &dirty,
-                &work,
-                &model,
-                &pwork,
-                &pmodel,
-                &dwork,
-                &cross_delivery_work,
-                &templates_work,
-                &history_retention_work,
-                &notify_work,
-            );
+            load_with_draft(&settings, &dirty, &work, &model, &pmodel, &wk);
             push_settings_status(&settings, &install::status());
             // 调试参数（--show-settings）不设误导的「未检测到」状态行
             if !debug_show {
@@ -2295,14 +2266,8 @@ pub fn run_gui() -> Result<()> {
         let sw = settings.as_weak();
         let work = work.clone();
         let model = bots_model.clone();
-        let pwork = providers_work.clone();
         let pmodel = providers_model.clone();
-        let dwork = default_provider_work.clone();
-        let cdwork = cross_delivery_work.clone();
-        let retention_work = history_retention_work.clone();
-        let notify_work = notify_work.clone();
         let dirty_open = dirty.clone();
-        let twork = templates_work.clone();
         // 供托盘「设置…」与 Dock 点击共用的显示逻辑：草稿恢复 + 显示置前。
         // Dock 图标点击恢复窗口（no-frame 后系统标题栏窗口的默认 reopen 行为失效，
         // 2026-08-18 回归修复）走同款路径。
@@ -2312,52 +2277,35 @@ pub fn run_gui() -> Result<()> {
             let dock_sw = settings.as_weak();
             let dock_work = work.clone();
             let dock_model = bots_model.clone();
-            let dock_pwork = providers_work.clone();
             let dock_pmodel = providers_model.clone();
-            let dock_dwork = default_provider_work.clone();
-            let dock_cdwork = cross_delivery_work.clone();
-            let dock_retention_work = history_retention_work.clone();
-            let dock_notify_work = notify_work.clone();
             let dock_dirty = dirty.clone();
-            let dock_twork = templates_work.clone();
-            crate::platform::install_dock_reopen(Box::new(move || {
-                if let Some(w) = dock_sw.upgrade() {
-                    load_with_draft(
-                        &w,
-                        &dock_dirty,
-                        &dock_work,
-                        &dock_model,
-                        &dock_pwork,
-                        &dock_pmodel,
-                        &dock_dwork,
-                        &dock_cdwork,
-                        &dock_twork,
-                        &dock_retention_work,
-                        &dock_notify_work,
-                    );
-                    push_settings_status(&w, &install::status());
-                    show_window_and_focus(&w);
+            crate::platform::install_dock_reopen(Box::new({
+                let wk = wk.clone();
+                move || {
+                    if let Some(w) = dock_sw.upgrade() {
+                        load_with_draft(
+                            &w,
+                            &dock_dirty,
+                            &dock_work,
+                            &dock_model,
+                            &dock_pmodel,
+                            &wk,
+                        );
+                        push_settings_status(&w, &install::status());
+                        show_window_and_focus(&w);
+                    }
                 }
             }));
         }
-        tray.on_open_settings(move || {
-            if let Some(w) = tray_sw.upgrade() {
-                // 草稿比正式配置新（上次编辑没保存就退出/崩溃）→ 静默恢复为工作底稿
-                load_with_draft(
-                    &w,
-                    &dirty_open,
-                    &work,
-                    &model,
-                    &pwork,
-                    &pmodel,
-                    &dwork,
-                    &cdwork,
-                    &twork,
-                    &retention_work,
-                    &notify_work,
-                );
-                push_settings_status(&w, &install::status());
-                show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
+        tray.on_open_settings({
+            let wk = wk.clone();
+            move || {
+                if let Some(w) = tray_sw.upgrade() {
+                    // 草稿比正式配置新（上次编辑没保存就退出/崩溃）→ 静默恢复为工作底稿
+                    load_with_draft(&w, &dirty_open, &work, &model, &pmodel, &wk);
+                    push_settings_status(&w, &install::status());
+                    show_window_and_focus(&w); // 先 show 再激活再重绘（见该函数注释：避免内容区透明）
+                }
             }
         });
     }
@@ -2538,8 +2486,27 @@ pub fn run_gui() -> Result<()> {
             sync_model(&model, &b);
         });
     }
+    // 「每日工作目录整理」开关（默认关）：孤儿会话文件/临时文件/超期历史截断/
+    // 文档归档 + git 留痕。同独立 bool callback 模式（避开 CheckBox 绑定坑）。
     {
-        let cdwork = cross_delivery_work.clone();
+        let work = work.clone();
+        let model = bots_model.clone();
+        let dirty = dirty.clone();
+        settings.on_set_tidy_enabled(move |idx, enabled| {
+            dirty.set(true);
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.tidy_enabled = enabled;
+                }
+            }
+            // 同步回写 model：勾选框状态绑 model，不刷新会显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
+        });
+    }
+    {
+        let cdwork = wk.cross_delivery.clone();
         let dirty = dirty.clone();
         settings.on_set_cross_delivery(move |enabled| {
             dirty.set(true);
@@ -2707,7 +2674,7 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let dlg = vb_dialog.as_weak();
-        let twork = templates_work.clone();
+        let twork = wk.templates.clone();
         let dirty = dirty.clone();
         vb_dialog.on_template_save_clicked(move || {
             if let Some(d) = dlg.upgrade() {
@@ -2759,7 +2726,7 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let dlg = vb_dialog.as_weak();
-        let twork = templates_work.clone();
+        let twork = wk.templates.clone();
         let dirty = dirty.clone();
         vb_dialog.on_template_delete_clicked(move |idx| {
             if let Some(d) = dlg.upgrade() {
@@ -2920,7 +2887,7 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let ctx = vb_ctx.clone();
         let dlg = vb_dialog.as_weak();
-        let twork = templates_work.clone();
+        let twork = wk.templates.clone();
         settings.on_virtual_bot_create(move |idx| {
             let b = work.borrow();
             if let Some(bot) = b.get(idx as usize) {
@@ -2967,7 +2934,7 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let ctx = vb_ctx.clone();
         let dlg = vb_dialog.as_weak();
-        let twork = templates_work.clone();
+        let twork = wk.templates.clone();
         settings.on_virtual_bot_edit(move |row| {
             let Some(w) = sw.upgrade() else { return };
             let sel = w.get_selected();
@@ -3067,34 +3034,24 @@ pub fn run_gui() -> Result<()> {
     {
         let tx = tx.clone();
         let work = work.clone();
-        let pwork = providers_work.clone();
-        let dwork = default_provider_work.clone();
-        let cdwork = cross_delivery_work.clone();
-        let twork = templates_work.clone();
-        let retention_work = history_retention_work.clone();
-        let notify_work = notify_work.clone();
         let sw = settings.as_weak();
         let dirty = dirty.clone();
-        settings.on_save_clicked(move || {
-            dirty.set(false);
-            if let Some(w) = sw.upgrade() {
-                let (c, dropped) = snapshot_config(
-                    &work,
-                    &pwork,
-                    &dwork,
-                    &cdwork,
-                    &twork,
-                    &retention_work,
-                    &notify_work,
-                );
-                let _ = tx.send(UiCmd::Save(c));
-                // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
-                w.set_status_is_error(false);
-                let mut msg = "✅ 已保存。窗口可继续编辑，不用了点「关闭」或红点关闭。".to_string();
-                if dropped > 0 {
-                    msg.push_str(&format!("（丢弃 {dropped} 个未命名供应商）"));
+        settings.on_save_clicked({
+            let wk = wk.clone();
+            move || {
+                dirty.set(false);
+                if let Some(w) = sw.upgrade() {
+                    let (c, dropped) = snapshot_config(&work, &wk);
+                    let _ = tx.send(UiCmd::Save(c));
+                    // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
+                    w.set_status_is_error(false);
+                    let mut msg =
+                        "✅ 已保存。窗口可继续编辑，不用了点「关闭」或红点关闭。".to_string();
+                    if dropped > 0 {
+                        msg.push_str(&format!("（丢弃 {dropped} 个未命名供应商）"));
+                    }
+                    w.set_status_line(msg.into());
                 }
-                w.set_status_line(msg.into());
             }
         });
     }
@@ -3167,7 +3124,7 @@ pub fn run_gui() -> Result<()> {
     // 提醒开关：写工作副本 + 标记 dirty（随保存写 config；保存走既有重启链路）
     settings.on_set_notify_enabled({
         let sw = settings.as_weak();
-        let work = notify_work.clone();
+        let work = wk.notify.clone();
         let dirty = dirty.clone();
         move |on| {
             *work.borrow_mut() = on;
@@ -3180,7 +3137,7 @@ pub fn run_gui() -> Result<()> {
     // 保留期下拉（下标 0=7 天 1=30 天 2=90 天）：写工作副本 + 标记 dirty
     settings.on_set_history_retention({
         let sw = settings.as_weak();
-        let work = history_retention_work.clone();
+        let work = wk.history_retention.clone();
         let dirty = dirty.clone();
         move |idx| {
             let days = match idx {
@@ -3192,6 +3149,38 @@ pub fn run_gui() -> Result<()> {
             dirty.set(true);
             if let Some(w) = sw.upgrade() {
                 w.set_history_retention_days(days as i32);
+            }
+        }
+    });
+    // 会话归纳清理开关（#78，默认关）：写工作副本 + 标记 dirty
+    settings.on_set_session_gc_enabled({
+        let sw = settings.as_weak();
+        let work = wk.session_gc.clone();
+        let dirty = dirty.clone();
+        move |on| {
+            *work.borrow_mut() = on;
+            dirty.set(true);
+            if let Some(w) = sw.upgrade() {
+                w.set_session_gc_enabled(on); // 回写属性：页面切换重建控件时保持选中态
+            }
+        }
+    });
+    // 过期天数下拉（下标 0=3 天 1=7 天 2=14 天 3=30 天）：写工作副本 + 标记 dirty
+    settings.on_set_session_gc_days({
+        let sw = settings.as_weak();
+        let work = wk.session_gc_days.clone();
+        let dirty = dirty.clone();
+        move |idx| {
+            let days = match idx {
+                0 => 3,
+                2 => 14,
+                3 => 30,
+                _ => 7,
+            };
+            *work.borrow_mut() = days;
+            dirty.set(true);
+            if let Some(w) = sw.upgrade() {
+                w.set_session_gc_days(days as i32);
             }
         }
     });
@@ -3573,7 +3562,7 @@ pub fn run_gui() -> Result<()> {
 
     // ── 供应商编辑回调（per-field 纪律与 bot 一致）──
     {
-        let pwork = providers_work.clone();
+        let pwork = wk.providers.clone();
         let dirty = dirty.clone();
         settings.on_provider_field_edited(move |idx, field, value| {
             dirty.set(true);
@@ -3592,9 +3581,9 @@ pub fn run_gui() -> Result<()> {
     }
     {
         // 切中别的供应商：重建 model 强制编辑区刷新（同 bot 的 ComboBox current-value 陈旧坑）
-        let pwork = providers_work.clone();
+        let pwork = wk.providers.clone();
         let pmodel = providers_model.clone();
-        let dwork = default_provider_work.clone();
+        let dwork = wk.default_provider.clone();
         settings.on_provider_selection_changed(move |_idx| {
             let pv = pwork.borrow();
             let d = dwork.borrow();
@@ -3602,9 +3591,9 @@ pub fn run_gui() -> Result<()> {
         });
     }
     {
-        let pwork = providers_work.clone();
+        let pwork = wk.providers.clone();
         let pmodel = providers_model.clone();
-        let dwork = default_provider_work.clone();
+        let dwork = wk.default_provider.clone();
         let sw = settings.as_weak();
         let dirty = dirty.clone();
         settings.on_add_provider(move || {
@@ -3626,9 +3615,9 @@ pub fn run_gui() -> Result<()> {
         });
     }
     {
-        let pwork = providers_work.clone();
+        let pwork = wk.providers.clone();
         let pmodel = providers_model.clone();
-        let dwork = default_provider_work.clone();
+        let dwork = wk.default_provider.clone();
         let sw = settings.as_weak();
         let dirty = dirty.clone();
         settings.on_remove_provider(move |idx| {
@@ -3654,9 +3643,9 @@ pub fn run_gui() -> Result<()> {
         });
     }
     {
-        let pwork = providers_work.clone();
+        let pwork = wk.providers.clone();
         let pmodel = providers_model.clone();
-        let dwork = default_provider_work.clone();
+        let dwork = wk.default_provider.clone();
         let dirty = dirty.clone();
         settings.on_set_default_provider(move |idx| {
             dirty.set(true);
@@ -3672,7 +3661,7 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let tx = tx.clone();
-        let pwork = providers_work.clone();
+        let pwork = wk.providers.clone();
         let sw = settings.as_weak();
         settings.on_test_provider(move |idx| {
             let pv = pwork.borrow();
@@ -3699,19 +3688,8 @@ pub fn run_gui() -> Result<()> {
         // 覆盖 config，把磁盘上已有的 bots 全部抹掉（半配置状态：配了但 is_configured 为假）。
         // 此处仍在事件循环启动前的主线程设置阶段，直接调用即可（Rc 非 Send，
         // 不能塞进 invoke_from_event_loop）。
-        let restored = load_with_draft(
-            &settings,
-            &dirty,
-            &work,
-            &bots_model,
-            &providers_work,
-            &providers_model,
-            &default_provider_work,
-            &cross_delivery_work,
-            &templates_work,
-            &history_retention_work,
-            &notify_work,
-        );
+        let restored =
+            load_with_draft(&settings, &dirty, &work, &bots_model, &providers_model, &wk);
         // 已静默恢复草稿时保留恢复提示，别被「请先添加」覆盖
         if !restored {
             settings.set_status_is_error(false);
@@ -3731,12 +3709,6 @@ pub fn run_gui() -> Result<()> {
         let tray_hold = tray;
         let tray_weak = tray_hold.as_weak();
         let dirty = dirty.clone();
-        let providers_work_t = providers_work.clone();
-        let default_provider_work_t = default_provider_work.clone();
-        let cross_delivery_work_t = cross_delivery_work.clone();
-        let templates_work_t = templates_work.clone();
-        let history_retention_work_t = history_retention_work.clone();
-        let notify_work_t = notify_work.clone();
         // #74 未读提醒：弹窗句柄 + 防重弹标记 + 5s 自动收起定时器（每次弹出 restart）
         let notif_weak = notifications.as_weak();
         let notif_showing = notif_showing.clone();
@@ -3750,37 +3722,31 @@ pub fn run_gui() -> Result<()> {
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
-            move || {
-                let _keep = &tray_hold;
-                // 每 tick 只查一次进程状态（install::status 内部 fork ps，别重复查）
-                let st = install::status();
-                // 看门：意图=运行但进程不在 → 崩溃，重拉（用户手动停止会清 desired，不覆盖）
-                if install::is_desired() && !st.running {
-                    crate::log!("[watchdog] service 意外退出，自动重拉");
-                    let _ = install::svc_start();
-                }
-                if let Some(t) = tray_weak.upgrade() {
-                    push_status(&t, &st);
-                }
-                // 同步设置窗的动态标题 + 顶部运行概览（隐藏也更新，下次打开即最新）
-                if let Some(w) = settings_weak.upgrade() {
-                    push_settings_status(&w, &st);
-                }
-                // 草稿自动保存：有未保存修改就每 tick 落盘一次（小文件 + 原子写，成本可忽略）
-                if dirty.get() {
-                    let (draft, _dropped) = snapshot_config(
-                        &work,
-                        &providers_work_t,
-                        &default_provider_work_t,
-                        &cross_delivery_work_t,
-                        &templates_work_t,
-                        &history_retention_work_t,
-                        &notify_work_t,
-                    );
-                    if let Err(e) = draft.save_draft() {
-                        crate::log!("[gui] 草稿自动保存失败: {e:#}");
+            {
+                let wk = wk.clone();
+                move || {
+                    let _keep = &tray_hold;
+                    // 每 tick 只查一次进程状态（install::status 内部 fork ps，别重复查）
+                    let st = install::status();
+                    // 看门：意图=运行但进程不在 → 崩溃，重拉（用户手动停止会清 desired，不覆盖）
+                    if install::is_desired() && !st.running {
+                        crate::log!("[watchdog] service 意外退出，自动重拉");
+                        let _ = install::svc_start();
                     }
-                }
+                    if let Some(t) = tray_weak.upgrade() {
+                        push_status(&t, &st);
+                    }
+                    // 同步设置窗的动态标题 + 顶部运行概览（隐藏也更新，下次打开即最新）
+                    if let Some(w) = settings_weak.upgrade() {
+                        push_settings_status(&w, &st);
+                    }
+                    // 草稿自动保存：有未保存修改就每 tick 落盘一次（小文件 + 原子写，成本可忽略）
+                    if dirty.get() {
+                        let (draft, _dropped) = snapshot_config(&work, &wk);
+                        if let Err(e) = draft.save_draft() {
+                            crate::log!("[gui] 草稿自动保存失败: {e:#}");
+                        }
+                    }
                 // 依赖安装结果：清 dep-busy，刷新检测状态，报结果
                 while let Ok(evt) = dep_rx.try_recv() {
                     if let Some(w) = settings_weak.upgrade() {
@@ -4128,7 +4094,7 @@ pub fn run_gui() -> Result<()> {
                         }
                     }
                 }
-            },
+            }},
         );
     }
 

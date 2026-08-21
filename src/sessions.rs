@@ -69,8 +69,8 @@ impl SessionStore {
         Self::at(current_backend, dir.join("sessions.json"))
     }
 
-    /// 按指定路径构造（生产/测试共用）。
-    fn at(current_backend: &str, path: PathBuf) -> SessionStore {
+    /// 按指定路径构造（生产/测试共用；会话归纳清理测试注入 temp workspace）。
+    pub(crate) fn at(current_backend: &str, path: PathBuf) -> SessionStore {
         let data = if path.exists() {
             fs::read_to_string(&path)
                 .ok()
@@ -162,7 +162,7 @@ impl SessionStore {
         Some(out)
     }
 
-    fn save_locked(&self, data: &HashMap<String, ChatEntry>) {
+    fn save_locked(&self, data: &HashMap<String, ChatEntry>) -> bool {
         // 原子写：唯一 tmp + rename（崩溃不留半截；唯一 tmp 避免 CLI reset 与 service
         // 写盘并发时互相覆盖同一 tmp 文件）
         let tmp = self
@@ -174,10 +174,11 @@ impl SessionStore {
                 *self.loaded_sig.lock().unwrap() = fs::metadata(&self.path)
                     .ok()
                     .and_then(|m| Some((m.modified().ok()?, m.len())));
-                return;
+                return true;
             }
         }
         let _ = fs::remove_file(&tmp);
+        false
     }
 
     /// 取当前后端槽位的可变引用（没有则建默认槽位）。
@@ -309,6 +310,42 @@ impl SessionStore {
                 }
             })
             .unwrap_or(false)
+    }
+
+    /// 读某 chat 的完整槽位（所有后端）。不存在返回 None。
+    /// 会话归纳清理（session_gc）用它取各后端 sid，精确匹配删除对应会话文件。
+    pub fn chat_entry(&self, chat_id: &str) -> Option<ChatEntry> {
+        self.refresh();
+        self.data.lock().unwrap().get(chat_id).cloned()
+    }
+
+    /// 枚举全部 chat key（会话归纳候选判定用；与 parse/refresh 同源——sessions.json
+    /// 的解析/旧格式迁移只此一处，schema 演进不绕行裸读）。
+    pub fn chat_keys(&self) -> Vec<String> {
+        self.refresh();
+        self.data.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// 删除某 chat 的整个槽位（会话归纳清理用：历史与后端会话文件已清，槽位无意义）。
+    /// 返回是否真的删除了且**落盘成功**（save 失败返回 false，调用方据此保留会话状态，
+    /// 避免陈旧槽位指向已删文件）；下一个 `ensure_with_started` 会自动重建新 UUID。
+    pub fn remove_chat(&self, chat_id: &str) -> bool {
+        self.refresh();
+        let mut data = self.data.lock().unwrap();
+        if !data.contains_key(chat_id) {
+            return false;
+        }
+        // 先落盘再改内存：save 失败时内存与磁盘一致（槽位仍在），「保留会话状态」才
+        // 是真的（原实现先 remove 再 save——失败后内存已丢、磁盘还在，进程重启后
+        // 陈旧槽位复活指向已删文件；审查修复）。
+        let mut next = data.clone();
+        next.remove(chat_id);
+        if self.save_locked(&next) {
+            *data = next;
+            true
+        } else {
+            false
+        }
     }
 
     /// 枚举指定后端**全部 chat** 存活槽位的 session_id（#67 /new 清理用）。
@@ -470,6 +507,35 @@ mod tests {
             "claude 槽位不算 prime 存活会话"
         );
         assert_eq!(store.live_session_ids("claude"), vec!["c-uuid"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_chat_removes_entry_and_persists() {
+        // 会话归纳清理（session_gc）：删除整 chat 槽位，落盘可重载；不存在返回 false
+        let dir = std::env::temp_dir().join(format!("abb-sessions-rm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("claude", path.clone());
+        let sid = store.ensure_session("oc_a");
+        store.ensure_session("oc_b");
+        // chat_entry 读回全部后端槽位
+        let entry = store.chat_entry("oc_a").expect("存在应返回");
+        assert_eq!(entry.claude.session_id, sid);
+        assert!(store.chat_entry("oc_none").is_none());
+        // remove_chat：删一个，另一个不受影响
+        assert!(store.remove_chat("oc_a"));
+        assert!(store.chat_entry("oc_a").is_none());
+        assert!(store.chat_entry("oc_b").is_some());
+        assert!(!store.remove_chat("oc_a"), "已删的 chat 再删返回 false");
+        // 落盘持久化（新实例重读）
+        let store2 = SessionStore::new_at("claude", path.clone());
+        assert!(store2.chat_entry("oc_a").is_none());
+        assert!(store2.chat_entry("oc_b").is_some());
+        // 删除后重建：ensure_with_started 自动生成新 UUID
+        let (sid2, started) = store2.ensure_with_started("oc_a");
+        assert_ne!(sid2, sid, "删除后重建应换新 UUID");
+        assert!(!started);
         std::fs::remove_dir_all(&dir).ok();
     }
 

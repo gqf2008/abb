@@ -403,6 +403,32 @@ fn build_injection(
 ///
 /// codex 上下文：codex 用自己的 thread_id（非桥生成的 UUID），故需要 `sessions` 在首轮抓到
 /// 真实 thread_id 后回存（bridge 调 claude 时传 None，claude 直接用桥的 UUID 无需回存）。
+/// codex / prime-agent 首轮（或回退重建）抓到对端真实会话 id 时采纳：sid 同步换成
+/// 真实值（RunOutcome 返回的就是它——桥的 mark_started_if 按 session_id 校验身份，
+/// 返回旧占位 UUID 会让它们永远 mark 不上：started 恒 false → 每轮都当首轮新开会话、
+/// 上下文全丢；#49 审查 I-1）。有 store 时回存走 CAS（set_session_id_if）：仅当槽位
+/// 仍是我们启动时的会话才写——运行中被 /new 或 CLI reset 换走时不得把旧任务会话写进
+/// 新槽位，否则 mark_started_if 匹配旧会话、新会话 resume 旧会话（#49 审查）。
+/// sessions=None（session_gc 归纳 / run_job 定时任务）也换 sid：无槽位可回存（跳过
+/// CAS），但返回真实 id——占位 UUID 匹配不到 prime 自生成的会话文件，调用方按
+/// Reply.session_id 精确清理转录会落空（审查修复；抽成纯函数便于回归测试）。
+fn adopt_thread_id(
+    backend: Backend,
+    sid: String,
+    tid: &str,
+    sessions: Option<&crate::sessions::SessionStore>,
+    session_key: &str,
+) -> String {
+    if matches!(backend, Backend::Codex | Backend::PrimeAgent) && tid != sid {
+        if let Some(store) = sessions {
+            store.set_session_id_if(session_key, &sid, tid);
+        }
+        tid.to_string()
+    } else {
+        sid
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     backend: Backend,
@@ -484,13 +510,11 @@ pub async fn run(
                 // 回存走 CAS（set_session_id_if）：仅当槽位仍是我们启动时的会话才写——
                 // 运行中被 /new 或 CLI reset 换走时不得把旧任务会话写进新槽位，
                 // 否则 mark_started_if 匹配旧会话、新会话 resume 旧会话（#49 审查）。
-                if matches!(backend, Backend::Codex | Backend::PrimeAgent) {
-                    if let (Some(tid), Some(store)) = (&out.thread_id, sessions) {
-                        if tid != &sid {
-                            store.set_session_id_if(session_key, &sid, tid);
-                            sid = tid.clone();
-                        }
-                    }
+                // sessions=None（session_gc 归纳 / run_job 定时任务）也换 sid：无槽位可
+                // 回存（跳过 CAS），但返回真实 id——占位 UUID 匹配不到 prime 自生成的
+                // 会话文件，调用方按 Reply.session_id 精确清理转录会落空（审查修复）。
+                if let Some(tid) = &out.thread_id {
+                    sid = adopt_thread_id(backend, sid, tid, sessions, session_key);
                 }
                 // pi 不用回存：--session-id 直接用桥的 UUID，首轮就固定（无需 thread_id）
                 return Ok(RunOutcome::Reply {
@@ -944,6 +968,124 @@ pub fn session_file_id(path: &std::path::Path) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(first.trim_start_matches('\u{feff}'))
         .ok()
         .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_owned))
+}
+
+/// 会话文件删除的匹配模式（pi/prime 会话文件清理的公共判定）。
+/// - [`SidMatch::InSet`]：删「匹配集合内」的文件——session_gc 按槽位 sid 精确清理；
+/// - [`SidMatch::NotInSet`]：删「匹配集合外」的文件——孤儿清理（/new 与 tidy）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidMatch {
+    InSet,
+    NotInSet,
+}
+
+/// 后端会话文件删除的「即时清理」mtime 护栏（秒）：10 分钟。
+/// /new 与 session_gc 共用（另一个聊天正在跑的首轮任务文件 mtime 新鲜，不得误删）；
+/// tidy 的每日孤儿清理用更宽的 24h（[`crate::tidy::ORPHAN_FRESH_SECS`]）。
+pub const TRANSCRIPT_FRESH_SECS: u64 = 600;
+
+/// 删除 `.pi-sessions` 中的会话文件（文件名 `<ts>_<sid>.jsonl`，sid 用 contains 匹配——
+/// ts 是纯数字+下划线、sid 是 UUID，文件名无分隔歧义）。
+/// `fresh_secs`：mtime 距今小于该值的文件保留（宁留不删——可能是运行中的轮次）；
+/// `None` = 不查 mtime（/new 的即时清理语义：被轮换的旧 sid 不可能再被使用）。
+/// mtime 读不到按新鲜保留（宁留不删）。返回删除数。
+pub fn remove_pi_transcripts(
+    workspace: &std::path::Path,
+    sids: &std::collections::HashSet<String>,
+    mode: SidMatch,
+    fresh_secs: Option<u64>,
+) -> usize {
+    remove_transcripts_in(workspace, ".pi-sessions", fresh_secs, |path| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // 空 sid 必须跳过：name.contains("") 恒真——session_gc 精确清理（InSet）若拿到
+        // 空 sid（codex/prime 的 thread_id 为空串时 agent::run 会把占位换成 ""，审查
+        // 发现）会把整个 .pi-sessions 当命中删光；live 集（NotInSet）侧已由
+        // live_session_ids 过滤空值，此处统一兜底（审查修复）。
+        let hit = sids
+            .iter()
+            .any(|sid| !sid.is_empty() && name.contains(sid.as_str()));
+        if mode == SidMatch::InSet {
+            hit
+        } else {
+            !hit
+        }
+    })
+}
+
+/// 删除 `.prime-sessions` 中的会话文件（文件名是 ULID、不含会话 id，只能读首行
+/// 内容判定，见 [`session_file_id`]）。首行损坏（id 不可解析）视为「不在集合内」——
+/// 孤儿清理（NotInSet）时删除，精确清理（InSet）时不命中。
+/// `fresh_secs` / 返回值语义同 [`remove_pi_transcripts`]。
+pub fn remove_prime_transcripts(
+    workspace: &std::path::Path,
+    ids: &std::collections::HashSet<String>,
+    mode: SidMatch,
+    fresh_secs: Option<u64>,
+) -> usize {
+    remove_transcripts_in(
+        workspace,
+        ".prime-sessions",
+        fresh_secs,
+        |path| match session_file_id(path) {
+            None => mode == SidMatch::NotInSet,
+            Some(id) => {
+                let hit = ids.contains(&id);
+                if mode == SidMatch::InSet {
+                    hit
+                } else {
+                    !hit
+                }
+            }
+        },
+    )
+}
+
+/// 两个删除函数的公共骨架：扫目录 → mtime 护栏（读不到按新鲜，宁留不删）→ 谓词判定。
+/// 只删文件（目录跳过）；目录不存在/枚举失败按 0（常态：该后端无会话文件）。
+fn remove_transcripts_in<F: FnMut(&std::path::Path) -> bool>(
+    workspace: &std::path::Path,
+    dir_name: &str,
+    fresh_secs: Option<u64>,
+    mut should_remove: F,
+) -> usize {
+    let Ok(rd) = std::fs::read_dir(workspace.join(dir_name)) else {
+        return 0;
+    };
+    let now = crate::chrono_lite::unix_secs();
+    let cutoff = fresh_secs.map(|s| now.saturating_sub(s));
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // 读不到 mtime 按新鲜（u64::MAX > 任何 cutoff）——宁留不删。
+        // 无护栏（fresh_secs=None，session_gc 转录清理）时无需 stat（审查修复：
+        // 原来无条件对每个文件做一次元数据调用）。
+        let mtime = match cutoff {
+            Some(_) => entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs())
+                })
+                .unwrap_or(u64::MAX),
+            None => u64::MAX,
+        };
+        if cutoff.is_some_and(|c| mtime > c) {
+            continue; // 新鲜文件可能是运行中的轮次，宁留不删
+        }
+        if should_remove(&path) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// 末行必须是完整 JSON 记录（截断检测）。追加式 JSONL 最常见的损坏形态是崩溃中断
@@ -1561,6 +1703,40 @@ mod tests {
         Option<String>,
     );
 
+    #[test]
+    fn adopt_thread_id_swaps_sid_even_without_store() {
+        // 回归护栏（审查修复）：sessions=None（session_gc 归纳 / run_job 定时任务）
+        // 也换 sid——占位 UUID 匹配不到 prime 自生成的会话文件，调用方按
+        // Reply.session_id 精确清理转录会落空（曾无任何测试覆盖此分支）。
+        let sid = "u0".to_string();
+        // sessions=None：换 sid、不写库（无 store 可写，也不 panic）
+        assert_eq!(
+            adopt_thread_id(Backend::Codex, sid.clone(), "tid1", None, "chat"),
+            "tid1"
+        );
+        assert_eq!(
+            adopt_thread_id(Backend::PrimeAgent, sid.clone(), "tid1", None, "chat"),
+            "tid1"
+        );
+        // 相同 id → 不换（run_once 的 codex 复用轮 thread_id == sid）
+        assert_eq!(
+            adopt_thread_id(Backend::Codex, sid.clone(), "u0", None, "chat"),
+            "u0"
+        );
+        // pi 不换：--session-id 直接用桥的 UUID，首轮就固定（无需 thread_id）
+        assert_eq!(
+            adopt_thread_id(Backend::Pi, sid.clone(), "tid2", None, "chat"),
+            "u0"
+        );
+        // claude 不换（桥直接传 UUID，无 thread_id 语义）
+        assert_eq!(
+            adopt_thread_id(Backend::Claude, sid.clone(), "tid3", None, "chat"),
+            "u0"
+        );
+        // 空 tid 也换（原语义：thread_id 为 Some("") 同样触发 swap）——保持行为一致
+        assert_eq!(adopt_thread_id(Backend::Codex, sid, "", None, "chat"), "");
+    }
+
     fn run_lines(backend: Backend, lines: &[&str]) -> LineState {
         let mut tid = None;
         let mut pending = None;
@@ -1570,6 +1746,117 @@ mod tests {
             process_line(backend, l, &mut tid, &mut pending, &mut res, &mut pi_err);
         }
         (pending, tid, res, pi_err)
+    }
+
+    /// 唯一 temp workspace（每个测试独立，避免并发互踩）。
+    fn temp_ws(name: &str) -> std::path::PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("abb-agent-sess-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 把文件 mtime 拨旧（模拟不活跃会话文件；与 tidy/session_gc 测试同款手法）。
+    fn set_mtime_old(path: &std::path::Path, secs_ago: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remove_pi_in_set_matches_by_contains() {
+        // /new 语义（fresh_secs=None，无护栏）：只删文件名包含匹配 sid 的文件
+        let ws = temp_ws("pi-in");
+        std::fs::create_dir_all(ws.join(".pi-sessions")).unwrap();
+        let a = ws.join(".pi-sessions/1000_sid_a.jsonl");
+        let b = ws.join(".pi-sessions/1000_sid_b.jsonl");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "x").unwrap();
+        let sids = std::collections::HashSet::from(["sid_a".to_string()]);
+        assert_eq!(
+            remove_pi_transcripts(&ws, &sids, SidMatch::InSet, None),
+            1,
+            "无护栏即时删（/new 语义）"
+        );
+        assert!(!a.exists() && b.exists(), "只删匹配 sid");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn remove_pi_not_in_set_keeps_live_and_fresh() {
+        // tidy 孤儿语义（NotInSet + 护栏）：live 集内与新鲜文件都保留
+        let ws = temp_ws("pi-out");
+        std::fs::create_dir_all(ws.join(".pi-sessions")).unwrap();
+        let live_f = ws.join(".pi-sessions/1000_live_s.jsonl");
+        let dead_old = ws.join(".pi-sessions/1000_dead_s.jsonl");
+        let dead_fresh = ws.join(".pi-sessions/1000_dead_fresh.jsonl");
+        for p in [&live_f, &dead_old, &dead_fresh] {
+            std::fs::write(p, "x").unwrap();
+        }
+        set_mtime_old(&dead_old, 30 * 3600);
+        set_mtime_old(&dead_fresh, 2 * 60); // 2 分钟 < 10 分钟护栏
+        let live = std::collections::HashSet::from(["live_s".to_string()]);
+        assert_eq!(
+            remove_pi_transcripts(&ws, &live, SidMatch::NotInSet, Some(TRANSCRIPT_FRESH_SECS)),
+            1,
+            "只删死 sid + 旧 mtime"
+        );
+        assert!(live_f.exists() && dead_fresh.exists() && !dead_old.exists());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn remove_prime_in_set_matches_exact_id() {
+        // session_gc 语义（InSet）：首行 id 精确匹配；损坏首行不命中
+        let ws = temp_ws("prime-in");
+        std::fs::create_dir_all(ws.join(".prime-sessions")).unwrap();
+        let a = ws.join(".prime-sessions/ulid_a.jsonl");
+        let b = ws.join(".prime-sessions/ulid_b.jsonl");
+        let bad = ws.join(".prime-sessions/ulid_bad.jsonl");
+        std::fs::write(&a, "{\"id\":\"p_a\"}\n").unwrap();
+        std::fs::write(&b, "{\"id\":\"p_b\"}\n").unwrap();
+        std::fs::write(&bad, "{坏json\n").unwrap();
+        let ids = std::collections::HashSet::from(["p_a".to_string()]);
+        assert_eq!(
+            remove_prime_transcripts(&ws, &ids, SidMatch::InSet, None),
+            1,
+            "精确匹配只删目标"
+        );
+        assert!(
+            !a.exists() && b.exists() && bad.exists(),
+            "损坏首行（InSet）不命中"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn remove_prime_not_in_set_removes_orphans_and_corrupt() {
+        // /new 与 tidy 的孤儿语义（NotInSet）：非 live 全删（含损坏首行），护栏保护新鲜文件
+        let ws = temp_ws("prime-out");
+        std::fs::create_dir_all(ws.join(".prime-sessions")).unwrap();
+        let live_f = ws.join(".prime-sessions/ulid_live.jsonl");
+        let orphan = ws.join(".prime-sessions/ulid_orphan.jsonl");
+        let bad = ws.join(".prime-sessions/ulid_bad.jsonl");
+        let fresh_orphan = ws.join(".prime-sessions/ulid_fresh.jsonl");
+        std::fs::write(&live_f, "{\"id\":\"p_live\"}\n").unwrap();
+        std::fs::write(&orphan, "{\"id\":\"p_dead\"}\n").unwrap();
+        std::fs::write(&bad, "{坏json\n").unwrap();
+        std::fs::write(&fresh_orphan, "{\"id\":\"p_fresh\"}\n").unwrap();
+        set_mtime_old(&orphan, 30 * 3600);
+        set_mtime_old(&bad, 30 * 3600);
+        set_mtime_old(&fresh_orphan, 2 * 60); // 2 分钟 < 10 分钟护栏
+        let live = std::collections::HashSet::from(["p_live".to_string()]);
+        assert_eq!(
+            remove_prime_transcripts(&ws, &live, SidMatch::NotInSet, Some(TRANSCRIPT_FRESH_SECS)),
+            2,
+            "删非 live（含损坏首行）；live 与新鲜孤儿保留"
+        );
+        assert!(live_f.exists() && fresh_orphan.exists() && !orphan.exists() && !bad.exists());
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]

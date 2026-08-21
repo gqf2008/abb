@@ -316,6 +316,158 @@ async fn run_bot(
         });
     }
 
+    // 每日工作目录整理循环（per-bot 开关 tidy_enabled，默认关）：24h 门 + 配置热读。
+    // 纯文件操作（无 agent 调用），与调度循环独立——调度跑 agent（慢）不该阻塞整理。
+    // 首轮延迟 24h + jitter（盐与 session_gc 不同，错开两循环触发分钟）：
+    // 启动即跑会对每个 bot 全量扫描写盘 + git 操作，不值得。
+    {
+        let bridge = bridge.clone();
+        let key = key.clone();
+        let stop = stop.clone();
+        let name: &'static str = Box::leak(format!("tidy:{key}").into_boxed_str());
+        crate::tasks::tasks().spawn_forever(name, async move {
+            crate::log!("[tidy:{key}] 工作目录整理循环启动");
+            let workspace = crate::workspace_dir(&key);
+            // 上次运行标记（重启不丢 24h 门）：损坏/缺失 → 回退内存门
+            let marker = workspace.join(".abb-tidy-last");
+            let jitter = (fnv(&key) ^ 0xC0FFEE) % 3600;
+            // 内存门起点：落盘标记优先（重启不丢 24h 门——若以 now+jitter 起门，
+            // daily_due 恒取新内存门，标记形同虚设：每次重启都把下次运行推迟
+            // 24h+jitter，日重启的机器维护永不触发——审查修复）；无标记（首轮）
+            // → now+jitter 首轮延迟（盐与 session_gc 不同，错开两循环触发分钟）。
+            let mut gate = boot_gate(read_run_marker(&marker), crate::chrono_lite::unix_secs(), jitter);
+            loop {
+                if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
+                    break;
+                }
+                let now = crate::chrono_lite::unix_secs();
+                // 门已由标记种子化并随 due/运行推进（唯一写者是本任务），无需每 tick 读盘
+                let due = daily_due(gate, now);
+                if !due {
+                    continue;
+                }
+                // 到点才推进门并热读配置（原来每 2s tick 全量读盘解析，改每 24h 门一次）。
+                // 门推进与开关无关：关着也推进，下次到点再读——运行中打开 → 最迟 24h 跑首轮
+                gate = Some(now);
+                let cfg = match Config::load() {
+                    Ok(c) => c,
+                    Err(_) => continue, // 配置损坏 → 本周期跳过，下个门再试
+                };
+                let enabled = cfg
+                    .bots
+                    .iter()
+                    .find(|b| b.key() == key)
+                    .map(|b| b.tidy_enabled)
+                    .unwrap_or(false);
+                if !enabled {
+                    continue;
+                }
+                let days = cfg.history_retention_days.max(1);
+                // 孤儿判定依赖 live 集：现取（SessionStore::new 轻量读盘）
+                let live: std::collections::HashSet<String> = {
+                    let store = crate::sessions::SessionStore::new(
+                        &bridge.default_backend,
+                        &key,
+                    );
+                    store
+                        .live_session_ids("pi")
+                        .into_iter()
+                        .chain(store.live_session_ids("prime-agent"))
+                        .collect()
+                };
+                let report = crate::tidy::run_once(&workspace, now, days, &live);
+                write_run_marker(&marker, now);
+                crate::log!(
+                    "[tidy:{key}] 整理完成：临时文件 {}，孤儿会话 {}，历史截断 {} 条，归档 {}，空目录 {}",
+                    report.temp_removed,
+                    report.orphan_removed,
+                    report.history_truncated,
+                    report.archived,
+                    report.emptied_dirs
+                );
+                match crate::tidy::git_commit(&workspace).await {
+                    Ok(crate::tidy::GitOutcome::Committed(h)) => {
+                        crate::log!("[tidy:{key}] git 留痕 commit {h}")
+                    }
+                    Ok(crate::tidy::GitOutcome::NothingToCommit) => {
+                        crate::log!("[tidy:{key}] git 无变更")
+                    }
+                    Ok(crate::tidy::GitOutcome::Skipped(r)) | Err(r) => {
+                        crate::log!("[tidy:{key}] ⚠️ git 留痕跳过：{r}")
+                    }
+                }
+            }
+            crate::log!("[tidy:{key}] 工作目录整理循环退出");
+        });
+    }
+
+    // 每日会话归纳清理循环（全局开关 session_gc_enabled，默认关）：24h 门 + 配置热读。
+    // 过期会话（最后活跃超 session_gc_days）交 bot 后端 agent 归纳成摘要存档
+    //（summaries/），再清理工作区内历史/后端会话文件（绝不触碰 ~/.claude 等后端
+    // 私有目录），摘要下次会话注入衔接上下文。破坏性 + 每会话一次 LLM 调用，故
+    // 默认关、首轮延迟 24h+jitter（盐与 tidy 不同——tidy 用 ^0xC0FFEE，错开两循环
+    // 触发分钟，避免同刻全 bot 全量扫描 + 归纳同时开跑）。
+    {
+        let bridge = bridge.clone();
+        let key = key.clone();
+        let stop = stop.clone();
+        let name: &'static str = Box::leak(format!("session-gc:{key}").into_boxed_str());
+        crate::tasks::tasks().spawn_forever(name, async move {
+            crate::log!("[session-gc:{key}] 会话归纳清理循环启动");
+            let workspace = crate::workspace_dir(&key);
+            // 上次运行标记（重启不丢 24h 门）：损坏/缺失 → 回退内存门
+            let marker = workspace.join(".abb-session-gc-last");
+            let jitter = fnv(&key) % 3600;
+            // 内存门起点：落盘标记优先（重启不丢 24h 门，同上 tidy 循环——审查修复）；
+            // 无标记（首轮）→ now+jitter 首轮延迟（盐与 tidy 不同——tidy 用 ^0xC0FFEE，
+            // 错开两循环触发分钟，避免同刻全 bot 全量扫描 + 归纳同时开跑）
+            let mut gate = boot_gate(
+                read_run_marker(&marker),
+                crate::chrono_lite::unix_secs(),
+                jitter,
+            );
+            loop {
+                if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
+                    break;
+                }
+                let now = crate::chrono_lite::unix_secs();
+                // 门已由标记种子化并随 due/运行推进（唯一写者是本任务），无需每 tick 读盘
+                let due = daily_due(gate, now);
+                if !due {
+                    continue;
+                }
+                // 到点才推进门并热读配置（原来每 2s tick 全量读盘解析，改每 24h 门一次）；
+                // 门推进与开关无关——关着也推进，运行中打开 → 最迟 24h 跑首轮
+                gate = Some(now);
+                let cfg = match Config::load() {
+                    Ok(c) => c,
+                    Err(_) => continue, // 配置损坏 → 本周期跳过，下个门再试
+                };
+                if !cfg.session_gc_enabled {
+                    continue;
+                }
+                // 跑前再确认关停：每会话一次 LLM 调用，可能很慢（run_once 内部每会话也查）
+                if stop.is_cancelled() {
+                    break;
+                }
+                let report = crate::session_gc::run_once(&bridge, &stop).await;
+                // 归纳被关停打断（run_once 内每 chat 前检查 stop）→ 不写运行标记：
+                // 中断轮不得记成完成轮，否则未归纳的会话要再等一个 24h 门才重试
+                //（审查修复）；完整跑完（含提前 break 的 stop 已在 run_once 内兜住）才落盘
+                if !stop.is_cancelled() {
+                    write_run_marker(&marker, now);
+                }
+                crate::log!(
+                    "[session-gc:{key}] 归纳完成：成功 {}，失败 {}，跳过 {}",
+                    report.summarized,
+                    report.failed,
+                    report.skipped
+                );
+            }
+            crate::log!("[session-gc:{key}] 会话归纳清理循环退出");
+        });
+    }
+
     // 事件循环：按通道分派
     if bot.is_dingtalk() {
         crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop)
@@ -461,6 +613,68 @@ async fn history_gc_loop(stop: tokio_util::sync::CancellationToken) {
     crate::log!("[history-gc] 历史维护循环退出");
 }
 
+/// FNV-1a 64 位哈希：per-bot 维护循环（tidy/session_gc）的首轮 jitter 用。
+/// 进程内一致即可，无需跨进程稳定（std hash 不保证跨版本稳定，自写最稳）。
+fn fnv(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 维护循环 24h 门判定：自上次运行（门=落盘标记种子）满 24h 即到点。
+/// 门缺失（仅理论：boot_gate 恒有值）→ 到点。
+fn daily_due(gate: Option<u64>, now: u64) -> bool {
+    match gate {
+        Some(t) => now.saturating_sub(t) >= 24 * 3600,
+        None => true,
+    }
+}
+
+/// 维护循环内存门起点：落盘标记优先（重启不丢 24h 门——门以「上次实际运行」为起点，
+/// 重启/停用期间照常推进，不会每 tick 判定到点 + 全量读配置）；无标记（首轮）→
+/// now+jitter 首轮延迟。调用方每次到点把门推进到 now（与落盘标记同步）。
+fn boot_gate(marker_ts: Option<u64>, now: u64, jitter: u64) -> Option<u64> {
+    marker_ts.or(Some(now + jitter))
+}
+
+/// 维护循环 24h 门落盘标记：读上次运行时间戳（unix_secs 十进制），进程重启不丢进度。
+/// 缺失/损坏 → None（调用方回退内存门，首轮仍延迟 24h+jitter）。
+fn read_run_marker(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// 维护循环运行标记落盘（best-effort：失败只 log——重启后 24h 门重算，
+/// run_once 幂等，重复跑一轮无害）。
+fn write_run_marker(path: &std::path::Path, ts: u64) {
+    if let Err(e) = std::fs::write(path, ts.to_string()) {
+        crate::log!("⚠️ 写运行标记 {} 失败：{e}", path.display());
+    }
+}
+
+/// 组装定时任务的 prompt：三级 AGENTS.md 指令文件块（abb → bot → session，session_key
+/// 用 job.chat_id，与下方 agent::run 的 session_key 一致）+ 受限分支前置受限说明。
+/// 抽成纯函数便于测试（run_job 的 agent 调用不可测，prompt 组装可测）。
+fn job_prompt(job: &crate::schedule::Job, bot_key: &str) -> String {
+    let agents_block = crate::agents_md::collect_block(bot_key, &job.chat_id);
+    // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明
+    //（否则模型不知道自己被闸着，越界被拒后瞎试）。与 agent::run 同源公共判定
+    // config::restrict_granted（role==Granted && 开关热读）。受限说明必须最外层。
+    let body = if agents_block.is_empty() {
+        job.prompt.clone()
+    } else {
+        format!("{agents_block}\n\n{}", job.prompt)
+    };
+    if crate::config::restrict_granted(job.role, bot_key) {
+        // 受限说明与聊天路径同源（config::RESTRICT_PREAMBLE，文本/次序单一来源）
+        format!("{}{body}", crate::config::RESTRICT_PREAMBLE)
+    } else {
+        body
+    }
+}
+
 /// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
 /// 回发优先发任务原会话；若该会话已失效（群解散/bot 被移出等），回落到主会话（私聊，必存在）。
 /// 多目标（#21）：job.targets 非空时向每个目标各投一份（可跨 bot，经路由表投递 + 失败兜底）。
@@ -480,20 +694,9 @@ async fn run_job(
         prompt_preview,
         backend.name()
     );
-    // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明
-    //（否则模型不知道自己被闸着，越界被拒后瞎试）。与 agent::run 同源公共判定
-    // config::restrict_granted（role==Granted && 开关热读）。
-    let prompt = if crate::config::restrict_granted(job.role, &bot_key) {
-        format!(
-            "[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
-你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
-可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git；不可联网、不可访问工作区外任何路径；\
-越界操作会被系统拦截并记录。\n\n{}",
-            job.prompt
-        )
-    } else {
-        job.prompt.clone()
-    };
+    // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明 + 三级
+    // AGENTS.md 指令文件块（组装抽成 job_prompt 纯函数，可测）。
+    let prompt = job_prompt(&job, &bot_key);
     let reply = match crate::agent::run(
         backend,
         &prompt,
@@ -582,5 +785,120 @@ async fn run_job(
     }
     if job.kind == crate::schedule::JobKind::Once {
         bridge.jobs.remove(&job.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_job(
+        prompt: &str,
+        chat_id: &str,
+        role: crate::config::SenderRole,
+    ) -> crate::schedule::Job {
+        crate::schedule::Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: crate::schedule::JobKind::Once,
+            schedule: String::new(),
+            prompt: prompt.to_string(),
+            chat_id: chat_id.to_string(),
+            note: String::new(),
+            targets: Vec::new(),
+            role,
+        }
+    }
+
+    #[test]
+    fn daily_due_gate_semantics() {
+        // 门语义：满 24h 即到点；门缺失 → 到点（理论路径，boot_gate 恒有值）
+        let now = 1_000_000_000u64;
+        let h24 = 24 * 3600u64;
+        assert!(daily_due(None, now));
+        // 门未满 24h → 未到点（首轮延迟）
+        assert!(!daily_due(Some(now - 1000), now));
+        assert!(daily_due(Some(now - h24), now));
+        // 恰好满 24h 边界
+        assert!(daily_due(Some(now - h24 - 1), now));
+        assert!(!daily_due(Some(now - h24 + 1), now));
+        // 功能关闭期间门照常推进（due 分支置 gate=now）→ 关着也每 24h 才醒一次，不 spin
+        assert!(!daily_due(Some(now), now));
+    }
+
+    #[test]
+    fn boot_gate_restart_keeps_marker_cadence() {
+        // 回归护栏（审查修复）：原实现在循环里以 now+jitter 起内存门、daily_due 取
+        // 标记与门的较晚者——重启后门（未来时间戳）恒胜标记，每次重启都把下次运行
+        // 推迟 24h+jitter，日重启的机器维护永不触发。修复后门以落盘标记为种子。
+        let now = 1_000_000_000u64;
+        let jitter = 1800u64;
+        let h24 = 24 * 3600u64;
+        // 重启时距上次运行不足 24h → 门=标记 → 未到点（重启不丢 24h 门）
+        let gate = boot_gate(Some(now - 3600), now, jitter);
+        assert!(!daily_due(gate, now), "重启后 1h 未到点");
+        // 重启时已超 24h（停机超过一天）→ 门=标记 → 到点（补跑维护）
+        let gate = boot_gate(Some(now - 50 * 3600), now, jitter);
+        assert!(daily_due(gate, now), "停机两天重启即补跑");
+        // 无标记（首轮）→ now+jitter 首轮延迟
+        let gate = boot_gate(None, now, jitter);
+        assert!(!daily_due(gate, now));
+        assert!(
+            daily_due(gate, now + h24 + jitter),
+            "首轮满 24h+jitter 到点"
+        );
+        // 标记损坏/缺失 → 回退首轮延迟（与无标记一致）
+        assert_eq!(boot_gate(None, now, jitter), boot_gate(None, now, jitter));
+        let gate = boot_gate(None, now, 0);
+        assert_eq!(gate, Some(now), "jitter=0 时门=now");
+    }
+
+    #[test]
+    fn job_prompt_restricted_preamble_then_agents_md() {
+        // 受限任务：受限说明必须最外层，其后是三级 AGENTS.md 块（bot 级按唯一 key 可控）
+        let bot_key = format!("abb-jobtest-{}", uuid::Uuid::new_v4());
+        let ws = crate::workspace_dir(&bot_key);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "定时任务 bot 规则").unwrap();
+        let job = test_job("提醒我喝水", "oc_job", crate::config::SenderRole::Granted);
+        let p = job_prompt(&job, &bot_key);
+        assert!(p.starts_with("[受限模式]"), "受限说明必须最外层: {p}");
+        let i_a = p.find("[指令文件]").unwrap();
+        let i_b = p.find("定时任务 bot 规则").unwrap();
+        let i_t = p.find("提醒我喝水").unwrap();
+        assert!(
+            i_a < i_b && i_b < i_t,
+            "顺序：受限 > 指令文件 > 用户 prompt"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn job_prompt_owner_includes_agents_md_if_present() {
+        // 非受限：有指令文件（bot 级）→ [指令文件] 块在用户 prompt 之前、无受限说明。
+        // abb 级读真实 ~/.agent-bridge/AGENTS.md（用户机器上可能已建本功能文件），
+        // 故不依赖它不存在——只断言结构，不断言块头精确位置。
+        let bot_key = format!("abb-jobtest-{}", uuid::Uuid::new_v4());
+        let ws = crate::workspace_dir(&bot_key);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "bot 规则").unwrap();
+        let job = test_job("简单提醒", "oc_job2", crate::config::SenderRole::Owner);
+        let p = job_prompt(&job, &bot_key);
+        assert!(!p.starts_with("[受限模式]"), "owner 任务无受限说明");
+        let i_a = p.find("[指令文件]");
+        let i_t = p.find("简单提醒").unwrap();
+        assert!(i_a.is_some(), "bot 级文件存在应注入块");
+        assert!(i_a.unwrap() < i_t, "指令文件在用户 prompt 之前");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn job_prompt_owner_without_files_keeps_prompt() {
+        // 非受限 + 唯一 key 无 bot/会话级文件（abb 级不可控：可能已存在）：
+        // 只断言用户 prompt 出现、无受限说明；块的有无取决于 abb 级文件，不强断。
+        let bot_key = format!("abb-jobtest-{}", uuid::Uuid::new_v4());
+        let job = test_job("简单提醒", "oc_job3", crate::config::SenderRole::Owner);
+        let p = job_prompt(&job, &bot_key);
+        assert!(p.contains("简单提醒"));
+        assert!(!p.starts_with("[受限模式]"));
     }
 }
