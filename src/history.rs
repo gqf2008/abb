@@ -89,8 +89,8 @@ impl History {
         Self::open_in(&crate::workspace_dir(bot_key).join("history"), key)
     }
 
-    /// 按指定目录构造（生产 history/ 子目录 / 测试 temp dir 共用）。
-    fn open_in(dir: &std::path::Path, key: &str) -> History {
+    /// 按指定目录构造（生产 history/ 子目录 / 测试 temp dir / 会话归纳清理共用）。
+    pub(crate) fn open_in(dir: &std::path::Path, key: &str) -> History {
         let esc = escape_key(key);
         let _ = std::fs::create_dir_all(dir);
         History {
@@ -266,6 +266,13 @@ impl History {
         }
     }
 
+    /// 该会话历史的最后活跃时间（最新一条条目的内容 ts）。空/无文件 → None。
+    /// 用内容 ts 而非文件 mtime——jsonl 每行自带 ts，文件 mtime 会因原子重写而失真
+    /// （会话归纳清理的过期判定依赖它，见 session_gc）。
+    pub fn last_ts(&self) -> Option<u64> {
+        self.read_entries().iter().map(|e| e.ts).max()
+    }
+
     /// 组装注入 prompt 的 [历史上下文] 段。
     ///
     /// - `exclude_mid`：排除该 mid 的条目（重放场景防当前消息自我重复——它已在历史里）。
@@ -343,13 +350,96 @@ impl History {
     }
 }
 
+/// 截断超期历史（每日工作目录整理用，见 tidy）：枚举 history/ 下全部 `<escaped>.jsonl`
+/// （escape_key 不产生 '.'，`*.jsonl` 精确命中 chat 文件，`.migrated.json`/`.imported.json`
+/// 天然排除），删除 `ts < cutoff_ts` 的条目并原子重写；某文件全部过期则整体删除文件
+/// （保留 `.migrated.json` 标记——那是会话级迁移状态，会话归纳清理才负责删它）。
+/// 返回删除的条目总数。坏行保留（不主动丢数据）；IO 失败只 log 警告（历史是增强能力）。
+pub fn truncate_stale(history_dir: &std::path::Path, cutoff_ts: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(history_dir) else {
+        return 0;
+    };
+    let mut removed_total = 0usize;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || path
+                .extension()
+                .map(|e| !e.eq_ignore_ascii_case("jsonl"))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        // 读前快照 (mtime, size)：与桥的 append（读-改-写）并发时，直接写回会把
+        // 读后新追加的行覆盖掉（lost update）。写回/删除前复核快照，变了 → 跳过
+        // 本文件（宁留不删，下轮每日整理再截断）。
+        let snap = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue, // 读不到跳过（宁留不删）
+        };
+        let mut kept_lines: Vec<&str> = Vec::new();
+        let mut dropped = 0usize;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<HistoryEntry>(line) {
+                Ok(e) if e.ts >= cutoff_ts => kept_lines.push(line),
+                Ok(_) => dropped += 1,
+                Err(_) => kept_lines.push(line), // 坏行保留
+            }
+        }
+        if dropped == 0 {
+            continue; // 无超期条目，不动文件
+        }
+        // 复核快照：读后文件被改动（append/其它写/删除）→ 放弃写回，宁留不删
+        let changed = std::fs::metadata(&path)
+            .ok()
+            .map(|m| Some((m.modified().ok(), m.len())) != snap)
+            .unwrap_or(true); // 元数据读不到 → 视为已变，保守跳过
+        if changed {
+            continue;
+        }
+        removed_total += dropped;
+        if kept_lines.is_empty() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) => {
+                    removed_total -= dropped; // 删除失败 → 行还在盘上，不计数（审查修复）
+                    crate::log!(
+                        "[history] ⚠️ 超期截断删除失败 path={}: {e}",
+                        trunc_path(&path)
+                    );
+                }
+            }
+        } else {
+            let mut out = String::new();
+            for l in kept_lines {
+                out.push_str(l);
+                out.push('\n');
+            }
+            if let Err(e) = crate::atomic_write_sensitive(&path, &out) {
+                removed_total -= dropped; // 重写失败 → 超期行仍在，不算截断（审查修复）
+                crate::log!(
+                    "[history] ⚠️ 超期截断重写失败 path={}: {e}",
+                    trunc_path(&path)
+                );
+            }
+        }
+    }
+    removed_total
+}
+
 /// 文件名转义：仅保留 [a-z0-9_-]（字母统一小写——APFS/NTFS 默认大小写不敏感，统一小写
 /// 使跨平台行为一致：仅大小写不同的 key 在这些卷上本来就会坍缩为同一文件），其余字节
 /// 按 %XX（大写十六进制）。':' → "%3A"。可逆且单射，无路径分隔符风险（Windows 安全）。
 /// Windows 保留设备名（CON/NUL/COM1-9/LPT1-9/AUX/PRN）加 "%5F"（'_' 的转义形态）前缀
 /// 防吞文件（审查 M-1）——前缀必须取转义形态：若直接加 '_'，自然键 "_con"（'_' 在允许
 /// 集内原样保留）会与保留键 "con" 坍缩到同一文件，破坏单射（#49 审查）。
-fn escape_key(key: &str) -> String {
+pub(crate) fn escape_key(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for b in key.bytes() {
         if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' {
@@ -454,6 +544,91 @@ mod tests {
             "超保险上限截断防撑爆文件"
         );
         h.clear();
+    }
+
+    #[test]
+    fn last_ts_returns_newest_entry_ts() {
+        // 会话归纳清理的过期判定：用内容 ts（非文件 mtime——原子重写会失真）
+        let h = temp_history("lastts", "oc_x");
+        assert_eq!(h.last_ts(), None, "空历史 → None");
+        h.append_user("m1", "claude", "问");
+        // append 的 ts 是写入时刻，两条之间必然递增（unix 秒）
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        h.append_assistant("m1", "claude", "答");
+        let ts = h.last_ts().expect("有历史应有 last_ts");
+        assert!(ts > 0);
+        // 手工拨一条更旧的 ts（内容 ts 语义：取最大）
+        let dir = std::env::temp_dir().join(format!("abb-hist-lastts2-{}", uuid::Uuid::new_v4()));
+        let h2 = History::open_in(&dir, "oc_x");
+        std::fs::write(
+            &h2.path,
+            "{\"mid\":\"a\",\"user\":true,\"backend\":\"claude\",\"text\":\"旧\",\"ts\":100}\n\
+             {\"mid\":\"b\",\"user\":true,\"backend\":\"claude\",\"text\":\"新\",\"ts\":200}\n\
+             {坏json\n",
+        )
+        .unwrap();
+        assert_eq!(h2.last_ts(), Some(200), "坏行容忍，取最新 ts");
+        std::fs::remove_dir_all(&dir).ok();
+        h.clear();
+    }
+
+    #[test]
+    fn truncate_stale_keeps_new_drops_old() {
+        // 工作目录整理（tidy）：按内容 ts 截断超期行，坏行保留，全过期删文件
+        let dir = std::env::temp_dir().join(format!("abb-hist-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("oc_x.jsonl");
+        let mk = |mid: &str, ts: u64| {
+            format!("{{\"mid\":\"{mid}\",\"user\":true,\"backend\":\"claude\",\"text\":\"{mid}\",\"ts\":{ts}}}\n")
+        };
+        std::fs::write(
+            &p,
+            format!(
+                "{}{}{}{}",
+                mk("old1", 100),
+                mk("old2", 200),
+                mk("new1", 300),
+                "{坏json\n"
+            ),
+        )
+        .unwrap();
+        // cutoff=250：old1/old2 删，new1 与坏行留
+        assert_eq!(super::truncate_stale(&dir, 250), 2, "删除 2 条超期");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("new1"), "新行保留");
+        assert!(text.contains("坏json"), "坏行保留（不主动丢数据）");
+        assert!(
+            !text.contains("old1") && !text.contains("old2"),
+            "超期行删除"
+        );
+        // 无超期 → 文件不动（截断幂等）
+        assert_eq!(super::truncate_stale(&dir, 300), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncate_stale_removes_fully_stale_file_keeps_marker() {
+        // 全过期 → 删 jsonl 文件，但 .migrated.json 标记保留（会话级状态归 session_gc 管）
+        let dir = std::env::temp_dir().join(format!("abb-hist-trunc2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("oc_y.jsonl");
+        std::fs::write(
+            &p,
+            "{\"mid\":\"a\",\"user\":true,\"backend\":\"claude\",\"text\":\"旧\",\"ts\":100}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("oc_y.migrated.json"), r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(super::truncate_stale(&dir, 500), 1);
+        assert!(!p.exists(), "全过期文件删除");
+        assert!(
+            dir.join("oc_y.migrated.json").exists(),
+            "迁移标记保留（非本层职责）"
+        );
+        // 非 jsonl / 标记文件不被扫
+        std::fs::write(dir.join("oc_z.imported.json"), "{}").unwrap();
+        std::fs::write(dir.join("readme.txt"), "x").unwrap();
+        assert_eq!(super::truncate_stale(&dir, 0), 0, "只扫 *.jsonl");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

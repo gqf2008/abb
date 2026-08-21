@@ -6,6 +6,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod agent;
+mod agents_md;
 mod attachments;
 mod botstatus;
 mod bridge;
@@ -28,10 +29,12 @@ mod platform;
 mod proto;
 mod schedule;
 mod service;
+mod session_gc;
 mod session_import;
 mod sessions;
 mod single_instance;
 mod tasks;
+mod tidy;
 mod ui;
 mod unread;
 mod updater;

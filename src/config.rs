@@ -112,6 +112,12 @@ pub struct BotConfig {
     /// false=授权者与 owner 同权限（现状全权限）。owner 会话不受此字段影响，恒全权限。
     #[serde(default = "default_true", skip_serializing_if = "restrict_on")]
     pub restrict_granted_agent: bool,
+    /// 每日工作目录整理开关（默认关）：service 每日对该 bot 工作区做 tidy——孤儿后端
+    /// 会话文件（24h 护栏 + live 集双保险）、临时/垃圾文件、超期历史 jsonl 截断、
+    /// 根目录文档归档（archive/YYYY-MM/）+ git 留痕。破坏性/磁盘操作，故默认关，
+    /// 需 owner 在 bot 配置页显式打开。false（默认）不落盘，旧 config 兼容。
+    #[serde(default, skip_serializing_if = "tidy_off")]
+    pub tidy_enabled: bool,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
     /// 缺省（无条目）= 需要 @（默认，向后兼容旧 config）。仅顶层群聊 chat_id 记录；
     /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
@@ -152,6 +158,7 @@ impl Default for BotConfig {
             granted_infos: Vec::new(),
             open_access: false,
             restrict_granted_agent: true,
+            tidy_enabled: false,
             mention_modes: std::collections::HashMap::new(),
         }
     }
@@ -169,6 +176,11 @@ fn not_open(b: &bool) -> bool {
 /// skip_serializing_if：restrict_granted_agent 为 true（安全默认）不落盘，旧 config 兼容。
 fn restrict_on(b: &bool) -> bool {
     *b
+}
+
+/// skip_serializing_if：tidy_enabled 为 false（默认关）不落盘，旧 config 兼容。
+fn tidy_off(b: &bool) -> bool {
+    !*b
 }
 
 /// 授权码有效期（秒）：30 分钟。过期码仍保留在 pending_codes 里直到被消费/重新生成，
@@ -298,6 +310,11 @@ fn default_true() -> bool {
 /// #74 消息历史保留期默认值（天）。
 fn default_history_retention_days() -> u32 {
     30
+}
+
+/// 会话过期阈值默认值（天）：最后一条历史消息距今超过该值视为过期候选（session_gc）。
+fn default_session_gc_days() -> u32 {
+    7
 }
 
 impl BotConfig {
@@ -569,6 +586,14 @@ impl SenderRole {
     }
 }
 
+/// 受限会话 prompt 前置说明（bridge 聊天路径 virtualbot.rs 与 run_job 定时任务同源；
+/// 必须最外层——安全约束不得被任何指令文件/历史内容盖过）。尾部带两个换行（与下文分隔）。
+pub const RESTRICT_PREAMBLE: &str = "\
+[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
+你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
+可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git（status/diff 摘要等，不可读历史）；\
+不可联网、不可访问工作区外任何路径；越界操作会被系统拦截并记录。\n\n";
+
 /// 受限模式判定（agent::run 的 spawn 分支 / bridge prompt 注入 / run_job 定时任务
 /// 三处共用，防语义漂移）：role==Granted 且该 bot 的「授权者 agent 隔离」开关未放宽；
 /// 配置读不到按安全默认 true。每次热读（授权/关开关即时生效）。
@@ -598,6 +623,16 @@ pub struct Config {
     /// （历史记录仍照常落库，历史页不受影响）。默认 true。
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
+    /// 每日会话归纳清理总开关（默认关）：service 每日把过期会话（按 session_gc_days
+    /// 判定的最后活跃时间）交 bot 后端 agent 归纳成摘要存档（summaries/），再清理
+    /// 工作区内历史/后端会话文件（绝不触碰 ~/.claude 等后端私有目录），摘要下次
+    /// 会话注入衔接上下文。破坏性 + 每会话一次 LLM 调用，故默认关，需用户在
+    /// 历史记录页显式打开。
+    #[serde(default)]
+    pub session_gc_enabled: bool,
+    /// 会话过期阈值（天）：最后一条历史消息距今超过该值即视为过期候选。默认 7。
+    #[serde(default = "default_session_gc_days")]
+    pub session_gc_days: u32,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -637,6 +672,8 @@ impl Default for Config {
             cross_delivery_enabled: false,
             history_retention_days: default_history_retention_days(),
             notify_enabled: true,
+            session_gc_enabled: false,
+            session_gc_days: default_session_gc_days(),
             bots: Vec::new(),
             providers: Vec::new(),
             default_provider: String::new(),
@@ -1411,6 +1448,28 @@ mod tests {
         assert!(!back2.restrict_granted_agent);
     }
 
+    #[test]
+    fn tidy_enabled_serde_default_and_skip() {
+        // 手动 Default 与旧 config 反序列化都落到默认关（破坏性/磁盘操作 opt-in）
+        assert!(!BotConfig::default().tidy_enabled);
+        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
+        assert!(!bot.tidy_enabled, "旧 config 无字段 → 默认关");
+        // round-trip：默认 false 不落盘（skip_serializing_if = tidy_off）
+        let s = serde_json::to_string(&bot).unwrap();
+        assert!(!s.contains("tidy_enabled"));
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert!(!back.tidy_enabled);
+        // 显式开启（GUI 勾选）→ 落盘并往返保真
+        let on = BotConfig {
+            tidy_enabled: true,
+            ..Default::default()
+        };
+        let s2 = serde_json::to_string(&on).unwrap();
+        assert!(s2.contains("\"tidy_enabled\":true"));
+        let back2: BotConfig = serde_json::from_str(&s2).unwrap();
+        assert!(back2.tidy_enabled);
+    }
+
     // ── 授权码（GUI 生成 / 对方发码给 bot 自动授权）──
 
     #[test]
@@ -1817,6 +1876,30 @@ mod tests {
         let back2: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back2.history_retention_days, 90);
         assert!(!back2.notify_enabled);
+    }
+
+    #[test]
+    fn session_gc_defaults_and_roundtrip() {
+        // 会话归纳清理默认关、默认 7 天；旧 config 无字段 → 反序列化按默认
+        let c = Config::default();
+        assert!(!c.session_gc_enabled);
+        assert_eq!(c.session_gc_days, 7);
+        let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
+        let back: Config = serde_json::from_str(old).unwrap();
+        assert!(!back.session_gc_enabled, "旧文件兼容缺省");
+        assert_eq!(back.session_gc_days, 7, "旧文件兼容缺省");
+        // 显式值序列化/反序列化往返不丢
+        let c2 = Config {
+            session_gc_enabled: true,
+            session_gc_days: 14,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        assert!(s.contains("\"session_gc_enabled\":true"));
+        assert!(s.contains("\"session_gc_days\":14"));
+        let back2: Config = serde_json::from_str(&s).unwrap();
+        assert!(back2.session_gc_enabled);
+        assert_eq!(back2.session_gc_days, 14);
     }
 
     #[test]
