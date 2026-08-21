@@ -391,6 +391,7 @@ pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)] // stub：仅占位对齐 API，非 macOS 无调用方
 pub fn install_dock_reopen(_on_reopen: Box<dyn Fn()>) {}
 
 #[cfg(target_os = "macos")]

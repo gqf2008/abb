@@ -676,9 +676,8 @@ fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
     }
     let cipher = aes::Aes128::new_from_slice(key).context("AES key 初始化失败")?;
     let mut buf = ciphertext.to_vec();
-    for chunk in buf.chunks_exact_mut(16) {
-        let block = GenericArray::from_mut_slice(chunk);
-        cipher.decrypt_block(block);
+    for block in buf.as_chunks_mut::<16>().0 {
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
     }
     // PKCS7 去填充
     let pad = *buf.last().unwrap() as usize;
