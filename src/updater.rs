@@ -24,6 +24,9 @@ pub struct LatestRelease {
     pub version: String,
     /// 本机平台的资产下载 URL；该平台没有预编译包（Linux）时为 None。
     pub asset_url: Option<String>,
+    /// 本机平台安装包在 SHA256SUMS 里的期望哈希（hex 小写）；release 未附
+    /// SHA256SUMS 时为 None——下载后校验环节会拒绝安装（fail-closed）。
+    pub asset_sha256: Option<String>,
 }
 
 /// 有状态的升级器：复用同一个 reqwest Client（连接池/rustls 配置）。
@@ -84,13 +87,56 @@ impl Updater {
                     .collect()
             })
             .unwrap_or_default();
-        let asset_url = pick_asset(&names, &version).and_then(|picked| {
-            names
-                .iter()
-                .position(|n| *n == picked)
-                .and_then(|i| urls.get(i).cloned())
+        let (asset_name, asset_url) = pick_asset(&names, &version)
+            .and_then(|picked| {
+                names
+                    .iter()
+                    .position(|n| *n == picked)
+                    .and_then(|i| urls.get(i).cloned().map(|u| (picked, u)))
+            })
+            .ok_or_else(|| anyhow!("release 无本平台安装包资产"))?;
+        // SHA256SUMS：release 附带则解析出本平台安装包的期望哈希（校验用）。
+        let sums_url: Option<String> = v.get("assets").and_then(|a| a.as_array()).and_then(|arr| {
+            arr.iter().find_map(|a| {
+                let n = a.get("name").and_then(|n| n.as_str())?;
+                if n != SHASUMS_NAME {
+                    return None;
+                }
+                a.get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .map(String::from)
+            })
         });
-        Ok(LatestRelease { version, asset_url })
+        let asset_sha256 = match sums_url {
+            Some(u) => match self.fetch_shasums(&u).await {
+                Ok(map) => map.get(&asset_name).cloned(),
+                Err(e) => {
+                    crate::log!("[update] 拉 SHA256SUMS 失败：{e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        Ok(LatestRelease {
+            version,
+            asset_url: Some(asset_url),
+            asset_sha256,
+        })
+    }
+
+    /// 拉取并解析 SHA256SUMS（`<sha256-hex>  <文件名>` 两空格格式，sha256sum -c 兼容）。
+    async fn fetch_shasums(&self, url: &str) -> Result<std::collections::HashMap<String, String>> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("请求 SHA256SUMS 失败")?;
+        if !resp.status().is_success() {
+            bail!("SHA256SUMS 下载返回 {}", resp.status());
+        }
+        let text = resp.text().await.context("读 SHA256SUMS 失败")?;
+        Ok(parse_shasums(&text))
     }
 
     /// 流式下载到目标文件（逐块写盘，不把整个 dmg 堆进内存）。
@@ -169,6 +215,62 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     parse_semver(latest) > parse_semver(current)
 }
 
+/// release 资产里的校验清单文件名（CI 打包时生成上传）。
+pub const SHASUMS_NAME: &str = "SHA256SUMS";
+
+/// 解析 SHA256SUMS 文本 → {文件名: hex小写哈希}。容忍多空白与 CRLF；
+/// 注释行（# 开头）与残缺行跳过。
+fn parse_shasums(text: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let Some(hash) = it.next() else { continue };
+        let Some(name) = it.next() else { continue };
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        map.insert(name.to_string(), hash.to_ascii_lowercase());
+    }
+    map
+}
+
+/// 下载完成后校验产物哈希。expected=None = release 未提供校验清单 → 拒绝安装
+/// （fail-closed：无校验不装，宁可不升级也不执行来源未证明的安装包）。
+pub fn verify_sha256(
+    file: &std::path::Path,
+    name_for_log: &str,
+    expected: Option<&str>,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let expected = expected.ok_or_else(|| {
+        anyhow!(
+            "release 未附 {}，无法校验安装包完整性（安全策略拒绝安装）",
+            SHASUMS_NAME
+        )
+    })?;
+    let bytes = std::fs::read(file).with_context(|| format!("读安装包失败: {}", file.display()))?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if actual != expected.to_ascii_lowercase() {
+        crate::log!(
+            "[update] 校验失败 {}: 期望 {} 实得 {}",
+            name_for_log,
+            expected,
+            actual
+        );
+        bail!(
+            "安装包 sha256 与 {} 不符（下载损坏或被篡改），已拒绝安装",
+            SHASUMS_NAME
+        );
+    }
+    Ok(())
+}
+
 /// 按平台从资产名列表里挑安装包（纯函数，便于单测）：
 /// macOS → ABB-x.y.z.dmg；Windows → ABB-Setup-x.y.z.exe；Linux → None。
 /// 先精确匹配版本号，再退后缀匹配（防 CI 命名微调）。
@@ -211,6 +313,17 @@ pub fn download_dest(version: &str) -> PathBuf {
     #[cfg(all(unix, not(target_os = "macos")))]
     let name = format!("ABB-{version}.bin");
     std::env::temp_dir().join(name)
+}
+
+/// 本平台安装包的资产文件名（校验/日志用；与 pick_asset/download_dest 命名一致）。
+pub fn asset_file_name(version: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let name = format!("ABB-{version}.dmg");
+    #[cfg(target_os = "windows")]
+    let name = format!("ABB-Setup-{version}.exe");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let name = format!("ABB-{version}.bin");
+    name
 }
 
 /// 安装并重启。成功返回后**调用方负责退出本进程**（macOS 由分离 sh 等进程死后拉起新实例；
@@ -326,6 +439,47 @@ fn windows_install(setup: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shasums_parse() {
+        let text = "# comment\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ABB-2.15.0.dmg\r\ndef456  ABB-Setup-2.15.0.exe\nshort  bad.txt\n";
+        let m = parse_shasums(text);
+        assert_eq!(
+            m.get("ABB-2.15.0.dmg").map(String::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(m.len(), 1); // 残缺行跳过（def456/short 均不足 64 位 hex）
+                                // 大写哈希归一为小写
+        let up = parse_shasums(
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789  x.dmg",
+        );
+        assert_eq!(
+            up.get("x.dmg").map(String::as_str),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+        );
+    }
+
+    #[test]
+    fn verify_rejects_missing_sums_fail_closed() {
+        let f = std::env::temp_dir().join(format!("abb-verify-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&f, b"data").unwrap();
+        // release 无 SHA256SUMS → 拒绝安装（fail-closed）
+        assert!(verify_sha256(&f, "x.dmg", None).is_err());
+        // 有清单且哈希匹配 → 通过
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"data");
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert!(verify_sha256(&f, "x.dmg", Some(&hash)).is_ok());
+        // 不匹配 → 拒绝
+        assert!(verify_sha256(&f, "x.dmg", Some(&"0".repeat(64))).is_err());
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn semver_compare() {

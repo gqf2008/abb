@@ -178,6 +178,17 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 生成 SHA256SUMS 校验清单并一并上传：客户端升级时下载后先校验哈希，
+      # 不匹配/清单缺失一律拒绝安装（updater verify_sha256 fail-closed）。
+      # 注意：清单与产物同渠道分发，防的是传输损坏与资产被换；真正的信任根仍是
+      # Apple 公证 / Windows Authenticode（有证书配置时），本清单是完整性兜底。
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ABB-*.dmg ABB-Setup-*.exe > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Prepare release notes (auto-generated + 架构提示)
         shell: bash
         env:
