@@ -1607,6 +1607,12 @@ pub fn run_gui() -> Result<()> {
                             let r = async {
                                 let up = crate::updater::Updater::new()?;
                                 up.download_to(&url, &dest, &on_progress).await?;
+                                // 安装前完整性校验（fail-closed：release 无校验清单也拒绝装）
+                                crate::updater::verify_sha256(
+                                    &dest,
+                                    &crate::updater::asset_file_name(&rel.version),
+                                    rel.asset_sha256.as_deref(),
+                                )?;
                                 let tw4 = tw.clone();
                                 let _ = slint::invoke_from_event_loop(move || {
                                     if let Some(t) = tw4.upgrade() {
