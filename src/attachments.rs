@@ -129,7 +129,7 @@ pub fn save_attachment_in(
         note: String::new(),
     };
     let meta_json = serde_json::to_string_pretty(&meta).context("附件 meta 序列化失败")?;
-    crate::atomic_write_text(&path.with_extension("meta.json"), &meta_json)
+    crate::atomic_write_sensitive(&path.with_extension("meta.json"), &meta_json)
         .with_context(|| format!("写附件 meta 失败: {}.meta.json", path.display()))?;
     Ok(meta)
 }

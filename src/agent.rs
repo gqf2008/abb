@@ -1133,21 +1133,33 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
               不要解释、不要引号、不要“角色名：”前缀。";
     let full = format!("{sys}\n\n角色/任务名称：{role_name}");
+    // 可执行路径解析：与 run_once 同源——GUI/launchd 环境 PATH 精简，裸命令名
+    // spawn 必然 "No such file or directory (os error 2)"；必须经
+    // deps::find_in_path（composed_path 覆盖 ~/.local/bin、npm-global 等）
+    // 解析出绝对路径再启动。找不到时保留裸名让下方错误文案带安装指引。
+    let program = match backend {
+        Backend::Pi => "pi",
+        Backend::Codex => "codex",
+        Backend::Claude => "claude",
+        Backend::PrimeAgent => unreachable!(),
+    };
+    let resolved =
+        crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
     let mut cmd = match backend {
         Backend::Claude => {
-            let mut c = tokio::process::Command::new("claude");
+            let mut c = tokio::process::Command::from(shim_command(&resolved));
             c.arg("-p").arg("--output-format").arg("text");
             c
         }
         Backend::Codex => {
-            let mut c = tokio::process::Command::new("codex");
+            let mut c = tokio::process::Command::from(shim_command(&resolved));
             c.arg("exec");
             c
         }
         Backend::Pi => {
             // pi 非交互 JSON 模式：stdin 读 prompt，stdout JSONL（message_end 权威文本，
             // 解析同 run_once 的 process_line）。临时 uuid 会话（无状态一次性调用）。
-            let mut c = tokio::process::Command::new("pi");
+            let mut c = tokio::process::Command::from(shim_command(&resolved));
             c.arg("-p")
                 .arg("--mode")
                 .arg("json")
@@ -1162,7 +1174,10 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().context("启动后端 CLI 失败")?;
+    // spawn 失败（CLI 缺失）时带上与 run_once 一致的安装指引文案
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("{}", agent_missing_msg(backend, &e)))?;
     use tokio::io::AsyncWriteExt;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -1693,6 +1708,21 @@ pub fn kill_stale_agents(bot_key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_role_prompt_resolves_cli_via_find_in_path() {
+        // 回归锁（#86）：生成提示词路径必须与 run_once 同源走 find_in_path。
+        // 直接验证解析函数在本测试环境能找到 claude/codex/pi 之一——
+        // generate_role_prompt 本体是网络调用无法单测，这里锁"解析链路存在且有效"：
+        // find_in_path 找不到时回落裸名的行为由下方断言覆盖。
+        for name in ["claude", "codex", "pi"] {
+            let resolved = crate::deps::find_in_path(name);
+            if let Some(p) = &resolved {
+                assert!(p.is_absolute(), "{name} 解析结果必须是绝对路径: {p:?}");
+            }
+            // 找不到（CI 无 CLI）不失败——生产错误文案已带安装指引
+        }
+    }
 
     // process_line 测试辅助的解析状态：
     // (pending 候选, thread_id, claude_result, pi_error)

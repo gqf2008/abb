@@ -98,6 +98,17 @@ Windows 包为免管理员安装。有问题欢迎提 [Issue](https://github.com
 
 ---
 
+## 从源码构建（开发者）
+
+仓库依赖同作者的 [slint-pixel](https://github.com/gqf2008/slint-pixel) 组件库，
+Cargo 以 `../slint-pixel` 路径依赖引用，克隆后需放到同级目录再构建：
+
+```sh
+git clone https://github.com/gqf2008/abb.git
+git clone https://github.com/gqf2008/slint-pixel.git
+cd abb && cargo build --release
+```
+
 ## 开发者文档
 
 - [会话隔离机制（群 / 话题 / 用户）](docs/session-isolation.md)：三平台 chat_id 规则、隔离矩阵、话题维度结论与最小改动方案。
