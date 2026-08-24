@@ -118,6 +118,13 @@ export struct OptionRow {
     checked: bool,
 }
 
+// 编辑框/下拉的单元素行（value 存显示值）：交互（输入/选择）同样移除 text/value 绑定，
+// 直接绑 root.bots[selected].x 会在切 bot 后残留上一 bot 的值；走单元素 model +
+// for 循环重建实例（refresh_editors 装载/切 bot 时整体替换），与 OptionRow 同款绕法。
+export struct EditorRow {
+    value: string,
+}
+
 // 单个 bot 行的数据（与 Rust 侧 BotRow 对应）
 export struct BotRow {
     name: string,        // 显示名
@@ -865,6 +872,24 @@ export component SettingsWindow inherits Window {
     in-out property <string> running-line: "";   // 底部运行概览（N 个 bot 在线…）；status-line 非空时优先显示 status-line
     in-out property <[BotRow]> bots: [];
     in-out property <int> selected: -1;   // 当前选中的 bot 下标，-1=无
+    // 三个独立开关（启用/授权者隔离/每日整理）的显示态。刻意不直接绑
+    // root.bots[selected].x 或独立 bool property：PixelCheckBox 交互内部赋值
+    // 会移除 checked 绑定（无论绑什么），切 bot 后残留上一 bot 的状态（#80 回归：
+    // 点 A 的每日整理 B 也显示改）。绕法同 backend-options：单元素 model +
+    // for 循环重建实例，由 Rust 侧在装载/切 bot/写回时整体替换 model。
+    in-out property <[OptionRow]> enabled-options: [];
+    in-out property <[OptionRow]> restrict-options: [];
+    in-out property <[OptionRow]> tidy-options: [];
+    // 文本编辑框/下拉的单元素 model（name/provider/owner/app_id/app_secret/
+    // ding_robot_code/ding_owner_ids 各一）：输入/选择交互断绑后显示不跟随，切 bot
+    // 时由 refresh_editors 整体替换 model → for 重建实例（同 OptionRow 绕法）。
+    in-out property <[EditorRow]> name-editor-options: [];
+    in-out property <[EditorRow]> provider-editor-options: [];
+    in-out property <[EditorRow]> owner-editor-options: [];
+    in-out property <[EditorRow]> app-id-editor-options: [];
+    in-out property <[EditorRow]> app-secret-editor-options: [];
+    in-out property <[EditorRow]> ding-robot-code-editor-options: [];
+    in-out property <[EditorRow]> ding-owner-ids-editor-options: [];
     in-out property <string> status-line;
     in-out property <bool> status-is-error: true;   // true=红（报错）/ false=绿（成功/信息）
     // 跨会话投递总开关（#21）：打开后 agent 可用 `$ABB_BIN deliver` 投递到其它 bot 的会话。
@@ -1288,19 +1313,27 @@ export component SettingsWindow inherits Window {
                                                 vertical-stretch: 0;
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Rectangle { width: 80px; }
-                                                    PixelCheckBox {
-                                                        text: "启用此 bot";
-                                                        checked: root.bots[root.selected].enabled;
-                                                        toggled => { root.set-bot-enabled(root.selected, self.checked); }
+                                                    // for 循环必须独占容器（slint 限制：RepeatedItemTree 不能直接占 grid 单元格）
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        for opt[i] in root.enabled-options: PixelCheckBox {
+                                                            text: "启用此 bot";
+                                                            checked: opt.checked;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.set-bot-enabled(root.selected, self.checked); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "名称"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].name;
-                                                        placeholder: "如：庆小丰（隔离目录名）";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "name", self.text); }
+                                                        for opt[i] in root.name-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "如：庆小丰（隔离目录名）";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "name", self.text); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
@@ -1334,11 +1367,14 @@ export component SettingsWindow inherits Window {
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "模型供应商"; width: 80px; vertical-alignment: center; }
                                                     // provider 下拉：PixelSelect（value 字符串驱动，动态 options）
-                                                    PixelSelect {
-                                                        options: root.provider-names;
-                                                        value: root.bots[root.selected].provider;
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        changed(v) => { root.bot-field-edited(root.selected, "provider", v); }
+                                                        for opt[i] in root.provider-editor-options: PixelSelect {
+                                                            options: root.provider-names;
+                                                            value: opt.value;
+                                                            horizontal-stretch: 1;
+                                                            changed(v) => { root.bot-field-edited(root.selected, "provider", v); }
+                                                        }
                                                     }
                                                 }
                                                 // 授权者 agent 隔离（安全默认开启；三种 kind 都显示）：
@@ -1351,9 +1387,9 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         spacing: 12px;
-                                                        PixelCheckBox {
+                                                        for opt[i] in root.restrict-options: PixelCheckBox {
                                                             text: "授权者 agent 受限模式";
-                                                            checked: root.bots[root.selected].restrict-granted;
+                                                            checked: opt.checked;
                                                             horizontal-stretch: 1;
                                                             toggled => { root.set-restrict-granted(root.selected, self.checked); }
                                                         }
@@ -1366,9 +1402,9 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         spacing: 12px;
-                                                        PixelCheckBox {
+                                                        for opt[i] in root.tidy-options: PixelCheckBox {
                                                             text: "每日工作目录整理（孤儿会话/临时文件/超期历史/文档归档 + git 留痕）";
-                                                            checked: root.bots[root.selected].tidy-enabled;
+                                                            checked: opt.checked;
                                                             horizontal-stretch: 1;
                                                             toggled => { root.set-tidy-enabled(root.selected, self.checked); }
                                                         }
@@ -1390,11 +1426,14 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "Owner（管理员）"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].owner-open-id;
-                                                        placeholder: "ou_xxx（管理员 open_id，逗号分隔多个）";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "owner", self.text); }
+                                                        for opt[i] in root.owner-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "ou_xxx（管理员 open_id，逗号分隔多个）";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "owner", self.text); }
+                                                        }
                                                     }
                                                     PixelButton {
                                                         text: "生成管理员授权码";
@@ -1424,17 +1463,22 @@ export component SettingsWindow inherits Window {
                                                         clicked => { root.generate-owner-code(root.selected, "granted"); }
                                                     }
                                                 }
-                                                for granted[gi] in root.bots[root.selected].granted: Row {
-                                                    Rectangle { width: 80px; }
-                                                    Text {
-                                                        text: granted.name + "（" + granted.open-id + "）";
-                                                        font-size: 12px;
-                                                        horizontal-stretch: 1;
-                                                        vertical-alignment: center;
-                                                    }
-                                                    PixelButton {
-                                                        text: "取消授权";
-                                                        clicked => { root.remove-granted(root.selected, gi); }
+                                                // for 循环必须独占容器（slint 限制：RepeatedItemTree 不能直接占 grid 单元格；
+                                                // Row 又只能放 GridLayout 内，故用 HorizontalBox 组合同款横排）
+                                                VerticalBox {
+                                                    spacing: 4px;
+                                                    for granted[gi] in root.bots[root.selected].granted: HorizontalBox {
+                                                        Rectangle { width: 80px; }
+                                                        Text {
+                                                            text: granted.name + "（" + granted.open-id + "）";
+                                                            font-size: 12px;
+                                                            horizontal-stretch: 1;
+                                                            vertical-alignment: center;
+                                                        }
+                                                        PixelButton {
+                                                            text: "取消授权";
+                                                            clicked => { root.remove-granted(root.selected, gi); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.owner-code-info != "": Row {
@@ -1475,21 +1519,27 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "App ID"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].app-id;
-                                                        placeholder: "cli_xxxxxxxx";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
+                                                        for opt[i] in root.app-id-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "cli_xxxxxxxx";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "App Secret"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].app-secret;
-                                                        input-type: "password";
-                                                        placeholder: "飞书应用密钥";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
+                                                        for opt[i] in root.app-secret-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            input-type: "password";
+                                                            placeholder: "飞书应用密钥";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
@@ -1519,30 +1569,39 @@ export component SettingsWindow inherits Window {
                                                 // ── 钉钉字段（企业内部应用机器人，Stream 模式长连接，无需公网地址）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "App Key"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].app-id;
-                                                        placeholder: "钉钉应用 AppKey（dingxxxx）";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
+                                                        for opt[i] in root.app-id-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "钉钉应用 AppKey（dingxxxx）";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "app_id", self.text); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "App Secret"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].app-secret;
-                                                        input-type: "password";
-                                                        placeholder: "钉钉应用 AppSecret";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
+                                                        for opt[i] in root.app-secret-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            input-type: "password";
+                                                            placeholder: "钉钉应用 AppSecret";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "app_secret", self.text); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "机器人编码"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].ding-robot-code;
-                                                        placeholder: "留空=默认 AppKey（个别后台单独展示才填）";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "ding_robot_code", self.text); }
+                                                        for opt[i] in root.ding-robot-code-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "留空=默认 AppKey（个别后台单独展示才填）";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "ding_robot_code", self.text); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
@@ -1560,11 +1619,14 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Text { text: "Owner（管理员）"; width: 80px; vertical-alignment: center; }
-                                                    PixelTextInput {
-                                                        text: root.bots[root.selected].ding-owner-ids;
-                                                        placeholder: "员工 staffId（管理员，逗号分隔多个）";
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        edited => { root.bot-field-edited(root.selected, "ding_owner_ids", self.text); }
+                                                        for opt[i] in root.ding-owner-ids-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "员工 staffId（管理员，逗号分隔多个）";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "ding_owner_ids", self.text); }
+                                                        }
                                                     }
                                                     PixelButton {
                                                         text: "生成管理员授权码";

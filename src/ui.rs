@@ -893,6 +893,48 @@ fn reload_bots_if_external_change(
     refresh_owner_code_info(w, work);
 }
 
+/// 按当前选中 bot 重建三个独立开关（启用/授权者隔离/每日整理）的单元素 model。
+/// 与 backend-options 同款绕法：整体替换 model → for 循环重建 PixelCheckBox 实例，
+/// 实例全新、checked 绑定全新——绕开 slint「用户交互移除 checked 绑定（内部赋值断绑，
+/// 绑 model 行属性或独立 property 都一样）、状态残留到其它 bot」的坑（#80 回归：
+/// 点 A 的每日整理，切到 B 显示残留，诱导误操作后连配置一起串）。
+fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let bot = work.borrow().get(w.get_selected() as usize).cloned();
+    let mk = |v: bool| -> slint::ModelRc<OptionRow> {
+        slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![OptionRow {
+            name: "".into(),
+            checked: v,
+        }])))
+    };
+    w.set_enabled_options(mk(bot.as_ref().map(|b| b.enabled).unwrap_or(false)));
+    w.set_restrict_options(mk(bot
+        .as_ref()
+        .map(|b| b.restrict_granted_agent)
+        .unwrap_or(false)));
+    w.set_tidy_options(mk(bot.as_ref().map(|b| b.tidy_enabled).unwrap_or(false)));
+}
+
+/// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/供应商/Owner/App ID/App Secret/
+/// 钉钉机器人编码/钉钉 Owner）。输入/选择交互同样移除组件 text/value 绑定（与 checkbox
+/// 同源坑），直接绑 model 行属性会在切 bot 后残留上一 bot 的值；整体替换 model →
+/// for 循环重建实例，绑定全新。密码框按现有语义回填原值（bot_to_row 已如此）。
+fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let bot = work.borrow().get(w.get_selected() as usize).cloned();
+    let mk = |v: &str| -> slint::ModelRc<EditorRow> {
+        slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![EditorRow {
+            value: v.into(),
+        }])))
+    };
+    let b = bot.as_ref();
+    w.set_name_editor_options(mk(b.map(|b| b.name.as_str()).unwrap_or("")));
+    w.set_provider_editor_options(mk(b.map(|b| b.provider.as_str()).unwrap_or("")));
+    w.set_owner_editor_options(mk(b.map(|b| b.owner_open_id.as_str()).unwrap_or("")));
+    w.set_app_id_editor_options(mk(b.map(|b| b.app_id.as_str()).unwrap_or("")));
+    w.set_app_secret_editor_options(mk(b.map(|b| b.app_secret.as_str()).unwrap_or("")));
+    w.set_ding_robot_code_editor_options(mk(b.map(|b| b.ding_robot_code.as_str()).unwrap_or("")));
+    w.set_ding_owner_ids_editor_options(mk(b.map(|b| b.ding_owner_ids.as_str()).unwrap_or("")));
+}
+
 /// 按当前选中 bot 重算互斥 CheckBox 的勾选态（后端 + 对话权限）。
 /// 切 bot / 装载设置窗时调用。整体替换 option model → for 循环重建 CheckBox 实例，
 /// 绕开 slint「用户交互移除 checked 绑定、状态残留到其它 bot」的坑。
@@ -1344,6 +1386,8 @@ pub fn run_gui() -> Result<()> {
         w.set_provider_selected(if c.providers.is_empty() { -1 } else { 0 });
         refresh_owner_code_info(w, work);
         refresh_exclusive_checks(w, work);
+        refresh_toggle_checks(w, work);
+        refresh_editors(w, work);
         w.set_status_line("".into());
         // 依赖检测：claude/codex/node/python3/lark-cli 是否在本机可执行路径上。
         push_deps_to_window(w);
@@ -2410,6 +2454,7 @@ pub fn run_gui() -> Result<()> {
         // 按字段回写（slint 侧只传被改的那一个字段）：杜绝「未改字段从过期 model 读回」
         // 导致的连改两字段互相回滚（旧 bot-edited 的 CRITICAL bug）。
         let dirty = dirty.clone();
+        let sw = settings.as_weak();
         settings.on_bot_field_edited(move |idx, field, value| {
             dirty.set(true);
             let mut refresh = false;
@@ -2453,6 +2498,10 @@ pub fn run_gui() -> Result<()> {
             if refresh {
                 let b = work.borrow();
                 sync_model(&model, &b);
+                // 输入框/下拉断绑后不跟随 model 重建，这里一并重建（kind/backend 切换）
+                if let Some(w) = sw.upgrade() {
+                    refresh_editors(&w, &work);
+                }
             }
         });
     }
@@ -2460,6 +2509,7 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let dirty = dirty.clone();
+        let sw = settings.as_weak();
         settings.on_set_bot_enabled(move |idx, enabled| {
             dirty.set(true);
             {
@@ -2471,6 +2521,15 @@ pub fn run_gui() -> Result<()> {
             // 同步回写 model：列表的 ⚪/停用 前缀与勾选框状态都绑 model，不刷新会显示旧值
             let b = work.borrow();
             sync_model(&model, &b);
+            // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
+            if let Some(w) = sw.upgrade() {
+                w.set_enabled_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+                    OptionRow {
+                        name: "".into(),
+                        checked: enabled,
+                    },
+                ]))));
+            }
         });
     }
     // 「授权者 agent 隔离」开关（安全默认开启）：关闭=授权者与 owner 同权限（现状全权限）。
@@ -2479,6 +2538,7 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let dirty = dirty.clone();
+        let sw = settings.as_weak();
         settings.on_set_restrict_granted(move |idx, enabled| {
             dirty.set(true);
             {
@@ -2490,6 +2550,15 @@ pub fn run_gui() -> Result<()> {
             // 同步回写 model：勾选框状态绑 model，不刷新会显示旧值
             let b = work.borrow();
             sync_model(&model, &b);
+            // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
+            if let Some(w) = sw.upgrade() {
+                w.set_restrict_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+                    OptionRow {
+                        name: "".into(),
+                        checked: enabled,
+                    },
+                ]))));
+            }
         });
     }
     // 「每日工作目录整理」开关（默认关）：孤儿会话文件/临时文件/超期历史截断/
@@ -2498,6 +2567,7 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let dirty = dirty.clone();
+        let sw = settings.as_weak();
         settings.on_set_tidy_enabled(move |idx, enabled| {
             dirty.set(true);
             {
@@ -2509,6 +2579,15 @@ pub fn run_gui() -> Result<()> {
             // 同步回写 model：勾选框状态绑 model，不刷新会显示旧值
             let b = work.borrow();
             sync_model(&model, &b);
+            // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
+            if let Some(w) = sw.upgrade() {
+                w.set_tidy_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+                    OptionRow {
+                        name: "".into(),
+                        checked: enabled,
+                    },
+                ]))));
+            }
         });
     }
     {
@@ -2532,6 +2611,8 @@ pub fn run_gui() -> Result<()> {
             if let Some(w) = sw.upgrade() {
                 refresh_owner_code_info(&w, &work);
                 refresh_exclusive_checks(&w, &work);
+                refresh_toggle_checks(&w, &work);
+                refresh_editors(&w, &work);
                 // 虚拟 Bot 登记列表按选中 bot 刷新 + 收起 ⋯ 菜单（切 bot 残留展开态会串行）
                 refresh_vb_rows(&w, &work);
                 w.set_vb_menu_open(-1);
