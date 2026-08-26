@@ -1909,8 +1909,8 @@ export component SettingsWindow inherits Window {
                                             if !root.codex-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
                                         }
                                         // #93：版本满足显示实际版本；版本过低给升级指引；未装保留 npm 命令提示
-                                        if root.codex-ok && root.codex-version != "": Text { text: "已安装 v\(root.codex-version)（最低要求 v0.140）"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
-                                        if root.codex-installed && !root.codex-ok: Text { text: "当前 v\(root.codex-version) 低于最低要求 v0.140（与沙箱能力对齐），请升级"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if root.codex-ok && root.codex-version != "": Text { text: "已安装 v\{root.codex-version}（最低要求 v0.140）"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if root.codex-installed && !root.codex-ok: Text { text: "当前 v\{root.codex-version} 低于最低要求 v0.140（与沙箱能力对齐），请升级"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // pi
                                         HorizontalBox {
