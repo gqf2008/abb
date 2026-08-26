@@ -907,6 +907,9 @@ export component SettingsWindow inherits Window {
     // 环境配置（依赖检测）：各项是否在本机可执行路径上
     in-out property <bool> claude-installed: false;
     in-out property <bool> codex-installed: false;
+    // #93 codex 最低版本锁定：codex-version=检测到的版本串；codex-ok=已装且版本 >= MIN_CODEX_VERSION。
+    in-out property <string> codex-version: "";
+    in-out property <bool> codex-ok: false;
     in-out property <bool> pi-installed: false;
     in-out property <bool> prime-agent-installed: false;
     in-out property <bool> node-installed: false;
@@ -1030,8 +1033,9 @@ export component SettingsWindow inherits Window {
     callback set-session-gc-days(int);         // 过期天数下拉下标（0=3 1=7 2=14 3=30）
 
     // 首页「待处理」卡用到的统计（纯表达式，跟随各 *_installed / perm-* 属性自动更新）
+    // #93：codex 版本过低也算待处理（codex-ok = 已装且版本满足）。
     property <int> missing-deps: (root.claude-installed ? 0 : 1)
-        + (root.codex-installed ? 0 : 1)
+        + (root.codex-ok ? 0 : 1)
         + (root.pi-installed ? 0 : 1)
         + (root.prime-agent-installed ? 0 : 1)
         + (root.node-installed ? 0 : 1)
@@ -1893,15 +1897,20 @@ export component SettingsWindow inherits Window {
                                             height: 34px;
                                             spacing: 10px;
                                             Text { text: "Codex CLI"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
-                                            StatusPill { text: root.codex-installed ? "已安装" : "未安装"; ok: root.codex-installed; }
+                                            if root.codex-ok: StatusPill { text: "已安装"; ok: true; }
+                                            if root.codex-installed && !root.codex-ok: StatusPill { text: "版本过低"; ok: false; warn: true; }
+                                            if !root.codex-installed: StatusPill { text: "未安装"; ok: false; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.codex-installed: PixelButton {
-                                                text: "安装";
+                                            if !root.codex-ok: PixelButton {
+                                                text: root.codex-installed ? "升级" : "安装";
                                                 enabled: root.dep-busy == "";
                                                 clicked => { root.install-dep("codex"); }
                                             }
                                             if !root.codex-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
                                         }
+                                        // #93：版本满足显示实际版本；版本过低给升级指引；未装保留 npm 命令提示
+                                        if root.codex-ok && root.codex-version != "": Text { text: "已安装 v\{root.codex-version}（最低要求 v0.140）"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if root.codex-installed && !root.codex-ok: Text { text: "当前 v\{root.codex-version} 低于最低要求 v0.140（与沙箱能力对齐），请升级"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
                                         // pi
                                         HorizontalBox {

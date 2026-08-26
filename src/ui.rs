@@ -1015,10 +1015,17 @@ fn push_deps_to_window(w: &SettingsWindow) {
             .map(|d| d.found)
             .unwrap_or(false)
     };
+    // #93 codex 三态：codex_ok = 已装且版本满足最低锁定（< MIN_CODEX_VERSION → 需升级）。
+    let codex = all.iter().find(|d| d.id == "codex");
+    let codex_version = codex.map(|d| d.version.clone()).unwrap_or_default();
+    let codex_ok = codex.map(|d| d.found && d.version_ok).unwrap_or(false);
     // #8 M0：claude/codex/pi/prime-agent 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
-    w.set_missing_agent(!get("claude") || !get("codex") || !get("pi") || !get("prime-agent"));
+    // #93：codex 版本过低同样视为「待处理」——启动引导/横幅继续提示，直到升级到最低锁定版本。
+    w.set_missing_agent(!get("claude") || !codex_ok || !get("pi") || !get("prime-agent"));
     w.set_claude_installed(get("claude"));
     w.set_codex_installed(get("codex"));
+    w.set_codex_version(codex_version.into());
+    w.set_codex_ok(codex_ok);
     w.set_pi_installed(get("pi"));
     w.set_prime_agent_installed(get("prime-agent"));
     w.set_node_installed(get("node"));
@@ -2289,8 +2296,15 @@ pub fn run_gui() -> Result<()> {
                 .map(|d| !d.found)
                 .unwrap_or(true)
         };
+        // #93：codex 版本过低也触发启动引导（升级到最低锁定版本前一直引导）
+        let codex_low = deps
+            .iter()
+            .find(|d| d.id == "codex")
+            .map(|d| d.found && !d.version_ok)
+            .unwrap_or(false);
         if missing("claude")
             || missing("codex")
+            || codex_low
             || missing("pi")
             || missing("prime-agent")
             || std::env::args().any(|a| a == "--show-settings")
@@ -3444,7 +3458,11 @@ pub fn run_gui() -> Result<()> {
                 push_perms_to_window(&w);
                 w.set_status_is_error(false);
                 let all = crate::deps::detect_all();
-                let missing: Vec<&str> = all.iter().filter(|d| !d.found).map(|d| d.label).collect();
+                let missing: Vec<&str> = all
+                    .iter()
+                    .filter(|d| !d.found || (d.id == "codex" && !d.version_ok))
+                    .map(|d| d.label)
+                    .collect();
                 let msg = if missing.is_empty() {
                     "✅ 全部依赖均已安装".to_string()
                 } else {
@@ -3842,10 +3860,18 @@ pub fn run_gui() -> Result<()> {
                                 w.set_dep_busy("".into());
                                 push_deps_to_window(&w);
                                 match result {
-                                    Ok(_) => {
+                                    Ok(tail) => {
                                         w.set_dep_detail("".into());
                                         w.set_status_is_error(false);
-                                        w.set_status_line(format!("✅ {dep_id} 安装完成").into());
+                                        // #93：codex 装完的登录引导（run_install 成功返回已附）。
+                                        // 其它依赖保持原样文案（npm/brew 输出冗长不直接上状态行）。
+                                        if dep_id == "codex" {
+                                            w.set_status_line(
+                                                crate::agent::truncate(&tail, 200).into(),
+                                            );
+                                        } else {
+                                            w.set_status_line(format!("✅ {dep_id} 安装完成").into());
+                                        }
                                     }
                                     Err(e) => {
                                         // 分类 + 引导进详情区（普通用户可操作）；自动切到
@@ -3901,9 +3927,14 @@ pub fn run_gui() -> Result<()> {
                                     w.set_dep_detail("".into());
                                     w.set_status_is_error(false);
                                     w.set_dep_failed_count(0);
-                                    w.set_status_line(
-                                        crate::deps::format_all_summary(&outcome).into(),
-                                    );
+                                    let mut line = crate::deps::format_all_summary(&outcome);
+                                    // #93：一键装里带 codex → 追加登录引导（与单项装同文案）
+                                    if outcome.ok.iter().any(|id| id == "codex") {
+                                        line.push_str(
+                                            "；codex 首次使用请运行 `codex login` 或在「模型供应商」页配 API key",
+                                        );
+                                    }
+                                    w.set_status_line(line.into());
                                 }
                             }
                         }

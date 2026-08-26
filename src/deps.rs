@@ -208,6 +208,11 @@ fn is_executable(p: &std::path::Path) -> bool {
 }
 
 /// 单个依赖的检测结果。
+/// #93 codex 最低版本锁定：与 agent.rs codex_command 的 OS 沙箱能力对齐（issues/93：
+/// 「最低版本锁定，如 >= 0.140」）。低于此版本视为「需升级」（进一键安装清单 / UI 显示
+/// 升级态），缺失视为「需安装」。
+pub const MIN_CODEX_VERSION: &str = "0.140";
+
 #[derive(Debug, Clone)]
 pub struct DepStatus {
     /// 机器键：claude | codex | pi | prime-agent | node | python3 | lark-cli | dingtalk-cli
@@ -218,10 +223,16 @@ pub struct DepStatus {
     /// 找到时的可执行路径（未找到为空）。当前 UI 只显 found，路径留作排障/将来展示。
     #[allow(dead_code)]
     pub path: String,
+    /// 已装版本字符串（仅 codex 做版本探测；其它依赖为空串）。
+    pub version: String,
+    /// 版本是否满足最低要求（仅 codex 有最低版本锁定，见 MIN_CODEX_VERSION；
+    /// 未找到恒 false，其它依赖恒 true）。
+    pub version_ok: bool,
 }
 
 /// 检测全部依赖。设置窗打开 + 「重新检测」时调。
 /// node 探 `node`；python 先试 `python3` 再 `python`；lark-cli 用于技能引导门控。
+/// codex 额外做版本探测（#93 最低版本锁定，见 MIN_CODEX_VERSION）。
 pub fn detect_all() -> Vec<DepStatus> {
     let probe = |id: &'static str, label: &'static str, names: &[&str]| -> DepStatus {
         for n in names {
@@ -231,6 +242,8 @@ pub fn detect_all() -> Vec<DepStatus> {
                     label,
                     found: true,
                     path: p.to_string_lossy().into_owned(),
+                    version: String::new(),
+                    version_ok: true,
                 };
             }
         }
@@ -239,11 +252,33 @@ pub fn detect_all() -> Vec<DepStatus> {
             label,
             found: false,
             path: String::new(),
+            version: String::new(),
+            version_ok: false,
         }
+    };
+    let codex = probe("codex", "Codex CLI", &["codex"]);
+    let codex = if codex.found {
+        // 版本探测失败（`codex --version` 跑不通）保守按「可用」放行：能跑 codex 就
+        // 大概率能跑 --version，探测失败的场景极少；若按「不满足」会假阳性地一直提示
+        // 升级，误伤已装用户（每次启动都被引导）。权衡后取放行。
+        match codex_version(&codex.path) {
+            Some(v) => DepStatus {
+                version: v.clone(),
+                version_ok: version_at_least(&v, MIN_CODEX_VERSION),
+                ..codex
+            },
+            None => DepStatus {
+                version: String::new(),
+                version_ok: true,
+                ..codex
+            },
+        }
+    } else {
+        codex
     };
     vec![
         probe("claude", "Claude Code", &["claude"]),
-        probe("codex", "Codex CLI", &["codex"]),
+        codex,
         // pi：npm 全局 bin（~/.npm-global/bin/pi，软链到 pi-coding-agent 的 cli.js）
         probe("pi", "Pi (pi-coding-agent)", &["pi"]),
         // prime-agent：官方 curl 安装器装到 npm 全局 bin（~/.npm-global/bin/prime-agent）
@@ -258,6 +293,67 @@ pub fn detect_all() -> Vec<DepStatus> {
         // 钉钉 CLI（dingtalk-workspace-cli，命令名 dws）：接入钉钉 bot 后让 agent 调钉钉能力
         probe("dingtalk-cli", "dingtalk-cli (dws)", &["dws"]),
     ]
+}
+
+/// 跑 `codex --version` 解析版本号。跑不通/非零退出 → None。
+pub fn codex_version(exe: &str) -> Option<String> {
+    let out = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    codex_version_from_text(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 从 `codex --version` 输出文本里提取版本号。输出形如 `codex-cli 0.146.0`
+/// （也可能带 build 后缀，如 `codex-cli 0.146.0 (abc1234)`）→ 返回 `0.146.0`。
+/// 找不到形如 `d+.d+` 的 token → None。
+pub fn codex_version_from_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|tok| {
+            let head: String = tok
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            !head.is_empty()
+                && head.split('.').count() >= 2
+                && head
+                    .split('.')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(|tok| {
+            tok.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect()
+        })
+}
+
+/// 解析 `X.Y.Z` 版本串为数值元组（前导数字段；多余段忽略，缺段补 0）。
+/// 如 `0.146.0` → (0,146,0)；`1.2` → (1,2,0)；非版本串 → None。
+pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let digits: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let parts: Vec<&str> = digits.split('.').collect();
+    if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut nums = [0u64; 3];
+    for (i, p) in parts.iter().take(3).enumerate() {
+        nums[i] = p.parse().ok()?;
+    }
+    Some((nums[0], nums[1], nums[2]))
+}
+
+/// `v >= min` 的语义化版本比较（三段数值；解析失败保守返回 false）。
+pub fn version_at_least(v: &str, min: &str) -> bool {
+    match (parse_version(v), parse_version(min)) {
+        (Some(a), Some(b)) => a >= b,
+        _ => false,
+    }
 }
 
 /// 按 id 查某项的检测状态。
@@ -466,8 +562,22 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
         match run_step(step).await {
             Ok(tail) => {
                 // 该步退出 0：再确认依赖真的可用了（有些安装器 0 退出但需重开 shell 才上 PATH）。
-                if detect_one(dep_id).map(|d| d.found).unwrap_or(false) {
+                // #93：codex 装完还要过最低版本锁（npm 装到旧版缓存/降级场景少见，但过一下更稳）。
+                let ok_after = detect_one(dep_id)
+                    .map(|d| d.found && (dep_id != "codex" || d.version_ok))
+                    .unwrap_or(false);
+                if ok_after {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
+                    // #93 登录引导：codex 装完给下一步指引（装完即能用的最后一公里）。
+                    // 不自动跑 codex login（交互式浏览器授权，GUI 里无人值守会挂死）；
+                    // 给出两条路径：命令行 codex login / GUI 供应商页配 key（ABB 已有供应商注入）。
+                    // 状态行要精简：不返回 npm/brew 的冗长输出，只回引导文案。
+                    if dep_id == "codex" {
+                        return Ok(
+                            "✅ codex 安装完成。首次使用：① 命令行运行 `codex login`（浏览器授权）；② 或到「设置 → 模型供应商」配 OpenAI / DeepSeek / OpenRouter 的 API key。"
+                                .to_string(),
+                        );
+                    }
                     return Ok(tail);
                 }
                 last_err = format!(
@@ -653,7 +763,9 @@ const ALL_INSTALL_DEP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for d in deps {
-        if !d.found {
+        // #93：codex 已装但版本低于最低锁定（MIN_CODEX_VERSION）也进清单——
+        // 一键安装/单项安装会重跑 npm/brew 升级到最新。其余依赖只看 found。
+        if !d.found || (d.id == "codex" && !d.version_ok) {
             ids.push(d.id.to_string());
         }
     }
@@ -1140,6 +1252,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_version_normalizes() {
+        assert_eq!(parse_version("0.146.0"), Some((0, 146, 0)));
+        assert_eq!(parse_version("0.140"), Some((0, 140, 0)));
+        assert_eq!(parse_version("1.2.3.4"), Some((1, 2, 3))); // 多余段忽略
+        assert_eq!(parse_version("1.2-beta"), Some((1, 2, 0))); // 后缀截断
+        assert_eq!(parse_version("0.146.0 (abc1234)"), Some((0, 146, 0)));
+        assert_eq!(parse_version("abc"), None);
+        assert_eq!(parse_version("0"), None); // 不足两段
+        assert_eq!(parse_version("1..2"), None); // 空段
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn version_at_least_gates() {
+        // 满足
+        assert!(version_at_least("0.146.0", MIN_CODEX_VERSION));
+        assert!(version_at_least("0.140.0", MIN_CODEX_VERSION));
+        assert!(version_at_least("0.140.1", MIN_CODEX_VERSION));
+        assert!(version_at_least("1.0.0", MIN_CODEX_VERSION));
+        assert!(version_at_least("0.200", MIN_CODEX_VERSION)); // 缺段补 0
+                                                               // 不满足
+        assert!(!version_at_least("0.139.9", MIN_CODEX_VERSION));
+        assert!(!version_at_least("0.14", MIN_CODEX_VERSION)); // 0.14 < 0.140
+        assert!(!version_at_least("0.1.99", MIN_CODEX_VERSION));
+        // 解析失败保守 false
+        assert!(!version_at_least("abc", MIN_CODEX_VERSION));
+        assert!(!version_at_least("0.146.0", "not-a-version"));
+    }
+
+    #[test]
+    fn codex_version_parses_cli_output() {
+        // codex --version 实测输出形态：`codex-cli 0.146.0`（新版可能带 build 后缀）。
+        assert_eq!(
+            codex_version_from_text("codex-cli 0.146.0"),
+            Some("0.146.0".into())
+        );
+        assert_eq!(
+            codex_version_from_text("codex-cli 0.146.0 (abc1234)\n"),
+            Some("0.146.0".into())
+        );
+        assert_eq!(
+            codex_version_from_text("@openai/codex 0.140.0"),
+            Some("0.140.0".into())
+        );
+        assert_eq!(codex_version_from_text("未知版本"), None);
+        assert_eq!(codex_version_from_text(""), None);
+    }
+
+    #[test]
+    fn missing_deps_includes_version_low_codex() {
+        // 已装但版本过低 → 进缺失清单（升级路径）
+        let low = DepStatus {
+            id: "codex",
+            label: "Codex CLI",
+            found: true,
+            path: String::new(),
+            version: "0.139.0".into(),
+            version_ok: false,
+        };
+        let ok = DepStatus {
+            id: "codex",
+            label: "Codex CLI",
+            found: true,
+            path: String::new(),
+            version: "0.146.0".into(),
+            version_ok: true,
+        };
+        let missing = missing_dep_ids(&[low]);
+        assert_eq!(missing, vec!["codex".to_string()], "版本过低应进安装清单");
+        assert!(missing_dep_ids(&[ok]).is_empty(), "版本满足不应进清单");
+    }
+
+    #[test]
     fn classify_fail_matrix() {
         // 分类矩阵：每类构造代表性错误串 → 断言 kind + advice 非空
         let cases = [
@@ -1294,6 +1479,8 @@ mod tests {
             label: id,
             found,
             path: String::new(),
+            version: String::new(),
+            version_ok: found,
         }
     }
 
