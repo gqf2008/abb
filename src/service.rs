@@ -401,6 +401,68 @@ async fn run_bot(
         });
     }
 
+    // 回收站 TTL 清理循环（#88 删除保护）：24h 门 + jitter（盐与 tidy/session_gc 错开）。
+    // delete_protect 默认开 → 回收站必须定期清，否则磁盘只进不出。纯文件操作，
+    // 与调度/整理循环独立；配置损坏只跳过本轮。
+    {
+        let key = key.clone();
+        let stop = stop.clone();
+        let name: &'static str = Box::leak(format!("trash-gc:{key}").into_boxed_str());
+        crate::tasks::tasks().spawn_forever(name, async move {
+            crate::log!("[trash-gc:{key}] 回收站 TTL 清理循环启动");
+            let workspace = crate::workspace_dir(&key);
+            // 上次运行标记（重启不丢 24h 门，同 tidy）
+            let marker = workspace.join(".abb-trash-gc-last");
+            let jitter = (fnv(&key) ^ 0x5EED) % 3600;
+            let mut gate = boot_gate(
+                read_run_marker(&marker),
+                crate::chrono_lite::unix_secs(),
+                jitter,
+            );
+            loop {
+                if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
+                    break;
+                }
+                let now = crate::chrono_lite::unix_secs();
+                let due = daily_due(gate, now);
+                if !due {
+                    continue;
+                }
+                // 到点才推进门并热读配置（同 tidy）
+                gate = Some(now);
+                let cfg = match Config::load() {
+                    Ok(c) => c,
+                    Err(_) => continue, // 配置损坏 → 本周期跳过，下个门再试
+                };
+                let settings = cfg
+                    .bots
+                    .iter()
+                    .find(|b| b.key() == key)
+                    .map(crate::trash::TrashSettings::from_bot)
+                    .unwrap_or_else(crate::trash::TrashSettings::defaults);
+                if !settings.enabled {
+                    continue;
+                }
+                let purged = crate::trash::purge_expired(&workspace, settings.ttl_days);
+                write_run_marker(&marker, now);
+                crate::log!("[trash-gc:{key}] 回收站 TTL 清理：过期 {} 条", purged);
+                if purged > 0 {
+                    // 清理也是变更：git 留痕（工作区有 .git 时；tidy::git_commit 兜底跳过）
+                    match crate::tidy::git_commit(&workspace).await {
+                        Ok(crate::tidy::GitOutcome::Committed(h)) => {
+                            crate::log!("[trash-gc:{key}] git 留痕 commit {h}")
+                        }
+                        Ok(crate::tidy::GitOutcome::NothingToCommit) => {}
+                        Ok(crate::tidy::GitOutcome::Skipped(r)) | Err(r) => {
+                            crate::log!("[trash-gc:{key}] ⚠️ git 留痕跳过：{r}")
+                        }
+                    }
+                }
+            }
+            crate::log!("[trash-gc:{key}] 回收站 TTL 清理循环退出");
+        });
+    }
+
     // 每日会话归纳清理循环（全局开关 session_gc_enabled，默认关）：24h 门 + 配置热读。
     // 过期会话（最后活跃超 session_gc_days）交 bot 后端 agent 归纳成摘要存档
     //（summaries/），再清理工作区内历史/后端会话文件（绝不触碰 ~/.claude 等后端

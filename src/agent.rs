@@ -463,9 +463,14 @@ pub async fn run(
     // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
     //（返回用户可见错误，不静默降级成全权限）。
+    // owner 会话（非受限）：也生成删除保护 settings.json（#88，claude Bash hook），
+    // 失败同样拒绝启动——删除保护是安全默认，不能静默裸奔。
     if restrict {
         crate::guard::ensure_guard_files(bot_key)
             .map_err(|e| format!("⚠️ 受限会话 guard 文件生成失败，已拒绝启动：{e:#}"))?;
+    } else {
+        crate::guard::ensure_owner_guard_files(bot_key)
+            .map_err(|e| format!("⚠️ 删除保护 guard 文件生成失败，已拒绝启动：{e:#}"))?;
     }
 
     // 本 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）
@@ -791,6 +796,10 @@ fn claude_command(
             .arg("Write(./**)");
     } else {
         c.arg("--dangerously-skip-permissions");
+        // 删除保护（#88）：owner 会话也挂 Bash hook（settings 由调用方传入，指向
+        // 工作区外的 owner-settings.json）。hook 在删除类命令上拦截（移入回收站/危险
+        // 确认），其余 Bash 命令直通——owner 全权限行为不变。
+        c.arg("--settings").arg(settings_path);
     }
     c.arg("--verbose").arg("--output-format").arg("stream-json");
     c.arg(if resume { "--resume" } else { "--session-id" })
@@ -1265,7 +1274,12 @@ async fn run_once(
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
             // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）与受限模式分支
             //（受限时 --settings 指向工作区外的 guard settings.json）。
-            let settings = crate::guard::guard_settings_path(bot_key);
+            // owner 会话的 --settings 指向删除保护 owner-settings.json（#88）。
+            let settings = if restrict {
+                crate::guard::guard_settings_path(bot_key)
+            } else {
+                crate::guard::owner_guard_settings_path(bot_key)
+            };
             tokio::process::Command::from(claude_command(
                 &resolved, resume, session_id, restrict, &settings,
             ))
@@ -2476,6 +2490,10 @@ mod tests {
         assert!(
             c.get_args().any(|a| a == "--dangerously-skip-permissions"),
             "owner 会话保持全权限"
+        );
+        assert!(
+            c.get_args().any(|a| a == "--settings"),
+            "owner 会话也挂删除保护 settings（#88）"
         );
         let r = claude_command(
             std::path::Path::new("claude"),

@@ -269,6 +269,22 @@ impl Bridge {
             return;
         }
 
+        // /trash 删除保护指令（#88）：管理回收站（list/restore/purge）与确认危险删除
+        //（confirm）。即时控制指令，不进 agent、不落盘 pending。仅 owner 可用（删除是
+        // 管理动作，与 /mention 开关同口径）。三渠道共用（on_payload/on_weixin/on_dingtalk
+        // 都汇入 handle）。
+        if let Some(tc) = parse_trash_cmd(&text) {
+            let reply = if ev.role != crate::config::SenderRole::Owner {
+                "⚠️ 回收站管理仅管理员（owner）可用。".to_string()
+            } else {
+                self.trash_reply(&ev, tc).await
+            };
+            if let Err(e) = self.send_reply(&ev, &reply).await {
+                crate::log!("[bridge] /trash 确认发送失败: {e:#}");
+            }
+            return;
+        }
+
         // #25 重启恢复：进入 agent 处理前落盘 pending（已排除 /new、停止词等控制指令），
         // service 崩溃/重启后由 recover_pending 自动重放续跑。重放时同 mid 再次 add
         // 会按 mid 去重，不会产生重复条目。
@@ -773,5 +789,100 @@ impl Bridge {
         self.msgr.del_typing(&ev.mid, typing_rid).await;
         self.msgr.done(&ev.mid).await;
         // _serial_guard 在此函数末尾 drop，释放 per-chat 锁，排队的下一条开始处理。
+    }
+
+    /// /trash 子命令处理（#88）。owner 已由调用方过滤；这里只产出回复文案。
+    async fn trash_reply(&self, _ev: &Ev, tc: TrashCmd) -> String {
+        let workspace = crate::workspace_dir(&self.bot.key());
+        match tc {
+            TrashCmd::List => {
+                let items = crate::trash::list(&workspace);
+                let pending = crate::guard::list_pending(&self.bot.key());
+                if items.is_empty() && pending.is_empty() {
+                    return "🗑 回收站为空".into();
+                }
+                let mut lines = Vec::new();
+                for it in items.iter().take(10) {
+                    let remain = it
+                        .trashed_at
+                        .saturating_add((self.bot.trash_ttl_days.max(1) as u64) * 86400)
+                        .saturating_sub(crate::chrono_lite::unix_secs())
+                        / 86400;
+                    lines.push(format!(
+                        "{} | {}（{} 天后过期）{}",
+                        &it.id[..it.id.len().min(8)],
+                        crate::trash::pretty_path(std::path::Path::new(&it.orig)),
+                        remain,
+                        if it.dangerous { " ⚠️" } else { "" }
+                    ));
+                }
+                if items.len() > 10 {
+                    lines.push(format!("…共 {} 条（更多用 trash list 命令查看）", items.len()));
+                }
+                if !pending.is_empty() {
+                    lines.push("\n待确认危险删除（/trash confirm <路径>）：".into());
+                    for (p, _) in pending {
+                        lines.push(format!("  {p}"));
+                    }
+                }
+                lines.join("\n")
+            }
+            TrashCmd::Restore(id) => match crate::trash::restore(&workspace, &id) {
+                Ok(it) => format!("♻️ 已恢复：{} → {}", &it.id[..it.id.len().min(8)], it.orig),
+                Err(e) => format!("⚠️ 恢复失败：{e}"),
+            },
+            TrashCmd::Purge(all) => {
+                let n = if all {
+                    crate::trash::purge_all(&workspace)
+                } else {
+                    crate::trash::purge_expired(&workspace, self.bot.trash_ttl_days.max(1))
+                };
+                format!("🧹 已清理回收站条目 {n} 条{}", if all { "（全部）" } else { "（过期）" })
+            }
+            TrashCmd::Confirm(path) => {
+                match crate::guard::confirm_dangerous_delete(&self.bot.key(), &workspace, &path) {
+                    Ok(it) => format!(
+                        "✅ 已确认并移入回收站：{}（{} 天内可恢复；/trash restore 可撤回）",
+                        it.orig, self.bot.trash_ttl_days.max(1)
+                    ),
+                    Err(e) => format!("⚠️ 确认失败：{e}"),
+                }
+            }
+        }
+    }
+}
+
+/// /trash 回收站指令（#88）。
+#[derive(Debug, PartialEq)]
+enum TrashCmd {
+    List,
+    Restore(String),
+    Purge(bool),
+    Confirm(String),
+}
+
+/// 识别 /trash 指令：
+///
+/// - `/trash` / `/trash list` → List
+/// - `/trash restore <id>` → Restore(id)
+/// - `/trash purge` → Purge(false)；`/trash purge --all` → Purge(true)
+/// - `/trash confirm <path>` → Confirm(path)
+///
+/// 其它形态（含 `/trash` 后跟未知子命令）返回 None（原样透传 agent）。
+fn parse_trash_cmd(text: &str) -> Option<TrashCmd> {
+    let mut parts = text.split_whitespace();
+    if !parts.next().map(|p| p.eq_ignore_ascii_case("/trash"))? {
+        return None;
+    }
+    let sub = parts.next().map(|s| s.to_ascii_lowercase());
+    match sub.as_deref() {
+        None | Some("list") => Some(TrashCmd::List),
+        Some("restore") => parts.next().map(|id| TrashCmd::Restore(id.to_string())),
+        Some("purge") => {
+            let all = parts.any(|p| p.eq_ignore_ascii_case("--all"));
+            Some(TrashCmd::Purge(all))
+        }
+        Some("confirm") => parts.next().map(|p| TrashCmd::Confirm(p.to_string())),
+        _ => None,
     }
 }

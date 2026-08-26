@@ -55,6 +55,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 开机自启 | 托盘常驻，崩溃自动拉起 |
 | 多机器人 | 飞书、微信、钉钉同时在线，各自独立配置 |
 | 跨会话投递 | 设置里开启后，agent 可把消息/任务结果投递到其它 bot 的会话（`agent-bridge deliver --bot <key> --chat <id> --text ...`），支持附件元数据转发与定时任务多目标（`job add --to bot:chat`） |
+| 删除保护 | agent 删除 → 移入工作区回收站（`/trash list` 查看、`/trash restore` 恢复、TTL 自动清理）；危险删除（≥50MB / 含源码）拦截并需 `/trash confirm` 二次确认；有 git 时自动快照留痕 |
 
 ## 隐私
 
@@ -78,6 +79,25 @@ owner 会话不受影响（保持本机全权限）；信任的团队成员可�
 但沙箱可读全盘（敏感文件若被写进回复仍会外泄）、macOS 网络隔离历史上不可靠需
 按环境复测、read-only 下授权者的定时任务与跨会话投递不可用；pi / prime-agent
 后端不支持受限模式（授权者会话被拒绝，换 claude/codex 后端即可）。
+
+### 删除保护（回收站，默认开启）
+
+agent 的每个删除动作都**可撤销、可追溯**（#88，bot 配置页可调，默认全开）：
+
+- **回收站（兜底层）**：agent 在工作区内执行删除 → 不直接删，移入 `workspace/.trash/`，
+  保留 **7 天**（可配置 TTL）后自动清理。聊天里发 `/trash list` 查看、`/trash restore <id>`
+  恢复、`/trash purge` 清空过期项。
+- **危险删除确认（拦截层）**：删除 ≥50MB（可配置阈值）或含代码特征（.py/.rs/.go/.js/
+  package.json/Cargo.toml 等，可配置扩展名）的路径 → **拦截并等待二次确认**——agent
+  回复会说明拦截原因，你在聊天里发 `/trash confirm <路径>` 确认后才会移入回收站。
+- **git 时光机（留痕层）**：工作区已有 `.git` 时，删除前后自动 `git add -A` 快照
+  （回收站清理同样留痕），即使过了 TTL 也有历史可回退。
+
+实现方式：owner 的 Claude 会话也挂 PreToolUse hook（仅匹配 Bash，其它工具零开销），
+guard-check 在删除命令上做拦截与回收站移动；`trash` CLI 供手动管理
+（`agent-bridge trash list|restore|purge|confirm`）。已知局限：codex 后端暂无 hook
+机制（execpolicy 实测不可靠），删除保护当前覆盖 claude 后端，codex 收敛（#92）后
+再对齐。
 
 ## 常见问题
 

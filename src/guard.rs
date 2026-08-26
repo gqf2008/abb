@@ -10,8 +10,12 @@
 //!
 //! hook 决策流程：`"$ABB_BIN" guard-check` 由 claude 以子进程执行，stdin 收
 //! hook 事件 JSON，stdout 输出决策 JSON（deny 时 claude 拒绝该工具调用并把
-//! reason 反馈给模型）。guard-check 读 env AGENT_BRIDGE_SENDER_ROLE，非
-//! granted 会话直接 allow（owner 会话不被卡）。
+//! reason 反馈给模型）。guard-check 读 env AGENT_BRIDGE_SENDER_ROLE：
+//! - granted 会话：受限白名单闸（只读工作区 + $ABB_BIN 白名单）；
+//! - owner 会话：删除保护（#88）——只拦删除类 Bash（rm/rmdir/unlink…），
+//!   安全删除移入回收站、危险删除拦截待确认，其它命令一律直通。
+
+use serde::{Deserialize, Serialize};
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +27,18 @@ fn guard_dir(bot_key: &str) -> PathBuf {
 /// 受限 claude spawn 时 `--settings` 指向的 settings.json 绝对路径。
 pub fn guard_settings_path(bot_key: &str) -> PathBuf {
     guard_dir(bot_key).join("settings.json")
+}
+
+/// 删除保护（#88）：owner 会话 claude spawn 时 `--settings` 指向的 settings.json。
+/// 与受限 settings 分离（受限文件只有 PreToolUse hook，owner 文件也只有 Bash hook——
+/// 避免两套守卫互相污染；guard-check 按 env 角色分派行为）。
+pub fn owner_guard_settings_path(bot_key: &str) -> PathBuf {
+    guard_dir(bot_key).join("owner-settings.json")
+}
+
+/// 待确认的危险删除登记文件（工作区外，与 guard 文件同目录；/trash confirm 消费）。
+pub fn pending_dangerous_path(bot_key: &str) -> PathBuf {
+    guard_dir(bot_key).join("pending-dangerous.json")
 }
 
 /// 幂等生成受限会话的 guard 文件（受限 spawn 前调用；内容静态，直接覆盖重写最稳）：
@@ -58,51 +74,102 @@ fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 幂等生成 owner 会话的删除保护 settings.json（#88）：matcher 限定 Bash——
+/// 删除保护只需要看 Bash 工具，其它工具（Edit/Write/Read/WebFetch…）零开销直通，
+/// 不被 hook 拦截（与受限会话的 matcher="*" 全量白名单不同）。
+/// owner 会话仍带 `--dangerously-skip-permissions`（全权限保持），hook 只在
+/// 全权限旗标下做删除拦截——claude 官方语义：hook 在未信任目录与全权限旗标下都执行。
+pub fn ensure_owner_guard_files(bot_key: &str) -> std::io::Result<()> {
+    ensure_owner_guard_files_at(&guard_dir(bot_key), &std::env::current_exe()?)
+}
+
+/// ensure_owner_guard_files 的内部实现（目录/可执行文件可注入，单测用）。
+fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(guard_dir)?;
+    let exe_str = exe.to_string_lossy();
+    let settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": format!("\"{exe_str}\" guard-check") }
+                    ]
+                }
+            ]
+        }
+    });
+    crate::atomic_write_text(
+        &guard_dir.join("owner-settings.json"),
+        &serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?,
+    )?;
+    Ok(())
+}
+
 /// guard-check 子命令入口（main.rs 分发）：读 stdin 的 hook 事件 JSON，输出决策 JSON。
 /// 返回进程退出码（0；决策在 stdout，hook 不看退出码）。
 pub fn guard_check_main() -> i32 {
-    // 前置：非 granted 会话直接放行（owner 会话/手动调用不被卡）。
-    // env 由桥 spawn agent 时注入、hook 子进程继承。与 CLI 侧共用 SenderRole::from_env，
-    // 避免角色判定语义在多处手写漂移。
-    if crate::config::SenderRole::from_env() != crate::config::SenderRole::Granted {
-        println!("{}", decision_json(&Decision::Allow));
-        return 0;
-    }
+    // 前置：非 granted 会话不再直接放行——owner 会话也要删除保护（#88）。
+    // 角色分派：granted → 现有白名单闸；owner → 只拦删除类 Bash（其它命令直通）。
+    let role = crate::config::SenderRole::from_env();
     let Some(workspace) = resolve_workspace() else {
-        println!(
-            "{}",
-            decision_json(&Decision::Deny(
-                "无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）".into()
-            ))
-        );
+        // 无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）：granted 拒绝（fail-closed），
+        // owner 放行（无工作区上下文可拦，保持原行为）。
+        if role == crate::config::SenderRole::Granted {
+            println!(
+                "{}",
+                decision_json(&Decision::Deny(
+                    "无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）".into()
+                ))
+            );
+        } else {
+            println!("{}", decision_json(&Decision::Allow));
+        }
         return 0;
     };
     let mut input = String::new();
     if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
-        println!(
-            "{}",
-            decision_json(&Decision::Deny("无法读取 hook 事件".into()))
-        );
+        // 读不到 hook 事件：granted 拒绝（fail-closed）；owner 放行（手动调用/异常形态
+        // 不拦——删除保护是增量拦截，读不到事件时保持无保护原行为，不扩大拒绝面）。
+        if role == crate::config::SenderRole::Granted {
+            println!(
+                "{}",
+                decision_json(&Decision::Deny("无法读取 hook 事件".into()))
+            );
+        } else {
+            println!("{}", decision_json(&Decision::Allow));
+        }
         return 0;
     }
     let v: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
         Err(e) => {
-            println!(
-                "{}",
-                decision_json(&Decision::Deny(format!("hook 事件解析失败: {e}")))
-            );
+            if role == crate::config::SenderRole::Granted {
+                println!(
+                    "{}",
+                    decision_json(&Decision::Deny(format!("hook 事件解析失败: {e}")))
+                );
+            } else {
+                println!("{}", decision_json(&Decision::Allow));
+            }
             return 0;
         }
     };
     let tool = v["tool_name"].as_str().unwrap_or("");
     let input_obj = &v["tool_input"];
-    let decision = match tool {
-        "Read" | "Edit" | "Write" => check_file_paths(tool, input_obj, &workspace),
-        "Glob" | "Grep" => check_patterns(tool, input_obj, &workspace),
-        "Bash" => check_bash(input_obj, &workspace),
-        // WebFetch/MCP/AskUserQuestion/未知工具：dontAsk 兜底拒绝，这里再显式 deny
-        _ => Decision::Deny(format!("工具 {tool} 不在受限白名单")),
+    let decision = match role {
+        crate::config::SenderRole::Granted => match tool {
+            "Read" | "Edit" | "Write" => check_file_paths(tool, input_obj, &workspace),
+            "Glob" | "Grep" => check_patterns(tool, input_obj, &workspace),
+            "Bash" => check_bash(input_obj, &workspace),
+            // WebFetch/MCP/AskUserQuestion/未知工具：dontAsk 兜底拒绝，这里再显式 deny
+            _ => Decision::Deny(format!("工具 {tool} 不在受限白名单")),
+        },
+        crate::config::SenderRole::Owner => match tool {
+            "Bash" => check_owner_bash(input_obj, &workspace),
+            // matcher 限定 Bash，理论上只有 Bash 会进来；其它工具一律直通
+            _ => Decision::Allow,
+        },
     };
     if let Decision::Deny(r) = &decision {
         // hook 的 stdout 是决策 JSON，日志走 stderr（否则污染决策被 claude 误读）
@@ -484,6 +551,243 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
     }
 }
 
+/// 删除保护（#88）：owner 会话 Bash 钩子的决策。
+/// - 非删除类命令 → 直通 Allow（owner 全权限行为保持，零额外卡顿）
+/// - 删除类命令（rm/rmdir/unlink/del/erase）：解析目标路径 →
+///   工作区外 → 放行（owner 自由）；.trash 内 → 拒绝（走 restore/purge）；
+///   工作区内 → 危险（≥阈值/代码特征）→ 拒绝 + 登记待确认；安全 → 移入回收站 + 拒绝告知
+/// - find -delete/-exec：无法可靠提取目标 → 显式拒绝给指引（不让它绕过回收站）
+/// - 复合语法（管道/重定向等）：owner 保持放行——删除保护是增量拦截，不因解析不了
+///   就把 owner 的合法命令全卡死（与受限会话的 fail-closed 白名单语义不同）。
+fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
+    let Some(cmd) = input["command"].as_str() else {
+        return Decision::Allow;
+    };
+    let Some(argv) = split_shell(cmd) else {
+        return Decision::Allow; // 复合语法：owner 保持原行为
+    };
+    let program = argv[0].as_str();
+    const DELETE_CMDS: &[&str] = &["rm", "rmdir", "unlink", "del", "erase"];
+    if !DELETE_CMDS.contains(&program) {
+        // find -delete/-exec 形态：显式拒绝（无法可靠提取目标做回收站移动）
+        if program == "find"
+            && argv[1..]
+                .iter()
+                .any(|a| matches!(a.as_str(), "-delete" | "-exec" | "-execdir" | "-ok"))
+        {
+            return Decision::Deny(
+                "find -delete/-exec 删除已拦截：请改用 rm -rf <路径>（自动移入回收站）或 /trash 指令管理".into(),
+            );
+        }
+        return Decision::Allow;
+    }
+    // 解析删除目标路径（跳过 flag；`--` 之后都是路径）
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut after_sep = false;
+    for a in &argv[1..] {
+        if !after_sep && a == "--" {
+            after_sep = true;
+            continue;
+        }
+        if !after_sep && a.starts_with('-') {
+            continue; // -r/-f/-rf 等 flag
+        }
+        paths.push(PathBuf::from(a));
+    }
+    if paths.is_empty() {
+        return Decision::Allow; // rm 无目标：命令自身报错，无需拦截
+    }
+    // 删除保护开关与阈值（热读 config；读不到按安全默认 true）
+    let settings = bot_trash_settings();
+    if !settings.enabled {
+        return Decision::Allow;
+    }
+    // 分拣：工作区外（放行）/ .trash 内（拒绝）/ 工作区内（危险或安全）
+    let mut in_trash: Vec<String> = Vec::new();
+    let mut dangerous: Vec<(PathBuf, crate::trash::Classify)> = Vec::new();
+    let mut safe: Vec<PathBuf> = Vec::new();
+    let trash_root = crate::trash::trash_root(workspace);
+    for p in &paths {
+        let ps = p.to_string_lossy();
+        if !canonical_in_workspace(&ps, workspace) {
+            continue; // 工作区外：owner 自由，不拦
+        }
+        let abs = crate::trash::absolutize(workspace, p);
+        if abs.starts_with(&trash_root) {
+            in_trash.push(ps.into_owned());
+            continue;
+        }
+        let c = crate::trash::classify(workspace, &abs, &settings);
+        if c.dangerous {
+            dangerous.push((abs, c));
+        } else {
+            safe.push(abs);
+        }
+    }
+    // 回收站内路径：拒绝（防二次套娃；清空走 /trash purge）
+    if !in_trash.is_empty() {
+        return Decision::Deny(format!(
+            "回收站内路径不能直接删除（已拒绝：{}）。请用 /trash restore 恢复，或 /trash purge 清理",
+            in_trash.join("，")
+        ));
+    }
+    // 危险删除：拒绝 + 登记待确认（不移动、不删除——等 /trash confirm）
+    if !dangerous.is_empty() {
+        if let Ok(k) = std::env::var("AGENT_BRIDGE_BOT_KEY") {
+            register_pending(&k, &dangerous.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+        }
+        let reasons: Vec<String> = dangerous
+            .iter()
+            .map(|(p, c)| {
+                format!(
+                    "{}（{}）",
+                    crate::trash::pretty_path(p),
+                    c.reason.as_deref().unwrap_or("危险")
+                )
+            })
+            .collect();
+        return Decision::Deny(format!(
+            "危险删除已拦截：{}\n如确认删除，请在聊天中回复 /trash confirm <路径>（将移入回收站，{} 天内可恢复）",
+            reasons.join("；"),
+            settings.ttl_days
+        ));
+    }
+    // 安全删除：移入回收站 + 拒绝原命令（reason 告知 agent 已完成，无需重试）
+    if safe.is_empty() {
+        return Decision::Allow; // 全是工作区外/不存在：rm -f 无事可做
+    }
+    match crate::trash::move_to_trash(workspace, &safe, &settings, "guard 删除保护") {
+        Ok(moved) if moved.is_empty() => Decision::Allow, // 全是已不存在的目标（rm -f 语义）
+        Ok(moved) => {
+            let names: Vec<String> = moved
+                .iter()
+                .map(|i| crate::trash::pretty_path(std::path::Path::new(&i.orig)))
+                .collect();
+            Decision::Deny(format!(
+                "已将 {} 移入回收站（{} 天内可恢复）；原删除命令被拦截，无需再次执行删除",
+                names.join("，"),
+                settings.ttl_days
+            ))
+        }
+        Err(e) => Decision::Deny(format!("删除保护执行失败：{e}（已拒绝原删除命令）")),
+    }
+}
+
+/// 当前 bot 的删除保护设置（hook 子进程热读 config；读不到按安全默认）。
+fn bot_trash_settings() -> crate::trash::TrashSettings {
+    let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+    match (bot_key, crate::config::Config::load()) {
+        (Some(k), Ok(cfg)) => cfg
+            .bots
+            .iter()
+            .find(|b| b.key() == k)
+            .map(crate::trash::TrashSettings::from_bot)
+            .unwrap_or_else(crate::trash::TrashSettings::defaults),
+        _ => crate::trash::TrashSettings::defaults(),
+    }
+}
+
+/// 一条待确认的危险删除登记。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct PendingDangerous {
+    /// 原路径（绝对路径，登记时已规范化）。
+    path: String,
+    /// 登记时间（unix 秒）。
+    requested_at: u64,
+}
+
+/// 登记待确认的危险删除（/trash confirm 消费）。路径去重，重复登记只留最新。
+/// 存 pretty 形态（去 \\?\ 前缀），与 take_pending 的比对口径一致。
+fn register_pending(bot_key: &str, paths: &[PathBuf]) {
+    let p = pending_dangerous_path(bot_key);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent); // guard 目录可能尚不存在（首次危险拦截）
+    }
+    let mut list: Vec<PendingDangerous> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let now = crate::chrono_lite::unix_secs();
+    for path in paths {
+        let ps = crate::trash::pretty_path(path);
+        if let Some(e) = list.iter_mut().find(|e| e.path == ps) {
+            e.requested_at = now;
+        } else {
+            list.push(PendingDangerous {
+                path: ps,
+                requested_at: now,
+            });
+        }
+    }
+    let _ = crate::atomic_write_text(
+        &p,
+        &serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".into()),
+    );
+}
+
+/// 消费一条待确认危险删除（/trash confirm）：路径精确匹配（绝对路径或工作区相对），
+/// 匹配后移除登记。返回是否命中。
+pub fn take_pending(bot_key: &str, workspace: &Path, path: &str) -> bool {
+    let p = pending_dangerous_path(bot_key);
+    let mut list: Vec<PendingDangerous> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    // 比对口径：pretty 化（去 \\?\ 前缀）后的绝对路径 / 原始入参（用户可能贴相对路径）
+    let abs = crate::trash::pretty_path(&crate::trash::absolutize(
+        workspace,
+        std::path::Path::new(path),
+    ));
+    let raw = crate::trash::pretty_path(std::path::Path::new(path));
+    let before = list.len();
+    list.retain(|e| e.path != abs && e.path != raw);
+    if list.len() == before {
+        return false;
+    }
+    let _ = crate::atomic_write_text(
+        &p,
+        &serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".into()),
+    );
+    true
+}
+
+/// 待确认清单（/trash list 展示用）。
+pub fn list_pending(bot_key: &str) -> Vec<(String, u64)> {
+    let p = pending_dangerous_path(bot_key);
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<PendingDangerous>>(&t).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.path, e.requested_at))
+        .collect()
+}
+
+/// /trash confirm 的完整动作：消费登记 → 移入回收站（条目记 dangerous=true）。
+/// 返回移动的条目。
+pub fn confirm_dangerous_delete(
+    bot_key: &str,
+    workspace: &std::path::Path,
+    path: &str,
+) -> Result<crate::trash::TrashItem, String> {
+    if !take_pending(bot_key, workspace, path) {
+        return Err(format!("没有待确认的危险删除匹配：{path}（/trash list 查看）"));
+    }
+    let settings = bot_trash_settings();
+    let moved = crate::trash::move_to_trash(
+        workspace,
+        &[PathBuf::from(path)],
+        &settings,
+        "/trash confirm 已确认",
+    )
+    .map_err(|e| format!("移入回收站失败：{e}"))?;
+    moved
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("目标不存在或已在回收站：{path}"))
+}
+
 /// 简易 shell 分词：处理单/双引号与反斜杠转义，返回 argv。
 /// 复合语法（| > < & ; $() `${` 等）返回 None → 上层整体拒绝（白名单校验
 /// 无法安全拆解复合命令，宁可不放行）。简单变量展开（$ABB_BIN 等）允许——
@@ -609,6 +913,141 @@ mod tests {
             &ws
         ));
         let _ = root;
+    }
+
+    #[test]
+    fn owner_guard_files_written_with_bash_matcher() {
+        let root = std::env::temp_dir().join(format!("abb-guard-owner-{}", uuid::Uuid::new_v4()));
+        let exe = root.join("abb.exe");
+        std::fs::create_dir_all(&root).unwrap();
+        ensure_owner_guard_files_at(&root, &exe).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("owner-settings.json")).unwrap())
+                .unwrap();
+        let hook = &v["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "Bash", "owner 只拦 Bash（其它工具零开销直通）");
+        let cmd = hook["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("guard-check"),
+            "hook 命令应指向 guard-check：{cmd}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 删除保护单测环境：临时工作区（canonical 化，对齐 guard 的 canonical 判定）+ 子目录。
+    fn owner_delete_env() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("abb-trash-guard-{}", uuid::Uuid::new_v4()));
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        (root, std::fs::canonicalize(&ws).unwrap())
+    }
+
+    #[test]
+    fn owner_bash_delete_moves_to_trash() {
+        let (root, ws) = owner_delete_env();
+        std::fs::write(ws.join("a.txt"), "hello").unwrap();
+        std::fs::write(ws.join("sub/b.txt"), "world").unwrap();
+        // 工作区内小文件删除 → 移入回收站 + deny
+        let d = check_owner_bash(
+            &serde_json::json!({"command": "rm a.txt sub/b.txt"}),
+            &ws,
+        );
+        match d {
+            Decision::Deny(r) => {
+                assert!(r.contains("回收站"), "reason 应告知移入回收站：{r}");
+                assert!(r.contains("a.txt"), "reason 应列出已移入路径：{r}");
+            }
+            Decision::Allow => panic!("工作区内删除必须被拦截"),
+        }
+        assert!(!ws.join("a.txt").exists(), "原路径应已移走");
+        assert!(ws.join(".trash").join("items").exists());
+        assert_eq!(crate::trash::list(&ws).len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_bash_dangerous_delete_denied_and_pending() {
+        let (root, ws) = owner_delete_env();
+        std::fs::write(ws.join("main.rs"), "fn main() {}").unwrap();
+        let d = check_owner_bash(&serde_json::json!({"command": "rm main.rs"}), &ws);
+        match d {
+            Decision::Deny(r) => assert!(r.contains("危险删除已拦截"), "{r}"),
+            Decision::Allow => panic!("代码文件删除必须拦截"),
+        }
+        assert!(
+            ws.join("main.rs").exists(),
+            "危险删除不移动原文件（等 /trash confirm）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_bash_non_delete_allowed() {
+        let (root, ws) = owner_delete_env();
+        for cmd in [
+            "ls -la",
+            "git status",
+            "echo hello",
+            "cat a.txt",
+            "mkdir sub2",
+            "mv a.txt b.txt",
+            "cp a.txt c.txt",
+        ] {
+            let d = check_owner_bash(&serde_json::json!({"command": cmd}), &ws);
+            assert_eq!(d, Decision::Allow, "{cmd} 应直通放行");
+        }
+        // 复合语法：owner 放行（不因解析不了卡死合法命令）
+        assert_eq!(
+            check_owner_bash(&serde_json::json!({"command": "rm a.txt | tee /tmp/x"}), &ws),
+            Decision::Allow
+        );
+        // 工作区外删除：owner 自由
+        assert_eq!(
+            check_owner_bash(&serde_json::json!({"command": "rm /tmp/x.txt"}), &ws),
+            Decision::Allow
+        );
+        // find -delete：显式拒绝（无法可靠提取目标）
+        assert_ne!(
+            check_owner_bash(&serde_json::json!({"command": "find . -name '*.tmp' -delete"}), &ws),
+            Decision::Allow
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_bash_rm_force_missing_allowed() {
+        let (root, ws) = owner_delete_env();
+        // rm -f 不存在目标（工作区内）：无事可做 → 放行（agent 正常流程不被打断）
+        assert_eq!(
+            check_owner_bash(&serde_json::json!({"command": "rm -f nope.txt"}), &ws),
+            Decision::Allow
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_confirm_roundtrip() {
+        let (root, ws) = owner_delete_env();
+        std::fs::write(ws.join("x.rs"), "fn x() {}").unwrap();
+        let key = format!("test-bot-{}", uuid::Uuid::new_v4());
+        let prev = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+        std::env::set_var("AGENT_BRIDGE_BOT_KEY", &key);
+        let d = check_owner_bash(&serde_json::json!({"command": "rm x.rs"}), &ws);
+        assert!(matches!(d, Decision::Deny(_)));
+        assert_eq!(list_pending(&key).len(), 1);
+        // 未匹配路径 → 消费失败
+        assert!(!take_pending(&key, &ws, "yyy.rs"));
+        // confirm 完整动作：消费登记 + 移入回收站（条目记 dangerous）
+        let it = confirm_dangerous_delete(&key, &ws, "x.rs").unwrap();
+        assert!(it.dangerous);
+        assert!(!ws.join("x.rs").exists());
+        assert_eq!(list_pending(&key).len(), 0);
+        // 恢复 env（并行测试隔离）
+        match prev {
+            Some(v) => std::env::set_var("AGENT_BRIDGE_BOT_KEY", v),
+            None => std::env::remove_var("AGENT_BRIDGE_BOT_KEY"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod sessions;
 mod single_instance;
 mod tasks;
 mod tidy;
+mod trash;
 mod ui;
 mod unread;
 mod updater;
@@ -244,6 +245,16 @@ fn main() {
     // bot 从 AGENT_BRIDGE_BOT_KEY env（桥注入）解析；chat_id 缺省取 AGENT_BRIDGE_CHAT_ID。
     if args.len() >= 2 && args[1] == "session" {
         std::process::exit(run_session_cli(&args[2..]));
+    }
+
+    // 删除保护回收站 CLI（#88）：供 owner 手动恢复/清理（也可被桥 /trash 指令调用）。
+    //   agent-bridge trash list [--bot <key>] [--pending]
+    //   agent-bridge trash restore <id> [--bot <key>]
+    //   agent-bridge trash purge [--bot <key>] [--all]
+    //   agent-bridge trash confirm <path> [--bot <key>]
+    // bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析（手动调用无 env 时报错提示）。
+    if args.len() >= 2 && args[1] == "trash" {
+        std::process::exit(run_trash_cli(&args[2..]));
     }
 
     // 历史会话迁移（#33）：agent-bridge session-import [--bot <key>] [--dry-run]。
@@ -818,6 +829,125 @@ fn session_reset_chat_id(args: &[String], env_chat: &str) -> Result<String, Stri
         return Ok(env_chat.to_string());
     }
     Err("缺 chat_id：agent-bridge session reset <chat_id>（或用 AGENT_BRIDGE_CHAT_ID env）".into())
+}
+
+/// trash CLI 入口（#88 删除保护回收站）。bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析。
+fn run_trash_cli(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("用法：agent-bridge trash list|restore <id>|purge|confirm <path> [--bot <key>]");
+        return 2;
+    };
+    let bot_key = match trash_bot_key(args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let workspace = crate::workspace_dir(&bot_key);
+    let settings = crate::trash::TrashSettings::defaults();
+    match sub {
+        "list" => {
+            let items = crate::trash::list(&workspace);
+            if items.is_empty() {
+                println!("回收站为空");
+            } else {
+                for it in &items {
+                    let days_ago =
+                        crate::chrono_lite::unix_secs().saturating_sub(it.trashed_at) / 86400;
+                    println!(
+                        "{} | {} | {} MB | {} 天前 | {}{}",
+                        it.id,
+                        crate::trash::pretty_path(std::path::Path::new(&it.orig)),
+                        it.size / (1024 * 1024),
+                        days_ago,
+                        it.reason,
+                        if it.dangerous { " | ⚠️危险" } else { "" }
+                    );
+                }
+            }
+            let pending = crate::guard::list_pending(&bot_key);
+            if !pending.is_empty() {
+                println!("\n待确认的危险删除（/trash confirm <路径>）：");
+                for (p, _) in pending {
+                    println!("  {p}");
+                }
+            }
+            0
+        }
+        "restore" => {
+            let id = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            if id.is_empty() {
+                eprintln!("用法：agent-bridge trash restore <id> [--bot <key>]");
+                return 2;
+            }
+            match crate::trash::restore(&workspace, id) {
+                Ok(it) => {
+                    println!("已恢复：{} → {}", it.id, it.orig);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+        "purge" => {
+            let all = args.iter().any(|a| a == "--all");
+            let n = if all {
+                crate::trash::purge_all(&workspace)
+            } else {
+                crate::trash::purge_expired(&workspace, settings.ttl_days)
+            };
+            println!(
+                "已清理回收站条目 {} 条{}",
+                n,
+                if all { "（全部）" } else { "（过期）" }
+            );
+            0
+        }
+        "confirm" => {
+            let path = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            if path.is_empty() {
+                eprintln!("用法：agent-bridge trash confirm <path> [--bot <key>]");
+                return 2;
+            }
+            match crate::guard::confirm_dangerous_delete(&bot_key, &workspace, path) {
+                Ok(it) => {
+                    println!(
+                        "已确认并移入回收站：{}（{} 天内可恢复）",
+                        it.orig, settings.ttl_days
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("未知 trash 子命令：{other}");
+            2
+        }
+    }
+}
+
+/// 解析 bot key：优先命令行 --bot，回落 AGENT_BRIDGE_BOT_KEY env。
+fn trash_bot_key(args: &[String]) -> Result<String, String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--bot" {
+            if let Some(v) = args.get(i + 1) {
+                return Ok(v.clone());
+            }
+        }
+        i += 1;
+    }
+    std::env::var("AGENT_BRIDGE_BOT_KEY").map_err(|_| {
+        "缺少 bot key：请用 --bot <key> 指定，或在桥注入环境（AGENT_BRIDGE_BOT_KEY）下调用"
+            .to_string()
+    })
 }
 
 #[cfg(test)]
