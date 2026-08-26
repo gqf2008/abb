@@ -378,12 +378,13 @@ async fn run_bot(
                 let report = crate::tidy::run_once(&workspace, now, days, &live);
                 write_run_marker(&marker, now);
                 crate::log!(
-                    "[tidy:{key}] 整理完成：临时文件 {}，孤儿会话 {}，历史截断 {} 条，归档 {}，空目录 {}",
+                    "[tidy:{key}] 整理完成：临时文件 {}，孤儿会话 {}，历史截断 {} 条，归档 {}，空目录 {}，回收站清理 {}",
                     report.temp_removed,
                     report.orphan_removed,
                     report.history_truncated,
                     report.archived,
-                    report.emptied_dirs
+                    report.emptied_dirs,
+                    report.trash_purged
                 );
                 match crate::tidy::git_commit(&workspace).await {
                     Ok(crate::tidy::GitOutcome::Committed(h)) => {

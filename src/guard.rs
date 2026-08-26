@@ -61,19 +61,17 @@ fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
 /// guard-check 子命令入口（main.rs 分发）：读 stdin 的 hook 事件 JSON，输出决策 JSON。
 /// 返回进程退出码（0；决策在 stdout，hook 不看退出码）。
 pub fn guard_check_main() -> i32 {
-    // 前置：非 granted 会话直接放行（owner 会话/手动调用不被卡）。
-    // env 由桥 spawn agent 时注入、hook 子进程继承。与 CLI 侧共用 SenderRole::from_env，
-    // 避免角色判定语义在多处手写漂移。
-    if crate::config::SenderRole::from_env() != crate::config::SenderRole::Granted {
-        println!("{}", decision_json(&Decision::Allow));
-        return 0;
-    }
+    // #88 角色分派：granted（授权者受限会话）走完整白名单检查；owner/其它会话只拦
+    // 删除类命令（回收站保护），其余全 Allow——不卡 owner 正常读写操作。
+    // env 由桥 spawn agent 时注入、hook 子进程继承。与 CLI 侧共用 SenderRole::from_env。
+    let restricted = crate::config::SenderRole::from_env() == crate::config::SenderRole::Granted;
     let Some(workspace) = resolve_workspace() else {
         println!(
             "{}",
-            decision_json(&Decision::Deny(
-                "无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）".into()
-            ))
+            decision_json(
+                &Decision::Deny("无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）".into()),
+                false
+            )
         );
         return 0;
     };
@@ -81,7 +79,7 @@ pub fn guard_check_main() -> i32 {
     if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
         println!(
             "{}",
-            decision_json(&Decision::Deny("无法读取 hook 事件".into()))
+            decision_json(&Decision::Deny("无法读取 hook 事件".into()), false)
         );
         return 0;
     }
@@ -90,13 +88,26 @@ pub fn guard_check_main() -> i32 {
         Err(e) => {
             println!(
                 "{}",
-                decision_json(&Decision::Deny(format!("hook 事件解析失败: {e}")))
+                decision_json(&Decision::Deny(format!("hook 事件解析失败: {e}")), false)
             );
             return 0;
         }
     };
     let tool = v["tool_name"].as_str().unwrap_or("");
     let input_obj = &v["tool_input"];
+    if !restricted {
+        // owner/其它会话：删除保护。hook 只拦 Bash 的删除类命令，其余一律放行。
+        let decision = if tool == "Bash" {
+            check_delete_command(input_obj)
+        } else {
+            Decision::Allow
+        };
+        if let Decision::Deny(r) = &decision {
+            eprintln!("[guard-check] 拒绝（删除保护）{tool}: {r}");
+        }
+        println!("{}", decision_json(&decision, false));
+        return 0;
+    }
     let decision = match tool {
         "Read" | "Edit" | "Write" => check_file_paths(tool, input_obj, &workspace),
         "Glob" | "Grep" => check_patterns(tool, input_obj, &workspace),
@@ -108,7 +119,7 @@ pub fn guard_check_main() -> i32 {
         // hook 的 stdout 是决策 JSON，日志走 stderr（否则污染决策被 claude 误读）
         eprintln!("[guard-check] 拒绝 {tool}: {r}");
     }
-    println!("{}", decision_json(&decision));
+    println!("{}", decision_json(&decision, true));
     0
 }
 
@@ -121,16 +132,22 @@ enum Decision {
 
 /// 输出给 claude hook 的决策 JSON。schema 为 hookSpecificOutput 形态
 /// （新旧版本兼容性见实测清单；deny 时 reason 会成为模型可见的拒绝原因）。
-fn decision_json(d: &Decision) -> String {
+/// `restricted` = granted 会话（文案前缀区分；owner 删除保护被拒时避免误导为受限白名单）。
+fn decision_json(d: &Decision, restricted: bool) -> String {
     let (decision, reason) = match d {
         Decision::Allow => ("allow", "guard 校验通过"),
         Decision::Deny(r) => ("deny", r.as_str()),
+    };
+    let prefix = if restricted {
+        "受限模式：授权者会话仅允许操作工作区内文件与 $ABB_BIN 白名单命令"
+    } else {
+        "删除保护：agent 删除操作须走回收站"
     };
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": decision,
-            "permissionDecisionReason": format!("受限模式：授权者会话仅允许操作工作区内文件与 $ABB_BIN 白名单命令（{reason}）")
+            "permissionDecisionReason": format!("{prefix}（{reason}）")
         }
     })
     .to_string()
@@ -301,6 +318,12 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
     let Some(cmd) = input["command"].as_str() else {
         return Decision::Deny("Bash 缺 command".into());
     };
+    // #88 删除保护：rm/rmdir 等删除命令一律拒绝并指引回收站（granted/owner 同文案）。
+    // 放在程序白名单之前——granted 会话原本对 rm 是「不在白名单」，统一升级为指引式拒绝。
+    let del = check_delete_command(input);
+    if let Decision::Deny(_) = &del {
+        return del;
+    }
     let Some(argv) = split_shell(cmd) else {
         return Decision::Deny("含复合语法（管道/重定向/命令替换等），受限会话拒绝".into());
     };
@@ -423,6 +446,26 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
     }
 }
 
+/// #88 删除保护：检测删除类命令，命中 → 指引式拒绝（改走回收站 trash CLI）。
+/// 供 granted 完整检查与 owner 删除保护共用。复合命令（split_shell 失败）不在此判断——
+/// granted 由 check_bash 的复合语法拒绝兜底；owner 对复合命令放行（不卡 owner 正常工作）。
+fn check_delete_command(input: &serde_json::Value) -> Decision {
+    let Some(cmd) = input["command"].as_str() else {
+        return Decision::Allow;
+    };
+    let Some(argv) = split_shell(cmd) else {
+        return Decision::Allow;
+    };
+    let program = argv[0].as_str();
+    if matches!(program, "rm" | "rmdir" | "del" | "erase" | "rd") {
+        return Decision::Deny(
+            "删除已由回收站保护：请改用 `$ABB_BIN trash <path>` 把文件移入回收站（默认保留 7 天，`trash list` / `trash restore <条目>` 可恢复；确需永久删除请用 `trash purge`）"
+                .into(),
+        );
+    }
+    Decision::Allow
+}
+
 /// 参数是否可能是路径（绝对/含 / /~ 开头/./ 开头）。纯选项（-n）、纯文件名（a.txt）
 /// 不算——工作区内相对路径的 `cat a.txt` 的 a.txt 也会被 join 校验放行。
 /// `$` 开头（$HOME 等）与 `~` 一样会在 shell 里展开成工作区外绝对路径——必须当路径
@@ -480,6 +523,8 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
             }
             Decision::Allow
         }
+        // #88 回收站：trash 只操作工作区内路径（trash.rs 内部 canonical 校验），受限会话放行。
+        Some("trash") => Decision::Allow,
         other => Decision::Deny(format!("$ABB_BIN 子命令不在白名单：{other:?}")),
     }
 }
@@ -1064,19 +1109,26 @@ mod tests {
     #[test]
     fn decision_json_shape() {
         let d = Decision::Deny("cat ~/.ssh".into());
-        let s = decision_json(&d);
+        let s = decision_json(&d, true);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
         assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
             .as_str()
             .unwrap()
             .contains("工作区"));
-        let a = decision_json(&Decision::Allow);
+        let a = decision_json(&Decision::Allow, false);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&a).unwrap()["hookSpecificOutput"]
                 ["permissionDecision"],
             "allow"
         );
+        // #88 owner 删除保护文案前缀（restricted=false）
+        let o = decision_json(&Decision::Deny("rm x".into()), false);
+        let ov: serde_json::Value = serde_json::from_str(&o).unwrap();
+        assert!(ov["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("删除保护"));
     }
 
     #[test]

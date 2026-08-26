@@ -35,6 +35,7 @@ mod sessions;
 mod single_instance;
 mod tasks;
 mod tidy;
+mod trash;
 mod ui;
 mod unread;
 mod updater;
@@ -227,8 +228,16 @@ fn main() {
 
     // guard-check：claude PreToolUse hook 的决策子进程（授权者受限会话的强制闸）。
     // claude 以 `"$ABB_BIN" guard-check` 调用，stdin 收 hook 事件 JSON，stdout 出决策 JSON。
+    // #88：owner 会话（非受限）也挂同一 hook——guard_check_main 按角色分派：granted 走完整
+    // 白名单，owner 只拦删除类命令（回收站保护），其余全 Allow。
     if args.len() >= 2 && args[1] == "guard-check" {
         std::process::exit(guard::guard_check_main());
+    }
+
+    // 删除回收站 CLI（#88）：agent-bridge trash <path...> | trash list | trash restore <条目> | trash purge。
+    // agent 删除操作被 guard hook 拒绝后按指引调用（也可人用）。工作区从 AGENT_BRIDGE_BOT_KEY env 解析。
+    if args.len() >= 2 && args[1] == "trash" {
+        std::process::exit(trash::run_trash_cli(&args[2..]));
     }
 
     // 跨会话投递 CLI：供 claude 用 Bash 调用（也可人用）。

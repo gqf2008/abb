@@ -33,7 +33,9 @@ pub const ARCHIVE_AGE_DAYS: u32 = 30;
 /// 结构目录：临时文件扫描 / 空目录清理 / 文档扫描一律跳过（绝不触碰）。
 /// attachments 是消息附件落地目录（下载中目录可能瞬时为空——walk 见空与删除之间文件
 /// 落地会删掉下载目标；且内含用户聊天媒体，与结构目录同待遇；审查修复）。
-const STRUCTURE_DIRS: [&str; 8] = [
+/// .trash（#88 删除回收站）同待遇：回收站内容绝不被 tidy 当临时/空目录清掉，
+/// 也不进 prompt 注入面；超期条目由 run_once 第 6 步（trash TTL）单独清理。
+const STRUCTURE_DIRS: [&str; 9] = [
     ".git",
     "history",
     "sessions",
@@ -42,6 +44,7 @@ const STRUCTURE_DIRS: [&str; 8] = [
     ".prime-sessions",
     "archive",
     "attachments",
+    ".trash",
 ];
 /// 根目录临时/垃圾文件后缀（小写比较；.tmp.* 形态单独匹配）。
 const TEMP_SUFFIXES: [&str; 3] = [".tmp", ".swp", ".bak"];
@@ -58,6 +61,8 @@ pub struct TidyReport {
     pub history_truncated: usize,
     pub archived: usize,
     pub emptied_dirs: usize,
+    /// #88 回收站 TTL 清理数（超期 .trash/ 条目）。
+    pub trash_purged: usize,
 }
 
 /// git 留痕结果。
@@ -126,12 +131,21 @@ pub fn run_once(
             emptied_dirs += 1;
         }
     }
+    // 6. #88 回收站 TTL 清理（默认保留 7 天；超期条目永久清除）
+    let trash_purged = crate::trash::purge_expired(workspace, crate::trash::TRASH_TTL_DAYS);
+    if trash_purged > 0 {
+        crate::log!(
+            "[tidy] 回收站清理 {trash_purged} 个超期条目（保留 {} 天）",
+            crate::trash::TRASH_TTL_DAYS
+        );
+    }
     TidyReport {
         orphan_removed,
         temp_removed,
         history_truncated,
         archived,
         emptied_dirs,
+        trash_purged,
     }
 }
 

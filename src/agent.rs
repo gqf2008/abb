@@ -460,12 +460,13 @@ pub async fn run(
         ));
     }
 
-    // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
+    // guard 文件（claude settings.json hook）：granted 生成（受限强制闸）+ #88 owner 也生成
+    // （删除保护——owner claude 会话挂同一 hook，guard-check 按角色分派只拦删除命令）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
-    //（返回用户可见错误，不静默降级成全权限）。
-    if restrict {
+    //（返回用户可见错误，不静默降级成全权限）。codex/pi/prime 无 hook 机制不生成。
+    if restrict || backend == Backend::Claude {
         crate::guard::ensure_guard_files(bot_key)
-            .map_err(|e| format!("⚠️ 受限会话 guard 文件生成失败，已拒绝启动：{e:#}"))?;
+            .map_err(|e| format!("⚠️ guard 文件生成失败，已拒绝启动：{e:#}"))?;
     }
 
     // 本 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）
@@ -790,7 +791,12 @@ fn claude_command(
             .arg("Edit(./**)")
             .arg("Write(./**)");
     } else {
+        // #88 删除保护：owner 会话也挂 guard hook（保留全权限旗标——hook 在全权限
+        // 旗标与未信任目录下都执行，guard.rs 模块注释的实测结论）。guard-check 按
+        // AGENT_BRIDGE_SENDER_ROLE 分派：owner 只拦删除类命令（回收站保护），其余
+        // 工具/命令一律 Allow——不卡 owner 正常读写。
         c.arg("--dangerously-skip-permissions");
+        c.arg("--settings").arg(settings_path);
     }
     c.arg("--verbose").arg("--output-format").arg("stream-json");
     c.arg(if resume { "--resume" } else { "--session-id" })
