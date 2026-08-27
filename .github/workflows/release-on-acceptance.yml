@@ -1,0 +1,68 @@
+name: Release on Acceptance（验收通过发版）
+
+# 验收驱动发版：功能合入 main 后【不会自动发版】。
+# 由验收人（迭代负责人）实测冒烟通过后，手动触发本工作流：
+#   自动 bump 版本（默认 patch，可指定）→ 打 tag → 触发现有 release.yml 构建发布。
+# 验收说明为必填输入，会写入 bump commit，随自动生成的 release notes 一并公开。
+#
+# 使用方式（Actions 页面或 gh CLI）：
+#   gh workflow run "Release on Acceptance（验收通过发版）" \
+#     -f acceptance_note="实测冒烟通过：xxx" \
+#     [-f version="2.20.0"]   # 可选，留空自动 bump patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '指定版本号（如 2.20.0），留空则自动 bump patch'
+        required: false
+        default: ''
+      acceptance_note:
+        description: '验收说明（必填）：实测了哪些功能、结论'
+        required: true
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-acceptance
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version & tag
+        env:
+          ACCEPTANCE: ${{ github.event.inputs.acceptance_note }}
+          SPEC_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -e
+          VER=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          if [ -n "$SPEC_VERSION" ]; then
+            NEW_VER="$SPEC_VERSION"
+          else
+            NEW_VER=$(echo "$VER" | awk -F. '{print $1"."$2"."$3+1}')
+          fi
+          # 版本号格式校验（统一 X.Y.Z）
+          case "$NEW_VER" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "❌ 版本号格式非法: $NEW_VER（应为 X.Y.Z）"; exit 1 ;;
+          esac
+          if git tag -l "v$NEW_VER" | grep -q .; then
+            echo "❌ tag v$NEW_VER 已存在，请检查版本号"; exit 1
+          fi
+          sed -i "s/^version = \"$VER\"/version = \"$NEW_VER\"/" Cargo.toml
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add Cargo.toml
+          git commit -m "chore(release): v$NEW_VER — 验收通过发版；验收说明: $ACCEPTANCE"
+          git tag "v$NEW_VER"
+          git push origin main
+          git push origin "v$NEW_VER"
+          echo "✅ 验收通过，已打 tag v$NEW_VER，release.yml 将自动构建发布"
