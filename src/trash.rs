@@ -259,10 +259,7 @@ pub fn restore_entry(workspace: &Path, name: &str) -> Result<(), String> {
     let content_dir = entry_dir.join("content");
     let mut found: Option<PathBuf> = None;
     if let Ok(rd) = std::fs::read_dir(&content_dir) {
-        for e in rd.flatten() {
-            found = Some(e.path());
-            break;
-        }
+        found = rd.flatten().next().map(|e| e.path());
     }
     let item = found.ok_or("回收站条目缺原内容（数据异常）")?;
     let _ = kind; // 文件/目录统一按「移出条目」处理，kind 仅存档
