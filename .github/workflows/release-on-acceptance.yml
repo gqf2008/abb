@@ -61,9 +61,7 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add Cargo.toml
-          git commit -m "chore(release): v$NEW_VER — 验收通过发版
-
-验收说明: $ACCEPTANCE"
+          git commit -m "chore(release): v$NEW_VER — 验收通过发版；验收说明: $ACCEPTANCE"
           git tag "v$NEW_VER"
           git push origin main
           git push origin "v$NEW_VER"
