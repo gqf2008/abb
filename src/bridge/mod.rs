@@ -270,7 +270,7 @@ impl Bridge {
         // 未授权者按 sender_role 已推导的 Granted（受限模式，隔离安全默认）处理；
         // 授权白名单只管私聊。每次消息从 config.json 热读最新访问控制（授权/取消/改开关
         // 即时生效，不依赖启动快照）；config 读不到该 bot（单测注入）→ 回落构造时的快照。
-        let (allowed, sender_role, mention_map) = self.access_and_role(sender_id);
+        let (allowed, sender_role, mention_map, mention_default) = self.access_and_role(sender_id);
         let allowed = allowed || chat_type == "group";
         if !allowed {
             // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
@@ -354,7 +354,7 @@ impl Bridge {
         if chat_type == "group"
             && thread_id.is_empty()
             && !self.bot_is_mentioned(&mentions)
-            && !self.mention_off(&mention_map, chat_id)
+            && !self.mention_off(&mention_map, chat_id, mention_default)
         {
             crate::log!(
                 "[bridge] 群聊未 @ 机器人，忽略（bot={} chat={} sender={}）",

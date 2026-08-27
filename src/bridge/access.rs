@@ -79,12 +79,14 @@ impl Bridge {
             .unwrap_or_default()
     }
 
-    /// 热读 config 推导（准入, 发送者角色）——on_payload / on_dingtalk 共用同一份
-    /// load+find+快照回落，避免两个入口各写一份导致准入与角色推导漂移
-    /// （同一发送者在不同通道被推导成不同角色 = 授权者拿到 owner 权限或反之）。
+    /// 热读 config 推导（准入, 发送者角色, mention map, #91 mention_default）——
+    /// on_payload / on_dingtalk 共用同一份 load+find+快照回落，避免两个入口各写一份
+    /// 导致准入与角色推导漂移（同一发送者在不同通道被推导成不同角色 = 授权者拿到
+    /// owner 权限或反之）。
     /// 第三个返回值 = 该 bot 的 mention_modes（config 路径成功时 Some，含空 map——
     /// 空 map 同样是权威判定；config 无该 bot / 读失败时 None，由调用方回落快照）。
-    /// 门槛与准入共用这一次 load：未 @ 的顶层群消息不必再整份读一次 config.json。
+    /// 第四个返回值 = #91 bot 级提及默认（true=免 @；config 路径失败回落 false=需要 @，
+    /// 与旧行为一致）。门槛与准入共用这一次 load：未 @ 的顶层群消息不必再整份读一次 config.json。
     pub(super) fn access_and_role(
         &self,
         sender_id: &str,
@@ -92,6 +94,7 @@ impl Bridge {
         bool,
         crate::config::SenderRole,
         Option<std::collections::HashMap<String, String>>,
+        bool,
     ) {
         match crate::config::Config::load() {
             Ok(c) => match c.bots.into_iter().find(|b| b.key() == self.bot.key()) {
@@ -99,30 +102,41 @@ impl Bridge {
                     b.access_allows(sender_id),
                     b.sender_role(sender_id),
                     Some(b.mention_modes),
+                    b.mention_default,
                 ),
                 None => (
                     self.access_snapshot_allows(sender_id),
                     self.bot.sender_role(sender_id),
                     None,
+                    false,
                 ),
             },
             Err(_) => (
                 self.access_snapshot_allows(sender_id),
                 self.bot.sender_role(sender_id),
                 None,
+                false,
             ),
         }
     }
 
-    /// #51 门槛判定：config 路径有该 bot → 以 config 的 map 为准（无条目 = 需要 @）；
-    /// 否则（单测随机 key / 读失败）→ 回落内存快照。
+    /// #51+#91 门槛判定：per-chat 显式值优先（"off"→免@，"on"→要@），无条目回落 bot 级
+    /// 默认（mention_default）。config 路径有该 bot → 以 config 为准；否则（单测随机 key /
+    /// 读失败）→ 回落内存快照（快照只有 per-chat 值，无 bot 默认概念，保持旧语义）。
     pub(super) fn mention_off(
         &self,
         mention: &Option<std::collections::HashMap<String, String>>,
         chat_id: &str,
+        mention_default: bool,
     ) -> bool {
         match mention {
-            Some(m) => m.get(chat_id).map(String::as_str) == Some("off"),
+            Some(m) => match m.get(chat_id).map(String::as_str) {
+                Some("off") => true,
+                // 显式 per-chat "on"（或未知值）→ 覆盖 bot 默认，按需要 @ 处理
+                Some(_) => false,
+                // 无 per-chat 条目 → 用 bot 级默认（#91）
+                None => mention_default,
+            },
             None => {
                 self.mention_snapshot
                     .lock()

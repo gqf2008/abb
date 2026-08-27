@@ -228,7 +228,8 @@ impl Bridge {
         // 访问控制（与飞书同套，staffId 标识）：公开开关开 → 放行所有人；否则只放行 owner ∪
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
         // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
-        let (allowed, sender_role, mention_map) = self.access_and_role(&msg.sender_staff_id);
+        let (allowed, sender_role, mention_map, mention_default) =
+            self.access_and_role(&msg.sender_staff_id);
         // 群聊豁免授权（8-20 用户决策，与飞书一致）：群里 @ bot 就响应，授权只管私聊
         let allowed = allowed || msg.is_group();
         if !allowed {
@@ -277,7 +278,10 @@ impl Bridge {
         // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理。
         // #51：该群设了免 @（mention_modes off）则无需 @ 也进 agent（与飞书同开关）。
         // 门槛判定复用 access_and_role 同一次 config load；已 @ 则短路不付门槛判定。
-        if msg.is_group() && !msg.mentioned && !self.mention_off(&mention_map, &msg.chat_id()) {
+        if msg.is_group()
+            && !msg.mentioned
+            && !self.mention_off(&mention_map, &msg.chat_id(), mention_default)
+        {
             crate::log!(
                 "[dingtalk] 忽略群聊未 @ 机器人的消息 chat={}",
                 trunc(msg.chat_id(), 10)

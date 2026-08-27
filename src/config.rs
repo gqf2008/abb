@@ -123,6 +123,11 @@ pub struct BotConfig {
     /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mention_modes: std::collections::HashMap<String, String>,
+    /// #91 群聊提及默认策略：true=该 bot 所有群免 @ 参与；false=需要 @（默认，向后兼容）。
+    /// 判定优先级：mention_modes[chat_id] 显式值（"off"/"on"）> 本默认值。
+    /// GUI bot 面板开关 + 虚拟 Bot 面板开关共用，事实源单一。
+    #[serde(default, skip_serializing_if = "mention_default_off")]
+    pub mention_default: bool,
     /// 删除保护（#88）：agent 删除 → 移入工作区 .trash/ 回收站（TTL 后自动清）。
     /// 默认开（安全默认）；false 不落盘，旧 config 兼容。
     #[serde(default = "default_true", skip_serializing_if = "protect_on")]
@@ -182,6 +187,7 @@ impl Default for BotConfig {
             restrict_granted_agent: true,
             tidy_enabled: false,
             mention_modes: std::collections::HashMap::new(),
+            mention_default: false,
             delete_protect_enabled: true,
             trash_ttl_days: default_trash_ttl_days(),
             dangerous_size_mb: default_dangerous_size_mb(),
@@ -231,6 +237,11 @@ pub(crate) fn default_kind() -> String {
 
 /// skip_serializing_if：false（默认私有）不落盘，旧 config 兼容。
 fn not_open(b: &bool) -> bool {
+    !*b
+}
+
+/// #91：mention_default 默认 false（需要 @），false 不落盘（旧 config 兼容）。
+fn mention_default_off(b: &bool) -> bool {
     !*b
 }
 
@@ -1937,6 +1948,42 @@ mod tests {
         let back2: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back2.history_retention_days, 90);
         assert!(!back2.notify_enabled);
+    }
+
+    #[test]
+    fn mention_default_defaults_and_roundtrip() {
+        // #91：mention_default 默认 false（需要 @，向后兼容）；旧 config 无字段按默认
+        let c = Config {
+            bots: vec![BotConfig::default()],
+            ..Default::default()
+        };
+        assert!(!c.bots[0].mention_default);
+        let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
+        let back: Config = serde_json::from_str(old).unwrap();
+        assert!(!back.bots[0].mention_default, "旧文件兼容缺省 = 需要 @");
+        // 显式 true 往返不丢；false 不落盘（旧 config 兼容）
+        let c2 = Config {
+            bots: vec![BotConfig {
+                name: "b".into(),
+                mention_default: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        assert!(s.contains("\"mention_default\":true"), "true 应序列化: {s}");
+        let back2: Config = serde_json::from_str(&s).unwrap();
+        assert!(back2.bots[0].mention_default, "往返不丢");
+        let c3 = Config {
+            bots: vec![BotConfig {
+                name: "b".into(),
+                mention_default: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let s3 = serde_json::to_string(&c3).unwrap();
+        assert!(!s3.contains("mention_default"), "false 不落盘: {s3}");
     }
 
     #[test]
