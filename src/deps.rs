@@ -86,9 +86,33 @@ fn unix_etc_paths() -> Vec<String> {
     out
 }
 
+/// Windows 上 codex 沙箱 runner 解析 pwsh 用的候选目录（真实 PowerShell 7 安装路径）。
+/// 背景（#90 spike 2026-08-27 实测）：codex sandbox（workspace-write / read-only）在
+/// Windows 上以受限用户 CreateProcessAsUserW 拉起 pwsh 作为命令 runner；而 PATH 里
+/// `WindowsApps\pwsh.exe` 是重解析点别名（App Execution Alias），受限沙箱用户无权
+/// 访问 → `CreateProcessAsUserW failed: 1920`，沙箱内任何命令都跑不了（这也是 main
+/// 一直走 --dangerously-bypass-approvals-and-sandbox 的真实原因）。把真实 pwsh 目录
+/// 前置到 composed_path 最前，让 sandbox runner 解析到可执行的 pwsh.exe。
+#[cfg(windows)]
+fn windows_pwsh_dirs() -> Vec<String> {
+    let mut out = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(pf) = std::env::var(var) {
+            let dir = PathBuf::from(pf).join("PowerShell").join("7");
+            if dir.join("pwsh.exe").is_file() {
+                out.push(dir.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(windows)]
 pub fn composed_path() -> String {
     let mut parts: Vec<String> = Vec::new();
+    // #90：真实 pwsh 目录必须最优先（见 windows_pwsh_dirs 注释——sandbox runner 用
+    // PATH 解析 pwsh，WindowsApps 别名会 1920 失败）。放最前保证优先于 WindowsApps。
+    parts.extend(windows_pwsh_dirs());
     let push_env = |parts: &mut Vec<String>, var: &str, sub: &str| {
         if let Ok(base) = std::env::var(var) {
             parts.push(PathBuf::from(base).join(sub).to_string_lossy().into_owned());
