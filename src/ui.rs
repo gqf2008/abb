@@ -3155,7 +3155,7 @@ pub fn run_gui() -> Result<()> {
                 }
                 dirty.set(true);
                 drop(b);
-                refresh_vb_rows(&w, &*work);
+                refresh_vb_rows(&w, &work);
             }
         });
         settings.on_virtual_bot_deregister(move |row| {
