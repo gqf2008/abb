@@ -156,7 +156,6 @@ export struct BotRow {
     owner-open-id: string, // 飞书：owner（管理员）白名单（逗号分隔 open_id）；微信 bot 不用
     owners: [OwnerRow],  // 飞书：owner 展示名（手填的没名字，列表备用；实际以输入框为准）
     granted: [OwnerRow], // 飞书：授权者列表（授权码添加，名字 + open_id）
-    open-access: bool,   // 飞书：true=任何人都可以对话；false=仅授权用户（owner+授权者）
     app-id: string,
     app-secret: string,
     bot-name: string,    // 运行时获取的 bot 名
@@ -164,7 +163,6 @@ export struct BotRow {
     ding-user-id: string,    // 钉钉：旧单值 owner staffId（迁移到 ding-owner-ids）
     ding-owner-ids: string,  // 钉钉：owner（管理员）白名单（逗号分隔 staffId）
     ding-granted: [OwnerRow], // 钉钉：授权者列表（授权码添加，名字 + staffId）
-    ding-open-access: bool,  // 钉钉：true=任何人都可以对话；false=仅授权用户
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
     restrict-granted: bool, // 授权者 agent 会话隔离（true=受限模式，安全默认；false=与 owner 同权限）
     tidy-enabled: bool, // 每日工作目录整理（默认关：孤儿会话/临时文件/超期历史/文档归档 + git 留痕）
@@ -982,13 +980,12 @@ export component SettingsWindow inherits Window {
         { name: "codex", checked: false },
         { name: "pi", checked: false },
     ];
+    // #118：访问控制收紧后无「公开」一档，对话权限固定为「仅授权用户」
     in-out property <[OptionRow]> access-options: [
         { name: "仅授权用户", checked: true },
-        { name: "任何人都可以对话", checked: false },
     ];
     in-out property <[OptionRow]> ding-access-options: [
         { name: "仅授权用户", checked: true },
-        { name: "任何人都可以对话", checked: false },
     ];
     // 虚拟 Bot（#75）：当前选中 bot 的登记列表（Rust 按选中 bot 刷新）
     in-out property <[VirtualBotRow]> virtual-bots: [];
@@ -1483,7 +1480,6 @@ export component SettingsWindow inherits Window {
                                                     }
                                                     PixelButton {
                                                         text: "生成管理员授权码";
-                                                        enabled: !root.bots[root.selected].open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "owner"); }
                                                     }
                                                 }
@@ -1505,7 +1501,6 @@ export component SettingsWindow inherits Window {
                                                     }
                                                     PixelButton {
                                                         text: "生成授权码";
-                                                        enabled: !root.bots[root.selected].open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "granted"); }
                                                     }
                                                 }
@@ -1553,14 +1548,6 @@ export component SettingsWindow inherits Window {
                                                     PixelButton {
                                                         text: "复制";
                                                         clicked => { root.copy-owner-code("granted"); }
-                                                    }
-                                                }
-                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu" && root.bots[root.selected].open-access: Row {
-                                                    Rectangle { width: 80px; }
-                                                    Text {
-                                                        text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
-                                                        color: UiTokens.text-dim;
-                                                        font-size: 12px;
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
@@ -1676,7 +1663,6 @@ export component SettingsWindow inherits Window {
                                                     }
                                                     PixelButton {
                                                         text: "生成管理员授权码";
-                                                        enabled: !root.bots[root.selected].ding-open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "owner"); }
                                                     }
                                                 }
@@ -1698,7 +1684,6 @@ export component SettingsWindow inherits Window {
                                                     }
                                                     PixelButton {
                                                         text: "生成授权码";
-                                                        enabled: !root.bots[root.selected].ding-open-access;
                                                         clicked => { root.generate-owner-code(root.selected, "granted"); }
                                                     }
                                                 }
@@ -1741,14 +1726,6 @@ export component SettingsWindow inherits Window {
                                                     PixelButton {
                                                         text: "复制";
                                                         clicked => { root.copy-owner-code("granted"); }
-                                                    }
-                                                }
-                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.bots[root.selected].ding-open-access: Row {
-                                                    Rectangle { width: 80px; }
-                                                    Text {
-                                                        text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
-                                                        color: UiTokens.text-dim;
-                                                        font-size: 12px;
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {

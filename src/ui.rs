@@ -600,7 +600,6 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         owner_open_id: b.owner_open_id.clone().into(),
         owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
         granted: slint::ModelRc::from(Rc::new(granted)),
-        open_access: b.open_access,
         app_id: b.app_id.clone().into(),
         app_secret: b.app_secret.clone().into(),
         bot_name: b.bot_name.clone().into(),
@@ -610,7 +609,6 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_user_id: b.ding_user_id.clone().into(),
         ding_owner_ids: b.ding_owner_ids.clone().into(),
         ding_granted: slint::ModelRc::from(Rc::new(ding_granted)),
-        ding_open_access: b.ding_open_access,
         ding_robot_code: b.ding_robot_code.clone().into(),
         restrict_granted: b.restrict_granted_agent,
         tidy_enabled: b.tidy_enabled,
@@ -961,21 +959,12 @@ fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) 
             be_sel,
         ),
     ))));
-    let is_ding = bot.as_ref().map(|b| b.is_dingtalk()).unwrap_or(false);
-    let open = bot
-        .map(|b| {
-            if is_ding {
-                b.ding_open_access
-            } else {
-                b.open_access
-            }
-        })
-        .unwrap_or(false);
-    let access_sel = if open { "open" } else { "private" };
-    let access_model = slint::ModelRc::from(Rc::new(slint::VecModel::from(mk_opts(
-        &[("仅授权用户", "private"), ("任何人都可以对话", "open")],
-        access_sel,
-    ))));
+    // #118：访问控制收紧后无「公开」一档，对话权限固定为「仅授权用户」
+    // （open_access / ding_open_access 字段保留兼容旧 config，判定链已不读）。
+    let access_model = slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![OptionRow {
+        name: "仅授权用户".into(),
+        checked: true,
+    }])));
     w.set_access_options(access_model.clone());
     w.set_ding_access_options(access_model);
 }
@@ -2527,18 +2516,10 @@ pub fn run_gui() -> Result<()> {
                         }
                         "provider" => bot.provider = value.to_string(),
                         "owner" => bot.owner_open_id = value.trim().to_string(),
-                        "open_access" => {
-                            bot.open_access = value.contains("任何人都可以对话");
-                            refresh = true; // 对话权限互斥 CheckBox 同样依赖 model 重求值
-                        }
                         "app_id" => bot.app_id = value.trim().to_string(),
                         "app_secret" => bot.app_secret = value.trim().to_string(),
                         "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
                         "ding_owner_ids" => bot.ding_owner_ids = value.trim().to_string(),
-                        "ding_open_access" => {
-                            bot.ding_open_access = value.contains("任何人都可以对话");
-                            refresh = true; // 同 open_access：互斥显示靠 model 重建
-                        }
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
                         _ => {}
                     }
@@ -3622,17 +3603,6 @@ pub fn run_gui() -> Result<()> {
         settings.on_generate_owner_code(move |idx, role| {
             let Some(w) = sw.upgrade() else { return };
             let Some(bot) = work.borrow().get(idx as usize).cloned() else { return };
-            let open = if bot.is_dingtalk() {
-                bot.ding_open_access
-            } else {
-                bot.open_access
-            };
-            if open {
-                // 公开模式无需授权（按钮已禁用，双保险防参数矛盾）
-                w.set_status_is_error(true);
-                w.set_status_line("❌ 公开模式下任何人都可对话，无需生成授权码（请先切回「仅授权用户」）".into());
-                return;
-            }
             match crate::config::Config::generate_owner_code(&bot.key(), role.as_str()) {
                 Some((code, _expires)) => {
                     let label = if role == "owner" { "管理员授权码" } else { "授权码" };
@@ -3696,22 +3666,18 @@ pub fn run_gui() -> Result<()> {
     {
         let work = work.clone();
         let sw = settings.as_weak();
-        settings.on_access_option_toggled(move |i| {
+        settings.on_access_option_toggled(move |_i| {
             let Some(w) = sw.upgrade() else { return };
-            if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
-                bot.open_access = i == 1;
-            }
+            // #118：对话权限固定「仅授权用户」，点击仅触发重算回正（无公开档可写）
             refresh_exclusive_checks(&w, &work);
         });
     }
     {
         let work = work.clone();
         let sw = settings.as_weak();
-        settings.on_ding_access_option_toggled(move |i| {
+        settings.on_ding_access_option_toggled(move |_i| {
             let Some(w) = sw.upgrade() else { return };
-            if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
-                bot.ding_open_access = i == 1;
-            }
+            // #118：同上——钉钉对话权限同样固定「仅授权用户」
             refresh_exclusive_checks(&w, &work);
         });
     }

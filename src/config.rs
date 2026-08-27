@@ -476,8 +476,10 @@ impl BotConfig {
         }
     }
 
-    /// 统一访问判定（不矛盾的单一入口）：公开开关开 → 放行所有人；否则只放行 owner ∪ 授权者
-    /// 白名单成员。飞书用 open_id 字段、钉钉用 staffId 字段（各自独立，互不干扰）。
+    /// 统一访问判定（不矛盾的单一入口）：只放行 owner ∪ 授权者白名单成员
+    /// （#118：公开开关已从判定链移除，open_access / ding_open_access 字段仅保留兼容旧 config，
+    /// 不再被读取——未经授权一律拦截，fail-closed）。
+    /// 飞书用 open_id 字段、钉钉用 staffId 字段（各自独立，互不干扰）。
     /// 微信不走这套（wx_user_id 是登录身份，on_weixin 独立过滤）。
     /// 桥每次消息从 config 读最新值调用（授权后立即生效，不依赖启动快照）。
     pub fn access_allows(&self, sender_id: &str) -> bool {
@@ -499,8 +501,8 @@ impl BotConfig {
     }
 
     /// 会话发送者角色推导（与 access_allows 同构，准入闸顺路区分 owner 与授权者）：
-    /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）——
-    /// 公开模式（open_access）下的陌生人同样归 Granted。注意：空 owner 白名单 → 一律
+    /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）。
+    /// 注意：空 owner 白名单 → 一律
     /// Granted（安全默认，不猜 Owner；is_owner_allowed 对空串返回 true 只管准入不管角色，
     /// 若需 owner 全权限请先把自己加进白名单）。微信恒 Owner
     /// （wx_user_id 是唯一 owner 判据，on_weixin 已先过滤，无授权者概念）。
