@@ -698,6 +698,11 @@ pub struct Config {
     /// （历史记录仍照常落库，历史页不受影响）。默认 true。
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
+    /// 锁屏控制开关（#129）：默认关闭。开启后 agent 在用户当前会话明确提供密码时，
+    /// 可经 root 特权助手 abb-helper 把按键注入 loginwindow 完成解锁（密码只瞬态转发，
+    /// 不落盘/不进日志/不参与事件溯源/不跨会话投递）。关闭时特权助手不安装不运行。
+    #[serde(default)]
+    pub lock_screen_control: bool,
     /// 每日会话归纳清理总开关（默认关）：service 每日把过期会话（按 session_gc_days
     /// 判定的最后活跃时间）交 bot 后端 agent 归纳成摘要存档（summaries/），再清理
     /// 工作区内历史/后端会话文件（绝不触碰 ~/.claude 等后端私有目录），摘要下次
@@ -745,6 +750,7 @@ impl Default for Config {
             owner_open_id: String::new(),
             default_backend: String::new(),
             cross_delivery_enabled: false,
+            lock_screen_control: false, // #129 锁屏控制默认关
             history_retention_days: default_history_retention_days(),
             notify_enabled: true,
             session_gc_enabled: false,

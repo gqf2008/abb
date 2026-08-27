@@ -162,3 +162,60 @@ pub fn request_media_permissions() {
     request_one(c"AVMediaTypeAudio", "microphone");
     crate::log!("[perm] 权限请求流程结束");
 }
+
+// ── #129 锁屏控制前置权限 ──
+// 仿 ToDesk：agent 向锁屏 loginwindow 注入按键，需要 辅助功能（kTCCServicePostEvent，
+// 注入键鼠事件必需）＋ 输入监控（kTCCServiceListenEvent，可选但建议）两项授权。
+// 用 CoreGraphics 同步 API（CGRequest*EventAccess）：未决定时才弹系统授权框，
+// 已授权/已拒绝不弹（返回当前布尔态），与 request_screen 同模式，无 block/信号量。
+
+/// 触发「辅助功能」授权请求（kTCCServicePostEvent，CGEvent 注入必需）。
+fn request_post_event() {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightPostEventAccess() -> bool;
+        fn CGRequestPostEventAccess() -> bool;
+    }
+    let r = std::panic::catch_unwind(|| unsafe {
+        if CGPreflightPostEventAccess() {
+            crate::log!("[perm] 辅助功能（按键注入）已授权，跳过");
+        } else {
+            crate::log!("[perm] 请求 辅助功能 授权（系统弹框中，请点允许）…");
+            let granted = CGRequestPostEventAccess();
+            crate::log!("[perm] 辅助功能 请求结果={granted}");
+        }
+    });
+    if r.is_err() {
+        crate::log!("[perm] ⚠️ 辅助功能 请求过程异常（已忽略，请到系统设置手动开）");
+    }
+}
+
+/// 触发「输入监控」授权请求（kTCCServiceListenEvent）。
+fn request_listen_event() {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightListenEventAccess() -> bool;
+        fn CGRequestListenEventAccess() -> bool;
+    }
+    let r = std::panic::catch_unwind(|| unsafe {
+        if CGPreflightListenEventAccess() {
+            crate::log!("[perm] 输入监控 已授权，跳过");
+        } else {
+            crate::log!("[perm] 请求 输入监控 授权（系统弹框中，请点允许）…");
+            let granted = CGRequestListenEventAccess();
+            crate::log!("[perm] 输入监控 请求结果={granted}");
+        }
+    });
+    if r.is_err() {
+        crate::log!("[perm] ⚠️ 输入监控 请求过程异常（已忽略，请到系统设置手动开）");
+    }
+}
+
+/// #129 锁屏控制前置权限：辅助功能 → 输入监控。
+/// 与 request_media_permissions 同流程由 GUI「请求权限」按钮统一拉起。
+pub fn request_lock_permissions() {
+    crate::log!("[perm] 开始逐项请求锁屏控制权限（辅助功能 → 输入监控）");
+    request_post_event();
+    request_listen_event();
+    crate::log!("[perm] 锁屏控制权限请求流程结束");
+}
