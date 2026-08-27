@@ -1070,6 +1070,8 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
 /// 一次 stdin 问答。claude（`claude -p --output-format text`）/ codex（`codex exec`）
 /// 支持；pi CLI 形态差异大，回落明确错误。输出：去空行 + 截断 100 字符
 /// （char 安全，truncate 语义）。
+/// #123 同根因加固（2026-08-27）：codex 分支补 `--skip-git-repo-check`（非 git 目录
+/// 下 codex 拒绝执行 → 空输出），stderr 改管道透传（失败原因可定位，不再静默空结果）。
 pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
     let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
@@ -1094,7 +1096,9 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         }
         Backend::Codex => {
             let mut c = tokio::process::Command::from(shim_command(&resolved));
-            c.arg("exec");
+            // #123：非 git 目录下 codex 拒跑（trusted directory 检查）→ 补 flag；
+            // 输出仍走文本（与 teambuilder 不同：这里不解析 JSON 事件，故不加 --json）。
+            c.arg("exec").arg("--skip-git-repo-check");
             c
         }
         Backend::Pi => {
@@ -1111,9 +1115,9 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     };
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
-    // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
+        .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，空结果时透传归因
+                                               // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
+                                               // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
     #[cfg(windows)]
     {
         crate::deps::apply_no_window_tokio(&mut cmd);
@@ -1160,7 +1164,14 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
     if text.is_empty() {
-        anyhow::bail!("生成结果为空（后端无输出）");
+        // #123：stderr 透传（截断 200 字符），失败原因可定位，不再静默「空结果」。
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let err = stderr.trim();
+        if err.is_empty() {
+            anyhow::bail!("生成结果为空（后端无输出）");
+        }
+        let shown: String = err.chars().take(200).collect();
+        anyhow::bail!("生成结果为空（后端无输出）；模型 stderr：{shown}");
     }
     Ok(truncate(&text, 100).to_string())
 }
