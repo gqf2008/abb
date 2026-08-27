@@ -595,7 +595,7 @@ const CANCEL_POLL_MS: u64 = 250;
 
 /// 从 pi 的 assistant message 里取纯文本（content[].type == "text" 块拼接）。
 /// 工具调用轮（只有 toolCall 块）返回空串——不产生进度候选。
-fn pi_message_text(v: &serde_json::Value) -> String {
+pub fn pi_message_text(v: &serde_json::Value) -> String {
     let mut txt = String::new();
     if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
         for block in content {
@@ -737,7 +737,7 @@ fn stderr_tail(stderr: &str) -> String {
 /// 构造子进程命令：Windows 下 npm 全局装的 claude/codex/pi 都是 `.cmd`/`.bat` shim，
 /// CreateProcess 不直接执行脚本（报 "program not found"）→ 必须经 `cmd.exe /c` 包装；
 /// 其它平台直接执行。program 传入 deps::find_in_path 解析出的真实路径（找不到才回落裸名）。
-fn shim_command(program: &std::path::Path) -> std::process::Command {
+pub fn shim_command(program: &std::path::Path) -> std::process::Command {
     #[cfg(windows)]
     {
         let ext = program
