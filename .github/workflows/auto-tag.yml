@@ -1,0 +1,44 @@
+name: Auto Tag & Release
+
+# 合并即发：PR 合入 main 后自动 bump patch 版本并打 tag，
+# 触发现有 release.yml（打 tag v* 时自动构建+签名+发 GitHub Release）。
+# 含 [skip-release] 的 commit 不触发（用于不需要发版的文档/CI 改动）。
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip-release]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Auto bump patch & tag
+        run: |
+          set -e
+          VER=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          if git tag -l "v$VER" | grep -q .; then
+            echo "v$VER 已存在（刚发过），跳过"
+            exit 0
+          fi
+          NEW_VER=$(echo "$VER" | awk -F. '{print $1"."$2"."$3+1}')
+          sed -i "s/^version = \"$VER\"/version = \"$NEW_VER\"/" Cargo.toml
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add Cargo.toml
+          git commit -m "chore(release): v$NEW_VER [skip-release]"
+          git tag "v$NEW_VER"
+          git push origin main
+          git push origin "v$NEW_VER"
+          echo "✅ 已打 tag v$NEW_VER，release.yml 将自动构建发布"
