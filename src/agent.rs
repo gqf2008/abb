@@ -205,11 +205,12 @@ enum AttemptErr {
 }
 
 /// 供应商解析产物：要注入子进程的 env，和仅 codex/pi 用的额外 CLI 参数。
-struct Injection {
-    env: Option<HashMap<String, String>>,
+/// pub(crate)：teambuilder（#123 team generate 链路）复用同一套注入。
+pub(crate) struct Injection {
+    pub(crate) env: Option<HashMap<String, String>>,
     /// codex：`-c model_provider=... -c model_providers.agent_bridge.*=...`；
     /// pi：`--provider <名> --model <模型>`。claude 永远为空。
-    extra_args: Vec<String>,
+    pub(crate) extra_args: Vec<String>,
 }
 
 /// codex 注入 api key 用的 env 变量名（经 `env_key` 引用，key 绝不进 argv / config.toml）。
@@ -253,7 +254,7 @@ fn ccswitch_env_or_err() -> Result<HashMap<String, String>, String> {
 
 /// 由（后端, 供应商）算出注入产物。优先级：桥内供应商 > CC Switch / codex 自认证。
 /// 类型与后端不匹配 → Err（用户可见）。供应商为 None → 旧行为回落。
-fn build_injection(
+pub(crate) fn build_injection(
     backend: Backend,
     provider: Option<&crate::config::ProviderConfig>,
 ) -> Result<Injection, String> {
@@ -795,6 +796,8 @@ fn claude_command(
 }
 
 /// codex 会话命令构造（exec / exec resume，含桥内供应商 -c 注入）。
+/// pub(crate)：teambuilder（#123 team generate 链路）复用，保证参数不漂移。
+///
 /// 沙箱策略（#90 bot 数据边界，2026-08-27 落地）：
 /// - restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
 ///   但不可写任何文件），不变。
@@ -813,7 +816,7 @@ fn claude_command(
 /// （文档与实测不符、写入 config.toml 会破坏登录态）→ 不生成；④ Windows sandbox
 /// runner 依赖真实 pwsh（composed_path 已前置，见 deps.rs windows_pwsh_dirs——
 /// WindowsApps 别名会让 CreateProcessAsUserW 1920 失败，spike 2026-08-27 实测）。
-fn codex_command(
+pub(crate) fn codex_command(
     program: &std::path::Path,
     resume: bool,
     session_id: &str,
