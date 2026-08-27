@@ -62,3 +62,10 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# #111 本地补丁：i-slint-core 的 Windows 托盘窗口从 message-only 改为顶层隐藏窗口，
+# 使 Slint 内置的 TaskbarCreated 图标重建逻辑真正生效（explorer 重启后托盘自动恢复）。
+# 上游 1.17.1 用 HWND_MESSAGE 收不到 HWND_BROADCAST 广播（spike 已验证）。
+# 升级 slint 时需同步核对 third_party/i-slint-core 是否仍需要该补丁。
+[patch.crates-io]
+i-slint-core = { path = "third_party/i-slint-core" }

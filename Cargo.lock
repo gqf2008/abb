@@ -2251,8 +2251,6 @@ dependencies = [
 [[package]]
 name = "i-slint-core"
 version = "1.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e407dc2bd5385dcbdd9c1cf927213d2e4bacda667545abf8839c60f8290f754"
 dependencies = [
  "async-channel",
  "auto_enums",
