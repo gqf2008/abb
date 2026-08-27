@@ -2110,10 +2110,45 @@ pub fn run_gui() -> Result<()> {
                                     None => Err(anyhow::anyhow!("钉钉不支持群验证")),
                                 };
                                 match r {
-                                    Ok(_) => results.push((
-                                        reg.role_name.clone(),
-                                        Ok("正常".to_string()),
-                                    )),
+                                    Ok((name, _desc)) => {
+                                        // #101：刷新同步群名——平台群名回写登记（群名=角色名约定）。
+                                        // 平台侧改名后刷新即同步，deliver @新角色名 立即可用；
+                                        // 重名冲突（update_role 拦截）/超长时保留旧名并提示，不静默改错。
+                                        // 钉钉无群信息 API → 恒走“正常”。
+                                        let name = name.trim().to_string();
+                                        if name.is_empty() || name == reg.role_name {
+                                            results.push((
+                                                reg.role_name.clone(),
+                                                Ok("正常".to_string()),
+                                            ));
+                                        } else if name.chars().count() > ROLE_NAME_MAX {
+                                            results.push((
+                                                reg.role_name.clone(),
+                                                Err(format!(
+                                                    "群名超长（{} 字 > {ROLE_NAME_MAX}），未同步（保留旧名）",
+                                                    name.chars().count()
+                                                )),
+                                            ));
+                                        } else {
+                                            match VirtualBotStore::new().update_role(
+                                                &bot_key,
+                                                &reg.chat_id,
+                                                &name,
+                                            ) {
+                                                Ok(_) => results.push((
+                                                    reg.role_name.clone(),
+                                                    Ok(format!(
+                                                        "群名已同步：{} → {}",
+                                                        reg.role_name, name
+                                                    )),
+                                                )),
+                                                Err(e) => results.push((
+                                                    reg.role_name.clone(),
+                                                    Err(format!("群名未同步（保留旧名）：{e}")),
+                                                )),
+                                            }
+                                        }
+                                    }
                                     Err(e) => {
                                         let es = format!("{e:#}");
                                         let gone = es.contains("不存在")

@@ -353,6 +353,12 @@ pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Windows：每日整理 spawn git.exe 也抑制控制台窗口（#104），
+        // 否则每天 git init/add/commit 都会闪一个黑框。
+        #[cfg(windows)]
+        {
+            crate::deps::apply_no_window_tokio(&mut cmd);
+        }
         match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
             Ok(Ok(o)) => Ok(o),
             Ok(Err(e)) => Err(format!("git {} 启动失败：{e}", args.join(" "))),
