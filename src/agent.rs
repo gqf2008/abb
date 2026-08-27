@@ -795,20 +795,31 @@ fn claude_command(
 }
 
 /// codex 会话命令构造（exec / exec resume，含桥内供应商 -c 注入）。
-/// restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
-/// 但不可写任何文件）。审批策略不传额外参数：codex exec 非交互（stdin 管道 + EOF）
-/// 时需审批的操作被当作「用户拒绝」自动取消（openai/codex #24135 实测结论）。
-/// 已知局限（尽力隔离，2026-08-14 实测）：① read-only 沙箱可读全盘——敏感读只能靠
-/// 网络拦截兜底，无法 100% 防「读进回复」；② 网络拦截本机实测有效（curl DNS 失败），
-/// 但 macOS 上 codex 网络隔离历史上不可靠，需按环境复测；③ execpolicy 在 codex
-/// 0.147 上机制不明（文档与实测不符、写入 config.toml 会破坏登录态）→ 不生成；
-/// ④ read-only 下 $ABB_BIN 写 jobs.json（定时任务）与 outbox（投递）不可用。
+/// 沙箱策略（#90 bot 数据边界，2026-08-27 落地）：
+/// - restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
+///   但不可写任何文件），不变。
+/// - restricted=false（owner 会话）：默认域 = 本 bot 工作区（--sandbox workspace-write），
+///   额外可写根 = writable_roots（调用方传入 bridge_dir，保住 $ABB_BIN job/deliver 的
+///   落盘写入域：jobs.json / deliveries.json 在 ~/.agent-bridge 下，不在工作区内）。
+///   工作区外（除 writable_roots）只读——替代旧的 --dangerously-bypass-approvals-and-sandbox。
+///   需要 codex >= 0.146（--add-dir 实测支持，spike 2026-08-27）；旧版本由调用方
+///   传空 writable_roots 回退 bypass（见 codex_command 调用处）。
+///
+/// 审批策略不传额外参数：codex exec 非交互（stdin 管道 + EOF）时需审批的操作被当作
+/// 「用户拒绝」自动取消（openai/codex #24135 实测结论）。
+/// 已知局限（尽力隔离，2026-08-14 实测）：① workspace-write 沙箱可读全盘（敏感读
+/// 只能靠网络拦截兜底）；② 网络拦截本机实测有效（curl DNS 失败），但 macOS 上 codex
+/// 网络隔离历史上不可靠，需按环境复测；③ execpolicy 在 codex 0.147 上机制不明
+/// （文档与实测不符、写入 config.toml 会破坏登录态）→ 不生成；④ Windows sandbox
+/// runner 依赖真实 pwsh（composed_path 已前置，见 deps.rs windows_pwsh_dirs——
+/// WindowsApps 别名会让 CreateProcessAsUserW 1920 失败，spike 2026-08-27 实测）。
 fn codex_command(
     program: &std::path::Path,
     resume: bool,
     session_id: &str,
     extra_args: &[String],
     restricted: bool,
+    writable_roots: &[std::path::PathBuf],
 ) -> tokio::process::Command {
     let mut c = tokio::process::Command::from(shim_command(program));
     c.arg("exec");
@@ -818,8 +829,15 @@ fn codex_command(
     c.arg("--json").arg("--skip-git-repo-check");
     if restricted {
         c.arg("--sandbox").arg("read-only");
-    } else {
+    } else if writable_roots.is_empty() {
+        // 旧 codex（<0.146，无 --add-dir）回退：全权限（现状行为）。
         c.arg("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+        // #90：owner 会话默认域 = 工作区；writable_roots 追加可写根。
+        c.arg("--sandbox").arg("workspace-write");
+        for root in writable_roots {
+            c.arg("--add-dir").arg(root);
+        }
     }
     // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
     // 追加在固定参数后（flags-after-subcommand 对 exec / exec resume 都成立，实测）。
@@ -1180,7 +1198,28 @@ async fn run_once(
             // 关键坑（实测）：① 必须 `exec resume`（顶层 `codex resume` 是 TUI，stdin 非终端报错）；
             // ② codex 用自己的 thread_id（`thread.started` 事件），不是桥生成的 UUID —— 故加 --json
             //    从输出抓真实 tid 回存；③ resume 一个没建过的 tid 报 "no rollout found" → 上层回退 exec。
-            codex_command(&resolved, resume, session_id, extra_args, restrict)
+            // #90：owner 会话沙箱默认域=工作区（workspace-write）。workspace 是 cwd（自动可写主域）；
+            // 额外把 bridge_dir 加入可写根——$ABB_BIN job/deliver 落盘 jobs.json / deliveries.json
+            // 在 ~/.agent-bridge/ 下（不在工作区内），不加会破坏定时任务/跨会话投递（#21/#27）。
+            // codex < 0.146 无 --add-dir → 传空回退 bypass（保持现状行为）。
+            let codex_writable_roots: Vec<std::path::PathBuf> = if restrict {
+                Vec::new()
+            } else if crate::deps::codex_version(resolved.to_str().unwrap_or("codex"))
+                .map(|v| crate::deps::version_at_least(&v, "0.146"))
+                .unwrap_or(false)
+            {
+                vec![crate::bridge_dir()]
+            } else {
+                Vec::new()
+            };
+            codex_command(
+                &resolved,
+                resume,
+                session_id,
+                extra_args,
+                restrict,
+                &codex_writable_roots,
+            )
         }
         Backend::Claude => {
             // stream-json：逐事件流式输出（assistant/result…），配合逐行解析可实时推进度。
@@ -2216,7 +2255,14 @@ mod tests {
         // codex 0.147 实测无 --approval-policy flag），不带全权限旗标；
         // -c 供应商注入两分支都保留
         let extra = vec!["model_provider=abc".to_string()];
-        let c = codex_command(std::path::Path::new("codex"), false, "tid-1", &extra, true);
+        let c = codex_command(
+            std::path::Path::new("codex"),
+            false,
+            "tid-1",
+            &extra,
+            true,
+            &[],
+        );
         let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
         assert!(
             !args
@@ -2233,16 +2279,70 @@ mod tests {
         assert!(args.iter().any(|a| *a == "-c"));
         assert!(args.iter().any(|a| *a == "model_provider=abc"));
         // resume 形态
-        let r = codex_command(std::path::Path::new("codex"), true, "tid-2", &[], true);
+        let r = codex_command(std::path::Path::new("codex"), true, "tid-2", &[], true, &[]);
         assert!(r.as_std().get_args().any(|a| a == "resume"));
         assert!(r.as_std().get_args().any(|a| a == "tid-2"));
     }
 
     #[test]
-    fn codex_command_full_keeps_bypass_flag() {
-        // owner 会话：保持现状全权限旗标 + -c 注入
+    fn codex_command_owner_uses_workspace_write_sandbox() {
+        // #90：owner 会话沙箱默认域=工作区（workspace-write），不再全权限 bypass；
+        // writable_roots（bridge_dir）追加可写根，保证 $ABB_BIN job/deliver 落盘可用；
+        // -c 供应商注入保留
         let extra = vec!["model=abc".to_string()];
-        let c = codex_command(std::path::Path::new("codex"), false, "tid-1", &extra, false);
+        let roots = vec![std::path::PathBuf::from("C:\\Users\\x\\.agent-bridge")];
+        let c = codex_command(
+            std::path::Path::new("codex"),
+            false,
+            "tid-1",
+            &extra,
+            false,
+            &roots,
+        );
+        let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
+        assert!(
+            !args
+                .iter()
+                .any(|a| *a == "--dangerously-bypass-approvals-and-sandbox"),
+            "#90：owner 会话不再全权限 bypass"
+        );
+        assert!(args.iter().any(|a| *a == "--sandbox"));
+        assert!(args.iter().any(|a| *a == "workspace-write"));
+        // 每个 writable root 一个 --add-dir
+        let add_dirs: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "--add-dir")
+            .map(|w| w[1].to_str().unwrap_or(""))
+            .collect();
+        assert_eq!(add_dirs, vec!["C:\\Users\\x\\.agent-bridge"]);
+        assert!(args.iter().any(|a| *a == "-c"));
+        assert!(args.iter().any(|a| *a == "model=abc"));
+        // resume 形态
+        let r = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-2",
+            &[],
+            false,
+            &roots,
+        );
+        assert!(r.as_std().get_args().any(|a| a == "resume"));
+        assert!(r.as_std().get_args().any(|a| a == "tid-2"));
+    }
+
+    #[test]
+    fn codex_command_owner_empty_roots_falls_back_to_bypass() {
+        // #90：codex < 0.146（无 --add-dir）→ 调用方传空 writable_roots，回退全权限
+        //（现状行为不变，避免老版本 codex 因未知 flag 挂掉）；-c 注入保留
+        let extra = vec!["model=abc".to_string()];
+        let c = codex_command(
+            std::path::Path::new("codex"),
+            false,
+            "tid-1",
+            &extra,
+            false,
+            &[],
+        );
         let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
         assert!(args
             .iter()
