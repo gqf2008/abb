@@ -742,6 +742,21 @@ async fn run_job(
     job: crate::schedule::Job,
 ) {
     let bot_key = bridge.bot.key();
+    // #87 暂停拦截：任务目标会话已暂停 → 跳过本轮（不消耗 LLM）。
+    // 多目标任务的目标侧由 Router::deliver 的暂停检查兜底（回源提示）；
+    // 这里拦的是旧路径「先发原会话」——原会话已暂停则本轮无意义。
+    if bridge.session_state.is_paused(&bot_key, &job.chat_id) {
+        crate::log!(
+            "[bot:{bot_key}] 任务 {} 跳过：目标会话已暂停（#87）chat={}",
+            &job.id[..job.id.len().min(8)],
+            &job.chat_id[..job.chat_id.len().min(16)]
+        );
+        crate::session_state::audit("job.skip", &bot_key, &job.chat_id, "scheduler", "paused");
+        if job.kind == crate::schedule::JobKind::Once {
+            bridge.jobs.remove(&job.id);
+        }
+        return;
+    }
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
                                                                   // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
                                                                   // 与聊天消息同一后端，避免「聊天走 codex、定时任务却跑 claude」的割裂。

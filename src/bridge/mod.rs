@@ -75,6 +75,9 @@ pub struct Bridge {
     /// 虚拟 Bot 登记表（#75）：事件驱动移除（im.chat.deleted_v1 群被解散）用它写；
     /// 生产 = ~/.agent-bridge/virtual-bots.json，测试注入临时路径（同 msgstore/unread）。
     pub vb_store: crate::virtualbot::VirtualBotStore,
+    /// #87 会话管控状态（暂停/恢复）。生产 = ~/.agent-bridge/session_state.json，
+    /// 热重载——CLI pause/resume 落盘后无需重启即生效（测试注入临时路径）。
+    pub session_state: crate::session_state::SessionState,
     /// 三级 AGENTS.md 注入根目录（abb 级文件所在）。生产 = ~/.agent-bridge；测试注入
     /// temp 根——现有测试断言 prompt 精确相等（如 on_payload_owner_gets_full_session），
     /// 真实 ~/.agent-bridge/AGENTS.md 若存在会破坏它们（同 mention_snapshot 的
@@ -173,6 +176,7 @@ impl Bridge {
             msgstore: crate::msgstore::MsgStore::production(),
             unread: crate::unread::UnreadStore::production(),
             vb_store: crate::virtualbot::VirtualBotStore::new(),
+            session_state: crate::session_state::SessionState::production(),
             agents_md_root: crate::bridge_dir(),
         }
     }
@@ -1043,6 +1047,10 @@ mod tests {
         );
         bridge.vb_store = crate::virtualbot::VirtualBotStore::new_at(
             std::env::temp_dir().join(format!("abb-vb-test-{key}.json")),
+        );
+        // #87 会话管控状态注入临时路径：不碰真实 ~/.agent-bridge/session_state.json
+        bridge.session_state = crate::session_state::SessionState::at(
+            std::env::temp_dir().join(format!("abb-sessstate-test-{key}.json")),
         );
         // 三级 AGENTS.md 注入根注入临时目录：不碰真实 ~/.agent-bridge/AGENTS.md
         //（现有测试断言 prompt 精确相等，真实 abb 级文件会破坏它们）
@@ -3889,6 +3897,46 @@ https://b.com/y"
         let payload2 = br#"{"schema":"2.0","header":{"event_type":"im.chat.deleted_v1"},"event":{"chat_id":"oc_other"}}"#;
         bridge.on_payload(payload2).await;
         assert_eq!(bridge.vb_store.load().len(), 1, "未登记群不影响登记表");
+        cleanup_bridge(&bridge);
+    }
+
+    // ─── #87 会话暂停/恢复（消息仍入库、不触发 agent、恢复即生效）──────────
+
+    #[tokio::test]
+    async fn paused_chat_stores_message_but_does_not_run_agent() {
+        let runner = Arc::new(MockAgentRunner::immediate("不该出现的回复"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+        // 暂停该会话（写入注入的临时 session_state）
+        bridge
+            .session_state
+            .pause(&bridge.bot.key(), "oc_x", "test");
+        bridge.handle(test_ev("m1", "oc_x", "暂停期间的消息")).await;
+        // 不触发 agent、不回复
+        assert!(
+            msgr.sent().is_empty(),
+            "暂停会话不应回复: {:?}",
+            msgr.sent()
+        );
+        assert_eq!(runner.prompts().len(), 0, "暂停会话不应触发 agent");
+        // 消息仍入库（可查）
+        let rows = bridge.msgstore.list_recent(10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "暂停期间的消息");
+        assert_eq!(rows[0].direction, "user");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn resumed_chat_runs_agent_again() {
+        let runner = Arc::new(MockAgentRunner::immediate("恢复后的回复"));
+        let (bridge, msgr) = build_test_bridge(runner.clone());
+        bridge
+            .session_state
+            .pause(&bridge.bot.key(), "oc_x", "test");
+        bridge.session_state.resume(&bridge.bot.key(), "oc_x");
+        bridge.handle(test_ev("m1", "oc_x", "恢复后的消息")).await;
+        assert_eq!(runner.prompts().len(), 1, "恢复后应正常触发 agent");
+        assert!(!msgr.sent().is_empty(), "恢复后应正常回复");
         cleanup_bridge(&bridge);
     }
 }
