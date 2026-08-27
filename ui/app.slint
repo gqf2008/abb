@@ -154,6 +154,7 @@ export struct BotRow {
     backend: string,     // 该 bot 的默认后端 claude | codex（跟着 bot 走，不是全局）
     provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
     owner-open-id: string, // 飞书：owner（管理员）白名单（逗号分隔 open_id）；微信 bot 不用
+    wx-owner-configured: bool, // 微信：扫码登录时自动写入 wx_user_id（登录者即管理员）；false=未配置（fail-closed 拒绝所有人）
     owners: [OwnerRow],  // 飞书：owner 展示名（手填的没名字，列表备用；实际以输入框为准）
     granted: [OwnerRow], // 飞书：授权者列表（授权码添加，名字 + open_id）
     app-id: string,
@@ -1598,6 +1599,33 @@ export component SettingsWindow inherits Window {
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat": Row {
                                                     Rectangle { width: 80px; }
                                                     PixelButton { text: "📱 扫码登录微信"; clicked => { root.wx-login(root.selected); } }
+                                                }
+                                                // #118 复核：微信 owner 判据 = wx_user_id（扫码登录时自动写入，登录者即管理员）。
+                                                // 未配置 → fail-closed 拒绝所有人（私聊/群聊均静默拦截）。GUI 给可见提示，
+                                                // 避免「扫码后没人能聊」无从排查。复用 UiTokens.warn-bg/warn（与首页待处理卡同视觉）。
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "wechat" && !root.bots[root.selected].wx-owner-configured: Row {
+                                                    Rectangle { width: 80px; }
+                                                    Rectangle {
+                                                        horizontal-stretch: 1;
+                                                        border-radius: 4px;
+                                                        background: UiTokens.warn-bg;
+                                                        VerticalBox {
+                                                            padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
+                                                            spacing: 3px;
+                                                            Text {
+                                                                text: "⚠️ 尚未配置管理员（fail-closed）";
+                                                                font-size: 12px;
+                                                                font-weight: 700;
+                                                                color: UiTokens.warn;
+                                                            }
+                                                            Text {
+                                                                text: "当前拒绝所有人对话：尚未配置管理员，所有人（含你自己）的私聊/群聊均被静默拦截。扫码登录后，登录者自动成为管理员（wx_user_id），即可对话。";
+                                                                font-size: 12px;
+                                                                color: UiTokens.text-dim;
+                                                                wrap: word-wrap;
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 // ── 钉钉字段（企业内部应用机器人，Stream 模式长连接，无需公网地址）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
