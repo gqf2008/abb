@@ -389,6 +389,11 @@ fn default_session_gc_days() -> u32 {
     7
 }
 
+/// #130 压缩保留最近轮数默认值。
+fn default_ctx_compress_keep_rounds() -> u32 {
+    6
+}
+
 impl BotConfig {
     /// 隔离键：name 优先，空则 app_id 尾 6 位；再空则 "default"。
     pub fn key(&self) -> String {
@@ -679,6 +684,25 @@ pub fn granted_pi_unusable(role: SenderRole, bot_key: &str, backend: &str) -> bo
     restrict_granted(role, bot_key) && backend.eq_ignore_ascii_case("pi")
 }
 
+/// #130 上下文超长自动压缩开关（热读，改配置即时生效）。读不到按安全默认开启。
+pub fn ctx_compress_enabled() -> bool {
+    Config::load()
+        .map(|c| c.ctx_compress_enabled)
+        .unwrap_or(true)
+}
+
+/// #130 压缩保留的最近轮数（热读）。默认 6。
+pub fn ctx_compress_keep_rounds() -> usize {
+    Config::load()
+        .map(|c| c.ctx_compress_keep_rounds.max(1) as usize)
+        .unwrap_or(6)
+}
+
+/// #130 是否用 LLM 分段摘要（热读）。默认 true（失败自动回退确定性截断）。
+pub fn ctx_compress_llm() -> bool {
+    Config::load().map(|c| c.ctx_compress_llm).unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -721,6 +745,21 @@ pub struct Config {
     /// 与其它字段同走「保存」写盘。#[serde(default)] 兼容旧 config（无此字段）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_roles: Vec<crate::virtualbot::RoleTemplate>,
+    /// #130 上下文超长自动压缩总开关：后端返回上下文超长错误（claude prompt is too
+    /// long / codex context_length_exceeded / pi errorMessage 超长）时，自动把该会话
+    /// 历史分段压缩（旧段摘要 + 保留最近若干轮原文），换新会话注入后自动重试当前
+    /// 消息，用户无感续聊。默认开启；关闭后行为与现状一致（只报错不压缩）。
+    #[serde(default = "default_true")]
+    pub ctx_compress_enabled: bool,
+    /// #130 压缩保留的最近轮数：旧段（更早轮次）压缩为摘要，最近 M 轮保留原文
+    /// （保证当前话题完整性）。默认 6 轮（≈12 条条目）。
+    #[serde(default = "default_ctx_compress_keep_rounds")]
+    pub ctx_compress_keep_rounds: u32,
+    /// #130 是否用 LLM 分段摘要：true = 旧段用同后端一次性 LLM 摘要（专用 prompt、
+    /// 不出现在用户可见回复），失败/超时回退确定性截断；false = 直接确定性截断。
+    /// 默认 true（LLM 有界：单轮最多 3 段 × 25s 超时）。
+    #[serde(default = "default_true")]
+    pub ctx_compress_llm: bool,
 
     // ── 旧单 bot 字段（仅用于自动迁移，迁移后清空）──
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -752,7 +791,10 @@ impl Default for Config {
             bots: Vec::new(),
             providers: Vec::new(),
             default_provider: String::new(),
-            custom_roles: Vec::new(), // #75 自定义角色模板
+            custom_roles: Vec::new(),   // #75 自定义角色模板
+            ctx_compress_enabled: true, // #130 上下文超长自动压缩默认开启
+            ctx_compress_keep_rounds: default_ctx_compress_keep_rounds(),
+            ctx_compress_llm: true,
             app_id: String::new(),
             app_secret: String::new(),
             bot_name: String::new(),

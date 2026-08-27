@@ -227,13 +227,42 @@ impl History {
     /// 清空历史与迁移标记（/new：用户明确要求全新会话）。
     /// 任一文件「仍存在却没删掉」才算失败（半删状态会泄漏旧历史进新会话，审查 M-3）。
     pub fn clear(&self) -> bool {
-        let a = std::fs::remove_file(&self.path);
-        let b = std::fs::remove_file(&self.marker_path);
-        let ok = (a.is_ok() || !self.path.exists()) && (b.is_ok() || !self.marker_path.exists());
-        if !ok {
-            crate::log!("[history] ⚠️ 清空失败 path={}", trunc_path(&self.path));
-        }
+        let ok = match std::fs::remove_file(&self.path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        let _ = std::fs::remove_file(&self.marker_path);
         ok
+    }
+
+    /// #130 上下文压缩：用给定条目整体替换历史（调用方构造压缩后条目：旧段摘要 +
+    /// 最近原文）。原子写（uuid tmp + rename）；不触碰迁移标记（会话级状态由调用方/桥管理）。
+    pub fn overwrite(&self, entries: &[HistoryEntry]) -> bool {
+        self.write_entries(entries)
+    }
+
+    /// #130 压缩前备份原始历史（审计/回溯）：`<key>.precompress-<ts>.jsonl`。
+    /// best-effort：失败只 log，不阻断压缩主链路（原始内容仍可从旧文件恢复的场景很少）。
+    pub fn backup_original(&self) {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        let ts = crate::chrono_lite::unix_secs();
+        let stem = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let bak = self
+            .path
+            .with_file_name(format!("{stem}.precompress-{ts}.jsonl"));
+        if let Err(e) = std::fs::write(&bak, text) {
+            crate::log!(
+                "[history] ⚠️ 压缩前备份失败 path={}: {e}",
+                trunc_path(&self.path)
+            );
+        }
     }
 
     pub fn marker(&self) -> Option<MigratedMarker> {

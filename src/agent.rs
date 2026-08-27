@@ -477,6 +477,10 @@ pub async fn run(
 
     let mut sid = session_id.to_string();
     let mut is_resume = resume;
+    // #130 上下文超长自动压缩的用户可见提示（压缩重试成功后拼到回复头部，一次性）。
+    let mut compressed_note: Option<String> = None;
+    // 重试需改 prompt（注入压缩块），循环内用 owned 副本。
+    let mut prompt_owned = prompt.to_string();
     // #54：同 sid 会话自愈重建标志。claude already-in-use 换 UUID 路径不置位（sid 已
     // 变）——但 marker 失效本身不会带来注入（started 被 mark 回 true 后 !resume 闸不再
     // 开），bridge 按「Claude && resume && final_sid != 入口 sid」另行补写 pending。
@@ -484,7 +488,7 @@ pub async fn run(
     for attempt in 0..2 {
         match run_once(
             backend,
-            prompt,
+            &prompt_owned,
             &sid,
             is_resume,
             chat_id,
@@ -514,8 +518,12 @@ pub async fn run(
                     sid = adopt_thread_id(backend, sid, tid, sessions, session_key);
                 }
                 // pi 不用回存：--session-id 直接用桥的 UUID，首轮就固定（无需 thread_id）
+                let reply = match &compressed_note {
+                    Some(note) => format!("{note}\n\n{}", out.reply),
+                    None => out.reply,
+                };
                 return Ok(RunOutcome::Reply {
-                    reply: out.reply,
+                    reply,
                     session_id: sid,
                     rebuilt,
                 });
@@ -577,6 +585,96 @@ pub async fn run(
                 if rebuilt {
                     if let Some(store) = sessions {
                         store.reset_session(session_key);
+                    }
+                }
+                // #130 上下文超长自动压缩（最后兜底）：识别 → 压缩历史 → 换新会话 →
+                // 注入压缩块重试当前消息。只在首轮（attempt==0）触发；重试仍超长则
+                // 走下方 return Err（循环退出，不二次重试 = 每会话只自动压缩一次）。
+                if attempt == 0
+                    && sessions.is_some()
+                    && crate::config::ctx_compress_enabled()
+                    && crate::ctxcompress::is_context_overflow(&e)
+                {
+                    let hist = crate::history::History::open(bot_key, session_key);
+                    // 复现桥注入的旧历史块（若本轮注入过）：重试时精确替换为压缩块，
+                    // 避免「旧注入块 + 压缩块」双重上下文。与桥同一 inject_block/
+                    // 预算/exclude_mid（当前消息 = 最后一条用户条目）。
+                    let cur_mid = hist
+                        .entries()
+                        .iter()
+                        .rev()
+                        .find(|e| e.user)
+                        .map(|e| e.mid.clone());
+                    let old_block = match &cur_mid {
+                        Some(m) => hist.inject_block(m, crate::history::INJECT_CHARS_DEFAULT).0,
+                        None => String::new(),
+                    };
+                    let keep = crate::config::ctx_compress_keep_rounds();
+                    if let Some(stats) = crate::ctxcompress::compress(
+                        &hist,
+                        backend,
+                        keep,
+                        crate::config::ctx_compress_llm(),
+                    )
+                    .await
+                    {
+                        let store = sessions.unwrap();
+                        let new_sid = store.reset_session(session_key);
+                        crate::log!(
+                            "[agent] #130 上下文超长自动压缩 bot={} key={} {}→{} 条（保留 {} 条原文，LLM 摘要={}），换新会话 {} 重试",
+                            truncate(bot_key, 12),
+                            truncate(session_key, 16),
+                            stats.before,
+                            stats.after,
+                            stats.kept,
+                            stats.llm,
+                            &new_sid[..new_sid.len().min(8)]
+                        );
+                        sid = new_sid;
+                        is_resume = false;
+                        let block = crate::ctxcompress::build_block(&hist);
+                        let agents = crate::agents_md::collect_block(bot_key, session_key);
+                        let tail = if old_block.is_empty() {
+                            prompt_owned.clone()
+                        } else {
+                            // 旧注入块应在受限说明+指令文件之后（桥的插入次序）：
+                            // 只替换该位置的一次出现，避免误伤用户文本里的同名内容。
+                            // 前缀须确实存在才切片（防 UTF-8 边界 panic：byte 偏移只
+                            // 在完整字符串匹配时才安全）。
+                            let mut prefix_len = 0usize;
+                            if restrict {
+                                if let Some(r) =
+                                    prompt_owned.strip_prefix(crate::config::RESTRICT_PREAMBLE)
+                                {
+                                    prefix_len = prompt_owned.len() - r.len();
+                                }
+                            }
+                            if !agents.is_empty() {
+                                if prompt_owned[prefix_len..].starts_with(&agents) {
+                                    prefix_len += agents.len();
+                                }
+                            }
+                            match prompt_owned[prefix_len..].find(&old_block) {
+                                Some(pos) => {
+                                    let at = prefix_len + pos;
+                                    format!(
+                                        "{}{}",
+                                        &prompt_owned[..at],
+                                        &prompt_owned[at + old_block.len()..]
+                                    )
+                                }
+                                None => prompt_owned.clone(),
+                            }
+                        };
+                        prompt_owned = crate::ctxcompress::rebuild_retry_prompt(
+                            &tail, restrict, &agents, &block,
+                        );
+                        compressed_note = Some(format!(
+                            "📦 历史过长，已自动压缩 {} 条旧消息为摘要（保留最近 {} 条原文），本条已在新会话中重试。",
+                            stats.before - stats.after,
+                            stats.kept
+                        ));
+                        continue;
                     }
                 }
                 return Err(e);
@@ -1066,22 +1164,24 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
     )
 }
 
-/// 虚拟 Bot「✨ 生成」提示词（8-20 需求）：根据角色/任务名让 LLM 写系统提示词
-/// （群介绍，≤100 字符）。轻量单轮 CLI 调用——无会话/无工作区/无受限模式，就是
-/// 一次 stdin 问答。claude（`claude -p --output-format text`）/ codex（`codex exec`）
-/// 支持；pi CLI 形态差异大，回落明确错误。输出：去空行 + 截断 100 字符
-/// （char 安全，truncate 语义）。
-/// #123 同根因加固（2026-08-27）：codex 分支补 `--skip-git-repo-check`（非 git 目录
-/// 下 codex 拒绝执行 → 空输出），stderr 改管道透传（失败原因可定位，不再静默空结果）。
-pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
-    let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
-              系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
-              不要解释、不要引号、不要“角色名：”前缀。";
-    let full = format!("{sys}\n\n角色/任务名称：{role_name}");
+/// 一次性 LLM 问答（#130 上下文摘要 / #8 角色提示词共用）：非交互单轮调用同后端
+/// CLI——claude（`claude -p --output-format text`）/ codex（`codex exec`）/ pi
+/// （`pi -p --mode json --session-id <uuid>`，临时无状态会话）。无会话/无工作区/
+/// 无受限模式，就是一次 stdin 问答，`timeout_secs` 超时。返回原始文本：
+/// claude/codex = stdout 全文；pi = 最后一条 message_end 的 assistant 文本。
+/// CLI 缺失/超时/无输出返回 Err（#123：无输出时透传 stderr 归因），调用方自行
+/// 兜底（#130 摘要失败回退确定性截断）。
+pub async fn one_shot_text(
+    backend: Backend,
+    sys: &str,
+    user: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    let full = format!("{sys}\n\n{user}");
     // 可执行路径解析：与 run_once 同源——GUI/launchd 环境 PATH 精简，裸命令名
     // spawn 必然 "No such file or directory (os error 2)"；必须经
     // deps::find_in_path（composed_path 覆盖 ~/.local/bin、npm-global 等）
-    // 解析出绝对路径再启动。找不到时保留裸名让下方错误文案带安装指引。
+    // 解析出绝对路径再启动。找不到时保留裸名让错误文案带安装指引。
     let program = match backend {
         Backend::Pi => "pi",
         Backend::Codex => "codex",
@@ -1117,8 +1217,8 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，空结果时透传归因
-                                               // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
-                                               // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
+                                               // Windows：调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
+                                               // 与 run_once（L1227）同款——否则 GUI 环境每次调用都闪一个黑框。
     #[cfg(windows)]
     {
         crate::deps::apply_no_window_tokio(&mut cmd);
@@ -1135,9 +1235,12 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
             .context("写入 prompt 失败")?;
         drop(stdin); // EOF：触发后端非交互模式处理
     }
-    let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
-        .await
-        .context("生成超时（60s）")??;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .context("生成超时")??;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     // pi：JSONL 里最后一条 message_end（assistant）的文本；claude/codex：stdout 直接是文本
@@ -1160,12 +1263,7 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     } else {
         stdout.to_string()
     };
-    let text = raw
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
-        .unwrap_or_default();
-    if text.is_empty() {
+    if raw.trim().is_empty() {
         // #123：stderr 透传（截断 200 字符），失败原因可定位，不再静默「空结果」。
         let err = stderr.trim();
         if err.is_empty() {
@@ -1173,6 +1271,25 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         }
         let shown: String = err.chars().take(200).collect();
         anyhow::bail!("生成结果为空（后端无输出）；模型 stderr：{shown}");
+    }
+    Ok(raw)
+}
+
+/// 虚拟 Bot「✨ 生成」提示词（8-20 需求）：根据角色/任务名让 LLM 写系统提示词
+/// （群介绍，≤100 字符）。轻量单轮 CLI 调用（one_shot_text）。输出：去空行 + 截断
+/// 100 字符（char 安全，truncate 语义）。
+pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
+    let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
+              系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
+              不要解释、不要引号、不要“角色名：”前缀。";
+    let raw = one_shot_text(backend, sys, &format!("角色/任务名称：{role_name}"), 60).await?;
+    let text = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default();
+    if text.is_empty() {
+        anyhow::bail!("生成结果为空（后端无输出）");
     }
     Ok(truncate(&text, 100).to_string())
 }
