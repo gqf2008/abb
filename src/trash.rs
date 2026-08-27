@@ -9,8 +9,9 @@
 //!   agent-bridge trash purge [--older-than N] 清理超期条目（tidy 每日自动调；也可手动）
 //! ```
 //!
-//! 目录形态：`.trash/<yyyyMMdd-HHmmss>-<flatname>/`，条目内放 `.abb-trash.json`
-//! manifest（原相对路径 + 移动时间 + 大小），restore 据此定位，不依赖名字解析。
+//! 目录形态：`.trash/<yyyyMMdd-HHmmss>-<flatname>/`，条目内 `content/` 子目录放原内容
+//!（保持原名，杜绝与 manifest 名冲突）+ `manifest.json`（原相对路径 + 移动时间 + 大小 +
+//! 类型），restore 据此定位，不依赖名字解析。
 //!
 //! 安全边界：
 //! - 只操作 workspace 内路径；源路径经 `canonical_in_workspace` 校验（防 symlink 逃逸）。
@@ -96,10 +97,13 @@ pub fn trash_path(workspace: &Path, src: &str) -> Result<String, String> {
 
     let trash = trash_dir(workspace);
     std::fs::create_dir_all(&trash).map_err(|e| format!("创建回收站失败：{e}"))?;
-    // 条目 = 目录（源是文件时包一层）：.trash/<ts>-<flatname>/
+    // 条目 = 目录：.trash/<ts>-<flatname>/
+    // 内容统一放进 content/ 子目录（保持原名）——杜绝「源文件名 == manifest 名」时
+    // manifest 覆盖源内容的冲突（审查发现：源叫 .abb-trash.json 会丢数据）。
     let dest_dir = unique_entry_dir(&trash, rel);
-    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("创建回收站条目失败：{e}"))?;
-    let dest = dest_dir.join(rel.file_name().unwrap_or_default());
+    let content_dir = dest_dir.join("content");
+    std::fs::create_dir_all(&content_dir).map_err(|e| format!("创建回收站条目失败：{e}"))?;
+    let dest = content_dir.join(rel.file_name().unwrap_or_default());
     let is_dir = full_canon.is_dir();
     std::fs::rename(&full_canon, &dest).map_err(|e| format!("移入回收站失败（{}）：{e}", src))?;
     let moved_at = crate::chrono_lite::unix_secs();
@@ -217,7 +221,7 @@ pub fn list_entries(workspace: &Path) -> Vec<TrashEntry> {
             });
         }
     }
-    out.sort_by(|a, b| b.moved_at.cmp(&a.moved_at));
+    out.sort_by_key(|a| std::cmp::Reverse(a.moved_at));
     out
 }
 
@@ -250,16 +254,13 @@ pub fn restore_entry(workspace: &Path, name: &str) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("重建父目录失败：{e}"))?;
     }
-    // 条目目录里取「非 manifest 的那一项」（文件或目录，trash 时保持原名移入）移回 dest；
-    // 再清空条目目录。目录条目整体 rename 会多包一层原名（trash 时内容在 条目目录/原名 下）。
+    // 条目内容在 content/ 子目录（保持原名移入，防与 manifest 名冲突）——取其中唯一一项移回
+    // dest，再清空条目目录。
+    let content_dir = entry_dir.join("content");
     let mut found: Option<PathBuf> = None;
-    if let Ok(rd) = std::fs::read_dir(&entry_dir) {
+    if let Ok(rd) = std::fs::read_dir(&content_dir) {
         for e in rd.flatten() {
-            let p = e.path();
-            if p.file_name().and_then(|n| n.to_str()) == Some(MANIFEST_NAME) {
-                continue;
-            }
-            found = Some(p);
+            found = Some(e.path());
             break;
         }
     }
@@ -274,7 +275,7 @@ pub fn restore_entry(workspace: &Path, name: &str) -> Result<(), String> {
 pub fn purge_expired(workspace: &Path, ttl_days: u64) -> usize {
     let now = crate::chrono_lite::unix_secs();
     let cutoff = now.saturating_sub(ttl_days * 24 * 3600);
-    let entries = list_entries(&workspace);
+    let entries = list_entries(workspace);
     let mut removed = 0;
     for e in entries {
         if e.moved_at < cutoff {
@@ -453,6 +454,24 @@ mod tests {
             fs::read_to_string(ws.join("proj/src/main.rs")).unwrap(),
             "fn main(){}",
             "目录恢复层级必须与原路径一致"
+        );
+
+        fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn trash_manifest_name_conflict_survives() {
+        // 回归（审查发现）：源文件名恰为 manifest 名时，内容必须原样保留——
+        // 内容现在放 content/ 子目录，与 manifest 隔离，不可能互相覆盖。
+        let ws = tmp_ws("manifest-conflict");
+        fs::write(ws.join(MANIFEST_NAME), b"real-content").unwrap();
+
+        let name = trash_path(&ws, MANIFEST_NAME).unwrap();
+        restore_entry(&ws, &name).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.join(MANIFEST_NAME)).unwrap(),
+            "real-content",
+            "源内容不得被 manifest 覆盖"
         );
 
         fs::remove_dir_all(&ws).ok();

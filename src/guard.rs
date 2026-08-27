@@ -449,6 +449,11 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
 /// #88 删除保护：检测删除类命令，命中 → 指引式拒绝（改走回收站 trash CLI）。
 /// 供 granted 完整检查与 owner 删除保护共用。复合命令（split_shell 失败）不在此判断——
 /// granted 由 check_bash 的复合语法拒绝兜底；owner 对复合命令放行（不卡 owner 正常工作）。
+///
+/// 软保护说明（非安全边界）：仅精确匹配 argv[0]（rm/rmdir/del/erase/rd）——
+/// `/bin/rm`、`sudo rm`、`command rm`、`rm` 带 env 前缀等形态可绕过；owner 会话的删除
+/// 保护语义是「指引式」（agent 被引导走 trash），不是强制闸。绝对路径/变体形态的强制
+/// 拦截留待 #92 codex 收敛后统一（codex 无 hook，需沙箱/命令层方案）。
 fn check_delete_command(input: &serde_json::Value) -> Decision {
     let Some(cmd) = input["command"].as_str() else {
         return Decision::Allow;
