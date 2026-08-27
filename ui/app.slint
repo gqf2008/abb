@@ -862,6 +862,173 @@ export component VirtualBotDialog inherits Window {
     }
 }
 
+// #124 一键创建团队弹窗（P2）。三态：0=目标输入 → 1=方案预览 → 2=创建结果。
+// mock 阶段：生成/确认为预设数据（后端 #123 修复后换真数据流），UI 骨架先定型。
+// 视觉规范：#98 token（UiTokens.ok/warn/error/info + text-dim）、4px 圆角、12px 起、不用 emoji。
+export struct TeamRoleRow {
+    role-name: string,   // 角色名
+    member: string,      // 成员名（""=待任命）
+    duty: string,        // 职责摘要
+}
+// 创建结果行：ok=true 成功（绿）/ false 失败（红）
+export struct TeamResultRow {
+    text: string,
+    ok: bool,
+}
+export component TeamDialog inherits Window {
+    title: root.window-title;
+    width: 560px;
+    height: 560px;
+    preferred-width: 560px;
+    preferred-height: 560px;
+    background: PixelTheme.bg;
+
+    in-out property <string> window-title: "一键创建团队";
+    in-out property <string> bot-label: "";       // 归属 bot 展示名
+    // 模式：0=目标输入 1=方案预览 2=创建结果
+    in-out property <int> mode: 0;
+    in-out property <string> target-input: "";
+    in-out property <string> team-name: "";
+    in-out property <string> flow: "";
+    in-out property <[TeamRoleRow]> roles: [];
+    in-out property <[TeamResultRow]> results: [];
+    in-out property <bool> busy: false;            // 创建中（防连点 + 加载提示）
+
+    callback close-clicked();      // 关闭（结果态 = 完成）
+    callback generate-clicked();   // 模式0 → 生成方案
+    callback confirm-clicked();    // 模式1 → 确认创建
+    callback back-clicked();       // 模式1 → 回模式0 修改目标
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: PixelTheme.bg;
+        VerticalBox {
+            padding-top: 16px; padding-right: 16px; padding-bottom: 16px; padding-left: 16px;
+            spacing: 10px;
+
+            // ── 标题行 ──
+            HorizontalBox {
+                spacing: 8px;
+                ImageIcon { icon: @image-url("icons/plus.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                Text {
+                    text: root.window-title + "（" + root.bot-label + "）";
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: PixelTheme.text;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ── 模式 0：目标输入 ──
+            if root.mode == 0: VerticalBox {
+                spacing: 8px;
+                Text { text: "一句话描述你的团队目标"; font-size: 12px; color: PixelTheme.text.with-alpha(0.7); }
+                PixelTextArea {
+                    text: root.target-input;
+                    placeholder: "如：做一个记账 App，需要产品、UI、开发、测试";
+                    frame-height: 90px;
+                    enabled: !root.busy;
+                    edited => { root.target-input = self.text; }
+                }
+                Text { text: "生成方案后可在预览中调整角色与成员（成员分配功能开发中，当前为待任命）"; font-size: 12px; color: UiTokens.text-dim; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalBox {
+                    alignment: center;
+                    spacing: 10px;
+                    PixelButton { text: "取消"; variant: "ghost"; enabled: !root.busy; clicked => { root.close-clicked(); } }
+                    PixelButton { text: "生成方案"; variant: "primary"; enabled: root.target-input != "" && !root.busy; clicked => { root.generate-clicked(); } }
+                }
+            }
+
+            // ── 模式 1：方案预览 ──
+            if root.mode == 1: VerticalBox {
+                spacing: 8px;
+                Text { text: "团队「" + root.team-name + "」方案预览"; font-size: 14px; font-weight: 700; color: PixelTheme.text; }
+                Rectangle {
+                    border-radius: 4px;
+                    background: PixelTheme.panel;
+                    border-width: 1px;
+                    border-color: PixelTheme.edge;
+                    PixelScrollPanel {
+                        height: 230px;
+                        VerticalBox {
+                            width: 100%;
+                            spacing: 6px;
+                            for r[i] in root.roles: HorizontalBox {
+                                spacing: 8px;
+                                Text {
+                                    text: r.role-name + "（" + (r.member == "" ? "待任命" : r.member) + "）";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: PixelTheme.text;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: r.duty;
+                                    font-size: 12px;
+                                    color: UiTokens.text-dim;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            if root.roles.length == 0: Text { text: "（方案为空，点「修改」重新生成）"; font-size: 12px; color: UiTokens.text-dim; }
+                        }
+                    }
+                }
+                if root.flow != "": Text { text: "协作流程：" + root.flow; font-size: 12px; color: UiTokens.text-dim; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalBox {
+                    alignment: center;
+                    spacing: 10px;
+                    PixelButton { text: "修改"; variant: "ghost"; clicked => { root.back-clicked(); } }
+                    PixelButton { text: "取消"; variant: "ghost"; clicked => { root.close-clicked(); } }
+                    PixelButton { text: "确认创建"; variant: "primary"; clicked => { root.confirm-clicked(); } }
+                }
+            }
+
+            // ── 模式 2：创建结果 ──
+            if root.mode == 2: VerticalBox {
+                spacing: 8px;
+                if root.busy: Text { text: "正在创建角色群…"; font-size: 13px; font-weight: 600; color: UiTokens.info; }
+                if !root.busy: Text {
+                    text: "团队「" + root.team-name + "」创建完成";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: UiTokens.ok;
+                }
+                if !root.busy: Rectangle {
+                    border-radius: 4px;
+                    background: PixelTheme.panel;
+                    border-width: 1px;
+                    border-color: PixelTheme.edge;
+                    PixelScrollPanel {
+                        height: 220px;
+                        VerticalBox {
+                            width: 100%;
+                            spacing: 4px;
+                            for r[i] in root.results: Text {
+                                text: r.text;
+                                font-size: 12px;
+                                color: r.ok ? UiTokens.ok : UiTokens.error;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalBox {
+                    alignment: center;
+                    spacing: 10px;
+                    PixelButton { text: "关闭"; variant: "primary"; enabled: !root.busy; clicked => { root.close-clicked(); } }
+                }
+            }
+        }
+    }
+}
+
 // 设置窗主体。
 export component SettingsWindow inherits Window {
     // 像素风自绘窗口：无系统边框/红绿灯，PixelTitleBar 自绘标题栏（拖拽/最小化/最大化/关闭）
@@ -1050,6 +1217,7 @@ export component SettingsWindow inherits Window {
     callback virtual-bot-deregister(int); // ⋯ 菜单：取消登记（轻确认）
     callback virtual-bot-disband(int);    // ⋯ 菜单：解散群（红色强确认，仅飞书）
     callback virtual-bot-refresh();       // ⟳ 刷新：验证登记群存在性（平台解散兜底 + 历史归档）
+    callback team-create-clicked(int);    // #124 一键创建团队（P2，mock）→ 打开 TeamDialog
     // #74 历史记录页
     callback history-selection-changed(int);   // 选中某条 → Rust 侧记录（详情在 slint 内由 model 直接取）
     callback clear-history();                  // 「清除全部历史」→ Rust 侧弹二次确认
@@ -1823,6 +1991,26 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.virtual-bots.length == 0: Text { text: "暂无登记。点下方按钮一键建群（平台 API 失败时手动建群后「手动登记」）。"; font-size: 12px; color: UiTokens.text-dim; }
                                                 PixelButton { text: "＋ 创建虚拟 Bot"; clicked => { root.virtual-bot-create(root.selected); } }
+                                                // #124 一键创建团队（P2，mock 阶段）：一句话生成角色群方案，确认后批量建群。
+                                                // 视觉：PixelCard 外壳 + 现有 token；按钮与「创建虚拟 Bot」并列，主操作优先。
+                                                Rectangle {
+                                                    border-radius: 4px;
+                                                    background: PixelTheme.bg;
+                                                    border-width: 1px;
+                                                    border-color: PixelTheme.edge;
+                                                    HorizontalBox {
+                                                        padding: 10px;
+                                                        spacing: 10px;
+                                                        ImageIcon { icon: @image-url("icons/plus.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                                                        VerticalBox {
+                                                            horizontal-stretch: 1;
+                                                            spacing: 2px;
+                                                            Text { text: "一键创建团队"; font-size: 13px; font-weight: 700; color: PixelTheme.text; }
+                                                            Text { text: "一句话生成角色群方案，确认后批量建群（当前为预览版）"; font-size: 12px; color: UiTokens.text-dim; wrap: word-wrap; }
+                                                        }
+                                                        PixelButton { text: "去创建"; variant: "primary"; clicked => { root.team-create-clicked(root.selected); } }
+                                                    }
+                                                }
                                                 if root.bots[root.selected].kind == "dingtalk": Text {
                                                     text: "钉钉提示：机器人建群能力待平台实测；失败时手动建群（群名=角色名）后走弹窗「手动登记」。钉钉群无「群介绍」字段，角色提示词只能注入群名。";
                                                     font-size: 12px; color: UiTokens.warn; wrap: word-wrap;
