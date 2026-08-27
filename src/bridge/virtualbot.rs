@@ -102,6 +102,31 @@ impl Bridge {
         // 打断/串行/会话/发送全部按 key 走——同一群不同话题互不串线。
         let key = ev.key();
 
+        // #87 暂停拦截：会话被 pause 后，新消息仍落消息库（可查）但不触发 agent、
+        // 不回复；话题消息回落 chat 前缀判定（暂停整个群 = 群内所有话题一并静音）。
+        // 暂停期消息不进 history——恢复后 agent 上下文不被暂停期内容污染，也不补发/重放。
+        if self.session_state.is_paused(&self.bot.key(), &key)
+            || self.session_state.is_paused(&self.bot.key(), &ev.chat_id)
+        {
+            self.msgstore.insert(
+                &self.bot.key(),
+                &ev.chat_id,
+                &ev.mid,
+                "user",
+                &ev.sender_id,
+                "",
+                &text,
+                ev.ts,
+            );
+            crate::log!(
+                "[bridge] 会话已暂停（#87），消息入库不回复 bot={} chat={} mid={}",
+                self.bot.key(),
+                trunc(&key, 16),
+                trunc(&ev.mid, 12)
+            );
+            return;
+        }
+
         // 打断拦截：停止词 → 叫停该 chat 正在跑的任务。必须在拿串行锁**之前**判断，
         // 否则会被排到运行中任务之后，等任务跑完才处理（那时打断就没意义了）。
         // 显式命令 /cancel /stop：有任务 → 打断；无任务 → 明确回复（不透传给 agent，避免

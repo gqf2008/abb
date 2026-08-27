@@ -31,6 +31,8 @@ mod schedule;
 mod service;
 mod session_gc;
 mod session_import;
+mod session_manage;
+mod session_state;
 mod sessions;
 mod single_instance;
 mod tasks;
@@ -769,6 +771,9 @@ fn run_session_import_cli(args: &[String]) -> i32 {
 fn run_session_cli(args: &[String]) -> i32 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
+        // #87 会话可观察/可管控（list/show/pause/resume/delete）由独立模块实现。
+        // 原有 reset（#23）保持原逻辑不变。
+        "list" | "show" | "pause" | "resume" | "delete" => crate::session_manage::run(args),
         "reset" => {
             let bot_key = match resolve_bot_key() {
                 Ok(k) => k,
@@ -810,7 +815,7 @@ fn run_session_cli(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!(
-                "用法：\n  agent-bridge session reset <chat_id>（bot 取 AGENT_BRIDGE_BOT_KEY，chat 缺省取 AGENT_BRIDGE_CHAT_ID）"
+                "用法：\n  agent-bridge session list [--bot <名>] [--state active|paused|gc-pending] [--active-days N] [--paused]\n  agent-bridge session show <chat_id> [--last N] [--since YYYY-MM-DD] [--bot <名>]\n  agent-bridge session pause <chat_id> [--bot <名>]\n  agent-bridge session resume <chat_id> [--bot <名>]\n  agent-bridge session delete <chat_id> [--purge] [--yes] [--bot <名>]\n  agent-bridge session reset <chat_id>（bot 取 AGENT_BRIDGE_BOT_KEY，chat 缺省取 AGENT_BRIDGE_CHAT_ID）"
             );
             1
         }

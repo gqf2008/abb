@@ -270,6 +270,28 @@ impl Router {
             .await;
             return;
         };
+        // #87 暂停拦截：目标会话被 pause → 拒绝投递并回源提示（不静默丢）。
+        // 覆盖 deliver CLI 与定时任务多目标（job_target_items）两条路径；
+        // 暂停期消息不入队不发送，源会话收到明确原因。
+        if crate::session_state::SessionState::production()
+            .is_paused(&item.target_bot, &item.target_chat)
+        {
+            crate::log!(
+                "[deliver] 拒绝投递：目标会话已暂停（#87）bot={} chat={} id={}",
+                tb,
+                tc,
+                tid
+            );
+            self.notify_source(
+                item,
+                &format!(
+                    "⚠️ 目标会话「{}」（bot {}）已暂停，投递被拒绝。恢复后再投（session resume）。",
+                    item.target_chat, item.target_bot
+                ),
+            )
+            .await;
+            return;
+        }
         // 先发文本，再逐个发附件（附件失败只回源报错，附件无 outbox 文本可补）。
         if !item.text.is_empty() {
             if let Err(e) = msgr.send_text(&item.target_chat, &item.text).await {

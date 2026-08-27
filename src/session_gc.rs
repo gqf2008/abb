@@ -200,12 +200,40 @@ pub async fn run_once_with_days(
 /// 枚举过期候选 chat key（会话归纳用）：读 sessions.json 的槽位，history jsonl 的
 /// 内容 ts 距今超 `days` 才入选；无历史文件/空/新鲜跳过。最久未活跃优先（排序稳定）。
 pub fn select_candidates_in(workspace: &Path, now: u64, days: u32) -> Vec<String> {
+    select_candidates_in_with_state(
+        workspace,
+        now,
+        days,
+        &crate::session_state::SessionState::production(),
+    )
+}
+
+/// 可测核心：暂停态由调用方注入（生产 = production；测试注入临时 session_state，
+/// 不碰真实 ~/.agent-bridge/session_state.json）。
+pub(crate) fn select_candidates_in_with_state(
+    workspace: &Path,
+    now: u64,
+    days: u32,
+    state: &crate::session_state::SessionState,
+) -> Vec<String> {
     // 复用 SessionStore 的解析（新格式/旧扁平迁移/刷新签名单一来源，不绕行裸读
     // sessions.json——schema 演进只改一处；审查修复）。无槽位文件 → 空（常态）。
     let store = crate::sessions::SessionStore::at("claude", workspace.join("sessions.json"));
     let cutoff = now.saturating_sub(u64::from(days.max(1)) * 86400);
+    // #87 暂停豁免：暂停会话不参与 GC（用户显式想保留，不应被静默归纳回收）。
+    // 暂停期消息不入 history → last_ts 不再推进，若不豁免必然下一轮入选。
+    // bot_key = workspace 目录名（workspace_dir(bot_key) 的末段）；测试临时目录
+    // 无对应暂停记录，lookup 自然不命中。
+    let bot_key = workspace
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     let mut out: Vec<(u64, String)> = Vec::new();
     for key in store.chat_keys() {
+        if state.is_paused(&bot_key, &key) {
+            continue;
+        }
         let hist = crate::history::History::open_in(&workspace.join("history"), &key);
         let Some(last) = hist.last_ts() else {
             continue; // 无历史文件/空 → 跳过（已归纳清理过的会话不再进候选）
@@ -426,6 +454,30 @@ mod tests {
             vec!["oc_stale_old", "oc_stale_new"],
             "只选过期且最久优先"
         );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn paused_chat_is_exempt_from_gc_candidates() {
+        // #87：暂停会话不参与 GC（即使已超 session_gc_days）
+        let ws = temp_ws("paused");
+        let now = crate::chrono_lite::unix_secs();
+        let bot_key = ws.file_name().unwrap().to_str().unwrap().to_string();
+        seed_chat(&ws, "oc_stale_paused", now - 30 * 86400);
+        seed_chat(&ws, "oc_stale_free", now - 30 * 86400);
+        // 注入临时暂停态：暂停 stale_paused
+        let state_path =
+            std::env::temp_dir().join(format!("abb-gc-paused-{}.json", uuid::Uuid::new_v4()));
+        let state = crate::session_state::SessionState::at(state_path.clone());
+        state.pause(&bot_key, "oc_stale_paused", "test");
+
+        let cands = select_candidates_in_with_state(&ws, now, 7, &state);
+        assert_eq!(
+            cands,
+            vec!["oc_stale_free"],
+            "暂停会话被豁免，仅未暂停的过期会话入选"
+        );
+        let _ = std::fs::remove_file(&state_path);
         std::fs::remove_dir_all(&ws).ok();
     }
 

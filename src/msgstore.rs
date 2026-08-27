@@ -208,6 +208,109 @@ impl MsgStore {
             }
         }
     }
+
+    /// 按 (bot_key, chat_id) 聚合的消息统计（#87 session list 数据源）。
+    /// 消息量按 chat_id 粒度（msgstore 只记原始 chat_id，话题消息同属其群）；
+    /// 库不存在/损坏返回空。
+    pub fn chat_stats(&self) -> Vec<ChatStats> {
+        if !self.path.exists() {
+            return Vec::new();
+        }
+        let con = match Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log!("[msgstore] 只读打开失败: {e:#}");
+                return Vec::new();
+            }
+        };
+        let cutoff = crate::chrono_lite::unix_secs() as i64 - 7 * 86400;
+        let mut stmt = match con.prepare(
+            "SELECT bot_key, chat_id,
+                    SUM(CASE WHEN ts >= ?1 THEN 1 ELSE 0 END),
+                    COUNT(*),
+                    MAX(ts)
+             FROM messages GROUP BY bot_key, chat_id",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log!("[msgstore] chat_stats 查询失败: {e:#}");
+                return Vec::new();
+            }
+        };
+        stmt.query_map(rusqlite::params![cutoff], |r| {
+            Ok(ChatStats {
+                bot_key: r.get(0)?,
+                chat_id: r.get(1)?,
+                count_7d: r.get(2)?,
+                count_total: r.get(3)?,
+                last_ts: r.get(4)?,
+            })
+        })
+        .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+        .unwrap_or_default()
+    }
+
+    /// 删除某 bot 某 chat 的全部消息记录（#87 session delete --purge），返回删除条数。
+    pub fn delete_chat(&self, bot_key: &str, chat_id: &str) -> u64 {
+        let Some(con) = self.open_writer() else {
+            return 0;
+        };
+        match con.execute(
+            "DELETE FROM messages WHERE bot_key = ?1 AND chat_id = ?2",
+            rusqlite::params![bot_key, chat_id],
+        ) {
+            Ok(n) => n as u64,
+            Err(e) => {
+                crate::log!("[msgstore] 删除会话消息失败: {e:#}");
+                0
+            }
+        }
+    }
+
+    /// 某 chat 的消息量 + 时间范围（#87 session delete 二次确认展示）。
+    /// 返回 (条数, 最早 ts, 最晚 ts)；无记录返回 (0, None, None)。
+    pub fn chat_count_and_range(
+        &self,
+        bot_key: &str,
+        chat_id: &str,
+    ) -> (u64, Option<i64>, Option<i64>) {
+        if !self.path.exists() {
+            return (0, None, None);
+        }
+        let con = match Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log!("[msgstore] 只读打开失败: {e:#}");
+                return (0, None, None);
+            }
+        };
+        let mut stmt = match con.prepare(
+            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM messages WHERE bot_key = ?1 AND chat_id = ?2",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log!("[msgstore] chat_count 查询失败: {e:#}");
+                return (0, None, None);
+            }
+        };
+        stmt.query_row(rusqlite::params![bot_key, chat_id], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?))
+        })
+        .unwrap_or((0, None, None))
+    }
+}
+
+/// 单条会话消息统计（#87 session list 用）。
+#[derive(Debug, Clone)]
+pub struct ChatStats {
+    pub bot_key: String,
+    pub chat_id: String,
+    /// 近 7 天消息数。
+    pub count_7d: i64,
+    /// 总消息数。
+    pub count_total: i64,
+    /// 最后一条消息时间（unix 秒）。
+    pub last_ts: Option<i64>,
 }
 
 /// 消费 GUI 命令文件（跨进程队列，先例：deliveries.json 的令牌语义；这里是「存在即消费」——
@@ -349,6 +452,58 @@ mod tests {
         s.insert("b2", "c2", "m2", "user", "ou_2", "", "y", 200);
         assert_eq!(s.clear_all(), 2);
         assert!(s.list_recent(10).is_empty());
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn chat_stats_aggregates_per_bot_and_chat() {
+        let s = MsgStore::at(temp_path("stats"));
+        let now = crate::chrono_lite::unix_secs() as i64;
+        // b1/c1：2 条（1 条近 7 天）；b1/c2：1 条（10 天前）；b2/c1：1 条
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "a", now - 86400);
+        s.insert("b1", "c1", "m2", "assistant", "ou_1", "", "b", now);
+        s.insert("b1", "c2", "m3", "user", "ou_1", "", "c", now - 10 * 86400);
+        s.insert("b2", "c1", "m4", "user", "ou_2", "", "d", now);
+        let stats = s.chat_stats();
+        assert_eq!(stats.len(), 3);
+        let c1 = stats
+            .iter()
+            .find(|x| x.bot_key == "b1" && x.chat_id == "c1")
+            .unwrap();
+        assert_eq!(c1.count_total, 2);
+        assert_eq!(c1.count_7d, 2, "两条都在 7 天内");
+        let c2 = stats
+            .iter()
+            .find(|x| x.bot_key == "b1" && x.chat_id == "c2")
+            .unwrap();
+        assert_eq!(c2.count_total, 1);
+        assert_eq!(c2.count_7d, 0, "10 天前的消息不计入 7 天");
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn delete_chat_removes_only_target_chat() {
+        let s = MsgStore::at(temp_path("delchat"));
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100);
+        s.insert("b1", "c1", "m2", "assistant", "ou_1", "", "y", 101);
+        s.insert("b1", "c2", "m3", "user", "ou_1", "", "z", 102);
+        assert_eq!(s.delete_chat("b1", "c1"), 2);
+        let rows = s.list_recent(10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chat_id, "c2", "其它会话不受影响");
+        let _ = std::fs::remove_file(&s.path);
+    }
+
+    #[test]
+    fn chat_count_and_range_reports_impact() {
+        let s = MsgStore::at(temp_path("range"));
+        assert_eq!(s.chat_count_and_range("b1", "c1"), (0, None, None));
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100);
+        s.insert("b1", "c1", "m2", "assistant", "ou_1", "", "y", 200);
+        let (n, min, max) = s.chat_count_and_range("b1", "c1");
+        assert_eq!(n, 2);
+        assert_eq!(min, Some(100));
+        assert_eq!(max, Some(200));
         let _ = std::fs::remove_file(&s.path);
     }
 }
