@@ -858,6 +858,8 @@ mod tests {
         /// 一次性 claude already-in-use 自愈模拟：run 内把槽位 CAS 换成该 sid 并返回
         /// 之（等价 reset_session 换 UUID + started 复位后再 mark 的最终状态）。
         heal_to_sid: Mutex<Option<String>>,
+        /// #130：前 N 次 run 返回 Err(err)，随后正常 Reply（上下文压缩重试测试用）。
+        fail_then_reply: Mutex<Option<(usize, String)>>,
     }
     impl MockAgentRunner {
         fn blocking(reply: &str) -> Self {
@@ -872,7 +874,12 @@ mod tests {
                 roles: Mutex::new(Vec::new()),
                 rebuilt_left: std::sync::atomic::AtomicUsize::new(0),
                 heal_to_sid: Mutex::new(None),
+                fail_then_reply: Mutex::new(None),
             }
+        }
+        /// #130：前 n 次调用返回 Err(err)，随后正常 Reply。
+        fn fail_then_reply(&self, n: usize, err: &str) {
+            *self.fail_then_reply.lock().unwrap() = Some((n, err.to_string()));
         }
         fn set_rebuilt_rounds(&self, n: usize) {
             self.rebuilt_left
@@ -971,6 +978,13 @@ mod tests {
                     } => {
                         return Ok(agent::RunOutcome::Cancelled);
                     }
+                }
+            }
+            // #130：前 N 次失败后正常（fail_then_reply 优先于 outcome）
+            if let Some((n, err)) = self.fail_then_reply.lock().unwrap().as_mut() {
+                if *n > 0 {
+                    *n -= 1;
+                    return Err(err.clone());
                 }
             }
             // 返回本次运行使用的 session_id——bridge 据此做 mark_started_if 身份校验
@@ -1246,6 +1260,96 @@ mod tests {
             .unwrap();
         assert!(!runner.prompts()[1].contains("[历史上下文]"), "不重复注入");
         assert!(!msgr.sent()[1].contains("已携带"), "第二轮无提示");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #130：上下文超长 → 自动压缩（旧段摘要 + 近期原文）→ 换新会话重试一次，
+    /// 回复前置压缩提示；原历史保留不删；二次超长（已压缩过）不重复压缩。
+    #[tokio::test]
+    async fn context_too_long_auto_compresses_and_retries() {
+        let runner = Arc::new(MockAgentRunner::immediate("压缩后重试成功"));
+        // 首次 run 失败（超长），随后的摘要任务/重试均正常
+        runner.fail_then_reply(1, "claude: prompt is too long (context window exceeded)");
+        let bot = backend_bot("claude");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        // 预写 14 轮历史（> keep_recent=10，触发压缩）
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        for i in 0..14 {
+            hist.append_user(&format!("u{i}"), "claude", &format!("第{i}轮用户问题"));
+            hist.append_assistant(&format!("u{i}"), "claude", &format!("第{i}轮回答"));
+        }
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "继续聊")).await })
+            .await
+            .unwrap();
+
+        let prompts = runner.prompts();
+        assert!(
+            prompts.len() >= 2,
+            "首轮失败 + 压缩重试（+摘要任务），实际 {} 次",
+            prompts.len()
+        );
+        // 首轮注入全量历史；重试轮注入压缩块 + 保留当前消息
+        assert!(
+            prompts[0].contains("[历史上下文]"),
+            "首轮全量历史: {}",
+            prompts[0]
+        );
+        let last = prompts.last().unwrap();
+        assert!(
+            last.contains("[历史上下文·压缩版]"),
+            "重试轮注入压缩块: {last}"
+        );
+        assert!(last.contains("继续聊"), "当前消息保留: {last}");
+        // 用户可见压缩提示 + 重试回复
+        assert!(
+            msgr.sent()[0].contains("已自动压缩"),
+            "回复带压缩提示: {}",
+            msgr.sent()[0]
+        );
+        assert!(msgr.sent()[0].contains("压缩后重试成功"));
+        // ctxsum 落盘（压缩块）+ 原历史保留
+        let workspace = crate::workspace_dir(&bot.key());
+        let sum = crate::contextsum::ctxsum_block_at(&workspace, "oc_x").expect("ctxsum 已写");
+        assert!(sum.contains("## 旧对话摘要"));
+        assert!(sum.contains("## 近期原文"));
+        assert_eq!(
+            crate::history::History::open(&bot.key(), "oc_x")
+                .entries()
+                .len(),
+            30, // 14 轮 + 本轮用户轮 + 重试成功的助手轮
+            "原历史保留不删"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// #130：已压缩过（ctxsum 存在）再超长 → 不重复压缩，错误原样返回（防循环）。
+    #[tokio::test]
+    async fn context_too_long_no_second_compression() {
+        let runner = Arc::new(MockAgentRunner::immediate("不应走到"));
+        runner.fail_then_reply(2, "codex: context length exceeded");
+        let bot = backend_bot("codex");
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
+        let hist = crate::history::History::open(&bot.key(), "oc_x");
+        for i in 0..14 {
+            hist.append_user(&format!("u{i}"), "codex", &format!("第{i}轮用户问题"));
+            hist.append_assistant(&format!("u{i}"), "codex", &format!("第{i}轮回答"));
+        }
+        // 预置 ctxsum（模拟已压缩过）
+        let workspace = crate::workspace_dir(&bot.key());
+        std::fs::write(
+            crate::contextsum::ctxsum_path(&workspace, "oc_x"),
+            "[历史上下文·压缩版]\n已压缩",
+        )
+        .unwrap();
+        let b = bridge.clone();
+        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "继续")).await })
+            .await
+            .unwrap();
+        // 只跑一次（不压缩不重试）；错误原样返回
+        assert_eq!(runner.prompts().len(), 1, "已压缩过不重试");
+        assert!(msgr.sent()[0].contains("context length exceeded"));
+        assert!(!msgr.sent()[0].contains("已自动压缩"), "无压缩提示");
         cleanup_bridge(&bridge);
     }
 

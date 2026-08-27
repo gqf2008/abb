@@ -12,6 +12,7 @@ mod botstatus;
 mod bridge;
 mod ccswitch;
 mod config;
+mod contextsum;
 mod deliver;
 mod deps;
 mod dingtalk;

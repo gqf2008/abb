@@ -379,6 +379,16 @@ fn default_true() -> bool {
     true
 }
 
+/// #130 压缩保留最近原文轮数默认值。
+fn default_ctx_keep_recent() -> usize {
+    10
+}
+
+/// #130 摘要分段大小默认值（条目数）。
+fn default_ctx_segment_size() -> usize {
+    8
+}
+
 /// #74 消息历史保留期默认值（天）。
 fn default_history_retention_days() -> u32 {
     30
@@ -698,6 +708,16 @@ pub struct Config {
     /// （历史记录仍照常落库，历史页不受影响）。默认 true。
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
+    /// 上下文超长自动分段压缩总开关（#130，默认开）：后端返回上下文超长错误时，自动把
+    /// 旧历史分段摘要压缩 + 保留近期原文，换新会话重试本条。关 = 行为与现状一致。
+    #[serde(default = "default_true")]
+    pub context_compress_enabled: bool,
+    /// 压缩时保留的最近原文轮数（#130，默认 10）。
+    #[serde(default = "default_ctx_keep_recent")]
+    pub context_keep_recent: usize,
+    /// 摘要分段大小：每段条目数（#130，默认 8；偶数化到轮对）。
+    #[serde(default = "default_ctx_segment_size")]
+    pub context_segment_size: usize,
     /// 每日会话归纳清理总开关（默认关）：service 每日把过期会话（按 session_gc_days
     /// 判定的最后活跃时间）交 bot 后端 agent 归纳成摘要存档（summaries/），再清理
     /// 工作区内历史/后端会话文件（绝不触碰 ~/.claude 等后端私有目录），摘要下次
@@ -745,6 +765,9 @@ impl Default for Config {
             owner_open_id: String::new(),
             default_backend: String::new(),
             cross_delivery_enabled: false,
+            context_compress_enabled: true, // #130 超长自动压缩默认开
+            context_keep_recent: default_ctx_keep_recent(),
+            context_segment_size: default_ctx_segment_size(),
             history_retention_days: default_history_retention_days(),
             notify_enabled: true,
             session_gc_enabled: false,
