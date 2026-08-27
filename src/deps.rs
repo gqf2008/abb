@@ -1,4 +1,4 @@
-//! 依赖检测与安装 —— claude / codex / pi / prime-agent / nodejs / python3 / lark-cli / dingtalk-cli。
+//! 依赖检测与安装 —— claude / codex / pi / nodejs / python3 / lark-cli / dingtalk-cli。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
 //! 安装命令按平台出（mac 用 brew/npm/curl 安装器，win 用 winget/npm，linux 用 apt/dnf/npm）。
 //! 本轮只验证 mac 路径；win/linux 编译可用、不行则给「请手动安装」文案。
@@ -18,6 +18,14 @@ use tokio::process::Command;
 pub fn apply_no_window(cmd: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x0800_0000);
+}
+
+/// tokio Command 版：spawn 外部子进程时抑制控制台窗口（CREATE_NO_WINDOW，#104）。
+/// tokio 的 Command 内部包 std Command，经 `as_std_mut()` 设同一标志位。
+#[cfg(windows)]
+pub fn apply_no_window_tokio(cmd: &mut tokio::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.as_std_mut().creation_flags(0x0800_0000);
 }
 
 /// 组 PATH：claude 在 ~/.local/bin，codex/lark-cli 在 ~/.npm-global/bin；launchd 环境精简须显式带。
@@ -213,9 +221,13 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// 升级态），缺失视为「需安装」。
 pub const MIN_CODEX_VERSION: &str = "0.140";
 
+/// #105 git 最低版本锁定：< 2.30 视为「需升级」（2.30 起覆盖后续安全修复；
+/// 删除保护 git 留痕（#88）与 tidy 每日整理（#104 已核实）都依赖 git）。
+pub const MIN_GIT_VERSION: &str = "2.30";
+
 #[derive(Debug, Clone)]
 pub struct DepStatus {
-    /// 机器键：claude | codex | pi | prime-agent | node | python3 | lark-cli | dingtalk-cli
+    /// 机器键：claude | codex | pi | node | python3 | lark-cli | dingtalk-cli
     pub id: &'static str,
     /// 展示名。
     pub label: &'static str,
@@ -232,7 +244,8 @@ pub struct DepStatus {
 
 /// 检测全部依赖。设置窗打开 + 「重新检测」时调。
 /// node 探 `node`；python 先试 `python3` 再 `python`；lark-cli 用于技能引导门控。
-/// codex 额外做版本探测（#93 最低版本锁定，见 MIN_CODEX_VERSION）。
+/// codex 额外做版本探测（#93 最低版本锁定，见 MIN_CODEX_VERSION）；
+/// git 额外做版本探测（#105 最低版本锁定，见 MIN_GIT_VERSION）。
 pub fn detect_all() -> Vec<DepStatus> {
     let probe = |id: &'static str, label: &'static str, names: &[&str]| -> DepStatus {
         for n in names {
@@ -276,31 +289,50 @@ pub fn detect_all() -> Vec<DepStatus> {
     } else {
         codex
     };
+    let git = probe("git", "Git", &["git"]);
+    let git = if git.found {
+        // git 版本探测失败保守按「可用」放行（与 codex 同权衡：能跑 git 就大概率能
+        // 跑 --version；按不满足会假阳性一直提示升级）。
+        match git_version(&git.path) {
+            Some(v) => DepStatus {
+                version: v.clone(),
+                version_ok: version_at_least(&v, MIN_GIT_VERSION),
+                ..git
+            },
+            None => DepStatus {
+                version: String::new(),
+                version_ok: true,
+                ..git
+            },
+        }
+    } else {
+        git
+    };
     vec![
         probe("claude", "Claude Code", &["claude"]),
         codex,
         // pi：npm 全局 bin（~/.npm-global/bin/pi，软链到 pi-coding-agent 的 cli.js）
         probe("pi", "Pi (pi-coding-agent)", &["pi"]),
-        // prime-agent：官方 curl 安装器装到 npm 全局 bin（~/.npm-global/bin/prime-agent）
-        probe(
-            "prime-agent",
-            "prime-agent (Prime Intellect)",
-            &["prime-agent"],
-        ),
         probe("node", "Node.js", &["node"]),
         probe("python3", "Python 3", &["python3", "python"]),
         probe("lark-cli", "lark-cli", &["lark-cli"]),
         // 钉钉 CLI（dingtalk-workspace-cli，命令名 dws）：接入钉钉 bot 后让 agent 调钉钉能力
         probe("dingtalk-cli", "dingtalk-cli (dws)", &["dws"]),
+        git,
     ]
 }
 
 /// 跑 `codex --version` 解析版本号。跑不通/非零退出 → None。
 pub fn codex_version(exe: &str) -> Option<String> {
-    let out = std::process::Command::new(exe)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    // Windows：依赖检测跑 codex --version 也抑制控制台窗口（#104），
+    // 否则每次「环境检测/一键安装」都会闪一个黑框。
+    #[cfg(windows)]
+    {
+        apply_no_window(&mut cmd);
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -327,6 +359,41 @@ pub fn codex_version_from_text(text: &str) -> Option<String> {
             tok.chars()
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect()
+        })
+}
+
+/// 跑 `git --version` 解析版本号。跑不通/非零退出 → None。
+pub fn git_version(exe: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    // Windows：检测也抑制控制台窗口（#104 同款——GUI 下跑 git --version 不闪黑框）。
+    #[cfg(windows)]
+    {
+        apply_no_window(&mut cmd);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    git_version_from_text(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 从 `git --version` 输出文本里提取版本号。输出形如 `git version 2.39.2.windows.1`
+/// → 返回 `2.39.2`（去平台后缀）；找不到形如 `d+.d+` 的 token → None。
+pub fn git_version_from_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|tok| {
+            tok.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>()
+        })
+        .map(|head| head.trim_end_matches('.').to_string())
+        .find(|head| {
+            !head.is_empty()
+                && head.split('.').count() >= 2
+                && head
+                    .split('.')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         })
 }
 
@@ -419,12 +486,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     ],
                 ),
             ],
-            // prime-agent：官方安装器（curl app.primeintellect.ai，README 标注 macOS/Linux）。
-            // 无 npm 公共包回落（官方文档明确：源码树里的 npm 标识不是公开安装路径）；
-            // 安装器要求 node 20.6+/npm——缺失时由一键装的 node 前置/跳过判定兜底。
-            "prime-agent" => vec![InstallStep::shell(
-                "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
-            )],
             "node" => vec![InstallStep::exec("brew", &["install", "node"])],
             "python3" => vec![InstallStep::exec("brew", &["install", "python"])],
             "lark-cli" => vec![InstallStep::exec(
@@ -443,6 +504,11 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     ],
                 ),
                 InstallStep::exec("brew", &["install", "dingtalk-workspace-cli"]),
+            ],
+            // git：brew 首选（可自动化）；无 brew 回落 xcode-select（弹系统安装对话框，需人工确认）。
+            "git" => vec![
+                InstallStep::exec("brew", &["install", "git"]),
+                InstallStep::shell("xcode-select --install"),
             ],
             other => return Err(format!("未知依赖：{other}")),
         };
@@ -468,12 +534,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     "@earendil-works/pi-coding-agent",
                 ],
             )],
-            // prime-agent：官方安装器只标 macOS/Linux（Windows 需 bash 环境，官方
-            // windows.md 指导装 Git for Windows 后走同一安装脚本）——桥不自动装，
-            // 给手动指引（deps 页「安装」按钮会展示该文案）。
-            "prime-agent" => {
-                return Err("prime-agent 官方安装器仅覆盖 macOS/Linux。Windows 请先安装 Git for Windows，再在 Git Bash 里运行：curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | bash".to_string());
-            }
             "node" => vec![InstallStep::exec("winget", &["install", "OpenJS.NodeJS"])],
             "python3" => vec![InstallStep::exec(
                 "winget",
@@ -486,6 +546,19 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
             "dingtalk-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "dingtalk-workspace-cli"],
+            )],
+            // git：winget 官方包（Git for Windows）静默安装——与 node/python 同款入口；
+            // 装完 WinGet\Links 里生成 git.exe 链接（composed_path 已含该目录），
+            // 无需重启 ABB 即可重新检测到（PATH 即时生效）。
+            "git" => vec![InstallStep::exec(
+                "winget",
+                &[
+                    "install",
+                    "Git.Git",
+                    "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ],
             )],
             other => return Err(format!("未知依赖：{other}")),
         };
@@ -511,10 +584,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     "@earendil-works/pi-coding-agent",
                 ],
             )],
-            // prime-agent：官方安装器（README 标注 macOS/Linux）；无 npm 公共包回落。
-            "prime-agent" => vec![InstallStep::shell(
-                "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
-            )],
             // linux 包管理器按二进制探测：优先 apt-get，其次 dnf。
             "node" => vec![InstallStep::shell(
                 "if command -v apt-get >/dev/null; then sudo apt-get install -y nodejs npm; \
@@ -533,6 +602,11 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
             "dingtalk-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "dingtalk-workspace-cli"],
+            )],
+            "git" => vec![InstallStep::shell(
+                "if command -v apt-get >/dev/null; then sudo apt-get install -y git; \
+                     elif command -v dnf >/dev/null; then sudo dnf install -y git; \
+                     else echo 'no-supported-pkg-mgr' >&2; exit 1; fi",
             )],
             other => return Err(format!("未知依赖：{other}")),
         };
@@ -562,9 +636,9 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
         match run_step(step).await {
             Ok(tail) => {
                 // 该步退出 0：再确认依赖真的可用了（有些安装器 0 退出但需重开 shell 才上 PATH）。
-                // #93：codex 装完还要过最低版本锁（npm 装到旧版缓存/降级场景少见，但过一下更稳）。
+                // #93/#105：codex/git 装完还要过最低版本锁（旧版缓存/降级场景少见，但过一下更稳）。
                 let ok_after = detect_one(dep_id)
-                    .map(|d| d.found && (dep_id != "codex" || d.version_ok))
+                    .map(|d| d.found && !((dep_id == "codex" || dep_id == "git") && !d.version_ok))
                     .unwrap_or(false);
                 if ok_after {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
@@ -763,9 +837,10 @@ const ALL_INSTALL_DEP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for d in deps {
-        // #93：codex 已装但版本低于最低锁定（MIN_CODEX_VERSION）也进清单——
-        // 一键安装/单项安装会重跑 npm/brew 升级到最新。其余依赖只看 found。
-        if !d.found || (d.id == "codex" && !d.version_ok) {
+        // #93/#105：codex/git 已装但版本低于最低锁定（MIN_CODEX_VERSION /
+        // MIN_GIT_VERSION）也进清单——一键安装/单项安装会重跑安装器升级到最新。
+        // 其余依赖只看 found。
+        if !d.found || ((d.id == "codex" || d.id == "git") && !d.version_ok) {
             ids.push(d.id.to_string());
         }
     }
@@ -779,14 +854,10 @@ pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     ids
 }
 
-/// 该依赖安装是否需要 node/npm 已就绪：① 安装计划首步用 npm（win 的 claude/pi 首步是
-/// npm；mac 的 claude/pi 是 curl shell 不依赖 node）；② prime-agent——curl 安装器内部
-/// 检查 node 20.6+/npm，无终端环境无法交互装 node 必失败。纯函数（内部调 install_plan），
+/// 该依赖安装是否需要 node/npm 已就绪：安装计划首步用 npm（win 的 claude/pi 首步是
+/// npm；mac 的 claude/pi 是 curl shell 不依赖 node）。纯函数（内部调 install_plan），
 /// 供「node 失败 → 跳过」判定。
 fn install_needs_node(dep_id: &str) -> bool {
-    if dep_id == "prime-agent" {
-        return true;
-    }
     install_plan(dep_id)
         .ok()
         .and_then(|steps| steps.into_iter().next())
@@ -824,7 +895,7 @@ pub fn format_all_summary(o: &AllInstallOutcome) -> String {
 
 /// 一键安装全部缺失组件（#60）。on_evt 在每项开始前同步调用（非 async 闭包，await
 /// 间隙之间触发）。策略：继续不中断 + 如实汇总；node 失败后跳过需 node/npm 的依赖
-/// （npm 首步计划 + prime-agent 安装器；mac 的 claude/pi 走 curl 原生路径不受影响）；
+/// （npm 首步计划；mac 的 claude/pi 走 curl 原生路径不受影响）；
 /// 每项 20 分钟超时。
 pub async fn install_all_missing(mut on_evt: impl FnMut(InstallEvt) + Send) -> AllInstallOutcome {
     let mut outcome = AllInstallOutcome::default();
@@ -1301,6 +1372,26 @@ mod tests {
     }
 
     #[test]
+    fn git_version_parses_cli_output() {
+        // git --version 实测输出形态（win 带平台后缀）：`git version 2.39.2.windows.1`。
+        assert_eq!(
+            git_version_from_text("git version 2.39.2.windows.1\n"),
+            Some("2.39.2".into())
+        );
+        assert_eq!(
+            git_version_from_text("git version 2.30.0"),
+            Some("2.30.0".into())
+        );
+        assert_eq!(git_version_from_text("git version"), None);
+        assert_eq!(git_version_from_text(""), None);
+        // 版本门：2.30 边界
+        assert!(version_at_least("2.30.0", MIN_GIT_VERSION));
+        assert!(version_at_least("2.39.2", MIN_GIT_VERSION));
+        assert!(!version_at_least("2.29.3", MIN_GIT_VERSION));
+        assert!(!version_at_least("1.9.5", MIN_GIT_VERSION));
+    }
+
+    #[test]
     fn missing_deps_includes_version_low_codex() {
         // 已装但版本过低 → 进缺失清单（升级路径）
         let low = DepStatus {
@@ -1388,11 +1479,11 @@ mod tests {
             "claude",
             "codex",
             "pi",
-            "prime-agent",
             "node",
             "python3",
             "lark-cli",
             "dingtalk-cli",
+            "git",
         ] {
             assert!(ids.contains(&want), "缺 {want}");
         }
@@ -1408,14 +1499,6 @@ mod tests {
         assert!(install_plan("lark-cli").is_ok());
         assert!(install_plan("dingtalk-cli").is_ok());
         assert!(install_plan("nope").is_err());
-        // prime-agent：mac/linux 走官方 curl 安装器；win 无自动安装（给手动 Git Bash 指引）
-        #[cfg(not(target_os = "windows"))]
-        assert!(install_plan("prime-agent").is_ok());
-        #[cfg(target_os = "windows")]
-        match install_plan("prime-agent") {
-            Err(err) => assert!(err.contains("Git Bash"), "win 给手动指引: {err}"),
-            Ok(_) => panic!("win 应无自动安装"),
-        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1503,7 +1586,6 @@ mod tests {
             dep("claude", true),
             dep("codex", false),
             dep("pi", false),
-            dep("prime-agent", true),
             dep("node", true),
             dep("python3", false),
             dep("lark-cli", true),
@@ -1546,11 +1628,6 @@ mod tests {
             assert!(install_needs_node("pi"));
             assert!(!install_needs_node("python3"), "win python3 走 winget");
         }
-        // prime-agent：curl 安装器内部要求 node 20.6+/npm → 恒 true（全平台）
-        assert!(
-            install_needs_node("prime-agent"),
-            "prime-agent 安装器要求 node/npm"
-        );
         // 未知 id：install_plan Err → false（不误跳过）
         assert!(!install_needs_node("no-such-dep"));
     }

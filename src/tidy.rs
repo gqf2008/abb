@@ -1,7 +1,7 @@
 //! 每日工作目录自动整理（tidy）——bot 配置页 per-bot 开关控制（默认关）。
 //!
 //! 每天整理 `workspaces/<bot_key>/` 五项内容（全部纯文件操作，绝不出工作区）：
-//! 1. **孤儿后端会话文件**：.pi-sessions / .prime-sessions 中不属于任何 live 会话
+//! 1. **孤儿后端会话文件**：.pi-sessions 中不属于任何 live 会话
 //!    槽位（sessions.json）且 mtime 超 [`ORPHAN_FRESH_SECS`]（24h——每日节奏下 fresh
 //!    文件在检查时最多 ~24h 新，24h 护栏 + live 集双保险，误删风险≈0；/new 的 10 分钟
 //!    护栏是即时清理语义，不适用于跨日扫描）。
@@ -33,13 +33,12 @@ pub const ARCHIVE_AGE_DAYS: u32 = 30;
 /// 结构目录：临时文件扫描 / 空目录清理 / 文档扫描一律跳过（绝不触碰）。
 /// attachments 是消息附件落地目录（下载中目录可能瞬时为空——walk 见空与删除之间文件
 /// 落地会删掉下载目标；且内含用户聊天媒体，与结构目录同待遇；审查修复）。
-const STRUCTURE_DIRS: [&str; 9] = [
+const STRUCTURE_DIRS: [&str; 8] = [
     ".git",
     "history",
     "sessions",
     "summaries",
     ".pi-sessions",
-    ".prime-sessions",
     "archive",
     "attachments",
     ".trash",
@@ -92,11 +91,6 @@ pub fn run_once(
         0
     } else {
         crate::agent::remove_pi_transcripts(
-            workspace,
-            live,
-            crate::agent::SidMatch::NotInSet,
-            Some(ORPHAN_FRESH_SECS),
-        ) + crate::agent::remove_prime_transcripts(
             workspace,
             live,
             crate::agent::SidMatch::NotInSet,
@@ -359,6 +353,12 @@ pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Windows：每日整理 spawn git.exe 也抑制控制台窗口（#104），
+        // 否则每天 git init/add/commit 都会闪一个黑框。
+        #[cfg(windows)]
+        {
+            crate::deps::apply_no_window_tokio(&mut cmd);
+        }
         match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
             Ok(Ok(o)) => Ok(o),
             Ok(Err(e)) => Err(format!("git {} 启动失败：{e}", args.join(" "))),
@@ -471,7 +471,6 @@ pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
 /// 运行时文件排除（缺失时写入；用户已有 .gitignore 不覆盖）。
 const GITIGNORE: &str = "\
 .pi-sessions/
-.prime-sessions/
 history/
 sessions/
 sessions.json
@@ -635,38 +634,22 @@ mod tests {
         std::fs::write(&p_live, "x").unwrap();
         std::fs::write(&p_old, "x").unwrap();
         std::fs::write(&p_fresh, "x").unwrap();
-        // prime：首行 {"id":...}；live 集含 prime_live
-        std::fs::create_dir_all(ws.join(".prime-sessions")).unwrap();
-        let q_live = ws.join(".prime-sessions/prime_live.jsonl");
-        let q_bad = ws.join(".prime-sessions/prime_bad.jsonl");
-        std::fs::write(&q_live, "{\"id\":\"prime_live\"}\n").unwrap();
-        std::fs::write(&q_bad, "{坏json\n").unwrap();
-        // 拨旧：dead_sid 与 prime_bad 拨旧到超 24h 护栏；live 保持新；fresh 拨旧 2h（未超护栏）
+        // 拨旧：dead_sid 拨旧到超 24h 护栏；live 保持新；fresh 拨旧 2h（未超护栏）
         set_mtime_old(&p_old, 30 * 3600);
-        set_mtime_old(&q_bad, 30 * 3600);
         set_mtime_old(&p_fresh, 2 * 3600);
 
-        let live: HashSet<String> = ["live_sid".into(), "prime_live".into()]
-            .into_iter()
-            .collect();
+        let live: HashSet<String> = ["live_sid".into()].into_iter().collect();
         // 孤儿清理 = 公共判定的 NotInSet 模式（与 /new、session_gc 同源，护栏 24h）
         let removed = crate::agent::remove_pi_transcripts(
             &ws,
             &live,
             crate::agent::SidMatch::NotInSet,
             Some(ORPHAN_FRESH_SECS),
-        ) + crate::agent::remove_prime_transcripts(
-            &ws,
-            &live,
-            crate::agent::SidMatch::NotInSet,
-            Some(ORPHAN_FRESH_SECS),
         );
-        assert_eq!(removed, 2, "只删 dead_sid 与 prime_bad（坏首行）");
+        assert_eq!(removed, 1, "只删 dead_sid（孤儿）");
         assert!(p_live.exists(), "live 集内不删");
         assert!(!p_old.exists(), "死 sid + 旧 mtime 删");
         assert!(p_fresh.exists(), "死 sid 但 mtime 新鲜不删（护栏）");
-        assert!(q_live.exists(), "prime live 不删");
-        assert!(!q_bad.exists(), "prime 首行损坏 + 旧 mtime 删");
         std::fs::remove_dir_all(&ws).ok();
     }
 

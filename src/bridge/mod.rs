@@ -928,15 +928,8 @@ mod tests {
             // 留文件（文件里已有该轮的注入块与消息）；mock 原只在 Reply 写盘，导致
             // 「失败后文件存在 → 不重复注入」的生产路径测试不可表达，T5 反而锁定了
             // 与生产矛盾的语义。写在 run 入口 = 所有 outcome（Reply/Fail/Cancel）都留盘。
-            // prime 同 pi（#67）：会话创建即落盘，mock 同等对待。
-            match backend {
-                Backend::Pi => {
-                    let _ = write_pi_session_file(bot_key, session_id);
-                }
-                Backend::PrimeAgent => {
-                    let _ = write_prime_session_file(bot_key, session_id);
-                }
-                _ => {}
+            if backend == Backend::Pi {
+                let _ = write_pi_session_file(bot_key, session_id);
             }
             // 先把中途输出推完（unbounded 即推即走），桥侧 select/收尾排空负责丢弃
             if let Some(tx) = &progress {
@@ -1004,34 +997,6 @@ mod tests {
                 "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
             ),
         )
-    }
-
-    /// #67：写一个形态正确的 prime 会话文件——与 pi 的差异仅在目录与文件名
-    /// （prime 文件名是 ULID，**不含**会话 id，探针按首行 id 匹配）。
-    /// 返回文件路径（/new 清理测试需要按文件断言存在性/拨旧 mtime）。
-    fn write_prime_session_file(bot_key: &str, sid: &str) -> std::io::Result<std::path::PathBuf> {
-        let dir = crate::workspace_dir(bot_key).join(".prime-sessions");
-        std::fs::create_dir_all(&dir)?;
-        let compact = sid.replace('-', "");
-        let stem = compact.get(..12).unwrap_or(&compact);
-        let path = dir.join(format!("01a00a5d-fc0a-760e-b9dc-{stem}.jsonl"));
-        std::fs::write(
-            &path,
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
-            ),
-        )?;
-        Ok(path)
-    }
-
-    /// 把文件 mtime 拨旧（1 小时前）——模拟不活跃会话/孤儿（/new 清理的 10 分钟护栏外）。
-    fn set_mtime_old(path: &std::path::Path) {
-        let f = std::fs::File::options().write(true).open(path).unwrap();
-        f.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)),
-        )
-        .unwrap();
     }
 
     fn test_ev(mid: &str, chat_id: &str, text: &str) -> Ev {
@@ -1294,52 +1259,6 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
-    /// #67：/new 后 prime 会话文件清理（审查 Important 修复）：删「首行 id 不属于任何
-    /// 存活槽位且 mtime 已过期」的文件——本聊天旧会话与失败轮孤儿回收；同 bot 其它
-    /// 聊天的活跃会话与在途新会话（mtime 新鲜）不得误删。
-    #[tokio::test]
-    async fn new_clears_prime_session_files() {
-        let runner = Arc::new(MockAgentRunner::immediate("ok"));
-        let bot = backend_bot("prime-agent");
-        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        let dir = crate::workspace_dir(&bot.key()).join(".prime-sessions");
-
-        // 本聊天既有会话（mtime 拨旧 = 已不活跃）→ /new 后应删
-        let sid = bridge.sessions.ensure_with_started("oc_x").0;
-        assert!(bridge.sessions.mark_started_if("oc_x", &sid));
-        let f_old = write_prime_session_file(&bot.key(), &sid).unwrap();
-        set_mtime_old(&f_old);
-        // 同 bot 其它聊天的活跃会话（存活槽位）→ 必须保留
-        let other_sid = bridge.sessions.ensure_with_started("oc_other").0;
-        let f_other = write_prime_session_file(&bot.key(), &other_sid).unwrap();
-        // 失败轮孤儿（id 不在任何槽位，mtime 旧）→ 应回收
-        let f_orphan = dir.join("01a00a5d-fc0a-760e-b9dc-orphan01.jsonl");
-        std::fs::write(
-            &f_orphan,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"orphan-dead-id\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}\n",
-        )
-        .unwrap();
-        set_mtime_old(&f_orphan);
-        // 在途新会话（id 未知、mtime 新鲜）→ 10 分钟护栏保留
-        let f_inflight = dir.join("01a00a5d-fc0a-760e-b9dc-inflight1.jsonl");
-        std::fs::write(
-            &f_inflight,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"inflight-unknown\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}\n",
-        )
-        .unwrap();
-
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("n1", "oc_x", "/new")).await })
-            .await
-            .unwrap();
-
-        assert!(!f_old.exists(), "本聊天旧会话文件已清");
-        assert!(f_other.exists(), "其它聊天活跃会话保留");
-        assert!(!f_orphan.exists(), "失败轮孤儿回收");
-        assert!(f_inflight.exists(), "在途（mtime 新鲜）不误删");
-        cleanup_bridge(&bridge);
-    }
-
     /// T4：会话已 started（切回旧后端场景）→ 直接 resume 原上下文，不注入。
     #[tokio::test]
     async fn resume_existing_session_skips_injection() {
@@ -1599,42 +1518,6 @@ mod tests {
         assert!(!m.pending && m.session_id == sid, "注入后 marker 复位");
 
         // msg2：mock 已模拟 pi 落盘（run 成功必写会话文件）→ 正常续聊不注入、无提示
-        let b2 = bridge.clone();
-        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
-            .await
-            .unwrap();
-        assert!(!runner.prompts()[1].contains("[历史上下文]"));
-        assert!(!msgr.sent()[1].contains("已携带"));
-        cleanup_bridge(&bridge);
-    }
-
-    /// #67：prime-agent 会话文件丢失 → resume 轮本轮直接注入（与 pi 探针同语义；
-    /// 差异只在探针目录/文件名——prime 文件名不含 sid，按首行 id 匹配）。
-    /// prime 对不可续聊目标另有 exit 1 + "No session found" 错误信号（run 重建兜底），
-    /// 探针先行可早一轮注入，两者互补。
-    #[tokio::test]
-    async fn prime_session_loss_injects_directly() {
-        let runner = Arc::new(MockAgentRunner::immediate("重建轮的回复"));
-        let bot = backend_bot("prime-agent");
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        let (hist, sid) = seed_migrated_session(&bridge, &bot, "oc_x");
-
-        // msg1：.prime-sessions 下无该 sid 文件 = 会话已丢失 → 本轮直接注入 + 提示
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "还在吗")).await })
-            .await
-            .unwrap();
-        assert!(
-            runner.prompts()[0].contains("[历史上下文]"),
-            "文件丢失本轮直接注入: {}",
-            runner.prompts()[0]
-        );
-        assert!(runner.prompts()[0].contains("旧背景"));
-        assert!(msgr.sent()[0].contains("已携带"));
-        let m = hist.marker().unwrap();
-        assert!(!m.pending && m.session_id == sid, "注入后 marker 复位");
-
-        // msg2：mock 已模拟 prime 落盘（ULID 文件名、首行 id 命中）→ 正常续聊不注入
         let b2 = bridge.clone();
         tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
             .await

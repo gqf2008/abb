@@ -258,7 +258,7 @@ fn main() {
     }
 
     // 历史会话迁移（#33）：agent-bridge session-import [--bot <key>] [--dry-run]。
-    // 把后端私有 session 文件（claude/codex/pi/prime）里的对话导入 ABB 的 history.rs，
+    // 把后端私有 session 文件（claude/codex/pi）里的对话导入 ABB 的 history.rs，
     // 让 #49 之前的老历史参与注入接续。幂等（已导入来源跳过），可重跑。
     // --dry-run 只统计不写入；退出码 0=全部成功 1=有失败/跳过。
     if args.len() >= 2 && args[1] == "session-import" {

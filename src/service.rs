@@ -231,7 +231,7 @@ async fn run_bot(
     }
 
     // #33 历史会话迁移**自动触发**：每次启动把后端私有 session 里尚未导入的对话
-    // （claude/codex/pi/prime）导入 history.rs——老历史参与注入接续，无需手动跑
+    // （claude/codex/pi）导入 history.rs——老历史参与注入接续，无需手动跑
     // `session-import`。幂等：imported.json 来源键标记，已导入来源秒跳过；追加式
     // 写入不触碰现有 history。spawn_blocking（fs 密集：读后端文件 + 提取 + 写）；
     // 失败仅 log 警告，绝不阻塞 bot 启动。
@@ -369,11 +369,7 @@ async fn run_bot(
                         &bridge.default_backend,
                         &key,
                     );
-                    store
-                        .live_session_ids("pi")
-                        .into_iter()
-                        .chain(store.live_session_ids("prime-agent"))
-                        .collect()
+                    store.live_session_ids("pi").into_iter().collect()
                 };
                 let report = crate::tidy::run_once(&workspace, now, days, &live);
                 write_run_marker(&marker, now);

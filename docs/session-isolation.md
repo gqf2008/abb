@@ -11,7 +11,7 @@
 
 ```
 sessions.json = { key: { claude: {session_id, started}, codex: {session_id, started},
-                        pi: {session_id, started}, prime_agent: {session_id, started} } }
+                        pi: {session_id, started} } }
 key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 ```
 
