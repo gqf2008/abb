@@ -131,6 +131,30 @@ enum UiCmd {
         bot_key: String,
         name: String,
     },
+    /// #141 一键创建团队（真实数据流）：LLM 生成团队方案（teambuilder），结果经 team_rx 回主线程。
+    TeamGenerate {
+        idx: i32,
+        bot_key: String,
+        target: String,
+    },
+    /// #141 确认建群：teamflow::create_team_groups（幂等）逐角色建群 + 登记，结果经 team_rx 回主线程。
+    TeamCreate {
+        idx: i32,
+        bot_key: String,
+        plan: String,
+    },
+}
+
+/// #141 一键创建团队结果（后台 → 主线程）。
+enum TeamEvt {
+    /// 生成完成：Ok(TeamPlan JSON) / Err(用户可操作错误文案)。
+    Generate {
+        result: std::result::Result<String, String>,
+    },
+    /// 确认建群完成：Ok(逐角色创建结果) / Err(整体错误)。
+    Create {
+        result: std::result::Result<Vec<(String, String, bool, String)>, String>,
+    },
 }
 
 /// 微信扫码登录的阶段结果（后台 → 主线程）。
@@ -210,6 +234,35 @@ fn kind_label(kind: &str) -> String {
         "dingtalk" => "钉钉".to_string(),
         other => other.to_string(),
     }
+}
+
+/// #141 团队方案 → 预览行（role_name, member, duty），供 TeamDialog 角色列表消费。
+/// member 为空 = 待任命（UI 显示占位）。
+fn team_plan_rows(plan: &crate::teambuilder::TeamPlan) -> Vec<(String, String, String)> {
+    plan.roles
+        .iter()
+        .map(|r| {
+            (
+                r.role_name.clone(),
+                r.member_name.clone().unwrap_or_default(),
+                r.system_prompt.clone(),
+            )
+        })
+        .collect()
+}
+
+/// #141 单角色创建结果行文案（成功/失败清单展示）：`角色（成员）→ 详情`。
+fn team_create_line(role_name: &str, member: &str, detail: &str) -> String {
+    format!(
+        "{}（{}）→ {}",
+        role_name,
+        if member.is_empty() {
+            "待任命"
+        } else {
+            member
+        },
+        detail
+    )
 }
 
 /// 把已查好的服务状态写进 Tray 属性。主线程调用（status 由调用方查，避免重复 fork ps）。
@@ -1308,6 +1361,12 @@ pub fn run_gui() -> Result<()> {
     let (prov_tx, prov_rx) = std_mpsc::channel::<(i32, std::result::Result<String, String>)>();
     // 虚拟 Bot 操作结果（创建/编辑/登记/解散/预填）
     let (vb_tx, vb_rx) = std_mpsc::channel::<VirtualBotEvt>();
+    // #141 一键创建团队结果（生成/建群）
+    let (team_tx, team_rx) = std_mpsc::channel::<TeamEvt>();
+    // #141 团队弹窗上下文：打开时记录 (bot 下标, bot_key)；生成/建群按下标从工作副本取最新 bot。
+    let team_ctx: Rc<RefCell<Option<(i32, String)>>> = Rc::new(RefCell::new(None));
+    // #141 当前生成的方案 JSON（确认建群时复用，避免二次生成）。
+    let team_plan: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     // 虚拟 Bot 弹窗的归属 bot 上下文（bot 下标, bot_key, kind）——打开时记录，
     // 点「创建」时按下标从工作副本取最新 app_id/app_secret（用户可能刚改过没保存）。
     let vb_ctx: Rc<RefCell<Option<(i32, String, String)>>> = Rc::new(RefCell::new(None));
@@ -2306,6 +2365,94 @@ pub fn run_gui() -> Result<()> {
                             }
                         });
                     }
+                    // #141 团队生成（真实 LLM 链路）：取该 bot 生效后端，生成方案后经 team_rx 回主线程。
+                    UiCmd::TeamGenerate {
+                        idx,
+                        bot_key,
+                        target,
+                    } => {
+                        let team_tx = team_tx.clone();
+                        tokio::spawn(async move {
+                            // 走该 bot 生效后端（与 GeneratePrompt 同口径）
+                            let backend = Config::load()
+                                .ok()
+                                .and_then(|c| {
+                                    c.bots.iter().find(|b| b.key() == bot_key).map(|b| {
+                                        b.effective_backend(&c.default_backend).to_string()
+                                    })
+                                })
+                                .unwrap_or_default();
+                            let r = crate::teambuilder::generate_team_plan(
+                                crate::agent::Backend::parse(&backend),
+                                &target,
+                                &[],
+                                None,
+                            )
+                            .await;
+                            let _ = team_tx.send(TeamEvt::Generate {
+                                result: r.map(|plan| {
+                                    serde_json::to_string(&plan).unwrap_or_default()
+                                }),
+                            });
+                            let _ = idx;
+                        });
+                    }
+                    // #141 确认建群：messenger::build + teamflow::create_team_groups（幂等），
+                    // 逐角色建群 + 登记，结果经 team_rx 回主线程。
+                    UiCmd::TeamCreate {
+                        idx,
+                        bot_key,
+                        plan,
+                    } => {
+                        let team_tx = team_tx.clone();
+                        tokio::spawn(async move {
+                            let r = async {
+                                let plan: crate::teambuilder::TeamPlan =
+                                    serde_json::from_str(&plan)
+                                        .map_err(|e| format!("方案解析失败：{e}"))?;
+                                let cfg = Config::load()
+                                    .map_err(|e| format!("读取配置失败：{e:#}"))?;
+                                let bot = cfg
+                                    .bots
+                                    .iter()
+                                    .find(|b| b.key() == bot_key)
+                                    .cloned()
+                                    .ok_or_else(|| "找不到该 bot 配置".to_string())?;
+                                let msgr =
+                                    crate::messenger::build(&bot).map_err(|e| format!("{e:#}"))?;
+                                // owner 平台 id（飞书建群必须拉进群；与 bridge/teamflow 同口径）
+                                let owner = if bot.is_wechat() {
+                                    bot.wx_user_id.clone()
+                                } else if bot.is_dingtalk() {
+                                    crate::config::first_owner_id(&bot.ding_owner_ids)
+                                        .unwrap_or_default()
+                                } else {
+                                    crate::config::first_owner_id(&bot.owner_open_id)
+                                        .unwrap_or_default()
+                                };
+                                if owner.is_empty() {
+                                    return Err("该 bot 未配置 owner（群主）：建群必须有群主。请在 bot 设置里填写 owner 白名单后重试。"
+                                        .to_string());
+                                }
+                                let outcomes = crate::teamflow::create_team_groups(
+                                    msgr.as_ref(),
+                                    &crate::virtualbot::VirtualBotStore::new(),
+                                    &bot_key,
+                                    &owner,
+                                    &plan,
+                                )
+                                .await;
+                                let rows: Vec<(String, String, bool, String)> = outcomes
+                                    .into_iter()
+                                    .map(|o| (o.role_name, o.member, o.ok, o.detail))
+                                    .collect();
+                                Ok(rows)
+                            }
+                            .await;
+                            let _ = team_tx.send(TeamEvt::Create { result: r });
+                            let _ = idx;
+                        });
+                    }
                 }
             }
         });
@@ -3153,6 +3300,8 @@ pub fn run_gui() -> Result<()> {
     {
         let td = team_dialog.as_weak();
         let work = work.clone();
+        let team_ctx = team_ctx.clone();
+        let team_plan = team_plan.clone();
         settings.on_team_create_clicked(move |idx| {
             let Some(d) = td.upgrade() else { return };
             let label = work
@@ -3166,6 +3315,12 @@ pub fn run_gui() -> Result<()> {
                     }
                 })
                 .unwrap_or_default();
+            // #141：记录归属 bot（生成/建群按下标取最新配置）
+            let bot_key = work.borrow().get(idx as usize).map(|b| b.key());
+            if let Some(k) = bot_key {
+                *team_ctx.borrow_mut() = Some((idx, k));
+            }
+            *team_plan.borrow_mut() = None; // 新会话清掉旧方案
             d.set_bot_label(label.into());
             d.set_mode(0);
             d.set_target_input("".into());
@@ -3183,79 +3338,45 @@ pub fn run_gui() -> Result<()> {
             show_window_and_focus(&d);
         });
     }
-    // 生成方案（mock：从目标文本取前 10 字符作团队名，固定 4 角色，成员待任命）
+    // 生成方案（#141 真实链路）：发 UiCmd::TeamGenerate，后台 LLM 生成，结果经 team_rx 回填。
     {
         let td = team_dialog.as_weak();
+        let tx = tx.clone();
+        let team_ctx = team_ctx.clone();
         team_dialog.on_generate_clicked(move || {
             let Some(d) = td.upgrade() else { return };
             let target = d.get_target_input().trim().to_string();
-            let name = if target.is_empty() {
-                "我的团队".to_string()
-            } else {
-                let mut n: String = target.chars().take(10).collect();
-                if target.chars().count() > 10 {
-                    n.push('…');
-                }
-                n
+            if target.is_empty() {
+                return; // 目标为空：无操作（输入框留提示）
+            }
+            let Some((idx, bot_key)) = team_ctx.borrow().clone() else {
+                return;
             };
-            d.set_team_name(name.into());
-            d.set_flow("产品 → UI/UX → 开发 → 测试 循环".into());
-            let roles = vec![
-                TeamRoleRow {
-                    role_name: "产品经理".into(),
-                    member: "".into(),
-                    duty: "负责需求分析与排期".into(),
-                },
-                TeamRoleRow {
-                    role_name: "UI/UX 设计".into(),
-                    member: "".into(),
-                    duty: "负责界面与交互设计".into(),
-                },
-                TeamRoleRow {
-                    role_name: "开发工程师".into(),
-                    member: "".into(),
-                    duty: "负责功能实现".into(),
-                },
-                TeamRoleRow {
-                    role_name: "测试工程师".into(),
-                    member: "".into(),
-                    duty: "负责质量保障".into(),
-                },
-            ];
-            d.set_roles(slint::ModelRc::from(Rc::new(slint::VecModel::from(roles))));
-            d.set_mode(1);
+            d.set_busy(true);
+            let _ = tx.send(UiCmd::TeamGenerate {
+                idx,
+                bot_key,
+                target,
+            });
         });
     }
-    // 确认创建（mock：演示部分失败清单；真实后端就绪后改走 UiCmd 异步建群）
+    // 确认创建（#141 真实链路）：携已生成的方案 JSON 发 UiCmd::TeamCreate，
+    // 后台逐角色建群 + 登记（幂等），结果经 team_rx 回填。
     {
         let td = team_dialog.as_weak();
+        let tx = tx.clone();
+        let team_plan = team_plan.clone();
+        let team_ctx = team_ctx.clone();
         team_dialog.on_confirm_clicked(move || {
             let Some(d) = td.upgrade() else { return };
+            let Some((idx, bot_key)) = team_ctx.borrow().clone() else {
+                return;
+            };
+            let Some(plan) = team_plan.borrow().clone() else {
+                return;
+            };
             d.set_busy(true);
-            d.set_mode(2);
-            let results = vec![
-                TeamResultRow {
-                    text: "产品经理（待任命）→ 已建，可 @产品经理 对话".into(),
-                    ok: true,
-                },
-                TeamResultRow {
-                    text: "UI/UX 设计（待任命）→ 已建".into(),
-                    ok: true,
-                },
-                TeamResultRow {
-                    text: "开发工程师（待任命）→ 已建".into(),
-                    ok: true,
-                },
-                TeamResultRow {
-                    text: "测试工程师（待任命）→ 失败：群名与现有群冲突，请改名后重试（mock 演示）"
-                        .into(),
-                    ok: false,
-                },
-            ];
-            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(
-                results,
-            ))));
-            d.set_busy(false);
+            let _ = tx.send(UiCmd::TeamCreate { idx, bot_key, plan });
         });
     }
     // 修改 → 回目标输入
@@ -4110,6 +4231,7 @@ pub fn run_gui() -> Result<()> {
     {
         let settings_weak = settings.as_weak();
         let vb_dialog_weak = vb_dialog.as_weak();
+        let team_dialog_weak = team_dialog.as_weak(); // #141 团队弹窗
         let vb_edit_t = vb_edit.clone();
         let qr_weak = qr_dialog.as_weak();
         let work = work.clone();
@@ -4163,8 +4285,7 @@ pub fn run_gui() -> Result<()> {
                                 w.set_dep_busy("".into());
                                 push_deps_to_window(&w);
                                 match result {
-                                    Ok(tail) => {
-                                        w.set_dep_detail("".into());
+                                    Ok(tail) => {                                        w.set_dep_detail("".into());
                                         w.set_status_is_error(false);
                                         // #93：codex 装完的登录引导（run_install 成功返回已附）。
                                         // 其它依赖保持原样文案（npm/brew 输出冗长不直接上状态行）。
@@ -4254,6 +4375,75 @@ pub fn run_gui() -> Result<()> {
                             Err(e) => {
                                 w.set_status_is_error(true);
                                 w.set_status_line(e.into());
+                            }
+                        }
+                    }
+                }
+                // #141 一键创建团队结果：生成回填方案预览；建群回填创建清单
+                while let Ok(evt) = team_rx.try_recv() {
+                    match evt {
+                        TeamEvt::Generate { result } => {
+                            let team_plan = team_plan.clone();
+                            if let Some(d) = team_dialog_weak.upgrade() {
+                                d.set_busy(false);
+                                match result {
+                                    Ok(plan_json) => {
+                                        *team_plan.borrow_mut() = Some(plan_json.clone());
+                                        if let Ok(plan) =
+                                            serde_json::from_str::<crate::teambuilder::TeamPlan>(
+                                                &plan_json,
+                                            )
+                                        {
+                                            d.set_team_name(plan.team_name.clone().into());
+                                            d.set_flow(
+                                                plan.collab.clone().unwrap_or_default().into(),
+                                            );
+                                            let rows: Vec<TeamRoleRow> = team_plan_rows(&plan)
+                                                .into_iter()
+                                                .map(|(rn, member, duty)| TeamRoleRow {
+                                                    role_name: rn.into(),
+                                                    member: member.into(),
+                                                    duty: duty.into(),
+                                                })
+                                                .collect();
+                                            d.set_roles(slint::ModelRc::from(Rc::new(
+                                                slint::VecModel::from(rows),
+                                            )));
+                                            d.set_mode(1);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // 生成失败：留在目标输入可重试（错误显示在 flow 行）
+                                        d.set_team_name("生成失败".into());
+                                        d.set_flow(e.into());
+                                        d.set_mode(0);
+                                    }
+                                }
+                            }
+                        }
+                        TeamEvt::Create { result } => {
+                            if let Some(d) = team_dialog_weak.upgrade() {
+                                d.set_busy(false);
+                                match result {
+                                    Ok(rows) => {
+                                        let results: Vec<TeamResultRow> = rows
+                                            .into_iter()
+                                            .map(|(rn, member, ok, detail)| TeamResultRow {
+                                                text: team_create_line(&rn, &member, &detail).into(),
+                                                ok,
+                                            })
+                                            .collect();
+                                        d.set_results(slint::ModelRc::from(Rc::new(
+                                            slint::VecModel::from(results),
+                                        )));
+                                        d.set_mode(2);
+                                    }
+                                    Err(e) => {
+                                        // 建群整体失败：留在预览可重试
+                                        d.set_flow(e.into());
+                                        d.set_mode(1);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4644,6 +4834,47 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_plan_rows_flattens_roles() {
+        // #141：TeamPlan → 预览行（role_name/member/duty），member 空 = 待任命占位
+        let plan = crate::teambuilder::TeamPlan {
+            team_name: "记账团队".into(),
+            roles: vec![
+                crate::teambuilder::TeamRole {
+                    role_name: "产品经理".into(),
+                    member_name: Some("小王".into()),
+                    system_prompt: "负责需求".into(),
+                },
+                crate::teambuilder::TeamRole {
+                    role_name: "后端".into(),
+                    member_name: None,
+                    system_prompt: "负责 API".into(),
+                },
+            ],
+            collab: None,
+        };
+        let rows = team_plan_rows(&plan);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ("产品经理".into(), "小王".into(), "负责需求".into())
+        );
+        assert_eq!(rows[1], ("后端".into(), String::new(), "负责 API".into()));
+    }
+
+    #[test]
+    fn team_create_line_formats_member_and_pending() {
+        // #141：创建结果行「角色（成员）→ 详情」；member 空 → 待任命
+        assert_eq!(
+            team_create_line("产品经理", "小王", "已建"),
+            "产品经理（小王）→ 已建"
+        );
+        assert_eq!(
+            team_create_line("测试", "", "失败：群名冲突"),
+            "测试（待任命）→ 失败：群名冲突"
+        );
+    }
 
     /// #74 红点合成行为：右上角出现红点（含白描边），左下角像素保持原图不动。
     /// 用真实托盘资产（CARGO_MANIFEST_DIR 相对路径，测试进程 cwd 无关）。
