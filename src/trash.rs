@@ -418,10 +418,7 @@ pub fn move_to_trash(
         // 越界防护（#88 审查跟进）：绝对路径越过工作区根（如 /trash rm 别处文件）
         // 拒绝——回收站是工作区级设施，不代收工作区外内容。
         if !contained_in(workspace, &abs) {
-            return Err(format!(
-                "{} 不在工作区范围内，拒绝移入回收站",
-                p.display()
-            ));
+            return Err(format!("{} 不在工作区范围内，拒绝移入回收站", p.display()));
         }
         if !abs.exists() {
             continue;
@@ -679,19 +676,17 @@ mod tests {
         let ws = temp_ws();
         let s = TrashSettings::defaults();
         // 工作区外绝对路径（如临时目录）→ 拒绝
-        let outside = std::env::temp_dir().join(format!(
-            "abb-trash-outside-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("abb-trash-outside-{}", uuid::Uuid::new_v4()));
         std::fs::write(&outside, "x").unwrap();
-        let r = move_to_trash(&ws, &[outside.clone()], &s, "t");
+        let r = move_to_trash(&ws, std::slice::from_ref(&outside), &s, "t");
         assert!(r.is_err(), "工作区外路径应拒绝移入回收站");
         assert!(outside.exists(), "外部文件应保持原位");
         // `..` 上跳逃逸 → 拒绝
         let escape = ws.join("..").join("esc").join("x.txt");
         std::fs::create_dir_all(escape.parent().unwrap()).unwrap();
         std::fs::write(&escape, "x").unwrap();
-        assert!(move_to_trash(&ws, &[escape.clone()], &s, "t").is_err());
+        assert!(move_to_trash(&ws, std::slice::from_ref(&escape), &s, "t").is_err());
         assert!(escape.exists());
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_file(&outside);
