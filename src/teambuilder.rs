@@ -203,6 +203,9 @@ pub fn validate_team_plan_json(text: &str) -> Result<TeamPlan, String> {
 /// 复用 generate_role_prompt 的调用模式：deps::find_in_path 解析绝对路径、
 /// Windows 抑制控制台窗口（#104）、stdin 写 prompt + EOF、超时兜底。
 /// 返回解析 + 校验后的 [`TeamPlan`]，失败给用户可操作错误（重试/手动编辑）。
+/// #123（2026-08-27）：codex 分支对齐 agent.rs::codex_command 成熟版（--json
+/// --skip-git-repo-check + owner 沙箱 + 供应商 -c 注入）；claude/pi 分支补供应商
+/// env / --provider/--model 注入；stderr 不再吞（失败原因透传，替代「空输出」）。
 pub async fn generate_team_plan(
     backend: crate::agent::Backend,
     goal: &str,
@@ -215,6 +218,26 @@ pub async fn generate_team_plan(
     let template = resolve_template(template_name);
     let prompt = build_generation_prompt(&template, goal, members);
 
+    // #123：供应商注入与主链路（agent.rs run_once）同源。CLI 无 bot 上下文：
+    // 优先 AGENT_BRIDGE_BOT_KEY env（桥内调用），否则回落全局 default_provider；
+    // 未配置供应商 = 各后端自认证/CC Switch 的旧行为（build_injection 内部处理）。
+    let provider = crate::config::Config::load().ok().and_then(|cfg| {
+        match std::env::var("AGENT_BRIDGE_BOT_KEY") {
+            Ok(bk) if !bk.is_empty() => cfg
+                .bots
+                .iter()
+                .find(|b| b.key() == bk)
+                .and_then(|b| cfg.resolve_provider(b))
+                .cloned(),
+            _ => cfg
+                .providers
+                .iter()
+                .find(|p| p.name == cfg.default_provider)
+                .cloned(),
+        }
+    });
+    let inject = crate::agent::build_injection(backend, provider.as_ref())?;
+
     let program = match backend {
         crate::agent::Backend::Pi => "pi",
         crate::agent::Backend::Codex => "codex",
@@ -222,31 +245,20 @@ pub async fn generate_team_plan(
     };
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
-    let mut cmd = match backend {
-        crate::agent::Backend::Claude => {
-            let mut c = tokio::process::Command::from(crate::agent::shim_command(&resolved));
-            c.arg("-p").arg("--output-format").arg("text");
-            c
-        }
-        crate::agent::Backend::Codex => {
-            let mut c = tokio::process::Command::from(crate::agent::shim_command(&resolved));
-            c.arg("exec");
-            c
-        }
-        crate::agent::Backend::Pi => {
-            // pi 非交互 JSON 模式：stdin 读 prompt，stdout JSONL（message_end 权威文本）。
-            let mut c = tokio::process::Command::from(crate::agent::shim_command(&resolved));
-            c.arg("-p")
-                .arg("--mode")
-                .arg("json")
-                .arg("--session-id")
-                .arg(uuid::Uuid::new_v4().to_string());
-            c
-        }
+    // codex >= 0.146 才支持 --add-dir（沙箱 workspace-write 需要）；旧版回退 bypass。
+    let codex_sandbox_ok = if backend == crate::agent::Backend::Codex {
+        resolved
+            .to_str()
+            .and_then(crate::deps::codex_version)
+            .map(|v| crate::deps::version_at_least(&v, "0.146"))
+            .unwrap_or(false)
+    } else {
+        false
     };
+    let mut cmd = build_agent_command(backend, &resolved, &inject, codex_sandbox_ok);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，失败原因透传
     #[cfg(windows)]
     {
         crate::deps::apply_no_window_tokio(&mut cmd);
@@ -272,29 +284,123 @@ pub async fn generate_team_plan(
     .map_err(|e| format!("等待 {program} 退出失败：{e}"))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // pi：JSONL 里最后一条 message_end（assistant）的文本；claude/codex：stdout 直接是文本
-    let raw = if backend == crate::agent::Backend::Pi {
-        let mut last = String::new();
-        for line in stdout.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("type").and_then(|t| t.as_str()) == Some("message_end") {
-                    let msg = &v["message"];
-                    if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                        let t = crate::agent::pi_message_text(msg);
-                        if !t.is_empty() {
-                            last = t;
-                        }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // codex：--json 事件流（item.completed/agent_message）；pi：JSONL message_end；claude：stdout 直接文本
+    let raw = match backend {
+        crate::agent::Backend::Codex => codex_json_text(&stdout),
+        crate::agent::Backend::Pi => pi_json_text(&stdout),
+        crate::agent::Backend::Claude => stdout.to_string(),
+    };
+
+    validate_team_plan_json(&raw).map_err(|e| {
+        let mut msg = format!("{e}\n（模型原始输出片段：{}）", preview(&raw, 200));
+        let err = stderr.trim();
+        if !err.is_empty() {
+            msg.push_str(&format!("\n（模型 stderr：{}）", preview(err, 300)));
+        }
+        msg
+    })
+}
+
+/// 单轮 agent 命令构造（#123：与 agent.rs run_once 同源）。
+/// - codex：复用 agent::codex_command 成熟版（--json --skip-git-repo-check + owner
+///   沙箱 workspace-write / <0.146 回退 bypass + 供应商 -c 注入），单轮生成不涉受限会话。
+/// - claude：-p --output-format text + 供应商 ANTHROPIC_* env 注入（对齐 run_once，
+///   不再依赖全局 env 恰好有 key）。
+/// - pi：-p --mode json --session-id <uuid> + 供应商 --provider/--model + api key env。
+fn build_agent_command(
+    backend: crate::agent::Backend,
+    resolved: &std::path::Path,
+    inject: &crate::agent::Injection,
+    codex_sandbox_ok: bool,
+) -> tokio::process::Command {
+    let mut cmd = match backend {
+        crate::agent::Backend::Claude => {
+            let mut c = tokio::process::Command::from(crate::agent::shim_command(resolved));
+            c.arg("-p").arg("--output-format").arg("text");
+            c
+        }
+        crate::agent::Backend::Codex => {
+            // #123：对齐 agent.rs::codex_command——--json --skip-git-repo-check +
+            // owner 沙箱（workspace-write，默认域=cwd；bridge_dir 可写根保住
+            // $ABB_BIN job/deliver 落盘域）。codex < 0.146 无 --add-dir → 回退 bypass。
+            let writable_roots: Vec<std::path::PathBuf> = if codex_sandbox_ok {
+                vec![crate::bridge_dir()]
+            } else {
+                Vec::new()
+            };
+            crate::agent::codex_command(
+                resolved,
+                false,
+                "",
+                &inject.extra_args,
+                false,
+                &writable_roots,
+            )
+        }
+        crate::agent::Backend::Pi => {
+            // pi 非交互 JSON 模式：stdin 读 prompt，stdout JSONL（message_end 权威文本）。
+            let mut c = tokio::process::Command::from(crate::agent::shim_command(resolved));
+            c.arg("-p")
+                .arg("--mode")
+                .arg("json")
+                .arg("--session-id")
+                .arg(uuid::Uuid::new_v4().to_string());
+            // 桥内供应商 → --provider/--model（api key 走 env，见 build_injection）
+            for a in &inject.extra_args {
+                c.arg(a);
+            }
+            c
+        }
+    };
+    // 供应商 env（codex 的 AGENT_BRIDGE_MODEL_KEY / claude 的 ANTHROPIC_* / pi 的 api key）
+    if let Some(env) = &inject.env {
+        cmd.envs(env);
+    }
+    cmd
+}
+
+/// codex `--json` 事件流 → 最后一条 agent_message 文本（与 agent.rs process_line 同源解析）。
+fn codex_json_text(stdout: &str) -> String {
+    let mut last = String::new();
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
+                let item = &v["item"];
+                if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
+                    let t = item
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !t.is_empty() {
+                        last = t;
                     }
                 }
             }
         }
-        last
-    } else {
-        stdout.to_string()
-    };
+    }
+    last
+}
 
-    validate_team_plan_json(&raw)
-        .map_err(|e| format!("{e}\n（模型原始输出片段：{}）", preview(&raw, 200)))
+/// pi JSONL → 最后一条 message_end（assistant）的文本。
+fn pi_json_text(stdout: &str) -> String {
+    let mut last = String::new();
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("message_end") {
+                let msg = &v["message"];
+                if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                    let t = crate::agent::pi_message_text(msg);
+                    if !t.is_empty() {
+                        last = t;
+                    }
+                }
+            }
+        }
+    }
+    last
 }
 
 /// 输出片段预览（错误提示用，截断到 n 字符，避免刷屏）。
@@ -449,5 +555,173 @@ mod tests {
             Some("{\"a\":1}")
         );
         assert_eq!(extract_json("无 JSON").as_deref(), None);
+    }
+
+    // ── #123：命令构造对齐 agent.rs run_once（QA 静态核对 A8）──
+
+    fn args_of(cmd: &tokio::process::Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn envs_of(cmd: &tokio::process::Command) -> Vec<(String, String)> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_agent_command_codex_aligns_run_once() {
+        // codex + OpenAI 兼容供应商：--json --skip-git-repo-check + workspace-write
+        // 沙箱 + --add-dir(bridge_dir) + 供应商 -c 注入；api key 只进 env 不进 argv。
+        let provider = crate::config::ProviderConfig {
+            name: "测试网关".into(),
+            kind: "openai-chat".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "sk-test-123".into(),
+            model: "gpt-x".into(),
+        };
+        let inject =
+            crate::agent::build_injection(crate::agent::Backend::Codex, Some(&provider)).unwrap();
+        let cmd = build_agent_command(
+            crate::agent::Backend::Codex,
+            std::path::Path::new("codex"),
+            &inject,
+            true,
+        );
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a == "exec"));
+        assert!(args.iter().any(|a| a == "--json"));
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+        assert!(args.iter().any(|a| a == "--sandbox"));
+        assert!(args.iter().any(|a| a == "workspace-write"));
+        assert!(args.iter().any(|a| a == "--add-dir"));
+        assert!(args.iter().any(|a| a == "-c"));
+        assert!(args.iter().any(|a| a.starts_with("model_provider=")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("model_providers.agent_bridge.base_url=")));
+        // api key 不进 argv
+        assert!(!args.iter().any(|a| a.contains("sk-test-123")));
+        let envs = envs_of(&cmd);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "AGENT_BRIDGE_MODEL_KEY" && v == "sk-test-123"));
+    }
+
+    #[test]
+    fn build_agent_command_codex_old_version_falls_back_bypass() {
+        // codex < 0.146（无 --add-dir）：与 run_once 同款回退 bypass，不带 --sandbox。
+        let inject = crate::agent::build_injection(crate::agent::Backend::Codex, None).unwrap();
+        let cmd = build_agent_command(
+            crate::agent::Backend::Codex,
+            std::path::Path::new("codex"),
+            &inject,
+            false,
+        );
+        let args = args_of(&cmd);
+        assert!(args
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!args.iter().any(|a| a == "--sandbox"));
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn build_agent_command_claude_injects_provider_env() {
+        // claude + anthropic 供应商：ANTHROPIC_* env 注入（不再依赖全局 env 恰好有 key）。
+        let provider = crate::config::ProviderConfig {
+            name: "测试Anthropic".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.example".into(),
+            api_key: "sk-ant-test".into(),
+            model: "claude-x".into(),
+        };
+        let inject =
+            crate::agent::build_injection(crate::agent::Backend::Claude, Some(&provider)).unwrap();
+        let cmd = build_agent_command(
+            crate::agent::Backend::Claude,
+            std::path::Path::new("claude"),
+            &inject,
+            false,
+        );
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a == "-p"));
+        assert!(!args.iter().any(|a| a.contains("sk-ant-test")));
+        let envs = envs_of(&cmd);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v == "sk-ant-test"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "https://api.anthropic.example"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_MODEL" && v == "claude-x"));
+    }
+
+    #[test]
+    fn build_agent_command_pi_injects_provider_args() {
+        // pi + OpenAI 兼容供应商：--provider/--model 参数 + OPENAI_API_KEY env。
+        let provider = crate::config::ProviderConfig {
+            name: "测试OpenAI".into(),
+            kind: "openai-responses".into(),
+            base_url: "https://api.openai.example/v1".into(),
+            api_key: "sk-pi-test".into(),
+            model: "gpt-pi".into(),
+        };
+        let inject =
+            crate::agent::build_injection(crate::agent::Backend::Pi, Some(&provider)).unwrap();
+        let cmd = build_agent_command(
+            crate::agent::Backend::Pi,
+            std::path::Path::new("pi"),
+            &inject,
+            false,
+        );
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a == "--provider"));
+        assert!(args.iter().any(|a| a == "openai"));
+        assert!(args.iter().any(|a| a == "--model"));
+        assert!(args.iter().any(|a| a == "gpt-pi"));
+        assert!(!args.iter().any(|a| a.contains("sk-pi-test")));
+        let envs = envs_of(&cmd);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "OPENAI_API_KEY" && v == "sk-pi-test"));
+    }
+
+    #[test]
+    fn codex_json_text_extracts_last_agent_message() {
+        // #123：codex --json 事件流 → 最后一条 agent_message 文本（对齐 process_line）。
+        let out = "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n\
+                   {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"先输出一句：\"}}\n\
+                   {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"team_name\\\":\\\"记账团队\\\",\\\"roles\\\":[]}\"}}\n";
+        let t = codex_json_text(out);
+        assert!(t.contains("team_name"));
+        assert!(!t.contains("先输出一句"));
+    }
+
+    #[test]
+    fn codex_json_text_ignores_non_message_events() {
+        let out = "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n\
+                   {\"type\":\"item.completed\",\"item\":{\"type\":\"function_call\",\"name\":\"x\"}}\n";
+        assert_eq!(codex_json_text(out), "");
+    }
+
+    #[test]
+    fn pi_json_text_extracts_last_message_end() {
+        let out = "{\"type\":\"session\",\"session_id\":\"s1\"}\n\
+                   {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"方案：{\\\"team_name\\\":\\\"A\\\"}\"}]}}\n";
+        assert!(pi_json_text(out).contains("team_name"));
     }
 }
