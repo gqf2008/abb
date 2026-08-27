@@ -441,7 +441,11 @@ pub fn move_to_trash(
     // git add -A 会把「删除后、回收站内」状态一并入库——回收站内容本身完整可恢复，
     // git 时光机与回收站互补（各有可回退路径），留痕失败不影响移动。
     if !moved.is_empty() {
-        let _ = git_snapshot_sync(workspace);
+        if let Err(e) = git_snapshot_sync(workspace) {
+            // #105 联动：git 缺失/失败时留痕静默降级（不阻断删除保护），
+            // 日志留痕便于排查「留痕为什么没生效」。
+            crate::log!("[trash] git 留痕跳过（best-effort）：{e}");
+        }
     }
     save_manifest(workspace, &items).map_err(|e| format!("回收站清单写入失败：{e}"))?;
     Ok(moved)
