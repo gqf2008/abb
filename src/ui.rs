@@ -3053,20 +3053,30 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         settings.on_team_create_clicked(move |idx| {
             let Some(d) = td.upgrade() else { return };
-            let label = work.borrow().get(idx as usize).map(|bot| {
-                if bot.name.is_empty() {
-                    format!("（{}）", kind_label(&bot.kind))
-                } else {
-                    bot.name.clone()
-                }
-            }).unwrap_or_default();
+            let label = work
+                .borrow()
+                .get(idx as usize)
+                .map(|bot| {
+                    if bot.name.is_empty() {
+                        format!("（{}）", kind_label(&bot.kind))
+                    } else {
+                        bot.name.clone()
+                    }
+                })
+                .unwrap_or_default();
             d.set_bot_label(label.into());
             d.set_mode(0);
             d.set_target_input("".into());
             d.set_team_name("".into());
             d.set_flow("".into());
-            d.set_roles(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<TeamRoleRow>::new()))));
-            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<TeamResultRow>::new()))));
+            d.set_roles(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<
+                TeamRoleRow,
+            >::new(
+            )))));
+            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<
+                TeamResultRow,
+            >::new(
+            )))));
             d.set_busy(false);
             show_window_and_focus(&d);
         });
@@ -3089,10 +3099,26 @@ pub fn run_gui() -> Result<()> {
             d.set_team_name(name.into());
             d.set_flow("产品 → UI/UX → 开发 → 测试 循环".into());
             let roles = vec![
-                TeamRoleRow { role_name: "产品经理".into(), member: "".into(), duty: "负责需求分析与排期".into() },
-                TeamRoleRow { role_name: "UI/UX 设计".into(), member: "".into(), duty: "负责界面与交互设计".into() },
-                TeamRoleRow { role_name: "开发工程师".into(), member: "".into(), duty: "负责功能实现".into() },
-                TeamRoleRow { role_name: "测试工程师".into(), member: "".into(), duty: "负责质量保障".into() },
+                TeamRoleRow {
+                    role_name: "产品经理".into(),
+                    member: "".into(),
+                    duty: "负责需求分析与排期".into(),
+                },
+                TeamRoleRow {
+                    role_name: "UI/UX 设计".into(),
+                    member: "".into(),
+                    duty: "负责界面与交互设计".into(),
+                },
+                TeamRoleRow {
+                    role_name: "开发工程师".into(),
+                    member: "".into(),
+                    duty: "负责功能实现".into(),
+                },
+                TeamRoleRow {
+                    role_name: "测试工程师".into(),
+                    member: "".into(),
+                    duty: "负责质量保障".into(),
+                },
             ];
             d.set_roles(slint::ModelRc::from(Rc::new(slint::VecModel::from(roles))));
             d.set_mode(1);
@@ -3106,12 +3132,27 @@ pub fn run_gui() -> Result<()> {
             d.set_busy(true);
             d.set_mode(2);
             let results = vec![
-                TeamResultRow { text: "产品经理（待任命）→ 已建，可 @产品经理 对话".into(), ok: true },
-                TeamResultRow { text: "UI/UX 设计（待任命）→ 已建".into(), ok: true },
-                TeamResultRow { text: "开发工程师（待任命）→ 已建".into(), ok: true },
-                TeamResultRow { text: "测试工程师（待任命）→ 失败：群名与现有群冲突，请改名后重试（mock 演示）".into(), ok: false },
+                TeamResultRow {
+                    text: "产品经理（待任命）→ 已建，可 @产品经理 对话".into(),
+                    ok: true,
+                },
+                TeamResultRow {
+                    text: "UI/UX 设计（待任命）→ 已建".into(),
+                    ok: true,
+                },
+                TeamResultRow {
+                    text: "开发工程师（待任命）→ 已建".into(),
+                    ok: true,
+                },
+                TeamResultRow {
+                    text: "测试工程师（待任命）→ 失败：群名与现有群冲突，请改名后重试（mock 演示）"
+                        .into(),
+                    ok: false,
+                },
             ];
-            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(results))));
+            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                results,
+            ))));
             d.set_busy(false);
         });
     }
