@@ -478,6 +478,86 @@ fn sync_vb_templates(dlg: &VirtualBotDialog, templates_work: &RefCell<Vec<RoleTe
     dlg.set_selected_count(0);
 }
 
+/// #125 编辑弹窗异步预填状态机（防「登记旧名残留 + 保存回退平台群名」）：
+/// - Pending：打开即异步拉平台群资料，期间禁止保存（防把登记旧名/空提示词写回平台）；
+/// - Ok：Fetched 成功，回填平台真实群名/群介绍（用户已改动的字段不回填）；
+/// - Failed：拉取失败，恢复登记旧名供核对 + 强提示，须用户显式改过群名才允许保存。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum VbFetchPhase {
+    Pending,
+    Ok,
+    Failed,
+}
+
+#[derive(Clone)]
+struct VbEditState {
+    phase: VbFetchPhase,
+    chat_id: String,       // 目标群（Fetched 迟到时按 chat_id 作废）
+    fallback_name: String, // 登记旧名（Failed 时恢复显示，供用户核对）
+    name_dirty: bool,      // 用户手动改过群名 → 回填不覆盖
+    prompt_dirty: bool,    // 用户手动改过提示词 → 回填不覆盖
+}
+
+impl Default for VbEditState {
+    fn default() -> Self {
+        VbEditState {
+            phase: VbFetchPhase::Pending,
+            chat_id: String::new(),
+            fallback_name: String::new(),
+            name_dirty: false,
+            prompt_dirty: false,
+        }
+    }
+}
+
+/// #125 纯逻辑：Fetched 事件推进状态机，返回需要回填的 (群名, 群介绍)。
+/// 返回 None = 不回填该字段（用户已手动改动 dirty，或值无效）；
+/// error=Some 时状态转 Failed，群名回填登记旧名供用户核对。
+fn vb_edit_apply_fetched(
+    st: &mut VbEditState,
+    name: &str,
+    desc: &str,
+    error: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(_err) = error {
+        st.phase = VbFetchPhase::Failed;
+        let fallback = if st.fallback_name.is_empty() {
+            None
+        } else {
+            Some(st.fallback_name.clone())
+        };
+        return (fallback, None);
+    }
+    st.phase = VbFetchPhase::Ok;
+    let n = if st.name_dirty || name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    };
+    let p = if st.prompt_dirty {
+        None
+    } else {
+        Some(desc.to_string())
+    };
+    (n, p)
+}
+
+/// #125 纯逻辑：编辑模式保存是否被拦截。返回 Some(msg) = 拦截并提示；None = 放行。
+/// Pending（还没拉到平台资料）或 Failed（拉到失败、当前为登记旧名/空提示词且用户
+/// 未显式编辑任一字段）都禁止静默保存，防把旧名/空提示词写回平台。
+fn vb_edit_save_blocked(st: &VbEditState, chat_id: &str) -> Option<&'static str> {
+    if st.chat_id != chat_id {
+        return Some("群资料加载状态异常，请关闭弹窗重试");
+    }
+    match st.phase {
+        VbFetchPhase::Pending => Some("正在拉取群资料，请稍候再保存…"),
+        VbFetchPhase::Failed if !(st.name_dirty || st.prompt_dirty) => Some(
+            "读取群资料失败，当前为登记旧名：直接保存会把平台群名改回旧名并清空群介绍。请核对修改群名后再保存",
+        ),
+        _ => None,
+    }
+}
+
 /// 弹窗校验提示（hint-error=true 红色报错 / false 灰色说明）。
 fn vb_hint(dlg: &VirtualBotDialog, text: &str, is_error: bool) {
     dlg.set_hint_text(text.into());
@@ -1230,6 +1310,8 @@ pub fn run_gui() -> Result<()> {
     // 虚拟 Bot 弹窗的归属 bot 上下文（bot 下标, bot_key, kind）——打开时记录，
     // 点「创建」时按下标从工作副本取最新 app_id/app_secret（用户可能刚改过没保存）。
     let vb_ctx: Rc<RefCell<Option<(i32, String, String)>>> = Rc::new(RefCell::new(None));
+    // #125 编辑弹窗异步预填状态（见 VbEditState）：打开编辑时重置，Fetched 回填推进。
+    let vb_edit: Rc<RefCell<VbEditState>> = Rc::new(RefCell::new(VbEditState::default()));
     // 确认弹窗待执行操作（确认回调 take；取消/关闭清空）
     let vb_action: Rc<RefCell<Option<VbAction>>> = Rc::new(RefCell::new(None));
     // 确认弹窗：取消 = 清空待执行操作并隐藏
@@ -2721,18 +2803,28 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let dlg = vb_dialog.as_weak();
+        let edit = vb_edit.clone();
         vb_dialog.on_name_edited(move || {
             if let Some(d) = dlg.upgrade() {
                 // 字符计数按 chars()（中文安全）；≤60 为飞书群名限制
                 d.set_name_count(d.get_name_input().chars().count() as i32);
+                // #125：用户手动编辑群名 → dirty，异步回填不得覆盖（Fetched 竞态）
+                if d.get_mode() == 3 {
+                    edit.borrow_mut().name_dirty = true;
+                }
             }
         });
     }
     {
         let dlg = vb_dialog.as_weak();
+        let edit = vb_edit.clone();
         vb_dialog.on_prompt_edited(move || {
             if let Some(d) = dlg.upgrade() {
                 d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
+                // #125：用户手动编辑提示词 → dirty，异步回填不得覆盖
+                if d.get_mode() == 3 {
+                    edit.borrow_mut().prompt_dirty = true;
+                }
             }
         });
     }
@@ -2895,6 +2987,7 @@ pub fn run_gui() -> Result<()> {
         let tx = tx.clone();
         let work = work.clone();
         let ctx = vb_ctx.clone();
+        let edit = vb_edit.clone();
         vb_dialog.on_create_clicked(move || {
             let Some(d) = dlg.upgrade() else { return };
             // 归属 bot 上下文（打开时记录；app_id/secret 点创建时从工作副本取最新——
@@ -2943,6 +3036,14 @@ pub fn run_gui() -> Result<()> {
                             items: vec![(name, prompt)],
                         });
                     } else {
+                        // #125：编辑保存前校验异步预填状态——Pending（未拉到平台资料）
+                        // 或 Failed（拉到失败、当前为登记旧名）都禁止静默保存，防把
+                        // 旧名/空提示词写回平台
+                        let st = edit.borrow().clone();
+                        if let Some(msg) = vb_edit_save_blocked(&st, d.get_edit_chat_id().as_str()) {
+                            vb_hint(&d, msg, true);
+                            return;
+                        }
                         let chat_id = d.get_edit_chat_id().to_string();
                         let _ = tx.send(UiCmd::VirtualBotUpdate {
                             bot_key,
@@ -3077,6 +3178,7 @@ pub fn run_gui() -> Result<()> {
         let sw = settings.as_weak();
         let work = work.clone();
         let ctx = vb_ctx.clone();
+        let edit = vb_edit.clone();
         let dlg = vb_dialog.as_weak();
         let twork = wk.templates.clone();
         settings.on_virtual_bot_edit(move |row| {
@@ -3093,9 +3195,18 @@ pub fn run_gui() -> Result<()> {
                 return;
             };
             *ctx.borrow_mut() = Some((sel, bot.key(), bot.kind.clone()));
-            // 先用登记的角色名立即打开（快速响应）；平台群资料（群介绍）异步拉回回填
+            // #125：打开即进入 Pending——群名/提示词不预填登记旧值（避免打开残留旧名、
+            // 保存回退平台群名），显示「正在拉取…」；平台真实群资料由 Fetched 回填。
+            *edit.borrow_mut() = VbEditState {
+                phase: VbFetchPhase::Pending,
+                chat_id: reg.chat_id.clone(),
+                fallback_name: reg.role_name.clone(),
+                name_dirty: false,
+                prompt_dirty: false,
+            };
             if let Some(d) = dlg.upgrade() {
-                vb_open_dialog(&d, bot, 3, Some((reg, &reg.role_name, "")), &twork);
+                vb_open_dialog(&d, bot, 3, Some((reg, "", "")), &twork);
+                vb_hint(&d, "正在拉取群资料…", false);
                 show_window_and_focus(&d);
             }
             let _ = tx.send(UiCmd::VirtualBotFetchInfo {
@@ -3867,6 +3978,7 @@ pub fn run_gui() -> Result<()> {
     {
         let settings_weak = settings.as_weak();
         let vb_dialog_weak = vb_dialog.as_weak();
+        let vb_edit_t = vb_edit.clone();
         let qr_weak = qr_dialog.as_weak();
         let work = work.clone();
         let model = bots_model.clone();
@@ -4096,21 +4208,36 @@ pub fn run_gui() -> Result<()> {
                             // 编辑预填：群资料异步拉回 → 回填弹窗（仍在编辑该群时）
                             if let Some(d) = vb_dialog_weak.upgrade() {
                                 if d.get_mode() == 3 && d.get_edit_chat_id() == chat_id.as_str() {
+                                    let mut st = vb_edit_t.borrow_mut();
+                                    if st.chat_id != chat_id {
+                                        return; // 弹窗已切换目标，迟到的旧拉取作废
+                                    }
+                                    let (name_fb, prompt_fb) =
+                                        vb_edit_apply_fetched(&mut st, &name, &desc, error.as_deref());
                                     if let Some(err) = error {
+                                        // #125 Failed：恢复登记旧名供核对 + 强提示
+                                        // （保存被拦截，须用户显式改过群名才放行）
+                                        if let Some(n) = name_fb {
+                                            d.set_name_input(n.into());
+                                        }
+                                        d.set_name_count(d.get_name_input().chars().count() as i32);
                                         vb_hint(
                                             &d,
                                             &format!(
-                                                "读取群资料失败：{err}（提示词留空保存会清空群介绍）"
+                                                "读取群资料失败：{err}。当前为登记旧名，直接保存会把平台群名改回旧名并清空群介绍——请核对修改后再保存"
                                             ),
                                             true,
                                         );
                                     } else {
-                                        if !name.is_empty() {
-                                            d.set_name_input(name.into());
+                                        if let Some(n) = name_fb {
+                                            d.set_name_input(n.into());
                                         }
-                                        d.set_prompt_input(desc.into());
+                                        if let Some(p) = prompt_fb {
+                                            d.set_prompt_input(p.into());
+                                        }
                                         d.set_name_count(d.get_name_input().chars().count() as i32);
                                         d.set_prompt_count(d.get_prompt_input().chars().count() as i32);
+                                        vb_hint(&d, "", false);
                                     }
                                 }
                             }
@@ -4429,5 +4556,91 @@ mod tests {
             (bl.r, bl.g, bl.b, bl.a),
             (bl_orig.r, bl_orig.g, bl_orig.b, bl_orig.a)
         );
+    }
+
+    // ── #125 编辑弹窗异步预填状态机 ──
+    fn st() -> VbEditState {
+        VbEditState {
+            phase: VbFetchPhase::Pending,
+            chat_id: "oc_chat_a".into(),
+            fallback_name: "软件工程师-Steven".into(),
+            name_dirty: false,
+            prompt_dirty: false,
+        }
+    }
+
+    #[test]
+    fn vb_edit_fetch_ok_backfills_and_phase_ok() {
+        let mut s = st();
+        let (n, p) = vb_edit_apply_fetched(&mut s, "软件工程师-StevenV2", "新的群介绍", None);
+        assert_eq!(s.phase, VbFetchPhase::Ok);
+        // 平台新名回填（解决「打开残留登记旧名」）
+        assert_eq!(n.as_deref(), Some("软件工程师-StevenV2"));
+        assert_eq!(p.as_deref(), Some("新的群介绍"));
+        // Ok 后保存放行
+        assert_eq!(vb_edit_save_blocked(&s, "oc_chat_a"), None);
+    }
+
+    #[test]
+    fn vb_edit_fetch_ok_does_not_override_user_edits() {
+        // 用户已手动改过群名 → 回填不得覆盖（dirty 保护，防竞态）
+        let mut s = st();
+        s.name_dirty = true;
+        let (n, p) = vb_edit_apply_fetched(&mut s, "软件工程师-StevenV2", "新的群介绍", None);
+        assert_eq!(n, None, "群名 dirty：不回填");
+        assert_eq!(p.as_deref(), Some("新的群介绍"), "提示词未改：仍回填");
+
+        // 提示词 dirty 同理
+        let mut s2 = st();
+        s2.prompt_dirty = true;
+        let (n2, p2) = vb_edit_apply_fetched(&mut s2, "软件工程师-StevenV2", "新的群介绍", None);
+        assert_eq!(n2.as_deref(), Some("软件工程师-StevenV2"));
+        assert_eq!(p2, None, "提示词 dirty：不回填");
+    }
+
+    #[test]
+    fn vb_edit_fetch_failed_blocks_save_until_user_edits_name() {
+        // 拉取失败：恢复登记旧名显示，且保存被拦截（防把旧名写回平台）
+        let mut s = st();
+        let (n, p) = vb_edit_apply_fetched(&mut s, "", "", Some("99992356"));
+        assert_eq!(s.phase, VbFetchPhase::Failed);
+        assert_eq!(n.as_deref(), Some("软件工程师-Steven"), "失败恢复登记旧名");
+        assert_eq!(p, None);
+        assert!(
+            vb_edit_save_blocked(&s, "oc_chat_a").is_some(),
+            "Failed 且未改群名：禁止保存"
+        );
+
+        // 用户显式改过群名（dirty）→ 视为有意为之，放行
+        s.name_dirty = true;
+        assert_eq!(vb_edit_save_blocked(&s, "oc_chat_a"), None);
+
+        // 只改提示词同样视为显式操作 → 放行
+        let mut s3 = st();
+        let _ = vb_edit_apply_fetched(&mut s3, "", "", Some("99992356"));
+        s3.prompt_dirty = true;
+        assert_eq!(vb_edit_save_blocked(&s3, "oc_chat_a"), None);
+    }
+
+    #[test]
+    fn vb_edit_pending_blocks_save_and_stale_fetch_discarded() {
+        // Pending：保存被拦截（还没拉到平台资料）
+        let s = st();
+        assert_eq!(vb_edit_save_blocked(&s, "oc_chat_a").unwrap(), "正在拉取群资料，请稍候再保存…");
+        // 弹窗已切换目标：chat_id 不匹配 → 拦截 + 迟到拉取作废
+        assert!(vb_edit_save_blocked(&s, "oc_chat_b").is_some());
+        let mut s2 = st();
+        let (n, _) = vb_edit_apply_fetched(&mut s2, "别的群", "", None);
+        assert_eq!(s2.chat_id, "oc_chat_a");
+        assert_eq!(n.as_deref(), Some("别的群"));
+    }
+
+    #[test]
+    fn vb_edit_empty_platform_name_not_backfilled() {
+        // 平台名空串：不回填（保留空 + Pending 语义由保存拦截兜底）
+        let mut s = st();
+        let (n, p) = vb_edit_apply_fetched(&mut s, "", "desc", None);
+        assert_eq!(n, None);
+        assert_eq!(p.as_deref(), Some("desc"));
     }
 }
