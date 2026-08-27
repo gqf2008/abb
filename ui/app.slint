@@ -11,6 +11,27 @@ import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, Horizont
 import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
+// ═══════════ 设计令牌（UI/UX 审查）：语义色集中定义，替换全部硬编码彩色 ═══════════
+// 原则：基础层走 PixelTheme（黑白像素体系）；状态语义色/文字层级走本令牌。
+// 全部色值收敛于此，改一处全局生效；已按 PixelTheme.scheme 内置暗色适配值
+// （未来开暗色模式时零改动兼容）。色值对比度按白底验算：
+//   ok #0b8a3e ≈4.5:1 / info #0a6fc2 ≈5.2:1 / warn #b86f00 ≈3.9:1（配加粗）/ error #d13438 ≈4.9:1
+//   text-dim #5c5c5c ≈4.6:1（替代原 #888/#aaa，原值不达 WCAG AA 正文 4.5:1）
+export global UiTokens {
+    // 语义状态色
+    in property <color> ok: PixelTheme.scheme == "dark" ? #4caf50 : #0b8a3e;      // 成功/已安装/已授权
+    in property <color> info: PixelTheme.scheme == "dark" ? #5ab0e8 : #0a6fc2;    // 信息/进行中/链接
+    in property <color> warn: PixelTheme.scheme == "dark" ? #e0a800 : #b86f00;    // 警示/待处理（强调用加粗）
+    in property <color> error: PixelTheme.scheme == "dark" ? #ff6b6b : #d13438;   // 错误/危险/超限
+    // 语义色浅底（提示卡/横幅背景）
+    in property <color> warn-bg: PixelTheme.scheme == "dark" ? #33280a : #fff8e6;    // 待处理卡底色
+    in property <color> banner-bg: PixelTheme.scheme == "dark" ? #332b0a : #fff3cd;  // 环境横幅底色
+    in property <color> error-bg: PixelTheme.scheme == "dark" ? #3a1212 : #fff1f0;   // 安装失败详情底色
+    // 文字层级
+    in property <color> text-dim: PixelTheme.scheme == "dark" ? #9a9a9a : #5c5c5c;        // 次要说明/占位（替代 #888）
+    in property <color> text-disabled: PixelTheme.scheme == "dark" ? #6b6b6b : #9a9a9a;   // 停用/禁用态（弱化）
+}
+
 export struct BotMenuRow {
     title: string,
     icon: image,
@@ -210,7 +231,7 @@ export component QrDialog inherits Window {
         Text { text: root.tip; font-weight: 600; horizontal-alignment: center; wrap: word-wrap; }
         Rectangle {
             background: white;
-            border-radius: 2px;
+            border-radius: 4px;
             min-height: 300px;
             Image {
                 source: root.qr-image;
@@ -219,7 +240,7 @@ export component QrDialog inherits Window {
                 image-fit: contain;
             }
         }
-        Text { text: "扫不上就点「取消」重新获取"; font-size: 11px; color: #888; horizontal-alignment: center; }
+        Text { text: "扫不上就点「取消」重新获取"; font-size: 12px; color: UiTokens.text-dim; horizontal-alignment: center; }
         HorizontalBox {
             alignment: center;
             PixelButton { text: "取消"; clicked => { root.close-clicked(); } }
@@ -328,8 +349,8 @@ component StatusPill inherits PixelBadge {
     in property <bool> ok: false;
     in property <bool> warn: false;
     width: 84px;
-    font-size: 11px;
-    face: root.ok ? #0b8a3e : (root.warn ? #b86f00 : #d13438);
+    font-size: 12px;
+    face: root.ok ? UiTokens.ok : (root.warn ? UiTokens.warn : UiTokens.error);
     text-color: #ffffff;
     border: PixelTheme.edge;
 }
@@ -343,7 +364,7 @@ component ProblemRow inherits HorizontalBox {
     spacing: 8px;
     Text {
         text: root.text;
-        font-size: 12.5px;
+        font-size: 13px;
         color: PixelTheme.text;
         vertical-alignment: center;
         horizontal-stretch: 1;
@@ -352,14 +373,14 @@ component ProblemRow inherits HorizontalBox {
         width: 84px;
         height: 24px;
         border-radius: 4px;
-        background: #b86f0018;
+        background: UiTokens.warn-bg;
         TouchArea {
             clicked => { root.clicked(); }
             Text {
                 text: root.action;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 600;
-                color: #b86f00;
+                color: UiTokens.warn;
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 width: 100%;
@@ -387,8 +408,8 @@ component QuickCard inherits Rectangle {
         VerticalLayout {
             spacing: 6px;
             ImageIcon { icon: root.icon; tint: PixelTheme.accent; }
-            Text { text: root.desc; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
-            Text { text: root.action-label; font-size: 11px; font-weight: 600; color: PixelTheme.accent; }
+            Text { text: root.desc; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
+            Text { text: root.action-label; font-size: 12px; font-weight: 600; color: PixelTheme.accent; }
         }
     }
     TouchArea {
@@ -434,7 +455,7 @@ export component UnsavedDialog inherits Window {
         }
         Text {
             text: root.message;
-            font-size: 12.5px;
+            font-size: 13px;
             color: PixelTheme.text.with-alpha(0.7);
             wrap: word-wrap;
             horizontal-alignment: center;
@@ -490,7 +511,7 @@ export component ConfirmDialog inherits Window {
         }
         Text {
             text: root.message;
-            font-size: 12.5px;
+            font-size: 13px;
             color: PixelTheme.text.with-alpha(0.7);
             wrap: word-wrap;
             horizontal-alignment: center;
@@ -612,7 +633,7 @@ export component VirtualBotDialog inherits Window {
                         enabled: !root.busy;
                         edited => { root.name-input = self.text; root.name-edited(); }
                     }
-                    Text { text: root.name-count + "/60"; font-size: 11px; color: root.name-count > 60 ? #d33 : #888; vertical-alignment: center; }
+                    Text { text: root.name-count + "/60"; font-size: 12px; color: root.name-count > 60 ? UiTokens.error : UiTokens.text-dim; vertical-alignment: center; }
                     // 「✨ 生成」：根据群名让 LLM 写系统提示词（≤100 字符，回填下方输入框）
                     PixelButton {
                         text: root.busy ? "生成中…" : "✨ 生成";
@@ -638,14 +659,14 @@ export component VirtualBotDialog inherits Window {
                         }
                         Text {
                             text: root.prompt-count + "/100";
-                            font-size: 11px;
-                            color: root.prompt-count > 100 ? #d33 : #888;
+                            font-size: 12px;
+                            color: root.prompt-count > 100 ? UiTokens.error : UiTokens.text-dim;
                         }
                     }
                 }
                 if root.mode == 3: Text {
                     text: "保存 = 平台改群名/群介绍（PATCH）+ 本地登记同步。改名会改变 deliver 的 @角色名 寻址。";
-                    font-size: 11px; color: #b80; wrap: word-wrap;
+                    font-size: 12px; color: UiTokens.warn; wrap: word-wrap;
                 }
                 // 预览卡：所见即所得（群资料卡样式）
                 Rectangle {
@@ -656,7 +677,7 @@ export component VirtualBotDialog inherits Window {
                     VerticalBox {
                         padding: 10px;
                         spacing: 6px;
-                        Text { text: "预览（群资料卡）"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                        Text { text: "预览（群资料卡）"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                         HorizontalBox {
                             spacing: 10px;
                             Rectangle {
@@ -672,7 +693,7 @@ export component VirtualBotDialog inherits Window {
                             VerticalBox {
                                 spacing: 2px;
                                 Text { text: root.name-input == "" ? "（群名）" : root.name-input; font-weight: 600; font-size: 13px; color: PixelTheme.text; }
-                                Text { text: root.prompt-input == "" ? "（群介绍）" : root.prompt-input; font-size: 11px; color: PixelTheme.text.with-alpha(0.6); wrap: word-wrap; }
+                                Text { text: root.prompt-input == "" ? "（群介绍）" : root.prompt-input; font-size: 12px; color: PixelTheme.text.with-alpha(0.6); wrap: word-wrap; }
                             }
                         }
                     }
@@ -716,7 +737,7 @@ export component VirtualBotDialog inherits Window {
                                 }
                                 Text {
                                     text: t.prompt;
-                                    font-size: 10px;
+                                    font-size: 11px;
                                     color: PixelTheme.text.with-alpha(0.5);
                                     horizontal-stretch: 1;
                                     vertical-alignment: center;
@@ -761,7 +782,7 @@ export component VirtualBotDialog inherits Window {
                     text: "将创建 " + root.selected-count + " 个群" + (root.prefix-input == "" ? "" : "（前缀「" + root.prefix-input + "·」）");
                     font-size: 12px;
                     font-weight: 600;
-                    color: root.selected-count > 0 ? #0a6fc2 : #888;
+                    color: root.selected-count > 0 ? UiTokens.info : UiTokens.text-dim;
                 }
             }
 
@@ -778,7 +799,7 @@ export component VirtualBotDialog inherits Window {
                         enabled: !root.busy;
                         edited => { root.name-input = self.text; root.name-edited(); }
                     }
-                    Text { text: root.name-count + "/60"; font-size: 11px; color: root.name-count > 60 ? #d33 : #888; vertical-alignment: center; }
+                    Text { text: root.name-count + "/60"; font-size: 12px; color: root.name-count > 60 ? UiTokens.error : UiTokens.text-dim; vertical-alignment: center; }
                 }
                 HorizontalBox {
                     spacing: 8px;
@@ -793,15 +814,15 @@ export component VirtualBotDialog inherits Window {
                 }
                 Text {
                     text: root.platform-label == "钉钉" ? "降级路径：机器人建群失败时，在钉钉手动建群（群名=角色名），把群内消息日志里的 chat_id 填这里。钉钉群无「群介绍」字段，角色提示词只能注入群名。" : "降级路径：API 建群失败时，平台手动建群（群名=角色名、群介绍=提示词），把 chat_id 填这里。";
-                    font-size: 11px; color: #b80; wrap: word-wrap;
+                    font-size: 12px; color: UiTokens.warn; wrap: word-wrap;
                 }
             }
 
             // ── 校验提示 ──
             if root.hint-text != "": Text {
                 text: root.hint-text;
-                font-size: 11px;
-                color: root.hint-error ? #d33 : #888;
+                font-size: 12px;
+                color: root.hint-error ? UiTokens.error : UiTokens.text-dim;
                 wrap: word-wrap;
             }
 
@@ -814,13 +835,13 @@ export component VirtualBotDialog inherits Window {
                 VerticalBox {
                     padding: 8px;
                     spacing: 4px;
-                    if root.busy: Text { text: root.progress-text; font-size: 12px; font-weight: 600; color: #0a6fc2; }
+                    if root.busy: Text { text: root.progress-text; font-size: 12px; font-weight: 600; color: UiTokens.info; }
                     PixelScrollPanel {
                         height: 110px;
                         VerticalBox {
                             width: 100%;
                             spacing: 2px;
-                            for r[i] in root.results: Text { text: r; font-size: 11px; color: PixelTheme.text.with-alpha(0.8); wrap: word-wrap; }
+                            for r[i] in root.results: Text { text: r; font-size: 12px; color: PixelTheme.text.with-alpha(0.8); wrap: word-wrap; }
                         }
                     }
                 }
@@ -1108,7 +1129,7 @@ export component SettingsWindow inherits Window {
                         // hero：状态 + 大按钮（PCM「立即加速」同款）。未运行时可从这里直接启动（原来只能去托盘）。
                         Rectangle {
                             height: 132px;
-                            border-radius: 14px;
+                            border-radius: 8px;
                             background: PixelTheme.accent;
                             HorizontalBox {
                                 padding-top: 16px; padding-right: 24px; padding-bottom: 16px; padding-left: 24px;
@@ -1128,16 +1149,16 @@ export component SettingsWindow inherits Window {
                                         text: root.service-running
                                             ? "飞书 / 微信 / 钉钉消息自动转给本地 Claude / Codex 处理"
                                             : "点右侧「启动服务」，或在托盘菜单点「启动」";
-                                        font-size: 12.5px;
+                                        font-size: 13px;
                                         color: PixelTheme.bg.with-alpha(0.75);
                                         wrap: word-wrap;
                                     }
                                     // 状态点（Defender 式「一目了然」）：在线/离线一眼可见；用文字点而非胶囊，避免在 accent 底上发闷
                                     HorizontalBox {
                                         spacing: 12px;
-                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 11.5px; font-weight: 600; color: PixelTheme.bg; vertical-alignment: center; }
-                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 11.5px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
-                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 11.5px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
+                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 12px; font-weight: 600; color: PixelTheme.bg; vertical-alignment: center; }
+                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 12px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
+                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 12px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
                                     }
                                 }
                                 VerticalBox {
@@ -1156,11 +1177,11 @@ export component SettingsWindow inherits Window {
                                     Rectangle {
                                         width: 140px;
                                         height: 32px;
-                                        border-radius: 9px;
+                                        border-radius: 4px;
                                         background: PixelTheme.bg.with-alpha(0.15);
                                         TouchArea {
                                             clicked => { root.open-logs(); }
-                                            Text { text: "打开日志"; color: PixelTheme.bg; font-size: 12.5px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            Text { text: "打开日志"; color: PixelTheme.bg; font-size: 13px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         }
                                     }
                                 }
@@ -1170,14 +1191,14 @@ export component SettingsWindow inherits Window {
                         // 待处理建议（火绒「主页建议」/ PCM「智能提醒」同款）：只有异常才出现，每行点一下直达对应页。
                         if root.dep-failed-count > 0 || root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0: Rectangle {
                             border-radius: 4px;
-                            background: #fff8e6;
+                            background: UiTokens.warn-bg;
                             VerticalBox {
                                 padding-top: 12px; padding-right: 16px; padding-bottom: 10px; padding-left: 16px;
                                 spacing: 4px;
                                 HorizontalBox {
                                     spacing: 8px;
-                                    ImageIcon { icon: @image-url("icons/alert.svg"); tint: #b86f00; width: 18px; height: 18px; }
-                                    Text { text: "待处理"; font-size: 13px; font-weight: 700; color: #8a5a00; vertical-alignment: center; }
+                                    ImageIcon { icon: @image-url("icons/alert.svg"); tint: UiTokens.warn; width: 18px; height: 18px; }
+                                    Text { text: "待处理"; font-size: 13px; font-weight: 700; color: UiTokens.warn; vertical-alignment: center; }
                                 }
                                 if root.dep-failed-count > 0: ProblemRow {
                                     text: "一键安装失败 " + root.dep-failed-count + " 项 — 点击查看详情与处理指引";
@@ -1232,8 +1253,8 @@ export component SettingsWindow inherits Window {
                                         checked: root.cross-delivery-enabled;
                                         toggled => { root.set-cross-delivery(self.checked); }
                                     }
-                                    Text { text: "允许 agent 把结果投递到其它 bot 的会话"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
-                                    Text { text: root.cross-delivery-enabled ? "已开启" : "已关闭"; font-size: 11px; font-weight: 600; color: #0a6fc2; }
+                                    Text { text: "允许 agent 把结果投递到其它 bot 的会话"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
+                                    Text { text: root.cross-delivery-enabled ? "已开启" : "已关闭"; font-size: 12px; font-weight: 600; color: UiTokens.info; }
                                 }
                             }
                         }
@@ -1277,13 +1298,13 @@ export component SettingsWindow inherits Window {
                                                         Text {
                                                             // 停用的 bot 前缀 ⚪ 并显灰，一眼可辨（启用的维持原色）
                                                             text: (bot.enabled ? "" : "⚪ ") + (bot.name == "" ? "(未命名)" : bot.name);
-                                                            color: idx == root.selected ? PixelTheme.bg : (bot.enabled ? PixelTheme.text : #aaa);
+                                                            color: idx == root.selected ? PixelTheme.bg : (bot.enabled ? PixelTheme.text : UiTokens.text-disabled);
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: bot.kind + (bot.enabled ? "" : " · 停用");
-                                                            font-size: 11px;
-                                                            color: idx == root.selected ? PixelTheme.bg.with-alpha(0.85) : #888;
+                                                            font-size: 12px;
+                                                            color: idx == root.selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
                                                         }
                                                     }
                                                 }
@@ -1449,14 +1470,14 @@ export component SettingsWindow inherits Window {
                                                     Text { text: "已授权用户"; width: 80px; vertical-alignment: center; }
                                                     if root.bots[root.selected].granted.length == 0: Text {
                                                         text: "暂无（点「生成授权码」邀请）";
-                                                        color: #888;
+                                                        color: UiTokens.text-dim;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
                                                     if root.bots[root.selected].granted.length > 0: Text {
                                                         text: "共 " + root.bots[root.selected].granted.length + " 人，逐一取消见下";
-                                                        color: #888;
+                                                        color: UiTokens.text-dim;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
@@ -1489,7 +1510,7 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.owner-code-info;
-                                                        color: #b80;
+                                                        color: UiTokens.warn;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
@@ -1503,7 +1524,7 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.grant-code-info;
-                                                        color: #b80;
+                                                        color: UiTokens.warn;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
@@ -1517,8 +1538,8 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
-                                                        color: #888;
-                                                        font-size: 11px;
+                                                        color: UiTokens.text-dim;
+                                                        font-size: 12px;
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
@@ -1550,7 +1571,7 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     HorizontalBox {
                                                         spacing: 8px;
-                                                        Text { text: "bot：" + root.bots[root.selected].bot-name + "  " + root.bots[root.selected].bot-open-id; font-size: 11px; color: PixelTheme.text.with-alpha(0.6); vertical-alignment: center; wrap: word-wrap; }
+                                                        Text { text: "bot：" + root.bots[root.selected].bot-name + "  " + root.bots[root.selected].bot-open-id; font-size: 12px; color: PixelTheme.text.with-alpha(0.6); vertical-alignment: center; wrap: word-wrap; }
                                                         PixelButton { text: "自动获取"; clicked => { root.fetch-bot-info(root.selected); } }
                                                     }
                                                 }
@@ -1562,7 +1583,7 @@ export component SettingsWindow inherits Window {
                                                             ? "未登录。点下方按钮，用微信扫码登录。"
                                                             : "已登录：" + root.bots[root.selected].bot-name;
                                                         wrap: word-wrap;
-                                                        color: root.bots[root.selected].bot-name == "" ? #888 : #060;
+                                                        color: root.bots[root.selected].bot-name == "" ? UiTokens.text-dim : UiTokens.ok;
                                                         vertical-alignment: center;
                                                     }
                                                 }
@@ -1642,14 +1663,14 @@ export component SettingsWindow inherits Window {
                                                     Text { text: "已授权用户"; width: 80px; vertical-alignment: center; }
                                                     if root.bots[root.selected].ding-granted.length == 0: Text {
                                                         text: "暂无（点「生成授权码」邀请）";
-                                                        color: #888;
+                                                        color: UiTokens.text-dim;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
                                                     if root.bots[root.selected].ding-granted.length > 0: Text {
                                                         text: "共 " + root.bots[root.selected].ding-granted.length + " 人，逐一取消见下";
-                                                        color: #888;
+                                                        color: UiTokens.text-dim;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
@@ -1677,7 +1698,7 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.owner-code-info;
-                                                        color: #b80;
+                                                        color: UiTokens.warn;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
@@ -1691,7 +1712,7 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: root.grant-code-info;
-                                                        color: #b80;
+                                                        color: UiTokens.warn;
                                                         font-size: 12px;
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
@@ -1705,16 +1726,16 @@ export component SettingsWindow inherits Window {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: "公开模式：任何人都可以对话，无需授权（授权码已禁用）";
-                                                        color: #888;
-                                                        font-size: 11px;
+                                                        color: UiTokens.text-dim;
+                                                        font-size: 12px;
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk": Row {
                                                     Rectangle { width: 80px; }
                                                     Text {
                                                         text: "要求：企业自建应用已添加「机器人」能力，消息接收模式选 Stream 模式；群聊需 @ 机器人。";
-                                                        font-size: 11px;
-                                                        color: #888;
+                                                        font-size: 12px;
+                                                        color: UiTokens.text-dim;
                                                         wrap: word-wrap;
                                                         vertical-alignment: center;
                                                     }
@@ -1742,7 +1763,7 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 Text {
                                                     text: "平台真实群 + ABB 登记：群名=角色名、群介绍=system prompt（改群介绍=改角色，即时生效）。群内 @ 机器人自动注入角色；AI 可用 deliver --bot <此 bot> --chat @角色名 寻址。";
-                                                    font-size: 11px; color: #888; wrap: word-wrap;
+                                                    font-size: 12px; color: UiTokens.text-dim; wrap: word-wrap;
                                                 }
                                                 for vb[i] in root.virtual-bots: Rectangle {
                                                     background: PixelTheme.panel;
@@ -1754,9 +1775,9 @@ export component SettingsWindow inherits Window {
                                                             spacing: 8px;
                                                             ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
                                                             Text { text: vb.role-name; font-weight: 600; font-size: 13px; color: PixelTheme.text; vertical-alignment: center; }
-                                                            Text { text: vb.platform; font-size: 11px; color: #888; vertical-alignment: center; }
+                                                            Text { text: vb.platform; font-size: 12px; color: UiTokens.text-dim; vertical-alignment: center; }
                                                             Rectangle { horizontal-stretch: 1; }
-                                                            Text { text: vb.created-at; font-size: 11px; color: #888; vertical-alignment: center; }
+                                                            Text { text: vb.created-at; font-size: 12px; color: UiTokens.text-dim; vertical-alignment: center; }
                                                             PixelButton { text: "编辑"; size: "small"; clicked => { root.virtual-bot-edit(i); } }
                                                             PixelButton { text: "⋯"; size: "small"; clicked => { root.vb-menu-open = root.vb-menu-open == i ? -1 : i; } }
                                                         }
@@ -1769,14 +1790,14 @@ export component SettingsWindow inherits Window {
                                                         }
                                                     }
                                                 }
-                                                if root.virtual-bots.length == 0: Text { text: "暂无登记。点下方按钮一键建群（平台 API 失败时手动建群后「手动登记」）。"; font-size: 11px; color: #888; }
+                                                if root.virtual-bots.length == 0: Text { text: "暂无登记。点下方按钮一键建群（平台 API 失败时手动建群后「手动登记」）。"; font-size: 12px; color: UiTokens.text-dim; }
                                                 PixelButton { text: "＋ 创建虚拟 Bot"; clicked => { root.virtual-bot-create(root.selected); } }
                                                 if root.bots[root.selected].kind == "dingtalk": Text {
                                                     text: "钉钉提示：机器人建群能力待平台实测；失败时手动建群（群名=角色名）后走弹窗「手动登记」。钉钉群无「群介绍」字段，角色提示词只能注入群名。";
-                                                    font-size: 11px; color: #b80; wrap: word-wrap;
+                                                    font-size: 12px; color: UiTokens.warn; wrap: word-wrap;
                                                 }
                                             }
-                                            if root.selected < 0: Text { text: "← 选择或添加一个机器人"; color: #888; }
+                                            if root.selected < 0: Text { text: "← 选择或添加一个机器人"; color: UiTokens.text-dim; }
                                         }
                                     }
                                 }
@@ -1804,14 +1825,14 @@ export component SettingsWindow inherits Window {
                                 // 未安装 agent 的醒目横幅（#8 M0 自动引导）
                                 if root.missing-agent: Rectangle {
                                     vertical-stretch: 0;
-                                    background: #fff3cd;
+                                    background: UiTokens.banner-bg;
                                     border-radius: 4px;
                                     HorizontalBox {
                                         padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
                                         spacing: 8px;
                                         Text {
                                             text: "⚠️ 未检测到 Claude Code / Codex CLI：机器人收到消息后将无法处理。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
-                                            color: #664d03;
+                                            color: UiTokens.warn;
                                             wrap: word-wrap;
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
@@ -1847,7 +1868,7 @@ export component SettingsWindow inherits Window {
                                         }
                                         if root.dep-busy != "": Text {
                                             text: "⏳ 正在安装 " + root.dep-busy + " …（可能要几分钟，期间请勿重复点）";
-                                            color: #b80;
+                                            color: UiTokens.warn;
                                             wrap: word-wrap;
                                         }
                                         // 安装失败详情区（与 busy 提示为**兄弟**节点——失败路径先清
@@ -1856,9 +1877,9 @@ export component SettingsWindow inherits Window {
                                             // 分类 + 怎么办 + 原始错误。醒目样式：粗边框 + 大字号
                                             // ——失败即所见（ui.rs 失败时自动切到本页）。
                                             border-width: 2px;
-                                            border-color: #d13438;
-                                            background: #fff1f0;
-                                            border-radius: 2px;
+                                            border-color: UiTokens.error;
+                                            background: UiTokens.error-bg;
+                                            border-radius: 4px;
                                             VerticalBox {
                                                 padding: 10px;
                                                 spacing: 6px;
@@ -1866,11 +1887,11 @@ export component SettingsWindow inherits Window {
                                                     text: "⚠️ 安装失败";
                                                     font-size: 14px;
                                                     font-weight: 700;
-                                                    color: #d13438;
+                                                    color: UiTokens.error;
                                                 }
                                                 Text {
                                                     text: root.dep-detail;
-                                                    color: #b02a2a;
+                                                    color: UiTokens.error;
                                                     font-size: 13px;
                                                     wrap: word-wrap;
                                                     horizontal-stretch: 1;
@@ -1891,7 +1912,7 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.claude-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://docs.claude.com/en/docs/claude-code/setup"); } }
                                         }
-                                        if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // codex
                                         HorizontalBox {
                                             height: 34px;
@@ -1909,9 +1930,9 @@ export component SettingsWindow inherits Window {
                                             if !root.codex-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
                                         }
                                         // #93：版本满足显示实际版本；版本过低给升级指引；未装保留 npm 命令提示
-                                        if root.codex-ok && root.codex-version != "": Text { text: "已安装 v\{root.codex-version}（最低要求 v0.140）"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
-                                        if root.codex-installed && !root.codex-ok: Text { text: "当前 v\{root.codex-version} 低于最低要求 v0.140（与沙箱能力对齐），请升级"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
-                                        if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if root.codex-ok && root.codex-version != "": Text { text: "已安装 v\{root.codex-version}（最低要求 v0.140）"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if root.codex-installed && !root.codex-ok: Text { text: "当前 v\{root.codex-version} 低于最低要求 v0.140（与沙箱能力对齐），请升级"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // pi
                                         HorizontalBox {
                                             height: 34px;
@@ -1926,7 +1947,7 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.pi-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
                                         }
-                                        if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // prime-agent
                                         HorizontalBox {
                                             height: 34px;
@@ -1941,7 +1962,7 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.prime-agent-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/PrimeIntellect-ai/prime-agent"); } }
                                         }
-                                        if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // nodejs
                                         HorizontalBox {
                                             height: 34px;
@@ -1955,7 +1976,7 @@ export component SettingsWindow inherits Window {
                                                 clicked => { root.install-dep("node"); }
                                             }
                                         }
-                                        if !root.node-installed: Text { text: "brew install node"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.node-installed: Text { text: "brew install node"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // python3
                                         HorizontalBox {
                                             height: 34px;
@@ -1969,7 +1990,7 @@ export component SettingsWindow inherits Window {
                                                 clicked => { root.install-dep("python3"); }
                                             }
                                         }
-                                        if !root.python-installed: Text { text: "brew install python"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.python-installed: Text { text: "brew install python"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // lark-cli
                                         HorizontalBox {
                                             height: 34px;
@@ -1983,7 +2004,7 @@ export component SettingsWindow inherits Window {
                                                 clicked => { root.install-dep("lark-cli"); }
                                             }
                                         }
-                                        if !root.lark-installed: Text { text: "npm install -g @larksuite/cli"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.lark-installed: Text { text: "npm install -g @larksuite/cli"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // dingtalk-cli
                                         HorizontalBox {
                                             height: 34px;
@@ -1998,7 +2019,7 @@ export component SettingsWindow inherits Window {
                                             }
                                             if !root.dingtalk-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
                                         }
-                                        if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 11px; color: PixelTheme.text.with-alpha(0.55); }
+                                        if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                     }
                                 }
 
@@ -2019,7 +2040,7 @@ export component SettingsWindow inherits Window {
                                         }
                                         if root.perms-supported && root.platform == "macos" && root.perm-busy: Text {
                                             text: "⏳ 正在逐项弹系统授权框（屏幕录制→摄像头→麦克风），请在弹框里点「允许」。完成后点「重新检测」刷新。";
-                                            font-size: 11px; color: #b80; wrap: word-wrap;
+                                            font-size: 12px; color: UiTokens.warn; wrap: word-wrap;
                                         }
                                         // Windows：管理员身份
                                         if root.perms-supported && root.platform == "windows": HorizontalBox {
@@ -2032,7 +2053,7 @@ export component SettingsWindow inherits Window {
                                         }
                                         if root.perms-supported && root.platform == "windows" && root.perm-admin != 2: Text {
                                             text: "Windows 无需逐项授权；以管理员身份运行即可完全控制本机（文件/鼠标键盘/屏幕/摄像头/麦克风）。点击上方按钮会弹 UAC 确认框。";
-                                            font-size: 11px; color: #888; wrap: word-wrap;
+                                            font-size: 12px; color: UiTokens.text-dim; wrap: word-wrap;
                                         }
                                         // macOS 六项权限
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
@@ -2109,15 +2130,15 @@ export component SettingsWindow inherits Window {
                                         }
                                         if root.perms-supported && root.platform == "macos" && (root.perm-full-disk != 2 || root.perm-screen != 2 || root.perm-camera != 2 || root.perm-microphone != 2): Text {
                                             text: "💡 未授权项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。改完可能需要重启服务生效。";
-                                            font-size: 11px;
-                                            color: #b80;
+                                            font-size: 12px;
+                                            color: UiTokens.warn;
                                             wrap: word-wrap;
                                         }
                                         if root.perms-supported: HorizontalBox {
                                             spacing: 8px;
                                             Text {
                                                 text: "授权/改权限后，运行中的服务要重启才认：";
-                                                font-size: 11px; color: #888; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1;
+                                                font-size: 12px; color: UiTokens.text-dim; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1;
                                             }
                                             PixelButton { text: "🔁 重启服务生效"; clicked => { root.restart-service-request(); } }
                                         }
@@ -2125,15 +2146,15 @@ export component SettingsWindow inherits Window {
                                 }
                                 if !root.perms-supported: Text {
                                     text: "系统权限检测仅 macOS 需要（本机为其它系统）。";
-                                    font-size: 11px;
-                                    color: #888;
+                                    font-size: 12px;
+                                    color: UiTokens.text-dim;
                                     wrap: word-wrap;
                                 }
 
                                 Text {
                                     text: "说明：claude/codex 由「模型供应商配置」提供凭证，不再在运行期弹授权；pi/prime-agent 用自己的登录态（~/.pi、~/.prime，配了供应商则注入对应 key）。nodejs 是 codex/prime-agent/lark-cli 的前置；接入飞书 bot 时会自动装 lark 技能。";
-                                    font-size: 11px;
-                                    color: #888;
+                                    font-size: 12px;
+                                    color: UiTokens.text-dim;
                                     wrap: word-wrap;
                                 }
                             }
@@ -2179,8 +2200,8 @@ export component SettingsWindow inherits Window {
                                                         }
                                                         Text {
                                                             text: prov.kind + (prov.is-default ? " · 默认" : "");
-                                                            font-size: 11px;
-                                                            color: idx == root.provider-selected ? PixelTheme.bg.with-alpha(0.85) : #888;
+                                                            font-size: 12px;
+                                                            color: idx == root.provider-selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
                                                         }
                                                     }
                                                 }
@@ -2270,12 +2291,12 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                             }
-                                            if root.provider-selected < 0: Text { text: "← 选择或添加一个供应商"; color: #888; }
+                                            if root.provider-selected < 0: Text { text: "← 选择或添加一个供应商"; color: UiTokens.text-dim; }
 
                                             Text {
                                                 text: "只支持 Anthropic 原生（claude / pi / prime-agent）与 OpenAI 兼容（codex / pi / prime-agent：chat / responses 两种接口）。claude 后端需 anthropic 型，codex 后端需 openai 型；pi/prime-agent 两种都吃（key 走对应 env）。桥内配置优先于 CC Switch。";
-                                                font-size: 11px;
-                                                color: #888;
+                                                font-size: 12px;
+                                                color: UiTokens.text-dim;
                                                 wrap: word-wrap;
                                             }
                                         }
@@ -2350,8 +2371,8 @@ export component SettingsWindow inherits Window {
                             Text {
                                 horizontal-stretch: 1;
                                 text: "超过该天数未活跃的会话，由 bot 后端 agent 归纳成摘要存档（summaries/）并清理工作区内的历史/会话文件；摘要下次会话自动注入衔接上下文。仅清理本 bot 工作区，不触碰后端私有目录。";
-                                font-size: 11px;
-                                color: #888;
+                                font-size: 12px;
+                                color: UiTokens.text-dim;
                                 wrap: word-wrap;
                                 vertical-alignment: center;
                             }
@@ -2387,7 +2408,7 @@ export component SettingsWindow inherits Window {
                                                         spacing: 2px;
                                                         Text {
                                                             text: h.time + "  " + h.sender + "  " + h.bot + "  " + h.kind + "  " + h.direction;
-                                                            font-size: 11.5px;
+                                                            font-size: 12px;
                                                             font-weight: 600;
                                                             overflow: elide;
                                                             width: 100%;
@@ -2395,7 +2416,7 @@ export component SettingsWindow inherits Window {
                                                         }
                                                         Text {
                                                             text: h.preview;
-                                                            font-size: 11px;
+                                                            font-size: 12px;
                                                             overflow: elide;
                                                             width: 100%;
                                                             color: idx == root.history-selected ? PixelTheme.bg.with-alpha(0.85) : PixelTheme.text.with-alpha(0.6);
@@ -2406,7 +2427,7 @@ export component SettingsWindow inherits Window {
                                             if root.history-rows.length == 0: Text {
                                                 text: "暂无记录：授权者私聊本机器人后，消息与回复会显示在这里";
                                                 font-size: 12px;
-                                                color: #888;
+                                                color: UiTokens.text-dim;
                                                 wrap: word-wrap;
                                             }
                                         }
@@ -2460,7 +2481,7 @@ export component SettingsWindow inherits Window {
                     Text {
                         // 有临时状态（保存/测试结果）优先显示；平时显示服务运行概览行
                         text: root.status-line != "" ? root.status-line : root.running-line;
-                        color: root.status-line != "" && root.status-is-error ? #c00 : #2a7d2f;
+                        color: root.status-line != "" && root.status-is-error ? UiTokens.error : UiTokens.ok;
                         wrap: word-wrap;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
