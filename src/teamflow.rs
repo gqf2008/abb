@@ -178,17 +178,39 @@ impl TeamPlanGenerator for RealTeamPlanGenerator {
     }
 }
 
+/// #142：角色名 → emoji 稳定映射（顺序无关、关键词匹配；未知回退 ⚙️）。
+/// 修正原 `i % len` 下标循环：角色顺序变化不再错位，同一角色跨团队显示一致。
+fn emoji_for_role(role_name: &str) -> &'static str {
+    // 按特异性排序：含「测试/QA」的角色名（如「测试工程师」）优先命中 🧪，
+    // 避免被更宽泛的「工程/开发」抢先映射成 💻。
+    const MAP: [(&[&str], &str); 7] = [
+        (&["产品"], "👤"),
+        (&["ui", "设计", "ux", "交互"], "🎨"),
+        (&["测试", "qa", "质量"], "🧪"),
+        (&["后端", "前端", "编程", "开发", "工程", "技术"], "💻"),
+        (&["运营"], "📣"),
+        (&["市场", "增长", "营销"], "📈"),
+        (&["运维", "基础设施", "部署"], "🛠️"),
+    ];
+    let lower = role_name.to_lowercase();
+    for (keys, emoji) in MAP {
+        if keys.iter().any(|k| lower.contains(k)) {
+            return emoji;
+        }
+    }
+    "⚙️"
+}
+
 /// 渲染方案预览（#124 2.3 纯文本格式，三端通用；UI 定稿的推荐基线）。
 pub fn render_preview(plan: &TeamPlan) -> String {
-    const EMOJIS: [&str; 10] = ["👤", "🎨", "💻", "🧪", "📈", "📣", "🛠️", "📚", "🔧", "🧭"];
     let mut out = String::new();
     out.push_str(&format!("📋 团队「{}」方案预览\n", plan.team_name));
     out.push_str("━━━━━━━━━━━━━━\n");
-    for (i, role) in plan.roles.iter().enumerate() {
+    for role in plan.roles.iter() {
         let member = role.member_name.as_deref().unwrap_or("待任命");
         out.push_str(&format!(
             "{} {}（{}）— {}\n",
-            EMOJIS[i % EMOJIS.len()],
+            emoji_for_role(&role.role_name),
             role.role_name,
             member,
             role.system_prompt
@@ -319,6 +341,54 @@ pub fn render_create_result(plan: &TeamPlan, outcomes: &[CreateOutcome]) -> Stri
 mod tests {
     use super::*;
     use crate::teambuilder::TeamRole;
+
+    #[test]
+    fn emoji_mapping_is_order_independent_and_stable() {
+        // #142：同一角色名在任何顺序下都映射同一 emoji；关键词命中；未知回退 ⚙️
+        assert_eq!(emoji_for_role("产品经理"), "👤");
+        assert_eq!(emoji_for_role("UI/UX 设计"), "🎨");
+        assert_eq!(emoji_for_role("交互设计师"), "🎨");
+        assert_eq!(emoji_for_role("后端工程师"), "💻");
+        assert_eq!(emoji_for_role("前端开发"), "💻");
+        assert_eq!(emoji_for_role("测试工程师"), "🧪");
+        assert_eq!(emoji_for_role("QA"), "🧪");
+        assert_eq!(emoji_for_role("运营专员"), "📣");
+        assert_eq!(emoji_for_role("市场增长"), "📈");
+        assert_eq!(emoji_for_role("运维"), "🛠️");
+        assert_eq!(emoji_for_role("法务顾问"), "⚙️", "未知角色回退");
+        assert_eq!(
+            emoji_for_role("产品经理"),
+            emoji_for_role("产品经理"),
+            "稳定"
+        );
+    }
+
+    #[test]
+    fn render_preview_uses_keyword_emoji() {
+        // #142：预览行 emoji 与角色名匹配（首个角色是 UI 时不再拿到 👤）
+        let plan = crate::teambuilder::TeamPlan {
+            team_name: "x".into(),
+            roles: vec![
+                TeamRole {
+                    role_name: "UI/UX 设计".into(),
+                    member_name: None,
+                    system_prompt: "负责界面".into(),
+                },
+                TeamRole {
+                    role_name: "产品经理".into(),
+                    member_name: None,
+                    system_prompt: "负责需求".into(),
+                },
+            ],
+            collab: None,
+        };
+        let out = render_preview(&plan);
+        assert!(
+            out.contains("🎨 UI/UX 设计"),
+            "UI 角色应映射 🎨（即使排第一个）: {out}"
+        );
+        assert!(out.contains("👤 产品经理"), "产品应映射 👤: {out}");
+    }
 
     #[test]
     fn intent_hits_with_goal() {
