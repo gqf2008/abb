@@ -770,7 +770,7 @@ impl Default for Config {
             owner_open_id: String::new(),
             default_backend: String::new(),
             cross_delivery_enabled: false,
-            lock_screen_control: false, // #129 锁屏控制默认关
+            lock_screen_control: false,     // #129 锁屏控制默认关
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
             context_segment_size: default_ctx_segment_size(),
