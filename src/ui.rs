@@ -1121,6 +1121,7 @@ pub fn run_gui() -> Result<()> {
     let unsaved_dialog = UnsavedDialog::new()?;
     // 虚拟 Bot（#75）：创建/编辑/登记弹窗 + 取消登记/解散群确认弹窗
     let vb_dialog = VirtualBotDialog::new()?;
+    let team_dialog = TeamDialog::new()?; // #124 一键创建团队（P2，mock）
     let vb_confirm = ConfirmDialog::new()?;
     // #74 提醒弹窗：授权者私聊 toast（右上角、5s 自动收起）；创建后一直隐藏，
     // 2s 轮询发现未读时由 show_notifications_window 显示。
@@ -3046,6 +3047,95 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // #124 一键创建团队（P2，mock 阶段）：UI 骨架先行，数据为预设，后端 #123 就绪后换真数据流。
+    {
+        let td = team_dialog.as_weak();
+        let work = work.clone();
+        settings.on_team_create_clicked(move |idx| {
+            let Some(d) = td.upgrade() else { return };
+            let label = work.borrow().get(idx as usize).map(|bot| {
+                if bot.name.is_empty() {
+                    format!("（{}）", kind_label(&bot.kind))
+                } else {
+                    bot.name.clone()
+                }
+            }).unwrap_or_default();
+            d.set_bot_label(label.into());
+            d.set_mode(0);
+            d.set_target_input("".into());
+            d.set_team_name("".into());
+            d.set_flow("".into());
+            d.set_roles(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<TeamRoleRow>::new()))));
+            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<TeamResultRow>::new()))));
+            d.set_busy(false);
+            show_window_and_focus(&d);
+        });
+    }
+    // 生成方案（mock：从目标文本取前 10 字符作团队名，固定 4 角色，成员待任命）
+    {
+        let td = team_dialog.as_weak();
+        team_dialog.on_generate_clicked(move || {
+            let Some(d) = td.upgrade() else { return };
+            let target = d.get_target_input().trim().to_string();
+            let name = if target.is_empty() {
+                "我的团队".to_string()
+            } else {
+                let mut n: String = target.chars().take(10).collect();
+                if target.chars().count() > 10 {
+                    n.push('…');
+                }
+                n
+            };
+            d.set_team_name(name.into());
+            d.set_flow("产品 → UI/UX → 开发 → 测试 循环".into());
+            let roles = vec![
+                TeamRoleRow { role_name: "产品经理".into(), member: "".into(), duty: "负责需求分析与排期".into() },
+                TeamRoleRow { role_name: "UI/UX 设计".into(), member: "".into(), duty: "负责界面与交互设计".into() },
+                TeamRoleRow { role_name: "开发工程师".into(), member: "".into(), duty: "负责功能实现".into() },
+                TeamRoleRow { role_name: "测试工程师".into(), member: "".into(), duty: "负责质量保障".into() },
+            ];
+            d.set_roles(slint::ModelRc::from(Rc::new(slint::VecModel::from(roles))));
+            d.set_mode(1);
+        });
+    }
+    // 确认创建（mock：演示部分失败清单；真实后端就绪后改走 UiCmd 异步建群）
+    {
+        let td = team_dialog.as_weak();
+        team_dialog.on_confirm_clicked(move || {
+            let Some(d) = td.upgrade() else { return };
+            d.set_busy(true);
+            d.set_mode(2);
+            let results = vec![
+                TeamResultRow { text: "产品经理（待任命）→ 已建，可 @产品经理 对话".into(), ok: true },
+                TeamResultRow { text: "UI/UX 设计（待任命）→ 已建".into(), ok: true },
+                TeamResultRow { text: "开发工程师（待任命）→ 已建".into(), ok: true },
+                TeamResultRow { text: "测试工程师（待任命）→ 失败：群名与现有群冲突，请改名后重试（mock 演示）".into(), ok: false },
+            ];
+            d.set_results(slint::ModelRc::from(Rc::new(slint::VecModel::from(results))));
+            d.set_busy(false);
+        });
+    }
+    // 修改 → 回目标输入
+    {
+        let td = team_dialog.as_weak();
+        team_dialog.on_back_clicked(move || {
+            if let Some(d) = td.upgrade() {
+                d.set_mode(0);
+            }
+        });
+    }
+    // 关闭（busy 时禁用，同虚拟 Bot 弹窗纪律）
+    {
+        let td = team_dialog.as_weak();
+        team_dialog.on_close_clicked(move || {
+            if let Some(d) = td.upgrade() {
+                if !d.get_busy() {
+                    let _ = d.hide();
+                }
+            }
+        });
+    }
+
     // 手动刷新：验证登记群存在性（平台解散兜底 + 历史归档），结果走状态行。
     // 独立 block：不依赖上面的 block 变量（work/tx 已被 on_virtual_bot_create 闭包 move），
     // 直接 clone 最外层作用域变量 + weak settings。
