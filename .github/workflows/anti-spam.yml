@@ -1,0 +1,27 @@
+name: Anti-Spam
+
+# 防广告评论：扫描 issue/PR 评论中的推广 spam，自动删除高置信广告并通知。
+# 触发：新评论事件 + 每 6 小时补扫 + 手动全量扫描。
+
+on:
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run anti-spam scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: python3 .github/antispam/anti-spam.py
