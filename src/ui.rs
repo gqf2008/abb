@@ -437,6 +437,8 @@ fn vb_rows_for(bot: &BotConfig) -> Vec<VirtualBotRow> {
             platform: kind_label(&bot.kind).into(),
             chat_id: v.chat_id.clone().into(),
             created_at: format_created(v.created_at).into(),
+            // #91：虚拟 Bot 免 @ 状态 = mention_modes[chat_id] == "off"（事实源单一）
+            mention_off: bot.mention_modes.get(&v.chat_id).map(String::as_str) == Some("off"),
         })
         .collect()
 }
@@ -912,6 +914,8 @@ fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
         .map(|b| b.restrict_granted_agent)
         .unwrap_or(false)));
     w.set_tidy_options(mk(bot.as_ref().map(|b| b.tidy_enabled).unwrap_or(false)));
+    // #91 群聊提及默认（bot 级）：true=免 @ 参与
+    w.set_mention_options(mk(bot.as_ref().map(|b| b.mention_default).unwrap_or(false)));
 }
 
 /// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/供应商/Owner/App ID/App Secret/
@@ -2604,6 +2608,32 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // #91 群聊提及默认（bot 级）：true=免 @ 参与。同独立 bool callback 模式。
+    {
+        let work = work.clone();
+        let model = bots_model.clone();
+        let dirty = dirty.clone();
+        let sw = settings.as_weak();
+        settings.on_set_mention_default(move |idx, enabled| {
+            dirty.set(true);
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.mention_default = enabled;
+                }
+            }
+            let b = work.borrow();
+            sync_model(&model, &b);
+            if let Some(w) = sw.upgrade() {
+                w.set_mention_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+                    OptionRow {
+                        name: "".into(),
+                        checked: enabled,
+                    },
+                ]))));
+            }
+        });
+    }
     {
         let cdwork = wk.cross_delivery.clone();
         let dirty = dirty.clone();
@@ -3037,7 +3067,9 @@ pub fn run_gui() -> Result<()> {
         let dlg = vb_dialog.as_weak();
         let twork = wk.templates.clone();
         settings.on_virtual_bot_edit(move |row| {
-            let Some(w) = sw.upgrade() else { return };
+            let Some(w) = sw.upgrade() else {
+                return;
+            };
             let sel = w.get_selected();
             let b = work.borrow();
             let Some(bot) = b.get(sel as usize) else {
@@ -3066,6 +3098,35 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let action = vb_action.clone();
         let confirm = vb_confirm.as_weak();
+        // #91 虚拟 Bot 免 @ 开关：切换 mention_modes[chat_id]（事实源单一，热读即时生效）。
+        settings.on_virtual_bot_mention_toggle({
+            let sw = sw.clone();
+            let work = work.clone();
+            let dirty = dirty.clone();
+            move |row| {
+                crate::log!("[gui] ⋯ 切换虚拟 Bot 免@开关 row={row}");
+                let Some(w) = sw.upgrade() else { return };
+                let sel = w.get_selected();
+                let mut b = work.borrow_mut();
+                let Some(bot) = b.get_mut(sel as usize) else {
+                    return;
+                };
+                let regs = VirtualBotStore::new().load_for(&bot.key());
+                let Some(reg) = regs.get(row as usize) else {
+                    return;
+                };
+                // toggle：off → 移除条目（恢复需要 @）；其它 → 置 off（免 @）
+                let is_off = bot.mention_modes.get(&reg.chat_id).map(String::as_str) == Some("off");
+                if is_off {
+                    bot.mention_modes.remove(&reg.chat_id);
+                } else {
+                    bot.mention_modes.insert(reg.chat_id.clone(), "off".into());
+                }
+                dirty.set(true);
+                drop(b);
+                refresh_vb_rows(&w, &*work);
+            }
+        });
         settings.on_virtual_bot_deregister(move |row| {
             crate::log!("[gui] ⋯ 点击「取消登记」 row={row}");
             let Some(w) = sw.upgrade() else { return };

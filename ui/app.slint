@@ -186,6 +186,7 @@ export struct VirtualBotRow {
     platform: string,    // 飞书 / 钉钉（微信排除）
     chat-id: string,     // 平台群会话 id（编辑/解散用）
     created-at: string,  // 登记时间（已格式化 YYYY-MM-DD HH:MM）
+    mention-off: bool,   // #91 该角色群是否免 @ 参与（事实源 mention_modes[chat-id]）
 }
 
 // 角色模板行（#75）：内置 + 自定义（前 builtin-count 个为内置，不可编辑/删除）
@@ -901,6 +902,8 @@ export component SettingsWindow inherits Window {
     in-out property <[OptionRow]> enabled-options: [];
     in-out property <[OptionRow]> restrict-options: [];
     in-out property <[OptionRow]> tidy-options: [];
+    // #91 群聊提及默认策略（bot 级）：true=免 @ 参与（该 bot 所有群默认免 @；per-chat 覆盖优先）
+    in-out property <[OptionRow]> mention-options: [];
     // 文本编辑框/下拉的单元素 model（name/provider/owner/app_id/app_secret/
     // ding_robot_code/ding_owner_ids 各一）：输入/选择交互断绑后显示不跟随，切 bot
     // 时由 refresh_editors 整体替换 model → for 重建实例（同 OptionRow 绕法）。
@@ -1015,6 +1018,8 @@ export component SettingsWindow inherits Window {
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
     callback set-restrict-granted(int, bool); // 授权者 agent 隔离开关（true=受限模式，保存后即时生效）
     callback set-tidy-enabled(int, bool); // 每日工作目录整理开关（默认关，保存后即时生效）
+    callback set-mention-default(int, bool); // #91 群聊提及默认开关（true=免 @ 参与，保存后即时生效）
+    callback virtual-bot-mention-toggle(int); // #91 虚拟 Bot 免 @ 开关（按行索引切换 mention_modes[chat-id]）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-url(string); // 打开外部链接（依赖文档 / 申请 token 等，默认浏览器）
     callback recheck-deps();            // 重新检测依赖是否已装
@@ -1435,6 +1440,20 @@ export component SettingsWindow inherits Window {
                                                         }
                                                     }
                                                 }
+                                                // #91 群聊提及默认策略：true=该 bot 所有群免 @ 参与（per-chat /mention 可单独覆盖）。
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "群聊提及"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        spacing: 12px;
+                                                        for opt[i] in root.mention-options: PixelCheckBox {
+                                                            text: "免 @ 参与（该 bot 所有群默认无需 @；群内 /mention 指令可单独覆盖）";
+                                                            checked: opt.checked;
+                                                            horizontal-stretch: 1;
+                                                            toggled => { root.set-mention-default(root.selected, self.checked); }
+                                                        }
+                                                    }
+                                                }
                                                 // ── 飞书字段（owner/授权者/对话权限）──
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "feishu": Row {
                                                     Text { text: "对话权限"; width: 80px; vertical-alignment: center; }
@@ -1781,10 +1800,15 @@ export component SettingsWindow inherits Window {
                                                             PixelButton { text: "编辑"; size: "small"; clicked => { root.virtual-bot-edit(i); } }
                                                             PixelButton { text: "⋯"; size: "small"; clicked => { root.vb-menu-open = root.vb-menu-open == i ? -1 : i; } }
                                                         }
-                                                        // ⋯ 菜单（行内展开）：取消登记（轻确认）/ 解散群（强确认，仅飞书有解散 API）
+                                                        // ⋯ 菜单（行内展开）：免@开关（#91）/ 取消登记（轻确认）/ 解散群（强确认，仅飞书有解散 API）
                                                         if root.vb-menu-open == i: HorizontalBox {
                                                             spacing: 8px;
                                                             Rectangle { horizontal-stretch: 1; }
+                                                            PixelCheckBox {
+                                                                text: vb.mention-off ? "免 @ 参与：开" : "免 @ 参与：关";
+                                                                checked: vb.mention-off;
+                                                                toggled => { root.virtual-bot-mention-toggle(i); }
+                                                            }
                                                             PixelButton { text: "取消登记"; size: "small"; variant: "ghost"; clicked => { root.virtual-bot-deregister(i); root.vb-menu-open = -1; } }
                                                             if root.bots[root.selected].kind == "feishu": PixelButton { text: "解散群"; size: "small"; variant: "danger"; clicked => { root.virtual-bot-disband(i); root.vb-menu-open = -1; } }
                                                         }
