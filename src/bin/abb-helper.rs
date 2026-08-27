@@ -141,12 +141,14 @@ fn handle_conn(mut stream: UnixStream) -> Result<(), String> {
     let resp = match cmd {
         "status" => serde_json::json!({ "ok": true, "pid": std::process::id() }),
         "unlock" => {
-            let pw = req
+            let mut pw = req
                 .get("password")
                 .and_then(|p| p.as_str())
                 .unwrap_or("")
                 .to_string();
-            match do_unlock(&pw) {
+            let result = do_unlock(&pw);
+            wipe(&mut pw); // 瞬态密码清零（不落盘/不进日志）
+            match result {
                 Ok(()) => serde_json::json!({ "ok": true }),
                 Err(e) => serde_json::json!({ "ok": false, "error": e }),
             }
@@ -188,8 +190,9 @@ fn peer_ok(stream: &UnixStream) -> bool {
     let Some(path) = proc_path(pid) else {
         return false;
     };
-    let path_ok = path.ends_with(&format!("/{MAIN_APP_NAME}"))
-        || path.contains(&format!("/{MAIN_APP_NAME}."));
+    // basename 精确匹配（防 /agent-bridge.* 子串误放行用户可写目录；签名校验才是强闸）。
+    let name = path.rsplit('/').next().unwrap_or("");
+    let path_ok = name == MAIN_APP_NAME || name.starts_with(&format!("{MAIN_APP_NAME}."));
     if !path_ok {
         return false;
     }
@@ -258,6 +261,8 @@ fn signature_state(pid: i32) -> SignatureState {
     const ERR_CS_UNSIGNED: i32 = -67062;
     const ERR_CS_REQ_FAILED: i32 = -67072;
 
+    #[link(name = "Security", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn SecCodeCopyGuestWithAttributes(
             host: *const c_void,
@@ -362,6 +367,17 @@ fn signature_state(pid: i32) -> SignatureState {
 
 // ─────────────────────────── 解锁（HID 注入） ───────────────────────────
 
+/// 清零字符串内容（瞬态密码用；不打印、不落盘）。
+#[cfg(target_os = "macos")]
+fn wipe(s: &mut String) {
+    unsafe {
+        for b in s.as_bytes_mut() {
+            *b = 0;
+        }
+    }
+    s.clear();
+}
+
 /// 单次解锁：逐字符注入按键（含 shift），最后回车。密码瞬态，不落盘/不重试。
 #[cfg(target_os = "macos")]
 fn do_unlock(pw: &str) -> Result<(), String> {
@@ -379,6 +395,7 @@ fn do_unlock(pw: &str) -> Result<(), String> {
         .ok_or_else(|| "密码含当前布局不支持的非 ASCII/特殊字符".to_string())?;
 
     // IOHIDEventSystemClient：root 下 DispatchEvent 可注入锁屏会话（ToDesk 同路线）。
+    // 逐字符注入：中途失败会留下部分已输入字符（Return 在末尾不提交，未登录成功）——可接受，失败即返回。
     let client = hid_client_create()
         .ok_or_else(|| "IOHIDEventSystemClientCreate 失败（无 HID 子系统？）".to_string())?;
 
@@ -458,6 +475,8 @@ fn key_for(ch: char) -> Option<(u32, bool)> {
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "IOKit", kind = "framework")]
+#[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     // IOKit HID
     fn IOHIDEventSystemClientCreate(allocator: *const std::ffi::c_void) -> *mut std::ffi::c_void;

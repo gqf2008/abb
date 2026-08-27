@@ -183,7 +183,6 @@ pub fn unlock(mut password: String) -> Result<(), String> {
     let cmd = serde_json::json!({
         "cmd": "unlock",
         "password": password,
-        "timeout_ms": 8000,
     });
     let r = send_cmd(&cmd);
     wipe(&mut password); // 瞬态密码立即清零（不落盘/不进日志）
