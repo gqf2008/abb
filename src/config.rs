@@ -1953,7 +1953,10 @@ mod tests {
     #[test]
     fn mention_default_defaults_and_roundtrip() {
         // #91：mention_default 默认 false（需要 @，向后兼容）；旧 config 无字段按默认
-        let c = Config::default();
+        let c = Config {
+            bots: vec![BotConfig::default()],
+            ..Default::default()
+        };
         assert!(!c.bots[0].mention_default);
         let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
         let back: Config = serde_json::from_str(old).unwrap();
