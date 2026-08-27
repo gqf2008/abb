@@ -139,6 +139,18 @@ impl Bridge {
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
+            // #124 团队创建流程进行中：/cancel 也中止（WaitingGoal/WaitingConfirm 通用），
+            // 避免出现「/cancel 却说没有任务在跑」的割裂。
+            if self.team_flows.get(&key).is_some() {
+                self.team_flows.remove(&key);
+                if let Err(e) = self
+                    .send_reply(&ev, "已取消团队创建，随时可以再发起。")
+                    .await
+                {
+                    crate::log!("[bridge] /cancel 团队中止确认发送失败: {e:#}");
+                }
+                return;
+            }
             // 无在跑任务 → 命令化反馈，不喂给 agent
             if let Err(e) = self.send_reply(&ev, "✅ 当前没有正在运行的任务。").await {
                 crate::log!("[bridge] /cancel 确认发送失败: {e:#}");
@@ -284,6 +296,16 @@ impl Bridge {
             };
             if let Err(e) = self.send_reply(&ev, &reply).await {
                 crate::log!("[bridge] /trash 确认发送失败: {e:#}");
+            }
+            return;
+        }
+
+        // #124 一键创建团队·聊天入口（P1 后端）：触发词 → 方案预览 → 确认/修改/取消 → 建群。
+        // 拦截在 pending 落盘之前（命中即短路返回，不落盘、不进 agent）；未命中原样透传。
+        // 仅 owner 可触发（建群是管理动作）；内部持 per-chat 串行锁与 agent 路径互斥。
+        if let Some(reply) = self.team_chat_reply(&ev, &text).await {
+            if let Err(e) = self.send_reply(&ev, &reply).await {
+                crate::log!("[bridge] 团队流程回复发送失败: {e:#}");
             }
             return;
         }
