@@ -332,9 +332,9 @@ fn signature_state(pid: i32) -> SignatureState {
         }
 
         // requirement: identifier "com.sqb.abb"（bundle id；裸二进制按 designated requirement 匹配）。
-        let req_str =
-            CStr::from_bytes_with_nul(format!("identifier \"{MAIN_BUNDLE_ID}\"\0").as_bytes())
-                .unwrap_or(c"identifier \"com.sqb.abb\"");
+        let req_bytes = format!("identifier \"{MAIN_BUNDLE_ID}\"\0");
+        let req_str = CStr::from_bytes_with_nul(req_bytes.as_bytes())
+            .unwrap_or(c"identifier \"com.sqb.abb\"");
         let req_cf =
             CFStringCreateWithCString(std::ptr::null(), req_str.as_ptr(), KCF_STRING_ENCODING_UTF8);
         let mut req: *const c_void = std::ptr::null();
@@ -379,7 +379,7 @@ fn do_unlock(pw: &str) -> Result<(), String> {
         .ok_or_else(|| "密码含当前布局不支持的非 ASCII/特殊字符".to_string())?;
 
     // IOHIDEventSystemClient：root 下 DispatchEvent 可注入锁屏会话（ToDesk 同路线）。
-    let client = unsafe { hid_client_create() }
+    let client = hid_client_create()
         .ok_or_else(|| "IOHIDEventSystemClientCreate 失败（无 HID 子系统？）".to_string())?;
 
     let r = (|| -> Result<(), String> {
@@ -404,7 +404,7 @@ fn do_unlock(pw: &str) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(12));
         hid_post_key(client, RETURN, false)
     })();
-    unsafe { hid_client_release(client) };
+    hid_client_release(client);
     // 无论成败：密码字符串在调用方已清零；这里再保险（不打印、不落盘）。
     r
 }

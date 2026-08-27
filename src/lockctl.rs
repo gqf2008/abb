@@ -159,6 +159,8 @@ pub fn uninstall() -> Result<String, String> {
 /// 解锁：把用户提供的密码按键瞬态注入 loginwindow。
 /// 前置闸：config.lock_screen_control 必须为 true；密码非空且 ≤512 字符。
 /// 失败/超时即丢弃，助手侧不重试（防暴力尝试）。密码在发送后立即覆写清零。
+/// Stage 2：agent 集成（用户当前会话提供密码 → 调本入口）；当前 CLI/GUI 未接线。
+#[allow(dead_code)] // Stage 2 agent 集成入口（#129 待真机验证项）
 pub fn unlock(mut password: String) -> Result<(), String> {
     let cfg = crate::config::Config::load().map_err(|e| format!("读配置失败: {e}"))?;
     if !cfg.lock_screen_control {
@@ -254,6 +256,7 @@ fn run_admin(script: &str) -> Result<String, String> {
 }
 
 /// 内存覆写清零（瞬态密码用；不保证编译器不优化，但配合 move 语义足够 Stage 1）。
+#[allow(dead_code)] // 仅 unlock 路径使用（Stage 2 接线后移除）
 fn wipe(s: &mut String) {
     unsafe {
         for b in s.as_bytes_mut() {
