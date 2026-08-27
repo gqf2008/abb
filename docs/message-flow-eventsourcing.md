@@ -29,7 +29,7 @@ add(pending) ── agent run ── set_reply(回复落盘) ── send ── 
 dsh 式事件溯源（`msg/received` / `agent/started` / `agent/completed` / `delivery/sent` 事件 + 恢复状态机 + checkpoint 裁剪）评估：
 
 **收益**：
-- W1 重跑收敛为「不重跑」——但 ABB 后端 resume 语义各异（codex 需真实 tid、pi 无 resume、prime 同 codex 式），「续跑」不可靠；不重跑 = 用户问题不被回答，对 IM 场景更糟
+- W1 重跑收敛为「不重跑」——但 ABB 后端 resume 语义各异（codex 需真实 tid、pi 无 resume），「续跑」不可靠；不重跑 = 用户问题不被回答，对 IM 场景更糟
 - 副作用去重——**2.11.0 已全部幂等**（见上表），无增量
 - 唯一实质收益：架构对齐 dsh（未来扩展面），非功能收益
 

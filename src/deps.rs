@@ -1,4 +1,4 @@
-//! 依赖检测与安装 —— claude / codex / pi / prime-agent / nodejs / python3 / lark-cli / dingtalk-cli。
+//! 依赖检测与安装 —— claude / codex / pi / nodejs / python3 / lark-cli / dingtalk-cli。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
 //! 安装命令按平台出（mac 用 brew/npm/curl 安装器，win 用 winget/npm，linux 用 apt/dnf/npm）。
 //! 本轮只验证 mac 路径；win/linux 编译可用、不行则给「请手动安装」文案。
@@ -215,7 +215,7 @@ pub const MIN_CODEX_VERSION: &str = "0.140";
 
 #[derive(Debug, Clone)]
 pub struct DepStatus {
-    /// 机器键：claude | codex | pi | prime-agent | node | python3 | lark-cli | dingtalk-cli
+    /// 机器键：claude | codex | pi | node | python3 | lark-cli | dingtalk-cli
     pub id: &'static str,
     /// 展示名。
     pub label: &'static str,
@@ -281,12 +281,6 @@ pub fn detect_all() -> Vec<DepStatus> {
         codex,
         // pi：npm 全局 bin（~/.npm-global/bin/pi，软链到 pi-coding-agent 的 cli.js）
         probe("pi", "Pi (pi-coding-agent)", &["pi"]),
-        // prime-agent：官方 curl 安装器装到 npm 全局 bin（~/.npm-global/bin/prime-agent）
-        probe(
-            "prime-agent",
-            "prime-agent (Prime Intellect)",
-            &["prime-agent"],
-        ),
         probe("node", "Node.js", &["node"]),
         probe("python3", "Python 3", &["python3", "python"]),
         probe("lark-cli", "lark-cli", &["lark-cli"]),
@@ -419,12 +413,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     ],
                 ),
             ],
-            // prime-agent：官方安装器（curl app.primeintellect.ai，README 标注 macOS/Linux）。
-            // 无 npm 公共包回落（官方文档明确：源码树里的 npm 标识不是公开安装路径）；
-            // 安装器要求 node 20.6+/npm——缺失时由一键装的 node 前置/跳过判定兜底。
-            "prime-agent" => vec![InstallStep::shell(
-                "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
-            )],
             "node" => vec![InstallStep::exec("brew", &["install", "node"])],
             "python3" => vec![InstallStep::exec("brew", &["install", "python"])],
             "lark-cli" => vec![InstallStep::exec(
@@ -468,12 +456,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     "@earendil-works/pi-coding-agent",
                 ],
             )],
-            // prime-agent：官方安装器只标 macOS/Linux（Windows 需 bash 环境，官方
-            // windows.md 指导装 Git for Windows 后走同一安装脚本）——桥不自动装，
-            // 给手动指引（deps 页「安装」按钮会展示该文案）。
-            "prime-agent" => {
-                return Err("prime-agent 官方安装器仅覆盖 macOS/Linux。Windows 请先安装 Git for Windows，再在 Git Bash 里运行：curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | bash".to_string());
-            }
             "node" => vec![InstallStep::exec("winget", &["install", "OpenJS.NodeJS"])],
             "python3" => vec![InstallStep::exec(
                 "winget",
@@ -510,10 +492,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                     "--ignore-scripts",
                     "@earendil-works/pi-coding-agent",
                 ],
-            )],
-            // prime-agent：官方安装器（README 标注 macOS/Linux）；无 npm 公共包回落。
-            "prime-agent" => vec![InstallStep::shell(
-                "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
             )],
             // linux 包管理器按二进制探测：优先 apt-get，其次 dnf。
             "node" => vec![InstallStep::shell(
@@ -779,14 +757,10 @@ pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     ids
 }
 
-/// 该依赖安装是否需要 node/npm 已就绪：① 安装计划首步用 npm（win 的 claude/pi 首步是
-/// npm；mac 的 claude/pi 是 curl shell 不依赖 node）；② prime-agent——curl 安装器内部
-/// 检查 node 20.6+/npm，无终端环境无法交互装 node 必失败。纯函数（内部调 install_plan），
+/// 该依赖安装是否需要 node/npm 已就绪：安装计划首步用 npm（win 的 claude/pi 首步是
+/// npm；mac 的 claude/pi 是 curl shell 不依赖 node）。纯函数（内部调 install_plan），
 /// 供「node 失败 → 跳过」判定。
 fn install_needs_node(dep_id: &str) -> bool {
-    if dep_id == "prime-agent" {
-        return true;
-    }
     install_plan(dep_id)
         .ok()
         .and_then(|steps| steps.into_iter().next())
@@ -824,7 +798,7 @@ pub fn format_all_summary(o: &AllInstallOutcome) -> String {
 
 /// 一键安装全部缺失组件（#60）。on_evt 在每项开始前同步调用（非 async 闭包，await
 /// 间隙之间触发）。策略：继续不中断 + 如实汇总；node 失败后跳过需 node/npm 的依赖
-/// （npm 首步计划 + prime-agent 安装器；mac 的 claude/pi 走 curl 原生路径不受影响）；
+/// （npm 首步计划；mac 的 claude/pi 走 curl 原生路径不受影响）；
 /// 每项 20 分钟超时。
 pub async fn install_all_missing(mut on_evt: impl FnMut(InstallEvt) + Send) -> AllInstallOutcome {
     let mut outcome = AllInstallOutcome::default();
@@ -1380,15 +1354,14 @@ mod tests {
     }
 
     #[test]
-    fn detect_all_covers_eight() {
+    fn detect_all_covers_seven() {
         let all = detect_all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 7);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
         for want in [
             "claude",
             "codex",
             "pi",
-            "prime-agent",
             "node",
             "python3",
             "lark-cli",
@@ -1408,14 +1381,6 @@ mod tests {
         assert!(install_plan("lark-cli").is_ok());
         assert!(install_plan("dingtalk-cli").is_ok());
         assert!(install_plan("nope").is_err());
-        // prime-agent：mac/linux 走官方 curl 安装器；win 无自动安装（给手动 Git Bash 指引）
-        #[cfg(not(target_os = "windows"))]
-        assert!(install_plan("prime-agent").is_ok());
-        #[cfg(target_os = "windows")]
-        match install_plan("prime-agent") {
-            Err(err) => assert!(err.contains("Git Bash"), "win 给手动指引: {err}"),
-            Ok(_) => panic!("win 应无自动安装"),
-        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1496,14 +1461,13 @@ mod tests {
             .map(|d| dep(d.id, false))
             .collect::<Vec<_>>();
         let ids = missing_dep_ids(&all_missing);
-        assert_eq!(ids.len(), 8, "全缺 → 8 项");
+        assert_eq!(ids.len(), 7, "全缺 → 7 项");
         assert_eq!(ids[0], "node", "node 恒在最前");
         // 部分缺保 detect 序（node 不在缺失集时不插队）
         let partial = vec![
             dep("claude", true),
             dep("codex", false),
             dep("pi", false),
-            dep("prime-agent", true),
             dep("node", true),
             dep("python3", false),
             dep("lark-cli", true),
@@ -1546,11 +1510,6 @@ mod tests {
             assert!(install_needs_node("pi"));
             assert!(!install_needs_node("python3"), "win python3 走 winget");
         }
-        // prime-agent：curl 安装器内部要求 node 20.6+/npm → 恒 true（全平台）
-        assert!(
-            install_needs_node("prime-agent"),
-            "prime-agent 安装器要求 node/npm"
-        );
         // 未知 id：install_plan Err → false（不误跳过）
         assert!(!install_needs_node("no-such-dep"));
     }

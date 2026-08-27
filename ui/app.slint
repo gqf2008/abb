@@ -932,12 +932,11 @@ export component SettingsWindow inherits Window {
     in-out property <string> codex-version: "";
     in-out property <bool> codex-ok: false;
     in-out property <bool> pi-installed: false;
-    in-out property <bool> prime-agent-installed: false;
     in-out property <bool> node-installed: false;
     in-out property <bool> python-installed: false;
     in-out property <bool> lark-installed: false;
     in-out property <bool> dingtalk-installed: false; // dingtalk-cli (dws)
-    // claude/codex/pi/prime-agent 任一未装 = true：环境配置页顶部显示醒目横幅（首次启动也据此自动弹出设置窗引导安装）。
+    // claude/codex/pi 任一未装 = true：环境配置页顶部显示醒目横幅（首次启动也据此自动弹出设置窗引导安装）。
     in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
@@ -975,7 +974,6 @@ export component SettingsWindow inherits Window {
         { name: "claude", checked: true },
         { name: "codex", checked: false },
         { name: "pi", checked: false },
-        { name: "prime-agent", checked: false },
     ];
     in-out property <[OptionRow]> access-options: [
         { name: "仅授权用户", checked: true },
@@ -1006,7 +1004,7 @@ export component SettingsWindow inherits Window {
     // 旧版 bot-edited 一次传全部字段、未改字段从 model 读，而 model 在编辑后不同步（过期），
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
     callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
-    callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi 3=prime-agent）
+    callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi）
     callback access-option-toggled(int);   // 飞书对话权限下标（0=仅授权 1=任何人）
     callback ding-access-option-toggled(int); // 钉钉对话权限下标
     callback generate-owner-code(int, string); // 生成授权码：bot idx + role（"owner"=管理员码 / "granted"=普通码），覆盖同类型旧码
@@ -1058,7 +1056,6 @@ export component SettingsWindow inherits Window {
     property <int> missing-deps: (root.claude-installed ? 0 : 1)
         + (root.codex-ok ? 0 : 1)
         + (root.pi-installed ? 0 : 1)
-        + (root.prime-agent-installed ? 0 : 1)
         + (root.node-installed ? 0 : 1)
         + (root.python-installed ? 0 : 1)
         + (root.lark-installed ? 0 : 1)
@@ -1948,21 +1945,6 @@ export component SettingsWindow inherits Window {
                                             if !root.pi-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
                                         }
                                         if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        // prime-agent
-                                        HorizontalBox {
-                                            height: 34px;
-                                            spacing: 10px;
-                                            Text { text: "prime-agent"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
-                                            StatusPill { text: root.prime-agent-installed ? "已安装" : "未安装"; ok: root.prime-agent-installed; }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            if !root.prime-agent-installed: PixelButton {
-                                                text: "安装";
-                                                enabled: root.dep-busy == "";
-                                                clicked => { root.install-dep("prime-agent"); }
-                                            }
-                                            if !root.prime-agent-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/PrimeIntellect-ai/prime-agent"); } }
-                                        }
-                                        if !root.prime-agent-installed: Text { text: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // nodejs
                                         HorizontalBox {
                                             height: 34px;
@@ -2152,7 +2134,7 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: "说明：claude/codex 由「模型供应商配置」提供凭证，不再在运行期弹授权；pi/prime-agent 用自己的登录态（~/.pi、~/.prime，配了供应商则注入对应 key）。nodejs 是 codex/prime-agent/lark-cli 的前置；接入飞书 bot 时会自动装 lark 技能。";
+                                    text: "说明：claude/codex 由「模型供应商配置」提供凭证，不再在运行期弹授权；pi 用自己的登录态（~/.pi，配了供应商则注入对应 key）。nodejs 是 codex/lark-cli 的前置；接入飞书 bot 时会自动装 lark 技能。";
                                     font-size: 12px;
                                     color: UiTokens.text-dim;
                                     wrap: word-wrap;
@@ -2294,7 +2276,7 @@ export component SettingsWindow inherits Window {
                                             if root.provider-selected < 0: Text { text: "← 选择或添加一个供应商"; color: UiTokens.text-dim; }
 
                                             Text {
-                                                text: "只支持 Anthropic 原生（claude / pi / prime-agent）与 OpenAI 兼容（codex / pi / prime-agent：chat / responses 两种接口）。claude 后端需 anthropic 型，codex 后端需 openai 型；pi/prime-agent 两种都吃（key 走对应 env）。桥内配置优先于 CC Switch。";
+                                                text: "只支持 Anthropic 原生（claude / pi）与 OpenAI 兼容（codex / pi：chat / responses 两种接口）。claude 后端需 anthropic 型，codex 后端需 openai 型；pi 两种都吃（key 走对应 env）。桥内配置优先于 CC Switch。";
                                                 font-size: 12px;
                                                 color: UiTokens.text-dim;
                                                 wrap: word-wrap;

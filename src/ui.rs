@@ -953,12 +953,7 @@ fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) 
     let be_sel = if be.is_empty() { "claude" } else { be.as_str() };
     w.set_backend_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(
         mk_opts(
-            &[
-                ("claude", "claude"),
-                ("codex", "codex"),
-                ("pi", "pi"),
-                ("prime-agent", "prime-agent"),
-            ],
+            &[("claude", "claude"), ("codex", "codex"), ("pi", "pi")],
             be_sel,
         ),
     ))));
@@ -1005,8 +1000,8 @@ fn refresh_owner_code_info(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_grant_code_info(grant_line.into());
 }
 
-/// 跑一次依赖检测并把全部 8 项状态回填到设置窗
-/// （claude/codex/pi/prime-agent/node/python3/lark-cli/dingtalk-cli）。
+/// 跑一次依赖检测并把全部 7 项状态回填到设置窗
+/// （claude/codex/pi/node/python3/lark-cli/dingtalk-cli）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
     let get = |id: &str| {
@@ -1019,15 +1014,14 @@ fn push_deps_to_window(w: &SettingsWindow) {
     let codex = all.iter().find(|d| d.id == "codex");
     let codex_version = codex.map(|d| d.version.clone()).unwrap_or_default();
     let codex_ok = codex.map(|d| d.found && d.version_ok).unwrap_or(false);
-    // #8 M0：claude/codex/pi/prime-agent 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
+    // #8 M0：claude/codex/pi 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
     // #93：codex 版本过低同样视为「待处理」——启动引导/横幅继续提示，直到升级到最低锁定版本。
-    w.set_missing_agent(!get("claude") || !codex_ok || !get("pi") || !get("prime-agent"));
+    w.set_missing_agent(!get("claude") || !codex_ok || !get("pi"));
     w.set_claude_installed(get("claude"));
     w.set_codex_installed(get("codex"));
     w.set_codex_version(codex_version.into());
     w.set_codex_ok(codex_ok);
     w.set_pi_installed(get("pi"));
-    w.set_prime_agent_installed(get("prime-agent"));
     w.set_node_installed(get("node"));
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
@@ -2175,12 +2169,8 @@ pub fn run_gui() -> Result<()> {
                                         .map(|b| b.effective_backend(&c.default_backend).to_string())
                                 })
                                 .unwrap_or_default();
-                            let r = match crate::agent::Backend::parse(&backend) {
-                                crate::agent::Backend::PrimeAgent => Err(anyhow::anyhow!(
-                                    "后端 {backend} 暂不支持提示词生成（请用 claude/codex/pi）"
-                                )),
-                                b => crate::agent::generate_role_prompt(b, &name).await,
-                            };
+                            let r =
+                                crate::agent::generate_role_prompt(crate::agent::Backend::parse(&backend), &name).await;
                             match r {
                                 Ok(text) => {
                                     let _ = vb_tx.send(VirtualBotEvt::PromptGenerated {
@@ -2285,7 +2275,7 @@ pub fn run_gui() -> Result<()> {
         );
         std::mem::forget(t6);
     }
-    // #8 M0 自动引导：claude/codex/pi/prime-agent 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
+    // #8 M0 自动引导：claude/codex/pi 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
     // （load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好 agent 的
     // 开发者/朋友零打扰（条件不成立）；对新装用户这是「打开就能被引导」的关键一步。
     {
@@ -2306,7 +2296,6 @@ pub fn run_gui() -> Result<()> {
             || missing("codex")
             || codex_low
             || missing("pi")
-            || missing("prime-agent")
             || std::env::args().any(|a| a == "--show-settings")
         {
             let debug_show = std::env::args().any(|a| a == "--show-settings");
@@ -3594,7 +3583,7 @@ pub fn run_gui() -> Result<()> {
         let sw = settings.as_weak();
         settings.on_backend_option_toggled(move |i| {
             let Some(w) = sw.upgrade() else { return };
-            let val = ["claude", "codex", "pi", "prime-agent"][i as usize];
+            let val = ["claude", "codex", "pi"][i as usize];
             if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
                 bot.backend = val.to_string();
             }
