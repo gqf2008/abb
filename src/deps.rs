@@ -1232,6 +1232,36 @@ fn accessibility_state() -> PermState {
     }
 }
 
+/// #129：辅助功能（kTCCServicePostEvent）权威布尔检测——CGPreflightPostEventAccess。
+/// macOS 10.15+。与 screen_state 同模式（同步、不弹框）。
+#[cfg(target_os = "macos")]
+fn post_event_state() -> PermState {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightPostEventAccess() -> bool;
+    }
+    if unsafe { CGPreflightPostEventAccess() } {
+        PermState::Granted
+    } else {
+        PermState::NotDetermined
+    }
+}
+
+/// #129：输入监控（kTCCServiceListenEvent）权威布尔检测——CGPreflightListenEventAccess。
+/// macOS 10.15+。
+#[cfg(target_os = "macos")]
+fn listen_event_state() -> PermState {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightListenEventAccess() -> bool;
+    }
+    if unsafe { CGPreflightListenEventAccess() } {
+        PermState::Granted
+    } else {
+        PermState::NotDetermined
+    }
+}
+
 /// 完全磁盘访问：功能探测——能列出受保护目录 `~/Library/Safari` 即视为已授权。
 /// 比读 TCC 库可靠（路径身份对 ad-hoc 二进制落库不稳，且 WAL 可能读到旧值）。
 #[cfg(target_os = "macos")]
@@ -1305,6 +1335,22 @@ pub fn detect_permissions() -> Vec<PermStatus> {
             state: accessibility_state(),
             settings_url:
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        },
+        // #129 锁屏控制：辅助功能（kTCCServicePostEvent）与输入监控（kTCCServiceListenEvent）
+        // 分开展示。权威检测用 CGPreflight*EventAccess（与系统设置同源，同 screen_state 模式）。
+        PermStatus {
+            id: "post-event",
+            label: "辅助功能·锁屏按键注入",
+            state: post_event_state(),
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        },
+        PermStatus {
+            id: "listen-event",
+            label: "输入监控·锁屏按键注入",
+            state: listen_event_state(),
+            settings_url:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
         },
         PermStatus {
             id: "screen",

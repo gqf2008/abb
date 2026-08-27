@@ -59,9 +59,13 @@ jobs:
           sed -i '' "s|<string>2\.[0-9]*\.[0-9]*</string>|<string>$VERSION</string>|g" app-assets/Info.plist
           mkdir -p ABB.app/Contents/MacOS ABB.app/Contents/Resources
           cp target/aarch64-apple-darwin/release/agent-bridge ABB.app/Contents/MacOS/
+          # #129 锁屏特权助手：必须与主程序同目录（lockctl install 从 current_exe 同目录
+          # 取 abb-helper），独立签名（嵌套二进制不随主程序签名自动覆盖）
+          cp target/aarch64-apple-darwin/release/abb-helper ABB.app/Contents/MacOS/
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
           codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
           codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
 

@@ -42,3 +42,13 @@ dsh 式事件溯源（`msg/received` / `agent/started` / `agent/completed` / `de
 - 2026-08-17：阶段 1 完成并推送 main（`54821df` 实现 + `1d8d68f` 审查跟进；268 测试全绿，CI 绿）
 - 审查发现并修复：Cancelled 臂 remove 位置回归（叫停不变式）、发送失败/补发不对称判据注释、thread 补发测试、恰发一条断言
 - 全面审查跟进（2026-08-17）：B1 空注入镜像方向兜底（孤立助手轮截断收编，I-1 症状在「助手轮恰好装进预算」方向仍可达）、same_session 闸不落盘 reply（/new 换走会话不补发）、补发持 per-chat 锁 + 补 DONE 回执、pending 写盘/解析失败留痕、Cancelled 臂停止通知失败留痕；剩余接受项：补发无 TTL（at-least-once 语义）、助手轮超预算整条跳过（I-1 既有取舍）、ENTRY_MAX 写放大（存储保真取舍）
+
+## 例外通道：锁屏控制（#129）
+
+锁屏解锁密码通道**不参与事件溯源**（`lockctl::unlock` → abb-helper → loginwindow 按键注入）：
+
+- 密码仅瞬态存在于 `lockctl::unlock(password)` 调用栈内存：序列化进 IPC 请求后立即覆写清零；
+- 不落盘（无 sqlite/jsonl/pending 记录）、不进日志（`[perm]`/daemon 日志均不打印密码）、
+  不跨会话投递（deliver 通道不含密码字段）；
+- 单次失败/超时即丢弃，不重试；`config.lock_screen_control` 默认关闭时 agent 侧直接拒绝。
+- 事件溯源文档与实现均不含该通道（安全设计：见 `docs/lock-screen-helper.md`）。

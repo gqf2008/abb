@@ -708,6 +708,11 @@ pub struct Config {
     /// （历史记录仍照常落库，历史页不受影响）。默认 true。
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
+    /// 锁屏控制开关（#129）：默认关闭。开启后 agent 在用户当前会话明确提供密码时，
+    /// 可经 root 特权助手 abb-helper 把按键注入 loginwindow 完成解锁（密码只瞬态转发，
+    /// 不落盘/不进日志/不参与事件溯源/不跨会话投递）。关闭时特权助手不安装不运行。
+    #[serde(default)]
+    pub lock_screen_control: bool,
     /// 上下文超长自动分段压缩总开关（#130，默认开）：后端返回上下文超长错误时，自动把
     /// 旧历史分段摘要压缩 + 保留近期原文，换新会话重试本条。关 = 行为与现状一致。
     #[serde(default = "default_true")]
@@ -765,6 +770,7 @@ impl Default for Config {
             owner_open_id: String::new(),
             default_backend: String::new(),
             cross_delivery_enabled: false,
+            lock_screen_control: false,     // #129 锁屏控制默认关
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
             context_segment_size: default_ctx_segment_size(),
