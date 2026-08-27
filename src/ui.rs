@@ -1014,6 +1014,10 @@ fn push_deps_to_window(w: &SettingsWindow) {
     let codex = all.iter().find(|d| d.id == "codex");
     let codex_version = codex.map(|d| d.version.clone()).unwrap_or_default();
     let codex_ok = codex.map(|d| d.found && d.version_ok).unwrap_or(false);
+    // #105 git 三态：git_ok = 已装且版本 >= MIN_GIT_VERSION（< 2.30 → 需升级）。
+    let git = all.iter().find(|d| d.id == "git");
+    let git_version = git.map(|d| d.version.clone()).unwrap_or_default();
+    let git_ok = git.map(|d| d.found && d.version_ok).unwrap_or(false);
     // #8 M0：claude/codex/pi 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
     // #93：codex 版本过低同样视为「待处理」——启动引导/横幅继续提示，直到升级到最低锁定版本。
     w.set_missing_agent(!get("claude") || !codex_ok || !get("pi"));
@@ -1026,6 +1030,9 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
     w.set_dingtalk_installed(get("dingtalk-cli"));
+    w.set_git_installed(get("git"));
+    w.set_git_version(git_version.into());
+    w.set_git_ok(git_ok);
     // 主动重新检测/启动 = 新的开始：清掉上次一键安装的失败计数
     //（失败详情 dep-detail 保留到下次安装；AllDone 分支在调用本函数后重新设回）
     w.set_dep_failed_count(0);
