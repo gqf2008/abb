@@ -262,6 +262,31 @@ pub fn absolutize(workspace: &Path, p: &Path) -> PathBuf {
     }
 }
 
+/// 词法 containment：`p` 归一化后是否落在 `root` 之内（防 `..` 上跳 / 越界绝对路径
+/// 逃逸出工作区）。只做词法归一（消 `.`/`..`，不碰文件系统），符号链接目标逃逸由
+/// 调用方场景决定（restore 的 orig 来自清单，属数据面，必须拦；移动面 guard 已限定
+/// 工作区内路径，此处兜底）。
+pub fn contained_in(root: &Path, p: &Path) -> bool {
+    let mut base = PathBuf::new();
+    for c in root.components() {
+        base.push(c.as_os_str());
+    }
+    let mut q = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !q.pop() {
+                    // 上跳超过根（如 /.. 或 C:\..）→ 必然逃逸
+                    return false;
+                }
+            }
+            other => q.push(other.as_os_str()),
+        }
+    }
+    q.starts_with(&base)
+}
+
 /// 用户可读路径：去掉 Windows canonicalize 的 `\\?\` 动词前缀（该前缀是 Win32 长路径
 /// 形态，展示/比对都难看；hook reason、清单、CLI 输出统一用它）。
 pub fn pretty_path(p: &Path) -> String {
@@ -390,6 +415,11 @@ pub fn move_to_trash(
     let mut moved = Vec::new();
     for p in paths {
         let abs = absolutize(workspace, p);
+        // 越界防护（#88 审查跟进）：绝对路径越过工作区根（如 /trash rm 别处文件）
+        // 拒绝——回收站是工作区级设施，不代收工作区外内容。
+        if !contained_in(workspace, &abs) {
+            return Err(format!("{} 不在工作区范围内，拒绝移入回收站", p.display()));
+        }
         if !abs.exists() {
             continue;
         }
@@ -468,6 +498,15 @@ pub fn restore(workspace: &Path, id: &str) -> Result<TrashItem, String> {
         .map(|e| e.path())
         .ok_or_else(|| format!("条目 {} 内容为空（{}）", item.id, item.orig))?;
     let orig = PathBuf::from(&item.orig);
+    // 越界逃逸防护（#88 审查跟进）：清单是普通 JSON，可被手工编辑/污染——
+    // orig 若为相对路径或解析后越过工作区根，restore 的 create_dir_all + rename
+    // 会把内容写到工作区外任意位置。此处先拒：非绝对路径或不在工作区内 → 拒绝恢复。
+    if !orig.is_absolute() || !contained_in(workspace, &orig) {
+        return Err(format!(
+            "条目 {} 原路径超出工作区范围，拒绝恢复：{}",
+            item.id, item.orig
+        ));
+    }
     if !src.exists() {
         return Err(format!("条目 {} 内容缺失（可能已被手动清理）", item.id));
     }
@@ -633,6 +672,50 @@ mod tests {
         save_manifest(&ws, &items).unwrap();
         assert_eq!(purge_expired(&ws, 7), 1);
         assert_eq!(list(&ws).len(), 0);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn move_rejects_outside_workspace() {
+        let ws = temp_ws();
+        let s = TrashSettings::defaults();
+        // 工作区外绝对路径（如临时目录）→ 拒绝
+        let outside =
+            std::env::temp_dir().join(format!("abb-trash-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, "x").unwrap();
+        let r = move_to_trash(&ws, std::slice::from_ref(&outside), &s, "t");
+        assert!(r.is_err(), "工作区外路径应拒绝移入回收站");
+        assert!(outside.exists(), "外部文件应保持原位");
+        // `..` 上跳逃逸 → 拒绝
+        let escape = ws.join("..").join("esc").join("x.txt");
+        std::fs::create_dir_all(escape.parent().unwrap()).unwrap();
+        std::fs::write(&escape, "x").unwrap();
+        assert!(move_to_trash(&ws, std::slice::from_ref(&escape), &s, "t").is_err());
+        assert!(escape.exists());
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn restore_rejects_escape_path() {
+        let ws = temp_ws();
+        let s = TrashSettings::defaults();
+        std::fs::write(ws.join("x.txt"), "x").unwrap();
+        let moved = move_to_trash(&ws, &[PathBuf::from("x.txt")], &s, "t").unwrap();
+        // 污染清单：orig 改为工作区外的绝对路径 → restore 拒绝且不写外部文件
+        let outside = std::env::temp_dir()
+            .join(format!("abb-trash-escape-{}", uuid::Uuid::new_v4()))
+            .join("evil.txt");
+        let mut items = load_manifest(&ws);
+        items[0].orig = outside.to_string_lossy().into_owned();
+        save_manifest(&ws, &items).unwrap();
+        assert!(restore(&ws, &moved[0].id).is_err());
+        assert!(!outside.exists(), "越界恢复不得写出工作区外");
+        // 相对路径 orig → 拒绝
+        let mut items = load_manifest(&ws);
+        items[0].orig = "../evil.txt".to_string();
+        save_manifest(&ws, &items).unwrap();
+        assert!(restore(&ws, &moved[0].id).is_err());
         let _ = std::fs::remove_dir_all(&ws);
     }
 
