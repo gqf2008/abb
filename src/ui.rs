@@ -598,6 +598,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         })
         .into(),
         owner_open_id: b.owner_open_id.clone().into(),
+        wx_owner_configured: !b.wx_user_id.is_empty(),
         owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
         granted: slint::ModelRc::from(Rc::new(granted)),
         app_id: b.app_id.clone().into(),
