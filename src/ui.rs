@@ -543,15 +543,15 @@ fn vb_edit_apply_fetched(
 }
 
 /// #125 纯逻辑：编辑模式保存是否被拦截。返回 Some(msg) = 拦截并提示；None = 放行。
-/// Pending（还没拉到平台资料）或 Failed（拉到失败、当前为登记旧名/空提示词且用户
-/// 未显式编辑任一字段）都禁止静默保存，防把旧名/空提示词写回平台。
+/// Pending（还没拉到平台资料）或 Failed（拉到失败、恢复登记旧名且用户未显式修改群名）
+/// 都禁止静默保存，防把旧名/空提示词写回平台。
 fn vb_edit_save_blocked(st: &VbEditState, chat_id: &str) -> Option<&'static str> {
     if st.chat_id != chat_id {
         return Some("群资料加载状态异常，请关闭弹窗重试");
     }
     match st.phase {
         VbFetchPhase::Pending => Some("正在拉取群资料，请稍候再保存…"),
-        VbFetchPhase::Failed if !(st.name_dirty || st.prompt_dirty) => Some(
+        VbFetchPhase::Failed if !st.name_dirty => Some(
             "读取群资料失败，当前为登记旧名：直接保存会把平台群名改回旧名并清空群介绍。请核对修改群名后再保存",
         ),
         _ => None,
@@ -3040,7 +3040,8 @@ pub fn run_gui() -> Result<()> {
                         // 或 Failed（拉到失败、当前为登记旧名）都禁止静默保存，防把
                         // 旧名/空提示词写回平台
                         let st = edit.borrow().clone();
-                        if let Some(msg) = vb_edit_save_blocked(&st, d.get_edit_chat_id().as_str()) {
+                        if let Some(msg) = vb_edit_save_blocked(&st, d.get_edit_chat_id().as_str())
+                        {
                             vb_hint(&d, msg, true);
                             return;
                         }
@@ -4615,10 +4616,17 @@ mod tests {
         s.name_dirty = true;
         assert_eq!(vb_edit_save_blocked(&s, "oc_chat_a"), None);
 
-        // 只改提示词同样视为显式操作 → 放行
+        // 只改提示词不算显式改群名：仍拦截（防把登记旧名 PUT 回平台）
         let mut s3 = st();
         let _ = vb_edit_apply_fetched(&mut s3, "", "", Some("99992356"));
         s3.prompt_dirty = true;
+        assert!(
+            vb_edit_save_blocked(&s3, "oc_chat_a").is_some(),
+            "Failed 且只改提示词：仍禁止保存（须显式改群名）"
+        );
+
+        // 显式改过群名 → 放行
+        s3.name_dirty = true;
         assert_eq!(vb_edit_save_blocked(&s3, "oc_chat_a"), None);
     }
 
@@ -4626,7 +4634,10 @@ mod tests {
     fn vb_edit_pending_blocks_save_and_stale_fetch_discarded() {
         // Pending：保存被拦截（还没拉到平台资料）
         let s = st();
-        assert_eq!(vb_edit_save_blocked(&s, "oc_chat_a").unwrap(), "正在拉取群资料，请稍候再保存…");
+        assert_eq!(
+            vb_edit_save_blocked(&s, "oc_chat_a").unwrap(),
+            "正在拉取群资料，请稍候再保存…"
+        );
         // 弹窗已切换目标：chat_id 不匹配 → 拦截 + 迟到拉取作废
         assert!(vb_edit_save_blocked(&s, "oc_chat_b").is_some());
         let mut s2 = st();
