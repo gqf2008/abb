@@ -123,6 +123,28 @@ pub struct BotConfig {
     /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mention_modes: std::collections::HashMap<String, String>,
+    /// 删除保护（#88）：agent 删除 → 移入工作区 .trash/ 回收站（TTL 后自动清）。
+    /// 默认开（安全默认）；false 不落盘，旧 config 兼容。
+    #[serde(default = "default_true", skip_serializing_if = "protect_on")]
+    pub delete_protect_enabled: bool,
+    /// 回收站保留天数（TTL），默认 7。默认值不落盘，旧 config 兼容。
+    #[serde(
+        default = "default_trash_ttl_days",
+        skip_serializing_if = "ttl_default"
+    )]
+    pub trash_ttl_days: u32,
+    /// 危险删除大小阈值（MB），默认 50。≥阈值的删除需二次确认（/trash confirm）。
+    #[serde(
+        default = "default_dangerous_size_mb",
+        skip_serializing_if = "size_default"
+    )]
+    pub dangerous_size_mb: u64,
+    /// 危险删除代码特征扩展名（默认见 trash::default_code_exts）。命中即需二次确认。
+    #[serde(
+        default = "default_code_exts",
+        skip_serializing_if = "code_exts_default"
+    )]
+    pub code_exts: Vec<String>,
 }
 
 /// 手动 Default：enabled 默认 true（derive(Default) 对 bool 给 false，会把新/迁移 bot 误设成停用）。
@@ -160,8 +182,47 @@ impl Default for BotConfig {
             restrict_granted_agent: true,
             tidy_enabled: false,
             mention_modes: std::collections::HashMap::new(),
+            delete_protect_enabled: true,
+            trash_ttl_days: default_trash_ttl_days(),
+            dangerous_size_mb: default_dangerous_size_mb(),
+            code_exts: default_code_exts(),
         }
     }
+}
+
+/// 回收站 TTL 默认（天）：7。
+fn default_trash_ttl_days() -> u32 {
+    7
+}
+
+/// 危险删除大小阈值默认（MB）：50。
+fn default_dangerous_size_mb() -> u64 {
+    50
+}
+
+/// 危险删除代码特征扩展名默认（对齐 trash 模块默认）。
+fn default_code_exts() -> Vec<String> {
+    crate::trash::default_code_exts()
+}
+
+/// skip_serializing_if：delete_protect_enabled 为 true（安全默认）不落盘，旧 config 兼容。
+fn protect_on(b: &bool) -> bool {
+    *b
+}
+
+/// skip_serializing_if：trash_ttl_days 为默认 7 不落盘。
+fn ttl_default(d: &u32) -> bool {
+    *d == 7
+}
+
+/// skip_serializing_if：dangerous_size_mb 为默认 50 不落盘。
+fn size_default(d: &u64) -> bool {
+    *d == 50
+}
+
+/// skip_serializing_if：code_exts 为默认清单不落盘（与默认逐项相等）。
+fn code_exts_default(exts: &[String]) -> bool {
+    exts == crate::trash::default_code_exts()
 }
 
 pub(crate) fn default_kind() -> String {

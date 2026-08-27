@@ -33,7 +33,7 @@ pub const ARCHIVE_AGE_DAYS: u32 = 30;
 /// 结构目录：临时文件扫描 / 空目录清理 / 文档扫描一律跳过（绝不触碰）。
 /// attachments 是消息附件落地目录（下载中目录可能瞬时为空——walk 见空与删除之间文件
 /// 落地会删掉下载目标；且内含用户聊天媒体，与结构目录同待遇；审查修复）。
-const STRUCTURE_DIRS: [&str; 8] = [
+const STRUCTURE_DIRS: [&str; 9] = [
     ".git",
     "history",
     "sessions",
@@ -42,6 +42,7 @@ const STRUCTURE_DIRS: [&str; 8] = [
     ".prime-sessions",
     "archive",
     "attachments",
+    ".trash",
 ];
 /// 根目录临时/垃圾文件后缀（小写比较；.tmp.* 形态单独匹配）。
 const TEMP_SUFFIXES: [&str; 3] = [".tmp", ".swp", ".bak"];
@@ -483,6 +484,7 @@ pending_outbox.json
 .DS_Store
 GRANTED.md
 attachments/
+.trash/
 .abb-tidy-last
 .abb-session-gc-last
 ";
