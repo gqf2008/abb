@@ -154,10 +154,11 @@ impl Bridge {
         if from.is_empty() {
             return;
         }
-        // should_respond：微信侧 owner 判据是登录拿到的 ilink_user_id（不是飞书 open_id）
+        // #118 fail-closed：微信 owner 判据是登录拿到的 ilink_user_id（不是飞书 open_id）。
+        // wx_user_id 未配置（owner 为空）→ 拒绝所有人（此前是放行旁路）。
         let owner = self.bot.wx_owner();
-        if !owner.is_empty() && from != owner {
-            crate::log!("[weixin] 忽略非 owner 消息 from={}", trunc(from, 10));
+        if owner.is_empty() || from != owner {
+            crate::log!("[weixin] 忽略未授权消息 from={}", trunc(from, 10));
             return;
         }
         // 回复必须回显该用户最新 context_token
@@ -228,10 +229,9 @@ impl Bridge {
         // 访问控制（与飞书同套，staffId 标识）：公开开关开 → 放行所有人；否则只放行 owner ∪
         // 授权者白名单。每次热读 config（授权/取消/改开关即时生效）；config 读不到（单测）回落快照。
         // 同一份热读顺路推导发送者角色（owner=全权限 / granted=受限），随 Ev 传给 agent。
+        // #118：无公开开关、无群聊豁免——群里任何人未经授权也拦截。
         let (allowed, sender_role, mention_map, mention_default) =
             self.access_and_role(&msg.sender_staff_id);
-        // 群聊豁免授权（8-20 用户决策，与飞书一致）：群里 @ bot 就响应，授权只管私聊
-        let allowed = allowed || msg.is_group();
         if !allowed {
             // 未授权用户可能在发授权码：仅单聊（chat_id=staffId，非 cid 开头）接受，群里发码防抢注
             let chat_id = msg.chat_id().to_string();
@@ -242,9 +242,9 @@ impl Bridge {
             {
                 return;
             }
-            // #74 扩展（8-20 用户反馈，与飞书对称）：未授权单聊也提醒 + 落历史；
-            // 钉钉事件无时间字段 → 当前秒；授权码消费成功（上面 return）的不提醒
-            if is_p2p && !msg.mid.is_empty() {
+            // #118：未授权一律拦截且**无提示文案**；记录历史——单聊保留 #74 提醒+落历史；
+            // 群聊落历史、不提醒。钉钉事件无时间字段 → 当前秒；授权码消费成功（上面 return）的不提醒
+            if !msg.mid.is_empty() {
                 // 展示名：未授权用户不在本地名单，API 反查（best-effort）
                 let uname = self
                     .msgr
@@ -261,18 +261,55 @@ impl Bridge {
                     &msg.text,
                     crate::chrono_lite::unix_secs() as i64,
                 );
-                self.unread.report(
-                    &self.bot.key(),
-                    &msg.sender_staff_id,
-                    &uname,
-                    &crate::agent::truncate(&msg.text, 40),
-                    crate::chrono_lite::unix_secs() as i64,
-                );
+                if is_p2p {
+                    self.unread.report(
+                        &self.bot.key(),
+                        &msg.sender_staff_id,
+                        &uname,
+                        &crate::agent::truncate(&msg.text, 40),
+                        crate::chrono_lite::unix_secs() as i64,
+                    );
+                }
             }
             crate::log!(
-                "[dingtalk] 忽略非 owner 消息 from={}",
+                "[dingtalk] 忽略未授权消息 from={}",
                 trunc(&msg.sender_staff_id, 10)
             );
+            return;
+        }
+        // #118：granted + pi 后端 + 隔离开 → 接入层静默拦截（落历史不回复，不暴露配置）
+        let backend = self.bot.effective_backend(&self.default_backend);
+        if crate::config::granted_pi_unusable(sender_role, &self.bot.key(), backend) {
+            crate::log!(
+                "[dingtalk] granted+pi 会话静默拦截 from={}",
+                trunc(&msg.sender_staff_id, 10)
+            );
+            if !msg.mid.is_empty() {
+                let uname = self
+                    .msgr
+                    .user_display_name(&msg.sender_staff_id)
+                    .await
+                    .unwrap_or_default();
+                self.msgstore.insert(
+                    &self.bot.key(),
+                    &msg.chat_id(),
+                    &msg.mid,
+                    "user",
+                    &msg.sender_staff_id,
+                    &uname,
+                    &msg.text,
+                    crate::chrono_lite::unix_secs() as i64,
+                );
+                if !msg.is_group() {
+                    self.unread.report(
+                        &self.bot.key(),
+                        &msg.sender_staff_id,
+                        &uname,
+                        &crate::agent::truncate(&msg.text, 40),
+                        crate::chrono_lite::unix_secs() as i64,
+                    );
+                }
+            }
             return;
         }
         // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理。

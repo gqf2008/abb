@@ -476,8 +476,10 @@ impl BotConfig {
         }
     }
 
-    /// 统一访问判定（不矛盾的单一入口）：公开开关开 → 放行所有人；否则只放行 owner ∪ 授权者
-    /// 白名单成员。飞书用 open_id 字段、钉钉用 staffId 字段（各自独立，互不干扰）。
+    /// 统一访问判定（不矛盾的单一入口）：只放行 owner ∪ 授权者白名单成员
+    /// （#118：公开开关已从判定链移除，open_access / ding_open_access 字段仅保留兼容旧 config，
+    /// 不再被读取——未经授权一律拦截，fail-closed）。
+    /// 飞书用 open_id 字段、钉钉用 staffId 字段（各自独立，互不干扰）。
     /// 微信不走这套（wx_user_id 是登录身份，on_weixin 独立过滤）。
     /// 桥每次消息从 config 读最新值调用（授权后立即生效，不依赖启动快照）。
     pub fn access_allows(&self, sender_id: &str) -> bool {
@@ -485,17 +487,11 @@ impl BotConfig {
             return true; // 微信由 on_weixin 的 wx_user_id 判据管，不在这里限制
         }
         if self.is_dingtalk() {
-            if self.ding_open_access {
-                return true;
-            }
             let in_owner = !self.ding_owner_ids.is_empty()
                 && is_owner_allowed(&self.ding_owner_ids, sender_id);
             let in_granted = !self.ding_granted_ids.is_empty()
                 && is_owner_allowed(&self.ding_granted_ids, sender_id);
             return in_owner || in_granted;
-        }
-        if self.open_access {
-            return true;
         }
         let in_owner =
             !self.owner_open_id.is_empty() && is_owner_allowed(&self.owner_open_id, sender_id);
@@ -505,8 +501,8 @@ impl BotConfig {
     }
 
     /// 会话发送者角色推导（与 access_allows 同构，准入闸顺路区分 owner 与授权者）：
-    /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）——
-    /// 公开模式（open_access）下的陌生人同样归 Granted。注意：空 owner 白名单 → 一律
+    /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）。
+    /// 注意：空 owner 白名单 → 一律
     /// Granted（安全默认，不猜 Owner；is_owner_allowed 对空串返回 true 只管准入不管角色，
     /// 若需 owner 全权限请先把自己加进白名单）。微信恒 Owner
     /// （wx_user_id 是唯一 owner 判据，on_weixin 已先过滤，无授权者概念）。
@@ -674,6 +670,13 @@ pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
         && Config::bot_for_bot_key(bot_key)
             .map(|b| b.restrict_granted_agent)
             .unwrap_or(true)
+}
+
+/// #118：granted 会话 + pi 后端 + 隔离开 → 接入层静默拦截（pi 无权限/沙箱系统，
+/// 受限会话无法降级）。聊天路径由接入层（on_payload / on_dingtalk）拦截：落历史、
+/// 不回复、不暴露配置；job 路径保留 agent::run 的失败提示为防御兜底。
+pub fn granted_pi_unusable(role: SenderRole, bot_key: &str, backend: &str) -> bool {
+    restrict_granted(role, bot_key) && backend.eq_ignore_ascii_case("pi")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1521,6 +1524,38 @@ mod tests {
     }
 
     #[test]
+    fn granted_pi_unusable_only_for_granted_pi() {
+        // #118：granted + pi + 隔离开 → 拦截；owner / claude / 放宽开关 → 不拦截
+        let bot_key = "granted_pi_test_bot";
+        let owner = SenderRole::Owner;
+        let granted = SenderRole::Granted;
+        assert!(crate::config::granted_pi_unusable(granted, bot_key, "pi"));
+        assert!(!crate::config::granted_pi_unusable(owner, bot_key, "pi"));
+        assert!(!crate::config::granted_pi_unusable(
+            granted, bot_key, "claude"
+        ));
+        assert!(!crate::config::granted_pi_unusable(
+            granted, bot_key, "codex"
+        ));
+        assert!(
+            crate::config::granted_pi_unusable(granted, bot_key, "PI"),
+            "大小写不敏感"
+        );
+    }
+
+    #[test]
+    fn open_access_field_kept_but_not_read() {
+        // #118：字段保留兼容（反序列化不崩），但 access_allows 不再读它
+        let bot: BotConfig =
+            serde_json::from_str(r#"{"name":"b1","kind":"feishu","open_access":true}"#).unwrap();
+        assert!(bot.open_access, "字段保留");
+        assert!(
+            !bot.access_allows("ou_unknown"),
+            "fail-closed：公开字段不再放行"
+        );
+    }
+
+    #[test]
     fn tidy_enabled_serde_default_and_skip() {
         // 手动 Default 与旧 config 反序列化都落到默认关（破坏性/磁盘操作 opt-in）
         assert!(!BotConfig::default().tidy_enabled);
@@ -1655,9 +1690,9 @@ mod tests {
     }
 
     #[test]
-    fn open_access_allows_everyone_and_ignores_lists() {
-        // 公开开关：任何人都能对话，owner/授权者/授权码均不限制（无矛盾：公开优先）
-        let mut bot = BotConfig {
+    fn open_access_no_longer_opens_door() {
+        // #118：公开开关从判定链移除（字段保留兼容，不再被读）——open_access=true 不再放行陌生人
+        let bot = BotConfig {
             owner_open_id: "ou_boss".into(),
             granted_ids: "ou_friend".into(),
             open_access: true,
@@ -1665,12 +1700,10 @@ mod tests {
         };
         assert!(bot.access_allows("ou_boss"));
         assert!(bot.access_allows("ou_friend"));
-        assert!(bot.access_allows("ou_stranger"), "公开模式任何人可对话");
-        // 私有模式（默认）才限制
-        bot.open_access = false;
-        assert!(!bot.access_allows("ou_stranger"));
-        assert!(bot.access_allows("ou_boss"));
-        assert!(bot.access_allows("ou_friend"));
+        assert!(
+            !bot.access_allows("ou_stranger"),
+            "公开开关失效：陌生人仍被拦截（fail-closed）"
+        );
     }
 
     #[test]

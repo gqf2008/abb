@@ -127,6 +127,52 @@ impl Ev {
 }
 
 impl Bridge {
+    /// #118：未授权 / granted-pi 拦截统一落历史（接入层静默拦截，无提示文案）。
+    /// p2p：落历史 + #74 未读提醒（owner 可见谁在找 bot）；group：落历史、不提醒。
+    /// mid 为空（事件缺 id）时跳过——与主路径缺 mid 直接忽略的口径一致。
+    async fn record_intercepted(
+        &self,
+        bot_key: &str,
+        message: &serde_json::Value,
+        body: &serde_json::Value,
+        sender_id: &str,
+        chat_type: &str,
+    ) {
+        let mid = message["message_id"].as_str().unwrap_or("").to_string();
+        if mid.is_empty() {
+            return;
+        }
+        let ts = body["header"]["create_time"]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| body["header"]["create_time"].as_i64())
+            .map(|ms| ms / 1000)
+            .unwrap_or_else(|| crate::chrono_lite::unix_secs() as i64);
+        let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
+        let text = crate::feishu::parse_content(message["content"].as_str().unwrap_or(""))
+            .text
+            .trim()
+            .to_string();
+        // 展示名：拦截用户不在本地名单，API 反查（best-effort；失败空串由 GUI 回落 id）
+        let uname = self
+            .msgr
+            .user_display_name(sender_id)
+            .await
+            .unwrap_or_default();
+        self.msgstore.insert(
+            bot_key, &chat_id, &mid, "user", sender_id, &uname, &text, ts,
+        );
+        if chat_type == "p2p" {
+            self.unread.report(
+                bot_key,
+                sender_id,
+                &uname,
+                &crate::agent::truncate(&text, 40),
+                ts,
+            );
+        }
+    }
+
     pub fn new(msgr: Arc<dyn Messenger>, bot: BotConfig, cfg: &Config) -> Bridge {
         Self::build(msgr, bot, cfg, Arc::new(agent::RealAgentRunner))
     }
@@ -268,14 +314,11 @@ impl Bridge {
             crate::log!("[群] bot@={}", self.bot_is_mentioned(&mentions));
         }
 
-        // should_respond（访问控制，默认私有）：公开开关开 → 放行所有人；否则只放行 owner
-        // （管理员）∪ 授权者（授权码添加）白名单。未授权者只能通过授权码激活。
-        // **群聊豁免授权（8-20 用户决策）**：群聊不要求白名单——任何人 @ bot 都响应，
-        // 未授权者按 sender_role 已推导的 Granted（受限模式，隔离安全默认）处理；
-        // 授权白名单只管私聊。每次消息从 config.json 热读最新访问控制（授权/取消/改开关
+        // should_respond（访问控制，默认私有，#118 收紧）：只放行 owner（管理员）∪ 授权者
+        // （授权码添加）白名单。**无公开开关、无群聊豁免**——群里任何人未经授权也拦截。
+        // 未授权者只能通过授权码激活。每次消息从 config.json 热读最新访问控制（授权/取消
         // 即时生效，不依赖启动快照）；config 读不到该 bot（单测注入）→ 回落构造时的快照。
         let (allowed, sender_role, mention_map, mention_default) = self.access_and_role(sender_id);
-        let allowed = allowed || chat_type == "group";
         if !allowed {
             // 未授权用户可能在发授权码：仅 p2p 接受；文本精确匹配 pending 码 → 消费并
             // 把发送者加入白名单（管理员码→owner / 普通码→授权者）、回发结果；
@@ -292,56 +335,28 @@ impl Bridge {
                 }
             }
             crate::log!(
-                "[bridge] 忽略非 owner 消息（bot={} sender={} chat_type={}）",
+                "[bridge] 忽略未授权消息（bot={} sender={} chat_type={}）",
                 self.bot.key(),
                 sender_id,
                 chat_type
             );
-            // #74 扩展（8-20 用户实测反馈）：**未授权私聊也提醒 + 落历史**——owner 能
-            // 看到谁在找 bot（决定是否授权）；群聊未授权保持忽略（提醒范围=私聊）。
-            // 授权码消费成功（上面 return）的不提醒——那是激活流程，owner 无需被打扰。
-            // mid/ts 主路径解析在 access 闸之后，这里分支内自取（事件字段同源）。
-            if chat_type == "p2p" {
-                let mid = message["message_id"].as_str().unwrap_or("").to_string();
-                let ts = body["header"]["create_time"]
-                    .as_str()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .or_else(|| body["header"]["create_time"].as_i64())
-                    .map(|ms| ms / 1000)
-                    .unwrap_or_else(|| crate::chrono_lite::unix_secs() as i64);
-                if !mid.is_empty() {
-                    let chat_id = message["chat_id"].as_str().unwrap_or("").to_string();
-                    let text =
-                        crate::feishu::parse_content(message["content"].as_str().unwrap_or(""))
-                            .text
-                            .trim()
-                            .to_string();
-                    // 展示名：未授权用户不在本地名单，API 反查（best-effort，8-20 用户
-                    // 反馈：提醒/历史要显示名字不是 open_id；失败空串由 GUI 回落 id）
-                    let uname = self
-                        .msgr
-                        .user_display_name(sender_id)
-                        .await
-                        .unwrap_or_default();
-                    self.msgstore.insert(
-                        &self.bot.key(),
-                        &chat_id,
-                        &mid,
-                        "user",
-                        sender_id,
-                        &uname,
-                        &text,
-                        ts,
-                    );
-                    self.unread.report(
-                        &self.bot.key(),
-                        sender_id,
-                        &uname,
-                        &crate::agent::truncate(&text, 40),
-                        ts,
-                    );
-                }
-            }
+            // #118：未授权一律拦截且**无提示文案**；记录历史——p2p 保留 #74 提醒+落历史；
+            // 群聊落历史、不提醒（不再完全忽略）。
+            self.record_intercepted(&self.bot.key(), message, &body, sender_id, chat_type)
+                .await;
+            return;
+        }
+        // #118：granted + pi 后端 + 隔离开 → 接入层静默拦截（落历史不回复，
+        // 不再出现「后端是 pi」提示文案外泄；job 路径保留 agent::run 防御兜底）。
+        let backend = self.bot.effective_backend(&self.default_backend);
+        if crate::config::granted_pi_unusable(sender_role, &self.bot.key(), backend) {
+            crate::log!(
+                "[bridge] granted+pi 会话静默拦截（bot={} sender={}）",
+                self.bot.key(),
+                sender_id
+            );
+            self.record_intercepted(&self.bot.key(), message, &body, sender_id, chat_type)
+                .await;
             return;
         }
         // 群聊只有 @ 了本机器人（或话题内回复）的消息才处理：
@@ -2314,7 +2329,7 @@ mod tests {
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
         bridge.set_mention_mode("oc_g", Some("off"));
-        // 未授权 sender + 免 @ 群 → 群聊豁免授权：被服务（受限角色）
+        // #118：无群聊豁免——未授权 sender + 免 @ 群 → 仍被拦截（不触发 agent）
         bridge
             .on_payload(
                 feishu_payload(
@@ -2332,10 +2347,10 @@ mod tests {
             )
             .await;
         assert!(
-            !runner.prompts().is_empty(),
-            "群聊豁免授权：未授权者被服务（@ 门槛才是防洪闸）"
+            runner.prompts().is_empty(),
+            "#118 无群聊豁免：未授权群聊消息也被拦截（静默）"
         );
-        // 未授权私聊 → 仍被拒（不触发 agent，只提醒/落历史）
+        // 未授权私聊 → 同样被拒（不触发 agent，只提醒/落历史）
         bridge
             .on_payload(
                 feishu_payload(
@@ -2352,18 +2367,14 @@ mod tests {
                 .as_bytes(),
             )
             .await;
-        assert_eq!(
-            runner.prompts().len(),
-            1,
-            "私聊授权仍生效：未授权私聊不触发 agent"
-        );
+        assert_eq!(runner.prompts().len(), 0, "未授权私聊不触发 agent（拦截）");
         cleanup_bridge(&bridge);
     }
 
-    /// 开关是管理动作（用户拍板）：open_access 模式下陌生人可 @ 机器人对话，
-    /// 但切换 /mention off/on 被拒——@ 门槛是公开群唯一的防洪闸。
+    /// 开关是管理动作（用户拍板）。#118 公开开关失效：陌生人即使 @ 也被接入层拦截，
+    /// 更不可能切换 /mention——未授权静默拦截，无提示文案。
     #[tokio::test]
-    async fn open_access_stranger_cannot_toggle_mention() {
+    async fn open_access_stranger_is_intercepted() {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
@@ -2371,11 +2382,11 @@ mod tests {
             bot_name: "庆小丰".into(),
             bot_open_id: "ou_bot".into(),
             owner_open_id: "ou_owner".into(),
-            open_access: true, // 公开模式：任何人都可对话
+            open_access: true, // #118：字段保留但不再被读（无公开开关）
             ..Default::default()
         };
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
-        // 陌生人 @ 机器人发 /mention off → 拒绝回显、开关不落
+        // 陌生人 @ 机器人发 /mention off → 接入层静默拦截：无任何回复、开关不落
         bridge
             .on_payload(
                 feishu_payload(
@@ -2393,29 +2404,12 @@ mod tests {
             )
             .await;
         assert!(
-            msgr.sent().iter().any(|s| s.contains("仅管理员")),
-            "陌生人切换被拒: {:?}",
+            msgr.sent().is_empty(),
+            "未授权静默拦截：无任何提示文案: {:?}",
             msgr.sent()
         );
+        assert!(runner.prompts().is_empty(), "未授权不触发 agent");
         assert!(bridge.mention_mode("oc_g").is_none(), "开关未被陌生人改动");
-        // 未 @ 消息仍被 @ 门槛过滤（闸门没被关掉）
-        bridge
-            .on_payload(
-                feishu_payload(
-                    "m2",
-                    "oc_g",
-                    "group",
-                    "",
-                    "",
-                    "user",
-                    "ou_stranger",
-                    &[],
-                    "陌生人的未@消息",
-                )
-                .as_bytes(),
-            )
-            .await;
-        assert!(runner.prompts().is_empty(), "@ 门槛仍生效");
         cleanup_bridge(&bridge);
     }
 
@@ -3358,12 +3352,13 @@ mod tests {
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
             kind: "wechat".into(),
+            wx_user_id: "wx_owner".into(), // #118 fail-closed：wx_user_id 未配置则拒绝所有人
             ..Default::default()
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
 
         let msg = crate::wechat::WeixinMessage {
-            from_user_id: "u1".into(),
+            from_user_id: "wx_owner".into(),
             message_type: 1,
             message_id: "7491".into(),
             item_list: vec![crate::wechat::MessageItem {
@@ -3479,12 +3474,13 @@ mod tests {
         let bot = BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
             kind: "wechat".into(),
+            wx_user_id: "wx_owner".into(), // #118 fail-closed：wx_user_id 未配置则拒绝所有人
             ..Default::default()
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
 
         let msg = crate::wechat::WeixinMessage {
-            from_user_id: "u1".into(),
+            from_user_id: "wx_owner".into(),
             message_type: 1,
             message_id: "7491".into(),
             item_list: vec![crate::wechat::MessageItem {
