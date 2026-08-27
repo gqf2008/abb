@@ -342,7 +342,7 @@ impl Bridge {
             );
             // #118：未授权一律拦截且**无提示文案**；记录历史——p2p 保留 #74 提醒+落历史；
             // 群聊落历史、不提醒（不再完全忽略）。
-            self.record_intercepted(&self.bot.key(), &message, &body, sender_id, chat_type)
+            self.record_intercepted(&self.bot.key(), message, &body, sender_id, chat_type)
                 .await;
             return;
         }
@@ -355,7 +355,7 @@ impl Bridge {
                 self.bot.key(),
                 sender_id
             );
-            self.record_intercepted(&self.bot.key(), &message, &body, sender_id, chat_type)
+            self.record_intercepted(&self.bot.key(), message, &body, sender_id, chat_type)
                 .await;
             return;
         }
