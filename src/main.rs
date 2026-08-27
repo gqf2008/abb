@@ -39,6 +39,7 @@ mod sessions;
 mod single_instance;
 mod tasks;
 mod teambuilder;
+mod teamflow;
 mod tidy;
 mod trash;
 mod ui;

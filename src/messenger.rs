@@ -52,6 +52,19 @@ pub trait Messenger: Send + Sync {
         None
     }
 
+    /// 创建群会话（#124 一键创建团队·聊天入口用）。返回平台 chat_id。
+    /// 平台支持：飞书/钉钉实现；微信无建群 API → 默认 Err（聊天侧回落登记制指引：
+    /// 手动建群后 GUI 虚拟 Bot 面板登记）。`owner_user_id`：飞书把 owner 设为群成员
+    /// + 管理员（建群后用户才看得到群，8-20 实测）；钉钉忽略该参数。
+    async fn create_chat(
+        &self,
+        _name: &str,
+        _description: &str,
+        _owner_user_id: &str,
+    ) -> Result<String, String> {
+        Err("当前平台不支持自动建群（微信）。请手动建群后在 GUI 虚拟 Bot 面板登记。".to_string())
+    }
+
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
     async fn typing(&self, _message_id: &str) -> Option<String> {
         None
@@ -155,6 +168,17 @@ impl Messenger for FeishuMessenger {
                 None
             }
         }
+    }
+    async fn create_chat(
+        &self,
+        name: &str,
+        description: &str,
+        owner_user_id: &str,
+    ) -> Result<String, String> {
+        self.fs
+            .create_chat(name, description, owner_user_id)
+            .await
+            .map_err(|e| format!("建群失败：{e:#}"))
     }
     async fn download_attachment(
         &self,
@@ -348,6 +372,17 @@ impl Messenger for DingTalkMessenger {
     async fn get_chat_info(&self, chat_id: &str) -> Option<(String, String)> {
         // 钉钉群信息接口无「群介绍」字段：desc 恒空（平台限制，见 dingtalk.rs 注释）
         self.dt.get_chat_info(chat_id).await.ok()
+    }
+    async fn create_chat(
+        &self,
+        name: &str,
+        description: &str,
+        _owner_user_id: &str,
+    ) -> Result<String, String> {
+        self.dt
+            .create_chat(name, description)
+            .await
+            .map_err(|e| format!("建群失败：{e:#}"))
     }
     async fn send_thread_reply(&self, chat_id: &str, _message_id: &str, text: &str) -> Result<()> {
         // 群聊回复 @ 最近提问者（单聊 chat_id=对方 staffId，无需 @）

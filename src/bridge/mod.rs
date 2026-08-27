@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 mod access;
 mod outbox;
 mod recover;
+mod teamflow;
 mod virtualbot;
 
 pub struct Bridge {
@@ -54,6 +55,12 @@ pub struct Bridge {
     /// 待处理消息持久化（#25 重启恢复）：进入 agent 前落盘、完成后删除；
     /// service 重启后 recover_pending 自动重放，续跑上次未完成的消息/会话。
     pending: PendingStore,
+    /// 一键创建团队·聊天入口的会话态（#124 P1）：按 chat key 持久化
+    /// `workspaces/<bot>/teamflow.json`，重启不丢（确认/改/取消可跨重启）。
+    team_flows: crate::teamflow::TeamFlowStore,
+    /// 团队方案生成器（#124 测试可测性）：生产 RealTeamPlanGenerator 转发 teambuilder；
+    /// 测试注入挡板返回固定方案/错误（仿 agent_runner 设计）。
+    team_gen: Arc<dyn crate::teamflow::TeamPlanGenerator>,
     /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
     /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
     /// pub(crate)：session_gc::run_once 经它走归纳调用（与聊天/job 同源，可挡板测试）。
@@ -205,6 +212,8 @@ impl Bridge {
             mention_snapshot: Mutex::new(mention_seed),
             outbox: OutboxStore::new(&key),
             pending: PendingStore::new(&key),
+            team_flows: crate::teamflow::TeamFlowStore::new(&key),
+            team_gen: Arc::new(crate::teamflow::RealTeamPlanGenerator),
             agent_runner,
             // #75：启动即加载登记快照 + 记录文件签名（后续由 refresh_virtual_bots 懒刷新）
             virtual_bots: Mutex::new(crate::virtualbot::VirtualBotStore::new().load()),
@@ -605,6 +614,7 @@ fn is_cancel_command(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::teambuilder::{TeamPlan, TeamRole};
 
     #[test]
     fn strip_user_mentions() {
@@ -738,6 +748,10 @@ mod tests {
         done: Mutex<Vec<String>>,
         /// 群资料（#75 注入测试）：None=查不到（默认）。
         chat_info: Mutex<Option<(String, String)>>,
+        /// #124 一键创建团队：已建群名（create_chat 成功记录）。
+        created: Mutex<Vec<String>>,
+        /// #124 建群失败注入：命中角色名 → Err（测部分失败清单）。
+        fail_create: Mutex<Option<String>>,
     }
     impl MockMessenger {
         fn new() -> Self {
@@ -748,7 +762,18 @@ mod tests {
                 fail_chat: Mutex::new(None),
                 done: Mutex::new(Vec::new()),
                 chat_info: Mutex::new(None),
+                created: Mutex::new(Vec::new()),
+                fail_create: Mutex::new(None),
             }
+        }
+        fn set_fail_create(&self, role: &str) {
+            *self.fail_create.lock().unwrap() = Some(role.to_string());
+        }
+        fn clear_fail_create(&self) {
+            *self.fail_create.lock().unwrap() = None;
+        }
+        fn created(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
         }
         fn set_chat_info(&self, name: &str, desc: &str) {
             *self.chat_info.lock().unwrap() = Some((name.to_string(), desc.to_string()));
@@ -830,6 +855,21 @@ mod tests {
                 sha256: "abc".into(),
                 note: String::new(),
             })
+        }
+        async fn create_chat(
+            &self,
+            name: &str,
+            _description: &str,
+            _owner_user_id: &str,
+        ) -> Result<String, String> {
+            if let Some(f) = self.fail_create.lock().unwrap().clone() {
+                if f == name {
+                    return Err(format!("模拟建群失败：{name}"));
+                }
+            }
+            let n = self.created.lock().unwrap().len();
+            self.created.lock().unwrap().push(name.to_string());
+            Ok(format!("oc_new_{n}"))
         }
     }
 
@@ -1016,6 +1056,69 @@ mod tests {
                 MockOutcome::Cancel => Ok(agent::RunOutcome::Cancelled),
                 MockOutcome::Fail(e) => Err(e.clone()),
             }
+        }
+    }
+
+    /// #124 团队方案生成挡板：固定返回 2 角色方案 / 指定错误；记录收到的 goal
+    /// （断言「改：xxx」把调整要求合并进目标）。不碰真实 LLM。
+    struct MockTeamPlanGenerator {
+        plan: Mutex<Option<TeamPlan>>,
+        err: Mutex<Option<String>>,
+        goals: Mutex<Vec<String>>,
+    }
+    impl MockTeamPlanGenerator {
+        fn ok() -> Self {
+            Self {
+                plan: Mutex::new(Some(mock_team_plan())),
+                err: Mutex::new(None),
+                goals: Mutex::new(Vec::new()),
+            }
+        }
+        fn fail(msg: &str) -> Self {
+            Self {
+                plan: Mutex::new(None),
+                err: Mutex::new(Some(msg.to_string())),
+                goals: Mutex::new(Vec::new()),
+            }
+        }
+        fn goals(&self) -> Vec<String> {
+            self.goals.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl crate::teamflow::TeamPlanGenerator for MockTeamPlanGenerator {
+        async fn generate(
+            &self,
+            _backend: Backend,
+            goal: &str,
+            _members: &[String],
+            _template: Option<&str>,
+        ) -> Result<TeamPlan, String> {
+            self.goals.lock().unwrap().push(goal.to_string());
+            if let Some(e) = self.err.lock().unwrap().clone() {
+                return Err(e);
+            }
+            Ok(self.plan.lock().unwrap().clone().expect("mock plan"))
+        }
+    }
+
+    /// #124 测试用固定方案：2 角色（开发/测试），全部待任命。
+    fn mock_team_plan() -> TeamPlan {
+        TeamPlan {
+            team_name: "测试团队".into(),
+            roles: vec![
+                TeamRole {
+                    role_name: "开发".into(),
+                    member_name: None,
+                    system_prompt: "负责开发".into(),
+                },
+                TeamRole {
+                    role_name: "测试".into(),
+                    member_name: None,
+                    system_prompt: "负责测试".into(),
+                },
+            ],
+            collab: None,
         }
     }
 
@@ -4037,6 +4140,219 @@ https://b.com/y"
         bridge.handle(test_ev("m1", "oc_x", "恢复后的消息")).await;
         assert_eq!(runner.prompts().len(), 1, "恢复后应正常触发 agent");
         assert!(!msgr.sent().is_empty(), "恢复后应正常回复");
+        cleanup_bridge(&bridge);
+    }
+
+    // ─── #124 一键创建团队·聊天入口（P1 后端）──────────────────────────────
+
+    #[tokio::test]
+    async fn team_flow_trigger_generates_preview_without_agent() {
+        // 触发词 → 加载提示 + 方案预览；不进 agent、不落 pending（消息被消费）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        bridge
+            .handle(test_ev("m1", "oc_team1", "帮我建个团队做测试"))
+            .await;
+        let sent = msgr.sent();
+        assert!(
+            sent.iter().any(|t| t.contains("⏳ 正在为你组建团队")),
+            "应先发加载提示: {:?}",
+            sent
+        );
+        assert!(
+            sent.iter()
+                .any(|t| t.contains("📋 团队「测试团队」方案预览")),
+            "应发方案预览: {:?}",
+            sent
+        );
+        assert!(
+            sent.iter().any(|t| t.contains("✅ 回复「确认」创建团队")),
+            "预览应含操作提示"
+        );
+        assert!(runner.prompts().is_empty(), "团队流程不应进 agent");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_confirm_creates_groups_and_registers() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().bot.owner_open_id = "ou_owner".into();
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        bridge
+            .handle(test_ev("m1", "oc_team2", "帮我建个团队做测试"))
+            .await;
+        bridge.handle(test_ev("m2", "oc_team2", "确认")).await;
+        let sent = msgr.sent();
+        assert!(
+            sent.iter()
+                .any(|t| t.contains("✅ 团队「测试团队」已创建（2 个角色群）")),
+            "确认应建群并回清单: {:?}",
+            sent
+        );
+        assert_eq!(msgr.created(), vec!["开发".to_string(), "测试".to_string()]);
+        assert_eq!(bridge.vb_store.load().len(), 2, "建群后应登记虚拟 Bot");
+        // 流程结束：后续普通消息应进 agent（不再被团队流程消费）
+        bridge.handle(test_ev("m3", "oc_team2", "你好")).await;
+        assert_eq!(runner.prompts().len(), 1);
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_modify_regenerates_with_revision_merged() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        let gen = Arc::new(MockTeamPlanGenerator::ok());
+        Arc::get_mut(&mut bridge).unwrap().team_gen = gen.clone();
+        bridge
+            .handle(test_ev("m1", "oc_team3", "帮我建个团队做测试"))
+            .await;
+        bridge
+            .handle(test_ev("m2", "oc_team3", "改：把测试改成运营"))
+            .await;
+        let sent = msgr.sent();
+        let previews = sent
+            .iter()
+            .filter(|t| t.contains("📋 团队「测试团队」方案预览"))
+            .count();
+        assert_eq!(previews, 2, "改：应重新生成并替换预览（新预览消息）");
+        let goals = gen.goals();
+        assert_eq!(goals.len(), 2);
+        assert!(
+            goals[1].contains("调整要求：把测试改成运营"),
+            "调整要求应合并进生成目标: {:?}",
+            goals
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_cancel_aborts_and_clears() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        bridge
+            .handle(test_ev("m1", "oc_team4", "帮我建个团队做测试"))
+            .await;
+        bridge.handle(test_ev("m2", "oc_team4", "取消")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("已取消团队创建")),
+            "取消应回复中止确认"
+        );
+        bridge.handle(test_ev("m3", "oc_team4", "你好")).await;
+        assert_eq!(runner.prompts().len(), 1, "取消后普通消息应进 agent");
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_cancel_command_aborts() {
+        // /cancel 显式命令：团队流程进行中也要能中止（不能出现「/cancel 却说没任务」）。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        bridge
+            .handle(test_ev("m1", "oc_teamC", "帮我建个团队做测试"))
+            .await;
+        bridge.handle(test_ev("m2", "oc_teamC", "/cancel")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("已取消团队创建")),
+            "/cancel 应中止团队流程: {:?}",
+            msgr.sent()
+        );
+        bridge.handle(test_ev("m3", "oc_teamC", "你好")).await;
+        assert_eq!(runner.prompts().len(), 1);
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_trigger_without_goal_asks_then_generates() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        bridge.handle(test_ev("m1", "oc_team5", "创建团队")).await;
+        assert!(
+            msgr.sent()
+                .iter()
+                .any(|t| t.contains("想建一个什么样的团队")),
+            "缺目标应追问"
+        );
+        assert!(runner.prompts().is_empty());
+        bridge
+            .handle(test_ev("m2", "oc_team5", "帮我们建一个做运营的团队"))
+            .await;
+        assert!(
+            msgr.sent()
+                .iter()
+                .any(|t| t.contains("📋 团队「测试团队」方案预览")),
+            "补目标后应生成预览"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_generation_failure_is_retryable() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().team_gen =
+            Arc::new(MockTeamPlanGenerator::fail("模型超时"));
+        bridge
+            .handle(test_ev("m1", "oc_team6", "帮我建个团队做测试"))
+            .await;
+        assert!(
+            msgr.sent().iter().any(|t| {
+                t.contains("⚠️ 团队方案生成失败") && t.contains("模型超时") && t.contains("重试")
+            }),
+            "失败应明确提示可重试: {:?}",
+            msgr.sent()
+        );
+        // 失败不残留流程：下一条普通消息进 agent
+        bridge.handle(test_ev("m2", "oc_team6", "普通问题")).await;
+        assert_eq!(runner.prompts().len(), 1);
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_partial_failure_keeps_flow_and_retry_is_idempotent() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().bot.owner_open_id = "ou_owner".into();
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        bridge
+            .handle(test_ev("m1", "oc_team8", "帮我建个团队做测试"))
+            .await;
+        msgr.set_fail_create("测试");
+        bridge.handle(test_ev("m2", "oc_team8", "确认")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("部分成功（1/2）")),
+            "部分失败应分开展示成功/失败: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("❌ 测试（待任命）")),
+            "失败项应列出原因"
+        );
+        // 重试：已成功的「开发」跳过（不重复建），失败的「测试」补建
+        msgr.clear_fail_create();
+        bridge.handle(test_ev("m3", "oc_team8", "确认")).await;
+        assert_eq!(
+            msgr.created(),
+            vec!["开发".to_string(), "测试".to_string()],
+            "重试不应重复建已成功的群"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn team_flow_granted_role_passes_through_to_agent() {
+        // 建群是管理动作：granted（授权者）不触发团队流程，原样进 agent。
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let (mut bridge, _msgr) = build_test_bridge(runner.clone());
+        Arc::get_mut(&mut bridge).unwrap().team_gen = Arc::new(MockTeamPlanGenerator::ok());
+        let mut ev = test_ev("m1", "oc_team9", "帮我建个团队做测试");
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+        assert_eq!(runner.prompts().len(), 1, "granted 应透传 agent");
         cleanup_bridge(&bridge);
     }
 }
