@@ -20,6 +20,14 @@ pub fn apply_no_window(cmd: &mut std::process::Command) {
     cmd.creation_flags(0x0800_0000);
 }
 
+/// tokio Command 版：spawn 外部子进程时抑制控制台窗口（CREATE_NO_WINDOW，#104）。
+/// tokio 的 Command 内部包 std Command，经 `as_std_mut()` 设同一标志位。
+#[cfg(windows)]
+pub fn apply_no_window_tokio(cmd: &mut tokio::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.as_std_mut().creation_flags(0x0800_0000);
+}
+
 /// 组 PATH：claude 在 ~/.local/bin，codex/lark-cli 在 ~/.npm-global/bin；launchd 环境精简须显式带。
 /// 分平台：分隔符 win 用 `;`、unix 用 `:`；常见安装目录各平台不同。
 #[cfg(unix)]
@@ -291,10 +299,15 @@ pub fn detect_all() -> Vec<DepStatus> {
 
 /// 跑 `codex --version` 解析版本号。跑不通/非零退出 → None。
 pub fn codex_version(exe: &str) -> Option<String> {
-    let out = std::process::Command::new(exe)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    // Windows：依赖检测跑 codex --version 也抑制控制台窗口（#104），
+    // 否则每次「环境检测/一键安装」都会闪一个黑框。
+    #[cfg(windows)]
+    {
+        apply_no_window(&mut cmd);
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }

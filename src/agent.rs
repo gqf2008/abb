@@ -1091,6 +1091,12 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
+    // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
+    #[cfg(windows)]
+    {
+        crate::deps::apply_no_window_tokio(&mut cmd);
+    }
     // spawn 失败（CLI 缺失）时带上与 run_once 一致的安装指引文案
     let mut child = cmd
         .spawn()
