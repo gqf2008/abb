@@ -34,6 +34,7 @@ mod session_import;
 mod sessions;
 mod single_instance;
 mod tasks;
+mod teambuilder;
 mod tidy;
 mod trash;
 mod ui;
@@ -255,6 +256,13 @@ fn main() {
     // bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析（手动调用无 env 时报错提示）。
     if args.len() >= 2 && args[1] == "trash" {
         std::process::exit(run_trash_cli(&args[2..]));
+    }
+
+    // 一键创建团队 CLI（#100，P0）：LLM 按提示词生成团队方案（预览确认对象）。
+    //   agent-bridge team generate "<团队目标>" [--members "小王,steven"] [--backend codex] [--template 软件产品团队]
+    // 输出：校验后的团队方案 JSON（stdout），供上层预览确认/建群。
+    if args.len() >= 2 && args[1] == "team" {
+        std::process::exit(run_team_cli(&args[2..]));
     }
 
     // 历史会话迁移（#33）：agent-bridge session-import [--bot <key>] [--dry-run]。
@@ -930,6 +938,93 @@ fn run_trash_cli(args: &[String]) -> i32 {
         other => {
             eprintln!("未知 trash 子命令：{other}");
             2
+        }
+    }
+}
+
+/// 一键创建团队 CLI（#100 P0）：LLM 按提示词生成团队方案（预览确认对象）。
+/// 用法：agent-bridge team generate "<目标>" [--members "小王,steven"] [--backend codex] [--template 软件产品团队]
+/// 成功 → stdout 输出校验后的团队方案 JSON（缩进）；失败 → stderr 提示重试/手动编辑。
+fn run_team_cli(args: &[String]) -> i32 {
+    match args.first().map(|s| s.as_str()) {
+        Some("templates") => {
+            // 列出内置起手式模板（含说明），供用户选择
+            for t in crate::teambuilder::builtin_team_templates() {
+                println!("{} — {}", t.name, t.description);
+            }
+            return 0;
+        }
+        Some("generate") => {}
+        _ => {
+            eprintln!("用法：agent-bridge team generate \"<团队目标>\" [--members \"小王,steven\"] [--backend codex] [--template 软件产品团队]\n       agent-bridge team templates");
+            return 2;
+        }
+    }
+    let mut goal = String::new();
+    let mut members: Vec<String> = Vec::new();
+    let mut backend = crate::agent::Backend::Codex;
+    let mut template: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--members" => {
+                i += 1;
+                if let Some(m) = args.get(i) {
+                    members = m
+                        .split([',', '，'])
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            "--backend" => {
+                i += 1;
+                if let Some(b) = args.get(i) {
+                    backend = crate::agent::Backend::parse(b);
+                }
+            }
+            "--template" => {
+                i += 1;
+                template = args.get(i).cloned();
+            }
+            other => {
+                if goal.is_empty() {
+                    goal = other.to_string();
+                } else {
+                    goal.push(' ');
+                    goal.push_str(other);
+                }
+            }
+        }
+        i += 1;
+    }
+    if goal.trim().is_empty() {
+        eprintln!("缺少团队目标。用法：agent-bridge team generate \"<团队目标>\"");
+        return 2;
+    }
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("运行时创建失败：{e}");
+            return 1;
+        }
+    };
+    match rt.block_on(crate::teambuilder::generate_team_plan(
+        backend,
+        &goal,
+        &members,
+        template.as_deref(),
+    )) {
+        Ok(plan) => {
+            match serde_json::to_string_pretty(&plan) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("序列化失败：{e}"),
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
         }
     }
 }
