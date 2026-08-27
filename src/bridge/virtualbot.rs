@@ -432,6 +432,8 @@ impl Bridge {
         // /new 清盘互斥——新会话首轮不可能读到未清盘的旧历史（审查 I-2 读侧闭环）。
         // 锁持于块作用域内（std MutexGuard 非 Send 不能跨 await）：块结束即释放，
         // agent 运行期间不持锁（/new 不被运行中任务阻塞）。
+        // #130：记录本轮实际注入的历史块原文（重试替换用；空 = 未注入历史）。
+        let mut injected_block: Option<String> = None;
         let (hist_epoch_lock, hist_epoch, injected_rounds) = {
             let lock = self.history_lock(&key);
             let lock_ret = lock.clone(); // guard 借用 lock，返回值需独立 Arc
@@ -454,8 +456,7 @@ impl Bridge {
                 resume = res2;
             }
             // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）：
-            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）。
-            //   pi 例外（#56 同一探针，两个 !resume 臂都参与）：文件存在即续聊——被打断/
+            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）。            //   pi 例外（#56 同一探针，两个 !resume 臂都参与）：文件存在即续聊——被打断/
             //   失败的 pi 轮次文件已在盘上（pi 会话创建即落盘），文件存在时再注入会把
             //   同一历史块二次写进 pi transcript；文件缺失（且 marker 命中）才是真丢失。
             // - resume（既有会话）：pending 命中（#54 自愈重建/换 UUID 后待补注入）
@@ -498,8 +499,18 @@ impl Bridge {
                     || session_file_lost()
             };
             let injected_rounds = if should_inject {
-                let (block, n) = hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
+                // #130：该会话已被上下文压缩（ctxsum 存在）→ 注入压缩块（旧摘要 + 近期
+                // 原文）而非全量历史——压缩后全量历史仍会超长，注入必须切到压缩源。
+                let workspace = crate::workspace_dir(&self.bot.key());
+                let (block, n) = match crate::contextsum::ctxsum_block_at(&workspace, &key) {
+                    Some(sum) => {
+                        let rounds = sum.matches("用户: ").count();
+                        (sum, rounds.max(1))
+                    }
+                    None => hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT),
+                };
                 if n > 0 {
+                    injected_block = Some(block.clone());
                     prompt.insert_str(0, &block);
                     Some(n)
                 } else {
@@ -573,10 +584,7 @@ impl Bridge {
 
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
-        // agent 边跑边把中途完整消息推进 progress 通道（agent.rs 现状不变）；
-        // 打字机已下线：中途处理过程消息一律丢弃不回，任务结束只发最终结果一条。
         // cancel flag 注册进 cancel_flags，供该 chat 后续「停止词」消息叫停。
-        let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cancel_flags
             .lock()
@@ -588,44 +596,105 @@ impl Bridge {
         // 避免 future 跨 await 持有 `&self.agent_runner`，与 select 内 `&self` 的其它字段
         // 借用冲突（保持原自由函数调用「future 只持有 &self.sessions」的借用形态）。
         let runner = self.agent_runner.clone();
-        let run_fut = runner.run(
-            backend,
-            &prompt,
-            &session_id,
-            resume,
-            &ev.chat_id,
-            &key, // 会话隔离 key（话题=chat:thread，#14）：session 存储按 key 记账，回存须同 key
-            &bot_key,
-            ev.role, // 发送者角色：granted 走受限分支（restrict 判定在 agent::run 内热读）
-            Some(&self.sessions),
-            Some(ptx),
-            Some(cancel_flag.clone()),
-        );
-        tokio::pin!(run_fut);
+        let mut result = self
+            .run_agent_with_progress(
+                &runner,
+                backend,
+                &prompt,
+                &session_id,
+                resume,
+                &ev.chat_id,
+                &key,
+                &bot_key,
+                ev.role,
+                &cancel_flag,
+            )
+            .await;
 
-        // 中途输出只计数不逐条留日志：编码 agent 一轮任务可推数百条进度，逐条写盘会让
-        // 日志量随任务时长无界增长（打字机路径原有 500ms 节流，微信/关停路径静默丢弃）。
-        // 统一只发最终结果：丢弃并计数，收尾汇总成一行日志，信息不减、日志量有界。
-        let mut dropped_progress = 0usize;
-        let result = loop {
-            tokio::select! {
-                Some(_p) = prx.recv() => {
-                    dropped_progress += 1;
+        // #130：上下文超长错误 → 自动分段压缩 + 换新会话重试一次（每会话只压缩一次）。
+        // 开关默认开（config context_compress_enabled）；ctxsum 已存在 = 已压缩过 → 不
+        // 再压缩（防循环），错误照常返回并带提示。压缩失败（LLM 摘要不可用/写盘失败）
+        // 也不阻塞主链路：回落原错误，用户可见 hint 不误导。
+        let mut compress_note: Option<String> = None;
+        if let Err(e) = &result {
+            let enabled = crate::config::Config::load()
+                .map(|c| c.context_compress_enabled)
+                .unwrap_or(true);
+            if enabled && crate::contextsum::is_context_too_long(e) {
+                let workspace = crate::workspace_dir(&bot_key);
+                if crate::contextsum::ctxsum_block_at(&workspace, &key).is_none() {
+                    crate::log!(
+                        "[bridge] #130 上下文超长，自动压缩 chat={} err_len={}",
+                        trunc(&ev.chat_id, 10),
+                        e.chars().count()
+                    );
+                    match crate::contextsum::compress(
+                        &workspace,
+                        &key,
+                        backend,
+                        &ev.chat_id,
+                        &bot_key,
+                        ev.role,
+                        runner.as_ref(),
+                        Some(cancel_flag.clone()),
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            // 换新会话（reset_session：新 UUID + started=false）＋重建
+                            // prompt：压缩块替换原历史块（未注入历史则前置压缩块）。
+                            let new_sid = self.sessions.reset_session(&key);
+                            let ctxsum_block = crate::contextsum::ctxsum_block_at(&workspace, &key)
+                                .unwrap_or_default();
+                            let mut prompt2 = prompt.clone();
+                            match &injected_block {
+                                Some(hb) if !hb.is_empty() => {
+                                    prompt2 = prompt2.replacen(hb, &ctxsum_block, 1);
+                                }
+                                _ => {
+                                    if !ctxsum_block.is_empty() {
+                                        prompt2.insert_str(0, &ctxsum_block);
+                                    }
+                                }
+                            }
+                            compress_note = Some(format!(
+                                "💡 历史过长，已自动压缩 {} 条旧消息为摘要（{} 段），保留最近 {} 条原文，已换新会话重试本条…",
+                                report.compressed, report.summaries, report.kept
+                            ));
+                            crate::log!(
+                                "[bridge] #130 压缩完成 chat={} 压缩={} 保留={} 段={} llm={} → 新会话重试",
+                                trunc(&ev.chat_id, 10),
+                                report.compressed,
+                                report.kept,
+                                report.summaries,
+                                report.used_llm
+                            );
+                            result = self
+                                .run_agent_with_progress(
+                                    &runner,
+                                    backend,
+                                    &prompt2,
+                                    &new_sid,
+                                    false,
+                                    &ev.chat_id,
+                                    &key,
+                                    &bot_key,
+                                    ev.role,
+                                    &cancel_flag,
+                                )
+                                .await;
+                        }
+                        Err(ce) => {
+                            crate::log!("[bridge] ⚠️ #130 上下文压缩失败: {ce}");
+                        }
+                    }
+                } else {
+                    crate::log!(
+                        "[bridge] #130 已压缩过仍超长 chat={}（不重复压缩，提示用户）",
+                        trunc(&ev.chat_id, 10)
+                    );
                 }
-                r = &mut run_fut => { break r; }
             }
-        };
-        // run 完成时通道里可能还有刚入队未消费的中途输出（select 双就绪随机 break）——
-        // 全部排空丢弃（agent 侧 unbounded send 不阻塞），不留残留。
-        while let Ok(_p) = prx.try_recv() {
-            dropped_progress += 1;
-        }
-        if dropped_progress > 0 {
-            crate::log!(
-                "[bridge] 丢弃中途进度 {} 条 chat={}（统一只发最终结果）",
-                dropped_progress,
-                trunc(&ev.chat_id, 10)
-            );
         }
         // 任务结束 → 摘掉打断标志（后续停止词将按普通消息处理）
         self.cancel_flags.lock().unwrap().remove(&key);
@@ -637,6 +706,12 @@ impl Bridge {
                 session_id: final_sid,
                 rebuilt,
             }) => {
+                // #130：压缩重试成功 → 回复前置系统提示（用户可见压缩动作；历史落盘
+                // 与发送均用同一份 reply，保持显示一致）。
+                let reply = match &compress_note {
+                    Some(note) => format!("{note}\n\n{reply}"),
+                    None => reply,
+                };
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
                 // #23：仅当当前槽位仍是本次任务的会话时才 mark——运行中被 /new 或
                 // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
@@ -758,6 +833,12 @@ impl Bridge {
                 // 不 mark_started：被打断的轮次不算完成
             }
             Err(e) => {
+                // #130：压缩重试仍失败 → 错误文案前置压缩提示（用户知道已自动处理过，
+                // 不再静默重试）。
+                let e = match &compress_note {
+                    Some(note) => format!("{note}\n\n{e}"),
+                    None => e,
+                };
                 // 错误文案作为最终回复发出（用户可见原因），同样留痕。
                 // 先摘 pending（任务已结束；错误文案发送失败不重跑，与基线一致——
                 // remove 若在发送后，崩溃窗口会让失败任务被重启重放续跑）。
@@ -779,6 +860,63 @@ impl Bridge {
         self.msgr.del_typing(&ev.mid, typing_rid).await;
         self.msgr.done(&ev.mid).await;
         // _serial_guard 在此函数末尾 drop，释放 per-chat 锁，排队的下一条开始处理。
+    }
+
+    /// 执行一轮 agent 任务（统一中途进度排空：打字机已下线，中途输出丢弃不回，
+    /// 任务结束只发最终结果一条）。#130 压缩重试也走本方法（每轮独立 progress 通道）。
+    #[allow(clippy::too_many_arguments)] // 与 agent::run 同款参数集（11 参）
+    async fn run_agent_with_progress(
+        &self,
+        runner: &std::sync::Arc<dyn crate::agent::AgentRunner>,
+        backend: crate::agent::Backend,
+        prompt: &str,
+        session_id: &str,
+        resume: bool,
+        chat_id: &str,
+        key: &str,
+        bot_key: &str,
+        role: crate::config::SenderRole,
+        cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::agent::RunOutcome, String> {
+        let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let run_fut = runner.run(
+            backend,
+            prompt,
+            session_id,
+            resume,
+            chat_id,
+            key, // 会话隔离 key（话题=chat:thread，#14）：session 存储按 key 记账，回存须同 key
+            bot_key,
+            role, // 发送者角色：granted 走受限分支（restrict 判定在 agent::run 内热读）
+            Some(&self.sessions),
+            Some(ptx),
+            Some(cancel_flag.clone()),
+        );
+        tokio::pin!(run_fut);
+        // 中途输出只计数不逐条留日志：编码 agent 一轮任务可推数百条进度，逐条写盘会让
+        // 日志量随任务时长无界增长。统一只发最终结果：丢弃并计数，收尾汇总成一行日志。
+        let mut dropped_progress = 0usize;
+        let result = loop {
+            tokio::select! {
+                Some(_p) = prx.recv() => {
+                    dropped_progress += 1;
+                }
+                r = &mut run_fut => { break r; }
+            }
+        };
+        // run 完成时通道里可能还有刚入队未消费的中途输出（select 双就绪随机 break）——
+        // 全部排空丢弃（agent 侧 unbounded send 不阻塞），不留残留。
+        while let Ok(_p) = prx.try_recv() {
+            dropped_progress += 1;
+        }
+        if dropped_progress > 0 {
+            crate::log!(
+                "[bridge] 丢弃中途进度 {} 条 chat={}（统一只发最终结果）",
+                dropped_progress,
+                trunc(chat_id, 10)
+            );
+        }
+        result
     }
 
     /// /trash 子命令处理（#88）。owner 已由调用方过滤；这里只产出回复文案。

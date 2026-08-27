@@ -82,6 +82,8 @@ pub struct History {
     marker_path: PathBuf,
     /// #33 已导入来源标记（`<key>.imported.json`）。
     imported_path: PathBuf,
+    /// #130 上下文压缩块（压缩后注入优先用它；/new 清历史时一并删）。
+    ctxsum_path: PathBuf,
 }
 
 impl History {
@@ -97,6 +99,7 @@ impl History {
             path: dir.join(format!("{esc}.jsonl")),
             marker_path: dir.join(format!("{esc}.migrated.json")),
             imported_path: dir.join(format!("{esc}.imported.json")),
+            ctxsum_path: dir.join(format!("{esc}.ctxsum")),
         }
     }
 
@@ -229,7 +232,10 @@ impl History {
     pub fn clear(&self) -> bool {
         let a = std::fs::remove_file(&self.path);
         let b = std::fs::remove_file(&self.marker_path);
-        let ok = (a.is_ok() || !self.path.exists()) && (b.is_ok() || !self.marker_path.exists());
+        let c = std::fs::remove_file(&self.ctxsum_path); // #130 压缩块随清历史一并移除
+        let ok = (a.is_ok() || !self.path.exists())
+            && (b.is_ok() || !self.marker_path.exists())
+            && (c.is_ok() || !self.ctxsum_path.exists());
         if !ok {
             crate::log!("[history] ⚠️ 清空失败 path={}", trunc_path(&self.path));
         }
