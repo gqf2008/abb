@@ -845,7 +845,8 @@ fn run_trash_cli(args: &[String]) -> i32 {
         }
     };
     let workspace = crate::workspace_dir(&bot_key);
-    let settings = crate::trash::TrashSettings::defaults();
+    // 热读 bot 实际配置（与 hook/service 同口径），避免 TTL 默认值提前清条目
+    let settings = crate::guard::bot_trash_settings_for(&bot_key);
     match sub {
         "list" => {
             let items = crate::trash::list(&workspace);

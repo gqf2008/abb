@@ -817,7 +817,10 @@ impl Bridge {
                     ));
                 }
                 if items.len() > 10 {
-                    lines.push(format!("…共 {} 条（更多用 trash list 命令查看）", items.len()));
+                    lines.push(format!(
+                        "…共 {} 条（更多用 trash list 命令查看）",
+                        items.len()
+                    ));
                 }
                 if !pending.is_empty() {
                     lines.push("\n待确认危险删除（/trash confirm <路径>）：".into());
@@ -837,13 +840,17 @@ impl Bridge {
                 } else {
                     crate::trash::purge_expired(&workspace, self.bot.trash_ttl_days.max(1))
                 };
-                format!("🧹 已清理回收站条目 {n} 条{}", if all { "（全部）" } else { "（过期）" })
+                format!(
+                    "🧹 已清理回收站条目 {n} 条{}",
+                    if all { "（全部）" } else { "（过期）" }
+                )
             }
             TrashCmd::Confirm(path) => {
                 match crate::guard::confirm_dangerous_delete(&self.bot.key(), &workspace, &path) {
                     Ok(it) => format!(
                         "✅ 已确认并移入回收站：{}（{} 天内可恢复；/trash restore 可撤回）",
-                        it.orig, self.bot.trash_ttl_days.max(1)
+                        it.orig,
+                        self.bot.trash_ttl_days.max(1)
                     ),
                     Err(e) => format!("⚠️ 确认失败：{e}"),
                 }

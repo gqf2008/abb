@@ -232,13 +232,19 @@ pub fn classify(workspace: &Path, p: &Path, s: &TrashSettings) -> Classify {
 /// 文件名（不含目录）是否命中代码特征：扩展名在 code_exts 或文件名在 code_files。
 /// 大小写不敏感（Windows/macOS 文件系统行为对齐，`.PY` 与 `.py` 同判）。
 fn is_code_path(p: &Path, s: &TrashSettings) -> bool {
-    let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()) else {
+    let Some(name) = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+    else {
         return false;
     };
     if s.code_files.iter().any(|f| f.eq_ignore_ascii_case(&name)) {
         return true;
     }
-    match p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()) {
+    match p
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    {
         Some(ext) => {
             let dotted = format!(".{ext}");
             s.code_exts.iter().any(|e| e.eq_ignore_ascii_case(&dotted))
@@ -323,7 +329,11 @@ pub fn git_snapshot_sync(workspace: &Path) -> Result<(), String> {
 
 /// 有界同步 git 执行：try_wait 轮询 + 超时杀进程（Windows/macOS 通用，不依赖 wait_timeout）。
 /// stdout/stderr 管道容量：add -A 静默、commit 输出小，不会因管道填满阻塞子进程。
-fn run_git(workspace: &Path, args: &[&str], timeout_secs: u64) -> Result<std::process::Output, String> {
+fn run_git(
+    workspace: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
     let mut child = std::process::Command::new("git")
         .args(args)
         .current_dir(workspace)
@@ -333,7 +343,10 @@ fn run_git(workspace: &Path, args: &[&str], timeout_secs: u64) -> Result<std::pr
         .map_err(|e| format!("git {} 启动失败：{e}", args.join(" ")))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("git wait 失败：{e}"))? {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("git wait 失败：{e}"))?
+        {
             let out = child
                 .wait_with_output()
                 .map_err(|e| format!("git 收尾失败：{e}"))?;
@@ -348,7 +361,11 @@ fn run_git(workspace: &Path, args: &[&str], timeout_secs: u64) -> Result<std::pr
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            return Err(format!("git {} 超时（{}s），已终止", args.join(" "), timeout_secs));
+            return Err(format!(
+                "git {} 超时（{}s），已终止",
+                args.join(" "),
+                timeout_secs
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -367,8 +384,7 @@ pub fn move_to_trash(
     reason: &str,
 ) -> Result<Vec<TrashItem>, String> {
     let root = trash_root(workspace);
-    std::fs::create_dir_all(root.join("items"))
-        .map_err(|e| format!("创建回收站目录失败：{e}"))?;
+    std::fs::create_dir_all(root.join("items")).map_err(|e| format!("创建回收站目录失败：{e}"))?;
     let mut items = load_manifest(workspace);
     let now = crate::chrono_lite::unix_secs();
     let mut moved = Vec::new();
@@ -378,10 +394,17 @@ pub fn move_to_trash(
             continue;
         }
         if abs.starts_with(&root) {
-            return Err(format!("{} 已在回收站内，请用 /trash restore 或 /trash purge 处理", p.display()));
+            return Err(format!(
+                "{} 已在回收站内，请用 /trash restore 或 /trash purge 处理",
+                p.display()
+            ));
         }
         let c = classify(workspace, &abs, settings);
-        let id = format!("{}-{}", crate::chrono_lite::now().replace([':', ' '], ""), rand_suffix());
+        let id = format!(
+            "{}-{}",
+            crate::chrono_lite::now().replace([':', ' '], ""),
+            rand_suffix()
+        );
         let dest_dir = root.join("items").join(&id);
         std::fs::create_dir_all(&dest_dir).map_err(|e| format!("创建条目目录失败：{e}"))?;
         let name = abs
@@ -466,8 +489,9 @@ pub fn purge_expired(workspace: &Path, ttl_days: u32) -> usize {
     let ttl_secs = (ttl_days.max(1) as u64) * 24 * 3600;
     let now = crate::chrono_lite::unix_secs();
     let items = load_manifest(workspace);
-    let (keep, drop): (Vec<TrashItem>, Vec<TrashItem>) =
-        items.into_iter().partition(|i| now.saturating_sub(i.trashed_at) < ttl_secs);
+    let (keep, drop): (Vec<TrashItem>, Vec<TrashItem>) = items
+        .into_iter()
+        .partition(|i| now.saturating_sub(i.trashed_at) < ttl_secs);
     let dropped = drop.len();
     for item in &drop {
         let _ = std::fs::remove_dir_all(trash_root(workspace).join("items").join(&item.id));

@@ -128,13 +128,22 @@ pub struct BotConfig {
     #[serde(default = "default_true", skip_serializing_if = "protect_on")]
     pub delete_protect_enabled: bool,
     /// 回收站保留天数（TTL），默认 7。默认值不落盘，旧 config 兼容。
-    #[serde(default = "default_trash_ttl_days", skip_serializing_if = "ttl_default")]
+    #[serde(
+        default = "default_trash_ttl_days",
+        skip_serializing_if = "ttl_default"
+    )]
     pub trash_ttl_days: u32,
     /// 危险删除大小阈值（MB），默认 50。≥阈值的删除需二次确认（/trash confirm）。
-    #[serde(default = "default_dangerous_size_mb", skip_serializing_if = "size_default")]
+    #[serde(
+        default = "default_dangerous_size_mb",
+        skip_serializing_if = "size_default"
+    )]
     pub dangerous_size_mb: u64,
     /// 危险删除代码特征扩展名（默认见 trash::default_code_exts）。命中即需二次确认。
-    #[serde(default = "default_code_exts", skip_serializing_if = "code_exts_default")]
+    #[serde(
+        default = "default_code_exts",
+        skip_serializing_if = "code_exts_default"
+    )]
     pub code_exts: Vec<String>,
 }
 

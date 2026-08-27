@@ -634,7 +634,10 @@ fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
     // 危险删除：拒绝 + 登记待确认（不移动、不删除——等 /trash confirm）
     if !dangerous.is_empty() {
         if let Ok(k) = std::env::var("AGENT_BRIDGE_BOT_KEY") {
-            register_pending(&k, &dangerous.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+            register_pending(
+                &k,
+                &dangerous.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            );
         }
         let reasons: Vec<String> = dangerous
             .iter()
@@ -675,15 +678,21 @@ fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
 
 /// 当前 bot 的删除保护设置（hook 子进程热读 config；读不到按安全默认）。
 fn bot_trash_settings() -> crate::trash::TrashSettings {
-    let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
-    match (bot_key, crate::config::Config::load()) {
-        (Some(k), Ok(cfg)) => cfg
+    let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
+    bot_trash_settings_for(&bot_key)
+}
+
+/// 指定 bot 的删除保护设置（热读 config；找不到 bot 或读不到按安全默认）。
+/// trash CLI 与 hook/service 统一走这里，保证 TTL 口径一致。
+pub(crate) fn bot_trash_settings_for(bot_key: &str) -> crate::trash::TrashSettings {
+    match crate::config::Config::load() {
+        Ok(cfg) => cfg
             .bots
             .iter()
-            .find(|b| b.key() == k)
+            .find(|b| b.key() == bot_key)
             .map(crate::trash::TrashSettings::from_bot)
             .unwrap_or_else(crate::trash::TrashSettings::defaults),
-        _ => crate::trash::TrashSettings::defaults(),
+        Err(_) => crate::trash::TrashSettings::defaults(),
     }
 }
 
@@ -772,7 +781,9 @@ pub fn confirm_dangerous_delete(
     path: &str,
 ) -> Result<crate::trash::TrashItem, String> {
     if !take_pending(bot_key, workspace, path) {
-        return Err(format!("没有待确认的危险删除匹配：{path}（/trash list 查看）"));
+        return Err(format!(
+            "没有待确认的危险删除匹配：{path}（/trash list 查看）"
+        ));
     }
     let settings = bot_trash_settings();
     let moved = crate::trash::move_to_trash(
@@ -921,11 +932,15 @@ mod tests {
         let exe = root.join("abb.exe");
         std::fs::create_dir_all(&root).unwrap();
         ensure_owner_guard_files_at(&root, &exe).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join("owner-settings.json")).unwrap())
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("owner-settings.json")).unwrap(),
+        )
+        .unwrap();
         let hook = &v["hooks"]["PreToolUse"][0];
-        assert_eq!(hook["matcher"], "Bash", "owner 只拦 Bash（其它工具零开销直通）");
+        assert_eq!(
+            hook["matcher"], "Bash",
+            "owner 只拦 Bash（其它工具零开销直通）"
+        );
         let cmd = hook["hooks"][0]["command"].as_str().unwrap();
         assert!(
             cmd.contains("guard-check"),
@@ -948,10 +963,7 @@ mod tests {
         std::fs::write(ws.join("a.txt"), "hello").unwrap();
         std::fs::write(ws.join("sub/b.txt"), "world").unwrap();
         // 工作区内小文件删除 → 移入回收站 + deny
-        let d = check_owner_bash(
-            &serde_json::json!({"command": "rm a.txt sub/b.txt"}),
-            &ws,
-        );
+        let d = check_owner_bash(&serde_json::json!({"command": "rm a.txt sub/b.txt"}), &ws);
         match d {
             Decision::Deny(r) => {
                 assert!(r.contains("回收站"), "reason 应告知移入回收站：{r}");
@@ -998,7 +1010,10 @@ mod tests {
         }
         // 复合语法：owner 放行（不因解析不了卡死合法命令）
         assert_eq!(
-            check_owner_bash(&serde_json::json!({"command": "rm a.txt | tee /tmp/x"}), &ws),
+            check_owner_bash(
+                &serde_json::json!({"command": "rm a.txt | tee /tmp/x"}),
+                &ws
+            ),
             Decision::Allow
         );
         // 工作区外删除：owner 自由
@@ -1008,7 +1023,10 @@ mod tests {
         );
         // find -delete：显式拒绝（无法可靠提取目标）
         assert_ne!(
-            check_owner_bash(&serde_json::json!({"command": "find . -name '*.tmp' -delete"}), &ws),
+            check_owner_bash(
+                &serde_json::json!({"command": "find . -name '*.tmp' -delete"}),
+                &ws
+            ),
             Decision::Allow
         );
         let _ = std::fs::remove_dir_all(&root);
