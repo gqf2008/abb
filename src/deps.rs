@@ -221,6 +221,10 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// 升级态），缺失视为「需安装」。
 pub const MIN_CODEX_VERSION: &str = "0.140";
 
+/// #105 git 最低版本锁定：< 2.30 视为「需升级」（2.30 起覆盖后续安全修复；
+/// 删除保护 git 留痕（#88）与 tidy 每日整理（#104 已核实）都依赖 git）。
+pub const MIN_GIT_VERSION: &str = "2.30";
+
 #[derive(Debug, Clone)]
 pub struct DepStatus {
     /// 机器键：claude | codex | pi | node | python3 | lark-cli | dingtalk-cli
@@ -240,7 +244,8 @@ pub struct DepStatus {
 
 /// 检测全部依赖。设置窗打开 + 「重新检测」时调。
 /// node 探 `node`；python 先试 `python3` 再 `python`；lark-cli 用于技能引导门控。
-/// codex 额外做版本探测（#93 最低版本锁定，见 MIN_CODEX_VERSION）。
+/// codex 额外做版本探测（#93 最低版本锁定，见 MIN_CODEX_VERSION）；
+/// git 额外做版本探测（#105 最低版本锁定，见 MIN_GIT_VERSION）。
 pub fn detect_all() -> Vec<DepStatus> {
     let probe = |id: &'static str, label: &'static str, names: &[&str]| -> DepStatus {
         for n in names {
@@ -284,6 +289,25 @@ pub fn detect_all() -> Vec<DepStatus> {
     } else {
         codex
     };
+    let git = probe("git", "Git", &["git"]);
+    let git = if git.found {
+        // git 版本探测失败保守按「可用」放行（与 codex 同权衡：能跑 git 就大概率能
+        // 跑 --version；按不满足会假阳性一直提示升级）。
+        match git_version(&git.path) {
+            Some(v) => DepStatus {
+                version: v.clone(),
+                version_ok: version_at_least(&v, MIN_GIT_VERSION),
+                ..git
+            },
+            None => DepStatus {
+                version: String::new(),
+                version_ok: true,
+                ..git
+            },
+        }
+    } else {
+        git
+    };
     vec![
         probe("claude", "Claude Code", &["claude"]),
         codex,
@@ -294,6 +318,7 @@ pub fn detect_all() -> Vec<DepStatus> {
         probe("lark-cli", "lark-cli", &["lark-cli"]),
         // 钉钉 CLI（dingtalk-workspace-cli，命令名 dws）：接入钉钉 bot 后让 agent 调钉钉能力
         probe("dingtalk-cli", "dingtalk-cli (dws)", &["dws"]),
+        git,
     ]
 }
 
@@ -334,6 +359,41 @@ pub fn codex_version_from_text(text: &str) -> Option<String> {
             tok.chars()
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect()
+        })
+}
+
+/// 跑 `git --version` 解析版本号。跑不通/非零退出 → None。
+pub fn git_version(exe: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    // Windows：检测也抑制控制台窗口（#104 同款——GUI 下跑 git --version 不闪黑框）。
+    #[cfg(windows)]
+    {
+        apply_no_window(&mut cmd);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    git_version_from_text(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 从 `git --version` 输出文本里提取版本号。输出形如 `git version 2.39.2.windows.1`
+/// → 返回 `2.39.2`（去平台后缀）；找不到形如 `d+.d+` 的 token → None。
+pub fn git_version_from_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|tok| {
+            tok.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>()
+        })
+        .map(|head| head.trim_end_matches('.').to_string())
+        .find(|head| {
+            !head.is_empty()
+                && head.split('.').count() >= 2
+                && head
+                    .split('.')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         })
 }
 
@@ -445,6 +505,11 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 ),
                 InstallStep::exec("brew", &["install", "dingtalk-workspace-cli"]),
             ],
+            // git：brew 首选（可自动化）；无 brew 回落 xcode-select（弹系统安装对话框，需人工确认）。
+            "git" => vec![
+                InstallStep::exec("brew", &["install", "git"]),
+                InstallStep::shell("xcode-select --install"),
+            ],
             other => return Err(format!("未知依赖：{other}")),
         };
         return Ok(plan);
@@ -481,6 +546,19 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
             "dingtalk-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "dingtalk-workspace-cli"],
+            )],
+            // git：winget 官方包（Git for Windows）静默安装——与 node/python 同款入口；
+            // 装完 WinGet\Links 里生成 git.exe 链接（composed_path 已含该目录），
+            // 无需重启 ABB 即可重新检测到（PATH 即时生效）。
+            "git" => vec![InstallStep::exec(
+                "winget",
+                &[
+                    "install",
+                    "Git.Git",
+                    "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ],
             )],
             other => return Err(format!("未知依赖：{other}")),
         };
@@ -525,6 +603,11 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 "npm",
                 &["install", "-g", "dingtalk-workspace-cli"],
             )],
+            "git" => vec![InstallStep::shell(
+                "if command -v apt-get >/dev/null; then sudo apt-get install -y git; \
+                     elif command -v dnf >/dev/null; then sudo dnf install -y git; \
+                     else echo 'no-supported-pkg-mgr' >&2; exit 1; fi",
+            )],
             other => return Err(format!("未知依赖：{other}")),
         };
         return Ok(plan);
@@ -553,9 +636,9 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
         match run_step(step).await {
             Ok(tail) => {
                 // 该步退出 0：再确认依赖真的可用了（有些安装器 0 退出但需重开 shell 才上 PATH）。
-                // #93：codex 装完还要过最低版本锁（npm 装到旧版缓存/降级场景少见，但过一下更稳）。
+                // #93/#105：codex/git 装完还要过最低版本锁（旧版缓存/降级场景少见，但过一下更稳）。
                 let ok_after = detect_one(dep_id)
-                    .map(|d| d.found && (dep_id != "codex" || d.version_ok))
+                    .map(|d| d.found && !((dep_id == "codex" || dep_id == "git") && !d.version_ok))
                     .unwrap_or(false);
                 if ok_after {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
@@ -754,9 +837,10 @@ const ALL_INSTALL_DEP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for d in deps {
-        // #93：codex 已装但版本低于最低锁定（MIN_CODEX_VERSION）也进清单——
-        // 一键安装/单项安装会重跑 npm/brew 升级到最新。其余依赖只看 found。
-        if !d.found || (d.id == "codex" && !d.version_ok) {
+        // #93/#105：codex/git 已装但版本低于最低锁定（MIN_CODEX_VERSION /
+        // MIN_GIT_VERSION）也进清单——一键安装/单项安装会重跑安装器升级到最新。
+        // 其余依赖只看 found。
+        if !d.found || ((d.id == "codex" || d.id == "git") && !d.version_ok) {
             ids.push(d.id.to_string());
         }
     }
@@ -1288,6 +1372,26 @@ mod tests {
     }
 
     #[test]
+    fn git_version_parses_cli_output() {
+        // git --version 实测输出形态（win 带平台后缀）：`git version 2.39.2.windows.1`。
+        assert_eq!(
+            git_version_from_text("git version 2.39.2.windows.1\n"),
+            Some("2.39.2".into())
+        );
+        assert_eq!(
+            git_version_from_text("git version 2.30.0"),
+            Some("2.30.0".into())
+        );
+        assert_eq!(git_version_from_text("git version"), None);
+        assert_eq!(git_version_from_text(""), None);
+        // 版本门：2.30 边界
+        assert!(version_at_least("2.30.0", MIN_GIT_VERSION));
+        assert!(version_at_least("2.39.2", MIN_GIT_VERSION));
+        assert!(!version_at_least("2.29.3", MIN_GIT_VERSION));
+        assert!(!version_at_least("1.9.5", MIN_GIT_VERSION));
+    }
+
+    #[test]
     fn missing_deps_includes_version_low_codex() {
         // 已装但版本过低 → 进缺失清单（升级路径）
         let low = DepStatus {
@@ -1367,9 +1471,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_all_covers_seven() {
+    fn detect_all_covers_eight() {
         let all = detect_all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
         for want in [
             "claude",
@@ -1379,6 +1483,7 @@ mod tests {
             "python3",
             "lark-cli",
             "dingtalk-cli",
+            "git",
         ] {
             assert!(ids.contains(&want), "缺 {want}");
         }
@@ -1474,7 +1579,7 @@ mod tests {
             .map(|d| dep(d.id, false))
             .collect::<Vec<_>>();
         let ids = missing_dep_ids(&all_missing);
-        assert_eq!(ids.len(), 7, "全缺 → 7 项");
+        assert_eq!(ids.len(), 8, "全缺 → 8 项");
         assert_eq!(ids[0], "node", "node 恒在最前");
         // 部分缺保 detect 序（node 不在缺失集时不插队）
         let partial = vec![
