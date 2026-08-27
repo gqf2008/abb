@@ -205,11 +205,13 @@ enum AttemptErr {
 }
 
 /// 供应商解析产物：要注入子进程的 env，和仅 codex/pi 用的额外 CLI 参数。
-struct Injection {
-    env: Option<HashMap<String, String>>,
+/// pub(crate)：teambuilder（#123）复用同一套供应商注入，保证 team generate
+/// 与主链路同源（桥内配置优先，未配置回落各后端自认证）。
+pub(crate) struct Injection {
+    pub(crate) env: Option<HashMap<String, String>>,
     /// codex：`-c model_provider=... -c model_providers.agent_bridge.*=...`；
     /// pi：`--provider <名> --model <模型>`。claude 永远为空。
-    extra_args: Vec<String>,
+    pub(crate) extra_args: Vec<String>,
 }
 
 /// codex 注入 api key 用的 env 变量名（经 `env_key` 引用，key 绝不进 argv / config.toml）。
@@ -253,7 +255,7 @@ fn ccswitch_env_or_err() -> Result<HashMap<String, String>, String> {
 
 /// 由（后端, 供应商）算出注入产物。优先级：桥内供应商 > CC Switch / codex 自认证。
 /// 类型与后端不匹配 → Err（用户可见）。供应商为 None → 旧行为回落。
-fn build_injection(
+pub(crate) fn build_injection(
     backend: Backend,
     provider: Option<&crate::config::ProviderConfig>,
 ) -> Result<Injection, String> {
@@ -813,7 +815,9 @@ fn claude_command(
 /// （文档与实测不符、写入 config.toml 会破坏登录态）→ 不生成；④ Windows sandbox
 /// runner 依赖真实 pwsh（composed_path 已前置，见 deps.rs windows_pwsh_dirs——
 /// WindowsApps 别名会让 CreateProcessAsUserW 1920 失败，spike 2026-08-27 实测）。
-fn codex_command(
+/// pub(crate)：teambuilder（#123）复用成熟版 codex 参数（--json --skip-git-repo-check
+/// + sandbox + 供应商 -c 注入），team generate 与主链路参数对齐（QA 静态核对 A8）。
+pub(crate) fn codex_command(
     program: &std::path::Path,
     resume: bool,
     session_id: &str,
@@ -1067,6 +1071,8 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
 /// 一次 stdin 问答。claude（`claude -p --output-format text`）/ codex（`codex exec`）
 /// 支持；pi CLI 形态差异大，回落明确错误。输出：去空行 + 截断 100 字符
 /// （char 安全，truncate 语义）。
+/// #123 同根因加固（2026-08-27）：codex 分支补 `--skip-git-repo-check`（非 git 目录
+/// 下 codex 拒绝执行 → 空输出），stderr 改管道透传（失败原因可定位，不再静默空结果）。
 pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
     let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
@@ -1091,7 +1097,9 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         }
         Backend::Codex => {
             let mut c = tokio::process::Command::from(shim_command(&resolved));
-            c.arg("exec");
+            // #123：非 git 目录下 codex 拒跑（trusted directory 检查）→ 补 flag；
+            // 输出仍走文本（与 teambuilder 不同：这里不解析 JSON 事件，故不加 --json）。
+            c.arg("exec").arg("--skip-git-repo-check");
             c
         }
         Backend::Pi => {
@@ -1108,9 +1116,9 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     };
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
-    // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
+        .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，空结果时透传归因
+                                               // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
+                                               // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
     #[cfg(windows)]
     {
         crate::deps::apply_no_window_tokio(&mut cmd);
@@ -1131,6 +1139,7 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         .await
         .context("生成超时（60s）")??;
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     // pi：JSONL 里最后一条 message_end（assistant）的文本；claude/codex：stdout 直接是文本
     let raw = if backend == Backend::Pi {
         let mut last = String::new();
@@ -1157,7 +1166,13 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
     if text.is_empty() {
-        anyhow::bail!("生成结果为空（后端无输出）");
+        // #123：stderr 透传（截断 200 字符），失败原因可定位，不再静默「空结果」。
+        let err = stderr.trim();
+        if err.is_empty() {
+            anyhow::bail!("生成结果为空（后端无输出）");
+        }
+        let shown: String = err.chars().take(200).collect();
+        anyhow::bail!("生成结果为空（后端无输出）；模型 stderr：{shown}");
     }
     Ok(truncate(&text, 100).to_string())
 }
