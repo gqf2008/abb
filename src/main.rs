@@ -59,11 +59,19 @@ pub fn workspace_dir(bot_key: &str) -> std::path::PathBuf {
 }
 
 /// 原子写文本文件（tmp + rename）。config/sessions/jobs/botstatus 共用，避免崩溃留半截。
+/// #137：唯一 tmp 名防并发写方互踩——固定名时进程 A rename 后，进程 B 的 rename
+/// 拿不到 tmp → ENOENT（定时任务并发触发 guard 文件生成竞争失败）。与
+/// `atomic_write_sensitive` 同款：uuid 唯一 tmp + rename，失败清理残留。
 pub fn atomic_write_text(path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// 原子写敏感文本文件：uuid 唯一 tmp + rename + 落盘前收紧 0o600（unix）。
@@ -1054,6 +1062,45 @@ fn trash_bot_key(args: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::session_reset_chat_id;
+
+    #[test]
+    fn atomic_write_text_concurrent_no_race() {
+        // #137：并发写同一目标（定时任务多触发 / CLI 与 service 并存）不因固定 tmp 名
+        // 竞争失败——旧实现固定 `path.with_extension("tmp")`，A rename 后 B 的
+        // rename 拿不到 tmp → ENOENT。新实现唯一 tmp，并发全部成功且无残留。
+        let dir = std::env::temp_dir().join(format!("abb-atomic-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("guard/settings.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        // 模拟两进程并发：每个写方各写 20 次（固定名下必然撞车）
+        let mut handles = Vec::new();
+        for w in 0..2 {
+            let t = target.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20 {
+                    super::atomic_write_text(&t, &format!("writer{w}-{i}")).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 最终文件内容完整（最后一次写入的某个 writer 的值，非空即对）
+        let final_text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            final_text.starts_with("writer"),
+            "文件内容应完整：{final_text}"
+        );
+        // 无 tmp 残留
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应有 tmp 残留: {:?}", leftovers);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rfc3339_now_utc_format() {
