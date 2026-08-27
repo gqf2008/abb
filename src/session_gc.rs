@@ -8,16 +8,16 @@
 //! 破坏性语义：
 //! - **每会话一次 LLM 调用**（烧钱）+ 删除用户历史——故默认关，需用户在设置页
 //!   显式打开；首轮延迟 24h+jitter（见 service.rs session_gc_loop）。
-//! - 只删工作区内文件（history/、.pi-sessions/、.prime-sessions/、sessions.json
-//!   槽位）；claude/codex 的 transcript 在后端私有目录（~/.claude、~/.codex），
+//! - 只删工作区内文件（history/、.pi-sessions/、sessions.json 槽位）；claude/codex
+//!   的 transcript 在后端私有目录（~/.claude、~/.codex），
 //!   物理不可达，绝不触碰。
 //! - 清理次序（摘要写盘**成功后**）：二次校验仍过期（TOCTOU 收窄——归纳期间用户
 //!   又发消息则保留会话）→ 删槽位并持久化（未持久化 = 磁盘错误，文件一律未动，
 //!   宁留不删下轮重试）→ 删 history jsonl + 迁移/导入标记 → 按槽位 sid 精确删
-//!   pi/prime 会话文件（10 分钟 mtime 护栏宁留不删，对齐 /new 清理语义）。
+//!   pi 会话文件（10 分钟 mtime 护栏宁留不删，对齐 /new 清理语义）。
 //! - 会话级 AGENTS.md 与摘要文件保留（摘要本身就是下一步的上下文）。
 //!
-//! 归纳任务角色用 Owner（内部维护任务，pi/prime 也放行——与 run_job 的受限分支
+//! 归纳任务角色用 Owner（内部维护任务，pi 也放行——与 run_job 的受限分支
 //! 相反：受限会话跑不了 pi，但维护任务必须能跟 bot 后端走）。汇报只走 `crate::log!`，
 //! 绝不发聊天消息（系统维护不打扰用户）。
 
@@ -98,7 +98,7 @@ pub async fn run_once_with_days(
             crate::agents_md::collect_block_at(&bridge.agents_md_root, &bot_key, &key);
         let prompt = build_summary_prompt(&agents_block, &history_block);
         // 镜像 run_job 的 agent 调用：fresh UUID、resume=false、sessions=None（无需
-        // 回存 thread_id）、role=Owner（内部维护任务，pi/prime 也放行）。
+        // 回存 thread_id）、role=Owner（内部维护任务，pi 也放行）。
         let backend = crate::agent::Backend::parse(&bridge.default_backend);
         let sum_sid = uuid::Uuid::new_v4().to_string();
         // 关停联动：stop 触发即置位 cancel flag——agent::run 阶段间检查它，
@@ -114,7 +114,7 @@ pub async fn run_once_with_days(
             });
         }
         // 归纳会话自身转录用 run 返回的真实 id 删（见下方注释；占位 UUID 的 InSet
-        // 匹配不到 prime 的转录——审查修复）
+        // 匹配不到后端自生成/真实 id 的转录——审查修复）
         let (reply, transcript_sid) = match runner
             .run(
                 backend,
@@ -133,17 +133,16 @@ pub async fn run_once_with_days(
         {
             Ok(crate::agent::RunOutcome::Reply {
                 reply,
-                // 真实 id：pi 的 --session-id 固定 = 入口 sum_sid；prime 自生成 id
-                //（无 --session-id），agent::run 已把返回值换成对端真实 id（sessions=
-                // None 也换）——与 .prime-sessions 文件首行一致，InSet 才能命中。
+                // 真实 id：pi 的 --session-id 固定 = 入口 sum_sid；agent::run 已把
+                // 返回值换成对端真实 id（sessions=None 也换）——与 .pi-sessions 文件
+                // 一致，InSet 才能命中。
                 session_id: real_sid,
                 ..
             }) => (reply, real_sid),
             Ok(crate::agent::RunOutcome::Cancelled) => {
                 crate::log!("[session-gc:{bot_key}] ⏰ {esc} 归纳被中断，保留会话");
                 // 失败/中断也要清掉归纳会话自己的转录：pi 文件含入口 sum_sid（固定
-                // --session-id），精确删（prime 的 id 由对端自生成，失败时未知，留待
-                // tidy 的孤儿清理兜底——审查修复）
+                // --session-id），精确删（留待 tidy 的孤儿清理兜底——审查修复）
                 crate::agent::remove_pi_transcripts(
                     &workspace,
                     &std::collections::HashSet::from([sum_sid.clone()]),
@@ -165,17 +164,10 @@ pub async fn run_once_with_days(
                 continue;
             }
         };
-        // 归纳会话自身的转录文件：pi/prime 后端会在 .pi-sessions/.prime-sessions
-        // 落盘（<ts>_<真实sid>.jsonl / ULID 文件，id 不属于任何槽位）——run 已结束，
-        // 即刻删掉，不留孤儿（tidy 默认关，不能依赖它兜底）。claude/codex 的转录在
-        // 后端私有目录（~/.claude 等），物理不可达，跳过。
+        // 归纳会话自身的转录文件：pi 后端会在 .pi-sessions 落盘（<ts>_<真实sid>.jsonl，
+        // id 不属于任何槽位）——run 已结束，即刻删掉，不留孤儿（tidy 默认关，不能
+        // 依赖它兜底）。claude/codex 的转录在后端私有目录（~/.claude 等），物理不可达，跳过。
         crate::agent::remove_pi_transcripts(
-            &workspace,
-            &std::collections::HashSet::from([transcript_sid.clone()]),
-            crate::agent::SidMatch::InSet,
-            None,
-        );
-        crate::agent::remove_prime_transcripts(
             &workspace,
             &std::collections::HashSet::from([transcript_sid]),
             crate::agent::SidMatch::InSet,
@@ -282,7 +274,7 @@ pub fn write_summary_file(
 ///    ——「先文件后槽位」在 save 失败时文件已删而槽位还在，陈旧槽位指向已删文件；
 ///    审查修复。槽位删后文件清理中断 → 残留文件由 tidy 孤儿清理兜底，宁留文件）；
 /// 3. 删 history jsonl + 迁移/导入标记（`.migrated.json` 是会话级迁移状态，一并删）；
-/// 4. 按槽位 sid 精确删 pi/prime 会话文件（mtime 超 [`TRANSCRIPT_FRESH_SECS`] 才删，
+/// 4. 按槽位 sid 精确删 pi 会话文件（mtime 超 [`TRANSCRIPT_FRESH_SECS`] 才删，
 ///    宁留不删）；claude/codex 的 transcript 在后端私有目录，物理不可达，跳过。
 ///
 /// 返回是否真的清理了（false = 会话恢复活跃或持久化失败，保留一切）。
@@ -309,9 +301,7 @@ pub fn cleanup_chat_in(
     //    「先删文件后删槽位」在持久化失败时文件已丢而槽位还在，陈旧槽位指向已删
     //    文件（审查修复）。槽位删成功后文件删除若中断（崩溃），残留文件由 tidy
     //    孤儿清理兜底，语义是「宁留文件」而非「宁留空洞」。
-    let sids = store
-        .chat_entry(key)
-        .map(|e| (e.pi.session_id.clone(), e.prime_agent.session_id.clone()));
+    let pi_sid = store.chat_entry(key).map(|e| e.pi.session_id.clone());
     if !store.remove_chat(key) {
         crate::log!(
             "[session-gc] ⚠️ {} 槽位删除未持久化，保留会话状态",
@@ -328,21 +318,12 @@ pub fn cleanup_chat_in(
     // 4. 按槽位 sid 精确删后端会话文件（mtime 护栏宁留不删；claude/codex 的 transcript
     //    在后端私有目录，物理不可达，跳过）。公共判定见 agent::remove_*_transcripts
     //    （与 /new 同源；护栏 10 分钟，过期会话槽位理论上无在跑任务，护栏只是双保险）。
-    if let Some((pi_sid, prime_sid)) = sids {
+    if let Some(pi_sid) = pi_sid {
         if !pi_sid.is_empty() {
             let sids = std::collections::HashSet::from([pi_sid]);
             crate::agent::remove_pi_transcripts(
                 workspace,
                 &sids,
-                crate::agent::SidMatch::InSet,
-                Some(crate::agent::TRANSCRIPT_FRESH_SECS),
-            );
-        }
-        if !prime_sid.is_empty() {
-            let ids = std::collections::HashSet::from([prime_sid]);
-            crate::agent::remove_prime_transcripts(
-                workspace,
-                &ids,
                 crate::agent::SidMatch::InSet,
                 Some(crate::agent::TRANSCRIPT_FRESH_SECS),
             );
@@ -410,12 +391,8 @@ mod tests {
                     session_id: format!("sid_{key}"),
                     started: true,
                 },
-                // pi/prime 槽位同 sid：cleanup 按各自槽位 sid 精确删会话文件
+                // pi 槽位同 sid：cleanup 按槽位 sid 精确删会话文件
                 pi: crate::sessions::Slot {
-                    session_id: format!("sid_{key}"),
-                    started: true,
-                },
-                prime_agent: crate::sessions::Slot {
                     session_id: format!("sid_{key}"),
                     started: true,
                 },
@@ -482,18 +459,14 @@ mod tests {
             "[]",
         )
         .unwrap();
-        // 后端会话文件：pi（文件名含 sid）拨旧可删；prime（首行 id 匹配）拨旧可删；
-        // 另一个新鲜 pi 文件（含同 sid 但 mtime 新）宁留不删
+        // 后端会话文件：pi（文件名含 sid）拨旧可删；另一个新鲜 pi 文件（含同 sid
+        // 但 mtime 新）宁留不删
         std::fs::create_dir_all(ws.join(".pi-sessions")).unwrap();
         let pi_old = ws.join(".pi-sessions/1000_sid_oc_a.jsonl");
         std::fs::write(&pi_old, "x").unwrap();
         set_mtime_old(&pi_old, 2 * 3600);
         let pi_fresh = ws.join(".pi-sessions/2000_sid_oc_a.jsonl");
         std::fs::write(&pi_fresh, "x").unwrap();
-        std::fs::create_dir_all(ws.join(".prime-sessions")).unwrap();
-        let prime_old = ws.join(".prime-sessions/prime_a.jsonl");
-        std::fs::write(&prime_old, "{\"id\":\"sid_oc_a\"}\n").unwrap();
-        set_mtime_old(&prime_old, 2 * 3600);
         // 会话级 AGENTS.md：保留（与摘要同属「下一步的上下文」）
         std::fs::create_dir_all(ws.join("sessions")).unwrap();
         let ses_agents = ws.join("sessions").join(format!("{esc}.AGENTS.md"));
@@ -538,7 +511,6 @@ mod tests {
             "导入标记已删"
         );
         assert!(!pi_old.exists(), "旧 pi 会话文件已删");
-        assert!(!prime_old.exists(), "旧 prime 会话文件已删");
         assert!(pi_fresh.exists(), "新鲜 pi 文件宁留不删");
         assert!(ses_agents.exists(), "会话级 AGENTS.md 保留");
         assert!(path.exists(), "摘要保留");
@@ -657,7 +629,7 @@ mod tests {
         ))
     }
 
-    /// 种一个过期会话（history + 槽位 + 一个旧 pi 转录 + 一个旧 prime 转录）。
+    /// 种一个过期会话（history + 槽位 + 一个旧 pi 转录）。
     fn seed_gc_chat(ws: &std::path::Path, key: &str) {
         let now = crate::chrono_lite::unix_secs();
         seed_chat(ws, key, now - 8 * 86400); // 8 天前最后活跃 > 7 天阈值
@@ -665,10 +637,6 @@ mod tests {
         let pi_file = ws.join(".pi-sessions/1000_sid_oc_gc.jsonl");
         std::fs::write(&pi_file, "x").unwrap();
         set_mtime_old(&pi_file, 2 * 3600);
-        std::fs::create_dir_all(ws.join(".prime-sessions")).unwrap();
-        let prime_file = ws.join(".prime-sessions/prime_gc.jsonl");
-        std::fs::write(&prime_file, "{\"id\":\"sid_oc_gc\"}\n").unwrap();
-        set_mtime_old(&prime_file, 2 * 3600);
     }
 
     #[tokio::test]
@@ -695,10 +663,6 @@ mod tests {
         assert!(
             !ws.join(".pi-sessions/1000_sid_oc_gc.jsonl").exists(),
             "pi 转录已删"
-        );
-        assert!(
-            !ws.join(".prime-sessions/prime_gc.jsonl").exists(),
-            "prime 转录已删"
         );
         // 摘要已存档
         assert!(
@@ -731,10 +695,6 @@ mod tests {
         assert!(
             ws.join(".pi-sessions/1000_sid_oc_gc.jsonl").exists(),
             "pi 转录保留"
-        );
-        assert!(
-            ws.join(".prime-sessions/prime_gc.jsonl").exists(),
-            "prime 转录保留"
         );
         assert!(
             !ws.join("summaries").join(format!("{esc}.md")).exists(),

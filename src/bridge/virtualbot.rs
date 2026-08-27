@@ -157,42 +157,20 @@ impl Bridge {
                 let old_sid = self.sessions.ensure_with_started(&key).0;
                 let new_sid = self.sessions.reset_session(&key);
                 let ws = crate::workspace_dir(&self.bot.key());
-                match Backend::parse(self.bot.effective_backend(&self.default_backend)) {
+                if Backend::parse(self.bot.effective_backend(&self.default_backend)) == Backend::Pi
+                {
                     // #56/#57：/new 后旧 sid 的 pi 会话文件永久失效（pi 按 sid 续聊，新 sid
                     // 不再触碰旧文件）——顺手清掉：.pi-sessions 是 #56 探针的唯一信号源，
                     // 残留文件只增不减会拖慢每轮探针扫描并堆积磁盘。CLI `session reset`
                     // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
                     // 无 mtime 护栏（fresh_secs=None）：被轮换的旧 sid 不可能再被使用。
-                    Backend::Pi => {
-                        let sids = std::collections::HashSet::from([old_sid.clone()]);
-                        crate::agent::remove_pi_transcripts(
-                            &ws,
-                            &sids,
-                            crate::agent::SidMatch::InSet,
-                            None,
-                        );
-                    }
-                    // #67：prime 会话文件名是 ULID（不含会话 id），无法按文件名过滤——
-                    // 按内容判定：删「首行 id 不属于任何存活槽位」的文件（含损坏首行）。
-                    // **不得**像 pi 那样简单清目录：.prime-sessions 是 per-bot 目录而
-                    // 槽位是 per-chat——直接清空会把同 bot 其它聊天的活跃会话连带删掉
-                    //（审查 Important）。10 分钟 mtime 护栏：另一个聊天正在跑的首轮
-                    // 任务（新会话 id 尚未回存进槽位）不属存活集，但文件正被追加写
-                    //（mtime 新鲜）——不得误删，留待下次 /new 时已过期回收。
-                    Backend::PrimeAgent => {
-                        let live: std::collections::HashSet<String> = self
-                            .sessions
-                            .live_session_ids("prime-agent")
-                            .into_iter()
-                            .collect();
-                        crate::agent::remove_prime_transcripts(
-                            &ws,
-                            &live,
-                            crate::agent::SidMatch::NotInSet,
-                            Some(crate::agent::TRANSCRIPT_FRESH_SECS),
-                        );
-                    }
-                    _ => {}
+                    let sids = std::collections::HashSet::from([old_sid.clone()]);
+                    crate::agent::remove_pi_transcripts(
+                        &ws,
+                        &sids,
+                        crate::agent::SidMatch::InSet,
+                        None,
+                    );
                 }
                 crate::log!(
                     "[bridge] /new 新建会话 bot={} key={} sid={}",
@@ -457,8 +435,8 @@ impl Bridge {
             //   同一历史块二次写进 pi transcript；文件缺失（且 marker 命中）才是真丢失。
             // - resume（既有会话）：pending 命中（#54 自愈重建/换 UUID 后待补注入）
             //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）；
-            //   或 pi/prime-agent 会话文件丢失/损坏（#56/#67：pi 对不可续聊的文件同 sid
-            //   静默新建空会话——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入
+            //   或 pi 会话文件丢失/损坏（#56：pi 对不可续聊的文件同 sid 静默新建空
+            //   会话——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入
             //   （run 前即可探明，比 pending 早一轮）。**不设 marker 防重复护栏**：pi run
             //   成功必落会话文件（核心功能），文件持续不可续聊 = 每轮都是新会话，重注入是
             //   正确行为；用「marker 匹配即已注入过」拦截会把「迁移后文件才丢失」的
@@ -466,37 +444,24 @@ impl Bridge {
             //   误报的代价是可见噪音（提示从首轮起可见；误报持续时注入块按轮累积进
             //   pi transcript，每轮 ≤6000 字符），可接受。
             //
-            // 架构（#56/#57/#67 定论）：丢失检测**分层是本质而非债**——
+            // 架构（#56/#57 定论）：丢失检测**分层是本质而非债**——
             // - claude/codex 有错误文本（no rollout found / No conversation found），事后
             //   分类（agent.rs run）→ rebuilt + pending 迁移标记补注入；
-            // - pi 无错误信号（静默新建），只能事前探查（本闸的探针）→ 本轮直接注入；
-            // - prime-agent 两种信号都有（--resume 不存在 → exit 1 + "No session found"，
-            //   可走后述重建；会话文件经 --session-dir 落盘，可走探针）——探针先行
-            //   （早一轮注入），run 失败后 run() 的 session_lost 分支兜底重建。
+            // - pi 无错误信号（静默新建），只能事前探查（本闸的探针）→ 本轮直接注入。
             let marker = hist.marker();
             let session_file_lost = || {
-                (backend == Backend::Pi
+                backend == Backend::Pi
                     && !crate::agent::pi_session_exists(
                         &crate::workspace_dir(&self.bot.key()),
                         &session_id,
-                    ))
-                    || (backend == Backend::PrimeAgent
-                        && !crate::agent::prime_session_exists(
-                            &crate::workspace_dir(&self.bot.key()),
-                            &session_id,
-                        ))
+                    )
             };
             let session_file_alive = || {
-                (backend == Backend::Pi
+                backend == Backend::Pi
                     && crate::agent::pi_session_exists(
                         &crate::workspace_dir(&self.bot.key()),
                         &session_id,
-                    ))
-                    || (backend == Backend::PrimeAgent
-                        && crate::agent::prime_session_exists(
-                            &crate::workspace_dir(&self.bot.key()),
-                            &session_id,
-                        ))
+                    )
             };
             let should_inject = if !resume {
                 match &marker {

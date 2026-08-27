@@ -1,5 +1,5 @@
 //! 历史会话迁移（#33）：把后端私有 session 文件（claude jsonl / codex rollout /
-//! pi session / prime session）里的对话一次性导入 ABB 自己的 history.rs。
+//! pi session）里的对话一次性导入 ABB 自己的 history.rs。
 //!
 //! #49 上线时明确「不做后端 session 格式迁移」——history.rs 从 #49 起从零记录，
 //! **切换前聊过的对话只存在于后端私有位置**，切后端/会话丢失时注入的历史不含它们。
@@ -12,7 +12,7 @@
 //! - 条数：导入绕过 history 的 50 条裁剪（填充老历史，裁剪丢最旧违背目的）；
 //!   每来源 200 条上限 + 单条 20k 保险（最坏 4MB/来源）
 //! - 提取范围：只取 user/assistant 最终文本（thinking/工具调用/系统消息有意排除）；
-//!   prime-agent 无真实数据实证，按 pi 同构推断 + 解析失败跳过容错
+//!   解析失败跳过容错
 
 use crate::history::HistoryEntry;
 use serde_json::Value;
@@ -235,9 +235,9 @@ fn extract_codex(path: &Path) -> Result<Vec<Msg>, String> {
     Ok(msgs)
 }
 
-/// pi/prime session：`type=="message"` + role user/assistant + text blocks；
+/// pi session：`type=="message"` + role user/assistant + text blocks；
 /// assistant 用 `stopReason=="stop"` 筛最终回复（toolUse 中途轮跳过）；
-/// `toolResult` role 天然排除。prime 与 pi 同构（agent.rs 测试固定），
+/// `toolResult` role 天然排除。
 /// 差异仅目录/文件名定位（调用方处理）。
 fn extract_pi(path: &Path) -> Result<Vec<Msg>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
@@ -354,17 +354,6 @@ fn locate_session_file(backend: &str, workspace: &Path, sid: &str) -> Option<Pat
             }
             None
         }
-        "prime-agent" => {
-            // workspace/.prime-sessions/*.jsonl：文件名是 ULID 不含 sid，按首行 id 扫描
-            let dir = workspace.join(".prime-sessions");
-            let rd = std::fs::read_dir(dir).ok()?;
-            for f in rd.flatten() {
-                if crate::agent::session_file_id(&f.path()).as_deref() == Some(sid) {
-                    return Some(f.path());
-                }
-            }
-            None
-        }
         _ => None,
     }
 }
@@ -373,7 +362,7 @@ fn extract_for(backend: &str, path: &Path) -> Result<Vec<Msg>, String> {
     match backend {
         "claude" => extract_claude(path),
         "codex" => extract_codex(path),
-        "pi" | "prime-agent" => extract_pi(path),
+        "pi" => extract_pi(path),
         _ => Err(format!("未知后端 {backend}")),
     }
 }
@@ -411,7 +400,6 @@ pub fn import_bot(bot_key: &str, dry_run: bool) -> ImportReport {
             ("claude", &entry.claude),
             ("codex", &entry.codex),
             ("pi", &entry.pi),
-            ("prime-agent", &entry.prime_agent),
         ];
         for (backend, slot) in slots {
             if !slot.started || slot.session_id.is_empty() {
