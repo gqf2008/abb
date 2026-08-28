@@ -623,6 +623,11 @@ async fn kill_agent_tree(pid: Option<u32>, child: &mut tokio::process::Child) {
             unsafe {
                 let _ = libc::kill(-(pid as i32), libc::SIGTERM);
             }
+            // 极端挂死（子进程忽略/阻塞 SIGTERM）兜底：2s 后 SIGKILL 强制清组。
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+            }
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -2596,7 +2601,8 @@ mod tests {
         // 纯 LLM 思考一般 <5 分钟，15 分钟足够宽裕，又远小于「find / 卡 10 小时」级事故。
         assert_eq!(AGENT_NO_OUTPUT_WATCHDOG_SECS, 15 * 60);
         // 轮询间隔必须远小于 watchdog，保证 cancel/挂起能在合理时间内被感知
-        assert!(CANCEL_POLL_MS < 1_000);
+        // （const 块断言：避免 clippy::assertions_on_constants，rust 1.98 新 lint）
+        const { assert!(CANCEL_POLL_MS < 1_000) };
     }
 
     #[test]
