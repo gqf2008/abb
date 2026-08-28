@@ -187,6 +187,26 @@ impl Bridge {
         )
         .await;
         let reply = render_create_result(plan, &outcomes);
+        // #147：建群完成后登记团队（聊天入口 ↔ GUI 同一份数据源；部分成功也登记，
+        // 重试「确认」时 register_created 按角色名合并补建成功的角色）。登记失败不阻断。
+        if outcomes.iter().any(|o| o.ok) {
+            let regs = crate::teamreg::role_regs_from_plan(
+                plan,
+                &crate::virtualbot::VirtualBotStore::new(),
+                &self.bot.key(),
+            );
+            if let Err(e) = crate::teamreg::TeamStore::new().register_created(
+                &self.bot.key(),
+                &plan.team_name,
+                regs,
+            ) {
+                crate::log!(
+                    "[bridge] 团队登记失败 bot={} team={}: {e}",
+                    self.bot.key(),
+                    plan.team_name
+                );
+            }
+        }
         if outcomes.iter().all(|o| o.ok) {
             self.team_flows.remove(key);
         }

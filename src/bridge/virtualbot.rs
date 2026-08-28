@@ -42,6 +42,8 @@ impl Bridge {
                 "[bridge] 群被解散（im.chat.deleted_v1），已自动移除虚拟 Bot 登记 chat={}",
                 trunc(chat_id, 12)
             );
+            // #147 双向一致：团队条目对应角色 chat_id 清空（状态转「部分失败」）
+            crate::teamreg::TeamStore::new().clear_chat(&self.bot.key(), chat_id);
             // 会话历史归档（用户决策：解散后不删除，移入工作区 archive/）
             crate::virtualbot::VirtualBotStore::archive_chat_history(&self.bot.key(), chat_id);
         } else {
