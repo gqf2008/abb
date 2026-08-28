@@ -236,11 +236,20 @@ pub fn role_regs_from_plan(
 ) -> Vec<TeamRoleReg> {
     plan.roles
         .iter()
-        .map(|r| TeamRoleReg {
-            role_name: r.role_name.clone(),
-            member: r.member_name.clone().unwrap_or_default(),
-            chat_id: store.resolve(bot_key, &r.role_name).unwrap_or_default(),
-            duty: truncate_duty(&r.system_prompt),
+        .map(|r| {
+            // #162：角色登记/寻址统一用完整三段名（项目-角色-姓名）——登记表（建群时
+            // create_team_groups 写入）与团队条目必须同口径，纯名 resolve 会 miss。
+            let full_name = crate::teamflow::full_role_name(
+                &plan.team_name,
+                &r.role_name,
+                r.member_name.as_deref(),
+            );
+            TeamRoleReg {
+                role_name: full_name.clone(),
+                member: r.member_name.clone().unwrap_or_default(),
+                chat_id: store.resolve(bot_key, &full_name).unwrap_or_default(),
+                duty: truncate_duty(&r.system_prompt),
+            }
         })
         .collect()
 }
@@ -448,16 +457,19 @@ mod tests {
         };
         let p = std::env::temp_dir().join(format!("abb-vb-{}.json", uuid::Uuid::new_v4()));
         let store = crate::virtualbot::VirtualBotStore::new_at(p.clone());
+        // #162：登记表存完整三段名（建群时 create_team_groups 写入）——resolve 同口径
         store
             .add(crate::virtualbot::VirtualBot {
                 bot_key: "bot_a".into(),
                 chat_id: "oc_1".into(),
-                role_name: "产品经理".into(),
+                role_name: "T-产品经理-小王".into(),
                 created_at: 1,
             })
             .unwrap();
         let regs = role_regs_from_plan(&plan, &store, "bot_a");
         assert_eq!(regs.len(), 2);
+        assert_eq!(regs[0].role_name, "T-产品经理-小王", "角色登记用三段全名");
+        assert_eq!(regs[1].role_name, "T-UI-待任命", "无成员 = 待任命三段");
         assert_eq!(regs[0].chat_id, "oc_1", "已登记角色解析到 chat_id");
         assert_eq!(regs[0].member, "小王");
         assert!(regs[1].chat_id.is_empty(), "未登记角色 = 建群失败");

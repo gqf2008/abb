@@ -4294,7 +4294,13 @@ https://b.com/y"
             "确认应建群并回清单: {:?}",
             sent
         );
-        assert_eq!(msgr.created(), vec!["开发".to_string(), "测试".to_string()]);
+        assert_eq!(
+            msgr.created(),
+            vec![
+                "测试团队-开发-待任命".to_string(),
+                "测试团队-测试-待任命".to_string()
+            ]
+        );
         assert_eq!(bridge.vb_store.load().len(), 2, "建群后应登记虚拟 Bot");
         // 流程结束：后续普通消息应进 agent（不再被团队流程消费）
         bridge.handle(test_ev("m3", "oc_team2", "你好")).await;
@@ -4424,7 +4430,7 @@ https://b.com/y"
         bridge
             .handle(test_ev("m1", "oc_team8", "帮我建个团队做测试"))
             .await;
-        msgr.set_fail_create("测试");
+        msgr.set_fail_create("测试团队-测试-待任命");
         bridge.handle(test_ev("m2", "oc_team8", "确认")).await;
         assert!(
             msgr.sent().iter().any(|t| t.contains("部分成功（1/2）")),
@@ -4432,7 +4438,9 @@ https://b.com/y"
             msgr.sent()
         );
         assert!(
-            msgr.sent().iter().any(|t| t.contains("❌ 测试（待任命）")),
+            msgr.sent()
+                .iter()
+                .any(|t| t.contains("❌ 测试团队-测试-待任命")),
             "失败项应列出原因"
         );
         // 重试：已成功的「开发」跳过（不重复建），失败的「测试」补建
@@ -4440,7 +4448,10 @@ https://b.com/y"
         bridge.handle(test_ev("m3", "oc_team8", "确认")).await;
         assert_eq!(
             msgr.created(),
-            vec!["开发".to_string(), "测试".to_string()],
+            vec![
+                "测试团队-开发-待任命".to_string(),
+                "测试团队-测试-待任命".to_string()
+            ],
             "重试不应重复建已成功的群"
         );
         cleanup_bridge(&bridge);
