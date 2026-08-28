@@ -421,6 +421,46 @@ fn adopt_thread_id(
     }
 }
 
+/// #168 通用权限档位解析（run / run_once 同源单点）：热读 config（agent 调用秒级起，
+/// 读一次 ~KB 文件可接受；读不到/损坏回落 auto）。auto = 现状（owner 全权限 /
+/// workspace-write、受限会话受限）；显式模式（read-only/workspace-write/full-access）
+/// 用户选择优先，受限会话也尊重。
+/// #163 补充（老板拍板）：虚拟 Bot（团队角色群）里**受限会话**默认 workspace-write——
+/// 团队角色要干活（读写工作区），auto 的「受限→read-only」会卡住它们。仅 auto + 受限
+/// 生效；用户显式配置仍优先。owner 会话不受此覆盖（保持现状全权限，与 codex 原语义
+/// 一致——codex owner 默认本就是 workspace-write，覆盖与否结果相同）。
+fn resolve_sandbox_mode(
+    bot_key: &str,
+    chat_id: &str,
+    restrict: bool,
+) -> crate::config::SandboxMode {
+    let mut sandbox = match crate::config::Config::load() {
+        Ok(c) => c
+            .bots
+            .iter()
+            .find(|b| b.key() == bot_key)
+            .map(|b| b.sandbox_mode)
+            .unwrap_or_default(),
+        Err(_) => crate::config::SandboxMode::Auto,
+    };
+    if sandbox == crate::config::SandboxMode::Auto
+        && restrict
+        && chat_in_virtual_bots(&crate::virtualbot::VirtualBotStore::new(), bot_key, chat_id)
+    {
+        sandbox = crate::config::SandboxMode::WorkspaceWrite;
+    }
+    sandbox
+}
+
+/// #168：claude 会话的 --settings 是否指向 guard settings.json（Bash 强制闸）。
+/// run（spawn 前生成 guard 文件）与 run_once（选择 --settings 路径）必须同源——
+/// 不一致会让 claude 因 settings 文件不存在直接启动失败（"Settings file not found"，
+/// 实测 CLI 硬错误）。语义：档位非 full-access（含受限会话、read-only、workspace-write）
+/// → guard 闸；full-access / auto-owner → owner 删除保护文件（#88）。
+fn claude_settings_use_guard(restrict: bool, sandbox: crate::config::SandboxMode) -> bool {
+    restrict || sandbox != crate::config::SandboxMode::FullAccess
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     backend: Backend,
@@ -452,12 +492,25 @@ pub async fn run(
         ));
     }
 
-    // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
+    // #168 权限档位（claude/codex 消费；pi 无沙箱体系，不解析）。与 run_once 同源
+    //（resolve_sandbox_mode 单点），保证下面「生成哪个 guard 文件」与 run_once 里
+    //「--settings 指向哪个文件」永远一致——写错文件 claude 启动即报
+    // "Settings file not found"（实测 CLI 硬错误退出）。
+    let sandbox = if matches!(backend, Backend::Claude | Backend::Codex) {
+        resolve_sandbox_mode(bot_key, chat_id, restrict)
+    } else {
+        crate::config::SandboxMode::Auto
+    };
+
+    // 受限会话：生成/刷新 guard 文件（claude settings.json hook）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
     //（返回用户可见错误，不静默降级成全权限）。
     // owner 会话（非受限）：也生成删除保护 settings.json（#88，claude Bash hook），
     // 失败同样拒绝启动——删除保护是安全默认，不能静默裸奔。
-    if restrict {
+    // #168：档位非 full-access（含显式 read-only/workspace-write、受限会话）需要
+    // guard settings.json，full-access / auto-owner 需要 owner-settings.json——
+    // 选择必须与 run_once 的 --settings 同源（claude_settings_use_guard）。
+    if claude_settings_use_guard(restrict, sandbox) {
         crate::guard::ensure_guard_files(bot_key)
             .map_err(|e| format!("⚠️ 受限会话 guard 文件生成失败，已拒绝启动：{e:#}"))?;
     } else {
@@ -496,6 +549,7 @@ pub async fn run(
             cancel.clone(),
             role,
             restrict,
+            sandbox,
         )
         .await
         {
@@ -822,31 +876,58 @@ fn claude_command(
     resume: bool,
     session_id: &str,
     restricted: bool,
+    sandbox: crate::config::SandboxMode,
     settings_path: &std::path::Path,
 ) -> std::process::Command {
     let mut c = shim_command(program);
     c.arg("-p");
-    if restricted {
-        // 受限模式（授权者会话）：去掉全权限旗标，改走「默认拒绝 + 白名单」。
-        // dontAsk = 未预批准的工具调用直接拒绝（非交互下不挂起等输入）；
-        // --allowedTools 只放行工作区相对路径的读/写/查工具（Read(./**) 等）。
-        // Bash 不在 CLI 层放行：受限会话的 $ABB_BIN 命令由 guard hook 校验放行
-        //（--settings 指向工作区外的 settings.json，hook 是强制闸）；
-        // WebFetch/MCP 等其余工具全被 dontAsk 拒绝。
-        c.arg("--permission-mode").arg("dontAsk");
-        c.arg("--settings").arg(settings_path);
-        c.arg("--allowedTools")
-            .arg("Read(./**)")
-            .arg("Glob")
-            .arg("Grep")
-            .arg("Edit(./**)")
-            .arg("Write(./**)");
-    } else {
-        c.arg("--dangerously-skip-permissions");
-        // 删除保护（#88）：owner 会话也挂 Bash hook（settings 由调用方传入，指向
-        // 工作区外的 owner-settings.json）。hook 在删除类命令上拦截（移入回收站/危险
-        // 确认），其余 Bash 命令直通——owner 全权限行为不变。
-        c.arg("--settings").arg(settings_path);
+    // #168 权限档位 → claude 参数。auto 按会话角色走现状；显式档位用户选择优先
+    //（受限会话也尊重）：
+    // - full-access / auto-owner：--dangerously-skip-permissions 全权限（删除保护
+    //   hook 经 --settings 保留，回收站安全网不动）
+    // - workspace-write / auto-受限：默认拒绝 + 白名单（Read/Edit/Write(./**) +
+    //   Bash 走 guard 强制闸），工作区可写
+    // - read-only：白名单只剩 Read/Glob/Grep（无 Edit/Write/Bash——Bash 工具不进
+    //   白名单即被 CLI 拒绝，与 codex --sandbox read-only 的「不可写」语义对齐）
+    let perm = match sandbox {
+        crate::config::SandboxMode::Auto => {
+            if restricted {
+                ClaudePerm::Restricted
+            } else {
+                ClaudePerm::Full
+            }
+        }
+        crate::config::SandboxMode::ReadOnly => ClaudePerm::ReadOnly,
+        crate::config::SandboxMode::WorkspaceWrite => ClaudePerm::Restricted,
+        crate::config::SandboxMode::FullAccess => ClaudePerm::Full,
+    };
+    match perm {
+        ClaudePerm::Full => {
+            c.arg("--dangerously-skip-permissions");
+            // 删除保护（#88）：owner 会话也挂 Bash hook（settings 由调用方传入，指向
+            // 工作区外的 owner-settings.json）。hook 在删除类命令上拦截（移入回收站/危险
+            // 确认），其余 Bash 命令直通——owner 全权限行为不变。
+            c.arg("--settings").arg(settings_path);
+        }
+        ClaudePerm::Restricted | ClaudePerm::ReadOnly => {
+            // 受限模式（授权者会话 / workspace-write / read-only 档位）：去掉全权限
+            // 旗标，改走「默认拒绝 + 白名单」。dontAsk = 未预批准的工具调用直接拒绝
+            //（非交互下不挂起等输入）；--allowedTools 只放行工作区相对路径工具；
+            // Bash 不在 CLI 层放行：$ABB_BIN 命令由 guard hook 校验放行（--settings
+            // 指向工作区外的 settings.json，hook 是强制闸）；WebFetch/MCP 等其余工具
+            // 全被 dontAsk 拒绝。
+            c.arg("--permission-mode").arg("dontAsk");
+            c.arg("--settings").arg(settings_path);
+            c.arg("--allowedTools")
+                .arg("Read(./**)")
+                .arg("Glob")
+                .arg("Grep");
+            if perm == ClaudePerm::Restricted {
+                // workspace-write：工作区可写（Edit/Write 放行，Bash 仍走 guard 闸）
+                c.arg("Edit(./**)").arg("Write(./**)");
+            }
+            // read-only：不加 Edit/Write —— 工作区也只读（Write 等被 dontAsk 拒绝）
+        }
     }
     c.arg("--verbose").arg("--output-format").arg("stream-json");
     c.arg(if resume { "--resume" } else { "--session-id" })
@@ -856,6 +937,17 @@ fn claude_command(
     // 非必要流量（API 请求不受影响）；配合 run_once 的 60s 启动健康检查兜底。
     c.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
     c
+}
+
+/// #168：claude 权限档位（claude_command 内部映射，非导出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudePerm {
+    /// 全权限：--dangerously-skip-permissions（auto-owner / full-access）
+    Full,
+    /// 工作区可写：白名单 Read/Edit/Write(./**) + guard 强制闸（auto-受限 / workspace-write）
+    Restricted,
+    /// 只读：白名单只剩 Read/Glob/Grep（read-only 档位）
+    ReadOnly,
 }
 
 /// #90/#163：owner 沙箱的可写根预算——codex >= 0.146 时 bridge_dir 可写
@@ -883,21 +975,21 @@ fn chat_in_virtual_bots(
     store.load_for(bot_key).iter().any(|v| v.chat_id == chat_id)
 }
 
-/// #163：codex 沙箱模式 → (restricted, writable_roots) 参数映射（可单测纯函数）。
+/// #163/#168：通用权限档位 → codex 的 (restricted, writable_roots) 参数映射（可单测纯函数）。
 /// - Auto（默认）：保持现状——restrict 原样（受限会话 read-only）、owner 用预算 roots
 /// - ReadOnly：强制 read-only（显式选择优先，受限会话也尊重）
 /// - WorkspaceWrite：强制工作区可写（roots 预算）
 /// - FullAccess：bypass 全权限（roots 空 → codex_command 走 --dangerously-bypass-...）
-pub(crate) fn codex_sandbox_params(
-    mode: crate::config::CodexSandboxMode,
+pub(crate) fn sandbox_mode_params(
+    mode: crate::config::SandboxMode,
     restrict: bool,
     roots: Vec<std::path::PathBuf>,
 ) -> (bool, Vec<std::path::PathBuf>) {
     match mode {
-        crate::config::CodexSandboxMode::Auto => (restrict, roots),
-        crate::config::CodexSandboxMode::ReadOnly => (true, Vec::new()),
-        crate::config::CodexSandboxMode::WorkspaceWrite => (false, roots),
-        crate::config::CodexSandboxMode::FullAccess => (false, Vec::new()),
+        crate::config::SandboxMode::Auto => (restrict, roots),
+        crate::config::SandboxMode::ReadOnly => (true, Vec::new()),
+        crate::config::SandboxMode::WorkspaceWrite => (false, roots),
+        crate::config::SandboxMode::FullAccess => (false, Vec::new()),
     }
 }
 
@@ -1316,6 +1408,8 @@ async fn run_once(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     role: crate::config::SenderRole,
     restrict: bool,
+    // #168 通用权限档位（run 里 resolve_sandbox_mode 解析后传入；三后端按档位翻译）。
+    sandbox: crate::config::SandboxMode,
 ) -> Result<AgentOutput, AttemptErr> {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncBufReadExt;
@@ -1340,39 +1434,17 @@ async fn run_once(
             // 额外把 bridge_dir 加入可写根——$ABB_BIN job/deliver 落盘 jobs.json / deliveries.json
             // 在 ~/.agent-bridge/ 下（不在工作区内），不加会破坏定时任务/跨会话投递（#21/#27）。
             // codex < 0.146 无 --add-dir → 传空回退 bypass（保持现状行为）。
-            // #163：沙箱模式用户可配置（每 bot BotConfig.codex_sandbox，默认 auto）。热读
-            // config（agent 调用秒级起，读一次 ~KB 文件可接受；读不到/损坏回落 auto）。
+            // #163/#168：档位（sandbox）由 run() 的 resolve_sandbox_mode 统一解析后传入
+            //（含虚拟 Bot 受限会话默认覆盖）。
             // auto = 现状（owner→workspace-write(+bridge_dir)、受限→read-only）；显式
-            // 模式（read-only/workspace-write/full-access）用户选择优先，受限会话也尊重。
-            let sandbox = match crate::config::Config::load() {
-                Ok(c) => c
-                    .bots
-                    .iter()
-                    .find(|b| b.key() == bot_key)
-                    .map(|b| b.codex_sandbox)
-                    .unwrap_or_default(),
-                Err(_) => crate::config::CodexSandboxMode::Auto,
-            };
-            // #163 补充（老板拍板）：虚拟 Bot（团队角色群）默认 workspace-write——
-            // 团队角色要干活（读写工作区），auto 的「受限→read-only」会卡住它们。
-            // 仅 auto 生效；用户显式配置（read-only/workspace-write/full-access）仍优先。
-            let sandbox = if sandbox == crate::config::CodexSandboxMode::Auto
-                && chat_in_virtual_bots(
-                    &crate::virtualbot::VirtualBotStore::new(),
-                    bot_key,
-                    chat_id,
-                ) {
-                crate::config::CodexSandboxMode::WorkspaceWrite
-            } else {
-                sandbox
-            };
+            // 模式用户选择优先，受限会话也尊重。
             // roots 按「owner 预算」算好（restrict 时无意义，映射函数按模式取舍）
             let roots = if restrict {
                 Vec::new()
             } else {
                 codex_writable_roots(&resolved)
             };
-            let (use_restrict, roots) = codex_sandbox_params(sandbox, restrict, roots);
+            let (use_restrict, roots) = sandbox_mode_params(sandbox, restrict, roots);
             codex_command(
                 &resolved,
                 resume,
@@ -1385,16 +1457,18 @@ async fn run_once(
         Backend::Claude => {
             // stream-json：逐事件流式输出（assistant/result…），配合逐行解析可实时推进度。
             // 注意：--output-format=stream-json 强制要求 --verbose（实测报错确认）。
-            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）与受限模式分支
-            //（受限时 --settings 指向工作区外的 guard settings.json）。
-            // owner 会话的 --settings 指向删除保护 owner-settings.json（#88）。
-            let settings = if restrict {
+            // 构造拆到 claude_command()（可单测）：含关遥测 env（#7）与权限档位分支。
+            // #168：档位非 full-access（含受限会话、read-only、workspace-write）时
+            // settings 指向工作区外的 guard settings.json（Bash 强制闸）；full-access /
+            // auto-owner 指向删除保护 owner-settings.json（#88，回收站安全网）。
+            // 与 run 里生成 guard 文件的同源判定（claude_settings_use_guard）保持一致。
+            let settings = if claude_settings_use_guard(restrict, sandbox) {
                 crate::guard::guard_settings_path(bot_key)
             } else {
                 crate::guard::owner_guard_settings_path(bot_key)
             };
             tokio::process::Command::from(claude_command(
-                &resolved, resume, session_id, restrict, &settings,
+                &resolved, resume, session_id, restrict, sandbox, &settings,
             ))
         }
         Backend::Pi => {
@@ -2390,6 +2464,7 @@ mod tests {
             false,
             "sess-1",
             false,
+            crate::config::SandboxMode::Auto,
             std::path::Path::new("/tmp/abb-settings.json"),
         );
         let has_disable = c.get_envs().any(|(k, v)| {
@@ -2416,6 +2491,7 @@ mod tests {
             true,
             "sess-2",
             false,
+            crate::config::SandboxMode::Auto,
             std::path::Path::new("/tmp/abb-settings.json"),
         );
         assert!(r.get_args().any(|a| a == "--resume"));
@@ -2431,6 +2507,7 @@ mod tests {
             false,
             "sess-1",
             true,
+            crate::config::SandboxMode::Auto,
             std::path::Path::new("/tmp/abb-settings.json"),
         );
         let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
@@ -2449,6 +2526,74 @@ mod tests {
         // 基础参数不受影响（会话 id / stream-json）
         assert!(args.iter().any(|a| *a == "--session-id"));
         assert!(args.iter().any(|a| *a == "sess-1"));
+    }
+
+    #[test]
+    fn claude_command_sandbox_tiers_map_permissions() {
+        // #168 统一权限档位 → claude 参数：
+        // - read-only：白名单只剩 Read/Glob/Grep（无 Edit/Write，Bash 不进白名单被拒）
+        // - workspace-write：受限白名单（Read/Edit/Write(./**) + guard 闸）
+        // - full-access：--dangerously-skip-permissions（owner 也显式选择优先）
+        // - auto：owner 全权限 / 受限白名单（现状回归，见上两个测试）
+        use crate::config::SandboxMode;
+        // read-only（owner 会话也强制只读）
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-ro",
+            false,
+            SandboxMode::ReadOnly,
+            std::path::Path::new("/tmp/abb-guard.json"),
+        );
+        let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
+        assert!(
+            !args.iter().any(|a| *a == "--dangerously-skip-permissions"),
+            "read-only 绝不允许全权限旗标"
+        );
+        for tool in ["Read(./**)", "Glob", "Grep"] {
+            assert!(
+                args.iter().any(|a| a.to_str() == Some(tool)),
+                "read-only 应放行 {tool}"
+            );
+        }
+        for tool in ["Edit(./**)", "Write(./**)"] {
+            assert!(
+                !args.iter().any(|a| a.to_str() == Some(tool)),
+                "read-only 不应放行写工具 {tool}"
+            );
+        }
+        // workspace-write（受限会话也尊重用户选择 → 白名单含写工具）
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-ww",
+            true,
+            SandboxMode::WorkspaceWrite,
+            std::path::Path::new("/tmp/abb-guard.json"),
+        );
+        let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
+        for tool in ["Read(./**)", "Glob", "Grep", "Edit(./**)", "Write(./**)"] {
+            assert!(
+                args.iter().any(|a| a.to_str() == Some(tool)),
+                "workspace-write 应放行工作区工具 {tool}"
+            );
+        }
+        assert!(args.iter().any(|a| *a == "--permission-mode"));
+        // full-access（受限会话也尊重用户选择 → 全权限）
+        let c = claude_command(
+            std::path::Path::new("claude"),
+            false,
+            "sess-fa",
+            true,
+            SandboxMode::FullAccess,
+            std::path::Path::new("/tmp/abb-owner.json"),
+        );
+        let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
+        assert!(
+            args.iter().any(|a| *a == "--dangerously-skip-permissions"),
+            "full-access 显式选择优先（受限会话也全权限）"
+        );
+        assert!(!args.iter().any(|a| *a == "--permission-mode"));
     }
 
     #[test]
@@ -2487,43 +2632,79 @@ mod tests {
     }
 
     #[test]
-    fn codex_sandbox_params_maps_modes() {
+    fn sandbox_mode_params_maps_modes() {
         // #163 模式映射：auto=现状（restrict 原样）、read-only 强制、workspace-write
         // 强制、full-access 走 bypass（roots 空）。显式选择优先于受限判定。
-        use crate::config::CodexSandboxMode;
+        use crate::config::SandboxMode;
         let roots = vec![std::path::PathBuf::from("~/.agent-bridge")];
         // auto + owner → 原样（workspace-write + roots）
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::Auto, false, roots.clone()),
+            sandbox_mode_params(SandboxMode::Auto, false, roots.clone()),
             (false, roots.clone())
         );
         // auto + 受限 → read-only（roots 被调用方预算为空，映射原样保留）
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::Auto, true, vec![]),
+            sandbox_mode_params(SandboxMode::Auto, true, vec![]),
             (true, vec![])
         );
         // read-only：显式强制（即使 owner 也 read-only）
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::ReadOnly, false, roots.clone()),
+            sandbox_mode_params(SandboxMode::ReadOnly, false, roots.clone()),
             (true, vec![])
         );
         // workspace-write：显式强制（即使受限会话也按用户选择）
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::WorkspaceWrite, true, roots.clone()),
+            sandbox_mode_params(SandboxMode::WorkspaceWrite, true, roots.clone()),
             (false, roots.clone())
         );
         // full-access：roots 清空 → codex_command 走 bypass 分支
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::FullAccess, true, roots.clone()),
+            sandbox_mode_params(SandboxMode::FullAccess, true, roots.clone()),
             (false, vec![])
         );
+    }
+
+    #[test]
+    fn claude_settings_use_guard_matches_ensure_selection() {
+        // #168 回归锁：run（spawn 前 ensure 哪个 guard 文件）与 run_once（--settings
+        // 指向哪个文件）共用 claude_settings_use_guard 同源判定——任何一处分叉都会让
+        // claude 因 settings 文件不存在直接启动失败（"Settings file not found" 实测）。
+        // 期望语义：非 full-access（含受限会话、read-only、workspace-write）→ guard 闸；
+        // 仅 full-access + owner 会话 → owner 删除保护文件（restricted+full-access 仍
+        // 走 guard 闸——授权者身份的 $ABB_BIN 白名单强制闸不因档位放宽）。
+        use crate::config::SandboxMode;
+        // 受限会话：除显式 full-access 外全走 guard 闸；full-access 也走 guard 闸
+        //（白名单强制闸保留，仅 full-access + owner 才落到 owner 文件）
+        for m in [
+            SandboxMode::Auto,
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::FullAccess,
+        ] {
+            assert!(
+                claude_settings_use_guard(true, m),
+                "{m:?} 受限会话应走 guard 闸"
+            );
+        }
+        // owner 会话：auto / read-only / workspace-write → guard 闸；full-access → owner 文件
+        for m in [
+            SandboxMode::Auto,
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+        ] {
+            assert!(
+                claude_settings_use_guard(false, m),
+                "{m:?} owner 会话应走 guard 闸"
+            );
+        }
+        assert!(!claude_settings_use_guard(false, SandboxMode::FullAccess));
     }
 
     #[test]
     fn virtual_bot_chat_detection_and_default_workspace_write() {
         // #163 补充（老板拍板）：虚拟 Bot 群默认 workspace-write——auto + 虚拟 Bot chat
         // → workspace-write（受限会话也尊重团队角色默认）；普通 chat 保持 auto 现状。
-        use crate::config::CodexSandboxMode;
+        use crate::config::SandboxMode;
         let p = std::env::temp_dir().join(format!("abb-vb-sandbox-{}.json", uuid::Uuid::new_v4()));
         let store = crate::virtualbot::VirtualBotStore::new_at(p.clone());
         store
@@ -2544,43 +2725,43 @@ mod tests {
         // 语义：auto + 虚拟 Bot → workspace-write；auto + 普通 chat → auto 现状
         let roots = vec![std::path::PathBuf::from("bridge_dir")];
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::Auto, false, roots.clone()),
+            sandbox_mode_params(SandboxMode::Auto, false, roots.clone()),
             (false, roots.clone()),
             "普通 chat 的 auto 保持现状（owner workspace-write + roots）"
         );
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::WorkspaceWrite, true, roots.clone()),
+            sandbox_mode_params(SandboxMode::WorkspaceWrite, true, roots.clone()),
             (false, roots.clone()),
             "虚拟 Bot 的 auto 按 workspace-write 走（受限会话也尊重团队角色默认）"
         );
         // 显式配置优先：虚拟 Bot 显式 read-only → read-only（覆盖默认）
         assert_eq!(
-            codex_sandbox_params(CodexSandboxMode::ReadOnly, false, roots),
+            sandbox_mode_params(SandboxMode::ReadOnly, false, roots),
             (true, vec![])
         );
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn codex_sandbox_mode_serde_roundtrip_and_defaults() {
+    fn sandbox_mode_mode_serde_roundtrip_and_defaults() {
         // #163：kebab-case 反序列化 + auto 默认（旧 config 无字段兼容）+ 非 auto 落盘
-        use crate::config::CodexSandboxMode;
+        use crate::config::SandboxMode;
         // 枚举 serde：kebab-case
-        let v: CodexSandboxMode = serde_json::from_str("\"workspace-write\"").unwrap();
-        assert_eq!(v, CodexSandboxMode::WorkspaceWrite);
-        let v: CodexSandboxMode = serde_json::from_str("\"full-access\"").unwrap();
-        assert_eq!(v, CodexSandboxMode::FullAccess);
+        let v: SandboxMode = serde_json::from_str("\"workspace-write\"").unwrap();
+        assert_eq!(v, SandboxMode::WorkspaceWrite);
+        let v: SandboxMode = serde_json::from_str("\"full-access\"").unwrap();
+        assert_eq!(v, SandboxMode::FullAccess);
         // 未知值 → 反序列化失败（fail-closed，不静默回落）
-        assert!(serde_json::from_str::<CodexSandboxMode>("\"weird\"").is_err());
+        assert!(serde_json::from_str::<SandboxMode>("\"weird\"").is_err());
         // 序列化 roundtrip
         assert_eq!(
-            serde_json::to_string(&CodexSandboxMode::ReadOnly).unwrap(),
+            serde_json::to_string(&SandboxMode::ReadOnly).unwrap(),
             "\"read-only\""
         );
         // BotConfig 无该字段 → auto（旧 config 兼容）
         let cfg: crate::config::BotConfig =
             serde_json::from_str(r#"{"name":"b1","app_id":"cli_app","app_secret":"s"}"#).unwrap();
-        assert_eq!(cfg.codex_sandbox, CodexSandboxMode::Auto);
+        assert_eq!(cfg.sandbox_mode, SandboxMode::Auto);
     }
 
     #[test]

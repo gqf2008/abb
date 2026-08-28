@@ -797,7 +797,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         })
         .into(),
         // #163：codex 沙箱模式（auto 默认；非 codex 后端时该下拉无实际作用）
-        codex_sandbox: b.codex_sandbox.as_str().into(),
+        sandbox_mode: b.sandbox_mode.as_str().into(),
         owner_open_id: b.owner_open_id.clone().into(),
         wx_owner_configured: !b.wx_user_id.is_empty(),
         owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
@@ -4363,13 +4363,13 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         let model = bots_model.clone();
         let dirty = dirty.clone();
-        settings.on_codex_sandbox_changed(move |idx, opt| {
+        settings.on_sandbox_mode_changed(move |idx, opt| {
             dirty.set(true);
             let val = ["auto", "read-only", "workspace-write", "full-access"][opt as usize];
             {
                 let mut b = work.borrow_mut();
                 if let Some(bot) = b.get_mut(idx as usize) {
-                    bot.codex_sandbox = crate::config::CodexSandboxMode::parse(val);
+                    bot.sandbox_mode = crate::config::SandboxMode::parse(val);
                 }
             }
             // 同步回写 model：下拉 index 与警示行都绑 model，不刷新显示旧值
