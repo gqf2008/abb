@@ -57,6 +57,18 @@ slint-pixel = { path = "../slint-pixel/crates/slint-pixel" }
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
+# #153：Windows 隐藏控制台 spawn agent——std Command 不暴露 STARTUPINFO，
+# 须用 CreateProcessW + CREATE_NEW_CONSOLE + SW_HIDE（见 src/winproc.rs）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 # #129 锁屏控制 root 特权助手（macOS）：独立二进制，与主程序同目录打包/独立签名。
 # 非 macOS 平台为占位 main（拒绝运行），保证全平台构建一致（Windows CI 不炸）。
 [[bin]]

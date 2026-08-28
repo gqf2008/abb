@@ -259,11 +259,28 @@ pub async fn generate_team_plan(
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，失败原因透传
-    #[cfg(windows)]
-    {
-        crate::deps::apply_no_window_tokio(&mut cmd);
-    }
 
+    #[cfg(windows)]
+    let mut child = {
+        // #153：隐藏控制台 spawn（CreateProcessW + SW_HIDE），agent 内部 Bash 孙进程
+        // 继承隐藏控制台 → 不再闪可见黑框；参数/环境从同一 tokio Command 提取。
+        use std::ffi::OsString;
+        let program = cmd.as_std().get_program().to_os_string();
+        let args: Vec<OsString> = cmd.as_std().get_args().map(|a| a.to_os_string()).collect();
+        let cwd = cmd.as_std().get_current_dir().map(|p| p.to_path_buf());
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|x| x.to_os_string())))
+            .collect();
+        crate::winproc::spawn_hidden(&program, &args, cwd.as_deref(), &envs).map_err(|e| {
+            format!(
+                "启动 {} 失败：{e}（未安装？请先在一键安装里装好后端）",
+                program.to_string_lossy()
+            )
+        })?
+    };
+    #[cfg(not(windows))]
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动 {program} 失败：{e}（未安装？请先在一键安装里装好后端）"))?;

@@ -48,6 +48,7 @@ mod unread;
 mod updater;
 mod virtualbot;
 mod wechat;
+mod winproc;
 mod ws;
 
 /// 运行时数据目录：~/.agent-bridge（隐藏目录，与 ~/.claude 同款）。
