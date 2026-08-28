@@ -262,32 +262,29 @@ fn kind_label(kind: &str) -> String {
 }
 
 /// #141 团队方案 → 预览行（role_name, member, duty），供 TeamDialog 角色列表消费。
-/// member 为空 = 待任命（UI 显示占位）。
+/// #162：role_name 为完整三段（项目-角色-姓名，含成员），member 列置空——避免
+/// 「斯蒂芬（斯蒂芬）」重复；既有 GUI 列表（登记表/团队条目）显示三段自动生效。
 fn team_plan_rows(plan: &crate::teambuilder::TeamPlan) -> Vec<(String, String, String)> {
     plan.roles
         .iter()
         .map(|r| {
             (
-                r.role_name.clone(),
-                r.member_name.clone().unwrap_or_default(),
+                crate::teamflow::full_role_name(
+                    &plan.team_name,
+                    &r.role_name,
+                    r.member_name.as_deref(),
+                ),
+                String::new(), // #162：三段名已含成员，member 列不再显示
                 r.system_prompt.clone(),
             )
         })
         .collect()
 }
 
-/// #141 单角色创建结果行文案（成功/失败清单展示）：`角色（成员）→ 详情`。
-fn team_create_line(role_name: &str, member: &str, detail: &str) -> String {
-    format!(
-        "{}（{}）→ {}",
-        role_name,
-        if member.is_empty() {
-            "待任命"
-        } else {
-            member
-        },
-        detail
-    )
+/// #141 单角色创建结果行文案（成功/失败清单展示）：`角色 → 详情`。
+/// #162：role_name 已是完整三段（含成员），不再拼（成员）括号。
+fn team_create_line(role_name: &str, detail: &str) -> String {
+    format!("{role_name} → {detail}")
 }
 
 /// 把已查好的服务状态写进 Tray 属性。主线程调用（status 由调用方查，避免重复 fork ps）。
@@ -4730,9 +4727,9 @@ pub fn run_gui() -> Result<()> {
                                             );
                                             let rows: Vec<TeamRoleRow> = team_plan_rows(&plan)
                                                 .into_iter()
-                                                .map(|(rn, member, duty)| TeamRoleRow {
+                                                .map(|(rn, _member, duty)| TeamRoleRow {
                                                     role_name: rn.into(),
-                                                    member: member.into(),
+                                                    member: String::new().into(),
                                                     duty: duty.into(),
                                                 })
                                                 .collect();
@@ -4758,8 +4755,8 @@ pub fn run_gui() -> Result<()> {
                                     Ok(rows) => {
                                         let results: Vec<TeamResultRow> = rows
                                             .into_iter()
-                                            .map(|(rn, member, ok, detail)| TeamResultRow {
-                                                text: team_create_line(&rn, &member, &detail).into(),
+                                            .map(|(rn, _member, ok, detail)| TeamResultRow {
+                                                text: team_create_line(&rn, &detail).into(),
                                                 ok,
                                             })
                                             .collect();
@@ -5232,23 +5229,36 @@ mod tests {
         };
         let rows = team_plan_rows(&plan);
         assert_eq!(rows.len(), 2);
+        // #162：预览行 role_name = 完整三段（项目-角色-姓名）；member 列置空避免重复
         assert_eq!(
             rows[0],
-            ("产品经理".into(), "小王".into(), "负责需求".into())
+            (
+                "记账团队-产品经理-小王".into(),
+                String::new(),
+                "负责需求".into()
+            )
         );
-        assert_eq!(rows[1], ("后端".into(), String::new(), "负责 API".into()));
+        assert_eq!(
+            rows[1],
+            (
+                "记账团队-后端-待任命".into(),
+                String::new(),
+                "负责 API".into()
+            )
+        );
     }
 
     #[test]
     fn team_create_line_formats_member_and_pending() {
-        // #141：创建结果行「角色（成员）→ 详情」；member 空 → 待任命
+        // #141/#162：创建结果行「角色 → 详情」——role_name 已是三段（含成员），
+        // 不再拼（成员）括号
         assert_eq!(
-            team_create_line("产品经理", "小王", "已建"),
-            "产品经理（小王）→ 已建"
+            team_create_line("记账团队-产品经理-小王", "已建"),
+            "记账团队-产品经理-小王 → 已建"
         );
         assert_eq!(
-            team_create_line("测试", "", "失败：群名冲突"),
-            "测试（待任命）→ 失败：群名冲突"
+            team_create_line("记账团队-测试-待任命", "失败：群名冲突"),
+            "记账团队-测试-待任命 → 失败：群名冲突"
         );
     }
 

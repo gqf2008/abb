@@ -201,18 +201,35 @@ fn emoji_for_role(role_name: &str) -> &'static str {
     "⚙️"
 }
 
+/// #162 方案 A：角色全名 = 项目-角色-姓名（member 空 = 待任命）。
+/// LLM 生成的 role_name 保持纯角色名（TeamRole 字段不动），**所有使用处**（预览/
+/// 建群/登记/@寻址）统一经此拼装——用户「改：」调整 member 后重新拼装仍一致；
+/// emoji_for_role 仍按纯角色名匹配（完整名 contains 也能命中，纯名更稳）。
+pub fn full_role_name(team_name: &str, role_name: &str, member: Option<&str>) -> String {
+    // filter 空串：LLM 可能输出空 member_name（"" vs null），统一按待任命处理
+    format!(
+        "{team_name}-{role_name}-{}",
+        member.filter(|s| !s.trim().is_empty()).unwrap_or("待任命")
+    )
+}
+
 /// 渲染方案预览（#124 2.3 纯文本格式，三端通用；UI 定稿的推荐基线）。
 pub fn render_preview(plan: &TeamPlan) -> String {
     let mut out = String::new();
     out.push_str(&format!("📋 团队「{}」方案预览\n", plan.team_name));
     out.push_str("━━━━━━━━━━━━━━\n");
     for role in plan.roles.iter() {
-        let member = role.member_name.as_deref().unwrap_or("待任命");
+        // #162：role_name 显示完整三段（项目-角色-姓名），不再另加（member）括号
+        //（三段已含姓名，避免「斯蒂芬（斯蒂芬）」重复）。
+        let full = full_role_name(
+            &plan.team_name,
+            &role.role_name,
+            role.member_name.as_deref(),
+        );
         out.push_str(&format!(
-            "{} {}（{}）— {}\n",
+            "{} {} — {}\n",
             emoji_for_role(&role.role_name),
-            role.role_name,
-            member,
+            full,
             role.system_prompt
         ));
     }
@@ -254,39 +271,48 @@ pub async fn create_team_groups(
         .collect();
     let mut out = Vec::new();
     for role in &plan.roles {
+        // #162：群名/@寻址/幂等检查统一用完整三段名（项目-角色-姓名）；member 空 =
+        // 待任命。LLM 生成的纯 role_name 仅作 emoji 匹配等内部用途。
+        let full_name = full_role_name(
+            &plan.team_name,
+            &role.role_name,
+            role.member_name.as_deref(),
+        );
         let member = role
             .member_name
             .clone()
             .unwrap_or_else(|| "待任命".to_string());
-        if existing.contains(&role.role_name) {
+        // #162 幂等兼容：登记表既可能存三段全名（新团队）也可能存纯角色名（#162 前
+        // 旧团队，不迁移）——两者都命中即跳过，旧团队「确认」重试不会重复建群。
+        if existing.contains(&full_name) || existing.contains(&role.role_name) {
             out.push(CreateOutcome {
-                role_name: role.role_name.clone(),
+                role_name: full_name.clone(),
                 member,
                 ok: true,
-                detail: format!("已存在，跳过（可 @{} 对话）", role.role_name),
+                detail: format!("已存在，跳过（可 @{} 对话）", full_name),
             });
             continue;
         }
         match msgr
-            .create_chat(&role.role_name, &role.system_prompt, owner)
+            .create_chat(&full_name, &role.system_prompt, owner)
             .await
         {
             Ok(chat_id) => {
                 let reg = crate::virtualbot::VirtualBot {
                     bot_key: bot_key.to_string(),
                     chat_id,
-                    role_name: role.role_name.clone(),
+                    role_name: full_name.clone(),
                     created_at: crate::chrono_lite::unix_secs(),
                 };
                 match store.add(reg) {
                     Ok(()) => out.push(CreateOutcome {
-                        role_name: role.role_name.clone(),
+                        role_name: full_name.clone(),
                         member,
                         ok: true,
-                        detail: format!("已建，可 @{} 对话", role.role_name),
+                        detail: format!("已建，可 @{} 对话", full_name),
                     }),
                     Err(e) => out.push(CreateOutcome {
-                        role_name: role.role_name.clone(),
+                        role_name: full_name,
                         member,
                         ok: false,
                         detail: format!("群已创建但登记失败：{e}"),
@@ -294,7 +320,7 @@ pub async fn create_team_groups(
                 }
             }
             Err(e) => out.push(CreateOutcome {
-                role_name: role.role_name.clone(),
+                role_name: full_name,
                 member,
                 ok: false,
                 detail: e,
@@ -326,10 +352,8 @@ pub fn render_create_result(plan: &TeamPlan, outcomes: &[CreateOutcome]) -> Stri
     }
     for o in outcomes {
         let mark = if o.ok { "✅" } else { "❌" };
-        out.push_str(&format!(
-            "  {} {}（{}）→ {}\n",
-            mark, o.role_name, o.member, o.detail
-        ));
+        // #162：role_name 已是完整三段（含姓名），不再另加（member）括号。
+        out.push_str(&format!("  {} {} → {}\n", mark, o.role_name, o.detail));
     }
     if ok != outcomes.len() {
         out.push_str("回复「确认」可重试未成功的角色（已成功的不会重复建）。");
@@ -364,6 +388,29 @@ mod tests {
     }
 
     #[test]
+    fn full_role_name_joins_three_segments() {
+        // #162 方案 A：项目-角色-姓名；member 空 → 待任命（三段不省略）
+        assert_eq!(
+            full_role_name("xxx项目", "前端工程师", Some("斯蒂芬")),
+            "xxx项目-前端工程师-斯蒂芬"
+        );
+        assert_eq!(
+            full_role_name("xxx项目", "前端工程师", None),
+            "xxx项目-前端工程师-待任命"
+        );
+        assert_eq!(
+            full_role_name("xxx项目", "前端工程师", Some("")),
+            "xxx项目-前端工程师-待任命",
+            "空串 member 按待任命处理"
+        );
+        // 纯角色名保持原样（emoji 匹配等内部用途依赖它）
+        assert_eq!(
+            full_role_name("T", "产品经理", Some("小王")),
+            "T-产品经理-小王"
+        );
+    }
+
+    #[test]
     fn render_preview_uses_keyword_emoji() {
         // #142：预览行 emoji 与角色名匹配（首个角色是 UI 时不再拿到 👤）
         let plan = crate::teambuilder::TeamPlan {
@@ -384,10 +431,10 @@ mod tests {
         };
         let out = render_preview(&plan);
         assert!(
-            out.contains("🎨 UI/UX 设计"),
+            out.contains("🎨 x-UI/UX 设计-待任命"),
             "UI 角色应映射 🎨（即使排第一个）: {out}"
         );
-        assert!(out.contains("👤 产品经理"), "产品应映射 👤: {out}");
+        assert!(out.contains("👤 x-产品经理-待任命"), "产品应映射 👤: {out}");
     }
 
     #[test]
@@ -491,8 +538,13 @@ mod tests {
         };
         let s = render_preview(&plan);
         assert!(s.contains("📋 团队「记账 App 研发组」方案预览"));
-        assert!(s.contains("产品经理（小王）"));
-        assert!(s.contains("UI/UX（待任命）"));
+        // #162：预览角色行 = 完整三段（项目-角色-姓名），无（member）括号避免重复
+        assert!(s.contains("记账 App 研发组-产品经理-小王 — 负责需求分析与排期"));
+        assert!(s.contains("记账 App 研发组-UI/UX-待任命 — 负责界面与交互设计"));
+        assert!(
+            !s.contains("（小王）"),
+            "三段名已含姓名，不应再有成员括号: {s}"
+        );
         assert!(s.contains("✅ 回复「确认」创建团队"));
         assert!(s.contains("✏️ 回复「改："));
         assert!(s.contains("❌ 回复「取消」放弃"));
@@ -521,8 +573,9 @@ mod tests {
         ];
         let s = render_create_result(&plan, &outcomes);
         assert!(s.contains("部分成功（1/2）"));
-        assert!(s.contains("✅ 开发（待任命）→ 已建"));
-        assert!(s.contains("❌ 测试（待任命）→ 建群失败：模拟"));
+        // #162：role_name 已是三段，结果行不再带（member）括号
+        assert!(s.contains("✅ 开发 → 已建"));
+        assert!(s.contains("❌ 测试 → 建群失败：模拟"));
         assert!(s.contains("回复「确认」可重试"));
     }
 }
