@@ -65,16 +65,28 @@ pub(crate) fn collect_block_at(base: &Path, bot_key: &str, session_key: &str) ->
         let content = cap_content(&content, FILE_CAP_CHARS);
         sections.push(format!("── {label}：{} ──\n{content}", path.display()));
     }
-    if sections.is_empty() {
-        return String::new();
-    }
     let mut block = String::from(
         "[指令文件]\n（以下是三级 AGENTS.md 指引，按 abb → bot → session 依次读取，冲突时以 session 级为准）\n\n",
     );
-    block.push_str(&sections.join("\n\n"));
+    if sections.is_empty() {
+        block.push_str(HOST_GUARD);
+    } else {
+        block.push_str(&sections.join("\n\n"));
+        block.push_str("\n\n");
+        block.push_str(HOST_GUARD);
+    }
     block.push_str("\n\n");
     block
 }
+
+/// #164 宿主护栏（无条件注入）：agent 持有全权限 bash（owner 会话），必须有底线约束
+/// ——实测 pi 在任务执行中自行 `taskkill /F /IM agent-bridge.exe` 杀宿主 ABB 导致
+/// 「启动→恢复→再杀」死循环。护栏只约束行为（LLM 可能不遵守，真正兜底是
+/// recover_pending 的冻结阈值），但能显著降低自作主张概率；不依赖用户指令文件存在。
+const HOST_GUARD: &str = "── 宿主护栏（ABB 无条件）──\n\
+- 禁止 kill / taskkill / Stop-Process 本机 agent-bridge / ABB 进程（含 /IM、/PID 方式）\n\
+- 禁止修改 ~/.agent-bridge 下的宿主配置文件（config.json、teams.json 等），禁止迁移/删除该数据目录\n\
+- 需要重启服务或修改宿主配置时，请直接告知用户操作，不要自行执行";
 
 #[cfg(test)]
 mod tests {
@@ -123,8 +135,12 @@ mod tests {
     #[test]
     fn skips_missing_files_silently() {
         let base = temp_base("skip");
-        // 全缺 → 空串
-        assert_eq!(collect_block_at(&base, "b1", "k1"), "");
+        // 全缺 → 只含宿主护栏（#164 无条件注入，不再返回空串）
+        let empty_block = collect_block_at(&base, "b1", "k1");
+        assert!(
+            empty_block.contains("宿主护栏") && !empty_block.contains("── abb 级"),
+            "全缺时应只剩护栏: {empty_block}"
+        );
         // 只有 bot 级 → 块从 bot 级开始，不出现 abb/session 段
         write(&base.join("workspaces/b1/AGENTS.md"), "只有 bot");
         let block = collect_block_at(&base, "b1", "k1");

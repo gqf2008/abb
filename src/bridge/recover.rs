@@ -3,6 +3,12 @@
 
 use super::*;
 
+/// #164 恢复冻结阈值：同一消息「异常退出后残留待恢复」累计次数达到此值 → 不再自动
+/// 恢复（通知 owner 停止循环）。2 次的语义：第 1 次异常 → 给一次重试机会（正常崩溃
+/// 恢复 #25 不回退）；重试仍异常 → 判定坏消息（如 agent 杀宿主）→ 冻结。
+/// 与 watchdog 常量同款护栏测试兜底（见 tests::resume_max_attempts_is_sane）。
+const RESUME_MAX_ATTEMPTS: u32 = 2;
+
 impl Bridge {
     /// 补发路径的 Ev 重建（崩溃残留 PendingItem → Ev）：quoted/attachments 已随原轮
     /// 消费（原消息已被处理过），补发只重发文本，字段按 send_reply 所需最小集。
@@ -34,13 +40,21 @@ impl Bridge {
         if self.pending.is_empty() {
             return;
         }
-        let items = self.pending.snapshot();
         crate::log!(
             "[bot:{}] 检测到 {} 条上次未完成的消息，自动恢复续跑（先清理孤儿 agent 进程）",
             self.bot.key(),
             self.pending.len()
         );
-        crate::agent::kill_stale_agents(&self.bot.key());
+        // #164 恢复失败计数：残留 agent pid = 上次进程异常退出（被强杀/崩溃）→ 本轮
+        // 待恢复消息全部 +1（优雅关停不会残留，不计）。计数在清理**之后**（残留信号
+        // 先被 kill_stale_agents 消费再清空文件），重新快照拿更新后的计数。
+        let had_stale = crate::agent::kill_stale_agents(&self.bot.key());
+        if had_stale {
+            for item in self.pending.snapshot() {
+                self.pending.bump_resume_attempt(&item.mid);
+            }
+        }
+        let items = self.pending.snapshot();
         for item in items {
             if stop.is_cancelled() {
                 crate::log!(
@@ -114,6 +128,35 @@ impl Bridge {
                     Err(e) => {
                         crate::log!("[bot:{}] 补发失败（留盘下次再试）: {e:#}", self.bot.key())
                     }
+                }
+                continue;
+            }
+            // #164 冻结：同一消息连续异常退出恢复达到上限 → 不再自动重跑 agent
+            //（补发分支不重跑 agent、控制指令不触发 agent，均不冻结——只有这里
+            // 会再次调 agent，是「agent 杀宿主 → 重启 → 恢复 → 再杀」死循环的入口）。
+            if item.resume_attempts >= RESUME_MAX_ATTEMPTS {
+                crate::log!(
+                    "[bot:{}] 消息 {} 连续 {} 次恢复失败（上次处理疑似导致进程异常退出），冻结不再自动恢复",
+                    self.bot.key(),
+                    trunc(&item.mid, 12),
+                    item.resume_attempts
+                );
+                self.pending.remove(&item.mid);
+                // 通知 owner（主会话，必存在）：让用户知道消息没丢但停了，可重发。
+                let primary = crate::config::Config::primary_chat(&self.bot.key());
+                if !primary.is_empty() {
+                    let notice = format!(
+                        "⚠️ 消息「{}」连续 {} 次恢复失败（处理期间疑似导致进程异常退出），已停止自动恢复。如需继续请重新发送。",
+                        crate::agent::truncate(&item.text, 40),
+                        item.resume_attempts
+                    );
+                    let _ = self.msgr.send_text(&primary, &notice).await;
+                    crate::log!(
+                        "[bot:{}] 已通知 owner 冻结消息 {}（chat={}）",
+                        self.bot.key(),
+                        trunc(&item.mid, 12),
+                        trunc(&primary, 12)
+                    );
                 }
                 continue;
             }
@@ -403,5 +446,21 @@ impl Bridge {
             ts: crate::chrono_lite::unix_secs() as i64,
         };
         self.handle(ev).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_max_attempts_is_sane() {
+        // 护栏（同 watchdog 常量护栏风格，assert_eq 锁精确值避免 clippy 常量断言）：
+        // 阈值 = 2 = 一次异常 + 一次重试机会（正常崩溃恢复 #25 不回退）；改阈值必须
+        // 同步本测试，防止「冻结形同虚设」或「一次异常就丢消息」的漂移。
+        assert_eq!(
+            RESUME_MAX_ATTEMPTS, 2,
+            "冻结阈值语义：1 次异常 + 1 次重试机会，变更需审慎并同步测试"
+        );
     }
 }

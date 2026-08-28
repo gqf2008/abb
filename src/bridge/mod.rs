@@ -2002,6 +2002,7 @@ mod tests {
             ts: 0,
             created_at: 10,
             reply: None,
+            resume_attempts: 0, // #164 新消息从 0 计
         });
         bridge.pending.add(crate::pending::PendingItem {
             mid: "r2".into(),
@@ -2015,6 +2016,7 @@ mod tests {
             sender_id: String::new(),
             ts: 0,
             created_at: 20,
+            resume_attempts: 0, // #164 新消息从 0 计
             reply: None,
         });
 
@@ -2023,7 +2025,11 @@ mod tests {
 
         let prompts = runner.prompts();
         assert_eq!(prompts.len(), 2, "应按入队顺序重放");
-        assert_eq!(prompts[0], "第一条");
+        assert!(
+            prompts[0].ends_with("第一条"),
+            "prompt 尾部应为用户文本: {}",
+            prompts[0]
+        );
         // 第二条是 granted 角色：重放时按原角色走受限分支（prompt 前置受限说明）
         assert!(prompts[1].contains("第二条"), "受限说明在前，原文在后");
         assert!(prompts[1].starts_with("[受限模式]"));
@@ -2067,6 +2073,7 @@ mod tests {
             role: crate::config::SenderRole::Owner,
             sender_id: String::new(),
             ts: 0,
+            resume_attempts: 0, // #164 新消息从 0 计
             created_at: 10,
             reply: None,
         });
@@ -2145,6 +2152,7 @@ mod tests {
             attachments: Vec::new(),
             role: crate::config::SenderRole::Granted,
             sender_id: "ou_friend".into(),
+            resume_attempts: 0, // #164 新消息从 0 计
             ts: 1000,
             created_at: 10,
             reply: None,
@@ -2202,6 +2210,7 @@ mod tests {
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
             role: crate::config::SenderRole::Owner,
+            resume_attempts: 0, // #164 新消息从 0 计
             sender_id: String::new(),
             ts: 0,
             created_at: 10,
@@ -2235,6 +2244,7 @@ mod tests {
             text: "问题".into(),
             quoted: crate::messenger::QuotedContent::default(),
             attachments: Vec::new(),
+            resume_attempts: 0, // #164 新消息从 0 计
             role: crate::config::SenderRole::Owner,
             sender_id: String::new(),
             ts: 0,
@@ -2826,7 +2836,11 @@ mod tests {
             "你好",
         );
         bridge.on_payload(payload.as_bytes()).await;
-        assert_eq!(runner.prompts(), vec!["你好"], "白名单成员应触发 agent");
+        assert!(
+            runner.prompts()[0].ends_with("你好"),
+            "白名单成员应触发 agent: {}",
+            runner.prompts()[0]
+        );
         cleanup_bridge(&bridge);
     }
 
@@ -2904,7 +2918,11 @@ mod tests {
 
         let prompts = runner.prompts();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], "随便聊聊", "owner 会话 prompt 不应带受限说明");
+        assert!(
+            prompts[0].ends_with("随便聊聊"),
+            "owner 会话 prompt 不应带受限说明: {}",
+            prompts[0]
+        );
         assert_eq!(
             runner.roles(),
             [crate::config::SenderRole::Owner],
@@ -3053,8 +3071,8 @@ mod tests {
         let prompts = runner.prompts();
         assert_eq!(prompts.len(), 1);
         assert!(
-            !prompts[0].contains("[指令文件]"),
-            "无文件不注入: {}",
+            prompts[0].contains("宿主护栏"),
+            "无文件也应注入宿主护栏（#164 无条件）: {}",
             &prompts[0][..prompts[0].len().min(60)]
         );
         cleanup_bridge(&bridge);
@@ -3099,11 +3117,15 @@ mod tests {
         let prompts = runner.prompts();
         assert_eq!(prompts.len(), 1);
         let p = &prompts[0];
-        assert!(p.starts_with("[会话摘要]"), "摘要块兜底注入: {p}");
+        assert!(p.contains("[会话摘要]"), "摘要块兜底注入: {p}");
         assert!(p.contains("主题：写周报"), "摘要内容在 prompt 中");
         assert!(
             p.find("[会话摘要]").unwrap() < p.find("你好").unwrap(),
             "摘要块在用户文本前"
+        );
+        assert!(
+            p.find("[指令文件]").unwrap() < p.find("[会话摘要]").unwrap(),
+            "指令文件块在摘要块前"
         );
         // 回复带「已携带会话摘要」提示（而非 0 轮上下文）
         let sent = msgr.sent();
@@ -3441,7 +3463,11 @@ mod tests {
         );
         bridge.on_payload(payload.as_bytes()).await;
 
-        assert_eq!(runner.prompts(), ["回复一下"], "话题内回复应进 agent");
+        assert!(
+            runner.prompts()[0].ends_with("回复一下"),
+            "话题内回复应进 agent: {}",
+            runner.prompts()[0]
+        );
         assert!(msgr.sent().iter().any(|t| t == "done"));
         cleanup_bridge(&bridge);
     }
@@ -3508,7 +3534,11 @@ mod tests {
         );
         bridge.on_payload(payload.as_bytes()).await;
 
-        assert_eq!(runner.prompts(), ["在吗"], "owner 私聊消息应进 agent");
+        assert!(
+            runner.prompts()[0].ends_with("在吗"),
+            "owner 私聊消息应进 agent: {}",
+            runner.prompts()[0]
+        );
         assert!(msgr.sent().iter().any(|t| t == "done"));
         cleanup_bridge(&bridge);
     }
@@ -3543,10 +3573,10 @@ mod tests {
         );
         bridge.on_payload(payload.as_bytes()).await;
 
-        assert_eq!(
-            runner.prompts(),
-            ["[引用消息]\n上面那条被引用的消息\n\n回复内容"],
-            "prompt 应带引用上下文"
+        assert!(
+            runner.prompts()[0].ends_with("[引用消息]\n上面那条被引用的消息\n\n回复内容"),
+            "prompt 应带引用上下文（引用块在尾部）: {}",
+            runner.prompts()[0]
         );
         assert!(msgr.sent().iter().any(|t| t == "done"));
         cleanup_bridge(&bridge);
@@ -3563,7 +3593,12 @@ mod tests {
             attachments: Vec::new(),
         };
         bridge.handle(ev).await;
-        assert_eq!(runner.prompts(), ["[引用消息]\n被引用的原消息\n\n回复内容"]);
+        assert_eq!(runner.prompts().len(), 1);
+        assert!(
+            runner.prompts()[0].ends_with("[引用消息]\n被引用的原消息\n\n回复内容"),
+            "引用块应在 prompt 尾部: {}",
+            runner.prompts()[0]
+        );
         cleanup_bridge(&bridge);
     }
 
@@ -3604,9 +3639,10 @@ mod tests {
         };
         bridge.on_weixin(msg).await;
 
-        assert_eq!(
-            runner.prompts(),
-            ["[引用消息]\n摘要 | 被引用的原消息\n\n回复内容"]
+        assert!(
+            runner.prompts()[0].ends_with("[引用消息]\n摘要 | 被引用的原消息\n\n回复内容"),
+            "引用块应在 prompt 尾部: {}",
+            runner.prompts()[0]
         );
         cleanup_bridge(&bridge);
     }
@@ -3638,7 +3674,12 @@ mod tests {
         };
         bridge.on_dingtalk(msg).await;
 
-        assert_eq!(runner.prompts(), ["[引用消息]\n被引用的原消息\n\n回复内容"]);
+        assert_eq!(runner.prompts().len(), 1);
+        assert!(
+            runner.prompts()[0].ends_with("[引用消息]\n被引用的原消息\n\n回复内容"),
+            "引用块应在 prompt 尾部: {}",
+            runner.prompts()[0]
+        );
         cleanup_bridge(&bridge);
     }
 
@@ -3682,10 +3723,9 @@ mod tests {
         bridge.on_payload(payload.as_bytes()).await;
 
         // 文本+附件同时存在：整段精确断言，钉死「[引用附件] 独占一行」的格式
-        assert_eq!(
-            runner.prompts(),
-            ["[引用消息]\n引用的文字\n[引用附件]\n[image] 来源=mock 文件名=截图.png mime=application/octet-stream 大小=1 本地路径=/tmp/mock-attachment.bin sha256=abc\n\n回复内容"]
-        );
+        assert!(runner.prompts()[0].ends_with(
+            "[引用消息]\n引用的文字\n[引用附件]\n[image] 来源=mock 文件名=截图.png mime=application/octet-stream 大小=1 本地路径=/tmp/mock-attachment.bin sha256=abc\n\n回复内容"
+        ), "引用+附件块应在 prompt 尾部: {}", runner.prompts()[0]);
         cleanup_bridge(&bridge);
     }
 
@@ -4004,6 +4044,7 @@ https://b.com/y"
                 thread_id: String::new(),
                 text: format!("第{i}条"),
                 quoted: crate::messenger::QuotedContent::default(),
+                resume_attempts: 0, // #164 新消息从 0 计
                 attachments: Vec::new(),
                 role: crate::config::SenderRole::Owner,
                 sender_id: String::new(),
@@ -4063,9 +4104,13 @@ https://b.com/y"
         let prompts = runner.prompts();
         assert_eq!(prompts.len(), 1);
         assert!(
-            prompts[0].starts_with("[群角色]\n群名：后端开发\n群介绍：你是后端开发工程师。\n\n"),
-            "注入块应前置在 prompt 最前: {:?}",
+            prompts[0].contains("[群角色]\n群名：后端开发\n群介绍：你是后端开发工程师。\n\n"),
+            "群角色块应注入（在指令文件块之后）: {:?}",
             &prompts[0][..prompts[0].len().min(120)]
+        );
+        assert!(
+            prompts[0].find("[群角色]").unwrap() > prompts[0].find("[指令文件]").unwrap(),
+            "指令文件块应在群角色块前"
         );
         assert!(prompts[0].ends_with("帮我评审这个 API 设计"));
         cleanup_bridge(&bridge);
@@ -4085,7 +4130,7 @@ https://b.com/y"
         bridge.handle(test_ev("m1", "oc_vb_1", "hi")).await;
         let prompts = runner.prompts();
         assert!(
-            prompts[0].starts_with("[群角色]\n群名：新角色名\n群介绍：\n\n"),
+            prompts[0].contains("[群角色]\n群名：新角色名\n群介绍：\n\n"),
             "事件名优先: {:?}",
             &prompts[0][..prompts[0].len().min(120)]
         );
@@ -4101,7 +4146,11 @@ https://b.com/y"
 
         // 未登记群 → 不注入
         bridge.handle(test_ev("m1", "oc_other", "你好")).await;
-        assert_eq!(runner.prompts()[0], "你好");
+        assert!(
+            runner.prompts()[0].ends_with("你好"),
+            "prompt 尾部应为用户文本: {}",
+            runner.prompts()[0]
+        );
         // 登记了但消息是私聊（chat_type != group）→ 不注入
         register_virtual_bot(&bridge, "oc_vb_2", "产品经理");
         bridge
@@ -4110,7 +4159,11 @@ https://b.com/y"
         let mut ev = test_ev("m2", "oc_vb_2", "私聊你好");
         ev.chat_type = "dm".into();
         bridge.handle(ev).await;
-        assert_eq!(runner.prompts()[1], "私聊你好");
+        assert!(
+            runner.prompts()[1].ends_with("私聊你好"),
+            "prompt 尾部应为用户文本: {}",
+            runner.prompts()[1]
+        );
         cleanup_bridge(&bridge);
     }
 

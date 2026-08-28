@@ -659,12 +659,16 @@ mod tests {
     /// OS 自动终止作业内 agent 及全部子孙进程——确定性零残留，不依赖自身清理逻辑。
     #[test]
     fn job_object_kills_grandchildren_on_drop() {
-        // 持久孙进程构造（同 #156 测试）：`start ping` 独立进程 + `& ping` 阻塞保持主进程
+        // 持久孙进程构造（同 #156 测试）：`start ping` 独立进程 + `& ping` 阻塞保持主进程。
+        // ping 带独特 `-w 2222` 标记：与 #159 kill_agent_tree（-w 1111）/ #153 hidden_console
+        //（无标记）测试并行时按命令行标记过滤计数，互不干扰。
         let child = spawn_hidden(
             &OsString::from("cmd"),
             &[
                 OsString::from("/C"),
-                OsString::from("start ping -n 120 127.0.0.1 & ping -n 120 127.0.0.1"),
+                OsString::from(
+                    "start ping -n 120 -w 2222 127.0.0.1 & ping -n 120 -w 2222 127.0.0.1",
+                ),
             ],
             None,
             &[],
@@ -682,9 +686,8 @@ mod tests {
         );
         let _ = pid;
         // drop → 作业句柄关闭 → KILL_ON_JOB_CLOSE → 作业内全部进程被 OS 终止。
-        // 10s 窗口：KILL_ON_JOB_CLOSE 是内核异步终止（实测 <1.5s），且 ping_count_winproc
-        // 统计全局 ping——并行跑 hidden_console 测试的 `ping -n 5`（约 4s）也在计数里，
-        // 4s 窗口会被它挤爆（实测并行失败、单跑 1.36s 过）；10s 足够两者都退净。
+        // 10s 窗口：KILL_ON_JOB_CLOSE 是内核异步终止（实测 <1.5s）；标记过滤后计数
+        // 只含本测试的 ping，窗口内必然归零，与其它测试并行无干扰。
         drop(child);
         let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -699,20 +702,26 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        // 清理保险（正常应无残留）
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "ping.exe", "/F"])
-            .status();
+        // 清理：正常应无残留（KILL_ON_JOB_CLOSE 已保证）——**不做** taskkill /IM ping.exe
+        // /F 全局清理：并行跑 kill_agent_tree 测试（#159）时其基线 ping 会被误杀
+        //（全局计数互踩，实测并行必发失败）。本测试的 ping 由 Job 关闭杀净，残留时
+        // 上面归零断言已红，无需额外清理。
     }
 
     fn ping_count_winproc() -> usize {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq ping.exe"])
+        // 只数带本测试标记（-w 2222）的 ping（与 #159 kill_agent_tree 测试的全局计数
+        // 隔离）：wmic 已弃用（Win11 移除），用 PowerShell CIM 取命令行（跨 Win10/11）。
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"name='ping.exe'\" | ForEach-Object { $_.CommandLine }",
+            ])
             .output()
-            .expect("tasklist 应可执行");
+            .expect("powershell 应可执行");
         String::from_utf8_lossy(&out.stdout)
-            .to_ascii_lowercase()
-            .matches("ping.exe")
+            .lines()
+            .filter(|l| l.contains("-w 2222"))
             .count()
     }
 
