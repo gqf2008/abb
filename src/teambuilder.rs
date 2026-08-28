@@ -246,7 +246,7 @@ pub async fn generate_team_plan(
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
     // codex >= 0.146 才支持 --add-dir（沙箱 workspace-write 需要）；旧版回退 bypass。
-    let codex_sandbox_ok = if backend == crate::agent::Backend::Codex {
+    let sandbox_mode_ok = if backend == crate::agent::Backend::Codex {
         resolved
             .to_str()
             .and_then(crate::deps::codex_version)
@@ -255,7 +255,7 @@ pub async fn generate_team_plan(
     } else {
         false
     };
-    let mut cmd = build_agent_command(backend, &resolved, &inject, codex_sandbox_ok);
+    let mut cmd = build_agent_command(backend, &resolved, &inject, sandbox_mode_ok);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，失败原因透传
@@ -329,7 +329,7 @@ fn build_agent_command(
     backend: crate::agent::Backend,
     resolved: &std::path::Path,
     inject: &crate::agent::Injection,
-    codex_sandbox_ok: bool,
+    sandbox_mode_ok: bool,
 ) -> tokio::process::Command {
     let mut cmd = match backend {
         crate::agent::Backend::Claude => {
@@ -341,7 +341,7 @@ fn build_agent_command(
             // #123：对齐 agent.rs::codex_command——--json --skip-git-repo-check +
             // owner 沙箱（workspace-write，默认域=cwd；bridge_dir 可写根保住
             // $ABB_BIN job/deliver 落盘域）。codex < 0.146 无 --add-dir → 回退 bypass。
-            let writable_roots: Vec<std::path::PathBuf> = if codex_sandbox_ok {
+            let writable_roots: Vec<std::path::PathBuf> = if sandbox_mode_ok {
                 vec![crate::bridge_dir()]
             } else {
                 Vec::new()
