@@ -604,15 +604,20 @@ const AGENT_NO_OUTPUT_WATCHDOG_SECS: u64 = 15 * 60;
 /// （如 pi 里跑的 `find /` 卡死——只杀 pi 主进程，find 仍会占着 stdout 管道）。
 /// Windows：taskkill /PID <pid> /T /F（/T 递归杀子树）；Unix：进程组负 pid 杀整组
 /// （spawn 时已 setsid 建新进程组，见 build_command）。
+/// #150 验收 P1 修复：Windows 分支 taskkill 必须**同步完成**（status 阻塞等待）后再
+/// kill 主进程——原先 .spawn() 异步不等待，紧接着 child.kill() 抢先杀掉根 PID，
+/// taskkill 找不到根进程（CreateProcess 数十 ms 开销 > kill 延迟）→ 子树成孤儿。
 async fn kill_agent_tree(pid: Option<u32>, child: &mut tokio::process::Child) {
     #[cfg(windows)]
     {
         if let Some(pid) = pid {
             use std::os::windows::process::CommandExt;
+            // status() 同步阻塞直到 taskkill 执行完（含递归杀子树），随后主进程才被 kill。
+            // 顺序保证：子树先清，主进程后杀——不依赖进程调度时序。
             let _ = std::process::Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .creation_flags(0x0800_0000)
-                .spawn();
+                .status();
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -2622,5 +2627,36 @@ mod tests {
         // 进程可能已退出：kill 树对已退出的 pid 是 no-op（不 panic 即通过）
         let fut = kill_agent_tree(pid, &mut child);
         tokio::runtime::Runtime::new().unwrap().block_on(fut);
+    }
+
+    /// #150 验收 P1 回归（Windows）：taskkill 同步完成后子树（孙进程）必须被递归杀掉。
+    /// 用 `cmd /C ping -n 120 127.0.0.1` 构造真实进程树（cmd=主进程，ping=其子进程），
+    /// kill_agent_tree 后 ping.exe 不得存活——若 taskkill 竞态（异步不等待）则 ping 残留。
+    #[cfg(windows)]
+    #[test]
+    fn kill_agent_tree_kills_grandchild_on_windows() {
+        let mut child = match tokio::process::Command::new("cmd")
+            .args(["/C", "ping -n 120 127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let pid = child.id();
+        let fut = kill_agent_tree(pid, &mut child);
+        tokio::runtime::Runtime::new().unwrap().block_on(fut);
+        // 给 taskkill 一点落地时间（已同步等待，这里只是等系统清进程表）
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq ping.exe"])
+            .output()
+            .expect("tasklist 应可执行");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("ping.exe"),
+            "孙进程 ping 应被 taskkill /T 递归杀掉（#150 竞态回归）: {text}"
+        );
     }
 }
