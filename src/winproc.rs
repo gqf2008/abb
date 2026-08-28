@@ -27,6 +27,11 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, CREATE_NEW_CONSOLE,
@@ -44,6 +49,12 @@ pub(crate) struct HiddenChild {
     pub(crate) stderr: Option<tokio::fs::File>,
     /// 进程句柄（wait/kill 用；Drop 时未回收则终止防孤儿）。
     proc: Arc<OwnedHandle>,
+    /// #158 Job Object（KILL_ON_JOB_CLOSE）：作业句柄全部关闭（ABB 退出/崩溃/异常
+    /// Drop）→ OS 自动终止作业内 agent 及全部子孙进程，零残留。正常退出时作业内
+    /// 已无进程，关闭无害。
+    /// 字段从不读取：作用仅是持句柄保活到 Drop（句柄关闭即触发 KILL_ON_JOB_CLOSE）。
+    #[expect(dead_code)]
+    job: Option<OwnedHandle>,
     pid: u32,
 }
 
@@ -129,6 +140,10 @@ pub(crate) fn spawn_hidden(
     cwd: Option<&Path>,
     envs: &[(OsString, Option<OsString>)],
 ) -> io::Result<HiddenChild> {
+    // #158 Job Object（KILL_ON_JOB_CLOSE）：创建即失败则整体报错（agent 无资源防护
+    // 不裸奔——挂起残留正是本机制要根治的）。作业句柄随 HiddenChild 生命周期，
+    // ABB 退出/崩溃 → OS 终止作业内 agent 及全部子孙，零残留。
+    let job = create_kill_on_close_job()?;
     // ── 1. 管道：stdin 父写子读，stdout/stderr 子写父读（两端都先可继承）──
     let mut stdin_read: HANDLE = INVALID_HANDLE_VALUE;
     let mut stdin_write: HANDLE = INVALID_HANDLE_VALUE;
@@ -242,6 +257,25 @@ pub(crate) fn spawn_hidden(
         return Err(io::Error::last_os_error());
     }
 
+    // ── 4.5 Job Object：把 agent 主进程分配进作业（其子孙进程默认继承作业）──
+    unsafe {
+        let ok = AssignProcessToJobObject(job.as_raw_handle() as HANDLE, pi.hProcess);
+        if ok == 0 {
+            // 极端情况（进程已退出/作业权限异常）：关闭作业句柄避免泄漏，返回错误。
+            // agent 未受保护即拒绝启动，与「无资源防护不裸奔」一致。
+            let _ = TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(stdin_read);
+            CloseHandle(stdin_write);
+            CloseHandle(stdout_read);
+            CloseHandle(stdout_write);
+            CloseHandle(stderr_read);
+            CloseHandle(stderr_write);
+            return Err(io::Error::last_os_error());
+        }
+    }
+
     // ── 5. 收尾：关子端句柄，父端句柄包装成 tokio File ──
     unsafe {
         CloseHandle(stdin_read);
@@ -259,8 +293,34 @@ pub(crate) fn spawn_hidden(
         stdout: Some(tokio::fs::File::from_std(stdout_file)),
         stderr: Some(tokio::fs::File::from_std(stderr_file)),
         proc: Arc::new(proc),
+        job: Some(job),
         pid: pi.dwProcessId,
     })
+}
+
+/// 创建 Job Object 并设 KILL_ON_JOB_CLOSE：作业句柄全部关闭时 OS 终止作业内全部进程。
+/// ABB 进程退出/崩溃（句柄随进程回收）→ agent 及全部子孙零残留——确定性兜底，
+/// 不依赖 ABB 自身清理逻辑（#158）。
+fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedHandle::from_raw_handle(job as RawHandle))
+    }
 }
 
 /// 拼命令行：`program args...`，每段按 Windows 规则引号化（与 std::process::Command
@@ -595,6 +655,67 @@ mod tests {
     /// #153 回归：agent（node）spawn 孙进程（cmd）不得新建**可见**控制台窗口。
     /// 旧行为（CREATE_NO_WINDOW）：agent 无控制台 → cmd 孙进程新建可见控制台 → 闪框。
     /// 新行为（隐藏控制台）：孙进程继承隐藏控制台 → 无新可见窗口。
+    /// #158 Job Object（KILL_ON_JOB_CLOSE）回归：HiddenChild drop（作业句柄关闭）→
+    /// OS 自动终止作业内 agent 及全部子孙进程——确定性零残留，不依赖自身清理逻辑。
+    #[test]
+    fn job_object_kills_grandchildren_on_drop() {
+        // 持久孙进程构造（同 #156 测试）：`start ping` 独立进程 + `& ping` 阻塞保持主进程
+        let child = spawn_hidden(
+            &OsString::from("cmd"),
+            &[
+                OsString::from("/C"),
+                OsString::from("start ping -n 120 127.0.0.1 & ping -n 120 127.0.0.1"),
+            ],
+            None,
+            &[],
+        )
+        .expect("spawn 应成功");
+        let pid = child.id().unwrap();
+        // 轮询等孙进程出现
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while ping_count_winproc() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            ping_count_winproc() >= 1,
+            "前置：孙进程应存在（构造/断言失效则本测试无意义）"
+        );
+        let _ = pid;
+        // drop → 作业句柄关闭 → KILL_ON_JOB_CLOSE → 作业内全部进程被 OS 终止。
+        // 10s 窗口：KILL_ON_JOB_CLOSE 是内核异步终止（实测 <1.5s），且 ping_count_winproc
+        // 统计全局 ping——并行跑 hidden_console 测试的 `ping -n 5`（约 4s）也在计数里，
+        // 4s 窗口会被它挤爆（实测并行失败、单跑 1.36s 过）；10s 足够两者都退净。
+        drop(child);
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if ping_count_winproc() == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline2 {
+                panic!(
+                    "Job Object 关闭后孙进程应被 OS 终止（KILL_ON_JOB_CLOSE），残留 {} 个",
+                    ping_count_winproc()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // 清理保险（正常应无残留）
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "ping.exe", "/F"])
+            .status();
+    }
+
+    fn ping_count_winproc() -> usize {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq ping.exe"])
+            .output()
+            .expect("tasklist 应可执行");
+        String::from_utf8_lossy(&out.stdout)
+            .to_ascii_lowercase()
+            .matches("ping.exe")
+            .count()
+    }
+
     #[test]
     fn hidden_console_no_new_visible_window_for_grandchildren() {
         // node 缺失时跳过（CI/精简环境）。
