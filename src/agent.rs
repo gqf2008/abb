@@ -600,6 +600,24 @@ const CANCEL_POLL_MS: u64 = 250;
 /// 正常长任务（编译/下载/批量处理）会有持续输出，不受影响；纯 LLM 思考一般 <5 分钟。
 const AGENT_NO_OUTPUT_WATCHDOG_SECS: u64 = 15 * 60;
 
+/// kill_agent_tree 需要的子进程抽象：Windows 用隐藏控制台 spawn（winproc::HiddenChild，#153），
+/// 其它平台用 tokio::process::Child。两者提供同一套 kill/wait 接口。
+#[async_trait::async_trait]
+pub(crate) trait KillableChild: Send {
+    async fn kill(&mut self) -> std::io::Result<()>;
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+#[async_trait::async_trait]
+impl KillableChild for tokio::process::Child {
+    async fn kill(&mut self) -> std::io::Result<()> {
+        self.kill().await
+    }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.wait().await
+    }
+}
+
 /// 杀 agent 进程**树**（含其内部 bash/工具子进程），避免主进程被 kill 后子进程成孤儿继续跑
 /// （如 pi 里跑的 `find /` 卡死——只杀 pi 主进程，find 仍会占着 stdout 管道）。
 /// Windows：taskkill /PID <pid> /T /F（/T 递归杀子树）；Unix：进程组负 pid 杀整组
@@ -607,7 +625,7 @@ const AGENT_NO_OUTPUT_WATCHDOG_SECS: u64 = 15 * 60;
 /// #150 验收 P1 修复：Windows 分支 taskkill 必须**同步完成**（status 阻塞等待）后再
 /// kill 主进程——原先 .spawn() 异步不等待，紧接着 child.kill() 抢先杀掉根 PID，
 /// taskkill 找不到根进程（CreateProcess 数十 ms 开销 > kill 延迟）→ 子树成孤儿。
-async fn kill_agent_tree(pid: Option<u32>, child: &mut tokio::process::Child) {
+async fn kill_agent_tree<K: KillableChild + Send>(pid: Option<u32>, child: &mut K) {
     #[cfg(windows)]
     {
         if let Some(pid) = pid {
@@ -1330,13 +1348,10 @@ async fn run_once(
         }
     };
 
-    // Windows：GUI 子系统进程 spawn 控制台子进程（claude/codex）会弹新控制台窗口，
-    // CREATE_NO_WINDOW 让子进程无窗口运行（stdout/stderr 仍走管道，功能不受影响）。
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.as_std_mut().creation_flags(0x0800_0000);
-    }
+    // Windows（#153）：std Command 无法注入 STARTUPINFO，改用 winproc::spawn_hidden——
+    // CreateProcessW + CREATE_NEW_CONSOLE + SW_HIDE，让 agent 持**隐藏控制台**，
+    // 其 Bash 工具 spawn 的孙进程（git/node/cmd）继承隐藏控制台 → 不再新建可见黑框。
+    // 参数/环境/cwd 从同一 tokio Command 提取（get_program/get_args/get_envs），链路一致。
 
     // claude 和 codex 统一收进 ~/.agent-bridge/workspace（用户拍板 2026-08-05）：
     // 在飞书里不区分后端，哪个 agent 工作目录都该受控，而不是 codex 仍在 home。
@@ -1376,6 +1391,21 @@ async fn run_once(
         truncate(prompt, 60)
     );
 
+    #[cfg(target_os = "windows")]
+    let mut child = {
+        use std::ffi::OsString;
+        let program = cmd.as_std().get_program().to_os_string();
+        let args: Vec<OsString> = cmd.as_std().get_args().map(|a| a.to_os_string()).collect();
+        let cwd = cmd.as_std().get_current_dir().map(|p| p.to_path_buf());
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|x| x.to_os_string())))
+            .collect();
+        crate::winproc::spawn_hidden(&program, &args, cwd.as_deref(), &envs)
+            .map_err(|e| AttemptErr::Failed(agent_missing_msg(backend, &e)))?
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut child = cmd
         .spawn()
         .map_err(|e| AttemptErr::Failed(agent_missing_msg(backend, &e)))?;
