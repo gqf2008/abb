@@ -327,7 +327,8 @@ impl Bridge {
             sender_id: ev.sender_id.clone(), // #74 重放落库时保持原发送者标识
             ts: ev.ts,     // #74 重放落库时保持原事件时间
             created_at: crate::chrono_lite::unix_secs(),
-            reply: None, // 回复产出后由 set_reply 落盘（阶段 1：W2 补发）
+            reply: None,        // 回复产出后由 set_reply 落盘（阶段 1：W2 补发）
+            resume_attempts: 0, // #164 新消息首次入队从 0 计（异常退出恢复才递增）
         });
 
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——

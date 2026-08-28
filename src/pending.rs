@@ -55,6 +55,13 @@ pub struct PendingItem {
     /// serde default 兼容旧 pending.json（无此字段 = 未产出回复，恢复时重跑）。
     #[serde(default)]
     pub reply: Option<String>,
+    /// #164 连续恢复失败计数：启动恢复时若检测到上次进程**异常退出**（残留 agent pid，
+    /// 即 AgentPidGuard 未及清理 = 被强杀/崩溃；优雅关停不会残留）→ 本条 +1。达到
+    /// RESUME_MAX_ATTEMPTS 后冻结（不再自动恢复 + 通知 owner）——防「agent 杀宿主 →
+    /// 重启 → 恢复同一条 → 再杀」死循环。serde default 兼容旧 pending.json（无此
+    /// 字段 = 0，首次异常才计 1）。
+    #[serde(default)]
+    pub resume_attempts: u32,
 }
 
 /// per-bot 的待处理队列（`workspaces/<bot>/pending.json`）。
@@ -121,6 +128,16 @@ impl PendingStore {
         }
     }
 
+    /// #164 恢复失败计数 +1（仅「上次进程异常退出且本条仍在待恢复」时调用）并落盘。
+    /// saturating 防溢出；已移除（处理成功）时静默忽略。
+    pub fn bump_resume_attempt(&self, mid: &str) {
+        let mut data = self.data.lock().unwrap();
+        if let Some(p) = data.iter_mut().find(|p| p.mid == mid) {
+            p.resume_attempts = p.resume_attempts.saturating_add(1);
+            self.save(&data);
+        }
+    }
+
     /// 启动恢复用快照：按入队时间升序（同秒按原顺序）。
     pub fn snapshot(&self) -> Vec<PendingItem> {
         let mut items = self.data.lock().unwrap().clone();
@@ -170,6 +187,7 @@ mod tests {
             ts: 0,
             created_at: at,
             reply: None,
+            resume_attempts: 0,
         }
     }
 
@@ -265,6 +283,8 @@ mod tests {
         );
         // 旧文件无 role 字段 → 默认 Owner（重放时走全权限，与现状一致）
         assert_eq!(store.snapshot()[0].role, crate::config::SenderRole::Owner);
+        // 旧文件无 resume_attempts 字段 → 默认 0（#164 首次异常才计 1）
+        assert_eq!(store.snapshot()[0].resume_attempts, 0);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -275,6 +295,34 @@ mod tests {
         store.add(item("m1", 1));
         store.remove("nope");
         assert_eq!(store.len(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn bump_resume_attempt_persists_and_saturates() {
+        // #164：恢复失败计数 +1 落盘（重启后仍读得到）；溢出 saturating 不 panic。
+        let p = temp_path("bump");
+        let store = PendingStore::at(p.clone());
+        store.add(item("m1", 1));
+        store.bump_resume_attempt("m1");
+        store.bump_resume_attempt("m1");
+        // 新实例重读（模拟重启）→ 计数仍在
+        let reloaded = PendingStore::at(p.clone());
+        assert_eq!(reloaded.snapshot()[0].resume_attempts, 2);
+        // 已移除 → 静默忽略
+        reloaded.remove("m1");
+        reloaded.bump_resume_attempt("m1");
+        assert!(PendingStore::at(p.clone()).is_empty());
+        // saturating：从 u32::MAX 再加不溢出
+        let store2 = PendingStore::at(p.clone());
+        let mut it = item("m2", 2);
+        it.resume_attempts = u32::MAX;
+        store2.add(it);
+        store2.bump_resume_attempt("m2");
+        assert_eq!(
+            PendingStore::at(p.clone()).snapshot()[0].resume_attempts,
+            u32::MAX
+        );
         let _ = std::fs::remove_file(&p);
     }
 }
