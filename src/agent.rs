@@ -1186,13 +1186,24 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，空结果时透传归因
-                                               // Windows：虚拟 Bot「✨生成」调 claude/codex/pi（.cmd shim）同样抑制控制台窗口（#104），
-                                               // 与 run_once（L1227）同款——否则 GUI 环境每次生成都闪一个黑框。
-    #[cfg(windows)]
-    {
-        crate::deps::apply_no_window_tokio(&mut cmd);
-    }
-    // spawn 失败（CLI 缺失）时带上与 run_once 一致的安装指引文案
+                                               // spawn 失败（CLI 缺失）时带上与 run_once 一致的安装指引文案
+    #[cfg(target_os = "windows")]
+    let mut child = {
+        // #153 同根因遗漏修复：虚拟 Bot「✨生成」也改走 winproc 隐藏控制台——
+        // 原 CREATE_NO_WINDOW 让 agent 无控制台，其内部命令孙进程会新建可见黑框。
+        use std::ffi::OsString;
+        let program = cmd.as_std().get_program().to_os_string();
+        let args: Vec<OsString> = cmd.as_std().get_args().map(|a| a.to_os_string()).collect();
+        let cwd = cmd.as_std().get_current_dir().map(|p| p.to_path_buf());
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|x| x.to_os_string())))
+            .collect();
+        crate::winproc::spawn_hidden(&program, &args, cwd.as_deref(), &envs)
+            .map_err(|e| anyhow::anyhow!("{}", agent_missing_msg(backend, &e)))?
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("{}", agent_missing_msg(backend, &e)))?;
