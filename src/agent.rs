@@ -831,16 +831,23 @@ pub(crate) fn codex_command(
         c.arg("resume").arg(session_id);
     }
     c.arg("--json").arg("--skip-git-repo-check");
-    if restricted {
-        c.arg("--sandbox").arg("read-only");
-    } else if writable_roots.is_empty() {
-        // 旧 codex（<0.146，无 --add-dir）回退：全权限（现状行为）。
-        c.arg("--dangerously-bypass-approvals-and-sandbox");
-    } else {
-        // #90：owner 会话默认域 = 工作区；writable_roots 追加可写根。
-        c.arg("--sandbox").arg("workspace-write");
-        for root in writable_roots {
-            c.arg("--add-dir").arg(root);
+    // #145（2026-08-27 实测）：codex exec resume 不支持 --sandbox / --add-dir
+    //（codex-cli 0.146.0，Usage: codex exec resume --json --skip-git-repo-check
+    // <SESSION_ID> [PROMPT]）。沙箱域在会话创建时已固定，续聊继承会话沙箱——
+    // resume 分支一律不追加沙箱/权限参数（含旧版 bypass 回退），避免
+    // `unexpected argument '--sandbox'` 导致 owner/granted 续聊必然失败。
+    if !resume {
+        if restricted {
+            c.arg("--sandbox").arg("read-only");
+        } else if writable_roots.is_empty() {
+            // 旧 codex（<0.146，无 --add-dir）回退：全权限（现状行为）。
+            c.arg("--dangerously-bypass-approvals-and-sandbox");
+        } else {
+            // #90：owner 会话默认域 = 工作区；writable_roots 追加可写根。
+            c.arg("--sandbox").arg("workspace-write");
+            for root in writable_roots {
+                c.arg("--add-dir").arg(root);
+            }
         }
     }
     // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
@@ -2343,6 +2350,63 @@ mod tests {
         );
         assert!(r.as_std().get_args().any(|a| a == "resume"));
         assert!(r.as_std().get_args().any(|a| a == "tid-2"));
+    }
+
+    #[test]
+    fn codex_command_resume_omits_sandbox_flags() {
+        // #145（2026-08-27 实测 codex-cli 0.146.0）：exec resume 子命令不支持
+        // --sandbox / --add-dir（Usage 只接受 --json --skip-git-repo-check）。
+        // 续聊继承会话创建时固定的沙箱域，resume 分支不得追加任何沙箱/权限参数，
+        // 否则 owner（workspace-write + writable_roots）与 granted（read-only）
+        // 续聊必然报 `unexpected argument '--sandbox'`（exit 2）。
+        let roots = vec![std::path::PathBuf::from("C:\\Users\\x\\.agent-bridge")];
+        let extra = vec!["model=abc".to_string()];
+
+        // owner resume：不得出现 sandbox 三件套，基础参数与 -c 注入保留
+        let r = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-2",
+            &extra,
+            false,
+            &roots,
+        );
+        let args: Vec<&std::ffi::OsStr> = r.as_std().get_args().collect();
+        assert!(args.iter().any(|a| *a == "resume"));
+        assert!(args.iter().any(|a| *a == "tid-2"));
+        assert!(args.iter().any(|a| *a == "--json"));
+        assert!(args.iter().any(|a| *a == "--skip-git-repo-check"));
+        assert!(
+            !args.iter().any(|a| *a == "--sandbox"),
+            "resume 不得带 --sandbox"
+        );
+        assert!(
+            !args.iter().any(|a| *a == "--add-dir"),
+            "resume 不得带 --add-dir"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| *a == "--dangerously-bypass-approvals-and-sandbox"),
+            "resume 不得带 bypass 旗标"
+        );
+        assert!(args.iter().any(|a| *a == "-c"));
+        assert!(args.iter().any(|a| *a == "model=abc"));
+
+        // granted（restricted）resume：同样不得带 --sandbox
+        let rg = codex_command(std::path::Path::new("codex"), true, "tid-3", &[], true, &[]);
+        let args_g: Vec<&std::ffi::OsStr> = rg.as_std().get_args().collect();
+        assert!(args_g.iter().any(|a| *a == "resume"));
+        assert!(
+            !args_g.iter().any(|a| *a == "--sandbox"),
+            "granted resume 不得带 --sandbox"
+        );
+        assert!(
+            !args_g
+                .iter()
+                .any(|a| *a == "--dangerously-bypass-approvals-and-sandbox"),
+            "granted resume 不得带 bypass 旗标"
+        );
     }
 
     #[test]
