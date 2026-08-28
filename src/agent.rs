@@ -421,6 +421,46 @@ fn adopt_thread_id(
     }
 }
 
+/// #168 通用权限档位解析（run / run_once 同源单点）：热读 config（agent 调用秒级起，
+/// 读一次 ~KB 文件可接受；读不到/损坏回落 auto）。auto = 现状（owner 全权限 /
+/// workspace-write、受限会话受限）；显式模式（read-only/workspace-write/full-access）
+/// 用户选择优先，受限会话也尊重。
+/// #163 补充（老板拍板）：虚拟 Bot（团队角色群）里**受限会话**默认 workspace-write——
+/// 团队角色要干活（读写工作区），auto 的「受限→read-only」会卡住它们。仅 auto + 受限
+/// 生效；用户显式配置仍优先。owner 会话不受此覆盖（保持现状全权限，与 codex 原语义
+/// 一致——codex owner 默认本就是 workspace-write，覆盖与否结果相同）。
+fn resolve_sandbox_mode(
+    bot_key: &str,
+    chat_id: &str,
+    restrict: bool,
+) -> crate::config::SandboxMode {
+    let mut sandbox = match crate::config::Config::load() {
+        Ok(c) => c
+            .bots
+            .iter()
+            .find(|b| b.key() == bot_key)
+            .map(|b| b.sandbox_mode)
+            .unwrap_or_default(),
+        Err(_) => crate::config::SandboxMode::Auto,
+    };
+    if sandbox == crate::config::SandboxMode::Auto
+        && restrict
+        && chat_in_virtual_bots(&crate::virtualbot::VirtualBotStore::new(), bot_key, chat_id)
+    {
+        sandbox = crate::config::SandboxMode::WorkspaceWrite;
+    }
+    sandbox
+}
+
+/// #168：claude 会话的 --settings 是否指向 guard settings.json（Bash 强制闸）。
+/// run（spawn 前生成 guard 文件）与 run_once（选择 --settings 路径）必须同源——
+/// 不一致会让 claude 因 settings 文件不存在直接启动失败（"Settings file not found"，
+/// 实测 CLI 硬错误）。语义：档位非 full-access（含受限会话、read-only、workspace-write）
+/// → guard 闸；full-access / auto-owner → owner 删除保护文件（#88）。
+fn claude_settings_use_guard(restrict: bool, sandbox: crate::config::SandboxMode) -> bool {
+    restrict || sandbox != crate::config::SandboxMode::FullAccess
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     backend: Backend,
@@ -452,12 +492,25 @@ pub async fn run(
         ));
     }
 
-    // 受限会话：生成/刷新 guard 文件（claude settings.json hook + codex execpolicy）。
+    // #168 权限档位（claude/codex 消费；pi 无沙箱体系，不解析）。与 run_once 同源
+    //（resolve_sandbox_mode 单点），保证下面「生成哪个 guard 文件」与 run_once 里
+    //「--settings 指向哪个文件」永远一致——写错文件 claude 启动即报
+    // "Settings file not found"（实测 CLI 硬错误退出）。
+    let sandbox = if matches!(backend, Backend::Claude | Backend::Codex) {
+        resolve_sandbox_mode(bot_key, chat_id, restrict)
+    } else {
+        crate::config::SandboxMode::Auto
+    };
+
+    // 受限会话：生成/刷新 guard 文件（claude settings.json hook）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
     //（返回用户可见错误，不静默降级成全权限）。
     // owner 会话（非受限）：也生成删除保护 settings.json（#88，claude Bash hook），
     // 失败同样拒绝启动——删除保护是安全默认，不能静默裸奔。
-    if restrict {
+    // #168：档位非 full-access（含显式 read-only/workspace-write、受限会话）需要
+    // guard settings.json，full-access / auto-owner 需要 owner-settings.json——
+    // 选择必须与 run_once 的 --settings 同源（claude_settings_use_guard）。
+    if claude_settings_use_guard(restrict, sandbox) {
         crate::guard::ensure_guard_files(bot_key)
             .map_err(|e| format!("⚠️ 受限会话 guard 文件生成失败，已拒绝启动：{e:#}"))?;
     } else {
@@ -496,6 +549,7 @@ pub async fn run(
             cancel.clone(),
             role,
             restrict,
+            sandbox,
         )
         .await
         {
@@ -921,7 +975,7 @@ fn chat_in_virtual_bots(
     store.load_for(bot_key).iter().any(|v| v.chat_id == chat_id)
 }
 
-/// #163：codex 沙箱模式 → (restricted, writable_roots) 参数映射（可单测纯函数）。
+/// #163/#168：通用权限档位 → codex 的 (restricted, writable_roots) 参数映射（可单测纯函数）。
 /// - Auto（默认）：保持现状——restrict 原样（受限会话 read-only）、owner 用预算 roots
 /// - ReadOnly：强制 read-only（显式选择优先，受限会话也尊重）
 /// - WorkspaceWrite：强制工作区可写（roots 预算）
@@ -1354,6 +1408,8 @@ async fn run_once(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     role: crate::config::SenderRole,
     restrict: bool,
+    // #168 通用权限档位（run 里 resolve_sandbox_mode 解析后传入；三后端按档位翻译）。
+    sandbox: crate::config::SandboxMode,
 ) -> Result<AgentOutput, AttemptErr> {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncBufReadExt;
@@ -1368,30 +1424,6 @@ async fn run_once(
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
 
-    // #168 通用权限档位（每 bot 可配置，三后端翻译）：热读 config（agent 调用秒级起，
-    // 读一次 ~KB 文件可接受；读不到/损坏回落 auto）。auto = 现状（owner 全权限/
-    // workspace-write、受限会话受限）；显式模式（read-only/workspace-write/full-access）
-    // 用户选择优先，受限会话也尊重。
-    let sandbox = match crate::config::Config::load() {
-        Ok(c) => c
-            .bots
-            .iter()
-            .find(|b| b.key() == bot_key)
-            .map(|b| b.sandbox_mode)
-            .unwrap_or_default(),
-        Err(_) => crate::config::SandboxMode::Auto,
-    };
-    // #163 补充（老板拍板）：虚拟 Bot（团队角色群）默认 workspace-write——团队角色要
-    // 干活（读写工作区），auto 的「受限→read-only」会卡住它们。仅 auto 生效；用户
-    // 显式配置（read-only/workspace-write/full-access）仍优先。
-    let sandbox = if sandbox == crate::config::SandboxMode::Auto
-        && chat_in_virtual_bots(&crate::virtualbot::VirtualBotStore::new(), bot_key, chat_id)
-    {
-        crate::config::SandboxMode::WorkspaceWrite
-    } else {
-        sandbox
-    };
-
     let mut cmd = match backend {
         Backend::Codex => {
             // codex 多轮上下文（对齐 claude）：首轮 `codex exec`，后续轮 `codex exec resume <tid>`。
@@ -1402,7 +1434,8 @@ async fn run_once(
             // 额外把 bridge_dir 加入可写根——$ABB_BIN job/deliver 落盘 jobs.json / deliveries.json
             // 在 ~/.agent-bridge/ 下（不在工作区内），不加会破坏定时任务/跨会话投递（#21/#27）。
             // codex < 0.146 无 --add-dir → 传空回退 bypass（保持现状行为）。
-            // #163/#168：档位（sandbox）已在上方统一解析（含虚拟 Bot 默认覆盖）。
+            // #163/#168：档位（sandbox）由 run() 的 resolve_sandbox_mode 统一解析后传入
+            //（含虚拟 Bot 受限会话默认覆盖）。
             // auto = 现状（owner→workspace-write(+bridge_dir)、受限→read-only）；显式
             // 模式用户选择优先，受限会话也尊重。
             // roots 按「owner 预算」算好（restrict 时无意义，映射函数按模式取舍）
@@ -1428,7 +1461,8 @@ async fn run_once(
             // #168：档位非 full-access（含受限会话、read-only、workspace-write）时
             // settings 指向工作区外的 guard settings.json（Bash 强制闸）；full-access /
             // auto-owner 指向删除保护 owner-settings.json（#88，回收站安全网）。
-            let settings = if restrict || sandbox != crate::config::SandboxMode::FullAccess {
+            // 与 run 里生成 guard 文件的同源判定（claude_settings_use_guard）保持一致。
+            let settings = if claude_settings_use_guard(restrict, sandbox) {
                 crate::guard::guard_settings_path(bot_key)
             } else {
                 crate::guard::owner_guard_settings_path(bot_key)
@@ -2628,6 +2662,42 @@ mod tests {
             sandbox_mode_params(SandboxMode::FullAccess, true, roots.clone()),
             (false, vec![])
         );
+    }
+
+    #[test]
+    fn claude_settings_use_guard_matches_ensure_selection() {
+        // #168 回归锁：run（spawn 前 ensure 哪个 guard 文件）与 run_once（--settings
+        // 指向哪个文件）共用 claude_settings_use_guard 同源判定——任何一处分叉都会让
+        // claude 因 settings 文件不存在直接启动失败（"Settings file not found" 实测）。
+        // 期望语义：非 full-access（含受限会话、read-only、workspace-write）→ guard 闸；
+        // 仅 full-access + owner 会话 → owner 删除保护文件（restricted+full-access 仍
+        // 走 guard 闸——授权者身份的 $ABB_BIN 白名单强制闸不因档位放宽）。
+        use crate::config::SandboxMode;
+        // 受限会话：除显式 full-access 外全走 guard 闸；full-access 也走 guard 闸
+        //（白名单强制闸保留，仅 full-access + owner 才落到 owner 文件）
+        for m in [
+            SandboxMode::Auto,
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::FullAccess,
+        ] {
+            assert!(
+                claude_settings_use_guard(true, m),
+                "{m:?} 受限会话应走 guard 闸"
+            );
+        }
+        // owner 会话：auto / read-only / workspace-write → guard 闸；full-access → owner 文件
+        for m in [
+            SandboxMode::Auto,
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+        ] {
+            assert!(
+                claude_settings_use_guard(false, m),
+                "{m:?} owner 会话应走 guard 闸"
+            );
+        }
+        assert!(!claude_settings_use_guard(false, SandboxMode::FullAccess));
     }
 
     #[test]

@@ -14,11 +14,13 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::PathBuf;
 
-/// #163 codex 沙箱模式（每 bot 可配置，默认 auto）：
-/// - Auto（默认）：保持现状——owner → workspace-write(+bridge_dir)、受限会话 → read-only
-/// - ReadOnly：`--sandbox read-only`（全盘只读）
-/// - WorkspaceWrite：`--sandbox workspace-write` + bridge_dir 可写根
-/// - FullAccess：`--dangerously-bypass-approvals-and-sandbox`（全权限，UI 有警示）
+/// #168 通用权限档位（每 bot 可配置，默认 auto；三后端 claude/codex/pi 按档位翻译）：
+/// - Auto（默认）：保持现状——claude：owner 全权限、受限会话受限白名单；codex：
+///   owner → workspace-write(+bridge_dir)、受限会话 → read-only
+/// - ReadOnly：claude 白名单只剩读/查工具；codex `--sandbox read-only`（全盘只读）
+/// - WorkspaceWrite：claude 工作区可写白名单；codex `--sandbox workspace-write` + bridge_dir 可写根
+/// - FullAccess：claude --dangerously-skip-permissions；codex --dangerously-bypass-...（全权限，UI 有警示）
+/// - pi 无 OS 沙箱/权限体系，档位不翻译（保持现状）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
@@ -51,7 +53,7 @@ impl SandboxMode {
     }
 }
 
-/// #163 默认 codex 沙箱模式（auto）。
+/// #168 默认权限档位（auto）。
 fn default_sandbox_mode() -> SandboxMode {
     SandboxMode::Auto
 }
@@ -291,7 +293,7 @@ fn not_open(b: &bool) -> bool {
     !*b
 }
 
-/// #163：sandbox_mode = auto 时不落盘（旧 config 兼容；显示默认值）。
+/// #168：sandbox_mode = auto 时不落盘（旧 config 兼容；显示默认值）。
 fn is_auto_sandbox(m: &SandboxMode) -> bool {
     *m == SandboxMode::Auto
 }
