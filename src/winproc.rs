@@ -52,6 +52,8 @@ pub(crate) struct HiddenChild {
     /// #158 Job Object（KILL_ON_JOB_CLOSE）：作业句柄全部关闭（ABB 退出/崩溃/异常
     /// Drop）→ OS 自动终止作业内 agent 及全部子孙进程，零残留。正常退出时作业内
     /// 已无进程，关闭无害。
+    /// 字段从不读取：作用仅是持句柄保活到 Drop（句柄关闭即触发 KILL_ON_JOB_CLOSE）。
+    #[expect(dead_code)]
     job: Option<OwnedHandle>,
     pid: u32,
 }
@@ -658,7 +660,7 @@ mod tests {
     #[test]
     fn job_object_kills_grandchildren_on_drop() {
         // 持久孙进程构造（同 #156 测试）：`start ping` 独立进程 + `& ping` 阻塞保持主进程
-        let mut child = spawn_hidden(
+        let child = spawn_hidden(
             &OsString::from("cmd"),
             &[
                 OsString::from("/C"),
@@ -679,9 +681,12 @@ mod tests {
             "前置：孙进程应存在（构造/断言失效则本测试无意义）"
         );
         let _ = pid;
-        // drop → 作业句柄关闭 → KILL_ON_JOB_CLOSE → 作业内全部进程被 OS 终止
+        // drop → 作业句柄关闭 → KILL_ON_JOB_CLOSE → 作业内全部进程被 OS 终止。
+        // 10s 窗口：KILL_ON_JOB_CLOSE 是内核异步终止（实测 <1.5s），且 ping_count_winproc
+        // 统计全局 ping——并行跑 hidden_console 测试的 `ping -n 5`（约 4s）也在计数里，
+        // 4s 窗口会被它挤爆（实测并行失败、单跑 1.36s 过）；10s 足够两者都退净。
         drop(child);
-        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if ping_count_winproc() == 0 {
                 break;
@@ -711,6 +716,7 @@ mod tests {
             .count()
     }
 
+    #[test]
     fn hidden_console_no_new_visible_window_for_grandchildren() {
         // node 缺失时跳过（CI/精简环境）。
         let Some(node) = crate::deps::find_in_path("node") else {
