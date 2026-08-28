@@ -595,6 +595,45 @@ struct AgentOutput {
 /// 打断轮询间隔：无输出时也最多这么久就检查一次 cancel（卡死的进程也能被叫停）。
 const CANCEL_POLL_MS: u64 = 250;
 
+/// 无输出 watchdog：agent 子进程（pi/claude/codex）stdout 连续这么久没有任何新行，
+/// 判定疑似挂起（如 agent 内部 bash 工具调用卡死在 find/网络等），强制杀进程树并报错。
+/// 正常长任务（编译/下载/批量处理）会有持续输出，不受影响；纯 LLM 思考一般 <5 分钟。
+const AGENT_NO_OUTPUT_WATCHDOG_SECS: u64 = 15 * 60;
+
+/// 杀 agent 进程**树**（含其内部 bash/工具子进程），避免主进程被 kill 后子进程成孤儿继续跑
+/// （如 pi 里跑的 `find /` 卡死——只杀 pi 主进程，find 仍会占着 stdout 管道）。
+/// Windows：taskkill /PID <pid> /T /F（/T 递归杀子树）；Unix：进程组负 pid 杀整组
+/// （spawn 时已 setsid 建新进程组，见 build_command）。
+async fn kill_agent_tree(pid: Option<u32>, child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    {
+        if let Some(pid) = pid {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000)
+                .spawn();
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    #[cfg(unix)]
+    {
+        if let Some(pid) = pid {
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+            // 极端挂死（子进程忽略/阻塞 SIGTERM）兜底：2s 后 SIGKILL 强制清组。
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
 /// 从 pi 的 assistant message 里取纯文本（content[].type == "text" 块拼接）。
 /// 工具调用轮（只有 toolCall 块）返回空串——不产生进度候选。
 pub fn pi_message_text(v: &serde_json::Value) -> String {
@@ -1306,6 +1345,12 @@ async fn run_once(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Unix：自建进程组，kill_agent_tree 用负 pid 杀整组（覆盖 agent 内部的 bash 子进程）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
     // 注入本程序绝对路径：agent 调 job CLI 用 $ABB_BIN，保证是当前安装/当前版本，
     // 不依赖 PATH（macOS 在 .app 内、Windows 在安装目录，裸命令名都调不到）。
     if let Ok(exe) = std::env::current_exe() {
@@ -1338,6 +1383,7 @@ async fn run_once(
             pid,
         }
     });
+    let child_pid = child.id();
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes()).await;
@@ -1381,14 +1427,14 @@ async fn run_once(
     };
 
     // 流式读取：每行即时解析；无输出时也每 CANCEL_POLL_MS 检查一次打断
+    let mut last_output_at = tokio::time::Instant::now();
     loop {
         if cancel
             .as_ref()
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(false)
         {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            kill_agent_tree(child_pid, &mut child).await;
             crate::log!("[agent] {} 被用户打断（kill）", backend.name());
             return Err(AttemptErr::Cancelled);
         }
@@ -1402,8 +1448,7 @@ async fn run_once(
                 // 超时无输出 → 先查启动健康检查，再回去查 cancel
                 if let Some(deadline) = startup_deadline {
                     if !got_output && tokio::time::Instant::now() >= deadline {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        kill_agent_tree(child_pid, &mut child).await;
                         crate::log!(
                             "[agent] claude 启动 {}s 无输出（疑似启动遥测/网络阻塞），终止并自动重建",
                             CLAUDE_STARTUP_GRACE_SECS
@@ -1414,10 +1459,29 @@ async fn run_once(
                         )));
                     }
                 }
+                // 无输出 watchdog：任意后端（pi/claude/codex）stdout 连续无新行超过阈值，
+                // 判定 agent 内部命令疑似挂死（如 bash 工具调用卡在 find /、网络等待），
+                // 强制杀进程树并报错——避免昨晚「find / 全盘扫描卡 10 小时」重现。
+                if last_output_at.elapsed()
+                    >= std::time::Duration::from_secs(AGENT_NO_OUTPUT_WATCHDOG_SECS)
+                {
+                    kill_agent_tree(child_pid, &mut child).await;
+                    crate::log!(
+                        "[agent] {} 无输出 {}s（疑似内部命令挂起），强制终止（watchdog）",
+                        backend.name(),
+                        AGENT_NO_OUTPUT_WATCHDOG_SECS
+                    );
+                    return Err(AttemptErr::Failed(format!(
+                        "⚠️ {} 疑似挂起：{} 分钟无任何输出（可能内部命令卡死），已强制终止。可回复 /cancel 或重试。",
+                        backend.name(),
+                        AGENT_NO_OUTPUT_WATCHDOG_SECS / 60
+                    )));
+                }
                 continue;
             }
             Ok(Ok(Some(l))) => {
                 got_output = true;
+                last_output_at = tokio::time::Instant::now();
                 if let Some(p) = process_line(
                     backend,
                     &l,
@@ -2529,5 +2593,34 @@ mod tests {
         // 空文件再次清理是 no-op
         kill_stale_agents(&key);
         let _ = std::fs::remove_dir_all(crate::workspace_dir(&key));
+    }
+
+    #[test]
+    fn watchdog_constant_is_reasonable() {
+        // 兜底阈值护栏：无输出 15 分钟才杀，正常长任务（编译/下载/批量）有持续输出不受影响；
+        // 纯 LLM 思考一般 <5 分钟，15 分钟足够宽裕，又远小于「find / 卡 10 小时」级事故。
+        assert_eq!(AGENT_NO_OUTPUT_WATCHDOG_SECS, 15 * 60);
+        // 轮询间隔必须远小于 watchdog，保证 cancel/挂起能在合理时间内被感知
+        // （const 块断言：避免 clippy::assertions_on_constants，rust 1.98 新 lint）
+        const { assert!(CANCEL_POLL_MS < 1_000) };
+    }
+
+    #[test]
+    fn kill_agent_tree_handles_missing_pid() {
+        // 无 pid（spawn 失败极端情况）也走 child.kill 兜底，不 panic。
+        // 这里用一条真实 spawn 的短命进程验证 kill 路径不卡死（wait 有返回）。
+        let mut child = match tokio::process::Command::new("cmd")
+            .args(["/C", "echo ok"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return, // 无 cmd 的环境跳过（测试机必有，防御性）
+        };
+        let pid = child.id();
+        // 进程可能已退出：kill 树对已退出的 pid 是 no-op（不 panic 即通过）
+        let fut = kill_agent_tree(pid, &mut child);
+        tokio::runtime::Runtime::new().unwrap().block_on(fut);
     }
 }

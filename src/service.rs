@@ -770,6 +770,10 @@ async fn run_job(
     // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明 + 三级
     // AGENTS.md 指令文件块（组装抽成 job_prompt 纯函数，可测）。
     let prompt = job_prompt(&job, &bot_key);
+    // 定时任务可被「停止词」打断（#卡死修复）：注册到目标会话的 cancel 标志，
+    // 用户在该会话发 停/停止/cancel 即可终止正在跑的后台任务；
+    // 与聊天任务共用同一 key（chat_id）——同一 chat 同一时刻只有一个在跑任务。
+    let cancel_flag = bridge.register_cancel_flag(&job.chat_id);
     let reply = match crate::agent::run(
         backend,
         &prompt,
@@ -778,17 +782,18 @@ async fn run_job(
         &job.chat_id,
         &job.chat_id, // session_key：sessions=None 时仅回存分支用不到，占位保持一致
         &bot_key,
-        job.role, // 按创建者角色执行：授权者建的任务走受限分支
-        None,     // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
-        None,     // 定时任务不推中间进度（统一只发最终结果）
-        None,     // 定时任务不可被聊天打断
+        job.role,                  // 按创建者角色执行：授权者建的任务走受限分支
+        None, // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
+        None, // 定时任务不推中间进度（统一只发最终结果）
+        Some(cancel_flag.clone()), // 定时任务可被用户停止词打断
     )
     .await
     {
         Ok(crate::agent::RunOutcome::Reply { reply, .. }) => reply,
-        Ok(crate::agent::RunOutcome::Cancelled) => "⏰ 任务被中断".to_string(), // 定时任务不会触发
+        Ok(crate::agent::RunOutcome::Cancelled) => "⏰ 任务被中断".to_string(),
         Err(e) => format!("⏰ 定时任务执行失败：{e}"),
     };
+    bridge.unregister_cancel_flag(&job.chat_id);
     let header = match job.kind {
         crate::schedule::JobKind::Once => "⏰ 定时提醒",
         crate::schedule::JobKind::Cron => "⏰ 定时任务",
