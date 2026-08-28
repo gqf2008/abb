@@ -799,6 +799,8 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
             b.backend.as_str()
         })
         .into(),
+        // #163：codex 沙箱模式（auto 默认；非 codex 后端时该下拉无实际作用）
+        codex_sandbox: b.codex_sandbox.as_str().into(),
         owner_open_id: b.owner_open_id.clone().into(),
         wx_owner_configured: !b.wx_user_id.is_empty(),
         owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
@@ -4356,6 +4358,26 @@ pub fn run_gui() -> Result<()> {
                 bot.backend = val.to_string();
             }
             refresh_exclusive_checks(&w, &work);
+        });
+    }
+    // #163 codex 沙箱模式下拉：写 work + dirty + 同步 model（下拉 index 绑 model，
+    // 不重建的话切 bot 后仍显示旧值）。full-access 警示行由 slint 按 model 值条件显示。
+    {
+        let work = work.clone();
+        let model = bots_model.clone();
+        let dirty = dirty.clone();
+        settings.on_codex_sandbox_changed(move |idx, opt| {
+            dirty.set(true);
+            let val = ["auto", "read-only", "workspace-write", "full-access"][opt as usize];
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.codex_sandbox = crate::config::CodexSandboxMode::parse(val);
+                }
+            }
+            // 同步回写 model：下拉 index 与警示行都绑 model，不刷新显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
         });
     }
     {

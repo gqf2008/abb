@@ -152,6 +152,7 @@ export struct BotRow {
     kind: string,        // feishu | wechat | dingtalk
     enabled: bool,       // 是否启用（false 则 service 不启动此 bot）
     backend: string,     // 该 bot 的默认后端 claude | codex（跟着 bot 走，不是全局）
+    codex-sandbox: string, // #163 codex 沙箱模式 auto | read-only | workspace-write | full-access
     provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
     owner-open-id: string, // 飞书：owner（管理员）白名单（逗号分隔 open_id）；微信 bot 不用
     wx-owner-configured: bool, // 微信：扫码登录时自动写入 wx_user_id（登录者即管理员）；false=未配置（fail-closed 拒绝所有人）
@@ -1242,6 +1243,9 @@ export component SettingsWindow inherits Window {
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
     callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
     callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi）
+    // #163 codex 沙箱模式下拉（每 bot）：4 项 = config 落盘值（auto/read-only/...）
+    in-out property <[string]> codex-sandbox-options: ["auto", "read-only", "workspace-write", "full-access"];
+    callback codex-sandbox-changed(int, int);  // (bot idx, 选项下标)
     callback access-option-toggled(int);   // 飞书对话权限下标（0=仅授权 1=任何人）
     callback ding-access-option-toggled(int); // 钉钉对话权限下标
     callback generate-owner-code(int, string); // 生成授权码：bot idx + role（"owner"=管理员码 / "granted"=普通码），覆盖同类型旧码
@@ -1628,6 +1632,22 @@ export component SettingsWindow inherits Window {
                                                             toggled => { root.backend-option-toggled(i); }
                                                         }
                                                     }
+                                                }
+                                                // #163 codex 沙箱模式（每 bot 下拉）：auto 默认（owner 工作区可写、受限只读）；
+                                                // 显式模式用户选择优先。选项值即 config 落盘值（kebab-case）。
+                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
+                                                    Text { text: "codex 沙箱"; width: 80px; vertical-alignment: center; }
+                                                    PixelComboBox {
+                                                        model: root.codex-sandbox-options;
+                                                        index: root.bots[root.selected].codex-sandbox == "read-only" ? 1 : root.bots[root.selected].codex-sandbox == "workspace-write" ? 2 : root.bots[root.selected].codex-sandbox == "full-access" ? 3 : 0;
+                                                        horizontal-stretch: 1;
+                                                        selected(idx) => { root.codex-sandbox-changed(root.selected, idx); }
+                                                    }
+                                                }
+                                                // #163 full-access 警示：选全权限时明确提示（不限制权限，可读写全盘）
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].codex-sandbox == "full-access": Row {
+                                                    Text { text: "⚠️"; width: 80px; color: #e5484d; vertical-alignment: center; }
+                                                    Text { text: "full-access 不限制权限，可读写全盘，请谨慎使用"; color: #e5484d; vertical-alignment: center; horizontal-stretch: 1; }
                                                 }
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {

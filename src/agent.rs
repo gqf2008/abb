@@ -858,6 +858,38 @@ fn claude_command(
     c
 }
 
+/// #90/#163：owner 沙箱的可写根预算——codex >= 0.146 时 bridge_dir 可写
+///（$ABB_BIN job/deliver 落盘域），旧版本无 --add-dir → 空（调用方回退 bypass）。
+/// 受限会话不调用（restrict 时 roots 无意义）；显式 workspace-write 模式复用。
+fn codex_writable_roots(resolved: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if crate::deps::codex_version(resolved.to_str().unwrap_or("codex"))
+        .map(|v| crate::deps::version_at_least(&v, "0.146"))
+        .unwrap_or(false)
+    {
+        vec![crate::bridge_dir()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// #163：codex 沙箱模式 → (restricted, writable_roots) 参数映射（可单测纯函数）。
+/// - Auto（默认）：保持现状——restrict 原样（受限会话 read-only）、owner 用预算 roots
+/// - ReadOnly：强制 read-only（显式选择优先，受限会话也尊重）
+/// - WorkspaceWrite：强制工作区可写（roots 预算）
+/// - FullAccess：bypass 全权限（roots 空 → codex_command 走 --dangerously-bypass-...）
+pub(crate) fn codex_sandbox_params(
+    mode: crate::config::CodexSandboxMode,
+    restrict: bool,
+    roots: Vec<std::path::PathBuf>,
+) -> (bool, Vec<std::path::PathBuf>) {
+    match mode {
+        crate::config::CodexSandboxMode::Auto => (restrict, roots),
+        crate::config::CodexSandboxMode::ReadOnly => (true, Vec::new()),
+        crate::config::CodexSandboxMode::WorkspaceWrite => (false, roots),
+        crate::config::CodexSandboxMode::FullAccess => (false, Vec::new()),
+    }
+}
+
 /// codex 会话命令构造（exec / exec resume，含桥内供应商 -c 注入）。
 /// 沙箱策略（#90 bot 数据边界，2026-08-27 落地）：
 /// - restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
@@ -1297,23 +1329,33 @@ async fn run_once(
             // 额外把 bridge_dir 加入可写根——$ABB_BIN job/deliver 落盘 jobs.json / deliveries.json
             // 在 ~/.agent-bridge/ 下（不在工作区内），不加会破坏定时任务/跨会话投递（#21/#27）。
             // codex < 0.146 无 --add-dir → 传空回退 bypass（保持现状行为）。
-            let codex_writable_roots: Vec<std::path::PathBuf> = if restrict {
-                Vec::new()
-            } else if crate::deps::codex_version(resolved.to_str().unwrap_or("codex"))
-                .map(|v| crate::deps::version_at_least(&v, "0.146"))
-                .unwrap_or(false)
-            {
-                vec![crate::bridge_dir()]
-            } else {
-                Vec::new()
+            // #163：沙箱模式用户可配置（每 bot BotConfig.codex_sandbox，默认 auto）。热读
+            // config（agent 调用秒级起，读一次 ~KB 文件可接受；读不到/损坏回落 auto）。
+            // auto = 现状（owner→workspace-write(+bridge_dir)、受限→read-only）；显式
+            // 模式（read-only/workspace-write/full-access）用户选择优先，受限会话也尊重。
+            let sandbox = match crate::config::Config::load() {
+                Ok(c) => c
+                    .bots
+                    .iter()
+                    .find(|b| b.key() == bot_key)
+                    .map(|b| b.codex_sandbox)
+                    .unwrap_or_default(),
+                Err(_) => crate::config::CodexSandboxMode::Auto,
             };
+            // roots 按「owner 预算」算好（restrict 时无意义，映射函数按模式取舍）
+            let roots = if restrict {
+                Vec::new()
+            } else {
+                codex_writable_roots(&resolved)
+            };
+            let (use_restrict, roots) = codex_sandbox_params(sandbox, restrict, roots);
             codex_command(
                 &resolved,
                 resume,
                 session_id,
                 extra_args,
-                restrict,
-                &codex_writable_roots,
+                use_restrict,
+                &roots,
             )
         }
         Backend::Claude => {
@@ -2418,6 +2460,61 @@ mod tests {
         let r = codex_command(std::path::Path::new("codex"), true, "tid-2", &[], true, &[]);
         assert!(r.as_std().get_args().any(|a| a == "resume"));
         assert!(r.as_std().get_args().any(|a| a == "tid-2"));
+    }
+
+    #[test]
+    fn codex_sandbox_params_maps_modes() {
+        // #163 模式映射：auto=现状（restrict 原样）、read-only 强制、workspace-write
+        // 强制、full-access 走 bypass（roots 空）。显式选择优先于受限判定。
+        use crate::config::CodexSandboxMode;
+        let roots = vec![std::path::PathBuf::from("~/.agent-bridge")];
+        // auto + owner → 原样（workspace-write + roots）
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::Auto, false, roots.clone()),
+            (false, roots.clone())
+        );
+        // auto + 受限 → read-only（roots 被调用方预算为空，映射原样保留）
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::Auto, true, vec![]),
+            (true, vec![])
+        );
+        // read-only：显式强制（即使 owner 也 read-only）
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::ReadOnly, false, roots.clone()),
+            (true, vec![])
+        );
+        // workspace-write：显式强制（即使受限会话也按用户选择）
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::WorkspaceWrite, true, roots.clone()),
+            (false, roots.clone())
+        );
+        // full-access：roots 清空 → codex_command 走 bypass 分支
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::FullAccess, true, roots.clone()),
+            (false, vec![])
+        );
+    }
+
+    #[test]
+    fn codex_sandbox_mode_serde_roundtrip_and_defaults() {
+        // #163：kebab-case 反序列化 + auto 默认（旧 config 无字段兼容）+ 非 auto 落盘
+        use crate::config::CodexSandboxMode;
+        // 枚举 serde：kebab-case
+        let v: CodexSandboxMode = serde_json::from_str("\"workspace-write\"").unwrap();
+        assert_eq!(v, CodexSandboxMode::WorkspaceWrite);
+        let v: CodexSandboxMode = serde_json::from_str("\"full-access\"").unwrap();
+        assert_eq!(v, CodexSandboxMode::FullAccess);
+        // 未知值 → 反序列化失败（fail-closed，不静默回落）
+        assert!(serde_json::from_str::<CodexSandboxMode>("\"weird\"").is_err());
+        // 序列化 roundtrip
+        assert_eq!(
+            serde_json::to_string(&CodexSandboxMode::ReadOnly).unwrap(),
+            "\"read-only\""
+        );
+        // BotConfig 无该字段 → auto（旧 config 兼容）
+        let cfg: crate::config::BotConfig =
+            serde_json::from_str(r#"{"name":"b1","app_id":"cli_app","app_secret":"s"}"#).unwrap();
+        assert_eq!(cfg.codex_sandbox, CodexSandboxMode::Auto);
     }
 
     #[test]

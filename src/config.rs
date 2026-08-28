@@ -14,6 +14,48 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::PathBuf;
 
+/// #163 codex 沙箱模式（每 bot 可配置，默认 auto）：
+/// - Auto（默认）：保持现状——owner → workspace-write(+bridge_dir)、受限会话 → read-only
+/// - ReadOnly：`--sandbox read-only`（全盘只读）
+/// - WorkspaceWrite：`--sandbox workspace-write` + bridge_dir 可写根
+/// - FullAccess：`--dangerously-bypass-approvals-and-sandbox`（全权限，UI 有警示）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    #[default]
+    Auto,
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+impl CodexSandboxMode {
+    /// config 落盘值（kebab-case，与 serde rename 一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CodexSandboxMode::Auto => "auto",
+            CodexSandboxMode::ReadOnly => "read-only",
+            CodexSandboxMode::WorkspaceWrite => "workspace-write",
+            CodexSandboxMode::FullAccess => "full-access",
+        }
+    }
+
+    /// 从字符串解析（GUI 下拉值/配置读取）。未知值回落 auto（宽松容错，与 backend 同款）。
+    pub fn parse(s: &str) -> CodexSandboxMode {
+        match s {
+            "read-only" => CodexSandboxMode::ReadOnly,
+            "workspace-write" => CodexSandboxMode::WorkspaceWrite,
+            "full-access" => CodexSandboxMode::FullAccess,
+            _ => CodexSandboxMode::Auto,
+        }
+    }
+}
+
+/// #163 默认 codex 沙箱模式（auto）。
+fn default_codex_sandbox() -> CodexSandboxMode {
+    CodexSandboxMode::Auto
+}
+
 /// 单个 bot 的配置。name 是隔离键（决定 workspace/jobs/sessions 子目录）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
@@ -43,6 +85,12 @@ pub struct BotConfig {
     /// per-bot 独立：改飞书 bot 的后端不会再动到微信 bot。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
+    /// #163 codex 沙箱模式（auto 默认；旧 config 无此字段 → auto，兼容不落盘）。
+    #[serde(
+        default = "default_codex_sandbox",
+        skip_serializing_if = "is_auto_sandbox"
+    )]
+    pub codex_sandbox: CodexSandboxMode,
     /// 飞书：**owner（管理员）** 白名单（逗号/分号/空白分隔多个 open_id）。负责管理 bot、
     /// 生成授权码。与「授权者」（granted_ids，授权码添加）分开。微信 bot 忽略。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -166,6 +214,7 @@ impl Default for BotConfig {
             bot_open_id: String::new(),
             primary_chat_id: String::new(),
             backend: String::new(),
+            codex_sandbox: CodexSandboxMode::Auto,
             owner_open_id: String::new(),
             wx_token: String::new(),
             wx_base_url: String::new(),
@@ -238,6 +287,11 @@ pub(crate) fn default_kind() -> String {
 /// skip_serializing_if：false（默认私有）不落盘，旧 config 兼容。
 fn not_open(b: &bool) -> bool {
     !*b
+}
+
+/// #163：codex_sandbox = auto 时不落盘（旧 config 兼容；显示默认值）。
+fn is_auto_sandbox(m: &CodexSandboxMode) -> bool {
+    *m == CodexSandboxMode::Auto
 }
 
 /// #91：mention_default 默认 false（需要 @），false 不落盘（旧 config 兼容）。
