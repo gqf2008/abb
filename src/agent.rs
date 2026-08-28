@@ -872,6 +872,17 @@ fn codex_writable_roots(resolved: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
 }
 
+/// #163 补充（老板拍板）：chat 是否虚拟 Bot 登记群（团队角色群）。虚拟 Bot 默认
+/// workspace-write——团队角色要干活（读写工作区），auto 的「受限→read-only」会卡住
+/// 它们。纯函数便于测试（生产 new()，测试 new_at 注入临时登记表）。
+fn chat_in_virtual_bots(
+    store: &crate::virtualbot::VirtualBotStore,
+    bot_key: &str,
+    chat_id: &str,
+) -> bool {
+    store.load_for(bot_key).iter().any(|v| v.chat_id == chat_id)
+}
+
 /// #163：codex 沙箱模式 → (restricted, writable_roots) 参数映射（可单测纯函数）。
 /// - Auto（默认）：保持现状——restrict 原样（受限会话 read-only）、owner 用预算 roots
 /// - ReadOnly：强制 read-only（显式选择优先，受限会话也尊重）
@@ -1341,6 +1352,19 @@ async fn run_once(
                     .map(|b| b.codex_sandbox)
                     .unwrap_or_default(),
                 Err(_) => crate::config::CodexSandboxMode::Auto,
+            };
+            // #163 补充（老板拍板）：虚拟 Bot（团队角色群）默认 workspace-write——
+            // 团队角色要干活（读写工作区），auto 的「受限→read-only」会卡住它们。
+            // 仅 auto 生效；用户显式配置（read-only/workspace-write/full-access）仍优先。
+            let sandbox = if sandbox == crate::config::CodexSandboxMode::Auto
+                && chat_in_virtual_bots(
+                    &crate::virtualbot::VirtualBotStore::new(),
+                    bot_key,
+                    chat_id,
+                ) {
+                crate::config::CodexSandboxMode::WorkspaceWrite
+            } else {
+                sandbox
             };
             // roots 按「owner 预算」算好（restrict 时无意义，映射函数按模式取舍）
             let roots = if restrict {
@@ -2493,6 +2517,48 @@ mod tests {
             codex_sandbox_params(CodexSandboxMode::FullAccess, true, roots.clone()),
             (false, vec![])
         );
+    }
+
+    #[test]
+    fn virtual_bot_chat_detection_and_default_workspace_write() {
+        // #163 补充（老板拍板）：虚拟 Bot 群默认 workspace-write——auto + 虚拟 Bot chat
+        // → workspace-write（受限会话也尊重团队角色默认）；普通 chat 保持 auto 现状。
+        use crate::config::CodexSandboxMode;
+        let p = std::env::temp_dir().join(format!("abb-vb-sandbox-{}.json", uuid::Uuid::new_v4()));
+        let store = crate::virtualbot::VirtualBotStore::new_at(p.clone());
+        store
+            .add(crate::virtualbot::VirtualBot {
+                bot_key: "bot_a".into(),
+                chat_id: "oc_vb_1".into(),
+                role_name: "T-开发-待任命".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        // 判定：登记群命中、非登记群 miss、跨 bot 不串
+        assert!(chat_in_virtual_bots(&store, "bot_a", "oc_vb_1"));
+        assert!(!chat_in_virtual_bots(&store, "bot_a", "oc_other"));
+        assert!(
+            !chat_in_virtual_bots(&store, "bot_b", "oc_vb_1"),
+            "跨 bot 不串"
+        );
+        // 语义：auto + 虚拟 Bot → workspace-write；auto + 普通 chat → auto 现状
+        let roots = vec![std::path::PathBuf::from("bridge_dir")];
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::Auto, false, roots.clone()),
+            (false, roots.clone()),
+            "普通 chat 的 auto 保持现状（owner workspace-write + roots）"
+        );
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::WorkspaceWrite, true, roots.clone()),
+            (false, roots.clone()),
+            "虚拟 Bot 的 auto 按 workspace-write 走（受限会话也尊重团队角色默认）"
+        );
+        // 显式配置优先：虚拟 Bot 显式 read-only → read-only（覆盖默认）
+        assert_eq!(
+            codex_sandbox_params(CodexSandboxMode::ReadOnly, false, roots),
+            (true, vec![])
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
