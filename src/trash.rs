@@ -359,11 +359,18 @@ fn run_git(
     args: &[&str],
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
-    let mut child = std::process::Command::new("git")
-        .args(args)
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args)
         .current_dir(workspace)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // #152（#104 遗漏）：Windows 托盘 GUI 场景下回收站 git 留痕/归档也闪控制台窗口，
+    // 与 tidy.rs git_commit 同款抑制（CREATE_NO_WINDOW）。
+    #[cfg(windows)]
+    {
+        crate::deps::apply_no_window(&mut cmd);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("git {} 启动失败：{e}", args.join(" ")))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
