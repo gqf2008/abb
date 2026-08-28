@@ -143,6 +143,18 @@ enum UiCmd {
         bot_key: String,
         plan: String,
     },
+    /// #147 任命成员：写团队登记表（member="" = 恢复「待任命」）。结果经 team_rx 回主线程。
+    TeamAppoint {
+        bot_key: String,
+        team_name: String,
+        role_name: String,
+        member: String,
+    },
+    /// #147 解散团队（红色强确认后）：移除全部角色虚拟 Bot 登记 + 归档聊天历史 + 删团队条目。
+    TeamDissolve {
+        bot_key: String,
+        team_name: String,
+    },
 }
 
 /// #141 一键创建团队结果（后台 → 主线程）。
@@ -154,6 +166,10 @@ enum TeamEvt {
     /// 确认建群完成：Ok(逐角色创建结果) / Err(整体错误)。
     Create {
         result: std::result::Result<Vec<(String, String, bool, String)>, String>,
+    },
+    /// #147 团队管理操作完成（任命/解散）：Ok(摘要) / Err(错误文案)。
+    Manage {
+        result: std::result::Result<String, String>,
     },
 }
 
@@ -207,6 +223,15 @@ enum VbAction {
         /// owner open_id（权限不足时发授权指引给 owner；None = 未配置则不提示）。
         owner: Option<String>,
     },
+}
+
+/// #147 解散团队确认弹窗待执行操作（与 VbAction 同款：确认回调 clone 发 UiCmd，
+/// 成功才 take 清空，失败保留可重试）。与 VbAction 共用 vb_confirm 弹窗实例，
+/// 互斥存在（同一时刻只会有一个待操作）。
+#[derive(Clone)]
+enum TeamAction {
+    /// 解散团队：移除全部角色登记 + 归档聊天历史 + 删团队条目（平台群物理保留）。
+    Dissolve { bot_key: String, team_name: String },
 }
 
 /// 依赖安装的结果事件（后台 → 主线程）。
@@ -505,6 +530,50 @@ fn refresh_vb_rows(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     if let Some(bot) = work.borrow().get(sel as usize) {
         w.set_virtual_bots(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             vb_rows_for(bot),
+        ))));
+    }
+}
+
+/// #147 团队列表行：按 bot 读团队登记表（最近创建在前）→ slint 行。
+/// 状态：全角色有群 = 运行中（ok 色）；有角色缺群 = 部分失败（warn 色）。
+fn team_rows_for(bot: &BotConfig) -> Vec<TeamRow> {
+    let mut teams = crate::teamreg::TeamStore::new().load_for(&bot.key());
+    teams.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+    teams
+        .into_iter()
+        .map(|t| {
+            let running = t.running();
+            TeamRow {
+                team_name: t.team_name.clone().into(),
+                role_count: t.roles.len() as i32,
+                status: (if running { "运行中" } else { "部分失败" }).into(),
+                status_ok: running,
+                created_at: format_created(t.created_at).into(),
+                roles: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                    t.roles
+                        .into_iter()
+                        .map(|r| TeamRoleRow {
+                            role_name: r.role_name.into(),
+                            member: r.member.into(),
+                            duty: r.duty.into(),
+                        })
+                        .collect::<Vec<_>>(),
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// 刷新设置窗「团队」列表（#147；选中 bot 维度，热读 teams.json——GUI 与聊天入口
+/// 创建结果双向一致，不双写）。
+fn refresh_team_rows(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    let sel = w.get_selected();
+    if sel < 0 {
+        return;
+    }
+    if let Some(bot) = work.borrow().get(sel as usize) {
+        w.set_teams(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            team_rows_for(bot),
         ))));
     }
 }
@@ -1255,6 +1324,7 @@ pub fn run_gui() -> Result<()> {
     // 虚拟 Bot（#75）：创建/编辑/登记弹窗 + 取消登记/解散群确认弹窗
     let vb_dialog = VirtualBotDialog::new()?;
     let team_dialog = TeamDialog::new()?; // #124 一键创建团队（P2，mock）
+    let appoint_dialog = TeamAppointDialog::new()?; // #147 任命成员小表单
     let vb_confirm = ConfirmDialog::new()?;
     // #74 提醒弹窗：授权者私聊 toast（右上角、5s 自动收起）；创建后一直隐藏，
     // 2s 轮询发现未读时由 show_notifications_window 显示。
@@ -1365,6 +1435,8 @@ pub fn run_gui() -> Result<()> {
     let (team_tx, team_rx) = std_mpsc::channel::<TeamEvt>();
     // #141 团队弹窗上下文：打开时记录 (bot 下标, bot_key)；生成/建群按下标从工作副本取最新 bot。
     let team_ctx: Rc<RefCell<Option<(i32, String)>>> = Rc::new(RefCell::new(None));
+    // #147 任命弹窗上下文：打开时记录 (bot_key, 团队名, 角色名)；确认时按它写团队登记表。
+    let appoint_ctx: Rc<RefCell<Option<(String, String, String)>>> = Rc::new(RefCell::new(None));
     // #141 当前生成的方案 JSON（确认建群时复用，避免二次生成）。
     let team_plan: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     // 虚拟 Bot 弹窗的归属 bot 上下文（bot 下标, bot_key, kind）——打开时记录，
@@ -1374,6 +1446,8 @@ pub fn run_gui() -> Result<()> {
     let vb_edit: Rc<RefCell<VbEditState>> = Rc::new(RefCell::new(VbEditState::default()));
     // 确认弹窗待执行操作（确认回调 take；取消/关闭清空）
     let vb_action: Rc<RefCell<Option<VbAction>>> = Rc::new(RefCell::new(None));
+    // #147 解散团队待执行操作（与 vb_action 互斥共用 vb_confirm 弹窗）
+    let team_action: Rc<RefCell<Option<TeamAction>>> = Rc::new(RefCell::new(None));
     // 确认弹窗：取消 = 清空待执行操作并隐藏
     {
         let cw = vb_confirm.as_weak();
@@ -1386,17 +1460,30 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 确认弹窗：确认 = 执行待操作（按 VbAction 分发到后台线程）。
-    // 执行中不关窗（busy）：结果由 VirtualBotEvt::Done 回填——成功才关，失败在弹窗里
-    // 显示错误（8-20 用户反馈"点了窗口就关了但群还在"——失败必须可见，不能静默）。
+    // 解散团队取消：清空待操作（与 vb_action 互斥，共用同一确认弹窗）
+    {
+        let cw = vb_confirm.as_weak();
+        let team_action = team_action.clone();
+        vb_confirm.on_canceled(move || {
+            team_action.borrow_mut().take();
+            if let Some(c) = cw.upgrade() {
+                let _ = c.hide();
+            }
+        });
+    }
+    // 确认弹窗：确认 = 执行待操作（按 VbAction / TeamAction 分发到后台线程）。
+    // 执行中不关窗（busy）：结果由 VirtualBotEvt::Done / TeamEvt::Manage 回填——
+    // 成功才关，失败在弹窗里显示错误（8-20 用户反馈"点了窗口就关了但群还在"——
+    // 失败必须可见，不能静默）。
     {
         let cw = vb_confirm.as_weak();
         let action = vb_action.clone();
+        let team_action = team_action.clone();
         let tx = tx.clone();
         vb_confirm.on_confirmed(move || {
-            crate::log!("[gui] 虚拟 Bot 确认弹窗：确认");
+            crate::log!("[gui] 确认弹窗：确认");
             // clone 而非 take（8-20 用户反馈：失败态「重试」需要保留 action 重发；
-            // 成功后在 Done 里 take 清空）
+            // 成功后在 Done / Manage 里 take 清空）
             if let Some(a) = action.borrow().clone() {
                 // 有 action：执行中（busy），**不关窗**——结果由 Done 回填（成功态
                 // 才可点「知道了」关闭；失败态「重试」保留 action）。曾残留旧 hide()
@@ -1425,6 +1512,18 @@ pub fn run_gui() -> Result<()> {
                         chat_id,
                         owner,
                     },
+                });
+            } else if let Some(ta) = team_action.borrow().clone() {
+                // #147 解散团队：结果经 TeamEvt::Manage 回填（成功才关，失败可重试）
+                if let Some(c) = cw.upgrade() {
+                    c.set_busy(true);
+                    c.set_failed(false);
+                    c.set_message("正在解散团队…".into());
+                }
+                let _ = tx.send(match ta {
+                    TeamAction::Dissolve { bot_key, team_name } => {
+                        UiCmd::TeamDissolve { bot_key, team_name }
+                    }
                 });
             } else {
                 // 无 action（成功态点「知道了」）：关窗，不动 dock（8-20 用户反馈）
@@ -1539,6 +1638,8 @@ pub fn run_gui() -> Result<()> {
         push_perms_to_window(w);
         // 虚拟 Bot 登记列表（#75）：按选中 bot 刷新
         refresh_vb_rows(w, work);
+        // #147 团队列表：按选中 bot 刷新（热读 teams.json）
+        refresh_team_rows(w, work);
     }
 
     /// 装载设置窗：发现比正式配置新的草稿 → 静默恢复（返回 true，标记 dirty 并给一行提示）；
@@ -2059,6 +2160,8 @@ pub fn run_gui() -> Result<()> {
                                 .map(|v| v.role_name)
                                 .unwrap_or_else(|| chat_id.clone());
                             let ok = store.remove(&bot_key, &chat_id);
+                            // #147 双向一致：取消登记 → 团队条目对应角色 chat_id 清空（状态转「部分失败」）
+                            crate::teamreg::TeamStore::new().clear_chat(&bot_key, &chat_id);
                             let result = if ok {
                                 Ok("已取消登记（群保留）".to_string())
                             } else {
@@ -2110,6 +2213,9 @@ pub fn run_gui() -> Result<()> {
                             let mut result = match r {
                                 Ok(()) => {
                                     store.remove(&bot_key, &chat_id);
+                                    // #147 双向一致：解散群 → 团队条目对应角色 chat_id 清空
+                                    crate::teamreg::TeamStore::new()
+                                        .clear_chat(&bot_key, &chat_id);
                                     // 解散成功同样归档会话历史（与事件/刷新路径一致——
                                     // 8-20 用户追问后补：三路径统一，历史移入 archive/）
                                     let archived =
@@ -2294,6 +2400,9 @@ pub fn run_gui() -> Result<()> {
                                         if gone {
                                             let removed =
                                                 VirtualBotStore::new().remove(&bot_key, &reg.chat_id);
+                                            // #147 双向一致：平台解散刷新发现 → 团队角色 chat_id 清空
+                                            crate::teamreg::TeamStore::new()
+                                                .clear_chat(&bot_key, &reg.chat_id);
                                             let archived = VirtualBotStore::archive_chat_history(
                                                 &bot_key,
                                                 &reg.chat_id,
@@ -2442,6 +2551,25 @@ pub fn run_gui() -> Result<()> {
                                     &plan,
                                 )
                                 .await;
+                                // #147：建群完成后登记团队（GUI ↔ 聊天入口同一份数据源；
+                                // 部分成功也登记，重试时 register_created 合并补建成功的角色）
+                                if outcomes.iter().any(|o| o.ok) {
+                                    let store = crate::virtualbot::VirtualBotStore::new();
+                                    let regs = crate::teamreg::role_regs_from_plan(
+                                        &plan,
+                                        &store,
+                                        &bot_key,
+                                    );
+                                    if let Err(e) = crate::teamreg::TeamStore::new()
+                                        .register_created(&bot_key, &plan.team_name, regs)
+                                    {
+                                        crate::log!(
+                                            "[gui] 团队登记失败 bot={} team={}: {e}",
+                                            bot_key,
+                                            plan.team_name
+                                        );
+                                    }
+                                }
                                 let rows: Vec<(String, String, bool, String)> = outcomes
                                     .into_iter()
                                     .map(|o| (o.role_name, o.member, o.ok, o.detail))
@@ -2451,6 +2579,61 @@ pub fn run_gui() -> Result<()> {
                             .await;
                             let _ = team_tx.send(TeamEvt::Create { result: r });
                             let _ = idx;
+                        });
+                    }
+                    // #147 任命成员：只写团队登记表（成员元数据；建群/寻址仍走 virtual-bots.json）
+                    UiCmd::TeamAppoint {
+                        bot_key,
+                        team_name,
+                        role_name,
+                        member,
+                    } => {
+                        let team_tx = team_tx.clone();
+                        tokio::spawn(async move {
+                            let r = crate::teamreg::TeamStore::new()
+                                .set_member(&bot_key, &team_name, &role_name, &member)
+                                .map(|()| {
+                                    if member.trim().is_empty() {
+                                        format!("已恢复「{role_name}」为待任命")
+                                    } else {
+                                        format!("已任命 {member} 为「{role_name}」")
+                                    }
+                                });
+                            let _ = team_tx.send(TeamEvt::Manage { result: r });
+                        });
+                    }
+                    // #147 解散团队：逐个移除角色虚拟 Bot 登记 + 归档聊天历史 + 删团队条目。
+                    // 平台群物理保留（钉钉无解散 API，飞书单群解散走虚拟 Bot 列表的「解散群」）。
+                    UiCmd::TeamDissolve { bot_key, team_name } => {
+                        let team_tx = team_tx.clone();
+                        tokio::spawn(async move {
+                            let r = async {
+                                let store = crate::virtualbot::VirtualBotStore::new();
+                                let team = crate::teamreg::TeamStore::new()
+                                    .find(&bot_key, &team_name)
+                                    .ok_or_else(|| "团队不存在（可能已解散）".to_string())?;
+                                let mut removed = 0usize;
+                                let mut archived = 0usize;
+                                for role in &team.roles {
+                                    if role.chat_id.is_empty() {
+                                        continue;
+                                    }
+                                    if store.remove(&bot_key, &role.chat_id) {
+                                        removed += 1;
+                                    }
+                                    archived += crate::virtualbot::VirtualBotStore::
+                                        archive_chat_history(&bot_key, &role.chat_id);
+                                }
+                                if !crate::teamreg::TeamStore::new().remove(&bot_key, &team_name)
+                                {
+                                    return Err("团队条目移除失败（可能已被删除）".to_string());
+                                }
+                                Ok(format!(
+                                    "团队「{team_name}」已解散：移除 {removed} 个角色登记，归档 {archived} 个聊天历史文件（平台群保留）"
+                                ))
+                            }
+                            .await;
+                            let _ = team_tx.send(TeamEvt::Manage { result: r });
                         });
                     }
                 }
@@ -2903,6 +3086,9 @@ pub fn run_gui() -> Result<()> {
                 // 虚拟 Bot 登记列表按选中 bot 刷新 + 收起 ⋯ 菜单（切 bot 残留展开态会串行）
                 refresh_vb_rows(&w, &work);
                 w.set_vb_menu_open(-1);
+                // #147 团队列表按选中 bot 刷新 + 收起团队 ⋯ 菜单
+                refresh_team_rows(&w, &work);
+                w.set_team_menu_open(-1);
             }
         });
     }
@@ -3336,6 +3522,150 @@ pub fn run_gui() -> Result<()> {
             )))));
             d.set_busy(false);
             show_window_and_focus(&d);
+        });
+    }
+    // #147 任命成员：打开小表单弹窗（预填当前成员；确认后发 TeamAppoint 写团队登记表）
+    {
+        let sw = settings.as_weak();
+        let work = work.clone();
+        let dlg = appoint_dialog.as_weak();
+        let ctx = appoint_ctx.clone();
+        settings.on_team_appoint(move |team_idx, role_idx| {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            let Some(bot) = b.get(sel as usize) else {
+                return;
+            };
+            let teams = crate::teamreg::TeamStore::new().load_for(&bot.key());
+            let Some(team) = teams.get(team_idx as usize) else {
+                return;
+            };
+            let Some(role) = team.roles.get(role_idx as usize) else {
+                return;
+            };
+            *ctx.borrow_mut() = Some((bot.key(), team.team_name.clone(), role.role_name.clone()));
+            let bot_label = if bot.name.is_empty() {
+                kind_label(&bot.kind)
+            } else {
+                bot.name.clone()
+            };
+            if let Some(d) = dlg.upgrade() {
+                d.set_team_label(format!("{}（{}）", team.team_name, bot_label).into());
+                d.set_role_name(role.role_name.clone().into());
+                d.set_member_input(role.member.clone().into());
+                d.set_window_title("任命成员".into());
+                show_window_and_focus(&d);
+            }
+        });
+    }
+    // #147 跳转角色群：打开对应平台会话（复用 open-url 回调；未建成角色 = 部分失败，提示不跳）
+    {
+        let sw = settings.as_weak();
+        let work = work.clone();
+        settings.on_team_jump(move |team_idx, role_idx| {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            let Some(bot) = b.get(sel as usize) else {
+                return;
+            };
+            let teams = crate::teamreg::TeamStore::new().load_for(&bot.key());
+            let Some(team) = teams.get(team_idx as usize) else {
+                return;
+            };
+            let Some(role) = team.roles.get(role_idx as usize) else {
+                return;
+            };
+            if role.chat_id.is_empty() {
+                w.set_status_is_error(true);
+                w.set_status_line(
+                    format!(
+                        "角色「{}」未建成角色群（部分失败），无法跳转",
+                        role.role_name
+                    )
+                    .into(),
+                );
+                return;
+            }
+            let link = match bot.kind.as_str() {
+                "dingtalk" => format!(
+                    "dingtalk://dingtalkclient/action/openchat?chatid={}",
+                    role.chat_id
+                ),
+                _ => format!(
+                    "https://applink.feishu.cn/client/chat/open?chatId={}",
+                    role.chat_id
+                ),
+            };
+            crate::log!(
+                "[gui] 跳转角色群 bot={} chat={}",
+                bot.key(),
+                crate::agent::truncate(&role.chat_id, 12)
+            );
+            w.invoke_open_url(link.into());
+        });
+    }
+    // #147 解散团队：红色强确认（与虚拟 Bot 解散同款纪律）→ 发 TeamDissolve
+    {
+        let sw = settings.as_weak();
+        let work = work.clone();
+        let team_action = team_action.clone();
+        let confirm = vb_confirm.as_weak();
+        settings.on_team_dissolve(move |team_idx| {
+            let Some(w) = sw.upgrade() else { return };
+            let sel = w.get_selected();
+            let b = work.borrow();
+            let Some(bot) = b.get(sel as usize) else { return };
+            let teams = crate::teamreg::TeamStore::new().load_for(&bot.key());
+            let Some(team) = teams.get(team_idx as usize) else { return };
+            *team_action.borrow_mut() = Some(TeamAction::Dissolve {
+                bot_key: bot.key(),
+                team_name: team.team_name.clone(),
+            });
+            if let Some(c) = confirm.upgrade() {
+                c.set_title_text("解散团队（不可恢复）".into());
+                c.set_message(
+                    format!(
+                        "将解散团队「{}」（{} 个角色）：移除全部角色登记并归档聊天记录（平台群保留、不再受 ABB 管理）。此操作不可恢复，确认继续？",
+                        team.team_name,
+                        team.roles.len()
+                    )
+                    .into(),
+                );
+                c.set_confirm_text("解散团队".into());
+                c.set_cancel_text("取消".into());
+                c.set_danger(true); // 红色强确认
+                show_window_and_focus(&c);
+            }
+        });
+    }
+    // #147 任命弹窗：确认 → 发 TeamAppoint（留空 = 恢复待任命）；取消 → 隐藏
+    {
+        let dlg = appoint_dialog.as_weak();
+        let ctx = appoint_ctx.clone();
+        let tx = tx.clone();
+        appoint_dialog.on_confirm_clicked(move || {
+            let Some(d) = dlg.upgrade() else { return };
+            let Some((bot_key, team_name, role_name)) = ctx.borrow().clone() else {
+                return;
+            };
+            let member = d.get_member_input().trim().to_string();
+            let _ = tx.send(UiCmd::TeamAppoint {
+                bot_key,
+                team_name,
+                role_name,
+                member,
+            });
+            let _ = d.hide();
+        });
+    }
+    {
+        let dlg = appoint_dialog.as_weak();
+        appoint_dialog.on_cancel_clicked(move || {
+            if let Some(d) = dlg.upgrade() {
+                let _ = d.hide();
+            }
         });
     }
     // 生成方案（#141 真实链路）：发 UiCmd::TeamGenerate，后台 LLM 生成，结果经 team_rx 回填。
@@ -4445,6 +4775,50 @@ pub fn run_gui() -> Result<()> {
                                     }
                                 }
                             }
+                            // #147：建群完成 → 刷新团队列表（GUI 与聊天入口同源，热读即同步）
+                            if let Some(w) = settings_weak.upgrade() {
+                                refresh_team_rows(&w, &work);
+                                refresh_vb_rows(&w, &work);
+                            }
+                        }
+                        // #147 团队管理（任命/解散）结果：状态行展示；解散后同时刷新登记列表
+                        TeamEvt::Manage { result } => {
+                            if let Some(w) = settings_weak.upgrade() {
+                                match &result {
+                                    Ok(msg) => {
+                                        w.set_status_is_error(false);
+                                        w.set_status_line(msg.clone().into());
+                                    }
+                                    Err(e) => {
+                                        w.set_status_is_error(true);
+                                        w.set_status_line(e.clone().into());
+                                    }
+                                }
+                                refresh_team_rows(&w, &work);
+                                refresh_vb_rows(&w, &work);
+                            }
+                            // 解散团队确认弹窗回填（与虚拟 Bot Done 同款纪律：成功才关、
+                            // 失败保留 action 可重试；任命走 AppointDialog 不涉及这里）
+                            if let Some(c) = vb_confirm_weak.upgrade() {
+                                if c.get_busy() {
+                                    match &result {
+                                        Ok(msg) => {
+                                            c.set_busy(false);
+                                            c.set_failed(false);
+                                            c.set_message(msg.clone().into());
+                                            c.set_confirm_text("知道了".into());
+                                            team_action.borrow_mut().take();
+                                        }
+                                        Err(e) => {
+                                            c.set_busy(false);
+                                            c.set_failed(true);
+                                            c.set_message(e.clone().into());
+                                            c.set_confirm_text("重试".into());
+                                            // action 保留：再点「重试」重发同一解散
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -4519,6 +4893,8 @@ pub fn run_gui() -> Result<()> {
                                 );
                                 // 登记表已变（建群/登记/取消/解散都写文件）→ 刷新列表
                                 refresh_vb_rows(&w, &work);
+                                // #147 团队列表同步刷新（取消登记/解散群可能清角色 chat_id）
+                                refresh_team_rows(&w, &work);
                             }
                         }
                         VirtualBotEvt::Fetched {
