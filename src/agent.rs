@@ -2665,28 +2665,79 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn kill_agent_tree_kills_grandchild_on_windows() {
-        let mut child = match tokio::process::Command::new("cmd")
-            .args(["/C", "ping -n 120 127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return,
+        // #150 竞态回归（#156 P2 修复）：断言必须真实反映「孙进程是否残留」。
+        // 孙进程持久构造：`start ping` 产生独立进程（不随主进程死），`& ping` 让
+        // cmd 阻塞保持主进程存活。主进程被杀后 start 的 ping 成孤儿继续跑——
+        // 只有 taskkill /T 递归能杀到，正是 kill_agent_tree 的行为判据。
+        /// 轮询等待孙进程（start ping）出现：并行测试负载高时固定 sleep 可能不够。
+        fn wait_ping_ready() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while ping_count() < 1 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        fn spawn_tree() -> tokio::process::Child {
+            tokio::process::Command::new("cmd")
+                .args(["/C", "start ping -n 120 127.0.0.1 & ping -n 120 127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn cmd 应成功")
+        }
+        fn ping_count() -> usize {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", "IMAGENAME eq ping.exe"])
+                .output()
+                .expect("tasklist 应可执行");
+            // #156 P2：tasklist 进程名为大写（PING.EXE），lowercase 后统一匹配
+            String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .matches("ping.exe")
+                .count()
+        }
+
+        // ① 基线：只杀主进程（taskkill 未执行 = 竞态中 taskkill 来晚的确定结果）→
+        //    孙进程必须存活——若此处 FAIL 说明构造/断言失效（恒真防线），测试无意义。
+        let mut base = spawn_tree();
+        wait_ping_ready(); // 轮询等孙进程出现（并行负载下固定 sleep 不可靠）
+        let bpid = base.id();
+        let fut = async {
+            let _ = base.kill().await;
+            let _ = base.wait().await;
         };
+        tokio::runtime::Runtime::new().unwrap().block_on(fut);
+        let _ = bpid;
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let base_left = ping_count();
+        assert!(
+            base_left >= 1,
+            "基线断言：主进程被杀后孙进程应存活（{base_left} 个）——否则断言恒真失效"
+        );
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "ping.exe", "/F"])
+            .status();
+
+        // ② 修复版 kill_agent_tree：taskkill /T 同步完成后杀主 → 孙进程必死
+        let mut child = spawn_tree();
+        wait_ping_ready();
         let pid = child.id();
         let fut = kill_agent_tree(pid, &mut child);
         tokio::runtime::Runtime::new().unwrap().block_on(fut);
-        // 给 taskkill 一点落地时间（已同步等待，这里只是等系统清进程表）
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq ping.exe"])
-            .output()
-            .expect("tasklist 应可执行");
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            !text.contains("ping.exe"),
-            "孙进程 ping 应被 taskkill /T 递归杀掉（#150 竞态回归）: {text}"
-        );
+        // 轮询等孙进程归零（taskkill 同步已保证执行完，这里只是等系统清进程表；
+        // 并行负载下固定 sleep 不可靠）。修复前（.spawn() 竞态）taskkill 失效 → 永不归零 → FAIL。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let left = ping_count();
+            if left == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                assert!(
+                    left == 0,
+                    "孙进程 ping 应被 taskkill /T 递归杀掉（#150 竞态回归）: 残留 {left} 个"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 }
