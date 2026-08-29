@@ -571,20 +571,25 @@ pub fn set_autostart(_enable: bool) -> Result<()> {
 /// 在新增平铺文件时静默分叉：闸门漏判 → dest 不建 → rename 静默失败数据搁浅）。
 const LEGACY_FLAT_FILES: [&str; 2] = ["sessions.json", "jobs.json"];
 
-pub fn migrate_legacy_state(bot_key: &str) {
-    let base = crate::bridge_dir();
-    let dest = crate::workspace_dir(bot_key);
-    // #178：只有确有旧数据要搬时才建 dest——无条件预建空目录会抢跑 service 的
-    // 隔离键迁移（migrate_keys 见目标已存在跳过 rename），旧工作区数据搁浅
-    //（2026-08-29 老板真机：GUI 启动预建空目录致庆小丰整目录未迁移）。
+pub fn migrate_legacy_state(bot: &crate::config::BotConfig) {
+    migrate_legacy_state_at(&crate::bridge_dir(), bot);
+}
+
+/// 内部实现（base 可注入，单测不碰真实 ~/.agent-bridge）。
+fn migrate_legacy_state_at(base: &std::path::Path, bot: &crate::config::BotConfig) {
+    let new_key = bot.key();
+    let dest = base.join("workspaces").join(&new_key);
+    // #187：旧数据候选有三处——平铺 json、旧 workspace/ 目录、workspaces/<legacy_key>/
+    //（#174 旧隔离键布局）。任一存在才建 dest（#178：无条件预建空目录会搁浅数据）。
     let old_ws = base.join("workspace");
     let flat_pending = LEGACY_FLAT_FILES.iter().any(|f| base.join(f).exists());
-    if old_ws.is_dir() || flat_pending {
+    let legacy_dir = base.join("workspaces").join(bot.legacy_key());
+    let legacy_dir_pending = legacy_dir.is_dir() && legacy_dir != dest;
+    if old_ws.is_dir() || flat_pending || legacy_dir_pending {
         let _ = std::fs::create_dir_all(&dest);
     }
 
     // 旧 workspace/ 目录内容搬入 workspaces/<key>/
-    let old_ws = base.join("workspace");
     if old_ws.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&old_ws) {
             for e in entries.flatten() {
@@ -604,7 +609,25 @@ pub fn migrate_legacy_state(bot_key: &str) {
             let _ = std::fs::rename(&from, &to);
         }
     }
-    crate::log!("[migrate] 旧单 bot 数据已并入 workspaces/{bot_key}/（幂等）");
+    // #187：隔离键旧目录折入——GUI 先于 service 跑时，把 workspaces/<legacy_key>/
+    // 逐项并入 dest（绝不覆盖已有项），service 的 migrate_keys 不再被非空 dest 拦住
+    //（#178 修复后只响亮跳过，数据照样搁浅）；service 先跑时旧目录已被 rename 成
+    // dest，此步自然 no-op。两序皆收敛，平铺/目录两类遗留都不搁浅。
+    // 该旧目录只属于本 bot（flat 遗留是单 bot 时代的产物，归 bots.first()——与
+    // ui.rs 只对首 bot 调用本函数一致；bot2+ 的隔离键迁移由 service 的 migrate_keys
+    // 负责，GUI 不越界）。逐项搬移天然幂等且不覆盖，可安全重入。
+    if legacy_dir_pending {
+        if let Ok(entries) = std::fs::read_dir(&legacy_dir) {
+            for e in entries.flatten() {
+                let to = dest.join(e.file_name());
+                if !to.exists() {
+                    let _ = std::fs::rename(e.path(), &to);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&legacy_dir); // 仅当空了才成功
+    }
+    crate::log!("[migrate] 旧单 bot 数据已并入 workspaces/{new_key}/（幂等）");
 }
 
 /// 一次性数据迁移：改名 feishu-bridge → agent-bridge，数据目录 `~/feishu-bridge` → `~/.agent-bridge`。
@@ -673,5 +696,68 @@ fn rewrite_workspace_guides(workspaces: &std::path::Path) {
             // 内容相同跳过写盘（共享 helper，避免无谓重写）
             let _ = crate::atomic_write_text_if_changed(&p, &new);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_bot() -> crate::config::BotConfig {
+        crate::config::BotConfig::for_test("旧名bot", "cli_newkey123456")
+    }
+
+    /// #187 回归护栏（GUI 先行序）：平铺遗留 + 隔离键旧目录同时存在 → GUI 的
+    /// legacy 迁移把两路数据都并入 dest、旧目录消失——service 的隔离键迁移不再
+    /// 被非空 dest 拦住（#178 修复后只会响亮跳过，数据照样搁浅）。
+    #[test]
+    fn migrate_legacy_state_folds_isolated_legacy_dir_gui_first() {
+        let base = std::env::temp_dir().join(format!("abb-legacy-gui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
+        std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
+        std::fs::write(base.join("sessions.json"), r#"{"a":1}"#).unwrap();
+
+        let b = legacy_bot();
+        migrate_legacy_state_at(&base, &b);
+
+        // dest 同时收到两路数据（隔离键旧目录 + 平铺）
+        assert!(
+            base.join("workspaces/cli_newkey123456/pending.json")
+                .exists(),
+            "隔离键旧目录内容必须折入 dest"
+        );
+        assert!(
+            base.join("workspaces/cli_newkey123456/sessions.json")
+                .exists(),
+            "平铺遗留必须落入 dest"
+        );
+        // 旧目录已折入消失：service 的 migrate_keys 无事可做，无搁浅
+        //（service 序的收敛性由 config::migrate_keys 幂等测试覆盖）
+        assert!(!base.join("workspaces/旧名bot").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #187 回归护栏（service 先行序）：旧目录已被 service rename 成 dest →
+    /// GUI 的 fold 自然 no-op（不重建旧目录），平铺数据直接落 dest。两序收敛。
+    #[test]
+    fn migrate_legacy_state_after_service_rename_noop_fold() {
+        let base = std::env::temp_dir().join(format!("abb-legacy-svc-{}", uuid::Uuid::new_v4()));
+        // 模拟 service 已完成隔离键迁移：dest 已带数据、旧目录不存在
+        std::fs::create_dir_all(base.join("workspaces/cli_newkey123456")).unwrap();
+        std::fs::write(base.join("workspaces/cli_newkey123456/pending.json"), "[]").unwrap();
+        // 平铺遗留还在（GUI 从未跑过）
+        std::fs::write(base.join("jobs.json"), r#"[]"#).unwrap();
+
+        migrate_legacy_state_at(&base, &legacy_bot());
+
+        assert!(
+            base.join("workspaces/cli_newkey123456/jobs.json").exists(),
+            "平铺遗留必须落 dest"
+        );
+        assert!(
+            !base.join("workspaces/旧名bot").exists(),
+            "fold 不得重建旧目录（service 已 rename 走，no-op）"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
