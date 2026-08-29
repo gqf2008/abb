@@ -1047,7 +1047,10 @@ mod tests {
     /// #191 回归护栏（信号路径）：SIGTERM 到达返回 true（真实信号，调用方记日志）。
     /// 给测试进程自己发 SIGTERM——tokio 信号处理器已捕获，进程不死，仅本测试的
     /// helper 收到事件。三个信号测试共享 SIGNAL_TEST_LOCK 串行化（独立审查 F1）：
-    /// 并行时发出的 SIGTERM 可能被其他测试 helper 的注册/parked 窗口消费致偶发 flake。
+    /// 并行时发出的 SIGTERM 可能被别的测试 helper 的注册/parked 窗口消费致偶发 flake。
+    /// 仅 unix：libc::kill 是 unix API（Windows CI 编译炸，#192 教训；false 路径
+    /// 两测跨平台仍跑）。
+    #[cfg(unix)]
     #[tokio::test]
     async fn wait_exit_signal_or_shutdown_returns_true_on_sigterm() {
         let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
