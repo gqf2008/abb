@@ -503,8 +503,9 @@ pub async fn run(
     };
 
     // #171 档位变化感知：会话创建时记录档位；resume 旧会话的记录档位 ≠ 当前配置 →
-    // 提示用户 /new 换新会话（旧会话 resume 继承创建时档位，#145 codex 技术限制，
-    // 改档位对旧会话不生效——不提示会静默继续旧沙箱，用户以为改了就生效）。
+    // 提示一次（#185：#180 起 resume 按当前解析档位运行，记录随即覆盖为本轮档位，
+    // 文案与实际一致、至多提示一次；旧版 codex <0.150 resume 无 bypass 支持仍会
+    // 静默降级 read-only——宁严勿松，#180 版本门控的已知限制）。
     // 记在 session_key 槽位（与 ensure_with_started/mark_started_if 同 key，#14）。
     // sessions=None（定时任务/会话归纳）不感知；pi 无沙箱体系不感知。
     let sandbox_change_hint = if matches!(backend, Backend::Claude | Backend::Codex) {

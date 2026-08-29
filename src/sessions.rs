@@ -302,11 +302,19 @@ impl SessionStore {
                 self.save_locked(&data);
                 None
             }
-            Some(recorded) if recorded != *mode => Some(format!(
-                "⚠️ 权限档位已变化：当前配置为「{}」，本会话仍按创建时的「{}」运行（resume 会话档位在创建时固定）。回复 /new 换新会话后生效。",
-                mode.as_str(),
-                recorded.as_str()
-            )),
+            Some(recorded) if recorded != *mode => {
+                // #185：#180 起 resume 按当前解析档位运行（全权限档位还会追加
+                // bypass），旧文案「仍按创建时档位」与现实相反；且「变化不覆盖记录」
+                // 语义下记录恒旧 → 每条消息都提示一次。改为：提示一次 + 记录即
+                // 覆盖为本轮档位（本轮确实按它跑）——提示至多一次、文案与实际一致。
+                slot.sandbox_mode = Some(*mode);
+                self.save_locked(&data);
+                Some(format!(
+                    "⚠️ 权限档位已变化：本轮起按当前配置「{}」运行（此前记录为「{}」）。",
+                    mode.as_str(),
+                    recorded.as_str()
+                ))
+            }
             Some(_) => None,
         }
     }
@@ -636,8 +644,9 @@ mod tests {
 
     #[test]
     fn sandbox_mode_change_detection() {
-        // #171：新会话记录档位不提示；档位变化对 resume 会话提示且不覆盖记录；
-        // 同档位不提示；落盘可重载（记录持久化）。
+        // #171 建立感知、#185 修正语义：#180 起 resume 按当前解析档位运行——
+        // 档位变化提示一次（文案=本轮起按新档位），记录随即覆盖；同档位不提示；
+        // 记录持久化（提示一次后重载也不再提示）。
         let dir = std::env::temp_dir().join(format!("abb-sessions-sb-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
@@ -657,27 +666,30 @@ mod tests {
             None,
             "同档位不提示"
         );
-        // 档位变化 → 提示且引导 /new
+        // 档位变化 → 提示一次，文案与实际一致（本轮起按新档位）
         let hint = store
             .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
             .expect("档位变化应提示");
-        assert!(hint.contains("/new"), "提示应引导换新会话：{hint}");
+        assert!(hint.contains("本轮起"), "提示应说明本轮起按新档位：{hint}");
+        assert!(
+            !hint.contains("仍按创建时"),
+            "不得再声称按旧档位运行：{hint}"
+        );
         assert!(hint.contains("read-only"), "提示应说明旧档位：{hint}");
         assert!(hint.contains("full-access"), "提示应说明新档位：{hint}");
-        // 记录不覆盖：变化持续可感知（用户 /new 前不得静默吞掉差异）
-        assert!(
-            store
-                .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
-                .is_some(),
-            "记录不覆盖：变化持续提示"
+        // 记录已覆盖为本轮档位：提示至多一次（#185，旧语义「变化持续提示」与
+        // #180 的实际运行档位相反且每条消息刷屏）
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::FullAccess),
+            None,
+            "记录已覆盖：同档位后续不提示"
         );
-        // 落盘持久化：重载后仍感知变化
+        // 落盘持久化：重载后记录已是新档位，不再提示
         let store2 = SessionStore::new_at("codex", path.clone());
-        assert!(
-            store2
-                .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
-                .is_some(),
-            "重载后仍感知档位变化"
+        assert_eq!(
+            store2.check_sandbox_mode("oc_x", &SandboxMode::FullAccess),
+            None,
+            "重载后记录已覆盖，不再提示"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
