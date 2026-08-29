@@ -502,6 +502,17 @@ pub async fn run(
         crate::config::SandboxMode::Auto
     };
 
+    // #171 档位变化感知：会话创建时记录档位；resume 旧会话的记录档位 ≠ 当前配置 →
+    // 提示用户 /new 换新会话（旧会话 resume 继承创建时档位，#145 codex 技术限制，
+    // 改档位对旧会话不生效——不提示会静默继续旧沙箱，用户以为改了就生效）。
+    // 记在 session_key 槽位（与 ensure_with_started/mark_started_if 同 key，#14）。
+    // sessions=None（定时任务/会话归纳）不感知；pi 无沙箱体系不感知。
+    let sandbox_change_hint = if matches!(backend, Backend::Claude | Backend::Codex) {
+        sessions.and_then(|s| s.check_sandbox_mode(session_key, &sandbox))
+    } else {
+        None
+    };
+
     // 受限会话：生成/刷新 guard 文件（claude settings.json hook）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
     //（返回用户可见错误，不静默降级成全权限）。
@@ -567,9 +578,15 @@ pub async fn run(
                 if let Some(tid) = &out.thread_id {
                     sid = adopt_thread_id(backend, sid, tid, sessions, session_key);
                 }
+                // #171：档位变化提示附在回复尾部（不改变 agent 行为，仅告知换 /new）。
+                let mut reply = out.reply;
+                if let Some(hint) = &sandbox_change_hint {
+                    reply.push_str("\n\n");
+                    reply.push_str(hint);
+                }
                 // pi 不用回存：--session-id 直接用桥的 UUID，首轮就固定（无需 thread_id）
                 return Ok(RunOutcome::Reply {
-                    reply: out.reply,
+                    reply,
                     session_id: sid,
                     rebuilt,
                 });

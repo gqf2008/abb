@@ -418,11 +418,13 @@ mod tests {
                 claude: crate::sessions::Slot {
                     session_id: format!("sid_{key}"),
                     started: true,
+                    ..Default::default()
                 },
                 // pi 槽位同 sid：cleanup 按槽位 sid 精确删会话文件
                 pi: crate::sessions::Slot {
                     session_id: format!("sid_{key}"),
                     started: true,
+                    ..Default::default()
                 },
                 ..Default::default()
             },
