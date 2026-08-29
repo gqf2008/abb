@@ -1096,12 +1096,12 @@ impl Config {
         self.migrate_keys_at(&crate::bridge_dir());
     }
 
-    /// 目录是否为空（不存在/读取失败一律 false——宁可跳过也不碰拿不准的目录，防误删）。
-    /// migrate_keys 的空目标判定用（#178）。
-    fn is_empty_dir(p: &std::path::Path) -> bool {
-        std::fs::read_dir(p)
-            .map(|mut it| it.next().is_none())
-            .unwrap_or(false)
+    /// 目录是否为空：Ok(true)=空、Ok(false)=非空、Err=读取失败（不存在/权限等）。
+    /// migrate_keys 的空目标判定用（#178）。读失败与「非空」分开——两者处置不同
+    ///（读失败=环境异常，日志要能区分），沉默跳过会把搁浅伪装成成功。
+    fn dir_empty(p: &std::path::Path) -> std::io::Result<bool> {
+        let mut it = std::fs::read_dir(p)?;
+        Ok(it.next().is_none())
     }
 
     /// migrate_keys 的内部实现（base 目录可注入，单测用临时目录不碰真实数据）。
@@ -1129,17 +1129,62 @@ impl Config {
                 if !old_p.exists() {
                     continue;
                 }
+                // 目标已存在时的处置（#178）：
+                // - 空目标：继续 rename（迁移是一次性的，空目录抢占不得搁浅旧数据）
+                // - 非空目标：响亮跳过（可能已有数据，绝不覆盖——沉默跳过会把搁浅伪装成成功）
+                // - 读失败：响亮跳过（环境异常，区别于非空，日志可分辨）
+                // POSIX：rename 原子替换空目录，单步完成（探测+删除会放大竞态窗口，审查发现）；
+                // Windows：rename 不覆盖已存在目录，必须先确认空再移除。
+                #[cfg(not(windows))]
                 if new_p.exists() {
-                    if !Self::is_empty_dir(&new_p) {
-                        continue;
+                    match Self::dir_empty(&new_p) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            crate::log!(
+                                "[config] ⚠️ 迁移跳过：目标 {} 非空（不覆盖），旧目录 {} 数据搁浅",
+                                new_p.display(),
+                                old_p.display()
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            crate::log!(
+                                "[config] ⚠️ 迁移跳过：目标 {} 不可读（{e}），旧目录 {} 数据搁浅",
+                                new_p.display(),
+                                old_p.display()
+                            );
+                            continue;
+                        }
                     }
-                    // Windows rename 不覆盖已存在目录，先移除空目标再 rename
-                    if let Err(e) = std::fs::remove_dir(&new_p) {
-                        crate::log!(
-                            "[config] ⚠️ 迁移移除空目录 {} 失败: {e:#}（数据仍在旧目录）",
-                            new_p.display()
-                        );
-                        continue;
+                }
+                #[cfg(windows)]
+                if new_p.exists() {
+                    match Self::dir_empty(&new_p) {
+                        Ok(true) => {
+                            if let Err(e) = std::fs::remove_dir(&new_p) {
+                                crate::log!(
+                                    "[config] ⚠️ 迁移移除空目录 {} 失败: {e:#}（数据仍在旧目录）",
+                                    new_p.display()
+                                );
+                                continue;
+                            }
+                        }
+                        Ok(false) => {
+                            crate::log!(
+                                "[config] ⚠️ 迁移跳过：目标 {} 非空（不覆盖），旧目录 {} 数据搁浅",
+                                new_p.display(),
+                                old_p.display()
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            crate::log!(
+                                "[config] ⚠️ 迁移跳过：目标 {} 不可读（{e}），旧目录 {} 数据搁浅",
+                                new_p.display(),
+                                old_p.display()
+                            );
+                            continue;
+                        }
                     }
                 }
                 if let Err(e) = std::fs::rename(&old_p, &new_p) {

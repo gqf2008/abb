@@ -567,6 +567,10 @@ pub fn set_autostart(_enable: bool) -> Result<()> {
 ///   ~/.agent-bridge/workspace/     → workspaces/<key>/   （目录内容整体搬入）
 ///   ~/.agent-bridge/sessions.json  → workspaces/<key>/sessions.json
 ///   ~/.agent-bridge/jobs.json      → workspaces/<key>/jobs.json
+/// 旧「单 bot 平铺」数据文件名（#178 闸门与迁移循环共用单一事实源——两侧分写会
+/// 在新增平铺文件时静默分叉：闸门漏判 → dest 不建 → rename 静默失败数据搁浅）。
+const LEGACY_FLAT_FILES: [&str; 2] = ["sessions.json", "jobs.json"];
+
 pub fn migrate_legacy_state(bot_key: &str) {
     let base = crate::bridge_dir();
     let dest = crate::workspace_dir(bot_key);
@@ -574,9 +578,7 @@ pub fn migrate_legacy_state(bot_key: &str) {
     // 隔离键迁移（migrate_keys 见目标已存在跳过 rename），旧工作区数据搁浅
     //（2026-08-29 老板真机：GUI 启动预建空目录致庆小丰整目录未迁移）。
     let old_ws = base.join("workspace");
-    let flat_pending = ["sessions.json", "jobs.json"]
-        .iter()
-        .any(|f| base.join(f).exists());
+    let flat_pending = LEGACY_FLAT_FILES.iter().any(|f| base.join(f).exists());
     if old_ws.is_dir() || flat_pending {
         let _ = std::fs::create_dir_all(&dest);
     }
@@ -595,7 +597,7 @@ pub fn migrate_legacy_state(bot_key: &str) {
         let _ = std::fs::remove_dir(&old_ws); // 仅当空了才成功
     }
     // 旧平铺 json 搬入
-    for f in ["sessions.json", "jobs.json"] {
+    for f in LEGACY_FLAT_FILES {
         let from = base.join(f);
         let to = dest.join(f);
         if from.exists() && !to.exists() {

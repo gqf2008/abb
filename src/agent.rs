@@ -971,10 +971,9 @@ enum ClaudePerm {
 ///（$ABB_BIN job/deliver 落盘域），旧版本无 --add-dir → 空（调用方回退 bypass）。
 /// 受限会话不调用（restrict 时 roots 无意义）；显式 workspace-write 模式复用。
 fn codex_writable_roots(resolved: &std::path::Path) -> Vec<std::path::PathBuf> {
-    if crate::deps::codex_version(resolved.to_str().unwrap_or("codex"))
-        .map(|v| crate::deps::version_at_least(&v, "0.146"))
-        .unwrap_or(false)
-    {
+    // 版本探测走缓存（进程内一次）：每条消息 spawn `codex --version` 是纯浪费
+    //（审查发现；#180 版本门控同样依赖缓存版本）。
+    if crate::deps::codex_version_at_least_cached(resolved.to_str().unwrap_or("codex"), "0.146") {
         vec![crate::bridge_dir()]
     } else {
         Vec::new()
@@ -1019,6 +1018,25 @@ pub(crate) fn sandbox_mode_params(
     }
 }
 
+/// #180：codex resume 的权限旗标决策——与 `sandbox_mode_params` 同表同源，**不**看
+/// roots 空性（roots 空同时编码「FullAccess」与「旧 codex 无 --add-dir 回退」，两义混用
+/// 会让旧 codex 上的 workspace-write 意图会话被提权成全权限——审查发现）。
+/// 只有「全权限直跑」档位（FullAccess / Auto+owner）resume 才追加 bypass；
+/// ReadOnly/WorkspaceWrite/受限一律不追加（codex resume 默认 read-only 与受限意图一致；
+/// workspace-write 无法在 resume 表达——`--sandbox` 被拒——宁严勿松）。
+/// codex_resume_bypass_ok：版本门控（首个实测支持 resume bypass 的版本为 0.150；
+/// 更老版本不追加——保持旧行为 read-only，避免 unexpected argument 每轮硬失败）。
+/// 纯函数便于单测（映射矩阵全组合）。
+pub(crate) fn codex_resume_bypass(
+    sandbox: crate::config::SandboxMode,
+    restricted: bool,
+    codex_resume_bypass_ok: bool,
+) -> bool {
+    let full_access = matches!(sandbox, crate::config::SandboxMode::FullAccess)
+        || (sandbox == crate::config::SandboxMode::Auto && !restricted);
+    full_access && codex_resume_bypass_ok
+}
+
 /// codex 会话命令构造（exec / exec resume，含桥内供应商 -c 注入）。
 /// 沙箱策略（#90 bot 数据边界，2026-08-27 落地）：
 /// - restricted=true（授权者受限会话）：--sandbox read-only（OS 级 seatbelt，可读全盘
@@ -1047,6 +1065,7 @@ pub(crate) fn codex_command(
     extra_args: &[String],
     restricted: bool,
     writable_roots: &[std::path::PathBuf],
+    resume_bypass: bool,
 ) -> tokio::process::Command {
     let mut c = tokio::process::Command::from(shim_command(program));
     c.arg("exec");
@@ -1056,9 +1075,13 @@ pub(crate) fn codex_command(
     c.arg("--json").arg("--skip-git-repo-check");
     // #145（2026-08-27 实测）：codex exec resume 不支持 --sandbox / --add-dir
     //（codex-cli 0.146.0，Usage: codex exec resume --json --skip-git-repo-check
-    // <SESSION_ID> [PROMPT]）。沙箱域在会话创建时已固定，续聊继承会话沙箱——
-    // resume 分支一律不追加沙箱/权限参数（含旧版 bypass 回退），避免
+    // <SESSION_ID> [PROMPT]）→ resume 分支不追加这两类参数，避免
     // `unexpected argument '--sandbox'` 导致 owner/granted 续聊必然失败。
+    // 唯一例外（#180，2026-08-29 真机）：全权限档位追加 bypass 旗标——
+    // `--dangerously-bypass-approvals-and-sandbox` resume 可用（0.150.1 实测），
+    // 不传则 codex resume 默认 read-only（写/网络全拒），全权限会话续聊静默降级。
+    // 是否追加由调用方按「解析后档位（codex_resume_bypass，与 sandbox_mode_params
+    // 同表同源）+ 版本门控（0.150+）」预先算好（resume_bypass）。
     if !resume {
         if restricted {
             c.arg("--sandbox").arg("read-only");
@@ -1072,14 +1095,12 @@ pub(crate) fn codex_command(
                 c.arg("--add-dir").arg(root);
             }
         }
-    } else if !restricted && writable_roots.is_empty() {
-        // #180：resume 不支持 --sandbox/--add-dir（#145，0.146+ 实测拒绝），但支持
-        // --dangerously-bypass-approvals-and-sandbox（0.150.1 实测生效）。不传时 codex
-        // exec resume 默认 read-only 沙箱（写拒绝、网络受限）——全权限会话续聊静默
-        // 降级（2026-08-29 老板真机：会话创建 danger-full-access、resume 全轮
-        // read-only，写文件 Operation not permitted）。
-        // 受限/workspace-write 会话 resume 不追加：codex 默认 read-only 与受限意图
-        // 一致；workspace-write 无法在 resume 表达（--sandbox 被拒），宁严勿松。
+    } else if resume_bypass {
+        // #180：全权限档位（FullAccess/Auto-owner）resume 追加 bypass——判定在调用方
+        // 由 codex_resume_bypass 按「解析后档位 + 版本门控」预先算好（与
+        // sandbox_mode_params 同表同源）。受限/workspace-write resume 恒不追加：
+        // codex 默认 read-only 与受限意图一致；workspace-write 无法在 resume 表达
+        //（--sandbox 被拒），宁严勿松。
         c.arg("--dangerously-bypass-approvals-and-sandbox");
     }
     // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
@@ -1480,6 +1501,18 @@ async fn run_once(
                 codex_writable_roots(&resolved)
             };
             let (use_restrict, roots) = sandbox_mode_params(sandbox, restrict, roots);
+            // #180：resume 全权限档位补 bypass（--sandbox 在 resume 被拒、bypass 可用）。
+            // 版本门控 0.150+（0.150.1 实测；更老版本不追加——保持旧行为 read-only，
+            // 避免 unexpected argument 每轮硬失败）。
+            let resume_bypass = resume
+                && codex_resume_bypass(
+                    sandbox,
+                    use_restrict,
+                    crate::deps::codex_version_at_least_cached(
+                        resolved.to_str().unwrap_or("codex"),
+                        "0.150",
+                    ),
+                );
             codex_command(
                 &resolved,
                 resume,
@@ -1487,6 +1520,7 @@ async fn run_once(
                 extra_args,
                 use_restrict,
                 &roots,
+                resume_bypass,
             )
         }
         Backend::Claude => {
@@ -2644,6 +2678,7 @@ mod tests {
             &extra,
             true,
             &[],
+            false,
         );
         let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
         assert!(
@@ -2661,9 +2696,38 @@ mod tests {
         assert!(args.iter().any(|a| *a == "-c"));
         assert!(args.iter().any(|a| *a == "model_provider=abc"));
         // resume 形态
-        let r = codex_command(std::path::Path::new("codex"), true, "tid-2", &[], true, &[]);
+        let r = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-2",
+            &[],
+            true,
+            &[],
+            false,
+        );
         assert!(r.as_std().get_args().any(|a| a == "resume"));
         assert!(r.as_std().get_args().any(|a| a == "tid-2"));
+    }
+
+    #[test]
+    fn codex_resume_bypass_mapping_matrix() {
+        // #180 决策矩阵（与 sandbox_mode_params 同表同源）：只有
+        // FullAccess / Auto+owner 且版本门控通过才追加 bypass。
+        use crate::config::SandboxMode;
+        let ok = true;
+        let old = false;
+        // FullAccess：无论受限与否都全权限（显式选择优先）
+        assert!(codex_resume_bypass(SandboxMode::FullAccess, false, ok));
+        assert!(codex_resume_bypass(SandboxMode::FullAccess, true, ok));
+        // Auto：owner 全权限、受限 read-only（#172 老板拍板）
+        assert!(codex_resume_bypass(SandboxMode::Auto, false, ok));
+        assert!(!codex_resume_bypass(SandboxMode::Auto, true, ok));
+        // ReadOnly / WorkspaceWrite：恒不 bypass（宁严勿松）
+        assert!(!codex_resume_bypass(SandboxMode::ReadOnly, false, ok));
+        assert!(!codex_resume_bypass(SandboxMode::WorkspaceWrite, false, ok));
+        // 版本门控：旧 codex（0.146-0.149 未实测）不追加——保持旧行为，避免硬失败
+        assert!(!codex_resume_bypass(SandboxMode::FullAccess, false, old));
+        assert!(!codex_resume_bypass(SandboxMode::Auto, false, old));
     }
 
     #[test]
@@ -2678,6 +2742,7 @@ mod tests {
             &[],
             false,
             &[],
+            true, // resume_bypass：调用方（档位+版本门控）判定为真
         );
         assert!(c.as_std().get_args().any(|a| a == "resume"));
         assert!(
@@ -2698,6 +2763,7 @@ mod tests {
             &[],
             true,
             &[],
+            false,
         );
         assert!(
             !r.as_std()
@@ -2714,6 +2780,7 @@ mod tests {
             &[],
             false,
             &roots,
+            false,
         );
         assert!(
             !w.as_std()
@@ -2872,6 +2939,7 @@ mod tests {
             &extra,
             false,
             &roots,
+            false,
         );
         let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
         assert!(
@@ -2899,6 +2967,7 @@ mod tests {
             &[],
             false,
             &roots,
+            false,
         );
         assert!(r.as_std().get_args().any(|a| a == "resume"));
         assert!(r.as_std().get_args().any(|a| a == "tid-2"));
@@ -2907,10 +2976,11 @@ mod tests {
     #[test]
     fn codex_command_resume_omits_sandbox_flags() {
         // #145（2026-08-27 实测 codex-cli 0.146.0）：exec resume 子命令不支持
-        // --sandbox / --add-dir（Usage 只接受 --json --skip-git-repo-check）。
-        // 续聊继承会话创建时固定的沙箱域，resume 分支不得追加任何沙箱/权限参数，
+        // --sandbox / --add-dir（Usage 只接受 --json --skip-git-repo-check），
         // 否则 owner（workspace-write + writable_roots）与 granted（read-only）
         // 续聊必然报 `unexpected argument '--sandbox'`（exit 2）。
+        // 唯一例外是 #180 的全权限 bypass 旗标（由调用方 resume_bypass 显式传入，
+        // 本测试传 false 验证默认不追加）。
         let roots = vec![std::path::PathBuf::from("C:\\Users\\x\\.agent-bridge")];
         let extra = vec!["model=abc".to_string()];
 
@@ -2922,6 +2992,7 @@ mod tests {
             &extra,
             false,
             &roots,
+            false,
         );
         let args: Vec<&std::ffi::OsStr> = r.as_std().get_args().collect();
         assert!(args.iter().any(|a| *a == "resume"));
@@ -2946,7 +3017,15 @@ mod tests {
         assert!(args.iter().any(|a| *a == "model=abc"));
 
         // granted（restricted）resume：同样不得带 --sandbox
-        let rg = codex_command(std::path::Path::new("codex"), true, "tid-3", &[], true, &[]);
+        let rg = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-3",
+            &[],
+            true,
+            &[],
+            false,
+        );
         let args_g: Vec<&std::ffi::OsStr> = rg.as_std().get_args().collect();
         assert!(args_g.iter().any(|a| *a == "resume"));
         assert!(
@@ -2973,6 +3052,7 @@ mod tests {
             &extra,
             false,
             &[],
+            false,
         );
         let args: Vec<&std::ffi::OsStr> = c.as_std().get_args().collect();
         assert!(args

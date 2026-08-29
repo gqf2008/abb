@@ -386,6 +386,23 @@ pub fn codex_version_from_text(text: &str) -> Option<String> {
         })
 }
 
+/// codex 版本探测缓存（进程内不变）：`codex --version` 是 spawn 子进程的同步阻塞调用，
+/// 每条消息都探测纯属浪费（#172 后默认 Auto 档探测结果恒不消费——审查发现；#180 版本
+/// 门控又要每消息用一次）。首次调用探测一次，后续走缓存；探测失败缓存 None（进程生命
+/// 周期内不重试——安装/升级 codex 的场景由重启 ABB 覆盖）。注意：以首次调用方传入的
+/// exe 为准（进程内各调用点解析的是同一 codex 路径）。
+pub fn codex_version_cached(exe: &str) -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| codex_version(exe)).as_deref()
+}
+
+/// 版本门控便捷入口：缓存的 codex 版本是否 >= min（探测失败保守 false）。
+pub fn codex_version_at_least_cached(exe: &str, min: &str) -> bool {
+    codex_version_cached(exe)
+        .map(|v| version_at_least(v, min))
+        .unwrap_or(false)
+}
+
 /// 跑 `git --version` 解析版本号。跑不通/非零退出 → None。
 pub fn git_version(exe: &str) -> Option<String> {
     let mut cmd = std::process::Command::new(exe);
