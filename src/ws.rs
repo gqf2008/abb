@@ -86,6 +86,23 @@ fn parse_query_u32(url: &str, key: &str) -> Option<u32> {
     None
 }
 
+/// #179：发送超时包装——网络半死（代理 TUN 抖动，os error 54/60）时 sink.send() 可能
+/// 永久挂起，优雅关闭卡死在该 await（现场：进程活着全线程 parked、flock 不释放）。
+/// 超时（5s）返回 Err → 外层重连/退出，不永久卡。超时后 sink 状态不可靠，但网络
+/// 半死本就该重连——Err 路径由调用方处理。
+async fn send_with_timeout(
+    sink: &mut (impl futures_util::Sink<Message> + Unpin),
+    msg: Message,
+) -> anyhow::Result<()> {
+    // 泛型 Sink::Error 不保证 Debug/Display/std Error——统一转 anyhow 报错
+    //（错误细节由调用方 context 补充：发 ping 失败/回 ack 失败/关闭连接）
+    tokio::time::timeout(Duration::from_secs(5), sink.send(msg))
+        .await
+        .context("发送超时（网络卡死）")?
+        .map_err(|_| anyhow!("发送失败"))?;
+    Ok(())
+}
+
 fn ping_frame(service_id: u32) -> Frame {
     Frame {
         seq_id: 0,
@@ -184,7 +201,7 @@ async fn run_conn(
         tokio::select! {
             _ = stop.cancelled() => {
                 crate::log!("[ws] 收到停止信号，关闭连接");
-                let _ = sink.send(Message::Close(None)).await;
+                let _ = send_with_timeout(&mut sink, Message::Close(None)).await;
                 return Ok(());
             }
             _ = ping_t.tick() => {
@@ -197,7 +214,7 @@ async fn run_conn(
                     ));
                 }
                 let pf = ping_frame(conf.service_id);
-                sink.send(Message::Binary(pf.encode().into()))
+                send_with_timeout(&mut sink, Message::Binary(pf.encode().into()))
                     .await
                     .context("发 ping 失败")?;
                 // 续命「在线」的前提已从「ping 发出去」升级为「刚确认收过帧」（见上面看门狗）：
@@ -231,9 +248,13 @@ async fn run_conn(
                                         headers: f.headers.clone(),
                                         payload: br#"{"code":200}"#.to_vec(),
                                     };
-                                    sink.send(Message::Binary(ack.encode().into()))
-                                        .await
-                                        .context("回 ack 失败")?;
+                                    // 回 ack 超时包装（#179）：send 网络半死卡住时不得拖死事件循环
+                                    send_with_timeout(
+                                        &mut sink,
+                                        Message::Binary(ack.encode().into()),
+                                    )
+                                    .await
+                                    .context("回 ack 失败")?;
                                     let b = bridge.clone();
                                     let payload = f.payload.clone();
                                     // #69 审计：短/中命、有 owner（bridge chat_lock +

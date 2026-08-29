@@ -176,8 +176,18 @@ pub fn svc_restart() {
 /// 跨平台终止进程。
 fn terminate(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        // #179：优雅关闭可能卡死（如 WS 发送挂起）→ SIGTERM 杀不死、锁占着 → 新实例
+        // 无限拉起失败。SIGTERM 后 3s 未退 → SIGKILL 兜底（后台线程，不阻塞调用方）。
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        });
     }
     #[cfg(not(unix))]
     {
