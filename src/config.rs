@@ -1096,6 +1096,14 @@ impl Config {
         self.migrate_keys_at(&crate::bridge_dir());
     }
 
+    /// 目录是否为空（不存在/读取失败一律 false——宁可跳过也不碰拿不准的目录，防误删）。
+    /// migrate_keys 的空目标判定用（#178）。
+    fn is_empty_dir(p: &std::path::Path) -> bool {
+        std::fs::read_dir(p)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
+    }
+
     /// migrate_keys 的内部实现（base 目录可注入，单测用临时目录不碰真实数据）。
     fn migrate_keys_at(&self, bridge: &std::path::Path) {
         for b in &self.bots {
@@ -1109,18 +1117,37 @@ impl Config {
                 old_key,
                 new_key
             );
-            // 目录 rename（目标已存在 = 已迁移/同名冲突，跳过）
+            // 目录 rename（目标已存在 = 已迁移/同名冲突，跳过）。
+            // #178：目标被预建为**空目录**时同样会跳过（GUI 启动的 legacy 迁移
+            // platform::migrate_legacy_state 会先无条件建 workspaces/<新 key>），
+            // 而迁移是一次性的——错过窗口旧数据就永久搁浅（2026-08-29 老板真机：
+            // 庆小丰 工作区整目录搁浅）。空目标也执行 rename；非空目标绝不碰
+            // （可能已有数据，防覆盖）。
             for sub in ["workspaces", "guard"] {
                 let old_p = bridge.join(sub).join(&old_key);
                 let new_p = bridge.join(sub).join(&new_key);
-                if old_p.exists() && !new_p.exists() {
-                    if let Err(e) = std::fs::rename(&old_p, &new_p) {
+                if !old_p.exists() {
+                    continue;
+                }
+                if new_p.exists() {
+                    if !Self::is_empty_dir(&new_p) {
+                        continue;
+                    }
+                    // Windows rename 不覆盖已存在目录，先移除空目标再 rename
+                    if let Err(e) = std::fs::remove_dir(&new_p) {
                         crate::log!(
-                            "[config] ⚠️ 迁移目录 {} → {} 失败: {e:#}（数据仍在旧目录）",
-                            old_p.display(),
+                            "[config] ⚠️ 迁移移除空目录 {} 失败: {e:#}（数据仍在旧目录）",
                             new_p.display()
                         );
+                        continue;
                     }
+                }
+                if let Err(e) = std::fs::rename(&old_p, &new_p) {
+                    crate::log!(
+                        "[config] ⚠️ 迁移目录 {} → {} 失败: {e:#}（数据仍在旧目录）",
+                        old_p.display(),
+                        new_p.display()
+                    );
                 }
             }
             // 登记/状态文件 bot_key 替换（读改写；缺失/损坏跳过）
@@ -2499,5 +2526,76 @@ fn migrate_keys_renames_dirs_and_replaces_registrations() {
     assert!(base
         .join("workspaces/cli_newkey123456/pending.json")
         .exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migrate_keys_renames_onto_precreated_empty_target() {
+    // #178：GUI 启动预建空的新 key 目录 → 迁移必须仍执行 rename（旧数据不搁浅）。
+    // 现场：platform::migrate_legacy_state 在 GUI 启动时无条件
+    // create_dir_all(workspaces/<新 key>)，抢在 service 的 migrate_keys 之前——
+    // 原实现「目标已存在跳过」把旧工作区整目录搁浅（老板真机庆小丰目录）。
+    let base = std::env::temp_dir().join(format!("abb-migrate-empty-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
+    std::fs::create_dir_all(base.join("guard/旧名bot")).unwrap();
+    std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
+    // 模拟 GUI 预建：空的新 key 目录
+    std::fs::create_dir_all(base.join("workspaces/cli_newkey123456")).unwrap();
+
+    let mut cfg = Config {
+        bots: vec![BotConfig {
+            name: "旧名bot".into(),
+            app_id: "cli_newkey123456".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    cfg.migrate_keys_at(&base);
+
+    assert!(
+        base.join("workspaces/cli_newkey123456/pending.json")
+            .exists(),
+        "预建空目录不得阻断迁移：旧内容必须迁入新目录"
+    );
+    assert!(!base.join("workspaces/旧名bot").exists(), "旧目录应已搬走");
+    assert!(base.join("guard/cli_newkey123456").exists());
+    // 幂等：二次调用无变化
+    cfg.migrate_keys_at(&base);
+    assert!(base
+        .join("workspaces/cli_newkey123456/pending.json")
+        .exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migrate_keys_skips_nonempty_target() {
+    // #178 反面护栏：非空目标绝不覆盖（可能已有数据，防覆盖）。
+    let base = std::env::temp_dir().join(format!("abb-migrate-nonempty-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
+    std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
+    std::fs::create_dir_all(base.join("workspaces/cli_newkey123456")).unwrap();
+    std::fs::write(base.join("workspaces/cli_newkey123456/keep.json"), "keep").unwrap();
+
+    let mut cfg = Config {
+        bots: vec![BotConfig {
+            name: "旧名bot".into(),
+            app_id: "cli_newkey123456".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    cfg.migrate_keys_at(&base);
+
+    assert!(
+        base.join("workspaces/旧名bot").exists(),
+        "非空目标不得被迁移覆盖"
+    );
+    assert_eq!(
+        std::fs::read_to_string(base.join("workspaces/cli_newkey123456/keep.json")).unwrap(),
+        "keep",
+        "非空目标内容不得被破坏"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }

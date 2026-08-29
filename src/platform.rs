@@ -570,7 +570,16 @@ pub fn set_autostart(_enable: bool) -> Result<()> {
 pub fn migrate_legacy_state(bot_key: &str) {
     let base = crate::bridge_dir();
     let dest = crate::workspace_dir(bot_key);
-    let _ = std::fs::create_dir_all(&dest);
+    // #178：只有确有旧数据要搬时才建 dest——无条件预建空目录会抢跑 service 的
+    // 隔离键迁移（migrate_keys 见目标已存在跳过 rename），旧工作区数据搁浅
+    //（2026-08-29 老板真机：GUI 启动预建空目录致庆小丰整目录未迁移）。
+    let old_ws = base.join("workspace");
+    let flat_pending = ["sessions.json", "jobs.json"]
+        .iter()
+        .any(|f| base.join(f).exists());
+    if old_ws.is_dir() || flat_pending {
+        let _ = std::fs::create_dir_all(&dest);
+    }
 
     // 旧 workspace/ 目录内容搬入 workspaces/<key>/
     let old_ws = base.join("workspace");
