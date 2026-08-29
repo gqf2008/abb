@@ -60,25 +60,16 @@ pub async fn run() {
     // CancelOnShutdown 守卫：本任务任何提前退出路径（含 panic 被捕获）都补一次 cancel
     // （幂等），保持原 watch 实现的 fail-open 语义（循环退出 → 进程优雅退出 → 看门狗重启），
     // 绝不出现「signal 死了所有循环永久挂起」的 fail-closed 死挂。
+    // #191：select 同时监听关停令牌——自发起关停（无信号，如全部 bot 自行退出）时
+    // shutdown_wait 会 cancel 令牌，本任务若仍 parked 在等信号，tracker.wait() 永等
+    // 它 → 收尾恒烧满 20s 总期限强退。令牌已取消即让位退出（不记信号日志，cancel
+    // 幂等无害）。代价：收尾窗口内再来的 SIGTERM 走默认处置立即终止进程——与
+    // systemd「第二次信号=立即杀」惯例一致，且强退本就是该窗口的兜底终点。
     crate::tasks::tasks().spawn_forever("signal", async {
         let _cancel_guard = crate::tasks::CancelOnShutdown::default();
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = signal(SignalKind::terminate()).ok();
-            let mut int = signal(SignalKind::interrupt()).ok();
-            tokio::select! {
-                _ = async { if let Some(t)=term.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
-                _ = async { if let Some(t)=int.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
+        if wait_exit_signal_or_shutdown(crate::tasks::shutdown_token()).await {
+            crate::log!("[service] 收到退出信号");
         }
-        #[cfg(not(unix))]
-        {
-            // Windows 无 SIGTERM/SIGINT 语义：Ctrl+C/关闭控制台即优雅退出
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        crate::log!("[service] 收到退出信号");
         crate::tasks::shutdown_token().cancel();
     });
 
@@ -191,6 +182,36 @@ pub async fn run() {
         std::process::exit(1);
     }
     crate::log!("[service] 已退出");
+}
+
+/// 等待退出信号或关停广播（#191）。返回 true=收到真实信号（调用方记「收到退出信号」
+/// 日志）；false=关停序列已开始（令牌被 shutdown_wait cancel——自发起关停，signal
+/// 任务让位退出，让 tracker.wait() 能清零收尾，不再恒烧满 20s 总期限强退）。
+/// 信号等待抽成独立 future（跨 cfg 统一 select，避免 cfg 块语句丢值）；term/int
+/// 注册失败该路永久 pending（与原实现一致，不 panic）。可单测。
+async fn wait_exit_signal_or_shutdown(stop: tokio_util::sync::CancellationToken) -> bool {
+    #[cfg(unix)]
+    let signal_fired = wait_unix_signals();
+    #[cfg(not(unix))]
+    // Windows 无 SIGTERM/SIGINT 语义：Ctrl+C/关闭控制台即优雅退出
+    let signal_fired = tokio::signal::ctrl_c();
+    tokio::select! {
+        _ = signal_fired => true,
+        _ = stop.cancelled() => false,
+    }
+}
+
+/// unix 退出信号（TERM/INT，ctrl_c 复用 INT 注册）任一到达即完成。
+#[cfg(unix)]
+async fn wait_unix_signals() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut int = signal(SignalKind::interrupt()).ok();
+    tokio::select! {
+        _ = async { if let Some(t)=term.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
+        _ = async { if let Some(t)=int.as_mut(){t.recv().await} else {std::future::pending().await} } => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 /// 服务期等待 bot 循环：等「关停广播」或「全部 bot 循环结束」哪个先到，**无期限**。
@@ -1015,6 +1036,67 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "混合形态（已完成+卡死+迟到广播）不得 panic 且须受限时支配，实际 {elapsed:?}"
+        );
+    }
+
+    /// #191 回归护栏（信号路径）：SIGTERM 到达返回 true（真实信号，调用方记日志）。
+    /// 给测试进程自己发 SIGTERM——tokio 信号处理器已捕获，进程不死，仅本测试的
+    /// helper 收到事件。
+    #[tokio::test]
+    async fn wait_exit_signal_or_shutdown_returns_true_on_sigterm() {
+        let stop = tokio_util::sync::CancellationToken::new(); // 无关停广播
+        let task = tokio::spawn(wait_exit_signal_or_shutdown(stop));
+        // 等 helper 完成信号注册（首次 poll 安装处理器），再给进程发 SIGTERM
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+            task.await.unwrap()
+        })
+        .await;
+        assert!(r == Ok(true), "SIGTERM 必须返回 true（实际 {r:?}）");
+    }
+
+    /// #191 回归护栏（让位路径·先取消）：关停令牌已取消 → 立即返回 false
+    ///（自发起关停，不记信号日志）。
+    #[tokio::test]
+    async fn wait_exit_signal_or_shutdown_returns_false_when_already_cancelled() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_exit_signal_or_shutdown(stop),
+        )
+        .await;
+        assert!(
+            r == Ok(false),
+            "已取消的令牌必须立即返回 false（实际 {r:?}）"
+        );
+    }
+
+    /// #191 回归护栏（让位路径·后取消）：helper 先 parked 等信号，关停令牌后到仍能
+    /// 唤醒返回 false——这正是自发起关停时 tracker.wait() 不再永等的前提
+    ///（旧实现无此分支，parked 至烧满 20s 总期限强退）。
+    #[tokio::test]
+    async fn wait_exit_signal_or_shutdown_returns_false_on_late_cancel() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                stop.cancel();
+            });
+        }
+        let t = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_exit_signal_or_shutdown(stop),
+        )
+        .await;
+        assert!(r == Ok(false), "迟到取消必须返回 false（实际 {r:?}）");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "取消后必须立即唤醒，实际 {:?}",
+            t.elapsed()
         );
     }
 
