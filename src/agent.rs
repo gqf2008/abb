@@ -986,7 +986,16 @@ pub(crate) fn sandbox_mode_params(
     roots: Vec<std::path::PathBuf>,
 ) -> (bool, Vec<std::path::PathBuf>) {
     match mode {
-        crate::config::SandboxMode::Auto => (restrict, roots),
+        // #172（老板拍板 2026-08-29：claude/codex 不要跑沙箱）：auto 默认 = owner 会话
+        // 全权限直跑（codex bypass，不再 #90 的 workspace-write 数据边界）；受限会话
+        //（授权者隔离）仍 read-only，安全功能保留。
+        crate::config::SandboxMode::Auto => {
+            if restrict {
+                (true, Vec::new())
+            } else {
+                (false, Vec::new())
+            }
+        }
         crate::config::SandboxMode::ReadOnly => (true, Vec::new()),
         crate::config::SandboxMode::WorkspaceWrite => (false, roots),
         crate::config::SandboxMode::FullAccess => (false, Vec::new()),
@@ -2633,16 +2642,17 @@ mod tests {
 
     #[test]
     fn sandbox_mode_params_maps_modes() {
-        // #163 模式映射：auto=现状（restrict 原样）、read-only 强制、workspace-write
-        // 强制、full-access 走 bypass（roots 空）。显式选择优先于受限判定。
+        // #163/#172 模式映射：auto=owner 全权限直跑（bypass，老板拍板不要沙箱）、
+        // 受限 read-only；read-only 强制、workspace-write 强制、full-access 走 bypass。
+        // 显式选择优先于受限判定。
         use crate::config::SandboxMode;
         let roots = vec![std::path::PathBuf::from("~/.agent-bridge")];
-        // auto + owner → 原样（workspace-write + roots）
+        // auto + owner → 全权限直跑（roots 忽略，不再 workspace-write 沙箱——#172）
         assert_eq!(
             sandbox_mode_params(SandboxMode::Auto, false, roots.clone()),
-            (false, roots.clone())
+            (false, vec![])
         );
-        // auto + 受限 → read-only（roots 被调用方预算为空，映射原样保留）
+        // auto + 受限 → read-only（授权者隔离保留）
         assert_eq!(
             sandbox_mode_params(SandboxMode::Auto, true, vec![]),
             (true, vec![])
@@ -2722,17 +2732,18 @@ mod tests {
             !chat_in_virtual_bots(&store, "bot_b", "oc_vb_1"),
             "跨 bot 不串"
         );
-        // 语义：auto + 虚拟 Bot → workspace-write；auto + 普通 chat → auto 现状
+        // 语义：#172 auto + owner = 全权限直跑（不沙箱）；虚拟 Bot 的 granted 会话
+        // 经 resolve_sandbox_mode 覆盖为 workspace-write（团队角色默认，显式档位优先）
         let roots = vec![std::path::PathBuf::from("bridge_dir")];
         assert_eq!(
             sandbox_mode_params(SandboxMode::Auto, false, roots.clone()),
-            (false, roots.clone()),
-            "普通 chat 的 auto 保持现状（owner workspace-write + roots）"
+            (false, vec![]),
+            "auto + owner 全权限直跑（#172 老板拍板：不要沙箱）"
         );
         assert_eq!(
             sandbox_mode_params(SandboxMode::WorkspaceWrite, true, roots.clone()),
             (false, roots.clone()),
-            "虚拟 Bot 的 auto 按 workspace-write 走（受限会话也尊重团队角色默认）"
+            "虚拟 Bot 的 granted 默认按 workspace-write 走（团队角色要干活）"
         );
         // 显式配置优先：虚拟 Bot 显式 read-only → read-only（覆盖默认）
         assert_eq!(
