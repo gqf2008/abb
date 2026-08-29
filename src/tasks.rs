@@ -153,6 +153,17 @@ impl TaskGovernance {
         ms
     }
 
+    /// 带期限的优雅关闭（#184）：与 shutdown_wait 同语义，但总期限 deadline——
+    /// 超时返回 Err（调用方应记日志强退，进程退出即释放外部资源）。正常完成返回
+    /// Ok(耗时 ms)。期限必须从「关闭路径开始」起算，绝不能在服务期等待时起算
+    ///（#184 初版把期限包在等 bot handle 外面，健康服务 20s 一到被强杀成重启
+    /// 风暴——真机事故 2026-08-29）。
+    pub async fn shutdown_wait_bounded(&self, deadline: std::time::Duration) -> Result<u64, ()> {
+        tokio::time::timeout(deadline, self.shutdown_wait())
+            .await
+            .map_err(|_| ())
+    }
+
     /// 指标快照。
     pub fn metrics(&self) -> Metrics {
         Metrics {
@@ -323,4 +334,29 @@ mod tests {
         );
         h.await.unwrap();
     }
+}
+/// #184 回归护栏：卡死的登记任务（无视关停令牌）必须触发收尾期限，
+/// 不得无限等（真机：shutdown_wait 挂死 → flock 占死 → 新实例起不来）。
+/// 用局部 TaskGovernance（不碰全局单例，避免并行测试互踩）。
+#[tokio::test]
+async fn shutdown_wait_bounded_times_out_on_stuck_task() {
+    let tg = TaskGovernance::new();
+    tg.spawn("stuck", async {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    });
+    let r = tg
+        .shutdown_wait_bounded(std::time::Duration::from_millis(150))
+        .await;
+    assert!(r.is_err(), "挂死任务必须触发收尾期限");
+}
+
+/// #184 正面：正常收尾（全部登记任务已结束）必须在期限内完成。
+#[tokio::test]
+async fn shutdown_wait_bounded_completes_when_all_finish() {
+    let tg = TaskGovernance::new();
+    tg.spawn("quick", async {});
+    let r = tg
+        .shutdown_wait_bounded(std::time::Duration::from_secs(5))
+        .await;
+    assert!(r.is_ok(), "正常收尾必须在期限内完成");
 }

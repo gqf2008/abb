@@ -165,36 +165,26 @@ pub async fn run() {
     // 等所有 bot 循环结束（正常只有关停广播才会结束）。
     // #179：关闭时限——单个 bot 循环卡死（如 WS 发送挂起，历史缺陷已由 send_with_timeout
     // 根治，这里兜底）时不能无限等：30s 后强制继续退出流程。
-    // #184：收尾总期限——#179 的逐 handle 时限没盖住其后的 shutdown_wait（等 recover/
-    // session-import/larkskills 等启动期短命任务收尾；网络安装/磁盘挂死会永久挂起——
-    // 2026-08-29 真机：v2.21.3 首停 0ms 干净、启动 61s 后二停挂死占锁，新实例起不来）。
+    for h in handles {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), h).await;
+    }
+    // #184：收尾总期限——从「bot 循环全部结束」**之后**起算，包住 shutdown_wait
+    //（等 recover/session-import/larkskills 等启动期短命任务收尾；网络安装/磁盘
+    // 挂死会永久挂起——2026-08-29 真机：v2.21.3 启动 61s 后二停挂死占锁）。
+    // ⚠️ 期限绝不能包住上面的等 handle：服务期的常态就是「等 handle 等到关停广播」，
+    // 期限从启动起算会在 20s 后把健康服务强杀成每 20s 一循环的重启风暴
+    //（#184 初版真机事故，2026-08-29 同日修正）。
     // 到期 process::exit 强退：进程退出即释放 flock，看门 2s 内拉起新实例；
     // 残留任务随进程消亡（block_on 返回后 runtime drop 也会等残留任务，不能依赖它收尾）。
-    if graceful_shutdown_wait(handles, std::time::Duration::from_secs(20))
+    if crate::tasks::tasks()
+        .shutdown_wait_bounded(std::time::Duration::from_secs(20))
         .await
         .is_err()
     {
-        crate::log!("[service] ⚠️ 优雅关闭超时（总期限 20s），强制退出（防挂死占锁）");
+        crate::log!("[service] ⚠️ 优雅关闭超时（收尾 20s），强制退出（防挂死占锁）");
         std::process::exit(1);
     }
     crate::log!("[service] 已退出");
-}
-
-/// 优雅关闭等待：全部 bot 循环收尾 + 任务治理收尾（close → cancel → wait 指标汇总），
-/// 总期限 deadline。超时返回 Err（调用方应记日志强退）。抽成函数便于单测——
-/// run() 的超时分支是 process::exit，进程内不可测。
-async fn graceful_shutdown_wait(
-    handles: Vec<tokio::task::JoinHandle<()>>,
-    deadline: std::time::Duration,
-) -> Result<(), ()> {
-    tokio::time::timeout(deadline, async {
-        for h in handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), h).await;
-        }
-        let _ = crate::tasks::tasks().shutdown_wait().await;
-    })
-    .await
-    .map_err(|_| ())
 }
 
 /// 跨会话投递消费循环：轮询 deliveries.json（agent 的 deliver CLI 落盘），逐条经路由表投递。
@@ -897,18 +887,6 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// #184 回归护栏：卡死的 bot 循环必须在总期限内触发超时（调用方记日志强退），
-    /// 不能无限等——真机：shutdown_wait 挂死 → flock 占死 → 新实例起不来。
-    /// 只测超时路径（不触达全局 tracker 的 shutdown_wait，避免并行测试互踩）。
-    #[tokio::test]
-    async fn graceful_shutdown_wait_times_out_on_stuck_bot_loop() {
-        let h = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        });
-        let r = graceful_shutdown_wait(vec![h], std::time::Duration::from_millis(150)).await;
-        assert!(r.is_err(), "挂死循环必须触发总期限超时");
-    }
 
     fn test_job(
         prompt: &str,
