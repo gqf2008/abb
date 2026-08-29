@@ -188,7 +188,8 @@ pub async fn run() {
 /// 日志）；false=关停序列已开始（令牌被 shutdown_wait cancel——自发起关停，signal
 /// 任务让位退出，让 tracker.wait() 能清零收尾，不再恒烧满 20s 总期限强退）。
 /// 信号等待抽成独立 future（跨 cfg 统一 select，避免 cfg 块语句丢值）；term/int
-/// 注册失败该路永久 pending（与原实现一致，不 panic）。可单测。
+/// 注册失败该路永久 pending（与原实现一致，不 panic）；ctrl_c 注册失败会以 Err
+/// 立即完成（原实现即如此，实践不可达）。可单测。
 async fn wait_exit_signal_or_shutdown(stop: tokio_util::sync::CancellationToken) -> bool {
     #[cfg(unix)]
     let signal_fired = wait_unix_signals();
@@ -1039,11 +1040,17 @@ mod tests {
         );
     }
 
+    /// 三个信号测试的进程内串行锁（独立审查 F1）：SIGTERM 发给整个进程，并行时
+    /// 可能被其他信号测试 helper 的注册/parked 窗口消费致偶发 flake，串行化消除。
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// #191 回归护栏（信号路径）：SIGTERM 到达返回 true（真实信号，调用方记日志）。
     /// 给测试进程自己发 SIGTERM——tokio 信号处理器已捕获，进程不死，仅本测试的
-    /// helper 收到事件。
+    /// helper 收到事件。三个信号测试共享 SIGNAL_TEST_LOCK 串行化（独立审查 F1）：
+    /// 并行时发出的 SIGTERM 可能被其他测试 helper 的注册/parked 窗口消费致偶发 flake。
     #[tokio::test]
     async fn wait_exit_signal_or_shutdown_returns_true_on_sigterm() {
+        let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = tokio_util::sync::CancellationToken::new(); // 无关停广播
         let task = tokio::spawn(wait_exit_signal_or_shutdown(stop));
         // 等 helper 完成信号注册（首次 poll 安装处理器），再给进程发 SIGTERM
@@ -1060,6 +1067,7 @@ mod tests {
     ///（自发起关停，不记信号日志）。
     #[tokio::test]
     async fn wait_exit_signal_or_shutdown_returns_false_when_already_cancelled() {
+        let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
         let r = tokio::time::timeout(
@@ -1078,6 +1086,7 @@ mod tests {
     ///（旧实现无此分支，parked 至烧满 20s 总期限强退）。
     #[tokio::test]
     async fn wait_exit_signal_or_shutdown_returns_false_on_late_cancel() {
+        let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = tokio_util::sync::CancellationToken::new();
         {
             let stop = stop.clone();
