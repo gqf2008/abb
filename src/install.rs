@@ -175,15 +175,25 @@ pub fn svc_restart() {
 
 /// 跨平台终止进程。
 fn terminate(pid: u32) {
+    terminate_with_grace(pid, std::time::Duration::from_secs(3));
+}
+
+/// terminate 的实现（grace 可注入，单测用短宽限验证升级链路不拖慢测试）。
+fn terminate_with_grace(pid: u32, grace: std::time::Duration) {
     #[cfg(unix)]
     {
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
         // #179：优雅关闭可能卡死（如 WS 发送挂起）→ SIGTERM 杀不死、锁占着 → 新实例
-        // 无限拉起失败。SIGTERM 后 3s 未退 → SIGKILL 兜底（后台线程，不阻塞调用方）。
+        // 无限拉起失败。SIGTERM 后 grace 未退 → SIGKILL 兜底（后台线程，不阻塞调用方）。
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(grace);
+            // #183（PR #181 审查 P1 补强）：SIGKILL 前复查存活——grace 内已优雅退出
+            // （含 zombie）时 pid 可能被系统复用，盲发 SIGKILL 会误杀无辜进程。
+            if !pid_alive(pid) {
+                return;
+            }
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
@@ -197,5 +207,61 @@ fn terminate(pid: u32) {
             .args(["/PID", &pid.to_string(), "/F"])
             .creation_flags(0x0800_0000)
             .spawn();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// #183 回归护栏：pid_alive 必须把 zombie（已死未 reap）判为不存活——
+    /// SIGKILL 兜底靠它避免对已退出 pid 盲发（pid 复用后误杀无辜进程）。
+    #[test]
+    fn pid_alive_detects_zombie_as_dead() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::mem::forget(child); // 不 reap：退出后保持 zombie 供 pid_alive 判定
+                                 // 等它退出变 zombie（kill(pid,0) 对 zombie 成功，is_zombie 判死）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(pid),
+            "zombie（已死未 reap）必须判为不存活，否则 SIGKILL 兜底会误发"
+        );
+    }
+
+    /// 活进程必须判为存活（升级兜底的前提：真卡死的 service 才能被 SIGKILL）。
+    #[test]
+    fn pid_alive_detects_live_process() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        assert!(pid_alive(child.id()), "活进程必须判为存活");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// #179/#183 链路端到端：忽略 SIGTERM 的进程必须在宽限后被杀（SIGKILL 升级有效）。
+    #[test]
+    fn terminate_escalates_to_sigkill_when_graceful_exit_stalls() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        terminate_with_grace(pid, std::time::Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        let _ = child.wait(); // 阻塞到被杀
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(3),
+            "忽略 TERM 的进程必须在宽限+SIGKILL 内被杀，实际 {:?}",
+            t.elapsed()
+        );
     }
 }
