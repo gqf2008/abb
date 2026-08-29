@@ -164,14 +164,26 @@ pub async fn run() {
     }
     // 等所有 bot 循环结束（正常只有关停广播才会结束）。
     // #179：关闭时限——单个 bot 循环卡死（如 WS 发送挂起，历史缺陷已由 send_with_timeout
-    // 根治，这里兜底）时不能无限等：30s 后强制继续退出流程（进程退出 → flock 释放，
-    // 看门/新实例可接管；残留任务随 runtime drop 取消）。
+    // 根治，这里兜底）时不能无限等：30s 后强制继续退出流程。
     for h in handles {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), h).await;
     }
-    // #69 优雅关闭：close（拒绝新登记）→ cancel（幂等，信号任务可能已广播）→ wait
-    // 等全部在册任务收尾；指标汇总一行日志（shutdown_wait_ms 等）。
-    let _ = crate::tasks::tasks().shutdown_wait().await;
+    // #184：收尾总期限——从「bot 循环全部结束」**之后**起算，包住 shutdown_wait
+    //（等 recover/session-import/larkskills 等启动期短命任务收尾；网络安装/磁盘
+    // 挂死会永久挂起——2026-08-29 真机：v2.21.3 启动 61s 后二停挂死占锁）。
+    // ⚠️ 期限绝不能包住上面的等 handle：服务期的常态就是「等 handle 等到关停广播」，
+    // 期限从启动起算会在 20s 后把健康服务强杀成每 20s 一循环的重启风暴
+    //（#184 初版真机事故，2026-08-29 同日修正）。
+    // 到期 process::exit 强退：进程退出即释放 flock，看门 2s 内拉起新实例；
+    // 残留任务随进程消亡（block_on 返回后 runtime drop 也会等残留任务，不能依赖它收尾）。
+    if crate::tasks::tasks()
+        .shutdown_wait_bounded(std::time::Duration::from_secs(20))
+        .await
+        .is_err()
+    {
+        crate::log!("[service] ⚠️ 优雅关闭超时（收尾 20s），强制退出（防挂死占锁）");
+        std::process::exit(1);
+    }
     crate::log!("[service] 已退出");
 }
 

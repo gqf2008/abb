@@ -353,6 +353,7 @@ fn build_agent_command(
                 &inject.extra_args,
                 false,
                 &writable_roots,
+                false, // resume_bypass：team generate 恒全新会话，resume=false 无意义
             )
         }
         crate::agent::Backend::Pi => {
