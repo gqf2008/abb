@@ -28,6 +28,9 @@ pub async fn run() {
         crate::install::set_desired(false);
         std::process::exit(1);
     }
+    // #174：一次性迁移旧 key（name）目录/登记 → 新 key（app_id/wx_user_id 优先）。
+    // 幂等（新目录存在跳过）；失败只 log 不阻塞（数据仍在旧目录，日志指明）。
+    cfg.migrate_keys();
     crate::log!(
         "[service] 只响应: {}  默认后端: {}  bot数: {}",
         cfg.owner_open_id,

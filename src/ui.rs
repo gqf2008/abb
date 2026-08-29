@@ -499,6 +499,8 @@ fn snapshot_config(work: &RefCell<Vec<BotConfig>>, wk: &SettingsWork) -> (Config
     };
     // 虚拟 Bot 自定义角色模板（#75）：弹窗里管理的工作副本，随保存写盘
     c.custom_roles = wk.templates.borrow().clone();
+    // #174：同名 bot 自动分配唯一 key suffix 并**落盘固化**（load 只做内存分配）
+    c.assign_unique_keys();
     (c, dropped)
 }
 
