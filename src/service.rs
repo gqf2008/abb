@@ -204,8 +204,9 @@ async fn wait_bots_or_shutdown(
     per_bot_shutdown_bound: std::time::Duration,
 ) {
     // 服务期：逐个等 bot 循环结束，任一步可被关停广播打断。无期限。
-    // 索引推进（完成即跳过）+ is_finished 守卫：JoinHandle 完成后再次 poll 会
-    // panic，必须保证每个 handle 至多 poll 一次。
+    // 索引推进（完成即跳过）+ is_finished 守卫：JoinHandle 返回 Ready（完成性
+    // poll）后再 poll 会 panic，必须保证每个 handle 至多一次完成性 poll
+    //（Pending 态可多次 poll，不受限）。
     let mut i = 0;
     while i < handles.len() {
         if handles[i].is_finished() {
@@ -985,6 +986,35 @@ mod tests {
         assert!(
             r.is_ok(),
             "全部 bot 自行退出后必须进入收尾（fail-open），不得无限等广播"
+        );
+    }
+
+    /// #189 补充（独立审查 P3）：多 bot 顺序推进 + 迟到广播的混合形态——已完成
+    /// handle 在服务期被 select 消费后，广播到达、尾段必须跳过它（不二次 poll
+    /// panic），同时对未完成 handle 限时。删尾段 is_finished 守卫此测试必红。
+    #[tokio::test]
+    async fn wait_bots_or_shutdown_mixed_bots_with_late_cancel() {
+        let mut handles = vec![
+            tokio::spawn(async {}), // 立即退出的 bot：服务期被完成性消费
+            tokio::spawn(async {
+                // 卡死 bot：广播后由尾段限时兜底
+                std::future::pending::<()>().await;
+            }),
+        ];
+        let stop = tokio_util::sync::CancellationToken::new();
+        {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                stop.cancel();
+            });
+        }
+        let t = std::time::Instant::now();
+        wait_bots_or_shutdown(&mut handles, stop, std::time::Duration::from_millis(100)).await;
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "混合形态（已完成+卡死+迟到广播）不得 panic 且须受限时支配，实际 {elapsed:?}"
         );
     }
 
