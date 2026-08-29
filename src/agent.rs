@@ -1072,6 +1072,15 @@ pub(crate) fn codex_command(
                 c.arg("--add-dir").arg(root);
             }
         }
+    } else if !restricted && writable_roots.is_empty() {
+        // #180：resume 不支持 --sandbox/--add-dir（#145，0.146+ 实测拒绝），但支持
+        // --dangerously-bypass-approvals-and-sandbox（0.150.1 实测生效）。不传时 codex
+        // exec resume 默认 read-only 沙箱（写拒绝、网络受限）——全权限会话续聊静默
+        // 降级（2026-08-29 老板真机：会话创建 danger-full-access、resume 全轮
+        // read-only，写文件 Operation not permitted）。
+        // 受限/workspace-write 会话 resume 不追加：codex 默认 read-only 与受限意图
+        // 一致；workspace-write 无法在 resume 表达（--sandbox 被拒），宁严勿松。
+        c.arg("--dangerously-bypass-approvals-and-sandbox");
     }
     // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
     // 追加在固定参数后（flags-after-subcommand 对 exec / exec resume 都成立，实测）。
@@ -2655,6 +2664,63 @@ mod tests {
         let r = codex_command(std::path::Path::new("codex"), true, "tid-2", &[], true, &[]);
         assert!(r.as_std().get_args().any(|a| a == "resume"));
         assert!(r.as_std().get_args().any(|a| a == "tid-2"));
+    }
+
+    #[test]
+    fn codex_command_resume_full_access_keeps_bypass() {
+        // #180 回归护栏：resume 不追加任何沙箱参数时 codex 默认 read-only（写/网络
+        // 全拒），全权限会话续聊静默降级。全权限 resume 必须带 bypass 旗标
+        //（--sandbox 在 resume 被拒、bypass 实测可用，见 #180）。
+        let c = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-r",
+            &[],
+            false,
+            &[],
+        );
+        assert!(c.as_std().get_args().any(|a| a == "resume"));
+        assert!(
+            c.as_std()
+                .get_args()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "全权限 resume 必须带 bypass，否则续聊静默降级 read-only"
+        );
+        assert!(
+            !c.as_std().get_args().any(|a| a == "--sandbox"),
+            "resume 不支持 --sandbox（#145）"
+        );
+        // 受限 resume 不带 bypass（codex 默认 read-only 与受限意图一致）
+        let r = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-r2",
+            &[],
+            true,
+            &[],
+        );
+        assert!(
+            !r.as_std()
+                .get_args()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "受限 resume 不得带 bypass"
+        );
+        // workspace-write resume（roots 非空）不带 bypass：无法在 resume 表达，宁严勿松
+        let roots = vec![std::path::PathBuf::from("/ws")];
+        let w = codex_command(
+            std::path::Path::new("codex"),
+            true,
+            "tid-r3",
+            &[],
+            false,
+            &roots,
+        );
+        assert!(
+            !w.as_std()
+                .get_args()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "workspace-write resume 不得带 bypass（宁严勿松）"
+        );
     }
 
     #[test]
