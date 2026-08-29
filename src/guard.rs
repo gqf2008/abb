@@ -51,6 +51,19 @@ pub fn ensure_guard_files(bot_key: &str) -> std::io::Result<()> {
     ensure_guard_files_at(&guard_dir(bot_key), &std::env::current_exe()?)
 }
 
+/// #170：内容相同跳过写盘。guard 文件是静态配置（exe 路径 + 固定 JSON），每次 agent
+/// 调用都原子重写会在并发（定时任务 + 聊天消息并行）时 rename 目标被另一进程占用 →
+/// 拒绝访问（os error 5，8/28 实测「删除保护 guard 文件生成失败，已拒绝启动」）。
+/// 相同内容不写，消除并发竞争窗口；内容真变化（如 exe 路径变更）才原子写。
+fn write_guard_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
+        }
+    }
+    crate::atomic_write_text(path, content)
+}
+
 /// ensure_guard_files 的内部实现（目录/可执行文件可注入，单测用）。
 fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(guard_dir)?;
@@ -67,7 +80,7 @@ fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
             ]
         }
     });
-    crate::atomic_write_text(
+    write_guard_if_changed(
         &guard_dir.join("settings.json"),
         &serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?,
     )?;
@@ -99,7 +112,7 @@ fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<
             ]
         }
     });
-    crate::atomic_write_text(
+    write_guard_if_changed(
         &guard_dir.join("owner-settings.json"),
         &serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?,
     )?;
@@ -1565,5 +1578,34 @@ mod tests {
         .unwrap();
         let _ = root;
         let _ = ws;
+    }
+
+    #[test]
+    fn guard_write_skips_unchanged_content() {
+        // #170：内容相同跳过写盘（消除并发 rename 竞争窗口）。验证：同内容重复写
+        // 不触发写盘（mtime 不变）；内容变化（exe 路径变更）才写。
+        let guard = std::env::temp_dir().join(format!("abb-guard-skip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&guard).unwrap();
+        let path = guard.join("settings.json");
+
+        // 首次写入（内容 A）
+        write_guard_if_changed(&path, "content-a").unwrap();
+        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // 同内容重复写 → 跳过（mtime 不变）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_guard_if_changed(&path, "content-a").unwrap();
+        let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "内容相同不应触发写盘（mtime 不变）");
+        // 内容变化 → 写盘（mtime 推进）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_guard_if_changed(&path, "content-b").unwrap();
+        let mtime3 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_ne!(mtime1, mtime3, "内容变化应触发写盘");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "content-b",
+            "新内容落盘"
+        );
+        let _ = std::fs::remove_dir_all(&guard);
     }
 }
