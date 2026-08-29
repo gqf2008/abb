@@ -41,7 +41,8 @@ pub fn pending_dangerous_path(bot_key: &str) -> PathBuf {
     guard_dir(bot_key).join("pending-dangerous.json")
 }
 
-/// 幂等生成受限会话的 guard 文件（受限 spawn 前调用；内容静态，直接覆盖重写最稳）：
+/// 幂等生成受限会话的 guard 文件（受限 spawn 前调用；内容静态，同内容跳过写盘防
+/// 并发 rename 竞争，见 main.rs atomic_write_text_if_changed）：
 /// settings.json：claude PreToolUse hook 指向 `"$ABB_BIN" guard-check`
 /// （ABB_BIN 绝对路径烘焙进 command，避免依赖 hook 子进程的 env 展开）。
 /// 注：codex 侧不再生成 execpolicy——codex 0.147 实测其机制与文档不符
@@ -49,19 +50,6 @@ pub fn pending_dangerous_path(bot_key: &str) -> PathBuf {
 /// codex 受限依赖 read-only 沙箱 + 网络拦截（实测有效），见 agent.rs codex_command 注释。
 pub fn ensure_guard_files(bot_key: &str) -> std::io::Result<()> {
     ensure_guard_files_at(&guard_dir(bot_key), &std::env::current_exe()?)
-}
-
-/// #170：内容相同跳过写盘。guard 文件是静态配置（exe 路径 + 固定 JSON），每次 agent
-/// 调用都原子重写会在并发（定时任务 + 聊天消息并行）时 rename 目标被另一进程占用 →
-/// 拒绝访问（os error 5，8/28 实测「删除保护 guard 文件生成失败，已拒绝启动」）。
-/// 相同内容不写，消除并发竞争窗口；内容真变化（如 exe 路径变更）才原子写。
-fn write_guard_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
-            return Ok(());
-        }
-    }
-    crate::atomic_write_text(path, content)
 }
 
 /// ensure_guard_files 的内部实现（目录/可执行文件可注入，单测用）。
@@ -80,7 +68,10 @@ fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
             ]
         }
     });
-    write_guard_if_changed(
+    // #170：guard 文件是静态配置（exe 路径 + 固定 JSON），内容相同跳过写盘（共享
+    // helper 见 main.rs atomic_write_text_if_changed），避免并发（定时任务 + 聊天消息
+    // 并行）原子重写时 rename 目标被另一进程占用 → 拒绝访问（os error 5）。
+    crate::atomic_write_text_if_changed(
         &guard_dir.join("settings.json"),
         &serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?,
     )?;
@@ -112,7 +103,7 @@ fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<
             ]
         }
     });
-    write_guard_if_changed(
+    crate::atomic_write_text_if_changed(
         &guard_dir.join("owner-settings.json"),
         &serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?,
     )?;
@@ -1589,23 +1580,78 @@ mod tests {
         let path = guard.join("settings.json");
 
         // 首次写入（内容 A）
-        write_guard_if_changed(&path, "content-a").unwrap();
+        crate::atomic_write_text_if_changed(&path, "content-a").unwrap();
         let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
         // 同内容重复写 → 跳过（mtime 不变）
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_guard_if_changed(&path, "content-a").unwrap();
+        crate::atomic_write_text_if_changed(&path, "content-a").unwrap();
         let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(mtime1, mtime2, "内容相同不应触发写盘（mtime 不变）");
-        // 内容变化 → 写盘（mtime 推进）
+        // 内容变化 → 写盘。这里用「长度 + 内容回读」断言而非 mtime 不等式：
+        // FAT32/exFAT（2s）/ HFS+（1s）等粗粒度文件系统会把相邻两次写入压进同一
+        // 时间桶，mtime 不等式会误报失败；长度用不同值确保变化可被稳定观测。
         std::thread::sleep(std::time::Duration::from_millis(20));
-        write_guard_if_changed(&path, "content-b").unwrap();
-        let mtime3 = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_ne!(mtime1, mtime3, "内容变化应触发写盘");
+        crate::atomic_write_text_if_changed(&path, "longer-content-b").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            "longer-content-b".len() as u64,
+            "内容变化应触发写盘（长度变化）"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "content-b",
+            "longer-content-b",
             "新内容落盘"
         );
         let _ = std::fs::remove_dir_all(&guard);
+    }
+
+    #[test]
+    fn guard_ensure_skips_unchanged_content() {
+        // 集成臂：走生产调用点 ensure_guard_files_at / ensure_owner_guard_files_at——
+        // 若调用点被改回无条件原子写（#170 bug 形态），第二次调用会重写文件、
+        // mtime 前进 → 断言失败（NTFS/APFS 粒度足够；粗粒度文件系统上此断言
+        // 至多退化为恒真，不会误报失败）。
+        let root = std::env::temp_dir().join(format!("abb-guard-skip-at-{}", uuid::Uuid::new_v4()));
+        let guard = root.join("guard");
+        std::fs::create_dir_all(&guard).unwrap();
+        let exe = Path::new("C:/Program Files/ABB/abb.exe");
+
+        ensure_guard_files_at(&guard, exe).unwrap();
+        let s1 = std::fs::metadata(guard.join("settings.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        ensure_owner_guard_files_at(&guard, exe).unwrap();
+        let o1 = std::fs::metadata(guard.join("owner-settings.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ensure_guard_files_at(&guard, exe).unwrap();
+        ensure_owner_guard_files_at(&guard, exe).unwrap();
+
+        let s2 = std::fs::metadata(guard.join("settings.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let o2 = std::fs::metadata(guard.join("owner-settings.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(s1, s2, "settings.json 内容相同应跳过写盘");
+        assert_eq!(o1, o2, "owner-settings.json 内容相同应跳过写盘");
+        // 内容仍完整（hook command 烘焙 exe 路径）
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(guard.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("abb.exe"),
+            "hook command 应烘焙 exe 路径"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

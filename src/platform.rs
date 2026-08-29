@@ -659,9 +659,8 @@ fn rewrite_workspace_guides(workspaces: &std::path::Path) {
                 .replace("FEISHU_BOT_KEY", "AGENT_BRIDGE_BOT_KEY")
                 .replace("feishu-bridge", "agent-bridge")
                 .replace("飞书桥", "Agent Bridge");
-            if new != text {
-                let _ = crate::atomic_write_text(&p, &new);
-            }
+            // 内容相同跳过写盘（共享 helper，避免无谓重写）
+            let _ = crate::atomic_write_text_if_changed(&p, &new);
         }
     }
 }
