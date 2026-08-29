@@ -5,6 +5,7 @@
 //! 当前操作哪个后端的槽位由 SessionStore::new(current_backend, bot_key) 选定——即 per-bot 配置的后端。
 //! 旧扁平格式 {chat_id: {backend, session_id, started}} load 时自动迁移到对应后端的槽位。
 
+use crate::config::SandboxMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -19,6 +20,10 @@ pub struct Slot {
     pub session_id: String,
     #[serde(default)]
     pub started: bool,
+    /// #171 会话创建时的权限档位（resume 继承创建时档位，codex 沙箱在会话创建时固定）。
+    /// 档位变化对旧会话不生效 → 桥提示用户 /new 换新会话；None = 升级迁移（旧会话无记录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<SandboxMode>,
 }
 
 /// 一个 chat 的会话：按后端各存一份（缺省=该后端还没会话）。
@@ -143,6 +148,7 @@ impl SessionStore {
             let slot = Slot {
                 session_id: e.session_id,
                 started: e.started,
+                ..Default::default()
             };
             let mut entry = ChatEntry::default();
             if e.backend.eq_ignore_ascii_case("codex") {
@@ -258,8 +264,51 @@ impl SessionStore {
         let sid = uuid::Uuid::new_v4().to_string();
         slot.session_id = sid.clone();
         slot.started = false;
+        // #171：重建即新会话——清档位记录，下一轮按当前配置重新记录（防旧档位残留导致
+        // 新会话误报「档位已变化」）。
+        slot.sandbox_mode = None;
         self.save_locked(&data);
         sid
+    }
+
+    /// #171 权限档位变化感知：会话创建（未开过首轮）时记录当前档位；既有 resume 会话
+    /// 的记录档位与当前配置不符 → 返回提示（resume 继承创建时档位，#145 codex 技术限制，
+    /// 改档位对旧会话不生效，用户以为改了就生效——必须显式提示，不静默继续旧沙箱）。
+    ///
+    /// 语义：
+    /// - 新会话（started=false）：记录当前档位，返回 None（本轮即以当前档位运行，无需提示）；
+    /// - 既有会话无记录（升级迁移）：补记当前档位，返回 None（无从判断是否变化，不误报）；
+    /// - 既有会话记录 ≠ 当前：返回提示，**不覆盖记录**（本轮仍按旧档位跑，变化保持可感知，
+    ///   用户 /new 后新会话才会吃新档位并重新记录）。
+    pub fn check_sandbox_mode(&self, chat_id: &str, mode: &SandboxMode) -> Option<String> {
+        self.refresh();
+        let mut data = self.data.lock().unwrap();
+        let entry = data.entry(chat_id.to_string()).or_default();
+        let slot = Self::slot_mut(entry, &self.current_backend);
+        if slot.session_id.is_empty() {
+            return None; // 无会话（ensure 未建）：不落记录
+        }
+        if !slot.started {
+            if slot.sandbox_mode.as_ref() != Some(mode) {
+                slot.sandbox_mode = Some(*mode);
+                self.save_locked(&data);
+            }
+            return None;
+        }
+        match slot.sandbox_mode {
+            None => {
+                // 升级迁移：旧会话无档位记录 → 补记当前值，不提示（无从判断是否变化）。
+                slot.sandbox_mode = Some(*mode);
+                self.save_locked(&data);
+                None
+            }
+            Some(recorded) if recorded != *mode => Some(format!(
+                "⚠️ 权限档位已变化：当前配置为「{}」，本会话仍按创建时的「{}」运行（resume 会话档位在创建时固定）。回复 /new 换新会话后生效。",
+                mode.as_str(),
+                recorded.as_str()
+            )),
+            Some(_) => None,
+        }
     }
 
     /// set_session_id 的 CAS 版本：仅当该 chat 当前槽位的 session_id == expected 时回存，
@@ -582,6 +631,114 @@ mod tests {
 
         // 新会话（fresh）自己的回存正常
         assert!(store.set_session_id_if("oc_x", &fresh, "tid-real-2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sandbox_mode_change_detection() {
+        // #171：新会话记录档位不提示；档位变化对 resume 会话提示且不覆盖记录；
+        // 同档位不提示；落盘可重载（记录持久化）。
+        let dir = std::env::temp_dir().join(format!("abb-sessions-sb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("codex", path.clone());
+
+        // 新会话（未开过首轮）：记录档位、无提示
+        let sid = store.ensure_session("oc_x");
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            None,
+            "新会话不提示"
+        );
+        // 同档位 resume：不提示
+        assert!(store.mark_started_if("oc_x", &sid));
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            None,
+            "同档位不提示"
+        );
+        // 档位变化 → 提示且引导 /new
+        let hint = store
+            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+            .expect("档位变化应提示");
+        assert!(hint.contains("/new"), "提示应引导换新会话：{hint}");
+        assert!(hint.contains("read-only"), "提示应说明旧档位：{hint}");
+        assert!(hint.contains("full-access"), "提示应说明新档位：{hint}");
+        // 记录不覆盖：变化持续可感知（用户 /new 前不得静默吞掉差异）
+        assert!(
+            store
+                .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+                .is_some(),
+            "记录不覆盖：变化持续提示"
+        );
+        // 落盘持久化：重载后仍感知变化
+        let store2 = SessionStore::new_at("codex", path.clone());
+        assert!(
+            store2
+                .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+                .is_some(),
+            "重载后仍感知档位变化"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sandbox_mode_migration_records_silently() {
+        // #171 升级迁移：旧会话槽位无 sandbox_mode 字段 → 补记当前档位不提示；
+        // 之后档位再变化才提示。
+        let dir =
+            std::env::temp_dir().join(format!("abb-sessions-sb-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        // 旧格式槽位（无 sandbox_mode 字段，started=true 可 resume）
+        std::fs::write(
+            &path,
+            r#"{"oc_x": {"codex": {"session_id": "tid-1", "started": true}}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::new_at("codex", path.clone());
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::WorkspaceWrite),
+            None,
+            "迁移补记不提示（无从判断是否变化）"
+        );
+        assert!(
+            store
+                .check_sandbox_mode("oc_x", &SandboxMode::ReadOnly)
+                .is_some(),
+            "迁移后档位再变化才提示"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reset_session_clears_sandbox_record() {
+        // #171：重建（claude 自愈换 UUID）即新会话——清档位记录，下一轮按当前配置
+        // 重新记录，不残留旧档位误报「档位已变化」。
+        let dir =
+            std::env::temp_dir().join(format!("abb-sessions-sb-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("codex", path.clone());
+        let sid = store.ensure_session("oc_x");
+        // 新会话首轮前记录初始档位
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            None
+        );
+        assert!(store.mark_started_if("oc_x", &sid));
+        // 已记录旧档位并感知变化
+        assert!(store
+            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+            .is_some());
+        // 重建：换新 UUID + 清记录 + started 复位
+        let fresh = store.reset_session("oc_x");
+        assert_ne!(fresh, sid);
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::FullAccess),
+            None,
+            "重建后按新档位重新记录，不残留旧档位误报"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
