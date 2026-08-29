@@ -162,9 +162,12 @@ pub async fn run() {
             run_bot(bot, cfg, msgr, router, stop).await;
         }));
     }
-    // 等所有 bot 循环结束（正常只有关停广播才会结束）
+    // 等所有 bot 循环结束（正常只有关停广播才会结束）。
+    // #179：关闭时限——单个 bot 循环卡死（如 WS 发送挂起，历史缺陷已由 send_with_timeout
+    // 根治，这里兜底）时不能无限等：30s 后强制继续退出流程（进程退出 → flock 释放，
+    // 看门/新实例可接管；残留任务随 runtime drop 取消）。
     for h in handles {
-        let _ = h.await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), h).await;
     }
     // #69 优雅关闭：close（拒绝新登记）→ cancel（幂等，信号任务可能已广播）→ wait
     // 等全部在册任务收尾；指标汇总一行日志（shutdown_wait_ms 等）。
