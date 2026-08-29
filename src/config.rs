@@ -14,9 +14,9 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::PathBuf;
 
-/// #168 通用权限档位（每 bot 可配置，默认 auto；三后端 claude/codex/pi 按档位翻译）：
-/// - Auto（默认）：保持现状——claude：owner 全权限、受限会话受限白名单；codex：
-///   owner → workspace-write(+bridge_dir)、受限会话 → read-only
+/// #168/#172 通用权限档位（每 bot 可配置，默认 auto；三后端 claude/codex/pi 按档位翻译）：
+/// - Auto（默认）：owner 会话**全权限直跑**（老板拍板 2026-08-29：不跑沙箱）——claude
+///   skip-permissions、codex bypass；受限会话（授权者隔离）read-only 保留
 /// - ReadOnly：claude 白名单只剩读/查工具；codex `--sandbox read-only`（全盘只读）
 /// - WorkspaceWrite：claude 工作区可写白名单；codex `--sandbox workspace-write` + bridge_dir 可写根
 /// - FullAccess：claude --dangerously-skip-permissions；codex --dangerously-bypass-...（全权限，UI 有警示）
@@ -95,6 +95,11 @@ pub struct BotConfig {
         skip_serializing_if = "is_auto_sandbox"
     )]
     pub sandbox_mode: SandboxMode,
+    /// #174 同名自动区分后缀（-2/-3…；空 = 唯一/首个）。assign_unique_keys 分配——
+    /// 同名 bot 的 key（workspace 目录/登记隔离键）自动唯一，**不强制用户改名**。
+    /// GUI 保存落盘固化；load 内存分配（确定性，重启重算同结果）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_suffix: String,
     /// 飞书：**owner（管理员）** 白名单（逗号/分号/空白分隔多个 open_id）。负责管理 bot、
     /// 生成授权码。与「授权者」（granted_ids，授权码添加）分开。微信 bot 忽略。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -219,6 +224,7 @@ impl Default for BotConfig {
             primary_chat_id: String::new(),
             backend: String::new(),
             sandbox_mode: SandboxMode::Auto,
+            key_suffix: String::new(),
             owner_open_id: String::new(),
             wx_token: String::new(),
             wx_base_url: String::new(),
@@ -452,14 +458,72 @@ fn default_history_retention_days() -> u32 {
     30
 }
 
+/// #174 迁移辅助：list 结构 JSON 里指定字段（bot_key/target_bot/source_bot）替换。
+/// 文件缺失/解析失败 → 跳过（幂等）；替换后原子写。
+fn replace_json_string_field(path: &std::path::Path, field: &str, old: &str, new: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(arr) = v.as_array_mut() {
+        for item in arr.iter_mut() {
+            if let Some(k) = item.get_mut(field) {
+                if k.as_str() == Some(old) {
+                    *k = serde_json::Value::String(new.to_string());
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        if let Ok(out) = serde_json::to_string_pretty(&v) {
+            let _ = crate::atomic_write_text(path, &out);
+        }
+    }
+}
+
+/// #174 迁移辅助：session_state.json 的 paused 对象键（bot_key）替换。
+fn replace_session_state_key(path: &std::path::Path, old: &str, new: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(paused) = v.get_mut("paused").and_then(|p| p.as_object_mut()) {
+        if let Some(entry) = paused.remove(old) {
+            paused.insert(new.to_string(), entry);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(out) = serde_json::to_string_pretty(&v) {
+            let _ = crate::atomic_write_text(path, &out);
+        }
+    }
+}
+
 /// 会话过期阈值默认值（天）：最后一条历史消息距今超过该值视为过期候选（session_gc）。
 fn default_session_gc_days() -> u32 {
     7
 }
 
 impl BotConfig {
-    /// 隔离键：name 优先，空则 app_id 尾 6 位；再空则 "default"。
-    pub fn key(&self) -> String {
+    /// 隔离键基础段（不含 suffix）：#174 优先级 = app_id（飞书/钉钉平台唯一）→
+    /// wx_user_id（微信登录者 id，一个微信号同一时刻只登录一个 bot，实际唯一）→
+    /// name（兜底：未登录微信等）→ app_id 尾 6 位 → "default"。
+    /// 唯一性兜底由 assign_unique_keys 分配 key_suffix（-2/-3…）。
+    fn key_base(&self) -> String {
+        if !self.app_id.is_empty() {
+            return sanitize(&self.app_id);
+        }
+        if !self.wx_user_id.is_empty() {
+            return sanitize(&self.wx_user_id);
+        }
         if !self.name.is_empty() {
             return sanitize(&self.name);
         }
@@ -470,6 +534,31 @@ impl BotConfig {
             return sanitize(&tail);
         }
         "default".to_string()
+    }
+
+    /// #174 迁移用：旧 key 逻辑（#174 之前 = name 或 app_id 尾 6，无 suffix）。
+    /// 迁移判定：旧 key ≠ 新 key → 目录/登记需要搬到新 key。
+    fn legacy_key(&self) -> String {
+        if !self.name.is_empty() {
+            return sanitize(&self.name);
+        }
+        let chars: Vec<char> = self.app_id.chars().collect();
+        if chars.len() >= 6 {
+            let tail: String = chars[chars.len() - 6..].iter().collect();
+            return sanitize(&tail);
+        }
+        "default".to_string()
+    }
+
+    /// 隔离键：app_id → wx_user_id → name → app_id 尾 6（+ 同名 suffix）。
+    /// workspace 目录/虚拟 Bot 登记按 key 隔离——改名/同名都不串扰（#174）。
+    pub fn key(&self) -> String {
+        let base = self.key_base();
+        if self.key_suffix.is_empty() {
+            base
+        } else {
+            format!("{base}{}", self.key_suffix)
+        }
     }
 
     /// 是否微信通道。
@@ -887,6 +976,8 @@ impl Config {
         }
         cfg.migrate_legacy();
         cfg.migrate_ding_owner();
+        // #174：内存分配同名 suffix（确定性；GUI 保存时落盘固化）
+        cfg.assign_unique_keys();
         Ok(cfg)
     }
 
@@ -977,6 +1068,82 @@ impl Config {
     }
 
     /// 缺哪些必填项（缺则服务不能跑）。
+    /// #174：同名 bot 自动分配唯一 key 后缀（-2/-3…），**不强制用户改名**——显示名
+    /// 保持（name 不动），仅内部隔离键（workspace 目录/登记）自动区分。确定性：
+    /// 按 config 顺序分配，同一 config 每次分配结果相同（重启稳定）。GUI 保存时
+    /// 调用（suffix 落盘固化）；load 时也在内存分配（不落盘，重启重算同结果）。
+    pub fn assign_unique_keys(&mut self) {
+        let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for b in &mut self.bots {
+            let base = b.key_base();
+            let n = counts.entry(base.clone()).or_insert(0);
+            *n += 1;
+            b.key_suffix = if *n == 1 {
+                String::new()
+            } else {
+                format!("-{n}")
+            };
+        }
+    }
+
+    /// #174 一次性迁移：旧 key（name/尾 6）→ 新 key（app_id/wx_user_id 优先）。
+    /// 启动时调用（Config::load 之后、bot 循环启动前）。幂等：新目录/新值存在即跳过；
+    /// 失败只 log 警告不阻塞启动（数据仍在旧目录，日志指明）。迁移范围：
+    /// - workspaces/<old>/ 与 guard/<old>/ 目录 rename → <new>
+    /// - virtual-bots.json / teams.json / deliveries.json 的 bot_key 字段替换
+    /// - session_state.json 的 paused 对象键替换
+    pub fn migrate_keys(&self) {
+        self.migrate_keys_at(&crate::bridge_dir());
+    }
+
+    /// migrate_keys 的内部实现（base 目录可注入，单测用临时目录不碰真实数据）。
+    fn migrate_keys_at(&self, bridge: &std::path::Path) {
+        for b in &self.bots {
+            let old_key = b.legacy_key();
+            let new_key = b.key();
+            if old_key == new_key {
+                continue;
+            }
+            crate::log!(
+                "[config] 迁移隔离键 {} → {}（#174：key 改为 app_id/wx_user_id 优先）",
+                old_key,
+                new_key
+            );
+            // 目录 rename（目标已存在 = 已迁移/同名冲突，跳过）
+            for sub in ["workspaces", "guard"] {
+                let old_p = bridge.join(sub).join(&old_key);
+                let new_p = bridge.join(sub).join(&new_key);
+                if old_p.exists() && !new_p.exists() {
+                    if let Err(e) = std::fs::rename(&old_p, &new_p) {
+                        crate::log!(
+                            "[config] ⚠️ 迁移目录 {} → {} 失败: {e:#}（数据仍在旧目录）",
+                            old_p.display(),
+                            new_p.display()
+                        );
+                    }
+                }
+            }
+            // 登记/状态文件 bot_key 替换（读改写；缺失/损坏跳过）
+            for f in ["virtual-bots.json", "teams.json"] {
+                replace_json_string_field(&bridge.join(f), "bot_key", &old_key, &new_key);
+            }
+            // deliveries：target_bot / source_bot 两个 bot key 字段
+            replace_json_string_field(
+                &bridge.join("deliveries.json"),
+                "target_bot",
+                &old_key,
+                &new_key,
+            );
+            replace_json_string_field(
+                &bridge.join("deliveries.json"),
+                "source_bot",
+                &old_key,
+                &new_key,
+            );
+            replace_session_state_key(&bridge.join("session_state.json"), &old_key, &new_key);
+        }
+    }
+
     pub fn missing(&self) -> Vec<String> {
         let mut v = Vec::new();
         let mut any_enabled = false;
@@ -1431,8 +1598,8 @@ mod tests {
         assert_eq!(c.bots[0].app_id, "cli_old");
         assert_eq!(c.bots[0].primary_chat_id, "oc_main");
         assert!(c.app_id.is_empty(), "迁移后旧字段清空");
-        // key 用 bot_name
-        assert_eq!(c.bots[0].key(), "庆小丰");
+        // #174：key 用 app_id（平台唯一，不再用 bot_name）
+        assert_eq!(c.bots[0].key(), "cli_old");
         // 旧全局 owner 复制进 bots[0]：迁移后 owner 判定只读 per-bot，不复制会静默变成响应所有人
         assert_eq!(c.bots[0].owner_open_id, "ou_x");
     }
@@ -1937,12 +2104,13 @@ mod tests {
             app_id: "cli_a75884b6c733900b".into(),
             ..Default::default()
         };
-        assert_eq!(b.key(), "33900b"); // app_id 尾 6 位
+        // #174：app_id 非空 → key = 完整 app_id（平台唯一，不再截尾 6）
+        assert_eq!(b.key(), "cli_a75884b6c733900b");
         let named = BotConfig {
             name: "my bot/一号".into(),
             ..Default::default()
         };
-        assert_eq!(named.key(), "mybot一号"); // 去空白/斜杠
+        assert_eq!(named.key(), "mybot一号"); // 无 app_id → name 兜底（去空白/斜杠）
     }
 
     #[test]
@@ -2188,4 +2356,148 @@ mod tests {
         let back_old: Config = serde_json::from_str(old).unwrap();
         assert!(back_old.bots[0].mention_modes.is_empty(), "旧文件兼容缺省");
     }
+}
+
+#[test]
+fn key_priority_appid_wxuserid_name() {
+    // #174：key 优先级 app_id（平台唯一）→ wx_user_id（微信登录者）→ name（兜底）
+    let b = BotConfig {
+        name: "显示名".into(),
+        app_id: "cli_a920466cc538dcc0".into(),
+        wx_user_id: "wx_user_1".into(),
+        ..Default::default()
+    };
+    assert_eq!(b.key(), "cli_a920466cc538dcc0", "app_id 优先于 name");
+    let wx = BotConfig {
+        name: "微信bot".into(),
+        app_id: String::new(),
+        wx_user_id: "wx_user_1".into(),
+        ..Default::default()
+    };
+    assert_eq!(wx.key(), "wx_user_1", "微信无 app_id → wx_user_id");
+    let named = BotConfig {
+        name: "高哥".into(),
+        app_id: String::new(),
+        wx_user_id: String::new(),
+        ..Default::default()
+    };
+    assert_eq!(named.key(), "高哥", "兜底 name");
+    // suffix 追加（clippy：field reassign 用 ..clone() 构造）
+    let dup = BotConfig {
+        key_suffix: "-2".into(),
+        ..named.clone()
+    };
+    assert_eq!(dup.key(), "高哥-2");
+}
+
+#[test]
+fn assign_unique_keys_same_name_gets_suffix() {
+    // #174：同名 bot 自动分配 -2/-3（显示名不动，隔离键唯一）；确定性
+    let mut cfg = Config {
+        bots: vec![
+            BotConfig {
+                name: "同名bot".into(),
+                app_id: "cli_aaaa1111".into(),
+                ..Default::default()
+            },
+            BotConfig {
+                name: "同名bot".into(),
+                app_id: "cli_bbbb2222".into(),
+                ..Default::default()
+            },
+            BotConfig {
+                name: "同名bot".into(),
+                app_id: "cli_cccc3333".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    let keys: Vec<String> = cfg.bots.iter().map(|b| b.key()).collect();
+    assert_eq!(
+        keys[0], "cli_aaaa1111",
+        "第一个无 suffix（app_id 不同本就唯一）"
+    );
+    assert_eq!(keys[1], "cli_bbbb2222");
+    assert_eq!(keys[2], "cli_cccc3333");
+    {
+        let mut ks = keys.clone();
+        ks.sort();
+        ks.dedup();
+        assert_eq!(ks.len(), 3, "app_id 唯一 → key 全部唯一");
+    }
+    // 无 app_id（微信）同名 → suffix 兜底
+    cfg.bots = vec![
+        BotConfig {
+            name: "微信A".into(),
+            app_id: String::new(),
+            ..Default::default()
+        },
+        BotConfig {
+            name: "微信A".into(),
+            app_id: String::new(),
+            ..Default::default()
+        },
+    ];
+    cfg.assign_unique_keys();
+    let keys: Vec<String> = cfg.bots.iter().map(|b| b.key()).collect();
+    assert_eq!(keys, vec!["微信A", "微信A-2"], "同名微信 bot 自动 -2");
+    // 确定性：重跑结果相同
+    cfg.assign_unique_keys();
+    assert_eq!(cfg.bots[1].key(), "微信A-2");
+}
+
+#[test]
+fn migrate_keys_renames_dirs_and_replaces_registrations() {
+    // #174：旧 key（name）目录/登记 → 新 key（app_id）；幂等（二次调用无变化）
+    let base = std::env::temp_dir().join(format!("abb-migrate-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
+    std::fs::create_dir_all(base.join("guard/旧名bot")).unwrap();
+    std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
+    std::fs::write(
+        base.join("virtual-bots.json"),
+        r#"[{"bot_key":"旧名bot","chat_id":"oc_1","role_name":"r1","created_at":1}]"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("session_state.json"),
+        r#"{"paused":{"旧名bot":{"oc_x":{"since":1,"by":"b"}}}}"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config {
+        bots: vec![BotConfig {
+            name: "旧名bot".into(),
+            app_id: "cli_newkey123456".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    cfg.migrate_keys_at(&base);
+
+    // 目录已迁移
+    assert!(base
+        .join("workspaces/cli_newkey123456/pending.json")
+        .exists());
+    assert!(!base.join("workspaces/旧名bot").exists(), "旧目录应已搬走");
+    assert!(base.join("guard/cli_newkey123456").exists());
+    // 登记替换
+    let vb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("virtual-bots.json")).unwrap())
+            .unwrap();
+    assert_eq!(vb[0]["bot_key"], "cli_newkey123456");
+    // session_state 键替换
+    let ss: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("session_state.json")).unwrap())
+            .unwrap();
+    assert!(ss["paused"].get("cli_newkey123456").is_some());
+    assert!(ss["paused"].get("旧名bot").is_none());
+    // 幂等：二次调用不报错、目录不再变
+    cfg.migrate_keys_at(&base);
+    assert!(base
+        .join("workspaces/cli_newkey123456/pending.json")
+        .exists());
+    let _ = std::fs::remove_dir_all(&base);
 }
