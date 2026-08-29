@@ -63,20 +63,60 @@ pub fn workspace_dir(bot_key: &str) -> std::path::PathBuf {
     bridge_dir().join("workspaces").join(bot_key)
 }
 
+/// Windows：rename 覆盖目标被另一进程短暂占用（打开方无 FILE_SHARE_DELETE，如杀毒
+/// 扫描、并发写方换名瞬间）→ MoveFileExW 报 ERROR_ACCESS_DENIED（os error 5）/
+/// ERROR_SHARING_VIOLATION（32），#170 实测的「拒绝访问」。短暂退避重试后仍失败
+/// 才上报；unix rename 无此占用语义，直接原样转发。
+#[cfg(windows)]
+fn rename_replace_retry(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    let mut last_err = None;
+    for _ in 0..3 {
+        match std::fs::rename(tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if matches!(e.raw_os_error(), Some(5) | Some(32)) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename 重试耗尽")))
+}
+
+#[cfg(not(windows))]
+fn rename_replace_retry(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
 /// 原子写文本文件（tmp + rename）。config/sessions/jobs/botstatus 共用，避免崩溃留半截。
 /// #137：唯一 tmp 名防并发写方互踩——固定名时进程 A rename 后，进程 B 的 rename
 /// 拿不到 tmp → ENOENT（定时任务并发触发 guard 文件生成竞争失败）。与
 /// `atomic_write_sensitive` 同款：uuid 唯一 tmp + rename，失败清理残留。
+/// #170：rename 覆盖目标被占用时（os error 5）走 `rename_replace_retry` 短暂重试。
 pub fn atomic_write_text(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, text)?;
-    match std::fs::rename(&tmp, path) {
+    match rename_replace_retry(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
+}
+
+/// 内容相同跳过写盘（#170）：静态配置文件（如 guard settings.json、workspace 引导
+/// 文档）每次调用都原子重写，会在并发（定时任务 + 聊天消息并行）时 rename 目标被
+/// 另一进程占用 → 拒绝访问（os error 5）。相同内容不写，消除稳态并发竞争窗口；
+/// 内容真变化（如 exe 路径变更）才走 `atomic_write_text`（其内部 rename 仍有
+/// `rename_replace_retry` 兜底首次写/变更瞬间的残留窗口）。
+pub fn atomic_write_text_if_changed(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == text {
+            return Ok(());
+        }
+    }
+    atomic_write_text(path, text)
 }
 
 /// 原子写敏感文本文件：uuid 唯一 tmp + rename + 落盘前收紧 0o600（unix）。
@@ -92,7 +132,7 @@ pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Re
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    match std::fs::rename(&tmp, path) {
+    match rename_replace_retry(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
