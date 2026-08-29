@@ -1,6 +1,6 @@
 [package]
 name = "agent-bridge"
-version = "2.21.5"
+version = "2.21.6"
 edition = "2021"
 build = "build.rs"
 
