@@ -1047,8 +1047,12 @@ mod tests {
     /// #191 回归护栏（信号路径）：SIGTERM 到达返回 true（真实信号，调用方记日志）。
     /// 给测试进程自己发 SIGTERM——tokio 信号处理器已捕获，进程不死，仅本测试的
     /// helper 收到事件。三个信号测试共享 SIGNAL_TEST_LOCK 串行化（独立审查 F1）：
-    /// 并行时发出的 SIGTERM 可能被其他测试 helper 的注册/parked 窗口消费致偶发 flake。
+    /// 并行时发出的 SIGTERM 可能被别的测试 helper 的注册/parked 窗口消费致偶发 flake。
+    /// 仅 unix：libc::kill 是 unix API（Windows CI 编译炸，#192 教训；false 路径
+    /// 两测跨平台仍跑）。
+    #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 串行锁必须横跨注册→发信号全程（F1），lint 会让位于测试目的
     async fn wait_exit_signal_or_shutdown_returns_true_on_sigterm() {
         let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = tokio_util::sync::CancellationToken::new(); // 无关停广播
@@ -1066,6 +1070,7 @@ mod tests {
     /// #191 回归护栏（让位路径·先取消）：关停令牌已取消 → 立即返回 false
     ///（自发起关停，不记信号日志）。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 串行锁必须横跨注册→发信号全程（F1），lint 会让位于测试目的
     async fn wait_exit_signal_or_shutdown_returns_false_when_already_cancelled() {
         let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = tokio_util::sync::CancellationToken::new();
@@ -1085,6 +1090,7 @@ mod tests {
     /// 唤醒返回 false——这正是自发起关停时 tracker.wait() 不再永等的前提
     ///（旧实现无此分支，parked 至烧满 20s 总期限强退）。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 串行锁必须横跨注册→发信号全程（F1），lint 会让位于测试目的
     async fn wait_exit_signal_or_shutdown_returns_false_on_late_cancel() {
         let _serial = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = tokio_util::sync::CancellationToken::new();

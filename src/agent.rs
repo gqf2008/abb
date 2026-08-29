@@ -503,14 +503,24 @@ pub async fn run(
     };
 
     // #171 档位变化感知：会话创建时记录档位；resume 旧会话的记录档位 ≠ 当前配置 →
-    // 提示用户 /new 换新会话（旧会话 resume 继承创建时档位，#145 codex 技术限制，
-    // 改档位对旧会话不生效——不提示会静默继续旧沙箱，用户以为改了就生效）。
+    // 提示一次（#185：#180 起 resume 按当前解析档位运行，记录随即覆盖为本轮档位，
+    // 文案与实际一致、至多提示一次；旧版 codex <0.150 resume 无 bypass 支持仍会
+    // 静默降级 read-only——宁严勿松，#180 版本门控的已知限制）。
     // 记在 session_key 槽位（与 ensure_with_started/mark_started_if 同 key，#14）。
     // sessions=None（定时任务/会话归纳）不感知；pi 无沙箱体系不感知。
     let sandbox_change_hint = if matches!(backend, Backend::Claude | Backend::Codex) {
         sessions.and_then(|s| s.check_sandbox_mode(session_key, &sandbox))
     } else {
         None
+    };
+    // #185 审查 F4：codex resume 的档位表达限制——workspace-write 全版本降级
+    // read-only（--sandbox 被 resume 拒绝、无 bypass 参数，#145/#180），提示现场
+    // 如实补降级说明，防「文案高于实际」（与 #185 要修的失实同类）。claude 无此限制。
+    let sandbox_change_hint = match (&sandbox_change_hint, backend, &sandbox) {
+        (Some(h), Backend::Codex, crate::config::SandboxMode::WorkspaceWrite) => Some(format!(
+            "{h}\n（codex 限制：resume 不支持 workspace-write，本轮实际按 read-only 运行。）"
+        )),
+        _ => sandbox_change_hint,
     };
 
     // 受限会话：生成/刷新 guard 文件（claude settings.json hook）。

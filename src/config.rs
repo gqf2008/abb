@@ -211,6 +211,18 @@ pub struct BotConfig {
 
 /// 手动 Default：enabled 默认 true（derive(Default) 对 bool 给 false，会把新/迁移 bot 误设成停用）。
 /// 所有 `BotConfig { ..Default::default() }` 站点因此都拿到 enabled=true。
+impl BotConfig {
+    /// 测试辅助：跨模块单测构造（字段私有，platform 等模块的迁移测试用）。
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, app_id: &str) -> Self {
+        Self {
+            name: name.into(),
+            app_id: app_id.into(),
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
@@ -538,7 +550,7 @@ impl BotConfig {
 
     /// #174 迁移用：旧 key 逻辑（#174 之前 = name 或 app_id 尾 6，无 suffix）。
     /// 迁移判定：旧 key ≠ 新 key → 目录/登记需要搬到新 key。
-    fn legacy_key(&self) -> String {
+    pub(crate) fn legacy_key(&self) -> String {
         if !self.name.is_empty() {
             return sanitize(&self.name);
         }
@@ -1099,120 +1111,262 @@ impl Config {
     /// 目录是否为空：Ok(true)=空、Ok(false)=非空、Err=读取失败（不存在/权限等）。
     /// migrate_keys 的空目标判定用（#178）。读失败与「非空」分开——两者处置不同
     ///（读失败=环境异常，日志要能区分），沉默跳过会把搁浅伪装成成功。
-    fn dir_empty(p: &std::path::Path) -> std::io::Result<bool> {
+    pub(crate) fn dir_empty(p: &std::path::Path) -> std::io::Result<bool> {
         let mut it = std::fs::read_dir(p)?;
         Ok(it.next().is_none())
     }
 
     /// migrate_keys 的内部实现（base 目录可注入，单测用临时目录不碰真实数据）。
-    fn migrate_keys_at(&self, bridge: &std::path::Path) {
-        for b in &self.bots {
-            let old_key = b.legacy_key();
-            let new_key = b.key();
-            if old_key == new_key {
+    ///
+    /// #186 碰撞感知：legacy_key 不含同名后缀（-2/-3），同名双 bot 共享同一
+    /// old_key；且某 bot 的 old_key 可能恰是另一 bot 的 new_key（bot2.name 恰等
+    /// 于 bot1.app_id 的链式变体）。逐 bot 朴素「rename + 全局字符串替换」在这两
+    /// 种布局下会把目录/登记整份过户。分三阶段：
+    /// 1. 计划：收集 movers（old≠new），按 old_key 占用检测 contested——
+    ///    同 old_key 多 bot 占用且存在「留守 bot」（new==old，同名首位常态）时，
+    ///    mover 的 rename 与登记替换全部响亮跳过（目录/登记归留守 bot，mover 以
+    ///    新键全新开始——宁可不迁不可迁错）；无留守（理论形态）仅首个 claimant
+    ///    迁移。另记 skipped 明细供响亮日志。
+    /// 2. 顺序：chain（mover 的**迁入名** dir_src/new 仍被另一 mover 的**迁出名**
+    ///    占用）按依赖拓扑排序——被依赖者（占用方）先行，否则先行者刚搬入的目录
+    ///    会被后来者二次搬走。环（对称互指）以临时目录名断环两步搬。
+    /// 3. 执行：逐 mover 迁目录（#178 空/非空/不可读三态处置）+ 登记替换。
+    pub(crate) fn migrate_keys_at(&self, bridge: &std::path::Path) {
+        struct Move {
+            /// 登记替换与依赖检测用的逻辑旧键（不受断环 tmp 改名影响）
+            old: String,
+            new: String,
+            /// 目录搬移的实际来源（断环后指向 tmp 名）
+            dir_src: String,
+            /// 登记替换的来源：None=跳过（断环且旧键被共享，宁可不迁不可迁错）；
+            /// Some(src)=替换 src→new（常态为 old；断环预替换后为 tmp）
+            reg_from: Option<String>,
+        }
+        // 计划：old_key → 使用者下标；movers 及 contested 判定
+        let mut claims: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, b) in self.bots.iter().enumerate() {
+            claims.entry(b.legacy_key()).or_default().push(i);
+        }
+        let mut skipped: Vec<(usize, String, String, &'static str)> = Vec::new();
+        let mut movers: Vec<Move> = Vec::new();
+        for (i, b) in self.bots.iter().enumerate() {
+            let old = b.legacy_key();
+            let new = b.key();
+            if old == new {
                 continue;
             }
+            let claimants = &claims[&old];
+            let mut skip = false;
+            if claimants.len() > 1 {
+                let stayer = claimants
+                    .iter()
+                    .any(|j| *j != i && self.bots[*j].key() == old);
+                // 留守 bot（new==old）占用：目录/登记归它，mover 不迁（#186 主形态）
+                // 无留守（理论形态）：仅首个 claimant 迁移（「只迁移一次」）
+                let first_claimant = claimants.iter().min() == Some(&i);
+                if stayer || !first_claimant {
+                    skipped.push((
+                        i,
+                        old.clone(),
+                        new.clone(),
+                        if stayer {
+                            "旧键仍被留守 bot 占用，目录/登记不迁移（防过户）"
+                        } else {
+                            "同旧键多 bot，仅首个迁移（防过户）"
+                        },
+                    ));
+                    skip = true;
+                }
+            }
+            if !skip {
+                movers.push(Move {
+                    reg_from: Some(old.clone()),
+                    dir_src: old.clone(),
+                    old,
+                    new,
+                });
+            }
+        }
+
+        // 顺序：dir_src（迁出名）被另一 pending mover 占用（其 dir_src == 本 mover
+        // 的 new，即本 mover 要迁入的名字）→ 占用方先行。环以 tmp 名断开。
+        let mut ordered: Vec<Move> = Vec::new();
+        while !movers.is_empty() {
+            let pos = movers.iter().position(|m| {
+                !movers
+                    .iter()
+                    .any(|o| !std::ptr::eq(o, m) && o.dir_src == m.new)
+            });
+            match pos {
+                Some(p) => ordered.push(movers.remove(p)),
+                None => {
+                    // 环：断第一个——目录先改名 tmp 腾出名字，随后自然解除阻塞。
+                    // 登记替换同样需要 tmp 中转（独立审查 F1：全局字符串替换无法
+                    // 表达交换——bot2 的 a1→b2 先行后，bot1 的 b2→a1 会把两者登记
+                    // 全坍缩到 a1）。old 键无其他 bot 共享（contested 已剔除）时
+                    // 预替换 old→tmp，执行期统一按 dir_src→new 替换；共享时登记
+                    // 替换响亮跳过（宁可不迁不可迁错）。
+                    let mut m = movers.remove(0);
+                    let tmp = format!("{}.migrating-{}", m.dir_src, std::process::id());
+                    for sub in ["workspaces", "guard"] {
+                        let src = bridge.join(sub).join(&m.dir_src);
+                        if src.is_dir() {
+                            let _ = std::fs::rename(&src, bridge.join(sub).join(&tmp));
+                        }
+                    }
+                    if claims[&m.old].len() == 1 {
+                        for f in ["virtual-bots.json", "teams.json"] {
+                            replace_json_string_field(&bridge.join(f), "bot_key", &m.old, &tmp);
+                        }
+                        replace_json_string_field(
+                            &bridge.join("deliveries.json"),
+                            "target_bot",
+                            &m.old,
+                            &tmp,
+                        );
+                        replace_json_string_field(
+                            &bridge.join("deliveries.json"),
+                            "source_bot",
+                            &m.old,
+                            &tmp,
+                        );
+                        replace_session_state_key(&bridge.join("session_state.json"), &m.old, &tmp);
+                        crate::log!(
+                            "[config] 迁移键 {} ↔ {} 成环，以临时名 {} 断环两步搬（含登记）",
+                            m.old,
+                            m.new,
+                            tmp
+                        );
+                        m.dir_src = tmp.clone();
+                        m.reg_from = Some(tmp);
+                        movers.push(m);
+                    } else {
+                        crate::log!(
+                            "[config] ⚠️ 迁移键 {} ↔ {} 成环且旧键被多 bot 共享，登记替换跳过（请人工迁移）",
+                            m.old,
+                            m.new
+                        );
+                        m.reg_from = None; // 登记替换跳过（执行期按此标记）
+                        m.dir_src = tmp;
+                        movers.push(m);
+                    }
+                }
+            }
+        }
+
+        // 响亮日志：contested 跳过明细（含 bot 定位，便于人工恢复）。
+        // 独立审查 F6：bot_name（微信展示名）常为空，优先用 name。
+        for (i, old, new, reason) in &skipped {
+            let b = &self.bots[*i];
+            let display = if b.name.is_empty() {
+                b.bot_name.as_str()
+            } else {
+                b.name.as_str()
+            };
+            crate::log!(
+                "[config] ⚠️ 迁移跳过 bot「{display}」（{} → {}）：{}——数据仍在 workspaces/{old}/，请人工确认归属",
+                old,
+                new,
+                reason
+            );
+        }
+
+        // 执行：拓扑序迁目录 + 登记替换。
+        // 注意按拓扑序执行：链式场景 bot2 的 old==bot1 的 new，bot2 的替换必须
+        // 先于 bot1（否则 bot1 刚写入的新键值被 bot2 的替换二次改写）。断环 mover
+        // 的替换对为 dir_src（tmp）→ new（断环时已预替换 old→tmp）。
+        for m in &ordered {
             crate::log!(
                 "[config] 迁移隔离键 {} → {}（#174：key 改为 app_id/wx_user_id 优先）",
-                old_key,
-                new_key
+                m.old,
+                m.new
             );
-            // 目录 rename（目标已存在 = 已迁移/同名冲突，跳过）。
-            // #178：目标被预建为**空目录**时同样会跳过（GUI 启动的 legacy 迁移
-            // platform::migrate_legacy_state 会先无条件建 workspaces/<新 key>），
-            // 而迁移是一次性的——错过窗口旧数据就永久搁浅（2026-08-29 老板真机：
-            // 庆小丰 工作区整目录搁浅）。空目标也执行 rename；非空目标绝不碰
-            // （可能已有数据，防覆盖）。
             for sub in ["workspaces", "guard"] {
-                let old_p = bridge.join(sub).join(&old_key);
-                let new_p = bridge.join(sub).join(&new_key);
+                let old_p = bridge.join(sub).join(&m.dir_src);
+                let new_p = bridge.join(sub).join(&m.new);
                 if !old_p.exists() {
                     continue;
                 }
-                // 目标已存在时的处置（#178）：
-                // - 空目标：继续 rename（迁移是一次性的，空目录抢占不得搁浅旧数据）
-                // - 非空目标：响亮跳过（可能已有数据，绝不覆盖——沉默跳过会把搁浅伪装成成功）
-                // - 读失败：响亮跳过（环境异常，区别于非空，日志可分辨）
-                // POSIX：rename 原子替换空目录，单步完成（探测+删除会放大竞态窗口，审查发现）；
-                // Windows：rename 不覆盖已存在目录，必须先确认空再移除。
-                #[cfg(not(windows))]
-                if new_p.exists() {
-                    match Self::dir_empty(&new_p) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            crate::log!(
-                                "[config] ⚠️ 迁移跳过：目标 {} 非空（不覆盖），旧目录 {} 数据搁浅",
-                                new_p.display(),
-                                old_p.display()
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            crate::log!(
-                                "[config] ⚠️ 迁移跳过：目标 {} 不可读（{e}），旧目录 {} 数据搁浅",
-                                new_p.display(),
-                                old_p.display()
-                            );
-                            continue;
-                        }
-                    }
+                Self::migrate_dir(&old_p, &new_p);
+            }
+            if let Some(reg_from) = &m.reg_from {
+                for f in ["virtual-bots.json", "teams.json"] {
+                    replace_json_string_field(&bridge.join(f), "bot_key", reg_from, &m.new);
                 }
-                #[cfg(windows)]
-                if new_p.exists() {
-                    match Self::dir_empty(&new_p) {
-                        Ok(true) => {
-                            if let Err(e) = std::fs::remove_dir(&new_p) {
-                                crate::log!(
-                                    "[config] ⚠️ 迁移移除空目录 {} 失败: {e:#}（数据仍在旧目录）",
-                                    new_p.display()
-                                );
-                                continue;
-                            }
-                        }
-                        Ok(false) => {
-                            crate::log!(
-                                "[config] ⚠️ 迁移跳过：目标 {} 非空（不覆盖），旧目录 {} 数据搁浅",
-                                new_p.display(),
-                                old_p.display()
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            crate::log!(
-                                "[config] ⚠️ 迁移跳过：目标 {} 不可读（{e}），旧目录 {} 数据搁浅",
-                                new_p.display(),
-                                old_p.display()
-                            );
-                            continue;
-                        }
-                    }
-                }
-                if let Err(e) = std::fs::rename(&old_p, &new_p) {
+                replace_json_string_field(
+                    &bridge.join("deliveries.json"),
+                    "target_bot",
+                    reg_from,
+                    &m.new,
+                );
+                replace_json_string_field(
+                    &bridge.join("deliveries.json"),
+                    "source_bot",
+                    reg_from,
+                    &m.new,
+                );
+                replace_session_state_key(&bridge.join("session_state.json"), reg_from, &m.new);
+            }
+        }
+    }
+
+    /// 单目录迁移（#178 三态处置 + POSIX 单步 rename / Windows 先确认空再移除）。
+    /// 返回是否完成 rename（目标非空/不可读时响亮跳过返回 false，数据留在旧目录）。
+    fn migrate_dir(old_p: &std::path::Path, new_p: &std::path::Path) -> bool {
+        if !new_p.exists() {
+            return match std::fs::rename(old_p, new_p) {
+                Ok(()) => true,
+                Err(e) => {
                     crate::log!(
                         "[config] ⚠️ 迁移目录 {} → {} 失败: {e:#}（数据仍在旧目录）",
                         old_p.display(),
                         new_p.display()
                     );
+                    false
                 }
+            };
+        }
+        match Self::dir_empty(new_p) {
+            Ok(true) => {}
+            Ok(false) => {
+                crate::log!(
+                    "[config] ⚠️ 迁移跳过：目标 {} 非空（不覆盖），旧目录 {} 数据搁浅",
+                    new_p.display(),
+                    old_p.display()
+                );
+                return false;
             }
-            // 登记/状态文件 bot_key 替换（读改写；缺失/损坏跳过）
-            for f in ["virtual-bots.json", "teams.json"] {
-                replace_json_string_field(&bridge.join(f), "bot_key", &old_key, &new_key);
+            Err(e) => {
+                crate::log!(
+                    "[config] ⚠️ 迁移跳过：目标 {} 不可读（{e}），旧目录 {} 数据搁浅",
+                    new_p.display(),
+                    old_p.display()
+                );
+                return false;
             }
-            // deliveries：target_bot / source_bot 两个 bot key 字段
-            replace_json_string_field(
-                &bridge.join("deliveries.json"),
-                "target_bot",
-                &old_key,
-                &new_key,
-            );
-            replace_json_string_field(
-                &bridge.join("deliveries.json"),
-                "source_bot",
-                &old_key,
-                &new_key,
-            );
-            replace_session_state_key(&bridge.join("session_state.json"), &old_key, &new_key);
+        }
+        #[cfg(windows)]
+        {
+            // Windows：rename 不覆盖已存在目录，必须先移除空目标
+            if let Err(e) = std::fs::remove_dir(new_p) {
+                crate::log!(
+                    "[config] ⚠️ 迁移移除空目录 {} 失败: {e:#}（数据仍在旧目录）",
+                    new_p.display()
+                );
+                return false;
+            }
+        }
+        match std::fs::rename(old_p, new_p) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log!(
+                    "[config] ⚠️ 迁移目录 {} → {} 失败: {e:#}（数据仍在旧目录）",
+                    old_p.display(),
+                    new_p.display()
+                );
+                false
+            }
         }
     }
 
@@ -2642,5 +2796,194 @@ fn migrate_keys_skips_nonempty_target() {
         "keep",
         "非空目标内容不得被破坏"
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migrate_keys_same_name_dual_bot_no_transfer() {
+    // #186 主形态回归护栏：同名双 bot（无 app_id/wx_user_id）共享 legacy_key——
+    // bot1 留守（new==old）、bot2 是 mover。旧实现 bot2 会把 bot1 的目录 rename
+    // 走、登记全局替换过户；新实现 contested 响亮跳过：目录/登记归留守 bot，
+    // mover 以新键全新开始（宁可不迁不可迁错）。
+    let base = std::env::temp_dir().join(format!("abb-migrate-samename-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("workspaces/龙虾")).unwrap();
+    std::fs::write(base.join("workspaces/龙虾/bot1-data.json"), "bot1").unwrap();
+    // 旧方案下双 bot 共用 key「龙虾」的登记（无法按 key 拆分归属）
+    std::fs::write(
+        base.join("virtual-bots.json"),
+        r#"[{"bot_key": "龙虾", "name": "角色A"}, {"bot_key": "龙虾", "name": "角色B"}]"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config {
+        bots: vec![
+            BotConfig {
+                name: "龙虾".into(),
+                ..Default::default()
+            },
+            BotConfig {
+                name: "龙虾".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    assert_eq!(cfg.bots[0].key(), "龙虾", "首位留守：new==old");
+    assert_eq!(cfg.bots[1].key(), "龙虾-2", "次位带唯一后缀");
+    cfg.migrate_keys_at(&base);
+
+    // 留守 bot1 的目录原位不动（不得被 bot2 的 rename 搬走）
+    assert!(
+        base.join("workspaces/龙虾/bot1-data.json").exists(),
+        "留守 bot 的目录必须原位保留（防过户）"
+    );
+    // mover bot2 不得把 bot1 的目录搬成自己的：全新开始，无过户目录
+    assert!(
+        !base.join("workspaces/龙虾-2").exists(),
+        "contested 时 mover 不得迁走共享旧目录"
+    );
+    // 登记不替换：仍归留守键（旧实现会把全部 龙虾→龙虾-2 过户给 bot2）
+    let vb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("virtual-bots.json")).unwrap())
+            .unwrap();
+    assert!(
+        vb.as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["bot_key"] == "龙虾"),
+        "登记不得过户给 mover：{vb}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migrate_keys_chain_moves_both_without_transfer() {
+    // #186 链式变体回归护栏：bot2.name 恰等于 bot1.app_id——bot1 迁入的名字正是
+    // bot2 要迁出的名字。必须 bot2 先搬走、bot1 再搬入（目录与登记替换皆然），
+    // 否则 bot1 刚搬入的数据/登记被 bot2 二次搬走。
+    let base = std::env::temp_dir().join(format!("abb-migrate-chain-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("workspaces/x2bot")).unwrap();
+    std::fs::create_dir_all(base.join("workspaces/app1")).unwrap();
+    std::fs::write(base.join("workspaces/x2bot/marker1"), "bot1").unwrap();
+    std::fs::write(base.join("workspaces/app1/marker2"), "bot2").unwrap();
+    std::fs::write(
+        base.join("virtual-bots.json"),
+        r#"[{"bot_key": "x2bot"}, {"bot_key": "app1"}]"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config {
+        bots: vec![
+            BotConfig {
+                name: "x2bot".into(),
+                app_id: "app1".into(),
+                ..Default::default()
+            },
+            BotConfig {
+                name: "app1".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    assert_eq!(cfg.bots[0].key(), "app1");
+    assert_eq!(cfg.bots[1].key(), "app1-2");
+    cfg.migrate_keys_at(&base);
+
+    // 各归各位：bot1 的数据在 app1（其新键），bot2 的数据在 app1-2（其新键）
+    assert_eq!(
+        std::fs::read_to_string(base.join("workspaces/app1/marker1"))
+            .ok()
+            .as_deref(),
+        Some("bot1"),
+        "bot1 数据必须落在自己的新键目录（不得被 bot2 二次搬走）"
+    );
+    assert_eq!(
+        std::fs::read_to_string(base.join("workspaces/app1-2/marker2"))
+            .ok()
+            .as_deref(),
+        Some("bot2"),
+        "bot2 数据必须先搬出自己的旧键目录（该名字归 bot1）"
+    );
+    assert!(
+        !base.join("workspaces/x2bot").exists(),
+        "bot1 旧目录应已搬走"
+    );
+    // 登记各归各位：拓扑序保证 bot2 的替换先于 bot1（否则 bot1 刚写入的 app1
+    // 会被 bot2 的 app1→app1-2 替换二次改写过户）
+    let vb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("virtual-bots.json")).unwrap())
+            .unwrap();
+    assert_eq!(vb[0]["bot_key"], "app1", "bot1 登记归 app1");
+    assert_eq!(vb[1]["bot_key"], "app1-2", "bot2 登记归 app1-2");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn migrate_keys_swap_cycle_resolves_via_tmp() {
+    // #186 环形变体回归护栏：bot1.name==bot2.app_id 且 bot2.name==bot1.app_id——
+    // 互指成环（b2→a1 与 a1→b2 互为迁入/迁出）。以临时目录名断环两步搬，最终
+    // 各归各位（目录与登记皆不串）。
+    let base = std::env::temp_dir().join(format!("abb-migrate-cycle-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(base.join("workspaces/b2")).unwrap();
+    std::fs::create_dir_all(base.join("workspaces/a1")).unwrap();
+    std::fs::write(base.join("workspaces/b2/marker1"), "bot1").unwrap();
+    std::fs::write(base.join("workspaces/a1/marker2"), "bot2").unwrap();
+    // 登记（独立审查 F1：环形下登记替换需 tmp 中转，必须断言防二次改写过户）
+    std::fs::write(
+        base.join("virtual-bots.json"),
+        r#"[{"bot_key": "b2"}, {"bot_key": "a1"}]"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config {
+        bots: vec![
+            BotConfig {
+                name: "b2".into(),
+                app_id: "a1".into(),
+                ..Default::default()
+            },
+            BotConfig {
+                name: "a1".into(),
+                app_id: "b2".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    cfg.assign_unique_keys();
+    assert_eq!(cfg.bots[0].key(), "a1");
+    assert_eq!(cfg.bots[1].key(), "b2");
+    cfg.migrate_keys_at(&base);
+
+    assert_eq!(
+        std::fs::read_to_string(base.join("workspaces/a1/marker1"))
+            .ok()
+            .as_deref(),
+        Some("bot1"),
+        "bot1 数据落位 a1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(base.join("workspaces/b2/marker2"))
+            .ok()
+            .as_deref(),
+        Some("bot2"),
+        "bot2 数据落位 b2"
+    );
+    // 无 tmp 残留
+    let leftovers: Vec<_> = std::fs::read_dir(base.join("workspaces"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(leftovers.len(), 2, "断环 tmp 不得残留：{leftovers:?}");
+    // 登记各归各位（F1：断环 tmp 中转后 bot2 先行、bot1 经 tmp→a1，不得坍缩）
+    let vb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("virtual-bots.json")).unwrap())
+            .unwrap();
+    assert_eq!(vb[0]["bot_key"], "a1", "bot1 登记归 a1");
+    assert_eq!(vb[1]["bot_key"], "b2", "bot2 登记归 b2");
     let _ = std::fs::remove_dir_all(&base);
 }

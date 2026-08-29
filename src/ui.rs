@@ -1299,11 +1299,12 @@ fn configure_backend() -> Result<()> {
 pub fn run_gui() -> Result<()> {
     configure_backend()?;
 
-    // 旧「单 bot 平铺」数据 → workspaces/<key>/（幂等）
+    // 旧「单 bot 平铺」数据 → workspaces/<key>/（幂等）。#187：顺带把
+    // workspaces/<legacy_key>/ 折入 dest，service 的隔离键迁移不再被非空 dest 拦住
+    //（contested——旧键被别的 bot 留守——时不折入，归属两序一致）。
+    // flat 遗留是单 bot 时代产物，归首 bot；bot2+ 的迁移由 service 的 migrate_keys 负责。
     if let Ok(c) = Config::load() {
-        if let Some(b) = c.bots.first() {
-            platform::migrate_legacy_state(&b.key());
-        }
+        platform::migrate_legacy_state(&c);
     }
 
     let tray = Tray::new()?;
