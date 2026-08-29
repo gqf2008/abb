@@ -162,12 +162,18 @@ pub async fn run() {
             run_bot(bot, cfg, msgr, router, stop).await;
         }));
     }
-    // 等所有 bot 循环结束（正常只有关停广播才会结束）。
-    // #179：关闭时限——单个 bot 循环卡死（如 WS 发送挂起，历史缺陷已由 send_with_timeout
-    // 根治，这里兜底）时不能无限等：30s 后强制继续退出流程。
-    for h in handles {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), h).await;
-    }
+    // 等所有 bot 循环结束。⚠️ 服务期的常态就是等在这里（等关停广播），**绝不能包超时**：
+    // 健康的 bot 循环不会在固定时限内结束，超时必然触发——「启动后 30s×bot 数自动关机
+    // → 看门狗按崩溃重拉」的无限重启风暴（#189 真机诊断：2 bot 60s、实验室 1 bot 30s
+    // 分毫不差；#184 初版 22s 风暴与 v2.21.3「启动 61s 后二停挂死占锁」同为它的形态）。
+    // #179 的 30s 关闭时限只作用于**关闭路径**（关停广播已到仍不退出的卡死 bot）：
+    // 先无期限等服务期结束（关停广播或全部 bot 自行退出），进入收尾后才逐 handle 限时。
+    wait_bots_or_shutdown(
+        &mut handles,
+        crate::tasks::shutdown_token(),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
     // #184：收尾总期限——从「bot 循环全部结束」**之后**起算，包住 shutdown_wait
     //（等 recover/session-import/larkskills 等启动期短命任务收尾；网络安装/磁盘
     // 挂死会永久挂起——2026-08-29 真机：v2.21.3 启动 61s 后二停挂死占锁）。
@@ -185,6 +191,41 @@ pub async fn run() {
         std::process::exit(1);
     }
     crate::log!("[service] 已退出");
+}
+
+/// 服务期等待 bot 循环：等「关停广播」或「全部 bot 循环结束」哪个先到，**无期限**。
+/// 期限（per_bot_shutdown_bound）只在进入收尾（广播已到 / bot 自行退出）后才逐
+/// handle 生效——#179 卡死兜底语义保留，但绝不再作用于服务期（#189：服务期加超时
+/// = 健康服务 30s×bot 数后自关机 → 看门狗按崩溃重拉的重启风暴根源）。
+/// 抽成独立函数 + 令牌/期限可注入，便于单测（run() 收尾是 process::exit，进程内不可测）。
+async fn wait_bots_or_shutdown(
+    handles: &mut [tokio::task::JoinHandle<()>],
+    stop: tokio_util::sync::CancellationToken,
+    per_bot_shutdown_bound: std::time::Duration,
+) {
+    // 服务期：逐个等 bot 循环结束，任一步可被关停广播打断。无期限。
+    // 索引推进（完成即跳过）+ is_finished 守卫：JoinHandle 完成后再次 poll 会
+    // panic，必须保证每个 handle 至多 poll 一次。
+    let mut i = 0;
+    while i < handles.len() {
+        if handles[i].is_finished() {
+            i += 1;
+            continue;
+        }
+        tokio::select! {
+            _ = &mut handles[i] => { i += 1; } // 该 bot 自行退出，继续等下一个
+            _ = stop.cancelled() => break,     // 关停广播 → 进入限时收尾
+        }
+    }
+    // 进入收尾：关停广播已到（或全部 bot 自行退出，fail-open 语义不变）。
+    // #179：卡死的 bot 循环（如 WS 发送挂起，历史缺陷已由 send_with_timeout 根治，
+    // 这里兜底）不能无限等：逐个限时后强制继续退出流程。
+    for h in handles.iter_mut() {
+        if h.is_finished() {
+            continue;
+        }
+        let _ = tokio::time::timeout(per_bot_shutdown_bound, h).await;
+    }
 }
 
 /// 跨会话投递消费循环：轮询 deliveries.json（agent 的 deliver CLI 落盘），逐条经路由表投递。
@@ -887,6 +928,65 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #189 回归护栏（服务期无期限）：健康 bot 循环（不自行结束、无关停广播）期间，
+    /// 等待绝不能提前返回进入关闭路径——旧实现把 30s 逐 handle 时限放在服务期，
+    /// 健康服务 30s×bot 数后必然自关停（真机 2 bot=60s、实验室 1 bot=30s 重启风暴）。
+    /// 探针期内不返回即「无期限」。
+    #[tokio::test]
+    async fn wait_bots_or_shutdown_never_times_out_on_healthy_bots() {
+        let mut handles = vec![tokio::spawn(async {
+            // 健康 bot：正常服务期不结束（300s 远超探针）
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        })];
+        let stop = tokio_util::sync::CancellationToken::new(); // 无广播
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            wait_bots_or_shutdown(&mut handles, stop, std::time::Duration::from_millis(50)),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "健康 bot 期间服务期等待必须无期限（探针超时=正确，提前返回=重启风暴回归）"
+        );
+    }
+
+    /// #189 回归护栏（关闭路径限时）：关停广播到达后，卡死的 bot 循环仍被逐 handle
+    /// 时限兜底（#179 语义保留）——总耗时受 bound 支配，不得无限等。
+    #[tokio::test]
+    async fn wait_bots_or_shutdown_bounds_stuck_bot_after_cancel() {
+        let mut handles = vec![tokio::spawn(async {
+            // 卡死 bot：关停广播也不退出
+            std::future::pending::<()>().await;
+        })];
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel(); // 关停广播已到
+        let t = std::time::Instant::now();
+        wait_bots_or_shutdown(&mut handles, stop, std::time::Duration::from_millis(100)).await;
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "关停后卡死 bot 必须被逐 handle 时限兜底，实际 {elapsed:?}"
+        );
+    }
+
+    /// #189 回归护栏（fail-open 保留）：全部 bot 循环自行退出（如微信会话过期 -14）
+    /// 时，即使无关停广播也进入收尾——与 v2.21.2 原语义一致（循环退出 → 进程优雅
+    /// 退出 → 看门狗重启）。
+    #[tokio::test]
+    async fn wait_bots_or_shutdown_returns_when_all_bots_exit() {
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![tokio::spawn(async {})]; // bot 立即退出
+        let stop = tokio_util::sync::CancellationToken::new(); // 无广播
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_bots_or_shutdown(&mut handles, stop, std::time::Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "全部 bot 自行退出后必须进入收尾（fail-open），不得无限等广播"
+        );
+    }
 
     fn test_job(
         prompt: &str,
