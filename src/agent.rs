@@ -513,6 +513,15 @@ pub async fn run(
     } else {
         None
     };
+    // #185 审查 F4：codex resume 的档位表达限制——workspace-write 全版本降级
+    // read-only（--sandbox 被 resume 拒绝、无 bypass 参数，#145/#180），提示现场
+    // 如实补降级说明，防「文案高于实际」（与 #185 要修的失实同类）。claude 无此限制。
+    let sandbox_change_hint = match (&sandbox_change_hint, backend, &sandbox) {
+        (Some(h), Backend::Codex, crate::config::SandboxMode::WorkspaceWrite) => Some(format!(
+            "{h}\n（codex 限制：resume 不支持 workspace-write，本轮实际按 read-only 运行。）"
+        )),
+        _ => sandbox_change_hint,
+    };
 
     // 受限会话：生成/刷新 guard 文件（claude settings.json hook）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动

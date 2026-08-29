@@ -571,12 +571,20 @@ pub fn set_autostart(_enable: bool) -> Result<()> {
 /// 在新增平铺文件时静默分叉：闸门漏判 → dest 不建 → rename 静默失败数据搁浅）。
 const LEGACY_FLAT_FILES: [&str; 2] = ["sessions.json", "jobs.json"];
 
-pub fn migrate_legacy_state(bot: &crate::config::BotConfig) {
-    migrate_legacy_state_at(&crate::bridge_dir(), bot);
+pub fn migrate_legacy_state(cfg: &crate::config::Config) {
+    // flat 遗留是单 bot 时代产物，归首 bot；bot2+ 的隔离键迁移由 service 的
+    // migrate_keys 负责（职责边界）。
+    if let Some(b) = cfg.bots.first() {
+        migrate_legacy_state_at(&crate::bridge_dir(), &cfg.bots, b);
+    }
 }
 
 /// 内部实现（base 可注入，单测不碰真实 ~/.agent-bridge）。
-fn migrate_legacy_state_at(base: &std::path::Path, bot: &crate::config::BotConfig) {
+fn migrate_legacy_state_at(
+    base: &std::path::Path,
+    bots: &[crate::config::BotConfig],
+    bot: &crate::config::BotConfig,
+) {
     let new_key = bot.key();
     let dest = base.join("workspaces").join(&new_key);
     // #187：旧数据候选有三处——平铺 json、旧 workspace/ 目录、workspaces/<legacy_key>/
@@ -584,7 +592,14 @@ fn migrate_legacy_state_at(base: &std::path::Path, bot: &crate::config::BotConfi
     let old_ws = base.join("workspace");
     let flat_pending = LEGACY_FLAT_FILES.iter().any(|f| base.join(f).exists());
     let legacy_dir = base.join("workspaces").join(bot.legacy_key());
-    let legacy_dir_pending = legacy_dir.is_dir() && legacy_dir != dest;
+    // #187 审查 F5：legacy_key 被别的 bot 留守（其 key==legacy_key，同名双 bot 且
+    // 首位带 app_id 的形态）时**不 fold**——该目录归留守 bot（service 的 contested
+    // 规则同样判给它），两序归属才一致；否则 GUI 折给首 bot、service 判给留守者，
+    // 同一目录两序发散。
+    let contested = bots
+        .iter()
+        .any(|o| !std::ptr::eq(o, bot) && o.key() == bot.legacy_key());
+    let legacy_dir_pending = legacy_dir.is_dir() && legacy_dir != dest && !contested;
     if old_ws.is_dir() || flat_pending || legacy_dir_pending {
         let _ = std::fs::create_dir_all(&dest);
     }
@@ -612,10 +627,8 @@ fn migrate_legacy_state_at(base: &std::path::Path, bot: &crate::config::BotConfi
     // #187：隔离键旧目录折入——GUI 先于 service 跑时，把 workspaces/<legacy_key>/
     // 逐项并入 dest（绝不覆盖已有项），service 的 migrate_keys 不再被非空 dest 拦住
     //（#178 修复后只响亮跳过，数据照样搁浅）；service 先跑时旧目录已被 rename 成
-    // dest，此步自然 no-op。两序皆收敛，平铺/目录两类遗留都不搁浅。
-    // 该旧目录只属于本 bot（flat 遗留是单 bot 时代的产物，归 bots.first()——与
-    // ui.rs 只对首 bot 调用本函数一致；bot2+ 的隔离键迁移由 service 的 migrate_keys
-    // 负责，GUI 不越界）。逐项搬移天然幂等且不覆盖，可安全重入。
+    // dest，此步自然 no-op。两序皆收敛。contested（留守 bot 占用旧键）时不折入，
+    // 归属两序一致（见上 F5 注释）。逐项搬移天然幂等且不覆盖，可安全重入。
     if legacy_dir_pending {
         if let Ok(entries) = std::fs::read_dir(&legacy_dir) {
             for e in entries.flatten() {
@@ -626,6 +639,16 @@ fn migrate_legacy_state_at(base: &std::path::Path, bot: &crate::config::BotConfi
             }
         }
         let _ = std::fs::remove_dir(&legacy_dir); // 仅当空了才成功
+                                                  // #187 审查 F7：目标同名冲突会让部分条目滞留旧目录（每次 GUI 启动静默
+                                                  // 重试）——响亮落日志，别把搁浅伪装成成功。
+        if legacy_dir.is_dir() && matches!(crate::config::Config::dir_empty(&legacy_dir), Ok(false))
+        {
+            crate::log!(
+                "[migrate] ⚠️ 旧目录 {} 部分内容因同名未折入 {}，已保留原位，请人工处理",
+                legacy_dir.display(),
+                dest.display()
+            );
+        }
     }
     crate::log!("[migrate] 旧单 bot 数据已并入 workspaces/{new_key}/（幂等）");
 }
@@ -718,7 +741,7 @@ mod tests {
         std::fs::write(base.join("sessions.json"), r#"{"a":1}"#).unwrap();
 
         let b = legacy_bot();
-        migrate_legacy_state_at(&base, &b);
+        migrate_legacy_state_at(&base, std::slice::from_ref(&b), &b);
 
         // dest 同时收到两路数据（隔离键旧目录 + 平铺）
         assert!(
@@ -748,7 +771,7 @@ mod tests {
         // 平铺遗留还在（GUI 从未跑过）
         std::fs::write(base.join("jobs.json"), r#"[]"#).unwrap();
 
-        migrate_legacy_state_at(&base, &legacy_bot());
+        migrate_legacy_state_at(&base, std::slice::from_ref(&legacy_bot()), &legacy_bot());
 
         assert!(
             base.join("workspaces/cli_newkey123456/jobs.json").exists(),
@@ -757,6 +780,42 @@ mod tests {
         assert!(
             !base.join("workspaces/旧名bot").exists(),
             "fold 不得重建旧目录（service 已 rename 走，no-op）"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #187 审查 F5 回归护栏（contested fold 跳过）：首 bot 带 app_id、第二 bot
+    /// 同名留守（key==首 bot 的 legacy_key）→ GUI fold 必须跳过（目录归留守 bot，
+    /// 与 service 的 contested 规则两序一致，不折给首 bot）。
+    #[test]
+    fn migrate_legacy_state_skips_fold_when_legacy_key_contested() {
+        let base = std::env::temp_dir().join(format!("abb-legacy-ct-{}", uuid::Uuid::new_v4()));
+        // 隔离键旧目录 workspaces/x1（被留守 bot2 的 key 占用）
+        std::fs::create_dir_all(base.join("workspaces/x1")).unwrap();
+        std::fs::write(base.join("workspaces/x1/data.json"), "d").unwrap();
+
+        let bots = vec![
+            crate::config::BotConfig::for_test("x1", "a1"),
+            crate::config::BotConfig::for_test("x1", ""),
+        ];
+        let first = &bots[0];
+        assert_eq!(first.legacy_key(), "x1", "首 bot legacy=name");
+        assert_eq!(first.key(), "a1", "首 bot 新键=app_id");
+        assert_eq!(
+            bots[1].key(),
+            "x1",
+            "留守 bot 的 key 即首 bot 的 legacy_key"
+        );
+        migrate_legacy_state_at(&base, &bots, first);
+
+        // contested：目录不得被折入首 bot 的 dest，原位保留归留守 bot
+        assert!(
+            base.join("workspaces/x1/data.json").exists(),
+            "留守占用的旧目录不得被 fold 折走"
+        );
+        assert!(
+            !base.join("workspaces/a1").exists(),
+            "contested 时不得为首 bot 建 dest（无其他可搬数据）"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
