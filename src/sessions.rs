@@ -300,14 +300,18 @@ impl SessionStore {
 
     /// #171 权限档位变化感知；#185 修正语义：#180 起 resume 按**当前解析档位**运行
     /// （全权限档位还会追加 bypass），旧文案「仍按创建时档位」失实、不覆盖记录会
-    /// 每条消息刷屏——现改为提示一次并把记录覆盖为本轮档位。codex resume 的
-    /// workspace-write 降级限制由 agent.rs 提示现场补充说明（本函数无后端语境）。
+    /// 每条消息刷屏——现改为提示一次并把记录覆盖为本轮档位。
+    /// #198：codex 档位变更**自动重建会话**（轮换 sid、started 复位——等价 reset），
+    /// 本轮以全新 exec 按新档位运行（resume 继承首轮沙箱，不重建新档位不生效）；
+    /// claude 不轮换（每轮旗标即生效）、pi 无沙箱体系。
     ///
     /// 语义：
     /// - 新会话（started=false）：记录当前档位，返回 None（本轮即以当前档位运行）；
     /// - 既有会话无记录（升级迁移）：补记当前档位，返回 None（无从判断是否变化，不误报）；
-    /// - 既有会话记录 ≠ 当前：返回提示一次，记录覆盖为本轮档位（下轮同配置不再提示）。
-    pub fn check_sandbox_mode(&self, chat_id: &str, mode: &SandboxMode) -> Option<String> {
+    /// - 既有会话记录 ≠ 当前：返回 (提示一次, rotated)，记录覆盖为本轮档位
+    ///   （rotated=true=codex：调用方置 rebuilt 让桥写 pending 标记，下一条消息
+    ///   注入历史一次——上下文接续）。
+    pub fn check_sandbox_mode(&self, chat_id: &str, mode: &SandboxMode) -> Option<(String, bool)> {
         self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
@@ -334,28 +338,30 @@ impl SessionStore {
                 // #198：codex 档位变更 → 自动重建会话（等价 reset：轮换 sid、started
                 // 复位）——resume 继承首轮沙箱（#196 实测 0.150.1），不重建则新档位
                 // 不生效（切到 workspace-write 写不了）。重建后本轮以全新 exec 按新
-                // 档位运行，历史保留、#49 注入接续。仅 codex：claude 每轮旗标即生效
+                // 档位运行；调用方据 rotated 置 rebuilt → 桥写 pending 标记，下一条
+                // 消息注入历史一次（上下文接续）。仅 codex：claude 每轮旗标即生效
                 //（轮换反而丢上下文）、pi 无沙箱体系。
-                let rotated = self.current_backend.eq_ignore_ascii_case("codex");
-                if rotated {
+                let should_rotate = self.current_backend.eq_ignore_ascii_case("codex");
+                if should_rotate {
                     slot.session_id = uuid::Uuid::new_v4().to_string();
                     slot.started = false;
                 }
                 slot.sandbox_mode = Some(*mode);
                 self.save_locked(&data);
-                if rotated {
-                    Some(format!(
-                        "⚠️ 权限档位已变化：已自动重建会话（历史保留、上下文接续），本轮起按「{}」运行（此前「{}」）。",
+                let hint = if should_rotate {
+                    format!(
+                        "⚠️ 权限档位已变化：已自动重建会话（本轮起按「{}」运行，此前「{}」；旧会话上下文将在下一条消息注入接续）。",
                         mode.as_str(),
                         recorded.as_str()
-                    ))
+                    )
                 } else {
-                    Some(format!(
+                    format!(
                         "⚠️ 权限档位已变化：本轮起按当前配置「{}」运行（此前记录为「{}」）。",
                         mode.as_str(),
                         recorded.as_str()
-                    ))
-                }
+                    )
+                };
+                Some((hint, should_rotate))
             }
             Some(_) => None,
         }
@@ -791,9 +797,10 @@ mod tests {
             "同档位不提示"
         );
         // 档位变化 → 提示一次，文案与实际一致（本轮起按新档位）
-        let hint = store
+        let (hint, rotated) = store
             .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
             .expect("档位变化应提示");
+        assert!(rotated, "codex 档位变更必须轮换会话（#198）");
         assert!(hint.contains("本轮起"), "提示应说明本轮起按新档位：{hint}");
         assert!(
             !hint.contains("仍按创建时"),

@@ -160,6 +160,22 @@ pub trait AgentRunner: Send + Sync {
     ) -> Result<RunOutcome, String>;
 }
 
+/// #198：档位变更后的会话快照重取——changed=true 时从 store 重取 (sid, started)
+/// （codex 变更轮换后取新 sid+非 resume，本轮全新 exec 按新档位）；changed=false
+/// 或无 store 时原值返回（claude/pi/未变更会话零变化）。
+fn resync_after_sandbox_change(
+    sessions: Option<&SessionStore>,
+    session_key: &str,
+    sid: String,
+    resume: bool,
+    changed: bool,
+) -> (String, bool) {
+    match (changed, sessions) {
+        (true, Some(s)) => s.ensure_with_started(session_key),
+        _ => (sid, resume),
+    }
+}
+
 /// 默认实现：原样转发本模块的自由函数 `run`（spawn 真实 claude/codex 子进程）。
 pub struct RealAgentRunner;
 
@@ -525,11 +541,15 @@ pub async fn run(
     // read-only」的观察来自 bypass 记录的会话（#180 已加 bypass 旗标解决）。
     // 记在 session_key 槽位（与 ensure_with_started/mark_started_if 同 key，#14）。
     // sessions=None（定时任务/会话归纳）不感知；pi 无沙箱体系不感知。
-    let sandbox_change_hint = if matches!(backend, Backend::Claude | Backend::Codex) {
+    // #198：check 返回 (提示, rotated)——codex 变更时已重建会话（轮换 sid），
+    // rotated 供 run 置 rebuilt（桥写 pending 标记，下一条消息注入历史一次）。
+    let sandbox_change = if matches!(backend, Backend::Claude | Backend::Codex) {
         sessions.and_then(|s| s.check_sandbox_mode(session_key, &sandbox))
     } else {
         None
     };
+    let sandbox_change_hint =
+        sandbox_change.as_ref().map(|(hint, _rotated)| hint.clone());
     // #185 审查 F4 的降级说明已移除（#196 实测推翻，0.150.1）：`codex exec resume`
     // 继承首轮沙箱——workspace-write 会话（含 #194 虚拟 Bot 会话）resume 轮可写
     // cwd（vb 目录）、cwd 外沙箱拒绝；「按 read-only 运行」的提示与实际相反。
@@ -564,21 +584,25 @@ pub async fn run(
     let provider = crate::config::Config::provider_for_bot_key(bot_key);
     let inject = build_injection(backend, provider.as_ref())?;
 
-    let mut sid = session_id.to_string();
-    let mut is_resume = resume;
     // #198：档位变更时 check_sandbox_mode 已重建 codex 会话（轮换 sid、started 复位）
-    // ——从 store 重取：本轮以新 sid 首轮 exec（新 --sandbox 档位立即生效），不以旧
-    // sid resume（resume 会继承旧沙箱，新档位不生效）。claude/pi 无轮换，重取为
-    // 原值零变化。sessions=None（定时任务）无档位感知，跳过。
-    if let Some(s) = sessions {
-        let (sid_now, res_now) = s.ensure_with_started(session_key);
-        sid = sid_now;
-        is_resume = res_now;
-    }
-    // #54：同 sid 会话自愈重建标志。claude already-in-use 换 UUID 路径不置位（sid 已
-    // 变）——但 marker 失效本身不会带来注入（started 被 mark 回 true 后 !resume 闸不再
-    // 开），bridge 按「Claude && resume && final_sid != 入口 sid」另行补写 pending。
-    let mut rebuilt = false;
+    // ——仅在该场景从 store 重取：本轮以新 sid 首轮 exec（新 --sandbox 档位立即生效），
+    // 不以旧 sid resume（resume 继承旧沙箱，新档位不生效）。限定变更场景重取：
+    // claude/pi 及未变更会话严格零变化——含 /new、CLI reset 落在桥快照与重取之间
+    // 竞态的形态（独立审查 F3：此前无条件重取会让 claude/pi 在竞态下改跑新 sid）。
+    let (sid, is_resume) = resync_after_sandbox_change(
+        sessions,
+        session_key,
+        session_id.to_string(),
+        resume,
+        sandbox_change.is_some(),
+    );
+    // #198（独立审查 F1）：轮换会话按 #54 同款置 rebuilt——本轮成功后桥写 pending
+    // 标记，下一条消息注入历史一次（上下文接续）；本轮 Cancelled/Failed 时 run_once
+    // 对 rebuilt 槽位 reset_session 自愈（下一条走 !resume 注入闸），恰为正确行为。
+    let mut rebuilt = sandbox_change
+        .as_ref()
+        .map(|(_, rotated)| *rotated)
+        .unwrap_or(false);
     for attempt in 0..2 {
         match run_once(
             backend,
