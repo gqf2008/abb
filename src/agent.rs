@@ -506,8 +506,8 @@ pub async fn run(
     //（agent cwd 即该目录）。后端差异（如实）：
     // - codex ≥0.146：workspace-write 可写域 = cwd(vb)+roots([vb])——写仅限自己
     //   目录；读全盘不受限。已知取舍：$ABB_BIN job add/deliver 的 bridge_dir 落盘
-    //   域不可写（跨会话投递/定时任务在 codex vb 会话内会报写盘失败）；resume 轮
-    //   无沙箱参数表达，按 read-only 运行（提示如实告知）。
+    //   域不可写（跨会话投递/定时任务在 codex vb 会话内会报写盘失败）。resume 轮
+    //   继承首轮沙箱（#196 实测 0.150.1：cwd 内可写、cwd 外拒）——无需特殊处理。
     // - codex <0.146：roots 空 → bypass（与 owner 旧版回退一致，无隔离）。
     // - claude：guard 双区（写=vb，读=vb∪bot 工作区）+ workspace-write 白名单，
     //   完整满足边界；$ABB_BIN 白名单命令不受沙箱限制（deliver/job 正常）。
@@ -518,9 +518,11 @@ pub async fn run(
     }
 
     // #171 档位变化感知：会话创建时记录档位；resume 旧会话的记录档位 ≠ 当前配置 →
-    // 提示一次（#185：#180 起 resume 按当前解析档位运行，记录随即覆盖为本轮档位，
-    // 文案与实际一致、至多提示一次；旧版 codex <0.150 resume 无 bypass 支持仍会
-    // 静默降级 read-only——宁严勿松，#180 版本门控的已知限制）。
+    // 提示一次（#185：resume 按当前解析档位运行，记录随即覆盖为本轮档位，文案与
+    // 实际一致、至多提示一次）。
+    // #196 实测（0.150.1，2026-08-30）：`codex exec resume` **继承首轮记录的沙箱**
+    //（workspace-write 会话 resume：cwd 内可写、cwd 外沙箱拒绝）——早期「resume 默认
+    // read-only」的观察来自 bypass 记录的会话（#180 已加 bypass 旗标解决）。
     // 记在 session_key 槽位（与 ensure_with_started/mark_started_if 同 key，#14）。
     // sessions=None（定时任务/会话归纳）不感知；pi 无沙箱体系不感知。
     let sandbox_change_hint = if matches!(backend, Backend::Claude | Backend::Codex) {
@@ -528,15 +530,9 @@ pub async fn run(
     } else {
         None
     };
-    // #185 审查 F4：codex resume 的档位表达限制——workspace-write 全版本降级
-    // read-only（--sandbox 被 resume 拒绝、无 bypass 参数，#145/#180），提示现场
-    // 如实补降级说明，防「文案高于实际」（与 #185 要修的失实同类）。claude 无此限制。
-    let sandbox_change_hint = match (&sandbox_change_hint, backend, &sandbox) {
-        (Some(h), Backend::Codex, crate::config::SandboxMode::WorkspaceWrite) => Some(format!(
-            "{h}\n（codex 限制：resume 不支持 workspace-write，本轮实际按 read-only 运行。）"
-        )),
-        _ => sandbox_change_hint,
-    };
+    // #185 审查 F4 的降级说明已移除（#196 实测推翻，0.150.1）：`codex exec resume`
+    // 继承首轮沙箱——workspace-write 会话（含 #194 虚拟 Bot 会话）resume 轮可写
+    // cwd（vb 目录）、cwd 外沙箱拒绝；「按 read-only 运行」的提示与实际相反。
 
     // 受限会话：生成/刷新 guard 文件（claude settings.json hook）。
     // 必须在 spawn 前完成——hook 配置未就位就启动 agent 等于裸奔，失败则拒绝启动
@@ -1051,10 +1047,12 @@ pub(crate) fn sandbox_mode_params(
 /// roots 空性（roots 空同时编码「FullAccess」与「旧 codex 无 --add-dir 回退」，两义混用
 /// 会让旧 codex 上的 workspace-write 意图会话被提权成全权限——审查发现）。
 /// 只有「全权限直跑」档位（FullAccess / Auto+owner）resume 才追加 bypass；
-/// ReadOnly/WorkspaceWrite/受限一律不追加（codex resume 默认 read-only 与受限意图一致；
-/// workspace-write 无法在 resume 表达——`--sandbox` 被拒——宁严勿松）。
+/// ReadOnly/WorkspaceWrite/受限一律不追加——#196 实测（0.150.1）resume **继承首轮
+/// 沙箱**（workspace-write 会话 resume：cwd 内可写、cwd 外拒），不追加即为正确档位；
+/// ReadOnly/受限继承 read-only 与意图一致。历史上「resume 默认 read-only」的观察
+/// 出自 bypass 记录的会话（无沙箱可继承——#180 bypass 旗标即为此补）。
 /// codex_resume_bypass_ok：版本门控（首个实测支持 resume bypass 的版本为 0.150；
-/// 更老版本不追加——保持旧行为 read-only，避免 unexpected argument 每轮硬失败）。
+/// 更老版本不追加——保持旧行为，避免 unexpected argument 每轮硬失败）。
 /// 纯函数便于单测（映射矩阵全组合）。
 pub(crate) fn codex_resume_bypass(
     sandbox: crate::config::SandboxMode,
@@ -1128,8 +1126,9 @@ pub(crate) fn codex_command(
         // #180：全权限档位（FullAccess/Auto-owner）resume 追加 bypass——判定在调用方
         // 由 codex_resume_bypass 按「解析后档位 + 版本门控」预先算好（与
         // sandbox_mode_params 同表同源）。受限/workspace-write resume 恒不追加：
-        // codex 默认 read-only 与受限意图一致；workspace-write 无法在 resume 表达
-        //（--sandbox 被拒），宁严勿松。
+        // #196 实测 resume 继承首轮沙箱——workspace-write 会话续聊仍 workspace-write
+        //（cwd 内可写）、ReadOnly/受限继承 read-only 与意图一致；bypass 记录的会话
+        // 无沙箱可继承（#180 加旗标的由来），宁严勿松。
         c.arg("--dangerously-bypass-approvals-and-sandbox");
     }
     // 桥内 OpenAI 兼容供应商 → -c 覆盖 model_provider/base_url/wire_api/env_key。
