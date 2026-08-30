@@ -566,6 +566,15 @@ pub async fn run(
 
     let mut sid = session_id.to_string();
     let mut is_resume = resume;
+    // #198：档位变更时 check_sandbox_mode 已重建 codex 会话（轮换 sid、started 复位）
+    // ——从 store 重取：本轮以新 sid 首轮 exec（新 --sandbox 档位立即生效），不以旧
+    // sid resume（resume 会继承旧沙箱，新档位不生效）。claude/pi 无轮换，重取为
+    // 原值零变化。sessions=None（定时任务）无档位感知，跳过。
+    if let Some(s) = sessions {
+        let (sid_now, res_now) = s.ensure_with_started(session_key);
+        sid = sid_now;
+        is_resume = res_now;
+    }
     // #54：同 sid 会话自愈重建标志。claude already-in-use 换 UUID 路径不置位（sid 已
     // 变）——但 marker 失效本身不会带来注入（started 被 mark 回 true 后 !resume 闸不再
     // 开），bridge 按「Claude && resume && final_sid != 入口 sid」另行补写 pending。

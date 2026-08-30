@@ -330,17 +330,32 @@ impl SessionStore {
                 None
             }
             Some(recorded) if recorded != *mode => {
-                // #185：#180 起 resume 按当前解析档位运行（全权限档位还会追加
-                // bypass），旧文案「仍按创建时档位」与现实相反；且「变化不覆盖记录」
-                // 语义下记录恒旧 → 每条消息都提示一次。改为：提示一次 + 记录即
-                // 覆盖为本轮档位（本轮确实按它跑）——提示至多一次、文案与实际一致。
+                // #185：提示一次 + 记录即覆盖为本轮档位（提示至多一次、文案与实际一致）。
+                // #198：codex 档位变更 → 自动重建会话（等价 reset：轮换 sid、started
+                // 复位）——resume 继承首轮沙箱（#196 实测 0.150.1），不重建则新档位
+                // 不生效（切到 workspace-write 写不了）。重建后本轮以全新 exec 按新
+                // 档位运行，历史保留、#49 注入接续。仅 codex：claude 每轮旗标即生效
+                //（轮换反而丢上下文）、pi 无沙箱体系。
+                let rotated = self.current_backend.eq_ignore_ascii_case("codex");
+                if rotated {
+                    slot.session_id = uuid::Uuid::new_v4().to_string();
+                    slot.started = false;
+                }
                 slot.sandbox_mode = Some(*mode);
                 self.save_locked(&data);
-                Some(format!(
-                    "⚠️ 权限档位已变化：本轮起按当前配置「{}」运行（此前记录为「{}」）。",
-                    mode.as_str(),
-                    recorded.as_str()
-                ))
+                if rotated {
+                    Some(format!(
+                        "⚠️ 权限档位已变化：已自动重建会话（历史保留、上下文接续），本轮起按「{}」运行（此前「{}」）。",
+                        mode.as_str(),
+                        recorded.as_str()
+                    ))
+                } else {
+                    Some(format!(
+                        "⚠️ 权限档位已变化：本轮起按当前配置「{}」运行（此前记录为「{}」）。",
+                        mode.as_str(),
+                        recorded.as_str()
+                    ))
+                }
             }
             Some(_) => None,
         }
@@ -786,6 +801,11 @@ mod tests {
         );
         assert!(hint.contains("read-only"), "提示应说明旧档位：{hint}");
         assert!(hint.contains("full-access"), "提示应说明新档位：{hint}");
+        // #198：codex 档位变更自动重建会话（轮换 sid、started 复位）——resume 继承
+        // 首轮沙箱，不重建则新档位不生效。重建后本轮以全新 exec 按新档位运行。
+        let (sid_after, started_after) = store.ensure_with_started("oc_x");
+        assert_ne!(sid_after, sid, "档位变更必须轮换会话 sid（#198 自动重建）");
+        assert!(!started_after, "重建后 started 复位（本轮全新 exec）");
         // 记录已覆盖为本轮档位：提示至多一次（#185，旧语义「变化持续提示」与
         // #180 的实际运行档位相反且每条消息刷屏）
         assert_eq!(
@@ -860,6 +880,33 @@ mod tests {
             None,
             "重建后按新档位重新记录，不残留旧档位误报"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #198：claude 会话档位变更**不轮换 sid**——claude 的 permission/guard 每轮
+    /// 重建，改档位立即生效，轮换反而丢上下文（与 codex 的沙箱继承机制相反）。
+    #[test]
+    fn sandbox_change_does_not_rotate_claude_session() {
+        let dir =
+            std::env::temp_dir().join(format!("abb-sessions-sb-claude-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new_at("claude", path.clone());
+        let sid = store.ensure_session("oc_x");
+        assert!(store.mark_started_if("oc_x", &sid));
+        assert_eq!(
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            None
+        );
+        assert!(
+            store
+                .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+                .is_some(),
+            "档位变化应提示"
+        );
+        let (sid_after, started_after) = store.ensure_with_started("oc_x");
+        assert_eq!(sid_after, sid, "claude 会话不得轮换 sid");
+        assert!(started_after, "claude 会话 started 保持");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
