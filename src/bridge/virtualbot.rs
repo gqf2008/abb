@@ -181,6 +181,9 @@ impl Bridge {
         // 运行中并发由 mark_started_if 兜底：旧任务完成时若槽位已被换走（/new 或 CLI reset），
         // 不会把新槽位 mark 回 started=true（审查修复——替代原 pending_new 标记，后者
         // 覆盖不了 CLI 跨进程 reset，且存在 insert 晚于 reset 的 TOCTOU）。
+        // #194：虚拟 Bot 群的会话存储与工作目录（vb/<uuid>/，含存量迁移）；非虚拟零变化。
+        let sessions = self.sessions_for(&ev.chat_id);
+        let workspace = self.workspace_for(&ev.chat_id);
         if is_new_command(&text) {
             // #49：/new = 用户明确要求全新会话 → 连对话历史与迁移标记一起清
             // （切换注入的历史随之失效，不会泄进新会话）。代际自增使交错窗口内
@@ -193,9 +196,9 @@ impl Bridge {
                 // 不再触碰旧文件）——顺手清掉：.pi-sessions 是 #56 探针的唯一信号源，
                 // 残留文件只增不减会拖慢每轮探针扫描并堆积磁盘。CLI `session reset`
                 // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
-                let old_sid = self.sessions.ensure_with_started(&key).0;
-                let new_sid = self.sessions.reset_session(&key);
-                let ws = crate::workspace_dir(&self.bot.key());
+                let old_sid = sessions.ensure_with_started(&key).0;
+                let new_sid = sessions.reset_session(&key);
+                let ws = workspace.clone();
                 if Backend::parse(self.bot.effective_backend(&self.default_backend)) == Backend::Pi
                 {
                     // #56/#57：/new 后旧 sid 的 pi 会话文件永久失效（pi 按 sid 续聊，新 sid
@@ -438,7 +441,7 @@ impl Bridge {
         // codex 侧新建 thread 覆盖掉首轮的 → 首轮上下文永久丢失。锁内取则前一轮必已 mark_started。
         // 一次锁内原子取 session_id + started：避免 ensure_session 与 is_started 两次
         // refresh 之间被外部改盘读到中间态（审查 P3-1a）。
-        let (mut session_id, mut resume) = self.sessions.ensure_with_started(&key);
+        let (mut session_id, mut resume) = sessions.ensure_with_started(&key);
 
         // #49 后端切换上下文迁移：新会话首轮（!resume）且历史尚未注入过该会话 →
         // 把最近几轮对话注入 prompt 开头（切后端/会话丢失后新后端由此接续上下文）。
@@ -469,8 +472,8 @@ impl Bridge {
             // 则重建全新会话（本轮以新 sid 跑，mark_started_if 才能命中，回复与历史
             // 才不丢；gc 已写摘要 → 下方摘要兜底注入衔接上下文。审查修复）。/new /
             // CLI reset 换走的槽位仍在（新 sid），复核不触发——保持原语义（旧轮丢弃）。
-            if self.sessions.chat_entry(&key).is_none() {
-                let (sid2, res2) = self.sessions.ensure_with_started(&key);
+            if sessions.chat_entry(&key).is_none() {
+                let (sid2, res2) = sessions.ensure_with_started(&key);
                 crate::log!(
                     "[bridge] 会话槽位被清理（session_gc），重建全新会话 bot={} key={} sid={}",
                     self.bot.key(),
@@ -501,18 +504,10 @@ impl Bridge {
             // - pi 无错误信号（静默新建），只能事前探查（本闸的探针）→ 本轮直接注入。
             let marker = hist.marker();
             let session_file_lost = || {
-                backend == Backend::Pi
-                    && !crate::agent::pi_session_exists(
-                        &crate::workspace_dir(&self.bot.key()),
-                        &session_id,
-                    )
+                backend == Backend::Pi && !crate::agent::pi_session_exists(&workspace, &session_id)
             };
             let session_file_alive = || {
-                backend == Backend::Pi
-                    && crate::agent::pi_session_exists(
-                        &crate::workspace_dir(&self.bot.key()),
-                        &session_id,
-                    )
+                backend == Backend::Pi && crate::agent::pi_session_exists(&workspace, &session_id)
             };
             let should_inject = if !resume {
                 match &marker {
@@ -526,7 +521,7 @@ impl Bridge {
             let injected_rounds = if should_inject {
                 // #130：该会话已被上下文压缩（ctxsum 存在）→ 注入压缩块（旧摘要 + 近期
                 // 原文）而非全量历史——压缩后全量历史仍会超长，注入必须切到压缩源。
-                let workspace = crate::workspace_dir(&self.bot.key());
+                //（#194：workspace 已按 chat 路由——虚拟 Bot 群用 vb/<uuid>/）
                 let (block, n) = match crate::contextsum::ctxsum_block_at(&workspace, &key) {
                     Some(sum) => {
                         let rounds = sum.matches("用户: ").count();
@@ -620,6 +615,7 @@ impl Bridge {
         // clone Arc 再调：async_trait 的 method future 会借用 receiver，先取出独立 runner
         // 避免 future 跨 await 持有 `&self.agent_runner`，与 select 内 `&self` 的其它字段
         // 借用冲突（保持原自由函数调用「future 只持有 &self.sessions」的借用形态）。
+        // 会话存储与工作目录已在函数前部按 chat 路由（#194：vb/<uuid>/ 或 bot 级）。
         let runner = self.agent_runner.clone();
         let mut result = self
             .run_agent_with_progress(
@@ -632,6 +628,7 @@ impl Bridge {
                 &key,
                 &bot_key,
                 ev.role,
+                &sessions,
                 &cancel_flag,
             )
             .await;
@@ -646,7 +643,7 @@ impl Bridge {
                 .map(|c| c.context_compress_enabled)
                 .unwrap_or(true);
             if enabled && crate::contextsum::is_context_too_long(e) {
-                let workspace = crate::workspace_dir(&bot_key);
+                // #194：压缩工作区按 chat 路由（虚拟 Bot 群用 vb/<uuid>/）
                 if crate::contextsum::ctxsum_block_at(&workspace, &key).is_none() {
                     crate::log!(
                         "[bridge] #130 上下文超长，自动压缩 chat={} err_len={}",
@@ -668,7 +665,7 @@ impl Bridge {
                         Ok(report) => {
                             // 换新会话（reset_session：新 UUID + started=false）＋重建
                             // prompt：压缩块替换原历史块（未注入历史则前置压缩块）。
-                            let new_sid = self.sessions.reset_session(&key);
+                            let new_sid = sessions.reset_session(&key);
                             let ctxsum_block = crate::contextsum::ctxsum_block_at(&workspace, &key)
                                 .unwrap_or_default();
                             let mut prompt2 = prompt.clone();
@@ -705,6 +702,7 @@ impl Bridge {
                                     &key,
                                     &bot_key,
                                     ev.role,
+                                    &sessions,
                                     &cancel_flag,
                                 )
                                 .await;
@@ -742,7 +740,7 @@ impl Bridge {
                 // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
                 // #49：同一道闸决定历史落盘——换走后不写孤儿助手条目、不写迁移标记
                 // （历史已被 /new 清空，旧任务的回复不得写回去）。
-                let same_session = self.sessions.mark_started_if(&key, &final_sid);
+                let same_session = sessions.mark_started_if(&key, &final_sid);
                 if same_session {
                     // 代际闸：/new 恰好落在 mark 与写盘之间（亚毫秒窗口）也不残留孤儿条目
                     let guard = hist_epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -887,6 +885,31 @@ impl Bridge {
         // _serial_guard 在此函数末尾 drop，释放 per-chat 锁，排队的下一条开始处理。
     }
 
+    /// #194：chat 的会话存储——虚拟 Bot 群用其独立工作区的 sessions.json（按 chat
+    /// 缓存实例），其余会话用 bot 级存储。按值返回（SessionStore 手写 Clone=句柄
+    /// 拷贝，文件是唯一事实源，新实例首次使用 refresh 从盘加载）。
+    fn sessions_for(&self, chat_id: &str) -> SessionStore {
+        let Some(dir) = crate::virtualbot::ensure_vb_dir(&self.bot.key(), chat_id) else {
+            return self.sessions.clone();
+        };
+        let mut cache = self.vb_sessions.lock().unwrap();
+        cache
+            .entry(chat_id.to_string())
+            .or_insert_with(|| {
+                crate::sessions::SessionStore::at(
+                    self.sessions.backend(),
+                    dir.join("sessions.json"),
+                )
+            })
+            .clone()
+    }
+
+    /// #194：chat 的工作目录——虚拟 Bot 群 = vb/<uuid>/，其余 = bot 工作区。
+    fn workspace_for(&self, chat_id: &str) -> std::path::PathBuf {
+        crate::virtualbot::ensure_vb_dir(&self.bot.key(), chat_id)
+            .unwrap_or_else(|| crate::workspace_dir(&self.bot.key()))
+    }
+
     /// 执行一轮 agent 任务（统一中途进度排空：打字机已下线，中途输出丢弃不回，
     /// 任务结束只发最终结果一条）。#130 压缩重试也走本方法（每轮独立 progress 通道）。
     #[allow(clippy::too_many_arguments)] // 与 agent::run 同款参数集（11 参）
@@ -901,6 +924,7 @@ impl Bridge {
         key: &str,
         bot_key: &str,
         role: crate::config::SenderRole,
+        sessions: &SessionStore,
         cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<crate::agent::RunOutcome, String> {
         let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -913,7 +937,7 @@ impl Bridge {
             key, // 会话隔离 key（话题=chat:thread，#14）：session 存储按 key 记账，回存须同 key
             bot_key,
             role, // 发送者角色：granted 走受限分支（restrict 判定在 agent::run 内热读）
-            Some(&self.sessions),
+            Some(sessions),
             Some(ptx),
             Some(cancel_flag.clone()),
         );

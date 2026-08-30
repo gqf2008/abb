@@ -65,6 +65,20 @@ pub struct SessionStore {
     loaded_sig: Mutex<Option<(SystemTime, u64)>>,
 }
 
+// #194：手写 Clone——句柄式拷贝（path/后端复制，内存缓存清空）。
+// 用途：bridge 的 vb 会话存储按 chat 缓存并按值返回；文件是唯一事实源，
+// 新实例首次使用时 refresh 从盘加载，语义不变。
+impl Clone for SessionStore {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            data: Mutex::new(HashMap::new()),
+            current_backend: self.current_backend.clone(),
+            loaded_sig: Mutex::new(None),
+        }
+    }
+}
+
 impl SessionStore {
     pub fn new(current_backend: &str, bot_key: &str) -> SessionStore {
         let dir = crate::bridge_dir().join("workspaces").join(bot_key);
@@ -96,6 +110,11 @@ impl SessionStore {
     #[cfg(test)]
     fn new_at(current_backend: &str, path: PathBuf) -> SessionStore {
         Self::at(current_backend, path)
+    }
+
+    /// 当前生效后端（bridge 的 vb 会话存储按 bot 生效后端建实例，#194）。
+    pub(crate) fn backend(&self) -> &str {
+        &self.current_backend
     }
 
     /// 若 sessions.json 的 (mtime, size) 比上次加载新（CLI/外部进程改了），重新读盘。
@@ -319,6 +338,36 @@ impl SessionStore {
         }
     }
 
+    /// #194：把本 chat 的全部后端槽位搬到目标 store（虚拟 Bot 独立工作区迁移）。
+    /// 源删除、目标写入（目标已有该 chat 则不覆盖，防迁移覆盖新数据）。幂等：
+    /// 源无条目即 no-op。返回是否搬了东西。
+    pub fn extract_chat_to(&self, chat_id: &str, dst: &SessionStore) -> bool {
+        self.refresh();
+        let mut data = self.data.lock().unwrap();
+        let Some(entry) = data.remove(chat_id) else {
+            return false;
+        };
+        // 三槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃
+        let empty = entry.claude.session_id.is_empty()
+            && !entry.claude.started
+            && entry.codex.session_id.is_empty()
+            && !entry.codex.started
+            && entry.pi.session_id.is_empty()
+            && !entry.pi.started;
+        if empty {
+            self.save_locked(&data);
+            return false;
+        }
+        self.save_locked(&data);
+        dst.refresh();
+        let mut ddata = dst.data.lock().unwrap();
+        if !ddata.contains_key(chat_id) {
+            ddata.insert(chat_id.to_string(), entry);
+            dst.save_locked(&ddata);
+        }
+        true
+    }
+
     /// set_session_id 的 CAS 版本：仅当该 chat 当前槽位的 session_id == expected 时回存，
     /// 返回是否真的回存。任务运行中槽位被 /new 或 CLI `session reset` 换走时（槽位已不是
     /// 本次任务启动时的会话），不得把旧任务的会话 id 写进新槽位——否则桥的
@@ -424,6 +473,43 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #194：extract_chat_to——整 chat 槽位搬到目标 store（虚拟 Bot 独立工作区迁移），
+    /// 源移除、目标不覆盖已有、幂等。
+    #[test]
+    fn extract_chat_to_moves_entry_without_overwrite() {
+        let dir = std::env::temp_dir().join(format!("abb-sessions-xfer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = SessionStore::new_at("codex", dir.join("bot-sessions.json"));
+        let dst = SessionStore::new_at("codex", dir.join("vb-sessions.json"));
+        let (sid, _) = src.ensure_with_started("oc_vb");
+        assert!(src.mark_started_if("oc_vb", &sid));
+
+        // 目标已有同 chat（新数据）：迁移不得覆盖
+        let (dst_sid, _) = dst.ensure_with_started("oc_vb");
+        assert!(src.extract_chat_to("oc_vb", &dst));
+        let moved = dst.chat_entry("oc_vb").unwrap();
+        assert_eq!(
+            moved.codex.session_id, dst_sid,
+            "目标已有槽位时不得被迁移覆盖"
+        );
+        assert!(
+            src.chat_entry("oc_vb").is_none(),
+            "源槽位必须移除（不双写）"
+        );
+
+        // 目标为空：整槽位搬入
+        let src2 = SessionStore::new_at("codex", dir.join("bot2.json"));
+        let (sid2, _) = src2.ensure_with_started("oc_x");
+        assert!(src2.mark_started_if("oc_x", &sid2));
+        let dst2 = SessionStore::new_at("codex", dir.join("vb2.json"));
+        assert!(src2.extract_chat_to("oc_x", &dst2));
+        assert_eq!(dst2.chat_entry("oc_x").unwrap().codex.session_id, sid2);
+        assert!(src2.chat_entry("oc_x").is_none());
+        // 幂等：再搬一次 no-op
+        assert!(!src2.extract_chat_to("oc_x", &dst2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn migrates_legacy_flat_format() {

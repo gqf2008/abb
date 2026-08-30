@@ -42,13 +42,38 @@ pub fn collect_block(bot_key: &str, session_key: &str) -> String {
 /// 全缺返回空串（调用方跳过注入）。失败读（权限等）按缺失处理——指令文件是增强能力，
 /// 读不到不该阻塞聊天主链路。
 pub(crate) fn collect_block_at(base: &Path, bot_key: &str, session_key: &str) -> String {
+    // #194：虚拟 Bot 群的 session 级指令目录 = 其独立工作区的 sessions/
+    let chat = session_key.split(':').next().unwrap_or(session_key);
+    let vb_session_dir = crate::virtualbot::vb_dir_for(bot_key, chat).map(|d| d.join("sessions"));
+    collect_block_at_with(base, bot_key, session_key, vb_session_dir.as_deref())
+}
+
+/// 可测核心（vb_session_dir 注入：虚拟 Bot 群 = 其独立工作区的 sessions/，None =
+/// bot 级 sessions/）。任意 base 目录（生产 = `~/.agent-bridge`；测试注入 temp 根——
+/// 现有 bridge 测试断言 prompt 精确相等，真实 ~/.agent-bridge/AGENTS.md 若存在会破坏
+/// 它们）。按 abb → bot → session 顺序拼接；缺文件/空文件静默跳过；
+/// 全缺返回空串（调用方跳过注入）。失败读（权限等）按缺失处理——指令文件是增强能力，
+/// 读不到不该阻塞聊天主链路。
+fn collect_block_at_with(
+    base: &Path,
+    bot_key: &str,
+    session_key: &str,
+    vb_session_dir: Option<&Path>,
+) -> String {
     let bot_dir = base.join("workspaces").join(bot_key);
+    // #194：虚拟 Bot 群的 session 级指令落在自己的 vb/<uuid>/sessions/ 下（会话记录
+    // 独立目录的一部分）。vb 目录根的 AGENTS.md 由后端按 cwd 原生发现（claude 读
+    // CLAUDE.md、codex 读 AGENTS.md），不走注入；bot 级仍注入（「可读 bot 工作目录」
+    // 的指令层）。
+    let session_dir = vb_session_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| bot_dir.join("sessions"));
     let levels: [(&str, std::path::PathBuf); 3] = [
         ("abb 级", base.join("AGENTS.md")),
         ("bot 级", bot_dir.join("AGENTS.md")),
         (
             "session 级",
-            bot_dir.join("sessions").join(format!(
+            session_dir.join(format!(
                 "{}.AGENTS.md",
                 crate::history::escape_key(session_key)
             )),
@@ -203,6 +228,32 @@ mod tests {
             block.matches(TRUNC_MARKER).count(),
             2,
             "两个超限文件各自截断"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// #194：虚拟 Bot 群的 session 级指令从 vb/<uuid>/sessions/ 收集（注入 vb 目录
+    /// 参数时），不再取 bot 级 sessions/；bot 级仍注入（可读 bot 工作目录的指令层）。
+    #[test]
+    fn collect_block_uses_vb_session_dir_when_given() {
+        let base = temp_base("vbdir");
+        write(&base.join("workspaces/b1/AGENTS.md"), "bot 级规则");
+        let vb_sessions = base.join("workspaces/b1/vb/uuid-1/sessions");
+        write(&vb_sessions.join("oc_vb.AGENTS.md"), "vb 专属指令");
+
+        // 传入 vb 目录：session 级取 vb/sessions/
+        let block = collect_block_at_with(&base, "b1", "oc_vb", Some(&vb_sessions));
+        assert!(
+            block.contains("vb 专属指令"),
+            "session 级取 vb 目录: {block}"
+        );
+        assert!(block.contains("bot 级规则"), "bot 级仍注入");
+
+        // 不传 vb 目录（非虚拟会话）：session 级回到 bot 级 sessions/，vb 文件不泄入
+        let block2 = collect_block_at_with(&base, "b1", "oc_vb", None);
+        assert!(
+            !block2.contains("vb 专属指令"),
+            "非虚拟路径不得读 vb 会话指令: {block2}"
         );
         std::fs::remove_dir_all(&base).ok();
     }

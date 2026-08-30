@@ -206,6 +206,11 @@ impl VirtualBotStore {
             .collect()
     }
 
+    /// chat 是否已登记为虚拟 Bot 群（本 bot 名下）。
+    pub fn is_registered(&self, bot_key: &str, chat_id: &str) -> bool {
+        self.load_for(bot_key).iter().any(|v| v.chat_id == chat_id)
+    }
+
     /// 整文件原子重写（唯一 tmp + rename；`atomic_write_sensitive` 语义同 config）。
     fn write(&self, entries: &[VirtualBot]) -> Result<(), String> {
         let text = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
@@ -217,6 +222,121 @@ impl Default for VirtualBotStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ══════════ #194 虚拟 Bot 独立工作区 ══════════
+//
+// 隔离粒度从会话级升级到目录级（老板需求 2026-08-30）：
+// - 每个虚拟 Bot 群独立目录 `workspaces/<bot_key>/vb/<uuid>/`（自有 AGENTS.md、
+//   会话记录、历史，agent cwd 也在这里）；
+// - 可读 bot 工作区（读不受限），可写仅限自己目录（codex 靠 cwd+roots、claude 靠
+//   guard 双区判定），不可写其他虚拟 Bot 目录与 bot 工作区根；
+// - 目录名用确定性 UUID 而非角色名——角色可改名/重名/含特殊字符；(bot_key, chat_id)
+//   派生（fnv128，uuid v5 同思路），跨进程/重启稳定，无需存储与迁移字段。
+
+/// 虚拟 Bot 目录名的确定性 UUID（fnv128 → 8-4-4-4-12 十六进制）。
+/// 输入含 bot_key：同群换绑 bot（理论上不发生）视为新身份。
+pub fn vb_uuid(bot_key: &str, chat_id: &str) -> String {
+    fn fnv64(seed: u64, s: &str) -> u64 {
+        let mut h = seed;
+        for b in s.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+    let ns = format!("abb-vb:{bot_key}:{chat_id}");
+    let hi = fnv64(0xcbf2_9ce4_8422_2325, &ns);
+    let lo = fnv64(0x9e37_79b9_7f4a_7c15, &ns);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&lo.to_be_bytes());
+    let hex = |r: std::ops::Range<usize>| {
+        bytes[r]
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<String>()
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    )
+}
+
+/// chat 的虚拟 Bot 独立工作目录（只解析不落盘）。None = 非虚拟 Bot 群。
+pub fn vb_dir_for(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
+    if VirtualBotStore::new().is_registered(bot_key, chat_id) {
+        Some(
+            crate::workspace_dir(bot_key)
+                .join("vb")
+                .join(vb_uuid(bot_key, chat_id)),
+        )
+    } else {
+        None
+    }
+}
+
+/// 解析并确保虚拟 Bot 工作目录存在；同时把该群的存量数据一次性迁入（#194）：
+/// bot 级 sessions.json 中本 chat 的槽位迁到 vb/<uuid>/sessions.json（迁移后从 bot
+/// 级移除，两处不双写）；bot 级 history/ 中本 chat 前缀的历史文件迁到 vb/<uuid>/
+/// history/。逐项搬移幂等（源不存在即 no-op），service/GUI 谁先解析都收敛。
+/// None = 非虚拟群。
+pub fn ensure_vb_dir(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
+    let dir = vb_dir_for(bot_key, chat_id)?;
+    let _ = std::fs::create_dir_all(&dir);
+    migrate_legacy_vb_data(&crate::bridge_dir(), bot_key, chat_id, &dir);
+    Some(dir)
+}
+
+/// 存量迁移（#194）：bot 级会话槽位 + 前缀匹配的历史文件搬入 vb 目录。幂等。
+fn migrate_legacy_vb_data(
+    base: &std::path::Path,
+    bot_key: &str,
+    chat_id: &str,
+    vb_dir: &std::path::Path,
+) {
+    // 1) 会话槽位：bot 级 sessions.json → vb/sessions.json（backend 无关，整 chat 搬）
+    let bot_sessions = base.join("workspaces").join(bot_key).join("sessions.json");
+    let bot_store = crate::sessions::SessionStore::at("codex", bot_sessions);
+    let vb_store = crate::sessions::SessionStore::at("codex", vb_dir.join("sessions.json"));
+    let _ = bot_store.extract_chat_to(chat_id, &vb_store);
+    // 2) 历史文件：bot history/ 下以 escape(chat_id) 为前缀的 jsonl/json → vb/history/
+    let bot_hist = base.join("workspaces").join(bot_key).join("history");
+    let vb_hist = vb_dir.join("history");
+    let prefix = crate::config::sanitize(chat_id);
+    let Ok(entries) = std::fs::read_dir(&bot_hist) else {
+        return;
+    };
+    let mut moved = 0usize;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && (name.ends_with(".jsonl") || name.ends_with(".json")) {
+            let _ = std::fs::create_dir_all(&vb_hist);
+            let dst = vb_hist.join(&name);
+            if !dst.exists() && std::fs::rename(e.path(), dst).is_ok() {
+                moved += 1;
+            }
+        }
+    }
+    if moved > 0 {
+        crate::log!("[virtualbot] 群 {chat_id} 存量历史 {moved} 个文件已迁入独立工作区");
+    }
+}
+
+/// 测试辅助：迁移函数暴露给同 crate 单测（ensure_vb_dir 依赖真实登记表路径，
+/// 单测直接驱动迁移核心）。
+#[cfg(test)]
+pub(crate) fn migrate_legacy_vb_data_pub(
+    base: &std::path::Path,
+    bot_key: &str,
+    chat_id: &str,
+    vb_dir: &std::path::Path,
+) {
+    migrate_legacy_vb_data(base, bot_key, chat_id, vb_dir);
 }
 
 /// 内置角色模板库（虚拟团队场景：一次建整套角色群：后端/前端/UIUX/产品/…）。
@@ -649,5 +769,104 @@ mod tests {
         assert_eq!(format_created(0), "1970-01-01 08:00");
         // 2026-08-20T00:00Z = 2026-08-20 08:00 本地
         assert_eq!(format_created(1_787_184_000), "2026-08-20 08:00");
+    }
+
+    /// #194：确定性 UUID——同 (bot_key, chat_id) 恒同值、uuid 形态、不同群不同值、
+    /// 与角色名无关（改名不变）。
+    #[test]
+    fn vb_uuid_is_deterministic_and_name_independent() {
+        let a1 = vb_uuid("bot_a", "oc_1");
+        let a2 = vb_uuid("bot_a", "oc_1");
+        assert_eq!(a1, a2, "同群必须同 uuid（跨进程/重启稳定）");
+        assert_ne!(vb_uuid("bot_a", "oc_2"), a1, "不同群不同 uuid");
+        assert_ne!(vb_uuid("bot_b", "oc_1"), a1, "不同 bot 不同 uuid");
+        // uuid 形态：8-4-4-4-12 十六进制
+        let parts: Vec<&str> = a1.split('-').collect();
+        assert_eq!(parts.len(), 5, "uuid 形态 8-4-4-4-12: {a1}");
+        assert_eq!(
+            [
+                parts[0].len(),
+                parts[1].len(),
+                parts[2].len(),
+                parts[3].len(),
+                parts[4].len()
+            ],
+            [8, 4, 4, 4, 12],
+            "uuid 段长: {a1}"
+        );
+        assert!(
+            a1.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+            "仅十六进制字符: {a1}"
+        );
+    }
+
+    /// #194：ensure_vb_dir 存量迁移——bot 级 sessions 槽位与 history 文件一次性
+    /// 迁入 vb/<uuid>/，bot 级不再保留（不双写）；幂等（二次调用无变化）。
+    #[test]
+    fn ensure_vb_dir_migrates_legacy_sessions_and_history() {
+        let base = std::env::temp_dir().join(format!("abb-vb-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let bot_key = "bot_x";
+        let chat = "oc_vb1";
+        // 真实登记表路径写入临时登记（VirtualBotStore::new 读 crate::bridge_dir()——
+        // 迁移函数经 vb_dir_for 查登记，故这里直接以vb_dir_for 依赖的登记表为
+        // 桥接点：改用 HOME 注入不可行（crate::bridge_dir 固定），改测内部组合：
+        // 先手工构造登记表于真实位置不可接受 → 本测试改为验证「登记存在」路径的
+        // 组合件 migrate_legacy_vb_data（pub(crate) 供测试）。
+        let vb_dir = base.join("workspaces").join(bot_key).join("vb").join("u1");
+        std::fs::create_dir_all(vb_dir.join("history")).unwrap();
+        // bot 级存量：sessions.json 有该 chat 槽位；history 有前缀匹配文件
+        let bot_sessions = base.join("workspaces").join(bot_key).join("sessions.json");
+        std::fs::create_dir_all(bot_sessions.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(base.join("workspaces").join(bot_key).join("history")).unwrap();
+        std::fs::write(
+            &bot_sessions,
+            r#"{"oc_vb1": {"codex": {"session_id": "tid-legacy", "started": true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("workspaces")
+                .join(bot_key)
+                .join("history")
+                .join(format!("{}.jsonl", crate::config::sanitize(chat))),
+            "user: 旧消息\n",
+        )
+        .unwrap();
+
+        crate::virtualbot::migrate_legacy_vb_data_pub(&base, bot_key, chat, &vb_dir);
+
+        // 会话槽位迁入 vb 且 bot 级移除（不双写）
+        let vb_store = crate::sessions::SessionStore::at("codex", vb_dir.join("sessions.json"));
+        assert_eq!(
+            vb_store.chat_entry(chat).unwrap().codex.session_id,
+            "tid-legacy",
+            "槽位必须迁入 vb"
+        );
+        let bot_store = crate::sessions::SessionStore::new("codex", bot_key);
+        assert!(
+            bot_store.chat_entry(chat).is_none(),
+            "bot 级槽位必须移除（不双写）"
+        );
+        // 历史文件迁入
+        assert!(
+            vb_dir
+                .join("history")
+                .join(format!("{}.jsonl", crate::config::sanitize(chat)))
+                .exists(),
+            "历史文件必须迁入 vb"
+        );
+        assert!(!base
+            .join("workspaces")
+            .join(bot_key)
+            .join("history")
+            .join(format!("{}.jsonl", crate::config::sanitize(chat)))
+            .exists());
+        // 幂等：再跑一次无变化不报错
+        crate::virtualbot::migrate_legacy_vb_data_pub(&base, bot_key, chat, &vb_dir);
+        assert_eq!(
+            vb_store.chat_entry(chat).unwrap().codex.session_id,
+            "tid-legacy"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -496,11 +496,20 @@ pub async fn run(
     //（resolve_sandbox_mode 单点），保证下面「生成哪个 guard 文件」与 run_once 里
     //「--settings 指向哪个文件」永远一致——写错文件 claude 启动即报
     // "Settings file not found"（实测 CLI 硬错误退出）。
-    let sandbox = if matches!(backend, Backend::Claude | Backend::Codex) {
+    let mut sandbox = if matches!(backend, Backend::Claude | Backend::Codex) {
         resolve_sandbox_mode(bot_key, chat_id, restrict)
     } else {
         crate::config::SandboxMode::Auto
     };
+
+    // #194：虚拟 Bot 群强制 workspace-write——写边界 = 自己的 vb/<uuid>/ 目录
+    //（agent cwd 即该目录：codex workspace-write 可写域 = cwd+roots、claude 白名单
+    // ./ 同理；guard 钩子按 chat 解析 vb 目录做双区判定）。可读 bot 工作区（读不受
+    // 限），不可写其他虚拟 Bot 目录与 bot 工作区根。配置档位只影响非虚拟会话。
+    let is_vb_chat = crate::virtualbot::vb_dir_for(bot_key, chat_id).is_some();
+    if is_vb_chat && matches!(backend, Backend::Claude | Backend::Codex) {
+        sandbox = crate::config::SandboxMode::WorkspaceWrite;
+    }
 
     // #171 档位变化感知：会话创建时记录档位；resume 旧会话的记录档位 ≠ 当前配置 →
     // 提示一次（#185：#180 起 resume 按当前解析档位运行，记录随即覆盖为本轮档位，
@@ -539,8 +548,12 @@ pub async fn run(
             .map_err(|e| format!("⚠️ 删除保护 guard 文件生成失败，已拒绝启动：{e:#}"))?;
     }
 
-    // 本 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）
-    let workspace = crate::workspace_dir(bot_key);
+    // 工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）。
+    // #194：虚拟 Bot 群的 chat 使用独立工作区 vb/<uuid>/（自有 AGENTS.md/会话/历史，
+    // agent cwd 也在这里——codex workspace-write 的可写域随之限定为自己的目录；
+    // ensure 内含存量会话/历史一次性迁移）。非虚拟会话路径完全不变。
+    let workspace = crate::virtualbot::ensure_vb_dir(bot_key, chat_id)
+        .unwrap_or_else(|| crate::workspace_dir(bot_key));
     let _ = std::fs::create_dir_all(&workspace);
     ensure_workspace_guide(&workspace);
 
