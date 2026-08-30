@@ -33,7 +33,9 @@ pub const ARCHIVE_AGE_DAYS: u32 = 30;
 /// 结构目录：临时文件扫描 / 空目录清理 / 文档扫描一律跳过（绝不触碰）。
 /// attachments 是消息附件落地目录（下载中目录可能瞬时为空——walk 见空与删除之间文件
 /// 落地会删掉下载目标；且内含用户聊天媒体，与结构目录同待遇；审查修复）。
-const STRUCTURE_DIRS: [&str; 8] = [
+/// vb 是虚拟 Bot 独立工作区根（#194）：其下每个 uuid 目录都有自己的会话/历史/指令，
+/// 生命周期独立管理，bot 级 tidy 一律不触碰。
+const STRUCTURE_DIRS: [&str; 9] = [
     ".git",
     "history",
     "sessions",
@@ -42,6 +44,7 @@ const STRUCTURE_DIRS: [&str; 8] = [
     "archive",
     "attachments",
     ".trash",
+    "vb",
 ];
 /// 根目录临时/垃圾文件后缀（小写比较；.tmp.* 形态单独匹配）。
 const TEMP_SUFFIXES: [&str; 3] = [".tmp", ".swp", ".bak"];

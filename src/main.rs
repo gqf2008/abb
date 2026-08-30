@@ -896,7 +896,8 @@ fn run_session_cli(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            let store = sessions::SessionStore::new(&backend, &bot_key);
+            // #194：虚拟 Bot 群的 reset 路由到独立工作区的 sessions.json
+            let store = sessions::SessionStore::store_for_chat(&backend, &bot_key, &chat);
             let sid = store.reset_session(&chat);
             // 打印完整 UUID：后续要拿它做 --session-id / resume 时截断会误导
             println!(

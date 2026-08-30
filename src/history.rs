@@ -88,6 +88,13 @@ pub struct History {
 
 impl History {
     pub fn open(bot_key: &str, key: &str) -> History {
+        // #194：虚拟 Bot 群的会话历史落在独立工作区 vb/<uuid>/history/（会话记录
+        // 独立目录的一部分）。key 的话题后缀（chat:thread）取 chat 部分查登记；
+        // ensure 含存量一次性迁移（旧历史从 bot 级搬入），非虚拟路径零变化。
+        let chat = key.split(':').next().unwrap_or(key);
+        if let Some(vb_dir) = crate::virtualbot::ensure_vb_dir(bot_key, chat) {
+            return Self::open_in(&vb_dir.join("history"), key);
+        }
         Self::open_in(&crate::workspace_dir(bot_key).join("history"), key)
     }
 

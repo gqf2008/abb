@@ -21,6 +21,8 @@ mod virtualbot;
 pub struct Bridge {
     pub msgr: Arc<dyn Messenger>,
     pub sessions: SessionStore,
+    /// #194：虚拟 Bot 群的独立会话存储（per-chat 缓存；键=chat_id）。
+    vb_sessions: Mutex<HashMap<String, SessionStore>>,
     pub jobs: JobStore,
     /// 本 bot 的配置（app_id/bot_name/bot_open_id/primary_chat_id/wx_*…）；
     /// 访问控制（owner/授权者/对话权限）也以它为准——生产每次消息从 config.json 热读覆盖
@@ -217,6 +219,7 @@ impl Bridge {
         Bridge {
             msgr,
             sessions,
+            vb_sessions: Mutex::new(HashMap::new()),
             jobs: JobStore::new(&bot.key()),
             default_backend: effective,
             bot,

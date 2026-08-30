@@ -115,8 +115,11 @@ fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<
 pub fn guard_check_main() -> i32 {
     // 前置：非 granted 会话不再直接放行——owner 会话也要删除保护（#88）。
     // 角色分派：granted → 现有白名单闸；owner → 只拦删除类 Bash（其它命令直通）。
+    // #194：虚拟 Bot 群（AGENT_BRIDGE_CHAT_ID 命中登记）——无论发送者角色，一律
+    // 全量闸 + 双区：写域 = 自己的 vb/<uuid>/，读域 = 写域 ∪ bot 工作区（可读 bot
+    // 工作目录、不可写他人目录/bot 根）。
     let role = crate::config::SenderRole::from_env();
-    let Some(workspace) = resolve_workspace() else {
+    let Some(zones) = resolve_workspaces() else {
         // 无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）：granted 拒绝（fail-closed），
         // owner 放行（无工作区上下文可拦，保持原行为）。
         if role == crate::config::SenderRole::Granted {
@@ -131,11 +134,28 @@ pub fn guard_check_main() -> i32 {
         }
         return 0;
     };
+    let (workspace, read_workspace, vb_confined) = match zones {
+        WsZones::Single(ws) => (ws, None, false),
+        WsZones::Dual { write, read } => (write, Some(read), true),
+        // 虚拟 Bot 群但 vb 目录不可解析：fail-closed 全拒（写隔离是存在意义）
+        WsZones::Broken => {
+            eprintln!("[guard-check] vb 目录不可解析，fail-closed 全拒");
+            println!(
+                "{}",
+                decision_json(&Decision::Deny(
+                    "虚拟 Bot 工作区不可用（目录缺失且重建失败），已拒绝全部工具调用".into()
+                ))
+            );
+            return 0;
+        }
+    };
     let mut input = String::new();
     if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
         // 读不到 hook 事件：granted 拒绝（fail-closed）；owner 放行（手动调用/异常形态
         // 不拦——删除保护是增量拦截，读不到事件时保持无保护原行为，不扩大拒绝面）。
-        if role == crate::config::SenderRole::Granted {
+        // #194：虚拟 Bot 群 fail-closed（写隔离是它的存在意义，读不到事件不放大拒绝面
+        // 的理由不成立）。
+        if role == crate::config::SenderRole::Granted || vb_confined {
             println!(
                 "{}",
                 decision_json(&Decision::Deny("无法读取 hook 事件".into()))
@@ -148,7 +168,7 @@ pub fn guard_check_main() -> i32 {
     let v: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
         Err(e) => {
-            if role == crate::config::SenderRole::Granted {
+            if role == crate::config::SenderRole::Granted || vb_confined {
                 println!(
                     "{}",
                     decision_json(&Decision::Deny(format!("hook 事件解析失败: {e}")))
@@ -161,19 +181,39 @@ pub fn guard_check_main() -> i32 {
     };
     let tool = v["tool_name"].as_str().unwrap_or("");
     let input_obj = &v["tool_input"];
-    let decision = match role {
-        crate::config::SenderRole::Granted => match tool {
-            "Read" | "Edit" | "Write" => check_file_paths(tool, input_obj, &workspace),
-            "Glob" | "Grep" => check_patterns(tool, input_obj, &workspace),
-            "Bash" => check_bash(input_obj, &workspace),
+    let read_zone = read_workspace.as_deref();
+    let decision = if vb_confined {
+        // 虚拟 Bot 群：全量闸（无论角色）。Read 落写区或读区皆可；Edit/Write 仅写区；
+        // Glob/Grep/Bash 的读路径双区、写路径仅写区。
+        match tool {
+            "Read" => {
+                let d = check_file_paths(tool, input_obj, &workspace);
+                match (d, read_zone) {
+                    (Decision::Deny(_), Some(rz)) => check_file_paths("Read", input_obj, rz),
+                    (d, _) => d,
+                }
+            }
+            "Edit" | "Write" => check_file_paths(tool, input_obj, &workspace),
+            "Glob" | "Grep" => check_patterns_zoned(tool, input_obj, &workspace, read_zone),
+            "Bash" => check_bash(input_obj, &workspace, read_zone),
             // WebFetch/MCP/AskUserQuestion/未知工具：dontAsk 兜底拒绝，这里再显式 deny
-            _ => Decision::Deny(format!("工具 {tool} 不在受限白名单")),
-        },
-        crate::config::SenderRole::Owner => match tool {
-            "Bash" => check_owner_bash(input_obj, &workspace),
-            // matcher 限定 Bash，理论上只有 Bash 会进来；其它工具一律直通
-            _ => Decision::Allow,
-        },
+            _ => Decision::Deny(format!("工具 {tool} 不在虚拟 Bot 白名单")),
+        }
+    } else {
+        match role {
+            crate::config::SenderRole::Granted => match tool {
+                "Read" | "Edit" | "Write" => check_file_paths(tool, input_obj, &workspace),
+                "Glob" | "Grep" => check_patterns(tool, input_obj, &workspace),
+                "Bash" => check_bash(input_obj, &workspace, None),
+                // WebFetch/MCP/AskUserQuestion/未知工具：dontAsk 兜底拒绝，这里再显式 deny
+                _ => Decision::Deny(format!("工具 {tool} 不在受限白名单")),
+            },
+            crate::config::SenderRole::Owner => match tool {
+                "Bash" => check_owner_bash(input_obj, &workspace),
+                // matcher 限定 Bash，理论上只有 Bash 会进来；其它工具一律直通
+                _ => Decision::Allow,
+            },
+        }
     };
     if let Decision::Deny(r) = &decision {
         // hook 的 stdout 是决策 JSON，日志走 stderr（否则污染决策被 claude 误读）
@@ -207,10 +247,46 @@ fn decision_json(d: &Decision) -> String {
     .to_string()
 }
 
-/// 按 AGENT_BRIDGE_BOT_KEY 解析并规范化工作区根（spawn 前已 create_dir_all，必然存在）。
-fn resolve_workspace() -> Option<PathBuf> {
+/// 工作区解析结果（#194）。
+enum WsZones {
+    /// 非虚拟会话：单区（写=读=bot 工作区，行为与历史版本一致）。
+    Single(PathBuf),
+    /// 虚拟 Bot 群：双区（写=vb/<uuid>/，读=写区∪bot 工作区）。
+    Dual { write: PathBuf, read: PathBuf },
+    /// 虚拟 Bot 群但 vb 目录不可解析（被手动删除/竞态）：fail-closed 全拒
+    ///（独立审查 F6：回落 bot 工作区=全 bot 可写，违背写隔离的存在意义）。
+    Broken,
+}
+
+/// 解析工作区双区。
+fn resolve_workspaces() -> Option<WsZones> {
     let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").ok()?;
-    std::fs::canonicalize(crate::workspace_dir(&bot_key)).ok()
+    let bot_ws = std::fs::canonicalize(crate::workspace_dir(&bot_key)).ok()?;
+    let chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+    if chat.is_empty() {
+        return Some(WsZones::Single(bot_ws));
+    }
+    let Some(vb) = crate::virtualbot::vb_dir_for(&bot_key, &chat) else {
+        return Some(WsZones::Single(bot_ws));
+    };
+    // vb 目录理论上由 agent spawn 前建好；不可解析（被删/竞态）先重建再 canonicalize，
+    // 仍失败 → Broken（fail-closed 全拒）。
+    match std::fs::canonicalize(&vb) {
+        Ok(v) => Some(WsZones::Dual {
+            write: v,
+            read: bot_ws,
+        }),
+        Err(_) => {
+            let _ = std::fs::create_dir_all(&vb);
+            match std::fs::canonicalize(&vb) {
+                Ok(v) => Some(WsZones::Dual {
+                    write: v,
+                    read: bot_ws,
+                }),
+                Err(_) => Some(WsZones::Broken),
+            }
+        }
+    }
 }
 
 /// 路径是否落在工作区内（防 symlink 逃逸：canonicalize 解析符号链接后再判前缀）。
@@ -339,6 +415,17 @@ fn is_bridge_state_path(p: &str) -> bool {
 /// Grep 另有 path/glob 输入字段（绝对路径/搜索根）——同样必须落在工作区内，
 /// 只查 pattern 会漏掉以 `path` 指定工作区外目录的内容搜索。
 fn check_patterns(tool: &str, input: &serde_json::Value, workspace: &Path) -> Decision {
+    check_patterns_zoned(tool, input, workspace, None)
+}
+
+/// 双区版（#194）：虚拟 Bot 群可读 bot 工作区——Glob/Grep 是读工具，path 落在
+/// 写区（vb 目录）**或**读区（bot 工作区）都放行；穿越/绝对形态仍拒绝。
+fn check_patterns_zoned(
+    tool: &str,
+    input: &serde_json::Value,
+    workspace: &Path,
+    read_zone: Option<&Path>,
+) -> Decision {
     let Some(pattern) = input["pattern"].as_str() else {
         return Decision::Deny(format!("{tool} 缺 pattern"));
     };
@@ -354,7 +441,9 @@ fn check_patterns(tool: &str, input: &serde_json::Value, workspace: &Path) -> De
     }
     // Grep 的 path 字段：搜索根（绝对/相对路径）——必须落在工作区内。
     if let Some(p) = input["path"].as_str() {
-        if !canonical_in_workspace(p, workspace) {
+        let ok = canonical_in_workspace(p, workspace)
+            || read_zone.is_some_and(|z| canonical_in_workspace(p, z));
+        if !ok {
             return Decision::Deny(format!("{tool} path 指向工作区外（已拒绝：{p}）"));
         }
     }
@@ -368,7 +457,9 @@ fn check_patterns(tool: &str, input: &serde_json::Value, workspace: &Path) -> De
 }
 
 /// Bash：shell 分词后按白名单校验（ABB_BIN / 只读 git / 只读命令 + 路径参数校验）。
-fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
+/// read_zone（#194）：虚拟 Bot 群的读区（bot 工作区）——只读命令的路径参数落在
+/// 写区或读区都放行；None = 单区（非虚拟会话，行为不变）。
+fn check_bash(input: &serde_json::Value, workspace: &Path, read_zone: Option<&Path>) -> Decision {
     let Some(cmd) = input["command"].as_str() else {
         return Decision::Deny("Bash 缺 command".into());
     };
@@ -377,6 +468,11 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
     };
     let program = argv[0].as_str();
     let rest = &argv[1..];
+    // 只读命令的路径参数：写区或读区（#194 双区）。
+    let path_in_read_scope = |arg: &str| -> bool {
+        canonical_in_workspace(arg, workspace)
+            || read_zone.is_some_and(|z| canonical_in_workspace(arg, z))
+    };
     // $ABB_BIN（桥注入的本程序绝对路径）：job/session/deliver 白名单
     let exe = std::env::current_exe().ok();
     let is_abb = exe
@@ -484,7 +580,7 @@ fn check_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
                 return Decision::Deny("find -exec/-execdir/-ok/-delete 不受限（已拒绝）".into());
             }
             for arg in rest {
-                if is_path_arg(arg) && !canonical_in_workspace(arg, workspace) {
+                if is_path_arg(arg) && !path_in_read_scope(arg) {
                     return Decision::Deny(format!("命令参数指向工作区外（已拒绝：{arg}）"));
                 }
             }
@@ -1128,8 +1224,7 @@ mod tests {
     fn bash_whitelist() {
         let (root, ws, _guard) = temp_guard_env();
         let ws = workspace_canon(&ws);
-        let decide = |cmd: &str| check_bash(&serde_json::json!({"command": cmd}), &ws);
-        // $ABB_BIN 白名单
+        let decide = |cmd: &str| check_bash(&serde_json::json!({"command": cmd}), &ws, None); // $ABB_BIN 白名单
         assert_eq!(
             decide(r#""$ABB_BIN" job add --once "2026-08-15 09:00" --prompt "喝水""#),
             Decision::Allow
@@ -1653,5 +1748,85 @@ mod tests {
             "hook command 应烘焙 exe 路径"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #194 双区判定（虚拟 Bot 群）：Grep/Bash 只读命令的路径落在写区（vb 目录）
+    /// **或**读区（bot 工作区）都放行；写入路径仍仅写区。
+    /// 仅 unix：测试里的 ls 命令白名单与 `/` 路径分隔符是 unix 语义（Windows CI
+    /// 实测路径形态差异致红；双区组合逻辑本身平台无关，Windows 由既有单区测试覆盖）。
+    #[cfg(unix)]
+    #[test]
+    fn vb_dual_zone_read_and_write_scope() {
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        // 读区：模拟 bot 工作区（这里用 root 下另一目录代表）
+        let bot_ws = root.join("bot-ws");
+        std::fs::create_dir_all(&bot_ws).unwrap();
+        let bot_ws = workspace_canon(&bot_ws);
+
+        // Grep path 在读区（bot 工作区）→ 放行；在两区之外 → 拒绝
+        let grep = |p: &str| {
+            check_patterns_zoned(
+                "Grep",
+                &serde_json::json!({"pattern": "x", "path": p}),
+                &ws,
+                Some(bot_ws.as_path()),
+            )
+        };
+        assert_eq!(grep(&str_ws(&ws)), Decision::Allow, "写区内可搜索");
+        assert_eq!(
+            grep(&str_ws(&bot_ws)),
+            Decision::Allow,
+            "读区（bot 工作区）可搜索——虚拟 Bot 可读 bot 工作目录"
+        );
+        assert!(matches!(grep("/etc"), Decision::Deny(_)), "两区之外仍拒绝");
+
+        // Bash 只读命令（find/ls）路径参数：读区放行；两区外拒绝
+        let bash = |cmd: &str| {
+            check_bash(
+                &serde_json::json!({"command": cmd}),
+                &ws,
+                Some(bot_ws.as_path()),
+            )
+        };
+        assert_eq!(
+            bash(&format!("ls {}", str_ws(&bot_ws))),
+            Decision::Allow,
+            "只读命令可列读区"
+        );
+        assert!(
+            matches!(bash("ls /etc"), Decision::Deny(_)),
+            "只读命令两区外仍拒绝"
+        );
+
+        // Write 工具：写区（vb）放行；读区（bot 工作区）拒绝——「不可写 bot 根/他人目录」
+        let write = |p: &str| {
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": p, "content": "x"}),
+                &ws,
+            )
+        };
+        assert_eq!(
+            write(&format!("{}/a.md", str_ws(&ws).trim_end_matches('/'))),
+            Decision::Allow
+        );
+        assert!(
+            matches!(
+                write(&format!(
+                    "{}/evil.md",
+                    str_ws(&bot_ws).trim_end_matches('/')
+                )),
+                Decision::Deny(_)
+            ),
+            "bot 工作区对虚拟 Bot 是只读（不得写）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 测试辅助：canonicalize 后的字符串形态（vb 双区测试拼路径用）。
+    #[cfg(unix)]
+    fn str_ws(p: &Path) -> String {
+        p.to_string_lossy().to_string()
     }
 }

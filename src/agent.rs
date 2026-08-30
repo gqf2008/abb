@@ -496,11 +496,26 @@ pub async fn run(
     //（resolve_sandbox_mode 单点），保证下面「生成哪个 guard 文件」与 run_once 里
     //「--settings 指向哪个文件」永远一致——写错文件 claude 启动即报
     // "Settings file not found"（实测 CLI 硬错误退出）。
-    let sandbox = if matches!(backend, Backend::Claude | Backend::Codex) {
+    let mut sandbox = if matches!(backend, Backend::Claude | Backend::Codex) {
         resolve_sandbox_mode(bot_key, chat_id, restrict)
     } else {
         crate::config::SandboxMode::Auto
     };
+
+    // #194：虚拟 Bot 群强制 workspace-write——写边界 = 自己的 vb/<uuid>/ 目录
+    //（agent cwd 即该目录）。后端差异（如实）：
+    // - codex ≥0.146：workspace-write 可写域 = cwd(vb)+roots([vb])——写仅限自己
+    //   目录；读全盘不受限。已知取舍：$ABB_BIN job add/deliver 的 bridge_dir 落盘
+    //   域不可写（跨会话投递/定时任务在 codex vb 会话内会报写盘失败）；resume 轮
+    //   无沙箱参数表达，按 read-only 运行（提示如实告知）。
+    // - codex <0.146：roots 空 → bypass（与 owner 旧版回退一致，无隔离）。
+    // - claude：guard 双区（写=vb，读=vb∪bot 工作区）+ workspace-write 白名单，
+    //   完整满足边界；$ABB_BIN 白名单命令不受沙箱限制（deliver/job 正常）。
+    // 配置档位只影响非虚拟会话。
+    let is_vb_chat = crate::virtualbot::vb_dir_for(bot_key, chat_id).is_some();
+    if is_vb_chat && matches!(backend, Backend::Claude | Backend::Codex) {
+        sandbox = crate::config::SandboxMode::WorkspaceWrite;
+    }
 
     // #171 档位变化感知：会话创建时记录档位；resume 旧会话的记录档位 ≠ 当前配置 →
     // 提示一次（#185：#180 起 resume 按当前解析档位运行，记录随即覆盖为本轮档位，
@@ -539,8 +554,12 @@ pub async fn run(
             .map_err(|e| format!("⚠️ 删除保护 guard 文件生成失败，已拒绝启动：{e:#}"))?;
     }
 
-    // 本 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）
-    let workspace = crate::workspace_dir(bot_key);
+    // 工作目录：~/.agent-bridge/workspaces/<bot_key>/（多 bot 相互隔离）。
+    // #194：虚拟 Bot 群的 chat 使用独立工作区 vb/<uuid>/（自有 AGENTS.md/会话/历史，
+    // agent cwd 也在这里——codex workspace-write 的可写域随之限定为自己的目录；
+    // ensure 内含存量会话/历史一次性迁移）。非虚拟会话路径完全不变。
+    let workspace = crate::virtualbot::ensure_vb_dir(bot_key, chat_id)
+        .unwrap_or_else(|| crate::workspace_dir(bot_key));
     let _ = std::fs::create_dir_all(&workspace);
     ensure_workspace_guide(&workspace);
 
@@ -1504,9 +1523,31 @@ async fn run_once(
             //（含虚拟 Bot 受限会话默认覆盖）。
             // auto = 现状（owner→workspace-write(+bridge_dir)、受限→read-only）；显式
             // 模式用户选择优先，受限会话也尊重。
-            // roots 按「owner 预算」算好（restrict 时无意义，映射函数按模式取舍）
+            // #194：--add-dir 需要绝对路径——workspace（虚拟 Bot 会话 = vb/<uuid>/）
+            // 规范化；失败回落原值。
+            let resolved_workspace =
+                std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+            // 虚拟 Bot 会话判定（与 run() 的强制档位同源：chat 命中登记即 vb）
+            let is_vb_chat = crate::virtualbot::vb_dir_for(bot_key, chat_id).is_some();
+            // roots 按「owner 预算」算好（restrict 时无意义，映射函数按模式取舍）。
+            // #194：虚拟 Bot 会话的 roots 收窄为 [vb 目录]——不再含 bridge_dir（其下
+            // 有其他 bot 工作区/config.json，违反「不可写其他虚拟 Bot 目录/bot 根」）。
+            // 代价（已知取舍，注释与验收同步）：$ABB_BIN job add/deliver 的落盘域
+            // （bridge_dir）在 codex vb 沙箱内不可写——团队协作的 deliver 走 claude
+            // 后端不受影响；codex vb 会话内调用会看到写盘失败并如实报错。
+            // 版本门控同 codex_writable_roots（<0.146 无 --add-dir → 空回退 bypass，
+            // 与 owner 旧版回退一致——此时无隔离，但避免硬失败）。
             let roots = if restrict {
                 Vec::new()
+            } else if is_vb_chat {
+                if crate::deps::codex_version_at_least_cached(
+                    resolved.to_str().unwrap_or("codex"),
+                    "0.146",
+                ) {
+                    vec![resolved_workspace.clone()]
+                } else {
+                    Vec::new()
+                }
             } else {
                 codex_writable_roots(&resolved)
             };
