@@ -119,7 +119,7 @@ pub fn guard_check_main() -> i32 {
     // 全量闸 + 双区：写域 = 自己的 vb/<uuid>/，读域 = 写域 ∪ bot 工作区（可读 bot
     // 工作目录、不可写他人目录/bot 根）。
     let role = crate::config::SenderRole::from_env();
-    let Some((workspace, read_workspace)) = resolve_workspaces() else {
+    let Some(zones) = resolve_workspaces() else {
         // 无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）：granted 拒绝（fail-closed），
         // owner 放行（无工作区上下文可拦，保持原行为）。
         if role == crate::config::SenderRole::Granted {
@@ -134,7 +134,21 @@ pub fn guard_check_main() -> i32 {
         }
         return 0;
     };
-    let vb_confined = read_workspace.is_some();
+    let (workspace, read_workspace, vb_confined) = match zones {
+        WsZones::Single(ws) => (ws, None, false),
+        WsZones::Dual { write, read } => (write, Some(read), true),
+        // 虚拟 Bot 群但 vb 目录不可解析：fail-closed 全拒（写隔离是存在意义）
+        WsZones::Broken => {
+            eprintln!("[guard-check] vb 目录不可解析，fail-closed 全拒");
+            println!(
+                "{}",
+                decision_json(&Decision::Deny(
+                    "虚拟 Bot 工作区不可用（目录缺失且重建失败），已拒绝全部工具调用".into()
+                ))
+            );
+            return 0;
+        }
+    };
     let mut input = String::new();
     if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
         // 读不到 hook 事件：granted 拒绝（fail-closed）；owner 放行（手动调用/异常形态
@@ -233,24 +247,45 @@ fn decision_json(d: &Decision) -> String {
     .to_string()
 }
 
-/// 解析工作区根（#194 双区）：返回 (写域, 读域 Option)。
-/// - 非虚拟会话：写域 = bot 工作区，读域 None（行为与历史版本一致）。
-/// - 虚拟 Bot 群（AGENT_BRIDGE_CHAT_ID 命中登记）：写域 = vb/<uuid>/（agent cwd，
-///   spawn 前已 create_dir_all），读域 = bot 工作区（可读 bot 工作目录）。
-fn resolve_workspaces() -> Option<(PathBuf, Option<PathBuf>)> {
+/// 工作区解析结果（#194）。
+enum WsZones {
+    /// 非虚拟会话：单区（写=读=bot 工作区，行为与历史版本一致）。
+    Single(PathBuf),
+    /// 虚拟 Bot 群：双区（写=vb/<uuid>/，读=写区∪bot 工作区）。
+    Dual { write: PathBuf, read: PathBuf },
+    /// 虚拟 Bot 群但 vb 目录不可解析（被手动删除/竞态）：fail-closed 全拒
+    ///（独立审查 F6：回落 bot 工作区=全 bot 可写，违背写隔离的存在意义）。
+    Broken,
+}
+
+/// 解析工作区双区。
+fn resolve_workspaces() -> Option<WsZones> {
     let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").ok()?;
     let bot_ws = std::fs::canonicalize(crate::workspace_dir(&bot_key)).ok()?;
     let chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
     if chat.is_empty() {
-        return Some((bot_ws, None));
+        return Some(WsZones::Single(bot_ws));
     }
-    match crate::virtualbot::vb_dir_for(&bot_key, &chat) {
-        Some(vb) => match std::fs::canonicalize(&vb) {
-            // vb 目录不存在（理论上 agent spawn 前已建）：保守回落 bot 工作区
-            Ok(v) => Some((v, Some(bot_ws))),
-            Err(_) => Some((bot_ws, None)),
-        },
-        None => Some((bot_ws, None)),
+    let Some(vb) = crate::virtualbot::vb_dir_for(&bot_key, &chat) else {
+        return Some(WsZones::Single(bot_ws));
+    };
+    // vb 目录理论上由 agent spawn 前建好；不可解析（被删/竞态）先重建再 canonicalize，
+    // 仍失败 → Broken（fail-closed 全拒）。
+    match std::fs::canonicalize(&vb) {
+        Ok(v) => Some(WsZones::Dual {
+            write: v,
+            read: bot_ws,
+        }),
+        Err(_) => {
+            let _ = std::fs::create_dir_all(&vb);
+            match std::fs::canonicalize(&vb) {
+                Ok(v) => Some(WsZones::Dual {
+                    write: v,
+                    read: bot_ws,
+                }),
+                Err(_) => Some(WsZones::Broken),
+            }
+        }
     }
 }
 

@@ -342,29 +342,44 @@ impl SessionStore {
     /// 源删除、目标写入（目标已有该 chat 则不覆盖，防迁移覆盖新数据）。幂等：
     /// 源无条目即 no-op。返回是否搬了东西。
     pub fn extract_chat_to(&self, chat_id: &str, dst: &SessionStore) -> bool {
+        // #194 审查 F3：覆盖精确键 + 话题键（`{chat}:thread…`）——话题槽位不迁会
+        // 丢上下文连续性。前缀带 ':' 防 oc_1 误吞 oc_12。
         self.refresh();
+        let thread_prefix = format!("{chat_id}:");
         let mut data = self.data.lock().unwrap();
-        let Some(entry) = data.remove(chat_id) else {
+        let keys: Vec<String> = data
+            .keys()
+            .filter(|k| *k == chat_id || k.starts_with(&thread_prefix))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
             return false;
-        };
-        // 三槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃
-        let empty = entry.claude.session_id.is_empty()
-            && !entry.claude.started
-            && entry.codex.session_id.is_empty()
-            && !entry.codex.started
-            && entry.pi.session_id.is_empty()
-            && !entry.pi.started;
-        if empty {
-            self.save_locked(&data);
-            return false;
+        }
+        let mut moved = Vec::new();
+        for k in &keys {
+            let entry = data.remove(k).unwrap();
+            // 三槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃
+            let empty = entry.claude.session_id.is_empty()
+                && !entry.claude.started
+                && entry.codex.session_id.is_empty()
+                && !entry.codex.started
+                && entry.pi.session_id.is_empty()
+                && !entry.pi.started;
+            if !empty {
+                moved.push((k.clone(), entry));
+            }
         }
         self.save_locked(&data);
+        if moved.is_empty() {
+            return false;
+        }
         dst.refresh();
         let mut ddata = dst.data.lock().unwrap();
-        if !ddata.contains_key(chat_id) {
-            ddata.insert(chat_id.to_string(), entry);
-            dst.save_locked(&ddata);
+        for (k, entry) in moved {
+            // 目标已有该键（新数据）→ 不覆盖（保留目标，丢弃源）
+            ddata.entry(k).or_insert(entry);
         }
+        dst.save_locked(&ddata);
         true
     }
 

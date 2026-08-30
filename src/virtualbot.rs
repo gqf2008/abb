@@ -130,30 +130,40 @@ impl VirtualBotStore {
     /// 群解散后归档会话历史（8-20 用户决策）：把该 chat 的 history jsonl（+迁移/导入
     /// 标记文件）从 `workspaces/<bot>/history/<key>.jsonl` 移到
     /// `workspaces/<bot>/archive/<key>-<ts>.jsonl`——不删除（可追溯），移出活跃区。
+    /// #194：独立工作区 vb/<uuid>/history/ 的文件一并归档（审查 F4：迁移后 bot 级
+    /// 已空，只扫 bot 级会恒 0 文件）。
     /// 返回归档的文件数。调用方：im.chat.deleted_v1 事件 / GUI 手动刷新发现群不存在。
     pub fn archive_chat_history(bot_key: &str, chat_id: &str) -> usize {
-        let hist_dir = crate::workspace_dir(bot_key).join("history");
-        let archive_dir = crate::workspace_dir(bot_key).join("archive");
         let ts = crate::chrono_lite::unix_secs();
-        let mut moved = 0;
-        // history 文件名 = sanitize 后的会话 key（= chat_id，非话题场景；话题带 :thread
-        // 后缀——按 chat_id 前缀匹配归档该群的全部话题历史）
         let prefix = crate::config::sanitize(chat_id);
-        let entries = match std::fs::read_dir(&hist_dir) {
-            Ok(e) => e.flatten().collect::<Vec<_>>(),
-            Err(_) => return 0,
+        let archive = |hist_dir: &std::path::Path, archive_dir: &std::path::Path| -> usize {
+            let mut moved = 0;
+            let entries = match std::fs::read_dir(hist_dir) {
+                Ok(e) => e.flatten().collect::<Vec<_>>(),
+                Err(_) => return 0,
+            };
+            for e in entries {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !(name.starts_with(&prefix)
+                    && (name.ends_with(".jsonl") || name.ends_with(".json")))
+                {
+                    continue;
+                }
+                let _ = std::fs::create_dir_all(archive_dir);
+                let dst = archive_dir.join(format!("{name}.archived-{ts}"));
+                if std::fs::rename(e.path(), dst).is_ok() {
+                    moved += 1;
+                }
+            }
+            moved
         };
-        for e in entries {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !(name.starts_with(&prefix) && (name.ends_with(".jsonl") || name.ends_with(".json")))
-            {
-                continue;
-            }
-            let _ = std::fs::create_dir_all(&archive_dir);
-            let dst = archive_dir.join(format!("{name}.archived-{ts}"));
-            if std::fs::rename(e.path(), &dst).is_ok() {
-                moved += 1;
-            }
+        let mut moved = archive(
+            &crate::workspace_dir(bot_key).join("history"),
+            &crate::workspace_dir(bot_key).join("archive"),
+        );
+        // #194：独立工作区侧（登记存在才扫）
+        if let Some(vb_dir) = vb_dir_for(bot_key, chat_id) {
+            moved += archive(&vb_dir.join("history"), &vb_dir.join("archive"));
         }
         if moved > 0 {
             crate::log!("[virtualbot] 群 {chat_id} 已归档 {moved} 个历史文件 → archive/");
@@ -299,22 +309,32 @@ fn migrate_legacy_vb_data(
     chat_id: &str,
     vb_dir: &std::path::Path,
 ) {
-    // 1) 会话槽位：bot 级 sessions.json → vb/sessions.json（backend 无关，整 chat 搬）
+    // 已迁移 marker：短路重复扫描/解析（每消息多次触达本函数）。部分失败不落
+    // marker，下次重试（独立审查 F8）。
+    let marker = vb_dir.join(".migrated");
+    if marker.exists() {
+        return;
+    }
+    // 1) 会话槽位：bot 级 sessions.json → vb/sessions.json（backend 无关，整 chat 搬，
+    //    含话题键；独立审查 F3）
     let bot_sessions = base.join("workspaces").join(bot_key).join("sessions.json");
     let bot_store = crate::sessions::SessionStore::at("codex", bot_sessions);
     let vb_store = crate::sessions::SessionStore::at("codex", vb_dir.join("sessions.json"));
     let _ = bot_store.extract_chat_to(chat_id, &vb_store);
-    // 2) 历史文件：bot history/ 下以 escape(chat_id) 为前缀的 jsonl/json → vb/history/
+    // 2) 历史文件族：bot history/ 下 escape(chat). 前缀的**全部**文件（.jsonl/.json/
+    //    .ctxsum/.migrated.json/.imported.json——独立审查 F9；前缀用 escape_key 与
+    //    文件命名同源，sanitize 会漏大写/特殊字符 chat——独立审查 F8）
+    let esc = crate::history::escape_key(chat_id);
+    let prefix = format!("{esc}.");
     let bot_hist = base.join("workspaces").join(bot_key).join("history");
     let vb_hist = vb_dir.join("history");
-    let prefix = crate::config::sanitize(chat_id);
     let Ok(entries) = std::fs::read_dir(&bot_hist) else {
         return;
     };
     let mut moved = 0usize;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && (name.ends_with(".jsonl") || name.ends_with(".json")) {
+        if name.starts_with(&prefix) {
             let _ = std::fs::create_dir_all(&vb_hist);
             let dst = vb_hist.join(&name);
             if !dst.exists() && std::fs::rename(e.path(), dst).is_ok() {
@@ -322,9 +342,18 @@ fn migrate_legacy_vb_data(
             }
         }
     }
+    // 3) 会话级指令：bot sessions/<esc>.AGENTS.md → vb/sessions/（独立审查 F9）
+    let bot_ses = base.join("workspaces").join(bot_key).join("sessions");
+    let vb_ses = vb_dir.join("sessions");
+    let agents_md = format!("{esc}.AGENTS.md");
+    if bot_ses.join(&agents_md).exists() {
+        let _ = std::fs::create_dir_all(&vb_ses);
+        let _ = std::fs::rename(bot_ses.join(&agents_md), vb_ses.join(&agents_md));
+    }
     if moved > 0 {
         crate::log!("[virtualbot] 群 {chat_id} 存量历史 {moved} 个文件已迁入独立工作区");
     }
+    let _ = std::fs::write(&marker, "1");
 }
 
 /// 测试辅助：迁移函数暴露给同 crate 单测（ensure_vb_dir 依赖真实登记表路径，
