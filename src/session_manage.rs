@@ -155,31 +155,53 @@ fn display_name(vbs: &[crate::virtualbot::VirtualBot], bot_key: &str, chat_key: 
 }
 
 /// 收集某 bot 的全部会话 key：sessions.json 槽位 + history 目录文件（去重）。
+/// #194：虚拟 Bot 独立工作区（vb/<uuid>/，与 bot 级同布局）一并并入。
 fn chat_keys_for(ws: &std::path::Path, backend: &str) -> Vec<String> {
     let mut keys: Vec<String> = SessionStore::at(backend, ws.join("sessions.json")).chat_keys();
-    if let Ok(rd) = std::fs::read_dir(ws.join("history")) {
-        for e in rd.flatten() {
-            let path = e.path();
-            if !path.is_file()
-                || path
-                    .extension()
-                    .map(|x| !x.eq_ignore_ascii_case("jsonl"))
-                    .unwrap_or(true)
-            {
-                continue;
+    let mut scan_hist = |dir: &std::path::Path, keys: &mut Vec<String>| {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if !path.is_file()
+                    || path
+                        .extension()
+                        .map(|x| !x.eq_ignore_ascii_case("jsonl"))
+                        .unwrap_or(true)
+                {
+                    continue;
+                }
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let k = unescape_key(&stem);
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
             }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let k = unescape_key(&stem);
-            if !keys.contains(&k) {
-                keys.push(k);
+        }
+    };
+    scan_hist(&ws.join("history"), &mut keys);
+    // #194：vb/<uuid>/ 独立工作区的会话并入列表（布局与 bot 级相同）
+    if let Ok(rd) = std::fs::read_dir(ws.join("vb")) {
+        for d in rd.flatten() {
+            if d.path().is_dir() {
+                for k in SessionStore::at(backend, d.path().join("sessions.json")).chat_keys() {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+                scan_hist(&d.path().join("history"), &mut keys);
             }
         }
     }
     keys
+}
+
+/// #194：chat 的工作目录——虚拟 Bot 群 = vb/<uuid>/（含存量迁移），否则 bot 级。
+fn ws_for_chat(bot_key: &str, chat: &str) -> std::path::PathBuf {
+    crate::virtualbot::ensure_vb_dir(bot_key, chat).unwrap_or_else(|| crate::workspace_dir(bot_key))
 }
 
 /// list 输出行。
@@ -337,7 +359,8 @@ fn cmd_show(args: &[String]) -> i32 {
         .unwrap_or(0);
     let bot = cfg.bots.iter().find(|b| b.key() == bot_key).unwrap();
     let backend = bot.effective_backend(&cfg.default_backend).to_string();
-    let ws = crate::workspace_dir(&bot_key);
+    // #194：虚拟 Bot 群的会话/历史/指令在独立工作区 vb/<uuid>/
+    let ws = ws_for_chat(&bot_key, &chat);
     let state = SessionState::production();
     let paused = state.is_paused(&bot_key, &chat);
 
@@ -490,7 +513,8 @@ fn cmd_delete(args: &[String]) -> i32 {
 
     let bot = cfg.bots.iter().find(|b| b.key() == bot_key).unwrap();
     let backend = bot.effective_backend(&cfg.default_backend).to_string();
-    let ws = crate::workspace_dir(&bot_key);
+    // #194：虚拟 Bot 群的会话/历史/指令在独立工作区 vb/<uuid>/
+    let ws = ws_for_chat(&bot_key, &chat);
     let state = SessionState::production();
 
     // 影响面统计：消息库 + 历史 + 会话槽位

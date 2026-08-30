@@ -117,6 +117,14 @@ impl SessionStore {
         &self.current_backend
     }
 
+    /// #194：chat 的会话存储——虚拟 Bot 群 → 独立工作区 vb/<uuid>/sessions.json
+    ///（含存量迁移），其余 → bot 级。CLI 管理面（reset/show/delete）与桥共用路由。
+    pub fn store_for_chat(current_backend: &str, bot_key: &str, chat_id: &str) -> SessionStore {
+        let dir = crate::virtualbot::ensure_vb_dir(bot_key, chat_id)
+            .unwrap_or_else(|| crate::workspace_dir(bot_key));
+        SessionStore::at(current_backend, dir.join("sessions.json"))
+    }
+
     /// 若 sessions.json 的 (mtime, size) 比上次加载新（CLI/外部进程改了），重新读盘。
     /// 每次公开方法前调用，保证「运行中改文件即时生效」。size 与 mtime 双重判定，
     /// 缓解单 mtime 在同 tick 内精度不足的漏检（审查 P3-2）。
