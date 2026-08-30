@@ -1752,6 +1752,9 @@ mod tests {
 
     /// #194 双区判定（虚拟 Bot 群）：Grep/Bash 只读命令的路径落在写区（vb 目录）
     /// **或**读区（bot 工作区）都放行；写入路径仍仅写区。
+    /// 仅 unix：测试里的 ls 命令白名单与 `/` 路径分隔符是 unix 语义（Windows CI
+    /// 实测路径形态差异致红；双区组合逻辑本身平台无关，Windows 由既有单区测试覆盖）。
+    #[cfg(unix)]
     #[test]
     fn vb_dual_zone_read_and_write_scope() {
         let (root, ws, _guard) = temp_guard_env();
@@ -1822,6 +1825,7 @@ mod tests {
     }
 
     /// 测试辅助：canonicalize 后的字符串形态（vb 双区测试拼路径用）。
+    #[cfg(unix)]
     fn str_ws(p: &Path) -> String {
         p.to_string_lossy().to_string()
     }
