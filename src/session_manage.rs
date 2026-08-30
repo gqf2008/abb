@@ -158,7 +158,7 @@ fn display_name(vbs: &[crate::virtualbot::VirtualBot], bot_key: &str, chat_key: 
 /// #194：虚拟 Bot 独立工作区（vb/<uuid>/，与 bot 级同布局）一并并入。
 fn chat_keys_for(ws: &std::path::Path, backend: &str) -> Vec<String> {
     let mut keys: Vec<String> = SessionStore::at(backend, ws.join("sessions.json")).chat_keys();
-    let mut scan_hist = |dir: &std::path::Path, keys: &mut Vec<String>| {
+    let scan_hist = |dir: &std::path::Path, keys: &mut Vec<String>| {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let path = e.path();
