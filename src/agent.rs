@@ -548,8 +548,7 @@ pub async fn run(
     } else {
         None
     };
-    let sandbox_change_hint =
-        sandbox_change.as_ref().map(|(hint, _rotated)| hint.clone());
+    let sandbox_change_hint = sandbox_change.as_ref().map(|(hint, _rotated)| hint.clone());
     // #185 审查 F4 的降级说明已移除（#196 实测推翻，0.150.1）：`codex exec resume`
     // 继承首轮沙箱——workspace-write 会话（含 #194 虚拟 Bot 会话）resume 轮可写
     // cwd（vb 目录）、cwd 外沙箱拒绝；「按 read-only 运行」的提示与实际相反。
