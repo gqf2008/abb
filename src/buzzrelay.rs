@@ -439,6 +439,7 @@ impl RelayState {
 
     /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入 mini-relay。
     /// buzz-acp 订阅到后触发 buzz-agent session/prompt。
+    #[allow(dead_code)] // #200 Phase 2 bridge 接线时消费
     pub async fn publish_user_message(&self, chat_id: &str, content: &str) {
         let uuid = self
             .channels
@@ -470,6 +471,7 @@ impl RelayState {
     }
 
     /// agent 身份公钥（hex）。
+    #[allow(dead_code)]
     pub fn agent_pubkey(&self) -> &str {
         &self.agent_pubkey
     }

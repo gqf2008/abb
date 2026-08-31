@@ -25,6 +25,8 @@ pub enum Backend {
     Claude,
     Codex,
     Pi,
+    /// #200：buzz-acp/buzz-agent 执行层（mini-relay 路径）。
+    Buzz,
 }
 
 impl Backend {
@@ -33,6 +35,8 @@ impl Backend {
             Backend::Codex
         } else if s.eq_ignore_ascii_case("pi") {
             Backend::Pi
+        } else if s.eq_ignore_ascii_case("buzz") || s.eq_ignore_ascii_case("buzz-agent") {
+            Backend::Buzz
         } else if s.eq_ignore_ascii_case("prime-agent") || s.eq_ignore_ascii_case("prime") {
             // #92 收敛：prime-agent 下线，存量配置迁移到 codex（默认）
             Backend::Codex
@@ -45,6 +49,7 @@ impl Backend {
             Backend::Claude => "claude",
             Backend::Codex => "codex",
             Backend::Pi => "pi",
+            Backend::Buzz => "buzz",
         }
     }
 }
@@ -278,6 +283,11 @@ pub(crate) fn build_injection(
     use crate::config::ProviderConfig as P;
     let no_args = Vec::new();
     match (backend, provider) {
+        // ── #200：buzz 后端无 provider 注入（buzz-agent 自带 provider 配置）──
+        (Backend::Buzz, _) => Ok(Injection {
+            env: None,
+            extra_args: Vec::new(),
+        }),
         // ── 未配供应商：旧行为回落 ──
         (Backend::Claude, None) => Ok(Injection {
             env: Some(ccswitch_env_or_err()?),
@@ -820,6 +830,7 @@ fn process_line(
 ) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     match backend {
+        Backend::Buzz => None,
         Backend::Codex => match v.get("type").and_then(|t| t.as_str()) {
             Some("thread.started") => {
                 *thread_id = v
@@ -1406,10 +1417,12 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
         Backend::Pi => "pi",
         Backend::Codex => "codex",
         Backend::Claude => "claude",
+        Backend::Buzz => "buzz-agent", // #200：spawn buzz-agent（ACP stdio）
     };
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
     let mut cmd = match backend {
+        Backend::Buzz => tokio::process::Command::from(shim_command(&resolved)),
         Backend::Claude => {
             let mut c = tokio::process::Command::from(shim_command(&resolved));
             c.arg("-p").arg("--output-format").arg("text");
@@ -1536,11 +1549,17 @@ async fn run_once(
         Backend::Pi => "pi",
         Backend::Codex => "codex",
         Backend::Claude => "claude",
+        Backend::Buzz => "buzz-agent", // #200：spawn buzz-agent（ACP stdio）
     };
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
 
     let mut cmd = match backend {
+        Backend::Buzz => {
+            // #200：buzz 后端不经 run_once spawn（走 mini-relay → buzz-acp → buzz-agent）。
+            // 此分支仅为 match 完整性保留；调用方（bridge）在 dispatch 前已拦截 Buzz。
+            unreachable!("buzz backend is dispatched via mini-relay, not run_once")
+        }
         Backend::Codex => {
             // codex 多轮上下文（对齐 claude）：首轮 `codex exec`，后续轮 `codex exec resume <tid>`。
             // 关键坑（实测）：① 必须 `exec resume`（顶层 `codex resume` 是 TUI，stdin 非终端报错）；
@@ -1862,6 +1881,9 @@ async fn run_once(
     }
 
     let reply = match backend {
+        Backend::Buzz => {
+            unreachable!("buzz backend is dispatched via mini-relay, not run_once")
+        }
         Backend::Codex => pending.take().filter(|s| !s.is_empty()).ok_or_else(|| {
             AttemptErr::Failed(format!("⚠️ codex 没有输出。{}", stderr_tail(&stderr_text)))
         })?,

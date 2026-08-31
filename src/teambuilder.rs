@@ -242,6 +242,7 @@ pub async fn generate_team_plan(
         crate::agent::Backend::Pi => "pi",
         crate::agent::Backend::Codex => "codex",
         crate::agent::Backend::Claude => "claude",
+        crate::agent::Backend::Buzz => "buzz-agent",
     };
     let resolved =
         crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
@@ -306,7 +307,7 @@ pub async fn generate_team_plan(
     let raw = match backend {
         crate::agent::Backend::Codex => codex_json_text(&stdout),
         crate::agent::Backend::Pi => pi_json_text(&stdout),
-        crate::agent::Backend::Claude => stdout.to_string(),
+        crate::agent::Backend::Claude | crate::agent::Backend::Buzz => stdout.to_string(),
     };
 
     validate_team_plan_json(&raw).map_err(|e| {
@@ -332,6 +333,9 @@ fn build_agent_command(
     sandbox_mode_ok: bool,
 ) -> tokio::process::Command {
     let mut cmd = match backend {
+        crate::agent::Backend::Buzz => {
+            tokio::process::Command::from(crate::agent::shim_command(resolved))
+        }
         crate::agent::Backend::Claude => {
             let mut c = tokio::process::Command::from(crate::agent::shim_command(resolved));
             c.arg("-p").arg("--output-format").arg("text");
