@@ -238,7 +238,7 @@ mod tests {
 // ══════════ 事件存储（turso）与 relay 服务 ══════════
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
