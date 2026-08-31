@@ -80,7 +80,6 @@ pub async fn run() {
                     about: String::new(),
                 })
                 .collect();
-            let relay_cfg = cfg.clone();
             // 回复回流 → 日志（messenger 发送接线随 #200 后续批次）
             // 事件库打开失败极罕见（磁盘满/权限），失败则跳过本轮
             let store = match crate::buzzrelay::EventStore::open(

@@ -67,6 +67,8 @@ pub enum ClientFrame {
         filters: Vec<nostr::Filter>,
     },
     Close(String),
+    /// NIP-42 AUTH 响应（kind 22242 已签名事件）。
+    Auth(Box<nostr::Event>),
 }
 
 /// 解析 NIP-01 客户端帧（["EVENT",e] / ["REQ",sub,filters] / ["CLOSE",sub]）。
@@ -88,6 +90,10 @@ pub fn parse_client_frame(text: &str) -> Option<ClientFrame> {
                 .filter_map(|f| serde_json::from_value(f.clone()).ok())
                 .collect();
             Some(ClientFrame::Req { sub_id, filters })
+        }
+        "AUTH" => {
+            let e: nostr::Event = serde_json::from_value(arr.get(1)?.clone()).ok()?;
+            Some(ClientFrame::Auth(Box::new(e)))
         }
         "CLOSE" => Some(ClientFrame::Close(arr.get(1)?.as_str()?.to_string())),
         _ => None,
@@ -434,30 +440,44 @@ impl RelayState {
 
     /// 种子频道元数据/成员事件（kind 39002 成员 + 39000 元数据，bridge 身份签名）——
     /// buzz-acp discover_channels 两步 /query 的数据源。幂等（同 id 去重）。
+    /// agent_pubkey 为空时跳过成员事件（无法构造有效的 #p tag）。
     pub async fn seed_channel_events(&self) {
         // 先克隆（不持 RwLock 跨 await——RwLockReadGuard 非 Send）
         let channels: Vec<Channel> = self.channels.read().unwrap().values().cloned().collect();
+        let agent_pk = if self.agent_pubkey.is_empty() {
+            None
+        } else {
+            nostr::PublicKey::from_hex(&self.agent_pubkey).ok()
+        };
         for ch in &channels {
-            let member = EventBuilder::new(Kind::Custom(39002), "")
-                .tag(Tag::public_key(
-                    nostr::PublicKey::from_hex(&self.agent_pubkey).unwrap(),
-                ))
-                .tag(Tag::custom(
-                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
-                    [ch.uuid.as_str()],
-                ))
-                .custom_created_at(Timestamp::from_secs(1))
-                .sign_with_keys(&self.bridge_keys)
-                .ok();
+            // kind 39002：成员（#p = agent pubkey, #d = 频道 uuid）
+            // P0-1 修复：agent_pubkey 无效时跳过成员事件，不再 panic
+            if let Some(pk) = &agent_pk {
+                let member = EventBuilder::new(Kind::Custom(39002), "")
+                    .tag(Tag::public_key(*pk))
+                    .tag(Tag::custom(
+                        TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
+                        [ch.uuid.as_str()],
+                    ))
+                    .custom_created_at(Timestamp::from_secs(1))
+                    .sign_with_keys(&self.bridge_keys)
+                    .ok();
+                if let Some(ev) = member {
+                    let _ = self.db.store(&ev).await;
+                }
+            }
+            // kind 39000：频道元数据（name/about 标签供 discover_channels 读取）
             let meta = EventBuilder::new(Kind::Custom(39000), ch.about.clone())
                 .tag(Tag::custom(
                     TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
                     [ch.uuid.as_str()],
                 ))
+                .tag(Tag::custom(TagKind::custom("name"), [ch.name.as_str()]))
+                .tag(Tag::custom(TagKind::custom("about"), [ch.about.as_str()]))
                 .custom_created_at(Timestamp::from_secs(1))
                 .sign_with_keys(&self.bridge_keys)
                 .ok();
-            for ev in [member, meta].into_iter().flatten() {
+            if let Some(ev) = meta {
                 let _ = self.db.store(&ev).await;
             }
         }
@@ -472,10 +492,13 @@ impl RelayState {
                 e.id.to_hex()
             );
         }
-        let is_new = self.db.store(e).await;
-        self.fan_out(e);
-        // kind 9（Buzz 频道消息）且作者是 agent → 回复回流
-        if e.kind.as_u16() == 9 && e.pubkey.to_hex() == self.agent_pubkey {
+        let stored = self.db.store(e).await;
+        if stored {
+            self.fan_out(e);
+        }
+        // kind 9（Buzz 频道消息）→ 回复回流。不按 pubkey 过滤（Phase 1 简化：
+        // 事件已验签、频道已映射，任何 kind 9 都是有效回复）。
+        if e.kind.as_u16() == 9 {
             if let Some(h) = h_tag_of(e) {
                 if let Some(ch) = self.channel_by_uuid(&h) {
                     let _ = self.reply_tx.send(AgentReply {
@@ -486,8 +509,11 @@ impl RelayState {
                 }
             }
         }
-        let _ = is_new;
-        format!("[\"OK\",\"{}\",true,\"\"]", e.id.to_hex())
+        if stored {
+            format!("[\"OK\",\"{}\",true,\"\"]", e.id.to_hex())
+        } else {
+            format!("[\"OK\",\"{}\",false,\"duplicate\"]", e.id.to_hex())
+        }
     }
 
     /// fan-out：发给所有命中的订阅。
@@ -539,13 +565,17 @@ async fn ws_loop(state: Arc<RelayState>, socket: axum::extract::ws::WebSocket) {
     state.conns.lock().unwrap().insert(conn_id, tx);
 
     let challenge = uuid::Uuid::new_v4().to_string();
-    let _ = sink.send(WsMessage::Text(
-        format!("[\"AUTH\",\"{challenge}\"]").into(),
-    ));
-    // 认证事件（kind 22242）存储： buzz-acp 回的 AUTH 帧按 NIP-42 处理后不落库——
-    // 这里跳过存储，仅帧级处理。
-    let authed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _ = &authed;
+    // P0-2 修复：challenge 必须 .await 发出（原 let _ = drop 了 future，帧从未发出）
+    if sink
+        .send(WsMessage::Text(
+            format!("[\"AUTH\",\"{challenge}\"]").into(),
+        ))
+        .await
+        .is_err()
+    {
+        state.conns.lock().unwrap().remove(&conn_id);
+        return;
+    }
 
     loop {
         tokio::select! {
@@ -558,6 +588,9 @@ async fn ws_loop(state: Arc<RelayState>, socket: axum::extract::ws::WebSocket) {
                 let Some(Ok(WsMessage::Text(text))) = msg else { break };
                 let Some(frame) = parse_client_frame(&text) else { continue };
                 match frame {
+                    ClientFrame::Auth(_) => {
+                        // NIP-42 AUTH 响应：本地回环不强制门禁，接受即可
+                    }
                     ClientFrame::Event(e) => {
                         let ack = state.ingest(&e).await;
                         if sink.send(WsMessage::Text(ack.into())).await.is_err() {
@@ -631,6 +664,6 @@ async fn post_query(
 
 /// mini-relay 服务入口：端口监听（service spawn 调用）。
 pub async fn run_server(state: Arc<RelayState>, port: u16) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     axum::serve(listener, router(state)).await
 }
