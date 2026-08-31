@@ -164,7 +164,7 @@ pub trait AgentRunner: Send + Sync {
 /// （codex 变更轮换后取新 sid+非 resume，本轮全新 exec 按新档位）；changed=false
 /// 或无 store 时原值返回（claude/pi/未变更会话零变化）。
 fn resync_after_sandbox_change(
-    sessions: Option<&SessionStore>,
+    sessions: Option<&crate::sessions::SessionStore>,
     session_key: &str,
     sid: String,
     resume: bool,
