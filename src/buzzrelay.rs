@@ -149,6 +149,7 @@ fn h_tag_of(e: &nostr::Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use nostr::prelude::*;
 
     /// channel_uuid：确定性、uuid 形态、不同群不同、与 bot 绑定。
@@ -258,6 +259,7 @@ pub struct Channel {
 /// 回流事件：虚拟 Bot agent 的回复（kind 9），bridge 据此发回聊天平台。
 #[derive(Debug, Clone)]
 pub struct AgentReply {
+    #[allow(dead_code)]
     pub channel_uuid: String,
     pub chat_id: String,
     pub content: String,
