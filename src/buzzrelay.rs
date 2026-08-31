@@ -67,8 +67,8 @@ pub enum ClientFrame {
         filters: Vec<nostr::Filter>,
     },
     Close(String),
-    /// NIP-42 AUTH 响应（kind 22242 已签名事件）。
-    Auth(Box<nostr::Event>),
+    /// NIP-42 AUTH 响应（Phase 1 不验签不读内容）。
+    Auth,
 }
 
 /// 解析 NIP-01 客户端帧（["EVENT",e] / ["REQ",sub,filters] / ["CLOSE",sub]）。
@@ -91,10 +91,7 @@ pub fn parse_client_frame(text: &str) -> Option<ClientFrame> {
                 .collect();
             Some(ClientFrame::Req { sub_id, filters })
         }
-        "AUTH" => {
-            let e: nostr::Event = serde_json::from_value(arr.get(1)?.clone()).ok()?;
-            Some(ClientFrame::Auth(Box::new(e)))
-        }
+        "AUTH" => Some(ClientFrame::Auth),
         "CLOSE" => Some(ClientFrame::Close(arr.get(1)?.as_str()?.to_string())),
         _ => None,
     }
@@ -590,7 +587,7 @@ async fn ws_loop(state: Arc<RelayState>, socket: axum::extract::ws::WebSocket) {
                 let Some(Ok(WsMessage::Text(text))) = msg else { break };
                 let Some(frame) = parse_client_frame(&text) else { continue };
                 match frame {
-                    ClientFrame::Auth(_) => {
+                    ClientFrame::Auth => {
                         // NIP-42 AUTH 响应：本地回环不强制门禁，接受即可
                     }
                     ClientFrame::Event(e) => {
