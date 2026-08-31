@@ -5,7 +5,8 @@
 use crate::bridge::Bridge;
 use crate::config::Config;
 use crate::messenger;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 pub async fn run() {
     crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
     let cfg = match Config::load() {
@@ -54,21 +55,54 @@ pub async fn run() {
         crate::tasks::tasks().spawn_forever("mini-relay", async move {
             // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；首次生成后持久化）
             let key_path = crate::bridge_dir().join("buzz-bridge-key");
-            let secret_hex = std::fs::read_to_string(&key_path).unwrap_or_else(|_| {
-                let k = nostr::prelude::Keys::generate();
-                let hex = k.secret_key().display_secret().to_string();
-                let _ = std::fs::write(&key_path, &hex);
-                hex
-            });
+            let secret_hex = match std::fs::read_to_string(&key_path) {
+                Ok(s) => s,
+                Err(_) => {
+                    let k = nostr::prelude::Keys::generate();
+                    let hex = k.secret_key().display_secret().to_string();
+                    let _ = std::fs::write(&key_path, &hex);
+                    hex
+                }
+            };
             let bridge_keys = nostr::prelude::Keys::parse(secret_hex.trim()).unwrap_or_else(|_| {
                 crate::log!("[mini-relay] ⚠️ buzz-bridge-key 解析失败，重新生成");
                 let k = nostr::prelude::Keys::generate();
                 let _ = std::fs::write(&key_path, k.secret_key().display_secret().to_string());
                 k
             });
-            // agent 身份公钥：Phase 1 暂不按 pubkey 过滤回流（空值 = 接受所有 kind 9）。
-            // Phase 2 可加 config 字段让用户指定 buzz-acp 的 Nostr pubkey。
-            let agent_pubkey = String::new();
+            // agent 身份私钥：config 指定，否则生成并持久化到 buzz-agent-key（0o600）
+            let agent_key_path = crate::bridge_dir().join("buzz-agent-key");
+            let agent_secret = if !cfg.buzz_agent_private_key.is_empty() {
+                cfg.buzz_agent_private_key.clone()
+            } else {
+                std::fs::read_to_string(&agent_key_path).unwrap_or_else(|_| {
+                    let hex = nostr::prelude::Keys::generate()
+                        .secret_key()
+                        .display_secret()
+                        .to_string();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::write(&agent_key_path, &hex).and_then(|_| {
+                            std::fs::set_permissions(
+                                &agent_key_path,
+                                std::fs::Permissions::from_mode(0o600),
+                            )
+                        });
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = std::fs::write(&agent_key_path, &hex);
+                    }
+                    hex
+                })
+            };
+            let agent_keys =
+                nostr::prelude::Keys::parse(agent_secret.trim()).unwrap_or_else(|_| {
+                    crate::log!("[mini-relay] ⚠️ agent 密钥解析失败，重新生成");
+                    nostr::prelude::Keys::generate()
+                });
+            let agent_pubkey = agent_keys.public_key().to_hex();
             // 频道集：登记的虚拟 Bot 群（uuid 派生 + chat_id + 角色名/描述）
             let vbs = crate::virtualbot::VirtualBotStore::new().load();
             let channels: Vec<crate::buzzrelay::Channel> = vbs
@@ -80,7 +114,6 @@ pub async fn run() {
                     about: String::new(),
                 })
                 .collect();
-            // 回复回流 → 日志（messenger 发送接线随 #200 后续批次）
             // 事件库打开失败极罕见（磁盘满/权限），失败则跳过本轮
             let store = match crate::buzzrelay::EventStore::open(
                 &crate::bridge_dir().join("buzz-relay.db"),
@@ -94,20 +127,86 @@ pub async fn run() {
                 }
             };
             let (state, mut reply_rx) =
-                crate::buzzrelay::RelayState::new(store, bridge_keys, agent_pubkey);
+                crate::buzzrelay::RelayState::new(store, bridge_keys, agent_pubkey.clone());
             state.set_channels(channels);
             state.seed_channel_events().await;
-            crate::tasks::tasks().spawn_forever("mini-relay-replies", async move {
-                while let Some(reply) = reply_rx.recv().await {
-                    crate::log!(
-                        "[mini-relay] agent 回复 chat={} len={}",
-                        &reply.chat_id[..reply.chat_id.len().min(16)],
-                        reply.content.chars().count()
-                    );
+
+            // #200 胶水 ①：拉起 buzz-acp 子进程（BUZZ_RELAY_URL 指向本 mini-relay）。
+            let acp_exe = if cfg.buzz_acp_exe.is_empty() {
+                crate::bridge_dir()
+                    .join("bin/buzz-acp")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                cfg.buzz_acp_exe.clone()
+            };
+            let agent_exe = if cfg.buzz_agent_exe.is_empty() {
+                crate::bridge_dir()
+                    .join("bin/buzz-agent")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                cfg.buzz_agent_exe.clone()
+            };
+            let relay_url = format!("ws://127.0.0.1:{}", cfg.buzz_relay_port);
+            match crate::buzzacp::BuzzAcpProcess::spawn(
+                &acp_exe,
+                &relay_url,
+                &cfg.buzz_agent_private_key,
+                &agent_exe,
+                "", // agent owner：Phase 1 空（回环信任）
+            ) {
+                Ok(_) => {
+                    crate::log!("[mini-relay] buzz-acp 子进程已拉起（{acp_exe} → {relay_url}）")
+                }
+                Err(e) => crate::log!(
+                    "[mini-relay] ⚠️ buzz-acp spawn 失败: {e}（agent 回复不可用，relay 仍运行）"
+                ),
+            }
+
+            // #200 胶水：回复回流 → 找到对应 bot 的 messenger → send_text 发回聊天平台。
+            // messenger 句柄经 mpsc 从 ready 循环注入（见下方 Arc<Mutex<HashMap>>）。
+            let senders: Arc<
+                std::sync::Mutex<HashMap<String, std::sync::Arc<dyn crate::messenger::Messenger>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+            crate::tasks::tasks().spawn_forever("mini-relay-replies", {
+                let senders = Arc::clone(&senders);
+                async move {
+                    while let Some(reply) = reply_rx.recv().await {
+                        match sender_of(&senders, &reply.chat_id) {
+                            Some(msgr) => {
+                                if let Err(e) = msgr.send_text(&reply.chat_id, &reply.content).await
+                                {
+                                    crate::log!(
+                                        "[mini-relay] 回复发送失败 chat={}: {e:#}",
+                                        &reply.chat_id[..reply.chat_id.len().min(16)]
+                                    );
+                                }
+                            }
+                            None => crate::log!(
+                                "[mini-relay] agent 回复无对应 bot chat={} len={}",
+                                &reply.chat_id[..reply.chat_id.len().min(16)],
+                                reply.content.chars().count()
+                            ),
+                        }
+                    }
                 }
             });
+
+            // 供 mini-relay-replies 任务查 bot messenger 的便捷注册点
+            fn sender_of(
+                senders: &Arc<
+                    std::sync::Mutex<
+                        HashMap<String, std::sync::Arc<dyn crate::messenger::Messenger>>,
+                    >,
+                >,
+                chat_id: &str,
+            ) -> Option<std::sync::Arc<dyn crate::messenger::Messenger>> {
+                senders.lock().unwrap().get(chat_id).cloned()
+            }
+
             crate::log!(
-                "[mini-relay] 监听 0.0.0.0:{}（{} 个虚拟 Bot 频道）",
+                "[mini-relay] 监听 127.0.0.1:{}（{} 个虚拟 Bot 频道，agent={agent_pubkey:.16}…）",
                 cfg.buzz_relay_port,
                 vbs.len()
             );

@@ -10,6 +10,7 @@ mod agents_md;
 mod attachments;
 mod botstatus;
 mod bridge;
+mod buzzacp;
 mod buzzrelay;
 mod ccswitch;
 mod config;

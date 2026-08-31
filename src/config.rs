@@ -904,6 +904,15 @@ pub struct Config {
     /// #200：mini-relay 监听端口。默认 3000（与 buzz 生态默认一致）。
     #[serde(default = "default_buzz_relay_port")]
     pub buzz_relay_port: u16,
+    /// #200：buzz-acp 可执行文件路径（service spawn 用）。空 = ~/.agent-bridge/bin/buzz-acp。
+    #[serde(default)]
+    pub buzz_acp_exe: String,
+    /// #200：buzz-agent 可执行文件路径（传给 buzz-acp）。空 = ~/.agent-bridge/bin/buzz-agent。
+    #[serde(default)]
+    pub buzz_agent_exe: String,
+    /// #200：agent 的 Nostr 私钥（hex）。空 = 首次启动生成并持久化到 buzz-agent-key。
+    #[serde(default)]
+    pub buzz_agent_private_key: String,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -943,6 +952,9 @@ impl Default for Config {
             cross_delivery_enabled: false,
             buzz_relay_enabled: false,
             buzz_relay_port: 3000,
+            buzz_acp_exe: String::new(),
+            buzz_agent_exe: String::new(),
+            buzz_agent_private_key: String::new(),
             lock_screen_control: false,     // #129 锁屏控制默认关
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
