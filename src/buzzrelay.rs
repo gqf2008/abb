@@ -437,6 +437,43 @@ impl RelayState {
         self.channels.read().unwrap().get(uuid).cloned()
     }
 
+    /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入 mini-relay。
+    /// buzz-acp 订阅到后触发 buzz-agent session/prompt。
+    pub async fn publish_user_message(&self, chat_id: &str, content: &str) {
+        let uuid = self
+            .channels
+            .read()
+            .unwrap()
+            .values()
+            .find(|c| c.chat_id == chat_id)
+            .map(|c| c.uuid.clone());
+        let Some(uuid) = uuid else {
+            return; // 非虚拟 Bot 群，不经 relay
+        };
+        let ev = EventBuilder::new(Kind::Custom(9), content)
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [uuid.as_str()],
+            ))
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [uuid.as_str()],
+            ))
+            .sign_with_keys(&self.bridge_keys)
+            .ok();
+        if let Some(e) = ev {
+            let stored = self.db.store(&e).await;
+            if stored {
+                self.fan_out(&e);
+            }
+        }
+    }
+
+    /// agent 身份公钥（hex）。
+    pub fn agent_pubkey(&self) -> &str {
+        &self.agent_pubkey
+    }
+
     /// 种子频道元数据/成员事件（kind 39002 成员 + 39000 元数据，bridge 身份签名）——
     /// buzz-acp discover_channels 两步 /query 的数据源。幂等（同 id 去重）。
     /// agent_pubkey 为空时跳过成员事件（无法构造有效的 #p tag）。
@@ -497,7 +534,8 @@ impl RelayState {
         }
         // kind 9（Buzz 频道消息）→ 回复回流。不按 pubkey 过滤（Phase 1 简化：
         // 事件已验签、频道已映射，任何 kind 9 都是有效回复）。
-        if e.kind.as_u16() == 9 {
+        // 只回流 agent 的回复（排除 bridge 签的用户消息，防回声循环）
+        if e.kind.as_u16() == 9 && e.pubkey.to_hex() != self.bridge_keys.public_key().to_hex() {
             if let Some(h) = h_tag_of(e) {
                 if let Some(ch) = self.channel_by_uuid(&h) {
                     let _ = self.reply_tx.send(AgentReply {
