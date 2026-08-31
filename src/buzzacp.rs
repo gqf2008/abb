@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Phase 2 渐进接线：部分 API 先于调用点落位
+
 //! #200 Phase 2：buzz-acp 执行层——bridge dispatch 的 buzz 路径。
 //!
 //! 后端为 buzz 时不再 spawn CLI 子进程，改为把消息写入 mini-relay（kind 9），
@@ -7,7 +9,6 @@
 //! 进程管理：ABB service 启动时拉起 buzz-acp 子进程（环境变量配置 relay 地址/
 //! agent 命令/身份密钥），退出由 kill_on_drop 兜底。
 
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
