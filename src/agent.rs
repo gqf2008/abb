@@ -589,7 +589,7 @@ pub async fn run(
     // 不以旧 sid resume（resume 继承旧沙箱，新档位不生效）。限定变更场景重取：
     // claude/pi 及未变更会话严格零变化——含 /new、CLI reset 落在桥快照与重取之间
     // 竞态的形态（独立审查 F3：此前无条件重取会让 claude/pi 在竞态下改跑新 sid）。
-    let (sid, is_resume) = resync_after_sandbox_change(
+    let (mut sid, mut is_resume) = resync_after_sandbox_change(
         sessions,
         session_key,
         session_id.to_string(),
