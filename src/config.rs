@@ -524,6 +524,11 @@ fn default_session_gc_days() -> u32 {
     7
 }
 
+/// #200：mini-relay 默认端口。
+fn default_buzz_relay_port() -> u16 {
+    3000
+}
+
 impl BotConfig {
     /// 隔离键基础段（不含 suffix）：#174 优先级 = app_id（飞书/钉钉平台唯一）→
     /// wx_user_id（微信登录者 id，一个微信号同一时刻只登录一个 bot，实际唯一）→
@@ -892,6 +897,13 @@ pub struct Config {
     /// 会话过期阈值（天）：最后一条历史消息距今超过该值即视为过期候选。默认 7。
     #[serde(default = "default_session_gc_days")]
     pub session_gc_days: u32,
+    /// #200：mini-relay 开关——开启后 ABB 内嵌 Nostr relay（NIP-01/42/98 子集），
+    /// buzz-acp 可连接订阅虚拟 Bot 频道触发 buzz-agent 执行。默认关。
+    #[serde(default)]
+    pub buzz_relay_enabled: bool,
+    /// #200：mini-relay 监听端口。默认 3000（与 buzz 生态默认一致）。
+    #[serde(default = "default_buzz_relay_port")]
+    pub buzz_relay_port: u16,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -929,6 +941,8 @@ impl Default for Config {
             owner_open_id: String::new(),
             default_backend: String::new(),
             cross_delivery_enabled: false,
+            buzz_relay_enabled: false,
+            buzz_relay_port: 3000,
             lock_screen_control: false,     // #129 锁屏控制默认关
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),

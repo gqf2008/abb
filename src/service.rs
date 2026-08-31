@@ -47,6 +47,76 @@ pub async fn run() {
 
     let cfg = Arc::new(cfg);
 
+    // #200：mini-relay —— ABB 内嵌 Nostr relay（NIP-01/42/98 子集），buzz-acp 可连接
+    // 订阅虚拟 Bot 频道触发 buzz-agent 执行。开关默认关（config buzz_relay_enabled）。
+    if cfg.buzz_relay_enabled {
+        let cfg = Arc::clone(&cfg);
+        crate::tasks::tasks().spawn_forever("mini-relay", async move {
+            // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；首次生成后持久化）
+            let key_path = crate::bridge_dir().join("buzz-bridge-key");
+            let secret_hex = std::fs::read_to_string(&key_path).unwrap_or_else(|_| {
+                let k = nostr::prelude::Keys::generate();
+                let hex = k.secret_key().display_secret().to_string();
+                let _ = std::fs::write(&key_path, &hex);
+                hex
+            });
+            let bridge_keys = nostr::prelude::Keys::parse(secret_hex.trim()).unwrap_or_else(|_| {
+                crate::log!("[mini-relay] ⚠️ buzz-bridge-key 解析失败，重新生成");
+                let k = nostr::prelude::Keys::generate();
+                let _ = std::fs::write(&key_path, k.secret_key().display_secret().to_string());
+                k
+            });
+            // agent 身份公钥：Phase 1 暂不按 pubkey 过滤回流（空值 = 接受所有 kind 9）。
+            // Phase 2 可加 config 字段让用户指定 buzz-acp 的 Nostr pubkey。
+            let agent_pubkey = String::new();
+            // 频道集：登记的虚拟 Bot 群（uuid 派生 + chat_id + 角色名/描述）
+            let vbs = crate::virtualbot::VirtualBotStore::new().load();
+            let channels: Vec<crate::buzzrelay::Channel> = vbs
+                .iter()
+                .map(|v| crate::buzzrelay::Channel {
+                    uuid: crate::buzzrelay::channel_uuid(&v.bot_key, &v.chat_id),
+                    chat_id: v.chat_id.clone(),
+                    name: v.role_name.clone(),
+                    about: String::new(),
+                })
+                .collect();
+            // 回复回流 → 日志（messenger 发送接线随 #200 后续批次）
+            // 事件库打开失败极罕见（磁盘满/权限），失败则跳过本轮
+            let store = match crate::buzzrelay::EventStore::open(
+                &crate::bridge_dir().join("buzz-relay.db"),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::log!("[mini-relay] ⚠️ buzz-relay.db 打开失败: {e}，跳过 mini-relay");
+                    return;
+                }
+            };
+            let (state, mut reply_rx) =
+                crate::buzzrelay::RelayState::new(store, bridge_keys, agent_pubkey);
+            state.set_channels(channels);
+            state.seed_channel_events().await;
+            crate::tasks::tasks().spawn_forever("mini-relay-replies", async move {
+                while let Some(reply) = reply_rx.recv().await {
+                    crate::log!(
+                        "[mini-relay] agent 回复 chat={} len={}",
+                        &reply.chat_id[..reply.chat_id.len().min(16)],
+                        reply.content.chars().count()
+                    );
+                }
+            });
+            crate::log!(
+                "[mini-relay] 监听 0.0.0.0:{}（{} 个虚拟 Bot 频道）",
+                cfg.buzz_relay_port,
+                vbs.len()
+            );
+            if let Err(e) = crate::buzzrelay::run_server(state.clone(), cfg.buzz_relay_port).await {
+                crate::log!("[mini-relay] ❌ relay 服务异常退出: {e:#}");
+            }
+        });
+    }
+
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
     if cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
