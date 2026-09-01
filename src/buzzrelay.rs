@@ -513,6 +513,11 @@ impl RelayState {
         self.db.query(filters).await
     }
 
+    /// 桥身份公钥（hex）——用户消息事件的签名者，buzz-acp owner 门的合法作者。
+    pub fn bridge_pubkey(&self) -> String {
+        self.bridge_keys.public_key().to_hex()
+    }
+
     /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入指定频道。
     /// 频道 uuid 由 (bot_key, chat_id) 确定性派生——不扫表按 chat_id 匹配（两 bot
     /// 同群时会有歧义）。返回 false = 未送达（无频道/签名失败/未入库），调用方负责

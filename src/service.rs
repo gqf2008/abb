@@ -195,6 +195,8 @@ pub async fn run() {
             Arc::new(map)
         };
         let relay_state_for_bots = Arc::clone(&state);
+        // buzz-acp 作者门的合法 owner = 桥身份公钥（用户消息由桥签名，见 spawn_buzz_acp）
+        let bridge_pubkey = state.bridge_pubkey();
         let cfg = Arc::clone(&cfg);
         crate::tasks::tasks().spawn_forever("mini-relay", async move {
             // ① buzz-acp 子进程 + 存活巡检。句柄必须被长期持有：Child 置了
@@ -204,8 +206,9 @@ pub async fn run() {
             // agent 池化执行的唯一入口，死了全部 buzz 会话静默停摆）。
             crate::tasks::tasks().spawn_forever("mini-relay-acp", {
                 let cfg = Arc::clone(&cfg);
+                let bridge_pubkey = bridge_pubkey.clone();
                 async move {
-                    let mut acp = spawn_buzz_acp(&cfg, &agent_secret);
+                    let mut acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
                     let stop = crate::tasks::shutdown_token();
                     loop {
                         // 关停可中断的 30s 节拍（服务期常态等待，不设总期限）
@@ -219,7 +222,7 @@ pub async fn run() {
                         };
                         if dead {
                             crate::log!("[mini-relay] ⚠️ buzz-acp 不在运行，重拉");
-                            acp = spawn_buzz_acp(&cfg, &agent_secret);
+                            acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
                         }
                     }
                     // 句柄随本任务 drop → kill_on_drop 收子进程（关停语义即如此）
@@ -447,8 +450,14 @@ struct BuzzRelayInit {
 
 /// 拉起 buzz-acp（含缺省路径解析）。失败返回 None（缺二进制等）只告警——
 /// relay 仍运行，消息继续入库；调用方巡检任务会周期性重拉。
-/// 私钥传**生效值**（agent_secret），恒与种子成员事件同源。
-fn spawn_buzz_acp(cfg: &Config, agent_secret: &str) -> Option<crate::buzzacp::BuzzAcpProcess> {
+/// 私钥/owner 都传**生效值**（agent_secret / bridge_pubkey）：owner 必须是发布
+/// 用户消息的桥身份公钥——buzz-acp respond-to=owner-only 缺 owner 即 fail-closed
+/// 丢弃全部事件（审查 #205 后追问 buzz 配置面时发现的第二个断链）。
+fn spawn_buzz_acp(
+    cfg: &Config,
+    agent_secret: &str,
+    bridge_pubkey: &str,
+) -> Option<crate::buzzacp::BuzzAcpProcess> {
     let acp_exe = if cfg.buzz_acp_exe.is_empty() {
         crate::bridge_dir()
             .join("bin/buzz-acp")
@@ -471,7 +480,7 @@ fn spawn_buzz_acp(cfg: &Config, agent_secret: &str) -> Option<crate::buzzacp::Bu
         &relay_url,
         agent_secret,
         &agent_exe,
-        "", // agent owner：Phase 1 空（回环信任）
+        bridge_pubkey, // 作者门 owner = 桥身份公钥（见 buzzacp::acp_env）
     ) {
         Ok(p) => {
             crate::log!("[mini-relay] buzz-acp 子进程已拉起（{acp_exe} → {relay_url}）");
@@ -534,6 +543,7 @@ async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
         })
         .collect();
     let n_channels = channels.len();
+    let bridge_pubkey = bridge_keys.public_key().to_hex();
     let store = crate::buzzrelay::EventStore::open(&crate::bridge_dir().join("buzz-relay.db"))
         .await
         .map_err(|e| format!("buzz-relay.db 打开失败: {e}"))?;
@@ -542,7 +552,7 @@ async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
     state.set_channels(channels);
     state.seed_channel_events().await;
     crate::log!(
-        "[mini-relay] 初始化完成（{n_channels} 个虚拟 Bot 频道，agent={agent_pubkey:.16}…）"
+        "[mini-relay] 初始化完成（{n_channels} 个虚拟 Bot 频道，agent={agent_pubkey:.16}…，owner 门=桥身份 {bridge_pubkey:.16}…）"
     );
     Ok(BuzzRelayInit {
         state,

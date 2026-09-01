@@ -16,8 +16,37 @@ pub struct BuzzAcpProcess {
     child: tokio::process::Child,
 }
 
+/// buzz-acp 的环境变量装配（纯函数——单测守住 env 名：写错名字 = owner 门
+/// fail-closed 静默全丢，这类 bug 只有对着 buzz-acp 的 clap 定义才能发现）。
+///
+/// 正字表（buzz-acp/src/config.rs CliArgs）：BUZZ_RELAY_URL / BUZZ_PRIVATE_KEY /
+/// BUZZ_ACP_AGENT_COMMAND / BUZZ_ACP_AGENT_OWNER / BUZZ_ACP_RESPOND_TO…。
+/// BUZZ_AGENT_PROVIDER 是 **buzz-agent 专属**（persona 约定，其它适配器不读）。
+/// BUZZ_ACP_AGENT_ARGS 不设置：clap 默认 "acp" 会被 buzz-acp 的
+/// normalize_agent_args 按命令身份纠正（goose→["acp"]，buzz-agent/codex-acp/
+/// claude-agent-acp→[]），无需桥侧干预。
+pub fn acp_env(
+    relay_url: &str,
+    private_key: &str,
+    agent_command: &str,
+    agent_owner: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("BUZZ_RELAY_URL".into(), relay_url.into()),
+        ("BUZZ_PRIVATE_KEY".into(), private_key.into()),
+        ("BUZZ_ACP_AGENT_COMMAND".into(), agent_command.into()),
+        ("BUZZ_AGENT_PROVIDER".into(), "anthropic".into()),
+        // 入站作者门（buzz-acp 默认 respond-to=owner-only，owner 未配置=fail-closed
+        // 丢弃一切事件，lib.rs is_owner_or_sibling）。ABB 发布的 kind-9 用户消息由
+        // 桥身份签名 → owner 必须设为**桥身份公钥**，author==owner 直接短路通过。
+        // 曾误写 BUZZ_AGENT_OWNER（无此正字）且传空——静默全链路失效的根因。
+        ("BUZZ_ACP_AGENT_OWNER".into(), agent_owner.into()),
+    ]
+}
+
 impl BuzzAcpProcess {
-    /// 拉起 buzz-acp。relay_url 指向 ABB 的 mini-relay 端口。
+    /// 拉起 buzz-acp。relay_url 指向 ABB 的 mini-relay；agent_owner = 桥身份公钥
+    /// （见 [`acp_env`] 的门控说明）。
     pub fn spawn(
         exe: &str,
         relay_url: &str,
@@ -25,12 +54,11 @@ impl BuzzAcpProcess {
         agent_command: &str,
         agent_owner: &str,
     ) -> std::io::Result<Self> {
-        let child = tokio::process::Command::new(exe)
-            .env("BUZZ_RELAY_URL", relay_url)
-            .env("BUZZ_PRIVATE_KEY", private_key)
-            .env("BUZZ_ACP_AGENT_COMMAND", agent_command)
-            .env("BUZZ_AGENT_PROVIDER", "anthropic")
-            .env("BUZZ_AGENT_OWNER", agent_owner)
+        let mut cmd = tokio::process::Command::new(exe);
+        for (k, v) in acp_env(relay_url, private_key, agent_command, agent_owner) {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -42,5 +70,32 @@ impl BuzzAcpProcess {
     /// 进程是否存活。
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// env 装配回归（审查 #205 后追问 buzz 配置面）：变量名必须是 buzz-acp
+    /// CliArgs 的正字——`BUZZ_ACP_AGENT_OWNER`（曾误写 BUZZ_AGENT_OWNER + 空值：
+    /// respond-to=owner-only 门 fail-closed，全部事件被静默丢弃）。owner 值 =
+    /// 传入的桥身份公钥；relay 地址/私钥/agent 命令逐一透传。
+    #[test]
+    fn acp_env_uses_canonical_buzz_acp_names() {
+        let env: std::collections::HashMap<String, String> =
+            std::collections::HashMap::from_iter(acp_env(
+                "ws://127.0.0.1:3000",
+                "agent-sec",
+                "/opt/bin/buzz-agent",
+                "br1dg3pubkey",
+            ));
+        assert_eq!(env["BUZZ_RELAY_URL"], "ws://127.0.0.1:3000");
+        assert_eq!(env["BUZZ_PRIVATE_KEY"], "agent-sec");
+        assert_eq!(env["BUZZ_ACP_AGENT_COMMAND"], "/opt/bin/buzz-agent");
+        assert_eq!(env["BUZZ_ACP_AGENT_OWNER"], "br1dg3pubkey");
+        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "anthropic");
+        // 错名绝迹：历史上写错的 BUZZ_AGENT_OWNER 不得回流
+        assert!(!env.contains_key("BUZZ_AGENT_OWNER"));
     }
 }
