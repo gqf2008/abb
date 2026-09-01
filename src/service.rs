@@ -209,6 +209,12 @@ pub async fn run() {
                 let bridge_pubkey = bridge_pubkey.clone();
                 async move {
                     let mut acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                    // I5（buzz docs/remote-agents.md「Intentional termination is
+                    // final」）：**主动退出（exit 0，owner !shutdown / auto-stop 到点）
+                    // 对自动重拉是终态**——巡检不得复活操作者有意停掉的实例；崩溃
+                    // （非零/探测失败）才重拉。「owner 可再发起一次 Start」的路径 =
+                    // 重启 ABB 服务（本任务随进程重建），不是这里的自动复活。
+                    let mut terminal = false;
                     let stop = crate::tasks::shutdown_token();
                     loop {
                         // 关停可中断的 30s 节拍（服务期常态等待，不设总期限）
@@ -216,13 +222,33 @@ pub async fn run() {
                             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                             _ = stop.cancelled() => break,
                         }
-                        let dead = match acp.as_mut() {
-                            Some(p) => !p.is_running(),
-                            None => true, // 上次 spawn 失败（缺二进制等），继续尝试
-                        };
-                        if dead {
-                            crate::log!("[mini-relay] ⚠️ buzz-acp 不在运行，重拉");
-                            acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                        if terminal {
+                            continue;
+                        }
+                        match acp.as_mut().map(|p| p.try_exit()) {
+                            None => {
+                                // 从未拉起成功（缺二进制等）：按可自愈路径继续重拉
+                                crate::log!("[mini-relay] ⚠️ buzz-acp 未在运行（上次拉起失败），重试");
+                                acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                            }
+                            Some(None) => {} // 仍在跑
+                            Some(Some(Ok(st))) if st.success() => {
+                                crate::log!(
+                                    "[mini-relay] buzz-acp 主动退出（intentional）——按 I5 不再自动重拉；需再启请重启本服务"
+                                );
+                                terminal = true;
+                            }
+                            Some(Some(Ok(st))) => {
+                                crate::log!(
+                                    "[mini-relay] ⚠️ buzz-acp 崩溃退出 code={:?}，重拉",
+                                    st.code()
+                                );
+                                acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                            }
+                            Some(Some(Err(e))) => {
+                                crate::log!("[mini-relay] ⚠️ buzz-acp 状态探测失败: {e}，重拉");
+                                acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                            }
                         }
                     }
                     // 句柄随本任务 drop → kill_on_drop 收子进程（关停语义即如此）
@@ -458,6 +484,14 @@ fn spawn_buzz_acp(
     agent_secret: &str,
     bridge_pubkey: &str,
 ) -> Option<crate::buzzacp::BuzzAcpProcess> {
+    // I1（buzz docs/remote-agents.md「Identity fail-closed」）：**空私钥/空 owner
+    // 一律拒启**——装配 harness 环境的任何一方（桌面/provider/脚本/本桥）都 MUST
+    // refuse rather than launch identityless。空身份的进程是「活着但收得到全丢」的
+    // 哑实例，比不启动更糟；这里宁可不拉，巡检 30s 后再试（配置修好自愈）。
+    if agent_secret.trim().is_empty() || bridge_pubkey.trim().is_empty() {
+        crate::log!("[mini-relay] ❌ 拒绝拉起 buzz-acp：agent 私钥或 owner 为空（I1 fail-closed）");
+        return None;
+    }
     let acp_exe = if cfg.buzz_acp_exe.is_empty() {
         crate::bridge_dir()
             .join("bin/buzz-acp")

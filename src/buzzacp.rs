@@ -5,9 +5,11 @@
 //! AgentReply 通道，由 service 的回流任务发回聊天平台。
 //!
 //! 进程管理：ABB service 拉起 buzz-acp（环境变量配置 relay 地址/agent 命令/
-//! 身份密钥）。**句柄必须被长期持有**：Child 置 kill_on_drop(true)，drop 即
-//! SIGKILL——service 的 mini-relay-acp 巡检任务持有句柄并负责崩溃重拉，关停
-//! 时随任务 drop 收进程。
+//! 身份密钥，身份装配守 I1 fail-closed，见 service::spawn_buzz_acp）。**句柄必须
+//! 被长期持有**：Child 置 kill_on_drop(true)，drop 即 SIGKILL——service 的
+//! mini-relay-acp 巡检任务持有句柄：崩溃（非零退出）重拉，**主动退出（exit 0）
+//! 按 I5 是终态不复活**（buzz docs/remote-agents.md 五不变量）；关停随任务
+//! drop 收进程。
 
 use std::process::Stdio;
 
@@ -67,9 +69,16 @@ impl BuzzAcpProcess {
         Ok(Self { child })
     }
 
-    /// 进程是否存活。
-    pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    /// 退出状态探测（I5 判据）：`None` = 仍在跑；`Some(Ok(status))` = 已退出
+    /// （**exit 0 = 主动停止**——owner `!shutdown` 或 auto-stop 到点，按 I5 不得
+    /// 自动重拉；非零 = 崩溃，可重拉）；`Some(Err)` = wait 系统错（按崩溃处理）。
+    /// （「是否存活」的同一问题的更 informative 形态——取代 is_running。）
+    pub fn try_exit(&mut self) -> Option<std::io::Result<std::process::ExitStatus>> {
+        match self.child.try_wait() {
+            Ok(None) => None,
+            Ok(Some(status)) => Some(Ok(status)),
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -97,5 +106,59 @@ mod tests {
         assert_eq!(env["BUZZ_AGENT_PROVIDER"], "anthropic");
         // 错名绝迹：历史上写错的 BUZZ_AGENT_OWNER 不得回流
         assert!(!env.contains_key("BUZZ_AGENT_OWNER"));
+    }
+
+    /// I5 判据通道：干净退出（exit 0）与崩溃退出（非零）必须可区分——
+    /// 巡检据此决定「终态不重拉」还是「崩溃重拉」。真进程回归：
+    /// 以 true/false 两个最小 harness 替身验证 exit 码判定通道。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn try_exit_distinguishes_clean_and_crash_exit() {
+        // true/false 的落位随发行版不同（macOS 无 /bin/true；多数 Linux 两处都有
+        // 软链），按存在性解析——找不到就跳过（环境性，不红）。
+        fn pick(cands: &[&'static str; 2]) -> Option<&'static str> {
+            cands
+                .iter()
+                .copied()
+                .find(|p| std::path::Path::new(p).exists())
+        }
+        let (Some(true_exe), Some(false_exe)) = (
+            pick(&["/usr/bin/true", "/bin/true"]),
+            pick(&["/usr/bin/false", "/bin/false"]),
+        ) else {
+            eprintln!("skip: 本机无 true/false 替身");
+            return;
+        };
+        let mut clean = BuzzAcpProcess::spawn(true_exe, "ws://x", "k", "cmd", "owner").unwrap();
+        let mut crash = BuzzAcpProcess::spawn(false_exe, "ws://x", "k", "cmd", "owner").unwrap();
+        // 极短轮询等退出（进程秒退；上限 ~2s 防挂）
+        let mut clean_status = None;
+        let mut crash_status = None;
+        for _ in 0..200 {
+            if clean_status.is_none() {
+                if let Some(r) = clean.try_exit() {
+                    clean_status = Some(r.unwrap());
+                }
+            }
+            if crash_status.is_none() {
+                if let Some(r) = crash.try_exit() {
+                    crash_status = Some(r.unwrap());
+                }
+            }
+            if clean_status.is_some() && crash_status.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(clean_status.is_some(), "true 替身应探测到退出");
+        assert!(
+            clean_status.unwrap().success(),
+            "exit 0 必须判为主动退出（I5 终态）"
+        );
+        assert!(crash_status.is_some(), "false 替身应探测到退出");
+        assert!(
+            !crash_status.unwrap().success(),
+            "非零退出必须判为崩溃（可重拉）"
+        );
     }
 }
