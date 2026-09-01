@@ -537,22 +537,27 @@ fn spawn_buzz_acp(
         crate::log!("[mini-relay] ❌ 拒绝拉起 buzz-acp：agent 私钥或 owner 为空（I1 fail-closed）");
         return None;
     }
-    let acp_exe = if cfg.buzz_acp_exe.is_empty() {
-        crate::bridge_dir()
-            .join("bin/buzz-acp")
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        cfg.buzz_acp_exe.clone()
-    };
-    let agent_exe = if cfg.buzz_agent_exe.is_empty() {
-        crate::bridge_dir()
-            .join("bin/buzz-agent")
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        cfg.buzz_agent_exe.clone()
-    };
+    // #207：发布包内置 buzz 二进制——解析顺序见 resolve_buzz_exe。
+    let bundle_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let bridge_dir = crate::bridge_dir();
+    let acp_exe = resolve_buzz_exe(
+        &cfg.buzz_acp_exe,
+        "buzz-acp",
+        bundle_dir.as_deref(),
+        &bridge_dir,
+    )
+    .to_string_lossy()
+    .into_owned();
+    let agent_exe = resolve_buzz_exe(
+        &cfg.buzz_agent_exe,
+        "buzz-agent",
+        bundle_dir.as_deref(),
+        &bridge_dir,
+    )
+    .to_string_lossy()
+    .into_owned();
     let relay_url = format!("ws://127.0.0.1:{}", cfg.buzz_relay_port);
     match crate::buzzacp::BuzzAcpProcess::spawn(
         &acp_exe,
@@ -572,6 +577,40 @@ fn spawn_buzz_acp(
             None
         }
     }
+}
+
+/// #207：buzz-acp / buzz-agent 可执行文件解析（发布包内置 buzz 二进制）。
+/// 顺序：**配置覆盖**（原样用，不做存在性裁决——显式配置宁可在 spawn 时报清楚的
+/// 路径错）→ **应用包同目录**（发布包的 Contents/MacOS、Windows 安装目录、dev 的
+/// target/<profile>/，`current_exe()` 同目录取，abb-helper 同款先例）→
+/// **~/.agent-bridge/bin/**（旧 dev 位置）→ **PATH**（find_in_path 覆盖
+/// ~/.local/bin、homebrew 等）→ 全落空回退 ~/.agent-bridge/bin/ 路径，让报错文案
+/// 指向一个可安放位置（spawn 失败仅告警，巡检会重试）。
+/// `exe_name` 传不带扩展名的裸名（"buzz-acp"）：包内/legacy 按平台补 EXE_SUFFIX，
+/// PATH 查找由 find_in_path 自己处理 PATHEXT。
+fn resolve_buzz_exe(
+    override_path: &str,
+    exe_name: &str,
+    bundle_dir: Option<&std::path::Path>,
+    bridge_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    if !override_path.is_empty() {
+        return std::path::PathBuf::from(override_path);
+    }
+    let file_name = format!("{exe_name}{}", std::env::consts::EXE_SUFFIX);
+    if let Some(p) = bundle_dir.map(|d| d.join(&file_name)) {
+        if p.is_file() {
+            return p;
+        }
+    }
+    let legacy = bridge_dir.join("bin").join(&file_name);
+    if legacy.is_file() {
+        return legacy;
+    }
+    if let Some(p) = crate::deps::find_in_path(exe_name) {
+        return p;
+    }
+    legacy
 }
 
 /// 崩溃重拉的退避决策（纯函数——复核 #205r4：这类「复位时机」错一个单测就能钉死，
@@ -1396,6 +1435,59 @@ mod tests {
         assert_eq!(next_backoff(d(1), d(64)), d(128));
         // 真活够了才复位
         assert_eq!(next_backoff(d(61), d(300)), d(2));
+    }
+
+    /// #207：buzz 可执行文件解析顺序——配置覆盖 → 应用包同目录 → ~/.agent-bridge/bin
+    /// → PATH → 回退 ~/.agent-bridge/bin 路径。用保证不存在的名字隔离 PATH 环境差异
+    /// （本机真装了 buzz-acp 时 PATH 支路命中会让「回退」断言失真）。
+    #[test]
+    fn resolve_buzz_exe_orders_override_bundle_legacy_then_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "abb-resolve-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let bundle = root.join("bundle");
+        let bridge = root.join("bridge");
+        let legacy_bin = bridge.join("bin");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&legacy_bin).unwrap();
+        let name = "buzz-acp-test-fixture-not-installed";
+        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+
+        // 1. 配置覆盖最高优先：即使路径不存在也原样用（存在性交给 spawn 报错）
+        assert_eq!(
+            resolve_buzz_exe("/custom/acp", name, Some(&bundle), &bridge),
+            std::path::PathBuf::from("/custom/acp")
+        );
+        // 2. 包内与 legacy 同时存在 → 包内胜（发布场景：包内版本随 ABB 升级）
+        std::fs::write(bundle.join(&file), b"x").unwrap();
+        std::fs::write(legacy_bin.join(&file), b"x").unwrap();
+        assert_eq!(
+            resolve_buzz_exe("", name, Some(&bundle), &bridge),
+            bundle.join(&file)
+        );
+        // 3. 包内缺失 → legacy
+        std::fs::remove_file(bundle.join(&file)).unwrap();
+        assert_eq!(
+            resolve_buzz_exe("", name, Some(&bundle), &bridge),
+            legacy_bin.join(&file)
+        );
+        // 4. 全落空 → 回退 legacy 路径（不存在也返回，报错文案指向可安放位置）
+        std::fs::remove_file(legacy_bin.join(&file)).unwrap();
+        assert_eq!(
+            resolve_buzz_exe("", name, Some(&bundle), &bridge),
+            legacy_bin.join(&file)
+        );
+        // 5. bundle_dir 为 None（current_exe 解析失败）不 panic
+        assert_eq!(
+            resolve_buzz_exe("", name, None, &bridge),
+            legacy_bin.join(&file)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// #189 回归护栏（服务期无期限）：健康 bot 循环（不自行结束、无关停广播）期间，

@@ -38,6 +38,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
+; #207 内置 buzz 执行层：与主程序同目录（运行时按 current_exe 同目录解析）；
+; buzz 上游 Apache-2.0，再分发附 LICENSE。fake-mcp 是测试桩，不入包。
+Source: "..\buzz\target\release\buzz-acp.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\buzz\target\release\buzz-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\buzz\LICENSE"; DestDir: "{app}"; DestName: "buzz-LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\ABB.ico"

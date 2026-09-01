@@ -35,6 +35,24 @@ jobs:
       - name: Build release (aarch64)
         run: cargo build --release --target aarch64-apple-darwin
 
+      # #207 内置 buzz 执行层：buzz-acp/buzz-agent 随包发布（public 仓库，无需 token）。
+      # 钉死 SHA（#200 开发基线）；升级 buzz 版本 = 改这里 + 独立 PR，不追踪移动 ref。
+      - name: Checkout buzz (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: block/buzz
+          ref: c3132c3ee982d194cd0198ad07b57ec8bd726e4e
+          path: buzz
+
+      # buzz 的 rust-toolchain.toml 钉 1.95.0（与本仓库 stable 不同），rustup 按需自动装；
+      # 注意 rust-toolchain.toml 按 **cwd** 而非 --manifest-path 解析，故必须 cd 进 buzz
+      # 构建（产物路径不变：buzz/target/<triple>/release/）。target 已由上一步装好。
+      # -p buzz-agent 会连带产出 fake-mcp（测试桩），下方只挑 buzz-acp/buzz-agent 两个入包。
+      - name: Build buzz-acp + buzz-agent (aarch64)
+        run: |
+          cd buzz
+          cargo build --release -p buzz-acp -p buzz-agent --target aarch64-apple-darwin
+
       - name: Import Developer ID certificate (temporary keychain)
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
@@ -62,10 +80,17 @@ jobs:
           # #129 锁屏特权助手：必须与主程序同目录（lockctl install 从 current_exe 同目录
           # 取 abb-helper），独立签名（嵌套二进制不随主程序签名自动覆盖）
           cp target/aarch64-apple-darwin/release/abb-helper ABB.app/Contents/MacOS/
+          # #207 buzz 执行层：同目录同规约——逐个 hardened runtime + timestamp 签名后随包公证
+          cp buzz/target/aarch64-apple-darwin/release/buzz-acp ABB.app/Contents/MacOS/
+          cp buzz/target/aarch64-apple-darwin/release/buzz-agent ABB.app/Contents/MacOS/
+          # buzz 上游 Apache-2.0，再分发须附 LICENSE 文本
+          cp buzz/LICENSE ABB.app/Contents/Resources/buzz-LICENSE.txt
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
           codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
           codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-acp
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
           codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
 
@@ -127,6 +152,20 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+
+      # #207 内置 buzz 执行层：与 macOS job 同一钉死 SHA；默认 target 即 x86_64-pc-windows-msvc。
+      # cd 进 buzz 构建（rust-toolchain.toml 按 cwd 解析，钉 1.95.0，rustup 按需自动装）。
+      - name: Checkout buzz (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: block/buzz
+          ref: c3132c3ee982d194cd0198ad07b57ec8bd726e4e
+          path: buzz
+
+      - name: Build buzz-acp + buzz-agent
+        run: |
+          cd buzz
+          cargo build --release -p buzz-acp -p buzz-agent
 
       - name: Install Inno Setup
         shell: pwsh
