@@ -1964,8 +1964,7 @@ mod tests {
             hist.append_assistant("old1", "claude", "旧答复");
         }
         // mini-relay 状态：临时库 + 登记一个频道（uuid 按 (bot_key, chat_id) 派生）
-        let db_path =
-            std::env::temp_dir().join(format!("abb-buzz-bridge-{}.db", uuid::Uuid::new_v4()));
+        let db_path = crate::buzzrelay::test_db("abb-buzz-bridge");
         let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
         let (state, _rx) = crate::buzzrelay::RelayState::new(
             store,
@@ -2017,12 +2016,16 @@ mod tests {
             "第二轮不应重复注入历史（buzz 会话上下文由 channel→session 持有）"
         );
         cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
     }
 
     #[tokio::test]
     async fn buzz_undelivered_replies_error_and_keeps_gate() {
         // buzz dispatch 失败面：① relay None（未启用/初始化失败）；② relay Some 但
-        // chat 无频道（未登记/登记晚于启动）。两种都必须用户可见「未送达」报错、
+        // chat 无频道（未登记/登记晚于启动）。两种都必须用户可见「无法处理」报错、
         // 摘 pending、且不 mark_started——一次性迁移注入闸不能被没发生的轮次消耗。
         let bot = backend_bot("buzz");
         let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
@@ -2031,7 +2034,7 @@ mod tests {
         // ① relay None
         bridge.handle(test_ev("m1", "oc_n", "你好")).await;
         assert!(
-            msgr.sent().iter().any(|t| t.contains("未送达")),
+            msgr.sent().iter().any(|t| t.contains("无法处理")),
             "relay 不可用必须可见报错，不做静默黑洞"
         );
         assert!(bridge.pending.is_empty());
@@ -2041,8 +2044,7 @@ mod tests {
         );
 
         // ② relay Some 但该 chat 未登记为频道
-        let db_path =
-            std::env::temp_dir().join(format!("abb-buzz-neg-{}.db", uuid::Uuid::new_v4()));
+        let db_path = crate::buzzrelay::test_db("abb-buzz-neg");
         let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
         let (state, _rx) = crate::buzzrelay::RelayState::new(
             store,
@@ -2054,12 +2056,71 @@ mod tests {
             .buzz_relay_state = Some(state);
         bridge.handle(test_ev("m2", "oc_x", "再试")).await;
         assert!(
-            msgr.sent().iter().filter(|t| t.contains("未送达")).count() >= 2,
+            msgr.sent()
+                .iter()
+                .filter(|t| t.contains("无法处理"))
+                .count()
+                >= 2,
             "无频道会话同样要可见报错"
         );
         assert!(bridge.pending.is_empty());
         assert!(!bridge.sessions.is_started("oc_x"));
         cleanup_bridge(&bridge);
+        drop(bridge);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 安全回归（审查 #205r2）：**受限会话（授权者 Granted）不得走 buzz dispatch**。
+    /// CLI 路径对 Granted 的硬闸是 agent::run 内挂的 guard hook/沙箱；buzz 跑在
+    /// acp 侧自己的工具权限下（permission-mode 默认 bypass），RESTRICT_PREAMBLE 只是
+    /// 提示文本——guard→request_permission 映射未接线前放行 = 静默提权。
+    #[tokio::test]
+    async fn buzz_refuses_restricted_granted_session() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_g";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-grant");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            String::new(),
+        );
+        // 频道**已登记**：唯一拒绝理由必须是「受限会话」，不能是资格不足
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+
+        let mut ev = test_ev("m1", chat, "帮我改代码");
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("受限")),
+            "Granted 会话必须被拒绝并说明原因"
+        );
+        assert!(
+            state.query(std::slice::from_ref(&all)).await.is_empty(),
+            "安全回归：受限会话的内容不得进入 buzz 频道（那里没有 guard 硬闸）"
+        );
+        assert!(bridge.pending.is_empty());
+        assert!(!bridge.sessions.is_started(chat));
+        // 同群 owner 角色对照：owner 可正常 dispatch（拒绝只针对受限会话）
+        bridge.handle(test_ev("m2", chat, "owner 正常消息")).await;
+        assert_eq!(state.query(&[all]).await.len(), 1);
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
     }
 
     // ---- #25 重启恢复（in-flight 消息持久化 + 自动重放）----

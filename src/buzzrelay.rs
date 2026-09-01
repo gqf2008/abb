@@ -143,6 +143,22 @@ fn h_tag_of(e: &nostr::Event) -> Option<String> {
     })
 }
 
+/// #200 测试夹具：临时 sqlite 库路径（uuid 唯一，防并行测试互删——见仓库 LESSON）。
+/// pub(crate)：bridge 侧 dispatch 测试复用，避免第二份拷贝。
+#[cfg(test)]
+pub(crate) fn test_db(prefix: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("{prefix}-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// #200 测试夹具：删库及 -wal/-shm 旁文件（只删主文件必漏，审查 #205r2）。
+/// ⚠️ 必须等 EventStore/RelayState 全部 drop 之后再调。
+#[cfg(test)]
+pub(crate) fn remove_test_db(p: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", p.display(), suffix));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,8 +253,7 @@ mod tests {
     /// 同秒同文不同 mid → 两条独立入库（事件 id 含 mid tag，不撞 hash 被吞）。
     #[tokio::test]
     async fn publish_user_message_maps_channel_with_single_h_tag() {
-        let db_path =
-            std::env::temp_dir().join(format!("abb-buzzrelay-pub-{}.db", uuid::Uuid::new_v4()));
+        let db_path = test_db("abb-buzzrelay-pub");
         let store = EventStore::open(&db_path).await.unwrap();
         let (state, _reply_rx) = RelayState::new(store, Keys::generate(), String::new());
         let uuid_a = channel_uuid("bot_a", "oc_a");
@@ -293,6 +308,71 @@ mod tests {
         let nine: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         let evs = state.db.query(&[nine]).await;
         assert_eq!(evs.len(), 3, "mid tag 应保证同文不同 mid 的两条各自入库");
+        drop(state);
+        drop(_reply_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// 回流安全门（审查 #205r2）：只有 **agent 身份签名**的 kind-9 才投递回聊天，
+    /// 且只在**首次入库**投递。原判定「非 bridge 即回复」叠加本 PR 填上的 senders
+    /// 路由 = 任意本地进程（或 SSRF 到 127.0.0.1:port 的 POST /events）自签一条
+    /// `#h=任意频道 uuid` 的事件即可**以 bot 身份向真实群发任意文本**；WS 断连后
+    /// buzz-acp 重发的同一条回复也会被投递两遍。
+    #[tokio::test]
+    async fn ingest_only_forwards_first_seen_agent_replies() {
+        let db = test_db("abb-buzzrelay-gate");
+        let store = EventStore::open(&db).await.unwrap();
+        let agent = Keys::generate();
+        let stranger = Keys::generate();
+        let (state, mut rx) = RelayState::new(store, Keys::generate(), agent.public_key().to_hex());
+        state.set_channels([Channel {
+            uuid: "chan-1".into(),
+            chat_id: "oc_1".into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        let kind9 = |keys: &Keys, text: &str, h: &str| {
+            EventBuilder::new(Kind::Custom(9), text)
+                .tag(Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                    [h],
+                ))
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+
+        // ① 陌生人签的 kind-9：可入库，但绝不投递到聊天（伪造 bot 回复的闸门）
+        state
+            .ingest(&kind9(&stranger, "冒充 bot 的伪造回复", "chan-1"))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "安全回归：非 agent 身份的 kind-9 不得回流真实聊天"
+        );
+
+        // ② agent 签的：投递一次，路由键与 chat 都对
+        let real = kind9(&agent, "真回复", "chan-1");
+        state.ingest(&real).await;
+        let got = rx.try_recv().expect("agent 回复应投递");
+        assert_eq!(got.chat_id, "oc_1");
+        assert_eq!(got.channel_uuid, "chan-1");
+        assert_eq!(got.content, "真回复");
+
+        // ③ 同一事件重发（ACK 未收到 → 重连重投）：不得二次投递
+        state.ingest(&real).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "重复事件不得把同一条回复再发一遍到群里"
+        );
+
+        // ④ agent 签但 #h 不在频道集：丢弃不投递（配日志）
+        state
+            .ingest(&kind9(&agent, "孤儿回复", "chan-unregistered"))
+            .await;
+        assert!(rx.try_recv().is_err(), "#h 不在频道集时不得投递");
+        drop(state);
+        drop(rx);
+        remove_test_db(&db);
     }
 }
 
@@ -389,6 +469,27 @@ impl EventStore {
             .unwrap_or(false)
     }
 
+    /// 按 (kind 集合, pubkey) 删除事件。用于种子事件的「先清后写」：种子 id 由内容
+    /// 哈希决定（created_at 固定），群改名/取消登记后旧 39000/39002 行会永存，而
+    /// buzz-acp 的 merge_discovered_channels 对同 #d 多行无 created_at 决胜
+    /// （都=1）→ 旧名可能胜出。清后重发使库状态恒等于当前登记表（审查 #205r2）。
+    pub async fn delete_where(&self, kinds: &[u16], pubkey: &str) -> u64 {
+        if kinds.is_empty() {
+            return 0;
+        }
+        let placeholders = vec!["?"; kinds.len()].join(",");
+        let sql = format!("DELETE FROM events WHERE kind IN ({placeholders}) AND pubkey = ?");
+        let mut params: Vec<turso::Value> = kinds
+            .iter()
+            .map(|k| turso::Value::Integer(*k as i64))
+            .collect();
+        params.push(turso::Value::Text(pubkey.to_string()));
+        self.conn
+            .execute(&sql, turso::params_from_iter(params))
+            .await
+            .unwrap_or(0)
+    }
+
     /// 按 filter 集合查事件（NIP-01 多 filter OR 语义；h_tag/kind 走索引，
     /// 其余条件内存二次过滤）。
     pub async fn query(&self, filters: &[Filter]) -> Vec<nostr::Event> {
@@ -463,6 +564,8 @@ pub struct RelayState {
     /// 连接 → 订阅（sub_id → filter 集）
     subs: Mutex<HashMap<u64, HashMap<String, Vec<Filter>>>>,
     conn_seq: AtomicU64,
+    /// 上次「无订阅者」告警的 unix 秒（节流用，60s 一条）
+    last_no_sub_warn: AtomicU64,
     /// ABB 桥身份密钥（签名种子事件与正向喂入的消息事件）
     bridge_keys: Keys,
     /// agent 身份公钥（hex）——回流事件按它识别
@@ -486,6 +589,7 @@ impl RelayState {
                 conns: Mutex::new(HashMap::new()),
                 subs: Mutex::new(HashMap::new()),
                 conn_seq: AtomicU64::new(1),
+                last_no_sub_warn: AtomicU64::new(0),
                 bridge_keys: bridge_keys.clone(),
                 agent_pubkey,
                 reply_tx,
@@ -563,19 +667,47 @@ impl RelayState {
             return false;
         }
         self.fan_out(&e);
+        // 入库 ≠ 有人消费：零订阅时事件仍在库里，acp 重连按 since 水位回放（不丢），
+        // 但持续零订阅 = buzz-acp 未装/未起，60s 一条告警让运维看到（审查 #205r2）。
+        if self.subscriber_count() == 0 {
+            let now = nostr::prelude::Timestamp::now().as_secs();
+            if self.should_warn_no_subscriber(now) {
+                crate::log!(
+                    "[mini-relay] ⚠️ 已入库但当前无 WS 订阅者（buzz-acp 未连？回复会等它重连背充）"
+                );
+            }
+        }
         true
     }
 
-    /// agent 身份公钥（hex）。
-    #[allow(dead_code)]
-    pub fn agent_pubkey(&self) -> &str {
-        &self.agent_pubkey
+    /// 当前连上来的 WS 连接数（≈buzz-acp 消费者数）。dispatch 用它区分
+    /// 「已入库待背充」与「无人消费」——事件存储后 acp 重连会按 since 水位回放
+    /// （Phase 1 REQ 语义），所以零订阅**不等于**丢失，只是延迟；但持续零订阅
+    /// = buzz-acp 没装/没起，运维必须看得见（审查 #205r2）。
+    pub fn subscriber_count(&self) -> usize {
+        self.conns.lock().unwrap().len()
+    }
+
+    /// 距上次「无订阅者」告警是否已过节流窗（60s；避免每消息一行刷屏）。
+    pub fn should_warn_no_subscriber(&self, now_secs: u64) -> bool {
+        let prev = self.last_no_sub_warn.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(prev) >= 60 {
+            self.last_no_sub_warn.store(now_secs, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// 种子频道元数据/成员事件（kind 39002 成员 + 39000 元数据，bridge 身份签名）——
     /// buzz-acp discover_channels 两步 /query 的数据源。幂等（同 id 去重）。
     /// agent_pubkey 为空时跳过成员事件（无法构造有效的 #p tag）。
     pub async fn seed_channel_events(&self) {
+        // 先清后写（见 EventStore::delete_where）：本函数只写桥身份签的 39000/39002，
+        // 清同 (kinds, 桥 pubkey) 的旧行不会影响 agent 的 kind-9 回复，且让改名与
+        // 取消登记的频道不再留残行。
+        let bridge_pk = self.bridge_keys.public_key().to_hex();
+        self.db.delete_where(&[39000, 39002], &bridge_pk).await;
         // 先克隆（不持 RwLock 跨 await——RwLockReadGuard 非 Send）
         let channels: Vec<Channel> = self.channels.read().unwrap().values().cloned().collect();
         let agent_pk = if self.agent_pubkey.is_empty() {
@@ -630,18 +762,30 @@ impl RelayState {
         if stored {
             self.fan_out(e);
         }
-        // kind 9（Buzz 频道消息）→ 回复回流。不按 pubkey 过滤（Phase 1 简化：
-        // 事件已验签、频道已映射，任何 kind 9 都是有效回复）。
-        // 只回流 agent 的回复（排除 bridge 签的用户消息，防回声循环）
-        if e.kind.as_u16() == 9 && e.pubkey.to_hex() != self.bridge_keys.public_key().to_hex() {
-            if let Some(h) = h_tag_of(e) {
-                if let Some(ch) = self.channel_by_uuid(&h) {
+        // kind 9（Buzz 频道消息）→ 回复回流。**两道闸缺一不可**（审查 #205r2）：
+        // ① 作者必须是 **agent 身份公钥**——原「非 bridge 即回复」让任意本地进程
+        //    （或 SSRF 到 127.0.0.1:port 的 POST /events）自签一条 kind-9 + 任意
+        //    #h（uuid 从 virtual-bots.json 可推）就能**以 bot 身份向真实聊天群发
+        //    任意文本**；本 PR 填上 senders 路由后才从死代码变成活通路，绝不能留。
+        // ② 必须**首次入库**——WS 断连后 buzz-acp 重发同一事件（ACK 未收到）会走
+        //    这里第二次，重复投递同一条回复到群里。
+        if stored && e.kind.as_u16() == 9 && e.pubkey.to_hex() == self.agent_pubkey {
+            let h = h_tag_of(e);
+            let chan = h.as_deref().and_then(|u| self.channel_by_uuid(u));
+            match (h, chan) {
+                (Some(uuid), Some(ch)) => {
                     let _ = self.reply_tx.send(AgentReply {
-                        channel_uuid: h,
+                        channel_uuid: uuid,
                         chat_id: ch.chat_id,
                         content: e.content.clone(),
                     });
                 }
+                // 频道集是启动快照：agent 回了但 #h 不在集内 = 唯一的静默黑洞，
+                // 与 dispatch 侧的日志对称（审查 #205r2）。
+                _ => crate::log!(
+                    "[mini-relay] ⚠️ agent 回复的 #h 无对应频道（登记晚于启动？）或无 #h tag，丢弃 id={}",
+                    e.id.to_hex()
+                ),
             }
         }
         if stored {
@@ -798,7 +942,17 @@ async fn post_query(
 }
 
 /// mini-relay 服务入口：端口监听（service spawn 调用）。
-pub async fn run_server(state: Arc<RelayState>, port: u16) -> std::io::Result<()> {
+/// 关停感知版（#8）：`stop` 触发即优雅排水并返回 Ok——仓库纪律是每个长驻循环
+/// 都观察关停令牌（否则 shutdown_wait 恒烧满 20s 总期限走强退，每次正常关停
+/// 在日志/看门狗统计里都像崩溃，升级也白等 20s）。
+pub async fn run_server_until(
+    state: Arc<RelayState>,
+    port: u16,
+    stop: tokio_util::sync::CancellationToken,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    axum::serve(listener, router(state)).await
+    axum::serve(listener, router(state))
+        // move 进异步块：with_graceful_shutdown 要 'static future，借用的令牌不满足
+        .with_graceful_shutdown(async move { stop.cancelled().await })
+        .await
 }

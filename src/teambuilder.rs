@@ -218,8 +218,8 @@ pub async fn generate_team_plan(
     // #200：buzz = ACP 常驻执行层（mini-relay），本函数的一次性 CLI spawn 模式不适用
     // （裸起 buzz-agent 无 ACP 握手 → 挂死）。守卫放 generate 入口即覆盖唯一生产调用
     // 路径（build_agent_command 仅此处被调，其余为单测）。审查 #205。
-    if matches!(backend, crate::agent::Backend::Buzz) {
-        return Err("团队方案生成暂不支持 buzz 后端（请临时切 claude/codex 生成）。".into());
+    if backend.is_buzz() {
+        return Err(crate::agent::buzz_unsupported_msg("团队方案生成"));
     }
     let template = resolve_template(template_name);
     let prompt = build_generation_prompt(&template, goal, members);
@@ -751,5 +751,20 @@ mod tests {
         let out = "{\"type\":\"session\",\"session_id\":\"s1\"}\n\
                    {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"方案：{\\\"team_name\\\":\\\"A\\\"}\"}]}}\n";
         assert!(pi_json_text(out).contains("team_name"));
+    }
+
+    /// #200 守卫回归（审查 #205r2）：团队方案生成走一次性 CLI spawn，buzz 是 ACP
+    /// 常驻执行层——入口必须拒绝（否则会裸起 buzz-agent 等 ACP 握手 → 挂死）。
+    #[tokio::test]
+    async fn generate_team_plan_rejects_buzz_backend() {
+        let r = generate_team_plan(
+            crate::agent::Backend::Buzz,
+            "做个记账 App",
+            &["PM".to_string()],
+            None,
+        )
+        .await;
+        assert!(r.is_err(), "buzz 后端不得进入一次性 CLI 方案生成");
+        assert!(r.unwrap_err().contains("buzz"));
     }
 }

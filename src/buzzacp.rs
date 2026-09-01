@@ -14,8 +14,15 @@
 use std::process::Stdio;
 
 /// buzz-acp 子进程管理（service spawn，bridge 只调用 publish/subscribe）。
+///
+/// **杀整组而非单进程**（审查 #205r2）：kill_on_drop 只 SIGKILL 直接子进程，
+/// 而 buzz-acp 按设计持有 session 池（若干常驻 buzz-agent 孙进程）——单杀 acp
+/// 会留下孤儿池：旧池继续占 API 额度、并在下次 ABB 启动后与新池同时消费同一频道
+/// （重复回复）。故 unix 下自建进程组（process_group(0)），Drop 时 killpg 整组
+/// （同 agent.rs::kill_agent_tree 立的规矩）。
 pub struct BuzzAcpProcess {
     child: tokio::process::Child,
+    pid: Option<u32>,
 }
 
 /// buzz-acp 的环境变量装配（纯函数——单测守住 env 名：写错名字 = owner 门
@@ -48,7 +55,7 @@ pub fn acp_env(
 
 impl BuzzAcpProcess {
     /// 拉起 buzz-acp。relay_url 指向 ABB 的 mini-relay；agent_owner = 桥身份公钥
-    /// （见 [`acp_env`] 的门控说明）。
+    /// （见 [`acp_env`] 的门控说明）。unix 下自建进程组，Drop 杀整组（见类型注释）。
     pub fn spawn(
         exe: &str,
         relay_url: &str,
@@ -60,24 +67,43 @@ impl BuzzAcpProcess {
         for (k, v) in acp_env(relay_url, private_key, agent_command, agent_owner) {
             cmd.env(k, v);
         }
+        // 自建进程组：让 Drop 的 killpg(-pid) 能连带收掉 acp 的 buzz-agent 池。
+        // Windows 无此语义（杀树需 toolhelp 快照，本仓 winproc 那套是为 CLI spawn
+        // 建的），暂由 kill_on_drop 兜直接子进程——孤儿池风险记入 #206。
+        #[cfg(unix)]
+        cmd.process_group(0);
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
-        Ok(Self { child })
+        let pid = child.id();
+        Ok(Self { child, pid })
     }
 
-    /// 退出状态探测（I5 判据）：`None` = 仍在跑；`Some(Ok(status))` = 已退出
-    /// （**exit 0 = 主动停止**——owner `!shutdown` 或 auto-stop 到点，按 I5 不得
-    /// 自动重拉；非零 = 崩溃，可重拉）；`Some(Err)` = wait 系统错（按崩溃处理）。
-    /// （「是否存活」的同一问题的更 informative 形态——取代 is_running。）
-    pub fn try_exit(&mut self) -> Option<std::io::Result<std::process::ExitStatus>> {
-        match self.child.try_wait() {
-            Ok(None) => None,
-            Ok(Some(status)) => Some(Ok(status)),
-            Err(e) => Some(Err(e)),
+    /// 等退出（I5 判据的载体：巡检用它替代轮询——即时、无常驻定时器唤醒）。
+    /// 返回的 ExitStatus：success()=exit 0=**主动停止**（owner `!shutdown` / auto-stop
+    /// 到点，按 I5 不得自动重拉）；非零或 Err = 崩溃/系统错（可重拉）。
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+}
+
+/// 句柄消亡即收进程组：kill_on_drop 只保证直接子进程，组内 buzz-agent 池由这里
+/// 兜底（崩溃重拉与关停两条路径都经 Drop；不做 SIGTERM→SIGKILL 两段等待——
+/// Drop 里阻塞 2s 会拖住关停路径，池无可保存状态，直接收组）。
+impl Drop for BuzzAcpProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            // SAFETY: kill(-pgid, SIGKILL) 只作用于本类型 spawn 时用 process_group(0)
+            // 自建的进程组；pid 取自 Child::id()，进程已退出时 pid 可能被复用——与
+            // agent.rs::kill_agent_tree 同款权衡（杀错组的前提是 pid 已被复用为新组
+            // 组长，实践中窗口极小）。调用只传合法整数、无内存解引用。
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+            }
         }
     }
 }
@@ -113,7 +139,7 @@ mod tests {
     /// 以 true/false 两个最小 harness 替身验证 exit 码判定通道。
     #[cfg(unix)]
     #[tokio::test]
-    async fn try_exit_distinguishes_clean_and_crash_exit() {
+    async fn wait_distinguishes_clean_and_crash_exit() {
         // true/false 的落位随发行版不同（macOS 无 /bin/true；多数 Linux 两处都有
         // 软链），按存在性解析——找不到就跳过（环境性，不红）。
         fn pick(cands: &[&'static str; 2]) -> Option<&'static str> {
@@ -131,34 +157,19 @@ mod tests {
         };
         let mut clean = BuzzAcpProcess::spawn(true_exe, "ws://x", "k", "cmd", "owner").unwrap();
         let mut crash = BuzzAcpProcess::spawn(false_exe, "ws://x", "k", "cmd", "owner").unwrap();
-        // 极短轮询等退出（进程秒退；上限 ~2s 防挂）
-        let mut clean_status = None;
-        let mut crash_status = None;
-        for _ in 0..200 {
-            if clean_status.is_none() {
-                if let Some(r) = clean.try_exit() {
-                    clean_status = Some(r.unwrap());
-                }
-            }
-            if crash_status.is_none() {
-                if let Some(r) = crash.try_exit() {
-                    crash_status = Some(r.unwrap());
-                }
-            }
-            if clean_status.is_some() && crash_status.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(clean_status.is_some(), "true 替身应探测到退出");
+        // wait() 即时返回（服务期不等退出，只在终态判定处用；加 5s 兜底防测试挂）
+        let clean_status = tokio::time::timeout(std::time::Duration::from_secs(5), clean.wait())
+            .await
+            .expect("true 替身应退出")
+            .unwrap();
+        let crash_status = tokio::time::timeout(std::time::Duration::from_secs(5), crash.wait())
+            .await
+            .expect("false 替身应退出")
+            .unwrap();
         assert!(
-            clean_status.unwrap().success(),
-            "exit 0 必须判为主动退出（I5 终态）"
+            clean_status.success(),
+            "exit 0 必须判为主动退出（I5 终态，不自动重拉）"
         );
-        assert!(crash_status.is_some(), "false 替身应探测到退出");
-        assert!(
-            !crash_status.unwrap().success(),
-            "非零退出必须判为崩溃（可重拉）"
-        );
+        assert!(!crash_status.success(), "非零退出必须判为崩溃（可重拉）");
     }
 }

@@ -52,6 +52,19 @@ impl Backend {
             Backend::Buzz => "buzz",
         }
     }
+    /// #200：buzz 是「不经 CLI 执行」的后端（走 mini-relay → buzz-acp）。所有需要
+    /// 判断这一点的入口用它——审查 #205r2 数出五种拼写（`== Buzz` / `matches!` /
+    /// 两处字符串解析），下次改后端策略必然漏。
+    pub fn is_buzz(&self) -> bool {
+        matches!(self, Backend::Buzz)
+    }
+}
+
+/// #200：buzz 旁路（不经 CLI 的执行路径）统一错误文案。`what` = 该路径的中文名
+/// （"定时任务"/"会话归纳"/"团队方案生成"/"角色提示词生成"）。单点措辞：这些文案
+/// 会原样进用户聊天或日志，散成 4 份就会漂（审查 #205r2）。
+pub fn buzz_unsupported_msg(what: &str) -> String {
+    format!("⚠️ {what}暂不支持 buzz 后端（Phase 2 只接线了聊天 dispatch）。请在设置里把该 bot 临时切回 claude/codex。")
 }
 
 /// 在每个 bot 的 workspace 里放指引（claude 读 CLAUDE.md、codex 读 AGENTS.md、pi 两者都读）。
@@ -508,8 +521,8 @@ pub async fn run(
     // 旁路调用方（run_job 定时任务 / session_gc 会话归纳）在此拒绝并给出人话错误。
     // 没有这道守卫：它们会撞 run_once 的 unreachable! panic（panic 被 tasks 捕获
     // 只留 stderr，且 run_job 的去重槽位/取消标志泄漏——审查 #205）。
-    if matches!(backend, Backend::Buzz) {
-        return Err("⚠️ buzz 后端不经 CLI 执行：定时任务/会话归纳等旁路暂未接线（Phase 2 仅聊天 dispatch）。".into());
+    if backend.is_buzz() {
+        return Err(buzz_unsupported_msg("定时任务/会话归纳"));
     }
 
     // 受限模式判定：授权者会话且该 bot 的「授权者 agent 隔离」开关未放宽。
@@ -1415,10 +1428,8 @@ pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<S
     // #200：buzz 是 ACP 常驻执行层（mini-relay 驱动），一次性 CLI spawn 不适用——
     // 裸起 buzz-agent 无 ACP 握手，只会挂到超时/空输出（审查 #205）。GUI「✨生成」
     // 按钮对 buzz bot 给明确错误（调用方展示 err）。
-    if matches!(backend, Backend::Buzz) {
-        anyhow::bail!(
-            "角色提示词生成暂不支持 buzz 后端（请临时切 claude/codex 生成，或手写群介绍）。"
-        );
+    if backend.is_buzz() {
+        anyhow::bail!("{}", buzz_unsupported_msg("角色提示词生成"));
     }
     let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
@@ -3429,5 +3440,38 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+    }
+
+    /// #200 守卫回归（审查 #205r2）：buzz 的两条 CLI 旁路入口必须**返回 Err**，
+    /// 绝不落到 run_once 的 unreachable!（panic 被 tasks 捕获只留 stderr，且
+    /// run_job 的去重槽位/取消标志不回收 = 该 job 之后永久静默跳过）。
+    #[tokio::test]
+    async fn buzz_never_enters_cli_run_or_role_prompt() {
+        let e = crate::agent::run(
+            Backend::Buzz,
+            "跑一下",
+            "sid",
+            false,
+            "oc_buzz",
+            "oc_buzz",
+            "bot_buzz",
+            crate::config::SenderRole::Owner,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let msg = match e {
+            Err(m) => m,
+            Ok(_) => panic!("buzz 不得进入 CLI run 路径（应早退 Err）"),
+        };
+        assert!(msg.contains("buzz"), "错误文案要指明是 buzz 后端: {msg}");
+        assert!(Backend::Buzz.is_buzz() && !Backend::Claude.is_buzz());
+        assert!(
+            crate::agent::generate_role_prompt(Backend::Buzz, "角色")
+                .await
+                .is_err(),
+            "角色提示词生成同样不得裸起 buzz-agent"
+        );
     }
 }

@@ -179,6 +179,9 @@ pub async fn run() {
             agent_secret,
             vbs,
         } = init;
+        // 频道集只用于建路由表（下表）与一行日志——**不**把 Vec 长期闭包进任务：
+        // 长驻任务里读启动快照的登记表会误导后续改动（审查 #205r2）。
+        let n_vbs = vbs.len();
         // 回复回流路由表：频道 uuid → messenger（uuid 含 bot_key，两 bot 同群不串线；
         // 回流事件本身带 channel_uuid）。vbs 用 init 的同一份快照（频道集与路由表
         // 绝不同源漂移）。运行期新登记的群不参与 buzz（重启生效，与频道集一致）。
@@ -198,102 +201,120 @@ pub async fn run() {
         // buzz-acp 作者门的合法 owner = 桥身份公钥（用户消息由桥签名，见 spawn_buzz_acp）
         let bridge_pubkey = state.bridge_pubkey();
         let cfg = Arc::clone(&cfg);
+        let stop = crate::tasks::shutdown_token();
         crate::tasks::tasks().spawn_forever("mini-relay", async move {
-            // ① buzz-acp 子进程 + 存活巡检。句柄必须被长期持有：Child 置了
-            // kill_on_drop(true)，句柄一 drop 子进程即被 SIGKILL（审查 #205 P0——
-            // 原实现 match Ok(_) 即丢，「已拉起」日志后微秒级被杀，功能整体失效）。
-            // 巡检任务持有句柄：30s 检查存活，退出即重拉（父进程责任：buzz-acp 是
-            // agent 池化执行的唯一入口，死了全部 buzz 会话静默停摆）。
+            // ① buzz-acp 子进程 + 巡检。句柄必须被长期持有：Child 置 kill_on_drop，
+            // 句柄一 drop 即 SIGKILL（审查 #205 P0——原实现 match Ok(_) 即丢，
+            // 「已拉起」日志后微秒级被杀）。巡检用 **wait() 等退出**（审查 #205r2：
+            // 30s 轮询既让崩溃恢复最多慢 30s，又在「没装二进制」的机器上每 30s 一行
+            // 日志永刷）；重拉带**指数退避下限**防快崩循环拉起。
             crate::tasks::tasks().spawn_forever("mini-relay-acp", {
                 let cfg = Arc::clone(&cfg);
                 let bridge_pubkey = bridge_pubkey.clone();
+                let stop = stop.clone();
                 async move {
-                    let mut acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
                     // I5（buzz docs/remote-agents.md「Intentional termination is
-                    // final」）：**主动退出（exit 0，owner !shutdown / auto-stop 到点）
-                    // 对自动重拉是终态**——巡检不得复活操作者有意停掉的实例；崩溃
-                    // （非零/探测失败）才重拉。「owner 可再发起一次 Start」的路径 =
-                    // 重启 ABB 服务（本任务随进程重建），不是这里的自动复活。
+                    // final」）：**主动退出（exit 0 = owner !shutdown / auto-stop 到点）
+                    // 对自动重拉是终态**——巡检绝不复活操作者有意停掉的实例；崩溃
+                    // （非零/拉起失败）才重拉。再启的路径 = 重启 ABB 服务。
+                    let mut backoff = std::time::Duration::from_secs(2);
                     let mut terminal = false;
-                    let stop = crate::tasks::shutdown_token();
                     loop {
-                        // 关停可中断的 30s 节拍（服务期常态等待，不设总期限）
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                            _ = stop.cancelled() => break,
-                        }
                         if terminal {
-                            continue;
+                            // 终态：只等关停（无常驻定时器；一行日志已在落定处打过）
+                            stop.cancelled().await;
+                            break;
                         }
-                        match acp.as_mut().map(|p| p.try_exit()) {
-                            None => {
-                                // 从未拉起成功（缺二进制等）：按可自愈路径继续重拉
-                                crate::log!("[mini-relay] ⚠️ buzz-acp 未在运行（上次拉起失败），重试");
-                                acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                        let Some(mut acp) = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey)
+                        else {
+                            // 拉起失败（缺二进制/权限/I1 拒启）：退避重试 2s→300s 封顶
+                            crate::log!("[mini-relay] ⚠️ buzz-acp 拉起失败，{:?} 后重试", backoff);
+                            if interruptible_sleep(backoff, &stop).await {
+                                break;
                             }
-                            Some(None) => {} // 仍在跑
-                            Some(Some(Ok(st))) if st.success() => {
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
+                            continue;
+                        };
+                        // 拉起成功 → 退避复位（后续再失败从 2s 重新起算）
+                        backoff = std::time::Duration::from_secs(2);
+                        // 等退出或关停（服务期常态等待，不设总期限）
+                        let exited = tokio::select! {
+                            r = acp.wait() => Some(r),
+                            _ = stop.cancelled() => None,
+                        };
+                        match exited {
+                            // 关停：acp 随作用域结束 drop → 杀进程组（含 agent 池）
+                            None => break,
+                            // exit 0 = 主动停止 → I5 终态，绝不自动复活
+                            Some(Ok(st)) if st.success() => {
                                 crate::log!(
                                     "[mini-relay] buzz-acp 主动退出（intentional）——按 I5 不再自动重拉；需再启请重启本服务"
                                 );
                                 terminal = true;
                             }
-                            Some(Some(Ok(st))) => {
-                                crate::log!(
-                                    "[mini-relay] ⚠️ buzz-acp 崩溃退出 code={:?}，重拉",
-                                    st.code()
-                                );
-                                acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
-                            }
-                            Some(Some(Err(e))) => {
-                                crate::log!("[mini-relay] ⚠️ buzz-acp 状态探测失败: {e}，重拉");
-                                acp = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey);
+                            // 崩溃/等待失败 → 退避后重拉（acp 已随本轮结束 drop）
+                            _ => {
+                                crate::log!("[mini-relay] ⚠️ buzz-acp 退出异常，{:?} 后重拉", backoff);
+                                if interruptible_sleep(backoff, &stop).await {
+                                    break;
+                                }
+                                backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
                             }
                         }
                     }
-                    // 句柄随本任务 drop → kill_on_drop 收子进程（关停语义即如此）
                 }
             });
 
-            // ② 回复回流（独立任务——下面的 run_server 才是本任务的常态驻留点）
-            crate::tasks::tasks().spawn_forever("mini-relay-replies", async move {
-                while let Some(reply) = reply_rx.recv().await {
-                    match senders.get(&reply.channel_uuid) {
-                        Some(msgr) => {
-                            if let Err(e) = msgr.send_text(&reply.chat_id, &reply.content).await {
-                                crate::log!(
-                                    "[mini-relay] 回复发送失败 chat={}: {e:#}",
-                                    crate::agent::truncate(&reply.chat_id, 16)
-                                );
+            // ② 回复回流（独立任务——下面的 run_server 才是本任务的常态驻留点）。
+            // 观察关停令牌：parked 在 recv() 的循环不收尾 = shutdown_wait 恒烧满总期限
+            // （仓库纪律，审查 #205r2）。
+            crate::tasks::tasks().spawn_forever("mini-relay-replies", {
+                let stop = stop.clone();
+                async move {
+                    loop {
+                        let reply = tokio::select! {
+                            Some(r) = reply_rx.recv() => r,
+                            _ = stop.cancelled() => break,
+                        };
+                        match senders.get(&reply.channel_uuid) {
+                            Some(msgr) => {
+                                if let Err(e) = msgr.send_text(&reply.chat_id, &reply.content).await {
+                                    crate::log!(
+                                        "[mini-relay] 回复发送失败 chat={}: {e:#}",
+                                        crate::agent::truncate(&reply.chat_id, 16)
+                                    );
+                                }
                             }
+                            None => crate::log!(
+                                "[mini-relay] agent 回复无对应 messenger（登记晚于启动？）chat={} len={}",
+                                crate::agent::truncate(&reply.chat_id, 16),
+                                reply.content.chars().count()
+                            ),
                         }
-                        None => crate::log!(
-                            "[mini-relay] agent 回复无对应 messenger（登记晚于启动？）chat={} len={}",
-                            crate::agent::truncate(&reply.chat_id, 16),
-                            reply.content.chars().count()
-                        ),
                     }
                 }
             });
 
             // ③ WS 服务。绑定失败（端口占用等）退避重试：relay 死了而 dispatch 活着
             // = 静默黑洞（bridge 照常入库/摘 pending 却无人消费），服务期持续自愈。
-            let stop = crate::tasks::shutdown_token();
+            // 关停感知：stop 触发即优雅排水返回 Ok → break（不再白烧收尾总期限）。
             loop {
                 crate::log!(
                     "[mini-relay] 监听 127.0.0.1:{}（{} 个虚拟 Bot 频道）",
                     cfg.buzz_relay_port,
-                    vbs.len()
+                    n_vbs
                 );
-                match crate::buzzrelay::run_server(state.clone(), cfg.buzz_relay_port).await {
+                match
+                    crate::buzzrelay::run_server_until(state.clone(), cfg.buzz_relay_port, stop.clone())
+                        .await
+                {
                     Ok(()) => break,
                     Err(e) => {
                         crate::log!("[mini-relay] ❌ relay 服务异常退出: {e:#}（2s 后重绑）")
                     }
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-                    _ = stop.cancelled() => break,
+                if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
+                    break;
                 }
             }
         });
@@ -534,36 +555,31 @@ fn spawn_buzz_acp(
 /// → 登记表频道集 → buzz-relay.db 打开 → RelayState（含回复回流通道）→ 种子频道事件。
 /// Err = relay 不可用（磁盘/权限等）：buzz 后端随之不可用，CLI 后端不受影响。
 async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
-    // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；首次生成后持久化）
+    // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；缺/坏 → 生成并**覆盖**持久化）
     let key_path = crate::bridge_dir().join("buzz-bridge-key");
-    let bridge_secret = load_or_generate_key(&key_path);
-    let bridge_keys = nostr::prelude::Keys::parse(&bridge_secret).unwrap_or_else(|_| {
-        // 文件损坏/非 hex：重生成并回写（写回的才是本次生效值——身份跨重启稳定）
-        crate::log!("[mini-relay] ⚠️ buzz-bridge-key 解析失败，重新生成");
-        let fresh = load_or_generate_key(&key_path);
-        nostr::prelude::Keys::parse(&fresh).expect("新生成密钥必可解析")
-    });
-    // agent 身份私钥：config 指定（合法 hex）优先；缺省/非法 → 落盘文件
-    // buzz-agent-key（0o600）。非法 config 值不再「每次启动临时重生成」——那会让
-    // 种子成员事件跨启动堆积互相矛盾的 agent 身份（审查 #205）；告警后回落文件
-    // 身份，生效值回传给 spawn（两边必须同一身份）。
+    let bridge_keys = load_or_repair_key(&key_path, "buzz-bridge-key")?;
+    // agent 身份私钥：config 指定（合法 hex）优先；缺省/非法 → 文件 buzz-agent-key
+    // （缺/坏同样生成并覆盖）。非法 config 值不「每次启动临时重生成」——那会让种子
+    // 成员事件跨启动堆积互相矛盾的 agent 身份（审查 #205）；回落文件身份，并把
+    // **生效值**回传给 spawn（种子与子进程必须同一身份）。
     let agent_key_path = crate::bridge_dir().join("buzz-agent-key");
-    let agent_secret = if !cfg.buzz_agent_private_key.is_empty()
-        && nostr::prelude::Keys::parse(cfg.buzz_agent_private_key.trim()).is_ok()
-    {
-        cfg.buzz_agent_private_key.trim().to_string()
+    let cfg_key = cfg.buzz_agent_private_key.trim();
+    let cfg_parsed = if cfg_key.is_empty() {
+        None
     } else {
-        if !cfg.buzz_agent_private_key.is_empty() {
-            crate::log!("[mini-relay] ⚠️ config buzz_agent_private_key 非法（非 hex 私钥），回落文件身份 buzz-agent-key");
-        }
-        load_or_generate_key(&agent_key_path)
+        nostr::prelude::Keys::parse(cfg_key).ok()
     };
-    let agent_keys = nostr::prelude::Keys::parse(&agent_secret).unwrap_or_else(|_| {
-        // 走到这里 = 文件内容损坏（config 分支已验 isValid）→ 重生成 + 回写。
-        crate::log!("[mini-relay] ⚠️ agent 密钥解析失败，重新生成");
-        let fresh = load_or_generate_key(&agent_key_path);
-        nostr::prelude::Keys::parse(&fresh).expect("新生成密钥必可解析")
-    });
+    let (agent_keys, agent_secret) = match cfg_parsed {
+        Some(k) => (k, cfg_key.to_string()),
+        None => {
+            if !cfg_key.is_empty() {
+                crate::log!("[mini-relay] ⚠️ config buzz_agent_private_key 非法（非 hex 私钥），回落文件身份 buzz-agent-key");
+            }
+            let k = load_or_repair_key(&agent_key_path, "buzz-agent-key")?;
+            let hex = k.secret_key().display_secret().to_string();
+            (k, hex)
+        }
+    };
     let agent_pubkey = agent_keys.public_key().to_hex();
     // 频道集：登记的虚拟 Bot 群（uuid 派生 + chat_id + 角色名/描述）
     let vbs = crate::virtualbot::VirtualBotStore::new().load();
@@ -596,27 +612,46 @@ async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
     })
 }
 
-/// #200：读取/生成本地 hex 私钥。敏感工件统一走 atomic_write_sensitive
-/// （0o600 + tmp+rename 原子替换）——裸 fs::write 会留世界可读密钥，崩溃半写
-/// 直接换掉身份（仓库口径：config.json/history/sessions 同款，不再新增手写副本）。
-fn load_or_generate_key(path: &std::path::Path) -> String {
+/// #200：读取并校验本地 hex 私钥；缺失/空/损坏一律**重新生成并覆盖持久化**。
+///
+/// 三条硬要求（审查 #205r2）：
+/// - **绝不 panic**：init_buzz_relay 在 run() 的关键路径上 await，不在 tasks 的
+///   catch_unwind 保护内——这里 panic = 整个服务连 CLI bot 一起崩、看门狗 2s 重拉
+///   = 崩溃循环。原实现「解析失败→再调 load（读同一坏文件）→expect」正是踩这个：
+///   #202 时代裸 fs::write 可能留下截断内容，坏文件必须被**覆盖**而不是回读。
+///   失败统一走 Err → relay=None → 只有 buzz 不可用。
+/// - **读取路径也收权限**：#202 时代写过 0644 的密钥文件，只在新建分支 chmod 等于
+///   永不修复；读成功也要收紧 0600。
+/// - 原子写复用 atomic_write_sensitive（0600 + tmp+rename），不再新增手写副本。
+fn load_or_repair_key(path: &std::path::Path, label: &str) -> Result<nostr::prelude::Keys, String> {
     if let Ok(s) = std::fs::read_to_string(path) {
         let t = s.trim().to_string();
         if !t.is_empty() {
-            return t;
+            match nostr::prelude::Keys::parse(&t) {
+                Ok(k) => {
+                    // 读成功也要修权限（历史遗留 0644 在此收敛）
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    }
+                    return Ok(k);
+                }
+                Err(e) => {
+                    crate::log!("[mini-relay] ⚠️ {label} 内容无法解析（{e}），重新生成并覆盖旧文件")
+                }
+            }
         }
     }
-    let hex = nostr::prelude::Keys::generate()
-        .secret_key()
-        .display_secret()
-        .to_string();
+    let k = nostr::prelude::Keys::generate();
+    let hex = k.secret_key().display_secret().to_string();
     if let Err(e) = crate::atomic_write_sensitive(path, &hex) {
         crate::log!(
-            "[mini-relay] ⚠️ 私钥持久化失败 {}: {e}（本次身份不落盘，重启会换）",
-            path.display()
+            "[mini-relay] ⚠️ {label} 持久化失败: {e}（本次身份不落盘，重启会换；不影响本次运行）"
         );
     }
-    hex
+    Ok(k)
 }
 
 /// 单个 bot 的全套：事件循环（飞书 WS / 微信长轮询）+ 定时任务调度循环。
@@ -1570,5 +1605,34 @@ mod tests {
         let p = job_prompt(&job, &bot_key);
         assert!(p.contains("简单提醒"));
         assert!(!p.starts_with("[受限模式]"));
+    }
+
+    /// #1 回归（审查 #205r2）：**密钥文件损坏不得 panic**。#202 时代用裸 fs::write
+    /// 写过该文件（无原子性），崩溃可留下截断内容；原「解析失败 → 再调 load（读同
+    /// 一坏文件）→ expect」会在 run() 的关键路径上确定性 panic——init_buzz_relay
+    /// 不在 tasks 的 catch_unwind 内，整个服务连 CLI bot 一起崩、看门狗 2s 重拉
+    /// = 崩溃循环。现要求：覆盖重生成、返回 Ok、跨调用身份稳定、权限收 0600。
+    #[test]
+    fn load_or_repair_key_repairs_corrupt_file_without_panic() {
+        let dir = std::env::temp_dir().join(format!("abb-keyfix-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("buzz-bridge-key");
+        std::fs::write(&p, "截断的坏内容-not-a-hex-key").unwrap();
+
+        let k = load_or_repair_key(&p, "buzz-bridge-key").expect("坏文件必须重生成而非 panic");
+        // 覆盖生效：盘上内容现在可解析，且就是本次返回的那把
+        let on_disk = std::fs::read_to_string(&p).unwrap();
+        let reparsed = nostr::prelude::Keys::parse(on_disk.trim()).expect("落盘内容必须可解析");
+        assert_eq!(reparsed.public_key().to_hex(), k.public_key().to_hex());
+        // 跨重启稳定：第二次读直接命中修好的文件（同一身份，不再换）
+        let again = load_or_repair_key(&p, "buzz-bridge-key").unwrap();
+        assert_eq!(again.public_key().to_hex(), k.public_key().to_hex());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "密钥文件不得世界可读（读取路径也要收权限）");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

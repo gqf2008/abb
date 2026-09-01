@@ -154,11 +154,11 @@ impl Bridge {
                 return;
             }
             // 无在跑任务 → 命令化反馈，不喂给 agent。#200：buzz bot 说「没有正在运行
-            // 的任务」不诚实（dispatch 即返回，回复异步回流——用户视角本轮就在跑，
-            // 且无打断协议），给专用文案。
-            let buzz_note = Backend::parse(&self.default_backend) == Backend::Buzz;
-            let msg = if buzz_note {
-                "⏳ buzz 后端一轮对话不支持中途打断（session/prompt 原子）；等本轮回复送达即可继续。"
+            // 的任务」不诚实（dispatch 即返回、回复异步回流，桥侧没有同步轮次记账，
+            // 也无打断协议）——只陈述「不支持打断」这个能力事实，不断言有没有轮次在跑
+            //（审查 #205r2）。
+            let msg = if Backend::parse(&self.default_backend).is_buzz() {
+                "⏳ buzz 后端的一轮对话不支持中途打断（session/prompt 原子执行）；若有轮次在跑，等它回复即可继续。"
             } else {
                 "✅ 当前没有正在运行的任务。"
             };
@@ -345,6 +345,48 @@ impl Bridge {
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
         // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
         let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
+        // #200 Phase 2：buzz 路径资格预检——必须在 **prompt 组装与历史落盘之前**
+        // （审查 #205r2）：预检不过 = 这一轮根本不会发生，既不该白烧迁移历史读/指令块
+        // 拼接，更不该往 ABB 历史里写一条「有去无回」的用户轮（单边历史会在日后
+        // buzz→CLI 切换时被当上下文注入）。三条资格：
+        // ① mini-relay 可用（未启用/初始化失败 → 无法服务）；
+        // ② 本会话是已登记的虚拟 Bot 群（频道集是启动快照，p2p/未登记群不支持）；
+        // ③ **不是受限会话**——CLI 路径对授权者（Granted）的硬闸是 agent::run 里
+        //    挂的 guard hook/沙箱，buzz 走 acp 侧自己的工具权限（permission-mode 默认
+        //    bypass），RESTRICT_PREAMBLE 只是提示文本。guard→request_permission 映射
+        //    未落地前（#206），给受限用户跑 buzz = 静默提权，必须拒绝而非降级运行。
+        if backend.is_buzz() {
+            let reason = match self.buzz_relay_state.as_ref() {
+                None => Some("mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）"),
+                Some(relay) => {
+                    let uuid = crate::buzzrelay::channel_uuid(&self.bot.key(), &ev.chat_id);
+                    if relay.channel_by_uuid(&uuid).is_none() {
+                        Some("本会话不是已登记的虚拟 Bot 群（新登记的群需重启后参与 buzz）")
+                    } else if crate::config::restrict_granted(ev.role, &self.bot.key()) {
+                        Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(why) = reason {
+                crate::log!(
+                    "[bridge] ⚠️ buzz 路径预检未通过 chat={}: {why}",
+                    trunc(&ev.chat_id, 12)
+                );
+                self.pending.remove(&ev.mid);
+                if let Err(e) = self
+                    .send_reply(&ev, &format!("⚠️ buzz 后端无法处理本条消息：{why}。"))
+                    .await
+                {
+                    crate::log!(
+                        "[bridge] ⚠️ buzz 预检失败提示发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    );
+                }
+                return;
+            }
+        }
         // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
         // 附件元数据行带路径/mime/sha256，agent 可直接读取工作区文件内容。
         let has_text = !text.is_empty();
@@ -621,38 +663,35 @@ impl Bridge {
         //   停止词按普通消息透传进频道（与 CLI 无在跑任务时一致）。已知边界：buzz
         //   轮次进行中的叫停无协议支持（#200 后续 steer/cancel）。
         // - typing/DONE 表情不出现：无同步轮次可挂（回复回流路径也不发表情）。
-        if backend == Backend::Buzz {
+        if backend.is_buzz() {
             crate::log!(
                 "[bridge] buzz 路径：写入 mini-relay chat={} len={}",
                 trunc(&ev.chat_id, 12),
                 prompt.chars().count()
             );
-            let delivered = match self.buzz_relay_state.as_ref() {
-                Some(relay) => {
-                    relay
-                        .publish_user_message(&self.bot.key(), &ev.chat_id, &ev.mid, &prompt)
-                        .await
-                }
-                None => {
-                    crate::log!("[bridge] ⚠️ buzz 后端但 mini-relay 不可用（未启用或初始化失败）");
-                    false
-                }
-            };
+            // 预检已保证 relay 存在 + 频道已登记 + 非受限会话；这里 false 只剩
+            // 「签名失败 / 入库失败（磁盘等）」——同样给可见报错，且不消耗会话闸。
+            let delivered = self
+                .buzz_relay_state
+                .as_ref()
+                .expect("buzz 预检通过则 relay 必在")
+                .publish_user_message(&self.bot.key(), &ev.chat_id, &ev.mid, &prompt)
+                .await;
             // 发布即处理完毕：摘 pending（重启不重放；发布-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
             if !delivered {
-                // 用户可见报错（CLI 路径任何轮次都有回执，buzz 不得做成黑洞）。
-                // **不**落会话标记：迁移注入的一次性闸不能被没发生的轮次消耗——
-                // 修好配置重启后首轮仍应带历史。
                 if let Err(e) = self
                     .send_reply(
                         &ev,
-                        "⚠️ buzz 后端消息未送达：本会话不是已登记的虚拟 Bot 群，或 mini-relay 未运行（设置开 buzz_relay_enabled 后重启）。",
+                        "⚠️ buzz 后端消息写入 mini-relay 失败（详见服务日志），请重发或换后端。",
                     )
                     .await
                 {
-                    crate::log!("[bridge] ⚠️ buzz 未送达报错发送失败 chat={}: {e:#}", trunc(&ev.chat_id, 10));
+                    crate::log!(
+                        "[bridge] ⚠️ buzz 未送达报错发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    );
                 }
                 return;
             }
