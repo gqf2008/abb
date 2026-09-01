@@ -786,12 +786,18 @@ fn bot_trash_settings() -> crate::trash::TrashSettings {
 /// trash CLI 与 hook/service 统一走这里，保证 TTL 口径一致。
 pub(crate) fn bot_trash_settings_for(bot_key: &str) -> crate::trash::TrashSettings {
     match crate::config::Config::load() {
-        Ok(cfg) => cfg
-            .bots
-            .iter()
-            .find(|b| b.key() == bot_key)
-            .map(crate::trash::TrashSettings::from_bot)
-            .unwrap_or_else(crate::trash::TrashSettings::defaults),
+        Ok(cfg) => {
+            let mut s = cfg
+                .bots
+                .iter()
+                .find(|b| b.key() == bot_key)
+                .map(crate::trash::TrashSettings::from_bot)
+                .unwrap_or_else(crate::trash::TrashSettings::defaults);
+            // #209：全局工作区版本管理开关由持有 Config 的调用方覆盖
+            // （from_bot 只见 bot 配置；配置损坏 → defaults=true 保护偏置）。
+            s.git_enabled = cfg.workspace_git_enabled;
+            s
+        }
         Err(_) => crate::trash::TrashSettings::defaults(),
     }
 }

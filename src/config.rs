@@ -904,6 +904,11 @@ pub struct Config {
     /// #200：mini-relay 监听端口。默认 3000（与 buzz 生态默认一致）。
     #[serde(default = "default_buzz_relay_port")]
     pub buzz_relay_port: u16,
+    /// 工作区版本管理总开关（#209，默认开）：bot 启动时为工作区自动 init git 仓库
+    /// （内置 libgit2，不依赖系统 git），删除保护快照（trash 留痕）也依赖该仓库。
+    /// 关闭 = ABB 完全不 init、不快照（工作区已有仓库也不写入，由用户自主管理）。
+    #[serde(default = "default_true")]
+    pub workspace_git_enabled: bool,
     /// #200：buzz-acp 可执行文件路径（service spawn 用）。
     /// #207：空 = 按序解析——应用包同目录（发布包内置）→ ~/.agent-bridge/bin/ → PATH。
     #[serde(default)]
@@ -953,6 +958,7 @@ impl Default for Config {
             cross_delivery_enabled: false,
             buzz_relay_enabled: false,
             buzz_relay_port: 3000,
+            workspace_git_enabled: true, // #209 工作区版本管理默认开
             buzz_acp_exe: String::new(),
             buzz_agent_exe: String::new(),
             buzz_agent_private_key: String::new(),

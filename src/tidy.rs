@@ -395,24 +395,12 @@ pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
     // 2b. 确保运行时文件排除写进 .gitignore——**无论仓库/ignore 是否已存在**：用户
     // 已有 .gitignore 时漏了这些排除，git add -A 会把会话历史/槽位/GRANTED.md 等
     // 运行时文件提交进 git（历史含对话全文、GRANTED.md 含授权者名单——隐私外泄，
-    // 审查修复）。幂等：逐行比对，只追加缺失条目，不覆盖用户内容。
+    // 审查修复）。清单与合并逻辑单一事实源在 wsver（#209，启动 init/删除快照共用）；
+    // 幂等：只追加缺失行，不覆盖用户内容。
     {
-        let gi = workspace.join(".gitignore");
-        let existing = std::fs::read_to_string(&gi).unwrap_or_default();
-        let missing: Vec<&str> = GITIGNORE
-            .lines()
-            .filter(|l| !l.is_empty() && !existing.lines().any(|e| e.trim() == *l))
-            .collect();
-        if !missing.is_empty() {
-            let mut content = existing;
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push_str(&format!(
-                "\n# ABB 运行时文件（每日整理自动追加，勿删）\n{}\n",
-                missing.join("\n")
-            ));
-            if let Err(e) = std::fs::write(&gi, content) {
+        match crate::wsver::merge_gitignore(workspace) {
+            Ok(_) => {}
+            Err(e) => {
                 // 写失败（只读目录/权限）→ 运行时文件可能被 add -A 提交，降级为不提交
                 // 任何内容（隐私优先，宁不留痕不可外泄——审查修复）
                 crate::log!("[tidy] ⚠️ 追加 .gitignore 失败（{}）：跳过本轮 git 留痕", e);
@@ -471,25 +459,9 @@ pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
     Ok(GitOutcome::Committed(hash))
 }
 
-/// 运行时文件排除（缺失时写入；用户已有 .gitignore 不覆盖）。
-const GITIGNORE: &str = "\
-.pi-sessions/
-history/
-sessions/
-sessions.json
-jobs.json
-pending.json
-pending_outbox.json
-*.tmp
-*.swp
-*.bak
-.DS_Store
-GRANTED.md
-attachments/
-.trash/
-.abb-tidy-last
-.abb-session-gc-last
-";
+// 运行时文件排除清单已收敛到 wsver::GITIGNORE（#209 单一事实源：启动 init /
+// 删除快照 / 每日整理三处共用，防清单漂移）；本函数仍走外部系统 git，迁移到
+// libgit2 见 #209 批次 3。
 
 #[cfg(test)]
 mod tests {

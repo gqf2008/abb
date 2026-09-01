@@ -52,6 +52,7 @@ mod virtualbot;
 mod wechat;
 mod winproc;
 mod ws;
+mod wsver;
 
 /// 运行时数据目录：~/.agent-bridge（隐藏目录，与 ~/.claude 同款）。
 /// 老路径 ~/feishu-bridge 由 platform::migrate_to_agent_bridge() 一次性迁移过来（main 启动时跑）。

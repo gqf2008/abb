@@ -15,9 +15,11 @@
 //! ```
 //! manifest 原子写（atomic_write_text），崩溃不残留半截。
 //!
-//! git 留痕（留痕层）：工作区已存在 `.git` 时，移动完成后 `git add -A` + commit 快照
-//! （有界超时，best-effort——git 挂住/不可用不阻塞删除保护）；无 `.git` 不强制 init
-//! （与任务拆解一致）。`.trash/` 本身进 .gitignore（tidy 追加），不污染仓库。
+//! git 留痕（留痕层，#209 起内置 libgit2）：**删除前** add -A + commit 快照——
+//! 被删内容（含从未提交过的新文件）完整落在快照里，删除即有恢复点；工作区无
+//! `.git` 自动 init（不依赖系统 git）。best-effort——留痕失败不阻塞删除保护。
+//! `.trash/` 本身在 .gitignore 清单里，回收站本体不入库（内容靠清单 restore/purge
+//! 恢复）。
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +66,11 @@ pub struct TrashSettings {
     pub code_exts: Vec<String>,
     /// 危险删除代码特征文件名（如 package.json / Cargo.toml / go.mod）。
     pub code_files: Vec<String>,
+    /// #209 全局工作区版本管理开关（config.workspace_git_enabled）：false = 删除前
+    /// 快照完全停用（不 init、不写入已有仓库）。from_bot/defaults 填 true——
+    /// 全局开关 bot 配置不可见，由持有 Config 的调用方（guard bot_trash_settings_for）
+    /// 覆盖；测试直接构造字段即可（不经 Config::load，封闭）。
+    pub git_enabled: bool,
 }
 
 /// 默认代码扩展名：主流源码/配置即代码特征（与任务拆解 #88 对齐，.py/.rs/.go/.js/
@@ -121,6 +128,7 @@ impl TrashSettings {
                 bot.code_exts.clone()
             },
             code_files: default_code_files(),
+            git_enabled: true,
         }
     }
 
@@ -132,6 +140,7 @@ impl TrashSettings {
             dangerous_size_mb: 50,
             code_exts: default_code_exts(),
             code_files: default_code_files(),
+            git_enabled: true, // 保护偏置（与 enabled 同口径）
         }
     }
 }
@@ -320,93 +329,26 @@ fn rand_suffix() -> String {
     format!("{n:016x}")[..8].to_string()
 }
 
-/// 移动前 git 快照（best-effort，有界超时）：
+/// 删除前 git 快照（#209 起为内置 libgit2 实现，不再依赖系统 git）：
 ///
-/// - 工作区无 `.git` → 跳过（不强制 init，任务拆解明确）
-/// - git 不可用/超时/失败 → 跳过（删除保护不因留痕失败而失效）
+/// - 工作区无 `.git` → 自动 init（[`crate::wsver`]，bot 启动 init 被关/失败过的
+///   存量工作区也能在此补上）
+/// - init/快照失败 → Err（删除保护不因留痕失败而失效，调用方降级）
+/// - `git_enabled`（config.workspace_git_enabled，经 TrashSettings 注入）关闭 →
+///   Ok(false) 跳过，完全不 init、不写已有仓库
 ///
-/// 返回是否成功（供日志/测试）。
-pub fn git_snapshot_sync(workspace: &Path) -> Result<(), String> {
-    if !workspace.join(".git").exists() {
-        return Err("工作区无 .git，跳过 git 快照（不强制 init）".into());
+/// 返回是否产生了新 commit（供日志）。
+pub fn git_snapshot_sync(workspace: &Path, git_enabled: bool) -> Result<bool, String> {
+    if !git_enabled {
+        return Ok(false);
     }
-    run_git(workspace, &["add", "-A"], 30)?;
-    // 无变更不产生空 commit：status --porcelain 空 = 无变更
-    let out = run_git(workspace, &["status", "--porcelain"], 30)?;
-    if out.stdout.is_empty() {
-        return Err("无变更，不产生空 commit".into());
-    }
-    run_git(
-        workspace,
-        &[
-            "-c",
-            "user.name=ABB",
-            "-c",
-            "user.email=abb@agent-bridge.local",
-            "commit",
-            "-m",
-            &format!("[abb] 删除保护快照 {}", crate::chrono_lite::now()),
-        ],
-        30,
-    )?;
-    Ok(())
-}
-
-/// 有界同步 git 执行：try_wait 轮询 + 超时杀进程（Windows/macOS 通用，不依赖 wait_timeout）。
-/// stdout/stderr 管道容量：add -A 静默、commit 输出小，不会因管道填满阻塞子进程。
-fn run_git(
-    workspace: &Path,
-    args: &[&str],
-    timeout_secs: u64,
-) -> Result<std::process::Output, String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(args)
-        .current_dir(workspace)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // #152（#104 遗漏）：Windows 托盘 GUI 场景下回收站 git 留痕/归档也闪控制台窗口，
-    // 与 tidy.rs git_commit 同款抑制（CREATE_NO_WINDOW）。
-    #[cfg(windows)]
-    {
-        crate::deps::apply_no_window(&mut cmd);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("git {} 启动失败：{e}", args.join(" ")))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("git wait 失败：{e}"))?
-        {
-            let out = child
-                .wait_with_output()
-                .map_err(|e| format!("git 收尾失败：{e}"))?;
-            if status.success() {
-                return Ok(out);
-            }
-            return Err(format!(
-                "git {} 失败：{}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err(format!(
-                "git {} 超时（{}s），已终止",
-                args.join(" "),
-                timeout_secs
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    crate::wsver::snapshot_lazy(workspace, "删除前快照")
 }
 
 /// 把路径移入回收站（核心动作）。`reason` 是拦截原因摘要（写入清单条目）。
 /// - 目标不存在 → 跳过（rm -f 语义）
 /// - 已在 .trash 内 → 拒绝（回收站内容只能 restore/purge，防二次套娃）
-/// - 移动前 best-effort git 快照（工作区有 .git 时）
+/// - 移动前 best-effort git 快照（内置 libgit2，无 .git 自动 init；#209）
 ///
 /// 返回新条目列表（成功移动的）。
 pub fn move_to_trash(
@@ -417,6 +359,27 @@ pub fn move_to_trash(
 ) -> Result<Vec<TrashItem>, String> {
     let root = trash_root(workspace);
     std::fs::create_dir_all(root.join("items")).map_err(|e| format!("创建回收站目录失败：{e}"))?;
+    // 留痕层（#209 批次 2：删除前自动快照）：**先** add -A + commit 快照再放行删除
+    // ——被删内容（含从未提交过的新文件）完整落在快照里，删除即有恢复点。内置
+    // libgit2，工作区无 .git 自动 init，不依赖系统 git；best-effort——留痕失败不
+    // 阻断删除保护。.trash/ 由 .gitignore 排除，回收站本体不入库（恢复走清单
+    // restore/purge）。确有删除对象才快照（全为不存在/越界路径时，不为空工作区
+    // 建库打基线）。
+    let has_target = paths.iter().any(|p| {
+        let abs = absolutize(workspace, p);
+        abs.exists() && contained_in(workspace, &abs)
+    });
+    if has_target {
+        match git_snapshot_sync(workspace, settings.git_enabled) {
+            Ok(true) => crate::log!("[trash] git 删除前快照完成（可从快照恢复）"),
+            Ok(false) => {}
+            Err(e) => {
+                // #105 联动：留痕失败静默降级（不阻断删除保护），日志留痕便于
+                // 排查「留痕为什么没生效」。
+                crate::log!("[trash] git 留痕跳过（best-effort）：{e}");
+            }
+        }
+    }
     let mut items = load_manifest(workspace);
     let now = crate::chrono_lite::unix_secs();
     let mut moved = Vec::new();
@@ -473,16 +436,6 @@ pub fn move_to_trash(
             dangerous: c.dangerous,
             reason: reason.to_string(),
         });
-    }
-    // 留痕层：全部移动完成后 git 快照（有 .git 时；best-effort，失败不阻断删除保护）。
-    // git add -A 会把「删除后、回收站内」状态一并入库——回收站内容本身完整可恢复，
-    // git 时光机与回收站互补（各有可回退路径），留痕失败不影响移动。
-    if !moved.is_empty() {
-        if let Err(e) = git_snapshot_sync(workspace) {
-            // #105 联动：git 缺失/失败时留痕静默降级（不阻断删除保护），
-            // 日志留痕便于排查「留痕为什么没生效」——配合环境页 git 安装指引。
-            crate::log!("[trash] git 留痕跳过（best-effort）：{e}");
-        }
     }
     save_manifest(workspace, &items).map_err(|e| format!("回收站清单写入失败：{e}"))?;
     Ok(moved)
@@ -735,6 +688,54 @@ mod tests {
         // 对 .trash 内路径再删 → 拒绝
         let trash_inner = trash_root(&ws).join("items");
         assert!(move_to_trash(&ws, &[trash_inner], &s, "t2").is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn deleted_content_recoverable_from_git_snapshot() {
+        // #209 批次 2 集成：删除前快照——首次删除、文件从未提交过也有恢复点
+        // （内置 libgit2 自动 init，无系统 git 的机器同样成立）。
+        let ws = temp_ws();
+        let s = TrashSettings::defaults();
+        std::fs::write(ws.join("doc.md"), "误删前内容\n").unwrap();
+        move_to_trash(&ws, &[PathBuf::from("doc.md")], &s, "误删").unwrap();
+        assert!(!ws.join("doc.md").exists(), "文件已移入回收站");
+        // 快照先于移动：HEAD 就是被删内容的恢复点
+        let repo = git2::Repository::open(&ws).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let blob = head
+            .tree()
+            .unwrap()
+            .get_path(Path::new("doc.md"))
+            .unwrap()
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_blob()
+            .unwrap();
+        assert_eq!(std::str::from_utf8(blob.content()).unwrap(), "误删前内容\n");
+        // 回收站本体不入库
+        let tree = head.tree().unwrap();
+        assert!(
+            tree.get_path(Path::new(".trash")).is_err(),
+            ".trash/ 被 gitignore 排除"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn git_disabled_skips_snapshot_and_repo_creation() {
+        // #209 开关关闭（审查 P2-3 补充）：完全不 init、不快照，删除保护本体不受影响。
+        // 直接构造字段不经 Config::load——测试封闭，不受开发机真实配置影响。
+        let ws = temp_ws();
+        let s = TrashSettings {
+            git_enabled: false,
+            ..TrashSettings::defaults()
+        };
+        std::fs::write(ws.join("x.txt"), "x").unwrap();
+        let moved = move_to_trash(&ws, &[PathBuf::from("x.txt")], &s, "t").unwrap();
+        assert_eq!(moved.len(), 1, "删除保护本体正常工作");
+        assert!(!ws.join(".git").exists(), "开关关闭不得创建 .git");
+        assert!(!git_snapshot_sync(&ws, false).unwrap(), "关闭 → Ok(false)");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
