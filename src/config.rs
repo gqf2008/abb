@@ -904,10 +904,11 @@ pub struct Config {
     /// #200：mini-relay 监听端口。默认 3000（与 buzz 生态默认一致）。
     #[serde(default = "default_buzz_relay_port")]
     pub buzz_relay_port: u16,
-    /// #200：buzz-acp 可执行文件路径（service spawn 用）。空 = ~/.agent-bridge/bin/buzz-acp。
+    /// #200：buzz-acp 可执行文件路径（service spawn 用）。
+    /// #207：空 = 按序解析——应用包同目录（发布包内置）→ ~/.agent-bridge/bin/ → PATH。
     #[serde(default)]
     pub buzz_acp_exe: String,
-    /// #200：buzz-agent 可执行文件路径（传给 buzz-acp）。空 = ~/.agent-bridge/bin/buzz-agent。
+    /// #200：buzz-agent 可执行文件路径（传给 buzz-acp）。空 = 同 buzz_acp_exe 的解析顺序。
     #[serde(default)]
     pub buzz_agent_exe: String,
     /// #200：agent 的 Nostr 私钥（hex）。空 = 首次启动生成并持久化到 buzz-agent-key。
