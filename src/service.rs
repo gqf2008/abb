@@ -50,171 +50,29 @@ pub async fn run() {
 
     // #200：mini-relay —— ABB 内嵌 Nostr relay（NIP-01/42/98 子集），buzz-acp 可连接
     // 订阅虚拟 Bot 频道触发 buzz-agent 执行。开关默认关（config buzz_relay_enabled）。
-    if cfg.buzz_relay_enabled {
-        let cfg = Arc::clone(&cfg);
-        crate::tasks::tasks().spawn_forever("mini-relay", async move {
-            // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；首次生成后持久化）
-            let key_path = crate::bridge_dir().join("buzz-bridge-key");
-            let secret_hex = match std::fs::read_to_string(&key_path) {
-                Ok(s) => s,
-                Err(_) => {
-                    let k = nostr::prelude::Keys::generate();
-                    let hex = k.secret_key().display_secret().to_string();
-                    let _ = std::fs::write(&key_path, &hex);
-                    hex
-                }
-            };
-            let bridge_keys = nostr::prelude::Keys::parse(secret_hex.trim()).unwrap_or_else(|_| {
-                crate::log!("[mini-relay] ⚠️ buzz-bridge-key 解析失败，重新生成");
-                let k = nostr::prelude::Keys::generate();
-                let _ = std::fs::write(&key_path, k.secret_key().display_secret().to_string());
-                k
-            });
-            // agent 身份私钥：config 指定，否则生成并持久化到 buzz-agent-key（0o600）
-            let agent_key_path = crate::bridge_dir().join("buzz-agent-key");
-            let agent_secret = if !cfg.buzz_agent_private_key.is_empty() {
-                cfg.buzz_agent_private_key.clone()
-            } else {
-                std::fs::read_to_string(&agent_key_path).unwrap_or_else(|_| {
-                    let hex = nostr::prelude::Keys::generate()
-                        .secret_key()
-                        .display_secret()
-                        .to_string();
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::write(&agent_key_path, &hex).and_then(|_| {
-                            std::fs::set_permissions(
-                                &agent_key_path,
-                                std::fs::Permissions::from_mode(0o600),
-                            )
-                        });
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = std::fs::write(&agent_key_path, &hex);
-                    }
-                    hex
-                })
-            };
-            let agent_keys =
-                nostr::prelude::Keys::parse(agent_secret.trim()).unwrap_or_else(|_| {
-                    crate::log!("[mini-relay] ⚠️ agent 密钥解析失败，重新生成");
-                    nostr::prelude::Keys::generate()
-                });
-            let agent_pubkey = agent_keys.public_key().to_hex();
-            // 频道集：登记的虚拟 Bot 群（uuid 派生 + chat_id + 角色名/描述）
-            let vbs = crate::virtualbot::VirtualBotStore::new().load();
-            let channels: Vec<crate::buzzrelay::Channel> = vbs
-                .iter()
-                .map(|v| crate::buzzrelay::Channel {
-                    uuid: crate::buzzrelay::channel_uuid(&v.bot_key, &v.chat_id),
-                    chat_id: v.chat_id.clone(),
-                    name: v.role_name.clone(),
-                    about: String::new(),
-                })
-                .collect();
-            // 事件库打开失败极罕见（磁盘满/权限），失败则跳过本轮
-            let store = match crate::buzzrelay::EventStore::open(
-                &crate::bridge_dir().join("buzz-relay.db"),
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    crate::log!("[mini-relay] ⚠️ buzz-relay.db 打开失败: {e}，跳过 mini-relay");
-                    return;
-                }
-            };
-            let (state, mut reply_rx) =
-                crate::buzzrelay::RelayState::new(store, bridge_keys, agent_pubkey.clone());
-            state.set_channels(channels);
-            state.seed_channel_events().await;
-
-            // #200 胶水 ①：拉起 buzz-acp 子进程（BUZZ_RELAY_URL 指向本 mini-relay）。
-            let acp_exe = if cfg.buzz_acp_exe.is_empty() {
-                crate::bridge_dir()
-                    .join("bin/buzz-acp")
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                cfg.buzz_acp_exe.clone()
-            };
-            let agent_exe = if cfg.buzz_agent_exe.is_empty() {
-                crate::bridge_dir()
-                    .join("bin/buzz-agent")
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                cfg.buzz_agent_exe.clone()
-            };
-            let relay_url = format!("ws://127.0.0.1:{}", cfg.buzz_relay_port);
-            match crate::buzzacp::BuzzAcpProcess::spawn(
-                &acp_exe,
-                &relay_url,
-                &cfg.buzz_agent_private_key,
-                &agent_exe,
-                "", // agent owner：Phase 1 空（回环信任）
-            ) {
-                Ok(_) => {
-                    crate::log!("[mini-relay] buzz-acp 子进程已拉起（{acp_exe} → {relay_url}）")
-                }
-                Err(e) => crate::log!(
-                    "[mini-relay] ⚠️ buzz-acp spawn 失败: {e}（agent 回复不可用，relay 仍运行）"
-                ),
+    // 状态（密钥/sqlite/频道表）在 bot 循环前**同步**初始化：Bridge 构造即拿到
+    // RelayState（或 None），不存在「后台任务异步填共享句柄、bot 先读为 None」的
+    // 启动竞态。WS 服务 / buzz-acp 子进程 / 回复回流仍在后台任务，等 messengers
+    // 就绪后再 spawn（回复回流要按 chat_id 路由到对应 bot，见下方）。
+    let mut buzz_reply_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::buzzrelay::AgentReply>,
+    > = None;
+    let buzz_relay_state: Option<std::sync::Arc<crate::buzzrelay::RelayState>> = if cfg
+        .buzz_relay_enabled
+    {
+        match init_buzz_relay(&cfg).await {
+            Ok((state, rx)) => {
+                buzz_reply_rx = Some(rx);
+                Some(state)
             }
-
-            // #200 胶水：回复回流 → 找到对应 bot 的 messenger → send_text 发回聊天平台。
-            // messenger 句柄经 mpsc 从 ready 循环注入（见下方 Arc<Mutex<HashMap>>）。
-            let senders: Arc<
-                std::sync::Mutex<HashMap<String, std::sync::Arc<dyn crate::messenger::Messenger>>>,
-            > = Arc::new(Mutex::new(HashMap::new()));
-            crate::tasks::tasks().spawn_forever("mini-relay-replies", {
-                let senders = Arc::clone(&senders);
-                async move {
-                    while let Some(reply) = reply_rx.recv().await {
-                        match sender_of(&senders, &reply.chat_id) {
-                            Some(msgr) => {
-                                if let Err(e) = msgr.send_text(&reply.chat_id, &reply.content).await
-                                {
-                                    crate::log!(
-                                        "[mini-relay] 回复发送失败 chat={}: {e:#}",
-                                        &reply.chat_id[..reply.chat_id.len().min(16)]
-                                    );
-                                }
-                            }
-                            None => crate::log!(
-                                "[mini-relay] agent 回复无对应 bot chat={} len={}",
-                                &reply.chat_id[..reply.chat_id.len().min(16)],
-                                reply.content.chars().count()
-                            ),
-                        }
-                    }
-                }
-            });
-
-            // 供 mini-relay-replies 任务查 bot messenger 的便捷注册点
-            fn sender_of(
-                senders: &Arc<
-                    std::sync::Mutex<
-                        HashMap<String, std::sync::Arc<dyn crate::messenger::Messenger>>,
-                    >,
-                >,
-                chat_id: &str,
-            ) -> Option<std::sync::Arc<dyn crate::messenger::Messenger>> {
-                senders.lock().unwrap().get(chat_id).cloned()
+            Err(e) => {
+                crate::log!("[mini-relay] ⚠️ 初始化失败: {e}（buzz 后端不可用，CLI 后端不受影响）");
+                None
             }
-
-            crate::log!(
-                "[mini-relay] 监听 127.0.0.1:{}（{} 个虚拟 Bot 频道，agent={agent_pubkey:.16}…）",
-                cfg.buzz_relay_port,
-                vbs.len()
-            );
-            if let Err(e) = crate::buzzrelay::run_server(state.clone(), cfg.buzz_relay_port).await {
-                crate::log!("[mini-relay] ❌ relay 服务异常退出: {e:#}");
-            }
-        });
-    }
+        }
+    } else {
+        None
+    };
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -288,6 +146,97 @@ pub async fn run() {
         crate::install::set_desired(false);
         std::process::exit(1);
     }
+    // #200 胶水：mini-relay 服务期任务（状态初始化成功才启动）：
+    // ① 拉起 buzz-acp 子进程（BUZZ_RELAY_URL 指向本 mini-relay）；② 回复回流 →
+    // 按 chat_id 路由到对应 bot 的 messenger → send_text 发回聊天平台；③ WS 服务。
+    // 必须在 messenger 就绪后 spawn（回流路由要查 messengers），且在 Router::new
+    // 消费 messengers 之前建好路由表（messengers 此后被 move）。
+    if let Some(state) = &buzz_relay_state {
+        // 回复回流路由表：chat_id → messenger。频道集与登记表同源（init 时的快照）：
+        // 运行期新登记的群不参与 buzz（与 mini-relay 频道集一致，重启生效）。
+        let senders: Arc<Mutex<HashMap<String, Arc<dyn crate::messenger::Messenger>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = senders.lock().unwrap();
+            for vb in crate::virtualbot::VirtualBotStore::new().load() {
+                if let Some(m) = messengers.get(&vb.bot_key) {
+                    map.insert(vb.chat_id, Arc::clone(m));
+                }
+            }
+        }
+        let state = Arc::clone(state);
+        let mut reply_rx = buzz_reply_rx
+            .take()
+            .expect("relay 状态就绪则回复通道必已就绪");
+        let cfg = Arc::clone(&cfg);
+        crate::tasks::tasks().spawn_forever("mini-relay", async move {
+            // ① buzz-acp 子进程。spawn 失败只告警不重试（Phase 2 简化）：agent 回复
+            // 不可用，relay 仍运行，消息继续入库（重启后重拉）。
+            let acp_exe = if cfg.buzz_acp_exe.is_empty() {
+                crate::bridge_dir()
+                    .join("bin/buzz-acp")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                cfg.buzz_acp_exe.clone()
+            };
+            let agent_exe = if cfg.buzz_agent_exe.is_empty() {
+                crate::bridge_dir()
+                    .join("bin/buzz-agent")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                cfg.buzz_agent_exe.clone()
+            };
+            let relay_url = format!("ws://127.0.0.1:{}", cfg.buzz_relay_port);
+            match crate::buzzacp::BuzzAcpProcess::spawn(
+                &acp_exe,
+                &relay_url,
+                &cfg.buzz_agent_private_key,
+                &agent_exe,
+                "", // agent owner：Phase 1 空（回环信任）
+            ) {
+                Ok(_) => {
+                    crate::log!("[mini-relay] buzz-acp 子进程已拉起（{acp_exe} → {relay_url}）")
+                }
+                Err(e) => crate::log!(
+                    "[mini-relay] ⚠️ buzz-acp spawn 失败: {e}（agent 回复不可用，relay 仍运行）"
+                ),
+            }
+
+            // ② 回复回流（独立任务——下面的 run_server 才是本任务的常态驻留点）
+            crate::tasks::tasks().spawn_forever("mini-relay-replies", {
+                let senders = Arc::clone(&senders);
+                async move {
+                    while let Some(reply) = reply_rx.recv().await {
+                        let msgr = senders.lock().unwrap().get(&reply.chat_id).cloned();
+                        match msgr {
+                            Some(msgr) => {
+                                if let Err(e) = msgr.send_text(&reply.chat_id, &reply.content).await
+                                {
+                                    crate::log!(
+                                        "[mini-relay] 回复发送失败 chat={}: {e:#}",
+                                        crate::agent::truncate(&reply.chat_id, 16)
+                                    );
+                                }
+                            }
+                            None => crate::log!(
+                                "[mini-relay] agent 回复无对应 bot chat={} len={}",
+                                crate::agent::truncate(&reply.chat_id, 16),
+                                reply.content.chars().count()
+                            ),
+                        }
+                    }
+                }
+            });
+
+            // ③ WS 服务（服务期常态：本任务活到关停）
+            if let Err(e) = crate::buzzrelay::run_server(state, cfg.buzz_relay_port).await {
+                crate::log!("[mini-relay] ❌ relay 服务异常退出: {e:#}");
+            }
+        });
+    }
+
     let router = std::sync::Arc::new(crate::deliver::Router::new(
         cfg.cross_delivery_enabled,
         messengers, // 此后无其它消费方（github bot 循环已移除），直接 move
@@ -315,11 +264,13 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = crate::tasks::shutdown_token();
         let router = router.clone();
+        // #200：每 bot 一份 relay 状态（None=未启用/初始化失败）
+        let buzz_relay = buzz_relay_state.clone();
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
         handles.push(crate::tasks::tasks().spawn_forever(name, async move {
-            run_bot(bot, cfg, msgr, router, stop).await;
+            run_bot(bot, cfg, msgr, router, stop, buzz_relay).await;
         }));
     }
     // 等所有 bot 循环结束。⚠️ 服务期的常态就是等在这里（等关停广播），**绝不能包超时**：
@@ -446,6 +397,93 @@ async fn deliver_loop(
     crate::log!("[deliver] 投递循环退出");
 }
 
+/// #200：mini-relay 状态初始化（buzz_relay_enabled=true 时在 bot 循环前同步执行）。
+/// 密钥准备（桥身份 buzz-bridge-key / agent 身份 buzz-agent-key，缺则生成并持久化）
+/// → 登记表频道集 → buzz-relay.db 打开 → RelayState（含回复回流通道）→ 种子频道事件。
+/// Err = relay 不可用（磁盘/权限等）：buzz 后端随之不可用，CLI 后端不受影响。
+async fn init_buzz_relay(
+    cfg: &Config,
+) -> Result<
+    (
+        std::sync::Arc<crate::buzzrelay::RelayState>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::buzzrelay::AgentReply>,
+    ),
+    String,
+> {
+    // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；首次生成后持久化）
+    let key_path = crate::bridge_dir().join("buzz-bridge-key");
+    let secret_hex = match std::fs::read_to_string(&key_path) {
+        Ok(s) => s,
+        Err(_) => {
+            let k = nostr::prelude::Keys::generate();
+            let hex = k.secret_key().display_secret().to_string();
+            let _ = std::fs::write(&key_path, &hex);
+            hex
+        }
+    };
+    let bridge_keys = nostr::prelude::Keys::parse(secret_hex.trim()).unwrap_or_else(|_| {
+        crate::log!("[mini-relay] ⚠️ buzz-bridge-key 解析失败，重新生成");
+        let k = nostr::prelude::Keys::generate();
+        let _ = std::fs::write(&key_path, k.secret_key().display_secret().to_string());
+        k
+    });
+    // agent 身份私钥：config 指定，否则生成并持久化到 buzz-agent-key（0o600）
+    let agent_key_path = crate::bridge_dir().join("buzz-agent-key");
+    let agent_secret = if !cfg.buzz_agent_private_key.is_empty() {
+        cfg.buzz_agent_private_key.clone()
+    } else {
+        std::fs::read_to_string(&agent_key_path).unwrap_or_else(|_| {
+            let hex = nostr::prelude::Keys::generate()
+                .secret_key()
+                .display_secret()
+                .to_string();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::write(&agent_key_path, &hex).and_then(|_| {
+                    std::fs::set_permissions(
+                        &agent_key_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::write(&agent_key_path, &hex);
+            }
+            hex
+        })
+    };
+    let agent_keys = nostr::prelude::Keys::parse(agent_secret.trim()).unwrap_or_else(|_| {
+        crate::log!("[mini-relay] ⚠️ agent 密钥解析失败，重新生成");
+        nostr::prelude::Keys::generate()
+    });
+    let agent_pubkey = agent_keys.public_key().to_hex();
+    // 频道集：登记的虚拟 Bot 群（uuid 派生 + chat_id + 角色名/描述）
+    let vbs = crate::virtualbot::VirtualBotStore::new().load();
+    let channels: Vec<crate::buzzrelay::Channel> = vbs
+        .iter()
+        .map(|v| crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&v.bot_key, &v.chat_id),
+            chat_id: v.chat_id.clone(),
+            name: v.role_name.clone(),
+            about: String::new(),
+        })
+        .collect();
+    let n_channels = channels.len();
+    let store = crate::buzzrelay::EventStore::open(&crate::bridge_dir().join("buzz-relay.db"))
+        .await
+        .map_err(|e| format!("buzz-relay.db 打开失败: {e}"))?;
+    let (state, reply_rx) =
+        crate::buzzrelay::RelayState::new(store, bridge_keys, agent_pubkey.clone());
+    state.set_channels(channels);
+    state.seed_channel_events().await;
+    crate::log!(
+        "[mini-relay] 初始化完成（{n_channels} 个虚拟 Bot 频道，agent={agent_pubkey:.16}…）"
+    );
+    Ok((state, reply_rx))
+}
+
 /// 单个 bot 的全套：事件循环（飞书 WS / 微信长轮询）+ 定时任务调度循环。
 /// msgr 由 run() 构建并登记进跨会话投递路由表后传入（Bridge 与路由表共享同一实例）。
 async fn run_bot(
@@ -454,6 +492,7 @@ async fn run_bot(
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
+    buzz_relay: Option<std::sync::Arc<crate::buzzrelay::RelayState>>, // #200：buzz dispatch 用
 ) {
     let key = bot.key();
     crate::log!(
@@ -461,7 +500,11 @@ async fn run_bot(
         bot.kind,
         bot.bot_name
     );
-    let bridge = Arc::new(Bridge::new(msgr, bot.clone(), &cfg));
+    let bridge = {
+        let mut b = Bridge::new(msgr, bot.clone(), &cfg);
+        b.buzz_relay_state = buzz_relay; // #200：buzz dispatch 用；未启用/初始化失败 = None
+        Arc::new(b)
+    };
 
     // 连接态初始上报：进入事件循环前是「连接中」；之后由各事件循环在状态迁移时更新。
     // （别用独立心跳任务只报「活着」——那测的是上报线程不是通道连通，会话死了托盘还在线。）

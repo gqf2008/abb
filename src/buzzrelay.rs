@@ -231,6 +231,45 @@ mod tests {
             .unwrap();
         assert_eq!(h_tag_of(&e2), None);
     }
+
+    /// publish_user_message（#200 dispatch）：已登记 chat → kind 9 入库、单个 #h tag
+    /// 指向频道 uuid、内容原样；未登记 chat → 不产生事件（日志提示，不静默丢）。
+    #[tokio::test]
+    async fn publish_user_message_maps_channel_with_single_h_tag() {
+        let db_path =
+            std::env::temp_dir().join(format!("abb-buzzrelay-pub-{}.db", uuid::Uuid::new_v4()));
+        let store = EventStore::open(&db_path).await.unwrap();
+        let (state, _reply_rx) = RelayState::new(store, Keys::generate(), String::new());
+        state.set_channels([Channel {
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            chat_id: "oc_a".into(),
+            name: "角色A".into(),
+            about: String::new(),
+        }]);
+
+        // 未登记 chat：不入库
+        state.publish_user_message("oc_unknown", "hi").await;
+        let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        assert!(state.db.query(std::slice::from_ref(&all)).await.is_empty());
+
+        // 已登记 chat：kind 9 入库，单 #h tag，内容原样
+        state.publish_user_message("oc_a", "你好，buzz").await;
+        let evs = state.db.query(&[all]).await;
+        assert_eq!(evs.len(), 1);
+        let e = &evs[0];
+        assert_eq!(e.kind.as_u16(), 9);
+        assert_eq!(e.content, "你好，buzz");
+        let h_count = e
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().is_some_and(|k| k.as_str() == "h"))
+            .count();
+        assert_eq!(h_count, 1);
+        assert_eq!(
+            h_tag_of(e).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
 }
 
 // ══════════ 事件存储（turso）与 relay 服务 ══════════
@@ -437,9 +476,14 @@ impl RelayState {
         self.channels.read().unwrap().get(uuid).cloned()
     }
 
+    /// 查询已入库事件（仅测试断言用；与 EventStore::query 同义）。
+    #[cfg(test)]
+    pub async fn query(&self, filters: &[Filter]) -> Vec<nostr::Event> {
+        self.db.query(filters).await
+    }
+
     /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入 mini-relay。
     /// buzz-acp 订阅到后触发 buzz-agent session/prompt。
-    #[allow(dead_code)] // #200 Phase 2 bridge 接线时消费
     pub async fn publish_user_message(&self, chat_id: &str, content: &str) {
         let uuid = self
             .channels
@@ -449,13 +493,17 @@ impl RelayState {
             .find(|c| c.chat_id == chat_id)
             .map(|c| c.uuid.clone());
         let Some(uuid) = uuid else {
-            return; // 非虚拟 Bot 群，不经 relay
+            // 非虚拟 Bot 群（或登记晚于 relay 启动的频道集快照），不经 relay；
+            // 留日志防静默丢消息。
+            crate::log!(
+                "[mini-relay] ⚠️ chat 无对应频道，消息不入 relay chat={}",
+                crate::agent::truncate(chat_id, 16)
+            );
+            return;
         };
+        // 单 #h tag：buzz-acp extract_h_tag_uuid 取首个命中，冗余 tag 无益（对齐其
+        // build_typing_event 的单 tag 形态）。
         let ev = EventBuilder::new(Kind::Custom(9), content)
-            .tag(Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-                [uuid.as_str()],
-            ))
             .tag(Tag::custom(
                 TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
                 [uuid.as_str()],

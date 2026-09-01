@@ -21,6 +21,10 @@ mod virtualbot;
 pub struct Bridge {
     pub msgr: Arc<dyn Messenger>,
     pub sessions: SessionStore,
+    /// #200 Phase 2：mini-relay 状态（buzz 后端的消息经它注入 buzz-acp）。
+    /// None = 未启用（buzz_relay_enabled=false）或初始化失败。service 启动时同步
+    /// 注入（bot 循环前 relay 已就绪），无「bot 先于 relay 初始化」竞态。
+    pub buzz_relay_state: Option<Arc<crate::buzzrelay::RelayState>>,
     /// #194：虚拟 Bot 群的独立会话存储（per-chat 缓存；键=chat_id）。
     vb_sessions: Mutex<HashMap<String, SessionStore>>,
     pub jobs: JobStore,
@@ -219,6 +223,7 @@ impl Bridge {
         Bridge {
             msgr,
             sessions,
+            buzz_relay_state: None, // #200：service 启动后由 buzz_relay_enabled 分支注入
             vb_sessions: Mutex::new(HashMap::new()),
             jobs: JobStore::new(&bot.key()),
             default_backend: effective,
@@ -1937,6 +1942,64 @@ mod tests {
         assert!(
             bridge.sessions.is_started("oc_z"),
             "新会话完成应正常 mark_started"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    // ---- #200 Phase 2：buzz 后端 dispatch（mini-relay 短路）----
+
+    #[tokio::test]
+    async fn buzz_backend_publishes_to_relay_without_cli_spawn() {
+        // buzz 后端：消息写入 mini-relay（kind 9 事件含用户文本），不走 CLI spawn
+        //（mock runner 若被调用会发出「不应被调用」，据此断言）；无同步回复；
+        // 就地 mark_started，第二轮不重复注入历史（channel→session 上下文在 buzz 侧）。
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        // mini-relay 状态：临时库 + 登记一个频道（bot key 与本测试 bot 一致）
+        let db_path =
+            std::env::temp_dir().join(format!("abb-buzz-bridge-{}.db", uuid::Uuid::new_v4()));
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            String::new(),
+        );
+        let chat = "oc_buzz";
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+
+        bridge.handle(test_ev("m1", chat, "第一问")).await;
+
+        // 第一轮：kind 9 事件入库、含用户文本（连同每轮必注入的指令文件块，与 CLI
+        // 路径的 prompt 组装同源）；无 CLI 调用、无同步回复；pending 摘除、会话
+        // mark_started（首轮迁移注入后防重复闸的前置）。
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.query(std::slice::from_ref(&all)).await;
+        assert_eq!(evs.len(), 1, "消息应写入 mini-relay");
+        assert!(evs[0].content.contains("第一问"));
+        assert!(msgr.sent().is_empty(), "buzz 路径无同步回复");
+        assert!(bridge.pending.is_empty(), "发布即处理完毕，pending 应摘除");
+        assert!(
+            bridge.sessions.is_started(chat),
+            "buzz 轮完成应 mark_started"
+        );
+
+        // 第二轮：marker 已落盘 → 不再把历史重复注入 prompt（事件内容无「用户: 」块）。
+        bridge.handle(test_ev("m2", chat, "第二问")).await;
+        let evs = state.query(&[all]).await;
+        assert_eq!(evs.len(), 2);
+        assert!(evs[1].content.contains("第二问"));
+        assert!(
+            !evs[1].content.contains("用户: "),
+            "第二轮不应重复注入历史（buzz 会话上下文由 channel→session 持有）"
         );
         cleanup_bridge(&bridge);
     }

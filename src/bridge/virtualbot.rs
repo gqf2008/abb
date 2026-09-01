@@ -602,6 +602,41 @@ impl Bridge {
             (lock_ret, epoch, injected_rounds)
         };
 
+        // #200 Phase 2：buzz 后端短路——消息写入 mini-relay（buzz-acp 订阅触发
+        // buzz-agent），回复经回流通道异步发回聊天平台，不走 CLI spawn（run_once 的
+        // Buzz 臂 unreachable，见 agent.rs）。与 CLI 路径的差异：
+        // - 会话上下文由 buzz-acp 的 channel→session 持有：ABB 侧首轮迁移注入照常
+        //   （注入闸照跑），发布后就地 mark_started + 落 marker，防后续每轮重复注入
+        //   （CLI 路径这步在 run 返回后做；buzz 无同步轮次，就地补齐）。
+        // - 中断：session/prompt 原子，一轮内无可叫停点——不注册 cancel flag（显式
+        //   /cancel 得「没有正在运行的任务」；自然停止词按普通消息透传，与 CLI 无
+        //   在跑任务时一致）。
+        // - typing/DONE 表情不出现：无同步轮次可挂（回复回流路径也不发表情）。
+        if backend == Backend::Buzz {
+            crate::log!(
+                "[bridge] buzz 路径：写入 mini-relay chat={} len={}",
+                trunc(&ev.chat_id, 12),
+                prompt.chars().count()
+            );
+            match self.buzz_relay_state.as_ref() {
+                Some(relay) => relay.publish_user_message(&ev.chat_id, &prompt).await,
+                None => {
+                    crate::log!(
+                        "[bridge] ⚠️ buzz 后端但 mini-relay 不可用（未启用或初始化失败），消息丢弃"
+                    )
+                }
+            }
+            // 发布即处理完毕：摘 pending（重启不重放；发布-摘除间崩溃 = 重启重放
+            // 重复 prompt，at-least-once 语义，可接受）。
+            self.pending.remove(&ev.mid);
+            // 首轮迁移注入后的防重复闸（同 CLI 成功路径）。mark_started_if 的槽位
+            // 校验天然挡住与 /new 的竞态；即便 marker 错写旧 sid，失配也会让下轮
+            // 重新走注入闸（自愈），无需 CLI 路径的代际复检。
+            if sessions.mark_started_if(&key, &session_id) && injected_rounds.is_some() {
+                hist.set_marker(&session_id, backend.name(), false);
+            }
+            return;
+        }
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
         // cancel flag 注册进 cancel_flags，供该 chat 后续「停止词」消息叫停。
