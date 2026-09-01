@@ -906,7 +906,7 @@ pub struct Config {
     pub buzz_relay_port: u16,
     /// 工作区版本管理总开关（#209，默认开）：bot 启动时为工作区自动 init git 仓库
     /// （内置 libgit2，不依赖系统 git），删除保护快照（trash 留痕）也依赖该仓库。
-    /// 关闭 = 工作区不再自动 init，删除留痕回到「有仓库才快照」的旧行为。
+    /// 关闭 = ABB 完全不 init、不快照（工作区已有仓库也不写入，由用户自主管理）。
     #[serde(default = "default_true")]
     pub workspace_git_enabled: bool,
     /// #200：buzz-acp 可执行文件路径（service spawn 用）。

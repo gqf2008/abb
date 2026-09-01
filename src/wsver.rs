@@ -9,6 +9,11 @@
 //! 失败降级原则：版本管理是增强层，任何失败由调用方决定降级（启动 init 失败仅告警、
 //! 删除留痕失败不阻断删除保护），本模块不 log 不 panic。作者身份固定内联
 //! `ABB <abb@agent-bridge.local>`，不读不写全局 git config。
+//!
+//! 并发（审查确认，best-effort 语义内可接受）：bot 启动 init 与 guard hook 子进程
+//! 的 trash 快照可能并发操作同一工作区——index 写入走 index.lock，撞锁一方干净
+//! 报 Err 走降级，无索引损坏；ref 更新无 CAS，双 commit 竞态最坏孤儿化一个 commit
+//! （对象仍可达，git fsck 可恢复）。
 
 use git2::{IndexAddOption, Repository, RepositoryInitOptions, Signature};
 use std::path::Path;
@@ -16,14 +21,22 @@ use std::path::Path;
 /// 运行时文件排除清单（缺失时写入；用户已有 .gitignore 不覆盖）。单一事实源：
 /// tidy.rs（每日整理留痕）与本模块（启动 init / 删除快照）共用，防两处清单漂移。
 ///
-/// 隐私相关条目（history/、sessions*、GRANTED.md、attachments/）必须保留：
-/// 会话历史含对话全文、GRANTED.md 含授权者名单，git add -A 绝不能把它们提交进
-/// 仓库（#88 审查结论：历史外泄）。
+/// 隐私相关条目（history/、sessions*、summaries/、GRANTED.md、attachments/）必须
+/// 保留：会话历史/归纳摘要含对话全文（summaries/ 为 #130 session_gc 产物）、
+/// GRANTED.md 含授权者名单，git add -A 绝不能把它们提交进仓库（#88 审查结论：
+/// 历史外泄）。churn 条目（context_tokens.json / agent-pids.json / .abb-*-last /
+/// *.tmp 等）防高频变更击穿「无变更不空 commit」快路径。
+///
+/// 注意：ignore 只对未跟踪文件生效——存量 tidy 仓库若曾把上述文件提交过，需
+/// `git rm --cached` 去 track（#209 批次 3 tidy 迁移时一并处理）。
 pub(crate) const GITIGNORE: &str = "\
 .pi-sessions/
 history/
 sessions/
 sessions.json
+summaries/
+context_tokens.json
+agent-pids.json
 jobs.json
 pending.json
 pending_outbox.json
@@ -36,6 +49,7 @@ attachments/
 .trash/
 .abb-tidy-last
 .abb-session-gc-last
+.abb-trash-gc-last
 ";
 
 /// libgit2 错误统一转 String（message 含根因，class 略去——调用方只做日志/降级）。
@@ -64,7 +78,8 @@ pub(crate) fn merge_gitignore(workspace: &Path) -> std::io::Result<usize> {
         "\n# ABB 运行时文件（自动追加，勿删）\n{}\n",
         missing.join("\n")
     ));
-    std::fs::write(&gi, content)?;
+    // 原子写（项目约定，同 trash manifest）：崩溃不残留半截 .gitignore
+    crate::atomic_write_text(&gi, &content)?;
     Ok(missing.len())
 }
 
@@ -206,10 +221,18 @@ mod tests {
         let hist = ws.0.join("history");
         std::fs::create_dir_all(&hist).unwrap();
         std::fs::write(hist.join("chat.log"), "对话全文").unwrap();
+        // 嵌套目录内的非忽略文件也要被收录（pathspec "*" 跨目录语义，审查 P3-7）
+        let sub = ws.0.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("real2.txt"), "keep2").unwrap();
         ensure_repo(&ws.0).unwrap();
         let repo = Repository::open(&ws.0).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         assert!(tree.get_path(Path::new("real.txt")).is_ok(), "正常文件入库");
+        assert!(
+            tree.get_path(Path::new("sub/real2.txt")).is_ok(),
+            "嵌套目录内非忽略文件入库"
+        );
         assert!(
             tree.get_path(Path::new("sessions.json")).is_err(),
             "运行时文件被排除"
