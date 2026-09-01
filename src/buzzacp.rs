@@ -22,6 +22,10 @@ use std::process::Stdio;
 /// （同 agent.rs::kill_agent_tree 立的规矩）。
 pub struct BuzzAcpProcess {
     child: tokio::process::Child,
+    /// 仅 unix 的 killpg 路径读（Drop / kill_tree 都在 cfg(unix) 内）；Windows 下
+    /// 不读但保留字段（跨平台构造点单一，不为 Windows 拆两套）。
+    /// 不加这条会挂 Windows CI：`field pid is never read` 被 -D warnings 拦。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
 }
 
