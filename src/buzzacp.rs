@@ -8,23 +8,28 @@
 //! 身份密钥，身份装配守 I1 fail-closed，见 service::spawn_buzz_acp）。**句柄必须
 //! 被长期持有**：Child 置 kill_on_drop(true)，drop 即 SIGKILL——service 的
 //! mini-relay-acp 巡检任务持有句柄：崩溃（非零退出）重拉，**主动退出（exit 0）
-//! 按 I5 是终态不复活**（buzz docs/remote-agents.md 五不变量）；关停随任务
-//! drop 收进程。
+//! 按 I5 是终态不复活**（buzz docs/remote-agents.md 五不变量）；**关停必须调
+//! graceful_stop()**（drop 只硬杀，会让 acp 来不及收自己的 agent 池与 flush relay）。
 
 use std::process::Stdio;
 
 /// buzz-acp 子进程管理（service spawn，bridge 只调用 publish/subscribe）。
 ///
-/// **杀整组而非单进程**（审查 #205r2）：kill_on_drop 只 SIGKILL 直接子进程，
-/// 而 buzz-acp 按设计持有 session 池（若干常驻 buzz-agent 孙进程）——单杀 acp
-/// 会留下孤儿池：旧池继续占 API 额度、并在下次 ABB 启动后与新池同时消费同一频道
-/// （重复回复）。故 unix 下自建进程组（process_group(0)），Drop 时 killpg 整组
-/// （同 agent.rs::kill_agent_tree 立的规矩）。
+/// **进程树与回收边界**（审查 #205r3 更正上一轮的失实描述）：buzz-acp 给它自己的
+/// 每个 agent 池子进程也置了 `process_group(0)`（buzz `acp.rs:523`，注释明言「让
+/// SIGKILL 不传到 harness 自己的组」）——所以 `kill(-acp_pid)` **收不到池**，池是
+/// acp 自己在**协作式关停**里逐组收的（`AcpClient::shutdown` → `kill_process_group`
+/// 每个池 pid，acp.rs:422-431），而那条路径只在它收到 **SIGTERM** 时才跑。结论：
+/// - 关停必须走 [`BuzzAcpProcess::graceful_stop`]（SIGTERM → 等它自己排水收池 →
+///   超时才硬杀）。**不能只靠 drop**：drop 序里 `kill_on_drop` 会立刻 SIGKILL，
+///   同拍发出的 SIGTERM 根本来不及被它的 tokio 信号处理器处理。
+/// - acp 崩溃/被硬杀时：池收不到 acp 的清理，只能靠 stdin EOF 自退——我们的
+///   `reap` 无法代杀（不掌握池 pid），残留风险记 #206。
 pub struct BuzzAcpProcess {
     child: tokio::process::Child,
-    /// 仅 unix 的 killpg 路径读（Drop / kill_tree 都在 cfg(unix) 内）；Windows 下
-    /// 不读但保留字段（跨平台构造点单一，不为 Windows 拆两套）。
-    /// 不加这条会挂 Windows CI：`field pid is never read` 被 -D warnings 拦。
+    /// 仅 unix 的 graceful_stop 发信号用；Windows 下不读但保留字段（跨平台构造点
+    /// 单一，不为 Windows 拆两套）。不加 cfg_attr 会挂 Windows CI：
+    /// `field pid is never read` 被 -D warnings 拦（本机 macOS 门禁看不到，0a3acd9）。
     #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
 }
@@ -59,7 +64,7 @@ pub fn acp_env(
 
 impl BuzzAcpProcess {
     /// 拉起 buzz-acp。relay_url 指向 ABB 的 mini-relay；agent_owner = 桥身份公钥
-    /// （见 [`acp_env`] 的门控说明）。unix 下自建进程组，Drop 杀整组（见类型注释）。
+    /// （见 [`acp_env`] 的门控说明）。
     pub fn spawn(
         exe: &str,
         relay_url: &str,
@@ -71,9 +76,10 @@ impl BuzzAcpProcess {
         for (k, v) in acp_env(relay_url, private_key, agent_command, agent_owner) {
             cmd.env(k, v);
         }
-        // 自建进程组：让 Drop 的 killpg(-pid) 能连带收掉 acp 的 buzz-agent 池。
-        // Windows 无此语义（杀树需 toolhelp 快照，本仓 winproc 那套是为 CLI spawn
-        // 建的），暂由 kill_on_drop 兜直接子进程——孤儿池风险记入 #206。
+        // 自成进程组的实际作用（更正上一版注释）：**不是**「让我们 killpg 能连带收
+        // 池」——池各在自己的组里（acp 自己置的），只能由 acp 协作式关停来收。这里
+        // 置组是让 acp 成为组长，从而按 pid 精确发 SIGTERM 可达，且 ABB 收到的组信号
+        // （开发期 Ctrl+C / 对 ABB 的 killpg）不会顺带误杀它。
         #[cfg(unix)]
         cmd.process_group(0);
         let child = cmd
@@ -93,46 +99,35 @@ impl BuzzAcpProcess {
         self.child.wait().await
     }
 
-    /// 硬收整组（崩溃重拉前调用）：SIGTERM → 最长 2s → SIGKILL，然后 reap。
-    /// 用在「旧实例已崩溃但它的 agent 池可能还在」的场合——不先清干净就重拉，
-    /// 新旧两池会同时消费同一频道（重复回复）。关停路径不用它（同步上下文不能
-    /// 阻塞 2s，见 Drop 注释；交由 kill_on_drop + SIGTERM 组播）。
-    pub async fn kill_tree(mut self) {
-        #[cfg(unix)]
-        {
-            if let Some(pid) = self.pid {
-                unsafe {
-                    let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-                }
-                // 给 acp 一次走「stdio 关闭 → 会话终止」的机会（与 agent.rs 同款预算）
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                unsafe {
-                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-        }
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
-    }
-}
-
-/// 句柄消亡即收进程组。信号选择（审查 #205r3）：**Drop 里只能发 SIGTERM**——
-/// kill_on_drop 仍会对直接子进程补 SIGKILL，而组内的 buzz-acp/buzz-agent 需要
-/// 走完「关 stdio → acp 会话终止」的自退路径；在 Drop（同步、可能正处于优雅关停）
-/// 里做 2s 两段等待会拖住 shutdown_wait，直接 SIGKILL 又会把 acp 主动 shutdown
-/// 时正在 flush 的 relay 尾部事件打断、且违反其 SIGTERM→排空→SIGKILL 惯例。
-/// 需要硬保证的先走 [`BuzzAcpProcess::kill_tree`]（崩溃重拉路径，异步可等）。
-impl Drop for BuzzAcpProcess {
-    fn drop(&mut self) {
+    /// 优雅关停（关停路径专用，审查 #205r3）：SIGTERM 给 acp → 给它 `grace` 走完
+    /// 「flush relay 尾部事件 → 逐组收自己的 agent 池 → 退出」→ 超时才 SIGKILL 兜底。
+    /// 只 drop 句柄拿不到这个效果（kill_on_drop 的同拍 SIGKILL 会让它的 SIGTERM
+    /// 处理器根本没机会跑），所以关停必须显式调本方法。
+    pub async fn graceful_stop(mut self, grace: std::time::Duration) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
-            // SAFETY: kill(-pgid, SIGTERM) 只作用于本类型 spawn 时用 process_group(0)
-            // 自建的进程组；无内存解引用，参数均为合法整数。pid 复用窗口与
-            // agent.rs::kill_agent_tree 同款权衡。
+            // SAFETY: 只对本类型 spawn 出的子进程 pid 发信号（process_group(0) 使
+            // acp 自成组长，池在其自己的组里、收不到也伤不到）；无内存解引用。
             unsafe {
-                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                let _ = libc::kill(pid as i32, libc::SIGTERM);
             }
         }
+        // 等它自己收干净；超时才硬杀（服务期常态等待不设总期限，这里是关停预算，
+        // 有界是正确形态——见 RULE：关闭路径才允许期限）
+        if tokio::time::timeout(grace, self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+        }
+    }
+
+    /// 收割已退出的句柄（崩溃重拉前）：acp 已经死了，只剩 reap 防僵尸。
+    /// 注意**不要**在这里等 2s 或 killpg——上一版那么写的理由是「清整组防留池」，
+    /// 实为不成立（见类型注释：池各在自己的组里，acp 崩溃时也无法代杀）。
+    pub async fn reap(mut self) {
+        let _ = self.child.wait().await;
     }
 }
 

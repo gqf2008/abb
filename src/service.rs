@@ -235,16 +235,21 @@ pub async fn run() {
                             backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
                             continue;
                         };
-                        // 拉起成功 → 退避复位（后续再失败从 2s 重新起算）
-                        backoff = std::time::Duration::from_secs(2);
+                        let started = tokio::time::Instant::now();
                         // 等退出或关停（服务期常态等待，不设总期限）
                         let exited = tokio::select! {
                             r = acp.wait() => Some(r),
                             _ = stop.cancelled() => None,
                         };
                         match exited {
-                            // 关停：acp 随作用域结束 drop → 杀进程组（含 agent 池）
-                            None => break,
+                            // 关停：**必须显式 graceful_stop**（SIGTERM → 等 acp 自己
+                            // flush relay + 逐组收 agent 池，5s 预算内）——只让句柄
+                            // drop 等于同拍 SIGKILL，acp 的 SIGTERM 处理器来不及跑，
+                            // 池会残留到 stdin EOF 才自退（审查 #205r3）。
+                            None => {
+                                acp.graceful_stop(std::time::Duration::from_secs(5)).await;
+                                break;
+                            }
                             // exit 0 = 主动停止 → I5 终态，绝不自动复活
                             Some(Ok(st)) if st.success() => {
                                 crate::log!(
@@ -252,17 +257,22 @@ pub async fn run() {
                                 );
                                 terminal = true;
                             }
-                            // 崩溃/等待失败 → **先硬收整组**（旧 acp 的 agent 池可能
-                            // 还活着，不清就重拉会让新旧两池同时消费同一频道 = 重复
-                            // 回复），再退避重拉。关停路径不做这 2s（见 Drop 注释）。
+                            // 崩溃/等待失败 → reap（acp 已死，只剩防僵尸）后退避重拉
                             _ => {
-                                crate::log!("[mini-relay] ⚠️ buzz-acp 退出异常，清整组后重拉");
-                                acp.kill_tree().await;
+                                crate::log!("[mini-relay] ⚠️ buzz-acp 异常退出，退避后重拉");
+                                acp.reap().await;
                                 if interruptible_sleep(backoff, &stop).await {
                                     break;
                                 }
                                 backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
                             }
+                        }
+                        // 退避复位条件（审查 #205r3）：**存活够久**才算「环境是好的」
+                        // 才复位。原实现在 spawn 系统调用成功即复位 → 「装上但必快崩」
+                        // 的机器上 backoff 永远被抹回 2s（每 ~4s 一轮 + 一行日志永刷，
+                        // 注释承诺的 2s→300s 封顶根本不生效）。
+                        if started.elapsed() >= std::time::Duration::from_secs(60) {
+                            backoff = std::time::Duration::from_secs(2);
                         }
                     }
                 }

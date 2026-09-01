@@ -157,7 +157,11 @@ impl Bridge {
             // 的任务」不诚实（dispatch 即返回、回复异步回流，桥侧没有同步轮次记账，
             // 也无打断协议）——只陈述「不支持打断」这个能力事实，不断言有没有轮次在跑
             //（审查 #205r2）。
-            let msg = if Backend::parse(&self.default_backend).is_buzz() {
+            // 口径必须与 dispatch 一致（per-bot effective_backend，不是全局默认）——
+            // 否则 default=claude + 本 bot=buzz 时仍答「没有正在运行的任务」，正是
+            // 这条文案要消除的不诚实（审查 #205r3）。
+            let msg = if Backend::parse(self.bot.effective_backend(&self.default_backend)).is_buzz()
+            {
                 "⏳ buzz 后端的一轮对话不支持中途打断（session/prompt 原子执行）；若有轮次在跑，等它回复即可继续。"
             } else {
                 "✅ 当前没有正在运行的任务。"

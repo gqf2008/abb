@@ -417,7 +417,8 @@ mod tests {
                 .unwrap()
         };
 
-        // ① 陌生人签的 kind-9：可入库，但绝不投递到聊天（伪造 bot 回复的闸门）
+        // ① 陌生人签的 kind-9：**准入层就拒**（连库都不进，见 admit）；即便绕过也
+        //    绝不投递——两层防御各管一层，都不许漏（审查 #205r3 更正本注释）
         state
             .ingest(&kind9(&stranger, "冒充 bot 的伪造回复", "chan-1"))
             .await;
@@ -549,9 +550,9 @@ impl EventStore {
     /// 哈希决定（created_at 固定），群改名/取消登记后旧 39000/39002 行会永存，而
     /// buzz-acp 的 merge_discovered_channels 对同 #d 多行无 created_at 决胜
     /// （都=1）→ 旧名可能胜出。清后重发使库状态恒等于当前登记表（审查 #205r2）。
-    pub async fn delete_where(&self, kinds: &[u16], pubkey: &str) -> u64 {
+    pub async fn delete_where(&self, kinds: &[u16], pubkey: &str) -> Result<u64, String> {
         if kinds.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let placeholders = vec!["?"; kinds.len()].join(",");
         let sql = format!("DELETE FROM events WHERE kind IN ({placeholders}) AND pubkey = ?");
@@ -563,7 +564,7 @@ impl EventStore {
         self.conn
             .execute(&sql, turso::params_from_iter(params))
             .await
-            .unwrap_or(0)
+            .map_err(|e| format!("DELETE kinds={kinds:?} pubkey={pubkey}: {e}"))
     }
 
     /// 按 filter 集合查事件（NIP-01 多 filter OR 语义；h_tag/kind 走索引，
@@ -793,7 +794,11 @@ impl RelayState {
         // 清同 (kinds, 桥 pubkey) 的旧行不会影响 agent 的 kind-9 回复，且让改名与
         // 取消登记的频道不再留残行。
         let bridge_pk = self.bridge_keys.public_key().to_hex();
-        self.db.delete_where(&[39000, 39002], &bridge_pk).await;
+        // 清理失败必须可见：吞掉错误的话，旧名的 39000 会继续在 discover_channels
+        // 里胜出——那正是本函数要修的场景（审查 #205r3）。
+        if let Err(e) = self.db.delete_where(&[39000, 39002], &bridge_pk).await {
+            crate::log!("[mini-relay] ⚠️ 旧种子事件清理失败: {e}（频道资料可能残留旧名）");
+        }
         // 先克隆（不持 RwLock 跨 await——RwLockReadGuard 非 Send）
         let channels: Vec<Channel> = self.channels.read().unwrap().values().cloned().collect();
         let agent_pk = if self.agent_pubkey.is_empty() {
@@ -849,6 +854,11 @@ impl RelayState {
     /// - 20001/20002（presence/typing）：瞬时事件——只 fan-out 不入库（NIP-01
     ///   ephemeral 语义；入库会在 REQ 回放时把陈旧在线态当历史喂回去）。
     /// - 其余（含 22242 auth：只属于 WS 握手路径）：拒。
+    ///
+    /// 白名单的已知缺口：**kind 24200（buzz-acp 的 observer frame，它按 durable 经
+    /// WS EVENT 发）** 现会被拒——ABB 未配 `relay_observer`（buzz-acp 默认 off）故
+    /// 零影响，且 OK-false 不引发重投活锁。日后接 observer 视图（#206）必须把它加
+    /// 进白名单，别当成「消费矩阵已核全」。
     fn admit(&self, e: &Event) -> Admit {
         let author = e.pubkey.to_hex();
         let bridge = self.bridge_keys.public_key().to_hex();
