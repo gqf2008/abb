@@ -15,9 +15,10 @@
 //! 5. **空目录清理**：结构目录（history/ sessions/ summaries/ .pi-sessions/ 等）永不
 //!    清理，即使为空。
 //!
-//! 整理完成后 git 留痕（[`git_commit`]）：存在 .git 复用、无则 init；.gitignore 排除
-//! 运行时文件（history/、会话文件、sessions.json 等逐日 churn 的）——删除/截断/归档
-//! 都被 `git add -A` 记录，整理痕迹有历史可回退。git 不可用 → 降级纯整理 + 日志警告。
+//! 整理完成后 git 留痕（[`git_commit`]，#209 批次 3 起内置 libgit2）：无 .git 自动
+//! init、.gitignore 排除运行时文件（history/、会话文件、sessions.json 等逐日 churn
+//! 的，清单单一事实源在 wsver）——删除/截断/归档都被 add -A 记录，整理痕迹有历史
+//! 可回退。libgit2 失败 → 降级纯整理 + 日志警告（不再有「git 未安装」场景）。
 //!
 //! 安全：只操作 workspace 内路径，`~/.claude` 等后端私有目录物理不可达；guard 名单
 //! 不覆盖 archive/——归档文件从不进入任何 prompt 注入面，无提权路径（受限会话写
@@ -63,15 +64,14 @@ pub struct TidyReport {
     pub emptied_dirs: usize,
 }
 
-/// git 留痕结果。
+/// git 留痕结果（#209 批次 3 起：迁移 libgit2 后无「git 未安装」跳过路径，
+/// 失败直接走 Err）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum GitOutcome {
     /// 已提交（携带短 hash）。
     Committed(String),
     /// 无变更，不产生空 commit。
     NothingToCommit,
-    /// 跳过（git 不可用等），reason 供日志。
-    Skipped(String),
 }
 
 /// 一轮整理：孤儿会话文件 → 临时文件 → 历史截断 → 文档归档 → 空目录。
@@ -343,125 +343,24 @@ fn trunc(s: &str) -> String {
         .collect()
 }
 
-/// git 留痕（独立薄函数，与 tidy 核心解耦）：init/reuse → add -A → 有变更才 commit。
-/// 60s 超时保护（大仓库 add 可能慢）；git 不可用返回 [`GitOutcome::Skipped`]，
-/// 调用方降级为纯整理 + 日志警告。身份用 `-c` 内联（不触碰全局 git config）。
+/// git 留痕（独立薄函数，与 tidy 核心解耦）。#209 批次 3：外部系统 git 子进程
+/// → 内置 libgit2（wsver）——init/ignore 合并/add -A/有变更才 commit 全进程内，
+/// 无 git 二进制依赖、无子进程可挂（原 60s 超时保护随之取消）；身份内置
+/// `ABB <abb@agent-bridge.local>`，不触碰全局 git config。同步 C 调用首轮大仓库
+/// add 可能秒级，spawn_blocking 让出 tokio worker。失败返回 Err（libgit2 真实
+/// 错误），调用方降级为纯整理 + 日志警告。
 pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
-    // 每步 git 命令统一 60s 超时 + kill_on_drop：git 挂住（大仓库 add、网络盘）不能
-    // 卡死整理循环（spawn_forever 任务，关停要等它退）；超时则杀掉子进程返回跳过。
-    async fn git(workspace: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(args)
-            .current_dir(workspace)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        // Windows：每日整理 spawn git.exe 也抑制控制台窗口（#104），
-        // 否则每天 git init/add/commit 都会闪一个黑框。
-        #[cfg(windows)]
-        {
-            crate::deps::apply_no_window_tokio(&mut cmd);
+    let ws = workspace.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::wsver::ensure_repo(&ws)?;
+        match crate::wsver::snapshot(&ws, "每日整理")? {
+            Some(h) => Ok(GitOutcome::Committed(h)),
+            None => Ok(GitOutcome::NothingToCommit),
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
-            Ok(Ok(o)) => Ok(o),
-            Ok(Err(e)) => Err(format!("git {} 启动失败：{e}", args.join(" "))),
-            Err(_) => Err(format!("git {} 超时（60s）", args.join(" "))),
-        }
-    }
-    // 1. git 可用性
-    match git(workspace, &["--version"]).await {
-        Err(r) => return Ok(GitOutcome::Skipped(r)),
-        Ok(out) if !out.status.success() => {
-            return Ok(GitOutcome::Skipped(format!(
-                "git --version 失败：{}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )))
-        }
-        Ok(_) => {}
-    }
-    // 2. 无 .git → init（用户已有仓库复用，不重复 init）
-    if !workspace.join(".git").exists() {
-        match git(workspace, &["init"]).await {
-            Err(r) => return Ok(GitOutcome::Skipped(r)),
-            Ok(out) if !out.status.success() => {
-                return Ok(GitOutcome::Skipped(format!(
-                    "git init 失败：{}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )))
-            }
-            Ok(_) => {}
-        }
-    }
-    // 2b. 确保运行时文件排除写进 .gitignore——**无论仓库/ignore 是否已存在**：用户
-    // 已有 .gitignore 时漏了这些排除，git add -A 会把会话历史/槽位/GRANTED.md 等
-    // 运行时文件提交进 git（历史含对话全文、GRANTED.md 含授权者名单——隐私外泄，
-    // 审查修复）。清单与合并逻辑单一事实源在 wsver（#209，启动 init/删除快照共用）；
-    // 幂等：只追加缺失行，不覆盖用户内容。
-    {
-        match crate::wsver::merge_gitignore(workspace) {
-            Ok(_) => {}
-            Err(e) => {
-                // 写失败（只读目录/权限）→ 运行时文件可能被 add -A 提交，降级为不提交
-                // 任何内容（隐私优先，宁不留痕不可外泄——审查修复）
-                crate::log!("[tidy] ⚠️ 追加 .gitignore 失败（{}）：跳过本轮 git 留痕", e);
-                return Ok(GitOutcome::Skipped(
-                    "运行时文件排除写入失败，跳过 git 留痕".into(),
-                ));
-            }
-        }
-    }
-    // 3. add -A（删除/截断/归档全被 stage）
-    match git(workspace, &["add", "-A"]).await {
-        Err(r) => return Ok(GitOutcome::Skipped(r)),
-        Ok(out) if !out.status.success() => {
-            return Ok(GitOutcome::Skipped(format!(
-                "git add 失败：{}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )))
-        }
-        Ok(_) => {}
-    }
-    // 4. 无变更 → 不产生空 commit（读不到/超时 → 保守继续 commit）
-    match git(workspace, &["diff", "--cached", "--quiet"]).await {
-        Ok(out) if out.status.success() => return Ok(GitOutcome::NothingToCommit),
-        _ => {}
-    }
-    // 5. commit（内联身份，不依赖用户 git config）
-    let msg = format!("[abb] 每日整理 {}", crate::chrono_lite::now());
-    match git(
-        workspace,
-        &[
-            "-c",
-            "user.name=ABB",
-            "-c",
-            "user.email=abb@agent-bridge.local",
-            "commit",
-            "-m",
-            &msg,
-        ],
-    )
+    })
     .await
-    {
-        Err(r) => return Ok(GitOutcome::Skipped(r)),
-        Ok(out) if !out.status.success() => {
-            return Ok(GitOutcome::Skipped(format!(
-                "git commit 失败：{}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )))
-        }
-        Ok(_) => {}
-    }
-    // 6. 短 hash 回执
-    let hash = match git(workspace, &["rev-parse", "--short", "HEAD"]).await {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => String::new(),
-    };
-    Ok(GitOutcome::Committed(hash))
+    .map_err(|e| format!("join 失败：{e}"))?
 }
-
-// 运行时文件排除清单已收敛到 wsver::GITIGNORE（#209 单一事实源：启动 init /
-// 删除快照 / 每日整理三处共用，防清单漂移）；本函数仍走外部系统 git，迁移到
-// libgit2 见 #209 批次 3。
 
 #[cfg(test)]
 mod tests {
@@ -772,16 +671,34 @@ mod tests {
         }
         let ws = temp_ws("git");
         std::fs::create_dir_all(&ws).unwrap();
-        // 首轮：init + 归档内容 → commit
+        // 首轮：init + 基线——已有文件（notes.md v1）随基线入库，本轮无新增变更。
+        // #209 批次 3：libgit2 语义 = 基线承载 init 时已存在的内容。
         std::fs::write(ws.join("notes.md"), "v1").unwrap();
-        match git_commit(&ws).await {
-            Ok(GitOutcome::Committed(h)) => {
-                assert!(!h.is_empty(), "有短 hash");
-            }
-            other => panic!("首轮应 commit，实际 {other:?}"),
-        }
+        assert_eq!(
+            git_commit(&ws).await.unwrap(),
+            GitOutcome::NothingToCommit,
+            "首轮已有文件由基线承载"
+        );
         assert!(ws.join(".git").exists(), "git init 完成");
         assert!(ws.join(".gitignore").exists(), ".gitignore 写入");
+        // 基线确实包含 notes.md v1（恢复能力不因基线承接而缺失）
+        {
+            let repo = git2::Repository::open(&ws).unwrap();
+            let blob = repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(Path::new("notes.md"))
+                .unwrap()
+                .to_object(&repo)
+                .unwrap()
+                .peel_to_blob()
+                .unwrap();
+            assert_eq!(std::str::from_utf8(blob.content()).unwrap(), "v1");
+        }
         // 二轮：无变更 → NothingToCommit，commit 数不增
         assert_eq!(
             git_commit(&ws).await.unwrap(),
@@ -813,6 +730,58 @@ mod tests {
             .unwrap();
         let tracked = String::from_utf8_lossy(&tracked.stdout).to_string();
         assert!(!tracked.contains("sessions.json"), "运行时文件被排除");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn git_commit_libgit2_leaves_clean_status() {
+        // 验收（#209 批次 3）：外部 git → libgit2 迁移行为等价——快照落库后
+        // `git status --porcelain` 为空（工作树与 HEAD 零 diff：add -A 完备、
+        // ignore 齐全），且正常文件入库、churn 不入库。系统 git 仅作 cross-check
+        // 读侧（不可用则跳过——被测路径本身不依赖它）。
+        if tokio::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("环境无 git，跳过 cross-check");
+            return;
+        }
+        let ws = temp_ws("equiv");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.md"), "v1").unwrap();
+        std::fs::write(ws.join("sessions.json"), "{}").unwrap();
+        std::fs::create_dir_all(ws.join("history")).unwrap();
+        std::fs::write(ws.join("history/chat.log"), "对话全文").unwrap();
+        // 首轮：已有内容由基线承载（结果不区分基线/快照，验收看落库后的树）
+        let _ = git_commit(&ws).await.unwrap();
+        // 再改内容 → 本轮快照真正产生新 commit（等价性：外部 git 视角 diff 为空）
+        std::fs::write(ws.join("notes.md"), "v2").unwrap();
+        assert!(matches!(
+            git_commit(&ws).await.unwrap(),
+            GitOutcome::Committed(_)
+        ));
+        let status = tokio::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&ws)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "快照后系统 git status 应干净（diff 为空）"
+        );
+        let tracked = tokio::process::Command::new("git")
+            .args(["ls-files"])
+            .current_dir(&ws)
+            .output()
+            .await
+            .unwrap();
+        let tracked = String::from_utf8_lossy(&tracked.stdout).to_string();
+        assert!(tracked.contains("notes.md"), "正常文件入库");
+        assert!(!tracked.contains("sessions.json"), "churn 不入库");
+        assert!(!tracked.contains("history/"), "隐私不入库");
         std::fs::remove_dir_all(&ws).ok();
     }
 

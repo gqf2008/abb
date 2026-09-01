@@ -347,6 +347,15 @@ fn main() {
         std::process::exit(run_trash_cli(&args[2..]));
     }
 
+    // 工作区版本管理 CLI（#209 批次 4/5）：快照历史 / 按快照恢复 / 保护状态一览。
+    //   agent-bridge wsver log [--bot <key>] [-n 10]
+    //   agent-bridge wsver restore <commit> <path> [--bot <key>]
+    //   agent-bridge wsver status [--bot <key>]
+    // bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析（同 trash）。
+    if args.len() >= 2 && args[1] == "wsver" {
+        std::process::exit(run_wsver_cli(&args[2..]));
+    }
+
     // 一键创建团队 CLI（#100，P0）：LLM 按提示词生成团队方案（预览确认对象）。
     //   agent-bridge team generate "<团队目标>" [--members "小王,steven"] [--backend codex] [--template 软件产品团队]
     // 输出：校验后的团队方案 JSON（stdout），供上层预览确认/建群。
@@ -932,6 +941,105 @@ fn session_reset_chat_id(args: &[String], env_chat: &str) -> Result<String, Stri
     Err("缺 chat_id：agent-bridge session reset <chat_id>（或用 AGENT_BRIDGE_CHAT_ID env）".into())
 }
 
+/// 工作区版本管理 CLI（#209 批次 4/5）：快照历史 / 按快照恢复 / 保护状态一览。
+/// bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析（同 trash）。
+fn run_wsver_cli(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("用法：agent-bridge wsver log|restore <commit> <path>|status [--bot <key>]");
+        return 2;
+    };
+    let bot_key = match trash_bot_key(args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let workspace = crate::workspace_dir(&bot_key);
+    match sub {
+        "log" => {
+            // -n <N>：条数（默认 10）
+            let limit = args
+                .iter()
+                .position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(10);
+            match crate::wsver::log(&workspace, limit) {
+                Ok(entries) if entries.is_empty() => {
+                    println!("无快照（bot 下次启动自动 init 工作区仓库）");
+                    0
+                }
+                Ok(entries) => {
+                    println!("工作区 {bot_key} 快照历史（新→旧）：");
+                    for (h, t, msg) in entries {
+                        println!("{h} | {t} | {msg}");
+                    }
+                    println!("恢复：agent-bridge wsver restore <hash> <路径>");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+        "restore" => {
+            let (rev, path) = match (args.get(1), args.get(2)) {
+                (Some(r), Some(p)) => (r.as_str(), p.as_str()),
+                _ => {
+                    eprintln!(
+                        "用法：agent-bridge wsver restore <commit> <path> [--bot <key>]\n（路径为工作区内相对路径；先自动打「恢复前快照」，恢复错了还能退回）"
+                    );
+                    return 2;
+                }
+            };
+            match crate::wsver::restore_path(&workspace, rev, path) {
+                Ok(n) => {
+                    println!("已从快照 {rev} 恢复 {path}（{n} 个文件）；恢复前状态已自动快照（wsver log 查看）");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+        "status" => {
+            let git_enabled = crate::config::Config::load()
+                .map(|c| c.workspace_git_enabled)
+                .unwrap_or(true);
+            let s = crate::wsver::repo_status(&workspace);
+            println!(
+                "工作区版本管理：{}",
+                if git_enabled {
+                    "已启用"
+                } else {
+                    "已关闭（config workspace_git_enabled）"
+                }
+            );
+            if !s.has_repo {
+                println!("仓库：无（启用状态下 bot 下次启动自动 init）");
+            } else {
+                println!(
+                    "仓库：有（HEAD {}，共 {} 个快照）",
+                    s.head.as_deref().unwrap_or("(空仓)"),
+                    s.commit_count
+                );
+            }
+            println!(
+                "回收站：{} 条（/trash list 查看）",
+                crate::trash::list(&workspace).len()
+            );
+            0
+        }
+        other => {
+            eprintln!("未知 wsver 子命令：{other}");
+            2
+        }
+    }
+}
+
 /// trash CLI 入口（#88 删除保护回收站）。bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析。
 fn run_trash_cli(args: &[String]) -> i32 {
     let Some(sub) = args.first().map(|s| s.as_str()) else {
@@ -957,14 +1065,20 @@ fn run_trash_cli(args: &[String]) -> i32 {
                 for it in &items {
                     let days_ago =
                         crate::chrono_lite::unix_secs().saturating_sub(it.trashed_at) / 86400;
+                    // 恢复点列（批次 5）：git:<hash> = 快照可恢复；git:- = 仅回收站
+                    let snap = match &it.snapshot {
+                        Some(h) => format!("git:{h}"),
+                        None => "git:-".to_string(),
+                    };
                     println!(
-                        "{} | {} | {} MB | {} 天前 | {}{}",
+                        "{} | {} | {} MB | {} 天前 | {}{} | {}",
                         it.id,
                         crate::trash::pretty_path(std::path::Path::new(&it.orig)),
                         it.size / (1024 * 1024),
                         days_ago,
                         it.reason,
-                        if it.dangerous { " | ⚠️危险" } else { "" }
+                        if it.dangerous { " | ⚠️危险" } else { "" },
+                        snap
                     );
                 }
             }
@@ -1002,7 +1116,7 @@ fn run_trash_cli(args: &[String]) -> i32 {
                 crate::trash::purge_expired(&workspace, settings.ttl_days)
             };
             println!(
-                "已清理回收站条目 {} 条{}",
+                "已永久清理回收站条目 {} 条{}（不可恢复；git 快照中的历史版本不受影响）",
                 n,
                 if all { "（全部）" } else { "（过期）" }
             );
@@ -1016,8 +1130,13 @@ fn run_trash_cli(args: &[String]) -> i32 {
             }
             match crate::guard::confirm_dangerous_delete(&bot_key, &workspace, path) {
                 Ok(it) => {
+                    // 批次 5：如实展示恢复路径（快照恢复点 / 仅回收站）
+                    let prot = match it.snapshot.as_deref() {
+                        Some(h) => format!("git 恢复点 {h}"),
+                        None => "git 快照未启用/失败，仅回收站".to_string(),
+                    };
                     println!(
-                        "已确认并移入回收站：{}（{} 天内可恢复）",
+                        "已确认并移入回收站：{}（{} 天内可恢复，{prot}）",
                         it.orig, settings.ttl_days
                     );
                     0
