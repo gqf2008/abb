@@ -51,6 +51,10 @@ pub struct TrashItem {
     pub dangerous: bool,
     /// 拦截说明（hook 决策 reason 摘要，供列表展示）。
     pub reason: String,
+    /// git 恢复点（#209 批次 5：删除前快照的短 hash）。开关关闭/留痕失败 = None，
+    /// 此时该条目仅回收站可恢复——列表/删除回执须如实展示。
+    #[serde(default)]
+    pub snapshot: Option<String>,
 }
 
 /// 删除保护设置（从 BotConfig 收敛，guard-check / CLI / service 共用一套默认）。
@@ -335,12 +339,12 @@ fn rand_suffix() -> String {
 ///   存量工作区也能在此补上）
 /// - init/快照失败 → Err（删除保护不因留痕失败而失效，调用方降级）
 /// - `git_enabled`（config.workspace_git_enabled，经 TrashSettings 注入）关闭 →
-///   Ok(false) 跳过，完全不 init、不写已有仓库
+///   Ok(None) 跳过，完全不 init、不写已有仓库
 ///
-/// 返回是否产生了新 commit（供日志）。
-pub fn git_snapshot_sync(workspace: &Path, git_enabled: bool) -> Result<bool, String> {
+/// 返回恢复点（新 commit 的短 hash；None = 未产生新 commit，供日志/清单）。
+pub fn git_snapshot_sync(workspace: &Path, git_enabled: bool) -> Result<Option<String>, String> {
     if !git_enabled {
-        return Ok(false);
+        return Ok(None);
     }
     crate::wsver::snapshot_lazy(workspace, "删除前快照")
 }
@@ -364,15 +368,19 @@ pub fn move_to_trash(
     // libgit2，工作区无 .git 自动 init，不依赖系统 git；best-effort——留痕失败不
     // 阻断删除保护。.trash/ 由 .gitignore 排除，回收站本体不入库（恢复走清单
     // restore/purge）。确有删除对象才快照（全为不存在/越界路径时，不为空工作区
-    // 建库打基线）。
+    // 建库打基线）。恢复点短 hash 记入清单条目（批次 5：保护状态可见）。
     let has_target = paths.iter().any(|p| {
         let abs = absolutize(workspace, p);
         abs.exists() && contained_in(workspace, &abs)
     });
+    let mut snapshot_hash: Option<String> = None;
     if has_target {
         match git_snapshot_sync(workspace, settings.git_enabled) {
-            Ok(true) => crate::log!("[trash] git 删除前快照完成（可从快照恢复）"),
-            Ok(false) => {}
+            Ok(Some(h)) => {
+                crate::log!("[trash] git 删除前快照完成（恢复点 {h}）");
+                snapshot_hash = Some(h); // 批次 5：记入清单条目
+            }
+            Ok(None) => {}
             Err(e) => {
                 // #105 联动：留痕失败静默降级（不阻断删除保护），日志留痕便于
                 // 排查「留痕为什么没生效」。
@@ -427,6 +435,7 @@ pub fn move_to_trash(
             size: c.size,
             dangerous: c.dangerous,
             reason: reason.to_string(),
+            snapshot: snapshot_hash.clone(),
         });
         moved.push(TrashItem {
             id,
@@ -435,6 +444,7 @@ pub fn move_to_trash(
             size: c.size,
             dangerous: c.dangerous,
             reason: reason.to_string(),
+            snapshot: snapshot_hash.clone(),
         });
     }
     save_manifest(workspace, &items).map_err(|e| format!("回收站清单写入失败：{e}"))?;
@@ -698,8 +708,21 @@ mod tests {
         let ws = temp_ws();
         let s = TrashSettings::defaults();
         std::fs::write(ws.join("doc.md"), "误删前内容\n").unwrap();
-        move_to_trash(&ws, &[PathBuf::from("doc.md")], &s, "误删").unwrap();
+        let moved = move_to_trash(&ws, &[PathBuf::from("doc.md")], &s, "误删").unwrap();
         assert!(!ws.join("doc.md").exists(), "文件已移入回收站");
+        // 恢复点记入清单条目（批次 5）：短 hash，且与 HEAD 一致
+        assert_eq!(
+            moved[0].snapshot.as_deref().map(str::len),
+            Some(7),
+            "条目带恢复点"
+        );
+        let repo = git2::Repository::open(&ws).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(
+            moved[0].snapshot.as_deref(),
+            Some(&head.id().to_string()[..7]),
+            "恢复点 = HEAD 短 hash"
+        );
         // 快照先于移动：HEAD 就是被删内容的恢复点
         let repo = git2::Repository::open(&ws).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
@@ -735,7 +758,10 @@ mod tests {
         let moved = move_to_trash(&ws, &[PathBuf::from("x.txt")], &s, "t").unwrap();
         assert_eq!(moved.len(), 1, "删除保护本体正常工作");
         assert!(!ws.join(".git").exists(), "开关关闭不得创建 .git");
-        assert!(!git_snapshot_sync(&ws, false).unwrap(), "关闭 → Ok(false)");
+        assert!(
+            git_snapshot_sync(&ws, false).unwrap().is_none(),
+            "关闭 → Ok(None)"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 

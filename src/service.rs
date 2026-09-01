@@ -952,15 +952,18 @@ async fn run_bot(
                     report.archived,
                     report.emptied_dirs
                 );
-                match crate::tidy::git_commit(&workspace).await {
+                match crate::tidy::git_commit(&workspace, cfg.workspace_git_enabled).await {
                     Ok(crate::tidy::GitOutcome::Committed(h)) => {
                         crate::log!("[tidy:{key}] git 留痕 commit {h}")
                     }
                     Ok(crate::tidy::GitOutcome::NothingToCommit) => {
                         crate::log!("[tidy:{key}] git 无变更")
                     }
-                    Ok(crate::tidy::GitOutcome::Skipped(r)) | Err(r) => {
-                        crate::log!("[tidy:{key}] ⚠️ git 留痕跳过：{r}")
+                    Ok(crate::tidy::GitOutcome::Skipped) => {
+                        crate::log!("[tidy:{key}] git 留痕已关闭（workspace_git_enabled），跳过")
+                    }
+                    Err(r) => {
+                        crate::log!("[tidy:{key}] ⚠️ git 留痕失败（不影响整理）：{r}")
                     }
                 }
             }
@@ -1012,16 +1015,21 @@ async fn run_bot(
                 }
                 let purged = crate::trash::purge_expired(&workspace, settings.ttl_days);
                 write_run_marker(&marker, now);
-                crate::log!("[trash-gc:{key}] 回收站 TTL 清理：过期 {} 条", purged);
+                crate::log!(
+                    "[trash-gc:{key}] 回收站 TTL 清理：过期 {} 条（永久删除，不可恢复；git 快照历史不受影响）",
+                    purged
+                );
                 if purged > 0 {
-                    // 清理也是变更：git 留痕（工作区有 .git 时；tidy::git_commit 兜底跳过）
-                    match crate::tidy::git_commit(&workspace).await {
+                    // 清理也是变更：git 留痕（开关关闭 → Skipped 静默，审查 P1-2：
+                    // 不许绕过 workspace_git_enabled 去 init/commit）
+                    match crate::tidy::git_commit(&workspace, cfg.workspace_git_enabled).await {
                         Ok(crate::tidy::GitOutcome::Committed(h)) => {
                             crate::log!("[trash-gc:{key}] git 留痕 commit {h}")
                         }
-                        Ok(crate::tidy::GitOutcome::NothingToCommit) => {}
-                        Ok(crate::tidy::GitOutcome::Skipped(r)) | Err(r) => {
-                            crate::log!("[trash-gc:{key}] ⚠️ git 留痕跳过：{r}")
+                        Ok(crate::tidy::GitOutcome::NothingToCommit)
+                        | Ok(crate::tidy::GitOutcome::Skipped) => {}
+                        Err(r) => {
+                            crate::log!("[trash-gc:{key}] ⚠️ git 留痕失败：{r}")
                         }
                     }
                 }

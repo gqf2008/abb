@@ -750,9 +750,14 @@ fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
             })
             .collect();
         return Decision::Deny(format!(
-            "危险删除已拦截：{}\n如确认删除，请在聊天中回复 /trash confirm <路径>（将移入回收站，{} 天内可恢复）",
+            "危险删除已拦截：{}\n如确认删除，请在聊天中回复 /trash confirm <路径>（确认后先打 git 快照再移入回收站，{} 天内可恢复{}）",
             reasons.join("；"),
-            settings.ttl_days
+            settings.ttl_days,
+            if settings.git_enabled {
+                String::new()
+            } else {
+                "；git 快照未启用，仅回收站保护".to_string()
+            }
         ));
     }
     // 安全删除：移入回收站 + 拒绝原命令（reason 告知 agent 已完成，无需重试）
@@ -766,8 +771,27 @@ fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
                 .iter()
                 .map(|i| crate::trash::pretty_path(std::path::Path::new(&i.orig)))
                 .collect();
+            // 批次 5（保护状态可见）：删除回执如实展示恢复路径——git 快照恢复点 /
+            // 仅回收站（开关关闭） / 快照失败（仅回收站）；忽略类路径不入快照时
+            // 明示，防「git 恢复点」过度承诺（审查 P3-2）。
+            let rels: Vec<PathBuf> = moved
+                .iter()
+                .filter_map(|i| {
+                    Path::new(&i.orig)
+                        .strip_prefix(workspace)
+                        .ok()
+                        .map(|p| p.to_path_buf())
+                })
+                .collect();
+            let refs: Vec<&Path> = rels.iter().map(|p| p.as_path()).collect();
+            let prot = crate::wsver::prot_phrase(
+                workspace,
+                moved[0].snapshot.as_deref(),
+                settings.git_enabled,
+                &refs,
+            );
             Decision::Deny(format!(
-                "已将 {} 移入回收站（{} 天内可恢复）；原删除命令被拦截，无需再次执行删除",
+                "已将 {} 移入回收站（{} 天内可恢复，{prot}）；原删除命令被拦截，无需再次执行删除",
                 names.join("，"),
                 settings.ttl_days
             ))
