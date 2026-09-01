@@ -147,8 +147,11 @@ fn untrack_ignored(repo: &Repository) -> Result<usize, String> {
     if victims.is_empty() {
         return Ok(0);
     }
-    // git_index_remove_all = `git rm --cached`：仅移出索引，工作区文件不动
-    g2r(index.remove_all(&victims, None))?;
+    // 逐条 `git rm --cached`：仅移出索引，工作区文件不动。不用 remove_all——
+    // 那是 pathspec/glob 语义，含 *?[ 的文件名会误伤其他索引项（审查 P3-1）
+    for p in &victims {
+        g2r(index.remove_path(p))?;
+    }
     g2r(index.write())?;
     Ok(victims.len())
 }
@@ -268,6 +271,11 @@ pub fn restore_path(workspace: &Path, rev: &str, rel: &str) -> Result<usize, Str
     match entry.kind() {
         Some(git2::ObjectType::Blob) => {
             let blob = g2r(obj.peel_to_blob())?;
+            // 符号链接（filemode 0o120000）：blob 内容是链接目标串而非文件内容，
+            // 直接 write 会畸变（审查 P2-2）——走忠实恢复/明确报错路径
+            if entry.filemode() & 0o170000 == 0o120000 {
+                return restore_symlink(blob.content(), &target, rel);
+            }
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("重建父目录失败：{e}"))?;
             }
@@ -294,6 +302,15 @@ fn write_tree_to(repo: &Repository, tree: &git2::Tree, dir: &Path) -> Result<usi
         match e.kind() {
             Some(git2::ObjectType::Blob) => {
                 let blob = g2r(obj.peel_to_blob())?;
+                // 符号链接畸变防护同 restore_path（审查 P2-2）
+                if e.filemode() & 0o170000 == 0o120000 {
+                    n += restore_symlink(
+                        blob.content(),
+                        &dst,
+                        &format!("{}/{}", dir.display(), name),
+                    )?;
+                    continue;
+                }
                 std::fs::write(&dst, blob.content())
                     .map_err(|e| format!("写回 {name} 失败：{e}"))?;
                 apply_filemode(&dst, e.filemode());
@@ -306,6 +323,27 @@ fn write_tree_to(repo: &Repository, tree: &git2::Tree, dir: &Path) -> Result<usi
         }
     }
     Ok(n)
+}
+
+/// 恢复符号链接条目：blob 内容即链接目标（相对/绝对按原样重建）。unix 忠实重建；
+/// 其余平台（Windows 无特权建不了 symlink）明确报错——绝不把目标串写成普通文件。
+fn restore_symlink(content: &[u8], dst: &Path, display: &str) -> Result<usize, String> {
+    let link_target =
+        std::str::from_utf8(content).map_err(|_| format!("符号链接目标非 UTF-8：{display}"))?;
+    #[cfg(unix)]
+    {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("重建父目录失败：{e}"))?;
+        }
+        std::os::unix::fs::symlink(link_target, dst)
+            .map_err(|e| format!("重建符号链接失败：{e}"))?;
+        Ok(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (link_target, dst);
+        Err(format!("符号链接条目暂不支持在此平台恢复：{display}"))
+    }
 }
 
 /// 恢复可执行位（git filemode 0o111 位）；Windows 无 POSIX 权限，no-op。
@@ -350,6 +388,39 @@ pub fn repo_status(workspace: &Path) -> RepoStatus {
         has_repo: true,
         head,
         commit_count,
+    }
+}
+
+/// 工作区内相对路径是否命中忽略规则（批次 5 保护状态展示用）。
+/// 无仓库/判定失败一律 false——宁可少标不误标（误标会让回执错说「不入快照」）。
+pub fn path_is_ignored(workspace: &Path, rel: &Path) -> bool {
+    let Ok(repo) = Repository::open(workspace) else {
+        return false;
+    };
+    repo.is_path_ignored(rel).unwrap_or(false)
+}
+
+/// 保护状态短语（审查 P3-2/P3-3 统一口径）：删除回执如实说明可恢复途径。
+/// - 有恢复点：`git 恢复点 {h}`；若被删路径含忽略类文件（隐私设计不入快照，
+///   restore 会「无此路径」），追加「仅回收站可恢复」防过度承诺。
+/// - 无恢复点：按开关状态区分「未启用」/「失败」。
+pub fn prot_phrase(
+    workspace: &Path,
+    snapshot: Option<&str>,
+    git_enabled: bool,
+    rels: &[&Path],
+) -> String {
+    match snapshot {
+        Some(h) => {
+            let any_ignored = rels.iter().any(|r| path_is_ignored(workspace, r));
+            if any_ignored {
+                format!("git 恢复点 {h}（忽略类文件不入快照，仅回收站可恢复）")
+            } else {
+                format!("git 恢复点 {h}")
+            }
+        }
+        None if git_enabled => "git 快照失败，仅回收站可恢复".to_string(),
+        None => "git 快照未启用，仅回收站可恢复".to_string(),
     }
 }
 
@@ -557,6 +628,66 @@ mod tests {
         std::fs::write(ws.0.join("new-after.txt"), "keep").unwrap();
         restore_path(&ws.0, &rev, "a.txt").unwrap();
         assert!(ws.0.join("new-after.txt").exists(), "多余文件不动");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_recreates_symlink_faithfully() {
+        // 审查 P2-2：symlink 条目（filemode 0o120000）blob 内容是链接目标串，
+        // 直接当文件写会畸变——unix 忠实重建符号链接本体。
+        let ws = TempWs::new();
+        std::fs::write(ws.0.join("real.txt"), "content").unwrap();
+        std::os::unix::fs::symlink("real.txt", ws.0.join("link.ln")).unwrap();
+        ensure_repo(&ws.0).unwrap();
+        let rev = log(&ws.0, 1).unwrap()[0].0.clone();
+        std::fs::remove_file(ws.0.join("link.ln")).unwrap();
+        assert_eq!(restore_path(&ws.0, &rev, "link.ln").unwrap(), 1);
+        let md = std::fs::symlink_metadata(ws.0.join("link.ln")).unwrap();
+        assert!(md.file_type().is_symlink(), "恢复的是符号链接本体");
+        assert_eq!(
+            std::fs::read_link(ws.0.join("link.ln")).unwrap(),
+            Path::new("real.txt"),
+            "链接目标原样"
+        );
+        // 目录内的符号链接同样忠实（write_tree_to 递归路径）
+        std::fs::create_dir_all(ws.0.join("d")).unwrap();
+        std::os::unix::fs::symlink("../real.txt", ws.0.join("d/in-dir.ln")).unwrap();
+        let snapshot = snapshot(&ws.0, "symlink-in-dir").unwrap().unwrap();
+        std::fs::remove_file(ws.0.join("d/in-dir.ln")).unwrap();
+        assert_eq!(restore_path(&ws.0, &snapshot, "d/in-dir.ln").unwrap(), 1);
+        assert_eq!(
+            std::fs::read_link(ws.0.join("d/in-dir.ln")).unwrap(),
+            Path::new("../real.txt")
+        );
+    }
+
+    #[test]
+    fn prot_phrase_marks_ignored_paths() {
+        // 审查 P3-2：忽略类路径（隐私不入快照）的恢复点文案必须标注「仅回收站
+        // 可恢复」，非忽略路径保持简洁恢复点展示。
+        let ws = TempWs::new();
+        ensure_repo(&ws.0).unwrap(); // 基线 .gitignore 已含 sessions.json
+        assert!(
+            path_is_ignored(&ws.0, Path::new("sessions.json")),
+            "忽略路径判定"
+        );
+        assert!(!path_is_ignored(&ws.0, Path::new("notes.txt")));
+        assert_eq!(
+            prot_phrase(&ws.0, Some("abc1234"), true, &[Path::new("notes.txt")]),
+            "git 恢复点 abc1234"
+        );
+        assert_eq!(
+            prot_phrase(&ws.0, Some("abc1234"), true, &[Path::new("sessions.json")]),
+            "git 恢复点 abc1234（忽略类文件不入快照，仅回收站可恢复）"
+        );
+        assert_eq!(
+            prot_phrase(&ws.0, None, true, &[Path::new("notes.txt")]),
+            "git 快照失败，仅回收站可恢复"
+        );
+        assert_eq!(
+            prot_phrase(&ws.0, None, false, &[Path::new("notes.txt")]),
+            "git 快照未启用，仅回收站可恢复"
+        );
     }
 
     #[test]

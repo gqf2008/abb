@@ -772,12 +772,24 @@ fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
                 .map(|i| crate::trash::pretty_path(std::path::Path::new(&i.orig)))
                 .collect();
             // 批次 5（保护状态可见）：删除回执如实展示恢复路径——git 快照恢复点 /
-            // 仅回收站（开关关闭） / 快照失败（仅回收站）。
-            let prot = match moved[0].snapshot.as_deref() {
-                Some(h) => format!("git 恢复点 {h}"),
-                None if settings.git_enabled => "git 快照失败，仅回收站可恢复".to_string(),
-                None => "git 快照未启用，仅回收站可恢复".to_string(),
-            };
+            // 仅回收站（开关关闭） / 快照失败（仅回收站）；忽略类路径不入快照时
+            // 明示，防「git 恢复点」过度承诺（审查 P3-2）。
+            let rels: Vec<PathBuf> = moved
+                .iter()
+                .filter_map(|i| {
+                    Path::new(&i.orig)
+                        .strip_prefix(workspace)
+                        .ok()
+                        .map(|p| p.to_path_buf())
+                })
+                .collect();
+            let refs: Vec<&Path> = rels.iter().map(|p| p.as_path()).collect();
+            let prot = crate::wsver::prot_phrase(
+                workspace,
+                moved[0].snapshot.as_deref(),
+                settings.git_enabled,
+                &refs,
+            );
             Decision::Deny(format!(
                 "已将 {} 移入回收站（{} 天内可恢复，{prot}）；原删除命令被拦截，无需再次执行删除",
                 names.join("，"),

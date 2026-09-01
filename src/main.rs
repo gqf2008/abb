@@ -958,6 +958,11 @@ fn run_wsver_cli(args: &[String]) -> i32 {
     let workspace = crate::workspace_dir(&bot_key);
     match sub {
         "log" => {
+            // 无仓库给可操作文案而非裸 libgit2 错误（审查 P3-4；restore 同）
+            if !crate::wsver::repo_status(&workspace).has_repo {
+                eprintln!("工作区还没有 git 仓库：启用 config workspace_git_enabled 后，bot 下次启动自动 init");
+                return 1;
+            }
             // -n <N>：条数（默认 10）
             let limit = args
                 .iter()
@@ -985,6 +990,10 @@ fn run_wsver_cli(args: &[String]) -> i32 {
             }
         }
         "restore" => {
+            if !crate::wsver::repo_status(&workspace).has_repo {
+                eprintln!("工作区还没有 git 仓库：启用 config workspace_git_enabled 后，bot 下次启动自动 init");
+                return 1;
+            }
             let (rev, path) = match (args.get(1), args.get(2)) {
                 (Some(r), Some(p)) => (r.as_str(), p.as_str()),
                 _ => {
@@ -1130,11 +1139,19 @@ fn run_trash_cli(args: &[String]) -> i32 {
             }
             match crate::guard::confirm_dangerous_delete(&bot_key, &workspace, path) {
                 Ok(it) => {
-                    // 批次 5：如实展示恢复路径（快照恢复点 / 仅回收站）
-                    let prot = match it.snapshot.as_deref() {
-                        Some(h) => format!("git 恢复点 {h}"),
-                        None => "git 快照未启用/失败，仅回收站".to_string(),
-                    };
+                    // 批次 5：如实展示恢复路径（快照恢复点 / 仅回收站；忽略类路径
+                    // 不入快照时明示——审查 P3-2，与 guard 回执同口径）
+                    let rels: Vec<&std::path::Path> = std::path::Path::new(&it.orig)
+                        .strip_prefix(&workspace)
+                        .ok()
+                        .map(|p| vec![p])
+                        .unwrap_or_default();
+                    let prot = crate::wsver::prot_phrase(
+                        &workspace,
+                        it.snapshot.as_deref(),
+                        settings.git_enabled,
+                        &rels,
+                    );
                     println!(
                         "已确认并移入回收站：{}（{} 天内可恢复，{prot}）",
                         it.orig, settings.ttl_days

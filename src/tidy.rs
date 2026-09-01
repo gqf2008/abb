@@ -72,6 +72,10 @@ pub enum GitOutcome {
     Committed(String),
     /// 无变更，不产生空 commit。
     NothingToCommit,
+    /// git 留痕开关关闭（config workspace_git_enabled=false）：不 init、不写
+    /// 已有仓库、不 commit——用户拒绝 ABB 碰 git 时必须完全静默（审查 P1-2：
+    /// 开关此前只门控 trash 路径，tidy/trash-gc 留痕会绕过）。
+    Skipped,
 }
 
 /// 一轮整理：孤儿会话文件 → 临时文件 → 历史截断 → 文档归档 → 空目录。
@@ -348,8 +352,13 @@ fn trunc(s: &str) -> String {
 /// 无 git 二进制依赖、无子进程可挂（原 60s 超时保护随之取消）；身份内置
 /// `ABB <abb@agent-bridge.local>`，不触碰全局 git config。同步 C 调用首轮大仓库
 /// add 可能秒级，spawn_blocking 让出 tokio worker。失败返回 Err（libgit2 真实
-/// 错误），调用方降级为纯整理 + 日志警告。
-pub async fn git_commit(workspace: &Path) -> Result<GitOutcome, String> {
+/// 错误），调用方降级为纯整理 + 日志警告。`git_enabled=false`（config
+/// workspace_git_enabled）时返回 [`GitOutcome::Skipped`]：不 init、不写已有
+/// 仓库、不 commit（审查 P1-2：与 trash 路径同一开关，不许绕过用户关闭动机）。
+pub async fn git_commit(workspace: &Path, git_enabled: bool) -> Result<GitOutcome, String> {
+    if !git_enabled {
+        return Ok(GitOutcome::Skipped);
+    }
     let ws = workspace.to_path_buf();
     tokio::task::spawn_blocking(move || {
         crate::wsver::ensure_repo(&ws)?;
@@ -675,7 +684,7 @@ mod tests {
         // #209 批次 3：libgit2 语义 = 基线承载 init 时已存在的内容。
         std::fs::write(ws.join("notes.md"), "v1").unwrap();
         assert_eq!(
-            git_commit(&ws).await.unwrap(),
+            git_commit(&ws, true).await.unwrap(),
             GitOutcome::NothingToCommit,
             "首轮已有文件由基线承载"
         );
@@ -701,14 +710,14 @@ mod tests {
         }
         // 二轮：无变更 → NothingToCommit，commit 数不增
         assert_eq!(
-            git_commit(&ws).await.unwrap(),
+            git_commit(&ws, true).await.unwrap(),
             GitOutcome::NothingToCommit,
             "无变更不产生空 commit"
         );
         // 三轮：再改内容 → 新 commit（消息前缀 [abb]）
         std::fs::write(ws.join("notes.md"), "v2").unwrap();
         assert!(matches!(
-            git_commit(&ws).await.unwrap(),
+            git_commit(&ws, true).await.unwrap(),
             GitOutcome::Committed(_)
         ));
         let log = tokio::process::Command::new("git")
@@ -734,6 +743,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_commit_disabled_skips_init_and_commit() {
+        // 审查 P1-2：workspace_git_enabled=false 必须完全不碰 git——不 init、
+        // 不写已有仓库、不 commit（用户关闭动机是隐私，留痕绕过即违约）。
+        let ws = temp_ws("git-off");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.md"), "v1").unwrap();
+        assert_eq!(
+            git_commit(&ws, false).await.unwrap(),
+            GitOutcome::Skipped,
+            "关闭 → Skipped"
+        );
+        assert!(!ws.join(".git").exists(), "不 init");
+        // 已有仓库也绝不写入：手工建一个 ABB 基线仓再调关闭路径
+        git_commit(&ws, true).await.unwrap();
+        let commits_before = {
+            let repo = git2::Repository::open(&ws).unwrap();
+            let mut w = repo.revwalk().unwrap();
+            w.push_head().unwrap();
+            w.count()
+        };
+        std::fs::write(ws.join("notes.md"), "v2").unwrap();
+        assert_eq!(git_commit(&ws, false).await.unwrap(), GitOutcome::Skipped);
+        let commits_after = {
+            let repo = git2::Repository::open(&ws).unwrap();
+            let mut w = repo.revwalk().unwrap();
+            w.push_head().unwrap();
+            w.count()
+        };
+        assert_eq!(commits_before, commits_after, "关闭时不产生新 commit");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
     async fn git_commit_libgit2_leaves_clean_status() {
         // 验收（#209 批次 3）：外部 git → libgit2 迁移行为等价——快照落库后
         // `git status --porcelain` 为空（工作树与 HEAD 零 diff：add -A 完备、
@@ -755,11 +797,11 @@ mod tests {
         std::fs::create_dir_all(ws.join("history")).unwrap();
         std::fs::write(ws.join("history/chat.log"), "对话全文").unwrap();
         // 首轮：已有内容由基线承载（结果不区分基线/快照，验收看落库后的树）
-        let _ = git_commit(&ws).await.unwrap();
+        let _ = git_commit(&ws, true).await.unwrap();
         // 再改内容 → 本轮快照真正产生新 commit（等价性：外部 git 视角 diff 为空）
         std::fs::write(ws.join("notes.md"), "v2").unwrap();
         assert!(matches!(
-            git_commit(&ws).await.unwrap(),
+            git_commit(&ws, true).await.unwrap(),
             GitOutcome::Committed(_)
         ));
         let status = tokio::process::Command::new("git")

@@ -1134,12 +1134,38 @@ impl Bridge {
                 )
             }
             TrashCmd::Confirm(path) => {
-                match crate::guard::confirm_dangerous_delete(&self.bot.key(), &workspace, &path) {
-                    Ok(it) => format!(
-                        "✅ 已确认并移入回收站：{}（{} 天内可恢复；/trash restore 可撤回）",
-                        it.orig,
-                        self.bot.trash_ttl_days.max(1)
-                    ),
+                // 确认 = git 快照 + 移入回收站（libgit2 首轮全量 add 可能秒级），
+                // spawn_blocking 让出 tokio worker（审查 P2-1；与 service/tidy 同口径）
+                let key = self.bot.key();
+                let ws = workspace.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::guard::confirm_dangerous_delete(&key, &ws, &path)
+                })
+                .await
+                {
+                    Ok(Ok(it)) => {
+                        // 批次 5 回执（审查 P3-3）：与 guard/CLI 同口径如实展示恢复途径
+                        let git_enabled = crate::config::Config::load()
+                            .map(|c| c.workspace_git_enabled)
+                            .unwrap_or(true);
+                        let rels: Vec<&std::path::Path> = std::path::Path::new(&it.orig)
+                            .strip_prefix(&workspace)
+                            .ok()
+                            .map(|p| vec![p])
+                            .unwrap_or_default();
+                        let prot = crate::wsver::prot_phrase(
+                            &workspace,
+                            it.snapshot.as_deref(),
+                            git_enabled,
+                            &rels,
+                        );
+                        format!(
+                            "✅ 已确认并移入回收站：{}（{} 天内可恢复，{prot}；/trash restore 可撤回）",
+                            it.orig,
+                            self.bot.trash_ttl_days.max(1)
+                        )
+                    }
+                    Ok(Err(e)) => format!("⚠️ 确认失败：{e}"),
                     Err(e) => format!("⚠️ 确认失败：{e}"),
                 }
             }
