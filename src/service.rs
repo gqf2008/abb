@@ -241,11 +241,18 @@ pub async fn run() {
                             r = acp.wait() => Some(r),
                             _ = stop.cancelled() => None,
                         };
+                        // 本轮**进程存活时长**必须在任何睡眠之前快照，且在 match 之外
+                        // （复核 #205r4：判据若含睡眠时长，长睡眠自己就把它推过 60s
+                        // → 误复位 → 退避永远在 2↔64s 之间震荡，300s 封顶不可达）
+                        let lifetime = started.elapsed();
                         match exited {
-                            // 关停：**必须显式 graceful_stop**（SIGTERM → 等 acp 自己
-                            // flush relay + 逐组收 agent 池，5s 预算内）——只让句柄
-                            // drop 等于同拍 SIGKILL，acp 的 SIGTERM 处理器来不及跑，
-                            // 池会残留到 stdin EOF 才自退（审查 #205r3）。
+                            // 关停：**必须显式 graceful_stop**——只 drop 句柄 = 同拍
+                            // SIGKILL，acp 的 SIGTERM 处理器根本没机会跑。
+                            // 预算诚实说明（复核 #205r4）：**空闲时** 5s 够它 flush
+                            // relay + 逐组收池后自退；**有 in-flight 轮次时不够**——
+                            // 上游先做 ≤30s 排水才开始收池（buzz lib.rs:3442），我们
+                            // 再多等也只能吃到 20s 收尾总期限（#184：期限只包关闭
+                            // 路径）。故忙时池仍走 stdin-EOF 自退兜底，缺口记 #206。
                             None => {
                                 acp.graceful_stop(std::time::Duration::from_secs(5)).await;
                                 break;
@@ -259,21 +266,21 @@ pub async fn run() {
                             }
                             // 崩溃/等待失败 → reap（acp 已死，只剩防僵尸）后退避重拉
                             _ => {
-                                crate::log!("[mini-relay] ⚠️ buzz-acp 异常退出，退避后重拉");
+                                let tail = acp.stderr_tail();
+                                let reason = if tail.trim().is_empty() {
+                                    "（stderr 无输出）".to_string()
+                                } else {
+                                    crate::agent::truncate(tail.trim(), 300)
+                                };
+                                crate::log!("[mini-relay] ⚠️ buzz-acp 异常退出，退避后重拉：{reason}");
                                 acp.reap().await;
                                 if interruptible_sleep(backoff, &stop).await {
                                     break;
                                 }
-                                backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
                             }
                         }
-                        // 退避复位条件（审查 #205r3）：**存活够久**才算「环境是好的」
-                        // 才复位。原实现在 spawn 系统调用成功即复位 → 「装上但必快崩」
-                        // 的机器上 backoff 永远被抹回 2s（每 ~4s 一轮 + 一行日志永刷，
-                        // 注释承诺的 2s→300s 封顶根本不生效）。
-                        if started.elapsed() >= std::time::Duration::from_secs(60) {
-                            backoff = std::time::Duration::from_secs(2);
-                        }
+                        // 翻倍/复位由 next_backoff 决策（纯函数，单测钉住时机）
+                        backoff = next_backoff(lifetime, backoff);
                     }
                 }
             });
@@ -560,6 +567,23 @@ fn spawn_buzz_acp(
             );
             None
         }
+    }
+}
+
+/// 崩溃重拉的退避决策（纯函数——复核 #205r4：这类「复位时机」错一个单测就能钉死，
+/// 故从循环里抽出）。规则：**只有活够 STABLE 才说明环境是好的、才复位**，否则翻倍
+/// 封顶 300s。`lifetime` 必须是本轮**进程存活时长**、不含任何退避睡眠——含了就
+/// 永远复位、封顶不可达。
+fn next_backoff(
+    lifetime: std::time::Duration,
+    backoff: std::time::Duration,
+) -> std::time::Duration {
+    const STABLE: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(300);
+    if lifetime >= STABLE {
+        std::time::Duration::from_secs(2)
+    } else {
+        (backoff * 2).min(MAX)
     }
 }
 
@@ -1351,6 +1375,24 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 退避时机回归（复核 #205r4）：快崩循环必须**单调爬封顶**，长命进程才复位。
+    /// 上一版的复位判据混进了睡眠时长 → 2↔64s 永震、300s 不可达；本测试按「lifetime
+    /// 只含进程存活」的语义钉死它。
+    #[test]
+    fn next_backoff_climbs_to_cap_and_only_resets_when_stable() {
+        let d = std::time::Duration::from_secs;
+        // 快崩（每轮活 1s）：持续翻倍到 300s 封顶，绝不回落
+        let mut b = d(2);
+        for _ in 0..12 {
+            b = next_backoff(d(1), b);
+        }
+        assert_eq!(b, d(300), "连续快崩必须爬到封顶而不是被复位");
+        // 短睡不算稳定：睡眠 64s 后本轮再崩（进程只活了 1s）也不得复位
+        assert_eq!(next_backoff(d(1), d(64)), d(128));
+        // 真活够了才复位
+        assert_eq!(next_backoff(d(61), d(300)), d(2));
+    }
 
     /// #189 回归护栏（服务期无期限）：健康 bot 循环（不自行结束、无关停广播）期间，
     /// 等待绝不能提前返回进入关闭路径——旧实现把 30s 逐 handle 时限放在服务期，

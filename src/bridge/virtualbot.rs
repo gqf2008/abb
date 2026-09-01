@@ -366,11 +366,12 @@ impl Bridge {
                     let uuid = crate::buzzrelay::channel_uuid(&self.bot.key(), &ev.chat_id);
                     if relay.channel_by_uuid(&uuid).is_none() {
                         Some("本会话不是已登记的虚拟 Bot 群（新登记的群需重启后参与 buzz）")
-                    } else if relay.subscriber_count() == 0 {
-                        // 无 WS 消费者 = buzz-acp 没连上（未装/崩溃窗口/I5 终态）。
-                        // 事件入库只是「等它重连背充」，用户侧是无限等待——当场报错
-                        // 优于静默悬挂（重发一次就能过；账本式无响应超时见 #206）。
-                        Some("buzz-acp 未连接（无 WS 订阅者），本轮无法执行")
+                    } else if !relay.has_subscription_for(&uuid) {
+                        // 判据是「有连接 REQ 订阅了本频道」而非裸连接数：握手未完、
+                        // 半开连接、别的 WS 客户端都不算消费者（#205r4）。
+                        // 无消费者时入库只是「寄望对端水位补发」（ABB 不掌握其语义），
+                        // 用户侧是无限等待——当场报错优于静默悬挂（账本式超时见 #206）。
+                        Some("buzz-acp 未订阅本频道（未连接/未就绪），本轮无法执行")
                     } else if crate::config::restrict_granted(ev.role, &self.bot.key()) {
                         Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
                     } else {

@@ -1977,8 +1977,8 @@ mod tests {
 
         bridge.handle(test_ev("m1", chat, "你好")).await;
         assert!(
-            msgr.sent().iter().any(|t| t.contains("未连接")),
-            "无订阅者要当场报错，不能让用户无限等待"
+            msgr.sent().iter().any(|t| t.contains("未订阅")),
+            "无消费者要当场报错，不能让用户无限等待"
         );
         assert!(
             state.query(std::slice::from_ref(&all)).await.is_empty(),

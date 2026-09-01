@@ -32,6 +32,30 @@ pub struct BuzzAcpProcess {
     /// `field pid is never read` 被 -D warnings 拦（本机 macOS 门禁看不到，0a3acd9）。
     #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
+    /// stderr 有界尾巴。acp 的 clap 解析错、致命配置错、panic 全文**只**在这里——
+    /// 三路 stdio 全 null 时它们统统塌成一行「退出异常」，与仓库在 CLI 路径上付过
+    /// 学费的结论相反（#123：stderr 改管道透传，失败原因才可定位）。
+    stderr_tail: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+/// stderr 尾巴上限（**字符**）：够装一条 panic + 若干行 clap 报错，又不无界增长。
+const STDERR_TAIL_CHARS: usize = 2000;
+
+/// 追加一段 stderr 并只保留末尾 [`STDERR_TAIL_CHARS`]。按 char 计数截断——按字节切
+/// 会在多字节边界产出 U+FFFD（仓库规则：字符串处理必须 char-aware）。
+fn push_tail(tail: &std::sync::Mutex<String>, chunk: &str) {
+    let mut t = tail.lock().unwrap();
+    t.push_str(chunk);
+    t.push('\n');
+    let total = t.chars().count();
+    if total > STDERR_TAIL_CHARS {
+        let byte_at = t
+            .char_indices()
+            .nth(total - STDERR_TAIL_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(t.len());
+        *t = t[byte_at..].to_string();
+    }
 }
 
 /// buzz-acp 的环境变量装配（纯函数——单测守住 env 名：写错名字 = owner 门
@@ -82,14 +106,38 @@ impl BuzzAcpProcess {
         // （开发期 Ctrl+C / 对 ABB 的 killpg）不会顺带误杀它。
         #[cfg(unix)]
         cmd.process_group(0);
-        let child = cmd
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // 唯一保留的管道：失败诊断（见 stderr_tail 注释）。必须持续排空，
+            // 否则管道写满会把 acp 卡死——由下面的读取任务负责。
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         let pid = child.id();
-        Ok(Self { child, pid })
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(err) = child.stderr.take() {
+            let sink = std::sync::Arc::clone(&stderr_tail);
+            // 短命任务（随子进程 stderr EOF 收尾）：登记进治理，panic/指标可见（#69）
+            crate::tasks::tasks().spawn("buzz-acp-stderr", async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    push_tail(&sink, &line);
+                }
+            });
+        }
+        Ok(Self {
+            child,
+            pid,
+            stderr_tail,
+        })
+    }
+
+    /// stderr 尾巴（诊断用；无输出返回空串）。崩溃日志带它，否则 clap 报错/panic
+    /// 与「子进程自己退了」在日志里长得一模一样。
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail.lock().unwrap().clone()
     }
 
     /// 等退出（I5 判据的载体：巡检用它替代轮询——即时、无常驻定时器唤醒）。
@@ -155,6 +203,28 @@ mod tests {
         assert_eq!(env["BUZZ_AGENT_PROVIDER"], "anthropic");
         // 错名绝迹：历史上写错的 BUZZ_AGENT_OWNER 不得回流
         assert!(!env.contains_key("BUZZ_AGENT_OWNER"));
+    }
+
+    /// stderr 尾巴：按 char 保留末尾（多字节不得切坏），超限截断而非无界增长。
+    #[test]
+    fn push_tail_is_char_bounded_and_multibyte_safe() {
+        let tail = std::sync::Mutex::new(String::new());
+        for i in 0..400 {
+            push_tail(&tail, &format!("第 {i} 行——中文与 emoji 🐛 混排"));
+        }
+        let t = tail.lock().unwrap().clone();
+        assert!(t.chars().count() <= STDERR_TAIL_CHARS, "按 char 计不得超限");
+        assert!(
+            !t.contains('\u{FFFD}'),
+            "多字节边界不得被切坏（char 计数而非字节）"
+        );
+        assert!(t.contains("399"), "保留的必须是末尾内容");
+        // 空行只追加换行（按 char 计，且不得因截断丢内容字符）
+        let before = tail.lock().unwrap().chars().count();
+        push_tail(&tail, "");
+        let after = tail.lock().unwrap().chars().count();
+        assert!(after >= before, "只可能追加，不得吞内容");
+        assert!(after - before <= 1, "一行空输入最多一个换行");
     }
 
     /// I5 判据通道：干净退出（exit 0）与崩溃退出（非零）必须可区分——

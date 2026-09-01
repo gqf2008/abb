@@ -67,8 +67,10 @@ pub enum ClientFrame {
         filters: Vec<nostr::Filter>,
     },
     Close(String),
-    /// NIP-42 AUTH 响应（Phase 1 不验签不读内容）。
-    Auth,
+    /// NIP-42 AUTH 响应（kind 22242 事件本体——必须拿它的 id 回 OK，见 ws_loop 的
+    /// Auth 臂：buzz-acp 的 do_connect 在发出 auth 后**硬等** accepted=true 的 OK，
+    /// 拿不到即判连接失败并重试到退出）。
+    Auth(Box<nostr::Event>),
 }
 
 /// 解析 NIP-01 客户端帧（["EVENT",e] / ["REQ",sub,filters] / ["CLOSE",sub]）。
@@ -91,7 +93,10 @@ pub fn parse_client_frame(text: &str) -> Option<ClientFrame> {
                 .collect();
             Some(ClientFrame::Req { sub_id, filters })
         }
-        "AUTH" => Some(ClientFrame::Auth),
+        "AUTH" => {
+            let e: nostr::Event = serde_json::from_value(arr.get(1)?.clone()).ok()?;
+            Some(ClientFrame::Auth(Box::new(e)))
+        }
         "CLOSE" => Some(ClientFrame::Close(arr.get(1)?.as_str()?.to_string())),
         _ => None,
     }
@@ -482,6 +487,14 @@ pub struct AgentReply {
     pub content: String,
 }
 
+/// `EventStore::store3` 的三态结果（见其文档：Duplicate ≠ 失败）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Store3 {
+    Stored,
+    Duplicate,
+    Failed(String),
+}
+
 /// 事件存储（turso：buzz-relay.db）。`h_tag` 单列直查，不依赖 json_each 扩展。
 pub struct EventStore {
     conn: turso::Connection,
@@ -531,8 +544,19 @@ impl EventStore {
         ]
     }
 
+    /// 入库（id 去重）。**三种结果必须分开**（审查 #205r4）：Duplicate 是 NIP-01
+    /// 幂等语义下的正常结果（崩溃重放同一 mid 会命中），把它当失败会让用户收到
+    /// 「写入失败请重发」而消息其实就在库里等回复；真失败（磁盘/权限）才要报错。
+    pub async fn store3(&self, e: &nostr::Event) -> Store3 {
+        match self.store_raw(e).await {
+            Ok(n) if n > 0 => Store3::Stored,
+            Ok(_) => Store3::Duplicate,
+            Err(e) => Store3::Failed(e.to_string()),
+        }
+    }
+
     /// 入库（id 去重；NIP 语义同 id 重复提交为 no-op）。返回是否新写入。
-    pub async fn store(&self, e: &nostr::Event) -> bool {
+    async fn store_raw(&self, e: &nostr::Event) -> Result<u64, turso::Error> {
         let values = Self::row_values(e);
         self.conn
             .execute(
@@ -542,8 +566,6 @@ impl EventStore {
                 turso::params_from_iter(values),
             )
             .await
-            .map(|n| n > 0)
-            .unwrap_or(false)
     }
 
     /// 按 (kind 集合, pubkey) 删除事件。用于种子事件的「先清后写」：种子 id 由内容
@@ -735,17 +757,23 @@ impl RelayState {
             crate::log!("[mini-relay] ⚠️ 用户消息事件签名失败（桥身份密钥异常），丢弃");
             return false;
         };
-        if !self.db.store(&e).await {
-            crate::log!(
-                "[mini-relay] ⚠️ 消息事件未入库（重复 id 或写失败）chat={} mid={}",
-                crate::agent::truncate(chat_id, 16),
-                crate::agent::truncate(mid, 16)
-            );
-            return false;
+        match self.db.store3(&e).await {
+            // Duplicate：同一 mid 的幂等重放（崩溃恢复路径），事件已在库里等被应答
+            // ——算送达。把它当失败会让用户收到「写入失败请重发」的假错（#205r4）。
+            Store3::Stored | Store3::Duplicate => {}
+            Store3::Failed(err) => {
+                crate::log!(
+                    "[mini-relay] ⚠️ 消息事件入库失败 chat={} mid={}: {err}",
+                    crate::agent::truncate(chat_id, 16),
+                    crate::agent::truncate(mid, 16)
+                );
+                return false;
+            }
         }
         self.fan_out(&e);
-        // 入库 ≠ 有人消费：零订阅时事件仍在库里，acp 重连按 since 水位回放（不丢），
-        // 但持续零订阅 = buzz-acp 未装/未起，60s 一条告警让运维看到（审查 #205r2）。
+        // 入库 ≠ 有人消费。**能否补发取决于对端的订阅水位**（buzz-acp 的
+        // subscribe_since/startup_watermark 在其进程内存里，ABB 不掌握也不该声称
+        // 「不丢」——#205r4 更正上一版注释），所以这里只保证运维看得见（60s 一条）。
         if self.subscriber_count() == 0 {
             let now = nostr::prelude::Timestamp::now().as_secs();
             if self.should_warn_no_subscriber(now) {
@@ -765,13 +793,48 @@ impl RelayState {
         self.conns.lock().unwrap().len()
     }
 
-    /// 测试夹具：登记一个假 WS 连接，用于过 dispatch 预检的「有订阅者」条件
-    /// （预检是真的，不能为了测试放宽）。返回的接收端须由调用方持有。
+    /// 是否有连接**已 REQ 订阅了该频道**（filter 的 #h 含此 uuid，或 filter 未限定
+    /// #h＝订阅全频道）。dispatch 预检用它而非 `subscriber_count`：只有连接数会把
+    /// 「刚握手还没订阅」「半开黑洞」也算成消费者，于是当场放行、事后无人应答。
+    pub fn has_subscription_for(&self, uuid: &str) -> bool {
+        let conns = self.conns.lock().unwrap();
+        let subs = self.subs.lock().unwrap();
+        conns.keys().any(|cid| {
+            subs.get(cid).map(|by_sub| {
+                by_sub.values().any(|filters| {
+                    filters.iter().any(|f| {
+                        // 无 kinds 或 kinds 含 9 且 #h 命中（未给 #h＝全频道订阅）
+                        let kind_ok = f
+                            .kinds
+                            .as_ref()
+                            .map(|ks| ks.is_empty() || ks.iter().any(|k| k.as_u16() == 9))
+                            .unwrap_or(true);
+                        let h_ok = match f.generic_tags.iter().find(|(t, _)| t.to_string() == "h") {
+                            Some((_, vals)) => vals.iter().any(|v| v == uuid),
+                            None => true,
+                        };
+                        kind_ok && h_ok
+                    })
+                })
+            }) == Some(true)
+        })
+    }
+
+    /// 测试夹具：模拟一个**已完成 REQ 订阅的 buzz-acp 连接**（conn + 一条 kinds=[9]
+    /// 全频道订阅），用于过 dispatch 预检——预检判据是真的（要真订阅），不能为了
+    /// 测试放宽。返回的接收端须由调用方持有。
     #[cfg(test)]
     pub fn test_attach_subscriber(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.conns.lock().unwrap().insert(id, tx);
+        let f: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        self.subs
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .insert("sub-test".to_string(), vec![f]);
         rx
     }
 
@@ -820,7 +883,7 @@ impl RelayState {
                     .sign_with_keys(&self.bridge_keys)
                     .ok();
                 if let Some(ev) = member {
-                    let _ = self.db.store(&ev).await;
+                    let _ = self.db.store3(&ev).await;
                 }
             }
             // kind 39000：频道元数据（name/about 标签供 discover_channels 读取）
@@ -835,7 +898,7 @@ impl RelayState {
                 .sign_with_keys(&self.bridge_keys)
                 .ok();
             if let Some(ev) = meta {
-                let _ = self.db.store(&ev).await;
+                let _ = self.db.store3(&ev).await;
             }
         }
     }
@@ -898,7 +961,8 @@ impl RelayState {
             }
             Admit::Store => {}
         }
-        let stored = self.db.store(e).await;
+        let st = self.db.store3(e).await;
+        let stored = st == Store3::Stored;
         if stored {
             self.fan_out(e);
         }
@@ -928,25 +992,55 @@ impl RelayState {
                 ),
             }
         }
-        if stored {
-            format!("[\"OK\",\"{}\",true,\"\"]", e.id.to_hex())
-        } else {
-            format!("[\"OK\",\"{}\",false,\"duplicate\"]", e.id.to_hex())
+        match st {
+            Store3::Stored => format!("[\"OK\",\"{}\",true,\"\"]", e.id.to_hex()),
+            Store3::Duplicate => format!("[\"OK\",\"{}\",false,\"duplicate\"]", e.id.to_hex()),
+            Store3::Failed(err) => {
+                crate::log!("[mini-relay] ⚠️ 入库失败 id={}: {err}", e.id.to_hex());
+                format!("[\"OK\",\"{}\",false,\"internal error\"]", e.id.to_hex())
+            }
         }
     }
 
     /// fan-out：发给所有命中的订阅。
     fn fan_out(&self, e: &Event) {
-        let conns = self.conns.lock().unwrap();
-        for (conn_id, tx) in conns.iter() {
+        // 先收集再发（不持锁跨 send）；发送失败的连接**当场摘掉**——半开连接的
+        // tx.send 会一直 Ok 而 sink 早已死，留着它会让 has_subscription_for
+        // 永远返回真，dispatch 预检形同虚设（审查 #205r4）。ws_loop 退出时也摘，
+        // 这里是「对端不再读」的第二道清理。
+        let mut targets: Vec<(u64, String)> = Vec::new();
+        {
+            let conns = self.conns.lock().unwrap();
             let subs = self.subs.lock().unwrap();
-            if let Some(filters) = subs.get(conn_id) {
-                for (sub_id, filters) in filters {
-                    if filters.iter().any(|f| filter_matches(f, e)) {
-                        let frame = format!("[\"EVENT\",\"{sub_id}\",{}]", e.as_json());
-                        let _ = tx.send(frame);
+            for conn_id in conns.keys() {
+                if let Some(by_sub) = subs.get(conn_id) {
+                    for (sub_id, filters) in by_sub {
+                        if filters.iter().any(|f| filter_matches(f, e)) {
+                            targets.push((
+                                *conn_id,
+                                format!("[\"EVENT\",\"{sub_id}\",{}]", e.as_json()),
+                            ));
+                        }
                     }
                 }
+            }
+        }
+        let mut dead: Vec<u64> = Vec::new();
+        for (conn_id, frame) in targets {
+            let sent = match self.conns.lock().unwrap().get(&conn_id).cloned() {
+                Some(tx) => tx.send(frame).is_ok(),
+                None => false,
+            };
+            if !sent && !dead.contains(&conn_id) {
+                dead.push(conn_id);
+            }
+        }
+        if !dead.is_empty() {
+            let mut conns = self.conns.lock().unwrap();
+            let mut subs = self.subs.lock().unwrap();
+            for id in dead {
+                conns.remove(&id);
+                subs.remove(&id);
             }
         }
     }
@@ -969,8 +1063,34 @@ async fn health() -> &'static str {
 
 async fn ws_upgrade(
     axum::extract::State(state): axum::extract::State<Arc<RelayState>>,
+    headers: axum::http::HeaderMap,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
+    // **WS 握手不受 CORS 约束**：浏览器会为跨源 WS 带上 Origin，而 relay 只听
+    // 127.0.0.1 并不构成防护——用户访问的任意网页都能开 ws://127.0.0.1:port，
+    // 认证后 REQ 就能拉走全量对话存档（写侧已在 admit 收口，读侧此前完全敞开）。
+    // 因此：**带 Origin 且不是回环源**即拒；命令行/原生客户端不发 Origin，放行。
+    if let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        let local = [
+            "http://127.0.0.1",
+            "https://127.0.0.1",
+            "http://localhost",
+            "https://localhost",
+            "null",
+        ]
+        .iter()
+        .any(|p| origin.starts_with(p));
+        if !local {
+            crate::log!("[mini-relay] ⚠️ 拒绝非回环 Origin 的 WS 握手: {origin}");
+            return axum::http::Response::builder()
+                .status(axum::http::StatusCode::FORBIDDEN)
+                .body(axum::body::Body::from("forbidden origin"))
+                .unwrap();
+        }
+    }
     upgrade.on_upgrade(move |socket| async move { ws_loop(state, socket).await })
 }
 
@@ -979,6 +1099,8 @@ async fn ws_loop(state: Arc<RelayState>, socket: axum::extract::ws::WebSocket) {
     use axum::extract::ws::Message as WsMessage;
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
+    // 该连接是否已完成 NIP-42 认证（读侧门禁：REQ 未认证不服务）
+    let mut authenticated = false;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let conn_id = state.conn_seq.fetch_add(1, Ordering::Relaxed);
     state.conns.lock().unwrap().insert(conn_id, tx);
@@ -1007,14 +1129,46 @@ async fn ws_loop(state: Arc<RelayState>, socket: axum::extract::ws::WebSocket) {
                 let Some(Ok(WsMessage::Text(text))) = msg else { break };
                 let Some(frame) = parse_client_frame(&text) else { continue };
                 match frame {
-                    ClientFrame::Auth => {
-                        // NIP-42 AUTH 响应：本地回环不强制门禁，接受即可
+                    ClientFrame::Auth(ev) => {
+                        // NIP-42：**必须回 OK**。buzz-acp 的 do_connect（buzz
+                        // relay.rs:3932-3947）在发出 auth 事件后 `wait_for_any_ok`
+                        // 硬等 `accepted=true`，拿不到就 return Err → 重试梯耗尽
+                        // → 进程非零退出 → 正好喂给 ABB 的崩溃重拉循环（表现为
+                        // 「relay 在跑、日志说已拉起、永远没有回复」）。
+                        // 门禁强度：只校验 kind=22242 + 自洽签名，不校验它签的是
+                        // 本轮 challenge（回环信任模型）；但**认证标记用于挡 REQ**：
+                        // 未认证的连接不给读（见下），配合 Origin 检查关掉浏览器
+                        // 侧 WS 旁路（WS 不受 CORS 约束）。
+                        let ok = ev.kind.as_u16() == 22242
+                            && ev.verify_id()
+                            && ev.verify_signature();
+                        if ok {
+                            authenticated = true;
+                        }
+                        let ack = format!(
+                            "[\"OK\",\"{}\",{ok},\"{}\"]",
+                            ev.id.to_hex(),
+                            if ok { "" } else { "invalid: not a signed 22242" }
+                        );
+                        if sink.send(WsMessage::Text(ack.into())).await.is_err() {
+                            break;
+                        }
                     }
                     ClientFrame::Event(e) => {
                         let ack = state.ingest(&e).await;
                         if sink.send(WsMessage::Text(ack.into())).await.is_err() {
                             break;
                         }
+                    }
+                    ClientFrame::Req { .. } if !authenticated => {
+                        // 未认证连接不给读：REQ 会回放库里全量 kind-9（含注入的
+                        // 历史块、附件本地路径、指令块）。回环本机进程不是本门禁的
+                        // 目标（那属于「本机已沦陷」），挡的是浏览器 WS 旁路。
+                        let _ = sink
+                            .send(WsMessage::Text(
+                                r#"["NOTICE","auth required before REQ"]"#.into(),
+                            ))
+                            .await;
                     }
                     ClientFrame::Req { sub_id, filters } => {
                         // 历史回放 + EOSE
