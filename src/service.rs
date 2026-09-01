@@ -266,6 +266,10 @@ pub async fn run() {
                             }
                             // 崩溃/等待失败 → reap（acp 已死，只剩防僵尸）后退避重拉
                             _ => {
+                                // 稍等一拍再读 stderr 尾巴——排空任务是独立的，
+                                // wait() 返回后最后几行可能还在管道里（复核 #205r5：
+                                // 否则首条崩溃日志误报「无输出」）。
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                                 let tail = acp.stderr_tail();
                                 let reason = if tail.trim().is_empty() {
                                     "（stderr 无输出）".to_string()

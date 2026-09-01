@@ -1961,7 +1961,7 @@ mod tests {
         let (state, _rx) = crate::buzzrelay::RelayState::new(
             store,
             nostr::prelude::Keys::generate(),
-            String::new(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
         );
         // 频道已登记，但**没有任何 WS 连接**
         state.set_channels([crate::buzzrelay::Channel {
@@ -2014,7 +2014,7 @@ mod tests {
         let (state, _rx) = crate::buzzrelay::RelayState::new(
             store,
             nostr::prelude::Keys::generate(),
-            String::new(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
         );
         state.set_channels([crate::buzzrelay::Channel {
             uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
@@ -2096,7 +2096,7 @@ mod tests {
         let (state, _rx) = crate::buzzrelay::RelayState::new(
             store,
             nostr::prelude::Keys::generate(),
-            String::new(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
         );
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2132,7 +2132,7 @@ mod tests {
         let (state, _rx) = crate::buzzrelay::RelayState::new(
             store,
             nostr::prelude::Keys::generate(),
-            String::new(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
         );
         // 频道**已登记**：唯一拒绝理由必须是「受限会话」，不能是资格不足
         state.set_channels([crate::buzzrelay::Channel {

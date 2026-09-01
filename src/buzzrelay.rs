@@ -270,7 +270,11 @@ mod tests {
     async fn publish_user_message_maps_channel_with_single_h_tag() {
         let db_path = test_db("abb-buzzrelay-pub");
         let store = EventStore::open(&db_path).await.unwrap();
-        let (state, _reply_rx) = RelayState::new(store, Keys::generate(), String::new());
+        let (state, _reply_rx) = RelayState::new(
+            store,
+            Keys::generate(),
+            Keys::generate().public_key().to_hex(),
+        );
         let uuid_a = channel_uuid("bot_a", "oc_a");
         state.set_channels([Channel {
             uuid: uuid_a.clone(),
@@ -328,7 +332,113 @@ mod tests {
         remove_test_db(&db_path);
     }
 
-    /// 准入权威回归（审查 #205r3 高危）：**验签只证明自洽，不证明可信**。任意本地
+    /// Origin 判据回归（审查 #205r5）：前缀匹配被 `127.0.0.1.evil.com` 绕过、
+    /// "null" 白名单放进 file:// 页面——两处都得拒；原生客户端不发 Origin（由
+    /// 调用方放行）不在本函数职责内。
+    #[test]
+    fn origin_allowed_requires_exact_loopback_host() {
+        assert!(origin_allowed("http://127.0.0.1:3000"));
+        assert!(origin_allowed("https://localhost"));
+        assert!(origin_allowed("http://[::1]:8080"));
+        // 攻击面
+        assert!(
+            !origin_allowed("http://127.0.0.1.evil.com"),
+            "前缀绕过必须被拒"
+        );
+        assert!(!origin_allowed("http://localhostevil.com"));
+        assert!(!origin_allowed("null"), "file:// 页面不得放行");
+        assert!(!origin_allowed("https://example.com"));
+        assert!(!origin_allowed("garbage"), "非 URL 一律拒");
+    }
+
+    /// NIP-42 auth 裁决回归：kind/签名/challenge tag 三道都要过；challenge 错误
+    /// （别处 auth 事件重放）必须拒——这是挡「跨连接重放认证」的那道闸。
+    #[test]
+    fn auth_decision_verifies_kind_sig_and_challenge() {
+        let keys = Keys::generate();
+        // EventBuilder::auth() 即 NIP-42 正形（challenge+relay tag），buzz 也用它
+        let mk = |challenge: &str| {
+            EventBuilder::auth(
+                challenge,
+                nostr::RelayUrl::parse("ws://127.0.0.1:3000").unwrap(),
+            )
+            .sign_with_keys(&keys)
+            .unwrap()
+        };
+        assert!(auth_decision(&mk("chal-1"), "chal-1").is_ok());
+        let wrong = mk("chal-other");
+        assert!(
+            auth_decision(&wrong, "chal-1")
+                .unwrap_err()
+                .contains("challenge"),
+            "challenge 不匹配必须拒（跨连接重放闸）"
+        );
+        // kind 不对：把同一签名结构做成普通事件
+        let not_auth = EventBuilder::new(Kind::Custom(9), "")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(auth_decision(&not_auth, "chal-1").is_err());
+        // 无 challenge tag = 缺失 → 拒
+        let no_tag = EventBuilder::new(Kind::Authentication, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(auth_decision(&no_tag, "chal-1").is_err());
+    }
+
+    /// 消费者判据回归（审查 #205r4/r5）：预检判「有连接 REQ 订阅了本频道」，
+    /// kinds 不含 9、#h 不匹配、无订阅，都不得算有消费者。
+    #[tokio::test]
+    async fn has_subscription_for_matches_channel_filters() {
+        let db = test_db("abb-buzzrelay-sub");
+        let store = EventStore::open(&db).await.unwrap();
+        let (state, _rx) = RelayState::new(
+            store,
+            Keys::generate(),
+            Keys::generate().public_key().to_hex(),
+        );
+        let conn_id = state.conn_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        state.conns.lock().unwrap().insert(conn_id, tx);
+        let mk = |json: &str| -> Filter { serde_json::from_str(json).unwrap() };
+
+        // 无订阅 → false
+        assert!(!state.has_subscription_for("chan-1"));
+
+        // kinds 含 9 且 #h 命中 → true
+        state
+            .subs
+            .lock()
+            .unwrap()
+            .entry(conn_id)
+            .or_default()
+            .insert(
+                "s1".into(),
+                vec![mk(r##"{"kinds":[9,46010],"#h":["chan-1"],"since":1}"##)],
+            );
+        assert!(state.has_subscription_for("chan-1"));
+
+        // #h 不命中 → false（别的频道的订阅不算）
+        assert!(!state.has_subscription_for("chan-2"));
+
+        // kinds 不含 9（如纯 membership 订阅）→ 不算 kind-9 消费者
+        let mut subs = state.subs.lock().unwrap();
+        subs.get_mut(&conn_id).unwrap().clear();
+        subs.get_mut(&conn_id).unwrap().insert(
+            "s2".into(),
+            vec![mk(r##"{"kinds":[39002],"#h":["chan-1"]}"##)],
+        );
+        drop(subs);
+        assert!(
+            !state.has_subscription_for("chan-1"),
+            "没订 kind-9 就不是消费者"
+        );
+        drop(state);
+        drop(_rx);
+        drop(_rx2);
+        remove_test_db(&db);
+    }
+
+    /// 准入权威回归（审查 #205r3 高危）    /// 准入权威回归（审查 #205r3 高危）：**验签只证明自洽，不证明可信**。任意本地
     /// 进程都能生成一把新密钥签一条合法事件，而 buzz-acp 的 discover_channels 把
     /// kind 39000 的 about 当**角色 system prompt** 用（喂给带工具权限的 agent）——
     /// 所以频道元数据/成员只能认桥身份，kind-9 只认桥或 agent，其余 kind 拒收，
@@ -669,6 +779,9 @@ pub struct RelayState {
     bridge_keys: Keys,
     /// agent 身份公钥（hex）——回流事件按它识别
     agent_pubkey: String,
+    /// 同上的解析结果（构造时一次）；None = 身份非法/空（I1：消息无法「发给
+    /// agent」，publish 必须如实失败而非发出一条没人收的事件）
+    agent_pk: Option<nostr::PublicKey>,
     /// kind 9 回流（频道 uuid → 文本）
     pub reply_tx: tokio::sync::mpsc::UnboundedSender<AgentReply>,
 }
@@ -687,6 +800,7 @@ impl RelayState {
                 channels: std::sync::RwLock::new(HashMap::new()),
                 conns: Mutex::new(HashMap::new()),
                 subs: Mutex::new(HashMap::new()),
+                agent_pk: nostr::PublicKey::from_hex(&agent_pubkey).ok(),
                 conn_seq: AtomicU64::new(1),
                 last_no_sub_warn: AtomicU64::new(0),
                 bridge_keys: bridge_keys.clone(),
@@ -743,13 +857,26 @@ impl RelayState {
             );
             return false;
         }
-        // 单 #h tag：buzz-acp extract_h_tag_uuid 取首个命中，冗余 tag 无益（对齐其
-        // build_typing_event 的单 tag 形态）；abb-mid 自定义 tag 保事件 id 唯一。
+        // I1 口径：没有合法 agent 身份 = 消息「发不出去给谁」——如实失败，
+        // 不发一条注定无人订阅的事件（审查 #205r5：测试夹具的空串暴露的正是
+        // 这个分支，生产里 init 必然生成真钥）。
+        let Some(agent_pk) = self.agent_pk else {
+            crate::log!("[mini-relay] ⚠️ agent 身份未配置（pubkey 为空/非法），消息无法定址，拒发");
+            return false;
+        };
+        // tag 三件套（缺一不可，审查 #205r5）：
+        // - #h：频道（buzz-acp extract_h_tag_uuid / REQ #h）
+        // - #p：**agent 公钥**——acp 默认 subscribe=mentions，订阅 filter 为
+        //   {"kinds":[9,…],"#h":[uuid],"#p":[agent]}；消息不带 #p 就永远匹配不上
+        //   订阅（fan-out 与 REQ 回放都进不去，静默无回复）。语义也正确：消息是
+        //   「发给这个 agent」的。
+        // - abb-mid：保事件 id 唯一（同秒同文不撞 hash）。
         let ev = EventBuilder::new(Kind::Custom(9), content)
             .tag(Tag::custom(
                 TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
                 [uuid.as_str()],
             ))
+            .tag(Tag::public_key(agent_pk))
             .tag(Tag::custom(TagKind::custom("abb-mid"), [mid]))
             .sign_with_keys(&self.bridge_keys)
             .ok();
@@ -1004,10 +1131,11 @@ impl RelayState {
 
     /// fan-out：发给所有命中的订阅。
     fn fan_out(&self, e: &Event) {
-        // 先收集再发（不持锁跨 send）；发送失败的连接**当场摘掉**——半开连接的
-        // tx.send 会一直 Ok 而 sink 早已死，留着它会让 has_subscription_for
-        // 永远返回真，dispatch 预检形同虚设（审查 #205r4）。ws_loop 退出时也摘，
-        // 这里是「对端不再读」的第二道清理。
+        // 先收集再发（不持锁跨 send）。send 失败 = 接收端已被 drop = ws_loop 已
+        // 退出（ws_loop 自己也会清，这里是竞态窗口内的兜底）。注意**不能**指望它
+        // 清「半开 TCP」：无界 mpsc 对半开连接的 send 永远 Ok——那类僵尸要靠 acp
+        // 自己的 30s Ping 断线重连兜底（buzz relay.rs:47、2026），注释不得夸大
+        // （审查 #205r5）。
         let mut targets: Vec<(u64, String)> = Vec::new();
         {
             let conns = self.conns.lock().unwrap();
@@ -1061,29 +1189,49 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// NIP-42 auth 事件裁决（纯函数，可测）：kind=22242 + 自洽签名 + challenge tag
+/// 必须等于**本连接**发出的那条（acp 的 auth 两个分支都带 challenge tag，buzz
+/// relay.rs:3530-3548）。Err = 拒绝原因（进 OK 的 message 与日志）。
+fn auth_decision(ev: &nostr::Event, expected_challenge: &str) -> Result<(), String> {
+    if ev.kind.as_u16() != 22242 {
+        return Err(format!("invalid: kind {} is not 22242", ev.kind.as_u16()));
+    }
+    if !ev.verify_id() || !ev.verify_signature() {
+        return Err("invalid: signature or id".into());
+    }
+    let got = ev
+        .tags
+        .iter()
+        .find(|t| {
+            t.as_slice()
+                .first()
+                .is_some_and(|k| k.as_str() == "challenge")
+        })
+        .and_then(|t| t.as_slice().get(1))
+        .map(|v| v.as_str())
+        .unwrap_or("");
+    if got != expected_challenge {
+        return Err("invalid: challenge tag mismatch".into());
+    }
+    Ok(())
+}
+
 async fn ws_upgrade(
     axum::extract::State(state): axum::extract::State<Arc<RelayState>>,
     headers: axum::http::HeaderMap,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
-    // **WS 握手不受 CORS 约束**：浏览器会为跨源 WS 带上 Origin，而 relay 只听
-    // 127.0.0.1 并不构成防护——用户访问的任意网页都能开 ws://127.0.0.1:port，
-    // 认证后 REQ 就能拉走全量对话存档（写侧已在 admit 收口，读侧此前完全敞开）。
-    // 因此：**带 Origin 且不是回环源**即拒；命令行/原生客户端不发 Origin，放行。
+    // **WS 握手不受 CORS 约束**：浏览器会为跨源 WS 带上 Origin（=发起页的源），
+    // 而 relay 只听 127.0.0.1 并不构成防护——用户访问的任意网页都能开
+    // ws://127.0.0.1:port 拉走全量对话存档。因此：**带 Origin 且 host 非回环**即拒；
+    // 原生客户端不发 Origin，放行。必须**解析后精确比对 host**——前缀匹配
+    // （starts_with）会被 `http://127.0.0.1.evil.com` 绕过，"null" 白名单会放进
+    // file:// 页面与沙箱 iframe（审查 #205r5）。
     if let Some(origin) = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
     {
-        let local = [
-            "http://127.0.0.1",
-            "https://127.0.0.1",
-            "http://localhost",
-            "https://localhost",
-            "null",
-        ]
-        .iter()
-        .any(|p| origin.starts_with(p));
-        if !local {
+        if !origin_allowed(origin) {
             crate::log!("[mini-relay] ⚠️ 拒绝非回环 Origin 的 WS 握手: {origin}");
             return axum::http::Response::builder()
                 .status(axum::http::StatusCode::FORBIDDEN)
@@ -1092,6 +1240,30 @@ async fn ws_upgrade(
         }
     }
     upgrade.on_upgrade(move |socket| async move { ws_loop(state, socket).await })
+}
+
+/// Origin 是否来自回环宿主。解析 `scheme://host[:port]` 后**精确比对 host**
+/// （端口/协议不限——本机页面本就是用户自己跑的；攻击者域名的相似域被拒）。
+/// 不引入 url crate 依赖：手写窄解析（scheme 后取到第一个 `/`，IPv6 取 `[..]`）。
+/// `None`（原生客户端不发 Origin）由调用方放行。**不含 "null"**：file:// 页面与
+/// 沙箱 iframe 发的就是它。
+fn origin_allowed(origin: &str) -> bool {
+    let Some((_, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped
+            .split_once(']')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
 }
 
 /// WS 会话：AUTH challenge → 帧循环（EVENT/REQ/CLOSE）。
@@ -1135,21 +1307,25 @@ async fn ws_loop(state: Arc<RelayState>, socket: axum::extract::ws::WebSocket) {
                         // 硬等 `accepted=true`，拿不到就 return Err → 重试梯耗尽
                         // → 进程非零退出 → 正好喂给 ABB 的崩溃重拉循环（表现为
                         // 「relay 在跑、日志说已拉起、永远没有回复」）。
-                        // 门禁强度：只校验 kind=22242 + 自洽签名，不校验它签的是
-                        // 本轮 challenge（回环信任模型）；但**认证标记用于挡 REQ**：
-                        // 未认证的连接不给读（见下），配合 Origin 检查关掉浏览器
-                        // 侧 WS 旁路（WS 不受 CORS 约束）。
-                        let ok = ev.kind.as_u16() == 22242
-                            && ev.verify_id()
-                            && ev.verify_signature();
-                        if ok {
-                            authenticated = true;
-                        }
-                        let ack = format!(
-                            "[\"OK\",\"{}\",{ok},\"{}\"]",
-                            ev.id.to_hex(),
-                            if ok { "" } else { "invalid: not a signed 22242" }
-                        );
+                        // 校验：kind=22242 + 自洽签名 + **challenge tag 必须等于
+                        // 本连接发的那条**（acp 两个分支都带 challenge tag，buzz
+                        // relay.rs:3530-3548；NIP-42 语义本身如此）——否则别的
+                        // 连接/别的会话的 auth 事件可以重放过来顶替认证。
+                        // Origin 检查挡的是浏览器旁路；challenge 校验挡的是
+                        // 「拿别处 auth 事件来重放」，两道各管一面。
+                        let (ok, why) = match auth_decision(&ev, &challenge) {
+                            // **必须回写认证标记**——上一版重构时把它弄丢，读侧门禁
+                            // 将永远关死（unused_mut 警告暴露，教训：重构后立即编译）
+                            Ok(()) => {
+                                authenticated = true;
+                                (true, String::new())
+                            }
+                            Err(why) => {
+                                crate::log!("[mini-relay] ⚠️ 拒绝 AUTH: {why}");
+                                (false, why)
+                            }
+                        };
+                        let ack = format!("[\"OK\",\"{}\",{ok},\"{why}\"]", ev.id.to_hex());
                         if sink.send(WsMessage::Text(ack.into())).await.is_err() {
                             break;
                         }
