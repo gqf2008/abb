@@ -20,14 +20,6 @@ pub fn apply_no_window(cmd: &mut std::process::Command) {
     cmd.creation_flags(0x0800_0000);
 }
 
-/// tokio Command 版：spawn 外部子进程时抑制控制台窗口（CREATE_NO_WINDOW，#104）。
-/// tokio 的 Command 内部包 std Command，经 `as_std_mut()` 设同一标志位。
-#[cfg(windows)]
-pub fn apply_no_window_tokio(cmd: &mut tokio::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.as_std_mut().creation_flags(0x0800_0000);
-}
-
 /// 组 PATH：claude 在 ~/.local/bin，codex/lark-cli 在 ~/.npm-global/bin；launchd 环境精简须显式带。
 /// 分平台：分隔符 win 用 `;`、unix 用 `:`；常见安装目录各平台不同。
 #[cfg(unix)]
