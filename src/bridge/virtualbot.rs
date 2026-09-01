@@ -153,8 +153,20 @@ impl Bridge {
                 }
                 return;
             }
-            // 无在跑任务 → 命令化反馈，不喂给 agent
-            if let Err(e) = self.send_reply(&ev, "✅ 当前没有正在运行的任务。").await {
+            // 无在跑任务 → 命令化反馈，不喂给 agent。#200：buzz bot 说「没有正在运行
+            // 的任务」不诚实（dispatch 即返回、回复异步回流，桥侧没有同步轮次记账，
+            // 也无打断协议）——只陈述「不支持打断」这个能力事实，不断言有没有轮次在跑
+            //（审查 #205r2）。
+            // 口径必须与 dispatch 一致（per-bot effective_backend，不是全局默认）——
+            // 否则 default=claude + 本 bot=buzz 时仍答「没有正在运行的任务」，正是
+            // 这条文案要消除的不诚实（审查 #205r3）。
+            let msg = if Backend::parse(self.bot.effective_backend(&self.default_backend)).is_buzz()
+            {
+                "⏳ buzz 后端的一轮对话不支持中途打断（session/prompt 原子执行）；若有轮次在跑，等它回复即可继续。"
+            } else {
+                "✅ 当前没有正在运行的任务。"
+            };
+            if let Err(e) = self.send_reply(&ev, msg).await {
                 crate::log!("[bridge] /cancel 确认发送失败: {e:#}");
             }
             return;
@@ -337,6 +349,54 @@ impl Bridge {
         // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
         // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
         let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
+        // #200 Phase 2：buzz 路径资格预检——必须在 **prompt 组装与历史落盘之前**
+        // （审查 #205r2）：预检不过 = 这一轮根本不会发生，既不该白烧迁移历史读/指令块
+        // 拼接，更不该往 ABB 历史里写一条「有去无回」的用户轮（单边历史会在日后
+        // buzz→CLI 切换时被当上下文注入）。三条资格：
+        // ① mini-relay 可用（未启用/初始化失败 → 无法服务）；
+        // ② 本会话是已登记的虚拟 Bot 群（频道集是启动快照，p2p/未登记群不支持）；
+        // ③ **不是受限会话**——CLI 路径对授权者（Granted）的硬闸是 agent::run 里
+        //    挂的 guard hook/沙箱，buzz 走 acp 侧自己的工具权限（permission-mode 默认
+        //    bypass），RESTRICT_PREAMBLE 只是提示文本。guard→request_permission 映射
+        //    未落地前（#206），给受限用户跑 buzz = 静默提权，必须拒绝而非降级运行。
+        if backend.is_buzz() {
+            let reason = match self.buzz_relay_state.as_ref() {
+                None => Some("mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）"),
+                Some(relay) => {
+                    let uuid = crate::buzzrelay::channel_uuid(&self.bot.key(), &ev.chat_id);
+                    if relay.channel_by_uuid(&uuid).is_none() {
+                        Some("本会话不是已登记的虚拟 Bot 群（新登记的群需重启后参与 buzz）")
+                    } else if !relay.has_subscription_for(&uuid) {
+                        // 判据是「有连接 REQ 订阅了本频道」而非裸连接数：握手未完、
+                        // 半开连接、别的 WS 客户端都不算消费者（#205r4）。
+                        // 无消费者时入库只是「寄望对端水位补发」（ABB 不掌握其语义），
+                        // 用户侧是无限等待——当场报错优于静默悬挂（账本式超时见 #206）。
+                        Some("buzz-acp 未订阅本频道（未连接/未就绪），本轮无法执行")
+                    } else if crate::config::restrict_granted(ev.role, &self.bot.key()) {
+                        Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(why) = reason {
+                crate::log!(
+                    "[bridge] ⚠️ buzz 路径预检未通过 chat={}: {why}",
+                    trunc(&ev.chat_id, 12)
+                );
+                self.pending.remove(&ev.mid);
+                if let Err(e) = self
+                    .send_reply(&ev, &format!("⚠️ buzz 后端无法处理本条消息：{why}。"))
+                    .await
+                {
+                    crate::log!(
+                        "[bridge] ⚠️ buzz 预检失败提示发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    );
+                }
+                return;
+            }
+        }
         // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
         // 附件元数据行带路径/mime/sha256，agent 可直接读取工作区文件内容。
         let has_text = !text.is_empty();
@@ -602,6 +662,57 @@ impl Bridge {
             (lock_ret, epoch, injected_rounds)
         };
 
+        // #200 Phase 2：buzz 后端短路——消息写入 mini-relay（buzz-acp 订阅触发
+        // buzz-agent），回复经回流通道异步发回聊天平台，不走 CLI spawn（run_once 的
+        // Buzz 臂 unreachable，旁路调用方在 agent::run/generate_* 有守卫）。与 CLI
+        // 路径的差异：
+        // - 会话上下文由 buzz-acp 的 channel→session 持有：ABB 侧首轮迁移注入照常
+        //   （注入闸照跑），发布成功后 mark_started + 落 marker，防后续每轮重复注入
+        //   （CLI 路径这步在 run 返回后做；buzz 无同步轮次，就地补齐）。
+        // - 中断：session/prompt 原子，一轮内无可叫停点——不注册 cancel flag；自然
+        //   停止词按普通消息透传进频道（与 CLI 无在跑任务时一致）。已知边界：buzz
+        //   轮次进行中的叫停无协议支持（#200 后续 steer/cancel）。
+        // - typing/DONE 表情不出现：无同步轮次可挂（回复回流路径也不发表情）。
+        if backend.is_buzz() {
+            crate::log!(
+                "[bridge] buzz 路径：写入 mini-relay chat={} len={}",
+                trunc(&ev.chat_id, 12),
+                prompt.chars().count()
+            );
+            // 预检已保证 relay 存在 + 频道已登记 + 非受限会话；这里 false 只剩
+            // 「签名失败 / 入库失败（磁盘等）」——同样给可见报错，且不消耗会话闸。
+            let delivered = self
+                .buzz_relay_state
+                .as_ref()
+                .expect("buzz 预检通过则 relay 必在")
+                .publish_user_message(&self.bot.key(), &ev.chat_id, &ev.mid, &prompt)
+                .await;
+            // 发布即处理完毕：摘 pending（重启不重放；发布-摘除间崩溃 = 重启重放
+            // 重复 prompt，at-least-once 语义，可接受）。
+            self.pending.remove(&ev.mid);
+            if !delivered {
+                if let Err(e) = self
+                    .send_reply(
+                        &ev,
+                        "⚠️ buzz 后端消息写入 mini-relay 失败（详见服务日志），请重发或换后端。",
+                    )
+                    .await
+                {
+                    crate::log!(
+                        "[bridge] ⚠️ buzz 未送达报错发送失败 chat={}: {e:#}",
+                        trunc(&ev.chat_id, 10)
+                    );
+                }
+                return;
+            }
+            // mark_started 是防重复注入的主闸（resume 轮不再注入）；marker 与 CLI
+            // 成功路径同形（注入轮的迁移标记）。mark_started_if 的槽位校验天然挡
+            // 与 /new 的竞态；marker 错写旧 sid 也会因失配下轮重注入（自愈）。
+            if sessions.mark_started_if(&key, &session_id) && injected_rounds.is_some() {
+                hist.set_marker(&session_id, backend.name(), false);
+            }
+            return;
+        }
         let typing_rid = self.msgr.typing(&ev.mid).await;
 
         // cancel flag 注册进 cancel_flags，供该 chat 后续「停止词」消息叫停。

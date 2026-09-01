@@ -73,6 +73,15 @@ pub async fn run_once_with_days(
     let store = &bridge.sessions;
     let mut report = GcReport::default();
 
+    // #200：buzz 后端不经 CLI → 归纳无法执行。整轮**一次性**跳过并留一行日志：
+    // 落到 per-chat 循环里撞 agent::run 的守卫，会变成「每 chat 每天一行 归纳失败」
+    // 的永刷（审查 #205r2）。代价（记录）：buzz bot 的历史/会话不因归纳而收缩，
+    // 接线归纳到 relay 前进 #206。
+    if crate::agent::Backend::parse(&bridge.default_backend).is_buzz() {
+        crate::log!("[session-gc:{bot_key}] buzz 后端不经 CLI，跳过本轮会话归纳（见 #206）");
+        return report;
+    }
+
     for key in select_candidates_in(&workspace, now, days)
         .into_iter()
         .take(MAX_CHATS_PER_RUN)
