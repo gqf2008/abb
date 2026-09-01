@@ -88,21 +88,45 @@ impl BuzzAcpProcess {
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
+
+    /// 硬收整组（崩溃重拉前调用）：SIGTERM → 最长 2s → SIGKILL，然后 reap。
+    /// 用在「旧实例已崩溃但它的 agent 池可能还在」的场合——不先清干净就重拉，
+    /// 新旧两池会同时消费同一频道（重复回复）。关停路径不用它（同步上下文不能
+    /// 阻塞 2s，见 Drop 注释；交由 kill_on_drop + SIGTERM 组播）。
+    pub async fn kill_tree(mut self) {
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.pid {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                }
+                // 给 acp 一次走「stdio 关闭 → 会话终止」的机会（与 agent.rs 同款预算）
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
 }
 
-/// 句柄消亡即收进程组：kill_on_drop 只保证直接子进程，组内 buzz-agent 池由这里
-/// 兜底（崩溃重拉与关停两条路径都经 Drop；不做 SIGTERM→SIGKILL 两段等待——
-/// Drop 里阻塞 2s 会拖住关停路径，池无可保存状态，直接收组）。
+/// 句柄消亡即收进程组。信号选择（审查 #205r3）：**Drop 里只能发 SIGTERM**——
+/// kill_on_drop 仍会对直接子进程补 SIGKILL，而组内的 buzz-acp/buzz-agent 需要
+/// 走完「关 stdio → acp 会话终止」的自退路径；在 Drop（同步、可能正处于优雅关停）
+/// 里做 2s 两段等待会拖住 shutdown_wait，直接 SIGKILL 又会把 acp 主动 shutdown
+/// 时正在 flush 的 relay 尾部事件打断、且违反其 SIGTERM→排空→SIGKILL 惯例。
+/// 需要硬保证的先走 [`BuzzAcpProcess::kill_tree`]（崩溃重拉路径，异步可等）。
 impl Drop for BuzzAcpProcess {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
-            // SAFETY: kill(-pgid, SIGKILL) 只作用于本类型 spawn 时用 process_group(0)
-            // 自建的进程组；pid 取自 Child::id()，进程已退出时 pid 可能被复用——与
-            // agent.rs::kill_agent_tree 同款权衡（杀错组的前提是 pid 已被复用为新组
-            // 组长，实践中窗口极小）。调用只传合法整数、无内存解引用。
+            // SAFETY: kill(-pgid, SIGTERM) 只作用于本类型 spawn 时用 process_group(0)
+            // 自建的进程组；无内存解引用，参数均为合法整数。pid 复用窗口与
+            // agent.rs::kill_agent_tree 同款权衡。
             unsafe {
-                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
             }
         }
     }

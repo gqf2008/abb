@@ -81,7 +81,7 @@ pub async fn run() {
             .filter(|b| {
                 b.enabled
                     && crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend))
-                        == crate::agent::Backend::Buzz
+                        .is_buzz()
             })
             .map(|b| b.key())
             .collect();
@@ -252,9 +252,12 @@ pub async fn run() {
                                 );
                                 terminal = true;
                             }
-                            // 崩溃/等待失败 → 退避后重拉（acp 已随本轮结束 drop）
+                            // 崩溃/等待失败 → **先硬收整组**（旧 acp 的 agent 池可能
+                            // 还活着，不清就重拉会让新旧两池同时消费同一频道 = 重复
+                            // 回复），再退避重拉。关停路径不做这 2s（见 Drop 注释）。
                             _ => {
-                                crate::log!("[mini-relay] ⚠️ buzz-acp 退出异常，{:?} 后重拉", backoff);
+                                crate::log!("[mini-relay] ⚠️ buzz-acp 退出异常，清整组后重拉");
+                                acp.kill_tree().await;
                                 if interruptible_sleep(backoff, &stop).await {
                                     break;
                                 }
@@ -555,6 +558,11 @@ fn spawn_buzz_acp(
 /// → 登记表频道集 → buzz-relay.db 打开 → RelayState（含回复回流通道）→ 种子频道事件。
 /// Err = relay 不可用（磁盘/权限等）：buzz 后端随之不可用，CLI 后端不受影响。
 async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
+    // 配置校验（审查 #205r3）：port 0 = 让 OS 随机挑，但 relay_url 也印 0 →
+    // buzz-acp 永远连不上（而绑定成功，所以零订阅告警看起来像「acp 有问题」）。
+    if cfg.buzz_relay_port == 0 {
+        return Err("buzz_relay_port 不得为 0（会绑到随机端口而 acp 连不上）".into());
+    }
     // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；缺/坏 → 生成并**覆盖**持久化）
     let key_path = crate::bridge_dir().join("buzz-bridge-key");
     let bridge_keys = load_or_repair_key(&key_path, "buzz-bridge-key")?;

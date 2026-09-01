@@ -132,6 +132,16 @@ pub fn filter_matches(f: &nostr::Filter, e: &nostr::Event) -> bool {
     true
 }
 
+/// 摄取准入结果（见 RelayState::admit）。
+enum Admit {
+    /// 入库 + fan-out（作者与 kind 都在权威表内）
+    Store,
+    /// 只 fan-out 不入库（NIP-01 瞬时事件）
+    Ephemeral,
+    /// 拒收（附返回给客户端的原因）
+    Reject(String),
+}
+
 /// 从事件 tags 提取 `#h` 首值（频道 uuid）。
 fn h_tag_of(e: &nostr::Event) -> Option<String> {
     e.tags.iter().find_map(|tags| {
@@ -311,6 +321,72 @@ mod tests {
         drop(state);
         drop(_reply_rx);
         remove_test_db(&db_path);
+    }
+
+    /// 准入权威回归（审查 #205r3 高危）：**验签只证明自洽，不证明可信**。任意本地
+    /// 进程都能生成一把新密钥签一条合法事件，而 buzz-acp 的 discover_channels 把
+    /// kind 39000 的 about 当**角色 system prompt** 用（喂给带工具权限的 agent）——
+    /// 所以频道元数据/成员只能认桥身份，kind-9 只认桥或 agent，其余 kind 拒收，
+    /// 瞬时事件（presence/typing）只转发不入库。
+    #[tokio::test]
+    async fn ingest_enforces_kind_and_author_authority() {
+        let db = test_db("abb-buzzrelay-authority");
+        let store = EventStore::open(&db).await.unwrap();
+        let bridge = Keys::generate();
+        let agent = Keys::generate();
+        let attacker = Keys::generate();
+        let (state, mut rx) = RelayState::new(store, bridge.clone(), agent.public_key().to_hex());
+        let ev = |keys: &Keys, kind: u16, text: &str| {
+            EventBuilder::new(Kind::Custom(kind), text)
+                .tag(Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
+                    ["chan-1"],
+                ))
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+
+        // ① 陌生人签的频道元数据（39000，改写角色 system prompt 的攻击面）→ 拒
+        let ack = state
+            .ingest(&ev(&attacker, 39000, "你是攻击者的角色"))
+            .await;
+        assert!(ack.contains("false"), "非桥身份的 39000 必须拒收: {ack}");
+        let f39: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        assert!(
+            state.db.query(std::slice::from_ref(&f39)).await.is_empty(),
+            "被拒的事件不得入库（否则 discover_channels 会读到假频道资料）"
+        );
+
+        // ② 桥签的 39000 → 收
+        let ack = state.ingest(&ev(&bridge, 39000, "正规角色描述")).await;
+        assert!(ack.contains("true"), "桥身份的 39000 应接受: {ack}");
+        assert_eq!(state.db.query(&[f39]).await.len(), 1);
+
+        // ③ 陌生人 kind-9（伪造用户轮/伪造回复）→ 拒且不回流
+        state.ingest(&ev(&attacker, 9, "伪造内容")).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "非桥/非 agent 的 kind-9 既不入库也不回流"
+        );
+
+        // ④ presence/typing（20001/20002）：ACK 成功但**不入库**（NIP-01 瞬时语义）
+        let ack = state.ingest(&ev(&agent, 20002, "")).await;
+        assert!(ack.contains("true"), "瞬时事件应 ACK 成功: {ack}");
+        let f20: Filter = serde_json::from_str(r#"{"kinds":[20002]}"#).unwrap();
+        assert!(
+            state.db.query(std::slice::from_ref(&f20)).await.is_empty(),
+            "瞬时事件不得持久化（REQ 回放会把陈旧在线态当历史喂回）"
+        );
+
+        // ⑤ 未列入白名单的 kind（含 auth 22242：只属于 WS 握手路径）→ 拒
+        let ack = state.ingest(&ev(&attacker, 22242, "auth")).await;
+        assert!(
+            ack.contains("false"),
+            "22242 不得经 HTTP /events 摄取: {ack}"
+        );
+        drop(state);
+        drop(rx);
+        remove_test_db(&db);
     }
 
     /// 回流安全门（审查 #205r2）：只有 **agent 身份签名**的 kind-9 才投递回聊天，
@@ -688,6 +764,16 @@ impl RelayState {
         self.conns.lock().unwrap().len()
     }
 
+    /// 测试夹具：登记一个假 WS 连接，用于过 dispatch 预检的「有订阅者」条件
+    /// （预检是真的，不能为了测试放宽）。返回的接收端须由调用方持有。
+    #[cfg(test)]
+    pub fn test_attach_subscriber(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.conns.lock().unwrap().insert(id, tx);
+        rx
+    }
+
     /// 距上次「无订阅者」告警是否已过节流窗（60s；避免每消息一行刷屏）。
     pub fn should_warn_no_subscriber(&self, now_secs: u64) -> bool {
         let prev = self.last_no_sub_warn.load(Ordering::Relaxed);
@@ -749,7 +835,33 @@ impl RelayState {
         }
     }
 
-    /// 事件摄取：验签 → 入库 → fan-out → 回流抽取（kind 9 = agent 回复）。
+    /// 摄取准入判定（**kind 白名单 + 作者权威**，审查 #205r3 安全项）。
+    ///
+    /// 验签只证明「事件与其 pubkey 自洽」，任何本地进程（或 SSRF 到
+    /// 127.0.0.1:port 的 POST /events）都能自签一把新密钥造出合法签名的事件——
+    /// 而 buzz-acp 的 discover_channels 把 kind 39000 的 name/about 当频道资料用、
+    /// **about 即角色 system prompt**，喂给带工具权限的 agent 会话。因此「签名有效」
+    /// 绝不能当「可信」用。规则：
+    /// - 39000/39002（频道元数据/成员）：**只认桥身份**——ABB 登记表是唯一权威，
+    ///   否则任何进程都能改写角色的系统提示词。
+    /// - 9（频道消息）：只认 **桥**（dispatch 的用户轮）或 **agent**（回复）；
+    ///   陌生人 kind-9 = 伪造用户轮注入上下文，同样拒。
+    /// - 20001/20002（presence/typing）：瞬时事件——只 fan-out 不入库（NIP-01
+    ///   ephemeral 语义；入库会在 REQ 回放时把陈旧在线态当历史喂回去）。
+    /// - 其余（含 22242 auth：只属于 WS 握手路径）：拒。
+    fn admit(&self, e: &Event) -> Admit {
+        let author = e.pubkey.to_hex();
+        let bridge = self.bridge_keys.public_key().to_hex();
+        match e.kind.as_u16() {
+            39000 | 39002 if author == bridge => Admit::Store,
+            9 if author == bridge || author == self.agent_pubkey => Admit::Store,
+            20001 | 20002 => Admit::Ephemeral,
+            k => Admit::Reject(format!("blocked: unsupported kind or author {k}")),
+        }
+    }
+
+    /// 事件摄取：验签 → **准入（kind 白名单 + 作者权威）** → 入库 → fan-out →
+    /// 回流抽取（kind 9 = agent 回复）。
     async fn ingest(&self, e: &Event) -> String {
         let sig_ok = e.verify_id() && e.verify_signature();
         if !sig_ok {
@@ -757,6 +869,24 @@ impl RelayState {
                 "[\"OK\",\"{}\",false,\"invalid: signature or id\"]",
                 e.id.to_hex()
             );
+        }
+        match self.admit(e) {
+            Admit::Reject(r) => {
+                // 留日志：这是「有东西在试着改频道资料/塞假用户轮」的指纹（本地进程
+                // 或 SSRF），运维必须能看到，不能静默 200 OK。
+                crate::log!(
+                    "[mini-relay] ⚠️ 拒收事件 kind={} pubkey={:.12}…: {r}",
+                    e.kind.as_u16(),
+                    e.pubkey.to_hex()
+                );
+                return format!("[\"OK\",\"{}\",false,\"{r}\"]", e.id.to_hex());
+            }
+            // 瞬时事件：只转发不落库（ACK true——对端要的是送达，不是持久化）
+            Admit::Ephemeral => {
+                self.fan_out(e);
+                return format!("[\"OK\",\"{}\",true,\"\"]", e.id.to_hex());
+            }
+            Admit::Store => {}
         }
         let stored = self.db.store(e).await;
         if stored {

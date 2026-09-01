@@ -1949,6 +1949,51 @@ mod tests {
     // ---- #200 Phase 2：buzz 后端 dispatch（mini-relay 短路）----
 
     #[tokio::test]
+    async fn buzz_zero_subscriber_fails_fast() {
+        // 第三轮审查 finding 3：buzz-acp 未连（未装/崩溃窗口/I5 终态）时，入库只是
+        // 「等它重连背充」，用户侧是无限等待——必须当场可见失败，不静默悬挂。
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_ns";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-nosub");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            String::new(),
+        );
+        // 频道已登记，但**没有任何 WS 连接**
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("未连接")),
+            "无订阅者要当场报错，不能让用户无限等待"
+        );
+        assert!(
+            state.query(std::slice::from_ref(&all)).await.is_empty(),
+            "预检未过不得入库（也不消耗会话闸）"
+        );
+        assert!(!bridge.sessions.is_started(chat));
+        assert!(bridge.pending.is_empty());
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    #[tokio::test]
     async fn buzz_backend_publishes_to_relay_without_cli_spawn() {
         // buzz 后端：消息写入 mini-relay（kind 9 事件含用户文本），不走 CLI spawn
         //（mock runner 若被调用会发出「不应被调用」，据此断言）；无同步回复。
@@ -1980,6 +2025,8 @@ mod tests {
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
             .buzz_relay_state = Some(state.clone());
+        // dispatch 预检要求「有 WS 订阅者」——登记一个假连接（不为测试放宽预检）
+        let _sub = state.test_attach_subscriber();
 
         bridge.handle(test_ev("m1", chat, "第一问")).await;
 
@@ -2098,6 +2145,9 @@ mod tests {
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
             .buzz_relay_state = Some(state.clone());
+        // 假订阅者：预检顺序是「资格 → 策略」，没有订阅者会先撞上「未连接」，
+        // 那样本测试断言的就不是受限拒绝了（第三轮审查 finding 3 引入的顺序）。
+        let _sub = state.test_attach_subscriber();
 
         let mut ev = test_ev("m1", chat, "帮我改代码");
         ev.role = crate::config::SenderRole::Granted;
