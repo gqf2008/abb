@@ -765,6 +765,28 @@ async fn run_bot(
     // （别用独立心跳任务只报「活着」——那测的是上报线程不是通道连通，会话死了托盘还在线。）
     crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "连接中");
 
+    // #209 工作区版本管理：bot 启动时确保工作区带 .git + 基线 commit（内置 libgit2，
+    // 不依赖系统 git）。删除保护快照（trash）与每日整理留痕共用该仓库。失败仅告警
+    // ——版本管理是增强层，绝不阻塞 bot 运行。spawn_blocking：存量工作区首次 init
+    // 要全量 add + commit（文件多时秒级），不能阻塞 tokio worker。
+    {
+        let key = key.clone();
+        let enabled = cfg.workspace_git_enabled;
+        let name: &'static str = Box::leak(format!("wsver-init:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn(name, async move {
+            if !enabled {
+                return;
+            }
+            let workspace = crate::workspace_dir(&key);
+            let res = tokio::task::spawn_blocking(move || crate::wsver::ensure_repo(&workspace))
+                .await
+                .unwrap_or_else(|e| Err(format!("join 失败：{e}")));
+            if let Err(e) = res {
+                crate::log!("[bot:{key}] ⚠️ 工作区版本管理 init 失败（不影响运行）：{e}");
+            }
+        });
+    }
+
     // #25 重启恢复：上次崩溃/退出时未处理完的消息 → 自动续跑（异步进行，不阻塞事件循环
     // 启动；per-chat 串行锁保证重放与实时消息不乱序）。
     // #69 审计：短命任务，登记进治理，**token 逐条检查**（审查 Important）——恢复会跑

@@ -29,6 +29,10 @@ reqwest = { version = "0.12", default-features = false,
 # #200：mini-relay——buzz-acp 消费的 Nostr NIP-01/42/98 协议子集（WS + HTTP 桥）。
 axum = { version = "0.8", features = ["ws"] }
 nostr = "=0.44.7"
+# #209 工作区版本管理：内置 libgit2（进程内 init/add/commit/diff），删除保护快照
+# （trash.rs）与 bot 启动基线（service.rs）共用，不依赖系统 git、不依赖 PATH。
+# 关默认特性（ssh/https/openssl）：纯本地操作，不联网、少一条 C 依赖链。
+git2 = { version = "0.21", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
