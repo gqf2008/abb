@@ -1951,12 +1951,19 @@ mod tests {
     #[tokio::test]
     async fn buzz_backend_publishes_to_relay_without_cli_spawn() {
         // buzz 后端：消息写入 mini-relay（kind 9 事件含用户文本），不走 CLI spawn
-        //（mock runner 若被调用会发出「不应被调用」，据此断言）；无同步回复；
-        // 就地 mark_started，第二轮不重复注入历史（channel→session 上下文在 buzz 侧）。
+        //（mock runner 若被调用会发出「不应被调用」，据此断言）；无同步回复。
+        // 预置旧后端历史（#49 迁移场景）：首轮 prompt 带旧历史并落 marker；第二轮不再
+        // 注入（resume 主闸 + marker 副闸——buzz 侧 channel→session 自带上下文）。
         let bot = backend_bot("buzz");
         let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
         let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
-        // mini-relay 状态：临时库 + 登记一个频道（bot key 与本测试 bot 一致）
+        let chat = "oc_buzz";
+        {
+            let hist = crate::history::History::open(&bot.key(), chat);
+            hist.append_user("old1", "claude", "旧背景");
+            hist.append_assistant("old1", "claude", "旧答复");
+        }
+        // mini-relay 状态：临时库 + 登记一个频道（uuid 按 (bot_key, chat_id) 派生）
         let db_path =
             std::env::temp_dir().join(format!("abb-buzz-bridge-{}.db", uuid::Uuid::new_v4()));
         let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
@@ -1965,7 +1972,6 @@ mod tests {
             nostr::prelude::Keys::generate(),
             String::new(),
         );
-        let chat = "oc_buzz";
         state.set_channels([crate::buzzrelay::Channel {
             uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
             chat_id: chat.into(),
@@ -1978,29 +1984,81 @@ mod tests {
 
         bridge.handle(test_ev("m1", chat, "第一问")).await;
 
-        // 第一轮：kind 9 事件入库、含用户文本（连同每轮必注入的指令文件块，与 CLI
-        // 路径的 prompt 组装同源）；无 CLI 调用、无同步回复；pending 摘除、会话
-        // mark_started（首轮迁移注入后防重复闸的前置）。
+        // 第一轮：kind 9 入库（用户文本 + 每轮必注入的指令块 + 迁移注入的旧历史）；
+        // 无 CLI 调用、无同步回复；pending 摘除、mark_started、marker 落盘。
         let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         let evs = state.query(std::slice::from_ref(&all)).await;
         assert_eq!(evs.len(), 1, "消息应写入 mini-relay");
         assert!(evs[0].content.contains("第一问"));
+        assert!(
+            evs[0].content.contains("旧背景"),
+            "首轮应带 #49 迁移注入的旧历史"
+        );
         assert!(msgr.sent().is_empty(), "buzz 路径无同步回复");
         assert!(bridge.pending.is_empty(), "发布即处理完毕，pending 应摘除");
         assert!(
             bridge.sessions.is_started(chat),
             "buzz 轮完成应 mark_started"
         );
+        let sid = bridge.sessions.ensure_with_started(chat).0;
+        let marker = crate::history::History::open(&bot.key(), chat).marker();
+        assert!(
+            matches!(&marker, Some(m) if m.session_id == sid && !m.pending),
+            "注入轮应落非 pending marker（去掉 marker 写入逻辑此断言必红）"
+        );
 
-        // 第二轮：marker 已落盘 → 不再把历史重复注入 prompt（事件内容无「用户: 」块）。
+        // 第二轮：不再注入历史（旧背景不得再进 prompt）。
         bridge.handle(test_ev("m2", chat, "第二问")).await;
         let evs = state.query(&[all]).await;
         assert_eq!(evs.len(), 2);
         assert!(evs[1].content.contains("第二问"));
         assert!(
-            !evs[1].content.contains("用户: "),
+            !evs[1].content.contains("旧背景"),
             "第二轮不应重复注入历史（buzz 会话上下文由 channel→session 持有）"
         );
+        cleanup_bridge(&bridge);
+    }
+
+    #[tokio::test]
+    async fn buzz_undelivered_replies_error_and_keeps_gate() {
+        // buzz dispatch 失败面：① relay None（未启用/初始化失败）；② relay Some 但
+        // chat 无频道（未登记/登记晚于启动）。两种都必须用户可见「未送达」报错、
+        // 摘 pending、且不 mark_started——一次性迁移注入闸不能被没发生的轮次消耗。
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+
+        // ① relay None
+        bridge.handle(test_ev("m1", "oc_n", "你好")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("未送达")),
+            "relay 不可用必须可见报错，不做静默黑洞"
+        );
+        assert!(bridge.pending.is_empty());
+        assert!(
+            !bridge.sessions.is_started("oc_n"),
+            "未送达轮不得 mark_started（迁移注入闸保留）"
+        );
+
+        // ② relay Some 但该 chat 未登记为频道
+        let db_path =
+            std::env::temp_dir().join(format!("abb-buzz-neg-{}.db", uuid::Uuid::new_v4()));
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            String::new(),
+        );
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state);
+        bridge.handle(test_ev("m2", "oc_x", "再试")).await;
+        assert!(
+            msgr.sent().iter().filter(|t| t.contains("未送达")).count() >= 2,
+            "无频道会话同样要可见报错"
+        );
+        assert!(bridge.pending.is_empty());
+        assert!(!bridge.sessions.is_started("oc_x"));
         cleanup_bridge(&bridge);
     }
 

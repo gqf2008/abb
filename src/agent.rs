@@ -504,6 +504,13 @@ pub async fn run(
     if prompt.is_empty() {
         return Err("（空消息，没收到内容）".into());
     }
+    // #200：buzz 后端不经 CLI run 路径——聊天侧由 bridge dispatch 写 mini-relay，
+    // 旁路调用方（run_job 定时任务 / session_gc 会话归纳）在此拒绝并给出人话错误。
+    // 没有这道守卫：它们会撞 run_once 的 unreachable! panic（panic 被 tasks 捕获
+    // 只留 stderr，且 run_job 的去重槽位/取消标志泄漏——审查 #205）。
+    if matches!(backend, Backend::Buzz) {
+        return Err("⚠️ buzz 后端不经 CLI 执行：定时任务/会话归纳等旁路暂未接线（Phase 2 仅聊天 dispatch）。".into());
+    }
 
     // 受限模式判定：授权者会话且该 bot 的「授权者 agent 隔离」开关未放宽。
     // 每次热读 config（授权/关开关即时生效，与访问控制一致）；读不到按安全默认 true。
@@ -1405,6 +1412,14 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
 /// #123 同根因加固（2026-08-27）：codex 分支补 `--skip-git-repo-check`（非 git 目录
 /// 下 codex 拒绝执行 → 空输出），stderr 改管道透传（失败原因可定位，不再静默空结果）。
 pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
+    // #200：buzz 是 ACP 常驻执行层（mini-relay 驱动），一次性 CLI spawn 不适用——
+    // 裸起 buzz-agent 无 ACP 握手，只会挂到超时/空输出（审查 #205）。GUI「✨生成」
+    // 按钮对 buzz bot 给明确错误（调用方展示 err）。
+    if matches!(backend, Backend::Buzz) {
+        anyhow::bail!(
+            "角色提示词生成暂不支持 buzz 后端（请临时切 claude/codex 生成，或手写群介绍）。"
+        );
+    }
     let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
               不要解释、不要引号、不要“角色名：”前缀。";
@@ -1557,7 +1572,9 @@ async fn run_once(
     let mut cmd = match backend {
         Backend::Buzz => {
             // #200：buzz 后端不经 run_once spawn（走 mini-relay → buzz-acp → buzz-agent）。
-            // 此分支仅为 match 完整性保留；调用方（bridge）在 dispatch 前已拦截 Buzz。
+            // 到达本函数的前置守卫：聊天侧 bridge.handle 短路（dispatch 写 relay）、
+            // 旁路侧 agent::run 入口拒绝（run_job/session_gc，审查 #205）——此臂仅
+            // 为 match 完整性保留，unreachable 作 tripwire。
             unreachable!("buzz backend is dispatched via mini-relay, not run_once")
         }
         Backend::Codex => {

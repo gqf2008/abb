@@ -215,6 +215,12 @@ pub async fn generate_team_plan(
     if goal.trim().is_empty() {
         return Err("团队目标不能为空。".into());
     }
+    // #200：buzz = ACP 常驻执行层（mini-relay），本函数的一次性 CLI spawn 模式不适用
+    // （裸起 buzz-agent 无 ACP 握手 → 挂死）。守卫放 generate 入口即覆盖唯一生产调用
+    // 路径（build_agent_command 仅此处被调，其余为单测）。审查 #205。
+    if matches!(backend, crate::agent::Backend::Buzz) {
+        return Err("团队方案生成暂不支持 buzz 后端（请临时切 claude/codex 生成）。".into());
+    }
     let template = resolve_template(template_name);
     let prompt = build_generation_prompt(&template, goal, members);
 

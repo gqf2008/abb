@@ -232,28 +232,43 @@ mod tests {
         assert_eq!(h_tag_of(&e2), None);
     }
 
-    /// publish_user_message（#200 dispatch）：已登记 chat → kind 9 入库、单个 #h tag
-    /// 指向频道 uuid、内容原样；未登记 chat → 不产生事件（日志提示，不静默丢）。
+    /// publish_user_message（#200 dispatch）：uuid 按 (bot_key, chat_id) 派生定位频道；
+    /// 未登记 → false 且不入库；已登记 → true、kind 9、单 #h tag、内容原样；
+    /// 同秒同文不同 mid → 两条独立入库（事件 id 含 mid tag，不撞 hash 被吞）。
     #[tokio::test]
     async fn publish_user_message_maps_channel_with_single_h_tag() {
         let db_path =
             std::env::temp_dir().join(format!("abb-buzzrelay-pub-{}.db", uuid::Uuid::new_v4()));
         let store = EventStore::open(&db_path).await.unwrap();
         let (state, _reply_rx) = RelayState::new(store, Keys::generate(), String::new());
+        let uuid_a = channel_uuid("bot_a", "oc_a");
         state.set_channels([Channel {
-            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            uuid: uuid_a.clone(),
             chat_id: "oc_a".into(),
             name: "角色A".into(),
             about: String::new(),
         }]);
 
-        // 未登记 chat：不入库
-        state.publish_user_message("oc_unknown", "hi").await;
+        // 未登记 chat（含「另一 bot 的同名 chat」——uuid 含 bot_key，不串线）：false 不入库
+        assert!(
+            !state
+                .publish_user_message("bot_x", "oc_a", "m0", "hi")
+                .await
+        );
+        assert!(
+            !state
+                .publish_user_message("bot_a", "oc_unknown", "m0", "hi")
+                .await
+        );
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         assert!(state.db.query(std::slice::from_ref(&all)).await.is_empty());
 
-        // 已登记 chat：kind 9 入库，单 #h tag，内容原样
-        state.publish_user_message("oc_a", "你好，buzz").await;
+        // 已登记频道：true、kind 9、单 #h tag、内容原样
+        assert!(
+            state
+                .publish_user_message("bot_a", "oc_a", "m1", "你好，buzz")
+                .await
+        );
         let evs = state.db.query(&[all]).await;
         assert_eq!(evs.len(), 1);
         let e = &evs[0];
@@ -265,10 +280,19 @@ mod tests {
             .filter(|t| t.as_slice().first().is_some_and(|k| k.as_str() == "h"))
             .count();
         assert_eq!(h_count, 1);
-        assert_eq!(
-            h_tag_of(e).as_deref(),
-            Some("11111111-2222-3333-4444-555555555555")
-        );
+        assert_eq!(h_tag_of(e).as_deref(), Some(uuid_a.as_str()));
+
+        // 同秒同文（「好」「好」）：mid 不同 → 事件 id 不同 → 两条都在库（回归：
+        // 无 mid tag 时第二条撞 id 被 INSERT OR IGNORE 静默吞）。
+        state
+            .publish_user_message("bot_a", "oc_a", "m2", "好")
+            .await;
+        state
+            .publish_user_message("bot_a", "oc_a", "m3", "好")
+            .await;
+        let nine: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.db.query(&[nine]).await;
+        assert_eq!(evs.len(), 3, "mid tag 应保证同文不同 mid 的两条各自入库");
     }
 }
 
@@ -295,7 +319,7 @@ pub struct Channel {
 /// 回流事件：虚拟 Bot agent 的回复（kind 9），bridge 据此发回聊天平台。
 #[derive(Debug, Clone)]
 pub struct AgentReply {
-    #[allow(dead_code)]
+    /// 频道 uuid（回流路由键——含 bot 归属，两 bot 同群不串线）
     pub channel_uuid: String,
     pub chat_id: String,
     pub content: String,
@@ -326,6 +350,13 @@ impl EventStore {
              CREATE INDEX IF NOT EXISTS idx_events_kind_h ON events(kind, h_tag, created_at);",
         )
         .await?;
+        // 对话内容工件对齐仓库口径（history/msgstore 0600）：库里是全量 prompt 与
+        // agent 回复，不得世界可读。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(Self { conn })
     }
 
@@ -482,40 +513,52 @@ impl RelayState {
         self.db.query(filters).await
     }
 
-    /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入 mini-relay。
-    /// buzz-acp 订阅到后触发 buzz-agent session/prompt。
-    pub async fn publish_user_message(&self, chat_id: &str, content: &str) {
-        let uuid = self
-            .channels
-            .read()
-            .unwrap()
-            .values()
-            .find(|c| c.chat_id == chat_id)
-            .map(|c| c.uuid.clone());
-        let Some(uuid) = uuid else {
+    /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入指定频道。
+    /// 频道 uuid 由 (bot_key, chat_id) 确定性派生——不扫表按 chat_id 匹配（两 bot
+    /// 同群时会有歧义）。返回 false = 未送达（无频道/签名失败/未入库），调用方负责
+    /// 给用户可见反馈（不做静默黑洞）。mid 进 tag：Nostr 事件 id 是内容哈希，
+    /// 「同秒同文」两条消息不带 mid 会撞 id——第二条被 INSERT OR IGNORE 静默吞。
+    pub async fn publish_user_message(
+        &self,
+        bot_key: &str,
+        chat_id: &str,
+        mid: &str,
+        content: &str,
+    ) -> bool {
+        let uuid = channel_uuid(bot_key, chat_id);
+        if self.channel_by_uuid(&uuid).is_none() {
             // 非虚拟 Bot 群（或登记晚于 relay 启动的频道集快照），不经 relay；
             // 留日志防静默丢消息。
             crate::log!(
-                "[mini-relay] ⚠️ chat 无对应频道，消息不入 relay chat={}",
+                "[mini-relay] ⚠️ chat 无对应频道（未登记/登记晚于启动），消息不入 relay chat={}",
                 crate::agent::truncate(chat_id, 16)
             );
-            return;
-        };
+            return false;
+        }
         // 单 #h tag：buzz-acp extract_h_tag_uuid 取首个命中，冗余 tag 无益（对齐其
-        // build_typing_event 的单 tag 形态）。
+        // build_typing_event 的单 tag 形态）；abb-mid 自定义 tag 保事件 id 唯一。
         let ev = EventBuilder::new(Kind::Custom(9), content)
             .tag(Tag::custom(
                 TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
                 [uuid.as_str()],
             ))
+            .tag(Tag::custom(TagKind::custom("abb-mid"), [mid]))
             .sign_with_keys(&self.bridge_keys)
             .ok();
-        if let Some(e) = ev {
-            let stored = self.db.store(&e).await;
-            if stored {
-                self.fan_out(&e);
-            }
+        let Some(e) = ev else {
+            crate::log!("[mini-relay] ⚠️ 用户消息事件签名失败（桥身份密钥异常），丢弃");
+            return false;
+        };
+        if !self.db.store(&e).await {
+            crate::log!(
+                "[mini-relay] ⚠️ 消息事件未入库（重复 id 或写失败）chat={} mid={}",
+                crate::agent::truncate(chat_id, 16),
+                crate::agent::truncate(mid, 16)
+            );
+            return false;
         }
+        self.fan_out(&e);
+        true
     }
 
     /// agent 身份公钥（hex）。

@@ -153,8 +153,16 @@ impl Bridge {
                 }
                 return;
             }
-            // 无在跑任务 → 命令化反馈，不喂给 agent
-            if let Err(e) = self.send_reply(&ev, "✅ 当前没有正在运行的任务。").await {
+            // 无在跑任务 → 命令化反馈，不喂给 agent。#200：buzz bot 说「没有正在运行
+            // 的任务」不诚实（dispatch 即返回，回复异步回流——用户视角本轮就在跑，
+            // 且无打断协议），给专用文案。
+            let buzz_note = Backend::parse(&self.default_backend) == Backend::Buzz;
+            let msg = if buzz_note {
+                "⏳ buzz 后端一轮对话不支持中途打断（session/prompt 原子）；等本轮回复送达即可继续。"
+            } else {
+                "✅ 当前没有正在运行的任务。"
+            };
+            if let Err(e) = self.send_reply(&ev, msg).await {
                 crate::log!("[bridge] /cancel 确认发送失败: {e:#}");
             }
             return;
@@ -604,13 +612,14 @@ impl Bridge {
 
         // #200 Phase 2：buzz 后端短路——消息写入 mini-relay（buzz-acp 订阅触发
         // buzz-agent），回复经回流通道异步发回聊天平台，不走 CLI spawn（run_once 的
-        // Buzz 臂 unreachable，见 agent.rs）。与 CLI 路径的差异：
+        // Buzz 臂 unreachable，旁路调用方在 agent::run/generate_* 有守卫）。与 CLI
+        // 路径的差异：
         // - 会话上下文由 buzz-acp 的 channel→session 持有：ABB 侧首轮迁移注入照常
-        //   （注入闸照跑），发布后就地 mark_started + 落 marker，防后续每轮重复注入
+        //   （注入闸照跑），发布成功后 mark_started + 落 marker，防后续每轮重复注入
         //   （CLI 路径这步在 run 返回后做；buzz 无同步轮次，就地补齐）。
-        // - 中断：session/prompt 原子，一轮内无可叫停点——不注册 cancel flag（显式
-        //   /cancel 得「没有正在运行的任务」；自然停止词按普通消息透传，与 CLI 无
-        //   在跑任务时一致）。
+        // - 中断：session/prompt 原子，一轮内无可叫停点——不注册 cancel flag；自然
+        //   停止词按普通消息透传进频道（与 CLI 无在跑任务时一致）。已知边界：buzz
+        //   轮次进行中的叫停无协议支持（#200 后续 steer/cancel）。
         // - typing/DONE 表情不出现：无同步轮次可挂（回复回流路径也不发表情）。
         if backend == Backend::Buzz {
             crate::log!(
@@ -618,20 +627,38 @@ impl Bridge {
                 trunc(&ev.chat_id, 12),
                 prompt.chars().count()
             );
-            match self.buzz_relay_state.as_ref() {
-                Some(relay) => relay.publish_user_message(&ev.chat_id, &prompt).await,
-                None => {
-                    crate::log!(
-                        "[bridge] ⚠️ buzz 后端但 mini-relay 不可用（未启用或初始化失败），消息丢弃"
-                    )
+            let delivered = match self.buzz_relay_state.as_ref() {
+                Some(relay) => {
+                    relay
+                        .publish_user_message(&self.bot.key(), &ev.chat_id, &ev.mid, &prompt)
+                        .await
                 }
-            }
+                None => {
+                    crate::log!("[bridge] ⚠️ buzz 后端但 mini-relay 不可用（未启用或初始化失败）");
+                    false
+                }
+            };
             // 发布即处理完毕：摘 pending（重启不重放；发布-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
-            // 首轮迁移注入后的防重复闸（同 CLI 成功路径）。mark_started_if 的槽位
-            // 校验天然挡住与 /new 的竞态；即便 marker 错写旧 sid，失配也会让下轮
-            // 重新走注入闸（自愈），无需 CLI 路径的代际复检。
+            if !delivered {
+                // 用户可见报错（CLI 路径任何轮次都有回执，buzz 不得做成黑洞）。
+                // **不**落会话标记：迁移注入的一次性闸不能被没发生的轮次消耗——
+                // 修好配置重启后首轮仍应带历史。
+                if let Err(e) = self
+                    .send_reply(
+                        &ev,
+                        "⚠️ buzz 后端消息未送达：本会话不是已登记的虚拟 Bot 群，或 mini-relay 未运行（设置开 buzz_relay_enabled 后重启）。",
+                    )
+                    .await
+                {
+                    crate::log!("[bridge] ⚠️ buzz 未送达报错发送失败 chat={}: {e:#}", trunc(&ev.chat_id, 10));
+                }
+                return;
+            }
+            // mark_started 是防重复注入的主闸（resume 轮不再注入）；marker 与 CLI
+            // 成功路径同形（注入轮的迁移标记）。mark_started_if 的槽位校验天然挡
+            // 与 /new 的竞态；marker 错写旧 sid 也会因失配下轮重注入（自愈）。
             if sessions.mark_started_if(&key, &session_id) && injected_rounds.is_some() {
                 hist.set_marker(&session_id, backend.name(), false);
             }
