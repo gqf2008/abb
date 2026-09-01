@@ -1437,6 +1437,15 @@ mod tests {
         assert_eq!(next_backoff(d(61), d(300)), d(2));
     }
 
+    /// 测试临时目录 RAII 清理（审查 #208r2）：assert 失败路径也必须清，
+    /// 不能只在全过时删——guard 在 unwind 时照样 drop。
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// #207：buzz 可执行文件解析顺序——配置覆盖 → 应用包同目录 → ~/.agent-bridge/bin
     /// → PATH → 回退 ~/.agent-bridge/bin 路径。用保证不存在的名字隔离 PATH 环境差异
     /// （本机真装了 buzz-acp 时 PATH 支路命中会让「回退」断言失真）。
@@ -1455,6 +1464,7 @@ mod tests {
         let legacy_bin = bridge.join("bin");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::create_dir_all(&legacy_bin).unwrap();
+        let _cleanup = TempDirGuard(root.clone());
         let name = "buzz-acp-test-fixture-not-installed";
         let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
 
@@ -1487,7 +1497,6 @@ mod tests {
             resolve_buzz_exe("", name, None, &bridge),
             legacy_bin.join(&file)
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// #189 回归护栏（服务期无期限）：健康 bot 循环（不自行结束、无关停广播）期间，

@@ -46,7 +46,8 @@ jobs:
 
       # buzz 的 rust-toolchain.toml 钉 1.95.0（与本仓库 stable 不同），rustup 按需自动装；
       # 注意 rust-toolchain.toml 按 **cwd** 而非 --manifest-path 解析，故必须 cd 进 buzz
-      # 构建（产物路径不变：buzz/target/<triple>/release/）。target 已由上一步装好。
+      # 构建（产物路径不变：buzz/target/<triple>/release/）。macos-14 宿主即 arm64，
+      # host triple == 构建 triple，1.95.0 自带 host std 即可，无需另装 target。
       # -p buzz-agent 会连带产出 fake-mcp（测试桩），下方只挑 buzz-acp/buzz-agent 两个入包。
       - name: Build buzz-acp + buzz-agent (aarch64)
         run: |
