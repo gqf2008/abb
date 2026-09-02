@@ -84,6 +84,11 @@ pub struct History {
     imported_path: PathBuf,
     /// #130 上下文压缩块（压缩后注入优先用它；/new 清历史时一并删）。
     ctxsum_path: PathBuf,
+    /// #206 跟进：历史代际 sidecar（`<key>.epoch`）。代际计数器原本只在内存
+    /// （bridge history_epochs），重启归零而 buzz 回复账本持久——跨重启对账把
+    /// 合法回复误判孤儿（只发不写）、/new 后崩溃的孤儿回复反被放行。sidecar
+    /// 让代际跨重启延续（/new 锁内先落盘再清盘；clear **不**删它，见 clear）。
+    epoch_path: PathBuf,
 }
 
 impl History {
@@ -107,6 +112,7 @@ impl History {
             marker_path: dir.join(format!("{esc}.migrated.json")),
             imported_path: dir.join(format!("{esc}.imported.json")),
             ctxsum_path: dir.join(format!("{esc}.ctxsum")),
+            epoch_path: dir.join(format!("{esc}.epoch")),
         }
     }
 
@@ -247,6 +253,31 @@ impl History {
             crate::log!("[history] ⚠️ 清空失败 path={}", trunc_path(&self.path));
         }
         ok
+    }
+
+    /// #206 跟进：读代际 sidecar。缺失/损坏视为 0——与内存 get-or-create 的起点
+    /// 一致；写侧失败已留痕，读侧静默降级即退回原「重启归零」行为，不因坏行
+    /// 卡死对账。
+    pub(crate) fn read_epoch(&self) -> u64 {
+        std::fs::read_to_string(&self.epoch_path)
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// #206 跟进：写代际 sidecar（/new 的 history_reset 锁内、clear 之前调用）。
+    /// 先落盘新代际再清盘：崩溃窗口内重启 = 旧回复被拦（只发不写，保守正确）；
+    /// 反向顺序则是「盘上代际仍旧值 + 历史已清」→ 孤儿回复被写进新会话。
+    /// 失败仅告警不阻断 /new——中止重置会漏清旧历史，危害更大；此时闸退化为
+    /// 原「重启归零」行为，对账照旧（宁误杀不误放）。
+    pub(crate) fn write_epoch(&self, epoch: u64) {
+        let text = format!("{epoch}\n");
+        if let Err(e) = crate::atomic_write_text(&self.epoch_path, &text) {
+            crate::log!(
+                "[history] ⚠️ 代际 sidecar 写失败（重启后代际闸退化归零）path={}: {e}",
+                trunc_path(&self.epoch_path)
+            );
+        }
     }
 
     pub fn marker(&self) -> Option<MigratedMarker> {
