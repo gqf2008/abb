@@ -308,15 +308,26 @@ pub async fn run() {
             crate::tasks::tasks().spawn_forever("mini-relay-replies", {
                 let stop = stop.clone();
                 let registry = registry_for_replies.clone();
+                // #206 话题隔离：话题频道是运行期动态登记的（dispatch 时 ensure），
+                // 不在上面的启动快照路由表内——路由先查快照（群根频道），未命中再
+                // 按频道登记表的 bot_key 回落（Channel.bot_key 与 uuid 同源登记，
+                // 两 bot 同群不串线）。Bridge 未注册（bot 凭证不齐未启动）仍丢+日志。
+                let state_for_routes = state.clone();
                 async move {
                     loop {
                         let reply = tokio::select! {
                             Some(r) = reply_rx.recv() => r,
                             _ = stop.cancelled() => break,
                         };
-                        let bridge = reply_routes
+                        let bot_key = reply_routes
                             .get(&reply.channel_uuid)
-                            .and_then(|k| registry.get(k));
+                            .cloned()
+                            .or_else(|| {
+                                state_for_routes
+                                    .channel_by_uuid(&reply.channel_uuid)
+                                    .map(|ch| ch.bot_key)
+                            });
+                        let bridge = bot_key.and_then(|k| registry.get(&k));
                         match bridge {
                             Some(b) => b.handle_buzz_reply(reply).await,
                             None => crate::log!(
@@ -687,6 +698,9 @@ async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
             chat_id: v.chat_id.clone(),
             name: v.role_name.clone(),
             about: String::new(),
+            bot_key: v.bot_key.clone(),
+            thread_id: String::new(), // 群根频道；话题频道运行期由 ensure_topic_channel 登记
+            anchor_mid: String::new(),
         })
         .collect();
     let n_channels = channels.len();

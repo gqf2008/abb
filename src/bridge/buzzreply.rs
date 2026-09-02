@@ -28,8 +28,14 @@ impl Bridge {
     /// 未命中的条目不动（留给 buzz-acp 重连水位回放重跑整轮：重放产新回复事件、
     /// e-tag 指向同一用户事件，实时回流再认领——风险②，与现状同为 at-least-once）。
     /// 加载时已把 in-flight 残留归一化为未发（见 replyledger），所以这里没有第三态。
+    ///
+    /// #206 话题隔离：话题频道登记表是 **relay 侧内存态**——重启后话题频道不在
+    /// 表内，ingest/find_agent_replies_to 的频道门（channel_by_uuid）会把话题回复
+    /// 滤掉。故对账前先为话题条目（key=chat:thread）重登记话题频道（幂等，
+    /// ensure_topic_channel 含种子 + 44100 重发）——否则崩溃窗口里的话题回复
+    /// 永远对不回来（群根频道无此问题：启动即登记）。
     pub async fn recover_buzz_replies(&self, stop: &tokio_util::sync::CancellationToken) {
-        let Some(relay) = &self.buzz_relay_state else {
+        let Some(relay) = self.buzz_relay_state.clone() else {
             return; // buzz 未启用：无账本可对了（账本是空的，直接返回）
         };
         let awaiting = self.reply_ledger.awaiting_snapshot();
@@ -48,6 +54,28 @@ impl Bridge {
                     self.bot.key()
                 );
                 break;
+            }
+            // 话题条目：先重登记话题频道（重启后注册表为空，不登记则下方
+            // find_agent_replies_to 的频道门把话题回复滤光）。角色名取群根频道名
+            // （与 dispatch 预检同源）；群根频道不在（该群已取消登记）→ 跳过登记，
+            // 对账照常查（频道门滤掉 = 留账下次再对，不丢账）。
+            if let Some(thread_id) = entry
+                .key
+                .strip_prefix(entry.chat_id.as_str())
+                .and_then(|rest| rest.strip_prefix(':'))
+            {
+                let group_uuid = crate::buzzrelay::channel_uuid(&self.bot.key(), &entry.chat_id);
+                if let Some(group_ch) = relay.channel_by_uuid(&group_uuid) {
+                    relay
+                        .ensure_topic_channel(
+                            &self.bot.key(),
+                            &entry.chat_id,
+                            thread_id,
+                            &group_ch.name,
+                            &entry.mid,
+                        )
+                        .await;
+                }
             }
             // since 下推（审查 P2）：回复不可能早于其用户消息——把扫描界到该轮之后，
             // 免「awaiting 条数 × 全量 kind-9 扫描」。2s 余量吸收秒级边界偏移
@@ -86,7 +114,9 @@ impl Bridge {
         };
         // 关联归属：e-tag 命中 awaiting → 用 dispatch 登记的 key/epoch（话题消息
         // 落回 chat:thread 同一历史，风险③）；未命中（agent 未带 --reply-to / 登记
-        // 被剪）→ key=chat_id 兜底 + 记日志（风险①：软关联是 best-effort，不阻塞发送）。
+        // 被剪）→ 兜底 + 记日志（风险①：软关联是 best-effort，不阻塞发送）。
+        // 兜底 key：话题回复（reply.thread_id 非空）按 chat:thread 落回话题历史
+        // （回复来源频道自带话题维，比 dispatch 登记更直接），群根回复按 chat。
         let (key, epoch, via_fallback) = match &entry {
             Some(e) => (e.key.clone(), Some(e.epoch), false),
             None => {
@@ -95,7 +125,12 @@ impl Bridge {
                     trunc(&reply.chat_id, 12),
                     reply.event_id
                 );
-                (reply.chat_id.clone(), None, true)
+                let key = if reply.thread_id.is_empty() {
+                    reply.chat_id.clone()
+                } else {
+                    format!("{}:{}", reply.chat_id, reply.thread_id)
+                };
+                (key, None, true)
             }
         };
         // 发送串行化：与实时 handle 共用 per-chat 锁，补发/回流不与消息处理交错。
@@ -125,7 +160,27 @@ impl Bridge {
                 );
             }
         }
-        match self.msgr.send_text(&reply.chat_id, &reply.content).await {
+        // #206 话题隔离：回复来源是话题频道 → send_thread_reply 落回原话题
+        // （飞书 reply_in_thread；钉钉/微信无话题概念，平台实现回落普通发送）。
+        // 锚点是频道登记表里的最近话题用户 mid（publish 时更新）——同一话题的
+        // 迟到回复可能锚到更新的消息，飞书侧仍落同一话题（可接受的近似）。
+        // 话题频道但锚点为空 = 异常态（ensure/publish 都会设置）——如实回落
+        // send_text + 日志，不静默吞。
+        let send_result = if reply.thread_id.is_empty() {
+            self.msgr.send_text(&reply.chat_id, &reply.content).await
+        } else if reply.anchor_mid.is_empty() {
+            crate::log!(
+                "[bridge] ⚠️ 话题回复缺锚点 mid（话题频道登记异常？），回落普通发送 chat={} rev={:.12}",
+                trunc(&reply.chat_id, 12),
+                reply.event_id
+            );
+            self.msgr.send_text(&reply.chat_id, &reply.content).await
+        } else {
+            self.msgr
+                .send_thread_reply(&reply.chat_id, &reply.anchor_mid, &reply.content)
+                .await
+        };
+        match send_result {
             Ok(()) => {
                 self.reply_ledger.mark_sent(&reply.event_id);
                 // 回复时龄（事件 created_at → 投递）是回流链路健康度的直接读数：
