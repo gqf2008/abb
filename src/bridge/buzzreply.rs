@@ -120,16 +120,16 @@ impl Bridge {
         let (key, epoch, via_fallback) = match &entry {
             Some(e) => (e.key.clone(), Some(e.epoch), false),
             None => {
-                crate::log!(
-                    "[bridge] ⚠️ buzz 回复无 e-tag 关联（agent 未带 --reply-to 或登记已剪枝），按 chat 兜底 chat={} rev={:.12}",
-                    trunc(&reply.chat_id, 12),
-                    reply.event_id
-                );
                 let key = if reply.thread_id.is_empty() {
                     reply.chat_id.clone()
                 } else {
                     format!("{}:{}", reply.chat_id, reply.thread_id)
                 };
+                crate::log!(
+                    "[bridge] ⚠️ buzz 回复无 e-tag 关联（agent 未带 --reply-to 或登记已剪枝），按会话键兜底 key={} rev={:.12}",
+                    trunc(&key, 24),
+                    reply.event_id
+                );
                 (key, None, true)
             }
         };
@@ -166,6 +166,10 @@ impl Bridge {
         // 迟到回复可能锚到更新的消息，飞书侧仍落同一话题（可接受的近似）。
         // 话题频道但锚点为空 = 异常态（ensure/publish 都会设置）——如实回落
         // send_text + 日志，不静默吞。
+        // 审查 #214 P1-1：send_thread_reply 失败（锚点消息被删/撤回 → 飞书 reply
+        // 永久报错）必须回落 send_text——回复已写历史，无回落则永远投递不出、
+        // 账本无限重试。回落成功 = 投递成功（mark_sent）；两级都败才走下方统一
+        // Err 臂 unclaim 留账（与本函数锚点为空的回落先例同形）。
         let send_result = if reply.thread_id.is_empty() {
             self.msgr.send_text(&reply.chat_id, &reply.content).await
         } else if reply.anchor_mid.is_empty() {
@@ -176,9 +180,21 @@ impl Bridge {
             );
             self.msgr.send_text(&reply.chat_id, &reply.content).await
         } else {
-            self.msgr
+            match self
+                .msgr
                 .send_thread_reply(&reply.chat_id, &reply.anchor_mid, &reply.content)
                 .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    crate::log!(
+                        "[bridge] ⚠️ 话题回复发送失败（锚点消息可能已删/撤回），回落普通发送 chat={} rev={:.12}: {e:#}",
+                        trunc(&reply.chat_id, 12),
+                        reply.event_id
+                    );
+                    self.msgr.send_text(&reply.chat_id, &reply.content).await
+                }
+            }
         };
         match send_result {
             Ok(()) => {
@@ -189,7 +205,7 @@ impl Bridge {
                 crate::log!(
                     "[bridge] buzz 回复已投递{} chat={} 长度={} 时龄={}s",
                     if via_fallback {
-                        "（chat 兜底关联）"
+                        "（无 e-tag 兜底关联）"
                     } else {
                         ""
                     },

@@ -800,6 +800,9 @@ mod tests {
         quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
         /// 设置后：发给该 chat 的消息返回 Err（失败注入，测游标回退链路）。
         fail_chat: Mutex<Option<String>>,
+        /// 审查 #214 P1-1：设置后 send_thread_reply 对该 chat 返回 Err（锚点消息
+        /// 被删/撤回的失败注入），send_text 不受影响——测话题回复的 send_text 回落。
+        fail_thread_reply: Mutex<Option<String>>,
         /// done 回执收集（W2 补发补 DONE 断言用；实时路径 handle 尾部也会调）。
         done: Mutex<Vec<String>>,
         /// 群资料（#75 注入测试）：None=查不到（默认）。
@@ -817,6 +820,7 @@ mod tests {
                 thread_replies: Mutex::new(Vec::new()),
                 quoted: Mutex::new(std::collections::HashMap::new()),
                 fail_chat: Mutex::new(None),
+                fail_thread_reply: Mutex::new(None),
                 done: Mutex::new(Vec::new()),
                 chat_info: Mutex::new(None),
                 created: Mutex::new(Vec::new()),
@@ -884,6 +888,11 @@ mod tests {
             message_id: &str,
             text: &str,
         ) -> anyhow::Result<()> {
+            if let Some(f) = self.fail_thread_reply.lock().unwrap().clone() {
+                if f == chat_id {
+                    anyhow::bail!("模拟话题回复失败（锚点消息已删/撤回）");
+                }
+            }
             self.thread_replies.lock().unwrap().push((
                 chat_id.to_string(),
                 message_id.to_string(),
@@ -2693,6 +2702,101 @@ mod tests {
                 .iter()
                 .any(|(_, _, t)| t.contains("群根回复")),
             "群根回复不得走 send_thread_reply"
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 审查 #214 P1-1：话题回复的 send_thread_reply 失败（锚点消息被删/撤回 →
+    /// 飞书 reply 永久报错）必须回落 send_text——回复已写历史，无回落则永远投递
+    /// 不出、账本每次启动对账无限重试。回落成功 = 投递成功记 sent；拔掉回落分支
+    /// 本测试必红（阳性对照）。
+    #[tokio::test]
+    async fn buzz_thread_reply_falls_back_to_send_text_on_anchor_failure() {
+        let chat = "oc_rl8";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let mut ev = test_ev("m1", chat, "话题里的问题");
+        ev.thread_id = "omt_8".into();
+        bridge.handle(ev).await;
+        let uev = relay_user_event_id(&state).await;
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_8");
+
+        // 锚点消息失效：send_thread_reply 必败，send_text 正常
+        *msgr.fail_thread_reply.lock().unwrap() = Some(chat.into());
+        bridge
+            .handle_buzz_reply(agent_reply_in_thread(
+                &tuuid,
+                chat,
+                "rev-fb",
+                Some(&uev),
+                "话题回复（锚已删）",
+                "omt_8",
+                "m1",
+            ))
+            .await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("话题回复（锚已删）")),
+            "send_thread_reply 失败必须回落 send_text 投递: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            msgr.thread_replies().is_empty(),
+            "失败的话题发送不得留成功记录（回落前不得入 thread_replies）"
+        );
+        assert!(
+            bridge.reply_ledger.is_sent("rev-fb"),
+            "回落投递成功必须记 sent（否则启动对账无限重试）"
+        );
+        // 历史仍写话题 key（回落只影响发送形态，不影响归属）
+        let tkey = format!("{chat}:omt_8");
+        assert!(
+            crate::history::History::open(&bot_key, &tkey)
+                .entries()
+                .iter()
+                .any(|e| !e.user && e.mid == "rev-fb"),
+            "回落后助手轮仍落话题历史"
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 审查 #214 P2-1：受限会话（Granted）的话题消息被拒时不得污染频道注册表——
+    /// ensure_topic_channel 在全闸（含受限闸④）通过之后才执行。闸前登记 = 被拒
+    /// dispatch 也留下话题频道 + 44100 成员通知（预检「不过=无副作用」invariant
+    /// 破坏）。把 buzz_ensure_topic_channel 挪回闸前本测试必红（阳性对照）。
+    #[tokio::test]
+    async fn buzz_restricted_thread_dispatch_registers_nothing() {
+        let chat = "oc_ti3";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_r");
+        let f44100: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[44100]}"#).unwrap();
+
+        let mut ev = test_ev("m1", chat, "受限用户的话题消息");
+        ev.thread_id = "omt_r".into();
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("受限")),
+            "受限会话必须被拒绝: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            state.channel_by_uuid(&tuuid).is_none(),
+            "被拒 dispatch 不得登记话题频道（预检不过=无副作用）"
+        );
+        assert!(
+            state.query(std::slice::from_ref(&f44100)).await.is_empty(),
+            "被拒 dispatch 不得发布 44100 成员通知"
         );
         cleanup_bridge(&bridge);
         drop(state);

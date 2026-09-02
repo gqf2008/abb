@@ -35,18 +35,22 @@ impl Bridge {
         }
     }
 
-    /// #206 话题隔离：dispatch 预检（话题感知）。与 /cancel 的
+    /// #206 话题隔离：dispatch 预检（话题感知，**纯判据无副作用**——预检
+    /// 「不过 = 无副作用」invariant：被拒的 dispatch（含受限会话闸④）不得
+    /// 污染频道注册表，审查 #214 P2-1。话题频道登记（注册 + 种子 + 44100）
+    /// 由 [`Self::buzz_ensure_topic_channel`] 在全闸通过之后执行）。
+    /// 与 /cancel 的
     /// [`buzz_channel_precheck`](Self::buzz_channel_precheck) 差异在话题臂：
     /// - 群根消息：三判据原样（relay 在 → 群根频道已登记 → 群根频道有订阅）。
     /// - 话题消息（thread_id 非空）：话题从属于群——**群根频道必须已登记**
-    ///   （未登记群的话题消息同样拒绝）；话题频道缺失 →
-    ///   [`RelayState::ensure_topic_channel`](crate::buzzrelay::RelayState::ensure_topic_channel)
-    ///   登记（种子 39000/39002 + 44100 成员通知，幂等）后**继续**而非拒绝；
+    ///   （未登记群的话题消息同样拒绝）；话题频道缺失**不再拒绝**（闸后登记）；
     ///   订阅判据放宽为「群根频道有订阅」作 acp 存活代理——话题订阅随 44100
     ///   在途属正常，首条话题消息靠 acp 处理 44100 后的 REQ 回放消费
     ///   （at-least-once 仍在，与群根预检强度不等价——日志如实，见 PR 风险节）。
-    ///   重启自愈同路径：登记表是内存态，重启后首条话题消息在此重登记。
-    async fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<(), BuzzPrecheckFail> {
+    /// 返回 Ok(群根频道名)：群根频道名 = 角色名（service 启动登记自虚拟 Bot
+    /// 登记表），闸后登记话题频道时作话题频道名来源——不另查 vb 快照，防两份
+    /// 来源漂移。
+    async fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
         let Some(relay) = self.buzz_relay_state.as_ref() else {
             return Err(BuzzPrecheckFail::RelayUnavailable);
         };
@@ -57,35 +61,41 @@ impl Bridge {
         if !relay.has_subscription_for(&group_uuid) {
             return Err(BuzzPrecheckFail::SubscriberAbsent);
         }
-        if !ev.thread_id.is_empty() {
-            let is_new = relay
-                .channel_by_uuid(&crate::buzzrelay::topic_channel_uuid(
-                    &self.bot.key(),
-                    &ev.chat_id,
-                    &ev.thread_id,
-                ))
-                .is_none();
-            // 话题频道名与群根同源（群根频道名 = 角色名，service 启动登记自
-            // 虚拟 Bot 登记表）——不另查 vb 快照，防两份来源漂移。
-            relay
-                .ensure_topic_channel(
-                    &self.bot.key(),
-                    &ev.chat_id,
-                    &ev.thread_id,
-                    &group_ch.name,
-                    &ev.mid,
-                )
-                .await;
-            if is_new {
-                crate::log!(
-                    "[bridge] 话题频道已登记（44100 已发，acp 订阅在途）bot={} chat={} thread={}",
-                    self.bot.key(),
-                    trunc(&ev.chat_id, 12),
-                    trunc(&ev.thread_id, 16)
-                );
-            }
+        Ok(group_ch.name)
+    }
+
+    /// #206 话题隔离：话题频道登记——dispatch 全闸（①②③ + 受限会话闸④）通过
+    /// 之后调用（审查 #214 P2-1：被拒 dispatch 不得登记频道/发 44100）。
+    /// 幂等（已登记则 ensure_topic_channel 内部早退）；重启自愈同路径：注册表
+    /// 是内存态，重启后首条话题消息在此重登记。
+    async fn buzz_ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
+        let Some(relay) = self.buzz_relay_state.as_ref() else {
+            return; // 预检已过则 relay 必在；防御性早退
+        };
+        let is_new = relay
+            .channel_by_uuid(&crate::buzzrelay::topic_channel_uuid(
+                &self.bot.key(),
+                &ev.chat_id,
+                &ev.thread_id,
+            ))
+            .is_none();
+        relay
+            .ensure_topic_channel(
+                &self.bot.key(),
+                &ev.chat_id,
+                &ev.thread_id,
+                group_name,
+                &ev.mid,
+            )
+            .await;
+        if is_new {
+            crate::log!(
+                "[bridge] 话题频道已登记（44100 已发，acp 订阅在途）bot={} chat={} thread={}",
+                self.bot.key(),
+                trunc(&ev.chat_id, 12),
+                trunc(&ev.thread_id, 16)
+            );
         }
-        Ok(())
     }
 
     /// 虚拟 Bot 注入数据（#75）：仅登记过的群聊返回 (群名, 群介绍)。
@@ -438,8 +448,8 @@ impl Bridge {
         // 承载，④ 是 dispatch 独有）：
         // ① mini-relay 可用（未启用/初始化失败 → 无法服务）；
         // ② 本会话是已登记的虚拟 Bot 群（频道集是启动快照，p2p/未登记群不支持；
-        //    #206 话题隔离：话题消息只要求**群根频道**已登记——话题频道缺失在预检里
-        //    就地 ensure 登记后继续，不再拒绝）；
+        //    #206 话题隔离：话题消息只要求**群根频道**已登记——话题频道缺失不再
+        //    拒绝，全闸通过后由 buzz_ensure_topic_channel 登记）；
         // ③ 有连接 REQ 订阅了本群根频道（buzz-acp 已就绪——无消费者时入库只是「寄望
         //    对端水位补发」，用户侧是无限等待，#205r4；话题频道订阅随 44100 在途属
         //    正常，故话题消息以群根订阅作 acp 存活代理）；
@@ -448,9 +458,11 @@ impl Bridge {
         //    bypass），RESTRICT_PREAMBLE 只是提示文本。guard→request_permission 映射
         //    未落地前（#206），给受限用户跑 buzz = 静默提权，必须拒绝而非降级运行。
         if backend.is_buzz() {
-            // #206 话题隔离：话题消息走话题感知预检（话题频道缺失 → 登记后继续，
-            // 不再拒绝；订阅判据以群根频道为 acp 存活代理，见 buzz_dispatch_precheck）。
-            let reason = match self.buzz_dispatch_precheck(&ev).await {
+            // #206 话题隔离：话题消息走话题感知预检（话题频道缺失不再拒绝——
+            // 登记在全闸通过后做，见下方 buzz_ensure_topic_channel；订阅判据以
+            // 群根频道为 acp 存活代理，见 buzz_dispatch_precheck）。
+            let precheck = self.buzz_dispatch_precheck(&ev).await;
+            let reason = match &precheck {
                 Err(BuzzPrecheckFail::RelayUnavailable) => {
                     Some("mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）")
                 }
@@ -464,10 +476,10 @@ impl Bridge {
                 Err(BuzzPrecheckFail::SubscriberAbsent) => {
                     Some("buzz-acp 未订阅本频道（未连接/未就绪），本轮无法执行")
                 }
-                Ok(()) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
+                Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
                     Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
                 }
-                Ok(()) => None,
+                Ok(_) => None,
             };
             if let Some(why) = reason {
                 crate::log!(
@@ -485,6 +497,13 @@ impl Bridge {
                     );
                 }
                 return;
+            }
+            // 全闸（①②③ + 受限会话闸④）通过后才登记话题频道（审查 #214 P2-1：
+            // 被拒的 dispatch 不得污染频道注册表/发 44100——预检「不过=无副作用」）。
+            if !ev.thread_id.is_empty() {
+                if let Ok(group_name) = &precheck {
+                    self.buzz_ensure_topic_channel(&ev, group_name).await;
+                }
             }
         }
         // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
