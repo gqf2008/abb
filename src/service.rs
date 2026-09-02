@@ -590,7 +590,7 @@ async fn deliver_loop(
 /// #200：mini-relay 初始化产物（run() 分发给 dispatch/回流/子进程管理三份消费者）。
 struct BuzzRelayInit {
     state: std::sync::Arc<crate::buzzrelay::RelayState>,
-    reply_rx: tokio::sync::mpsc::UnboundedReceiver<crate::buzzrelay::AgentReply>,
+    reply_rx: tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
     /// **实际生效**的 agent 私钥（config 值或生成的 buzz-agent-key）——spawn buzz-acp
     /// 必须传它而非 config 原值：config 空时传空 → buzz-acp 身份与种子成员事件（#p）
     /// 对不上 → discover_channels 找不到频道，dispatch 全链路静默失效（审查 #205）。
@@ -2025,7 +2025,7 @@ mod tests {
         routes: std::sync::RwLock<HashMap<String, String>>,
         active: std::collections::HashSet<String>,
         path: std::path::PathBuf,
-        _rx: tokio::sync::mpsc::UnboundedReceiver<crate::buzzrelay::AgentReply>,
+        _rx: tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
     }
 
     async fn refresh_fixture(name: &str) -> RefreshFixture {

@@ -803,6 +803,85 @@ mod tests {
         remove_test_db(&db);
     }
 
+    /// 阈值守卫（RULE_阈值变更「新阈值落地即带验证」）：REPLY_QUEUE_CAP 当前值
+    /// 钉死为 256——调整它必须独立 commit（写明新旧值与理由）并同步更新常量
+    /// 注释里的理据与本断言。
+    #[test]
+    fn reply_queue_cap_is_pinned() {
+        assert_eq!(
+            REPLY_QUEUE_CAP, 256,
+            "回流队列容量调整须独立 commit 并更新理据注释"
+        );
+    }
+
+    /// #206「回复通道无界」子项：回流队列有界（REPLY_QUEUE_CAP），满时 try_send
+    /// 失败 → **丢弃新回复 + dropped_replies 计数**；被丢弃回复的事件仍入库
+    ///（ACK 仍 true——relay 的摄取职责已尽，补发归下次启动对账
+    /// recover_buzz_replies 管）；排空后新回复恢复入队。绝不允许退化成
+    /// send().await 背压（ingest 在 WS 帧循环/POST handler 里，会头阻塞所有连接）。
+    #[tokio::test]
+    async fn ingest_drops_reply_when_reply_queue_full() {
+        let db = test_db("abb-buzzrelay-replycap");
+        let store = EventStore::open(&db).await.unwrap();
+        let agent = Keys::generate();
+        // cap=1：第一条入队即满，第二条必触发丢弃分支
+        let (state, mut rx) =
+            RelayState::new_with_reply_cap(store, Keys::generate(), agent.public_key().to_hex(), 1);
+        state.set_channels([Channel {
+            uuid: "chan-1".into(),
+            chat_id: "oc_1".into(),
+            name: "角色".into(),
+            about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        }]);
+        let kind9 = |text: &str| {
+            EventBuilder::new(Kind::Custom(9), text)
+                .tag(Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                    ["chan-1"],
+                ))
+                .sign_with_keys(&agent)
+                .unwrap()
+        };
+
+        // ① A：入队（不消费，占满 cap=1 的唯一槽位）
+        let ack_a = state.ingest(&kind9("回复A")).await;
+        assert!(ack_a.contains("true"), "A 应入库: {ack_a}");
+        assert_eq!(state.dropped_replies(), 0, "A 入队成功，无丢弃");
+
+        // ② B：队列满 → 丢弃 + 计数；但事件仍入库、ACK 仍 true（relay 职责已尽）
+        let ev_b = kind9("回复B");
+        let ack_b = state.ingest(&ev_b).await;
+        assert!(
+            ack_b.contains("true"),
+            "B 已入库，ACK 必须仍 true（回流丢弃不影响摄取 ACK）: {ack_b}"
+        );
+        assert_eq!(state.dropped_replies(), 1, "B 必须被计数丢弃");
+        let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        assert_eq!(
+            state.db.query(&[all]).await.len(),
+            2,
+            "B 的事件必须仍在 buzz-relay.db（下次启动对账补发的依据）"
+        );
+
+        // ③ try_recv 只出 A（B 已被丢弃）
+        let got = rx.try_recv().expect("A 在队里");
+        assert_eq!(got.content, "回复A");
+        assert!(rx.try_recv().is_err(), "B 已被丢弃，不得出现在队列");
+
+        // ④ 排空后 C：恢复入队，计数不再涨
+        let ack_c = state.ingest(&kind9("回复C")).await;
+        assert!(ack_c.contains("true"), "C 应入库: {ack_c}");
+        let got = rx.try_recv().expect("排空后 C 应入队");
+        assert_eq!(got.content, "回复C");
+        assert_eq!(state.dropped_replies(), 1, "C 入队成功，计数保持 1");
+        drop(state);
+        drop(rx);
+        remove_test_db(&db);
+    }
+
     /// #206：first_e_tag 提取——无 e-tag → None；单个 → 其值；多个 → 首值
     ///（NIP-10 首 e-tag 是被回复事件，其余是 thread 祖先，只认首个）。
     #[test]
@@ -989,7 +1068,7 @@ mod tests {
     ) -> (
         std::path::PathBuf,
         Arc<RelayState>,
-        tokio::sync::mpsc::UnboundedReceiver<AgentReply>,
+        tokio::sync::mpsc::Receiver<AgentReply>,
     ) {
         let db_path = test_db(db_name);
         let store = EventStore::open(&db_path).await.unwrap();
@@ -1824,6 +1903,15 @@ impl EventStore {
     }
 }
 
+/// 回复回流队列容量（条数上限，#206「回复通道无界」子项）。理据：人性节奏
+/// 每轮一条回复，256 条 ≈ 全频道数分钟平台中断的缓冲；按条不按字节计
+/// （最坏 256 × ~50KB ≈ 13MB，可接受）。满时**丢弃新回复**（计数 + 60s 节流
+/// 告警）——绝不用 send().await 背压：ingest 在 WS 帧循环/POST handler 里，
+/// await 会把所有连接拖进头阻塞。且 #213 起丢弃 ≠ 丢失：回复事件已入
+/// buzz-relay.db 且 awaiting 账本有登记，下次启动对账（recover_buzz_replies）
+/// 会补发——丢弃从「静默丢失」降级为「延迟到下次启动」。
+pub(crate) const REPLY_QUEUE_CAP: usize = 256;
+
 /// mini-relay 共享状态：事件库 + 频道表 + 订阅/连接注册 + 回流通道。
 pub struct RelayState {
     db: EventStore,
@@ -1843,18 +1931,45 @@ pub struct RelayState {
     /// 同上的解析结果（构造时一次）；None = 身份非法/空（I1：消息无法「发给
     /// agent」，publish 必须如实失败而非发出一条没人收的事件）
     agent_pk: Option<nostr::PublicKey>,
-    /// kind 9 回流（频道 uuid → 文本）
-    pub reply_tx: tokio::sync::mpsc::UnboundedSender<AgentReply>,
+    /// kind 9 回流（频道 uuid → 文本）。**有界**（REPLY_QUEUE_CAP）：消费侧
+    ///（bridge 回流任务）停滞时队列满即丢弃新回复，见 ingest 的 try_send 分支。
+    pub reply_tx: tokio::sync::mpsc::Sender<AgentReply>,
+    /// 回流队列满丢弃的回复累计条数（运行期唯一即时信号的计数面；#213 起丢弃
+    /// 仅延迟——回复仍在 buzz-relay.db，待下次启动对账补发）。
+    dropped_replies: AtomicU64,
+    /// 上次「回流队列满丢弃」告警的 unix 秒（节流用，60s 一条）
+    last_drop_warn: AtomicU64,
 }
 
 impl RelayState {
-    /// 组装。reply_rx 由 bridge 消费（发回聊天平台）。
+    /// 组装。reply_rx 由 bridge 消费（发回聊天平台）。回流队列有界
+    ///（REPLY_QUEUE_CAP，见常量注释）。
     pub fn new(
         db: EventStore,
         bridge_keys: Keys,
         agent_pubkey: String,
-    ) -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<AgentReply>) {
-        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> (Arc<Self>, tokio::sync::mpsc::Receiver<AgentReply>) {
+        Self::assemble(db, bridge_keys, agent_pubkey, REPLY_QUEUE_CAP)
+    }
+
+    /// 测试专用：自定回流队列容量（溢出丢弃测试用 cap=1 让队列一拍即满）。
+    #[cfg(test)]
+    pub fn new_with_reply_cap(
+        db: EventStore,
+        bridge_keys: Keys,
+        agent_pubkey: String,
+        reply_cap: usize,
+    ) -> (Arc<Self>, tokio::sync::mpsc::Receiver<AgentReply>) {
+        Self::assemble(db, bridge_keys, agent_pubkey, reply_cap)
+    }
+
+    fn assemble(
+        db: EventStore,
+        bridge_keys: Keys,
+        agent_pubkey: String,
+        reply_cap: usize,
+    ) -> (Arc<Self>, tokio::sync::mpsc::Receiver<AgentReply>) {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(reply_cap);
         (
             Arc::new(Self {
                 db,
@@ -1867,9 +1982,16 @@ impl RelayState {
                 bridge_keys: bridge_keys.clone(),
                 agent_pubkey,
                 reply_tx,
+                dropped_replies: AtomicU64::new(0),
+                last_drop_warn: AtomicU64::new(0),
             }),
             reply_rx,
         )
+    }
+
+    /// 回流队列满丢弃的回复累计条数（监控观察/测试断言用）。
+    pub fn dropped_replies(&self) -> u64 {
+        self.dropped_replies.load(Ordering::Relaxed)
     }
 
     /// 登记表驱动：同步频道集合（新增/更新元数据；不删除——下线频道由登记侧清理）。
@@ -2326,6 +2448,18 @@ impl RelayState {
         }
     }
 
+    /// 距上次「回流队列满丢弃」告警是否已过节流窗（60s；与
+    /// should_warn_no_subscriber 同模式——队列停滞时每条回复一行会刷屏）。
+    fn should_warn_dropped_reply(&self, now_secs: u64) -> bool {
+        let prev = self.last_drop_warn.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(prev) >= 60 {
+            self.last_drop_warn.store(now_secs, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 种子**单个**频道的元数据/成员事件（kind 39002 成员 + 39000 元数据，桥身份
     /// 签名，created_at=1 幂等）——seed_channel_events（启动全量）与
     /// ensure_topic_channel（运行期话题登记）共用的单入口，防两份种子逻辑漂移。
@@ -2565,7 +2699,33 @@ impl RelayState {
         if stored && e.kind.as_u16() == 9 && e.pubkey.to_hex() == self.agent_pubkey {
             match self.agent_reply_from_event(e) {
                 Some(reply) => {
-                    let _ = self.reply_tx.send(reply);
+                    // 有界队列（REPLY_QUEUE_CAP）+ try_send：**绝不用 send().await**
+                    // ——ingest 在 WS 帧循环/POST handler 里，背压 await 会把所有连接
+                    // 拖进头阻塞。满 = 消费侧（bridge 回流任务）停滞：丢弃新回复 +
+                    // 计数 + 60s 节流告警。#213 起丢弃 ≠ 丢失：回复事件已入库且
+                    // awaiting 账本有登记，下次启动对账（recover_buzz_replies）补发，
+                    // 告警日志是运行期唯一即时信号。丢弃分支也**不**往群里发「丢失
+                    // 提示」——那走的正是已停滞的发送路径。
+                    match self.reply_tx.try_send(reply) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(reply)) => {
+                            // 计数无条件递增（计数面恒在线）；日志走 60s 节流，
+                            // 累计数经访问器现读（与递增间可能有并发新丢弃，
+                            // 日志取「此刻累计」即可——诊断口径不求逐条精确）。
+                            self.dropped_replies.fetch_add(1, Ordering::Relaxed);
+                            let now = nostr::prelude::Timestamp::now().as_secs();
+                            if self.should_warn_dropped_reply(now) {
+                                crate::log!(
+                                    "[mini-relay] ⚠️ 回复回流队列已满（cap={REPLY_QUEUE_CAP}），丢弃回复 chat={}（累计丢弃 {} 条；回复仍在 buzz-relay.db，下次启动对账补发）",
+                                    crate::agent::truncate(&reply.chat_id, 16),
+                                    self.dropped_replies()
+                                );
+                            }
+                        }
+                        // 消费端已关闭（服务关停中）：维持原 UnboundedSender 时代的
+                        // 静默口径（send 返回 Err 同样被 let _ 吞掉）。
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
                 // 频道不在表内：agent 回了但 #h 不在集内 = 唯一的静默黑洞——
                 // 与 dispatch 侧的日志对称（审查 #205r2；频道集运行期刷新后，
