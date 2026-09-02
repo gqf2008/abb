@@ -82,6 +82,8 @@ pub struct Bridge {
     /// #206 跟进：代际值随 `<key>.epoch` sidecar 持久化（get-or-create 时读回，
     /// /new 时落盘）——账本持久而代际原本只在内存，重启归零会跨重启破坏代际闸
     /// （合法回复误判孤儿只发不写；/new 后崩溃的孤儿回复反被放行）。
+    /// 注意外层 map 锁内 miss 时有一次 sidecar 读取（每 key 每进程一次的文件
+    /// IO，毫秒级）——map 锁是叶子锁（闭包内不取任何桥内锁），无重入。
     history_epochs: Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>,
     /// #51 免 @ 开关的测试快照：config.json 里有该 bot 时全走 config 热读/热写；
     /// 读不到该 bot（单测随机 key）→ 回落此内存快照（仿 access_and_role 的
@@ -326,7 +328,9 @@ impl Bridge {
     fn history_reset(&self, key: &str) -> bool {
         let lock = self.history_lock(key);
         let mut epoch = lock.lock().unwrap_or_else(|e| e.into_inner());
-        *epoch += 1;
+        // 饱和自增：read_epoch 对坏/读不出的 sidecar 回 u64::MAX（误杀向降级），
+        // 普通自增 debug 下 panic、release 下回绕 0（= 误放向），饱和钉住 MAX。
+        *epoch = epoch.saturating_add(1);
         // #206 跟进：新代际先落盘（sidecar）再清盘，同一锁持内——进程内语义不变
         // （写方要么在 clear 前写完被清掉、要么被新代际拦下），重启后由 sidecar
         // 延续代际闸。崩溃窗口语义与进程内 bump→clear 一致：窗口内重启 = 旧回复

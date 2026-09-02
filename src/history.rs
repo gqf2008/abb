@@ -255,24 +255,28 @@ impl History {
         ok
     }
 
-    /// #206 跟进：读代际 sidecar。缺失/损坏视为 0——与内存 get-or-create 的起点
-    /// 一致；写侧失败已留痕，读侧静默降级即退回原「重启归零」行为，不因坏行
-    /// 卡死对账。
+    /// #206 跟进：读代际 sidecar。三态：文件缺失 = 真·新 key → 0（与内存
+    /// get-or-create 起点一致）；存在但坏行/读不出 = 持久代际不可知 → u64::MAX
+    /// （代际闸全失配 = 误杀向，与「先落盘后清盘」的崩溃窗口语义同向——若回 0
+    /// 则可能与 epoch-0 账本登记误配，重演误放）。MAX 进入内存后由 history_reset
+    /// 的饱和自增钉住（不 panic、不回绕到 0）。
     pub(crate) fn read_epoch(&self) -> u64 {
-        std::fs::read_to_string(&self.epoch_path)
-            .ok()
-            .and_then(|t| t.trim().parse::<u64>().ok())
-            .unwrap_or(0)
+        match std::fs::read_to_string(&self.epoch_path) {
+            Ok(t) => t.trim().parse::<u64>().unwrap_or(u64::MAX),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => u64::MAX,
+        }
     }
 
     /// #206 跟进：写代际 sidecar（/new 的 history_reset 锁内、clear 之前调用）。
     /// 先落盘新代际再清盘：崩溃窗口内重启 = 旧回复被拦（只发不写，保守正确）；
     /// 反向顺序则是「盘上代际仍旧值 + 历史已清」→ 孤儿回复被写进新会话。
-    /// 失败仅告警不阻断 /new——中止重置会漏清旧历史，危害更大；此时闸退化为
-    /// 原「重启归零」行为，对账照旧（宁误杀不误放）。
+    /// 失败仅告警不阻断 /new——中止重置会漏清旧历史，危害更大；此时闸退化回
+    /// 修复前「重启归零」行为，**误放向**（盘上代际停在旧值，重启后与 /new 前
+    /// 登记的 awaiting epoch 误配 → 孤儿被放）——写失败告警日志即排查锚点。
     pub(crate) fn write_epoch(&self, epoch: u64) {
         let text = format!("{epoch}\n");
-        if let Err(e) = crate::atomic_write_text(&self.epoch_path, &text) {
+        if let Err(e) = crate::atomic_write_sensitive(&self.epoch_path, &text) {
             crate::log!(
                 "[history] ⚠️ 代际 sidecar 写失败（重启后代际闸退化归零）path={}: {e}",
                 trunc_path(&self.epoch_path)
@@ -896,5 +900,26 @@ mod tests {
         assert!(block.contains("答二"), "配对助手轮保留: {block}");
         assert_eq!(n, 1, "N=窗口内用户轮数");
         h.clear();
+    }
+
+    /// #206 跟进：代际 sidecar 三态读——缺失 = 0（新 key 起步），写读往返，
+    /// 坏行 = u64::MAX（持久代际不可知 → 误杀向，绝不能回 0 与 epoch-0 登记误配）。
+    #[test]
+    fn epoch_sidecar_missing_zero_roundtrip_corrupt_max() {
+        let h = temp_history("epoch", "oc_ep1");
+        assert_eq!(h.read_epoch(), 0, "sidecar 缺失 = 新 key 起步 0");
+        h.write_epoch(3);
+        assert_eq!(h.read_epoch(), 3, "写读往返");
+        std::fs::write(&h.epoch_path, "not-a-number\n").unwrap();
+        assert_eq!(
+            h.read_epoch(),
+            u64::MAX,
+            "坏行 = 误杀向降级（回 0 会重演误放）"
+        );
+        std::fs::write(&h.epoch_path, "\n \n").unwrap();
+        assert_eq!(h.read_epoch(), u64::MAX, "空白行同坏行处理");
+        if let Some(dir) = h.epoch_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
