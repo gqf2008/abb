@@ -794,9 +794,15 @@ mod tests {
         sent: Mutex<Vec<String>>,
         /// (chat_id, text) 全量记录：提及私信等按目标断言用（sent() 只留文本）。
         sent_chats: Mutex<Vec<(String, String)>>,
+        /// #206 话题隔离：(chat_id, anchor_mid, text)——send_thread_reply 调用记录
+        ///（同时回落记进 sent/sent_chats，既有断言不受影响）。
+        thread_replies: Mutex<Vec<(String, String, String)>>,
         quoted: Mutex<std::collections::HashMap<String, crate::messenger::QuotedMessage>>,
         /// 设置后：发给该 chat 的消息返回 Err（失败注入，测游标回退链路）。
         fail_chat: Mutex<Option<String>>,
+        /// 审查 #214 P1-1：设置后 send_thread_reply 对该 chat 返回 Err（锚点消息
+        /// 被删/撤回的失败注入），send_text 不受影响——测话题回复的 send_text 回落。
+        fail_thread_reply: Mutex<Option<String>>,
         /// done 回执收集（W2 补发补 DONE 断言用；实时路径 handle 尾部也会调）。
         done: Mutex<Vec<String>>,
         /// 群资料（#75 注入测试）：None=查不到（默认）。
@@ -811,8 +817,10 @@ mod tests {
             Self {
                 sent: Mutex::new(Vec::new()),
                 sent_chats: Mutex::new(Vec::new()),
+                thread_replies: Mutex::new(Vec::new()),
                 quoted: Mutex::new(std::collections::HashMap::new()),
                 fail_chat: Mutex::new(None),
+                fail_thread_reply: Mutex::new(None),
                 done: Mutex::new(Vec::new()),
                 chat_info: Mutex::new(None),
                 created: Mutex::new(Vec::new()),
@@ -852,6 +860,10 @@ mod tests {
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
         }
+        /// #206：send_thread_reply 调用记录（chat_id, anchor_mid, text）。
+        fn thread_replies(&self) -> Vec<(String, String, String)> {
+            self.thread_replies.lock().unwrap().clone()
+        }
     }
     #[async_trait]
     impl Messenger for MockMessenger {
@@ -867,6 +879,26 @@ mod tests {
                 .unwrap()
                 .push((chat_id.to_string(), text.to_string()));
             Ok(())
+        }
+        /// #206：话题回复独立记录（chat_id, anchor_mid, text）后再走 send_text
+        /// 同路径——既有 sent()/sent_chats 断言（含失败注入）不受影响。
+        async fn send_thread_reply(
+            &self,
+            chat_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            if let Some(f) = self.fail_thread_reply.lock().unwrap().clone() {
+                if f == chat_id {
+                    anyhow::bail!("模拟话题回复失败（锚点消息已删/撤回）");
+                }
+            }
+            self.thread_replies.lock().unwrap().push((
+                chat_id.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+            ));
+            self.send_text(chat_id, text).await
         }
         async fn done(&self, message_id: &str) {
             self.done.lock().unwrap().push(message_id.to_string());
@@ -1999,6 +2031,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2051,6 +2086,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2170,6 +2208,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         Arc::get_mut(&mut bridge)
@@ -2238,6 +2279,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2256,7 +2300,7 @@ mod tests {
     }
 
     /// 构造回流回复（绕过 ingest 直调 handle_buzz_reply 的测试用；event_id 用
-    /// 可读短串即可——账本键是不透明字符串）。
+    /// 可读短串即可——账本键是不透明字符串）。群根频道回复（thread_id/anchor_mid 空）。
     fn agent_reply(
         uuid: &str,
         chat: &str,
@@ -2271,6 +2315,26 @@ mod tests {
             event_id: event_id.into(),
             in_reply_to: in_reply_to.map(|s| s.to_string()),
             created_at: crate::chrono_lite::unix_secs(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        }
+    }
+
+    /// #206：话题频道回复（thread_id/anchor_mid 非空 → deliver 走 send_thread_reply）。
+    #[allow(clippy::too_many_arguments)]
+    fn agent_reply_in_thread(
+        uuid: &str,
+        chat: &str,
+        event_id: &str,
+        in_reply_to: Option<&str>,
+        content: &str,
+        thread_id: &str,
+        anchor_mid: &str,
+    ) -> crate::buzzrelay::AgentReply {
+        crate::buzzrelay::AgentReply {
+            thread_id: thread_id.into(),
+            anchor_mid: anchor_mid.into(),
+            ..agent_reply(uuid, chat, event_id, in_reply_to, content)
         }
     }
 
@@ -2549,8 +2613,10 @@ mod tests {
         crate::buzzrelay::remove_test_db(&db_path);
     }
 
-    /// ⑥ 话题消息 dispatch（key=chat:thread，风险③）：账本记 dispatch 时的 key →
-    /// 回复写回**同一 key** 的历史文件（用户轮/助手轮不分裂到两个文件）。
+    /// ⑥ 话题消息 dispatch（key=chat:thread，风险③；#206 话题隔离）：话题 =
+    /// 独立 buzz 频道——dispatch 把用户事件发到**话题频道**（#h=话题 uuid），
+    /// 账本记 dispatch 时的 key → 回复写回**同一 key** 的历史文件（用户轮/助手轮
+    /// 不分裂到两个文件），发送走 send_thread_reply 落回原话题（锚点=用户 mid）。
     #[tokio::test]
     async fn buzz_thread_reply_writes_thread_history() {
         let chat = "oc_rl6";
@@ -2558,13 +2624,36 @@ mod tests {
             build_buzz_reply_fixture(chat).await;
         let bot_key = bridge.bot.key();
         let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_7");
         let mut ev = test_ev("m1", chat, "话题里的问题");
         ev.thread_id = "omt_7".into();
         bridge.handle(ev).await;
         let uev = relay_user_event_id(&state).await;
 
+        // 话题频道已登记（预检 ensure），用户事件发到话题频道而非群根
+        let tch = state
+            .channel_by_uuid(&tuuid)
+            .expect("话题首条消息必须触发话题频道登记");
+        assert_eq!(tch.thread_id, "omt_7");
+        assert_eq!(tch.anchor_mid, "m1", "锚点 = 触发话题消息的 mid");
+        let nine: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(
+            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
+            Some(tuuid.as_str()),
+            "话题消息必须发布到话题频道（#h=话题 uuid）"
+        );
+
         bridge
-            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-t", Some(&uev), "话题回复"))
+            .handle_buzz_reply(agent_reply_in_thread(
+                &tuuid,
+                chat,
+                "rev-t",
+                Some(&uev),
+                "话题回复",
+                "omt_7",
+                "m1",
+            ))
             .await;
 
         let tkey = format!("{chat}:omt_7");
@@ -2584,14 +2673,131 @@ mod tests {
                 .all(|e| e.mid != "rev-t"),
             "话题回复不得落进顶层 chat 的历史（key 分裂）"
         );
-        // 发送目标是顶层 chat（buzz 频道按 chat 派生，话题在 dispatch 侧已坍缩——
-        // 与回流现状 send_text 行为一致，不引入话题回复分叉）
+        // 发送：走 send_thread_reply（chat_id, 锚点 mid=m1, 文本）落回原话题——
+        // 不再是「话题坍缩成群频道 + send_text 到顶层」
+        assert!(
+            msgr.thread_replies()
+                .iter()
+                .any(|(c, mid, t)| c == chat && mid == "m1" && t.contains("话题回复")),
+            "话题回复必须经 send_thread_reply 落回原话题: {:?}",
+            msgr.thread_replies()
+        );
         assert!(msgr
             .sent_chats
             .lock()
             .unwrap()
             .iter()
             .any(|(c, t)| c == chat && t.contains("话题回复")));
+        // 群根频道回复仍走 send_text（对照：thread_replies 不含群根回复）
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-root", None, "群根回复"))
+            .await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("群根回复")),
+            "群根回复照常 send_text"
+        );
+        assert!(
+            !msgr
+                .thread_replies()
+                .iter()
+                .any(|(_, _, t)| t.contains("群根回复")),
+            "群根回复不得走 send_thread_reply"
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 审查 #214 P1-1：话题回复的 send_thread_reply 失败（锚点消息被删/撤回 →
+    /// 飞书 reply 永久报错）必须回落 send_text——回复已写历史，无回落则永远投递
+    /// 不出、账本每次启动对账无限重试。回落成功 = 投递成功记 sent；拔掉回落分支
+    /// 本测试必红（阳性对照）。
+    #[tokio::test]
+    async fn buzz_thread_reply_falls_back_to_send_text_on_anchor_failure() {
+        let chat = "oc_rl8";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let mut ev = test_ev("m1", chat, "话题里的问题");
+        ev.thread_id = "omt_8".into();
+        bridge.handle(ev).await;
+        let uev = relay_user_event_id(&state).await;
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_8");
+
+        // 锚点消息失效：send_thread_reply 必败，send_text 正常
+        *msgr.fail_thread_reply.lock().unwrap() = Some(chat.into());
+        bridge
+            .handle_buzz_reply(agent_reply_in_thread(
+                &tuuid,
+                chat,
+                "rev-fb",
+                Some(&uev),
+                "话题回复（锚已删）",
+                "omt_8",
+                "m1",
+            ))
+            .await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("话题回复（锚已删）")),
+            "send_thread_reply 失败必须回落 send_text 投递: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            msgr.thread_replies().is_empty(),
+            "失败的话题发送不得留成功记录（回落前不得入 thread_replies）"
+        );
+        assert!(
+            bridge.reply_ledger.is_sent("rev-fb"),
+            "回落投递成功必须记 sent（否则启动对账无限重试）"
+        );
+        // 历史仍写话题 key（回落只影响发送形态，不影响归属）
+        let tkey = format!("{chat}:omt_8");
+        assert!(
+            crate::history::History::open(&bot_key, &tkey)
+                .entries()
+                .iter()
+                .any(|e| !e.user && e.mid == "rev-fb"),
+            "回落后助手轮仍落话题历史"
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 审查 #214 P2-1：受限会话（Granted）的话题消息被拒时不得污染频道注册表——
+    /// ensure_topic_channel 在全闸（含受限闸④）通过之后才执行。闸前登记 = 被拒
+    /// dispatch 也留下话题频道 + 44100 成员通知（预检「不过=无副作用」invariant
+    /// 破坏）。把 buzz_ensure_topic_channel 挪回闸前本测试必红（阳性对照）。
+    #[tokio::test]
+    async fn buzz_restricted_thread_dispatch_registers_nothing() {
+        let chat = "oc_ti3";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_r");
+        let f44100: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[44100]}"#).unwrap();
+
+        let mut ev = test_ev("m1", chat, "受限用户的话题消息");
+        ev.thread_id = "omt_r".into();
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("受限")),
+            "受限会话必须被拒绝: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            state.channel_by_uuid(&tuuid).is_none(),
+            "被拒 dispatch 不得登记话题频道（预检不过=无副作用）"
+        );
+        assert!(
+            state.query(std::slice::from_ref(&f44100)).await.is_empty(),
+            "被拒 dispatch 不得发布 44100 成员通知"
+        );
         cleanup_bridge(&bridge);
         drop(state);
         drop(_rx);
@@ -2629,6 +2835,308 @@ mod tests {
         crate::buzzrelay::remove_test_db(&db_path);
     }
 
+    // ---- #206 话题隔离（话题 = 独立 buzz 频道）----
+
+    /// ⑧ 话题 dispatch 主链路：首条话题消息**登记而非拒绝**（ensure_topic_channel
+    /// + 44100 一条）、用户事件发到话题频道；第二条同话题消息正常路由（不重复
+    /// 44100）；同群两话题各自独立频道（uuid 互异、消息各自落 #h）；群根消息
+    /// 行为不变（#h=群根 uuid、不产生新话题频道/44100）。
+    /// 阳性对照锚点：注释掉 buzz_dispatch_precheck 里的 ensure_topic_channel 调用
+    /// → 首条话题消息发布失败（报错回执 + 无 kind-9 入库），本测试必红。
+    #[tokio::test]
+    async fn buzz_thread_dispatch_registers_isolates_and_keeps_root() {
+        let chat = "oc_ti1";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let root_uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        let tuuid1 = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_a");
+        let tuuid2 = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_b");
+        let nine: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let f44100: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[44100]}"#).unwrap();
+
+        // 首条话题消息：登记而非拒绝
+        let mut ev = test_ev("m1", chat, "话题A 第一问");
+        ev.thread_id = "omt_a".into();
+        bridge.handle(ev).await;
+        assert!(
+            !msgr.sent().iter().any(|t| t.contains("无法处理")),
+            "话题首条消息不得被拒: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            state.channel_by_uuid(&tuuid1).is_some(),
+            "话题首条消息必须登记话题频道"
+        );
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(
+            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
+            Some(tuuid1.as_str())
+        );
+        assert_eq!(
+            state.query(std::slice::from_ref(&f44100)).await.len(),
+            1,
+            "首个话题各发一条 44100"
+        );
+
+        // 同话题第二条：正常路由，不重复 44100
+        let mut ev = test_ev("m2", chat, "话题A 第二问");
+        ev.thread_id = "omt_a".into();
+        bridge.handle(ev).await;
+        assert_eq!(
+            state.query(std::slice::from_ref(&f44100)).await.len(),
+            1,
+            "同话题第二条不得重发 44100（幂等）"
+        );
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(evs.len(), 2);
+        assert!(evs
+            .iter()
+            .all(|e| crate::buzzrelay::h_tag_of(e).as_deref() == Some(tuuid1.as_str())));
+
+        // 同群第二个话题：独立频道、独立 44100
+        let mut ev = test_ev("m3", chat, "话题B 第一问");
+        ev.thread_id = "omt_b".into();
+        bridge.handle(ev).await;
+        assert!(state.channel_by_uuid(&tuuid2).is_some());
+        assert_ne!(tuuid1, tuuid2, "同群两话题必须频道隔离");
+        assert_eq!(state.query(std::slice::from_ref(&f44100)).await.len(), 2);
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(evs.len(), 3);
+        assert_eq!(
+            evs.iter()
+                .filter(|e| crate::buzzrelay::h_tag_of(e).as_deref() == Some(tuuid2.as_str()))
+                .count(),
+            1,
+            "话题B 的消息只落话题B 频道"
+        );
+
+        // 群根消息行为不变：#h=群根 uuid，不新增话题频道/44100
+        bridge.handle(test_ev("m4", chat, "顶层消息")).await;
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(evs.len(), 4);
+        assert_eq!(
+            evs.iter()
+                .filter(|e| crate::buzzrelay::h_tag_of(e).as_deref() == Some(root_uuid.as_str()))
+                .count(),
+            1,
+            "群根消息仍落群根频道"
+        );
+        assert_eq!(
+            state.query(std::slice::from_ref(&f44100)).await.len(),
+            2,
+            "群根消息不得产生成员通知"
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ⑨ 两 bot 同群同话题不串线：话题 uuid 命名空间含 bot_key——两个 buzz bot
+    /// 在同一群同一话题各自 dispatch，各自落在自己的话题频道（#h 互异、频道
+    /// 登记各带各的 bot_key）。
+    #[tokio::test]
+    async fn buzz_two_bots_same_chat_thread_isolated() {
+        let chat = "oc_ti2";
+        let bot_a = backend_bot("buzz");
+        let bot_b = backend_bot("buzz");
+        let runner_a = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let runner_b = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge_a, _msgr_a) = build_test_bridge_with_bot(runner_a, bot_a.clone());
+        let (mut bridge_b, _msgr_b) = build_test_bridge_with_bot(runner_b, bot_b.clone());
+        let db_path = crate::buzzrelay::test_db("abb-buzz-2bot");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        let mk_ch = |bot: &crate::config::BotConfig| crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        };
+        state.set_channels([mk_ch(&bot_a), mk_ch(&bot_b)]);
+        Arc::get_mut(&mut bridge_a)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        Arc::get_mut(&mut bridge_b)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let _sub = state.test_attach_subscriber();
+
+        let mut ev_a = test_ev("m1", chat, "同一话题提问");
+        ev_a.thread_id = "omt_same".into();
+        bridge_a.handle(ev_a).await;
+        let mut ev_b = test_ev("m2", chat, "同一话题提问");
+        ev_b.thread_id = "omt_same".into();
+        bridge_b.handle(ev_b).await;
+
+        let tuuid_a = crate::buzzrelay::topic_channel_uuid(&bot_a.key(), chat, "omt_same");
+        let tuuid_b = crate::buzzrelay::topic_channel_uuid(&bot_b.key(), chat, "omt_same");
+        assert_ne!(tuuid_a, tuuid_b, "两 bot 同群同话题必须频道互异");
+        assert_eq!(
+            state.channel_by_uuid(&tuuid_a).unwrap().bot_key,
+            bot_a.key()
+        );
+        assert_eq!(
+            state.channel_by_uuid(&tuuid_b).unwrap().bot_key,
+            bot_b.key()
+        );
+        let nine: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(evs.len(), 2);
+        assert!(
+            evs.iter()
+                .any(|e| crate::buzzrelay::h_tag_of(e).as_deref() == Some(tuuid_a.as_str()))
+                && evs
+                    .iter()
+                    .any(|e| crate::buzzrelay::h_tag_of(e).as_deref() == Some(tuuid_b.as_str())),
+            "两 bot 的消息各自落各自话题频道"
+        );
+        cleanup_bridge(&bridge_a);
+        cleanup_bridge(&bridge_b);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ⑩ 重启自愈对账（话题）：relay 频道登记表是内存态——重启后话题频道丢失，
+    /// 但账本 awaiting 与 relay db 持久。启动对账必须先**重登记**话题频道
+    /// （否则频道门把话题回复滤光），再补发：send_thread_reply 落回话题 +
+    /// 补写 chat:thread 历史。
+    #[tokio::test]
+    async fn buzz_topic_reply_reconciled_after_registry_loss() {
+        let chat = "oc_ti3";
+        let (mut bridge, msgr, state1, agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let mut ev = test_ev("m1", chat, "话题里的问题");
+        ev.thread_id = "omt_9".into();
+        bridge.handle(ev).await;
+        let uev = relay_user_event_id(&state1).await;
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_9");
+
+        // agent 回复入库但桥从未消费（崩溃窗口）
+        let rev = signed_reply_event(&agent_keys, &tuuid, &uev, "重启窗口的话题回复");
+        state1.ingest(&rev).await;
+        assert!(msgr.sent().is_empty());
+
+        // 「重启」：新 RelayState（同 db、同 agent 身份）——只登记群根频道，
+        // 话题频道不在登记表（内存态丢失）。
+        drop(state1);
+        drop(_rx);
+        drop(_sub);
+        let store2 = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state2, _rx2) = crate::buzzrelay::RelayState::new(
+            store2,
+            nostr::prelude::Keys::generate(),
+            agent_keys.public_key().to_hex(),
+        );
+        state2.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot_key, chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+            bot_key: bot_key.clone(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        }]);
+        assert!(
+            state2.channel_by_uuid(&tuuid).is_none(),
+            "重启后话题频道不在登记表（内存态）"
+        );
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state2.clone());
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_buzz_replies(&stop).await;
+
+        assert!(
+            state2.channel_by_uuid(&tuuid).is_some(),
+            "对账必须重登记话题频道（否则频道门滤掉话题回复）"
+        );
+        assert!(
+            msgr.thread_replies()
+                .iter()
+                .any(|(c, mid, t)| c == chat && mid == "m1" && t.contains("重启窗口的话题回复")),
+            "话题回复必须补发且走 send_thread_reply: {:?}",
+            msgr.thread_replies()
+        );
+        let tkey = format!("{chat}:omt_9");
+        assert!(
+            crate::history::History::open(&bot_key, &tkey)
+                .entries()
+                .iter()
+                .any(|e| !e.user && e.text.contains("重启窗口的话题回复")),
+            "对账补发必须补写 chat:thread 历史"
+        );
+        assert!(bridge.reply_ledger.is_sent(&rev.id.to_hex()));
+        cleanup_bridge(&bridge);
+        drop(state2);
+        drop(_rx2);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ⑪ 话题回复无 e-tag 兜底（风险①话题版）：agent 未带 --reply-to 的话题回复
+    /// → 按 reply 自带的 thread_id 落回 chat:thread 历史（不污染顶层），发送仍走
+    /// send_thread_reply。
+    #[tokio::test]
+    async fn buzz_topic_reply_without_e_tag_lands_in_thread_history() {
+        let chat = "oc_ti4";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let mut ev = test_ev("m1", chat, "话题里的问题");
+        ev.thread_id = "omt_5".into();
+        bridge.handle(ev).await;
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot_key, chat, "omt_5");
+
+        bridge
+            .handle_buzz_reply(agent_reply_in_thread(
+                &tuuid,
+                chat,
+                "rev-noetag",
+                None,
+                "无关联话题回复",
+                "omt_5",
+                "m1",
+            ))
+            .await;
+
+        assert!(msgr
+            .thread_replies()
+            .iter()
+            .any(|(c, mid, t)| c == chat && mid == "m1" && t.contains("无关联话题回复")));
+        let tkey = format!("{chat}:omt_5");
+        assert!(
+            crate::history::History::open(&bot_key, &tkey)
+                .entries()
+                .iter()
+                .any(|e| !e.user && e.mid == "rev-noetag"),
+            "兜底话题回复必须写回 chat:thread 历史"
+        );
+        assert!(
+            crate::history::History::open(&bot_key, chat)
+                .entries()
+                .iter()
+                .all(|e| e.mid != "rev-noetag"),
+            "兜底话题回复不得落进顶层 chat 历史"
+        );
+        assert!(bridge.reply_ledger.is_sent("rev-noetag"));
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
     // ---- #206：buzz 轮次叫停（/cancel → owner 控制命令 "!cancel"）----
 
     // 事件 #h 提取直接用 buzzrelay::h_tag_of（pub(crate)，单一实现防漂移）
@@ -2655,6 +3163,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2722,6 +3233,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2793,6 +3307,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         bridge.handle(test_ev("m3", chat, "/cancel")).await;
         assert!(
@@ -2835,6 +3352,9 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
@@ -2860,11 +3380,13 @@ mod tests {
         crate::buzzrelay::remove_test_db(&db_path);
     }
 
-    /// 粒度语义钉扎：话题消息（thread_id 非空）的 /cancel 仍发布到**群频道**——
-    /// buzz 叫停是频道级=群级（同群各话题共用 channel，#206 已知边界），与 CLI
-    /// 按 chat:thread key 隔离不同。
+    /// 粒度语义钉扎（#206 话题隔离后）：话题消息 dispatch 进**独立话题频道**，
+    /// 话题内的 /cancel 随之发布到**话题频道**（留在群根频道的 !cancel 停不到
+    /// 话题频道的在跑轮次）——叫停粒度与 CLI 的 chat:thread key 隔离对齐。
+    /// 话题频道从未登记（= 该话题从未 dispatch 过 = 无轮次可停）→ 不空发控制
+    /// 事件，如实回「没有正在运行的任务」。
     #[tokio::test]
-    async fn buzz_cancel_from_thread_publishes_to_group_channel() {
+    async fn buzz_cancel_from_thread_publishes_to_topic_channel() {
         let bot = backend_bot("buzz");
         let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
         let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
@@ -2882,24 +3404,53 @@ mod tests {
             chat_id: chat.into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: bot.key(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         Arc::get_mut(&mut bridge)
             .expect("测试期唯一引用")
             .buzz_relay_state = Some(state.clone());
         let _sub = state.test_attach_subscriber();
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
 
-        let mut ev = test_ev("m1", chat, "/cancel");
+        // 话题频道从未登记时的 /cancel：不空发控制事件 + 如实回执
+        let mut ev = test_ev("m0", chat, "/cancel");
+        ev.thread_id = "omt_fresh".into();
+        bridge.handle(ev).await;
+        assert!(
+            state.query(std::slice::from_ref(&all)).await.is_empty(),
+            "话题从未 dispatch 过 = 无轮次可停，不得空发控制事件"
+        );
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("没有正在运行的任务")),
+            "回执必须如实（无轮次）: {:?}",
+            msgr.sent()
+        );
+
+        // 话题 dispatch（登记话题频道）后：/cancel 发布到**话题频道**
+        let mut ev = test_ev("m1", chat, "话题里的任务");
+        ev.thread_id = "omt_topic1".into();
+        bridge.handle(ev).await;
+        let tuuid = crate::buzzrelay::topic_channel_uuid(&bot.key(), chat, "omt_topic1");
+        assert!(
+            state.channel_by_uuid(&tuuid).is_some(),
+            "话题 dispatch 必须已登记话题频道"
+        );
+
+        let mut ev = test_ev("m2", chat, "/cancel");
         ev.thread_id = "omt_topic1".into();
         bridge.handle(ev).await;
 
-        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         let evs = state.query(std::slice::from_ref(&all)).await;
-        assert_eq!(evs.len(), 1, "话题 /cancel 同样发布控制事件");
-        assert_eq!(evs[0].content, "!cancel");
+        let ctrls: Vec<_> = evs.iter().filter(|e| e.content == "!cancel").collect();
+        assert_eq!(ctrls.len(), 1, "话题 /cancel 应发布恰好一条控制事件");
+        // 协议钉扎（buzz-acp is_owner_control_command lib.rs:3552-3562 @ c3132c3）：
+        // content.trim()=="!cancel" 精确比对——钉死精确相等，防日后被加上下文前缀
         assert_eq!(
-            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
-            Some(uuid.as_str()),
-            "话题 /cancel 路由到群频道（频道级叫停）"
+            crate::buzzrelay::h_tag_of(ctrls[0]).as_deref(),
+            Some(tuuid.as_str()),
+            "话题 /cancel 必须路由到话题频道（话题轮次在话题频道里跑）"
         );
         assert!(
             msgr.sent().iter().any(|t| t.contains("叫停指令")),

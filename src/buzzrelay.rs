@@ -25,9 +25,9 @@
 
 use nostr::prelude::*;
 
-/// 频道 uuid：fnv128 确定性派生（命名空间与 #194 vb_uuid 区分）。
-/// chat_id ↔ uuid 双向映射由本函数 + 登记表共同维护。
-pub fn channel_uuid(bot_key: &str, chat_id: &str) -> String {
+/// fnv128 确定性 uuid 派生（命名空间字符串 → uuid 形态文本）。
+/// channel_uuid / topic_channel_uuid 共用（两者只差命名空间，算法绝不漂移）。
+fn fnv128_uuid(ns: &str) -> String {
     fn fnv64(seed: u64, s: &str) -> u64 {
         let mut h = seed;
         for b in s.bytes() {
@@ -36,9 +36,8 @@ pub fn channel_uuid(bot_key: &str, chat_id: &str) -> String {
         }
         h
     }
-    let ns = format!("abb-relay:{bot_key}:{chat_id}");
-    let hi = fnv64(0xcbf2_9ce4_8422_2325, &ns);
-    let lo = fnv64(0x9e37_79b9_7f4a_7c15, &ns);
+    let hi = fnv64(0xcbf2_9ce4_8422_2325, ns);
+    let lo = fnv64(0x9e37_79b9_7f4a_7c15, ns);
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&hi.to_be_bytes());
     bytes[8..].copy_from_slice(&lo.to_be_bytes());
@@ -56,6 +55,21 @@ pub fn channel_uuid(bot_key: &str, chat_id: &str) -> String {
         hex(8..10),
         hex(10..16)
     )
+}
+
+/// 频道 uuid：fnv128 确定性派生（命名空间与 #194 vb_uuid 区分）。
+/// chat_id ↔ uuid 双向映射由本函数 + 登记表共同维护。
+pub fn channel_uuid(bot_key: &str, chat_id: &str) -> String {
+    fnv128_uuid(&format!("abb-relay:{bot_key}:{chat_id}"))
+}
+
+/// #206 话题隔离：话题频道 uuid——命名空间在群根基础上加 thread 段
+///（群根 uuid 算法不动：存量频道映射/账本/库内事件全部不失效）。
+/// 「话题 = 独立 buzz 频道」而非「同频道 + 话题 tag」：buzz-acp 的会话/队列/轮次
+/// 全按 channel_id 键控（上游 pool.rs:117 @ c3132c3），频道方案根治同群话题串线，
+/// 且回复路由（#h → 话题频道 → chat+thread）自动正确。不同话题/不同 bot 互异。
+pub fn topic_channel_uuid(bot_key: &str, chat_id: &str, thread_id: &str) -> String {
+    fnv128_uuid(&format!("abb-relay:{bot_key}:{chat_id}:thread:{thread_id}"))
 }
 
 /// NIP-01 客户端消息（mini-relay 消费的子集）。
@@ -297,15 +311,18 @@ mod tests {
             chat_id: "oc_a".into(),
             name: "角色A".into(),
             about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
 
         // 未登记 chat（含「另一 bot 的同名 chat」——uuid 含 bot_key，不串线）：None 不入库
         assert!(state
-            .publish_user_message("bot_x", "oc_a", "m0", "hi")
+            .publish_user_message("bot_x", "oc_a", "m0", "hi", "")
             .await
             .is_none());
         assert!(state
-            .publish_user_message("bot_a", "oc_unknown", "m0", "hi")
+            .publish_user_message("bot_a", "oc_unknown", "m0", "hi", "")
             .await
             .is_none());
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
@@ -313,7 +330,7 @@ mod tests {
 
         // 已登记频道：Some(事件 id)、kind 9、单 #h tag、内容原样
         let id1 = state
-            .publish_user_message("bot_a", "oc_a", "m1", "你好，buzz")
+            .publish_user_message("bot_a", "oc_a", "m1", "你好，buzz", "")
             .await
             .expect("已登记频道应返回事件 id");
         let evs = state.db.query(&[all]).await;
@@ -337,11 +354,11 @@ mod tests {
         // 同秒同文（「好」「好」）：mid 不同 → 事件 id 不同 → 两条都在库（回归：
         // 无 mid tag 时第二条撞 id 被 INSERT OR IGNORE 静默吞）。
         let id2 = state
-            .publish_user_message("bot_a", "oc_a", "m2", "好")
+            .publish_user_message("bot_a", "oc_a", "m2", "好", "")
             .await
             .expect("m2 应返回事件 id");
         let id3 = state
-            .publish_user_message("bot_a", "oc_a", "m3", "好")
+            .publish_user_message("bot_a", "oc_a", "m3", "好", "")
             .await
             .expect("m3 应返回事件 id");
         assert_ne!(id2, id3, "同秒同文不同 mid 不得撞事件 id");
@@ -371,13 +388,16 @@ mod tests {
             chat_id: "oc_a".into(),
             name: "角色A".into(),
             about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
 
         // 未登记 chat → false 且不入库
         assert!(
             !state
-                .publish_control_command("bot_a", "oc_unknown", ControlCommand::Cancel)
+                .publish_control_command("bot_a", "oc_unknown", "", ControlCommand::Cancel)
                 .await
         );
         assert!(state.db.query(std::slice::from_ref(&all)).await.is_empty());
@@ -385,7 +405,7 @@ mod tests {
         // 已登记频道 → true，事件四要素
         assert!(
             state
-                .publish_control_command("bot_a", "oc_a", ControlCommand::Cancel)
+                .publish_control_command("bot_a", "oc_a", "", ControlCommand::Cancel)
                 .await
         );
         let evs = state.db.query(std::slice::from_ref(&all)).await;
@@ -414,7 +434,7 @@ mod tests {
         // 连发第二条（同秒同 content）：abb-mid nonce 保事件 id 唯一，不被吞
         assert!(
             state
-                .publish_control_command("bot_a", "oc_a", ControlCommand::Cancel)
+                .publish_control_command("bot_a", "oc_a", "", ControlCommand::Cancel)
                 .await
         );
         let evs = state.db.query(&[all]).await;
@@ -444,10 +464,13 @@ mod tests {
             chat_id: "oc_a".into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         assert!(
             !state
-                .publish_control_command("bot_a", "oc_a", ControlCommand::Cancel)
+                .publish_control_command("bot_a", "oc_a", "", ControlCommand::Cancel)
                 .await
         );
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
@@ -479,6 +502,9 @@ mod tests {
             chat_id: "oc_a".into(),
             name: "角色A".into(),
             about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
 
@@ -490,7 +516,7 @@ mod tests {
         {
             assert!(
                 state
-                    .publish_user_message("bot_a", "oc_a", &format!("bad{i}"), lit)
+                    .publish_user_message("bot_a", "oc_a", &format!("bad{i}"), lit, "")
                     .await
                     .is_none(),
                 "{lit:?} 必须被拒发"
@@ -503,16 +529,16 @@ mod tests {
 
         // 非精确命中的相似文本不受影响（正常透传）
         assert!(state
-            .publish_user_message("bot_a", "oc_a", "ok1", "!shutdown 现在")
+            .publish_user_message("bot_a", "oc_a", "ok1", "!shutdown 现在", "")
             .await
             .is_some());
         assert!(state
-            .publish_user_message("bot_a", "oc_a", "ok2", "请执行 !rotate 流程")
+            .publish_user_message("bot_a", "oc_a", "ok2", "请执行 !rotate 流程", "")
             .await
             .is_some());
         assert!(
             state
-                .publish_user_message("bot_a", "oc_a", "ok3", "!CANCEL")
+                .publish_user_message("bot_a", "oc_a", "ok3", "!CANCEL", "")
                 .await
                 .is_some(),
             "上游比对大小写敏感，!CANCEL 不是控制命令"
@@ -714,6 +740,9 @@ mod tests {
             chat_id: "oc_1".into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         let kind9 = |keys: &Keys, text: &str, h: &str| {
             EventBuilder::new(Kind::Custom(9), text)
@@ -826,6 +855,9 @@ mod tests {
             chat_id: "oc_1".into(),
             name: "角色".into(),
             about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
         }]);
         let h = || {
             Tag::custom(
@@ -916,6 +948,325 @@ mod tests {
         drop(_rx);
         remove_test_db(&db);
     }
+
+    // ---- #206 话题隔离（话题 = 独立 buzz 频道）----
+
+    /// topic_channel_uuid：确定性；与群根互异；同群互异话题互异；同群同话题不同
+    /// bot 互异（uuid 含 bot_key——两 bot 同群同话题不串线）；uuid 形态同群根。
+    #[test]
+    fn topic_channel_uuid_is_deterministic_and_isolated() {
+        let root = channel_uuid("bot_a", "oc_1");
+        let t1 = topic_channel_uuid("bot_a", "oc_1", "omt_1");
+        assert_eq!(t1, topic_channel_uuid("bot_a", "oc_1", "omt_1"), "确定性");
+        assert_ne!(t1, root, "话题频道必须与群根频道互异");
+        assert_ne!(
+            t1,
+            topic_channel_uuid("bot_a", "oc_1", "omt_2"),
+            "同群两个话题必须互异"
+        );
+        assert_ne!(
+            t1,
+            topic_channel_uuid("bot_b", "oc_1", "omt_1"),
+            "两 bot 同群同话题必须互异（不串线）"
+        );
+        let parts: Vec<&str> = t1.split('-').collect();
+        assert_eq!(
+            [
+                parts[0].len(),
+                parts[1].len(),
+                parts[2].len(),
+                parts[3].len(),
+                parts[4].len()
+            ],
+            [8, 4, 4, 4, 12],
+            "uuid 形态与群根一致"
+        );
+    }
+
+    /// #206 测试夹具：登记了群根频道的 RelayState（话题测试共用）。
+    async fn topic_fixture_state(
+        db_name: &str,
+    ) -> (
+        std::path::PathBuf,
+        Arc<RelayState>,
+        tokio::sync::mpsc::UnboundedReceiver<AgentReply>,
+    ) {
+        let db_path = test_db(db_name);
+        let store = EventStore::open(&db_path).await.unwrap();
+        let (state, rx) = RelayState::new(
+            store,
+            Keys::generate(),
+            Keys::generate().public_key().to_hex(),
+        );
+        state.set_channels([Channel {
+            uuid: channel_uuid("bot_a", "oc_a"),
+            chat_id: "oc_a".into(),
+            name: "角色A".into(),
+            about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        }]);
+        (db_path, state, rx)
+    }
+
+    /// ensure_topic_channel：登记 + 种子 39002(#p=agent,#d=uuid)/39000(name=
+    /// 「角色·话题」) + 44100 成员通知（桥签名，#h=uuid,#p=agent）**入库**；
+    /// 44100 可被 REQ（kinds=[44100], #p=agent, since）回放（acp 重连恢复订阅的
+    /// 关键路径）且实时 fan-out 到达订阅连接。**幂等**：重复调用不重复种子/通知。
+    #[tokio::test]
+    async fn ensure_topic_channel_registers_seeds_and_notifies_once() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-topic").await;
+        let agent_pk = state.agent_pubkey.clone();
+        let mut sub = state.test_attach_subscriber_with("{}"); // 全量订阅收 fan-out
+
+        let tuuid = state
+            .ensure_topic_channel("bot_a", "oc_a", "omt_1", "角色A", "m1")
+            .await;
+        assert_eq!(tuuid, topic_channel_uuid("bot_a", "oc_a", "omt_1"));
+        // 登记表：thread_id/anchor_mid/bot_key 落位
+        let ch = state.channel_by_uuid(&tuuid).expect("话题频道必须登记");
+        assert_eq!(ch.chat_id, "oc_a");
+        assert_eq!(ch.thread_id, "omt_1");
+        assert_eq!(ch.anchor_mid, "m1");
+        assert_eq!(ch.bot_key, "bot_a");
+        assert_eq!(ch.name, "角色A·话题");
+
+        // 种子 39002（#p=agent, #d=uuid）+ 39000（name=「角色·话题」）入库
+        let f39002: Filter = serde_json::from_str(r#"{"kinds":[39002]}"#).unwrap();
+        let members = state.query(&[f39002]).await;
+        assert_eq!(members.len(), 1, "话题频道成员事件恰好一条");
+        assert_eq!(members[0].kind.as_u16(), 39002);
+        assert!(
+            members[0]
+                .tags
+                .iter()
+                .any(|t| t.as_slice().first().is_some_and(|k| k.as_str() == "d")
+                    && t.as_slice().get(1).is_some_and(|v| v.as_str() == tuuid)),
+            "39002 必须带 #d=话题 uuid"
+        );
+        let f39000: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        let metas = state.query(&[f39000]).await;
+        assert_eq!(metas.len(), 1, "话题频道元数据恰好一条");
+        assert!(
+            metas[0].tags.iter().any(|t| t
+                .as_slice()
+                .first()
+                .is_some_and(|k| k.as_str() == "name")
+                && t.as_slice()
+                    .get(1)
+                    .is_some_and(|v| v.as_str() == "角色A·话题")),
+            "39000 必须带 name=「角色·话题」"
+        );
+
+        // 44100：桥签名 + #h=话题 uuid + #p=agent + 入库 + fan-out 到达
+        let f44100: Filter =
+            serde_json::from_str(&format!(r##"{{"kinds":[44100],"#p":["{agent_pk}"]}}"##)).unwrap();
+        let notifs = state.query(std::slice::from_ref(&f44100)).await;
+        assert_eq!(notifs.len(), 1, "44100 成员通知必须入库（REQ 回放路径）");
+        assert_eq!(h_tag_of(&notifs[0]).as_deref(), Some(tuuid.as_str()));
+        assert_eq!(
+            notifs[0].pubkey.to_hex(),
+            state.bridge_pubkey(),
+            "44100 必须桥身份签名（relay-signed）"
+        );
+        // 实时 fan-out：全量订阅连接按序收到 44100（fan-out 帧含 kind:44100）
+        let frame = sub.try_recv().expect("44100 必须实时 fan-out 到订阅连接");
+        assert!(
+            frame.contains("\"kind\":44100"),
+            "fan-out 帧必须是 44100: {frame}"
+        );
+        // REQ since 回放语义：since=0 的查询（acp 重连回放形态）能捞到 44100
+        let replay: Filter = serde_json::from_str(&format!(
+            r##"{{"kinds":[44100],"#p":["{agent_pk}"],"since":0}}"##
+        ))
+        .unwrap();
+        assert_eq!(state.query(&[replay]).await.len(), 1, "since 回放必须命中");
+
+        // 幂等：重复 ensure 不重复种子/通知，登记表不变
+        let tuuid2 = state
+            .ensure_topic_channel("bot_a", "oc_a", "omt_1", "角色A", "m2")
+            .await;
+        assert_eq!(tuuid2, tuuid);
+        let f39000b: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        assert_eq!(
+            state.query(&[f39000b]).await.len(),
+            1,
+            "重复 ensure 不得重复种子"
+        );
+        assert_eq!(
+            state.query(std::slice::from_ref(&f44100)).await.len(),
+            1,
+            "重复 ensure 不得重发 44100"
+        );
+        assert!(sub.try_recv().is_err(), "重复 ensure 不得再 fan-out 44100");
+        // 幂等路径不改锚点（锚点只随 publish 更新）
+        assert_eq!(state.channel_by_uuid(&tuuid).unwrap().anchor_mid, "m1");
+        drop(state);
+        drop(_rx);
+        drop(sub);
+        remove_test_db(&db_path);
+    }
+
+    /// 安全钉扎（relay-signed only，与上游 ingest.rs:2187 对齐）：44100/44101
+    /// **不在 admit 白名单**——任何外部身份（含桥身份）经 ingest（WS EVENT /
+    /// HTTP /events 同路径）提交一律拒收且不入库。成员通知只经
+    /// publish_membership_notification 内部发布。
+    #[tokio::test]
+    async fn admit_rejects_membership_kinds_from_any_author() {
+        let db = test_db("abb-buzzrelay-44100");
+        let store = EventStore::open(&db).await.unwrap();
+        let bridge = Keys::generate();
+        let agent = Keys::generate();
+        let attacker = Keys::generate();
+        let (state, _rx) = RelayState::new(store, bridge.clone(), agent.public_key().to_hex());
+        let tuuid = topic_channel_uuid("bot_a", "oc_a", "omt_1");
+        let mk = |keys: &Keys, kind: u16| {
+            EventBuilder::new(Kind::Custom(kind), "")
+                .tag(Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                    [tuuid.as_str()],
+                ))
+                .tag(Tag::public_key(agent.public_key()))
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+
+        // 桥身份经 ingest 提交 44100 → 仍拒（内部发布不入 admit）
+        let ack = state.ingest(&mk(&bridge, 44100)).await;
+        assert!(
+            ack.contains("false"),
+            "桥身份经 ingest 的 44100 必须拒收: {ack}"
+        );
+        // 陌生人 44100 → 拒
+        let ack = state.ingest(&mk(&attacker, 44100)).await;
+        assert!(ack.contains("false"), "陌生人 44100 必须拒收: {ack}");
+        // 44101（移除，预留）同门关死
+        let ack = state.ingest(&mk(&bridge, 44101)).await;
+        assert!(ack.contains("false"), "44101 同样不得经 ingest 摄取: {ack}");
+        let f: Filter = serde_json::from_str(r#"{"kinds":[44100,44101]}"#).unwrap();
+        assert!(
+            state.query(&[f]).await.is_empty(),
+            "被拒的成员通知不得入库（否则 REQ 回放会把伪造成员关系喂给 acp）"
+        );
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db);
+    }
+
+    /// 话题发布：#h = 话题频道 uuid（不是群根）；锚点随发布更新为当前 mid；
+    /// fan-out 顺序 = 44100（ensure）先于 kind-9 用户消息（acp 先收成员通知
+    /// 即时订阅，再收消息）。话题频道未 ensure → 拒发（不静默落群根）。
+    #[tokio::test]
+    async fn publish_to_topic_channel_uses_topic_uuid_and_updates_anchor() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-topicpub").await;
+        let mut sub = state.test_attach_subscriber_with("{}");
+        let tuuid = topic_channel_uuid("bot_a", "oc_a", "omt_1");
+
+        // 未 ensure → None 且不入库（话题频道不存在时不许落到群根频道）
+        assert!(state
+            .publish_user_message("bot_a", "oc_a", "m0", "话题消息", "omt_1")
+            .await
+            .is_none());
+        let nine: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        assert!(state.query(std::slice::from_ref(&nine)).await.is_empty());
+
+        // ensure（44100 fan-out 先到）→ publish（kind-9 随后）
+        state
+            .ensure_topic_channel("bot_a", "oc_a", "omt_1", "角色A", "m1")
+            .await;
+        let f44100: Filter = serde_json::from_str(r#"{"kinds":[44100]}"#).unwrap();
+        let n44100 = state.query(std::slice::from_ref(&f44100)).await.len();
+        let id1 = state
+            .publish_user_message("bot_a", "oc_a", "m1", "话题消息一", "omt_1")
+            .await
+            .expect("话题频道已 ensure 必须可发布");
+        let evs = state.query(std::slice::from_ref(&nine)).await;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].id.to_hex(), id1);
+        assert_eq!(
+            h_tag_of(&evs[0]).as_deref(),
+            Some(tuuid.as_str()),
+            "话题消息必须发到话题频道（#h=话题 uuid，不是群根）"
+        );
+        assert_eq!(state.channel_by_uuid(&tuuid).unwrap().anchor_mid, "m1");
+        // 锚点随发布更新
+        state
+            .publish_user_message("bot_a", "oc_a", "m2", "话题消息二", "omt_1")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.channel_by_uuid(&tuuid).unwrap().anchor_mid,
+            "m2",
+            "锚点必须随发布更新为最新话题用户 mid"
+        );
+        // 重复发布不重复 44100
+        assert_eq!(
+            state.query(std::slice::from_ref(&f44100)).await.len(),
+            n44100
+        );
+
+        // fan-out 顺序：44100 在两条 kind-9 之前（同一订阅连接按序到达）
+        let f1 = sub.try_recv().expect("44100 帧");
+        let f2 = sub.try_recv().expect("用户消息帧 1");
+        let f3 = sub.try_recv().expect("用户消息帧 2");
+        assert!(f1.contains("\"kind\":44100"), "首帧必须是成员通知: {f1}");
+        assert!(f2.contains("\"kind\":9") && f2.contains("话题消息一"));
+        assert!(f3.contains("\"kind\":9") && f3.contains("话题消息二"));
+        drop(state);
+        drop(_rx);
+        drop(sub);
+        remove_test_db(&db_path);
+    }
+
+    /// 话题回复回流抽取：agent 签名的 kind-9（#h=话题 uuid）→ AgentReply 带出
+    /// chat_id + thread_id + anchor_mid（bridge 据此 send_thread_reply）；
+    /// 陌生人伪造同 #h 回复仍拒（作者门不松）。
+    #[tokio::test]
+    async fn ingest_topic_reply_carries_thread_fields() {
+        let db = test_db("abb-buzzrelay-topicingest");
+        let store = EventStore::open(&db).await.unwrap();
+        let agent = Keys::generate();
+        let stranger = Keys::generate();
+        let (state, mut rx) = RelayState::new(store, Keys::generate(), agent.public_key().to_hex());
+        state.set_channels([Channel {
+            uuid: channel_uuid("bot_a", "oc_a"),
+            chat_id: "oc_a".into(),
+            name: "角色A".into(),
+            about: String::new(),
+            bot_key: "bot_a".into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        }]);
+        let tuuid = state
+            .ensure_topic_channel("bot_a", "oc_a", "omt_1", "角色A", "m1")
+            .await;
+        let kind9 = |keys: &Keys, text: &str| {
+            EventBuilder::new(Kind::Custom(9), text)
+                .tag(Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                    [tuuid.as_str()],
+                ))
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+
+        // 陌生人伪造话题回复 → 拒（准入层作者门），不回流
+        state.ingest(&kind9(&stranger, "伪造话题回复")).await;
+        assert!(rx.try_recv().is_err(), "陌生人伪造话题回复不得回流");
+
+        // agent 话题回复 → AgentReply 带 thread_id/anchor_mid
+        state.ingest(&kind9(&agent, "话题里的回复")).await;
+        let got = rx.try_recv().expect("agent 话题回复应回流");
+        assert_eq!(got.chat_id, "oc_a");
+        assert_eq!(got.channel_uuid, tuuid);
+        assert_eq!(got.thread_id, "omt_1", "话题回复必须带 thread_id");
+        assert_eq!(got.anchor_mid, "m1", "话题回复必须带锚点 mid");
+        assert_eq!(got.content, "话题里的回复");
+        drop(state);
+        drop(rx);
+        remove_test_db(&db);
+    }
 }
 
 // ══════════ 事件存储（turso）与 relay 服务 ══════════
@@ -925,17 +1276,27 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// 一个频道（= ABB 登记的虚拟 Bot 群）。
+/// 一个频道（= ABB 登记的虚拟 Bot 群；#206 起话题 = 群下的独立频道）。
 #[derive(Debug, Clone)]
 pub struct Channel {
     /// 频道 uuid（REQ #h 与回复事件 #h 都用它）
     pub uuid: String,
     /// 对应的 ABB chat_id（回流路由用）
     pub chat_id: String,
-    /// 频道名（= 角色名）
+    /// 频道名（= 角色名；话题频道 = 「角色·话题」）
     pub name: String,
     /// 频道描述（= 角色提示词）
     pub about: String,
+    /// 归属 bot（话题频道是运行期动态登记的——service 回流路由的启动快照
+    /// uuid→bot_key 表覆盖不到它们，按本字段回落解析归属 Bridge）。
+    pub bot_key: String,
+    /// #206：话题 id（飞书 omt_ 开头）；空 = 群根频道。话题频道由
+    /// [`RelayState::ensure_topic_channel`] 在首条话题消息时登记。
+    pub thread_id: String,
+    /// #206：话题锚点 mid（最近一条话题用户消息的 mid）——回流回复经
+    /// send_thread_reply 落在该消息所在话题（飞书 reply_in_thread）。内存态：
+    /// 重启后首条话题消息以当前 mid 重锚（见 ensure_topic_channel 注释）。
+    pub anchor_mid: String,
 }
 
 /// 回流事件：虚拟 Bot agent 的回复（kind 9），bridge 据此发回聊天平台。
@@ -953,6 +1314,13 @@ pub struct AgentReply {
     pub in_reply_to: Option<String>,
     /// 事件 created_at（unix 秒；对账排序/诊断用）。
     pub created_at: u64,
+    /// #206 话题隔离：来源频道的话题 id；空 = 群根频道回复（发送走 send_text 原路径）。
+    /// 非空 → bridge 走 send_thread_reply 落回原话题。
+    pub thread_id: String,
+    /// #206：话题锚点 mid（抽取自频道登记表，见 Channel::anchor_mid）——
+    /// send_thread_reply 的 reply 目标。空（异常态：话题频道无锚点）时 bridge
+    /// 如实回落 send_text + 日志。
+    pub anchor_mid: String,
 }
 
 /// #206：上游 buzz-acp 的**全部** owner 控制命令字面量（lib.rs:2756-2848
@@ -969,6 +1337,15 @@ pub(crate) fn is_control_command_text(text: &str) -> bool {
     let t = text.trim();
     CONTROL_COMMAND_LITERALS.contains(&t)
 }
+
+/// #206 话题隔离：频道成员通知 kind（上游 buzz-relay 同值；44101=移除留给后续
+/// channel-refresh 项）。**relay-signed only 纪律**：本仓库只经
+/// [`RelayState::publish_membership_notification`] 内部发布（桥签名 + 入库 +
+/// fan-out，绕开 ingest/admit）；admit 白名单对 44100/44101 保持关闭——任何外部
+/// 身份（含桥身份）经 WS/HTTP 提交一律拒收，与上游 ingest.rs:2187 对齐。
+/// 内部发布已满足全部需求（acp 实时靠 fan-out、重连靠 REQ since 回放——故必须
+/// 入库），开口 admit 只会把「任意本地进程注入频道成员」的攻击面放到协议层。
+pub(crate) const KIND_MEMBERSHIP_ADD: u16 = 44100;
 
 /// #206：可发布到频道的 owner 控制命令——**白名单是结构性的**（枚举闭集，不接受
 /// 任意 content 字符串）。上游同机制的 `!shutdown`（终态杀 acp，I5 不复活）与
@@ -1235,18 +1612,24 @@ impl RelayState {
     }
 
     /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入指定频道。
-    /// 频道 uuid 由 (bot_key, chat_id) 确定性派生——不扫表按 chat_id 匹配（两 bot
-    /// 同群时会有歧义）。返回 None = 未送达（无频道/签名失败/未入库），调用方负责
-    /// 给用户可见反馈（不做静默黑洞）。成功（含 Duplicate 幂等重放）返回
-    /// Some(事件 id hex)——#206 回复侧记账以它登记 awaiting，回复事件的 e-tag
-    /// 按它反查。mid 进 tag：Nostr 事件 id 是内容哈希，「同秒同文」两条消息不带
-    /// mid 会撞 id——第二条被 INSERT OR IGNORE 静默吞。
+    /// `thread_id` 空 = 群根频道（uuid 由 (bot_key, chat_id) 确定性派生——不扫表
+    /// 按 chat_id 匹配，两 bot 同群时会有歧义）；非空 = 话题频道（#206 话题隔离，
+    /// uuid 见 [`topic_channel_uuid`]；**调用方须先 [`RelayState::ensure_topic_channel`]**
+    /// ——话题频道缺失如实失败，不静默落到群根）。返回 None = 未送达（无频道/签名
+    /// 失败/未入库），调用方负责给用户可见反馈（不做静默黑洞）。成功（含 Duplicate
+    /// 幂等重放）返回 Some(事件 id hex)——#206 回复侧记账以它登记 awaiting，回复事件
+    /// 的 e-tag 按它反查。mid 进 tag：Nostr 事件 id 是内容哈希，「同秒同文」两条消息
+    /// 不带 mid 会撞 id——第二条被 INSERT OR IGNORE 静默吞。
+    /// 话题发布成功后锚点随发布更新（Channel.anchor_mid = 当前 mid）——回流回复
+    /// 以最新话题用户消息为 reply 目标（同话题内的近似：迟到回复锚到更新消息的
+    /// 话题同侧，飞书 reply_in_thread 仍落原话题）。
     pub async fn publish_user_message(
         &self,
         bot_key: &str,
         chat_id: &str,
         mid: &str,
         content: &str,
+        thread_id: &str,
     ) -> Option<String> {
         // P1-1 安全闸（审查 #212，#206 回复侧记账 rebase 移植：签名 bool→Option，
         // 拒发由 return false 改为 return None）：本函数以**桥身份**（= acp 的
@@ -1265,13 +1648,18 @@ impl RelayState {
             );
             return None;
         }
-        let uuid = channel_uuid(bot_key, chat_id);
+        let uuid = if thread_id.is_empty() {
+            channel_uuid(bot_key, chat_id)
+        } else {
+            topic_channel_uuid(bot_key, chat_id, thread_id)
+        };
         if self.channel_by_uuid(&uuid).is_none() {
-            // 非虚拟 Bot 群（或登记晚于 relay 启动的频道集快照），不经 relay；
-            // 留日志防静默丢消息。
+            // 非虚拟 Bot 群（或登记晚于 relay 启动的频道集快照；话题频道 = 调用方
+            // 未先 ensure_topic_channel），不经 relay；留日志防静默丢消息。
             crate::log!(
-                "[mini-relay] ⚠️ chat 无对应频道（未登记/登记晚于启动），消息不入 relay chat={}",
-                crate::agent::truncate(chat_id, 16)
+                "[mini-relay] ⚠️ chat 无对应频道（未登记/登记晚于启动/话题未 ensure），消息不入 relay chat={} thread={}",
+                crate::agent::truncate(chat_id, 16),
+                crate::agent::truncate(thread_id, 16)
             );
             return None;
         }
@@ -1317,6 +1705,13 @@ impl RelayState {
                 return None;
             }
         }
+        // 话题频道：锚点随发布更新为当前用户 mid（回流回复的 reply 目标；
+        // 群根频道无锚点概念）。
+        if !thread_id.is_empty() {
+            if let Some(ch) = self.channels.write().unwrap().get_mut(&uuid) {
+                ch.anchor_mid = mid.to_string();
+            }
+        }
         self.fan_out(&e);
         // 入库 ≠ 有人消费。**能否补发取决于对端的订阅水位**（buzz-acp 的
         // subscribe_since/startup_watermark 在其进程内存里，ABB 不掌握也不该声称
@@ -1359,7 +1754,10 @@ impl RelayState {
 
     /// kind-9 事件 → AgentReply（共享抽取：实时回流 ingest 与对账
     /// find_agent_replies_to 同一条装配线，字段口径绝不漂移）。
-    /// None = #h 缺失或不在频道集（登记晚于启动快照）。
+    /// None = #h 缺失或不在频道集（登记晚于启动快照；话题频道在 ABB 重启后、
+    /// 下一条话题消息重登记前的窗口内同样不在——该窗口内到达的话题回复按此
+    /// 丢弃并留日志，崩溃窗口条目由启动对账的重登记兜住，见 bridge::buzzreply）。
+    /// 话题频道 → 带出 thread_id/anchor_mid（bridge 据此走 send_thread_reply）。
     fn agent_reply_from_event(&self, e: &Event) -> Option<AgentReply> {
         let uuid = h_tag_of(e)?;
         let ch = self.channel_by_uuid(&uuid)?;
@@ -1370,6 +1768,8 @@ impl RelayState {
             event_id: e.id.to_hex(),
             in_reply_to: first_e_tag(e),
             created_at: e.created_at.as_secs(),
+            thread_id: ch.thread_id,
+            anchor_mid: ch.anchor_mid,
         })
     }
 
@@ -1398,6 +1798,11 @@ impl RelayState {
     /// 返回 false = 未送达（无频道/agent 身份非法/签名失败/入库失败）；Duplicate
     /// 算送达（幂等语义同 publish_user_message）。
     ///
+    /// `thread_id`（#206 话题隔离）：空 = 发布到群根频道；非空 = 发布到话题频道
+    /// （叫停粒度与 CLI 的 chat:thread key 对齐——话题消息自本项起 dispatch 进
+    /// 独立话题频道，留在群根频道的 !cancel 停不到话题频道的在跑轮次）。
+    /// 话题频道缺失（从未 dispatch 过 = 无轮次可停）→ false，调用方如实表述。
+    ///
     /// 背充重放**不是无害 no-op**（审查 #212 更正），两种真实形态：
     /// ① 半开连接吞帧——fan-out 进 mpsc 成功但 acp 未收到/未 record_event；acp
     ///   重连回放窗口为 min(last_seen, dropped_since) - SINCE_SKEW_SECS(5s)
@@ -1410,14 +1815,20 @@ impl RelayState {
         &self,
         bot_key: &str,
         chat_id: &str,
+        thread_id: &str,
         cmd: ControlCommand,
     ) -> bool {
-        let uuid = channel_uuid(bot_key, chat_id);
+        let uuid = if thread_id.is_empty() {
+            channel_uuid(bot_key, chat_id)
+        } else {
+            topic_channel_uuid(bot_key, chat_id, thread_id)
+        };
         if self.channel_by_uuid(&uuid).is_none() {
             crate::log!(
-                "[mini-relay] ⚠️ 控制命令 {:?} 无对应频道（未登记/登记晚于启动），不发布 chat={}",
+                "[mini-relay] ⚠️ 控制命令 {:?} 无对应频道（未登记/登记晚于启动/话题未 ensure），不发布 chat={} thread={}",
                 cmd,
-                crate::agent::truncate(chat_id, 16)
+                crate::agent::truncate(chat_id, 16),
+                crate::agent::truncate(thread_id, 16)
             );
             return false;
         }
@@ -1498,10 +1909,20 @@ impl RelayState {
     /// 测试放宽。返回的接收端须由调用方持有。
     #[cfg(test)]
     pub fn test_attach_subscriber(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        self.test_attach_subscriber_with(r#"{"kinds":[9]}"#)
+    }
+
+    /// 测试夹具：同上但订阅 filter 自定（如 `{}` 全量订阅——断言 fan-out 帧序列
+    /// 用：44100 成员通知与 kind-9 用户消息的同连接到达顺序）。
+    #[cfg(test)]
+    pub fn test_attach_subscriber_with(
+        &self,
+        filter_json: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.conns.lock().unwrap().insert(id, tx);
-        let f: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let f: Filter = serde_json::from_str(filter_json).unwrap();
         self.subs
             .lock()
             .unwrap()
@@ -1522,6 +1943,144 @@ impl RelayState {
         }
     }
 
+    /// 种子**单个**频道的元数据/成员事件（kind 39002 成员 + 39000 元数据，桥身份
+    /// 签名，created_at=1 幂等）——seed_channel_events（启动全量）与
+    /// ensure_topic_channel（运行期话题登记）共用的单入口，防两份种子逻辑漂移。
+    /// agent 身份非法时跳过成员事件（无法构造有效的 #p tag；39000 照发）。
+    async fn seed_one_channel(&self, ch: &Channel) {
+        let agent_pk = if self.agent_pubkey.is_empty() {
+            None
+        } else {
+            nostr::PublicKey::from_hex(&self.agent_pubkey).ok()
+        };
+        // kind 39002：成员（#p = agent pubkey, #d = 频道 uuid）
+        // P0-1 修复：agent_pubkey 无效时跳过成员事件，不再 panic
+        if let Some(pk) = &agent_pk {
+            let member = EventBuilder::new(Kind::Custom(39002), "")
+                .tag(Tag::public_key(*pk))
+                .tag(Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
+                    [ch.uuid.as_str()],
+                ))
+                .custom_created_at(Timestamp::from_secs(1))
+                .sign_with_keys(&self.bridge_keys)
+                .ok();
+            if let Some(ev) = member {
+                let _ = self.db.store3(&ev).await;
+            }
+        }
+        // kind 39000：频道元数据（name/about 标签供 discover_channels 读取）
+        let meta = EventBuilder::new(Kind::Custom(39000), ch.about.clone())
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
+                [ch.uuid.as_str()],
+            ))
+            .tag(Tag::custom(TagKind::custom("name"), [ch.name.as_str()]))
+            .tag(Tag::custom(TagKind::custom("about"), [ch.about.as_str()]))
+            .custom_created_at(Timestamp::from_secs(1))
+            .sign_with_keys(&self.bridge_keys)
+            .ok();
+        if let Some(ev) = meta {
+            let _ = self.db.store3(&ev).await;
+        }
+    }
+
+    /// #206 话题隔离：确保话题频道已登记（**幂等**——已在登记表 → 直接返回
+    /// uuid，不重复种子/通知）。新话题：登记 Channel（bot_key/thread_id/锚点）
+    /// → 种子 39002(#p=agent,#d=uuid)/39000(name=「角色·话题」) → 内部发布
+    /// 44100 成员通知（#h=uuid,#p=agent）入库并 fan-out。acp 收 44100 后
+    /// Mentions 模式默认放行并即时订阅（resolve_dynamic_channel_filter
+    /// config.rs:1376 @ c3132c3）；重连则靠 REQ since 回放恢复订阅（故 44100
+    /// 必须入库，见 publish_membership_notification）。
+    ///
+    /// 重启自愈：频道登记表是内存态——重启后话题频道不在表内，下一条话题消息
+    /// 经 bridge 预检再次走本函数重登记 + 重发 44100（库内旧 39000/39002 种子
+    /// 按事件 id 幂等不重复，44100 每次新增一条属预期，无界增长见 PR 风险节）；
+    /// 锚点 mid 同为内存态，以触发消息的 mid 重锚。
+    /// `role_name`：话题频道名 = 「{role_name}·话题」（调用方取群根频道名，
+    /// 与群频道同源）。`anchor_mid`：触发登记的消息 mid。
+    pub async fn ensure_topic_channel(
+        &self,
+        bot_key: &str,
+        chat_id: &str,
+        thread_id: &str,
+        role_name: &str,
+        anchor_mid: &str,
+    ) -> String {
+        let uuid = topic_channel_uuid(bot_key, chat_id, thread_id);
+        if self.channel_by_uuid(&uuid).is_some() {
+            return uuid; // 幂等：已登记不重复种子/通知
+        }
+        let ch = Channel {
+            uuid: uuid.clone(),
+            chat_id: chat_id.to_string(),
+            name: format!("{role_name}·话题"),
+            // 与群根频道口径一致（service 启动登记同样 about=空——角色提示词
+            // 经 buzz-acp 侧 channel→session 的群根频道元数据承载，话题频道
+            // 不另造一份）
+            about: String::new(),
+            bot_key: bot_key.to_string(),
+            thread_id: thread_id.to_string(),
+            anchor_mid: anchor_mid.to_string(),
+        };
+        self.set_channels([ch.clone()]);
+        self.seed_one_channel(&ch).await;
+        if !self
+            .publish_membership_notification(&uuid, KIND_MEMBERSHIP_ADD)
+            .await
+        {
+            // agent 身份非法（同 publish_user_message 的 I1 口径）：频道已登记、
+            // 消息照常入库——acp 收不到 44100 不会即时订阅，回复等下次启动种子
+            // /REQ 回放，日志如实。
+            crate::log!(
+                "[mini-relay] ⚠️ 话题频道已登记但 44100 成员通知发布失败（agent 身份非法？）uuid={}",
+                crate::agent::truncate(&uuid, 16)
+            );
+        }
+        uuid
+    }
+
+    /// 内部发布频道成员通知（44100=加入；44101=移除预留，后续 channel-refresh
+    /// 项用）：**桥身份签名 → 入库 → fan-out，绕开 ingest/admit**——admit 白名单
+    /// 对 44100/44101 保持关闭（任何外部身份含桥身份经 WS/HTTP 提交一律拒收），
+    /// 与上游 buzz-relay「relay-signed only」纪律对齐（上游 ingest.rs:2187 拒
+    /// 外部提交）。内部发布已满足全部需求：acp 实时靠 fan-out，重连靠 REQ
+    /// （kinds=[44100], #p=agent, since）回放——**故必须入库**（Store 语义）。
+    /// Duplicate（同秒同参数重发撞内容哈希）算送达：事件已在库里等被回放。
+    /// false = 未送达（agent 身份非法无法构造 #p / 签名失败 / 入库失败）。
+    pub(crate) async fn publish_membership_notification(&self, uuid: &str, kind: u16) -> bool {
+        let Some(agent_pk) = self.agent_pk else {
+            crate::log!(
+                "[mini-relay] ⚠️ agent 身份未配置（pubkey 为空/非法），成员通知 kind={kind} 无法定址，拒发"
+            );
+            return false;
+        };
+        let ev = EventBuilder::new(Kind::Custom(kind), "")
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [uuid],
+            ))
+            .tag(Tag::public_key(agent_pk))
+            .sign_with_keys(&self.bridge_keys)
+            .ok();
+        let Some(e) = ev else {
+            crate::log!("[mini-relay] ⚠️ 成员通知事件签名失败（桥身份密钥异常），丢弃");
+            return false;
+        };
+        match self.db.store3(&e).await {
+            Store3::Stored | Store3::Duplicate => {}
+            Store3::Failed(err) => {
+                crate::log!(
+                    "[mini-relay] ⚠️ 成员通知 kind={kind} 入库失败 uuid={}: {err}",
+                    crate::agent::truncate(uuid, 16)
+                );
+                return false;
+            }
+        }
+        self.fan_out(&e);
+        true
+    }
+
     /// 种子频道元数据/成员事件（kind 39002 成员 + 39000 元数据，bridge 身份签名）——
     /// buzz-acp discover_channels 两步 /query 的数据源。幂等（同 id 去重）。
     /// agent_pubkey 为空时跳过成员事件（无法构造有效的 #p tag）。
@@ -1537,42 +2096,8 @@ impl RelayState {
         }
         // 先克隆（不持 RwLock 跨 await——RwLockReadGuard 非 Send）
         let channels: Vec<Channel> = self.channels.read().unwrap().values().cloned().collect();
-        let agent_pk = if self.agent_pubkey.is_empty() {
-            None
-        } else {
-            nostr::PublicKey::from_hex(&self.agent_pubkey).ok()
-        };
         for ch in &channels {
-            // kind 39002：成员（#p = agent pubkey, #d = 频道 uuid）
-            // P0-1 修复：agent_pubkey 无效时跳过成员事件，不再 panic
-            if let Some(pk) = &agent_pk {
-                let member = EventBuilder::new(Kind::Custom(39002), "")
-                    .tag(Tag::public_key(*pk))
-                    .tag(Tag::custom(
-                        TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
-                        [ch.uuid.as_str()],
-                    ))
-                    .custom_created_at(Timestamp::from_secs(1))
-                    .sign_with_keys(&self.bridge_keys)
-                    .ok();
-                if let Some(ev) = member {
-                    let _ = self.db.store3(&ev).await;
-                }
-            }
-            // kind 39000：频道元数据（name/about 标签供 discover_channels 读取）
-            let meta = EventBuilder::new(Kind::Custom(39000), ch.about.clone())
-                .tag(Tag::custom(
-                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
-                    [ch.uuid.as_str()],
-                ))
-                .tag(Tag::custom(TagKind::custom("name"), [ch.name.as_str()]))
-                .tag(Tag::custom(TagKind::custom("about"), [ch.about.as_str()]))
-                .custom_created_at(Timestamp::from_secs(1))
-                .sign_with_keys(&self.bridge_keys)
-                .ok();
-            if let Some(ev) = meta {
-                let _ = self.db.store3(&ev).await;
-            }
+            self.seed_one_channel(ch).await;
         }
     }
 
@@ -1589,6 +2114,11 @@ impl RelayState {
     ///   陌生人 kind-9 = 伪造用户轮注入上下文，同样拒。
     /// - 20001/20002（presence/typing）：瞬时事件——只 fan-out 不入库（NIP-01
     ///   ephemeral 语义；入库会在 REQ 回放时把陈旧在线态当历史喂回去）。
+    /// - 44100/44101（频道成员通知，#206）：**保持关闭**——成员通知是
+    ///   relay-signed only（上游 ingest.rs:2187 同纪律），本仓库只经
+    ///   [`RelayState::publish_membership_notification`] 内部发布（绕开
+    ///   ingest/admit）；任何外部身份（含桥身份）经 WS/HTTP 提交一律拒收，
+    ///   否则任意本地进程可注入频道成员把 agent 拉进攻击者频道。
     /// - 其余（含 22242 auth：只属于 WS 握手路径）：拒。
     ///
     /// 白名单的已知缺口：**kind 24200（buzz-acp 的 observer frame，它按 durable 经
