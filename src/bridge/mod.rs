@@ -2175,16 +2175,7 @@ mod tests {
 
     // ---- #206：buzz 轮次叫停（/cancel → owner 控制命令 "!cancel"）----
 
-    /// 从事件 tags 提取 #h 首值（buzzrelay::h_tag_of 是私有的，测试侧就地复刻）。
-    fn test_h_tag(e: &nostr::prelude::Event) -> Option<String> {
-        e.tags.iter().find_map(|t| {
-            let s = t.as_slice();
-            s.first()
-                .is_some_and(|k| k.as_str() == "h")
-                .then(|| s.get(1).map(|v| v.as_str().to_string()))
-                .flatten()
-        })
-    }
+    // 事件 #h 提取直接用 buzzrelay::h_tag_of（pub(crate)，单一实现防漂移）
 
     /// buzz bot /cancel → 发布恰好一条 owner 控制命令事件（content 精确 "!cancel"，
     /// #h 命中本 chat 频道）+ 诚实回执（只说「已发送」，附无轮次 no-op 说明）；
@@ -2224,7 +2215,10 @@ mod tests {
         // content.trim()=="!cancel" 精确比对——钉死精确相等，防日后被加上下文前缀
         //（加了 acp 就把它当普通消息喂给 agent，叫停静默失效）。
         assert_eq!(evs[0].content, "!cancel");
-        assert_eq!(test_h_tag(&evs[0]).as_deref(), Some(uuid.as_str()));
+        assert_eq!(
+            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
+            Some(uuid.as_str())
+        );
         // 回执诚实：只说「已发送」+ 无轮次 no-op 说明，绝不谎称「已停止」
         //（acp 对无 in-flight 的 !cancel 仅 warn no-op，桥无轮次记账可确知）
         let sent = msgr.sent();
@@ -2243,6 +2237,53 @@ mod tests {
         // 即时控制指令：不落 pending、不消耗会话闸（迁移注入闸保留）
         assert!(bridge.pending.is_empty());
         assert!(!bridge.sessions.is_started(chat));
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 审查 #212 P1-1 安全性质钉扎（bridge 层端到端，机制无关）：用户发纯文本
+    /// "!shutdown"——无论哪层兜底（宿主护栏注入使最终 content 带前缀 ≠ 字面量，
+    /// 或 relay 入口闸按精确判据拒发），事件库里都绝不出现桥身份（=acp owner）
+    /// 署名的裸控制命令（上游 lib.rs:2756-2848 的判定只看 content.trim()）。
+    #[tokio::test]
+    async fn buzz_dispatch_never_stores_bare_control_literal() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, _msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_ctl_gate";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-ctl-gate");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let _sub = state.test_attach_subscriber();
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        for (i, lit) in ["!shutdown", "!rotate", "!cancel"].iter().enumerate() {
+            bridge.handle(test_ev(&format!("m{i}"), chat, lit)).await;
+        }
+
+        let evs = state.query(std::slice::from_ref(&all)).await;
+        assert!(
+            evs.iter()
+                .all(|e| !crate::buzzrelay::is_control_command_text(&e.content)),
+            "owner 署名的裸控制命令绝不允许入库: {:?}",
+            evs.iter().map(|e| &e.content).collect::<Vec<_>>()
+        );
         cleanup_bridge(&bridge);
         drop(bridge);
         drop(state);
@@ -2400,7 +2441,7 @@ mod tests {
         assert_eq!(evs.len(), 1, "话题 /cancel 同样发布控制事件");
         assert_eq!(evs[0].content, "!cancel");
         assert_eq!(
-            test_h_tag(&evs[0]).as_deref(),
+            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
             Some(uuid.as_str()),
             "话题 /cancel 路由到群频道（频道级叫停）"
         );

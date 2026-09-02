@@ -718,6 +718,8 @@ impl Bridge {
             );
             // 预检已保证 relay 存在 + 频道已登记 + 非受限会话；这里 false 只剩
             // 「签名失败 / 入库失败（磁盘等）」——同样给可见报错，且不消耗会话闸。
+            // （owner 控制命令字面量的拦截在 relay 入口闸 publish_user_message，
+            // 对**最终组装后**的 content 做精确判据——是唯一权威边界，审查 #212 P1-1）
             let delivered = self
                 .buzz_relay_state
                 .as_ref()
@@ -1068,7 +1070,7 @@ impl Bridge {
     ///   丢弃、频道 session 失效，pool.rs:2654-2678 / requeue_cancelled_batch 对
     ///   Cancel return None pool.rs:4184）——被叫停轮次不重发，下条消息以新会话
     ///   续跑（acp 每轮拉最近频道消息作上下文，context_message_limit 默认 12，
-    ///   pool.rs:2467 / config.rs:371，可感知失忆有限）；
+    ///   pool.rs:2467 / config.rs:372，可感知失忆有限）；
     /// - 明示粒度：叫停是**频道级=群级**——话题与顶层同一 channel，/cancel 会停掉
     ///   本群任意话题的在跑轮次（CLI 路径按 chat:thread key 隔离，语义不同）。
     ///
@@ -1082,7 +1084,9 @@ impl Bridge {
                     BuzzPrecheckFail::RelayUnavailable => {
                         "mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）"
                     }
-                    BuzzPrecheckFail::ChannelUnregistered => "本会话不是已登记的虚拟 Bot 群",
+                    BuzzPrecheckFail::ChannelUnregistered => {
+                        "本会话不是已登记的虚拟 Bot 群（新登记的群需重启后参与 buzz）"
+                    }
                     BuzzPrecheckFail::SubscriberAbsent => "buzz-acp 未订阅本频道（未连接/未就绪）",
                 };
                 format!("⚠️ buzz 叫停未送达：{why}。")
