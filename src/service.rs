@@ -389,7 +389,7 @@ pub async fn run() {
                                 }
                             }
                             ChannelRefresh::ParseFailed => crate::log!(
-                                "[mini-relay] ⚠️ virtual-bots.json 解析失败，本拍跳过（频道集保持旧值，修复后自动生效）"
+                                "[mini-relay] ⚠️ virtual-bots.json 解析失败，本拍跳过（频道集保持旧值；内容修复经原子重写后下拍自动收敛——注意权限失败类问题不改 (mtime,len)，需内容变更才再触发）"
                             ),
                         }
                     }

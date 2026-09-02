@@ -2140,7 +2140,7 @@ mod tests {
     #[tokio::test]
     async fn buzz_undelivered_replies_error_and_keeps_gate() {
         // buzz dispatch 失败面：① relay None（未启用/初始化失败）；② relay Some 但
-        // chat 无频道（未登记/登记晚于启动）。两种都必须用户可见「无法处理」报错、
+        // chat 无频道（未登记；#206 频道集刷新后运行期登记约 2s 巡检内自动接入）。两种都必须用户可见「无法处理」报错、
         // 摘 pending、且不 mark_started——一次性迁移注入闸不能被没发生的轮次消耗。
         let bot = backend_bot("buzz");
         let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));

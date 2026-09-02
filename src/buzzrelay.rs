@@ -1546,8 +1546,9 @@ pub struct Channel {
     pub name: String,
     /// 频道描述（= 角色提示词）
     pub about: String,
-    /// 归属 bot（话题频道是运行期动态登记的——service 回流路由的启动快照
-    /// uuid→bot_key 表覆盖不到它们，按本字段回落解析归属 Bridge）。
+    /// 归属 bot（话题频道是运行期动态登记的——service 回流路由表按
+    /// (mtime,len) 巡检增量更新但只覆盖群根频道，话题频道按本字段回落解析
+    /// 归属 Bridge）。
     pub bot_key: String,
     /// #206：话题 id（飞书 omt_ 开头）；空 = 群根频道。话题频道由
     /// [`RelayState::ensure_topic_channel`] 在首条话题消息时登记。
