@@ -31,6 +31,7 @@ mod pending;
 mod permreq;
 mod platform;
 mod proto;
+mod replyledger;
 mod schedule;
 mod service;
 mod session_gc;

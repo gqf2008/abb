@@ -165,11 +165,17 @@ pub async fn run() {
         std::process::exit(1);
     }
     // #200 胶水：mini-relay 服务期任务（状态初始化成功才启动）：
-    // ① buzz-acp 子进程（含存活巡检重拉）；② 回复回流 → 按频道 uuid 路由到归属 bot
-    // 的 messenger → send_text 发回聊天平台；③ WS 服务（绑定失败退避重试）。
+    // ① buzz-acp 子进程（含存活巡检重拉）；② 回复回流 → 按频道 uuid 路由到归属
+    // bot 的 Bridge → handle_buzz_reply（#206 回复侧记账：写历史 + 发送 + 账本）；
+    // ③ WS 服务（绑定失败退避重试）。
     // 必须在 messenger 就绪后 spawn（回流路由要查 messengers），且在 Router::new
     // 消费 messengers 之前建好路由表（messengers 此后被 move）。
     // 表达式值 = 注入各 Bridge 的 relay 状态（bot 循环构造时按值传入，无竞态）。
+    // #206：bridge 注册表（bot_key → Weak<Bridge>）——回流任务按它把回复交给
+    // 归属 bot 的 Bridge 处理（账本/历史/发送都在桥内闭环）；Weak 不阻止 bot 循环
+    // 退出后 Bridge 析构。路由表只需 uuid→bot_key（uuid 含 bot_key，两 bot 同群
+    // 不串线；vbs 用 init 的同一份快照，频道集与路由表绝不同源漂移）。
+    let bridge_registry: crate::bridge::BridgeRegistry = Default::default();
     let buzz_relay_state: Option<std::sync::Arc<crate::buzzrelay::RelayState>> = if let Some(init) =
         buzz_init.take()
     {
@@ -182,16 +188,15 @@ pub async fn run() {
         // 频道集只用于建路由表（下表）与一行日志——**不**把 Vec 长期闭包进任务：
         // 长驻任务里读启动快照的登记表会误导后续改动（审查 #205r2）。
         let n_vbs = vbs.len();
-        // 回复回流路由表：频道 uuid → messenger（uuid 含 bot_key，两 bot 同群不串线；
-        // 回流事件本身带 channel_uuid）。vbs 用 init 的同一份快照（频道集与路由表
-        // 绝不同源漂移）。运行期新登记的群不参与 buzz（重启生效，与频道集一致）。
-        let senders: Arc<HashMap<String, Arc<dyn crate::messenger::Messenger>>> = {
+        // 回复回流路由表：频道 uuid → bot_key。运行期新登记的群不参与 buzz（重启
+        // 生效，与频道集一致）。
+        let reply_routes: Arc<HashMap<String, String>> = {
             let mut map = HashMap::new();
             for vb in &vbs {
-                if let Some(m) = messengers.get(&vb.bot_key) {
+                if messengers.contains_key(&vb.bot_key) {
                     map.insert(
                         crate::buzzrelay::channel_uuid(&vb.bot_key, &vb.chat_id),
-                        Arc::clone(m),
+                        vb.bot_key.clone(),
                     );
                 }
             }
@@ -202,6 +207,8 @@ pub async fn run() {
         let bridge_pubkey = state.bridge_pubkey();
         let cfg = Arc::clone(&cfg);
         let stop = crate::tasks::shutdown_token();
+        // 回流任务用的注册表句柄在闭包外克隆（外层 async move 会整体吃掉捕获变量）
+        let registry_for_replies = bridge_registry.clone();
         crate::tasks::tasks().spawn_forever("mini-relay", async move {
             // ① buzz-acp 子进程 + 巡检。句柄必须被长期持有：Child 置 kill_on_drop，
             // 句柄一 drop 即 SIGKILL（审查 #205 P0——原实现 match Ok(_) 即丢，
@@ -292,25 +299,28 @@ pub async fn run() {
             // ② 回复回流（独立任务——下面的 run_server 才是本任务的常态驻留点）。
             // 观察关停令牌：parked 在 recv() 的循环不收尾 = shutdown_wait 恒烧满总期限
             // （仓库纪律，审查 #205r2）。
+            // #206 回复侧记账：路由改为 uuid → bot_key → Bridge 注册表（Weak 升级），
+            // 调 handle_buzz_reply——账本去重、写历史（代际闸）、chat_lock 串行发送
+            // 都在桥内闭环。逐条 await（不 spawn per reply）保 per-chat 发送顺序
+            // （风险⑦）。Bridge 未注册（bot 凭证不齐未启动/登记晚于启动）= 该频道
+            // 不可能有 dispatch（dispatch 依赖同一 Bridge 存在），只可能是陈旧事件
+            // 或配置漂移——记日志丢弃。
             crate::tasks::tasks().spawn_forever("mini-relay-replies", {
                 let stop = stop.clone();
+                let registry = registry_for_replies.clone();
                 async move {
                     loop {
                         let reply = tokio::select! {
                             Some(r) = reply_rx.recv() => r,
                             _ = stop.cancelled() => break,
                         };
-                        match senders.get(&reply.channel_uuid) {
-                            Some(msgr) => {
-                                if let Err(e) = msgr.send_text(&reply.chat_id, &reply.content).await {
-                                    crate::log!(
-                                        "[mini-relay] 回复发送失败 chat={}: {e:#}",
-                                        crate::agent::truncate(&reply.chat_id, 16)
-                                    );
-                                }
-                            }
+                        let bridge = reply_routes
+                            .get(&reply.channel_uuid)
+                            .and_then(|k| registry.get(k));
+                        match bridge {
+                            Some(b) => b.handle_buzz_reply(reply).await,
                             None => crate::log!(
-                                "[mini-relay] agent 回复无对应 messenger（登记晚于启动？）chat={} len={}",
+                                "[mini-relay] agent 回复无对应 bridge（bot 未启动/登记晚于启动？）chat={} len={}",
                                 crate::agent::truncate(&reply.chat_id, 16),
                                 reply.content.chars().count()
                             ),
@@ -376,11 +386,13 @@ pub async fn run() {
         let router = router.clone();
         // #200：每 bot 一份 relay 状态（None=未启用/初始化失败）
         let buzz_relay = buzz_relay_state.clone();
+        // #206：回复回流路由注册表（全部 bot 共享同一份）
+        let registry = bridge_registry.clone();
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
         handles.push(crate::tasks::tasks().spawn_forever(name, async move {
-            run_bot(bot, cfg, msgr, router, stop, buzz_relay).await;
+            run_bot(bot, cfg, msgr, router, stop, buzz_relay, registry).await;
         }));
     }
     // 等所有 bot 循环结束。⚠️ 服务期的常态就是等在这里（等关停广播），**绝不能包超时**：
@@ -748,6 +760,7 @@ async fn run_bot(
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
     buzz_relay: Option<std::sync::Arc<crate::buzzrelay::RelayState>>, // #200：buzz dispatch 用
+    bridge_registry: crate::bridge::BridgeRegistry,                   // #206：buzz 回复回流路由用
 ) {
     let key = bot.key();
     crate::log!(
@@ -760,6 +773,9 @@ async fn run_bot(
         b.buzz_relay_state = buzz_relay; // #200：buzz dispatch 用；未启用/初始化失败 = None
         Arc::new(b)
     };
+    // #206：注册进回流路由表（必须在事件循环开始前——dispatch 只能发生在注册后，
+    // 回复不可能先于注册到达）。
+    bridge_registry.register(&key, &bridge);
 
     // 连接态初始上报：进入事件循环前是「连接中」；之后由各事件循环在状态迁移时更新。
     // （别用独立心跳任务只报「活着」——那测的是上报线程不是通道连通，会话死了托盘还在线。）
@@ -798,6 +814,19 @@ async fn run_bot(
         let name: &'static str = Box::leak(format!("recover:{}", key).into_boxed_str());
         crate::tasks::tasks().spawn(name, async move {
             bridge.recover_pending(&stop).await;
+        });
+    }
+
+    // #206 回复侧记账·启动对账：buzz 回复在「relay 已入库 → 桥未发送」崩溃窗口
+    // （含发送失败留账）的条目补发 + 补历史。buzz 未启用（relay=None）时函数内
+    // 直接返回，不占资源。短命任务登记进治理；token 逐条检查（对账会真实发送
+    // 消息，关停广播后立即停，剩余留账下次启动续对）。
+    {
+        let bridge = bridge.clone();
+        let stop = stop.clone();
+        let name: &'static str = Box::leak(format!("buzz-recover:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn(name, async move {
+            bridge.recover_buzz_replies(&stop).await;
         });
     }
 

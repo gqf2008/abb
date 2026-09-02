@@ -31,8 +31,10 @@ const ABB_EMAIL: &str = "abb@agent-bridge.local";
 /// 隐私相关条目（history/、sessions*、summaries/、GRANTED.md、attachments/）必须
 /// 保留：会话历史/归纳摘要含对话全文（summaries/ 为 #130 session_gc 产物）、
 /// GRANTED.md 含授权者名单，git add -A 绝不能把它们提交进仓库（#88 审查结论：
-/// 历史外泄）。churn 条目（context_tokens.json / agent-pids.json / .abb-*-last /
-/// *.tmp 等）防高频变更击穿「无变更不空 commit」快路径。
+/// 历史外泄）。buzz-reply-ledger.json（#206 回复侧账本）含 chat_id/事件 id 等
+/// 对话元数据，与 pending.json 同类排除。churn 条目（context_tokens.json /
+/// agent-pids.json / .abb-*-last / *.tmp 等）防高频变更击穿「无变更不空 commit」
+/// 快路径。
 ///
 /// 注意：ignore 只对未跟踪文件生效——存量 tidy 仓库若曾把上述文件提交过，需
 /// `git rm --cached` 去 track（#209 批次 3 tidy 迁移时一并处理）。
@@ -47,6 +49,7 @@ agent-pids.json
 jobs.json
 pending.json
 pending_outbox.json
+buzz-reply-ledger.json
 *.tmp
 *.swp
 *.bak
@@ -514,6 +517,8 @@ mod tests {
         let ws = TempWs::new();
         std::fs::write(ws.0.join("real.txt"), "keep").unwrap();
         std::fs::write(ws.0.join("sessions.json"), "{\" secret\":1}").unwrap();
+        // #206 回复侧账本（chat_id/事件 id 对话元数据）与 pending.json 同类排除
+        std::fs::write(ws.0.join("buzz-reply-ledger.json"), "{\"awaiting\":{}}").unwrap();
         let hist = ws.0.join("history");
         std::fs::create_dir_all(&hist).unwrap();
         std::fs::write(hist.join("chat.log"), "对话全文").unwrap();
@@ -532,6 +537,10 @@ mod tests {
         assert!(
             tree.get_path(Path::new("sessions.json")).is_err(),
             "运行时文件被排除"
+        );
+        assert!(
+            tree.get_path(Path::new("buzz-reply-ledger.json")).is_err(),
+            "#206 回复账本不入库（对话元数据，与 pending.json 同类）"
         );
         assert!(
             tree.get_path(Path::new("history/chat.log")).is_err(),
