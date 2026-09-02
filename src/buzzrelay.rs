@@ -1267,6 +1267,265 @@ mod tests {
         drop(rx);
         remove_test_db(&db);
     }
+
+    // ---- #206 频道集运行期刷新（sync_channels）----
+
+    /// 测试夹具：群根频道一条（uuid 按 (bot_key, chat_id) 派生，与启动登记同源）。
+    fn root_channel(bot_key: &str, chat_id: &str, name: &str) -> Channel {
+        Channel {
+            uuid: channel_uuid(bot_key, chat_id),
+            chat_id: chat_id.into(),
+            name: name.into(),
+            about: String::new(),
+            bot_key: bot_key.into(),
+            thread_id: String::new(),
+            anchor_mid: String::new(),
+        }
+    }
+
+    /// 事件的 #d tag 首值（39000/39002 种子的频道键）是否等于 want。
+    fn d_tag_is(e: &nostr::Event, want: &str) -> bool {
+        e.tags.iter().any(|t| {
+            t.as_slice().first().is_some_and(|k| k.as_str() == "d")
+                && t.as_slice().get(1).is_some_and(|v| v.as_str() == want)
+        })
+    }
+
+    /// sync 增：新登记频道进表 + 种子 39002/39000 入库 + 44100（桥签名、#h=新 uuid、
+    /// #p=agent）入库可 REQ since 回放 + 实时 fan-out 到 kinds=[44100,44101] #p
+    /// 订阅连接。delta 只含 added。
+    #[tokio::test]
+    async fn sync_channels_adds_new_root_channel_and_notifies_44100() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-syncadd").await;
+        let agent_pk = state.agent_pubkey.clone();
+        // acp 形态的成员通知订阅：kinds=[44100,44101] #p=agent
+        let mut sub = state.test_attach_subscriber_with(&format!(
+            r##"{{"kinds":[44100,44101],"#p":["{agent_pk}"]}}"##
+        ));
+        let ch_b = root_channel("bot_a", "oc_b", "角色B");
+        let delta = state
+            .sync_channels(vec![root_channel("bot_a", "oc_a", "角色A"), ch_b.clone()])
+            .await;
+        assert_eq!(delta.added.len(), 1, "delta 必须恰含一个 added");
+        assert_eq!(delta.added[0].uuid, ch_b.uuid);
+        assert!(delta.removed.is_empty() && delta.renamed.is_empty());
+        assert!(
+            state.channel_by_uuid(&ch_b.uuid).is_some(),
+            "新频道必须进表（dispatch 立即可用）"
+        );
+        // 种子：新频道的 39002(#d=uuid)/39000 入库（重种子幂等——旧频道不重复）
+        let f39002: Filter = serde_json::from_str(r#"{"kinds":[39002]}"#).unwrap();
+        let members = state.query(&[f39002]).await;
+        assert_eq!(members.len(), 2, "两个频道各一条成员种子");
+        assert!(
+            members.iter().any(|e| d_tag_is(e, &ch_b.uuid)),
+            "新频道必须有 39002 成员种子"
+        );
+        let f39000: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        let metas = state.query(&[f39000]).await;
+        assert_eq!(metas.len(), 2, "两个频道各一条元数据种子");
+        assert!(metas.iter().any(|e| d_tag_is(e, &ch_b.uuid)));
+        // 44100：入库 + 桥签名 + #h=新 uuid + #p=agent + REQ since 回放命中
+        let f44100: Filter =
+            serde_json::from_str(&format!(r##"{{"kinds":[44100],"#p":["{agent_pk}"]}}"##)).unwrap();
+        let notifs = state.query(std::slice::from_ref(&f44100)).await;
+        assert_eq!(notifs.len(), 1, "44100 加入通知必须入库（REQ 回放路径）");
+        assert_eq!(h_tag_of(&notifs[0]).as_deref(), Some(ch_b.uuid.as_str()));
+        assert_eq!(
+            notifs[0].pubkey.to_hex(),
+            state.bridge_pubkey(),
+            "44100 必须桥身份签名（relay-signed）"
+        );
+        let replay: Filter = serde_json::from_str(&format!(
+            r##"{{"kinds":[44100],"#p":["{agent_pk}"],"since":0}}"##
+        ))
+        .unwrap();
+        assert_eq!(state.query(&[replay]).await.len(), 1, "since 回放必须命中");
+        // 实时 fan-out 到达 kinds=[44100,44101] #p 订阅连接
+        let frame = sub.try_recv().expect("44100 必须实时 fan-out 到订阅连接");
+        assert!(
+            frame.contains("\"kind\":44100"),
+            "fan-out 帧必须是 44100: {frame}"
+        );
+        drop(state);
+        drop(_rx);
+        drop(sub);
+        remove_test_db(&db_path);
+    }
+
+    /// sync 删：取消登记的频道出表 + 44101（桥签名、#h=旧 uuid、#p=agent）入库可
+    /// 回放 + 实时 fan-out；旧频道的 39000/39002 种子残行随重种子清掉（库状态恒
+    /// 等于当前频道表）。
+    #[tokio::test]
+    async fn sync_channels_removes_deregistered_channel_and_notifies_44101() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-syncdel").await;
+        let agent_pk = state.agent_pubkey.clone();
+        // 模拟启动：全量种子落库（移除后必须被清掉的就是这批残行）
+        state.seed_channel_events().await;
+        let uuid_a = channel_uuid("bot_a", "oc_a");
+        let mut sub = state.test_attach_subscriber_with(&format!(
+            r##"{{"kinds":[44100,44101],"#p":["{agent_pk}"]}}"##
+        ));
+        // 登记表变空（取消登记）→ removed
+        let delta = state.sync_channels(vec![]).await;
+        assert_eq!(delta.removed.len(), 1, "delta 必须恰含一个 removed");
+        assert_eq!(delta.removed[0].uuid, uuid_a);
+        assert!(delta.added.is_empty() && delta.renamed.is_empty());
+        assert!(
+            state.channel_by_uuid(&uuid_a).is_none(),
+            "取消登记的频道必须出表"
+        );
+        // 44101：入库 + 桥签名 + #h=旧 uuid + 回放 + fan-out
+        let f44101: Filter =
+            serde_json::from_str(&format!(r##"{{"kinds":[44101],"#p":["{agent_pk}"]}}"##)).unwrap();
+        let notifs = state.query(std::slice::from_ref(&f44101)).await;
+        assert_eq!(notifs.len(), 1, "44101 移除通知必须入库");
+        assert_eq!(h_tag_of(&notifs[0]).as_deref(), Some(uuid_a.as_str()));
+        assert_eq!(notifs[0].pubkey.to_hex(), state.bridge_pubkey());
+        let replay: Filter = serde_json::from_str(&format!(
+            r##"{{"kinds":[44101],"#p":["{agent_pk}"],"since":0}}"##
+        ))
+        .unwrap();
+        assert_eq!(state.query(&[replay]).await.len(), 1, "44101 必须可回放");
+        let frame = sub.try_recv().expect("44101 必须实时 fan-out");
+        assert!(
+            frame.contains("\"kind\":44101"),
+            "fan-out 帧必须是 44101: {frame}"
+        );
+        // 旧频道种子残行随重种子清掉（delete_where 先清后写）
+        let seeds: Filter = serde_json::from_str(r#"{"kinds":[39000,39002]}"#).unwrap();
+        assert!(
+            state.query(&[seeds]).await.is_empty(),
+            "移除频道的 39000/39002 种子残行必须清掉（否则 discover_channels 还读得到旧频道）"
+        );
+        drop(state);
+        drop(_rx);
+        drop(sub);
+        remove_test_db(&db_path);
+    }
+
+    /// sync 改名：同 uuid 不同角色名 → renamed（只更新表内元数据 + 重种子落新名，
+    /// **不发** 44100/44101——acp 每轮 discover 重拉 39000，改名随种子生效）；
+    /// 旧名残行清掉。
+    #[tokio::test]
+    async fn sync_channels_rename_updates_metadata_without_notification() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-syncren").await;
+        state.seed_channel_events().await;
+        let uuid_a = channel_uuid("bot_a", "oc_a");
+        let delta = state
+            .sync_channels(vec![root_channel("bot_a", "oc_a", "角色A·新名")])
+            .await;
+        assert_eq!(delta.renamed.len(), 1, "同 uuid 改名必须进 renamed");
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+        assert_eq!(
+            state.channel_by_uuid(&uuid_a).unwrap().name,
+            "角色A·新名",
+            "表内元数据必须更新为新名"
+        );
+        // 不发任何成员通知
+        let fm: Filter = serde_json::from_str(r#"{"kinds":[44100,44101]}"#).unwrap();
+        assert!(
+            state.query(&[fm]).await.is_empty(),
+            "改名不得发 44100/44101（acp 每轮重拉 39000 元数据）"
+        );
+        // 重种子落新名、旧名残行清掉（先清后写：恰一条 39000，name=新名）
+        let f39000: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        let metas = state.query(&[f39000]).await;
+        assert_eq!(metas.len(), 1, "改名后 39000 必须恰一条（旧名残行已清）");
+        assert!(metas[0].tags.iter().any(|t| {
+            t.as_slice().first().is_some_and(|k| k.as_str() == "name")
+                && t.as_slice()
+                    .get(1)
+                    .is_some_and(|v| v.as_str() == "角色A·新名")
+        }));
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// sync 幂等：同集合再同步 → 空 delta；不重复种子、不发成员通知、表不变。
+    #[tokio::test]
+    async fn sync_channels_same_set_is_noop() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-syncidem").await;
+        state.seed_channel_events().await;
+        let delta = state
+            .sync_channels(vec![root_channel("bot_a", "oc_a", "角色A")])
+            .await;
+        assert!(delta.is_empty(), "同集合必须空 delta: {delta:?}");
+        // 无种子新增（夹具未种子过，上面 seed 过一次：39000/39002 各一条）
+        let f39000: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        assert_eq!(state.query(&[f39000]).await.len(), 1, "空 delta 不得重种子");
+        let fm: Filter = serde_json::from_str(r#"{"kinds":[44100,44101]}"#).unwrap();
+        assert!(
+            state.query(&[fm]).await.is_empty(),
+            "空 delta 不得发成员通知"
+        );
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// agent 身份非法（agent_pk=None）：跳过成员通知但**表更新与种子照做**（I1
+    /// 口径：如实降级而非整体失败）——频道进表、39000 落库、无 44100。
+    #[tokio::test]
+    async fn sync_channels_without_agent_identity_skips_notification_but_applies() {
+        let db_path = test_db("abb-buzzrelay-syncnopk");
+        let store = EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = RelayState::new(store, Keys::generate(), String::new());
+        let ch = root_channel("bot_a", "oc_a", "角色A");
+        let delta = state.sync_channels(vec![ch.clone()]).await;
+        assert_eq!(delta.added.len(), 1);
+        assert!(
+            state.channel_by_uuid(&ch.uuid).is_some(),
+            "agent 身份非法时频道也必须进表"
+        );
+        let f39000: Filter = serde_json::from_str(r#"{"kinds":[39000]}"#).unwrap();
+        assert_eq!(
+            state.query(&[f39000]).await.len(),
+            1,
+            "39000 元数据照种子（无需 agent 身份）"
+        );
+        let fm: Filter = serde_json::from_str(r#"{"kinds":[44100,44101]}"#).unwrap();
+        assert!(
+            state.query(&[fm]).await.is_empty(),
+            "agent 身份非法 → 无法构造 #p → 成员通知跳过（只留日志）"
+        );
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// 话题频道**绝不参与 sync diff**（审查级 invariant）：话题频道由
+    /// ensure_topic_channel 运行期登记、不在 virtual-bots.json 内——sync 不得把
+    /// 它当「已删除」清掉。两种形态：① sync 同集合（话题在表不在新集）→ 空
+    /// delta 话题保留；② 群根被取消登记（新集为空）→ 群根移除、话题仍保留
+    ///（其生命周期归 #214 惰性重登记管）。
+    #[tokio::test]
+    async fn sync_channels_never_purges_topic_channels() {
+        let (db_path, state, _rx) = topic_fixture_state("abb-buzzrelay-synctopic").await;
+        let tuuid = state
+            .ensure_topic_channel("bot_a", "oc_a", "omt_1", "角色A", "m1")
+            .await;
+        // ① 同集合 sync：话题频道在表不在新集 → 不算 removed，空 delta
+        let delta = state
+            .sync_channels(vec![root_channel("bot_a", "oc_a", "角色A")])
+            .await;
+        assert!(delta.is_empty(), "话题频道不得进入 diff: {delta:?}");
+        assert!(state.channel_by_uuid(&tuuid).is_some(), "话题频道必须保留");
+        // ② 群根取消登记（新集空）：群根 removed，话题仍保留
+        let delta = state.sync_channels(vec![]).await;
+        assert_eq!(delta.removed.len(), 1, "群根必须移除");
+        assert!(state
+            .channel_by_uuid(&channel_uuid("bot_a", "oc_a"))
+            .is_none());
+        assert!(
+            state.channel_by_uuid(&tuuid).is_some(),
+            "群根移除也不得连带清掉话题频道（不归登记表管）"
+        );
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db_path);
+    }
 }
 
 // ══════════ 事件存储（turso）与 relay 服务 ══════════
@@ -1287,8 +1546,9 @@ pub struct Channel {
     pub name: String,
     /// 频道描述（= 角色提示词）
     pub about: String,
-    /// 归属 bot（话题频道是运行期动态登记的——service 回流路由的启动快照
-    /// uuid→bot_key 表覆盖不到它们，按本字段回落解析归属 Bridge）。
+    /// 归属 bot（话题频道是运行期动态登记的——service 回流路由表按
+    /// (mtime,len) 巡检增量更新但只覆盖群根频道，话题频道按本字段回落解析
+    /// 归属 Bridge）。
     pub bot_key: String,
     /// #206：话题 id（飞书 omt_ 开头）；空 = 群根频道。话题频道由
     /// [`RelayState::ensure_topic_channel`] 在首条话题消息时登记。
@@ -1338,14 +1598,39 @@ pub(crate) fn is_control_command_text(text: &str) -> bool {
     CONTROL_COMMAND_LITERALS.contains(&t)
 }
 
-/// #206 话题隔离：频道成员通知 kind（上游 buzz-relay 同值；44101=移除留给后续
-/// channel-refresh 项）。**relay-signed only 纪律**：本仓库只经
-/// [`RelayState::publish_membership_notification`] 内部发布（桥签名 + 入库 +
-/// fan-out，绕开 ingest/admit）；admit 白名单对 44100/44101 保持关闭——任何外部
-/// 身份（含桥身份）经 WS/HTTP 提交一律拒收，与上游 ingest.rs:2187 对齐。
+/// #206 话题隔离：频道成员通知 kind（上游 buzz-relay 同值；44101=移除，频道集
+/// 运行期刷新用，见 [`RelayState::sync_channels`]）。**relay-signed only 纪律**：
+/// 本仓库只经 [`RelayState::publish_membership_notification`] 内部发布（桥签名 +
+/// 入库 + fan-out，绕开 ingest/admit）；admit 白名单对 44100/44101 保持关闭——
+/// 任何外部身份（含桥身份）经 WS/HTTP 提交一律拒收，与上游 ingest.rs:2187 对齐。
 /// 内部发布已满足全部需求（acp 实时靠 fan-out、重连靠 REQ since 回放——故必须
 /// 入库），开口 admit 只会把「任意本地进程注入频道成员」的攻击面放到协议层。
 pub(crate) const KIND_MEMBERSHIP_ADD: u16 = 44100;
+
+/// #206 频道集运行期刷新：频道成员移除通知 kind（上游 buzz-relay 同值）。
+/// 纪律同 [`KIND_MEMBERSHIP_ADD`]（relay-signed only）。
+pub(crate) const KIND_MEMBERSHIP_REMOVE: u16 = 44101;
+
+/// #206 频道集运行期刷新：[`RelayState::sync_channels`] 的 diff 结果。
+/// 只覆盖**群根频道**（thread_id 为空）——话题频道不在 virtual-bots.json 登记表内，
+/// 其生命周期归 [`RelayState::ensure_topic_channel`] 惰性重登记管，绝不参与 diff。
+#[derive(Debug, Default)]
+pub struct ChannelDelta {
+    /// 新登记的群根频道（进表 + 种子 + 44100 加入通知）
+    pub added: Vec<Channel>,
+    /// 取消登记/群解散的群根频道（出表 + 44101 移除通知）
+    pub removed: Vec<Channel>,
+    /// 同 uuid 改名的群根频道（只更新表内元数据 + 重种子，**不发成员通知**——
+    /// acp 每轮 discover 重拉 39000 元数据，改名随种子生效）
+    pub renamed: Vec<Channel>,
+}
+
+impl ChannelDelta {
+    /// 是否有任何变更（空 delta = 本拍 no-op，不碰表不种子不通知）。
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.renamed.is_empty()
+    }
+}
 
 /// #206：可发布到频道的 owner 控制命令——**白名单是结构性的**（枚举闭集，不接受
 /// 任意 content 字符串）。上游同机制的 `!shutdown`（终态杀 acp，I5 不复活）与
@@ -1588,11 +1873,108 @@ impl RelayState {
     }
 
     /// 登记表驱动：同步频道集合（新增/更新元数据；不删除——下线频道由登记侧清理）。
+    /// 启动全量登记与 ensure_topic_channel 的运行期话题登记用；登记**变更**（增/删/
+    /// 改名）走 [`RelayState::sync_channels`]（含成员通知，本函数不发）。
     pub fn set_channels(&self, channels: impl IntoIterator<Item = Channel>) {
         let mut map = self.channels.write().unwrap();
         for ch in channels {
             map.insert(ch.uuid.clone(), ch);
         }
+    }
+
+    /// #206 频道集运行期刷新：以新的**群根频道集**（virtual-bots.json 登记表驱动）
+    /// 与当前频道表按 uuid diff，返回 [`ChannelDelta`] 并生效——登记变更免重启接入
+    /// buzz（service 的 mini-relay-channels 巡检驱动，无需重启服务）。
+    ///
+    /// diff 语义：
+    /// - added（新登记）：进表；
+    /// - removed（取消登记/群解散）：出表；
+    /// - renamed（同 uuid 改名/about 变化）：只更新表内元数据，**不发成员通知**
+    ///   （acp 每轮 discover 重拉 39000 元数据，改名随重种子生效）；
+    /// - 话题频道（thread_id 非空）：不在登记表内，**绝不参与 diff**——不会被误判
+    ///   「已删除」清掉；其生命周期归 [`RelayState::ensure_topic_channel`] 惰性
+    ///   重登记管。
+    ///
+    /// delta 非空时的副作用次序：更新表 → 重跑种子（幂等——`seed_channel_events`
+    /// 先清后写桥签名的 39000/39002，库状态恒等于当前表：removed 频道的种子残行
+    /// 清掉、renamed 的新名落库）→ added 各发 44100、removed 各发 44101（复用
+    /// [`RelayState::publish_membership_notification`] 内部发布：桥签名 + 入库 +
+    /// fan-out，绕开 admit；admit 对 44100/44101 保持关闭 = relay-signed only）。
+    /// agent 身份非法（agent_pk=None）：通知跳过只留日志，表更新与种子照做（同
+    /// publish_user_message 的 I1 口径：如实降级而非整体失败）。
+    pub async fn sync_channels(&self, new_set: Vec<Channel>) -> ChannelDelta {
+        // diff（读锁内纯计算，短持）。话题频道两侧都滤掉：新集本不该含（防御），
+        // 旧集里的话题频道不归登记表管（防误删——审查级 invariant，测试钉死）。
+        let delta = {
+            let map = self.channels.read().unwrap();
+            let new_roots: HashMap<&str, &Channel> = new_set
+                .iter()
+                .filter(|c| c.thread_id.is_empty())
+                .map(|c| (c.uuid.as_str(), c))
+                .collect();
+            let mut added = Vec::new();
+            let mut renamed = Vec::new();
+            for ch in new_roots.values() {
+                match map.get(ch.uuid.as_str()) {
+                    None => added.push((*ch).clone()),
+                    Some(old) if old.name != ch.name || old.about != ch.about => {
+                        renamed.push((*ch).clone())
+                    }
+                    Some(_) => {}
+                }
+            }
+            let removed = map
+                .values()
+                .filter(|c| c.thread_id.is_empty() && !new_roots.contains_key(c.uuid.as_str()))
+                .cloned()
+                .collect();
+            ChannelDelta {
+                added,
+                removed,
+                renamed,
+            }
+        };
+        if delta.is_empty() {
+            return delta;
+        }
+        // 更新表（写锁短持，绝不跨 await——下方种子/通知都是 async）
+        {
+            let mut map = self.channels.write().unwrap();
+            for ch in delta.added.iter().chain(delta.renamed.iter()) {
+                map.insert(ch.uuid.clone(), ch.clone());
+            }
+            for ch in &delta.removed {
+                map.remove(&ch.uuid);
+            }
+        }
+        // 重跑种子（幂等）：removed 频道的 39000/39002 残行随之清掉，renamed 的
+        // 新名落库，added 的种子补齐（与 ensure_topic_channel 同一单入口 seed_one_channel）。
+        self.seed_channel_events().await;
+        // 成员通知：added → 44100、removed → 44101。失败只留日志不阻塞后续频道
+        //（表与种子已生效；acp 侧下次 REQ since 回放/重启种子仍可收敛）。
+        for ch in &delta.added {
+            if !self
+                .publish_membership_notification(&ch.uuid, KIND_MEMBERSHIP_ADD)
+                .await
+            {
+                crate::log!(
+                    "[mini-relay] ⚠️ 新频道 44100 加入通知未送达（agent 身份非法？）uuid={}",
+                    crate::agent::truncate(&ch.uuid, 16)
+                );
+            }
+        }
+        for ch in &delta.removed {
+            if !self
+                .publish_membership_notification(&ch.uuid, KIND_MEMBERSHIP_REMOVE)
+                .await
+            {
+                crate::log!(
+                    "[mini-relay] ⚠️ 频道 44101 移除通知未送达（agent 身份非法？）uuid={}",
+                    crate::agent::truncate(&ch.uuid, 16)
+                );
+            }
+        }
+        delta
     }
 
     /// 按 uuid 取频道（回流路由用）。
@@ -1654,10 +2036,10 @@ impl RelayState {
             topic_channel_uuid(bot_key, chat_id, thread_id)
         };
         if self.channel_by_uuid(&uuid).is_none() {
-            // 非虚拟 Bot 群（或登记晚于 relay 启动的频道集快照；话题频道 = 调用方
-            // 未先 ensure_topic_channel），不经 relay；留日志防静默丢消息。
+            // 非虚拟 Bot 群（或刚取消登记被巡检移除；话题频道 = 调用方未先
+            // ensure_topic_channel），不经 relay；留日志防静默丢消息。
             crate::log!(
-                "[mini-relay] ⚠️ chat 无对应频道（未登记/登记晚于启动/话题未 ensure），消息不入 relay chat={} thread={}",
+                "[mini-relay] ⚠️ chat 无对应频道（未登记/已取消登记/话题未 ensure），消息不入 relay chat={} thread={}",
                 crate::agent::truncate(chat_id, 16),
                 crate::agent::truncate(thread_id, 16)
             );
@@ -1754,9 +2136,10 @@ impl RelayState {
 
     /// kind-9 事件 → AgentReply（共享抽取：实时回流 ingest 与对账
     /// find_agent_replies_to 同一条装配线，字段口径绝不漂移）。
-    /// None = #h 缺失或不在频道集（登记晚于启动快照；话题频道在 ABB 重启后、
-    /// 下一条话题消息重登记前的窗口内同样不在——该窗口内到达的话题回复按此
-    /// 丢弃并留日志，崩溃窗口条目由启动对账的重登记兜住，见 bridge::buzzreply）。
+    /// None = #h 缺失或不在频道集（未登记/刚取消登记/话题重启窗口：话题频道在
+    /// ABB 重启后、下一条话题消息重登记前的窗口内同样不在——该窗口内到达的话题
+    /// 回复按此丢弃并留日志，崩溃窗口条目由启动对账的重登记兜住，见
+    /// bridge::buzzreply）。
     /// 话题频道 → 带出 thread_id/anchor_mid（bridge 据此走 send_thread_reply）。
     fn agent_reply_from_event(&self, e: &Event) -> Option<AgentReply> {
         let uuid = h_tag_of(e)?;
@@ -1825,7 +2208,7 @@ impl RelayState {
         };
         if self.channel_by_uuid(&uuid).is_none() {
             crate::log!(
-                "[mini-relay] ⚠️ 控制命令 {:?} 无对应频道（未登记/登记晚于启动/话题未 ensure），不发布 chat={} thread={}",
+                "[mini-relay] ⚠️ 控制命令 {:?} 无对应频道（未登记/已取消登记/话题未 ensure），不发布 chat={} thread={}",
                 cmd,
                 crate::agent::truncate(chat_id, 16),
                 crate::agent::truncate(thread_id, 16)
@@ -2040,12 +2423,13 @@ impl RelayState {
         uuid
     }
 
-    /// 内部发布频道成员通知（44100=加入；44101=移除预留，后续 channel-refresh
-    /// 项用）：**桥身份签名 → 入库 → fan-out，绕开 ingest/admit**——admit 白名单
-    /// 对 44100/44101 保持关闭（任何外部身份含桥身份经 WS/HTTP 提交一律拒收），
-    /// 与上游 buzz-relay「relay-signed only」纪律对齐（上游 ingest.rs:2187 拒
-    /// 外部提交）。内部发布已满足全部需求：acp 实时靠 fan-out，重连靠 REQ
-    /// （kinds=[44100], #p=agent, since）回放——**故必须入库**（Store 语义）。
+    /// 内部发布频道成员通知（44100=加入、44101=移除；话题登记 ensure_topic_channel
+    /// 与频道集刷新 sync_channels 共用本入口）：**桥身份签名 → 入库 → fan-out，绕开
+    /// ingest/admit**——admit 白名单对 44100/44101 保持关闭（任何外部身份含桥身份
+    /// 经 WS/HTTP 提交一律拒收），与上游 buzz-relay「relay-signed only」纪律对齐
+    /// （上游 ingest.rs:2187 拒外部提交）。内部发布已满足全部需求：acp 实时靠
+    /// fan-out，重连靠 REQ（kinds=[44100/44101], #p=agent, since）回放——**故必须
+    /// 入库**（Store 语义）。
     /// Duplicate（同秒同参数重发撞内容哈希）算送达：事件已在库里等被回放。
     /// false = 未送达（agent 身份非法无法构造 #p / 签名失败 / 入库失败）。
     pub(crate) async fn publish_membership_notification(&self, uuid: &str, kind: u16) -> bool {
@@ -2183,10 +2567,11 @@ impl RelayState {
                 Some(reply) => {
                     let _ = self.reply_tx.send(reply);
                 }
-                // 频道集是启动快照：agent 回了但 #h 不在集内 = 唯一的静默黑洞，
-                // 与 dispatch 侧的日志对称（审查 #205r2）。
+                // 频道不在表内：agent 回了但 #h 不在集内 = 唯一的静默黑洞——
+                // 与 dispatch 侧的日志对称（审查 #205r2；频道集运行期刷新后，
+                // 刚取消登记的频道回复也走这里）。
                 None => crate::log!(
-                    "[mini-relay] ⚠️ agent 回复的 #h 无对应频道（登记晚于启动？）或无 #h tag，丢弃 id={}",
+                    "[mini-relay] ⚠️ agent 回复的 #h 无对应频道（未登记/已取消登记/话题重启窗口），丢弃 id={}",
                     e.id.to_hex()
                 ),
             }

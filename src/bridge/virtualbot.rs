@@ -10,7 +10,8 @@ use super::*;
 enum BuzzPrecheckFail {
     /// mini-relay 未运行（未启用/初始化失败）
     RelayUnavailable,
-    /// chat 无对应频道（未登记/登记晚于 relay 启动的频道集快照）
+    /// chat 无对应频道（未登记/刚登记待巡检接入——#206 频道集运行期刷新，
+    /// 新登记 ≤ 巡检周期内自动接入，无需重启）
     ChannelUnregistered,
     /// 无连接 REQ 订阅本频道（buzz-acp 未连/未就绪/半开黑洞）
     SubscriberAbsent,
@@ -448,9 +449,10 @@ impl Bridge {
         // buzz→CLI 切换时被当上下文注入）。四条资格（①②③ 由 buzz_dispatch_precheck
         // 承载，④ 是 dispatch 独有）：
         // ① mini-relay 可用（未启用/初始化失败 → 无法服务）；
-        // ② 本会话是已登记的虚拟 Bot 群（频道集是启动快照，p2p/未登记群不支持；
-        //    #206 话题隔离：话题消息只要求**群根频道**已登记——话题频道缺失不再
-        //    拒绝，全闸通过后由 buzz_ensure_topic_channel 登记）；
+        // ② 本会话是已登记的虚拟 Bot 群（频道集运行期刷新：新登记在巡检周期
+        //    （2s）内自动接入，p2p/未登记群不支持；#206 话题隔离：话题消息只
+        //    要求**群根频道**已登记——话题频道缺失不再拒绝，全闸通过后由
+        //    buzz_ensure_topic_channel 登记）；
         // ③ 有连接 REQ 订阅了本群根频道（buzz-acp 已就绪——无消费者时入库只是「寄望
         //    对端水位补发」，用户侧是无限等待，#205r4；话题频道订阅随 44100 在途属
         //    正常，故话题消息以群根订阅作 acp 存活代理）；
@@ -468,7 +470,7 @@ impl Bridge {
                     Some("mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）")
                 }
                 Err(BuzzPrecheckFail::ChannelUnregistered) => {
-                    Some("本会话不是已登记的虚拟 Bot 群（新登记的群需重启后参与 buzz）")
+                    Some("本会话不是已登记的虚拟 Bot 群；若刚刚登记，频道正在接入，请稍后重试")
                 }
                 // 判据是「有连接 REQ 订阅了本频道」而非裸连接数：握手未完、
                 // 半开连接、别的 WS 客户端都不算消费者（#205r4）。
@@ -1193,7 +1195,7 @@ impl Bridge {
                         "mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）"
                     }
                     BuzzPrecheckFail::ChannelUnregistered => {
-                        "本会话不是已登记的虚拟 Bot 群（新登记的群需重启后参与 buzz）"
+                        "本会话不是已登记的虚拟 Bot 群；若刚刚登记，频道正在接入，请稍后重试"
                     }
                     BuzzPrecheckFail::SubscriberAbsent => "buzz-acp 未订阅本频道（未连接/未就绪）",
                 };
