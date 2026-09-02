@@ -83,6 +83,12 @@ pub fn acp_env(
         // 桥身份签名 → owner 必须设为**桥身份公钥**，author==owner 直接短路通过。
         // 曾误写 BUZZ_AGENT_OWNER（无此正字）且传空——静默全链路失效的根因。
         ("BUZZ_ACP_AGENT_OWNER".into(), agent_owner.into()),
+        // #206：显式钉住「轮次中再来消息」策略 = steer（cancel+merge 重跑，agent
+        // 续跑并织入新消息）。上游默认本就是 steer（buzz-acp config.rs:361-365
+        // default_value @ c3132c3），但自然停止词透传的实际效果依赖它（透传的
+        // 「停」触发 cancel+merge 重跑一轮而非 CLI 式透传）——上游哪天改默认值
+        // 会静默改变这一可感知行为，显式设置防漂移。
+        ("BUZZ_ACP_MULTIPLE_EVENT_HANDLING".into(), "steer".into()),
     ]
 }
 
@@ -201,6 +207,8 @@ mod tests {
         assert_eq!(env["BUZZ_ACP_AGENT_COMMAND"], "/opt/bin/buzz-agent");
         assert_eq!(env["BUZZ_ACP_AGENT_OWNER"], "br1dg3pubkey");
         assert_eq!(env["BUZZ_AGENT_PROVIDER"], "anthropic");
+        // #206：轮次中再来消息的策略显式钉为 steer（上游默认同款，防默认值漂移）
+        assert_eq!(env["BUZZ_ACP_MULTIPLE_EVENT_HANDLING"], "steer");
         // 错名绝迹：历史上写错的 BUZZ_AGENT_OWNER 不得回流
         assert!(!env.contains_key("BUZZ_AGENT_OWNER"));
     }
