@@ -147,8 +147,9 @@ enum Admit {
     Reject(String),
 }
 
-/// 从事件 tags 提取 `#h` 首值（频道 uuid）。
-fn h_tag_of(e: &nostr::Event) -> Option<String> {
+/// 从事件 tags 提取 `#h` 首值（频道 uuid）。pub(crate)：bridge 测试断言复用
+///（单一实现，防测试侧复刻漂移）。
+pub(crate) fn h_tag_of(e: &nostr::Event) -> Option<String> {
     e.tags.iter().find_map(|tags| {
         tags.as_slice()
             .first()
@@ -349,6 +350,176 @@ mod tests {
         assert_eq!(evs.len(), 3, "mid tag 应保证同文不同 mid 的两条各自入库");
         drop(state);
         drop(_reply_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// #206：publish_control_command 事件形态四要素（对照上游 is_owner_control_command
+    /// 判据，buzz-acp lib.rs:3552-3562 @ c3132c3）：kind==9、content 精确 "!cancel"
+    /// （不得带任何前后缀）、#h==channel_uuid(bot,chat)、#p==agent 公钥、桥身份签名；
+    /// 连发两条不撞事件 id（abb-mid nonce 生效——同秒同 content 撞内容哈希会被
+    /// INSERT OR IGNORE 吞）；无频道 → false 且不入库。
+    #[tokio::test]
+    async fn publish_control_command_event_shape() {
+        let db_path = test_db("abb-buzzrelay-ctrl");
+        let store = EventStore::open(&db_path).await.unwrap();
+        let agent = Keys::generate();
+        let bridge = Keys::generate();
+        let (state, _rx) = RelayState::new(store, bridge.clone(), agent.public_key().to_hex());
+        let uuid_a = channel_uuid("bot_a", "oc_a");
+        state.set_channels([Channel {
+            uuid: uuid_a.clone(),
+            chat_id: "oc_a".into(),
+            name: "角色A".into(),
+            about: String::new(),
+        }]);
+        let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        // 未登记 chat → false 且不入库
+        assert!(
+            !state
+                .publish_control_command("bot_a", "oc_unknown", ControlCommand::Cancel)
+                .await
+        );
+        assert!(state.db.query(std::slice::from_ref(&all)).await.is_empty());
+
+        // 已登记频道 → true，事件四要素
+        assert!(
+            state
+                .publish_control_command("bot_a", "oc_a", ControlCommand::Cancel)
+                .await
+        );
+        let evs = state.db.query(std::slice::from_ref(&all)).await;
+        assert_eq!(evs.len(), 1);
+        let e = &evs[0];
+        assert_eq!(e.kind.as_u16(), 9);
+        // 协议钉扎：上游 content.trim()=="!cancel" 精确比对（lib.rs:2791/3558）——
+        // content 多一个字符（上下文前缀/后缀）都会被 acp 当普通消息喂给 agent。
+        assert_eq!(e.content, "!cancel");
+        assert_eq!(h_tag_of(e).as_deref(), Some(uuid_a.as_str()));
+        let agent_hex = agent.public_key().to_hex();
+        let p_hit = e.tags.iter().any(|t| {
+            t.as_slice().first().is_some_and(|k| k.as_str() == "p")
+                && t.as_slice().get(1).is_some_and(|v| v.as_str() == agent_hex)
+        });
+        assert!(
+            p_hit,
+            "#p 必须 mention agent 公钥（event_mentions_agent lib.rs:3545）"
+        );
+        assert_eq!(
+            e.pubkey,
+            bridge.public_key(),
+            "桥身份签名（owner 门 author==桥公钥，lib.rs:2796）"
+        );
+
+        // 连发第二条（同秒同 content）：abb-mid nonce 保事件 id 唯一，不被吞
+        assert!(
+            state
+                .publish_control_command("bot_a", "oc_a", ControlCommand::Cancel)
+                .await
+        );
+        let evs = state.db.query(&[all]).await;
+        assert_eq!(
+            evs.len(),
+            2,
+            "两条 !cancel 必须各自入库（同 content 撞 id 会被 INSERT OR IGNORE 吞）"
+        );
+        assert_ne!(evs[0].id, evs[1].id);
+        // 同事件重发 = Duplicate 算送达：与 publish_user_message 共用 store3 三态口径
+        //（Duplicate 臂无法经本 API 触发——nonce 每次新生成；该臂由 store3 单测语义
+        // 与 ingest 重放测试覆盖）。
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// #206：agent 身份非法（空 pubkey）→ 拒发且不入库（同 publish_user_message 的
+    /// I1 口径：命令无法定址时如实失败，不发注定无人订阅的事件）。
+    #[tokio::test]
+    async fn publish_control_command_fails_without_agent_identity() {
+        let db_path = test_db("abb-buzzrelay-ctrl-nopk");
+        let store = EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = RelayState::new(store, Keys::generate(), String::new());
+        state.set_channels([Channel {
+            uuid: channel_uuid("bot_a", "oc_a"),
+            chat_id: "oc_a".into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        assert!(
+            !state
+                .publish_control_command("bot_a", "oc_a", ControlCommand::Cancel)
+                .await
+        );
+        let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        assert!(
+            state.db.query(std::slice::from_ref(&all)).await.is_empty(),
+            "无 agent 身份不得发出控制事件"
+        );
+        drop(state);
+        drop(_rx);
+        remove_test_db(&db_path);
+    }
+
+    /// P1-1 安全闸（审查 #212）：publish_user_message 以桥身份（=acp owner 门）
+    /// 签名——原文 trim 后精确命中 owner 控制命令字面量必须**拒发且不入库**
+    ///（否则群成员发纯文本 "!shutdown" 会被 acp 当 owner 命令执行，终态杀 acp
+    /// 不复活，buzz-acp lib.rs:2756-2779）。非精确命中的相似文本不受影响
+    ///（上游判据是 content.trim()==literal 精确比对，大小写敏感）。
+    #[tokio::test]
+    async fn publish_user_message_rejects_control_command_literals() {
+        let db_path = test_db("abb-buzzrelay-gate");
+        let store = EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = RelayState::new(
+            store,
+            Keys::generate(),
+            Keys::generate().public_key().to_hex(),
+        );
+        state.set_channels([Channel {
+            uuid: channel_uuid("bot_a", "oc_a"),
+            chat_id: "oc_a".into(),
+            name: "角色A".into(),
+            about: String::new(),
+        }]);
+        let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        // 三个字面量 + 带首尾空白（上游 trim 后比对）全部拒发
+        //（#206 回复侧记账把返回值改为 Option<String>：拒发 = None）
+        for (i, lit) in ["!cancel", "!shutdown", "!rotate", "  !shutdown  "]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                state
+                    .publish_user_message("bot_a", "oc_a", &format!("bad{i}"), lit)
+                    .await
+                    .is_none(),
+                "{lit:?} 必须被拒发"
+            );
+        }
+        assert!(
+            state.db.query(std::slice::from_ref(&all)).await.is_empty(),
+            "被拒的控制字面量不得入库（入库即会被 REQ 回放喂给 acp）"
+        );
+
+        // 非精确命中的相似文本不受影响（正常透传）
+        assert!(state
+            .publish_user_message("bot_a", "oc_a", "ok1", "!shutdown 现在")
+            .await
+            .is_some());
+        assert!(state
+            .publish_user_message("bot_a", "oc_a", "ok2", "请执行 !rotate 流程")
+            .await
+            .is_some());
+        assert!(
+            state
+                .publish_user_message("bot_a", "oc_a", "ok3", "!CANCEL")
+                .await
+                .is_some(),
+            "上游比对大小写敏感，!CANCEL 不是控制命令"
+        );
+        assert_eq!(state.db.query(&[all]).await.len(), 3);
+        drop(state);
+        drop(_rx);
         remove_test_db(&db_path);
     }
 
@@ -718,7 +889,7 @@ mod tests {
         state.ingest(&no_tag).await;
         state.ingest(&unreg).await;
 
-        let found = state.find_agent_replies_to(&uid).await;
+        let found = state.find_agent_replies_to(&uid, 0).await;
         let mut ids: Vec<String> = found.iter().map(|r| r.event_id.clone()).collect();
         ids.sort();
         let mut want = vec![r1.id.to_hex(), r2.id.to_hex()];
@@ -727,8 +898,19 @@ mod tests {
         assert_eq!(found[0].chat_id, "oc_1");
         assert_eq!(found[0].in_reply_to.as_deref(), Some(uid.as_str()));
         assert!(
-            state.find_agent_replies_to("never-seen").await.is_empty(),
+            state
+                .find_agent_replies_to("never-seen", 0)
+                .await
+                .is_empty(),
             "无关联事件 → 空"
+        );
+        // since 下推生效（审查 P2）：未来起点 → 全空（本测试事件都是「现在」创建）
+        assert!(
+            state
+                .find_agent_replies_to(&uid, crate::chrono_lite::unix_secs() + 3600)
+                .await
+                .is_empty(),
+            "since 晚于回复 created_at 必须过滤掉全部"
         );
         drop(state);
         drop(_rx);
@@ -771,6 +953,47 @@ pub struct AgentReply {
     pub in_reply_to: Option<String>,
     /// 事件 created_at（unix 秒；对账排序/诊断用）。
     pub created_at: u64,
+}
+
+/// #206：上游 buzz-acp 的**全部** owner 控制命令字面量（lib.rs:2756-2848
+/// @ c3132c3：!shutdown / !cancel / !rotate）。聊天面只开放 `!cancel`
+///（见 [`ControlCommand`]），但入口闸必须挡**全集**：ABB 发布的用户消息由
+/// 桥身份（= acp owner 门，BUZZ_ACP_AGENT_OWNER=桥公钥）签名——原文 trim 后
+/// 命中任一即被 acp 当 owner 命令执行（!shutdown 终态杀 acp 不复活、!rotate
+/// 静默作废频道会话），见 [`RelayState::publish_user_message`] 的入口闸。
+pub(crate) const CONTROL_COMMAND_LITERALS: [&str; 3] = ["!cancel", "!shutdown", "!rotate"];
+
+/// 文本 trim 后是否精确命中 owner 控制命令字面量（与上游判据同形：
+/// `event.content.trim() == command`，大小写敏感，lib.rs:3558）。
+pub(crate) fn is_control_command_text(text: &str) -> bool {
+    let t = text.trim();
+    CONTROL_COMMAND_LITERALS.contains(&t)
+}
+
+/// #206：可发布到频道的 owner 控制命令——**白名单是结构性的**（枚举闭集，不接受
+/// 任意 content 字符串）。上游同机制的 `!shutdown`（终态杀 acp，I5 不复活）与
+/// `!rotate`（会话轮换）绝不加入本枚举暴露给聊天面（审查风险：所有 IM 用户的
+/// /cancel 都以桥身份=owner 发出，命令面必须锁死最小集）；同时
+/// [`publish_user_message`](RelayState::publish_user_message) 入口闸拒发任何
+/// 原文命中 [`CONTROL_COMMAND_LITERALS`] 的用户消息（旁路封堵，审查 #212 P1-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCommand {
+    /// 叫停本频道当前在跑的轮次（buzz-acp 在 queue.push 前拦截：kind 9 +
+    /// content.trim()=="!cancel" + #p mentions agent + author==owner，
+    /// lib.rs:2788-2812 / is_owner_control_command lib.rs:3552-3562 @ c3132c3）。
+    Cancel,
+}
+
+impl ControlCommand {
+    /// 线上协议字面量：上游 `event.content.trim() == command` 精确比对
+    ///（lib.rs:3558）——不得带任何前后缀/上下文，否则静默失效（外部进程协议，
+    /// ABB 测试钉不住对端行为，只能钉住自己发出的字面量）。与
+    /// [`CONTROL_COMMAND_LITERALS`] 单源，防两处漂移。
+    pub fn literal(self) -> &'static str {
+        match self {
+            ControlCommand::Cancel => CONTROL_COMMAND_LITERALS[0],
+        }
+    }
 }
 
 /// `EventStore::store3` 的三态结果（见其文档：Duplicate ≠ 失败）。
@@ -1025,6 +1248,23 @@ impl RelayState {
         mid: &str,
         content: &str,
     ) -> Option<String> {
+        // P1-1 安全闸（审查 #212，#206 回复侧记账 rebase 移植：签名 bool→Option，
+        // 拒发由 return false 改为 return None）：本函数以**桥身份**（= acp 的
+        // owner 门，BUZZ_ACP_AGENT_OWNER=桥公钥）签名用户消息——原文 trim 后精确
+        // 命中 owner 控制命令字面量（!cancel/!shutdown/!rotate，buzz-acp
+        // lib.rs:2756-2848 @ c3132c3）会被 acp 当 owner 命令执行：!shutdown 终态
+        // 杀 acp 不复活（I5）、!rotate 静默作废频道会话、!cancel 旁路 /cancel
+        // 专用路径。此前只靠 prompt 组装的副作用（角色块/历史注入改变最终
+        // content）侥幸挡住，不是设计边界。本闸是权威边界（任何调用方都绕不过）；
+        // bridge dispatch 在更上层拦同一判据以给用户看得懂的文案。
+        if is_control_command_text(content) {
+            crate::log!(
+                "[mini-relay] ⚠️ 用户消息命中 owner 控制命令字面量，拒发（防桥身份提权） chat={} mid={}",
+                crate::agent::truncate(chat_id, 16),
+                crate::agent::truncate(mid, 16)
+            );
+            return None;
+        }
         let uuid = channel_uuid(bot_key, chat_id);
         if self.channel_by_uuid(&uuid).is_none() {
             // 非虚拟 Bot 群（或登记晚于 relay 启动的频道集快照），不经 relay；
@@ -1094,11 +1334,19 @@ impl RelayState {
 
     /// #206 对账查询：按用户事件 id 反查该轮 **agent 身份**的 kind-9 回复事件
     /// （e-tag 命中）。e-tag 无索引、不加表结构迁移（风险⑥）：kind 走
-    /// idx_events_kind_h 索引，作者/e-tag 用 payload 内存过滤。返回的 AgentReply
+    /// idx_events_kind_h 索引，作者/e-tag 用 payload 内存过滤。`since_secs` 下推
+    /// SQL（回复不可能早于其用户消息诞生——审查 P2：无下推时启动对账 = awaiting
+    /// 条数 × 全量 kind-9 扫描，事件表随 relay 寿命无界增长）。返回的 AgentReply
     /// 与实时回流同构（含 event_id —— 去重键）；#h 不在频道集的事件跳过（与
     /// ingest 的回流门同口径）。
-    pub async fn find_agent_replies_to(&self, user_event_id: &str) -> Vec<AgentReply> {
-        let f = Filter::new().kind(Kind::Custom(9));
+    pub async fn find_agent_replies_to(
+        &self,
+        user_event_id: &str,
+        since_secs: u64,
+    ) -> Vec<AgentReply> {
+        let f = Filter::new()
+            .kind(Kind::Custom(9))
+            .since(nostr::Timestamp::from(since_secs));
         self.db
             .query(&[f])
             .await
@@ -1123,6 +1371,91 @@ impl RelayState {
             in_reply_to: first_e_tag(e),
             created_at: e.created_at.as_secs(),
         })
+    }
+
+    /// #206 胶水：bridge /cancel 调用——把 owner 控制命令签成 kind-9 事件注入指定
+    /// 频道。buzz-acp 主循环在 queue.push 前拦截（**消费即丢弃，不进 prompt 队列**，
+    /// lib.rs:2794-2812），对在跑轮次 signal_in_flight_task → ControlSignal::Cancel →
+    /// session/cancel notification（acp.rs:849）→ 5s 排水（pool.rs:1047
+    /// CONTROL_CANCEL_GRACE）→ 丢弃触发批次 + 作废频道 session（pool.rs:2654-2678；
+    /// requeue_cancelled_batch 对 Cancel return None，pool.rs:4184）。无在跑轮次时
+    /// acp 仅打一条 warn no-op，**不给频道任何反馈**——送达≠叫停成功，回执话术由
+    /// 桥侧负责诚实表述（只说「已发送」）。
+    ///
+    /// 事件形态四要素（对照上游判据，缺一不可）：
+    /// - kind 9 + content 精确 "!cancel"（is_owner_control_command lib.rs:3552-3562）；
+    /// - #p = agent 公钥（event_mentions_agent lib.rs:3545——订阅 filter 也含 #p，
+    ///   缺了永远匹配不上 mentions 订阅）；
+    /// - #h = 频道 uuid：relay 侧 REQ filter 恒带 #h（relay.rs:3266-3267）且本
+    ///   relay 的 fan_out/回放都按它匹配——缺了事件根本到不了 acp。注意 acp 定位
+    ///   频道在跑任务走的是 **sub_id→channel 映射**（channel_id_from_sub_id
+    ///   relay.rs:2228/3573）；extract_h_tag_uuid（relay.rs:2168）是 membership
+    ///   通知路径，不是本事件的定址机制（审查 #212 更正归属）。
+    /// - 桥身份签名（owner 门：author==BUZZ_ACP_AGENT_OWNER=桥公钥，lib.rs:2796）。
+    ///
+    /// abb-mid 必须保留：!cancel 无业务 mid 可用，用随机 nonce——Nostr 事件 id 是
+    /// 内容哈希，同秒两条 "!cancel" 会撞 id，第二条被 INSERT OR IGNORE 静默吞。
+    /// 返回 false = 未送达（无频道/agent 身份非法/签名失败/入库失败）；Duplicate
+    /// 算送达（幂等语义同 publish_user_message）。
+    ///
+    /// 背充重放**不是无害 no-op**（审查 #212 更正），两种真实形态：
+    /// ① 半开连接吞帧——fan-out 进 mpsc 成功但 acp 未收到/未 record_event；acp
+    ///   重连回放窗口为 min(last_seen, dropped_since) - SINCE_SKEW_SECS(5s)
+    ///   （relay.rs:59/3277），若本频道后续流量把 last_seen 推过
+    ///   cancel.created_at+5s，回放永久跳过这条 !cancel——叫停丢失，但用户已收
+    ///   「已发送」回执（桥无从确知，回执措辞已按此设计）。
+    /// ② 快速重连——未见的 !cancel 在窗口内被回放，若此时已有**新轮次**在跑，
+    ///   会被误停（批次丢弃 + 频道会话作废），不是 no-op。
+    pub async fn publish_control_command(
+        &self,
+        bot_key: &str,
+        chat_id: &str,
+        cmd: ControlCommand,
+    ) -> bool {
+        let uuid = channel_uuid(bot_key, chat_id);
+        if self.channel_by_uuid(&uuid).is_none() {
+            crate::log!(
+                "[mini-relay] ⚠️ 控制命令 {:?} 无对应频道（未登记/登记晚于启动），不发布 chat={}",
+                cmd,
+                crate::agent::truncate(chat_id, 16)
+            );
+            return false;
+        }
+        // 同 publish_user_message 的 I1 口径：没有合法 agent 身份 = 命令无法定址，
+        // 如实失败而非发出一条没人收的控制事件。
+        let Some(agent_pk) = self.agent_pk else {
+            crate::log!(
+                "[mini-relay] ⚠️ agent 身份未配置（pubkey 为空/非法），控制命令无法定址，拒发"
+            );
+            return false;
+        };
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let ev = EventBuilder::new(Kind::Custom(9), cmd.literal())
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [uuid.as_str()],
+            ))
+            .tag(Tag::public_key(agent_pk))
+            .tag(Tag::custom(TagKind::custom("abb-mid"), [nonce.as_str()]))
+            .sign_with_keys(&self.bridge_keys)
+            .ok();
+        let Some(e) = ev else {
+            crate::log!("[mini-relay] ⚠️ 控制命令事件签名失败（桥身份密钥异常），丢弃");
+            return false;
+        };
+        match self.db.store3(&e).await {
+            Store3::Stored | Store3::Duplicate => {}
+            Store3::Failed(err) => {
+                crate::log!(
+                    "[mini-relay] ⚠️ 控制命令 {:?} 入库失败 chat={}: {err}",
+                    cmd,
+                    crate::agent::truncate(chat_id, 16)
+                );
+                return false;
+            }
+        }
+        self.fan_out(&e);
+        true
     }
 
     /// 当前连上来的 WS 连接数（≈buzz-acp 消费者数）。dispatch 用它区分

@@ -2629,6 +2629,290 @@ mod tests {
         crate::buzzrelay::remove_test_db(&db_path);
     }
 
+    // ---- #206：buzz 轮次叫停（/cancel → owner 控制命令 "!cancel"）----
+
+    // 事件 #h 提取直接用 buzzrelay::h_tag_of（pub(crate)，单一实现防漂移）
+
+    /// buzz bot /cancel → 发布恰好一条 owner 控制命令事件（content 精确 "!cancel"，
+    /// #h 命中本 chat 频道）+ 诚实回执（只说「已发送」，附无轮次 no-op 说明）；
+    /// pending 不残留、不消耗会话闸（不 mark_started）。
+    #[tokio::test]
+    async fn buzz_cancel_publishes_control_command() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_cancel";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-cancel");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        let uuid = crate::buzzrelay::channel_uuid(&bot.key(), chat);
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: uuid.clone(),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        // 预检判据为真：必须有连接 REQ 订阅了本频道（与 dispatch 同判据）
+        let _sub = state.test_attach_subscriber();
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        bridge.handle(test_ev("m1", chat, "/cancel")).await;
+
+        let evs = state.query(std::slice::from_ref(&all)).await;
+        assert_eq!(evs.len(), 1, "/cancel 应发布恰好一条控制事件");
+        // 协议钉扎（buzz-acp is_owner_control_command lib.rs:3552-3562 @ c3132c3）：
+        // content.trim()=="!cancel" 精确比对——钉死精确相等，防日后被加上下文前缀
+        //（加了 acp 就把它当普通消息喂给 agent，叫停静默失效）。
+        assert_eq!(evs[0].content, "!cancel");
+        assert_eq!(
+            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
+            Some(uuid.as_str())
+        );
+        // 回执诚实：只说「已发送」+ 无轮次 no-op 说明，绝不谎称「已停止」
+        //（acp 对无 in-flight 的 !cancel 仅 warn no-op，桥无轮次记账可确知）
+        let sent = msgr.sent();
+        assert_eq!(sent.len(), 1, "buzz /cancel 应回一条回执");
+        assert!(
+            sent[0].contains("已向 buzz 发送叫停指令"),
+            "回执: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("无轮次在跑时本指令无效果"),
+            "回执: {}",
+            sent[0]
+        );
+        assert!(!sent[0].contains("已停止"), "不得谎称已停止: {}", sent[0]);
+        // 即时控制指令：不落 pending、不消耗会话闸（迁移注入闸保留）
+        assert!(bridge.pending.is_empty());
+        assert!(!bridge.sessions.is_started(chat));
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 审查 #212 P1-1 安全性质钉扎（bridge 层端到端，机制无关）：用户发纯文本
+    /// "!shutdown"——无论哪层兜底（宿主护栏注入使最终 content 带前缀 ≠ 字面量，
+    /// 或 relay 入口闸按精确判据拒发），事件库里都绝不出现桥身份（=acp owner）
+    /// 署名的裸控制命令（上游 lib.rs:2756-2848 的判定只看 content.trim()）。
+    #[tokio::test]
+    async fn buzz_dispatch_never_stores_bare_control_literal() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, _msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_ctl_gate";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-ctl-gate");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let _sub = state.test_attach_subscriber();
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        for (i, lit) in ["!shutdown", "!rotate", "!cancel"].iter().enumerate() {
+            bridge.handle(test_ev(&format!("m{i}"), chat, lit)).await;
+        }
+
+        let evs = state.query(std::slice::from_ref(&all)).await;
+        assert!(
+            evs.iter()
+                .all(|e| !crate::buzzrelay::is_control_command_text(&e.content)),
+            "owner 署名的裸控制命令绝不允许入库: {:?}",
+            evs.iter().map(|e| &e.content).collect::<Vec<_>>()
+        );
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// buzz /cancel 三失败面各自的可见文案（预检判据与 dispatch 共用）：
+    /// ① relay None；② 频道未登记；③ 无订阅者。都不发布控制事件、不落 pending。
+    #[tokio::test]
+    async fn buzz_cancel_preflight_failures_are_visible() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+
+        // ① relay None（未启用/初始化失败）
+        bridge.handle(test_ev("m1", "oc_n", "/cancel")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("mini-relay 未运行")),
+            "relay 不在要可见报错: {:?}",
+            msgr.sent()
+        );
+        assert!(bridge.pending.is_empty());
+
+        // ② relay 在但频道未登记
+        let db_path = crate::buzzrelay::test_db("abb-buzz-cancel-neg");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        bridge.handle(test_ev("m2", "oc_x", "/cancel")).await;
+        assert!(
+            msgr.sent()
+                .iter()
+                .any(|t| t.contains("不是已登记的虚拟 Bot 群")),
+            "未登记频道要可见报错: {:?}",
+            msgr.sent()
+        );
+        assert!(state.query(std::slice::from_ref(&all)).await.is_empty());
+
+        // ③ 频道已登记但无订阅者（buzz-acp 未连/未就绪）
+        let chat = "oc_nosub";
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        bridge.handle(test_ev("m3", chat, "/cancel")).await;
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("未订阅本频道")),
+            "无订阅者要可见报错: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            state.query(std::slice::from_ref(&all)).await.is_empty(),
+            "预检未过不得发布控制事件"
+        );
+        assert!(bridge.pending.is_empty());
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 自然停止词「停」透传不回归：buzz 路径不注册 cancel flag，无在跑任务时
+    /// 停止词按普通消息进频道（事件 content 是原文而非 "!cancel"）。
+    /// 已知边界（#206）：透传的停止词在 acp 侧实际触发 steer 模式 cancel+merge
+    /// 重跑一轮（BUZZ_ACP_MULTIPLE_EVENT_HANDLING=steer 已显式钉住），与 CLI
+    /// 「无任务透传」语义不同——对齐需桥侧轮次记账，本项不含。
+    #[tokio::test]
+    async fn buzz_natural_stop_keyword_passes_through() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_kw";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-kw");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let _sub = state.test_attach_subscriber();
+
+        bridge.handle(test_ev("m1", chat, "停")).await;
+
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.query(std::slice::from_ref(&all)).await;
+        assert_eq!(evs.len(), 1, "停止词应按普通消息透传进频道");
+        assert!(
+            evs[0].content.contains('停'),
+            "透传原文: {}",
+            evs[0].content
+        );
+        assert_ne!(evs[0].content, "!cancel", "自然停止词不得被翻译成控制命令");
+        assert!(msgr.sent().is_empty(), "透传轮无同步回复");
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// 粒度语义钉扎：话题消息（thread_id 非空）的 /cancel 仍发布到**群频道**——
+    /// buzz 叫停是频道级=群级（同群各话题共用 channel，#206 已知边界），与 CLI
+    /// 按 chat:thread key 隔离不同。
+    #[tokio::test]
+    async fn buzz_cancel_from_thread_publishes_to_group_channel() {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let chat = "oc_thr";
+        let db_path = crate::buzzrelay::test_db("abb-buzz-thr");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let (state, _rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            nostr::prelude::Keys::generate().public_key().to_hex(),
+        );
+        let uuid = crate::buzzrelay::channel_uuid(&bot.key(), chat);
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: uuid.clone(),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let _sub = state.test_attach_subscriber();
+
+        let mut ev = test_ev("m1", chat, "/cancel");
+        ev.thread_id = "omt_topic1".into();
+        bridge.handle(ev).await;
+
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.query(std::slice::from_ref(&all)).await;
+        assert_eq!(evs.len(), 1, "话题 /cancel 同样发布控制事件");
+        assert_eq!(evs[0].content, "!cancel");
+        assert_eq!(
+            crate::buzzrelay::h_tag_of(&evs[0]).as_deref(),
+            Some(uuid.as_str()),
+            "话题 /cancel 路由到群频道（频道级叫停）"
+        );
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("叫停指令")),
+            "话题内也要收到回执: {:?}",
+            msgr.sent()
+        );
+        cleanup_bridge(&bridge);
+        drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
     // ---- #25 重启恢复（in-flight 消息持久化 + 自动重放）----
 
     #[tokio::test]

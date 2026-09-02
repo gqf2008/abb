@@ -41,7 +41,7 @@ impl Bridge {
             self.bot.key(),
             awaiting.len()
         );
-        for (user_event_id, _entry) in awaiting {
+        for (user_event_id, entry) in awaiting {
             if stop.is_cancelled() {
                 crate::log!(
                     "[bot:{}] buzz 回复对账被关停打断（剩余条目留账，下次启动续对）",
@@ -49,7 +49,13 @@ impl Bridge {
                 );
                 break;
             }
-            for reply in relay.find_agent_replies_to(&user_event_id).await {
+            // since 下推（审查 P2）：回复不可能早于其用户消息——把扫描界到该轮之后，
+            // 免「awaiting 条数 × 全量 kind-9 扫描」。2s 余量吸收秒级边界偏移
+            //（用户事件 created_at 在签名时刻取秒，登记 ts 可能晚跨一个秒界）。
+            for reply in relay
+                .find_agent_replies_to(&user_event_id, entry.ts.saturating_sub(2))
+                .await
+            {
                 // claim 在 deliver 内部做：已 sent / 实时回流正在发 → Duplicate 跳过，
                 // 绝不双发（风险⑤）。
                 self.deliver_buzz_reply(reply).await;

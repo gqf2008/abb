@@ -48,10 +48,14 @@ pub struct AwaitingEntry {
     /// 会话隔离 key（chat 或 chat:thread）——历史/串行锁必须与 dispatch 同 key，
     /// 否则用户轮与助手轮落进不同历史文件（风险③）。
     pub key: String,
+    /// dispatch 时的 chat（诊断参考；实际发送目标以回复事件经频道门反查的
+    /// chat_id 为准，见 bridge::buzzreply）。
     pub chat_id: String,
     /// dispatch 时历史代际快照（history_lock 内取）。回复到达时代际已变 = /new
     /// 清过历史 → 只发不写（孤儿闸，风险④；与 CLI same_session=false 语义一致）。
     pub epoch: u64,
+    /// dispatch 时的会话 id（诊断/对账参考——投递路径只读 key/epoch：
+    /// 发送目标以回复事件的 chat_id 为准，代际以 epoch 比对）。
     pub session_id: String,
     /// 登记时间（unix 秒；剪枝排序用）。
     pub ts: u64,
