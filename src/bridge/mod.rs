@@ -79,6 +79,11 @@ pub struct Bridge {
     /// per-key（原为全局单锁）：任一 chat 的磁盘写不再阻塞其它 chat 的 /new 与写盘
     /// （审查：全局锁跨文件 I/O 是全 bot 的串行点）。锁内只有快速文件 I/O，
     /// agent 运行期间不持锁（/new 不被运行中任务阻塞的语义保留）。
+    /// #206 跟进：代际值随 `<key>.epoch` sidecar 持久化（get-or-create 时读回，
+    /// /new 时落盘）——账本持久而代际原本只在内存，重启归零会跨重启破坏代际闸
+    /// （合法回复误判孤儿只发不写；/new 后崩溃的孤儿回复反被放行）。
+    /// 注意外层 map 锁内 miss 时有一次 sidecar 读取（每 key 每进程一次的文件
+    /// IO，毫秒级）——map 锁是叶子锁（闭包内不取任何桥内锁），无重入。
     history_epochs: Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>,
     /// #51 免 @ 开关的测试快照：config.json 里有该 bot 时全走 config 热读/热写；
     /// 读不到该 bot（单测随机 key）→ 回落此内存快照（仿 access_and_role 的
@@ -300,12 +305,19 @@ impl Bridge {
     /// #49：取该 key 的历史代际锁（get-or-create）。同一 key 的注入读、用户轮写盘、
     /// 助手轮写盘、/new 清盘全部持此锁串行；不同 key 互不阻塞（审查后收敛：原全局锁
     /// 会让任一 chat 的磁盘写阻塞所有 chat 的 /new 与代际快照）。
+    /// #206 跟进：首次为某 key 建锁时从 sidecar 读回代际（每 key 每进程一次的
+    /// History::open 开销）——重启后代际闸对既有账本登记仍然成立。
     pub(crate) fn history_lock(&self, key: &str) -> Arc<std::sync::Mutex<u64>> {
+        let bot_key = self.bot.key();
         self.history_epochs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(std::sync::Mutex::new(0)))
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(
+                    crate::history::History::open(&bot_key, key).read_epoch(),
+                ))
+            })
             .clone()
     }
 
@@ -316,11 +328,20 @@ impl Bridge {
     fn history_reset(&self, key: &str) -> bool {
         let lock = self.history_lock(key);
         let mut epoch = lock.lock().unwrap_or_else(|e| e.into_inner());
-        *epoch += 1;
+        // 饱和自增：read_epoch 对坏/读不出的 sidecar 回 u64::MAX（误杀向降级），
+        // 普通自增 debug 下 panic、release 下回绕 0（= 误放向），饱和钉住 MAX。
+        *epoch = epoch.saturating_add(1);
+        // #206 跟进：新代际先落盘（sidecar）再清盘，同一锁持内——进程内语义不变
+        // （写方要么在 clear 前写完被清掉、要么被新代际拦下），重启后由 sidecar
+        // 延续代际闸。崩溃窗口语义与进程内 bump→clear 一致：窗口内重启 = 旧回复
+        // 被拦只发不写（保守正确），反向「先清盘后落盘」则会把孤儿回复放进新会话。
+        // 写失败仅告警（闸退化为重启归零）不阻断：中止重置会漏清旧历史，危害更大。
+        let hist = crate::history::History::open(&self.bot.key(), key);
+        hist.write_epoch(*epoch);
         // bump + clear 在同一锁持内：写方要么在 clear 前写完（被清掉）、要么在 clear 后
         // 看到新代际被拦，不会残留（审查 I-2；清盘不放锁外，否则 post-/new 写盘会落进
         // 尚未清掉的旧文件再被清掉——该轮历史静默丢失）。
-        crate::history::History::open(&self.bot.key(), key).clear()
+        hist.clear()
     }
 
     /// 发一条回复：话题消息走 reply 接口（落在原话题），非话题走普通发送。
@@ -2263,7 +2284,24 @@ mod tests {
         tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
         tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
-        let bot = backend_bot("buzz");
+        build_buzz_reply_fixture_with_bot(backend_bot("buzz"), chat).await
+    }
+
+    /// 同上夹具但 bot 由调用方给定：名字固定 → 两次构建同 key = 同工作区/账本/
+    /// 历史目录（「崩溃重启」测试用——Bridge 内存态全丢，只剩盘上状态）。
+    #[allow(clippy::type_complexity)]
+    async fn build_buzz_reply_fixture_with_bot(
+        bot: BotConfig,
+        chat: &str,
+    ) -> (
+        Arc<Bridge>,
+        Arc<MockMessenger>,
+        Arc<crate::buzzrelay::RelayState>,
+        nostr::prelude::Keys,
+        std::path::PathBuf,
+        tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
         let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
         let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
         let db_path = crate::buzzrelay::test_db("abb-buzz-ledger");
@@ -2573,6 +2611,118 @@ mod tests {
         cleanup_bridge(&bridge);
         drop(state);
         drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    // ---- #206 跟进：代际闸跨重启持久化（`<key>.epoch` sidecar）----
+    //
+    // 代际计数器原本只在内存（history_epochs），重启归零而账本持久——两个失效模式：
+    // (a) 误杀：重启前用过 /new 的会话（epoch>0）在启动对账里代际失配，合法回复
+    //     只发不写；(b) 误放：/new 后崩溃重启，两侧代际恰好都归 0，孤儿回复被写进
+    //     新会话历史。sidecar 让代际跨重启延续——以下两测试各钉一个模式，修复前
+    //     必红（阳性对照）。relay 复用同一 state（db 持久性由崩溃窗口测试④覆盖），
+    //     「重启」指 Bridge 进程态：内存代际/账本态全丢，只剩盘上状态。
+
+    /// (a) 误杀修复：/new（epoch 0→1）→ dispatch 登记 awaiting epoch=1 → 回复入库
+    /// 未消费（崩溃）→ 重启对账必须补发**并补写历史**——代际从 sidecar 读回 1，
+    /// 与登记一致。修复前重启归零 → 失配 → 只发不写（历史断言红）。
+    #[tokio::test]
+    async fn buzz_reply_epoch_survives_restart_writes_history() {
+        let chat = "oc_rl_ep1";
+        let bot = backend_bot("buzz");
+        let (bridge, _msgr, state, agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture_with_bot(bot.clone(), chat).await;
+        let uuid = crate::buzzrelay::channel_uuid(&bot.key(), chat);
+
+        bridge.handle(test_ev("m1", chat, "/new")).await;
+        bridge.handle(test_ev("m2", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+
+        // 崩溃窗口：回复已入库，桥未消费
+        let ev = signed_reply_event(&agent_keys, &uuid, &uev, "重启前回复");
+        state.ingest(&ev).await;
+
+        // 重启：同 bot key 重建 Bridge（不 cleanup——工作区/账本/sidecar 必须留盘）
+        drop(bridge);
+        drop(_rx);
+        drop(_sub);
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge2, msgr2) = build_test_bridge_with_bot(runner, bot.clone());
+        Arc::get_mut(&mut bridge2)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge2.recover_buzz_replies(&stop).await;
+
+        assert_eq!(
+            msgr2
+                .sent()
+                .iter()
+                .filter(|t| t.contains("重启前回复"))
+                .count(),
+            1,
+            "启动对账必须补发（账本持久，与代际无关）"
+        );
+        let entries = crate::history::History::open(&bot.key(), chat).entries();
+        assert!(
+            entries.iter().any(|e| !e.user && e.mid == ev.id.to_hex()),
+            "代际跨重启延续：epoch=1 的合法回复必须补写历史（失配=sidecar 回归）"
+        );
+        assert!(
+            bridge2.reply_ledger.is_sent(&ev.id.to_hex()),
+            "补发成功必须记 sent（下次对账不得重复）"
+        );
+        cleanup_bridge(&bridge2);
+        drop(state);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// (b) 误放修复：dispatch（epoch=0）→ /new（epoch 0→1，sidecar 落盘）→ 回复
+    /// 入库未消费 → 重启。修复前两侧代际恰好都归 0 → 孤儿回复被写进新会话历史
+    /// （历史断言红）；修复后 sidecar=1 ≠ 登记 0 → 只发不写（进程内风险④语义
+    /// 跨重启成立）。
+    #[tokio::test]
+    async fn buzz_orphan_reply_after_new_stays_blocked_across_restart() {
+        let chat = "oc_rl_ep2";
+        let bot = backend_bot("buzz");
+        let (bridge, _msgr, state, agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture_with_bot(bot.clone(), chat).await;
+        let uuid = crate::buzzrelay::channel_uuid(&bot.key(), chat);
+
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+        bridge.handle(test_ev("m2", chat, "/new")).await; // epoch 0→1 + 清历史
+
+        // 崩溃窗口：旧会话的回复已入库，桥未消费
+        let ev = signed_reply_event(&agent_keys, &uuid, &uev, "旧会话的回复");
+        state.ingest(&ev).await;
+
+        drop(bridge);
+        drop(_rx);
+        drop(_sub);
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge2, msgr2) = build_test_bridge_with_bot(runner, bot.clone());
+        Arc::get_mut(&mut bridge2)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge2.recover_buzz_replies(&stop).await;
+
+        assert!(
+            msgr2.sent().iter().any(|t| t.contains("旧会话的回复")),
+            "代际失配只丢历史不丢发送（用户在场看得到回复）"
+        );
+        let entries = crate::history::History::open(&bot.key(), chat).entries();
+        assert!(
+            entries.iter().all(|e| e.mid != ev.id.to_hex()),
+            "孤儿闸跨重启：/new 后崩溃重启的孤儿回复不得写进新会话历史"
+        );
+        assert!(
+            bridge2.reply_ledger.is_sent(&ev.id.to_hex()),
+            "发送仍记 sent（对账不得因「没写历史」重发）"
+        );
+        cleanup_bridge(&bridge2);
+        drop(state);
         crate::buzzrelay::remove_test_db(&db_path);
     }
 
