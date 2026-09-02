@@ -159,6 +159,20 @@ pub(crate) fn h_tag_of(e: &nostr::Event) -> Option<String> {
     })
 }
 
+/// #206：从事件 tags 提取首个 `e` tag 的值（NIP-10 回复指向的被回复事件 id）。
+/// buzz-acp 回复用户消息时经 `buzz messages send --reply-to <event_id>` 产出该 tag
+/// （上游 queue.rs / builders.rs 的 thread_tags，pin SHA c3132c3 已核实）。agent 不带
+/// --reply-to 时无 e-tag —— 软关联失败，回流侧按 chat 兜底（风险①，不阻塞主链路）。
+fn first_e_tag(e: &nostr::Event) -> Option<String> {
+    e.tags.iter().find_map(|tags| {
+        tags.as_slice()
+            .first()
+            .is_some_and(|t| t.as_str() == "e")
+            .then(|| tags.as_slice().get(1).map(|v| v.as_str().to_string()))
+            .flatten()
+    })
+}
+
 /// #200 测试夹具：临时 sqlite 库路径（uuid 唯一，防并行测试互删——见仓库 LESSON）。
 /// pub(crate)：bridge 侧 dispatch 测试复用，避免第二份拷贝。
 #[cfg(test)]
@@ -265,8 +279,9 @@ mod tests {
     }
 
     /// publish_user_message（#200 dispatch）：uuid 按 (bot_key, chat_id) 派生定位频道；
-    /// 未登记 → false 且不入库；已登记 → true、kind 9、单 #h tag、内容原样；
+    /// 未登记 → None 且不入库；已登记 → Some(事件 id)、kind 9、单 #h tag、内容原样；
     /// 同秒同文不同 mid → 两条独立入库（事件 id 含 mid tag，不撞 hash 被吞）。
+    /// #206：返回的事件 id 必须与入库事件 id 一致（账本 awaiting 按它关联回复 e-tag）。
     #[tokio::test]
     async fn publish_user_message_maps_channel_with_single_h_tag() {
         let db_path = test_db("abb-buzzrelay-pub");
@@ -284,29 +299,31 @@ mod tests {
             about: String::new(),
         }]);
 
-        // 未登记 chat（含「另一 bot 的同名 chat」——uuid 含 bot_key，不串线）：false 不入库
-        assert!(
-            !state
-                .publish_user_message("bot_x", "oc_a", "m0", "hi")
-                .await
-        );
-        assert!(
-            !state
-                .publish_user_message("bot_a", "oc_unknown", "m0", "hi")
-                .await
-        );
+        // 未登记 chat（含「另一 bot 的同名 chat」——uuid 含 bot_key，不串线）：None 不入库
+        assert!(state
+            .publish_user_message("bot_x", "oc_a", "m0", "hi")
+            .await
+            .is_none());
+        assert!(state
+            .publish_user_message("bot_a", "oc_unknown", "m0", "hi")
+            .await
+            .is_none());
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         assert!(state.db.query(std::slice::from_ref(&all)).await.is_empty());
 
-        // 已登记频道：true、kind 9、单 #h tag、内容原样
-        assert!(
-            state
-                .publish_user_message("bot_a", "oc_a", "m1", "你好，buzz")
-                .await
-        );
+        // 已登记频道：Some(事件 id)、kind 9、单 #h tag、内容原样
+        let id1 = state
+            .publish_user_message("bot_a", "oc_a", "m1", "你好，buzz")
+            .await
+            .expect("已登记频道应返回事件 id");
         let evs = state.db.query(&[all]).await;
         assert_eq!(evs.len(), 1);
         let e = &evs[0];
+        assert_eq!(
+            e.id.to_hex(),
+            id1,
+            "返回的事件 id 必须与入库事件 id 一致（回复账本按它关联）"
+        );
         assert_eq!(e.kind.as_u16(), 9);
         assert_eq!(e.content, "你好，buzz");
         let h_count = e
@@ -319,12 +336,15 @@ mod tests {
 
         // 同秒同文（「好」「好」）：mid 不同 → 事件 id 不同 → 两条都在库（回归：
         // 无 mid tag 时第二条撞 id 被 INSERT OR IGNORE 静默吞）。
-        state
+        let id2 = state
             .publish_user_message("bot_a", "oc_a", "m2", "好")
-            .await;
-        state
+            .await
+            .expect("m2 应返回事件 id");
+        let id3 = state
             .publish_user_message("bot_a", "oc_a", "m3", "好")
-            .await;
+            .await
+            .expect("m3 应返回事件 id");
+        assert_ne!(id2, id3, "同秒同文不同 mid 不得撞事件 id");
         let nine: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
         let evs = state.db.query(&[nine]).await;
         assert_eq!(evs.len(), 3, "mid tag 应保证同文不同 mid 的两条各自入库");
@@ -463,14 +483,16 @@ mod tests {
         let all: Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
 
         // 三个字面量 + 带首尾空白（上游 trim 后比对）全部拒发
+        //（#206 回复侧记账把返回值改为 Option<String>：拒发 = None）
         for (i, lit) in ["!cancel", "!shutdown", "!rotate", "  !shutdown  "]
             .iter()
             .enumerate()
         {
             assert!(
-                !state
+                state
                     .publish_user_message("bot_a", "oc_a", &format!("bad{i}"), lit)
-                    .await,
+                    .await
+                    .is_none(),
                 "{lit:?} 必须被拒发"
             );
         }
@@ -480,20 +502,19 @@ mod tests {
         );
 
         // 非精确命中的相似文本不受影响（正常透传）
-        assert!(
-            state
-                .publish_user_message("bot_a", "oc_a", "ok1", "!shutdown 现在")
-                .await
-        );
-        assert!(
-            state
-                .publish_user_message("bot_a", "oc_a", "ok2", "请执行 !rotate 流程")
-                .await
-        );
+        assert!(state
+            .publish_user_message("bot_a", "oc_a", "ok1", "!shutdown 现在")
+            .await
+            .is_some());
+        assert!(state
+            .publish_user_message("bot_a", "oc_a", "ok2", "请执行 !rotate 流程")
+            .await
+            .is_some());
         assert!(
             state
                 .publish_user_message("bot_a", "oc_a", "ok3", "!CANCEL")
-                .await,
+                .await
+                .is_some(),
             "上游比对大小写敏感，!CANCEL 不是控制命令"
         );
         assert_eq!(state.db.query(&[all]).await.len(), 3);
@@ -679,6 +700,8 @@ mod tests {
     /// 路由 = 任意本地进程（或 SSRF 到 127.0.0.1:port 的 POST /events）自签一条
     /// `#h=任意频道 uuid` 的事件即可**以 bot 身份向真实群发任意文本**；WS 断连后
     /// buzz-acp 重发的同一条回复也会被投递两遍。
+    /// #206：投递的 AgentReply 必须带 event_id（账本去重键/历史 mid）、in_reply_to
+    /// （首个 e-tag）、created_at。
     #[tokio::test]
     async fn ingest_only_forwards_first_seen_agent_replies() {
         let db = test_db("abb-buzzrelay-gate");
@@ -712,13 +735,27 @@ mod tests {
             "安全回归：非 agent 身份的 kind-9 不得回流真实聊天"
         );
 
-        // ② agent 签的：投递一次，路由键与 chat 都对
-        let real = kind9(&agent, "真回复", "chan-1");
+        // ② agent 签的（带 e-tag 指向用户事件）：投递一次，路由键与 chat 都对，
+        //    #206 新字段齐全（event_id=事件 id hex，in_reply_to=首个 e-tag）
+        let real = EventBuilder::new(Kind::Custom(9), "真回复")
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                ["chan-1"],
+            ))
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+                ["user-event-id-hex"],
+            ))
+            .sign_with_keys(&agent)
+            .unwrap();
         state.ingest(&real).await;
         let got = rx.try_recv().expect("agent 回复应投递");
         assert_eq!(got.chat_id, "oc_1");
         assert_eq!(got.channel_uuid, "chan-1");
         assert_eq!(got.content, "真回复");
+        assert_eq!(got.event_id, real.id.to_hex());
+        assert_eq!(got.in_reply_to.as_deref(), Some("user-event-id-hex"));
+        assert_eq!(got.created_at, real.created_at.as_secs());
 
         // ③ 同一事件重发（ACK 未收到 → 重连重投）：不得二次投递
         state.ingest(&real).await;
@@ -734,6 +771,149 @@ mod tests {
         assert!(rx.try_recv().is_err(), "#h 不在频道集时不得投递");
         drop(state);
         drop(rx);
+        remove_test_db(&db);
+    }
+
+    /// #206：first_e_tag 提取——无 e-tag → None；单个 → 其值；多个 → 首值
+    ///（NIP-10 首 e-tag 是被回复事件，其余是 thread 祖先，只认首个）。
+    #[test]
+    fn first_e_tag_extracts_first_only() {
+        let keys = Keys::generate();
+        let no_e: nostr::Event = EventBuilder::new(Kind::Custom(9), "plain")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(first_e_tag(&no_e), None);
+
+        let one: nostr::Event = EventBuilder::new(Kind::Custom(9), "reply")
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+                ["ev-1"],
+            ))
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(first_e_tag(&one).as_deref(), Some("ev-1"));
+
+        let multi: nostr::Event = EventBuilder::new(Kind::Custom(9), "reply")
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+                ["ev-root"],
+            ))
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+                ["ev-parent"],
+            ))
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(
+            first_e_tag(&multi).as_deref(),
+            Some("ev-root"),
+            "只取首个 e-tag（NIP-10 被回复事件）"
+        );
+    }
+
+    /// #206 对账查询：按用户事件 id 反查 agent 回复——e-tag 命中才返回；非 agent
+    /// 作者（桥签的用户轮也带同 e-tag 时）排除；#h 不在频道集的排除；无 e-tag /
+    /// e-tag 指别处的不命中。返回的 AgentReply 带 event_id（账本去重键）。
+    #[tokio::test]
+    async fn find_agent_replies_to_matches_e_tag_and_agent_author() {
+        let db = test_db("abb-buzzrelay-find");
+        let store = EventStore::open(&db).await.unwrap();
+        let bridge_keys = Keys::generate();
+        let agent = Keys::generate();
+        let (state, _rx) = RelayState::new(store, bridge_keys.clone(), agent.public_key().to_hex());
+        state.set_channels([Channel {
+            uuid: "chan-1".into(),
+            chat_id: "oc_1".into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        let h = || {
+            Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                ["chan-1"],
+            )
+        };
+        let et = |v: &str| {
+            Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+                [v],
+            )
+        };
+        // 目标用户事件（桥签的 kind-9；其 id 是回复 e-tag 的指向）
+        let user_ev = EventBuilder::new(Kind::Custom(9), "用户问题")
+            .tag(h())
+            .sign_with_keys(&bridge_keys)
+            .unwrap();
+        state.ingest(&user_ev).await;
+        let uid = user_ev.id.to_hex();
+
+        // ① agent 回复带 e-tag → 命中；同 e-tag 第二条（一轮多回复）也命中
+        let r1 = EventBuilder::new(Kind::Custom(9), "回复一")
+            .tag(h())
+            .tag(et(&uid))
+            .sign_with_keys(&agent)
+            .unwrap();
+        let r2 = EventBuilder::new(Kind::Custom(9), "回复二")
+            .tag(h())
+            .tag(et(&uid))
+            .sign_with_keys(&agent)
+            .unwrap();
+        state.ingest(&r1).await;
+        state.ingest(&r2).await;
+        // ② 桥签的「假回复」（同 e-tag 但作者是桥——重放的用户事件/注入块）→ 排除
+        let forged = EventBuilder::new(Kind::Custom(9), "桥签同 e-tag")
+            .tag(h())
+            .tag(et(&uid))
+            .sign_with_keys(&bridge_keys)
+            .unwrap();
+        state.ingest(&forged).await;
+        // ③ agent 签但 e-tag 指别处 / 无 e-tag / #h 未登记 → 不命中
+        let other = EventBuilder::new(Kind::Custom(9), "别的轮次")
+            .tag(h())
+            .tag(et("someone-else"))
+            .sign_with_keys(&agent)
+            .unwrap();
+        let no_tag = EventBuilder::new(Kind::Custom(9), "无 e-tag")
+            .tag(h())
+            .sign_with_keys(&agent)
+            .unwrap();
+        let unreg = EventBuilder::new(Kind::Custom(9), "未登记频道")
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                ["chan-x"],
+            ))
+            .tag(et(&uid))
+            .sign_with_keys(&agent)
+            .unwrap();
+        state.ingest(&other).await;
+        state.ingest(&no_tag).await;
+        state.ingest(&unreg).await;
+
+        let found = state.find_agent_replies_to(&uid, 0).await;
+        let mut ids: Vec<String> = found.iter().map(|r| r.event_id.clone()).collect();
+        ids.sort();
+        let mut want = vec![r1.id.to_hex(), r2.id.to_hex()];
+        want.sort();
+        assert_eq!(ids, want, "只有 agent 签、e-tag 命中、频道已登记的回复返回");
+        assert_eq!(found[0].chat_id, "oc_1");
+        assert_eq!(found[0].in_reply_to.as_deref(), Some(uid.as_str()));
+        assert!(
+            state
+                .find_agent_replies_to("never-seen", 0)
+                .await
+                .is_empty(),
+            "无关联事件 → 空"
+        );
+        // since 下推生效（审查 P2）：未来起点 → 全空（本测试事件都是「现在」创建）
+        assert!(
+            state
+                .find_agent_replies_to(&uid, crate::chrono_lite::unix_secs() + 3600)
+                .await
+                .is_empty(),
+            "since 晚于回复 created_at 必须过滤掉全部"
+        );
+        drop(state);
+        drop(_rx);
         remove_test_db(&db);
     }
 }
@@ -765,6 +945,14 @@ pub struct AgentReply {
     pub channel_uuid: String,
     pub chat_id: String,
     pub content: String,
+    /// #206：回复事件 id（hex）。回复侧记账的去重键（重连重发同 id 不重复投递），
+    /// 也作历史助手轮的 mid——一轮多条回复各自落一条（(mid,user) 去重不吞第二条）。
+    pub event_id: String,
+    /// #206：首个 e-tag 值 = 被回复的用户事件 id（NIP-10；agent 未带 --reply-to 时
+    /// 为 None → 账本按 chat 兜底关联，见 bridge::buzzreply）。
+    pub in_reply_to: Option<String>,
+    /// 事件 created_at（unix 秒；对账排序/诊断用）。
+    pub created_at: u64,
 }
 
 /// #206：上游 buzz-acp 的**全部** owner 控制命令字面量（lib.rs:2756-2848
@@ -1048,31 +1236,34 @@ impl RelayState {
 
     /// #200 胶水：bridge 调用——把用户消息签成 kind-9 事件注入指定频道。
     /// 频道 uuid 由 (bot_key, chat_id) 确定性派生——不扫表按 chat_id 匹配（两 bot
-    /// 同群时会有歧义）。返回 false = 未送达（无频道/签名失败/未入库），调用方负责
-    /// 给用户可见反馈（不做静默黑洞）。mid 进 tag：Nostr 事件 id 是内容哈希，
-    /// 「同秒同文」两条消息不带 mid 会撞 id——第二条被 INSERT OR IGNORE 静默吞。
+    /// 同群时会有歧义）。返回 None = 未送达（无频道/签名失败/未入库），调用方负责
+    /// 给用户可见反馈（不做静默黑洞）。成功（含 Duplicate 幂等重放）返回
+    /// Some(事件 id hex)——#206 回复侧记账以它登记 awaiting，回复事件的 e-tag
+    /// 按它反查。mid 进 tag：Nostr 事件 id 是内容哈希，「同秒同文」两条消息不带
+    /// mid 会撞 id——第二条被 INSERT OR IGNORE 静默吞。
     pub async fn publish_user_message(
         &self,
         bot_key: &str,
         chat_id: &str,
         mid: &str,
         content: &str,
-    ) -> bool {
-        // P1-1 安全闸（审查 #212）：本函数以**桥身份**（= acp 的 owner 门，
-        // BUZZ_ACP_AGENT_OWNER=桥公钥）签名用户消息——原文 trim 后精确命中 owner
-        // 控制命令字面量（!cancel/!shutdown/!rotate，buzz-acp lib.rs:2756-2848
-        // @ c3132c3）会被 acp 当 owner 命令执行：!shutdown 终态杀 acp 不复活（I5）、
-        // !rotate 静默作废频道会话、!cancel 旁路 /cancel 专用路径。此前只靠 prompt
-        // 组装的副作用（角色块/历史注入改变最终 content）侥幸挡住，不是设计边界。
-        // 本闸是权威边界（任何调用方都绕不过）；bridge dispatch 在更上层拦同一
-        // 判据以给用户看得懂的文案。
+    ) -> Option<String> {
+        // P1-1 安全闸（审查 #212，#206 回复侧记账 rebase 移植：签名 bool→Option，
+        // 拒发由 return false 改为 return None）：本函数以**桥身份**（= acp 的
+        // owner 门，BUZZ_ACP_AGENT_OWNER=桥公钥）签名用户消息——原文 trim 后精确
+        // 命中 owner 控制命令字面量（!cancel/!shutdown/!rotate，buzz-acp
+        // lib.rs:2756-2848 @ c3132c3）会被 acp 当 owner 命令执行：!shutdown 终态
+        // 杀 acp 不复活（I5）、!rotate 静默作废频道会话、!cancel 旁路 /cancel
+        // 专用路径。此前只靠 prompt 组装的副作用（角色块/历史注入改变最终
+        // content）侥幸挡住，不是设计边界。本闸是权威边界（任何调用方都绕不过）；
+        // bridge dispatch 在更上层拦同一判据以给用户看得懂的文案。
         if is_control_command_text(content) {
             crate::log!(
                 "[mini-relay] ⚠️ 用户消息命中 owner 控制命令字面量，拒发（防桥身份提权） chat={} mid={}",
                 crate::agent::truncate(chat_id, 16),
                 crate::agent::truncate(mid, 16)
             );
-            return false;
+            return None;
         }
         let uuid = channel_uuid(bot_key, chat_id);
         if self.channel_by_uuid(&uuid).is_none() {
@@ -1082,14 +1273,14 @@ impl RelayState {
                 "[mini-relay] ⚠️ chat 无对应频道（未登记/登记晚于启动），消息不入 relay chat={}",
                 crate::agent::truncate(chat_id, 16)
             );
-            return false;
+            return None;
         }
         // I1 口径：没有合法 agent 身份 = 消息「发不出去给谁」——如实失败，
         // 不发一条注定无人订阅的事件（审查 #205r5：测试夹具的空串暴露的正是
         // 这个分支，生产里 init 必然生成真钥）。
         let Some(agent_pk) = self.agent_pk else {
             crate::log!("[mini-relay] ⚠️ agent 身份未配置（pubkey 为空/非法），消息无法定址，拒发");
-            return false;
+            return None;
         };
         // tag 三件套（缺一不可，审查 #205r5）：
         // - #h：频道（buzz-acp extract_h_tag_uuid / REQ #h）
@@ -1109,11 +1300,13 @@ impl RelayState {
             .ok();
         let Some(e) = ev else {
             crate::log!("[mini-relay] ⚠️ 用户消息事件签名失败（桥身份密钥异常），丢弃");
-            return false;
+            return None;
         };
+        let event_id = e.id.to_hex();
         match self.db.store3(&e).await {
             // Duplicate：同一 mid 的幂等重放（崩溃恢复路径），事件已在库里等被应答
             // ——算送达。把它当失败会让用户收到「写入失败请重发」的假错（#205r4）。
+            // 事件 id 是内容哈希，Duplicate 的 id 与库内一致，照常返回供记账。
             Store3::Stored | Store3::Duplicate => {}
             Store3::Failed(err) => {
                 crate::log!(
@@ -1121,7 +1314,7 @@ impl RelayState {
                     crate::agent::truncate(chat_id, 16),
                     crate::agent::truncate(mid, 16)
                 );
-                return false;
+                return None;
             }
         }
         self.fan_out(&e);
@@ -1136,7 +1329,48 @@ impl RelayState {
                 );
             }
         }
-        true
+        Some(event_id)
+    }
+
+    /// #206 对账查询：按用户事件 id 反查该轮 **agent 身份**的 kind-9 回复事件
+    /// （e-tag 命中）。e-tag 无索引、不加表结构迁移（风险⑥）：kind 走
+    /// idx_events_kind_h 索引，作者/e-tag 用 payload 内存过滤。`since_secs` 下推
+    /// SQL（回复不可能早于其用户消息诞生——审查 P2：无下推时启动对账 = awaiting
+    /// 条数 × 全量 kind-9 扫描，事件表随 relay 寿命无界增长）。返回的 AgentReply
+    /// 与实时回流同构（含 event_id —— 去重键）；#h 不在频道集的事件跳过（与
+    /// ingest 的回流门同口径）。
+    pub async fn find_agent_replies_to(
+        &self,
+        user_event_id: &str,
+        since_secs: u64,
+    ) -> Vec<AgentReply> {
+        let f = Filter::new()
+            .kind(Kind::Custom(9))
+            .since(nostr::Timestamp::from(since_secs));
+        self.db
+            .query(&[f])
+            .await
+            .into_iter()
+            .filter(|e| e.pubkey.to_hex() == self.agent_pubkey)
+            .filter(|e| first_e_tag(e).as_deref() == Some(user_event_id))
+            .filter_map(|e| self.agent_reply_from_event(&e))
+            .collect()
+    }
+
+    /// kind-9 事件 → AgentReply（共享抽取：实时回流 ingest 与对账
+    /// find_agent_replies_to 同一条装配线，字段口径绝不漂移）。
+    /// None = #h 缺失或不在频道集（登记晚于启动快照）。
+    fn agent_reply_from_event(&self, e: &Event) -> Option<AgentReply> {
+        let uuid = h_tag_of(e)?;
+        let ch = self.channel_by_uuid(&uuid)?;
+        Some(AgentReply {
+            channel_uuid: uuid,
+            chat_id: ch.chat_id,
+            content: e.content.clone(),
+            event_id: e.id.to_hex(),
+            in_reply_to: first_e_tag(e),
+            created_at: e.created_at.as_secs(),
+        })
     }
 
     /// #206 胶水：bridge /cancel 调用——把 owner 控制命令签成 kind-9 事件注入指定
@@ -1374,7 +1608,9 @@ impl RelayState {
 
     /// 事件摄取：验签 → **准入（kind 白名单 + 作者权威）** → 入库 → fan-out →
     /// 回流抽取（kind 9 = agent 回复）。
-    async fn ingest(&self, e: &Event) -> String {
+    /// pub(crate)：bridge 的 #206 对账测试需要把 agent 回复事件经真实准入/入库/回流
+    /// 管线喂进来（绕过它直插 db 会漏掉回流通道一侧的覆盖）。
+    pub(crate) async fn ingest(&self, e: &Event) -> String {
         let sig_ok = e.verify_id() && e.verify_signature();
         if !sig_ok {
             return format!(
@@ -1413,19 +1649,13 @@ impl RelayState {
         // ② 必须**首次入库**——WS 断连后 buzz-acp 重发同一事件（ACK 未收到）会走
         //    这里第二次，重复投递同一条回复到群里。
         if stored && e.kind.as_u16() == 9 && e.pubkey.to_hex() == self.agent_pubkey {
-            let h = h_tag_of(e);
-            let chan = h.as_deref().and_then(|u| self.channel_by_uuid(u));
-            match (h, chan) {
-                (Some(uuid), Some(ch)) => {
-                    let _ = self.reply_tx.send(AgentReply {
-                        channel_uuid: uuid,
-                        chat_id: ch.chat_id,
-                        content: e.content.clone(),
-                    });
+            match self.agent_reply_from_event(e) {
+                Some(reply) => {
+                    let _ = self.reply_tx.send(reply);
                 }
                 // 频道集是启动快照：agent 回了但 #h 不在集内 = 唯一的静默黑洞，
                 // 与 dispatch 侧的日志对称（审查 #205r2）。
-                _ => crate::log!(
+                None => crate::log!(
                     "[mini-relay] ⚠️ agent 回复的 #h 无对应频道（登记晚于启动？）或无 #h tag，丢弃 id={}",
                     e.id.to_hex()
                 ),

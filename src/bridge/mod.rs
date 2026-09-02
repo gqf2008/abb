@@ -13,10 +13,35 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 mod access;
+mod buzzreply;
 mod outbox;
 mod recover;
 mod teamflow;
 mod virtualbot;
+
+/// #206：bot_key → Bridge 弱引用注册表（service 的 mini-relay 回复回流任务按它
+/// 把回复路由给归属 bot 的 Bridge）。Weak 不阻止 bot 循环退出后 Bridge 析构；
+/// 注册在 run_bot 构造后即发生（早于事件循环），而 dispatch 依赖 Bridge 存在——
+/// 所以任何回复到达时注册必然已完成，无「回复先于注册」窗口。
+#[derive(Debug, Default, Clone)]
+pub struct BridgeRegistry(Arc<Mutex<HashMap<String, std::sync::Weak<Bridge>>>>);
+
+impl BridgeRegistry {
+    pub fn register(&self, bot_key: &str, bridge: &Arc<Bridge>) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(bot_key.to_string(), Arc::downgrade(bridge));
+    }
+
+    pub fn get(&self, bot_key: &str) -> Option<Arc<Bridge>> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(bot_key)
+            .and_then(|w| w.upgrade())
+    }
+}
 
 pub struct Bridge {
     pub msgr: Arc<dyn Messenger>,
@@ -25,6 +50,10 @@ pub struct Bridge {
     /// None = 未启用（buzz_relay_enabled=false）或初始化失败。service 启动时同步
     /// 注入（bot 循环前 relay 已就绪），无「bot 先于 relay 初始化」竞态。
     pub buzz_relay_state: Option<Arc<crate::buzzrelay::RelayState>>,
+    /// #206 回复侧记账：buzz 回复的 per-bot 持久账本（dispatch 登记 awaiting、
+    /// 回流 claim/mark_sent、启动对账补发）。文件在 workspaces/<bot>/ 下（测试按
+    /// bot key 隔离，与 sessions/pending 同例）。
+    pub reply_ledger: crate::replyledger::ReplyLedger,
     /// #194：虚拟 Bot 群的独立会话存储（per-chat 缓存；键=chat_id）。
     vb_sessions: Mutex<HashMap<String, SessionStore>>,
     pub jobs: JobStore,
@@ -224,6 +253,7 @@ impl Bridge {
             msgr,
             sessions,
             buzz_relay_state: None, // #200：service 启动后由 buzz_relay_enabled 分支注入
+            reply_ledger: crate::replyledger::ReplyLedger::new(&key), // #206 回复侧记账
             vb_sessions: Mutex::new(HashMap::new()),
             jobs: JobStore::new(&bot.key()),
             default_backend: effective,
@@ -2168,6 +2198,432 @@ mod tests {
         assert_eq!(state.query(&[all]).await.len(), 1);
         cleanup_bridge(&bridge);
         drop(bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    // ---- #206 回复侧记账（buzz 回复回流：写历史 + 账本去重 + 启动对账）----
+
+    /// #206 测试夹具：buzz bot + mini-relay（登记 chat 频道 + 假订阅者过 dispatch
+    /// 预检），agent 身份密钥自持（回复事件必须 agent 签名才过 ingest 作者门）。
+    /// 返回的订阅接收端与回复接收端必须由调用方持有到底（drop 后订阅连接在下次
+    /// fan-out 时被清，影响第二次 dispatch 的预检）。调用方负责 cleanup_bridge +
+    /// remove_test_db。
+    #[allow(clippy::type_complexity)]
+    async fn build_buzz_reply_fixture(
+        chat: &str,
+    ) -> (
+        Arc<Bridge>,
+        Arc<MockMessenger>,
+        Arc<crate::buzzrelay::RelayState>,
+        nostr::prelude::Keys,
+        std::path::PathBuf,
+        tokio::sync::mpsc::UnboundedReceiver<crate::buzzrelay::AgentReply>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let bot = backend_bot("buzz");
+        let runner = Arc::new(MockAgentRunner::immediate("不应被调用"));
+        let (mut bridge, msgr) = build_test_bridge_with_bot(runner, bot.clone());
+        let db_path = crate::buzzrelay::test_db("abb-buzz-ledger");
+        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
+        let agent_keys = nostr::prelude::Keys::generate();
+        let (state, reply_rx) = crate::buzzrelay::RelayState::new(
+            store,
+            nostr::prelude::Keys::generate(),
+            agent_keys.public_key().to_hex(),
+        );
+        state.set_channels([crate::buzzrelay::Channel {
+            uuid: crate::buzzrelay::channel_uuid(&bot.key(), chat),
+            chat_id: chat.into(),
+            name: "角色".into(),
+            about: String::new(),
+        }]);
+        Arc::get_mut(&mut bridge)
+            .expect("测试期唯一引用")
+            .buzz_relay_state = Some(state.clone());
+        let sub = state.test_attach_subscriber();
+        (bridge, msgr, state, agent_keys, db_path, reply_rx, sub)
+    }
+
+    /// 取 dispatch 进 relay 的用户事件 id（= 账本 awaiting 的键）。夹具假设：每个
+    /// 测试只 dispatch 一条用户消息（kind-9 在库里唯一）。
+    async fn relay_user_event_id(state: &crate::buzzrelay::RelayState) -> String {
+        let all: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[9]}"#).unwrap();
+        let evs = state.query(&[all]).await;
+        assert_eq!(evs.len(), 1, "夹具假设：测试只 dispatch 一条用户消息");
+        evs[0].id.to_hex()
+    }
+
+    /// 构造回流回复（绕过 ingest 直调 handle_buzz_reply 的测试用；event_id 用
+    /// 可读短串即可——账本键是不透明字符串）。
+    fn agent_reply(
+        uuid: &str,
+        chat: &str,
+        event_id: &str,
+        in_reply_to: Option<&str>,
+        content: &str,
+    ) -> crate::buzzrelay::AgentReply {
+        crate::buzzrelay::AgentReply {
+            channel_uuid: uuid.into(),
+            chat_id: chat.into(),
+            content: content.into(),
+            event_id: event_id.into(),
+            in_reply_to: in_reply_to.map(|s| s.to_string()),
+            created_at: crate::chrono_lite::unix_secs(),
+        }
+    }
+
+    /// agent 签名、带 #h + e-tag 的 kind-9 回复事件（走 ingest 入库的对账测试用）。
+    fn signed_reply_event(
+        agent_keys: &nostr::prelude::Keys,
+        uuid: &str,
+        in_reply_to: &str,
+        content: &str,
+    ) -> nostr::prelude::Event {
+        use nostr::prelude::*;
+        EventBuilder::new(Kind::Custom(9), content)
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [uuid],
+            ))
+            .tag(Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+                [in_reply_to],
+            ))
+            .sign_with_keys(agent_keys)
+            .unwrap()
+    }
+
+    /// ① 主链路：epoch 匹配的回复 → 写历史（mid=回复事件 id）+ 发送 + 记 sent；
+    /// 同一事件再到达（重连重放）→ 账本去重，不重发不重记。
+    #[tokio::test]
+    async fn buzz_reply_lands_in_history_and_sends() {
+        let chat = "oc_rl1";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+        assert!(msgr.sent().is_empty(), "dispatch 本身无同步回复");
+
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-1", Some(&uev), "buzz 的回复"))
+            .await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("buzz 的回复")),
+            "回复必须发到群里"
+        );
+        let entries = crate::history::History::open(&bot_key, chat).entries();
+        let assistants: Vec<_> = entries.iter().filter(|e| !e.user).collect();
+        assert_eq!(assistants.len(), 1, "助手轮必须落历史（修复单边转录）");
+        assert_eq!(assistants[0].mid, "rev-1", "助手轮 mid = 回复事件 id");
+        assert_eq!(assistants[0].backend, "buzz");
+        assert_eq!(assistants[0].text, "buzz 的回复");
+        assert!(bridge.reply_ledger.is_sent("rev-1"), "发送成功必须记 sent");
+
+        // 重连重放（同事件 id）→ 去重：不重发、历史不重复
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-1", Some(&uev), "buzz 的回复"))
+            .await;
+        assert_eq!(
+            msgr.sent()
+                .iter()
+                .filter(|t| t.contains("buzz 的回复"))
+                .count(),
+            1,
+            "账本必须挡住重连重发的重复投递"
+        );
+        assert_eq!(
+            crate::history::History::open(&bot_key, chat)
+                .entries()
+                .iter()
+                .filter(|e| !e.user)
+                .count(),
+            1
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ② /new 竞态（风险④）：dispatch 后、回复到达前用户 /new（代际 bump + 历史
+    /// 清空）→ 回复**只发不写历史**（与 CLI same_session=false 同语义）。若代际闸
+    /// 失效（回复写进 /new 后的新历史文件），断言必红——这是阳性对照所在。
+    #[tokio::test]
+    async fn buzz_reply_after_new_sends_without_history() {
+        let chat = "oc_rl2";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+        bridge.handle(test_ev("m2", chat, "/new")).await; // 代际 bump + 清历史
+
+        bridge
+            .handle_buzz_reply(agent_reply(
+                &uuid,
+                chat,
+                "rev-2",
+                Some(&uev),
+                "旧会话的回复",
+            ))
+            .await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("旧会话的回复")),
+            "代际失配只丢历史不丢发送（用户在场看得到回复）"
+        );
+        let entries = crate::history::History::open(&bot_key, chat).entries();
+        assert!(
+            entries.iter().all(|e| e.mid != "rev-2"),
+            "孤儿闸：/new 后到达的回复不得写进新会话历史"
+        );
+        assert!(
+            bridge.reply_ledger.is_sent("rev-2"),
+            "发送仍记 sent（对账不得因「没写历史」重发）"
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ③ 发送失败 → 账本留未发（unclaim）→ 通道恢复后启动对账补发**恰好一次**
+    /// （再对账/再投递同事件都被 sent 去重挡住）。
+    #[tokio::test]
+    async fn buzz_reply_send_failure_recovered_exactly_once() {
+        let chat = "oc_rl3";
+        let (bridge, msgr, state, agent_keys, db_path, mut rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+
+        // agent 回复入库并经实时回流到达；发送通道故障 → 发送失败留账
+        let ev = signed_reply_event(&agent_keys, &uuid, &uev, "故障期回复");
+        let rev_id = ev.id.to_hex();
+        state.ingest(&ev).await;
+        let reply = rx.try_recv().expect("agent 回复应回流");
+        *msgr.fail_chat.lock().unwrap() = Some(chat.into());
+        bridge.handle_buzz_reply(reply).await;
+        assert!(msgr.sent().is_empty(), "发送故障期无成功投递");
+        assert!(
+            !bridge.reply_ledger.is_sent(&rev_id),
+            "发送失败不得记 sent（否则对账永远不补发）"
+        );
+
+        // 通道恢复 → 启动对账（relay db 里有、账本未 sent）→ 补发恰好一次
+        *msgr.fail_chat.lock().unwrap() = None;
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_buzz_replies(&stop).await;
+        assert_eq!(
+            msgr.sent()
+                .iter()
+                .filter(|t| t.contains("故障期回复"))
+                .count(),
+            1,
+            "启动对账必须补发失败窗口的回复恰好一次"
+        );
+        bridge.recover_buzz_replies(&stop).await;
+        assert_eq!(
+            msgr.sent()
+                .iter()
+                .filter(|t| t.contains("故障期回复"))
+                .count(),
+            1,
+            "重复对账不得重发（sent 去重）"
+        );
+        let n = crate::history::History::open(&bot_key, chat)
+            .entries()
+            .iter()
+            .filter(|e| !e.user && e.text.contains("故障期回复"))
+            .count();
+        assert_eq!(n, 1, "历史同样只落一条（mid=事件 id 幂等）");
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ④ 崩溃窗口对账：回复已入 relay db，但桥从未见过它（回流通道未消费 = 桥在
+    /// 回流前崩溃重启）→ 启动对账按 e-tag 从 db 找回，补发 + 补历史；重复事件 id
+    /// 不重复处理。
+    #[tokio::test]
+    async fn buzz_crash_window_reply_reconciled_from_relay_db() {
+        let chat = "oc_rl4";
+        let (bridge, msgr, state, agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+
+        // 回复入库但桥从未消费（_rx 不读 = 崩溃窗口）
+        let ev = signed_reply_event(&agent_keys, &uuid, &uev, "崩溃窗口回复");
+        state.ingest(&ev).await;
+        assert!(msgr.sent().is_empty());
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        bridge.recover_buzz_replies(&stop).await;
+        assert_eq!(
+            msgr.sent()
+                .iter()
+                .filter(|t| t.contains("崩溃窗口回复"))
+                .count(),
+            1,
+            "崩溃窗口的回复必须由启动对账补发"
+        );
+        let entries = crate::history::History::open(&bot_key, chat).entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| !e.user && e.text.contains("崩溃窗口回复") && e.mid == ev.id.to_hex()),
+            "对账补发必须补历史（mid=回复事件 id）"
+        );
+        // 再对账 + 实时重放到达同事件 → 都不重复
+        bridge.recover_buzz_replies(&stop).await;
+        bridge
+            .handle_buzz_reply(agent_reply(
+                &uuid,
+                chat,
+                &ev.id.to_hex(),
+                Some(&uev),
+                "崩溃窗口回复",
+            ))
+            .await;
+        assert_eq!(
+            msgr.sent()
+                .iter()
+                .filter(|t| t.contains("崩溃窗口回复"))
+                .count(),
+            1
+        );
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ⑤ 一轮多回复（buzz-agent 一轮可发多条消息）：两个不同事件 id 同 e-tag →
+    /// 两条都发、两条助手轮都落历史。钉住「(mid,user) 去重以回复事件 id 为 mid」
+    /// ——若误用用户 mid，第二条会被 history 去重吞掉（断言必红，阳性对照）。
+    #[tokio::test]
+    async fn buzz_multiple_replies_same_turn_all_recorded() {
+        let chat = "oc_rl5";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+        let uev = relay_user_event_id(&state).await;
+
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-a", Some(&uev), "第一条回复"))
+            .await;
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-b", Some(&uev), "第二条回复"))
+            .await;
+
+        assert!(msgr.sent().iter().any(|t| t.contains("第一条回复")));
+        assert!(msgr.sent().iter().any(|t| t.contains("第二条回复")));
+        let entries = crate::history::History::open(&bot_key, chat).entries();
+        let assistants: Vec<_> = entries.iter().filter(|e| !e.user).collect();
+        assert_eq!(
+            assistants.len(),
+            2,
+            "一轮多条回复必须各自落一条助手轮（(mid,user) 去重不得吞第二条）"
+        );
+        assert!(entries.iter().any(|e| e.mid == "rev-a" && !e.user));
+        assert!(entries.iter().any(|e| e.mid == "rev-b" && !e.user));
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ⑥ 话题消息 dispatch（key=chat:thread，风险③）：账本记 dispatch 时的 key →
+    /// 回复写回**同一 key** 的历史文件（用户轮/助手轮不分裂到两个文件）。
+    #[tokio::test]
+    async fn buzz_thread_reply_writes_thread_history() {
+        let chat = "oc_rl6";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        let mut ev = test_ev("m1", chat, "话题里的问题");
+        ev.thread_id = "omt_7".into();
+        bridge.handle(ev).await;
+        let uev = relay_user_event_id(&state).await;
+
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-t", Some(&uev), "话题回复"))
+            .await;
+
+        let tkey = format!("{chat}:omt_7");
+        let t_entries = crate::history::History::open(&bot_key, &tkey).entries();
+        assert!(
+            t_entries.iter().any(|e| !e.user && e.mid == "rev-t"),
+            "话题回复必须写回 chat:thread 同一 key 的历史"
+        );
+        assert!(
+            t_entries.iter().any(|e| e.user && e.mid == "m1"),
+            "用户轮本就在该 key 的历史里（对照）"
+        );
+        assert!(
+            crate::history::History::open(&bot_key, chat)
+                .entries()
+                .iter()
+                .all(|e| e.mid != "rev-t"),
+            "话题回复不得落进顶层 chat 的历史（key 分裂）"
+        );
+        // 发送目标是顶层 chat（buzz 频道按 chat 派生，话题在 dispatch 侧已坍缩——
+        // 与回流现状 send_text 行为一致，不引入话题回复分叉）
+        assert!(msgr
+            .sent_chats
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(c, t)| c == chat && t.contains("话题回复")));
+        cleanup_bridge(&bridge);
+        drop(state);
+        drop(_rx);
+        crate::buzzrelay::remove_test_db(&db_path);
+    }
+
+    /// ⑦ 无 e-tag 兜底（风险①）：agent 未带 --reply-to（in_reply_to=None，或登记
+    /// 已被剪枝）→ 按 chat 兜底：照发 + 写 chat 级历史 + 记 sent，绝不阻塞主链路。
+    #[tokio::test]
+    async fn buzz_reply_without_e_tag_falls_back_to_chat() {
+        let chat = "oc_rl7";
+        let (bridge, msgr, state, _agent_keys, db_path, _rx, _sub) =
+            build_buzz_reply_fixture(chat).await;
+        let bot_key = bridge.bot.key();
+        let uuid = crate::buzzrelay::channel_uuid(&bot_key, chat);
+        bridge.handle(test_ev("m1", chat, "你好")).await;
+
+        bridge
+            .handle_buzz_reply(agent_reply(&uuid, chat, "rev-nf", None, "无关联回复"))
+            .await;
+
+        assert!(
+            msgr.sent().iter().any(|t| t.contains("无关联回复")),
+            "无 e-tag 回复必须照发（软关联失败不阻塞主链路）"
+        );
+        let entries = crate::history::History::open(&bot_key, chat).entries();
+        assert!(
+            entries.iter().any(|e| !e.user && e.mid == "rev-nf"),
+            "兜底路径也要写历史（否则回到单边转录）"
+        );
+        assert!(bridge.reply_ledger.is_sent("rev-nf"));
+        cleanup_bridge(&bridge);
         drop(state);
         drop(_rx);
         crate::buzzrelay::remove_test_db(&db_path);

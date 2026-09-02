@@ -716,11 +716,11 @@ impl Bridge {
                 trunc(&ev.chat_id, 12),
                 prompt.chars().count()
             );
-            // 预检已保证 relay 存在 + 频道已登记 + 非受限会话；这里 false 只剩
+            // 预检已保证 relay 存在 + 频道已登记 + 非受限会话；这里 None 只剩
             // 「签名失败 / 入库失败（磁盘等）」——同样给可见报错，且不消耗会话闸。
             // （owner 控制命令字面量的拦截在 relay 入口闸 publish_user_message，
             // 对**最终组装后**的 content 做精确判据——是唯一权威边界，审查 #212 P1-1）
-            let delivered = self
+            let published = self
                 .buzz_relay_state
                 .as_ref()
                 .expect("buzz 预检通过则 relay 必在")
@@ -729,7 +729,7 @@ impl Bridge {
             // 发布即处理完毕：摘 pending（重启不重放；发布-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
-            if !delivered {
+            let Some(user_event_id) = published else {
                 if let Err(e) = self
                     .send_reply(
                         &ev,
@@ -743,7 +743,23 @@ impl Bridge {
                     );
                 }
                 return;
-            }
+            };
+            // #206 回复侧记账：登记 awaiting（回复事件 e-tag 按它反查会话 key 与
+            // 代际快照）。epoch 取 dispatch 时 history_lock 内的快照（与用户轮写盘
+            // 同一代际）——此后任何 /new 都会 bump 代际，回复到达时按失配「只发不
+            // 写历史」（孤儿闸，与 CLI same_session=false 同语义）。发布-登记间崩溃
+            // = 回复走 chat 兜底关联（账本无登记，仍发仍写，见 buzzreply）。
+            self.reply_ledger.register_dispatch(
+                &user_event_id,
+                crate::replyledger::AwaitingEntry {
+                    mid: ev.mid.clone(),
+                    key: key.clone(),
+                    chat_id: ev.chat_id.clone(),
+                    epoch: hist_epoch,
+                    session_id: session_id.clone(),
+                    ts: crate::chrono_lite::unix_secs(),
+                },
+            );
             // mark_started 是防重复注入的主闸（resume 轮不再注入）；marker 与 CLI
             // 成功路径同形（注入轮的迁移标记）。mark_started_if 的槽位校验天然挡
             // 与 /new 的竞态；marker 错写旧 sid 也会因失配下轮重注入（自愈）。
