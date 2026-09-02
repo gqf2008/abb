@@ -2260,7 +2260,7 @@ mod tests {
         Arc<crate::buzzrelay::RelayState>,
         nostr::prelude::Keys,
         std::path::PathBuf,
-        tokio::sync::mpsc::UnboundedReceiver<crate::buzzrelay::AgentReply>,
+        tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
         tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
         let bot = backend_bot("buzz");
