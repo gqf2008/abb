@@ -20,8 +20,10 @@ logs/
 *.swp
 *~
 
-# 开发脚本不入库（本地自用，避免公开仓库暴露内部工具链）
-scripts/
+# 开发脚本不入库（本地自用，避免公开仓库暴露内部工具链）。
+# 锚定根目录：无锚点 `scripts/` 会匹配任意层级，曾静默吞掉
+# crates/buzz-agent/scripts/ 的 vendor JSON（include_str! 硬依赖，release 爆）。
+/scripts/
 
 # CI 生成的安装包，不入库
 app-assets/Output/

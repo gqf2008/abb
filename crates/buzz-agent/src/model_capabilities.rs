@@ -814,7 +814,9 @@ mod tests {
     /// time — the same file [`CORPUS_JSON`] embeds, so the regen recipe writes
     /// exactly what the drift gate reads.
     fn corpus_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/normative-corpus.json")
+        // fork 改包内 vendor（../scripts/ 相对 manifest 目录会错层到 crates/scripts/）：
+        // include_str! 相对源文件无恙，此处 CARGO_MANIFEST_DIR 相对必须用包内 scripts/
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/normative-corpus.json")
     }
 
     #[test]
