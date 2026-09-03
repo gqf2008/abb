@@ -413,11 +413,11 @@ async fn deliver_loop(
     crate::log!("[deliver] 投递循环退出");
 }
 
-/// #200 Phase 3：装配 buzz harness——解析 agent 可执行文件（配置覆盖优先，缺省
-/// pi-acp；PATH 查找用 deps::composed_path 合成）→ 构造 [`BuzzHandle`]（懒启动：
-/// 首条消息才拉起 agent 进程，崩溃退避重拉在 harness 主循环内闭环）→ 登记
-/// harness 主循环任务。turn 消费 / 根频道巡检两个长驻任务由 run() 在 messenger
-/// 就绪后登记（它们要用注册表与 messengers 过滤集）。
+/// #200 Phase 3：装配 buzz harness——解析 agent 可执行文件（配置覆盖优先 → 主程序
+/// 同目录随包 fork buzz-agent → PATH 缺省 pi-acp；PATH 查找用 deps::composed_path
+/// 合成）→ 构造 [`BuzzHandle`]（懒启动：首条消息才拉起 agent 进程，崩溃退避重拉
+/// 在 harness 主循环内闭环）→ 登记 harness 主循环任务。turn 消费 / 根频道巡检两个
+/// 长驻任务由 run() 在 messenger 就绪后登记（它们要用注册表与 messengers 过滤集）。
 ///
 /// 与旧 mini-relay 架构差异：无子进程预拉（懒启动）、无身份密钥准备（ACP 协议
 /// 不带 nostr 身份世界）、无 relay 绑定。agent 路径解析**不做存在性裁决**——配置
@@ -425,10 +425,19 @@ async fn deliver_loop(
 /// 留痕（用户 `npm i -g pi-acp` 后首条消息即拉起，无需重启）。
 /// 返回 handle：None = 无启用 buzz bot（run() 调用方已按此短路，防御性处理）。
 fn init_buzz_harness(cfg: &Config) -> Option<std::sync::Arc<crate::buzz::harness::BuzzHandle>> {
-    let exe = if cfg.buzz_agent_exe.trim().is_empty() {
-        "pi-acp".to_string()
-    } else {
+    // 解析顺序：配置显式指定（绝对/裸名原样用）→ 主程序同目录的 buzz-agent
+    // （#200 随包 fork，与 lockctl 的 abb-helper 同款同目录规约）→ PATH 的 pi-acp。
+    let exe = if !cfg.buzz_agent_exe.trim().is_empty() {
         cfg.buzz_agent_exe.trim().to_string()
+    } else {
+        let bundled = std::env::current_exe()
+            .ok()
+            .and_then(|me| me.parent().map(|d| d.join("buzz-agent")))
+            .filter(|p| p.is_file());
+        match bundled {
+            Some(p) => p.display().to_string(), // 绝对路径：find 检查跳过、spawn 直接可用
+            None => "pi-acp".to_string(),
+        }
     };
     if !std::path::Path::new(&exe).is_absolute() && crate::deps::find_in_path(&exe).is_none() {
         crate::log!(
@@ -438,6 +447,31 @@ fn init_buzz_harness(cfg: &Config) -> Option<std::sync::Arc<crate::buzz::harness
              buzz_agent_exe 指到绝对路径）"
         );
     }
+    // 供应商 env：harness 共享一份 agent 进程 → env 全局一份——取首个启用 buzz bot
+    // 的生效供应商装配（区别于其它后端的 per-bot 注入：buzz 是 ACP 常驻进程池，
+    // 一个 agent 进程只能带一组凭据）。多 buzz bot 供应商不一致 → 后登记的 bot 会
+    // 沿首个 env 请求（超出共享进程架构，配置时按同一供应商/全局默认统一即可）。
+    let mut extra_env = vec![("PATH".to_string(), crate::deps::composed_path())];
+    if let Some(bot) = cfg.bots.iter().find(|b| {
+        b.enabled
+            && crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend)).is_buzz()
+    }) {
+        if let Some(p) = cfg.resolve_provider(bot) {
+            match crate::agent::buzz_provider_env(Some(p)) {
+                Ok(Some(env)) => {
+                    crate::log!(
+                        "[buzz] 供应商 env 注入：首个 buzz bot「{}」的生效供应商「{}」（kind={}）",
+                        bot.name,
+                        p.name,
+                        p.kind
+                    );
+                    extra_env.extend(env);
+                }
+                Ok(None) => {}
+                Err(e) => crate::log!("[buzz] ⚠️ 供应商注入失败（走纯宿主 env）：{e}"),
+            }
+        }
+    }
     let handle = crate::buzz::harness::BuzzHandle::new(
         crate::buzz::harness::AgentConfig {
             command: exe,
@@ -445,7 +479,7 @@ fn init_buzz_harness(cfg: &Config) -> Option<std::sync::Arc<crate::buzz::harness
             // PATH 无条件覆盖为 ABB 合成值（acp.rs 对 extra_env 是无条件覆盖语义）：
             // launchd/GUI 环境 PATH 极简（/usr/bin:/bin），找不到 npm 全局安装的
             // agent 是历史高发问题——子进程必须看到与终端一致的 PATH。
-            extra_env: vec![("PATH".to_string(), crate::deps::composed_path())],
+            extra_env,
         },
         crate::tasks::shutdown_token(),
         // agent 子进程工作目录 = ABB 启动时的当前目录（与旧 buzz-acp spawn 同源；

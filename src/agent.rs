@@ -287,6 +287,72 @@ fn ccswitch_env_or_err() -> Result<HashMap<String, String>, String> {
     }
 }
 
+/// base_url → 小写 host（去 scheme/port/路径；容忍无 scheme 写法）。空串 → None。
+/// 用于识别「桥内供应商指向哪个官方端点」（pi 内置 provider 的身份判定）。
+fn provider_host(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let host = after_scheme.split(['/', ':']).next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// buzz 后端（共享 ACP agent 进程）的供应商 env 装配。命名空间与 pi 的宿主映射
+/// 无关：buzz-agent 的 OPENAI_COMPAT_BASE_URL / ANTHROPIC_BASE_URL 直接可指任意
+/// 端点，供应商配置的 base_url 原样透传。
+/// 支持 anthropic / openai-chat / openai-responses；其余 kind → Err（用户可见）。
+/// provider 为 None → Ok(None)（纯继承宿主 env，旧行为——e2e 即靠宿主注入）。
+pub(crate) fn buzz_provider_env(
+    provider: Option<&crate::config::ProviderConfig>,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let Some(p) = provider else {
+        return Ok(None);
+    };
+    let mut env = HashMap::new();
+    match p.kind.as_str() {
+        "anthropic" => {
+            env.insert("BUZZ_AGENT_PROVIDER".into(), "anthropic".into());
+            env.insert("ANTHROPIC_API_KEY".into(), p.api_key.clone());
+            if !p.base_url.is_empty() {
+                env.insert("ANTHROPIC_BASE_URL".into(), p.base_url.clone());
+            }
+            if !p.model.is_empty() {
+                env.insert("ANTHROPIC_MODEL".into(), p.model.clone());
+            }
+        }
+        "openai-chat" | "openai-responses" => {
+            env.insert("BUZZ_AGENT_PROVIDER".into(), "openai".into());
+            env.insert("OPENAI_COMPAT_API_KEY".into(), p.api_key.clone());
+            // 与 pi 不同：buzz-agent 的 base_url 就是请求端点，不是 provider 身份
+            // 判定——供应商配的什么 URL 就打什么（含自定义网关/本地端点）。
+            if !p.base_url.is_empty() {
+                env.insert("OPENAI_COMPAT_BASE_URL".into(), p.base_url.clone());
+            }
+            if !p.model.is_empty() {
+                env.insert("OPENAI_COMPAT_MODEL".into(), p.model.clone());
+            }
+            let api = if p.kind == "openai-chat" { "chat" } else { "responses" };
+            env.insert("OPENAI_COMPAT_API".into(), api.into());
+        }
+        other => {
+            return Err(format!(
+                "⚠️ 供应商「{}」类型 {other} 无法用于 buzz 后端（支持 anthropic / openai-chat / openai-responses）。",
+                p.name
+            ))
+        }
+    }
+    Ok(Some(env))
+}
+
 /// 由（后端, 供应商）算出注入产物。优先级：桥内供应商 > CC Switch / codex 自认证。
 /// 类型与后端不匹配 → Err（用户可见）。供应商为 None → 旧行为回落。
 pub(crate) fn build_injection(
@@ -296,11 +362,15 @@ pub(crate) fn build_injection(
     use crate::config::ProviderConfig as P;
     let no_args = Vec::new();
     match (backend, provider) {
-        // ── #200：buzz 后端无 provider 注入（buzz-agent 自带 provider 配置）──
-        (Backend::Buzz, _) => Ok(Injection {
-            env: None,
-            extra_args: Vec::new(),
-        }),
+        // ── buzz 后端：供应商 env 经 buzz_provider_env 装配（当前调用方在
+        // service 装配 harness 处，见 init_buzz_harness；此处保留供同源调用）──
+        (Backend::Buzz, p) => {
+            let env = buzz_provider_env(p)?;
+            Ok(Injection {
+                env,
+                extra_args: Vec::new(),
+            })
+        }
         // ── 未配供应商：旧行为回落 ──
         (Backend::Claude, None) => Ok(Injection {
             env: Some(ccswitch_env_or_err()?),
@@ -331,9 +401,9 @@ pub(crate) fn build_injection(
             })
         }
         // ── pi + anthropic 供应商：注入 ANTHROPIC_API_KEY + --provider/--model。
-        // pi 内置 anthropic provider 固定官方端点，不读 ANTHROPIC_BASE_URL——配了 base_url
-        // 也照常打官方端点（日志警告，避免用户误以为走了自定义网关）；自定义端点需在
-        // ~/.pi/agent/models.json 自定义 provider（超出桥职责，文档提示即可）。
+        // pi 内置 anthropic provider 固定官方端点（api.anthropic.com），不读
+        // ANTHROPIC_BASE_URL——base_url 指向官方 host（或留空）即内置语义、静默；
+        // 指向其它网关时内置 provider 到不了，告警提示走 agent 侧 custom provider。
         (Backend::Pi, Some(p)) if p.kind == "anthropic" => {
             let mut env = HashMap::new();
             env.insert("ANTHROPIC_API_KEY".into(), p.api_key.clone());
@@ -342,10 +412,10 @@ pub(crate) fn build_injection(
                 args.push("--model".to_string());
                 args.push(p.model.clone());
             }
-            if !p.base_url.is_empty() {
+            let host = provider_host(&p.base_url).unwrap_or_default();
+            if host != "api.anthropic.com" && !host.is_empty() {
                 crate::log!(
-                    "[agent] {} 后端忽略 anthropic 供应商「{}」的 base_url（内置 provider 固定官方端点；自定义端点请在 agent 侧配 custom provider）",
-                    backend.name(),
+                    "[agent] pi 后端忽略 anthropic 供应商「{}」的 base_url（host={host}）：内置 provider 固定官方端点；请在模型供应商配置改用 https://api.anthropic.com，或在 agent 侧配 custom provider 并留空桥内 base_url",
                     p.name
                 );
             }
@@ -389,23 +459,34 @@ pub(crate) fn build_injection(
                 extra_args: args,
             })
         }
-        // ── pi + OpenAI 兼容供应商：注入 OPENAI_API_KEY + --provider openai + --model。
-        // pi 内置 openai provider 固定 api.openai.com；非官方端点同样需 agent 侧自定义
-        // provider（见上 anthropic 分支注释）。wire_api（chat/responses）由 agent 侧决定，桥不干预。
+        // ── pi + OpenAI 兼容供应商 ──
+        // 桥内供应商的 base_url 只用于识别 pi 内置 provider 身份（pi 内置 provider
+        // 端点固定官方，无通用 base_url 注入面）：host 命中内置 provider → 换用该
+        // provider 的 env 键与 --provider id（#200 实测：deepseek key 打进
+        // OPENAI_API_KEY + provider openai，pi 照常请求 api.openai.com → 供应商
+        // URL 引用错误）。未命中 → 回落 openai 并告警（自定义端点须在 agent 侧
+        // ~/.pi/agent/models.json 配 custom provider，超出桥职责）。wire_api
+        // （chat/responses）由 agent 侧决定，桥不干预。
         (Backend::Pi, Some(p)) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
+            let host = provider_host(&p.base_url).unwrap_or_default();
+            let (pid, key_env): (&str, &str) = match host.as_str() {
+                // 空 base_url = 默认官方（pi openai 内置固定 api.openai.com/v1）
+                "" | "api.openai.com" => ("openai", "OPENAI_API_KEY"),
+                "api.deepseek.com" => ("deepseek", "DEEPSEEK_API_KEY"),
+                other => {
+                    crate::log!(
+                        "[agent] pi 后端忽略 OpenAI 兼容供应商「{}」的 base_url（host={other}）：pi 内置 provider 端点固定官方、不可自定义；请在模型供应商配置改用官方端点 host（api.openai.com / api.deepseek.com），或在 agent 侧 ~/.pi/agent/models.json 配 custom provider 后留空桥内 base_url",
+                        p.name
+                    );
+                    ("openai", "OPENAI_API_KEY")
+                }
+            };
             let mut env = HashMap::new();
-            env.insert("OPENAI_API_KEY".into(), p.api_key.clone());
-            let mut args = vec!["--provider".to_string(), "openai".to_string()];
+            env.insert(key_env.into(), p.api_key.clone());
+            let mut args = vec!["--provider".to_string(), pid.to_string()];
             if !p.model.is_empty() {
                 args.push("--model".to_string());
                 args.push(p.model.clone());
-            }
-            if !p.base_url.is_empty() {
-                crate::log!(
-                    "[agent] {} 后端忽略 OpenAI 兼容供应商「{}」的 base_url（内置 provider 固定官方端点；自定义端点请在 agent 侧配 custom provider）",
-                    backend.name(),
-                    p.name
-                );
             }
             Ok(Injection {
                 env: Some(env),
@@ -2510,6 +2591,124 @@ mod tests {
             args.iter().all(|a| !a.contains("sk-secret")),
             "key 绝不进 argv"
         );
+    }
+
+    fn prov_bu(name: &str, kind: &str, base_url: &str) -> crate::config::ProviderConfig {
+        let mut p = prov(name, kind);
+        p.base_url = base_url.into();
+        p
+    }
+
+    #[test]
+    fn provider_host_normalizes() {
+        assert_eq!(
+            provider_host("https://api.deepseek.com").as_deref(),
+            Some("api.deepseek.com")
+        );
+        assert_eq!(
+            provider_host("https://api.deepseek.com/v1").as_deref(),
+            Some("api.deepseek.com")
+        );
+        assert_eq!(
+            provider_host("https://api.openai.com/v1").as_deref(),
+            Some("api.openai.com")
+        );
+        assert_eq!(
+            provider_host("http://127.0.0.1:11434/v1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            provider_host("api.deepseek.com").as_deref(),
+            Some("api.deepseek.com")
+        );
+        assert_eq!(provider_host(""), None);
+        assert_eq!(provider_host("   "), None);
+    }
+
+    #[test]
+    fn pi_deepseek_host_maps_to_deepseek_provider() {
+        // #200 供应商 URL 引用错误修复：base_url 指向 api.deepseek.com → pi 内置
+        // deepseek provider（DEEPSEEK_API_KEY + --provider deepseek），不再拿
+        // deepseek key 打官方 openai 端点。
+        let p = prov_bu("deepseek", "openai-chat", "https://api.deepseek.com/v1");
+        let inj = build_injection(Backend::Pi, Some(&p)).unwrap();
+        let env = inj.env.as_ref().unwrap();
+        assert_eq!(env["DEEPSEEK_API_KEY"], "sk-secret");
+        assert!(
+            !env.contains_key("OPENAI_API_KEY"),
+            "key 键名随 provider 身份走"
+        );
+        let args = &inj.extra_args;
+        assert!(args.iter().any(|a| a == "deepseek"));
+        assert!(!args.iter().any(|a| a == "openai"));
+        assert!(args.iter().any(|a| a == "some-model"));
+    }
+
+    #[test]
+    fn pi_official_openai_host_stays_openai() {
+        // base_url 显式写官方 / 留空 → openai 内置 provider（原语义，无告警路径可断言）
+        for bu in ["", "https://api.openai.com/v1", "api.openai.com"] {
+            let p = prov_bu("o", "openai-chat", bu);
+            let inj = build_injection(Backend::Pi, Some(&p)).unwrap();
+            let env = inj.env.as_ref().unwrap();
+            assert_eq!(env["OPENAI_API_KEY"], "sk-secret");
+            assert!(!env.contains_key("DEEPSEEK_API_KEY"));
+            let args = &inj.extra_args;
+            assert!(
+                args.iter().any(|a| a == "openai"),
+                "base_url={bu:?} → openai"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_unknown_host_falls_back_openai_with_models_key() {
+        // 未命中内置 host：回落现有行为（openai + OPENAI_API_KEY + 告警），不静默改向
+        let p = prov("unknown", "openai-responses"); // example.com/v1
+        let inj = build_injection(Backend::Pi, Some(&p)).unwrap();
+        assert_eq!(inj.env.as_ref().unwrap()["OPENAI_API_KEY"], "sk-secret");
+        assert!(inj.extra_args.iter().any(|a| a == "openai"));
+    }
+
+    #[test]
+    fn buzz_provider_env_maps_anthropic() {
+        let p = prov_bu("myant", "anthropic", "https://gateway.example.com");
+        let env = buzz_provider_env(Some(&p)).unwrap().unwrap();
+        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "anthropic");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "sk-secret");
+        // buzz-agent 支持自定义 anthropic 网关：base_url 原样透传（区别于 pi 的固定端点）
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example.com");
+        assert_eq!(env["ANTHROPIC_MODEL"], "some-model");
+        assert!(!env.contains_key("OPENAI_COMPAT_API_KEY"));
+    }
+
+    #[test]
+    fn buzz_provider_env_maps_openai_chat_and_responses() {
+        let p = prov_bu("ds", "openai-chat", "https://api.deepseek.com");
+        let env = buzz_provider_env(Some(&p)).unwrap().unwrap();
+        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "openai");
+        assert_eq!(env["OPENAI_COMPAT_API_KEY"], "sk-secret");
+        assert_eq!(env["OPENAI_COMPAT_BASE_URL"], "https://api.deepseek.com");
+        assert_eq!(env["OPENAI_COMPAT_MODEL"], "some-model");
+        assert_eq!(env["OPENAI_COMPAT_API"], "chat");
+        let p2 = prov_bu("rs", "openai-responses", "https://api.openai.com/v1");
+        let env2 = buzz_provider_env(Some(&p2)).unwrap().unwrap();
+        assert_eq!(env2["OPENAI_COMPAT_API"], "responses");
+    }
+
+    #[test]
+    fn buzz_provider_env_none_and_mismatch() {
+        assert!(buzz_provider_env(None).unwrap().is_none());
+        let p = prov("x", "gemini");
+        let err = buzz_provider_env(Some(&p)).unwrap_err();
+        assert!(err.contains("gemini"), "未知 kind → 用户可见错误: {err}");
+        // build_injection buzz 臂同源装配
+        let pa = prov_bu("a", "anthropic", "");
+        let inj = build_injection(Backend::Buzz, Some(&pa)).unwrap();
+        assert_eq!(inj.env.as_ref().unwrap()["ANTHROPIC_API_KEY"], "sk-secret");
+        assert!(inj.extra_args.is_empty(), "buzz 不需要 argv 注入");
+        let inj0 = build_injection(Backend::Buzz, None).unwrap();
+        assert!(inj0.env.is_none());
     }
 
     // ── pi 注入与解析（供应商注入 + 事件流）──

@@ -898,9 +898,10 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub workspace_git_enabled: bool,
     /// #206：buzz 后端的 agent ACP 适配器可执行文件（harness 直接 spawn 的对象）。
-    /// 空 = 默认 **pi-acp**（pi 的 ACP 适配器，npm 全局
-    /// 安装 `npm i -g pi-acp`；find_in_path 的 composed_path 已含 ~/.npm-global/bin
-    /// 等）。覆盖可指向任意 ACP agent 适配器。
+    /// 空 = 解析顺序：主程序同目录的 `buzz-agent`（#200 随包 fork，ABB.app/Contents/
+    /// MacOS/ 下与 agent-bridge 同目录）→ PATH 里的 **pi-acp**（pi 的 ACP 适配器，
+    /// npm 全局安装 `npm i -g pi-acp`；find_in_path 的 composed_path 已含
+    /// ~/.npm-global/bin 等）。覆盖可指向任意 ACP agent 适配器（绝对路径优先）。
     #[serde(default)]
     pub buzz_agent_exe: String,
     #[serde(default)]
