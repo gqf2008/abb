@@ -1159,7 +1159,12 @@ fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) 
     let be_sel = if be.is_empty() { "claude" } else { be.as_str() };
     w.set_backend_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(
         mk_opts(
-            &[("claude", "claude"), ("codex", "codex"), ("pi", "pi")],
+            &[
+                ("claude", "claude"),
+                ("codex", "codex"),
+                ("pi", "pi"),
+                ("buzz", "buzz"), // #200：buzz = ACP harness 后端（外部 agent 常驻进程）
+            ],
             be_sel,
         ),
     ))));
@@ -4353,7 +4358,7 @@ pub fn run_gui() -> Result<()> {
         let sw = settings.as_weak();
         settings.on_backend_option_toggled(move |i| {
             let Some(w) = sw.upgrade() else { return };
-            let val = ["claude", "codex", "pi"][i as usize];
+            let val = ["claude", "codex", "pi", "buzz"][i as usize]; // 与 backend-options model 同序
             if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
                 bot.backend = val.to_string();
             }
