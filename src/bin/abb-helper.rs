@@ -30,8 +30,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
-const HELPER_LABEL: &str = "com.sqb.abb-helper";
-#[cfg(target_os = "macos")]
 const SOCKET_PATH: &str = "/var/run/com.sqb.abb-helper.sock";
 /// 主程序可执行名（对等进程路径校验用）。
 #[cfg(target_os = "macos")]

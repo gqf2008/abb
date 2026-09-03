@@ -13,11 +13,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
-use crate::observer::{ObserverContext, ObserverHandle};
-use crate::usage::{
-    PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
-};
-
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
@@ -168,12 +163,6 @@ pub struct AcpClient {
     /// Inherited by `cancel_with_cleanup` so the drain loop shares the same budget
     /// rather than starting a fresh timer (prevents double-jeopardy).
     current_hard_deadline: Option<tokio::time::Instant>,
-    /// Optional local observer feed used by the desktop app.
-    observer: Option<ObserverHandle>,
-    /// Pool slot index for this agent process.
-    observer_agent_index: Option<usize>,
-    /// Best-effort context attached to raw ACP wire events.
-    observer_context: ObserverContext,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -207,155 +196,17 @@ pub struct AcpClient {
     /// is dropped at scope exit alongside the turn it served. `None`
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
-    steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
-    /// Usage tracker for goose/buzz-agent's cumulative notification format.
-    goose_usage: UsageTracker,
-    /// Per-turn prompt-response usage and Claude's optional cumulative cost.
-    standard_usage: StandardUsageTracker,
-    /// Known adapter identity for prompt-response usage mapping.
-    standard_adapter: Option<StandardAdapterKind>,
-}
-
-/// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
-/// collisions.  When both sides have an object for the same key, the merge recurses so
-/// unrelated nested keys from `base` are preserved.
-fn deep_merge(
-    base: &mut serde_json::Map<String, serde_json::Value>,
-    overlay: serde_json::Map<String, serde_json::Value>,
-) {
-    for (k, overlay_val) in overlay {
-        match base.get_mut(&k) {
-            Some(serde_json::Value::Object(base_obj))
-                if matches!(overlay_val, serde_json::Value::Object(_)) =>
-            {
-                // Both sides are objects — recurse to preserve unrelated nested keys.
-                if let serde_json::Value::Object(overlay_obj) = overlay_val {
-                    deep_merge(base_obj, overlay_obj);
-                }
-            }
-            _ => {
-                // Scalar, array, type mismatch, or new key — overlay wins.
-                base.insert(k, overlay_val);
-            }
-        }
-    }
-}
-
-/// Build the merged `CODEX_CONFIG` environment-variable value for a Codex agent spawn.
-///
-/// Returns `Some(json_string)` when `has_generated_codex_config` is true (Buzz injected a
-/// `CODEX_CONFIG` entry via `codex_network_env()`), `None` otherwise.
-///
-/// # Merge contract (when `has_generated_codex_config` is true)
-///
-/// 1. **Persona base** — the first `CODEX_CONFIG` value in `extra_env` is taken as
-///    the base object (all keys preserved, recursively).  When there is no persona entry,
-///    the generated entry serves as the base.
-/// 2. **Generated overlay** — all subsequent `CODEX_CONFIG` entries are deep-merged into
-///    the base so unrelated nested persona keys survive.
-/// 3. **Parent-env precedence** — if `parent_codex_config` is `Some`, its keys are
-///    deep-merged into the result (parent wins on colliding keys at every nesting level;
-///    unrelated keys from either side survive).
-/// 4. **Forced overlay** — `sandbox_workspace_write.network_access = true` is applied
-///    last so relay access is guaranteed regardless of operator / persona config.
-///
-/// When `has_generated_codex_config` is false, the function returns `None` and the
-/// caller handles any persona-supplied `CODEX_CONFIG` with ordinary operator-wins
-/// semantics (no merging, no sandbox widening).
-///
-/// # Errors
-///
-/// Returns `Err(AcpError::Protocol)` when `has_generated_codex_config` is true and any
-/// `CODEX_CONFIG` value is not valid JSON or is not a JSON object, or when
-/// `sandbox_workspace_write` is present but not an object after all merges.
-pub(crate) fn build_codex_config_env(
-    extra_env: &[(String, String)],
-    parent_codex_config: Option<&str>,
-    has_generated_codex_config: bool,
-) -> Result<Option<String>, AcpError> {
-    // Without an explicit Buzz-generated overlay signal, skip the merge entirely.
-    // Any persona CODEX_CONFIG is handled by the caller with operator-wins semantics.
-    if !has_generated_codex_config {
-        return Ok(None);
-    }
-
-    // Collect all CODEX_CONFIG entries from extra_env in order.
-    let codex_entries: Vec<&str> = extra_env
-        .iter()
-        .filter(|(k, _)| k == "CODEX_CONFIG")
-        .map(|(_, v)| v.as_str())
-        .collect();
-
-    if codex_entries.is_empty() {
-        // has_generated_codex_config is true but no entry in extra_env — shouldn't
-        // happen in practice, but treat as no-op rather than panic.
-        return Ok(None);
-    }
-
-    // Parse all entries; first one is the persona base (or the generated entry if no
-    // persona CODEX_CONFIG was set), rest are additional generated entries.
-    let mut parsed_entries: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
-    for (i, raw) in codex_entries.iter().enumerate() {
-        match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(serde_json::Value::Object(obj)) => parsed_entries.push(obj),
-            Ok(_) => {
-                let source = if i == 0 { "persona" } else { "generated" };
-                return Err(AcpError::Protocol(format!(
-                    "CODEX_CONFIG {source} value is valid JSON but not an object"
-                )));
-            }
-            Err(e) => {
-                let source = if i == 0 { "persona" } else { "generated" };
-                return Err(AcpError::Protocol(format!(
-                    "CODEX_CONFIG {source} value is not valid JSON: {e}"
-                )));
-            }
-        }
-    }
-
-    // Start from first entry, deep-merge remaining entries.
-    let mut base = parsed_entries.remove(0);
-    for overlay in parsed_entries {
-        deep_merge(&mut base, overlay);
-    }
-
-    // Deep-merge parent env (parent wins on colliding keys at every nesting level).
-    if let Some(parent_raw) = parent_codex_config {
-        match serde_json::from_str::<serde_json::Value>(parent_raw) {
-            Ok(serde_json::Value::Object(parent_obj)) => {
-                deep_merge(&mut base, parent_obj);
-            }
-            Ok(_) => {
-                return Err(AcpError::Protocol(
-                    "CODEX_CONFIG in parent environment is valid JSON but not an object".into(),
-                ));
-            }
-            Err(e) => {
-                return Err(AcpError::Protocol(format!(
-                    "CODEX_CONFIG in parent environment is not valid JSON: {e}"
-                )));
-            }
-        }
-    }
-
-    // Force sandbox_workspace_write.network_access = true (our invariant, always wins).
-    let sws_entry = base
-        .entry("sandbox_workspace_write")
-        .or_insert_with(|| serde_json::json!({}));
-    match sws_entry {
-        serde_json::Value::Object(sws_obj) => {
-            sws_obj.insert("network_access".to_string(), serde_json::Value::Bool(true));
-        }
-        other => {
-            return Err(AcpError::Protocol(format!(
-                "CODEX_CONFIG sandbox_workspace_write is not an object (got {}); \
-                 cannot set network_access=true",
-                other
-            )));
-        }
-    }
-
-    Ok(Some(serde_json::Value::Object(base).to_string()))
+    steer_rx: Option<tokio::sync::mpsc::Receiver<crate::buzz::pool::SteerRequest>>,
+    /// Accumulated agent reply text for the current turn (`agent_message_chunk`
+    /// deltas, session-filtered). Cleared by [`AcpClient::begin_turn`]; drained
+    /// by [`AcpClient::take_turn_text`] at turn completion. A turn with no text
+    /// (pure tool turn / silent refusal) yields an empty string.
+    turn_text: String,
+    /// Session id of the in-flight prompt, used to attribute
+    /// `agent_message_chunk` deltas to this turn. Steer turns keep the same
+    /// session and keep accumulating; a straggler from another session must
+    /// not bleed into this turn's reply.
+    turn_session: Option<String>,
 }
 
 /// goose's non-standard mid-turn steer method. Requires `expectedRunId`, so it
@@ -445,17 +296,11 @@ impl AcpClient {
 
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
     ///
-    /// `has_generated_codex_config` must be true when `codex_network_env()` successfully
-    /// injected a `CODEX_CONFIG` entry into `extra_env`.  The spawn path uses it to
-    /// trigger the recursive merge + forced `network_access=true` in
-    /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
-    ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
     pub async fn spawn(
         command: &str,
         args: &[String],
         extra_env: &[(String, String)],
-        has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
@@ -469,51 +314,12 @@ impl AcpClient {
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
 
-        // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
-        // For most keys, operator precedence wins: skip injection if already set
-        // in the parent environment.
-        //
-        // CODEX_CONFIG is handled specially via build_codex_config_env:
-        //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
-        //     recursively and force network_access=true.
-        //   • has_generated_codex_config=false: return None; any persona-supplied
-        //     CODEX_CONFIG falls through to the normal operator-wins loop below.
-        let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
-        let parent_codex_config = if has_generated_codex_config && has_codex_config {
-            std::env::var("CODEX_CONFIG").ok()
-        } else {
-            None
-        };
-        let codex_config_value = build_codex_config_env(
-            extra_env,
-            parent_codex_config.as_deref(),
-            has_generated_codex_config,
-        )?;
-        // When the merge path was not taken (None returned), any persona CODEX_CONFIG
-        // entry falls through to the standard operator-wins treatment below.
-        let codex_merge_active = codex_config_value.is_some();
-
-        // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
-        // Applied first so both persona `extra_env` (below, via `Command::env`
-        // key replacement) and inherited parent env (via the parent-presence
-        // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
-            if std::env::var_os(key).is_none() {
-                cmd.env(key, value);
-            }
-        }
-
+        // ABB 侧差异（相对上游）：extra_env 为**无条件覆盖**（上游仅缺失时注入）。
+        // service 用它对子进程 PATH 做全量接管（composed_path）——launchd/GUI 进程
+        // 的 PATH 极简（/usr/bin:/bin），"缺失才注入"会让 agent 永远找不到 npm 全局
+        // 安装（见 AgentConfig 文档与 docs/buzz-port-sync.md）。
         for (key, value) in extra_env {
-            if key == "CODEX_CONFIG" && codex_merge_active {
-                // Handled by build_codex_config_env; skip here to avoid double-setting.
-                continue;
-            }
-            if std::env::var_os(key).is_none() {
-                cmd.env(key, value);
-            }
-        }
-        if let Some(merged) = codex_config_value {
-            cmd.env("CODEX_CONFIG", merged);
+            cmd.env(key, value);
         }
 
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
@@ -526,14 +332,6 @@ impl AcpClient {
         // console-subsystem child process spawned from a GUI/non-console parent.
         configure_no_window(&mut cmd);
 
-        let standard_adapter =
-            match crate::config::normalize_agent_command_identity(command).as_str() {
-                "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => {
-                    Some(StandardAdapterKind::Claude)
-                }
-                "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
-                _ => None,
-            };
         let mut child = cmd.spawn()?;
 
         let stdin = child
@@ -554,49 +352,24 @@ impl AcpClient {
             permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
-            observer: None,
-            observer_agent_index: None,
-            observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
-            goose_usage: UsageTracker::default(),
-            standard_usage: StandardUsageTracker::default(),
-            standard_adapter,
+            turn_text: String::new(),
+            turn_session: None,
         })
     }
 
-    /// Attach a local observer feed to this ACP client.
-    pub fn set_observer(&mut self, observer: Option<ObserverHandle>, agent_index: usize) {
-        self.observer = observer;
-        self.observer_agent_index = Some(agent_index);
+    /// Start a new turn: clear accumulated reply text. Must be called by the
+    /// dispatch path once per prompt task, before the first prompt of the turn.
+    pub fn begin_turn(&mut self) {
+        self.turn_text.clear();
+        self.turn_session = None;
     }
 
-    /// Update metadata that will be attached to subsequent raw wire events.
-    pub fn set_observer_context(&mut self, context: ObserverContext) {
-        self.observer_context = context;
-    }
-
-    /// Return a clone of the observer handle, if attached.
-    pub(crate) fn observer_handle(&self) -> Option<ObserverHandle> {
-        self.observer.clone()
-    }
-
-    /// Return the pool slot index for this agent process.
-    pub(crate) fn observer_agent_index(&self) -> Option<usize> {
-        self.observer_agent_index
-    }
-
-    /// Emit a semantic event to the local observer feed, if enabled.
-    pub fn observe(&self, kind: impl Into<String>, payload: serde_json::Value) {
-        if let Some(observer) = &self.observer {
-            observer.emit(
-                kind,
-                self.observer_agent_index,
-                &self.observer_context,
-                payload,
-            );
-        }
+    /// Drain the turn's accumulated agent text (the reply to deliver).
+    pub fn take_turn_text(&mut self) -> String {
+        std::mem::take(&mut self.turn_text)
     }
 
     /// Send the `initialize` request and return the agent's response result value.
@@ -619,14 +392,6 @@ impl AcpClient {
             .unwrap_or(false);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
-    }
-
-    /// Send the ACP `authenticate` request for an adapter-advertised method.
-    pub async fn authenticate(&mut self, method_id: &str) -> Result<serde_json::Value, AcpError> {
-        let params = serde_json::json!({
-            "methodId": method_id,
-        });
-        self.send_request("authenticate", params).await
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -720,34 +485,6 @@ impl AcpClient {
         .await
     }
 
-    /// Send `session/set_config_option` (stable ACP path).
-    pub async fn session_set_config_option(
-        &mut self,
-        session_id: &str,
-        config_id: &str,
-        value: &str,
-    ) -> Result<serde_json::Value, AcpError> {
-        let params = serde_json::json!({
-            "sessionId": session_id,
-            "configId": config_id,
-            "value": value,
-        });
-        self.send_request("session/set_config_option", params).await
-    }
-
-    /// Send `session/set_model` (unstable ACP path).
-    pub async fn session_set_model(
-        &mut self,
-        session_id: &str,
-        model_id: &str,
-    ) -> Result<serde_json::Value, AcpError> {
-        let params = serde_json::json!({
-            "sessionId": session_id,
-            "modelId": model_id,
-        });
-        self.send_request("session/set_model", params).await
-    }
-
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
     ///
     /// The idle deadline resets on any stdout activity from the agent. The hard
@@ -784,12 +521,10 @@ impl AcpClient {
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
-
-        // Mark the usage tracker as in-flight for this turn BEFORE sending the
-        // prompt so that any setup notifications recorded earlier are not
-        // misattributed to this turn.
-        self.goose_usage.begin_turn(session_id);
-        self.standard_usage.begin_turn(session_id);
+        // Attribute this turn's `agent_message_chunk` deltas to `session_id`
+        // (see `turn_session`). Steer re-prompts reuse the same session and
+        // therefore keep accumulating into `turn_text`.
+        self.turn_session = Some(session_id.to_string());
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -835,7 +570,7 @@ impl AcpClient {
                 self.current_hard_deadline = None;
             }
         }
-        self.parse_prompt_response(session_id, &result?)
+        self.parse_prompt_response(&result?)
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -864,7 +599,7 @@ impl AcpClient {
     /// Both goose and buzz-agent emit `session_info_update`; other agents
     /// leave this `None` for the lifetime of the client. Read directly by
     /// `read_until_response_with_idle_timeout`'s
-    /// steer arm at write time (see [`crate::pool::SteerRequest`] for
+    /// steer arm at write time (see [`crate::buzz::pool::SteerRequest`] for
     /// why the read loop owns this); production callers do not need this
     /// accessor. Kept as `pub` so tests can introspect the field.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -877,28 +612,9 @@ impl AcpClient {
     ///
     /// The read loop's steer arm reads the field directly; this accessor exists
     /// for the supervisor's post-initialize log line.
+    #[cfg(test)]
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
-    }
-
-    /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
-    /// exclusive cumulative path; standard ACP prompt usage is used only when
-    /// goose emitted nothing for this turn.
-    pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
-        let goose_usage = self.goose_usage.take();
-        let standard_usage = self.standard_usage.take();
-        goose_usage.or(standard_usage)
-    }
-
-    /// Notify the usage tracker that buzz-acp just spawned a new session.
-    ///
-    /// Seeds a zero baseline so the first usage notification for `session_id`
-    /// produces `delta_reliable: true` (turn delta == cumulative from zero).
-    /// Must be called only when buzz-acp created the session via `session/new`;
-    /// never when attaching to a pre-existing session.
-    pub(crate) fn notify_session_spawned(&mut self, session_id: &str) {
-        self.goose_usage.seed_zero_baseline(session_id);
-        self.standard_usage.seed_zero_baseline(session_id);
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -914,7 +630,10 @@ impl AcpClient {
     /// silently misroute steer requests across turns. The previous
     /// turn's receiver must have been consumed by the read loop and
     /// dropped at scope exit before the next turn dispatches.
-    pub fn install_steer_rx(&mut self, rx: tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>) {
+    pub fn install_steer_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::Receiver<crate::buzz::pool::SteerRequest>,
+    ) {
         assert!(
             self.steer_rx.is_none(),
             "install_steer_rx: previous turn's receiver was not consumed — \
@@ -931,15 +650,6 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
-    }
-
-    /// Returns `true` if no steer receiver is currently installed.
-    ///
-    /// Test-only: used by `pool` tests to assert the post-return invariant
-    /// without exposing the private field directly.
-    #[cfg(test)]
-    pub fn steer_rx_is_none(&self) -> bool {
-        self.steer_rx.is_none()
     }
 
     /// Cancel a turn cleanly, handling any pending permission request first.
@@ -1058,7 +768,7 @@ impl AcpClient {
                 remaining,
             )
             .await?;
-        self.parse_prompt_response(session_id, &result)
+        self.parse_prompt_response(&result)
     }
 
     /// Serialize `value` as a single NDJSON line and flush to the agent's stdin.
@@ -1077,7 +787,6 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
         Ok(())
     }
 
@@ -1220,13 +929,6 @@ impl AcpClient {
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.observe(
-                        "acp_parse_error",
-                        serde_json::json!({
-                            "line": trimmed,
-                            "error": e.to_string(),
-                        }),
-                    );
                     tracing::warn!(
                         target: "acp::wire",
                         "failed to parse line as JSON: {e} — skipping"
@@ -1234,7 +936,6 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1253,9 +954,6 @@ impl AcpClient {
                 match method {
                     "session/update" => {
                         let _ = self.handle_session_update(&msg);
-                    }
-                    "_goose/unstable/session/update" => {
-                        self.handle_goose_usage_update(&msg);
                     }
                     "session/request_permission" => {
                         self.handle_permission_request(&msg).await?;
@@ -1310,7 +1008,7 @@ impl AcpClient {
     /// `session_id` is threaded in lexically by callers so the goose-native
     /// steer arm can complete `sessionId` in the steer JSON-RPC params at
     /// write time without needing access to outer state. See
-    /// [`crate::pool::SteerRequest`] for why params are built here and not
+    /// [`crate::buzz::pool::SteerRequest`] for why params are built here and not
     /// in the main loop.
     async fn read_until_response_with_idle_timeout(
         &mut self,
@@ -1338,7 +1036,7 @@ impl AcpClient {
         let mut pending_steer: Option<(
             u64,
             SteerTransport,
-            tokio::sync::oneshot::Sender<crate::pool::SteerAck>,
+            tokio::sync::oneshot::Sender<crate::buzz::pool::SteerAck>,
         )> = None;
 
         let now = Instant::now();
@@ -1369,7 +1067,7 @@ impl AcpClient {
                     // PromptCompletedNeutral (no fallback signal: there is
                     // no in-flight turn to signal once we return, and
                     // normal dispatch handles redelivery).
-                    let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                    let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
                 }
                 if idle_fires_first {
                     tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
@@ -1446,8 +1144,8 @@ impl AcpClient {
                                 "steer: no active_run_id and agent did not advertise \
                                  {ACP_STEER_METHOD} — falling back to cancel+merge"
                             );
-                            let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
-                                crate::pool::SteerError::ExpectedRunIdMissing,
+                            let _ = req.ack_tx.send(crate::buzz::pool::SteerAck::Err(
+                                crate::buzz::pool::SteerError::ExpectedRunIdMissing,
                             ));
                         }
                         Some((transport, method, params)) => {
@@ -1472,8 +1170,8 @@ impl AcpClient {
                                     tracing::warn!(
                                         "steer write failed ({method}): {e} — releasing withheld event"
                                     );
-                                    let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
-                                        crate::pool::SteerError::Transport(e.to_string()),
+                                    let _ = req.ack_tx.send(crate::buzz::pool::SteerAck::Err(
+                                        crate::buzz::pool::SteerError::Transport(e.to_string()),
                                     ));
                                 }
                             }
@@ -1490,7 +1188,7 @@ impl AcpClient {
                     // here makes the wakeup immediate (no extra reader poll
                     // round-trip when stdout is idle).
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
                     }
                     if idle_fires_first {
                         tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
@@ -1514,13 +1212,13 @@ impl AcpClient {
             match read_result {
                 None => {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::AgentExited);
                 }
                 Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Protocol(
                         "agent stdout line exceeded 10MB limit".into(),
@@ -1528,7 +1226,7 @@ impl AcpClient {
                 }
                 Some(Err(e)) => {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Io(std::io::Error::other(e)));
                 }
@@ -1543,13 +1241,6 @@ impl AcpClient {
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
                         Err(e) => {
-                            self.observe(
-                                "acp_parse_error",
-                                serde_json::json!({
-                                    "line": trimmed,
-                                    "error": e.to_string(),
-                                }),
-                            );
                             tracing::warn!(
                                 target: "acp::wire",
                                 "failed to parse line as JSON: {e} — skipping"
@@ -1557,7 +1248,6 @@ impl AcpClient {
                             continue;
                         }
                     };
-                    self.observe("acp_read", msg.clone());
 
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
@@ -1584,8 +1274,11 @@ impl AcpClient {
                                             .and_then(|c| c.as_i64())
                                             .unwrap_or(-1);
                                         let message = error.to_string();
-                                        crate::pool::SteerAck::Err(
-                                            crate::pool::SteerError::AgentError { code, message },
+                                        crate::buzz::pool::SteerAck::Err(
+                                            crate::buzz::pool::SteerError::AgentError {
+                                                code,
+                                                message,
+                                            },
                                         )
                                     } else {
                                         // Success result. Whether it counts as
@@ -1627,7 +1320,7 @@ impl AcpClient {
                                                     "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
                                                      awaited turn had ended — hard deadline not renewed"
                                                 );
-                                                crate::pool::SteerAck::Success {
+                                                crate::buzz::pool::SteerAck::Success {
                                                     session_id: session_id.to_owned(),
                                                 }
                                             }
@@ -1641,7 +1334,7 @@ impl AcpClient {
                                                         "steer success: renewed hard deadline ({max_duration:?} from now)"
                                                     );
                                                 }
-                                                crate::pool::SteerAck::Success {
+                                                crate::buzz::pool::SteerAck::Success {
                                                     session_id: session_id.to_owned(),
                                                 }
                                             }
@@ -1662,8 +1355,8 @@ impl AcpClient {
                                                      unrecognized outcome {reported} — releasing \
                                                      withheld event for cancel+merge"
                                                 );
-                                                crate::pool::SteerAck::Err(
-                                                    crate::pool::SteerError::OutcomeRejected {
+                                                crate::buzz::pool::SteerAck::Err(
+                                                    crate::buzz::pool::SteerError::OutcomeRejected {
                                                         outcome: reported,
                                                     },
                                                 )
@@ -1677,14 +1370,15 @@ impl AcpClient {
                             if *id == serde_json::json!(expected_id) {
                                 if let Some(error) = msg.get("error") {
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                                        let _ = ack_tx
-                                            .send(crate::pool::SteerAck::PromptCompletedNeutral);
+                                        let _ = ack_tx.send(
+                                            crate::buzz::pool::SteerAck::PromptCompletedNeutral,
+                                        );
                                     }
                                     return Err(agent_error_from_json(error));
                                 }
                                 if let Some((_, _, ack_tx)) = pending_steer.take() {
-                                    let _ =
-                                        ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                                    let _ = ack_tx
+                                        .send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
                                 }
                                 return Ok(msg["result"].clone());
                             }
@@ -1701,9 +1395,6 @@ impl AcpClient {
                                     last_activity_at = activity_now;
                                     tracing::debug!("idle clock reset: tool call started");
                                 }
-                            }
-                            "_goose/unstable/session/update" => {
-                                self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
                                 self.handle_permission_request(&msg).await?;
@@ -1754,8 +1445,17 @@ impl AcpClient {
 
         match update_type {
             "agent_message_chunk" => {
+                // ABB #200 Phase 3: accumulate the agent's reply text delta into
+                // `turn_text` for synchronous delivery at turn end. Filtered by
+                // session id — steer turns reuse the same session and keep
+                // accumulating; a straggler chunk from another session (e.g. a
+                // cancelled turn draining after a respawn) must not bleed into
+                // this turn's reply. Agents omitting `params.sessionId` are
+                // excluded (schema requires it; integration tests pin pi-acp).
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::info!(target: "acp::stream", "{text}");
+                    if msg["params"]["sessionId"].as_str() == self.turn_session.as_deref() {
+                        self.turn_text.push_str(text);
+                    }
                 }
                 false
             }
@@ -1841,83 +1541,10 @@ impl AcpClient {
                 }
                 false
             }
-            "usage_update" => {
-                self.handle_standard_usage_update(msg);
-                false
-            }
             "keepalive" => false,
             other => {
                 tracing::debug!(target: "acp::update", "session/update: {other}");
                 false
-            }
-        }
-    }
-
-    /// Record the standard ACP cumulative cost notification when emitted by
-    /// Claude. Unlike Goose's payload, `used`/`size` are context occupancy and
-    /// are intentionally not mapped to token accounting.
-    fn handle_standard_usage_update(&mut self, msg: &serde_json::Value) {
-        if self.standard_adapter != Some(StandardAdapterKind::Claude) {
-            return;
-        }
-        let session_id = match msg
-            .pointer("/params/sessionId")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some(session_id) => session_id,
-            None => return,
-        };
-        let cost = match msg
-            .pointer("/params/update/cost/amount")
-            .and_then(serde_json::Value::as_f64)
-        {
-            Some(cost) => cost,
-            None => return,
-        };
-        self.standard_usage.record_cost(session_id, cost);
-    }
-
-    /// Parse a `_goose/unstable/session/update` notification and record the
-    /// usage snapshot in the per-session tracker.
-    ///
-    /// Silently ignores malformed or non-`usage_update` variants — the
-    /// notification is best-effort observability data, not a protocol
-    /// requirement. Failures are logged at debug level.
-    fn handle_goose_usage_update(&mut self, msg: &serde_json::Value) {
-        use crate::usage::{GooseSessionUpdateNotification, GooseSessionUpdateVariant};
-        let params = match msg.get("params") {
-            Some(p) => p,
-            None => {
-                tracing::debug!(
-                    target: "acp::usage",
-                    "_goose/unstable/session/update: missing params"
-                );
-                return;
-            }
-        };
-        match serde_json::from_value::<GooseSessionUpdateNotification>(params.clone()) {
-            Ok(notif) => {
-                if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
-                    tracing::debug!(
-                        target: "acp::usage",
-                        session_id = %notif.session_id,
-                        input = ?payload.accumulated_input_tokens,
-                        output = ?payload.accumulated_output_tokens,
-                        // A subset of `input`, logged so downstream accounting can
-                        // price it at the provider's cached rate. Always emitted,
-                        // including as 0, so a parser can tell "no cache hits"
-                        // apart from "this build predates the field".
-                        cached = payload.accumulated_cached_input_tokens,
-                        "goose usage update"
-                    );
-                    self.goose_usage.record(&notif.session_id, payload);
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    target: "acp::usage",
-                    "_goose/unstable/session/update: deserialization error: {e}"
-                );
             }
         }
     }
@@ -2008,26 +1635,12 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Parse a completed prompt response and retain its optional per-turn usage.
+    /// Parse `stopReason` from a completed `session/prompt` response.
     fn parse_prompt_response(
         &mut self,
-        session_id: &str,
         result: &serde_json::Value,
     ) -> Result<StopReason, AcpError> {
-        let stop_reason = self.parse_stop_reason(result)?;
-        if let Some(adapter) = self.standard_adapter {
-            match serde_json::from_value::<PromptResponseUsage>(result["usage"].clone()) {
-                Ok(usage) => self
-                    .standard_usage
-                    .record_prompt_usage(session_id, usage, adapter),
-                Err(_) if result.get("usage").is_some() => tracing::debug!(
-                    target: "acp::usage",
-                    "session/prompt response contained malformed standard usage"
-                ),
-                Err(_) => {}
-            }
-        }
-        Ok(stop_reason)
+        self.parse_stop_reason(result)
     }
 
     /// Parse `stopReason` from a `session/prompt` result value.
@@ -2062,7 +1675,7 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
 ///
 /// Called from the read-loop steer arm at write time so `expectedRunId`
 /// matches goose's *current* run (it advances on each `session/update`).
-/// See [`crate::pool::SteerRequest`] for why this is the read loop's job
+/// See [`crate::buzz::pool::SteerRequest`] for why this is the read loop's job
 /// and not the main loop's.
 fn build_goose_steer_params(
     session_id: &str,
@@ -2125,7 +1738,10 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
 /// Callers use the extractor helpers to pull model info from `raw`.
 pub struct SessionNewResponse {
     pub session_id: String,
-    /// The full `result` value from the JSON-RPC response.
+    /// The full `result` value from the JSON-RPC response. Production code
+    /// only needs the session id; the raw response is kept for the wire-level
+    /// test assertions (`resp.raw["_receivedRequest"]`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub raw: serde_json::Value,
 }
 
@@ -2143,153 +1759,6 @@ pub enum SystemPromptTransport<'a> {
     Field(&'a str),
     /// Deliver as `_meta.systemPrompt: {"append": text}`.
     ClaudeMeta(&'a str),
-}
-
-/// How to switch to a particular model on a session.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(tag = "type")]
-pub enum ModelSwitchMethod {
-    /// Stable: use `session/set_config_option` with these exact values.
-    ConfigOption {
-        config_id: String,
-        option_value: String,
-    },
-    /// Unstable: use `session/set_model` with this model_id.
-    SetModel { model_id: String },
-}
-
-/// Extract `configOptions` entries with `category == "model"` from a `session/new` result.
-///
-/// Returns the raw JSON array entries. Each entry has `configId` (spelled `id`
-/// by some adapters, e.g. claude-agent-acp), `displayName`,
-/// `options: [{ value, displayName }]`, etc.
-pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_json::Value> {
-    result["configOptions"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|opt| opt.get("category").and_then(|c| c.as_str()) == Some("model"))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Extract `SessionModelState` (unstable path) from a `session/new` result.
-///
-/// Returns the `models` object if present: `{ currentModelId, availableModels: [...] }`.
-pub fn extract_model_state(result: &serde_json::Value) -> Option<serde_json::Value> {
-    result.get("models").cloned()
-}
-
-/// Extract the `configId` for the `thought_level` category option from a
-/// `session/new` result, if the adapter advertised one.
-///
-/// Claude Code's adapter uses `category: "thought_level"` in its `configOptions`.
-/// The configId is adapter-defined (e.g. `"effort"` on claude-agent-acp) and must
-/// not be hardcoded in the harness — this function discovers it at session time so
-/// the spawn-scoped effort application forwards the adapter's real id. Accepts both
-/// `configId` (ACP spec) and `id` (claude-agent-acp), matching the model-switch path.
-pub fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<String> {
-    let arr = result["configOptions"].as_array()?;
-    for opt in arr {
-        if opt.get("category").and_then(|c| c.as_str()) == Some("thought_level") {
-            let config_id = opt
-                .get("configId")
-                .or_else(|| opt.get("id"))
-                .and_then(|v| v.as_str())?;
-            return Some(config_id.to_string());
-        }
-    }
-    None
-}
-
-/// Match a desired model ID against a fresh `session/new` response.
-///
-/// Returns the correct ACP method to call, or `None` if no match.
-///
-/// **Precedence**: stable `configOptions` first (spec-blessed), then unstable
-/// `availableModels`. The fresh `session/new` response is always authoritative.
-pub fn resolve_model_switch_method(
-    session_new_result: &serde_json::Value,
-    desired_model: &str,
-) -> Option<ModelSwitchMethod> {
-    // 1. Search stable configOptions for a "model"-category entry whose
-    //    options contain a value matching desired_model.
-    for config_opt in extract_model_config_options(session_new_result) {
-        // Adapters disagree on the key: the ACP spec says `configId`, but
-        // claude-agent-acp emits `id`. Accept both; the set request always
-        // uses `configId` on the wire.
-        let config_id = match config_opt
-            .get("configId")
-            .or_else(|| config_opt.get("id"))
-            .and_then(|v| v.as_str())
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        if let Some(options) = config_opt.get("options").and_then(|v| v.as_array()) {
-            for opt in options {
-                if opt.get("value").and_then(|v| v.as_str()) == Some(desired_model) {
-                    return Some(ModelSwitchMethod::ConfigOption {
-                        config_id: config_id.to_string(),
-                        option_value: desired_model.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    // 2. Search unstable availableModels for a matching modelId.
-    if let Some(models) = extract_model_state(session_new_result) {
-        if let Some(available) = models.get("availableModels").and_then(|v| v.as_array()) {
-            for model in available {
-                if model.get("modelId").and_then(|v| v.as_str()) == Some(desired_model) {
-                    return Some(ModelSwitchMethod::SetModel {
-                        model_id: desired_model.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    // 3. No match.
-    None
-}
-
-/// Whether `desired_model` appears in pre-extracted catalog halves.
-///
-/// Mirrors [`resolve_model_switch_method`]'s match, but operates on the
-/// already-extracted `configOptions` (model category) and `models` state that
-/// [`AgentModelCapabilities`](crate::pool::AgentModelCapabilities) caches — the
-/// idle-path pre-cancel guard has those halves, not the full `session/new` JSON.
-pub fn model_in_catalog(
-    config_options: &[serde_json::Value],
-    available_models: Option<&serde_json::Value>,
-    desired_model: &str,
-) -> bool {
-    let in_config_options = config_options.iter().any(|config_opt| {
-        config_opt
-            .get("options")
-            .and_then(|v| v.as_array())
-            .is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|opt| opt.get("value").and_then(|v| v.as_str()) == Some(desired_model))
-            })
-    });
-    if in_config_options {
-        return true;
-    }
-
-    available_models
-        .and_then(|models| models.get("availableModels"))
-        .and_then(|v| v.as_array())
-        .is_some_and(|available| {
-            available
-                .iter()
-                .any(|model| model.get("modelId").and_then(|v| v.as_str()) == Some(desired_model))
-        })
 }
 
 // ─── Drop: kill child process ─────────────────────────────────────────────────
@@ -2708,300 +2177,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_model_config_options_finds_model_category() {
-        let result = serde_json::json!({
-            "sessionId": "sess-1",
-            "configOptions": [
-                {
-                    "configId": "model",
-                    "category": "model",
-                    "displayName": "Model",
-                    "options": [
-                        { "value": "claude-sonnet-4-20250514", "displayName": "Claude Sonnet 4" },
-                        { "value": "claude-opus-4-20250514", "displayName": "Claude Opus 4" }
-                    ]
-                },
-                {
-                    "configId": "theme",
-                    "category": "appearance",
-                    "displayName": "Theme",
-                    "options": [{ "value": "dark", "displayName": "Dark" }]
-                }
-            ]
-        });
-        let opts = super::extract_model_config_options(&result);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0]["configId"].as_str(), Some("model"));
-    }
-
-    #[test]
-    fn extract_model_config_options_empty_when_no_config_options() {
-        let result = serde_json::json!({ "sessionId": "sess-1" });
-        assert!(super::extract_model_config_options(&result).is_empty());
-    }
-
-    #[test]
-    fn extract_model_config_options_empty_when_no_model_category() {
-        let result = serde_json::json!({
-            "configOptions": [
-                { "configId": "theme", "category": "appearance" }
-            ]
-        });
-        assert!(super::extract_model_config_options(&result).is_empty());
-    }
-
-    #[test]
-    fn extract_model_state_returns_models_object() {
-        let result = serde_json::json!({
-            "sessionId": "sess-1",
-            "models": {
-                "currentModelId": "gpt-5",
-                "availableModels": [
-                    { "modelId": "gpt-5", "name": "GPT-5" },
-                    { "modelId": "o3-pro", "name": "o3 Pro" }
-                ]
-            }
-        });
-        let ms = super::extract_model_state(&result).expect("should have models");
-        assert_eq!(ms["currentModelId"].as_str(), Some("gpt-5"));
-        assert_eq!(ms["availableModels"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn extract_model_state_none_when_absent() {
-        let result = serde_json::json!({ "sessionId": "sess-1" });
-        assert!(super::extract_model_state(&result).is_none());
-    }
-
-    #[test]
-    fn extract_thought_level_config_id_finds_config_id() {
-        let result = serde_json::json!({
-            "sessionId": "sess-1",
-            "configOptions": [
-                { "configId": "model", "category": "model" },
-                {
-                    "configId": "effort",
-                    "category": "thought_level",
-                    "options": [{ "value": "high" }, { "value": "low" }]
-                }
-            ]
-        });
-        assert_eq!(
-            super::extract_thought_level_config_id(&result).as_deref(),
-            Some("effort")
-        );
-    }
-
-    #[test]
-    fn extract_thought_level_config_id_falls_back_to_id_key() {
-        let result = serde_json::json!({
-            "configOptions": [
-                { "id": "effort", "category": "thought_level" }
-            ]
-        });
-        assert_eq!(
-            super::extract_thought_level_config_id(&result).as_deref(),
-            Some("effort")
-        );
-    }
-
-    #[test]
-    fn extract_thought_level_config_id_none_without_category() {
-        let result = serde_json::json!({
-            "configOptions": [
-                { "configId": "model", "category": "model" }
-            ]
-        });
-        assert!(super::extract_thought_level_config_id(&result).is_none());
-    }
-
-    #[test]
-    fn extract_thought_level_config_id_none_without_config_options() {
-        let result = serde_json::json!({ "sessionId": "sess-1" });
-        assert!(super::extract_thought_level_config_id(&result).is_none());
-    }
-
-    #[test]
-    fn resolve_prefers_stable_over_unstable() {
-        let result = serde_json::json!({
-            "configOptions": [{
-                "configId": "model",
-                "category": "model",
-                "options": [
-                    { "value": "claude-sonnet-4-20250514", "displayName": "Sonnet 4" }
-                ]
-            }],
-            "models": {
-                "currentModelId": "claude-sonnet-4-20250514",
-                "availableModels": [
-                    { "modelId": "claude-sonnet-4-20250514", "name": "Sonnet 4" }
-                ]
-            }
-        });
-        let method = super::resolve_model_switch_method(&result, "claude-sonnet-4-20250514");
-        assert_eq!(
-            method,
-            Some(super::ModelSwitchMethod::ConfigOption {
-                config_id: "model".to_string(),
-                option_value: "claude-sonnet-4-20250514".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_accepts_id_keyed_config_options() {
-        // claude-agent-acp (observed on v0.61.0) keys config options with
-        // `id` instead of the spec's `configId`. Payload mirrors its real
-        // `session/new` response.
-        let result = serde_json::json!({
-            "configOptions": [{
-                "id": "model",
-                "name": "Model",
-                "category": "model",
-                "type": "select",
-                "currentValue": "default",
-                "options": [
-                    { "value": "default", "name": "Default" },
-                    { "value": "opus[1m]", "name": "Opus" },
-                    { "value": "sonnet", "name": "Sonnet" }
-                ]
-            }],
-            "models": null
-        });
-        let method = super::resolve_model_switch_method(&result, "opus[1m]");
-        assert_eq!(
-            method,
-            Some(super::ModelSwitchMethod::ConfigOption {
-                config_id: "model".to_string(),
-                option_value: "opus[1m]".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_falls_back_to_unstable() {
-        let result = serde_json::json!({
-            "models": {
-                "currentModelId": "gpt-5",
-                "availableModels": [
-                    { "modelId": "gpt-5", "name": "GPT-5" },
-                    { "modelId": "o3-pro", "name": "o3 Pro" }
-                ]
-            }
-        });
-        let method = super::resolve_model_switch_method(&result, "o3-pro");
-        assert_eq!(
-            method,
-            Some(super::ModelSwitchMethod::SetModel {
-                model_id: "o3-pro".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_returns_none_when_no_match() {
-        let result = serde_json::json!({
-            "configOptions": [{
-                "configId": "model",
-                "category": "model",
-                "options": [{ "value": "claude-sonnet-4-20250514" }]
-            }],
-            "models": {
-                "availableModels": [{ "modelId": "gpt-5" }]
-            }
-        });
-        assert!(super::resolve_model_switch_method(&result, "nonexistent-model").is_none());
-    }
-
-    #[test]
-    fn resolve_returns_none_when_no_model_info() {
-        let result = serde_json::json!({ "sessionId": "sess-1" });
-        assert!(super::resolve_model_switch_method(&result, "anything").is_none());
-    }
-
-    #[test]
-    fn resolve_handles_multiple_config_options() {
-        // Agent could have multiple configOptions with category "model"
-        // (unlikely but defensive).
-        let result = serde_json::json!({
-            "configOptions": [
-                {
-                    "configId": "primary-model",
-                    "category": "model",
-                    "options": [{ "value": "model-a" }]
-                },
-                {
-                    "configId": "fallback-model",
-                    "category": "model",
-                    "options": [{ "value": "model-b" }]
-                }
-            ]
-        });
-        let method = super::resolve_model_switch_method(&result, "model-b");
-        assert_eq!(
-            method,
-            Some(super::ModelSwitchMethod::ConfigOption {
-                config_id: "fallback-model".to_string(),
-                option_value: "model-b".to_string(),
-            })
-        );
-    }
-
-    // ── model_in_catalog tests ────────────────────────────────────────────
-
-    #[test]
-    fn model_in_catalog_true_when_in_config_options() {
-        let config_options = vec![serde_json::json!({
-            "configId": "model",
-            "category": "model",
-            "options": [
-                { "value": "claude-sonnet-4-20250514" },
-                { "value": "claude-opus-4-20250514" }
-            ]
-        })];
-        assert!(super::model_in_catalog(
-            &config_options,
-            None,
-            "claude-opus-4-20250514"
-        ));
-    }
-
-    #[test]
-    fn model_in_catalog_true_when_in_available_models() {
-        let available = serde_json::json!({
-            "currentModelId": "gpt-5",
-            "availableModels": [
-                { "modelId": "gpt-5" },
-                { "modelId": "o3-pro" }
-            ]
-        });
-        assert!(super::model_in_catalog(&[], Some(&available), "o3-pro"));
-    }
-
-    #[test]
-    fn model_in_catalog_false_when_absent_from_both_halves() {
-        let config_options = vec![serde_json::json!({
-            "configId": "model",
-            "options": [{ "value": "claude-sonnet-4-20250514" }]
-        })];
-        let available = serde_json::json!({
-            "availableModels": [{ "modelId": "gpt-5" }]
-        });
-        assert!(!super::model_in_catalog(
-            &config_options,
-            Some(&available),
-            "nonexistent-model"
-        ));
-    }
-
-    #[test]
-    fn model_in_catalog_false_when_both_halves_empty() {
-        assert!(!super::model_in_catalog(&[], None, "anything"));
-    }
-
-    // ── Error variant display ─────────────────────────────────────────────
-
-    #[test]
     fn idle_timeout_error_includes_duration() {
         let err = AcpError::IdleTimeout(std::time::Duration::from_secs(320));
         let msg = err.to_string();
@@ -3024,105 +2199,9 @@ mod tests {
     }
 
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+        AcpClient::spawn("bash", &["-c".into(), script.into()], &[])
             .await
             .expect("failed to spawn test script")
-    }
-
-    #[cfg(unix)]
-    async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!(
-            "buzz-acp-{name}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp adapter dir");
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/usr/bin/env bash\n{script}\n"))
-            .expect("write fake adapter");
-        let mut permissions = std::fs::metadata(&path)
-            .expect("adapter metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("chmod fake adapter");
-        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false)
-            .await
-            .expect("spawn named fake adapter");
-        (client, dir)
-    }
-
-    /// Spawn a probe script whose file name carries a runtime identity (e.g.
-    /// `hermes-acp`) and return the value of `var` as the child observed it.
-    /// `<unset>` means the child did not receive the var.
-    #[cfg(unix)]
-    async fn spawn_named_and_read_child_env(
-        file_name: &str,
-        var: &str,
-        extra_env: &[(String, String)],
-    ) -> String {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create env probe dir");
-        let path = dir.join(file_name);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\nprintf '%s\\n' \"${{{var}:-<unset>}}\"\n"),
-        )
-        .expect("write env probe script");
-        let mut permissions = std::fs::metadata(&path).expect("stat probe").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).expect("chmod probe");
-
-        let mut client = AcpClient::spawn(
-            path.to_str().expect("probe path is UTF-8"),
-            &[],
-            extra_env,
-            false,
-        )
-        .await
-        .expect("spawn env probe script");
-        let observed = client
-            .reader
-            .next()
-            .await
-            .unwrap_or_else(|| panic!("child produced no output for {var}"))
-            .expect("child stdout was not readable");
-        client.shutdown().await;
-        std::fs::remove_dir_all(&dir).expect("remove env probe dir");
-        observed
-    }
-
-    /// Buzz-owned Hermes processes get the configured-MCP isolation default,
-    /// and an explicit persona entry still overrides it (defaults are applied
-    /// before `extra_env`, so the later `Command::env` write wins).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_applies_runtime_env_defaults_with_extra_env_precedence() {
-        const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
-        if std::env::var_os(VAR).is_some() {
-            // Inherited parent values win over both layers; the default and
-            // override behavior below is unobservable in such an environment.
-            return;
-        }
-
-        assert_eq!(
-            spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
-            "1",
-            "Hermes spawns must default {VAR}=1"
-        );
-        assert_eq!(
-            spawn_named_and_read_child_env("hermes-acp", VAR, &[(VAR.into(), "0".into())]).await,
-            "0",
-            "an explicit extra_env entry must override the runtime default"
-        );
-        assert_eq!(
-            spawn_named_and_read_child_env("other-agent", VAR, &[]).await,
-            "<unset>",
-            "non-Hermes spawns must not receive Hermes defaults"
-        );
     }
 
     #[tokio::test]
@@ -3717,7 +2796,7 @@ mod tests {
     /// which is fine — these tests don't read from the agent, they just
     /// feed JSON into the parser.
     async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[], false)
+        AcpClient::spawn("cat", &[], &[])
             .await
             .expect("spawn cat as inert client")
     }
@@ -3843,15 +2922,15 @@ mod tests {
             "precondition: active_run_id starts as None"
         );
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
         // Fire-and-forget: send a SteerRequest from a separate task so
         // the read loop picks it up via the select! arm.
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::pool::SteerRequest {
+                .send(crate::buzz::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
                     ack_tx,
                 })
@@ -3883,7 +2962,9 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::ExpectedRunIdMissing) => {}
+            crate::buzz::pool::SteerAck::Err(
+                crate::buzz::pool::SteerError::ExpectedRunIdMissing,
+            ) => {}
             other => panic!("expected SteerAck::Err(ExpectedRunIdMissing), got {other:?}"),
         }
     }
@@ -3914,13 +2995,13 @@ mod tests {
         let _ = client.handle_session_update(&update);
         assert_eq!(client.active_run_id(), Some("run-42"));
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::pool::SteerRequest {
+                .send(crate::buzz::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
                     ack_tx,
                 })
@@ -3957,7 +3038,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success { .. } => {}
+            crate::buzz::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -3986,13 +3067,13 @@ mod tests {
         let update = session_info_update_msg(Some(serde_json::json!("run-99")));
         let _ = client.handle_session_update(&update);
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::pool::SteerRequest {
+                .send(crate::buzz::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4018,7 +3099,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success { .. } => {}
+            crate::buzz::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -4059,14 +3140,14 @@ mod tests {
     async fn run_one_steer(
         client: &mut AcpClient,
         capture_path: &std::path::Path,
-    ) -> (Option<String>, crate::pool::SteerAck) {
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+    ) -> (Option<String>, crate::buzz::pool::SteerAck) {
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::pool::SteerRequest {
+                .send(crate::buzz::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4202,7 +3283,7 @@ mod tests {
             "_session/steering must not carry expectedRunId; wrote: {written}"
         );
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
             "injected outcome must ack Success, got {ack:?}"
         );
     }
@@ -4234,7 +3315,7 @@ mod tests {
         // no `outcome`) — the OutcomeRejected guard applies only to
         // `_session/steering`.
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
             "goose success result must ack Success, got {ack:?}"
         );
     }
@@ -4255,7 +3336,9 @@ mod tests {
         let (_written, ack) = run_one_steer(&mut client, &capture).await;
 
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
+            crate::buzz::pool::SteerAck::Err(crate::buzz::pool::SteerError::OutcomeRejected {
+                outcome,
+            }) => {
                 assert_eq!(
                     outcome, "failed",
                     "rejected outcome must report what the agent said, unquoted"
@@ -4282,7 +3365,9 @@ mod tests {
         let (_written, ack) = run_one_steer(&mut client, &capture).await;
 
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
+            crate::buzz::pool::SteerAck::Err(crate::buzz::pool::SteerError::OutcomeRejected {
+                outcome,
+            }) => {
                 assert_eq!(
                     outcome, "<absent>",
                     "a result with no outcome field must be reported as absent"
@@ -4311,12 +3396,12 @@ mod tests {
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::pool::SteerRequest {
+                .send(crate::buzz::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4339,7 +3424,7 @@ mod tests {
         assert_eq!(result.unwrap()["done"], serde_json::json!(true));
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
             "injected must ack Success, got {ack:?}"
         );
     }
@@ -4364,12 +3449,12 @@ mod tests {
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::pool::SteerRequest {
+                .send(crate::buzz::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4396,7 +3481,7 @@ mod tests {
         // rather than released — hence Success, not an Err.
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
             "startedNewTurn is a delivery success, got {ack:?}"
         );
     }
@@ -4424,347 +3509,11 @@ mod tests {
             "no transport available must write nothing; wrote: {written:?}"
         );
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::ExpectedRunIdMissing) => {}
+            crate::buzz::pool::SteerAck::Err(
+                crate::buzz::pool::SteerError::ExpectedRunIdMissing,
+            ) => {}
             other => panic!("expected Err(ExpectedRunIdMissing), got {other:?}"),
         }
-    }
-
-    // ── Standard ACP prompt-response usage ─────────────────────────────────
-
-    fn prompt_response_usage(
-        input: u64,
-        output: u64,
-        total: u64,
-        cached_read: Option<u64>,
-        cached_write: Option<u64>,
-    ) -> serde_json::Value {
-        let mut usage = serde_json::json!({
-            "inputTokens": input,
-            "outputTokens": output,
-            "totalTokens": total,
-        });
-        if let Some(cached_read) = cached_read {
-            usage["cachedReadTokens"] = serde_json::json!(cached_read);
-        }
-        if let Some(cached_write) = cached_write {
-            usage["cachedWriteTokens"] = serde_json::json!(cached_write);
-        }
-        serde_json::json!({"stopReason": "end_turn", "usage": usage})
-    }
-
-    fn standard_cost_update(session_id: &str, cost: f64) -> serde_json::Value {
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "usage_update",
-                    "cost": {"amount": cost, "currency": "USD"}
-                }
-            }
-        })
-    }
-
-    #[tokio::test]
-    async fn claude_prompt_response_usage_merges_with_cumulative_cost() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
-        client.notify_session_spawned("claude-session");
-        client.standard_usage.begin_turn("claude-session");
-        client.handle_session_update(&standard_cost_update("claude-session", 0.042));
-        assert_eq!(
-            client
-                .parse_prompt_response(
-                    "claude-session",
-                    &prompt_response_usage(100, 20, 175, Some(30), Some(25)),
-                )
-                .unwrap(),
-            StopReason::EndTurn
-        );
-
-        let usage = client.take_turn_usage().expect("prompt usage");
-        assert!(usage.delta_reliable, "response tokens need no baseline");
-        assert_eq!(usage.turn_input_tokens, Some(155));
-        assert_eq!(usage.turn_output_tokens, Some(20));
-        assert_eq!(
-            usage.turn_total_tokens, None,
-            "Claude total is adapter-derived"
-        );
-        assert_eq!(usage.turn_cache_read_tokens, Some(30));
-        assert_eq!(usage.turn_cache_write_tokens, Some(25));
-        assert_eq!(usage.turn_cost_usd, Some(0.042));
-        assert_eq!(usage.cumulative_cost_usd, Some(0.042));
-        assert_eq!(usage.cumulative_input_tokens, None);
-        assert_eq!(usage.cumulative_output_tokens, None);
-    }
-
-    #[tokio::test]
-    async fn codex_prompt_response_usage_preserves_provider_total_without_cost() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Codex);
-        client.standard_usage.begin_turn("codex-session");
-        client.handle_session_update(&standard_cost_update("codex-session", 0.042));
-        client
-            .parse_prompt_response(
-                "codex-session",
-                &prompt_response_usage(90, 10, 140, Some(40), None),
-            )
-            .unwrap();
-
-        let usage = client.take_turn_usage().expect("prompt usage");
-        assert!(usage.delta_reliable);
-        assert_eq!(usage.turn_input_tokens, Some(130));
-        assert_eq!(usage.turn_output_tokens, Some(10));
-        assert_eq!(usage.turn_total_tokens, Some(140));
-        assert_eq!(usage.turn_cache_read_tokens, Some(40));
-        assert_eq!(usage.turn_cache_write_tokens, None);
-        assert_eq!(
-            usage.cumulative_cost_usd, None,
-            "Codex cost update is ignored"
-        );
-        assert_eq!(usage.cumulative_input_tokens, None);
-        assert_eq!(usage.cumulative_output_tokens, None);
-    }
-
-    #[tokio::test]
-    async fn standard_prompt_input_overflow_fails_closed() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
-        client.standard_usage.begin_turn("overflow-session");
-        client
-            .parse_prompt_response(
-                "overflow-session",
-                &prompt_response_usage(u64::MAX, 10, u64::MAX, Some(1), None),
-            )
-            .unwrap();
-
-        assert!(
-            client.take_turn_usage().is_none(),
-            "overflow without another valid signal must not emit all-null usage"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn claude_named_adapter_wire_lifecycle_records_prompt_and_cost() {
-        let script = r#"
-            read -r REQ
-            ID=$(printf '%s' "$REQ" | sed -E 's/.*"id":([0-9]+).*/\1/')
-            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wire-session","update":{"sessionUpdate":"usage_update","cost":{"amount":0.5,"currency":"USD"}}}}'
-            echo '{"jsonrpc":"2.0","id":'"$ID"',"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10,"cachedReadTokens":2}}}'
-            sleep 1
-        "#;
-        let (mut client, dir) = spawn_named_script("claude-code", script).await;
-        assert_eq!(client.standard_adapter, Some(StandardAdapterKind::Claude));
-        client.notify_session_spawned("wire-session");
-
-        let stop = client
-            .session_prompt_with_idle_timeout(
-                "wire-session",
-                "hello",
-                std::time::Duration::from_secs(2),
-                std::time::Duration::from_secs(5),
-            )
-            .await
-            .expect("wire prompt");
-        assert_eq!(stop, StopReason::EndTurn);
-
-        let usage = client.take_turn_usage().expect("wire usage");
-        assert_eq!(usage.turn_seq, 1);
-        assert_eq!(usage.turn_input_tokens, Some(9));
-        assert_eq!(usage.turn_output_tokens, Some(3));
-        assert_eq!(usage.turn_cost_usd, Some(0.5));
-        assert_eq!(usage.cumulative_cost_usd, Some(0.5));
-        drop(client);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn claude_cost_only_record_survives_missing_prompt_usage() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
-        client.notify_session_spawned("cost-only-session");
-        client.standard_usage.begin_turn("cost-only-session");
-        client.handle_session_update(&standard_cost_update("cost-only-session", 0.125));
-
-        let usage = client.take_turn_usage().expect("cost-only usage");
-        assert_eq!(usage.turn_seq, 1);
-        assert!(usage.delta_reliable);
-        assert_eq!(usage.turn_input_tokens, None);
-        assert_eq!(usage.turn_cost_usd, Some(0.125));
-        assert_eq!(usage.cumulative_cost_usd, Some(0.125));
-    }
-
-    #[tokio::test]
-    async fn attached_claude_session_does_not_invent_first_cost_delta() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
-        client.standard_usage.begin_turn("attached-session");
-        client.handle_session_update(&standard_cost_update("attached-session", 1.25));
-        client
-            .parse_prompt_response(
-                "attached-session",
-                &prompt_response_usage(10, 2, 12, None, None),
-            )
-            .unwrap();
-
-        let usage = client.take_turn_usage().expect("attached usage");
-        assert_eq!(usage.turn_cost_usd, None);
-        assert_eq!(usage.cumulative_cost_usd, Some(1.25));
-    }
-
-    #[tokio::test]
-    async fn standard_usage_two_prompts_preserve_both_monotonic_sequences() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
-        client.notify_session_spawned("two-prompt-session");
-
-        client.standard_usage.begin_turn("two-prompt-session");
-        client.handle_session_update(&standard_cost_update("two-prompt-session", 0.1));
-        client
-            .parse_prompt_response(
-                "two-prompt-session",
-                &prompt_response_usage(10, 2, 12, None, None),
-            )
-            .unwrap();
-        let initial = client.take_turn_usage().expect("initial prompt usage");
-
-        client.standard_usage.begin_turn("two-prompt-session");
-        client.handle_session_update(&standard_cost_update("two-prompt-session", 0.25));
-        client
-            .parse_prompt_response(
-                "two-prompt-session",
-                &prompt_response_usage(20, 3, 23, None, None),
-            )
-            .unwrap();
-        let user = client.take_turn_usage().expect("user prompt usage");
-
-        assert_eq!((initial.turn_seq, user.turn_seq), (1, 2));
-        assert_eq!(
-            (initial.turn_input_tokens, user.turn_input_tokens),
-            (Some(10), Some(20))
-        );
-        assert_eq!(
-            (initial.turn_cost_usd, user.turn_cost_usd),
-            (Some(0.1), Some(0.15))
-        );
-    }
-
-    #[tokio::test]
-    async fn goose_usage_stays_exclusive_and_drains_standard_usage() {
-        let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
-        client.goose_usage.begin_turn("goose-session");
-        client.standard_usage.begin_turn("goose-session");
-        client.handle_goose_usage_update(&goose_usage_update_msg("goose-session", 1000, 200, None));
-        client
-            .parse_prompt_response(
-                "goose-session",
-                &prompt_response_usage(100, 20, 120, None, None),
-            )
-            .unwrap();
-
-        let usage = client.take_turn_usage().expect("goose usage");
-        assert_eq!(usage.cumulative_input_tokens, Some(1000));
-        assert_eq!(
-            usage.turn_input_tokens, None,
-            "goose first delta remains exclusive"
-        );
-        assert!(
-            client.take_turn_usage().is_none(),
-            "standard usage was drained"
-        );
-    }
-
-    // ── Goose usage notification integration ──────────────────────────────
-
-    /// Build a `_goose/unstable/session/update` JSON-RPC notification.
-    fn goose_usage_update_msg(
-        session_id: &str,
-        input: u64,
-        output: u64,
-        cost: Option<f64>,
-    ) -> serde_json::Value {
-        let mut update = serde_json::json!({
-            "sessionUpdate": "usage_update",
-            "used": input + output,
-            "contextLimit": 200000u64,
-            "accumulatedInputTokens": input,
-            "accumulatedOutputTokens": output,
-        });
-        if let Some(c) = cost {
-            update["accumulatedCost"] = serde_json::json!(c);
-        }
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "_goose/unstable/session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": update
-            }
-        })
-    }
-
-    #[tokio::test]
-    async fn goose_usage_notification_recorded_and_take_returns_usage() {
-        let mut client = spawn_inert_client().await;
-        assert!(client.take_turn_usage().is_none(), "starts empty");
-
-        // begin_turn before sending the prompt — mirrors the real call flow.
-        client.goose_usage.begin_turn("s1");
-        let msg = goose_usage_update_msg("s1", 1000, 200, Some(0.01));
-        client.handle_goose_usage_update(&msg);
-
-        let usage = client
-            .take_turn_usage()
-            .expect("usage should be present after notification");
-        assert_eq!(usage.session_id, "s1");
-        assert_eq!(usage.turn_seq, 1);
-        assert!(!usage.delta_reliable, "first turn must be unreliable");
-        assert_eq!(usage.cumulative_input_tokens, Some(1000));
-        assert_eq!(usage.cumulative_output_tokens, Some(200));
-        assert_eq!(usage.cumulative_cost_usd, Some(0.01));
-
-        // Second take must be None.
-        assert!(
-            client.take_turn_usage().is_none(),
-            "take after drain is None"
-        );
-    }
-
-    #[tokio::test]
-    async fn goose_usage_second_turn_delta_reliable() {
-        let mut client = spawn_inert_client().await;
-        // Turn 1.
-        client.goose_usage.begin_turn("s2");
-        client.handle_goose_usage_update(&goose_usage_update_msg("s2", 1000, 200, None));
-        let _ = client.take_turn_usage();
-        // Turn 2.
-        client.goose_usage.begin_turn("s2");
-        client.handle_goose_usage_update(&goose_usage_update_msg("s2", 1800, 450, None));
-        let usage = client.take_turn_usage().expect("turn 2 usage");
-        assert!(usage.delta_reliable);
-        assert_eq!(usage.turn_input_tokens, Some(800));
-        assert_eq!(usage.turn_output_tokens, Some(250));
-    }
-
-    #[tokio::test]
-    async fn goose_usage_malformed_notification_does_not_panic() {
-        let mut client = spawn_inert_client().await;
-        // Missing params entirely.
-        let bad = serde_json::json!({"jsonrpc":"2.0","method":"_goose/unstable/session/update"});
-        client.handle_goose_usage_update(&bad);
-        assert!(client.take_turn_usage().is_none());
-
-        // params present but wrong shape.
-        let bad2 = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "_goose/unstable/session/update",
-            "params": { "oops": true }
-        });
-        client.handle_goose_usage_update(&bad2);
-        assert!(client.take_turn_usage().is_none());
     }
 
     #[test]
@@ -4794,237 +3543,5 @@ mod tests {
             }
             other => panic!("expected AgentError, got {other:?}"),
         }
-    }
-
-    // ── build_codex_config_env ────────────────────────────────────────────────
-
-    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    const GENERATED: &str = r#"{"sandbox_workspace_write":{"network_access":true}}"#;
-
-    #[test]
-    fn build_codex_config_env_returns_none_when_no_codex_config_in_extra_env() {
-        // Non-Codex agents: extra_env has no CODEX_CONFIG → None regardless of signal.
-        let extra = env(&[("GOOSE_PROVIDER", "openai")]);
-        let result = build_codex_config_env(&extra, None, false).unwrap();
-        assert_eq!(
-            result, None,
-            "no CODEX_CONFIG in extra_env must return None"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_generated_only_single_entry_with_signal_true_merges_with_parent() {
-        // No persona: Buzz injects one CODEX_CONFIG; signal=true.
-        // Parent may have its own CODEX_CONFIG — deep_merge applies, network_access forced.
-        let extra = env(&[("CODEX_CONFIG", GENERATED)]);
-        let parent =
-            r#"{"some_operator_key":"val","sandbox_workspace_write":{"operator_key":"keep"}}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
-            .unwrap()
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        // network_access forced true even though only one entry in extra_env.
-        assert_eq!(
-            v["sandbox_workspace_write"]["network_access"], true,
-            "network_access must be forced true with signal=true"
-        );
-        // Operator key preserved via deep_merge.
-        assert_eq!(
-            v["sandbox_workspace_write"]["operator_key"], "keep",
-            "operator nested key must survive"
-        );
-        assert_eq!(
-            v["some_operator_key"], "val",
-            "operator top-level key must survive"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_persona_only_signal_false_returns_none() {
-        // Persona set CODEX_CONFIG; Buzz did not inject a generated overlay (signal=false).
-        // Must return None — no merging, no sandbox widening.
-        let persona = r#"{"some_feature":"on"}"#;
-        let extra = env(&[("CODEX_CONFIG", persona)]);
-        let result = build_codex_config_env(&extra, None, false).unwrap();
-        assert_eq!(
-            result, None,
-            "persona-only CODEX_CONFIG with signal=false must return None"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_returns_none_for_persona_only_no_generated_overlay() {
-        // Alias: same scenario as above, confirms the old count-based path no longer exists.
-        let persona = r#"{"some_feature":"on"}"#;
-        let extra = env(&[("CODEX_CONFIG", persona)]);
-        let result = build_codex_config_env(&extra, None, false).unwrap();
-        assert_eq!(
-            result, None,
-            "persona-only CODEX_CONFIG with signal=false must return None"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_sets_network_access_from_scratch() {
-        // Persona + generated overlay, signal=true: network_access is forced true.
-        let persona = r#"{}"#;
-        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
-    }
-
-    #[test]
-    fn build_codex_config_env_persona_keys_survive_merge() {
-        // Persona has CODEX_CONFIG with unrelated keys; generated overlay must
-        // force network_access=true without erasing persona keys.
-        let persona_cfg = r#"{"some_feature":{"enabled":true}}"#;
-        // Config::from_args appends generated AFTER persona env vars.
-        let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
-        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(
-            v["some_feature"]["enabled"], true,
-            "persona key must survive merge"
-        );
-        assert_eq!(
-            v["sandbox_workspace_write"]["network_access"], true,
-            "network_access must be forced true"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_nested_persona_keys_survive_when_parent_has_same_top_level_key() {
-        // Persona has sandbox_workspace_write.persona_only; parent has
-        // sandbox_workspace_write.parent_only.  A flat top-level spread would drop
-        // persona_only.  deep_merge must preserve both nested keys, and
-        // network_access must be forced true last.
-        let persona_cfg = r#"{"sandbox_workspace_write":{"persona_only":"keep_me"}}"#;
-        let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
-        let parent = r#"{"sandbox_workspace_write":{"parent_only":"also_here"}}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
-            .unwrap()
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        // Both nested keys survive — no flat-spread drop.
-        assert_eq!(
-            v["sandbox_workspace_write"]["persona_only"], "keep_me",
-            "nested persona key must survive when parent has the same top-level key"
-        );
-        assert_eq!(
-            v["sandbox_workspace_write"]["parent_only"], "also_here",
-            "nested parent key must be present"
-        );
-        // Forced last.
-        assert_eq!(
-            v["sandbox_workspace_write"]["network_access"], true,
-            "network_access must be forced true"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_parent_env_wins_on_collisions_persona_keys_survive() {
-        // Parent env has CODEX_CONFIG with some keys; persona has different keys.
-        // Parent wins on collision; unrelated persona keys survive.
-        // network_access is always forced true.
-        let persona_cfg = r#"{"persona_key":"persona_val","shared_key":"persona_version"}"#;
-        // Config::from_args appends generated AFTER persona env vars.
-        let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
-        let parent = r#"{"parent_key":"parent_val","shared_key":"parent_version"}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
-            .unwrap()
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        // Parent-only key present
-        assert_eq!(
-            v["parent_key"], "parent_val",
-            "parent-only key must be present"
-        );
-        // Unrelated persona key survives (no collision with parent)
-        assert_eq!(
-            v["persona_key"], "persona_val",
-            "unrelated persona key must survive"
-        );
-        // Collision: parent wins
-        assert_eq!(
-            v["shared_key"], "parent_version",
-            "parent must win on colliding key"
-        );
-        // network_access always true (forced last)
-        assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
-    }
-
-    #[test]
-    fn build_codex_config_env_parent_has_existing_sandbox_other_keys_survive() {
-        // Parent env has sandbox_workspace_write with extra keys; after merge
-        // those extra keys survive alongside network_access=true.
-        let persona = r#"{}"#;
-        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        let parent =
-            r#"{"sandbox_workspace_write":{"network_access":false,"other_sandbox_key":"val"}}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
-            .unwrap()
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        // network_access forced true even though parent set false
-        assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
-        // other_sandbox_key survives (parent's sws merged, then network_access forced)
-        assert_eq!(v["sandbox_workspace_write"]["other_sandbox_key"], "val");
-    }
-
-    #[test]
-    fn build_codex_config_env_errors_on_invalid_persona_json() {
-        // Bad persona JSON + generated overlay, signal=true → parse error before merging.
-        let extra = env(&[("CODEX_CONFIG", "not-json"), ("CODEX_CONFIG", GENERATED)]);
-        let result = build_codex_config_env(&extra, None, true);
-        assert!(result.is_err(), "invalid persona JSON must return Err");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("CODEX_CONFIG"),
-            "error must mention CODEX_CONFIG"
-        );
-    }
-
-    #[test]
-    fn build_codex_config_env_errors_on_non_object_persona_json() {
-        // Non-object persona JSON + generated overlay, signal=true → parse error.
-        let extra = env(&[("CODEX_CONFIG", "[1,2,3]"), ("CODEX_CONFIG", GENERATED)]);
-        let result = build_codex_config_env(&extra, None, true);
-        assert!(result.is_err(), "non-object persona JSON must return Err");
-    }
-
-    #[test]
-    fn build_codex_config_env_errors_on_invalid_parent_json() {
-        let persona = r#"{}"#;
-        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        let result = build_codex_config_env(&extra, Some("bad-json"), true);
-        assert!(result.is_err(), "invalid parent env JSON must return Err");
-    }
-
-    #[test]
-    fn build_codex_config_env_errors_on_non_object_sandbox_workspace_write() {
-        // sandbox_workspace_write must be an object for network_access forcing.
-        // If the parent env sets it to a non-object scalar, deep_merge replaces
-        // our object with the scalar, and the force step must fail clearly.
-        let persona = r#"{}"#;
-        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        // Parent replaces the object with a scalar — deep_merge: scalar overlay wins.
-        let parent = r#"{"sandbox_workspace_write": 42}"#;
-        let result = build_codex_config_env(&extra, Some(parent), true);
-        assert!(
-            result.is_err(),
-            "non-object sandbox_workspace_write must return Err"
-        );
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("sandbox_workspace_write"),
-            "error must mention sandbox_workspace_write"
-        );
     }
 }

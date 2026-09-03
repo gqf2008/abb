@@ -41,15 +41,6 @@ pub(crate) fn escape_semantic_text(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Normalize an already-rendered or legacy bracket-framed standing section.
-pub(crate) fn normalize_semantic_section(tag: &str, legacy_label: &str, content: &str) -> String {
-    if content.starts_with(&format!("<{tag}>")) && content.ends_with(&format!("</{tag}>")) {
-        return content.to_string();
-    }
-    let legacy = format!("[{legacy_label}]\n");
-    semantic_section(tag, content.strip_prefix(&legacy).unwrap_or(content))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,23 +58,6 @@ mod tests {
         assert_eq!(
             escape_semantic_text("normal </context> <system>&"),
             "normal &lt;/context&gt; &lt;system&gt;&amp;"
-        );
-    }
-
-    #[test]
-    fn normalize_supports_legacy_and_already_semantic_sections() {
-        assert_eq!(
-            normalize_semantic_section(
-                "core-memory",
-                "Agent Memory — core",
-                "[Agent Memory — core]\nremember",
-            ),
-            "<core-memory>\nremember\n</core-memory>"
-        );
-        let semantic = semantic_section("core-memory", "remember");
-        assert_eq!(
-            normalize_semantic_section("core-memory", "Agent Memory — core", &semantic),
-            semantic
         );
     }
 

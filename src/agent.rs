@@ -25,7 +25,7 @@ pub enum Backend {
     Claude,
     Codex,
     Pi,
-    /// #200：buzz-acp/buzz-agent 执行层（mini-relay 路径）。
+    /// #200：buzz = 外部 ACP 适配器执行层（harness → pi-acp）。
     Buzz,
 }
 
@@ -52,7 +52,7 @@ impl Backend {
             Backend::Buzz => "buzz",
         }
     }
-    /// #200：buzz 是「不经 CLI 执行」的后端（走 mini-relay → buzz-acp）。所有需要
+    /// #200：buzz 是「不经 CLI 执行」的后端（走 harness → ACP 适配器）。所有需要
     /// 判断这一点的入口用它——审查 #205r2 数出五种拼写（`== Buzz` / `matches!` /
     /// 两处字符串解析），下次改后端策略必然漏。
     pub fn is_buzz(&self) -> bool {
@@ -517,7 +517,7 @@ pub async fn run(
     if prompt.is_empty() {
         return Err("（空消息，没收到内容）".into());
     }
-    // #200：buzz 后端不经 CLI run 路径——聊天侧由 bridge dispatch 写 mini-relay，
+    // #200：buzz 后端不经 CLI run 路径——聊天侧由 bridge dispatch 写 ACP harness，
     // 旁路调用方（run_job 定时任务 / session_gc 会话归纳）在此拒绝并给出人话错误。
     // 没有这道守卫：它们会撞 run_once 的 unreachable! panic（panic 被 tasks 捕获
     // 只留 stderr，且 run_job 的去重槽位/取消标志泄漏——审查 #205）。
@@ -1425,7 +1425,7 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
 /// #123 同根因加固（2026-08-27）：codex 分支补 `--skip-git-repo-check`（非 git 目录
 /// 下 codex 拒绝执行 → 空输出），stderr 改管道透传（失败原因可定位，不再静默空结果）。
 pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
-    // #200：buzz 是 ACP 常驻执行层（mini-relay 驱动），一次性 CLI spawn 不适用——
+    // #200：buzz 是 ACP 常驻执行层（harness 驱动），一次性 CLI spawn 不适用——
     // 裸起 buzz-agent 无 ACP 握手，只会挂到超时/空输出（审查 #205）。GUI「✨生成」
     // 按钮对 buzz bot 给明确错误（调用方展示 err）。
     if backend.is_buzz() {
@@ -1582,11 +1582,11 @@ async fn run_once(
 
     let mut cmd = match backend {
         Backend::Buzz => {
-            // #200：buzz 后端不经 run_once spawn（走 mini-relay → buzz-acp → buzz-agent）。
+            // #200：buzz 后端不经 run_once spawn（走 ACP harness → pi-acp）。
             // 到达本函数的前置守卫：聊天侧 bridge.handle 短路（dispatch 写 relay）、
             // 旁路侧 agent::run 入口拒绝（run_job/session_gc，审查 #205）——此臂仅
             // 为 match 完整性保留，unreachable 作 tripwire。
-            unreachable!("buzz backend is dispatched via mini-relay, not run_once")
+            unreachable!("buzz backend is dispatched via ACP harness, not run_once")
         }
         Backend::Codex => {
             // codex 多轮上下文（对齐 claude）：首轮 `codex exec`，后续轮 `codex exec resume <tid>`。
@@ -1910,7 +1910,7 @@ async fn run_once(
 
     let reply = match backend {
         Backend::Buzz => {
-            unreachable!("buzz backend is dispatched via mini-relay, not run_once")
+            unreachable!("buzz backend is dispatched via ACP harness, not run_once")
         }
         Backend::Codex => pending.take().filter(|s| !s.is_empty()).ok_or_else(|| {
             AttemptErr::Failed(format!("⚠️ codex 没有输出。{}", stderr_tail(&stderr_text)))
