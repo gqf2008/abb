@@ -1,0 +1,75 @@
+# ABB 分叉：buzz-agent（上游 buzz crates/buzz-agent 裁剪移植，独立自持 manifest）
+#
+# 来源：block/sprout 的 crates/buzz-agent（自维护分叉，不再跟上游）。
+# 同步规则：上游改动经 git diff 人工合并入本分叉；禁止反向污染上游。
+# 本分叉差异（相对上游）：
+#   - agent.rs：文本直答回合 EndTurn 前补最终 steer drain（steer 接受即必须
+#     在回合内消化，否则 in-flight 期间到达的 steer 随回合结束静默丢弃）
+#     （2026-09-03 e2e 实测缺陷，ABB #200 验收时修复）。
+#   - workspace 继承全部展开为直接值（独立包，不挂任何 workspace）。
+#   - model_capabilities.rs 的 include_str!/regen 写回路径自 `../../../scripts/`
+#     改为包内 `../scripts/`——两 JSON（model-capabilities / normative-corpus，
+#     上游 workspace 根 scripts/ 下）随包 vendor 于 scripts/，同步时一并更新。
+#
+# 构建：cargo build --release --manifest-path crates/buzz-agent/Cargo.toml
+# （ABB release.yml 同构打包进 .app；buzz_agent_exe 指向随包产物）
+#
+[package]
+name = "buzz-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/gqf2008/abb"
+description = "Minimal, unbreakable ACP-compliant agent. Non-streaming. Tool-calls-as-output."
+readme = "README.md"
+keywords = ["acp", "agent", "llm", "mcp", "minimal"]
+categories = ["command-line-utilities", "web-programming"]
+
+[lib]
+name = "buzz_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-agent"
+path = "src/main.rs"
+
+# Test-only fake MCP server. Built unconditionally because cargo can't gate
+# bins on `cfg(test)`, but it's tiny and only used by integration tests.
+[[bin]]
+name = "fake-mcp"
+path = "tests/bin/fake_mcp.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "process", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process"] }
+arc-swap = "1"
+getrandom = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OAuth 2.0 PKCE for Databricks (and future browser-auth providers).
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.11"
+url = "2"
+urlencoding = "2"
+webbrowser = "1"
+dirs = "6"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "process", "io-std"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+tempfile = "3"
