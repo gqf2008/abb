@@ -259,6 +259,9 @@ fn signature_state(pid: i32) -> SignatureState {
     const ERR_CS_UNSIGNED: i32 = -67062;
     const ERR_CS_REQ_FAILED: i32 = -67072;
 
+    // 多 framework 链接是惯用写法；clippy::duplicated_attributes 只比属性路径
+    // 不看 name，双 #[link] 必误报——就地豁免
+    #[allow(clippy::duplicated_attributes)]
     #[link(name = "Security", kind = "framework")]
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
@@ -473,6 +476,8 @@ fn key_for(ch: char) -> Option<(u32, bool)> {
 }
 
 #[cfg(target_os = "macos")]
+// 同上：多 framework 链接双 #[link] 误报豁免
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "IOKit", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {

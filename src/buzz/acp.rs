@@ -2948,14 +2948,12 @@ mod tests {
 
     // ── Goose-native steer scaffold (PR follow-up to #1160) ──────────────
 
-    /// Helper: spawn an inert `cat` subprocess so we have a real AcpClient
-    /// to drive `handle_session_update` against. `cat` never writes back,
-    /// which is fine — these tests don't read from the agent, they just
-    /// feed JSON into the parser.
+    /// Helper: spawn an inert echo peer（原 bash `cat`——进程内 duplex 版）
+    /// so we have a real AcpClient to drive `handle_session_update` against.
+    /// It never writes anything *new* — these tests don't read from the
+    /// agent, they just feed JSON into the parser.
     async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[])
-            .await
-            .expect("spawn cat as inert client")
+        spawn_script(vec![EchoAll]).await
     }
 
     /// Build a `session/update` JSON-RPC notification carrying a
