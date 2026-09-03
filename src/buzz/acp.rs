@@ -10,7 +10,7 @@
 
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::process::Child;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
@@ -135,13 +135,16 @@ fn build_initialize_params() -> serde_json::Value {
 /// same client via repeated calls to [`session_new`](AcpClient::session_new).
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
-    child: Child,
+    /// 进程内双工传输（测试 [`Self::connect`]）时为 `None`——无进程可杀，
+    /// EOF 语义由对端半边 drop 产生（与子进程退出等价）。
+    child: Option<Child>,
     /// Write end of the agent's stdin pipe.
-    stdin: ChildStdin,
+    /// Box 化以兼容子进程管道与测试 duplex 两种传输（协议层零分叉）。
+    stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
     /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
     /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
-    reader: FramedRead<ChildStdout, LinesCodec>,
+    reader: FramedRead<Box<dyn tokio::io::AsyncRead + Unpin + Send>, LinesCodec>,
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
@@ -271,6 +274,10 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
+        // 进程内双工（测试）无子进程：清理由 Drop 半边自然完成，直接返回。
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -278,16 +285,16 @@ impl AcpClient {
         //
         // Falls back to start_kill() (direct child only) on non-Unix or if
         // the child has been polled to completion (id() returns None).
-        match self.child.id() {
+        match child.id() {
             Some(pid) if kill_process_group(pid) => {}
             _ => {
-                let _ = self.child.start_kill();
+                let _ = child.start_kill();
             }
         }
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
             Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
@@ -343,7 +350,21 @@ impl AcpClient {
             .take()
             .ok_or_else(|| AcpError::Protocol("failed to open agent stdout".into()))?;
 
-        Ok(Self {
+        Ok(Self::from_transport(
+            Some(child),
+            Box::new(stdin),
+            Box::new(stdout),
+        ))
+    }
+
+    /// 协议层公共构造：子进程管道（生产 spawn）与进程内 duplex（测试 connect）
+    /// 共用——帧编解码、读循环、steer 记账完全同码。
+    fn from_transport(
+        child: Option<Child>,
+        stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    ) -> Self {
+        Self {
             child,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
@@ -357,7 +378,17 @@ impl AcpClient {
             steer_rx: None,
             turn_text: String::new(),
             turn_session: None,
-        })
+        }
+    }
+
+    /// 进程内双工通道构造（测试专用）：对端是 tokio task 而非子进程——
+    /// 原 bash 脚本 mock 依赖 Unix shell 语义（sleep/cat/路径内嵌），windows 上
+    /// 起进程即退（CI 31 例 AgentExited）；duplex 三平台行为一致且更快。
+    /// 协议层与 [`Self::spawn`] 完全同码（见 [`Self::from_transport`]）。
+    #[cfg(test)]
+    fn connect(io: tokio::io::DuplexStream) -> Self {
+        let (reader, stdin) = tokio::io::split(io);
+        Self::from_transport(None, Box::new(stdin), Box::new(reader))
     }
 
     /// Start a new turn: clear accumulated reply text. Must be called by the
@@ -1765,18 +1796,22 @@ pub enum SystemPromptTransport<'a> {
 
 impl Drop for AcpClient {
     fn drop(&mut self) {
+        // 进程内双工（测试）无子进程：半边随 Self 一起 drop 即对端 EOF。
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
-        match self.child.id() {
+        match child.id() {
             Some(pid) if kill_process_group(pid) => {}
             _ => {
-                let _ = self.child.start_kill();
+                let _ = child.start_kill();
             }
         }
         // Non-blocking reap attempt — prevents zombie accumulation in the
         // common case where SIGKILL takes effect before Drop returns.
-        let _ = self.child.try_wait();
+        let _ = child.try_wait();
     }
 }
 
@@ -2198,15 +2233,119 @@ mod tests {
         );
     }
 
-    async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[])
-            .await
-            .expect("failed to spawn test script")
+    /// 进程内 mock agent 剧本步骤（替代原 bash 脚本——sleep/cat/单引号拼接/反斜杠
+    /// 路径内嵌在 windows 上语义不稳：CI 31 例 AgentExited 全部源于此）。三平台
+    /// 一致、更快、无 PATH 依赖；协议字节与原 bash 版逐字一致（Emit 原文输出）。
+    #[derive(Debug, Clone)]
+    enum Step {
+        /// 写一行（LF 结尾）；`{captured}` 占位符替换为最近一次 ReadLine 的原始行
+        /// （等价原脚本的 `'"$VAR"'` 拼接）。
+        Emit(String),
+        /// 读客户端一行（超时 ms）；读到存入 captured，超时/EOF 继续后续步骤
+        /// （等价 bash `read -t N _var`：失败不中断顺序）。
+        ReadLine(u64),
+        /// 静默存活 ms（模拟 agent 处理中不输出；期间不读不写）。
+        SleepMs(u64),
+        /// 每 every_ms 输出 line 共 count 行（0=无限直到客户端断开；等价
+        /// `for i in $(seq 1 N)` / `while true` 洪水形态）。
+        Flood(String, u64, u64),
+        /// 把 captured 原样写入文件（steer 请求捕获断言；等价 `printf '%s' > path`）。
+        CaptureTo(String),
+        /// 全双工回显直到 EOF（等价 `cat`：惰性对端，请求原样反弹）。
+        EchoAll,
+        /// 立即关闭对端（客户端读到 EOF → AgentExited；等价 `exit 0`）。
+        Exit,
+    }
+
+    use Step::{CaptureTo, EchoAll, Emit, Exit, Flood, ReadLine, SleepMs};
+
+    /// 逐步执行剧本；跑完即 drop 半边（客户端读到 EOF，等价脚本结束进程退出）。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_mock_agent(
+        rx: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        mut wx: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        steps: Vec<Step>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        // split::ReadHalf 不实现 AsyncBufRead，BufReader 包装后读行
+        let mut br = tokio::io::BufReader::new(rx);
+        let mut captured = String::new();
+        for step in steps {
+            match step {
+                Emit(line) => {
+                    let line = line.replace("{captured}", &captured);
+                    if wx.write_all(line.as_bytes()).await.is_err()
+                        || wx.write_all(b"\n").await.is_err()
+                    {
+                        return;
+                    }
+                    let _ = wx.flush().await;
+                }
+                ReadLine(timeout_ms) => {
+                    let mut buf = Vec::new();
+                    let fut = br.read_until(b'\n', &mut buf);
+                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut)
+                        .await
+                    {
+                        Ok(Ok(0)) | Err(_) => {} // EOF/超时：继续后续步骤（bash read -t 同语义）
+                        Ok(Ok(_)) => {
+                            captured = String::from_utf8_lossy(&buf)
+                                .trim_end_matches(['\n', '\r'])
+                                .to_string();
+                        }
+                        Ok(Err(_)) => return, // 读错误：对端已断，结束 mock
+                    }
+                }
+                SleepMs(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                Flood(line, every_ms, count) => {
+                    let mut sent = 0u64;
+                    loop {
+                        if count > 0 && sent >= count {
+                            break;
+                        }
+                        sent += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+                        let line = line.replace("{captured}", &captured);
+                        if wx.write_all(line.as_bytes()).await.is_err()
+                            || wx.write_all(b"\n").await.is_err()
+                        {
+                            return;
+                        }
+                        let _ = wx.flush().await;
+                    }
+                }
+                CaptureTo(path) => {
+                    if std::fs::write(&path, captured.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+                EchoAll => loop {
+                    let mut buf = Vec::new();
+                    match br.read_until(b'\n', &mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {
+                            if wx.write_all(&buf).await.is_err() {
+                                return;
+                            }
+                            let _ = wx.flush().await;
+                        }
+                    }
+                },
+                Exit => return,
+            }
+        }
+    }
+
+    async fn spawn_script(steps: Vec<Step>) -> AcpClient {
+        let (client_io, agent_io) = tokio::io::duplex(64 * 1024);
+        let (agent_rx, agent_wx) = tokio::io::split(agent_io);
+        tokio::spawn(run_mock_agent(agent_rx, agent_wx, steps));
+        AcpClient::connect(client_io)
     }
 
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
-        let mut client = spawn_script("sleep 10").await;
+        let mut client = spawn_script(vec![SleepMs(10_000)]).await;
         let max_dur = std::time::Duration::from_secs(30);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
@@ -2226,7 +2365,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_timeout_fires_when_deadline_is_immediate() {
-        let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
+        let mut client = spawn_script(vec![Flood("noise".into(), 10, 0)]).await;
         let max_dur = std::time::Duration::from_millis(1);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2254,7 +2393,7 @@ mod tests {
     async fn cancel_with_cleanup_grace_maps_expiry_to_cancel_drain_timeout() {
         // Agent ignores `session/cancel` on stdin and keeps producing noise
         // forever — never drains within the grace window.
-        let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
+        let mut client = spawn_script(vec![Flood("noise".into(), 10, 0)]).await;
         client.last_prompt_id = Some(999);
         let grace = std::time::Duration::from_millis(200);
         let result = client
@@ -2270,9 +2409,10 @@ mod tests {
     async fn idle_resets_on_stdout_activity() {
         // Send valid JSON (session/update notifications) to reset the idle timer.
         // Non-JSON lines no longer reset idle — only valid JSON notifications do.
-        let mut client = spawn_script(
-            r#"for i in $(seq 1 10); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}}}}'; sleep 0.05; done; sleep 10"#,
-        )
+        let mut client = spawn_script(vec![
+            Flood(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}}}}"#.to_string(), 50, 10),
+            SleepMs(10_000),
+        ])
         .await;
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2295,9 +2435,10 @@ mod tests {
 
     #[tokio::test]
     async fn response_returned_when_matching_id_arrives() {
-        let mut client =
-            spawn_script(r#"echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#)
-                .await;
+        let mut client = spawn_script(vec![Emit(
+            r#"{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}"#.to_string(),
+        )])
+        .await;
         let max_dur = std::time::Duration::from_secs(5);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
@@ -2315,7 +2456,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_exit_detected_as_eof() {
-        let mut client = spawn_script("exit 0").await;
+        let mut client = spawn_script(vec![Exit]).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let max_dur = std::time::Duration::from_secs(5);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2340,12 +2481,12 @@ mod tests {
         // whose id matches what we're waiting for (0), then sends the real
         // response. The request should be dispatched (triggering -32601 since
         // "test/method" is unknown), and the real response should be returned.
-        let script = r#"
-            echo '{"jsonrpc":"2.0","id":0,"method":"test/method","params":{}}'
-            read -t 2 _reply
-            echo '{"jsonrpc":"2.0","id":0,"result":{"ok":true}}'
-            sleep 1
-        "#;
+        let script = vec![
+            Emit(r#"{"jsonrpc":"2.0","id":0,"method":"test/method","params":{}}"#.to_string()),
+            ReadLine(2_000),
+            Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"ok":true}}"#.to_string()),
+            SleepMs(1000),
+        ];
         let mut client = spawn_script(script).await;
         let max_dur = std::time::Duration::from_secs(5);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2364,7 +2505,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_fires_before_hard_when_idle_is_shorter() {
-        let mut client = spawn_script("sleep 10").await;
+        let mut client = spawn_script(vec![SleepMs(10_000)]).await;
         let idle = std::time::Duration::from_millis(100);
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2407,9 +2548,11 @@ mod tests {
         // this, fast hardware drains a bounded loop in < hard_deadline
         // and the reader hits EOF (`AgentExited`) before the timer fires,
         // masking whether the pre-select check actually works.
-        let mut client = spawn_script(
-            r#"while :; do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}}}'; done"#,
-        )
+        let mut client = spawn_script(vec![Flood(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}}}"#.to_string(),
+            0,
+            0,
+        )])
         .await;
         let hard = std::time::Duration::from_millis(300);
         let hard_deadline = tokio::time::Instant::now() + hard;
@@ -2439,15 +2582,18 @@ mod tests {
         // Script: wait for the initialize request, reply, then send an
         // agent-initiated request with id=1 (matching the next send_request id),
         // wait for the -32601 error reply, then send the real response.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 _req
-            echo '{"jsonrpc":"2.0","id":1,"method":"test/unknown","params":{}}'
-            read -t 2 _err_reply
-            echo '{"jsonrpc":"2.0","id":1,"result":{"worked":true}}'
-            sleep 1
-        "#;
+        let script = vec![
+            ReadLine(2_000),
+            Emit(
+                r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#
+                    .to_string(),
+            ),
+            ReadLine(2_000),
+            Emit(r#"{"jsonrpc":"2.0","id":1,"method":"test/unknown","params":{}}"#.to_string()),
+            ReadLine(2_000),
+            Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"worked":true}}"#.to_string()),
+            SleepMs(1000),
+        ];
         let mut client = spawn_script(script).await;
         // initialize consumes id=0
         let _init = client
@@ -2467,9 +2613,10 @@ mod tests {
     async fn keepalive_resets_idle_past_deadline() {
         // Keepalive session/update lines every 50ms against a 100ms idle deadline.
         // The turn should survive well past the 100ms deadline (proves the fix).
-        let mut client = spawn_script(
-            r#"for i in $(seq 1 20); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}'; sleep 0.05; done; sleep 10"#,
-        )
+        let mut client = spawn_script(vec![
+            Flood(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}"#.to_string(), 50, 20),
+            SleepMs(10_000),
+        ])
         .await;
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2503,9 +2650,11 @@ mod tests {
         // The script emits a tool_call, waits 80ms (under the 200ms idle), then goes
         // silent. If the tool_call reset didn't fire, idle would fire at 200ms from
         // start. With the reset, idle fires at 80ms + 200ms = ~280ms from start.
-        let mut client = spawn_script(
-            r#"echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"long_running","kind":"shell"}}}'; sleep 0.08; sleep 10"#,
-        )
+        let mut client = spawn_script(vec![
+            Emit(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"long_running","kind":"shell"}}}"#.to_string()),
+            SleepMs(80),
+            SleepMs(10_000),
+        ])
         .await;
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
@@ -2537,13 +2686,13 @@ mod tests {
     #[tokio::test]
     async fn session_new_full_includes_system_prompt_when_some() {
         // Script: respond to initialize, then echo back the session/new request.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":{captured}}}"#.to_string()),
+        SleepMs(1000),
+    ];
         let mut client = spawn_script(script).await;
         client
             .initialize()
@@ -2571,11 +2720,13 @@ mod tests {
 
     #[tokio::test]
     async fn goose_system_prompt_request_uses_set_contract() {
-        let script = r#"
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":0,"result":{"_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+            ReadLine(2_000),
+            Emit(
+                r#"{"jsonrpc":"2.0","id":0,"result":{"_receivedRequest":{captured}}}"#.to_string(),
+            ),
+            SleepMs(1000),
+        ];
         let mut client = spawn_script(script).await;
         let result = client
             .session_set_goose_system_prompt("ses_goose", "Be terse")
@@ -2594,11 +2745,14 @@ mod tests {
 
     #[tokio::test]
     async fn goose_system_prompt_preserves_method_not_found_for_fallback() {
-        let script = r#"
-            read -t 2 _REQ
-            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}'
-            sleep 1
-        "#;
+        let script = vec![
+            ReadLine(2_000),
+            Emit(
+                r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}"#
+                    .to_string(),
+            ),
+            SleepMs(1000),
+        ];
         let mut client = spawn_script(script).await;
         assert!(matches!(
             client
@@ -2610,11 +2764,14 @@ mod tests {
 
     #[tokio::test]
     async fn goose_system_prompt_preserves_invalid_params_as_error() {
-        let script = r#"
-            read -t 2 _REQ
-            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Invalid params"}}'
-            sleep 1
-        "#;
+        let script = vec![
+            ReadLine(2_000),
+            Emit(
+                r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Invalid params"}}"#
+                    .to_string(),
+            ),
+            SleepMs(1000),
+        ];
         let mut client = spawn_script(script).await;
         assert!(matches!(
             client
@@ -2627,13 +2784,13 @@ mod tests {
     #[tokio::test]
     async fn session_new_full_omits_system_prompt_when_none() {
         // When system_prompt is None, the field should not appear in params.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":{captured}}}"#.to_string()),
+        SleepMs(1000),
+    ];
         let mut client = spawn_script(script).await;
         client
             .initialize()
@@ -2655,13 +2812,13 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_sends_session_title_in_meta_when_some() {
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":{captured}}}"#.to_string()),
+        SleepMs(1000),
+    ];
         let mut client = spawn_script(script).await;
         client
             .initialize()
@@ -2683,13 +2840,13 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_omits_meta_when_session_title_none() {
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":{captured}}}"#.to_string()),
+        SleepMs(1000),
+    ];
         let mut client = spawn_script(script).await;
         client
             .initialize()
@@ -2714,13 +2871,13 @@ mod tests {
     async fn session_new_full_sends_claude_meta_system_prompt_when_claude_meta_transport() {
         // When ClaudeMeta transport is requested, the prompt must appear as
         // _meta.systemPrompt: {"append": text} — never as a bare systemPrompt field.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_claude","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_claude","_receivedRequest":{captured}}}"#.to_string()),
+        SleepMs(1000),
+    ];
         let mut client = spawn_script(script).await;
         client
             .initialize()
@@ -2753,13 +2910,13 @@ mod tests {
     async fn session_new_full_merges_claude_meta_and_session_title_into_single_meta_object() {
         // Both ClaudeMeta prompt and session_title must coexist under _meta —
         // the prompt must not clobber sessionTitle or vice versa.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_merged","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
+        let script = vec![
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+        ReadLine(2_000),
+        Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_merged","_receivedRequest":{captured}}}"#.to_string()),
+        SleepMs(1000),
+    ];
         let mut client = spawn_script(script).await;
         client
             .initialize()
@@ -2916,7 +3073,7 @@ mod tests {
     async fn native_steer_with_no_active_run_id_acks_expected_run_id_missing() {
         // Quiet process: never emits anything, so the read loop has only
         // the steer arm and the idle timeout to consider.
-        let mut client = spawn_script("sleep 10").await;
+        let mut client = spawn_script(vec![SleepMs(10_000)]).await;
         assert!(
             client.active_run_id().is_none(),
             "precondition: active_run_id starts as None"
@@ -2984,9 +3141,11 @@ mod tests {
         // writes), then idle. This is a JSON-RPC success response with
         // a `stopReason` payload (matching the shape goose uses for
         // steer responses in fake_llm.rs).
-        let script = "sleep 0.5; \
-                      echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"end_turn\"}}'; \
-                      sleep 10";
+        let script = vec![
+            SleepMs(500),
+            Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}"#.to_string()),
+            SleepMs(10_000),
+        ];
         let mut client = spawn_script(script).await;
 
         // Set active_run_id via a synthesized session_info_update so the
@@ -3058,10 +3217,12 @@ mod tests {
     /// New code: deadline renewed at t≈0.5s → prompt response at t≈1.5s → `Ok`.
     #[tokio::test]
     async fn steer_success_renews_hard_deadline_and_survives_past_original() {
-        let script = "sleep 0.5; \
-                      echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"end_turn\"}}'; \
-                      sleep 1; \
-                      echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
+        let script = vec![
+            SleepMs(500),
+            Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}"#.to_string()),
+            SleepMs(1_000),
+            Emit(r#"{"jsonrpc":"2.0","id":999,"result":{"done":true}}"#.to_string()),
+        ];
         let mut client = spawn_script(script).await;
 
         let update = session_info_update_msg(Some(serde_json::json!("run-99")));
@@ -3118,17 +3279,18 @@ mod tests {
     ///
     /// The steer request is the first thing this read loop writes, so the
     /// captured line IS the steer request bytes.
+    /// steer 请求捕获：读客户端一行 → 原样落盘 → 回固定响应 → 静默存活。
     async fn spawn_steer_capture_script(
         capture_path: &std::path::Path,
         response: &str,
     ) -> AcpClient {
-        let script = format!(
-            "read -r line; printf '%s' \"$line\" > {capture}; \
-             printf '%s\\n' '{response}'; sleep 10",
-            capture = capture_path.display(),
-            response = response,
-        );
-        spawn_script(&script).await
+        spawn_script(vec![
+            ReadLine(10_000),
+            CaptureTo(capture_path.display().to_string()),
+            Emit(response.to_string()),
+            SleepMs(10_000),
+        ])
+        .await
     }
 
     /// Drive one steer through the read loop and return
@@ -3185,15 +3347,17 @@ mod tests {
         client.steering_supported = true;
     }
 
-    /// Run `initialize` against a script that replies with `init_result` as
+    /// Run `initialize` against a mock that replies with `init_result` as
     /// the JSON-RPC result, and return the resulting `steering_supported`.
     async fn steering_supported_after_initialize(init_result: &str) -> bool {
-        let script = format!(
-            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
-             sleep 5",
-            result = init_result,
-        );
-        let mut client = spawn_script(&script).await;
+        let mut client = spawn_script(vec![
+            ReadLine(10_000),
+            Emit(format!(
+                r#"{{"jsonrpc":"2.0","id":0,"result":{init_result}}}"#
+            )),
+            SleepMs(5_000),
+        ])
+        .await;
         client
             .initialize()
             .await
@@ -3389,10 +3553,12 @@ mod tests {
     /// renews it to t≈3.5s; prompt response at t≈1.5s lands inside it.
     #[tokio::test]
     async fn acp_steer_injected_renews_hard_deadline_and_survives_past_original() {
-        let script = "sleep 0.5; \
-                      echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"injected\"}}'; \
-                      sleep 1; \
-                      echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
+        let script = vec![
+            SleepMs(500),
+            Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"outcome":"injected"}}"#.to_string()),
+            SleepMs(1_000),
+            Emit(r#"{"jsonrpc":"2.0","id":999,"result":{"done":true}}"#.to_string()),
+        ];
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
 
@@ -3442,10 +3608,12 @@ mod tests {
     /// deadline fires first and we get `HardTimeout`.
     #[tokio::test]
     async fn acp_steer_started_new_turn_acks_success_without_renewing_hard_deadline() {
-        let script = "sleep 0.5; \
-             echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"startedNewTurn\"}}'; \
-             sleep 1; \
-             echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
+        let script = vec![
+            SleepMs(500),
+            Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"outcome":"startedNewTurn"}}"#.to_string()),
+            SleepMs(1_000),
+            Emit(r#"{"jsonrpc":"2.0","id":999,"result":{"done":true}}"#.to_string()),
+        ];
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
 
