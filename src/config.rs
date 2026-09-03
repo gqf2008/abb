@@ -524,11 +524,6 @@ fn default_session_gc_days() -> u32 {
     7
 }
 
-/// #200：mini-relay 默认端口。
-fn default_buzz_relay_port() -> u16 {
-    3000
-}
-
 impl BotConfig {
     /// 隔离键基础段（不含 suffix）：#174 优先级 = app_id（飞书/钉钉平台唯一）→
     /// wx_user_id（微信登录者 id，一个微信号同一时刻只登录一个 bot，实际唯一）→
@@ -897,28 +892,18 @@ pub struct Config {
     /// 会话过期阈值（天）：最后一条历史消息距今超过该值即视为过期候选。默认 7。
     #[serde(default = "default_session_gc_days")]
     pub session_gc_days: u32,
-    /// #200：mini-relay 开关——开启后 ABB 内嵌 Nostr relay（NIP-01/42/98 子集），
-    /// buzz-acp 可连接订阅虚拟 Bot 频道触发 buzz-agent 执行。默认关。
-    #[serde(default)]
-    pub buzz_relay_enabled: bool,
-    /// #200：mini-relay 监听端口。默认 3000（与 buzz 生态默认一致）。
-    #[serde(default = "default_buzz_relay_port")]
-    pub buzz_relay_port: u16,
     /// 工作区版本管理总开关（#209，默认开）：bot 启动时为工作区自动 init git 仓库
     /// （内置 libgit2，不依赖系统 git），删除保护快照（trash 留痕）也依赖该仓库。
     /// 关闭 = ABB 完全不 init、不快照（工作区已有仓库也不写入，由用户自主管理）。
     #[serde(default = "default_true")]
     pub workspace_git_enabled: bool,
-    /// #200：buzz-acp 可执行文件路径（service spawn 用）。
-    /// #207：空 = 按序解析——应用包同目录（发布包内置）→ ~/.agent-bridge/bin/ → PATH。
-    #[serde(default)]
-    pub buzz_acp_exe: String,
-    /// #200：buzz-agent 可执行文件路径（传给 buzz-acp）。空 = 同 buzz_acp_exe 的解析顺序。
+    /// #206：buzz 后端的 agent ACP 适配器可执行文件（harness 直接 spawn 的对象）。
+    /// 空 = 解析顺序：主程序同目录的 `buzz-agent`（#200 随包 fork，ABB.app/Contents/
+    /// MacOS/ 下与 agent-bridge 同目录）→ PATH 里的 **pi-acp**（pi 的 ACP 适配器，
+    /// npm 全局安装 `npm i -g pi-acp`；find_in_path 的 composed_path 已含
+    /// ~/.npm-global/bin 等）。覆盖可指向任意 ACP agent 适配器（绝对路径优先）。
     #[serde(default)]
     pub buzz_agent_exe: String,
-    /// #200：agent 的 Nostr 私钥（hex）。空 = 首次启动生成并持久化到 buzz-agent-key。
-    #[serde(default)]
-    pub buzz_agent_private_key: String,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -956,12 +941,8 @@ impl Default for Config {
             owner_open_id: String::new(),
             default_backend: String::new(),
             cross_delivery_enabled: false,
-            buzz_relay_enabled: false,
-            buzz_relay_port: 3000,
             workspace_git_enabled: true, // #209 工作区版本管理默认开
-            buzz_acp_exe: String::new(),
             buzz_agent_exe: String::new(),
-            buzz_agent_private_key: String::new(),
             lock_screen_control: false,     // #129 锁屏控制默认关
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),

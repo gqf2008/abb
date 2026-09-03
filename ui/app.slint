@@ -151,7 +151,7 @@ export struct BotRow {
     name: string,        // 显示名
     kind: string,        // feishu | wechat | dingtalk
     enabled: bool,       // 是否启用（false 则 service 不启动此 bot）
-    backend: string,     // 该 bot 的默认后端 claude | codex（跟着 bot 走，不是全局）
+    backend: string,     // 该 bot 的默认后端 claude | codex | pi | buzz（跟着 bot 走，不是全局）
     sandbox-mode: string, // #168 权限档位 auto | read-only | workspace-write | full-access
     provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
     owner-open-id: string, // 飞书：owner（管理员）白名单（逗号分隔 open_id）；微信 bot 不用
@@ -1242,7 +1242,7 @@ export component SettingsWindow inherits Window {
     // 旧版 bot-edited 一次传全部字段、未改字段从 model 读，而 model 在编辑后不同步（过期），
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
     callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
-    callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi）
+    callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi 3=buzz）
     // #168 权限档位下拉（每 bot，claude/codex 生效）：4 项 = config 落盘值（auto/read-only/...）
     in-out property <[string]> sandbox-mode-options: ["auto", "read-only", "workspace-write", "full-access"];
     callback sandbox-mode-changed(int, int);  // (bot idx, 选项下标)

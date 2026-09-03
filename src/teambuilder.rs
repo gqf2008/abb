@@ -215,7 +215,7 @@ pub async fn generate_team_plan(
     if goal.trim().is_empty() {
         return Err("团队目标不能为空。".into());
     }
-    // #200：buzz = ACP 常驻执行层（mini-relay），本函数的一次性 CLI spawn 模式不适用
+    // #200：buzz = ACP 常驻执行层（harness），本函数的一次性 CLI spawn 模式不适用
     // （裸起 buzz-agent 无 ACP 握手 → 挂死）。守卫放 generate 入口即覆盖唯一生产调用
     // 路径（build_agent_command 仅此处被调，其余为单测）。审查 #205。
     if backend.is_buzz() {

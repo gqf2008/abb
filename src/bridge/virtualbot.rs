@@ -2,102 +2,93 @@
 //! 子模块是父模块后代，可访问 mod.rs 私有字段，无需改可见性）。
 
 use super::*;
+use uuid::Uuid;
 
 /// #206：buzz 通道资格预检的三种失败（dispatch 与 /cancel 共用判据、各自表述
 /// 文案——判据只有一处，杜绝两处预检漂移）。dispatch 的第四条「非受限会话」是
 /// dispatch 独有（/cancel 与 CLI 一致无角色门槛），由调用方各自叠加。
 #[derive(Debug, PartialEq, Eq)]
 enum BuzzPrecheckFail {
-    /// mini-relay 未运行（未启用/初始化失败）
-    RelayUnavailable,
-    /// chat 无对应频道（未登记/刚登记待巡检接入——#206 频道集运行期刷新，
+    /// buzz 后端未启用（config 默认后端/本 bot 非 buzz → service 未起 harness）
+    BuzzDisabled,
+    /// chat 无对应频道登记（未登记/刚登记待巡检接入——#206 频道集运行期刷新，
     /// 新登记 ≤ 巡检周期内自动接入，无需重启）
     ChannelUnregistered,
-    /// 无连接 REQ 订阅本频道（buzz-acp 未连/未就绪/半开黑洞）
-    SubscriberAbsent,
+    /// agent 进程不可用（未拉起/崩溃退避中——新消息会被预检拒绝，避免「以为
+    /// 已受理」的静默排队）
+    AgentDown,
 }
 
 impl Bridge {
-    /// buzz 通道资格预检（dispatch 与 /cancel 共用前三条判据）：relay 在 →
-    /// 频道已登记 → 有连接 REQ 订阅本频道。Ok(()) = 可发布/可 dispatch。
-    fn buzz_channel_precheck(&self, chat_id: &str) -> Result<(), BuzzPrecheckFail> {
-        match self.buzz_relay_state.as_ref() {
-            None => Err(BuzzPrecheckFail::RelayUnavailable),
-            Some(relay) => {
-                let uuid = crate::buzzrelay::channel_uuid(&self.bot.key(), chat_id);
-                if relay.channel_by_uuid(&uuid).is_none() {
-                    Err(BuzzPrecheckFail::ChannelUnregistered)
-                } else if !relay.has_subscription_for(&uuid) {
-                    Err(BuzzPrecheckFail::SubscriberAbsent)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
     /// #206 话题隔离：dispatch 预检（话题感知，**纯判据无副作用**——预检
     /// 「不过 = 无副作用」invariant：被拒的 dispatch（含受限会话闸④）不得
-    /// 污染频道注册表，审查 #214 P2-1。话题频道登记（注册 + 种子 + 44100）
-    /// 由 [`Self::buzz_ensure_topic_channel`] 在全闸通过之后执行）。
-    /// 与 /cancel 的
-    /// [`buzz_channel_precheck`](Self::buzz_channel_precheck) 差异在话题臂：
-    /// - 群根消息：三判据原样（relay 在 → 群根频道已登记 → 群根频道有订阅）。
+    /// 污染频道注册表，审查 #214 P2-1。话题频道登记（注册 + 锚点）由
+    /// [`Self::buzz_ensure_topic_channel`] 在全闸通过之后执行）。
+    /// 与 /cancel 的判据差异在话题臂：
+    /// - 群根消息：三判据原样（buzz 启用 → 群根频道已登记 → agent 可用）。
     /// - 话题消息（thread_id 非空）：话题从属于群——**群根频道必须已登记**
     ///   （未登记群的话题消息同样拒绝）；话题频道缺失**不再拒绝**（闸后登记）；
-    ///   订阅判据放宽为「群根频道有订阅」作 acp 存活代理——话题订阅随 44100
-    ///   在途属正常，首条话题消息靠 acp 处理 44100 后的 REQ 回放消费
-    ///   （at-least-once 仍在，与群根预检强度不等价——日志如实，见 PR 风险节）。
+    ///   agent 可用性判据沿用（acp 就绪才有轮次可跑，与群根一致——单 slot
+    ///   无「话题订阅在途」中间态，话题消息与群根消息共享同一判据）。
     ///
-    /// 返回 Ok(群根频道名)：群根频道名 = 角色名（service 启动登记自虚拟 Bot
-    /// 登记表），闸后登记话题频道时作话题频道名来源——不另查 vb 快照，防两份
-    /// 来源漂移。
-    async fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
-        let Some(relay) = self.buzz_relay_state.as_ref() else {
-            return Err(BuzzPrecheckFail::RelayUnavailable);
+    /// 返回 Ok(群根频道名)：群根频道名 = 角色名（虚拟 Bot 登记表），闸后登记
+    /// 话题频道时作话题频道名来源——不另查 harness 频道表，防两份来源漂移。
+    fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
+        let Some(handle) = self.buzz.as_ref() else {
+            return Err(BuzzPrecheckFail::BuzzDisabled);
         };
-        let group_uuid = crate::buzzrelay::channel_uuid(&self.bot.key(), &ev.chat_id);
-        let Some(group_ch) = relay.channel_by_uuid(&group_uuid) else {
+        let group_uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+            &self.bot.key(),
+            &ev.chat_id,
+        ))
+        .expect("channel_uuid output must parse as Uuid");
+        if !handle.channel_registered(&group_uuid) {
             return Err(BuzzPrecheckFail::ChannelUnregistered);
-        };
-        if !relay.has_subscription_for(&group_uuid) {
-            return Err(BuzzPrecheckFail::SubscriberAbsent);
         }
-        Ok(group_ch.name)
+        if !handle.is_agent_available() {
+            return Err(BuzzPrecheckFail::AgentDown);
+        }
+        // 群根频道名 = 角色名：取虚拟 Bot 登记快照（mtime 懒刷新，与注入判定同源）。
+        self.refresh_virtual_bots();
+        let name = {
+            let bots = self.virtual_bots.lock().unwrap();
+            bots.iter()
+                .find(|v| v.bot_key == self.bot.key() && v.chat_id == ev.chat_id)
+                .map(|v| v.role_name.clone())
+        };
+        name.ok_or(BuzzPrecheckFail::ChannelUnregistered)
     }
 
     /// #206 话题隔离：话题频道登记——dispatch 全闸（①②③ + 受限会话闸④）通过
-    /// 之后调用（审查 #214 P2-1：被拒 dispatch 不得登记频道/发 44100）。
-    /// 幂等（已登记则 ensure_topic_channel 内部早退）；重启自愈同路径：注册表
-    /// 是内存态，重启后首条话题消息在此重登记。
-    async fn buzz_ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
-        let Some(relay) = self.buzz_relay_state.as_ref() else {
-            return; // 预检已过则 relay 必在；防御性早退
+    /// 之后调用（审查 #214 P2-1：被拒 dispatch 不得登记频道）。幂等（upsert 覆盖
+    /// 同频道）；每次 dispatch 都刷新锚点（= 本条用户消息 mid，话题回复
+    /// send_thread_reply 的落点）。
+    fn buzz_ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
+        let Some(handle) = self.buzz.as_ref() else {
+            return; // 预检已过则 handle 必在；防御性早退
         };
-        let is_new = relay
-            .channel_by_uuid(&crate::buzzrelay::topic_channel_uuid(
-                &self.bot.key(),
-                &ev.chat_id,
-                &ev.thread_id,
-            ))
-            .is_none();
-        relay
-            .ensure_topic_channel(
-                &self.bot.key(),
-                &ev.chat_id,
-                &ev.thread_id,
-                group_name,
-                &ev.mid,
-            )
-            .await;
-        if is_new {
-            crate::log!(
-                "[bridge] 话题频道已登记（44100 已发，acp 订阅在途）bot={} chat={} thread={}",
-                self.bot.key(),
-                trunc(&ev.chat_id, 12),
-                trunc(&ev.thread_id, 16)
-            );
-        }
+        let uuid = Uuid::parse_str(&crate::buzz::keys::topic_channel_uuid(
+            &self.bot.key(),
+            &ev.chat_id,
+            &ev.thread_id,
+        ))
+        .expect("channel_uuid output must parse as Uuid");
+        handle.upsert_channel(
+            uuid,
+            crate::buzz::harness::ChannelMeta {
+                bot_key: self.bot.key(),
+                chat_id: ev.chat_id.clone(),
+                thread_id: Some(ev.thread_id.clone()),
+                name: group_name.to_string(),
+                anchor_mid: Some(ev.mid.clone()),
+            },
+        );
+        crate::log!(
+            "[bridge] 话题频道已登记/刷新锚点 bot={} chat={} thread={}",
+            self.bot.key(),
+            trunc(&ev.chat_id, 12),
+            trunc(&ev.thread_id, 16)
+        );
     }
 
     /// 虚拟 Bot 注入数据（#75）：仅登记过的群聊返回 (群名, 群介绍)。
@@ -253,7 +244,7 @@ impl Bridge {
             //（per-bot effective_backend，不是全局默认）——否则 default=claude +
             // 本 bot=buzz 时仍答「没有正在运行的任务」（审查 #205r3）。
             // #206：buzz 臂从「固定文案」升级为真实叫停——发布 owner 控制命令
-            // "!cancel" 进 mini-relay（协议与语义见 buzz_cancel_reply）。
+            // "!cancel" 走 harness.cancel（协议与语义见 buzz_cancel_reply）。
             let msg = if Backend::parse(self.bot.effective_backend(&self.default_backend)).is_buzz()
             {
                 self.buzz_cancel_reply(&ev).await
@@ -446,38 +437,32 @@ impl Bridge {
         // #200 Phase 2：buzz 路径资格预检——必须在 **prompt 组装与历史落盘之前**
         // （审查 #205r2）：预检不过 = 这一轮根本不会发生，既不该白烧迁移历史读/指令块
         // 拼接，更不该往 ABB 历史里写一条「有去无回」的用户轮（单边历史会在日后
-        // buzz→CLI 切换时被当上下文注入）。四条资格（①②③ 由 buzz_dispatch_precheck
+        // buzz→CLI 切换时被当上下文注入）。三条资格（①②③ 由 buzz_dispatch_precheck
         // 承载，④ 是 dispatch 独有）：
-        // ① mini-relay 可用（未启用/初始化失败 → 无法服务）；
+        // ① buzz 后端启用（service 只在该 bot 生效后端是 buzz 时注入 harness 句柄；
+        //    None = 非 buzz 后端，本分支不可达——防御）；
         // ② 本会话是已登记的虚拟 Bot 群（频道集运行期刷新：新登记在巡检周期
         //    （2s）内自动接入，p2p/未登记群不支持；#206 话题隔离：话题消息只
         //    要求**群根频道**已登记——话题频道缺失不再拒绝，全闸通过后由
         //    buzz_ensure_topic_channel 登记）；
-        // ③ 有连接 REQ 订阅了本群根频道（buzz-acp 已就绪——无消费者时入库只是「寄望
-        //    对端水位补发」，用户侧是无限等待，#205r4；话题频道订阅随 44100 在途属
-        //    正常，故话题消息以群根订阅作 acp 存活代理）；
-        // ④ **不是受限会话**——CLI 路径对授权者（Granted）的硬闸是 agent::run 里
-        //    挂的 guard hook/沙箱，buzz 走 acp 侧自己的工具权限（permission-mode 默认
-        //    bypass），RESTRICT_PREAMBLE 只是提示文本。guard→request_permission 映射
-        //    未落地前（#206），给受限用户跑 buzz = 静默提权，必须拒绝而非降级运行。
+        // ③ agent 进程可用（启动失败/崩溃退避中 = 不可用——此时 push 只是排队
+        //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）。
         if backend.is_buzz() {
             // #206 话题隔离：话题消息走话题感知预检（话题频道缺失不再拒绝——
-            // 登记在全闸通过后做，见下方 buzz_ensure_topic_channel；订阅判据以
-            // 群根频道为 acp 存活代理，见 buzz_dispatch_precheck）。
-            let precheck = self.buzz_dispatch_precheck(&ev).await;
+            // 登记在全闸通过后做，见下方 buzz_ensure_topic_channel；agent 可用性
+            // 判据与群根共用，见 buzz_dispatch_precheck）。
+            let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
-                Err(BuzzPrecheckFail::RelayUnavailable) => {
-                    Some("mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）")
+                Err(BuzzPrecheckFail::BuzzDisabled) => {
+                    Some("buzz 后端未启用（服务未装配 agent，检查默认后端/重启）")
                 }
                 Err(BuzzPrecheckFail::ChannelUnregistered) => {
                     Some("本会话不是已登记的虚拟 Bot 群；若刚刚登记，频道正在接入，请稍后重试")
                 }
-                // 判据是「有连接 REQ 订阅了本频道」而非裸连接数：握手未完、
-                // 半开连接、别的 WS 客户端都不算消费者（#205r4）。
-                // 无消费者时入库只是「寄望对端水位补发」（ABB 不掌握其语义），
-                // 用户侧是无限等待——当场报错优于静默悬挂（账本式超时见 #206）。
-                Err(BuzzPrecheckFail::SubscriberAbsent) => {
-                    Some("buzz-acp 未订阅本频道（未连接/未就绪），本轮无法执行")
+                // agent 不可用 = 启动失败/崩溃退避中：当场报错优于静默排队
+                //（失败批次会随重拉重试，死信积压见 harness queue 语义）。
+                Err(BuzzPrecheckFail::AgentDown) => {
+                    Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
                 }
                 Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
                     Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
@@ -502,10 +487,10 @@ impl Bridge {
                 return;
             }
             // 全闸（①②③ + 受限会话闸④）通过后才登记话题频道（审查 #214 P2-1：
-            // 被拒的 dispatch 不得污染频道注册表/发 44100——预检「不过=无副作用」）。
+            // 被拒的 dispatch 不得污染频道注册表——预检「不过=无副作用」）。
             if !ev.thread_id.is_empty() {
                 if let Ok(group_name) = &precheck {
-                    self.buzz_ensure_topic_channel(&ev, group_name).await;
+                    self.buzz_ensure_topic_channel(&ev, group_name);
                 }
             }
         }
@@ -774,53 +759,55 @@ impl Bridge {
             (lock_ret, epoch, injected_rounds)
         };
 
-        // #200 Phase 2：buzz 后端短路——消息写入 mini-relay（buzz-acp 订阅触发
-        // buzz-agent），回复经回流通道异步发回聊天平台，不走 CLI spawn（run_once 的
-        // Buzz 臂 unreachable，旁路调用方在 agent::run/generate_* 有守卫）。与 CLI
-        // 路径的差异：
-        // - 会话上下文由 buzz-acp 的 channel→session 持有：ABB 侧首轮迁移注入照常
-        //   （注入闸照跑），发布成功后 mark_started + 落 marker，防后续每轮重复注入
-        //   （CLI 路径这步在 run 返回后做；buzz 无同步轮次，就地补齐）。
-        // - 中断：buzz 轮次叫停已接线（#206）——/cancel 发布 owner 控制命令
-        //   "!cancel"（见 buzz_cancel_reply；话题内 /cancel 发到话题频道，粒度与
-        //   CLI 的 chat:thread key 对齐）；桥侧仍无轮次记账，本路径不注册
+        // #200 Phase 3：buzz 后端短路——消息 push 进 harness 队列（harness 单
+        // slot + per-channel 串行锁：同一频道不会有两轮并发，在跑轮次期间到达
+        // 的消息按 Queue 语义入队、回合结束时随 steer 合并进下一轮），回合结束
+        // 捕获 agent 文本同步投递回聊天平台，不走 CLI spawn（run_once 的 Buzz 臂
+        // unreachable，旁路调用方在 agent::run/generate_* 有守卫）。与 CLI 路径
+        // 的差异：
+        // - 会话上下文由 harness 的 channel→session 持有：ABB 侧首轮迁移注入照常
+        //   （注入闸照跑），push 成功后 mark_started + 落 marker，防后续每轮重复
+        //   注入（CLI 路径这步在 run 返回后做；buzz 无同步轮次，就地补齐）。
+        // - 中断：buzz 轮次叫停已接线（#206）——/cancel 走 harness 的 cancel
+        //   信号（见 buzz_cancel_reply；话题内 /cancel 停话题频道在跑轮次，粒度
+        //   与 CLI 的 chat:thread key 对齐）；桥侧仍无轮次记账，本路径不注册
         //   cancel flag（桥无从知道轮次何时在跑）。自然停止词（停/取消/…）维持
-        //   按普通消息透传：它在 acp 侧的实际效果是默认 steer 模式的 cancel+merge
-        //   重跑一轮（费 token、agent 会回话——mode_gate_signal lib.rs:3575-3589 +
-        //   config.rs:362 默认 steer，已由 BUZZ_ACP_MULTIPLE_EVENT_HANDLING 显式
-        //   钉住），与 CLI「无任务时透传」语义不同；对齐需桥侧轮次记账（#206 已知
-        //   边界，本项不含）。
-        // - typing/DONE 表情不出现：无同步轮次可挂（回复回流路径也不发表情）。
+        //   按普通消息透传：队列语义下它并入在跑轮次后、随下一轮 steered prompt
+        //   一起交 agent（pi-acp 无原生 steer，走 cancel+merge 重跑一轮重提示）。
+        // - typing/DONE 表情不出现：无同步轮次可挂（回复投递路径也不发表情）。
         if backend.is_buzz() {
+            let handle = self.buzz.clone().expect("buzz 预检通过则 handle 必在");
             crate::log!(
-                "[bridge] buzz 路径：写入 mini-relay chat={} len={}",
+                "[bridge] buzz 路径：push 进 harness chat={} len={}",
                 trunc(&ev.chat_id, 12),
                 prompt.chars().count()
             );
-            // 预检已保证 relay 存在 + 频道已登记 + 非受限会话；这里 None 只剩
-            // 「签名失败 / 入库失败（磁盘等）」——同样给可见报错，且不消耗会话闸。
-            // （owner 控制命令字面量的拦截在 relay 入口闸 publish_user_message，
-            // 对**最终组装后**的 content 做精确判据——是唯一权威边界，审查 #212 P1-1）
-            let published = self
-                .buzz_relay_state
-                .as_ref()
-                .expect("buzz 预检通过则 relay 必在")
-                .publish_user_message(
-                    &self.bot.key(),
-                    &ev.chat_id,
-                    &ev.mid,
-                    &prompt,
-                    &ev.thread_id,
-                )
-                .await;
-            // 发布即处理完毕：摘 pending（重启不重放；发布-摘除间崩溃 = 重启重放
+            // 频道 uuid 派生（root/话题与 harness 登记同源——root 由 service 巡检
+            // 登记、话题由 buzz_ensure_topic_channel 登记，keys 命名空间见 keys.rs）。
+            let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
+                crate::buzz::keys::channel_uuid(&self.bot.key(), &ev.chat_id)
+            } else {
+                crate::buzz::keys::topic_channel_uuid(&self.bot.key(), &ev.chat_id, &ev.thread_id)
+            })
+            .expect("channel_uuid output must parse as Uuid");
+            // push 即处理完毕：摘 pending（重启不重放；push-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
-            let Some(user_event_id) = published else {
+            if !handle.push_message(
+                channel_id,
+                crate::buzz::queue::InboundMsg {
+                    id_hex: ev.mid.clone(),
+                    author_role: ev.role.as_str().to_string(),
+                    text: prompt.clone(),
+                    ts_secs: ev.ts,
+                    // ABB 会话面扁平：无话题维；话题隔离走频道维（topic_channel_uuid）。
+                    prompt_tag: "channel_message".to_string(),
+                },
+            ) {
                 if let Err(e) = self
                     .send_reply(
                         &ev,
-                        "⚠️ buzz 后端消息写入 mini-relay 失败（详见服务日志），请重发或换后端。",
+                        "⚠️ buzz 后端消息入队失败（harness 已关闭，详见服务日志），请重发或换后端。",
                     )
                     .await
                 {
@@ -830,21 +817,18 @@ impl Bridge {
                     );
                 }
                 return;
-            };
-            // #206 回复侧记账：登记 awaiting（回复事件 e-tag 按它反查会话 key 与
-            // 代际快照）。epoch 取 dispatch 时 history_lock 内的快照（与用户轮写盘
-            // 同一代际）——此后任何 /new 都会 bump 代际，回复到达时按失配「只发不
-            // 写历史」（孤儿闸，与 CLI same_session=false 同语义）。发布-登记间崩溃
-            // = 回复走 chat 兜底关联（账本无登记，仍发仍写，见 buzzreply）。
-            self.reply_ledger.register_dispatch(
-                &user_event_id,
-                crate::replyledger::AwaitingEntry {
+            }
+            // 回合登记（TurnOutput 投递时按它定位会话 key/代际快照/历史 mid）。
+            // epoch 取 dispatch 时 history_lock 内的快照（与用户轮写盘同一代际）
+            // ——此后任何 /new 都会 bump 代际，回复到达时按失配「只发不写历史」
+            // （孤儿闸，与 CLI same_session=false 同语义，见 bridge::buzzreply）。
+            // push-登记间崩溃 = 回复走 chat 兜底关联（回合表无登记，仍发仍写）。
+            self.turn_registry.lock().unwrap().insert(
+                channel_id,
+                crate::bridge::buzzreply::TurnEntry {
                     mid: ev.mid.clone(),
                     key: key.clone(),
-                    chat_id: ev.chat_id.clone(),
                     epoch: hist_epoch,
-                    session_id: session_id.clone(),
-                    ts: crate::chrono_lite::unix_secs(),
                 },
             );
             // mark_started 是防重复注入的主闸（resume 轮不再注入）；marker 与 CLI
@@ -1163,83 +1147,59 @@ impl Bridge {
             .unwrap_or_else(|| crate::workspace_dir(&self.bot.key()))
     }
 
-    /// #206：buzz /cancel——预检（群根频道 + 群根订阅 = acp 存活代理，与 dispatch
-    /// 同判据）→ 发布 owner 控制命令 "!cancel" 到**目标频道**（事件形态与上游锚点
-    /// 见 buzzrelay::publish_control_command）。
+    /// #206：buzz /cancel——预检（频道已登记；buzz 未启用则拒——与 dispatch 同
+    /// 判据的前两条）→ 向 harness 的**目标频道**发 Cancel 信号（同步回执）。
     ///
     /// 叫停粒度（#206 话题隔离后）：与 CLI 的 chat:thread key 对齐——话题内的
-    /// /cancel 发到**话题频道**（话题消息已 dispatch 进独立话题频道，留在群根
-    /// 频道的 !cancel 停不到话题频道的在跑轮次）；群顶层的 /cancel 只停群根频道
-    /// 轮次。话题频道从未登记 = 该话题从未 dispatch 过 = 无轮次可停 → 如实回
-    /// 「没有正在运行的任务」（不空发一条注定 no-op 的控制事件）。
+    /// /cancel 停**话题频道**的在跑轮次（话题消息已 dispatch 进独立话题频道，
+    /// 群根频道的 cancel 停不到话题频道的在跑轮次）；群顶层的 /cancel 只停群根
+    /// 频道轮次。话题频道从未登记 = 该话题从未 dispatch 过 = 无轮次可停 → 如实回
+    /// 「没有正在运行的任务」。
     ///
-    /// 回执必须诚实：
-    /// - 只说「已发送」不说「已停止」——桥侧无轮次记账，acp 对无 in-flight 的
-    ///   !cancel 仅打一条 warn no-op（lib.rs:2802-2808 @ c3132c3）且**不给频道任何
-    ///   反馈**，桥无法确知是否真停了什么；
-    /// - 明示后果：有在跑轮次 → session/cancel + 5s 排水 → 该轮作废（触发批次
-    ///   丢弃、频道 session 失效，pool.rs:2654-2678 / requeue_cancelled_batch 对
-    ///   Cancel return None pool.rs:4184）——被叫停轮次不重发，下条消息以新会话
-    ///   续跑（acp 每轮拉最近频道消息作上下文，context_message_limit 默认 12，
-    ///   pool.rs:2467 / config.rs:372，可感知失忆有限）；
-    /// - 明示粒度：叫停按所在作用域生效（话题内 → 本话题；群顶层 → 群根频道）。
+    /// 回执必须诚实：cancel 是**同步信号 + 同步回执**（harness 主循环在命令通道
+    /// 内应答）——`Ok(true)` = 已向在跑任务发 Cancel 信号；`Ok(false)` = 没有
+    /// 在跑任务（队列里等着的消息不在取消范围——取消只停正在跑的那一轮，不吞
+    /// 用户还没被受理的消息）。桥侧无轮次记账，无法在「信号已发」之外再确认
+    /// agent 是否真停了——文案只如实说「叫停指令已发送」。
     ///
-    /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停（控制事件以桥身份
-    /// = owner 发出）；同机制的 !shutdown/!rotate 绝不暴露给聊天面（命令白名单
-    /// 是结构性的，见 buzzrelay::ControlCommand）。
+    /// 明示后果：有在跑轮次 → 向 agent 发 cancel（pi-acp 无原生 steer，回合终止
+    /// 走 cancel+merge 回退：该轮文本作废不投递、频道 session 失效），下条消息
+    /// 以新会话续跑。被叫停轮次不重发、不回复。
+    ///
+    /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停。!shutdown/!rotate
+    /// 等 harness 无此面（cancel 是唯一暴露给聊天的控制信号）。
     async fn buzz_cancel_reply(&self, ev: &Ev) -> String {
-        match self.buzz_channel_precheck(&ev.chat_id) {
-            Err(fail) => {
-                let why = match fail {
-                    BuzzPrecheckFail::RelayUnavailable => {
-                        "mini-relay 未运行（设置里开 buzz_relay_enabled 后重启）"
-                    }
-                    BuzzPrecheckFail::ChannelUnregistered => {
-                        "本会话不是已登记的虚拟 Bot 群；若刚刚登记，频道正在接入，请稍后重试"
-                    }
-                    BuzzPrecheckFail::SubscriberAbsent => "buzz-acp 未订阅本频道（未连接/未就绪）",
-                };
-                format!("⚠️ buzz 叫停未送达：{why}。")
-            }
-            Ok(()) => {
-                let relay = self
-                    .buzz_relay_state
-                    .as_ref()
-                    .expect("buzz 预检通过则 relay 必在");
-                // 话题臂：话题频道从未登记 = 该话题从未 dispatch 过 = 无轮次可停
-                if !ev.thread_id.is_empty() {
-                    let tuuid = crate::buzzrelay::topic_channel_uuid(
-                        &self.bot.key(),
-                        &ev.chat_id,
-                        &ev.thread_id,
-                    );
-                    if relay.channel_by_uuid(&tuuid).is_none() {
-                        return "✅ 当前没有正在运行的任务。".to_string();
-                    }
-                }
-                let delivered = relay
-                    .publish_control_command(
-                        &self.bot.key(),
-                        &ev.chat_id,
-                        &ev.thread_id,
-                        crate::buzzrelay::ControlCommand::Cancel,
-                    )
-                    .await;
-                if delivered {
-                    let scope = if ev.thread_id.is_empty() {
-                        "本群顶层频道"
-                    } else {
-                        "本话题"
-                    };
-                    format!(
-                        "⏹ 已向 buzz 发送叫停指令（{scope}生效）。\
-                         有轮次在跑时将在数秒内停止——被叫停的轮次不会回复也不会自动重发，\
-                         会话将重新开始；无轮次在跑时本指令无效果。"
-                    )
+        let Some(handle) = self.buzz.as_ref() else {
+            return "⚠️ buzz 叫停未送达：buzz 后端未启用（服务未装配 agent，检查默认后端/重启）。"
+                .to_string();
+        };
+        let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
+            crate::buzz::keys::channel_uuid(&self.bot.key(), &ev.chat_id)
+        } else {
+            crate::buzz::keys::topic_channel_uuid(&self.bot.key(), &ev.chat_id, &ev.thread_id)
+        })
+        .expect("channel_uuid output must parse as Uuid");
+        // 频道从未登记 = 从未 dispatch 过 = 无轮次可停（话题与群根同判据——
+        // 登记先于 dispatch 发生，见 buzz_ensure_topic_channel / 巡检登记）。
+        if !handle.channel_registered(&channel_id) {
+            return "✅ 当前没有正在运行的任务。".to_string();
+        }
+        match handle.cancel(channel_id).await {
+            // Ok(false) = 无在跑任务（消息还在队列/空闲）；如实回执，不空发 no-op
+            Some(false) => "✅ 当前没有正在运行的任务。".to_string(),
+            Some(true) => {
+                let scope = if ev.thread_id.is_empty() {
+                    "本群顶层频道"
                 } else {
-                    "⚠️ buzz 叫停指令写入 mini-relay 失败（详见服务日志），请重试。".to_string()
-                }
+                    "本话题"
+                };
+                format!(
+                    "⏹ 已向 buzz 发送叫停指令（{scope}生效）。\
+                     有轮次在跑时将在数秒内停止——被叫停的轮次不会回复也不会自动重发，\
+                     会话将重新开始；无轮次在跑时本指令无效果。"
+                )
             }
+            None => "⚠️ buzz 叫停未送达（harness 已关闭），请重试。".to_string(),
         }
     }
 

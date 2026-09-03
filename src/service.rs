@@ -5,7 +5,6 @@
 use crate::bridge::Bridge;
 use crate::config::Config;
 use crate::messenger;
-use std::collections::HashMap;
 use std::sync::Arc;
 pub async fn run() {
     crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
@@ -48,33 +47,13 @@ pub async fn run() {
 
     let cfg = Arc::new(cfg);
 
-    // #200：mini-relay —— ABB 内嵌 Nostr relay（NIP-01/42/98 子集），buzz-acp 可连接
-    // 订阅虚拟 Bot 频道触发 buzz-agent 执行。开关默认关（config buzz_relay_enabled）。
-    // 状态（密钥/sqlite/频道表）在 bot 循环前**同步**初始化：Bridge 构造即拿到
-    // RelayState（或 None），不存在「后台任务异步填共享句柄、bot 先读为 None」的
-    // 启动竞态。WS 服务 / buzz-acp 子进程 / 回复回流仍在后台任务，等 messengers
-    // 就绪后再 spawn（回复回流要按频道 uuid 路由到归属 bot，见下方）。
-    let mut buzz_init: Option<BuzzRelayInit> = if cfg.buzz_relay_enabled {
-        // 启动关键路径加期限（#184 教训：常态等待不设限、启动步骤要有界）：
-        // sqlite 打开/种子事件在挂起介质上不得卡死全部 bot 启动。
-        match tokio::time::timeout(std::time::Duration::from_secs(10), init_buzz_relay(&cfg)).await
-        {
-            Ok(Ok(init)) => Some(init),
-            Ok(Err(e)) => {
-                crate::log!("[mini-relay] ⚠️ 初始化失败: {e}（buzz 后端不可用，CLI 后端不受影响）");
-                None
-            }
-            Err(_) => {
-                crate::log!("[mini-relay] ⚠️ 初始化超时 10s（buzz 后端不可用）");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // buzz 后端 bot + relay 不可用（开关关/初始化失败）= dispatch 必然丢弃：
-    // 配置不对齐没有运行期补救，启动即告警（消息侧另有用户可见报错，这里给运维看）。
-    if buzz_init.is_none() {
+    // #200 Phase 3：buzz 后端 harness（单进程形态）——有启用且后端为 buzz 的 bot
+    // 时装配：BuzzHandle（懒池：首条消息才拉起 agent 子进程）+ 三个长驻任务
+    //（主循环 / 回合投递消费 / 频道巡检）。装配本身零等待（不 spawn 进程、不碰
+    // 盘）——handle 同步可得，bot 循环构造 Bridge 即拿到，无「后台任务异步填共享
+    // 句柄、bot 先读为 None」的启动竞态。agent 进程是懒启动 + 崩溃退避重拉
+    //（harness 内闭环），启动失败只影响 buzz 频道，CLI 后端不受影响。
+    let buzz_handle: Option<std::sync::Arc<crate::buzz::harness::BuzzHandle>> = {
         let buzz_bots: Vec<String> = cfg
             .bots
             .iter()
@@ -85,12 +64,16 @@ pub async fn run() {
             })
             .map(|b| b.key())
             .collect();
-        if !buzz_bots.is_empty() {
+        if buzz_bots.is_empty() {
+            None
+        } else {
             crate::log!(
-                "[mini-relay] ⚠️ buzz_relay_enabled=false 或初始化失败，但 bot {buzz_bots:?} 后端为 buzz：消息将被丢弃并报错"
+                "[buzz] 装配 harness（{} 个 bot 后端为 buzz：{buzz_bots:?}）——agent 懒启动，首条消息拉起",
+                buzz_bots.len()
             );
+            init_buzz_harness(&cfg)
         }
-    }
+    };
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -164,266 +147,109 @@ pub async fn run() {
         crate::install::set_desired(false);
         std::process::exit(1);
     }
-    // #200 胶水：mini-relay 服务期任务（状态初始化成功才启动）：
-    // ① buzz-acp 子进程（含存活巡检重拉）；② 回复回流 → 按频道 uuid 路由到归属
-    // bot 的 Bridge → handle_buzz_reply（#206 回复侧记账：写历史 + 发送 + 账本）；
-    // ③ WS 服务（绑定失败退避重试）；④ #206 频道集运行期刷新（登记变更免重启
-    // 接入 buzz：2s 巡检 virtual-bots.json → sync_channels → 路由表增删）。
-    // 必须在 messenger 就绪后 spawn（回流路由要查 messengers），且在 Router::new
-    // 消费 messengers 之前建好路由表（messengers 此后被 move）。
-    // 表达式值 = 注入各 Bridge 的 relay 状态（bot 循环构造时按值传入，无竞态）。
-    // #206：bridge 注册表（bot_key → Weak<Bridge>）——回流任务按它把回复交给
-    // 归属 bot 的 Bridge 处理（账本/历史/发送都在桥内闭环）；Weak 不阻止 bot 循环
-    // 退出后 Bridge 析构。路由表只需 uuid→bot_key（uuid 含 bot_key，两 bot 同群
-    // 不串线；启动快照与巡检刷新用同一份映射 root_channel_of，绝不双源漂移）。
+    // #200/#206 接线（单进程 harness）：bridge 注册表 + buzz harness 长驻任务族。
+    // 与旧 mini-relay 架构的差异：无 buzz-acp 子进程 / WS relay / 回复回流通道/
+    // 账本——回合文本由 harness 主循环经出站通道（TurnOutput）同步送回，任务②
+    // 按 meta.bot_key 路由到归属 Bridge（注册表 weak 升级，见下）。
+    // 必须在 messenger 就绪后 spawn（任务② 路由要查 messengers 集合过滤根频道），
+    // 且在 Router::new 消费 messengers 之前建好过滤集（messengers 此后被 move）。
+    // buzz 未装配（无启用 bot / pi-acp 缺失）→ handle=None，以下任务族整体跳过。
+    //
+    // 注册表任务：bot 循环构造 Bridge 时注册（weak 升级），回合消费任务查它路由
+    // （不在注册表 = 回复先于注册到达或 bot 已退出——按无对应 bridge 丢弃）。
     let bridge_registry: crate::bridge::BridgeRegistry = Default::default();
-    let buzz_relay_state: Option<std::sync::Arc<crate::buzzrelay::RelayState>> = if let Some(init) =
-        buzz_init.take()
-    {
-        let BuzzRelayInit {
-            state,
-            mut reply_rx,
-            agent_secret,
-            vbs,
-        } = init;
-        // 频道集只用于建路由表（下表）与一行日志——**不**把 Vec 长期闭包进任务：
-        // 长驻任务里读启动快照的登记表会误导后续改动（审查 #205r2）。
-        let n_vbs = vbs.len();
-        // 已启动 bot 集合（回流路由只为有 messenger/Bridge 的 bot 建——加了无桥
-        // 的条目也只会在回流任务查 registry 时落空丢弃，徒增误导）。
-        let active_bots: std::collections::HashSet<String> = messengers.keys().cloned().collect();
-        // 回复回流路由表：频道 uuid → bot_key。#206 频道集运行期刷新：RwLock——
-        // mini-relay-channels 巡检在登记变更时增删条目（写锁，见 refresh_channels_once），
-        // 回流任务读锁查询（先 clone bot_key 再放锁，不持锁过 await）。
-        let reply_routes: Arc<std::sync::RwLock<HashMap<String, String>>> = {
-            let mut map = HashMap::new();
-            for vb in &vbs {
-                if active_bots.contains(&vb.bot_key) {
-                    map.insert(
-                        crate::buzzrelay::channel_uuid(&vb.bot_key, &vb.chat_id),
-                        vb.bot_key.clone(),
-                    );
+    if let Some(handle) = &buzz_handle {
+        // 任务① harness 主循环（agent 懒启动 + 崩溃退避重拉，harness 内闭环）。
+        let run_handle = handle.clone();
+        crate::tasks::tasks().spawn_forever("buzz-harness", async move {
+            crate::buzz::harness::run_loop(run_handle).await;
+        });
+        // 任务② 回合投递消费：TurnOutput → meta.bot_key → Bridge → deliver_turn_reply
+        //（写历史 + 发送在桥内闭环；epoch 代际闸、chat 串行锁同在桥侧）。
+        // meta=None（频道回合途中被移除）无法路由 → 记日志丢弃（harness 侧保证
+        // 该频道其后不再有输出）。逐条 await 保 per-chat 发送顺序（与旧回流同语义）。
+        let registry_for_turns = bridge_registry.clone();
+        crate::tasks::tasks().spawn_forever("buzz-turn-consumer", {
+            let handle = handle.clone();
+            async move {
+                let stop = crate::tasks::shutdown_token();
+                let mut turn_rx = match handle.take_turn_rx() {
+                    Some(rx) => rx,
+                    None => {
+                        crate::log!("[buzz] 回合输出接收端已被取走（重复装配？），消费任务退出");
+                        return;
+                    }
+                };
+                loop {
+                    let out = tokio::select! {
+                        Some(o) = turn_rx.recv() => o,
+                        _ = stop.cancelled() => break,
+                    };
+                    let Some(bot_key) = out.meta.as_ref().map(|m| m.bot_key.clone()) else {
+                        crate::log!(
+                            "[buzz] 回合输出缺频道登记快照（频道已移除），丢弃 uuid={} len={}",
+                            out.channel_id,
+                            out.text.chars().count()
+                        );
+                        continue;
+                    };
+                    match registry_for_turns.get(&bot_key) {
+                        Some(b) => b.deliver_turn_reply(out).await,
+                        None => crate::log!(
+                            "[buzz] 回合输出无对应 bridge（bot 未启动/已退出？）bot={bot_key} len={}",
+                            out.text.chars().count()
+                        ),
+                    }
                 }
             }
-            Arc::new(std::sync::RwLock::new(map))
-        };
-        let relay_state_for_bots = Arc::clone(&state);
-        // buzz-acp 作者门的合法 owner = 桥身份公钥（用户消息由桥签名，见 spawn_buzz_acp）
-        let bridge_pubkey = state.bridge_pubkey();
-        let cfg = Arc::clone(&cfg);
-        let stop = crate::tasks::shutdown_token();
-        // 回流任务用的注册表句柄在闭包外克隆（外层 async move 会整体吃掉捕获变量）
-        let registry_for_replies = bridge_registry.clone();
-        crate::tasks::tasks().spawn_forever("mini-relay", async move {
-            // ① buzz-acp 子进程 + 巡检。句柄必须被长期持有：Child 置 kill_on_drop，
-            // 句柄一 drop 即 SIGKILL（审查 #205 P0——原实现 match Ok(_) 即丢，
-            // 「已拉起」日志后微秒级被杀）。巡检用 **wait() 等退出**（审查 #205r2：
-            // 30s 轮询既让崩溃恢复最多慢 30s，又在「没装二进制」的机器上每 30s 一行
-            // 日志永刷）；重拉带**指数退避下限**防快崩循环拉起。
-            crate::tasks::tasks().spawn_forever("mini-relay-acp", {
-                let cfg = Arc::clone(&cfg);
-                let bridge_pubkey = bridge_pubkey.clone();
-                let stop = stop.clone();
-                async move {
-                    // I5（buzz docs/remote-agents.md「Intentional termination is
-                    // final」）：**主动退出（exit 0 = owner !shutdown / auto-stop 到点）
-                    // 对自动重拉是终态**——巡检绝不复活操作者有意停掉的实例；崩溃
-                    // （非零/拉起失败）才重拉。再启的路径 = 重启 ABB 服务。
-                    let mut backoff = std::time::Duration::from_secs(2);
-                    let mut terminal = false;
-                    loop {
-                        if terminal {
-                            // 终态：只等关停（无常驻定时器；一行日志已在落定处打过）
-                            stop.cancelled().await;
-                            break;
-                        }
-                        let Some(mut acp) = spawn_buzz_acp(&cfg, &agent_secret, &bridge_pubkey)
-                        else {
-                            // 拉起失败（缺二进制/权限/I1 拒启）：退避重试 2s→300s 封顶
-                            crate::log!("[mini-relay] ⚠️ buzz-acp 拉起失败，{:?} 后重试", backoff);
-                            if interruptible_sleep(backoff, &stop).await {
-                                break;
-                            }
-                            backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
-                            continue;
-                        };
-                        let started = tokio::time::Instant::now();
-                        // 等退出或关停（服务期常态等待，不设总期限）
-                        let exited = tokio::select! {
-                            r = acp.wait() => Some(r),
-                            _ = stop.cancelled() => None,
-                        };
-                        // 本轮**进程存活时长**必须在任何睡眠之前快照，且在 match 之外
-                        // （复核 #205r4：判据若含睡眠时长，长睡眠自己就把它推过 60s
-                        // → 误复位 → 退避永远在 2↔64s 之间震荡，300s 封顶不可达）
-                        let lifetime = started.elapsed();
-                        match exited {
-                            // 关停：**必须显式 graceful_stop**——只 drop 句柄 = 同拍
-                            // SIGKILL，acp 的 SIGTERM 处理器根本没机会跑。
-                            // 预算诚实说明（复核 #205r4）：**空闲时** 5s 够它 flush
-                            // relay + 逐组收池后自退；**有 in-flight 轮次时不够**——
-                            // 上游先做 ≤30s 排水才开始收池（buzz lib.rs:3442），我们
-                            // 再多等也只能吃到 20s 收尾总期限（#184：期限只包关闭
-                            // 路径）。故忙时池仍走 stdin-EOF 自退兜底，缺口记 #206。
-                            None => {
-                                acp.graceful_stop(std::time::Duration::from_secs(5)).await;
-                                break;
-                            }
-                            // exit 0 = 主动停止 → I5 终态，绝不自动复活
-                            Some(Ok(st)) if st.success() => {
-                                crate::log!(
-                                    "[mini-relay] buzz-acp 主动退出（intentional）——按 I5 不再自动重拉；需再启请重启本服务"
-                                );
-                                terminal = true;
-                            }
-                            // 崩溃/等待失败 → reap（acp 已死，只剩防僵尸）后退避重拉
-                            _ => {
-                                // 稍等一拍再读 stderr 尾巴——排空任务是独立的，
-                                // wait() 返回后最后几行可能还在管道里（复核 #205r5：
-                                // 否则首条崩溃日志误报「无输出」）。
-                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                let tail = acp.stderr_tail();
-                                let reason = if tail.trim().is_empty() {
-                                    "（stderr 无输出）".to_string()
-                                } else {
-                                    crate::agent::truncate(tail.trim(), 300)
-                                };
-                                crate::log!("[mini-relay] ⚠️ buzz-acp 异常退出，退避后重拉：{reason}");
-                                acp.reap().await;
-                                if interruptible_sleep(backoff, &stop).await {
-                                    break;
-                                }
-                            }
-                        }
-                        // 翻倍/复位由 next_backoff 决策（纯函数，单测钉住时机）
-                        backoff = next_backoff(lifetime, backoff);
-                    }
-                }
-            });
-
-            // ② 回复回流（独立任务——下面的 run_server 才是本任务的常态驻留点）。
-            // 观察关停令牌：parked 在 recv() 的循环不收尾 = shutdown_wait 恒烧满总期限
-            // （仓库纪律，审查 #205r2）。
-            // #206 回复侧记账：路由改为 uuid → bot_key → Bridge 注册表（Weak 升级），
-            // 调 handle_buzz_reply——账本去重、写历史（代际闸）、chat_lock 串行发送
-            // 都在桥内闭环。逐条 await（不 spawn per reply）保 per-chat 发送顺序
-            // （风险⑦）。Bridge 未注册（bot 凭证不齐未启动）= 该频道不可能有 dispatch
-            //（dispatch 依赖同一 Bridge 存在），只可能是陈旧事件或配置漂移——记日志丢弃。
-            crate::tasks::tasks().spawn_forever("mini-relay-replies", {
-                let stop = stop.clone();
-                let registry = registry_for_replies.clone();
-                // 路由两级：先查路由表（群根频道——启动快照 + 巡检刷新增删，读锁内
-                // clone bot_key 即放锁，不持锁过 await）；未命中再按频道登记表的
-                // bot_key 回落（#206 话题频道是运行期动态登记的，不进路由表——
-                // Channel.bot_key 与 uuid 同源登记，两 bot 同群不串线）。Bridge
-                // 未注册（bot 凭证不齐未启动）仍丢+日志。
-                let state_for_routes = state.clone();
-                let reply_routes = reply_routes.clone();
-                async move {
-                    loop {
-                        let reply = tokio::select! {
-                            Some(r) = reply_rx.recv() => r,
-                            _ = stop.cancelled() => break,
-                        };
-                        let bot_key = reply_routes
-                            .read()
-                            .unwrap()
-                            .get(&reply.channel_uuid)
-                            .cloned()
-                            .or_else(|| {
-                                state_for_routes
-                                    .channel_by_uuid(&reply.channel_uuid)
-                                    .map(|ch| ch.bot_key)
-                            });
-                        let bridge = bot_key.and_then(|k| registry.get(&k));
-                        match bridge {
-                            Some(b) => b.handle_buzz_reply(reply).await,
-                            None => crate::log!(
-                                "[mini-relay] agent 回复无对应 bridge（bot 未启动/频道已移除？）chat={} len={}",
-                                crate::agent::truncate(&reply.chat_id, 16),
-                                reply.content.chars().count()
-                            ),
-                        }
-                    }
-                }
-            });
-
-            // ④ #206 频道集运行期刷新：登记变更免重启接入 buzz。2s 巡检
-            // virtual-bots.json 的 (mtime,len) 签名，变了才重读解析 → sync_channels
-            //（按 uuid diff → 更新频道表 → 重种子 → added 发 44100 / removed 发
-            // 44101）→ 按 delta 更新回流路由表（写锁）。单拍逻辑抽
-            // refresh_channels_once（纯函数化便于单测——含「损坏文件跳过本拍、
-            // 旧集保留」的防误删闸）。
-            crate::tasks::tasks().spawn_forever("mini-relay-channels", {
-                let stop = stop.clone();
-                let state = state.clone();
-                let reply_routes = reply_routes.clone();
-                async move {
-                    let path = crate::bridge_dir().join("virtual-bots.json");
-                    // 不从「当前签名」起步：启动快照与首拍之间的窗口内可能已有变更
-                    // ——首拍照常跑一遍 sync（同内容 diff 为空，幂等无开销），窗口
-                    // 内的变更也能被 diff 捕获。
-                    let mut last_sig = None;
-                    loop {
-                        if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
-                            break;
-                        }
-                        match refresh_channels_once(
-                            &state,
-                            &reply_routes,
-                            &active_bots,
-                            &path,
-                            &mut last_sig,
-                        )
-                        .await
-                        {
-                            ChannelRefresh::Unchanged => {}
-                            ChannelRefresh::Applied(delta) => {
-                                if !delta.is_empty() {
-                                    crate::log!(
-                                        "[mini-relay] 登记变更已接入 buzz：新增 {}、移除 {}、改名 {}",
-                                        delta.added.len(),
-                                        delta.removed.len(),
-                                        delta.renamed.len()
-                                    );
-                                }
-                            }
-                            ChannelRefresh::ParseFailed => crate::log!(
-                                "[mini-relay] ⚠️ virtual-bots.json 解析失败，本拍跳过（频道集保持旧值；内容修复经原子重写后下拍自动收敛——注意权限失败类问题不改 (mtime,len)，需内容变更才再触发）"
-                            ),
-                        }
-                    }
-                    crate::log!("[mini-relay] 频道巡检循环退出");
-                }
-            });
-
-            // ③ WS 服务。绑定失败（端口占用等）退避重试：relay 死了而 dispatch 活着
-            // = 静默黑洞（bridge 照常入库/摘 pending 却无人消费），服务期持续自愈。
-            // 关停感知：stop 触发即优雅排水返回 Ok → break（不再白烧收尾总期限）。
+        });
+        // 任务③ 根频道巡检：2s 轮询 virtual-bots.json 的 (mtime, len) 签名，变了才
+        // 重读 → 全量 sync_roots（harness 主循环按登记表 diff：新增注册/消失排空
+        // 队列+失效会话）。只同步已装配 messenger 的 bot（无桥频道进了登记表也只
+        // 会在 dispatch 预检落空，徒增误导——与旧 refresh_channels_once 同口径）。
+        let active_bots: std::collections::HashSet<String> = messengers.keys().cloned().collect();
+        let handle = handle.clone();
+        crate::tasks::tasks().spawn_forever("buzz-channel-sync", async move {
+            let stop = crate::tasks::shutdown_token();
+            let path = crate::bridge_dir().join("virtual-bots.json");
+            let store = crate::virtualbot::VirtualBotStore::new_at(path.clone());
+            let mut last_sig: Option<(u64, u64)> = None;
             loop {
-                crate::log!(
-                    "[mini-relay] 监听 127.0.0.1:{}（{} 个虚拟 Bot 频道）",
-                    cfg.buzz_relay_port,
-                    n_vbs
-                );
-                match
-                    crate::buzzrelay::run_server_until(state.clone(), cfg.buzz_relay_port, stop.clone())
-                        .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        crate::log!("[mini-relay] ❌ relay 服务异常退出: {e:#}（2s 后重绑）")
-                    }
-                }
                 if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
+                    break;
+                }
+                let sig = std::fs::metadata(&path).ok().map(|m| {
+                    (
+                        m.modified()
+                            .map(|t| t.elapsed().unwrap_or_default().as_nanos() as u64)
+                            .unwrap_or_default(),
+                        m.len(),
+                    )
+                });
+                if sig == last_sig {
+                    continue;
+                }
+                last_sig = sig;
+                let mut roots = Vec::new();
+                for vb in store.load() {
+                    if !active_bots.contains(&vb.bot_key) {
+                        continue;
+                    }
+                    roots.push(crate::buzz::harness::ChannelMeta {
+                        bot_key: vb.bot_key,
+                        chat_id: vb.chat_id,
+                        thread_id: None,
+                        name: vb.role_name,
+                        anchor_mid: None,
+                    });
+                }
+                if !handle.sync_roots(roots) {
+                    crate::log!("[buzz] 频道巡检发送失败（harness 已关闭）");
                     break;
                 }
             }
         });
-        Some(relay_state_for_bots)
-    } else {
-        None
-    };
+    }
 
     let router = std::sync::Arc::new(crate::deliver::Router::new(
         cfg.cross_delivery_enabled,
@@ -452,15 +278,15 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = crate::tasks::shutdown_token();
         let router = router.clone();
-        // #200：每 bot 一份 relay 状态（None=未启用/初始化失败）
-        let buzz_relay = buzz_relay_state.clone();
-        // #206：回复回流路由注册表（全部 bot 共享同一份）
+        // #200：buzz harness 句柄（None = 未装配；构造 Bridge 时注入 buzz 字段）
+        let buzz_handle = buzz_handle.clone();
+        // #206：回合投递路由注册表（全部 bot 共享同一份）
         let registry = bridge_registry.clone();
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
         handles.push(crate::tasks::tasks().spawn_forever(name, async move {
-            run_bot(bot, cfg, msgr, router, stop, buzz_relay, registry).await;
+            run_bot(bot, cfg, msgr, router, stop, buzz_handle, registry).await;
         }));
     }
     // 等所有 bot 循环结束。⚠️ 服务期的常态就是等在这里（等关停广播），**绝不能包超时**：
@@ -587,334 +413,92 @@ async fn deliver_loop(
     crate::log!("[deliver] 投递循环退出");
 }
 
-/// #200：mini-relay 初始化产物（run() 分发给 dispatch/回流/子进程管理三份消费者）。
-struct BuzzRelayInit {
-    state: std::sync::Arc<crate::buzzrelay::RelayState>,
-    reply_rx: tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
-    /// **实际生效**的 agent 私钥（config 值或生成的 buzz-agent-key）——spawn buzz-acp
-    /// 必须传它而非 config 原值：config 空时传空 → buzz-acp 身份与种子成员事件（#p）
-    /// 对不上 → discover_channels 找不到频道，dispatch 全链路静默失效（审查 #205）。
-    agent_secret: String,
-    /// 频道集来源快照（回流路由表复用同一份，两处绝不同源漂移）。
-    vbs: Vec<crate::virtualbot::VirtualBot>,
-}
-
-/// 拉起 buzz-acp（含缺省路径解析）。失败返回 None（缺二进制等）只告警——
-/// relay 仍运行，消息继续入库；调用方巡检任务会周期性重拉。
-/// 私钥/owner 都传**生效值**（agent_secret / bridge_pubkey）：owner 必须是发布
-/// 用户消息的桥身份公钥——buzz-acp respond-to=owner-only 缺 owner 即 fail-closed
-/// 丢弃全部事件（审查 #205 后追问 buzz 配置面时发现的第二个断链）。
-fn spawn_buzz_acp(
-    cfg: &Config,
-    agent_secret: &str,
-    bridge_pubkey: &str,
-) -> Option<crate::buzzacp::BuzzAcpProcess> {
-    // I1（buzz docs/remote-agents.md「Identity fail-closed」）：**空私钥/空 owner
-    // 一律拒启**——装配 harness 环境的任何一方（桌面/provider/脚本/本桥）都 MUST
-    // refuse rather than launch identityless。空身份的进程是「活着但收得到全丢」的
-    // 哑实例，比不启动更糟；这里宁可不拉，巡检 30s 后再试（配置修好自愈）。
-    if agent_secret.trim().is_empty() || bridge_pubkey.trim().is_empty() {
-        crate::log!("[mini-relay] ❌ 拒绝拉起 buzz-acp：agent 私钥或 owner 为空（I1 fail-closed）");
-        return None;
-    }
-    // #207：发布包内置 buzz 二进制——解析顺序见 resolve_buzz_exe。
-    let bundle_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let bridge_dir = crate::bridge_dir();
-    let acp_exe = resolve_buzz_exe(
-        &cfg.buzz_acp_exe,
-        "buzz-acp",
-        bundle_dir.as_deref(),
-        &bridge_dir,
-    )
-    .to_string_lossy()
-    .into_owned();
-    let agent_exe = resolve_buzz_exe(
-        &cfg.buzz_agent_exe,
-        "buzz-agent",
-        bundle_dir.as_deref(),
-        &bridge_dir,
-    )
-    .to_string_lossy()
-    .into_owned();
-    let relay_url = format!("ws://127.0.0.1:{}", cfg.buzz_relay_port);
-    match crate::buzzacp::BuzzAcpProcess::spawn(
-        &acp_exe,
-        &relay_url,
-        agent_secret,
-        &agent_exe,
-        bridge_pubkey, // 作者门 owner = 桥身份公钥（见 buzzacp::acp_env）
-    ) {
-        Ok(p) => {
-            crate::log!("[mini-relay] buzz-acp 子进程已拉起（{acp_exe} → {relay_url}）");
-            Some(p)
-        }
-        Err(e) => {
-            crate::log!(
-                "[mini-relay] ⚠️ buzz-acp spawn 失败: {e}（agent 回复不可用，relay 仍运行）"
-            );
-            None
-        }
-    }
-}
-
-/// #207：buzz-acp / buzz-agent 可执行文件解析（发布包内置 buzz 二进制）。
-/// 顺序：**配置覆盖**（原样用，不做存在性裁决——显式配置宁可在 spawn 时报清楚的
-/// 路径错）→ **应用包同目录**（发布包的 Contents/MacOS、Windows 安装目录、dev 的
-/// target/<profile>/，`current_exe()` 同目录取，abb-helper 同款先例）→
-/// **~/.agent-bridge/bin/**（旧 dev 位置）→ **PATH**（find_in_path 覆盖
-/// ~/.local/bin、homebrew 等）→ 全落空回退 ~/.agent-bridge/bin/ 路径，让报错文案
-/// 指向一个可安放位置（spawn 失败仅告警，巡检会重试）。
-/// `exe_name` 传不带扩展名的裸名（"buzz-acp"）：包内/legacy 按平台补 EXE_SUFFIX，
-/// PATH 查找由 find_in_path 自己处理 PATHEXT。
-fn resolve_buzz_exe(
-    override_path: &str,
-    exe_name: &str,
-    bundle_dir: Option<&std::path::Path>,
-    bridge_dir: &std::path::Path,
-) -> std::path::PathBuf {
-    if !override_path.is_empty() {
-        return std::path::PathBuf::from(override_path);
-    }
-    let file_name = format!("{exe_name}{}", std::env::consts::EXE_SUFFIX);
-    if let Some(p) = bundle_dir.map(|d| d.join(&file_name)) {
-        if p.is_file() {
-            return p;
-        }
-    }
-    let legacy = bridge_dir.join("bin").join(&file_name);
-    if legacy.is_file() {
-        return legacy;
-    }
-    if let Some(p) = crate::deps::find_in_path(exe_name) {
-        return p;
-    }
-    legacy
-}
-
-/// 崩溃重拉的退避决策（纯函数——复核 #205r4：这类「复位时机」错一个单测就能钉死，
-/// 故从循环里抽出）。规则：**只有活够 STABLE 才说明环境是好的、才复位**，否则翻倍
-/// 封顶 300s。`lifetime` 必须是本轮**进程存活时长**、不含任何退避睡眠——含了就
-/// 永远复位、封顶不可达。
-fn next_backoff(
-    lifetime: std::time::Duration,
-    backoff: std::time::Duration,
-) -> std::time::Duration {
-    const STABLE: std::time::Duration = std::time::Duration::from_secs(60);
-    const MAX: std::time::Duration = std::time::Duration::from_secs(300);
-    if lifetime >= STABLE {
-        std::time::Duration::from_secs(2)
+/// #200 Phase 3：装配 buzz harness——解析 agent 可执行文件（配置覆盖优先 → 主程序
+/// 同目录随包 fork buzz-agent → PATH 缺省 pi-acp；PATH 查找用 deps::composed_path
+/// 合成）→ 构造 [`BuzzHandle`]（懒启动：首条消息才拉起 agent 进程，崩溃退避重拉
+/// 在 harness 主循环内闭环）→ 登记 harness 主循环任务。turn 消费 / 根频道巡检两个
+/// 长驻任务由 run() 在 messenger 就绪后登记（它们要用注册表与 messengers 过滤集）。
+///
+/// 与旧 mini-relay 架构差异：无子进程预拉（懒启动）、无身份密钥准备（ACP 协议
+/// 不带 nostr 身份世界）、无 relay 绑定。agent 路径解析**不做存在性裁决**——配置
+/// 显式指定时宁可在懒启动 spawn 时报清楚的路径错；缺省名时交由 spawn 失败如实
+/// 留痕（用户 `npm i -g pi-acp` 后首条消息即拉起，无需重启）。
+/// 返回 handle：None = 无启用 buzz bot（run() 调用方已按此短路，防御性处理）。
+fn init_buzz_harness(cfg: &Config) -> Option<std::sync::Arc<crate::buzz::harness::BuzzHandle>> {
+    // 解析顺序：配置显式指定（绝对/裸名原样用）→ 主程序同目录的 buzz-agent
+    // （#200 随包 fork，与 lockctl 的 abb-helper 同款同目录规约）→ PATH 的 pi-acp。
+    let exe = if !cfg.buzz_agent_exe.trim().is_empty() {
+        cfg.buzz_agent_exe.trim().to_string()
     } else {
-        (backoff * 2).min(MAX)
-    }
-}
-
-/// #200：mini-relay 状态初始化（buzz_relay_enabled=true 时在 bot 循环前同步执行）。
-/// 密钥准备（桥身份 buzz-bridge-key / agent 身份 buzz-agent-key，缺则生成并持久化）
-/// → 登记表频道集 → buzz-relay.db 打开 → RelayState（含回复回流通道）→ 种子频道事件。
-/// Err = relay 不可用（磁盘/权限等）：buzz 后端随之不可用，CLI 后端不受影响。
-async fn init_buzz_relay(cfg: &Config) -> Result<BuzzRelayInit, String> {
-    // 配置校验（审查 #205r3）：port 0 = 让 OS 随机挑，但 relay_url 也印 0 →
-    // buzz-acp 永远连不上（而绑定成功，所以零订阅告警看起来像「acp 有问题」）。
-    if cfg.buzz_relay_port == 0 {
-        return Err("buzz_relay_port 不得为 0（会绑到随机端口而 acp 连不上）".into());
-    }
-    // 桥身份密钥：存 ~/.agent-bridge/buzz-bridge-key（hex；缺/坏 → 生成并**覆盖**持久化）
-    let key_path = crate::bridge_dir().join("buzz-bridge-key");
-    let bridge_keys = load_or_repair_key(&key_path, "buzz-bridge-key")?;
-    // agent 身份私钥：config 指定（合法 hex）优先；缺省/非法 → 文件 buzz-agent-key
-    // （缺/坏同样生成并覆盖）。非法 config 值不「每次启动临时重生成」——那会让种子
-    // 成员事件跨启动堆积互相矛盾的 agent 身份（审查 #205）；回落文件身份，并把
-    // **生效值**回传给 spawn（种子与子进程必须同一身份）。
-    let agent_key_path = crate::bridge_dir().join("buzz-agent-key");
-    let cfg_key = cfg.buzz_agent_private_key.trim();
-    let cfg_parsed = if cfg_key.is_empty() {
-        None
-    } else {
-        nostr::prelude::Keys::parse(cfg_key).ok()
-    };
-    let (agent_keys, agent_secret) = match cfg_parsed {
-        Some(k) => (k, cfg_key.to_string()),
-        None => {
-            if !cfg_key.is_empty() {
-                crate::log!("[mini-relay] ⚠️ config buzz_agent_private_key 非法（非 hex 私钥），回落文件身份 buzz-agent-key");
-            }
-            let k = load_or_repair_key(&agent_key_path, "buzz-agent-key")?;
-            let hex = k.secret_key().display_secret().to_string();
-            (k, hex)
+        let bundled = std::env::current_exe()
+            .ok()
+            .and_then(|me| me.parent().map(|d| d.join("buzz-agent")))
+            .filter(|p| p.is_file());
+        match bundled {
+            Some(p) => p.display().to_string(), // 绝对路径：find 检查跳过、spawn 直接可用
+            None => "pi-acp".to_string(),
         }
     };
-    let agent_pubkey = agent_keys.public_key().to_hex();
-    // 频道集：登记的虚拟 Bot 群（uuid 派生 + chat_id + 角色名/描述）——映射与
-    // 运行期刷新（mini-relay-channels 巡检）共用 root_channel_of，两处绝不漂移。
-    let vbs = crate::virtualbot::VirtualBotStore::new().load();
-    let channels: Vec<crate::buzzrelay::Channel> = vbs.iter().map(root_channel_of).collect();
-    let n_channels = channels.len();
-    let bridge_pubkey = bridge_keys.public_key().to_hex();
-    let store = crate::buzzrelay::EventStore::open(&crate::bridge_dir().join("buzz-relay.db"))
-        .await
-        .map_err(|e| format!("buzz-relay.db 打开失败: {e}"))?;
-    let (state, reply_rx) =
-        crate::buzzrelay::RelayState::new(store, bridge_keys, agent_pubkey.clone());
-    state.set_channels(channels);
-    state.seed_channel_events().await;
-    crate::log!(
-        "[mini-relay] 初始化完成（{n_channels} 个虚拟 Bot 频道，agent={agent_pubkey:.16}…，owner 门=桥身份 {bridge_pubkey:.16}…）"
-    );
-    Ok(BuzzRelayInit {
-        state,
-        reply_rx,
-        agent_secret,
-        vbs,
-    })
-}
-
-/// #200/#206：登记条目 → 群根频道映射（启动登记 init_buzz_relay 与运行期刷新
-/// refresh_channels_once 共用同一入口——两处绝不漂移）。话题频道不在此（运行期
-/// 由 ensure_topic_channel 惰性登记，不归 virtual-bots.json 管）。
-fn root_channel_of(vb: &crate::virtualbot::VirtualBot) -> crate::buzzrelay::Channel {
-    crate::buzzrelay::Channel {
-        uuid: crate::buzzrelay::channel_uuid(&vb.bot_key, &vb.chat_id),
-        chat_id: vb.chat_id.clone(),
-        name: vb.role_name.clone(),
-        about: String::new(),
-        bot_key: vb.bot_key.clone(),
-        thread_id: String::new(), // 群根频道；话题频道运行期由 ensure_topic_channel 登记
-        anchor_mid: String::new(),
-    }
-}
-
-/// #206 频道集运行期刷新·单拍结果（巡检循环据此记日志；测试据此断言）。
-#[derive(Debug)]
-enum ChannelRefresh {
-    /// 签名未变：本拍 no-op（只付一次 stat）
-    Unchanged,
-    /// 文件损坏/读失败：本拍跳过、旧集保留（防误删闸，见 refresh_channels_once）
-    ParseFailed,
-    /// 已解析并同步（delta 可能为空——内容变了但 uuid 集无 diff）
-    Applied(crate::buzzrelay::ChannelDelta),
-}
-
-/// #206 频道集运行期刷新·单拍逻辑（mini-relay-channels 巡检循环逐拍调用；
-/// 抽出便于单测）。
-///
-/// 签名（mtime,len）未变 → Unchanged。变了 → **自行 read_to_string + serde_json
-/// 解析**——绝不用 VirtualBotStore::load（它把解析失败吞成空 vec：损坏瞬间全量
-/// 误判删除 → 44101 风暴 → acp 退订所有频道）：
-/// - 文件不存在 / 合法空数组 → 真空集（全删——取消登记/全部解散的真实形态）；
-/// - 解析失败 / 读失败（权限等）→ ParseFailed，**本拍跳过、旧集保留**。签名照记
-///   ——同一坏文件不每 2s 刷屏重试；原子重写修复后签名变化，下一拍自然收敛。
-///
-/// 解析成功 → sync_channels（diff → 更新频道表 → 重种子 → added 发 44100 /
-/// removed 发 44101）→ 按 delta 更新回流路由表（写锁短持）：added 只为活跃 bot
-///（有 messenger/Bridge）建 uuid→bot_key（无桥的条目只会在回流任务查 registry
-/// 时落空丢弃，不建）；removed 直接 remove；renamed 的 uuid→bot_key 映射不变
-///（不动）。路由表与 relay 频道表在本函数内同源更新，两处绝不漂移。
-async fn refresh_channels_once(
-    state: &crate::buzzrelay::RelayState,
-    reply_routes: &std::sync::RwLock<HashMap<String, String>>,
-    active_bots: &std::collections::HashSet<String>,
-    path: &std::path::Path,
-    last_sig: &mut Option<(std::time::SystemTime, u64)>,
-) -> ChannelRefresh {
-    let sig = std::fs::metadata(path).ok().map(|m| {
-        (
-            m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-            m.len(),
-        )
-    });
-    if *last_sig == sig {
-        return ChannelRefresh::Unchanged;
-    }
-    // 先记签名再处理：解析失败也记（同一坏文件不每拍重试刷屏；修复后签名变，
-    // 下一拍自然重读）。长度进签名同 refresh_virtual_bots 纪律（防同 mtime tick
-    // 内两次连续写入漏刷新）。
-    *last_sig = sig;
-    let vbs: Vec<crate::virtualbot::VirtualBot> = match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => return ChannelRefresh::ParseFailed,
-        },
-        // 文件不存在 = 合法空集（登记表被整体清掉/尚未创建），与 VirtualBotStore::load 同口径
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        // 读失败（权限/IO 等）：同损坏口径——跳过本拍保旧集，不误删
-        Err(_) => return ChannelRefresh::ParseFailed,
-    };
-    let channels: Vec<crate::buzzrelay::Channel> = vbs.iter().map(root_channel_of).collect();
-    let delta = state.sync_channels(channels).await;
-    if !delta.is_empty() {
-        let mut routes = reply_routes.write().unwrap();
-        for ch in &delta.added {
-            if active_bots.contains(&ch.bot_key) {
-                routes.insert(ch.uuid.clone(), ch.bot_key.clone());
-            } else {
-                crate::log!(
-                    "[mini-relay] 新登记频道的归属 bot 未启动（凭证不齐/已停用），回流路由不建 bot={} uuid={}",
-                    ch.bot_key,
-                    crate::agent::truncate(&ch.uuid, 16)
-                );
-            }
-        }
-        for ch in &delta.removed {
-            routes.remove(&ch.uuid);
-        }
-    }
-    ChannelRefresh::Applied(delta)
-}
-
-/// #200：读取并校验本地 hex 私钥；缺失/空/损坏一律**重新生成并覆盖持久化**。
-///
-/// 三条硬要求（审查 #205r2）：
-/// - **绝不 panic**：init_buzz_relay 在 run() 的关键路径上 await，不在 tasks 的
-///   catch_unwind 保护内——这里 panic = 整个服务连 CLI bot 一起崩、看门狗 2s 重拉
-///   = 崩溃循环。原实现「解析失败→再调 load（读同一坏文件）→expect」正是踩这个：
-///   #202 时代裸 fs::write 可能留下截断内容，坏文件必须被**覆盖**而不是回读。
-///   失败统一走 Err → relay=None → 只有 buzz 不可用。
-/// - **读取路径也收权限**：#202 时代写过 0644 的密钥文件，只在新建分支 chmod 等于
-///   永不修复；读成功也要收紧 0600。
-/// - 原子写复用 atomic_write_sensitive（0600 + tmp+rename），不再新增手写副本。
-fn load_or_repair_key(path: &std::path::Path, label: &str) -> Result<nostr::prelude::Keys, String> {
-    if let Ok(s) = std::fs::read_to_string(path) {
-        let t = s.trim().to_string();
-        if !t.is_empty() {
-            match nostr::prelude::Keys::parse(&t) {
-                Ok(k) => {
-                    // 读成功也要修权限（历史遗留 0644 在此收敛）
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-                    }
-                    return Ok(k);
-                }
-                Err(e) => {
-                    crate::log!("[mini-relay] ⚠️ {label} 内容无法解析（{e}），重新生成并覆盖旧文件")
-                }
-            }
-        }
-    }
-    let k = nostr::prelude::Keys::generate();
-    let hex = k.secret_key().display_secret().to_string();
-    if let Err(e) = crate::atomic_write_sensitive(path, &hex) {
+    if !std::path::Path::new(&exe).is_absolute() && crate::deps::find_in_path(&exe).is_none() {
         crate::log!(
-            "[mini-relay] ⚠️ {label} 持久化失败: {e}（本次身份不落盘，重启会换；不影响本次运行）"
+            "[buzz] ⚠️ agent 可执行文件 {exe:?} 不在 PATH（composed_path 已含 \
+             ~/.local/bin、~/.npm-global/bin 等）——buzz 后端将不可用直到装上；\
+             首条消息的拉起失败会如实留痕。装法：npm i -g pi-acp（或改配置 \
+             buzz_agent_exe 指到绝对路径）"
         );
     }
-    Ok(k)
+    // 供应商 env：harness 共享一份 agent 进程 → env 全局一份——取首个启用 buzz bot
+    // 的生效供应商装配（区别于其它后端的 per-bot 注入：buzz 是 ACP 常驻进程池，
+    // 一个 agent 进程只能带一组凭据）。多 buzz bot 供应商不一致 → 后登记的 bot 会
+    // 沿首个 env 请求（超出共享进程架构，配置时按同一供应商/全局默认统一即可）。
+    let mut extra_env = vec![("PATH".to_string(), crate::deps::composed_path())];
+    if let Some(bot) = cfg.bots.iter().find(|b| {
+        b.enabled
+            && crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend)).is_buzz()
+    }) {
+        if let Some(p) = cfg.resolve_provider(bot) {
+            match crate::agent::buzz_provider_env(Some(p)) {
+                Ok(Some(env)) => {
+                    crate::log!(
+                        "[buzz] 供应商 env 注入：首个 buzz bot「{}」的生效供应商「{}」（kind={}）",
+                        bot.name,
+                        p.name,
+                        p.kind
+                    );
+                    extra_env.extend(env);
+                }
+                Ok(None) => {}
+                Err(e) => crate::log!("[buzz] ⚠️ 供应商注入失败（走纯宿主 env）：{e}"),
+            }
+        }
+    }
+    let handle = crate::buzz::harness::BuzzHandle::new(
+        crate::buzz::harness::AgentConfig {
+            command: exe,
+            args: Vec::new(),
+            // PATH 无条件覆盖为 ABB 合成值（acp.rs 对 extra_env 是无条件覆盖语义）：
+            // launchd/GUI 环境 PATH 极简（/usr/bin:/bin），找不到 npm 全局安装的
+            // agent 是历史高发问题——子进程必须看到与终端一致的 PATH。
+            extra_env,
+        },
+        crate::tasks::shutdown_token(),
+        // agent 子进程工作目录 = ABB 启动时的当前目录（与旧 buzz-acp spawn 同源；
+        // 上游 session/update 落盘相对路径的锚点）。
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| crate::bridge_dir().to_string_lossy().into_owned()),
+    );
+    Some(handle)
 }
 
-/// 单个 bot 的全套：事件循环（飞书 WS / 微信长轮询）+ 定时任务调度循环。
-/// msgr 由 run() 构建并登记进跨会话投递路由表后传入（Bridge 与路由表共享同一实例）。
 async fn run_bot(
     bot: crate::config::BotConfig,
     cfg: Arc<Config>,
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
-    buzz_relay: Option<std::sync::Arc<crate::buzzrelay::RelayState>>, // #200：buzz dispatch 用
-    bridge_registry: crate::bridge::BridgeRegistry,                   // #206：buzz 回复回流路由用
+    buzz_handle: Option<std::sync::Arc<crate::buzz::harness::BuzzHandle>>, // #200：buzz dispatch 用
+    bridge_registry: crate::bridge::BridgeRegistry,                        // #206：回合投递路由用
 ) {
     let key = bot.key();
     crate::log!(
@@ -924,10 +508,10 @@ async fn run_bot(
     );
     let bridge = {
         let mut b = Bridge::new(msgr, bot.clone(), &cfg);
-        b.buzz_relay_state = buzz_relay; // #200：buzz dispatch 用；未启用/初始化失败 = None
+        b.buzz = buzz_handle; // #200：buzz dispatch 用；未装配（无 buzz bot/pi-acp 缺失）= None
         Arc::new(b)
     };
-    // #206：注册进回流路由表（必须在事件循环开始前——dispatch 只能发生在注册后，
+    // #206：注册进回合投递路由表（必须在事件循环开始前——dispatch 只能发生在注册后，
     // 回复不可能先于注册到达）。
     bridge_registry.register(&key, &bridge);
 
@@ -971,18 +555,9 @@ async fn run_bot(
         });
     }
 
-    // #206 回复侧记账·启动对账：buzz 回复在「relay 已入库 → 桥未发送」崩溃窗口
-    // （含发送失败留账）的条目补发 + 补历史。buzz 未启用（relay=None）时函数内
-    // 直接返回，不占资源。短命任务登记进治理；token 逐条检查（对账会真实发送
-    // 消息，关停广播后立即停，剩余留账下次启动续对）。
-    {
-        let bridge = bridge.clone();
-        let stop = stop.clone();
-        let name: &'static str = Box::leak(format!("buzz-recover:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn(name, async move {
-            bridge.recover_buzz_replies(&stop).await;
-        });
-    }
+    // #206 启动对账已随账本/relay 架构删除：同步形态下回合表（turn_registry）纯内存，
+    // 崩溃即失——in-flight 回合不补发（at-most-once，见 buzzreply.rs 模块文档），
+    // 未跑完的用户消息由上方 recover_pending 按 pending.json 重放续跑。
 
     // #33 历史会话迁移**自动触发**：每次启动把后端私有 session 里尚未导入的对话
     // （claude/codex/pi）导入 history.rs——老历史参与注入接续，无需手动跑
@@ -1632,87 +1207,6 @@ async fn run_job(
 mod tests {
     use super::*;
 
-    /// 退避时机回归（复核 #205r4）：快崩循环必须**单调爬封顶**，长命进程才复位。
-    /// 上一版的复位判据混进了睡眠时长 → 2↔64s 永震、300s 不可达；本测试按「lifetime
-    /// 只含进程存活」的语义钉死它。
-    #[test]
-    fn next_backoff_climbs_to_cap_and_only_resets_when_stable() {
-        let d = std::time::Duration::from_secs;
-        // 快崩（每轮活 1s）：持续翻倍到 300s 封顶，绝不回落
-        let mut b = d(2);
-        for _ in 0..12 {
-            b = next_backoff(d(1), b);
-        }
-        assert_eq!(b, d(300), "连续快崩必须爬到封顶而不是被复位");
-        // 短睡不算稳定：睡眠 64s 后本轮再崩（进程只活了 1s）也不得复位
-        assert_eq!(next_backoff(d(1), d(64)), d(128));
-        // 真活够了才复位
-        assert_eq!(next_backoff(d(61), d(300)), d(2));
-    }
-
-    /// 测试临时目录 RAII 清理（审查 #208r2）：assert 失败路径也必须清，
-    /// 不能只在全过时删——guard 在 unwind 时照样 drop。
-    struct TempDirGuard(std::path::PathBuf);
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// #207：buzz 可执行文件解析顺序——配置覆盖 → 应用包同目录 → ~/.agent-bridge/bin
-    /// → PATH → 回退 ~/.agent-bridge/bin 路径。用保证不存在的名字隔离 PATH 环境差异
-    /// （本机真装了 buzz-acp 时 PATH 支路命中会让「回退」断言失真）。
-    #[test]
-    fn resolve_buzz_exe_orders_override_bundle_legacy_then_fallback() {
-        let root = std::env::temp_dir().join(format!(
-            "abb-resolve-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        let bundle = root.join("bundle");
-        let bridge = root.join("bridge");
-        let legacy_bin = bridge.join("bin");
-        std::fs::create_dir_all(&bundle).unwrap();
-        std::fs::create_dir_all(&legacy_bin).unwrap();
-        let _cleanup = TempDirGuard(root.clone());
-        let name = "buzz-acp-test-fixture-not-installed";
-        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-
-        // 1. 配置覆盖最高优先：即使路径不存在也原样用（存在性交给 spawn 报错）
-        assert_eq!(
-            resolve_buzz_exe("/custom/acp", name, Some(&bundle), &bridge),
-            std::path::PathBuf::from("/custom/acp")
-        );
-        // 2. 包内与 legacy 同时存在 → 包内胜（发布场景：包内版本随 ABB 升级）
-        std::fs::write(bundle.join(&file), b"x").unwrap();
-        std::fs::write(legacy_bin.join(&file), b"x").unwrap();
-        assert_eq!(
-            resolve_buzz_exe("", name, Some(&bundle), &bridge),
-            bundle.join(&file)
-        );
-        // 3. 包内缺失 → legacy
-        std::fs::remove_file(bundle.join(&file)).unwrap();
-        assert_eq!(
-            resolve_buzz_exe("", name, Some(&bundle), &bridge),
-            legacy_bin.join(&file)
-        );
-        // 4. 全落空 → 回退 legacy 路径（不存在也返回，报错文案指向可安放位置）
-        std::fs::remove_file(legacy_bin.join(&file)).unwrap();
-        assert_eq!(
-            resolve_buzz_exe("", name, Some(&bundle), &bridge),
-            legacy_bin.join(&file)
-        );
-        // 5. bundle_dir 为 None（current_exe 解析失败）不 panic
-        assert_eq!(
-            resolve_buzz_exe("", name, None, &bridge),
-            legacy_bin.join(&file)
-        );
-    }
-
-    /// #189 回归护栏（服务期无期限）：健康 bot 循环（不自行结束、无关停广播）期间，
     /// 等待绝不能提前返回进入关闭路径——旧实现把 30s 逐 handle 时限放在服务期，
     /// 健康服务 30s×bot 数后必然自关停（真机 2 bot=60s、实验室 1 bot=30s 重启风暴）。
     /// 探针期内不返回即「无期限」。
@@ -1983,293 +1477,5 @@ mod tests {
         let p = job_prompt(&job, &bot_key);
         assert!(p.contains("简单提醒"));
         assert!(!p.starts_with("[受限模式]"));
-    }
-
-    /// #1 回归（审查 #205r2）：**密钥文件损坏不得 panic**。#202 时代用裸 fs::write
-    /// 写过该文件（无原子性），崩溃可留下截断内容；原「解析失败 → 再调 load（读同
-    /// 一坏文件）→ expect」会在 run() 的关键路径上确定性 panic——init_buzz_relay
-    /// 不在 tasks 的 catch_unwind 内，整个服务连 CLI bot 一起崩、看门狗 2s 重拉
-    /// = 崩溃循环。现要求：覆盖重生成、返回 Ok、跨调用身份稳定、权限收 0600。
-    #[test]
-    fn load_or_repair_key_repairs_corrupt_file_without_panic() {
-        let dir = std::env::temp_dir().join(format!("abb-keyfix-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("buzz-bridge-key");
-        std::fs::write(&p, "截断的坏内容-not-a-hex-key").unwrap();
-
-        let k = load_or_repair_key(&p, "buzz-bridge-key").expect("坏文件必须重生成而非 panic");
-        // 覆盖生效：盘上内容现在可解析，且就是本次返回的那把
-        let on_disk = std::fs::read_to_string(&p).unwrap();
-        let reparsed = nostr::prelude::Keys::parse(on_disk.trim()).expect("落盘内容必须可解析");
-        assert_eq!(reparsed.public_key().to_hex(), k.public_key().to_hex());
-        // 跨重启稳定：第二次读直接命中修好的文件（同一身份，不再换）
-        let again = load_or_repair_key(&p, "buzz-bridge-key").unwrap();
-        assert_eq!(again.public_key().to_hex(), k.public_key().to_hex());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "密钥文件不得世界可读（读取路径也要收权限）");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ---- #206 频道集运行期刷新（refresh_channels_once）----
-
-    /// 夹具：临时登记表路径 + 临时 relay 库 + 空路由表 + 活跃 bot 集 {bot_a}。
-    /// 全程不触碰真实 ~/.agent-bridge（路径全部注入）。
-    struct RefreshFixture {
-        db_path: std::path::PathBuf,
-        _dir: TempDirGuard,
-        state: std::sync::Arc<crate::buzzrelay::RelayState>,
-        routes: std::sync::RwLock<HashMap<String, String>>,
-        active: std::collections::HashSet<String>,
-        path: std::path::PathBuf,
-        _rx: tokio::sync::mpsc::Receiver<crate::buzzrelay::AgentReply>,
-    }
-
-    async fn refresh_fixture(name: &str) -> RefreshFixture {
-        let dir = std::env::temp_dir().join(format!("abb-refresh-{name}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = crate::buzzrelay::test_db("abb-refresh");
-        let store = crate::buzzrelay::EventStore::open(&db_path).await.unwrap();
-        let (state, rx) = crate::buzzrelay::RelayState::new(
-            store,
-            nostr::prelude::Keys::generate(),
-            nostr::prelude::Keys::generate().public_key().to_hex(),
-        );
-        RefreshFixture {
-            db_path,
-            path: dir.join("virtual-bots.json"),
-            _dir: TempDirGuard(dir),
-            state,
-            routes: std::sync::RwLock::new(HashMap::new()),
-            active: std::collections::HashSet::from(["bot_a".to_string()]),
-            _rx: rx,
-        }
-    }
-
-    impl RefreshFixture {
-        fn cleanup(self) {
-            crate::buzzrelay::remove_test_db(&self.db_path);
-        }
-    }
-
-    /// 写登记表（(bot_key, chat_id, role_name) 三元组 → JSON）。
-    fn write_vbs(path: &std::path::Path, entries: &[(&str, &str, &str)]) {
-        let v: Vec<crate::virtualbot::VirtualBot> = entries
-            .iter()
-            .map(|(b, c, r)| crate::virtualbot::VirtualBot {
-                bot_key: b.to_string(),
-                chat_id: c.to_string(),
-                role_name: r.to_string(),
-                created_at: 1,
-            })
-            .collect();
-        std::fs::write(path, serde_json::to_string(&v).unwrap()).unwrap();
-    }
-
-    /// 签名未变 → Unchanged no-op（首轮处理后第二拍不重读不同步）。
-    #[tokio::test]
-    async fn refresh_channels_once_noop_when_signature_unchanged() {
-        let fx = refresh_fixture("noop").await;
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        let mut sig = None;
-        let first =
-            refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        let uuid_a = crate::buzzrelay::channel_uuid("bot_a", "oc_a");
-        match first {
-            ChannelRefresh::Applied(d) => assert_eq!(d.added.len(), 1),
-            other => panic!("首拍必须 Applied: {other:?}"),
-        }
-        assert!(fx.routes.read().unwrap().contains_key(&uuid_a));
-        assert!(fx.state.channel_by_uuid(&uuid_a).is_some());
-        // 签名未变 → no-op
-        let second =
-            refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(
-            matches!(second, ChannelRefresh::Unchanged),
-            "签名未变必须 Unchanged: {second:?}"
-        );
-        fx.cleanup();
-    }
-
-    /// added 进表（路由 + relay 频道表 + 44100）；removed 出表（路由移除 + 频道
-    /// 出表 + 44101 入库）。
-    #[tokio::test]
-    async fn refresh_channels_once_adds_and_removes_routes() {
-        let fx = refresh_fixture("adddel").await;
-        let mut sig = None;
-        let uuid_a = crate::buzzrelay::channel_uuid("bot_a", "oc_a");
-        let uuid_b = crate::buzzrelay::channel_uuid("bot_a", "oc_b");
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-
-        // 新增 oc_b → added 进表 + 44100 入库
-        write_vbs(
-            &fx.path,
-            &[("bot_a", "oc_a", "角色A"), ("bot_a", "oc_b", "角色B")],
-        );
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        match r {
-            ChannelRefresh::Applied(d) => {
-                assert_eq!(d.added.len(), 1, "新增必须进 added");
-                assert!(d.removed.is_empty());
-            }
-            other => panic!("新增拍必须 Applied: {other:?}"),
-        }
-        {
-            let routes = fx.routes.read().unwrap();
-            assert_eq!(routes.get(&uuid_b).map(String::as_str), Some("bot_a"));
-            assert!(routes.contains_key(&uuid_a));
-        }
-        assert!(fx.state.channel_by_uuid(&uuid_b).is_some());
-        // 首轮 oc_a 的 44100 + 本轮 oc_b 的 44100 = 2 条（各自入库可回放）
-        let f44100: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[44100]}"#).unwrap();
-        assert_eq!(
-            fx.state.query(&[f44100]).await.len(),
-            2,
-            "每个新增频道必须各发一条 44100（入库可回放）"
-        );
-
-        // 移除 oc_b → removed 出表 + 44101 入库
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        match r {
-            ChannelRefresh::Applied(d) => {
-                assert_eq!(d.removed.len(), 1, "移除必须进 removed");
-                assert!(d.added.is_empty());
-            }
-            other => panic!("移除拍必须 Applied: {other:?}"),
-        }
-        {
-            let routes = fx.routes.read().unwrap();
-            assert!(!routes.contains_key(&uuid_b), "移除后路由必须出表");
-            assert!(routes.contains_key(&uuid_a));
-        }
-        assert!(fx.state.channel_by_uuid(&uuid_b).is_none());
-        let f44101: nostr::prelude::Filter = serde_json::from_str(r#"{"kinds":[44101]}"#).unwrap();
-        assert_eq!(fx.state.query(&[f44101]).await.len(), 1, "移除必须发 44101");
-        fx.cleanup();
-    }
-
-    /// 防误删回归（必修）：登记表损坏（非法 JSON）→ ParseFailed 跳过本拍，
-    /// **旧集保留**（路由与频道表原样，绝不发 44101 风暴）。同一坏文件不重复
-    /// 处理（签名照记 → 下一拍 Unchanged）；修复后（合法 JSON）自然收敛。
-    #[tokio::test]
-    async fn refresh_channels_once_corrupt_file_skips_and_keeps_old_set() {
-        let fx = refresh_fixture("corrupt").await;
-        let mut sig = None;
-        let uuid_a = crate::buzzrelay::channel_uuid("bot_a", "oc_a");
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(fx.routes.read().unwrap().contains_key(&uuid_a));
-        // 首轮新增的 44100 已在库（1 条）——损坏拍的判据是「不得新增任何成员通知」
-        let fm: nostr::prelude::Filter =
-            serde_json::from_str(r#"{"kinds":[44100,44101]}"#).unwrap();
-        let before = fx.state.query(std::slice::from_ref(&fm)).await.len();
-
-        // 文件损坏（如半截写入/手滑编辑）→ 跳过且旧集保留
-        std::fs::write(&fx.path, "not-json{{{").unwrap();
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(
-            matches!(r, ChannelRefresh::ParseFailed),
-            "损坏必须 ParseFailed: {r:?}"
-        );
-        assert!(
-            fx.routes.read().unwrap().contains_key(&uuid_a),
-            "损坏瞬间路由必须保留（防全量误删 → 44101 风暴）"
-        );
-        assert!(
-            fx.state.channel_by_uuid(&uuid_a).is_some(),
-            "频道表必须保留"
-        );
-        assert_eq!(
-            fx.state.query(std::slice::from_ref(&fm)).await.len(),
-            before,
-            "损坏拍不得新增任何成员通知（尤其不得有 44101 误删通知）"
-        );
-        // 同一坏文件不每拍重试（签名照记）→ Unchanged
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(
-            matches!(r, ChannelRefresh::Unchanged),
-            "坏文件不得刷屏重试: {r:?}"
-        );
-        // 修复后收敛（内容同旧值 → Applied 空 delta，旧集依旧）
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(
-            matches!(r, ChannelRefresh::Applied(_)),
-            "修复后必须收敛: {r:?}"
-        );
-        assert!(fx.routes.read().unwrap().contains_key(&uuid_a));
-        fx.cleanup();
-    }
-
-    /// 合法空数组 → 真空集：全部群根频道移除（取消登记/全部解散的真实形态）。
-    #[tokio::test]
-    async fn refresh_channels_once_legal_empty_array_removes_all() {
-        let fx = refresh_fixture("empty").await;
-        let mut sig = None;
-        let uuid_a = crate::buzzrelay::channel_uuid("bot_a", "oc_a");
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        std::fs::write(&fx.path, "[]").unwrap();
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        match r {
-            ChannelRefresh::Applied(d) => assert_eq!(d.removed.len(), 1, "空数组必须全删"),
-            other => panic!("空数组拍必须 Applied: {other:?}"),
-        }
-        assert!(fx.routes.read().unwrap().is_empty());
-        assert!(fx.state.channel_by_uuid(&uuid_a).is_none());
-        fx.cleanup();
-    }
-
-    /// 文件不存在 = 真空集（与 VirtualBotStore::load 同口径）：从有到无 → 全删；
-    /// 从无到有 → 新增。
-    #[tokio::test]
-    async fn refresh_channels_once_missing_file_is_empty_set() {
-        let fx = refresh_fixture("missing").await;
-        let mut sig = None;
-        let uuid_a = crate::buzzrelay::channel_uuid("bot_a", "oc_a");
-        // 从未存在：sig None == last_sig None → no-op（正确处理：无事可做）
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(matches!(r, ChannelRefresh::Unchanged));
-        // 创建 → 新增
-        write_vbs(&fx.path, &[("bot_a", "oc_a", "角色A")]);
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        assert!(matches!(r, ChannelRefresh::Applied(_)));
-        assert!(fx.routes.read().unwrap().contains_key(&uuid_a));
-        // 删除（测试自建的临时文件）→ 全删
-        std::fs::remove_file(&fx.path).unwrap();
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        match r {
-            ChannelRefresh::Applied(d) => assert_eq!(d.removed.len(), 1, "文件消失必须全删"),
-            other => panic!("文件消失拍必须 Applied: {other:?}"),
-        }
-        assert!(fx.routes.read().unwrap().is_empty());
-        fx.cleanup();
-    }
-
-    /// 归属 bot 未启动（无 messenger/Bridge）的新登记：频道进 relay 表（dispatch
-    /// 侧预检「频道已登记」不骗用户），但**不建回流路由**（建了也只会在回流任务
-    /// 查 registry 落空丢弃）。
-    #[tokio::test]
-    async fn refresh_channels_once_skips_route_for_inactive_bot() {
-        let fx = refresh_fixture("inactive").await;
-        let mut sig = None;
-        write_vbs(&fx.path, &[("bot_x", "oc_x", "角色X")]); // bot_x 不在活跃集
-        let r = refresh_channels_once(&fx.state, &fx.routes, &fx.active, &fx.path, &mut sig).await;
-        match r {
-            ChannelRefresh::Applied(d) => assert_eq!(d.added.len(), 1),
-            other => panic!("必须 Applied: {other:?}"),
-        }
-        let uuid_x = crate::buzzrelay::channel_uuid("bot_x", "oc_x");
-        assert!(fx.state.channel_by_uuid(&uuid_x).is_some(), "频道必须进表");
-        assert!(
-            fx.routes.read().unwrap().is_empty(),
-            "无桥 bot 不得建回流路由"
-        );
-        fx.cleanup();
     }
 }

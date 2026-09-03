@@ -66,7 +66,7 @@ fn send_cmd(cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
 /// 状态摘要：not-installed | installed(ok|unreachable)。
 pub fn status() -> String {
     if !helper_installed() {
-        return format!("not-installed（特权助手未安装，可执行 `--lockctl install`）");
+        return "not-installed（特权助手未安装，可执行 `--lockctl install`）".to_string();
     }
     match send_cmd(&serde_json::json!({ "cmd": "status" })) {
         Ok(v) => {
@@ -250,7 +250,7 @@ fn run_admin(script: &str) -> Result<String, String> {
     if out.status.success() {
         Ok(stdout)
     } else {
-        Err(format!("{stderr}").trim().to_string())
+        Err(stderr.trim().to_string())
     }
 }
 
