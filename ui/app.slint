@@ -1513,7 +1513,9 @@ export component SettingsWindow inherits Window {
                                 action-label: "去授权 ›";
                                 clicked => { root.current-page = 2; }
                             }
-                            // 跨会话投递是开关不是跳转，卡片内直接放 CheckBox（PixelCard 外壳）
+                            // 跨会话投递是开关不是跳转，卡片内直接放 CheckBox（PixelCard 外壳）。
+                            // 内容必须少于 122px（与 QuickCard 同高）：曾因 wrap 说明 + 状态行
+                            // 溢出卡外（「已开启」漂出底边）——状态由勾选态表达，文案缩一行。
                             PixelCard {
                                 height: 122px;
                                 horizontal-stretch: 1;
@@ -1525,8 +1527,7 @@ export component SettingsWindow inherits Window {
                                         checked: root.cross-delivery-enabled;
                                         toggled => { root.set-cross-delivery(self.checked); }
                                     }
-                                    Text { text: "允许 agent 把结果投递到其它 bot 的会话"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
-                                    Text { text: root.cross-delivery-enabled ? "已开启" : "已关闭"; font-size: 12px; font-weight: 600; color: UiTokens.info; }
+                                    Text { text: "允许 agent 把结果投递到其它 bot"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: no-wrap; overflow: elide; }
                                 }
                             }
                         }
@@ -1560,6 +1561,7 @@ export component SettingsWindow inherits Window {
                                                 spacing: 2px;
                                                 for bot[idx] in root.bots: Rectangle {
                                                 height: 38px;
+                                                vertical-stretch: 0; // 禁 VerticalBox 拉伸：bot 少时列表项不撑满整列（38px 恒定）
                                                 background: idx == root.selected ? PixelTheme.accent : transparent;
                                                 border-radius: 0px;
                                                 TouchArea {
@@ -1580,6 +1582,10 @@ export component SettingsWindow inherits Window {
                                                         }
                                                     }
                                                 }
+                                                // spacer：ScrollPanel 的 viewport 会被拉伸到视口高，无 spacer 时
+                                                // 唯一内容（for 项）跟着被拉高成大色块——spacer 吸收剩余空间，
+                                                // 列表项保持 38px 恒定（bot 少时空白沉底）
+                                                Rectangle { vertical-stretch: 1; }
                                             }
                                         }
                                         }
@@ -1682,8 +1688,14 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 // #163 full-access 警示：选全权限时明确提示（不限制权限，可读写全盘）
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].sandbox-mode == "full-access": Row {
-                                                    Text { text: "⚠️"; width: 80px; color: #e5484d; vertical-alignment: center; }
-                                                    Text { text: "full-access 不限制权限，可读写全盘，请谨慎使用"; color: #e5484d; vertical-alignment: center; horizontal-stretch: 1; }
+                                                    // ⚠️ 字符在本机字体缺字形渲染成空心方框——用 alert 图标（同 ImageIcon 约定）
+                                                    Rectangle { width: 80px; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        spacing: 6px;
+                                                        ImageIcon { icon: @image-url("icons/alert.svg"); tint: #e5484d; }
+                                                        Text { text: "full-access 不限制权限，可读写全盘，请谨慎使用"; color: #e5484d; vertical-alignment: center; horizontal-stretch: 1; }
+                                                    }
                                                 }
                                                 // 模型供应商（per-bot 覆盖；""=跟随全局默认）。下拉项 = [""] + provider-names
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
@@ -2716,70 +2728,69 @@ export component SettingsWindow inherits Window {
                 if root.current-page == 4: PageContainer {
                     PageHeader { title: "历史记录"; subtitle: "授权者私聊本机器人的消息与回复（默认保留 30 天，可手动清除）"; }
 
-                    // 顶部工具行：提醒开关 + 保留期下拉 + 手动清除
+                    // 顶部工具区：提醒开关 + 保留期 + 归纳清理。两行合一个 GridBox——
+                    // 共享列宽让 checkbox/标签/下拉三列严格对齐（两张独立 HorizontalBox 卡
+                    // 会各自排版，checkbox 文本宽度不同导致下拉起点错位）。
                     Rectangle {
                         vertical-stretch: 0;
                         background: PixelTheme.bg;
                         border-radius: 4px;
-                        HorizontalBox {
+                        GridBox {
                             padding: 10px;
                             spacing: 12px;
-                            PixelCheckBox {
-                                text: "消息提醒";
-                                checked: root.notify-enabled;
-                                toggled => { root.notify-enabled = self.checked; root.set-notify-enabled(self.checked); }
+                            Row {
+                                PixelCheckBox {
+                                    text: "消息提醒";
+                                    checked: root.notify-enabled;
+                                    toggled => { root.notify-enabled = self.checked; root.set-notify-enabled(self.checked); }
+                                }
+                                Text {
+                                    text: "保留期";
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    color: PixelTheme.text;
+                                }
+                                PixelComboBox {
+                                    width: 110px;
+                                    model: ["7 天", "30 天", "90 天"];
+                                    index: root.history-retention-days == 7 ? 0 : root.history-retention-days == 90 ? 2 : 1;
+                                    selected(idx) => { root.set-history-retention(idx); }
+                                }
+                                HorizontalBox {
+                                    horizontal-stretch: 1;
+                                    Rectangle { horizontal-stretch: 1; }
+                                    PixelButton {
+                                        text: "🗑 清除全部历史";
+                                        clicked => { root.clear-history(); }
+                                    }
+                                }
                             }
-                            Text {
-                                text: "保留期";
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                color: PixelTheme.text;
-                            }
-                            PixelComboBox {
-                                width: 110px;
-                                model: ["7 天", "30 天", "90 天"];
-                                index: root.history-retention-days == 7 ? 0 : root.history-retention-days == 90 ? 2 : 1;
-                                selected(idx) => { root.set-history-retention(idx); }
-                            }
-                            Rectangle { horizontal-stretch: 1; }
-                            PixelButton {
-                                text: "🗑 清除全部历史";
-                                clicked => { root.clear-history(); }
-                            }
-                        }
-                    }
-                    // 第二行：每日会话归纳清理（#78，全局开关默认关——破坏性 + 每会话一次 LLM 调用）
-                    Rectangle {
-                        vertical-stretch: 0;
-                        background: PixelTheme.bg;
-                        border-radius: 4px;
-                        HorizontalBox {
-                            padding: 10px;
-                            spacing: 12px;
-                            PixelCheckBox {
-                                text: "每日会话归纳清理";
-                                checked: root.session-gc-enabled;
-                                toggled => { root.session-gc-enabled = self.checked; root.set-session-gc-enabled(self.checked); }
-                            }
-                            Text {
-                                text: "过期判定";
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                color: PixelTheme.text;
-                            }
-                            PixelComboBox {
-                                width: 110px;
-                                model: ["3 天", "7 天", "14 天", "30 天"];
-                                index: root.session-gc-days == 3 ? 0 : root.session-gc-days == 14 ? 2 : root.session-gc-days == 30 ? 3 : 1;
-                                selected(idx) => { root.set-session-gc-days(idx); }
-                            }
-                            Text {
-                                horizontal-stretch: 1;
-                                text: "超过该天数未活跃的会话，由 bot 后端 agent 归纳成摘要存档（summaries/）并清理工作区内的历史/会话文件；摘要下次会话自动注入衔接上下文。仅清理本 bot 工作区，不触碰后端私有目录。";
-                                font-size: 12px;
-                                color: UiTokens.text-dim;
-                                wrap: word-wrap;
-                                vertical-alignment: center;
+                            Row {
+                                PixelCheckBox {
+                                    text: "每日会话归纳清理";
+                                    checked: root.session-gc-enabled;
+                                    toggled => { root.session-gc-enabled = self.checked; root.set-session-gc-enabled(self.checked); }
+                                }
+                                Text {
+                                    text: "过期判定";
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    color: PixelTheme.text;
+                                }
+                                PixelComboBox {
+                                    width: 110px;
+                                    model: ["3 天", "7 天", "14 天", "30 天"];
+                                    index: root.session-gc-days == 3 ? 0 : root.session-gc-days == 14 ? 2 : root.session-gc-days == 30 ? 3 : 1;
+                                    selected(idx) => { root.set-session-gc-days(idx); }
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "超过该天数未活跃的会话，由 bot 后端 agent 归纳成摘要存档（summaries/）并清理工作区内的历史/会话文件；摘要下次会话自动注入衔接上下文。仅清理本 bot 工作区，不触碰后端私有目录。";
+                                    font-size: 12px;
+                                    color: UiTokens.text-dim;
+                                    wrap: word-wrap;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
                     }
@@ -2861,6 +2872,9 @@ export component SettingsWindow inherits Window {
                                     PixelScrollPanel {
                                         vertical-stretch: 1;
                                         Text {
+                                            // 钳制宽度=视口宽：无宽度约束时 Text 按单行自然宽排开，
+                                            // wrap 永不触发、长文水平溢出被裁（实测 3000 字消息只露中段）
+                                            width: 100%;
                                             text: root.history-selected >= 0 && root.history-selected < root.history-rows.length
                                                 ? root.history-rows[root.history-selected].text : "";
                                             font-size: 12px;
