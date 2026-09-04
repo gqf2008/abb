@@ -1099,49 +1099,75 @@ fn reload_bots_if_external_change(
         Ok(c) => c,
         Err(_) => return,
     };
+    // 内容与当前工作副本一致（保存后签名推进/无意义触碰是常态）就到此为止：
+    // 重载会整体销毁重建编辑区实例，无谓重建会在用户点进输入框还没敲键的窗口期抢走焦点
+    if serde_json::to_string(&*work.borrow()).ok() == serde_json::to_string(&cfg.bots).ok() {
+        return;
+    }
     let sel = w.get_selected();
     *work.borrow_mut() = cfg.bots.clone();
     sync_model(model, &cfg.bots);
     w.set_selected(sel);
-    refresh_owner_code_info(w, work);
+    // work 整体被替换：开关/编辑框的单元素 model 不随 bots model 自动跟随，必须整体重建
+    refresh_bot_panel(w, work);
 }
 
-/// 按当前选中 bot 重建三个独立开关（启用/授权者隔离/每日整理）的单元素 model。
+/// 单元素 model 构造。关键在于「整体替换 model」这一动作本身（set_row_data 不行）：
+/// model 身份变化才会让 for 循环销毁重建组件实例、绑定全新——这是绕开 slint
+/// 「用户交互赋值永久移除属性绑定」的唯一杠杆。
+fn single_model<T: 'static + Clone>(row: T) -> slint::ModelRc<T> {
+    slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![row])))
+}
+
+/// 按当前选中 bot 重建全部派生显示（授权码行 + 互斥框 + 各开关 + 各编辑框 +
+/// 虚拟 Bot 登记/团队列表 + ⋯ 菜单收起）。所有改变选中 bot 或整体替换 work 的路径
+/// （装载/切 bot/增删 bot/外部改盘重载）都必须走这里：单元素 model 与按 bot.key()
+/// 重读的列表都不随 work 自动更新，漏调一处就残留上一个 bot 的值（#80 回归类）。
+fn refresh_bot_panel(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
+    refresh_owner_code_info(w, work);
+    refresh_exclusive_checks(w, work);
+    refresh_toggle_checks(w, work);
+    refresh_editors(w, work);
+    // 虚拟 Bot/团队列表按选中 bot 重读；展开的 ⋯ 菜单引用旧行号，一并收起
+    refresh_vb_rows(w, work);
+    w.set_vb_menu_open(-1);
+    refresh_team_rows(w, work);
+    w.set_team_menu_open(-1);
+}
+
+/// 按当前选中 bot 重建各独立开关（启用/授权者隔离/每日整理/群聊提及）的单元素 model。
 /// 与 backend-options 同款绕法：整体替换 model → for 循环重建 PixelCheckBox 实例，
 /// 实例全新、checked 绑定全新——绕开 slint「用户交互移除 checked 绑定（内部赋值断绑，
 /// 绑 model 行属性或独立 property 都一样）、状态残留到其它 bot」的坑（#80 回归：
 /// 点 A 的每日整理，切到 B 显示残留，诱导误操作后连配置一起串）。
 fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
-    let bot = work.borrow().get(w.get_selected() as usize).cloned();
+    let bots = work.borrow();
+    let bot = bots.get(w.get_selected() as usize);
     let mk = |v: bool| -> slint::ModelRc<OptionRow> {
-        slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![OptionRow {
+        single_model(OptionRow {
             name: "".into(),
             checked: v,
-        }])))
+        })
     };
-    w.set_enabled_options(mk(bot.as_ref().map(|b| b.enabled).unwrap_or(false)));
-    w.set_restrict_options(mk(bot
-        .as_ref()
-        .map(|b| b.restrict_granted_agent)
-        .unwrap_or(false)));
-    w.set_tidy_options(mk(bot.as_ref().map(|b| b.tidy_enabled).unwrap_or(false)));
+    w.set_enabled_options(mk(bot.map(|b| b.enabled).unwrap_or(false)));
+    w.set_restrict_options(mk(bot.map(|b| b.restrict_granted_agent).unwrap_or(false)));
+    w.set_tidy_options(mk(bot.map(|b| b.tidy_enabled).unwrap_or(false)));
     // #91 群聊提及默认（bot 级）：true=免 @ 参与
-    w.set_mention_options(mk(bot.as_ref().map(|b| b.mention_default).unwrap_or(false)));
+    w.set_mention_options(mk(bot.map(|b| b.mention_default).unwrap_or(false)));
 }
 
-/// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/供应商/Owner/App ID/App Secret/
-/// 钉钉机器人编码/钉钉 Owner）。输入/选择交互同样移除组件 text/value 绑定（与 checkbox
-/// 同源坑），直接绑 model 行属性会在切 bot 后残留上一 bot 的值；整体替换 model →
-/// for 循环重建实例，绑定全新。密码框按现有语义回填原值（bot_to_row 已如此）。
+/// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/类型/权限档位/供应商/Owner/
+/// App ID/App Secret/钉钉机器人编码/钉钉 Owner）。输入/选择交互同样移除 text/index/value
+/// 绑定（与 checkbox 同源坑），直接绑 model 行属性会在切 bot 后残留上一 bot 的值；
+/// 整体替换 model → for 循环重建实例，绑定全新。密码框按现有语义回填原值（bot_to_row 已如此）。
 fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
-    let bot = work.borrow().get(w.get_selected() as usize).cloned();
-    let mk = |v: &str| -> slint::ModelRc<EditorRow> {
-        slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![EditorRow {
-            value: v.into(),
-        }])))
-    };
-    let b = bot.as_ref();
+    let bots = work.borrow();
+    let b = bots.get(w.get_selected() as usize);
+    let mk = |v: &str| -> slint::ModelRc<EditorRow> { single_model(EditorRow { value: v.into() }) };
     w.set_name_editor_options(mk(b.map(|b| b.name.as_str()).unwrap_or("")));
+    // 类型/权限档位下拉同款重建（PixelComboBox 点选内部赋值 index 同样断绑，残留上一 bot）
+    w.set_kind_editor_options(mk(b.map(|b| b.kind.as_str()).unwrap_or("")));
+    w.set_sandbox_editor_options(mk(b.map(|b| b.sandbox_mode.as_str()).unwrap_or("")));
     w.set_provider_editor_options(mk(b.map(|b| b.provider.as_str()).unwrap_or("")));
     w.set_owner_editor_options(mk(b.map(|b| b.owner_open_id.as_str()).unwrap_or("")));
     w.set_app_id_editor_options(mk(b.map(|b| b.app_id.as_str()).unwrap_or("")));
@@ -1643,19 +1669,12 @@ pub fn run_gui() -> Result<()> {
         // 后端、Owner、供应商 都是 per-bot（bots[i].backend / .owner_open_id / .provider）
         w.set_selected(if c.bots.is_empty() { -1 } else { 0 });
         w.set_provider_selected(if c.providers.is_empty() { -1 } else { 0 });
-        refresh_owner_code_info(w, work);
-        refresh_exclusive_checks(w, work);
-        refresh_toggle_checks(w, work);
-        refresh_editors(w, work);
+        refresh_bot_panel(w, work);
         w.set_status_line("".into());
         // 依赖检测：claude/codex/node/python3/lark-cli 是否在本机可执行路径上。
         push_deps_to_window(w);
         // 系统权限检测（macOS）：完全磁盘/辅助功能/屏幕录制/自动化。
         push_perms_to_window(w);
-        // 虚拟 Bot 登记列表（#75）：按选中 bot 刷新
-        refresh_vb_rows(w, work);
-        // #147 团队列表：按选中 bot 刷新（热读 teams.json）
-        refresh_team_rows(w, work);
     }
 
     /// 装载设置窗：发现比正式配置新的草稿 → 静默恢复（返回 true，标记 dirty 并给一行提示）；
@@ -2889,6 +2908,9 @@ pub fn run_gui() -> Result<()> {
             drop(b);
             if let Some(w) = sw.upgrade() {
                 w.set_selected(idx);
+                // Rust 侧 set_selected 不触发 slint 的 selection-changed（只有列表点击会发），
+                // 必须显式重建面板显示，否则新 bot 面板残留上一个 bot 的值（#80 回归类）
+                refresh_bot_panel(&w, &work);
             }
         });
     }
@@ -2913,6 +2935,9 @@ pub fn run_gui() -> Result<()> {
             drop(b);
             if let Some(w) = sw.upgrade() {
                 w.set_selected(new_sel);
+                // 同 add_bot：删除后 selected 原地不变（min(len-1, idx)==selected）时连属性
+                // 变化都没有，必须显式重建面板，否则显示的是被删 bot 的值、编辑会写进移位上来的 bot
+                refresh_bot_panel(&w, &work);
             }
         });
     }
@@ -2981,14 +3006,10 @@ pub fn run_gui() -> Result<()> {
             // 同步回写 model：列表的 ⚪/停用 前缀与勾选框状态都绑 model，不刷新会显示旧值
             let b = work.borrow();
             sync_model(&model, &b);
-            // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
+            // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）；
+            // 统一走 refresh_toggle_checks 从 work 重读（slint 侧 idx 恒为 root.selected）
             if let Some(w) = sw.upgrade() {
-                w.set_enabled_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
-                    OptionRow {
-                        name: "".into(),
-                        checked: enabled,
-                    },
-                ]))));
+                refresh_toggle_checks(&w, &work);
             }
         });
     }
@@ -3012,12 +3033,7 @@ pub fn run_gui() -> Result<()> {
             sync_model(&model, &b);
             // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
             if let Some(w) = sw.upgrade() {
-                w.set_restrict_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
-                    OptionRow {
-                        name: "".into(),
-                        checked: enabled,
-                    },
-                ]))));
+                refresh_toggle_checks(&w, &work);
             }
         });
     }
@@ -3041,12 +3057,7 @@ pub fn run_gui() -> Result<()> {
             sync_model(&model, &b);
             // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
             if let Some(w) = sw.upgrade() {
-                w.set_tidy_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
-                    OptionRow {
-                        name: "".into(),
-                        checked: enabled,
-                    },
-                ]))));
+                refresh_toggle_checks(&w, &work);
             }
         });
     }
@@ -3067,12 +3078,7 @@ pub fn run_gui() -> Result<()> {
             let b = work.borrow();
             sync_model(&model, &b);
             if let Some(w) = sw.upgrade() {
-                w.set_mention_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
-                    OptionRow {
-                        name: "".into(),
-                        checked: enabled,
-                    },
-                ]))));
+                refresh_toggle_checks(&w, &work);
             }
         });
     }
@@ -3095,16 +3101,7 @@ pub fn run_gui() -> Result<()> {
             let b = work.borrow();
             sync_model(&model, &b);
             if let Some(w) = sw.upgrade() {
-                refresh_owner_code_info(&w, &work);
-                refresh_exclusive_checks(&w, &work);
-                refresh_toggle_checks(&w, &work);
-                refresh_editors(&w, &work);
-                // 虚拟 Bot 登记列表按选中 bot 刷新 + 收起 ⋯ 菜单（切 bot 残留展开态会串行）
-                refresh_vb_rows(&w, &work);
-                w.set_vb_menu_open(-1);
-                // #147 团队列表按选中 bot 刷新 + 收起团队 ⋯ 菜单
-                refresh_team_rows(&w, &work);
-                w.set_team_menu_open(-1);
+                refresh_bot_panel(&w, &work);
             }
         });
     }
@@ -5012,7 +5009,10 @@ pub fn run_gui() -> Result<()> {
                                     }
                                 }
                                 sync_model(&model, &b);
+                                drop(b);
                                 w.set_status_line("".into());
+                                // 名称写进了 work，但编辑框的单元素 model 不自动跟随，须重建
+                                refresh_editors(&w, &work);
                             }
                             Err(e) => w.set_status_line(format!("自动获取失败：{e}").into()),
                         }
@@ -5067,6 +5067,9 @@ pub fn run_gui() -> Result<()> {
                                 w.set_status_line(
                                     "✅ 微信登录成功！点「保存」写入配置。".into(),
                                 );
+                                // 占位名被自动改成 wxN：编辑框的单元素 model 不自动跟随，须重建，
+                                // 否则名称框残留 botN 诱导用户重名覆盖自动名
+                                refresh_editors(&w, &work);
                                 show_window_and_focus(&w);
                             }
                         }
@@ -5299,6 +5302,23 @@ mod tests {
             team_create_line("记账团队-测试-待任命", "失败：群名冲突"),
             "记账团队-测试-待任命 → 失败：群名冲突"
         );
+    }
+
+    #[test]
+    fn single_model_holds_exactly_one_row() {
+        // 单元素 model 是「交互断绑后重建实例」绕法的承重原语：行数恒为 1、
+        // 值原样进出（SetWindow 层的刷新链路依赖 Slint 窗口，只能人工/E2E 验证）
+        let m = single_model(OptionRow {
+            name: "".into(),
+            checked: true,
+        });
+        assert_eq!(m.row_count(), 1);
+        assert!(m.row_data(0).unwrap().checked);
+        let e = single_model(EditorRow {
+            value: "cli_xxx".into(),
+        });
+        assert_eq!(e.row_count(), 1);
+        assert_eq!(e.row_data(0).unwrap().value.as_str(), "cli_xxx");
     }
 
     /// #74 红点合成行为：右上角出现红点（含白描边），左下角像素保持原图不动。

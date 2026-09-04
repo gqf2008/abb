@@ -1157,6 +1157,8 @@ export component SettingsWindow inherits Window {
     // ding_robot_code/ding_owner_ids 各一）：输入/选择交互断绑后显示不跟随，切 bot
     // 时由 refresh_editors 整体替换 model → for 重建实例（同 OptionRow 绕法）。
     in-out property <[EditorRow]> name-editor-options: [];
+    in-out property <[EditorRow]> kind-editor-options: [];       // 类型下拉：点选同样断 index 绑定，切 bot 须重建实例
+    in-out property <[EditorRow]> sandbox-editor-options: [];    // 权限档位下拉：同上
     in-out property <[EditorRow]> provider-editor-options: [];
     in-out property <[EditorRow]> owner-editor-options: [];
     in-out property <[EditorRow]> app-id-editor-options: [];
@@ -1633,11 +1635,16 @@ export component SettingsWindow inherits Window {
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "类型"; width: 80px; vertical-alignment: center; }
-                                                    PixelComboBox {
-                                                        model: ["feishu", "wechat", "dingtalk"];
-                                                        index: root.bots[root.selected].kind == "feishu" ? 0 : root.bots[root.selected].kind == "wechat" ? 1 : 2;
+                                                    // 下拉与编辑框同款绕法：PixelComboBox 点选内部赋值 index 会
+                                                    // 断绑，直接绑 model 行属性切 bot 后残留上一 bot 的类型
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        selected(idx) => { root.bot-field-edited(root.selected, "kind", self.model[idx]); }
+                                                        for opt[i] in root.kind-editor-options: PixelComboBox {
+                                                            model: ["feishu", "wechat", "dingtalk"];
+                                                            index: opt.value == "feishu" ? 0 : opt.value == "wechat" ? 1 : 2;
+                                                            horizontal-stretch: 1;
+                                                            selected(idx) => { root.bot-field-edited(root.selected, "kind", self.model[idx]); }
+                                                        }
                                                     }
                                                 }
                                                 // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot。
@@ -1662,11 +1669,15 @@ export component SettingsWindow inherits Window {
                                                 // 显式模式用户选择优先。选项值即 config 落盘值（kebab-case）。
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "权限档位"; width: 80px; vertical-alignment: center; }
-                                                    PixelComboBox {
-                                                        model: root.sandbox-mode-options;
-                                                        index: root.bots[root.selected].sandbox-mode == "read-only" ? 1 : root.bots[root.selected].sandbox-mode == "workspace-write" ? 2 : root.bots[root.selected].sandbox-mode == "full-access" ? 3 : 0;
+                                                    // 同类型下拉：点选断 index 绑定，走单元素 model 重建实例
+                                                    HorizontalBox {
                                                         horizontal-stretch: 1;
-                                                        selected(idx) => { root.sandbox-mode-changed(root.selected, idx); }
+                                                        for opt[i] in root.sandbox-editor-options: PixelComboBox {
+                                                            model: root.sandbox-mode-options;
+                                                            index: opt.value == "read-only" ? 1 : opt.value == "workspace-write" ? 2 : opt.value == "full-access" ? 3 : 0;
+                                                            horizontal-stretch: 1;
+                                                            selected(idx) => { root.sandbox-mode-changed(root.selected, idx); }
+                                                        }
                                                     }
                                                 }
                                                 // #163 full-access 警示：选全权限时明确提示（不限制权限，可读写全盘）
@@ -1787,8 +1798,11 @@ export component SettingsWindow inherits Window {
                                                     }
                                                 }
                                                 // for 循环必须独占容器（slint 限制：RepeatedItemTree 不能直接占 grid 单元格；
-                                                // Row 又只能放 GridLayout 内，故用 HorizontalBox 组合同款横排）
+                                                // Row 又只能放 GridLayout 内，故用 HorizontalBox 组合同款横排）。
+                                                // 裸元素占 grid 默认只跨 1 列（80px 标签列），必须 colspan 拉满整行，
+                                                // 否则授权行被挤进标签列、标签列又被撑宽错位。
                                                 VerticalBox {
+                                                    colspan: 3;
                                                     spacing: 4px;
                                                     for granted[gi] in root.bots[root.selected].granted: HorizontalBox {
                                                         Rectangle { width: 80px; }
@@ -1994,17 +2008,24 @@ export component SettingsWindow inherits Window {
                                                         clicked => { root.generate-owner-code(root.selected, "granted"); }
                                                     }
                                                 }
-                                                for dg[gi] in root.bots[root.selected].ding-granted: Row {
-                                                    Rectangle { width: 80px; }
-                                                    Text {
-                                                        text: dg.name + "（" + dg.open-id + "）";
-                                                        font-size: 12px;
-                                                        horizontal-stretch: 1;
-                                                        vertical-alignment: center;
-                                                    }
-                                                    PixelButton {
-                                                        text: "取消授权";
-                                                        clicked => { root.remove-granted(root.selected, gi); }
+                                                // 钉钉授权者列表：与飞书同款绕法（for 不能直接占 grid 单元格，
+                                                // 会触发 RepeatedItemTree::grid_layout_input_data 内部错误；
+                                                // colspan 同飞书，避免被挤进 80px 标签列）
+                                                VerticalBox {
+                                                    colspan: 3;
+                                                    spacing: 4px;
+                                                    for dg[gi] in root.bots[root.selected].ding-granted: HorizontalBox {
+                                                        Rectangle { width: 80px; }
+                                                        Text {
+                                                            text: dg.name + "（" + dg.open-id + "）";
+                                                            font-size: 12px;
+                                                            horizontal-stretch: 1;
+                                                            vertical-alignment: center;
+                                                        }
+                                                        PixelButton {
+                                                            text: "取消授权";
+                                                            clicked => { root.remove-granted(root.selected, gi); }
+                                                        }
                                                     }
                                                 }
                                                 if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "dingtalk" && root.owner-code-info != "": Row {
