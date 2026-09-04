@@ -5065,7 +5065,7 @@ pub fn run_gui() -> Result<()> {
                                 drop(b);
                                 w.set_status_is_error(false);
                                 w.set_status_line(
-                                    "✅ 微信登录成功！点「保存」写入配置并重启服务。".into(),
+                                    "✅ 微信登录成功！点「保存」写入配置。".into(),
                                 );
                                 show_window_and_focus(&w);
                             }
