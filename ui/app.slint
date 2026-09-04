@@ -319,6 +319,24 @@ component ImageIcon inherits Image {
     image-fit: contain;
 }
 
+// 复制图标按钮（授权码旁）：24px 触达区 + 18px 图标，hover 高亮底色。
+component CopyIconButton inherits Rectangle {
+    callback clicked;
+    width: 26px;
+    height: 26px;
+    border-radius: 4px;
+    background: ta.has-hover ? PixelTheme.hover : transparent;
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+    ImageIcon {
+        icon: @image-url("icons/copy.svg");
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
 // ═══════════ 全局页面样式（所有 tab 页统一，改一处全生效） ═══════════
 // 页面根容器：padding 20 + spacing 14（各页切换视觉稳定）。
 // 不设 alignment：VerticalBox 默认让 vertical-stretch>0 的子元素（机器人/环境/供应商页
@@ -1795,8 +1813,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    PixelButton {
-                                                        text: "复制";
+                                                    CopyIconButton {
                                                         clicked => { root.copy-owner-code("owner"); }
                                                     }
                                                 }
@@ -1809,8 +1826,7 @@ export component SettingsWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         vertical-alignment: center;
                                                     }
-                                                    PixelButton {
-                                                        text: "复制";
+                                                    CopyIconButton {
                                                         clicked => { root.copy-owner-code("granted"); }
                                                     }
                                                 }
@@ -2856,7 +2872,8 @@ export component SettingsWindow inherits Window {
                     }
                     if root.current-page != 0: PixelButton { text: "关闭"; clicked => { root.cancel-clicked(); } }
                     if root.current-page != 0: PixelButton {
-                        text: root.service-running ? "保存并重启服务" : "保存";
+                        // 保存后的行为即「写盘 + 服务在跑时重启」（对用户只说「保存」，重启是实现细节）
+                        text: "保存";
                         variant: "primary";
                         clicked => { root.save-clicked(); }
                     }
