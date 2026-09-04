@@ -19,6 +19,7 @@ impl Bridge {
             mid: item.mid.clone(),
             chat_id: item.chat_id.clone(),
             chat_type: item.chat_type.clone(),
+            chat_name: String::new(), // 补发最小集：PendingItem 未落群名
             thread_id: item.thread_id.clone(),
             quoted: crate::messenger::QuotedContent::default(),
             text: item.text.clone(),
@@ -122,6 +123,8 @@ impl Bridge {
                                 "", // assistant 行 GUI 显示 bot 名
                                 reply,
                                 crate::chrono_lite::unix_secs() as i64,
+                                &item.chat_type,
+                                "", // p2p/dm 私聊无群名
                             );
                         }
                     }
@@ -164,6 +167,7 @@ impl Bridge {
                 mid: item.mid,
                 chat_id: item.chat_id,
                 chat_type: item.chat_type,
+                chat_name: String::new(), // PendingItem 未落群名（重放轮少一栏，可接受）
                 thread_id: item.thread_id,
                 quoted: item.quoted,
                 text: item.text,
@@ -250,6 +254,7 @@ impl Bridge {
             mid,
             chat_id: from.clone(),       // 微信会话标识 = 对方 ilink_user_id
             chat_type: "dm".to_string(), // 微信私聊当 dm（主会话候选）
+            chat_name: String::new(),    // 微信私聊无会话名
             thread_id: String::new(),    // 微信无话题
             quoted,
             text,
@@ -303,6 +308,8 @@ impl Bridge {
                     &uname,
                     &msg.text,
                     crate::chrono_lite::unix_secs() as i64,
+                    if msg.is_group() { "group" } else { "p2p" },
+                    &msg.conversation_title,
                 );
                 if is_p2p {
                     self.unread.report(
@@ -342,6 +349,8 @@ impl Bridge {
                     &uname,
                     &msg.text,
                     crate::chrono_lite::unix_secs() as i64,
+                    if msg.is_group() { "group" } else { "p2p" },
+                    &msg.conversation_title,
                 );
                 if !msg.is_group() {
                     self.unread.report(
@@ -435,7 +444,8 @@ impl Bridge {
             } else {
                 "dm".to_string()
             },
-            thread_id: String::new(), // 钉钉无话题
+            chat_name: msg.conversation_title.clone(), // 钉钉事件自带群名
+            thread_id: String::new(),                  // 钉钉无话题
             quoted,
             text,
             attachments,

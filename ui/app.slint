@@ -202,7 +202,8 @@ export struct ChatSessionRow {
     bot-key: string,     // bot key（Rust 侧定位会话消息流用）
     chat-id: string,     // 会话 id
     bot: string,         // bot 展示名
-    sender: string,      // 会话展示名（授权者名反查，查不到用 id 前缀）
+    sender: string,      // 会话展示名（群聊 = 群名；私聊 = 授权者名）
+    kind-tag: string,    // "群" / ""（私聊不标——默认语义）
     time: string,        // 最后消息 MM-DD HH:MM
     count: string,       // 消息条数（"12 条"）
     preview: string,     // 最后消息摘要
@@ -2825,7 +2826,7 @@ export component SettingsWindow inherits Window {
                                                         HorizontalBox {
                                                             spacing: 6px;
                                                             Text {
-                                                                text: s.sender;
+                                                                text: (s.kind-tag == "" ? "" : "[" + s.kind-tag + "] ") + s.sender;
                                                                 font-size: 12px;
                                                                 font-weight: 600;
                                                                 overflow: elide;

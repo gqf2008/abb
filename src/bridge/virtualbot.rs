@@ -214,6 +214,8 @@ impl Bridge {
                 "",
                 &text,
                 ev.ts,
+                &ev.chat_type,
+                &ev.chat_name,
             );
             crate::log!(
                 "[bridge] 会话已暂停（#87），消息入库不回复 bot={} chat={} mid={}",
@@ -754,6 +756,8 @@ impl Bridge {
                     &granted_uname,
                     &user_text,
                     ev.ts,
+                    &ev.chat_type,
+                    &ev.chat_name,
                 );
                 if inserted {
                     // 未读提醒：只记发送者 id + 名字 + 摘要（40 字符预览）。
@@ -1073,6 +1077,8 @@ impl Bridge {
                                 "", // assistant 行 GUI 显示 bot 名（direction 区分）
                                 &reply,
                                 crate::chrono_lite::unix_secs() as i64,
+                                &ev.chat_type,
+                                &ev.chat_name,
                             );
                         }
                         crate::log!(
