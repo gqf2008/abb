@@ -17,6 +17,9 @@ enum BuzzPrecheckFail {
     /// agent 进程不可用（未拉起/崩溃退避中——新消息会被预检拒绝，避免「以为
     /// 已受理」的静默排队）
     AgentDown,
+    /// 未配置模型供应商（生效供应商解析为 None——buzz agent 进程共用一组凭证，
+    /// 与 CLI 后端硬闸同源语义；区别仅在 buzz 闸在预检而非 build_injection）
+    NoProvider,
 }
 
 impl Bridge {
@@ -47,6 +50,11 @@ impl Bridge {
         }
         if !handle.is_agent_available() {
             return Err(BuzzPrecheckFail::AgentDown);
+        }
+        // ④ 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
+        // None 时 agent 无凭证可用，拒答并引导配置（每消息热读，与 agent.rs 同款成本）。
+        if crate::config::Config::provider_for_bot_key(&self.bot.key()).is_none() {
+            return Err(BuzzPrecheckFail::NoProvider);
         }
         // 群根频道名 = 角色名：取虚拟 Bot 登记快照（mtime 懒刷新，与注入判定同源）。
         self.refresh_virtual_bots();
@@ -464,6 +472,9 @@ impl Bridge {
                 Err(BuzzPrecheckFail::AgentDown) => {
                     Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
                 }
+                Err(BuzzPrecheckFail::NoProvider) => Some(
+                    "未配置模型供应商：buzz agent 进程共用一组凭证，请在 ABB 设置「模型供应商」页配置并保存",
+                ),
                 Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
                     Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
                 }

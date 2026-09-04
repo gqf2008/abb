@@ -1,7 +1,7 @@
 //! 调本机 agent —— claude / codex / pi，host 直跑。
 //! prompt 走 stdin（避免多行/-开头被 argparse 误判）；per-chat 串行由 bridge 保证；
-//! claude 注入 CC Switch 当前 provider 的 ANTHROPIC_* env；codex 走自己 ~/.codex 登录态；
-//! pi 走自己 ~/.pi 登录态（配了供应商则注入对应 API key env + --provider/--model）。
+//! 供应商注入：三后端均必须走 ABB「模型供应商」配置（build_injection None = Err 硬闸拒答，
+//! 不再回落 CC Switch / agent 自有登录态）；生效供应商按 kind 映射为对应后端的 env + 参数。
 //! pi 用法：`pi -p --mode json --session-id <uuid>`（--session-id 已存在即续聊、不存在即新建），
 //! prompt 走 stdin（pi 非交互模式会读管道 stdin 作首条消息，见 pi main.js readPipedStdin）。
 //! #92 收敛：prime-agent 后端已下线（保留 claude / codex / pi），存量 backend=prime-agent
@@ -271,20 +271,13 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-/// 读 CC Switch 当前 claude provider 的 ANTHROPIC_* env（桥内未配供应商时的回落）。
-/// 拿不到 → 用户可见错误文案（沿用原硬失败语义，不静默跑一个没凭证的 claude）。
-fn ccswitch_env_or_err() -> Result<HashMap<String, String>, String> {
-    match crate::ccswitch::active_env() {
-        Some(env)
-            if env.contains_key("ANTHROPIC_BASE_URL") && env.contains_key("ANTHROPIC_AUTH_TOKEN") =>
-        {
-            Ok(env)
-        }
-        _ => Err(format!(
-            "⚠️ 未配置模型供应商，且读不到宿主 CC Switch 当前 claude provider 配置（{} 不可读或无激活项）。请在「模型供应商配置」加一个 anthropic 供应商，或在 CC Switch 选好 provider。",
-            dirs::home_dir().unwrap_or_default().join(".cc-switch/cc-switch.db").display()
-        )),
-    }
+/// 生效供应商为 None 时的统一拒答文案（硬闸：所有 CLI 后端一律要求桥内供应商，
+/// 不再回落 agent 自有登录态 / CC Switch——见 build_injection None 臂）。
+fn provider_missing_msg(backend_name: &str) -> String {
+    format!(
+        "⚠️ 该 bot 未配置模型供应商（或指向的供应商已不存在），已拒绝启动 {backend_name}。\
+         请打开 ABB 设置「模型供应商」页添加供应商，并设为全局默认或该 bot 的供应商。"
+    )
 }
 
 /// base_url → 小写 host（去 scheme/port/路径；容忍无 scheme 写法）。空串 → None。
@@ -353,7 +346,8 @@ pub(crate) fn buzz_provider_env(
     Ok(Some(env))
 }
 
-/// 由（后端, 供应商）算出注入产物。优先级：桥内供应商 > CC Switch / codex 自认证。
+/// 由（后端, 供应商）算出注入产物。供应商为 None → Err 硬闸（所有 CLI 后端一律
+/// 要求桥内供应商，拒答文案见 [`provider_missing_msg`]）。
 /// 类型与后端不匹配 → Err（用户可见）。供应商为 None → 旧行为回落。
 pub(crate) fn build_injection(
     backend: Backend,
@@ -371,19 +365,12 @@ pub(crate) fn build_injection(
                 extra_args: Vec::new(),
             })
         }
-        // ── 未配供应商：旧行为回落 ──
-        (Backend::Claude, None) => Ok(Injection {
-            env: Some(ccswitch_env_or_err()?),
-            extra_args: no_args,
-        }),
-        (Backend::Codex, None) => Ok(Injection {
-            env: None, // codex 走自己 ~/.codex 的登录态，不注入
-            extra_args: no_args,
-        }),
-        (Backend::Pi, None) => Ok(Injection {
-            env: None, // pi 走自己 ~/.pi 的登录态/默认模型，不注入
-            extra_args: no_args,
-        }),
+        // ── 未配供应商：硬闸（拒答并引导，见 provider_missing_msg）──
+        // 不再回落 agent 自有登录态（codex ~/.codex / pi ~/.pi）或 CC Switch——
+        // 大模型调用必须走 ABB 供应商配置，否则用户侧 key 错配无从排查（401 黑盒）。
+        (Backend::Claude, None) => Err(provider_missing_msg("claude")),
+        (Backend::Codex, None) => Err(provider_missing_msg("codex")),
+        (Backend::Pi, None) => Err(provider_missing_msg("pi")),
 
         // ── anthropic 供应商 ──
         (Backend::Claude, Some(p)) if p.kind == "anthropic" => {
@@ -495,7 +482,7 @@ pub(crate) fn build_injection(
         }
         (Backend::Claude, Some(p)) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
             Err(format!(
-                "⚠️ 供应商「{}」是 OpenAI 兼容型；claude 只支持 Anthropic 原生 API（或留空走 CC Switch）。请给该 bot 换个 anthropic 供应商。",
+                "⚠️ 供应商「{}」是 OpenAI 兼容型；claude 只支持 Anthropic 原生 API。请给该 bot 换个 anthropic 供应商。",
                 p.name
             ))
         }
@@ -689,7 +676,7 @@ pub async fn run(
     let _ = std::fs::create_dir_all(&workspace);
     ensure_workspace_guide(&workspace);
 
-    // 解析供应商 → env + codex -c 参数（桥内配置优先于 CC Switch / codex 自认证）。
+    // 解析供应商 → env + codex -c 参数。未配置 = Err 硬闸拒答；
     // 类型不匹配在此直接报错返回（用户可见文案），不进 run_once。
     let provider = crate::config::Config::provider_for_bot_key(bot_key);
     let inject = build_injection(backend, provider.as_ref())?;
@@ -1807,7 +1794,7 @@ async fn run_once(
         cmd.env("ABB_BIN", exe);
     }
 
-    // 供应商 / CC Switch env（含 claude 的 ANTHROPIC_*、codex 的 AGENT_BRIDGE_MODEL_KEY）。
+    // 供应商 env（含 claude 的 ANTHROPIC_*、codex 的 AGENT_BRIDGE_MODEL_KEY）。
     // 永不进日志（env 不由桥打印；argv 里也没有 key）。
     if let Some(env) = inject_env {
         cmd.envs(env);
@@ -2545,19 +2532,30 @@ mod tests {
     }
 
     #[test]
-    fn no_provider_codex_no_injection() {
-        // codex 未配供应商 → 不注入任何 env/参数（走自己 ~/.codex 登录态）
-        let inj = build_injection(Backend::Codex, None).unwrap();
-        assert!(inj.env.is_none());
-        assert!(inj.extra_args.is_empty());
+    fn no_provider_codex_rejected() {
+        // 硬闸：codex 未配供应商 → Err 拒答（不再走 ~/.codex 自有登录态）
+        assert!(build_injection(Backend::Codex, None)
+            .err()
+            .unwrap()
+            .contains("未配置模型供应商"));
     }
 
     #[test]
-    fn no_provider_pi_no_injection() {
-        // pi 未配供应商 → 不注入任何 env/参数（走自己 ~/.pi 登录态/默认模型）
-        let inj = build_injection(Backend::Pi, None).unwrap();
-        assert!(inj.env.is_none());
-        assert!(inj.extra_args.is_empty());
+    fn no_provider_pi_rejected() {
+        // 硬闸：pi 未配供应商 → Err 拒答（不再走 ~/.pi 登录态/默认模型）
+        assert!(build_injection(Backend::Pi, None)
+            .err()
+            .unwrap()
+            .contains("未配置模型供应商"));
+    }
+
+    #[test]
+    fn no_provider_claude_rejected() {
+        // 硬闸：claude 未配供应商 → Err 拒答（不再回落 CC Switch，db 有无激活项均拒）
+        assert!(build_injection(Backend::Claude, None)
+            .err()
+            .unwrap()
+            .contains("未配置模型供应商"));
     }
 
     #[test]

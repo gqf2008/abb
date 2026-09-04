@@ -11,7 +11,6 @@ mod attachments;
 mod botstatus;
 mod bridge;
 mod buzz;
-mod ccswitch;
 mod config;
 mod contextsum;
 mod deliver;
