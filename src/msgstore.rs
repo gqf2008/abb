@@ -14,9 +14,11 @@
 use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
 
-/// 单条历史消息（GUI 历史页列表/详情用）。
+/// 单条历史消息（GUI 历史页会话消息流用）。
 #[derive(Debug, Clone)]
 pub struct MsgRow {
+    /// 库主键（查询投影保留；GUI 消息流按 ts 排序不读它，bridge 测试断言用）
+    #[allow(dead_code)]
     pub id: i64,
     pub bot_key: String,
     /// 会话 id（查询投影保留：per-chat 过滤/后续按会话分组用；当前 GUI 不展示）
@@ -137,6 +139,8 @@ impl MsgStore {
 
     /// GUI 历史页数据：全 bot、最新在上（ts 反序，同秒按 id 反序保持插入顺序）。
     /// 只读连接——GUI 进程绝不能写消息库；库不存在/损坏只返回空列表。
+    /// （历史页 #会话化 后改走 chat_stats+list_chat；本函数保留给 bridge 测试。）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn list_recent(&self, limit: usize) -> Vec<MsgRow> {
         if !self.path.exists() {
             return Vec::new();
@@ -159,6 +163,50 @@ impl MsgStore {
             }
         };
         let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+            Ok(MsgRow {
+                id: r.get(0)?,
+                bot_key: r.get(1)?,
+                chat_id: r.get(2)?,
+                mid: r.get(3)?,
+                direction: r.get(4)?,
+                sender_id: r.get(5)?,
+                sender_name: r.get(6)?,
+                text: r.get(7)?,
+                ts: r.get(8)?,
+            })
+        });
+        rows.and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default()
+    }
+
+    /// GUI 历史页会话消息流：某 bot 某 chat 的全部消息，**ts 升序**（聊天流正序）。
+    /// limit 防御超大历史（取最近的 limit 条再正序返回）；走 (bot_key, chat_id, ts) 索引。
+    pub fn list_chat(&self, bot_key: &str, chat_id: &str, limit: usize) -> Vec<MsgRow> {
+        if !self.path.exists() {
+            return Vec::new();
+        }
+        let con = match Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log!("[msgstore] 只读打开失败: {e:#}");
+                return Vec::new();
+            }
+        };
+        // 内层 DESC 取最近 limit 条，外层 ASC 翻正序
+        let mut stmt = match con.prepare(
+            "SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts FROM (
+                 SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts
+                 FROM messages WHERE bot_key = ?1 AND chat_id = ?2
+                 ORDER BY ts DESC, id DESC LIMIT ?3
+             ) ORDER BY ts ASC, id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log!("[msgstore] 会话消息查询失败: {e:#}");
+                return Vec::new();
+            }
+        };
+        let rows = stmt.query_map(rusqlite::params![bot_key, chat_id, limit as i64], |r| {
             Ok(MsgRow {
                 id: r.get(0)?,
                 bot_key: r.get(1)?,
@@ -225,11 +273,20 @@ impl MsgStore {
         };
         let cutoff = crate::chrono_lite::unix_secs() as i64 - 7 * 86400;
         let mut stmt = match con.prepare(
-            "SELECT bot_key, chat_id,
-                    SUM(CASE WHEN ts >= ?1 THEN 1 ELSE 0 END),
+            "SELECT m.bot_key, m.chat_id,
+                    SUM(CASE WHEN m.ts >= ?1 THEN 1 ELSE 0 END),
                     COUNT(*),
-                    MAX(ts)
-             FROM messages GROUP BY bot_key, chat_id",
+                    MAX(m.ts),
+                    (SELECT m2.sender_name FROM messages m2
+                      WHERE m2.bot_key = m.bot_key AND m2.chat_id = m.chat_id
+                      ORDER BY m2.ts DESC, m2.id DESC LIMIT 1),
+                    (SELECT m2.text FROM messages m2
+                      WHERE m2.bot_key = m.bot_key AND m2.chat_id = m.chat_id
+                      ORDER BY m2.ts DESC, m2.id DESC LIMIT 1),
+                    (SELECT m2.sender_id FROM messages m2
+                      WHERE m2.bot_key = m.bot_key AND m2.chat_id = m.chat_id
+                      ORDER BY m2.ts DESC, m2.id DESC LIMIT 1)
+             FROM messages m GROUP BY m.bot_key, m.chat_id",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -244,6 +301,9 @@ impl MsgStore {
                 count_7d: r.get(2)?,
                 count_total: r.get(3)?,
                 last_ts: r.get(4)?,
+                last_sender: r.get(5).unwrap_or_default(),
+                last_text: r.get(6).unwrap_or_default(),
+                last_sender_id: r.get(7).unwrap_or_default(),
             })
         })
         .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
@@ -311,6 +371,12 @@ pub struct ChatStats {
     pub count_total: i64,
     /// 最后一条消息时间（unix 秒）。
     pub last_ts: Option<i64>,
+    /// 最后一条消息的发送者名（会话列表展示；assistant 行 = bot 名）。
+    pub last_sender: String,
+    /// 最后一条 user 消息的发送者 id（会话名授权名单反查用）。
+    pub last_sender_id: String,
+    /// 最后一条消息文本预览。
+    pub last_text: String,
 }
 
 /// 消费 GUI 命令文件（跨进程队列，先例：deliveries.json 的令牌语义；这里是「存在即消费」——
@@ -505,5 +571,68 @@ mod tests {
         assert_eq!(min, Some(100));
         assert_eq!(max, Some(200));
         let _ = std::fs::remove_file(&s.path);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn chat_stats_returns_sender_and_text() {
+        let dir = std::env::temp_dir().join(format!("msg-stats-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MsgStore::at(dir.join("messages.sqlite"));
+        store.insert("b1", "c1", "m1", "user", "u1", "张三", "你好", 1000);
+        store.insert("b1", "c1", "m1", "assistant", "bot", "", "回复你", 1001);
+        store.insert("b1", "c2", "m2", "user", "u2", "李四", "第二条", 2000);
+        let stats = store.chat_stats();
+        assert_eq!(stats.len(), 2, "两个会话: {stats:?}");
+        let c1 = stats.iter().find(|s| s.chat_id == "c1").unwrap();
+        assert_eq!(c1.count_total, 2);
+        assert_eq!(c1.last_ts, Some(1001));
+        assert_eq!(c1.last_sender, "");
+        assert_eq!(c1.last_text, "回复你");
+        let c2 = stats.iter().find(|s| s.chat_id == "c2").unwrap();
+        assert_eq!(c2.last_sender, "李四");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_chat_returns_ascending() {
+        let dir = std::env::temp_dir().join(format!("msg-lc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MsgStore::at(dir.join("messages.sqlite"));
+        for i in 0..5 {
+            store.insert(
+                "b1",
+                "c1",
+                &format!("m{i}"),
+                "user",
+                "u1",
+                "张三",
+                &format!("消息{i}"),
+                1000 + i,
+            );
+        }
+        let rows = store.list_chat("b1", "c1", 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].text, "消息2", "取最近3条（2/3/4）再正序");
+        assert_eq!(rows[2].text, "消息4");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod prod_probe {
+    #[test]
+    #[ignore = "手动探针：验证 production 库可查（勿在 CI 跑，本机有真实库才 pass）"]
+    fn production_chat_stats_probe() {
+        let stats = super::MsgStore::production().chat_stats();
+        println!("production chat_stats: {} 个会话", stats.len());
+        for s in stats.iter().take(3) {
+            println!("  {} {} last={:?}", s.chat_id, s.last_sender, s.last_ts);
+        }
+        assert!(!stats.is_empty());
     }
 }

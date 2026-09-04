@@ -197,15 +197,23 @@ export struct RoleTemplateRow {
 }
 
 // #74 历史记录页的单条消息（与 Rust 侧 HistoryRow 对应）
-export struct HistoryRow {
-    id: int,             // 消息库行 id（选中/详情定位用）
-    bot: string,         // bot 展示名（config 反查，查不到用 key）
-    kind: string,        // 平台（飞书/钉钉）
-    sender: string,      // 发送者展示名（config 授权名单反查，查不到用 id）
+// 会话行（历史页左列表）：同一 chat_id 的消息聚合为一个会话（微信式会话列表）
+export struct ChatSessionRow {
+    bot-key: string,     // bot key（Rust 侧定位会话消息流用）
+    chat-id: string,     // 会话 id
+    bot: string,         // bot 展示名
+    sender: string,      // 会话展示名（授权者名反查，查不到用 id 前缀）
+    time: string,        // 最后消息 MM-DD HH:MM
+    count: string,       // 消息条数（"12 条"）
+    preview: string,     // 最后消息摘要
+}
+
+// 消息流行（历史页右详情）：选中会话内的逐条消息
+export struct ChatMsgRow {
     time: string,        // MM-DD HH:MM
     direction: string,   // 用户 / 回复
-    preview: string,     // 摘要（列表行）
-    text: string,        // 完整文本（详情区）
+    sender: string,      // 该条展示名
+    text: string,        // 完整文本（wrap 换行）
 }
 
 // 微信扫码登录二维码弹窗：直接在 GUI 里显示二维码，避免依赖系统看图。
@@ -1174,10 +1182,12 @@ export component SettingsWindow inherits Window {
     in-out property <int> history-retention-days: 30;
     in-out property <bool> session-gc-enabled: false;   // 每日会话归纳清理（#78，默认关）
     in-out property <int> session-gc-days: 7;           // 过期判定天数（3/7/14/30）
-    in-out property <[HistoryRow]> history-rows: [];
+    in-out property <[ChatSessionRow]> chat-sessions: [];   // 会话列表（chat_id 分组）
+    in-out property <[ChatMsgRow]> history-msgs: [];         // 选中会话的消息流（ts 正序）
+    in-out property <string> chat-title: "";                 // 选中会话标题（会话名 · bot · N 条）
     // 虚拟 Bot 手动刷新进行中（#75）：禁用刷新按钮防连点 + 按钮文字"同步中"
     in-out property <bool> vb-syncing: false;
-    in-out property <int> history-selected: -1;
+    in-out property <int> chat-selected: -1;   // 历史页选中的会话下标（chat-sessions 内）
 
     // 环境配置（依赖检测）：各项是否在本机可执行路径上
     in-out property <bool> claude-installed: false;
@@ -1314,7 +1324,7 @@ export component SettingsWindow inherits Window {
     callback team-jump(int, int);         // #147 跳转角色群：打开对应平台会话
     callback team-dissolve(int);          // #147 解散团队（红色强确认）
     // #74 历史记录页
-    callback history-selection-changed(int);   // 选中某条 → Rust 侧记录（详情在 slint 内由 model 直接取）
+    callback history-selection-changed(int);   // 选中某会话 → Rust 侧载入该会话消息流
     callback clear-history();                  // 「清除全部历史」→ Rust 侧弹二次确认
     callback set-notify-enabled(bool);         // 提醒开关 → Rust 侧写工作副本（保存时落盘）
     callback set-history-retention(int);       // 保留期下拉下标（0=7天 1=30天 2=90天）
@@ -2783,14 +2793,14 @@ export component SettingsWindow inherits Window {
                             }
                         }
                     }
-                    // 主体：左列表 + 右详情（同供应商页布局）
+                    // 主体：左会话列表（chat_id 分组，微信式）+ 右消息流（ts 正序）
                     Rectangle {
                         vertical-stretch: 1;
                         background: PixelTheme.bg;
                         border-radius: 4px;
                         HorizontalBox {
                             spacing: 0;
-                            // ── 左：消息列表（时间/平台/发送者/摘要）──
+                            // ── 左：会话列表（同一 chat 的消息聚合为一个会话）──
                             VerticalBox {
                                 width: 300px;
                                 padding: 10px;
@@ -2803,53 +2813,69 @@ export component SettingsWindow inherits Window {
                                         vertical-stretch: 1;
                                         VerticalBox {
                                             spacing: 2px;
-                                            for h[idx] in root.history-rows: Rectangle {
-                                                height: 46px;
-                                                background: idx == root.history-selected ? PixelTheme.accent : transparent;
+                                            for s[idx] in root.chat-sessions: Rectangle {
+                                                height: 52px;
+                                                vertical-stretch: 0;
+                                                background: idx == root.chat-selected ? PixelTheme.accent : transparent;
                                                 TouchArea {
-                                                    clicked => { root.history-selected = idx; root.history-selection-changed(idx); }
+                                                    clicked => { root.chat-selected = idx; root.history-selection-changed(idx); }
                                                     VerticalBox {
                                                         padding-left: 10px;
                                                         spacing: 2px;
-                                                        Text {
-                                                            text: h.time + "  " + h.sender + "  " + h.bot + "  " + h.kind + "  " + h.direction;
-                                                            font-size: 12px;
-                                                            font-weight: 600;
-                                                            overflow: elide;
-                                                            width: 100%;
-                                                            color: idx == root.history-selected ? PixelTheme.bg : PixelTheme.text;
+                                                        HorizontalBox {
+                                                            spacing: 6px;
+                                                            Text {
+                                                                text: s.sender;
+                                                                font-size: 12px;
+                                                                font-weight: 600;
+                                                                overflow: elide;
+                                                                horizontal-stretch: 1;
+                                                                color: idx == root.chat-selected ? PixelTheme.bg : PixelTheme.text;
+                                                            }
+                                                            Text {
+                                                                text: s.time;
+                                                                font-size: 11px;
+                                                                vertical-alignment: center;
+                                                                color: idx == root.chat-selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
+                                                            }
                                                         }
-                                                        Text {
-                                                            text: h.preview;
-                                                            font-size: 12px;
-                                                            overflow: elide;
-                                                            width: 100%;
-                                                            color: idx == root.history-selected ? PixelTheme.bg.with-alpha(0.85) : PixelTheme.text.with-alpha(0.6);
+                                                        HorizontalBox {
+                                                            spacing: 6px;
+                                                            Text {
+                                                                text: s.preview;
+                                                                font-size: 12px;
+                                                                overflow: elide;
+                                                                horizontal-stretch: 1;
+                                                                color: idx == root.chat-selected ? PixelTheme.bg.with-alpha(0.85) : PixelTheme.text.with-alpha(0.6);
+                                                            }
+                                                            Text {
+                                                                text: s.count;
+                                                                font-size: 11px;
+                                                                vertical-alignment: center;
+                                                                color: idx == root.chat-selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                            if root.history-rows.length == 0: Text {
-                                                text: "暂无记录：授权者私聊本机器人后，消息与回复会显示在这里";
+                                            if root.chat-sessions.length == 0: Text {
+                                                text: "暂无记录：授权者私聊本机器人后，同一会话的消息会聚合显示在这里";
                                                 font-size: 12px;
                                                 color: UiTokens.text-dim;
                                                 wrap: word-wrap;
                                             }
+                                            Rectangle { vertical-stretch: 1; } // spacer：防会话项被 viewport 拉伸成大色块
                                         }
                                     }
                                 }
                             }
-                            // ── 右：详情（完整文本）──
+                            // ── 右：选中会话的消息流（wrap 换行，纵向滚动）──
                             VerticalBox {
                                 horizontal-stretch: 1;
                                 padding-top: 14px; padding-right: 14px; padding-bottom: 14px; padding-left: 14px;
                                 spacing: 8px;
                                 Text {
-                                    text: root.history-selected >= 0 && root.history-selected < root.history-rows.length
-                                        ? root.history-rows[root.history-selected].time + " · " + root.history-rows[root.history-selected].bot
-                                            + " · " + root.history-rows[root.history-selected].sender
-                                            + " · " + root.history-rows[root.history-selected].direction
-                                        : "← 选择左侧一条消息查看完整内容";
+                                    text: root.chat-title == "" ? "← 选择左侧一个会话查看消息流" : root.chat-title;
                                     font-size: 13px;
                                     font-weight: 600;
                                     color: PixelTheme.text;
@@ -2860,12 +2886,30 @@ export component SettingsWindow inherits Window {
                                     vertical-stretch: 1;
                                     PixelScrollPanel {
                                         vertical-stretch: 1;
-                                        Text {
-                                            text: root.history-selected >= 0 && root.history-selected < root.history-rows.length
-                                                ? root.history-rows[root.history-selected].text : "";
-                                            font-size: 12px;
-                                            color: PixelTheme.text;
-                                            wrap: word-wrap;
+                                        VerticalLayout {
+                                            width: 100%; // 钳制视口宽：wrap 生效，长文换行纵向滚动（#223 同款坑）
+                                            spacing: 10px;
+                                            padding-right: 12px;
+                                            for m in root.history-msgs: VerticalLayout {
+                                                spacing: 2px;
+                                                Text {
+                                                    text: m.time + " · " + m.direction + " · " + m.sender;
+                                                    font-size: 11px;
+                                                    color: UiTokens.text-dim;
+                                                }
+                                                Text {
+                                                    width: 100%;
+                                                    text: m.text;
+                                                    font-size: 12px;
+                                                    color: PixelTheme.text;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                            if root.history-msgs.length == 0 && root.chat-title != "": Text {
+                                                text: "（该会话暂无消息）";
+                                                font-size: 12px;
+                                                color: UiTokens.text-dim;
+                                            }
                                         }
                                     }
                                 }
