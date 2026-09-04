@@ -549,6 +549,40 @@ async fn run_bot(
         });
     }
 
+    // 历史会话类型回填（9-4 会话化跟进）：库迁移补列前的旧消息 chat_type/chat_name
+    // 为空 → 会话列表只能按人名展示。启动后异步对缺类型的会话逐个 chat_brief 反查
+    // （飞书 chat API 自带 chat_type）并 UPDATE 回填；失败留空下次启动再试。逐个间
+    // 隔 200ms 防限流；低频一次性任务，不阻塞事件循环。
+    {
+        let bridge = bridge.clone();
+        let name: &'static str = Box::leak(format!("history-backfill:{}", key).into_boxed_str());
+        crate::tasks::tasks().spawn(name, async move {
+            let missing = bridge.msgstore.chats_missing_type();
+            if missing.is_empty() {
+                return;
+            }
+            crate::log!(
+                "[history] 回填 {} 个缺类型会话的 chat_type/chat_name",
+                missing.len()
+            );
+            for (bot_key, chat_id) in missing {
+                if let Some((ctype, cname)) = bridge.msgr.chat_brief(&chat_id).await {
+                    let n = bridge
+                        .msgstore
+                        .backfill_chat(&bot_key, &chat_id, &ctype, &cname);
+                    crate::log!(
+                        "[history] 回填 chat={} type={} name={:?} rows={}",
+                        &chat_id[..chat_id.len().min(12)],
+                        ctype,
+                        cname,
+                        n
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+    }
+
     // #25 重启恢复：上次崩溃/退出时未处理完的消息 → 自动续跑（异步进行，不阻塞事件循环
     // 启动；per-chat 串行锁保证重放与实时消息不乱序）。
     // #69 审计：短命任务，登记进治理，**token 逐条检查**（审查 Important）——恢复会跑

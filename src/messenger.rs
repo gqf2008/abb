@@ -52,6 +52,13 @@ pub trait Messenger: Send + Sync {
         None
     }
 
+    /// 会话类型 + 会话名（历史回填用）：飞书 chat API 返回体自带 chat_type
+    /// （"p2p"/"group"）；其它平台默认 None（钉钉落库时已带 conversationTitle，
+    /// 微信无群概念）。None = 查不到/不支持——回填任务跳过该会话。
+    async fn chat_brief(&self, _chat_id: &str) -> Option<(String, String)> {
+        None
+    }
+
     /// 创建群会话（#124 一键创建团队·聊天入口用）。返回平台 chat_id。
     /// 平台支持：飞书/钉钉实现；微信无建群 API → 默认 Err（聊天侧回落登记制指引：
     /// 手动建群后 GUI 虚拟 Bot 面板登记）。`owner_user_id`：飞书把 owner 设为群成员
@@ -158,6 +165,11 @@ impl Messenger for FeishuMessenger {
                 None
             }
         }
+    }
+    async fn chat_brief(&self, chat_id: &str) -> Option<(String, String)> {
+        // GET /im/v1/chats/{id} 的 data.chat_type（"p2p"/"group"）+ data.name
+        let (ctype, name) = self.fs.chat_brief(chat_id).await.ok()?;
+        Some((ctype, name))
     }
     async fn get_chat_info(&self, chat_id: &str) -> Option<(String, String)> {
         // best-effort：失败只 log（缓存层会自然降级为事件名/跳过注入），不阻塞消息

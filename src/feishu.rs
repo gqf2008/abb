@@ -529,6 +529,29 @@ impl FeishuClient {
 
     /// 群资料（虚拟 Bot 注入用）：(群名, 群介绍)。失败返回 Err——调用方 best-effort：
     /// 拿不到只 log 不阻塞消息处理（对齐 get_quoted_message 的语义）。
+    /// 会话简报：chat_type（"p2p"/"group"）+ 会话名。历史回填任务用——
+    /// 与 get_chat_info 同一端点，但取 chat_type 字段（群/私聊判定源）。
+    pub async fn chat_brief(&self, chat_id: &str) -> Result<(String, String)> {
+        let token = self.tenant_token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .get(self.url(&format!("/im/v1/chats/{chat_id}")))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!("查询会话失败 code={:?}", resp.get("code"));
+        }
+        let ctype = resp["data"]["chat_type"].as_str().unwrap_or("").to_string();
+        let name = resp["data"]["name"].as_str().unwrap_or("").to_string();
+        if ctype.is_empty() {
+            anyhow::bail!("响应缺 chat_type");
+        }
+        Ok((ctype, name))
+    }
+
     pub async fn get_chat_info(&self, chat_id: &str) -> Result<(String, String)> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
