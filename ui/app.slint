@@ -1114,6 +1114,9 @@ export component SettingsWindow inherits Window {
     in-out property <string> version: "";
     // 当前页：0=首页 1=机器人配置 2=环境配置 3=模型供应商
     in-out property <int> current-page: 0;
+    // 硬闸配套引导：全局默认供应商缺失/悬空（push_settings_status 每 tick 推导）。
+    // true 时首页待处理卡提示并跳模型供应商页（current-page=3）。
+    in-out property <bool> provider-unconfigured: false;
     // 首页 hero / 状态卡用的结构化状态（running-line 保留给底部状态行）
     in-out property <bool> service-running: false;
     in-out property <bool> autostart: false;
@@ -1434,7 +1437,7 @@ export component SettingsWindow inherits Window {
                         }
 
                         // 待处理建议（火绒「主页建议」/ PCM「智能提醒」同款）：只有异常才出现，每行点一下直达对应页。
-                        if root.dep-failed-count > 0 || root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0: Rectangle {
+                        if root.dep-failed-count > 0 || root.missing-deps > 0 || root.missing-perms > 0 || root.bot-count - root.online-count > 0 || root.provider-unconfigured: Rectangle {
                             border-radius: 4px;
                             background: UiTokens.warn-bg;
                             VerticalBox {
@@ -1444,6 +1447,10 @@ export component SettingsWindow inherits Window {
                                     spacing: 8px;
                                     ImageIcon { icon: @image-url("icons/alert.svg"); tint: UiTokens.warn; width: 18px; height: 18px; }
                                     Text { text: "待处理"; font-size: 13px; font-weight: 700; color: UiTokens.warn; vertical-alignment: center; }
+                                }
+                                if root.provider-unconfigured: ProblemRow {
+                                    text: "未配置模型供应商 — 机器人将拒绝回复，点击去配置";
+                                    clicked => { root.current-page = 3; }
                                 }
                                 if root.dep-failed-count > 0: ProblemRow {
                                     text: "一键安装失败 " + root.dep-failed-count + " 项 — 点击查看详情与处理指引";
@@ -2513,7 +2520,7 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: "说明：claude/codex 由「模型供应商配置」提供凭证，不再在运行期弹授权；pi 用自己的登录态（~/.pi，配了供应商则注入对应 key）。nodejs 是 codex/lark-cli 的前置；接入飞书 bot 时会自动装 lark 技能。";
+                                    text: "说明：claude/codex/pi 均由「模型供应商」页提供凭证，未配置供应商的 bot 会拒答并引导配置；nodejs 是 codex/lark-cli 的前置；接入飞书 bot 时会自动装 lark 技能。";
                                     font-size: 12px;
                                     color: UiTokens.text-dim;
                                     wrap: word-wrap;

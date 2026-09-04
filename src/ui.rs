@@ -370,6 +370,15 @@ fn push_settings_status(settings: &SettingsWindow, st: &install::ServiceStatus) 
     settings.set_autostart(platform::autostart_enabled());
     settings.set_bot_count(bots.len() as i32);
     settings.set_online_count(online as i32);
+    // 硬闸配套引导：全局默认供应商缺失/悬空 → 首页待处理卡提示（点击跳供应商页）。
+    // load 失败按 true（保守提示）；bot 级 provider 覆盖属进阶语义，卡片按全局判定。
+    let provider_unconfigured = crate::config::Config::load()
+        .map(|c| {
+            c.default_provider.is_empty()
+                || !c.providers.iter().any(|p| p.name == c.default_provider)
+        })
+        .unwrap_or(true);
+    settings.set_provider_unconfigured(provider_unconfigured);
     let line = if !st.running {
         "● 服务已停止 — 点首页「启动服务」或托盘菜单「启动」".to_string()
     } else if bots.is_empty() {
@@ -4709,10 +4718,10 @@ pub fn run_gui() -> Result<()> {
                                     w.set_status_is_error(false);
                                     w.set_dep_failed_count(0);
                                     let mut line = crate::deps::format_all_summary(&outcome);
-                                    // #93：一键装里带 codex → 追加登录引导（与单项装同文案）
+                                    // #93：一键装里带 codex → 追加供应商引导（与单项装同口径）
                                     if outcome.ok.iter().any(|id| id == "codex") {
                                         line.push_str(
-                                            "；codex 首次使用请运行 `codex login` 或在「模型供应商」页配 API key",
+                                            "；codex 请到「模型供应商」页添加供应商并设为默认",
                                         );
                                     }
                                     w.set_status_line(line.into());

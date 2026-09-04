@@ -650,7 +650,16 @@ mod tests {
     #[test]
     fn build_agent_command_codex_old_version_falls_back_bypass() {
         // codex < 0.146（无 --add-dir）：与 run_once 同款回退 bypass，不带 --sandbox。
-        let inject = crate::agent::build_injection(crate::agent::Backend::Codex, None).unwrap();
+        // 硬闸后 None 会 Err，注入载体用 Some(provider)（本测试只验 bypass 回退）。
+        let provider = crate::config::ProviderConfig {
+            name: "p".into(),
+            kind: "openai-chat".into(),
+            base_url: "https://api.openai.com".into(),
+            api_key: "sk-test-123".into(),
+            model: String::new(),
+        };
+        let inject =
+            crate::agent::build_injection(crate::agent::Backend::Codex, Some(&provider)).unwrap();
         let cmd = build_agent_command(
             crate::agent::Backend::Codex,
             std::path::Path::new("codex"),

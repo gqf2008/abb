@@ -470,6 +470,14 @@ fn init_buzz_harness(cfg: &Config) -> Option<std::sync::Arc<crate::buzz::harness
                 Ok(None) => {}
                 Err(e) => crate::log!("[buzz] ⚠️ 供应商注入失败（走纯宿主 env）：{e}"),
             }
+        } else {
+            // 硬闸配套提示：无生效供应商时 harness 照装配（PATH env 照注入），
+            // 让 dispatch 预检给出精确的「未配置模型供应商」文案而非误导性的
+            // 「buzz 后端未启用」（BuzzPrecheckFail::NoProvider 对应此态）。
+            crate::log!(
+                "[buzz] ⚠️ buzz bot「{}」未配置生效供应商——该 bot 的消息将被拒答，请在模型供应商页配置",
+                bot.name
+            );
         }
     }
     let handle = crate::buzz::harness::BuzzHandle::new(

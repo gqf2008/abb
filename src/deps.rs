@@ -677,11 +677,11 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
                     // #93 登录引导：codex 装完给下一步指引（装完即能用的最后一公里）。
                     // 不自动跑 codex login（交互式浏览器授权，GUI 里无人值守会挂死）；
-                    // 给出两条路径：命令行 codex login / GUI 供应商页配 key（ABB 已有供应商注入）。
+                    // 硬闸后 CLI 登录态不再被 ABB 使用，引导统一走供应商页。
                     // 状态行要精简：不返回 npm/brew 的冗长输出，只回引导文案。
                     if dep_id == "codex" {
                         return Ok(
-                            "✅ codex 安装完成。首次使用：① 命令行运行 `codex login`（浏览器授权）；② 或到「设置 → 模型供应商」配 OpenAI / DeepSeek / OpenRouter 的 API key。"
+                            "✅ codex 安装完成。请到「设置 → 模型供应商」添加 OpenAI / DeepSeek / OpenRouter 供应商并设为默认（未配置供应商的 bot 会拒答）。"
                                 .to_string(),
                         );
                     }
