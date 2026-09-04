@@ -8,7 +8,10 @@ pub const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;
 const SKILL_DIRS: &[&str] = &[".agents/skills", ".goose/skills", ".claude/skills"];
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    // 跨平台 home：macOS/Linux 用 HOME，Windows 只有 USERPROFILE（无 HOME）——
+    // 手写 env 读法会让 Windows 丢全局 skill 发现与 ~/AGENTS.md 层；与 auth.rs
+    // 的 dirs::home_dir 对齐（dirs crate 已在依赖中）。
+    dirs::home_dir()
 }
 
 #[derive(Clone)]
@@ -30,10 +33,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
         if current.join(".git").exists() {
             return Some(current);
         }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return None,
-        }
+        current = current.parent()?.to_path_buf();
     }
 }
 
