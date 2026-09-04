@@ -292,6 +292,50 @@ impl MsgStore {
     /// 按 (bot_key, chat_id) 聚合的消息统计（#87 session list 数据源）。
     /// 消息量按 chat_id 粒度（msgstore 只记原始 chat_id，话题消息同属其群）；
     /// 库不存在/损坏返回空。
+    /// 待回填会话：chat_type 为空的 (bot_key, chat_id) 去重列表（旧数据迁移前的
+    /// 消息没有类型/群名列）。回填任务按此列表逐个反查后调 [`backfill_chat`]。
+    /// 只读连接；库不存在返回空。
+    pub fn chats_missing_type(&self) -> Vec<(String, String)> {
+        if !self.path.exists() {
+            return Vec::new();
+        }
+        let con = match Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log!("[msgstore] 只读打开失败: {e:#}");
+                return Vec::new();
+            }
+        };
+        let mut stmt = match con
+            .prepare("SELECT DISTINCT bot_key, chat_id FROM messages WHERE chat_type = ''")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default()
+    }
+
+    /// 回填某会话的类型/群名（同 chat 全部行统一更新——chat_type/chat_name 是
+    /// 会话级属性）。返回受影响行数；写连接失败返回 0（下次启动再试）。
+    pub fn backfill_chat(
+        &self,
+        bot_key: &str,
+        chat_id: &str,
+        chat_type: &str,
+        chat_name: &str,
+    ) -> usize {
+        let Some(con) = self.open_writer() else {
+            return 0;
+        };
+        con.execute(
+            "UPDATE messages SET chat_type = ?3, chat_name = ?4 WHERE bot_key = ?1 AND chat_id = ?2 AND chat_type = ''",
+            rusqlite::params![bot_key, chat_id, chat_type, chat_name],
+        )
+        .unwrap_or(0)
+    }
+
     pub fn chat_stats(&self) -> Vec<ChatStats> {
         if !self.path.exists() {
             return Vec::new();
