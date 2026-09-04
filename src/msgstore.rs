@@ -35,6 +35,12 @@ pub struct MsgRow {
     pub text: String,
     /// 事件时间（unix 秒）。
     pub ts: i64,
+    /// 会话类型（"p2p"/"group"；旧数据空）。消息流页头不用，留投影完整。
+    #[allow(dead_code)]
+    pub chat_type: String,
+    /// 群名（仅 group 会话有值）。
+    #[allow(dead_code)]
+    pub chat_name: String,
 }
 
 fn db_path() -> PathBuf {
@@ -83,21 +89,41 @@ impl MsgStore {
             CREATE INDEX IF NOT EXISTS idx_messages_bot_chat_ts ON messages(bot_key, chat_id, ts);",
         )
         .ok()?;
-        // 老库迁移（8-20 加 sender_name 列）：PRAGMA 检查列存在，缺失则 ALTER 补列
-        // （CREATE TABLE IF NOT EXISTS 不补列；缺列会让 list_recent 的 SELECT 失败）
-        let has_col: bool = con
+        // 老库迁移（PRAGMA 检查列存在，缺失则 ALTER 补列——CREATE TABLE IF NOT EXISTS
+        // 不补列，缺列会让 SELECT 失败）：
+        // - sender_name（8-20）：发送者展示名
+        // - chat_type/chat_name（9-4 会话化：群/私聊区分 + 群名——历史页会话列表按
+        //   类型显示群名或人名；旧数据两列为空，GUI 按「无类型」回退发送者名展示）
+        let cols: Vec<String> = con
             .prepare("PRAGMA table_info(messages)")
             .ok()?
             .query_map([], |r| r.get::<_, String>(1))
             .ok()?
             .filter_map(|r| r.ok())
-            .any(|name| name == "sender_name");
-        if !has_col {
-            let _ = con.execute(
+            .collect();
+        for (col, _ddl) in [
+            (
+                "sender_name",
                 "ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT ''",
-                [],
-            );
+            ),
+            (
+                "chat_type",
+                "ALTER TABLE messages ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "chat_name",
+                "ALTER TABLE messages ADD COLUMN chat_name TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            if !cols.iter().any(|c| c == col) {
+                let _ = con.execute(
+                    &format!("ALTER TABLE messages ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"),
+                    [],
+                );
+                let _ = col; // cols 借用检查
+            }
         }
+        let _ = &cols;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -119,15 +145,17 @@ impl MsgStore {
         sender_name: &str,
         text: &str,
         ts: i64,
+        chat_type: &str,
+        chat_name: &str,
     ) -> bool {
         let Some(con) = self.open_writer() else {
             crate::log!("[msgstore] 打开消息库失败，跳过落库");
             return false;
         };
         match con.execute(
-            "INSERT OR IGNORE INTO messages (bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts],
+            "INSERT OR IGNORE INTO messages (bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts, chat_type, chat_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts, chat_type, chat_name],
         ) {
             Ok(n) => n > 0,
             Err(e) => {
@@ -153,7 +181,7 @@ impl MsgStore {
             }
         };
         let mut stmt = match con.prepare(
-            "SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts
+            "SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts, chat_type, chat_name
              FROM messages ORDER BY ts DESC, id DESC LIMIT ?1",
         ) {
             Ok(s) => s,
@@ -173,6 +201,8 @@ impl MsgStore {
                 sender_name: r.get(6)?,
                 text: r.get(7)?,
                 ts: r.get(8)?,
+                chat_type: r.get(9).unwrap_or_default(),
+                chat_name: r.get(10).unwrap_or_default(),
             })
         });
         rows.and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
@@ -194,8 +224,8 @@ impl MsgStore {
         };
         // 内层 DESC 取最近 limit 条，外层 ASC 翻正序
         let mut stmt = match con.prepare(
-            "SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts FROM (
-                 SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts
+            "SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts, chat_type, chat_name FROM (
+                 SELECT id, bot_key, chat_id, mid, direction, sender_id, sender_name, text, ts, chat_type, chat_name
                  FROM messages WHERE bot_key = ?1 AND chat_id = ?2
                  ORDER BY ts DESC, id DESC LIMIT ?3
              ) ORDER BY ts ASC, id ASC",
@@ -217,6 +247,8 @@ impl MsgStore {
                 sender_name: r.get(6)?,
                 text: r.get(7)?,
                 ts: r.get(8)?,
+                chat_type: r.get(9).unwrap_or_default(),
+                chat_name: r.get(10).unwrap_or_default(),
             })
         });
         rows.and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
@@ -285,6 +317,12 @@ impl MsgStore {
                       ORDER BY m2.ts DESC, m2.id DESC LIMIT 1),
                     (SELECT m2.sender_id FROM messages m2
                       WHERE m2.bot_key = m.bot_key AND m2.chat_id = m.chat_id
+                      ORDER BY m2.ts DESC, m2.id DESC LIMIT 1),
+                    (SELECT m2.chat_type FROM messages m2
+                      WHERE m2.bot_key = m.bot_key AND m2.chat_id = m.chat_id
+                      ORDER BY m2.ts DESC, m2.id DESC LIMIT 1),
+                    (SELECT m2.chat_name FROM messages m2
+                      WHERE m2.bot_key = m.bot_key AND m2.chat_id = m.chat_id
                       ORDER BY m2.ts DESC, m2.id DESC LIMIT 1)
              FROM messages m GROUP BY m.bot_key, m.chat_id",
         ) {
@@ -304,6 +342,8 @@ impl MsgStore {
                 last_sender: r.get(5).unwrap_or_default(),
                 last_text: r.get(6).unwrap_or_default(),
                 last_sender_id: r.get(7).unwrap_or_default(),
+                chat_type: r.get(8).unwrap_or_default(),
+                chat_name: r.get(9).unwrap_or_default(),
             })
         })
         .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
@@ -377,6 +417,10 @@ pub struct ChatStats {
     pub last_sender_id: String,
     /// 最后一条消息文本预览。
     pub last_text: String,
+    /// 会话类型（"p2p"/"group"；旧数据空 = 未知）。
+    pub chat_type: String,
+    /// 群名（仅群聊有值；事件自带，空 = 未取到）。
+    pub chat_name: String,
 }
 
 /// 消费 GUI 命令文件（跨进程队列，先例：deliveries.json 的令牌语义；这里是「存在即消费」——
@@ -415,9 +459,31 @@ mod tests {
     #[test]
     fn insert_then_list_roundtrip_newest_first() {
         let s = MsgStore::at(temp_path("roundtrip"));
-        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "", "你好", 100));
-        assert!(s.insert("b1", "c1", "m1", "assistant", "ou_1", "", "回复", 101));
-        assert!(s.insert("b1", "c2", "m2", "user", "ou_2", "", "另一条", 200));
+        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "", "你好", 100, "p2p", ""));
+        assert!(s.insert(
+            "b1",
+            "c1",
+            "m1",
+            "assistant",
+            "ou_1",
+            "",
+            "回复",
+            101,
+            "p2p",
+            ""
+        ));
+        assert!(s.insert(
+            "b1",
+            "c2",
+            "m2",
+            "user",
+            "ou_2",
+            "",
+            "另一条",
+            200,
+            "p2p",
+            ""
+        ));
         let rows = s.list_recent(10);
         assert_eq!(rows.len(), 3);
         // 最新在上：m2 最前；同 mid 的用户/助手对保留各自方向
@@ -433,11 +499,44 @@ mod tests {
     #[test]
     fn duplicate_mid_same_direction_is_ignored() {
         let s = MsgStore::at(temp_path("dedup"));
-        assert!(s.insert("b1", "c1", "m1", "user", "ou_1", "", "第一遍", 100));
+        assert!(s.insert(
+            "b1",
+            "c1",
+            "m1",
+            "user",
+            "ou_1",
+            "",
+            "第一遍",
+            100,
+            "p2p",
+            ""
+        ));
         // 同 mid 同方向（重放兜底）→ 幂等忽略
-        assert!(!s.insert("b1", "c1", "m1", "user", "ou_1", "", "第一遍", 100));
+        s.insert(
+            "b1",
+            "c1",
+            "m1",
+            "user",
+            "ou_1",
+            "",
+            "第一遍",
+            100,
+            "p2p",
+            "",
+        );
         // 同 mid 不同方向（bot 回复）→ 允许
-        assert!(s.insert("b1", "c1", "m1", "assistant", "ou_1", "", "回复", 101));
+        assert!(s.insert(
+            "b1",
+            "c1",
+            "m1",
+            "assistant",
+            "ou_1",
+            "",
+            "回复",
+            101,
+            "p2p",
+            ""
+        ));
         assert_eq!(s.list_recent(10).len(), 2);
         let _ = std::fs::remove_file(&s.path);
     }
@@ -455,6 +554,8 @@ mod tests {
                 "",
                 "x",
                 i * 10,
+                "p2p",
+                "",
             );
         }
         assert_eq!(s.list_recent(2).len(), 2);
@@ -481,6 +582,8 @@ mod tests {
             "",
             "旧",
             now - 31 * 86400,
+            "p2p",
+            "",
         );
         s.insert(
             "b1",
@@ -491,6 +594,8 @@ mod tests {
             "",
             "新",
             now - 29 * 86400,
+            "p2p",
+            "",
         );
         // 保留 30 天：31 天前的删掉，29 天前的留下
         assert_eq!(s.gc(30), 1);
@@ -504,7 +609,18 @@ mod tests {
     fn gc_with_zero_days_falls_back_to_one() {
         let s = MsgStore::at(temp_path("gc0"));
         let now = crate::chrono_lite::unix_secs() as i64;
-        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", now - 2 * 86400);
+        s.insert(
+            "b1",
+            "c1",
+            "m1",
+            "user",
+            "ou_1",
+            "",
+            "x",
+            now - 2 * 86400,
+            "p2p",
+            "",
+        );
         // retention 0（异常配置）→ 按 1 天兜底，2 天前的记录被删
         assert_eq!(s.gc(0), 1);
         assert!(s.list_recent(10).is_empty());
@@ -514,8 +630,8 @@ mod tests {
     #[test]
     fn clear_all_empties_table() {
         let s = MsgStore::at(temp_path("clear"));
-        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100);
-        s.insert("b2", "c2", "m2", "user", "ou_2", "", "y", 200);
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100, "p2p", "");
+        s.insert("b2", "c2", "m2", "user", "ou_2", "", "y", 200, "p2p", "");
         assert_eq!(s.clear_all(), 2);
         assert!(s.list_recent(10).is_empty());
         let _ = std::fs::remove_file(&s.path);
@@ -526,10 +642,43 @@ mod tests {
         let s = MsgStore::at(temp_path("stats"));
         let now = crate::chrono_lite::unix_secs() as i64;
         // b1/c1：2 条（1 条近 7 天）；b1/c2：1 条（10 天前）；b2/c1：1 条
-        s.insert("b1", "c1", "m1", "user", "ou_1", "", "a", now - 86400);
-        s.insert("b1", "c1", "m2", "assistant", "ou_1", "", "b", now);
-        s.insert("b1", "c2", "m3", "user", "ou_1", "", "c", now - 10 * 86400);
-        s.insert("b2", "c1", "m4", "user", "ou_2", "", "d", now);
+        s.insert(
+            "b1",
+            "c1",
+            "m1",
+            "user",
+            "ou_1",
+            "",
+            "a",
+            now - 86400,
+            "p2p",
+            "",
+        );
+        s.insert(
+            "b1",
+            "c1",
+            "m2",
+            "assistant",
+            "ou_1",
+            "",
+            "b",
+            now,
+            "p2p",
+            "",
+        );
+        s.insert(
+            "b1",
+            "c2",
+            "m3",
+            "user",
+            "ou_1",
+            "",
+            "c",
+            now - 10 * 86400,
+            "p2p",
+            "",
+        );
+        s.insert("b2", "c1", "m4", "user", "ou_2", "", "d", now, "p2p", "");
         let stats = s.chat_stats();
         assert_eq!(stats.len(), 3);
         let c1 = stats
@@ -550,9 +699,20 @@ mod tests {
     #[test]
     fn delete_chat_removes_only_target_chat() {
         let s = MsgStore::at(temp_path("delchat"));
-        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100);
-        s.insert("b1", "c1", "m2", "assistant", "ou_1", "", "y", 101);
-        s.insert("b1", "c2", "m3", "user", "ou_1", "", "z", 102);
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100, "p2p", "");
+        s.insert(
+            "b1",
+            "c1",
+            "m2",
+            "assistant",
+            "ou_1",
+            "",
+            "y",
+            101,
+            "p2p",
+            "",
+        );
+        s.insert("b1", "c2", "m3", "user", "ou_1", "", "z", 102, "p2p", "");
         assert_eq!(s.delete_chat("b1", "c1"), 2);
         let rows = s.list_recent(10);
         assert_eq!(rows.len(), 1);
@@ -564,8 +724,19 @@ mod tests {
     fn chat_count_and_range_reports_impact() {
         let s = MsgStore::at(temp_path("range"));
         assert_eq!(s.chat_count_and_range("b1", "c1"), (0, None, None));
-        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100);
-        s.insert("b1", "c1", "m2", "assistant", "ou_1", "", "y", 200);
+        s.insert("b1", "c1", "m1", "user", "ou_1", "", "x", 100, "p2p", "");
+        s.insert(
+            "b1",
+            "c1",
+            "m2",
+            "assistant",
+            "ou_1",
+            "",
+            "y",
+            200,
+            "p2p",
+            "",
+        );
         let (n, min, max) = s.chat_count_and_range("b1", "c1");
         assert_eq!(n, 2);
         assert_eq!(min, Some(100));
@@ -583,12 +754,47 @@ mod stats_tests {
         let dir = std::env::temp_dir().join(format!("msg-stats-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = MsgStore::at(dir.join("messages.sqlite"));
-        store.insert("b1", "c1", "m1", "user", "u1", "张三", "你好", 1000);
-        store.insert("b1", "c1", "m1", "assistant", "bot", "", "回复你", 1001);
-        store.insert("b1", "c2", "m2", "user", "u2", "李四", "第二条", 2000);
+        store.insert(
+            "b1",
+            "c1",
+            "m1",
+            "user",
+            "u1",
+            "张三",
+            "你好",
+            1000,
+            "group",
+            "后端开发群",
+        );
+        store.insert(
+            "b1",
+            "c1",
+            "m1",
+            "assistant",
+            "bot",
+            "",
+            "回复你",
+            1001,
+            "group",
+            "后端开发群",
+        );
+        store.insert(
+            "b1",
+            "c2",
+            "m2",
+            "user",
+            "u2",
+            "李四",
+            "第二条",
+            2000,
+            "p2p",
+            "",
+        );
         let stats = store.chat_stats();
         assert_eq!(stats.len(), 2, "两个会话: {stats:?}");
         let c1 = stats.iter().find(|s| s.chat_id == "c1").unwrap();
+        assert_eq!(c1.chat_type, "group");
+        assert_eq!(c1.chat_name, "后端开发群");
         assert_eq!(c1.count_total, 2);
         assert_eq!(c1.last_ts, Some(1001));
         assert_eq!(c1.last_sender, "");
@@ -613,6 +819,8 @@ mod stats_tests {
                 "张三",
                 &format!("消息{i}"),
                 1000 + i,
+                "p2p",
+                "",
             );
         }
         let rows = store.list_chat("b1", "c1", 3);

@@ -142,6 +142,9 @@ pub struct Ev {
     pub chat_id: String,
     /// 会话类型：飞书 p2p/group，微信 dm（主会话候选判定用）
     pub chat_type: String,
+    /// 会话名（群聊 = 事件自带群名 chat_name/conversationTitle；私聊空）。
+    /// #74 历史落库用——会话列表按类型显示群名或人名。
+    pub chat_name: String,
     /// 飞书话题 ID（omt_ 开头）；空=非话题消息。微信/钉钉恒为空。
     pub thread_id: String,
     /// 被引用消息的内容（引用/回复场景：用户引用上一条消息再 @ bot 时，
@@ -223,8 +226,18 @@ impl Bridge {
             .user_display_name(sender_id)
             .await
             .unwrap_or_default();
+        let ev_chat_name = message["chat_name"].as_str().unwrap_or("");
         self.msgstore.insert(
-            bot_key, &chat_id, &mid, "user", sender_id, &uname, &text, ts,
+            bot_key,
+            &chat_id,
+            &mid,
+            "user",
+            sender_id,
+            &uname,
+            &text,
+            ts,
+            chat_type,
+            ev_chat_name,
         );
         if chat_type == "p2p" {
             self.unread.report(
@@ -506,6 +519,7 @@ impl Bridge {
             mid,
             chat_id: message["chat_id"].as_str().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
+            chat_name: chat_name.clone(),
             // 话题消息事件体带 thread_id（omt_ 开头）；非话题不返回该字段 → 空
             thread_id: thread_id.to_string(),
             quoted: crate::messenger::QuotedContent::default(),
@@ -718,6 +732,7 @@ mod tests {
             mid: "om_1".into(),
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
+            chat_name: String::new(),
             thread_id: String::new(),
             quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
@@ -736,6 +751,7 @@ mod tests {
             mid: "om_1".into(),
             chat_id: "oc_group".into(),
             chat_type: "group".into(),
+            chat_name: String::new(),
             thread_id: thread.into(),
             quoted: crate::messenger::QuotedContent::default(),
             text: "hi".into(),
@@ -1235,6 +1251,7 @@ mod tests {
             mid: mid.into(),
             chat_id: chat_id.into(),
             chat_type: "group".into(), // 非 p2p/dm：跳过 save_primary_chat 写盘
+            chat_name: String::new(),
             thread_id: String::new(),
             quoted: crate::messenger::QuotedContent::default(),
             text: text.into(),
@@ -2218,7 +2235,9 @@ mod tests {
                 "ou_friend",
                 "",
                 "帮我查一下",
-                1000
+                1000,
+                "p2p",
+                "",
             ),
             "前置：用户轮应已落库"
         );
@@ -2266,7 +2285,9 @@ mod tests {
                 "ou_friend",
                 "",
                 "补发的回复",
-                2000
+                2000,
+                "p2p",
+                "",
             ),
             "UNIQUE(mid,direction) 应挡住重复 assistant 行"
         );

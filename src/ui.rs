@@ -901,25 +901,39 @@ fn chat_stats_to_row(s: &crate::msgstore::ChatStats, cfg: &Config) -> ChatSessio
     let bot_name = bot
         .map(|b| b.name.clone())
         .unwrap_or_else(|| s.bot_key.clone());
-    // 会话名：最后一条 user 消息的发送者优先走落库名（未授权 API 反查的真实名字），
-    // 空则本地名单反查，再空则 id 前缀。assistant 结尾（bot 主动回复）也以该会话的
-    // user 身份命名——会话是「和某个授权者的对话」。
-    let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
-    let sender = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
-        s.last_sender.clone()
+    // 会话名按类型：群聊 = 群名（事件自带，空则「群聊」兜底）；
+    // 私聊 = 最后一条 user 消息发送者（落库名优先，空则本地名单反查，再空 id 前缀）。
+    // assistant 结尾也按会话身份命名。旧数据 chat_type 空 = 未知，按私聊回退。
+    let is_group = s.chat_type == "group";
+    let (kind_tag, sender) = if is_group {
+        (
+            "群",
+            if s.chat_name.is_empty() {
+                "群聊".to_string()
+            } else {
+                s.chat_name.clone()
+            },
+        )
     } else {
-        fallback
-    };
-    let sender = if sender.is_empty() {
-        format!("…{}", &s.chat_id[s.chat_id.len().saturating_sub(8)..])
-    } else {
-        sender
+        let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
+        let sender = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
+            s.last_sender.clone()
+        } else {
+            fallback
+        };
+        let sender = if sender.is_empty() {
+            format!("…{}", &s.chat_id[s.chat_id.len().saturating_sub(8)..])
+        } else {
+            sender
+        };
+        ("", sender)
     };
     ChatSessionRow {
         bot_key: s.bot_key.clone().into(),
         chat_id: s.chat_id.clone().into(),
         bot: bot_name.into(),
         sender: sender.into(),
+        kind_tag: kind_tag.into(),
         time: s.last_ts.map(fmt_msg_time).unwrap_or_default().into(),
         count: format!("{} 条", s.count_total).into(),
         preview: crate::agent::truncate(
@@ -961,15 +975,24 @@ fn sync_history_msgs(
     let bot_name = bot
         .map(|b| b.name.clone())
         .unwrap_or_else(|| s.bot_key.clone());
-    let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
-    let session_name = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
-        s.last_sender.clone()
+    let session_name = if s.chat_type == "group" {
+        if s.chat_name.is_empty() {
+            "群聊".to_string()
+        } else {
+            s.chat_name.clone()
+        }
     } else {
-        fallback
+        let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
+        if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
+            s.last_sender.clone()
+        } else {
+            fallback
+        }
     };
     w.set_chat_title(
         format!(
-            "{} · {} · {} 条",
+            "{}{} · {} · {} 条",
+            if s.chat_type == "group" { "[群] " } else { "" },
             if session_name.is_empty() {
                 &s.chat_id
             } else {
