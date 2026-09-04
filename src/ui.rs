@@ -895,50 +895,116 @@ fn fmt_msg_time(ts: i64) -> String {
     format!("{mo:02}-{d:02} {h:02}:{mi:02}")
 }
 
-/// #74 历史页列表行（消息库行 → 生成类型 HistoryRow）。
-fn history_to_row(r: &crate::msgstore::MsgRow, cfg: &Config) -> HistoryRow {
-    let bot = cfg.bots.iter().find(|b| b.key() == r.bot_key);
-    let kind = bot.map(|b| kind_label(&b.kind)).unwrap_or_default();
-    let (bot_name, sender) = resolve_display(cfg, &r.bot_key, &r.sender_id);
-    // 审查跟进：assistant 行（bot 回复）发送者列显示 bot 名——回复来自 bot 而非
-    // 授权者，否则「授权者名 + 回复」标签语义错位。
-    // user 行优先落库时的 sender_name（未授权用户 API 反查的真实名字；8-20 用户
-    // 反馈：历史记录显示名字而不是 open_id），回落本地名单/id。
-    let sender = if r.direction == "assistant" {
-        bot_name.clone()
-    } else if !r.sender_name.is_empty() {
-        r.sender_name.clone()
+/// #74 历史页会话行（chat_stats 聚合 → ChatSessionRow，按最后消息时间倒序）。
+fn chat_stats_to_row(s: &crate::msgstore::ChatStats, cfg: &Config) -> ChatSessionRow {
+    let bot = cfg.bots.iter().find(|b| b.key() == s.bot_key);
+    let bot_name = bot
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| s.bot_key.clone());
+    // 会话名：最后一条 user 消息的发送者优先走落库名（未授权 API 反查的真实名字），
+    // 空则本地名单反查，再空则 id 前缀。assistant 结尾（bot 主动回复）也以该会话的
+    // user 身份命名——会话是「和某个授权者的对话」。
+    let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
+    let sender = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
+        s.last_sender.clone()
+    } else {
+        fallback
+    };
+    let sender = if sender.is_empty() {
+        format!("…{}", &s.chat_id[s.chat_id.len().saturating_sub(8)..])
     } else {
         sender
     };
-    HistoryRow {
-        id: r.id as i32,
+    ChatSessionRow {
+        bot_key: s.bot_key.clone().into(),
+        chat_id: s.chat_id.clone().into(),
         bot: bot_name.into(),
-        kind: kind.into(),
         sender: sender.into(),
-        time: fmt_msg_time(r.ts).into(),
-        direction: (if r.direction == "assistant" {
-            "回复"
-        } else {
-            "用户"
-        })
+        time: s.last_ts.map(fmt_msg_time).unwrap_or_default().into(),
+        count: format!("{} 条", s.count_total).into(),
+        preview: crate::agent::truncate(
+            &format!(
+                "{}：{}",
+                if s.last_sender.is_empty() {
+                    "…"
+                } else {
+                    &s.last_sender
+                },
+                s.last_text
+            ),
+            40,
+        )
         .into(),
-        preview: crate::agent::truncate(&r.text, 60).into(),
-        text: r.text.clone().into(),
     }
 }
 
-/// #74 历史列表 model 整体替换（2s 轮询刷新，ui.rs sync_model 同款手法）。
-fn sync_history_model(
-    model: &slint::VecModel<HistoryRow>,
+/// #74 历史会话列表 model 整体替换（2s 轮询刷新；last_ts 倒序——最近活跃在前）。
+fn sync_chat_sessions_model(
+    model: &slint::VecModel<ChatSessionRow>,
+    stats: &[crate::msgstore::ChatStats],
+    cfg: &Config,
+) {
+    let mut rows: Vec<ChatSessionRow> = stats.iter().map(|s| chat_stats_to_row(s, cfg)).collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.time.to_string()));
+    model.set_vec(rows);
+}
+
+/// #74 选中会话的消息流（ts 正序逐条 → ChatMsgRow；标题 = 会话名 · bot · N 条）。
+fn sync_history_msgs(
+    model: &slint::VecModel<ChatMsgRow>,
+    w: &SettingsWindow,
+    s: &crate::msgstore::ChatStats,
     rows: &[crate::msgstore::MsgRow],
     cfg: &Config,
 ) {
-    model.set_vec(
-        rows.iter()
-            .map(|r| history_to_row(r, cfg))
-            .collect::<Vec<_>>(),
+    let bot = cfg.bots.iter().find(|b| b.key() == s.bot_key);
+    let bot_name = bot
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| s.bot_key.clone());
+    let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
+    let session_name = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
+        s.last_sender.clone()
+    } else {
+        fallback
+    };
+    w.set_chat_title(
+        format!(
+            "{} · {} · {} 条",
+            if session_name.is_empty() {
+                &s.chat_id
+            } else {
+                &session_name
+            },
+            bot_name,
+            s.count_total
+        )
+        .into(),
     );
+    let out: Vec<ChatMsgRow> = rows
+        .iter()
+        .map(|r| {
+            let (who, _) = resolve_display(cfg, &r.bot_key, &r.sender_id);
+            let sender = if r.direction == "assistant" {
+                bot_name.clone()
+            } else if !r.sender_name.is_empty() {
+                r.sender_name.clone()
+            } else {
+                who
+            };
+            ChatMsgRow {
+                time: fmt_msg_time(r.ts).into(),
+                direction: (if r.direction == "assistant" {
+                    "回复"
+                } else {
+                    "用户"
+                })
+                .into(),
+                sender: sender.into(),
+                text: r.text.clone().into(),
+            }
+        })
+        .collect();
+    model.set_vec(out);
 }
 
 /// #74 未读项 → 弹窗行（最多 8 条：toast 高度有限，更早的看历史页）。
@@ -1619,9 +1685,14 @@ pub fn run_gui() -> Result<()> {
         session_gc: Rc::new(RefCell::new(false)),
         session_gc_days: Rc::new(RefCell::new(7)),
     });
-    // 历史记录列表 model：2s 轮询只读查询消息库 → set_vec 整体替换（ui.rs sync_history_model）
-    let history_model: Rc<slint::VecModel<HistoryRow>> = Rc::new(slint::VecModel::default());
-    settings.set_history_rows(slint::ModelRc::from(history_model.clone()));
+    // 历史记录页：会话列表 + 选中会话的消息流双 model（2s 轮询整体替换）+
+    // 选中会话快照（轮询期消息新增时标题/条数随 tick 更新，消息流重查）。
+    let sessions_model: Rc<slint::VecModel<ChatSessionRow>> = Rc::new(slint::VecModel::default());
+    settings.set_chat_sessions(slint::ModelRc::from(sessions_model.clone()));
+    let msgs_model: Rc<slint::VecModel<ChatMsgRow>> = Rc::new(slint::VecModel::default());
+    settings.set_history_msgs(slint::ModelRc::from(msgs_model.clone()));
+    let selected_chat: Rc<RefCell<Option<crate::msgstore::ChatStats>>> =
+        Rc::new(RefCell::new(None));
     settings.set_providers(slint::ModelRc::from(providers_model.clone()));
 
     /// 供 bot Tab 的供应商下拉：第一项 ""（=跟随全局默认），后接各供应商 name。
@@ -4066,6 +4137,30 @@ pub fn run_gui() -> Result<()> {
             }
         }
     });
+    // 历史页选中会话：记快照 + 立即载入该会话消息流（轮询只做刷新，首查在这里）
+    {
+        let sm = sessions_model.clone();
+        let sel = selected_chat.clone();
+        let msgs = msgs_model.clone();
+        let sw = settings.as_weak();
+        settings.on_history_selection_changed(move |idx| {
+            let row = sm.row_data(idx as usize);
+            let Some(row) = row else { return };
+            // 从会话行反查 ChatStats（标题要 count_total/last_ts；轮询 tick 会持续刷新）
+            let stats = crate::msgstore::MsgStore::production()
+                .chat_stats()
+                .into_iter()
+                .find(|s| s.bot_key == row.bot_key.as_str() && s.chat_id == row.chat_id.as_str());
+            let Some(s) = stats else { return };
+            let cfg = Config::load().unwrap_or_default();
+            let rows =
+                crate::msgstore::MsgStore::production().list_chat(&s.bot_key, &s.chat_id, 500);
+            if let Some(w) = sw.upgrade() {
+                sync_history_msgs(&msgs, &w, &s, &rows, &cfg);
+            }
+            *sel.borrow_mut() = Some(s);
+        });
+    }
     // 「清除全部历史」→ 二次确认弹窗（复用 UnsavedDialog 独立实例）
     {
         let dw = clear_dialog.as_weak();
@@ -4085,13 +4180,17 @@ pub fn run_gui() -> Result<()> {
     }
     {
         let dw = clear_dialog.as_weak();
-        let hm = history_model.clone();
+        let hm = sessions_model.clone();
+        let hs = selected_chat.clone();
+        let hm_msgs = msgs_model.clone();
         clear_dialog.on_save_close(move || {
             // 确认清除：GUI 只读连接不能写消息库 → 落命令文件，service 的 history-gc
             // 消费执行（清空 messages.sqlite + unread.json）。这里先乐观清空列表，
             // 服务端确认后下个 2s tick 自然对齐。
             write_command_file("msg-clear.command");
             hm.set_vec(Vec::new());
+            hm_msgs.set_vec(Vec::new());
+            *hs.borrow_mut() = None;
             if let Some(d) = dw.upgrade() {
                 let _ = d.hide();
             }
@@ -4610,8 +4709,10 @@ pub fn run_gui() -> Result<()> {
         let vb_confirm_weak = vb_confirm.as_weak();
         // 确认弹窗待执行操作（失败重试时保留；成功才 take 清空）
         let vb_action_t = vb_action.clone();
-        // #74 历史记录列表 model（历史页打开时每 tick 刷新）
-        let history_model = history_model.clone();
+        // #74 历史记录页 model + 选中快照（历史页打开时每 tick 刷新）
+        let history_sessions = sessions_model.clone();
+        let history_msgs = msgs_model.clone();
+        let history_selected = selected_chat.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -5084,14 +5185,18 @@ pub fn run_gui() -> Result<()> {
                         }
                     }
                 }
-                // #74 历史记录页刷新（仅该页打开时）：只读查询消息库 → 整体替换 model。
-                // 与弹窗同 tick：点弹窗条目跳历史页后列表即时可见；清除命令执行后
-                // 列表在下个 tick 自然清空。
+                // #74 历史记录页刷新（仅该页打开时）：会话列表整体替换；选中会话的
+                // 消息流随 tick 重查（新消息进入即上屏，标题条数同步更新）。
                 if let Some(w) = settings_weak.upgrade() {
                     if w.get_current_page() == 4 {
-                        let rows = crate::msgstore::MsgStore::production().list_recent(1000);
+                        let stats = crate::msgstore::MsgStore::production().chat_stats();
                         let cfg = Config::load().unwrap_or_default();
-                        sync_history_model(&history_model, &rows, &cfg);
+                        sync_chat_sessions_model(&history_sessions, &stats, &cfg);
+                        if let Some(s) = history_selected.borrow().as_ref() {
+                            let rows = crate::msgstore::MsgStore::production()
+                                .list_chat(&s.bot_key, &s.chat_id, 500);
+                            sync_history_msgs(&history_msgs, &w, s, &rows, &cfg);
+                        }
                     }
                 }
                 // #74 未读提醒（与托盘刷新同 tick）：读 unread.json →
