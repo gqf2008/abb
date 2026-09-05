@@ -292,8 +292,9 @@ impl MsgStore {
     /// 按 (bot_key, chat_id) 聚合的消息统计（#87 session list 数据源）。
     /// 消息量按 chat_id 粒度（msgstore 只记原始 chat_id，话题消息同属其群）；
     /// 库不存在/损坏返回空。
-    /// 待回填会话：chat_type 为空的 (bot_key, chat_id) 去重列表（旧数据迁移前的
-    /// 消息没有类型/群名列）。回填任务按此列表逐个反查后调 [`backfill_chat`]。
+    /// 待回填会话 (bot_key, chat_id) 去重列表：旧数据 type/name 全空，或新数据
+    /// type 已落但群名空（飞书群消息事件不带 chat_name 字段，落库恒空）——两种
+    /// 都要补。回填任务按此列表逐个 chat_brief 反查后调 [`backfill_chat`]。
     /// 只读连接；库不存在返回空。
     pub fn chats_missing_type(&self) -> Vec<(String, String)> {
         if !self.path.exists() {
@@ -306,9 +307,12 @@ impl MsgStore {
                 return Vec::new();
             }
         };
-        let mut stmt = match con
-            .prepare("SELECT DISTINCT bot_key, chat_id FROM messages WHERE chat_type = ''")
-        {
+        // 两种缺：旧数据 type/name 全空；新数据 type 已落但飞书事件不带群名
+        // （chat_name 恒空）→ group 行也要补名。
+        let mut stmt = match con.prepare(
+            "SELECT DISTINCT bot_key, chat_id FROM messages
+             WHERE chat_type = '' OR (chat_type = 'group' AND chat_name = '')",
+        ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -330,7 +334,7 @@ impl MsgStore {
             return 0;
         };
         con.execute(
-            "UPDATE messages SET chat_type = ?3, chat_name = ?4 WHERE bot_key = ?1 AND chat_id = ?2 AND chat_type = ''",
+            "UPDATE messages SET chat_type = ?3, chat_name = ?4 WHERE bot_key = ?1 AND chat_id = ?2",
             rusqlite::params![bot_key, chat_id, chat_type, chat_name],
         )
         .unwrap_or(0)
@@ -845,6 +849,29 @@ mod stats_tests {
         assert_eq!(c1.last_text, "回复你");
         let c2 = stats.iter().find(|s| s.chat_id == "c2").unwrap();
         assert_eq!(c2.last_sender, "李四");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backfill_fills_group_rows_with_empty_name() {
+        let dir = std::env::temp_dir().join(format!("msg-bf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MsgStore::at(dir.join("messages.sqlite"));
+        // 旧数据：type/name 全空；新数据：type=group 但名空（飞书事件无 chat_name）
+        store.insert("b1", "c1", "m1", "user", "u1", "张三", "旧", 1000, "", "");
+        store.insert(
+            "b1", "c2", "m2", "user", "u2", "李四", "新", 2000, "group", "",
+        );
+        let mut missing = store.chats_missing_type();
+        missing.sort();
+        assert_eq!(missing.len(), 2, "两种缺都要进清单: {missing:?}");
+        store.backfill_chat("b1", "c1", "p2p", "对方名");
+        store.backfill_chat("b1", "c2", "group", "后端开发群");
+        let stats = store.chat_stats();
+        let c2 = stats.iter().find(|s| s.chat_id == "c2").unwrap();
+        assert_eq!(c2.chat_type, "group");
+        assert_eq!(c2.chat_name, "后端开发群");
+        assert!(store.chats_missing_type().is_empty(), "回填后清单应清空");
         std::fs::remove_dir_all(&dir).ok();
     }
 
