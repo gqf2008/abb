@@ -902,10 +902,22 @@ fn chat_stats_to_row(s: &crate::msgstore::ChatStats, cfg: &Config) -> ChatSessio
         .map(|b| b.name.clone())
         .unwrap_or_else(|| s.bot_key.clone());
     // 会话名按类型：群聊 = 群名（事件自带，空则「群聊」兜底）；
-    // 私聊 = 最后一条 user 消息发送者（落库名优先，空则本地名单反查，再空 id 前缀）。
-    // assistant 结尾也按会话身份命名。旧数据 chat_type 空 = 未知，按私聊回退。
-    let is_group = s.chat_type == "group";
-    let (kind_tag, sender) = if is_group {
+    // 会话名：chat_name（回填的飞书会话名）优先——群聊即群名、单聊即对方名。
+    // 实测飞书 chat API 的 chat_type 值为 "private"（群私聊同值），不可作群标；
+    // 群标仅在显式 group 时打（保守：宁可漏标不误标）。chat_name 空（旧数据未
+    // 回填/反查失败）回落人名解析链。
+    let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
+    let person = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
+        s.last_sender.clone()
+    } else {
+        fallback
+    };
+    let person = if person.is_empty() {
+        format!("…{}", &s.chat_id[s.chat_id.len().saturating_sub(8)..])
+    } else {
+        person
+    };
+    let (kind_tag, sender) = if s.chat_type == "group" {
         (
             "群",
             if s.chat_name.is_empty() {
@@ -914,19 +926,12 @@ fn chat_stats_to_row(s: &crate::msgstore::ChatStats, cfg: &Config) -> ChatSessio
                 s.chat_name.clone()
             },
         )
+    } else if !s.chat_name.is_empty() {
+        // 回填后的会话名（群名或单聊对方名）——飞书 type 恒 private 不可判群，
+        // 无群标但名字正确（用户核心诉求：看得到群名）
+        ("", s.chat_name.clone())
     } else {
-        let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
-        let sender = if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
-            s.last_sender.clone()
-        } else {
-            fallback
-        };
-        let sender = if sender.is_empty() {
-            format!("…{}", &s.chat_id[s.chat_id.len().saturating_sub(8)..])
-        } else {
-            sender
-        };
-        ("", sender)
+        ("", person)
     };
     ChatSessionRow {
         bot_key: s.bot_key.clone().into(),
@@ -975,12 +980,8 @@ fn sync_history_msgs(
     let bot_name = bot
         .map(|b| b.name.clone())
         .unwrap_or_else(|| s.bot_key.clone());
-    let session_name = if s.chat_type == "group" {
-        if s.chat_name.is_empty() {
-            "群聊".to_string()
-        } else {
-            s.chat_name.clone()
-        }
+    let session_name = if !s.chat_name.is_empty() {
+        s.chat_name.clone()
     } else {
         let (fallback, _) = resolve_display(cfg, &s.bot_key, &s.last_sender_id);
         if !s.last_sender.is_empty() && s.last_sender_id != "assistant" {
