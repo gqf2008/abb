@@ -40,6 +40,25 @@ impl Bridge {
         let Some(handle) = self.buzz.as_ref() else {
             return Err(BuzzPrecheckFail::BuzzDisabled);
         };
+        // p2p（私聊）：免登记——频道由 dispatch 全闸通过后即时注册（upsert 幂等），
+        // 频道名 = 对方展示名。私聊无「群登记」概念，原 ChannelUnregistered 拒答
+        // 对私聊无意义（用户私聊 bot 用 buzz 是合理路径）。
+        if ev.chat_type == "p2p" || ev.chat_type == "dm" {
+            if !handle.is_agent_available() {
+                return Err(BuzzPrecheckFail::AgentDown);
+            }
+            if crate::config::Config::provider_for_bot_key(&self.bot.key()).is_none() {
+                return Err(BuzzPrecheckFail::NoProvider);
+            }
+            let cfg = crate::config::Config::load().unwrap_or_default();
+            let (peer, _) = crate::ui::resolve_display(&cfg, &self.bot.key(), &ev.sender_id);
+            let name = if peer.is_empty() {
+                format!("私聊·{}", trunc(&ev.sender_id, 10))
+            } else {
+                peer
+            };
+            return Ok(name);
+        }
         let group_uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
             &self.bot.key(),
             &ev.chat_id,
@@ -67,6 +86,31 @@ impl Bridge {
         name.ok_or(BuzzPrecheckFail::ChannelUnregistered)
     }
 
+    /// p2p 私聊的群根频道即时注册：dispatch 全闸通过后调用（upsert 幂等——首条
+    /// 消息注册，后续消息刷新 meta）。巡检对 p2p 豁免清理（chat_type=="p2p"），
+    /// 不会被登记表 diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
+    fn buzz_ensure_p2p_channel(&self, ev: &Ev, peer_name: &str) {
+        let Some(handle) = self.buzz.as_ref() else {
+            return;
+        };
+        let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+            &self.bot.key(),
+            &ev.chat_id,
+        ))
+        .expect("channel_uuid output must parse as Uuid");
+        handle.upsert_channel(
+            uuid,
+            crate::buzz::harness::ChannelMeta {
+                bot_key: self.bot.key(),
+                chat_id: ev.chat_id.clone(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: peer_name.to_string(),
+                anchor_mid: None,
+            },
+        );
+    }
+
     /// #206 话题隔离：话题频道登记——dispatch 全闸（①②③ + 受限会话闸④）通过
     /// 之后调用（审查 #214 P2-1：被拒 dispatch 不得登记频道）。幂等（upsert 覆盖
     /// 同频道）；每次 dispatch 都刷新锚点（= 本条用户消息 mid，话题回复
@@ -86,6 +130,7 @@ impl Bridge {
             crate::buzz::harness::ChannelMeta {
                 bot_key: self.bot.key(),
                 chat_id: ev.chat_id.clone(),
+                chat_type: "group".to_string(),
                 thread_id: Some(ev.thread_id.clone()),
                 name: group_name.to_string(),
                 anchor_mid: Some(ev.mid.clone()),
@@ -499,11 +544,17 @@ impl Bridge {
                 }
                 return;
             }
-            // 全闸（①②③ + 受限会话闸④）通过后才登记话题频道（审查 #214 P2-1：
+            // 全闸（①②③ + 受限会话闸④）通过后才登记频道（审查 #214 P2-1：
             // 被拒的 dispatch 不得污染频道注册表——预检「不过=无副作用」）。
+            // 话题消息：登记话题频道（群根已登记）；p2p 私聊：即时注册群根频道
+            //（免登记语义，频道名 = 对方名）。
             if !ev.thread_id.is_empty() {
                 if let Ok(group_name) = &precheck {
                     self.buzz_ensure_topic_channel(&ev, group_name);
+                }
+            } else if ev.chat_type != "group" {
+                if let Ok(peer_name) = &precheck {
+                    self.buzz_ensure_p2p_channel(&ev, peer_name);
                 }
             }
         }
