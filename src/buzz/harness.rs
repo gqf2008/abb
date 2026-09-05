@@ -58,6 +58,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 pub struct ChannelMeta {
     pub bot_key: String,
     pub chat_id: String,
+    /// 会话类型："group"（登记表频道）/ "p2p"（私聊，dispatch 即时注册）。
+    /// 巡检「消失清理」豁免 p2p——它不在登记表，误清会排空队列丢回复。
+    pub chat_type: String,
     pub thread_id: Option<String>,
     /// 群展示名（角色名）：进 prompt 上下文与 session 标题。
     pub name: String,
@@ -416,7 +419,20 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
                 next.insert(key, uuid);
             }
             // 消失的根频道：排空队列、失效会话、其后返回的批次直接丢弃。
+            // p2p 频道豁免——它由 dispatch 即时注册（不在登记表），巡检「不在
+            // next」是常态而非消失，误清会丢私聊回复。
             for (key, uuid) in current {
+                let is_p2p = handle
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .channels
+                    .get(&uuid)
+                    .map(|m| m.chat_type == "p2p")
+                    .unwrap_or(false);
+                if is_p2p {
+                    continue;
+                }
                 if next.contains_key(&key) {
                     continue;
                 }

@@ -859,7 +859,7 @@ fn sync_providers_model(
 /// #74 展示名解析：bot_key/sender_id → 人类可读名（config 反查，查不到用原始 id 兜底）。
 /// 发送者名字来自授权者名单（授权时已反查名字落盘，桥内无需再异步反查）。
 /// 返回 (bot 名, 发送者名)。
-fn resolve_display(cfg: &Config, bot_key: &str, sender_id: &str) -> (String, String) {
+pub(crate) fn resolve_display(cfg: &Config, bot_key: &str, sender_id: &str) -> (String, String) {
     let bot = cfg.bots.iter().find(|b| b.key() == bot_key);
     let bot_name = bot
         .map(|b| {

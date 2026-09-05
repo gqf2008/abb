@@ -238,6 +238,7 @@ pub async fn run() {
                     roots.push(crate::buzz::harness::ChannelMeta {
                         bot_key: vb.bot_key,
                         chat_id: vb.chat_id,
+                        chat_type: "group".to_string(),
                         thread_id: None,
                         name: vb.role_name,
                         anchor_mid: None,
