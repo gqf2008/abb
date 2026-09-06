@@ -181,16 +181,6 @@ impl Ev {
 }
 
 impl Bridge {
-    /// 回复投递收尾（后端无关的统一出口）：移除「处理中」表情 + 打 ✅ DONE。
-    /// CLI 路径（handle 尾部）与 buzz 路径（TurnOutput 消费）共用——表情是 ABB
-    /// 平台侧动作，收尾散在各自路径尾部曾漏掉 buzz 的 done（mini-relay 时代
-    /// 账本做过的收尾，进程内化重写时未对齐）。typing_rid：CLI 路径持有（要删），
-    /// buzz 路径无（回合异步跑，dispatch 未打「处理中」）传 None。
-    pub(crate) async fn finish_delivery(&self, mid: &str, typing_rid: Option<String>) {
-        self.msgr.del_typing(mid, typing_rid).await;
-        self.msgr.done(mid).await;
-    }
-
     /// 注册/摘除一个 cancel 标志（聊天任务与定时任务共用）：
     /// 定时任务（run_job）也注册到目标 chat_id，用户在该会话发「停止」即可打断后台任务。
     /// 返回的 flag 传给 agent::run 的 cancel 参数；任务结束（含错误/取消路径）必须 remove。
@@ -1361,6 +1351,7 @@ mod tests {
     /// 等待异步回合回复到达（MockMessenger.sent() 出现目标片段），超时 10s panic。
     /// 必须用 tokio sleep 让出：#[tokio::test] 默认单线程 runtime，
     /// std::thread::sleep 会饿死 harness 主循环任务（回复永远到不了）。
+    #[allow(dead_code)] // 试点外的批量测试改造（下一步）将启用
     async fn wait_reply(msgr: &MockMessenger, frag: &str) -> Vec<String> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -1411,13 +1402,12 @@ mod tests {
     /// 带可选 ACP harness 注入的完整构造：传 harness 后 handle 的 dispatch 分支
     /// 可达（ACP 单轨测试用）。mock agent 脚本见 tests/mock_acp_agent.py——
     /// prompt 记录到 MOCK_RECORD_FILE 供断言，回复 echo 给 harness 回流。
+    type AcpHandles = std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>;
+
     fn build_test_bridge_full(
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
-        acp: Option<(
-            Arc<crate::buzz::harness::BuzzHandle>,
-            std::collections::HashMap<String, std::sync::Arc<crate::buzz::harness::BuzzHandle>>,
-        )>,
+        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, AcpHandles)>,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
         // 供应商硬闸（#219）需要生效供应商：测试统一注入 test-prov（mock agent

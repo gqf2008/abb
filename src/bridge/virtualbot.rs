@@ -520,7 +520,7 @@ impl Bridge {
         //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）。
         // ACP 单轨：该后端 harness 已装配（生产常驻）→ dispatch 异步回合；
         // 未装配（测试挡板/job 内部路径）→ 回落 spawn 同步路径。
-        if let Some(handle) = self.acp_handles.get(backend.name()).cloned() {
+        if self.acp_handles.contains_key(backend.name()) {
             // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
             eprintln!("DIAG reaching precheck");
             let precheck = self.buzz_dispatch_precheck(&ev);
