@@ -242,12 +242,6 @@ impl Bridge {
             }
         }
 
-        eprintln!(
-            "DIAG handle entered: backend={} chat_type={} sender={:?}",
-            Backend::parse(self.bot.effective_backend(&self.default_backend)).name(),
-            ev.chat_type,
-            ev.sender_id
-        );
         // 剥群聊 @_user_N 提及标签
         let text = strip_mentions(&ev.text).trim().to_string();
         // #12：纯附件消息（text 空但 attachments 非空）也进 agent，不丢
@@ -522,7 +516,6 @@ impl Bridge {
         // 未装配（测试挡板/job 内部路径）→ 回落 spawn 同步路径。
         if self.acp_handles.contains_key(backend.name()) {
             // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
-            eprintln!("DIAG reaching precheck");
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
                 Err(BuzzPrecheckFail::BuzzDisabled) => {
@@ -861,11 +854,6 @@ impl Bridge {
         // ACP 单轨：有 harness 的后端 push 进对应实例（异步回合）后返回；
         // 无 harness（测试挡板/job 内部）落到下方 spawn 同步路径。
         if let Some(handle) = self.acp_handles.get(backend.name()).cloned() {
-            eprintln!(
-                "DIAG dispatch: backend={} chat_type={}",
-                backend.name(),
-                ev.chat_type
-            );
             crate::log!(
                 "[bridge] buzz 路径：push 进 harness chat={} len={}",
                 trunc(&ev.chat_id, 12),
@@ -882,7 +870,6 @@ impl Bridge {
             // push 即处理完毕：摘 pending（重启不重放；push-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
-            eprintln!("DIAG push_message pending removed");
             if !handle.push_message(
                 channel_id,
                 crate::buzz::queue::InboundMsg {
