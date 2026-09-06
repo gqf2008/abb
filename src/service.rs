@@ -1180,7 +1180,9 @@ async fn run_job(
     // 定时任务可被「停止词」打断（#卡死修复）：注册到目标会话的 cancel 标志，
     // 用户在该会话发 停/停止/cancel 即可终止正在跑的后台任务；
     // 与聊天任务共用同一 key（chat_id）——同一 chat 同一时刻只有一个在跑任务。
-    let cancel_flag = bridge.register_cancel_flag(&job.chat_id);
+    // job 走 ACP 同步回合：叫停走 harness cancel 信号（/cancel 命令路径），
+    // CLI 的 cancel_flag 机制随 spawn 退役——不再注册。
+    let _cancel_flag = bridge.register_cancel_flag(&job.chat_id);
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     let reply = {
