@@ -50,7 +50,7 @@ impl Bridge {
             if !handle.is_agent_available() {
                 return Err(BuzzPrecheckFail::AgentDown);
             }
-            if crate::config::Config::provider_for_bot_key(&self.bot.key()).is_none() {
+            if crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key()).is_none() {
                 return Err(BuzzPrecheckFail::NoProvider);
             }
             let cfg = crate::config::Config::load().unwrap_or_default();
@@ -75,7 +75,7 @@ impl Bridge {
         }
         // ④ 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
         // None 时 agent 无凭证可用，拒答并引导配置（每消息热读，与 agent.rs 同款成本）。
-        if crate::config::Config::provider_for_bot_key(&self.bot.key()).is_none() {
+        if crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key()).is_none() {
             return Err(BuzzPrecheckFail::NoProvider);
         }
         // 群根频道名 = 角色名：取虚拟 Bot 登记快照（mtime 懒刷新，与注入判定同源）。
@@ -247,6 +247,9 @@ impl Bridge {
             }
         }
 
+        eprintln!("DIAG handle entered: backend={} chat_type={} sender={:?}",
+            Backend::parse(self.bot.effective_backend(&self.default_backend)).name(),
+            ev.chat_type, ev.sender_id);
         // 剥群聊 @_user_N 提及标签
         let text = strip_mentions(&ev.text).trim().to_string();
         // #12：纯附件消息（text 空但 attachments 非空）也进 agent，不丢
@@ -520,6 +523,7 @@ impl Bridge {
         {
             // 单轨（ACP 化）：全后端统一走 dispatch/harness——spawn 同步路径废弃。
             // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
+            eprintln!("DIAG reaching precheck");
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
                 Err(BuzzPrecheckFail::BuzzDisabled) => {
@@ -857,6 +861,7 @@ impl Bridge {
         // - typing/DONE 表情不出现：无同步轮次可挂（回复投递路径也不发表情）。
         {
             // 全后端统一 dispatch：按 bot 生效后端路由到对应 ACP harness 实例
+            eprintln!("DIAG dispatch: backend={} chat_type={}", backend.name(), ev.chat_type);
             let handle = self
                 .acp_handles
                 .get(backend.name())
@@ -878,6 +883,7 @@ impl Bridge {
             // push 即处理完毕：摘 pending（重启不重放；push-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
+            eprintln!("DIAG push_message pending removed");
             if !handle.push_message(
                 channel_id,
                 crate::buzz::queue::InboundMsg {

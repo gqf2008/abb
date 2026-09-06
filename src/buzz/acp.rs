@@ -2344,6 +2344,28 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "探针：真 spawn tests/mock_acp_agent.py 验证 spawn/init/prompt 全链（手动跑）"]
+    async fn probe_real_mock_agent_roundtrip() {
+        let script = format!(
+            "{}/tests/mock_acp_agent.py",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let rec = "/tmp/mock-probe.jsonl";
+        let mut client = AcpClient::spawn(
+            "/opt/homebrew/bin/python3",
+            &[script],
+            &[("MOCK_RECORD_FILE".to_string(), rec.to_string())],
+        )
+        .await
+        .expect("spawn mock agent");
+        let init = client.initialize().await.expect("initialize");
+        assert!(init["protocolVersion"].is_u64());
+        // initialize 通过 = spawn + 行分隔 JSON-RPC 读写全链路验证
+        let _ = init;
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script(vec![SleepMs(10_000)]).await;
         let max_dur = std::time::Duration::from_secs(30);

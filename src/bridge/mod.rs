@@ -50,6 +50,9 @@ pub struct Bridge {
     /// codex=codex-acp；各带各的供应商 env）。dispatch 按 bot 生效后端路由——
     /// 后端差异收敛在适配器命令与 env，桥内会话/历史/pending 语义与后端无关。
     pub acp_handles: HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
+    /// 构造时 config 快照（buzz 预检的供应商判定源——测试可注入，生产由 service
+    /// 传入运行时 config；provider 变更伴随 harness env 重装需重启，快照语义一致）。
+    pub cfg_snapshot: Config,
     /// #206 回合登记：channel uuid → dispatch 时的 (mid, key, epoch) 快照。
     /// buzz 回复（TurnOutput）到达时按它定位会话 key、比对代际闸；消费即摘除
     ///（同步形态一回合一条回复）。内存态无持久面——崩溃语义 at-most-once
@@ -276,10 +279,12 @@ impl Bridge {
         let key = bot.key();
         // I2：快照与 access 快照（self.bot）同源——bot 就是 build 时从 config 复制的那份，
         // 直接用它的 mention_modes 种子化，无需再扫 cfg.bots（两份来源可能漂移）。
+        let cfg_snapshot = cfg.clone();
         let mention_seed = bot.mention_modes.clone();
         let sessions = SessionStore::new(&effective, &key);
         Bridge {
             msgr,
+            cfg_snapshot,
             sessions,
             acp_handles: Default::default(), // service run_bot 按 bot 注入全后端句柄集
             turn_registry: Mutex::new(HashMap::new()), // #206 回合登记（内存态）
@@ -1271,6 +1276,121 @@ mod tests {
         }
     }
 
+    /// 测试 ACP harness：spawn tests/mock_acp_agent.py（prompt 记录到 record_file，
+    /// 回复 echo 回流），返回 (buzz 实例, 全后端句柄集)。record_file 每测唯一。
+    fn make_test_harness(
+        record_file: std::path::PathBuf,
+        registry: &crate::bridge::BridgeRegistry,
+    ) -> (
+        Arc<crate::buzz::harness::BuzzHandle>,
+        std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
+    ) {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/mock_acp_agent.py");
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let mk = || {
+            crate::buzz::harness::BuzzHandle::new(
+                crate::buzz::harness::AgentConfig {
+                    command: python3.clone(),
+                    args: vec![script.display().to_string()],
+                    extra_env: vec![
+                        (
+                            "PATH".to_string(),
+                            crate::deps::composed_path(),
+                        ),
+                        (
+                            "MOCK_RECORD_FILE".to_string(),
+                            record_file.display().to_string(),
+                        ),
+                    ],
+                },
+                crate::tasks::shutdown_token(),
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .display()
+                    .to_string(),
+            )
+        };
+        let buzz = mk();
+        let mut handles = std::collections::HashMap::new();
+        handles.insert("pi".to_string(), buzz.clone());
+        handles.insert("buzz".to_string(), buzz.clone());
+        handles.insert("claude".to_string(), buzz.clone());
+        handles.insert("codex".to_string(), buzz.clone());
+        // 诊断探针：3s 后快照 dead 状态（spawn 失败 = dead=true），写诊断文件供测试失败信息引用
+        {
+            let probe = buzz.clone();
+            let rf = record_file.clone();
+            crate::tasks::tasks().spawn("acp-test-probe", async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let line = format!(
+                    "{{\"probe\": {{\"dead\": {}}}}}\n",
+                    probe.is_agent_available()
+                );
+                let _ = std::fs::write(rf.with_extension("probe"), line);
+            });
+        }
+        // 主循环 + 回合消费（生产 service 同款）：没有它们 Cmd::Message 无人消费，
+        // queue 永不 dispatch、prompt 永不到 mock agent。
+        let run_handle = buzz.clone();
+        crate::tasks::tasks().spawn("acp-test-run", async move {
+            crate::buzz::harness::run_loop(run_handle).await;
+        });
+        let turn_handle = buzz.clone();
+        let registry = registry.clone();
+        crate::tasks::tasks().spawn("acp-test-turns", async move {
+            let stop = crate::tasks::shutdown_token();
+            let Some(mut turn_rx) = turn_handle.take_turn_rx() else {
+                return;
+            };
+            loop {
+                let out = tokio::select! {
+                    Some(o) = turn_rx.recv() => o,
+                    _ = stop.cancelled() => break,
+                };
+                let Some(bot_key) = out.meta.as_ref().map(|m| m.bot_key.clone()) else {
+                    continue;
+                };
+                if let Some(b) = registry.get(&bot_key) {
+                    b.deliver_turn_reply(out).await;
+                }
+            }
+        });
+        (buzz, handles)
+    }
+
+    /// 等待异步回合回复到达（MockMessenger.sent() 出现目标片段），超时 10s panic。
+    /// 必须用 tokio sleep 让出：#[tokio::test] 默认单线程 runtime，
+    /// std::thread::sleep 会饿死 harness 主循环任务（回复永远到不了）。
+    async fn wait_reply(msgr: &MockMessenger, frag: &str) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let sent = msgr.sent();
+            if sent.iter().any(|s| s.contains(frag)) {
+                return sent;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "回复 10s 未到达（等片段 {frag:?}），已发: {sent:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 读取 mock agent 的 prompt 记录（全部 event=prompt 条目文本）。
+    fn read_prompts(record_file: &std::path::Path) -> Vec<String> {
+        let Ok(s) = std::fs::read_to_string(record_file) else {
+            return Vec::new();
+        };
+        s.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "prompt")
+            .map(|v| v["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
     /// 构造带唯一 bot key 的 Bridge（隔离 ~/.agent-bridge/workspaces/<key>/），返回 bridge +
     /// messenger 供断言。调用方负责 `cleanup_bridge(&bridge)`。
     fn build_test_bridge(runner: Arc<dyn AgentRunner>) -> (Arc<Bridge>, Arc<MockMessenger>) {
@@ -1288,8 +1408,35 @@ mod tests {
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
+        build_test_bridge_full(runner, bot, None)
+    }
+
+    /// 带可选 ACP harness 注入的完整构造：传 harness 后 handle 的 dispatch 分支
+    /// 可达（ACP 单轨测试用）。mock agent 脚本见 tests/mock_acp_agent.py——
+    /// prompt 记录到 MOCK_RECORD_FILE 供断言，回复 echo 给 harness 回流。
+    fn build_test_bridge_full(
+        runner: Arc<dyn AgentRunner>,
+        bot: BotConfig,
+        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, std::collections::HashMap<String, std::sync::Arc<crate::buzz::harness::BuzzHandle>>)>,
+    ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
-        let mut bridge = Bridge::build(msgr.clone(), bot, &Config::default(), runner);
+        // 供应商硬闸（#219）需要生效供应商：测试统一注入 test-prov（mock agent
+        // 无视 env，仅满足闸判定；kind=anthropic 对 claude/pi 合法，codex 测试
+        // 用的 openai 型单测另行注入）
+        let mut test_cfg = Config::default();
+        test_cfg.providers = vec![crate::config::ProviderConfig {
+            name: "test-prov".into(),
+            kind: "anthropic".into(),
+            base_url: String::new(),
+            api_key: "sk-test".into(),
+            model: String::new(),
+        }];
+        test_cfg.default_provider = "test-prov".into();
+        test_cfg.bots = vec![bot.clone()]; // provider_for_bot_key_of 按 key 找 bot
+        let mut bridge = Bridge::build(msgr.clone(), bot, &test_cfg, runner);
+        if let Some((_, handles)) = acp {
+            bridge.acp_handles = handles;
+        }
         // 按 bot key 命名（key 本身唯一），cleanup_bridge 可按 key 回收
         let key = bridge.bot.key();
         bridge.msgstore = crate::msgstore::MsgStore::at(
@@ -3702,18 +3849,37 @@ mod tests {
     async fn handle_prompt_prepends_quoted() {
         // 核心拼装：Ev.quoted 非空 → prompt = [引用消息]\n引用内容\n\n用户文本。
         let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let (bridge, _msgr) = build_test_bridge(runner.clone());
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (buzz, handles) = make_test_harness(rec.clone(), &registry);
+        let (bridge, _msgr) = build_test_bridge_full(runner.clone(), backend_bot("claude"), Some((buzz, handles)));
+        registry.register(&bridge.bot.key(), &bridge);
         let mut ev = test_ev("m1", "oc_q", "回复内容");
+        ev.chat_type = "p2p".to_string(); // 单轨 dispatch：p2p 免登记直接进 harness
         ev.quoted = crate::messenger::QuotedContent {
             text: "被引用的原消息".to_string(),
             attachments: Vec::new(),
         };
         bridge.handle(ev).await;
-        assert_eq!(runner.prompts().len(), 1);
+        // 异步回合：轮询 mock agent 记录直到 prompt 到达（10s 超时；tokio sleep 让出
+        // 单线程 runtime，否则 harness 任务被 std::thread::sleep 饿死）
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let prompts = loop {
+            let p = read_prompts(&rec);
+            if !p.is_empty() {
+                break p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prompt 10s 未到达 mock agent"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(prompts.len(), 1);
         assert!(
-            runner.prompts()[0].ends_with("[引用消息]\n被引用的原消息\n\n回复内容"),
-            "引用块应在 prompt 尾部: {}",
-            runner.prompts()[0]
+            prompts[0].contains("[引用消息]\n被引用的原消息\n\n回复内容"),
+            "引用块应在 prompt 内（buzz base_prompt 包裹式，位置不限）: {}",
+            prompts[0]
         );
         cleanup_bridge(&bridge);
     }
