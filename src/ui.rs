@@ -762,6 +762,31 @@ fn configured_cached() -> bool {
     val
 }
 
+/// bot 集合的「结构/凭证签名」：增删/启停/kind/凭证变化才需要重启 service
+/// （bot 事件循环在 service 启动时构建）；后端/供应商/模型等热读字段不在签名内。
+fn bots_struct_sig(c: &Config) -> String {
+    let mut parts: Vec<String> = c
+        .bots
+        .iter()
+        .map(|b| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                b.key(),
+                b.enabled,
+                b.kind,
+                b.app_id,
+                b.app_secret,
+                b.wx_token,
+                b.wx_user_id,
+                b.ding_user_id,
+                b.ding_robot_code
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join(";")
+}
+
 /// 把工作副本 Vec<BotConfig> 同步进 Slint 的 VecModel<BotRow>。
 fn sync_model(model: &slint::VecModel<BotRow>, bots: &[BotConfig]) {
     model.set_vec(bots.iter().map(bot_to_row).collect::<Vec<_>>());
@@ -1825,11 +1850,18 @@ pub fn run_gui() -> Result<()> {
                     UiCmd::OpenLogs => platform::open_path(&crate::bridge_dir().join("logs")),
                     UiCmd::OpenFolder => platform::open_path(&crate::bridge_dir()),
                     UiCmd::Save(cfg) => {
+                        // 热切换：保存前快照盘上旧配置，save 后比对「结构/凭证签名」——
+                        // 只有 bot 增删/启停/kind/凭证变化才重启；backend/provider/model
+                        // 等运行期字段 service 每消息热读，保存即生效（免重启几秒断连）。
+                        let prev = Config::load().unwrap_or_default();
                         let res = cfg.save();
                         if res.is_ok() {
                             Config::remove_draft(); // 正式配置已落盘，草稿作废
                         }
-                        if res.is_ok() && install::status().running {
+                        if res.is_ok()
+                            && install::status().running
+                            && bots_struct_sig(&prev) != bots_struct_sig(&cfg)
+                        {
                             install::svc_restart();
                         }
                         // 接入飞书 bot → 后台自动装 lark-cli + lark 技能（幂等/best-effort）。

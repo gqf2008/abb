@@ -1577,6 +1577,13 @@ impl Config {
 
     /// 按 bot_key 读其生效供应商（load + find）。agent.rs 每条消息调用；config.json 很小，
     /// 每次 load 与 save_primary_chat 等现有站点同理，可接受。
+    /// 同 [`Config::provider_for_bot_key`]，但作用于给定 config（不落盘重读）——
+    /// buzz 预检用 Bridge 的 cfg 快照判定（测试可注入）。
+    pub fn provider_for_bot_key_of(cfg: &Config, bot_key: &str) -> Option<ProviderConfig> {
+        let bot = cfg.bots.iter().find(|b| b.key() == bot_key)?;
+        cfg.resolve_provider(bot).cloned()
+    }
+
     pub fn provider_for_bot_key(bot_key: &str) -> Option<ProviderConfig> {
         Config::load().ok().and_then(|c| {
             c.bots

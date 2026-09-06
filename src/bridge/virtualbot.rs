@@ -37,7 +37,9 @@ impl Bridge {
     /// 返回 Ok(群根频道名)：群根频道名 = 角色名（虚拟 Bot 登记表），闸后登记
     /// 话题频道时作话题频道名来源——不另查 harness 频道表，防两份来源漂移。
     fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
-        let Some(handle) = self.buzz.as_ref() else {
+        let backend =
+            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
+        let Some(handle) = self.acp_handles.get(backend.name()) else {
             return Err(BuzzPrecheckFail::BuzzDisabled);
         };
         // p2p（私聊）：免登记——频道由 dispatch 全闸通过后即时注册（upsert 幂等），
@@ -47,7 +49,9 @@ impl Bridge {
             if !handle.is_agent_available() {
                 return Err(BuzzPrecheckFail::AgentDown);
             }
-            if crate::config::Config::provider_for_bot_key(&self.bot.key()).is_none() {
+            if crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
+                .is_none()
+            {
                 return Err(BuzzPrecheckFail::NoProvider);
             }
             let cfg = crate::config::Config::load().unwrap_or_default();
@@ -72,7 +76,9 @@ impl Bridge {
         }
         // ④ 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
         // None 时 agent 无凭证可用，拒答并引导配置（每消息热读，与 agent.rs 同款成本）。
-        if crate::config::Config::provider_for_bot_key(&self.bot.key()).is_none() {
+        if crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
+            .is_none()
+        {
             return Err(BuzzPrecheckFail::NoProvider);
         }
         // 群根频道名 = 角色名：取虚拟 Bot 登记快照（mtime 懒刷新，与注入判定同源）。
@@ -90,7 +96,9 @@ impl Bridge {
     /// 消息注册，后续消息刷新 meta）。巡检对 p2p 豁免清理（chat_type=="p2p"），
     /// 不会被登记表 diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
     fn buzz_ensure_p2p_channel(&self, ev: &Ev, peer_name: &str) {
-        let Some(handle) = self.buzz.as_ref() else {
+        let backend =
+            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
+        let Some(handle) = self.acp_handles.get(backend.name()) else {
             return;
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
@@ -116,7 +124,9 @@ impl Bridge {
     /// 同频道）；每次 dispatch 都刷新锚点（= 本条用户消息 mid，话题回复
     /// send_thread_reply 的落点）。
     fn buzz_ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
-        let Some(handle) = self.buzz.as_ref() else {
+        let backend =
+            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
+        let Some(handle) = self.acp_handles.get(backend.name()) else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::topic_channel_uuid(
@@ -232,6 +242,12 @@ impl Bridge {
             }
         }
 
+        eprintln!(
+            "DIAG handle entered: backend={} chat_type={} sender={:?}",
+            Backend::parse(self.bot.effective_backend(&self.default_backend)).name(),
+            ev.chat_type,
+            ev.sender_id
+        );
         // 剥群聊 @_user_N 提及标签
         let text = strip_mentions(&ev.text).trim().to_string();
         // #12：纯附件消息（text 空但 attachments 非空）也进 agent，不丢
@@ -502,10 +518,11 @@ impl Bridge {
         //    buzz_ensure_topic_channel 登记）；
         // ③ agent 进程可用（启动失败/崩溃退避中 = 不可用——此时 push 只是排队
         //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）。
-        if backend.is_buzz() {
-            // #206 话题隔离：话题消息走话题感知预检（话题频道缺失不再拒绝——
-            // 登记在全闸通过后做，见下方 buzz_ensure_topic_channel；agent 可用性
-            // 判据与群根共用，见 buzz_dispatch_precheck）。
+        // ACP 单轨：该后端 harness 已装配（生产常驻）→ dispatch 异步回合；
+        // 未装配（测试挡板/job 内部路径）→ 回落 spawn 同步路径。
+        if self.acp_handles.contains_key(backend.name()) {
+            // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
+            eprintln!("DIAG reaching precheck");
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
                 Err(BuzzPrecheckFail::BuzzDisabled) => {
@@ -841,8 +858,14 @@ impl Bridge {
         //   按普通消息透传：队列语义下它并入在跑轮次后、随下一轮 steered prompt
         //   一起交 agent（pi-acp 无原生 steer，走 cancel+merge 重跑一轮重提示）。
         // - typing/DONE 表情不出现：无同步轮次可挂（回复投递路径也不发表情）。
-        if backend.is_buzz() {
-            let handle = self.buzz.clone().expect("buzz 预检通过则 handle 必在");
+        // ACP 单轨：有 harness 的后端 push 进对应实例（异步回合）后返回；
+        // 无 harness（测试挡板/job 内部）落到下方 spawn 同步路径。
+        if let Some(handle) = self.acp_handles.get(backend.name()).cloned() {
+            eprintln!(
+                "DIAG dispatch: backend={} chat_type={}",
+                backend.name(),
+                ev.chat_type
+            );
             crate::log!(
                 "[bridge] buzz 路径：push 进 harness chat={} len={}",
                 trunc(&ev.chat_id, 12),
@@ -859,6 +882,7 @@ impl Bridge {
             // push 即处理完毕：摘 pending（重启不重放；push-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
+            eprintln!("DIAG push_message pending removed");
             if !handle.push_message(
                 channel_id,
                 crate::buzz::queue::InboundMsg {
@@ -1237,9 +1261,10 @@ impl Bridge {
     /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停。!shutdown/!rotate
     /// 等 harness 无此面（cancel 是唯一暴露给聊天的控制信号）。
     async fn buzz_cancel_reply(&self, ev: &Ev) -> String {
-        let Some(handle) = self.buzz.as_ref() else {
-            return "⚠️ buzz 叫停未送达：buzz 后端未启用（服务未装配 agent，检查默认后端/重启）。"
-                .to_string();
+        let backend =
+            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
+        let Some(handle) = self.acp_handles.get(backend.name()) else {
+            return "⚠️ 叫停未送达：当前后端 harness 未装配（检查后端配置/重启）。".to_string();
         };
         let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
             crate::buzz::keys::channel_uuid(&self.bot.key(), &ev.chat_id)
