@@ -193,6 +193,7 @@ impl Bridge {
         flag
     }
 
+    #[allow(dead_code)] // spawn 退役后 job 不再消费；测试挡板仍引用
     pub(crate) fn unregister_cancel_flag(&self, key: &str) {
         self.cancel_flags.lock().unwrap().remove(key);
     }

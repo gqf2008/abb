@@ -1180,27 +1180,53 @@ async fn run_job(
     // 定时任务可被「停止词」打断（#卡死修复）：注册到目标会话的 cancel 标志，
     // 用户在该会话发 停/停止/cancel 即可终止正在跑的后台任务；
     // 与聊天任务共用同一 key（chat_id）——同一 chat 同一时刻只有一个在跑任务。
-    let cancel_flag = bridge.register_cancel_flag(&job.chat_id);
-    let reply = match crate::agent::run(
-        backend,
-        &prompt,
-        &uuid::Uuid::new_v4().to_string(), // 每次全新 session，不带聊天上下文
-        false,
-        &job.chat_id,
-        &job.chat_id, // session_key：sessions=None 时仅回存分支用不到，占位保持一致
-        &bot_key,
-        job.role,                  // 按创建者角色执行：授权者建的任务走受限分支
-        None, // claude/pi 无需回存 thread_id（只有 codex 要回存真实 thread_id）
-        None, // 定时任务不推中间进度（统一只发最终结果）
-        Some(cancel_flag.clone()), // 定时任务可被用户停止词打断
-    )
-    .await
-    {
-        Ok(crate::agent::RunOutcome::Reply { reply, .. }) => reply,
-        Ok(crate::agent::RunOutcome::Cancelled) => "⏰ 任务被中断".to_string(),
-        Err(e) => format!("⏰ 定时任务执行失败：{e}"),
+    // job 走 ACP 同步回合：叫停走 harness cancel 信号（/cancel 命令路径），
+    // CLI 的 cancel_flag 机制随 spawn 退役——不再注册。
+    let _cancel_flag = bridge.register_cancel_flag(&job.chat_id);
+    // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
+    // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
+    let reply = {
+        let backend = crate::agent::Backend::parse(&bridge.default_backend);
+        let handle = bridge.acp_handles.get(backend.name()).cloned();
+        let channel_id =
+            uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(&bot_key, &job.chat_id))
+                .expect("channel_uuid output must parse as Uuid");
+        match handle {
+            Some(h) => {
+                // 频道预注册：p2p/未知会话即时注册（job 消息无 Ev 上下文，用任务目标注册）
+                h.upsert_channel(
+                    channel_id,
+                    crate::buzz::harness::ChannelMeta {
+                        bot_key: bot_key.clone(),
+                        chat_id: job.chat_id.clone(),
+                        chat_type: "p2p".to_string(),
+                        thread_id: None,
+                        name: format!("定时任务 {}", &job.id[..job.id.len().min(8)]),
+                        anchor_mid: None,
+                    },
+                );
+                match h
+                    .wait_turn_text(
+                        channel_id,
+                        crate::buzz::queue::InboundMsg {
+                            id_hex: uuid::Uuid::new_v4().to_string(),
+                            author_role: job.role.as_str().to_string(),
+                            text: prompt.clone(),
+                            ts_secs: crate::chrono_lite::unix_secs() as i64,
+                            prompt_tag: "job_message".to_string(),
+                        },
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await
+                {
+                    Some(text) => text,
+                    None => "⏰ 定时任务执行超时（agent 无回复）".to_string(),
+                }
+            }
+            None => "⏰ 定时任务执行失败：后端未装配".to_string(),
+        }
     };
-    bridge.unregister_cancel_flag(&job.chat_id);
+
     let header = match job.kind {
         crate::schedule::JobKind::Once => "⏰ 定时提醒",
         crate::schedule::JobKind::Cron => "⏰ 定时任务",

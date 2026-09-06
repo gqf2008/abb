@@ -150,6 +150,11 @@ pub struct BuzzHandle {
     life_tx: mpsc::UnboundedSender<SpawnOutcome>,
     life_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<SpawnOutcome>>>,
     turn_tx: mpsc::UnboundedSender<TurnOutput>,
+    /// 同步回合等待表（job 路径）：channel_id → 文本回传。turn consumer 消费
+    /// TurnOutput 时若频道有等待者，文本旁路给它（不再走 chat 投递）。
+    sync_waiters: std::sync::Mutex<
+        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<String>>,
+    >,
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
 
@@ -190,7 +195,34 @@ impl BuzzHandle {
             life_rx: std::sync::Mutex::new(Some(life_rx)),
             turn_tx,
             turn_rx: std::sync::Mutex::new(Some(turn_rx)),
+            sync_waiters: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// 同步回合等待（job 路径）：注册等待者后 push 消息，等回合文本到达
+    ///（timeout 上限）。超时/句柄关闭返回 None——调用方降级报错文案。
+    pub async fn wait_turn_text(
+        &self,
+        channel_id: Uuid,
+        msg: InboundMsg,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.sync_waiters.lock().unwrap().insert(channel_id, tx);
+        if !self.push_message(channel_id, msg) {
+            self.sync_waiters.lock().unwrap().remove(&channel_id);
+            return None;
+        }
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(text)) => {
+                self.sync_waiters.lock().unwrap().remove(&channel_id);
+                Some(text)
+            }
+            _ => {
+                self.sync_waiters.lock().unwrap().remove(&channel_id);
+                None
+            }
+        }
     }
 
     /// agent 进程是否可用（桥侧预检读）。false = 启动/重拉失败退避中，新消息
@@ -861,11 +893,16 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
             if let Some(text) = result.final_text.take() {
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
-                let _ = handle.turn_tx.send(TurnOutput {
-                    channel_id: *channel_id,
-                    meta,
-                    text,
-                });
+                // 同步等待者（job 路径）旁路：文本直接回传，不产生 chat 投递
+                if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(channel_id) {
+                    let _ = tx.send(text);
+                } else {
+                    let _ = handle.turn_tx.send(TurnOutput {
+                        channel_id: *channel_id,
+                        meta,
+                        text,
+                    });
+                }
             }
             return_agent(l, result.agent, outcome_label, "agent_returned");
         }
