@@ -64,15 +64,16 @@ pub async fn run() {
         String,
         std::sync::Arc<crate::buzz::harness::BuzzHandle>,
     > = {
-        // ACP 适配器命令（npm 全局，随包 buzz-agent 优先给 pi/buzz）。
-        // env 注入：按该后端的 build_injection 矩阵映射（anthropic→ANTHROPIC_*、
-        // openai→AGENT_BRIDGE_MODEL_KEY 等），agent 进程启动即带凭据。
+        // ACP 适配器命令：claude→claude-agent-acp、codex→codex-acp、pi→pi-acp
+        //（pi 本尊，npm 全局）——buzz 才用随包 buzz-agent（pi 的 fork，指给 pi 后端
+        // 会让 pi 名存实亡）。env 注入按 agent 语义分叉（见 env_for）。
         let adapter = |backend: &str| -> String {
             match backend {
                 "claude" => "claude-agent-acp".to_string(),
                 "codex" => "codex-acp".to_string(),
+                "pi" => "pi-acp".to_string(),
                 _ => {
-                    // pi/buzz：随包 buzz-agent（同目录规约），回落 pi-acp
+                    // buzz：随包 buzz-agent（同目录规约，与主程序一起分发）
                     let bundled = std::env::current_exe()
                         .ok()
                         .and_then(|me| me.parent().map(|d| d.join("buzz-agent")))
@@ -84,7 +85,7 @@ pub async fn run() {
                 }
             }
         };
-        let env_for = |backend: &str| -> Vec<(String, String)> {
+        let env_for = move |backend: &str| -> Vec<(String, String)> {
             let b = crate::agent::Backend::parse(backend);
             let prov = crate::config::Config::load().ok().and_then(|c| {
                 c.bots
@@ -92,11 +93,29 @@ pub async fn run() {
                     .find(|bt| bt.enabled)
                     .and_then(|bt| c.resolve_provider(bt).cloned())
             });
-            match crate::agent::build_injection(b, prov.as_ref()) {
-                Ok(inj) => inj.env.unwrap_or_default().into_iter().collect(),
-                Err(e) => {
-                    crate::log!("[acp] {backend} 供应商 env 装配失败（该后端消息将拒答引导）: {e}");
-                    Vec::new()
+            // env 语义按 agent 分：
+            // - buzz（buzz-agent fork 自有约定）：BUZZ_AGENT_PROVIDER + OPENAI_COMPAT_*
+            // - pi（pi-acp 包装 pi 本尊）：pi 认原生 provider env（ANTHROPIC_API_KEY /
+            //   OPENAI_API_KEY / DEEPSEEK_API_KEY——与 spawn 注入同款 build_injection）
+            // - claude/codex：各自适配器认原生 env
+            if b.is_buzz() {
+                match crate::agent::buzz_provider_env(prov.as_ref()) {
+                    Ok(Some(env)) => env.into_iter().collect(),
+                    Ok(None) => Vec::new(), // 无供应商：agent 起来后回合报错（预检已引导配置）
+                    Err(e) => {
+                        crate::log!("[acp] {backend} 供应商 env 装配失败: {e}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                match crate::agent::build_injection(b, prov.as_ref()) {
+                    Ok(inj) => inj.env.unwrap_or_default().into_iter().collect(),
+                    Err(e) => {
+                        crate::log!(
+                            "[acp] {backend} 供应商 env 装配失败（该后端消息将拒答引导）: {e}"
+                        );
+                        Vec::new()
+                    }
                 }
             }
         };
