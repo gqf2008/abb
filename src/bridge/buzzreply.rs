@@ -145,6 +145,12 @@ impl Bridge {
         };
         match send_result {
             Ok(()) => {
+                // 表情回执对齐 CLI 路径：✅ DONE 给用户消息（typing 表情 buzz dispatch
+                // 路径未打——回合异步跑，无「处理中」窗口可挂；done 不缺）。mid 取自
+                // 回合登记；登记缺失兜底（无 mid）无从回执，跳过。
+                if let Some(e) = entry.as_ref() {
+                    self.msgr.done(&e.mid).await;
+                }
                 crate::log!(
                     "[bridge] buzz 回复已投递{} chat={} 长度={}",
                     if entry.is_none() {

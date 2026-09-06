@@ -72,7 +72,13 @@ impl ChannelMeta {
     fn channel_info(&self) -> PromptChannelInfo {
         PromptChannelInfo {
             name: self.name.clone(),
-            channel_type: "channel".to_string(),
+            // 队列侧约定："dm" = 单聊，其余 = 群聊。写死 "channel" 曾让 p2p 私聊
+            // 在 agent 上下文里显示「类型：群聊」。
+            channel_type: if self.chat_type == "p2p" {
+                "dm".to_string()
+            } else {
+                "channel".to_string()
+            },
             description: None,
         }
     }
