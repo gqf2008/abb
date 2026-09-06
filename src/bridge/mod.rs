@@ -3830,6 +3830,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore = "mock agent fixture 依赖 python3（Windows runner 未装）")]
     async fn handle_prompt_prepends_quoted() {
         // 核心拼装：Ev.quoted 非空 → prompt = [引用消息]\n引用内容\n\n用户文本。
         let runner = Arc::new(MockAgentRunner::immediate("done"));
