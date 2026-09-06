@@ -77,7 +77,8 @@ pub async fn run() {
                         .ok()
                         .and_then(|me| me.parent().map(|d| d.join("buzz-agent")))
                         .filter(|p| p.is_file());
-                    bundled.unwrap_or_else(|| "pi-acp".to_string().into())
+                    bundled
+                        .unwrap_or_else(|| "pi-acp".to_string().into())
                         .display()
                         .to_string()
                 }
@@ -85,14 +86,12 @@ pub async fn run() {
         };
         let env_for = |backend: &str| -> Vec<(String, String)> {
             let b = crate::agent::Backend::parse(backend);
-            let prov = crate::config::Config::load()
-                .ok()
-                .and_then(|c| {
-                    c.bots
-                        .iter()
-                        .find(|bt| bt.enabled)
-                        .and_then(|bt| c.resolve_provider(bt).cloned())
-                });
+            let prov = crate::config::Config::load().ok().and_then(|c| {
+                c.bots
+                    .iter()
+                    .find(|bt| bt.enabled)
+                    .and_then(|bt| c.resolve_provider(bt).cloned())
+            });
             match crate::agent::build_injection(b, prov.as_ref()) {
                 Ok(inj) => inj.env.unwrap_or_default().into_iter().collect(),
                 Err(e) => {
@@ -106,23 +105,25 @@ pub async fn run() {
             let agent_cfg = crate::buzz::harness::AgentConfig {
                 command: adapter(backend),
                 args: Vec::new(),
-                extra_env: vec![(
-                    "PATH".to_string(),
-                    crate::deps::composed_path(),
-                )]
-                .into_iter()
-                .chain(env_for(backend))
-                .collect(),
+                extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
+                    .into_iter()
+                    .chain(env_for(backend))
+                    .collect(),
             };
             let stop = crate::tasks::shutdown_token();
-            let cwd = std::env::current_dir().unwrap_or_default().display().to_string();
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string();
             let h = crate::buzz::harness::BuzzHandle::new(agent_cfg, stop, cwd);
-            crate::log!("[acp] harness 装配 backend={backend} cmd={}", adapter(backend));
+            crate::log!(
+                "[acp] harness 装配 backend={backend} cmd={}",
+                adapter(backend)
+            );
             handles.insert(backend.to_string(), h);
         }
         handles
     };
-
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -211,8 +212,7 @@ pub async fn run() {
         // 任务①：每后端 harness 实例一个主循环（agent 懒启动 + 崩溃退避重拉，闭环）。
         for (backend, handle) in &buzz_handles {
             let run_handle = handle.clone();
-            let name: &'static str =
-                Box::leak(format!("acp-harness:{backend}").into_boxed_str());
+            let name: &'static str = Box::leak(format!("acp-harness:{backend}").into_boxed_str());
             crate::tasks::tasks().spawn(name, async move {
                 crate::buzz::harness::run_loop(run_handle).await;
             });
@@ -222,39 +222,38 @@ pub async fn run() {
         let handles_for_turns = buzz_handles.clone();
         for (backend, handle) in handles_for_turns.clone() {
             let registry_for_turns = bridge_registry.clone();
-            let name: &'static str =
-                Box::leak(format!("acp-turns:{backend}").into_boxed_str());
+            let name: &'static str = Box::leak(format!("acp-turns:{backend}").into_boxed_str());
             let handle = handle.clone();
             crate::tasks::tasks().spawn(name, async move {
-                    let stop = crate::tasks::shutdown_token();
-                    let mut turn_rx = match handle.take_turn_rx() {
-                        Some(rx) => rx,
-                        None => {
-                            crate::log!("[acp:{backend}] 回合输出接收端已被取走，消费任务退出");
-                            return;
-                        }
-                    };
-                    loop {
-                        let out = tokio::select! {
-                            Some(o) = turn_rx.recv() => o,
-                            _ = stop.cancelled() => break,
-                        };
-                        let Some(bot_key) = out.meta.as_ref().map(|m| m.bot_key.clone()) else {
-                            crate::log!(
-                                "[acp:{backend}] 回合输出缺频道登记快照，丢弃 uuid={} len={}",
-                                out.channel_id,
-                                out.text.chars().count()
-                            );
-                            continue;
-                        };
-                        match registry_for_turns.get(&bot_key) {
-                            Some(b) => b.deliver_turn_reply(out).await,
-                            None => crate::log!(
-                                "[acp:{backend}] 回合输出无对应 bridge bot={bot_key} len={}",
-                                out.text.chars().count()
-                            ),
-                        }
+                let stop = crate::tasks::shutdown_token();
+                let mut turn_rx = match handle.take_turn_rx() {
+                    Some(rx) => rx,
+                    None => {
+                        crate::log!("[acp:{backend}] 回合输出接收端已被取走，消费任务退出");
+                        return;
                     }
+                };
+                loop {
+                    let out = tokio::select! {
+                        Some(o) = turn_rx.recv() => o,
+                        _ = stop.cancelled() => break,
+                    };
+                    let Some(bot_key) = out.meta.as_ref().map(|m| m.bot_key.clone()) else {
+                        crate::log!(
+                            "[acp:{backend}] 回合输出缺频道登记快照，丢弃 uuid={} len={}",
+                            out.channel_id,
+                            out.text.chars().count()
+                        );
+                        continue;
+                    };
+                    match registry_for_turns.get(&bot_key) {
+                        Some(b) => b.deliver_turn_reply(out).await,
+                        None => crate::log!(
+                            "[acp:{backend}] 回合输出无对应 bridge bot={bot_key} len={}",
+                            out.text.chars().count()
+                        ),
+                    }
+                }
             });
         }
         // 任务③：根频道巡检——按「bot 生效后端」把登记频道分发给对应 harness 实例
@@ -286,11 +285,9 @@ pub async fn run() {
                         .iter()
                         .find(|b| b.enabled && b.key() == bot_key)
                         .map(|b| {
-                            crate::agent::Backend::parse(
-                                b.effective_backend(&cfg.default_backend),
-                            )
-                            .name()
-                            .to_string()
+                            crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend))
+                                .name()
+                                .to_string()
                         })
                 };
                 // 签名 = 登记表 + 后端映射（切后端也触发迁移）
@@ -302,10 +299,8 @@ pub async fn run() {
                         format!(
                             "{}={}",
                             b.key(),
-                            crate::agent::Backend::parse(
-                                b.effective_backend(&cfg.default_backend)
-                            )
-                            .name()
+                            crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend))
+                                .name()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -316,23 +311,28 @@ pub async fn run() {
                 }
                 last_sig = cur_sig.clone();
                 // roots 按后端分组
-                let mut by_backend: std::collections::HashMap<String, Vec<crate::buzz::harness::ChannelMeta>> =
-                    std::collections::HashMap::new();
+                let mut by_backend: std::collections::HashMap<
+                    String,
+                    Vec<crate::buzz::harness::ChannelMeta>,
+                > = std::collections::HashMap::new();
                 for vb in store.load() {
                     if !active_bots.contains(&vb.bot_key) {
                         continue;
                     }
-                    let Some(be) = backend_of(&vb.bot_key) else { continue };
-                    by_backend.entry(be).or_default().push(
-                        crate::buzz::harness::ChannelMeta {
+                    let Some(be) = backend_of(&vb.bot_key) else {
+                        continue;
+                    };
+                    by_backend
+                        .entry(be)
+                        .or_default()
+                        .push(crate::buzz::harness::ChannelMeta {
                             bot_key: vb.bot_key,
                             chat_id: vb.chat_id,
                             chat_type: "group".to_string(),
                             thread_id: None,
                             name: vb.role_name,
                             anchor_mid: None,
-                        },
-                    );
+                        });
                 }
                 for (backend, handle) in &handles_for_sweep {
                     let roots = by_backend.get(backend).cloned().unwrap_or_default();
@@ -598,7 +598,10 @@ async fn run_bot(
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
-    acp_handles: std::collections::HashMap<String, std::sync::Arc<crate::buzz::harness::BuzzHandle>>, // ACP 句柄集（全后端）
+    acp_handles: std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::buzz::harness::BuzzHandle>,
+    >, // ACP 句柄集（全后端）
     bridge_registry: crate::bridge::BridgeRegistry, // #206：回合投递路由用
 ) {
     let key = bot.key();

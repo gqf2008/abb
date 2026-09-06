@@ -1285,8 +1285,8 @@ mod tests {
         Arc<crate::buzz::harness::BuzzHandle>,
         std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
     ) {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/mock_acp_agent.py");
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
@@ -1296,10 +1296,7 @@ mod tests {
                     command: python3.clone(),
                     args: vec![script.display().to_string()],
                     extra_env: vec![
-                        (
-                            "PATH".to_string(),
-                            crate::deps::composed_path(),
-                        ),
+                        ("PATH".to_string(), crate::deps::composed_path()),
                         (
                             "MOCK_RECORD_FILE".to_string(),
                             record_file.display().to_string(),
@@ -1417,7 +1414,10 @@ mod tests {
     fn build_test_bridge_full(
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
-        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, std::collections::HashMap<String, std::sync::Arc<crate::buzz::harness::BuzzHandle>>)>,
+        acp: Option<(
+            Arc<crate::buzz::harness::BuzzHandle>,
+            std::collections::HashMap<String, std::sync::Arc<crate::buzz::harness::BuzzHandle>>,
+        )>,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
         // 供应商硬闸（#219）需要生效供应商：测试统一注入 test-prov（mock agent
@@ -1519,7 +1519,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "同步语义测试：ACP 单轨迁移后 dispatch 为异步回合，本测试的同步挡板模型不再可达；等价语义由 queue/acp 测试覆盖（迁移收尾时补异步对应物）"]
     async fn new_during_run_skips_mark_started() {
         // #23 核心不变式：任务运行中发 /new → 槽位换成新 UUID；旧任务完成时
         // mark_started_if(旧 session_id) 与当前槽位不匹配 → 跳过 mark，
@@ -2029,7 +2028,6 @@ mod tests {
     /// T6：任务运行中 /new → 清历史后，旧任务完成不得写孤儿助手条目/标记
     ///（mark_started_if 身份校验同一道闸）。
     #[tokio::test]
-    #[ignore = "同步语义测试：ACP 单轨迁移后 dispatch 为异步回合，本测试的同步挡板模型不再可达；等价语义由 queue/acp 测试覆盖（迁移收尾时补异步对应物）"]
     async fn new_during_run_writes_no_orphan_history() {
         let runner = Arc::new(MockAgentRunner::blocking("旧任务回复"));
         let bot = backend_bot("pi");
@@ -2129,7 +2127,6 @@ mod tests {
     /// 按预算切）。
 
     #[tokio::test]
-    #[ignore = "同步语义测试：ACP 单轨迁移后 dispatch 为异步回合，本测试的同步挡板模型不再可达；等价语义由 queue/acp 测试覆盖（迁移收尾时补异步对应物）"]
     async fn cli_reset_during_run_skips_mark_started() {
         // #23 审查修复：CLI `session reset`（跨进程，等效直接改 sessions.json）发生在任务
         // 运行中 → 旧任务完成时 mark_started_if 不匹配 → 不得把新槽位 mark 回 started=true。
@@ -2197,7 +2194,6 @@ mod tests {
     // ---- #25 重启恢复（in-flight 消息持久化 + 自动重放）----
 
     #[tokio::test]
-    #[ignore = "同步语义测试：ACP 单轨迁移后 dispatch 为异步回合，本测试的同步挡板模型不再可达；等价语义由 queue/acp 测试覆盖（迁移收尾时补异步对应物）"]
     async fn handle_persists_pending_while_running_and_removes_after() {
         // 消息进入 agent 处理时 pending.json 有该条；agent 返回后摘除（不重复执行）。
         let runner = Arc::new(MockAgentRunner::blocking("done"));
@@ -2216,7 +2212,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "同步语义测试：ACP 单轨迁移后 dispatch 为异步回合，本测试的同步挡板模型不再可达；等价语义由 queue/acp 测试覆盖（迁移收尾时补异步对应物）"]
     async fn control_commands_not_persisted() {
         // /new 与停止词是即时控制指令，不落盘：崩溃后重放不会把停止词当普通消息透传。
         let runner = Arc::new(MockAgentRunner::immediate("done"));
@@ -3674,7 +3669,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "同步语义测试：ACP 单轨迁移后 dispatch 为异步回合，本测试的同步挡板模型不再可达；等价语义由 queue/acp 测试覆盖（迁移收尾时补异步对应物）"]
     async fn on_payload_cancel_interrupts_running_task() {
         // /cancel 在任务运行中 → 打断（mock 返回 Cancelled）→ 回「⏹ 已停止」
         let runner = Arc::new(MockAgentRunner::blocking("done"));
@@ -3852,7 +3846,8 @@ mod tests {
         let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
         let (buzz, handles) = make_test_harness(rec.clone(), &registry);
-        let (bridge, _msgr) = build_test_bridge_full(runner.clone(), backend_bot("claude"), Some((buzz, handles)));
+        let (bridge, _msgr) =
+            build_test_bridge_full(runner.clone(), backend_bot("claude"), Some((buzz, handles)));
         registry.register(&bridge.bot.key(), &bridge);
         let mut ev = test_ev("m1", "oc_q", "回复内容");
         ev.chat_type = "p2p".to_string(); // 单轨 dispatch：p2p 免登记直接进 harness

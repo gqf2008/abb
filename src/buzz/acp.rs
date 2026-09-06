@@ -2346,10 +2346,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "探针：真 spawn tests/mock_acp_agent.py 验证 spawn/init/prompt 全链（手动跑）"]
     async fn probe_real_mock_agent_roundtrip() {
-        let script = format!(
-            "{}/tests/mock_acp_agent.py",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let script = format!("{}/tests/mock_acp_agent.py", env!("CARGO_MANIFEST_DIR"));
         let rec = "/tmp/mock-probe.jsonl";
         let mut client = AcpClient::spawn(
             "/opt/homebrew/bin/python3",
