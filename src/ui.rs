@@ -2896,11 +2896,10 @@ pub fn run_gui() -> Result<()> {
         );
         std::mem::forget(t6);
     }
-    // #8 M0 自动引导：claude/codex/pi 未安装（或 ACP 适配器三件套缺任一）→ 启动即弹出
-    // 设置窗。复用托盘打开同一条路径（load_into → 依赖横幅 + 状态行），保证窗口内容
-    // 完整（不只是空窗）。已装好 agent 的开发者/朋友零打扰（条件不成立）；对新装用户
-    // 这是「打开就能被引导」的关键一步。与 push_deps_to_window 的 missing_agent 同口径
-    //（实机：agent 装齐但缺适配器时聊天全挂，同样要引导）。
+    // #8 M0 自动引导：claude/codex/pi 未安装 → 启动即弹出设置窗。复用托盘打开同一
+    // 条路径（load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好
+    // agent 的开发者/朋友零打扰；对新装用户这是「打开就能被引导」的关键一步。
+    // 缺 ACP 适配器不弹窗（service 回落随包 buzz-agent，聊天可用）——引导留在横幅。
     {
         let deps = crate::deps::detect_all();
         let missing = |id: &str| {
@@ -2915,14 +2914,12 @@ pub fn run_gui() -> Result<()> {
             .find(|d| d.id == "codex")
             .map(|d| d.found && !d.version_ok)
             .unwrap_or(false);
-        let acp_missing = ["pi-acp", "codex-acp", "claude-acp"]
-            .iter()
-            .any(|id| missing(id));
+        // 缺适配器不再强制弹窗：service 侧已回落随包 buzz-agent（聊天可用）；
+        // 引导性提示留在环境配置页横幅（口径见 push_deps_to_window）。
         if missing("claude")
             || missing("codex")
             || codex_low
             || missing("pi")
-            || acp_missing
             || std::env::args().any(|a| a == "--show-settings")
         {
             let debug_show = std::env::args().any(|a| a == "--show-settings");
@@ -2934,7 +2931,7 @@ pub fn run_gui() -> Result<()> {
             // 调试参数（--show-settings）不设误导的「未检测到」状态行
             if !debug_show {
                 settings.set_status_line(
-                    "⚠️ 缺少 Claude Code / Codex CLI / Pi 或 ACP 适配器：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
+                    "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
                         .into(),
                 );
                 settings.set_status_is_error(true);
@@ -4821,13 +4818,29 @@ pub fn run_gui() -> Result<()> {
                                 w.set_dep_busy("".into());
                                 push_deps_to_window(&w);
                                 match result {
-                                    Ok(tail) => {                                        w.set_dep_detail("".into());
+                                    Ok(tail) => {
+                                        w.set_dep_detail("".into());
                                         w.set_status_is_error(false);
+                                        // 装的是 ACP 适配器 → 重启 service：harness 装配是
+                                        // 启动快照，重启后 resolve_adapter 重新解析、自动切回
+                                        // 原生适配器（否则继续跑回落 buzz-agent）。
+                                        let adapter_installed = dep_id == "acp-adapters"
+                                            || crate::deps::ACP_ADAPTERS
+                                                .iter()
+                                                .any(|(key, _)| key == &dep_id);
+                                        if adapter_installed && install::status().running {
+                                            install::svc_restart();
+                                        }
                                         // #93：codex 装完的登录引导（run_install 成功返回已附）。
                                         // 其它依赖保持原样文案（npm/brew 输出冗长不直接上状态行）。
                                         if dep_id == "codex" {
                                             w.set_status_line(
                                                 crate::agent::truncate(&tail, 200).into(),
+                                            );
+                                        } else if adapter_installed {
+                                            w.set_status_line(
+                                                "✅ 适配器已安装，服务重启中（切回原生后端）"
+                                                    .into(),
                                             );
                                         } else {
                                             w.set_status_line(format!("✅ {dep_id} 安装完成").into());

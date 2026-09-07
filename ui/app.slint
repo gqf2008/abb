@@ -2258,7 +2258,7 @@ export component SettingsWindow inherits Window {
                                         padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
                                         spacing: 8px;
                                         Text {
-                                            text: "⚠️ 缺少 Claude Code / Codex CLI / Pi 或 ACP 适配器：机器人收到消息后将无法处理。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
+                                            text: "⚠️ 缺少 Claude Code / Codex CLI / Pi（机器人将无法处理消息）或 ACP 适配器（未装时使用随包 buzz-agent，聊天仍可用；装好后自动切回原生）。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
                                             color: UiTokens.warn;
                                             wrap: word-wrap;
                                             vertical-alignment: center;

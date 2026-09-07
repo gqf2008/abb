@@ -503,7 +503,7 @@ impl InstallStep {
 /// 键必须与 detect_all 的 probe id 一致——run_install 按装后 detect_one(key) 逐键复检。
 /// claude-acp/codex-acp 的包名带 @agentclientprotocol scope（codex-acp 曾误用
 /// @openai/codex-acp 致 npm 404）；pi-acp 为 pi-coding-agent 生态的非 scoped 包。
-const ACP_ADAPTERS: &[(&str, &str)] = &[
+pub(crate) const ACP_ADAPTERS: &[(&str, &str)] = &[
     ("claude-acp", "@agentclientprotocol/claude-agent-acp"),
     ("codex-acp", "@agentclientprotocol/codex-acp"),
     ("pi-acp", "pi-acp"),
@@ -765,8 +765,16 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
             // 三个都已装好却走到这：理论上不可达（装好后 ok_after 即返回 Ok），兜底防呆
             return Ok(String::new());
         }
+        // last_err 是「最后一步」的真实错误，未必属于仍缺的那个包——按事实标注
+        // 而不是并置，防张冠李戴；全步骤 0 退出仅探测不到（PATH 未刷新）时为空，
+        // 括号整段省略。
+        let ctx = if last_err.is_empty() {
+            String::new()
+        } else {
+            format!("（最后一步错误：{last_err}）")
+        };
         return Err(format!(
-            "acp-adapters 安装失败：仍缺 {}（{last_err}）",
+            "acp-adapters 安装失败：仍缺 {}{ctx}",
             missing.join("、")
         ));
     }
