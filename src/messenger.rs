@@ -225,6 +225,33 @@ impl Messenger for FeishuMessenger {
             }
         }
     }
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        meta: &crate::attachments::AttachmentMeta,
+    ) -> Result<()> {
+        // 真实文件发送（#253）：读本地附件 → 平台上传 → 以媒体消息发出，
+        // 不再给用户塞「带本地路径的文本元数据」。失败原样上报（deliver 回源提示）。
+        let bytes = crate::attachments::read_attachment_bytes(meta)?;
+        if meta.kind == "image" {
+            let key = self.fs.upload_image(bytes).await?;
+            return self
+                .fs
+                .send_media_message(chat_id, "image", &meta.file_name, &key, "image")
+                .await;
+        }
+        let ft = crate::feishu::feishu_file_type(&meta.file_name);
+        let name = if meta.file_name.is_empty() {
+            "attachment"
+        } else {
+            meta.file_name.as_str()
+        };
+        let key = self.fs.upload_file(ft, name, bytes).await?;
+        self.fs
+            .send_media_message(chat_id, "file", name, &key, &meta.kind)
+            .await
+    }
+
     async fn typing(&self, message_id: &str) -> Option<String> {
         self.fs.add_reaction(message_id, "Typing").await
     }
@@ -412,6 +439,28 @@ impl Messenger for DingTalkMessenger {
         Ok(())
     }
     // 钉钉无表情：typing/done 用默认空实现
+
+    async fn send_attachment(
+        &self,
+        chat_id: &str,
+        meta: &crate::attachments::AttachmentMeta,
+    ) -> Result<()> {
+        let bytes = crate::attachments::read_attachment_bytes(meta)?;
+        if meta.kind == "image" && crate::dingtalk::is_group_chat(chat_id) {
+            let media_id = self.dt.upload_image(bytes).await?;
+            return self
+                .dt
+                .send_group_image(chat_id, &self.robot_code, &media_id)
+                .await;
+        }
+        // 其余组合（单聊媒体 / 文件/语音/视频消息）钉钉 Stream 机器人消息集暂未覆盖：
+        // 明确报错而不是假装成功或退化成文本元数据，待 #253 后续补齐。
+        anyhow::bail!(
+            "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊图片；文件/语音/单聊媒体待 #253 后续补",
+            meta.kind,
+            if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" }
+        )
+    }
 
     async fn download_attachment(
         &self,

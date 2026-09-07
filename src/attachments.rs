@@ -353,6 +353,21 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     urls
 }
 
+/// 读取已保存附件字节（Messenger::send_attachment 真上传前用）。
+/// meta.path 为空或文件缺失 → Err（含文件名/路径提示），由调用方走既有错误语义
+/// （deliver 回源报错），绝不静默降级成「文本元数据」。
+pub fn read_attachment_bytes(meta: &AttachmentMeta) -> Result<Vec<u8>> {
+    if meta.path.is_empty() {
+        anyhow::bail!("附件没有本地路径（{}），无法上传发送", meta.file_name);
+    }
+    let bytes = std::fs::read(&meta.path)
+        .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
+    if bytes.is_empty() {
+        anyhow::bail!("附件为空文件，拒绝上传发送: {}", meta.file_name);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +505,77 @@ mod tests {
             meta.to_prompt_line(),
             "[image] 来源=feishu 文件名=a.png mime=image/png 大小=10 本地路径=/tmp/a.png sha256=ab"
         );
+    }
+
+    #[test]
+    fn read_attachment_bytes_reads_saved_file() {
+        let dir = std::env::temp_dir().join(format!("abb-read-{}", uuid::Uuid::new_v4()));
+        let ws = dir.join("workspaces").join("bot-x");
+        let bytes = b"hello attachment bytes";
+        let meta = save_attachment_in(
+            &ws,
+            "om_1/abc",
+            0,
+            "file",
+            "feishu",
+            "a.txt",
+            "text/plain",
+            bytes,
+        )
+        .expect("保存附件应成功");
+        let read = read_attachment_bytes(&meta).expect("读取本地附件应成功");
+        assert_eq!(read, bytes);
+    }
+
+    #[test]
+    fn read_attachment_bytes_errors_on_empty_path() {
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "a.txt".into(),
+            mime: "text/plain".into(),
+            size: 1,
+            path: String::new(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("没有本地路径"), "{e:#}");
+    }
+
+    #[test]
+    fn read_attachment_bytes_errors_on_missing_file() {
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "ghost.txt".into(),
+            mime: "text/plain".into(),
+            size: 1,
+            path: "/definitely/missing/ghost.txt".into(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("读取附件文件失败"), "{e:#}");
+    }
+
+    #[test]
+    fn read_attachment_bytes_errors_on_empty_file() {
+        let dir = std::env::temp_dir().join(format!("abb-read-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.bin");
+        std::fs::write(&path, b"").unwrap();
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "empty.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: path.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("空文件"), "{e:#}");
     }
 }
