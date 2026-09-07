@@ -369,6 +369,7 @@ pub async fn run() {
                             thread_id: None,
                             name: vb.role_name,
                             anchor_mid: None,
+                            adhoc: false,
                         });
                 }
                 for (backend, handle) in &handles_for_sweep {
@@ -1221,6 +1222,7 @@ async fn run_job(
                         thread_id: None,
                         name: format!("定时任务 {}", &job.id[..job.id.len().min(8)]),
                         anchor_mid: None,
+                        adhoc: true,
                     },
                 );
                 match h

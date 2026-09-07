@@ -3875,6 +3875,66 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
+    /// 未登记的群不再拒答（用户决策：bot 能收到消息的群都该能回）——dispatch
+    /// 走 harness（mock agent 收到 prompt），群根频道被自动登记（adhoc），
+    /// 且不产生「已登记的虚拟 Bot 群」拒答文案。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn unregistered_group_auto_registers_and_dispatches() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (buzz, handles) = make_test_harness(rec.clone(), &registry);
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("claude"),
+            Some((buzz.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+        // 随机 chat_id：绝不可能是登记表里的 vb 群（测试用临时 vb_store）
+        let chat_id = format!("oc_unreg_{}", uuid::Uuid::new_v4());
+        let ev = test_ev("m1", &chat_id, "hi");
+        bridge.handle(ev).await;
+
+        // 异步回合：mock agent 收到 prompt 即证明 dispatch 未被拒
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let prompts = loop {
+            let p = read_prompts(&rec);
+            if !p.is_empty() {
+                break p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prompt 10s 未到达 mock agent（未登记群 dispatch 被卡）"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(prompts.len(), 1);
+        // 群根频道自动登记（adhoc）
+        let uuid = uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+            &bridge.bot.key(),
+            &chat_id,
+        ))
+        .unwrap();
+        assert!(buzz.channel_registered(&uuid), "未登记群应被自动登记");
+        let meta = buzz.channel_meta(&uuid).unwrap();
+        assert!(meta.adhoc, "自动登记的群应带 adhoc 标记");
+        assert!(meta.name.starts_with("群聊·"), "回退群名: {}", meta.name);
+        // 无拒答文案投递
+        assert!(
+            !msgr
+                .sent()
+                .iter()
+                .any(|m| m.contains("已登记的虚拟 Bot 群")),
+            "不应产生登记门槛拒答: {:?}",
+            msgr.sent()
+        );
+        cleanup_bridge(&bridge);
+    }
+
     #[tokio::test]
     async fn on_weixin_quoted_text_in_prompt() {
         // 微信引用/回复：ref_msg 内容随事件携带，进 prompt。

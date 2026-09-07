@@ -59,13 +59,17 @@ pub struct ChannelMeta {
     pub bot_key: String,
     pub chat_id: String,
     /// 会话类型："group"（登记表频道）/ "p2p"（私聊，dispatch 即时注册）。
-    /// 巡检「消失清理」豁免 p2p——它不在登记表，误清会排空队列丢回复。
+    /// 巡检「消失清理」豁免 adhoc——不在登记表的频道（p2p / 自动登记的群）
+    /// 是常态而非消失，误清会排空队列丢回复。
     pub chat_type: String,
     pub thread_id: Option<String>,
     /// 群展示名（角色名）：进 prompt 上下文与 session 标题。
     pub name: String,
     /// 话题回复锚点 mid（话题频道每次 dispatch 时由桥刷新）。
     pub anchor_mid: Option<String>,
+    /// 即时登记（非巡检登记表来源）：p2p 私聊与「自动登记」的群。巡检 diff
+    /// 清理跳过 adhoc 频道（它们不在登记表，误清会丢会话）。
+    pub adhoc: bool,
 }
 
 impl ChannelMeta {
@@ -460,18 +464,18 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
                 next.insert(key, uuid);
             }
             // 消失的根频道：排空队列、失效会话、其后返回的批次直接丢弃。
-            // p2p 频道豁免——它由 dispatch 即时注册（不在登记表），巡检「不在
-            // next」是常态而非消失，误清会丢私聊回复。
+            // adhoc 频道（p2p 私聊 / 自动登记的群）豁免——它们不在登记表，
+            // 巡检「不在 next」是常态而非消失，误清会丢私聊/未登记群回复。
             for (key, uuid) in current {
-                let is_p2p = handle
+                let is_adhoc = handle
                     .registry
                     .lock()
                     .unwrap()
                     .channels
                     .get(&uuid)
-                    .map(|m| m.chat_type == "p2p")
+                    .map(|m| m.adhoc)
                     .unwrap_or(false);
-                if is_p2p {
+                if is_adhoc {
                     continue;
                 }
                 if next.contains_key(&key) {

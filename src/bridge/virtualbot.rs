@@ -11,9 +11,6 @@ use uuid::Uuid;
 enum BuzzPrecheckFail {
     /// buzz 后端未启用（config 默认后端/本 bot 非 buzz → service 未起 harness）
     BuzzDisabled,
-    /// chat 无对应频道登记（未登记/刚登记待巡检接入——#206 频道集运行期刷新，
-    /// 新登记 ≤ 巡检周期内自动接入，无需重启）
-    ChannelUnregistered,
     /// agent 进程不可用（未拉起/崩溃退避中——新消息会被预检拒绝，避免「以为
     /// 已受理」的静默排队）
     AgentDown,
@@ -31,14 +28,17 @@ impl Bridge {
     /// 污染频道注册表，审查 #214 P2-1。话题频道登记（注册 + 锚点）由
     /// [`Self::buzz_ensure_topic_channel`] 在全闸通过之后执行）。
     /// 与 /cancel 的判据差异在话题臂：
-    /// - 群根消息：三判据原样（buzz 启用 → 群根频道已登记 → agent 可用）。
-    /// - 话题消息（thread_id 非空）：话题从属于群——**群根频道必须已登记**
-    ///   （未登记群的话题消息同样拒绝）；话题频道缺失**不再拒绝**（闸后登记）；
-    ///   agent 可用性判据沿用（acp 就绪才有轮次可跑，与群根一致——单 slot
-    ///   无「话题订阅在途」中间态，话题消息与群根消息共享同一判据）。
+    /// - 群根消息：buzz 启用 → agent 可用 → 供应商闸。**无「已登记」门槛**——
+    ///   bot 能收到消息的群都该能回（提及/授权原则由平台与桥的 @ 门槛保证）；
+    ///   未登记的群由 [`Self::buzz_ensure_group_channel`] 闸后自动登记（adhoc，
+    ///   巡检豁免清理）。
+    /// - 话题消息（thread_id 非空）：话题从属于群——群根频道自动登记后话题
+    ///   频道同样闸后登记；agent 可用性判据沿用（acp 就绪才有轮次可跑，与群根
+    ///   一致——单 slot 无「话题订阅在途」中间态，话题消息与群根消息共享同一判据）。
     ///
-    /// 返回 Ok(群根频道名)：群根频道名 = 角色名（虚拟 Bot 登记表），闸后登记
-    /// 话题频道时作话题频道名来源——不另查 harness 频道表，防两份来源漂移。
+    /// 返回 Ok(群根频道名)：优先虚拟 Bot 登记表的角色名；未登记群回退
+    /// 「群聊·<chat_id 前缀>」——闸后登记话题频道时作话题频道名来源，不另查
+    /// harness 频道表，防两份来源漂移。
     fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
         let backend =
             crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
@@ -46,8 +46,7 @@ impl Bridge {
             return Err(BuzzPrecheckFail::BuzzDisabled);
         };
         // p2p（私聊）：免登记——频道由 dispatch 全闸通过后即时注册（upsert 幂等），
-        // 频道名 = 对方展示名。私聊无「群登记」概念，原 ChannelUnregistered 拒答
-        // 对私聊无意义（用户私聊 bot 用 buzz 是合理路径）。
+        // 频道名 = 对方展示名。私聊无「群登记」概念（用户私聊 bot 是合理路径）。
         if ev.chat_type == "p2p" || ev.chat_type == "dm" {
             if !handle.is_agent_available() {
                 return Err(BuzzPrecheckFail::AgentDown);
@@ -80,14 +79,8 @@ impl Bridge {
             };
             return Ok(name);
         }
-        let group_uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
-            &self.bot.key(),
-            &ev.chat_id,
-        ))
-        .expect("channel_uuid output must parse as Uuid");
-        if !handle.channel_registered(&group_uuid) {
-            return Err(BuzzPrecheckFail::ChannelUnregistered);
-        }
+        // 无「已登记」门槛：bot 能收到消息的群都该能回（自动登记见
+        // buzz_ensure_group_channel，闸后执行——预检无副作用 invariant）。
         if !handle.is_agent_available() {
             return Err(BuzzPrecheckFail::AgentDown);
         }
@@ -109,20 +102,57 @@ impl Bridge {
                 return Err(BuzzPrecheckFail::KindMismatch);
             }
         }
-        // 群根频道名 = 角色名：取虚拟 Bot 登记快照（mtime 懒刷新，与注入判定同源）。
+        // 群根频道名：优先虚拟 Bot 登记快照的角色名（mtime 懒刷新，与注入判定
+        // 同源）；未登记的群回退「群聊·<chat_id 前缀>」（自动登记语义，不拒答）。
         self.refresh_virtual_bots();
-        let name = {
+        {
             let bots = self.virtual_bots.lock().unwrap();
-            bots.iter()
+            let vb_name = bots
+                .iter()
                 .find(|v| v.bot_key == self.bot.key() && v.chat_id == ev.chat_id)
-                .map(|v| v.role_name.clone())
+                .map(|v| v.role_name.clone());
+            if let Some(name) = vb_name {
+                return Ok(name);
+            }
+        }
+        Ok(format!("群聊·{}", trunc(&ev.chat_id, 10)))
+    }
+
+    /// 未登记群的自动登记（用户决策：bot 能收到消息的群都该能回，提及/授权
+    /// 原则由平台与桥的 @ 门槛保证）。仅当频道未登记时 upsert（已登记的 vb
+    /// 群不被覆盖——巡检登记的角色名优先）。adhoc 标记让巡检 diff 豁免清理
+    ///（不在登记表是常态而非消失）。
+    fn buzz_ensure_group_channel(&self, ev: &Ev, group_name: &str) {
+        let backend =
+            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
+        let Some(handle) = self.acp_handles.get(backend.name()) else {
+            return; // 预检已过则 handle 必在；防御性早退
         };
-        name.ok_or(BuzzPrecheckFail::ChannelUnregistered)
+        let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+            &self.bot.key(),
+            &ev.chat_id,
+        ))
+        .expect("channel_uuid output must parse as Uuid");
+        if handle.channel_registered(&uuid) {
+            return;
+        }
+        handle.upsert_channel(
+            uuid,
+            crate::buzz::harness::ChannelMeta {
+                bot_key: self.bot.key(),
+                chat_id: ev.chat_id.clone(),
+                chat_type: "group".to_string(),
+                thread_id: None,
+                name: group_name.to_string(),
+                anchor_mid: None,
+                adhoc: true,
+            },
+        );
     }
 
     /// p2p 私聊的群根频道即时注册：dispatch 全闸通过后调用（upsert 幂等——首条
-    /// 消息注册，后续消息刷新 meta）。巡检对 p2p 豁免清理（chat_type=="p2p"），
-    /// 不会被登记表 diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
+    /// 消息注册，后续消息刷新 meta）。巡检对 adhoc 频道豁免清理，不会被登记表
+    /// diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
     fn buzz_ensure_p2p_channel(&self, ev: &Ev, peer_name: &str) {
         let backend =
             crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
@@ -143,6 +173,7 @@ impl Bridge {
                 thread_id: None,
                 name: peer_name.to_string(),
                 anchor_mid: None,
+                adhoc: true,
             },
         );
     }
@@ -172,6 +203,7 @@ impl Bridge {
                 thread_id: Some(ev.thread_id.clone()),
                 name: group_name.to_string(),
                 anchor_mid: Some(ev.mid.clone()),
+                adhoc: false,
             },
         );
         crate::log!(
@@ -534,10 +566,9 @@ impl Bridge {
         // 承载，④ 是 dispatch 独有）：
         // ① buzz 后端启用（service 只在该 bot 生效后端是 buzz 时注入 harness 句柄；
         //    None = 非 buzz 后端，本分支不可达——防御）；
-        // ② 本会话是已登记的虚拟 Bot 群（频道集运行期刷新：新登记在巡检周期
-        //    （2s）内自动接入，p2p/未登记群不支持；#206 话题隔离：话题消息只
-        //    要求**群根频道**已登记——话题频道缺失不再拒绝，全闸通过后由
-        //    buzz_ensure_topic_channel 登记）；
+        // ② 供应商硬闸 + 类型匹配闸（NoProvider/KindMismatch）——无「已登记」
+        //    门槛：bot 能收到消息的群都该能回，未登记群闸后自动登记
+        //    （buzz_ensure_group_channel，adhoc 标记巡检豁免；p2p 同语义即时注册）；
         // ③ agent 进程可用（启动失败/崩溃退避中 = 不可用——此时 push 只是排队
         //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）。
         // ACP 单轨：该后端 harness 已装配（生产常驻）→ dispatch 异步回合；
@@ -548,9 +579,6 @@ impl Bridge {
             let reason = match &precheck {
                 Err(BuzzPrecheckFail::BuzzDisabled) => {
                     Some("该后端未启用（服务未装配 agent，检查默认后端/重启）")
-                }
-                Err(BuzzPrecheckFail::ChannelUnregistered) => {
-                    Some("本会话不是已登记的虚拟 Bot 群；若刚刚登记，频道正在接入，请稍后重试")
                 }
                 // agent 不可用 = 启动失败/崩溃退避中：当场报错优于静默排队
                 //（失败批次会随重拉重试，死信积压见 harness queue 语义）。
@@ -602,6 +630,10 @@ impl Bridge {
                 if let Ok(peer_name) = &precheck {
                     self.buzz_ensure_p2p_channel(&ev, peer_name);
                 }
+            } else if let Ok(group_name) = &precheck {
+                // 群根：未登记的群自动登记（用户决策——bot 能收到消息的群都该
+                // 能回；已登记的 vb 群不被覆盖）。
+                self.buzz_ensure_group_channel(&ev, group_name);
             }
         }
         // prompt = 用户文本 + 附件元数据（agent 按本地路径读文件）+ 链接清单（可选能力）。
