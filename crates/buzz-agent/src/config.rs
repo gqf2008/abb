@@ -479,7 +479,10 @@ impl DatabricksModelFilter {
 /// Match one full-string `*`/`?` pattern without treating any other character
 /// as syntax. The inputs are converted to Unicode scalar values so `?` means
 /// one character rather than one UTF-8 byte.
-fn glob_matches(pattern: &str, value: &str) -> bool {
+///
+/// `pub(crate)`: devtools 的 glob 工具按段复用同一匹配器（`*` 逐字符跨 `/`
+/// 的语义由调用方按段切分保证），避免两套手写通配匹配漂移。
+pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let value: Vec<char> = value.chars().collect();
     let mut pattern_index = 0;

@@ -111,6 +111,26 @@ pub(crate) fn windows_child_passthrough_env() -> impl Iterator<Item = &'static s
         .chain(crate::WINDOWS_SHELL_RESOLUTION_ENV.iter().copied())
 }
 
+/// Shared `env_clear()` + whitelist application for every child this crate
+/// spawns (MCP servers via [`spawn_one`] and the built-in dev tools via
+/// `devtools::run_shell`). Keeping one copy means a whitelist change cannot
+/// silently diverge between the two consumers. Callers that need extra vars
+/// (per-server `spec.env`, or devtools' key stripping) apply them afterwards.
+pub(crate) fn apply_passthrough_env(cmd: &mut Command) {
+    cmd.env_clear();
+    for k in PASSTHROUGH_ENV {
+        if let Ok(v) = std::env::var(k) {
+            cmd.env(k, v);
+        }
+    }
+    #[cfg(windows)]
+    for k in windows_child_passthrough_env() {
+        if let Ok(v) = std::env::var(k) {
+            cmd.env(k, v);
+        }
+    }
+}
+
 type Client = RunningService<RoleClient, ()>;
 
 #[derive(Clone)]
@@ -298,14 +318,30 @@ impl McpRegistry {
         // 内置 dev 工具（shell/read/write/ls/glob，进程内执行）：挂在 "dev"
         // 伪服务器命名空间下，与 MCP 工具同权限/取消/结果回填链路。默认开，
         // BUZZ_AGENT_DEV_TOOLS=0 关闭。
+        //
+        // 与 MCP 工具不同，这里不做硬失败：qname 已被 MCP 服务器占用（比如
+        // 用户配置了一个名为 "dev" 的服务器）或 128 上限已满时跳过内置工具并
+        // 告警——静默覆盖会把运维配置的服务器工具换成内置实现，硬失败则会让
+        // 此前合法的 124..=128 工具配置整个会话起不来，两者都不可接受。
         if cfg.dev_tools {
             for (tool, def) in crate::devtools::defs() {
                 if reg.defs.len() >= MAX_TOOLS_PER_SESSION {
-                    return Err(AgentError::Mcp(format!(
-                        "too many tools (>{MAX_TOOLS_PER_SESSION})"
-                    )));
+                    tracing::warn!(
+                        "dev tools: tool budget ({MAX_TOOLS_PER_SESSION}) exhausted after {} MCP tools; \
+                         skipping remaining builtins (set BUZZ_AGENT_DEV_TOOLS=0 to disable them)",
+                        reg.defs.len()
+                    );
+                    break;
                 }
                 let qname = format!("dev{SEP}{}", def.name);
+                if reg.by_qname.contains_key(&qname) {
+                    tracing::warn!(
+                        tool = %qname,
+                        "builtin dev tool qname collides with an MCP tool (server named \"dev\"?); \
+                         skipping the builtin so the configured server tool keeps working"
+                    );
+                    continue;
+                }
                 reg.by_qname.insert(qname.clone(), Entry::Builtin { tool });
                 reg.defs.push(ToolDef { name: qname, ..def });
             }
@@ -555,9 +591,14 @@ impl McpRegistry {
             .ok_or_else(|| AgentError::Mcp(format!("unknown tool {qname}")))?;
 
         // 内置 dev 工具：进程内执行（无 MCP 往返、无进程健康态）。参数形状
-        // 与权限检查在调用方（execute_parallel）完成，与本路径无关。
+        // 与权限检查在调用方（execute_parallel）完成，与本路径无关；结果与
+        // MCP 工具同款预算裁边（budget.text/budget.total），保证配置的
+        // per-result 文本上限对两类工具一致生效。
         if let Entry::Builtin { tool } = entry {
-            return crate::devtools::run(*tool, arguments, &self.cwd, provider_id, cancel).await;
+            let mut result =
+                crate::devtools::run(*tool, arguments, &self.cwd, provider_id, cancel).await?;
+            clamp_tool_result_text(&mut result, budget);
+            return Ok(result);
         }
         let Entry::Mcp { server_idx, bare } = entry else {
             unreachable!("Entry::Builtin handled above");
@@ -771,18 +812,7 @@ async fn spawn_one(
 ) -> Result<(Client, Option<u32>, Vec<String>, Vec<rmcp::model::Tool>), AgentError> {
     let mut cmd = Command::new(&spec.command);
     cmd.args(&spec.args);
-    cmd.env_clear();
-    for k in PASSTHROUGH_ENV {
-        if let Ok(v) = std::env::var(k) {
-            cmd.env(k, v);
-        }
-    }
-    #[cfg(windows)]
-    for k in windows_child_passthrough_env() {
-        if let Ok(v) = std::env::var(k) {
-            cmd.env(k, v);
-        }
-    }
+    apply_passthrough_env(&mut cmd);
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -1070,6 +1100,23 @@ fn tool_result_content(
     }
     flush_text(&mut out, &mut text, &mut used, &mut text_used);
     out
+}
+
+/// Built-in dev tools produce plain-text results; apply the same per-result
+/// text budget the MCP path enforces inside [`tool_result_content`] (text
+/// middle-elided to `budget.text` with an elision marker). Dev tools cap
+/// themselves far below `budget.total` (8 MiB), so only the text arm matters.
+fn clamp_tool_result_text(result: &mut ToolResult, budget: ResultBudget) {
+    let mut text_used = 0usize;
+    for piece in &mut result.content {
+        if let ToolResultContent::Text(t) = piece {
+            let remaining = budget.text.saturating_sub(text_used);
+            if t.len() > remaining {
+                *t = truncate_middle(t, remaining);
+            }
+            text_used = text_used.saturating_add(t.len());
+        }
+    }
 }
 
 /// Suppress the console window that Windows otherwise allocates for every
