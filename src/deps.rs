@@ -517,15 +517,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
                 InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
                 InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
             ],
-            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
-            "acp-adapters" => vec![
-                InstallStep::exec(
-                    "npm",
-                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
-                ),
-                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
-                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
-            ],
             "claude" => vec![
                 InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
@@ -637,6 +628,15 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let plan = match dep_id {
+            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
+            "acp-adapters" => vec![
+                InstallStep::exec(
+                    "npm",
+                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
+                ),
+                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
+                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
+            ],
             "claude" => vec![
                 InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
