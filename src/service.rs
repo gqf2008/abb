@@ -73,11 +73,19 @@ pub async fn run() {
                 "codex" => "codex-acp".to_string(),
                 "pi" => "pi-acp".to_string(),
                 _ => {
-                    // buzz：随包 buzz-agent（同目录规约，与主程序一起分发）
-                    let bundled = std::env::current_exe()
-                        .ok()
-                        .and_then(|me| me.parent().map(|d| d.join("buzz-agent")))
-                        .filter(|p| p.is_file());
+                    // buzz：随包 buzz-agent（同目录规约，与主程序一起分发）。
+                    // Windows 包名为 buzz-agent.exe（ISS 同目录打包）——两个候选都试
+                    //（旧实现只认无扩展名，Windows 装配回落 pi-acp 实锤失效）。
+                    let bundled = std::env::current_exe().ok().and_then(|me| {
+                        let dir = me.parent()?;
+                        let plain = dir.join("buzz-agent");
+                        if plain.is_file() {
+                            Some(plain)
+                        } else {
+                            let exe = dir.join("buzz-agent.exe");
+                            exe.is_file().then_some(exe)
+                        }
+                    });
                     bundled
                         .unwrap_or_else(|| "pi-acp".to_string().into())
                         .display()
