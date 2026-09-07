@@ -1207,7 +1207,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> git-ok: false;
     // ACP 适配器三件套（claude-agent-acp/codex-acp/pi-acp）全部就位 = true
     in-out property <bool> acp-adapters-installed: false;
-    // claude/codex/pi 任一未装 = true：环境配置页顶部显示醒目横幅（首次启动也据此自动弹出设置窗引导安装）。
+    // claude/codex/pi 任一未装或 ACP 适配器三件套缺任一 = true：环境配置页顶部显示
+    // 醒目横幅（首次启动也据此自动弹出设置窗引导安装——ui.rs 启动引导与本站同口径）。
     in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
@@ -1339,6 +1340,7 @@ export component SettingsWindow inherits Window {
     property <int> missing-deps: (root.claude-installed ? 0 : 1)
         + (root.codex-ok ? 0 : 1)
         + (root.pi-installed ? 0 : 1)
+        + (root.acp-adapters-installed ? 0 : 1)
         + (root.node-installed ? 0 : 1)
         + (root.python-installed ? 0 : 1)
         + (root.lark-installed ? 0 : 1)
@@ -2256,7 +2258,7 @@ export component SettingsWindow inherits Window {
                                         padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
                                         spacing: 8px;
                                         Text {
-                                            text: "⚠️ 未检测到 Claude Code / Codex CLI：机器人收到消息后将无法处理。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
+                                            text: "⚠️ 缺少 Claude Code / Codex CLI / Pi 或 ACP 适配器：机器人收到消息后将无法处理。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
                                             color: UiTokens.warn;
                                             wrap: word-wrap;
                                             vertical-alignment: center;
