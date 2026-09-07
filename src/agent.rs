@@ -391,6 +391,13 @@ pub(crate) fn codex_acp_env(p: &crate::config::ProviderConfig) -> Vec<(String, S
     ]
 }
 
+/// 生效供应商是否「可用」：存在且 API Key 非空。空 key 的供应商一路放行到
+/// agent 只会得到 `Missing environment variable: AGENT_BRIDGE_MODEL_KEY` 这类
+/// 内部错误（Windows 实机）——硬闸在进 agent 前拒答并引导补填。
+pub(crate) fn provider_ready(p: Option<&crate::config::ProviderConfig>) -> bool {
+    p.is_some_and(|p| !p.api_key.trim().is_empty())
+}
+
 /// 由（后端, 供应商）算出注入产物。供应商为 None → Err 硬闸（所有 CLI 后端一律
 /// 要求桥内供应商，拒答文案见 [`provider_missing_msg`]）。
 /// 类型与后端不匹配 → Err（用户可见）。
@@ -400,6 +407,12 @@ pub(crate) fn build_injection(
 ) -> Result<Injection, String> {
     use crate::config::ProviderConfig as P;
     let no_args = Vec::new();
+    // 空 API Key 与「无供应商」同闸（文案同 provider_missing_msg——补填 key 即可）：
+    // 放行的话 agent 侧只会报 `Missing environment variable: AGENT_BRIDGE_MODEL_KEY`
+    // 这类内部错误（Windows 实机），用户无从下手。None 仍由各后端 None 臂给同款文案。
+    if provider.is_some_and(|p| p.api_key.trim().is_empty()) {
+        return Err(provider_missing_msg(backend.name()));
+    }
     match (backend, provider) {
         // ── buzz 后端：供应商 env 经 buzz_provider_env 装配（当前调用方在
         // service 装配 harness 处，见 init_buzz_harness；此处保留供同源调用）──

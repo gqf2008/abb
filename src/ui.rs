@@ -783,6 +783,23 @@ fn bots_struct_sig(c: &Config) -> String {
             )
         })
         .collect();
+    // 供应商入签名：harness 的供应商 env 是 service 启动快照（resolve_adapter/
+    // env_for 装配时读盘），GUI 改供应商（含补填 API Key）后必须重启才生效——
+    // Windows 实机：空 key 补填后不重启 → codex 持续报
+    // `Missing environment variable: AGENT_BRIDGE_MODEL_KEY`。api_key 以 sha256
+    // 摘要入签名（明文 key 绝不进字符串，它可能被日志/UI 侧读到）。
+    use sha2::Digest as _;
+    for pr in &c.providers {
+        let key_hash: String = sha2::Sha256::digest(pr.api_key.as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        parts.push(format!(
+            "prov|{}|{}|{}|{}|{}",
+            pr.name, pr.kind, pr.base_url, pr.model, key_hash
+        ));
+    }
     parts.sort();
     parts.join(";")
 }
@@ -5439,6 +5456,44 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bots_struct_sig_covers_providers() {
+        // harness 供应商 env 是启动快照 → 改供应商必须翻签名触发 svc_restart
+        //（Windows 实机：补填 API Key 后不重启，codex 持续 Missing env 报错）
+        let mut c = Config::default();
+        c.providers = vec![crate::config::ProviderConfig {
+            name: "ds".into(),
+            kind: "openai-chat".into(),
+            base_url: "https://api.deepseek.com".into(),
+            api_key: "sk-a".into(),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        }];
+        let s1 = bots_struct_sig(&c);
+        // ① 改 key → 翻签名
+        c.providers[0].api_key = "sk-b".into();
+        let s2 = bots_struct_sig(&c);
+        assert_ne!(s1, s2, "改 API Key 必须翻签名（触发 service 重启）");
+        // ② 明文 key 绝不出现在签名串里
+        assert!(
+            !s1.contains("sk-a") && !s2.contains("sk-b"),
+            "签名须用 key 摘要"
+        );
+        // ③ 供应商声明顺序无关（签名排序）
+        let mut d = c.clone();
+        d.providers.insert(
+            0,
+            crate::config::ProviderConfig {
+                name: "anth".into(),
+                kind: "anthropic".into(),
+                ..Default::default()
+            },
+        );
+        let mut e = c.clone();
+        e.providers.push(d.providers[0].clone());
+        assert_eq!(bots_struct_sig(&d), bots_struct_sig(&e), "顺序无关");
+    }
 
     #[test]
     fn team_plan_rows_flattens_roles() {
