@@ -846,6 +846,8 @@ mod tests {
         fail_thread_reply: Mutex<Option<String>>,
         /// done 回执收集（W2 补发补 DONE 断言用；实时路径 handle 尾部也会调）。
         done: Mutex<Vec<String>>,
+        /// typing 表情调用记录（爆发消息单 typing 复用断言用）。
+        typings: Mutex<Vec<String>>,
         /// 群资料（#75 注入测试）：None=查不到（默认）。
         chat_info: Mutex<Option<(String, String)>>,
         /// #124 一键创建团队：已建群名（create_chat 成功记录）。
@@ -865,6 +867,7 @@ mod tests {
                 chat_info: Mutex::new(None),
                 created: Mutex::new(Vec::new()),
                 fail_create: Mutex::new(None),
+                typings: Mutex::new(Vec::new()),
             }
         }
         fn set_fail_create(&self, role: &str) {
@@ -881,6 +884,9 @@ mod tests {
         }
         fn done_calls(&self) -> Vec<String> {
             self.done.lock().unwrap().clone()
+        }
+        fn typing_calls(&self) -> Vec<String> {
+            self.typings.lock().unwrap().clone()
         }
         fn set_quoted(&self, message_id: &str, text: &str) {
             self.quoted.lock().unwrap().insert(
@@ -930,6 +936,10 @@ mod tests {
                 }
             }
             self.send_text(chat_id, text).await
+        }
+        async fn typing(&self, message_id: &str) -> Option<String> {
+            self.typings.lock().unwrap().push(message_id.to_string());
+            Some(format!("rid-{message_id}"))
         }
         async fn done(&self, message_id: &str) {
             self.done.lock().unwrap().push(message_id.to_string());
@@ -3931,6 +3941,52 @@ mod tests {
                 .any(|m| m.contains("已登记的虚拟 Bot 群")),
             "不应产生登记门槛拒答: {:?}",
             msgr.sent()
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// 爆发消息（同频道在途回合期间连发多条）：typing 只打一次（首条），
+    /// 回合完成时 del_typing + done 都落在首条消息上——不再每条各挂一个
+    /// typing、完成只撤最后一条（实机复现的表情泄漏/错位）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn burst_reuses_single_typing_and_done_on_first() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (buzz, handles) = make_test_harness(rec.clone(), &registry);
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("claude"),
+            Some((buzz.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+        let chat = format!("oc_burst_{}", uuid::Uuid::new_v4());
+        // 连发三条（首条触发 harness 冷启动，二三条必然落在在途回合窗口内）
+        bridge.handle(test_ev("mb1", &chat, "第一条")).await;
+        bridge.handle(test_ev("mb2", &chat, "第二条")).await;
+        bridge.handle(test_ev("mb3", &chat, "第三条")).await;
+        // 等回复（合并回合一次投递）
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !msgr.sent().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "回复 10s 未到达（burst 被卡）"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // typing 只打一次且落在首条；done 也落在首条
+        assert_eq!(msgr.typing_calls(), vec!["mb1"], "typing 应只在首条打一次");
+        assert_eq!(
+            msgr.done_calls(),
+            vec!["mb1"],
+            "done 应落在 typing 所在的首条"
         );
         cleanup_bridge(&bridge);
     }

@@ -35,6 +35,11 @@ pub(crate) struct TurnEntry {
     /// 「处理中」表情回执 id（dispatch 时打 typing 记下，回复投递时 del_typing）。
     /// 表情对齐 CLI 语义：收到→打字表情、结束→✅。
     pub typing_rid: Option<String>,
+    /// typing 表情所在的用户消息 mid。爆发消息合并在途回合时 typing 只打在
+    /// 首条消息上（复用其 rid，见 virtualbot dispatch），而 `mid` 是回合登记
+    /// 锚（末条）——del_typing/done 必须用 typing_mid，否则会去末条消息上撤
+    /// 首条消息的表情 id（对不上，首条 typing 永久泄漏）。
+    pub typing_mid: Option<String>,
 }
 
 impl Bridge {
@@ -152,8 +157,11 @@ impl Bridge {
                 // dispatch 时登记（回合异步跑，「处理中」表情从收到挂到回复到达）。
                 // 登记缺失兜底（无 mid）无从回执，跳过。
                 if let Some(e) = entry.as_ref() {
-                    self.msgr.del_typing(&e.mid, e.typing_rid.clone()).await;
-                    self.msgr.done(&e.mid).await;
+                    // 表情回执落在 typing 所在的消息上（首条），不是回合登记锚
+                    // （末条）——见 TurnEntry.typing_mid。
+                    let emoji_mid = e.typing_mid.as_deref().unwrap_or(&e.mid);
+                    self.msgr.del_typing(emoji_mid, e.typing_rid.clone()).await;
+                    self.msgr.done(emoji_mid).await;
                 }
                 crate::log!(
                     "[bridge] buzz 回复已投递{} chat={} 长度={}",
