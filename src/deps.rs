@@ -1595,11 +1595,14 @@ mod tests {
         let perms = detect_permissions();
         #[cfg(target_os = "macos")]
         {
-            assert_eq!(perms.len(), 6);
+            // 8 项：辅助功能与输入监控分开展示（#129 锁屏按键注入需要两枚 TCC 权限）
+            assert_eq!(perms.len(), 8);
             let ids: Vec<&str> = perms.iter().map(|p| p.id).collect();
             for want in [
                 "full-disk",
                 "accessibility",
+                "post-event",
+                "listen-event",
                 "screen",
                 "automation",
                 "camera",

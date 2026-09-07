@@ -346,9 +346,6 @@ pub(crate) fn buzz_provider_env(
     Ok(Some(env))
 }
 
-/// 由（后端, 供应商）算出注入产物。供应商为 None → Err 硬闸（所有 CLI 后端一律
-/// 要求桥内供应商，拒答文案见 [`provider_missing_msg`]）。
-/// 类型与后端不匹配 → Err（用户可见）。供应商为 None → 旧行为回落。
 /// codex-acp（ACP 单轨）的供应商 env：`CODEX_CONFIG`（会话配置 JSON，inline
 /// `model_providers.agent_bridge`，零文件写入）+ `MODEL_PROVIDER` + key env。
 ///
@@ -394,6 +391,9 @@ pub(crate) fn codex_acp_env(p: &crate::config::ProviderConfig) -> Vec<(String, S
     ]
 }
 
+/// 由（后端, 供应商）算出注入产物。供应商为 None → Err 硬闸（所有 CLI 后端一律
+/// 要求桥内供应商，拒答文案见 [`provider_missing_msg`]）。
+/// 类型与后端不匹配 → Err（用户可见）。
 pub(crate) fn build_injection(
     backend: Backend,
     provider: Option<&crate::config::ProviderConfig>,
