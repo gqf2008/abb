@@ -2560,7 +2560,9 @@ async fn finite_round_cap_still_binds_without_a_context_overflow() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"drive a tool call"}]}),
         )
         .await;
-    let r0 = h.recv_until(|v| v["id"] == json!(p0)).await;
+    // dev__shell 现为真实内置工具：approving 接收器代答权限，让调用真正执行
+    //（工具存在与否不影响本测试断言的回合上限语义）。
+    let r0 = h.recv_until_approving(|v| v["id"] == json!(p0)).await;
     assert_eq!(
         r0["result"]["stopReason"],
         "max_turn_requests",

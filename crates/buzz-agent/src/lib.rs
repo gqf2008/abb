@@ -4,6 +4,7 @@ pub mod auth;
 mod builtin;
 pub mod catalog;
 pub mod config;
+mod devtools;
 mod handoff;
 mod hints;
 mod llm;
