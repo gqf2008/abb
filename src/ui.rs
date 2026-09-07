@@ -800,6 +800,13 @@ fn bots_struct_sig(c: &Config) -> String {
             pr.name, pr.kind, pr.base_url, pr.model, key_hash
         ));
     }
+    // 路由变更同样入签名：resolve_provider 每消息热读、harness env 是启动快照——
+    // 只改「用哪个供应商」（bot.provider / default_provider）而供应商本体没动时，
+    // 不重启就会继续拿旧供应商的 base_url/key 跑（与空 key 补填同型的快照-热读分叉）。
+    parts.push(format!("prov|route|{}", c.default_provider));
+    for b in &c.bots {
+        parts.push(format!("prov|route|{}|{}", b.key(), b.provider));
+    }
     parts.sort();
     parts.join(";")
 }
@@ -5475,6 +5482,28 @@ mod tests {
         c.providers[0].api_key = "sk-b".into();
         let s2 = bots_struct_sig(&c);
         assert_ne!(s1, s2, "改 API Key 必须翻签名（触发 service 重启）");
+        // ①b 改默认供应商指向 → 也翻签名（harness env 快照不热读，路由变更须重启）
+        let mut r = c.clone();
+        r.default_provider = "other-vendor".into();
+        assert_ne!(
+            bots_struct_sig(&c),
+            bots_struct_sig(&r),
+            "改默认供应商指向必须翻签名"
+        );
+        // ①c bot 级 provider 指向变更 → 翻签名
+        let mut r2 = c.clone();
+        r2.bots = vec![crate::config::BotConfig {
+            name: "bot1".into(),
+            provider: "ds".into(),
+            ..Default::default()
+        }];
+        let mut r3 = r2.clone();
+        r3.bots[0].provider = "other".into();
+        assert_ne!(
+            bots_struct_sig(&r2),
+            bots_struct_sig(&r3),
+            "bot 改供应商指向必须翻签名"
+        );
         // ② 明文 key 绝不出现在签名串里
         assert!(
             !s1.contains("sk-a") && !s2.contains("sk-b"),
