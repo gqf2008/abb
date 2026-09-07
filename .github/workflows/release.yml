@@ -75,10 +75,16 @@ jobs:
           cp crates/buzz-agent/LICENSE ABB.app/Contents/Resources/buzz-LICENSE.txt
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
-          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
-          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
-          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
-          codesign --force --options runtime --timestamp --sign "$IDENTITY" ABB.app
+          # #251：--options runtime（hardened runtime）必须与 --entitlements 配套——
+          # 缺 camera/audio-input/apple-events entitlement 时 tccd 对摄像头/麦克风
+          # 直接 deny 且不允许弹窗。主可执行与 bundle 双层都带（codesign 对 bundle
+          # 的 entitlements 不会从内层继承；TCC 责任进程链在 macOS 各版本上取
+          # 主可执行与 bundle 签名不一，双层带最稳）。
+          ENT="app-assets/abb.entitlements"
+          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
+          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
+          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
+          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
 
       - name: Notarize + staple app

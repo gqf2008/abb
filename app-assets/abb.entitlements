@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- #251 hardened runtime 下缺这些 entitlement，tccd 对摄像头/麦克风直接
+       deny 且不允许弹窗（Policy disallows prompt for hardened runtime）。
+       ABB 非沙盒 app：不加 com.apple.security.app-sandbox，普通文件访问走
+       TCC（用户手动授权，环境页已有引导）。 -->
+  <key>com.apple.security.device.camera</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <!-- AppleEvents（automation）：osascript/自动化控制需此 entitlement 才能弹窗授权 -->
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>

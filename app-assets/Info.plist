@@ -13,5 +13,14 @@
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <!-- #251 TCC 用途文案：agent 子进程（ffmpeg/语音链路）访问相机/麦克风/AppleEvents
+       时系统弹窗展示的说明；hardened runtime 下须与 abb.entitlements 配套，
+       缺 entitlement 则 tccd 直接 deny 且不弹窗（#251 根因）。 -->
+  <key>NSCameraUsageDescription</key>
+  <string>ABB 的机器人技能（拍照、视觉理解）需要访问摄像头。</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>ABB 的机器人技能（语音识别、录音）需要访问麦克风。</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>ABB 需要自动化控制本机应用（锁屏辅助、剪贴板与系统集成）。</string>
 </dict>
 </plist>
