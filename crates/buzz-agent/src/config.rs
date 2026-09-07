@@ -595,6 +595,9 @@ pub struct Config {
     /// all end-turn objections — at the default 3 both reminders fit; at 1 only
     /// one does; at 0 the guard is off with the hooks.
     pub require_reply: bool,
+    /// 内置 dev 工具（dev__shell/read/write/ls/glob，进程内执行，不经 MCP）。
+    /// 默认开；`BUZZ_AGENT_DEV_TOOLS=0` 关闭整套工具。
+    pub dev_tools: bool,
     /// Hook server allowlist. See [`HookServers`] for variant semantics.
     /// Default (env unset/empty) is `None` — hooks are off unless the
     /// operator explicitly opts in.
@@ -735,6 +738,7 @@ impl Config {
             hook_timeout: Duration::from_millis(parse_env("BUZZ_AGENT_HOOK_TIMEOUT_MS", 2500u64)?),
             stop_max_rejections: parse_env("BUZZ_AGENT_STOP_MAX_REJECTIONS", 3u32)?,
             require_reply: parse_env("BUZZ_AGENT_REQUIRE_REPLY", 0u8)? != 0,
+            dev_tools: parse_env("BUZZ_AGENT_DEV_TOOLS", 1u8)? != 0,
             hook_servers: parse_hook_servers_env("MCP_HOOK_SERVERS"),
             databricks_model_filter: DatabricksModelFilter::parse(
                 env("DATABRICKS_MODEL_FILTER").as_deref(),
@@ -791,6 +795,7 @@ impl Config {
             hook_timeout: Duration::from_secs(1),
             stop_max_rejections: 0,
             require_reply: false,
+            dev_tools: false,
             hook_servers: HookServers::None,
             databricks_model_filter,
             hints_enabled: false,

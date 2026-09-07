@@ -2598,6 +2598,7 @@ mod tests {
             hook_timeout: Duration::from_secs(1),
             stop_max_rejections: 0,
             require_reply: false,
+            dev_tools: false,
             hook_servers: HookServers::None,
             databricks_model_filter: None,
             api_key: "key".into(),

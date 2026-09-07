@@ -36,7 +36,7 @@ pub struct ResultBudget {
     pub text: usize,
 }
 
-const PASSTHROUGH_ENV: &[&str] = &[
+pub(crate) const PASSTHROUGH_ENV: &[&str] = &[
     // Core
     "PATH",
     "HOME",
@@ -102,8 +102,9 @@ const PASSTHROUGH_ENV_WINDOWS: &[&str] = &["TMP", "TEMP", "USERPROFILE", "APPDAT
 
 /// Environment retained by `spawn_one()` after `env_clear()` on Windows.
 /// Shell resolver keys are shared with Doctor through the public contract.
+/// Built-in dev tools（devtools::run_shell）复用同一白名单——供应商 key 不进子进程。
 #[cfg(windows)]
-fn windows_child_passthrough_env() -> impl Iterator<Item = &'static str> {
+pub(crate) fn windows_child_passthrough_env() -> impl Iterator<Item = &'static str> {
     PASSTHROUGH_ENV_WINDOWS
         .iter()
         .copied()
@@ -181,15 +182,18 @@ fn check_restart_state(server: &Server, max_attempts: u32) -> Result<RestartChec
     }
 }
 
-struct Entry {
-    server_idx: usize,
-    bare: String,
+/// 工具路由表项：MCP 服务器进程工具，或进程内内置工具（devtools，无子进程）。
+enum Entry {
+    Mcp { server_idx: usize, bare: String },
+    Builtin { tool: crate::devtools::Tool },
 }
 
 pub struct McpRegistry {
     by_qname: HashMap<String, Entry>,
     defs: Vec<ToolDef>,
     servers: Vec<Arc<Server>>,
+    /// 会话工作区（session/new 的 cwd）——内置工具的运行/限定目录。
+    cwd: String,
     max_attempts: u32,
     backoff_base: Duration,
     backoff_max: Duration,
@@ -214,7 +218,7 @@ impl McpRegistry {
             by_qname: HashMap::new(),
             defs: Vec::new(),
             servers: Vec::new(),
-
+            cwd: cwd.to_owned(),
             max_attempts: cfg.mcp_max_restart_attempts.max(1),
             backoff_base: Duration::from_millis(cfg.mcp_restart_base_ms.max(1)),
             backoff_max: Duration::from_millis(cfg.mcp_restart_max_ms.max(1)),
@@ -287,16 +291,34 @@ impl McpRegistry {
                     ),
                     input_schema: cap_schema(&qname, Value::Object((*t.input_schema).clone())),
                 });
-                reg.by_qname.insert(qname, Entry { server_idx, bare });
+                reg.by_qname.insert(qname, Entry::Mcp { server_idx, bare });
+            }
+        }
+
+        // 内置 dev 工具（shell/read/write/ls/glob，进程内执行）：挂在 "dev"
+        // 伪服务器命名空间下，与 MCP 工具同权限/取消/结果回填链路。默认开，
+        // BUZZ_AGENT_DEV_TOOLS=0 关闭。
+        if cfg.dev_tools {
+            for (tool, def) in crate::devtools::defs() {
+                if reg.defs.len() >= MAX_TOOLS_PER_SESSION {
+                    return Err(AgentError::Mcp(format!(
+                        "too many tools (>{MAX_TOOLS_PER_SESSION})"
+                    )));
+                }
+                let qname = format!("dev{SEP}{}", def.name);
+                reg.by_qname.insert(qname.clone(), Entry::Builtin { tool });
+                reg.defs.push(ToolDef { name: qname, ..def });
             }
         }
         Ok(reg)
     }
 
     pub fn server_of(&self, qname: &str) -> Option<&str> {
-        self.by_qname
-            .get(qname)
-            .map(|e| self.servers[e.server_idx].name.as_str())
+        match self.by_qname.get(qname) {
+            Some(Entry::Mcp { server_idx, .. }) => Some(self.servers[*server_idx].name.as_str()),
+            Some(Entry::Builtin { .. }) => None,
+            None => None,
+        }
     }
 
     pub fn has(&self, qname: &str) -> bool {
@@ -307,10 +329,11 @@ impl McpRegistry {
     /// with `_`). Used to reject hook calls coming from the LLM path —
     /// hooks are only callable via `call_hooks`.
     pub fn is_hook(&self, qname: &str) -> bool {
-        self.by_qname
-            .get(qname)
-            .map(|e| e.bare.starts_with('_'))
-            .unwrap_or(false)
+        match self.by_qname.get(qname) {
+            Some(Entry::Mcp { bare, .. }) => bare.starts_with('_'),
+            Some(Entry::Builtin { .. }) => false,
+            None => false,
+        }
     }
 
     pub fn tools(&self) -> Vec<ToolDef> {
@@ -321,16 +344,22 @@ impl McpRegistry {
                     Some(e) => e,
                     None => return false,
                 };
-                // Bare names starting with `_` are hooks — invisible to the LLM.
-                if entry.bare.starts_with('_') {
-                    return false;
-                }
-                let server = &self.servers[entry.server_idx];
-                match &**server.client.load() {
-                    ClientState::Healthy { tools, .. } => tools.iter().any(|t| t == &entry.bare),
-                    ClientState::Dead {
-                        attempts, tools, ..
-                    } => *attempts < self.max_attempts && tools.iter().any(|t| t == &entry.bare),
+                match entry {
+                    // Bare names starting with `_` are hooks — invisible to the LLM.
+                    Entry::Mcp { bare, server_idx } => {
+                        if bare.starts_with('_') {
+                            return false;
+                        }
+                        let server = &self.servers[*server_idx];
+                        match &**server.client.load() {
+                            ClientState::Healthy { tools, .. } => tools.iter().any(|t| t == bare),
+                            ClientState::Dead {
+                                attempts, tools, ..
+                            } => *attempts < self.max_attempts && tools.iter().any(|t| t == bare),
+                        }
+                    }
+                    // 内置 dev 工具无进程态：始终可见。
+                    Entry::Builtin { .. } => true,
                 }
             })
             .cloned()
@@ -524,11 +553,20 @@ impl McpRegistry {
             .by_qname
             .get(qname)
             .ok_or_else(|| AgentError::Mcp(format!("unknown tool {qname}")))?;
-        let server = self.servers[entry.server_idx].clone();
+
+        // 内置 dev 工具：进程内执行（无 MCP 往返、无进程健康态）。参数形状
+        // 与权限检查在调用方（execute_parallel）完成，与本路径无关。
+        if let Entry::Builtin { tool } = entry {
+            return crate::devtools::run(*tool, arguments, &self.cwd, provider_id, cancel).await;
+        }
+        let Entry::Mcp { server_idx, bare } = entry else {
+            unreachable!("Entry::Builtin handled above");
+        };
+        let server = self.servers[*server_idx].clone();
 
         let state = server.client.load();
         if let ClientState::Healthy { client, tools, .. } = &**state {
-            if !tools.iter().any(|t| t == &entry.bare) {
+            if !tools.iter().any(|t| t == bare) {
                 return Err(AgentError::Mcp(format!(
                     "tool '{qname}': no longer available; the MCP server restarted with a different tool set."
                 )));
@@ -539,7 +577,7 @@ impl McpRegistry {
                 .do_call(
                     &server,
                     &client,
-                    &entry.bare,
+                    bare,
                     qname,
                     provider_id,
                     arguments,
@@ -554,7 +592,7 @@ impl McpRegistry {
         let state = server.client.load();
         let client = match &**state {
             ClientState::Healthy { client, tools, .. } => {
-                if !tools.iter().any(|t| t == &entry.bare) {
+                if !tools.iter().any(|t| t == bare) {
                     return Err(AgentError::Mcp(format!(
                         "tool '{qname}': no longer available; the MCP server restarted with a different tool set."
                     )));
@@ -572,7 +610,7 @@ impl McpRegistry {
         self.do_call(
             &server,
             &client,
-            &entry.bare,
+            bare,
             qname,
             provider_id,
             arguments,
