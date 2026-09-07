@@ -1636,6 +1636,95 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
+    /// 场景回放（实机 bug：13:51 切 buzz 后端后上下文丢失）：
+    /// 预置「上个进程」持久态（buzz 槽 started=true + marker 同 sid + 历史轮次）
+    /// → 模拟服务重启（新 harness 进程，会话归零）：
+    /// - 无复位（旧行为）：注入闸误判 resume，mock agent 收不到 [历史上下文]
+    /// - service 复位（新行为）：槽位清空 → 首轮注入历史，上下文接续
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn restart_reinjects_history_on_harness_path() {
+        let bot = backend_bot("buzz");
+        let chat = format!("oc_restart_{}", uuid::Uuid::new_v4());
+        // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 buzz 槽）
+        {
+            let sessions = crate::sessions::SessionStore::new("buzz", &bot.key());
+            let sid = sessions.ensure_with_started(&chat).0;
+            assert!(sessions.mark_started_if(&chat, &sid));
+            let hist = crate::history::History::open(&bot.key(), &chat);
+            hist.append_user("old1", "buzz", "重启前聊过：登录偶发 401");
+            hist.append_assistant("old1", "buzz", "根因是 token 缓存竞态");
+            hist.set_marker(&sid, "buzz", false);
+        }
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+
+        // ── 阶段 A：无复位（复现 bug）——started=true 误判 resume，零注入 ──
+        let rec_a = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let reg_a: crate::bridge::BridgeRegistry = Default::default();
+        let (buzz_a, handles_a) = make_test_harness(rec_a.clone(), &reg_a);
+        let (bridge_a, _msgr_a) = build_test_bridge_full(
+            runner.clone(),
+            bot.clone(),
+            Some((buzz_a.clone(), handles_a)),
+        );
+        reg_a.register(&bridge_a.bot.key(), &bridge_a);
+        bridge_a.handle(test_ev("ma", &chat, "接着修")).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let prompts_a = loop {
+            let p = read_prompts(&rec_a);
+            if !p.is_empty() {
+                break p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "阶段 A prompt 10s 未到达"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            !prompts_a[0].contains("[历史上下文]"),
+            "无复位时不得注入（复现旧 bug 路径）: {}",
+            prompts_a[0]
+        );
+
+        // ── 阶段 B：service 复位（修复）——首轮注入历史 ──
+        let rec_b = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let reg_b: crate::bridge::BridgeRegistry = Default::default();
+        let (buzz_b, handles_b) = make_test_harness(rec_b.clone(), &reg_b);
+        let (bridge_b, _msgr_b) = build_test_bridge_full(
+            runner.clone(),
+            bot.clone(),
+            Some((buzz_b.clone(), handles_b)),
+        );
+        // 生产路径 service.rs 在 Bridge 构建后同款调用
+        bridge_b.sessions.reset_slots_for_service_start();
+        reg_b.register(&bridge_b.bot.key(), &bridge_b);
+        bridge_b.handle(test_ev("mb", &chat, "接着修")).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let prompts_b = loop {
+            let p = read_prompts(&rec_b);
+            if !p.is_empty() {
+                break p;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "阶段 B prompt 10s 未到达"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            prompts_b[0].contains("[历史上下文]"),
+            "复位后重启首轮必须注入历史: {}",
+            prompts_b[0]
+        );
+        assert!(prompts_b[0].contains("重启前聊过：登录偶发 401"));
+        assert!(prompts_b[0].contains("根因是 token 缓存竞态"));
+        cleanup_bridge(&bridge_b);
+    }
+
     /// #130：上下文超长 → 自动压缩（旧段摘要 + 近期原文）→ 换新会话重试一次，
     /// 回复前置压缩提示；原历史保留不删；二次超长（已压缩过）不重复压缩。
     #[tokio::test]
