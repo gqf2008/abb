@@ -35,6 +35,10 @@ pub struct ChatEntry {
     pub codex: Slot,
     #[serde(default, skip_serializing_if = "Slot::is_empty")]
     pub pi: Slot,
+    /// buzz 独立槽位（曾错误借用 claude 槽——切 buzz 后端时继承 claude 的
+    /// started/sid，注入闸误判 resume 跳过历史注入 → 上下文丢失）。
+    #[serde(default, skip_serializing_if = "Slot::is_empty")]
+    pub buzz: Slot,
 }
 
 impl Slot {
@@ -160,6 +164,7 @@ impl SessionStore {
                 !e.claude.session_id.is_empty()
                     || !e.codex.session_id.is_empty()
                     || !e.pi.session_id.is_empty()
+                    || !e.buzz.session_id.is_empty()
             });
             if has_data || m.is_empty() {
                 return Some(m);
@@ -182,6 +187,10 @@ impl SessionStore {
                 entry.codex = slot;
             } else if e.backend.eq_ignore_ascii_case("pi") {
                 entry.pi = slot;
+            } else if e.backend.eq_ignore_ascii_case("buzz")
+                || e.backend.eq_ignore_ascii_case("buzz-agent")
+            {
+                entry.buzz = slot;
             } else if e.backend.eq_ignore_ascii_case("prime-agent") {
                 continue; // #92 收敛：prime-agent 后端下线，旧会话 id 不再可续（不迁移）
             } else {
@@ -217,6 +226,9 @@ impl SessionStore {
             &mut entry.codex
         } else if backend.eq_ignore_ascii_case("pi") {
             &mut entry.pi
+        } else if backend.eq_ignore_ascii_case("buzz") || backend.eq_ignore_ascii_case("buzz-agent")
+        {
+            &mut entry.buzz
         } else {
             &mut entry.claude
         }
@@ -278,6 +290,36 @@ impl SessionStore {
         slot.started = true;
         self.save_locked(&data);
         true
+    }
+
+    /// 服务启动复位：ACP 单轨（harness）时代 agent 会话不跨进程存活——每次
+    /// ABB 重启 = 全部后端 harness 会话归零，盘上持久化的 started/sid 是上个
+    /// 进程的谎言。全部槽位清空后，每个 chat 在新进程的首轮走 !resume → 注入
+    /// 闸（marker 失配）→ 历史注入，上下文跨重启/跨后端衔接（#49 语义）。
+    ///
+    /// 由 service 在 Bridge 构建后调用（bot 级存储）；vb 会话存储在 sessions_for
+    /// 首建实例时同样复位（进程内首次使用 = 服务启动后的首次使用）。
+    pub fn reset_slots_for_service_start(&self) {
+        self.refresh();
+        let mut data = self.data.lock().unwrap();
+        let mut changed = false;
+        for entry in data.values_mut() {
+            for slot in [
+                &mut entry.claude,
+                &mut entry.codex,
+                &mut entry.pi,
+                &mut entry.buzz,
+            ] {
+                if !slot.session_id.is_empty() || slot.started {
+                    slot.session_id.clear();
+                    slot.started = false;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save_locked(&data);
+        }
     }
 
     /// 会话重建：换新 UUID 且复位 started=false，返回新 session_id。
@@ -584,24 +626,67 @@ mod tests {
 
     #[test]
     fn parses_per_backend_format() {
-        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}, "pi": {"session_id": "p-uuid", "started": true}}}"#;
+        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}, "pi": {"session_id": "p-uuid", "started": true}, "buzz": {"session_id": "b-uuid", "started": true}}}"#;
         let m = SessionStore::parse(new).expect("新格式应解析");
         let e = &m["oc_xxx"];
         assert_eq!(e.claude.session_id, "c-uuid");
         assert_eq!(e.codex.session_id, "x-tid");
         assert_eq!(e.pi.session_id, "p-uuid");
         assert!(e.pi.started);
+        assert_eq!(e.buzz.session_id, "b-uuid");
+        assert!(e.buzz.started);
     }
 
     #[test]
     fn backends_are_independent() {
-        // 同一 chat 的 claude/codex/pi 槽位互不干扰（切后端不串）
+        // 同一 chat 的 claude/codex/pi/buzz 槽位互不干扰（切后端不串）
         let new = r#"{"c": {"claude": {"session_id": "claude-uuid", "started": true}}}"#;
         let m = SessionStore::parse(new).unwrap();
         let e = &m["c"];
         assert_eq!(e.claude.session_id, "claude-uuid");
         assert!(e.codex.session_id.is_empty());
         assert!(e.pi.session_id.is_empty());
+        assert!(e.buzz.session_id.is_empty());
+    }
+
+    #[test]
+    fn buzz_slot_isolated_from_claude() {
+        // 回归：buzz 曾错误借用 claude 槽（slot_mut 缺 buzz 臂）——切 buzz 时
+        // 继承 claude 的 started=true，注入闸误判 resume 跳过历史注入。
+        let dir = std::env::temp_dir().join(format!("abb-sessions-buzz-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SessionStore::at("claude", dir.join("sessions.json"));
+        let (sid_c, _) = store.ensure_with_started("oc_x");
+        assert!(store.mark_started_if("oc_x", &sid_c));
+        // buzz 自己的槽位：不继承 claude 的 sid/started
+        let buzz = SessionStore::at("buzz", dir.join("sessions.json"));
+        let (sid_b, started_b) = buzz.ensure_with_started("oc_x");
+        assert_ne!(sid_b, sid_c, "buzz 不得借用 claude 槽位");
+        assert!(
+            !started_b,
+            "buzz 新槽位必须 started=false（首轮注入闸走 !resume）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn service_start_reset_clears_all_slots() {
+        let dir = std::env::temp_dir().join(format!("abb-sessions-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let sid = {
+            let store = SessionStore::at("pi", path.clone());
+            let (sid, _) = store.ensure_with_started("oc_x");
+            assert!(store.mark_started_if("oc_x", &sid));
+            sid
+        };
+        // 模拟服务重启：新实例复位 → 槽位清空
+        let store2 = SessionStore::at("pi", path.clone());
+        store2.reset_slots_for_service_start();
+        let (sid2, started2) = store2.ensure_with_started("oc_x");
+        assert!(!started2, "复位后首轮必须 !resume（注入闸）");
+        assert_ne!(sid2, sid, "复位后 sid 必须换新（marker 失配触发注入）");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

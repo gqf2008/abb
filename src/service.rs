@@ -564,6 +564,10 @@ async fn run_bot(
     let bridge = {
         let mut b = Bridge::new(msgr, bot.clone(), &cfg);
         b.acp_handles = acp_handles; // 全后端句柄集：dispatch 按 bot 生效后端路由
+                                     // ACP 单轨：harness 会话不跨进程存活——每次服务启动即复位全部槽位，
+                                     // 每个 chat 在本进程首轮走注入闸接续历史（否则 started=true 的旧槽位
+                                     // 会让新 harness 会话零上下文，切后端/重启后上下文丢失）。
+        b.sessions.reset_slots_for_service_start();
         Arc::new(b)
     };
     // #206：注册进回合投递路由表（必须在事件循环开始前——dispatch 只能发生在注册后，
