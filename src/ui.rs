@@ -2862,7 +2862,10 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 启动 20s 后静默检查一次更新，之后每 6h 复查（失败静默；有新版本时托盘菜单出现「升级」项）
+    // 启动 20s 后静默检查一次更新，之后每 30min 复查（失败静默；有新版本时托盘菜单出现「升级」项）。
+    // 曾为 6h：检出一次新版本后菜单只剩「升级」动作、无手动重查入口（state=3），
+    // 密集发版日（一天跳 7 级）菜单会在数小时内一直显示旧版本号——30min 让检出
+    // 结果自然刷新（GitHub API 匿名限流 60/h，2 次/h 无压力）。
     {
         let tx2 = tx.clone();
         let t = slint::Timer::default();
@@ -2879,7 +2882,7 @@ pub fn run_gui() -> Result<()> {
         let t6 = slint::Timer::default();
         t6.start(
             slint::TimerMode::Repeated,
-            Duration::from_secs(6 * 3600),
+            Duration::from_secs(30 * 60),
             move || {
                 let _ = tx3.send(UiCmd::CheckUpdate { silent: true });
             },
