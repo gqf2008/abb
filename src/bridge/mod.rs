@@ -1293,6 +1293,7 @@ mod tests {
                             record_file.display().to_string(),
                         ),
                     ],
+                    backend: "mock".to_string(),
                 },
                 crate::tasks::shutdown_token(),
                 std::env::current_dir()

@@ -40,8 +40,8 @@ use crate::buzz::queue::{
 
 /// 回合空闲超时：agent 静默（无 ACP 线活动）这么久判死。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
-/// 单回合硬上限。
-const MAX_TURN_DURATION: Duration = Duration::from_secs(3600);
+/// 单回合硬上限（chat 与 job 同款；job 同步等待预算 = 本值 + 小余量）。
+pub const MAX_TURN_DURATION: Duration = Duration::from_secs(3600);
 /// 崩溃重拉退避：2^level 秒封顶 [`RESPAWN_BACKOFF_MAX_SECS`]。
 const RESPAWN_BACKOFF_BASE_SECS: u64 = 2;
 const RESPAWN_BACKOFF_MAX_SECS: u64 = 60;
@@ -92,6 +92,9 @@ pub struct AgentConfig {
     /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同，
     /// 见 docs/buzz-port-sync.md）。
     pub extra_env: Vec<(String, String)>,
+    /// ABB 后端标识（claude/codex/pi/buzz）——agent 回复尾部标注用
+    ///（多后端热切换下用户可核验路由；与适配器进程身份解耦）。
+    pub backend: String,
 }
 
 /// 出站回合/告示：桥侧消费（写历史 + 发送）。
@@ -891,6 +894,13 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
         PromptOutcome::Ok(_) => {
             let PromptSource::Channel(channel_id) = &result.source;
             if let Some(text) = result.final_text.take() {
+                // 后端标识后缀：每个 agent 回复尾部标注实际后端（chat/job 两
+                // 路径同款；多后端热切换下用户可核验路由）。空文本不加。
+                let text = if text.trim().is_empty() {
+                    text
+                } else {
+                    format!("{text}\n── 后端：{}", handle.cfg.backend)
+                };
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
                 // 同步等待者（job 路径）旁路：文本直接回传，不产生 chat 投递

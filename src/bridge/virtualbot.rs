@@ -547,7 +547,7 @@ impl Bridge {
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
                 Err(BuzzPrecheckFail::BuzzDisabled) => {
-                    Some("buzz 后端未启用（服务未装配 agent，检查默认后端/重启）")
+                    Some("该后端未启用（服务未装配 agent，检查默认后端/重启）")
                 }
                 Err(BuzzPrecheckFail::ChannelUnregistered) => {
                     Some("本会话不是已登记的虚拟 Bot 群；若刚刚登记，频道正在接入，请稍后重试")
@@ -564,22 +564,27 @@ impl Bridge {
                     "供应商类型与当前后端不匹配（claude 需 anthropic 型、codex 需 OpenAI 兼容型）——请在「模型供应商」页为该 bot 选择匹配类型的供应商",
                 ),
                 Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
-                    Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
+                    Some("授权者（受限）会话不可用该后端：guard 权限映射未接线")
                 }
                 Ok(_) => None,
             };
             if let Some(why) = reason {
                 crate::log!(
-                    "[bridge] ⚠️ buzz 路径预检未通过 chat={}: {why}",
+                    "[bridge] ⚠️ {} 路径预检未通过 chat={}: {why}",
+                    backend.name(),
                     trunc(&ev.chat_id, 12)
                 );
                 self.pending.remove(&ev.mid);
                 if let Err(e) = self
-                    .send_reply(&ev, &format!("⚠️ buzz 后端无法处理本条消息：{why}。"))
+                    .send_reply(
+                        &ev,
+                        &format!("⚠️ {} 后端无法处理本条消息：{why}。", backend.name()),
+                    )
                     .await
                 {
                     crate::log!(
-                        "[bridge] ⚠️ buzz 预检失败提示发送失败 chat={}: {e:#}",
+                        "[bridge] ⚠️ {} 预检失败提示发送失败 chat={}: {e:#}",
+                        backend.name(),
                         trunc(&ev.chat_id, 10)
                     );
                 }
@@ -888,7 +893,8 @@ impl Bridge {
             // 「处理中」表情（对齐 CLI 语义）：收到即打，回复投递时撤销+打 ✅。
             let typing_rid = self.msgr.typing(&ev.mid).await;
             crate::log!(
-                "[bridge] buzz 路径：push 进 harness chat={} len={}",
+                "[bridge] {} 路径：push 进 harness chat={} len={}",
+                backend.name(),
                 trunc(&ev.chat_id, 12),
                 prompt.chars().count()
             );
@@ -917,12 +923,16 @@ impl Bridge {
                 if let Err(e) = self
                     .send_reply(
                         &ev,
-                        "⚠️ buzz 后端消息入队失败（harness 已关闭，详见服务日志），请重发或换后端。",
+                        &format!(
+                            "⚠️ {} 后端消息入队失败（harness 已关闭，详见服务日志），请重发或换后端。",
+                            backend.name()
+                        ),
                     )
                     .await
                 {
                     crate::log!(
-                        "[bridge] ⚠️ buzz 未送达报错发送失败 chat={}: {e:#}",
+                        "[bridge] ⚠️ {} 未送达报错发送失败 chat={}: {e:#}",
+                        backend.name(),
                         trunc(&ev.chat_id, 10)
                     );
                 }
