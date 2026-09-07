@@ -329,6 +329,16 @@ pub fn detect_all() -> Vec<DepStatus> {
         codex,
         // pi：npm 全局 bin（~/.npm-global/bin/pi，软链到 pi-coding-agent 的 cli.js）
         probe("pi", "Pi (pi-coding-agent)", &["pi"]),
+        // ACP 适配器（单轨执行层）：harness 按名解析的 npm 全局包。装 agent 本体
+        // 不等于装适配器——缺适配器时该后端预检 AgentDown 拒答（实机：Windows
+        // 新机只有 codex CLI 无 codex-acp，聊天全挂）。
+        probe("pi-acp", "pi ACP 适配器 (pi-acp)", &["pi-acp"]),
+        probe("codex-acp", "codex ACP 适配器 (codex-acp)", &["codex-acp"]),
+        probe(
+            "claude-acp",
+            "claude ACP 适配器 (claude-agent-acp)",
+            &["claude-agent-acp"],
+        ),
         probe("node", "Node.js", &["node"]),
         probe("python3", "Python 3", &["python3", "python"]),
         probe("lark-cli", "lark-cli", &["lark-cli"]),
@@ -498,6 +508,24 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     {
         let plan = match dep_id {
             // claude 官方原生安装器（无需 node），落 ~/.local/bin；回落 npm。
+            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
+            "acp-adapters" => vec![
+                InstallStep::exec(
+                    "npm",
+                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
+                ),
+                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
+                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
+            ],
+            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
+            "acp-adapters" => vec![
+                InstallStep::exec(
+                    "npm",
+                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
+                ),
+                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
+                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
+            ],
             "claude" => vec![
                 InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
@@ -550,6 +578,15 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     #[cfg(target_os = "windows")]
     {
         let plan = match dep_id {
+            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
+            "acp-adapters" => vec![
+                InstallStep::exec(
+                    "npm",
+                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
+                ),
+                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
+                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
+            ],
             "claude" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "@anthropic-ai/claude-code"],
@@ -1550,14 +1587,17 @@ mod tests {
     }
 
     #[test]
-    fn detect_all_covers_eight() {
+    fn detect_all_covers_eleven() {
         let all = detect_all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 11);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
         for want in [
             "claude",
             "codex",
             "pi",
+            "pi-acp",
+            "codex-acp",
+            "claude-acp",
             "node",
             "python3",
             "lark-cli",
@@ -1577,6 +1617,7 @@ mod tests {
         assert!(install_plan("python3").is_ok());
         assert!(install_plan("lark-cli").is_ok());
         assert!(install_plan("dingtalk-cli").is_ok());
+        assert!(install_plan("acp-adapters").is_ok());
         assert!(install_plan("nope").is_err());
     }
 
@@ -1661,7 +1702,7 @@ mod tests {
             .map(|d| dep(d.id, false))
             .collect::<Vec<_>>();
         let ids = missing_dep_ids(&all_missing);
-        assert_eq!(ids.len(), 8, "全缺 → 8 项");
+        assert_eq!(ids.len(), 11, "全缺 → 11 项");
         assert_eq!(ids[0], "node", "node 恒在最前");
         // 部分缺保 detect 序（node 不在缺失集时不插队）
         let partial = vec![

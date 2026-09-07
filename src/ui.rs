@@ -1372,7 +1372,12 @@ fn push_deps_to_window(w: &SettingsWindow) {
     let git_ok = git.map(|d| d.found && d.version_ok).unwrap_or(false);
     // #8 M0：claude/codex/pi 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
     // #93：codex 版本过低同样视为「待处理」——启动引导/横幅继续提示，直到升级到最低锁定版本。
-    w.set_missing_agent(!get("claude") || !codex_ok || !get("pi"));
+    w.set_missing_agent(
+        !get("claude")
+            || !codex_ok
+            || !get("pi")
+            || !(get("pi-acp") && get("codex-acp") && get("claude-acp")),
+    );
     w.set_claude_installed(get("claude"));
     w.set_codex_installed(get("codex"));
     w.set_codex_version(codex_version.into());
@@ -1385,6 +1390,8 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_git_installed(get("git"));
     w.set_git_version(git_version.into());
     w.set_git_ok(git_ok);
+    // ACP 适配器三件套：全部就位才算「已安装」（缺任一则该后端聊天 AgentDown 拒答）
+    w.set_acp_adapters_installed(get("pi-acp") && get("codex-acp") && get("claude-acp"));
     // 主动重新检测/启动 = 新的开始：清掉上次一键安装的失败计数
     //（失败详情 dep-detail 保留到下次安装；AllDone 分支在调用本函数后重新设回）
     w.set_dep_failed_count(0);

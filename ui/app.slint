@@ -1205,6 +1205,8 @@ export component SettingsWindow inherits Window {
     in-out property <bool> git-installed: false;
     in-out property <string> git-version: "";
     in-out property <bool> git-ok: false;
+    // ACP 适配器三件套（claude-agent-acp/codex-acp/pi-acp）全部就位 = true
+    in-out property <bool> acp-adapters-installed: false;
     // claude/codex/pi 任一未装 = true：环境配置页顶部显示醒目横幅（首次启动也据此自动弹出设置窗引导安装）。
     in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
@@ -2428,6 +2430,22 @@ export component SettingsWindow inherits Window {
                                             if !root.dingtalk-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
                                         }
                                         if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
+                                        // ACP 适配器（单轨执行层：claude-agent-acp / codex-acp / pi-acp）——
+                                        // harness 按名解析的 npm 全局包；装 agent 本体不等于装适配器，
+                                        // 缺适配器该后端预检 AgentDown 拒答（一条按钮装三个）
+                                        HorizontalBox {
+                                            height: 34px;
+                                            spacing: 10px;
+                                            Text { text: "ACP 适配器"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
+                                            StatusPill { text: root.acp-adapters-installed ? "已安装" : "未安装"; ok: root.acp-adapters-installed; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            if !root.acp-adapters-installed: PixelButton {
+                                                text: "安装";
+                                                enabled: root.dep-busy == "";
+                                                clicked => { root.install-dep("acp-adapters"); }
+                                            }
+                                        }
+                                        if !root.acp-adapters-installed: Text { text: "npm install -g @agentclientprotocol/claude-agent-acp @agentclientprotocol/codex-acp pi-acp"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // git（#105：删除保护 git 留痕 / tidy 每日整理依赖；最低版本 v2.30）
                                         HorizontalBox {
                                             height: 34px;
