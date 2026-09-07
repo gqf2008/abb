@@ -20,6 +20,9 @@ enum BuzzPrecheckFail {
     /// 未配置模型供应商（生效供应商解析为 None——buzz agent 进程共用一组凭证，
     /// 与 CLI 后端硬闸同源语义；区别仅在 buzz 闸在预检而非 build_injection）
     NoProvider,
+    /// 供应商类型与后端不匹配（如 claude 配 openai 型）——agent 进程起来也无
+    /// 凭据可用，静默吞消息；预检当场拒答引导。
+    KindMismatch,
 }
 
 impl Bridge {
@@ -54,6 +57,20 @@ impl Bridge {
             {
                 return Err(BuzzPrecheckFail::NoProvider);
             }
+            // 供应商类型匹配闸：claude 只吃 anthropic、codex 只吃 openai 型。
+            // 不匹配 = agent 无凭据，当场拒答优于静默吞消息（实机复现）。
+            {
+                let prov = crate::config::Config::provider_for_bot_key_of(
+                    &self.cfg_snapshot,
+                    &self.bot.key(),
+                );
+                if prov
+                    .as_ref()
+                    .is_some_and(|p| crate::agent::build_injection(backend, Some(p)).is_err())
+                {
+                    return Err(BuzzPrecheckFail::KindMismatch);
+                }
+            }
             let cfg = crate::config::Config::load().unwrap_or_default();
             let (peer, _) = crate::ui::resolve_display(&cfg, &self.bot.key(), &ev.sender_id);
             let name = if peer.is_empty() {
@@ -80,6 +97,17 @@ impl Bridge {
             .is_none()
         {
             return Err(BuzzPrecheckFail::NoProvider);
+        }
+        // 供应商类型匹配闸（同 p2p 分支）
+        {
+            let prov =
+                crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key());
+            if prov
+                .as_ref()
+                .is_some_and(|p| crate::agent::build_injection(backend, Some(p)).is_err())
+            {
+                return Err(BuzzPrecheckFail::KindMismatch);
+            }
         }
         // 群根频道名 = 角色名：取虚拟 Bot 登记快照（mtime 懒刷新，与注入判定同源）。
         self.refresh_virtual_bots();
@@ -530,7 +558,10 @@ impl Bridge {
                     Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
                 }
                 Err(BuzzPrecheckFail::NoProvider) => Some(
-                    "未配置模型供应商：buzz agent 进程共用一组凭证，请在 ABB 设置「模型供应商」页配置并保存",
+                    "未配置模型供应商：请在 ABB 设置「模型供应商」页配置并保存",
+                ),
+                Err(BuzzPrecheckFail::KindMismatch) => Some(
+                    "供应商类型与当前后端不匹配（claude 需 anthropic 型、codex 需 OpenAI 兼容型）——请在「模型供应商」页为该 bot 选择匹配类型的供应商",
                 ),
                 Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
                     Some("授权者（受限）会话不可用 buzz 后端：guard 权限映射未接线")
@@ -850,10 +881,12 @@ impl Bridge {
         //   cancel flag（桥无从知道轮次何时在跑）。自然停止词（停/取消/…）维持
         //   按普通消息透传：队列语义下它并入在跑轮次后、随下一轮 steered prompt
         //   一起交 agent（pi-acp 无原生 steer，走 cancel+merge 重跑一轮重提示）。
-        // - typing/DONE 表情不出现：无同步轮次可挂（回复投递路径也不发表情）。
+        // 表情语义与 CLI 对齐：收到打「处理中」（上方），回复投递时撤销+✅。
         // ACP 单轨：有 harness 的后端 push 进对应实例（异步回合）后返回；
         // 无 harness（测试挡板/job 内部）落到下方 spawn 同步路径。
         if let Some(handle) = self.acp_handles.get(backend.name()).cloned() {
+            // 「处理中」表情（对齐 CLI 语义）：收到即打，回复投递时撤销+打 ✅。
+            let typing_rid = self.msgr.typing(&ev.mid).await;
             crate::log!(
                 "[bridge] buzz 路径：push 进 harness chat={} len={}",
                 trunc(&ev.chat_id, 12),
@@ -906,6 +939,7 @@ impl Bridge {
                     mid: ev.mid.clone(),
                     key: key.clone(),
                     epoch: hist_epoch,
+                    typing_rid,
                 },
             );
             // mark_started 是防重复注入的主闸（resume 轮不再注入）；marker 与 CLI
