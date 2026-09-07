@@ -922,8 +922,6 @@ impl Bridge {
         // ACP 单轨：有 harness 的后端 push 进对应实例（异步回合）后返回；
         // 无 harness（测试挡板/job 内部）落到下方 spawn 同步路径。
         if let Some(handle) = self.acp_handles.get(backend.name()).cloned() {
-            // 「处理中」表情（对齐 CLI 语义）：收到即打，回复投递时撤销+打 ✅。
-            let typing_rid = self.msgr.typing(&ev.mid).await;
             crate::log!(
                 "[bridge] {} 路径：push 进 harness chat={} len={}",
                 backend.name(),
@@ -938,6 +936,25 @@ impl Bridge {
                 crate::buzz::keys::topic_channel_uuid(&self.bot.key(), &ev.chat_id, &ev.thread_id)
             })
             .expect("channel_uuid output must parse as Uuid");
+            // 「处理中」表情（对齐 CLI 语义）：**一个在途回合一个 typing**——该
+            // 频道回合表已有登记（上一条消息已打「处理中」，回合尚未结束）时
+            // 复用其 typing_mid/typing_rid、不再打新表情；回合完成时撤的就是
+            // 首条消息上的表情。爆发消息各打一个 typing、完成只撤最后一条 =
+            // 表情泄漏（实机复现：三条连发，第一条/第二条 typing 永久挂着）。
+            let (typing_mid, typing_rid) = {
+                let reuse = {
+                    let reg = self.turn_registry.lock().unwrap();
+                    reg.get(&channel_id)
+                        .map(|e| (e.typing_mid.clone(), e.typing_rid.clone()))
+                };
+                match reuse {
+                    Some((tm, tr)) => (tm, tr),
+                    None => {
+                        let rid = self.msgr.typing(&ev.mid).await;
+                        (Some(ev.mid.clone()), rid)
+                    }
+                }
+            };
             // push 即处理完毕：摘 pending（重启不重放；push-摘除间崩溃 = 重启重放
             // 重复 prompt，at-least-once 语义，可接受）。
             self.pending.remove(&ev.mid);
@@ -982,6 +999,7 @@ impl Bridge {
                     key: key.clone(),
                     epoch: hist_epoch,
                     typing_rid,
+                    typing_mid,
                 },
             );
             // mark_started 是防重复注入的主闸（resume 轮不再注入）；marker 与 CLI
