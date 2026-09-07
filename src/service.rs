@@ -141,6 +141,18 @@ pub async fn run() {
                     .find(|bt| bt.enabled)
                     .and_then(|bt| c.resolve_provider(bt).cloned())
             });
+            // 装配级硬闸：供应商存在但 API Key 为空 → 注入空 env（agent 侧只会报
+            // `Missing environment variable: AGENT_BRIDGE_MODEL_KEY` 内部错误，
+            // Windows 实机），预检已按 NoProvider 拒答引导补填。
+            if let Some(p) = prov.as_ref() {
+                if p.api_key.trim().is_empty() {
+                    crate::log!(
+                        "[acp] {backend} 供应商「{}」未填 API Key，该后端消息将拒答引导",
+                        p.name
+                    );
+                    return Vec::new();
+                }
+            }
             // env 语义按实际 spawn 的 agent 分：
             // - buzz-agent（buzz 后端 / 主适配器缺装回落）：BUZZ_AGENT_PROVIDER +
             //   OPENAI_COMPAT_*（anthropic / openai-chat / openai-responses 全支持，

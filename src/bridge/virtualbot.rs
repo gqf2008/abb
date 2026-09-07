@@ -51,9 +51,10 @@ impl Bridge {
             if !handle.is_agent_available() {
                 return Err(BuzzPrecheckFail::AgentDown);
             }
-            if crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
-                .is_none()
-            {
+            if !crate::agent::provider_ready(
+                crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
+                    .as_ref(),
+            ) {
                 return Err(BuzzPrecheckFail::NoProvider);
             }
             // 供应商类型匹配闸：claude 只吃 anthropic、codex 只吃 openai 型。
@@ -86,9 +87,10 @@ impl Bridge {
         }
         // ④ 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
         // None 时 agent 无凭证可用，拒答并引导配置（每消息热读，与 agent.rs 同款成本）。
-        if crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
-            .is_none()
-        {
+        if !crate::agent::provider_ready(
+            crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
+                .as_ref(),
+        ) {
             return Err(BuzzPrecheckFail::NoProvider);
         }
         // 供应商类型匹配闸（同 p2p 分支）
@@ -586,7 +588,7 @@ impl Bridge {
                     Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
                 }
                 Err(BuzzPrecheckFail::NoProvider) => Some(
-                    "未配置模型供应商：请在 ABB 设置「模型供应商」页配置并保存",
+                    "未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存",
                 ),
                 Err(BuzzPrecheckFail::KindMismatch) => Some(
                     "供应商类型与当前后端不匹配（claude 需 anthropic 型、codex 需 OpenAI 兼容型）——请在「模型供应商」页为该 bot 选择匹配类型的供应商",
