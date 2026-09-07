@@ -349,6 +349,51 @@ pub(crate) fn buzz_provider_env(
 /// 由（后端, 供应商）算出注入产物。供应商为 None → Err 硬闸（所有 CLI 后端一律
 /// 要求桥内供应商，拒答文案见 [`provider_missing_msg`]）。
 /// 类型与后端不匹配 → Err（用户可见）。供应商为 None → 旧行为回落。
+/// codex-acp（ACP 单轨）的供应商 env：`CODEX_CONFIG`（会话配置 JSON，inline
+/// `model_providers.agent_bridge`，零文件写入）+ `MODEL_PROVIDER` + key env。
+///
+/// codex-acp 把 `CODEX_CONFIG` 合并进每次 `session/new` 的会话配置，并在
+/// `thread/start` 用 `MODEL_PROVIDER` 指名 provider——供应商完全经 env 注入
+/// 进子进程，key 只出现在 `AGENT_BRIDGE_MODEL_KEY` env（经 `env_key` 引用），
+/// 绝不进 argv / config 文件。`NO_BROWSER` 隐藏浏览器型 ChatGPT 登录（无头环境
+/// 防弹窗）。形态与 spawn 回退的 `-c` 参数（build_injection Codex 臂）同构。
+pub(crate) fn codex_acp_env(p: &crate::config::ProviderConfig) -> Vec<(String, String)> {
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        "agent_bridge".to_string(),
+        serde_json::json!({
+            "name": p.name,
+            "base_url": p.base_url,
+            "wire_api": "responses",
+            "env_key": CODEX_KEY_ENV,
+        }),
+    );
+    let mut cfg = serde_json::Map::new();
+    cfg.insert(
+        "model_provider".to_string(),
+        serde_json::Value::String("agent_bridge".into()),
+    );
+    cfg.insert(
+        "model_providers".to_string(),
+        serde_json::Value::Object(providers),
+    );
+    if !p.model.is_empty() {
+        cfg.insert(
+            "model".to_string(),
+            serde_json::Value::String(p.model.clone()),
+        );
+    }
+    vec![
+        (
+            "CODEX_CONFIG".to_string(),
+            serde_json::Value::Object(cfg).to_string(),
+        ),
+        ("MODEL_PROVIDER".to_string(), "agent_bridge".into()),
+        ("NO_BROWSER".to_string(), "1".into()),
+        (CODEX_KEY_ENV.to_string(), p.api_key.clone()),
+    ]
+}
+
 pub(crate) fn build_injection(
     backend: Backend,
     provider: Option<&crate::config::ProviderConfig>,
@@ -417,12 +462,12 @@ pub(crate) fn build_injection(
         )),
 
         // ── OpenAI 兼容供应商（chat / responses）──
+        // codex app server ≥1.8.0 只支持 wire_api="responses"（"chat" 已弃用，
+        // 会话创建直接报错）；openai-chat 型供应商（DeepSeek 等）实测 responses
+        // 线可用（2026-09-07 本机 stdio 探针 end_turn）。ACB 单轨 harness 走
+        // codex_acp_env（CODEX_CONFIG env），本臂 -c 参数形态仅供 spawn 回退
+        // / teambuilder 路径。
         (Backend::Codex, Some(p)) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
-            let wire = if p.kind == "openai-chat" {
-                "chat"
-            } else {
-                "responses"
-            };
             let mut args = vec![
                 format!("model_provider={}", toml_str("agent_bridge")),
                 format!("model_providers.agent_bridge.name={}", toml_str(&p.name)),
@@ -430,7 +475,10 @@ pub(crate) fn build_injection(
                     "model_providers.agent_bridge.base_url={}",
                     toml_str(&p.base_url)
                 ),
-                format!("model_providers.agent_bridge.wire_api={}", toml_str(wire)),
+                format!(
+                    "model_providers.agent_bridge.wire_api={}",
+                    toml_str("responses")
+                ),
                 format!(
                     "model_providers.agent_bridge.env_key={}",
                     toml_str(CODEX_KEY_ENV)
@@ -2492,9 +2540,10 @@ mod tests {
         assert!(args
             .iter()
             .any(|a| a == "model_providers.agent_bridge.base_url=\"https://api.example.com/v1\""));
+        // codex app server ≥1.8.0 已弃用 "chat"——openai-chat 供应商也走 responses
         assert!(args
             .iter()
-            .any(|a| a == "model_providers.agent_bridge.wire_api=\"chat\""));
+            .any(|a| a == "model_providers.agent_bridge.wire_api=\"responses\""));
         assert!(args
             .iter()
             .any(|a| a == &format!("model_providers.agent_bridge.env_key=\"{CODEX_KEY_ENV}\"")));
@@ -2502,6 +2551,25 @@ mod tests {
         // api key 走 env，绝不出现在任一 -c 参数里
         assert!(args.iter().all(|a| !a.contains("sk-secret")));
         assert_eq!(inj.env.as_ref().unwrap()[CODEX_KEY_ENV], "sk-secret");
+    }
+
+    #[test]
+    fn codex_acp_env_shape() {
+        // ACP 单轨 harness env：CODEX_CONFIG inline 供应商 + MODEL_PROVIDER + key env
+        let p = prov("deepseek", "openai-chat");
+        let env: std::collections::HashMap<_, _> = codex_acp_env(&p).into_iter().collect();
+        let cfg: serde_json::Value = serde_json::from_str(&env["CODEX_CONFIG"]).unwrap();
+        assert_eq!(cfg["model_provider"], "agent_bridge");
+        let ab = &cfg["model_providers"]["agent_bridge"];
+        assert_eq!(ab["base_url"], "https://api.example.com/v1");
+        assert_eq!(ab["wire_api"], "responses");
+        assert_eq!(ab["env_key"], CODEX_KEY_ENV);
+        assert_eq!(cfg["model"], "some-model");
+        assert_eq!(env["MODEL_PROVIDER"], "agent_bridge");
+        // key 只走 env（env_key 引用），CODEX_CONFIG 里绝无 key 本体
+        assert_eq!(env[CODEX_KEY_ENV], "sk-secret");
+        assert!(!env["CODEX_CONFIG"].contains("sk-secret"));
+        assert_eq!(env["NO_BROWSER"], "1");
     }
 
     #[test]
