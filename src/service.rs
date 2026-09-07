@@ -95,9 +95,11 @@ pub async fn run() {
             });
             // env 语义按 agent 分：
             // - buzz（buzz-agent fork 自有约定）：BUZZ_AGENT_PROVIDER + OPENAI_COMPAT_*
-            // - pi（pi-acp 包装 pi 本尊）：pi 认原生 provider env（ANTHROPIC_API_KEY /
-            //   OPENAI_API_KEY / DEEPSEEK_API_KEY——与 spawn 注入同款 build_injection）
-            // - claude/codex：各自适配器认原生 env
+            // - codex（codex-acp）：CODEX_CONFIG（会话配置 JSON）+ MODEL_PROVIDER
+            //   + key env——适配器只认这三项（见 codex_acp_env）；build_injection
+            //   的 -c 参数形态适配器不消费，走 harness 必须用本分支
+            // - pi/claude：各自适配器认原生 provider env（与 spawn 注入同款
+            //   build_injection env 臂）
             if b.is_buzz() {
                 match crate::agent::buzz_provider_env(prov.as_ref()) {
                     Ok(Some(env)) => env.into_iter().collect(),
@@ -106,6 +108,21 @@ pub async fn run() {
                         crate::log!("[acp] {backend} 供应商 env 装配失败: {e}");
                         Vec::new()
                     }
+                }
+            } else if b == crate::agent::Backend::Codex {
+                match prov.as_ref() {
+                    Some(p) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
+                        crate::agent::codex_acp_env(p)
+                    }
+                    Some(p) => {
+                        crate::log!(
+                            "[acp] codex 供应商「{}」类型不符（{}），该后端消息将拒答引导",
+                            p.name,
+                            p.kind
+                        );
+                        Vec::new()
+                    }
+                    None => Vec::new(), // 硬闸：预检已拒答引导（provider_missing_msg）
                 }
             } else {
                 match crate::agent::build_injection(b, prov.as_ref()) {
@@ -128,6 +145,7 @@ pub async fn run() {
                     .into_iter()
                     .chain(env_for(backend))
                     .collect(),
+                backend: backend.to_string(),
             };
             let stop = crate::tasks::shutdown_token();
             let cwd = std::env::current_dir()
@@ -1215,12 +1233,21 @@ async fn run_job(
                             ts_secs: crate::chrono_lite::unix_secs() as i64,
                             prompt_tag: "job_message".to_string(),
                         },
-                        std::time::Duration::from_secs(60),
+                        // 预算与 chat 回合同款（harness 单回合硬上限 + 余量）：
+                        // 报告类任务实测 3~7 分钟，60s 必超时且回合在途仍会
+                        // 迟发投递（超时文案 + 真回复双发）。
+                        crate::buzz::harness::MAX_TURN_DURATION
+                            + std::time::Duration::from_secs(30),
                     )
                     .await
                 {
                     Some(text) => text,
-                    None => "⏰ 定时任务执行超时（agent 无回复）".to_string(),
+                    None => {
+                        // 超时/句柄关闭：叫停在途回合（防真回复迟发成第二条消息），
+                        // 再落超时文案。
+                        let _ = h.cancel(channel_id).await;
+                        "⏰ 定时任务执行超时（agent 无回复）".to_string()
+                    }
                 }
             }
             None => "⏰ 定时任务执行失败：后端未装配".to_string(),
