@@ -32,6 +32,9 @@ pub(crate) struct TurnEntry {
     /// dispatch 时历史代际快照（history_lock 内取）。回复到达时代际已变 = /new
     /// 清过历史 → 只发不写（孤儿闸，风险④；与 CLI same_session=false 语义一致）。
     pub epoch: u64,
+    /// 「处理中」表情回执 id（dispatch 时打 typing 记下，回复投递时 del_typing）。
+    /// 表情对齐 CLI 语义：收到→打字表情、结束→✅。
+    pub typing_rid: Option<String>,
 }
 
 impl Bridge {
@@ -145,10 +148,11 @@ impl Bridge {
         };
         match send_result {
             Ok(()) => {
-                // 表情回执对齐 CLI 路径：✅ DONE 给用户消息（typing 表情 buzz dispatch
-                // 路径未打——回合异步跑，无「处理中」窗口可挂；done 不缺）。mid 取自
-                // 回合登记；登记缺失兜底（无 mid）无从回执，跳过。
+                // 表情回执对齐 CLI 语义：撤销「处理中」+ 打 ✅。typing_rid 来自
+                // dispatch 时登记（回合异步跑，「处理中」表情从收到挂到回复到达）。
+                // 登记缺失兜底（无 mid）无从回执，跳过。
                 if let Some(e) = entry.as_ref() {
+                    self.msgr.del_typing(&e.mid, e.typing_rid.clone()).await;
                     self.msgr.done(&e.mid).await;
                 }
                 crate::log!(
