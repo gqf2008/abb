@@ -2549,6 +2549,10 @@ async fn finite_round_cap_still_binds_without_a_context_overflow() {
         &[
             ("BUZZ_AGENT_MAX_CONTEXT_TOKENS", "200000"),
             ("BUZZ_AGENT_MAX_ROUNDS", "1"),
+            // dev 工具（dev__shell 等）默认开，会让本测试的 fixture 工具调用
+            // 真实执行并引入权限往返——本测试断言的是回合上限语义，与工具
+            // 无关；关掉后保持纯合成结果路径（recv_until 即可）。
+            ("BUZZ_AGENT_DEV_TOOLS", "0"),
         ],
     )
     .await;
@@ -2560,9 +2564,7 @@ async fn finite_round_cap_still_binds_without_a_context_overflow() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"drive a tool call"}]}),
         )
         .await;
-    // dev__shell 现为真实内置工具：approving 接收器代答权限，让调用真正执行
-    //（工具存在与否不影响本测试断言的回合上限语义）。
-    let r0 = h.recv_until_approving(|v| v["id"] == json!(p0)).await;
+    let r0 = h.recv_until(|v| v["id"] == json!(p0)).await;
     assert_eq!(
         r0["result"]["stopReason"],
         "max_turn_requests",
