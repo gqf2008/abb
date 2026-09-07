@@ -894,6 +894,12 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
         PromptOutcome::Ok(_) => {
             let PromptSource::Channel(channel_id) = &result.source;
             if let Some(text) = result.final_text.take() {
+                // 技能路径归一化：模型被问技能时会把 pi 自带系统提示里的
+                // available_skills 段整段照抄（含全路径目录）——用户消息级的
+                //「不贴路径」指令压不住 pi 原生提示（探针实证）。这里把「整行
+                // 恰好是技能路径」的行改写成技能名，其余行一律不动（窄模式：
+                // 只有纯路径行会命中，正常提及路径的叙述不受影响）。
+                let text = redact_skill_paths(&text);
                 // 后端标识后缀：每个 agent 回复尾部标注实际后端（chat/job 两
                 // 路径同款；多后端热切换下用户可核验路由）。空文本不加。
                 let text = if text.trim().is_empty() {
@@ -1175,5 +1181,77 @@ async fn shutdown(l: &mut Loop) {
             agent.acp.shutdown().await;
             tracing::debug!(agent = agent.index, "reaped idle agent on shutdown");
         }
+    }
+}
+
+/// 技能路径行归一化：`- /…/<name>/SKILL.md` → `- <name>`（仅当「整行恰好是
+/// 一个技能路径（可带列表符号）」时改写；其余行——包括叙述里顺带提到的路径——
+/// 一律不动）。用于模型照抄系统提示 available_skills 段（含全路径目录）时的
+/// 回复净化；技能名含空格/斜杠等非标识符形态时跳过（保守）。
+fn redact_skill_paths(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            let (bullet, rest) = if let Some(r) = trimmed.strip_prefix("- ") {
+                ("- ", r)
+            } else if let Some(r) = trimmed.strip_prefix("* ") {
+                ("* ", r)
+            } else if let Some(r) = trimmed.strip_prefix("• ") {
+                ("• ", r)
+            } else {
+                ("", trimmed)
+            };
+            let Some(stripped) = rest.strip_suffix("/SKILL.md") else {
+                return line.to_string();
+            };
+            if !stripped.starts_with('/') {
+                return line.to_string();
+            }
+            let Some(name) = stripped.rsplit('/').next() else {
+                return line.to_string();
+            };
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+            {
+                return line.to_string();
+            }
+            let indent = &line[..line.len() - trimmed.len()];
+            format!("{indent}{bullet}{name}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_skill_paths;
+
+    #[test]
+    fn rewrites_skill_path_lines_to_names() {
+        let text = "pi v0.84.1\n\n## Skills\n- /Users/sqb/.agents/skills/wx-send/SKILL.md\n* /Users/sqb/.pi/skills/asr/SKILL.md\n/Users/sqb/.agents/skills/meegle/SKILL.md\n\n我有以下技能：";
+        let out = redact_skill_paths(text);
+        assert!(out.contains("- wx-send"));
+        assert!(out.contains("* asr"));
+        assert!(out.contains("\nmeegle\n"));
+        assert!(!out.contains("/SKILL.md"));
+        assert!(out.contains("## Skills"));
+    }
+
+    #[test]
+    fn leaves_narrative_path_mentions_alone() {
+        let text = "我修改了 /Users/sqb/.agents/skills/foo/SKILL.md 这个文件";
+        assert_eq!(redact_skill_paths(text), text);
+    }
+
+    #[test]
+    fn skips_non_identifier_names_and_relative_paths() {
+        // 相对路径不改写（不是系统提示的泄漏形态）
+        let rel = "- ./skills/foo/SKILL.md";
+        assert_eq!(redact_skill_paths(rel), rel);
+        // 技能名带空格（异常形态）保守跳过
+        let weird = "- /Users/x/skills/my skill/SKILL.md";
+        assert_eq!(redact_skill_paths(weird), weird);
     }
 }
