@@ -6,6 +6,50 @@ use crate::bridge::Bridge;
 use crate::config::Config;
 use crate::messenger;
 use std::sync::Arc;
+
+/// 后端 → 主适配器可执行名（buzz 无主适配器，恒 None）。
+fn primary_adapter(backend: &str) -> Option<&'static str> {
+    match backend {
+        "claude" => Some("claude-agent-acp"),
+        "codex" => Some("codex-acp"),
+        "pi" => Some("pi-acp"),
+        _ => None,
+    }
+}
+
+/// 随包 buzz-agent 同目录候选（Windows 包名带 .exe，两个都试；无则 None——
+/// 开发/自签构建不随包）。
+fn bundled_buzz_agent() -> Option<String> {
+    std::env::current_exe().ok().and_then(|me| {
+        let dir = me.parent()?;
+        let plain = dir.join("buzz-agent");
+        if plain.is_file() {
+            Some(plain)
+        } else {
+            let exe = dir.join("buzz-agent.exe");
+            exe.is_file().then_some(exe)
+        }
+        .map(|p| p.display().to_string())
+    })
+}
+
+/// 适配器解析纯函数（单测覆盖）：`(命令, env 是否按 buzz-agent 语义装配)`。
+///
+/// 决议链：主适配器已装 → 原生；否则随包 buzz-agent（永远在的执行层，
+/// 用户决策：缺装不挡聊天）；开发/自签构建无随包 → pi-acp 兜底（装 pi-acp
+/// 的开发机可起；都没有则 spawn 失败 → AgentDown，如实可见）。
+fn resolve_adapter(backend: &str, primary_found: bool, bundled: Option<String>) -> (String, bool) {
+    if let Some(p) = primary_adapter(backend) {
+        if primary_found {
+            return (p.to_string(), false);
+        }
+    }
+    if let Some(cmd) = bundled {
+        return (cmd, true);
+    }
+    ("pi-acp".to_string(), false)
+}
+
 pub async fn run() {
     crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
     let cfg = match Config::load() {
@@ -57,9 +101,10 @@ pub async fn run() {
     // 懒启动。不再按「生效后端=buzz」条件装配——bot 中途切到 buzz（GUI 保存热读）
     // 时 harness 已在，免重启；巡检/预检对非 buzz bot 天然无感。
     // 每后端一个 harness 实例（ACP 适配器 + 该后端供应商 env）——ABB 只面对协议，
-    // 后端差异收敛在适配器命令与 env。命令解析：pi/buzz → buzz-agent（随包 fork）；
-    // claude → claude-agent-acp；codex → codex-acp（npm 全局，缺装时该后端预检报
-    // AgentDown）。env：复用 build_injection 的注入矩阵按后端映射（供应商硬闸同源）。
+    // 后端差异收敛在适配器命令与 env。命令解析见 resolve_adapter：主适配器已装走
+    // 原生（claude→claude-agent-acp、codex→codex-acp、pi→pi-acp），缺装回落随包
+    // buzz-agent（开箱即用），开发/自签构建无随包时 pi-acp 兜底。env 复用
+    // build_injection 的注入矩阵按后端映射（供应商硬闸同源）。
     let buzz_handles: std::collections::HashMap<
         String,
         std::sync::Arc<crate::buzz::harness::BuzzHandle>,
@@ -71,39 +116,22 @@ pub async fn run() {
         // 后自动切回原生）。返回 (命令, 是否回落 buzz-agent)——env 装配按实际
         // spawn 的 agent 语义走（见 env_for）。
         let adapter = |backend: &str| -> (String, bool) {
-            let bundled = || -> Option<String> {
-                // 随包 buzz-agent（同目录规约，与主程序一起分发）。
-                // Windows 包名为 buzz-agent.exe（ISS 同目录打包）——两个候选都试
-                //（旧实现只认无扩展名，Windows 装配回落 pi-acp 实锤失效）。
-                std::env::current_exe().ok().and_then(|me| {
-                    let dir = me.parent()?;
-                    let plain = dir.join("buzz-agent");
-                    if plain.is_file() {
-                        Some(plain)
-                    } else {
-                        let exe = dir.join("buzz-agent.exe");
-                        exe.is_file().then_some(exe)
+            let primary = primary_adapter(backend);
+            let primary_found = primary
+                .map(|p| crate::deps::find_in_path(p).is_some())
+                .unwrap_or(false);
+            let bundled = bundled_buzz_agent();
+            match resolve_adapter(backend, primary_found, bundled) {
+                (cmd, true) if cmd != "pi-acp" => {
+                    if let Some(p) = primary {
+                        crate::log!(
+                            "[acp] {backend} 适配器 {p} 未装（npm 全局缺失），回落随包 buzz-agent"
+                        );
                     }
-                    .map(|p| p.display().to_string())
-                })
-            };
-            let primary = match backend {
-                "claude" => "claude-agent-acp",
-                "codex" => "codex-acp",
-                "pi" => "pi-acp",
-                _ => "", // buzz 后端：无主适配器，直接随包
-            };
-            if primary.is_empty() {
-                return (bundled().unwrap_or_else(|| "buzz-agent".to_string()), true);
+                    (cmd, true)
+                }
+                other => other,
             }
-            if crate::deps::find_in_path(primary).is_some() {
-                return (primary.to_string(), false);
-            }
-            // 主适配器未装 → 回落随包 buzz-agent（不挡聊天；装好适配器后自动切回）
-            crate::log!(
-                "[acp] {backend} 适配器 {primary} 未装（npm 全局缺失），回落随包 buzz-agent"
-            );
-            (bundled().unwrap_or_else(|| primary.to_string()), true)
         };
         let env_for = move |backend: &str, uses_buzz_agent: bool| -> Vec<(String, String)> {
             let b = crate::agent::Backend::parse(backend);
@@ -116,7 +144,8 @@ pub async fn run() {
             // env 语义按实际 spawn 的 agent 分：
             // - buzz-agent（buzz 后端 / 主适配器缺装回落）：BUZZ_AGENT_PROVIDER +
             //   OPENAI_COMPAT_*（anthropic / openai-chat / openai-responses 全支持，
-            //   回落不改变供应商语义）
+            //   回落不改变供应商语义）。装好适配器后 GUI 会重启 service，装配
+            //   重新解析 → 自动切回原生
             // - codex（codex-acp）：CODEX_CONFIG（会话配置 JSON）+ MODEL_PROVIDER
             //   + key env——适配器只认这三项（见 codex_acp_env）；build_injection
             //   的 -c 参数形态适配器不消费，走 harness 必须用本分支
@@ -1355,6 +1384,59 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 适配器决议链（4 后端 × 探测组合）——命令与 env 语义配对是聊天可用性的
+    /// 关键路径，任何配对错误都表现为静默异常（审查 P-1）。
+    #[test]
+    fn resolve_adapter_native_primary_wins() {
+        for backend in ["claude", "codex", "pi"] {
+            let (cmd, buzz_env) = resolve_adapter(backend, true, Some("bundled".into()));
+            assert_eq!(cmd, primary_adapter(backend).unwrap());
+            assert!(!buzz_env, "{backend} 原生适配器不用 buzz env");
+        }
+    }
+
+    #[test]
+    fn resolve_adapter_missing_primary_falls_back_to_bundled() {
+        for backend in ["claude", "codex", "pi"] {
+            let (cmd, buzz_env) = resolve_adapter(backend, false, Some("/app/buzz-agent".into()));
+            assert_eq!(cmd, "/app/buzz-agent");
+            assert!(
+                buzz_env,
+                "{backend} 回落随包 buzz-agent 必须用 buzz env 语义"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_adapter_dev_without_bundle_falls_to_piacp() {
+        // 开发/自签构建无随包：pi-acp 兜底（旧行为）；env 按原生语义（非 buzz）
+        for backend in ["claude", "codex", "pi"] {
+            let (cmd, buzz_env) = resolve_adapter(backend, false, None);
+            assert_eq!(cmd, "pi-acp");
+            assert!(!buzz_env, "{backend} pi-acp 兜底不走 buzz env");
+        }
+    }
+
+    #[test]
+    fn resolve_adapter_buzz_backend() {
+        // buzz 后端无主适配器：随包优先（buzz env），无随包 → pi-acp 兜底
+        let (cmd, buzz_env) = resolve_adapter("buzz", false, Some("bundled".into()));
+        assert_eq!(cmd, "bundled");
+        assert!(buzz_env);
+        let (cmd, buzz_env) = resolve_adapter("buzz", false, None);
+        assert_eq!(cmd, "pi-acp");
+        assert!(!buzz_env, "buzz 后端 pi-acp 兜底按原生语义");
+    }
+
+    #[test]
+    fn primary_adapter_mapping() {
+        assert_eq!(primary_adapter("claude"), Some("claude-agent-acp"));
+        assert_eq!(primary_adapter("codex"), Some("codex-acp"));
+        assert_eq!(primary_adapter("pi"), Some("pi-acp"));
+        assert_eq!(primary_adapter("buzz"), None);
+        assert_eq!(primary_adapter("unknown"), None);
+    }
 
     /// 等待绝不能提前返回进入关闭路径——旧实现把 30s 逐 handle 时限放在服务期，
     /// 健康服务 30s×bot 数后必然自关停（真机 2 bot=60s、实验室 1 bot=30s 重启风暴）。
