@@ -1352,8 +1352,8 @@ fn refresh_owner_code_info(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_grant_code_info(grant_line.into());
 }
 
-/// 跑一次依赖检测并把全部 7 项状态回填到设置窗
-/// （claude/codex/pi/node/python3/lark-cli/dingtalk-cli）。
+/// 跑一次依赖检测并把全部依赖状态回填到设置窗
+/// （claude/codex/pi/node/python3/lark-cli/dingtalk-cli/git + ACP 适配器三件套）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
     let get = |id: &str| {
@@ -2896,9 +2896,11 @@ pub fn run_gui() -> Result<()> {
         );
         std::mem::forget(t6);
     }
-    // #8 M0 自动引导：claude/codex/pi 未安装 → 启动即弹出设置窗。复用托盘打开同一条路径
-    // （load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好 agent 的
-    // 开发者/朋友零打扰（条件不成立）；对新装用户这是「打开就能被引导」的关键一步。
+    // #8 M0 自动引导：claude/codex/pi 未安装（或 ACP 适配器三件套缺任一）→ 启动即弹出
+    // 设置窗。复用托盘打开同一条路径（load_into → 依赖横幅 + 状态行），保证窗口内容
+    // 完整（不只是空窗）。已装好 agent 的开发者/朋友零打扰（条件不成立）；对新装用户
+    // 这是「打开就能被引导」的关键一步。与 push_deps_to_window 的 missing_agent 同口径
+    //（实机：agent 装齐但缺适配器时聊天全挂，同样要引导）。
     {
         let deps = crate::deps::detect_all();
         let missing = |id: &str| {
@@ -2913,10 +2915,14 @@ pub fn run_gui() -> Result<()> {
             .find(|d| d.id == "codex")
             .map(|d| d.found && !d.version_ok)
             .unwrap_or(false);
+        let acp_missing = ["pi-acp", "codex-acp", "claude-acp"]
+            .iter()
+            .any(|id| missing(id));
         if missing("claude")
             || missing("codex")
             || codex_low
             || missing("pi")
+            || acp_missing
             || std::env::args().any(|a| a == "--show-settings")
         {
             let debug_show = std::env::args().any(|a| a == "--show-settings");
@@ -2928,7 +2934,7 @@ pub fn run_gui() -> Result<()> {
             // 调试参数（--show-settings）不设误导的「未检测到」状态行
             if !debug_show {
                 settings.set_status_line(
-                    "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
+                    "⚠️ 缺少 Claude Code / Codex CLI / Pi 或 ACP 适配器：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
                         .into(),
                 );
                 settings.set_status_is_error(true);

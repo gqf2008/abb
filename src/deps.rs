@@ -499,24 +499,42 @@ impl InstallStep {
     }
 }
 
+/// ACP 适配器（单轨执行层）npm 包表：检测键 → npm 包名。
+/// 键必须与 detect_all 的 probe id 一致——run_install 按装后 detect_one(key) 逐键复检。
+/// claude-acp/codex-acp 的包名带 @agentclientprotocol scope（codex-acp 曾误用
+/// @openai/codex-acp 致 npm 404）；pi-acp 为 pi-coding-agent 生态的非 scoped 包。
+const ACP_ADAPTERS: &[(&str, &str)] = &[
+    ("claude-acp", "@agentclientprotocol/claude-agent-acp"),
+    ("codex-acp", "@agentclientprotocol/codex-acp"),
+    ("pi-acp", "pi-acp"),
+];
+
+/// ACP 适配器安装计划（三平台同构：npm 全局装，故在平台分块之前统一出计划，
+/// 不随平台重复三份臂）。单件 id（claude-acp/codex-acp/pi-acp）供一键安装按
+/// 缺失项逐件装；组合 id "acp-adapters" 供环境配置页「一条按钮装三个」。
+fn acp_adapters_plan(dep_id: &str) -> Option<Vec<InstallStep>> {
+    let npm_step = |pkg: &str| InstallStep::exec("npm", &["install", "-g", pkg]);
+    if dep_id == "acp-adapters" {
+        return Some(ACP_ADAPTERS.iter().map(|(_, pkg)| npm_step(pkg)).collect());
+    }
+    ACP_ADAPTERS
+        .iter()
+        .find(|(key, _)| *key == dep_id)
+        .map(|(_, pkg)| vec![npm_step(pkg)])
+}
+
 /// 出某依赖在当前平台的安装步骤序列（顺序执行，前一步失败即中止）。
 /// 不存在的依赖 id / 该平台无法自动装 → Err（用户可见文案）。
 /// （各平台是独立 #[cfg] 块，块内显式 return；clippy 的 needless_return 在此不适用。）
 #[allow(clippy::needless_return)]
 fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
+    if let Some(plan) = acp_adapters_plan(dep_id) {
+        return Ok(plan);
+    }
     #[cfg(target_os = "macos")]
     {
         let plan = match dep_id {
             // claude 官方原生安装器（无需 node），落 ~/.local/bin；回落 npm。
-            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
-            "acp-adapters" => vec![
-                InstallStep::exec(
-                    "npm",
-                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
-                ),
-                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
-                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
-            ],
             "claude" => vec![
                 InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
@@ -569,15 +587,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     #[cfg(target_os = "windows")]
     {
         let plan = match dep_id {
-            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
-            "acp-adapters" => vec![
-                InstallStep::exec(
-                    "npm",
-                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
-                ),
-                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
-                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
-            ],
             "claude" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "@anthropic-ai/claude-code"],
@@ -628,15 +637,6 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let plan = match dep_id {
-            // ACP 适配器三件套（单轨执行层）：npm 全局，一条按钮装三个
-            "acp-adapters" => vec![
-                InstallStep::exec(
-                    "npm",
-                    &["install", "-g", "@agentclientprotocol/claude-agent-acp"],
-                ),
-                InstallStep::exec("npm", &["install", "-g", "@agentclientprotocol/codex-acp"]),
-                InstallStep::exec("npm", &["install", "-g", "pi-acp"]),
-            ],
             "claude" => vec![
                 InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
                 InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
@@ -707,9 +707,18 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
             Ok(tail) => {
                 // 该步退出 0：再确认依赖真的可用了（有些安装器 0 退出但需重开 shell 才上 PATH）。
                 // #93/#105：codex/git 装完还要过最低版本锁（旧版缓存/降级场景少见，但过一下更稳）。
-                let ok_after = detect_one(dep_id)
-                    .map(|d| d.found && !((dep_id == "codex" || dep_id == "git") && !d.version_ok))
-                    .unwrap_or(false);
+                // "acp-adapters" 是组合 id（无单点探测）：逐键复检三个适配器，全中就收。
+                let ok_after = if dep_id == "acp-adapters" {
+                    ACP_ADAPTERS
+                        .iter()
+                        .all(|(key, _)| detect_one(key).map(|d| d.found).unwrap_or(false))
+                } else {
+                    detect_one(dep_id)
+                        .map(|d| {
+                            d.found && !((dep_id == "codex" || dep_id == "git") && !d.version_ok)
+                        })
+                        .unwrap_or(false)
+                };
                 if ok_after {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
                     // #93 登录引导：codex 装完给下一步指引（装完即能用的最后一公里）。
@@ -724,10 +733,15 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
                     }
                     return Ok(tail);
                 }
-                last_err = format!(
-                    "步骤{}跑完但未在 PATH 找到 {dep_id}（可能需重开终端/刷新 PATH）",
-                    i + 1
-                );
+                // 组合 id（acp-adapters）无单点可探测，误报「未在 PATH 找到 acp-adapters」
+                // 会误导用户；其失败文案在循环结束后按缺件点名给出（真实步骤错误仍保留
+                // 在 last_err，供点名文案当上下文）。
+                if dep_id != "acp-adapters" {
+                    last_err = format!(
+                        "步骤{}跑完但未在 PATH 找到 {dep_id}（可能需重开终端/刷新 PATH）",
+                        i + 1
+                    );
+                }
                 crate::log!(
                     "[deps] {dep_id} 步骤{} 退出0但检测不到，尝试回落步骤",
                     i + 1
@@ -738,6 +752,23 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
                 last_err = e;
             }
         }
+    }
+    // "acp-adapters" 是组合 id：本身不出现在 PATH，报错要点名仍缺的适配器
+    //（步骤级 last_err 里的 "未在 PATH 找到 acp-adapters" 会误导用户）。
+    if dep_id == "acp-adapters" {
+        let missing: Vec<&str> = ACP_ADAPTERS
+            .iter()
+            .filter(|(key, _)| !detect_one(key).map(|d| d.found).unwrap_or(false))
+            .map(|(_, pkg)| *pkg)
+            .collect();
+        if missing.is_empty() {
+            // 三个都已装好却走到这：理论上不可达（装好后 ok_after 即返回 Ok），兜底防呆
+            return Ok(String::new());
+        }
+        return Err(format!(
+            "acp-adapters 安装失败：仍缺 {}（{last_err}）",
+            missing.join("、")
+        ));
     }
     Err(format!("{dep_id} 安装失败：{last_err}"))
 }
@@ -1618,7 +1649,30 @@ mod tests {
         assert!(install_plan("lark-cli").is_ok());
         assert!(install_plan("dingtalk-cli").is_ok());
         assert!(install_plan("acp-adapters").is_ok());
+        // 单件臂：一键安装按缺失项逐件装（曾只有组合 id 而 missing 清单给的是单件
+        // id → 一键装永远报「未知依赖」，适配器装不上，见 a3eb382 后续修复）。
+        assert!(install_plan("pi-acp").is_ok());
+        assert!(install_plan("codex-acp").is_ok());
+        assert!(install_plan("claude-acp").is_ok());
         assert!(install_plan("nope").is_err());
+    }
+
+    #[test]
+    fn acp_adapters_plan_aligns_with_probes() {
+        // 组合 id 与单件 id 同表同包；表键必须与 detect_all 的 probe id 对齐
+        //（曾脱节：probe 出 pi-acp/codex-acp/claude-acp，安装计划只认组合 id）。
+        let probe_ids: Vec<&str> = detect_all().iter().map(|d| d.id).collect();
+        for (key, pkg) in ACP_ADAPTERS {
+            assert!(probe_ids.contains(key), "detect_all 缺 probe {key}");
+            let plan = acp_adapters_plan(key).unwrap_or_else(|| panic!("缺单件计划 {key}"));
+            assert_eq!(plan.len(), 1, "{key} 应为单步计划");
+            assert_eq!(plan[0].program, "npm");
+            assert_eq!(plan[0].args, vec!["install", "-g", *pkg]);
+        }
+        let bundle = acp_adapters_plan("acp-adapters").expect("组合计划");
+        assert_eq!(bundle.len(), ACP_ADAPTERS.len());
+        assert!(bundle.iter().all(|s| s.program == "npm"));
+        assert!(acp_adapters_plan("nope").is_none());
     }
 
     #[cfg(target_os = "macos")]
