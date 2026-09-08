@@ -79,6 +79,10 @@ struct App {
 struct Session {
     id: String,
     mcp: Arc<McpRegistry>,
+    /// 会话执行档位（P1.2；P1.3 域校验消费 roots）。注册表按它过滤工具面，
+    /// 这里留存供会话级判定/诊断。
+    #[allow(dead_code)] // P1.3 消费（读域/roots 判定在 devtools 调用侧）
+    sandbox: crate::wire::Sandbox,
     /// Skills discovered at session creation; used by the built-in `load_skill` tool.
     skills: Vec<SkillEntry>,
     history: Vec<HistoryItem>,
@@ -361,6 +365,10 @@ async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSend
                     "loadSession": false,
                     "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
                     "mcpCapabilities": { "http": false, "sse": false },
+                    // ABB 扩展能力位（P2.3 协商依据）：本 fork 认 session/new
+                    // `_meta.sandbox` 并执行档位。旧 fork 无此位 → ABB 对受限
+                    // 会话沿用拒答，绝不"发不出档位就当 FullAccess 放行"。
+                    "_meta": { "abbSandbox": ["read-only", "workspace-write", "full-access"] },
                 },
                 "agentInfo": { "name": "buzz-agent", "version": env!("CARGO_PKG_VERSION") },
             }),
@@ -427,6 +435,16 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             "session/new: cwd must be an absolute path",
         )
         .await;
+    }
+    // P1.1/P1.2：`_meta.sandbox` → 执行档位。缺省/未知值 = FullAccess
+    // （与不发 _meta 的旧客户端字节级同今天）；未知值额外 warn。
+    let raw_sandbox = p.meta.as_ref().and_then(|m| m.sandbox.as_deref());
+    let (sandbox, recognized) = crate::wire::Sandbox::parse_opt(raw_sandbox);
+    if raw_sandbox.is_some() && !recognized {
+        tracing::warn!(
+            "session/new: unknown sandbox mode {:?}, falling back to full-access",
+            raw_sandbox
+        );
     }
     // Check cap without holding lock across MCP spawn (which may be slow).
     {
@@ -521,7 +539,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         }
     };
 
-    let mcp = match McpRegistry::spawn_all(&app.cfg, &p.mcp_servers, &p.cwd).await {
+    let mcp = match McpRegistry::spawn_all(&app.cfg, &p.mcp_servers, &p.cwd, sandbox).await {
         Ok(m) => Arc::new(m),
         Err(e) => return reject(wire_tx, id, e.json_rpc_code(), &e.to_string()).await,
     };
@@ -546,6 +564,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         Session {
             id: session_id.clone(),
             mcp,
+            sandbox,
             skills,
             history: Vec::new(),
             cancel_tx,

@@ -63,6 +63,57 @@ pub struct SessionNewParams {
     pub mcp_servers: Vec<McpServerStdio>,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// ABB 扩展（单后端化 P1.1）：会话执行档位与域根。缺省 = FullAccess，
+    /// 与不发 `_meta` 的旧客户端字节级同今天（回归锁见 wire/mcp 测试）。
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<SessionNewMeta>,
+}
+
+/// `session/new` 的 `_meta` 扩展载荷。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNewMeta {
+    /// "read-only" | "workspace-write" | "full-access"（ABB SandboxMode 同词表）。
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    /// 写/读域根（P1.3 生效）。None = 仅 session cwd。
+    #[serde(default)]
+    pub writable_roots: Option<Vec<String>>,
+}
+
+/// 会话执行档位（`_meta.sandbox` 解析产物）。语义：
+/// - ReadOnly：`dev__write`/`dev__shell` 不进工具表且执行闸拒绝（模型根本看不见）
+/// - WorkspaceWrite：全工具可用，写限定 roots（P1.3 落地域校验）
+/// - FullAccess：今天的无限制行为（缺省值）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+impl Sandbox {
+    /// 宽松解析：未知/缺失值回落 FullAccess 并由调用方 warn（协议噪音绝不
+    /// 挂掉聊天）。词表与 ABB `SandboxMode::as_str` 对齐。
+    pub fn parse_opt(raw: Option<&str>) -> (Self, bool) {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            None => (Self::FullAccess, false),
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "read-only" => (Self::ReadOnly, true),
+                "workspace-write" => (Self::WorkspaceWrite, true),
+                "full-access" => (Self::FullAccess, true),
+                _ => (Self::FullAccess, true),
+            },
+        }
+    }
+
+    pub fn allow_write(self) -> bool {
+        self != Self::ReadOnly
+    }
+
+    pub fn allow_shell(self) -> bool {
+        self != Self::ReadOnly
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,6 +544,58 @@ mod tests {
         let params: SessionNewParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.cwd, "/tmp/test");
         assert!(params.system_prompt.is_none());
+    }
+
+    #[test]
+    fn sandbox_parse_matrix() {
+        use super::Sandbox;
+        // 缺省（旧客户端不发 _meta）= FullAccess（recognized=false → 不 warn）
+        let (sb, rec) = Sandbox::parse_opt(None);
+        assert_eq!(sb, Sandbox::FullAccess);
+        assert!(!rec);
+        let (sb, _) = Sandbox::parse_opt(Some(""));
+        assert_eq!(sb, Sandbox::FullAccess);
+        // 词表与 ABB SandboxMode::as_str 对齐；大小写宽容
+        assert_eq!(
+            Sandbox::parse_opt(Some("read-only")),
+            (Sandbox::ReadOnly, true)
+        );
+        assert_eq!(
+            Sandbox::parse_opt(Some("Workspace-Write")),
+            (Sandbox::WorkspaceWrite, true)
+        );
+        assert_eq!(
+            Sandbox::parse_opt(Some("full-access")),
+            (Sandbox::FullAccess, true)
+        );
+        // 未知值：回落 FullAccess + recognized=true（调用方据此 warn）
+        assert_eq!(
+            Sandbox::parse_opt(Some("ludicrous")),
+            (Sandbox::FullAccess, true)
+        );
+        assert!(!Sandbox::ReadOnly.allow_write());
+        assert!(!Sandbox::ReadOnly.allow_shell());
+        assert!(Sandbox::WorkspaceWrite.allow_write());
+    }
+
+    #[test]
+    fn session_new_accepts_abb_meta_extension() {
+        // `_meta.sandbox`/`writableRoots` 能解；缺 _meta 时字段 None（旧客户端兼容）
+        let p: SessionNewParams = serde_json::from_value(serde_json::json!({"cwd": "/", "_meta": {
+            "sandbox": "read-only", "writableRoots": ["/tmp/x"]
+        }}))
+        .unwrap();
+        assert_eq!(
+            p.meta.as_ref().unwrap().sandbox.as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
+            p.meta.as_ref().unwrap().writable_roots.as_deref(),
+            Some(["/tmp/x".to_string()].as_slice())
+        );
+        let p2: SessionNewParams =
+            serde_json::from_value(serde_json::json!({ "cwd": "/" })).unwrap();
+        assert!(p2.meta.is_none());
     }
 
     #[test]

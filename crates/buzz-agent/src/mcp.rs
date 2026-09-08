@@ -214,6 +214,9 @@ pub struct McpRegistry {
     servers: Vec<Arc<Server>>,
     /// 会话工作区（session/new 的 cwd）——内置工具的运行/限定目录。
     cwd: String,
+    /// 会话执行档位（P1.2）：read-only 档下 dev__write/dev__shell 不进工具表
+    /// 且执行闸双保险拒绝；workspace-write/full-access 工具面一致（域校验 P1.3）。
+    sandbox: crate::wire::Sandbox,
     max_attempts: u32,
     backoff_base: Duration,
     backoff_max: Duration,
@@ -227,6 +230,7 @@ impl McpRegistry {
         cfg: &Config,
         servers: &[McpServerStdio],
         cwd: &str,
+        sandbox: crate::wire::Sandbox,
     ) -> Result<Self, AgentError> {
         if servers.len() > MAX_MCP_SERVERS {
             return Err(AgentError::Mcp(format!(
@@ -239,6 +243,7 @@ impl McpRegistry {
             defs: Vec::new(),
             servers: Vec::new(),
             cwd: cwd.to_owned(),
+            sandbox,
             max_attempts: cfg.mcp_max_restart_attempts.max(1),
             backoff_base: Duration::from_millis(cfg.mcp_restart_base_ms.max(1)),
             backoff_max: Duration::from_millis(cfg.mcp_restart_max_ms.max(1)),
@@ -325,6 +330,13 @@ impl McpRegistry {
         // 此前合法的 124..=128 工具配置整个会话起不来，两者都不可接受。
         if cfg.dev_tools {
             for (tool, def) in crate::devtools::defs() {
+                // P1.2 档位过滤：read-only 下 write/shell 对模型直接不可见
+                // （最强的杠杆是「看不见」而不是「拒绝」）。
+                if (!sandbox.allow_write() && matches!(tool, crate::devtools::Tool::Write))
+                    || (!sandbox.allow_shell() && matches!(tool, crate::devtools::Tool::Shell))
+                {
+                    continue;
+                }
                 if reg.defs.len() >= MAX_TOOLS_PER_SESSION {
                     tracing::warn!(
                         "dev tools: tool budget ({MAX_TOOLS_PER_SESSION}) exhausted after {} MCP tools; \
@@ -595,6 +607,16 @@ impl McpRegistry {
         // MCP 工具同款预算裁边（budget.text/budget.total），保证配置的
         // per-result 文本上限对两类工具一致生效。
         if let Entry::Builtin { tool } = entry {
+            // 双保险执行闸：档位禁的工具即使名字可达（模型幻觉/旧缓存）也拒绝。
+            let denied = (!self.sandbox.allow_write()
+                && matches!(*tool, crate::devtools::Tool::Write))
+                || (!self.sandbox.allow_shell() && matches!(*tool, crate::devtools::Tool::Shell));
+            if denied {
+                return Err(AgentError::Mcp(format!(
+                    "tool '{qname}' is disabled in this session's sandbox mode ({:?})",
+                    self.sandbox
+                )));
+            }
             let mut result =
                 crate::devtools::run(*tool, arguments, &self.cwd, provider_id, cancel).await?;
             clamp_tool_result_text(&mut result, budget);
@@ -1130,6 +1152,73 @@ fn configure_no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use crate::config::Provider;
+    use crate::wire::Sandbox;
+
+    fn cfg_with_dev_tools() -> Config {
+        let mut cfg = Config::for_discovery(
+            Provider::OpenAi,
+            "k".into(),
+            "http://127.0.0.1:1".into(),
+            None,
+        );
+        cfg.dev_tools = true;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn read_only_hides_write_and_shell_from_tool_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cfg = cfg_with_dev_tools();
+        for (sb, shell, write) in [
+            (Sandbox::ReadOnly, false, false),
+            (Sandbox::WorkspaceWrite, true, true),
+            (Sandbox::FullAccess, true, true),
+        ] {
+            let reg = McpRegistry::spawn_all(&cfg, &[], cwd, sb).await.unwrap();
+            let names: Vec<String> = reg.tools().iter().map(|d| d.name.clone()).collect();
+            assert_eq!(
+                names.contains(&"dev__shell".to_string()),
+                shell,
+                "{sb:?}: {names:?}"
+            );
+            assert_eq!(
+                names.contains(&"dev__write".to_string()),
+                write,
+                "{sb:?}: {names:?}"
+            );
+            // 只读档里读类工具仍在（read/ls/glob/load_skill 不受档位影响）
+            assert!(names.contains(&"dev__read".to_string()), "{sb:?}");
+            // 未注册 = 名字不可达（defs 过滤同时摘 by_qname，执行闸是双保险）
+            assert_eq!(reg.has("dev__shell"), shell, "{sb:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_access_surface_identical_to_no_meta_default() {
+        // 回归锁：无 _meta（ABB 侧回落 FullAccess）与显式 full-access 的工具面一致
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cfg = cfg_with_dev_tools();
+        let a = McpRegistry::spawn_all(&cfg, &[], cwd, Sandbox::FullAccess)
+            .await
+            .unwrap();
+        let b = McpRegistry::spawn_all(&cfg, &[], cwd, Sandbox::FullAccess)
+            .await
+            .unwrap();
+        let mut n1: Vec<_> = a.tools().iter().map(|d| d.name.clone()).collect();
+        let mut n2: Vec<_> = b.tools().iter().map(|d| d.name.clone()).collect();
+        n1.sort();
+        n2.sort();
+        assert_eq!(n1, n2);
+        assert_eq!(n1.len(), 5, "dev 五工具（P1.2 前语义）");
+    }
 }
 
 #[cfg(test)]
