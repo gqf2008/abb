@@ -491,8 +491,14 @@ fn xml_unescape(s: &str) -> String {
 /// 自启 plist 的唯一模板（纯函数，便于单测锁 schema）。这些键不是装饰：
 /// `KeepAlive`/`ThrottleInterval` 承载本机实测结论，被人顺手删掉就等于把
 /// 「崩溃不复活」的老毛病改回来，所以有测试断言它们必须存在。
+///
+/// `StandardOutPath`/`StandardErrorPath` 是 GUI 日志的唯一出路：`crate::log!` 只写
+/// stdout（main.rs:147），而 GUI 由 `open`/LaunchServices 起来时 stdio 全指
+/// /dev/null（本机实测 lsof），不重定向就等于什么都不留——`heal_autostart` 这类
+/// 只在 GUI 里跑的诊断信息本来会彻底不可见。现存的 logs/gui.out（8/10 那份手写
+/// plist 留下的）就是这个键的产物，自愈重写 plist 时不能把它弄丢。
 #[cfg(target_os = "macos")]
-fn build_login_plist(exe: &std::path::Path) -> String {
+fn build_login_plist(exe: &std::path::Path, logs: &std::path::Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -513,11 +519,17 @@ fn build_login_plist(exe: &std::path::Path) -> String {
   </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>{out}</string>
+  <key>StandardErrorPath</key>
+  <string>{err}</string>
 </dict>
 </plist>
 "#,
         label = xml_escape(LOGIN_ITEM_LABEL),
         exe = xml_escape(&exe.display().to_string()),
+        out = xml_escape(&logs.join("gui.out").display().to_string()),
+        err = xml_escape(&logs.join("gui.err").display().to_string()),
     )
 }
 
@@ -634,7 +646,10 @@ pub fn set_autostart(enable: bool) -> Result<()> {
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&plist, build_login_plist(&exe))
+    // StandardOutPath 指向的目录必须先在：launchd 打不开重定向目标时会拒起 job。
+    let logs = crate::bridge_dir().join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    std::fs::write(&plist, build_login_plist(&exe, &logs))
         .with_context(|| format!("写登录项失败: {}", plist.display()))?;
     // reload 内部同样带防自杀保护：是我们自己就不重装载，新增的保活键下次登录生效。
     reload_login_agent(&plist)
@@ -1005,14 +1020,17 @@ mod tests {
             "/Users/x/My Apps&Co/ABB.app/Contents/MacOS/agent-bridge",
             "/tmp/a<b>c/agent-bridge",
         ] {
-            let built = build_login_plist(std::path::Path::new(p));
+            let built = build_login_plist(std::path::Path::new(p), std::path::Path::new("/logs"));
             assert!(
                 !built.contains("&Co") && built.contains("&amp;Co") == p.contains('&'),
                 "转义不符: {built}"
             );
             assert_eq!(plist_program_argument(&built).as_deref(), Some(p));
         }
-        let built = build_login_plist(std::path::Path::new("/x/agent-bridge"));
+        let built = build_login_plist(
+            std::path::Path::new("/x/agent-bridge"),
+            std::path::Path::new("/y/logs"),
+        );
         for key in [
             "<key>Label</key>",
             "<key>ProgramArguments</key>",
@@ -1020,9 +1038,17 @@ mod tests {
             "<key>KeepAlive</key>",
             "<key>SuccessfulExit</key>",
             "<key>ThrottleInterval</key>",
+            "<key>StandardOutPath</key>",
+            "<key>StandardErrorPath</key>",
         ] {
             assert!(built.contains(key), "plist 模板缺键 {key}：{built}");
         }
+        // GUI 日志重定向必须落在 logs/ 下（crate::log! 只写 stdout，不重定向=零证据）
+        assert!(
+            built.contains("<string>/y/logs/gui.out</string>")
+                && built.contains("<string>/y/logs/gui.err</string>"),
+            "{built}"
+        );
         // 三个实测选型值也锁住：RunAtLoad 翻 false = 登录根本不拉起（功能静默死亡）；
         // SuccessfulExit 翻 true = 托盘「退出」会被复活；ThrottleInterval = 重试节奏。
         assert!(built.contains("<key>RunAtLoad</key>\n  <true/>"), "{built}");
@@ -1078,7 +1104,7 @@ mod tests {
         std::fs::write(&current, b"bin").unwrap();
         let write_plist = |exe: &std::path::Path| {
             // 用真实模板造夹具（而不是手写一小段 XML），这样模板与解析器一起被锁。
-            std::fs::write(&plist, build_login_plist(exe)).unwrap();
+            std::fs::write(&plist, build_login_plist(exe, &base.join("logs"))).unwrap();
         };
 
         // 没有 plist = 用户从未开自启（自愈绝不能顺手给他开）
