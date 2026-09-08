@@ -472,6 +472,12 @@ fn main() {
             std::process::exit(0);
         }
     };
+    // 自启漂移自愈（macOS；其它平台是空函数）：LaunchAgent plist 在、但登记的二进制
+    // 已不存在或指向旧副本时，按当前二进制重建并 launchctl reload。App 被移动过
+    // （build.sh 装 ~/Applications、正式包拖进 /Applications）后 launchd 首次 exec
+    // 即判 EX_CONFIG(78) 并静默停手（实测不会重试、二进制补回也不拉），而托盘仍显示
+    // 「开」——在这里收敛回真值。
+    crate::platform::heal_autostart();
     if let Err(e) = ui::run_gui() {
         crate::log!("GUI 启动失败: {e:#}");
         std::process::exit(1);
