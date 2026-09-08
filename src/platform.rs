@@ -617,7 +617,9 @@ pub fn set_autostart(enable: bool) -> Result<()> {
     let want = if enable { "开" } else { "关" };
     let r = set_autostart_impl(enable);
     match &r {
-        Ok(()) => log_autostart_event(&format!("开机自启已设为{want}")),
+        Ok(()) => log_autostart_event(&format!(
+            "开机自启已设为{want}（本会话是否已重载 launchd，见相邻记录）",
+        )),
         Err(e) => log_autostart_event(&format!("开机自启设为{want} 失败: {e:#}")),
     }
     r
@@ -797,7 +799,9 @@ pub fn log_autostart_event(msg: &str) {
 /// msg 一律压平换行：错误链里会拼进 `launchctl` 的 stderr 与 plist 路径（都可含
 /// 换行），不清洗就会一条事件落成多行，甚至伪造出带时间戳样子的假记录。
 fn autostart_record(ts: &str, msg: &str) -> String {
-    let flat = msg.replace('\n', "⏎").replace('\r', "");
+    // CRLF 先归一（否则一个换行会落成两个 ⏎）；再统一把独立 CR/LF 显式压成 ⏎——
+    // 直接删掉 \r 会把 "a\rb" 无声粘成 "ab"，丢掉分隔语义。
+    let flat = msg.replace("\r\n", "\n").replace(['\r', '\n'], "⏎");
     format!("[{ts}] {flat}\n")
 }
 
@@ -1048,7 +1052,13 @@ mod tests {
             !dirty.contains("\n[T2099"),
             "被压平的内容不得另起一行冒充独立记录: {dirty}"
         );
-        assert_eq!(autostart_record("T", "a\r\nb"), "[T] a⏎b\n");
+        assert_eq!(
+            autostart_record("T", "a\r\nb"),
+            "[T] a⏎b\n",
+            "CRLF 只算一个分隔"
+        );
+        // 独立 CR（不带 LF）也得留痕：直接剥掉会把 "a\rb" 无声粘成 "ab"，丢分隔语义。
+        assert_eq!(autostart_record("T", "a\rb"), "[T] a⏎b\n");
     }
 
     /// 自启 plist 解析（macOS）：只认自己写的 schema；读不出参数一律 None（调用方
