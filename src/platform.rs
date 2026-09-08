@@ -598,18 +598,30 @@ pub fn heal_autostart() {
         return;
     }
     crate::log!("[autostart] 自启项指向失效路径（App 被移动过？），按当前二进制重建");
-    match set_autostart(true) {
-        Ok(()) => {
-            log_autostart_event("自愈：自启项原指向失效路径，已按当前二进制重建并重载 launchd")
-        }
-        Err(e) => log_autostart_event(&format!("自愈失败（自启仍不可用）: {e:#}")),
-    }
+    // 只记「检测到漂移并发起重建」这一条事实；成没成由 `set_autostart` 单点自己记
+    // （两处各写一遍早晚分叉，且这里写「已重载」在本会话跳过 bootout 时并不成立）。
+    log_autostart_event("自愈：自启项指向失效路径（App 被移动过？），发起按当前二进制重建");
+    let _ = set_autostart(true);
 }
 
 /// 非 macOS 无「登录项指向哪个二进制」这回事（Windows 的 Run 键每次由
 /// `current_exe()` 覆写；Linux 未实现）。
 #[cfg(not(target_os = "macos"))]
 pub fn heal_autostart() {}
+
+/// 设置开机自启的**唯一公开入口**：成败一律在这里落审计。
+///
+/// 记录点做在单点而不是各调用方（同 #263 把防自杀守卫下沉到 `unload_login_agent` 的
+/// 理由）：将来新增第三个调用点（CLI 之类）不会静默漏记——「漏记」本身没有任何症状。
+pub fn set_autostart(enable: bool) -> Result<()> {
+    let want = if enable { "开" } else { "关" };
+    let r = set_autostart_impl(enable);
+    match &r {
+        Ok(()) => log_autostart_event(&format!("开机自启已设为{want}")),
+        Err(e) => log_autostart_event(&format!("开机自启设为{want} 失败: {e:#}")),
+    }
+    r
+}
 
 /// 开启/关闭「登录时自动启动」。
 /// 实现：往 ~/Library/LaunchAgents 写一个 LaunchAgent plist（launchd 登录时拉起
@@ -628,7 +640,7 @@ pub fn heal_autostart() {}
 ///   把二进制装回原路径也不补拉）：既不会刷屏重试，也不能指望 launchd 自己恢复——
 ///   后者正是 [`heal_autostart`] 存在的理由。
 #[cfg(target_os = "macos")]
-pub fn set_autostart(enable: bool) -> Result<()> {
+fn set_autostart_impl(enable: bool) -> Result<()> {
     let plist = login_item_plist();
     if !enable {
         // 顺序要紧：先删 plist（「下次登录不再自启」的硬判据，必须落定），再尽力摘掉
@@ -781,8 +793,12 @@ pub fn log_autostart_event(msg: &str) {
 }
 
 /// 审计行格式（纯函数，便于单测；时间戳由调用方给，避免测试依赖时钟）。
+///
+/// msg 一律压平换行：错误链里会拼进 `launchctl` 的 stderr 与 plist 路径（都可含
+/// 换行），不清洗就会一条事件落成多行，甚至伪造出带时间戳样子的假记录。
 fn autostart_record(ts: &str, msg: &str) -> String {
-    format!("[{ts}] {msg}\n")
+    let flat = msg.replace('\n', "⏎").replace('\r', "");
+    format!("[{ts}] {flat}\n")
 }
 
 // ── Windows：登录自启 = HKCU Run 键 ──
@@ -813,7 +829,7 @@ pub fn autostart_enabled() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn set_autostart(enable: bool) -> Result<()> {
+fn set_autostart_impl(enable: bool) -> Result<()> {
     let exe = current_exe()?;
     let out = if enable {
         let val = format!("\"{}\"", exe.display());
@@ -844,7 +860,7 @@ pub fn autostart_enabled() -> bool {
     false // TODO: ~/.config/autostart/agent-bridge.desktop
 }
 #[cfg(target_os = "linux")]
-pub fn set_autostart(_enable: bool) -> Result<()> {
+fn set_autostart_impl(_enable: bool) -> Result<()> {
     anyhow::bail!("Linux autostart 尚未实现")
 }
 
@@ -1020,6 +1036,19 @@ mod tests {
         let r = autostart_record("2026-09-08 20:31:02", "自愈：已按当前二进制重建");
         assert_eq!(r, "[2026-09-08 20:31:02] 自愈：已按当前二进制重建\n");
         assert_eq!(r.matches('\n').count(), 1, "一条记录只允许一个换行");
+        // msg 里的换行必须被压平：错误链会拼进 launchctl 的 stderr（可含换行）与
+        // plist 路径，不清洗就是一条事件落多行，甚至伪造出带时间戳样子的假记录。
+        let dirty = autostart_record(
+            "T",
+            "bootstrap 失败: Bootstrap failed: 125\n[T2099-01-01 00:00:00] 伪造条目",
+        );
+        assert_eq!(dirty.matches('\n').count(), 1, "{dirty}");
+        assert!(dirty.contains("⏎"), "{dirty}");
+        assert!(
+            !dirty.contains("\n[T2099"),
+            "被压平的内容不得另起一行冒充独立记录: {dirty}"
+        );
+        assert_eq!(autostart_record("T", "a\r\nb"), "[T] a⏎b\n");
     }
 
     /// 自启 plist 解析（macOS）：只认自己写的 schema；读不出参数一律 None（调用方

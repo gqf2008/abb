@@ -2879,16 +2879,16 @@ pub fn run_gui() -> Result<()> {
         });
         tray.on_toggle_autostart(move |on| {
             // 失败不再静默吞（老写法是 `let _ =`）：~/Library/LaunchAgents 不可写、
-            // launchctl bootstrap 被拒都是真故障。两路都写自启审计（logs/autostart.log）：
-            // GUI 由 open 起时 stdout 指 /dev/null，只 crate::log! 等于什么都不留。
-            // 菜单回显走 2s tick 的 autostart_enabled()，读的是 plist 真值。
-            let want = if on { "开" } else { "关" };
-            match platform::set_autostart(on) {
-                Ok(()) => platform::log_autostart_event(&format!("用户把开机自启设为{want}")),
-                Err(e) => {
-                    platform::log_autostart_event(&format!("用户把开机自启设为{want} 失败: {e:#}"));
-                    crate::log!("[ui] ⚠️ 开机自启设置失败（想设为{want}）: {e:#}");
-                }
+            // launchctl bootstrap 被拒都是真故障。成败审计由 platform::set_autostart
+            // 单点写 logs/autostart.log（GUI 由 open 起时 stdout 指 /dev/null，只
+            // crate::log! 等于什么都不留），这里不再重复记一条以免两处文案早晚分叉；
+            // 这行 stdout 日志只为「终端里跑 GUI」调试时可见。菜单回显走 2s tick 的
+            // autostart_enabled()，读的是 plist 真值。
+            if let Err(e) = platform::set_autostart(on) {
+                crate::log!(
+                    "[ui] ⚠️ 开机自启设置失败（想设为{}）: {e:#}",
+                    if on { "开" } else { "关" }
+                );
             }
         });
         tray.on_check_update({
