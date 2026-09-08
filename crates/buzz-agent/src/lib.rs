@@ -79,10 +79,10 @@ struct App {
 struct Session {
     id: String,
     mcp: Arc<McpRegistry>,
-    /// 会话执行档位（P1.2；P1.3 域校验消费 roots）。注册表按它过滤工具面，
-    /// 这里留存供会话级判定/诊断。
-    #[allow(dead_code)] // P1.3 消费（读域/roots 判定在 devtools 调用侧）
-    sandbox: crate::wire::Sandbox,
+    /// 会话工具策略（P1.2 档位 + P1.3a 域根）。注册表按它过滤工具面并做
+    /// 域校验；留存供会话级判定/诊断。
+    #[allow(dead_code)]
+    policy: crate::wire::ToolPolicy,
     /// Skills discovered at session creation; used by the built-in `load_skill` tool.
     skills: Vec<SkillEntry>,
     history: Vec<HistoryItem>,
@@ -446,6 +446,9 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             raw_sandbox
         );
     }
+    // P1.3a：读/写域根（FullAccess=今天：读不限、写限 cwd）。
+    let extra_roots: Option<Vec<String>> = p.meta.as_ref().and_then(|m| m.writable_roots.clone());
+    let policy = crate::wire::ToolPolicy::build(sandbox, &p.cwd, extra_roots);
     // Check cap without holding lock across MCP spawn (which may be slow).
     {
         let sessions = app.sessions.lock().await;
@@ -539,7 +542,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         }
     };
 
-    let mcp = match McpRegistry::spawn_all(&app.cfg, &p.mcp_servers, &p.cwd, sandbox).await {
+    let mcp = match McpRegistry::spawn_all(&app.cfg, &p.mcp_servers, &p.cwd, policy.clone()).await {
         Ok(m) => Arc::new(m),
         Err(e) => return reject(wire_tx, id, e.json_rpc_code(), &e.to_string()).await,
     };
@@ -564,7 +567,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         Session {
             id: session_id.clone(),
             mcp,
-            sandbox,
+            policy: policy.clone(),
             skills,
             history: Vec::new(),
             cancel_tx,

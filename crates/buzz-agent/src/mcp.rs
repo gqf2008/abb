@@ -214,9 +214,8 @@ pub struct McpRegistry {
     servers: Vec<Arc<Server>>,
     /// 会话工作区（session/new 的 cwd）——内置工具的运行/限定目录。
     cwd: String,
-    /// 会话执行档位（P1.2）：read-only 档下 dev__write/dev__shell 不进工具表
-    /// 且执行闸双保险拒绝；workspace-write/full-access 工具面一致（域校验 P1.3）。
-    sandbox: crate::wire::Sandbox,
+    /// 会话工具策略（P1.2 档位 + P1.3a 读/写域根）。
+    policy: crate::wire::ToolPolicy,
     max_attempts: u32,
     backoff_base: Duration,
     backoff_max: Duration,
@@ -230,7 +229,7 @@ impl McpRegistry {
         cfg: &Config,
         servers: &[McpServerStdio],
         cwd: &str,
-        sandbox: crate::wire::Sandbox,
+        policy: crate::wire::ToolPolicy,
     ) -> Result<Self, AgentError> {
         if servers.len() > MAX_MCP_SERVERS {
             return Err(AgentError::Mcp(format!(
@@ -243,7 +242,7 @@ impl McpRegistry {
             defs: Vec::new(),
             servers: Vec::new(),
             cwd: cwd.to_owned(),
-            sandbox,
+            policy,
             max_attempts: cfg.mcp_max_restart_attempts.max(1),
             backoff_base: Duration::from_millis(cfg.mcp_restart_base_ms.max(1)),
             backoff_max: Duration::from_millis(cfg.mcp_restart_max_ms.max(1)),
@@ -332,8 +331,10 @@ impl McpRegistry {
             for (tool, def) in crate::devtools::defs() {
                 // P1.2 档位过滤：read-only 下 write/shell 对模型直接不可见
                 // （最强的杠杆是「看不见」而不是「拒绝」）。
-                if (!sandbox.allow_write() && matches!(tool, crate::devtools::Tool::Write))
-                    || (!sandbox.allow_shell() && matches!(tool, crate::devtools::Tool::Shell))
+                if (!reg.policy.sandbox.allow_write()
+                    && matches!(tool, crate::devtools::Tool::Write))
+                    || (!reg.policy.sandbox.allow_shell()
+                        && matches!(tool, crate::devtools::Tool::Shell))
                 {
                     continue;
                 }
@@ -359,6 +360,11 @@ impl McpRegistry {
             }
         }
         Ok(reg)
+    }
+
+    /// 会话工具策略（load_skill 等进程内路径的域校验用）。
+    pub fn policy(&self) -> &crate::wire::ToolPolicy {
+        &self.policy
     }
 
     pub fn server_of(&self, qname: &str) -> Option<&str> {
@@ -608,17 +614,25 @@ impl McpRegistry {
         // per-result 文本上限对两类工具一致生效。
         if let Entry::Builtin { tool } = entry {
             // 双保险执行闸：档位禁的工具即使名字可达（模型幻觉/旧缓存）也拒绝。
-            let denied = (!self.sandbox.allow_write()
+            let denied = (!self.policy.sandbox.allow_write()
                 && matches!(*tool, crate::devtools::Tool::Write))
-                || (!self.sandbox.allow_shell() && matches!(*tool, crate::devtools::Tool::Shell));
+                || (!self.policy.sandbox.allow_shell()
+                    && matches!(*tool, crate::devtools::Tool::Shell));
             if denied {
                 return Err(AgentError::Mcp(format!(
                     "tool '{qname}' is disabled in this session's sandbox mode ({:?})",
-                    self.sandbox
+                    self.policy.sandbox
                 )));
             }
-            let mut result =
-                crate::devtools::run(*tool, arguments, &self.cwd, provider_id, cancel).await?;
+            let mut result = crate::devtools::run_with_policy(
+                *tool,
+                arguments,
+                &self.cwd,
+                &self.policy,
+                provider_id,
+                cancel,
+            )
+            .await?;
             clamp_tool_result_text(&mut result, budget);
             return Ok(result);
         }
@@ -1181,7 +1195,14 @@ mod sandbox_tests {
             (Sandbox::WorkspaceWrite, true, true),
             (Sandbox::FullAccess, true, true),
         ] {
-            let reg = McpRegistry::spawn_all(&cfg, &[], cwd, sb).await.unwrap();
+            let reg = McpRegistry::spawn_all(
+                &cfg,
+                &[],
+                cwd,
+                crate::wire::ToolPolicy::build(sb, cwd, None),
+            )
+            .await
+            .unwrap();
             let names: Vec<String> = reg.tools().iter().map(|d| d.name.clone()).collect();
             assert_eq!(
                 names.contains(&"dev__shell".to_string()),
@@ -1206,12 +1227,10 @@ mod sandbox_tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let cfg = cfg_with_dev_tools();
-        let a = McpRegistry::spawn_all(&cfg, &[], cwd, Sandbox::FullAccess)
-            .await
-            .unwrap();
-        let b = McpRegistry::spawn_all(&cfg, &[], cwd, Sandbox::FullAccess)
-            .await
-            .unwrap();
+        let pa = crate::wire::ToolPolicy::build(Sandbox::FullAccess, cwd, None);
+        let pb = crate::wire::ToolPolicy::build(Sandbox::FullAccess, cwd, None);
+        let a = McpRegistry::spawn_all(&cfg, &[], cwd, pa).await.unwrap();
+        let b = McpRegistry::spawn_all(&cfg, &[], cwd, pb).await.unwrap();
         let mut n1: Vec<_> = a.tools().iter().map(|d| d.name.clone()).collect();
         let mut n2: Vec<_> = b.tools().iter().map(|d| d.name.clone()).collect();
         n1.sort();

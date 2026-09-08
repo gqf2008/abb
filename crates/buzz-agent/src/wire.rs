@@ -92,6 +92,53 @@ pub enum Sandbox {
     FullAccess,
 }
 
+/// 会话工具策略（P1.3a）：档位 + 读/写域根。
+///
+/// - FullAccess（缺省）：读不限制、写限会话 cwd——与今天字节级一致（回归锁）。
+/// - WorkspaceWrite：读/写都限定 roots（= 会话 cwd ∪ `_meta.writableRoots`）。
+/// - ReadOnly：读限 roots；write/shell 已被档位摘除（P1.2）。
+#[derive(Debug, Clone)]
+pub struct ToolPolicy {
+    pub sandbox: Sandbox,
+    /// 读域根；None = 不限制（仅 FullAccess）。判定时两侧均 canonicalize。
+    pub read_roots: Option<Vec<std::path::PathBuf>>,
+    /// 写域根（任一命中即允许）。FullAccess = [session cwd]（今天行为）。
+    pub write_roots: Vec<std::path::PathBuf>,
+}
+
+impl ToolPolicy {
+    pub fn build(sandbox: Sandbox, cwd: &str, extra_roots: Option<Vec<String>>) -> Self {
+        let cwd_path = std::path::PathBuf::from(cwd);
+        let mut roots = vec![cwd_path.clone()];
+        for r in extra_roots.unwrap_or_default() {
+            let pth = std::path::PathBuf::from(&r);
+            if pth.is_absolute() && !roots.iter().any(|x| x == &pth) {
+                roots.push(pth);
+            }
+        }
+        match sandbox {
+            Sandbox::FullAccess => Self {
+                sandbox,
+                read_roots: None,
+                write_roots: vec![cwd_path],
+            },
+            _ => Self {
+                sandbox,
+                read_roots: Some(roots.clone()),
+                write_roots: roots,
+            },
+        }
+    }
+
+    /// 目标路径（已 canonicalize）是否落在给定根集合内（根同样 canonicalize）。
+    pub fn within(roots: &[std::path::PathBuf], canon_target: &std::path::Path) -> bool {
+        roots.iter().any(|r| {
+            let rc = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+            canon_target.starts_with(&rc)
+        })
+    }
+}
+
 impl Sandbox {
     /// 宽松解析：未知/缺失值回落 FullAccess 并由调用方 warn（协议噪音绝不
     /// 挂掉聊天）。词表与 ABB `SandboxMode::as_str` 对齐。

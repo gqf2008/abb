@@ -211,6 +211,7 @@ pub fn defs() -> Vec<(Tool, ToolDef)> {
 }
 
 /// 内置工具分发入口（registry `call` 的 Builtin 臂）。
+#[cfg(test)]
 pub async fn run(
     tool: Tool,
     arguments: &Value,
@@ -218,12 +219,25 @@ pub async fn run(
     provider_id: &str,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ToolResult, AgentError> {
+    let policy = crate::wire::ToolPolicy::build(crate::wire::Sandbox::FullAccess, cwd, None);
+    run_with_policy(tool, arguments, cwd, &policy, provider_id, cancel).await
+}
+
+pub async fn run_with_policy(
+    tool: Tool,
+    arguments: &Value,
+    cwd: &str,
+    policy: &crate::wire::ToolPolicy,
+    provider_id: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<ToolResult, AgentError> {
     match tool {
+        // shell 的 argv 白名单策略在 P1.3b；本批只管 read/write 域（档位摘除在 P1.2）。
         Tool::Shell => run_shell(arguments, cwd, provider_id, cancel).await,
-        Tool::Read => run_read(arguments, cwd, provider_id).await,
-        Tool::Write => run_write(arguments, cwd, provider_id).await,
-        Tool::Ls => run_ls(arguments, cwd, provider_id).await,
-        Tool::Glob => run_glob(arguments, cwd, provider_id).await,
+        Tool::Read => run_read(arguments, cwd, policy, provider_id).await,
+        Tool::Write => run_write(arguments, cwd, policy, provider_id).await,
+        Tool::Ls => run_ls(arguments, cwd, policy, provider_id).await,
+        Tool::Glob => run_glob(arguments, cwd, policy, provider_id).await,
     }
 }
 
@@ -486,23 +500,43 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
 
 // ── 路径解析 ────────────────────────────────────────────────────────────────
 
-/// 只读工具的路径解析：相对路径基于会话工作区，绝对路径原样放行（与
-/// pi/claude 对齐——只读无写风险）。返回规范化（canonicalize 后）的路径。
-async fn resolve_read_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
+/// 只读工具的路径解析。FullAccess 档绝对路径原样放行（与 pi/claude 对齐——
+/// 今天的行为）；受限档（read_only/workspace_write，P1.3a）canonicalize 后必须
+/// 落在 read_roots 内——否则 granted/受限会话可以直接 `dev__read
+/// ~/.agent-bridge/config.json` 读走明文供应商 key / `~/.ssh`（实机审计结论）。
+async fn resolve_read_path(
+    cwd: &str,
+    path: &str,
+    policy: &crate::wire::ToolPolicy,
+) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
         Path::new(cwd).join(raw)
     };
-    tokio::fs::canonicalize(&joined)
+    let canon = tokio::fs::canonicalize(&joined)
         .await
-        .map_err(|e| format!("path not accessible: {path} ({e})"))
+        .map_err(|e| format!("path not accessible: {path} ({e})"))?;
+    if let Some(roots) = &policy.read_roots {
+        if !crate::wire::ToolPolicy::within(roots, &canon) {
+            return Err(format!(
+                "read denied outside the session's allowed roots (sandbox {:?}): {path}",
+                policy.sandbox
+            ));
+        }
+    }
+    Ok(canon)
 }
 
 /// write 专用：拒绝绝对路径，`..` 逃逸经父目录 canonicalize 后前缀校验拦截
-///（父目录允许自动创建）。返回值保证在 `cwd` 子树内。
-async fn confined_write_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
+///（父目录允许自动创建）。P1.3a：限定根从「仅 cwd」扩为 policy.write_roots
+/// 任一命中（FullAccess 时 write_roots=[cwd]，与今天一致）。
+async fn confined_write_path(
+    cwd: &str,
+    path: &str,
+    policy: &crate::wire::ToolPolicy,
+) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     if raw.is_absolute() {
         return Err(format!(
@@ -528,9 +562,15 @@ async fn confined_write_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("write: invalid path: {path}"))?;
     let target = parent.join(file_name);
-    if !target.starts_with(&base) {
+    let roots = if policy.write_roots.is_empty() {
+        vec![base.clone()]
+    } else {
+        policy.write_roots.clone()
+    };
+    if !crate::wire::ToolPolicy::within(&roots, &target) {
         return Err(format!(
-            "write: path escapes the workspace (.. traversal rejected): {path}"
+            "write: path outside the session's writable roots (sandbox {:?}): {path}",
+            policy.sandbox
         ));
     }
     Ok(target)
@@ -541,6 +581,7 @@ async fn confined_write_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
 async fn run_read(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
 ) -> Result<ToolResult, AgentError> {
     let path = match arg_str(arguments, "path") {
@@ -551,7 +592,7 @@ async fn run_read(
     let limit = arg_u64(arguments, "limit")
         .unwrap_or(2000)
         .clamp(1, READ_MAX_LINES as u64) as usize;
-    let resolved = match resolve_read_path(cwd, path).await {
+    let resolved = match resolve_read_path(cwd, path, policy).await {
         Ok(p) => p,
         Err(e) => return error_result(provider_id, format!("read: {e}")),
     };
@@ -633,6 +674,7 @@ async fn read_at_most(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 async fn run_write(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
 ) -> Result<ToolResult, AgentError> {
     let path = match arg_str(arguments, "path") {
@@ -652,7 +694,7 @@ async fn run_write(
             ),
         );
     }
-    let target = match confined_write_path(cwd, path).await {
+    let target = match confined_write_path(cwd, path, policy).await {
         Ok(t) => t,
         Err(e) => return error_result(provider_id, e),
     };
@@ -678,9 +720,14 @@ async fn run_write(
 
 // ── ls ──────────────────────────────────────────────────────────────────────
 
-async fn run_ls(arguments: &Value, cwd: &str, provider_id: &str) -> Result<ToolResult, AgentError> {
+async fn run_ls(
+    arguments: &Value,
+    cwd: &str,
+    policy: &crate::wire::ToolPolicy,
+    provider_id: &str,
+) -> Result<ToolResult, AgentError> {
     let path = arg_str(arguments, "path").unwrap_or(cwd);
-    let resolved = match resolve_read_path(cwd, path).await {
+    let resolved = match resolve_read_path(cwd, path, policy).await {
         Ok(p) => p,
         Err(e) => return error_result(provider_id, format!("ls: {e}")),
     };
@@ -771,6 +818,7 @@ fn match_segments(pat: &[&str], name: &[&str]) -> bool {
 async fn run_glob(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
 ) -> Result<ToolResult, AgentError> {
     let pattern = match arg_str(arguments, "pattern") {
@@ -778,7 +826,7 @@ async fn run_glob(
         _ => return error_result(provider_id, "glob: missing required argument \"pattern\""),
     };
     let base_str = arg_str(arguments, "path").unwrap_or(cwd);
-    let base = match resolve_read_path(cwd, base_str).await {
+    let base = match resolve_read_path(cwd, base_str, policy).await {
         Ok(p) => p,
         Err(e) => return error_result(provider_id, format!("glob: {e}")),
     };
@@ -912,6 +960,76 @@ mod tests {
 
     /// 独立临时目录（tempfile 已在本 crate dev-dependencies：自动唯一命名，
     /// Drop 时自动清理——断言 panic 也不会在 /tmp 留下 abb-devtools-* 残留）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_policy_denies_reads_outside_roots() {
+        // P1.3a：workspace_write/read_only 档读域必须挡在 roots 外——granted 经
+        // dev__read 读 ~/.ssh、config.json（明文 key）的洞就此封死。
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let policy =
+            crate::wire::ToolPolicy::build(crate::wire::Sandbox::WorkspaceWrite, cwd, None);
+        let mut rx = watch::channel(false).1;
+        let r = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "/etc/hosts" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "{:?}", r.text());
+        assert!(r.text().contains("allowed roots"), "{}", r.text());
+        // FullAccess 档保持今天：绝对路径可读（回归锁）
+        let full = crate::wire::ToolPolicy::build(crate::wire::Sandbox::FullAccess, cwd, None);
+        let ok = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "/etc/hosts" }),
+            cwd,
+            &full,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_escape_still_denied_after_canonicalize() {
+        // canonicalize 之后才比对 → 工作区内软链指向域外文件同样拒绝（读侧）
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), dir.path().join("link.txt"))
+            .unwrap();
+        let sub = dir.path().join("ws");
+        std::fs::create_dir_all(&sub).unwrap();
+        let subp = sub.to_str().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), sub.join("link.txt")).unwrap();
+        let policy = crate::wire::ToolPolicy::build(crate::wire::Sandbox::ReadOnly, subp, None);
+        let mut rx = watch::channel(false).1;
+        let r = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "link.txt" }),
+            subp,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "symlink 指向域外必须拒绝: {}", r.text());
+    }
+
+    /// FullAccess 测试策略（与今天字节级一致：读不限、写限 cwd）。
+    fn test_policy(cwd: &str) -> crate::wire::ToolPolicy {
+        crate::wire::ToolPolicy::build(crate::wire::Sandbox::FullAccess, cwd, None)
+    }
+
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
@@ -945,13 +1063,20 @@ mod tests {
         let tmp = test_dir();
         let cwd = tmp.path().to_str().unwrap();
         // 绝对路径拒绝
-        let err = confined_write_path(cwd, "/etc/passwd").await.unwrap_err();
+        let err = confined_write_path(cwd, "/etc/passwd", &test_policy(cwd))
+            .await
+            .unwrap_err();
         assert!(err.contains("absolute path"), "{err}");
         // `..` 逃逸拒绝
-        let err = confined_write_path(cwd, "../escape.txt").await.unwrap_err();
-        assert!(err.contains("escapes"), "{err}");
+        let err = confined_write_path(cwd, "../escape.txt", &test_policy(cwd))
+            .await
+            .unwrap_err();
+        // P1.3a 措辞：逃逸被「roots 前缀校验」拦截（同一语义换文案）
+        assert!(err.contains("writable roots"), "{err}");
         // 正常相对路径落在工作区内（tmp 先 canonicalize：macOS /var → /private/var）
-        let ok = confined_write_path(cwd, "sub/dir/a.txt").await.unwrap();
+        let ok = confined_write_path(cwd, "sub/dir/a.txt", &test_policy(cwd))
+            .await
+            .unwrap();
         let canon_tmp = tokio::fs::canonicalize(tmp.path()).await.unwrap();
         assert!(ok.starts_with(&canon_tmp), "{ok:?} not under {canon_tmp:?}");
     }

@@ -4,6 +4,8 @@
 //! and returns it so the agent can load skill content on demand rather than
 //! having every skill inlined into the system prompt at session start.
 
+use std::path::Path;
+
 use serde_json::{json, Value};
 
 use crate::hints::{strip_frontmatter, SkillEntry, MAX_SKILL_BODY_BYTES};
@@ -38,7 +40,25 @@ pub fn load_skill_def() -> ToolDef {
 
 /// Execute a `load_skill` call. Returns a `ToolResult` on success or a
 /// user-visible error result if the skill is not found or cannot be read.
-pub async fn call_load_skill(arguments: &Value, skills: &[SkillEntry]) -> ToolResult {
+/// 受限档读域校验辅助（P1.3a）：policy=None 或 FullAccess（read_roots=None）
+/// 一律放行；否则 canonicalize 后必须落在 read_roots 之一内。
+pub(crate) fn read_allowed(policy: Option<&crate::wire::ToolPolicy>, path: &Path) -> bool {
+    match policy.and_then(|p| p.read_roots.as_ref()) {
+        None => true,
+        Some(roots) => match std::fs::canonicalize(path) {
+            Ok(canon) => crate::wire::ToolPolicy::within(roots, &canon),
+            Err(_) => false,
+        },
+    }
+}
+
+/// `policy`（P1.3a）：受限档下技能文件也走读域校验——技能常在
+/// `~/.agents/skills`（会话工作区之外），受限会话必须拒绝读体。
+pub async fn call_load_skill(
+    arguments: &Value,
+    skills: &[SkillEntry],
+    policy: Option<&crate::wire::ToolPolicy>,
+) -> ToolResult {
     let name = match arguments.get("name").and_then(Value::as_str) {
         Some(n) => n,
         None => {
@@ -50,7 +70,7 @@ pub async fn call_load_skill(arguments: &Value, skills: &[SkillEntry]) -> ToolRe
     //   "skill-name"            → load SKILL.md body + ## Supporting Files section
     //   "skill-name/rel/path"   → load a specific supporting file
     if let Some((skill_name, rel_path)) = name.split_once('/') {
-        return load_supporting_file(skill_name, rel_path, skills).await;
+        return load_supporting_file(skill_name, rel_path, skills, policy).await;
     }
 
     // Plain skill-name form: load SKILL.md body.
@@ -63,6 +83,12 @@ pub async fn call_load_skill(arguments: &Value, skills: &[SkillEntry]) -> ToolRe
             ));
         }
     };
+
+    if !read_allowed(policy, &entry.path) {
+        return error_result(&format!(
+            "load_skill: skill {name:?} is outside this session's allowed read roots"
+        ));
+    }
 
     // Read the file off the async executor to avoid blocking a Tokio worker.
     let skill_path = entry.path.clone();
@@ -119,6 +145,7 @@ async fn load_supporting_file(
     skill_name: &str,
     rel_path: &str,
     skills: &[SkillEntry],
+    policy: Option<&crate::wire::ToolPolicy>,
 ) -> ToolResult {
     let rel_path = rel_path.replace('\\', "/");
 
@@ -147,6 +174,16 @@ async fn load_supporting_file(
             .map(|r| r.to_string_lossy().replace('\\', "/") == rel_path)
             .unwrap_or(false)
     });
+
+    // 只在「文件存在但越域」时拒绝；不存在走下方 not-found 分支
+    // （is_some_and(false) 直接取反会把 not-found 语义吞掉——本次审查教训）。
+    if let Some(f) = matched.as_ref() {
+        if !read_allowed(policy, f) {
+            return error_result(&format!(
+                "load_skill: supporting file {rel_path:?} of skill {skill_name:?} is outside this session's allowed read roots"
+            ));
+        }
+    }
 
     let file_path = match matched {
         Some(p) => p,
@@ -275,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_load_skill_missing_name_arg() {
-        let result = call_load_skill(&serde_json::json!({}), &[]).await;
+        let result = call_load_skill(&serde_json::json!({}), &[], None).await;
         assert!(result.is_error);
         let text = text_content(&result);
         assert!(text.contains("missing required argument"), "got: {text}");
@@ -283,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_load_skill_skill_not_found() {
-        let result = call_load_skill(&serde_json::json!({"name": "no-such"}), &[]).await;
+        let result = call_load_skill(&serde_json::json!({"name": "no-such"}), &[], None).await;
         assert!(result.is_error);
         let text = text_content(&result);
         assert!(text.contains("not found"), "got: {text}");
@@ -299,7 +336,7 @@ mod tests {
         )
         .unwrap();
         let skills = vec![make_skill("test", "A test", skill_md)];
-        let result = call_load_skill(&serde_json::json!({"name": "test"}), &skills).await;
+        let result = call_load_skill(&serde_json::json!({"name": "test"}), &skills, None).await;
         assert!(!result.is_error);
         let text = text_content(&result);
         assert!(text.contains("Skill body here."), "got: {text}");
@@ -330,7 +367,7 @@ mod tests {
             skill_md,
             vec![ref_file],
         )];
-        let result = call_load_skill(&serde_json::json!({"name": "my-skill"}), &skills).await;
+        let result = call_load_skill(&serde_json::json!({"name": "my-skill"}), &skills, None).await;
         assert!(!result.is_error);
         let text = text_content(&result);
         assert!(text.contains("Body."), "body missing: {text}");
@@ -358,7 +395,7 @@ mod tests {
         )
         .unwrap();
         let skills = vec![make_skill("bare", "desc", skill_md)];
-        let result = call_load_skill(&serde_json::json!({"name": "bare"}), &skills).await;
+        let result = call_load_skill(&serde_json::json!({"name": "bare"}), &skills, None).await;
         assert!(!result.is_error);
         let text = text_content(&result);
         assert!(
@@ -391,6 +428,7 @@ mod tests {
         let result = call_load_skill(
             &serde_json::json!({"name": "my-skill/references/foo.md"}),
             &skills,
+            None,
         )
         .await;
         assert!(!result.is_error, "expected success, got error");
@@ -429,6 +467,7 @@ mod tests {
         let result = call_load_skill(
             &serde_json::json!({"name": "my-skill/references/missing.md"}),
             &skills,
+            None,
         )
         .await;
         assert!(result.is_error);
@@ -450,8 +489,12 @@ mod tests {
         )
         .unwrap();
         let skills = vec![make_skill("bare", "desc", skill_md)];
-        let result =
-            call_load_skill(&serde_json::json!({"name": "bare/anything.md"}), &skills).await;
+        let result = call_load_skill(
+            &serde_json::json!({"name": "bare/anything.md"}),
+            &skills,
+            None,
+        )
+        .await;
         assert!(result.is_error);
         let text = text_content(&result);
         assert!(text.contains("no supporting files"), "got: {text}");
@@ -490,6 +533,7 @@ mod tests {
         let result = call_load_skill(
             &serde_json::json!({"name": "my-skill/../secret.txt"}),
             &skills,
+            None,
         )
         .await;
         assert!(result.is_error, "traversal attempt should be rejected");
@@ -525,7 +569,7 @@ mod tests {
             skill_md,
             vec![ref_file],
         )];
-        let result = call_load_skill(&serde_json::json!({"name": "big"}), &skills).await;
+        let result = call_load_skill(&serde_json::json!({"name": "big"}), &skills, None).await;
         assert!(!result.is_error);
         let text = text_content(&result);
         assert!(
@@ -557,6 +601,7 @@ mod tests {
         let result = call_load_skill(
             &serde_json::json!({"name": "big/references/huge.md"}),
             &skills,
+            None,
         )
         .await;
         assert!(!result.is_error);
