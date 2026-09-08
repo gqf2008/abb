@@ -622,10 +622,11 @@ pub fn set_autostart(enable: bool) -> Result<()> {
         if plist.exists() {
             std::fs::remove_file(&plist).with_context(|| "删除登录项失败")?;
         }
-        if login_job_is_self() {
-            crate::log!("[autostart] 本进程是 launchd 拉起的 job，跳过 bootout（摘它会杀掉自己）——已关，下次登录不再自启");
-            return Ok(());
-        }
+        // 再尽力摘本会话的 job；跑的是我们自己时 unload 内部会跳过（见其文档）。
+        // 已知窄窗：跳过意味着 launchd 内存里那份定义还在——若它带 KeepAlive（本会话
+        // 是被新模板拉起过的），此后 App 非 0 退出/被信号杀仍会被复活**一次**；正常
+        // 退出码 0 不复活，且 plist 已删 → 下次登录起彻底干净。宁可留这个窄窗，也不
+        // 为改配置杀掉用户正在用的 App。
         unload_login_agent();
         return Ok(());
     }
@@ -635,23 +636,11 @@ pub fn set_autostart(enable: bool) -> Result<()> {
     }
     std::fs::write(&plist, build_login_plist(&exe))
         .with_context(|| format!("写登录项失败: {}", plist.display()))?;
-    if login_job_is_self() {
-        // 同上：不 bootout 自己。拉起我们这个进程的旧定义里 ProgramArguments 就是当前
-        // 二进制（否则不会 exec 到这里），与新写的文件唯一的差别是 KeepAlive /
-        // ThrottleInterval 这些新增键——它们对本会话没有意义，下次登录 launchd 重读
-        // 文件自然生效。
-        crate::log!(
-            "[autostart] 本进程是 launchd 拉起的 job，跳过 reload（保活新增键下次登录生效）"
-        );
-        return Ok(());
-    }
+    // reload 内部同样带防自杀保护：是我们自己就不重装载，新增的保活键下次登录生效。
     reload_login_agent(&plist)
 }
 
-/// 由 launchd 拉起的自启 job 是否就是本进程。
-/// 判据是 `launchctl print` 里那条缩进一级的 `pid = <n>`（`responsible pid`/
-/// `last exit code` 等都不是 job 本体，故只认前缀恰为 `pid = ` 的行）。拿不到输出、
-/// job 没加载、没有 pid 一律判 false——那时摘它伤不到自己。
+/// 由 launchd 拉起的自启 job 是否就是本进程（**自杀保护的唯一判据**）。
 #[cfg(target_os = "macos")]
 fn login_job_is_self() -> bool {
     let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
@@ -664,13 +653,22 @@ fn login_job_is_self() -> bool {
     if !out.status.success() {
         return false;
     }
-    let me = std::process::id();
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .any(|l| match l.trim().strip_prefix("pid = ") {
-            Some(v) => v.trim().parse::<u32>() == Ok(me),
-            None => false,
-        })
+    parse_launchd_job_pid(&String::from_utf8_lossy(&out.stdout)) == Some(std::process::id())
+}
+
+/// 从 `launchctl print` 输出里取 job 主进程 pid。本机实测形态是一个 TAB 缩进的
+/// `pid = 61995`，且全输出含 `pid` 子串的行**仅此一条**（`last exit code`、
+/// `exit timeout` 都不以 `pid` 开头；真出现 `responsible pid` 也会因 trim 后前缀
+/// 不符而被跳过）。容忍 `pid=1` 这类空白差异。
+/// 解析不出（job 未运行/格式变了）→ `None` → 判「不是自己」→ 落回原行为：**宁可
+/// 保护失效，也不要把用户正在用的 App 误判成该跳过**。格式漂移是显式风险，故留了
+/// 单测锁住这行解析。
+#[cfg(target_os = "macos")]
+fn parse_launchd_job_pid(print_out: &str) -> Option<u32> {
+    print_out.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("pid")?.trim_start();
+        rest.strip_prefix('=')?.trim().parse::<u32>().ok()
+    })
 }
 
 /// 让 launchd 改用磁盘上最新定义（bootout 旧 job → bootstrap 新 plist）。
@@ -678,7 +676,11 @@ fn login_job_is_self() -> bool {
 /// 起的进程未必带它）。
 #[cfg(target_os = "macos")]
 fn reload_login_agent(plist: &std::path::Path) -> Result<()> {
-    unload_login_agent();
+    if !unload_login_agent() {
+        // 没摘成（正在跑的就是我们自己）→ 也别 bootstrap：同一 label 重复 bootstrap
+        // 会失败。新写的文件已在磁盘上，下次登录 launchd 重读即生效。
+        return Ok(());
+    }
     let domain = format!("gui/{}", uid());
     let out = std::process::Command::new("launchctl")
         .args(["bootstrap", &domain, &plist.display().to_string()])
@@ -694,15 +696,25 @@ fn reload_login_agent(plist: &std::path::Path) -> Result<()> {
     }
 }
 
-/// 从 launchd 摘掉本 App 的 agent。未加载过时报错属正常路径（首次开启前），忽略。
+/// 从 launchd 摘掉本 App 的 agent。返回 `false` = **因为那个 job 进程就是本进程而
+/// 跳过**（`bootout` 会终止 job 进程，实测 `kill -0` 拿 rc=1、pgrep/ps 全空；摘自己
+/// 等于让 ABB 凭空退出），调用方据此别再去 bootstrap。未加载过时报错属正常路径
+/// （首次开启前），按「已摘」处理。
+///
+/// 保护做在这里而不是各调用点：以后谁再加一条 reload/unload 路径，不会绕开它。
 #[cfg(target_os = "macos")]
-fn unload_login_agent() {
+fn unload_login_agent() -> bool {
+    if login_job_is_self() {
+        crate::log!("[autostart] 跳过 bootout：该 job 正在运行的进程就是本进程（摘它会杀掉自己）");
+        return false;
+    }
     let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
     let _ = std::process::Command::new("launchctl")
         .args(["bootout", &target])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    true
 }
 
 /// 本进程 uid（libc 已在直接依赖里，不必 spawn `id -u`）。
@@ -714,9 +726,11 @@ fn uid() -> u32 {
 
 #[cfg(target_os = "macos")]
 fn login_item_plist() -> PathBuf {
+    // 文件名 == 标签名（launchd 按标签记账），别把字符串写两遍以免分叉。
     dirs::home_dir()
         .unwrap_or_default()
-        .join("Library/LaunchAgents/com.sqb.agent-bridge.gui.plist")
+        .join("Library/LaunchAgents")
+        .join(format!("{LOGIN_ITEM_LABEL}.plist"))
 }
 
 // ── Windows：登录自启 = HKCU Run 键 ──
@@ -1009,12 +1023,46 @@ mod tests {
         ] {
             assert!(built.contains(key), "plist 模板缺键 {key}：{built}");
         }
-        // SuccessfulExit=false + ThrottleInterval=10 是实测选型，值也一并锁住
+        // 三个实测选型值也锁住：RunAtLoad 翻 false = 登录根本不拉起（功能静默死亡）；
+        // SuccessfulExit 翻 true = 托盘「退出」会被复活；ThrottleInterval = 重试节奏。
+        assert!(built.contains("<key>RunAtLoad</key>\n  <true/>"), "{built}");
         assert!(
             built.contains("<key>SuccessfulExit</key>\n    <false/>"),
             "{built}"
         );
         assert!(built.contains("<integer>10</integer>"), "{built}");
+        // plist 文件名与标签必须同源（launchd 按标签记账，两者分叉=写了个没人加载的文件）
+        assert_eq!(
+            login_item_plist()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            Some(format!("{LOGIN_ITEM_LABEL}.plist"))
+        );
+    }
+
+    /// 防自杀保护的唯一数据来源是 `launchctl print` 里那一行主进程 pid。格式一旦
+    /// 漂移，保护就静默失效（退回「点关 → 闪退」那个必修 bug），所以锁住实测形态：
+    /// 一个 TAB + `pid = <n>`，且不被 `last exit code`/`exit timeout` 之类干扰。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_launchd_job_pid_matches_real_print_output() {
+        assert_eq!(
+            parse_launchd_job_pid(
+                "\tstate = running\n\texit timeout = 5\n\tpid = 61995\n\tlast exit code = (never exited)\n"
+            ),
+            Some(61995)
+        );
+        // 无空格形态（未来格式变化的容错）
+        assert_eq!(parse_launchd_job_pid("        pid=42\n"), Some(42));
+        // 本机实测：那份 EX_CONFIG 的 job 输出里根本没有 pid 行 → None（可安全 bootout）
+        assert_eq!(
+            parse_launchd_job_pid(
+                "\tstate = spawn scheduled\n\truns = 1\n\tlast exit code = 78: EX_CONFIG\n"
+            ),
+            None
+        );
+        // 含 `pid` 字样但不是主进程行的，不误配
+        assert_eq!(parse_launchd_job_pid("\trespawn count = 3\n"), None);
     }
 
     /// 漂移判定四态：无 plist / 指向当前二进制 / 指向已消失的旧路径 / 指向另一份
