@@ -1042,7 +1042,6 @@ mod tests {
     async fn symlink_escape_still_denied_after_canonicalize() {
         // canonicalize 之后才比对 → 工作区内软链指向域外文件同样拒绝（读侧）
         let dir = test_dir();
-        let cwd = dir.path().to_str().unwrap();
         std::fs::write(dir.path().join("secret.txt"), "top").unwrap();
         std::os::unix::fs::symlink(dir.path().join("secret.txt"), dir.path().join("link.txt"))
             .unwrap();
@@ -1069,6 +1068,20 @@ mod tests {
         .await
         .unwrap();
         assert!(r.is_error, "symlink 指向域外必须拒绝: {}", r.text());
+        // 正向对照：ReadOnly 档读 root 内普通文件必须成功——否则上面那条"拒绝"
+        // 只是"什么都拒"，测不出越域判断本身。
+        std::fs::write(sub.join("plain.txt"), "inside").unwrap();
+        let inside = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "plain.txt" }),
+            subp,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!inside.is_error, "root 内文件被误拒: {}", inside.text());
     }
 
     #[tokio::test]
