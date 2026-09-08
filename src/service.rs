@@ -33,6 +33,30 @@ fn bundled_buzz_agent() -> Option<String> {
     })
 }
 
+/// 解析 buzz 执行层命令（`resolve_adapter` 的 bundled 输入；纯函数便于单测）。
+/// 决议链 = 文档承诺的顺序（#206 字段义）：
+/// ① `config.buzz_agent_exe` 覆盖（绝对路径是文件 → 直用；否则按 PATH 探测）——
+///    开发机指自己 build 的 fork、也作装了原生适配器的用户的逃生阀；
+/// ② 主程序同目录随包 `buzz-agent[.exe]`；
+/// ③ 都没有 → None（上层回落 pi-acp 兜底）。
+/// 覆盖配了但找不到 → 告警并落回 ②（宁可用随包版也不要起不来的进程）。
+fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
+    if !override_exe.trim().is_empty() {
+        let p = std::path::Path::new(override_exe.trim());
+        if p.is_file() {
+            return Some(override_exe.trim().to_string());
+        }
+        if let Some(found) = crate::deps::find_in_path(override_exe.trim()) {
+            return Some(found.display().to_string());
+        }
+        crate::log!(
+            "[acp] buzz_agent_exe 覆盖「{}」不存在/不可执行，回落随包解析",
+            override_exe.trim()
+        );
+    }
+    bundled_buzz_agent()
+}
+
 /// 适配器解析纯函数（单测覆盖）：`(命令, env 是否按 buzz-agent 语义装配)`。
 ///
 /// 决议链：主适配器已装 → 原生；否则随包 buzz-agent（永远在的执行层，
@@ -115,12 +139,14 @@ pub async fn run() {
         // **自动回落随包 buzz-agent**（用户决策：开箱即用优于后端死掉；装好适配器
         // 后自动切回原生）。返回 (命令, 是否回落 buzz-agent)——env 装配按实际
         // spawn 的 agent 语义走（见 env_for）。
+        // 覆盖/随包解析每进程一次（配置里 buzz_agent_exe 指错时只告警一回）
+        let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
         let adapter = |backend: &str| -> (String, bool) {
             let primary = primary_adapter(backend);
             let primary_found = primary
                 .map(|p| crate::deps::find_in_path(p).is_some())
                 .unwrap_or(false);
-            let bundled = bundled_buzz_agent();
+            let bundled = buzz_cmd.clone();
             match resolve_adapter(backend, primary_found, bundled) {
                 (cmd, true) if cmd != "pi-acp" => {
                     if let Some(p) = primary {
@@ -1396,6 +1422,26 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_buzz_agent_prefers_valid_override_and_falls_back() {
+        // ① 指向真实文件的绝对路径 → 直用
+        let dir = std::env::temp_dir().join(format!("abb-rba-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("my-agent");
+        std::fs::write(&fake, b"x").unwrap();
+        let expect = fake.display().to_string();
+        assert_eq!(resolve_buzz_agent(&expect), Some(expect.clone()));
+        // ② 覆盖指向不存在路径 → 回落随包（本机 dev 构建通常 None，不炸即正确）
+        let r = resolve_buzz_agent("/definitely/not/here-buzz");
+        assert!(
+            r == bundled_buzz_agent(),
+            "无效覆盖必须落回随包链，got {r:?}"
+        );
+        // ③ 空覆盖 = 纯随包链
+        assert_eq!(resolve_buzz_agent(""), bundled_buzz_agent());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// 适配器决议链（4 后端 × 探测组合）——命令与 env 语义配对是聊天可用性的
     /// 关键路径，任何配对错误都表现为静默异常（审查 P-1）。
