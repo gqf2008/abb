@@ -2878,7 +2878,15 @@ pub fn run_gui() -> Result<()> {
             }
         });
         tray.on_toggle_autostart(move |on| {
-            let _ = platform::set_autostart(on);
+            // 失败不再静默吞（老写法是 `let _ =`）：~/Library/LaunchAgents 不可写、
+            // launchctl bootstrap 被拒都是真故障，只落日志；菜单回显走 2s tick 的
+            // autostart_enabled()，读的是 plist 真值，不会显示成「已开启」。
+            if let Err(e) = platform::set_autostart(on) {
+                crate::log!(
+                    "[ui] ⚠️ 开机自启设置失败（想设为{}）: {e:#}",
+                    if on { "开" } else { "关" }
+                );
+            }
         });
         tray.on_check_update({
             let tx = txc();
