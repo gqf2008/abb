@@ -5475,7 +5475,6 @@ mod tests {
             base_url: "https://api.deepseek.com".into(),
             api_key: "sk-a".into(),
             model: "deepseek-chat".into(),
-            ..Default::default()
         }];
         let s1 = bots_struct_sig(&c);
         // ① 改 key → 翻签名
