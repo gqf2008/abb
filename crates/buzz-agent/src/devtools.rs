@@ -219,7 +219,13 @@ pub async fn run(
     provider_id: &str,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ToolResult, AgentError> {
-    let policy = crate::wire::ToolPolicy::build(crate::wire::Sandbox::FullAccess, cwd, None);
+    let policy = crate::wire::ToolPolicy::build(
+        crate::wire::Sandbox::FullAccess,
+        cwd,
+        None,
+        crate::wire::ShellMode::Full,
+        None,
+    );
     run_with_policy(tool, arguments, cwd, &policy, provider_id, cancel).await
 }
 
@@ -232,8 +238,7 @@ pub async fn run_with_policy(
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ToolResult, AgentError> {
     match tool {
-        // shell 的 argv 白名单策略在 P1.3b；本批只管 read/write 域（档位摘除在 P1.2）。
-        Tool::Shell => run_shell(arguments, cwd, provider_id, cancel).await,
+        Tool::Shell => run_shell(arguments, cwd, policy, provider_id, cancel).await,
         Tool::Read => run_read(arguments, cwd, policy, provider_id).await,
         Tool::Write => run_write(arguments, cwd, policy, provider_id).await,
         Tool::Ls => run_ls(arguments, cwd, policy, provider_id).await,
@@ -280,9 +285,33 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
 async fn run_shell(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ToolResult, AgentError> {
+    // P1.3b：Restricted 模式过 argv 白名单（granted 承诺语义）。拒绝以
+    // is_error 工具结果回流（模型可见、可改用白名单内命令），不挂回合。
+    if policy.shell == crate::wire::ShellMode::Restricted {
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match crate::shell_policy::check_restricted(
+            command,
+            &policy.write_roots,
+            policy.abb_bin.as_deref(),
+        ) {
+            crate::shell_policy::Decision::Allow => {}
+            crate::shell_policy::Decision::Deny(why) => {
+                return ok_result(provider_id, format!("shell: 拒绝受限命令：{why}")).map(
+                    |mut r| {
+                        r.is_error = true;
+                        r
+                    },
+                );
+            }
+        }
+    }
     let command = match arg_str(arguments, "command") {
         Some(c) if !c.trim().is_empty() => c,
         _ => return error_result(provider_id, "shell: missing required argument \"command\""),
@@ -967,8 +996,13 @@ mod tests {
         // dev__read 读 ~/.ssh、config.json（明文 key）的洞就此封死。
         let dir = test_dir();
         let cwd = dir.path().to_str().unwrap();
-        let policy =
-            crate::wire::ToolPolicy::build(crate::wire::Sandbox::WorkspaceWrite, cwd, None);
+        let policy = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::WorkspaceWrite,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
         let mut rx = watch::channel(false).1;
         let r = run_with_policy(
             Tool::Read,
@@ -983,7 +1017,13 @@ mod tests {
         assert!(r.is_error, "{:?}", r.text());
         assert!(r.text().contains("allowed roots"), "{}", r.text());
         // FullAccess 档保持今天：绝对路径可读（回归锁）
-        let full = crate::wire::ToolPolicy::build(crate::wire::Sandbox::FullAccess, cwd, None);
+        let full = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
         let ok = run_with_policy(
             Tool::Read,
             &json!({ "path": "/etc/hosts" }),
@@ -1010,7 +1050,13 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let subp = sub.to_str().unwrap();
         std::os::unix::fs::symlink(dir.path().join("secret.txt"), sub.join("link.txt")).unwrap();
-        let policy = crate::wire::ToolPolicy::build(crate::wire::Sandbox::ReadOnly, subp, None);
+        let policy = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::ReadOnly,
+            subp,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
         let mut rx = watch::channel(false).1;
         let r = run_with_policy(
             Tool::Read,
@@ -1025,9 +1071,74 @@ mod tests {
         assert!(r.is_error, "symlink 指向域外必须拒绝: {}", r.text());
     }
 
+    #[tokio::test]
+    async fn restricted_shell_whitelist_allows_and_denies() {
+        // P1.3b：Restricted 模式——白名单内放行、外拒绝（is_error 回流可自纠）
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let policy = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::WorkspaceWrite,
+            cwd,
+            None,
+            crate::wire::ShellMode::Restricted,
+            Some("/usr/bin/agent-bridge".into()),
+        );
+        // sender 必须存活：drop 即广播「取消」，shell 回合会 Cancelled
+        let (_tx, mut rx) = watch::channel(false);
+        let ok = run_with_policy(
+            Tool::Shell,
+            &json!({ "command": "echo whitelist-ok" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error, "{}", ok.text());
+        assert!(ok.text().contains("whitelist-ok"), "{}", ok.text());
+        let denied = run_with_policy(
+            Tool::Shell,
+            &json!({ "command": "rm -rf /tmp/x" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(denied.is_error, "rm 必须拒绝: {}", denied.text());
+        assert!(denied.text().contains("受限白名单"), "{}", denied.text());
+        // Full 模式回归锁：任意命令照跑（今天行为）
+        let full = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let free = run_with_policy(
+            Tool::Shell,
+            &json!({ "command": "echo free-ok" }),
+            cwd,
+            &full,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!free.is_error);
+    }
+
     /// FullAccess 测试策略（与今天字节级一致：读不限、写限 cwd）。
     fn test_policy(cwd: &str) -> crate::wire::ToolPolicy {
-        crate::wire::ToolPolicy::build(crate::wire::Sandbox::FullAccess, cwd, None)
+        crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        )
     }
 
     fn test_dir() -> tempfile::TempDir {

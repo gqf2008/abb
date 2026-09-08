@@ -1199,7 +1199,7 @@ mod sandbox_tests {
                 &cfg,
                 &[],
                 cwd,
-                crate::wire::ToolPolicy::build(sb, cwd, None),
+                crate::wire::ToolPolicy::build(sb, cwd, None, crate::wire::ShellMode::Full, None),
             )
             .await
             .unwrap();
@@ -1227,8 +1227,20 @@ mod sandbox_tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let cfg = cfg_with_dev_tools();
-        let pa = crate::wire::ToolPolicy::build(Sandbox::FullAccess, cwd, None);
-        let pb = crate::wire::ToolPolicy::build(Sandbox::FullAccess, cwd, None);
+        let pa = crate::wire::ToolPolicy::build(
+            Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let pb = crate::wire::ToolPolicy::build(
+            Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
         let a = McpRegistry::spawn_all(&cfg, &[], cwd, pa).await.unwrap();
         let b = McpRegistry::spawn_all(&cfg, &[], cwd, pb).await.unwrap();
         let mut n1: Vec<_> = a.tools().iter().map(|d| d.name.clone()).collect();

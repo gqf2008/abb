@@ -11,6 +11,7 @@ mod llm;
 mod mcp;
 pub mod model_capabilities;
 mod permission;
+mod shell_policy;
 pub mod types;
 mod wire;
 
@@ -448,7 +449,21 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
     }
     // P1.3a：读/写域根（FullAccess=今天：读不限、写限 cwd）。
     let extra_roots: Option<Vec<String>> = p.meta.as_ref().and_then(|m| m.writable_roots.clone());
-    let policy = crate::wire::ToolPolicy::build(sandbox, &p.cwd, extra_roots);
+    let meta = p.meta.as_ref();
+    let shell = crate::wire::ShellMode::parse_opt(meta.and_then(|m| m.shell.as_deref()));
+    let (shell, shell_recognized) = match (shell, meta.and_then(|m| m.shell.as_deref())) {
+        (crate::wire::ShellMode::Restricted, _) => (shell, true),
+        (_, None) => (shell, false),
+        _ => (shell, true),
+    };
+    if meta.and_then(|m| m.shell.as_deref()).is_some() && !shell_recognized {
+        tracing::warn!(
+            "session/new: unknown shell mode {:?}, falling back to full",
+            meta.and_then(|m| m.shell.as_deref())
+        );
+    }
+    let abb_bin = meta.and_then(|m| m.abb_bin.clone());
+    let policy = crate::wire::ToolPolicy::build(sandbox, &p.cwd, extra_roots, shell, abb_bin);
     // Check cap without holding lock across MCP spawn (which may be slow).
     {
         let sessions = app.sessions.lock().await;
