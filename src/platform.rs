@@ -471,10 +471,60 @@ enum LoginItem {
     Drifted,
 }
 
-/// 取 plist 里 `ProgramArguments` 数组的第一个 `<string>`。自己写的 schema 自己
-/// 解析（不为此引一个 plist 依赖）；读不到就判 [`LoginItem::Absent`]，绝不猜。
+/// plist 字符串值的 XML 转义（写侧）。不转义时含 `&` 的路径会产出非法 plist，
+/// launchd 直接拒载——而本 PR 的立身之本就是「回显说真话」，故写转义、读还原。
 #[cfg(target_os = "macos")]
-fn plist_program_argument(text: &str) -> Option<&str> {
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
+fn xml_unescape(s: &str) -> String {
+    // 还原顺序与写侧相反：最后才还原 `&amp;`，否则 `&amp;lt;` 会被二次解码成 `<`。
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// 自启 plist 的唯一模板（纯函数，便于单测锁 schema）。这些键不是装饰：
+/// `KeepAlive`/`ThrottleInterval` 承载本机实测结论，被人顺手删掉就等于把
+/// 「崩溃不复活」的老毛病改回来，所以有测试断言它们必须存在。
+#[cfg(target_os = "macos")]
+fn build_login_plist(exe: &std::path::Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
+"#,
+        label = xml_escape(LOGIN_ITEM_LABEL),
+        exe = xml_escape(&exe.display().to_string()),
+    )
+}
+
+/// 取 plist 里 `ProgramArguments` 数组的第一个 `<string>`（已 XML 还原）。自己写的
+/// schema 自己解析（不为此引一个 plist 依赖）；读不到就判 [`LoginItem::Absent`]，绝不猜。
+#[cfg(target_os = "macos")]
+fn plist_program_argument(text: &str) -> Option<String> {
     text.split("<key>ProgramArguments</key>")
         .nth(1)?
         .split("<array>")
@@ -483,6 +533,7 @@ fn plist_program_argument(text: &str) -> Option<&str> {
         .nth(1)
         .and_then(|s| s.split("</string>").next())
         .map(str::trim)
+        .map(xml_unescape)
 }
 
 /// 判定自启项状态。`plist`/`current` 参数化是为单测（不碰真实 ~/Library）。
@@ -496,7 +547,7 @@ fn login_item_state_at(plist: &std::path::Path, current: &std::path::Path) -> Lo
     let Some(arg) = plist_program_argument(&text) else {
         return LoginItem::Absent;
     };
-    let registered = std::path::Path::new(arg);
+    let registered = std::path::Path::new(&arg);
     if !registered.exists() {
         return LoginItem::Drifted;
     }
@@ -565,46 +616,61 @@ pub fn heal_autostart() {}
 pub fn set_autostart(enable: bool) -> Result<()> {
     let plist = login_item_plist();
     if !enable {
-        // 先摘 launchd 再删文件：否则本会话内 job 还挂着，下次登录前用户以为已关。
-        unload_login_agent();
+        // 顺序要紧：先删 plist（「下次登录不再自启」的硬判据，必须落定），再尽力摘掉
+        // 本会话的 job。反过来先 bootout 会在「launchd 拉起的实例里点关」时当场把自己
+        // 杀掉，删文件永远轮不到——用户看到 App 凭空退出而自启照旧（审查必修项）。
         if plist.exists() {
             std::fs::remove_file(&plist).with_context(|| "删除登录项失败")?;
         }
+        if login_job_is_self() {
+            crate::log!("[autostart] 本进程是 launchd 拉起的 job，跳过 bootout（摘它会杀掉自己）——已关，下次登录不再自启");
+            return Ok(());
+        }
+        unload_login_agent();
         return Ok(());
     }
     let exe = current_exe()?;
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-</dict>
-</plist>
-"#,
-        label = LOGIN_ITEM_LABEL,
-        exe = exe.display(),
-    );
-    std::fs::write(&plist, content)
+    std::fs::write(&plist, build_login_plist(&exe))
         .with_context(|| format!("写登录项失败: {}", plist.display()))?;
+    if login_job_is_self() {
+        // 同上：不 bootout 自己。拉起我们这个进程的旧定义里 ProgramArguments 就是当前
+        // 二进制（否则不会 exec 到这里），与新写的文件唯一的差别是 KeepAlive /
+        // ThrottleInterval 这些新增键——它们对本会话没有意义，下次登录 launchd 重读
+        // 文件自然生效。
+        crate::log!(
+            "[autostart] 本进程是 launchd 拉起的 job，跳过 reload（保活新增键下次登录生效）"
+        );
+        return Ok(());
+    }
     reload_login_agent(&plist)
+}
+
+/// 由 launchd 拉起的自启 job 是否就是本进程。
+/// 判据是 `launchctl print` 里那条缩进一级的 `pid = <n>`（`responsible pid`/
+/// `last exit code` 等都不是 job 本体，故只认前缀恰为 `pid = ` 的行）。拿不到输出、
+/// job 没加载、没有 pid 一律判 false——那时摘它伤不到自己。
+#[cfg(target_os = "macos")]
+fn login_job_is_self() -> bool {
+    let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
+    let Ok(out) = std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let me = std::process::id();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| match l.trim().strip_prefix("pid = ") {
+            Some(v) => v.trim().parse::<u32>() == Ok(me),
+            None => false,
+        })
 }
 
 /// 让 launchd 改用磁盘上最新定义（bootout 旧 job → bootstrap 新 plist）。
@@ -891,7 +957,7 @@ mod tests {
             plist_program_argument(
                 "<dict>\n  <key>ProgramArguments</key>\n  <array>\n    <string>/Applications/ABB.app/Contents/MacOS/agent-bridge</string>\n  </array>\n</dict>"
             ),
-            Some("/Applications/ABB.app/Contents/MacOS/agent-bridge")
+            Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string())
         );
         // 无 ProgramArguments（畸形/手写遗留）
         assert_eq!(
@@ -903,6 +969,52 @@ mod tests {
             plist_program_argument("<key>ProgramArguments</key><array></array>"),
             None
         );
+        // 后面还跟着别的 array（如 StandardPaths 之流）也不误伤：只取本 key 之后第一个
+        assert_eq!(
+            plist_program_argument(
+                "<key>ProgramArguments</key><array><string>/a/b</string></array><key>X</key><array><string>/c/d</string></array>"
+            ),
+            Some("/a/b".to_string())
+        );
+    }
+
+    /// plist 模板 ↔ 解析的往返，以及模板里承载实测结论的那几个键必须存在。
+    /// 抽成 `build_login_plist` 就是为了让这条测试能锁住 schema：谁把 `KeepAlive`
+    /// 顺手删了（=「崩溃自动拉起」这条承诺静默失效），这里就红。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_plist_round_trips_and_keeps_measured_keys() {
+        // 含 XML 特殊字符的路径：写侧必须转义，否则产出非法 plist（launchd 直接拒载），
+        // 而解析器又得还原回原路径，不然回显再次说谎。
+        for p in [
+            "/Applications/ABB.app/Contents/MacOS/agent-bridge",
+            "/Users/x/My Apps&Co/ABB.app/Contents/MacOS/agent-bridge",
+            "/tmp/a<b>c/agent-bridge",
+        ] {
+            let built = build_login_plist(std::path::Path::new(p));
+            assert!(
+                !built.contains("&Co") && built.contains("&amp;Co") == p.contains('&'),
+                "转义不符: {built}"
+            );
+            assert_eq!(plist_program_argument(&built).as_deref(), Some(p));
+        }
+        let built = build_login_plist(std::path::Path::new("/x/agent-bridge"));
+        for key in [
+            "<key>Label</key>",
+            "<key>ProgramArguments</key>",
+            "<key>RunAtLoad</key>",
+            "<key>KeepAlive</key>",
+            "<key>SuccessfulExit</key>",
+            "<key>ThrottleInterval</key>",
+        ] {
+            assert!(built.contains(key), "plist 模板缺键 {key}：{built}");
+        }
+        // SuccessfulExit=false + ThrottleInterval=10 是实测选型，值也一并锁住
+        assert!(
+            built.contains("<key>SuccessfulExit</key>\n    <false/>"),
+            "{built}"
+        );
+        assert!(built.contains("<integer>10</integer>"), "{built}");
     }
 
     /// 漂移判定四态：无 plist / 指向当前二进制 / 指向已消失的旧路径 / 指向另一份
@@ -917,14 +1029,8 @@ mod tests {
         let current = base.join("agent-bridge");
         std::fs::write(&current, b"bin").unwrap();
         let write_plist = |exe: &std::path::Path| {
-            std::fs::write(
-                &plist,
-                format!(
-                    "<key>ProgramArguments</key><array><string>{}</string></array>",
-                    exe.display()
-                ),
-            )
-            .unwrap();
+            // 用真实模板造夹具（而不是手写一小段 XML），这样模板与解析器一起被锁。
+            std::fs::write(&plist, build_login_plist(exe)).unwrap();
         };
 
         // 没有 plist = 用户从未开自启（自愈绝不能顺手给他开）
