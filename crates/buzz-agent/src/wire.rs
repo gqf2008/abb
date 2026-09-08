@@ -79,6 +79,12 @@ pub struct SessionNewMeta {
     /// 写/读域根（P1.3 生效）。None = 仅 session cwd。
     #[serde(default)]
     pub writable_roots: Option<Vec<String>>,
+    /// shell 策略："restricted" = argv 白名单（P1.3b）；缺省 = 今天。
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// ABB 主程序路径（`$ABB_BIN` 白名单的实体）。
+    #[serde(default)]
+    pub abb_bin: Option<String>,
 }
 
 /// 会话执行档位（`_meta.sandbox` 解析产物）。语义：
@@ -104,10 +110,40 @@ pub struct ToolPolicy {
     pub read_roots: Option<Vec<std::path::PathBuf>>,
     /// 写域根（任一命中即允许）。FullAccess = [session cwd]（今天行为）。
     pub write_roots: Vec<std::path::PathBuf>,
+    /// shell 策略（P1.3b）：Full=今天无限制；Restricted=argv 白名单
+    /// （granted 承诺语义：$ABB_BIN job add/session reset/deliver + 只读 git
+    /// + 域内只读命令；复合语法拒绝）。
+    pub shell: ShellMode,
+    /// ABB 主程序路径（`_meta.abbBin`）——Restricted 模式认 `$ABB_BIN` 白名单。
+    pub abb_bin: Option<String>,
+}
+
+/// shell 执行策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMode {
+    /// 今天的行为：任意命令（env 白名单之外无内容校验）。
+    Full,
+    /// argv 白名单（shell_policy::check_restricted）。
+    Restricted,
+}
+
+impl ShellMode {
+    pub fn parse_opt(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) if v.eq_ignore_ascii_case("restricted") => Self::Restricted,
+            _ => Self::Full, // 缺省/未知 = 今天（协议噪音不挂聊天；warn 由调用方做）
+        }
+    }
 }
 
 impl ToolPolicy {
-    pub fn build(sandbox: Sandbox, cwd: &str, extra_roots: Option<Vec<String>>) -> Self {
+    pub fn build(
+        sandbox: Sandbox,
+        cwd: &str,
+        extra_roots: Option<Vec<String>>,
+        shell: ShellMode,
+        abb_bin: Option<String>,
+    ) -> Self {
         let cwd_path = std::path::PathBuf::from(cwd);
         let mut roots = vec![cwd_path.clone()];
         for r in extra_roots.unwrap_or_default() {
@@ -116,16 +152,25 @@ impl ToolPolicy {
                 roots.push(pth);
             }
         }
+        let shell = if sandbox == Sandbox::ReadOnly {
+            ShellMode::Full // read-only 档 shell 已被工具面摘除，模式无意义
+        } else {
+            shell
+        };
         match sandbox {
             Sandbox::FullAccess => Self {
                 sandbox,
                 read_roots: None,
                 write_roots: vec![cwd_path],
+                shell,
+                abb_bin,
             },
             _ => Self {
                 sandbox,
                 read_roots: Some(roots.clone()),
                 write_roots: roots,
+                shell,
+                abb_bin,
             },
         }
     }
