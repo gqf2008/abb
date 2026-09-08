@@ -368,6 +368,36 @@ pub fn read_attachment_bytes(meta: &AttachmentMeta) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// 各目的地平台的上传体积上限（字节）：飞书 image 10MB / file 30MB（官方文档），
+/// 钉钉媒体 image 取保守 20MB。发送前先按元数据大小预检——整读进内存再被
+/// 服务端拒（HTTP 413 / 尺寸错误）既白烧内存又难诊断（审查 #254）。
+pub const FEISHU_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const FEISHU_FILE_MAX_BYTES: u64 = 30 * 1024 * 1024;
+pub const DINGTALK_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 读取前的体积预检：按 metadata().len() 对比目的地 caps。
+/// 文件不存在/无路径 → 交由 read_attachment_bytes 报同款错误（这里只量尺寸）。
+pub fn check_sendable_size(meta: &AttachmentMeta, max: u64) -> Result<()> {
+    if meta.path.is_empty() {
+        return Ok(()); // 由 read 报缺路径错误
+    }
+    if let Ok(m) = std::fs::metadata(&meta.path) {
+        if m.len() > max {
+            anyhow::bail!(
+                "附件过大（{} MB > 平台上限 {} MB）：{name}",
+                m.len() / (1024 * 1024),
+                max / (1024 * 1024),
+                name = if meta.file_name.is_empty() {
+                    &meta.path
+                } else {
+                    &meta.file_name
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

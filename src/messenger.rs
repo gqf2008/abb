@@ -12,6 +12,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// 飞书附件发送计划（纯函数——分发决策有单测钉死，审查 #254：dispatch 零覆盖）。
+/// `kind==image` 但扩展名不在 images 端点可靠集（svg/ico/heic…）→ 走文件卡片，
+/// 避免上传被服务端格式校验拒时整个附件失败。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FeishuSendPlan {
+    Image,
+    File(&'static str),
+}
+
+pub(crate) fn feishu_send_plan(meta: &crate::attachments::AttachmentMeta) -> FeishuSendPlan {
+    if meta.kind == "image" && crate::feishu::feishu_image_uploadable(&meta.file_name) {
+        FeishuSendPlan::Image
+    } else {
+        FeishuSendPlan::File(crate::feishu::feishu_file_type(&meta.file_name))
+    }
+}
+
+/// 钉钉附件能力闸（纯函数）：当前仅「群聊 + 图片」。判前于读文件（省大 IO）。
+pub(crate) fn dingtalk_can_send(meta: &crate::attachments::AttachmentMeta, chat_id: &str) -> bool {
+    meta.kind == "image" && crate::dingtalk::is_group_chat(chat_id)
+}
+
 /// 引用消息的原始内容（附件尚未下载；`attachments` 是各通道的附件描述，供
 /// `download_attachment` 下载成元数据）。
 #[derive(Debug, Clone, Default)]
@@ -232,24 +254,33 @@ impl Messenger for FeishuMessenger {
     ) -> Result<()> {
         // 真实文件发送（#253）：读本地附件 → 平台上传 → 以媒体消息发出，
         // 不再给用户塞「带本地路径的文本元数据」。失败原样上报（deliver 回源提示）。
-        let bytes = crate::attachments::read_attachment_bytes(meta)?;
-        if meta.kind == "image" {
-            let key = self.fs.upload_image(bytes).await?;
-            return self
-                .fs
-                .send_media_message(chat_id, "image", &meta.file_name, &key, "image")
-                .await;
-        }
-        let ft = crate::feishu::feishu_file_type(&meta.file_name);
+        // 分发决策在纯函数 feishu_send_plan（单测钉死）；上传带真实文件名（服务端
+        // 按后缀校验格式，审查 #254）。
         let name = if meta.file_name.is_empty() {
             "attachment"
         } else {
             meta.file_name.as_str()
         };
-        let key = self.fs.upload_file(ft, name, bytes).await?;
-        self.fs
-            .send_media_message(chat_id, "file", name, &key, &meta.kind)
-            .await
+        match feishu_send_plan(meta) {
+            FeishuSendPlan::Image => {
+                crate::attachments::check_sendable_size(
+                    meta,
+                    crate::attachments::FEISHU_IMAGE_MAX_BYTES,
+                )?;
+                let bytes = crate::attachments::read_attachment_bytes(meta)?;
+                let key = self.fs.upload_image(bytes, name).await?;
+                self.fs.send_media_message(chat_id, "image", &key).await
+            }
+            FeishuSendPlan::File(ft) => {
+                crate::attachments::check_sendable_size(
+                    meta,
+                    crate::attachments::FEISHU_FILE_MAX_BYTES,
+                )?;
+                let bytes = crate::attachments::read_attachment_bytes(meta)?;
+                let key = self.fs.upload_file(ft, name, bytes).await?;
+                self.fs.send_media_message(chat_id, "file", &key).await
+            }
+        }
     }
 
     async fn typing(&self, message_id: &str) -> Option<String> {
@@ -445,21 +476,28 @@ impl Messenger for DingTalkMessenger {
         chat_id: &str,
         meta: &crate::attachments::AttachmentMeta,
     ) -> Result<()> {
-        let bytes = crate::attachments::read_attachment_bytes(meta)?;
-        if meta.kind == "image" && crate::dingtalk::is_group_chat(chat_id) {
-            let media_id = self.dt.upload_image(bytes).await?;
-            return self
-                .dt
-                .send_group_image(chat_id, &self.robot_code, &media_id)
-                .await;
+        // 能力闸**先于读文件**（审查 #254：不支持的组合曾把 100MB 整读进内存再丢）。
+        if !dingtalk_can_send(meta, chat_id) {
+            anyhow::bail!(
+                "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊图片；文件/语音/单聊媒体待 #253 后续补",
+                meta.kind,
+                if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" }
+            )
         }
-        // 其余组合（单聊媒体 / 文件/语音/视频消息）钉钉 Stream 机器人消息集暂未覆盖：
-        // 明确报错而不是假装成功或退化成文本元数据，待 #253 后续补齐。
-        anyhow::bail!(
-            "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊图片；文件/语音/单聊媒体待 #253 后续补",
-            meta.kind,
-            if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" }
-        )
+        crate::attachments::check_sendable_size(
+            meta,
+            crate::attachments::DINGTALK_IMAGE_MAX_BYTES,
+        )?;
+        let bytes = crate::attachments::read_attachment_bytes(meta)?;
+        let name = if meta.file_name.is_empty() {
+            "attachment"
+        } else {
+            meta.file_name.as_str()
+        };
+        let media_id = self.dt.upload_image(bytes, name).await?;
+        self.dt
+            .send_group_image(chat_id, &self.robot_code, &media_id)
+            .await
     }
 
     async fn download_attachment(
@@ -547,5 +585,61 @@ pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
         Ok(std::sync::Arc::new(FeishuMessenger {
             fs: FeishuClient::new(&bot.app_id, &bot.app_secret),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(kind: &str, file_name: &str) -> crate::attachments::AttachmentMeta {
+        crate::attachments::AttachmentMeta {
+            kind: kind.into(),
+            source: "feishu".into(),
+            file_name: file_name.into(),
+            mime: String::new(),
+            size: 10,
+            path: "/tmp/whatever".into(),
+            sha256: String::new(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn feishu_plan_image_only_for_uploadable_extensions() {
+        assert_eq!(
+            feishu_send_plan(&meta("image", "shot.png")),
+            FeishuSendPlan::Image
+        );
+        assert_eq!(
+            feishu_send_plan(&meta("image", "a.JPEG")),
+            FeishuSendPlan::Image
+        );
+        // svg/heic：kind=image 但 images 端点不稳 → 文件卡片（stream）
+        assert_eq!(
+            feishu_send_plan(&meta("image", "logo.svg")),
+            FeishuSendPlan::File("stream")
+        );
+        assert_eq!(
+            feishu_send_plan(&meta("image", "old.heic")),
+            FeishuSendPlan::File("stream")
+        );
+        // 真文件按扩展名定型
+        assert_eq!(
+            feishu_send_plan(&meta("file", "报告.pdf")),
+            FeishuSendPlan::File("pdf")
+        );
+        assert_eq!(
+            feishu_send_plan(&meta("audio", "voice.mp3")),
+            FeishuSendPlan::File("stream")
+        );
+    }
+
+    #[test]
+    fn dingtalk_gate_group_image_only() {
+        // 群 openConversationId 恒以 cid 开头（模块头约定）
+        assert!(dingtalk_can_send(&meta("image", "a.png"), "cidAsXB=="));
+        assert!(!dingtalk_can_send(&meta("image", "a.png"), "staff_123"));
+        assert!(!dingtalk_can_send(&meta("file", "a.pdf"), "cidAsXB=="));
     }
 }

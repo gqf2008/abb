@@ -292,13 +292,17 @@ impl Router {
             .await;
             return;
         }
-        // 先发文本，再逐个发附件（附件失败只回源报错，附件无 outbox 文本可补）。
+        // 先发文本，再逐个发附件。**每个附件独立成败**：某个失败要上报但绝不
+        // 吞掉后面的附件（审查 #254：真发送引入了多种新失败模式——超大/格式
+        // 不支持/能力边界，旧「首败即 return」会把一次投递里其余本可送达的
+        // 附件连坐丢弃）。全部成功才进防循环登记（见 mark_delivered）。
         if !item.text.is_empty() {
             if let Err(e) = msgr.send_text(&item.target_chat, &item.text).await {
                 self.fail_text(item, &e).await;
                 return;
             }
         }
+        let mut failed: Vec<String> = Vec::new();
         for meta in &item.attachments {
             if let Err(e) = msgr.send_attachment(&item.target_chat, meta).await {
                 crate::log!(
@@ -307,16 +311,33 @@ impl Router {
                     tc,
                     meta.file_name
                 );
-                self.notify_source(
-                    item,
-                    &format!(
-                        "⚠️ 跨会话投递到「{}」的附件「{}」失败：{e:#}（元数据/本地路径已在前一条文本里）。",
-                        item.target_bot, meta.file_name
-                    ),
-                )
-                .await;
-                return;
+                failed.push(format!(
+                    "{}（{e:#}）",
+                    if meta.file_name.is_empty() {
+                        "未命名附件"
+                    } else {
+                        meta.file_name.as_str()
+                    }
+                ));
             }
+        }
+        if !failed.is_empty() {
+            self.notify_source(
+                item,
+                &format!(
+                    "⚠️ 跨会话投递到「{}」：{}/{} 个附件发送失败：{}。其余内容已送达。",
+                    item.target_bot,
+                    failed.len(),
+                    item.attachments.len(),
+                    failed.join("；")
+                ),
+            )
+            .await;
+        }
+        // 防循环指纹只在**完全成功**时登记：部分失败也记会让 10 分钟内的合法
+        // 重试被「防循环」挡掉，失败的那件永远补不回来（审查 #254）。
+        if !failed.is_empty() {
+            return;
         }
         crate::log!(
             "[deliver] 已投递 bot={} chat={} id={} 文本长度={} 附件数={}",
@@ -326,14 +347,18 @@ impl Router {
             item.text.chars().count(),
             item.attachments.len()
         );
+        if item.job_id.is_empty() {
+            self.mark_delivered(item);
+        }
     }
 
     /// 防循环去重：同（来源 bot/会话, 目标 bot/会话, 文本, 附件 sha256 列表）在窗口内只投一次。
     /// 附件 sha256 进指纹：纯附件投递（文本为空）或同文本不同附件不应被误判重复。
-    fn is_duplicate(&self, item: &DeliveryItem) -> bool {
+    /// 投递指纹（防循环键）。
+    fn dup_key(item: &DeliveryItem) -> String {
         let mut sha: Vec<&str> = item.attachments.iter().map(|a| a.sha256.as_str()).collect();
         sha.sort_unstable();
-        let dup_key = format!(
+        format!(
             "{}|{}|{}|{}|{}|{}",
             item.source_bot,
             item.source_chat,
@@ -341,7 +366,14 @@ impl Router {
             item.target_chat,
             item.text,
             sha.join(",")
-        );
+        )
+    }
+
+    /// 查指纹是否命中近窗（**只查不记**——审查 #254：旧实现在检查时就把指纹写进
+    /// recent，发送失败后 10 分钟内的合法重试会被「防循环」挡掉，槽位被失败的
+    /// 投递污染）。记录移到 `mark_delivered`，仅在真正投递成功后调用。
+    fn is_duplicate(&self, item: &DeliveryItem) -> bool {
+        let dup_key = Self::dup_key(item);
         let mut recent = self.recent.lock().unwrap();
         let now = crate::chrono_lite::unix_secs();
         while recent
@@ -351,11 +383,14 @@ impl Router {
         {
             recent.pop_front();
         }
-        let dup = recent.iter().any(|(_, k)| k == &dup_key);
-        if !dup {
-            recent.push_back((now, dup_key));
-        }
-        dup
+        recent.iter().any(|(_, k)| k == &dup_key)
+    }
+
+    /// 投递成功后登记指纹（进防循环窗口）。
+    fn mark_delivered(&self, item: &DeliveryItem) {
+        let dup_key = Self::dup_key(item);
+        let now = crate::chrono_lite::unix_secs();
+        self.recent.lock().unwrap().push_back((now, dup_key));
     }
 
     /// 文本投递失败：微信目标落其 outbox 等下次入站补发（#9 模式），同时回源报错。

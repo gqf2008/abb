@@ -297,7 +297,10 @@ impl DingTalkClient {
     /// 走旧网关 app 级媒体上传 POST /media/upload?type=image&access_token=…，
     /// multipart 字段名固定 `media`（服务端缺 multipart 时报 43008「参数需要multipart类型」——
     /// 已用无鉴权 POST 探测确认该路由真实存在）。返回 media_id（形如 "@…"）。
-    pub async fn upload_image(&self, bytes: Vec<u8>) -> Result<String> {
+    /// `file_name` 必须带真实扩展名：钉钉按文件名后缀校验媒体类型，固定名 "image"
+    /// 会被判 40004「不合法的媒体文件类型」（审查 #254）。上传走 120s 超时
+    /// （全局 30s 会掐断大图；与下载路径同预算）。
+    pub async fn upload_image(&self, bytes: Vec<u8>, file_name: &str) -> Result<String> {
         let token = self.access_token().await?;
         let url = format!(
             "{}{}?type=image&access_token={}",
@@ -305,11 +308,12 @@ impl DingTalkClient {
         );
         let form = reqwest::multipart::Form::new().part(
             "media",
-            reqwest::multipart::Part::bytes(bytes).file_name("image"),
+            reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string()),
         );
         let resp: Value = self
             .http
             .post(&url)
+            .timeout(Duration::from_secs(120))
             .multipart(form)
             .send()
             .await
@@ -331,7 +335,10 @@ impl DingTalkClient {
             .context("钉钉媒体上传响应缺 media_id")
     }
 
-    /// 群聊发送图片消息（机器人 msgKey=sampleImageMsg）。picMediaId 来自 media/upload。
+    /// 群聊发送图片消息（机器人 msgKey=sampleImageMsg）。官方文档该 msgKey 的
+    /// msgParam 字段是 **photoURL**（可填完整 URL 或 media/upload 返回的 media_id，
+    /// 见 open.dingtalk.com 消息类型文档）；`picMediaId` 是 sampleVideoMsg 的封面
+    /// 字段，用错会 400 miss.param.photo（审查 #254）。
     /// 与 send_group 同走 v1.0 robot/groupMessages/send，仅 msgKey/msgParam 不同；
     /// 请求形状照官方文档 + mock 单测锁定。
     pub async fn send_group_image(
@@ -345,7 +352,7 @@ impl DingTalkClient {
             "robotCode": robot_code,
             "openConversationId": conversation_id,
             "msgKey": "sampleImageMsg",
-            "msgParam": serde_json::to_string(&json!({ "picMediaId": media_id }))?,
+            "msgParam": serde_json::to_string(&json!({ "photoURL": media_id }))?,
         });
         let resp = self
             .http
@@ -1376,7 +1383,7 @@ mod tests {
         let server = dt_mock_server(routes).await;
         let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
         let media_id = dt
-            .upload_image(b"fake-image-bytes-001".to_vec())
+            .upload_image(b"fake-image-bytes-001".to_vec(), "shot.png")
             .await
             .unwrap();
         assert_eq!(media_id, "@lADPtest");
@@ -1397,6 +1404,12 @@ mod tests {
             up.body
         );
         assert!(up.body.contains("fake-image-bytes-001"), "应含图片字节");
+        // 审查 #254：钉钉按文件名后缀校验媒体类型——part 文件名必须带真实扩展名
+        assert!(
+            up.body.contains("filename=\"shot.png\""),
+            "part 文件名须带扩展名: {}",
+            up.body
+        );
     }
 
     #[tokio::test]
@@ -1408,7 +1421,7 @@ mod tests {
         );
         let server = dt_mock_server(routes).await;
         let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
-        let e = dt.upload_image(b"x".to_vec()).await.unwrap_err();
+        let e = dt.upload_image(b"x".to_vec(), "a.png").await.unwrap_err();
         assert!(e.to_string().contains("43008"), "errcode 应进文案: {e:#}");
     }
 
@@ -1422,7 +1435,7 @@ mod tests {
         );
         let server = dt_mock_server(routes).await;
         let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
-        let e = dt.upload_image(b"x".to_vec()).await.unwrap_err();
+        let e = dt.upload_image(b"x".to_vec(), "a.png").await.unwrap_err();
         assert!(
             e.to_string().contains("media_id"),
             "缺 media_id 应报错: {e:#}"
@@ -1457,6 +1470,8 @@ mod tests {
         assert_eq!(body["openConversationId"], "cidAsXSBLnA==");
         assert_eq!(body["msgKey"], "sampleImageMsg");
         let param: Value = serde_json::from_str(body["msgParam"].as_str().unwrap()).unwrap();
-        assert_eq!(param["picMediaId"], "@lADPtest");
+        // 官方 sampleImageMsg 字段是 photoURL（media_id 或 URL）；picMediaId 属视频封面
+        assert_eq!(param["photoURL"], "@lADPtest");
+        assert!(param.get("picMediaId").is_none(), "不得再发 picMediaId");
     }
 }

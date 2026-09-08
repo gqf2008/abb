@@ -135,21 +135,34 @@ fn resource_from_content(v: &serde_json::Value) -> Option<FeishuResource> {
 /// /im/v1/files 允许的 file_type（飞书文档口径：opus/mp4/pdf/doc/xls/ppt/stream）。
 /// 发送侧（#253）按文件名后缀映射；未知后缀回落通用 "stream"——消息仍以 file 卡片
 /// 真实送达（验收只要求「收到真实文件」），更细的类型（如把 mp3 当 opus 语音卡）后续按需扩展。
+/// 注意：mp4 是飞书为**视频**保留的容器类型，mov/mkv/webm 等异容器声明成 mp4
+/// 会被服务端按内容校验拒掉（审查 #254）——一律回落 stream。
 pub fn feishu_file_type(file_name: &str) -> &'static str {
-    let ext = file_name
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    match ext.as_str() {
+    // 无点文件名（如名为 "pdf" 的文件）不能把整个名字当扩展名。
+    let Some((_, ext)) = file_name.rsplit_once('.') else {
+        return "stream";
+    };
+    match ext.trim().to_ascii_lowercase().as_str() {
         "pdf" => "pdf",
         "doc" | "docx" => "doc",
         "xls" | "xlsx" => "xls",
         "ppt" | "pptx" => "ppt",
-        "mp4" | "mov" | "m4v" | "mkv" | "webm" | "avi" => "mp4",
+        "mp4" => "mp4",
         _ => "stream",
     }
+}
+
+/// 飞书 images 端点（msg_type=image 内联图）可靠渲染的图片扩展名。
+/// 不在表内的「图片」（svg/ico/heic/tiff…，kind_from_name 会把它们归 image）
+/// 走文件卡片更稳——images 上传被服务端格式校验拒时整个附件会失败（审查 #254）。
+pub fn feishu_image_uploadable(file_name: &str) -> bool {
+    matches!(
+        file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+    )
 }
 
 pub struct FeishuClient {
@@ -397,34 +410,76 @@ impl FeishuClient {
         Ok((bytes, mime))
     }
 
+    /// 非 2xx / 非 JSON 的 API 响应统一转可诊断错误（审查 #254：直接 `.json()`
+    /// 会把网关的 413/502 HTML 塌成「响应非 JSON」，丢光状态码）。
+    async fn api_json(resp: reqwest::Response, label: &str) -> Result<serde_json::Value> {
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context(format!("{label}：读响应体失败"))?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .map(|v| format!("code={:?} msg={:?}", v.get("code"), v.get("msg")))
+                .unwrap_or_else(|| body.chars().take(200).collect());
+            anyhow::bail!("{label}失败 (HTTP {status}): {detail}");
+        }
+        serde_json::from_str(&body).context(format!("{label}：响应非 JSON（HTTP {status}）"))
+    }
+
+    /// 按扩展名给 multipart part 的 Content-Type（飞书 images 端点校验格式；
+    /// 表内没有的回落 octet-stream，服务端仍以文件名嗅探为准）。
+    fn mime_from_name(name: &str) -> String {
+        let ext = name.rsplit('.').next().filter(|e| *e != name).unwrap_or("");
+        match ext.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "tiff" | "tif" => "image/tiff",
+            "svg" => "image/svg+xml",
+            _ => "application/octet-stream",
+        }
+        .to_string()
+    }
+
     /// 上传一张图片（发消息用）→ image_key。表单字段对齐飞书开放平台文档与 open-lark
     /// 参考实现：POST /im/v1/images，multipart `image_type=message` + `image=<二进制>`。
     /// 图片必须走 images 端点拿 image_key，不能走 /im/v1/files（那是 file_key）。
-    pub async fn upload_image(&self, bytes: Vec<u8>) -> Result<String> {
+    /// `file_name` 带真实扩展名：服务端按文件名嗅探格式，固定 "image" 会被判
+    /// 234001/234011（审查 #254）。上传 120s 超时（全局 30s 会掐断大图）。
+    pub async fn upload_image(&self, bytes: Vec<u8>, file_name: &str) -> Result<String> {
         let token = self.tenant_token().await?;
         let form = reqwest::multipart::Form::new()
             .text("image_type", "message")
             .part(
                 "image",
-                reqwest::multipart::Part::bytes(bytes).file_name("image"),
+                reqwest::multipart::Part::bytes(bytes)
+                    .file_name(file_name.to_string())
+                    .mime_str(&Self::mime_from_name(file_name))
+                    .context("设置图片 part Content-Type 失败")?,
             );
-        let resp: serde_json::Value = self
+        let resp = self
             .http
             .post(self.url("/im/v1/images"))
             .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(120))
             .multipart(form)
             .send()
             .await
-            .context("飞书图片上传网络错误")?
-            .json()
-            .await
-            .context("飞书图片上传响应非 JSON")?;
-        let key = resp["data"]["image_key"].as_str().map(str::to_string);
-        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) || key.is_none() {
+            .context("飞书图片上传网络错误")?;
+        let value: serde_json::Value = Self::api_json(resp, "飞书图片上传").await?;
+        let key = value["data"]["image_key"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if value.get("code").and_then(|c| c.as_i64()) != Some(0) || key.is_none() {
             anyhow::bail!(
                 "飞书图片上传失败 code={:?} msg={:?}",
-                resp.get("code"),
-                resp.get("msg")
+                value.get("code"),
+                value.get("msg")
             );
         }
         Ok(key.unwrap())
@@ -446,49 +501,40 @@ impl FeishuClient {
                 "file",
                 reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string()),
             );
-        let resp: serde_json::Value = self
+        let resp = self
             .http
             .post(self.url("/im/v1/files"))
             .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(120))
             .multipart(form)
             .send()
             .await
-            .context("飞书文件上传网络错误")?
-            .json()
-            .await
-            .context("飞书文件上传响应非 JSON")?;
-        let key = resp["data"]["file_key"].as_str().map(str::to_string);
-        if resp.get("code").and_then(|c| c.as_i64()) != Some(0) || key.is_none() {
+            .context("飞书文件上传网络错误")?;
+        let value: serde_json::Value = Self::api_json(resp, "飞书文件上传").await?;
+        let key = value["data"]["file_key"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if value.get("code").and_then(|c| c.as_i64()) != Some(0) || key.is_none() {
             anyhow::bail!(
                 "飞书文件上传失败 code={:?} msg={:?}",
-                resp.get("code"),
-                resp.get("msg")
+                value.get("code"),
+                value.get("msg")
             );
         }
         Ok(key.unwrap())
     }
 
-    /// 发一条携带媒体 key 的消息（#253）。image → msg_type=image；其它 → msg_type=file，
-    /// content 里的 type 与入站 parse_content 对 file 消息的解析对称（audio→audio / video→media），
-    /// 接收端能按文件/音频/视频正确渲染。
-    pub async fn send_media_message(
-        &self,
-        chat_id: &str,
-        msg_type: &str,
-        file_name: &str,
-        key: &str,
-        kind: &str,
-    ) -> Result<()> {
+    /// 发一条携带媒体 key 的消息（#253）。image → msg_type=image（内联图）；
+    /// 其它一律 msg_type=file（**下载卡片**——飞书真正的语音条要 msg_type=audio
+    /// +opus 上传、视频要 msg_type=media +封面 image_key，一期不做，注释与实现
+    /// 对齐；content 按官方 schema 只带 key，自造 type/file_name 字段有被服务端
+    /// 校验拒的风险——审查 #254）。
+    pub async fn send_media_message(&self, chat_id: &str, msg_type: &str, key: &str) -> Result<()> {
         let content = if msg_type == "image" {
             json!({ "image_key": key })
         } else {
-            let mut c = json!({ "file_key": key, "file_name": file_name });
-            if kind == "audio" {
-                c["type"] = json!("audio");
-            } else if kind == "video" {
-                c["type"] = json!("media");
-            }
-            c
+            json!({ "file_key": key })
         };
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
@@ -1238,10 +1284,39 @@ mod tests {
         assert_eq!(feishu_file_type("b.XLSX"), "xls");
         assert_eq!(feishu_file_type("c.PPT"), "ppt");
         assert_eq!(feishu_file_type("clip.MP4"), "mp4");
+        // 异容器不得声明成 mp4（服务端按内容校验会拒）——一律 stream（审查 #254）
+        assert_eq!(feishu_file_type("screen.mov"), "stream");
+        assert_eq!(feishu_file_type("mkv.mkv"), "stream");
         // 音频/未知后缀回落通用 stream（消息仍以 file 卡片真实送达）
         assert_eq!(feishu_file_type("voice.mp3"), "stream");
+        // 无点文件名不能把整个名字当扩展名
         assert_eq!(feishu_file_type("noext"), "stream");
+        assert_eq!(feishu_file_type("pdf"), "stream");
         assert_eq!(feishu_file_type(""), "stream");
+    }
+
+    #[test]
+    fn feishu_image_uploadable_whitelist() {
+        // images 端点可靠渲染的位图 → 走 image；svg/ico/heic 等走文件卡片
+        assert!(feishu_image_uploadable("a.PNG"));
+        assert!(feishu_image_uploadable("cat.jpeg"));
+        assert!(!feishu_image_uploadable("diagram.svg"));
+        assert!(!feishu_image_uploadable("old.heic"));
+        assert!(!feishu_image_uploadable("noext"));
+    }
+
+    #[tokio::test]
+    async fn upload_image_rejects_empty_key_and_html_error() {
+        // 空 image_key（网关剥字段）必须报错，不能 Ok("") 让后续发送拿废 key
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/images".to_string()),
+            json!({"code": 0, "msg": "success", "data": {"image_key": ""}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let e = fs.upload_image(b"x".to_vec(), "a.png").await.unwrap_err();
+        assert!(e.to_string().contains("图片上传失败"), "{e:#}");
     }
 
     #[tokio::test]
@@ -1254,7 +1329,7 @@ mod tests {
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
         let key = fs
-            .upload_image(b"fake-png-bytes-001".to_vec())
+            .upload_image(b"fake-png-bytes-001".to_vec(), "shot.png")
             .await
             .unwrap();
         assert_eq!(key, "img_k1");
@@ -1288,7 +1363,7 @@ mod tests {
         );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
-        let e = fs.upload_image(b"x".to_vec()).await.unwrap_err();
+        let e = fs.upload_image(b"x".to_vec(), "a.png").await.unwrap_err();
         assert!(e.to_string().contains("99991672"), "错误码应进文案: {e:#}");
     }
 
@@ -1330,7 +1405,7 @@ mod tests {
         );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
-        fs.send_media_message("oc_grp1", "image", "a.png", "img_k1", "image")
+        fs.send_media_message("oc_grp1", "image", "img_k1")
             .await
             .unwrap();
         let recs = server.requests.lock().unwrap().clone();
@@ -1350,9 +1425,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_media_message_file_marks_audio_video_kind() {
-        // 与入站 parse_content 对称：audio→content.type=audio / video→type=media，
-        // 普通文件不带 type（接收端按默认 file 渲染）。
+    async fn send_media_message_file_sends_plain_file_card() {
+        // 一期语义定案（审查 #254）：非图片一律 msg_type=file 下载卡片，
+        // content 按官方 schema 只带 file_key——自造 type/file_name 有被
+        // 服务端校验拒的风险；真语音条（audio+opus）/视频（media+封面）后续再做。
         let mut routes = std::collections::HashMap::new();
         routes.insert(
             ("POST".to_string(), "/im/v1/messages".to_string()),
@@ -1360,30 +1436,29 @@ mod tests {
         );
         let server = mock_server(routes).await;
         let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
-        fs.send_media_message("oc_grp1", "file", "a.mp3", "file_audio", "audio")
-            .await
-            .unwrap();
-        fs.send_media_message("oc_grp1", "file", "b.mp4", "file_video", "video")
-            .await
-            .unwrap();
-        fs.send_media_message("oc_grp1", "file", "c.pdf", "file_plain", "file")
-            .await
-            .unwrap();
+        for key in ["file_audio", "file_video", "file_plain"] {
+            fs.send_media_message("oc_grp1", "file", key).await.unwrap();
+        }
         let recs = server.requests.lock().unwrap().clone();
         let msgs: Vec<_> = recs
             .iter()
             .filter(|r| r.path == "/im/v1/messages")
             .collect();
         assert_eq!(msgs.len(), 3);
-        for r in &msgs {
+        for (i, r) in msgs.iter().enumerate() {
             let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            assert_eq!(body["msg_type"], "file");
             let content: serde_json::Value =
                 serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-            match content["file_name"].as_str().unwrap() {
-                "a.mp3" => assert_eq!(content["type"], "audio", "mp3 应按 audio 卡发送"),
-                "b.mp4" => assert_eq!(content["type"], "media", "视频 type=media"),
-                _ => assert!(content.get("type").is_none(), "普通文件不带 type"),
-            }
+            assert_eq!(
+                content["file_key"],
+                ["file_audio", "file_video", "file_plain"][i]
+            );
+            assert!(content.get("type").is_none(), "不带自造 type 字段");
+            assert!(
+                content.get("file_name").is_none(),
+                "不带自造 file_name 字段"
+            );
         }
     }
 }
