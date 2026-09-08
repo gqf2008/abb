@@ -70,6 +70,9 @@ pub struct ChannelMeta {
     /// 即时登记（非巡检登记表来源）：p2p 私聊与「自动登记」的群。巡检 diff
     /// 清理跳过 adhoc 频道（它们不在登记表，误清会丢会话）。
     pub adhoc: bool,
+    /// agent 工作目录（P0.B）：session/new 的 cwd 与 <workspace> 段用它；
+    /// None = 回落 handle 级 cwd（进程启动目录）。
+    pub workspace: Option<String>,
 }
 
 impl ChannelMeta {
@@ -84,6 +87,7 @@ impl ChannelMeta {
                 "channel".to_string()
             },
             description: None,
+            workspace: self.workspace.clone(),
         }
     }
 }
@@ -1229,6 +1233,33 @@ fn redact_skill_paths(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+mod channel_info_tests {
+    use super::*;
+
+    fn meta(chat_type: &str, workspace: Option<&str>) -> ChannelMeta {
+        ChannelMeta {
+            bot_key: "bot".into(),
+            chat_id: "oc_x".into(),
+            chat_type: chat_type.into(),
+            thread_id: None,
+            name: "名字".into(),
+            anchor_mid: None,
+            adhoc: false,
+            workspace: workspace.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn workspace_maps_through_to_prompt_info() {
+        // P0.B：workspace 随 channel_info 贯穿（p2p 的 dm 语义映射同时锁住）
+        let info = meta("p2p", Some("/ws/vb/uuid-1")).channel_info();
+        assert_eq!(info.channel_type, "dm");
+        assert_eq!(info.workspace.as_deref(), Some("/ws/vb/uuid-1"));
+        assert_eq!(meta("group", None).channel_info().workspace, None);
+    }
+}
+
 mod redact_tests {
     use super::redact_skill_paths;
 

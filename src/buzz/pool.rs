@@ -688,6 +688,8 @@ struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
     id: Option<Uuid>,
     channel_type: Option<&'a str>,
+    /// P0.B：频道工作目录（session/new cwd + <workspace> 段的真值来源）。
+    workspace: Option<&'a str>,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -769,8 +771,12 @@ async fn create_session_and_apply_model(
     // Goose receives it through the custom request below. Legacy agents receive
     // the same content as user-message sections via `format_prompt`.
     let is_goose = agent.agent_name == "goose";
+    // P0.B：会话工作目录优先取频道登记带的 workspace（vb 群=vb/<uuid>、
+    // 普通会话=bot 工作区），与退役 CLI 路径的 ensure_vb_dir/workspace_dir
+    // 语义对齐；缺省回落 handle 级 cwd（进程启动目录，旧行为）。
+    let session_cwd = channel.workspace.unwrap_or(ctx.cwd.as_str());
     let combined_system_prompt = with_team(
-        framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+        framed_system_prompt(session_cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
         ctx.team_instructions.as_deref(),
     );
 
@@ -788,7 +794,7 @@ async fn create_session_and_apply_model(
     let resp = agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            session_cwd,
             mcp_servers,
             session_new_system_prompt(
                 is_goose,
@@ -1042,6 +1048,9 @@ pub async fn run_prompt_task(
                     name: title_channel.as_deref(),
                     id: Some(batch.channel_id),
                     channel_type: origin_channel_type.as_deref(),
+                    workspace: resolved_channel_info
+                        .as_ref()
+                        .and_then(|i| i.workspace.as_deref()),
                 },
             )
             .await

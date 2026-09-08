@@ -450,6 +450,14 @@ pub async fn run() {
                         .entry(be)
                         .or_default()
                         .push(crate::buzz::harness::ChannelMeta {
+                            // P0.B：vb 群的 agent 工作目录 = 其独立工作区（与退役
+                            // CLI 路径的 ensure_vb_dir 语义对齐）
+                            workspace: Some(
+                                crate::virtualbot::ensure_vb_dir(&vb.bot_key, &vb.chat_id)
+                                    .unwrap_or_else(|| crate::workspace_dir(&vb.bot_key))
+                                    .display()
+                                    .to_string(),
+                            ),
                             bot_key: vb.bot_key,
                             chat_id: vb.chat_id,
                             chat_type: "group".to_string(),
@@ -1307,6 +1315,13 @@ async fn run_job(
                 h.upsert_channel(
                     channel_id,
                     crate::buzz::harness::ChannelMeta {
+                        // job 频道工作区 = 该 chat 的工作区（vb 群用其目录）
+                        workspace: Some(
+                            crate::virtualbot::ensure_vb_dir(&bot_key, &job.chat_id)
+                                .unwrap_or_else(|| crate::workspace_dir(&bot_key))
+                                .display()
+                                .to_string(),
+                        ),
                         bot_key: bot_key.clone(),
                         chat_id: job.chat_id.clone(),
                         chat_type: "p2p".to_string(),
