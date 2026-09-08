@@ -1260,6 +1260,7 @@ mod channel_info_tests {
     }
 }
 
+#[cfg(test)]
 mod redact_tests {
     use super::redact_skill_paths;
 
