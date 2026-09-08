@@ -40,6 +40,34 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # fork buzz-agent 是独立包（自有 manifest + lock，不挂 root workspace），上面
+  # root 的 clippy/fmt 覆盖不到它——v2.23.24 就带着一个 `#[cfg(unix)]` 测试里的
+  # unused variable 上了 main（本地门禁红、CI 全绿）。这里补 PR 级门禁。
+  # 跑 macOS 而非 Linux：fork 依赖 keyring-rs / libgit2(vendored) 在 Linux 需额外
+  # 系统库，且 CI 会因此编译不到 `#[cfg(unix)]` 之外的形态差异；macOS 与本地门禁
+  # 同平台，能真正编到那段测试代码。
+  fork-lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/buzz-agent
+
+      # --all 不含独立包，必须显式 manifest-path
+      - name: fmt（fork）
+        run: cargo fmt --check --manifest-path crates/buzz-agent/Cargo.toml
+
+      # --all-targets 关键：只 lint 非测试构建时，测试代码里的违例（正是这次的
+      # unused variable）永远漏网
+      - name: clippy（fork，-D warnings 门禁）
+        run: cargo clippy --locked --manifest-path crates/buzz-agent/Cargo.toml --all-targets -- -D warnings
+
   test:
     runs-on: windows-latest
     steps:

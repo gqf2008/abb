@@ -1042,7 +1042,6 @@ mod tests {
     async fn symlink_escape_still_denied_after_canonicalize() {
         // canonicalize 之后才比对 → 工作区内软链指向域外文件同样拒绝（读侧）
         let dir = test_dir();
-        let cwd = dir.path().to_str().unwrap();
         std::fs::write(dir.path().join("secret.txt"), "top").unwrap();
         std::os::unix::fs::symlink(dir.path().join("secret.txt"), dir.path().join("link.txt"))
             .unwrap();
