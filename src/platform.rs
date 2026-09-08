@@ -598,8 +598,11 @@ pub fn heal_autostart() {
         return;
     }
     crate::log!("[autostart] 自启项指向失效路径（App 被移动过？），按当前二进制重建");
-    if let Err(e) = set_autostart(true) {
-        crate::log!("[autostart] ⚠️ 自愈失败: {e:#}");
+    match set_autostart(true) {
+        Ok(()) => {
+            log_autostart_event("自愈：自启项原指向失效路径，已按当前二进制重建并重载 launchd")
+        }
+        Err(e) => log_autostart_event(&format!("自愈失败（自启仍不可用）: {e:#}")),
     }
 }
 
@@ -646,7 +649,8 @@ pub fn set_autostart(enable: bool) -> Result<()> {
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // StandardOutPath 指向的目录必须先在：launchd 打不开重定向目标时会拒起 job。
+    // logs/ 先建好：launchd 若打不开 StandardOutPath 目标可能不起 job（man 页只说
+    // 「文件不存在则创建」，对父目录缺失的行为沉默——这里按最保守做法先建目录）。
     let logs = crate::bridge_dir().join("logs");
     let _ = std::fs::create_dir_all(&logs);
     std::fs::write(&plist, build_login_plist(&exe, &logs))
@@ -721,6 +725,9 @@ fn reload_login_agent(plist: &std::path::Path) -> Result<()> {
 fn unload_login_agent() -> bool {
     if login_job_is_self() {
         crate::log!("[autostart] 跳过 bootout：该 job 正在运行的进程就是本进程（摘它会杀掉自己）");
+        log_autostart_event(
+            "跳过 launchctl bootout：正在跑的 job 进程就是本进程（摘它会杀掉自己）",
+        );
         return false;
     }
     let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
@@ -746,6 +753,36 @@ fn login_item_plist() -> PathBuf {
         .unwrap_or_default()
         .join("Library/LaunchAgents")
         .join(format!("{LOGIN_ITEM_LABEL}.plist"))
+}
+
+// ─────────────────────────── 自启变更审计（全平台） ───────────────────────────
+
+/// 把一次自启配置变更/自愈结果追加到 `<bridge_dir>/logs/autostart.log`。
+///
+/// 为什么不能只靠 `crate::log!`：它只写 stdout（`main.rs:147`），而 GUI 由
+/// `open`/Finder 拉起时 0/1/2 全指 /dev/null（本机实测 `lsof -p <gui pid>`），
+/// 「自愈成没成、为什么失败」这条最需要留证据的信息会当场蒸发。plist 里的
+/// `StandardOutPath` 只对 **launchd 拉起的那一次** 生效，救不了手工启动这条路。
+/// 与 plist 那两个键互补：一个管以后，一个管当下。
+///
+/// 内容只有动作、路径与 launchctl 回显文本，绝不含密钥（同类行早已落在 bridge.out）。
+/// best-effort：写失败只丢审计，绝不影响自启动作本身。
+pub fn log_autostart_event(msg: &str) {
+    use std::io::Write;
+    let dir = crate::bridge_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("autostart.log"))
+    {
+        let _ = writeln!(f, "{}", autostart_record(&crate::chrono_lite::now(), msg));
+    }
+}
+
+/// 审计行格式（纯函数，便于单测；时间戳由调用方给，避免测试依赖时钟）。
+fn autostart_record(ts: &str, msg: &str) -> String {
+    format!("[{ts}] {msg}\n")
 }
 
 // ── Windows：登录自启 = HKCU Run 键 ──
@@ -975,6 +1012,15 @@ fn rewrite_workspace_guides(workspaces: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 审计行格式：一行一条、带时间戳前缀，供 logs/autostart.log 事后排查
+    /// （GUI 由 open 起时 stdout 指 /dev/null，这是唯一留得下的证据）。
+    #[test]
+    fn autostart_record_is_one_timestamped_line() {
+        let r = autostart_record("2026-09-08 20:31:02", "自愈：已按当前二进制重建");
+        assert_eq!(r, "[2026-09-08 20:31:02] 自愈：已按当前二进制重建\n");
+        assert_eq!(r.matches('\n').count(), 1, "一条记录只允许一个换行");
+    }
 
     /// 自启 plist 解析（macOS）：只认自己写的 schema；读不出参数一律 None（调用方
     /// 判 Absent），宁可当作"不是我们的配置"也不猜——历史上现网那份 plist 就是带
