@@ -780,6 +780,13 @@ async fn steer_folds_into_active_turn_without_cancelling() {
     let (url, captures) = spawn_capturing_fake_llm(vec![
         openai_tool_call("call_steer", "fake__noop", json!({})),
         openai_text("acknowledged the steer"),
+        // Spare response for the extra round: a steer that lands after round 2's
+        // top-of-loop drain is folded by the end-turn drain (agent.rs:777), which
+        // then legitimately runs a third round. With only two canned responses the
+        // empty queue answers 500 — `llm::post()` treats any 5xx as retryable
+        // (llm.rs:1600,1894) — and the turn ends in `wire::err`, a frame that
+        // carries no `result`, so the stopReason assert below reads Null.
+        openai_text("acknowledged the steer"),
     ])
     .await;
     let mut h = Harness::spawn(&url).await;
