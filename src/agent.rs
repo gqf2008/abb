@@ -1558,11 +1558,26 @@ async fn generate_role_prompt_with(
         crate::buzz::harness::SyncTurnOutcome::Cancelled => anyhow::bail!("生成已中断"),
         crate::buzz::harness::SyncTurnOutcome::Failed(reason) => anyhow::bail!("{reason}"),
     };
-    let text = first_content_line(&text);
+    let text = post_process_role_prompt(&text);
     if text.is_empty() {
+        // 防御分支（审查 P3-1）：空回合文本 harness 不投递（等待者挂满预算得
+        // Timeout），Ok 文本恒非空——仅「模型输出全空白 + 剥后缀后归零」的病理
+        // 边角可达。空结果的主要表现形式是「生成超时（60s）」。
         anyhow::bail!("生成结果为空（后端无输出）");
     }
-    Ok(truncate(&text, 100).to_string())
+    Ok(text)
+}
+
+/// 角色 prompt 后处理（纯函数）：首个非空行（trim）→ 截断 100 字符（char 安全）。
+/// 空输入/全空白 → 空串（调用方转错误）。独立成函数是为了让「≤100 字符进 Slint
+/// 输入框」这一用户可见契约被纯测试直接锁死（截断与取行是同一组合，不再靠
+/// 全链路测试顺带覆盖——mock 应答长度不受控，那层锁不住截断）。
+fn post_process_role_prompt(text: &str) -> String {
+    let line = first_content_line(text);
+    if line.is_empty() {
+        return String::new();
+    }
+    truncate(&line, 100)
 }
 
 /// 首个非空行（trim 后）。模型可能多给解释行，只取第一行实质内容（旧 CLI 路径同款
@@ -2140,9 +2155,34 @@ mod tests {
         assert_eq!(first_content_line("\n\n  \n"), "");
     }
 
+    /// 后处理组合锁（审查 P1 修复）：「首个非空行 + 截断 100」的生产组合
+    /// post_process_role_prompt 直接被锁——>100 字符首行必须截到恰好 100（char
+    /// 安全，CJK 按字符计）；空/全空白归零。truncate 在此之前无任何单测。
+    #[test]
+    fn post_process_role_prompt_locks_line_pick_and_truncation() {
+        let long_line: String = "角".repeat(150);
+        let out = post_process_role_prompt(&long_line);
+        assert_eq!(
+            out.chars().count(),
+            100,
+            ">100 字符首行必须截到恰好 100（char 安全）"
+        );
+        assert_eq!(out, "角".repeat(100));
+        // 多行：取首个非空行（trim），后随解释行不进结果
+        assert_eq!(post_process_role_prompt("\n  提示词  \n解释行"), "提示词");
+        // 不足 100 原样；空/全空白 → 空串
+        assert_eq!(post_process_role_prompt("短"), "短");
+        assert_eq!(post_process_role_prompt(""), "");
+        assert_eq!(post_process_role_prompt("  \n\n "), "");
+    }
+
     /// mock 全链路（P3.3）：generate_role_prompt_with → oneshot_turn → mock 子进程。
-    /// mock echo 的 sys prompt 首行远超 100 字符，正好同时锁「首个非空行 + 截断
-    /// 100」后处理与「无后端标识后缀」（oneshot 已剥）。
+    /// 锁的是「链路真通」：prompt 原文（含角色名）到达 agent、应答文本进入后处理
+    /// （echo 首行进结果）。**不锁**截断与后缀剥除——mock 是 legacy agent，echo
+    /// 首行实为 standing context 的 `echo: <base>`（短行，长度不受本测试控制）：
+    /// 截断锁在 post_process_role_prompt_locks_line_pick_and_truncation（纯函数，
+    /// 长度可控）；后缀剥除锁在 P3.1 oneshot_echo_roundtrip（全量 Ok 文本上断言，
+    /// 本测试只取首行，断言后缀会空转——审查 P3-3）。
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
@@ -2173,15 +2213,9 @@ mod tests {
         let text = generate_role_prompt_with(agent_cfg, &ws, "测试角色")
             .await
             .expect("mock 回合应成功");
-        assert!(text.starts_with("echo:"), "mock echo 首行: {text}");
         assert!(
-            text.chars().count() <= 100,
-            "截断 100 字符（char 安全）: {} chars",
-            text.chars().count()
-        );
-        assert!(
-            !text.contains("── 后端"),
-            "角色 prompt 不得带后端标识后缀: {text}"
+            text.starts_with("echo:"),
+            "mock echo 首行应进入后处理结果: {text}"
         );
         // prompt 原文（含角色名）确实到达 agent
         let records: Vec<serde_json::Value> = std::fs::read_to_string(&rec)
