@@ -46,7 +46,7 @@ enum UiCmd {
         idx: i32,
         bot_key: String,
     },
-    /// 安装某个依赖（claude/codex/node/python3/lark-cli/dingtalk-cli）。结果经 dep_rx 回主线程。
+    /// 安装某个依赖（node/lark-cli/dingtalk-cli/git）。结果经 dep_rx 回主线程。
     InstallDep(String),
     /// #60 一键安装全部缺失组件（node 前置自动装）。逐项进度/汇总经 dep_rx 回主线程。
     InstallAllMissing,
@@ -849,14 +849,8 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         name: b.name.clone().into(),
         kind: b.kind.clone().into(),
         enabled: b.enabled,
-        // UI 上后端必须有个确定值显示：per-bot 为空（跟随全局）时显示 claude 兜底
-        backend: (if b.backend.is_empty() {
-            "claude"
-        } else {
-            b.backend.as_str()
-        })
-        .into(),
-        // #163：codex 沙箱模式（auto 默认；非 codex 后端时该下拉无实际作用）
+        // #168 权限档位（auto 默认）：单后端化后统一由随包 agent 执行（session/new
+        // `_meta` 下发）；UI 不再提供后端选择（P4.3 下架）。
         sandbox_mode: b.sandbox_mode.as_str().into(),
         owner_open_id: b.owner_open_id.clone().into(),
         wx_owner_configured: !b.wx_user_id.is_empty(),
@@ -1275,10 +1269,10 @@ fn refresh_bot_panel(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
 }
 
 /// 按当前选中 bot 重建各独立开关（启用/授权者隔离/每日整理/群聊提及）的单元素 model。
-/// 与 backend-options 同款绕法：整体替换 model → for 循环重建 PixelCheckBox 实例，
-/// 实例全新、checked 绑定全新——绕开 slint「用户交互移除 checked 绑定（内部赋值断绑，
-/// 绑 model 行属性或独立 property 都一样）、状态残留到其它 bot」的坑（#80 回归：
-/// 点 A 的每日整理，切到 B 显示残留，诱导误操作后连配置一起串）。
+/// 整体替换 model → for 循环重建 PixelCheckBox 实例，实例全新、checked 绑定全新——
+/// 绕开 slint「用户交互移除 checked 绑定（内部赋值断绑，绑 model 行属性或独立
+/// property 都一样）、状态残留到其它 bot」的坑（#80 回归：点 A 的每日整理，切到 B
+/// 显示残留，诱导误操作后连配置一起串）。
 fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     let bots = work.borrow();
     let bot = bots.get(w.get_selected() as usize);
@@ -1315,33 +1309,11 @@ fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_ding_owner_ids_editor_options(mk(b.map(|b| b.ding_owner_ids.as_str()).unwrap_or("")));
 }
 
-/// 按当前选中 bot 重算互斥 CheckBox 的勾选态（后端 + 对话权限）。
+/// 重算对话权限互斥 CheckBox 的勾选态（飞书/钉钉同模型）。
 /// 切 bot / 装载设置窗时调用。整体替换 option model → for 循环重建 CheckBox 实例，
 /// 绕开 slint「用户交互移除 checked 绑定、状态残留到其它 bot」的坑。
-fn refresh_exclusive_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
-    let bot = work.borrow().get(w.get_selected() as usize).cloned();
-    let be = bot.as_ref().map(|b| b.backend.clone()).unwrap_or_default();
-    let mk_opts = |opts: &[(&str, &str)], sel: &str| -> Vec<OptionRow> {
-        opts.iter()
-            .map(|(name, val)| OptionRow {
-                name: (*name).into(),
-                checked: *val == sel,
-            })
-            .collect()
-    };
-    // 空 = 跟随全局 → claude 选中
-    let be_sel = if be.is_empty() { "claude" } else { be.as_str() };
-    w.set_backend_options(slint::ModelRc::from(Rc::new(slint::VecModel::from(
-        mk_opts(
-            &[
-                ("claude", "claude"),
-                ("codex", "codex"),
-                ("pi", "pi"),
-                ("buzz", "buzz"), // #200：buzz = ACP harness 后端（外部 agent 常驻进程）
-            ],
-            be_sel,
-        ),
-    ))));
+/// （P4.3：后端三选一组已随 UI 下架删除——执行层收口随包 buzz-agent。）
+fn refresh_exclusive_checks(w: &SettingsWindow, _work: &RefCell<Vec<BotConfig>>) {
     // #118：访问控制收紧后无「公开」一档，对话权限固定为「仅授权用户」
     // （open_access / ding_open_access 字段保留兼容旧 config，判定链已不读）。
     let access_model = slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![OptionRow {
@@ -1376,8 +1348,9 @@ fn refresh_owner_code_info(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_grant_code_info(grant_line.into());
 }
 
-/// 跑一次依赖检测并把全部依赖状态回填到设置窗
-/// （claude/codex/pi/node/python3/lark-cli/dingtalk-cli/git + ACP 适配器三件套）。
+/// 跑一次依赖检测并把全部依赖状态回填到设置窗（node/python3/lark-cli/dingtalk-cli/git）。
+/// P4.3：claude/codex/pi 与 ACP 适配器探测已下架——执行层收口随包 buzz-agent（零安装），
+/// 余下为 agent 扩展能力依赖（缺失不阻断聊天）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
     let get = |id: &str| {
@@ -1386,27 +1359,10 @@ fn push_deps_to_window(w: &SettingsWindow) {
             .map(|d| d.found)
             .unwrap_or(false)
     };
-    // #93 codex 三态：codex_ok = 已装且版本满足最低锁定（< MIN_CODEX_VERSION → 需升级）。
-    let codex = all.iter().find(|d| d.id == "codex");
-    let codex_version = codex.map(|d| d.version.clone()).unwrap_or_default();
-    let codex_ok = codex.map(|d| d.found && d.version_ok).unwrap_or(false);
     // #105 git 三态：git_ok = 已装且版本 >= MIN_GIT_VERSION（< 2.30 → 需升级）。
     let git = all.iter().find(|d| d.id == "git");
     let git_version = git.map(|d| d.version.clone()).unwrap_or_default();
     let git_ok = git.map(|d| d.found && d.version_ok).unwrap_or(false);
-    // #8 M0：claude/codex/pi 任一未装 → 顶部横幅（首次启动也据此自动弹设置窗引导安装）
-    // #93：codex 版本过低同样视为「待处理」——启动引导/横幅继续提示，直到升级到最低锁定版本。
-    w.set_missing_agent(
-        !get("claude")
-            || !codex_ok
-            || !get("pi")
-            || !(get("pi-acp") && get("codex-acp") && get("claude-acp")),
-    );
-    w.set_claude_installed(get("claude"));
-    w.set_codex_installed(get("codex"));
-    w.set_codex_version(codex_version.into());
-    w.set_codex_ok(codex_ok);
-    w.set_pi_installed(get("pi"));
     w.set_node_installed(get("node"));
     w.set_python_installed(get("python3"));
     w.set_lark_installed(get("lark-cli"));
@@ -1414,8 +1370,6 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_git_installed(get("git"));
     w.set_git_version(git_version.into());
     w.set_git_ok(git_ok);
-    // ACP 适配器三件套：全部就位才算「已安装」（缺任一则该后端聊天 AgentDown 拒答）
-    w.set_acp_adapters_installed(get("pi-acp") && get("codex-acp") && get("claude-acp"));
     // 主动重新检测/启动 = 新的开始：清掉上次一键安装的失败计数
     //（失败详情 dep-detail 保留到下次安装；AllDone 分支在调用本函数后重新设回）
     w.set_dep_failed_count(0);
@@ -1817,12 +1771,12 @@ pub fn run_gui() -> Result<()> {
         w.set_provider_names(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             build_provider_names(&c.providers),
         ))));
-        // 后端、Owner、供应商 都是 per-bot（bots[i].backend / .owner_open_id / .provider）
+        // Owner、供应商 都是 per-bot（bots[i].owner_open_id / .provider）
         w.set_selected(if c.bots.is_empty() { -1 } else { 0 });
         w.set_provider_selected(if c.providers.is_empty() { -1 } else { 0 });
         refresh_bot_panel(w, work);
         w.set_status_line("".into());
-        // 依赖检测：claude/codex/node/python3/lark-cli 是否在本机可执行路径上。
+        // 依赖检测：node/python3/lark-cli/dingtalk-cli/git 是否在本机可执行路径上。
         push_deps_to_window(w);
         // 系统权限检测（macOS）：完全磁盘/辅助功能/屏幕录制/自动化。
         push_perms_to_window(w);
@@ -2930,48 +2884,17 @@ pub fn run_gui() -> Result<()> {
         );
         std::mem::forget(t6);
     }
-    // #8 M0 自动引导：claude/codex/pi 未安装 → 启动即弹出设置窗。复用托盘打开同一
-    // 条路径（load_into → 依赖横幅 + 状态行），保证窗口内容完整（不只是空窗）。已装好
-    // agent 的开发者/朋友零打扰；对新装用户这是「打开就能被引导」的关键一步。
-    // 缺 ACP 适配器不弹窗（service 回落随包 buzz-agent，聊天可用）——引导留在横幅。
-    {
-        let deps = crate::deps::detect_all();
-        let missing = |id: &str| {
-            deps.iter()
-                .find(|d| d.id == id)
-                .map(|d| !d.found)
-                .unwrap_or(true)
-        };
-        // #93：codex 版本过低也触发启动引导（升级到最低锁定版本前一直引导）
-        let codex_low = deps
-            .iter()
-            .find(|d| d.id == "codex")
-            .map(|d| d.found && !d.version_ok)
-            .unwrap_or(false);
-        // 缺适配器不再强制弹窗：service 侧已回落随包 buzz-agent（聊天可用）；
-        // 引导性提示留在环境配置页横幅（口径见 push_deps_to_window）。
-        if missing("claude")
-            || missing("codex")
-            || codex_low
-            || missing("pi")
-            || std::env::args().any(|a| a == "--show-settings")
-        {
-            let debug_show = std::env::args().any(|a| a == "--show-settings");
-            let work = work.clone();
-            let model = bots_model.clone();
-            let pmodel = providers_model.clone();
-            load_with_draft(&settings, &dirty, &work, &model, &pmodel, &wk);
-            push_settings_status(&settings, &install::status());
-            // 调试参数（--show-settings）不设误导的「未检测到」状态行
-            if !debug_show {
-                settings.set_status_line(
-                    "⚠️ 未检测到 Claude Code / Codex CLI：请到「环境配置」页安装依赖，否则机器人无法处理消息。"
-                        .into(),
-                );
-                settings.set_status_is_error(true);
-            }
-            show_window_and_focus(&settings);
-        }
+    // --show-settings 调试参数：启动即弹出设置窗。复用托盘打开同一条路径
+    //（load_into → 状态行），保证窗口内容完整（不只是空窗）。
+    // P4.3：「缺 claude/codex/pi → 启动自动弹窗引导安装」已随三后端 CLI 下架删除——
+    // 执行层收口随包 buzz-agent（零安装），新装用户开箱即可聊天。
+    if std::env::args().any(|a| a == "--show-settings") {
+        let work = work.clone();
+        let model = bots_model.clone();
+        let pmodel = providers_model.clone();
+        load_with_draft(&settings, &dirty, &work, &model, &pmodel, &wk);
+        push_settings_status(&settings, &install::status());
+        show_window_and_focus(&settings);
     }
     {
         let sw = settings.as_weak();
@@ -3136,13 +3059,6 @@ pub fn run_gui() -> Result<()> {
                             // 不回写 model 的话，改类型后右侧仍显示旧类型的表单（如改「钉钉」还显示微信登录框）
                             refresh = true;
                         }
-                        "backend" => {
-                            bot.backend = value.to_string();
-                            // 后端三选一 CheckBox：select-backend 已显式 set 勾选态，这里只回写
-                            // work；切 bot 时由 refresh_exclusive_checks 经 backend-ui property
-                            // 重新 set 勾选态（绕开用户交互会移除 checked 绑定的 slint 坑）。
-                            refresh = true;
-                        }
                         "provider" => bot.provider = value.to_string(),
                         "owner" => bot.owner_open_id = value.trim().to_string(),
                         "app_id" => bot.app_id = value.trim().to_string(),
@@ -3157,7 +3073,7 @@ pub fn run_gui() -> Result<()> {
             if refresh {
                 let b = work.borrow();
                 sync_model(&model, &b);
-                // 输入框/下拉断绑后不跟随 model 重建，这里一并重建（kind/backend 切换）
+                // 输入框/下拉断绑后不跟随 model 重建，这里一并重建（kind 切换）
                 if let Some(w) = sw.upgrade() {
                     refresh_editors(&w, &work);
                 }
@@ -4441,9 +4357,11 @@ pub fn run_gui() -> Result<()> {
                 push_perms_to_window(&w);
                 w.set_status_is_error(false);
                 let all = crate::deps::detect_all();
+                // #105：git 版本过低也按缺失提示（与 missing_dep_ids 同口径）；
+                // python3 信息项不计入缺失
                 let missing: Vec<&str> = all
                     .iter()
-                    .filter(|d| !d.found || (d.id == "codex" && !d.version_ok))
+                    .filter(|d| d.id != "python3" && (!d.found || (d.id == "git" && !d.version_ok)))
                     .map(|d| d.label)
                     .collect();
                 let msg = if missing.is_empty() {
@@ -4488,7 +4406,7 @@ pub fn run_gui() -> Result<()> {
                 }
                 w.set_dep_busy(format!("全部缺失组件（共 {} 项）", missing.len()).into());
                 w.set_status_is_error(false);
-                // 审查 Minor：node 不一定在缺失清单里（只缺 codex 时没有 node 步）——
+                // 审查 Minor：node 不一定在缺失清单里（只缺 lark-cli 等时没有 node 步）——
                 // 文案按实际清单条件化
                 let head = if missing.iter().any(|id| id == "node") {
                     "先装 Node.js…"
@@ -4560,21 +4478,9 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
-    // 后端 / 对话权限互斥选项的勾选回调：写 work + 重算 option model（整体替换 → CheckBox 重建）。
-    {
-        let work = work.clone();
-        let sw = settings.as_weak();
-        settings.on_backend_option_toggled(move |i| {
-            let Some(w) = sw.upgrade() else { return };
-            let val = ["claude", "codex", "pi", "buzz"][i as usize]; // 与 backend-options model 同序
-            if let Some(bot) = work.borrow_mut().get_mut(w.get_selected() as usize) {
-                bot.backend = val.to_string();
-            }
-            refresh_exclusive_checks(&w, &work);
-        });
-    }
-    // #163 codex 沙箱模式下拉：写 work + dirty + 同步 model（下拉 index 绑 model，
-    // 不重建的话切 bot 后仍显示旧值）。full-access 警示行由 slint 按 model 值条件显示。
+    // #168 权限档位下拉（每 bot，随包 agent 执行）：写 work + dirty + 同步 model
+    //（下拉 index 绑 model，不重建的话切 bot 后仍显示旧值）。
+    // full-access 警示行由 slint 按 model 值条件显示。
     {
         let work = work.clone();
         let model = bots_model.clone();
@@ -4852,35 +4758,11 @@ pub fn run_gui() -> Result<()> {
                                 w.set_dep_busy("".into());
                                 push_deps_to_window(&w);
                                 match result {
-                                    Ok(tail) => {
+                                    Ok(_tail) => {
                                         w.set_dep_detail("".into());
                                         w.set_status_is_error(false);
-                                        // 装的是 ACP 适配器 → 重启 service：harness 装配是
-                                        // 启动快照。单后端化（P2.1）后 harness 只消费随包
-                                        // buzz-agent（缺失时 pi-acp 兜底）——重启让新装的
-                                        // pi-acp 可被兜底解析到；claude/codex 适配器已不再
-                                        // 被 harness 消费（该安装项下架在 P4.3）。
-                                        let adapter_installed = dep_id == "acp-adapters"
-                                            || crate::deps::ACP_ADAPTERS
-                                                .iter()
-                                                .any(|(key, _)| key == &dep_id);
-                                        if adapter_installed && install::status().running {
-                                            install::svc_restart();
-                                        }
-                                        // #93：codex 装完的登录引导（run_install 成功返回已附）。
-                                        // 其它依赖保持原样文案（npm/brew 输出冗长不直接上状态行）。
-                                        if dep_id == "codex" {
-                                            w.set_status_line(
-                                                crate::agent::truncate(&tail, 200).into(),
-                                            );
-                                        } else if adapter_installed {
-                                            w.set_status_line(
-                                                "✅ 适配器已安装，服务重启中（切回原生后端）"
-                                                    .into(),
-                                            );
-                                        } else {
-                                            w.set_status_line(format!("✅ {dep_id} 安装完成").into());
-                                        }
+                                        // 安装输出（npm/brew）冗长不上状态行，只回完成态
+                                        w.set_status_line(format!("✅ {dep_id} 安装完成").into());
                                     }
                                     Err(e) => {
                                         // 分类 + 引导进详情区（普通用户可操作）；自动切到
@@ -4908,7 +4790,7 @@ pub fn run_gui() -> Result<()> {
                             }
                             DepEvt::AllDone(outcome) => {
                                 w.set_dep_busy("".into());
-                                push_deps_to_window(&w); // 重检测：卡片/横幅/首页计数自动刷新
+                                push_deps_to_window(&w); // 重检测：卡片/首页计数自动刷新
                                 let failed = !outcome.failed.is_empty();
                                 if failed {
                                     // 逐项分类 + 引导进详情区（普通用户可操作）；
@@ -4936,13 +4818,7 @@ pub fn run_gui() -> Result<()> {
                                     w.set_dep_detail("".into());
                                     w.set_status_is_error(false);
                                     w.set_dep_failed_count(0);
-                                    let mut line = crate::deps::format_all_summary(&outcome);
-                                    // #93：一键装里带 codex → 追加供应商引导（与单项装同口径）
-                                    if outcome.ok.iter().any(|id| id == "codex") {
-                                        line.push_str(
-                                            "；codex 请到「模型供应商」页添加供应商并设为默认",
-                                        );
-                                    }
+                                    let line = crate::deps::format_all_summary(&outcome);
                                     w.set_status_line(line.into());
                                 }
                             }

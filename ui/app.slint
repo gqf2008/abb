@@ -132,7 +132,7 @@ export struct OwnerRow {
     open_id: string,     // 飞书 open_id（事实键）
 }
 
-// 互斥选项行（后端三选一 / 对话权限二选一）：checked 由 Rust 按选中 bot 重算后整体替换
+// 互斥选项行（对话权限等单选组）：checked 由 Rust 按选中 bot 重算后整体替换
 // model → for 循环重建 CheckBox 实例，绕开「用户交互移除 checked 绑定、状态残留到其它 bot」的坑。
 export struct OptionRow {
     name: string,
@@ -151,8 +151,7 @@ export struct BotRow {
     name: string,        // 显示名
     kind: string,        // feishu | wechat | dingtalk
     enabled: bool,       // 是否启用（false 则 service 不启动此 bot）
-    backend: string,     // 该 bot 的默认后端 claude | codex | pi | buzz（跟着 bot 走，不是全局）
-    sandbox-mode: string, // #168 权限档位 auto | read-only | workspace-write | full-access
+    sandbox-mode: string, // #168 权限档位 auto | read-only | workspace-write | full-access（随包 agent 执行）
     provider: string,    // 该 bot 的模型供应商名（""=跟随全局 default_provider）
     owner-open-id: string, // 飞书：owner（管理员）白名单（逗号分隔 open_id）；微信 bot 不用
     wx-owner-configured: bool, // 微信：扫码登录时自动写入 wx_user_id（登录者即管理员）；false=未配置（fail-closed 拒绝所有人）
@@ -1155,8 +1154,8 @@ export component SettingsWindow inherits Window {
     // 三个独立开关（启用/授权者隔离/每日整理）的显示态。刻意不直接绑
     // root.bots[selected].x 或独立 bool property：PixelCheckBox 交互内部赋值
     // 会移除 checked 绑定（无论绑什么），切 bot 后残留上一 bot 的状态（#80 回归：
-    // 点 A 的每日整理 B 也显示改）。绕法同 backend-options：单元素 model +
-    // for 循环重建实例，由 Rust 侧在装载/切 bot/写回时整体替换 model。
+    // 点 A 的每日整理 B 也显示改）。绕法：单元素 model + for 循环重建实例，
+    // 由 Rust 侧在装载/切 bot/写回时整体替换 model。
     in-out property <[OptionRow]> enabled-options: [];
     in-out property <[OptionRow]> restrict-options: [];
     in-out property <[OptionRow]> tidy-options: [];
@@ -1190,13 +1189,10 @@ export component SettingsWindow inherits Window {
     in-out property <bool> vb-syncing: false;
     in-out property <int> chat-selected: -1;   // 历史页选中的会话下标（chat-sessions 内）
 
-    // 环境配置（依赖检测）：各项是否在本机可执行路径上
-    in-out property <bool> claude-installed: false;
-    in-out property <bool> codex-installed: false;
-    // #93 codex 最低版本锁定：codex-version=检测到的版本串；codex-ok=已装且版本 >= MIN_CODEX_VERSION。
-    in-out property <string> codex-version: "";
-    in-out property <bool> codex-ok: false;
-    in-out property <bool> pi-installed: false;
+    // 环境配置（依赖检测）：各项是否在本机可执行路径上。
+    // P4.3：claude/codex/pi 三后端 CLI 与 ACP 适配器行已下架——执行层收口随包
+    // buzz-agent（零安装）；余下为 agent 扩展能力依赖（node/lark-cli/dingtalk-cli/git），
+    // python3 仅信息展示（运行时无消费方）。
     in-out property <bool> node-installed: false;
     in-out property <bool> python-installed: false;
     in-out property <bool> lark-installed: false;
@@ -1205,11 +1201,6 @@ export component SettingsWindow inherits Window {
     in-out property <bool> git-installed: false;
     in-out property <string> git-version: "";
     in-out property <bool> git-ok: false;
-    // ACP 适配器三件套（claude-agent-acp/codex-acp/pi-acp）全部就位 = true
-    in-out property <bool> acp-adapters-installed: false;
-    // claude/codex/pi 任一未装或 ACP 适配器三件套缺任一 = true：环境配置页顶部显示
-    // 醒目横幅（首次启动也据此自动弹出设置窗引导安装——ui.rs 启动引导与本站同口径）。
-    in-out property <bool> missing-agent: false;
     // 正在安装的依赖 id（""=空闲）。用于禁用其它安装按钮 + 显示进度文案。
     in-out property <string> dep-busy: "";
     in-out property <string> dep-detail: ""; // 安装失败详情（分类 + 怎么办 + 原始错误）
@@ -1242,11 +1233,6 @@ export component SettingsWindow inherits Window {
     in-out property <string> grant-code-info: "";
     // 互斥 CheckBox 的勾选状态（Rust 侧按选中 bot 重算；slint 表达式绑定会被用户交互破坏——
     // 点击后 in-out 属性绑定失效、状态残留到其它 bot，故用显式 property 驱动）
-    in-out property <[OptionRow]> backend-options: [
-        { name: "claude", checked: true },
-        { name: "codex", checked: false },
-        { name: "pi", checked: false },
-    ];
     // #118：访问控制收紧后无「公开」一档，对话权限固定为「仅授权用户」
     in-out property <[OptionRow]> access-options: [
         { name: "仅授权用户", checked: true },
@@ -1278,9 +1264,8 @@ export component SettingsWindow inherits Window {
     // 编辑区变更时回写 bots[selected]。**只回写被改的那一个字段**（field+value）——
     // 旧版 bot-edited 一次传全部字段、未改字段从 model 读，而 model 在编辑后不同步（过期），
     // 连改两个字段会用过期值把前一个字段的修改静默回滚。按字段回写则无此问题。
-    callback bot-field-edited(int, string, string); // idx, field(name/kind/backend/provider/owner/app_id/app_secret), value
-    callback backend-option-toggled(int);  // 后端选项下标（0=claude 1=codex 2=pi 3=buzz）
-    // #168 权限档位下拉（每 bot，claude/codex 生效）：4 项 = config 落盘值（auto/read-only/...）
+    callback bot-field-edited(int, string, string); // idx, field(name/kind/provider/owner/app_id/app_secret), value
+    // #168 权限档位下拉（每 bot，随包 agent 执行）：4 项 = config 落盘值（auto/read-only/...）
     in-out property <[string]> sandbox-mode-options: ["auto", "read-only", "workspace-write", "full-access"];
     callback sandbox-mode-changed(int, int);  // (bot idx, 选项下标)
     callback access-option-toggled(int);   // 飞书对话权限下标（0=仅授权 1=任何人）
@@ -1296,7 +1281,7 @@ export component SettingsWindow inherits Window {
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
     callback open-url(string); // 打开外部链接（依赖文档 / 申请 token 等，默认浏览器）
     callback recheck-deps();            // 重新检测依赖是否已装
-    callback install-dep(string);       // 安装某个依赖（claude/codex/pi/node/python3/lark-cli/dingtalk-cli/git）
+    callback install-dep(string);       // 安装某个依赖（node/lark-cli/dingtalk-cli/git）
     callback install-all-missing();     // #60 一键安装全部缺失组件（node 前置自动装）
     // 像素自绘标题栏回调（Rust 侧 install_title_bar_controls_no_quit 接线：
     // 关闭=隐藏窗口不退出——托盘应用惯例）
@@ -1335,14 +1320,10 @@ export component SettingsWindow inherits Window {
     callback set-session-gc-enabled(bool);     // 会话归纳清理开关（#78 默认关）
     callback set-session-gc-days(int);         // 过期天数下拉下标（0=3 1=7 2=14 3=30）
 
-    // 首页「待处理」卡用到的统计（纯表达式，跟随各 *_installed / perm-* 属性自动更新）
-    // #93：codex 版本过低也算待处理（codex-ok = 已装且版本满足）。
-    property <int> missing-deps: (root.claude-installed ? 0 : 1)
-        + (root.codex-ok ? 0 : 1)
-        + (root.pi-installed ? 0 : 1)
-        + (root.acp-adapters-installed ? 0 : 1)
-        + (root.node-installed ? 0 : 1)
-        + (root.python-installed ? 0 : 1)
+    // 首页「待处理」卡用到的统计（纯表达式，跟随各 *_installed / perm-* 属性自动更新）。
+    // P4.3：只统计 agent 扩展能力依赖（缺失不影响聊天，只限制技能/扩展能力）；
+    // python3 信息项不计；git 版本过低也算待处理（git-ok = 已装且版本满足）。
+    property <int> missing-deps: (root.node-installed ? 0 : 1)
         + (root.lark-installed ? 0 : 1)
         + (root.dingtalk-installed ? 0 : 1)
         + (root.git-ok ? 0 : 1);
@@ -1430,7 +1411,7 @@ export component SettingsWindow inherits Window {
                                     }
                                     Text {
                                         text: root.service-running
-                                            ? "飞书 / 微信 / 钉钉消息自动转给本地 Claude / Codex 处理"
+                                            ? "飞书 / 微信 / 钉钉消息自动转给随包 AI agent 处理（零安装）"
                                             : "点右侧「启动服务」，或在托盘菜单点「启动」";
                                         font-size: 13px;
                                         color: PixelTheme.bg.with-alpha(0.75);
@@ -1492,7 +1473,7 @@ export component SettingsWindow inherits Window {
                                     clicked => { root.current-page = 2; }
                                 }
                                 if root.missing-deps > 0: ProblemRow {
-                                    text: "依赖未装齐（" + root.missing-deps + " 项）— 机器人将无法处理消息";
+                                    text: "扩展依赖未装齐（" + root.missing-deps + " 项）— 聊天不受影响，技能等扩展能力受限";
                                     clicked => { root.current-page = 2; }
                                 }
                                 if root.missing-perms > 0: ProblemRow {
@@ -1517,7 +1498,7 @@ export component SettingsWindow inherits Window {
                             }
                             QuickCard {
                                 title: "环境体检";
-                                desc: "Claude Code / Codex / Node.js 依赖检测";
+                                desc: "Node.js / lark-cli / git 等扩展依赖检测";
                                 icon: @image-url("icons/search.svg");
                                 clicked => { root.current-page = 2; root.recheck-deps(); }
                             }
@@ -1668,26 +1649,10 @@ export component SettingsWindow inherits Window {
                                                         }
                                                     }
                                                 }
-                                                // 默认后端跟着 bot 走（per-bot，不是全局）：改飞书 bot 不影响微信 bot。
-                                                // 勾选态由 backend-options model 驱动（for 循环重建实例），不依赖会被
-                                                // 用户交互破坏的 checked 绑定（实测「微信选 pi 飞书也选中」）。
-                                                if root.selected >= 0 && root.selected < root.bots.length: Row {
-                                                    Text { text: "默认后端"; width: 80px; vertical-alignment: center; }
-                                                    // 勾选框组必须包进 HorizontalBox 成一个格子：Row 的子元素是 GridBox
-                                                    // 共享列（label/字段/按钮），直接铺开会把 codex/pi 排进按钮列甚至面板外。
-                                                    HorizontalBox {
-                                                        horizontal-stretch: 1;
-                                                        spacing: 12px;
-                                                        for opt[i] in root.backend-options: PixelCheckBox {
-                                                            text: opt.name;
-                                                            checked: opt.checked;
-                                                            horizontal-stretch: 1;
-                                                            toggled => { root.backend-option-toggled(i); }
-                                                        }
-                                                    }
-                                                }
                                                 // #168 权限档位（每 bot 下拉）：auto 默认（owner 工作区可写、受限只读）；
                                                 // 显式模式用户选择优先。选项值即 config 落盘值（kebab-case）。
+                                                // P4.3：单后端化后统一由随包 agent 执行——档位经 initialize
+                                                // 能力协商 + session/new `_meta` 下发给随包 buzz-agent。
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "权限档位"; width: 80px; vertical-alignment: center; }
                                                     // 同类型下拉：点选断 index 绑定，走单元素 model 重建实例
@@ -2249,29 +2214,6 @@ export component SettingsWindow inherits Window {
                                 spacing: 14px;
                                 alignment: start;
 
-                                // 未安装 agent 的醒目横幅（#8 M0 自动引导）
-                                if root.missing-agent: Rectangle {
-                                    vertical-stretch: 0;
-                                    background: UiTokens.banner-bg;
-                                    border-radius: 4px;
-                                    HorizontalBox {
-                                        padding-top: 10px; padding-right: 14px; padding-bottom: 10px; padding-left: 14px;
-                                        spacing: 8px;
-                                        Text {
-                                            text: "⚠️ 缺少 Claude Code / Codex CLI / Pi（机器人将无法处理消息）或 ACP 适配器（未装时使用随包 buzz-agent，聊天仍可用；装好后自动切回原生）。请点「一键安装」自动补齐（无 Node.js 会自动先装）。";
-                                            color: UiTokens.warn;
-                                            wrap: word-wrap;
-                                            vertical-alignment: center;
-                                            horizontal-stretch: 1;
-                                        }
-                                        if root.missing-deps > 0: PixelButton {
-                                            text: "一键安装全部缺失（" + root.missing-deps + " 项）";
-                                            enabled: root.dep-busy == "";
-                                            clicked => { root.install-all-missing(); }
-                                        }
-                                    }
-                                }
-
                                 // ── 依赖卡片 ──
                                 Rectangle {
                                     vertical-stretch: 0;
@@ -2282,10 +2224,9 @@ export component SettingsWindow inherits Window {
                                         spacing: 6px;
                                         HorizontalBox {
                                             spacing: 8px;
-                                            Text { text: "依赖（本机 agent 运行环境）"; font-weight: 700; color: PixelTheme.text; vertical-alignment: center; }
+                                            Text { text: "依赖（agent 扩展能力运行环境）"; font-weight: 700; color: PixelTheme.text; vertical-alignment: center; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            // #60：标题行入口——横幅只在 agent 缺失时可见，
-                                            // 只缺 node/lark 等也要有一键装入口
+                                            // #60：标题行入口——缺 node/lark 等也要有一键装入口
                                             if root.missing-deps > 0: PixelButton {
                                                 text: "一键安装缺失";
                                                 enabled: root.dep-busy == "";
@@ -2325,56 +2266,6 @@ export component SettingsWindow inherits Window {
                                                 }
                                             }
                                         }
-                                        // claude
-                                        HorizontalBox {
-                                            height: 34px;
-                                            spacing: 10px;
-                                            Text { text: "Claude Code"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
-                                            StatusPill { text: root.claude-installed ? "已安装" : "未安装"; ok: root.claude-installed; }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            if !root.claude-installed: PixelButton {
-                                                text: "安装";
-                                                enabled: root.dep-busy == "";
-                                                clicked => { root.install-dep("claude"); }
-                                            }
-                                            if !root.claude-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://docs.claude.com/en/docs/claude-code/setup"); } }
-                                        }
-                                        if !root.claude-installed: Text { text: "curl -fsSL https://claude.ai/install.sh | bash"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        // codex
-                                        HorizontalBox {
-                                            height: 34px;
-                                            spacing: 10px;
-                                            Text { text: "Codex CLI"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
-                                            if root.codex-ok: StatusPill { text: "已安装"; ok: true; }
-                                            if root.codex-installed && !root.codex-ok: StatusPill { text: "版本过低"; ok: false; warn: true; }
-                                            if !root.codex-installed: StatusPill { text: "未安装"; ok: false; }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            if !root.codex-ok: PixelButton {
-                                                text: root.codex-installed ? "升级" : "安装";
-                                                enabled: root.dep-busy == "";
-                                                clicked => { root.install-dep("codex"); }
-                                            }
-                                            if !root.codex-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/openai/codex"); } }
-                                        }
-                                        // #93：版本满足显示实际版本；版本过低给升级指引；未装保留 npm 命令提示
-                                        if root.codex-ok && root.codex-version != "": Text { text: "已安装 v\{root.codex-version}（最低要求 v0.140）"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        if root.codex-installed && !root.codex-ok: Text { text: "当前 v\{root.codex-version} 低于最低要求 v0.140（与沙箱能力对齐），请升级"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        if !root.codex-installed: Text { text: "npm install -g @openai/codex"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        // pi
-                                        HorizontalBox {
-                                            height: 34px;
-                                            spacing: 10px;
-                                            Text { text: "Pi (pi-coding-agent)"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
-                                            StatusPill { text: root.pi-installed ? "已安装" : "未安装"; ok: root.pi-installed; }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            if !root.pi-installed: PixelButton {
-                                                text: "安装";
-                                                enabled: root.dep-busy == "";
-                                                clicked => { root.install-dep("pi"); }
-                                            }
-                                            if !root.pi-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://pi.dev"); } }
-                                        }
-                                        if !root.pi-installed: Text { text: "curl -fsSL https://pi.dev/install.sh | sh"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // nodejs
                                         HorizontalBox {
                                             height: 34px;
@@ -2389,20 +2280,16 @@ export component SettingsWindow inherits Window {
                                             }
                                         }
                                         if !root.node-installed: Text { text: "brew install node"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        // python3
+                                        // python3（P4.3 降为信息项：运行时无消费方，仅源码开发的
+                                        // 测试 fixture 用；不算缺失、不提供安装入口）
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
                                             Text { text: "Python 3"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill { text: root.python-installed ? "已安装" : "未安装"; ok: root.python-installed; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if !root.python-installed: PixelButton {
-                                                text: "安装";
-                                                enabled: root.dep-busy == "";
-                                                clicked => { root.install-dep("python3"); }
-                                            }
+                                            Text { text: "信息项：运行时已不依赖（仅源码开发跑测试需要）"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); vertical-alignment: center; }
                                         }
-                                        if !root.python-installed: Text { text: "brew install python"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
                                         // lark-cli
                                         HorizontalBox {
                                             height: 34px;
@@ -2432,23 +2319,8 @@ export component SettingsWindow inherits Window {
                                             if !root.dingtalk-installed: PixelButton { text: "文档"; clicked => { root.open-url("https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli"); } }
                                         }
                                         if !root.dingtalk-installed: Text { text: "npm install -g dingtalk-workspace-cli"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        // ACP 适配器（单轨执行层：claude-agent-acp / codex-acp / pi-acp）——
-                                        // harness 按名解析的 npm 全局包；装 agent 本体不等于装适配器，
-                                        // 缺适配器该后端预检 AgentDown 拒答（一条按钮装三个）
-                                        HorizontalBox {
-                                            height: 34px;
-                                            spacing: 10px;
-                                            Text { text: "ACP 适配器"; width: 120px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
-                                            StatusPill { text: root.acp-adapters-installed ? "已安装" : "未安装"; ok: root.acp-adapters-installed; }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            if !root.acp-adapters-installed: PixelButton {
-                                                text: "安装";
-                                                enabled: root.dep-busy == "";
-                                                clicked => { root.install-dep("acp-adapters"); }
-                                            }
-                                        }
-                                        if !root.acp-adapters-installed: Text { text: "npm install -g @agentclientprotocol/claude-agent-acp @agentclientprotocol/codex-acp pi-acp"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); }
-                                        // git（#105：删除保护 git 留痕 / tidy 每日整理依赖；最低版本 v2.30）
+                                        // git（larkskills 技能同步 + 受限会话 agent 只读 git 白名单用系统 git；
+                                        // 最低版本 v2.30——删除保护/tidy 留痕已内置 libgit2，不依赖系统 git）
                                         HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
@@ -2721,7 +2593,7 @@ export component SettingsWindow inherits Window {
                                                     Text { text: "模型"; width: 96px; vertical-alignment: center; }
                                                     PixelTextInput {
                                                         text: root.providers[root.provider-selected].model;
-                                                        placeholder: "如 claude-sonnet-4-5 / gpt-5（空=后端默认）";
+                                                        placeholder: "如 claude-sonnet-4-5 / gpt-5（空=agent 默认）";
                                                         horizontal-stretch: 1;
                                                         edited => { root.provider-field-edited(root.provider-selected, "model", self.text); }
                                                     }
@@ -2742,7 +2614,7 @@ export component SettingsWindow inherits Window {
                                             if root.provider-selected < 0: Text { text: "← 选择或添加一个供应商"; color: UiTokens.text-dim; }
 
                                             Text {
-                                                text: "只支持 Anthropic 原生（claude / pi）与 OpenAI 兼容（codex / pi：chat / responses 两种接口）。claude 后端需 anthropic 型，codex 后端需 openai 型；pi 两种都吃（key 走对应 env）。桥内配置优先于 CC Switch。";
+                                                text: "随包 agent 支持 Anthropic 原生与 OpenAI 兼容（chat / responses 两种接口）供应商，按供应商类型填对应 key。桥内配置优先于 CC Switch。";
                                                 font-size: 12px;
                                                 color: UiTokens.text-dim;
                                                 wrap: word-wrap;
@@ -2816,7 +2688,7 @@ export component SettingsWindow inherits Window {
                                 }
                                 Text {
                                     horizontal-stretch: 1;
-                                    text: "超过该天数未活跃的会话，由 bot 后端 agent 归纳成摘要存档（summaries/）并清理工作区内的历史/会话文件；摘要下次会话自动注入衔接上下文。仅清理本 bot 工作区，不触碰后端私有目录。";
+                                    text: "超过该天数未活跃的会话，由随包 agent 归纳成摘要存档（summaries/）并清理工作区内的历史/会话文件；摘要下次会话自动注入衔接上下文。仅清理本 bot 工作区，不触碰 agent 私有目录。";
                                     font-size: 12px;
                                     color: UiTokens.text-dim;
                                     wrap: word-wrap;

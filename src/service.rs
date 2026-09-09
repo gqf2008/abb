@@ -1327,7 +1327,7 @@ async fn run_job(
                 hs.normal.clone()
             }
         });
-        // granted 能力闸：仅在有句柄可判时求值（None=未装配，走下方"后端未装配"臂）。
+        // granted 能力闸：仅在有句柄可判时求值（None=未装配，走下方"agent 未装配"臂）。
         let granted_blocked = handle.as_ref().is_some_and(|h| {
             granted && h.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
         });
@@ -1390,7 +1390,7 @@ async fn run_job(
                         }
                     }
                 }
-                None => "⏰ 定时任务执行失败：后端未装配".to_string(),
+                None => "⏰ 定时任务执行失败：agent 未装配".to_string(),
             }
         }
     };
