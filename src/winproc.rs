@@ -90,6 +90,11 @@ impl HiddenChild {
     }
 
     /// 并发收满 stdout/stderr 后等退出（对齐 tokio::process::Child::wait_with_output）。
+    // 生产调用点（旧 teambuilder/run_once 的 Windows 段）随 P3.4 迁 oneshot 删除；
+    // 保留本方法作 tokio::process::Child 对齐的完整接口面（测试仍有 4 处调用），
+    // Windows 构建 -D warnings 下非 cfg(test) 故显式 allow（`pub(crate)` 不触发
+    // unreachable_pub）。删生产调用方不代表接口应删——wait/kill/id 同样仅测试触达。
+    #[allow(dead_code)]
     pub(crate) async fn wait_with_output(&mut self) -> io::Result<std::process::Output> {
         use tokio::io::AsyncReadExt;
         let mut stdout = Vec::new();
