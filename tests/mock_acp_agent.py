@@ -55,6 +55,17 @@ for line in sys.stdin:
         text = "".join(c.get("text", "") for c in chunks if isinstance(c, dict))
         record({"event": "prompt", "sessionId": params.get("sessionId"), "text": text})
         sid = params.get("sessionId")
+        if os.environ.get("MOCK_HANG_PROMPT"):
+            # P3.1 oneshot Timeout 路径：只记录不应答（session/cancel 照收，
+            # 排水宽限由 ABB 侧兜底）。
+            continue
+        if os.environ.get("MOCK_AUTH_ERROR"):
+            # P3.1 oneshot Failed 路径：401 认证错误属不可重试终态 → ABB 侧
+            # 立即死信（不重试），同步等待者应收 Err 而非挂到超时。
+            send({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32000,
+                            "message": "API Error: 401 authentication failed"}})
+            continue
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk",
                                           "content": {"type": "text", "text": f"echo: {text}"}}}})

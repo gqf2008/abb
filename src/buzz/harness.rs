@@ -121,6 +121,23 @@ pub struct TurnOutput {
     pub text: String,
 }
 
+/// 同步回合结局（P3.1，[`BuzzHandle::wait_turn_outcome`]）：oneshot 路径需要
+/// 区分超时/关闭/agent 错误；job 路径的 `wait_turn_text` 仍折叠成 Option。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncTurnOutcome {
+    /// 回合文本（含后端标识后缀，与 chat 投递同款处理）。
+    Ok(String),
+    /// 调用方预算先到（在途回合可能仍在跑——调用方负责 cancel 防迟发）。
+    Timeout,
+    /// 句柄已关闭，消息 push 不进主循环。另见 `wait_turn_outcome` 的
+    /// `Ok(None)` 臂：同 channel_id 并发两次等待时后注册者顶替前者，
+    /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
+    /// oneshot fresh Uuid，触不到；与旧实现同构）。
+    Closed,
+    /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
+    Failed(String),
+}
+
 enum Cmd {
     Message {
         channel_id: Uuid,
@@ -184,10 +201,12 @@ pub struct BuzzHandle {
     life_tx: mpsc::UnboundedSender<SpawnOutcome>,
     life_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<SpawnOutcome>>>,
     turn_tx: mpsc::UnboundedSender<TurnOutput>,
-    /// 同步回合等待表（job 路径）：channel_id → 文本回传。turn consumer 消费
-    /// TurnOutput 时若频道有等待者，文本旁路给它（不再走 chat 投递）。
+    /// 同步回合等待表（job/oneshot 路径）：channel_id → 结局回传。Ok = 回合文本
+    ///（turn consumer 消费 TurnOutput 时旁路）；Err = 终态失败原因（notify_channel
+    /// 死信/失败告示时旁路——否则 agent 错误对同步等待者只表现为「挂到超时」，
+    /// 见 docs/buzz-port-sync.md 与 oneshot.rs）。
     sync_waiters: std::sync::Mutex<
-        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<String>>,
+        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
     >,
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
@@ -235,29 +254,47 @@ impl BuzzHandle {
     }
 
     /// 同步回合等待（job 路径）：注册等待者后 push 消息，等回合文本到达
-    ///（timeout 上限）。超时/句柄关闭返回 None——调用方降级报错文案。
+    ///（timeout 上限）。超时/句柄关闭/回合终态失败一律折叠为 None——调用方
+    /// 降级报错文案（与旧实现字节级行为一致；终态失败现在会提前醒而非挂满
+    /// timeout，属失败提速）。需要区分结局的调用方（oneshot）用
+    /// [`Self::wait_turn_outcome`]。
     pub async fn wait_turn_text(
         &self,
         channel_id: Uuid,
         msg: InboundMsg,
         timeout: std::time::Duration,
     ) -> Option<String> {
+        match self.wait_turn_outcome(channel_id, msg, timeout).await {
+            SyncTurnOutcome::Ok(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// 同步回合等待（oneshot 路径）：与 [`Self::wait_turn_text`] 同机制，但
+    /// 结局四分——Ok(文本) / Timeout（调用方预算先到） / Closed（句柄已关闭，
+    /// push 不进） / Failed(agent 终态失败原因，由 notify_channel 旁路)。
+    pub async fn wait_turn_outcome(
+        &self,
+        channel_id: Uuid,
+        msg: InboundMsg,
+        timeout: std::time::Duration,
+    ) -> SyncTurnOutcome {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.sync_waiters.lock().unwrap().insert(channel_id, tx);
         if !self.push_message(channel_id, msg) {
             self.sync_waiters.lock().unwrap().remove(&channel_id);
-            return None;
+            return SyncTurnOutcome::Closed;
         }
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(text)) => {
-                self.sync_waiters.lock().unwrap().remove(&channel_id);
-                Some(text)
-            }
-            _ => {
-                self.sync_waiters.lock().unwrap().remove(&channel_id);
-                None
-            }
-        }
+        let outcome = match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(Ok(text))) => SyncTurnOutcome::Ok(text),
+            Ok(Some(Err(reason))) => SyncTurnOutcome::Failed(reason),
+            // Ok(None) = 回传端意外消失（同 channel_id 并发两次等待时后者
+            // 顶替前者的 tx；见 SyncTurnOutcome::Closed 文档），按关闭论。
+            Ok(None) => SyncTurnOutcome::Closed,
+            Err(_) => SyncTurnOutcome::Timeout,
+        };
+        self.sync_waiters.lock().unwrap().remove(&channel_id);
+        outcome
     }
 
     /// agent 进程是否可用（桥侧预检读）。false = 启动/重拉失败退避中，新消息
@@ -983,9 +1020,9 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 };
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
-                // 同步等待者（job 路径）旁路：文本直接回传，不产生 chat 投递
+                // 同步等待者（job/oneshot 路径）旁路：文本直接回传，不产生 chat 投递
                 if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(channel_id) {
-                    let _ = tx.send(text);
+                    let _ = tx.send(Ok(text));
                 } else {
                     let _ = handle.turn_tx.send(TurnOutput {
                         channel_id: *channel_id,
@@ -1079,12 +1116,22 @@ fn schedule_death_respawn(
 }
 
 /// 失败批次死信/重试耗尽时的频道告示（出站 TurnOutput，桥侧写历史并发送）。
+/// 同步等待者旁路（P3.1）：该频道有 waiter 时同文以 Err 回传——agent 终态失败
+/// （死信/认证失效/档位不支持）对 job/oneshot 路径不再只表现为「挂到超时」。
 fn notify_channel(l: &mut Loop, handle: &BuzzHandle, batch: &FlushBatch, text: String) {
     if l.removed_channels.contains(&batch.channel_id) {
         return;
     }
     let meta = handle.channel_meta(&batch.channel_id);
     tracing::warn!(channel_id = %batch.channel_id, "sending failure notice to channel");
+    if let Some(tx) = handle
+        .sync_waiters
+        .lock()
+        .unwrap()
+        .remove(&batch.channel_id)
+    {
+        let _ = tx.send(Err(text.clone()));
+    }
     let _ = handle.turn_tx.send(TurnOutput {
         channel_id: batch.channel_id,
         meta,
@@ -1334,6 +1381,113 @@ mod channel_info_tests {
         assert_eq!(info.channel_type, "dm");
         assert_eq!(info.workspace.as_deref(), Some("/ws/vb/uuid-1"));
         assert_eq!(meta("group", None).channel_info().workspace, None);
+    }
+
+    /// P3.1：主循环已退出（cmd 接收端随 run_loop 关闭）时，同步回合等待立即
+    /// 得 Closed——不挂预算、不留等待者。纯单测（不起 agent、不跑 run_loop）。
+    #[tokio::test]
+    async fn wait_turn_outcome_closed_when_loop_gone() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        // 模拟 run_loop 曾取走接收端后退出（生产上 Closed 只在此情形发生）。
+        drop(handle.take_cmd_rx());
+        let outcome = handle
+            .wait_turn_outcome(
+                Uuid::new_v4(),
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m1".to_string(),
+                    author_role: "owner".to_string(),
+                    text: "x".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(outcome, SyncTurnOutcome::Closed);
+        assert!(handle.sync_waiters.lock().unwrap().is_empty());
+        // wait_turn_text 折叠同路径 → None（job 调用方语义不变）
+        assert!(handle
+            .wait_turn_text(
+                Uuid::new_v4(),
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m2".to_string(),
+                    author_role: "owner".to_string(),
+                    text: "x".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .is_none());
+    }
+
+    /// P3.1（审查 P3-4）：job 折叠臂直接锁——频道死信（等待者收 Err）时
+    /// `wait_turn_text` 必须**提前醒**且折叠为 None，而不是挂满预算。
+    /// 纯单测：不跑 run_loop，直接拨 sync_waiters 表模拟 notify_channel 旁路。
+    #[tokio::test]
+    async fn wait_turn_text_folds_failure_to_none_fast() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        // cmd 接收端留着不消费：push 成功、等待者注册，消息无人处置。
+        let _cmd_rx = handle.take_cmd_rx();
+        let channel_id = Uuid::new_v4();
+        let waiter = {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                h.wait_turn_text(
+                    channel_id,
+                    crate::buzz::queue::InboundMsg {
+                        id_hex: "m1".to_string(),
+                        author_role: "owner".to_string(),
+                        text: "x".to_string(),
+                        ts_secs: 0,
+                        prompt_tag: "test".to_string(),
+                    },
+                    std::time::Duration::from_secs(3600),
+                )
+                .await
+            })
+        };
+        // 等等待者注册（确定性轮询，5s 上限），再模拟死信 Err 旁路。
+        let mut waited_ms = 0u64;
+        let tx = loop {
+            if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(&channel_id) {
+                break tx;
+            }
+            assert!(waited_ms < 5000, "等待者未注册");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited_ms += 10;
+        };
+        let started = std::time::Instant::now();
+        tx.send(Err("⚠️ 处理失败：agent 认证失效。".to_string()))
+            .unwrap();
+        let folded = waiter.await.unwrap();
+        assert_eq!(folded, None, "Failed 必须折叠为 None");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "死信必须提前醒而非挂预算: {:?}",
+            started.elapsed()
+        );
     }
 }
 
