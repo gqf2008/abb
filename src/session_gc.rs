@@ -131,8 +131,9 @@ impl Summarizer for ServiceSummarizer {
 }
 
 /// 一轮归纳清理（per-bot，service 每日循环调用）：选候选 → 逐个归纳 → 写盘 → 清理。
-/// 天数热读 config（与 tidy_loop 同款），热读失败按 7 天兜底；供应商配置热读失败
-/// 则整轮跳过（无 env 装配不出可用 agent，逐 chat 失败只会永刷日志）。
+/// 天数与供应商配置同一次热读 config（与 tidy_loop/gc 循环同款 load 语义）；
+/// 热读失败整轮跳过（无 env 装配不出可用 agent，逐 chat 失败只会永刷日志；
+/// 代价仅当日跳过、次日门重试，宁留不删无数据损失）。
 pub async fn run_once(
     bridge: &crate::bridge::Bridge,
     stop: &tokio_util::sync::CancellationToken,
