@@ -149,13 +149,14 @@ impl TeamFlowStore {
 }
 
 /// 方案生成抽象（仿 `agent::AgentRunner` 的测试可测性设计）：生产用
-/// [`RealTeamPlanGenerator`] 转发 teambuilder（spawn 本机 claude/codex/pi，120s 超时）；
-/// 测试注入挡板返回固定方案/错误，驱动聊天流程状态机，不碰真实 LLM。
+/// [`RealTeamPlanGenerator`] 转发 teambuilder（单后端化 P3.4：oneshot 同步回合，
+/// 120s 预算）；测试注入挡板返回固定方案/错误，驱动聊天流程状态机，不碰真实 LLM。
 #[async_trait::async_trait]
 pub trait TeamPlanGenerator: Send + Sync {
     async fn generate(
         &self,
-        backend: crate::agent::Backend,
+        bot: &crate::config::BotConfig,
+        cfg: &crate::config::Config,
         goal: &str,
         members: &[String],
         template: Option<&str>,
@@ -169,12 +170,13 @@ pub struct RealTeamPlanGenerator;
 impl TeamPlanGenerator for RealTeamPlanGenerator {
     async fn generate(
         &self,
-        backend: crate::agent::Backend,
+        bot: &crate::config::BotConfig,
+        cfg: &crate::config::Config,
         goal: &str,
         members: &[String],
         template: Option<&str>,
     ) -> Result<TeamPlan, String> {
-        crate::teambuilder::generate_team_plan(backend, goal, members, template).await
+        crate::teambuilder::generate_team_plan(bot, cfg, goal, members, template).await
     }
 }
 

@@ -66,6 +66,17 @@ for line in sys.stdin:
                   "error": {"code": -32000,
                             "message": "API Error: 401 authentication failed"}})
             continue
+        respond = os.environ.get("MOCK_RESPOND_JSON")
+        if respond is not None:
+            # P3.4 teambuilder 全链路：不 echo，以该 env 值作为助手文本原样
+            # 应答（记录照常）——合法/非法方案 JSON 两例驱动 extract_json 剥
+            # fence + schema 校验。
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk",
+                                              "content": {"type": "text", "text": respond}}}})
+            send({"jsonrpc": "2.0", "id": rid,
+                  "result": {"stopReason": "end_turn"}})
+            continue
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk",
                                           "content": {"type": "text", "text": f"echo: {text}"}}}})

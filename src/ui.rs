@@ -2666,7 +2666,8 @@ pub fn run_gui() -> Result<()> {
                             }
                         });
                     }
-                    // #141 团队生成（真实 LLM 链路）：取该 bot 生效后端，生成方案后经 team_rx 回主线程。
+                    // #141 团队生成（单后端化 P3.4：oneshot 同步回合）：加载配置 → 找 bot →
+                    // 生成方案后经 team_rx 回主线程（与 TeamCreate 同款的 cfg/bot 解析臂）。
                     UiCmd::TeamGenerate {
                         idx,
                         bot_key,
@@ -2674,21 +2675,20 @@ pub fn run_gui() -> Result<()> {
                     } => {
                         let team_tx = team_tx.clone();
                         tokio::spawn(async move {
-                            // 走该 bot 生效后端（与 GeneratePrompt 同口径）
-                            let backend = Config::load()
-                                .ok()
-                                .and_then(|c| {
-                                    c.bots.iter().find(|b| b.key() == bot_key).map(|b| {
-                                        b.effective_backend(&c.default_backend).to_string()
-                                    })
-                                })
-                                .unwrap_or_default();
-                            let r = crate::teambuilder::generate_team_plan(
-                                crate::agent::Backend::parse(&backend),
-                                &target,
-                                &[],
-                                None,
-                            )
+                            let r = async {
+                                let cfg = Config::load()
+                                    .map_err(|e| format!("读取配置失败：{e:#}"))?;
+                                let bot = cfg
+                                    .bots
+                                    .iter()
+                                    .find(|b| b.key() == bot_key)
+                                    .cloned()
+                                    .ok_or_else(|| "找不到该 bot 配置".to_string())?;
+                                crate::teambuilder::generate_team_plan(
+                                    &bot, &cfg, &target, &[], None,
+                                )
+                                .await
+                            }
                             .await;
                             let _ = team_tx.send(TeamEvt::Generate {
                                 result: r.map(|plan| {
