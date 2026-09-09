@@ -25,8 +25,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 /// 老四槽格式的单后端槽位（session_id + 是否已开过首轮）。仅用于读老文件
-/// （SessionStore load 即折叠清空；session_import 迁移车绕行裸读老文件时仍取得到——
-/// P4.1 收口前保持其编译与功能不变）。新 schema 不再使用本类型。
+/// （SessionStore load 即折叠成单槽——claude/codex/pi 槽被丢弃；session_import 迁移车
+/// 因此**改读 sessions.json.legacy.bak** 取 legacy 槽原件，见 session_import.rs P1-1 注）。
+/// 新 schema 不再使用本类型。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Slot {
     #[serde(default)]
@@ -217,8 +218,11 @@ impl SessionStore {
             }
             return ChatEntry::default();
         }
-        // 新格式平铺键与老槽并存（异常形态，如手工合并的文件）：平铺键优先，老槽舍弃
-        if !e.session_id.is_empty() || e.started {
+        // 新格式平铺键与老槽并存（异常形态，如手工合并的文件）：平铺键优先，老槽舍弃。
+        // 仅当平铺 session_id 非空才优先（审查 P3-1：空 sid 但 started=true 的异常平铺
+        // 不得把有效 buzz 槽 sid 顶掉——顶掉虽无害（重启即清、ensure 重建），但白丢一份
+        // 可续聊的 buzz 会话；fallback 到老四槽臂逐字提升 buzz 槽）。
+        if !e.session_id.is_empty() {
             return ChatEntry {
                 session_id: e.session_id,
                 started: e.started,
@@ -723,6 +727,24 @@ mod tests {
         assert!(e.started);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("slot-sid"), "老槽已清除: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fold_empty_flat_sid_falls_back_to_buzz_slot() {
+        // 审查 P3-1：平铺键空 sid 但 started=true 的异常形态，不得把有效 buzz 槽 sid 顶掉——
+        // 空平铺不 overriding，fallback 老四槽臂逐字提升 buzz 槽。
+        let dir = temp_dir("emptyflat");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_x": {"session_id": "", "started": true, "buzz": {"session_id": "b-uuid", "started": true}}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::at(path.clone());
+        let e = store.chat_entry("oc_x").unwrap();
+        assert_eq!(e.session_id, "b-uuid", "空平铺 sid 不顶掉 buzz 槽");
+        assert!(e.started);
         std::fs::remove_dir_all(&dir).ok();
     }
 

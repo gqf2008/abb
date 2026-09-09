@@ -369,9 +369,23 @@ fn extract_for(backend: &str, path: &Path) -> Result<Vec<Msg>, String> {
 
 /// 导入某 bot 的全部 chat 历史（幂等：已导入来源跳过）。
 /// dry_run = 只统计不写入。
+/// import 读哪份 sessions 文件（P4.2 审查 P1-1）：SessionStore load 即把四槽折叠成单槽
+/// （claude/codex/pi 槽丢弃），直接读 sessions.json 会逐条 continue、一条都不导入——
+/// legacy 槽逐字原件在 sessions.json.legacy.bak（折叠前 hard_link 归档），故 .bak 在
+/// 优先读 .bak；不在（从未折叠/全新工作区）才回落 sessions.json。纯函数便于单测
+/// （变异：去掉 .bak 优先 → 折叠后的 sessions.json 被选中 → 测试红）。
+fn sessions_source_path(ws: &std::path::Path) -> std::path::PathBuf {
+    let bak = ws.join("sessions.json.legacy.bak");
+    if bak.is_file() {
+        bak
+    } else {
+        ws.join("sessions.json")
+    }
+}
+
 pub fn import_bot(bot_key: &str, dry_run: bool) -> ImportReport {
     let ws = crate::workspace_dir(bot_key);
-    let sessions_path = ws.join("sessions.json");
+    let sessions_path = sessions_source_path(&ws);
     let data: HashMap<String, crate::sessions::ChatEntry> = std::fs::read_to_string(&sessions_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -511,6 +525,22 @@ mod tests {
             std::env::temp_dir().join(format!("abb-sessimp-{name}-{}.jsonl", uuid::Uuid::new_v4()));
         std::fs::write(&p, lines.join("\n")).unwrap();
         p
+    }
+
+    #[test]
+    fn sessions_source_prefers_legacy_bak() {
+        // P4.2 审查 P1-1：折叠后 sessions.json 已无 legacy 槽，import 必须改读 .bak。
+        let ws = std::env::temp_dir().join(format!("abb-sessimp-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        // 无 .bak：回落 sessions.json（全新/未折叠工作区）。
+        assert_eq!(sessions_source_path(&ws), ws.join("sessions.json"));
+        // 有 .bak：优先读之（legacy 槽原件在此）。
+        std::fs::write(ws.join("sessions.json.legacy.bak"), "{}").unwrap();
+        assert_eq!(
+            sessions_source_path(&ws),
+            ws.join("sessions.json.legacy.bak")
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
