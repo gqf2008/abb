@@ -67,9 +67,10 @@ jobs:
       - name: clippy（fork，-D warnings 门禁）
         run: cargo clippy --locked --manifest-path crates/buzz-agent/Cargo.toml --all-targets -- -D warnings
 
-      # 测试只编译不执行：fork 尚有两条已知 flaky（steer 家族，见 docs/buzz-port-sync.md），
-      # 真跑会间歇红；--no-run 已能抓住「测试代码编不过 / 新 cfg 形态漏编译」这类回归
-      # （v2.23.24 的 unused variable 即属此类）。逻辑回归仍由本地全量门禁负责。
+      # 测试只编译不执行：fork 尚存两条已知 flaky（一条 steer 时序、一条 cancel 竞争，
+      # 账在 docs/buzz-port-sync.md「已知 flaky」节），真跑会间歇红；--no-run 已能抓住
+      # 「测试代码编不过 / 新 cfg 形态漏编译」这类回归（v2.23.24 的 unused variable 即属
+      # 此类）。逻辑回归仍由本地全量门禁负责。
       - name: test 编译（fork，--no-run）
         run: cargo test --locked --manifest-path crates/buzz-agent/Cargo.toml --no-run
 

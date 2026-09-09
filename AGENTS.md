@@ -34,7 +34,7 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 
 ## Testing Guidelines
 
-- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package has no `tests/` directory (the fork `crates/buzz-agent` does — integration tests live in `crates/buzz-agent/tests/`).
+- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package has no Rust integration tests — `tests/` only holds Python mock helper scripts (e.g. `tests/mock_acp_agent.py`). The fork `crates/buzz-agent` does have Rust integration tests in `crates/buzz-agent/tests/`.
 - Name tests with `snake_case`, behavior-focused names (e.g., `codex_single_message_no_progress`, `strip_user_mentions`).
 - Add tests alongside the code you change and run `cargo test` before pushing.
 
