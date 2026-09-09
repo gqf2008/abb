@@ -94,11 +94,66 @@ fn buzz_env_for_bot(
     }
 }
 
-/// 按 bot 构造 ACP 句柄对（P2.1）：normal 与 granted 同命令同 env，granted 仅多
-/// `BUZZ_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、~/.agents/skills 扫盘）
-/// 发生在 session/new **之前**，per-session `_meta` 管不到，只能进程级收口
-///（计划决策 4）。域闸/argv 白名单经 `_meta` 随会话下发（P2.2 接线 dispatch 前，
-/// granted 句柄惰性待命：懒启动语义下未路由即零进程成本）。
+/// normal handle 的执行档位载荷（单后端化 P2.2）：把 bot 的 `sandbox_mode` 解析成
+/// 随 `session/new` `_meta` 下发的具体档。
+/// - ReadOnly → `read-only` + 读/写域根 = 该 bot 工作区（域闸收口到 workspace）；
+/// - WorkspaceWrite → `workspace-write` + 同域根；
+/// - Auto / FullAccess → None = fork 缺省 FullAccess（今天字节级行为，回归锁；
+///   auto 不作中间档——fork 无 auto 语义，None 即"照旧"）。
+///
+/// 域根先 canonicalize（symlink 归一），失败回落原路径（目录尚不存在时 canonicalize 会
+/// Err——build_bot_acp_handles 已 ensure，这里是防御兜底）。
+fn resolve_sandbox_meta(
+    bot: &crate::config::BotConfig,
+) -> Option<crate::buzz::acp::SessionSandboxMeta> {
+    let root = crate::workspace_dir(&bot.key());
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let root = root.display().to_string();
+    match bot.sandbox_mode {
+        crate::config::SandboxMode::ReadOnly => Some(crate::buzz::acp::SessionSandboxMeta {
+            sandbox: Some("read-only".to_string()),
+            writable_roots: Some(vec![root]),
+            shell: None,
+            abb_bin: None,
+        }),
+        crate::config::SandboxMode::WorkspaceWrite => Some(crate::buzz::acp::SessionSandboxMeta {
+            sandbox: Some("workspace-write".to_string()),
+            writable_roots: Some(vec![root]),
+            shell: None,
+            abb_bin: None,
+        }),
+        crate::config::SandboxMode::Auto | crate::config::SandboxMode::FullAccess => None,
+    }
+}
+
+/// granted handle 的强制 Restricted 剖面（P2.2/P2.3）：granted 是「受限」语义——
+/// 无论 bot 配的 `sandbox_mode` 是什么，授权者会话恒走 workspace-write 域闸 +
+/// argv 白名单 shell + `$ABB_BIN`。同群 owner/granted 混合频道的档位只能绑进程，
+/// 不能绑会话（角色 per-event，计划决策 4），故 granted 独立实例强制最严剖面。
+/// `abb_bin` = ABB 主程序路径（`$ABB_BIN` 白名单展开实体，让 agent 可 `job`/`deliver`）。
+fn granted_sandbox_profile(bot: &crate::config::BotConfig) -> crate::buzz::acp::SessionSandboxMeta {
+    let root = crate::workspace_dir(&bot.key());
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let root = root.display().to_string();
+    let abb_bin = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    crate::buzz::acp::SessionSandboxMeta {
+        sandbox: Some("workspace-write".to_string()),
+        writable_roots: Some(vec![root]),
+        shell: Some("restricted".to_string()),
+        abb_bin: (!abb_bin.is_empty()).then_some(abb_bin),
+    }
+}
+
+/// 按 bot 构造 ACP 句柄对（P2.1/P2.2）：normal 与 granted 同命令同 env，差异在
+/// ① env：granted 多 `BUZZ_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、
+/// ~/.agents/skills 扫盘）发生在 session/new **之前**，per-session `_meta` 管不到，
+/// 只能进程级收口（计划决策 4）；② `session_sandbox`：normal = bot `sandbox_mode`
+/// 解析产物（None=FullAccess 照旧），granted = 强制 Restricted 剖面。域闸/argv
+/// 白名单经 `_meta` 随会话下发；granted 实例由 dispatch/job 按角色路由
+///（`restrict_granted` + P2.3 能力协商硬闸）。
 fn build_bot_acp_handles(
     bot: &crate::config::BotConfig,
     cfg: &Config,
@@ -115,7 +170,10 @@ fn build_bot_acp_handles(
         .unwrap_or_default()
         .display()
         .to_string();
-    let mk = |extra_env: Vec<(String, String)>| {
+    let normal_meta = resolve_sandbox_meta(bot);
+    let granted_meta = granted_sandbox_profile(bot);
+    let mk = |extra_env: Vec<(String, String)>,
+              session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>| {
         crate::buzz::harness::BuzzHandle::new(
             crate::buzz::harness::AgentConfig {
                 command: command.clone(),
@@ -125,16 +183,19 @@ fn build_bot_acp_handles(
                     .chain(extra_env)
                     .collect(),
                 backend: "buzz".to_string(),
+                session_sandbox,
             },
             stop.clone(),
             cwd.clone(),
         )
     };
-    let normal = mk(env.clone());
-    let granted = mk(env
-        .into_iter()
-        .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
-        .collect());
+    let normal = mk(env.clone(), normal_meta);
+    let granted = mk(
+        env.into_iter()
+            .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
+            .collect(),
+        Some(granted_meta),
+    );
     crate::log!(
         "[acp] harness 装配 bot={} cmd={command}（normal+granted）",
         bot.key()
@@ -335,11 +396,18 @@ pub async fn run() {
                     let Some(bridge) = registry_for_sweep.get(bot_key) else {
                         continue;
                     };
-                    let Some(handle) = bridge.acp_handles.as_ref().map(|h| h.normal.clone()) else {
-                        continue;
-                    };
-                    if !handle.sync_roots(roots) {
-                        crate::log!("[acp:{bot_key}] 频道巡检发送失败（harness 已关闭）");
+                    // 巡检登记表是全量下发（diff 语义，空 roots 会清频道）——必须同时
+                    // 灌 normal 与 granted 双实例，否则 granted 侧频道被巡检排空、角色
+                    // 消息永入不了队列（owner/granted 混合群的会话隔离从根上失效）。
+                    for h in bridge
+                        .acp_handles
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|hs| [hs.normal.clone(), hs.granted.clone()])
+                    {
+                        if !h.sync_roots(roots.clone()) {
+                            crate::log!("[acp:{bot_key}] 频道巡检发送失败（harness 已关闭）");
+                        }
                     }
                 }
             }
@@ -574,7 +642,7 @@ async fn run_bot(
     }
     let bridge = {
         let mut b = Bridge::new(msgr, bot.clone(), &cfg);
-        b.acp_handles = Some(acp_handles); // 本 bot 句柄对：dispatch 走 normal（granted 待 P2.2 接线）
+        b.acp_handles = Some(acp_handles); // 本 bot 句柄对：dispatch/job 按角色路由（P2.2）
                                            // ACP 单轨：harness 会话不跨进程存活——每次服务启动即复位全部槽位，
                                            // 每个 chat 在本进程首轮走注入闸接续历史（否则 started=true 的旧槽位
                                            // 会让新 harness 会话零上下文，切后端/重启后上下文丢失）。
@@ -1219,61 +1287,83 @@ async fn run_job(
     let _cancel_flag = bridge.register_cancel_flag(&job.chat_id);
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
+    // P2.2/P2.3：按 job 角色选实例——granted 任务路由 granted 实例（强制受限剖面），
+    // 且经能力协商硬闸：fork 未声明 `_meta.abbSandbox` ⇒ 拒跑（绝不静默降级成
+    // 无闸 FullAccess）；未启动/启动中（Unknown）按未就绪处理。
     let reply = {
-        let handle = bridge.acp_handles.as_ref().map(|h| h.normal.clone());
+        let granted = crate::config::restrict_granted(job.role, &bot_key);
+        let handle = bridge.acp_handles.as_ref().map(|hs| {
+            if granted {
+                hs.granted.clone()
+            } else {
+                hs.normal.clone()
+            }
+        });
+        // granted 能力闸：仅在有句柄可判时求值（None=未装配，走下方"后端未装配"臂）。
+        let granted_blocked = handle.as_ref().is_some_and(|h| {
+            granted && h.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
+        });
         let channel_id =
             uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(&bot_key, &job.chat_id))
                 .expect("channel_uuid output must parse as Uuid");
-        match handle {
-            Some(h) => {
-                // 频道预注册：p2p/未知会话即时注册（job 消息无 Ev 上下文，用任务目标注册）
-                h.upsert_channel(
-                    channel_id,
-                    crate::buzz::harness::ChannelMeta {
-                        // job 频道工作区 = 该 chat 的工作区（vb 群用其目录）
-                        workspace: Some(
-                            crate::virtualbot::ensure_vb_dir(&bot_key, &job.chat_id)
-                                .unwrap_or_else(|| crate::workspace_dir(&bot_key))
-                                .display()
-                                .to_string(),
-                        ),
-                        bot_key: bot_key.clone(),
-                        chat_id: job.chat_id.clone(),
-                        chat_type: "p2p".to_string(),
-                        thread_id: None,
-                        name: format!("定时任务 {}", &job.id[..job.id.len().min(8)]),
-                        anchor_mid: None,
-                        adhoc: true,
-                    },
-                );
-                match h
-                    .wait_turn_text(
+        if granted_blocked {
+            crate::log!(
+                "[bot:{bot_key}] 任务 {} 拒跑：granted 受限实例未就绪或随包 agent 版本过旧（无 _meta.abbSandbox 能力）",
+                &job.id[..8]
+            );
+            "⚠️ 定时任务无法执行：受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力（请升级 ABB 后重试）".to_string()
+        } else {
+            match handle {
+                Some(h) => {
+                    // 频道预注册：p2p/未知会话即时注册（job 消息无 Ev 上下文，用任务目标注册）
+                    h.upsert_channel(
                         channel_id,
-                        crate::buzz::queue::InboundMsg {
-                            id_hex: uuid::Uuid::new_v4().to_string(),
-                            author_role: job.role.as_str().to_string(),
-                            text: prompt.clone(),
-                            ts_secs: crate::chrono_lite::unix_secs() as i64,
-                            prompt_tag: "job_message".to_string(),
+                        crate::buzz::harness::ChannelMeta {
+                            // job 频道工作区 = 该 chat 的工作区（vb 群用其目录）
+                            workspace: Some(
+                                crate::virtualbot::ensure_vb_dir(&bot_key, &job.chat_id)
+                                    .unwrap_or_else(|| crate::workspace_dir(&bot_key))
+                                    .display()
+                                    .to_string(),
+                            ),
+                            bot_key: bot_key.clone(),
+                            chat_id: job.chat_id.clone(),
+                            chat_type: "p2p".to_string(),
+                            thread_id: None,
+                            name: format!("定时任务 {}", &job.id[..job.id.len().min(8)]),
+                            anchor_mid: None,
+                            adhoc: true,
                         },
-                        // 预算与 chat 回合同款（harness 单回合硬上限 + 余量）：
-                        // 报告类任务实测 3~7 分钟，60s 必超时且回合在途仍会
-                        // 迟发投递（超时文案 + 真回复双发）。
-                        crate::buzz::harness::MAX_TURN_DURATION
-                            + std::time::Duration::from_secs(30),
-                    )
-                    .await
-                {
-                    Some(text) => text,
-                    None => {
-                        // 超时/句柄关闭：叫停在途回合（防真回复迟发成第二条消息），
-                        // 再落超时文案。
-                        let _ = h.cancel(channel_id).await;
-                        "⏰ 定时任务执行超时（agent 无回复）".to_string()
+                    );
+                    match h
+                        .wait_turn_text(
+                            channel_id,
+                            crate::buzz::queue::InboundMsg {
+                                id_hex: uuid::Uuid::new_v4().to_string(),
+                                author_role: job.role.as_str().to_string(),
+                                text: prompt.clone(),
+                                ts_secs: crate::chrono_lite::unix_secs() as i64,
+                                prompt_tag: "job_message".to_string(),
+                            },
+                            // 预算与 chat 回合同款（harness 单回合硬上限 + 余量）：
+                            // 报告类任务实测 3~7 分钟，60s 必超时且回合在途仍会
+                            // 迟发投递（超时文案 + 真回复双发）。
+                            crate::buzz::harness::MAX_TURN_DURATION
+                                + std::time::Duration::from_secs(30),
+                        )
+                        .await
+                    {
+                        Some(text) => text,
+                        None => {
+                            // 超时/句柄关闭：叫停在途回合（防真回复迟发成第二条消息），
+                            // 再落超时文案。
+                            let _ = h.cancel(channel_id).await;
+                            "⏰ 定时任务执行超时（agent 无回复）".to_string()
+                        }
                     }
                 }
+                None => "⏰ 定时任务执行失败：后端未装配".to_string(),
             }
-            None => "⏰ 定时任务执行失败：后端未装配".to_string(),
         }
     };
 
@@ -1425,6 +1515,85 @@ mod tests {
             c
         };
         assert!(buzz_env_for_bot(&cfg3.bots[1], &cfg3, true).is_empty());
+    }
+
+    /// P2.2：normal handle 的 `_meta` 档位映射——sandbox_mode 解析成具体档。
+    /// ReadOnly→read-only、WorkspaceWrite→workspace-write（域根=该 bot 工作区，
+    /// canonicalize 归一），Auto/FullAccess→None（fork 缺省 FullAccess 今天行为，
+    /// auto 不作中间档）。域根必须落在本 bot 工作区（隔离语义）。
+    #[test]
+    fn resolve_sandbox_meta_maps_modes() {
+        let mk_bot = |mode: crate::config::SandboxMode| crate::config::BotConfig {
+            name: "sb-test".into(),
+            sandbox_mode: mode,
+            ..Default::default()
+        };
+        let ws = std::fs::canonicalize(crate::workspace_dir("sb-test"))
+            .unwrap_or_else(|_| crate::workspace_dir("sb-test"))
+            .display()
+            .to_string();
+
+        let ro = resolve_sandbox_meta(&mk_bot(crate::config::SandboxMode::ReadOnly))
+            .expect("read-only 应产生档位载荷");
+        assert_eq!(ro.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(ro.writable_roots, Some(vec![ws.clone()]));
+        assert!(
+            ro.shell.is_none(),
+            "read-only 不带 shell 白名单（owner 档）"
+        );
+        assert!(ro.abb_bin.is_none());
+
+        let ww = resolve_sandbox_meta(&mk_bot(crate::config::SandboxMode::WorkspaceWrite))
+            .expect("workspace-write 应产生档位载荷");
+        assert_eq!(ww.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(ww.writable_roots, Some(vec![ws]));
+        assert!(ww.shell.is_none());
+
+        assert!(
+            resolve_sandbox_meta(&mk_bot(crate::config::SandboxMode::Auto)).is_none(),
+            "auto = None（fork 缺省照旧，不作中间档）"
+        );
+        assert!(
+            resolve_sandbox_meta(&mk_bot(crate::config::SandboxMode::FullAccess)).is_none(),
+            "full-access = None（今天字节级行为回归锁）"
+        );
+    }
+
+    /// P2.2/P2.3：granted 强制 Restricted 剖面——无论 bot 配的 sandbox_mode 是
+    /// 什么（含 FullAccess），granted 实例恒为 workspace-write 域闸 + argv 白名单
+    /// shell + `$ABB_BIN`。域根=该 bot 工作区。
+    #[test]
+    fn granted_sandbox_profile_forces_restricted() {
+        let mk_bot = |mode: crate::config::SandboxMode| crate::config::BotConfig {
+            name: "sb-grant".into(),
+            sandbox_mode: mode,
+            ..Default::default()
+        };
+        let ws = std::fs::canonicalize(crate::workspace_dir("sb-grant"))
+            .unwrap_or_else(|_| crate::workspace_dir("sb-grant"))
+            .display()
+            .to_string();
+        for mode in [
+            crate::config::SandboxMode::Auto,
+            crate::config::SandboxMode::ReadOnly,
+            crate::config::SandboxMode::WorkspaceWrite,
+            crate::config::SandboxMode::FullAccess,
+        ] {
+            let p = granted_sandbox_profile(&mk_bot(mode));
+            assert_eq!(
+                p.sandbox.as_deref(),
+                Some("workspace-write"),
+                "granted 恒 workspace-write（无视 bot 档 {mode:?}）"
+            );
+            assert_eq!(p.writable_roots, Some(vec![ws.clone()]));
+            assert_eq!(p.shell.as_deref(), Some("restricted"));
+            // abb_bin = ABB 主程序路径（$ABB_BIN 白名单展开实体）；测试环境 current_exe
+            // 是测试二进制（非空）——只断言存在性与非空，不绑具体路径。
+            assert!(
+                p.abb_bin.as_deref().is_some_and(|s| !s.is_empty()),
+                "granted 须带 $ABB_BIN"
+            );
+        }
     }
 
     /// 等待绝不能提前返回进入关闭路径——旧实现把 30s 逐 handle 时限放在服务期，

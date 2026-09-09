@@ -192,6 +192,11 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the agent advertised `_meta.abbSandbox` (fork ≥ P1.1) in its
+    /// `initialize` response. Set once by [`initialize`](Self::initialize);
+    /// `false` for agents that omit the key. The only gate on routing granted
+    /// sessions — see [`abb_sandbox_supported`](Self::abb_sandbox_supported).
+    abb_sandbox_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -375,6 +380,7 @@ impl AcpClient {
             current_hard_deadline: None,
             active_run_id: None,
             steering_supported: false,
+            abb_sandbox_supported: false,
             steer_rx: None,
             turn_text: String::new(),
             turn_session: None,
@@ -421,8 +427,25 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // 单后端化 P2.3：fork（buzz-agent ≥ P1.1）在 initialize 声明
+        // `_meta.abbSandbox`（支持的档位词表）= 认 `_meta.sandbox/shell` 并执行
+        // 档位。缺失（旧 fork / 其他适配器）→ false：granted 会话的硬闸据此
+        // 拒答，绝不把发不出的档位静默降级成 FullAccess。与 steering 同款
+        // 「在此解析，调用方不会忘」。
+        self.abb_sandbox_supported = result
+            .pointer("/_meta/abbSandbox")
+            .map(|v| v.is_array())
+            .unwrap_or(false);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Whether the agent advertised `_meta.abbSandbox` in its `initialize`
+    /// response (fork ≥ P1.1), meaning it honors `_meta.sandbox` /
+    /// `_meta.shell` on `session/new`. The **only** gate for routing granted
+    /// (restricted) sessions: absent ⇒ refuse, never silently FullAccess.
+    pub fn abb_sandbox_supported(&self) -> bool {
+        self.abb_sandbox_supported
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -451,6 +474,23 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        self.session_new_full_with_meta(cwd, mcp_servers, system_prompt, session_title, None)
+            .await
+    }
+
+    /// [`session_new_full`] with an optional ABB sandbox payload
+    /// （单后端化 P2.2）merged into `_meta`: `sandbox` / `writableRoots` /
+    /// `shell` / `abbBin`, each omitted when `None`. `None` meta ⇒ byte-identical
+    /// to [`session_new_full`]（旧客户端/FullAccess 回归锁）。Key casing matches
+    /// the fork's `SessionNewMeta` (`rename_all = "camelCase"`).
+    pub async fn session_new_full_with_meta(
+        &mut self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+        sandbox_meta: Option<&SessionSandboxMeta>,
+    ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -468,6 +508,20 @@ impl AcpClient {
         if let Some(title) = session_title {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if let Some(m) = sandbox_meta {
+            if let Some(s) = &m.sandbox {
+                params["_meta"]["sandbox"] = serde_json::Value::String(s.clone());
+            }
+            if let Some(roots) = &m.writable_roots {
+                params["_meta"]["writableRoots"] = serde_json::json!(roots);
+            }
+            if let Some(sh) = &m.shell {
+                params["_meta"]["shell"] = serde_json::Value::String(sh.clone());
+            }
+            if let Some(bin) = &m.abb_bin {
+                params["_meta"]["abbBin"] = serde_json::Value::String(bin.clone());
+            }
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -1776,6 +1830,26 @@ pub struct SessionNewResponse {
     pub raw: serde_json::Value,
 }
 
+/// ABB 会话执行档位载荷（单后端化 P2.2）——merged into `session/new` `_meta`
+/// as `sandbox` / `writableRoots` / `shell` / `abbBin`（fork `SessionNewMeta`
+/// 同词表）。每个 `None` 字段整键省略（adapters 区分缺席与 null）。
+///
+/// 语义（fork 侧 P1.1~1.3 契约）：
+/// - `sandbox`: `"read-only"` | `"workspace-write"` | `"full-access"`；缺省 =
+///   FullAccess（今天字节级行为）。
+/// - `writable_roots`: WorkspaceWrite/ReadOnly 档的读/写域根（= 会话 cwd ∪ 此集）；
+///   FullAccess 忽略。
+/// - `shell`: `"restricted"` = argv 白名单（granted 承诺语义，配 `abb_bin`
+///   认 `$ABB_BIN` 子命令）；缺省 = 今天（Full）。
+/// - `abb_bin`: ABB 主程序路径，`$ABB_BIN` 白名单展开实体。
+#[derive(Debug, Clone, Default)]
+pub struct SessionSandboxMeta {
+    pub sandbox: Option<String>,
+    pub writable_roots: Option<Vec<String>>,
+    pub shell: Option<String>,
+    pub abb_bin: Option<String>,
+}
+
 /// How to deliver a system prompt on `session/new`.
 ///
 /// The two variants match the two mechanisms supported by current adapters:
@@ -1855,6 +1929,109 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_meta.abbSandbox` 能力位解析（单后端化 P2.3 硬闸）：granted 会话路由的
+    /// 唯一闸门——fork 在 initialize 响应声明 `_meta.abbSandbox`（数组）⇒ true；
+    /// 缺省/非数组 ⇒ false。逐字节复刻 initialize 内的解析表达式（隔离 bug 只可能
+    /// 在表达式本身，表达式与判定同源才安全）。
+    fn parse_abb_sandbox_supported(result: &serde_json::Value) -> bool {
+        result
+            .pointer("/_meta/abbSandbox")
+            .map(|v| v.is_array())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn abb_sandbox_supported_true_when_array() {
+        let r = serde_json::json!({
+            "_meta": { "abbSandbox": ["read-only", "workspace-write", "full-access"] }
+        });
+        assert!(parse_abb_sandbox_supported(&r));
+    }
+
+    #[test]
+    fn abb_sandbox_supported_false_when_missing_or_non_array() {
+        // 旧 fork / 其他适配器：无 _meta / 无 abbSandbox
+        assert!(!parse_abb_sandbox_supported(&serde_json::json!({})));
+        assert!(!parse_abb_sandbox_supported(
+            &serde_json::json!({"_meta": {}})
+        ));
+        assert!(!parse_abb_sandbox_supported(
+            &serde_json::json!({"_meta": {"steering": {"supported": true}}})
+        ));
+        // 非数组（畸形/未来协议漂移）——按「发不出档位」保守判 false
+        assert!(!parse_abb_sandbox_supported(
+            &serde_json::json!({"_meta": {"abbSandbox": true}})
+        ));
+        assert!(!parse_abb_sandbox_supported(
+            &serde_json::json!({"_meta": {"abbSandbox": "workspace-write"}})
+        ));
+    }
+
+    /// SessionSandboxMeta 的 camelCase 键名必须逐字节等于 fork `SessionNewMeta`
+    ///（`rename_all = "camelCase"`，crates/buzz-agent/src/wire.rs）——sandbox /
+    /// writableRoots / shell / abbBin。任一字段 None ⇒ 该 `_meta` 成员整体缺省
+    ///（适配器区分缺省成员与 null，fork 对缺省回落 FullAccess/今天行为）。
+    #[test]
+    fn session_sandbox_meta_camel_case_and_omission() {
+        // 全字段
+        let m = SessionSandboxMeta {
+            sandbox: Some("workspace-write".to_string()),
+            writable_roots: Some(vec!["/ws/a".to_string()]),
+            shell: Some("restricted".to_string()),
+            abb_bin: Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string()),
+        };
+        let mut params = serde_json::json!({ "cwd": "/ws/a", "mcpServers": [] });
+        if let Some(s) = &m.sandbox {
+            params["_meta"]["sandbox"] = serde_json::Value::String(s.clone());
+        }
+        if let Some(roots) = &m.writable_roots {
+            params["_meta"]["writableRoots"] = serde_json::json!(roots);
+        }
+        if let Some(sh) = &m.shell {
+            params["_meta"]["shell"] = serde_json::Value::String(sh.clone());
+        }
+        if let Some(bin) = &m.abb_bin {
+            params["_meta"]["abbBin"] = serde_json::Value::String(bin.clone());
+        }
+        assert_eq!(params["_meta"]["sandbox"], "workspace-write");
+        assert_eq!(
+            params["_meta"]["writableRoots"],
+            serde_json::json!(["/ws/a"])
+        );
+        assert_eq!(params["_meta"]["shell"], "restricted");
+        assert_eq!(
+            params["_meta"]["abbBin"],
+            "/Applications/ABB.app/Contents/MacOS/agent-bridge"
+        );
+        // snake_case 键名绝不存在（协议契约回归锁）
+        assert!(params["_meta"].get("writable_roots").is_none());
+        assert!(params["_meta"].get("abb_bin").is_none());
+
+        // None 字段 ⇒ 该成员缺省（read-only 档无 shell/abbBin）
+        let ro = SessionSandboxMeta {
+            sandbox: Some("read-only".to_string()),
+            writable_roots: Some(vec!["/ws/a".to_string()]),
+            shell: None,
+            abb_bin: None,
+        };
+        let mut p2 = serde_json::json!({ "cwd": "/ws/a" });
+        if let Some(s) = &ro.sandbox {
+            p2["_meta"]["sandbox"] = serde_json::Value::String(s.clone());
+        }
+        if let Some(roots) = &ro.writable_roots {
+            p2["_meta"]["writableRoots"] = serde_json::json!(roots);
+        }
+        if let Some(sh) = &ro.shell {
+            p2["_meta"]["shell"] = serde_json::Value::String(sh.clone());
+        }
+        if let Some(bin) = &ro.abb_bin {
+            p2["_meta"]["abbBin"] = serde_json::Value::String(bin.clone());
+        }
+        assert_eq!(p2["_meta"]["sandbox"], "read-only");
+        assert!(p2["_meta"].get("shell").is_none());
+        assert!(p2["_meta"].get("abbBin").is_none());
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {

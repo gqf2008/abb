@@ -4,12 +4,31 @@
 use super::*;
 use uuid::Uuid;
 
-/// #206：buzz 通道资格预检的三种失败（dispatch 与 /cancel 共用判据、各自表述
-/// 文案——判据只有一处，杜绝两处预检漂移）。dispatch 的第四条「非受限会话」是
-/// dispatch 独有（/cancel 与 CLI 一致无角色门槛），由调用方各自叠加。
+impl Bridge {
+    /// 按消息/事件角色选 ACP 实例（单后端化 P2.2）：granted 受限会话路由 granted
+    /// 实例（强制受限剖面 + 进程级 NO_HINTS）；其余走 normal 实例（bot 配置档）。
+    /// 判据 `restrict_granted`（role==Granted && 开关热读）与 prompt 受限说明/agent
+    /// 受限判定同源，防语义漂移。None = 句柄对未装配（测试挡板/job 内部路径）。
+    fn acp_handle_for_role(
+        &self,
+        role: crate::config::SenderRole,
+    ) -> Option<std::sync::Arc<crate::buzz::harness::BuzzHandle>> {
+        self.acp_handles.as_ref().map(|hs| {
+            if crate::config::restrict_granted(role, &self.bot.key()) {
+                hs.granted.clone()
+            } else {
+                hs.normal.clone()
+            }
+        })
+    }
+}
+
+/// #206：buzz 通道资格预检的失败面（dispatch 与 /cancel 共用判据、各自表述
+/// 文案——判据只有一处，杜绝两处预检漂移）。P2.2 起角色不再是拒绝理由而是实例
+/// 选择器（granted → 受限实例）；/cancel 与 dispatch 均按角色选实例，判据一致。
 #[derive(Debug, PartialEq, Eq)]
 enum BuzzPrecheckFail {
-    /// buzz 后端未启用（config 默认后端/本 bot 非 buzz → service 未起 harness）
+    /// 句柄对未装配（生产常驻；None = 测试挡板/job 内部路径，生产不可达——防御）
     BuzzDisabled,
     /// agent 进程不可用（未拉起/崩溃退避中——新消息会被预检拒绝，避免「以为
     /// 已受理」的静默排队）
@@ -17,21 +36,23 @@ enum BuzzPrecheckFail {
     /// 未配置模型供应商（生效供应商解析为 None——buzz agent 进程共用一组凭证，
     /// 与 CLI 后端硬闸同源语义；区别仅在 buzz 闸在预检而非 build_injection）
     NoProvider,
-    /// 供应商类型与后端不匹配（如 claude 配 openai 型）——agent 进程起来也无
-    /// 凭据可用，静默吞消息；预检当场拒答引导。
-    KindMismatch,
+    /// granted 受限会话的执行能力已判为不支持（P2.3 硬闸）：随包 fork 已起且
+    /// initialize 未声明 `_meta.abbSandbox` ⇒ 提前拒答——绝不允许「发不出档位就
+    /// 默认 FullAccess」的静默降级（新 ABB + 旧随包 fork 是唯一 Critical 风险）。
+    /// 未启动（Unknown）不在此拒——真闸在 session 创建处（pool），此处只做
+    /// 「已知不行」的早拒，避免首条 granted 消息因懒启动被误拒。
+    SandboxUnsupported,
 }
 
 impl Bridge {
     /// #206 话题隔离：dispatch 预检（话题感知，**纯判据无副作用**——预检
-    /// 「不过 = 无副作用」invariant：被拒的 dispatch（含受限会话闸④）不得
-    /// 污染频道注册表，审查 #214 P2-1。话题频道登记（注册 + 锚点）由
+    /// 「不过 = 无副作用」invariant：被拒的 dispatch 不得污染频道注册表，
+    /// 审查 #214 P2-1。话题频道登记（注册 + 锚点）由
     /// [`Self::buzz_ensure_topic_channel`] 在全闸通过之后执行）。
-    /// 与 /cancel 的判据差异在话题臂：
-    /// - 群根消息：buzz 启用 → agent 可用 → 供应商闸。**无「已登记」门槛**——
-    ///   bot 能收到消息的群都该能回（提及/授权原则由平台与桥的 @ 门槛保证）；
-    ///   未登记的群由 [`Self::buzz_ensure_group_channel`] 闸后自动登记（adhoc，
-    ///   巡检豁免清理）。
+    /// 判据顺序：按角色选实例 → agent 可用 → 供应商闸 →（granted）能力协商闸。
+    /// - 群根消息：**无「已登记」门槛**——bot 能收到消息的群都该能回（提及/授权
+    ///   原则由平台与桥的 @ 门槛保证）；未登记的群由
+    ///   [`Self::buzz_ensure_group_channel`] 闸后自动登记（adhoc，巡检豁免清理）。
     /// - 话题消息（thread_id 非空）：话题从属于群——群根频道自动登记后话题
     ///   频道同样闸后登记；agent 可用性判据沿用（acp 就绪才有轮次可跑，与群根
     ///   一致——单 slot 无「话题订阅在途」中间态，话题消息与群根消息共享同一判据）。
@@ -40,11 +61,11 @@ impl Bridge {
     /// 「群聊·<chat_id 前缀>」——闸后登记话题频道时作话题频道名来源，不另查
     /// harness 频道表，防两份来源漂移。
     fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
-        let backend =
-            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let Some(handle) = self.acp_handles.as_ref().map(|h| &h.normal) else {
-            return Err(BuzzPrecheckFail::BuzzDisabled);
-        };
+        // P2.2：按角色选实例——granted 会话路由 granted 实例（受限剖面）。
+        let handle = self
+            .acp_handle_for_role(ev.role)
+            .ok_or(BuzzPrecheckFail::BuzzDisabled)?;
+        let granted = crate::config::restrict_granted(ev.role, &self.bot.key());
         // p2p（私聊）：免登记——频道由 dispatch 全闸通过后即时注册（upsert 幂等），
         // 频道名 = 对方展示名。私聊无「群登记」概念（用户私聊 bot 是合理路径）。
         if ev.chat_type == "p2p" || ev.chat_type == "dm" {
@@ -57,19 +78,14 @@ impl Bridge {
             ) {
                 return Err(BuzzPrecheckFail::NoProvider);
             }
-            // 供应商类型匹配闸：claude 只吃 anthropic、codex 只吃 openai 型。
-            // 不匹配 = agent 无凭据，当场拒答优于静默吞消息（实机复现）。
+            // P2.3 granted 能力硬闸（绝不静默降级 FullAccess）：仅在能力位已判为
+            // Unsupported（agent 已起、initialize 未声明）时提前拒答。Unknown
+            //（懒启动未起）放行——真闸在 session 创建处（pool，与本 agent 的
+            // initialize 结果同源，无竞态），否则首条 granted 消息必被误拒。
+            if granted
+                && handle.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
             {
-                let prov = crate::config::Config::provider_for_bot_key_of(
-                    &self.cfg_snapshot,
-                    &self.bot.key(),
-                );
-                if prov
-                    .as_ref()
-                    .is_some_and(|p| crate::agent::build_injection(backend, Some(p)).is_err())
-                {
-                    return Err(BuzzPrecheckFail::KindMismatch);
-                }
+                return Err(BuzzPrecheckFail::SandboxUnsupported);
             }
             let cfg = crate::config::Config::load().unwrap_or_default();
             let (peer, _) = crate::ui::resolve_display(&cfg, &self.bot.key(), &ev.sender_id);
@@ -85,7 +101,7 @@ impl Bridge {
         if !handle.is_agent_available() {
             return Err(BuzzPrecheckFail::AgentDown);
         }
-        // ④ 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
+        // 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
         // None 时 agent 无凭证可用，拒答并引导配置（每消息热读，与 agent.rs 同款成本）。
         if !crate::agent::provider_ready(
             crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
@@ -93,16 +109,10 @@ impl Bridge {
         ) {
             return Err(BuzzPrecheckFail::NoProvider);
         }
-        // 供应商类型匹配闸（同 p2p 分支）
+        // P2.3 granted 能力硬闸（同 p2p 分支：仅 Unsupported 提前拒答，Unknown 放行）
+        if granted && handle.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
         {
-            let prov =
-                crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key());
-            if prov
-                .as_ref()
-                .is_some_and(|p| crate::agent::build_injection(backend, Some(p)).is_err())
-            {
-                return Err(BuzzPrecheckFail::KindMismatch);
-            }
+            return Err(BuzzPrecheckFail::SandboxUnsupported);
         }
         // 群根频道名：优先虚拟 Bot 登记快照的角色名（mtime 懒刷新，与注入判定
         // 同源）；未登记的群回退「群聊·<chat_id 前缀>」（自动登记语义，不拒答）。
@@ -125,7 +135,7 @@ impl Bridge {
     /// 群不被覆盖——巡检登记的角色名优先）。adhoc 标记让巡检 diff 豁免清理
     ///（不在登记表是常态而非消失）。
     fn buzz_ensure_group_channel(&self, ev: &Ev, group_name: &str) {
-        let Some(handle) = self.acp_handles.as_ref().map(|h| &h.normal) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
@@ -155,7 +165,7 @@ impl Bridge {
     /// 消息注册，后续消息刷新 meta）。巡检对 adhoc 频道豁免清理，不会被登记表
     /// diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
     fn buzz_ensure_p2p_channel(&self, ev: &Ev, peer_name: &str) {
-        let Some(handle) = self.acp_handles.as_ref().map(|h| &h.normal) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return;
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
@@ -178,12 +188,12 @@ impl Bridge {
         );
     }
 
-    /// #206 话题隔离：话题频道登记——dispatch 全闸（①②③ + 受限会话闸④）通过
-    /// 之后调用（审查 #214 P2-1：被拒 dispatch 不得登记频道）。幂等（upsert 覆盖
+    /// #206 话题隔离：话题频道登记——dispatch 全闸通过之后调用（审查 #214 P2-1：
+    /// 被拒 dispatch 不得登记频道）。幂等（upsert 覆盖
     /// 同频道）；每次 dispatch 都刷新锚点（= 本条用户消息 mid，话题回复
     /// send_thread_reply 的落点）。
     fn buzz_ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
-        let Some(handle) = self.acp_handles.as_ref().map(|h| &h.normal) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::topic_channel_uuid(
@@ -561,38 +571,34 @@ impl Bridge {
         // #200 Phase 2：buzz 路径资格预检——必须在 **prompt 组装与历史落盘之前**
         // （审查 #205r2）：预检不过 = 这一轮根本不会发生，既不该白烧迁移历史读/指令块
         // 拼接，更不该往 ABB 历史里写一条「有去无回」的用户轮（单边历史会在日后
-        // buzz→CLI 切换时被当上下文注入）。三条资格（①②③ 由 buzz_dispatch_precheck
-        // 承载，④ 是 dispatch 独有）：
+        // buzz→CLI 切换时被当上下文注入）。资格（全部由 buzz_dispatch_precheck 承载）：
         // ① harness 句柄已装配（P2.1 起句柄对按 bot 常驻构造；None = 测试挡板/
         //    job 内部路径，本分支在生产不可达——防御）；
-        // ② 供应商硬闸 + 类型匹配闸（NoProvider/KindMismatch）——无「已登记」
-        //    门槛：bot 能收到消息的群都该能回，未登记群闸后自动登记
-        //    （buzz_ensure_group_channel，adhoc 标记巡检豁免；p2p 同语义即时注册）；
+        // ② 供应商硬闸（NoProvider）——无「已登记」门槛：bot 能收到消息的群都该能回，
+        //    未登记群闸后自动登记（buzz_ensure_group_channel，adhoc 标记巡检豁免；
+        //    p2p 同语义即时注册）；
         // ③ agent 进程可用（启动失败/崩溃退避中 = 不可用——此时 push 只是排队
-        //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）。
-        // ACP 单轨：harness 句柄对已装配（生产常驻）→ dispatch 异步回合；
+        //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）；
+        // ④ granted 能力协商闸（SandboxUnsupported，P2.3）——受限会话必须走受限
+        //    实例，随包 fork 未声明 `_meta.abbSandbox` 一律拒答（绝不静默降级）。
+        // ACP 单轨：harness 句柄对已装配（生产常驻）→ 按角色选实例 dispatch 异步回合；
         // 未装配（测试挡板/job 内部路径）→ 回落 spawn 同步路径。
         if self.acp_handles.is_some() {
             // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
-                Err(BuzzPrecheckFail::BuzzDisabled) => {
-                    Some("服务未装配 agent（重启服务）")
-                }
+                Err(BuzzPrecheckFail::BuzzDisabled) => Some("服务未装配 agent（重启服务）"),
                 // agent 不可用 = 启动失败/崩溃退避中：当场报错优于静默排队
                 //（失败批次会随重拉重试，死信积压见 harness queue 语义）。
                 Err(BuzzPrecheckFail::AgentDown) => {
                     Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
                 }
-                Err(BuzzPrecheckFail::NoProvider) => Some(
-                    "未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存",
-                ),
-                Err(BuzzPrecheckFail::KindMismatch) => Some(
-                    "供应商类型与当前后端不匹配（claude 需 anthropic 型、codex 需 OpenAI 兼容型）——请在「模型供应商」页为该 bot 选择匹配类型的供应商",
-                ),
-                Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
-                    Some("授权者（受限）会话不可用该后端：guard 权限映射未接线")
+                Err(BuzzPrecheckFail::NoProvider) => {
+                    Some("未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存")
                 }
+                Err(BuzzPrecheckFail::SandboxUnsupported) => Some(
+                    "受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力——请升级 ABB 后重试",
+                ),
                 Ok(_) => None,
             };
             if let Some(why) = reason {
@@ -617,7 +623,7 @@ impl Bridge {
                 }
                 return;
             }
-            // 全闸（①②③ + 受限会话闸④）通过后才登记频道（审查 #214 P2-1：
+            // 全闸（①②③④）通过后才登记频道（审查 #214 P2-1：
             // 被拒的 dispatch 不得污染频道注册表——预检「不过=无副作用」）。
             // 话题消息：登记话题频道（群根已登记）；p2p 私聊：即时注册群根频道
             //（免登记语义，频道名 = 对方名）。
@@ -918,9 +924,10 @@ impl Bridge {
         //   按普通消息透传：队列语义下它并入在跑轮次后、随下一轮 steered prompt
         //   一起交 agent（pi-acp 无原生 steer，走 cancel+merge 重跑一轮重提示）。
         // 表情语义与 CLI 对齐：收到打「处理中」（上方），回复投递时撤销+✅。
-        // ACP 单轨：句柄对已装配 → push 进本 bot 的 normal 实例（异步回合）后返回；
-        // 未装配（测试挡板/job 内部）落到下方 spawn 同步路径。
-        if let Some(handle) = self.acp_handles.as_ref().map(|h| h.normal.clone()) {
+        // ACP 单轨：句柄对已装配 → 按角色 push 进对应实例（P2.2：granted→受限实例，
+        // 其余→normal 实例）异步回合后返回；未装配（测试挡板/job 内部）落到下方
+        // spawn 同步路径。
+        if let Some(handle) = self.acp_handle_for_role(ev.role) {
             crate::log!(
                 "[bridge] {} 路径：push 进 harness chat={} len={}",
                 backend.name(),
@@ -1345,7 +1352,7 @@ impl Bridge {
     /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停。!shutdown/!rotate
     /// 等 harness 无此面（cancel 是唯一暴露给聊天的控制信号）。
     async fn buzz_cancel_reply(&self, ev: &Ev) -> String {
-        let Some(handle) = self.acp_handles.as_ref().map(|h| &h.normal) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return "⚠️ 叫停未送达：harness 未装配（检查服务状态/重启）。".to_string();
         };
         let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
