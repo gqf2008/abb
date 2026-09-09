@@ -1312,10 +1312,7 @@ impl Bridge {
         cache
             .entry(chat_id.to_string())
             .or_insert_with(|| {
-                let store = crate::sessions::SessionStore::at(
-                    self.sessions.backend(),
-                    dir.join("sessions.json"),
-                );
+                let store = crate::sessions::SessionStore::at(dir.join("sessions.json"));
                 // 进程内首建 = 服务启动后的首次使用：同 bot 级存储，复位槽位
                 // 让本进程首轮走注入闸（harness 会话不跨进程存活）。
                 store.reset_slots_for_service_start();

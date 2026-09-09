@@ -850,7 +850,6 @@ async fn run_bot(
     // 首轮延迟 24h + jitter（盐与 session_gc 不同，错开两循环触发分钟）：
     // 启动即跑会对每个 bot 全量扫描写盘 + git 操作，不值得。
     {
-        let bridge = bridge.clone();
         let key = key.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("tidy:{key}").into_boxed_str());
@@ -894,11 +893,8 @@ async fn run_bot(
                 let days = cfg.history_retention_days.max(1);
                 // 孤儿判定依赖 live 集：现取（SessionStore::new 轻量读盘）
                 let live: std::collections::HashSet<String> = {
-                    let store = crate::sessions::SessionStore::new(
-                        &bridge.default_backend,
-                        &key,
-                    );
-                    store.live_session_ids("pi").into_iter().collect()
+                    let store = crate::sessions::SessionStore::new(&key);
+                    store.live_session_ids().into_iter().collect()
                 };
                 let report = crate::tidy::run_once(&workspace, now, days, &live);
                 write_run_marker(&marker, now);

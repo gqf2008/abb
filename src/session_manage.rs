@@ -156,8 +156,8 @@ fn display_name(vbs: &[crate::virtualbot::VirtualBot], bot_key: &str, chat_key: 
 
 /// 收集某 bot 的全部会话 key：sessions.json 槽位 + history 目录文件（去重）。
 /// #194：虚拟 Bot 独立工作区（vb/<uuid>/，与 bot 级同布局）一并并入。
-fn chat_keys_for(ws: &std::path::Path, backend: &str) -> Vec<String> {
-    let mut keys: Vec<String> = SessionStore::at(backend, ws.join("sessions.json")).chat_keys();
+fn chat_keys_for(ws: &std::path::Path) -> Vec<String> {
+    let mut keys: Vec<String> = SessionStore::at(ws.join("sessions.json")).chat_keys();
     let scan_hist = |dir: &std::path::Path, keys: &mut Vec<String>| {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -187,7 +187,7 @@ fn chat_keys_for(ws: &std::path::Path, backend: &str) -> Vec<String> {
     if let Ok(rd) = std::fs::read_dir(ws.join("vb")) {
         for d in rd.flatten() {
             if d.path().is_dir() {
-                for k in SessionStore::at(backend, d.path().join("sessions.json")).chat_keys() {
+                for k in SessionStore::at(d.path().join("sessions.json")).chat_keys() {
                     if !keys.contains(&k) {
                         keys.push(k);
                     }
@@ -265,7 +265,7 @@ fn cmd_list(args: &[String]) -> i32 {
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        for ck in chat_keys_for(&ws, &backend) {
+        for ck in chat_keys_for(&ws) {
             let stat_chat = ck.split(':').next().unwrap_or(&ck).to_string();
             let s = stats
                 .iter()
@@ -511,8 +511,6 @@ fn cmd_delete(args: &[String]) -> i32 {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "cli".to_string());
 
-    let bot = cfg.bots.iter().find(|b| b.key() == bot_key).unwrap();
-    let backend = bot.effective_backend(&cfg.default_backend).to_string();
     // #194：虚拟 Bot 群的会话/历史/指令在独立工作区 vb/<uuid>/
     let ws = ws_for_chat(&bot_key, &chat);
     let state = SessionState::production();
@@ -521,7 +519,7 @@ fn cmd_delete(args: &[String]) -> i32 {
     let (msgs, min_ts, max_ts) = MsgStore::production().chat_count_and_range(&bot_key, &chat);
     let hist = History::open_in(&ws.join("history"), &chat);
     let hist_n = hist.entries().len();
-    let store = SessionStore::at(&backend, ws.join("sessions.json"));
+    let store = SessionStore::at(ws.join("sessions.json"));
     let slot = store
         .chat_keys()
         .iter()

@@ -77,7 +77,7 @@ pub struct Bridge {
     /// 访问控制（owner/授权者/对话权限）也以它为准——生产每次消息从 config.json 热读覆盖
     /// 判断（授权/取消即时生效），config 读不到（单测）时用它当快照。
     pub bot: BotConfig,
-    /// 全局：默认后端（SessionStore 已按它初始化；字段保留以便将来逐 bot 覆盖）
+    /// 全局：默认后端（字段保留以便将来逐 bot 覆盖）
     #[allow(dead_code)]
     pub default_backend: String,
     seen: Mutex<HashSet<String>>,
@@ -284,7 +284,7 @@ impl Bridge {
         // 直接用它的 mention_modes 种子化，无需再扫 cfg.bots（两份来源可能漂移）。
         let cfg_snapshot = cfg.clone();
         let mention_seed = bot.mention_modes.clone();
-        let sessions = SessionStore::new(&effective, &key);
+        let sessions = SessionStore::new(&key);
         Bridge {
             msgr,
             cfg_snapshot,
@@ -1674,7 +1674,7 @@ mod tests {
         let chat = format!("oc_restart_{}", uuid::Uuid::new_v4());
         // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 buzz 槽）
         {
-            let sessions = crate::sessions::SessionStore::new("buzz", &bot.key());
+            let sessions = crate::sessions::SessionStore::new(&bot.key());
             let sid = sessions.ensure_with_started(&chat).0;
             assert!(sessions.mark_started_if(&chat, &sid));
             let hist = crate::history::History::open(&bot.key(), &chat);

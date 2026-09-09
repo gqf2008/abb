@@ -657,8 +657,12 @@ pub async fn run(
     // sessions=None（定时任务/会话归纳）不感知；pi 无沙箱体系不感知。
     // #198：check 返回 (提示, rotated)——codex 变更时已重建会话（轮换 sid），
     // rotated 供 run 置 rebuilt（桥写 pending 标记，下一条消息注入历史一次）。
+    // P4.2：轮换判定上移到调用方（SessionStore 不再持有后端概念）——codex resume
+    // 继承首轮沙箱故轮换（#198）；claude 每轮旗标即生效不轮换。
     let sandbox_change = if matches!(backend, Backend::Claude | Backend::Codex) {
-        sessions.and_then(|s| s.check_sandbox_mode(session_key, &sandbox))
+        sessions.and_then(|s| {
+            s.check_sandbox_mode(session_key, &sandbox, matches!(backend, Backend::Codex))
+        })
     } else {
         None
     };
@@ -1377,18 +1381,13 @@ pub fn session_file_id(path: &std::path::Path) -> Option<String> {
 }
 
 /// 会话文件删除的匹配模式（pi 会话文件清理的公共判定）。
-/// - [`SidMatch::InSet`]：删「匹配集合内」的文件——session_gc 按槽位 sid 精确清理；
-/// - [`SidMatch::NotInSet`]：删「匹配集合外」的文件——孤儿清理（/new 与 tidy）。
+/// - [`SidMatch::InSet`]：删「匹配集合内」的文件——/new 按被轮换的旧 sid 即时清理；
+/// - [`SidMatch::NotInSet`]：删「匹配集合外」的文件——孤儿清理（tidy）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidMatch {
     InSet,
     NotInSet,
 }
-
-/// 后端会话文件删除的「即时清理」mtime 护栏（秒）：10 分钟。
-/// /new 与 session_gc 共用（另一个聊天正在跑的首轮任务文件 mtime 新鲜，不得误删）；
-/// tidy 的每日孤儿清理用更宽的 24h（[`crate::tidy::ORPHAN_FRESH_SECS`]）。
-pub const TRANSCRIPT_FRESH_SECS: u64 = 600;
 
 /// 删除 `.pi-sessions` 中的会话文件（文件名 `<ts>_<sid>.jsonl`，sid 用 contains 匹配——
 /// ts 是纯数字+下划线、sid 是 UUID，文件名无分隔歧义）。
@@ -2333,7 +2332,7 @@ mod tests {
         set_mtime_old(&dead_fresh, 2 * 60); // 2 分钟 < 10 分钟护栏
         let live = std::collections::HashSet::from(["live_s".to_string()]);
         assert_eq!(
-            remove_pi_transcripts(&ws, &live, SidMatch::NotInSet, Some(TRANSCRIPT_FRESH_SECS)),
+            remove_pi_transcripts(&ws, &live, SidMatch::NotInSet, Some(600)),
             1,
             "只删死 sid + 旧 mtime"
         );
