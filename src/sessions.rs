@@ -447,13 +447,17 @@ impl SessionStore {
         let mut moved = Vec::new();
         for k in &keys {
             let entry = data.remove(k).unwrap();
-            // 三槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃
+            // 四槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃。
+            // （审查 P2-1：原只查 claude/codex/pi 三槽漏 buzz——单后端世界活会话恒在
+            // buzz 槽，仅 buzz 槽有会话的 chat 会被误判 empty 而丢迁移。）
             let empty = entry.claude.session_id.is_empty()
                 && !entry.claude.started
                 && entry.codex.session_id.is_empty()
                 && !entry.codex.started
                 && entry.pi.session_id.is_empty()
-                && !entry.pi.started;
+                && !entry.pi.started
+                && entry.buzz.session_id.is_empty()
+                && !entry.buzz.started;
             if !empty {
                 moved.push((k.clone(), entry));
             }
@@ -558,6 +562,12 @@ impl SessionStore {
                 &e.codex.session_id
             } else if backend.eq_ignore_ascii_case("pi") {
                 &e.pi.session_id
+            } else if backend.eq_ignore_ascii_case("buzz")
+                || backend.eq_ignore_ascii_case("buzz-agent")
+            {
+                // 审查 P3-1：补 buzz 臂——current_backend 现已恒 "buzz"，缺臂会把
+                // buzz 调用落 else 误读 claude 槽（与 slot_ref/slot_mut 同表派生）。
+                &e.buzz.session_id
             } else {
                 &e.claude.session_id
             };
