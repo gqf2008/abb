@@ -25,6 +25,12 @@ use super::queue::InboundMsg;
 /// cancel 排水宽限（`CONTROL_CANCEL_GRACE` 5s）+ 杀进程组（≤5s）+ 余量。
 /// 超时仍拆不净则告警并 detach（残留任务由关停宽限/kill_on_drop 尽力收尸，
 /// 有界不泄漏——绝不为了等它把调用方挂死）。
+///
+/// 注意本预算**不是硬保证**（审查 P3-1）：cancel 回执与 `stop.cancel()` 之间有
+/// 亚毫秒窗口——若 agent 排水极快（干净 Cancelled）且主循环先处置该结果，
+/// `requeue_as_cancelled` 的批次会被 cancelled-fallback 立即重投为新回合，
+/// 此时拆栈走「宽限耗尽 → abort → kill_on_drop」的 detach 兜底（30s 量级），
+/// 进程组收尸仍然有界，只是 join 等不到。
 // 阶段性落地：P3.1 只交 helper 本体，首个生产调用方随 P3.2（session_gc）接入。
 #[allow(dead_code)]
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(12);
@@ -46,6 +52,10 @@ const CANCEL_CMD_BUDGET: Duration = Duration::from_secs(5);
 /// 失败原因)。句柄用自建的 [`CancellationToken`]（不碰全局关停令牌），用完即弃；
 /// 拆栈保证 agent 子进程组被杀（正常路径 join 内完成，最坏路径 detach 后由
 /// 关停宽限兜底，进程组收尸有界）。
+///
+/// 结局边界（审查 P3-3）：agent **拉不起**（二进制缺失/initialize 连败）时批次
+/// 按 harness 退避重拉设计不死信——结局是挂满 `budget` 得 Timeout，而非 Failed；
+/// Failed 只覆盖「回合已派发后的终态失败」（死信/认证失效/档位不支持）。
 // 阶段性落地：P3.1 只交 helper 本体，首个生产调用方随 P3.2（session_gc）接入，
 // 届时移除此 allow。
 #[allow(dead_code)]
@@ -245,10 +255,11 @@ mod tests {
         );
     }
 
-    /// 预算与回合上限的关系锁：调用方预算应小于 MAX_TURN_DURATION（否则硬上限
-    /// 死信先落地，oneshot 只会收到 Failed 而非 Timeout）——本测试只钉常量顺序。
+    /// 常量顺序锁：拆栈/取消预算必须远小于回合硬上限（否则 Timeout 路径的
+    /// 「cancel+拆栈」语义会被硬上限死信抢先）。调用方 budget 是运行时参数，
+    /// 本测试钉不了它，只钉内部常量的相对序。
     #[test]
-    fn oneshot_budget_below_hard_cap_doc() {
+    fn oneshot_teardown_consts_below_hard_cap() {
         assert!(TEARDOWN_BUDGET < MAX_TURN_DURATION);
         assert!(CANCEL_CMD_BUDGET < TEARDOWN_BUDGET);
     }

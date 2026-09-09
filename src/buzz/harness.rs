@@ -129,7 +129,10 @@ pub enum SyncTurnOutcome {
     Ok(String),
     /// 调用方预算先到（在途回合可能仍在跑——调用方负责 cancel 防迟发）。
     Timeout,
-    /// 句柄已关闭，消息 push 不进主循环。
+    /// 句柄已关闭，消息 push 不进主循环。另见 `wait_turn_outcome` 的
+    /// `Ok(None)` 臂：同 channel_id 并发两次等待时后注册者顶替前者，
+    /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
+    /// oneshot fresh Uuid，触不到；与旧实现同构）。
     Closed,
     /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
     Failed(String),
@@ -285,7 +288,8 @@ impl BuzzHandle {
         let outcome = match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(Ok(text))) => SyncTurnOutcome::Ok(text),
             Ok(Some(Err(reason))) => SyncTurnOutcome::Failed(reason),
-            // Ok(None) = 回传端意外消失（不移除等待者不会到此），按关闭论。
+            // Ok(None) = 回传端意外消失（同 channel_id 并发两次等待时后者
+            // 顶替前者的 tx；见 SyncTurnOutcome::Closed 文档），按关闭论。
             Ok(None) => SyncTurnOutcome::Closed,
             Err(_) => SyncTurnOutcome::Timeout,
         };
@@ -1426,6 +1430,64 @@ mod channel_info_tests {
             )
             .await
             .is_none());
+    }
+
+    /// P3.1（审查 P3-4）：job 折叠臂直接锁——频道死信（等待者收 Err）时
+    /// `wait_turn_text` 必须**提前醒**且折叠为 None，而不是挂满预算。
+    /// 纯单测：不跑 run_loop，直接拨 sync_waiters 表模拟 notify_channel 旁路。
+    #[tokio::test]
+    async fn wait_turn_text_folds_failure_to_none_fast() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        // cmd 接收端留着不消费：push 成功、等待者注册，消息无人处置。
+        let _cmd_rx = handle.take_cmd_rx();
+        let channel_id = Uuid::new_v4();
+        let waiter = {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                h.wait_turn_text(
+                    channel_id,
+                    crate::buzz::queue::InboundMsg {
+                        id_hex: "m1".to_string(),
+                        author_role: "owner".to_string(),
+                        text: "x".to_string(),
+                        ts_secs: 0,
+                        prompt_tag: "test".to_string(),
+                    },
+                    std::time::Duration::from_secs(3600),
+                )
+                .await
+            })
+        };
+        // 等等待者注册（确定性轮询，5s 上限），再模拟死信 Err 旁路。
+        let mut waited_ms = 0u64;
+        let tx = loop {
+            if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(&channel_id) {
+                break tx;
+            }
+            assert!(waited_ms < 5000, "等待者未注册");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited_ms += 10;
+        };
+        let started = std::time::Instant::now();
+        tx.send(Err("⚠️ 处理失败：agent 认证失效。".to_string()))
+            .unwrap();
+        let folded = waiter.await.unwrap();
+        assert_eq!(folded, None, "Failed 必须折叠为 None");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "死信必须提前醒而非挂预算: {:?}",
+            started.elapsed()
+        );
     }
 }
 
