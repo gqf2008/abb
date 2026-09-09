@@ -1288,11 +1288,11 @@ mod sandbox_tests {
         let cfg = cfg_with_dev_tools();
         let avail = crate::devtools::delegate_available(); // 本机实际可用性（真/假均可）
         for (sb, shell) in [
-            (Sandbox::FullAccess, ShellMode::Full), // 正常 owner 会话
+            (Sandbox::FullAccess, ShellMode::Full),     // 正常 owner 会话
             (Sandbox::WorkspaceWrite, ShellMode::Full), // 三档受限但 shell 本就 Full
             (Sandbox::WorkspaceWrite, ShellMode::Restricted), // granted
             (Sandbox::FullAccess, ShellMode::Restricted), // granted 与 full-access 漂移配对
-            (Sandbox::ReadOnly, ShellMode::Full),   // read-only：无 shell
+            (Sandbox::ReadOnly, ShellMode::Full),       // read-only：无 shell
         ] {
             let reg = McpRegistry::spawn_all(
                 &cfg,

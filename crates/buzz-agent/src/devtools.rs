@@ -654,7 +654,10 @@ fn resolve_delegate_cli(
 
 /// 生产包装：覆盖来自环境变量（`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` 逃生阀）。
 fn delegate_cli_path(backend: DelegateBackend) -> Option<PathBuf> {
-    resolve_delegate_cli(backend, std::env::var_os(backend.bin_override_env()).as_deref())
+    resolve_delegate_cli(
+        backend,
+        std::env::var_os(backend.bin_override_env()).as_deref(),
+    )
 }
 
 /// 当前可用的委派后端（生产：经环境变量覆盖 + PATH 探测）。
@@ -670,10 +673,17 @@ pub fn delegate_available() -> bool {
     !available_delegate_backends().is_empty()
 }
 
-/// delegate 注入/放行判定（纯函数，三层闸共用同一逻辑）：仅「shell 未摘（非
-/// read-only）且非 granted(Restricted) 且有可用 CLI」放行。read-only 没有 shell，
-/// 给了是新权限；granted 的 shell 走 argv 白名单，委派 CLI 不受域闸约束，给了
-/// =P1.3 白名单白做；workspace-write/full-access 的 shell 本就 Full（不扩权）。
+/// delegate 注入判定（纯函数）——仅 mcp.rs 的 defs 过滤用它收口「对模型可不可见」：
+/// 「shell 未摘（非 read-only）且非 granted(Restricted) 且有可用 CLI」才注入。
+/// read-only 没有 shell，给了是新权限；granted 的 shell 走 argv 白名单，委派 CLI
+/// 不受域闸约束，给了 =P1.3 白名单白做；workspace-write/full-access 的 shell 本就
+/// Full（不扩权）。
+///
+/// 注意：两个执行闸（mcp.rs `call` 的 denied、run_delegate 入口）刻意**不**复用
+/// 本函数，保持 `!allow_shell() || shell==Restricted` 二腿内联——它们不含
+/// cli_available 这一腿：CLI 缺失要走另一条「available: …」可行动报错，而非
+/// 「disabled in sandbox mode」。别把执行闸也「统一」进本函数，那会改变 CLI
+/// 缺失时的报错语义。
 pub fn delegate_def_visible(
     sandbox: crate::wire::Sandbox,
     shell: crate::wire::ShellMode,
@@ -687,11 +697,7 @@ fn backends_desc_from(avail: &[DelegateBackend]) -> String {
     if avail.is_empty() {
         "none (neither claude nor codex found in PATH)".to_owned()
     } else {
-        avail
-            .iter()
-            .map(|b| b.cli())
-            .collect::<Vec<_>>()
-            .join(", ")
+        avail.iter().map(|b| b.cli()).collect::<Vec<_>>().join(", ")
     }
 }
 
@@ -1521,15 +1527,39 @@ mod tests {
     fn delegate_def_visible_truth_table() {
         use crate::wire::{Sandbox, ShellMode};
         // 仅「shell 未摘 且 非 granted(Restricted) 且 有可用 CLI」放行
-        assert!(delegate_def_visible(Sandbox::FullAccess, ShellMode::Full, true));
-        assert!(delegate_def_visible(Sandbox::WorkspaceWrite, ShellMode::Full, true));
+        assert!(delegate_def_visible(
+            Sandbox::FullAccess,
+            ShellMode::Full,
+            true
+        ));
+        assert!(delegate_def_visible(
+            Sandbox::WorkspaceWrite,
+            ShellMode::Full,
+            true
+        ));
         // granted(Restricted) 永不放行（无论档位/CLI 可用性）
-        assert!(!delegate_def_visible(Sandbox::WorkspaceWrite, ShellMode::Restricted, true));
-        assert!(!delegate_def_visible(Sandbox::FullAccess, ShellMode::Restricted, true));
+        assert!(!delegate_def_visible(
+            Sandbox::WorkspaceWrite,
+            ShellMode::Restricted,
+            true
+        ));
+        assert!(!delegate_def_visible(
+            Sandbox::FullAccess,
+            ShellMode::Restricted,
+            true
+        ));
         // read-only 无 shell 永不放行
-        assert!(!delegate_def_visible(Sandbox::ReadOnly, ShellMode::Full, true));
+        assert!(!delegate_def_visible(
+            Sandbox::ReadOnly,
+            ShellMode::Full,
+            true
+        ));
         // CLI 不可用 → 不注入（其余条件再满足也没用）
-        assert!(!delegate_def_visible(Sandbox::FullAccess, ShellMode::Full, false));
+        assert!(!delegate_def_visible(
+            Sandbox::FullAccess,
+            ShellMode::Full,
+            false
+        ));
     }
 
     #[cfg(unix)]
