@@ -191,6 +191,18 @@ async fn handshake(h: &mut Harness) -> String {
         init["result"]["agentCapabilities"]["promptCapabilities"]["image"],
         false
     );
+    // P2.3 能力协商契约：`_meta.abbSandbox` 必须在响应**顶层** `_meta`
+    //（与 `_meta.steering` 同层）——ABB 的解析器只读顶层。曾误嵌在
+    // agentCapabilities 下，ABB 一律判「不支持受限档位」，受限会话与
+    // read-only/workspace-write 的 owner 会话全部拒建。位置在此逐字锁死。
+    assert_eq!(
+        init["result"]["_meta"]["abbSandbox"],
+        json!(["read-only", "workspace-write", "full-access"])
+    );
+    assert!(
+        init["result"]["agentCapabilities"].get("_meta").is_none(),
+        "能力位不得嵌在 agentCapabilities 下（ABB 读顶层）: {init}"
+    );
 
     let new_id = h
         .send("session/new", json!({ "cwd": "/tmp", "mcpServers": [] }))

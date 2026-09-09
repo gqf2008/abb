@@ -1337,8 +1337,9 @@ mod tests {
         let buzz = mk();
         let handles = BotAcpHandles {
             normal: buzz.clone(),
-            // 测试侧 granted 复用同一 mock 实例（2.1 无 granted 路由；单独建第二
-            // 实例只会多占一个 mock 进程而无断言价值）
+            // 默认 granted 复用同一 mock 实例（多数测试不区分实例）；需要区分
+            // normal/granted 的用例自行组装 BotAcpHandles（见
+            // restricted_session_refused_* 的两个硬闸测试）
             granted: buzz.clone(),
         };
         // 诊断探针：3s 后快照 dead 状态（spawn 失败 = dead=true），写诊断文件供测试失败信息引用
@@ -4156,6 +4157,9 @@ mod tests {
     ///（模拟旧 fork）时，受限会话**拒绝创建**——绝不静默降级 FullAccess。
     /// 断言：无 session/new 到达 agent（没有会话就没有执行），且用户收到
     /// 可行动提示；错误不可重试（一次性死信，不反复重投）。
+    ///
+    /// normal/granted 用**两个不同**的 mock 进程（normal 能力正常）：若路由
+    /// 错把 granted 走成 normal，本测试会因「无拒答、反而建了会话」而红。
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
@@ -4163,10 +4167,14 @@ mod tests {
     )]
     async fn restricted_session_refused_when_agent_lacks_capability() {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let rec = std::env::temp_dir().join(format!("mock-old-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec_normal =
+            std::env::temp_dir().join(format!("mock-cap-n-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec_granted =
+            std::env::temp_dir().join(format!("mock-cap-g-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (old_fork, _h) = make_test_harness_full(
-            rec.clone(),
+        let (normal, _h) = make_test_harness(rec_normal.clone(), &registry);
+        let (old_fork, _h2) = make_test_harness_full(
+            rec_granted.clone(),
             &registry,
             Some(crate::buzz::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
@@ -4177,7 +4185,7 @@ mod tests {
             vec![("MOCK_NO_ABB_SANDBOX".to_string(), "1".to_string())],
         );
         let handles = BotAcpHandles {
-            normal: old_fork.clone(),
+            normal,
             granted: old_fork.clone(),
         };
         let (bridge, msgr) = build_test_bridge_full(
@@ -4205,10 +4213,85 @@ mod tests {
         }
         // 没有会话被创建（拒绝发生在 session/new 之前），也没有 prompt 到达
         assert!(
-            read_session_metas(&rec).is_empty(),
+            read_session_metas(&rec_granted).is_empty(),
             "旧 fork 不得创建受限会话"
         );
-        assert!(read_prompts(&rec).is_empty(), "旧 fork 不得收到 prompt");
+        assert!(
+            read_prompts(&rec_granted).is_empty(),
+            "旧 fork 不得收到 prompt"
+        );
+        // 拒绝是 granted 实例专属：normal 实例（能力正常）不该被误伤
+        assert!(
+            read_session_metas(&rec_normal).is_empty(),
+            "normal 实例不应收到 granted 消息"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// P1-3 词表校验回归锁：agent 声明了能力位但词表不含请求档位（只声明
+    /// read-only）⇒ 同样拒建受限会话。声明的词表是权威，防未来词表漂移被
+    /// 静默降级成「有声明就放行」。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn restricted_session_refused_when_mode_absent_from_vocabulary() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let rec_normal =
+            std::env::temp_dir().join(format!("mock-vocab-n-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec = std::env::temp_dir().join(format!("mock-vocab-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (normal, _hn) = make_test_harness(rec_normal.clone(), &registry);
+        let (narrow, _h) = make_test_harness_full(
+            rec.clone(),
+            &registry,
+            Some(crate::buzz::acp::SessionSandboxMeta {
+                sandbox: Some("workspace-write".to_string()),
+                writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
+                shell: Some("restricted".to_string()),
+                abb_bin: None,
+            }),
+            vec![(
+                "MOCK_ABB_SANDBOX_MODES".to_string(),
+                "read-only".to_string(),
+            )],
+        );
+        let handles = BotAcpHandles {
+            normal: normal.clone(),
+            granted: narrow.clone(),
+        };
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("buzz"),
+            Some((narrow.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+        let mut ev = test_ev("m1", "oc_narrow_vocab", "hi");
+        ev.chat_type = "p2p".to_string();
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if msgr.sent().iter().any(|m| m.contains("不支持受限执行档位")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "10s 内未收到词表拒答提示: {:?}",
+                msgr.sent()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            read_session_metas(&rec).is_empty(),
+            "词表不含请求档位时不得创建会话"
+        );
+        assert!(
+            read_session_metas(&rec_normal).is_empty(),
+            "normal 实例（能力正常）不应收到 granted 消息"
+        );
         cleanup_bridge(&bridge);
     }
 

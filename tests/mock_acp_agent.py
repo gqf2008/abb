@@ -30,13 +30,17 @@ for line in sys.stdin:
     rid = req.get("id")
     params = req.get("params", {}) or {}
     if method == "initialize":
-        # 能力位与真实 fork 对齐（crates/buzz-agent/src/lib.rs）：声明
-        # `_meta.abbSandbox` ⇒ ABB 认 `_meta.sandbox/shell` 并允许受限会话。
-        # MOCK_NO_ABB_SANDBOX=1 模拟「旧 fork 未声明」——P2.3 硬闸回归锁用。
+        # 能力位与真实 fork 对齐（crates/buzz-agent/src/lib.rs）：响应**顶层**
+        # `_meta.abbSandbox` 声明支持的档位词表 ⇒ ABB 认 `_meta.sandbox/shell`
+        # 并允许受限会话。MOCK_NO_ABB_SANDBOX=1 模拟「旧 fork 未声明」——
+        # P2.3 硬闸回归锁用；MOCK_ABB_SANDBOX_MODES 覆盖词表（逗号分隔）——
+        # P1-3 词表校验回归锁用。
         result = {"protocolVersion": 1, "agentCapabilities": {}}
         if not os.environ.get("MOCK_NO_ABB_SANDBOX"):
-            result["_meta"] = {"abbSandbox": ["read-only", "workspace-write",
-                                              "full-access"]}
+            modes = os.environ.get("MOCK_ABB_SANDBOX_MODES")
+            result["_meta"] = {"abbSandbox": (modes.split(",") if modes
+                                              else ["read-only", "workspace-write",
+                                                    "full-access"])}
         send({"jsonrpc": "2.0", "id": rid, "result": result})
     elif method == "session/new":
         session_counter += 1

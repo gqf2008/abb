@@ -1288,8 +1288,8 @@ async fn run_job(
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     // P2.2/P2.3：按 job 角色选实例——granted 任务路由 granted 实例（强制受限剖面），
-    // 且经能力协商硬闸：fork 未声明 `_meta.abbSandbox` ⇒ 拒跑（绝不静默降级成
-    // 无闸 FullAccess）；未启动/启动中（Unknown）按未就绪处理。
+    // 且经能力协商硬闸：能力位已判不支持 ⇒ 拒跑（绝不静默降级成无闸 FullAccess）；
+    // Unknown（懒启动未起）放行到 session 创建处的真闸。
     let reply = {
         let granted = crate::config::restrict_granted(job.role, &bot_key);
         let handle = bridge.acp_handles.as_ref().map(|hs| {

@@ -366,11 +366,17 @@ async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSend
                     "loadSession": false,
                     "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
                     "mcpCapabilities": { "http": false, "sse": false },
-                    // ABB 扩展能力位（P2.3 协商依据）：本 fork 认 session/new
-                    // `_meta.sandbox` 并执行档位。旧 fork 无此位 → ABB 对受限
-                    // 会话沿用拒答，绝不"发不出档位就当 FullAccess 放行"。
-                    "_meta": { "abbSandbox": ["read-only", "workspace-write", "full-access"] },
                 },
+                // ABB 扩展能力位（P2.3 协商依据）：本 fork 认 session/new
+                // `_meta.sandbox` 并执行档位。旧 fork 无此位 → ABB 对受限
+                // 会话沿用拒答，绝不"发不出档位就当 FullAccess 放行"。
+                //
+                // **必须在响应顶层** `_meta`（与 `_meta.steering` 同层）——
+                // ABB 的解析器只读顶层。曾误嵌进 agentCapabilities 下，导致
+                // ABB 一律判"不支持受限档位"：受限会话与 read-only/workspace-write
+                // 的 owner 会话全部拒建。位置由 tests/golden_transcripts.rs 的
+                // handshake 逐字锁死。
+                "_meta": { "abbSandbox": ["read-only", "workspace-write", "full-access"] },
                 "agentInfo": { "name": "buzz-agent", "version": env!("CARGO_PKG_VERSION") },
             }),
         ),

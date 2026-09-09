@@ -101,6 +101,19 @@ pub enum AcpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// Restricted-session negotiation failed: the requested sandbox mode is
+    /// not in the vocabulary the agent declared at `initialize` — the session
+    /// is refused rather than run unrestricted (fail-closed).
+    ///
+    /// **Deliberately not a transport error**: the agent process is healthy
+    /// and the pipe is intact. `harness::is_transport_error` must not match
+    /// this variant — doing so would `schedule_death_respawn` a healthy agent
+    /// on every refusal and mark it dead, so later messages would all be
+    /// rejected by the precheck. `harness::is_sandbox_unsupported` matches it
+    /// instead and dead-letters the batch once with an actionable notice.
+    #[error("Sandbox mode not supported: {0}")]
+    SandboxUnsupported(String),
+
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
 }
@@ -127,6 +140,30 @@ fn build_initialize_params() -> serde_json::Value {
             "version": env!("CARGO_PKG_VERSION")
         },
     })
+}
+
+/// Parse the sandbox-mode vocabulary an agent declares in its `initialize`
+/// response at **top-level** `_meta.abbSandbox` (same layer as
+/// `_meta.steering`; the canonical position since fork 2.23.32).
+///
+/// Deliberately **not** compatible with the nested
+/// `agentCapabilities._meta.abbSandbox` shape shipped by fork v2.23.24–v2.23.31:
+/// that shape is the bug this parser exists to catch, and v2.23.24 implements
+/// only the defs filter — no domain roots, no shell whitelist — so honoring a
+/// nested declaration would silently drop `shell: "restricted"` and void the
+/// granted promise. A pinned old fork via `buzz_agent_exe` therefore gets an
+/// honest refusal, not a weakened sandbox.
+///
+/// Absent key / non-array / empty array ⇒ `None` (= unsupported). Fail-closed:
+/// a caller must never read `None` as "no restrictions".
+fn parse_abb_sandbox_modes(result: &serde_json::Value) -> Option<Vec<String>> {
+    let modes: Vec<String> = result
+        .pointer("/_meta/abbSandbox")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    (!modes.is_empty()).then_some(modes)
 }
 
 /// ACP client that owns an agent subprocess and communicates over its stdio.
@@ -192,11 +229,15 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
-    /// Whether the agent advertised `_meta.abbSandbox` (fork ≥ P1.1) in its
-    /// `initialize` response. Set once by [`initialize`](Self::initialize);
-    /// `false` for agents that omit the key. The only gate on routing granted
-    /// sessions — see [`abb_sandbox_supported`](Self::abb_sandbox_supported).
-    abb_sandbox_supported: bool,
+    /// Sandbox modes the agent advertised via top-level `_meta.abbSandbox`
+    /// (fork ≥ P1.1) in its `initialize` response. `None` = the key was
+    /// absent/empty/malformed — the agent does not honor `_meta.sandbox`, so
+    /// restricted sessions must be refused, never silently run as FullAccess.
+    /// Set once by [`initialize`](Self::initialize); the **only** gate on
+    /// routing restricted sessions — see
+    /// [`abb_sandbox_supported`](Self::abb_sandbox_supported) /
+    /// [`abb_sandbox_supports`](Self::abb_sandbox_supports).
+    abb_sandbox_modes: Option<Vec<String>>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -380,7 +421,7 @@ impl AcpClient {
             current_hard_deadline: None,
             active_run_id: None,
             steering_supported: false,
-            abb_sandbox_supported: false,
+            abb_sandbox_modes: None,
             steer_rx: None,
             turn_text: String::new(),
             turn_session: None,
@@ -427,25 +468,33 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // 单后端化 P2.3：fork（buzz-agent ≥ P1.1）在 initialize 声明
-        // `_meta.abbSandbox`（支持的档位词表）= 认 `_meta.sandbox/shell` 并执行
-        // 档位。缺失（旧 fork / 其他适配器）→ false：granted 会话的硬闸据此
+        // 单后端化 P2.3：fork（buzz-agent ≥ P1.1）在 initialize 顶层 `_meta`
+        // 声明 `_meta.abbSandbox`（支持的档位词表）= 认 `_meta.sandbox/shell`
+        // 并执行档位。缺失（旧 fork / 其他适配器）→ None：受限会话的硬闸据此
         // 拒答，绝不把发不出的档位静默降级成 FullAccess。与 steering 同款
         // 「在此解析，调用方不会忘」。
-        self.abb_sandbox_supported = result
-            .pointer("/_meta/abbSandbox")
-            .map(|v| v.is_array())
-            .unwrap_or(false);
+        self.abb_sandbox_modes = parse_abb_sandbox_modes(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
 
-    /// Whether the agent advertised `_meta.abbSandbox` in its `initialize`
-    /// response (fork ≥ P1.1), meaning it honors `_meta.sandbox` /
-    /// `_meta.shell` on `session/new`. The **only** gate for routing granted
-    /// (restricted) sessions: absent ⇒ refuse, never silently FullAccess.
+    /// Whether the agent advertised a non-empty `_meta.abbSandbox` vocabulary
+    /// in its `initialize` response (fork ≥ P1.1), meaning it honors
+    /// `_meta.sandbox` / `_meta.shell` on `session/new`. The **only** gate for
+    /// routing restricted (granted / read-only / workspace-write) sessions:
+    /// absent ⇒ refuse, never silently FullAccess.
     pub fn abb_sandbox_supported(&self) -> bool {
-        self.abb_sandbox_supported
+        self.abb_sandbox_modes.is_some()
+    }
+
+    /// Whether the agent's declared vocabulary includes `mode`. The declared
+    /// list is the authority: a mode outside it must be refused even though
+    /// the agent advertised *some* support — that is what keeps a future
+    /// vocabulary drift from silently downgrading a restricted session.
+    pub fn abb_sandbox_supports(&self, mode: &str) -> bool {
+        self.abb_sandbox_modes
+            .as_ref()
+            .is_some_and(|modes| modes.iter().any(|m| m == mode))
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -1930,42 +1979,77 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 mod tests {
     use super::*;
 
-    /// `_meta.abbSandbox` 能力位解析（单后端化 P2.3 硬闸）：granted 会话路由的
-    /// 唯一闸门——fork 在 initialize 响应声明 `_meta.abbSandbox`（数组）⇒ true；
-    /// 缺省/非数组 ⇒ false。逐字节复刻 initialize 内的解析表达式（隔离 bug 只可能
-    /// 在表达式本身，表达式与判定同源才安全）。
-    fn parse_abb_sandbox_supported(result: &serde_json::Value) -> bool {
-        result
-            .pointer("/_meta/abbSandbox")
-            .map(|v| v.is_array())
-            .unwrap_or(false)
-    }
-
+    /// `_meta.abbSandbox` 词表解析（单后端化 P2.3 硬闸）：驱动**生产函数**
+    /// [`parse_abb_sandbox_modes`] 本身，而非复刻表达式——复刻版曾在 P0-1
+    /// 里与真实 fork 的声明位置同时写错，测试全绿而生产全拒。
     #[test]
-    fn abb_sandbox_supported_true_when_array() {
+    fn abb_sandbox_modes_parsed_from_top_level_meta() {
         let r = serde_json::json!({
             "_meta": { "abbSandbox": ["read-only", "workspace-write", "full-access"] }
         });
-        assert!(parse_abb_sandbox_supported(&r));
+        assert_eq!(
+            parse_abb_sandbox_modes(&r).expect("顶层声明应解析出词表"),
+            vec!["read-only", "workspace-write", "full-access"]
+        );
     }
 
+    /// 缺省/畸形 ⇒ None（= 不支持），且**刻意不兼容**嵌套旧位形
+    ///（agentCapabilities._meta）——理由见 [`parse_abb_sandbox_modes`] 文档：
+    /// v2.23.24 的嵌套声明没有域根/shell 白名单，放行会静默丢弃
+    /// `shell: "restricted"`。
     #[test]
-    fn abb_sandbox_supported_false_when_missing_or_non_array() {
-        // 旧 fork / 其他适配器：无 _meta / 无 abbSandbox
-        assert!(!parse_abb_sandbox_supported(&serde_json::json!({})));
-        assert!(!parse_abb_sandbox_supported(
-            &serde_json::json!({"_meta": {}})
-        ));
-        assert!(!parse_abb_sandbox_supported(
+    fn abb_sandbox_modes_none_when_absent_malformed_or_nested_legacy() {
+        assert!(parse_abb_sandbox_modes(&serde_json::json!({})).is_none());
+        assert!(parse_abb_sandbox_modes(&serde_json::json!({"_meta": {}})).is_none());
+        assert!(parse_abb_sandbox_modes(
             &serde_json::json!({"_meta": {"steering": {"supported": true}}})
-        ));
-        // 非数组（畸形/未来协议漂移）——按「发不出档位」保守判 false
-        assert!(!parse_abb_sandbox_supported(
-            &serde_json::json!({"_meta": {"abbSandbox": true}})
-        ));
-        assert!(!parse_abb_sandbox_supported(
+        )
+        .is_none());
+        // 空词表 = 什么都没声明
+        assert!(
+            parse_abb_sandbox_modes(&serde_json::json!({"_meta": {"abbSandbox": []}})).is_none()
+        );
+        // 非数组（畸形/未来协议漂移）
+        assert!(
+            parse_abb_sandbox_modes(&serde_json::json!({"_meta": {"abbSandbox": true}})).is_none()
+        );
+        assert!(parse_abb_sandbox_modes(
             &serde_json::json!({"_meta": {"abbSandbox": "workspace-write"}})
-        ));
+        )
+        .is_none());
+        // 嵌套旧位形（fork v2.23.24–v2.23.31 的 bug 形态）——不认
+        assert!(
+            parse_abb_sandbox_modes(&serde_json::json!({
+                "agentCapabilities": { "_meta": { "abbSandbox": ["workspace-write"] } }
+            }))
+            .is_none(),
+            "嵌套声明是 bug 形态，不得放行"
+        );
+    }
+
+    /// 真实 `initialize()` 驱动（非复刻表达式）：顶层声明落进词表，且
+    /// [`AcpClient::abb_sandbox_supports`] 按成员判定——pool 硬闸的唯一数据源。
+    #[tokio::test]
+    async fn initialize_records_abb_sandbox_vocabulary() {
+        let line = r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{},"_meta":{"abbSandbox":["read-only","workspace-write"]}}}"#;
+        let mut client = spawn_script(vec![Emit(line.to_string())]).await;
+        client.initialize().await.expect("initialize");
+        assert!(client.abb_sandbox_supported());
+        assert!(client.abb_sandbox_supports("read-only"));
+        assert!(client.abb_sandbox_supports("workspace-write"));
+        // 词表里没有的档位必须判否（P1-3：声明的词表是权威）
+        assert!(!client.abb_sandbox_supports("full-access"));
+    }
+
+    /// 未声明（旧 fork）⇒ supported=false 且任何档位都判否。
+    #[tokio::test]
+    async fn initialize_without_abb_sandbox_declaration_supports_nothing() {
+        let line =
+            r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#;
+        let mut client = spawn_script(vec![Emit(line.to_string())]).await;
+        client.initialize().await.expect("initialize");
+        assert!(!client.abb_sandbox_supported());
+        assert!(!client.abb_sandbox_supports("workspace-write"));
     }
 
     /// SessionSandboxMeta 的 camelCase 键名必须逐字节等于 fork `SessionNewMeta`

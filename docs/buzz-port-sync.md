@@ -17,10 +17,10 @@
 | 上游文件 | 处置 | 说明 |
 |---|---|---|
 | `queue.rs` / `pool.rs`（同步区） | ABB 扩展字段 | P0.B：`PromptChannelInfo.workspace` + `NewSessionChannelContext.workspace`——session/new 的 cwd 与 `<workspace>` 段按频道工作区（vb 群=vb/<uuid>、普通=bot 工作区）取真值，None 回落 handle cwd；上游同步时保留该字段与其透传 |
-| acp.rs | 保留并裁剪 | ACP 客户端全协议面；删 usage/observer 引用；增 `turn_text` 文本捕获。P2.2/P2.3：initialize 解析 `_meta.abbSandbox` 能力位（`abb_sandbox_supported`，与既有 steering_supported 同「就地解析防调用方遗漏」模式）；新增 `SessionSandboxMeta`（sandbox/writableRoots/shell/abbBin，camelCase）+ `session_new_full_with_meta`（旧 `session_new_full` 保留为 None-meta 包装，None ⇒ 字节级不变回归锁） |
-| pool.rs | 保留并裁剪 | AgentPool/SessionState/run_prompt_task；删 fetch_* REST 面/reaction/用量/失败告示/guard REST 侧。P2.2：`OwnedAgent.session_sandbox` 透传，`create_session_and_apply_model` 改喂 `session_new_full_with_meta` |
+| acp.rs | 保留并裁剪 | ACP 客户端全协议面；删 usage/observer 引用；增 `turn_text` 文本捕获。P2.2/P2.3：initialize 顶层 `_meta.abbSandbox` 词表解析（`parse_abb_sandbox_modes` + `abb_sandbox_supported`/`abb_sandbox_supports`，与既有 steering_supported 同「就地解析防调用方遗漏」模式；**只认顶层**，嵌套旧位形刻意不兼容——见函数文档）；新增 `SessionSandboxMeta`（sandbox/writableRoots/shell/abbBin，camelCase）+ `session_new_full_with_meta`（旧 `session_new_full` 保留为 None-meta 包装，None ⇒ 字节级不变回归锁）；`AcpError::SandboxUnsupported` 独立变体（**不得并入 Protocol**：Protocol 属 `is_transport_error`，会把健康 agent 判死重拉） |
+| pool.rs | 保留并裁剪 | AgentPool/SessionState/run_prompt_task；删 fetch_* REST 面/reaction/用量/失败告示/guard REST 侧。P2.2/P2.3：`OwnedAgent.session_sandbox` 透传，`create_session_and_apply_model` 改喂 `session_new_full_with_meta`；建会话前档位硬闸（请求档位必须在本 agent initialize 声明的词表内，否则 `AcpError::SandboxUnsupported` 拒建——无懒启动竞态的真闸） |
 | queue.rs | 保留并裁剪 | EventQueue/format_prompt；nostr::Event → InboundMsg；删 buzz CLI 发布指令 |
-| harness.rs | ABB 扩展字段 | 单后端化 P2.2/P2.3：`AgentConfig.session_sandbox`（本 handle 全部会话的 `_meta` 档位载荷）；`SandboxSupport` 三态（Unknown/Supported/Unsupported）+ `BuzzHandle.sandbox_supported: AtomicU8`（`handle_spawn_outcome` Ok 臂写、`schedule_agent_start` 复位 Unknown，与 `dead` 共享态同模式）；`spawn_and_init_agent` 传播 `cfg.session_sandbox` 入 OwnedAgent |
+| harness.rs | ABB 扩展字段 | 单后端化 P2.2/P2.3：`AgentConfig.session_sandbox`（本 handle 全部会话的 `_meta` 档位载荷）；`SandboxSupport` 三态（Unknown/Supported/Unsupported）+ `BuzzHandle.sandbox_supported: AtomicU8`（`handle_spawn_outcome` Ok 臂写、`schedule_agent_start` 复位 Unknown，与 `dead` 共享态同模式）；`spawn_and_init_agent` 传播 `cfg.session_sandbox` 入 OwnedAgent；`is_sandbox_unsupported` 死信分支（匹配独立变体，**不进** `is_transport_error`） |
 | prompt_framing.rs | 保留 | 上下文片段渲染（可能小裁） |
 | lib.rs | 裁为壳 | 只留 dispatch_pending/handle_prompt_result/重拉退避切片；删 run()/clap/子命令/装配 |
 | pool_lifecycle.rs | 保留 | 懒池状态机（零外部依赖） |

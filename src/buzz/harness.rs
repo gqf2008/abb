@@ -1101,11 +1101,14 @@ fn is_auth_error(error: &AcpError) -> bool {
 }
 
 /// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
-/// （随包 agent 未声明 `_meta.abbSandbox`）。不可重试——同款字符串判定先例见
-/// [`is_auth_error`]（`AcpError` 无独立变体，标记文案由 pool 侧常量钉死）。
+/// （随包 agent 未声明 `_meta.abbSandbox`，或词表不含请求档位）。不可重试——
+/// agent 进程本身健康，重试只会再撞同一闸。
+///
+/// 走独立变体 [`AcpError::SandboxUnsupported`] 而非 `Protocol`：后者在
+/// `is_transport_error` 之列，会把健康 agent 判为「管道可能坏」而
+/// `schedule_death_respawn`（杀进程 + 置 dead，后续消息全被预检拒掉）。
 fn is_sandbox_unsupported(error: &AcpError) -> bool {
-    matches!(error, AcpError::Protocol(m)
-        if m.contains(crate::buzz::pool::SANDBOX_UNSUPPORTED_MARKER))
+    matches!(error, AcpError::SandboxUnsupported(_))
 }
 
 // ── recover_panicked_agent（上游移植） ───────────────────────────────────────
