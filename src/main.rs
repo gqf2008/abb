@@ -355,7 +355,8 @@ fn main() {
     }
 
     // 一键创建团队 CLI（#100，P0）：LLM 按提示词生成团队方案（预览确认对象）。
-    //   agent-bridge team generate "<团队目标>" [--members "小王,steven"] [--backend codex] [--template 软件产品团队]
+    //   agent-bridge team generate "<团队目标>" [--members "小王,steven"] [--template 软件产品团队]
+    // （--backend 已废弃：单后端化 P3.4 后统一由随包 buzz-agent 执行，传入仅警告并忽略）
     // 输出：校验后的团队方案 JSON（stdout），供上层预览确认/建群。
     if args.len() >= 2 && args[1] == "team" {
         std::process::exit(run_team_cli(&args[2..]));
@@ -1176,7 +1177,8 @@ fn run_trash_cli(args: &[String]) -> i32 {
 }
 
 /// 一键创建团队 CLI（#100 P0）：LLM 按提示词生成团队方案（预览确认对象）。
-/// 用法：agent-bridge team generate "<目标>" [--members "小王,steven"] [--backend codex] [--template 软件产品团队]
+/// 用法：agent-bridge team generate "<目标>" [--members "小王,steven"] [--template 软件产品团队]
+/// （--backend 已废弃：单后端化 P3.4 后统一由随包 buzz-agent 执行，传入仅警告并忽略）
 /// 成功 → stdout 输出校验后的团队方案 JSON（缩进）；失败 → stderr 提示重试/手动编辑。
 fn run_team_cli(args: &[String]) -> i32 {
     match args.first().map(|s| s.as_str()) {
@@ -1189,13 +1191,12 @@ fn run_team_cli(args: &[String]) -> i32 {
         }
         Some("generate") => {}
         _ => {
-            eprintln!("用法：agent-bridge team generate \"<团队目标>\" [--members \"小王,steven\"] [--backend codex] [--template 软件产品团队]\n       agent-bridge team templates");
+            eprintln!("用法：agent-bridge team generate \"<团队目标>\" [--members \"小王,steven\"] [--template 软件产品团队]\n       agent-bridge team templates");
             return 2;
         }
     }
     let mut goal = String::new();
     let mut members: Vec<String> = Vec::new();
-    let mut backend = crate::agent::Backend::Codex;
     let mut template: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -1211,9 +1212,11 @@ fn run_team_cli(args: &[String]) -> i32 {
                 }
             }
             "--backend" => {
+                // 单后端化 P3.4：仍解析该 flag（兼容旧脚本），但接受并忽略——
+                // 统一由随包 buzz-agent 执行。
                 i += 1;
-                if let Some(b) = args.get(i) {
-                    backend = crate::agent::Backend::parse(b);
+                if args.get(i).is_some() {
+                    eprintln!("⚠️ --backend 已忽略：单后端化后统一由随包 buzz-agent 执行");
                 }
             }
             "--template" => {
@@ -1235,6 +1238,30 @@ fn run_team_cli(args: &[String]) -> i32 {
         eprintln!("缺少团队目标。用法：agent-bridge team generate \"<团队目标>\"");
         return 2;
     }
+    let cfg = match crate::config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("读取配置失败：{e:#}");
+            return 1;
+        }
+    };
+    // bot 选择（保留旧 env 契约）：AGENT_BRIDGE_BOT_KEY 非空且命中 → 该 bot；
+    // 否则第一个 enabled bot（env 未命中也回落，对齐旧版回落 default_provider 的
+    // 宽松语义，但给警告防 stale env 静默错配）；都没有 → 引导配置。
+    let bot = match std::env::var("AGENT_BRIDGE_BOT_KEY") {
+        Ok(bk) if !bk.is_empty() => match cfg.bots.iter().find(|b| b.key() == bk) {
+            Some(b) => Some(b.clone()),
+            None => {
+                eprintln!("⚠️ AGENT_BRIDGE_BOT_KEY（{bk}）未命中任何 bot，回落第一个 enabled bot");
+                cfg.bots.iter().find(|b| b.enabled).cloned()
+            }
+        },
+        _ => cfg.bots.iter().find(|b| b.enabled).cloned(),
+    };
+    let Some(bot) = bot else {
+        eprintln!("请先在 GUI 配置 bot");
+        return 1;
+    };
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -1243,7 +1270,8 @@ fn run_team_cli(args: &[String]) -> i32 {
         }
     };
     match rt.block_on(crate::teambuilder::generate_team_plan(
-        backend,
+        &bot,
+        &cfg,
         &goal,
         &members,
         template.as_deref(),

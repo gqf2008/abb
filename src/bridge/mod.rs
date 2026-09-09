@@ -1214,7 +1214,8 @@ mod tests {
     impl crate::teamflow::TeamPlanGenerator for MockTeamPlanGenerator {
         async fn generate(
             &self,
-            _backend: Backend,
+            _bot: &BotConfig,
+            _cfg: &Config,
             goal: &str,
             _members: &[String],
             _template: Option<&str>,
