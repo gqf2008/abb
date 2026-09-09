@@ -52,3 +52,13 @@
 - 独立 manifest、独立 `Cargo.lock`：`cargo +1.98.0 build --release --manifest-path crates/buzz-agent/Cargo.toml`（产物在 `crates/buzz-agent/target/`，不污染仓库根 target）。
 - 测试：`cargo +1.98.0 test --manifest-path crates/buzz-agent/Cargo.toml`（642+ 全绿含 corpus drift gate）。
 - 分发：release.yml（macOS/Windows）+ ABB.iss 构建 fork 随包；运行时执行层解析（`service.rs::resolve_buzz_agent`）：`buzz_agent_exe` 覆盖（绝对路径或 PATH 名，指错告警并回落）→ 主程序同目录 `buzz-agent`/`buzz-agent.exe`（ABB.app/Contents/MacOS/）→ PATH `pi-acp` 兜底（开发/自签构建无随包时）。
+
+## 已知 flaky（fork 测试）
+
+CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归本地全量门禁。处置纪律：**禁止重跑至绿**（幸存者偏差），逐测试归因裁决。现存两条（出处：093451a 提交信息，均自移植早期存在、与本 fork 后续改动零交集）：
+
+1. `cancelled_turn_with_usage_emits_notification_before_response`（断言 `tests/fake_llm.rs:1376`，Null vs "cancelled"）——cancel 写 stdin 后 gate 立即放开、agent reader 未及处理，第 2 轮 fallback 错误臂在 biased select 中抢先（`agent.rs:406-410`）。修它要动同步区 cancel 优先级，**另案评估**。发生率：20 轮口径 1 轮。
+2. `steer_rejected_on_empty_prompt`（断言 `tests/fake_llm.rs:1459`）——空 prompt 的 -32602 拒绝帧在争用下落后于 prompt 响应帧，先 break → `saw_reject=false`。自移植初始提交 be46634 存在、从未改动；仅全量并发下偶发（整文件 20 轮 0 出现）。
+
+已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
+
