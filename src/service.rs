@@ -7,16 +7,6 @@ use crate::config::Config;
 use crate::messenger;
 use std::sync::Arc;
 
-/// 后端 → 主适配器可执行名（buzz 无主适配器，恒 None）。
-fn primary_adapter(backend: &str) -> Option<&'static str> {
-    match backend {
-        "claude" => Some("claude-agent-acp"),
-        "codex" => Some("codex-acp"),
-        "pi" => Some("pi-acp"),
-        _ => None,
-    }
-}
-
 /// 随包 buzz-agent 同目录候选（Windows 包名带 .exe，两个都试；无则 None——
 /// 开发/自签构建不随包）。
 fn bundled_buzz_agent() -> Option<String> {
@@ -33,12 +23,12 @@ fn bundled_buzz_agent() -> Option<String> {
     })
 }
 
-/// 解析 buzz 执行层命令（`resolve_adapter` 的 bundled 输入；纯函数便于单测）。
+/// 解析 ACP 执行层命令（纯函数便于单测）。
 /// 决议链 = 文档承诺的顺序（#206 字段义）：
 /// ① `config.buzz_agent_exe` 覆盖（绝对路径是文件 → 直用；否则按 PATH 探测）——
 ///    开发机指自己 build 的 fork、也作装了原生适配器的用户的逃生阀；
 /// ② 主程序同目录随包 `buzz-agent[.exe]`；
-/// ③ 都没有 → None（上层回落 pi-acp 兜底）。
+/// ③ 都没有 → None（build_bot_acp_handles 回落 pi-acp 兜底）。
 /// 覆盖配了但找不到 → 告警并落回 ②（宁可用随包版也不要起不来的进程）。
 fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
     if !override_exe.trim().is_empty() {
@@ -57,21 +47,99 @@ fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
     bundled_buzz_agent()
 }
 
-/// 适配器解析纯函数（单测覆盖）：`(命令, env 是否按 buzz-agent 语义装配)`。
-///
-/// 决议链：主适配器已装 → 原生；否则随包 buzz-agent（永远在的执行层，
-/// 用户决策：缺装不挡聊天）；开发/自签构建无随包 → pi-acp 兜底（装 pi-acp
-/// 的开发机可起；都没有则 spawn 失败 → AgentDown，如实可见）。
-fn resolve_adapter(backend: &str, primary_found: bool, bundled: Option<String>) -> (String, bool) {
-    if let Some(p) = primary_adapter(backend) {
-        if primary_found {
-            return (p.to_string(), false);
+/// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
+/// buzz 语义：`BUZZ_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses 全系
+/// 兼容 env（buzz_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
+/// `uses_buzz_agent=false`（无随包落 pi-acp 兜底）走 `build_injection(Backend::Buzz)`
+/// ——经核对该臂解析到 buzz_provider_env（agent.rs Buzz 臂），与 true 臂殊途同归，
+/// 且与旧 env_for 的 buzz 后端无随包兜底路径（旧代码同样 build_injection(Buzz)）
+/// 语义逐字节一致。装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
+/// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
+fn buzz_env_for_bot(
+    bot: &crate::config::BotConfig,
+    cfg: &Config,
+    uses_buzz_agent: bool,
+) -> Vec<(String, String)> {
+    let prov = cfg.resolve_provider(bot).cloned();
+    if let Some(p) = prov.as_ref() {
+        if p.api_key.trim().is_empty() {
+            crate::log!(
+                "[acp] bot={} 供应商「{}」未填 API Key，该 bot 消息将拒答引导",
+                bot.key(),
+                p.name
+            );
+            return Vec::new();
         }
     }
-    if let Some(cmd) = bundled {
-        return (cmd, true);
+    if uses_buzz_agent {
+        match crate::agent::buzz_provider_env(prov.as_ref()) {
+            Ok(Some(env)) => env.into_iter().collect(),
+            Ok(None) => Vec::new(), // 无供应商：agent 起来后回合报错（预检已引导配置）
+            Err(e) => {
+                crate::log!("[acp] bot={} 供应商 env 装配失败: {e}", bot.key());
+                Vec::new()
+            }
+        }
+    } else {
+        match crate::agent::build_injection(crate::agent::Backend::Buzz, prov.as_ref()) {
+            Ok(inj) => inj.env.unwrap_or_default().into_iter().collect(),
+            Err(e) => {
+                crate::log!(
+                    "[acp] bot={} 供应商 env 装配失败（该 bot 消息将拒答引导）: {e}",
+                    bot.key()
+                );
+                Vec::new()
+            }
+        }
     }
-    ("pi-acp".to_string(), false)
+}
+
+/// 按 bot 构造 ACP 句柄对（P2.1）：normal 与 granted 同命令同 env，granted 仅多
+/// `BUZZ_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、~/.agents/skills 扫盘）
+/// 发生在 session/new **之前**，per-session `_meta` 管不到，只能进程级收口
+///（计划决策 4）。域闸/argv 白名单经 `_meta` 随会话下发（P2.2 接线 dispatch 前，
+/// granted 句柄惰性待命：懒启动语义下未路由即零进程成本）。
+fn build_bot_acp_handles(
+    bot: &crate::config::BotConfig,
+    cfg: &Config,
+    buzz_cmd: Option<&str>,
+    stop: tokio_util::sync::CancellationToken,
+) -> crate::bridge::BotAcpHandles {
+    // 开发/自签构建无随包 → pi-acp 兜底（装 pi-acp 的开发机可起；都没有则 spawn
+    // 失败 → AgentDown，如实可见）
+    let command = buzz_cmd
+        .map(str::to_string)
+        .unwrap_or_else(|| "pi-acp".to_string());
+    let env = buzz_env_for_bot(bot, cfg, buzz_cmd.is_some());
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    let mk = |extra_env: Vec<(String, String)>| {
+        crate::buzz::harness::BuzzHandle::new(
+            crate::buzz::harness::AgentConfig {
+                command: command.clone(),
+                args: Vec::new(),
+                extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
+                    .into_iter()
+                    .chain(extra_env)
+                    .collect(),
+                backend: "buzz".to_string(),
+            },
+            stop.clone(),
+            cwd.clone(),
+        )
+    };
+    let normal = mk(env.clone());
+    let granted = mk(env
+        .into_iter()
+        .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
+        .collect());
+    crate::log!(
+        "[acp] harness 装配 bot={} cmd={command}（normal+granted）",
+        bot.key()
+    );
+    crate::bridge::BotAcpHandles { normal, granted }
 }
 
 pub async fn run() {
@@ -115,139 +183,14 @@ pub async fn run() {
 
     let cfg = Arc::new(cfg);
 
-    // #200 Phase 3：buzz 后端 harness（单进程形态）——有启用且后端为 buzz 的 bot
-    // 时装配：BuzzHandle（懒池：首条消息才拉起 agent 子进程）+ 三个长驻任务
-    //（主循环 / 回合投递消费 / 频道巡检）。装配本身零等待（不 spawn 进程、不碰
-    // 盘）——handle 同步可得，bot 循环构造 Bridge 即拿到，无「后台任务异步填共享
-    // 句柄、bot 先读为 None」的启动竞态。agent 进程是懒启动 + 崩溃退避重拉
-    //（harness 内闭环），启动失败只影响 buzz 频道，CLI 后端不受影响。
-    // harness 常驻装配（热切换前提）：装配零等待（不 spawn 进程、不碰盘），agent
-    // 懒启动。不再按「生效后端=buzz」条件装配——bot 中途切到 buzz（GUI 保存热读）
-    // 时 harness 已在，免重启；巡检/预检对非 buzz bot 天然无感。
-    // 每后端一个 harness 实例（ACP 适配器 + 该后端供应商 env）——ABB 只面对协议，
-    // 后端差异收敛在适配器命令与 env。命令解析见 resolve_adapter：主适配器已装走
-    // 原生（claude→claude-agent-acp、codex→codex-acp、pi→pi-acp），缺装回落随包
-    // buzz-agent（开箱即用），开发/自签构建无随包时 pi-acp 兜底。env 复用
-    // build_injection 的注入矩阵按后端映射（供应商硬闸同源）。
-    let buzz_handles: std::collections::HashMap<
-        String,
-        std::sync::Arc<crate::buzz::harness::BuzzHandle>,
-    > = {
-        // ACP 适配器命令：claude→claude-agent-acp、codex→codex-acp、pi→pi-acp
-        //（pi 本尊，npm 全局）——buzz 才用随包 buzz-agent（pi 的 fork，指给 pi 后端
-        // 会让 pi 名存实亡）。主适配器缺装（新机/Windows 未装 npm 全局包）时
-        // **自动回落随包 buzz-agent**（用户决策：开箱即用优于后端死掉；装好适配器
-        // 后自动切回原生）。返回 (命令, 是否回落 buzz-agent)——env 装配按实际
-        // spawn 的 agent 语义走（见 env_for）。
-        // 覆盖/随包解析每进程一次（配置里 buzz_agent_exe 指错时只告警一回）
-        let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
-        let adapter = |backend: &str| -> (String, bool) {
-            let primary = primary_adapter(backend);
-            let primary_found = primary
-                .map(|p| crate::deps::find_in_path(p).is_some())
-                .unwrap_or(false);
-            let bundled = buzz_cmd.clone();
-            match resolve_adapter(backend, primary_found, bundled) {
-                (cmd, true) if cmd != "pi-acp" => {
-                    if let Some(p) = primary {
-                        crate::log!(
-                            "[acp] {backend} 适配器 {p} 未装（npm 全局缺失），回落随包 buzz-agent"
-                        );
-                    }
-                    (cmd, true)
-                }
-                other => other,
-            }
-        };
-        let env_for = move |backend: &str, uses_buzz_agent: bool| -> Vec<(String, String)> {
-            let b = crate::agent::Backend::parse(backend);
-            let prov = crate::config::Config::load().ok().and_then(|c| {
-                c.bots
-                    .iter()
-                    .find(|bt| bt.enabled)
-                    .and_then(|bt| c.resolve_provider(bt).cloned())
-            });
-            // 装配级硬闸：供应商存在但 API Key 为空 → 注入空 env（agent 侧只会报
-            // `Missing environment variable: AGENT_BRIDGE_MODEL_KEY` 内部错误，
-            // Windows 实机），预检已按 NoProvider 拒答引导补填。
-            if let Some(p) = prov.as_ref() {
-                if p.api_key.trim().is_empty() {
-                    crate::log!(
-                        "[acp] {backend} 供应商「{}」未填 API Key，该后端消息将拒答引导",
-                        p.name
-                    );
-                    return Vec::new();
-                }
-            }
-            // env 语义按实际 spawn 的 agent 分：
-            // - buzz-agent（buzz 后端 / 主适配器缺装回落）：BUZZ_AGENT_PROVIDER +
-            //   OPENAI_COMPAT_*（anthropic / openai-chat / openai-responses 全支持，
-            //   回落不改变供应商语义）。装好适配器后 GUI 会重启 service，装配
-            //   重新解析 → 自动切回原生
-            // - codex（codex-acp）：CODEX_CONFIG（会话配置 JSON）+ MODEL_PROVIDER
-            //   + key env——适配器只认这三项（见 codex_acp_env）；build_injection
-            //   的 -c 参数形态适配器不消费，走 harness 必须用本分支
-            // - pi/claude：各自适配器认原生 provider env（与 spawn 注入同款
-            //   build_injection env 臂）
-            if uses_buzz_agent {
-                match crate::agent::buzz_provider_env(prov.as_ref()) {
-                    Ok(Some(env)) => env.into_iter().collect(),
-                    Ok(None) => Vec::new(), // 无供应商：agent 起来后回合报错（预检已引导配置）
-                    Err(e) => {
-                        crate::log!("[acp] {backend} 供应商 env 装配失败: {e}");
-                        Vec::new()
-                    }
-                }
-            } else if b == crate::agent::Backend::Codex {
-                match prov.as_ref() {
-                    Some(p) if p.kind == "openai-chat" || p.kind == "openai-responses" => {
-                        crate::agent::codex_acp_env(p)
-                    }
-                    Some(p) => {
-                        crate::log!(
-                            "[acp] codex 供应商「{}」类型不符（{}），该后端消息将拒答引导",
-                            p.name,
-                            p.kind
-                        );
-                        Vec::new()
-                    }
-                    None => Vec::new(), // 硬闸：预检已拒答引导（provider_missing_msg）
-                }
-            } else {
-                match crate::agent::build_injection(b, prov.as_ref()) {
-                    Ok(inj) => inj.env.unwrap_or_default().into_iter().collect(),
-                    Err(e) => {
-                        crate::log!(
-                            "[acp] {backend} 供应商 env 装配失败（该后端消息将拒答引导）: {e}"
-                        );
-                        Vec::new()
-                    }
-                }
-            }
-        };
-        let mut handles = std::collections::HashMap::new();
-        for backend in ["claude", "codex", "pi", "buzz"] {
-            let (command, uses_buzz_agent) = adapter(backend);
-            let agent_cfg = crate::buzz::harness::AgentConfig {
-                command: command.clone(),
-                args: Vec::new(),
-                extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
-                    .into_iter()
-                    .chain(env_for(backend, uses_buzz_agent))
-                    .collect(),
-                backend: backend.to_string(),
-            };
-            let stop = crate::tasks::shutdown_token();
-            let cwd = std::env::current_dir()
-                .unwrap_or_default()
-                .display()
-                .to_string();
-            let h = crate::buzz::harness::BuzzHandle::new(agent_cfg, stop, cwd);
-            crate::log!("[acp] harness 装配 backend={backend} cmd={command}");
-            handles.insert(backend.to_string(), h);
-        }
-        handles
-    };
+    // #200 Phase 3 + 单后端化 P2.1：执行层只有随包 buzz-agent——每 bot
+    // normal+granted 双进程实例，在 run_bot 内按 bot 构造（env 带本 bot 供应商，
+    // 结构消灭旧共享句柄集「env_for 取第一个 enabled bot 供应商」的多 bot 串台）。
+    // 装配零等待（不 spawn 进程、不碰盘）——handle 同步可得，无启动竞态；agent
+    // 懒启动 + 崩溃退避重拉（harness 内闭环），启动失败只影响本 bot 的 ACP 频道。
+    // 命令解析每进程一次（buzz_agent_exe 指错只告警一回）；None = 开发/自签构建
+    // 无随包 → run_bot 内落 pi-acp 兜底（build_injection(Buzz) 臂 env，旧语义）。
+    let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -321,81 +264,31 @@ pub async fn run() {
         crate::install::set_desired(false);
         std::process::exit(1);
     }
-    // #200/#206 接线（单进程 harness）：bridge 注册表 + buzz harness 长驻任务族。
-    // 与旧 mini-relay 架构的差异：无 buzz-acp 子进程 / WS relay / 回复回流通道/
-    // 账本——回合文本由 harness 主循环经出站通道（TurnOutput）同步送回，任务②
-    // 按 meta.bot_key 路由到归属 Bridge（注册表 weak 升级，见下）。
-    // 必须在 messenger 就绪后 spawn（任务② 路由要查 messengers 集合过滤根频道），
-    // 且在 Router::new 消费 messengers 之前建好过滤集（messengers 此后被 move）。
-    // buzz 未装配（无启用 bot / pi-acp 缺失）→ handle=None，以下任务族整体跳过。
-    //
-    // 注册表任务：bot 循环构造 Bridge 时注册（weak 升级），回合消费任务查它路由
-    // （不在注册表 = 回复先于注册到达或 bot 已退出——按无对应 bridge 丢弃）。
+    // #200/#206 接线（单进程 harness）：bridge 注册表 + 频道巡检长驻任务
+    //（harness 主循环 / 回合消费任务族已随句柄对下沉 run_bot——每 bot 每实例一份）。
+    // 账本——回合文本由 harness 主循环经出站通道（TurnOutput）同步送回；回合消费
+    // 任务按 meta.bot_key 路由到归属 Bridge（注册表 weak 升级）。注册表任务：bot
+    // 循环构造 Bridge 时注册，回合消费与频道巡检查它路由（不在注册表 = 回复先于
+    // 注册到达或 bot 已退出——按丢弃处理）。
     let bridge_registry: crate::bridge::BridgeRegistry = Default::default();
     {
-        // 任务①：每后端 harness 实例一个主循环（agent 懒启动 + 崩溃退避重拉，闭环）。
-        for (backend, handle) in &buzz_handles {
-            let run_handle = handle.clone();
-            let name: &'static str = Box::leak(format!("acp-harness:{backend}").into_boxed_str());
-            crate::tasks::tasks().spawn(name, async move {
-                crate::buzz::harness::run_loop(run_handle).await;
-            });
-        }
-        // 任务②：每后端一个回合投递消费（TurnOutput → meta.bot_key → Bridge →
-        // deliver_turn_reply；逐条 await 保 per-chat 发送顺序）。
-        let handles_for_turns = buzz_handles.clone();
-        for (backend, handle) in handles_for_turns.clone() {
-            let registry_for_turns = bridge_registry.clone();
-            let name: &'static str = Box::leak(format!("acp-turns:{backend}").into_boxed_str());
-            let handle = handle.clone();
-            crate::tasks::tasks().spawn(name, async move {
-                let stop = crate::tasks::shutdown_token();
-                let mut turn_rx = match handle.take_turn_rx() {
-                    Some(rx) => rx,
-                    None => {
-                        crate::log!("[acp:{backend}] 回合输出接收端已被取走，消费任务退出");
-                        return;
-                    }
-                };
-                loop {
-                    let out = tokio::select! {
-                        Some(o) = turn_rx.recv() => o,
-                        _ = stop.cancelled() => break,
-                    };
-                    let Some(bot_key) = out.meta.as_ref().map(|m| m.bot_key.clone()) else {
-                        crate::log!(
-                            "[acp:{backend}] 回合输出缺频道登记快照，丢弃 uuid={} len={}",
-                            out.channel_id,
-                            out.text.chars().count()
-                        );
-                        continue;
-                    };
-                    match registry_for_turns.get(&bot_key) {
-                        Some(b) => b.deliver_turn_reply(out).await,
-                        None => crate::log!(
-                            "[acp:{backend}] 回合输出无对应 bridge bot={bot_key} len={}",
-                            out.text.chars().count()
-                        ),
-                    }
-                }
-            });
-        }
-        // 任务③：根频道巡检——按「bot 生效后端」把登记频道分发给对应 harness 实例
-        //（bot 切后端 = 频道迁移到新 harness；旧实例按 diff 清理）。热读：巡检每
-        // tick 现算后端映射，切后端 ≤2s 生效。
+        // 任务③：根频道巡检——登记表（virtual-bots.json）频道按 bot_key 分组，经
+        // BridgeRegistry 解析各 bot 自己的 normal 句柄推送（单后端化 P2.1：句柄按
+        // bot 建，频道天然归属本 bot 实例，旧「按后端分组 + 切后端迁移」维度消亡）。
+        // 热读同前（2s tick，文件签名未变跳过重推）；无频道的 bot 照推空 roots
+        //（末频道删除后的 diff 清理由 handle 内部完成）。
         let active_bots: std::collections::HashSet<String> = messengers.keys().cloned().collect();
-        let handles_for_sweep = buzz_handles.clone();
+        let registry_for_sweep = bridge_registry.clone();
         let name: &'static str = "acp-channel-sync";
         crate::tasks::tasks().spawn(name, async move {
             let stop = crate::tasks::shutdown_token();
             let path = crate::bridge_dir().join("virtual-bots.json");
             let store = crate::virtualbot::VirtualBotStore::new_at(path.clone());
-            let mut last_sig: Option<(u64, u64, String)> = None;
+            let mut last_sig: Option<(u64, u64)> = None;
             loop {
                 if interruptible_sleep(std::time::Duration::from_secs(2), &stop).await {
                     break;
                 }
-                let cfg = crate::config::Config::load().unwrap_or_default();
                 let sig = std::fs::metadata(&path).ok().map(|m| {
                     (
                         m.modified()
@@ -404,38 +297,12 @@ pub async fn run() {
                         m.len(),
                     )
                 });
-                let backend_of = |bot_key: &str| -> Option<String> {
-                    cfg.bots
-                        .iter()
-                        .find(|b| b.enabled && b.key() == bot_key)
-                        .map(|b| {
-                            crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend))
-                                .name()
-                                .to_string()
-                        })
-                };
-                // 签名 = 登记表 + 后端映射（切后端也触发迁移）
-                let backend_sig: String = cfg
-                    .bots
-                    .iter()
-                    .filter(|b| b.enabled)
-                    .map(|b| {
-                        format!(
-                            "{}={}",
-                            b.key(),
-                            crate::agent::Backend::parse(b.effective_backend(&cfg.default_backend))
-                                .name()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";");
-                let cur_sig = sig.map(|(m, l)| (m, l, backend_sig.clone()));
-                if cur_sig == last_sig {
+                if sig == last_sig {
                     continue;
                 }
-                last_sig = cur_sig.clone();
-                // roots 按后端分组
-                let mut by_backend: std::collections::HashMap<
+                last_sig = sig;
+                // roots 按 bot 分组
+                let mut by_bot: std::collections::HashMap<
                     String,
                     Vec<crate::buzz::harness::ChannelMeta>,
                 > = std::collections::HashMap::new();
@@ -443,14 +310,9 @@ pub async fn run() {
                     if !active_bots.contains(&vb.bot_key) {
                         continue;
                     }
-                    let Some(be) = backend_of(&vb.bot_key) else {
-                        continue;
-                    };
-                    by_backend
-                        .entry(be)
-                        .or_default()
-                        .push(crate::buzz::harness::ChannelMeta {
-                            // P0.B：vb 群的 agent 工作目录 = 其独立工作区（与退役
+                    by_bot.entry(vb.bot_key.clone()).or_default().push(
+                        crate::buzz::harness::ChannelMeta {
+                            // vb 群的 agent 工作目录 = 其独立工作区（P0.B，与退役
                             // CLI 路径的 ensure_vb_dir 语义对齐）
                             workspace: Some(
                                 crate::virtualbot::ensure_vb_dir(&vb.bot_key, &vb.chat_id)
@@ -465,12 +327,19 @@ pub async fn run() {
                             name: vb.role_name,
                             anchor_mid: None,
                             adhoc: false,
-                        });
+                        },
+                    );
                 }
-                for (backend, handle) in &handles_for_sweep {
-                    let roots = by_backend.get(backend).cloned().unwrap_or_default();
+                for bot_key in &active_bots {
+                    let roots = by_bot.get(bot_key).cloned().unwrap_or_default();
+                    let Some(bridge) = registry_for_sweep.get(bot_key) else {
+                        continue;
+                    };
+                    let Some(handle) = bridge.acp_handles.as_ref().map(|h| h.normal.clone()) else {
+                        continue;
+                    };
                     if !handle.sync_roots(roots) {
-                        crate::log!("[acp:{backend}] 频道巡检发送失败（harness 已关闭）");
+                        crate::log!("[acp:{bot_key}] 频道巡检发送失败（harness 已关闭）");
                     }
                 }
             }
@@ -504,15 +373,16 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = crate::tasks::shutdown_token();
         let router = router.clone();
-        // ACP harness 句柄集（每后端一实例）：run_bot 构造 Bridge 时注入，dispatch 按后端路由
-        let acp_handles = buzz_handles.clone();
+        // ACP 执行层命令（随包 buzz-agent；None=开发/自签无随包 → run_bot 内落
+        // pi-acp 兜底）。句柄对按 bot 在 run_bot 内构造（P2.1）。
+        let buzz_cmd = buzz_cmd.clone();
         // #206：回合投递路由注册表（全部 bot 共享同一份）
         let registry = bridge_registry.clone();
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
         handles.push(crate::tasks::tasks().spawn_forever(name, async move {
-            run_bot(bot, cfg, msgr, router, stop, acp_handles, registry).await;
+            run_bot(bot, cfg, msgr, router, stop, buzz_cmd, registry).await;
         }));
     }
     // 等所有 bot 循环结束。⚠️ 服务期的常态就是等在这里（等关停广播），**绝不能包超时**：
@@ -644,10 +514,7 @@ async fn run_bot(
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
-    acp_handles: std::collections::HashMap<
-        String,
-        std::sync::Arc<crate::buzz::harness::BuzzHandle>,
-    >, // ACP 句柄集（全后端）
+    buzz_cmd: Option<String>, // ACP 执行层命令（None=无随包 → pi-acp 兜底）
     bridge_registry: crate::bridge::BridgeRegistry, // #206：回合投递路由用
 ) {
     let key = bot.key();
@@ -656,12 +523,61 @@ async fn run_bot(
         bot.kind,
         bot.bot_name
     );
+    // ACP 句柄对（P2.1）：normal+granted 按本 bot 构造，env 带本 bot 供应商。
+    let acp_handles = build_bot_acp_handles(&bot, &cfg, buzz_cmd.as_deref(), stop.clone());
+    // 任务族随句柄对下沉（旧 service 级任务①②）：每实例一个主循环（agent 懒启动 +
+    // 崩溃退避重拉）+ 一个回合投递消费（TurnOutput → meta.bot_key → Bridge 注册表
+    // 路由；逐条 await 保 per-chat 发送顺序）。任务名带 bot key 与实例标签。
+    for (label, handle) in [
+        ("normal", acp_handles.normal.clone()),
+        ("granted", acp_handles.granted.clone()),
+    ] {
+        let name: &'static str = Box::leak(format!("acp-harness:{key}:{label}").into_boxed_str());
+        let run_handle = handle.clone();
+        crate::tasks::tasks().spawn(name, async move {
+            crate::buzz::harness::run_loop(run_handle).await;
+        });
+        let name: &'static str = Box::leak(format!("acp-turns:{key}:{label}").into_boxed_str());
+        let registry_for_turns = bridge_registry.clone();
+        let bot_key_log = key.clone();
+        crate::tasks::tasks().spawn(name, async move {
+            let stop = crate::tasks::shutdown_token();
+            let mut turn_rx = match handle.take_turn_rx() {
+                Some(rx) => rx,
+                None => {
+                    crate::log!("[acp:{bot_key_log}:{label}] 回合输出接收端已被取走，消费任务退出");
+                    return;
+                }
+            };
+            loop {
+                let out = tokio::select! {
+                    Some(o) = turn_rx.recv() => o,
+                    _ = stop.cancelled() => break,
+                };
+                let Some(bot_key) = out.meta.as_ref().map(|m| m.bot_key.clone()) else {
+                    crate::log!(
+                        "[acp:{bot_key_log}:{label}] 回合输出缺频道登记快照，丢弃 uuid={} len={}",
+                        out.channel_id,
+                        out.text.chars().count()
+                    );
+                    continue;
+                };
+                match registry_for_turns.get(&bot_key) {
+                    Some(b) => b.deliver_turn_reply(out).await,
+                    None => crate::log!(
+                        "[acp:{bot_key_log}:{label}] 回合输出无对应 bridge bot={bot_key} len={}",
+                        out.text.chars().count()
+                    ),
+                }
+            }
+        });
+    }
     let bridge = {
         let mut b = Bridge::new(msgr, bot.clone(), &cfg);
-        b.acp_handles = acp_handles; // 全后端句柄集：dispatch 按 bot 生效后端路由
-                                     // ACP 单轨：harness 会话不跨进程存活——每次服务启动即复位全部槽位，
-                                     // 每个 chat 在本进程首轮走注入闸接续历史（否则 started=true 的旧槽位
-                                     // 会让新 harness 会话零上下文，切后端/重启后上下文丢失）。
+        b.acp_handles = Some(acp_handles); // 本 bot 句柄对：dispatch 走 normal（granted 待 P2.2 接线）
+                                           // ACP 单轨：harness 会话不跨进程存活——每次服务启动即复位全部槽位，
+                                           // 每个 chat 在本进程首轮走注入闸接续历史（否则 started=true 的旧槽位
+                                           // 会让新 harness 会话零上下文，切后端/重启后上下文丢失）。
         b.sessions.reset_slots_for_service_start();
         Arc::new(b)
     };
@@ -1304,8 +1220,7 @@ async fn run_job(
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     let reply = {
-        let backend = crate::agent::Backend::parse(&bridge.default_backend);
-        let handle = bridge.acp_handles.get(backend.name()).cloned();
+        let handle = bridge.acp_handles.as_ref().map(|h| h.normal.clone());
         let channel_id =
             uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(&bot_key, &job.chat_id))
                 .expect("channel_uuid output must parse as Uuid");
@@ -1458,57 +1373,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 适配器决议链（4 后端 × 探测组合）——命令与 env 语义配对是聊天可用性的
-    /// 关键路径，任何配对错误都表现为静默异常（审查 P-1）。
+    /// 回归（P2.1 结构消灭的串台）：旧 service 级共享句柄集的 env_for 取**第一个
+    /// enabled bot** 的供应商装配全部后端——多 bot 各配各供应商时全体串台。
+    /// per-bot 化后：每个 bot 的 env 必须只来自自己的供应商。
     #[test]
-    fn resolve_adapter_native_primary_wins() {
-        for backend in ["claude", "codex", "pi"] {
-            let (cmd, buzz_env) = resolve_adapter(backend, true, Some("bundled".into()));
-            assert_eq!(cmd, primary_adapter(backend).unwrap());
-            assert!(!buzz_env, "{backend} 原生适配器不用 buzz env");
-        }
-    }
+    fn buzz_env_for_bot_uses_own_bot_provider() {
+        let mk_prov = |name: &str, key: &str| crate::config::ProviderConfig {
+            name: name.into(),
+            kind: "openai-chat".into(),
+            base_url: format!("https://{name}.example.com"),
+            api_key: key.into(),
+            model: String::new(),
+        };
+        let mk_bot = |name: &str, prov: &str| crate::config::BotConfig {
+            name: name.into(),
+            provider: prov.into(),
+            ..Default::default()
+        };
+        let mut cfg = Config::default();
+        cfg.providers = vec![mk_prov("prov-a", "sk-a"), mk_prov("prov-b", "sk-b")];
+        cfg.default_provider = "prov-a".into();
+        cfg.bots = vec![mk_bot("bot-a", "prov-a"), mk_bot("bot-b", "prov-b")];
 
-    #[test]
-    fn resolve_adapter_missing_primary_falls_back_to_bundled() {
-        for backend in ["claude", "codex", "pi"] {
-            let (cmd, buzz_env) = resolve_adapter(backend, false, Some("/app/buzz-agent".into()));
-            assert_eq!(cmd, "/app/buzz-agent");
-            assert!(
-                buzz_env,
-                "{backend} 回落随包 buzz-agent 必须用 buzz env 语义"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_adapter_dev_without_bundle_falls_to_piacp() {
-        // 开发/自签构建无随包：pi-acp 兜底（旧行为）；env 按原生语义（非 buzz）
-        for backend in ["claude", "codex", "pi"] {
-            let (cmd, buzz_env) = resolve_adapter(backend, false, None);
-            assert_eq!(cmd, "pi-acp");
-            assert!(!buzz_env, "{backend} pi-acp 兜底不走 buzz env");
-        }
-    }
-
-    #[test]
-    fn resolve_adapter_buzz_backend() {
-        // buzz 后端无主适配器：随包优先（buzz env），无随包 → pi-acp 兜底
-        let (cmd, buzz_env) = resolve_adapter("buzz", false, Some("bundled".into()));
-        assert_eq!(cmd, "bundled");
-        assert!(buzz_env);
-        let (cmd, buzz_env) = resolve_adapter("buzz", false, None);
-        assert_eq!(cmd, "pi-acp");
-        assert!(!buzz_env, "buzz 后端 pi-acp 兜底按原生语义");
-    }
-
-    #[test]
-    fn primary_adapter_mapping() {
-        assert_eq!(primary_adapter("claude"), Some("claude-agent-acp"));
-        assert_eq!(primary_adapter("codex"), Some("codex-acp"));
-        assert_eq!(primary_adapter("pi"), Some("pi-acp"));
-        assert_eq!(primary_adapter("buzz"), None);
-        assert_eq!(primary_adapter("unknown"), None);
+        let env_a: std::collections::HashMap<_, _> = buzz_env_for_bot(&cfg.bots[0], &cfg, true)
+            .into_iter()
+            .collect();
+        let env_b: std::collections::HashMap<_, _> = buzz_env_for_bot(&cfg.bots[1], &cfg, true)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            env_a.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
+            Some("sk-a")
+        );
+        assert_eq!(
+            env_b.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
+            Some("sk-b")
+        );
+        assert_eq!(
+            env_b.get("OPENAI_COMPAT_BASE_URL").map(String::as_str),
+            Some("https://prov-b.example.com"),
+            "bot-b 不得串用 bot-a（第一个 enabled bot）的供应商"
+        );
+        // 空 API Key 硬闸：env 置空（预检按 NoProvider 拒答引导），不注入半截 env
+        let mut cfg2 = cfg.clone();
+        cfg2.providers[1].api_key = "  ".into();
+        assert!(buzz_env_for_bot(&cfg2.bots[1], &cfg2, true).is_empty());
+        // 无供应商（provider 名指向不存在）→ 空 env 不炸
+        let cfg3 = {
+            let mut c = cfg.clone();
+            c.bots[1].provider = "ghost".into();
+            c
+        };
+        assert!(buzz_env_for_bot(&cfg3.bots[1], &cfg3, true).is_empty());
     }
 
     /// 等待绝不能提前返回进入关闭路径——旧实现把 30s 逐 handle 时限放在服务期，
