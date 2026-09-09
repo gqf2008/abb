@@ -338,6 +338,17 @@ impl McpRegistry {
                 {
                     continue;
                 }
+                // P1.5：delegate 仅「shell 未摘（非 read-only）且非 granted(Restricted)
+                // 且本机有 claude/codex」时注入。read-only 没有 shell，给了是新权限；
+                // granted 的 shell 走 argv 白名单，而委派 CLI 天生不受域闸约束，给了
+                // =P1.3 白名单白做。CLI 不可用是「不注入」不是报错。
+                if matches!(tool, crate::devtools::Tool::Delegate)
+                    && (!reg.policy.sandbox.allow_shell()
+                        || reg.policy.shell == crate::wire::ShellMode::Restricted
+                        || !crate::devtools::delegate_available())
+                {
+                    continue;
+                }
                 if reg.defs.len() >= MAX_TOOLS_PER_SESSION {
                     tracing::warn!(
                         "dev tools: tool budget ({MAX_TOOLS_PER_SESSION}) exhausted after {} MCP tools; \
@@ -617,7 +628,11 @@ impl McpRegistry {
             let denied = (!self.policy.sandbox.allow_write()
                 && matches!(*tool, crate::devtools::Tool::Write))
                 || (!self.policy.sandbox.allow_shell()
-                    && matches!(*tool, crate::devtools::Tool::Shell));
+                    && matches!(*tool, crate::devtools::Tool::Shell))
+                // P1.5：delegate 在 read-only（无 shell）/ granted(Restricted) 永不放行。
+                || (matches!(*tool, crate::devtools::Tool::Delegate)
+                    && (!self.policy.sandbox.allow_shell()
+                        || self.policy.shell == crate::wire::ShellMode::Restricted));
             if denied {
                 return Err(AgentError::Mcp(format!(
                     "tool '{qname}' is disabled in this session's sandbox mode ({:?})",
@@ -1223,7 +1238,12 @@ mod sandbox_tests {
 
     #[tokio::test]
     async fn full_access_surface_identical_to_no_meta_default() {
-        // 回归锁：无 _meta（ABB 侧回落 FullAccess）与显式 full-access 的工具面一致
+        // 回归锁：无 _meta（ABB 侧回落 FullAccess）与显式 full-access 的工具面一致。
+        // delegate（P1.5）是否注入取决于本机 PATH——这里把它钉为不可用，让「五工具」
+        // 这条 P1.2 前语义断言与机器无关（delegate 的可见性矩阵由专门测试覆盖）。
+        let _g = crate::devtools::DELEGATE_TEST_ENV_LOCK.lock().await;
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", "/nonexistent-claude");
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CODEX_BIN", "/nonexistent-codex");
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let cfg = cfg_with_dev_tools();
@@ -1243,12 +1263,74 @@ mod sandbox_tests {
         );
         let a = McpRegistry::spawn_all(&cfg, &[], cwd, pa).await.unwrap();
         let b = McpRegistry::spawn_all(&cfg, &[], cwd, pb).await.unwrap();
+        std::env::remove_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN");
+        std::env::remove_var("BUZZ_AGENT_DELEGATE_CODEX_BIN");
         let mut n1: Vec<_> = a.tools().iter().map(|d| d.name.clone()).collect();
         let mut n2: Vec<_> = b.tools().iter().map(|d| d.name.clone()).collect();
         n1.sort();
         n2.sort();
         assert_eq!(n1, n2);
-        assert_eq!(n1.len(), 5, "dev 五工具（P1.2 前语义）");
+        assert_eq!(n1.len(), 5, "dev 五工具（delegate 钉为不可用）");
+    }
+
+    /// P1.5 攻击矩阵扩行：delegate 的可见性 = f(档位, shell 模式, CLI 可用性)。
+    /// read-only（无 shell）与 granted(Restricted) 永不可见；CLI 不可用则不注入。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_visible_only_when_full_shell_non_granted_and_cli_present() {
+        use crate::wire::ShellMode;
+        let _g = crate::devtools::DELEGATE_TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        // 伪造一个 claude CLI（可见性探测只查「在不在」，不执行）。
+        let fake = dir.path().join("claude");
+        std::fs::write(&fake, "#!/bin/sh\necho hi\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", &fake);
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CODEX_BIN", "/nonexistent-codex");
+        let cfg = cfg_with_dev_tools();
+        // (sandbox, shell, 期望 delegate 可见?)
+        for (sb, shell, expect) in [
+            (Sandbox::FullAccess, ShellMode::Full, true), // 正常 owner 会话
+            (Sandbox::WorkspaceWrite, ShellMode::Full, true), // 三档受限但 shell 本就 Full（不扩权）
+            (Sandbox::WorkspaceWrite, ShellMode::Restricted, false), // granted：永不可见
+            (Sandbox::FullAccess, ShellMode::Restricted, false), // granted 与 full-access 漂移配对仍拒
+            (Sandbox::ReadOnly, ShellMode::Full, false),         // read-only：无 shell
+        ] {
+            let reg = McpRegistry::spawn_all(
+                &cfg,
+                &[],
+                cwd,
+                crate::wire::ToolPolicy::build(sb, cwd, None, shell, None),
+            )
+            .await
+            .unwrap();
+            let names: Vec<String> = reg.tools().iter().map(|d| d.name.clone()).collect();
+            assert_eq!(
+                names.contains(&"dev__delegate".to_string()),
+                expect,
+                "{sb:?}/{shell:?}: {names:?}"
+            );
+            // 未注册 = 名字不可达（defs 过滤同时摘 by_qname）
+            assert_eq!(reg.has("dev__delegate"), expect, "{sb:?}/{shell:?}");
+        }
+        // 无任何 CLI 可用 → 不注入（不是报错）：覆盖指向不存在即禁用，绝不回落 PATH。
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", "/nonexistent-claude");
+        let reg = McpRegistry::spawn_all(
+            &cfg,
+            &[],
+            cwd,
+            crate::wire::ToolPolicy::build(Sandbox::FullAccess, cwd, None, ShellMode::Full, None),
+        )
+        .await
+        .unwrap();
+        let names: Vec<String> = reg.tools().iter().map(|d| d.name.clone()).collect();
+        assert!(!names.contains(&"dev__delegate".to_string()), "{names:?}");
+        std::env::remove_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN");
+        std::env::remove_var("BUZZ_AGENT_DELEGATE_CODEX_BIN");
     }
 }
 

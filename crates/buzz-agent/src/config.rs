@@ -598,7 +598,7 @@ pub struct Config {
     /// all end-turn objections — at the default 3 both reminders fit; at 1 only
     /// one does; at 0 the guard is off with the hooks.
     pub require_reply: bool,
-    /// 内置 dev 工具（dev__shell/read/write/ls/glob，进程内执行，不经 MCP）。
+    /// 内置 dev 工具（dev__shell/read/write/ls/glob/delegate，进程内执行，不经 MCP）。
     /// 默认开；`BUZZ_AGENT_DEV_TOOLS=0` 关闭整套工具。
     pub dev_tools: bool,
     /// Hook server allowlist. See [`HookServers`] for variant semantics.
