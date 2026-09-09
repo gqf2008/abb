@@ -1246,14 +1246,16 @@ fn run_team_cli(args: &[String]) -> i32 {
         }
     };
     // bot 选择（保留旧 env 契约）：AGENT_BRIDGE_BOT_KEY 非空且命中 → 该 bot；
-    // 否则第一个 enabled bot（env 未命中也回落，对齐旧版回落 default_provider 的
-    // 宽松语义，但给警告防 stale env 静默错配）；都没有 → 引导配置。
+    // env **设了但未命中** → 明确报错（供应商硬闸：旧路径此场景经 build_injection
+    // (Codex, None) 拒答，绝不允许显式指定的供应商路由被静默替换为另一 bot 的
+    // 供应商——审查 P1；与 job CLI 的 env→唯一 bot→报错 契约同款）；env 未设/空
+    // → 第一个 enabled bot；都没有 → 引导配置。
     let bot = match std::env::var("AGENT_BRIDGE_BOT_KEY") {
         Ok(bk) if !bk.is_empty() => match cfg.bots.iter().find(|b| b.key() == bk) {
             Some(b) => Some(b.clone()),
             None => {
-                eprintln!("⚠️ AGENT_BRIDGE_BOT_KEY（{bk}）未命中任何 bot，回落第一个 enabled bot");
-                cfg.bots.iter().find(|b| b.enabled).cloned()
+                eprintln!("AGENT_BRIDGE_BOT_KEY（{bk}）未命中任何 bot（供应商硬闸：不做静默回落，请修正 env 或在 GUI 配置该 bot）");
+                return 1;
             }
         },
         _ => cfg.bots.iter().find(|b| b.enabled).cloned(),
