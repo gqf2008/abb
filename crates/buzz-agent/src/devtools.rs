@@ -638,38 +638,70 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         .find(|cand| is_executable_file(cand))
 }
 
-/// 解析某后端要 spawn 的二进制。覆盖环境变量存在即唯一来源（指向不存在/不可
-/// 执行 = 该后端禁用，绝不回落 PATH——测试与运维要的就是确定性）；未设置才
-/// PATH 探测。
-fn delegate_cli_path(backend: DelegateBackend) -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os(backend.bin_override_env()) {
+/// 解析某后端要 spawn 的二进制（纯函数，显式覆盖入参——测试据此免改进程
+/// env，见 LESSON set_var-UB）。`override = Some` 即唯一来源（指向不存在/不可
+/// 执行 = 该后端禁用，绝不回落 PATH——运维要的就是确定性）；`None` 才 PATH 探测。
+fn resolve_delegate_cli(
+    backend: DelegateBackend,
+    override_: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(raw) = override_ {
         let p = PathBuf::from(raw);
         return is_executable_file(&p).then_some(p);
     }
     find_in_path(backend.cli())
 }
 
+/// 生产包装：覆盖来自环境变量（`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` 逃生阀）。
+fn delegate_cli_path(backend: DelegateBackend) -> Option<PathBuf> {
+    resolve_delegate_cli(backend, std::env::var_os(backend.bin_override_env()).as_deref())
+}
+
+/// 当前可用的委派后端（生产：经环境变量覆盖 + PATH 探测）。
+fn available_delegate_backends() -> Vec<DelegateBackend> {
+    [DelegateBackend::Claude, DelegateBackend::Codex]
+        .into_iter()
+        .filter(|b| delegate_cli_path(*b).is_some())
+        .collect()
+}
+
 /// 任一委派后端可用（mcp.rs defs 过滤的注入闸：claude/codex 都不在 → 工具不注入）。
 pub fn delegate_available() -> bool {
-    delegate_cli_path(DelegateBackend::Claude).is_some()
-        || delegate_cli_path(DelegateBackend::Codex).is_some()
+    !available_delegate_backends().is_empty()
 }
 
-/// 当前可用后端的可读描述（后端缺失报错里给模型可行动提示）。
-fn available_backends_desc() -> String {
-    let mut ok = Vec::new();
-    for b in [DelegateBackend::Claude, DelegateBackend::Codex] {
-        if delegate_cli_path(b).is_some() {
-            ok.push(b.cli());
-        }
-    }
-    if ok.is_empty() {
+/// delegate 注入/放行判定（纯函数，三层闸共用同一逻辑）：仅「shell 未摘（非
+/// read-only）且非 granted(Restricted) 且有可用 CLI」放行。read-only 没有 shell，
+/// 给了是新权限；granted 的 shell 走 argv 白名单，委派 CLI 不受域闸约束，给了
+/// =P1.3 白名单白做；workspace-write/full-access 的 shell 本就 Full（不扩权）。
+pub fn delegate_def_visible(
+    sandbox: crate::wire::Sandbox,
+    shell: crate::wire::ShellMode,
+    cli_available: bool,
+) -> bool {
+    sandbox.allow_shell() && shell != crate::wire::ShellMode::Restricted && cli_available
+}
+
+/// 可用后端集合的可读描述（纯函数）：后端缺失报错里给模型可行动提示。
+fn backends_desc_from(avail: &[DelegateBackend]) -> String {
+    if avail.is_empty() {
         "none (neither claude nor codex found in PATH)".to_owned()
     } else {
-        ok.join(", ")
+        avail
+            .iter()
+            .map(|b| b.cli())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
+/// 生产包装：当前可用后端描述（经环境变量覆盖 + PATH 探测）。
+fn available_backends_desc() -> String {
+    backends_desc_from(&available_delegate_backends())
+}
+
+/// delegate 工具入口：执行闸 + 参数解析 + 二进制解析（生产经 env/PATH），
+/// 然后委派给 [`run_delegate_with_bin`] 执行。
 async fn run_delegate(
     arguments: &Value,
     cwd: &str,
@@ -716,7 +748,20 @@ async fn run_delegate(
             .unwrap_or(DELEGATE_TIMEOUT_DEFAULT)
             .clamp(1, DELEGATE_TIMEOUT_MAX),
     );
+    run_delegate_with_bin(&bin, backend, task, timeout, cwd, provider_id, cancel).await
+}
 
+/// delegate 执行体：给定已解析的二进制，spawn 委派 CLI 并收割结果。抽出独立
+/// 函数让测试用显式临时二进制直调（免改进程 env，见 LESSON set_var-UB）。
+async fn run_delegate_with_bin(
+    bin: &Path,
+    backend: DelegateBackend,
+    task: &str,
+    timeout: Duration,
+    cwd: &str,
+    provider_id: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<ToolResult, AgentError> {
     let mut cmd = Command::new(bin);
     match backend {
         DelegateBackend::Claude => {
@@ -1300,13 +1345,6 @@ fn push_hit(hits: &mut Vec<String>, hit: String) -> bool {
     }
 }
 
-/// 委派后端二进制的 env 覆盖（`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN`）是进程级
-/// 全局态；并行测试若同时改它会串台。本 crate 内所有触碰这两个变量的测试
-/// （devtools 与 mcp::sandbox_tests）都必须先拿这把锁。用 tokio Mutex（guard 可
-/// 持跨 await，且每个 #[tokio::test] 独占 runtime/线程，跨线程串行正是所需）。
-#[cfg(test)]
-pub static DELEGATE_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,7 +1507,7 @@ mod tests {
 
     // ── delegate（P1.5） ────────────────────────────────────────────────────
 
-    /// 造一个可执行的假 CLI 脚本（unix shebang）。返回路径供 env 覆盖指向。
+    /// 造一个可执行的假 CLI 脚本（unix shebang）。返回路径供 run_delegate_with_bin 直调。
     #[cfg(unix)]
     fn fake_cli(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1479,9 +1517,57 @@ mod tests {
         p
     }
 
-    fn clear_delegate_env() {
-        std::env::remove_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN");
-        std::env::remove_var("BUZZ_AGENT_DELEGATE_CODEX_BIN");
+    #[test]
+    fn delegate_def_visible_truth_table() {
+        use crate::wire::{Sandbox, ShellMode};
+        // 仅「shell 未摘 且 非 granted(Restricted) 且 有可用 CLI」放行
+        assert!(delegate_def_visible(Sandbox::FullAccess, ShellMode::Full, true));
+        assert!(delegate_def_visible(Sandbox::WorkspaceWrite, ShellMode::Full, true));
+        // granted(Restricted) 永不放行（无论档位/CLI 可用性）
+        assert!(!delegate_def_visible(Sandbox::WorkspaceWrite, ShellMode::Restricted, true));
+        assert!(!delegate_def_visible(Sandbox::FullAccess, ShellMode::Restricted, true));
+        // read-only 无 shell 永不放行
+        assert!(!delegate_def_visible(Sandbox::ReadOnly, ShellMode::Full, true));
+        // CLI 不可用 → 不注入（其余条件再满足也没用）
+        assert!(!delegate_def_visible(Sandbox::FullAccess, ShellMode::Full, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_delegate_cli_override_semantics() {
+        let dir = test_dir();
+        let exe = fake_cli(dir.path(), "claude", "#!/bin/sh\nexit 0\n");
+        // Some(可执行) → 用之
+        assert_eq!(
+            resolve_delegate_cli(DelegateBackend::Claude, Some(exe.as_os_str())),
+            Some(exe.clone())
+        );
+        // Some(不存在) → None 且绝不回落 PATH（本机真装了 claude 也判禁用）
+        assert_eq!(
+            resolve_delegate_cli(
+                DelegateBackend::Claude,
+                Some(std::ffi::OsStr::new("/nonexistent-claude"))
+            ),
+            None
+        );
+        // None → PATH 探测（结果随机器，但必须与 find_in_path 一致）
+        assert_eq!(
+            resolve_delegate_cli(DelegateBackend::Claude, None),
+            find_in_path("claude")
+        );
+    }
+
+    #[test]
+    fn backends_desc_from_renders_availability() {
+        assert_eq!(
+            backends_desc_from(&[]),
+            "none (neither claude nor codex found in PATH)"
+        );
+        assert_eq!(backends_desc_from(&[DelegateBackend::Claude]), "claude");
+        assert_eq!(
+            backends_desc_from(&[DelegateBackend::Claude, DelegateBackend::Codex]),
+            "claude, codex"
+        );
     }
 
     #[tokio::test]
@@ -1572,9 +1658,8 @@ mod tests {
     async fn delegate_runs_fake_cli_and_passes_backend_env() {
         // 假 claude 回显 $CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC：直接锁死
         // 「后端专属 env 必须在 apply_passthrough_env（env_clear）之后 set」的
-        // 顺序——设在之前会被清掉，这里就会读到空。
-        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
-        clear_delegate_env();
+        // 顺序——设在之前会被清掉，这里就会读到空。显式二进制直调 run_delegate_with_bin
+        // （不改进程 env，LESSON set_var-UB）；该 env 设在子进程上，安全。
         let dir = test_dir();
         let cwd = dir.path().to_str().unwrap();
         let bin = fake_cli(
@@ -1582,21 +1667,19 @@ mod tests {
             "claude",
             "#!/bin/sh\nprintf 'traffic=%s\\n' \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\"\necho delegate-done\n",
         );
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", &bin);
-        let policy = test_policy(cwd);
         // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
         let (_tx, mut rx) = watch::channel(false);
-        let r = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "claude", "task": "do a thing" }),
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Claude,
+            "do a thing",
+            Duration::from_secs(30),
             cwd,
-            &policy,
             "p",
             &mut rx,
         )
         .await
         .unwrap();
-        clear_delegate_env();
         assert!(!r.is_error, "{}", r.text());
         assert!(r.text().contains("delegate-done"), "{}", r.text());
         assert!(
@@ -1609,26 +1692,21 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delegate_runs_fake_codex() {
-        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
-        clear_delegate_env();
         let dir = test_dir();
         let cwd = dir.path().to_str().unwrap();
         let bin = fake_cli(dir.path(), "codex", "#!/bin/sh\necho codex-done\n");
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CODEX_BIN", &bin);
-        let policy = test_policy(cwd);
-        // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
         let (_tx, mut rx) = watch::channel(false);
-        let r = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "codex", "task": "do a thing" }),
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Codex,
+            "do a thing",
+            Duration::from_secs(30),
             cwd,
-            &policy,
             "p",
             &mut rx,
         )
         .await
         .unwrap();
-        clear_delegate_env();
         assert!(!r.is_error, "{}", r.text());
         assert!(r.text().contains("codex-done"), "{}", r.text());
     }
@@ -1638,24 +1716,19 @@ mod tests {
     async fn delegate_locks_exact_argv_for_both_backends() {
         // 锁死精确 argv flag——防未来被静默降级/删除（--dangerously-skip-permissions /
         // --sandbox workspace-write 是安全相关 flag；`--` 分隔符防单词 task 被绑到
-        // codex 子命令、防 `-` 开头 task 被当选项）。
-        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
-        clear_delegate_env();
+        // codex 子命令、防 `-` 开头 task 被当选项）。显式二进制直调，不改进程 env。
         let dir = test_dir();
         let cwd = dir.path().to_str().unwrap();
         let echo = "#!/bin/sh\necho \"$@\"\n";
         let cb = fake_cli(dir.path(), "claude", echo);
         let xb = fake_cli(dir.path(), "codex", echo);
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", &cb);
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CODEX_BIN", &xb);
-        let policy = test_policy(cwd);
-        // sender 必须存活：drop 即广播「取消」
         let (_tx, mut rx) = watch::channel(false);
-        let c = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "claude", "task": "lock-argv" }),
+        let c = run_delegate_with_bin(
+            &cb,
+            DelegateBackend::Claude,
+            "lock-argv",
+            Duration::from_secs(30),
             cwd,
-            &policy,
             "p",
             &mut rx,
         )
@@ -1667,17 +1740,17 @@ mod tests {
             "claude argv: {}",
             c.text()
         );
-        let x = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "codex", "task": "lock-argv" }),
+        let x = run_delegate_with_bin(
+            &xb,
+            DelegateBackend::Codex,
+            "lock-argv",
+            Duration::from_secs(30),
             cwd,
-            &policy,
             "p",
             &mut rx,
         )
         .await
         .unwrap();
-        clear_delegate_env();
         assert!(
             x.text()
                 .contains("exec --skip-git-repo-check --sandbox workspace-write -C"),
@@ -1694,26 +1767,21 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delegate_marks_nonzero_exit_as_error() {
-        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
-        clear_delegate_env();
         let dir = test_dir();
         let cwd = dir.path().to_str().unwrap();
         let bin = fake_cli(dir.path(), "claude", "#!/bin/sh\necho boom\nexit 3\n");
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", &bin);
-        let policy = test_policy(cwd);
-        // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
         let (_tx, mut rx) = watch::channel(false);
-        let r = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "claude", "task": "x" }),
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Claude,
+            "x",
+            Duration::from_secs(30),
             cwd,
-            &policy,
             "p",
             &mut rx,
         )
         .await
         .unwrap();
-        clear_delegate_env();
         assert!(r.is_error, "非零退出必须 is_error: {}", r.text());
         assert!(r.text().contains("exit: 3"), "{}", r.text());
     }
@@ -1721,61 +1789,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delegate_times_out_and_kills_tree() {
-        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
-        clear_delegate_env();
         let dir = test_dir();
         let cwd = dir.path().to_str().unwrap();
         let bin = fake_cli(dir.path(), "claude", "#!/bin/sh\nsleep 30\n");
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", &bin);
-        let policy = test_policy(cwd);
-        // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
         let (_tx, mut rx) = watch::channel(false);
-        let r = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "claude", "task": "x", "timeout_secs": 1 }),
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Claude,
+            "x",
+            Duration::from_secs(1),
             cwd,
-            &policy,
             "p",
             &mut rx,
         )
         .await
         .unwrap();
-        clear_delegate_env();
         assert!(r.is_error, "{}", r.text());
         assert!(r.text().contains("timed out"), "{}", r.text());
-    }
-
-    #[tokio::test]
-    async fn delegate_backend_unavailable_is_actionable_error() {
-        // 覆盖指向不存在 ⇒ 该后端禁用且绝不回落 PATH（本机真装了 claude 也判不可用），
-        // 报错里给模型「可用后端」提示。跨平台：不 spawn，只到 CLI 解析。
-        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
-        clear_delegate_env();
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", "/nonexistent-claude");
-        std::env::set_var("BUZZ_AGENT_DELEGATE_CODEX_BIN", "/nonexistent-codex");
-        let dir = test_dir();
-        let cwd = dir.path().to_str().unwrap();
-        let policy = test_policy(cwd);
-        // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
-        let (_tx, mut rx) = watch::channel(false);
-        let r = run_with_policy(
-            Tool::Delegate,
-            &json!({ "backend": "claude", "task": "x" }),
-            cwd,
-            &policy,
-            "p",
-            &mut rx,
-        )
-        .await
-        .unwrap();
-        clear_delegate_env();
-        assert!(r.is_error, "{}", r.text());
-        assert!(r.text().contains("not available"), "{}", r.text());
-        assert!(
-            r.text().contains("neither claude nor codex"),
-            "{}",
-            r.text()
-        );
     }
 
     /// FullAccess 测试策略（与今天字节级一致：读不限、写限 cwd）。
