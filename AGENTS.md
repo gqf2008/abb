@@ -9,6 +9,9 @@ Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that b
 - `app-assets/` — macOS bundle assets (`Info.plist`, `AppIcon.icns`, tray icons).
 - `scripts/` — macOS helpers: `build.sh` (bundle + sign + install), `sign.sh` (re-sign), `make-certs.sh` (dev cert).
 - `reference/` — protocol references (e.g., `feishu_ws_protocol.py`).
+- `crates/buzz-agent/` — self-maintained fork (the ACP agent execution layer). Independent package: own manifest + lock, **not** a member of the root package (root `Cargo.toml` has no `[workspace]`), so root `cargo clippy/fmt/test` never touches it — CI has a dedicated `fork-lint` job; run commands with `--manifest-path crates/buzz-agent/Cargo.toml`.
+- `third_party/i-slint-core/` — vendored `i-slint-core` wired via `[patch.crates-io]`. The only local patch is the Windows tray window (message-only → top-level hidden; see `Cargo.toml` comment). Its published tree does not ship everything upstream's repo has — `benches/string.rs` and a font its lib tests `include_bytes!` are missing, so standalone `--all-targets` / `--lib --tests` builds fail for reasons unrelated to the patch; compile coverage of the patch comes from root CI building it as a dependency on windows-latest.
+- `src/buzz/**` — upstream-sync zone (ported buzz harness). Every change there must be logged in the ledger `docs/buzz-port-sync.md` (处置表); that file also records the fork's known-flaky tests and sync constraints.
 
 Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bridge/workspaces/<bot_key>/`.
 
@@ -31,7 +34,7 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 
 ## Testing Guidelines
 
-- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; no `tests/` directory yet.
+- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package has no `tests/` directory (the fork `crates/buzz-agent` does — integration tests live in `crates/buzz-agent/tests/`).
 - Name tests with `snake_case`, behavior-focused names (e.g., `codex_single_message_no_progress`, `strip_user_mentions`).
 - Add tests alongside the code you change and run `cargo test` before pushing.
 
