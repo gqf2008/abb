@@ -9,7 +9,7 @@
 //! **无超时**：桥是推送模型——等 agent 跑完即回发，跑多久等多久（曾设 600s 上限，
 //! 会把合法的长任务拦腰杀掉，用户拍板去掉，2026-08-07）。
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
@@ -1502,133 +1502,76 @@ fn agent_missing_msg(backend: Backend, err: &std::io::Error) -> String {
 }
 
 /// 虚拟 Bot「✨ 生成」提示词（8-20 需求）：根据角色/任务名让 LLM 写系统提示词
-/// （群介绍，≤100 字符）。轻量单轮 CLI 调用——无会话/无工作区/无受限模式，就是
-/// 一次 stdin 问答。claude（`claude -p --output-format text`）/ codex（`codex exec`）
-/// 支持；pi CLI 形态差异大，回落明确错误。输出：去空行 + 截断 100 字符
-/// （char 安全，truncate 语义）。
-/// #123 同根因加固（2026-08-27）：codex 分支补 `--skip-git-repo-check`（非 git 目录
-/// 下 codex 拒绝执行 → 空输出），stderr 改管道透传（失败原因可定位，不再静默空结果）。
-pub async fn generate_role_prompt(backend: Backend, role_name: &str) -> Result<String> {
-    // #200：buzz 是 ACP 常驻执行层（harness 驱动），一次性 CLI spawn 不适用——
-    // 裸起 buzz-agent 无 ACP 握手，只会挂到超时/空输出（审查 #205）。GUI「✨生成」
-    // 按钮对 buzz bot 给明确错误（调用方展示 err）。
-    if backend.is_buzz() {
-        anyhow::bail!("{}", buzz_unsupported_msg("角色提示词生成"));
-    }
+/// （群介绍，≤100 字符）。轻量单轮问答——无会话状态。输出：首个非空行（trim）+
+/// 截断 100 字符（char 安全，truncate 语义）。
+///
+/// 单后端化 P3.3：旧 CLI spawn 形态（claude -p / codex exec / pi --mode json）整体
+/// 删除，全 bot 收口 [`crate::buzz::oneshot::oneshot_turn`]——GUI 进程没有常驻 ACP
+/// 句柄（句柄只活在 service 进程），oneshot 自起自拆；agent 装配与 normal handle
+/// 同链（[`crate::service::oneshot_agent_config`]），维护任务跟 bot 配置档走。
+pub async fn generate_role_prompt(
+    bot: &crate::config::BotConfig,
+    cfg: &crate::config::Config,
+    role_name: &str,
+) -> Result<String> {
+    let agent_cfg = crate::service::oneshot_agent_config(bot, cfg);
+    let workspace = crate::workspace_dir(&bot.key());
+    // 全新 bot 可能尚无工作区目录——session/new 的 cwd 必须先存在
+    let _ = std::fs::create_dir_all(&workspace);
+    generate_role_prompt_with(agent_cfg, &workspace, role_name).await
+}
+
+/// 可测内层：agent 配置由调用方注入（生产 = oneshot_agent_config；测试注入 mock
+/// 配置走「oneshot_turn → mock 子进程」全链路）。预算 60s 与旧 CLI 超时同口径
+/// （按钮点击的 UX 上界）。
+async fn generate_role_prompt_with(
+    agent_cfg: crate::buzz::harness::AgentConfig,
+    workspace: &std::path::Path,
+    role_name: &str,
+) -> Result<String> {
     let sys = "你是虚拟团队的角色设计助手。根据角色/任务名称写一条飞书群聊机器人的\
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
               不要解释、不要引号、不要“角色名：”前缀。";
     let full = format!("{sys}\n\n角色/任务名称：{role_name}");
-    // 可执行路径解析：与 run_once 同源——GUI/launchd 环境 PATH 精简，裸命令名
-    // spawn 必然 "No such file or directory (os error 2)"；必须经
-    // deps::find_in_path（composed_path 覆盖 ~/.local/bin、npm-global 等）
-    // 解析出绝对路径再启动。找不到时保留裸名让下方错误文案带安装指引。
-    let program = match backend {
-        Backend::Pi => "pi",
-        Backend::Codex => "codex",
-        Backend::Claude => "claude",
-        Backend::Buzz => "buzz-agent", // #200：spawn buzz-agent（ACP stdio）
+    let msg = crate::buzz::queue::InboundMsg {
+        id_hex: uuid::Uuid::new_v4().to_string(),
+        author_role: crate::config::SenderRole::Owner.as_str().to_string(),
+        text: full,
+        ts_secs: crate::chrono_lite::unix_secs() as i64,
+        prompt_tag: "role_prompt".to_string(),
     };
-    let resolved =
-        crate::deps::find_in_path(program).unwrap_or_else(|| std::path::PathBuf::from(program));
-    let mut cmd = match backend {
-        Backend::Buzz => tokio::process::Command::from(shim_command(&resolved)),
-        Backend::Claude => {
-            let mut c = tokio::process::Command::from(shim_command(&resolved));
-            c.arg("-p").arg("--output-format").arg("text");
-            c
+    let outcome = crate::buzz::oneshot::oneshot_turn(
+        agent_cfg,
+        Some(workspace.display().to_string()),
+        msg,
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+    let text = match outcome {
+        crate::buzz::harness::SyncTurnOutcome::Ok(text) => text,
+        crate::buzz::harness::SyncTurnOutcome::Timeout => anyhow::bail!("生成超时（60s）"),
+        crate::buzz::harness::SyncTurnOutcome::Closed => {
+            anyhow::bail!("agent 不可用（会话未建起）")
         }
-        Backend::Codex => {
-            let mut c = tokio::process::Command::from(shim_command(&resolved));
-            // #123：非 git 目录下 codex 拒跑（trusted directory 检查）→ 补 flag；
-            // 输出仍走文本（与 teambuilder 不同：这里不解析 JSON 事件，故不加 --json）。
-            c.arg("exec").arg("--skip-git-repo-check");
-            c
-        }
-        Backend::Pi => {
-            // pi 非交互 JSON 模式：stdin 读 prompt，stdout JSONL（message_end 权威文本，
-            // 解析同 run_once 的 process_line）。临时 uuid 会话（无状态一次性调用）。
-            let mut c = tokio::process::Command::from(shim_command(&resolved));
-            c.arg("-p")
-                .arg("--mode")
-                .arg("json")
-                .arg("--session-id")
-                .arg(uuid::Uuid::new_v4().to_string());
-            c
-        }
+        // 无外部取消源（oneshot_turn 第四个参数恒 None），仅为穷尽匹配
+        crate::buzz::harness::SyncTurnOutcome::Cancelled => anyhow::bail!("生成已中断"),
+        crate::buzz::harness::SyncTurnOutcome::Failed(reason) => anyhow::bail!("{reason}"),
     };
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped()); // #123：stderr 不再吞，空结果时透传归因
-                                               // spawn 失败（CLI 缺失）时带上与 run_once 一致的安装指引文案
-    #[cfg(target_os = "windows")]
-    let mut child = {
-        // #153 同根因遗漏修复：虚拟 Bot「✨生成」也改走 winproc 隐藏控制台——
-        // 原 CREATE_NO_WINDOW 让 agent 无控制台，其内部命令孙进程会新建可见黑框。
-        use std::ffi::OsString;
-        let program = cmd.as_std().get_program().to_os_string();
-        let args: Vec<OsString> = cmd.as_std().get_args().map(|a| a.to_os_string()).collect();
-        let cwd = cmd.as_std().get_current_dir().map(|p| p.to_path_buf());
-        let envs: Vec<(OsString, Option<OsString>)> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|x| x.to_os_string())))
-            .collect();
-        crate::winproc::spawn_hidden(&program, &args, cwd.as_deref(), &envs)
-            .map_err(|e| anyhow::anyhow!("{}", agent_missing_msg(backend, &e)))?
-    };
-    #[cfg(not(target_os = "windows"))]
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("{}", agent_missing_msg(backend, &e)))?;
-    use tokio::io::AsyncWriteExt;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(full.as_bytes())
-            .await
-            .context("写入 prompt 失败")?;
-        drop(stdin); // EOF：触发后端非交互模式处理
-    }
-    let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
-        .await
-        .context("生成超时（60s）")??;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // pi：JSONL 里最后一条 message_end（assistant）的文本；claude/codex：stdout 直接是文本
-    let raw = if backend == Backend::Pi {
-        let mut last = String::new();
-        for line in stdout.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("type").and_then(|t| t.as_str()) == Some("message_end") {
-                    let msg = &v["message"];
-                    if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                        let t = pi_message_text(msg);
-                        if !t.is_empty() {
-                            last = t;
-                        }
-                    }
-                }
-            }
-        }
-        last
-    } else {
-        stdout.to_string()
-    };
-    let text = raw
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
-        .unwrap_or_default();
+    let text = first_content_line(&text);
     if text.is_empty() {
-        // #123：stderr 透传（截断 200 字符），失败原因可定位，不再静默「空结果」。
-        let err = stderr.trim();
-        if err.is_empty() {
-            anyhow::bail!("生成结果为空（后端无输出）");
-        }
-        let shown: String = err.chars().take(200).collect();
-        anyhow::bail!("生成结果为空（后端无输出）；模型 stderr：{shown}");
+        anyhow::bail!("生成结果为空（后端无输出）");
     }
     Ok(truncate(&text, 100).to_string())
+}
+
+/// 首个非空行（trim 后）。模型可能多给解释行，只取第一行实质内容（旧 CLI 路径同款
+/// 后处理）。
+fn first_content_line(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 单轮执行一个后端：流式读输出（不等 EOF），中途消息经 progress 推出，支持 cancel 打断。
@@ -2185,19 +2128,72 @@ pub fn kill_stale_agents(bot_key: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 后处理纯函数：首个非空行（trim）；空输入/全空白 → 空串。
     #[test]
-    fn generate_role_prompt_resolves_cli_via_find_in_path() {
-        // 回归锁（#86）：生成提示词路径必须与 run_once 同源走 find_in_path。
-        // 直接验证解析函数在本测试环境能找到 claude/codex/pi 之一——
-        // generate_role_prompt 本体是网络调用无法单测，这里锁"解析链路存在且有效"：
-        // find_in_path 找不到时回落裸名的行为由下方断言覆盖。
-        for name in ["claude", "codex", "pi"] {
-            let resolved = crate::deps::find_in_path(name);
-            if let Some(p) = &resolved {
-                assert!(p.is_absolute(), "{name} 解析结果必须是绝对路径: {p:?}");
-            }
-            // 找不到（CI 无 CLI）不失败——生产错误文案已带安装指引
-        }
+    fn first_content_line_picks_first_non_blank() {
+        assert_eq!(
+            first_content_line("\n  \n  角色提示词  \n第二行"),
+            "角色提示词"
+        );
+        assert_eq!(first_content_line("只有一行"), "只有一行");
+        assert_eq!(first_content_line(""), "");
+        assert_eq!(first_content_line("\n\n  \n"), "");
+    }
+
+    /// mock 全链路（P3.3）：generate_role_prompt_with → oneshot_turn → mock 子进程。
+    /// mock echo 的 sys prompt 首行远超 100 字符，正好同时锁「首个非空行 + 截断
+    /// 100」后处理与「无后端标识后缀」（oneshot 已剥）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn generate_role_prompt_with_mock_agent_roundtrip() {
+        let rec = std::env::temp_dir().join(format!(
+            "abb-roleprompt-test-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let agent_cfg = crate::buzz::harness::AgentConfig {
+            command: python3,
+            args: vec![script.display().to_string()],
+            extra_env: vec![
+                ("PATH".to_string(), crate::deps::composed_path()),
+                ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+            ],
+            backend: "mock".to_string(),
+            session_sandbox: None,
+        };
+        let ws = std::env::temp_dir().join(format!("abb-roleprompt-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let text = generate_role_prompt_with(agent_cfg, &ws, "测试角色")
+            .await
+            .expect("mock 回合应成功");
+        assert!(text.starts_with("echo:"), "mock echo 首行: {text}");
+        assert!(
+            text.chars().count() <= 100,
+            "截断 100 字符（char 安全）: {} chars",
+            text.chars().count()
+        );
+        assert!(
+            !text.contains("── 后端"),
+            "角色 prompt 不得带后端标识后缀: {text}"
+        );
+        // prompt 原文（含角色名）确实到达 agent
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&rec)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert!(
+            records.iter().any(|e| e["event"] == "prompt"
+                && e["text"].as_str().unwrap_or_default().contains("测试角色")),
+            "prompt 记录应含角色名: {records:?}"
+        );
     }
 
     // process_line 测试辅助的解析状态：
@@ -3656,11 +3652,12 @@ mod tests {
         }
     }
 
-    /// #200 守卫回归（审查 #205r2）：buzz 的两条 CLI 旁路入口必须**返回 Err**，
+    /// #200 守卫回归（审查 #205r2）：buzz 的 CLI 旁路入口必须**返回 Err**，
     /// 绝不落到 run_once 的 unreachable!（panic 被 tasks 捕获只留 stderr，且
     /// run_job 的去重槽位/取消标志不回收 = 该 job 之后永久静默跳过）。
+    /// （角色提示词生成旁路已于 P3.3 移除：全 bot 收口 oneshot_turn。）
     #[tokio::test]
-    async fn buzz_never_enters_cli_run_or_role_prompt() {
+    async fn buzz_never_enters_cli_run() {
         let e = crate::agent::run(
             Backend::Buzz,
             "跑一下",
@@ -3681,11 +3678,5 @@ mod tests {
         };
         assert!(msg.contains("buzz"), "错误文案要指明是 buzz 后端: {msg}");
         assert!(Backend::Buzz.is_buzz() && !Backend::Claude.is_buzz());
-        assert!(
-            crate::agent::generate_role_prompt(Backend::Buzz, "角色")
-                .await
-                .is_err(),
-            "角色提示词生成同样不得裸起 buzz-agent"
-        );
     }
 }
