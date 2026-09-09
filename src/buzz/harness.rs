@@ -103,6 +103,12 @@ pub struct AgentConfig {
     /// ABB 后端标识（claude/codex/pi/buzz）——agent 回复尾部标注用
     ///（多后端热切换下用户可核验路由；与适配器进程身份解耦）。
     pub backend: String,
+    /// 本 handle 全部会话的执行档位载荷（单后端化 P2.2）：随 `session/new`
+    /// `_meta` 下发。normal handle = bot 配置档（`sandbox_mode` 解析产物，
+    /// None=FullAccess 今天行为）；granted handle = 强制 Restricted 剖面
+    ///（workspace-write + shell 白名单 + `$ABB_BIN`）——同群 owner/granted
+    /// 混合频道的档位只能绑进程，不能绑会话（角色 per-event）。
+    pub session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
 }
 
 /// 出站回合/告示：桥侧消费（写历史 + 发送）。
@@ -149,6 +155,18 @@ struct SteerAckEvent {
 }
 
 /// 桥侧句柄。
+/// fork `_meta.abbSandbox` 能力协商结果（单后端化 P2.3）。存储为 AtomicU8
+/// （判别值见 BuzzHandle::sandbox_support）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxSupport {
+    /// agent 未启动/启动中——能力未知。
+    Unknown = 0,
+    /// initialize 声明 `_meta.abbSandbox`——认 `_meta.sandbox/shell`。
+    Supported = 1,
+    /// initialize 未声明——旧 fork/其他适配器，发不出档位。
+    Unsupported = 2,
+}
+
 pub struct BuzzHandle {
     cfg: AgentConfig,
     stop: CancellationToken,
@@ -156,6 +174,11 @@ pub struct BuzzHandle {
     registry: Arc<Mutex<Registry>>,
     /// agent 进程不可用（bridge 预检读）。
     dead: AtomicBool,
+    /// fork `_meta.abbSandbox` 能力位（单后端化 P2.3）：initialize 成功后由
+    /// handle_spawn_outcome 写入；新一轮 spawn 发起时复位 Unknown。
+    /// 桥侧预检据此对「已知不支持」的 granted 消息提前拒答；**真闸**在
+    /// `pool::create_session_and_apply_model`（拒绝创建受限会话，无懒启动竞态）。
+    sandbox_supported: std::sync::atomic::AtomicU8,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Cmd>>>,
     life_tx: mpsc::UnboundedSender<SpawnOutcome>,
@@ -200,6 +223,7 @@ impl BuzzHandle {
             ctx,
             registry: Arc::new(Mutex::new(Registry::default())),
             dead: AtomicBool::new(false),
+            sandbox_supported: std::sync::atomic::AtomicU8::new(SandboxSupport::Unknown as u8),
             cmd_tx,
             cmd_rx: std::sync::Mutex::new(Some(cmd_rx)),
             life_tx,
@@ -240,6 +264,17 @@ impl BuzzHandle {
     /// 会被预检拒绝（避免用户以为已受理）。
     pub fn is_agent_available(&self) -> bool {
         !self.dead.load(Ordering::Relaxed)
+    }
+
+    /// fork `_meta.abbSandbox` 能力位（P2.3）。桥侧预检只在 **Unsupported**
+    ///（agent 已起、initialize 未声明）时提前拒答；Unknown（懒启动未起）放行——
+    /// 真闸在 session 创建处（pool），否则首条 granted 消息必被误拒。
+    pub fn sandbox_support(&self) -> SandboxSupport {
+        match self.sandbox_supported.load(Ordering::Relaxed) {
+            1 => SandboxSupport::Supported,
+            2 => SandboxSupport::Unsupported,
+            _ => SandboxSupport::Unknown,
+        }
     }
 
     /// 入队一条用户消息（桥 dispatch 后调用）。channel 在跑时按 Queue 语义
@@ -516,6 +551,16 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome
             let agent = *agent;
             l.crash_backoff = 0;
             handle.dead.store(false, Ordering::Relaxed);
+            // P2.3：能力位随本次 initialize 落锤（每次成功拉起都重判——同进程
+            // 重启后 exe 可能已被换装）。
+            handle.sandbox_supported.store(
+                if agent.acp.abb_sandbox_supported() {
+                    SandboxSupport::Supported as u8
+                } else {
+                    SandboxSupport::Unsupported as u8
+                },
+                Ordering::Relaxed,
+            );
             l.pool.return_agent(agent);
             tracing::info!("agent process ready");
         }
@@ -551,6 +596,11 @@ fn schedule_agent_start(
 ) {
     debug_assert!(!l.spawn_in_flight, "must not stack spawn attempts");
     l.spawn_in_flight = true;
+    // 新一轮 spawn 发起：能力位复位 Unknown（initialize 前任何读取都按
+    // 「未就绪」拒答——绝不沿用上一次的判定给过旧 fork 开闸）。
+    handle
+        .sandbox_supported
+        .store(SandboxSupport::Unknown as u8, Ordering::Relaxed);
     let cfg = handle.cfg.clone();
     let stop = handle.stop.clone();
     let life_tx = handle.life_tx.clone();
@@ -597,6 +647,7 @@ async fn spawn_and_init_agent(cfg: &AgentConfig) -> SpawnOutcome {
                 agent_name,
                 goose_system_prompt_supported: None,
                 protocol_version,
+                session_sandbox: cfg.session_sandbox.clone(),
             }))
         }
         Ok(Err(e)) => {
@@ -839,6 +890,21 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                         ),
                     );
                 }
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_sandbox_unsupported(e))
+            {
+                // P2.3：受限档位能力缺失（session 创建被 pool 硬闸拒绝）——不可
+                // 重试：agent 进程本身健康，重试只会再撞同一闸。当场死信并给可
+                // 行动提示（升级 ABB / 换回随包 agent）。
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    "dead-lettering batch — agent lacks _meta.abbSandbox capability"
+                );
+                notify_channel(
+                    l,
+                    handle,
+                    &batch,
+                    "⚠️ 处理失败：随包 agent 不支持受限执行档位（请升级 ABB 后重试）。".to_string(),
+                );
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // 认证错误不可重试：立即死信并提示重登。
                 tracing::warn!(
@@ -1032,6 +1098,17 @@ fn is_auth_error(error: &AcpError) -> bool {
         return false;
     };
     message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+/// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
+/// （随包 agent 未声明 `_meta.abbSandbox`，或词表不含请求档位）。不可重试——
+/// agent 进程本身健康，重试只会再撞同一闸。
+///
+/// 走独立变体 [`AcpError::SandboxUnsupported`] 而非 `Protocol`：后者在
+/// `is_transport_error` 之列，会把健康 agent 判为「管道可能坏」而
+/// `schedule_death_respawn`（杀进程 + 置 dead，后续消息全被预检拒掉）。
+fn is_sandbox_unsupported(error: &AcpError) -> bool {
+    matches!(error, AcpError::SandboxUnsupported(_))
 }
 
 // ── recover_panicked_agent（上游移植） ───────────────────────────────────────

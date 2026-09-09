@@ -145,6 +145,10 @@ pub struct OwnedAgent {
     pub goose_system_prompt_supported: Option<bool>,
     /// Protocol version reported by the agent in its initialize response.
     pub protocol_version: u32,
+    /// 本进程全部会话的执行档位载荷（单后端化 P2.2，来自 AgentConfig）：
+    /// `create_session_and_apply_model` 随 `session/new` `_meta` 下发。
+    /// None = FullAccess（今天字节级行为）。
+    pub session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
 }
 
 /// Package name reported by `claude-agent-acp` in its `initialize` response.
@@ -766,6 +770,23 @@ async fn create_session_and_apply_model(
     ctx: &PromptContext,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
+    // P2.3 能力协商硬闸（真闸在此，非仅桥侧预检）：本 handle 配了执行档位
+    //（session_sandbox = Some，即 granted 受限实例或 read-only/workspace-write
+    // 的 owner 档）而 agent 未在 initialize 声明**该档位** ⇒ 拒绝建会话。
+    // 绝不允许「发不出档位就默认 FullAccess」——旧 fork 会忽略未知 `_meta`，
+    // 静默把受限会话跑成全权限（计划唯一的 Critical 风险）。桥侧预检只在能力位
+    // 已判为 Unsupported 时提前拒答；未启动（Unknown）放行到此——懒启动下预检
+    // 无从知道，此处的判定与同一 agent 的 initialize 结果同源，无竞态。
+    // P1-3 词表校验：声明的词表是权威——请求档位不在词表内一律拒（`sandbox`
+    // 缺省取空串，同样落拒），防未来词表漂移被静默降级。
+    if let Some(meta) = &agent.session_sandbox {
+        let mode = meta.sandbox.as_deref().unwrap_or_default();
+        if !agent.acp.abb_sandbox_supports(mode) {
+            return Err(AcpError::SandboxUnsupported(format!(
+                "随包 agent 未声明受限执行档位 {mode:?}（initialize 顶层 _meta.abbSandbox）——拒绝创建受限会话"
+            )));
+        }
+    }
     // Build base_prompt + system_prompt + team instructions into a single
     // session prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -793,7 +814,7 @@ async fn create_session_and_apply_model(
 
     let resp = agent
         .acp
-        .session_new_full(
+        .session_new_full_with_meta(
             session_cwd,
             mcp_servers,
             session_new_system_prompt(
@@ -803,6 +824,7 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
+            agent.session_sandbox.as_ref(),
         )
         .await?;
 
