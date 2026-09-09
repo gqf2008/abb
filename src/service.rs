@@ -50,9 +50,11 @@ fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
 /// buzz 语义：`BUZZ_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses 全系
 /// 兼容 env（buzz_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
-/// `uses_buzz_agent=false`（无随包落 pi-acp 兜底）走 pi 注入臂——旧 resolve_adapter
-/// 语义保留。装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧只会报
-/// 内部错误，预检已按 NoProvider 拒答引导补填）。
+/// `uses_buzz_agent=false`（无随包落 pi-acp 兜底）走 `build_injection(Backend::Buzz)`
+/// ——经核对该臂解析到 buzz_provider_env（agent.rs Buzz 臂），与 true 臂殊途同归，
+/// 且与旧 env_for 的 buzz 后端无随包兜底路径（旧代码同样 build_injection(Buzz)）
+/// 语义逐字节一致。装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
+/// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
 fn buzz_env_for_bot(
     bot: &crate::config::BotConfig,
     cfg: &Config,
@@ -187,7 +189,7 @@ pub async fn run() {
     // 装配零等待（不 spawn 进程、不碰盘）——handle 同步可得，无启动竞态；agent
     // 懒启动 + 崩溃退避重拉（harness 内闭环），启动失败只影响本 bot 的 ACP 频道。
     // 命令解析每进程一次（buzz_agent_exe 指错只告警一回）；None = 开发/自签构建
-    // 无随包 → run_bot 内落 pi-acp 兜底（pi 注入臂 env，旧 resolve_adapter 语义）。
+    // 无随包 → run_bot 内落 pi-acp 兜底（build_injection(Buzz) 臂 env，旧语义）。
     let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
