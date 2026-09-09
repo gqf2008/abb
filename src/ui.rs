@@ -2639,18 +2639,17 @@ pub fn run_gui() -> Result<()> {
                                 crate::agent::truncate(&bot_key, 12),
                                 crate::agent::truncate(&name, 20)
                             );
-                            // 走该 bot 生效后端（bot.backend 优先，回落全局默认）
-                            let backend = Config::load()
-                                .ok()
-                                .and_then(|c| {
-                                    c.bots
-                                        .iter()
-                                        .find(|b| b.key() == bot_key)
-                                        .map(|b| b.effective_backend(&c.default_backend).to_string())
-                                })
-                                .unwrap_or_default();
-                            let r =
-                                crate::agent::generate_role_prompt(crate::agent::Backend::parse(&backend), &name).await;
+                            // 单后端化 P3.3：全 bot 收口 buzz oneshot（不再按 backend
+                            // 分流 CLI spawn）；装配需要 bot 完整配置 + 全局 config。
+                            let r = match Config::load() {
+                                Ok(cfg) => match cfg.bots.iter().find(|b| b.key() == bot_key) {
+                                    Some(bot) => {
+                                        crate::agent::generate_role_prompt(bot, &cfg, &name).await
+                                    }
+                                    None => Err(anyhow::anyhow!("bot 配置不存在：{bot_key}")),
+                                },
+                                Err(e) => Err(anyhow::anyhow!("config.json 读取失败：{e:#}")),
+                            };
                             match r {
                                 Ok(text) => {
                                     let _ = vb_tx.send(VirtualBotEvt::PromptGenerated {
