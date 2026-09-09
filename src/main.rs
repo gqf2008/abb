@@ -12,7 +12,6 @@ mod botstatus;
 mod bridge;
 mod buzz;
 mod config;
-mod contextsum;
 mod deliver;
 mod deps;
 mod dingtalk;

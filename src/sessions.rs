@@ -234,6 +234,21 @@ impl SessionStore {
         }
     }
 
+    /// slot_mut 的只读镜像（is_started 等只读取方用）——同一 backend→槽位映射，
+    /// 两实现必须同步演进（P4.1：buzz/buzz-agent → buzz 槽）。
+    fn slot_ref<'a>(entry: &'a ChatEntry, backend: &str) -> &'a Slot {
+        if backend.eq_ignore_ascii_case("codex") {
+            &entry.codex
+        } else if backend.eq_ignore_ascii_case("pi") {
+            &entry.pi
+        } else if backend.eq_ignore_ascii_case("buzz") || backend.eq_ignore_ascii_case("buzz-agent")
+        {
+            &entry.buzz
+        } else {
+            &entry.claude
+        }
+    }
+
     /// 返回该 chat 在当前后端的 session_id，没有则新建 UUID。
     ///
     /// 生产 bridge 已改用 `ensure_with_started` 合并快照（审查 P3-1a）；此方法保留作
@@ -353,6 +368,9 @@ impl SessionStore {
     /// - 既有会话记录 ≠ 当前：返回 (提示一次, rotated)，记录覆盖为本轮档位
     ///   （rotated=true=codex：调用方置 rebuilt 让桥写 pending 标记，下一条消息
     ///   注入历史一次——上下文接续）。
+    // P4.1：codex/claude 档位轮换自愈已随 Backend 删除（沙箱档改由 harness `_meta` 下发，
+    // P2.2/P2.3）；本方法生产无调用点，仅测试锚定 codex 轮换臂——保留至后端族测试清理批次。
+    #[allow(dead_code)]
     pub fn check_sandbox_mode(&self, chat_id: &str, mode: &SandboxMode) -> Option<(String, bool)> {
         self.refresh();
         let mut data = self.data.lock().unwrap();
@@ -429,13 +447,17 @@ impl SessionStore {
         let mut moved = Vec::new();
         for k in &keys {
             let entry = data.remove(k).unwrap();
-            // 三槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃
+            // 四槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃。
+            // （审查 P2-1：原只查 claude/codex/pi 三槽漏 buzz——单后端世界活会话恒在
+            // buzz 槽，仅 buzz 槽有会话的 chat 会被误判 empty 而丢迁移。）
             let empty = entry.claude.session_id.is_empty()
                 && !entry.claude.started
                 && entry.codex.session_id.is_empty()
                 && !entry.codex.started
                 && entry.pi.session_id.is_empty()
-                && !entry.pi.started;
+                && !entry.pi.started
+                && entry.buzz.session_id.is_empty()
+                && !entry.buzz.started;
             if !empty {
                 moved.push((k.clone(), entry));
             }
@@ -461,6 +483,9 @@ impl SessionStore {
     /// 旧会话、/new 失效（#49 审查：codex 首轮运行中 /new 的交错场景）。
     /// （原无条件覆盖版 set_session_id 已被本方法取代：调用方是 codex 首轮回存——
     /// 用对端自生成的真实会话 id，必须先验证槽位身份再写。）
+    // P4.1：codex 首轮回存已删——生产唯一调用点消失，现仅 MockAgentRunner（测试挡板）
+    // 模拟 already-in-use 自愈回存调用；保留为 CAS 原语供测试缝。
+    #[allow(dead_code)]
     pub fn set_session_id_if(&self, chat_id: &str, expected: &str, session_id: &str) -> bool {
         self.refresh();
         let mut data = self.data.lock().unwrap();
@@ -485,15 +510,7 @@ impl SessionStore {
         self.refresh();
         let data = self.data.lock().unwrap();
         data.get(chat_id)
-            .map(|e| {
-                if self.current_backend.eq_ignore_ascii_case("codex") {
-                    e.codex.started
-                } else if self.current_backend.eq_ignore_ascii_case("pi") {
-                    e.pi.started
-                } else {
-                    e.claude.started
-                }
-            })
+            .map(|e| Self::slot_ref(e, &self.current_backend).started)
             .unwrap_or(false)
     }
 
@@ -545,6 +562,12 @@ impl SessionStore {
                 &e.codex.session_id
             } else if backend.eq_ignore_ascii_case("pi") {
                 &e.pi.session_id
+            } else if backend.eq_ignore_ascii_case("buzz")
+                || backend.eq_ignore_ascii_case("buzz-agent")
+            {
+                // 审查 P3-1：补 buzz 臂——current_backend 现已恒 "buzz"，缺臂会把
+                // buzz 调用落 else 误读 claude 槽（与 slot_ref/slot_mut 同表派生）。
+                &e.buzz.session_id
             } else {
                 &e.claude.session_id
             };

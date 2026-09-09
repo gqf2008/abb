@@ -1582,6 +1582,9 @@ impl Config {
         cfg.resolve_provider(bot).cloned()
     }
 
+    // P4.1：唯一生产调用点（旧 agent::run 的受限判定）已删；buzz 路径经
+    // `provider_for_bot_key_of`（快照版）解析。保留为热读工具方法（与 bot_for_bot_key 同族）。
+    #[allow(dead_code)]
     pub fn provider_for_bot_key(bot_key: &str) -> Option<ProviderConfig> {
         Config::load().ok().and_then(|c| {
             c.bots
