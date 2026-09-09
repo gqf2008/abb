@@ -124,15 +124,10 @@ impl Drop for HiddenChild {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::agent::KillableChild for HiddenChild {
-    async fn kill(&mut self) -> std::io::Result<()> {
-        self.kill().await
-    }
-    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.wait().await
-    }
-}
+//（P4.1 收尾：`impl crate::agent::KillableChild for HiddenChild` 已删——KillableChild
+// trait 与其全部消费方（旧 CLI spawn 路径）随后端大删除一并移除，该 impl 成孤儿。
+// Windows-only cfg 故 macOS 门禁不可见，由 release Windows 构建暴露。HiddenChild 自有
+// kill/wait 内联方法（:66/:78）保留，供 spawn_hidden 调用方直接使用。）
 
 /// 以「隐藏控制台」方式 spawn 子进程（#153）。参数从 std/tokio Command 提取：
 /// - `program`：可执行文件（Windows 下 .cmd shim 场景为 `cmd`，首参 `/c` 跟脚本路径）
