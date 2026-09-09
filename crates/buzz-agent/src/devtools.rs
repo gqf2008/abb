@@ -722,20 +722,25 @@ async fn run_delegate(
         DelegateBackend::Claude => {
             // headless 一次性：-p 打印最终文本结果；--dangerously-skip-permissions
             // 因无法交互授权（本工具仅在 shell 本就 Full 的会话可见，不扩权）。
+            // `--` 分隔 flag 与位置参数：task 以 `-` 开头不致被当未知选项。
             cmd.arg("-p")
                 .arg("--output-format")
                 .arg("text")
                 .arg("--dangerously-skip-permissions")
+                .arg("--")
                 .arg(task);
         }
         DelegateBackend::Codex => {
             // headless 一次性：codex 自有 workspace-write 沙箱限定写在工作区。
+            // `--` 分隔 flag 与位置参数：codex exec 有 resume/fork/review 子命令，
+            // 单词 task（如 "review"）或 `-` 开头的 task 不致被绑定子命令/当选项。
             cmd.arg("exec")
                 .arg("--skip-git-repo-check")
                 .arg("--sandbox")
                 .arg("workspace-write")
                 .arg("-C")
                 .arg(cwd)
+                .arg("--")
                 .arg(task);
         }
     }
@@ -795,13 +800,22 @@ async fn run_delegate(
         }
     };
     let drain = Duration::from_secs(5);
+    let mut lingering = false;
     let stdout = match tokio::time::timeout(drain, out_task).await {
         Ok(Ok(s)) => s,
-        _ => CappedStream::new(),
+        _ => {
+            // 孙进程（脱离进程组的后台子进程）仍持有管道：拿不到已读部分，
+            // 如实告知模型输出不完整（与 run_shell 同构）。
+            lingering = true;
+            CappedStream::new()
+        }
     };
     let stderr = match tokio::time::timeout(drain, err_task).await {
         Ok(Ok(s)) => s,
-        _ => CappedStream::new(),
+        _ => {
+            lingering = true;
+            CappedStream::new()
+        }
     };
 
     let mut text = format!(
@@ -817,6 +831,11 @@ async fn run_delegate(
     }
     if stderr.total > 0 {
         text.push_str(&format!("\nstderr:\n{}", stderr.render()));
+    }
+    if lingering {
+        text.push_str(
+            "\n[output still streaming from a lingering background child process; result truncated]\n",
+        );
     }
     // 委派失败（非零退出）标 is_error：模型不该把失败输出当成成功结果。
     ok_result(provider_id, text).map(|mut r| {
@@ -1612,6 +1631,64 @@ mod tests {
         clear_delegate_env();
         assert!(!r.is_error, "{}", r.text());
         assert!(r.text().contains("codex-done"), "{}", r.text());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_locks_exact_argv_for_both_backends() {
+        // 锁死精确 argv flag——防未来被静默降级/删除（--dangerously-skip-permissions /
+        // --sandbox workspace-write 是安全相关 flag；`--` 分隔符防单词 task 被绑到
+        // codex 子命令、防 `-` 开头 task 被当选项）。
+        let _g = DELEGATE_TEST_ENV_LOCK.lock().await;
+        clear_delegate_env();
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let echo = "#!/bin/sh\necho \"$@\"\n";
+        let cb = fake_cli(dir.path(), "claude", echo);
+        let xb = fake_cli(dir.path(), "codex", echo);
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", &cb);
+        std::env::set_var("BUZZ_AGENT_DELEGATE_CODEX_BIN", &xb);
+        let policy = test_policy(cwd);
+        // sender 必须存活：drop 即广播「取消」
+        let (_tx, mut rx) = watch::channel(false);
+        let c = run_with_policy(
+            Tool::Delegate,
+            &json!({ "backend": "claude", "task": "lock-argv" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            c.text()
+                .contains("-p --output-format text --dangerously-skip-permissions -- lock-argv"),
+            "claude argv: {}",
+            c.text()
+        );
+        let x = run_with_policy(
+            Tool::Delegate,
+            &json!({ "backend": "codex", "task": "lock-argv" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        clear_delegate_env();
+        assert!(
+            x.text()
+                .contains("exec --skip-git-repo-check --sandbox workspace-write -C"),
+            "codex argv: {}",
+            x.text()
+        );
+        assert!(
+            x.text().contains("-- lock-argv"),
+            "codex 缺 `--` 分隔: {}",
+            x.text()
+        );
     }
 
     #[cfg(unix)]

@@ -1297,7 +1297,8 @@ mod sandbox_tests {
             (Sandbox::FullAccess, ShellMode::Full, true), // 正常 owner 会话
             (Sandbox::WorkspaceWrite, ShellMode::Full, true), // 三档受限但 shell 本就 Full（不扩权）
             (Sandbox::WorkspaceWrite, ShellMode::Restricted, false), // granted：永不可见
-            (Sandbox::ReadOnly, ShellMode::Full, false),      // read-only：无 shell
+            (Sandbox::FullAccess, ShellMode::Restricted, false), // granted 与 full-access 漂移配对仍拒
+            (Sandbox::ReadOnly, ShellMode::Full, false),         // read-only：无 shell
         ] {
             let reg = McpRegistry::spawn_all(
                 &cfg,
