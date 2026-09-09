@@ -25,6 +25,11 @@ fn guard_dir(bot_key: &str) -> PathBuf {
 }
 
 /// 受限 claude spawn 时 `--settings` 指向的 settings.json 绝对路径。
+// P4.1：claude spawn 已删——本函数与其余 guard 文件生成器（owner_guard_settings_path/
+// ensure_guard_files/ensure_owner_guard_files 及 *_at 内层）同为 claude-only 死代码；
+// 删除保护已由 buzz harness 受限档（P2.2/P2.3 `_meta` 沙箱）取代。保留源供测试锚定，
+// 后续清理批次连同测试一并删除。guard_check_main 分发路径不在此列（仍可能经旧 hook 被调）。
+#[allow(dead_code)]
 pub fn guard_settings_path(bot_key: &str) -> PathBuf {
     guard_dir(bot_key).join("settings.json")
 }
@@ -32,6 +37,7 @@ pub fn guard_settings_path(bot_key: &str) -> PathBuf {
 /// 删除保护（#88）：owner 会话 claude spawn 时 `--settings` 指向的 settings.json。
 /// 与受限 settings 分离（受限文件只有 PreToolUse hook，owner 文件也只有 Bash hook——
 /// 避免两套守卫互相污染；guard-check 按 env 角色分派行为）。
+#[allow(dead_code)] // claude-only 死代码（P4.1，见 guard_settings_path 注释）
 pub fn owner_guard_settings_path(bot_key: &str) -> PathBuf {
     guard_dir(bot_key).join("owner-settings.json")
 }
@@ -48,11 +54,13 @@ pub fn pending_dangerous_path(bot_key: &str) -> PathBuf {
 /// 注：codex 侧不再生成 execpolicy——codex 0.147 实测其机制与文档不符
 /// （requirements.toml/prefix_rules 均未生效、写入 config.toml 会破坏登录态），
 /// codex 受限依赖 read-only 沙箱 + 网络拦截（实测有效），见 agent.rs codex_command 注释。
+#[allow(dead_code)] // claude-only 死代码（P4.1，见 guard_settings_path 注释）
 pub fn ensure_guard_files(bot_key: &str) -> std::io::Result<()> {
     ensure_guard_files_at(&guard_dir(bot_key), &std::env::current_exe()?)
 }
 
 /// ensure_guard_files 的内部实现（目录/可执行文件可注入，单测用）。
+#[allow(dead_code)] // claude-only 死代码（P4.1，见 guard_settings_path 注释）
 fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(guard_dir)?;
     let exe_str = exe.to_string_lossy();
@@ -83,11 +91,13 @@ fn ensure_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
 /// 不被 hook 拦截（与受限会话的 matcher="*" 全量白名单不同）。
 /// owner 会话仍带 `--dangerously-skip-permissions`（全权限保持），hook 只在
 /// 全权限旗标下做删除拦截——claude 官方语义：hook 在未信任目录与全权限旗标下都执行。
+#[allow(dead_code)] // claude-only 死代码（P4.1，见 guard_settings_path 注释）
 pub fn ensure_owner_guard_files(bot_key: &str) -> std::io::Result<()> {
     ensure_owner_guard_files_at(&guard_dir(bot_key), &std::env::current_exe()?)
 }
 
 /// ensure_owner_guard_files 的内部实现（目录/可执行文件可注入，单测用）。
+#[allow(dead_code)] // claude-only 死代码（P4.1，见 guard_settings_path 注释）
 fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(guard_dir)?;
     let exe_str = exe.to_string_lossy();
