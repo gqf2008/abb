@@ -203,6 +203,34 @@ fn build_bot_acp_handles(
     crate::bridge::BotAcpHandles { normal, granted }
 }
 
+/// 一次性同步回合的 agent 配置（单后端化 P3.2/P3.3/P3.4 共用）：与 normal
+/// handle **同命令同 env 同档位载荷**（归纳/角色生成/团队生成 = owner 角色
+/// 的内部任务，跟 bot 配置档走——维护任务必须能跟 bot 后端走）。granted 的
+/// 强制 Restricted 剖面与 NO_HINTS 不适用于此（那是授权者会话的进程级收口）。
+/// session_gc（service 进程）与 GUI 按钮（GUI 进程，同 binary）都经它装配，
+/// 配合 `buzz::oneshot::oneshot_turn` 用完即弃。
+pub(crate) fn oneshot_agent_config(
+    bot: &crate::config::BotConfig,
+    cfg: &Config,
+) -> crate::buzz::harness::AgentConfig {
+    // 命令解析与 build_bot_acp_handles 同链（覆盖指错告警一回/调用——gc 是
+    // 日频任务，GUI 是低频点击，重复解析可接受）。
+    let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
+    let uses_buzz_agent = buzz_cmd.is_some();
+    let command = buzz_cmd.unwrap_or_else(|| "pi-acp".to_string());
+    let env = buzz_env_for_bot(bot, cfg, uses_buzz_agent);
+    crate::buzz::harness::AgentConfig {
+        command,
+        args: Vec::new(),
+        extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
+            .into_iter()
+            .chain(env)
+            .collect(),
+        backend: "buzz".to_string(),
+        session_sandbox: resolve_sandbox_meta(bot),
+    }
+}
+
 pub async fn run() {
     crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
     let cfg = match Config::load() {

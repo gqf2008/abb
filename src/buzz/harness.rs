@@ -134,9 +134,17 @@ pub enum SyncTurnOutcome {
     /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
     /// oneshot fresh Uuid，触不到；与旧实现同构）。
     Closed,
+    /// 外部联动取消（P3.2：oneshot 的关停联动）——与 Timeout 同款 teardown
+    /// 已完成，在途回合已叫停。
+    Cancelled,
     /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
     Failed(String),
 }
+
+/// 后端标识后缀的行前标记（P3.2 常量化）：`handle_prompt_result` Ok 臂给回合
+/// 文本追加 `── 后端：X`（chat 投递的路由标注），oneshot 消费方（摘要/prompt/
+/// JSON）按同一标记剥除——单一来源，防两处文案漂移。
+pub(crate) const BACKEND_SUFFIX_MARK: &str = "\n── 后端：";
 
 enum Cmd {
     Message {
@@ -318,6 +326,13 @@ impl BuzzHandle {
     /// 排队并触发 steer（模块文档）。返回 `false` = 句柄已关闭。
     pub fn push_message(&self, channel_id: Uuid, msg: InboundMsg) -> bool {
         self.cmd_tx.send(Cmd::Message { channel_id, msg }).is_ok()
+    }
+
+    /// 移除同步等待者（P3.2 oneshot 外部取消臂）：`wait_turn_outcome` 的 future
+    /// 被外部取消 select 提前 drop 时，其尾部 remove 不再执行——调用方须显式
+    /// 清表防条目泄漏（迟到的回合文本/死信 send 进已 drop 的 rx 静默丢弃）。
+    pub fn remove_sync_waiter(&self, channel_id: Uuid) {
+        self.sync_waiters.lock().unwrap().remove(&channel_id);
     }
 
     /// `!cancel`：取消该频道在跑回合。`Ok(true)` = 已向在跑任务发 Cancel 信号；
@@ -1013,10 +1028,11 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 let text = redact_skill_paths(&text);
                 // 后端标识后缀：每个 agent 回复尾部标注实际后端（chat/job 两
                 // 路径同款；多后端热切换下用户可核验路由）。空文本不加。
+                // 标记与 oneshot 剥除处同常量化（BACKEND_SUFFIX_MARK）。
                 let text = if text.trim().is_empty() {
                     text
                 } else {
-                    format!("{text}\n── 后端：{}", handle.cfg.backend)
+                    format!("{text}{BACKEND_SUFFIX_MARK}{}", handle.cfg.backend)
                 };
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
