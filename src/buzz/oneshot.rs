@@ -31,12 +31,9 @@ use super::queue::InboundMsg;
 /// `requeue_as_cancelled` 的批次会被 cancelled-fallback 立即重投为新回合，
 /// 此时拆栈走「宽限耗尽 → abort → kill_on_drop」的 detach 兜底（30s 量级），
 /// 进程组收尸仍然有界，只是 join 等不到。
-// 阶段性落地：P3.1 只交 helper 本体，首个生产调用方随 P3.2（session_gc）接入。
-#[allow(dead_code)]
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(12);
 
 /// 超时后向主循环发 cancel 的等待上限（主循环活着时即时；防御 wedged）。
-#[allow(dead_code)]
 const CANCEL_CMD_BUDGET: Duration = Duration::from_secs(5);
 
 /// 自起句柄跑一轮同步回合并拆栈。
@@ -46,24 +43,27 @@ const CANCEL_CMD_BUDGET: Duration = Duration::from_secs(5);
 /// - `msg`：prompt 本体（`author_role`/`prompt_tag` 由调用方定，如归纳 = Owner +
 ///   `"gc_summary"`）；
 /// - `budget`：回合预算（调用方 tokio 超时；触发即 `SyncTurnOutcome::Timeout`，
-///   在途回合由本函数 cancel 防迟发）。
+///   在途回合由本函数 cancel 防迟发）；
+/// - `external_cancel`：外部联动取消（P3.2 关停联动 #69）——**只 watch，绝不
+///   cancel 传入的 token**；触发走 Timeout 同款 teardown，返回
+///   `SyncTurnOutcome::Cancelled`。
 ///
-/// 返回 [`SyncTurnOutcome`]：Ok(回合文本) / Timeout / Closed / Failed(agent 终态
-/// 失败原因)。句柄用自建的 [`CancellationToken`]（不碰全局关停令牌），用完即弃；
-/// 拆栈保证 agent 子进程组被杀（正常路径 join 内完成，最坏路径 detach 后由
+/// 返回 [`SyncTurnOutcome`]：Ok(回合文本，**已剥后端标识后缀**——那是 chat 投递
+/// 的路由标注，摘要/prompt/JSON 消费方不该带) / Timeout / Closed / Failed(agent
+/// 终态失败原因)。句柄用自建的 [`CancellationToken`]（不碰全局关停令牌），用完
+/// 即弃；拆栈保证 agent 子进程组被杀（正常路径 join 内完成，最坏路径 detach 后由
 /// 关停宽限兜底，进程组收尸有界）。
 ///
 /// 结局边界（审查 P3-3）：agent **拉不起**（二进制缺失/initialize 连败）时批次
 /// 按 harness 退避重拉设计不死信——结局是挂满 `budget` 得 Timeout，而非 Failed；
 /// Failed 只覆盖「回合已派发后的终态失败」（死信/认证失效/档位不支持）。
-// 阶段性落地：P3.1 只交 helper 本体，首个生产调用方随 P3.2（session_gc）接入，
-// 届时移除此 allow。
-#[allow(dead_code)]
+// 阶段性落地：首个生产调用方随 P3.2（session_gc）接入。
 pub async fn oneshot_turn(
     cfg: AgentConfig,
     workspace: Option<String>,
     msg: InboundMsg,
     budget: Duration,
+    external_cancel: Option<CancellationToken>,
 ) -> SyncTurnOutcome {
     let stop = CancellationToken::new();
     let cwd = std::env::current_dir()
@@ -88,8 +88,31 @@ pub async fn oneshot_turn(
         },
     );
 
-    let outcome = handle.wait_turn_outcome(channel_id, msg, budget).await;
-    if matches!(outcome, SyncTurnOutcome::Timeout) {
+    // 外部联动取消与同步等待竞速：外部触发 = Cancelled（区别于预算 Timeout）。
+    let outcome = {
+        let wait = handle.wait_turn_outcome(channel_id, msg, budget);
+        tokio::pin!(wait);
+        match external_cancel {
+            Some(ext) => {
+                tokio::select! {
+                    o = &mut wait => o,
+                    _ = ext.cancelled() => {
+                        // wait future 随本臂结束离开作用域即弃（其内部等待者
+                        // 表项由函数尾部 remove 清理，提前 drop 不会执行——
+                        // 须显式清表防泄漏：迟到的回合文本/死信 send 进已
+                        // drop 的 rx 静默丢弃）。
+                        handle.remove_sync_waiter(channel_id);
+                        SyncTurnOutcome::Cancelled
+                    }
+                }
+            }
+            None => wait.await,
+        }
+    };
+    if matches!(
+        outcome,
+        SyncTurnOutcome::Timeout | SyncTurnOutcome::Cancelled
+    ) {
         // 防迟发：叫停在途回合。等 cancel 回执 = 主循环已处置该指令（随后
         // token.cancel()  break 主循环不会抢在处置前）。排水+杀进程组在
         // run_loop 关停宽限内完成（见 shutdown）。
@@ -103,7 +126,21 @@ pub async fn oneshot_turn(
     {
         tracing::warn!("oneshot teardown exceeded budget — detached (shutdown grace reaps)");
     }
-    outcome
+    match outcome {
+        SyncTurnOutcome::Ok(text) => SyncTurnOutcome::Ok(strip_backend_suffix(&text)),
+        other => other,
+    }
+}
+
+/// 剥除 harness Ok 臂追加的后端标识后缀（`── 后端：X`）：它是 chat 投递的路由
+/// 标注（用户核验路由用），oneshot 消费方——摘要存档（P3.2）/角色 prompt
+/// （P3.3）/团队 JSON（P3.4，后缀会直接打死解析）——一律不需要。取最后一个
+/// 标记切尾（模型正文若含同款字面量，harness 追加的恒在最后）。无标记原样返回。
+fn strip_backend_suffix(text: &str) -> String {
+    match text.rfind(super::harness::BACKEND_SUFFIX_MARK) {
+        Some(i) => text[..i].trim_end().to_string(),
+        None => text.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -159,8 +196,13 @@ mod tests {
             .collect()
     }
 
-    /// echo 回合：Ok(含 echo 文本) + session cwd 落 workspace + prompt 原文到达。
+    /// echo 回合：Ok(含 echo 文本、**已剥后端后缀**) + session cwd 落 workspace
+    /// + prompt 原文到达。
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
     async fn oneshot_echo_roundtrip() {
         let rec = record_file("echo");
         let ws = std::env::temp_dir().join(format!("abb-oneshot-ws-{}", Uuid::new_v4()));
@@ -171,6 +213,7 @@ mod tests {
             Some(ws.display().to_string()),
             msg("oneshot-echo-probe"),
             Duration::from_secs(60),
+            None,
         )
         .await;
         let SyncTurnOutcome::Ok(text) = outcome else {
@@ -178,6 +221,10 @@ mod tests {
         };
         assert!(text.contains("echo:"), "echo 文本: {text}");
         assert!(text.contains("oneshot-echo-probe"), "prompt 原文: {text}");
+        assert!(
+            !text.contains("── 后端"),
+            "oneshot 消费方不得带后端标识后缀: {text}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "回合+拆栈应远快于预算: {:?}",
@@ -206,6 +253,10 @@ mod tests {
     /// agent 终态失败（401 认证，不可重试）：Failed(原因) 且远早于预算——
     /// 锁死 notify_channel → 同步等待者 Err 旁路（机制增量本體）。
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
     async fn oneshot_agent_error_surfaces_failed_fast() {
         let rec = record_file("auth");
         let started = std::time::Instant::now();
@@ -214,6 +265,7 @@ mod tests {
             None,
             msg("oneshot-auth-probe"),
             Duration::from_secs(120),
+            None,
         )
         .await;
         let SyncTurnOutcome::Failed(reason) = outcome else {
@@ -229,6 +281,10 @@ mod tests {
 
     /// 挂起的 agent：预算触发 Timeout + cancel 记录在案 + 拆栈有界。
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
     async fn oneshot_timeout_cancels_and_teardown_bounded() {
         let rec = record_file("hang");
         let started = std::time::Instant::now();
@@ -240,6 +296,7 @@ mod tests {
             None,
             msg("oneshot-hang-probe"),
             Duration::from_secs(2),
+            None,
         )
         .await;
         assert_eq!(outcome, SyncTurnOutcome::Timeout);
@@ -253,6 +310,61 @@ mod tests {
             events.iter().any(|e| e["event"] == "cancel"),
             "超时后应向在途回合发 cancel: {events:?}"
         );
+    }
+
+    /// 外部联动取消（P3.2 关停语义）：挂起回合 + 外部 token 触发 → Cancelled
+    ///（区别于预算 Timeout）+ 在途回合被 cancel + 拆栈有界 + 等待表无泄漏。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn oneshot_external_cancel_returns_cancelled() {
+        let rec = record_file("extcancel");
+        let ext = CancellationToken::new();
+        let ext2 = ext.clone();
+        // 1s 后触发外部取消（远早于 120s 预算）。
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ext2.cancel();
+        });
+        let started = std::time::Instant::now();
+        let outcome = oneshot_turn(
+            mock_cfg(
+                &rec,
+                vec![("MOCK_HANG_PROMPT".to_string(), "1".to_string())],
+            ),
+            None,
+            msg("oneshot-extcancel-probe"),
+            Duration::from_secs(120),
+            Some(ext.clone()),
+        )
+        .await;
+        assert_eq!(outcome, SyncTurnOutcome::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "外部取消必须立即生效且拆栈有界: {:?}",
+            started.elapsed()
+        );
+        let events = read_records(&rec);
+        assert!(
+            events.iter().any(|e| e["event"] == "cancel"),
+            "外部取消后应向在途回合发 cancel: {events:?}"
+        );
+    }
+
+    /// 后缀剥除纯函数：取最后一个标记切尾；无标记原样；正文含同款字面量不误伤。
+    #[test]
+    fn strip_backend_suffix_pure() {
+        assert_eq!(strip_backend_suffix("正文\n── 后端：buzz"), "正文");
+        assert_eq!(strip_backend_suffix("无后缀"), "无后缀");
+        // 模型正文自带同款字面量：rfind 取最后（harness 追加的恒在最末）
+        assert_eq!(
+            strip_backend_suffix("引用── 后端：四字\n── 后端：mock"),
+            "引用── 后端：四字"
+        );
+        // 空文本（harness 本就不追加后缀）原样
+        assert_eq!(strip_backend_suffix(""), "");
     }
 
     /// 常量顺序锁：拆栈/取消预算必须远小于回合硬上限（否则 Timeout 路径的
