@@ -43,13 +43,24 @@ impl BridgeRegistry {
     }
 }
 
+/// 单后端化（P2.1）：按 bot 构造的 ACP 句柄对——执行层只有随包 buzz-agent，
+/// normal 与 granted（授权者受限会话）各一个**进程级**实例。
+/// granted 与 normal 只差 env：BUZZ_AGENT_NO_HINTS=1——fork 的 hints（~/AGENTS.md、
+/// ~/.agents/skills 扫盘）发生在 session/new **之前**，per-session `_meta` 管不到，
+/// 只能进程级收口（计划决策 4）。域闸/argv 白名单经 `_meta` 随会话下发（P2.2 接线
+/// dispatch 前，granted 句柄惰性待命：懒启动语义下未路由即零进程成本）。
+pub struct BotAcpHandles {
+    pub normal: Arc<crate::buzz::harness::BuzzHandle>,
+    pub granted: Arc<crate::buzz::harness::BuzzHandle>,
+}
+
 pub struct Bridge {
     pub msgr: Arc<dyn Messenger>,
     pub sessions: SessionStore,
-    /// ACP harness 句柄集（每后端一个实例：pi/buzz=buzz-agent、claude=claude-agent-acp、
-    /// codex=codex-acp；各带各的供应商 env）。dispatch 按 bot 生效后端路由——
-    /// 后端差异收敛在适配器命令与 env，桥内会话/历史/pending 语义与后端无关。
-    pub acp_handles: HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
+    /// ACP harness 句柄对（本 bot 专属，normal+granted 双实例；供应商 env 按本 bot
+    /// 装配）。None = 未装配（测试挡板/job 内部路径），dispatch 回落 spawn 同步路径——
+    /// 语义同旧「空 HashMap」。桥内会话/历史/pending 语义与句柄拓扑无关。
+    pub acp_handles: Option<BotAcpHandles>,
     /// 构造时 config 快照（buzz 预检的供应商判定源——测试可注入，生产由 service
     /// 传入运行时 config；provider 变更伴随 harness env 重装需重启，快照语义一致）。
     pub cfg_snapshot: Config,
@@ -277,7 +288,7 @@ impl Bridge {
             msgr,
             cfg_snapshot,
             sessions,
-            acp_handles: Default::default(), // service run_bot 按 bot 注入全后端句柄集
+            acp_handles: None, // service run_bot 按 bot 注入句柄对；None=未装配（测试/回落）
             turn_registry: Mutex::new(HashMap::new()), // #206 回合登记（内存态）
             vb_sessions: Mutex::new(HashMap::new()),
             jobs: JobStore::new(&bot.key()),
@@ -1278,14 +1289,11 @@ mod tests {
     }
 
     /// 测试 ACP harness：spawn tests/mock_acp_agent.py（prompt 记录到 record_file，
-    /// 回复 echo 回流），返回 (buzz 实例, 全后端句柄集)。record_file 每测唯一。
+    /// 回复 echo 回流），返回 (buzz 实例, 注入用句柄对)。record_file 每测唯一。
     fn make_test_harness(
         record_file: std::path::PathBuf,
         registry: &crate::bridge::BridgeRegistry,
-    ) -> (
-        Arc<crate::buzz::harness::BuzzHandle>,
-        std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
-    ) {
+    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
@@ -1313,11 +1321,12 @@ mod tests {
             )
         };
         let buzz = mk();
-        let mut handles = std::collections::HashMap::new();
-        handles.insert("pi".to_string(), buzz.clone());
-        handles.insert("buzz".to_string(), buzz.clone());
-        handles.insert("claude".to_string(), buzz.clone());
-        handles.insert("codex".to_string(), buzz.clone());
+        let handles = BotAcpHandles {
+            normal: buzz.clone(),
+            // 测试侧 granted 复用同一 mock 实例（2.1 无 granted 路由；单独建第二
+            // 实例只会多占一个 mock 进程而无断言价值）
+            granted: buzz.clone(),
+        };
         // 诊断探针：3s 后快照 dead 状态（spawn 失败 = dead=true），写诊断文件供测试失败信息引用
         {
             let probe = buzz.clone();
@@ -1414,12 +1423,10 @@ mod tests {
     /// 带可选 ACP harness 注入的完整构造：传 harness 后 handle 的 dispatch 分支
     /// 可达（ACP 单轨测试用）。mock agent 脚本见 tests/mock_acp_agent.py——
     /// prompt 记录到 MOCK_RECORD_FILE 供断言，回复 echo 给 harness 回流。
-    type AcpHandles = std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>;
-
     fn build_test_bridge_full(
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
-        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, AcpHandles)>,
+        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles)>,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
         // 供应商硬闸（#219）需要生效供应商：测试统一注入 test-prov（mock agent
@@ -1437,7 +1444,7 @@ mod tests {
         test_cfg.bots = vec![bot.clone()]; // provider_for_bot_key_of 按 key 找 bot
         let mut bridge = Bridge::build(msgr.clone(), bot, &test_cfg, runner);
         if let Some((_, handles)) = acp {
-            bridge.acp_handles = handles;
+            bridge.acp_handles = Some(handles);
         }
         // 按 bot key 命名（key 本身唯一），cleanup_bridge 可按 key 回收
         let key = bridge.bot.key();

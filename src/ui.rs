@@ -783,9 +783,9 @@ fn bots_struct_sig(c: &Config) -> String {
             )
         })
         .collect();
-    // 供应商入签名：harness 的供应商 env 是 service 启动快照（resolve_adapter/
-    // env_for 装配时读盘），GUI 改供应商（含补填 API Key）后必须重启才生效——
-    // Windows 实机：空 key 补填后不重启 → codex 持续报
+    // 供应商入签名：harness 的供应商 env 是 service 启动快照（run_bot 内
+    // buzz_env_for_bot 按 bot 装配时读盘），GUI 改供应商（含补填 API Key）后必须
+    // 重启才生效——Windows 实机：空 key 补填后不重启 → codex 持续报
     // `Missing environment variable: AGENT_BRIDGE_MODEL_KEY`。api_key 以 sha256
     // 摘要入签名（明文 key 绝不进字符串，它可能被日志/UI 侧读到）。
     use sha2::Digest as _;
@@ -4857,8 +4857,10 @@ pub fn run_gui() -> Result<()> {
                                         w.set_dep_detail("".into());
                                         w.set_status_is_error(false);
                                         // 装的是 ACP 适配器 → 重启 service：harness 装配是
-                                        // 启动快照，重启后 resolve_adapter 重新解析、自动切回
-                                        // 原生适配器（否则继续跑回落 buzz-agent）。
+                                        // 启动快照。单后端化（P2.1）后 harness 只消费随包
+                                        // buzz-agent（缺失时 pi-acp 兜底）——重启让新装的
+                                        // pi-acp 可被兜底解析到；claude/codex 适配器已不再
+                                        // 被 harness 消费（该安装项下架在 P4.3）。
                                         let adapter_installed = dep_id == "acp-adapters"
                                             || crate::deps::ACP_ADAPTERS
                                                 .iter()
