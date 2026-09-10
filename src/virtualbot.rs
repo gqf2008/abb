@@ -301,10 +301,23 @@ pub fn vb_dir_for(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
 /// `workspace_for` 都经它拿路径，收口在此就不会漏写（marker 判定，幂等）。
 pub fn ensure_vb_dir(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
     let dir = vb_dir_for(bot_key, chat_id)?;
-    let _ = std::fs::create_dir_all(&dir);
-    migrate_legacy_vb_data(&crate::bridge_dir(), bot_key, chat_id, &dir);
-    crate::agent::ensure_workspace_guide(&dir);
+    ensure_vb_dir_at(&crate::bridge_dir(), &dir, bot_key, chat_id);
     Some(dir)
+}
+
+/// vb 工作区的物化实现体（目录已算出）：建目录 → 存量迁移 → 写工作区指引。
+/// 与 `vb_dir_for` 的登记表查询解耦，单测可直接驱动——否则测写指引就得往用户
+/// 真实 `~/.agent-bridge/virtual-bots.json` 里插条目（整表原子重写、无锁，
+/// 与真实 GUI/事件写并发会互相覆盖；审查 P2-2）。
+pub(crate) fn ensure_vb_dir_at(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    bot_key: &str,
+    chat_id: &str,
+) {
+    let _ = std::fs::create_dir_all(dir);
+    migrate_legacy_vb_data(base, bot_key, chat_id, dir);
+    crate::agent::ensure_workspace_guide(dir);
 }
 
 /// 存量迁移（#194）：bot 级会话槽位 + 前缀匹配的历史文件搬入 vb 目录。幂等。
@@ -901,58 +914,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// P4.4 回归：`ensure_vb_dir` 是 vb 工作区（= 该群 agent 会话 cwd）的唯一物化点，
-    /// 物化后工作区指引必须就位——修复前该路径不写任何指引，fork 经 hints 读 cwd
-    /// AGENTS.md 拿不到 `$ABB_BIN` job/deliver 用法。
+    /// P4.4 回归：vb 工作区（= 该群 agent 会话 cwd）物化后，工作区指引必须就位
+    /// ——修复前该路径不写任何指引，fork 经 hints 读 cwd AGENTS.md 拿不到
+    /// `$ABB_BIN` job/deliver 用法（agent 会自造 sleep/while 循环占住聊天，期间
+    /// 该会话新消息全部排队）。
     ///
-    /// 本测试必须走真实登记表（`vb_dir_for` 经 `VirtualBotStore::new()` 解析，无注入
-    /// 缝），故用唯一 bot key + Drop 守卫：无论断言如何结束都摘登记并删工作区，不把
-    /// 测试条目留在用户真实 `virtual-bots.json` 里。
+    /// 驱动的是实现体 `ensure_vb_dir_at`（目录已给定），全程临时目录——**不碰用户
+    /// 真实的 `~/.agent-bridge/virtual-bots.json`**（那是整表原子重写、无锁，
+    /// 与 GUI/事件的并发登记会互相覆盖；审查 P2-2）。登记表查询是既有行为，
+    /// 由 vb_dir_for 既有用例覆盖。
     #[test]
     fn ensure_vb_dir_writes_workspace_guide() {
-        let bot_key = format!("abb-vbguide-{}", uuid::Uuid::new_v4());
-        let chat = "oc_vbguide";
-        let store = VirtualBotStore::new();
-        store
-            .add(VirtualBot {
-                bot_key: bot_key.clone(),
-                chat_id: chat.to_string(),
-                role_name: format!("角色{}", uuid::Uuid::new_v4()),
-                created_at: 1,
-            })
-            .expect("登记临时虚拟群");
+        let base = std::env::temp_dir().join(format!("abb-vb-guide-{}", uuid::Uuid::new_v4()));
+        let dir = base.join("workspaces").join("bot_x").join("vb").join("u1");
+        assert!(!dir.exists(), "起点不存在：连目录创建一起测");
 
-        struct Cleanup {
-            bot_key: String,
-            chat: String,
-            ws: std::path::PathBuf,
-        }
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                VirtualBotStore::new().remove(&self.bot_key, &self.chat);
-                let _ = std::fs::remove_dir_all(&self.ws);
-            }
-        }
-        let _cleanup = Cleanup {
-            bot_key: bot_key.clone(),
-            chat: chat.to_string(),
-            ws: crate::workspace_dir(&bot_key),
-        };
+        ensure_vb_dir_at(&base, &dir, "bot_x", "oc_vbguide");
 
-        let dir = ensure_vb_dir(&bot_key, chat).expect("已登记群 → 必返回 vb 目录");
-        assert_eq!(
-            dir,
-            vb_dir_for(&bot_key, chat).unwrap(),
-            "返回 vb/<uuid> 目录"
-        );
         for name in ["AGENTS.md", "CLAUDE.md"] {
             let text = std::fs::read_to_string(dir.join(name))
-                .unwrap_or_else(|e| panic!("{name} 应由 ensure_vb_dir 写出: {e}"));
+                .unwrap_or_else(|e| panic!("{name} 应由 vb 工作区物化写出: {e}"));
             assert!(
                 text.contains(crate::agent::GUIDE_MARKER),
                 "{name} 应含版本标记（fork 据此判定指引新鲜度）"
             );
             assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
         }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

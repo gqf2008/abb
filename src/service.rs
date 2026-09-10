@@ -605,6 +605,9 @@ async fn run_bot(
     // 分支）。启动即写工作区指引，保证首条消息前指引已就位——fork 经 hints 读 cwd
     // 的 AGENTS.md 才知道用 `$ABB_BIN` 建定时任务/跨会话投递（幂等 marker 判定；
     // 写失败静默：指引缺失只影响可发现性，不挡 bot 启动）。
+    // 注意：全新 bot 的 `workspaces/<key>/` 此时**还不存在**（要到下面 Bridge::new
+    // 的 SessionStore 才建），所以目录由 `ensure_workspace_guide` 自建——它不自建
+    // 的话这次写入会 NotFound 被静默吞掉（审查 P2-1，回归测试在 agent.rs）。
     crate::agent::ensure_workspace_guide(&crate::workspace_dir(&key));
     // ACP 句柄对（P2.1）：normal+granted 按本 bot 构造，env 带本 bot 供应商。
     let acp_handles = build_bot_acp_handles(&bot, &cfg, buzz_cmd.as_deref(), stop.clone());

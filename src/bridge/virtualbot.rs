@@ -1451,6 +1451,15 @@ mod tests {
     fn workspace_for_writes_guide_for_bot_level_chat() {
         let bridge = test_bridge();
         let ws = crate::workspace_dir(&bridge.bot.key());
+        // Drop 守卫：断言失败（panic）时也要清掉把 ~/.agent-bridge/workspaces/<uuid>/
+        // 删干净——函数末尾那行在 panic 路径上不会执行（审查 P3-2）。
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(ws.clone());
 
         let got = bridge.workspace_for("oc_p2p_not_registered");
         assert_eq!(got, ws, "非虚拟群会话 cwd = bot 级工作区");
@@ -1463,6 +1472,5 @@ mod tests {
             );
             assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
         }
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

@@ -43,8 +43,16 @@ pub(crate) const GUIDE_MARKER: &str = "abb-guide-v3";
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
 /// `bridge::virtualbot::Bridge::workspace_for` 与 `virtualbot::ensure_vb_dir` 在解析
 /// 会话 cwd 时各写一次——三者覆盖 agent 可能落地的全部 cwd（bot 工作区 / vb/<uuid>）。
-/// 写失败静默（指引缺失只影响可发现性，不能反过来挡住消息处理）。
+///
+/// **自建目录**：全新 bot 的 `workspaces/<key>/` 要到 `Bridge::new` 的 SessionStore
+/// 才被创建，比 `run_bot` 的启动写点**晚**——不自己建目录，那次写入会 `NotFound`
+/// 被静默吞掉，指引根本没落盘（审查 P2-1）。
+///
+/// **必须廉价**：`workspace_for` 走 p2p / 话题频道的**每条消息**路径（那两条没有
+/// 频道已登记早退），所以本函数只做「建目录 + 读两文件判 marker」，已含 marker 即
+/// 只读不写（审查 P3-1）。
 pub(crate) fn ensure_workspace_guide(workspace: &std::path::Path) {
+    let _ = std::fs::create_dir_all(workspace);
     let guide = format!(
         "# ABB 工作区（{GUIDE_MARKER}）
 
@@ -741,6 +749,26 @@ mod tests {
         assert_eq!(before, (m("CLAUDE.md"), m("AGENTS.md")));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P4.4（审查 P2-1）：工作区目录可能**还不存在**——全新 bot 的
+    /// `workspaces/<key>/` 要到 `Bridge::new` 的 SessionStore 才被创建，晚于
+    /// `run_bot` 的启动写点。写指引必须自己建目录，否则那次写入 NotFound 被
+    /// `let _ =` 静默吞掉，「首条消息前指引已就位」根本不成立。
+    #[test]
+    fn workspace_guide_creates_missing_workspace_dir() {
+        let base = std::env::temp_dir().join(format!("abb-guide-mk-{}", uuid::Uuid::new_v4()));
+        let dir = base.join("workspaces").join("bot_new");
+        assert!(!dir.exists(), "起点必须不存在（测的就是自建目录）");
+
+        ensure_workspace_guide(&dir);
+
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name} 应在自建目录里落盘: {e}"));
+            assert!(text.contains(GUIDE_MARKER), "{name} 应含版本标记");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
