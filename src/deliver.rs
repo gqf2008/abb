@@ -1573,6 +1573,25 @@ mod tests {
         assert!(source.sent.lock().unwrap()[0]
             .1
             .contains("跨会话投递未开启"));
+
+        // ③ 伪造项：开关关 + in_session 但**来源≠目标** → 仍按跨会话被开关拒。
+        //    豁免判据是 `in_session ∧ 来源==目标`；「只读裸 flag」的实现会让这条穿过去
+        //    （开关与去重一起被绕），所以这是 :238/:271/:399 三处的回归锁。
+        let mut forged = item("c", "wechat", "u3", "hi");
+        forged.source_bot = "feishu".into();
+        forged.source_chat = "c1".into();
+        forged.in_session = true;
+        router.deliver(&forged).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            1,
+            "来源≠目标的伪造 in_session 不该被投出去"
+        );
+        assert_eq!(
+            source.sent.lock().unwrap().len(),
+            2,
+            "伪造项应走跨会话判定并被开关拒（再回一条提示）"
+        );
     }
 
     /// in_session 不进防循环窗口：10 分钟内连着要两次同一个文件都应该发出去
