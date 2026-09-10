@@ -141,15 +141,27 @@ pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Re
 }
 
 /// 统一日志到 stdout（带时间戳，与 Python 版一致，落 logs/bridge.out）。
+pub fn write_log(writer: &mut dyn std::io::Write, args: std::fmt::Arguments<'_>) {
+    let _ = std::io::Write::write_fmt(
+        writer,
+        format_args!("[{}] {}\n", crate::chrono_lite::now(), args),
+    );
+}
+
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
         // windows_subsystem=windows 下无控制台时 stdout 句柄无效：println! 会 panic，
         // 这里用 write_fmt + 忽略错误，日志在无控制台时静默丢弃，重定向时照常落盘。
-        let _ = std::io::Write::write_fmt(
-            &mut std::io::stdout(),
-            format_args!("[{}] {}\n", $crate::chrono_lite::now(), format!($($arg)*)),
-        );
+        $crate::write_log(&mut std::io::stdout(), format_args!($($arg)*));
+    }};
+}
+
+/// 与 `log!` 同一格式与时间戳，但允许测试注入 writer 验证真实发射路径。
+#[macro_export]
+macro_rules! log_to {
+    ($writer:expr, $($arg:tt)*) => {{
+        $crate::write_log($writer, format_args!($($arg)*));
     }};
 }
 
