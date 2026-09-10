@@ -601,6 +601,11 @@ async fn run_bot(
         bot.kind,
         bot.bot_name
     );
+    // P4.4：bot 级工作区是非虚拟群会话的 agent cwd（`Bridge::workspace_for` 的回落
+    // 分支）。启动即写工作区指引，保证首条消息前指引已就位——fork 经 hints 读 cwd
+    // 的 AGENTS.md 才知道用 `$ABB_BIN` 建定时任务/跨会话投递（幂等 marker 判定；
+    // 写失败静默：指引缺失只影响可发现性，不挡 bot 启动）。
+    crate::agent::ensure_workspace_guide(&crate::workspace_dir(&key));
     // ACP 句柄对（P2.1）：normal+granted 按本 bot 构造，env 带本 bot 供应商。
     let acp_handles = build_bot_acp_handles(&bot, &cfg, buzz_cmd.as_deref(), stop.clone());
     // 任务族随句柄对下沉（旧 service 级任务①②）：每实例一个主循环（agent 懒启动 +

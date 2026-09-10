@@ -35,16 +35,15 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// **立即退出**，别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。
 /// 版本化（GUIDE_MARKER）：老工作区里无标记的旧模板（写死 `agent-bridge job`、实际在
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
-// P4.1：唯一生产调用点（旧 agent::run）已删；P4.4 待把写指引接进 harness dispatch 路径
-// （buzz fork 经 hints 读 cwd AGENTS.md，缺指引 = $ABB_BIN job 用法无人告知）。
-#[allow(dead_code)]
-const GUIDE_MARKER: &str = "abb-guide-v3";
+// P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
+// 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v3";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
-/// P4.1 起生产无调用点（旧 agent::run 已删）——**P4.4 待办**：接进 harness dispatch
-/// 路径（service bot 启动写 bot 级 + buzz dispatch 懒建写 vb 工作区），恢复
-/// `$ABB_BIN` job 用法指引。当前仅测试调用。
-#[allow(dead_code)]
+/// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
+/// `bridge::virtualbot::Bridge::workspace_for` 与 `virtualbot::ensure_vb_dir` 在解析
+/// 会话 cwd 时各写一次——三者覆盖 agent 可能落地的全部 cwd（bot 工作区 / vb/<uuid>）。
+/// 写失败静默（指引缺失只影响可发现性，不能反过来挡住消息处理）。
 pub(crate) fn ensure_workspace_guide(workspace: &std::path::Path) {
     let guide = format!(
         "# ABB 工作区（{GUIDE_MARKER}）
