@@ -360,6 +360,24 @@ pub fn read_attachment_bytes(meta: &AttachmentMeta) -> Result<Vec<u8>> {
     if meta.path.is_empty() {
         anyhow::bail!("附件没有本地路径（{}），无法上传发送", meta.file_name);
     }
+    // 只接受普通文件：`/dev/zero`、FIFO、字符设备等 metadata().len() 常为 0 却能
+    // 无限读出，`fs::read` 会挂死或吃爆内存（审查 #254）。
+    // 报错文案与旧的直接 `fs::read` 失败同款（既有测试/用户提示都按这串文案认）。
+    let md = std::fs::metadata(&meta.path)
+        .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
+    if !md.is_file() {
+        anyhow::bail!("附件不是普通文件，拒绝上传发送: {}", meta.path);
+    }
+    // 兜底上限：调用方已按目的地平台预检过，这里保证**任何**入口都不会把超大对象
+    // 整读进内存（不能只依赖调用方记得预检——审查 #254）。
+    if md.len() > MAX_ATTACHMENT_BYTES as u64 {
+        anyhow::bail!(
+            "附件过大（{} MB > 本地 {} MB 读取上限），拒绝上传发送: {}",
+            md.len() / (1024 * 1024),
+            MAX_ATTACHMENT_BYTES / (1024 * 1024),
+            meta.path
+        );
+    }
     let bytes = std::fs::read(&meta.path)
         .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
     if bytes.is_empty() {
@@ -607,5 +625,65 @@ mod tests {
         };
         let e = read_attachment_bytes(&meta).unwrap_err();
         assert!(e.to_string().contains("空文件"), "{e:#}");
+    }
+
+    /// 审查 #254 P3-2①：非普通文件（字符设备/FIFO/目录）`len()` 常为 0 却能无限
+    /// 读出，必须在读之前按 `metadata().is_file()` 拦下——否则 `/dev/zero` 会挂死
+    /// 或吃爆内存，而且错误信息还会误报成「空文件」。
+    #[test]
+    fn read_attachment_bytes_rejects_non_regular_file() {
+        let dir = std::env::temp_dir().join(format!("abb-read-nonfile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "weird".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: dir.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("不是普通文件"), "目录应被拒: {e:#}");
+        #[cfg(unix)]
+        {
+            // /dev/null 是字符设备：旧实现会读成空 → 误报「空文件」
+            meta.path = "/dev/null".into();
+            let e = read_attachment_bytes(&meta).unwrap_err();
+            assert!(
+                e.to_string().contains("不是普通文件"),
+                "设备文件应被拒: {e:#}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审查 #254 P3-2②：读之前自己有体积兜底（不能只依赖调用方预检）——稀疏文件
+    /// 一步 set_len 就能造出超大 len 而不占盘。
+    #[test]
+    fn read_attachment_bytes_rejects_over_hard_cap() {
+        let dir = std::env::temp_dir().join(format!("abb-read-big-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_ATTACHMENT_BYTES as u64 + 1).unwrap();
+        drop(f);
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "huge.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: path.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(
+            e.to_string().contains("附件过大"),
+            "超过本地读取上限应被拒: {e:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

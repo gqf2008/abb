@@ -322,6 +322,18 @@ impl Router {
             }
         }
         if !failed.is_empty() {
+            // 只列前 3 条：附件多时全量拼接会顶爆平台单条文本上限，导致这条
+            // **失败提示本身**发不出去，用户反而什么都收不到（审查 #254 P3-5）。
+            let mut detail = failed
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("；");
+            let rest = failed.len().saturating_sub(3);
+            if rest > 0 {
+                detail.push_str(&format!(" 等 {rest} 个"));
+            }
             self.notify_source(
                 item,
                 &format!(
@@ -329,7 +341,7 @@ impl Router {
                     item.target_bot,
                     failed.len(),
                     item.attachments.len(),
-                    failed.join("；")
+                    detail
                 ),
             )
             .await;
@@ -921,14 +933,26 @@ mod tests {
     /// 测试假 messenger：记录发送，可配置失败。
     struct FakeMsgr {
         sent: Mutex<Vec<(String, String)>>,
+        /// 真正走到 `send_attachment` 的附件（（chat_id, 文件名））。必须覆盖该
+        /// 方法而不是依赖默认实现——逐件成败/指纹不污染这两条新语义只有能让
+        /// 附件失败才测得出来（审查 #254 P2-1）。
+        attachments: Mutex<Vec<(String, String)>>,
         fail: AtomicBool,
+        /// 命中这些文件名的附件发送失败（空 = 全部成功）。
+        fail_attachments: Mutex<Vec<String>>,
     }
     impl FakeMsgr {
         fn new() -> FakeMsgr {
             FakeMsgr {
                 sent: Mutex::new(Vec::new()),
+                attachments: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
+                fail_attachments: Mutex::new(Vec::new()),
             }
+        }
+        /// 让指定文件名的附件发送失败。
+        fn fail_attachment(&self, name: &str) {
+            self.fail_attachments.lock().unwrap().push(name.to_string());
         }
     }
     #[async_trait]
@@ -942,6 +966,40 @@ mod tests {
                 .unwrap()
                 .push((chat_id.to_string(), text.to_string()));
             Ok(())
+        }
+        async fn send_attachment(
+            &self,
+            chat_id: &str,
+            meta: &crate::attachments::AttachmentMeta,
+        ) -> Result<()> {
+            if self
+                .fail_attachments
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == &meta.file_name)
+            {
+                anyhow::bail!("模拟附件发送失败: {}", meta.file_name);
+            }
+            self.attachments
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), meta.file_name.clone()));
+            Ok(())
+        }
+    }
+
+    /// 最小附件元数据（只有 send_attachment / 指纹关心的字段）。
+    fn attach(name: &str) -> crate::attachments::AttachmentMeta {
+        crate::attachments::AttachmentMeta {
+            kind: "file".into(),
+            source: "deliver".into(),
+            file_name: name.into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            path: format!("/tmp/{name}"),
+            sha256: format!("sha-{name}"),
+            note: String::new(),
         }
     }
 
@@ -1140,28 +1198,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_sends_attachment_meta() {
+    async fn router_sends_attachments_through_send_attachment() {
         let (router, target, _source) = router_with(true, None);
         let mut d = item("a", "wechat", "u1", "看附件");
-        d.attachments.push(crate::attachments::AttachmentMeta {
-            kind: "image".into(),
-            source: "deliver".into(),
-            file_name: "pic.png".into(),
-            mime: "image/png".into(),
-            size: 13,
-            path: "/tmp/pic.png".into(),
-            sha256: "ab".into(),
-            note: String::new(),
-        });
+        d.attachments.push(attach("pic.png"));
         router.deliver(&d).await;
-        let sent = target.sent.lock().unwrap();
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0], ("u1".to_string(), "看附件".to_string()));
-        assert!(
-            sent[1].1.contains("pic.png"),
-            "附件元数据应随文本发出: {}",
-            sent[1].1
+        {
+            let sent = target.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1, "文本照发");
+            assert_eq!(sent[0], ("u1".to_string(), "看附件".to_string()));
+        }
+        assert_eq!(
+            target.attachments.lock().unwrap().clone(),
+            vec![("u1".to_string(), "pic.png".to_string())],
+            "附件必须走 send_attachment 真发送，而非文本元数据降级"
         );
+    }
+
+    /// P2-1①：一件失败不得连坐吞掉后面的附件（旧「首败即 return」会把同一次
+    /// 投递里其余本可送达的附件全丢）。
+    #[tokio::test]
+    async fn router_keeps_sending_after_one_attachment_fails() {
+        let (router, target, source) = router_with(true, None);
+        target.fail_attachment("bad.png");
+        let mut d = item("a", "wechat", "u1", "");
+        d.source_bot = "feishu".into();
+        d.source_chat = "c1".into();
+        d.attachments = vec![attach("bad.png"), attach("ok.png")];
+        router.deliver(&d).await;
+        assert_eq!(
+            target.attachments.lock().unwrap().clone(),
+            vec![("u1".to_string(), "ok.png".to_string())],
+            "首个失败后，后续附件仍须投递"
+        );
+        let src = source.sent.lock().unwrap();
+        assert_eq!(src.len(), 1, "失败必须回源提示");
+        assert!(
+            src[0].1.contains("1/2 个附件发送失败") && src[0].1.contains("bad.png"),
+            "回源要说明几件失败、哪件: {}",
+            src[0].1
+        );
+    }
+
+    /// P2-1②：部分失败**不登记**防循环指纹——否则 10 分钟内的合法重试会被
+    /// 「防循环」挡掉，失败那件永远补不回来。
+    #[tokio::test]
+    async fn router_partial_failure_leaves_retry_window_open() {
+        let (router, target, source) = router_with(true, None);
+        target.fail_attachment("bad.png");
+        let mut d = item("a", "wechat", "u1", "");
+        d.source_bot = "feishu".into();
+        d.source_chat = "c1".into();
+        d.attachments = vec![attach("bad.png")];
+        router.deliver(&d).await;
+        assert!(target.attachments.lock().unwrap().is_empty());
+        // 用户重试（同来源/目标/文本/附件指纹）：必须真的再投一次
+        target.fail_attachments.lock().unwrap().clear();
+        router.deliver(&d).await;
+        assert_eq!(
+            target.attachments.lock().unwrap().len(),
+            1,
+            "部分失败后同指纹重试不得被防循环拦"
+        );
+        assert!(
+            !source
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, t)| t.contains("防循环")),
+            "失败投递不得占用防循环槽位"
+        );
+    }
+
+    /// P2-1③：全部成功才登记指纹——同指纹再来一次被防循环拦下。
+    #[tokio::test]
+    async fn router_all_success_marks_fingerprint() {
+        let (router, target, source) = router_with(true, None);
+        let mut d = item("a", "wechat", "u1", "");
+        d.source_bot = "feishu".into();
+        d.source_chat = "c1".into();
+        d.attachments = vec![attach("ok.png")];
+        router.deliver(&d).await;
+        router.deliver(&d).await;
+        assert_eq!(
+            target.attachments.lock().unwrap().len(),
+            1,
+            "全成功后同指纹应被防循环拦"
+        );
+        assert!(source.sent.lock().unwrap()[0].1.contains("防循环"));
     }
 
     #[tokio::test]
@@ -1212,7 +1337,11 @@ mod tests {
         d2.attachments.push(meta("sha2"));
         router.deliver(&d1).await;
         router.deliver(&d2).await;
-        assert_eq!(target.sent.lock().unwrap().len(), 2);
+        assert_eq!(
+            target.attachments.lock().unwrap().len(),
+            2,
+            "不同附件（sha256 不同）不得被防循环误判为重复"
+        );
     }
 
     #[tokio::test]

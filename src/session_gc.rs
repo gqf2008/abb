@@ -639,6 +639,14 @@ mod tests {
         async fn send_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        /// 归纳流程不发附件（trait 无默认实现——审查 #254 P2-2）。
+        async fn send_attachment(
+            &self,
+            _chat_id: &str,
+            _meta: &crate::attachments::AttachmentMeta,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     /// 挡板归纳执行器：summarize 立即返回固定回复（Some）或报错（None）。

@@ -529,6 +529,20 @@ pub fn is_group_chat(chat_id: &str) -> bool {
     chat_id.starts_with("cid")
 }
 
+/// 钉钉群图片可上传的扩展名（与飞书 images 端点同表）。`kind_from_name` 会把
+/// svg/ico/heic 这类也归成 image，但钉钉按后缀/内容校验格式，必被服务端拒——
+/// 在能力闸（`messenger::dingtalk_can_send`）就拦下，别把服务端原始错误丢给用户
+/// （审查 #254 P2-3）。
+pub fn dingtalk_image_uploadable(file_name: &str) -> bool {
+    matches!(
+        file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+    )
+}
+
 /// 一条待下载的钉钉附件引用（picture/file/audio/video/富文本图片）。
 #[derive(Debug, Clone)]
 pub struct DingtalkAttachment {
@@ -1463,8 +1477,15 @@ mod tests {
             .find(|r| r.path == "/v1.0/robot/groupMessages/send")
             .expect("应有群图片发送请求");
         assert_eq!(msg.method, "POST");
-        // 注：x-acs-dingtalk-access-token 鉴权头不被 test_mock 记录（只记 authorization），
-        // 请求体形状在此锁定；鉴权注入与 send_group/send_single 同实现。
+        // 鉴权头也锁住（审查 #254 P3-4）：钉钉用 x-acs-dingtalk-access-token 而非
+        // Authorization，test_mock 的 headers 表已能记到——漏带/写错头会在这红。
+        assert_eq!(
+            msg.headers
+                .get("x-acs-dingtalk-access-token")
+                .map(String::as_str),
+            Some("dt-mock-token"),
+            "必须带钉钉 access token 鉴权头"
+        );
         let body: Value = serde_json::from_str(&msg.body).unwrap();
         assert_eq!(body["robotCode"], "ding123");
         assert_eq!(body["openConversationId"], "cidAsXSBLnA==");

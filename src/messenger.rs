@@ -29,9 +29,56 @@ pub(crate) fn feishu_send_plan(meta: &crate::attachments::AttachmentMeta) -> Fei
     }
 }
 
-/// 钉钉附件能力闸（纯函数）：当前仅「群聊 + 图片」。判前于读文件（省大 IO）。
+/// 钉钉群图片可上传的扩展名清单（与飞书同表；钉钉按后缀/内容校验格式）。
+pub(crate) const DINGTALK_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// 钉钉附件能力闸（纯函数）：当前仅「群聊 + 可上传后缀的图片」。判前于读文件
+/// （省大 IO）。后缀白名单不可省——`kind_from_name` 把 svg/ico/heic 也归成
+/// image，只判 kind 会让它们过闸后被服务端格式校验拒，用户只能看到原始报错
+/// （审查 #254 P2-3）。
 pub(crate) fn dingtalk_can_send(meta: &crate::attachments::AttachmentMeta, chat_id: &str) -> bool {
-    meta.kind == "image" && crate::dingtalk::is_group_chat(chat_id)
+    meta.kind == "image"
+        && crate::dingtalk::is_group_chat(chat_id)
+        && crate::dingtalk::dingtalk_image_uploadable(&attachment_upload_name(meta))
+}
+
+/// 上传时用的文件名（审查 #254 P3-1）：先取 meta.file_name，空则取本地路径的
+/// basename，再空则按 mime/kind 造一个**带后缀**的占位名。绝不能退化成无扩展名的
+/// 字面量——飞书 `file_type` 映射与 images 端点、钉钉 upload 都按后缀校验格式，
+/// 无后缀必被服务端拒（入站 meta 的 file_name 存在为空的分支）。
+pub(crate) fn attachment_upload_name(meta: &crate::attachments::AttachmentMeta) -> String {
+    if !meta.file_name.is_empty() {
+        return meta.file_name.clone();
+    }
+    let base = std::path::Path::new(&meta.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !base.is_empty() {
+        return base;
+    }
+    let ext = match meta
+        .mime
+        .rsplit_once('/')
+        .map(|(_, sub)| sub.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "png",
+        Some("jpeg") | Some("jpg") => "jpg",
+        Some("gif") => "gif",
+        Some("webp") => "webp",
+        Some("bmp") => "bmp",
+        Some("pdf") => "pdf",
+        Some("plain") => "txt",
+        _ => {
+            if meta.kind == "image" {
+                "png"
+            } else {
+                "bin"
+            }
+        }
+    };
+    format!("attachment.{ext}")
 }
 
 /// 引用消息的原始内容（附件尚未下载；`attachments` 是各通道的附件描述，供
@@ -127,28 +174,17 @@ pub trait Messenger: Send + Sync {
         None
     }
 
-    /// 发送一个已保存附件（#21 附件跨投递）。默认实现只发文本元数据——接收端按能力处理：
-    /// 跨 bot 同机运行时本地路径可读，接收端 agent/用户可按路径取用；各平台按能力覆盖为真图/真文件。
+    /// 发送一个已保存附件（#21 附件跨投递；#253 起要求**真发送**）。
+    ///
+    /// **必填，无默认实现**——历史默认实现是把「📎 … 本地路径=…」当文本发出去并返回
+    /// Ok：投递方以为附件送达、deliver 也报「已送达」，收件人实际只拿到一串自己机器
+    /// 上不存在的路径。移除默认实现让「本平台不支持附件」只能显式表达（`bail!`），
+    /// 不可能再被静默继承（审查 #254 P2-2）。
     async fn send_attachment(
         &self,
         chat_id: &str,
         meta: &crate::attachments::AttachmentMeta,
-    ) -> Result<()> {
-        let mut s = format!(
-            "📎 [{}] 文件名={} mime={} 大小={}",
-            meta.kind, meta.file_name, meta.mime, meta.size
-        );
-        if !meta.path.is_empty() {
-            s.push_str(&format!(" 本地路径={}", meta.path));
-        }
-        if !meta.sha256.is_empty() {
-            s.push_str(&format!(" sha256={}", meta.sha256));
-        }
-        if !meta.note.is_empty() {
-            s.push_str(&format!(" 备注={}", meta.note));
-        }
-        self.send_text(chat_id, &s).await
-    }
+    ) -> Result<()>;
 }
 
 /// 飞书实现：委托 FeishuClient，表情走 reactions。
@@ -256,11 +292,7 @@ impl Messenger for FeishuMessenger {
         // 不再给用户塞「带本地路径的文本元数据」。失败原样上报（deliver 回源提示）。
         // 分发决策在纯函数 feishu_send_plan（单测钉死）；上传带真实文件名（服务端
         // 按后缀校验格式，审查 #254）。
-        let name = if meta.file_name.is_empty() {
-            "attachment"
-        } else {
-            meta.file_name.as_str()
-        };
+        let name = attachment_upload_name(meta);
         match feishu_send_plan(meta) {
             FeishuSendPlan::Image => {
                 crate::attachments::check_sendable_size(
@@ -268,7 +300,7 @@ impl Messenger for FeishuMessenger {
                     crate::attachments::FEISHU_IMAGE_MAX_BYTES,
                 )?;
                 let bytes = crate::attachments::read_attachment_bytes(meta)?;
-                let key = self.fs.upload_image(bytes, name).await?;
+                let key = self.fs.upload_image(bytes, &name).await?;
                 self.fs.send_media_message(chat_id, "image", &key).await
             }
             FeishuSendPlan::File(ft) => {
@@ -277,7 +309,7 @@ impl Messenger for FeishuMessenger {
                     crate::attachments::FEISHU_FILE_MAX_BYTES,
                 )?;
                 let bytes = crate::attachments::read_attachment_bytes(meta)?;
-                let key = self.fs.upload_file(ft, name, bytes).await?;
+                let key = self.fs.upload_file(ft, &name, bytes).await?;
                 self.fs.send_media_message(chat_id, "file", &key).await
             }
         }
@@ -339,6 +371,21 @@ impl WeixinMessenger {
 
 #[async_trait::async_trait]
 impl Messenger for WeixinMessenger {
+    /// 微信附件外发未实现（#253 一期）：显式报错，**不**走 trait 默认的「文本元数据」
+    /// 降级——那串带本地路径的文本对微信里的真人收件人毫无用处，却让 deliver 把
+    /// 失败报成「其余内容已送达」（审查 #254 P2-2）。
+    async fn send_attachment(
+        &self,
+        _chat_id: &str,
+        meta: &crate::attachments::AttachmentMeta,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "微信会话外发附件尚未实现（kind={} 文件={}）：当前仅飞书/钉钉支持真发送，待 #253 后续补",
+            meta.kind,
+            meta.file_name
+        )
+    }
+
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
         let token = self.ctx.lock().unwrap().get(chat_id).cloned();
         let ctx = token.ok_or_else(|| {
@@ -479,9 +526,10 @@ impl Messenger for DingTalkMessenger {
         // 能力闸**先于读文件**（审查 #254：不支持的组合曾把 100MB 整读进内存再丢）。
         if !dingtalk_can_send(meta, chat_id) {
             anyhow::bail!(
-                "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊图片；文件/语音/单聊媒体待 #253 后续补",
+                "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊 {exts} 图片；文件/语音/单聊媒体待 #253 后续补",
                 meta.kind,
-                if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" }
+                if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" },
+                exts = DINGTALK_IMAGE_EXTS.join("/")
             )
         }
         crate::attachments::check_sendable_size(
@@ -489,12 +537,8 @@ impl Messenger for DingTalkMessenger {
             crate::attachments::DINGTALK_IMAGE_MAX_BYTES,
         )?;
         let bytes = crate::attachments::read_attachment_bytes(meta)?;
-        let name = if meta.file_name.is_empty() {
-            "attachment"
-        } else {
-            meta.file_name.as_str()
-        };
-        let media_id = self.dt.upload_image(bytes, name).await?;
+        let name = attachment_upload_name(meta);
+        let media_id = self.dt.upload_image(bytes, &name).await?;
         self.dt
             .send_group_image(chat_id, &self.robot_code, &media_id)
             .await
@@ -639,7 +683,50 @@ mod tests {
     fn dingtalk_gate_group_image_only() {
         // 群 openConversationId 恒以 cid 开头（模块头约定）
         assert!(dingtalk_can_send(&meta("image", "a.png"), "cidAsXB=="));
+        assert!(dingtalk_can_send(&meta("image", "a.JPG"), "cidAsXB=="));
         assert!(!dingtalk_can_send(&meta("image", "a.png"), "staff_123"));
         assert!(!dingtalk_can_send(&meta("file", "a.pdf"), "cidAsXB=="));
+        // 同飞书：kind=image 但服务端格式校验必拒的后缀在能力闸就拦下
+        // （审查 #254 P2-3——旧闸只判 kind，svg 会过闸后被服务端拒）
+        for bad in ["logo.svg", "app.ico", "photo.heic", "noext"] {
+            assert!(
+                !dingtalk_can_send(&meta("image", bad), "cidAsXB=="),
+                "{bad} 不应过钉钉图片闸"
+            );
+        }
+    }
+
+    /// P3-1：上传文件名绝不能是无扩展名的字面量——file_name 为空时取路径
+    /// basename，再空则按 mime/kind 造带后缀的名字。
+    #[test]
+    fn attachment_upload_name_never_loses_extension() {
+        assert_eq!(attachment_upload_name(&meta("image", "pic.png")), "pic.png");
+        let mut m = meta("image", "");
+        m.path = "/tmp/收件箱/shot.JPEG".into();
+        assert_eq!(
+            attachment_upload_name(&m),
+            "shot.JPEG",
+            "空文件名取路径 basename"
+        );
+        let mut m = meta("file", "");
+        m.path = String::new();
+        m.mime = "application/pdf".into();
+        assert_eq!(
+            attachment_upload_name(&m),
+            "attachment.pdf",
+            "末路按 mime 补后缀"
+        );
+        let mut m = meta("image", "");
+        m.path = String::new();
+        m.mime = String::new();
+        assert_eq!(
+            attachment_upload_name(&m),
+            "attachment.png",
+            "image 兜底 png"
+        );
+        let mut m = meta("file", "");
+        m.path = String::new();
+        m.mime = String::new();
+        assert_eq!(attachment_upload_name(&m), "attachment.bin", "其它兜底 bin");
     }
 }

@@ -537,21 +537,23 @@ impl FeishuClient {
             json!({ "file_key": key })
         };
         let token = self.tenant_token().await?;
-        let resp: serde_json::Value = self
-            .http
-            .post(self.url("/im/v1/messages?receive_id_type=chat_id"))
-            .bearer_auth(&token)
-            .json(&json!({
-                "receive_id": chat_id,
-                "msg_type": msg_type,
-                "content": serde_json::to_string(&content)?,
-            }))
-            .send()
-            .await
-            .context("飞书媒体消息发送网络错误")?
-            .json()
-            .await
-            .context("飞书媒体消息响应非 JSON")?;
+        // 与上传路径同款 `api_json`：网关 5xx/限流返回 HTML 时也要保住 HTTP 状态码，
+        // 不能塌成「响应非 JSON」（审查 #254 P2-5：同一条意见原先只修了上传两处）。
+        let resp = Self::api_json(
+            self.http
+                .post(self.url("/im/v1/messages?receive_id_type=chat_id"))
+                .bearer_auth(&token)
+                .json(&json!({
+                    "receive_id": chat_id,
+                    "msg_type": msg_type,
+                    "content": serde_json::to_string(&content)?,
+                }))
+                .send()
+                .await
+                .context("飞书媒体消息发送网络错误")?,
+            "飞书媒体消息发送",
+        )
+        .await?;
         if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
             anyhow::bail!(
                 "飞书媒体消息发送失败 code={:?} msg={:?}",
@@ -1485,6 +1487,9 @@ pub(crate) mod test_mock {
         pub query: String,
         /// Authorization 头值（无则为空）。
         pub auth: String,
+        /// 其余请求头（名小写 → 原值）。钉钉用 `x-acs-dingtalk-access-token`
+        /// 而不是 Authorization，靠这张表才能断言鉴权头（审查 #254 P3-4）。
+        pub headers: HashMap<String, String>,
         /// 请求体（按 Content-Length 精确读）。
         pub body: String,
     }
@@ -1549,6 +1554,7 @@ pub(crate) mod test_mock {
                             };
                             let mut content_length = 0usize;
                             let mut auth = String::new();
+                            let mut headers: HashMap<String, String> = HashMap::new();
                             for l in lines {
                                 if let Some((k, v)) = l.split_once(": ") {
                                     let k = k.to_ascii_lowercase();
@@ -1557,6 +1563,7 @@ pub(crate) mod test_mock {
                                     } else if k == "authorization" {
                                         auth = v.to_string();
                                     }
+                                    headers.insert(k, v.to_string());
                                 }
                             }
                             if body.len() < content_length {
@@ -1573,6 +1580,7 @@ pub(crate) mod test_mock {
                                 path: path.clone(),
                                 query,
                                 auth,
+                                headers,
                                 body: String::from_utf8_lossy(&body).into_owned(),
                             });
                             // 按 (method, path) 查预置响应；未命中 → 假 code=404，

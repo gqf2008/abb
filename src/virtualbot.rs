@@ -719,6 +719,14 @@ mod tests {
         async fn send_text(&self, _chat_id: &str, _text: &str) -> Result<()> {
             Ok(())
         }
+        /// 本挡板只服务 chat-info 缓存（trait 无默认实现——审查 #254 P2-2）。
+        async fn send_attachment(
+            &self,
+            _chat_id: &str,
+            _meta: &crate::attachments::AttachmentMeta,
+        ) -> Result<()> {
+            Ok(())
+        }
         async fn get_chat_info(&self, _chat_id: &str) -> Option<(String, String)> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.info.lock().unwrap().clone()
