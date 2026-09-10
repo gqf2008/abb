@@ -28,7 +28,7 @@ fn bundled_buzz_agent() -> Option<String> {
 /// ① `config.buzz_agent_exe` 覆盖（绝对路径是文件 → 直用；否则按 PATH 探测）——
 ///    开发机指自己 build 的 fork、也作装了原生适配器的用户的逃生阀；
 /// ② 主程序同目录随包 `buzz-agent[.exe]`；
-/// ③ 都没有 → None（build_bot_acp_handles 回落 pi-acp 兜底）。
+/// ③ 都没有 → None（调用方回落 PATH `pi-acp` 兜底）。
 /// 覆盖配了但找不到 → 告警并落回 ②（宁可用随包版也不要起不来的进程）。
 fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
     if !override_exe.trim().is_empty() {
@@ -45,6 +45,22 @@ fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
         );
     }
     bundled_buzz_agent()
+}
+
+/// 无随包时解析 `pi-acp` 的最终命令。Windows 上 npm 生成的是 `.cmd` shim，
+/// CreateProcess 裸名只试 `.exe`；`find_in_path` 命中后必须传全路径（#246④）。
+fn resolve_acp_command_with(
+    buzz_cmd: Option<&str>,
+    find_pi_acp: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> String {
+    buzz_cmd
+        .map(str::to_string)
+        .or_else(|| find_pi_acp().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "pi-acp".to_string())
+}
+
+fn resolve_acp_command(buzz_cmd: Option<&str>) -> String {
+    resolve_acp_command_with(buzz_cmd, || crate::deps::find_in_path("pi-acp"))
 }
 
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
@@ -143,11 +159,9 @@ fn build_bot_acp_handles(
     buzz_cmd: Option<&str>,
     stop: tokio_util::sync::CancellationToken,
 ) -> crate::bridge::BotAcpHandles {
-    // 开发/自签构建无随包 → pi-acp 兜底（装 pi-acp 的开发机可起；都没有则 spawn
-    // 失败 → AgentDown，如实可见）
-    let command = buzz_cmd
-        .map(str::to_string)
-        .unwrap_or_else(|| "pi-acp".to_string());
+    // 开发/自签构建无随包 → PATH pi-acp 全路径兜底（Windows .cmd shim 不能裸名 spawn；
+    // 都没装则保留裸名，spawn 失败 → AgentDown，如实可见，见 #246④）。
+    let command = resolve_acp_command(buzz_cmd);
     let env = buzz_env_for_bot(bot, cfg);
     let cwd = std::env::current_dir()
         .unwrap_or_default()
@@ -199,7 +213,7 @@ pub(crate) fn oneshot_agent_config(
     // 命令解析与 build_bot_acp_handles 同链（覆盖指错告警一回/调用——gc 是
     // 日频任务，GUI 是低频点击，重复解析可接受）。
     let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
-    let command = buzz_cmd.unwrap_or_else(|| "pi-acp".to_string());
+    let command = resolve_acp_command(buzz_cmd.as_deref());
     let env = buzz_env_for_bot(bot, cfg);
     crate::buzz::harness::AgentConfig {
         command,
@@ -260,7 +274,7 @@ pub async fn run() {
     // 装配零等待（不 spawn 进程、不碰盘）——handle 同步可得，无启动竞态；agent
     // 懒启动 + 崩溃退避重拉（harness 内闭环），启动失败只影响本 bot 的 ACP 频道。
     // 命令解析每进程一次（buzz_agent_exe 指错只告警一回）；None = 开发/自签构建
-    // 无随包 → run_bot 内落 pi-acp 兜底（build_injection(Buzz) 臂 env，旧语义）。
+    // 无随包 → run_bot 内落 PATH pi-acp 全路径兜底（Windows .cmd shim 见 #246④）。
     let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
@@ -452,7 +466,7 @@ pub async fn run() {
         let stop = crate::tasks::shutdown_token();
         let router = router.clone();
         // ACP 执行层命令（随包 buzz-agent；None=开发/自签无随包 → run_bot 内落
-        // pi-acp 兜底）。句柄对按 bot 在 run_bot 内构造（P2.1）。
+        // PATH pi-acp 全路径兜底）。句柄对按 bot 在 run_bot 内构造（P2.1）。
         let buzz_cmd = buzz_cmd.clone();
         // #206：回合投递路由注册表（全部 bot 共享同一份）
         let registry = bridge_registry.clone();
@@ -592,7 +606,7 @@ async fn run_bot(
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
-    buzz_cmd: Option<String>, // ACP 执行层命令（None=无随包 → pi-acp 兜底）
+    buzz_cmd: Option<String>, // ACP 执行层命令（None=无随包 → PATH pi-acp 全路径兜底）
     bridge_registry: crate::bridge::BridgeRegistry, // #206：回合投递路由用
 ) {
     let key = bot.key();
@@ -1472,6 +1486,45 @@ mod tests {
         // ③ 空覆盖 = 纯随包链
         assert_eq!(resolve_buzz_agent(""), bundled_buzz_agent());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn acp_fallback_prefers_full_pi_acp_path() {
+        let full = std::path::PathBuf::from(r"C:\Users\me\AppData\Roaming\npm\pi-acp.cmd");
+        let mut looked_up = false;
+        assert_eq!(
+            resolve_acp_command_with(Some("buzz-agent"), || {
+                looked_up = true;
+                Some(full.clone())
+            }),
+            "buzz-agent",
+            "随包 buzz-agent 优先于 pi-acp 兜底"
+        );
+        assert!(
+            !looked_up,
+            "已有 buzz-agent 时不得探测 pi-acp（Windows 会走同步注册表）"
+        );
+
+        let mut looked_up = false;
+        assert_eq!(
+            resolve_acp_command_with(None, || {
+                looked_up = true;
+                Some(full.clone())
+            }),
+            full.display().to_string(),
+            "Windows .cmd shim 必须传 PATH 命中的全路径，不能裸名 spawn"
+        );
+        assert!(looked_up, "无 buzz-agent 时必须探测 pi-acp");
+
+        let mut looked_up = false;
+        assert_eq!(
+            resolve_acp_command_with(None, || {
+                looked_up = true;
+                None
+            }),
+            "pi-acp"
+        );
+        assert!(looked_up, "pi-acp 缺失时也要完成一次探测");
     }
 
     /// 回归（P2.1 结构消灭的串台）：旧 service 级共享句柄集的 env_for 取**第一个
