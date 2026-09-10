@@ -312,15 +312,22 @@ impl Router {
                     meta.file_name
                 );
                 // 单条错误串也截断：平台返回的超长错误体若原样带上，3 条一样会顶爆
-                // 平台单条文本上限（审查 #254 复核 N4）。
+                // 平台单条文本上限（审查 #254 复核 N4）。按字符截断（可能含中文），
+                // 被截时补省略号，免得文案看起来像正常结束。完整错误已进上面的日志。
+                let detail = format!("{e:#}");
+                let brief = crate::agent::truncate(&detail, 160);
+                let brief = if brief.chars().count() < detail.chars().count() {
+                    format!("{brief}…")
+                } else {
+                    brief
+                };
                 failed.push(format!(
-                    "{}（{}）",
+                    "{}（{brief}）",
                     if meta.file_name.is_empty() {
                         "未命名附件"
                     } else {
                         meta.file_name.as_str()
-                    },
-                    crate::agent::truncate(&format!("{e:#}"), 160)
+                    }
                 ));
             }
         }

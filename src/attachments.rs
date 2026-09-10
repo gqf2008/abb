@@ -648,7 +648,7 @@ mod tests {
     fn read_attachment_bytes_rejects_non_regular_file() {
         let dir = std::env::temp_dir().join(format!("abb-read-nonfile-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut meta = AttachmentMeta {
+        let meta = AttachmentMeta {
             kind: "file".into(),
             source: "feishu".into(),
             file_name: "weird".into(),
@@ -662,9 +662,14 @@ mod tests {
         assert!(e.to_string().contains("不是普通文件"), "目录应被拒: {e:#}");
         #[cfg(unix)]
         {
-            // /dev/null 是字符设备：旧实现会读成空 → 误报「空文件」
-            meta.path = "/dev/null".into();
-            let e = read_attachment_bytes(&meta).unwrap_err();
+            // /dev/null 是字符设备：旧实现会读成空 → 误报「空文件」。
+            // 单独克隆一份而不是 `mut` + 改字段——`mut` 只在 cfg(unix) 分支里被用到，
+            // Windows clippy `-D warnings` 会因此报 unused_mut（本机 macOS 门禁看不到）。
+            let dev = AttachmentMeta {
+                path: "/dev/null".into(),
+                ..meta.clone()
+            };
+            let e = read_attachment_bytes(&dev).unwrap_err();
             assert!(
                 e.to_string().contains("不是普通文件"),
                 "设备文件应被拒: {e:#}"
@@ -675,6 +680,10 @@ mod tests {
 
     /// 审查 #254 P3-2②：读之前自己有体积兜底（不能只依赖调用方预检）——稀疏文件
     /// 一步 set_len 就能造出超大 len 而不占盘。
+    ///
+    /// 限 unix：NTFS 的 `SetEndOfFile` 不保证留稀疏，Windows CI 上可能真写 200MB
+    /// 零页（慢且吃盘）。上限逻辑本身与平台无关。
+    #[cfg(unix)]
     #[test]
     fn read_attachment_bytes_rejects_over_hard_cap() {
         let dir = std::env::temp_dir().join(format!("abb-read-big-{}", uuid::Uuid::new_v4()));
