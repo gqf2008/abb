@@ -314,51 +314,10 @@ pub fn detect_all() -> Vec<DepStatus> {
     ]
 }
 
-/// 跑 `codex --version` 解析版本号。跑不通/非零退出 → None。
-/// P4.3 后 codex 不再是 UI 依赖项；本族函数仅存消费方是 agent.rs 旧 CLI 路径
-/// 的沙箱能力版本门（`codex_version_at_least_cached`，随 P4.1 一并退役）。
-pub fn codex_version(exe: &str) -> Option<String> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--version");
-    // Windows：依赖检测跑 codex --version 也抑制控制台窗口（#104），
-    // 否则每次「环境检测/一键安装」都会闪一个黑框。
-    #[cfg(windows)]
-    {
-        apply_no_window(&mut cmd);
-    }
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    codex_version_from_text(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// 从 `codex --version` 输出文本里提取版本号。输出形如 `codex-cli 0.146.0`
-/// （也可能带 build 后缀，如 `codex-cli 0.146.0 (abc1234)`）→ 返回 `0.146.0`。
-/// 找不到形如 `d+.d+` 的 token → None。
-pub fn codex_version_from_text(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .find(|tok| {
-            let head: String = tok
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            !head.is_empty()
-                && head.split('.').count() >= 2
-                && head
-                    .split('.')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        })
-        .map(|tok| {
-            tok.chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect()
-        })
-}
-
 //（P4.1：codex_version_cached / codex_version_at_least_cached 已删——唯一调用方是旧
-// agent::run 的 codex 版本门控，随 Backend 一并退役；codex_version / version_at_least
-// 保留，deps 环境页 codex 探测仍用，见 P4.3 处置范围。）
+// agent::run 的 codex 版本门控，随 Backend 一并退役。P4.3 落地时 codex_version /
+// codex_version_from_text 一并删除：环境页 codex 探测行随 P4.3 下架，两函数成测试
+// 死码，依 winproc 同例整体删除；version_at_least 保留——git 探测的 version_ok 仍用。）
 
 /// 跑 `git --version` 解析版本号。跑不通/非零退出 → None。
 pub fn git_version(exe: &str) -> Option<String> {
@@ -1321,25 +1280,6 @@ mod tests {
         // 解析失败保守 false
         assert!(!version_at_least("abc", "0.140"));
         assert!(!version_at_least("0.146.0", "not-a-version"));
-    }
-
-    #[test]
-    fn codex_version_parses_cli_output() {
-        // codex --version 实测输出形态：`codex-cli 0.146.0`（新版可能带 build 后缀）。
-        assert_eq!(
-            codex_version_from_text("codex-cli 0.146.0"),
-            Some("0.146.0".into())
-        );
-        assert_eq!(
-            codex_version_from_text("codex-cli 0.146.0 (abc1234)\n"),
-            Some("0.146.0".into())
-        );
-        assert_eq!(
-            codex_version_from_text("@openai/codex 0.140.0"),
-            Some("0.140.0".into())
-        );
-        assert_eq!(codex_version_from_text("未知版本"), None);
-        assert_eq!(codex_version_from_text(""), None);
     }
 
     #[test]
