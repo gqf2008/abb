@@ -209,7 +209,6 @@ dependencies = [
  "tracing",
  "turso",
  "uuid",
- "windows-sys 0.61.2",
  "winit",
  "winres",
 ]

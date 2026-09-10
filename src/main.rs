@@ -47,7 +47,6 @@ mod unread;
 mod updater;
 mod virtualbot;
 mod wechat;
-mod winproc;
 mod ws;
 mod wsver;
 
