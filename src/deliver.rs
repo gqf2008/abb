@@ -1575,8 +1575,8 @@ mod tests {
             .contains("跨会话投递未开启"));
 
         // ③ 伪造项：开关关 + in_session 但**来源≠目标** → 仍按跨会话被开关拒。
-        //    豁免判据是 `in_session ∧ 来源==目标`；「只读裸 flag」的实现会让这条穿过去
-        //    （开关与去重一起被绕），所以这是 :238/:271/:399 三处的回归锁。
+        //    豁免判据是 `in_session ∧ 来源==目标`；「开关只读裸 flag」的实现会让它穿过去。
+        //    （去重/指纹登记两处见下面 `router_forged_in_session_still_obeys_dedup`）
         let mut forged = item("c", "wechat", "u3", "hi");
         forged.source_bot = "feishu".into();
         forged.source_chat = "c1".into();
@@ -1591,6 +1591,31 @@ mod tests {
             source.sent.lock().unwrap().len(),
             2,
             "伪造项应走跨会话判定并被开关拒（再回一条提示）"
+        );
+    }
+
+    /// 伪造的 `in_session`（来源≠目标）**不构成豁免**，所以它仍受防循环约束：
+    /// 同一项连投两次，第二次必须被去重拦下。这条同时锁住 `deliver()` 里
+    /// `is_duplicate`（只读裸 flag 会让第二次不查重）与 `mark_delivered`
+    /// （只读裸 flag 会让第一次不登记指纹）——任一处回退都会让第二次真投出去。
+    #[tokio::test]
+    async fn router_forged_in_session_still_obeys_dedup() {
+        let (router, target, source) = router_with(true, None);
+        let mut forged = item("d", "wechat", "u3", "hi");
+        forged.source_bot = "feishu".into();
+        forged.source_chat = "c1".into();
+        forged.in_session = true;
+        router.deliver(&forged).await;
+        router.deliver(&forged).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            1,
+            "伪造 in_session 的第二次投递应被防循环抑制"
+        );
+        assert!(
+            source.sent.lock().unwrap()[0].1.contains("防循环"),
+            "应回源「防循环」提示: {:?}",
+            source.sent.lock().unwrap()[0].1
         );
     }
 
