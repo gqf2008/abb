@@ -755,9 +755,10 @@ impl WeixinClient {
                 // 只报关键字段：`up` 里可能有短期签名的上传地址，别进日志、更别随
                 // deliver 的回源提示发给聊天里的真人（审查 P3-3）。
                 anyhow!(
-                    "getuploadurl 未返回 upload_full_url/upload_param（ret={:?} errcode={:?}）",
+                    "getuploadurl 未返回 upload_full_url/upload_param（ret={:?} errcode={:?} errmsg={:?}）",
                     up.get("ret"),
-                    up.get("errcode")
+                    up.get("errcode"),
+                    up.get("errmsg")
                 )
             })?;
         let cipher = aes_ecb_encrypt(data, &aeskey);
