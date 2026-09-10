@@ -1425,6 +1425,15 @@ mod tests {
         async fn send_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        /// 本组测试只解析工作区、不发送附件——但 `send_attachment` 自 #254 起
+        /// **无默认实现**（禁静默降级），挡板必须显式表态。
+        async fn send_attachment(
+            &self,
+            _chat_id: &str,
+            _meta: &crate::attachments::AttachmentMeta,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     /// 隔离桥：唯一 bot key → 独立 workspace（测后整树删除，不碰真实 bot 数据）。
