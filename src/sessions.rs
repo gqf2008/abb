@@ -404,6 +404,10 @@ impl SessionStore {
     /// - 新会话（started=false）：记录当前档位，返回 None（本轮即以当前档位运行）；
     /// - 既有会话无记录（升级迁移）：补记当前档位，返回 None（无从判断是否变化，不误报）；
     /// - 既有会话记录 ≠ 当前：返回 (提示一次, rotated)，记录覆盖为本轮档位。
+    // P4.1：codex/claude 档位轮换自愈已随 Backend 删除（沙箱档改由 harness `_meta` 下发，
+    // P2.2/P2.3）；本方法生产无调用点，仅测试锚定轮换臂——保留至后端族测试清理批次（P4.4）。
+    // P4.2：轮换判定上移至签名参数 rotate_on_change（SessionStore 不再持有后端概念）。
+    #[allow(dead_code)]
     pub fn check_sandbox_mode(
         &self,
         chat_id: &str,
@@ -508,6 +512,9 @@ impl SessionStore {
     /// 旧会话、/new 失效（#49 审查：首轮回存与 /new 的交错场景）。
     ///（原无条件覆盖版 set_session_id 已被本方法取代：调用方是首轮回存——
     /// 用对端自生成的真实会话 id，必须先验证槽位身份再写。）
+    // P4.1：codex 首轮回存已删——生产唯一调用点消失，现仅 MockAgentRunner（测试挡板）
+    // 模拟 already-in-use 自愈回存调用；保留为 CAS 原语供测试缝。
+    #[allow(dead_code)]
     pub fn set_session_id_if(&self, chat_id: &str, expected: &str, session_id: &str) -> bool {
         self.refresh();
         let mut data = self.data.lock().unwrap();

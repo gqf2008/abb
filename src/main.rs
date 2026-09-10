@@ -12,7 +12,6 @@ mod botstatus;
 mod bridge;
 mod buzz;
 mod config;
-mod contextsum;
 mod deliver;
 mod deps;
 mod dingtalk;
@@ -48,7 +47,6 @@ mod unread;
 mod updater;
 mod virtualbot;
 mod wechat;
-mod winproc;
 mod ws;
 mod wsver;
 
