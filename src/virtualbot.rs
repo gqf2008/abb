@@ -295,11 +295,29 @@ pub fn vb_dir_for(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
 /// 级移除，两处不双写）；bot 级 history/ 中本 chat 前缀的历史文件迁到 vb/<uuid>/
 /// history/。逐项搬移幂等（源不存在即 no-op），service/GUI 谁先解析都收敛。
 /// None = 非虚拟群。
+///
+/// P4.4：本函数是 vb 工作区（= 该群 agent 会话 cwd）的唯一物化点，故顺带写工作区
+/// 指引（AGENTS.md/CLAUDE.md）——service 的频道巡检与 job 派发、bridge 的
+/// `workspace_for` 都经它拿路径，收口在此就不会漏写（marker 判定，幂等）。
 pub fn ensure_vb_dir(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
     let dir = vb_dir_for(bot_key, chat_id)?;
-    let _ = std::fs::create_dir_all(&dir);
-    migrate_legacy_vb_data(&crate::bridge_dir(), bot_key, chat_id, &dir);
+    ensure_vb_dir_at(&crate::bridge_dir(), &dir, bot_key, chat_id);
     Some(dir)
+}
+
+/// vb 工作区的物化实现体（目录已算出）：建目录 → 存量迁移 → 写工作区指引。
+/// 与 `vb_dir_for` 的登记表查询解耦，单测可直接驱动——否则测写指引就得往用户
+/// 真实 `~/.agent-bridge/virtual-bots.json` 里插条目（整表原子重写、无锁，
+/// 与真实 GUI/事件写并发会互相覆盖；审查 P2-2）。
+pub(crate) fn ensure_vb_dir_at(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    bot_key: &str,
+    chat_id: &str,
+) {
+    let _ = std::fs::create_dir_all(dir);
+    migrate_legacy_vb_data(base, bot_key, chat_id, dir);
+    crate::agent::ensure_workspace_guide(dir);
 }
 
 /// 存量迁移（#194）：bot 级会话槽位 + 前缀匹配的历史文件搬入 vb 目录。幂等。
@@ -901,6 +919,38 @@ mod tests {
         // 幂等：再跑一次无变化不报错
         crate::virtualbot::migrate_legacy_vb_data_pub(&base, bot_key, chat, &vb_dir);
         assert_eq!(vb_store.chat_entry(chat).unwrap().session_id, "sid-legacy");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P4.4 回归：vb 工作区（= 该群 agent 会话 cwd）物化后，工作区指引必须就位
+    /// ——修复前该路径不写任何指引，fork 经 hints 读 cwd AGENTS.md 拿不到
+    /// `$ABB_BIN` job/deliver 用法（agent 会自造 sleep/while 循环占住聊天，期间
+    /// 该会话新消息全部排队）。
+    ///
+    /// 驱动的是实现体 `ensure_vb_dir_at`（目录已给定），全程临时目录——**不碰用户
+    /// 真实的 `~/.agent-bridge/virtual-bots.json`**（那是整表原子重写、无锁，
+    /// 与 GUI/事件的并发登记会互相覆盖；审查 P2-2）。
+    ///
+    /// 代价：`ensure_vb_dir` 的「查登记 → 委托实现体」这一层没有直测。它本来就
+    /// 没有——`vb_dir_for` 硬编码真实 `bridge_dir()`、无注入缝，仓库里除生产调用点
+    /// 外无人调用；store 层语义另由 `store_add_remove_roundtrip` 等用例覆盖。
+    #[test]
+    fn ensure_vb_dir_writes_workspace_guide() {
+        let base = std::env::temp_dir().join(format!("abb-vb-guide-{}", uuid::Uuid::new_v4()));
+        let dir = base.join("workspaces").join("bot_x").join("vb").join("u1");
+        assert!(!dir.exists(), "起点不存在：连目录创建一起测");
+
+        ensure_vb_dir_at(&base, &dir, "bot_x", "oc_vbguide");
+
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let text = std::fs::read_to_string(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name} 应由 vb 工作区物化写出: {e}"));
+            assert!(
+                text.contains(crate::agent::GUIDE_MARKER),
+                "{name} 应含版本标记（fork 据此判定指引新鲜度）"
+            );
+            assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }

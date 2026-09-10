@@ -1164,9 +1164,16 @@ impl Bridge {
     }
 
     /// #194：chat 的工作目录——虚拟 Bot 群 = vb/<uuid>/，其余 = bot 工作区。
+    /// P4.4：该路径就是 agent 会话 cwd（fork 经 hints 读它的 AGENTS.md 拿 `$ABB_BIN`
+    /// 用法），故返回前确保工作区指引就位——vb 分支已在 `ensure_vb_dir` 内写过，
+    /// 这里只补 bot 级分支（幂等，marker 判定）。
     fn workspace_for(&self, chat_id: &str) -> std::path::PathBuf {
-        crate::virtualbot::ensure_vb_dir(&self.bot.key(), chat_id)
-            .unwrap_or_else(|| crate::workspace_dir(&self.bot.key()))
+        if let Some(dir) = crate::virtualbot::ensure_vb_dir(&self.bot.key(), chat_id) {
+            return dir;
+        }
+        let dir = crate::workspace_dir(&self.bot.key());
+        crate::agent::ensure_workspace_guide(&dir);
+        dir
     }
 
     /// #206：buzz /cancel——预检（频道已登记；buzz 未启用则拒——与 dispatch 同
@@ -1406,5 +1413,73 @@ fn parse_trash_cmd(text: &str) -> Option<TrashCmd> {
         }
         Some("confirm") => parts.next().map(|p| TrashCmd::Confirm(p.to_string())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 挡板 messenger（`Bridge::new` 需要；本组测试只碰工作区解析，不发送）。
+    struct DummyMsgr;
+    #[async_trait::async_trait]
+    impl crate::messenger::Messenger for DummyMsgr {
+        async fn send_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        /// 本组测试只解析工作区、不发送附件——但 `send_attachment` 自 #254 起
+        /// **无默认实现**（禁静默降级），挡板必须显式表态。
+        async fn send_attachment(
+            &self,
+            _chat_id: &str,
+            _meta: &crate::attachments::AttachmentMeta,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 隔离桥：唯一 bot key → 独立 workspace（测后整树删除，不碰真实 bot 数据）。
+    fn test_bridge() -> std::sync::Arc<crate::bridge::Bridge> {
+        let bot = crate::config::BotConfig {
+            name: format!("abb-guide-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_boss".into(),
+            ..Default::default()
+        };
+        std::sync::Arc::new(crate::bridge::Bridge::new(
+            std::sync::Arc::new(DummyMsgr),
+            bot,
+            &crate::config::Config::default(),
+        ))
+    }
+
+    /// P4.4 回归：`workspace_for` 是会话 cwd 的唯一真值来源，bot 级（非虚拟群）
+    /// 会话解析后工作区指引必须已就位——修复前该路径不写任何指引，fork 经 hints
+    /// 读 cwd AGENTS.md 拿不到 `$ABB_BIN` job/deliver 用法（agent 自造 sleep 循环）。
+    #[test]
+    fn workspace_for_writes_guide_for_bot_level_chat() {
+        let bridge = test_bridge();
+        let ws = crate::workspace_dir(&bridge.bot.key());
+        // Drop 守卫：断言失败（panic）时也要清掉把 ~/.agent-bridge/workspaces/<uuid>/
+        // 删干净——函数末尾那行在 panic 路径上不会执行（审查 P3-2）。
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(ws.clone());
+
+        let got = bridge.workspace_for("oc_p2p_not_registered");
+        assert_eq!(got, ws, "非虚拟群会话 cwd = bot 级工作区");
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let text = std::fs::read_to_string(ws.join(name))
+                .unwrap_or_else(|e| panic!("{name} 应由 workspace_for 写出: {e}"));
+            assert!(
+                text.contains(crate::agent::GUIDE_MARKER),
+                "{name} 应含版本标记（fork 据此判定指引新鲜度）"
+            );
+            assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
+        }
     }
 }
