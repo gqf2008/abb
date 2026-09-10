@@ -699,10 +699,6 @@ fn run_deliver_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if !cfg.cross_delivery_enabled {
-        eprintln!("跨会话投递未开启：请在 ABB 设置里勾选「跨会话投递」后重试（保存即重启服务）。");
-        return 1;
-    }
     let env_bot = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
     let env_chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
     // @角色名寻址（#75 虚拟 Bot）：--chat @后端开发 → 查登记表解析成 chat_id；
@@ -711,13 +707,35 @@ fn run_deliver_cli(args: &[String]) -> i32 {
     let item = match deliver::parse_deliver_args_with_store(args, &env_bot, &env_chat, &roles) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…");
+            eprintln!(
+                "{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…\n      agent-bridge deliver --to-current --text \"内容\" [--file <本地路径>]…（发到当前会话）"
+            );
             return 1;
         }
     };
+    // 「跨会话投递」开关只管控**跨会话**：`--to-current` 是发给当前会话（等价于
+    // 「回复带附件」），不跨会话、也不是新风险面，不该逼用户为一个"给自己发文件"
+    // 去打开跨会话开关（冒烟测试暴露：原先开关检查在解析之前，把 in_session 一起挡了）。
+    if !item.in_session && !cfg.cross_delivery_enabled {
+        eprintln!("跨会话投递未开启：请在 ABB 设置里勾选「跨会话投递」后重试（保存即重启服务）。");
+        return 1;
+    }
     // 自环防护（消息循环防护 #21）：同 bot 同会话转发给自己没有意义且是循环温床。
-    if deliver::is_self_loop(&item) {
-        eprintln!("不能投递回当前会话（来源与目标相同），已拒绝。");
+    // 例外只有一条：`--to-current` 显式声明的"发给当前会话"。它**不是**放宽这条规则——
+    // 目标的来源必须确实等于目标（解析时已强制目标=来源=桥注入的当前会话），语义是
+    // "发送"而非"投递"，没有跨会话对；且 bot 自己的出站消息在三个平台都被桥丢弃
+    //（微信 message_type!=1、飞书 sender_type=app/bot、钉钉回调只在被 @ 时触发），
+    // 不会回灌成新的用户输入，结构上不可能自循环。
+    if deliver::is_self_loop(&item) && !item.in_session {
+        eprintln!(
+            "不能投递回当前会话（来源与目标相同），已拒绝。\n\
+             要把内容/文件发到当前会话，请用 --to-current（显式声明）。"
+        );
+        return 1;
+    }
+    // in_session 的前提是"来源确实等于目标"：不满足 = 参数拼错或来源被改写，直接拒。
+    if item.in_session && !deliver::is_self_loop(&item) {
+        eprintln!("--to-current 只能在 bot 会话内使用（来源与目标必须一致），已拒绝。");
         return 1;
     }
     // 授权者（受限会话）纵深防御：--file 只能投递工作区内文件。

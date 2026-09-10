@@ -43,6 +43,17 @@ pub struct DeliveryItem {
     /// 也豁免 Router 自环拒绝（任务回发本 bot 原会话是既有行为）。
     #[serde(default)]
     pub job_id: String,
+    /// 「发给当前会话」显式声明（CLI `--to-current`）：目标恒等于来源，语义是**发送**
+    /// 而不是**投递**——给当前会话回附件是正当需求（桥的回复通道只发文本，agent
+    /// 生成的附件必须显式发一次）。
+    ///
+    /// 与自环保护的关系：`is_self_loop` 这条硬规则**不变**，只有本字段为真**且**来源
+    /// 确实等于目标时才豁免；手改队列塞 `in_session` 却把来源写成别的会话 → 仍按普通
+    /// 投递走自环判定。结构上不可能自循环：没有跨会话对，且 bot 自己的出站消息在三个
+    /// 平台都被桥丢弃（微信 `message_type!=1`、飞书 `sender_type=app/bot`、钉钉回调
+    /// 只在被 @ 时触发），不会回灌成新的用户输入。
+    #[serde(default)]
+    pub in_session: bool,
 }
 
 /// 投递请求落盘队列（CLI 写、service 消费）。
@@ -213,7 +224,8 @@ impl Router {
         let tb = crate::agent::truncate(&item.target_bot, 16);
         let tc = crate::agent::truncate(&item.target_chat, 16);
         let tid = &item.id[..item.id.len().min(8)]; // uuid 恒 ASCII，按字节切安全
-        if !self.enabled {
+                                                    // 开关只管跨会话；`in_session` 等价于「回复带附件」，不受它限制（CLI 侧同判）。
+        if !self.enabled && !item.in_session {
             crate::log!(
                 "[deliver] 跳过投递：跨会话投递未开启（bot={} chat={} id={}）",
                 tb,
@@ -228,7 +240,11 @@ impl Router {
             return;
         }
         // 自环防护（Router 级兜底，防手改队列绕过 CLI）：来源==目标 且非定时任务 → 拒绝。
-        if item.job_id.is_empty() && is_self_loop(item) {
+        // 两处豁免：① 定时任务（既有）；② `in_session`（CLI `--to-current` 显式声明的
+        // 「发给当前会话」）——但它**只在来源确实等于目标时**才构成豁免；手改队列塞
+        // in_session 却把来源写成别的会话，下面这条判定照旧拒（自环硬规则不退化）。
+        let in_session_ok = item.in_session && is_self_loop(item);
+        if !in_session_ok && item.job_id.is_empty() && is_self_loop(item) {
             crate::log!(
                 "[deliver] 跳过投递：自环（来源==目标）bot={} chat={} id={}",
                 tb,
@@ -241,7 +257,9 @@ impl Router {
         }
         // 防循环（消息循环防护 #21）：非定时任务同指纹窗口内重复 → 跳过 + 回源说明。
         // 注意：MutexGuard 必须在任何 await 前 drop（std 锁不是 Send，跨 await 会编译失败）。
-        if item.job_id.is_empty() && self.is_duplicate(item) {
+        // `in_session` 也豁免去重：10 分钟内说两次「再发我一次」应该都能发出去
+        //（直发语义，不是跨会话中继）。
+        if item.job_id.is_empty() && !item.in_session && self.is_duplicate(item) {
             crate::log!(
                 "[deliver] 跳过重复投递（防循环）bot={} chat={} id={}",
                 tb,
@@ -369,7 +387,7 @@ impl Router {
             item.text.chars().count(),
             item.attachments.len()
         );
-        if item.job_id.is_empty() {
+        if item.job_id.is_empty() && !item.in_session {
             self.mark_delivered(item);
         }
     }
@@ -489,6 +507,7 @@ pub fn parse_deliver_args(
     let mut source_bot: Option<String> = None;
     let mut source_chat: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
+    let mut in_session = false;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -499,6 +518,8 @@ pub fn parse_deliver_args(
                 .ok_or_else(|| format!("参数 {} 缺少值", flag))
         };
         match flag {
+            // 无值开关：把目标钉在当前会话（= 桥注入的来源），见 DeliveryItem.in_session。
+            "--to-current" => in_session = true,
             "--bot" => target_bot = Some(val(&mut i)?),
             "--chat" => target_chat = Some(val(&mut i)?),
             "--text" => text = Some(val(&mut i)?),
@@ -508,6 +529,26 @@ pub fn parse_deliver_args(
             _ => return Err(format!("未知参数：{flag}")),
         }
         i += 1;
+    }
+    // --to-current：目标恒为当前会话（桥注入的 bot/chat），不接受显式目标与来源——
+    // 来源必须**确实**等于目标，这是 in_session 豁免自环保护的前提。
+    if in_session {
+        if env_bot.is_empty() || env_chat.is_empty() {
+            return Err(
+                "--to-current 只能在 bot 会话里使用（缺 AGENT_BRIDGE_BOT_KEY/CHAT_ID 环境变量）"
+                    .to_string(),
+            );
+        }
+        if target_bot.is_some() || target_chat.is_some() {
+            return Err("--to-current 的目标就是当前会话，不要再给 --bot/--chat".to_string());
+        }
+        if source_bot.is_some() || source_chat.is_some() {
+            return Err(
+                "--to-current 的来源恒为当前会话，不要再给 --source-bot/--source-chat".to_string(),
+            );
+        }
+        target_bot = Some(env_bot.to_string());
+        target_chat = Some(env_chat.to_string());
     }
     let target_bot = target_bot.ok_or_else(|| "缺少 --bot <目标 bot key>".to_string())?;
     let target_chat = target_chat.ok_or_else(|| "缺少 --chat <目标 chat_id>".to_string())?;
@@ -548,6 +589,7 @@ pub fn parse_deliver_args(
         created_at: crate::chrono_lite::unix_secs(),
         attachments,
         job_id: String::new(),
+        in_session,
     })
 }
 
@@ -658,6 +700,7 @@ pub fn job_target_items(
             created_at: crate::chrono_lite::unix_secs(),
             attachments: Vec::new(),
             job_id: job_id.to_string(),
+            in_session: false,
         })
         .collect()
 }
@@ -698,6 +741,7 @@ mod tests {
             created_at: 1,
             attachments: Vec::new(),
             job_id: String::new(),
+            in_session: false,
         }
     }
 
@@ -797,6 +841,64 @@ mod tests {
         assert_eq!(d.source_bot, "wechat");
         assert_eq!(d.source_chat, "u1");
         assert!(!d.id.is_empty());
+    }
+
+    /// `--to-current`：目标钉在当前会话（= 桥注入的 env），并置 in_session。
+    /// 这是 in_session 豁免自环保护的前提——来源必须**确实**等于目标。
+    #[test]
+    fn parse_to_current_pins_target_to_env_session() {
+        let args = vec![
+            "--to-current".to_string(),
+            "--text".to_string(),
+            "hi".to_string(),
+        ];
+        let d = parse_deliver_args(&args, "wechat", "u1").unwrap();
+        assert_eq!(d.target_bot, "wechat");
+        assert_eq!(d.target_chat, "u1");
+        assert_eq!(d.source_bot, "wechat");
+        assert_eq!(d.source_chat, "u1");
+        assert!(d.in_session, "应标记为「发给当前会话」");
+        assert!(is_self_loop(&d), "in_session 的项必须来源==目标");
+    }
+
+    /// `--to-current` 在 bot 会话之外（无 env）没有意义：拒绝，别猜目标。
+    #[test]
+    fn parse_to_current_requires_bot_session_env() {
+        let args = vec![
+            "--to-current".to_string(),
+            "--text".to_string(),
+            "hi".to_string(),
+        ];
+        for (b, c) in [("", ""), ("wechat", ""), ("", "u1")] {
+            let e = parse_deliver_args(&args, b, c).unwrap_err();
+            assert!(
+                e.contains("只能在 bot 会话里使用"),
+                "env=({b:?},{c:?}) → {e}"
+            );
+        }
+    }
+
+    /// `--to-current` 自己就是目标与来源，不接受重复指定（否则来源≠目标时
+    /// in_session 的豁免前提被破坏）。
+    #[test]
+    fn parse_to_current_rejects_explicit_target_or_source() {
+        let mk = |extra: &[&str]| {
+            let mut v = vec!["--to-current", "--text", "hi"];
+            v.extend_from_slice(extra);
+            v.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        for extra in [
+            vec!["--bot", "feishu"],
+            vec!["--chat", "c1"],
+            vec!["--source-bot", "feishu"],
+            vec!["--source-chat", "c1"],
+        ] {
+            let e = parse_deliver_args(&mk(&extra), "wechat", "u1").unwrap_err();
+            assert!(
+                e.contains("不要再给"),
+                "extra={extra:?} 应被拒并被提示重复指定: {e}"
+            );
+        }
     }
 
     #[test]
@@ -1399,6 +1501,88 @@ mod tests {
         router.deliver(&d2).await;
         assert_eq!(target.sent.lock().unwrap().len(), 2);
         assert!(source.sent.lock().unwrap().is_empty());
+    }
+
+    /// `--to-current`（in_session）是唯一能在同会话投递附件/内容的通道：
+    /// 来源确实等于目标时放行；来源≠目标（手改队列伪造 in_session）→ 仍按自环拒。
+    /// 注意上面那条 `router_rejects_self_loop_but_exempts_jobs` 是**自环保护的回归锁**，
+    /// 它必须继续绿——本 PR 没有放宽那条规则。
+    #[tokio::test]
+    async fn router_allows_in_session_but_only_when_source_equals_target() {
+        let (router, target, _source) = router_with(true, None);
+        // ① 正当的 in_session：来源==目标 → 真的发出去（不再拒）
+        let mut d = item("a", "wechat", "u1", "报告好了");
+        d.source_bot = "wechat".into();
+        d.source_chat = "u1".into();
+        d.in_session = true;
+        router.deliver(&d).await;
+        let sent = target.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "in_session 应放行: {sent:?}");
+        assert_eq!(sent[0], ("u1".to_string(), "报告好了".to_string()));
+        drop(sent);
+
+        // ② in_session 只在「来源确实等于目标」时才构成豁免：来源不同 = **本来就不是自环**，
+        //    此时它不作任何特殊处理，退化成一条普通投递（豁免逻辑不生效，也就没被滥用）。
+        let mut cross = item("b", "wechat", "u1", "hi");
+        cross.source_bot = "wechat".into();
+        cross.source_chat = "OTHER_CHAT".into();
+        cross.in_session = true;
+        assert!(!is_self_loop(&cross), "来源≠目标根本不是自环");
+        router.deliver(&cross).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            2,
+            "来源≠目标 + in_session = 普通投递照发（in_session 不产生额外豁免）"
+        );
+    }
+
+    /// 「跨会话投递」开关只管控跨会话：in_session（发给当前会话）在开关关闭时**也要发**
+    /// ——它等价于「回复带附件」，不该逼用户为这个去打开跨会话开关（冒烟测试发现的洞）。
+    /// 对照组：同开关关闭下的普通跨会话投递仍被拒。
+    #[tokio::test]
+    async fn router_in_session_ignores_cross_delivery_switch() {
+        let (router, target, source) = router_with(false, None);
+        // ① 开关关 + in_session → 照发
+        let mut d = item("a", "wechat", "u1", "报告好了");
+        d.source_bot = "wechat".into();
+        d.source_chat = "u1".into();
+        d.in_session = true;
+        router.deliver(&d).await;
+        assert_eq!(
+            target.sent.lock().unwrap().clone(),
+            vec![("u1".to_string(), "报告好了".to_string())],
+            "in_session 不受跨会话投递开关限制"
+        );
+
+        // ② 开关关 + 普通跨会话 → 仍拒（开关语义不退化）
+        let mut cross = item("b", "wechat", "u2", "hi");
+        cross.source_bot = "feishu".into();
+        cross.source_chat = "c1".into();
+        router.deliver(&cross).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 1, "跨会话仍被开关拒");
+        assert_eq!(source.sent.lock().unwrap().len(), 1, "应回源提示未开启");
+        assert!(source.sent.lock().unwrap()[0]
+            .1
+            .contains("跨会话投递未开启"));
+    }
+
+    /// in_session 不进防循环窗口：10 分钟内连着要两次同一个文件都应该发出去
+    /// （直发语义，不是跨会话中继）。
+    #[tokio::test]
+    async fn router_in_session_is_exempt_from_dedup_window() {
+        let (router, target, _source) = router_with(true, None);
+        let mut d = item("a", "wechat", "u1", "");
+        d.source_bot = "wechat".into();
+        d.source_chat = "u1".into();
+        d.in_session = true;
+        d.attachments.push(attach("report.pdf"));
+        router.deliver(&d).await;
+        router.deliver(&d).await;
+        assert_eq!(
+            target.attachments.lock().unwrap().len(),
+            2,
+            "同一个文件的两次 in_session 发送都该出去（不被防循环压掉）"
+        );
     }
 
     #[tokio::test]
