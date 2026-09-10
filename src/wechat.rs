@@ -652,18 +652,17 @@ impl WeixinClient {
         data: &[u8],
     ) -> Result<()> {
         let up = self.upload_media(to_user_id, kind, data).await?;
-        let media = serde_json::json!({
-            "media": {
-                "encrypt_query_param": up.download_param,
-                "aes_key": up.aes_key_b64,
-                "encrypt_type": 1,
-            }
+        // CDNMedia：下载参数 + 密钥（编码按类型，见 upload_media）。
+        let cdn_media = serde_json::json!({
+            "encrypt_query_param": up.download_param,
+            "aes_key": up.aes_key_b64,
+            "encrypt_type": 1,
         });
         let item = match kind {
             OutboundMediaKind::Image => serde_json::json!({
                 "type": kind.item_type(),
                 "image_item": {
-                    "media": media["media"],
+                    "media": cdn_media.clone(),
                     // 图片密钥的两种表示都放上：`media.aes_key` 是 base64(原始 16 字节)
                     // （协议对图片的规定），`aeskey` 是 hex。入站图片也同时带这两个字段
                     // （见 parse_aes_key_from_b64 的两种容忍分支），接收端取哪个都能解。
@@ -673,12 +672,12 @@ impl WeixinClient {
             }),
             OutboundMediaKind::Video => serde_json::json!({
                 "type": kind.item_type(),
-                "video_item": { "media": media["media"], "video_size": up.cipher_size }
+                "video_item": { "media": cdn_media.clone(), "video_size": up.cipher_size }
             }),
             OutboundMediaKind::File => serde_json::json!({
                 "type": kind.item_type(),
                 "file_item": {
-                    "media": media["media"],
+                    "media": cdn_media.clone(),
                     "file_name": file_name,
                     "len": data.len().to_string(),
                 }
