@@ -1,7 +1,10 @@
 //! 微信通道 —— 腾讯官方 ilink 协议（参考 ~/.openclaw/extensions/openclaw-weixin）。
 //! QR 扫码登录 → bot_token；之后 HTTP JSON 长轮询 getupdates 收消息、sendmessage 发消息。
 //! 端点：`{baseurl}/ilink/bot/{get_bot_qrcode,get_qrcode_status,getupdates,sendmessage}`。
-//! 只实现文本收发（图片/语音/文件走 CDN AES，后续再加）。跨平台（reqwest rustls）。
+//! 收：文本 + 图片/语音/文件/视频（入站媒体经 CDN 下载 + AES-128-ECB 解密）。
+//! 发：文本 + 媒体（`send_media`：getuploadurl → AES-128-ECB 加密 → CDN → sendmessage）。
+//! **音频按文件发**——VOICE 类型实测被官方丢弃（message_id 成功但端上不显示）。
+//! 跨平台（reqwest rustls）。
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -431,6 +434,50 @@ struct GetUpdatesResp {
     longpolling_timeout_ms: Option<u64>,
 }
 
+/// 外发媒体的种类：决定 `media_type`（上传）与 item `type`（消息体）。
+///
+/// 注意 item type 与 media_type **不是同一张表**：图片 item=2/media=1、视频 item=5/media=2、
+/// 文件 item=4/media=3（协议 Message Types 节）。语音（item=3/media=4）刻意不提供——
+/// 实测被官方丢弃，音频按文件发（见 `send_media` 注释）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundMediaKind {
+    Image,
+    Video,
+    File,
+}
+
+impl OutboundMediaKind {
+    /// `getuploadurl` 的 `media_type`。
+    pub fn media_type(self) -> i64 {
+        match self {
+            OutboundMediaKind::Image => 1,
+            OutboundMediaKind::Video => 2,
+            OutboundMediaKind::File => 3,
+        }
+    }
+
+    /// `item_list[].type`。
+    pub fn item_type(self) -> i64 {
+        match self {
+            OutboundMediaKind::Image => 2,
+            OutboundMediaKind::Video => 5,
+            OutboundMediaKind::File => 4,
+        }
+    }
+}
+
+/// 一次媒体上传的结果（拼 CDNMedia 与 item 尺寸字段所需的全部事实）。
+struct UploadedMedia {
+    /// CDN 下载参数（`CDNMedia.encrypt_query_param`）。
+    download_param: String,
+    /// `CDNMedia.aes_key`：图片=base64(原始 16 字节)，其余=base64(32 hex)。
+    aes_key_b64: String,
+    /// 原始 16 字节密钥的 hex（图片的 `image_item.aeskey` 用）。
+    aeskey_hex: String,
+    /// 加密后字节数（图片 mid_size / 视频 video_size）。
+    cipher_size: u64,
+}
+
 impl WeixinClient {
     pub fn new(base_url: &str, token: &str, cdn_base_url: &str) -> WeixinClient {
         // 单 client 复用连接池/TLS；长轮询用每请求超时覆盖默认总超时。
@@ -535,9 +582,26 @@ impl WeixinClient {
 
     /// 发文本消息给指定用户（context_token 从入站消息带上）。
     pub async fn send_text(&self, to_user_id: &str, context_token: &str, text: &str) -> Result<()> {
-        // 协议（github epiral/weixin-bot PROTOCOL.md）要求的外发 msg 字段，缺一会被服务器
-        // 「先 ack（给 message_id）再丢弃」——消息不投递。message_state:2=FINISH 尤其关键，
-        // 缺了被当「生成中」不渲染；from_user_id bot 外发留空；client_id 每条唯一。
+        self.send_items(
+            to_user_id,
+            context_token,
+            vec![serde_json::json!({ "type": 1, "text_item": { "text": text } })],
+        )
+        .await
+    }
+
+    /// 发一条 item_list 消息（文本/媒体共用信封）。
+    ///
+    /// 协议（github epiral/weixin-bot PROTOCOL.md）要求的外发 msg 字段，缺一会被服务器
+    /// 「先 ack（给 message_id）再丢弃」——消息不投递。message_state:2=FINISH 尤其关键，
+    /// 缺了被当「生成中」不渲染；from_user_id bot 外发留空；client_id 每条唯一；
+    /// **context_token 是必填**（须回显入站消息带上来的那个）。
+    async fn send_items(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        item_list: Vec<serde_json::Value>,
+    ) -> Result<()> {
         let client_id = format!(
             "fb_{}_{}",
             crate::chrono_lite::unix_secs(),
@@ -551,7 +615,7 @@ impl WeixinClient {
                 "message_type": 2,            // BOT
                 "message_state": 2,           // FINISH（缺这个 = 不投递）
                 "context_token": context_token,
-                "item_list": [ { "type": 1, "text_item": { "text": text } } ],
+                "item_list": item_list,
             },
             "base_info": base_info(),
         });
@@ -560,6 +624,148 @@ impl WeixinClient {
             return Err(anyhow!("sendmessage 失败: {v}"));
         }
         Ok(())
+    }
+
+    /// 发一条媒体消息（图片/视频/文件）。
+    ///
+    /// **音频走 File**：iLink 的 VOICE 类型（media_type=4 / item type=3）实测被官方丢弃
+    /// ——`message_id` 返回成功但微信端不显示（2026-08-23 实测，见 skill `wx-send`）。
+    /// 所以 `--voice` 那条路不用，音频按文件发（微信以文件消息展示，能点开）。
+    ///
+    /// 目标可以是**任意微信会话**：`to_user_id` 由调用方给，`context_token` 用该会话
+    /// 入站消息带上来的那个（与外发文本同一条要求）。
+    pub async fn send_media(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        kind: OutboundMediaKind,
+        file_name: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        let up = self.upload_media(to_user_id, kind, data).await?;
+        let media = serde_json::json!({
+            "media": {
+                "encrypt_query_param": up.download_param,
+                "aes_key": up.aes_key_b64,
+                "encrypt_type": 1,
+            }
+        });
+        let item = match kind {
+            OutboundMediaKind::Image => serde_json::json!({
+                "type": kind.item_type(),
+                "image_item": {
+                    "media": media["media"],
+                    // 图片密钥的两种表示都放上：`media.aes_key` 是 base64(原始 16 字节)
+                    // （协议对图片的规定），`aeskey` 是 hex。入站图片也同时带这两个字段
+                    // （见 parse_aes_key_from_b64 的两种容忍分支），接收端取哪个都能解。
+                    "aeskey": up.aeskey_hex,
+                    "mid_size": up.cipher_size,
+                }
+            }),
+            OutboundMediaKind::Video => serde_json::json!({
+                "type": kind.item_type(),
+                "video_item": { "media": media["media"], "video_size": up.cipher_size }
+            }),
+            OutboundMediaKind::File => serde_json::json!({
+                "type": kind.item_type(),
+                "file_item": {
+                    "media": media["media"],
+                    "file_name": file_name,
+                    "len": data.len().to_string(),
+                }
+            }),
+        };
+        self.send_items(to_user_id, context_token, vec![item]).await
+    }
+
+    /// 上传媒体到 CDN，返回拼消息所需的全部事实。
+    ///
+    /// 链路（PROTOCOL.md「Get Upload URL」+「CDN Upload」）：
+    /// `getuploadurl`（带 rawsize/rawfilemd5/filesize/aeskey/no_need_thumb）
+    /// → AES-128-ECB(PKCS7) 加密 → POST 密文到 CDN → 响应头 `x-encrypted-param`
+    /// 即下载参数。
+    async fn upload_media(
+        &self,
+        to_user_id: &str,
+        kind: OutboundMediaKind,
+        data: &[u8],
+    ) -> Result<UploadedMedia> {
+        if data.is_empty() {
+            anyhow::bail!("拒绝上传空媒体");
+        }
+        let rawsize = data.len();
+        let cipher_size = rawsize.div_ceil(16) * 16;
+        let mut aeskey = [0u8; 16];
+        for chunk in aeskey.as_chunks_mut::<8>().0.iter_mut() {
+            chunk.copy_from_slice(&fastrand::u64(..).to_le_bytes());
+        }
+        let aeskey_hex: String = aeskey.iter().map(|b| format!("{b:02x}")).collect();
+        // 图片与文件/视频/语音的 aes_key 编码不同（协议「Crypto」节）：
+        // 图片=base64(原始 16 字节)；其余=base64(32 个 hex 字符)。
+        let aes_key_b64 = match kind {
+            OutboundMediaKind::Image => b64::encode(&aeskey),
+            _ => b64::encode(aeskey_hex.as_bytes()),
+        };
+        let filekey: String = (0..32)
+            .map(|_| format!("{:x}", fastrand::u8(..16)))
+            .collect();
+        let body = serde_json::json!({
+            "filekey": filekey,
+            "media_type": kind.media_type(),
+            "to_user_id": to_user_id,
+            "rawsize": rawsize,
+            "rawfilemd5": format!("{:x}", md5::compute(data)),
+            "filesize": cipher_size,
+            "no_need_thumb": true,
+            "aeskey": aeskey_hex,
+            "base_info": base_info(),
+        });
+        let up = self.post("ilink/bot/getuploadurl", &body).await?;
+        // 两种响应形态都要认：实测（wx-send）返回 `upload_full_url` 直给完整地址；
+        // PROTOCOL.md 记的是 `upload_param` + 由客户端拼 CDN 地址。优先前者。
+        let cdn_url = up
+            .get("upload_full_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                up.get("upload_param")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|p| {
+                        format!(
+                            "{}/upload?encrypted_query_param={}&filekey={filekey}",
+                            self.cdn_base_url,
+                            percent_encode_query(p)
+                        )
+                    })
+            })
+            .ok_or_else(|| anyhow!("getuploadurl 未返回 upload_full_url/upload_param: {up}"))?;
+        let cipher = aes_ecb_encrypt(data, &aeskey);
+        let resp = self
+            .http
+            .post(&cdn_url)
+            .header("Content-Type", "application/octet-stream")
+            // 大文件上传用更长超时（默认 60s 对慢网偏紧）；上传是整块一次 POST。
+            .timeout(std::time::Duration::from_secs(300))
+            .body(cipher)
+            .send()
+            .await
+            .context("CDN 上传网络错误")?;
+        let status = resp.status();
+        let download_param = resp
+            .headers()
+            .get("x-encrypted-param")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("CDN 上传失败 HTTP {status}：响应缺 x-encrypted-param"))?;
+        Ok(UploadedMedia {
+            download_param,
+            aes_key_b64,
+            aeskey_hex,
+            cipher_size: cipher_size as u64,
+        })
     }
 
     /// 下载并解密一条 CDN 媒体（图片/语音/文件/视频），返回 (明文字节, 猜测 mime, 文件名, 备注)。
@@ -665,6 +871,21 @@ fn parse_aes_key_from_hex(hex: &str) -> Result<[u8; 16]> {
         *item = (hi << 4) | lo;
     }
     Ok(key)
+}
+
+/// AES-128-ECB 加密（PKCS7 填充）——`aes_ecb_decrypt` 的镜像，外发媒体用。
+/// 明文长度是 16 的倍数时补**整块**（PKCS7 规定），故密文恒为 16 的倍数。
+fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    let cipher = aes::Aes128::new_from_slice(key).expect("AES-128 密钥长度固定 16 字节");
+    let pad = 16 - (plain.len() % 16);
+    let mut buf = plain.to_vec();
+    buf.resize(buf.len() + pad, pad as u8);
+    for block in buf.as_chunks_mut::<16>().0 {
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+    }
+    buf
 }
 
 /// AES-128-ECB 解密（PKCS7 去填充）。密文长度必须是 16 的倍数。
@@ -850,6 +1071,154 @@ pub fn save_qrcode_image(bot_key: &str, content: &str) -> Result<std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::test_mock::{MockResp, MockServer};
+    use std::collections::HashMap;
+
+    /// #283 外发媒体链路的 mock：getuploadurl → CDN → sendmessage 三个端点。
+    /// `full_url=false` 时只回 `upload_param`（PROTOCOL.md 记的形态），逼客户端自己
+    /// 拼 CDN 地址；`true` 时回 `upload_full_url`（`wx-send` 实测走的形态）。
+    async fn media_mock(full_url: bool) -> MockServer {
+        let up = if full_url {
+            serde_json::json!({ "upload_full_url": "{{BASE}}/upload" })
+        } else {
+            serde_json::json!({ "upload_param": "UP+param=1" })
+        };
+        let mut routes: HashMap<(String, String), MockResp> = HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/ilink/bot/getuploadurl".to_string()),
+            MockResp::json(up),
+        );
+        routes.insert(
+            ("POST".to_string(), "/upload".to_string()),
+            MockResp::json(serde_json::json!({})).with_header("x-encrypted-param", "DL+param=2"),
+        );
+        routes.insert(
+            ("POST".to_string(), "/ilink/bot/sendmessage".to_string()),
+            MockResp::json(serde_json::json!({ "ret": 0, "message_id": 1 })),
+        );
+        MockServer::start_rich(routes).await
+    }
+
+    fn rec<'a>(
+        recs: &'a [crate::feishu::test_mock::Recorded],
+        path: &str,
+    ) -> &'a crate::feishu::test_mock::Recorded {
+        recs.iter().find(|r| r.path == path).unwrap_or_else(|| {
+            panic!(
+                "应有 {path} 请求，实际: {:?}",
+                recs.iter().map(|r| &r.path).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// #283 端到端形状（`upload_param` 分支）：getuploadurl 必填字段、
+    /// **CDN 收到的密文能用请求里那个 aeskey 解回原文**（真 roundtrip，不是只看有没有发）、
+    /// sendmessage 的 item 类型与字段。
+    #[tokio::test]
+    async fn send_media_uploads_ciphertext_and_posts_file_item() {
+        let server = media_mock(false).await;
+        let wx = WeixinClient::new(&server.base, "tok", &server.base);
+        let data = b"hello wechat media".to_vec(); // 19 字节 → 补到 32
+
+        wx.send_media("u1", "ctx-1", OutboundMediaKind::File, "a.txt", &data)
+            .await
+            .unwrap();
+
+        let recs = server.requests.lock().unwrap().clone();
+        let up_body: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/getuploadurl").body).unwrap();
+        assert_eq!(up_body["media_type"], 3, "文件 media_type=3");
+        assert_eq!(up_body["to_user_id"], "u1");
+        assert_eq!(up_body["rawsize"], data.len());
+        assert_eq!(up_body["filesize"], 32, "密文长度按 16 补齐");
+        assert_eq!(up_body["no_need_thumb"], true);
+        assert_eq!(up_body["rawfilemd5"], format!("{:x}", md5::compute(&data)));
+        let aeskey_hex = up_body["aeskey"].as_str().unwrap().to_string();
+        assert_eq!(aeskey_hex.len(), 32, "aeskey 是 16 字节的 hex");
+
+        // CDN 请求：地址由 upload_param 拼出，密文可解回原文
+        let cdn = rec(&recs, "/upload");
+        assert!(
+            cdn.query.contains("encrypted_query_param=UP%2Bparam%3D1"),
+            "upload_param 需百分号编码后拼进 CDN 地址: {}",
+            cdn.query
+        );
+        let key = parse_aes_key_from_hex(&aeskey_hex).unwrap();
+        assert_eq!(aes_ecb_decrypt(&cdn.body_bytes, &key).unwrap(), data);
+
+        // sendmessage：文件 item 形状
+        let sm: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/sendmessage").body).unwrap();
+        assert_eq!(sm["msg"]["context_token"], "ctx-1", "context_token 必填");
+        assert_eq!(sm["msg"]["message_state"], 2, "FINISH 缺了不投递");
+        let item = &sm["msg"]["item_list"][0];
+        assert_eq!(item["type"], 4, "文件 item type=4");
+        assert_eq!(item["file_item"]["file_name"], "a.txt");
+        assert_eq!(item["file_item"]["len"], data.len().to_string());
+        assert_eq!(item["file_item"]["media"]["encrypt_type"], 1);
+        assert_eq!(
+            item["file_item"]["media"]["encrypt_query_param"],
+            "DL+param=2"
+        );
+        assert_eq!(
+            item["file_item"]["media"]["aes_key"],
+            b64::encode(aeskey_hex.as_bytes()),
+            "文件类 aes_key = base64(32 个 hex 字符)"
+        );
+    }
+
+    /// 图片分支：item=2 / media_type=1，且 aes_key 的编码与文件类**不同**
+    /// （协议：图片 base64(原始 16 字节)），并额外带 image_item.aeskey（hex）。
+    #[tokio::test]
+    async fn send_media_image_uses_image_item_and_raw_key_encoding() {
+        let server = media_mock(true).await; // 这次走 upload_full_url 分支
+        let wx = WeixinClient::new(&server.base, "tok", &server.base);
+        let data = b"fakepng".to_vec();
+
+        wx.send_media("u2", "ctx-2", OutboundMediaKind::Image, "a.png", &data)
+            .await
+            .unwrap();
+
+        let recs = server.requests.lock().unwrap().clone();
+        let up_body: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/getuploadurl").body).unwrap();
+        assert_eq!(up_body["media_type"], 1, "图片 media_type=1");
+        let aeskey_hex = up_body["aeskey"].as_str().unwrap();
+        let key = parse_aes_key_from_hex(aeskey_hex).unwrap();
+
+        // upload_full_url 直连（不再拼 query）
+        let cdn = rec(&recs, "/upload");
+        assert!(cdn.query.is_empty(), "upload_full_url 分支不该再拼 query");
+        assert_eq!(aes_ecb_decrypt(&cdn.body_bytes, &key).unwrap(), data);
+
+        let sm: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/sendmessage").body).unwrap();
+        let item = &sm["msg"]["item_list"][0];
+        assert_eq!(item["type"], 2, "图片 item type=2");
+        assert_eq!(item["image_item"]["mid_size"], 16);
+        assert_eq!(
+            item["image_item"]["aeskey"], aeskey_hex,
+            "图片额外带 hex 形式"
+        );
+        assert_eq!(
+            item["image_item"]["media"]["aes_key"],
+            b64::encode(&key),
+            "图片 aes_key = base64(原始 16 字节)"
+        );
+    }
+
+    /// AES-128-ECB(PKCS7) 加密与既有解密互为逆运算；明文长度是 16 的倍数时补整块。
+    #[test]
+    fn aes_ecb_encrypt_roundtrips_with_decrypt() {
+        let key = [7u8; 16];
+        for len in [0usize, 1, 15, 16, 17, 32, 100] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            let enc = aes_ecb_encrypt(&plain, &key);
+            assert_eq!(enc.len() % 16, 0, "密文长度必须是 16 的倍数 (len={len})");
+            assert!(enc.len() > plain.len(), "PKCS7 必补填充 (len={len})");
+            assert_eq!(aes_ecb_decrypt(&enc, &key).unwrap(), plain, "len={len}");
+        }
+    }
 
     #[test]
     fn b64_encode_works() {

@@ -1486,6 +1486,32 @@ pub(crate) mod test_mock {
         pub headers: HashMap<String, String>,
         /// 请求体（按 Content-Length 精确读）。
         pub body: String,
+        /// 请求体的**原始字节**（`body` 是 lossy 字符串视图，二进制会失真）。
+        /// CDN 上传那类二进制请求体必须用它做校验（如 AES 密文 roundtrip）。
+        pub body_bytes: Vec<u8>,
+    }
+
+    /// 一条 mock 响应：JSON body + 附加响应头。
+    /// 需要它是因为有些链路的关键信息在**响应头**里（微信 CDN 上传的
+    /// `x-encrypted-param` 就是下载参数），只给 body 的 `start()` 表达不了。
+    #[derive(Debug, Clone)]
+    pub struct MockResp {
+        pub body: Value,
+        pub headers: Vec<(String, String)>,
+    }
+
+    impl MockResp {
+        pub fn json(body: Value) -> MockResp {
+            MockResp {
+                body,
+                headers: Vec::new(),
+            }
+        }
+
+        pub fn with_header(mut self, name: &str, value: impl Into<String>) -> MockResp {
+            self.headers.push((name.to_string(), value.into()));
+            self
+        }
     }
 
     /// 本地 mock HTTP 服务器：Drop 时中止服务任务。
@@ -1499,12 +1525,26 @@ pub(crate) mod test_mock {
         /// 启动。routes: (HTTP 方法, 路径) → 响应 JSON（未命中的路由回 {"code": 404}，
         /// 让客户端错误路径也能走到 code 判定分支，而不是连接层报错）。
         pub async fn start(routes: HashMap<(String, String), Value>) -> MockServer {
+            Self::start_rich(
+                routes
+                    .into_iter()
+                    .map(|(k, v)| (k, MockResp::json(v)))
+                    .collect(),
+            )
+            .await
+        }
+
+        pub async fn start_rich(routes: HashMap<(String, String), MockResp>) -> MockServer {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind mock server");
             let addr = listener.local_addr().expect("mock addr");
             let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
             let reqs = requests.clone();
+            // 响应体里的 `{{BASE}}` 会被替换成 mock 自己的地址——有些链路要求服务端
+            // 返回**指向本 mock** 的完整 URL（如微信 getuploadurl 的 upload_full_url），
+            // 而起服务前地址未知。
+            let base_for_task = format!("http://{addr}");
             let handle = tokio::spawn(async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -1512,6 +1552,7 @@ pub(crate) mod test_mock {
                     };
                     let reqs = reqs.clone();
                     let routes = routes.clone();
+                    let base_for_task = base_for_task.clone();
                     tokio::spawn(async move {
                         // 一条连接可承载多个请求（reqwest keep-alive）：循环读到 EOF
                         loop {
@@ -1576,16 +1617,23 @@ pub(crate) mod test_mock {
                                 auth,
                                 headers,
                                 body: String::from_utf8_lossy(&body).into_owned(),
+                                body_bytes: body,
                             });
                             // 按 (method, path) 查预置响应；未命中 → 假 code=404，
                             // 让客户端走到 code 判定分支而不是连接层报错。
                             let resp = routes
                                 .get(&(method, path))
                                 .cloned()
-                                .unwrap_or_else(|| json!({"code": 404}));
-                            let resp_body = resp.to_string();
+                                .unwrap_or_else(|| MockResp::json(json!({"code": 404})));
+                            let resp_body =
+                                resp.body.to_string().replace("{{BASE}}", &base_for_task);
+                            let extra_headers: String = resp
+                                .headers
+                                .iter()
+                                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                                .collect();
                             let resp_head = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                                 resp_body.len()
                             );
                             if stream.write_all(resp_head.as_bytes()).await.is_err() {
