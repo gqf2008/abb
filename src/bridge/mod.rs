@@ -905,6 +905,15 @@ mod tests {
     }
     #[async_trait]
     impl Messenger for MockMessenger {
+        /// 附件：本挡板的断言围绕文本/话题回复，附件只需如实返回成功
+        /// （trait 已无默认实现——审查 #254 P2-2 移除静默降级）。
+        async fn send_attachment(
+            &self,
+            _chat_id: &str,
+            _meta: &crate::attachments::AttachmentMeta,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
             if let Some(f) = self.fail_chat.lock().unwrap().clone() {
                 if f == chat_id {
