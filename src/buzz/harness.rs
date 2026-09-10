@@ -617,14 +617,20 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome
             handle.dead.store(true, Ordering::Relaxed);
             l.crash_backoff = l.crash_backoff.saturating_add(1);
             let delay = respawn_delay(l.crash_backoff);
-            tracing::error!(
-                backoff_secs = delay.as_secs(),
-                "agent start failed — retrying in {}s: {detail}",
-                delay.as_secs()
-            );
+            emit_agent_start_failure(&mut std::io::stdout(), &detail, delay);
             schedule_agent_start(l, handle, delay, None);
         }
     }
+}
+
+/// 启动失败必须落到 service stdout（bridge.out）；这里不要退回 tracing——
+/// 生产进程没有 tracing subscriber，日志会静默丢掉（#246②）。
+fn emit_agent_start_failure(writer: &mut dyn std::io::Write, detail: &str, delay: Duration) {
+    crate::log_to!(
+        writer,
+        "[acp] agent start failed — retrying in {}s: {detail}",
+        delay.as_secs()
+    );
 }
 
 /// 2^level 秒指数退避，封顶 RESPAWN_BACKOFF_MAX_SECS。
@@ -1364,6 +1370,27 @@ fn redact_skill_paths(text: &str) -> String {
 }
 
 #[cfg(test)]
+mod spawn_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn agent_start_failure_is_emitted_with_spawn_detail() {
+        let mut out = Vec::new();
+        emit_agent_start_failure(
+            &mut out,
+            "failed to spawn agent: program not found",
+            Duration::from_secs(4),
+        );
+        let line = String::from_utf8(out).unwrap();
+        let (timestamp, message) = line.split_once("] ").unwrap();
+        assert!(timestamp.starts_with('['), "缺日志时间戳: {line:?}");
+        assert_eq!(
+            message,
+            "[acp] agent start failed — retrying in 4s: failed to spawn agent: program not found\n"
+        );
+    }
+}
+
 #[cfg(test)]
 mod channel_info_tests {
     use super::*;
