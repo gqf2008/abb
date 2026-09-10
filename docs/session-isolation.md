@@ -6,12 +6,13 @@
 
 ## 1. 当前隔离模型
 
-会话持久化在 `src/sessions.rs`，key 按 bot + 后端分槽。非话题消息 key 是 **chat_id 单维度**；
+会话持久化在 `src/sessions.rs`，key 单槽（单后端化 P4.2 前按后端分槽）。非话题消息 key 是 **chat_id 单维度**；
 飞书话题消息（#14 起）key 是 **`{chat_id}:{thread_id}`**：
 
 ```
-sessions.json = { key: { claude: {session_id, started}, codex: {session_id, started},
-                        pi: {session_id, started} } }
+sessions.json = { key: { session_id, started, sandbox_mode? } }   // P4.2 单槽
+（老四槽 {claude, codex, pi, buzz} 与旧扁平 {backend, ...} 在 load 时折叠迁移：
+ buzz 槽逐字保留，其余后端槽位舍弃，原件归档 sessions.json.legacy.bak）
 key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 ```
 
@@ -84,7 +85,7 @@ key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 
 ## 6. 相关代码索引
 
-- 会话持久化：`src/sessions.rs`（chat_id 单维度、per-backend 槽位）
+- 会话持久化：`src/sessions.rs`（chat_id 单维度、单槽；老四槽/旧扁平 load 时折叠迁移）
 - 并发/打断：`src/bridge.rs`（`chat_lock` / `cancel_flags` / `handle`）
 - 各平台入站：`src/bridge.rs`（`on_payload` / `on_weixin` / `on_dingtalk`）、`src/dingtalk.rs`
 - 发送：`src/feishu.rs`（`send_text` / `reply_text`）、`src/messenger.rs`（`send_thread_reply`、WeixinMessenger context_token）

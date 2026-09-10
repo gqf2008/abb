@@ -1,9 +1,20 @@
 //! 会话持久化 —— ~/.agent-bridge/workspaces/<bot>/sessions.json。
-//! 会话按后端区分（claude 的 --resume UUID、codex 的 thread_id、pi 的 --session-id
-//! UUID——三者互不通用，共用一个槽位切后端必串）：
-//! {chat_id: {claude: {session_id, started}, codex: {...}, pi: {...}}}
-//! 当前操作哪个后端的槽位由 SessionStore::new(current_backend, bot_key) 选定——即 per-bot 配置的后端。
-//! 旧扁平格式 {chat_id: {backend, session_id, started}} load 时自动迁移到对应后端的槽位。
+//! 单后端（buzz-agent）单槽 schema（单后端化 P4.2）：
+//! {chat_id: {session_id, started, sandbox_mode?}}
+//!
+//! 历史 schema（load 时一次性折叠迁移，写盘只写新格式）：
+//! - 四槽：{chat_id: {claude: {...}, codex: {...}, pi: {...}, buzz: {...}}}
+//!   （按后端分槽时代：三后端会话 id 互不通用，共槽切后端必串）
+//! - 旧扁平：{chat_id: {backend, session_id, started}}（更早的聊天切后端时代）
+//!
+//! 折叠规则（buzz 已是唯一执行层，其余后端的会话 id 对 buzz 无续聊价值）：
+//! - buzz 槽 / backend=buzz 的旧扁平记录：逐字保留（session_id/started/sandbox_mode）；
+//! - claude/codex/pi 槽与其余旧扁平记录：舍弃——不同 agent 的会话 id 互不通用，
+//!   留着只会被误当可 resume 的会话；
+//! - 数据零丢失：折叠后首次写盘前，原件逐字归档到 sessions.json.legacy.bak
+//!   （只归档一次，已有备份绝不覆盖）；归档失败则不写盘（原件不动，下轮重试）。
+//!
+//! 迁移只跑一次：新格式文件不含老键，load 不再触发折叠。
 
 use crate::config::SandboxMode;
 use serde::{Deserialize, Serialize};
@@ -13,32 +24,19 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// 单个后端的会话槽位：session_id + 是否已开过首轮（决定下轮 --resume 还是新建）。
+/// 老四槽格式的单后端槽位（session_id + 是否已开过首轮）。仅用于读老文件
+/// （SessionStore load 即折叠成单槽——claude/codex/pi 槽被丢弃；session_import 迁移车
+/// 因此**改读 sessions.json.legacy.bak** 取 legacy 槽原件，见 session_import.rs P1-1 注）。
+/// 新 schema 不再使用本类型。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Slot {
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
     pub started: bool,
-    /// #171 会话创建时的权限档位（resume 继承创建时档位，codex 沙箱在会话创建时固定）。
-    /// 档位变化对旧会话不生效 → 桥提示用户 /new 换新会话；None = 升级迁移（旧会话无记录）。
+    /// #171 会话创建时的权限档位（老 buzz 槽可能携带，折叠时逐字提升）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<SandboxMode>,
-}
-
-/// 一个 chat 的会话：按后端各存一份（缺省=该后端还没会话）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ChatEntry {
-    #[serde(default, skip_serializing_if = "Slot::is_empty")]
-    pub claude: Slot,
-    #[serde(default, skip_serializing_if = "Slot::is_empty")]
-    pub codex: Slot,
-    #[serde(default, skip_serializing_if = "Slot::is_empty")]
-    pub pi: Slot,
-    /// buzz 独立槽位（曾错误借用 claude 槽——切 buzz 后端时继承 claude 的
-    /// started/sid，注入闸误判 resume 跳过历史注入 → 上下文丢失）。
-    #[serde(default, skip_serializing_if = "Slot::is_empty")]
-    pub buzz: Slot,
 }
 
 impl Slot {
@@ -47,29 +45,51 @@ impl Slot {
     }
 }
 
-/// 旧扁平格式（聊天切后端时代）：{backend, session_id, started}，仅用于 load 迁移。
-#[derive(Deserialize)]
-struct LegacyEntry {
+/// 一个 chat 的会话槽位（单后端单槽）：session_id + 是否已开过首轮（决定下轮
+/// resume 还是新建）。平铺三键是唯一生效数据、写盘只写它们；legacy_* / claude /
+/// codex / pi / buzz 字段仅为读老文件存在（serde 只进不出：skip_serializing），
+/// load 折叠后内存中一律清空。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatEntry {
     #[serde(default)]
-    backend: String,
+    pub session_id: String,
     #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    started: bool,
+    pub started: bool,
+    /// #171 会话创建时的权限档位（resume 继承创建时档位，沙箱在会话创建时固定）。
+    /// 档位变化对旧会话不生效 → 桥提示用户 /new 换新会话；None = 升级迁移（旧会话无记录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<SandboxMode>,
+    /// 旧扁平格式 {backend, session_id, started} 的后端标记（聊天切后端时代）——
+    /// 仅 load 折叠判定用（serde rename 读盘键名，内存名带 legacy 前缀防误用）。
+    #[serde(rename = "backend", default, skip_serializing)]
+    pub legacy_backend: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub claude: Slot,
+    #[serde(default, skip_serializing)]
+    pub codex: Slot,
+    #[serde(default, skip_serializing)]
+    pub pi: Slot,
+    /// 老四槽的 buzz 槽（曾错误借用 claude 槽——切 buzz 后端时继承 claude 的
+    /// started/sid，注入闸误判 resume 跳过历史注入 → 上下文丢失）。折叠时逐字
+    /// 提升为单槽。
+    #[serde(default, skip_serializing)]
+    pub buzz: Slot,
 }
 
 pub struct SessionStore {
     path: PathBuf,
     data: Mutex<HashMap<String, ChatEntry>>,
-    /// 当前 bot 生效后端（"claude"/"codex"）——决定各方法读写哪个槽位。
-    current_backend: String,
     /// 上次加载时的文件签名 (mtime, size)。CLI/外部改 sessions.json 后按签名热重载
     /// （#23），无需重启 service 即生效——复用 JobStore 的 refresh 模式；size 与 mtime
     /// 双重判定以缓解同 tick 内 mtime 精度不足的漏检（审查 P3-2）。
     loaded_sig: Mutex<Option<(SystemTime, u64)>>,
+    /// 老结构折叠待归档：load 折叠后置位，首次写盘前先把原件逐字归档到
+    /// sessions.json.legacy.bak 再覆盖（用户数据零丢失）；归档失败则不写盘，
+    /// 置位保留到下次写盘重试。
+    pending_archive: Mutex<bool>,
 }
 
-// #194：手写 Clone——句柄式拷贝（path/后端复制，内存缓存清空）。
+// #194：手写 Clone——句柄式拷贝（path 复制，内存缓存清空）。
 // 用途：bridge 的 vb 会话存储按 chat 缓存并按值返回；文件是唯一事实源，
 // 新实例首次使用时 refresh 从盘加载，语义不变。
 impl Clone for SessionStore {
@@ -77,56 +97,44 @@ impl Clone for SessionStore {
         Self {
             path: self.path.clone(),
             data: Mutex::new(HashMap::new()),
-            current_backend: self.current_backend.clone(),
             loaded_sig: Mutex::new(None),
+            pending_archive: Mutex::new(false),
         }
     }
 }
 
+/// 文件签名 (mtime, size)：refresh/at 同源。
+fn file_sig(path: &std::path::Path) -> Option<(SystemTime, u64)> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())))
+}
+
 impl SessionStore {
-    pub fn new(current_backend: &str, bot_key: &str) -> SessionStore {
+    pub fn new(bot_key: &str) -> SessionStore {
         let dir = crate::bridge_dir().join("workspaces").join(bot_key);
         let _ = fs::create_dir_all(&dir);
-        Self::at(current_backend, dir.join("sessions.json"))
+        Self::at(dir.join("sessions.json"))
     }
 
     /// 按指定路径构造（生产/测试共用；会话归纳清理测试注入 temp workspace）。
-    pub(crate) fn at(current_backend: &str, path: PathBuf) -> SessionStore {
-        let data = if path.exists() {
-            fs::read_to_string(&path)
-                .ok()
-                .and_then(|t| Self::parse(&t))
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-        let sig = fs::metadata(&path)
-            .ok()
-            .and_then(|m| Some((m.modified().ok()?, m.len())));
-        SessionStore {
+    pub(crate) fn at(path: PathBuf) -> SessionStore {
+        let store = SessionStore {
             path,
-            data: Mutex::new(data),
-            current_backend: current_backend.to_string(),
-            loaded_sig: Mutex::new(sig),
-        }
-    }
-
-    #[cfg(test)]
-    fn new_at(current_backend: &str, path: PathBuf) -> SessionStore {
-        Self::at(current_backend, path)
-    }
-
-    /// 当前生效后端（bridge 的 vb 会话存储按 bot 生效后端建实例，#194）。
-    pub(crate) fn backend(&self) -> &str {
-        &self.current_backend
+            data: Mutex::new(HashMap::new()),
+            loaded_sig: Mutex::new(None),
+            pending_archive: Mutex::new(false),
+        };
+        store.reload();
+        store
     }
 
     /// #194：chat 的会话存储——虚拟 Bot 群 → 独立工作区 vb/<uuid>/sessions.json
     ///（含存量迁移），其余 → bot 级。CLI 管理面（reset/show/delete）与桥共用路由。
-    pub fn store_for_chat(current_backend: &str, bot_key: &str, chat_id: &str) -> SessionStore {
+    pub fn store_for_chat(bot_key: &str, chat_id: &str) -> SessionStore {
         let dir = crate::virtualbot::ensure_vb_dir(bot_key, chat_id)
             .unwrap_or_else(|| crate::workspace_dir(bot_key));
-        SessionStore::at(current_backend, dir.join("sessions.json"))
+        SessionStore::at(dir.join("sessions.json"))
     }
 
     /// 若 sessions.json 的 (mtime, size) 比上次加载新（CLI/外部进程改了），重新读盘。
@@ -138,70 +146,140 @@ impl SessionStore {
     /// （lost update）。彻底修复需进程间文件锁（advisory lock），且 JobStore 同模式同问题，
     /// 宜独立架构升级；reset 幂等（丢失可重试），实际窗口在毫秒级同步路径内。
     fn refresh(&self) {
-        let cur = fs::metadata(&self.path)
-            .ok()
-            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        let cur = file_sig(&self.path);
         let stale = { *self.loaded_sig.lock().unwrap() != cur };
         if !stale {
             return;
         }
-        if let Ok(text) = fs::read_to_string(&self.path) {
-            if let Some(data) = Self::parse(&text) {
-                *self.data.lock().unwrap() = data;
-                // 只有解析成功才推进 sig：临时读失败/外部写了坏文件时不吞掉重试机会
-                *self.loaded_sig.lock().unwrap() = cur;
-            }
+        self.reload();
+    }
+
+    /// 从盘加载（at 首载与 refresh 热重载共用同一路径）：老格式在内存折叠后立即
+    /// 归档原件 + 落盘新格式——迁移只跑一次（落盘后的新格式不再触发折叠）。
+    /// 只有解析成功才推进 sig：临时读失败/坏文件不吞掉重试机会。
+    fn reload(&self) {
+        let cur = file_sig(&self.path);
+        let Ok(text) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        let Some((data, migrated)) = Self::parse(&text) else {
+            return;
+        };
+        *self.data.lock().unwrap() = data;
+        *self.loaded_sig.lock().unwrap() = cur;
+        if migrated {
+            *self.pending_archive.lock().unwrap() = true;
+            let data = self.data.lock().unwrap();
+            // 立即落盘新格式（内含原件归档）；失败则 pending_archive 保持置位，
+            // 下次写盘重试，盘上原件不动。
+            self.save_locked(&data);
         }
     }
 
-    /// 解析 sessions.json：先试新格式（按后端分槽），失败再按旧扁平格式迁移。
-    fn parse(text: &str) -> Option<HashMap<String, ChatEntry>> {
-        // 新格式直接命中（含真实的 claude/codex 键）才算数——serde 对旧扁平格式也会"解析成功"
-        // （backend/session_id/started 被当未知键忽略、claude/codex 缺省为空），结果全空、迁移分支走不到。
-        // 故只有解析出非空槽位才采纳新格式，否则回退旧格式迁移。
-        if let Ok(m) = serde_json::from_str::<HashMap<String, ChatEntry>>(text) {
-            let has_data = m.values().any(|e| {
-                !e.claude.session_id.is_empty()
-                    || !e.codex.session_id.is_empty()
-                    || !e.pi.session_id.is_empty()
-                    || !e.buzz.session_id.is_empty()
-            });
-            if has_data || m.is_empty() {
-                return Some(m);
-            }
-        }
-        // 旧格式：{chat_id: {backend, session_id, started}} → 落到该 backend 的槽位
-        let legacy = serde_json::from_str::<HashMap<String, LegacyEntry>>(text).ok()?;
-        let mut out = HashMap::new();
-        for (chat_id, e) in legacy {
-            if e.session_id.is_empty() {
+    /// 解析 sessions.json：统一读三种 schema（新单槽 / 老四槽 / 旧扁平），返回
+    /// （折叠后数据, 是否折叠了老结构）。老键一律只进不出——折叠只认平铺三键。
+    fn parse(text: &str) -> Option<(HashMap<String, ChatEntry>, bool)> {
+        let raw: HashMap<String, ChatEntry> = serde_json::from_str(text).ok()?;
+        let mut migrated = false;
+        let mut out = HashMap::with_capacity(raw.len());
+        for (chat_id, e) in raw {
+            let has_legacy = e.legacy_backend.is_some()
+                || !e.claude.is_empty()
+                || !e.codex.is_empty()
+                || !e.pi.is_empty()
+                || !e.buzz.is_empty();
+            if !has_legacy {
+                out.insert(chat_id, e);
                 continue;
             }
-            let slot = Slot {
+            migrated = true;
+            let folded = Self::fold_legacy_entry(e);
+            // 折叠后无会话状态（仅非 buzz 槽/记录）→ 整条移除（空槽不携带任何状态，
+            // 下一条消息 ensure 自动重建全新会话）。
+            if !folded.session_id.is_empty() || folded.started {
+                out.insert(chat_id, folded);
+            }
+        }
+        Some((out, migrated))
+    }
+
+    /// 老条目折叠为单槽：buzz 数据逐字保留，其余后端槽位/记录舍弃（不同 agent 的
+    /// 会话 id 互不通用，对 buzz 无续聊价值；原件见 sessions.json.legacy.bak）。
+    fn fold_legacy_entry(e: ChatEntry) -> ChatEntry {
+        // 旧扁平格式 {backend, session_id, started}：仅 backend=buzz 的记录保留
+        if let Some(backend) = &e.legacy_backend {
+            if backend.eq_ignore_ascii_case("buzz") || backend.eq_ignore_ascii_case("buzz-agent") {
+                return ChatEntry {
+                    session_id: e.session_id,
+                    started: e.started,
+                    sandbox_mode: e.sandbox_mode,
+                    ..Default::default()
+                };
+            }
+            return ChatEntry::default();
+        }
+        // 新格式平铺键与老槽并存（异常形态，如手工合并的文件）：平铺键优先，老槽舍弃。
+        // 仅当平铺 session_id 非空才优先（审查 P3-1：空 sid 但 started=true 的异常平铺
+        // 不得把有效 buzz 槽 sid 顶掉——顶掉虽无害（重启即清、ensure 重建），但白丢一份
+        // 可续聊的 buzz 会话；fallback 到老四槽臂逐字提升 buzz 槽）。
+        if !e.session_id.is_empty() {
+            return ChatEntry {
                 session_id: e.session_id,
                 started: e.started,
+                sandbox_mode: e.sandbox_mode,
                 ..Default::default()
             };
-            let mut entry = ChatEntry::default();
-            if e.backend.eq_ignore_ascii_case("codex") {
-                entry.codex = slot;
-            } else if e.backend.eq_ignore_ascii_case("pi") {
-                entry.pi = slot;
-            } else if e.backend.eq_ignore_ascii_case("buzz")
-                || e.backend.eq_ignore_ascii_case("buzz-agent")
-            {
-                entry.buzz = slot;
-            } else if e.backend.eq_ignore_ascii_case("prime-agent") {
-                continue; // #92 收敛：prime-agent 后端下线，旧会话 id 不再可续（不迁移）
-            } else {
-                entry.claude = slot; // 默认/旧值一律归 claude
-            }
-            out.insert(chat_id, entry);
         }
-        Some(out)
+        // 老四槽格式：buzz 槽逐字提升为单槽，claude/codex/pi 槽舍弃
+        ChatEntry {
+            session_id: e.buzz.session_id,
+            started: e.buzz.started,
+            sandbox_mode: e.buzz.sandbox_mode,
+            ..Default::default()
+        }
+    }
+
+    /// 折叠后首次写盘前归档原件：<file>.legacy.bak（sessions.json.legacy.bak）。
+    /// 「不存在才建」（tmp + hard_link 原子语意）：并发进程/崩溃重入都不覆盖已有
+    /// 备份——保留最老原件。盘上无原件（全新工作区）按已归档放行。归档失败返回
+    /// false——save_locked 据此不写盘（绝不无备份覆盖用户数据）。
+    fn archive_original(&self) -> bool {
+        let bak = self.path.with_extension("json.legacy.bak");
+        if bak.exists() {
+            return true;
+        }
+        let Ok(bytes) = fs::read(&self.path) else {
+            return true;
+        };
+        let tmp = self
+            .path
+            .with_extension(format!("json.legacy.tmp.{}", uuid::Uuid::new_v4()));
+        let ok = fs::write(&tmp, bytes).is_ok()
+            && match fs::hard_link(&tmp, &bak) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+                Err(_) => false,
+            };
+        let _ = fs::remove_file(&tmp);
+        ok
     }
 
     fn save_locked(&self, data: &HashMap<String, ChatEntry>) -> bool {
+        // 老结构折叠后的首次写盘：先归档原件再覆盖（数据零丢失）；归档失败不写盘，
+        // pending 保持置位，下次写盘重试。
+        {
+            let mut pending = self.pending_archive.lock().unwrap();
+            if *pending {
+                if !self.archive_original() {
+                    crate::log!(
+                        "[sessions] ⚠️ 原件归档失败，本次不写盘（保留老格式原件，下轮重试）: {}",
+                        self.path.display()
+                    );
+                    return false;
+                }
+                *pending = false;
+            }
+        }
         // 原子写：唯一 tmp + rename（崩溃不留半截；唯一 tmp 避免 CLI reset 与 service
         // 写盘并发时互相覆盖同一 tmp 文件）
         let tmp = self
@@ -210,9 +288,7 @@ impl SessionStore {
         if let Ok(text) = serde_json::to_string_pretty(data) {
             if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
                 // 写完即推进 sig，避免下次公开方法再读盘（磁盘==内存）
-                *self.loaded_sig.lock().unwrap() = fs::metadata(&self.path)
-                    .ok()
-                    .and_then(|m| Some((m.modified().ok()?, m.len())));
+                *self.loaded_sig.lock().unwrap() = file_sig(&self.path);
                 return true;
             }
         }
@@ -220,36 +296,7 @@ impl SessionStore {
         false
     }
 
-    /// 取当前后端槽位的可变引用（没有则建默认槽位）。
-    fn slot_mut<'a>(entry: &'a mut ChatEntry, backend: &str) -> &'a mut Slot {
-        if backend.eq_ignore_ascii_case("codex") {
-            &mut entry.codex
-        } else if backend.eq_ignore_ascii_case("pi") {
-            &mut entry.pi
-        } else if backend.eq_ignore_ascii_case("buzz") || backend.eq_ignore_ascii_case("buzz-agent")
-        {
-            &mut entry.buzz
-        } else {
-            &mut entry.claude
-        }
-    }
-
-    /// slot_mut 的只读镜像（is_started 等只读取方用）——同一 backend→槽位映射，
-    /// 两实现必须同步演进（P4.1：buzz/buzz-agent → buzz 槽）。
-    fn slot_ref<'a>(entry: &'a ChatEntry, backend: &str) -> &'a Slot {
-        if backend.eq_ignore_ascii_case("codex") {
-            &entry.codex
-        } else if backend.eq_ignore_ascii_case("pi") {
-            &entry.pi
-        } else if backend.eq_ignore_ascii_case("buzz") || backend.eq_ignore_ascii_case("buzz-agent")
-        {
-            &entry.buzz
-        } else {
-            &entry.claude
-        }
-    }
-
-    /// 返回该 chat 在当前后端的 session_id，没有则新建 UUID。
+    /// 返回该 chat 的 session_id，没有则新建 UUID。
     ///
     /// 生产 bridge 已改用 `ensure_with_started` 合并快照（审查 P3-1a）；此方法保留作
     /// 细粒度公共 API 与测试辅助。
@@ -258,13 +305,12 @@ impl SessionStore {
         self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
-        let slot = Self::slot_mut(entry, &self.current_backend);
-        if !slot.session_id.is_empty() {
-            return slot.session_id.clone();
+        if !entry.session_id.is_empty() {
+            return entry.session_id.clone();
         }
         let sid = uuid::Uuid::new_v4().to_string();
-        slot.session_id = sid.clone();
-        slot.started = false;
+        entry.session_id = sid.clone();
+        entry.started = false;
         self.save_locked(&data);
         sid
     }
@@ -276,20 +322,19 @@ impl SessionStore {
         self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
-        let slot = Self::slot_mut(entry, &self.current_backend);
-        if slot.session_id.is_empty() {
+        if entry.session_id.is_empty() {
             let sid = uuid::Uuid::new_v4().to_string();
-            slot.session_id = sid.clone();
-            slot.started = false;
+            entry.session_id = sid.clone();
+            entry.started = false;
             self.save_locked(&data);
             (sid, false)
         } else {
-            (slot.session_id.clone(), slot.started)
+            (entry.session_id.clone(), entry.started)
         }
     }
 
-    /// 仅当该 chat 当前槽位的 session_id == expected 时置 started=true（#23 审查修复）：
-    /// 任务运行中若被 /new 或 CLI `session reset` 换走（当前槽位已不是本次任务的会话），
+    /// 仅当该 chat 槽位的 session_id == expected 时置 started=true（#23 审查修复）：
+    /// 任务运行中若被 /new 或 CLI `session reset` 换走（槽位已不是本次任务的会话），
     /// 旧任务完成不得把新槽位 mark 成 started——否则下一条会误 resume 一个从未运行的新 UUID。
     /// 返回是否真的标记了（false = 槽位已被换走/不存在）。
     pub fn mark_started_if(&self, chat_id: &str, expected_session_id: &str) -> bool {
@@ -298,19 +343,18 @@ impl SessionStore {
         let Some(entry) = data.get_mut(chat_id) else {
             return false;
         };
-        let slot = Self::slot_mut(entry, &self.current_backend);
-        if slot.session_id != expected_session_id {
+        if entry.session_id != expected_session_id {
             return false;
         }
-        slot.started = true;
+        entry.started = true;
         self.save_locked(&data);
         true
     }
 
     /// 服务启动复位：ACP 单轨（harness）时代 agent 会话不跨进程存活——每次
-    /// ABB 重启 = 全部后端 harness 会话归零，盘上持久化的 started/sid 是上个
-    /// 进程的谎言。全部槽位清空后，每个 chat 在新进程的首轮走 !resume → 注入
-    /// 闸（marker 失配）→ 历史注入，上下文跨重启/跨后端衔接（#49 语义）。
+    /// ABB 重启 = harness 会话归零，盘上持久化的 started/sid 是上个进程的谎言。
+    /// 全部槽位清空后，每个 chat 在新进程的首轮走 !resume → 注入闸（marker 失配）
+    /// → 历史注入，上下文跨重启衔接（#49 语义）。
     ///
     /// 由 service 在 Bridge 构建后调用（bot 级存储）；vb 会话存储在 sessions_for
     /// 首建实例时同样复位（进程内首次使用 = 服务启动后的首次使用）。
@@ -319,17 +363,10 @@ impl SessionStore {
         let mut data = self.data.lock().unwrap();
         let mut changed = false;
         for entry in data.values_mut() {
-            for slot in [
-                &mut entry.claude,
-                &mut entry.codex,
-                &mut entry.pi,
-                &mut entry.buzz,
-            ] {
-                if !slot.session_id.is_empty() || slot.started {
-                    slot.session_id.clear();
-                    slot.started = false;
-                    changed = true;
-                }
+            if !entry.session_id.is_empty() || entry.started {
+                entry.session_id.clear();
+                entry.started = false;
+                changed = true;
             }
         }
         if changed {
@@ -338,19 +375,18 @@ impl SessionStore {
     }
 
     /// 会话重建：换新 UUID 且复位 started=false，返回新 session_id。
-    /// claude 用（#6/#7）：jsonl 残留 already in use / 启动挂起后，旧 UUID 槽位永久不可用，
-    /// 必须换新（started=false → 下轮走 --session-id 新 UUID）；resume 槽位也一并复位。
+    /// 旧 UUID 槽位永久不可用（jsonl 残留/启动挂起等自愈场景）时必须换新
+    ///（started=false → 下轮走新 UUID 首轮）；resume 槽位也一并复位。
     pub fn reset_session(&self, chat_id: &str) -> String {
         self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
-        let slot = Self::slot_mut(entry, &self.current_backend);
         let sid = uuid::Uuid::new_v4().to_string();
-        slot.session_id = sid.clone();
-        slot.started = false;
+        entry.session_id = sid.clone();
+        entry.started = false;
         // #171：重建即新会话——清档位记录，下一轮按当前配置重新记录（防旧档位残留导致
         // 新会话误报「档位已变化」）。
-        slot.sandbox_mode = None;
+        entry.sandbox_mode = None;
         self.save_locked(&data);
         sid
     }
@@ -358,57 +394,59 @@ impl SessionStore {
     /// #171 权限档位变化感知；#185 修正语义：#180 起 resume 按**当前解析档位**运行
     /// （全权限档位还会追加 bypass），旧文案「仍按创建时档位」失实、不覆盖记录会
     /// 每条消息刷屏——现改为提示一次并把记录覆盖为本轮档位。
-    /// #198：codex 档位变更**自动重建会话**（轮换 sid、started 复位——等价 reset），
-    /// 本轮以全新 exec 按新档位运行（resume 继承首轮沙箱，不重建新档位不生效）；
-    /// claude 不轮换（每轮旗标即生效）、pi 无沙箱体系。
+    /// `rotate_on_change`：档位变更是否轮换会话（新 sid + started 复位，等价 reset）
+    /// ——由调用方按后端语义决定（#198：codex resume 继承首轮沙箱，不轮换新档位
+    /// 不生效；claude 每轮旗标即生效，轮换反而丢上下文；buzz 经 session/new `_meta`
+    /// 下发档位，是否需轮换由 P4.1 接线时定）。rotated=true 时调用方置 rebuilt
+    /// 让桥写 pending 标记，下一条消息注入历史一次（上下文接续）。
     ///
     /// 语义：
     /// - 新会话（started=false）：记录当前档位，返回 None（本轮即以当前档位运行）；
     /// - 既有会话无记录（升级迁移）：补记当前档位，返回 None（无从判断是否变化，不误报）；
-    /// - 既有会话记录 ≠ 当前：返回 (提示一次, rotated)，记录覆盖为本轮档位
-    ///   （rotated=true=codex：调用方置 rebuilt 让桥写 pending 标记，下一条消息
-    ///   注入历史一次——上下文接续）。
+    /// - 既有会话记录 ≠ 当前：返回 (提示一次, rotated)，记录覆盖为本轮档位。
     // P4.1：codex/claude 档位轮换自愈已随 Backend 删除（沙箱档改由 harness `_meta` 下发，
-    // P2.2/P2.3）；本方法生产无调用点，仅测试锚定 codex 轮换臂——保留至后端族测试清理批次。
+    // P2.2/P2.3）；本方法生产无调用点，仅测试锚定轮换臂——保留至后端族测试清理批次（P4.4）。
+    // P4.2：轮换判定上移至签名参数 rotate_on_change（SessionStore 不再持有后端概念）。
     #[allow(dead_code)]
-    pub fn check_sandbox_mode(&self, chat_id: &str, mode: &SandboxMode) -> Option<(String, bool)> {
+    pub fn check_sandbox_mode(
+        &self,
+        chat_id: &str,
+        mode: &SandboxMode,
+        rotate_on_change: bool,
+    ) -> Option<(String, bool)> {
         self.refresh();
         let mut data = self.data.lock().unwrap();
         let entry = data.entry(chat_id.to_string()).or_default();
-        let slot = Self::slot_mut(entry, &self.current_backend);
-        if slot.session_id.is_empty() {
+        if entry.session_id.is_empty() {
             return None; // 无会话（ensure 未建）：不落记录
         }
-        if !slot.started {
-            if slot.sandbox_mode.as_ref() != Some(mode) {
-                slot.sandbox_mode = Some(*mode);
+        if !entry.started {
+            if entry.sandbox_mode.as_ref() != Some(mode) {
+                entry.sandbox_mode = Some(*mode);
                 self.save_locked(&data);
             }
             return None;
         }
-        match slot.sandbox_mode {
+        match entry.sandbox_mode {
             None => {
                 // 升级迁移：旧会话无档位记录 → 补记当前值，不提示（无从判断是否变化）。
-                slot.sandbox_mode = Some(*mode);
+                entry.sandbox_mode = Some(*mode);
                 self.save_locked(&data);
                 None
             }
             Some(recorded) if recorded != *mode => {
                 // #185：提示一次 + 记录即覆盖为本轮档位（提示至多一次、文案与实际一致）。
-                // #198：codex 档位变更 → 自动重建会话（等价 reset：轮换 sid、started
-                // 复位）——resume 继承首轮沙箱（#196 实测 0.150.1），不重建则新档位
-                // 不生效（切到 workspace-write 写不了）。重建后本轮以全新 exec 按新
-                // 档位运行；调用方据 rotated 置 rebuilt → 桥写 pending 标记，下一条
-                // 消息注入历史一次（上下文接续）。仅 codex：claude 每轮旗标即生效
-                //（轮换反而丢上下文）、pi 无沙箱体系。
-                let should_rotate = self.current_backend.eq_ignore_ascii_case("codex");
-                if should_rotate {
-                    slot.session_id = uuid::Uuid::new_v4().to_string();
-                    slot.started = false;
+                // #198：rotate_on_change → 轮换 sid、started 复位（等价 reset）——
+                // resume 继承首轮沙箱的后端（codex）不轮换则新档位不生效；轮换后本轮
+                // 以全新会话按新档位运行，调用方据 rotated 置 rebuilt → 桥写 pending
+                // 标记，下一条消息注入历史一次（上下文接续）。
+                if rotate_on_change {
+                    entry.session_id = uuid::Uuid::new_v4().to_string();
+                    entry.started = false;
                 }
-                slot.sandbox_mode = Some(*mode);
+                entry.sandbox_mode = Some(*mode);
                 self.save_locked(&data);
-                let hint = if should_rotate {
+                let hint = if rotate_on_change {
                     format!(
                         "⚠️ 权限档位已变化：已自动重建会话（本轮起按「{}」运行，此前「{}」；旧会话上下文将在下一条消息注入接续）。",
                         mode.as_str(),
@@ -421,13 +459,13 @@ impl SessionStore {
                         recorded.as_str()
                     )
                 };
-                Some((hint, should_rotate))
+                Some((hint, rotate_on_change))
             }
             Some(_) => None,
         }
     }
 
-    /// #194：把本 chat 的全部后端槽位搬到目标 store（虚拟 Bot 独立工作区迁移）。
+    /// #194：把本 chat 的槽位搬到目标 store（虚拟 Bot 独立工作区迁移）。
     /// 源删除、目标写入（目标已有该 chat 则不覆盖，防迁移覆盖新数据）。幂等：
     /// 源无条目即 no-op。返回是否搬了东西。
     pub fn extract_chat_to(&self, chat_id: &str, dst: &SessionStore) -> bool {
@@ -447,17 +485,8 @@ impl SessionStore {
         let mut moved = Vec::new();
         for k in &keys {
             let entry = data.remove(k).unwrap();
-            // 四槽全空（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃。
-            // （审查 P2-1：原只查 claude/codex/pi 三槽漏 buzz——单后端世界活会话恒在
-            // buzz 槽，仅 buzz 槽有会话的 chat 会被误判 empty 而丢迁移。）
-            let empty = entry.claude.session_id.is_empty()
-                && !entry.claude.started
-                && entry.codex.session_id.is_empty()
-                && !entry.codex.started
-                && entry.pi.session_id.is_empty()
-                && !entry.pi.started
-                && entry.buzz.session_id.is_empty()
-                && !entry.buzz.started;
+            // 空槽（无会话、未开首轮）＝没有值得迁移的状态：直接丢弃
+            let empty = entry.session_id.is_empty() && !entry.started;
             if !empty {
                 moved.push((k.clone(), entry));
             }
@@ -476,12 +505,12 @@ impl SessionStore {
         true
     }
 
-    /// set_session_id 的 CAS 版本：仅当该 chat 当前槽位的 session_id == expected 时回存，
+    /// set_session_id 的 CAS 版本：仅当该 chat 槽位的 session_id == expected 时回存，
     /// 返回是否真的回存。任务运行中槽位被 /new 或 CLI `session reset` 换走时（槽位已不是
     /// 本次任务启动时的会话），不得把旧任务的会话 id 写进新槽位——否则桥的
     /// mark_started_if 会匹配旧会话，把新会话标成旧会话的 started，下一条 resume
-    /// 旧会话、/new 失效（#49 审查：codex 首轮运行中 /new 的交错场景）。
-    /// （原无条件覆盖版 set_session_id 已被本方法取代：调用方是 codex 首轮回存——
+    /// 旧会话、/new 失效（#49 审查：首轮回存与 /new 的交错场景）。
+    ///（原无条件覆盖版 set_session_id 已被本方法取代：调用方是首轮回存——
     /// 用对端自生成的真实会话 id，必须先验证槽位身份再写。）
     // P4.1：codex 首轮回存已删——生产唯一调用点消失，现仅 MockAgentRunner（测试挡板）
     // 模拟 already-in-use 自愈回存调用；保留为 CAS 原语供测试缝。
@@ -492,43 +521,39 @@ impl SessionStore {
         let Some(entry) = data.get_mut(chat_id) else {
             return false;
         };
-        let slot = Self::slot_mut(entry, &self.current_backend);
-        if slot.session_id != expected {
+        if entry.session_id != expected {
             return false;
         }
-        if slot.session_id != session_id {
-            slot.session_id = session_id.to_string();
+        if entry.session_id != session_id {
+            entry.session_id = session_id.to_string();
             self.save_locked(&data);
         }
         true
     }
 
-    /// 该 chat 当前后端是否已开过首轮（只读查询）。bridge 走合并快照，此方法保留作
+    /// 该 chat 是否已开过首轮（只读查询）。bridge 走合并快照，此方法保留作
     /// 细粒度查询 API 与测试辅助（审查 P3-1a）。
     #[allow(dead_code)]
     pub fn is_started(&self, chat_id: &str) -> bool {
         self.refresh();
         let data = self.data.lock().unwrap();
-        data.get(chat_id)
-            .map(|e| Self::slot_ref(e, &self.current_backend).started)
-            .unwrap_or(false)
+        data.get(chat_id).map(|e| e.started).unwrap_or(false)
     }
 
-    /// 读某 chat 的完整槽位（所有后端）。不存在返回 None。
-    /// 会话归纳清理（session_gc）用它取各后端 sid，精确匹配删除对应会话文件。
+    /// 读某 chat 的完整槽位。不存在返回 None。
     pub fn chat_entry(&self, chat_id: &str) -> Option<ChatEntry> {
         self.refresh();
         self.data.lock().unwrap().get(chat_id).cloned()
     }
 
     /// 枚举全部 chat key（会话归纳候选判定用；与 parse/refresh 同源——sessions.json
-    /// 的解析/旧格式迁移只此一处，schema 演进不绕行裸读）。
+    /// 的解析/折叠迁移只此一处，schema 演进不绕行裸读）。
     pub fn chat_keys(&self) -> Vec<String> {
         self.refresh();
         self.data.lock().unwrap().keys().cloned().collect()
     }
 
-    /// 删除某 chat 的整个槽位（会话归纳清理用：历史与后端会话文件已清，槽位无意义）。
+    /// 删除某 chat 的槽位（会话归纳清理用：历史已清，槽位无意义）。
     /// 返回是否真的删除了且**落盘成功**（save 失败返回 false，调用方据此保留会话状态，
     /// 避免陈旧槽位指向已删文件）；下一个 `ensure_with_started` 会自动重建新 UUID。
     pub fn remove_chat(&self, chat_id: &str) -> bool {
@@ -550,32 +575,16 @@ impl SessionStore {
         }
     }
 
-    /// 枚举指定后端**全部 chat** 存活槽位的 session_id（#67 /new 清理用）。
-    /// 会话目录是 per-bot、槽位是 per-chat——清理会话文件必须知道哪些 id
+    /// 枚举**全部 chat** 存活槽位的 session_id（tidy 孤儿清理的 live 集，#67）。
+    /// 会话文件目录是 per-bot、槽位是 per-chat——清理会话文件必须知道哪些 id
     /// 仍被别的聊天占用（误删会让别的聊天静默丢上下文）。
-    pub fn live_session_ids(&self, backend: &str) -> Vec<String> {
+    pub fn live_session_ids(&self) -> Vec<String> {
         self.refresh();
         let data = self.data.lock().unwrap();
-        let mut ids = Vec::new();
-        for e in data.values() {
-            let sid = if backend.eq_ignore_ascii_case("codex") {
-                &e.codex.session_id
-            } else if backend.eq_ignore_ascii_case("pi") {
-                &e.pi.session_id
-            } else if backend.eq_ignore_ascii_case("buzz")
-                || backend.eq_ignore_ascii_case("buzz-agent")
-            {
-                // 审查 P3-1：补 buzz 臂——current_backend 现已恒 "buzz"，缺臂会把
-                // buzz 调用落 else 误读 claude 槽（与 slot_ref/slot_mut 同表派生）。
-                &e.buzz.session_id
-            } else {
-                &e.claude.session_id
-            };
-            if !sid.is_empty() {
-                ids.push(sid.clone());
-            }
-        }
-        ids
+        data.values()
+            .filter(|e| !e.session_id.is_empty())
+            .map(|e| e.session_id.clone())
+            .collect()
     }
 }
 
@@ -583,14 +592,225 @@ impl SessionStore {
 mod tests {
     use super::*;
 
-    /// #194：extract_chat_to——整 chat 槽位搬到目标 store（虚拟 Bot 独立工作区迁移），
-    /// 源移除、目标不覆盖已有、幂等。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("abb-sessions-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // ── P4.2 升级回归：老四槽 → 单槽折叠（用户数据零丢失是硬指标）──
+
+    #[test]
+    fn folds_four_slot_format_keeping_buzz_verbatim() {
+        // 老四槽文件 → load：buzz 槽逐字保留（sid/started/sandbox_mode）；
+        // claude/codex/pi 槽舍弃；仅非 buzz 槽的 chat 整条移除
+        let dir = temp_dir("fold4");
+        let path = dir.join("sessions.json");
+        let legacy = r#"{
+  "oc_buzz": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": true}, "pi": {"session_id": "p-uuid", "started": true}, "buzz": {"session_id": "b-uuid", "started": true, "sandbox_mode": "workspace-write"}},
+  "oc_only_legacy": {"claude": {"session_id": "c2-uuid", "started": true}, "pi": {"session_id": "p2-uuid", "started": false}},
+  "oc_codex_only": {"codex": {"session_id": "x2-tid", "started": true}}
+}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = SessionStore::at(path.clone());
+        // buzz 槽逐字提升（含 sandbox_mode）
+        let e = store.chat_entry("oc_buzz").expect("buzz 槽保留");
+        assert_eq!(e.session_id, "b-uuid");
+        assert!(e.started);
+        assert_eq!(e.sandbox_mode, Some(SandboxMode::WorkspaceWrite));
+        // 仅非 buzz 槽的 chat：会话 id 对 buzz 无意义 → 整条移除
+        assert!(store.chat_entry("oc_only_legacy").is_none());
+        assert!(store.chat_entry("oc_codex_only").is_none());
+        // 折叠即落盘新格式：文件只剩平铺键，无任何后端槽位键
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("b-uuid"));
+        for k in [
+            "\"claude\"",
+            "\"codex\"",
+            "\"pi\"",
+            "\"buzz\"",
+            "\"backend\"",
+        ] {
+            assert!(!text.contains(k), "新格式不得含老键 {k}: {text}");
+        }
+        // 原件逐字归档（用户数据零丢失）
+        let bak = std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap();
+        assert_eq!(bak, legacy, "备份必须逐字等于原件");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_runs_only_once() {
+        // 折叠迁移只跑一次：第二实例 load 新格式不再触发迁移——
+        // 备份不被改写（保留最老原件），文件内容稳定
+        let dir = temp_dir("once");
+        let path = dir.join("sessions.json");
+        let legacy = r#"{"oc_x": {"buzz": {"session_id": "b-uuid", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let store1 = SessionStore::at(path.clone());
+        assert_eq!(store1.chat_entry("oc_x").unwrap().session_id, "b-uuid");
+        let new_text = std::fs::read_to_string(&path).unwrap();
+        let bak_path = path.with_extension("json.legacy.bak");
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), legacy);
+
+        // 第二实例：新格式 load 不触发迁移（无二次改写、备份不动）
+        let store2 = SessionStore::at(path.clone());
+        assert_eq!(store2.chat_entry("oc_x").unwrap().session_id, "b-uuid");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            new_text,
+            "新格式 load 不得改写文件"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bak_path).unwrap(),
+            legacy,
+            "备份不得被二次迁移覆盖"
+        );
+
+        // 常规写盘（新格式）也不再触碰备份
+        store2.reset_session("oc_x");
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), legacy);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_format_does_not_trigger_migration() {
+        // 新格式 load：不产生备份文件、不改写原文件
+        let dir = temp_dir("newfmt");
+        let path = dir.join("sessions.json");
+        let text =
+            r#"{"oc_x": {"session_id": "b-uuid", "started": true, "sandbox_mode": "read-only"}}"#;
+        std::fs::write(&path, text).unwrap();
+        let store = SessionStore::at(path.clone());
+        let e = store.chat_entry("oc_x").unwrap();
+        assert_eq!(e.session_id, "b-uuid");
+        assert!(e.started);
+        assert_eq!(e.sandbox_mode, Some(SandboxMode::ReadOnly));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "原件不动");
+        assert!(
+            !path.with_extension("json.legacy.bak").exists(),
+            "新格式不产生迁移备份"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folds_legacy_flat_format_by_backend() {
+        // 旧扁平格式 {backend, session_id, started}：buzz 记录保留，其余后端舍弃
+        let dir = temp_dir("flat");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_b": {"backend": "buzz", "session_id": "b-uuid", "started": true}, "oc_c": {"backend": "claude", "session_id": "c-uuid", "started": true}, "oc_x": {"backend": "codex", "session_id": "x-tid", "started": true}, "oc_p": {"backend": "pi", "session_id": "p-uuid", "started": false}, "oc_q": {"backend": "prime-agent", "session_id": "q-uuid", "started": true}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::at(path.clone());
+        let e = store.chat_entry("oc_b").expect("buzz 旧扁平记录保留");
+        assert_eq!(e.session_id, "b-uuid");
+        assert!(e.started);
+        for k in ["oc_c", "oc_x", "oc_p", "oc_q"] {
+            assert!(store.chat_entry(k).is_none(), "非 buzz 旧扁平记录舍弃: {k}");
+        }
+        // 原件已归档
+        assert!(path.with_extension("json.legacy.bak").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fold_prefers_flat_keys_when_mixed() {
+        // 异常形态：平铺新键与老槽并存（手工合并等）→ 平铺键优先，老槽舍弃
+        let dir = temp_dir("mixed");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_x": {"session_id": "flat-sid", "started": true, "buzz": {"session_id": "slot-sid", "started": false}}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::at(path.clone());
+        let e = store.chat_entry("oc_x").unwrap();
+        assert_eq!(e.session_id, "flat-sid", "平铺键优先");
+        assert!(e.started);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("slot-sid"), "老槽已清除: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fold_empty_flat_sid_falls_back_to_buzz_slot() {
+        // 审查 P3-1：平铺键空 sid 但 started=true 的异常形态，不得把有效 buzz 槽 sid 顶掉——
+        // 空平铺不 overriding，fallback 老四槽臂逐字提升 buzz 槽。
+        let dir = temp_dir("emptyflat");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_x": {"session_id": "", "started": true, "buzz": {"session_id": "b-uuid", "started": true}}}"#,
+        )
+        .unwrap();
+        let store = SessionStore::at(path.clone());
+        let e = store.chat_entry("oc_x").unwrap();
+        assert_eq!(e.session_id, "b-uuid", "空平铺 sid 不顶掉 buzz 槽");
+        assert!(e.started);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_never_overwritten() {
+        // 已有备份时归档不得覆盖（保留最老原件）——即使文件再次变成老格式
+        let dir = temp_dir("keepbak");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#,
+        )
+        .unwrap();
+        let bak_path = path.with_extension("json.legacy.bak");
+        std::fs::write(&bak_path, "最老原件").unwrap();
+        let store = SessionStore::at(path.clone());
+        assert_eq!(store.chat_entry("oc_a").unwrap().session_id, "b1");
+        assert_eq!(
+            std::fs::read_to_string(&bak_path).unwrap(),
+            "最老原件",
+            "已有备份不得被覆盖"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hot_reload_folds_legacy_file_swapped_in() {
+        // 运行中外部把老格式文件换进来 → 下次操作热重载即折叠 + 归档
+        let dir = temp_dir("hotfold");
+        let path = dir.join("sessions.json");
+        let store = SessionStore::at(path.clone());
+        store.ensure_session("oc_a");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let legacy = r#"{"oc_b": {"buzz": {"session_id": "ext-buzz", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // 热重载折叠：oc_a 消失（外部覆盖）、oc_b 以 buzz 槽保留
+        assert!(!store.is_started("oc_a"));
+        let e = store.chat_entry("oc_b").unwrap();
+        assert_eq!(e.session_id, "ext-buzz");
+        assert!(e.started);
+        // 折叠已落盘 + 原件已归档
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap(),
+            legacy
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"buzz\""), "落盘为新格式: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 既有行为回归（单槽语义）──
+
     #[test]
     fn extract_chat_to_moves_entry_without_overwrite() {
-        let dir = std::env::temp_dir().join(format!("abb-sessions-xfer-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = SessionStore::new_at("codex", dir.join("bot-sessions.json"));
-        let dst = SessionStore::new_at("codex", dir.join("vb-sessions.json"));
+        // #194：extract_chat_to——整 chat 槽位搬到目标 store（虚拟 Bot 独立工作区迁移），
+        // 源移除、目标不覆盖已有、幂等。
+        let dir = temp_dir("xfer");
+        let src = SessionStore::at(dir.join("bot-sessions.json"));
+        let dst = SessionStore::at(dir.join("vb-sessions.json"));
         let (sid, _) = src.ensure_with_started("oc_vb");
         assert!(src.mark_started_if("oc_vb", &sid));
 
@@ -598,22 +818,19 @@ mod tests {
         let (dst_sid, _) = dst.ensure_with_started("oc_vb");
         assert!(src.extract_chat_to("oc_vb", &dst));
         let moved = dst.chat_entry("oc_vb").unwrap();
-        assert_eq!(
-            moved.codex.session_id, dst_sid,
-            "目标已有槽位时不得被迁移覆盖"
-        );
+        assert_eq!(moved.session_id, dst_sid, "目标已有槽位时不得被迁移覆盖");
         assert!(
             src.chat_entry("oc_vb").is_none(),
             "源槽位必须移除（不双写）"
         );
 
         // 目标为空：整槽位搬入
-        let src2 = SessionStore::new_at("codex", dir.join("bot2.json"));
+        let src2 = SessionStore::at(dir.join("bot2.json"));
         let (sid2, _) = src2.ensure_with_started("oc_x");
         assert!(src2.mark_started_if("oc_x", &sid2));
-        let dst2 = SessionStore::new_at("codex", dir.join("vb2.json"));
+        let dst2 = SessionStore::at(dir.join("vb2.json"));
         assert!(src2.extract_chat_to("oc_x", &dst2));
-        assert_eq!(dst2.chat_entry("oc_x").unwrap().codex.session_id, sid2);
+        assert_eq!(dst2.chat_entry("oc_x").unwrap().session_id, sid2);
         assert!(src2.chat_entry("oc_x").is_none());
         // 幂等：再搬一次 no-op
         assert!(!src2.extract_chat_to("oc_x", &dst2));
@@ -621,90 +838,17 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_flat_format() {
-        // 旧扁平格式：{chat: {backend, session_id, started}}，且新格式 parse 必先失败才走这里
-        let legacy = r#"{"oc_xxx": {"backend": "codex", "session_id": "tid-1", "started": true}}"#;
-        let m = SessionStore::parse(legacy).expect("旧格式应可迁移");
-        let e = &m["oc_xxx"];
-        assert_eq!(e.codex.session_id, "tid-1");
-        assert!(e.codex.started);
-        assert!(e.claude.session_id.is_empty(), "claude 槽位应为空");
-        assert!(e.pi.session_id.is_empty(), "pi 槽位应为空");
-
-        // pi 后端的旧扁平记录 → 落到 pi 槽位
-        let legacy_pi = r#"{"oc_p": {"backend": "pi", "session_id": "p-uuid", "started": false}}"#;
-        let m2 = SessionStore::parse(legacy_pi).expect("pi 旧格式应可迁移");
-        assert_eq!(m2["oc_p"].pi.session_id, "p-uuid");
-        assert!(m2["oc_p"].claude.session_id.is_empty());
-
-        // prime-agent 后端已下线（#92 收敛）→ 旧扁平记录不迁移（丢弃）
-        let legacy_pa =
-            r#"{"oc_q": {"backend": "prime-agent", "session_id": "q-uuid", "started": true}}"#;
-        let m3 = SessionStore::parse(legacy_pa).expect("prime-agent 旧格式应可解析");
-        assert!(
-            !m3.contains_key("oc_q"),
-            "prime-agent 下线：旧记录丢弃，不落到任何槽位"
-        );
-    }
-
-    #[test]
-    fn parses_per_backend_format() {
-        let new = r#"{"oc_xxx": {"claude": {"session_id": "c-uuid", "started": true}, "codex": {"session_id": "x-tid", "started": false}, "pi": {"session_id": "p-uuid", "started": true}, "buzz": {"session_id": "b-uuid", "started": true}}}"#;
-        let m = SessionStore::parse(new).expect("新格式应解析");
-        let e = &m["oc_xxx"];
-        assert_eq!(e.claude.session_id, "c-uuid");
-        assert_eq!(e.codex.session_id, "x-tid");
-        assert_eq!(e.pi.session_id, "p-uuid");
-        assert!(e.pi.started);
-        assert_eq!(e.buzz.session_id, "b-uuid");
-        assert!(e.buzz.started);
-    }
-
-    #[test]
-    fn backends_are_independent() {
-        // 同一 chat 的 claude/codex/pi/buzz 槽位互不干扰（切后端不串）
-        let new = r#"{"c": {"claude": {"session_id": "claude-uuid", "started": true}}}"#;
-        let m = SessionStore::parse(new).unwrap();
-        let e = &m["c"];
-        assert_eq!(e.claude.session_id, "claude-uuid");
-        assert!(e.codex.session_id.is_empty());
-        assert!(e.pi.session_id.is_empty());
-        assert!(e.buzz.session_id.is_empty());
-    }
-
-    #[test]
-    fn buzz_slot_isolated_from_claude() {
-        // 回归：buzz 曾错误借用 claude 槽（slot_mut 缺 buzz 臂）——切 buzz 时
-        // 继承 claude 的 started=true，注入闸误判 resume 跳过历史注入。
-        let dir = std::env::temp_dir().join(format!("abb-sessions-buzz-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = SessionStore::at("claude", dir.join("sessions.json"));
-        let (sid_c, _) = store.ensure_with_started("oc_x");
-        assert!(store.mark_started_if("oc_x", &sid_c));
-        // buzz 自己的槽位：不继承 claude 的 sid/started
-        let buzz = SessionStore::at("buzz", dir.join("sessions.json"));
-        let (sid_b, started_b) = buzz.ensure_with_started("oc_x");
-        assert_ne!(sid_b, sid_c, "buzz 不得借用 claude 槽位");
-        assert!(
-            !started_b,
-            "buzz 新槽位必须 started=false（首轮注入闸走 !resume）"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn service_start_reset_clears_all_slots() {
-        let dir = std::env::temp_dir().join(format!("abb-sessions-reset-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("reset");
         let path = dir.join("sessions.json");
         let sid = {
-            let store = SessionStore::at("pi", path.clone());
+            let store = SessionStore::at(path.clone());
             let (sid, _) = store.ensure_with_started("oc_x");
             assert!(store.mark_started_if("oc_x", &sid));
             sid
         };
         // 模拟服务重启：新实例复位 → 槽位清空
-        let store2 = SessionStore::at("pi", path.clone());
+        let store2 = SessionStore::at(path.clone());
         store2.reset_slots_for_service_start();
         let (sid2, started2) = store2.ensure_with_started("oc_x");
         assert!(!started2, "复位后首轮必须 !resume（注入闸）");
@@ -713,67 +857,32 @@ mod tests {
     }
 
     #[test]
-    fn pi_slot_isolated_from_claude() {
-        // pi 槽位独立：claude 槽位有值不影响 pi 槽位的读写（切后端不串）
-        let dir = std::env::temp_dir().join(format!("abb-sessions-pi-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sessions.json");
-        // 先写一个 claude 槽位有值的文件
-        std::fs::write(
-            &path,
-            r#"{"oc_x": {"claude": {"session_id": "c-uuid", "started": true}}}"#,
-        )
-        .unwrap();
-        let store = SessionStore::new_at("pi", path.clone());
-        let (sid, started) = store.ensure_with_started("oc_x");
-        assert!(!started, "pi 槽位应是全新会话");
-        assert!(!sid.is_empty());
-        assert!(store.mark_started_if("oc_x", &sid));
-        // claude 槽位不受影响
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("c-uuid"));
-        assert!(text.contains(&sid));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn live_session_ids_enumerates_all_chats() {
-        // #67：/new 清理会话文件按「存活槽位」判定——枚举必须跨全部 chat key
-        // 且只取指定后端（误删其它聊天/其它后端的会话都会静默丢上下文）
-        let dir = std::env::temp_dir().join(format!("abb-sessions-live-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // #67：清理会话文件按「存活槽位」判定——枚举必须跨全部 chat key
+        let dir = temp_dir("live");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("pi", path.clone());
+        let store = SessionStore::at(path.clone());
         let a = store.ensure_with_started("oc_a").0;
         let b = store.ensure_with_started("oc_b").0;
-        let mut ids = store.live_session_ids("pi");
+        let mut ids = store.live_session_ids();
         ids.sort();
         let mut want = vec![a, b];
         want.sort();
-        assert_eq!(ids, want, "跨全部 chat 枚举 pi 槽位");
-        // 其它后端的槽位不混入
-        let text = r#"{"oc_c": {"claude": {"session_id": "c-uuid", "started": true}}}"#;
-        std::fs::write(&path, text).unwrap();
-        assert!(
-            store.live_session_ids("pi").is_empty(),
-            "claude 槽位不算 pi 存活会话"
-        );
-        assert_eq!(store.live_session_ids("claude"), vec!["c-uuid"]);
+        assert_eq!(ids, want, "跨全部 chat 枚举存活槽位");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn remove_chat_removes_entry_and_persists() {
         // 会话归纳清理（session_gc）：删除整 chat 槽位，落盘可重载；不存在返回 false
-        let dir = std::env::temp_dir().join(format!("abb-sessions-rm-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("rm");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("claude", path.clone());
+        let store = SessionStore::at(path.clone());
         let sid = store.ensure_session("oc_a");
         store.ensure_session("oc_b");
-        // chat_entry 读回全部后端槽位
+        // chat_entry 读回槽位
         let entry = store.chat_entry("oc_a").expect("存在应返回");
-        assert_eq!(entry.claude.session_id, sid);
+        assert_eq!(entry.session_id, sid);
         assert!(store.chat_entry("oc_none").is_none());
         // remove_chat：删一个，另一个不受影响
         assert!(store.remove_chat("oc_a"));
@@ -781,7 +890,7 @@ mod tests {
         assert!(store.chat_entry("oc_b").is_some());
         assert!(!store.remove_chat("oc_a"), "已删的 chat 再删返回 false");
         // 落盘持久化（新实例重读）
-        let store2 = SessionStore::new_at("claude", path.clone());
+        let store2 = SessionStore::at(path.clone());
         assert!(store2.chat_entry("oc_a").is_none());
         assert!(store2.chat_entry("oc_b").is_some());
         // 删除后重建：ensure_with_started 自动生成新 UUID
@@ -793,10 +902,9 @@ mod tests {
 
     #[test]
     fn reset_session_swaps_uuid_and_clears_started() {
-        let dir = std::env::temp_dir().join(format!("abb-sessions-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("swap");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("claude", path.clone());
+        let store = SessionStore::at(path.clone());
         let old = store.ensure_session("oc_x");
         assert!(store.mark_started_if("oc_x", &old)); // 模拟已开过首轮（resume 槽位）
         assert!(store.is_started("oc_x"));
@@ -823,18 +931,16 @@ mod tests {
     #[test]
     fn hot_reload_picks_up_external_change() {
         // #23：运行中外部（CLI）改 sessions.json → 下一次操作热重载，无需重启
-        let dir =
-            std::env::temp_dir().join(format!("abb-sessions-reload-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("reload");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("claude", path.clone());
+        let store = SessionStore::at(path.clone());
         let sid_a = store.ensure_session("oc_a");
         assert!(store.mark_started_if("oc_a", &sid_a));
         assert!(store.is_started("oc_a"));
 
         // 模拟 CLI 在另一个进程直接覆盖文件（换一个 chat 的会话）
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let text = r#"{"oc_b": {"claude": {"session_id": "ext-uuid", "started": true}}}"#;
+        let text = r#"{"oc_b": {"session_id": "ext-uuid", "started": true}}"#;
         std::fs::write(&path, text).unwrap();
 
         // 下次操作即热重载：oc_a 消失、oc_b 可见
@@ -851,19 +957,18 @@ mod tests {
 
     #[test]
     fn set_session_id_if_cas_guards_slot_identity() {
-        // #49 审查：codex 首轮回存必须 CAS——运行中槽位被 /new / CLI reset 换走时，
-        // 不得把旧任务 thread 写进新槽位（否则 mark_started_if 匹配旧 thread，
-        // 新会话 resume 旧线程、/new 失效）。
-        let dir = std::env::temp_dir().join(format!("abb-sessions-cas-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // #49 审查：首轮回存必须 CAS——运行中槽位被 /new / CLI reset 换走时，
+        // 不得把旧任务的会话 id 写进新槽位（否则 mark_started_if 匹配旧会话，
+        // 新会话 resume 旧会话、/new 失效）。
+        let dir = temp_dir("cas");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("codex", path.clone());
+        let store = SessionStore::at(path.clone());
 
         // 首轮回存：槽位仍是任务启动时的占位 UUID → CAS 成功
         let placeholder = store.ensure_session("oc_x");
         assert!(store.set_session_id_if("oc_x", &placeholder, "tid-real-1"));
         let (cur, _) = store.ensure_with_started("oc_x");
-        assert_eq!(cur, "tid-real-1", "CAS 成功后槽位是真实 thread");
+        assert_eq!(cur, "tid-real-1", "CAS 成功后槽位是真实会话 id");
 
         // 模拟运行中 /new：槽位被换走 → 旧任务（持占位快照）的回存必须被拒
         let fresh = store.reset_session("oc_x");
@@ -882,33 +987,32 @@ mod tests {
 
     #[test]
     fn sandbox_mode_change_detection() {
-        // #171 建立感知、#185 修正语义：#180 起 resume 按当前解析档位运行——
-        // 档位变化提示一次（文案=本轮起按新档位），记录随即覆盖；同档位不提示；
-        // 记录持久化（提示一次后重载也不再提示）。
-        let dir = std::env::temp_dir().join(format!("abb-sessions-sb-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // #171 建立感知、#185 修正语义：resume 按当前解析档位运行——档位变化提示
+        // 一次（文案=本轮起按新档位），记录随即覆盖；同档位不提示；记录持久化。
+        // rotate_on_change=true（#198 codex 语义）：变更即轮换 sid、started 复位。
+        let dir = temp_dir("sb");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("codex", path.clone());
+        let store = SessionStore::at(path.clone());
 
         // 新会话（未开过首轮）：记录档位、无提示
         let sid = store.ensure_session("oc_x");
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly, true),
             None,
             "新会话不提示"
         );
         // 同档位 resume：不提示
         assert!(store.mark_started_if("oc_x", &sid));
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly, true),
             None,
             "同档位不提示"
         );
         // 档位变化 → 提示一次，文案与实际一致（本轮起按新档位）
         let (hint, rotated) = store
-            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess, true)
             .expect("档位变化应提示");
-        assert!(rotated, "codex 档位变更必须轮换会话（#198）");
+        assert!(rotated, "rotate_on_change=true 必须轮换会话（#198）");
         assert!(hint.contains("本轮起"), "提示应说明本轮起按新档位：{hint}");
         assert!(
             !hint.contains("仍按创建时"),
@@ -916,22 +1020,20 @@ mod tests {
         );
         assert!(hint.contains("read-only"), "提示应说明旧档位：{hint}");
         assert!(hint.contains("full-access"), "提示应说明新档位：{hint}");
-        // #198：codex 档位变更自动重建会话（轮换 sid、started 复位）——resume 继承
-        // 首轮沙箱，不重建则新档位不生效。重建后本轮以全新 exec 按新档位运行。
+        // 轮换：sid 换新、started 复位（本轮全新会话按新档位运行）
         let (sid_after, started_after) = store.ensure_with_started("oc_x");
-        assert_ne!(sid_after, sid, "档位变更必须轮换会话 sid（#198 自动重建）");
-        assert!(!started_after, "重建后 started 复位（本轮全新 exec）");
-        // 记录已覆盖为本轮档位：提示至多一次（#185，旧语义「变化持续提示」与
-        // #180 的实际运行档位相反且每条消息刷屏）
+        assert_ne!(sid_after, sid, "档位变更必须轮换会话 sid");
+        assert!(!started_after, "重建后 started 复位");
+        // 记录已覆盖为本轮档位：提示至多一次（#185）
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::FullAccess),
+            store.check_sandbox_mode("oc_x", &SandboxMode::FullAccess, true),
             None,
             "记录已覆盖：同档位后续不提示"
         );
         // 落盘持久化：重载后记录已是新档位，不再提示
-        let store2 = SessionStore::new_at("codex", path.clone());
+        let store2 = SessionStore::at(path.clone());
         assert_eq!(
-            store2.check_sandbox_mode("oc_x", &SandboxMode::FullAccess),
+            store2.check_sandbox_mode("oc_x", &SandboxMode::FullAccess, true),
             None,
             "重载后记录已覆盖，不再提示"
         );
@@ -942,25 +1044,23 @@ mod tests {
     fn sandbox_mode_migration_records_silently() {
         // #171 升级迁移：旧会话槽位无 sandbox_mode 字段 → 补记当前档位不提示；
         // 之后档位再变化才提示。
-        let dir =
-            std::env::temp_dir().join(format!("abb-sessions-sb-mig-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("sb-mig");
         let path = dir.join("sessions.json");
-        // 旧格式槽位（无 sandbox_mode 字段，started=true 可 resume）
+        // 无 sandbox_mode 字段的槽位（started=true 可 resume）
         std::fs::write(
             &path,
-            r#"{"oc_x": {"codex": {"session_id": "tid-1", "started": true}}}"#,
+            r#"{"oc_x": {"session_id": "tid-1", "started": true}}"#,
         )
         .unwrap();
-        let store = SessionStore::new_at("codex", path.clone());
+        let store = SessionStore::at(path.clone());
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::WorkspaceWrite),
+            store.check_sandbox_mode("oc_x", &SandboxMode::WorkspaceWrite, true),
             None,
             "迁移补记不提示（无从判断是否变化）"
         );
         assert!(
             store
-                .check_sandbox_mode("oc_x", &SandboxMode::ReadOnly)
+                .check_sandbox_mode("oc_x", &SandboxMode::ReadOnly, true)
                 .is_some(),
             "迁移后档位再变化才提示"
         );
@@ -969,59 +1069,54 @@ mod tests {
 
     #[test]
     fn reset_session_clears_sandbox_record() {
-        // #171：重建（claude 自愈换 UUID）即新会话——清档位记录，下一轮按当前配置
-        // 重新记录，不残留旧档位误报「档位已变化」。
-        let dir =
-            std::env::temp_dir().join(format!("abb-sessions-sb-reset-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // #171：重建即新会话——清档位记录，下一轮按当前配置重新记录，
+        // 不残留旧档位误报「档位已变化」。
+        let dir = temp_dir("sb-reset");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("codex", path.clone());
+        let store = SessionStore::at(path.clone());
         let sid = store.ensure_session("oc_x");
         // 新会话首轮前记录初始档位
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly, true),
             None
         );
         assert!(store.mark_started_if("oc_x", &sid));
         // 已记录旧档位并感知变化
         assert!(store
-            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
+            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess, true)
             .is_some());
         // 重建：换新 UUID + 清记录 + started 复位
         let fresh = store.reset_session("oc_x");
         assert_ne!(fresh, sid);
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::FullAccess),
+            store.check_sandbox_mode("oc_x", &SandboxMode::FullAccess, true),
             None,
             "重建后按新档位重新记录，不残留旧档位误报"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// #198：claude 会话档位变更**不轮换 sid**——claude 的 permission/guard 每轮
-    /// 重建，改档位立即生效，轮换反而丢上下文（与 codex 的沙箱继承机制相反）。
+    /// #198 反面对称：rotate_on_change=false（claude 语义——permission/guard 每轮
+    /// 重建，改档位立即生效）不轮换 sid，轮换反而丢上下文。
     #[test]
-    fn sandbox_change_does_not_rotate_claude_session() {
-        let dir =
-            std::env::temp_dir().join(format!("abb-sessions-sb-claude-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn sandbox_change_without_rotation_keeps_session() {
+        let dir = temp_dir("sb-norotate");
         let path = dir.join("sessions.json");
-        let store = SessionStore::new_at("claude", path.clone());
+        let store = SessionStore::at(path.clone());
         let sid = store.ensure_session("oc_x");
         assert!(store.mark_started_if("oc_x", &sid));
         assert_eq!(
-            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly),
+            store.check_sandbox_mode("oc_x", &SandboxMode::ReadOnly, false),
             None
         );
-        assert!(
-            store
-                .check_sandbox_mode("oc_x", &SandboxMode::FullAccess)
-                .is_some(),
-            "档位变化应提示"
-        );
+        let (hint, rotated) = store
+            .check_sandbox_mode("oc_x", &SandboxMode::FullAccess, false)
+            .expect("档位变化应提示");
+        assert!(!rotated, "rotate_on_change=false 不轮换");
+        assert!(!hint.contains("已自动重建会话"), "文案与行为一致：{hint}");
         let (sid_after, started_after) = store.ensure_with_started("oc_x");
-        assert_eq!(sid_after, sid, "claude 会话不得轮换 sid");
-        assert!(started_after, "claude 会话 started 保持");
+        assert_eq!(sid_after, sid, "不轮换 sid");
+        assert!(started_after, "started 保持");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

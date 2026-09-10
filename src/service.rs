@@ -875,8 +875,8 @@ async fn run_bot(
                 let days = cfg.history_retention_days.max(1);
                 // 孤儿判定依赖 live 集：现取（SessionStore::new 轻量读盘）
                 let live: std::collections::HashSet<String> = {
-                    let store = crate::sessions::SessionStore::new("buzz", &key);
-                    store.live_session_ids("pi").into_iter().collect()
+                    let store = crate::sessions::SessionStore::new(&key);
+                    store.live_session_ids().into_iter().collect()
                 };
                 let report = crate::tidy::run_once(&workspace, now, days, &live);
                 write_run_marker(&marker, now);

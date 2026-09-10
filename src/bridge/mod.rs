@@ -282,7 +282,7 @@ impl Bridge {
         // 直接用它的 mention_modes 种子化，无需再扫 cfg.bots（两份来源可能漂移）。
         let cfg_snapshot = cfg.clone();
         let mention_seed = bot.mention_modes.clone();
-        let sessions = SessionStore::new("buzz", &key);
+        let sessions = SessionStore::new(&key);
         Bridge {
             msgr,
             cfg_snapshot,
@@ -1635,7 +1635,7 @@ mod tests {
         let chat = format!("oc_restart_{}", uuid::Uuid::new_v4());
         // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 buzz 槽）
         {
-            let sessions = crate::sessions::SessionStore::new("buzz", &bot.key());
+            let sessions = crate::sessions::SessionStore::new(&bot.key());
             let sid = sessions.ensure_with_started(&chat).0;
             assert!(sessions.mark_started_if(&chat, &sid));
             let hist = crate::history::History::open(&bot.key(), &chat);

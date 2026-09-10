@@ -9,19 +9,19 @@
 //! 执行层（随包 buzz-agent），一次性句柄用完即弃，不碰常驻聊天句柄的队列与 slot。
 //! 取代旧的 CLI spawn（`agent::run` → claude/pi）与 #200 的 buzz 整轮跳过——buzz bot
 //! 的每日归纳自此可用。buzz 会话不在工作区落转录文件（fork 无 .pi-sessions 写入），
-//! 故归纳回合自身无转录清理；`cleanup_chat_in` 按槽位 sid 删 pi 会话文件的步骤保留
-//! （清理 **legacy pi 聊天**的残留）。
+//! 故归纳回合自身无转录清理。P4.2 后 sessions.json 折叠为单槽（老 pi 槽位 sid 在
+//! load 折叠时舍弃），legacy pi 转录不再能被精确匹配删除——残留由 tidy 孤儿清理
+//! （live 集 + 24h mtime 护栏）兜底。
 //!
 //! 破坏性语义：
 //! - **每会话一次 LLM 调用**（烧钱）+ 删除用户历史——故默认关，需用户在设置页
 //!   显式打开；首轮延迟 24h+jitter（见 service.rs session_gc_loop）。
-//! - 只删工作区内文件（history/、.pi-sessions/、sessions.json 槽位）；claude/codex
+//! - 只删工作区内文件（history/、sessions.json 槽位）；claude/codex
 //!   的 transcript 在后端私有目录（~/.claude、~/.codex），
 //!   物理不可达，绝不触碰。
 //! - 清理次序（摘要写盘**成功后**）：二次校验仍过期（TOCTOU 收窄——归纳期间用户
 //!   又发消息则保留会话）→ 删槽位并持久化（未持久化 = 磁盘错误，文件一律未动，
-//!   宁留不删下轮重试）→ 删 history jsonl + 迁移/导入标记 → 按槽位 sid 精确删
-//!   pi 会话文件（10 分钟 mtime 护栏宁留不删，对齐 /new 清理语义）。
+//!   宁留不删下轮重试）→ 删 history jsonl + 迁移/导入标记。
 //! - 会话级 AGENTS.md 与摘要文件保留（摘要本身就是下一步的上下文）。
 //!
 //! 归纳任务角色用 Owner（内部维护任务，跟 bot 配置档走——与 run_job 的受限分支
@@ -247,9 +247,9 @@ pub(crate) fn select_candidates_in_with_state(
     days: u32,
     state: &crate::session_state::SessionState,
 ) -> Vec<String> {
-    // 复用 SessionStore 的解析（新格式/旧扁平迁移/刷新签名单一来源，不绕行裸读
+    // 复用 SessionStore 的解析（新格式/老结构折叠/刷新签名单一来源，不绕行裸读
     // sessions.json——schema 演进只改一处；审查修复）。无槽位文件 → 空（常态）。
-    let store = crate::sessions::SessionStore::at("claude", workspace.join("sessions.json"));
+    let store = crate::sessions::SessionStore::at(workspace.join("sessions.json"));
     let cutoff = now.saturating_sub(u64::from(days.max(1)) * 86400);
     // #87 暂停豁免：暂停会话不参与 GC（用户显式想保留，不应被静默归纳回收）。
     // 暂停期消息不入 history → last_ts 不再推进，若不豁免必然下一轮入选。
@@ -332,9 +332,7 @@ pub fn write_summary_file(
 /// 2. 删 sessions.json 槽位并持久化（未持久化 = 磁盘错误，文件一律未动，返回 false
 ///    ——「先文件后槽位」在 save 失败时文件已删而槽位还在，陈旧槽位指向已删文件；
 ///    审查修复。槽位删后文件清理中断 → 残留文件由 tidy 孤儿清理兜底，宁留文件）；
-/// 3. 删 history jsonl + 迁移/导入标记（`.migrated.json` 是会话级迁移状态，一并删）；
-/// 4. 按槽位 sid 精确删 pi 会话文件（mtime 超 [`TRANSCRIPT_FRESH_SECS`] 才删，
-///    宁留不删）；claude/codex 的 transcript 在后端私有目录，物理不可达，跳过。
+/// 3. 删 history jsonl + 迁移/导入标记（`.migrated.json` 是会话级迁移状态，一并删）。
 ///
 /// 返回是否真的清理了（false = 会话恢复活跃或持久化失败，保留一切）。
 pub fn cleanup_chat_in(
@@ -355,12 +353,11 @@ pub fn cleanup_chat_in(
     if hist.last_ts().map(|ts| ts >= cutoff_ts).unwrap_or(false) {
         return false;
     }
-    // 2. 先取槽位 sid（文件删除要用），再**先删槽位并持久化**：save 失败 = 磁盘错误，
-    //    此时文件一律未动，保留会话状态返回 false（宁留不删，下轮重试）——原次序
-    //    「先删文件后删槽位」在持久化失败时文件已丢而槽位还在，陈旧槽位指向已删
-    //    文件（审查修复）。槽位删成功后文件删除若中断（崩溃），残留文件由 tidy
-    //    孤儿清理兜底，语义是「宁留文件」而非「宁留空洞」。
-    let pi_sid = store.chat_entry(key).map(|e| e.pi.session_id.clone());
+    // 2. **先删槽位并持久化**：save 失败 = 磁盘错误，此时文件一律未动，保留会话状态
+    //    返回 false（宁留不删，下轮重试）——原次序「先删文件后删槽位」在持久化失败时
+    //    文件已丢而槽位还在，陈旧槽位指向已删文件（审查修复）。槽位删成功后文件删除
+    //    若中断（崩溃），残留文件由 tidy 孤儿清理兜底，语义是「宁留文件」而非「宁留
+    //    空洞」。
     if !store.remove_chat(key) {
         crate::log!(
             "[session-gc] ⚠️ {} 槽位删除未持久化，保留会话状态",
@@ -374,20 +371,8 @@ pub fn cleanup_chat_in(
     for suffix in ["jsonl", "migrated.json", "imported.json"] {
         let _ = std::fs::remove_file(history_dir.join(format!("{esc}.{suffix}")));
     }
-    // 4. 按槽位 sid 精确删后端会话文件（mtime 护栏宁留不删；claude/codex 的 transcript
-    //    在后端私有目录，物理不可达，跳过）。公共判定见 agent::remove_*_transcripts
-    //    （与 /new 同源；护栏 10 分钟，过期会话槽位理论上无在跑任务，护栏只是双保险）。
-    if let Some(pi_sid) = pi_sid {
-        if !pi_sid.is_empty() {
-            let sids = std::collections::HashSet::from([pi_sid]);
-            crate::agent::remove_pi_transcripts(
-                workspace,
-                &sids,
-                crate::agent::SidMatch::InSet,
-                Some(crate::agent::TRANSCRIPT_FRESH_SECS),
-            );
-        }
-    }
+    // legacy pi 转录（.pi-sessions/）：P4.2 折叠后槽位不再携带 pi sid，无法精确匹配
+    // ——残留由 tidy 孤儿清理兜底（live 集 + 24h mtime 护栏，宁留不删）。
     true
 }
 
@@ -446,17 +431,8 @@ mod tests {
         data.insert(
             key.into(),
             crate::sessions::ChatEntry {
-                claude: crate::sessions::Slot {
-                    session_id: format!("sid_{key}"),
-                    started: true,
-                    ..Default::default()
-                },
-                // pi 槽位同 sid：cleanup 按槽位 sid 精确删会话文件
-                pi: crate::sessions::Slot {
-                    session_id: format!("sid_{key}"),
-                    started: true,
-                    ..Default::default()
-                },
+                session_id: format!("sid_{key}"),
+                started: true,
                 ..Default::default()
             },
         );
@@ -544,8 +520,8 @@ mod tests {
             "[]",
         )
         .unwrap();
-        // 后端会话文件：pi（文件名含 sid）拨旧可删；另一个新鲜 pi 文件（含同 sid
-        // 但 mtime 新）宁留不删
+        // legacy pi 转录文件：P4.2 折叠后槽位无 pi sid，GC 不再精确删——
+        // 残留由 tidy 孤儿清理兜底（新旧文件都保留）
         std::fs::create_dir_all(ws.join(".pi-sessions")).unwrap();
         let pi_old = ws.join(".pi-sessions/1000_sid_oc_a.jsonl");
         std::fs::write(&pi_old, "x").unwrap();
@@ -566,7 +542,7 @@ mod tests {
         assert!(content.contains("会话 key：oc_a"), "头注释含会话 key");
         assert!(content.contains("主题：…"), "agent 回复在头部之后");
 
-        let store = crate::sessions::SessionStore::at("claude", ws.join("sessions.json"));
+        let store = crate::sessions::SessionStore::at(ws.join("sessions.json"));
         let cutoff = now.saturating_sub(7 * 86400);
         assert!(
             cleanup_chat_in(
@@ -578,7 +554,7 @@ mod tests {
             ),
             "过期会话应清理"
         );
-        // 历史/标记/后端会话文件全清；摘要与会话级 AGENTS.md 保留
+        // 历史/标记全清；摘要与会话级 AGENTS.md 保留；legacy pi 转录保留（tidy 兜底）
         assert!(
             !ws.join("history").join(format!("{esc}.jsonl")).exists(),
             "历史 jsonl 已删"
@@ -595,7 +571,7 @@ mod tests {
                 .exists(),
             "导入标记已删"
         );
-        assert!(!pi_old.exists(), "旧 pi 会话文件已删");
+        assert!(pi_old.exists(), "legacy pi 转录保留（tidy 孤儿清理兜底）");
         assert!(pi_fresh.exists(), "新鲜 pi 文件宁留不删");
         assert!(ses_agents.exists(), "会话级 AGENTS.md 保留");
         assert!(path.exists(), "摘要保留");
@@ -730,10 +706,10 @@ mod tests {
             !ws.join("history").join(format!("{esc}.jsonl")).exists(),
             "历史 jsonl 已删"
         );
-        // 转录已清（槽位 sid 精确匹配）
+        // legacy pi 转录保留（P4.2 后槽位无 pi sid，tidy 孤儿清理兜底）
         assert!(
-            !ws.join(".pi-sessions/1000_sid_oc_gc.jsonl").exists(),
-            "pi 转录已删"
+            ws.join(".pi-sessions/1000_sid_oc_gc.jsonl").exists(),
+            "pi 转录保留（tidy 兜底）"
         );
         // 摘要已存档
         assert!(
@@ -741,7 +717,7 @@ mod tests {
             "摘要已落盘"
         );
         // 槽位已删并落盘（新实例读盘验证）
-        let store = crate::sessions::SessionStore::at("claude", ws.join("sessions.json"));
+        let store = crate::sessions::SessionStore::at(ws.join("sessions.json"));
         assert!(store.chat_entry("oc_gc").is_none(), "槽位已删并持久化");
         std::fs::remove_dir_all(&ws).ok();
     }
@@ -771,7 +747,7 @@ mod tests {
             !ws.join("summaries").join(format!("{esc}.md")).exists(),
             "无摘要落盘"
         );
-        let store = crate::sessions::SessionStore::at("claude", ws.join("sessions.json"));
+        let store = crate::sessions::SessionStore::at(ws.join("sessions.json"));
         assert!(store.chat_entry("oc_gc").is_some(), "槽位保留");
         std::fs::remove_dir_all(&ws).ok();
     }
