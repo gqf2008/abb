@@ -353,6 +353,83 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     urls
 }
 
+/// 平台「内联图片」通道可靠渲染的扩展名白名单（飞书 `/im/v1/images` 与钉钉
+/// 群图片上传同表）。`kind_from_name` 会把 svg/ico/heic 这类也归成 image，但它们
+/// 过不了服务端图片格式校验——判定必须看**扩展名**而不只是 kind（审查 #254）。
+/// 单一定义：飞书/钉钉两个判定函数与错误文案都引用它，避免三份清单漂移。
+pub const IMAGE_UPLOAD_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// 文件名是否为可上传的内联图片扩展名（大小写不敏感）。
+pub fn image_ext_uploadable(file_name: &str) -> bool {
+    file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.trim().to_ascii_lowercase())
+        .is_some_and(|e| IMAGE_UPLOAD_EXTS.contains(&e.as_str()))
+}
+
+/// 读取已保存附件字节（Messenger::send_attachment 真上传前用）。
+/// meta.path 为空或文件缺失 → Err（含文件名/路径提示），由调用方走既有错误语义
+/// （deliver 回源报错），绝不静默降级成「文本元数据」。
+pub fn read_attachment_bytes(meta: &AttachmentMeta) -> Result<Vec<u8>> {
+    if meta.path.is_empty() {
+        anyhow::bail!("附件没有本地路径（{}），无法上传发送", meta.file_name);
+    }
+    // 只接受普通文件：`/dev/zero`、FIFO、字符设备等 metadata().len() 常为 0 却能
+    // 无限读出，`fs::read` 会挂死或吃爆内存（审查 #254）。
+    // 报错文案与旧的直接 `fs::read` 失败同款（既有测试/用户提示都按这串文案认）。
+    let md = std::fs::metadata(&meta.path)
+        .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
+    if !md.is_file() {
+        anyhow::bail!("附件不是普通文件，拒绝上传发送: {}", meta.path);
+    }
+    // 兜底上限：调用方已按目的地平台预检过，这里保证**任何**入口都不会把超大对象
+    // 整读进内存（不能只依赖调用方记得预检——审查 #254）。
+    if md.len() > MAX_ATTACHMENT_BYTES as u64 {
+        anyhow::bail!(
+            "附件过大（{} MB > 本地 {} MB 读取上限），拒绝上传发送: {}",
+            md.len() / (1024 * 1024),
+            MAX_ATTACHMENT_BYTES / (1024 * 1024),
+            meta.path
+        );
+    }
+    let bytes = std::fs::read(&meta.path)
+        .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
+    if bytes.is_empty() {
+        anyhow::bail!("附件为空文件，拒绝上传发送: {}", meta.file_name);
+    }
+    Ok(bytes)
+}
+
+/// 各目的地平台的上传体积上限（字节）：飞书 image 10MB / file 30MB（官方文档），
+/// 钉钉媒体 image 取保守 20MB。发送前先按元数据大小预检——整读进内存再被
+/// 服务端拒（HTTP 413 / 尺寸错误）既白烧内存又难诊断（审查 #254）。
+pub const FEISHU_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const FEISHU_FILE_MAX_BYTES: u64 = 30 * 1024 * 1024;
+pub const DINGTALK_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 读取前的体积预检：按 metadata().len() 对比目的地 caps。
+/// 文件不存在/无路径 → 交由 read_attachment_bytes 报同款错误（这里只量尺寸）。
+pub fn check_sendable_size(meta: &AttachmentMeta, max: u64) -> Result<()> {
+    if meta.path.is_empty() {
+        return Ok(()); // 由 read 报缺路径错误
+    }
+    if let Ok(m) = std::fs::metadata(&meta.path) {
+        if m.len() > max {
+            anyhow::bail!(
+                "附件过大（{} MB > 平台上限 {} MB）：{name}",
+                m.len() / (1024 * 1024),
+                max / (1024 * 1024),
+                name = if meta.file_name.is_empty() {
+                    &meta.path
+                } else {
+                    &meta.file_name
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +567,146 @@ mod tests {
             meta.to_prompt_line(),
             "[image] 来源=feishu 文件名=a.png mime=image/png 大小=10 本地路径=/tmp/a.png sha256=ab"
         );
+    }
+
+    #[test]
+    fn read_attachment_bytes_reads_saved_file() {
+        let dir = std::env::temp_dir().join(format!("abb-read-{}", uuid::Uuid::new_v4()));
+        let ws = dir.join("workspaces").join("bot-x");
+        let bytes = b"hello attachment bytes";
+        let meta = save_attachment_in(
+            &ws,
+            "om_1/abc",
+            0,
+            "file",
+            "feishu",
+            "a.txt",
+            "text/plain",
+            bytes,
+        )
+        .expect("保存附件应成功");
+        let read = read_attachment_bytes(&meta).expect("读取本地附件应成功");
+        assert_eq!(read, bytes);
+    }
+
+    #[test]
+    fn read_attachment_bytes_errors_on_empty_path() {
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "a.txt".into(),
+            mime: "text/plain".into(),
+            size: 1,
+            path: String::new(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("没有本地路径"), "{e:#}");
+    }
+
+    #[test]
+    fn read_attachment_bytes_errors_on_missing_file() {
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "ghost.txt".into(),
+            mime: "text/plain".into(),
+            size: 1,
+            path: "/definitely/missing/ghost.txt".into(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("读取附件文件失败"), "{e:#}");
+    }
+
+    #[test]
+    fn read_attachment_bytes_errors_on_empty_file() {
+        let dir = std::env::temp_dir().join(format!("abb-read-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.bin");
+        std::fs::write(&path, b"").unwrap();
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "empty.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: path.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("空文件"), "{e:#}");
+    }
+
+    /// 审查 #254 P3-2①：非普通文件（字符设备/FIFO/目录）`len()` 常为 0 却能无限
+    /// 读出，必须在读之前按 `metadata().is_file()` 拦下——否则 `/dev/zero` 会挂死
+    /// 或吃爆内存，而且错误信息还会误报成「空文件」。
+    #[test]
+    fn read_attachment_bytes_rejects_non_regular_file() {
+        let dir = std::env::temp_dir().join(format!("abb-read-nonfile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "weird".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: dir.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(e.to_string().contains("不是普通文件"), "目录应被拒: {e:#}");
+        #[cfg(unix)]
+        {
+            // /dev/null 是字符设备：旧实现会读成空 → 误报「空文件」。
+            // 单独克隆一份而不是 `mut` + 改字段——`mut` 只在 cfg(unix) 分支里被用到，
+            // Windows clippy `-D warnings` 会因此报 unused_mut（本机 macOS 门禁看不到）。
+            let dev = AttachmentMeta {
+                path: "/dev/null".into(),
+                ..meta.clone()
+            };
+            let e = read_attachment_bytes(&dev).unwrap_err();
+            assert!(
+                e.to_string().contains("不是普通文件"),
+                "设备文件应被拒: {e:#}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审查 #254 P3-2②：读之前自己有体积兜底（不能只依赖调用方预检）——稀疏文件
+    /// 一步 set_len 就能造出超大 len 而不占盘。
+    ///
+    /// 限 unix：NTFS 的 `SetEndOfFile` 不保证留稀疏，Windows CI 上可能真写 200MB
+    /// 零页（慢且吃盘）。上限逻辑本身与平台无关。
+    #[cfg(unix)]
+    #[test]
+    fn read_attachment_bytes_rejects_over_hard_cap() {
+        let dir = std::env::temp_dir().join(format!("abb-read-big-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_ATTACHMENT_BYTES as u64 + 1).unwrap();
+        drop(f);
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "feishu".into(),
+            file_name: "huge.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: path.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = read_attachment_bytes(&meta).unwrap_err();
+        assert!(
+            e.to_string().contains("附件过大"),
+            "超过本地读取上限应被拒: {e:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

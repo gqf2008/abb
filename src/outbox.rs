@@ -195,6 +195,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Messenger for FakeMsgr {
+        /// 附件不参与本组断言（trait 无默认实现——审查 #254 P2-2）。
+        async fn send_attachment(
+            &self,
+            _chat_id: &str,
+            _meta: &crate::attachments::AttachmentMeta,
+        ) -> Result<()> {
+            Ok(())
+        }
         async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
             if self.fail.load(Ordering::Relaxed) {
                 anyhow::bail!("模拟发送失败");

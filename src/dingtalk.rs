@@ -293,6 +293,82 @@ impl DingTalkClient {
         Ok(resp2.bytes().await.context("读钉钉文件响应失败")?.to_vec())
     }
 
+    /// 上传一张图片（发群聊图片消息用）→ media_id。
+    /// 走旧网关 app 级媒体上传 POST /media/upload?type=image&access_token=…，
+    /// multipart 字段名固定 `media`（服务端缺 multipart 时报 43008「参数需要multipart类型」——
+    /// 已用无鉴权 POST 探测确认该路由真实存在）。返回 media_id（形如 "@…"）。
+    /// `file_name` 必须带真实扩展名：钉钉按文件名后缀校验媒体类型，固定名 "image"
+    /// 会被判 40004「不合法的媒体文件类型」（审查 #254）。上传走 120s 超时
+    /// （全局 30s 会掐断大图；与下载路径同预算）。
+    pub async fn upload_image(&self, bytes: Vec<u8>, file_name: &str) -> Result<String> {
+        let token = self.access_token().await?;
+        let url = format!(
+            "{}{}?type=image&access_token={}",
+            self.oapi_base, "/media/upload", token
+        );
+        let form = reqwest::multipart::Form::new().part(
+            "media",
+            reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string()),
+        );
+        let resp: Value = self
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(120))
+            .multipart(form)
+            .send()
+            .await
+            .context("钉钉媒体上传网络错误")?
+            .json()
+            .await
+            .context("钉钉媒体上传响应非 JSON")?;
+        if resp.get("errcode").and_then(|c| c.as_i64()) != Some(0) {
+            anyhow::bail!(
+                "钉钉媒体上传失败 errcode={:?} errmsg={:?}",
+                resp.get("errcode"),
+                resp.get("errmsg")
+            );
+        }
+        resp.get("media_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .context("钉钉媒体上传响应缺 media_id")
+    }
+
+    /// 群聊发送图片消息（机器人 msgKey=sampleImageMsg）。官方文档该 msgKey 的
+    /// msgParam 字段是 **photoURL**（可填完整 URL 或 media/upload 返回的 media_id，
+    /// 见 open.dingtalk.com 消息类型文档）；`picMediaId` 是 sampleVideoMsg 的封面
+    /// 字段，用错会 400 miss.param.photo（审查 #254）。
+    /// 与 send_group 同走 v1.0 robot/groupMessages/send，仅 msgKey/msgParam 不同；
+    /// 请求形状照官方文档 + mock 单测锁定。
+    pub async fn send_group_image(
+        &self,
+        conversation_id: &str,
+        robot_code: &str,
+        media_id: &str,
+    ) -> Result<()> {
+        let token = self.access_token().await?;
+        let body = json!({
+            "robotCode": robot_code,
+            "openConversationId": conversation_id,
+            "msgKey": "sampleImageMsg",
+            "msgParam": serde_json::to_string(&json!({ "photoURL": media_id }))?,
+        });
+        let resp = self
+            .http
+            .post(self.url("/v1.0/robot/groupMessages/send"))
+            .header("x-acs-dingtalk-access-token", &token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text_body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(api_error(status.as_u16(), &text_body));
+        }
+        Ok(())
+    }
+
     /// 创建群会话（虚拟 Bot #75；topapi/im/chat/create 的文档形状）。
     /// ⚠️ 能力边界（重要）：该接口需要 `owner`（群主员工 userid）+ `useridlist`
     /// （至少一名成员），企业内部应用机器人拿不到这些 → **真实建群大概率失败**。
@@ -451,6 +527,14 @@ fn api_error(status: u16, body: &str) -> anyhow::Error {
 /// 群聊会话判定：钉钉群会话 ID 恒以 "cid" 开头；单聊我们用对方 staffId 当 chat_id。
 pub fn is_group_chat(chat_id: &str) -> bool {
     chat_id.starts_with("cid")
+}
+
+/// 钉钉群图片可上传的扩展名（与飞书 images 端点同表）。`kind_from_name` 会把
+/// svg/ico/heic 这类也归成 image，但钉钉按后缀/内容校验格式，必被服务端拒——
+/// 在能力闸（`messenger::dingtalk_can_send`）就拦下，别把服务端原始错误丢给用户
+/// （审查 #254 P2-3）。
+pub fn dingtalk_image_uploadable(file_name: &str) -> bool {
+    crate::attachments::image_ext_uploadable(file_name)
 }
 
 /// 一条待下载的钉钉附件引用（picture/file/audio/video/富文本图片）。
@@ -1291,5 +1375,118 @@ mod tests {
         });
         let m2 = parse_message(&frame2).unwrap();
         assert_eq!(m2.conversation_title, "");
+    }
+
+    // ─── #253 外发媒体（首版=机器人群聊图片）：上传+发送请求形状（mock 锁定）───
+    // 能力边界：钉钉 Stream 机器人消息集暂无「媒体/文件」通用消息，首版只做群聊图片
+    // （旧网关 /media/upload 传图 → v1.0 groupMessages/send sampleImageMsg）；
+    // 单聊媒体与文件/语音/视频待 #253 后续补（messenger 侧对未覆盖组合显式报错）。
+    #[tokio::test]
+    async fn upload_image_posts_oapi_media_shape_and_returns_media_id() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/media/upload".to_string()),
+            json!({"errcode": 0, "errmsg": "ok", "media_id": "@lADPtest"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let media_id = dt
+            .upload_image(b"fake-image-bytes-001".to_vec(), "shot.png")
+            .await
+            .unwrap();
+        assert_eq!(media_id, "@lADPtest");
+        let recs = server.requests.lock().unwrap().clone();
+        assert_eq!(recs[0].path, "/v1.0/oauth2/accessToken", "应先取 token");
+        let up = recs
+            .iter()
+            .find(|r| r.path == "/media/upload")
+            .expect("应有媒体上传请求");
+        assert_eq!(up.method, "POST");
+        assert_eq!(
+            up.query, "type=image&access_token=dt-mock-token",
+            "旧网关鉴权走 query access_token"
+        );
+        assert!(
+            up.body.contains("name=\"media\""),
+            "multipart 字段应为 media: {}",
+            up.body
+        );
+        assert!(up.body.contains("fake-image-bytes-001"), "应含图片字节");
+        // 审查 #254：钉钉按文件名后缀校验媒体类型——part 文件名必须带真实扩展名
+        assert!(
+            up.body.contains("filename=\"shot.png\""),
+            "part 文件名须带扩展名: {}",
+            up.body
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_image_surfaces_errcode() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/media/upload".to_string()),
+            json!({"errcode": 43008, "errmsg": "参数需要multipart类型"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let e = dt.upload_image(b"x".to_vec(), "a.png").await.unwrap_err();
+        assert!(e.to_string().contains("43008"), "errcode 应进文案: {e:#}");
+    }
+
+    #[tokio::test]
+    async fn upload_image_missing_media_id_is_error() {
+        // errcode=0 但响应缺 media_id（形状异常）→ 显式报错，不谎报成功
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/media/upload".to_string()),
+            json!({"errcode": 0, "errmsg": "ok"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let e = dt.upload_image(b"x".to_vec(), "a.png").await.unwrap_err();
+        assert!(
+            e.to_string().contains("media_id"),
+            "缺 media_id 应报错: {e:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_group_image_posts_v1_sample_image_shape() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/v1.0/robot/groupMessages/send".to_string(),
+            ),
+            json!({"processCode": "proc1"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        dt.send_group_image("cidAsXSBLnA==", "ding123", "@lADPtest")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        let msg = recs
+            .iter()
+            .find(|r| r.path == "/v1.0/robot/groupMessages/send")
+            .expect("应有群图片发送请求");
+        assert_eq!(msg.method, "POST");
+        // 鉴权头也锁住（审查 #254 P3-4）：钉钉用 x-acs-dingtalk-access-token 而非
+        // Authorization，test_mock 的 headers 表已能记到——漏带/写错头会在这红。
+        assert_eq!(
+            msg.headers
+                .get("x-acs-dingtalk-access-token")
+                .map(String::as_str),
+            Some("dt-mock-token"),
+            "必须带钉钉 access token 鉴权头"
+        );
+        let body: Value = serde_json::from_str(&msg.body).unwrap();
+        assert_eq!(body["robotCode"], "ding123");
+        assert_eq!(body["openConversationId"], "cidAsXSBLnA==");
+        assert_eq!(body["msgKey"], "sampleImageMsg");
+        let param: Value = serde_json::from_str(body["msgParam"].as_str().unwrap()).unwrap();
+        // 官方 sampleImageMsg 字段是 photoURL（media_id 或 URL）；picMediaId 属视频封面
+        assert_eq!(param["photoURL"], "@lADPtest");
+        assert!(param.get("picMediaId").is_none(), "不得再发 picMediaId");
     }
 }
