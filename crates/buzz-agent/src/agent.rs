@@ -874,7 +874,9 @@ impl RunCtx<'_> {
             // Built-in load_skill: execute inline, no MCP round-trip.
             if call.name == builtin::LOAD_SKILL_TOOL {
                 emit_in_progress(self.wire, self.session_id, call).await;
-                let mut result = builtin::call_load_skill(&call.arguments, self.skills).await;
+                let mut result =
+                    builtin::call_load_skill(&call.arguments, self.skills, Some(self.mcp.policy()))
+                        .await;
                 result.provider_id = call.provider_id.clone();
                 emit_completed(self.wire, self.session_id, call, &result).await;
                 results[idx] = Some(result);

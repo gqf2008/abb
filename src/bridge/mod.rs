@@ -2,7 +2,7 @@
 //! 通道无关：通过 `Messenger` trait 收发（飞书 / 微信 / 钉钉），飞书事件解析在 on_payload，
 //! 微信消息在 on_weixin，钉钉消息在 on_dingtalk。零 regex（路由/@_user_ 手工解析）。
 
-use crate::agent::{self, AgentRunner, Backend};
+use crate::agent::{self, AgentRunner};
 use crate::config::{BotConfig, Config};
 use crate::messenger::Messenger;
 use crate::outbox::{OutboxItem, OutboxStore};
@@ -43,13 +43,25 @@ impl BridgeRegistry {
     }
 }
 
+/// 单后端化（P2.1）：按 bot 构造的 ACP 句柄对——执行层只有随包 buzz-agent，
+/// normal 与 granted（授权者受限会话）各一个**进程级**实例。
+/// granted 与 normal 差在 env（`BUZZ_AGENT_NO_HINTS=1`——fork 的 hints
+///（~/AGENTS.md、~/.agents/skills 扫盘）发生在 session/new **之前**，per-session
+/// `_meta` 管不到，只能进程级收口，计划决策 4）与 `session_sandbox`（granted
+/// 强制受限剖面）。域闸/argv 白名单经 `_meta` 随会话下发；dispatch/job 按角色
+/// 路由到对应实例（P2.2），granted 未路由时惰性待命（懒启动 = 零进程成本）。
+pub struct BotAcpHandles {
+    pub normal: Arc<crate::buzz::harness::BuzzHandle>,
+    pub granted: Arc<crate::buzz::harness::BuzzHandle>,
+}
+
 pub struct Bridge {
     pub msgr: Arc<dyn Messenger>,
     pub sessions: SessionStore,
-    /// ACP harness 句柄集（每后端一个实例：pi/buzz=buzz-agent、claude=claude-agent-acp、
-    /// codex=codex-acp；各带各的供应商 env）。dispatch 按 bot 生效后端路由——
-    /// 后端差异收敛在适配器命令与 env，桥内会话/历史/pending 语义与后端无关。
-    pub acp_handles: HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
+    /// ACP harness 句柄对（本 bot 专属，normal+granted 双实例；供应商 env 按本 bot
+    /// 装配）。None = 未装配（测试挡板/job 内部路径），dispatch 回落 spawn 同步路径——
+    /// 语义同旧「空 HashMap」。桥内会话/历史/pending 语义与句柄拓扑无关。
+    pub acp_handles: Option<BotAcpHandles>,
     /// 构造时 config 快照（buzz 预检的供应商判定源——测试可注入，生产由 service
     /// 传入运行时 config；provider 变更伴随 harness env 重装需重启，快照语义一致）。
     pub cfg_snapshot: Config,
@@ -65,9 +77,6 @@ pub struct Bridge {
     /// 访问控制（owner/授权者/对话权限）也以它为准——生产每次消息从 config.json 热读覆盖
     /// 判断（授权/取消即时生效），config 读不到（单测）时用它当快照。
     pub bot: BotConfig,
-    /// 全局：默认后端（SessionStore 已按它初始化；字段保留以便将来逐 bot 覆盖）
-    #[allow(dead_code)]
-    pub default_backend: String,
     seen: Mutex<HashSet<String>>,
     /// per-chat 串行锁：同一 chat 的并发消息在此**排队**等前一条处理完再跑（而非丢弃）。
     /// 每个 chat_id 一把 tokio 异步锁；锁 Arc 从 std Mutex 的 HashMap 取出后再 await，
@@ -105,9 +114,10 @@ pub struct Bridge {
     /// 团队方案生成器（#124 测试可测性）：生产 RealTeamPlanGenerator 转发 teambuilder；
     /// 测试注入挡板返回固定方案/错误（仿 agent_runner 设计）。
     team_gen: Arc<dyn crate::teamflow::TeamPlanGenerator>,
-    /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——生产用 RealAgentRunner
-    /// 转发 spawn 子进程，测试注入挡板以驱动「任务运行中」时序（详见 agent::AgentRunner）。
-    /// pub(crate)：session_gc::run_once 经它走归纳调用（与聊天/job 同源，可挡板测试）。
+    /// Agent 执行器（#23 测试可测性）：仿 `msgr` 的 trait 注入——**P4.1 起仅为
+    /// 测试挡板缝**：生产装配 [`agent::SpawnRetiredRunner`]（CLI spawn 已删，
+    /// dispatch 恒走 harness，回落路径生产不可达）；测试注入挡板以驱动
+    /// 「任务运行中」时序（详见 agent::AgentRunner）。
     pub(crate) agent_runner: Arc<dyn AgentRunner>,
     /// 虚拟 Bot 登记快照（#75）：启动时加载；注入判定前按文件 mtime 懒刷新
     /// （GUI 登记/取消登记即时生效，无需重启 service）。读-改由 VirtualBotStore 原子
@@ -254,34 +264,33 @@ impl Bridge {
     }
 
     pub fn new(msgr: Arc<dyn Messenger>, bot: BotConfig, cfg: &Config) -> Bridge {
-        Self::build(msgr, bot, cfg, Arc::new(agent::RealAgentRunner))
+        Self::build(msgr, bot, cfg, Arc::new(agent::SpawnRetiredRunner))
     }
 
-    /// 实际构造器：生产（`new` 用真实 `RealAgentRunner`）与测试（注入 `AgentRunner` 挡板
-    /// 驱动时序）共用。字段初始化集中在此。
+    /// 实际构造器：生产（`new` 装配 `SpawnRetiredRunner` 占位——spawn 回落路径在
+    /// 生产不可达）与测试（注入 `AgentRunner` 挡板驱动时序）共用。字段初始化集中在此。
     fn build(
         msgr: Arc<dyn Messenger>,
         bot: BotConfig,
         cfg: &Config,
         agent_runner: Arc<dyn AgentRunner>,
     ) -> Bridge {
-        // 后端跟着 bot 走：用该 bot 的生效后端（自身 backend 非空优先，否则回落全局默认）。
-        let effective = bot.effective_backend(&cfg.default_backend).to_string();
+        // 单后端化（P4.1）：会话槽位恒选 buzz（老配置 backend/default_backend 字段
+        // 直接忽略——serde 无 deny_unknown_fields 天然容错；槽位折叠在 P4.2）。
         let key = bot.key();
         // I2：快照与 access 快照（self.bot）同源——bot 就是 build 时从 config 复制的那份，
         // 直接用它的 mention_modes 种子化，无需再扫 cfg.bots（两份来源可能漂移）。
         let cfg_snapshot = cfg.clone();
         let mention_seed = bot.mention_modes.clone();
-        let sessions = SessionStore::new(&effective, &key);
+        let sessions = SessionStore::new(&key);
         Bridge {
             msgr,
             cfg_snapshot,
             sessions,
-            acp_handles: Default::default(), // service run_bot 按 bot 注入全后端句柄集
+            acp_handles: None, // service run_bot 按 bot 注入句柄对；None=未装配（测试/回落）
             turn_registry: Mutex::new(HashMap::new()), // #206 回合登记（内存态）
             vb_sessions: Mutex::new(HashMap::new()),
             jobs: JobStore::new(&bot.key()),
-            default_backend: effective,
             bot,
             seen: Mutex::new(HashSet::new()),
             chat_locks: Mutex::new(HashMap::new()),
@@ -445,19 +454,6 @@ impl Bridge {
             );
             // #118：未授权一律拦截且**无提示文案**；记录历史——p2p 保留 #74 提醒+落历史；
             // 群聊落历史、不提醒（不再完全忽略）。
-            self.record_intercepted(&self.bot.key(), message, &body, sender_id, chat_type)
-                .await;
-            return;
-        }
-        // #118：granted + pi 后端 + 隔离开 → 接入层静默拦截（落历史不回复，
-        // 不再出现「后端是 pi」提示文案外泄；job 路径保留 agent::run 防御兜底）。
-        let backend = self.bot.effective_backend(&self.default_backend);
-        if crate::config::granted_pi_unusable(sender_role, &self.bot.key(), backend) {
-            crate::log!(
-                "[bridge] granted+pi 会话静默拦截（bot={} sender={}）",
-                self.bot.key(),
-                sender_id
-            );
             self.record_intercepted(&self.bot.key(), message, &body, sender_id, chat_type)
                 .await;
             return;
@@ -1024,8 +1020,6 @@ mod tests {
         /// 一次性 claude already-in-use 自愈模拟：run 内把槽位 CAS 换成该 sid 并返回
         /// 之（等价 reset_session 换 UUID + started 复位后再 mark 的最终状态）。
         heal_to_sid: Mutex<Option<String>>,
-        /// #130：前 N 次 run 返回 Err(err)，随后正常 Reply（上下文压缩重试测试用）。
-        fail_then_reply: Mutex<Option<(usize, String)>>,
     }
     impl MockAgentRunner {
         fn blocking(reply: &str) -> Self {
@@ -1040,12 +1034,7 @@ mod tests {
                 roles: Mutex::new(Vec::new()),
                 rebuilt_left: std::sync::atomic::AtomicUsize::new(0),
                 heal_to_sid: Mutex::new(None),
-                fail_then_reply: Mutex::new(None),
             }
-        }
-        /// #130：前 n 次调用返回 Err(err)，随后正常 Reply。
-        fn fail_then_reply(&self, n: usize, err: &str) {
-            *self.fail_then_reply.lock().unwrap() = Some((n, err.to_string()));
         }
         fn set_rebuilt_rounds(&self, n: usize) {
             self.rebuilt_left
@@ -1100,13 +1089,12 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         async fn run(
             &self,
-            backend: Backend,
             prompt: &str,
             session_id: &str,
             _resume: bool,
             _chat_id: &str,
             session_key: &str,
-            bot_key: &str,
+            _bot_key: &str,
             role: crate::config::SenderRole,
             sessions: Option<&SessionStore>,
             progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -1115,14 +1103,6 @@ mod tests {
             self.prompts.lock().unwrap().push(prompt.to_string());
             self.roles.lock().unwrap().push(role);
             self.started.notify_one();
-            // #57 审查遗留修复：模拟 pi 的持久化时机——真实 pi 在**会话创建时**（run
-            // 开始、LLM 工作之前，SessionManager.open）即落盘，失败/被打断的轮次同样
-            // 留文件（文件里已有该轮的注入块与消息）；mock 原只在 Reply 写盘，导致
-            // 「失败后文件存在 → 不重复注入」的生产路径测试不可表达，T5 反而锁定了
-            // 与生产矛盾的语义。写在 run 入口 = 所有 outcome（Reply/Fail/Cancel）都留盘。
-            if backend == Backend::Pi {
-                let _ = write_pi_session_file(bot_key, session_id);
-            }
             // 先把中途输出推完（unbounded 即推即走），桥侧 select/收尾排空负责丢弃
             if let Some(tx) = &progress {
                 for p in &self.progress_msgs {
@@ -1146,13 +1126,6 @@ mod tests {
                     }
                 }
             }
-            // #130：前 N 次失败后正常（fail_then_reply 优先于 outcome）
-            if let Some((n, err)) = self.fail_then_reply.lock().unwrap().as_mut() {
-                if *n > 0 {
-                    *n -= 1;
-                    return Err(err.clone());
-                }
-            }
             // 返回本次运行使用的 session_id——bridge 据此做 mark_started_if 身份校验
             match &self.outcome {
                 MockOutcome::Reply => {
@@ -1171,8 +1144,7 @@ mod tests {
                     } else {
                         session_id.to_string()
                     };
-                    // pi 会话文件已在 run 入口写过（见上）；claude 换 UUID 自愈轮的
-                    // final_sid 若与入口 sid 不同——pi 不走 heal，无需补写。
+                    // 换 UUID 自愈轮的 final_sid 与入口 sid 不同 → 桥据此写 pending 标记。
                     Ok(agent::RunOutcome::Reply {
                         reply: self.reply.clone(),
                         session_id: final_sid,
@@ -1215,7 +1187,8 @@ mod tests {
     impl crate::teamflow::TeamPlanGenerator for MockTeamPlanGenerator {
         async fn generate(
             &self,
-            _backend: Backend,
+            _bot: &BotConfig,
+            _cfg: &Config,
             goal: &str,
             _members: &[String],
             _template: Option<&str>,
@@ -1248,19 +1221,6 @@ mod tests {
         }
     }
 
-    /// #56/#57：写一个形态正确的 pi 会话文件（探针按「首行 session 记录 id + 末行
-    /// 完整 JSON」校验）。mock 与各 fixture 共用，格式契约只此一处。
-    fn write_pi_session_file(bot_key: &str, sid: &str) -> std::io::Result<()> {
-        let dir = crate::workspace_dir(bot_key).join(".pi-sessions");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join(format!("2026-08-14T00-00-00-000Z_{sid}.jsonl")),
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"timestamp\":\"2026-08-14T00:00:00.000Z\"}}\n"
-            ),
-        )
-    }
-
     fn test_ev(mid: &str, chat_id: &str, text: &str) -> Ev {
         Ev {
             mid: mid.into(),
@@ -1278,14 +1238,33 @@ mod tests {
     }
 
     /// 测试 ACP harness：spawn tests/mock_acp_agent.py（prompt 记录到 record_file，
-    /// 回复 echo 回流），返回 (buzz 实例, 全后端句柄集)。record_file 每测唯一。
+    /// 回复 echo 回流），返回 (buzz 实例, 注入用句柄对)。record_file 每测唯一。
     fn make_test_harness(
         record_file: std::path::PathBuf,
         registry: &crate::bridge::BridgeRegistry,
-    ) -> (
-        Arc<crate::buzz::harness::BuzzHandle>,
-        std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>,
-    ) {
+    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
+        make_test_harness_full(record_file, registry, None, Vec::new())
+    }
+
+    /// [`make_test_harness`] 的带档位变体：`session_sandbox` 随 `session/new`
+    /// `_meta` 下发（P2.2 端到端断言用；mock agent 已声明 `_meta.abbSandbox`，
+    /// 与真实 fork 能力位对齐）。
+    fn make_test_harness_with_sandbox(
+        record_file: std::path::PathBuf,
+        registry: &crate::bridge::BridgeRegistry,
+        session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
+        make_test_harness_full(record_file, registry, session_sandbox, Vec::new())
+    }
+
+    /// 完整变体：额外 env（如 `MOCK_NO_ABB_SANDBOX=1` 模拟未声明能力位的旧
+    /// fork——P2.3 硬闸回归锁）。
+    fn make_test_harness_full(
+        record_file: std::path::PathBuf,
+        registry: &crate::bridge::BridgeRegistry,
+        session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+        extra_env: Vec<(String, String)>,
+    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
@@ -1302,8 +1281,12 @@ mod tests {
                             "MOCK_RECORD_FILE".to_string(),
                             record_file.display().to_string(),
                         ),
-                    ],
+                    ]
+                    .into_iter()
+                    .chain(extra_env.clone())
+                    .collect(),
                     backend: "mock".to_string(),
+                    session_sandbox: session_sandbox.clone(),
                 },
                 crate::tasks::shutdown_token(),
                 std::env::current_dir()
@@ -1313,11 +1296,13 @@ mod tests {
             )
         };
         let buzz = mk();
-        let mut handles = std::collections::HashMap::new();
-        handles.insert("pi".to_string(), buzz.clone());
-        handles.insert("buzz".to_string(), buzz.clone());
-        handles.insert("claude".to_string(), buzz.clone());
-        handles.insert("codex".to_string(), buzz.clone());
+        let handles = BotAcpHandles {
+            normal: buzz.clone(),
+            // 默认 granted 复用同一 mock 实例（多数测试不区分实例）；需要区分
+            // normal/granted 的用例自行组装 BotAcpHandles（见
+            // restricted_session_refused_* 的两个硬闸测试）
+            granted: buzz.clone(),
+        };
         // 诊断探针：3s 后快照 dead 状态（spawn 失败 = dead=true），写诊断文件供测试失败信息引用
         {
             let probe = buzz.clone();
@@ -1414,12 +1399,10 @@ mod tests {
     /// 带可选 ACP harness 注入的完整构造：传 harness 后 handle 的 dispatch 分支
     /// 可达（ACP 单轨测试用）。mock agent 脚本见 tests/mock_acp_agent.py——
     /// prompt 记录到 MOCK_RECORD_FILE 供断言，回复 echo 给 harness 回流。
-    type AcpHandles = std::collections::HashMap<String, Arc<crate::buzz::harness::BuzzHandle>>;
-
     fn build_test_bridge_full(
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
-        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, AcpHandles)>,
+        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles)>,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
         // 供应商硬闸（#219）需要生效供应商：测试统一注入 test-prov（mock agent
@@ -1437,7 +1420,7 @@ mod tests {
         test_cfg.bots = vec![bot.clone()]; // provider_for_bot_key_of 按 key 找 bot
         let mut bridge = Bridge::build(msgr.clone(), bot, &test_cfg, runner);
         if let Some((_, handles)) = acp {
-            bridge.acp_handles = handles;
+            bridge.acp_handles = Some(handles);
         }
         // 按 bot key 命名（key 本身唯一），cleanup_bridge 可按 key 回收
         let key = bridge.bot.key();
@@ -1588,12 +1571,13 @@ mod tests {
         (hist, sid)
     }
 
-    /// T1/T2：切后端首轮注入 [历史上下文]（旧→新、角色前缀、在当前消息之前）+
-    /// 回复尾部带提示；第二轮同会话 resume → 不重复注入、无提示。
+    /// T1/T2：新会话首轮注入 [历史上下文]（角色前缀、在当前消息之前）+ 回复尾部
+    /// 带提示；第二轮同会话 resume → 不重复注入、无提示。（#49 后端切换迁移语义；
+    /// P4.1 后历史/marker 的 backend 字段恒记 "buzz"——它只是出处标注，不参与闸判定。）
     #[tokio::test]
     async fn backend_switch_injects_history_once() {
         let runner = Arc::new(MockAgentRunner::immediate("pi 的回答"));
-        let bot = backend_bot("pi"); // bot 现在用 pi（历史里是 claude 的轮次）
+        let bot = backend_bot("buzz"); // 历史里是 claude 时代的轮次（backend 仅出处标注）
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
         // 预写 claude 历史（模拟切换前在该 chat 的 2 轮对话）
         let hist = crate::history::History::open(&bot.key(), "oc_x");
@@ -1620,7 +1604,7 @@ mod tests {
             msgr.sent()[0]
         );
         // marker 已写（绑定该 session）；助手轮落历史
-        assert_eq!(hist.marker().map(|m| m.backend), Some("pi".into()));
+        assert_eq!(hist.marker().map(|m| m.backend), Some("buzz".into()));
         assert!(hist
             .entries()
             .iter()
@@ -1651,7 +1635,7 @@ mod tests {
         let chat = format!("oc_restart_{}", uuid::Uuid::new_v4());
         // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 buzz 槽）
         {
-            let sessions = crate::sessions::SessionStore::new("buzz", &bot.key());
+            let sessions = crate::sessions::SessionStore::new(&bot.key());
             let sid = sessions.ensure_with_started(&chat).0;
             assert!(sessions.mark_started_if(&chat, &sid));
             let hist = crate::history::History::open(&bot.key(), &chat);
@@ -1725,96 +1709,6 @@ mod tests {
         cleanup_bridge(&bridge_b);
     }
 
-    /// #130：上下文超长 → 自动压缩（旧段摘要 + 近期原文）→ 换新会话重试一次，
-    /// 回复前置压缩提示；原历史保留不删；二次超长（已压缩过）不重复压缩。
-    #[tokio::test]
-    async fn context_too_long_auto_compresses_and_retries() {
-        let runner = Arc::new(MockAgentRunner::immediate("压缩后重试成功"));
-        // 首次 run 失败（超长），随后的摘要任务/重试均正常
-        runner.fail_then_reply(1, "claude: prompt is too long (context window exceeded)");
-        let bot = backend_bot("claude");
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        // 预写 14 轮历史（> keep_recent=10，触发压缩）
-        let hist = crate::history::History::open(&bot.key(), "oc_x");
-        for i in 0..14 {
-            hist.append_user(&format!("u{i}"), "claude", &format!("第{i}轮用户问题"));
-            hist.append_assistant(&format!("u{i}"), "claude", &format!("第{i}轮回答"));
-        }
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "继续聊")).await })
-            .await
-            .unwrap();
-
-        let prompts = runner.prompts();
-        assert!(
-            prompts.len() >= 2,
-            "首轮失败 + 压缩重试（+摘要任务），实际 {} 次",
-            prompts.len()
-        );
-        // 首轮注入全量历史；重试轮注入压缩块 + 保留当前消息
-        assert!(
-            prompts[0].contains("[历史上下文]"),
-            "首轮全量历史: {}",
-            prompts[0]
-        );
-        let last = prompts.last().unwrap();
-        assert!(
-            last.contains("[历史上下文·压缩版]"),
-            "重试轮注入压缩块: {last}"
-        );
-        assert!(last.contains("继续聊"), "当前消息保留: {last}");
-        // 用户可见压缩提示 + 重试回复
-        assert!(
-            msgr.sent()[0].contains("已自动压缩"),
-            "回复带压缩提示: {}",
-            msgr.sent()[0]
-        );
-        assert!(msgr.sent()[0].contains("压缩后重试成功"));
-        // ctxsum 落盘（压缩块）+ 原历史保留
-        let workspace = crate::workspace_dir(&bot.key());
-        let sum = crate::contextsum::ctxsum_block_at(&workspace, "oc_x").expect("ctxsum 已写");
-        assert!(sum.contains("## 旧对话摘要"));
-        assert!(sum.contains("## 近期原文"));
-        assert_eq!(
-            crate::history::History::open(&bot.key(), "oc_x")
-                .entries()
-                .len(),
-            30, // 14 轮 + 本轮用户轮 + 重试成功的助手轮
-            "原历史保留不删"
-        );
-        cleanup_bridge(&bridge);
-    }
-
-    /// #130：已压缩过（ctxsum 存在）再超长 → 不重复压缩，错误原样返回（防循环）。
-    #[tokio::test]
-    async fn context_too_long_no_second_compression() {
-        let runner = Arc::new(MockAgentRunner::immediate("不应走到"));
-        runner.fail_then_reply(2, "codex: context length exceeded");
-        let bot = backend_bot("codex");
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        let hist = crate::history::History::open(&bot.key(), "oc_x");
-        for i in 0..14 {
-            hist.append_user(&format!("u{i}"), "codex", &format!("第{i}轮用户问题"));
-            hist.append_assistant(&format!("u{i}"), "codex", &format!("第{i}轮回答"));
-        }
-        // 预置 ctxsum（模拟已压缩过）
-        let workspace = crate::workspace_dir(&bot.key());
-        std::fs::write(
-            crate::contextsum::ctxsum_path(&workspace, "oc_x"),
-            "[历史上下文·压缩版]\n已压缩",
-        )
-        .unwrap();
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "继续")).await })
-            .await
-            .unwrap();
-        // 只跑一次（不压缩不重试）；错误原样返回
-        assert_eq!(runner.prompts().len(), 1, "已压缩过不重试");
-        assert!(msgr.sent()[0].contains("context length exceeded"));
-        assert!(!msgr.sent()[0].contains("已自动压缩"), "无压缩提示");
-        cleanup_bridge(&bridge);
-    }
-
     /// T3：/new 清空历史与迁移标记——用户明确要全新会话，注入历史随之失效。
     #[tokio::test]
     async fn new_command_clears_history_and_marker() {
@@ -1854,14 +1748,11 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("接续回答"));
         let bot = backend_bot("pi");
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        // 预置：pi 槽位已有完整会话（started=true，可 resume 自己的上下文）。
-        // started=true 在真实世界必然伴随 pi 会话文件（run 成功即落盘）——fixture
-        // 补齐文件，否则 #56 探针会判定「会话丢失」而注入。
+        // 预置：槽位已有完整会话（started=true，可 resume 自己的上下文）。
+        // 不注入的真正原因：resume 轮注入闸只认 pending marker——marker 是 None
+        //（不是「对不上」），闸不放行（该轮 resume=true）。
         let sid = bridge.sessions.ensure_with_started("oc_x").0;
         assert!(bridge.sessions.mark_started_if("oc_x", &sid));
-        write_pi_session_file(&bot.key(), &sid).unwrap();
-        // 不注入的真正原因：pending 失配 + 探针命中文件（#56）——marker 是 None，
-        // 不是「对不上」；旧注释「!resume 直接短路」不成立（该轮 resume=true）。
         let hist = crate::history::History::open(&bot.key(), "oc_x");
         hist.append_user("old1", "claude", "claude 时代的内容");
 
@@ -1910,41 +1801,6 @@ mod tests {
             "下一条重新注入"
         );
         let _ = msgr;
-        cleanup_bridge(&bridge);
-    }
-
-    /// #57 审查遗留修复：pi 失败轮的**生产语义**——真实 pi 在会话创建时（run 开始）
-    /// 即落盘，失败轮的文件里已含该轮注入块与消息 → 下一条探针判定存活、**不重复
-    /// 注入**（mock 原只在 Reply 写盘，把这条路径测试成了反面）。
-    #[tokio::test]
-    async fn pi_failed_round_keeps_file_no_reinject() {
-        let runner = Arc::new(MockAgentRunner::with_progress_error(&[], "pi LLM 报错"));
-        let bot = backend_bot("pi");
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        let hist = crate::history::History::open(&bot.key(), "oc_x");
-        hist.append_user("old1", "claude", "旧背景");
-
-        // m1：fresh 首轮注入历史 → pi 失败（会话创建即落盘，注入块已在文件里）
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "第一问")).await })
-            .await
-            .unwrap();
-        assert!(runner.prompts()[0].contains("[历史上下文]"), "首轮注入");
-        assert!(hist.marker().is_none(), "失败轮不写 marker");
-
-        // m2：文件在（mock 于 run 入口落盘）→ 探针判存活 → 不重复注入
-        let b2 = bridge.clone();
-        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "再试")).await })
-            .await
-            .unwrap();
-        assert!(
-            !runner.prompts()[1].contains("[历史上下文]"),
-            "失败轮文件已在（含注入块），不重复注入: {}",
-            runner.prompts()[1]
-        );
-        // Err 轮发送的是错误文案（非 Reply）——断言它锁「失败可见」而非恒真的
-        // 否定式「不含已携带」（Err 文案在任何实现下都不含该提示，审查 Minor）。
-        assert_eq!(msgr.sent()[1], "pi LLM 报错", "m2 走失败可见路径");
         cleanup_bridge(&bridge);
     }
 
@@ -2002,44 +1858,6 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
-    /// 审查 Important（#54 同类缺口）：claude already-in-use 自愈在 run 内换 UUID——
-    /// 换 UUID 使旧 marker「失效」，但 !resume 闸永不触发（started 已被 mark 回 true）
-    /// → 必须由「final_sid != 入口 sid」判定补写 pending，下一条消息才注入。
-    #[tokio::test]
-    async fn claude_heal_sid_change_marks_pending() {
-        let runner = Arc::new(MockAgentRunner::immediate("自愈后的回复"));
-        runner.set_heal_sid("new-heal-sid"); // 一次性：run 内槽位 CAS 换新 sid
-        let bot = backend_bot("claude");
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        // 既有会话：started=true + marker 匹配（旧 sid）
-        let (hist, _sid) = seed_migrated_session(&bridge, &bot, "oc_x");
-
-        // 自愈轮：resume=true、marker 匹配且非 pending → 不注入；run 内换 UUID（rebuilt=false）
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "还在吗")).await })
-            .await
-            .unwrap();
-        assert!(
-            !runner.prompts()[0].contains("[历史上下文]"),
-            "自愈轮不注入"
-        );
-        let m = hist.marker().expect("换 UUID 自愈应写 pending 标记");
-        assert!(m.pending, "pending 标记");
-        assert_eq!(m.session_id, "new-heal-sid", "标记记最终 sid");
-        assert!(!msgr.sent()[0].contains("已携带"));
-
-        // 下一条：pending 命中（resume=true 也注入）→ 历史补上、标记复位
-        let b2 = bridge.clone();
-        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
-            .await
-            .unwrap();
-        assert!(runner.prompts()[1].contains("[历史上下文]"), "下一条注入");
-        assert!(runner.prompts()[1].contains("旧背景"));
-        assert!(msgr.sent()[1].contains("已携带"));
-        assert!(!hist.marker().unwrap().pending, "注入后复位");
-        cleanup_bridge(&bridge);
-    }
-
     /// #54 审查：claude 自愈换 UUID 发生在 !resume 首轮（空历史，没有旧上下文可丢）
     /// 时不得写 pending——重试已把本轮完整 prompt 交给新会话，再写 pending 只会让
     /// 下一条把本轮自身重复注入一遍（外加误导性的「已携带上下文」提示）。
@@ -2074,44 +1892,6 @@ mod tests {
             "无 pending：下一条不注入: {}",
             runner.prompts()[1]
         );
-        assert!(!msgr.sent()[1].contains("已携带"));
-        cleanup_bridge(&bridge);
-    }
-
-    /// #56：pi 会话文件丢失（对不存在文件同 sid 静默新建空会话，无错误可检）→
-    /// resume 轮**本轮直接注入**（run 前探明，比 pending 早一轮）；pi 落文件后
-    /// 恢复正常不注入。不设 marker 防重复护栏——真丢失不得被「已注入过」误拦
-    /// （见注入闸注释），文件持续缺失时每轮重注入是正确行为。
-    #[tokio::test]
-    async fn pi_session_loss_injects_directly() {
-        let runner = Arc::new(MockAgentRunner::immediate("重建轮的回复"));
-        let bot = backend_bot("pi");
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot.clone());
-        // 既有会话（started=true + marker 匹配非 pending）+ 一轮旧历史；
-        // .pi-sessions 下无该 sid 文件 = 会话已丢失
-        let (hist, sid) = seed_migrated_session(&bridge, &bot, "oc_x");
-
-        // msg1：文件缺失 → 本轮直接注入 + 提示
-        let b = bridge.clone();
-        tokio::spawn(async move { b.handle(test_ev("m1", "oc_x", "还在吗")).await })
-            .await
-            .unwrap();
-        assert!(
-            runner.prompts()[0].contains("[历史上下文]"),
-            "文件丢失本轮直接注入: {}",
-            runner.prompts()[0]
-        );
-        assert!(runner.prompts()[0].contains("旧背景"));
-        assert!(msgr.sent()[0].contains("已携带"));
-        let m = hist.marker().unwrap();
-        assert!(!m.pending && m.session_id == sid, "注入后 marker 复位");
-
-        // msg2：mock 已模拟 pi 落盘（run 成功必写会话文件）→ 正常续聊不注入、无提示
-        let b2 = bridge.clone();
-        tokio::spawn(async move { b2.handle(test_ev("m2", "oc_x", "继续")).await })
-            .await
-            .unwrap();
-        assert!(!runner.prompts()[1].contains("[历史上下文]"));
         assert!(!msgr.sent()[1].contains("已携带"));
         cleanup_bridge(&bridge);
     }
@@ -4030,6 +3810,245 @@ mod tests {
                 .any(|m| m.contains("已登记的虚拟 Bot 群")),
             "不应产生登记门槛拒答: {:?}",
             msgr.sent()
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// 读取 mock agent 的 session/new 记录（`_meta` 载荷断言用）。
+    fn read_session_metas(record_file: &std::path::Path) -> Vec<serde_json::Value> {
+        let Ok(s) = std::fs::read_to_string(record_file) else {
+            return Vec::new();
+        };
+        s.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "session_new")
+            .map(|v| v["meta"].clone())
+            .collect()
+    }
+
+    /// P2.2 端到端：granted 角色消息路由到 granted 实例（独立 mock 进程），
+    /// owner 消息走 normal 实例；档位载荷随 `session/new` `_meta` 下发且键名
+    /// camelCase（与 fork `SessionNewMeta` 契约一致），normal 侧（None）不带
+    /// `_meta`（今天字节级行为回归锁）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn granted_role_routes_to_granted_instance_with_sandbox_meta() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let rec_normal =
+            std::env::temp_dir().join(format!("mock-n-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec_granted =
+            std::env::temp_dir().join(format!("mock-g-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (normal, _h) = make_test_harness(rec_normal.clone(), &registry);
+        let (granted, _hg) = make_test_harness_with_sandbox(
+            rec_granted.clone(),
+            &registry,
+            Some(crate::buzz::acp::SessionSandboxMeta {
+                sandbox: Some("workspace-write".to_string()),
+                writable_roots: Some(vec!["/tmp/abb-granted-ws".to_string()]),
+                shell: Some("restricted".to_string()),
+                abb_bin: Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string()),
+            }),
+        );
+        let handles = BotAcpHandles {
+            normal: normal.clone(),
+            granted: granted.clone(),
+        };
+        let (bridge, _msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("buzz"),
+            Some((normal.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+
+        // owner 消息 → normal 实例
+        let mut ev_owner = test_ev("m-owner", "oc_route_owner", "hi owner");
+        ev_owner.chat_type = "p2p".to_string();
+        bridge.handle(ev_owner).await;
+        // granted 消息 → granted 实例（受限会话）
+        let mut ev_granted = test_ev("m-granted", "oc_route_granted", "hi granted");
+        ev_granted.chat_type = "p2p".to_string();
+        ev_granted.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev_granted).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (normal_metas, granted_metas) = loop {
+            let n = read_session_metas(&rec_normal);
+            let g = read_session_metas(&rec_granted);
+            if !n.is_empty() && !g.is_empty() {
+                break (n, g);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "session/new 10s 未到达 mock agent（normal={n:?} granted={g:?}）"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        // normal：无档位 ⇒ 无 _meta 键（None = FullAccess 今天行为）
+        assert!(
+            normal_metas[0].is_null(),
+            "normal 实例不应带 _meta 档位: {:?}",
+            normal_metas[0]
+        );
+        // granted：受限剖面 + camelCase 键名
+        let gm = &granted_metas[0];
+        assert_eq!(gm["sandbox"], "workspace-write");
+        assert_eq!(
+            gm["writableRoots"],
+            serde_json::json!(["/tmp/abb-granted-ws"])
+        );
+        assert_eq!(gm["shell"], "restricted");
+        assert_eq!(
+            gm["abbBin"],
+            "/Applications/ABB.app/Contents/MacOS/agent-bridge"
+        );
+        assert!(gm.get("writable_roots").is_none(), "键名必须 camelCase");
+        assert!(gm.get("abb_bin").is_none(), "键名必须 camelCase");
+        cleanup_bridge(&bridge);
+    }
+
+    /// P2.3 硬闸（Critical 风险回归锁）：随包 agent 未声明 `_meta.abbSandbox`
+    ///（模拟旧 fork）时，受限会话**拒绝创建**——绝不静默降级 FullAccess。
+    /// 断言：无 session/new 到达 agent（没有会话就没有执行），且用户收到
+    /// 可行动提示；错误不可重试（一次性死信，不反复重投）。
+    ///
+    /// normal/granted 用**两个不同**的 mock 进程（normal 能力正常）：若路由
+    /// 错把 granted 走成 normal，本测试会因「无拒答、反而建了会话」而红。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn restricted_session_refused_when_agent_lacks_capability() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let rec_normal =
+            std::env::temp_dir().join(format!("mock-cap-n-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec_granted =
+            std::env::temp_dir().join(format!("mock-cap-g-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (normal, _h) = make_test_harness(rec_normal.clone(), &registry);
+        let (old_fork, _h2) = make_test_harness_full(
+            rec_granted.clone(),
+            &registry,
+            Some(crate::buzz::acp::SessionSandboxMeta {
+                sandbox: Some("workspace-write".to_string()),
+                writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
+                shell: Some("restricted".to_string()),
+                abb_bin: None,
+            }),
+            vec![("MOCK_NO_ABB_SANDBOX".to_string(), "1".to_string())],
+        );
+        let handles = BotAcpHandles {
+            normal,
+            granted: old_fork.clone(),
+        };
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("buzz"),
+            Some((old_fork.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+        let mut ev = test_ev("m1", "oc_old_fork", "hi");
+        ev.chat_type = "p2p".to_string();
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if msgr.sent().iter().any(|m| m.contains("不支持受限执行档位")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "10s 内未收到受限拒答提示: {:?}",
+                msgr.sent()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // 没有会话被创建（拒绝发生在 session/new 之前），也没有 prompt 到达
+        assert!(
+            read_session_metas(&rec_granted).is_empty(),
+            "旧 fork 不得创建受限会话"
+        );
+        assert!(
+            read_prompts(&rec_granted).is_empty(),
+            "旧 fork 不得收到 prompt"
+        );
+        // 拒绝是 granted 实例专属：normal 实例（能力正常）不该被误伤
+        assert!(
+            read_session_metas(&rec_normal).is_empty(),
+            "normal 实例不应收到 granted 消息"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// P1-3 词表校验回归锁：agent 声明了能力位但词表不含请求档位（只声明
+    /// read-only）⇒ 同样拒建受限会话。声明的词表是权威，防未来词表漂移被
+    /// 静默降级成「有声明就放行」。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn restricted_session_refused_when_mode_absent_from_vocabulary() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let rec_normal =
+            std::env::temp_dir().join(format!("mock-vocab-n-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec = std::env::temp_dir().join(format!("mock-vocab-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (normal, _hn) = make_test_harness(rec_normal.clone(), &registry);
+        let (narrow, _h) = make_test_harness_full(
+            rec.clone(),
+            &registry,
+            Some(crate::buzz::acp::SessionSandboxMeta {
+                sandbox: Some("workspace-write".to_string()),
+                writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
+                shell: Some("restricted".to_string()),
+                abb_bin: None,
+            }),
+            vec![(
+                "MOCK_ABB_SANDBOX_MODES".to_string(),
+                "read-only".to_string(),
+            )],
+        );
+        let handles = BotAcpHandles {
+            normal: normal.clone(),
+            granted: narrow.clone(),
+        };
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("buzz"),
+            Some((narrow.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+        let mut ev = test_ev("m1", "oc_narrow_vocab", "hi");
+        ev.chat_type = "p2p".to_string();
+        ev.role = crate::config::SenderRole::Granted;
+        bridge.handle(ev).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if msgr.sent().iter().any(|m| m.contains("不支持受限执行档位")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "10s 内未收到词表拒答提示: {:?}",
+                msgr.sent()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            read_session_metas(&rec).is_empty(),
+            "词表不含请求档位时不得创建会话"
+        );
+        assert!(
+            read_session_metas(&rec_normal).is_empty(),
+            "normal 实例（能力正常）不应收到 granted 消息"
         );
         cleanup_bridge(&bridge);
     }

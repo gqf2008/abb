@@ -16,9 +16,12 @@
 
 | 上游文件 | 处置 | 说明 |
 |---|---|---|
-| acp.rs | 保留并裁剪 | ACP 客户端全协议面；删 usage/observer 引用；增 `turn_text` 文本捕获 |
-| pool.rs | 保留并裁剪 | AgentPool/SessionState/run_prompt_task；删 fetch_* REST 面/reaction/用量/失败告示/guard REST 侧 |
+| `queue.rs` / `pool.rs`（同步区） | ABB 扩展字段 | P0.B：`PromptChannelInfo.workspace` + `NewSessionChannelContext.workspace`——session/new 的 cwd 与 `<workspace>` 段按频道工作区（vb 群=vb/<uuid>、普通=bot 工作区）取真值，None 回落 handle cwd；上游同步时保留该字段与其透传 |
+| acp.rs | 保留并裁剪 | ACP 客户端全协议面；删 usage/observer 引用；增 `turn_text` 文本捕获。P2.2/P2.3：initialize 顶层 `_meta.abbSandbox` 词表解析（`parse_abb_sandbox_modes` + `abb_sandbox_supported`/`abb_sandbox_supports`，与既有 steering_supported 同「就地解析防调用方遗漏」模式；**只认顶层**，嵌套旧位形刻意不兼容——见函数文档）；新增 `SessionSandboxMeta`（sandbox/writableRoots/shell/abbBin，camelCase）+ `session_new_full_with_meta`（旧 `session_new_full` 保留为 None-meta 包装，None ⇒ 字节级不变回归锁）；`AcpError::SandboxUnsupported` 独立变体（**不得并入 Protocol**：Protocol 属 `is_transport_error`，会把健康 agent 判死重拉） |
+| pool.rs | 保留并裁剪 | AgentPool/SessionState/run_prompt_task；删 fetch_* REST 面/reaction/用量/失败告示/guard REST 侧。P2.2/P2.3：`OwnedAgent.session_sandbox` 透传，`create_session_and_apply_model` 改喂 `session_new_full_with_meta`；建会话前档位硬闸（请求档位必须在本 agent initialize 声明的词表内，否则 `AcpError::SandboxUnsupported` 拒建——无懒启动竞态的真闸） |
 | queue.rs | 保留并裁剪 | EventQueue/format_prompt；nostr::Event → InboundMsg；删 buzz CLI 发布指令 |
+| harness.rs | ABB 扩展字段 | 单后端化 P2.2/P2.3：`AgentConfig.session_sandbox`（本 handle 全部会话的 `_meta` 档位载荷）；`SandboxSupport` 三态（Unknown/Supported/Unsupported）+ `BuzzHandle.sandbox_supported: AtomicU8`（`handle_spawn_outcome` Ok 臂写、`schedule_agent_start` 复位 Unknown，与 `dead` 共享态同模式）；`spawn_and_init_agent` 传播 `cfg.session_sandbox` 入 OwnedAgent；`is_sandbox_unsupported` 死信分支（匹配独立变体，**不进** `is_transport_error`）。P3.1：`sync_waiters` 载荷 `String → Result<String,String>`（Err=终态失败原因）+ `notify_channel` 死信时旁路解析等待者（agent 错误对 job/oneshot 不再只表现为挂到超时）；新增 `SyncTurnOutcome`（Ok/Timeout/Closed/Failed）+ `wait_turn_outcome()`，`wait_turn_text` 改为其折叠包装（job 路径语义不变，仅死信提前醒）。P3.2：`SyncTurnOutcome::Cancelled`（外部联动取消）；`BACKEND_SUFFIX_MARK` 常量化（Ok 臂后缀追加处与 oneshot 剥除处同源）；`remove_sync_waiter()`（oneshot 外部取消臂清表防泄漏）。P4.3：`handle_prompt_result` Ok 臂的「── 后端：X」后缀追加与 `BACKEND_SUFFIX_MARK` 常量删除（单后端后路由核验维度消亡）；`AgentConfig.backend` 保留（写多读零的透传字段，移除留给后续清理批次） |
+| oneshot.rs | ABB 新增（上游无对应） | 单后端化 P3.1：`oneshot_turn()` 一次性同步回合——自建 CancellationToken + `BuzzHandle::new` + spawn `run_loop` + adhoc 频道 + `wait_turn_outcome`，Timeout 先 cancel 防迟发，`token.cancel()` + 12s 有界 join 拆栈（进程组收尸有界）。P3.2：`external_cancel: Option<CancellationToken>`（只 watch 绝不反 cancel；触发 → Cancelled + Timeout 同款 teardown）；Ok 文本剥后端标识后缀（`strip_backend_suffix`，摘要/prompt/JSON 消费方不带路由标注）。P4.3：harness 追加处已删，`strip_backend_suffix` 恒为无-op——标记字面量就地内联、剥除留作防御（升级前在途/迟发文本仍剥）。供 P3.2 session_gc / P3.3 generate_role_prompt / P3.4 teambuilder 复用；上游同步时保留 |
 | prompt_framing.rs | 保留 | 上下文片段渲染（可能小裁） |
 | lib.rs | 裁为壳 | 只留 dispatch_pending/handle_prompt_result/重拉退避切片；删 run()/clap/子命令/装配 |
 | pool_lifecycle.rs | 保留 | 懒池状态机（零外部依赖） |
@@ -50,4 +53,14 @@
 
 - 独立 manifest、独立 `Cargo.lock`：`cargo +1.98.0 build --release --manifest-path crates/buzz-agent/Cargo.toml`（产物在 `crates/buzz-agent/target/`，不污染仓库根 target）。
 - 测试：`cargo +1.98.0 test --manifest-path crates/buzz-agent/Cargo.toml`（642+ 全绿含 corpus drift gate）。
-- 分发：release.yml（macOS/Windows）+ ABB.iss 构建 fork 随包；运行时 `buzz_agent_exe` 为空时先查主程序同目录 `buzz-agent`（ABB.app/Contents/MacOS/），再回落 PATH `pi-acp`。
+- 分发：release.yml（macOS/Windows）+ ABB.iss 构建 fork 随包；运行时执行层解析（`service.rs::resolve_buzz_agent`）：`buzz_agent_exe` 覆盖（绝对路径或 PATH 名，指错告警并回落）→ 主程序同目录 `buzz-agent`/`buzz-agent.exe`（ABB.app/Contents/MacOS/）→ PATH `pi-acp` 兜底（开发/自签构建无随包时）。
+
+## 已知 flaky（fork 测试）
+
+CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归本地全量门禁。处置纪律：**禁止重跑至绿**（幸存者偏差），逐测试归因裁决。现存两条（出处：093451a 提交信息，均自移植早期存在、与本 fork 后续改动零交集）：
+
+1. `cancelled_turn_with_usage_emits_notification_before_response`（断言 `tests/fake_llm.rs:1376`，Null vs "cancelled"）——cancel 写 stdin 后 gate 立即放开、agent reader 未及处理，第 2 轮 fallback 错误臂在 biased select 中抢先（`agent.rs:406-410`）。修它要动同步区 cancel 优先级，**另案评估**。发生率：20 轮口径 1 轮。
+2. `steer_rejected_on_empty_prompt`（断言 `tests/fake_llm.rs:1459`）——空 prompt 的 -32602 拒绝帧在争用下落后于 prompt 响应帧，先 break → `saw_reject=false`。自移植初始提交 be46634 存在、从未改动；仅全量并发下偶发（整文件 20 轮 0 出现）。
+
+已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
+

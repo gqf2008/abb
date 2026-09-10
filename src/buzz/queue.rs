@@ -840,6 +840,10 @@ pub struct PromptChannelInfo {
     pub channel_type: String,
     /// Chat description / announcement, when the bridge exposes one.
     pub description: Option<String>,
+    /// 该频道的 agent 工作目录（P0.B：虚拟 Bot 群=vb/<uuid>，其余=bot 工作区）。
+    /// None = 桥没提供 → 会话回落到 PromptContext.cwd（进程启动目录，旧行为）。
+    /// ABB 侧扩展字段（docs/buzz-port-sync.md 处置表有记）。
+    pub workspace: Option<String>,
 }
 
 /// Maximum length (in characters) of a channel description rendered into `<context>`.

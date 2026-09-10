@@ -40,6 +40,40 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # fork buzz-agent 是独立包（自有 manifest + lock，不挂 root workspace），root 的
+  # clippy/fmt 覆盖不到它——v2.23.24 就带着一个 `#[cfg(unix)]` 测试里的 unused
+  # variable 上了 main（本地门禁红、远程 CI 全绿）。这里补 PR 级门禁。
+  # 选 macOS 只为与本地门禁同平台、少一类环境差异（Linux 同为 cfg(unix)，同样
+  # 能编到那段测试代码；fork 的 cfg(windows) 测试代码在两边都不被编译，属既有盲区）。
+  fork-lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/buzz-agent
+
+      # --all 不含独立包，必须显式 manifest-path
+      - name: fmt（fork）
+        run: cargo fmt --check --manifest-path crates/buzz-agent/Cargo.toml
+
+      # --all-targets 关键：只 lint 非测试构建时，测试代码里的违例（正是这次的
+      # unused variable）永远漏网
+      - name: clippy（fork，-D warnings 门禁）
+        run: cargo clippy --locked --manifest-path crates/buzz-agent/Cargo.toml --all-targets -- -D warnings
+
+      # 测试只编译不执行：fork 尚存两条已知 flaky（一条 steer 时序、一条 cancel 竞争，
+      # 账在 docs/buzz-port-sync.md「已知 flaky」节），真跑会间歇红；--no-run 已能抓住
+      # 「测试代码编不过 / 新 cfg 形态漏编译」这类回归（v2.23.24 的 unused variable 即属
+      # 此类）。逻辑回归仍由本地全量门禁负责。
+      - name: test 编译（fork，--no-run）
+        run: cargo test --locked --manifest-path crates/buzz-agent/Cargo.toml --no-run
+
   test:
     runs-on: windows-latest
     steps:

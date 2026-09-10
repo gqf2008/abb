@@ -63,6 +63,149 @@ pub struct SessionNewParams {
     pub mcp_servers: Vec<McpServerStdio>,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// ABB 扩展（单后端化 P1.1）：会话执行档位与域根。缺省 = FullAccess，
+    /// 与不发 `_meta` 的旧客户端字节级同今天（回归锁见 wire/mcp 测试）。
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<SessionNewMeta>,
+}
+
+/// `session/new` 的 `_meta` 扩展载荷。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNewMeta {
+    /// "read-only" | "workspace-write" | "full-access"（ABB SandboxMode 同词表）。
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    /// 写/读域根（P1.3 生效）。None = 仅 session cwd。
+    #[serde(default)]
+    pub writable_roots: Option<Vec<String>>,
+    /// shell 策略："restricted" = argv 白名单（P1.3b）；缺省 = 今天。
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// ABB 主程序路径（`$ABB_BIN` 白名单的实体）。
+    #[serde(default)]
+    pub abb_bin: Option<String>,
+}
+
+/// 会话执行档位（`_meta.sandbox` 解析产物）。语义：
+/// - ReadOnly：`dev__write`/`dev__shell` 不进工具表且执行闸拒绝（模型根本看不见）
+/// - WorkspaceWrite：全工具可用，写限定 roots（P1.3 落地域校验）
+/// - FullAccess：今天的无限制行为（缺省值）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+/// 会话工具策略（P1.3a）：档位 + 读/写域根。
+///
+/// - FullAccess（缺省）：读不限制、写限会话 cwd——与今天字节级一致（回归锁）。
+/// - WorkspaceWrite：读/写都限定 roots（= 会话 cwd ∪ `_meta.writableRoots`）。
+/// - ReadOnly：读限 roots；write/shell 已被档位摘除（P1.2）。
+#[derive(Debug, Clone)]
+pub struct ToolPolicy {
+    pub sandbox: Sandbox,
+    /// 读域根；None = 不限制（仅 FullAccess）。判定时两侧均 canonicalize。
+    pub read_roots: Option<Vec<std::path::PathBuf>>,
+    /// 写域根（任一命中即允许）。FullAccess = [session cwd]（今天行为）。
+    pub write_roots: Vec<std::path::PathBuf>,
+    /// shell 策略（P1.3b）：Full=今天无限制；Restricted=argv 白名单
+    /// （granted 承诺语义：$ABB_BIN job add/session reset/deliver + 只读 git
+    /// + 域内只读命令；复合语法拒绝）。
+    pub shell: ShellMode,
+    /// ABB 主程序路径（`_meta.abbBin`）——Restricted 模式认 `$ABB_BIN` 白名单。
+    pub abb_bin: Option<String>,
+}
+
+/// shell 执行策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMode {
+    /// 今天的行为：任意命令（env 白名单之外无内容校验）。
+    Full,
+    /// argv 白名单（shell_policy::check_restricted）。
+    Restricted,
+}
+
+impl ShellMode {
+    pub fn parse_opt(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) if v.eq_ignore_ascii_case("restricted") => Self::Restricted,
+            _ => Self::Full, // 缺省/未知 = 今天（协议噪音不挂聊天；warn 由调用方做）
+        }
+    }
+}
+
+impl ToolPolicy {
+    pub fn build(
+        sandbox: Sandbox,
+        cwd: &str,
+        extra_roots: Option<Vec<String>>,
+        shell: ShellMode,
+        abb_bin: Option<String>,
+    ) -> Self {
+        let cwd_path = std::path::PathBuf::from(cwd);
+        let mut roots = vec![cwd_path.clone()];
+        for r in extra_roots.unwrap_or_default() {
+            let pth = std::path::PathBuf::from(&r);
+            if pth.is_absolute() && !roots.iter().any(|x| x == &pth) {
+                roots.push(pth);
+            }
+        }
+        let shell = if sandbox == Sandbox::ReadOnly {
+            ShellMode::Full // read-only 档 shell 已被工具面摘除，模式无意义
+        } else {
+            shell
+        };
+        match sandbox {
+            Sandbox::FullAccess => Self {
+                sandbox,
+                read_roots: None,
+                write_roots: vec![cwd_path],
+                shell,
+                abb_bin,
+            },
+            _ => Self {
+                sandbox,
+                read_roots: Some(roots.clone()),
+                write_roots: roots,
+                shell,
+                abb_bin,
+            },
+        }
+    }
+
+    /// 目标路径（已 canonicalize）是否落在给定根集合内（根同样 canonicalize）。
+    pub fn within(roots: &[std::path::PathBuf], canon_target: &std::path::Path) -> bool {
+        roots.iter().any(|r| {
+            let rc = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+            canon_target.starts_with(&rc)
+        })
+    }
+}
+
+impl Sandbox {
+    /// 宽松解析：未知/缺失值回落 FullAccess 并由调用方 warn（协议噪音绝不
+    /// 挂掉聊天）。词表与 ABB `SandboxMode::as_str` 对齐。
+    pub fn parse_opt(raw: Option<&str>) -> (Self, bool) {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            None => (Self::FullAccess, false),
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "read-only" => (Self::ReadOnly, true),
+                "workspace-write" => (Self::WorkspaceWrite, true),
+                "full-access" => (Self::FullAccess, true),
+                _ => (Self::FullAccess, true),
+            },
+        }
+    }
+
+    pub fn allow_write(self) -> bool {
+        self != Self::ReadOnly
+    }
+
+    pub fn allow_shell(self) -> bool {
+        self != Self::ReadOnly
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,6 +636,58 @@ mod tests {
         let params: SessionNewParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.cwd, "/tmp/test");
         assert!(params.system_prompt.is_none());
+    }
+
+    #[test]
+    fn sandbox_parse_matrix() {
+        use super::Sandbox;
+        // 缺省（旧客户端不发 _meta）= FullAccess（recognized=false → 不 warn）
+        let (sb, rec) = Sandbox::parse_opt(None);
+        assert_eq!(sb, Sandbox::FullAccess);
+        assert!(!rec);
+        let (sb, _) = Sandbox::parse_opt(Some(""));
+        assert_eq!(sb, Sandbox::FullAccess);
+        // 词表与 ABB SandboxMode::as_str 对齐；大小写宽容
+        assert_eq!(
+            Sandbox::parse_opt(Some("read-only")),
+            (Sandbox::ReadOnly, true)
+        );
+        assert_eq!(
+            Sandbox::parse_opt(Some("Workspace-Write")),
+            (Sandbox::WorkspaceWrite, true)
+        );
+        assert_eq!(
+            Sandbox::parse_opt(Some("full-access")),
+            (Sandbox::FullAccess, true)
+        );
+        // 未知值：回落 FullAccess + recognized=true（调用方据此 warn）
+        assert_eq!(
+            Sandbox::parse_opt(Some("ludicrous")),
+            (Sandbox::FullAccess, true)
+        );
+        assert!(!Sandbox::ReadOnly.allow_write());
+        assert!(!Sandbox::ReadOnly.allow_shell());
+        assert!(Sandbox::WorkspaceWrite.allow_write());
+    }
+
+    #[test]
+    fn session_new_accepts_abb_meta_extension() {
+        // `_meta.sandbox`/`writableRoots` 能解；缺 _meta 时字段 None（旧客户端兼容）
+        let p: SessionNewParams = serde_json::from_value(serde_json::json!({"cwd": "/", "_meta": {
+            "sandbox": "read-only", "writableRoots": ["/tmp/x"]
+        }}))
+        .unwrap();
+        assert_eq!(
+            p.meta.as_ref().unwrap().sandbox.as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
+            p.meta.as_ref().unwrap().writable_roots.as_deref(),
+            Some(["/tmp/x".to_string()].as_slice())
+        );
+        let p2: SessionNewParams =
+            serde_json::from_value(serde_json::json!({ "cwd": "/" })).unwrap();
+        assert!(p2.meta.is_none());
     }
 
     #[test]

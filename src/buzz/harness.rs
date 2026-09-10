@@ -70,6 +70,9 @@ pub struct ChannelMeta {
     /// 即时登记（非巡检登记表来源）：p2p 私聊与「自动登记」的群。巡检 diff
     /// 清理跳过 adhoc 频道（它们不在登记表，误清会丢会话）。
     pub adhoc: bool,
+    /// agent 工作目录（P0.B）：session/new 的 cwd 与 <workspace> 段用它；
+    /// None = 回落 handle 级 cwd（进程启动目录）。
+    pub workspace: Option<String>,
 }
 
 impl ChannelMeta {
@@ -84,6 +87,7 @@ impl ChannelMeta {
                 "channel".to_string()
             },
             description: None,
+            workspace: self.workspace.clone(),
         }
     }
 }
@@ -96,9 +100,17 @@ pub struct AgentConfig {
     /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同，
     /// 见 docs/buzz-port-sync.md）。
     pub extra_env: Vec<(String, String)>,
-    /// ABB 后端标识（claude/codex/pi/buzz）——agent 回复尾部标注用
-    ///（多后端热切换下用户可核验路由；与适配器进程身份解耦）。
+    /// ABB 后端标识（单后端化后恒 "buzz"）。P4.3 删除回复尾部「── 后端：X」
+    /// 标注后暂无消费方——字段保留作配置透传（service → handle）与将来日志
+    /// 标注用；移除它要牵动 service/测试全部构造点，留给后续清理批次。
+    #[allow(dead_code)] // 暂无读方（P4.3 后缀标注已删），见上行注释——后续批次移除
     pub backend: String,
+    /// 本 handle 全部会话的执行档位载荷（单后端化 P2.2）：随 `session/new`
+    /// `_meta` 下发。normal handle = bot 配置档（`sandbox_mode` 解析产物，
+    /// None=FullAccess 今天行为）；granted handle = 强制 Restricted 剖面
+    ///（workspace-write + shell 白名单 + `$ABB_BIN`）——同群 owner/granted
+    /// 混合频道的档位只能绑进程，不能绑会话（角色 per-event）。
+    pub session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
 }
 
 /// 出站回合/告示：桥侧消费（写历史 + 发送）。
@@ -109,6 +121,26 @@ pub struct TurnOutput {
     pub meta: Option<ChannelMeta>,
     /// agent 回复文本（或 harness 失败告示文案）。
     pub text: String,
+}
+
+/// 同步回合结局（P3.1，[`BuzzHandle::wait_turn_outcome`]）：oneshot 路径需要
+/// 区分超时/关闭/agent 错误；job 路径的 `wait_turn_text` 仍折叠成 Option。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncTurnOutcome {
+    /// 回合文本（与 chat 投递同款处理；P4.3 起不再附后端标识后缀）。
+    Ok(String),
+    /// 调用方预算先到（在途回合可能仍在跑——调用方负责 cancel 防迟发）。
+    Timeout,
+    /// 句柄已关闭，消息 push 不进主循环。另见 `wait_turn_outcome` 的
+    /// `Ok(None)` 臂：同 channel_id 并发两次等待时后注册者顶替前者，
+    /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
+    /// oneshot fresh Uuid，触不到；与旧实现同构）。
+    Closed,
+    /// 外部联动取消（P3.2：oneshot 的关停联动）——与 Timeout 同款 teardown
+    /// 已完成，在途回合已叫停。
+    Cancelled,
+    /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
+    Failed(String),
 }
 
 enum Cmd {
@@ -145,6 +177,18 @@ struct SteerAckEvent {
 }
 
 /// 桥侧句柄。
+/// fork `_meta.abbSandbox` 能力协商结果（单后端化 P2.3）。存储为 AtomicU8
+/// （判别值见 BuzzHandle::sandbox_support）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxSupport {
+    /// agent 未启动/启动中——能力未知。
+    Unknown = 0,
+    /// initialize 声明 `_meta.abbSandbox`——认 `_meta.sandbox/shell`。
+    Supported = 1,
+    /// initialize 未声明——旧 fork/其他适配器，发不出档位。
+    Unsupported = 2,
+}
+
 pub struct BuzzHandle {
     cfg: AgentConfig,
     stop: CancellationToken,
@@ -152,15 +196,22 @@ pub struct BuzzHandle {
     registry: Arc<Mutex<Registry>>,
     /// agent 进程不可用（bridge 预检读）。
     dead: AtomicBool,
+    /// fork `_meta.abbSandbox` 能力位（单后端化 P2.3）：initialize 成功后由
+    /// handle_spawn_outcome 写入；新一轮 spawn 发起时复位 Unknown。
+    /// 桥侧预检据此对「已知不支持」的 granted 消息提前拒答；**真闸**在
+    /// `pool::create_session_and_apply_model`（拒绝创建受限会话，无懒启动竞态）。
+    sandbox_supported: std::sync::atomic::AtomicU8,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Cmd>>>,
     life_tx: mpsc::UnboundedSender<SpawnOutcome>,
     life_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<SpawnOutcome>>>,
     turn_tx: mpsc::UnboundedSender<TurnOutput>,
-    /// 同步回合等待表（job 路径）：channel_id → 文本回传。turn consumer 消费
-    /// TurnOutput 时若频道有等待者，文本旁路给它（不再走 chat 投递）。
+    /// 同步回合等待表（job/oneshot 路径）：channel_id → 结局回传。Ok = 回合文本
+    ///（turn consumer 消费 TurnOutput 时旁路）；Err = 终态失败原因（notify_channel
+    /// 死信/失败告示时旁路——否则 agent 错误对同步等待者只表现为「挂到超时」，
+    /// 见 docs/buzz-port-sync.md 与 oneshot.rs）。
     sync_waiters: std::sync::Mutex<
-        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<String>>,
+        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
     >,
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
@@ -196,6 +247,7 @@ impl BuzzHandle {
             ctx,
             registry: Arc::new(Mutex::new(Registry::default())),
             dead: AtomicBool::new(false),
+            sandbox_supported: std::sync::atomic::AtomicU8::new(SandboxSupport::Unknown as u8),
             cmd_tx,
             cmd_rx: std::sync::Mutex::new(Some(cmd_rx)),
             life_tx,
@@ -207,29 +259,47 @@ impl BuzzHandle {
     }
 
     /// 同步回合等待（job 路径）：注册等待者后 push 消息，等回合文本到达
-    ///（timeout 上限）。超时/句柄关闭返回 None——调用方降级报错文案。
+    ///（timeout 上限）。超时/句柄关闭/回合终态失败一律折叠为 None——调用方
+    /// 降级报错文案（与旧实现字节级行为一致；终态失败现在会提前醒而非挂满
+    /// timeout，属失败提速）。需要区分结局的调用方（oneshot）用
+    /// [`Self::wait_turn_outcome`]。
     pub async fn wait_turn_text(
         &self,
         channel_id: Uuid,
         msg: InboundMsg,
         timeout: std::time::Duration,
     ) -> Option<String> {
+        match self.wait_turn_outcome(channel_id, msg, timeout).await {
+            SyncTurnOutcome::Ok(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// 同步回合等待（oneshot 路径）：与 [`Self::wait_turn_text`] 同机制，但
+    /// 结局四分——Ok(文本) / Timeout（调用方预算先到） / Closed（句柄已关闭，
+    /// push 不进） / Failed(agent 终态失败原因，由 notify_channel 旁路)。
+    pub async fn wait_turn_outcome(
+        &self,
+        channel_id: Uuid,
+        msg: InboundMsg,
+        timeout: std::time::Duration,
+    ) -> SyncTurnOutcome {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.sync_waiters.lock().unwrap().insert(channel_id, tx);
         if !self.push_message(channel_id, msg) {
             self.sync_waiters.lock().unwrap().remove(&channel_id);
-            return None;
+            return SyncTurnOutcome::Closed;
         }
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(text)) => {
-                self.sync_waiters.lock().unwrap().remove(&channel_id);
-                Some(text)
-            }
-            _ => {
-                self.sync_waiters.lock().unwrap().remove(&channel_id);
-                None
-            }
-        }
+        let outcome = match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(Ok(text))) => SyncTurnOutcome::Ok(text),
+            Ok(Some(Err(reason))) => SyncTurnOutcome::Failed(reason),
+            // Ok(None) = 回传端意外消失（同 channel_id 并发两次等待时后者
+            // 顶替前者的 tx；见 SyncTurnOutcome::Closed 文档），按关闭论。
+            Ok(None) => SyncTurnOutcome::Closed,
+            Err(_) => SyncTurnOutcome::Timeout,
+        };
+        self.sync_waiters.lock().unwrap().remove(&channel_id);
+        outcome
     }
 
     /// agent 进程是否可用（桥侧预检读）。false = 启动/重拉失败退避中，新消息
@@ -238,10 +308,28 @@ impl BuzzHandle {
         !self.dead.load(Ordering::Relaxed)
     }
 
+    /// fork `_meta.abbSandbox` 能力位（P2.3）。桥侧预检只在 **Unsupported**
+    ///（agent 已起、initialize 未声明）时提前拒答；Unknown（懒启动未起）放行——
+    /// 真闸在 session 创建处（pool），否则首条 granted 消息必被误拒。
+    pub fn sandbox_support(&self) -> SandboxSupport {
+        match self.sandbox_supported.load(Ordering::Relaxed) {
+            1 => SandboxSupport::Supported,
+            2 => SandboxSupport::Unsupported,
+            _ => SandboxSupport::Unknown,
+        }
+    }
+
     /// 入队一条用户消息（桥 dispatch 后调用）。channel 在跑时按 Queue 语义
     /// 排队并触发 steer（模块文档）。返回 `false` = 句柄已关闭。
     pub fn push_message(&self, channel_id: Uuid, msg: InboundMsg) -> bool {
         self.cmd_tx.send(Cmd::Message { channel_id, msg }).is_ok()
+    }
+
+    /// 移除同步等待者（P3.2 oneshot 外部取消臂）：`wait_turn_outcome` 的 future
+    /// 被外部取消 select 提前 drop 时，其尾部 remove 不再执行——调用方须显式
+    /// 清表防条目泄漏（迟到的回合文本/死信 send 进已 drop 的 rx 静默丢弃）。
+    pub fn remove_sync_waiter(&self, channel_id: Uuid) {
+        self.sync_waiters.lock().unwrap().remove(&channel_id);
     }
 
     /// `!cancel`：取消该频道在跑回合。`Ok(true)` = 已向在跑任务发 Cancel 信号；
@@ -512,6 +600,16 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome
             let agent = *agent;
             l.crash_backoff = 0;
             handle.dead.store(false, Ordering::Relaxed);
+            // P2.3：能力位随本次 initialize 落锤（每次成功拉起都重判——同进程
+            // 重启后 exe 可能已被换装）。
+            handle.sandbox_supported.store(
+                if agent.acp.abb_sandbox_supported() {
+                    SandboxSupport::Supported as u8
+                } else {
+                    SandboxSupport::Unsupported as u8
+                },
+                Ordering::Relaxed,
+            );
             l.pool.return_agent(agent);
             tracing::info!("agent process ready");
         }
@@ -547,6 +645,11 @@ fn schedule_agent_start(
 ) {
     debug_assert!(!l.spawn_in_flight, "must not stack spawn attempts");
     l.spawn_in_flight = true;
+    // 新一轮 spawn 发起：能力位复位 Unknown（initialize 前任何读取都按
+    // 「未就绪」拒答——绝不沿用上一次的判定给过旧 fork 开闸）。
+    handle
+        .sandbox_supported
+        .store(SandboxSupport::Unknown as u8, Ordering::Relaxed);
     let cfg = handle.cfg.clone();
     let stop = handle.stop.clone();
     let life_tx = handle.life_tx.clone();
@@ -593,6 +696,7 @@ async fn spawn_and_init_agent(cfg: &AgentConfig) -> SpawnOutcome {
                 agent_name,
                 goose_system_prompt_supported: None,
                 protocol_version,
+                session_sandbox: cfg.session_sandbox.clone(),
             }))
         }
         Ok(Err(e)) => {
@@ -835,6 +939,21 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                         ),
                     );
                 }
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_sandbox_unsupported(e))
+            {
+                // P2.3：受限档位能力缺失（session 创建被 pool 硬闸拒绝）——不可
+                // 重试：agent 进程本身健康，重试只会再撞同一闸。当场死信并给可
+                // 行动提示（升级 ABB / 换回随包 agent）。
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    "dead-lettering batch — agent lacks _meta.abbSandbox capability"
+                );
+                notify_channel(
+                    l,
+                    handle,
+                    &batch,
+                    "⚠️ 处理失败：随包 agent 不支持受限执行档位（请升级 ABB 后重试）。".to_string(),
+                );
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // 认证错误不可重试：立即死信并提示重登。
                 tracing::warn!(
@@ -904,18 +1023,13 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 // 恰好是技能路径」的行改写成技能名，其余行一律不动（窄模式：
                 // 只有纯路径行会命中，正常提及路径的叙述不受影响）。
                 let text = redact_skill_paths(&text);
-                // 后端标识后缀：每个 agent 回复尾部标注实际后端（chat/job 两
-                // 路径同款；多后端热切换下用户可核验路由）。空文本不加。
-                let text = if text.trim().is_empty() {
-                    text
-                } else {
-                    format!("{text}\n── 后端：{}", handle.cfg.backend)
-                };
+                // P4.3：后端标识后缀（`── 后端：X`）已删——执行层收口随包
+                // buzz-agent 单一后端，路由核验维度消亡，回复正文即最终文本。
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
-                // 同步等待者（job 路径）旁路：文本直接回传，不产生 chat 投递
+                // 同步等待者（job/oneshot 路径）旁路：文本直接回传，不产生 chat 投递
                 if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(channel_id) {
-                    let _ = tx.send(text);
+                    let _ = tx.send(Ok(text));
                 } else {
                     let _ = handle.turn_tx.send(TurnOutput {
                         channel_id: *channel_id,
@@ -1009,12 +1123,22 @@ fn schedule_death_respawn(
 }
 
 /// 失败批次死信/重试耗尽时的频道告示（出站 TurnOutput，桥侧写历史并发送）。
+/// 同步等待者旁路（P3.1）：该频道有 waiter 时同文以 Err 回传——agent 终态失败
+/// （死信/认证失效/档位不支持）对 job/oneshot 路径不再只表现为「挂到超时」。
 fn notify_channel(l: &mut Loop, handle: &BuzzHandle, batch: &FlushBatch, text: String) {
     if l.removed_channels.contains(&batch.channel_id) {
         return;
     }
     let meta = handle.channel_meta(&batch.channel_id);
     tracing::warn!(channel_id = %batch.channel_id, "sending failure notice to channel");
+    if let Some(tx) = handle
+        .sync_waiters
+        .lock()
+        .unwrap()
+        .remove(&batch.channel_id)
+    {
+        let _ = tx.send(Err(text.clone()));
+    }
     let _ = handle.turn_tx.send(TurnOutput {
         channel_id: batch.channel_id,
         meta,
@@ -1028,6 +1152,17 @@ fn is_auth_error(error: &AcpError) -> bool {
         return false;
     };
     message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+/// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
+/// （随包 agent 未声明 `_meta.abbSandbox`，或词表不含请求档位）。不可重试——
+/// agent 进程本身健康，重试只会再撞同一闸。
+///
+/// 走独立变体 [`AcpError::SandboxUnsupported`] 而非 `Protocol`：后者在
+/// `is_transport_error` 之列，会把健康 agent 判为「管道可能坏」而
+/// `schedule_death_respawn`（杀进程 + 置 dead，后续消息全被预检拒掉）。
+fn is_sandbox_unsupported(error: &AcpError) -> bool {
+    matches!(error, AcpError::SandboxUnsupported(_))
 }
 
 // ── recover_panicked_agent（上游移植） ───────────────────────────────────────
@@ -1226,6 +1361,141 @@ fn redact_skill_paths(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod channel_info_tests {
+    use super::*;
+
+    fn meta(chat_type: &str, workspace: Option<&str>) -> ChannelMeta {
+        ChannelMeta {
+            bot_key: "bot".into(),
+            chat_id: "oc_x".into(),
+            chat_type: chat_type.into(),
+            thread_id: None,
+            name: "名字".into(),
+            anchor_mid: None,
+            adhoc: false,
+            workspace: workspace.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn workspace_maps_through_to_prompt_info() {
+        // P0.B：workspace 随 channel_info 贯穿（p2p 的 dm 语义映射同时锁住）
+        let info = meta("p2p", Some("/ws/vb/uuid-1")).channel_info();
+        assert_eq!(info.channel_type, "dm");
+        assert_eq!(info.workspace.as_deref(), Some("/ws/vb/uuid-1"));
+        assert_eq!(meta("group", None).channel_info().workspace, None);
+    }
+
+    /// P3.1：主循环已退出（cmd 接收端随 run_loop 关闭）时，同步回合等待立即
+    /// 得 Closed——不挂预算、不留等待者。纯单测（不起 agent、不跑 run_loop）。
+    #[tokio::test]
+    async fn wait_turn_outcome_closed_when_loop_gone() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        // 模拟 run_loop 曾取走接收端后退出（生产上 Closed 只在此情形发生）。
+        drop(handle.take_cmd_rx());
+        let outcome = handle
+            .wait_turn_outcome(
+                Uuid::new_v4(),
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m1".to_string(),
+                    author_role: "owner".to_string(),
+                    text: "x".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(outcome, SyncTurnOutcome::Closed);
+        assert!(handle.sync_waiters.lock().unwrap().is_empty());
+        // wait_turn_text 折叠同路径 → None（job 调用方语义不变）
+        assert!(handle
+            .wait_turn_text(
+                Uuid::new_v4(),
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m2".to_string(),
+                    author_role: "owner".to_string(),
+                    text: "x".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .is_none());
+    }
+
+    /// P3.1（审查 P3-4）：job 折叠臂直接锁——频道死信（等待者收 Err）时
+    /// `wait_turn_text` 必须**提前醒**且折叠为 None，而不是挂满预算。
+    /// 纯单测：不跑 run_loop，直接拨 sync_waiters 表模拟 notify_channel 旁路。
+    #[tokio::test]
+    async fn wait_turn_text_folds_failure_to_none_fast() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        // cmd 接收端留着不消费：push 成功、等待者注册，消息无人处置。
+        let _cmd_rx = handle.take_cmd_rx();
+        let channel_id = Uuid::new_v4();
+        let waiter = {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                h.wait_turn_text(
+                    channel_id,
+                    crate::buzz::queue::InboundMsg {
+                        id_hex: "m1".to_string(),
+                        author_role: "owner".to_string(),
+                        text: "x".to_string(),
+                        ts_secs: 0,
+                        prompt_tag: "test".to_string(),
+                    },
+                    std::time::Duration::from_secs(3600),
+                )
+                .await
+            })
+        };
+        // 等等待者注册（确定性轮询，5s 上限），再模拟死信 Err 旁路。
+        let mut waited_ms = 0u64;
+        let tx = loop {
+            if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(&channel_id) {
+                break tx;
+            }
+            assert!(waited_ms < 5000, "等待者未注册");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited_ms += 10;
+        };
+        let started = std::time::Instant::now();
+        tx.send(Err("⚠️ 处理失败：agent 认证失效。".to_string()))
+            .unwrap();
+        let folded = waiter.await.unwrap();
+        assert_eq!(folded, None, "Failed 必须折叠为 None");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "死信必须提前醒而非挂预算: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 #[cfg(test)]

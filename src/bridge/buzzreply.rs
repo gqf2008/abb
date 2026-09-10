@@ -100,11 +100,8 @@ impl Bridge {
                 // mid = 用户消息 mid（一消息一回复；与 CLI 成功路径同口径）。
                 // (mid,user) 去重只认用户轮，助手条目无重复风险（同步形态下每次
                 // dispatch 至多一条 TurnOutput）。
-                crate::history::History::open(&self.bot.key(), &key).append_assistant(
-                    mid,
-                    Backend::Buzz.name(),
-                    &text,
-                );
+                crate::history::History::open(&self.bot.key(), &key)
+                    .append_assistant(mid, "buzz", &text);
             } else {
                 crate::log!(
                     "[bridge] buzz 回合回复到达时会话已 /new（代际失配），跳过历史写入 chat={} uuid={}",

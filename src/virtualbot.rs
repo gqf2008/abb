@@ -315,11 +315,11 @@ fn migrate_legacy_vb_data(
     if marker.exists() {
         return;
     }
-    // 1) 会话槽位：bot 级 sessions.json → vb/sessions.json（backend 无关，整 chat 搬，
-    //    含话题键；独立审查 F3）
+    // 1) 会话槽位：bot 级 sessions.json → vb/sessions.json（整 chat 搬，含话题键；
+    //    独立审查 F3）
     let bot_sessions = base.join("workspaces").join(bot_key).join("sessions.json");
-    let bot_store = crate::sessions::SessionStore::at("codex", bot_sessions);
-    let vb_store = crate::sessions::SessionStore::at("codex", vb_dir.join("sessions.json"));
+    let bot_store = crate::sessions::SessionStore::at(bot_sessions);
+    let vb_store = crate::sessions::SessionStore::at(vb_dir.join("sessions.json"));
     let _ = bot_store.extract_chat_to(chat_id, &vb_store);
     // 2) 历史文件族：bot history/ 下 escape(chat). 前缀的**全部**文件（.jsonl/.json/
     //    .ctxsum/.migrated.json/.imported.json——独立审查 F9；前缀用 escape_key 与
@@ -850,7 +850,7 @@ mod tests {
         std::fs::create_dir_all(base.join("workspaces").join(bot_key).join("history")).unwrap();
         std::fs::write(
             &bot_sessions,
-            r#"{"oc_vb1": {"codex": {"session_id": "tid-legacy", "started": true}}}"#,
+            r#"{"oc_vb1": {"session_id": "sid-legacy", "started": true}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -865,13 +865,13 @@ mod tests {
         crate::virtualbot::migrate_legacy_vb_data_pub(&base, bot_key, chat, &vb_dir);
 
         // 会话槽位迁入 vb 且 bot 级移除（不双写）
-        let vb_store = crate::sessions::SessionStore::at("codex", vb_dir.join("sessions.json"));
+        let vb_store = crate::sessions::SessionStore::at(vb_dir.join("sessions.json"));
         assert_eq!(
-            vb_store.chat_entry(chat).unwrap().codex.session_id,
-            "tid-legacy",
+            vb_store.chat_entry(chat).unwrap().session_id,
+            "sid-legacy",
             "槽位必须迁入 vb"
         );
-        let bot_store = crate::sessions::SessionStore::new("codex", bot_key);
+        let bot_store = crate::sessions::SessionStore::new(bot_key);
         assert!(
             bot_store.chat_entry(chat).is_none(),
             "bot 级槽位必须移除（不双写）"
@@ -892,10 +892,7 @@ mod tests {
             .exists());
         // 幂等：再跑一次无变化不报错
         crate::virtualbot::migrate_legacy_vb_data_pub(&base, bot_key, chat, &vb_dir);
-        assert_eq!(
-            vb_store.chat_entry(chat).unwrap().codex.session_id,
-            "tid-legacy"
-        );
+        assert_eq!(vb_store.chat_entry(chat).unwrap().session_id, "sid-legacy");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

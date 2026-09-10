@@ -1,4 +1,4 @@
-//! Built-in dev tools（shell / read / write / ls / glob）——进程内执行，不经 MCP。
+//! Built-in dev tools（shell / read / write / ls / glob / delegate）——进程内执行，不经 MCP。
 //!
 //! 注册在 "dev" 伪服务器命名空间下（`dev__shell` 等，由 [`crate::mcp::McpRegistry`]
 //! 装配时挂进工具表）。与上游 Buzz 的 dev MCP 服务器同款安全姿态：
@@ -29,6 +29,9 @@ const STREAM_TAIL_BUDGET: usize = 2048; // 单流保留的末尾字节（错误�
 const STREAM_HEAD_BUDGET: usize = SHELL_OUT_CAP - STREAM_TAIL_BUDGET - 128; // 头部预算（余量给省略标记）
 const SHELL_TIMEOUT_DEFAULT: u64 = 120;
 const SHELL_TIMEOUT_MAX: u64 = 600;
+/// 委派编码回合（P1.5）：冷起秒级、回合分钟级，默认 30min、上限 60min。
+const DELEGATE_TIMEOUT_DEFAULT: u64 = 1800;
+const DELEGATE_TIMEOUT_MAX: u64 = 3600;
 const READ_MAX_BYTES: usize = 256 * 1024;
 const READ_MAX_LINES: usize = 10_000;
 const WRITE_MAX_BYTES: usize = 512 * 1024;
@@ -97,6 +100,7 @@ pub enum Tool {
     Write,
     Ls,
     Glob,
+    Delegate,
 }
 
 impl Tool {
@@ -107,6 +111,7 @@ impl Tool {
             Tool::Write => "write",
             Tool::Ls => "ls",
             Tool::Glob => "glob",
+            Tool::Delegate => "delegate",
         }
     }
 }
@@ -207,10 +212,41 @@ pub fn defs() -> Vec<(Tool, ToolDef)> {
                 }),
             },
         ),
+        (
+            Tool::Delegate,
+            ToolDef {
+                name: Tool::Delegate.bare().to_owned(),
+                description: "Delegate a self-contained coding task to a locally installed AI \
+                    coding CLI (claude or codex), run as a subprocess in the session workspace. \
+                    The CLI acts as an autonomous coding agent: it can read/edit files and run \
+                    commands to complete the task, then its final report is returned as this \
+                    tool's output. It uses the user's own login state and subscription quota and \
+                    never reads or writes their CLI config files. Cold start takes seconds and a \
+                    task runs for minutes — set timeout_secs accordingly. Prefer this for \
+                    multi-step coding/editing work; use dev__shell for single quick commands."
+                    .to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "string", "enum": ["claude", "codex"],
+                            "description": "Which local coding CLI to run."
+                        },
+                        "task": { "type": "string", "description": "Self-contained coding task / instructions for the delegated agent." },
+                        "timeout_secs": {
+                            "type": "integer", "minimum": 1, "maximum": 3600,
+                            "description": "Hard timeout in seconds (default 1800)."
+                        }
+                    },
+                    "required": ["backend", "task"]
+                }),
+            },
+        ),
     ]
 }
 
 /// 内置工具分发入口（registry `call` 的 Builtin 臂）。
+#[cfg(test)]
 pub async fn run(
     tool: Tool,
     arguments: &Value,
@@ -218,12 +254,31 @@ pub async fn run(
     provider_id: &str,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ToolResult, AgentError> {
+    let policy = crate::wire::ToolPolicy::build(
+        crate::wire::Sandbox::FullAccess,
+        cwd,
+        None,
+        crate::wire::ShellMode::Full,
+        None,
+    );
+    run_with_policy(tool, arguments, cwd, &policy, provider_id, cancel).await
+}
+
+pub async fn run_with_policy(
+    tool: Tool,
+    arguments: &Value,
+    cwd: &str,
+    policy: &crate::wire::ToolPolicy,
+    provider_id: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<ToolResult, AgentError> {
     match tool {
-        Tool::Shell => run_shell(arguments, cwd, provider_id, cancel).await,
-        Tool::Read => run_read(arguments, cwd, provider_id).await,
-        Tool::Write => run_write(arguments, cwd, provider_id).await,
-        Tool::Ls => run_ls(arguments, cwd, provider_id).await,
-        Tool::Glob => run_glob(arguments, cwd, provider_id).await,
+        Tool::Shell => run_shell(arguments, cwd, policy, provider_id, cancel).await,
+        Tool::Read => run_read(arguments, cwd, policy, provider_id).await,
+        Tool::Write => run_write(arguments, cwd, policy, provider_id).await,
+        Tool::Ls => run_ls(arguments, cwd, policy, provider_id).await,
+        Tool::Glob => run_glob(arguments, cwd, policy, provider_id).await,
+        Tool::Delegate => run_delegate(arguments, cwd, policy, provider_id, cancel).await,
     }
 }
 
@@ -266,9 +321,33 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
 async fn run_shell(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ToolResult, AgentError> {
+    // P1.3b：Restricted 模式过 argv 白名单（granted 承诺语义）。拒绝以
+    // is_error 工具结果回流（模型可见、可改用白名单内命令），不挂回合。
+    if policy.shell == crate::wire::ShellMode::Restricted {
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match crate::shell_policy::check_restricted(
+            command,
+            &policy.write_roots,
+            policy.abb_bin.as_deref(),
+        ) {
+            crate::shell_policy::Decision::Allow => {}
+            crate::shell_policy::Decision::Deny(why) => {
+                return ok_result(provider_id, format!("shell: 拒绝受限命令：{why}")).map(
+                    |mut r| {
+                        r.is_error = true;
+                        r
+                    },
+                );
+            }
+        }
+    }
     let command = match arg_str(arguments, "command") {
         Some(c) if !c.trim().is_empty() => c,
         _ => return error_result(provider_id, "shell: missing required argument \"command\""),
@@ -292,6 +371,9 @@ async fn run_shell(
     cmd.env_remove("BUZZ_PRIVATE_KEY");
     #[cfg(unix)]
     cmd.process_group(0);
+    // Windows 抑制控制台窗（#153 孙进程场景：buzz-agent 自身无控制台，shell
+    // 孙进程不设 CREATE_NO_WINDOW 会新建可见控制台窗闪框；与 mcp spawn_one 同款）。
+    crate::mcp::configure_no_window(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -484,25 +566,379 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+// ── delegate（P1.5 编码任务委派） ────────────────────────────────────────────
+//
+// 模型自判编码任务时 spawn 本机 `claude -p` / `codex exec` 子进程，结果回流为
+// 工具产出。安全姿态与 shell 完全同源：白名单 env（[`crate::mcp::PASSTHROUGH_ENV`]，
+// 供应商 key 绝不进子进程）、会话 cwd、有界输出（CappedStream）、进程组杀树
+// （ShellGuard/kill_child_tree）。委派 CLI 用用户自己的登录态/订阅额度，绝不读写
+// 用户的 CLI 配置文件（不 --config、不写 ~/.claude|~/.codex）。
+//
+// 可见性（mcp.rs defs 过滤 + 这里执行闸双保险）：仅「shell 未被摘（非 read-only）
+// 且非 granted(Restricted)」的会话可见——read-only 没有 shell，给了是新权限；
+// granted 的 shell 走 argv 白名单，而委派 CLI 天生不受域闸约束，给了=P1.3 白名单
+// 白做。workspace-write 档 shell 本就是 Full（模型已能经 dev__shell 直呼
+// claude/codex），delegate 只是便利封装、不扩权，故可见。
+
+/// 委派的本地编码 CLI。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegateBackend {
+    Claude,
+    Codex,
+}
+
+impl DelegateBackend {
+    /// PATH 里查的 CLI 名。
+    fn cli(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// 工具参数 `backend` 的解析（只认 "claude"/"codex"，其余 None 走报错）。
+    fn from_arg(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// 二进制路径覆盖的环境变量名（测试缝 + 运维逃生阀）。
+    fn bin_override_env(self) -> &'static str {
+        match self {
+            Self::Claude => "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
+            Self::Codex => "BUZZ_AGENT_DELEGATE_CODEX_BIN",
+        }
+    }
+}
+
+/// 文件存在且（unix 上）带可执行位。
+fn is_executable_file(p: &Path) -> bool {
+    let Ok(m) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !m.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// 在 PATH 里找可执行文件，返回解析到的完整路径。
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|cand| is_executable_file(cand))
+}
+
+/// 解析某后端要 spawn 的二进制（纯函数，显式覆盖入参——测试据此免改进程
+/// env，见 LESSON set_var-UB）。`override = Some` 即唯一来源（指向不存在/不可
+/// 执行 = 该后端禁用，绝不回落 PATH——运维要的就是确定性）；`None` 才 PATH 探测。
+fn resolve_delegate_cli(
+    backend: DelegateBackend,
+    override_: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(raw) = override_ {
+        let p = PathBuf::from(raw);
+        return is_executable_file(&p).then_some(p);
+    }
+    find_in_path(backend.cli())
+}
+
+/// 生产包装：覆盖来自环境变量（`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` 逃生阀）。
+fn delegate_cli_path(backend: DelegateBackend) -> Option<PathBuf> {
+    resolve_delegate_cli(
+        backend,
+        std::env::var_os(backend.bin_override_env()).as_deref(),
+    )
+}
+
+/// 当前可用的委派后端（生产：经环境变量覆盖 + PATH 探测）。
+fn available_delegate_backends() -> Vec<DelegateBackend> {
+    [DelegateBackend::Claude, DelegateBackend::Codex]
+        .into_iter()
+        .filter(|b| delegate_cli_path(*b).is_some())
+        .collect()
+}
+
+/// 任一委派后端可用（mcp.rs defs 过滤的注入闸：claude/codex 都不在 → 工具不注入）。
+pub fn delegate_available() -> bool {
+    !available_delegate_backends().is_empty()
+}
+
+/// delegate 注入判定（纯函数）——仅 mcp.rs 的 defs 过滤用它收口「对模型可不可见」：
+/// 「shell 未摘（非 read-only）且非 granted(Restricted) 且有可用 CLI」才注入。
+/// read-only 没有 shell，给了是新权限；granted 的 shell 走 argv 白名单，委派 CLI
+/// 不受域闸约束，给了 =P1.3 白名单白做；workspace-write/full-access 的 shell 本就
+/// Full（不扩权）。
+///
+/// 注意：两个执行闸（mcp.rs `call` 的 denied、run_delegate 入口）刻意**不**复用
+/// 本函数，保持 `!allow_shell() || shell==Restricted` 二腿内联——它们不含
+/// cli_available 这一腿：CLI 缺失要走另一条「available: …」可行动报错，而非
+/// 「disabled in sandbox mode」。别把执行闸也「统一」进本函数，那会改变 CLI
+/// 缺失时的报错语义。
+pub fn delegate_def_visible(
+    sandbox: crate::wire::Sandbox,
+    shell: crate::wire::ShellMode,
+    cli_available: bool,
+) -> bool {
+    sandbox.allow_shell() && shell != crate::wire::ShellMode::Restricted && cli_available
+}
+
+/// 可用后端集合的可读描述（纯函数）：后端缺失报错里给模型可行动提示。
+fn backends_desc_from(avail: &[DelegateBackend]) -> String {
+    if avail.is_empty() {
+        "none (neither claude nor codex found in PATH)".to_owned()
+    } else {
+        avail.iter().map(|b| b.cli()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// 生产包装：当前可用后端描述（经环境变量覆盖 + PATH 探测）。
+fn available_backends_desc() -> String {
+    backends_desc_from(&available_delegate_backends())
+}
+
+/// delegate 工具入口：执行闸 + 参数解析 + 二进制解析（生产经 env/PATH），
+/// 然后委派给 [`run_delegate_with_bin`] 执行。
+async fn run_delegate(
+    arguments: &Value,
+    cwd: &str,
+    policy: &crate::wire::ToolPolicy,
+    provider_id: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<ToolResult, AgentError> {
+    // 执行闸（双保险：mcp.rs defs 过滤已挡，这里再挡模型幻觉/旧缓存的直呼）。
+    // read-only（shell 被摘）与 granted(Restricted) 永不放行——见模块注释。
+    if !policy.sandbox.allow_shell() || policy.shell == crate::wire::ShellMode::Restricted {
+        return error_result(
+            provider_id,
+            "delegate: not available in this session's sandbox mode",
+        );
+    }
+    let backend = match arg_str(arguments, "backend").and_then(DelegateBackend::from_arg) {
+        Some(b) => b,
+        None => {
+            return error_result(
+                provider_id,
+                "delegate: \"backend\" must be \"claude\" or \"codex\"",
+            )
+        }
+    };
+    let task = match arg_str(arguments, "task") {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => return error_result(provider_id, "delegate: missing required argument \"task\""),
+    };
+    let bin = match delegate_cli_path(backend) {
+        Some(b) => b,
+        None => {
+            return error_result(
+                provider_id,
+                format!(
+                    "delegate: `{}` CLI not available; available: {}",
+                    backend.cli(),
+                    available_backends_desc()
+                ),
+            )
+        }
+    };
+    let timeout = Duration::from_secs(
+        arg_u64(arguments, "timeout_secs")
+            .unwrap_or(DELEGATE_TIMEOUT_DEFAULT)
+            .clamp(1, DELEGATE_TIMEOUT_MAX),
+    );
+    run_delegate_with_bin(&bin, backend, task, timeout, cwd, provider_id, cancel).await
+}
+
+/// delegate 执行体：给定已解析的二进制，spawn 委派 CLI 并收割结果。抽出独立
+/// 函数让测试用显式临时二进制直调（免改进程 env，见 LESSON set_var-UB）。
+async fn run_delegate_with_bin(
+    bin: &Path,
+    backend: DelegateBackend,
+    task: &str,
+    timeout: Duration,
+    cwd: &str,
+    provider_id: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<ToolResult, AgentError> {
+    let mut cmd = Command::new(bin);
+    match backend {
+        DelegateBackend::Claude => {
+            // headless 一次性：-p 打印最终文本结果；--dangerously-skip-permissions
+            // 因无法交互授权（本工具仅在 shell 本就 Full 的会话可见，不扩权）。
+            // `--` 分隔 flag 与位置参数：task 以 `-` 开头不致被当未知选项。
+            cmd.arg("-p")
+                .arg("--output-format")
+                .arg("text")
+                .arg("--dangerously-skip-permissions")
+                .arg("--")
+                .arg(task);
+        }
+        DelegateBackend::Codex => {
+            // headless 一次性：codex 自有 workspace-write 沙箱限定写在工作区。
+            // `--` 分隔 flag 与位置参数：codex exec 有 resume/fork/review 子命令，
+            // 单词 task（如 "review"）或 `-` 开头的 task 不致被绑定子命令/当选项。
+            cmd.arg("exec")
+                .arg("--skip-git-repo-check")
+                .arg("--sandbox")
+                .arg("workspace-write")
+                .arg("-C")
+                .arg(cwd)
+                .arg("--")
+                .arg(task);
+        }
+    }
+    cmd.current_dir(cwd);
+    // 白名单 env（供应商 key 绝不进子进程；HOME 透传带去用户自己的登录态）。
+    // 必须在 apply_passthrough_env（先 env_clear）之后再 set 后端专属变量，
+    // 否则会被清掉。
+    crate::mcp::apply_passthrough_env(&mut cmd);
+    if backend == DelegateBackend::Claude {
+        // 实测必需（#7）：关掉 claude headless 的非必要遥测/更新流量。
+        cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    }
+    cmd.env_remove("NOSTR_PRIVATE_KEY");
+    cmd.env_remove("BUZZ_PRIVATE_KEY");
+    #[cfg(unix)]
+    cmd.process_group(0);
+    // Windows 抑制控制台窗（#153 孙进程场景，与 dev__shell / mcp spawn_one 同款）。
+    crate::mcp::configure_no_window(&mut cmd);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return error_result(
+                provider_id,
+                format!("delegate: failed to start `{}`: {e}", backend.cli()),
+            )
+        }
+    };
+
+    let out_task = tokio::spawn(read_pipe(child.stdout.take()));
+    let err_task = tokio::spawn(read_pipe(child.stderr.take()));
+    let mut guard = ShellGuard::new(child);
+
+    let wait_status = tokio::select! {
+        biased;
+        _ = cancel.changed() => {
+            guard.kill_tree().await;
+            return Err(AgentError::Cancelled);
+        }
+        r = guard.wait() => r,
+        _ = tokio::time::sleep(timeout) => {
+            guard.kill_tree().await;
+            return error_result(
+                provider_id,
+                format!("delegate: `{}` timed out after {}s", backend.cli(), timeout.as_secs()),
+            );
+        }
+    };
+    let status = match wait_status {
+        Ok(s) => s,
+        Err(e) => {
+            return error_result(
+                provider_id,
+                format!("delegate: failed to wait on `{}`: {e}", backend.cli()),
+            )
+        }
+    };
+    let drain = Duration::from_secs(5);
+    let mut lingering = false;
+    let stdout = match tokio::time::timeout(drain, out_task).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            // 孙进程（脱离进程组的后台子进程）仍持有管道：拿不到已读部分，
+            // 如实告知模型输出不完整（与 run_shell 同构）。
+            lingering = true;
+            CappedStream::new()
+        }
+    };
+    let stderr = match tokio::time::timeout(drain, err_task).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            lingering = true;
+            CappedStream::new()
+        }
+    };
+
+    let mut text = format!(
+        "delegate({}) exit: {}",
+        backend.cli(),
+        status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "killed".into())
+    );
+    if stdout.total > 0 {
+        text.push_str(&format!("\noutput:\n{}", stdout.render()));
+    }
+    if stderr.total > 0 {
+        text.push_str(&format!("\nstderr:\n{}", stderr.render()));
+    }
+    if lingering {
+        text.push_str(
+            "\n[output still streaming from a lingering background child process; result truncated]\n",
+        );
+    }
+    // 委派失败（非零退出）标 is_error：模型不该把失败输出当成成功结果。
+    ok_result(provider_id, text).map(|mut r| {
+        r.is_error = !status.success();
+        r
+    })
+}
+
 // ── 路径解析 ────────────────────────────────────────────────────────────────
 
-/// 只读工具的路径解析：相对路径基于会话工作区，绝对路径原样放行（与
-/// pi/claude 对齐——只读无写风险）。返回规范化（canonicalize 后）的路径。
-async fn resolve_read_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
+/// 只读工具的路径解析。FullAccess 档绝对路径原样放行（与 pi/claude 对齐——
+/// 今天的行为）；受限档（read_only/workspace_write，P1.3a）canonicalize 后必须
+/// 落在 read_roots 内——否则 granted/受限会话可以直接 `dev__read
+/// ~/.agent-bridge/config.json` 读走明文供应商 key / `~/.ssh`（实机审计结论）。
+async fn resolve_read_path(
+    cwd: &str,
+    path: &str,
+    policy: &crate::wire::ToolPolicy,
+) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
         Path::new(cwd).join(raw)
     };
-    tokio::fs::canonicalize(&joined)
+    let canon = tokio::fs::canonicalize(&joined)
         .await
-        .map_err(|e| format!("path not accessible: {path} ({e})"))
+        .map_err(|e| format!("path not accessible: {path} ({e})"))?;
+    if let Some(roots) = &policy.read_roots {
+        if !crate::wire::ToolPolicy::within(roots, &canon) {
+            return Err(format!(
+                "read denied outside the session's allowed roots (sandbox {:?}): {path}",
+                policy.sandbox
+            ));
+        }
+    }
+    Ok(canon)
 }
 
 /// write 专用：拒绝绝对路径，`..` 逃逸经父目录 canonicalize 后前缀校验拦截
-///（父目录允许自动创建）。返回值保证在 `cwd` 子树内。
-async fn confined_write_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
+///（父目录允许自动创建）。P1.3a：限定根从「仅 cwd」扩为 policy.write_roots
+/// 任一命中（FullAccess 时 write_roots=[cwd]，与今天一致）。
+async fn confined_write_path(
+    cwd: &str,
+    path: &str,
+    policy: &crate::wire::ToolPolicy,
+) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     if raw.is_absolute() {
         return Err(format!(
@@ -528,9 +964,15 @@ async fn confined_write_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("write: invalid path: {path}"))?;
     let target = parent.join(file_name);
-    if !target.starts_with(&base) {
+    let roots = if policy.write_roots.is_empty() {
+        vec![base.clone()]
+    } else {
+        policy.write_roots.clone()
+    };
+    if !crate::wire::ToolPolicy::within(&roots, &target) {
         return Err(format!(
-            "write: path escapes the workspace (.. traversal rejected): {path}"
+            "write: path outside the session's writable roots (sandbox {:?}): {path}",
+            policy.sandbox
         ));
     }
     Ok(target)
@@ -541,6 +983,7 @@ async fn confined_write_path(cwd: &str, path: &str) -> Result<PathBuf, String> {
 async fn run_read(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
 ) -> Result<ToolResult, AgentError> {
     let path = match arg_str(arguments, "path") {
@@ -551,7 +994,7 @@ async fn run_read(
     let limit = arg_u64(arguments, "limit")
         .unwrap_or(2000)
         .clamp(1, READ_MAX_LINES as u64) as usize;
-    let resolved = match resolve_read_path(cwd, path).await {
+    let resolved = match resolve_read_path(cwd, path, policy).await {
         Ok(p) => p,
         Err(e) => return error_result(provider_id, format!("read: {e}")),
     };
@@ -633,6 +1076,7 @@ async fn read_at_most(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 async fn run_write(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
 ) -> Result<ToolResult, AgentError> {
     let path = match arg_str(arguments, "path") {
@@ -652,7 +1096,7 @@ async fn run_write(
             ),
         );
     }
-    let target = match confined_write_path(cwd, path).await {
+    let target = match confined_write_path(cwd, path, policy).await {
         Ok(t) => t,
         Err(e) => return error_result(provider_id, e),
     };
@@ -678,9 +1122,14 @@ async fn run_write(
 
 // ── ls ──────────────────────────────────────────────────────────────────────
 
-async fn run_ls(arguments: &Value, cwd: &str, provider_id: &str) -> Result<ToolResult, AgentError> {
+async fn run_ls(
+    arguments: &Value,
+    cwd: &str,
+    policy: &crate::wire::ToolPolicy,
+    provider_id: &str,
+) -> Result<ToolResult, AgentError> {
     let path = arg_str(arguments, "path").unwrap_or(cwd);
-    let resolved = match resolve_read_path(cwd, path).await {
+    let resolved = match resolve_read_path(cwd, path, policy).await {
         Ok(p) => p,
         Err(e) => return error_result(provider_id, format!("ls: {e}")),
     };
@@ -771,6 +1220,7 @@ fn match_segments(pat: &[&str], name: &[&str]) -> bool {
 async fn run_glob(
     arguments: &Value,
     cwd: &str,
+    policy: &crate::wire::ToolPolicy,
     provider_id: &str,
 ) -> Result<ToolResult, AgentError> {
     let pattern = match arg_str(arguments, "pattern") {
@@ -778,7 +1228,7 @@ async fn run_glob(
         _ => return error_result(provider_id, "glob: missing required argument \"pattern\""),
     };
     let base_str = arg_str(arguments, "path").unwrap_or(cwd);
-    let base = match resolve_read_path(cwd, base_str).await {
+    let base = match resolve_read_path(cwd, base_str, policy).await {
         Ok(p) => p,
         Err(e) => return error_result(provider_id, format!("glob: {e}")),
     };
@@ -912,6 +1362,498 @@ mod tests {
 
     /// 独立临时目录（tempfile 已在本 crate dev-dependencies：自动唯一命名，
     /// Drop 时自动清理——断言 panic 也不会在 /tmp 留下 abb-devtools-* 残留）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_policy_denies_reads_outside_roots() {
+        // P1.3a：workspace_write/read_only 档读域必须挡在 roots 外——granted 经
+        // dev__read 读 ~/.ssh、config.json（明文 key）的洞就此封死。
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let policy = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::WorkspaceWrite,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let mut rx = watch::channel(false).1;
+        let r = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "/etc/hosts" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "{:?}", r.text());
+        assert!(r.text().contains("allowed roots"), "{}", r.text());
+        // FullAccess 档保持今天：绝对路径可读（回归锁）
+        let full = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let ok = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "/etc/hosts" }),
+            cwd,
+            &full,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_escape_still_denied_after_canonicalize() {
+        // canonicalize 之后才比对 → 工作区内软链指向域外文件同样拒绝（读侧）
+        let dir = test_dir();
+        std::fs::write(dir.path().join("secret.txt"), "top").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), dir.path().join("link.txt"))
+            .unwrap();
+        let sub = dir.path().join("ws");
+        std::fs::create_dir_all(&sub).unwrap();
+        let subp = sub.to_str().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), sub.join("link.txt")).unwrap();
+        let policy = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::ReadOnly,
+            subp,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let mut rx = watch::channel(false).1;
+        let r = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "link.txt" }),
+            subp,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "symlink 指向域外必须拒绝: {}", r.text());
+        // 正向对照：ReadOnly 档读 root 内普通文件必须成功——否则上面那条"拒绝"
+        // 只是"什么都拒"，测不出越域判断本身。
+        std::fs::write(sub.join("plain.txt"), "inside").unwrap();
+        let inside = run_with_policy(
+            Tool::Read,
+            &json!({ "path": "plain.txt" }),
+            subp,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!inside.is_error, "root 内文件被误拒: {}", inside.text());
+    }
+
+    #[tokio::test]
+    async fn restricted_shell_whitelist_allows_and_denies() {
+        // P1.3b：Restricted 模式——白名单内放行、外拒绝（is_error 回流可自纠）
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let policy = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::WorkspaceWrite,
+            cwd,
+            None,
+            crate::wire::ShellMode::Restricted,
+            Some("/usr/bin/agent-bridge".into()),
+        );
+        // sender 必须存活：drop 即广播「取消」，shell 回合会 Cancelled
+        let (_tx, mut rx) = watch::channel(false);
+        let ok = run_with_policy(
+            Tool::Shell,
+            &json!({ "command": "echo whitelist-ok" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error, "{}", ok.text());
+        assert!(ok.text().contains("whitelist-ok"), "{}", ok.text());
+        let denied = run_with_policy(
+            Tool::Shell,
+            &json!({ "command": "rm -rf /tmp/x" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(denied.is_error, "rm 必须拒绝: {}", denied.text());
+        assert!(denied.text().contains("受限白名单"), "{}", denied.text());
+        // Full 模式回归锁：任意命令照跑（今天行为）
+        let full = crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let free = run_with_policy(
+            Tool::Shell,
+            &json!({ "command": "echo free-ok" }),
+            cwd,
+            &full,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!free.is_error);
+    }
+
+    // ── delegate（P1.5） ────────────────────────────────────────────────────
+
+    /// 造一个可执行的假 CLI 脚本（unix shebang）。返回路径供 run_delegate_with_bin 直调。
+    #[cfg(unix)]
+    fn fake_cli(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn delegate_def_visible_truth_table() {
+        use crate::wire::{Sandbox, ShellMode};
+        // 仅「shell 未摘 且 非 granted(Restricted) 且 有可用 CLI」放行
+        assert!(delegate_def_visible(
+            Sandbox::FullAccess,
+            ShellMode::Full,
+            true
+        ));
+        assert!(delegate_def_visible(
+            Sandbox::WorkspaceWrite,
+            ShellMode::Full,
+            true
+        ));
+        // granted(Restricted) 永不放行（无论档位/CLI 可用性）
+        assert!(!delegate_def_visible(
+            Sandbox::WorkspaceWrite,
+            ShellMode::Restricted,
+            true
+        ));
+        assert!(!delegate_def_visible(
+            Sandbox::FullAccess,
+            ShellMode::Restricted,
+            true
+        ));
+        // read-only 无 shell 永不放行
+        assert!(!delegate_def_visible(
+            Sandbox::ReadOnly,
+            ShellMode::Full,
+            true
+        ));
+        // CLI 不可用 → 不注入（其余条件再满足也没用）
+        assert!(!delegate_def_visible(
+            Sandbox::FullAccess,
+            ShellMode::Full,
+            false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_delegate_cli_override_semantics() {
+        let dir = test_dir();
+        let exe = fake_cli(dir.path(), "claude", "#!/bin/sh\nexit 0\n");
+        // Some(可执行) → 用之
+        assert_eq!(
+            resolve_delegate_cli(DelegateBackend::Claude, Some(exe.as_os_str())),
+            Some(exe.clone())
+        );
+        // Some(不存在) → None 且绝不回落 PATH（本机真装了 claude 也判禁用）
+        assert_eq!(
+            resolve_delegate_cli(
+                DelegateBackend::Claude,
+                Some(std::ffi::OsStr::new("/nonexistent-claude"))
+            ),
+            None
+        );
+        // None → PATH 探测（结果随机器，但必须与 find_in_path 一致）
+        assert_eq!(
+            resolve_delegate_cli(DelegateBackend::Claude, None),
+            find_in_path("claude")
+        );
+    }
+
+    #[test]
+    fn backends_desc_from_renders_availability() {
+        assert_eq!(
+            backends_desc_from(&[]),
+            "none (neither claude nor codex found in PATH)"
+        );
+        assert_eq!(backends_desc_from(&[DelegateBackend::Claude]), "claude");
+        assert_eq!(
+            backends_desc_from(&[DelegateBackend::Claude, DelegateBackend::Codex]),
+            "claude, codex"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_denied_in_read_only_and_restricted_modes() {
+        // 执行闸（跨平台，闸在 spawn 前、不碰 CLI）：read-only 与 granted(Restricted)
+        // 永不放行——这正是「defs 不可见」之外的第二道保险。
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let mut rx = watch::channel(false).1;
+        for policy in [
+            crate::wire::ToolPolicy::build(
+                crate::wire::Sandbox::ReadOnly,
+                cwd,
+                None,
+                crate::wire::ShellMode::Full,
+                None,
+            ),
+            crate::wire::ToolPolicy::build(
+                crate::wire::Sandbox::WorkspaceWrite,
+                cwd,
+                None,
+                crate::wire::ShellMode::Restricted,
+                Some("/usr/bin/agent-bridge".into()),
+            ),
+        ] {
+            let r = run_with_policy(
+                Tool::Delegate,
+                &json!({ "backend": "claude", "task": "x" }),
+                cwd,
+                &policy,
+                "p",
+                &mut rx,
+            )
+            .await
+            .unwrap();
+            assert!(r.is_error, "{:?}", r.text());
+            assert!(
+                r.text()
+                    .contains("not available in this session's sandbox mode"),
+                "{}",
+                r.text()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_unknown_backend_and_missing_task() {
+        // 参数校验（闸后、CLI 解析前）：backend 词表外、task 缺失都以 is_error 自纠。
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let policy = test_policy(cwd);
+        // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
+        let (_tx, mut rx) = watch::channel(false);
+        let bad = run_with_policy(
+            Tool::Delegate,
+            &json!({ "backend": "gpt", "task": "x" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            bad.is_error && bad.text().contains("claude\" or \"codex"),
+            "{}",
+            bad.text()
+        );
+        let no_task = run_with_policy(
+            Tool::Delegate,
+            &json!({ "backend": "claude" }),
+            cwd,
+            &policy,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            no_task.is_error && no_task.text().contains("\"task\""),
+            "{}",
+            no_task.text()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_runs_fake_cli_and_passes_backend_env() {
+        // 假 claude 回显 $CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC：直接锁死
+        // 「后端专属 env 必须在 apply_passthrough_env（env_clear）之后 set」的
+        // 顺序——设在之前会被清掉，这里就会读到空。显式二进制直调 run_delegate_with_bin
+        // （不改进程 env，LESSON set_var-UB）；该 env 设在子进程上，安全。
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let bin = fake_cli(
+            dir.path(),
+            "claude",
+            "#!/bin/sh\nprintf 'traffic=%s\\n' \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\"\necho delegate-done\n",
+        );
+        // sender 必须存活：drop 即广播「取消」，select 取消臂会立即 Cancelled
+        let (_tx, mut rx) = watch::channel(false);
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Claude,
+            "do a thing",
+            Duration::from_secs(30),
+            cwd,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!r.is_error, "{}", r.text());
+        assert!(r.text().contains("delegate-done"), "{}", r.text());
+        assert!(
+            r.text().contains("traffic=1"),
+            "env 被 env_clear 误清: {}",
+            r.text()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_runs_fake_codex() {
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let bin = fake_cli(dir.path(), "codex", "#!/bin/sh\necho codex-done\n");
+        let (_tx, mut rx) = watch::channel(false);
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Codex,
+            "do a thing",
+            Duration::from_secs(30),
+            cwd,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(!r.is_error, "{}", r.text());
+        assert!(r.text().contains("codex-done"), "{}", r.text());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_locks_exact_argv_for_both_backends() {
+        // 锁死精确 argv flag——防未来被静默降级/删除（--dangerously-skip-permissions /
+        // --sandbox workspace-write 是安全相关 flag；`--` 分隔符防单词 task 被绑到
+        // codex 子命令、防 `-` 开头 task 被当选项）。显式二进制直调，不改进程 env。
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let echo = "#!/bin/sh\necho \"$@\"\n";
+        let cb = fake_cli(dir.path(), "claude", echo);
+        let xb = fake_cli(dir.path(), "codex", echo);
+        let (_tx, mut rx) = watch::channel(false);
+        let c = run_delegate_with_bin(
+            &cb,
+            DelegateBackend::Claude,
+            "lock-argv",
+            Duration::from_secs(30),
+            cwd,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            c.text()
+                .contains("-p --output-format text --dangerously-skip-permissions -- lock-argv"),
+            "claude argv: {}",
+            c.text()
+        );
+        let x = run_delegate_with_bin(
+            &xb,
+            DelegateBackend::Codex,
+            "lock-argv",
+            Duration::from_secs(30),
+            cwd,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            x.text()
+                .contains("exec --skip-git-repo-check --sandbox workspace-write -C"),
+            "codex argv: {}",
+            x.text()
+        );
+        assert!(
+            x.text().contains("-- lock-argv"),
+            "codex 缺 `--` 分隔: {}",
+            x.text()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_marks_nonzero_exit_as_error() {
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let bin = fake_cli(dir.path(), "claude", "#!/bin/sh\necho boom\nexit 3\n");
+        let (_tx, mut rx) = watch::channel(false);
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Claude,
+            "x",
+            Duration::from_secs(30),
+            cwd,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "非零退出必须 is_error: {}", r.text());
+        assert!(r.text().contains("exit: 3"), "{}", r.text());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_times_out_and_kills_tree() {
+        let dir = test_dir();
+        let cwd = dir.path().to_str().unwrap();
+        let bin = fake_cli(dir.path(), "claude", "#!/bin/sh\nsleep 30\n");
+        let (_tx, mut rx) = watch::channel(false);
+        let r = run_delegate_with_bin(
+            &bin,
+            DelegateBackend::Claude,
+            "x",
+            Duration::from_secs(1),
+            cwd,
+            "p",
+            &mut rx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error, "{}", r.text());
+        assert!(r.text().contains("timed out"), "{}", r.text());
+    }
+
+    /// FullAccess 测试策略（与今天字节级一致：读不限、写限 cwd）。
+    fn test_policy(cwd: &str) -> crate::wire::ToolPolicy {
+        crate::wire::ToolPolicy::build(
+            crate::wire::Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        )
+    }
+
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
@@ -945,13 +1887,20 @@ mod tests {
         let tmp = test_dir();
         let cwd = tmp.path().to_str().unwrap();
         // 绝对路径拒绝
-        let err = confined_write_path(cwd, "/etc/passwd").await.unwrap_err();
+        let err = confined_write_path(cwd, "/etc/passwd", &test_policy(cwd))
+            .await
+            .unwrap_err();
         assert!(err.contains("absolute path"), "{err}");
         // `..` 逃逸拒绝
-        let err = confined_write_path(cwd, "../escape.txt").await.unwrap_err();
-        assert!(err.contains("escapes"), "{err}");
+        let err = confined_write_path(cwd, "../escape.txt", &test_policy(cwd))
+            .await
+            .unwrap_err();
+        // P1.3a 措辞：逃逸被「roots 前缀校验」拦截（同一语义换文案）
+        assert!(err.contains("writable roots"), "{err}");
         // 正常相对路径落在工作区内（tmp 先 canonicalize：macOS /var → /private/var）
-        let ok = confined_write_path(cwd, "sub/dir/a.txt").await.unwrap();
+        let ok = confined_write_path(cwd, "sub/dir/a.txt", &test_policy(cwd))
+            .await
+            .unwrap();
         let canon_tmp = tokio::fs::canonicalize(tmp.path()).await.unwrap();
         assert!(ok.starts_with(&canon_tmp), "{ok:?} not under {canon_tmp:?}");
     }

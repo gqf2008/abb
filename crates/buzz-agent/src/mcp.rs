@@ -214,6 +214,8 @@ pub struct McpRegistry {
     servers: Vec<Arc<Server>>,
     /// 会话工作区（session/new 的 cwd）——内置工具的运行/限定目录。
     cwd: String,
+    /// 会话工具策略（P1.2 档位 + P1.3a 读/写域根）。
+    policy: crate::wire::ToolPolicy,
     max_attempts: u32,
     backoff_base: Duration,
     backoff_max: Duration,
@@ -227,6 +229,7 @@ impl McpRegistry {
         cfg: &Config,
         servers: &[McpServerStdio],
         cwd: &str,
+        policy: crate::wire::ToolPolicy,
     ) -> Result<Self, AgentError> {
         if servers.len() > MAX_MCP_SERVERS {
             return Err(AgentError::Mcp(format!(
@@ -239,6 +242,7 @@ impl McpRegistry {
             defs: Vec::new(),
             servers: Vec::new(),
             cwd: cwd.to_owned(),
+            policy,
             max_attempts: cfg.mcp_max_restart_attempts.max(1),
             backoff_base: Duration::from_millis(cfg.mcp_restart_base_ms.max(1)),
             backoff_max: Duration::from_millis(cfg.mcp_restart_max_ms.max(1)),
@@ -325,6 +329,27 @@ impl McpRegistry {
         // 此前合法的 124..=128 工具配置整个会话起不来，两者都不可接受。
         if cfg.dev_tools {
             for (tool, def) in crate::devtools::defs() {
+                // P1.2 档位过滤：read-only 下 write/shell 对模型直接不可见
+                // （最强的杠杆是「看不见」而不是「拒绝」）。
+                if (!reg.policy.sandbox.allow_write()
+                    && matches!(tool, crate::devtools::Tool::Write))
+                    || (!reg.policy.sandbox.allow_shell()
+                        && matches!(tool, crate::devtools::Tool::Shell))
+                {
+                    continue;
+                }
+                // P1.5：delegate 仅「shell 未摘（非 read-only）且非 granted(Restricted)
+                // 且本机有 claude/codex」时注入——判定收口在 devtools::delegate_def_visible
+                // （与执行闸、wiring 测试共用同一纯函数）。CLI 不可用是「不注入」不是报错。
+                if matches!(tool, crate::devtools::Tool::Delegate)
+                    && !crate::devtools::delegate_def_visible(
+                        reg.policy.sandbox,
+                        reg.policy.shell,
+                        crate::devtools::delegate_available(),
+                    )
+                {
+                    continue;
+                }
                 if reg.defs.len() >= MAX_TOOLS_PER_SESSION {
                     tracing::warn!(
                         "dev tools: tool budget ({MAX_TOOLS_PER_SESSION}) exhausted after {} MCP tools; \
@@ -347,6 +372,11 @@ impl McpRegistry {
             }
         }
         Ok(reg)
+    }
+
+    /// 会话工具策略（load_skill 等进程内路径的域校验用）。
+    pub fn policy(&self) -> &crate::wire::ToolPolicy {
+        &self.policy
     }
 
     pub fn server_of(&self, qname: &str) -> Option<&str> {
@@ -595,8 +625,30 @@ impl McpRegistry {
         // MCP 工具同款预算裁边（budget.text/budget.total），保证配置的
         // per-result 文本上限对两类工具一致生效。
         if let Entry::Builtin { tool } = entry {
-            let mut result =
-                crate::devtools::run(*tool, arguments, &self.cwd, provider_id, cancel).await?;
+            // 双保险执行闸：档位禁的工具即使名字可达（模型幻觉/旧缓存）也拒绝。
+            let denied = (!self.policy.sandbox.allow_write()
+                && matches!(*tool, crate::devtools::Tool::Write))
+                || (!self.policy.sandbox.allow_shell()
+                    && matches!(*tool, crate::devtools::Tool::Shell))
+                // P1.5：delegate 在 read-only（无 shell）/ granted(Restricted) 永不放行。
+                || (matches!(*tool, crate::devtools::Tool::Delegate)
+                    && (!self.policy.sandbox.allow_shell()
+                        || self.policy.shell == crate::wire::ShellMode::Restricted));
+            if denied {
+                return Err(AgentError::Mcp(format!(
+                    "tool '{qname}' is disabled in this session's sandbox mode ({:?})",
+                    self.policy.sandbox
+                )));
+            }
+            let mut result = crate::devtools::run_with_policy(
+                *tool,
+                arguments,
+                &self.cwd,
+                &self.policy,
+                provider_id,
+                cancel,
+            )
+            .await?;
             clamp_tool_result_text(&mut result, budget);
             return Ok(result);
         }
@@ -1122,7 +1174,11 @@ fn clamp_tool_result_text(result: &mut ToolResult, budget: ResultBudget) {
 /// Suppress the console window that Windows otherwise allocates for every
 /// console-subsystem child process spawned from a GUI (non-console) parent.
 /// No-op on non-Windows platforms.
-fn configure_no_window(cmd: &mut Command) {
+///
+/// pub(crate)：devtools.rs 的 dev__shell / dev__delegate spawn 同用——#153 机理
+/// 对孙进程同样成立（buzz-agent 自身经 CREATE_NO_WINDOW 启动无控制台，其子进程
+/// 不设此旗标会在 Windows 新建可见控制台窗，闪框）。
+pub(crate) fn configure_no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1130,6 +1186,137 @@ fn configure_no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use crate::config::Provider;
+    use crate::wire::Sandbox;
+
+    fn cfg_with_dev_tools() -> Config {
+        let mut cfg = Config::for_discovery(
+            Provider::OpenAi,
+            "k".into(),
+            "http://127.0.0.1:1".into(),
+            None,
+        );
+        cfg.dev_tools = true;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn read_only_hides_write_and_shell_from_tool_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cfg = cfg_with_dev_tools();
+        for (sb, shell, write) in [
+            (Sandbox::ReadOnly, false, false),
+            (Sandbox::WorkspaceWrite, true, true),
+            (Sandbox::FullAccess, true, true),
+        ] {
+            let reg = McpRegistry::spawn_all(
+                &cfg,
+                &[],
+                cwd,
+                crate::wire::ToolPolicy::build(sb, cwd, None, crate::wire::ShellMode::Full, None),
+            )
+            .await
+            .unwrap();
+            let names: Vec<String> = reg.tools().iter().map(|d| d.name.clone()).collect();
+            assert_eq!(
+                names.contains(&"dev__shell".to_string()),
+                shell,
+                "{sb:?}: {names:?}"
+            );
+            assert_eq!(
+                names.contains(&"dev__write".to_string()),
+                write,
+                "{sb:?}: {names:?}"
+            );
+            // 只读档里读类工具仍在（read/ls/glob/load_skill 不受档位影响）
+            assert!(names.contains(&"dev__read".to_string()), "{sb:?}");
+            // 未注册 = 名字不可达（defs 过滤同时摘 by_qname，执行闸是双保险）
+            assert_eq!(reg.has("dev__shell"), shell, "{sb:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_access_surface_identical_to_no_meta_default() {
+        // 回归锁：无 _meta（ABB 侧回落 FullAccess）与显式 full-access 的工具面一致。
+        // delegate（P1.5）是否注入取决于本机 PATH——不断言死数，改断言「与
+        // delegate_available() 一致」，与机器无关且不改进程 env（LESSON set_var-UB）。
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cfg = cfg_with_dev_tools();
+        let pa = crate::wire::ToolPolicy::build(
+            Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let pb = crate::wire::ToolPolicy::build(
+            Sandbox::FullAccess,
+            cwd,
+            None,
+            crate::wire::ShellMode::Full,
+            None,
+        );
+        let a = McpRegistry::spawn_all(&cfg, &[], cwd, pa).await.unwrap();
+        let b = McpRegistry::spawn_all(&cfg, &[], cwd, pb).await.unwrap();
+        let mut n1: Vec<_> = a.tools().iter().map(|d| d.name.clone()).collect();
+        let mut n2: Vec<_> = b.tools().iter().map(|d| d.name.clone()).collect();
+        n1.sort();
+        n2.sort();
+        assert_eq!(n1, n2);
+        // 基础五工具 +（有可用 CLI 时）delegate
+        let expect_len = 5 + usize::from(crate::devtools::delegate_available());
+        assert_eq!(n1.len(), expect_len, "工具面 {n1:?}");
+        assert_eq!(
+            n1.contains(&"dev__delegate".to_string()),
+            crate::devtools::delegate_available()
+        );
+    }
+
+    /// P1.5 攻击矩阵扩行：delegate 的可见性 = f(档位, shell 模式, CLI 可用性)。
+    /// read-only（无 shell）与 granted(Restricted) 永不可见；CLI 不可用则不注入。
+    /// 期望值直接由生产判定函数 delegate_def_visible（与本机实际 delegate_available()）
+    /// 算出——既测 spawn_all 的接线，又与机器无关、不改进程 env（LESSON set_var-UB）。
+    /// 纯真值表由 devtools::delegate_def_visible_truth_table 覆盖。
+    #[tokio::test]
+    async fn delegate_visibility_matches_decision_fn_across_sandbox_matrix() {
+        use crate::wire::ShellMode;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let cfg = cfg_with_dev_tools();
+        let avail = crate::devtools::delegate_available(); // 本机实际可用性（真/假均可）
+        for (sb, shell) in [
+            (Sandbox::FullAccess, ShellMode::Full),     // 正常 owner 会话
+            (Sandbox::WorkspaceWrite, ShellMode::Full), // 三档受限但 shell 本就 Full
+            (Sandbox::WorkspaceWrite, ShellMode::Restricted), // granted
+            (Sandbox::FullAccess, ShellMode::Restricted), // granted 与 full-access 漂移配对
+            (Sandbox::ReadOnly, ShellMode::Full),       // read-only：无 shell
+        ] {
+            let reg = McpRegistry::spawn_all(
+                &cfg,
+                &[],
+                cwd,
+                crate::wire::ToolPolicy::build(sb, cwd, None, shell, None),
+            )
+            .await
+            .unwrap();
+            let expect = crate::devtools::delegate_def_visible(sb, shell, avail);
+            let names: Vec<String> = reg.tools().iter().map(|d| d.name.clone()).collect();
+            assert_eq!(
+                names.contains(&"dev__delegate".to_string()),
+                expect,
+                "{sb:?}/{shell:?} avail={avail}: {names:?}"
+            );
+            // 未注册 = 名字不可达（defs 过滤同时摘 by_qname）
+            assert_eq!(reg.has("dev__delegate"), expect, "{sb:?}/{shell:?}");
+        }
+    }
 }
 
 #[cfg(test)]

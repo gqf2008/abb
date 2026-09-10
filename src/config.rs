@@ -834,18 +834,16 @@ pub const RESTRICT_PREAMBLE: &str = "\
 /// 受限模式判定（agent::run 的 spawn 分支 / bridge prompt 注入 / run_job 定时任务
 /// 三处共用，防语义漂移）：role==Granted 且该 bot 的「授权者 agent 隔离」开关未放宽；
 /// 配置读不到按安全默认 true。每次热读（授权/关开关即时生效）。
+///
+/// 单后端化 P2.2 起，granted 会话不再被拒答——路由到独立 granted ACP 实例
+///（强制 workspace-write 域闸 + argv 白名单 shell + `$ABB_BIN`，进程级
+/// NO_HINTS）。「受限兑现」从「拒答」变成「受限实例执行」，本判定仍是选择该实例
+/// 的唯一角色闸门（与 prompt 受限说明/agent 受限判定同源）。
 pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
     role == SenderRole::Granted
         && Config::bot_for_bot_key(bot_key)
             .map(|b| b.restrict_granted_agent)
             .unwrap_or(true)
-}
-
-/// #118：granted 会话 + pi 后端 + 隔离开 → 接入层静默拦截（pi 无权限/沙箱系统，
-/// 受限会话无法降级）。聊天路径由接入层（on_payload / on_dingtalk）拦截：落历史、
-/// 不回复、不暴露配置；job 路径保留 agent::run 的失败提示为防御兜底。
-pub fn granted_pi_unusable(role: SenderRole, bot_key: &str, backend: &str) -> bool {
-    restrict_granted(role, bot_key) && backend.eq_ignore_ascii_case("pi")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1584,6 +1582,9 @@ impl Config {
         cfg.resolve_provider(bot).cloned()
     }
 
+    // P4.1：唯一生产调用点（旧 agent::run 的受限判定）已删；buzz 路径经
+    // `provider_for_bot_key_of`（快照版）解析。保留为热读工具方法（与 bot_for_bot_key 同族）。
+    #[allow(dead_code)]
     pub fn provider_for_bot_key(bot_key: &str) -> Option<ProviderConfig> {
         Config::load().ok().and_then(|c| {
             c.bots
@@ -2022,26 +2023,6 @@ mod tests {
         assert!(s2.contains("\"restrict_granted_agent\":false"));
         let back2: BotConfig = serde_json::from_str(&s2).unwrap();
         assert!(!back2.restrict_granted_agent);
-    }
-
-    #[test]
-    fn granted_pi_unusable_only_for_granted_pi() {
-        // #118：granted + pi + 隔离开 → 拦截；owner / claude / 放宽开关 → 不拦截
-        let bot_key = "granted_pi_test_bot";
-        let owner = SenderRole::Owner;
-        let granted = SenderRole::Granted;
-        assert!(crate::config::granted_pi_unusable(granted, bot_key, "pi"));
-        assert!(!crate::config::granted_pi_unusable(owner, bot_key, "pi"));
-        assert!(!crate::config::granted_pi_unusable(
-            granted, bot_key, "claude"
-        ));
-        assert!(!crate::config::granted_pi_unusable(
-            granted, bot_key, "codex"
-        ));
-        assert!(
-            crate::config::granted_pi_unusable(granted, bot_key, "PI"),
-            "大小写不敏感"
-        );
     }
 
     #[test]

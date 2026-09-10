@@ -114,15 +114,25 @@ impl Bridge {
             .lock()
             .unwrap()
             .insert(key.to_string(), cancel_flag.clone());
-        let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
         // 调整（改：xxx）时把原目标 + 调整要求合并给 LLM（保留上下文）
         let prompt_goal = match revision {
             Some(rev) => format!("{goal}\n调整要求：{rev}"),
             None => goal.to_string(),
         };
+        // 单后端化 P3.4：生成走 oneshot 同步回合，需 bot+cfg 装配（与 session_gc
+        // 同款热读；读不到给可操作错误，不落 WaitingConfirm——用户可重发意图重试）。
+        let cfg = match crate::config::Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                self.cancel_flags.lock().unwrap().remove(key);
+                return Some(format!(
+                    "⚠️ 团队方案生成失败：配置读取失败（{e}）。请检查 config.json 后重发创建意图重试。"
+                ));
+            }
+        };
         let plan = self
             .team_gen
-            .generate(backend, &prompt_goal, &[], None)
+            .generate(&self.bot, &cfg, &prompt_goal, &[], None)
             .await;
         self.cancel_flags.lock().unwrap().remove(key);
         if cancel_flag.load(Ordering::Relaxed) {

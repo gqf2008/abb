@@ -164,7 +164,11 @@ async fn mcp_init_timeout_kills_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_metadata_caps_enforced() {
     let llm = spawn_capturing_llm(vec![openai_text("done")]).await;
-    let mut h = Harness::spawn(&llm.url).await;
+    // 本用例的 fake-mcp 吐 200 工具 × 100KB 描述（≈20MB 清单）：共享默认 init
+    // 超时 2s 下先 timeout，128 上限路径根本走不到（满载时确定性红）。给足
+    // 30s（生产默认同值）让 list_tools 真跑完再断言上限行为。
+    let mut h =
+        Harness::spawn_with_env(&llm.url, &[("BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS", "30")]).await;
 
     let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
     h.send(

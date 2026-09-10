@@ -4,12 +4,31 @@
 use super::*;
 use uuid::Uuid;
 
-/// #206：buzz 通道资格预检的三种失败（dispatch 与 /cancel 共用判据、各自表述
-/// 文案——判据只有一处，杜绝两处预检漂移）。dispatch 的第四条「非受限会话」是
-/// dispatch 独有（/cancel 与 CLI 一致无角色门槛），由调用方各自叠加。
+impl Bridge {
+    /// 按消息/事件角色选 ACP 实例（单后端化 P2.2）：granted 受限会话路由 granted
+    /// 实例（强制受限剖面 + 进程级 NO_HINTS）；其余走 normal 实例（bot 配置档）。
+    /// 判据 `restrict_granted`（role==Granted && 开关热读）与 prompt 受限说明/agent
+    /// 受限判定同源，防语义漂移。None = 句柄对未装配（测试挡板/job 内部路径）。
+    fn acp_handle_for_role(
+        &self,
+        role: crate::config::SenderRole,
+    ) -> Option<std::sync::Arc<crate::buzz::harness::BuzzHandle>> {
+        self.acp_handles.as_ref().map(|hs| {
+            if crate::config::restrict_granted(role, &self.bot.key()) {
+                hs.granted.clone()
+            } else {
+                hs.normal.clone()
+            }
+        })
+    }
+}
+
+/// #206：buzz 通道资格预检的失败面（dispatch 与 /cancel 共用判据、各自表述
+/// 文案——判据只有一处，杜绝两处预检漂移）。P2.2 起角色不再是拒绝理由而是实例
+/// 选择器（granted → 受限实例）；/cancel 与 dispatch 均按角色选实例，判据一致。
 #[derive(Debug, PartialEq, Eq)]
 enum BuzzPrecheckFail {
-    /// buzz 后端未启用（config 默认后端/本 bot 非 buzz → service 未起 harness）
+    /// 句柄对未装配（生产常驻；None = 测试挡板/job 内部路径，生产不可达——防御）
     BuzzDisabled,
     /// agent 进程不可用（未拉起/崩溃退避中——新消息会被预检拒绝，避免「以为
     /// 已受理」的静默排队）
@@ -17,21 +36,23 @@ enum BuzzPrecheckFail {
     /// 未配置模型供应商（生效供应商解析为 None——buzz agent 进程共用一组凭证，
     /// 与 CLI 后端硬闸同源语义；区别仅在 buzz 闸在预检而非 build_injection）
     NoProvider,
-    /// 供应商类型与后端不匹配（如 claude 配 openai 型）——agent 进程起来也无
-    /// 凭据可用，静默吞消息；预检当场拒答引导。
-    KindMismatch,
+    /// granted 受限会话的执行能力已判为不支持（P2.3 硬闸）：随包 fork 已起且
+    /// initialize 未声明 `_meta.abbSandbox` ⇒ 提前拒答——绝不允许「发不出档位就
+    /// 默认 FullAccess」的静默降级（新 ABB + 旧随包 fork 是唯一 Critical 风险）。
+    /// 未启动（Unknown）不在此拒——真闸在 session 创建处（pool），此处只做
+    /// 「已知不行」的早拒，避免首条 granted 消息因懒启动被误拒。
+    SandboxUnsupported,
 }
 
 impl Bridge {
     /// #206 话题隔离：dispatch 预检（话题感知，**纯判据无副作用**——预检
-    /// 「不过 = 无副作用」invariant：被拒的 dispatch（含受限会话闸④）不得
-    /// 污染频道注册表，审查 #214 P2-1。话题频道登记（注册 + 锚点）由
+    /// 「不过 = 无副作用」invariant：被拒的 dispatch 不得污染频道注册表，
+    /// 审查 #214 P2-1。话题频道登记（注册 + 锚点）由
     /// [`Self::buzz_ensure_topic_channel`] 在全闸通过之后执行）。
-    /// 与 /cancel 的判据差异在话题臂：
-    /// - 群根消息：buzz 启用 → agent 可用 → 供应商闸。**无「已登记」门槛**——
-    ///   bot 能收到消息的群都该能回（提及/授权原则由平台与桥的 @ 门槛保证）；
-    ///   未登记的群由 [`Self::buzz_ensure_group_channel`] 闸后自动登记（adhoc，
-    ///   巡检豁免清理）。
+    /// 判据顺序：按角色选实例 → agent 可用 → 供应商闸 →（granted）能力协商闸。
+    /// - 群根消息：**无「已登记」门槛**——bot 能收到消息的群都该能回（提及/授权
+    ///   原则由平台与桥的 @ 门槛保证）；未登记的群由
+    ///   [`Self::buzz_ensure_group_channel`] 闸后自动登记（adhoc，巡检豁免清理）。
     /// - 话题消息（thread_id 非空）：话题从属于群——群根频道自动登记后话题
     ///   频道同样闸后登记；agent 可用性判据沿用（acp 就绪才有轮次可跑，与群根
     ///   一致——单 slot 无「话题订阅在途」中间态，话题消息与群根消息共享同一判据）。
@@ -40,11 +61,11 @@ impl Bridge {
     /// 「群聊·<chat_id 前缀>」——闸后登记话题频道时作话题频道名来源，不另查
     /// harness 频道表，防两份来源漂移。
     fn buzz_dispatch_precheck(&self, ev: &Ev) -> Result<String, BuzzPrecheckFail> {
-        let backend =
-            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let Some(handle) = self.acp_handles.get(backend.name()) else {
-            return Err(BuzzPrecheckFail::BuzzDisabled);
-        };
+        // P2.2：按角色选实例——granted 会话路由 granted 实例（受限剖面）。
+        let handle = self
+            .acp_handle_for_role(ev.role)
+            .ok_or(BuzzPrecheckFail::BuzzDisabled)?;
+        let granted = crate::config::restrict_granted(ev.role, &self.bot.key());
         // p2p（私聊）：免登记——频道由 dispatch 全闸通过后即时注册（upsert 幂等），
         // 频道名 = 对方展示名。私聊无「群登记」概念（用户私聊 bot 是合理路径）。
         if ev.chat_type == "p2p" || ev.chat_type == "dm" {
@@ -57,19 +78,14 @@ impl Bridge {
             ) {
                 return Err(BuzzPrecheckFail::NoProvider);
             }
-            // 供应商类型匹配闸：claude 只吃 anthropic、codex 只吃 openai 型。
-            // 不匹配 = agent 无凭据，当场拒答优于静默吞消息（实机复现）。
+            // P2.3 granted 能力硬闸（绝不静默降级 FullAccess）：仅在能力位已判为
+            // Unsupported（agent 已起、initialize 未声明）时提前拒答。Unknown
+            //（懒启动未起）放行——真闸在 session 创建处（pool，与本 agent 的
+            // initialize 结果同源，无竞态），否则首条 granted 消息必被误拒。
+            if granted
+                && handle.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
             {
-                let prov = crate::config::Config::provider_for_bot_key_of(
-                    &self.cfg_snapshot,
-                    &self.bot.key(),
-                );
-                if prov
-                    .as_ref()
-                    .is_some_and(|p| crate::agent::build_injection(backend, Some(p)).is_err())
-                {
-                    return Err(BuzzPrecheckFail::KindMismatch);
-                }
+                return Err(BuzzPrecheckFail::SandboxUnsupported);
             }
             let cfg = crate::config::Config::load().unwrap_or_default();
             let (peer, _) = crate::ui::resolve_display(&cfg, &self.bot.key(), &ev.sender_id);
@@ -85,7 +101,7 @@ impl Bridge {
         if !handle.is_agent_available() {
             return Err(BuzzPrecheckFail::AgentDown);
         }
-        // ④ 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
+        // 供应商硬闸（与 CLI 后端 build_injection None 臂同源）：生效供应商为
         // None 时 agent 无凭证可用，拒答并引导配置（每消息热读，与 agent.rs 同款成本）。
         if !crate::agent::provider_ready(
             crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key())
@@ -93,16 +109,10 @@ impl Bridge {
         ) {
             return Err(BuzzPrecheckFail::NoProvider);
         }
-        // 供应商类型匹配闸（同 p2p 分支）
+        // P2.3 granted 能力硬闸（同 p2p 分支：仅 Unsupported 提前拒答，Unknown 放行）
+        if granted && handle.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
         {
-            let prov =
-                crate::config::Config::provider_for_bot_key_of(&self.cfg_snapshot, &self.bot.key());
-            if prov
-                .as_ref()
-                .is_some_and(|p| crate::agent::build_injection(backend, Some(p)).is_err())
-            {
-                return Err(BuzzPrecheckFail::KindMismatch);
-            }
+            return Err(BuzzPrecheckFail::SandboxUnsupported);
         }
         // 群根频道名：优先虚拟 Bot 登记快照的角色名（mtime 懒刷新，与注入判定
         // 同源）；未登记的群回退「群聊·<chat_id 前缀>」（自动登记语义，不拒答）。
@@ -125,9 +135,7 @@ impl Bridge {
     /// 群不被覆盖——巡检登记的角色名优先）。adhoc 标记让巡检 diff 豁免清理
     ///（不在登记表是常态而非消失）。
     fn buzz_ensure_group_channel(&self, ev: &Ev, group_name: &str) {
-        let backend =
-            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let Some(handle) = self.acp_handles.get(backend.name()) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
@@ -145,6 +153,7 @@ impl Bridge {
                 chat_id: ev.chat_id.clone(),
                 chat_type: "group".to_string(),
                 thread_id: None,
+                workspace: Some(self.workspace_for(&ev.chat_id).display().to_string()),
                 name: group_name.to_string(),
                 anchor_mid: None,
                 adhoc: true,
@@ -156,9 +165,7 @@ impl Bridge {
     /// 消息注册，后续消息刷新 meta）。巡检对 adhoc 频道豁免清理，不会被登记表
     /// diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
     fn buzz_ensure_p2p_channel(&self, ev: &Ev, peer_name: &str) {
-        let backend =
-            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let Some(handle) = self.acp_handles.get(backend.name()) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return;
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
@@ -173,6 +180,7 @@ impl Bridge {
                 chat_id: ev.chat_id.clone(),
                 chat_type: "p2p".to_string(),
                 thread_id: None,
+                workspace: Some(self.workspace_for(&ev.chat_id).display().to_string()),
                 name: peer_name.to_string(),
                 anchor_mid: None,
                 adhoc: true,
@@ -180,14 +188,12 @@ impl Bridge {
         );
     }
 
-    /// #206 话题隔离：话题频道登记——dispatch 全闸（①②③ + 受限会话闸④）通过
-    /// 之后调用（审查 #214 P2-1：被拒 dispatch 不得登记频道）。幂等（upsert 覆盖
+    /// #206 话题隔离：话题频道登记——dispatch 全闸通过之后调用（审查 #214 P2-1：
+    /// 被拒 dispatch 不得登记频道）。幂等（upsert 覆盖
     /// 同频道）；每次 dispatch 都刷新锚点（= 本条用户消息 mid，话题回复
     /// send_thread_reply 的落点）。
     fn buzz_ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
-        let backend =
-            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let Some(handle) = self.acp_handles.get(backend.name()) else {
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::buzz::keys::topic_channel_uuid(
@@ -203,6 +209,7 @@ impl Bridge {
                 chat_id: ev.chat_id.clone(),
                 chat_type: "group".to_string(),
                 thread_id: Some(ev.thread_id.clone()),
+                workspace: Some(self.workspace_for(&ev.chat_id).display().to_string()),
                 name: group_name.to_string(),
                 anchor_mid: Some(ev.mid.clone()),
                 adhoc: false,
@@ -367,13 +374,11 @@ impl Bridge {
                 }
                 return;
             }
-            // 无在跑任务 → 命令化反馈，不喂给 agent。口径必须与 dispatch 一致
-            //（per-bot effective_backend，不是全局默认）——否则 default=claude +
-            // 本 bot=buzz 时仍答「没有正在运行的任务」（审查 #205r3）。
-            // #206：buzz 臂从「固定文案」升级为真实叫停——发布 owner 控制命令
-            // "!cancel" 走 harness.cancel（协议与语义见 buzz_cancel_reply）。
-            let msg = if Backend::parse(self.bot.effective_backend(&self.default_backend)).is_buzz()
-            {
+            // 无在跑任务 → 命令化反馈，不喂给 agent。口径与 dispatch 一致：harness
+            // 已装配（生产恒真）→ 真实叫停——发布 owner 控制命令 "!cancel" 走
+            // harness.cancel（协议与语义见 buzz_cancel_reply）；未装配（测试挡板）
+            // → 静态文案（测试不碰 harness）。
+            let msg = if self.acp_handles.is_some() {
                 self.buzz_cancel_reply(&ev).await
             } else {
                 "✅ 当前没有正在运行的任务。".to_string()
@@ -407,7 +412,6 @@ impl Bridge {
         // 覆盖不了 CLI 跨进程 reset，且存在 insert 晚于 reset 的 TOCTOU）。
         // #194：虚拟 Bot 群的会话存储与工作目录（vb/<uuid>/，含存量迁移）；非虚拟零变化。
         let sessions = self.sessions_for(&ev.chat_id);
-        let workspace = self.workspace_for(&ev.chat_id);
         if is_new_command(&text) {
             // #49：/new = 用户明确要求全新会话 → 连对话历史与迁移标记一起清
             // （切换注入的历史随之失效，不会泄进新会话）。代际自增使交错窗口内
@@ -416,28 +420,9 @@ impl Bridge {
             // 审查 I-2 读侧）；崩溃窗口从「新会话读到旧历史」变成「reset 未生效」
             //（用户可见的失败，无静默泄漏）。
             if self.history_reset(&key) {
-                // #56/#57：/new 后旧 sid 的 pi 会话文件永久失效（pi 按 sid 续聊，新 sid
-                // 不再触碰旧文件）——顺手清掉：.pi-sessions 是 #56 探针的唯一信号源，
-                // 残留文件只增不减会拖慢每轮探针扫描并堆积磁盘。CLI `session reset`
-                // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
-                let old_sid = sessions.ensure_with_started(&key).0;
+                // （P4.1 删除：/new 顺手清旧 sid 的 .pi-sessions 文件——pi 后端已退役，
+                // legacy 转录清理由 session_gc / tidy 的孤儿清理兜底。）
                 let new_sid = sessions.reset_session(&key);
-                let ws = workspace.clone();
-                if Backend::parse(self.bot.effective_backend(&self.default_backend)) == Backend::Pi
-                {
-                    // #56/#57：/new 后旧 sid 的 pi 会话文件永久失效（pi 按 sid 续聊，新 sid
-                    // 不再触碰旧文件）——顺手清掉：.pi-sessions 是 #56 探针的唯一信号源，
-                    // 残留文件只增不减会拖慢每轮探针扫描并堆积磁盘。CLI `session reset`
-                    // 同样只轮换 sid，但不走本分支（旧文件由探针按 mtime 忽略）。
-                    // 无 mtime 护栏（fresh_secs=None）：被轮换的旧 sid 不可能再被使用。
-                    let sids = std::collections::HashSet::from([old_sid.clone()]);
-                    crate::agent::remove_pi_transcripts(
-                        &ws,
-                        &sids,
-                        crate::agent::SidMatch::InSet,
-                        None,
-                    );
-                }
                 crate::log!(
                     "[bridge] /new 新建会话 bot={} key={} sid={}",
                     self.bot.key(),
@@ -558,69 +543,60 @@ impl Bridge {
             resume_attempts: 0, // #164 新消息首次入队从 0 计（异常退出恢复才递增）
         });
 
-        // 后端只认 per-bot 配置（app 里改），聊天里不再有 /codex /claude 切换——
-        // 斜杠前缀原样透传给 agent（claude/codex 有自己的 slash 命令，不该被桥拦截）。
-        let backend = Backend::parse(self.bot.effective_backend(&self.default_backend));
+        // 单后端化（P4.1）：执行层恒为 buzz harness——老配置 backend/default_backend
+        // 字段直接忽略（serde 天然容错），历史/marker 的 backend 字段恒记 "buzz"
+        //（出处标注，不参与任何闸判定）。
         // #200 Phase 2：buzz 路径资格预检——必须在 **prompt 组装与历史落盘之前**
         // （审查 #205r2）：预检不过 = 这一轮根本不会发生，既不该白烧迁移历史读/指令块
         // 拼接，更不该往 ABB 历史里写一条「有去无回」的用户轮（单边历史会在日后
-        // buzz→CLI 切换时被当上下文注入）。三条资格（①②③ 由 buzz_dispatch_precheck
-        // 承载，④ 是 dispatch 独有）：
-        // ① buzz 后端启用（service 只在该 bot 生效后端是 buzz 时注入 harness 句柄；
-        //    None = 非 buzz 后端，本分支不可达——防御）；
-        // ② 供应商硬闸 + 类型匹配闸（NoProvider/KindMismatch）——无「已登记」
-        //    门槛：bot 能收到消息的群都该能回，未登记群闸后自动登记
-        //    （buzz_ensure_group_channel，adhoc 标记巡检豁免；p2p 同语义即时注册）；
+        // buzz→CLI 切换时被当上下文注入）。资格（全部由 buzz_dispatch_precheck 承载）：
+        // ① harness 句柄已装配（P2.1 起句柄对按 bot 常驻构造；None = 测试挡板/
+        //    job 内部路径，本分支在生产不可达——防御）；
+        // ② 供应商硬闸（NoProvider）——无「已登记」门槛：bot 能收到消息的群都该能回，
+        //    未登记群闸后自动登记（buzz_ensure_group_channel，adhoc 标记巡检豁免；
+        //    p2p 同语义即时注册）；
         // ③ agent 进程可用（启动失败/崩溃退避中 = 不可用——此时 push 只是排队
-        //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）。
-        // ACP 单轨：该后端 harness 已装配（生产常驻）→ dispatch 异步回合；
+        //    进 dead queue，无 agent 可跑，用户侧是无限等待，#205r4 同型）；
+        // ④ granted 能力协商闸（SandboxUnsupported，P2.3）——受限会话必须走受限
+        //    实例，随包 fork 未声明 `_meta.abbSandbox` 一律拒答（绝不静默降级）。
+        // ACP 单轨：harness 句柄对已装配（生产常驻）→ 按角色选实例 dispatch 异步回合；
         // 未装配（测试挡板/job 内部路径）→ 回落 spawn 同步路径。
-        if self.acp_handles.contains_key(backend.name()) {
+        if self.acp_handles.is_some() {
             // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
-                Err(BuzzPrecheckFail::BuzzDisabled) => {
-                    Some("该后端未启用（服务未装配 agent，检查默认后端/重启）")
-                }
+                Err(BuzzPrecheckFail::BuzzDisabled) => Some("服务未装配 agent（重启服务）"),
                 // agent 不可用 = 启动失败/崩溃退避中：当场报错优于静默排队
                 //（失败批次会随重拉重试，死信积压见 harness queue 语义）。
                 Err(BuzzPrecheckFail::AgentDown) => {
                     Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
                 }
-                Err(BuzzPrecheckFail::NoProvider) => Some(
-                    "未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存",
-                ),
-                Err(BuzzPrecheckFail::KindMismatch) => Some(
-                    "供应商类型与当前后端不匹配（claude 需 anthropic 型、codex 需 OpenAI 兼容型）——请在「模型供应商」页为该 bot 选择匹配类型的供应商",
-                ),
-                Ok(_) if crate::config::restrict_granted(ev.role, &self.bot.key()) => {
-                    Some("授权者（受限）会话不可用该后端：guard 权限映射未接线")
+                Err(BuzzPrecheckFail::NoProvider) => {
+                    Some("未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存")
                 }
+                Err(BuzzPrecheckFail::SandboxUnsupported) => Some(
+                    "受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力——请升级 ABB 后重试",
+                ),
                 Ok(_) => None,
             };
             if let Some(why) = reason {
                 crate::log!(
-                    "[bridge] ⚠️ {} 路径预检未通过 chat={}: {why}",
-                    backend.name(),
+                    "[bridge] ⚠️ buzz 路径预检未通过 chat={}: {why}",
                     trunc(&ev.chat_id, 12)
                 );
                 self.pending.remove(&ev.mid);
                 if let Err(e) = self
-                    .send_reply(
-                        &ev,
-                        &format!("⚠️ {} 后端无法处理本条消息：{why}。", backend.name()),
-                    )
+                    .send_reply(&ev, &format!("⚠️ 无法处理本条消息：{why}。"))
                     .await
                 {
                     crate::log!(
-                        "[bridge] ⚠️ {} 预检失败提示发送失败 chat={}: {e:#}",
-                        backend.name(),
+                        "[bridge] ⚠️ buzz 预检失败提示发送失败 chat={}: {e:#}",
                         trunc(&ev.chat_id, 10)
                     );
                 }
                 return;
             }
-            // 全闸（①②③ + 受限会话闸④）通过后才登记频道（审查 #214 P2-1：
+            // 全闸（①②③④）通过后才登记频道（审查 #214 P2-1：
             // 被拒的 dispatch 不得污染频道注册表——预检「不过=无副作用」）。
             // 话题消息：登记话题频道（群根已登记）；p2p 私聊：即时注册群根频道
             //（免登记语义，频道名 = 对方名）。
@@ -761,8 +737,6 @@ impl Bridge {
         // /new 清盘互斥——新会话首轮不可能读到未清盘的旧历史（审查 I-2 读侧闭环）。
         // 锁持于块作用域内（std MutexGuard 非 Send 不能跨 await）：块结束即释放，
         // agent 运行期间不持锁（/new 不被运行中任务阻塞）。
-        // #130：记录本轮实际注入的历史块原文（重试替换用；空 = 未注入历史）。
-        let mut injected_block: Option<String> = None;
         let (hist_epoch_lock, hist_epoch, injected_rounds) = {
             let lock = self.history_lock(&key);
             let lock_ret = lock.clone(); // guard 借用 lock，返回值需独立 Arc
@@ -785,53 +759,29 @@ impl Bridge {
                 resume = res2;
             }
             // 注入闸（锁内读 marker/entries：与 /new 的 clear 互斥，杜绝读侧交错）：
-            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）。            //   pi 例外（#56 同一探针，两个 !resume 臂都参与）：文件存在即续聊——被打断/
-            //   失败的 pi 轮次文件已在盘上（pi 会话创建即落盘），文件存在时再注入会把
-            //   同一历史块二次写进 pi transcript；文件缺失（且 marker 命中）才是真丢失。
+            // - !resume（新会话首轮）：marker 缺失或 sid 失配 → 注入（#49 后端切换迁移）。
             // - resume（既有会话）：pending 命中（#54 自愈重建/换 UUID 后待补注入）
-            //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）；
-            //   或 pi 会话文件丢失/损坏（#56：pi 对不可续聊的文件同 sid 静默新建空
-            //   会话——文件被删或损坏均实测如此——无错误可检）→ 本轮直接注入
-            //   （run 前即可探明，比 pending 早一轮）。**不设 marker 防重复护栏**：pi run
-            //   成功必落会话文件（核心功能），文件持续不可续聊 = 每轮都是新会话，重注入是
-            //   正确行为；用「marker 匹配即已注入过」拦截会把「迁移后文件才丢失」的
-            //   真丢失误判为已注入（静默永久无上下文，恰是本功能要杀的症状）——布局
-            //   误报的代价是可见噪音（提示从首轮起可见；误报持续时注入块按轮累积进
-            //   pi transcript，每轮 ≤6000 字符），可接受。
+            //   → 放行恰好一次，注入成功后桥回写 pending=false（复位）。
             //
-            // 架构（#56/#57 定论）：丢失检测**分层是本质而非债**——
-            // - claude/codex 有错误文本（no rollout found / No conversation found），事后
-            //   分类（agent.rs run）→ rebuilt + pending 迁移标记补注入；
-            // - pi 无错误信号（静默新建），只能事前探查（本闸的探针）→ 本轮直接注入。
+            // 单后端化（P4.1）：CLI 后端随 run 一并删除，注入闸的 pi 探针臂（#56 事前
+            // 探查 pi 会话文件丢失/损坏）随之退役——buzz harness 会话不落盘续聊
+            // （服务启动即清槽，见 sessions.rs reset_slots_for_service_start），
+            // 丢失场景只剩「新会话首轮注入」与「pending 自愈补注入」两条既有闸臂。
             let marker = hist.marker();
-            let session_file_lost = || {
-                backend == Backend::Pi && !crate::agent::pi_session_exists(&workspace, &session_id)
-            };
-            let session_file_alive = || {
-                backend == Backend::Pi && crate::agent::pi_session_exists(&workspace, &session_id)
-            };
             let should_inject = if !resume {
                 match &marker {
-                    Some(m) => m.session_id != session_id || session_file_lost(),
-                    None => !session_file_alive(),
+                    Some(m) => m.session_id != session_id,
+                    None => true,
                 }
             } else {
                 matches!(&marker, Some(m) if m.pending && m.session_id == session_id)
-                    || session_file_lost()
             };
             let injected_rounds = if should_inject {
-                // #130：该会话已被上下文压缩（ctxsum 存在）→ 注入压缩块（旧摘要 + 近期
-                // 原文）而非全量历史——压缩后全量历史仍会超长，注入必须切到压缩源。
-                //（#194：workspace 已按 chat 路由——虚拟 Bot 群用 vb/<uuid>/）
-                let (block, n) = match crate::contextsum::ctxsum_block_at(&workspace, &key) {
-                    Some(sum) => {
-                        let rounds = sum.matches("用户: ").count();
-                        (sum, rounds.max(1))
-                    }
-                    None => hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT),
-                };
+                // #194：workspace 已按 chat 路由——虚拟 Bot 群用 vb/<uuid>/。
+                //（P4.1：contextsum 压缩模块已删——单执行层后生产不可达的死码，
+                // 注入只走全量历史块一条路径。）
+                let (block, n) = hist.inject_block(&ev.mid, crate::history::INJECT_CHARS_DEFAULT);
                 if n > 0 {
-                    injected_block = Some(block.clone());
                     prompt.insert_str(0, &block);
                     Some(n)
                 } else {
@@ -869,7 +819,7 @@ impl Bridge {
             let user_text = history_user_text(&text, &ev);
             // 当前用户轮落历史（锁内，与助手轮严格按真实顺序交替；重放由 (mid,user) 去重兜底）。
             // 锁内写与 /new 的 clear 互斥。
-            hist.append_user(&ev.mid, backend.name(), &user_text);
+            hist.append_user(&ev.mid, "buzz", &user_text);
             // #74：授权者（granted）私聊消息 → 落消息库 + 未读提醒（条件见 record_granted）。
             // 与 hist 同处锁内写：插入快、失败只 log，不阻塞主链路。
             // 落库与提醒联动（审查跟进）：insert 返回是否真正插入——重放（崩溃恢复
@@ -908,9 +858,9 @@ impl Bridge {
         // #200 Phase 3：buzz 后端短路——消息 push 进 harness 队列（harness 单
         // slot + per-channel 串行锁：同一频道不会有两轮并发，在跑轮次期间到达
         // 的消息按 Queue 语义入队、回合结束时随 steer 合并进下一轮），回合结束
-        // 捕获 agent 文本同步投递回聊天平台，不走 CLI spawn（run_once 的 Buzz 臂
-        // unreachable，旁路调用方在 agent::run/generate_* 有守卫）。与 CLI 路径
-        // 的差异：
+        // 捕获 agent 文本同步投递回聊天平台。单后端化（P4.1）后 CLI spawn 已整体
+        // 删除，下方 spawn 同步路径只剩测试挡板/job 内部兜底（生产 Runner 是
+        // SpawnRetiredRunner 诚实报错桩）。buzz 路径语义：
         // - 会话上下文由 harness 的 channel→session 持有：ABB 侧首轮迁移注入照常
         //   （注入闸照跑），push 成功后 mark_started + 落 marker，防后续每轮重复
         //   注入（CLI 路径这步在 run 返回后做；buzz 无同步轮次，就地补齐）。
@@ -921,12 +871,12 @@ impl Bridge {
         //   按普通消息透传：队列语义下它并入在跑轮次后、随下一轮 steered prompt
         //   一起交 agent（pi-acp 无原生 steer，走 cancel+merge 重跑一轮重提示）。
         // 表情语义与 CLI 对齐：收到打「处理中」（上方），回复投递时撤销+✅。
-        // ACP 单轨：有 harness 的后端 push 进对应实例（异步回合）后返回；
-        // 无 harness（测试挡板/job 内部）落到下方 spawn 同步路径。
-        if let Some(handle) = self.acp_handles.get(backend.name()).cloned() {
+        // ACP 单轨：句柄对已装配 → 按角色 push 进对应实例（P2.2：granted→受限实例，
+        // 其余→normal 实例）异步回合后返回；未装配（测试挡板/job 内部）落到下方
+        // spawn 同步路径。
+        if let Some(handle) = self.acp_handle_for_role(ev.role) {
             crate::log!(
-                "[bridge] {} 路径：push 进 harness chat={} len={}",
-                backend.name(),
+                "[bridge] buzz 路径：push 进 harness chat={} len={}",
                 trunc(&ev.chat_id, 12),
                 prompt.chars().count()
             );
@@ -974,16 +924,12 @@ impl Bridge {
                 if let Err(e) = self
                     .send_reply(
                         &ev,
-                        &format!(
-                            "⚠️ {} 后端消息入队失败（harness 已关闭，详见服务日志），请重发或换后端。",
-                            backend.name()
-                        ),
+                        "⚠️ buzz 后端消息入队失败（harness 已关闭，详见服务日志），请重发。",
                     )
                     .await
                 {
                     crate::log!(
-                        "[bridge] ⚠️ {} 未送达报错发送失败 chat={}: {e:#}",
-                        backend.name(),
+                        "[bridge] ⚠️ buzz 未送达报错发送失败 chat={}: {e:#}",
                         trunc(&ev.chat_id, 10)
                     );
                 }
@@ -1008,7 +954,7 @@ impl Bridge {
             // 成功路径同形（注入轮的迁移标记）。mark_started_if 的槽位校验天然挡
             // 与 /new 的竞态；marker 错写旧 sid 也会因失配下轮重注入（自愈）。
             if sessions.mark_started_if(&key, &session_id) && injected_rounds.is_some() {
-                hist.set_marker(&session_id, backend.name(), false);
+                hist.set_marker(&session_id, "buzz", false);
             }
             return;
         }
@@ -1027,10 +973,9 @@ impl Bridge {
         // 借用冲突（保持原自由函数调用「future 只持有 &self.sessions」的借用形态）。
         // 会话存储与工作目录已在函数前部按 chat 路由（#194：vb/<uuid>/ 或 bot 级）。
         let runner = self.agent_runner.clone();
-        let mut result = self
+        let result = self
             .run_agent_with_progress(
                 &runner,
-                backend,
                 &prompt,
                 &session_id,
                 resume,
@@ -1042,93 +987,8 @@ impl Bridge {
                 &cancel_flag,
             )
             .await;
-
-        // #130：上下文超长错误 → 自动分段压缩 + 换新会话重试一次（每会话只压缩一次）。
-        // 开关默认开（config context_compress_enabled）；ctxsum 已存在 = 已压缩过 → 不
-        // 再压缩（防循环），错误照常返回并带提示。压缩失败（LLM 摘要不可用/写盘失败）
-        // 也不阻塞主链路：回落原错误，用户可见 hint 不误导。
-        let mut compress_note: Option<String> = None;
-        if let Err(e) = &result {
-            let enabled = crate::config::Config::load()
-                .map(|c| c.context_compress_enabled)
-                .unwrap_or(true);
-            if enabled && crate::contextsum::is_context_too_long(e) {
-                // #194：压缩工作区按 chat 路由（虚拟 Bot 群用 vb/<uuid>/）
-                if crate::contextsum::ctxsum_block_at(&workspace, &key).is_none() {
-                    crate::log!(
-                        "[bridge] #130 上下文超长，自动压缩 chat={} err_len={}",
-                        trunc(&ev.chat_id, 10),
-                        e.chars().count()
-                    );
-                    match crate::contextsum::compress(
-                        &workspace,
-                        &key,
-                        backend,
-                        &ev.chat_id,
-                        &bot_key,
-                        ev.role,
-                        runner.as_ref(),
-                        Some(cancel_flag.clone()),
-                    )
-                    .await
-                    {
-                        Ok(report) => {
-                            // 换新会话（reset_session：新 UUID + started=false）＋重建
-                            // prompt：压缩块替换原历史块（未注入历史则前置压缩块）。
-                            let new_sid = sessions.reset_session(&key);
-                            let ctxsum_block = crate::contextsum::ctxsum_block_at(&workspace, &key)
-                                .unwrap_or_default();
-                            let mut prompt2 = prompt.clone();
-                            match &injected_block {
-                                Some(hb) if !hb.is_empty() => {
-                                    prompt2 = prompt2.replacen(hb, &ctxsum_block, 1);
-                                }
-                                _ => {
-                                    if !ctxsum_block.is_empty() {
-                                        prompt2.insert_str(0, &ctxsum_block);
-                                    }
-                                }
-                            }
-                            compress_note = Some(format!(
-                                "💡 历史过长，已自动压缩 {} 条旧消息为摘要（{} 段），保留最近 {} 条原文，已换新会话重试本条…",
-                                report.compressed, report.summaries, report.kept
-                            ));
-                            crate::log!(
-                                "[bridge] #130 压缩完成 chat={} 压缩={} 保留={} 段={} llm={} → 新会话重试",
-                                trunc(&ev.chat_id, 10),
-                                report.compressed,
-                                report.kept,
-                                report.summaries,
-                                report.used_llm
-                            );
-                            result = self
-                                .run_agent_with_progress(
-                                    &runner,
-                                    backend,
-                                    &prompt2,
-                                    &new_sid,
-                                    false,
-                                    &ev.chat_id,
-                                    &key,
-                                    &bot_key,
-                                    ev.role,
-                                    &sessions,
-                                    &cancel_flag,
-                                )
-                                .await;
-                        }
-                        Err(ce) => {
-                            crate::log!("[bridge] ⚠️ #130 上下文压缩失败: {ce}");
-                        }
-                    }
-                } else {
-                    crate::log!(
-                        "[bridge] #130 已压缩过仍超长 chat={}（不重复压缩，提示用户）",
-                        trunc(&ev.chat_id, 10)
-                    );
-                }
-            }
-        }
+        //（P4.1：#130 自动上下文压缩重试臂已随 contextsum 模块一并删除——单执行层后
+        // 生产不可达的死码；上下文超长错误照旧返回给上层。）
         // 任务结束 → 摘掉打断标志（后续停止词将按普通消息处理）
         self.cancel_flags.lock().unwrap().remove(&key);
 
@@ -1139,12 +999,6 @@ impl Bridge {
                 session_id: final_sid,
                 rebuilt,
             }) => {
-                // #130：压缩重试成功 → 回复前置系统提示（用户可见压缩动作；历史落盘
-                // 与发送均用同一份 reply，保持显示一致）。
-                let reply = match &compress_note {
-                    Some(note) => format!("{note}\n\n{reply}"),
-                    None => reply,
-                };
                 // agent 成功即标记 started（会话状态只跟 agent 跑没跑成有关，与投递无关）。
                 // #23：仅当当前槽位仍是本次任务的会话时才 mark——运行中被 /new 或
                 // CLI `session reset` 换走时跳过（旧任务完成不得把新槽位置回 started=true）。
@@ -1155,7 +1009,7 @@ impl Bridge {
                     // 代际闸：/new 恰好落在 mark 与写盘之间（亚毫秒窗口）也不残留孤儿条目
                     let guard = hist_epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
                     if *guard == hist_epoch {
-                        hist.append_assistant(&ev.mid, backend.name(), &reply);
+                        hist.append_assistant(&ev.mid, "buzz", &reply);
                         // #54 会话自愈后的历史补注入：
                         // - 注入轮成功 → 写非 pending 标记（复位）
                         // - 同 sid 重建轮（rebuilt，必为 resume 轮）→ pending 标记，下一条注入
@@ -1174,11 +1028,9 @@ impl Bridge {
                         // 重注入。对「提示从未送达模型」的失败轮这是必要的兜底；代价是
                         // 已送达但失败的轮次会在对端 transcript 里多一份注入块，可接受。
                         if injected_rounds.is_some() {
-                            hist.set_marker(&final_sid, backend.name(), false);
-                        } else if rebuilt
-                            || (backend == Backend::Claude && resume && final_sid != session_id)
-                        {
-                            hist.set_marker(&final_sid, backend.name(), true);
+                            hist.set_marker(&final_sid, "buzz", false);
+                        } else if rebuilt {
+                            hist.set_marker(&final_sid, "buzz", true);
                         }
                     }
                 }
@@ -1268,12 +1120,6 @@ impl Bridge {
                 // 不 mark_started：被打断的轮次不算完成
             }
             Err(e) => {
-                // #130：压缩重试仍失败 → 错误文案前置压缩提示（用户知道已自动处理过，
-                // 不再静默重试）。
-                let e = match &compress_note {
-                    Some(note) => format!("{note}\n\n{e}"),
-                    None => e,
-                };
                 // 错误文案作为最终回复发出（用户可见原因），同样留痕。
                 // 先摘 pending（任务已结束；错误文案发送失败不重跑，与基线一致——
                 // remove 若在发送后，崩溃窗口会让失败任务被重启重放续跑）。
@@ -1308,10 +1154,7 @@ impl Bridge {
         cache
             .entry(chat_id.to_string())
             .or_insert_with(|| {
-                let store = crate::sessions::SessionStore::at(
-                    self.sessions.backend(),
-                    dir.join("sessions.json"),
-                );
+                let store = crate::sessions::SessionStore::at(dir.join("sessions.json"));
                 // 进程内首建 = 服务启动后的首次使用：同 bot 级存储，复位槽位
                 // 让本进程首轮走注入闸（harness 会话不跨进程存活）。
                 store.reset_slots_for_service_start();
@@ -1348,10 +1191,8 @@ impl Bridge {
     /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停。!shutdown/!rotate
     /// 等 harness 无此面（cancel 是唯一暴露给聊天的控制信号）。
     async fn buzz_cancel_reply(&self, ev: &Ev) -> String {
-        let backend =
-            crate::agent::Backend::parse(self.bot.effective_backend(&self.default_backend));
-        let Some(handle) = self.acp_handles.get(backend.name()) else {
-            return "⚠️ 叫停未送达：当前后端 harness 未装配（检查后端配置/重启）。".to_string();
+        let Some(handle) = self.acp_handle_for_role(ev.role) else {
+            return "⚠️ 叫停未送达：harness 未装配（检查服务状态/重启）。".to_string();
         };
         let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
             crate::buzz::keys::channel_uuid(&self.bot.key(), &ev.chat_id)
@@ -1384,12 +1225,11 @@ impl Bridge {
     }
 
     /// 执行一轮 agent 任务（统一中途进度排空：打字机已下线，中途输出丢弃不回，
-    /// 任务结束只发最终结果一条）。#130 压缩重试也走本方法（每轮独立 progress 通道）。
-    #[allow(clippy::too_many_arguments)] // 与 agent::run 同款参数集（11 参）
+    /// 任务结束只发最终结果一条）。
+    #[allow(clippy::too_many_arguments)] // 与 AgentRunner::run 同款参数集（10 参）
     async fn run_agent_with_progress(
         &self,
         runner: &std::sync::Arc<dyn crate::agent::AgentRunner>,
-        backend: crate::agent::Backend,
         prompt: &str,
         session_id: &str,
         resume: bool,
@@ -1402,14 +1242,13 @@ impl Bridge {
     ) -> Result<crate::agent::RunOutcome, String> {
         let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let run_fut = runner.run(
-            backend,
             prompt,
             session_id,
             resume,
             chat_id,
             key, // 会话隔离 key（话题=chat:thread，#14）：session 存储按 key 记账，回存须同 key
             bot_key,
-            role, // 发送者角色：granted 走受限分支（restrict 判定在 agent::run 内热读）
+            role, // 发送者角色：granted 走受限分支（restrict 判定在 AgentRunner::run 内热读）
             Some(sessions),
             Some(ptx),
             Some(cancel_flag.clone()),

@@ -1,6 +1,8 @@
 //! 平台抽象 —— 跨平台差异都收敛在这里（打开文件夹 / 开机自启 / 一次性数据迁移）。
 //! 设计目标：本体（WS/协议/agent/定时）全平台同码；平台特有只在 macOS 实现，Win/Linux 留 stub。
-//! 「服务监控 + 开机自启」不依赖 launchd/systemd/任务计划：托盘 GUI 自启（登录项），GUI 当 service 的看门。
+//! 「服务监控 + 开机自启」：service 生命周期由 GUI 看门（不经 launchd/systemd/任务计划）；
+//! 自启在 macOS 用 LaunchAgent，且改完必须 `launchctl` reload——只写文件时 launchd
+//! 用的仍是内存里那份旧定义（历史上正是这个让"改了不生效"）。
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -450,59 +452,364 @@ pub fn hide_dock() {}
 
 // ─────────────────────────── macOS：登录项自启 ───────────────────────────
 
-/// 是否已设为「登录时自动启动」。
+/// LaunchAgent 标签（同时是 plist 文件名）。launchd 按标签记账，改这个字符串会让
+/// 存量用户的旧 agent 变孤儿——只能新增、不能更名。
 #[cfg(target_os = "macos")]
-pub fn autostart_enabled() -> bool {
-    login_item_plist().exists()
+const LOGIN_ITEM_LABEL: &str = "com.sqb.agent-bridge.gui";
+
+/// 自启 plist 与当前二进制的关系（判定见 [`login_item_state_at`]）。
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum LoginItem {
+    /// 没有 plist（用户从未开自启），或内容不是我们的 schema（读不出参数）——不猜。
+    Absent,
+    /// plist 登记的就是当前这个可执行文件。
+    Matches,
+    /// plist 在，但登记的二进制已不存在（App 被移动/删过），或指向另一份副本。
+    /// 前者 launchd 首次 exec 即判 `EX_CONFIG(78)` 并静默停手（实测不重试、二进制
+    /// 补回也不拉），托盘却仍显示「开」；后者会在登录时拉起旧版本。
+    Drifted,
 }
 
-/// 开启/关闭「登录时自动启动」。
-/// 实现：往 ~/Library/LaunchAgents 写一个 LaunchAgent plist（以 LaunchServices 登录项方式拉起 GUI）。
-/// 注意：这是「开机自启 GUI」，不是用 launchd 管 service 生命周期——service 由 GUI 监控。
+/// plist 字符串值的 XML 转义（写侧）。不转义时含 `&` 的路径会产出非法 plist，
+/// launchd 直接拒载——而本 PR 的立身之本就是「回显说真话」，故写转义、读还原。
 #[cfg(target_os = "macos")]
-pub fn set_autostart(enable: bool) -> Result<()> {
-    let plist = login_item_plist();
-    if enable {
-        let exe = current_exe()?;
-        if let Some(parent) = plist.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
+fn xml_unescape(s: &str) -> String {
+    // 还原顺序与写侧相反：最后才还原 `&amp;`，否则 `&amp;lt;` 会被二次解码成 `<`。
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// 自启 plist 的唯一模板（纯函数，便于单测锁 schema）。这些键不是装饰：
+/// `KeepAlive`/`ThrottleInterval` 承载本机实测结论，被人顺手删掉就等于把
+/// 「崩溃不复活」的老毛病改回来，所以有测试断言它们必须存在。
+///
+/// `StandardOutPath`/`StandardErrorPath` 是 GUI 日志的唯一出路：`crate::log!` 只写
+/// stdout（main.rs:147），而 GUI 由 `open`/LaunchServices 起来时 stdio 全指
+/// /dev/null（本机实测 lsof），不重定向就等于什么都不留——`heal_autostart` 这类
+/// 只在 GUI 里跑的诊断信息本来会彻底不可见。现存的 logs/gui.out（8/10 那份手写
+/// plist 留下的）就是这个键的产物，自愈重写 plist 时不能把它弄丢。
+#[cfg(target_os = "macos")]
+fn build_login_plist(exe: &std::path::Path, logs: &std::path::Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.sqb.agent-bridge.gui</string>
+  <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{}</string>
+    <string>{exe}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>{out}</string>
+  <key>StandardErrorPath</key>
+  <string>{err}</string>
 </dict>
 </plist>
 "#,
-            exe.display()
-        );
-        std::fs::write(&plist, content)
-            .with_context(|| format!("写登录项失败: {}", plist.display()))?;
-    } else if plist.exists() {
-        std::fs::remove_file(&plist).with_context(|| "删除登录项失败")?;
+        label = xml_escape(LOGIN_ITEM_LABEL),
+        exe = xml_escape(&exe.display().to_string()),
+        out = xml_escape(&logs.join("gui.out").display().to_string()),
+        err = xml_escape(&logs.join("gui.err").display().to_string()),
+    )
+}
+
+/// 取 plist 里 `ProgramArguments` 数组的第一个 `<string>`（已 XML 还原）。自己写的
+/// schema 自己解析（不为此引一个 plist 依赖）；读不到就判 [`LoginItem::Absent`]，绝不猜。
+#[cfg(target_os = "macos")]
+fn plist_program_argument(text: &str) -> Option<String> {
+    text.split("<key>ProgramArguments</key>")
+        .nth(1)?
+        .split("<array>")
+        .nth(1)?
+        .split("<string>")
+        .nth(1)
+        .and_then(|s| s.split("</string>").next())
+        .map(str::trim)
+        .map(xml_unescape)
+}
+
+/// 判定自启项状态。`plist`/`current` 参数化是为单测（不碰真实 ~/Library）。
+/// 两侧都 canonicalize：`/var` → `/private/var`、软链、大小写不敏感卷都可能让
+/// 字符串不等而路径实际相等。
+#[cfg(target_os = "macos")]
+fn login_item_state_at(plist: &std::path::Path, current: &std::path::Path) -> LoginItem {
+    let Ok(text) = std::fs::read_to_string(plist) else {
+        return LoginItem::Absent;
+    };
+    let Some(arg) = plist_program_argument(&text) else {
+        return LoginItem::Absent;
+    };
+    let registered = std::path::Path::new(&arg);
+    if !registered.exists() {
+        return LoginItem::Drifted;
     }
-    Ok(())
+    match (
+        std::fs::canonicalize(registered),
+        std::fs::canonicalize(current),
+    ) {
+        (Ok(a), Ok(b)) if a == b => LoginItem::Matches,
+        _ => LoginItem::Drifted,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn login_item_state() -> LoginItem {
+    match current_exe() {
+        Ok(exe) => login_item_state_at(&login_item_plist(), &exe),
+        Err(_) => LoginItem::Absent,
+    }
+}
+
+/// 是否已设为「登录时自动启动」。
+/// 老实现只判 plist 文件存在，于是 App 换过位置后（`scripts/build.sh` 装
+/// `~/Applications`、正式包拖进 `/Applications`，而 plist 里写的是写入当时的
+/// `current_exe()`）launchd 首次 exec 就静默失败、再不自理，托盘却仍显示「开」——
+/// 回显说谎。
+#[cfg(target_os = "macos")]
+pub fn autostart_enabled() -> bool {
+    login_item_state() == LoginItem::Matches
+}
+
+/// GUI 启动时自愈：plist 在但指向失效路径/旧副本 → 按当前二进制重建并 reload。
+/// 只动「用户已经开过自启」的配置——没有 plist 就是没开过，绝不擅自给人开。
+#[cfg(target_os = "macos")]
+pub fn heal_autostart() {
+    if login_item_state() != LoginItem::Drifted {
+        return;
+    }
+    crate::log!("[autostart] 自启项指向失效路径（App 被移动过？），按当前二进制重建");
+    // 只记「检测到漂移并发起重建」这一条事实；成没成由 `set_autostart` 单点自己记
+    // （两处各写一遍早晚分叉，且这里写「已重载」在本会话跳过 bootout 时并不成立）。
+    log_autostart_event("自愈：自启项指向失效路径（App 被移动过？），发起按当前二进制重建");
+    let _ = set_autostart(true);
+}
+
+/// 非 macOS 无「登录项指向哪个二进制」这回事（Windows 的 Run 键每次由
+/// `current_exe()` 覆写；Linux 未实现）。
+#[cfg(not(target_os = "macos"))]
+pub fn heal_autostart() {}
+
+/// 设置开机自启的**唯一公开入口**：成败一律在这里落审计。
+///
+/// 记录点做在单点而不是各调用方（同 #263 把防自杀守卫下沉到 `unload_login_agent` 的
+/// 理由）：将来新增第三个调用点（CLI 之类）不会静默漏记——「漏记」本身没有任何症状。
+pub fn set_autostart(enable: bool) -> Result<()> {
+    let want = if enable { "开" } else { "关" };
+    let r = set_autostart_impl(enable);
+    match &r {
+        Ok(()) => log_autostart_event(&format!(
+            "开机自启已设为{want}（本会话是否已重载 launchd，见相邻记录）",
+        )),
+        Err(e) => log_autostart_event(&format!("开机自启设为{want} 失败: {e:#}")),
+    }
+    r
+}
+
+/// 开启/关闭「登录时自动启动」。
+/// 实现：往 ~/Library/LaunchAgents 写一个 LaunchAgent plist（launchd 登录时拉起
+/// GUI；不是 LaunchServices 登录项 API）。注意：这是「开机自启 GUI」，不是用
+/// launchd 管 service 生命周期——service 由 GUI 看门（见 install.rs）。
+/// 写完必须 reload：只 `fs::write` 时 launchd 用的仍是内存里那份旧定义，改动
+/// 到下次登录都不生效（历史上正是这个让「重开自启」也修不好）。
+///
+/// plist 里 `KeepAlive = {SuccessfulExit = false}` + `ThrottleInterval = 10` 是
+/// 本机实测选的形态（macOS 26.5.2，gui/501 域，36s 观察窗，探针标签跑完即拆）：
+/// - 被信号杀 / 非 0 退出 → 重启（约 10s 一次，节流由 ThrottleInterval 管）；
+/// - 退出码 0（托盘「退出」走 `quit_event_loop`）→ **不**重启，用户意图得到尊重；
+/// - 不选 `Crashed = true` 的原因：release 配置未设 `panic = "abort"`，Rust panic 是
+///   **exit 101 且无信号**，`Crashed` 只认信号死，恰好救不活我们要救的那一类。
+/// - 可执行文件缺失时 launchd 判 `EX_CONFIG(78)` 后**静默停手**（实测 250s 内只试 1 次，
+///   把二进制装回原路径也不补拉）：既不会刷屏重试，也不能指望 launchd 自己恢复——
+///   后者正是 [`heal_autostart`] 存在的理由。
+#[cfg(target_os = "macos")]
+fn set_autostart_impl(enable: bool) -> Result<()> {
+    let plist = login_item_plist();
+    if !enable {
+        // 顺序要紧：先删 plist（「下次登录不再自启」的硬判据，必须落定），再尽力摘掉
+        // 本会话的 job。反过来先 bootout 会在「launchd 拉起的实例里点关」时当场把自己
+        // 杀掉，删文件永远轮不到——用户看到 App 凭空退出而自启照旧（审查必修项）。
+        if plist.exists() {
+            std::fs::remove_file(&plist).with_context(|| "删除登录项失败")?;
+        }
+        // 再尽力摘本会话的 job；跑的是我们自己时 unload 内部会跳过（见其文档）。
+        // 已知窄窗：跳过意味着 launchd 内存里那份定义还在——若它带 KeepAlive（本会话
+        // 是被新模板拉起过的），此后 App 非 0 退出/被信号杀仍会被复活**一次**；正常
+        // 退出码 0 不复活，且 plist 已删 → 下次登录起彻底干净。宁可留这个窄窗，也不
+        // 为改配置杀掉用户正在用的 App。
+        unload_login_agent();
+        return Ok(());
+    }
+    let exe = current_exe()?;
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // logs/ 先建好：launchd 若打不开 StandardOutPath 目标可能不起 job（man 页只说
+    // 「文件不存在则创建」，对父目录缺失的行为沉默——这里按最保守做法先建目录）。
+    let logs = crate::bridge_dir().join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    std::fs::write(&plist, build_login_plist(&exe, &logs))
+        .with_context(|| format!("写登录项失败: {}", plist.display()))?;
+    // reload 内部同样带防自杀保护：是我们自己就不重装载，新增的保活键下次登录生效。
+    reload_login_agent(&plist)
+}
+
+/// 由 launchd 拉起的自启 job 是否就是本进程（**自杀保护的唯一判据**）。
+#[cfg(target_os = "macos")]
+fn login_job_is_self() -> bool {
+    let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
+    let Ok(out) = std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    parse_launchd_job_pid(&String::from_utf8_lossy(&out.stdout)) == Some(std::process::id())
+}
+
+/// 从 `launchctl print` 输出里取 job 主进程 pid。本机实测形态是一个 TAB 缩进的
+/// `pid = 61995`，且全输出含 `pid` 子串的行**仅此一条**（`last exit code`、
+/// `exit timeout` 都不以 `pid` 开头；真出现 `responsible pid` 也会因 trim 后前缀
+/// 不符而被跳过）。容忍 `pid=1` 这类空白差异。
+/// 解析不出（job 未运行/格式变了）→ `None` → 判「不是自己」→ 落回原行为：**宁可
+/// 保护失效，也不要把用户正在用的 App 误判成该跳过**。格式漂移是显式风险，故留了
+/// 单测锁住这行解析。
+#[cfg(target_os = "macos")]
+fn parse_launchd_job_pid(print_out: &str) -> Option<u32> {
+    print_out.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("pid")?.trim_start();
+        rest.strip_prefix('=')?.trim().parse::<u32>().ok()
+    })
+}
+
+/// 让 launchd 改用磁盘上最新定义（bootout 旧 job → bootstrap 新 plist）。
+/// 域是 per-user 的 `gui/<uid>`；uid 取本进程，不用 `$UID` 环境变量（由 launchd
+/// 起的进程未必带它）。
+#[cfg(target_os = "macos")]
+fn reload_login_agent(plist: &std::path::Path) -> Result<()> {
+    if !unload_login_agent() {
+        // 没摘成（正在跑的就是我们自己）→ 也别 bootstrap：同一 label 重复 bootstrap
+        // 会失败。新写的文件已在磁盘上，下次登录 launchd 重读即生效。
+        return Ok(());
+    }
+    let domain = format!("gui/{}", uid());
+    let out = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist.display().to_string()])
+        .output()
+        .with_context(|| "执行 launchctl bootstrap 失败")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "launchctl bootstrap 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
+/// 从 launchd 摘掉本 App 的 agent。返回 `false` = **因为那个 job 进程就是本进程而
+/// 跳过**（`bootout` 会终止 job 进程，实测 `kill -0` 拿 rc=1、pgrep/ps 全空；摘自己
+/// 等于让 ABB 凭空退出），调用方据此别再去 bootstrap。未加载过时报错属正常路径
+/// （首次开启前），按「已摘」处理。
+///
+/// 保护做在这里而不是各调用点：以后谁再加一条 reload/unload 路径，不会绕开它。
+#[cfg(target_os = "macos")]
+fn unload_login_agent() -> bool {
+    if login_job_is_self() {
+        crate::log!("[autostart] 跳过 bootout：该 job 正在运行的进程就是本进程（摘它会杀掉自己）");
+        log_autostart_event(
+            "跳过 launchctl bootout：正在跑的 job 进程就是本进程（摘它会杀掉自己）",
+        );
+        return false;
+    }
+    let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    true
+}
+
+/// 本进程 uid（libc 已在直接依赖里，不必 spawn `id -u`）。
+#[cfg(target_os = "macos")]
+fn uid() -> u32 {
+    // SAFETY: getuid(2) 无参数、无内存交互，任意线程可调。
+    unsafe { libc::getuid() }
 }
 
 #[cfg(target_os = "macos")]
 fn login_item_plist() -> PathBuf {
+    // 文件名 == 标签名（launchd 按标签记账），别把字符串写两遍以免分叉。
     dirs::home_dir()
         .unwrap_or_default()
-        .join("Library/LaunchAgents/com.sqb.agent-bridge.gui.plist")
+        .join("Library/LaunchAgents")
+        .join(format!("{LOGIN_ITEM_LABEL}.plist"))
+}
+
+// ─────────────────────────── 自启变更审计（全平台） ───────────────────────────
+
+/// 把一次自启配置变更/自愈结果追加到 `<bridge_dir>/logs/autostart.log`。
+///
+/// 为什么不能只靠 `crate::log!`：它只写 stdout（`main.rs:147`），而 GUI 由
+/// `open`/Finder 拉起时 0/1/2 全指 /dev/null（本机实测 `lsof -p <gui pid>`），
+/// 「自愈成没成、为什么失败」这条最需要留证据的信息会当场蒸发。plist 里的
+/// `StandardOutPath` 只对 **launchd 拉起的那一次** 生效，救不了手工启动这条路。
+/// 与 plist 那两个键互补：一个管以后，一个管当下。
+///
+/// 内容只有动作、路径与 launchctl 回显文本，绝不含密钥（同类行早已落在 bridge.out）。
+/// best-effort：写失败只丢审计，绝不影响自启动作本身。
+pub fn log_autostart_event(msg: &str) {
+    use std::io::Write;
+    let dir = crate::bridge_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("autostart.log"))
+    {
+        let _ = writeln!(f, "{}", autostart_record(&crate::chrono_lite::now(), msg));
+    }
+}
+
+/// 审计行格式（纯函数，便于单测；时间戳由调用方给，避免测试依赖时钟）。
+///
+/// msg 一律压平换行：错误链里会拼进 `launchctl` 的 stderr 与 plist 路径（都可含
+/// 换行），不清洗就会一条事件落成多行，甚至伪造出带时间戳样子的假记录。
+fn autostart_record(ts: &str, msg: &str) -> String {
+    // CRLF 先归一（否则一个换行会落成两个 ⏎）；再统一把独立 CR/LF 显式压成 ⏎——
+    // 直接删掉 \r 会把 "a\rb" 无声粘成 "ab"，丢掉分隔语义。
+    let flat = msg.replace("\r\n", "\n").replace(['\r', '\n'], "⏎");
+    format!("[{ts}] {flat}\n")
 }
 
 // ── Windows：登录自启 = HKCU Run 键 ──
 // 值名 ABB，值 = "C:\...\agent-bridge.exe"（带引号；文件名由 current_exe() 决定）。
 // GUI 每次刷新读 Run 键决定菜单显「开/关」。
+// 注意：这里只判值**存在**，不像 macOS 那样校验路径是否还是当前二进制——安装位置
+// 由 Inno 固定、升级器原地替换二进制，键值不会漂移；不做未经实测的注册表解析。
 #[cfg(target_os = "windows")]
 const AUTOSTART_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(target_os = "windows")]
@@ -526,7 +833,7 @@ pub fn autostart_enabled() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn set_autostart(enable: bool) -> Result<()> {
+fn set_autostart_impl(enable: bool) -> Result<()> {
     let exe = current_exe()?;
     let out = if enable {
         let val = format!("\"{}\"", exe.display());
@@ -557,7 +864,7 @@ pub fn autostart_enabled() -> bool {
     false // TODO: ~/.config/autostart/agent-bridge.desktop
 }
 #[cfg(target_os = "linux")]
-pub fn set_autostart(_enable: bool) -> Result<()> {
+fn set_autostart_impl(_enable: bool) -> Result<()> {
     anyhow::bail!("Linux autostart 尚未实现")
 }
 
@@ -725,6 +1032,196 @@ fn rewrite_workspace_guides(workspaces: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 审计行格式：一行一条、带时间戳前缀，供 logs/autostart.log 事后排查
+    /// （GUI 由 open 起时 stdout 指 /dev/null，这是唯一留得下的证据）。
+    #[test]
+    fn autostart_record_is_one_timestamped_line() {
+        let r = autostart_record("2026-09-08 20:31:02", "自愈：已按当前二进制重建");
+        assert_eq!(r, "[2026-09-08 20:31:02] 自愈：已按当前二进制重建\n");
+        assert_eq!(r.matches('\n').count(), 1, "一条记录只允许一个换行");
+        // msg 里的换行必须被压平：错误链会拼进 launchctl 的 stderr（可含换行）与
+        // plist 路径，不清洗就是一条事件落多行，甚至伪造出带时间戳样子的假记录。
+        let dirty = autostart_record(
+            "T",
+            "bootstrap 失败: Bootstrap failed: 125\n[T2099-01-01 00:00:00] 伪造条目",
+        );
+        assert_eq!(dirty.matches('\n').count(), 1, "{dirty}");
+        assert!(dirty.contains("⏎"), "{dirty}");
+        assert!(
+            !dirty.contains("\n[T2099"),
+            "被压平的内容不得另起一行冒充独立记录: {dirty}"
+        );
+        assert_eq!(
+            autostart_record("T", "a\r\nb"),
+            "[T] a⏎b\n",
+            "CRLF 只算一个分隔"
+        );
+        // 独立 CR（不带 LF）也得留痕：直接剥掉会把 "a\rb" 无声粘成 "ab"，丢分隔语义。
+        assert_eq!(autostart_record("T", "a\rb"), "[T] a⏎b\n");
+    }
+
+    /// 自启 plist 解析（macOS）：只认自己写的 schema；读不出参数一律 None（调用方
+    /// 判 Absent），宁可当作"不是我们的配置"也不猜——历史上现网那份 plist 就是带
+    /// 代码从不产出的键的手写遗留。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_program_argument_reads_registered_exe() {
+        assert_eq!(
+            plist_program_argument(
+                "<dict>\n  <key>ProgramArguments</key>\n  <array>\n    <string>/Applications/ABB.app/Contents/MacOS/agent-bridge</string>\n  </array>\n</dict>"
+            ),
+            Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string())
+        );
+        // 无 ProgramArguments（畸形/手写遗留）
+        assert_eq!(
+            plist_program_argument("<dict><key>Label</key><string>x</string></dict>"),
+            None
+        );
+        // 有 key 但数组里没有 <string>
+        assert_eq!(
+            plist_program_argument("<key>ProgramArguments</key><array></array>"),
+            None
+        );
+        // 后面还跟着别的 array（如 StandardPaths 之流）也不误伤：只取本 key 之后第一个
+        assert_eq!(
+            plist_program_argument(
+                "<key>ProgramArguments</key><array><string>/a/b</string></array><key>X</key><array><string>/c/d</string></array>"
+            ),
+            Some("/a/b".to_string())
+        );
+    }
+
+    /// plist 模板 ↔ 解析的往返，以及模板里承载实测结论的那几个键必须存在。
+    /// 抽成 `build_login_plist` 就是为了让这条测试能锁住 schema：谁把 `KeepAlive`
+    /// 顺手删了（=「崩溃自动拉起」这条承诺静默失效），这里就红。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_plist_round_trips_and_keeps_measured_keys() {
+        // 含 XML 特殊字符的路径：写侧必须转义，否则产出非法 plist（launchd 直接拒载），
+        // 而解析器又得还原回原路径，不然回显再次说谎。
+        for p in [
+            "/Applications/ABB.app/Contents/MacOS/agent-bridge",
+            "/Users/x/My Apps&Co/ABB.app/Contents/MacOS/agent-bridge",
+            "/tmp/a<b>c/agent-bridge",
+        ] {
+            let built = build_login_plist(std::path::Path::new(p), std::path::Path::new("/logs"));
+            assert!(
+                !built.contains("&Co") && built.contains("&amp;Co") == p.contains('&'),
+                "转义不符: {built}"
+            );
+            assert_eq!(plist_program_argument(&built).as_deref(), Some(p));
+        }
+        let built = build_login_plist(
+            std::path::Path::new("/x/agent-bridge"),
+            std::path::Path::new("/y/logs"),
+        );
+        for key in [
+            "<key>Label</key>",
+            "<key>ProgramArguments</key>",
+            "<key>RunAtLoad</key>",
+            "<key>KeepAlive</key>",
+            "<key>SuccessfulExit</key>",
+            "<key>ThrottleInterval</key>",
+            "<key>StandardOutPath</key>",
+            "<key>StandardErrorPath</key>",
+        ] {
+            assert!(built.contains(key), "plist 模板缺键 {key}：{built}");
+        }
+        // GUI 日志重定向必须落在 logs/ 下（crate::log! 只写 stdout，不重定向=零证据）
+        assert!(
+            built.contains("<string>/y/logs/gui.out</string>")
+                && built.contains("<string>/y/logs/gui.err</string>"),
+            "{built}"
+        );
+        // 三个实测选型值也锁住：RunAtLoad 翻 false = 登录根本不拉起（功能静默死亡）；
+        // SuccessfulExit 翻 true = 托盘「退出」会被复活；ThrottleInterval = 重试节奏。
+        assert!(built.contains("<key>RunAtLoad</key>\n  <true/>"), "{built}");
+        assert!(
+            built.contains("<key>SuccessfulExit</key>\n    <false/>"),
+            "{built}"
+        );
+        assert!(built.contains("<integer>10</integer>"), "{built}");
+        // plist 文件名与标签必须同源（launchd 按标签记账，两者分叉=写了个没人加载的文件）
+        assert_eq!(
+            login_item_plist()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            Some(format!("{LOGIN_ITEM_LABEL}.plist"))
+        );
+    }
+
+    /// 防自杀保护的唯一数据来源是 `launchctl print` 里那一行主进程 pid。格式一旦
+    /// 漂移，保护就静默失效（退回「点关 → 闪退」那个必修 bug），所以锁住实测形态：
+    /// 一个 TAB + `pid = <n>`，且不被 `last exit code`/`exit timeout` 之类干扰。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_launchd_job_pid_matches_real_print_output() {
+        assert_eq!(
+            parse_launchd_job_pid(
+                "\tstate = running\n\texit timeout = 5\n\tpid = 61995\n\tlast exit code = (never exited)\n"
+            ),
+            Some(61995)
+        );
+        // 无空格形态（未来格式变化的容错）
+        assert_eq!(parse_launchd_job_pid("        pid=42\n"), Some(42));
+        // 本机实测：那份 EX_CONFIG 的 job 输出里根本没有 pid 行 → None（可安全 bootout）
+        assert_eq!(
+            parse_launchd_job_pid(
+                "\tstate = spawn scheduled\n\truns = 1\n\tlast exit code = 78: EX_CONFIG\n"
+            ),
+            None
+        );
+        // 含 `pid` 字样但不是主进程行的，不误配
+        assert_eq!(parse_launchd_job_pid("\trespawn count = 3\n"), None);
+    }
+
+    /// 漂移判定四态：无 plist / 指向当前二进制 / 指向已消失的旧路径 / 指向另一份
+    /// 仍存在的旧副本。后两种都必须判 Drifted——前者让 launchd 静默 EX_CONFIG(78)，
+    /// 后者会在登录时拉起旧版本，都不能被 `autostart_enabled()` 报成「正常开着」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_item_state_distinguishes_matches_and_drift() {
+        let base = std::env::temp_dir().join(format!("abb-autostart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let plist = base.join("gui.plist");
+        let current = base.join("agent-bridge");
+        std::fs::write(&current, b"bin").unwrap();
+        let write_plist = |exe: &std::path::Path| {
+            // 用真实模板造夹具（而不是手写一小段 XML），这样模板与解析器一起被锁。
+            std::fs::write(&plist, build_login_plist(exe, &base.join("logs"))).unwrap();
+        };
+
+        // 没有 plist = 用户从未开自启（自愈绝不能顺手给他开）
+        assert_eq!(login_item_state_at(&plist, &current), LoginItem::Absent);
+        write_plist(&current);
+        assert_eq!(
+            login_item_state_at(&plist, &current),
+            LoginItem::Matches,
+            "登记的就是当前二进制"
+        );
+        write_plist(&base.join("gone").join("agent-bridge"));
+        assert_eq!(
+            login_item_state_at(&plist, &current),
+            LoginItem::Drifted,
+            "App 被移动过：旧路径已不存在"
+        );
+        let other = base.join("agent-bridge-old");
+        std::fs::write(&other, b"bin").unwrap();
+        write_plist(&other);
+        assert_eq!(
+            login_item_state_at(&plist, &current),
+            LoginItem::Drifted,
+            "指向另一份仍存在的副本（旧版本残留）也算漂移"
+        );
+        std::fs::write(&plist, "<dict/>").unwrap();
+        assert_eq!(
+            login_item_state_at(&plist, &current),
+            LoginItem::Absent,
+            "读不出参数不猜"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn legacy_bot() -> crate::config::BotConfig {
         crate::config::BotConfig::for_test("旧名bot", "cli_newkey123456")

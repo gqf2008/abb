@@ -327,43 +327,6 @@ impl Bridge {
             );
             return;
         }
-        // #118：granted + pi 后端 + 隔离开 → 接入层静默拦截（落历史不回复，不暴露配置）
-        let backend = self.bot.effective_backend(&self.default_backend);
-        if crate::config::granted_pi_unusable(sender_role, &self.bot.key(), backend) {
-            crate::log!(
-                "[dingtalk] granted+pi 会话静默拦截 from={}",
-                trunc(&msg.sender_staff_id, 10)
-            );
-            if !msg.mid.is_empty() {
-                let uname = self
-                    .msgr
-                    .user_display_name(&msg.sender_staff_id)
-                    .await
-                    .unwrap_or_default();
-                self.msgstore.insert(
-                    &self.bot.key(),
-                    &msg.chat_id(),
-                    &msg.mid,
-                    "user",
-                    &msg.sender_staff_id,
-                    &uname,
-                    &msg.text,
-                    crate::chrono_lite::unix_secs() as i64,
-                    if msg.is_group() { "group" } else { "p2p" },
-                    &msg.conversation_title,
-                );
-                if !msg.is_group() {
-                    self.unread.report(
-                        &self.bot.key(),
-                        &msg.sender_staff_id,
-                        &uname,
-                        &crate::agent::truncate(&msg.text, 40),
-                        crate::chrono_lite::unix_secs() as i64,
-                    );
-                }
-            }
-            return;
-        }
         // 群聊只有 @ 了本机器人（或配置了「@ 才推送」）的消息才处理；单聊直接处理。
         // #51：该群设了免 @（mention_modes off）则无需 @ 也进 agent（与飞书同开关）。
         // 门槛判定复用 access_and_role 同一次 config load；已 @ 则短路不付门槛判定。

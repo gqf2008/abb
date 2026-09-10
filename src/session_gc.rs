@@ -5,21 +5,29 @@
 //! 后端 agent 归纳成摘要存档（`summaries/<escaped>.md`），再清理工作区内历史/后端
 //! 会话文件；摘要在下一次会话（/new 后或清理后的首条消息）里注入衔接上下文。
 //!
+//! 执行层（单后端化 P3.2）：归纳回合走 `buzz::oneshot::oneshot_turn`——与聊天同一
+//! 执行层（随包 buzz-agent），一次性句柄用完即弃，不碰常驻聊天句柄的队列与 slot。
+//! 取代旧的 CLI spawn（`agent::run` → claude/pi）与 #200 的 buzz 整轮跳过——buzz bot
+//! 的每日归纳自此可用。buzz 会话不在工作区落转录文件（fork 无 .pi-sessions 写入），
+//! 故归纳回合自身无转录清理。P4.2 后 sessions.json 折叠为单槽（老 pi 槽位 sid 在
+//! load 折叠时舍弃），legacy pi 转录不再能被精确匹配删除——残留由 tidy 孤儿清理
+//! （live 集 + 24h mtime 护栏）兜底。
+//!
 //! 破坏性语义：
 //! - **每会话一次 LLM 调用**（烧钱）+ 删除用户历史——故默认关，需用户在设置页
 //!   显式打开；首轮延迟 24h+jitter（见 service.rs session_gc_loop）。
-//! - 只删工作区内文件（history/、.pi-sessions/、sessions.json 槽位）；claude/codex
+//! - 只删工作区内文件（history/、sessions.json 槽位）；claude/codex
 //!   的 transcript 在后端私有目录（~/.claude、~/.codex），
 //!   物理不可达，绝不触碰。
 //! - 清理次序（摘要写盘**成功后**）：二次校验仍过期（TOCTOU 收窄——归纳期间用户
 //!   又发消息则保留会话）→ 删槽位并持久化（未持久化 = 磁盘错误，文件一律未动，
-//!   宁留不删下轮重试）→ 删 history jsonl + 迁移/导入标记 → 按槽位 sid 精确删
-//!   pi 会话文件（10 分钟 mtime 护栏宁留不删，对齐 /new 清理语义）。
+//!   宁留不删下轮重试）→ 删 history jsonl + 迁移/导入标记。
 //! - 会话级 AGENTS.md 与摘要文件保留（摘要本身就是下一步的上下文）。
 //!
-//! 归纳任务角色用 Owner（内部维护任务，pi 也放行——与 run_job 的受限分支
-//! 相反：受限会话跑不了 pi，但维护任务必须能跟 bot 后端走）。汇报只走 `crate::log!`，
-//! 绝不发聊天消息（系统维护不打扰用户）。
+//! 归纳任务角色用 Owner（内部维护任务，跟 bot 配置档走——与 run_job 的受限分支
+//! 相反：受限会话是授权者语义，维护任务不是）。关停联动 #69：service stop 经
+//! oneshot 外部取消立即中断在途归纳（Cancelled → 宁留不删下轮重试）。汇报只走
+//! `crate::log!`，绝不发聊天消息（系统维护不打扰用户）。
 
 use std::path::Path;
 
@@ -42,27 +50,116 @@ pub struct GcReport {
     pub skipped: usize,
 }
 
+/// 归纳执行缝（P3.2）：生产 = [`ServiceSummarizer`]（buzz 一次性同步回合）；
+/// 测试 = Stub（编排挡板）。返回 Ok(摘要文本，无后端标识后缀) / Err(失败或
+/// 中断原因)——失败与中断同臂处理（宁留不删，下轮重试）。
+#[async_trait::async_trait]
+pub(crate) trait Summarizer: Send + Sync {
+    async fn summarize(
+        &self,
+        prompt: &str,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, String>;
+}
+
+/// 生产归纳执行器：buzz 一次性同步回合（与聊天同一执行层）。配置在构造时
+/// 解析（per bot 命令/env/档位），每次 summarize 自起句柄用完即弃。
+pub(crate) struct ServiceSummarizer {
+    agent_cfg: crate::buzz::harness::AgentConfig,
+    workspace: String,
+    budget: std::time::Duration,
+}
+
+impl ServiceSummarizer {
+    pub(crate) fn for_bot(bot: &crate::config::BotConfig, cfg: &crate::config::Config) -> Self {
+        Self {
+            agent_cfg: crate::service::oneshot_agent_config(bot, cfg),
+            workspace: crate::workspace_dir(&bot.key()).display().to_string(),
+            // 预算与 run_job 同款（硬上限 + 小余量：让 harness 死信先于调用方预算
+            // 落地，拿到可行动的 Failed 原因）。
+            budget: crate::buzz::harness::MAX_TURN_DURATION + std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// 测试构造：显式注入 agent 配置/workspace/预算（mock agent 驱动全链路；
+    /// 短预算防 mock 拉不起时测试悬挂）。
+    #[cfg(test)]
+    fn for_test(
+        agent_cfg: crate::buzz::harness::AgentConfig,
+        workspace: String,
+        budget: std::time::Duration,
+    ) -> Self {
+        Self {
+            agent_cfg,
+            workspace,
+            budget,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Summarizer for ServiceSummarizer {
+    async fn summarize(
+        &self,
+        prompt: &str,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, String> {
+        let msg = crate::buzz::queue::InboundMsg {
+            id_hex: uuid::Uuid::new_v4().to_string(),
+            author_role: crate::config::SenderRole::Owner.as_str().to_string(),
+            text: prompt.to_string(),
+            ts_secs: crate::chrono_lite::unix_secs() as i64,
+            prompt_tag: "gc_summary".to_string(),
+        };
+        // 外部取消只 watch，oneshot 绝不反 cancel（#69 关停联动）。
+        match crate::buzz::oneshot::oneshot_turn(
+            self.agent_cfg.clone(),
+            Some(self.workspace.clone()),
+            msg,
+            self.budget,
+            Some(stop.clone()),
+        )
+        .await
+        {
+            crate::buzz::harness::SyncTurnOutcome::Ok(text) => Ok(text),
+            crate::buzz::harness::SyncTurnOutcome::Cancelled => Err("已中断（关停）".to_string()),
+            crate::buzz::harness::SyncTurnOutcome::Timeout => Err("归纳超时".to_string()),
+            crate::buzz::harness::SyncTurnOutcome::Closed => Err("agent 不可用".to_string()),
+            crate::buzz::harness::SyncTurnOutcome::Failed(reason) => Err(reason),
+        }
+    }
+}
+
 /// 一轮归纳清理（per-bot，service 每日循环调用）：选候选 → 逐个归纳 → 写盘 → 清理。
-/// 天数热读 config（与 tidy_loop 同款），热读失败按 7 天兜底。
+/// 天数与供应商配置同一次热读 config（与 tidy_loop/gc 循环同款 load 语义）；
+/// 热读失败整轮跳过（无 env 装配不出可用 agent，逐 chat 失败只会永刷日志；
+/// 代价仅当日跳过、次日门重试，宁留不删无数据损失）。
 pub async fn run_once(
     bridge: &crate::bridge::Bridge,
     stop: &tokio_util::sync::CancellationToken,
 ) -> GcReport {
-    let days = crate::config::Config::load()
-        .map(|c| c.session_gc_days.max(1))
-        .unwrap_or(7);
-    run_once_with_days(bridge, stop, days, bridge.agent_runner.as_ref()).await
+    let (days, cfg) = match crate::config::Config::load() {
+        Ok(c) => (c.session_gc_days.max(1), c),
+        Err(e) => {
+            crate::log!(
+                "[session-gc:{}] 配置热读失败（{e}），本轮跳过",
+                bridge.bot.key()
+            );
+            return GcReport::default();
+        }
+    };
+    let summarizer = ServiceSummarizer::for_bot(&bridge.bot, &cfg);
+    run_once_with_days(bridge, stop, days, &summarizer).await
 }
 
-/// 可测核心：天数与 agent runner 由调用方注入（生产 = run_once 热读 config +
-/// 桥的 RealAgentRunner；测试注入固定天数 + 挡板 runner）。归纳走桥的 AgentRunner
-/// 抽象（与聊天/job 路径同源），使「归纳 → 摘要写盘 → 二次校验 → 清理」整条编排
-/// 可被挡板驱动（此前 run_once 无任何测试——本 diff 最破坏性的路径）。
+/// 可测核心：天数与归纳执行器由调用方注入（生产 = run_once 热读 config +
+/// ServiceSummarizer；测试注入固定天数 + 挡板/mock）。归纳走 [`Summarizer`]
+/// 缝，使「归纳 → 摘要写盘 → 二次校验 → 清理」整条编排可被挡板驱动。
 pub async fn run_once_with_days(
     bridge: &crate::bridge::Bridge,
     stop: &tokio_util::sync::CancellationToken,
     days: u32,
-    runner: &dyn crate::agent::AgentRunner,
+    summarizer: &dyn Summarizer,
 ) -> GcReport {
     let bot_key = bridge.bot.key();
     let workspace = crate::workspace_dir(&bot_key);
@@ -72,15 +169,6 @@ pub async fn run_once_with_days(
     // 会与 bridge.sessions 产生 refresh→save 交叉覆盖，把刚删的槽位复活（审查）。
     let store = &bridge.sessions;
     let mut report = GcReport::default();
-
-    // #200：buzz 后端不经 CLI → 归纳无法执行。整轮**一次性**跳过并留一行日志：
-    // 落到 per-chat 循环里撞 agent::run 的守卫，会变成「每 chat 每天一行 归纳失败」
-    // 的永刷（审查 #205r2）。代价（记录）：buzz bot 的历史/会话不因归纳而收缩，
-    // 接线归纳到 relay 前进 #206。
-    if crate::agent::Backend::parse(&bridge.default_backend).is_buzz() {
-        crate::log!("[session-gc:{bot_key}] buzz 后端不经 CLI，跳过本轮会话归纳（见 #206）");
-        return report;
-    }
 
     for key in select_candidates_in(&workspace, now, days)
         .into_iter()
@@ -106,82 +194,16 @@ pub async fn run_once_with_days(
         let agents_block =
             crate::agents_md::collect_block_at(&bridge.agents_md_root, &bot_key, &key);
         let prompt = build_summary_prompt(&agents_block, &history_block);
-        // 镜像 run_job 的 agent 调用：fresh UUID、resume=false、sessions=None（无需
-        // 回存 thread_id）、role=Owner（内部维护任务，pi 也放行）。
-        let backend = crate::agent::Backend::parse(&bridge.default_backend);
-        let sum_sid = uuid::Uuid::new_v4().to_string();
-        // 关停联动：stop 触发即置位 cancel flag——agent::run 阶段间检查它，
-        // 正在跑的归纳尽快中断（#69：不可让 shutdown_wait 无界等一轮 LLM 调用跑完；
-        // 中断走 Cancelled 分支，宁留不删下轮重试）。flag 与 stop 同寿命，进程退出即弃。
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let cancel = cancel.clone();
-            let stop = stop.clone();
-            tokio::spawn(async move {
-                stop.cancelled().await;
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-        }
-        // 归纳会话自身转录用 run 返回的真实 id 删（见下方注释；占位 UUID 的 InSet
-        // 匹配不到后端自生成/真实 id 的转录——审查修复）
-        let (reply, transcript_sid) = match runner
-            .run(
-                backend,
-                &prompt,
-                &sum_sid,
-                false,
-                &key,
-                &key,
-                &bot_key,
-                crate::config::SenderRole::Owner,
-                None,
-                None,
-                Some(cancel),
-            )
-            .await
-        {
-            Ok(crate::agent::RunOutcome::Reply {
-                reply,
-                // 真实 id：pi 的 --session-id 固定 = 入口 sum_sid；agent::run 已把
-                // 返回值换成对端真实 id（sessions=None 也换）——与 .pi-sessions 文件
-                // 一致，InSet 才能命中。
-                session_id: real_sid,
-                ..
-            }) => (reply, real_sid),
-            Ok(crate::agent::RunOutcome::Cancelled) => {
-                crate::log!("[session-gc:{bot_key}] ⏰ {esc} 归纳被中断，保留会话");
-                // 失败/中断也要清掉归纳会话自己的转录：pi 文件含入口 sum_sid（固定
-                // --session-id），精确删（留待 tidy 的孤儿清理兜底——审查修复）
-                crate::agent::remove_pi_transcripts(
-                    &workspace,
-                    &std::collections::HashSet::from([sum_sid.clone()]),
-                    crate::agent::SidMatch::InSet,
-                    None,
-                );
-                report.failed += 1;
-                continue;
-            }
+        // 一次性同步回合（owner 角色内部维护任务）：buzz 会话不落工作区转录，
+        // 失败/中断无清理负担；关停经外部取消立即中断（#69）。
+        let reply = match summarizer.summarize(&prompt, stop).await {
+            Ok(reply) => reply,
             Err(e) => {
                 crate::log!("[session-gc:{bot_key}] ⚠️ {esc} 归纳失败：{e}");
-                crate::agent::remove_pi_transcripts(
-                    &workspace,
-                    &std::collections::HashSet::from([sum_sid.clone()]),
-                    crate::agent::SidMatch::InSet,
-                    None,
-                );
                 report.failed += 1;
                 continue;
             }
         };
-        // 归纳会话自身的转录文件：pi 后端会在 .pi-sessions 落盘（<ts>_<真实sid>.jsonl，
-        // id 不属于任何槽位）——run 已结束，即刻删掉，不留孤儿（tidy 默认关，不能
-        // 依赖它兜底）。claude/codex 的转录在后端私有目录（~/.claude 等），物理不可达，跳过。
-        crate::agent::remove_pi_transcripts(
-            &workspace,
-            &std::collections::HashSet::from([transcript_sid]),
-            crate::agent::SidMatch::InSet,
-            None,
-        );
         // 摘要写盘（幂等：同 key 覆盖旧摘要）。写盘失败**不得进入清理**——历史已删
         // 而摘要未落盘 = 永久丢上下文；按失败计，下轮重试（宁留不删）。
         let Some(path) = write_summary_file(&workspace, &key, &reply, last_ts) else {
@@ -225,9 +247,9 @@ pub(crate) fn select_candidates_in_with_state(
     days: u32,
     state: &crate::session_state::SessionState,
 ) -> Vec<String> {
-    // 复用 SessionStore 的解析（新格式/旧扁平迁移/刷新签名单一来源，不绕行裸读
+    // 复用 SessionStore 的解析（新格式/老结构折叠/刷新签名单一来源，不绕行裸读
     // sessions.json——schema 演进只改一处；审查修复）。无槽位文件 → 空（常态）。
-    let store = crate::sessions::SessionStore::at("claude", workspace.join("sessions.json"));
+    let store = crate::sessions::SessionStore::at(workspace.join("sessions.json"));
     let cutoff = now.saturating_sub(u64::from(days.max(1)) * 86400);
     // #87 暂停豁免：暂停会话不参与 GC（用户显式想保留，不应被静默归纳回收）。
     // 暂停期消息不入 history → last_ts 不再推进，若不豁免必然下一轮入选。
@@ -310,9 +332,7 @@ pub fn write_summary_file(
 /// 2. 删 sessions.json 槽位并持久化（未持久化 = 磁盘错误，文件一律未动，返回 false
 ///    ——「先文件后槽位」在 save 失败时文件已删而槽位还在，陈旧槽位指向已删文件；
 ///    审查修复。槽位删后文件清理中断 → 残留文件由 tidy 孤儿清理兜底，宁留文件）；
-/// 3. 删 history jsonl + 迁移/导入标记（`.migrated.json` 是会话级迁移状态，一并删）；
-/// 4. 按槽位 sid 精确删 pi 会话文件（mtime 超 [`TRANSCRIPT_FRESH_SECS`] 才删，
-///    宁留不删）；claude/codex 的 transcript 在后端私有目录，物理不可达，跳过。
+/// 3. 删 history jsonl + 迁移/导入标记（`.migrated.json` 是会话级迁移状态，一并删）。
 ///
 /// 返回是否真的清理了（false = 会话恢复活跃或持久化失败，保留一切）。
 pub fn cleanup_chat_in(
@@ -333,12 +353,11 @@ pub fn cleanup_chat_in(
     if hist.last_ts().map(|ts| ts >= cutoff_ts).unwrap_or(false) {
         return false;
     }
-    // 2. 先取槽位 sid（文件删除要用），再**先删槽位并持久化**：save 失败 = 磁盘错误，
-    //    此时文件一律未动，保留会话状态返回 false（宁留不删，下轮重试）——原次序
-    //    「先删文件后删槽位」在持久化失败时文件已丢而槽位还在，陈旧槽位指向已删
-    //    文件（审查修复）。槽位删成功后文件删除若中断（崩溃），残留文件由 tidy
-    //    孤儿清理兜底，语义是「宁留文件」而非「宁留空洞」。
-    let pi_sid = store.chat_entry(key).map(|e| e.pi.session_id.clone());
+    // 2. **先删槽位并持久化**：save 失败 = 磁盘错误，此时文件一律未动，保留会话状态
+    //    返回 false（宁留不删，下轮重试）——原次序「先删文件后删槽位」在持久化失败时
+    //    文件已丢而槽位还在，陈旧槽位指向已删文件（审查修复）。槽位删成功后文件删除
+    //    若中断（崩溃），残留文件由 tidy 孤儿清理兜底，语义是「宁留文件」而非「宁留
+    //    空洞」。
     if !store.remove_chat(key) {
         crate::log!(
             "[session-gc] ⚠️ {} 槽位删除未持久化，保留会话状态",
@@ -352,20 +371,8 @@ pub fn cleanup_chat_in(
     for suffix in ["jsonl", "migrated.json", "imported.json"] {
         let _ = std::fs::remove_file(history_dir.join(format!("{esc}.{suffix}")));
     }
-    // 4. 按槽位 sid 精确删后端会话文件（mtime 护栏宁留不删；claude/codex 的 transcript
-    //    在后端私有目录，物理不可达，跳过）。公共判定见 agent::remove_*_transcripts
-    //    （与 /new 同源；护栏 10 分钟，过期会话槽位理论上无在跑任务，护栏只是双保险）。
-    if let Some(pi_sid) = pi_sid {
-        if !pi_sid.is_empty() {
-            let sids = std::collections::HashSet::from([pi_sid]);
-            crate::agent::remove_pi_transcripts(
-                workspace,
-                &sids,
-                crate::agent::SidMatch::InSet,
-                Some(crate::agent::TRANSCRIPT_FRESH_SECS),
-            );
-        }
-    }
+    // legacy pi 转录（.pi-sessions/）：P4.2 折叠后槽位不再携带 pi sid，无法精确匹配
+    // ——残留由 tidy 孤儿清理兜底（live 集 + 24h mtime 护栏，宁留不删）。
     true
 }
 
@@ -424,17 +431,8 @@ mod tests {
         data.insert(
             key.into(),
             crate::sessions::ChatEntry {
-                claude: crate::sessions::Slot {
-                    session_id: format!("sid_{key}"),
-                    started: true,
-                    ..Default::default()
-                },
-                // pi 槽位同 sid：cleanup 按槽位 sid 精确删会话文件
-                pi: crate::sessions::Slot {
-                    session_id: format!("sid_{key}"),
-                    started: true,
-                    ..Default::default()
-                },
+                session_id: format!("sid_{key}"),
+                started: true,
                 ..Default::default()
             },
         );
@@ -522,8 +520,8 @@ mod tests {
             "[]",
         )
         .unwrap();
-        // 后端会话文件：pi（文件名含 sid）拨旧可删；另一个新鲜 pi 文件（含同 sid
-        // 但 mtime 新）宁留不删
+        // legacy pi 转录文件：P4.2 折叠后槽位无 pi sid，GC 不再精确删——
+        // 残留由 tidy 孤儿清理兜底（新旧文件都保留）
         std::fs::create_dir_all(ws.join(".pi-sessions")).unwrap();
         let pi_old = ws.join(".pi-sessions/1000_sid_oc_a.jsonl");
         std::fs::write(&pi_old, "x").unwrap();
@@ -544,7 +542,7 @@ mod tests {
         assert!(content.contains("会话 key：oc_a"), "头注释含会话 key");
         assert!(content.contains("主题：…"), "agent 回复在头部之后");
 
-        let store = crate::sessions::SessionStore::at("claude", ws.join("sessions.json"));
+        let store = crate::sessions::SessionStore::at(ws.join("sessions.json"));
         let cutoff = now.saturating_sub(7 * 86400);
         assert!(
             cleanup_chat_in(
@@ -556,7 +554,7 @@ mod tests {
             ),
             "过期会话应清理"
         );
-        // 历史/标记/后端会话文件全清；摘要与会话级 AGENTS.md 保留
+        // 历史/标记全清；摘要与会话级 AGENTS.md 保留；legacy pi 转录保留（tidy 兜底）
         assert!(
             !ws.join("history").join(format!("{esc}.jsonl")).exists(),
             "历史 jsonl 已删"
@@ -573,7 +571,7 @@ mod tests {
                 .exists(),
             "导入标记已删"
         );
-        assert!(!pi_old.exists(), "旧 pi 会话文件已删");
+        assert!(pi_old.exists(), "legacy pi 转录保留（tidy 孤儿清理兜底）");
         assert!(pi_fresh.exists(), "新鲜 pi 文件宁留不删");
         assert!(ses_agents.exists(), "会话级 AGENTS.md 保留");
         assert!(path.exists(), "摘要保留");
@@ -643,33 +641,19 @@ mod tests {
         }
     }
 
-    /// 挡板 agent runner：run 立即返回固定回复（Some）或报错（None）。
-    struct StubRunner {
+    /// 挡板归纳执行器：summarize 立即返回固定回复（Some）或报错（None）。
+    struct StubSummarizer {
         reply: Option<String>,
     }
     #[async_trait::async_trait]
-    impl crate::agent::AgentRunner for StubRunner {
-        #[allow(clippy::too_many_arguments)]
-        async fn run(
+    impl Summarizer for StubSummarizer {
+        async fn summarize(
             &self,
-            _backend: crate::agent::Backend,
             _prompt: &str,
-            session_id: &str,
-            _resume: bool,
-            _chat_id: &str,
-            _session_key: &str,
-            _bot_key: &str,
-            _role: crate::config::SenderRole,
-            _sessions: Option<&crate::sessions::SessionStore>,
-            _progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-            _cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        ) -> Result<crate::agent::RunOutcome, String> {
+            _stop: &tokio_util::sync::CancellationToken,
+        ) -> Result<String, String> {
             match &self.reply {
-                Some(r) => Ok(crate::agent::RunOutcome::Reply {
-                    reply: r.clone(),
-                    session_id: session_id.to_string(),
-                    rebuilt: false,
-                }),
+                Some(r) => Ok(r.clone()),
                 None => Err("后端不可用".into()),
             }
         }
@@ -708,7 +692,7 @@ mod tests {
         let bridge = gc_test_bridge();
         let ws = crate::workspace_dir(&bridge.bot.key());
         seed_gc_chat(&ws, "oc_gc");
-        let stub = StubRunner {
+        let stub = StubSummarizer {
             reply: Some("主题：写周报\n关键结论：无\n待办事项：无\n涉及资源：无".into()),
         };
         let stop = tokio_util::sync::CancellationToken::new();
@@ -722,10 +706,10 @@ mod tests {
             !ws.join("history").join(format!("{esc}.jsonl")).exists(),
             "历史 jsonl 已删"
         );
-        // 转录已清（槽位 sid 精确匹配）
+        // legacy pi 转录保留（P4.2 后槽位无 pi sid，tidy 孤儿清理兜底）
         assert!(
-            !ws.join(".pi-sessions/1000_sid_oc_gc.jsonl").exists(),
-            "pi 转录已删"
+            ws.join(".pi-sessions/1000_sid_oc_gc.jsonl").exists(),
+            "pi 转录保留（tidy 兜底）"
         );
         // 摘要已存档
         assert!(
@@ -733,7 +717,7 @@ mod tests {
             "摘要已落盘"
         );
         // 槽位已删并落盘（新实例读盘验证）
-        let store = crate::sessions::SessionStore::at("claude", ws.join("sessions.json"));
+        let store = crate::sessions::SessionStore::at(ws.join("sessions.json"));
         assert!(store.chat_entry("oc_gc").is_none(), "槽位已删并持久化");
         std::fs::remove_dir_all(&ws).ok();
     }
@@ -744,7 +728,7 @@ mod tests {
         let bridge = gc_test_bridge();
         let ws = crate::workspace_dir(&bridge.bot.key());
         seed_gc_chat(&ws, "oc_gc");
-        let stub = StubRunner { reply: None };
+        let stub = StubSummarizer { reply: None };
         let stop = tokio_util::sync::CancellationToken::new();
         let report = run_once_with_days(&bridge, &stop, 7, &stub).await;
         assert_eq!(report.failed, 1, "归纳失败应计数: {report:?}");
@@ -763,7 +747,7 @@ mod tests {
             !ws.join("summaries").join(format!("{esc}.md")).exists(),
             "无摘要落盘"
         );
-        let store = crate::sessions::SessionStore::at("claude", ws.join("sessions.json"));
+        let store = crate::sessions::SessionStore::at(ws.join("sessions.json"));
         assert!(store.chat_entry("oc_gc").is_some(), "槽位保留");
         std::fs::remove_dir_all(&ws).ok();
     }
@@ -774,7 +758,7 @@ mod tests {
         let bridge = gc_test_bridge();
         let ws = crate::workspace_dir(&bridge.bot.key());
         seed_gc_chat(&ws, "oc_gc");
-        let stub = StubRunner {
+        let stub = StubSummarizer {
             reply: Some("主题：x".into()),
         };
         let stop = tokio_util::sync::CancellationToken::new();
@@ -786,6 +770,65 @@ mod tests {
             "关停中不工作"
         );
         assert!(ws.join("history").join("oc_gc.jsonl").exists(), "历史保留");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// P3.2 全链路：真 oneshot（mock ACP agent）驱动 run_once——buzz bot 的
+    /// 每日归纳端到端可用（候选 → oneshot 回合 → 摘要落盘 → 清理），且摘要
+    /// 不含后端标识后缀。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn run_once_with_real_oneshot_mock_agent() {
+        let bridge = gc_test_bridge();
+        let ws = crate::workspace_dir(&bridge.bot.key());
+        seed_gc_chat(&ws, "oc_gc");
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let agent_cfg = crate::buzz::harness::AgentConfig {
+            command: python3,
+            args: vec![script.display().to_string()],
+            extra_env: vec![
+                ("PATH".to_string(), crate::deps::composed_path()),
+                (
+                    "MOCK_RECORD_FILE".to_string(),
+                    std::env::temp_dir()
+                        .join(format!("abb-gc-mock-{}.jsonl", uuid::Uuid::new_v4()))
+                        .display()
+                        .to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            backend: "mock".to_string(),
+            session_sandbox: None,
+        };
+        let summarizer = ServiceSummarizer::for_test(
+            agent_cfg,
+            ws.display().to_string(),
+            std::time::Duration::from_secs(60),
+        );
+        let stop = tokio_util::sync::CancellationToken::new();
+        let report = run_once_with_days(&bridge, &stop, 7, &summarizer).await;
+        assert_eq!(report.summarized, 1, "mock 回合归纳应成功: {report:?}");
+        assert_eq!(report.failed, 0);
+        let esc = crate::history::escape_key("oc_gc");
+        let summary = std::fs::read_to_string(ws.join("summaries").join(format!("{esc}.md")))
+            .expect("摘要已落盘");
+        assert!(summary.contains("echo:"), "mock 回复入摘要: {summary}");
+        assert!(
+            !summary.contains("── 后端"),
+            "摘要不得带后端标识后缀: {summary}"
+        );
+        assert!(
+            !ws.join("history").join(format!("{esc}.jsonl")).exists(),
+            "历史已清"
+        );
         std::fs::remove_dir_all(&ws).ok();
     }
 }
