@@ -12,7 +12,6 @@ mod botstatus;
 mod bridge;
 mod buzz;
 mod config;
-mod contextsum;
 mod deliver;
 mod deps;
 mod dingtalk;
@@ -48,7 +47,6 @@ mod unread;
 mod updater;
 mod virtualbot;
 mod wechat;
-mod winproc;
 mod ws;
 mod wsver;
 
@@ -891,20 +889,6 @@ fn run_session_cli(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            let cfg = match config::Config::load() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("读 config 失败: {e:#}");
-                    return 1;
-                }
-            };
-            // 后端跟 bot 走（与聊天/定时任务一致），决定 reset 哪个后端槽位
-            let backend = cfg
-                .bots
-                .iter()
-                .find(|b| b.key() == bot_key)
-                .map(|b| b.effective_backend(&cfg.default_backend).to_string())
-                .unwrap_or_else(|| cfg.default_backend.clone());
             let env_chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
             let chat = match session_reset_chat_id(&args[1..], &env_chat) {
                 Ok(c) => c,
@@ -914,7 +898,7 @@ fn run_session_cli(args: &[String]) -> i32 {
                 }
             };
             // #194：虚拟 Bot 群的 reset 路由到独立工作区的 sessions.json
-            let store = sessions::SessionStore::store_for_chat(&backend, &bot_key, &chat);
+            let store = sessions::SessionStore::store_for_chat(&bot_key, &chat);
             let sid = store.reset_session(&chat);
             // 打印完整 UUID：后续要拿它做 --session-id / resume 时截断会误导
             println!(

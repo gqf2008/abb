@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridge"
-version = "2.23.37"
+version = "2.23.39"
 dependencies = [
  "aes",
  "anyhow",
@@ -209,7 +209,6 @@ dependencies = [
  "tracing",
  "turso",
  "uuid",
- "windows-sys 0.61.2",
  "winit",
  "winres",
 ]

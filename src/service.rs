@@ -50,16 +50,12 @@ fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
 /// buzz 语义：`BUZZ_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses 全系
 /// 兼容 env（buzz_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
-/// `uses_buzz_agent=false`（无随包落 pi-acp 兜底）走 `build_injection(Backend::Buzz)`
-/// ——经核对该臂解析到 buzz_provider_env（agent.rs Buzz 臂），与 true 臂殊途同归，
-/// 且与旧 env_for 的 buzz 后端无随包兜底路径（旧代码同样 build_injection(Buzz)）
-/// 语义逐字节一致。装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
+/// 装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
 /// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
-fn buzz_env_for_bot(
-    bot: &crate::config::BotConfig,
-    cfg: &Config,
-    uses_buzz_agent: bool,
-) -> Vec<(String, String)> {
+///（P4.1：原 `uses_buzz_agent=false` 臂走已删的 `build_injection`——经核对该臂本就
+/// 解析到 buzz_provider_env（Buzz 臂）殊途同归；`build_injection` 矩阵随 Backend 一并
+/// 删除后，两臂并一为单一路径，`uses_buzz_agent` 形参随之摘除。）
+fn buzz_env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String, String)> {
     let prov = cfg.resolve_provider(bot).cloned();
     if let Some(p) = prov.as_ref() {
         if p.api_key.trim().is_empty() {
@@ -71,25 +67,12 @@ fn buzz_env_for_bot(
             return Vec::new();
         }
     }
-    if uses_buzz_agent {
-        match crate::agent::buzz_provider_env(prov.as_ref()) {
-            Ok(Some(env)) => env.into_iter().collect(),
-            Ok(None) => Vec::new(), // 无供应商：agent 起来后回合报错（预检已引导配置）
-            Err(e) => {
-                crate::log!("[acp] bot={} 供应商 env 装配失败: {e}", bot.key());
-                Vec::new()
-            }
-        }
-    } else {
-        match crate::agent::build_injection(crate::agent::Backend::Buzz, prov.as_ref()) {
-            Ok(inj) => inj.env.unwrap_or_default().into_iter().collect(),
-            Err(e) => {
-                crate::log!(
-                    "[acp] bot={} 供应商 env 装配失败（该 bot 消息将拒答引导）: {e}",
-                    bot.key()
-                );
-                Vec::new()
-            }
+    match crate::agent::buzz_provider_env(prov.as_ref()) {
+        Ok(Some(env)) => env.into_iter().collect(),
+        Ok(None) => Vec::new(), // 无供应商：agent 起来后回合报错（预检已引导配置）
+        Err(e) => {
+            crate::log!("[acp] bot={} 供应商 env 装配失败: {e}", bot.key());
+            Vec::new()
         }
     }
 }
@@ -165,7 +148,7 @@ fn build_bot_acp_handles(
     let command = buzz_cmd
         .map(str::to_string)
         .unwrap_or_else(|| "pi-acp".to_string());
-    let env = buzz_env_for_bot(bot, cfg, buzz_cmd.is_some());
+    let env = buzz_env_for_bot(bot, cfg);
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .display()
@@ -216,9 +199,8 @@ pub(crate) fn oneshot_agent_config(
     // 命令解析与 build_bot_acp_handles 同链（覆盖指错告警一回/调用——gc 是
     // 日频任务，GUI 是低频点击，重复解析可接受）。
     let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
-    let uses_buzz_agent = buzz_cmd.is_some();
     let command = buzz_cmd.unwrap_or_else(|| "pi-acp".to_string());
-    let env = buzz_env_for_bot(bot, cfg, uses_buzz_agent);
+    let env = buzz_env_for_bot(bot, cfg);
     crate::buzz::harness::AgentConfig {
         command,
         args: Vec::new(),
@@ -850,7 +832,6 @@ async fn run_bot(
     // 首轮延迟 24h + jitter（盐与 session_gc 不同，错开两循环触发分钟）：
     // 启动即跑会对每个 bot 全量扫描写盘 + git 操作，不值得。
     {
-        let bridge = bridge.clone();
         let key = key.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("tidy:{key}").into_boxed_str());
@@ -894,11 +875,8 @@ async fn run_bot(
                 let days = cfg.history_retention_days.max(1);
                 // 孤儿判定依赖 live 集：现取（SessionStore::new 轻量读盘）
                 let live: std::collections::HashSet<String> = {
-                    let store = crate::sessions::SessionStore::new(
-                        &bridge.default_backend,
-                        &key,
-                    );
-                    store.live_session_ids("pi").into_iter().collect()
+                    let store = crate::sessions::SessionStore::new(&key);
+                    store.live_session_ids().into_iter().collect()
                 };
                 let report = crate::tidy::run_once(&workspace, now, days, &live);
                 write_run_marker(&marker, now);
@@ -1295,14 +1273,11 @@ async fn run_job(
         return;
     }
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
-                                                                  // 后端跟 bot 走：bridge.default_backend 已在 Bridge::new 里取 bot.effective_backend(&cfg.default_backend)，
-                                                                  // 与聊天消息同一后端，避免「聊天走 codex、定时任务却跑 claude」的割裂。
-    let backend = crate::agent::Backend::parse(&bridge.default_backend);
+                                                                  //（P4.1：单执行层后 job 恒走随包 buzz-agent，`default_backend`/Backend 解析已删。）
     crate::log!(
-        "[bot:{bot_key}] 触发任务 {} → {}（backend: {}）",
+        "[bot:{bot_key}] 触发任务 {} → {}",
         &job.id[..8],
-        prompt_preview,
-        backend.name()
+        prompt_preview
     );
     // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明 + 三级
     // AGENTS.md 指令文件块（组装抽成 job_prompt 纯函数，可测）。
@@ -1513,12 +1488,10 @@ mod tests {
         cfg.default_provider = "prov-a".into();
         cfg.bots = vec![mk_bot("bot-a", "prov-a"), mk_bot("bot-b", "prov-b")];
 
-        let env_a: std::collections::HashMap<_, _> = buzz_env_for_bot(&cfg.bots[0], &cfg, true)
-            .into_iter()
-            .collect();
-        let env_b: std::collections::HashMap<_, _> = buzz_env_for_bot(&cfg.bots[1], &cfg, true)
-            .into_iter()
-            .collect();
+        let env_a: std::collections::HashMap<_, _> =
+            buzz_env_for_bot(&cfg.bots[0], &cfg).into_iter().collect();
+        let env_b: std::collections::HashMap<_, _> =
+            buzz_env_for_bot(&cfg.bots[1], &cfg).into_iter().collect();
         assert_eq!(
             env_a.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
             Some("sk-a")
@@ -1535,14 +1508,14 @@ mod tests {
         // 空 API Key 硬闸：env 置空（预检按 NoProvider 拒答引导），不注入半截 env
         let mut cfg2 = cfg.clone();
         cfg2.providers[1].api_key = "  ".into();
-        assert!(buzz_env_for_bot(&cfg2.bots[1], &cfg2, true).is_empty());
+        assert!(buzz_env_for_bot(&cfg2.bots[1], &cfg2).is_empty());
         // 无供应商（provider 名指向不存在）→ 空 env 不炸
         let cfg3 = {
             let mut c = cfg.clone();
             c.bots[1].provider = "ghost".into();
             c
         };
-        assert!(buzz_env_for_bot(&cfg3.bots[1], &cfg3, true).is_empty());
+        assert!(buzz_env_for_bot(&cfg3.bots[1], &cfg3).is_empty());
     }
 
     /// P2.2：normal handle 的 `_meta` 档位映射——sandbox_mode 解析成具体档。
