@@ -921,8 +921,11 @@ mod tests {
     ///
     /// 驱动的是实现体 `ensure_vb_dir_at`（目录已给定），全程临时目录——**不碰用户
     /// 真实的 `~/.agent-bridge/virtual-bots.json`**（那是整表原子重写、无锁，
-    /// 与 GUI/事件的并发登记会互相覆盖；审查 P2-2）。登记表查询是既有行为，
-    /// 由 vb_dir_for 既有用例覆盖。
+    /// 与 GUI/事件的并发登记会互相覆盖；审查 P2-2）。
+    ///
+    /// 代价：`ensure_vb_dir` 的「查登记 → 委托实现体」这一层没有直测。它本来就
+    /// 没有——`vb_dir_for` 硬编码真实 `bridge_dir()`、无注入缝，仓库里除生产调用点
+    /// 外无人调用；store 层语义另由 `store_add_remove_roundtrip` 等用例覆盖。
     #[test]
     fn ensure_vb_dir_writes_workspace_guide() {
         let base = std::env::temp_dir().join(format!("abb-vb-guide-{}", uuid::Uuid::new_v4()));
