@@ -586,7 +586,7 @@ impl Bridge {
                 );
                 self.pending.remove(&ev.mid);
                 if let Err(e) = self
-                    .send_reply(&ev, &format!("⚠️ buzz 后端无法处理本条消息：{why}。"))
+                    .send_reply(&ev, &format!("⚠️ 无法处理本条消息：{why}。"))
                     .await
                 {
                     crate::log!(

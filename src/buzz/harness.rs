@@ -100,8 +100,10 @@ pub struct AgentConfig {
     /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同，
     /// 见 docs/buzz-port-sync.md）。
     pub extra_env: Vec<(String, String)>,
-    /// ABB 后端标识（claude/codex/pi/buzz）——agent 回复尾部标注用
-    ///（多后端热切换下用户可核验路由；与适配器进程身份解耦）。
+    /// ABB 后端标识（单后端化后恒 "buzz"）。P4.3 删除回复尾部「── 后端：X」
+    /// 标注后暂无消费方——字段保留作配置透传（service → handle）与将来日志
+    /// 标注用；移除它要牵动 service/测试全部构造点，留给后续清理批次。
+    #[allow(dead_code)] // 暂无读方（P4.3 后缀标注已删），见上行注释——后续批次移除
     pub backend: String,
     /// 本 handle 全部会话的执行档位载荷（单后端化 P2.2）：随 `session/new`
     /// `_meta` 下发。normal handle = bot 配置档（`sandbox_mode` 解析产物，
@@ -125,7 +127,7 @@ pub struct TurnOutput {
 /// 区分超时/关闭/agent 错误；job 路径的 `wait_turn_text` 仍折叠成 Option。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncTurnOutcome {
-    /// 回合文本（含后端标识后缀，与 chat 投递同款处理）。
+    /// 回合文本（与 chat 投递同款处理；P4.3 起不再附后端标识后缀）。
     Ok(String),
     /// 调用方预算先到（在途回合可能仍在跑——调用方负责 cancel 防迟发）。
     Timeout,
@@ -140,11 +142,6 @@ pub enum SyncTurnOutcome {
     /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
     Failed(String),
 }
-
-/// 后端标识后缀的行前标记（P3.2 常量化）：`handle_prompt_result` Ok 臂给回合
-/// 文本追加 `── 后端：X`（chat 投递的路由标注），oneshot 消费方（摘要/prompt/
-/// JSON）按同一标记剥除——单一来源，防两处文案漂移。
-pub(crate) const BACKEND_SUFFIX_MARK: &str = "\n── 后端：";
 
 enum Cmd {
     Message {
@@ -1026,14 +1023,8 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 // 恰好是技能路径」的行改写成技能名，其余行一律不动（窄模式：
                 // 只有纯路径行会命中，正常提及路径的叙述不受影响）。
                 let text = redact_skill_paths(&text);
-                // 后端标识后缀：每个 agent 回复尾部标注实际后端（chat/job 两
-                // 路径同款；多后端热切换下用户可核验路由）。空文本不加。
-                // 标记与 oneshot 剥除处同常量化（BACKEND_SUFFIX_MARK）。
-                let text = if text.trim().is_empty() {
-                    text
-                } else {
-                    format!("{text}{BACKEND_SUFFIX_MARK}{}", handle.cfg.backend)
-                };
+                // P4.3：后端标识后缀（`── 后端：X`）已删——执行层收口随包
+                // buzz-agent 单一后端，路由核验维度消亡，回复正文即最终文本。
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
                 // 同步等待者（job/oneshot 路径）旁路：文本直接回传，不产生 chat 投递

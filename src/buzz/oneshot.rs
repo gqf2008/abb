@@ -132,12 +132,15 @@ pub async fn oneshot_turn(
     }
 }
 
-/// 剥除 harness Ok 臂追加的后端标识后缀（`── 后端：X`）：它是 chat 投递的路由
-/// 标注（用户核验路由用），oneshot 消费方——摘要存档（P3.2）/角色 prompt
-/// （P3.3）/团队 JSON（P3.4，后缀会直接打死解析）——一律不需要。取最后一个
-/// 标记切尾（模型正文若含同款字面量，harness 追加的恒在最后）。无标记原样返回。
+/// 剥除回合文本尾部的后端标识后缀（`── 后端：X`）。P4.3 起 harness Ok 臂已
+/// 不再追加该后缀（单后端化完成，路由核验维度消亡），本函数实际恒为无-op——
+/// 剥除逻辑保留作防御：升级前已在途/迟发的带后缀文本、以及任何历史残留，
+/// 消费方（摘要存档 P3.2 / 角色 prompt P3.3 / 团队 JSON P3.4，后缀会直接
+/// 打死解析）依旧不携带它。取最后一个标记切尾（模型正文若含同款字面量，
+/// 真后缀恒在最后）。无标记原样返回。标记字面量就地内联（harness 侧的
+/// BACKEND_SUFFIX_MARK 常量已随追加处一并删除）。
 fn strip_backend_suffix(text: &str) -> String {
-    match text.rfind(super::harness::BACKEND_SUFFIX_MARK) {
+    match text.rfind("\n── 后端：") {
         Some(i) => text[..i].trim_end().to_string(),
         None => text.to_string(),
     }

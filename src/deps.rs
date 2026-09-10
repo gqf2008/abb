@@ -1,6 +1,8 @@
-//! 依赖检测与安装 —— claude / codex / pi / nodejs / python3 / lark-cli / dingtalk-cli。
+//! 依赖检测与安装 —— nodejs / lark-cli / dingtalk-cli / git（python3 为信息项）。
+//! 单后端化 P4.3：claude / codex / pi 三后端 CLI 与 ACP 适配器三件套的探测+安装臂
+//! 已随 UI 下架删除——执行层收口随包 buzz-agent（零安装），本机不再要求任何 agent CLI。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
-//! 安装命令按平台出（mac 用 brew/npm/curl 安装器，win 用 winget/npm，linux 用 apt/dnf/npm）。
+//! 安装命令按平台出（mac 用 brew/npm，win 用 winget/npm，linux 用 apt/dnf/npm）。
 //! 本轮只验证 mac 路径；win/linux 编译可用、不行则给「请手动安装」文案。
 //!
 //! 从 agent.rs 挪来 composed_path/find_in_path/is_executable（原 Unix-only），并扩展。
@@ -232,18 +234,15 @@ fn is_executable(p: &std::path::Path) -> bool {
 }
 
 /// 单个依赖的检测结果。
-/// #93 codex 最低版本锁定：与 agent.rs codex_command 的 OS 沙箱能力对齐（issues/93：
-/// 「最低版本锁定，如 >= 0.140」）。低于此版本视为「需升级」（进一键安装清单 / UI 显示
-/// 升级态），缺失视为「需安装」。
-pub const MIN_CODEX_VERSION: &str = "0.140";
-
-/// #105 git 最低版本锁定：< 2.30 视为「需升级」（2.30 起覆盖后续安全修复；
-/// 删除保护 git 留痕（#88）与 tidy 每日整理（#104 已核实）都依赖 git）。
+/// #105 git 最低版本锁定：< 2.30 视为「需升级」（2.30 起覆盖后续安全修复）。
+/// P4.3 起保留 git 的理由：larkskills 技能同步（git clone/fetch）与受限会话
+/// agent 的只读 git 白名单都用系统 git——原「删除保护/tidy git 留痕依赖系统 git」
+/// 的理由已随 #209 迁移内置 libgit2 失效（不再依赖系统 git）。
 pub const MIN_GIT_VERSION: &str = "2.30";
 
 #[derive(Debug, Clone)]
 pub struct DepStatus {
-    /// 机器键：claude | codex | pi | node | python3 | lark-cli | dingtalk-cli
+    /// 机器键：node | python3 | lark-cli | dingtalk-cli | git
     pub id: &'static str,
     /// 展示名。
     pub label: &'static str,
@@ -251,17 +250,18 @@ pub struct DepStatus {
     /// 找到时的可执行路径（未找到为空）。当前 UI 只显 found，路径留作排障/将来展示。
     #[allow(dead_code)]
     pub path: String,
-    /// 已装版本字符串（仅 codex 做版本探测；其它依赖为空串）。
+    /// 已装版本字符串（仅 git 做版本探测；其它依赖为空串）。
     pub version: String,
-    /// 版本是否满足最低要求（仅 codex 有最低版本锁定，见 MIN_CODEX_VERSION；
+    /// 版本是否满足最低要求（仅 git 有最低版本锁定，见 MIN_GIT_VERSION；
     /// 未找到恒 false，其它依赖恒 true）。
     pub version_ok: bool,
 }
 
 /// 检测全部依赖。设置窗打开 + 「重新检测」时调。
 /// node 探 `node`；python 先试 `python3` 再 `python`；lark-cli 用于技能引导门控。
-/// codex 额外做版本探测（#93 最低版本锁定，见 MIN_CODEX_VERSION）；
 /// git 额外做版本探测（#105 最低版本锁定，见 MIN_GIT_VERSION）。
+/// python3 是信息项：运行时无消费方（仅源码开发的 mock fixture 用），
+/// 不进缺失清单/一键安装（见 missing_dep_ids）。
 pub fn detect_all() -> Vec<DepStatus> {
     let probe = |id: &'static str, label: &'static str, names: &[&str]| -> DepStatus {
         for n in names {
@@ -285,30 +285,10 @@ pub fn detect_all() -> Vec<DepStatus> {
             version_ok: false,
         }
     };
-    let codex = probe("codex", "Codex CLI", &["codex"]);
-    let codex = if codex.found {
-        // 版本探测失败（`codex --version` 跑不通）保守按「可用」放行：能跑 codex 就
-        // 大概率能跑 --version，探测失败的场景极少；若按「不满足」会假阳性地一直提示
-        // 升级，误伤已装用户（每次启动都被引导）。权衡后取放行。
-        match codex_version(&codex.path) {
-            Some(v) => DepStatus {
-                version: v.clone(),
-                version_ok: version_at_least(&v, MIN_CODEX_VERSION),
-                ..codex
-            },
-            None => DepStatus {
-                version: String::new(),
-                version_ok: true,
-                ..codex
-            },
-        }
-    } else {
-        codex
-    };
     let git = probe("git", "Git", &["git"]);
     let git = if git.found {
-        // git 版本探测失败保守按「可用」放行（与 codex 同权衡：能跑 git 就大概率能
-        // 跑 --version；按不满足会假阳性一直提示升级）。
+        // git 版本探测失败保守按「可用」放行：能跑 git 就大概率能跑 --version，
+        // 探测失败的场景极少；若按「不满足」会假阳性地一直提示升级，误伤已装用户。
         match git_version(&git.path) {
             Some(v) => DepStatus {
                 version: v.clone(),
@@ -325,20 +305,6 @@ pub fn detect_all() -> Vec<DepStatus> {
         git
     };
     vec![
-        probe("claude", "Claude Code", &["claude"]),
-        codex,
-        // pi：npm 全局 bin（~/.npm-global/bin/pi，软链到 pi-coding-agent 的 cli.js）
-        probe("pi", "Pi (pi-coding-agent)", &["pi"]),
-        // ACP 适配器（单轨执行层）：harness 按名解析的 npm 全局包。装 agent 本体
-        // 不等于装适配器——缺适配器时该后端预检 AgentDown 拒答（实机：Windows
-        // 新机只有 codex CLI 无 codex-acp，聊天全挂）。
-        probe("pi-acp", "pi ACP 适配器 (pi-acp)", &["pi-acp"]),
-        probe("codex-acp", "codex ACP 适配器 (codex-acp)", &["codex-acp"]),
-        probe(
-            "claude-acp",
-            "claude ACP 适配器 (claude-agent-acp)",
-            &["claude-agent-acp"],
-        ),
         probe("node", "Node.js", &["node"]),
         probe("python3", "Python 3", &["python3", "python"]),
         probe("lark-cli", "lark-cli", &["lark-cli"]),
@@ -348,49 +314,10 @@ pub fn detect_all() -> Vec<DepStatus> {
     ]
 }
 
-/// 跑 `codex --version` 解析版本号。跑不通/非零退出 → None。
-pub fn codex_version(exe: &str) -> Option<String> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--version");
-    // Windows：依赖检测跑 codex --version 也抑制控制台窗口（#104），
-    // 否则每次「环境检测/一键安装」都会闪一个黑框。
-    #[cfg(windows)]
-    {
-        apply_no_window(&mut cmd);
-    }
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    codex_version_from_text(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// 从 `codex --version` 输出文本里提取版本号。输出形如 `codex-cli 0.146.0`
-/// （也可能带 build 后缀，如 `codex-cli 0.146.0 (abc1234)`）→ 返回 `0.146.0`。
-/// 找不到形如 `d+.d+` 的 token → None。
-pub fn codex_version_from_text(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .find(|tok| {
-            let head: String = tok
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            !head.is_empty()
-                && head.split('.').count() >= 2
-                && head
-                    .split('.')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        })
-        .map(|tok| {
-            tok.chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect()
-        })
-}
-
 //（P4.1：codex_version_cached / codex_version_at_least_cached 已删——唯一调用方是旧
-// agent::run 的 codex 版本门控，随 Backend 一并退役；codex_version / version_at_least
-// 保留，deps 环境页 codex 探测仍用，见 P4.3 处置范围。）
+// agent::run 的 codex 版本门控，随 Backend 一并退役。P4.3 落地时 codex_version /
+// codex_version_from_text 一并删除：环境页 codex 探测行随 P4.3 下架，两函数成测试
+// 死码，依 winproc 同例整体删除；version_at_least 保留——git 探测的 version_ok 仍用。）
 
 /// 跑 `git --version` 解析版本号。跑不通/非零退出 → None。
 pub fn git_version(exe: &str) -> Option<String> {
@@ -486,65 +413,15 @@ impl InstallStep {
     }
 }
 
-/// ACP 适配器（单轨执行层）npm 包表：检测键 → npm 包名。
-/// 键必须与 detect_all 的 probe id 一致——run_install 按装后 detect_one(key) 逐键复检。
-/// claude-acp/codex-acp 的包名带 @agentclientprotocol scope（codex-acp 曾误用
-/// @openai/codex-acp 致 npm 404）；pi-acp 为 pi-coding-agent 生态的非 scoped 包。
-pub(crate) const ACP_ADAPTERS: &[(&str, &str)] = &[
-    ("claude-acp", "@agentclientprotocol/claude-agent-acp"),
-    ("codex-acp", "@agentclientprotocol/codex-acp"),
-    ("pi-acp", "pi-acp"),
-];
-
-/// ACP 适配器安装计划（三平台同构：npm 全局装，故在平台分块之前统一出计划，
-/// 不随平台重复三份臂）。单件 id（claude-acp/codex-acp/pi-acp）供一键安装按
-/// 缺失项逐件装；组合 id "acp-adapters" 供环境配置页「一条按钮装三个」。
-fn acp_adapters_plan(dep_id: &str) -> Option<Vec<InstallStep>> {
-    let npm_step = |pkg: &str| InstallStep::exec("npm", &["install", "-g", pkg]);
-    if dep_id == "acp-adapters" {
-        return Some(ACP_ADAPTERS.iter().map(|(_, pkg)| npm_step(pkg)).collect());
-    }
-    ACP_ADAPTERS
-        .iter()
-        .find(|(key, _)| *key == dep_id)
-        .map(|(_, pkg)| vec![npm_step(pkg)])
-}
-
 /// 出某依赖在当前平台的安装步骤序列（顺序执行，前一步失败即中止）。
 /// 不存在的依赖 id / 该平台无法自动装 → Err（用户可见文案）。
 /// （各平台是独立 #[cfg] 块，块内显式 return；clippy 的 needless_return 在此不适用。）
 #[allow(clippy::needless_return)]
 fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
-    if let Some(plan) = acp_adapters_plan(dep_id) {
-        return Ok(plan);
-    }
     #[cfg(target_os = "macos")]
     {
         let plan = match dep_id {
-            // claude 官方原生安装器（无需 node），落 ~/.local/bin；回落 npm。
-            "claude" => vec![
-                InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
-                InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
-            ],
-            "codex" => vec![
-                InstallStep::exec("npm", &["install", "-g", "@openai/codex"]),
-                InstallStep::exec("brew", &["install", "codex"]),
-            ],
-            // pi：官方安装器（curl pi.dev/install.sh，无需 node）；回落 npm。
-            "pi" => vec![
-                InstallStep::shell("curl -fsSL https://pi.dev/install.sh | sh"),
-                InstallStep::exec(
-                    "npm",
-                    &[
-                        "install",
-                        "-g",
-                        "--ignore-scripts",
-                        "@earendil-works/pi-coding-agent",
-                    ],
-                ),
-            ],
             "node" => vec![InstallStep::exec("brew", &["install", "node"])],
-            "python3" => vec![InstallStep::exec("brew", &["install", "python"])],
             "lark-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "@larksuite/cli"],
@@ -574,28 +451,7 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     #[cfg(target_os = "windows")]
     {
         let plan = match dep_id {
-            "claude" => vec![InstallStep::exec(
-                "npm",
-                &["install", "-g", "@anthropic-ai/claude-code"],
-            )],
-            "codex" => vec![InstallStep::exec(
-                "npm",
-                &["install", "-g", "@openai/codex"],
-            )],
-            "pi" => vec![InstallStep::exec(
-                "npm",
-                &[
-                    "install",
-                    "-g",
-                    "--ignore-scripts",
-                    "@earendil-works/pi-coding-agent",
-                ],
-            )],
             "node" => vec![InstallStep::exec("winget", &["install", "OpenJS.NodeJS"])],
-            "python3" => vec![InstallStep::exec(
-                "winget",
-                &["install", "Python.Python.3.12"],
-            )],
             "lark-cli" => vec![InstallStep::exec(
                 "npm",
                 &["install", "-g", "@larksuite/cli"],
@@ -624,32 +480,10 @@ fn install_plan(dep_id: &str) -> Result<Vec<InstallStep>, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let plan = match dep_id {
-            "claude" => vec![
-                InstallStep::shell("curl -fsSL https://claude.ai/install.sh | bash"),
-                InstallStep::exec("npm", &["install", "-g", "@anthropic-ai/claude-code"]),
-            ],
-            "codex" => vec![InstallStep::exec(
-                "npm",
-                &["install", "-g", "@openai/codex"],
-            )],
-            "pi" => vec![InstallStep::exec(
-                "npm",
-                &[
-                    "install",
-                    "-g",
-                    "--ignore-scripts",
-                    "@earendil-works/pi-coding-agent",
-                ],
-            )],
             // linux 包管理器按二进制探测：优先 apt-get，其次 dnf。
             "node" => vec![InstallStep::shell(
                 "if command -v apt-get >/dev/null; then sudo apt-get install -y nodejs npm; \
                      elif command -v dnf >/dev/null; then sudo dnf install -y nodejs npm; \
-                     else echo 'no-supported-pkg-mgr' >&2; exit 1; fi",
-            )],
-            "python3" => vec![InstallStep::shell(
-                "if command -v apt-get >/dev/null; then sudo apt-get install -y python3; \
-                     elif command -v dnf >/dev/null; then sudo dnf install -y python3; \
                      else echo 'no-supported-pkg-mgr' >&2; exit 1; fi",
             )],
             "lark-cli" => vec![InstallStep::exec(
@@ -693,42 +527,18 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
         match run_step(step).await {
             Ok(tail) => {
                 // 该步退出 0：再确认依赖真的可用了（有些安装器 0 退出但需重开 shell 才上 PATH）。
-                // #93/#105：codex/git 装完还要过最低版本锁（旧版缓存/降级场景少见，但过一下更稳）。
-                // "acp-adapters" 是组合 id（无单点探测）：逐键复检三个适配器，全中就收。
-                let ok_after = if dep_id == "acp-adapters" {
-                    ACP_ADAPTERS
-                        .iter()
-                        .all(|(key, _)| detect_one(key).map(|d| d.found).unwrap_or(false))
-                } else {
-                    detect_one(dep_id)
-                        .map(|d| {
-                            d.found && !((dep_id == "codex" || dep_id == "git") && !d.version_ok)
-                        })
-                        .unwrap_or(false)
-                };
+                // #105：git 装完还要过最低版本锁（旧版缓存/降级场景少见，但过一下更稳）。
+                let ok_after = detect_one(dep_id)
+                    .map(|d| d.found && !(dep_id == "git" && !d.version_ok))
+                    .unwrap_or(false);
                 if ok_after {
                     crate::log!("[deps] {dep_id} 安装成功（步骤{}）", i + 1);
-                    // #93 登录引导：codex 装完给下一步指引（装完即能用的最后一公里）。
-                    // 不自动跑 codex login（交互式浏览器授权，GUI 里无人值守会挂死）；
-                    // 硬闸后 CLI 登录态不再被 ABB 使用，引导统一走供应商页。
-                    // 状态行要精简：不返回 npm/brew 的冗长输出，只回引导文案。
-                    if dep_id == "codex" {
-                        return Ok(
-                            "✅ codex 安装完成。请到「设置 → 模型供应商」添加 OpenAI / DeepSeek / OpenRouter 供应商并设为默认（未配置供应商的 bot 会拒答）。"
-                                .to_string(),
-                        );
-                    }
                     return Ok(tail);
                 }
-                // 组合 id（acp-adapters）无单点可探测，误报「未在 PATH 找到 acp-adapters」
-                // 会误导用户；其失败文案在循环结束后按缺件点名给出（真实步骤错误仍保留
-                // 在 last_err，供点名文案当上下文）。
-                if dep_id != "acp-adapters" {
-                    last_err = format!(
-                        "步骤{}跑完但未在 PATH 找到 {dep_id}（可能需重开终端/刷新 PATH）",
-                        i + 1
-                    );
-                }
+                last_err = format!(
+                    "步骤{}跑完但未在 PATH 找到 {dep_id}（可能需重开终端/刷新 PATH）",
+                    i + 1
+                );
                 crate::log!(
                     "[deps] {dep_id} 步骤{} 退出0但检测不到，尝试回落步骤",
                     i + 1
@@ -739,31 +549,6 @@ pub async fn run_install(dep_id: &str) -> Result<String, String> {
                 last_err = e;
             }
         }
-    }
-    // "acp-adapters" 是组合 id：本身不出现在 PATH，报错要点名仍缺的适配器
-    //（步骤级 last_err 里的 "未在 PATH 找到 acp-adapters" 会误导用户）。
-    if dep_id == "acp-adapters" {
-        let missing: Vec<&str> = ACP_ADAPTERS
-            .iter()
-            .filter(|(key, _)| !detect_one(key).map(|d| d.found).unwrap_or(false))
-            .map(|(_, pkg)| *pkg)
-            .collect();
-        if missing.is_empty() {
-            // 三个都已装好却走到这：理论上不可达（装好后 ok_after 即返回 Ok），兜底防呆
-            return Ok(String::new());
-        }
-        // last_err 是「最后一步」的真实错误，未必属于仍缺的那个包——按事实标注
-        // 而不是并置，防张冠李戴；全步骤 0 退出仅探测不到（PATH 未刷新）时为空，
-        // 括号整段省略。
-        let ctx = if last_err.is_empty() {
-            String::new()
-        } else {
-            format!("（最后一步错误：{last_err}）")
-        };
-        return Err(format!(
-            "acp-adapters 安装失败：仍缺 {}{ctx}",
-            missing.join("、")
-        ));
     }
     Err(format!("{dep_id} 安装失败：{last_err}"))
 }
@@ -930,13 +715,17 @@ pub fn classify_fail(dep_id: &str, err: &str) -> FailedItem {
 const ALL_INSTALL_DEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// 缺失清单：node 恒在最前（其它 npm 计划的前置），其余按 detect_all 顺序。纯函数。
+/// python3 是信息项（运行时无消费方），不进缺失清单——一键安装不为它跑安装器。
 pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for d in deps {
-        // #93/#105：codex/git 已装但版本低于最低锁定（MIN_CODEX_VERSION /
-        // MIN_GIT_VERSION）也进清单——一键安装/单项安装会重跑安装器升级到最新。
-        // 其余依赖只看 found。
-        if !d.found || ((d.id == "codex" || d.id == "git") && !d.version_ok) {
+        // 信息项：只展示，不算缺失
+        if d.id == "python3" {
+            continue;
+        }
+        // #105：git 已装但版本低于最低锁定（MIN_GIT_VERSION）也进清单——
+        // 一键安装/单项安装会重跑安装器升级到最新。其余依赖只看 found。
+        if !d.found || (d.id == "git" && !d.version_ok) {
             ids.push(d.id.to_string());
         }
     }
@@ -950,9 +739,9 @@ pub fn missing_dep_ids(deps: &[DepStatus]) -> Vec<String> {
     ids
 }
 
-/// 该依赖安装是否需要 node/npm 已就绪：安装计划首步用 npm（win 的 claude/pi 首步是
-/// npm；mac 的 claude/pi 是 curl shell 不依赖 node）。纯函数（内部调 install_plan），
-/// 供「node 失败 → 跳过」判定。
+/// 该依赖安装是否需要 node/npm 已就绪：安装计划首步用 npm（lark-cli/dingtalk-cli
+/// 三平台首步都是 npm；node/git 走 brew/winget/包管理器不依赖 node）。纯函数
+/// （内部调 install_plan），供「node 失败 → 跳过」判定。
 fn install_needs_node(dep_id: &str) -> bool {
     install_plan(dep_id)
         .ok()
@@ -991,8 +780,7 @@ pub fn format_all_summary(o: &AllInstallOutcome) -> String {
 
 /// 一键安装全部缺失组件（#60）。on_evt 在每项开始前同步调用（非 async 闭包，await
 /// 间隙之间触发）。策略：继续不中断 + 如实汇总；node 失败后跳过需 node/npm 的依赖
-/// （npm 首步计划；mac 的 claude/pi 走 curl 原生路径不受影响）；
-/// 每项 20 分钟超时。
+/// （npm 首步计划；node/git 走 brew/winget 不受影响）；每项 20 分钟超时。
 pub async fn install_all_missing(mut on_evt: impl FnMut(InstallEvt) + Send) -> AllInstallOutcome {
     let mut outcome = AllInstallOutcome::default();
     let deps = detect_all();
@@ -1480,37 +1268,18 @@ mod tests {
     #[test]
     fn version_at_least_gates() {
         // 满足
-        assert!(version_at_least("0.146.0", MIN_CODEX_VERSION));
-        assert!(version_at_least("0.140.0", MIN_CODEX_VERSION));
-        assert!(version_at_least("0.140.1", MIN_CODEX_VERSION));
-        assert!(version_at_least("1.0.0", MIN_CODEX_VERSION));
-        assert!(version_at_least("0.200", MIN_CODEX_VERSION)); // 缺段补 0
-                                                               // 不满足
-        assert!(!version_at_least("0.139.9", MIN_CODEX_VERSION));
-        assert!(!version_at_least("0.14", MIN_CODEX_VERSION)); // 0.14 < 0.140
-        assert!(!version_at_least("0.1.99", MIN_CODEX_VERSION));
+        assert!(version_at_least("0.146.0", "0.140"));
+        assert!(version_at_least("0.140.0", "0.140"));
+        assert!(version_at_least("0.140.1", "0.140"));
+        assert!(version_at_least("1.0.0", "0.140"));
+        assert!(version_at_least("0.200", "0.140")); // 缺段补 0
+                                                     // 不满足
+        assert!(!version_at_least("0.139.9", "0.140"));
+        assert!(!version_at_least("0.14", "0.140")); // 0.14 < 0.140
+        assert!(!version_at_least("0.1.99", "0.140"));
         // 解析失败保守 false
-        assert!(!version_at_least("abc", MIN_CODEX_VERSION));
+        assert!(!version_at_least("abc", "0.140"));
         assert!(!version_at_least("0.146.0", "not-a-version"));
-    }
-
-    #[test]
-    fn codex_version_parses_cli_output() {
-        // codex --version 实测输出形态：`codex-cli 0.146.0`（新版可能带 build 后缀）。
-        assert_eq!(
-            codex_version_from_text("codex-cli 0.146.0"),
-            Some("0.146.0".into())
-        );
-        assert_eq!(
-            codex_version_from_text("codex-cli 0.146.0 (abc1234)\n"),
-            Some("0.146.0".into())
-        );
-        assert_eq!(
-            codex_version_from_text("@openai/codex 0.140.0"),
-            Some("0.140.0".into())
-        );
-        assert_eq!(codex_version_from_text("未知版本"), None);
-        assert_eq!(codex_version_from_text(""), None);
     }
 
     #[test]
@@ -1534,27 +1303,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_deps_includes_version_low_codex() {
+    fn missing_deps_includes_version_low_git() {
         // 已装但版本过低 → 进缺失清单（升级路径）
         let low = DepStatus {
-            id: "codex",
-            label: "Codex CLI",
+            id: "git",
+            label: "Git",
             found: true,
             path: String::new(),
-            version: "0.139.0".into(),
+            version: "2.29.3".into(),
             version_ok: false,
         };
         let ok = DepStatus {
-            id: "codex",
-            label: "Codex CLI",
+            id: "git",
+            label: "Git",
             found: true,
             path: String::new(),
-            version: "0.146.0".into(),
+            version: "2.39.2".into(),
             version_ok: true,
         };
         let missing = missing_dep_ids(&[low]);
-        assert_eq!(missing, vec!["codex".to_string()], "版本过低应进安装清单");
+        assert_eq!(missing, vec!["git".to_string()], "版本过低应进安装清单");
         assert!(missing_dep_ids(&[ok]).is_empty(), "版本满足不应进清单");
+    }
+
+    #[test]
+    fn missing_deps_excludes_info_only_python3() {
+        // python3 是信息项：未装也不进缺失清单（运行时无消费方）
+        let missing = missing_dep_ids(&[dep("python3", false)]);
+        assert!(missing.is_empty(), "python3 不进缺失清单: {missing:?}");
     }
 
     #[test]
@@ -1562,12 +1338,12 @@ mod tests {
         // 分类矩阵：每类构造代表性错误串 → 断言 kind + advice 非空
         let cases = [
             (
-                "codex",
+                "node",
                 "退出码 1：EACCES: permission denied",
                 FailKind::Permission,
             ),
             (
-                "codex",
+                "git",
                 "退出码 1：curl: (7) Failed to connect",
                 FailKind::Network,
             ),
@@ -1577,21 +1353,25 @@ mod tests {
                 FailKind::CommandMissing,
             ),
             (
-                "pi",
+                "dingtalk-cli",
                 "找不到 npm（请先装它的前置依赖）",
                 FailKind::CommandMissing,
             ),
             (
-                "claude",
+                "lark-cli",
                 "安装超时（20 分钟），可能卡在网络或系统弹窗",
                 FailKind::Timeout,
             ),
             (
-                "codex",
-                "步骤1跑完但未在 PATH 找到 codex（可能需重开终端/刷新 PATH）",
+                "git",
+                "步骤1跑完但未在 PATH 找到 git（可能需重开终端/刷新 PATH）",
                 FailKind::Path,
             ),
-            ("pi", "退出码 2：some unknown error text", FailKind::Other),
+            (
+                "dingtalk-cli",
+                "退出码 2：some unknown error text",
+                FailKind::Other,
+            ),
         ];
         for (id, err, expect) in cases {
             let f = classify_fail(id, err);
@@ -1613,61 +1393,35 @@ mod tests {
     }
 
     #[test]
-    fn detect_all_covers_eleven() {
+    fn detect_all_covers_five() {
         let all = detect_all();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 5);
         let ids: Vec<&str> = all.iter().map(|d| d.id).collect();
-        for want in [
-            "claude",
-            "codex",
-            "pi",
-            "pi-acp",
-            "codex-acp",
-            "claude-acp",
-            "node",
-            "python3",
-            "lark-cli",
-            "dingtalk-cli",
-            "git",
-        ] {
+        for want in ["node", "python3", "lark-cli", "dingtalk-cli", "git"] {
             assert!(ids.contains(&want), "缺 {want}");
         }
     }
 
     #[test]
     fn install_plan_known_unknown() {
-        assert!(install_plan("claude").is_ok());
-        assert!(install_plan("codex").is_ok());
-        assert!(install_plan("pi").is_ok());
         assert!(install_plan("node").is_ok());
-        assert!(install_plan("python3").is_ok());
         assert!(install_plan("lark-cli").is_ok());
         assert!(install_plan("dingtalk-cli").is_ok());
-        assert!(install_plan("acp-adapters").is_ok());
-        // 单件臂：一键安装按缺失项逐件装（曾只有组合 id 而 missing 清单给的是单件
-        // id → 一键装永远报「未知依赖」，适配器装不上，见 a3eb382 后续修复）。
-        assert!(install_plan("pi-acp").is_ok());
-        assert!(install_plan("codex-acp").is_ok());
-        assert!(install_plan("claude-acp").is_ok());
-        assert!(install_plan("nope").is_err());
-    }
-
-    #[test]
-    fn acp_adapters_plan_aligns_with_probes() {
-        // 组合 id 与单件 id 同表同包；表键必须与 detect_all 的 probe id 对齐
-        //（曾脱节：probe 出 pi-acp/codex-acp/claude-acp，安装计划只认组合 id）。
-        let probe_ids: Vec<&str> = detect_all().iter().map(|d| d.id).collect();
-        for (key, pkg) in ACP_ADAPTERS {
-            assert!(probe_ids.contains(key), "detect_all 缺 probe {key}");
-            let plan = acp_adapters_plan(key).unwrap_or_else(|| panic!("缺单件计划 {key}"));
-            assert_eq!(plan.len(), 1, "{key} 应为单步计划");
-            assert_eq!(plan[0].program, "npm");
-            assert_eq!(plan[0].args, vec!["install", "-g", *pkg]);
+        assert!(install_plan("git").is_ok());
+        // P4.3 下架的三后端 CLI 与 ACP 适配器 id 一律走「未知依赖」
+        for gone in [
+            "claude",
+            "codex",
+            "pi",
+            "pi-acp",
+            "codex-acp",
+            "claude-acp",
+            "acp-adapters",
+            "python3",
+        ] {
+            assert!(install_plan(gone).is_err(), "{gone} 应已下架");
         }
-        let bundle = acp_adapters_plan("acp-adapters").expect("组合计划");
-        assert_eq!(bundle.len(), ACP_ADAPTERS.len());
-        assert!(bundle.iter().all(|s| s.program == "npm"));
-        assert!(acp_adapters_plan("nope").is_none());
+        assert!(install_plan("nope").is_err());
     }
 
     #[cfg(target_os = "macos")]
@@ -1751,55 +1505,41 @@ mod tests {
             .map(|d| dep(d.id, false))
             .collect::<Vec<_>>();
         let ids = missing_dep_ids(&all_missing);
-        assert_eq!(ids.len(), 11, "全缺 → 11 项");
+        assert_eq!(ids.len(), 4, "全缺 → 4 项（python3 信息项不计）");
         assert_eq!(ids[0], "node", "node 恒在最前");
-        // 部分缺保 detect 序（node 不在缺失集时不插队）
+        // 部分缺保 detect 序（node 不在缺失集时不插队）；python3 信息项跳过
         let partial = vec![
-            dep("claude", true),
-            dep("codex", false),
-            dep("pi", false),
             dep("node", true),
             dep("python3", false),
             dep("lark-cli", true),
             dep("dingtalk-cli", false),
         ];
-        assert_eq!(
-            missing_dep_ids(&partial),
-            vec!["codex", "pi", "python3", "dingtalk-cli"]
-        );
+        assert_eq!(missing_dep_ids(&partial), vec!["dingtalk-cli"]);
     }
 
     #[test]
     fn missing_dep_ids_node_first_even_mid_list() {
         // 乱序输入里 node 缺失 → 恒提到首位，其余相对顺序稳定
         let deps = vec![
-            dep("claude", false),
-            dep("codex", true),
+            dep("dingtalk-cli", false),
+            dep("git", true),
             dep("node", false),
             dep("lark-cli", false),
         ];
-        assert_eq!(missing_dep_ids(&deps), vec!["node", "claude", "lark-cli"]);
+        assert_eq!(
+            missing_dep_ids(&deps),
+            vec!["node", "dingtalk-cli", "lark-cli"]
+        );
     }
 
     #[test]
     fn install_needs_node_per_platform() {
-        #[cfg(target_os = "macos")]
-        {
-            // mac：claude 首选 curl | bash（shell 步骤）→ false；codex 首选 npm → true
-            assert!(
-                !install_needs_node("claude"),
-                "mac claude 走 curl 不依赖 node"
-            );
-            assert!(install_needs_node("codex"), "mac codex 首选 npm");
-            assert!(!install_needs_node("python3"), "mac python3 走 brew");
-        }
-        #[cfg(target_os = "windows")]
-        {
-            // win：claude/codex/pi 全 npm；python3 走 winget
-            assert!(install_needs_node("claude"));
-            assert!(install_needs_node("pi"));
-            assert!(!install_needs_node("python3"), "win python3 走 winget");
-        }
+        // lark-cli/dingtalk-cli 三平台首步都是 npm → true；node/git 走
+        // brew/winget/包管理器 → false
+        assert!(install_needs_node("lark-cli"));
+        assert!(install_needs_node("dingtalk-cli"));
+        assert!(!install_needs_node("node"));
+        assert!(!install_needs_node("git"));
         // 未知 id：install_plan Err → false（不误跳过）
         assert!(!install_needs_node("no-such-dep"));
     }
@@ -1809,20 +1549,20 @@ mod tests {
         let empty = AllInstallOutcome::default();
         assert_eq!(format_all_summary(&empty), "✅ 全部依赖均已安装");
         let all_ok = AllInstallOutcome {
-            ok: vec!["node".into(), "claude".into()],
+            ok: vec!["node".into(), "lark-cli".into()],
             ..Default::default()
         };
         assert_eq!(format_all_summary(&all_ok), "一键安装完成：成功 2 项");
         let mixed = AllInstallOutcome {
             ok: vec!["node".into()],
-            failed: vec![("codex".into(), "找不到 npm（请先装它的前置依赖）".into())],
-            skipped: vec![("pi".into(), "node/npm 未装好，跳过".into())],
+            failed: vec![("lark-cli".into(), "找不到 npm（请先装它的前置依赖）".into())],
+            skipped: vec![("dingtalk-cli".into(), "node/npm 未装好，跳过".into())],
         };
         let s = format_all_summary(&mixed);
         assert!(s.contains("成功 1 项"), "成功数: {s}");
         assert!(s.contains("失败 1 项"), "失败数: {s}");
-        assert!(s.contains("codex:"), "失败项 id: {s}");
-        assert!(s.contains("跳过 1 项（pi）"), "跳过项: {s}");
+        assert!(s.contains("lark-cli:"), "失败项 id: {s}");
+        assert!(s.contains("跳过 1 项（dingtalk-cli）"), "跳过项: {s}");
         // 尾因超 100 字截断
         let long = AllInstallOutcome {
             ok: vec![],
