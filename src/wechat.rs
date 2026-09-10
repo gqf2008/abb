@@ -513,8 +513,17 @@ impl WeixinClient {
             .send()
             .await
             .with_context(|| format!("POST {endpoint} 网络错误"))?;
-        let v: serde_json::Value = resp.json().await.context("响应非 JSON")?;
-        Ok(v)
+        // 非 2xx 先把状态码与响应体带出来：网关 401/502 回 HTML 时，直接 `.json()`
+        // 会把它们塌成「响应非 JSON」，状态码与原因全丢（#254 在飞书侧修过同款）。
+        let status = resp.status();
+        let text = resp.text().await.context("读响应体失败")?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "POST {endpoint} HTTP {status}: {}",
+                crate::agent::truncate(&text, 200)
+            );
+        }
+        serde_json::from_str(&text).with_context(|| format!("POST {endpoint} 响应非 JSON"))
     }
 
     /// 长轮询取新消息。返回 (消息列表, 新游标, 建议下次超时ms)。
@@ -694,11 +703,13 @@ impl WeixinClient {
             anyhow::bail!("拒绝上传空媒体");
         }
         let rawsize = data.len();
-        let cipher_size = rawsize.div_ceil(16) * 16;
-        let mut aeskey = [0u8; 16];
-        for chunk in aeskey.as_chunks_mut::<8>().0.iter_mut() {
-            chunk.copy_from_slice(&fastrand::u64(..).to_le_bytes());
-        }
+        // PKCS7 **恒补**：明文是 16 的倍数时补一个整块，故密文 = (rawsize/16 + 1) * 16。
+        // 别用 `div_ceil(rawsize,16)*16` —— 整除输入会少报一整个块（审查 P2；wx-send 的
+        // `((rawsize+15)//16)*16` 正是这个偏差，它大概没拿 16 倍数大小的文件测过）。
+        // 下面加密完还有 debug_assert 锁住「预测 == 实际」。
+        let cipher_size = (rawsize / 16 + 1) * 16;
+        // 密钥是机密：用 CSPRNG（uuid v4 由 getrandom 提供）而不是通用 PRNG。
+        let aeskey: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
         let aeskey_hex: String = aeskey.iter().map(|b| format!("{b:02x}")).collect();
         // 图片与文件/视频/语音的 aes_key 编码不同（协议「Crypto」节）：
         // 图片=base64(原始 16 字节)；其余=base64(32 个 hex 字符)。
@@ -740,8 +751,21 @@ impl WeixinClient {
                         )
                     })
             })
-            .ok_or_else(|| anyhow!("getuploadurl 未返回 upload_full_url/upload_param: {up}"))?;
+            .ok_or_else(|| {
+                // 只报关键字段：`up` 里可能有短期签名的上传地址，别进日志、更别随
+                // deliver 的回源提示发给聊天里的真人（审查 P3-3）。
+                anyhow!(
+                    "getuploadurl 未返回 upload_full_url/upload_param（ret={:?} errcode={:?}）",
+                    up.get("ret"),
+                    up.get("errcode")
+                )
+            })?;
         let cipher = aes_ecb_encrypt(data, &aeskey);
+        debug_assert_eq!(
+            cipher.len(),
+            cipher_size,
+            "filesize 预测必须等于实际密文长度"
+        );
         let resp = self
             .http
             .post(&cdn_url)
@@ -1077,26 +1101,37 @@ mod tests {
     /// #283 外发媒体链路的 mock：getuploadurl → CDN → sendmessage 三个端点。
     /// `full_url=false` 时只回 `upload_param`（PROTOCOL.md 记的形态），逼客户端自己
     /// 拼 CDN 地址；`true` 时回 `upload_full_url`（`wx-send` 实测走的形态）。
+    /// 可调参数的媒体链路 mock：`cdn_param=None` 时不回 `x-encrypted-param`
+    /// （用来测"CDN 成功但缺下载参数"这条失败路径）。
+    async fn media_mock_cfg(
+        up: serde_json::Value,
+        cdn_param: Option<&str>,
+        send_ret: i64,
+    ) -> MockServer {
+        let mut cdn = MockResp::json(serde_json::json!({}));
+        if let Some(p) = cdn_param {
+            cdn = cdn.with_header("x-encrypted-param", p);
+        }
+        let mut routes: HashMap<(String, String), MockResp> = HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/ilink/bot/getuploadurl".to_string()),
+            MockResp::json(up),
+        );
+        routes.insert(("POST".to_string(), "/upload".to_string()), cdn);
+        routes.insert(
+            ("POST".to_string(), "/ilink/bot/sendmessage".to_string()),
+            MockResp::json(serde_json::json!({ "ret": send_ret, "message_id": 1 })),
+        );
+        MockServer::start_rich(routes).await
+    }
+
     async fn media_mock(full_url: bool) -> MockServer {
         let up = if full_url {
             serde_json::json!({ "upload_full_url": "{{BASE}}/upload" })
         } else {
             serde_json::json!({ "upload_param": "UP+param=1" })
         };
-        let mut routes: HashMap<(String, String), MockResp> = HashMap::new();
-        routes.insert(
-            ("POST".to_string(), "/ilink/bot/getuploadurl".to_string()),
-            MockResp::json(up),
-        );
-        routes.insert(
-            ("POST".to_string(), "/upload".to_string()),
-            MockResp::json(serde_json::json!({})).with_header("x-encrypted-param", "DL+param=2"),
-        );
-        routes.insert(
-            ("POST".to_string(), "/ilink/bot/sendmessage".to_string()),
-            MockResp::json(serde_json::json!({ "ret": 0, "message_id": 1 })),
-        );
-        MockServer::start_rich(routes).await
+        media_mock_cfg(up, Some("DL+param=2"), 0).await
     }
 
     fn rec<'a>(
@@ -1142,6 +1177,11 @@ mod tests {
             cdn.query.contains("encrypted_query_param=UP%2Bparam%3D1"),
             "upload_param 需百分号编码后拼进 CDN 地址: {}",
             cdn.query
+        );
+        assert_eq!(
+            cdn.headers.get("content-type").map(String::as_str),
+            Some("application/octet-stream"),
+            "CDN 上传必须声明 octet-stream"
         );
         let key = parse_aes_key_from_hex(&aeskey_hex).unwrap();
         assert_eq!(aes_ecb_decrypt(&cdn.body_bytes, &key).unwrap(), data);
@@ -1205,6 +1245,98 @@ mod tests {
             b64::encode(&key),
             "图片 aes_key = base64(原始 16 字节)"
         );
+    }
+
+    /// 审查 P2 回归：明文长度正好是 16 的倍数时 PKCS7 **补一个整块**，声明的
+    /// `filesize` 必须等于实际密文长度（旧实现用 ceil 公式会少报 16 字节）。
+    #[tokio::test]
+    async fn send_media_declares_real_cipher_size_for_aligned_input() {
+        let server = media_mock(false).await;
+        let wx = WeixinClient::new(&server.base, "tok", &server.base);
+        let data = vec![0xABu8; 32]; // 32 = 16×2：ceil 公式得 32，实际密文 48
+
+        wx.send_media("u3", "ctx-3", OutboundMediaKind::File, "aligned.bin", &data)
+            .await
+            .unwrap();
+
+        let recs = server.requests.lock().unwrap().clone();
+        let up_body: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/getuploadurl").body).unwrap();
+        assert_eq!(up_body["rawsize"], 32);
+        assert_eq!(
+            up_body["filesize"], 48,
+            "16 倍数输入必须申报实际 PKCS7 密文长度（补整块）"
+        );
+        let cdn = rec(&recs, "/upload");
+        assert_eq!(cdn.body_bytes.len(), 48, "实传长度要与申报一致");
+        let key = parse_aes_key_from_hex(up_body["aeskey"].as_str().unwrap()).unwrap();
+        assert_eq!(aes_ecb_decrypt(&cdn.body_bytes, &key).unwrap(), data);
+    }
+
+    /// 视频走 video_item（item=5 / media_type=2），尺寸字段是 video_size。
+    #[tokio::test]
+    async fn send_media_video_uses_video_item() {
+        let server = media_mock(false).await;
+        let wx = WeixinClient::new(&server.base, "tok", &server.base);
+        wx.send_media("u4", "ctx-4", OutboundMediaKind::Video, "clip.mp4", b"vid")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        let up_body: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/getuploadurl").body).unwrap();
+        assert_eq!(up_body["media_type"], 2);
+        let sm: serde_json::Value =
+            serde_json::from_str(&rec(&recs, "/ilink/bot/sendmessage").body).unwrap();
+        let item = &sm["msg"]["item_list"][0];
+        assert_eq!(item["type"], 5, "视频 item type=5");
+        assert_eq!(item["video_item"]["video_size"], 16);
+        assert!(item.get("file_item").is_none());
+    }
+
+    /// 失败面（审查 P3-5）：四条路径都必须显式报错，不静默、不谎报成功。
+    #[tokio::test]
+    async fn send_media_errors_are_explicit() {
+        // ① 空媒体：在读/传之前就拒
+        let server = media_mock(false).await;
+        let e = WeixinClient::new(&server.base, "tok", &server.base)
+            .send_media("u5", "ctx", OutboundMediaKind::File, "a.bin", b"")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("空媒体"), "{e:#}");
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "空媒体不该发出任何请求"
+        );
+
+        // ② getuploadurl 缺上传地址 → 点名缺什么，且不泄露整段响应
+        let server = media_mock_cfg(serde_json::json!({ "ret": -1 }), Some("DL"), 0).await;
+        let e = WeixinClient::new(&server.base, "tok", &server.base)
+            .send_media("u5", "ctx", OutboundMediaKind::File, "a.bin", b"x")
+            .await
+            .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("未返回 upload_full_url/upload_param"), "{msg}");
+        assert!(msg.contains("ret"), "要带关键字段便于诊断: {msg}");
+
+        // ③ CDN 200 但缺 x-encrypted-param → 显式报错
+        let server = media_mock_cfg(serde_json::json!({ "upload_param": "UP" }), None, 0).await;
+        let e = WeixinClient::new(&server.base, "tok", &server.base)
+            .send_media("u5", "ctx", OutboundMediaKind::File, "a.bin", b"x")
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("x-encrypted-param"),
+            "缺下载参数要显式报: {e:#}"
+        );
+
+        // ④ sendmessage 返回非 0 ret → 报错，不能当成功
+        let server =
+            media_mock_cfg(serde_json::json!({ "upload_param": "UP" }), Some("DL"), -1).await;
+        let e = WeixinClient::new(&server.base, "tok", &server.base)
+            .send_media("u5", "ctx", OutboundMediaKind::File, "a.bin", b"x")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("sendmessage 失败"), "{e:#}");
     }
 
     /// AES-128-ECB(PKCS7) 加密与既有解密互为逆运算；明文长度是 16 的倍数时补整块。

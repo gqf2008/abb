@@ -57,9 +57,22 @@ pub(crate) fn wechat_media_kind(
         "image" if crate::attachments::image_ext_uploadable(&name) => {
             crate::wechat::OutboundMediaKind::Image
         }
-        "video" => crate::wechat::OutboundMediaKind::Video,
+        "video" if wechat_video_uploadable(&name) => crate::wechat::OutboundMediaKind::Video,
         _ => crate::wechat::OutboundMediaKind::File,
     }
+}
+
+/// 微信视频通道能可靠渲染的容器。`kind_from_name` 把 mkv/avi/webm/flv 也归成 video，
+/// 但这些容器微信端常「发送成功但播不了」——退成文件更实在（与 svg→文件同思路）。
+/// 保守起见只放 mp4/m4v/mov（ISO-BMFF 系）。真机若确认别的容器也能播，加回这里即可。
+pub(crate) fn wechat_video_uploadable(file_name: &str) -> bool {
+    matches!(
+        file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4") | Some("m4v") | Some("mov")
+    )
 }
 
 /// 上传时用的文件名（审查 #254 P3-1）：先取 meta.file_name，空则取本地路径的
@@ -744,10 +757,21 @@ mod tests {
                 "{bad} 应退成文件"
             );
         }
-        assert_eq!(
-            wechat_media_kind(&meta("video", "clip.mp4")),
-            OutboundMediaKind::Video
-        );
+        for ok in ["clip.mp4", "a.MOV", "b.m4v"] {
+            assert_eq!(
+                wechat_media_kind(&meta("video", ok)),
+                OutboundMediaKind::Video,
+                "{ok} 是 ISO-BMFF 系容器，走视频"
+            );
+        }
+        // 异容器（kind=video 但微信端常"发送成功却播不了"）退成文件
+        for bad in ["a.mkv", "b.avi", "c.webm", "d.flv"] {
+            assert_eq!(
+                wechat_media_kind(&meta("video", bad)),
+                OutboundMediaKind::File,
+                "{bad} 应退成文件"
+            );
+        }
         // 音频走文件：VOICE 类型实测被官方丢弃（message_id 成功但端上不显示）
         assert_eq!(
             wechat_media_kind(&meta("audio", "voice.mp3")),
