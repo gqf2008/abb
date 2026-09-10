@@ -33,14 +33,39 @@ pub(crate) fn feishu_send_plan(meta: &crate::attachments::AttachmentMeta) -> Fei
     }
 }
 
-/// 钉钉附件能力闸（纯函数）：当前仅「群聊 + 可上传后缀的图片」。判前于读文件
-/// （省大 IO）。后缀白名单不可省——`kind_from_name` 把 svg/ico/heic 也归成
-/// image，只判 kind 会让它们过闸后被服务端格式校验拒，用户只能看到原始报错
-/// （审查 #254 P2-3）。
-pub(crate) fn dingtalk_can_send(meta: &crate::attachments::AttachmentMeta, chat_id: &str) -> bool {
-    meta.kind == "image"
-        && crate::dingtalk::is_group_chat(chat_id)
-        && crate::dingtalk::dingtalk_image_uploadable(&attachment_upload_name(meta))
+/// 钉钉附件发送计划（纯函数）：图片与官方支持类型的普通文件均可发单聊/群聊。
+/// 判前于读文件（省大 IO）；后缀白名单不可省——`kind_from_name` 会把 svg/ico/heic/
+/// webp 也归成 image，只判 kind 会让它们过闸后被服务端格式校验拒。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DingtalkSendPlan {
+    Image,
+    File(&'static str),
+}
+
+pub(crate) fn dingtalk_send_plan(
+    meta: &crate::attachments::AttachmentMeta,
+) -> std::result::Result<DingtalkSendPlan, String> {
+    let name = attachment_upload_name(meta);
+    match meta.kind.as_str() {
+        "image" if crate::dingtalk::dingtalk_image_uploadable(&name) => Ok(DingtalkSendPlan::Image),
+        "image" => Err(format!(
+            "钉钉机器人发送图片失败：仅支持 {}；当前图片={name}",
+            crate::dingtalk::DINGTALK_IMAGE_EXTS.join("/")
+        )),
+        "file" => crate::dingtalk::dingtalk_file_type(&name)
+            .map(DingtalkSendPlan::File)
+            .ok_or_else(|| {
+                format!(
+                    "钉钉机器人发送文件失败：仅支持 {}；当前文件={name}",
+                    crate::dingtalk::DINGTALK_FILE_EXTS.join("/")
+                )
+            }),
+        _ => Err(format!(
+            "钉钉机器人暂不支持该附件类型：kind={} 文件={name}；当前支持图片与 {}",
+            meta.kind,
+            crate::dingtalk::DINGTALK_FILE_EXTS.join("/")
+        )),
+    }
 }
 
 /// 微信外发媒体的种类判定（纯函数，单测钉死）：
@@ -563,25 +588,32 @@ impl Messenger for DingTalkMessenger {
         chat_id: &str,
         meta: &crate::attachments::AttachmentMeta,
     ) -> Result<()> {
-        // 能力闸**先于读文件**（审查 #254：不支持的组合曾把 100MB 整读进内存再丢）。
-        if !dingtalk_can_send(meta, chat_id) {
-            anyhow::bail!(
-                "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊 {exts} 图片；文件/语音/单聊媒体待 #253 后续补",
-                meta.kind,
-                if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" },
-                exts = crate::attachments::IMAGE_UPLOAD_EXTS.join("/")
-            )
-        }
-        crate::attachments::check_sendable_size(
-            meta,
-            crate::attachments::DINGTALK_IMAGE_MAX_BYTES,
-        )?;
-        let bytes = crate::attachments::read_attachment_bytes(meta)?;
         let name = attachment_upload_name(meta);
-        let media_id = self.dt.upload_image(bytes, &name).await?;
-        self.dt
-            .send_group_image(chat_id, &self.robot_code, &media_id)
-            .await
+        // 能力闸**先于读文件**（审查 #254：不支持的组合曾把 100MB 整读进内存再丢）。
+        match dingtalk_send_plan(meta).map_err(anyhow::Error::msg)? {
+            DingtalkSendPlan::Image => {
+                crate::attachments::check_sendable_size(
+                    meta,
+                    crate::attachments::DINGTALK_IMAGE_MAX_BYTES,
+                )?;
+                let bytes = crate::attachments::read_attachment_bytes(meta)?;
+                let media_id = self.dt.upload_image(bytes, &name).await?;
+                self.dt
+                    .send_image_message(chat_id, &self.robot_code, &media_id)
+                    .await
+            }
+            DingtalkSendPlan::File(file_type) => {
+                crate::attachments::check_sendable_size(
+                    meta,
+                    crate::attachments::DINGTALK_FILE_MAX_BYTES,
+                )?;
+                let bytes = crate::attachments::read_attachment_bytes(meta)?;
+                let media_id = self.dt.upload_media("file", bytes, &name).await?;
+                self.dt
+                    .send_file_message(chat_id, &self.robot_code, &media_id, &name, file_type)
+                    .await
+            }
+        }
     }
 
     async fn download_attachment(
@@ -720,20 +752,73 @@ mod tests {
     }
 
     #[test]
-    fn dingtalk_gate_group_image_only() {
-        // 群 openConversationId 恒以 cid 开头（模块头约定）
-        assert!(dingtalk_can_send(&meta("image", "a.png"), "cidAsXB=="));
-        assert!(dingtalk_can_send(&meta("image", "a.JPG"), "cidAsXB=="));
-        assert!(!dingtalk_can_send(&meta("image", "a.png"), "staff_123"));
-        assert!(!dingtalk_can_send(&meta("file", "a.pdf"), "cidAsXB=="));
-        // 同飞书：kind=image 但服务端格式校验必拒的后缀在能力闸就拦下
-        // （审查 #254 P2-3——旧闸只判 kind，svg 会过闸后被服务端拒）
-        for bad in ["logo.svg", "app.ico", "photo.heic", "noext"] {
+    fn dingtalk_plan_supports_images_and_documented_files() {
+        assert_eq!(
+            dingtalk_send_plan(&meta("image", "a.png")),
+            Ok(DingtalkSendPlan::Image)
+        );
+        assert_eq!(
+            dingtalk_send_plan(&meta("image", "a.JPG")),
+            Ok(DingtalkSendPlan::Image)
+        );
+        for (name, file_type) in [
+            ("报告.pdf", "pdf"),
+            ("合同.docx", "docx"),
+            ("表格.xlsx", "xlsx"),
+            ("归档.zip", "zip"),
+        ] {
+            assert_eq!(
+                dingtalk_send_plan(&meta("file", name)),
+                Ok(DingtalkSendPlan::File(file_type)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dingtalk_plan_rejects_unsupported_extensions_and_kinds() {
+        // 钉钉官方图片上传只支持 jpg/jpeg/gif/png/bmp；webp 也不在其中。
+        for bad in ["logo.svg", "app.ico", "photo.heic", "shot.webp", "noext"] {
             assert!(
-                !dingtalk_can_send(&meta("image", bad), "cidAsXB=="),
+                dingtalk_send_plan(&meta("image", bad)).is_err(),
                 "{bad} 不应过钉钉图片闸"
             );
         }
+        for bad in ["audio.mp3", "clip.mp4", "note.txt", "noext"] {
+            assert!(
+                dingtalk_send_plan(&meta("file", bad)).is_err(),
+                "{bad} 不应过钉钉文件闸"
+            );
+        }
+        for bad in ["old.xls", "slides.ppt", "slides.pptx"] {
+            assert!(
+                dingtalk_send_plan(&meta("file", bad)).is_err(),
+                "{bad} 不在 sampleFile 官方保证集合，不应过闸"
+            );
+        }
+        assert!(dingtalk_send_plan(&meta("audio", "voice.amr")).is_err());
+        assert!(dingtalk_send_plan(&meta("video", "clip.mp4")).is_err());
+
+        let image_err = dingtalk_send_plan(&meta("image", "shot.webp")).unwrap_err();
+        assert!(image_err.contains("jpg/jpeg/gif/png/bmp"), "{image_err}");
+    }
+
+    #[tokio::test]
+    async fn dingtalk_send_attachment_rejects_before_reading_file() {
+        let messenger = DingTalkMessenger::new(
+            crate::dingtalk::DingTalkClient::new("ding_a", "secret"),
+            "ding123".to_string(),
+        );
+        let mut unsupported = meta("file", "note.txt");
+        unsupported.path = "/definitely/not/read/note.txt".to_string();
+
+        let err = messenger
+            .send_attachment("cidAsXB==", &unsupported)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("仅支持"), "应在读文件前由能力闸拒绝: {err}");
+        assert!(!err.contains("读取"), "不应走到文件读取错误: {err}");
     }
 
     /// #283：微信外发媒体的种类判定——图片走内联图、视频走视频、其余（含音频）走文件；

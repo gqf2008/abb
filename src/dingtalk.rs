@@ -154,18 +154,48 @@ impl DingTalkClient {
         name.or(nick).map(|s| s.to_string())
     }
 
-    /// 发单聊文本（userIds 批量接口，单元素）。
-    pub async fn send_single(&self, user_id: &str, robot_code: &str, text: &str) -> Result<()> {
+    /// v1.0 机器人消息统一发送：群聊走 groupMessages，单聊走 oToMessages。
+    /// 文本与所有媒体模板共用请求形状；单聊额外检查 `invalidStaffIdList`，
+    /// 防止服务端 200 但 staffId 无效时被误报为成功。
+    async fn send_robot_message(
+        &self,
+        chat_id: &str,
+        robot_code: &str,
+        msg_key: &str,
+        msg_param: Value,
+        group_at: Option<Value>,
+    ) -> Result<()> {
         let token = self.access_token().await?;
-        let body = json!({
-            "robotCode": robot_code,
-            "userIds": [user_id],
-            "msgKey": "sampleText",
-            "msgParam": serde_json::to_string(&json!({"content": text}))?,
-        });
+        let is_group = is_group_chat(chat_id);
+        let (path, mut body) = if is_group {
+            (
+                "/v1.0/robot/groupMessages/send",
+                json!({
+                    "robotCode": robot_code,
+                    "openConversationId": chat_id,
+                    "msgKey": msg_key,
+                    "msgParam": serde_json::to_string(&msg_param)?,
+                }),
+            )
+        } else {
+            (
+                "/v1.0/robot/oToMessages/batchSend",
+                json!({
+                    "robotCode": robot_code,
+                    "userIds": [chat_id],
+                    "msgKey": msg_key,
+                    "msgParam": serde_json::to_string(&msg_param)?,
+                }),
+            )
+        };
+        if is_group {
+            if let Some(at) = group_at.filter(|v| !v.is_null()) {
+                body["at"] = at;
+            }
+        }
         let resp = self
             .http
-            .post(self.url("/v1.0/robot/oToMessages/batchSend"))
+            .post(self.url(path))
             .header("x-acs-dingtalk-access-token", &token)
             .json(&body)
             .send()
@@ -175,16 +205,38 @@ impl DingTalkClient {
         if !status.is_success() {
             return Err(api_error(status.as_u16(), &text_body));
         }
-        // 200 但用户 ID 全部无效（如 staffId 配错/已被删除）→ 必须上报，不能谎报成功
-        let v: Value = serde_json::from_str(&text_body).unwrap_or(Value::Null);
-        let invalid = v["invalidStaffIdList"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if invalid > 0 {
-            anyhow::bail!("钉钉单聊发送失败：{invalid} 个用户 ID 无效（staffId={user_id}）");
+        if !is_group {
+            let v: Value = serde_json::from_str(&text_body).unwrap_or(Value::Null);
+            let invalid = v["invalidStaffIdList"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if invalid > 0 {
+                anyhow::bail!("钉钉单聊发送失败：{invalid} 个用户 ID 无效（staffId={chat_id}）");
+            }
+            let flow_controlled = v["flowControlledStaffIdList"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if flow_controlled > 0 {
+                anyhow::bail!(
+                    "钉钉单聊发送失败：{flow_controlled} 个用户被平台限流（staffId={chat_id}）"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// 发单聊文本（userIds 批量接口，单元素）。
+    pub async fn send_single(&self, user_id: &str, robot_code: &str, text: &str) -> Result<()> {
+        self.send_robot_message(
+            user_id,
+            robot_code,
+            "sampleText",
+            json!({"content": text}),
+            None,
+        )
+        .await
     }
 
     /// 发群聊文本；at_user_id 非空时 @ 该用户（回复群消息时 @ 提问者，避免被淹没）。
@@ -197,7 +249,6 @@ impl DingTalkClient {
         text: &str,
         at_user_id: Option<&str>,
     ) -> Result<()> {
-        let token = self.access_token().await?;
         let (content, at) = match at_user_id.filter(|u| !u.is_empty()) {
             Some(uid) => (
                 format!("@{uid} {text}"),
@@ -205,28 +256,14 @@ impl DingTalkClient {
             ),
             None => (text.to_string(), Value::Null),
         };
-        let mut body = json!({
-            "robotCode": robot_code,
-            "openConversationId": conversation_id,
-            "msgKey": "sampleText",
-            "msgParam": serde_json::to_string(&json!({"content": content}))?,
-        });
-        if !at.is_null() {
-            body["at"] = at;
-        }
-        let resp = self
-            .http
-            .post(self.url("/v1.0/robot/groupMessages/send"))
-            .header("x-acs-dingtalk-access-token", &token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let text_body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text_body));
-        }
-        Ok(())
+        self.send_robot_message(
+            conversation_id,
+            robot_code,
+            "sampleText",
+            json!({"content": content}),
+            Some(at),
+        )
+        .await
     }
 
     /// 按会话标识分发：cid 开头 = 群聊，否则 = 单聊（staffId）。
@@ -293,18 +330,24 @@ impl DingTalkClient {
         Ok(resp2.bytes().await.context("读钉钉文件响应失败")?.to_vec())
     }
 
-    /// 上传一张图片（发群聊图片消息用）→ media_id。
-    /// 走旧网关 app 级媒体上传 POST /media/upload?type=image&access_token=…，
+    /// 上传媒体文件 → media_id。
+    /// 走旧网关 app 级媒体上传 POST /media/upload?type=<image|voice|file|video>&access_token=…，
     /// multipart 字段名固定 `media`（服务端缺 multipart 时报 43008「参数需要multipart类型」——
     /// 已用无鉴权 POST 探测确认该路由真实存在）。返回 media_id（形如 "@…"）。
     /// `file_name` 必须带真实扩展名：钉钉按文件名后缀校验媒体类型，固定名 "image"
     /// 会被判 40004「不合法的媒体文件类型」（审查 #254）。上传走 120s 超时
     /// （全局 30s 会掐断大图；与下载路径同预算）。
-    pub async fn upload_image(&self, bytes: Vec<u8>, file_name: &str) -> Result<String> {
+    pub async fn upload_media(
+        &self,
+        media_type: &str,
+        bytes: Vec<u8>,
+        file_name: &str,
+    ) -> Result<String> {
+        debug_assert!(matches!(media_type, "image" | "voice" | "file" | "video"));
         let token = self.access_token().await?;
         let url = format!(
-            "{}{}?type=image&access_token={}",
-            self.oapi_base, "/media/upload", token
+            "{}{}?type={}&access_token={}",
+            self.oapi_base, "/media/upload", media_type, token
         );
         let form = reqwest::multipart::Form::new().part(
             "media",
@@ -335,38 +378,52 @@ impl DingTalkClient {
             .context("钉钉媒体上传响应缺 media_id")
     }
 
-    /// 群聊发送图片消息（机器人 msgKey=sampleImageMsg）。官方文档该 msgKey 的
+    /// 上传一张图片（兼容既有调用）→ media_id。
+    pub async fn upload_image(&self, bytes: Vec<u8>, file_name: &str) -> Result<String> {
+        self.upload_media("image", bytes, file_name).await
+    }
+
+    /// 发送图片消息（机器人 msgKey=sampleImageMsg，群聊/单聊同模板）。官方文档该 msgKey 的
     /// msgParam 字段是 **photoURL**（可填完整 URL 或 media/upload 返回的 media_id，
     /// 见 open.dingtalk.com 消息类型文档）；`picMediaId` 是 sampleVideoMsg 的封面
     /// 字段，用错会 400 miss.param.photo（审查 #254）。
-    /// 与 send_group 同走 v1.0 robot/groupMessages/send，仅 msgKey/msgParam 不同；
-    /// 请求形状照官方文档 + mock 单测锁定。
-    pub async fn send_group_image(
+    pub async fn send_image_message(
         &self,
-        conversation_id: &str,
+        chat_id: &str,
         robot_code: &str,
         media_id: &str,
     ) -> Result<()> {
-        let token = self.access_token().await?;
-        let body = json!({
-            "robotCode": robot_code,
-            "openConversationId": conversation_id,
-            "msgKey": "sampleImageMsg",
-            "msgParam": serde_json::to_string(&json!({ "photoURL": media_id }))?,
-        });
-        let resp = self
-            .http
-            .post(self.url("/v1.0/robot/groupMessages/send"))
-            .header("x-acs-dingtalk-access-token", &token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let text_body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text_body));
-        }
-        Ok(())
+        self.send_robot_message(
+            chat_id,
+            robot_code,
+            "sampleImageMsg",
+            json!({ "photoURL": media_id }),
+            None,
+        )
+        .await
+    }
+
+    /// 发送普通文件消息（机器人群聊/单聊同模板 sampleFile）。
+    pub async fn send_file_message(
+        &self,
+        chat_id: &str,
+        robot_code: &str,
+        media_id: &str,
+        file_name: &str,
+        file_type: &str,
+    ) -> Result<()> {
+        self.send_robot_message(
+            chat_id,
+            robot_code,
+            "sampleFile",
+            json!({
+                "mediaId": media_id,
+                "fileName": file_name,
+                "fileType": file_type,
+            }),
+            None,
+        )
+        .await
     }
 
     /// 创建群会话（虚拟 Bot #75；topapi/im/chat/create 的文档形状）。
@@ -529,12 +586,34 @@ pub fn is_group_chat(chat_id: &str) -> bool {
     chat_id.starts_with("cid")
 }
 
-/// 钉钉群图片可上传的扩展名（与飞书 images 端点同表）。`kind_from_name` 会把
-/// svg/ico/heic 这类也归成 image，但钉钉按后缀/内容校验格式，必被服务端拒——
-/// 在能力闸（`messenger::dingtalk_can_send`）就拦下，别把服务端原始错误丢给用户
-/// （审查 #254 P2-3）。
+/// 钉钉图片上传支持的扩展名（官方 /media/upload 口径：jpg、gif、png、bmp；
+/// jpeg 是 jpg 的常见别名，一并接受）。`kind_from_name` 会把 svg/ico/heic/webp
+/// 也归成 image，但钉钉服务端会拒；在能力闸就拦下，别把原始错误丢给用户。
+pub const DINGTALK_IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "gif", "png", "bmp"];
+
 pub fn dingtalk_image_uploadable(file_name: &str) -> bool {
-    crate::attachments::image_ext_uploadable(file_name)
+    extension_lower(file_name).is_some_and(|e| DINGTALK_IMAGE_EXTS.contains(&e.as_str()))
+}
+
+/// 钉钉 `sampleFile` 消息模板端到端支持的扩展名。注意 `/media/upload?type=file`
+/// 本身还接受 xls/ppt/pptx，但消息模板官方文档未保证，能力闸按**发送链最窄集合**
+/// 收口，避免上传成功后才在消息发送阶段失败。
+pub const DINGTALK_FILE_EXTS: &[&str] = &["doc", "docx", "xlsx", "pdf", "zip", "rar"];
+
+/// 钉钉文件模板的 `fileType`：支持类型返回规范化扩展名，其余 None。
+pub fn dingtalk_file_type(file_name: &str) -> Option<&'static str> {
+    let ext = extension_lower(file_name)?;
+    DINGTALK_FILE_EXTS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == ext)
+}
+
+fn extension_lower(file_name: &str) -> Option<String> {
+    file_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.trim().to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
 }
 
 /// 一条待下载的钉钉附件引用（picture/file/audio/video/富文本图片）。
@@ -1377,10 +1456,7 @@ mod tests {
         assert_eq!(m2.conversation_title, "");
     }
 
-    // ─── #253 外发媒体（首版=机器人群聊图片）：上传+发送请求形状（mock 锁定）───
-    // 能力边界：钉钉 Stream 机器人消息集暂无「媒体/文件」通用消息，首版只做群聊图片
-    // （旧网关 /media/upload 传图 → v1.0 groupMessages/send sampleImageMsg）；
-    // 单聊媒体与文件/语音/视频待 #253 后续补（messenger 侧对未覆盖组合显式报错）。
+    // ─── #253 外发媒体：上传 + 群聊/单聊图片与文件请求形状（mock 锁定）───
     #[tokio::test]
     async fn upload_image_posts_oapi_media_shape_and_returns_media_id() {
         let mut routes = std::collections::HashMap::new();
@@ -1434,6 +1510,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_file_uses_type_file_and_real_filename() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/media/upload".to_string()),
+            json!({"errcode": 0, "errmsg": "ok", "media_id": "@lADPfile"}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let media_id = dt
+            .upload_media("file", b"pdf-bytes".to_vec(), "report.pdf")
+            .await
+            .unwrap();
+        assert_eq!(media_id, "@lADPfile");
+        let recs = server.requests.lock().unwrap().clone();
+        let up = recs
+            .iter()
+            .find(|r| r.path == "/media/upload")
+            .expect("应有文件上传请求");
+        assert_eq!(up.query, "type=file&access_token=dt-mock-token");
+        assert!(up.body.contains("filename=\"report.pdf\""), "{}", up.body);
+    }
+
+    #[tokio::test]
     async fn upload_image_missing_media_id_is_error() {
         // errcode=0 但响应缺 media_id（形状异常）→ 显式报错，不谎报成功
         let mut routes = std::collections::HashMap::new();
@@ -1451,7 +1550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_group_image_posts_v1_sample_image_shape() {
+    async fn send_image_message_group_posts_sample_image_shape() {
         let mut routes = std::collections::HashMap::new();
         routes.insert(
             (
@@ -1462,7 +1561,7 @@ mod tests {
         );
         let server = dt_mock_server(routes).await;
         let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
-        dt.send_group_image("cidAsXSBLnA==", "ding123", "@lADPtest")
+        dt.send_image_message("cidAsXSBLnA==", "ding123", "@lADPtest")
             .await
             .unwrap();
         let recs = server.requests.lock().unwrap().clone();
@@ -1488,5 +1587,130 @@ mod tests {
         // 官方 sampleImageMsg 字段是 photoURL（media_id 或 URL）；picMediaId 属视频封面
         assert_eq!(param["photoURL"], "@lADPtest");
         assert!(param.get("picMediaId").is_none(), "不得再发 picMediaId");
+    }
+
+    #[tokio::test]
+    async fn send_image_message_single_uses_batch_send_user_ids() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/v1.0/robot/oToMessages/batchSend".to_string(),
+            ),
+            json!({"invalidStaffIdList": []}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        dt.send_image_message("staff_1", "ding123", "@lADPtest")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        let msg = recs
+            .iter()
+            .find(|r| r.path == "/v1.0/robot/oToMessages/batchSend")
+            .expect("应有单聊图片发送请求");
+        let body: Value = serde_json::from_str(&msg.body).unwrap();
+        assert_eq!(body["userIds"], json!(["staff_1"]));
+        assert!(body.get("openConversationId").is_none());
+        assert_eq!(body["msgKey"], "sampleImageMsg");
+        let param: Value = serde_json::from_str(body["msgParam"].as_str().unwrap()).unwrap();
+        assert_eq!(param["photoURL"], "@lADPtest");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_group_uses_sample_file_shape() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/v1.0/robot/groupMessages/send".to_string(),
+            ),
+            json!({}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        dt.send_file_message("cidAsXSBLnA==", "ding123", "@lADPfile", "报告.pdf", "pdf")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        let msg = recs
+            .iter()
+            .find(|r| r.path == "/v1.0/robot/groupMessages/send")
+            .expect("应有群文件发送请求");
+        let body: Value = serde_json::from_str(&msg.body).unwrap();
+        assert_eq!(body["openConversationId"], "cidAsXSBLnA==");
+        assert_eq!(body["msgKey"], "sampleFile");
+        let param: Value = serde_json::from_str(body["msgParam"].as_str().unwrap()).unwrap();
+        assert_eq!(param["mediaId"], "@lADPfile");
+        assert_eq!(param["fileName"], "报告.pdf");
+        assert_eq!(param["fileType"], "pdf");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_single_uses_batch_send_user_ids() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/v1.0/robot/oToMessages/batchSend".to_string(),
+            ),
+            json!({"invalidStaffIdList": []}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        dt.send_file_message("staff_1", "ding123", "@lADPfile", "合同.docx", "docx")
+            .await
+            .unwrap();
+        let recs = server.requests.lock().unwrap().clone();
+        let msg = recs
+            .iter()
+            .find(|r| r.path == "/v1.0/robot/oToMessages/batchSend")
+            .expect("应有单聊文件发送请求");
+        let body: Value = serde_json::from_str(&msg.body).unwrap();
+        assert_eq!(body["userIds"], json!(["staff_1"]));
+        assert_eq!(body["msgKey"], "sampleFile");
+        let param: Value = serde_json::from_str(body["msgParam"].as_str().unwrap()).unwrap();
+        assert_eq!(param["fileName"], "合同.docx");
+        assert_eq!(param["fileType"], "docx");
+    }
+
+    #[tokio::test]
+    async fn send_media_rejects_invalid_staff_id() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/v1.0/robot/oToMessages/batchSend".to_string(),
+            ),
+            json!({"invalidStaffIdList": ["staff_missing"]}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let err = dt
+            .send_image_message("staff_missing", "ding123", "@lADPtest")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("用户 ID 无效"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_media_surfaces_flow_controlled_staff_id() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/v1.0/robot/oToMessages/batchSend".to_string(),
+            ),
+            json!({"invalidStaffIdList": [], "flowControlledStaffIdList": ["staff_1"]}),
+        );
+        let server = dt_mock_server(routes).await;
+        let dt = DingTalkClient::with_base("ding_a", "secret", &server.base);
+        let err = dt
+            .send_file_message("staff_1", "ding123", "@lADPfile", "报告.pdf", "pdf")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("限流"), "{err}");
     }
 }

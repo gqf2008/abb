@@ -353,10 +353,11 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     urls
 }
 
-/// 平台「内联图片」通道可靠渲染的扩展名白名单（飞书 `/im/v1/images` 与钉钉
-/// 群图片上传同表）。`kind_from_name` 会把 svg/ico/heic 这类也归成 image，但它们
+/// 飞书「内联图片」通道可靠渲染的扩展名白名单（`/im/v1/images`）。钉钉的
+/// `/media/upload?type=image` 白名单更窄，见 `dingtalk::dingtalk_image_uploadable`。
+/// `kind_from_name` 会把 svg/ico/heic 这类也归成 image，但它们
 /// 过不了服务端图片格式校验——判定必须看**扩展名**而不只是 kind（审查 #254）。
-/// 单一定义：飞书/钉钉两个判定函数与错误文案都引用它，避免三份清单漂移。
+/// 飞书判定函数与错误文案共同引用，避免清单漂移。
 pub const IMAGE_UPLOAD_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 /// 文件名是否为可上传的内联图片扩展名（大小写不敏感）。
@@ -401,11 +402,12 @@ pub fn read_attachment_bytes(meta: &AttachmentMeta) -> Result<Vec<u8>> {
 }
 
 /// 各目的地平台的上传体积上限（字节）：飞书 image 10MB / file 30MB（官方文档），
-/// 钉钉媒体 image 取保守 20MB。发送前先按元数据大小预检——整读进内存再被
+/// 钉钉 image/file 均为 20MB（官方文档）。发送前先按元数据大小预检——整读进内存再被
 /// 服务端拒（HTTP 413 / 尺寸错误）既白烧内存又难诊断（审查 #254）。
 pub const FEISHU_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const FEISHU_FILE_MAX_BYTES: u64 = 30 * 1024 * 1024;
 pub const DINGTALK_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+pub const DINGTALK_FILE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// 微信外发媒体的本地上限（字节）。**这不是腾讯公布的平台上限**——iLink 没有公开
 /// 文档说明各类型上限，这个值是我们自己的资源兜底：上传走"整块读进内存 → 加密再复制
@@ -681,6 +683,31 @@ mod tests {
                 "设备文件应被拒: {e:#}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 调用方平台体积预检必须独立可回归：稀疏文件用 set_len 即可低成本造超限。
+    #[cfg(unix)]
+    #[test]
+    fn check_sendable_size_rejects_over_platform_cap() {
+        let dir = std::env::temp_dir().join(format!("abb-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("too-big.pdf");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(11).unwrap();
+        drop(f);
+        let meta = AttachmentMeta {
+            kind: "file".into(),
+            source: "dingtalk".into(),
+            file_name: "too-big.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 0,
+            path: path.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let e = check_sendable_size(&meta, 10).unwrap_err();
+        assert!(e.to_string().contains("平台上限"), "{e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

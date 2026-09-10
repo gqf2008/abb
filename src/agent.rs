@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v4";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v5";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -86,7 +86,7 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 - 别用 `deliver --bot <本bot> --chat <本会话>`：那是同会话投递，会被**自环保护**拒绝
   （防消息循环）。要么用 `--to-current`，要么别绕——直接回复文本就行。
 - 各平台能力不同，别向用户过度承诺：飞书全类型；微信图片/文件/视频可用、**音频按文件发**
-  （微信端语音条会被官方丢弃）；**钉钉当前只支持群聊图片**（文件/语音/单聊媒体会明确报错）。
+  （微信端语音条会被官方丢弃）；**钉钉支持群聊/单聊图片及 doc/docx/xlsx/pdf/zip/rar 文件**（语音/视频暂明确报错）。
   发不出去时会收到显式错误，不会静默丢——把原因如实告诉用户即可。
 
 ## 跨会话投递（需在 ABB 设置里打开「跨会话投递」开关）
@@ -97,7 +97,7 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 
 - 投：`\"$ABB_BIN\" deliver --bot <目标bot key> --chat <目标chat_id> --text \"内容\" [--file <本地路径>]…`
   - `--file` 可重复：附件由接收端平台**真发送**（不再只发本地路径文本）。
-    能力有差异：飞书全类型；微信图片/文件/视频（音频按文件发）；**钉钉仅群聊图片**。
+    能力有差异：飞书全类型；微信图片/文件/视频（音频按文件发）；**钉钉支持图片与常见文档/压缩包（单聊/群聊）**。
     不支持的类型会明确报错，不会静默降级。
 - 投递是异步的：CLI 只入队，service 侧实际发送；失败会回源到当前会话报错，不会静默丢。
 - 开关关闭时 CLI 会直接报错——提示用户先去设置打开，不要反复重试。
