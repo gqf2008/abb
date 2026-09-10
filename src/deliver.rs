@@ -52,6 +52,10 @@ pub struct DeliveryItem {
     /// 投递走自环判定。结构上不可能自循环：没有跨会话对，且 bot 自己的出站消息在三个
     /// 平台都被桥丢弃（微信 `message_type!=1`、飞书 `sender_type=app/bot`、钉钉回调
     /// 只在被 @ 时触发），不会回灌成新的用户输入。
+    ///
+    /// **依赖差异（审查 P3-2）**：微信/飞书是**代码级**丢弃（本仓有过滤与测试）；
+    /// 钉钉 `bridge::recover::on_dingtalk` **没有** sender 判别，靠的是「平台不会把 bot
+    /// 自己发的消息推回」。那天若变了，需在 `on_dingtalk` 补一条与飞书同款的丢弃。
     #[serde(default)]
     pub in_session: bool,
 }
@@ -224,8 +228,14 @@ impl Router {
         let tb = crate::agent::truncate(&item.target_bot, 16);
         let tc = crate::agent::truncate(&item.target_chat, 16);
         let tid = &item.id[..item.id.len().min(8)]; // uuid 恒 ASCII，按字节切安全
-                                                    // 开关只管跨会话；`in_session` 等价于「回复带附件」，不受它限制（CLI 侧同判）。
-        if !self.enabled && !item.in_session {
+                                                    // `in_session` 的豁免判据**只此一处**：必须是「显式声明」**且**来源确实等于目标。
+                                                    // 后面的开关 / 自环 / 去重 / 指纹登记四处都用它，别各自去读裸 flag——否则伪造一条
+                                                    // `in_session:true` 但来源≠目标的项（手改 deliveries.json，或 owner 会话用
+                                                    // `AGENT_BRIDGE_BOT_KEY=… CHAT_ID=…` 覆盖 env 后调 --to-current）就能把
+                                                    // `cross_delivery_enabled` 关着的跨会话投递和 10 分钟防循环窗口一起绕掉（审查 P2）。
+        let in_session_ok = item.in_session && is_self_loop(item);
+        // 开关只管跨会话；`in_session` 等价于「回复带附件」，不受它限制（CLI 侧同判）。
+        if !self.enabled && !in_session_ok {
             crate::log!(
                 "[deliver] 跳过投递：跨会话投递未开启（bot={} chat={} id={}）",
                 tb,
@@ -243,7 +253,6 @@ impl Router {
         // 两处豁免：① 定时任务（既有）；② `in_session`（CLI `--to-current` 显式声明的
         // 「发给当前会话」）——但它**只在来源确实等于目标时**才构成豁免；手改队列塞
         // in_session 却把来源写成别的会话，下面这条判定照旧拒（自环硬规则不退化）。
-        let in_session_ok = item.in_session && is_self_loop(item);
         if !in_session_ok && item.job_id.is_empty() && is_self_loop(item) {
             crate::log!(
                 "[deliver] 跳过投递：自环（来源==目标）bot={} chat={} id={}",
@@ -259,7 +268,7 @@ impl Router {
         // 注意：MutexGuard 必须在任何 await 前 drop（std 锁不是 Send，跨 await 会编译失败）。
         // `in_session` 也豁免去重：10 分钟内说两次「再发我一次」应该都能发出去
         //（直发语义，不是跨会话中继）。
-        if item.job_id.is_empty() && !item.in_session && self.is_duplicate(item) {
+        if item.job_id.is_empty() && !in_session_ok && self.is_duplicate(item) {
             crate::log!(
                 "[deliver] 跳过重复投递（防循环）bot={} chat={} id={}",
                 tb,
@@ -387,7 +396,7 @@ impl Router {
             item.text.chars().count(),
             item.attachments.len()
         );
-        if item.job_id.is_empty() && !item.in_session {
+        if item.job_id.is_empty() && !in_session_ok {
             self.mark_delivered(item);
         }
     }
