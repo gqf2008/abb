@@ -43,6 +43,38 @@ pub(crate) fn dingtalk_can_send(meta: &crate::attachments::AttachmentMeta, chat_
         && crate::dingtalk::dingtalk_image_uploadable(&attachment_upload_name(meta))
 }
 
+/// 微信外发媒体的种类判定（纯函数，单测钉死）：
+/// - `image` 且后缀在内联图白名单 → 图片；`svg/ico/heic` 这类（`kind_from_name` 也归
+///   image，但微信图片通道必被格式校验拒）退成**文件**，与飞书同款处理；
+/// - `video` → 视频；
+/// - 其余（含 `audio`）→ 文件。**音频不用 VOICE**：iLink 的 VOICE 类型实测被官方丢弃
+///   （message_id 成功但微信端不显示），按文件发才能真收到。
+pub(crate) fn wechat_media_kind(
+    meta: &crate::attachments::AttachmentMeta,
+) -> crate::wechat::OutboundMediaKind {
+    let name = attachment_upload_name(meta);
+    match meta.kind.as_str() {
+        "image" if crate::attachments::image_ext_uploadable(&name) => {
+            crate::wechat::OutboundMediaKind::Image
+        }
+        "video" if wechat_video_uploadable(&name) => crate::wechat::OutboundMediaKind::Video,
+        _ => crate::wechat::OutboundMediaKind::File,
+    }
+}
+
+/// 微信视频通道能可靠渲染的容器。`kind_from_name` 把 mkv/avi/webm/flv 也归成 video，
+/// 但这些容器微信端常「发送成功但播不了」——退成文件更实在（与 svg→文件同思路）。
+/// 保守起见只放 mp4/m4v/mov（ISO-BMFF 系）。真机若确认别的容器也能播，加回这里即可。
+pub(crate) fn wechat_video_uploadable(file_name: &str) -> bool {
+    matches!(
+        file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4") | Some("m4v") | Some("mov")
+    )
+}
+
 /// 上传时用的文件名（审查 #254 P3-1）：先取 meta.file_name，空则取本地路径的
 /// basename，再空则按 mime/kind 造一个**带后缀**的占位名。绝不能退化成无扩展名的
 /// 字面量——飞书 `file_type` 映射与 images 端点、钉钉 upload 都按后缀校验格式，
@@ -372,19 +404,26 @@ impl WeixinMessenger {
 
 #[async_trait::async_trait]
 impl Messenger for WeixinMessenger {
-    /// 微信附件外发未实现（#253 一期）：显式报错，**不**走 trait 默认的「文本元数据」
-    /// 降级——那串带本地路径的文本对微信里的真人收件人毫无用处，却让 deliver 把
-    /// 失败报成「其余内容已送达」（审查 #254 P2-2）。
+    /// 微信附件外发（#283）：走 iLink 原生链路（`getuploadurl` → AES-128-ECB 加密 →
+    /// CDN → `sendmessage` 带 media item），**不再**走 trait 默认的「发一串本地路径
+    /// 文本并返回 Ok」的静默降级（审查 #254 P2-2 删的就是它）。
+    ///
+    /// 目标可以是任意微信会话（`chat_id` = `to_user_id`），`context_token` 用该会话
+    /// 入站消息带上来的那个——没有就报错让用户先发一条（与外发文本同一条要求）。
     async fn send_attachment(
         &self,
-        _chat_id: &str,
+        chat_id: &str,
         meta: &crate::attachments::AttachmentMeta,
     ) -> Result<()> {
-        anyhow::bail!(
-            "微信会话外发附件尚未实现（kind={} 文件={}）：当前仅飞书/钉钉支持真发送，待 #253 后续补",
-            meta.kind,
-            meta.file_name
-        )
+        let token = self.ctx.lock().unwrap().get(chat_id).cloned();
+        let ctx = token.ok_or_else(|| {
+            anyhow::anyhow!("微信会话 {chat_id} 还没有 context_token（需先收到对方一条消息）")
+        })?;
+        crate::attachments::check_sendable_size(meta, crate::attachments::WECHAT_UPLOAD_MAX_BYTES)?;
+        let name = attachment_upload_name(meta);
+        let kind = wechat_media_kind(meta);
+        let bytes = crate::attachments::read_attachment_bytes(meta)?;
+        self.wx.send_media(chat_id, &ctx, kind, &name, &bytes).await
     }
 
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<()> {
@@ -695,6 +734,57 @@ mod tests {
                 "{bad} 不应过钉钉图片闸"
             );
         }
+    }
+
+    /// #283：微信外发媒体的种类判定——图片走内联图、视频走视频、其余（含音频）走文件；
+    /// svg/ico/heic 这类 kind=image 但微信图片通道必拒的后缀退成文件卡片。
+    #[test]
+    fn wechat_media_kind_routes_by_kind_and_extension() {
+        use crate::wechat::OutboundMediaKind;
+        assert_eq!(
+            wechat_media_kind(&meta("image", "shot.png")),
+            OutboundMediaKind::Image
+        );
+        assert_eq!(
+            wechat_media_kind(&meta("image", "a.JPEG")),
+            OutboundMediaKind::Image
+        );
+        // kind=image 但后缀不在白名单 → 文件（别让服务端格式校验把整条打回）
+        for bad in ["logo.svg", "app.ico", "photo.heic", "noext"] {
+            assert_eq!(
+                wechat_media_kind(&meta("image", bad)),
+                OutboundMediaKind::File,
+                "{bad} 应退成文件"
+            );
+        }
+        for ok in ["clip.mp4", "a.MOV", "b.m4v"] {
+            assert_eq!(
+                wechat_media_kind(&meta("video", ok)),
+                OutboundMediaKind::Video,
+                "{ok} 是 ISO-BMFF 系容器，走视频"
+            );
+        }
+        // 异容器（kind=video 但微信端常"发送成功却播不了"）退成文件
+        for bad in ["a.mkv", "b.avi", "c.webm", "d.flv"] {
+            assert_eq!(
+                wechat_media_kind(&meta("video", bad)),
+                OutboundMediaKind::File,
+                "{bad} 应退成文件"
+            );
+        }
+        // 音频走文件：VOICE 类型实测被官方丢弃（message_id 成功但端上不显示）
+        assert_eq!(
+            wechat_media_kind(&meta("audio", "voice.mp3")),
+            OutboundMediaKind::File
+        );
+        assert_eq!(
+            wechat_media_kind(&meta("file", "报告.pdf")),
+            OutboundMediaKind::File
+        );
+        // 文件名空但路径带后缀时，判定要跟实际上传名一致（走 attachment_upload_name）
+        let mut m = meta("image", "");
+        m.path = "/tmp/pic.png".into();
+        assert_eq!(wechat_media_kind(&m), OutboundMediaKind::Image);
     }
 
     /// P3-1：上传文件名不能退化成**无扩展名的字面量** `"attachment"`——优先用

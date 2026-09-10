@@ -407,6 +407,12 @@ pub const FEISHU_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const FEISHU_FILE_MAX_BYTES: u64 = 30 * 1024 * 1024;
 pub const DINGTALK_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
+/// 微信外发媒体的本地上限（字节）。**这不是腾讯公布的平台上限**——iLink 没有公开
+/// 文档说明各类型上限，这个值是我们自己的资源兜底：上传走"整块读进内存 → 加密再复制
+/// 一份 → 一次 POST"，50MB 已是 ~100MB 瞬时占用。超限直接本地拒（比读进来再被服务端
+/// 拒更省），真机若发现平台上限更低，改这一个常量即可。
+pub const WECHAT_UPLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
 /// 读取前的体积预检：按 metadata().len() 对比目的地 caps。
 /// 文件不存在/无路径 → 交由 read_attachment_bytes 报同款错误（这里只量尺寸）。
 pub fn check_sendable_size(meta: &AttachmentMeta, max: u64) -> Result<()> {

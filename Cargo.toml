@@ -36,6 +36,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 turso = "0.7.2"
 uuid = { version = "1", features = ["v4"] }
 fastrand = "2"
+# 微信 iLink getuploadurl 要求 rawfilemd5（协议体必填字段）；md5 是纯 Rust 零依赖小 crate，
+# 比手写摘要稳（项目对 base64 手写是因为要零依赖且极短，摘要算法不值得手写）。
+md5 = "0.7"
 anyhow = "1"
 async-trait = "0.1"
 # 跨进程文件锁（deliveries.lock）：CLI 入队 / service ack 并发安全，Unix flock + Windows LockFileEx
