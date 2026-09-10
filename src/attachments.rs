@@ -353,6 +353,20 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     urls
 }
 
+/// 平台「内联图片」通道可靠渲染的扩展名白名单（飞书 `/im/v1/images` 与钉钉
+/// 群图片上传同表）。`kind_from_name` 会把 svg/ico/heic 这类也归成 image，但它们
+/// 过不了服务端图片格式校验——判定必须看**扩展名**而不只是 kind（审查 #254）。
+/// 单一定义：飞书/钉钉两个判定函数与错误文案都引用它，避免三份清单漂移。
+pub const IMAGE_UPLOAD_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// 文件名是否为可上传的内联图片扩展名（大小写不敏感）。
+pub fn image_ext_uploadable(file_name: &str) -> bool {
+    file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.trim().to_ascii_lowercase())
+        .is_some_and(|e| IMAGE_UPLOAD_EXTS.contains(&e.as_str()))
+}
+
 /// 读取已保存附件字节（Messenger::send_attachment 真上传前用）。
 /// meta.path 为空或文件缺失 → Err（含文件名/路径提示），由调用方走既有错误语义
 /// （deliver 回源报错），绝不静默降级成「文本元数据」。

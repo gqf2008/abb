@@ -311,13 +311,16 @@ impl Router {
                     tc,
                     meta.file_name
                 );
+                // 单条错误串也截断：平台返回的超长错误体若原样带上，3 条一样会顶爆
+                // 平台单条文本上限（审查 #254 复核 N4）。
                 failed.push(format!(
-                    "{}（{e:#}）",
+                    "{}（{}）",
                     if meta.file_name.is_empty() {
                         "未命名附件"
                     } else {
                         meta.file_name.as_str()
-                    }
+                    },
+                    crate::agent::truncate(&format!("{e:#}"), 160)
                 ));
             }
         }
@@ -1268,6 +1271,35 @@ mod tests {
                 .iter()
                 .any(|(_, t)| t.contains("防循环")),
             "失败投递不得占用防循环槽位"
+        );
+    }
+
+    /// P3-5（复核 N4）：失败件数 >3 时回源提示只列前 3 条 + 「等 N 个」——附件多
+    /// 时全量拼接会顶爆平台单条文本上限，这条提示**自己**发不出去。
+    #[tokio::test]
+    async fn router_failure_notice_lists_only_first_three() {
+        let (router, target, source) = router_with(true, None);
+        let mut d = item("a", "wechat", "u1", "");
+        d.source_bot = "feishu".into();
+        d.source_chat = "c1".into();
+        d.attachments = (1..=5)
+            .map(|i| {
+                let name = format!("bad{i}.png");
+                target.fail_attachment(&name);
+                attach(&name)
+            })
+            .collect();
+        router.deliver(&d).await;
+        assert!(target.attachments.lock().unwrap().is_empty(), "5 件全失败");
+        let src = source.sent.lock().unwrap();
+        assert_eq!(src.len(), 1);
+        let msg = &src[0].1;
+        assert!(msg.contains("5/5 个附件发送失败"), "{msg}");
+        assert!(msg.contains("bad3.png"), "前 3 条要列全: {msg}");
+        assert!(msg.contains("等 2 个"), "超出部分折叠成计数: {msg}");
+        assert!(
+            !msg.contains("bad4.png") && !msg.contains("bad5.png"),
+            "第 4/5 件不应出现在提示里: {msg}"
         );
     }
 

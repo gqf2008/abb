@@ -156,13 +156,7 @@ pub fn feishu_file_type(file_name: &str) -> &'static str {
 /// 不在表内的「图片」（svg/ico/heic/tiff…，kind_from_name 会把它们归 image）
 /// 走文件卡片更稳——images 上传被服务端格式校验拒时整个附件会失败（审查 #254）。
 pub fn feishu_image_uploadable(file_name: &str) -> bool {
-    matches!(
-        file_name
-            .rsplit_once('.')
-            .map(|(_, e)| e.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
-    )
+    crate::attachments::image_ext_uploadable(file_name)
 }
 
 pub struct FeishuClient {

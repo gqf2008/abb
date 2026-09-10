@@ -22,15 +22,16 @@ pub(crate) enum FeishuSendPlan {
 }
 
 pub(crate) fn feishu_send_plan(meta: &crate::attachments::AttachmentMeta) -> FeishuSendPlan {
-    if meta.kind == "image" && crate::feishu::feishu_image_uploadable(&meta.file_name) {
+    // 判定与实际上传用**同一个名字**（`attachment_upload_name`）：只用
+    // `meta.file_name` 会在它为空时把 `.../a.png` 这样的图错判成文件卡片
+    // （审查 #254 复核 N1）。
+    let name = attachment_upload_name(meta);
+    if meta.kind == "image" && crate::feishu::feishu_image_uploadable(&name) {
         FeishuSendPlan::Image
     } else {
-        FeishuSendPlan::File(crate::feishu::feishu_file_type(&meta.file_name))
+        FeishuSendPlan::File(crate::feishu::feishu_file_type(&name))
     }
 }
-
-/// 钉钉群图片可上传的扩展名清单（与飞书同表；钉钉按后缀/内容校验格式）。
-pub(crate) const DINGTALK_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 /// 钉钉附件能力闸（纯函数）：当前仅「群聊 + 可上传后缀的图片」。判前于读文件
 /// （省大 IO）。后缀白名单不可省——`kind_from_name` 把 svg/ico/heic 也归成
@@ -529,7 +530,7 @@ impl Messenger for DingTalkMessenger {
                 "钉钉机器人发送该附件尚未实现（kind={} 会话={}）：当前仅支持群聊 {exts} 图片；文件/语音/单聊媒体待 #253 后续补",
                 meta.kind,
                 if crate::dingtalk::is_group_chat(chat_id) { "群聊" } else { "单聊" },
-                exts = DINGTALK_IMAGE_EXTS.join("/")
+                exts = crate::attachments::IMAGE_UPLOAD_EXTS.join("/")
             )
         }
         crate::attachments::check_sendable_size(
@@ -696,11 +697,18 @@ mod tests {
         }
     }
 
-    /// P3-1：上传文件名绝不能是无扩展名的字面量——file_name 为空时取路径
-    /// basename，再空则按 mime/kind 造带后缀的名字。
+    /// P3-1：上传文件名不能退化成**无扩展名的字面量** `"attachment"`——优先用
+    /// 真名，空则取路径 basename，再空才按 mime/kind 造一个带后缀的占位名。
+    /// （有名字时不改写：`report` 这类本来就无后缀的名字原样保留，格式校验交给
+    /// 平台，飞书会走 `file_type=stream`。）
     #[test]
-    fn attachment_upload_name_never_loses_extension() {
+    fn attachment_upload_name_prefers_real_name_then_path_then_mime() {
         assert_eq!(attachment_upload_name(&meta("image", "pic.png")), "pic.png");
+        assert_eq!(
+            attachment_upload_name(&meta("file", "report")),
+            "report",
+            "真名原样用（无后缀不改写——不做无依据的补缀）"
+        );
         let mut m = meta("image", "");
         m.path = "/tmp/收件箱/shot.JPEG".into();
         assert_eq!(

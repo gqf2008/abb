@@ -534,13 +534,7 @@ pub fn is_group_chat(chat_id: &str) -> bool {
 /// 在能力闸（`messenger::dingtalk_can_send`）就拦下，别把服务端原始错误丢给用户
 /// （审查 #254 P2-3）。
 pub fn dingtalk_image_uploadable(file_name: &str) -> bool {
-    matches!(
-        file_name
-            .rsplit_once('.')
-            .map(|(_, e)| e.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
-    )
+    crate::attachments::image_ext_uploadable(file_name)
 }
 
 /// 一条待下载的钉钉附件引用（picture/file/audio/video/富文本图片）。
