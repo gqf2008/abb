@@ -371,6 +371,9 @@ async fn run_shell(
     cmd.env_remove("BUZZ_PRIVATE_KEY");
     #[cfg(unix)]
     cmd.process_group(0);
+    // Windows 抑制控制台窗（#153 孙进程场景：buzz-agent 自身无控制台，shell
+    // 孙进程不设 CREATE_NO_WINDOW 会新建可见控制台窗闪框；与 mcp spawn_one 同款）。
+    crate::mcp::configure_no_window(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -808,6 +811,8 @@ async fn run_delegate_with_bin(
     cmd.env_remove("BUZZ_PRIVATE_KEY");
     #[cfg(unix)]
     cmd.process_group(0);
+    // Windows 抑制控制台窗（#153 孙进程场景，与 dev__shell / mcp spawn_one 同款）。
+    crate::mcp::configure_no_window(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());

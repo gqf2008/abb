@@ -1174,7 +1174,11 @@ fn clamp_tool_result_text(result: &mut ToolResult, budget: ResultBudget) {
 /// Suppress the console window that Windows otherwise allocates for every
 /// console-subsystem child process spawned from a GUI (non-console) parent.
 /// No-op on non-Windows platforms.
-fn configure_no_window(cmd: &mut Command) {
+///
+/// pub(crate)：devtools.rs 的 dev__shell / dev__delegate spawn 同用——#153 机理
+/// 对孙进程同样成立（buzz-agent 自身经 CREATE_NO_WINDOW 启动无控制台，其子进程
+/// 不设此旗标会在 Windows 新建可见控制台窗，闪框）。
+pub(crate) fn configure_no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
