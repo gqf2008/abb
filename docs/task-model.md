@@ -40,7 +40,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 - `chat_lock()`（`src/bridge/mod.rs:326`，字段 `:84`）在生产路径只覆盖**组装 prompt + push 进 harness**；push 成功后函数就返回（`src/bridge/virtualbot.rs:703-706` 起），**锁不覆盖整个 agent 回合**。
 - 真正的单频道串行是两层：
-  1. **per-channel in-flight 队列**：`src/buzz/queue.rs`（同频道排队、攒批；不同频道可并行）；
+  1. **per-channel in-flight 队列**：`src/buzz/queue.rs`——队列层支持不同频道各自积压/公平选择，但**当前单 slot harness 下，同一 handle 最终仍是全局串行**（真并行要么 B1 独立 handle，要么 B2 多 slot）；
   2. **每个 handle 的单 slot 懒池**：`let pool = AgentPool::from_slots(vec![None]);`（`src/buzz/harness.rs:413-416`）。
 - **`run_job` 不取 chat_lock**，直接用 `channel_uuid(bot_key, job.chat_id)`（`src/service.rs:1341`）——**和聊天是同一个 channel**，于是两者在同一个 slot 池里排队。
 - 调度侧防重入按 **`job.id`** 键控（`src/service.rs:813-854`），不是按 chat：不同 job 可以在 Rust 层并发进入 `run_job`，然后一起在 harness 队列里排队。
@@ -60,7 +60,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 - `run_job` 注册了 `_cancel_flag`（`src/service.rs:1321`），但**从未把它传给 ACP 等待路径**；而且紧邻的注释自相矛盾（`:1316-1320` 先说「共用同一 key」，又说「不再注册」）。
 - 停止词处理只是置位 AtomicBool 后立即 return（`src/bridge/virtualbot.rs:358-364`），**因此反而不会走到真正的 cancel**。
 - 真正能取消 ACP 回合的是 `buzz_cancel_reply` → `handle.cancel(channel_id)`（`src/bridge/virtualbot.rs:1180-1215`）。
-- ⇒ **当前 job 不能可靠被停止词打断**。这是现存缺陷，不只是设计问题（建议单开 bug）。
+- ⇒ **当前 job 不能可靠被停止词打断**。这是现存缺陷，不只是设计问题，已单开 **#309**。
 
 **E. 投递目标与自环保护**
 
@@ -135,7 +135,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
     "role": "owner",                       // config::SenderRole（只能区分 Owner/Granted）
     "bot_key": "微信龙虾",
     "chat_id": "wx_chat_xxx",
-    "sender_id": "",                       // 当前 agent 环境尚无可靠 sender_id —— 见 Q3
+    "sender_id": "",                       // 当前 agent 环境尚无可靠 sender_id —— 见 Q9
     "capability": "cap_xxx"                // 创建时下发的管理凭据（若采用 capability 方案）
   },
   "payload": { "kind": "agent", "prompt": "……", "cwd": "", "cmd": [], "env": {} },
@@ -143,6 +143,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
   "delivery": { "targets": [], "default": "creator" },
   "channel": { "mode": "dedicated", "channel_id": "……" },   // 见 D1a
   "limits": { "timeout_secs": 0, "max_restarts": 3, "backoff": "exponential", "log_max_bytes": 10485760 },
+  // state 是运行态投影：实际落在 tasks-state.json，不回写本定义文件（见 Q12）
   "state": { "kind": "idle", "pid": null, "started_at": null, "last_exit_code": null, "restarts": 0 }
 }
 ```
@@ -150,7 +151,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 **存储**（按 bot 隔离，与现有目录约定一致）：
 
 - **定义**：`~/.agent-bridge/workspaces/<bot>/tasks.json`（由 `jobs.json` 迁移）
-- **运行态**：`~/.agent-bridge/workspaces/<bot>/tasks-state.json`（pid/重启计数/最近退出码）——**与定义分开**，避免高频写污染定义文件（见 Q6）
+- **运行态**：`~/.agent-bridge/workspaces/<bot>/tasks-state.json`（pid/重启计数/最近退出码）——**与定义分开**，避免高频写污染定义文件（见 Q12）。数据模型里的 `state` 只是运行态投影，**不写回定义文件**。
 - **日志**：`~/.agent-bridge/workspaces/<bot>/task-logs/<id>.log`
 
 三份文件都要进 §1.2 G 的状态文件写保护名单（**root guard + fork 两份**）。
@@ -161,16 +162,30 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
-**D1a 独立 channel**：task 使用独立 channel UUID（例如由 `channel_uuid(bot, "task:<id>")` 派生），并显式定义对应的 `ChannelMeta`（workspace / cwd / 指令作用域）。这是隔离 ACP session 的**唯一有效手段**（`src/buzz/pool.rs:82-95`）。
+**D1a 独立 channel**：task 使用独立 channel UUID（例如由 `channel_uuid(bot, "task:<id>")` 派生），并显式定义对应的 `ChannelMeta`（workspace / cwd / 指令作用域）。在**当前共享 handle** 的模型下，独立 channel 是隔离 ACP session（`src/buzz/pool.rs:82-95`）的必要手段（走 B1 独立 handle 也能达到同样隔离）。
+
+- ⚠️ **必须设 `adhoc: true`（或等价加入巡检登记）**：harness 频道巡检会删掉「不在 `sync_roots` 中且非 adhoc」的根频道（`src/buzz/harness.rs` 的 `Cmd::SyncRoots`，`:530` 起）。现有 `run_job` 正是这么做的（`src/service.rs:1353-1370` 的 `ChannelMeta { …, adhoc: true }`）。漏了这步，task channel 会在下次巡检被排空队列 / 失效 session。
+- task channel 的 UUID 命名空间不要与普通聊天 channel 混用。
 
 **D1b 独立执行容量**：当前每个 handle 是单 slot（`src/buzz/harness.rs:413-416`），且 task 与聊天会分到不同 channel 但**仍共享同一个 handle**。所以「不占线」与「同会话并发多个子代理」（#306 验收）在单 slot 下**不可能成立**。两个可选方案：
 
 - **B1**：给 task 独立 handle / 独立 pool（聊天与 task 各一套）——改动小、语义清晰，但每套都是进程与内存开销；
 - **B2**：把 harness 扩成多 slot 池——更省资源，但动的是共享执行层，回归面大。
 
-**这条是 #306 能否成立的前提，必须先定（Q1）。**
+**这条是 #306 能否成立的前提，必须先定（Q7）。**
 
-**D1c 取消**：用 `harness.cancel(task_channel)` 或每 task 独立 `CancellationToken`；**不复用 `cancel_flags`**（§1.2 D 已证其失效）。同时在会话内提供显式的 `task cancel <id>`（见 Q3）。
+**D1c 取消**：**不复用 `cancel_flags`**（§1.2 D 已证其失效），改用 `harness.cancel(task_channel)` / 每 task 独立 `CancellationToken`。
+
+但 `handle.cancel(channel_id)` **只作用于 in-flight 那一轮**——排队中的消息不在取消范围（`src/bridge/virtualbot.rs:1185-1193` 注释明说；实现见 `src/buzz/harness.rs:526-529` `signal_in_flight_task`）。后台 task 若因单 slot 排在聊天之后，`task cancel` 会回「没有在跑任务」，而它稍后仍会执行。取消语义必须按状态分别定义：
+
+| task 状态 | 取消动作 |
+|---|---|
+| `running` | `harness.cancel(task_channel)` |
+| `queued`（已进 harness 队列但未开跑） | 排空该 channel 的队列批次（不能只发信号） |
+| `scheduled` / `backoff` | 移除任务或取消 token，保证不再触发 |
+| 任意 | 取消后不得再产生副作用或投递（幂等键兜底） |
+
+同时在会话内提供显式的 `task cancel <id>`（见 Q3）。
 
 **配套（容易漏的）**：
 
@@ -188,7 +203,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 另外两条：
 
 - 给 task 结果带上稳定 `task_id`（幂等键），避免「任务完成但投递失败后重试」重复投递；
-- `DeliveryItem` 目前只有 bot + chat，**没有 thread/topic 维度**——默认回创建者时要明确落群根，还是扩展 thread（见 Q4）。
+- `DeliveryItem` 目前只有 bot + chat，**没有 thread/topic 维度**——默认回创建者时要明确落群根，还是扩展 thread（见 Q10）。
 
 #### D3 proc 由 ABB 派生以继承 TCC（**待验证，验不过就改方向**）
 
@@ -202,8 +217,9 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 #### D4 权限边界（现状比 v1 写的复杂）
 
-- `proc` 是**任意命令执行入口**：默认 **owner-only**；granted 直接禁止，或仅在可证明的 OS sandbox 内允许（Q2）。
-- 「只限自己创建的」**缺少可信身份**：`SenderRole` 只有 `Owner | Granted`（`src/config.rs:823-843`），同一群两个 granted 用户无法区分。可选：创建时下发 **capability token**（`task list/cancel/logs` 凭 token），或**直接 owner-only 管理**（更简单更严）。
+- `proc` 是**任意命令执行入口**：默认 **owner-only**；granted 直接禁止，或仅在可证明的 OS sandbox 内允许（Q8）。
+- 「只限自己创建的」**缺少可信身份**：`SenderRole` 只有 `Owner | Granted`（`src/config.rs:823-843`），同一群两个 granted 用户无法区分。可选：创建时下发 **capability token**，或**直接 owner-only 管理**（更简单更严）。
+- ⚠️ **capability token 不能明文存进 `tasks.json`**：该文件在 bot 工作区内，受限会话读策略允许读 root 内文件（读检查在 `crates/buzz-agent/src/wire.rs:168` 附近、调用在 `crates/buzz-agent/src/devtools.rs:923` 附近）——谁都读得到就不构成权限边界。至少只存 **hash**，或把 token 放到 agent 读域之外。
 - 白名单与保护名单**两份都要改**：`src/guard.rs:618` + `crates/buzz-agent/src/shell_policy.rs:126`；`tasks.json` / `tasks-state.json` / 日志目录加入 `src/guard.rs:359-390` 同类保护。
 - v1 那句「`task add` 全放行」不可接受。
 
@@ -212,7 +228,14 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 - **Windows 目前没有 Job Object**（`src/buzz/acp.rs:1958-1963` 只杀直接子进程）——要在 `proc` 落地时**新做**，否则 Windows 上的 proc 任务停不干净。
 - `agent-pids.json` 是 legacy 只读且只认 claude/codex/pi 命令行，**不能复用**（`src/agent.rs:446-452`、`:477-490`）。
 - 需要定义：SIGTERM 宽限 → SIGKILL；进程组/Job Object 归属；退出码与退出回收；ABB 崩溃后下次启动的清理（**Unix 上父进程被 SIGKILL 不会自动带走独立进程组**）。
-- 防自杀：#164 是动机，但现有保障只是 prompt 护栏（`src/agents_md.rs:107-114`）+ 恢复次数冻结（`src/bridge/recover.rs:6-10`、`:137-160`），**不是进程级边界**。supervisor 要保证 ABB 自身 PID / 自身会话不被纳入可杀集合——**不要用「pid 大小」这类伪规则**。
+- 防自杀：#164 是动机，但现有保障只是 prompt 护栏（`src/agents_md.rs:107-114`）+ 恢复次数冻结（`src/bridge/recover.rs:6-10`、`:137-160`），**不是进程级边界**。
+- ⚠️ **owner-only 不等于「禁止 owner 会话里的 agent 建自杀命令」**：owner 会话里的 agent 角色同样是 owner，仍可 `task add --proc` 出 `pkill` / `taskkill` / `kill <ABB pid>`。
+- 所以 P3 开工前必须在下面几条里**选一条能落地的**（Q8），而不是只写「supervisor 保证」：
+  1. **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）——最简最严；
+  2. `proc` 创建必须经过**不可绕过的二次确认**；
+  3. 用 **OS sandbox / 独立用户 / 受限 syscall** 做硬隔离；
+  4. 对命令与信号能力做**可执行白名单**（含禁止向 ABB 自身 pid / 进程组发信号）。
+- 以上都做不到，就**明确接受该风险并写进文档**，不要声称存在「防自杀边界」。**不要用「pid 大小」这类伪规则**判父子。
 
 #### D6 可观测与日志
 
@@ -237,7 +260,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | **P1a** | 统一默认投递目标（`deliver` / `job`） | D2 | 低 |
 | **P1b** | 可信 `DeliveryOrigin` + 豁免重构（含防循环回归） | D2 | **中**——碰防循环安全，不能当顺手改 |
 | **P2a** | task store + CLI + 权限/身份模型 | D4 | 中 |
-| **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q1 | **高**（动共享执行层） |
+| **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q7 | **高**（动共享执行层） |
 | **P3** | `proc` supervisor（含 Windows Job Object、基础日志/退出记录） | D3 Step 0、D5 | 中高 |
 | **P4** | 日志轮转 / 熔断告警 / 更完整可观测 | D6 | 低 |
 | **P5** | `job` → `task` 迁移（别名保留） | D7 | 中（兼容面广） |
@@ -252,7 +275,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 | 风险 | 说明 | 缓解 |
 |---|---|---|
-| 执行容量方案选错 | B1/B2 决定 #306 的并发上限与共享层回归面 | Q1 先拍板；P2b 前写性能/并发回归 |
+| 执行容量方案选错 | B1/B2 决定 #306 的并发上限与共享层回归面 | Q7 先拍板；P2b 前写性能/并发回归 |
 | TCC 继承不成立 | D3 是 #305 的地基 | Step 0 先行，验不过就改方向 |
 | 会话隔离的体验落差 | 后台任务看不到聊天上下文 | 文档写明；`--with-context` 观察需求后再做 |
 | 迁移破坏 `job` 使用者 | skill 与用户脚本依赖 `job` CLI | 别名保留 + 三件套迁移测试 |
