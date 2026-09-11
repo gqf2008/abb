@@ -208,8 +208,9 @@ impl AgentRunner for SpawnRetiredRunner {
 
 /// buzz 后端（共享 ACP agent 进程）的供应商 env 装配。命名空间与 pi 的宿主映射
 /// 无关：buzz-agent 的 OPENAI_COMPAT_BASE_URL / ANTHROPIC_BASE_URL 直接可指任意
-/// 端点，供应商配置的 base_url 原样透传。
-/// 支持 anthropic / openai-chat / openai-responses；其余 kind → Err（用户可见）。
+/// 端点，供应商配置的 base_url 原样透传（openrouter/deepseek 留空时回落各自预置端点）。
+/// 支持 anthropic / openai-chat / openai-responses / openrouter / deepseek；
+/// 其余 kind → Err（用户可见）。
 /// provider 为 None → Ok(None)（纯继承宿主 env，旧行为——e2e 即靠宿主注入）。
 pub(crate) fn buzz_provider_env(
     provider: Option<&crate::config::ProviderConfig>,
@@ -229,23 +230,30 @@ pub(crate) fn buzz_provider_env(
                 env.insert("ANTHROPIC_MODEL".into(), p.model.clone());
             }
         }
-        "openai-chat" | "openai-responses" => {
+        "openai-chat" | "openai-responses" | "openrouter" | "deepseek" => {
             env.insert("BUZZ_AGENT_PROVIDER".into(), "openai".into());
             env.insert("OPENAI_COMPAT_API_KEY".into(), p.api_key.clone());
             // 与 pi 不同：buzz-agent 的 base_url 就是请求端点，不是 provider 身份
             // 判定——供应商配的什么 URL 就打什么（含自定义网关/本地端点）。
-            if !p.base_url.is_empty() {
-                env.insert("OPENAI_COMPAT_BASE_URL".into(), p.base_url.clone());
+            // openrouter/deepseek 是预置端点：用户没填 base_url 时补默认值，填了以填的为准。
+            let base_url = if p.base_url.is_empty() {
+                crate::config::provider_kind_default_base_url(&p.kind)
+            } else {
+                p.base_url.as_str()
+            };
+            if !base_url.is_empty() {
+                env.insert("OPENAI_COMPAT_BASE_URL".into(), base_url.to_string());
             }
             if !p.model.is_empty() {
                 env.insert("OPENAI_COMPAT_MODEL".into(), p.model.clone());
             }
-            let api = if p.kind == "openai-chat" { "chat" } else { "responses" };
+            // 只有 openai-responses 走 responses 端点；其余（含两组预置）都是 chat
+            let api = if p.kind == "openai-responses" { "responses" } else { "chat" };
             env.insert("OPENAI_COMPAT_API".into(), api.into());
         }
         other => {
             return Err(format!(
-                "⚠️ 供应商「{}」类型 {other} 无法用于 buzz 后端（支持 anthropic / openai-chat / openai-responses）。",
+                "⚠️ 供应商「{}」类型 {other} 无法用于 buzz 后端（支持 anthropic / openai-chat / openai-responses / openrouter / deepseek）。",
                 p.name
             ))
         }
@@ -732,6 +740,38 @@ mod tests {
         let p2 = prov_bu("rs", "openai-responses", "https://api.openai.com/v1");
         let env2 = buzz_provider_env(Some(&p2)).unwrap().unwrap();
         assert_eq!(env2["OPENAI_COMPAT_API"], "responses");
+    }
+
+    /// #300：openrouter / deepseek 是 OpenAI 兼容**预置端点**——base_url 留空时补官方
+    /// 端点，填了以用户填的为准；协议路线都走 chat（不是 responses）。
+    #[test]
+    fn buzz_provider_env_maps_openrouter_and_deepseek_presets() {
+        let or = prov_bu("or", "openrouter", "");
+        let env = buzz_provider_env(Some(&or)).unwrap().unwrap();
+        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "openai");
+        assert_eq!(
+            env["OPENAI_COMPAT_BASE_URL"], "https://openrouter.ai/api/v1",
+            "openrouter 留空 base_url 必须补预置端点"
+        );
+        assert_eq!(env["OPENAI_COMPAT_API"], "chat");
+
+        let ds = prov_bu("ds", "deepseek", "");
+        let env2 = buzz_provider_env(Some(&ds)).unwrap().unwrap();
+        assert_eq!(
+            env2["OPENAI_COMPAT_BASE_URL"], "https://api.deepseek.com/v1",
+            "deepseek 留空 base_url 必须补预置端点"
+        );
+        assert_eq!(env2["OPENAI_COMPAT_API"], "chat");
+
+        // 显式 base_url 覆盖预置（自建网关 / 代理场景）——两种预置都要能覆盖
+        for kind in ["openrouter", "deepseek"] {
+            let custom = prov_bu("custom", kind, "https://proxy.example.com/v1");
+            let env3 = buzz_provider_env(Some(&custom)).unwrap().unwrap();
+            assert_eq!(
+                env3["OPENAI_COMPAT_BASE_URL"], "https://proxy.example.com/v1",
+                "{kind} 用户填了 base_url 就不能被预置覆盖"
+            );
+        }
     }
 
     #[test]

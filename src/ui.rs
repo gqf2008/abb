@@ -877,6 +877,8 @@ fn provider_to_row(p: &ProviderConfig, default_name: &str) -> ProviderRow {
     ProviderRow {
         name: p.name.clone().into(),
         kind: p.kind.clone().into(),
+        // 下拉下标与 label 同源，避免 Slint 侧再写一遍类型表（未知类型兜底 0=anthropic）
+        kind_index: crate::config::provider_kind_index(&p.kind).unwrap_or(0) as i32,
         base_url: p.base_url.clone().into(),
         api_key: "".into(), // 安全：密钥不回显
         model: p.model.clone().into(),
@@ -5245,23 +5247,45 @@ pub fn run_gui() -> Result<()> {
     Ok(())
 }
 
-/// 测试供应商连通性（best-effort，10s 超时）。返回用户可读结果，绝不含 api_key。
-/// openai-chat/responses：GET {base}/models 带 Bearer；anthropic：POST {base}/v1/messages 最小体。
-async fn test_provider(p: &ProviderConfig) -> std::result::Result<String, String> {
-    if p.base_url.is_empty() {
-        return Err("Base URL 为空".into());
+/// 「测试连接」的生效端点：`base_url` 留空时回落到类型预置（openrouter/deepseek），
+/// 两者都空 → `None`（调用方转成用户可见提示）。返回前去掉尾部 `/`，避免拼出 `//models`。
+fn test_provider_base_url(p: &ProviderConfig) -> Option<&str> {
+    let raw = if p.base_url.is_empty() {
+        crate::config::provider_kind_default_base_url(&p.kind)
+    } else {
+        p.base_url.as_str()
+    };
+    let trimmed = raw.trim_end_matches('/');
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// 「测试连接」用的协议族：openrouter/deepseek 是 OpenAI 兼容预置，与 openai-chat
+/// 走同一条 `GET {base}/models` + Bearer 路径；未知类型单独返回以便报错。
+fn test_provider_family(kind: &str) -> &'static str {
+    match kind {
+        "anthropic" => "anthropic",
+        "openai-chat" | "openai-responses" | "openrouter" | "deepseek" => "openai",
+        _ => "unknown",
     }
+}
+
+/// 测试供应商连通性（best-effort，10s 超时）。返回用户可读结果，绝不含 api_key。
+/// OpenAI 兼容系（含 openrouter/deepseek 预置）：GET {base}/models 带 Bearer；
+/// anthropic：POST {base}/v1/messages 最小体。
+async fn test_provider(p: &ProviderConfig) -> std::result::Result<String, String> {
+    let Some(base) = test_provider_base_url(p) else {
+        return Err("Base URL 为空（该类型无预置端点，请先填写）".into());
+    };
     if p.api_key.is_empty() {
         return Err("API Key 为空（测试前请先在输入框填密钥）".into());
     }
-    let base = p.base_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
     let label = format!("{}（{}）", p.name, p.kind);
-    match p.kind.as_str() {
-        "openai-chat" | "openai-responses" => {
+    match test_provider_family(&p.kind) {
+        "openai" => {
             let url = format!("{base}/models");
             let resp = client
                 .get(&url)
@@ -5314,7 +5338,7 @@ async fn test_provider(p: &ProviderConfig) -> std::result::Result<String, String
                 Err(format!("{label} 返回 HTTP {code}"))
             }
         }
-        other => Err(format!("未知供应商类型：{other}")),
+        _ => Err(format!("未知供应商类型：{}", p.kind)),
     }
 }
 
@@ -5350,6 +5374,49 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// #300：预置类型（openrouter/deepseek）留空 base_url 时，「测试连接」也要用预置端点；
+    /// 显式填的覆盖预置并去掉尾部斜杠；无预置且留空 → None。
+    #[test]
+    fn provider_test_base_url_uses_preset_when_blank() {
+        let mut p = crate::config::ProviderConfig {
+            kind: "openrouter".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            test_provider_base_url(&p),
+            Some("https://openrouter.ai/api/v1")
+        );
+        p.kind = "deepseek".into();
+        assert_eq!(
+            test_provider_base_url(&p),
+            Some("https://api.deepseek.com/v1")
+        );
+        // 显式填写覆盖预置，且去尾斜杠
+        p.base_url = "https://proxy.example.com/v1/".into();
+        assert_eq!(
+            test_provider_base_url(&p),
+            Some("https://proxy.example.com/v1")
+        );
+        // 无预置 + 留空 → 调用方报「Base URL 为空」
+        p.kind = "openai-chat".into();
+        p.base_url = String::new();
+        assert_eq!(test_provider_base_url(&p), None);
+    }
+
+    /// #300：预置类型必须走 OpenAI 兼容的测试路径（否则「测试连接」报未知类型）。
+    #[test]
+    fn provider_test_family_covers_presets() {
+        for k in ["openai-chat", "openai-responses", "openrouter", "deepseek"] {
+            assert_eq!(
+                test_provider_family(k),
+                "openai",
+                "{k} 应走 OpenAI 兼容路径"
+            );
+        }
+        assert_eq!(test_provider_family("anthropic"), "anthropic");
+        assert_eq!(test_provider_family("gemini"), "unknown");
+    }
     use super::*;
 
     #[test]

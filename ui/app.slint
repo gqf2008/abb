@@ -172,7 +172,8 @@ export struct BotRow {
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
 export struct ProviderRow {
     name: string,        // 唯一键
-    kind: string,        // anthropic | openai-chat | openai-responses
+    kind: string,        // anthropic | openai-chat | openai-responses | openrouter | deepseek
+    kind-index: int,     // kind 在类型下拉里的下标（Rust 侧按 PROVIDER_KINDS 算，未知类型=0）
     base-url: string,
     api-key: string,     // 密码框、加载后留空（编辑时重输=覆盖，留空=保留旧值）
     model: string,
@@ -2564,8 +2565,9 @@ export component SettingsWindow inherits Window {
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Text { text: "类型"; width: 96px; vertical-alignment: center; }
                                                     PixelComboBox {
-                                                        model: ["anthropic", "openai-chat", "openai-responses"];
-                                                        index: root.providers[root.provider-selected].kind == "anthropic" ? 0 : root.providers[root.provider-selected].kind == "openai-chat" ? 1 : 2;
+                                                        // 顺序与 Rust 侧 config::PROVIDER_KINDS 一致（openrouter/deepseek 是预置端点）
+                                                        model: ["anthropic", "openai-chat", "openai-responses", "openrouter", "deepseek"];
+                                                        index: root.providers[root.provider-selected].kind-index;
                                                         horizontal-stretch: 1;
                                                         selected(idx) => { root.provider-field-edited(root.provider-selected, "kind", self.model[idx]); }
                                                     }
@@ -2574,7 +2576,7 @@ export component SettingsWindow inherits Window {
                                                     Text { text: "Base URL"; width: 96px; vertical-alignment: center; }
                                                     PixelTextInput {
                                                         text: root.providers[root.provider-selected].base-url;
-                                                        placeholder: "如 https://api.anthropic.com 或 https://api.openai.com/v1";
+                                                        placeholder: "如 https://api.openai.com/v1；openrouter/deepseek 留空=官方端点";
                                                         horizontal-stretch: 1;
                                                         edited => { root.provider-field-edited(root.provider-selected, "base_url", self.text); }
                                                     }

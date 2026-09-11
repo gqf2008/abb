@@ -64,7 +64,7 @@ fn resolve_acp_command(buzz_cmd: Option<&str>) -> String {
 }
 
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
-/// buzz 语义：`BUZZ_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses 全系
+/// buzz 语义：`BUZZ_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses/openrouter/deepseek 全系
 /// 兼容 env（buzz_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
 /// 装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
 /// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
