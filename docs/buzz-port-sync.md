@@ -25,7 +25,7 @@
 | prompt_framing.rs | 保留 | 上下文片段渲染（可能小裁） |
 | lib.rs | 裁为壳 | 只留 dispatch_pending/handle_prompt_result/重拉退避切片；删 run()/clap/子命令/装配 |
 | pool_lifecycle.rs | 保留 | 懒池状态机（零外部依赖） |
-| base_prompt.md | 重写 | ABB 交付语义：「回合结束文本由桥直接投递，禁止发布命令/假装工具」 |
+| base_prompt.md | 重写 | ABB 交付语义：「回合结束文本由桥直接投递，禁止发布命令/假装工具」；另声明安装包随带 `rg/jq/uv/gh` 并优先使用，`git/bun/sed/find` 明确不随包 |
 | relay.rs | 删除 | WS/事件层——ABB 全进程内，无外部消费者 |
 | config.rs | 删除 | clap/env 装配——改由 ABB config 侧注入 |
 | filter.rs / engram_fetch.rs / setup_mode.rs / observer.rs / usage.rs / prompt_project.rs | 删除 | 门控/抓取/装配面被裁剪或由 ABB 侧替代 |

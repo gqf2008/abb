@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v5";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v6";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -105,6 +105,10 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 
 ## 其它
 
+- **随包工具优先**：安装包内置 `rg` / `jq` / `uv` / `gh`，PATH 已优先指向它们。
+  - 搜索优先 `rg`，JSON 优先 `jq`，Python 环境优先 `uv`，GitHub 操作优先 `gh`。
+  - `uv` 只管 Python 环境/依赖，不保证 Python 已下载；`gh` 会沿用宿主登录态，先查 `gh auth status`，未认证时给出 `command -v gh` 解析到的完整路径让用户执行 `gh auth login`。
+  - `git` / `bun` / `sed` / `find` **不随包**，仍按宿主环境处理，缺失时明确说明。
 - 任务完成（产出最终回复）后**立即退出**，不要持续运行或等待。
 - 普通问答、查资料、改文件等直接做即可，做完输出结论。
 - 你只能读写本工作区；不要假设有公网入站（消息靠桥转）。
@@ -743,7 +747,7 @@ mod tests {
         // 旧模板（无版本标记、写死 agent-bridge job）→ 覆盖升级为 $ABB_BIN 版
         let dir = std::env::temp_dir().join(format!("abb-guide-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let old = "# ABB 工作区\n\n## 定时 / 周期 / 延迟任务 → 用 job CLI\n\n用本机 `agent-bridge job` CLI 建定时任务…\n";
+        let old = "# ABB 工作区（abb-guide-v5）\n\n## 定时 / 周期 / 延迟任务 → 用 job CLI\n\n用本机 `agent-bridge job` CLI 建定时任务…\n";
         std::fs::write(dir.join("CLAUDE.md"), old).unwrap();
         std::fs::write(dir.join("AGENTS.md"), old).unwrap();
 
@@ -751,6 +755,10 @@ mod tests {
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             assert!(text.contains(GUIDE_MARKER), "{name} 应含版本标记");
+            assert!(
+                !text.contains("abb-guide-v5"),
+                "{name} 不应保留旧 v5 marker"
+            );
             assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
             assert!(
                 !text.contains("`agent-bridge job`"),
@@ -761,6 +769,13 @@ mod tests {
             assert!(
                 text.contains("--to-current"),
                 "{name} 必须写明把附件发到当前会话的用法"
+            );
+            for needle in ["随包工具优先", "rg", "jq", "uv", "gh"] {
+                assert!(text.contains(needle), "{name} 应写明随包工具 {needle}");
+            }
+            assert!(
+                text.contains("`git` / `bun` / `sed` / `find` **不随包**"),
+                "{name} 应明确四个不随包工具"
             );
         }
 
@@ -790,8 +805,20 @@ mod tests {
             let text = std::fs::read_to_string(dir.join(name))
                 .unwrap_or_else(|e| panic!("{name} 应在自建目录里落盘: {e}"));
             assert!(text.contains(GUIDE_MARKER), "{name} 应含版本标记");
+            assert!(text.contains("随包工具优先"), "{name} 应含工具偏好");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn base_prompt_mentions_bundled_tools_and_exclusions() {
+        let prompt = include_str!("buzz/base_prompt.md");
+        for needle in ["# 环境与工具", "`rg`", "`jq`", "`uv`", "`gh`"] {
+            assert!(prompt.contains(needle), "base prompt 缺 {needle}");
+        }
+        assert!(prompt.contains("`git` / `bun` / `sed` / `find` **不随包**"));
+        assert!(prompt.contains("gh auth login"));
+        assert!(prompt.contains("gh auth status"));
     }
 
     #[test]
