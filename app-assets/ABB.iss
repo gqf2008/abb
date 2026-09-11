@@ -43,6 +43,9 @@ Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; fake-mcp 是测试桩，不入包。buzz-acp 已随 #200 进程内化退役，不入包。
 Source: "..\crates\buzz-agent\target\release\buzz-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\crates\buzz-agent\LICENSE"; DestDir: "{app}"; DestName: "buzz-LICENSE.txt"; Flags: ignoreversion
+; 随包工具：rg/jq/uv/gh；git/bun/sed/find 明确不随包。
+Source: "..\tools-dist\bin\*"; DestDir: "{app}\tools\bin"; Flags: ignoreversion
+Source: "..\tools-dist\licenses\*"; DestDir: "{app}\tools\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\ABB.ico"

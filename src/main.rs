@@ -297,6 +297,28 @@ fn main() {
         return;
     }
 
+    // 隐藏诊断：确认随包工具与宿主 PATH 的最终解析结果。
+    if args.iter().any(|a| a == "--dump-tools") {
+        let strict = args.iter().any(|a| a == "--require-bundled-tools");
+        let mut not_bundled = false;
+        for tool in deps::BUNDLED_TOOLS {
+            let (source, path) = deps::bundled_tool_status(tool);
+            if source != "bundled" {
+                not_bundled = true;
+            }
+            println!(
+                "{tool}\t{source}\t{}",
+                path.as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+        if strict && not_bundled {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--service") {
         // 单实例：已有一个 --service 在跑就直接退出（flock 拿不到锁）
         let _guard = match single_instance::SingleInstance::acquire("service") {

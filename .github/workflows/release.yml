@@ -75,6 +75,9 @@ jobs:
           cp crates/buzz-agent/LICENSE ABB.app/Contents/Resources/buzz-LICENSE.txt
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
+          # 随包工具：版本/URL/SHA256 锁在 tools/tool-lock.tsv；不含 git/bun/sed/find。
+          bash tools/fetch_bundled_tools.sh --platform macos-arm64 \
+            --dest ABB.app/Contents/Resources/tools
           # #251：--options runtime（hardened runtime）必须与 --entitlements 配套——
           # 缺 camera/audio-input/apple-events entitlement 时 tccd 对摄像头/麦克风
           # 直接 deny 且不允许弹窗。主可执行与 bundle 双层都带（codesign 对 bundle
@@ -84,8 +87,12 @@ jobs:
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
+          for tool in rg jq uv gh; do
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
+          done
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
+          ./ABB.app/Contents/MacOS/agent-bridge --dump-tools --require-bundled-tools
 
       - name: Notarize + staple app
         env:
@@ -150,6 +157,10 @@ jobs:
       # 默认 target 即 x86_64-pc-windows-msvc。
       - name: Build forked buzz-agent
         run: cargo build --release --manifest-path crates/buzz-agent/Cargo.toml
+
+      - name: Fetch bundled tools
+        shell: pwsh
+        run: ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist
 
       - name: Install Inno Setup
         shell: pwsh

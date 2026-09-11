@@ -1,4 +1,5 @@
-//! 依赖检测与安装 —— nodejs / lark-cli / dingtalk-cli / git（python3 为信息项）。
+//! 依赖检测与安装 —— nodejs / lark-cli / dingtalk-cli / git（python3 为信息项），
+//! 以及安装包内置工具 rg/jq/uv/gh 的 PATH 注入与体检。
 //! 单后端化 P4.3：claude / codex / pi 三后端 CLI 与 ACP 适配器三件套的探测+安装臂
 //! 已随 UI 下架删除——执行层收口随包 buzz-agent（零安装），本机不再要求任何 agent CLI。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
@@ -11,6 +12,56 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+/// 安装包内置、优先于宿主 PATH 的四个工具。这里故意不含 git/bun/sed/find：
+/// git 仍为宿主依赖；sed/find 用系统版；bun 不随包。
+pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh"];
+
+/// 根据主程序路径推导随包工具 bin（不检查存在性，便于单测）。
+fn bundled_tools_dir_for(exe: &std::path::Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    #[cfg(target_os = "macos")]
+    {
+        Some(macos.parent()?.join("Resources").join("tools").join("bin"))
+    }
+    #[cfg(windows)]
+    {
+        Some(macos.join("tools").join("bin"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = macos;
+        None
+    }
+}
+
+/// 当前安装布局下的随包工具目录；开发构建没有该目录时返回 None。
+pub fn bundled_tools_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = bundled_tools_dir_for(&exe)?;
+    dir.is_dir().then_some(dir)
+}
+
+fn tool_source_with(
+    resolved: Option<&std::path::Path>,
+    bundled: Option<&std::path::Path>,
+) -> &'static str {
+    match resolved {
+        Some(path) if bundled.is_some_and(|dir| path.starts_with(dir)) => "bundled",
+        Some(_) => "system",
+        None => "missing",
+    }
+}
+
+/// 一个工具最终解析到的位置与来源（bundled/system/missing）。
+pub fn bundled_tool_status(tool: &str) -> (&'static str, Option<PathBuf>) {
+    let resolved = find_in_path(tool);
+    let bundled = bundled_tools_dir();
+    (
+        tool_source_with(resolved.as_deref(), bundled.as_deref()),
+        resolved,
+    )
+}
 
 /// Windows：spawn 外部子进程时抑制控制台窗口（CREATE_NO_WINDOW）。
 /// 桥/服务是 GUI 子系统，spawn reg/npm/cmd/taskkill 等控制台程序默认会弹黑框——
@@ -27,7 +78,11 @@ pub fn apply_no_window(cmd: &mut std::process::Command) {
 #[cfg(unix)]
 pub fn composed_path() -> String {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let mut parts = vec![
+    let mut parts = Vec::new();
+    if let Some(tools) = bundled_tools_dir() {
+        parts.push(tools.to_string_lossy().into_owned());
+    }
+    parts.extend([
         home.join(".local/bin").to_string_lossy().into_owned(),
         home.join(".npm-global/bin").to_string_lossy().into_owned(),
         home.join(".cargo/bin").to_string_lossy().into_owned(),
@@ -38,7 +93,7 @@ pub fn composed_path() -> String {
         "/bin".to_string(),
         "/usr/sbin".to_string(),
         "/sbin".to_string(),
-    ];
+    ]);
     // 系统级持久 PATH 源：/etc/paths 与 /etc/paths.d/*（GUI/launchd 启动不读 shell rc，
     // 但会读 /etc/paths.d——用户自定义安装目录常放在这）。
     parts.extend(unix_etc_paths());
@@ -104,6 +159,9 @@ fn windows_pwsh_dirs() -> Vec<String> {
 #[cfg(windows)]
 pub fn composed_path() -> String {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(tools) = bundled_tools_dir() {
+        parts.push(tools.to_string_lossy().into_owned());
+    }
     // #90：真实 pwsh 目录必须最优先（见 windows_pwsh_dirs 注释——sandbox runner 用
     // PATH 解析 pwsh，WindowsApps 别名会 1920 失败）。放最前保证优先于 WindowsApps。
     parts.extend(windows_pwsh_dirs());
@@ -1263,6 +1321,90 @@ mod tests {
         assert_eq!(parse_version("0"), None); // 不足两段
         assert_eq!(parse_version("1..2"), None); // 空段
         assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn bundled_tools_dir_matches_install_layout() {
+        #[cfg(target_os = "macos")]
+        {
+            let exe = std::path::Path::new("/Applications/ABB.app/Contents/MacOS/agent-bridge");
+            assert_eq!(
+                bundled_tools_dir_for(exe),
+                Some(PathBuf::from(
+                    "/Applications/ABB.app/Contents/Resources/tools/bin"
+                ))
+            );
+        }
+        #[cfg(windows)]
+        {
+            let exe =
+                std::path::Path::new(r"C:\Users\me\AppData\Local\Programs\ABB\agent-bridge.exe");
+            assert_eq!(
+                bundled_tools_dir_for(exe),
+                Some(PathBuf::from(
+                    r"C:\Users\me\AppData\Local\Programs\ABB\tools\bin"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_tool_source_distinguishes_bundled_system_missing() {
+        let bundled = std::path::Path::new("/Applications/ABB.app/Contents/Resources/tools/bin");
+        let in_bundle = bundled.join("rg");
+        let system = std::path::Path::new("/opt/homebrew/bin/rg");
+        assert_eq!(tool_source_with(Some(&in_bundle), Some(bundled)), "bundled");
+        assert_eq!(tool_source_with(Some(system), Some(bundled)), "system");
+        assert_eq!(tool_source_with(None, Some(bundled)), "missing");
+        assert_eq!(tool_source_with(Some(system), None), "system");
+    }
+
+    #[test]
+    fn bundled_tool_lock_has_exact_scope() {
+        let lock = include_str!("../tools/tool-lock.tsv");
+        let rows: Vec<&str> = lock
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            BUNDLED_TOOLS.len() * 2,
+            "每个工具应有两个平台资产"
+        );
+        for banned in ["git", "bun", "sed", "find"] {
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row.starts_with(&format!("{banned}\t"))),
+                "{banned} 明确不随包，不得进入 tool lock"
+            );
+        }
+        for row in rows {
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(cols.len(), 8, "lock 行字段数: {row}");
+            assert_eq!(cols[5].len(), 64, "SHA256 长度: {row}");
+            assert!(cols[4].starts_with("https://"), "URL 必须 HTTPS: {row}");
+        }
+        let matrix: std::collections::HashSet<(&str, &str, &str)> = lock
+            .lines()
+            .skip(1)
+            .filter_map(|row| {
+                let cols: Vec<&str> = row.split('\t').collect();
+                (cols.len() == 8).then(|| (cols[0], cols[2], cols[7]))
+            })
+            .collect();
+        let expected = std::collections::HashSet::from([
+            ("rg", "macos-arm64", "rg"),
+            ("rg", "windows-x64", "rg.exe"),
+            ("jq", "macos-arm64", "jq"),
+            ("jq", "windows-x64", "jq.exe"),
+            ("uv", "macos-arm64", "uv"),
+            ("uv", "windows-x64", "uv.exe"),
+            ("gh", "macos-arm64", "gh"),
+            ("gh", "windows-x64", "gh.exe"),
+        ]);
+        assert_eq!(matrix, expected, "随包工具矩阵必须精确锁定");
     }
 
     #[test]
