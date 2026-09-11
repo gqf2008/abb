@@ -2,6 +2,7 @@
 name = "agent-bridge"
 version = "2.23.48"
 edition = "2021"
+license = "MIT"
 build = "build.rs"
 
 [dependencies]
