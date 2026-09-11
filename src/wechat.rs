@@ -470,10 +470,9 @@ impl OutboundMediaKind {
 struct UploadedMedia {
     /// CDN 下载参数（`CDNMedia.encrypt_query_param`）。
     download_param: String,
-    /// `CDNMedia.aes_key`：图片=base64(原始 16 字节)，其余=base64(32 hex)。
+    /// `CDNMedia.aes_key`：官方发送器对**所有**媒体类型统一用 base64(32 个 hex 字符)
+    /// （见 `upload_media`，Tencent/openclaw-weixin `src/cdn/upload.ts`）。
     aes_key_b64: String,
-    /// 原始 16 字节密钥的 hex（图片的 `image_item.aeskey` 用）。
-    aeskey_hex: String,
     /// 加密后字节数（图片 mid_size / 视频 video_size）。
     cipher_size: u64,
 }
@@ -661,12 +660,11 @@ impl WeixinClient {
         let item = match kind {
             OutboundMediaKind::Image => serde_json::json!({
                 "type": kind.item_type(),
+                // 只放官方出站字段：media(aes_key/encrypt_query_param/encrypt_type) + mid_size。
+                // 别再加 `image_item.aeskey` —— 官方定义它是**入站**字段（下载时优先用），
+                // 出站带上属非官方形态（#297）。
                 "image_item": {
                     "media": cdn_media.clone(),
-                    // 图片密钥的两种表示都放上：`media.aes_key` 是 base64(原始 16 字节)
-                    // （协议对图片的规定），`aeskey` 是 hex。入站图片也同时带这两个字段
-                    // （见 parse_aes_key_from_b64 的两种容忍分支），接收端取哪个都能解。
-                    "aeskey": up.aeskey_hex,
                     "mid_size": up.cipher_size,
                 }
             }),
@@ -710,12 +708,11 @@ impl WeixinClient {
         // 密钥是机密：用 CSPRNG（uuid v4 由 getrandom 提供）而不是通用 PRNG。
         let aeskey: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
         let aeskey_hex: String = aeskey.iter().map(|b| format!("{b:02x}")).collect();
-        // 图片与文件/视频/语音的 aes_key 编码不同（协议「Crypto」节）：
-        // 图片=base64(原始 16 字节)；其余=base64(32 个 hex 字符)。
-        let aes_key_b64 = match kind {
-            OutboundMediaKind::Image => b64::encode(&aeskey),
-            _ => b64::encode(aeskey_hex.as_bytes()),
-        };
+        // 官方发送器（Tencent/openclaw-weixin src/messaging/send.ts）对图片/视频/文件
+        // **统一**用 base64(32 个 hex 字符)——即 base64(hex 字符串的 ASCII 字节)，
+        // 与 `getuploadurl` 里传的 `aeskey`(hex) 同源。历史上图片误用 base64(原始 16 字节)，
+        // 微信端拿这个 key 解不开 CDN 密文 → 显示「图片已过期或被清理」（回归见 #297 测试）。
+        let aes_key_b64 = b64::encode(aeskey_hex.as_bytes());
         let filekey: String = (0..32)
             .map(|_| format!("{:x}", fastrand::u8(..16)))
             .collect();
@@ -787,7 +784,6 @@ impl WeixinClient {
         Ok(UploadedMedia {
             download_param,
             aes_key_b64,
-            aeskey_hex,
             cipher_size: cipher_size as u64,
         })
     }
@@ -857,9 +853,11 @@ impl WeixinClient {
 
 // ── CDN AES-128-ECB 解密（对齐 openclaw-weixin src/cdn）──
 
-/// 从 base64 的 aes_key 还原 16 字节密钥。两种形态：
-///   - base64(原始 16 字节)          → 图片（media.aes_key）
-///   - base64(16 字节的 hex 字符串)  → 文件/语音/视频（media.aes_key）
+/// 从 base64 的 aes_key 还原 16 字节密钥（解析端两种形态都容忍）：
+///   - base64(32 个 hex 字符)        → 官方发送器当前一律用这种（图片/视频/文件）
+///   - base64(原始 16 字节)          → 兼容历史/第三方发送方
+///
+/// 官方协议文档：下载解码器接受两种；实际发送行为见 #297。
 fn parse_aes_key_from_b64(aes_key_b64: &str) -> Result<[u8; 16]> {
     let decoded = b64::decode(aes_key_b64).context("aes_key base64 解码失败")?;
     if decoded.len() == 16 {
@@ -1207,10 +1205,12 @@ mod tests {
         );
     }
 
-    /// 图片分支：item=2 / media_type=1，且 aes_key 的编码与文件类**不同**
-    /// （协议：图片 base64(原始 16 字节)），并额外带 image_item.aeskey（hex）。
+    /// 回归（#297）：图片 CDNMedia.aes_key 必须与官方实现一致 = base64(32 个 hex 字符)，
+    /// **不能**用 base64(原始 16 字节)——编码错了微信端解不开 CDN 密文，端上显示
+    /// 「图片已过期或被清理」。同时出站 image_item 只保留官方字段（media + mid_size），
+    /// 不再带仅供入站使用的 `aeskey`。
     #[tokio::test]
-    async fn send_media_image_uses_image_item_and_raw_key_encoding() {
+    async fn send_media_image_matches_official_aes_key_encoding() {
         let server = media_mock(true).await; // 这次走 upload_full_url 分支
         let wx = WeixinClient::new(&server.base, "tok", &server.base);
         let data = b"fakepng".to_vec();
@@ -1235,15 +1235,20 @@ mod tests {
             serde_json::from_str(&rec(&recs, "/ilink/bot/sendmessage").body).unwrap();
         let item = &sm["msg"]["item_list"][0];
         assert_eq!(item["type"], 2, "图片 item type=2");
-        assert_eq!(item["image_item"]["mid_size"], 16);
-        assert_eq!(
-            item["image_item"]["aeskey"], aeskey_hex,
-            "图片额外带 hex 形式"
-        );
+        assert_eq!(item["image_item"]["mid_size"], 16, "mid_size=密文字节数");
         assert_eq!(
             item["image_item"]["media"]["aes_key"],
+            b64::encode(aeskey_hex.as_bytes()),
+            "图片 aes_key 必须与官方一致 = base64(32 个 hex 字符)"
+        );
+        assert_ne!(
+            item["image_item"]["media"]["aes_key"],
             b64::encode(&key),
-            "图片 aes_key = base64(原始 16 字节)"
+            "不能再用 base64(原始 16 字节)——这正是 #297 的根因"
+        );
+        assert!(
+            item["image_item"].get("aeskey").is_none(),
+            "出站 image_item 不带 aeskey（官方定义为入站字段）: {item}"
         );
     }
 
