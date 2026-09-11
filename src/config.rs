@@ -729,14 +729,16 @@ impl BotConfig {
     }
 }
 
-/// 模型供应商配置。只支持 Anthropic 原生 + OpenAI 兼容（chat / responses）。
+/// 模型供应商配置。支持 Anthropic 原生 + OpenAI 兼容（chat / responses），
+/// 以及 OpenRouter / DeepSeek 两个 OpenAI 兼容预置（见 [`PROVIDER_KINDS`]）。
 /// api_key 等同凭证，随 config.json 0600 保存，绝不进日志。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// 唯一键（BotConfig.provider / Config.default_provider 指向它）。
     #[serde(default)]
     pub name: String,
-    /// 类型：anthropic | openai-chat | openai-responses
+    /// 类型：见 [`PROVIDER_KINDS`]（anthropic | openai-chat | openai-responses |
+    /// openrouter | deepseek）。未知类型在注入时会变成用户可见错误。
     #[serde(default = "default_provider_kind")]
     pub kind: String,
     #[serde(default)]
@@ -762,6 +764,32 @@ impl Default for ProviderConfig {
 
 fn default_provider_kind() -> String {
     "anthropic".to_string()
+}
+
+/// 供应商类型的规范列表——GUI「类型」下拉与合法性判定共用，**顺序即下拉顺序**。
+///
+/// `openai-chat` / `openai-responses` 是 OpenAI 兼容的两条协议路线；`openrouter` /
+/// `deepseek` 是同一协议族下的**预置端点**（省去手填 base_url，填了则以用户填的为准）。
+pub const PROVIDER_KINDS: [&str; 5] = [
+    "anthropic",
+    "openai-chat",
+    "openai-responses",
+    "openrouter",
+    "deepseek",
+];
+
+/// 类型 → 预置 base_url（空串 = 无预置，必须由用户自填）。
+pub fn provider_kind_default_base_url(kind: &str) -> &'static str {
+    match kind {
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "deepseek" => "https://api.deepseek.com/v1",
+        _ => "",
+    }
+}
+
+/// 类型在 [`PROVIDER_KINDS`] 里的下标（未知类型 → `None`，GUI 按 0 兜底）。
+pub fn provider_kind_index(kind: &str) -> Option<usize> {
+    PROVIDER_KINDS.iter().position(|k| *k == kind)
 }
 
 /// 纯函数：owner 白名单是否放行 sender。空（或只有分隔符/空白）owner = 不设限（true）；
@@ -2324,6 +2352,30 @@ mod tests {
         );
         // 消费新码时顺带清掉过期残留，pending 不无限增长
         assert!(bot.pending_codes.is_empty());
+    }
+
+    /// #300：类型表 / 预置端点 / 下拉下标三者必须对齐——GUI 靠下标回填，
+    /// 注入靠类型表判定，任一漂移都会让「选了 OpenRouter 却打错端点」。
+    #[test]
+    fn provider_kinds_are_consistent_with_presets_and_index() {
+        assert!(PROVIDER_KINDS.contains(&"openrouter"));
+        assert!(PROVIDER_KINDS.contains(&"deepseek"));
+        for (i, k) in PROVIDER_KINDS.iter().enumerate() {
+            assert_eq!(provider_kind_index(k), Some(i), "{k} 下标必须与表一致");
+        }
+        assert_eq!(provider_kind_index("nope"), None);
+        assert_eq!(
+            provider_kind_default_base_url("openrouter"),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            provider_kind_default_base_url("deepseek"),
+            "https://api.deepseek.com/v1"
+        );
+        // 无预置的类型必须返回空串（强制用户自填，不能静默打错端点）
+        assert_eq!(provider_kind_default_base_url("anthropic"), "");
+        assert_eq!(provider_kind_default_base_url("openai-chat"), "");
+        assert_eq!(provider_kind_default_base_url("openai-responses"), "");
     }
 
     #[test]

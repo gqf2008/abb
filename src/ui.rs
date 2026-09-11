@@ -877,6 +877,8 @@ fn provider_to_row(p: &ProviderConfig, default_name: &str) -> ProviderRow {
     ProviderRow {
         name: p.name.clone().into(),
         kind: p.kind.clone().into(),
+        // 下拉下标与 label 同源，避免 Slint 侧再写一遍类型表（未知类型兜底 0=anthropic）
+        kind_index: crate::config::provider_kind_index(&p.kind).unwrap_or(0) as i32,
         base_url: p.base_url.clone().into(),
         api_key: "".into(), // 安全：密钥不回显
         model: p.model.clone().into(),
