@@ -1,0 +1,9 @@
+tool	version	platform	package	url	sha256	inner_path	output_name
+rg	15.2.0	macos-arm64	tar.gz	https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz	3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4	rg	rg
+rg	15.2.0	windows-x64	zip	https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip	71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5	rg.exe	rg.exe
+jq	1.8.2	macos-arm64	source-tar	https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-1.8.2.tar.gz	71b8d6e8f5fe81f6c6d0d110e3892251f6ce76ed095abd315e26e6e1193af3af	jq	jq
+jq	1.8.2	windows-x64	raw	https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe	a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627	-	jq.exe
+uv	0.12.13	macos-arm64	tar.gz	https://github.com/astral-sh/uv/releases/download/0.12.13/uv-aarch64-apple-darwin.tar.gz	7e6ddb9316acc00f2296c82ff4d99977870ee34b2f0ddcae9444d714db9364ed	uv	uv
+uv	0.12.13	windows-x64	zip	https://github.com/astral-sh/uv/releases/download/0.12.13/uv-x86_64-pc-windows-msvc.zip	a86c9dc7bad9b03f388583b7187c05fe9951c2e0d392217e8fd43d97787f6ec2	uv.exe	uv.exe
+gh	2.100.0	macos-arm64	zip	https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_macOS_arm64.zip	45f9a62da2f6e641a7fad57e2ce39656dfd7ef331372d80a2a2aed65abb01642	bin/gh	gh
+gh	2.100.0	windows-x64	zip	https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_windows_amd64.zip	227e35230b25db3fa1b997bab7cf4d67df0470a3b75b99e4ee66bce1a7cd4e72	bin/gh.exe	gh.exe

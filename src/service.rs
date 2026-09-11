@@ -265,6 +265,15 @@ pub async fn run() {
     for p in crate::deps::detect_permissions() {
         crate::log!("[perm] 检测 {}: {:?}", p.id, p.state);
     }
+    for tool in crate::deps::BUNDLED_TOOLS {
+        let (source, path) = crate::deps::bundled_tool_status(tool);
+        crate::log!(
+            "[tools] {tool} -> {source} {}",
+            path.as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
 
     let cfg = Arc::new(cfg);
 
