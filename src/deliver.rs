@@ -960,6 +960,25 @@ mod tests {
             ("feishu", "c1")
         );
         assert!(!d2.in_session, "显式目标是跨会话投递，不该被默认改写");
+
+        // 单边目标不触发默认：仍按原样报缺另一半（别把半个目标当成"没给目标"）
+        let mk = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let e =
+            parse_deliver_args(&mk(&["--chat", "c1", "--text", "hi"]), "wechat", "u1").unwrap_err();
+        assert!(e.contains("--bot"), "只给 --chat 应报缺 --bot: {e}");
+        let e = parse_deliver_args(&mk(&["--bot", "feishu", "--text", "hi"]), "wechat", "u1")
+            .unwrap_err();
+        assert!(e.contains("--chat"), "只给 --bot 应报缺 --chat: {e}");
+
+        // 缺省目标 + 显式来源 → 拒绝：不能构造「in_session=true 但来源≠目标」的项
+        // （那正是 #21 自环豁免的信任前提，必须锁死）
+        let e = parse_deliver_args(
+            &mk(&["--text", "hi", "--source-bot", "feishu"]),
+            "wechat",
+            "u1",
+        )
+        .unwrap_err();
+        assert!(e.contains("不要再给"), "显式来源 + 缺省目标必须拒: {e}");
     }
 
     #[test]
