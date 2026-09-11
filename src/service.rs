@@ -1313,12 +1313,11 @@ async fn run_job(
     // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明 + 三级
     // AGENTS.md 指令文件块（组装抽成 job_prompt 纯函数，可测）。
     let prompt = job_prompt(&job, &bot_key);
-    // 定时任务可被「停止词」打断（#卡死修复）：注册到目标会话的 cancel 标志，
-    // 用户在该会话发 停/停止/cancel 即可终止正在跑的后台任务；
-    // 与聊天任务共用同一 key（chat_id）——同一 chat 同一时刻只有一个在跑任务。
-    // job 走 ACP 同步回合：叫停走 harness cancel 信号（/cancel 命令路径），
-    // CLI 的 cancel_flag 机制随 spawn 退役——不再注册。
-    let _cancel_flag = bridge.register_cancel_flag(&job.chat_id);
+    // 定时任务的叫停（#309）：job 走 ACP 同步回合，**不消费** Bridge 的 cancel flag
+    // （那是旧 spawn 路径的机制，随 spawn 退役）。历史上这里注册过一个 flag，但它没有
+    // 任何读者，反而让停止词分支命中后直接 return、把真实叫停短路掉——所以不再注册。
+    // 现在的路径：会话内发停止词/`/cancel` → 桥的 buzz_cancel() → handle.cancel(channel)，
+    // 而 job 与聊天共用同一个 channel_uuid，因此能真正打断在跑的 job 轮次。
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     // P2.2/P2.3：按 job 角色选实例——granted 任务路由 granted 实例（强制受限剖面），

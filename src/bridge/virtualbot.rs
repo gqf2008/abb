@@ -389,13 +389,29 @@ impl Bridge {
             return;
         }
         if is_cancel_keyword(&text) {
+            // 有 chat 回合在跑（该 chat 的 flag 在册）→ 置标志，由回合自己优雅收尾并回
+            // 「⏹ 已停止」（沿用既有语义，不动）。
             if let Some(flag) = self.cancel_flags.lock().unwrap().get(&key).cloned() {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::log!("[bridge] 收到停止指令 chat={}", trunc(&key, 16));
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
-            // 无在跑任务 → 停止词当普通消息透传给 agent
+            // 没有 chat 回合在跑，但可能有**非 chat 轮次**（定时任务 job 与聊天共用同一
+            // channel，走 ACP 等待、不消费本 chat 的 flag）→ 必须走真实叫停（#309）。
+            let harness = self.buzz_cancel(&ev).await;
+            match stop_word_route(false, harness) {
+                StopWordRoute::HarnessCancel => {
+                    crate::log!(
+                        "[bridge] 收到停止指令（无 chat 回合在跑）→ 真实叫停 harness 轮次 chat={}",
+                        trunc(&key, 16)
+                    );
+                    return;
+                }
+                // 没在跑 / harness 未装配：照旧把这条当普通消息透传
+                // （对话语境下不该硬拦，例如「别取消，先继续」）
+                StopWordRoute::Passthrough | StopWordRoute::SignalChatTurn => {}
+            }
         }
 
         // 记录本 bot 主会话（私聊）：定时任务会话失效时的回落目标 + job CLI 缺省回发处
@@ -1197,10 +1213,14 @@ impl Bridge {
     ///
     /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停。!shutdown/!rotate
     /// 等 harness 无此面（cancel 是唯一暴露给聊天的控制信号）。
-    async fn buzz_cancel_reply(&self, ev: &Ev) -> String {
-        let Some(handle) = self.acp_handle_for_role(ev.role) else {
-            return "⚠️ 叫停未送达：harness 未装配（检查服务状态/重启）。".to_string();
-        };
+    /// 向 harness 发**真实**叫停（无用户可见文案）。返回值语义：
+    /// `Some(true)` = 已向在跑轮次发 Cancel 信号；`Some(false)` = 没有在跑（含频道未登记）；
+    /// `None` = harness 未装配 / 已关闭（没送到）。
+    ///
+    /// 抽出来是给「自然停止词」用的：它需要知道**到底有没有叫停成功**才能决定
+    /// 是静默返回（真停了）还是把这条消息当普通对话透传（本来就没在跑）。
+    async fn buzz_cancel(&self, ev: &Ev) -> Option<bool> {
+        let handle = self.acp_handle_for_role(ev.role)?;
         let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
             crate::buzz::keys::channel_uuid(&self.bot.key(), &ev.chat_id)
         } else {
@@ -1210,11 +1230,14 @@ impl Bridge {
         // 频道从未登记 = 从未 dispatch 过 = 无轮次可停（话题与群根同判据——
         // 登记先于 dispatch 发生，见 buzz_ensure_topic_channel / 巡检登记）。
         if !handle.channel_registered(&channel_id) {
-            return "✅ 当前没有正在运行的任务。".to_string();
+            return Some(false);
         }
-        match handle.cancel(channel_id).await {
-            // Ok(false) = 无在跑任务（消息还在队列/空闲）；如实回执，不空发 no-op
-            Some(false) => "✅ 当前没有正在运行的任务。".to_string(),
+        handle.cancel(channel_id).await
+    }
+
+    async fn buzz_cancel_reply(&self, ev: &Ev) -> String {
+        // harness 未装配与「harness 已关闭」合成同一档文案（都是「没送到」）。
+        match self.buzz_cancel(ev).await {
             Some(true) => {
                 let scope = if ev.thread_id.is_empty() {
                     "本群顶层频道"
@@ -1227,7 +1250,9 @@ impl Bridge {
                      会话将重新开始；无轮次在跑时本指令无效果。"
                 )
             }
-            None => "⚠️ buzz 叫停未送达（harness 已关闭），请重试。".to_string(),
+            // 无在跑任务（消息还在队列/空闲）→ 如实回执，不空发 no-op
+            Some(false) => "✅ 当前没有正在运行的任务。".to_string(),
+            None => "⚠️ 叫停未送达：harness 未装配或已关闭（检查服务状态/重启）。".to_string(),
         }
     }
 
@@ -1416,8 +1441,62 @@ fn parse_trash_cmd(text: &str) -> Option<TrashCmd> {
     }
 }
 
+/// 停止词的路由决策（#309）。**这是本次缺陷的根因所在**：历史上 run_job 会注册一个
+/// 谁也不读的 cancel flag，于是停止词必然落进「有 flag」分支、置位后 return，
+/// 把真正能打断 ACP 轮次的 `handle.cancel(channel)` 短路掉。
+///
+/// 修好之后：flag 只可能来自 **chat 回合**（virtualbot 起回合时自己 insert）。所以
+/// - 有 flag → 交给 chat 回合优雅收尾（既有语义，不动）；
+/// - 没有 flag → 交给 harness 真实叫停；只有「确实没在跑」或「harness 没装配」才透传。
+#[derive(Debug, PartialEq, Eq)]
+enum StopWordRoute {
+    /// 有 chat 回合在跑：置 flag，由回合自己收尾并回「⏹ 已停止」。
+    SignalChatTurn,
+    /// 无 chat 回合但 harness 确实叫停了在跑轮次：静默返回，不打扰用户。
+    HarnessCancel,
+    /// 没在跑 / harness 未装配：当普通消息透传给 agent。
+    Passthrough,
+}
+
+fn stop_word_route(has_chat_flag: bool, harness_cancelled: Option<bool>) -> StopWordRoute {
+    if has_chat_flag {
+        return StopWordRoute::SignalChatTurn;
+    }
+    match harness_cancelled {
+        Some(true) => StopWordRoute::HarnessCancel,
+        _ => StopWordRoute::Passthrough,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// #309 回归：停止词的路由。
+    /// 缺陷期：run_job 注册了没人读的 flag → 停止词必然落进「有 flag」分支 → 真实叫停被短路。
+    /// 修好后 flag 只来自 chat 回合，所以「无 flag + harness 确实叫停了」必须走 HarnessCancel。
+    #[test]
+    fn stop_word_route_covers_job_cancel_path() {
+        // 有 chat 回合在跑 → 优雅收尾（即使 harness 说没在跑，也不越权）
+        assert_eq!(stop_word_route(true, None), StopWordRoute::SignalChatTurn);
+        assert_eq!(
+            stop_word_route(true, Some(false)),
+            StopWordRoute::SignalChatTurn
+        );
+        // 无 chat 回合 + harness 真实叫停在跑轮次（job 场景）→ 必须走 HarnessCancel
+        assert_eq!(
+            stop_word_route(false, Some(true)),
+            StopWordRoute::HarnessCancel,
+            "无 flag 时若 harness 叫停成功，必须认（否则就是 #309：停止词被死标志吞掉）"
+        );
+        // 无 chat 回合 + 确实没在跑 → 透传（别把「别取消」这类对话硬拦）
+        assert_eq!(
+            stop_word_route(false, Some(false)),
+            StopWordRoute::Passthrough
+        );
+        // 无 chat 回合 + harness 未装配 → 也透传（没送到不算叫停）
+        assert_eq!(stop_word_route(false, None), StopWordRoute::Passthrough);
+    }
     /// 挡板 messenger（`Bridge::new` 需要；本组测试只碰工作区解析，不发送）。
     struct DummyMsgr;
     #[async_trait::async_trait]
