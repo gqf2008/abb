@@ -505,6 +505,8 @@ impl Router {
 /// 解析 `deliver` CLI 参数（main.rs run_deliver_cli 用；拆出便于单测）。
 /// env_bot / env_chat 是桥 spawn agent 时注入的 AGENT_BRIDGE_BOT_KEY / AGENT_BRIDGE_CHAT_ID，
 /// 作为来源（回源报错）缺省值；人工 CLI 可显式 --source-bot/--source-chat 覆盖。
+/// **投递目标缺省 = 创建者会话**（#310 统一默认）：不给 --bot/--chat 也不给 --to-current 时，
+/// 等价于 --to-current（复用同一条 in_session 通路，不新增豁免）。
 pub fn parse_deliver_args(
     args: &[String],
     env_bot: &str,
@@ -539,22 +541,39 @@ pub fn parse_deliver_args(
         }
         i += 1;
     }
-    // --to-current：目标恒为当前会话（桥注入的 bot/chat），不接受显式目标与来源——
-    // 来源必须**确实**等于目标，这是 in_session 豁免自环保护的前提。
-    if in_session {
+    // 统一默认（#310 / #307 的 D2）：既没给目标、也没给 --to-current → 回**创建者会话**。
+    // 语义与 --to-current 完全相同（目标恒等于来源 = 桥注入的当前会话），因此直接复用
+    // 同一条可信 in_session 通路，**不新增任何豁免**；人工 CLI 无注入变量时显式报错。
+    let mut defaulted_to_creator = false;
+    if !in_session && target_bot.is_none() && target_chat.is_none() {
         if env_bot.is_empty() || env_chat.is_empty() {
             return Err(
-                "--to-current 只能在 bot 会话里使用（缺 AGENT_BRIDGE_BOT_KEY/CHAT_ID 环境变量）"
-                    .to_string(),
+                "缺投递目标：默认投递回创建者会话需要 AGENT_BRIDGE_BOT_KEY/CHAT_ID（当前不在 bot 会话里）；跨会话投递请显式给 --bot/--chat".to_string(),
             );
+        }
+        in_session = true;
+        defaulted_to_creator = true;
+    }
+    // --to-current（或上面的默认）：目标恒为当前会话（桥注入的 bot/chat），不接受显式
+    // 目标与来源——来源必须**确实**等于目标，这是 in_session 豁免自环保护的前提。
+    if in_session {
+        let how = if defaulted_to_creator {
+            "默认投递回创建者会话"
+        } else {
+            "--to-current"
+        };
+        if env_bot.is_empty() || env_chat.is_empty() {
+            return Err(format!(
+                "{how} 只能在 bot 会话里使用（缺 AGENT_BRIDGE_BOT_KEY/CHAT_ID 环境变量）"
+            ));
         }
         if target_bot.is_some() || target_chat.is_some() {
-            return Err("--to-current 的目标就是当前会话，不要再给 --bot/--chat".to_string());
+            return Err(format!("{how} 的目标就是当前会话，不要再给 --bot/--chat"));
         }
         if source_bot.is_some() || source_chat.is_some() {
-            return Err(
-                "--to-current 的来源恒为当前会话，不要再给 --source-bot/--source-chat".to_string(),
-            );
+            return Err(format!(
+                "{how} 的来源恒为当前会话，不要再给 --source-bot/--source-chat"
+            ));
         }
         target_bot = Some(env_bot.to_string());
         target_chat = Some(env_chat.to_string());
@@ -910,8 +929,61 @@ mod tests {
         }
     }
 
+    /// 统一默认（#310）：不给目标也不给 --to-current → 回创建者会话（等价 --to-current）。
+    /// 显式目标仍然优先；无桥注入变量时明确报错，不静默丢。
+    #[test]
+    fn parse_defaults_to_creator_session() {
+        let args: Vec<String> = ["--text", "hi"].iter().map(|s| s.to_string()).collect();
+        let d = parse_deliver_args(&args, "wechat", "u1").unwrap();
+        assert_eq!(d.target_bot, "wechat");
+        assert_eq!(d.target_chat, "u1");
+        assert_eq!(d.source_bot, "wechat");
+        assert_eq!(d.source_chat, "u1");
+        assert!(d.in_session, "缺省必须走可信 in_session 通路");
+        assert!(is_self_loop(&d), "默认目标=来源，自环豁免前提成立");
+
+        // 无桥注入（人工 CLI）→ 显式报错并提示出路
+        for (b, c) in [("", ""), ("wechat", ""), ("", "u1")] {
+            let e = parse_deliver_args(&args, b, c).unwrap_err();
+            assert!(e.contains("创建者会话"), "env=({b:?},{c:?}) → {e}");
+            assert!(e.contains("--bot"), "应提示显式目标出路: {e}");
+        }
+
+        // 显式目标优先，不触发默认（仍走跨会话路径）
+        let explicit: Vec<String> = ["--bot", "feishu", "--chat", "c1", "--text", "hi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let d2 = parse_deliver_args(&explicit, "wechat", "u1").unwrap();
+        assert_eq!(
+            (d2.target_bot.as_str(), d2.target_chat.as_str()),
+            ("feishu", "c1")
+        );
+        assert!(!d2.in_session, "显式目标是跨会话投递，不该被默认改写");
+
+        // 单边目标不触发默认：仍按原样报缺另一半（别把半个目标当成"没给目标"）
+        let mk = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let e =
+            parse_deliver_args(&mk(&["--chat", "c1", "--text", "hi"]), "wechat", "u1").unwrap_err();
+        assert!(e.contains("--bot"), "只给 --chat 应报缺 --bot: {e}");
+        let e = parse_deliver_args(&mk(&["--bot", "feishu", "--text", "hi"]), "wechat", "u1")
+            .unwrap_err();
+        assert!(e.contains("--chat"), "只给 --bot 应报缺 --chat: {e}");
+
+        // 缺省目标 + 显式来源 → 拒绝：不能构造「in_session=true 但来源≠目标」的项
+        // （那正是 #21 自环豁免的信任前提，必须锁死）
+        let e = parse_deliver_args(
+            &mk(&["--text", "hi", "--source-bot", "feishu"]),
+            "wechat",
+            "u1",
+        )
+        .unwrap_err();
+        assert!(e.contains("不要再给"), "显式来源 + 缺省目标必须拒: {e}");
+    }
+
     #[test]
     fn parse_requires_target_and_text() {
+        // 空参数：目标会默认成创建者会话，但 --text/--file 至少要给一个 → 仍报错
         assert!(parse_deliver_args(&[], "wechat", "u1").is_err());
         let args = vec![
             "--bot".to_string(),

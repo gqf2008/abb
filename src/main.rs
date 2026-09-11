@@ -353,6 +353,8 @@ fn main() {
     }
 
     // 跨会话投递 CLI：供 claude 用 Bash 调用（也可人用）。
+    //   agent-bridge deliver --text "内容" [--file <路径>]…
+    //     （不给目标 = 缺省发回创建者会话，等价 --to-current；见 parse_deliver_args）
     //   agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text "内容"
     //   [--source-bot <来源bot key> --source-chat <来源chat_id>]（缺省取桥注入的 env）
     // 总开关：Config.cross_delivery_enabled（设置 → 「跨会话投递」勾选），关闭时拒绝。
@@ -724,6 +726,7 @@ fn resolve_bot_key() -> Result<String, String> {
 
 /// 跨会话投递 CLI（供 claude 用 Bash 调用，也可人用）。退出码 0=已入队 1=失败。
 /// 来源缺省取 AGENT_BRIDGE_BOT_KEY / AGENT_BRIDGE_CHAT_ID（桥 spawn agent 时注入）。
+/// 目标缺省 = 创建者会话（不给 --bot/--chat/--to-current 时，等价 --to-current）。
 /// 投递是异步的：CLI 只负责校验 + 入队，service 侧投递循环实际发送。
 fn run_deliver_cli(args: &[String]) -> i32 {
     let cfg = match config::Config::load() {
@@ -742,7 +745,7 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         Ok(i) => i,
         Err(e) => {
             eprintln!(
-                "{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…\n      agent-bridge deliver --to-current --text \"内容\" [--file <本地路径>]…（发到当前会话）"
+                "{e}\n用法：agent-bridge deliver --text \"内容\" [--file <本地路径>]…（缺省发回创建者会话）\n      agent-bridge deliver --to-current --text \"内容\" …（同上，显式写法）\n      agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…（跨会话）"
             );
             return 1;
         }
