@@ -1,7 +1,7 @@
 # ABB 任务模型（复盘 + 重新设计）
 
 > 状态：**草案 v2，待评审**（#307）。本文只描述现状、设计与迁移路径，**不代表已实现**。
-> 关联：#305（常驻进程托管）· #306（后台子代理）· #158 · #69 · #21 · #137 · #164
+> 关联：#305（常驻进程托管）· #306（后台子代理）· #309（现存缺陷：job 停不掉）· #158 · #69 · #21 · #137 · #164
 >
 > v2 说明：v1 对执行链的事实判断有误（把串行归因于 per-chat 锁、把 cancel 标志当有效机制、把
 > `sessions.json` 当 ACP 会话的事实源）。经独立评审逐条核对后重写第 1、2 章。
@@ -76,7 +76,9 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 **G. 桥状态文件是信任凭据**
 
-`src/guard.rs:359-390` 把 `jobs.json` / `pending.json` 的 `role` 字段视为执行时信任的凭据（改写 = 把自己任务翻成 owner 执行），因此对受限会话禁写。`tasks.json` / 任务日志 / 运行态必须进入同一名单——**并且 fork 侧也要保护**。
+`src/guard.rs:359-390` 把 `jobs.json` / `pending.json` 的 `role` 字段视为执行时信任的凭据（改写 = 把自己任务翻成 owner 执行），因此对受限会话禁写——**注意这是「只禁写不禁读」**（`:363-365`）。
+
+⇒ 对新任务域，光有写保护不够：任务定义 / 运行态 / 日志含 prompt、target、env、cmd 与进程输出，**必须同时做读隔离**（放在 agent 读域之外，或两处策略都加 read deny）。详见 §2.2。
 
 **H. 恢复语义**
 
@@ -136,7 +138,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
     "bot_key": "微信龙虾",
     "chat_id": "wx_chat_xxx",
     "sender_id": "",                       // 当前 agent 环境尚无可靠 sender_id —— 见 Q9
-    "capability": "cap_xxx"                // 创建时下发的管理凭据（若采用 capability 方案）
+    "capability_hash": ""                  // 若是 capability 方案：只存 hash（明文不进任何 agent 可读文件）
   },
   "payload": { "kind": "agent", "prompt": "……", "cwd": "", "cmd": [], "env": {} },
   "trigger": { "kind": "cron", "expr": "0 9 * * *", "timezone": "Asia/Shanghai" },
@@ -148,13 +150,21 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 }
 ```
 
-**存储**（按 bot 隔离，与现有目录约定一致）：
+**存储**（按 bot 隔离，**放在 agent 读域之外**）：
 
-- **定义**：`~/.agent-bridge/workspaces/<bot>/tasks.json`（由 `jobs.json` 迁移）
-- **运行态**：`~/.agent-bridge/workspaces/<bot>/tasks-state.json`（pid/重启计数/最近退出码）——**与定义分开**，避免高频写污染定义文件（见 Q12）。数据模型里的 `state` 只是运行态投影，**不写回定义文件**。
-- **日志**：`~/.agent-bridge/workspaces/<bot>/task-logs/<id>.log`
+- **定义**：`~/.agent-bridge/tasks/<bot>/tasks.json`（由 `jobs.json` 迁移）
+- **运行态**：`~/.agent-bridge/tasks/<bot>/tasks-state.json`（pid / 重启计数 / 最近退出码）——**与定义分开**，避免高频写污染定义文件（见 Q12）。数据模型里的 `state` 只是运行态投影，**不写回定义文件**。
+- **日志**：`~/.agent-bridge/tasks/<bot>/task-logs/<id>.log`
 
-三份文件都要进 §1.2 G 的状态文件写保护名单（**root guard + fork 两份**）。
+> ⚠️ **为什么不放在 bot 工作区里**（评审三轮的阻塞项）：
+>
+> 现有桥状态文件的保护是**只禁写不禁读**（`src/guard.rs:363-365` 明确写「内容本属工作区可读范围」），fork 侧 `ToolPolicy::build` 也把 workspace 放进 `read_roots`（`crates/buzz-agent/src/wire.rs:168` 附近，读检查在 `crates/buzz-agent/src/devtools.rs:923` 附近）。
+>
+> 如果把 tasks 文件放在工作区里，**同一 bot 下任何受限会话都能直接 `cat` 出其它任务的 prompt / target / env / cmd 和全部日志**——D4 里「`task list/cancel/logs` 只限自己创建」的访问控制会被文件系统读取直接绕过（capability 只存 hash 只能防 token 被偷，防不住元数据与日志泄露）。
+>
+> 所以这三份文件**必须放在 agent 读域之外**，只通过受权的 `$ABB_BIN task …` 暴露过滤后的视图。
+>
+> 备选方案（若因迁移成本必须留在工作区内）：在 **root guard 与 buzz-agent fork 两处读策略里都加这些路径的 read deny**，并补「受限会话直接读任务文件被拒」的回归测试。二选一，不接受「既不读保护、又把它写成权限边界」。
 
 ### 2.3 关键设计决策
 
@@ -165,7 +175,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 **D1a 独立 channel**：task 使用独立 channel UUID（例如由 `channel_uuid(bot, "task:<id>")` 派生），并显式定义对应的 `ChannelMeta`（workspace / cwd / 指令作用域）。在**当前共享 handle** 的模型下，独立 channel 是隔离 ACP session（`src/buzz/pool.rs:82-95`）的必要手段（走 B1 独立 handle 也能达到同样隔离）。
 
 - ⚠️ **必须设 `adhoc: true`（或等价加入巡检登记）**：harness 频道巡检会删掉「不在 `sync_roots` 中且非 adhoc」的根频道（`src/buzz/harness.rs` 的 `Cmd::SyncRoots`，`:530` 起）。现有 `run_job` 正是这么做的（`src/service.rs:1353-1370` 的 `ChannelMeta { …, adhoc: true }`）。漏了这步，task channel 会在下次巡检被排空队列 / 失效 session。
-- task channel 的 UUID 命名空间不要与普通聊天 channel 混用。
+- task channel 的 UUID 命名空间不要与普通聊天 channel 混用——正式实现建议新增独立的 `task_channel_uuid()`（而不是直接复用 `keys.rs` 的聊天命名空间）。
 
 **D1b 独立执行容量**：当前每个 handle 是单 slot（`src/buzz/harness.rs:413-416`），且 task 与聊天会分到不同 channel 但**仍共享同一个 handle**。所以「不占线」与「同会话并发多个子代理」（#306 验收）在单 slot 下**不可能成立**。两个可选方案：
 
@@ -219,8 +229,9 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 - `proc` 是**任意命令执行入口**：默认 **owner-only**；granted 直接禁止，或仅在可证明的 OS sandbox 内允许（Q8）。
 - 「只限自己创建的」**缺少可信身份**：`SenderRole` 只有 `Owner | Granted`（`src/config.rs:823-843`），同一群两个 granted 用户无法区分。可选：创建时下发 **capability token**，或**直接 owner-only 管理**（更简单更严）。
-- ⚠️ **capability token 不能明文存进 `tasks.json`**：该文件在 bot 工作区内，受限会话读策略允许读 root 内文件（读检查在 `crates/buzz-agent/src/wire.rs:168` 附近、调用在 `crates/buzz-agent/src/devtools.rs:923` 附近）——谁都读得到就不构成权限边界。至少只存 **hash**，或把 token 放到 agent 读域之外。
-- 白名单与保护名单**两份都要改**：`src/guard.rs:618` + `crates/buzz-agent/src/shell_policy.rs:126`；`tasks.json` / `tasks-state.json` / 日志目录加入 `src/guard.rs:359-390` 同类保护。
+- ⚠️ **capability token 不能明文落盘**：任务文件即便挪到 agent 读域之外，也应按「只存 hash（`capability_hash`）」处理；能读到明文就不构成权限边界。
+- 白名单与保护名单**两份都要改**：`src/guard.rs:618` + `crates/buzz-agent/src/shell_policy.rs:126`。
+- ⚠️ **只做写保护不够，必须做读隔离**：任务定义 / 运行态 / 日志含 prompt、target、env、cmd 与进程输出；沿用现有「只禁写不禁读」（`src/guard.rs:363-365`）会让「只限自己创建」被 `cat` 直接绕过。落地方式见 §2.2（放 agent 读域之外，或两处策略都加 read deny + 回归测试）。
 - v1 那句「`task add` 全放行」不可接受。
 
 #### D5 进程生命周期（需要真正的 supervisor，不能复用 legacy）
