@@ -742,7 +742,7 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         Ok(i) => i,
         Err(e) => {
             eprintln!(
-                "{e}\n用法：agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…\n      agent-bridge deliver --to-current --text \"内容\" [--file <本地路径>]…（发到当前会话）"
+                "{e}\n用法：agent-bridge deliver --text \"内容\" [--file <本地路径>]…（缺省发回创建者会话）\n      agent-bridge deliver --to-current --text \"内容\" …（同上，显式写法）\n      agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…（跨会话）"
             );
             return 1;
         }
