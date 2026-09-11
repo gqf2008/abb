@@ -1313,18 +1313,17 @@ async fn run_job(
     // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明 + 三级
     // AGENTS.md 指令文件块（组装抽成 job_prompt 纯函数，可测）。
     let prompt = job_prompt(&job, &bot_key);
-    // 定时任务可被「停止词」打断（#卡死修复）：注册到目标会话的 cancel 标志，
-    // 用户在该会话发 停/停止/cancel 即可终止正在跑的后台任务；
-    // 与聊天任务共用同一 key（chat_id）——同一 chat 同一时刻只有一个在跑任务。
-    // job 走 ACP 同步回合：叫停走 harness cancel 信号（/cancel 命令路径），
-    // CLI 的 cancel_flag 机制随 spawn 退役——不再注册。
-    let _cancel_flag = bridge.register_cancel_flag(&job.chat_id);
+    // 定时任务的叫停（#309）：job 走 ACP 同步回合，**不消费** Bridge 的 cancel flag
+    // （那是 chat 回合的机制——virtualbot 起回合时自己 insert）。历史上这里注册过一个
+    // 没有任何读者的 flag，反而让停止词命中它后直接 return、把真实叫停短路掉，故删除。
+    // 现在的路径：下面 dispatch 前 register_job_turn(...) 登记本轮 → 会话内发停止词时
+    // 桥按 **job 的真实 role/channel** 发 handle.cancel 并唤醒 run_job 的等待。
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     // P2.2/P2.3：按 job 角色选实例——granted 任务路由 granted 实例（强制受限剖面），
     // 且经能力协商硬闸：能力位已判不支持 ⇒ 拒跑（绝不静默降级成无闸 FullAccess）；
     // Unknown（懒启动未起）放行到 session 创建处的真闸。
-    let reply = {
+    let reply: Option<String> = {
         let granted = crate::config::restrict_granted(job.role, &bot_key);
         let handle = bridge.acp_handles.as_ref().map(|hs| {
             if granted {
@@ -1345,7 +1344,7 @@ async fn run_job(
                 "[bot:{bot_key}] 任务 {} 拒跑：granted 受限实例未就绪或随包 agent 版本过旧（无 _meta.abbSandbox 能力）",
                 &job.id[..8]
             );
-            "⚠️ 定时任务无法执行：受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力（请升级 ABB 后重试）".to_string()
+            Some("⚠️ 定时任务无法执行：受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力（请升级 ABB 后重试）".to_string())
         } else {
             match handle {
                 Some(h) => {
@@ -1369,8 +1368,19 @@ async fn run_job(
                             adhoc: true,
                         },
                     );
-                    match h
-                        .wait_turn_text(
+                    // #309：登记本轮，供「停止词」按 job 的**真实 role/channel** 叫停，
+                    // 并唤醒这里的等待（否则要挂到超时才回，还会发一条错的「执行超时」）。
+                    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+                    bridge.register_job_turn(
+                        &job.chat_id,
+                        crate::bridge::JobTurn {
+                            role: job.role,
+                            channel_id,
+                            cancel: cancel.clone(),
+                        },
+                    );
+                    let outcome = tokio::select! {
+                        got = h.wait_turn_text(
                             channel_id,
                             crate::buzz::queue::InboundMsg {
                                 id_hex: uuid::Uuid::new_v4().to_string(),
@@ -1384,21 +1394,39 @@ async fn run_job(
                             // 迟发投递（超时文案 + 真回复双发）。
                             crate::buzz::harness::MAX_TURN_DURATION
                                 + std::time::Duration::from_secs(30),
-                        )
-                        .await
-                    {
-                        Some(text) => text,
-                        None => {
-                            // 超时/句柄关闭：叫停在途回合（防真回复迟发成第二条消息），
-                            // 再落超时文案。
+                        ) => match got {
+                            Some(text) => Some(text),
+                            None => {
+                                // 超时/句柄关闭：叫停在途回合（防真回复迟发成第二条消息），
+                                // 再落超时文案。
+                                let _ = h.cancel(channel_id).await;
+                                Some("⏰ 定时任务执行超时（agent 无回复）".to_string())
+                            }
+                        },
+                        // 用户叫停：停止词侧已向 job 的真实 handle 发过 cancel，这里兜底再发一次
+                        // 并**静默**收尾（None → 不投递）。
+                        _ = cancel.notified() => {
                             let _ = h.cancel(channel_id).await;
-                            "⏰ 定时任务执行超时（agent 无回复）".to_string()
+                            None
                         }
-                    }
+                    };
+                    bridge.unregister_job_turn(&job.chat_id);
+                    outcome
                 }
-                None => "⏰ 定时任务执行失败：agent 未装配".to_string(),
+                None => Some("⏰ 定时任务执行失败：agent 未装配".to_string()),
             }
         }
+    };
+    // None = 本轮被用户叫停（#309）：静默收尾，**不投递任何东西**（含超时文案）。
+    let Some(reply) = reply else {
+        crate::log!(
+            "[bot:{bot_key}] 任务 {} 已被叫停，静默收尾（不投递）",
+            &job.id[..8]
+        );
+        if job.kind == crate::schedule::JobKind::Once {
+            bridge.jobs.remove(&job.id);
+        }
+        return;
     };
 
     let header = match job.kind {

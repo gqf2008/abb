@@ -362,6 +362,12 @@ impl Bridge {
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
+            // #309：该 chat 上有定时任务轮次在跑（job 与 chat 共用 channel，但它不消费
+            // chat 的 cancel flag）→ 按 job 的真实 role/channel 叫停并唤醒它的等待。
+            // 静默返回：被叫停的 job 不投递任何东西，这里也不必回话。
+            if self.cancel_job_turn(&ev).await {
+                return;
+            }
             // #124 团队创建流程进行中：/cancel 也中止（WaitingGoal/WaitingConfirm 通用），
             // 避免出现「/cancel 却说没有任务在跑」的割裂。
             if self.team_flows.get(&key).is_some() {
@@ -393,6 +399,10 @@ impl Bridge {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::log!("[bridge] 收到停止指令 chat={}", trunc(&key, 16));
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
+                return;
+            }
+            // #309：没有 chat 回合在跑，但可能有定时任务轮次在跑 → 真实叫停（静默）。
+            if self.cancel_job_turn(&ev).await {
                 return;
             }
             // 无在跑任务 → 停止词当普通消息透传给 agent
@@ -1174,6 +1184,32 @@ impl Bridge {
         let dir = crate::workspace_dir(&self.bot.key());
         crate::agent::ensure_workspace_guide(&dir);
         dir
+    }
+
+    /// #309：若该 chat 上有正在跑的**定时任务轮次**，按 job 的**真实 role 选 handle**、
+    /// 在 **job 自己的 channel** 上发 cancel，并唤醒 run_job 的等待。返回是否叫停了 job。
+    ///
+    /// 两处刻意不按直觉来：
+    /// - **不用停止词发送者的 role 选 handle**：job 可能跑在另一个实例上（owner 建的 job 跑
+    ///   normal、granted 建的跑 granted），按发送者选就会 cancel 到别处、job 照旧；
+    /// - **只用 `ev.chat_id` 查（不带 thread）**：job 恒跑群根频道，而停止词可能来自该 chat
+    ///   的任意话题，按话题 key 查必然查不到。
+    async fn cancel_job_turn(&self, ev: &Ev) -> bool {
+        let Some(job) = self.job_turn(&ev.chat_id) else {
+            return false;
+        };
+        if let Some(h) = self.acp_handle_for_role(job.role) {
+            let _ = h.cancel(job.channel_id).await;
+        }
+        // 无论 handle 在不在（测试挡板 / 未装配），都要唤醒等待方，避免 job 挂到超时再发
+        // 一条错的「执行超时」。
+        job.cancel.notify_one();
+        crate::log!(
+            "[bridge] 停止指令 → 叫停定时任务轮次 chat={} role={:?}",
+            trunc(&ev.chat_id, 16),
+            job.role
+        );
+        true
     }
 
     /// #206：buzz /cancel——预检（频道已登记；buzz 未启用则拒——与 dispatch 同
