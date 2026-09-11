@@ -208,7 +208,7 @@ impl AgentRunner for SpawnRetiredRunner {
 
 /// buzz 后端（共享 ACP agent 进程）的供应商 env 装配。命名空间与 pi 的宿主映射
 /// 无关：buzz-agent 的 OPENAI_COMPAT_BASE_URL / ANTHROPIC_BASE_URL 直接可指任意
-/// 端点，供应商配置的 base_url 原样透传。
+/// 端点，供应商配置的 base_url 原样透传（openrouter/deepseek 留空时回落各自预置端点）。
 /// 支持 anthropic / openai-chat / openai-responses / openrouter / deepseek；
 /// 其余 kind → Err（用户可见）。
 /// provider 为 None → Ok(None)（纯继承宿主 env，旧行为——e2e 即靠宿主注入）。
@@ -763,13 +763,15 @@ mod tests {
         );
         assert_eq!(env2["OPENAI_COMPAT_API"], "chat");
 
-        // 显式 base_url 覆盖预置（自建网关 / 代理场景）
-        let custom = prov_bu("or", "openrouter", "https://proxy.example.com/v1");
-        let env3 = buzz_provider_env(Some(&custom)).unwrap().unwrap();
-        assert_eq!(
-            env3["OPENAI_COMPAT_BASE_URL"], "https://proxy.example.com/v1",
-            "用户填了 base_url 就不能被预置覆盖"
-        );
+        // 显式 base_url 覆盖预置（自建网关 / 代理场景）——两种预置都要能覆盖
+        for kind in ["openrouter", "deepseek"] {
+            let custom = prov_bu("custom", kind, "https://proxy.example.com/v1");
+            let env3 = buzz_provider_env(Some(&custom)).unwrap().unwrap();
+            assert_eq!(
+                env3["OPENAI_COMPAT_BASE_URL"], "https://proxy.example.com/v1",
+                "{kind} 用户填了 base_url 就不能被预置覆盖"
+            );
+        }
     }
 
     #[test]
