@@ -217,7 +217,7 @@ pub struct TextItem {
 }
 
 /// CDN 媒体引用（对齐 openclaw-weixin src/api/types.ts 的 CDNMedia）。
-/// aes_key 是 base64 字符串；图片优先用 ImageItem.aeskey（hex），文件/语音/视频用 media.aes_key。
+/// aes_key 是 base64 字符串。**入站解密时**：图片优先用 ImageItem.aeskey（hex），其余用 media.aes_key。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CDNMedia {
     #[serde(default)]
@@ -471,7 +471,8 @@ struct UploadedMedia {
     /// CDN 下载参数（`CDNMedia.encrypt_query_param`）。
     download_param: String,
     /// `CDNMedia.aes_key`：官方发送器对**所有**媒体类型统一用 base64(32 个 hex 字符)
-    /// （见 `upload_media`，Tencent/openclaw-weixin `src/cdn/upload.ts`）。
+    /// （Tencent/openclaw-weixin：`src/cdn/upload.ts` 产出 hex，`src/messaging/send.ts`
+    /// 再 `Buffer.from(hex).toString("base64")`）。
     aes_key_b64: String,
     /// 加密后字节数（图片 mid_size / 视频 video_size）。
     cipher_size: u64,
@@ -651,7 +652,7 @@ impl WeixinClient {
         data: &[u8],
     ) -> Result<()> {
         let up = self.upload_media(to_user_id, kind, data).await?;
-        // CDNMedia：下载参数 + 密钥（编码按类型，见 upload_media）。
+        // CDNMedia：下载参数 + 密钥（官方一律 base64(32 个 hex 字符)，见 upload_media）。
         let cdn_media = serde_json::json!({
             "encrypt_query_param": up.download_param,
             "aes_key": up.aes_key_b64,
