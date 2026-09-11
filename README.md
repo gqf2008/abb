@@ -137,4 +137,15 @@ cd abb && cargo build --release
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+ABB 本体采用 **MIT**，全文见 [LICENSE](LICENSE)。
+
+随包/内嵌的第三方组件保留各自的许可证，不适用本仓库的 MIT。**安装包里附带的**：
+
+- `ABB-LICENSE.txt` — ABB 本体（MIT）
+- `buzz-LICENSE.txt` — `crates/buzz-agent/`（buzz 分叉，Apache-2.0）
+- `tools/licenses/` — 随包工具 `rg` / `jq` / `uv` / `gh` 及其传递依赖
+
+**只在源码树里**（不出现在安装包中）：
+
+- `third_party/i-slint-core/LICENSES/` — Slint 组件库授权
+- `src/buzz/UPSTREAM-LICENSE.txt` — 上游 buzz 移植部分的许可说明

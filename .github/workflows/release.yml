@@ -73,6 +73,7 @@ jobs:
           cp crates/buzz-agent/target/aarch64-apple-darwin/release/buzz-agent ABB.app/Contents/MacOS/
           # 分叉 Apache-2.0，再分发须附 LICENSE 文本
           cp crates/buzz-agent/LICENSE ABB.app/Contents/Resources/buzz-LICENSE.txt
+          cp LICENSE ABB.app/Contents/Resources/ABB-LICENSE.txt
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
           # 随包工具：版本/URL/SHA256 锁在 tools/tool-lock.tsv；不含 git/bun/sed/find。
