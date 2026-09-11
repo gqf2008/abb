@@ -152,16 +152,6 @@ enum Cmd {
         channel_id: Uuid,
         reply: oneshot::Sender<bool>,
     },
-    /// **丢弃式取消**（#309 PR-A1）：打断在跑轮次，并且**不把该批次重提示**
-    /// （区别于 `Cancel` 的 `requeue_as_cancelled` 语义——那条是给 chat 的
-    /// 「取消重提示 / steer 合并」用的）。同时让同步 waiter 立刻拿到
-    /// `SyncWaitMsg::Cancelled` 终态。没有在跑轮次时与 `Cancel` 一样返回 false。
-    // 能力先落地、调用方随后（#309 PR-A2 的 job 接线）——分两批评审，故显式放行 dead_code。
-    #[allow(dead_code)]
-    CancelDrop {
-        channel_id: Uuid,
-        reply: oneshot::Sender<bool>,
-    },
     /// 根频道全量同步（service 每 2s 从 vb 存储扫描）。diff 应用：新增
     /// 注册，消失的根频道排空队列、失效会话、其后的失败批次直接丢弃。
     SyncRoots(Vec<ChannelMeta>),
@@ -172,7 +162,8 @@ enum Cmd {
 enum SyncWaitMsg {
     /// 回合文本（`Ok`）或终态失败原因（`Err`）——与改造前的 `Result<String,String>` 同义。
     Done(Result<String, String>),
-    /// 丢弃式取消（`Cmd::CancelDrop` 命中在跑轮次时回传）。
+    /// 取消终态（`Cmd::Cancel` 命中在跑轮次时回传）：批次已被丢弃，不会再重提示，
+    /// 等待方应立刻静默收尾。
     Cancelled,
 }
 
@@ -366,27 +357,6 @@ impl BuzzHandle {
         rx.await.ok()
     }
 
-    /// **丢弃式取消**（#309 PR-A1）：在跑轮次被叫停，且该批次**不会被重提示**；
-    /// 同步 waiter 同时拿到 `SyncTurnOutcome::Cancelled` 终态（不再挂到 Timeout）。
-    ///
-    /// 与 [`Self::cancel`] 的区别：`cancel` 走 `requeue_as_cancelled`——批次会并入
-    /// 下一批重提示（chat 的「取消重提示 / steer 合并」语义）；`cancel_drop` 是给
-    /// 需要**真停**的调用方（定时任务 / 后台任务）用的，批次直接丢。
-    ///
-    /// 返回：`Some(true)` = 命中在跑轮次并已发取消信号；`Some(false)` = 没有在跑
-    /// 轮次（无副作用）；`None` = 句柄已关闭。
-    #[allow(dead_code)] // 同上：调用方在 #309 PR-A2
-    pub async fn cancel_drop(&self, channel_id: Uuid) -> Option<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::CancelDrop {
-                channel_id,
-                reply: tx,
-            })
-            .ok()?;
-        rx.await.ok()
-    }
-
     /// 登记/刷新一个频道（话题频道 dispatch 前由桥调用；同步完成，不经过主循环）。
     pub fn upsert_channel(&self, channel_id: Uuid, meta: ChannelMeta) {
         let mut reg = self.registry.lock().unwrap();
@@ -448,9 +418,6 @@ struct Loop {
     spawn_in_flight: bool,
     /// 日志活跃度。
     last_activity: Instant,
-    /// 已请求「丢弃式取消」的频道（#309）：其 cancelled 结局到达时**不重提示**，
-    /// 直接丢批次。只由 `Cmd::CancelDrop` 且确实命中在跑轮次时写入；结局处置时消费。
-    drop_on_cancel: HashSet<Uuid>,
 }
 
 impl Loop {
@@ -469,7 +436,6 @@ impl Loop {
             crash_backoff: 0,
             spawn_in_flight: false,
             last_activity: Instant::now(),
-            drop_on_cancel: HashSet::new(),
         };
         (l, steer_ack_rx)
     }
@@ -571,18 +537,12 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
         }
         Cmd::Cancel { channel_id, reply } => {
             let fired = signal_in_flight_task(&mut l.pool, channel_id, ControlSignal::Cancel);
-            let _ = reply.send(fired);
-        }
-        Cmd::CancelDrop { channel_id, reply } => {
-            let fired = signal_in_flight_task(&mut l.pool, channel_id, ControlSignal::Cancel);
-            // 只有确实命中在跑轮次才登记「丢弃」——否则会误伤该频道下一次无关的
-            // cancelled 结局（那是别人的取消重提示）。
+            // 取消是**终态**：`ControlSignal::Cancel` 在 pool 侧直接丢批次
+            // （`requeue_cancelled_batch` 返回 None，只有 Steer 才重提示），
+            // 所以这里同步 waiter 应当立刻拿到 Cancelled 终态——否则 job/oneshot
+            // 会一直挂到 timeout 才醒（#309 的原始症状）。
             if fired {
-                l.drop_on_cancel.insert(channel_id);
-                // 同步 waiter 立刻拿终态：不必等重提示后的文本，也不会挂到 Timeout。
-                if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(&channel_id) {
-                    let _ = tx.send(SyncWaitMsg::Cancelled);
-                }
+                notify_waiter_cancelled(handle, channel_id);
             }
             let _ = reply.send(fired);
         }
@@ -958,20 +918,13 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
-                if l.drop_on_cancel.remove(&batch.channel_id) {
-                    // 丢弃式取消（#309）：批次直接丢，**不进** cancelled_batches、
-                    // 不再重提示。waiter 已在 Cmd::CancelDrop 处理时拿到 Cancelled。
-                    tracing::debug!(
-                        channel_id = %batch.channel_id,
-                        "cancel-drop: batch dropped (no re-prompt)"
-                    );
-                } else {
-                    // cancel 重提示：进 cancelled_batches，flush_next 并入下一批
-                    // 重提示。CancelDrainTimeout 与干净取消同路（5s 排水超时不是
-                    // 硬上限死信；批次不带重试账）。
-                    let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
-                    l.queue.requeue_as_cancelled(batch, reason);
-                }
+                // 走到这里说明批次是被 **Steer**（回合中来了新消息）取消后由 pool
+                // 交还的：进 cancelled_batches，flush_next 并入下一批重提示。
+                // CancelDrainTimeout 与干净取消同路（5s 排水超时不是硬上限死信；
+                // 批次不带重试账）。注意：纯 `Cmd::Cancel` 在 pool 侧就已丢批次，
+                // 不会进到这个分支（requeue_cancelled_batch(Cancel) == None）。
+                let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
+                l.queue.requeue_as_cancelled(batch, reason);
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -1194,6 +1147,20 @@ fn schedule_death_respawn(
         delay.as_secs()
     );
     schedule_agent_start(l, handle, delay, Some(old_agent));
+}
+
+/// 把该频道的同步 waiter 立刻置为「取消」终态（#309 PR-A1）。
+///
+/// 取消是**终态**：`ControlSignal::Cancel` 在 pool 侧直接丢批次、不重提示，所以
+/// 等待方不该再等文本或挂到 timeout。返回是否确实通知到了一个 waiter（便于观测/测试）。
+fn notify_waiter_cancelled(handle: &BuzzHandle, channel_id: Uuid) -> bool {
+    match handle.sync_waiters.lock().unwrap().remove(&channel_id) {
+        Some(tx) => {
+            let _ = tx.send(SyncWaitMsg::Cancelled);
+            true
+        }
+        None => false,
+    }
 }
 
 /// 失败批次死信/重试耗尽时的频道告示（出站 TurnOutput，桥侧写历史并发送）。
@@ -1600,10 +1567,10 @@ mod channel_info_tests {
         );
     }
 
-    /// #309 PR-A1：`cancel_drop` 在**没有在跑轮次**时必须返回 false 且**不动**
-    /// 该频道的同步 waiter（别把无关的取消结局误伤成「本频道已被丢式取消」）。
+    /// #309 PR-A1：取消命中在跑轮次时，必须把该频道的 waiter **立刻**置为 Cancelled
+    /// 终态；没有 waiter 时是 no-op（不误伤、不 panic）。
     #[tokio::test]
-    async fn cancel_drop_without_in_flight_is_noop() {
+    async fn notify_waiter_cancelled_sets_terminal_state() {
         let handle = BuzzHandle::new(
             AgentConfig {
                 command: "true".to_string(),
@@ -1615,24 +1582,29 @@ mod channel_info_tests {
             CancellationToken::new(),
             ".".to_string(),
         );
-        tokio::spawn(run_loop(handle.clone()));
         let channel_id = Uuid::new_v4();
-        // 手工挂一个 waiter（不 push 消息 → 该频道没有在跑轮次）
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<SyncWaitMsg>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncWaitMsg>();
         handle.sync_waiters.lock().unwrap().insert(channel_id, tx);
 
-        assert_eq!(
-            handle.cancel_drop(channel_id).await,
-            Some(false),
-            "没有在跑轮次时 cancel_drop 必须如实返回 false"
+        assert!(
+            notify_waiter_cancelled(&handle, channel_id),
+            "有 waiter 时必须通知"
         );
         assert!(
-            handle
+            matches!(rx.try_recv(), Ok(SyncWaitMsg::Cancelled)),
+            "waiter 必须收到 Cancelled 终态"
+        );
+        assert!(
+            !handle
                 .sync_waiters
                 .lock()
                 .unwrap()
                 .contains_key(&channel_id),
-            "false 路径不得动该频道的 waiter（假取消会让调用方静默丢结果）"
+            "通知后不得残留 waiter 条目（残留会吞掉后续聊天回复）"
+        );
+        assert!(
+            !notify_waiter_cancelled(&handle, channel_id),
+            "没有 waiter 时是 no-op"
         );
     }
 
