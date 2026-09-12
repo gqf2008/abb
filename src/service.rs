@@ -1282,6 +1282,17 @@ fn job_prompt(job: &crate::schedule::Job, bot_key: &str) -> String {
 /// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
 /// 回发优先发任务原会话；若该会话已失效（群解散/bot 被移出等），回落到主会话（私聊，必存在）。
 /// 多目标（#21）：job.targets 非空时向每个目标各投一份（可跨 bot，经路由表投递 + 失败兜底）。
+/// 仅供测试：把私有的 [`run_job`] 暴露给 bridge 侧的集成测试（#309 PR-A2 的
+/// 「真调 run_job + 真 harness」用例需要它，而 run_job 依赖 service 私有装配）。
+#[cfg(test)]
+pub(crate) async fn run_job_for_test(
+    bridge: Arc<Bridge>,
+    router: std::sync::Arc<crate::deliver::Router>,
+    job: crate::schedule::Job,
+) {
+    run_job(bridge, router, job).await
+}
+
 async fn run_job(
     bridge: Arc<Bridge>,
     router: std::sync::Arc<crate::deliver::Router>,

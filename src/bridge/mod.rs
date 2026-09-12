@@ -222,6 +222,36 @@ impl Bridge {
         self.job_turns.lock().unwrap().remove(job_id);
     }
 
+    /// #309 PR-A2：把停止词路由到本 chat 上**正在跑的定时任务轮次**。
+    ///
+    /// 两处刻意不按直觉来（都是前两版被否的原因）：
+    /// - 用登记表里 **job 启动时解析出的 handle**，不是停止词发送者的角色——job 可能跑在
+    ///   另一个实例上（owner 建的跑 normal、granted 建的跑 granted），按发送者选会打偏；
+    /// - 按 **chat_id** 查（不带 thread）：job 恒跑群根频道，而停止词可能来自任意话题。
+    ///
+    /// 只有 `handle.cancel(..)` 返回 `Some(true)`（**信号确已送达在跑轮次**）才返回 true
+    /// 让调用方吞掉该停止词；`Some(false)`（排队中/已完成/无轮次）与 `None`（句柄关闭）
+    /// 都返回 false，落回原路径——避免「假取消」把停止词吞掉而任务照跑。
+    ///
+    /// 注意这里是 **best-effort**：A1 的语义是「自然完成优先」，极端竞速下（cancel 信号
+    /// 发出时该轮其实已以 `Ok` 收尾）任务仍会正常投递结果，而用户的「停」不会得到回复。
+    /// queued 取消见 #309 PR-B。
+    pub(crate) async fn cancel_job_turns_for_chat(&self, chat_id: &str) -> bool {
+        let turns = self.job_turns_for_chat(chat_id);
+        let mut cancelled = false;
+        for turn in turns {
+            if turn.handle.cancel(turn.channel_id).await == Some(true) {
+                cancelled = true;
+                crate::log!(
+                    "[bridge] 停止指令 → 叫停定时任务轮次 chat={} channel={}",
+                    crate::agent::truncate(chat_id, 16),
+                    turn.channel_id
+                );
+            }
+        }
+        cancelled
+    }
+
     /// 该 chat 上正在跑的所有定时任务轮次（停止词路由用）。
     pub(crate) fn job_turns_for_chat(&self, chat_id: &str) -> Vec<JobTurn> {
         self.job_turns
@@ -3681,6 +3711,90 @@ mod tests {
             "没有在跑轮次时停止词必须透传（不能被假取消吞掉）"
         );
         bridge.unregister_job_turn("jobIdle");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #309 PR-A2 **端到端**：真调 `run_job` + 真 mock harness——会话内停止词必须让
+    /// job 走到 `SyncTurnOutcome::Cancelled` → **静默收尾（不投递）**，并摘掉登记。
+    ///
+    /// 这条锁的是「run_job 的接线真的生效」：上一版正是因为 `run_job` 里残留旧的
+    /// `_cancel_flag` 注册，停止词在到达取消路由前就被吞掉，而当时「手工注册 JobTurn」
+    /// 的单测完全看不出来。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn run_job_stop_word_cancels_and_finishes_silently() {
+        let runner = Arc::new(MockAgentRunner::immediate("x"));
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        // MOCK_HANG_PROMPT：agent 收到 prompt 后不应答但照收 session/cancel →
+        // 回合留在 in-flight，`handle.cancel` 才会返回 Some(true)（真实的取消路径）。
+        let (buzz, handles) = make_test_harness_full(
+            rec.clone(),
+            &registry,
+            None,
+            vec![("MOCK_HANG_PROMPT".to_string(), "1".to_string())],
+        );
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("claude"),
+            Some((buzz.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+
+        let chat_id = format!("oc_jobcancel_{}", uuid::Uuid::new_v4());
+        let job = crate::schedule::Job {
+            id: "job-e2e-cancel".to_string(),
+            kind: crate::schedule::JobKind::Once,
+            schedule: "2026-09-12 00:00".to_string(),
+            prompt: "长任务（会被停止词打断）".to_string(),
+            chat_id: chat_id.clone(),
+            note: String::new(),
+            targets: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+        };
+        // 单目标 job 不走 Router（直接 bridge.msgr.send_text），空 Router 即可。
+        let router = Arc::new(crate::deliver::Router::new(
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+        ));
+        let b = bridge.clone();
+        let task = tokio::spawn(async move {
+            crate::service::run_job_for_test(b, router, job).await;
+        });
+
+        // 等登记出现 = run_job 已 dispatch、回合在跑
+        let mut waited_ms = 0u64;
+        while bridge.job_turns_for_chat(&chat_id).is_empty() {
+            assert!(waited_ms < 20_000, "job 未进入登记表（未 dispatch？）");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waited_ms += 50;
+        }
+
+        // 走**生产的停止词路由**（同一个 Bridge 方法）
+        assert!(
+            bridge.cancel_job_turns_for_chat(&chat_id).await,
+            "在跑轮次应被叫停（handle.cancel 返回 Some(true)）"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("被叫停后 run_job 必须及时收尾（不得挂到超时）")
+            .unwrap();
+
+        assert!(
+            msgr.sent().is_empty(),
+            "被叫停的 job 不得投递任何东西（含超时文案）: {:?}",
+            msgr.sent()
+        );
+        assert!(
+            bridge.job_turns_for_chat(&chat_id).is_empty(),
+            "收尾必须摘除 job 登记"
+        );
         cleanup_bridge(&bridge);
     }
 

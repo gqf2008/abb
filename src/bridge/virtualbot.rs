@@ -1186,34 +1186,11 @@ impl Bridge {
         dir
     }
 
-    /// #309 PR-A2：把停止词路由到本 chat 上**正在跑的定时任务轮次**。
-    ///
-    /// 两处刻意不按直觉来（都是前两版被否的原因）：
-    /// - 用登记表里 **job 启动时解析出的 handle**，不是停止词发送者的角色——job 可能跑在
-    ///   另一个实例上（owner 建的跑 normal、granted 建的跑 granted），按发送者选会打偏；
-    /// - 按 **`ev.chat_id`** 查（不带 thread）：job 恒跑群根频道，而停止词可能来自任意话题。
-    ///
-    /// 只有 `handle.cancel(..)` 返回 `Some(true)`（**信号确已送达在跑轮次**）才返回 true
-    /// 并让调用方吞掉该停止词；`Some(false)`（排队中/已完成/无轮次）与 `None`（句柄关闭）
-    /// 都返回 false，落回原路径——避免「假取消」把停止词吞掉而任务照跑。
-    ///
-    /// 注意这里是 **best-effort**：A1 的语义是「自然完成优先」，所以极端竞态下
-    /// （cancel 信号发出时该轮其实已以 `Ok` 收尾）任务仍会正常投递结果，而用户的
-    /// 「停」不会得到回复。这是已知取舍，见 #309。queued 取消见 #309 PR-B。
+    /// #309 PR-A2：把停止词交给桥的 job 轮次路由（实现见
+    /// [`crate::bridge::Bridge::cancel_job_turns_for_chat`]，便于 service 侧集成测试
+    /// 直接驱动同一段逻辑）。
     async fn cancel_job_turns(&self, ev: &Ev) -> bool {
-        let turns = self.job_turns_for_chat(&ev.chat_id);
-        let mut cancelled = false;
-        for turn in turns {
-            if turn.handle.cancel(turn.channel_id).await == Some(true) {
-                cancelled = true;
-                crate::log!(
-                    "[bridge] 停止指令 → 叫停定时任务轮次 chat={} channel={}",
-                    trunc(&ev.chat_id, 16),
-                    turn.channel_id
-                );
-            }
-        }
-        cancelled
+        self.cancel_job_turns_for_chat(&ev.chat_id).await
     }
 
     /// #206：buzz /cancel——预检（频道已登记；buzz 未启用则拒——与 dispatch 同
