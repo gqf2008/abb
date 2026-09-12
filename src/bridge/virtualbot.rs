@@ -362,6 +362,12 @@ impl Bridge {
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
+            // #309：该 chat 上有定时任务轮次在跑 → 送到**它自己的** handle 与 channel。
+            // 只有确实命中在跑轮次（Some(true)）才算叫停成功：queued/已完成返回 false，
+            // 此时不能吞掉这条指令（否则就是「假取消」，用户以为停了其实还在跑）。
+            if self.cancel_job_turns(&ev).await {
+                return;
+            }
             // #124 团队创建流程进行中：/cancel 也中止（WaitingGoal/WaitingConfirm 通用），
             // 避免出现「/cancel 却说没有任务在跑」的割裂。
             if self.team_flows.get(&key).is_some() {
@@ -393,6 +399,10 @@ impl Bridge {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::log!("[bridge] 收到停止指令 chat={}", trunc(&key, 16));
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
+                return;
+            }
+            // #309：没有 chat 回合在跑，但可能有定时任务轮次在跑 → 真实叫停（静默）。
+            if self.cancel_job_turns(&ev).await {
                 return;
             }
             // 无在跑任务 → 停止词当普通消息透传给 agent
@@ -1174,6 +1184,32 @@ impl Bridge {
         let dir = crate::workspace_dir(&self.bot.key());
         crate::agent::ensure_workspace_guide(&dir);
         dir
+    }
+
+    /// #309 PR-A2：把停止词路由到本 chat 上**正在跑的定时任务轮次**。
+    ///
+    /// 两处刻意不按直觉来（都是前两版被否的原因）：
+    /// - 用登记表里 **job 启动时解析出的 handle**，不是停止词发送者的角色——job 可能跑在
+    ///   另一个实例上（owner 建的跑 normal、granted 建的跑 granted），按发送者选会打偏；
+    /// - 按 **`ev.chat_id`** 查（不带 thread）：job 恒跑群根频道，而停止词可能来自任意话题。
+    ///
+    /// 只有 `handle.cancel(..)` 返回 `Some(true)`（确实有在跑轮次）才算叫停成功并返回
+    /// true；`Some(false)`（排队中/已完成/无轮次）与 `None`（句柄关闭）都返回 false，
+    /// 让调用方落回原路径——避免「假取消」把停止词吞掉而任务照跑。queued 取消见 #309 PR-B。
+    async fn cancel_job_turns(&self, ev: &Ev) -> bool {
+        let turns = self.job_turns_for_chat(&ev.chat_id);
+        let mut cancelled = false;
+        for turn in turns {
+            if turn.handle.cancel(turn.channel_id).await == Some(true) {
+                cancelled = true;
+                crate::log!(
+                    "[bridge] 停止指令 → 叫停定时任务轮次 chat={} channel={}",
+                    trunc(&ev.chat_id, 16),
+                    turn.channel_id
+                );
+            }
+        }
+        cancelled
     }
 
     /// #206：buzz /cancel——预检（频道已登记；buzz 未启用则拒——与 dispatch 同
