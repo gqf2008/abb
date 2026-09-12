@@ -209,22 +209,6 @@ impl Ev {
 }
 
 impl Bridge {
-    /// 注册/摘除一个 cancel 标志（聊天任务与定时任务共用）：
-    /// 定时任务（run_job）也注册到目标 chat_id，用户在该会话发「停止」即可打断后台任务。
-    /// 返回的 flag 传给 agent::run 的 cancel 参数；任务结束（含错误/取消路径）必须 remove。
-    pub(crate) fn register_cancel_flag(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.cancel_flags
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), flag.clone());
-        flag
-    }
-
-    #[allow(dead_code)] // spawn 退役后 job 不再消费；测试挡板仍引用
-    pub(crate) fn unregister_cancel_flag(&self, key: &str) {
-        self.cancel_flags.lock().unwrap().remove(key);
-    }
     /// 登记/摘除一个正在跑的定时任务轮次（#309 PR-A2）。
     /// 注册时机：dispatch 之前；摘除：所有结束路径。
     pub(crate) fn register_job_turn(&self, job_id: &str, turn: JobTurn) {
@@ -4626,41 +4610,6 @@ https://b.com/y"
             vec!["⏹ 已停止"],
             "中途进度不得发送，只回「⏹ 已停止」一条"
         );
-        cleanup_bridge(&bridge);
-    }
-
-    #[test]
-    fn register_unregister_cancel_flag_roundtrip() {
-        let (bridge, _msgr) = build_test_bridge(Arc::new(MockAgentRunner::immediate("x")));
-        // 注册 → 可被「停止词」发现并置 true
-        let flag = bridge.register_cancel_flag("oc_jobchat");
-        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
-        // 模拟停止词到达（virtualbot 里对该 key 的 flag 置 true）
-        let got = bridge
-            .cancel_flags
-            .lock()
-            .unwrap()
-            .get("oc_jobchat")
-            .cloned();
-        let got = got.expect("注册后应可查到");
-        got.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            flag.load(std::sync::atomic::Ordering::Relaxed),
-            "同一 Arc，置 true 应互相可见"
-        );
-        // 摘除 → 停止词找不到（后续按普通消息处理）
-        bridge.unregister_cancel_flag("oc_jobchat");
-        assert!(
-            bridge
-                .cancel_flags
-                .lock()
-                .unwrap()
-                .get("oc_jobchat")
-                .is_none(),
-            "摘除后不应再可查"
-        );
-        // 未注册的 key 摘除是 no-op（不 panic）
-        bridge.unregister_cancel_flag("oc_none");
         cleanup_bridge(&bridge);
     }
 

@@ -1313,12 +1313,11 @@ async fn run_job(
     // 授权者建的任务在受限分支执行：prompt 前置与聊天路径一致的受限说明 + 三级
     // AGENTS.md 指令文件块（组装抽成 job_prompt 纯函数，可测）。
     let prompt = job_prompt(&job, &bot_key);
-    // 定时任务可被「停止词」打断（#卡死修复）：注册到目标会话的 cancel 标志，
-    // 用户在该会话发 停/停止/cancel 即可终止正在跑的后台任务；
-    // 与聊天任务共用同一 key（chat_id）——同一 chat 同一时刻只有一个在跑任务。
-    // job 走 ACP 同步回合：叫停走 harness cancel 信号（/cancel 命令路径），
-    // CLI 的 cancel_flag 机制随 spawn 退役——不再注册。
-    let _cancel_flag = bridge.register_cancel_flag(&job.chat_id);
+    // 定时任务的叫停（#309）：**不再**注册 Bridge 的 cancel flag——那是 chat 回合的
+    // 机制（virtualbot 起回合时自己 insert），job 走 ACP 同步回合根本不消费它。
+    // 历史上这里注册过一个没有读者的 flag，反而让停止词命中后直接 return，把真实叫停
+    // 短路掉（#309 的根因）。现在的路径：下面 register_job_turn(...) 登记本轮 → 会话内
+    // 发停止词时由 virtualbot 的 cancel_job_turns() 把取消送到**本 job 的 handle/channel**。
     // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     // P2.2/P2.3：按 job 角色选实例——granted 任务路由 granted 实例（强制受限剖面），
@@ -1371,9 +1370,10 @@ async fn run_job(
                     );
                     // #309 PR-A2：登记本轮，供会话内的停止词/`/cancel` 把取消送到
                     // **本 job 实际使用的 handle 与 channel**（不是停止词发送者的角色）。
-                    // 登记在 dispatch 之前，但真正的取消只在有在跑轮次时才生效
-                    // （停止词侧只认 handle.cancel 返回 Some(true)），所以不存在
-                    // 「登记了但 waiter 还没注册」导致误吞的窗口。
+                    // 登记在 dispatch 之前。注意这只保证**不会假吞停止词**：
+                    // starting/queued 阶段（waiter 尚未注册、handle.cancel 返回 false）
+                    // 的停止请求会落回原路径、job 之后仍会跑——那属于 queued 取消，
+                    // 见 #309 PR-B。
                     bridge.register_job_turn(
                         &job.id,
                         crate::bridge::JobTurn {

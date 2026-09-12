@@ -47,7 +47,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 **B. 同 channel 的等待者只有一个**
 
-`wait_turn_text` 的同步 waiter 是**每 channel 一个**（`src/buzz/harness.rs:287-301`）：同一 channel 上多个等待者会互相顶掉；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递（`src/buzz/harness.rs:1036-1043`）。
+`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/buzz/harness.rs:287-301`）：同一 channel 上多个等待者会互相顶掉；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递（`src/buzz/harness.rs:1036-1043`）。
 
 **C. 会话上下文挂在哪**
 
