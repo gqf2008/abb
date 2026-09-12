@@ -102,9 +102,17 @@ jobs:
       - name: test（全量测试）
         run: cargo test
 
+      # #317：Windows 上有一批依赖 python3（tests/mock_acp_agent.py）的端到端用例会被
+      # `cfg_attr(windows, ignore)` 跳过——把清单显式列出来，让「绿但没跑」可见。
+      # 它们由下面的 test-macos job 真实执行。
+      - name: 列出被 ignore 的用例（可见性）
+        if: always()
+        run: cargo test -- --list --ignored
+
   # macOS 特有代码（configure_backend 的 cfg(target_os="macos") 分支、SLINT_BACKEND
   # 经 BackendSelector 的选择路径、透明标题栏钩子）只在本平台编译；windows job 覆盖
-  # 不到，这里补编译验证。渲染器去 skia 后 macOS 冷构建无需外部 C++ 工具链。
+  # 不到，这里补**编译**验证。渲染器去 skia 后 macOS 冷构建无需外部 C++ 工具链。
+  # 注意：本 job 只 cargo check，不跑测试——真正跑测试的是下面的 test-macos。
   check-macos:
     runs-on: macos-latest
     steps:
@@ -152,9 +160,3 @@ jobs:
 
       - name: cargo test（macOS：含依赖 mock agent 的端到端用例）
         run: cargo test
-
-      # 可见性：把「被 ignore 的用例」显式列出来，避免再出现「绿但其实没跑」
-      - name: 列出被 ignore 的用例
-        if: always()
-        shell: bash
-        run: cargo test -- --list --ignored || true
