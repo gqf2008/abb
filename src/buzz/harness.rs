@@ -136,8 +136,12 @@ pub enum SyncTurnOutcome {
     /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
     /// oneshot fresh Uuid，触不到；与旧实现同构）。
     Closed,
-    /// 外部联动取消（P3.2：oneshot 的关停联动）——与 Timeout 同款 teardown
-    /// 已完成，在途回合已叫停。
+    /// 取消**终态**（#309 PR-A1）：该轮以取消收尾，且其批次已被丢弃、不会重提示
+    /// ——不是「取消信号已发出」这种中间态。与 Timeout 同款 teardown 已完成。
+    ///
+    /// 自然完成优先：若该轮其实以 `Ok` 收尾，则不会走到这里（给等待方真实文本）。
+    /// 另注意 `wait_turn_text` 会把本结局折叠成 `None`；需要区分的调用方用
+    /// [`Self::wait_turn_outcome`]。
     Cancelled,
     /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
     Failed(String),
@@ -155,6 +159,18 @@ enum Cmd {
     /// 根频道全量同步（service 每 2s 从 vb 存储扫描）。diff 应用：新增
     /// 注册，消失的根频道排空队列、失效会话、其后的失败批次直接丢弃。
     SyncRoots(Vec<ChannelMeta>),
+}
+
+/// 同步 waiter 的回传消息（#309 PR-A1）。区分「正常结局」与「**丢弃式取消**」：
+/// 后者表示这一轮被叫停**且批次不会再被重提示**，调用方应静默收尾、别再等文本。
+#[derive(Debug, PartialEq, Eq)]
+enum SyncWaitMsg {
+    /// 回合文本（`Ok`）或终态失败原因（`Err`）——与改造前的 `Result<String,String>` 同义。
+    Done(Result<String, String>),
+    /// 取消终态：该轮以 `PromptOutcome::Cancelled` 结束，且其批次**已被丢弃、
+    /// 不会被重提示**（被 Steer 合并重提示的那种不发这个，等待方等重提示文本）。
+    /// 等待方据此静默收尾。
+    Cancelled,
 }
 
 /// 懒启动 / 崩溃重拉的后台尝试结果。
@@ -211,7 +227,7 @@ pub struct BuzzHandle {
     /// 死信/失败告示时旁路——否则 agent 错误对同步等待者只表现为「挂到超时」，
     /// 见 docs/buzz-port-sync.md 与 oneshot.rs）。
     sync_waiters: std::sync::Mutex<
-        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
+        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SyncWaitMsg>>,
     >,
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
@@ -276,8 +292,9 @@ impl BuzzHandle {
     }
 
     /// 同步回合等待（oneshot 路径）：与 [`Self::wait_turn_text`] 同机制，但
-    /// 结局四分——Ok(文本) / Timeout（调用方预算先到） / Closed（句柄已关闭，
-    /// push 不进） / Failed(agent 终态失败原因，由 notify_channel 旁路)。
+    /// 结局五分——Ok(文本) / Timeout（调用方预算先到） / Closed（句柄已关闭，
+    /// push 不进） / Failed(agent 终态失败原因，由 notify_channel 旁路) /
+    /// Cancelled（取消终态且批次已丢弃，见 `SyncWaitMsg::Cancelled`）。
     pub async fn wait_turn_outcome(
         &self,
         channel_id: Uuid,
@@ -291,8 +308,10 @@ impl BuzzHandle {
             return SyncTurnOutcome::Closed;
         }
         let outcome = match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(Ok(text))) => SyncTurnOutcome::Ok(text),
-            Ok(Some(Err(reason))) => SyncTurnOutcome::Failed(reason),
+            Ok(Some(SyncWaitMsg::Done(Ok(text)))) => SyncTurnOutcome::Ok(text),
+            Ok(Some(SyncWaitMsg::Done(Err(reason)))) => SyncTurnOutcome::Failed(reason),
+            // 丢弃式取消：#309 起不再等重提示/超时，直接给调用方终态。
+            Ok(Some(SyncWaitMsg::Cancelled)) => SyncTurnOutcome::Cancelled,
             // Ok(None) = 回传端意外消失（同 channel_id 并发两次等待时后者
             // 顶替前者的 tx；见 SyncTurnOutcome::Closed 文档），按关闭论。
             Ok(None) => SyncTurnOutcome::Closed,
@@ -406,6 +425,10 @@ struct Loop {
     spawn_in_flight: bool,
     /// 日志活跃度。
     last_activity: Instant,
+    /// 收到过取消请求、但结局尚未到达的频道（#309）：取消作用于**这一轮**，
+    /// 而结局可能是 Cancelled / CancelDrainTimeout / AgentExited / Error / Timeout
+    /// 中的任意一种——所以不能只在 Cancelled 分支处理，必须在该轮真实结局处统一消费。
+    cancel_requested: HashSet<Uuid>,
 }
 
 impl Loop {
@@ -424,6 +447,7 @@ impl Loop {
             crash_backoff: 0,
             spawn_in_flight: false,
             last_activity: Instant::now(),
+            cancel_requested: HashSet::new(),
         };
         (l, steer_ack_rx)
     }
@@ -525,6 +549,17 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
         }
         Cmd::Cancel { channel_id, reply } => {
             let fired = signal_in_flight_task(&mut l.pool, channel_id, ControlSignal::Cancel);
+            // 只登记「这一轮收到过取消请求」——**不在这里**通知 waiter：`fired` 只表示
+            // 信号已送达，不代表最终结局是取消（回合可能已自然完成、结果正排在结果
+            // 分支里；run_loop 是 biased）。提前报取消会让调用方收到 Cancelled，而那
+            // 次自然完成的文本照样进聊天。
+            //
+            // 终态统一在 handle_prompt_result 里按**真实结局**判定并消费（见
+            // `cancel_waiter_terminal`）——覆盖 Cancelled / CancelDrainTimeout /
+            // AgentExited / Error / Timeout 全部结局，不会漏成「挂到 timeout」。
+            if fired {
+                l.cancel_requested.insert(channel_id);
+            }
             let _ = reply.send(fired);
         }
         Cmd::SyncRoots(roots) => {
@@ -893,17 +928,23 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
 
     // 批次命运：requeue 先于 mark_complete（requeue 设 retry_after 而
     // mark_complete 清 retry_counts——顺序颠倒废掉退避与死信保护）。
+    // `cancel_requeued` = 本次取消把批次交给队列**重提示**了（Steer 合并 /
+    // 排水超时同路）；只有**没有**重提示的取消才是同步等待方的终态（#309）。
+    let mut cancel_requeued = false;
     if let Some(batch) = result.batch.take() {
         if !l.removed_channels.contains(&batch.channel_id) {
             if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
-                // cancel 重提示：进 cancelled_batches，flush_next 并入下一批
-                // 重提示。CancelDrainTimeout 与干净取消同路（5s 排水超时不是
-                // 硬上限死信；批次不带重试账）。
+                // 走到这里说明批次是被 **Steer**（回合中来了新消息）取消后由 pool
+                // 交还的：进 cancelled_batches，flush_next 并入下一批重提示。
+                // CancelDrainTimeout 与干净取消同路（5s 排水超时不是硬上限死信；
+                // 批次不带重试账）。注意：纯 `Cmd::Cancel` 在 pool 侧就已丢批次，
+                // 不会进到这个分支（requeue_cancelled_batch(Cancel) == None）。
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 l.queue.requeue_as_cancelled(batch, reason);
+                cancel_requeued = true;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -997,7 +1038,16 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
         }
     }
 
+    // #309：本轮若收到过取消请求，就在**真实结局**处给同步 waiter 取消终态
+    // （覆盖 Cancelled / CancelDrainTimeout / AgentExited / Error / Timeout 全部结局——
+    // 不能只在 Cancelled 分支做，否则取消失败类结局会落回「挂到 timeout」）。
+    // 批次被 Steer 合并重提示时不发终态：等待方应当等那次重提示的文本。
     let PromptSource::Channel(ch) = &result.source;
+    if l.cancel_requested.remove(ch) {
+        if let Some(msg) = cancel_waiter_terminal(true, cancel_requeued, &result.outcome) {
+            let _ = deliver_sync_wait_msg(handle, *ch, msg);
+        }
+    }
     l.queue.mark_complete(*ch);
     // 该频道的 in-flight 批次已处置——从 removed 里消费掉（同频道后续
     // 推送只可能来自重新登记，upsert 会再把它清掉）。
@@ -1035,7 +1085,7 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
                 // 同步等待者（job/oneshot 路径）旁路：文本直接回传，不产生 chat 投递
                 if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(channel_id) {
-                    let _ = tx.send(Ok(text));
+                    let _ = tx.send(SyncWaitMsg::Done(Ok(text)));
                 } else {
                     let _ = handle.turn_tx.send(TurnOutput {
                         channel_id: *channel_id,
@@ -1128,6 +1178,47 @@ fn schedule_death_respawn(
     schedule_agent_start(l, handle, delay, Some(old_agent));
 }
 
+/// 取消终态决策（#309 PR-A1）——纯函数，便于把分支钉死在单测里：
+///
+/// - `cancel_requested`：这一轮收到过取消请求（`Cmd::Cancel` 且信号送达）；
+/// - `cancel_requeued`：该批次的取消走的是「合并重提示」（Steer / 排水超时）；
+/// - `outcome`：该轮**真实结局**。
+///
+/// 语义（**自然完成优先**）：
+/// - 收到取消、但该轮其实以 `Ok` 收尾 → **不发**取消终态，让等待方拿真实文本。
+///   取消与自然完成是竞速关系（`Cmd::Cancel` 只登记、终态在真实结局处判定）；
+///   若这里硬报 Cancelled，就会出现「谎报取消 + 文本照样进聊天」的不一致；
+/// - 收到取消且该轮**没有**产出结果（`Cancelled` / `CancelDrainTimeout` /
+///   `AgentExited` / `Error` / `Timeout`）→ 给 `Cancelled` 终态；
+/// - 批次被合并重提示 → 不发终态，等待方等重提示后的文本。
+///
+/// 注意：若错误旁路（`notify_channel`）已先把 waiter 取走并发了 `Done(Err)`，
+/// 本决策会找不到 waiter 而自然 no-op——即**错误旁路优先**，与上述并列一致。
+fn cancel_waiter_terminal(
+    cancel_requested: bool,
+    cancel_requeued: bool,
+    outcome: &PromptOutcome,
+) -> Option<SyncWaitMsg> {
+    if !cancel_requested || cancel_requeued {
+        return None;
+    }
+    if matches!(outcome, PromptOutcome::Ok(_)) {
+        return None;
+    }
+    Some(SyncWaitMsg::Cancelled)
+}
+
+/// 把消息投给该频道的同步 waiter（取走条目）。返回是否确实有一个 waiter 收到。
+fn deliver_sync_wait_msg(handle: &BuzzHandle, channel_id: Uuid, msg: SyncWaitMsg) -> bool {
+    match handle.sync_waiters.lock().unwrap().remove(&channel_id) {
+        Some(tx) => {
+            let _ = tx.send(msg);
+            true
+        }
+        None => false,
+    }
+}
+
 /// 失败批次死信/重试耗尽时的频道告示（出站 TurnOutput，桥侧写历史并发送）。
 /// 同步等待者旁路（P3.1）：该频道有 waiter 时同文以 Err 回传——agent 终态失败
 /// （死信/认证失效/档位不支持）对 job/oneshot 路径不再只表现为「挂到超时」。
@@ -1143,7 +1234,7 @@ fn notify_channel(l: &mut Loop, handle: &BuzzHandle, batch: &FlushBatch, text: S
         .unwrap()
         .remove(&batch.channel_id)
     {
-        let _ = tx.send(Err(text.clone()));
+        let _ = tx.send(SyncWaitMsg::Done(Err(text.clone())));
     }
     let _ = handle.turn_tx.send(TurnOutput {
         channel_id: batch.channel_id,
@@ -1466,6 +1557,157 @@ mod channel_info_tests {
             .is_none());
     }
 
+    /// #309 PR-A1：丢弃式取消的 waiter 回传必须映射成 `Cancelled` **终态**——
+    /// 不是 Timeout，也不等重提示后的文本。纯单测：直接拨 sync_waiters 表。
+    #[tokio::test]
+    async fn sync_wait_cancelled_maps_to_cancelled_outcome() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        let _cmd_rx = handle.take_cmd_rx();
+        let channel_id = Uuid::new_v4();
+        let waiter = {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                h.wait_turn_outcome(
+                    channel_id,
+                    crate::buzz::queue::InboundMsg {
+                        id_hex: "m1".to_string(),
+                        author_role: "owner".to_string(),
+                        text: "x".to_string(),
+                        ts_secs: 0,
+                        prompt_tag: "test".to_string(),
+                    },
+                    std::time::Duration::from_secs(3600),
+                )
+                .await
+            })
+        };
+        // 等等待者注册，再模拟丢弃式取消的回传
+        let mut waited_ms = 0u64;
+        let tx = loop {
+            if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(&channel_id) {
+                break tx;
+            }
+            assert!(waited_ms < 5000, "等待者未注册");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited_ms += 10;
+        };
+        let started = std::time::Instant::now();
+        tx.send(SyncWaitMsg::Cancelled).unwrap();
+        let outcome = waiter.await.unwrap();
+        assert_eq!(
+            outcome,
+            SyncTurnOutcome::Cancelled,
+            "丢弃式取消必须给出 Cancelled 终态"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "必须是立刻返回，而不是挂到 timeout"
+        );
+        assert!(
+            !handle
+                .sync_waiters
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id),
+            "终态后不得残留 waiter 条目"
+        );
+    }
+
+    /// #309 PR-A1：取消终态决策（纯函数）——覆盖「收到过取消 × 批次是否被重提示」
+    /// 四种组合。这是 A1 的核心契约：取消失败类结局（CancelDrainTimeout /
+    /// AgentExited / Error / Timeout）只要没被重提示，也必须给等待方终态，
+    /// 不能让它落回「挂到 timeout」。
+    #[test]
+    fn cancel_waiter_terminal_covers_all_cases() {
+        // 取消失败类结局（batch=None）必须都给终态，不能漏成挂 timeout
+        for outcome in [
+            PromptOutcome::Cancelled,
+            PromptOutcome::CancelDrainTimeout(std::time::Duration::from_secs(5)),
+            PromptOutcome::AgentExited,
+            PromptOutcome::Timeout(TimeoutKind::Idle),
+            PromptOutcome::Error(AcpError::Protocol("boom".to_string())),
+        ] {
+            assert_eq!(
+                cancel_waiter_terminal(true, false, &outcome),
+                Some(SyncWaitMsg::Cancelled),
+                "收到取消且该轮无产出 → 必须给 Cancelled 终态"
+            );
+        }
+        // 自然完成优先：真的产出了文本就交给等待方，别谎报取消
+        // （否则会出现「报了 Cancelled 但文本仍进聊天」的不一致）
+        assert_eq!(
+            cancel_waiter_terminal(
+                true,
+                false,
+                &PromptOutcome::Ok(crate::buzz::acp::StopReason::EndTurn)
+            ),
+            None,
+            "Ok 结局 → 不发取消终态，让等待方拿真实文本"
+        );
+        // 批次被合并重提示 → 等重提示后的文本
+        assert_eq!(
+            cancel_waiter_terminal(true, true, &PromptOutcome::Cancelled),
+            None
+        );
+        // 没收到取消 → 不动 waiter
+        assert_eq!(
+            cancel_waiter_terminal(false, false, &PromptOutcome::Cancelled),
+            None
+        );
+    }
+
+    /// #309 PR-A1：把终态投给该频道 waiter——有 waiter 时送达且不残留；
+    /// 没有 waiter 时是 no-op（不误伤、不 panic）。
+    #[tokio::test]
+    async fn deliver_sync_wait_msg_sets_terminal_state() {
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                extra_env: Vec::new(),
+                backend: "test".to_string(),
+                session_sandbox: None,
+            },
+            CancellationToken::new(),
+            ".".to_string(),
+        );
+        let channel_id = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncWaitMsg>();
+        handle.sync_waiters.lock().unwrap().insert(channel_id, tx);
+
+        assert!(
+            deliver_sync_wait_msg(&handle, channel_id, SyncWaitMsg::Cancelled),
+            "有 waiter 时必须送达"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(SyncWaitMsg::Cancelled),
+            "waiter 必须收到 Cancelled 终态"
+        );
+        assert!(
+            !handle
+                .sync_waiters
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id),
+            "送达后不得残留 waiter 条目（残留会吞掉后续聊天回复）"
+        );
+        assert!(
+            !deliver_sync_wait_msg(&handle, channel_id, SyncWaitMsg::Cancelled),
+            "没有 waiter 时是 no-op"
+        );
+    }
+
     /// P3.1（审查 P3-4）：job 折叠臂直接锁——频道死信（等待者收 Err）时
     /// `wait_turn_text` 必须**提前醒**且折叠为 None，而不是挂满预算。
     /// 纯单测：不跑 run_loop，直接拨 sync_waiters 表模拟 notify_channel 旁路。
@@ -1513,8 +1755,10 @@ mod channel_info_tests {
             waited_ms += 10;
         };
         let started = std::time::Instant::now();
-        tx.send(Err("⚠️ 处理失败：agent 认证失效。".to_string()))
-            .unwrap();
+        tx.send(SyncWaitMsg::Done(Err(
+            "⚠️ 处理失败：agent 认证失效。".to_string()
+        )))
+        .unwrap();
         let folded = waiter.await.unwrap();
         assert_eq!(folded, None, "Failed 必须折叠为 None");
         assert!(
