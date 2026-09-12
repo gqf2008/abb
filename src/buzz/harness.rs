@@ -136,8 +136,12 @@ pub enum SyncTurnOutcome {
     /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
     /// oneshot fresh Uuid，触不到；与旧实现同构）。
     Closed,
-    /// 外部联动取消（P3.2：oneshot 的关停联动）——与 Timeout 同款 teardown
-    /// 已完成，在途回合已叫停。
+    /// 取消**终态**（#309 PR-A1）：该轮以取消收尾，且其批次已被丢弃、不会重提示
+    /// ——不是「取消信号已发出」这种中间态。与 Timeout 同款 teardown 已完成。
+    ///
+    /// 自然完成优先：若该轮其实以 `Ok` 收尾，则不会走到这里（给等待方真实文本）。
+    /// 另注意 `wait_turn_text` 会把本结局折叠成 `None`；需要区分的调用方用
+    /// [`Self::wait_turn_outcome`]。
     Cancelled,
     /// agent 终态失败（死信/失败告示的原因文案，notify_channel 旁路）。
     Failed(String),
