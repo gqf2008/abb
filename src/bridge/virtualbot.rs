@@ -362,6 +362,12 @@ impl Bridge {
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
                 return;
             }
+            // #309：该 chat 上有定时任务轮次在跑 → 送到**它自己的** handle 与 channel。
+            // 只有确实命中在跑轮次（Some(true)）才算叫停成功：queued/已完成返回 false，
+            // 此时不能吞掉这条指令（否则就是「假取消」，用户以为停了其实还在跑）。
+            if self.cancel_job_turns(&ev).await {
+                return;
+            }
             // #124 团队创建流程进行中：/cancel 也中止（WaitingGoal/WaitingConfirm 通用），
             // 避免出现「/cancel 却说没有任务在跑」的割裂。
             if self.team_flows.get(&key).is_some() {
@@ -393,6 +399,10 @@ impl Bridge {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::log!("[bridge] 收到停止指令 chat={}", trunc(&key, 16));
                 // 「⏹ 已停止」由被叫停的任务自己发（它确认真停了才发）；这里不回话避免重复。
+                return;
+            }
+            // #309：没有 chat 回合在跑，但可能有定时任务轮次在跑 → 真实叫停（静默）。
+            if self.cancel_job_turns(&ev).await {
                 return;
             }
             // 无在跑任务 → 停止词当普通消息透传给 agent
@@ -1174,6 +1184,13 @@ impl Bridge {
         let dir = crate::workspace_dir(&self.bot.key());
         crate::agent::ensure_workspace_guide(&dir);
         dir
+    }
+
+    /// #309 PR-A2：把停止词交给桥的 job 轮次路由（实现见
+    /// [`crate::bridge::Bridge::cancel_job_turns_for_chat`]，便于 service 侧集成测试
+    /// 直接驱动同一段逻辑）。
+    async fn cancel_job_turns(&self, ev: &Ev) -> bool {
+        self.cancel_job_turns_for_chat(&ev.chat_id).await
     }
 
     /// #206：buzz /cancel——预检（频道已登记；buzz 未启用则拒——与 dispatch 同
