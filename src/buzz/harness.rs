@@ -1040,7 +1040,7 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
     // 批次被 Steer 合并重提示时不发终态：等待方应当等那次重提示的文本。
     let PromptSource::Channel(ch) = &result.source;
     if l.cancel_requested.remove(ch) {
-        if let Some(msg) = cancel_waiter_terminal(true, cancel_requeued) {
+        if let Some(msg) = cancel_waiter_terminal(true, cancel_requeued, &result.outcome) {
             let _ = deliver_sync_wait_msg(handle, *ch, msg);
         }
     }
@@ -1177,14 +1177,31 @@ fn schedule_death_respawn(
 /// 取消终态决策（#309 PR-A1）——纯函数，便于把分支钉死在单测里：
 ///
 /// - `cancel_requested`：这一轮收到过取消请求（`Cmd::Cancel` 且信号送达）；
-/// - `cancel_requeued`：该批次的取消走的是「合并重提示」（Steer / 排水超时）。
+/// - `cancel_requeued`：该批次的取消走的是「合并重提示」（Steer / 排水超时）；
+/// - `outcome`：该轮**真实结局**。
 ///
-/// 只有「收到过取消」且「批次没有被重提示」时才给等待方取消终态；被重提示的那种
-/// 应当继续等重提示后的文本。**故意与 outcome 无关**：取消的目标轮次可能以
-/// Cancelled / CancelDrainTimeout / AgentExited / Error / Timeout 任意一种收尾，
-/// 对等待方而言都是「我请求停，它停了」。
-fn cancel_waiter_terminal(cancel_requested: bool, cancel_requeued: bool) -> Option<SyncWaitMsg> {
-    (cancel_requested && !cancel_requeued).then_some(SyncWaitMsg::Cancelled)
+/// 语义（**自然完成优先**）：
+/// - 收到取消、但该轮其实以 `Ok` 收尾 → **不发**取消终态，让等待方拿真实文本。
+///   取消与自然完成是竞速关系（`Cmd::Cancel` 只登记、终态在真实结局处判定）；
+///   若这里硬报 Cancelled，就会出现「谎报取消 + 文本照样进聊天」的不一致；
+/// - 收到取消且该轮**没有**产出结果（`Cancelled` / `CancelDrainTimeout` /
+///   `AgentExited` / `Error` / `Timeout`）→ 给 `Cancelled` 终态；
+/// - 批次被合并重提示 → 不发终态，等待方等重提示后的文本。
+///
+/// 注意：若错误旁路（`notify_channel`）已先把 waiter 取走并发了 `Done(Err)`，
+/// 本决策会找不到 waiter 而自然 no-op——即**错误旁路优先**，与上述并列一致。
+fn cancel_waiter_terminal(
+    cancel_requested: bool,
+    cancel_requeued: bool,
+    outcome: &PromptOutcome,
+) -> Option<SyncWaitMsg> {
+    if !cancel_requested || cancel_requeued {
+        return None;
+    }
+    if matches!(outcome, PromptOutcome::Ok(_)) {
+        return None;
+    }
+    Some(SyncWaitMsg::Cancelled)
 }
 
 /// 把消息投给该频道的同步 waiter（取走条目）。返回是否确实有一个 waiter 收到。
@@ -1608,22 +1625,41 @@ mod channel_info_tests {
     /// 不能让它落回「挂到 timeout」。
     #[test]
     fn cancel_waiter_terminal_covers_all_cases() {
+        // 取消失败类结局（batch=None）必须都给终态，不能漏成挂 timeout
+        for outcome in [
+            PromptOutcome::Cancelled,
+            PromptOutcome::CancelDrainTimeout(std::time::Duration::from_secs(5)),
+            PromptOutcome::AgentExited,
+            PromptOutcome::Timeout(TimeoutKind::Idle),
+            PromptOutcome::Error(AcpError::Protocol("boom".to_string())),
+        ] {
+            assert_eq!(
+                cancel_waiter_terminal(true, false, &outcome),
+                Some(SyncWaitMsg::Cancelled),
+                "收到取消且该轮无产出 → 必须给 Cancelled 终态"
+            );
+        }
+        // 自然完成优先：真的产出了文本就交给等待方，别谎报取消
+        // （否则会出现「报了 Cancelled 但文本仍进聊天」的不一致）
         assert_eq!(
-            cancel_waiter_terminal(true, false),
-            Some(SyncWaitMsg::Cancelled),
-            "收到取消且批次未被重提示 → 必须给终态"
-        );
-        assert_eq!(
-            cancel_waiter_terminal(true, true),
+            cancel_waiter_terminal(
+                true,
+                false,
+                &PromptOutcome::Ok(crate::buzz::acp::StopReason::EndTurn)
+            ),
             None,
-            "批次被合并重提示 → 等待方应继续等重提示文本"
+            "Ok 结局 → 不发取消终态，让等待方拿真实文本"
         );
+        // 批次被合并重提示 → 等重提示后的文本
         assert_eq!(
-            cancel_waiter_terminal(false, false),
-            None,
-            "没收到取消 → 不动 waiter"
+            cancel_waiter_terminal(true, true, &PromptOutcome::Cancelled),
+            None
         );
-        assert_eq!(cancel_waiter_terminal(false, true), None);
+        // 没收到取消 → 不动 waiter
+        assert_eq!(
+            cancel_waiter_terminal(false, false, &PromptOutcome::Cancelled),
+            None
+        );
     }
 
     /// #309 PR-A1：把终态投给该频道 waiter——有 waiter 时送达且不残留；
