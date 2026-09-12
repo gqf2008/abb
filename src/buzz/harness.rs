@@ -162,8 +162,9 @@ enum Cmd {
 enum SyncWaitMsg {
     /// 回合文本（`Ok`）或终态失败原因（`Err`）——与改造前的 `Result<String,String>` 同义。
     Done(Result<String, String>),
-    /// 取消终态（`Cmd::Cancel` 命中在跑轮次时回传）：批次已被丢弃，不会再重提示，
-    /// 等待方应立刻静默收尾。
+    /// 取消终态：该轮以 `PromptOutcome::Cancelled` 结束，且其批次**已被丢弃、
+    /// 不会被重提示**（被 Steer 合并重提示的那种不发这个，等待方等重提示文本）。
+    /// 等待方据此静默收尾。
     Cancelled,
 }
 
@@ -286,8 +287,9 @@ impl BuzzHandle {
     }
 
     /// 同步回合等待（oneshot 路径）：与 [`Self::wait_turn_text`] 同机制，但
-    /// 结局四分——Ok(文本) / Timeout（调用方预算先到） / Closed（句柄已关闭，
-    /// push 不进） / Failed(agent 终态失败原因，由 notify_channel 旁路)。
+    /// 结局五分——Ok(文本) / Timeout（调用方预算先到） / Closed（句柄已关闭，
+    /// push 不进） / Failed(agent 终态失败原因，由 notify_channel 旁路) /
+    /// Cancelled（取消终态且批次已丢弃，见 `SyncWaitMsg::Cancelled`）。
     pub async fn wait_turn_outcome(
         &self,
         channel_id: Uuid,
@@ -537,13 +539,12 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
         }
         Cmd::Cancel { channel_id, reply } => {
             let fired = signal_in_flight_task(&mut l.pool, channel_id, ControlSignal::Cancel);
-            // 取消是**终态**：`ControlSignal::Cancel` 在 pool 侧直接丢批次
-            // （`requeue_cancelled_batch` 返回 None，只有 Steer 才重提示），
-            // 所以这里同步 waiter 应当立刻拿到 Cancelled 终态——否则 job/oneshot
-            // 会一直挂到 timeout 才醒（#309 的原始症状）。
-            if fired {
-                notify_waiter_cancelled(handle, channel_id);
-            }
+            // 注意：**不在这里**通知 waiter。`fired` 只表示「信号已送达」，
+            // 不代表最终结局是取消——回合可能已经自然完成、结果正排在结果分支里
+            // （run_loop 是 biased，命令分支优先）。提前报取消会让调用方收到
+            // Cancelled，而那次自然完成的文本照样进聊天。
+            // 真正的通知放在 handle_prompt_result 的 Cancelled 结局处（见下），
+            // 并只在该批次**确实被丢弃**（没有 Steer 合并重提示）时发。
             let _ = reply.send(fired);
         }
         Cmd::SyncRoots(roots) => {
@@ -912,6 +913,9 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
 
     // 批次命运：requeue 先于 mark_complete（requeue 设 retry_after 而
     // mark_complete 清 retry_counts——顺序颠倒废掉退避与死信保护）。
+    // `cancel_requeued` = 本次取消把批次交给队列**重提示**了（Steer 合并 /
+    // 排水超时同路）；只有**没有**重提示的取消才是同步等待方的终态（#309）。
+    let mut cancel_requeued = false;
     if let Some(batch) = result.batch.take() {
         if !l.removed_channels.contains(&batch.channel_id) {
             if matches!(
@@ -925,6 +929,7 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 // 不会进到这个分支（requeue_cancelled_batch(Cancel) == None）。
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 l.queue.requeue_as_cancelled(batch, reason);
+                cancel_requeued = true;
             } else if matches!(
                 result.outcome,
                 PromptOutcome::Timeout(TimeoutKind::Hard {
@@ -1087,6 +1092,20 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
         }
         // 显式取消：agent 健康，直接回池。
         PromptOutcome::Cancelled => {
+            // #309：取消是**终态**（pool 侧的 Cancel 直接丢批次，不重提示），所以
+            // 同步 waiter 必须在这里拿到 Cancelled 终态——否则 job/oneshot 会一直
+            // 挂到 timeout 才醒（原始症状）。
+            //
+            // 两个前提：
+            // - 放在**真实结局**处（不是 Cmd::Cancel 收到时）：与自然完成竞速时以
+            //   实际结局为准，不会出现「谎报取消 + 文本仍进聊天」；
+            // - `!cancel_requeued`：若该批次被 Steer 合并重提示，等待方应当等那次
+            //   重提示的文本，不能提前收终态。
+            if !cancel_requeued {
+                let PromptSource::Channel(channel_id) = &result.source;
+                let ch = *channel_id;
+                let _ = notify_waiter_cancelled(handle, ch);
+            }
             tracing::debug!(
                 agent = agent_index,
                 outcome = outcome_label,
