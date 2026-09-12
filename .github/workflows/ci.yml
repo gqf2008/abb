@@ -102,9 +102,17 @@ jobs:
       - name: test（全量测试）
         run: cargo test
 
+      # #317：Windows 上有一批依赖 python3（tests/mock_acp_agent.py）的端到端用例会被
+      # `cfg_attr(windows, ignore)` 跳过——把清单显式列出来，让「绿但没跑」可见。
+      # 它们由下面的 test-macos job 真实执行。
+      - name: 列出被 ignore 的用例（可见性）
+        if: always()
+        run: cargo test -- --list --ignored
+
   # macOS 特有代码（configure_backend 的 cfg(target_os="macos") 分支、SLINT_BACKEND
   # 经 BackendSelector 的选择路径、透明标题栏钩子）只在本平台编译；windows job 覆盖
-  # 不到，这里补编译验证。渲染器去 skia 后 macOS 冷构建无需外部 C++ 工具链。
+  # 不到，这里补**编译**验证。渲染器去 skia 后 macOS 冷构建无需外部 C++ 工具链。
+  # 注意：本 job 只 cargo check，不跑测试——真正跑测试的是下面的 test-macos。
   check-macos:
     runs-on: macos-latest
     steps:
@@ -126,3 +134,29 @@ jobs:
 
       - name: cargo check（macOS cfg 分支编译验证）
         run: cargo check --all-targets
+
+  # #317：上面的 test job 跑在 **windows-latest**，而所有依赖 tests/mock_acp_agent.py
+  # （需 python3）的端到端用例都带 cfg_attr(windows, ignore) —— 于是它们**在 CI 里从未执行**
+  # （PR #316 的日志：628 passed / 18 ignored），「CI 全绿」对 harness/桥接的端到端路径
+  # 不构成验证。这里在 macOS 上补一次真实运行（macOS runner 自带 python3）。
+  # 保留 windows 的 test job：Windows 特有分支（控制台窗口/Job 语义等）仍需在那跑。
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # slint-pixel 是本地 path 依赖（../slint-pixel），CI 需一并拉取（public 仓库）
+      - name: Checkout slint-pixel (path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: gqf2008/slint-pixel
+          path: slint-pixel
+
+      - name: Move slint-pixel to ../ (cargo path dep)
+        shell: bash
+        run: mv slint-pixel ../slint-pixel
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test（macOS：含依赖 mock agent 的端到端用例）
+        run: cargo test
