@@ -3714,12 +3714,14 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
-    /// #309 PR-A2 **端到端**：真调 `run_job` + 真 mock harness——会话内停止词必须让
-    /// job 走到 `SyncTurnOutcome::Cancelled` → **静默收尾（不投递）**，并摘掉登记。
+    /// #309 PR-A2 **端到端（走生产停止词入口）**：真调 `run_job` + 真 mock harness +
+    /// `Bridge::handle(停止词)`——停止词必须让 job 走到 `SyncTurnOutcome::Cancelled`
+    /// → **静默收尾（不投递）**，并摘掉登记。
     ///
     /// 这条锁的是「run_job 的接线真的生效」：上一版正是因为 `run_job` 里残留旧的
-    /// `_cancel_flag` 注册，停止词在到达取消路由前就被吞掉，而当时「手工注册 JobTurn」
-    /// 的单测完全看不出来。
+    /// `_cancel_flag` 注册，停止词在 `Bridge::handle` 里命中该死 flag 后直接 return、
+    /// 到不了取消路由；而当时「手工注册 JobTurn + 直调内部取消方法」的测试完全看不出来。
+    /// 所以本用例**必须**从 `bridge.handle(...)` 进入，不能直调内部方法。
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
@@ -3775,11 +3777,15 @@ mod tests {
             waited_ms += 50;
         }
 
-        // 走**生产的停止词路由**（同一个 Bridge 方法）
-        assert!(
-            bridge.cancel_job_turns_for_chat(&chat_id).await,
-            "在跑轮次应被叫停（handle.cancel 返回 Some(true)）"
-        );
+        // 走**生产的停止词入口**：Bridge::handle → is_cancel_keyword →
+        // cancel_flags 检查 → cancel_job_turns_for_chat。
+        //
+        // 这里**刻意不直调** `cancel_job_turns_for_chat`：直调会绕过 cancel_flags 那道
+        // 检查，于是「有人把旧的 `register_cancel_flag(job.chat_id)` 加回 run_job、
+        // 停止词被死 flag 吞掉」这种回归**依然全绿**（那正是本用例存在的理由）。
+        // 走 handle 时，若存在死 flag，停止词会在到达取消路由前 return，
+        // job 不会结束 → 下面的 timeout 断言失败。
+        bridge.handle(test_ev("m_stop", &chat_id, "停")).await;
 
         tokio::time::timeout(std::time::Duration::from_secs(60), task)
             .await
