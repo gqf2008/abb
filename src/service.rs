@@ -1282,6 +1282,28 @@ fn job_prompt(job: &crate::schedule::Job, bot_key: &str) -> String {
 /// 执行一个到点任务：跑该 bot 生效后端（全新会话，不带聊天上下文）→ 回发；once 任务执行后删除。
 /// 回发优先发任务原会话；若该会话已失效（群解散/bot 被移出等），回落到主会话（私聊，必存在）。
 /// 多目标（#21）：job.targets 非空时向每个目标各投一份（可跨 bot，经路由表投递 + 失败兜底）。
+/// job 轮次结局 → 该轮要投递的文案（`None` = **静默收尾、不投递**）。
+///
+/// - `Ok(text)`：正常结果；
+/// - `Cancelled`（#309）：用户叫停，静默；
+/// - `Timeout`：agent 没回 → 超时文案（既有行为）；
+/// - **`Closed`：等待者被同会话更新的任务顶替（每 channel 一个 waiter 槽）、或句柄已
+///   关闭（服务在关停）——这**不是**「agent 无回复」**，不能共用超时文案（#321）。
+///   静默收尾：被顶替时那一轮的真实结果由接管它的等待者负责投递，本轮再发一条只会重复；
+/// - `Failed(reason)`：agent 终态失败（认证失效/多次重试耗尽等，由 `notify_channel`
+///   旁路回传）——**不是**「agent 无回复」，带原因回报而非复用超时文案（#321 同类的误标）。
+///
+/// 本函数**无副作用**（纯映射）；Closed 的诊断日志由调用方打。
+fn job_outcome_reply(outcome: &crate::buzz::harness::SyncTurnOutcome) -> Option<String> {
+    use crate::buzz::harness::SyncTurnOutcome as O;
+    match outcome {
+        O::Ok(text) => Some(text.clone()),
+        O::Cancelled | O::Closed => None,
+        O::Timeout => Some("⏰ 定时任务执行超时（agent 无回复）".to_string()),
+        O::Failed(reason) => Some(format!("⏰ 定时任务执行失败：{reason}")),
+    }
+}
+
 /// 仅供测试：把私有的 [`run_job`] 暴露给 bridge 侧的集成测试（#309 PR-A2 的
 /// 「真调 run_job + 真 harness」用例需要它，而 run_job 依赖 service 私有装配）。
 #[cfg(test)]
@@ -1411,20 +1433,19 @@ async fn run_job(
                         )
                         .await;
                     bridge.unregister_job_turn(&job.id);
-                    match outcome {
-                        crate::buzz::harness::SyncTurnOutcome::Ok(text) => Some(text),
-                        // 用户叫停（#309）：取消是终态且批次已丢弃 → **静默收尾、不投递**
-                        // （None 会让下面提前 return，连超时文案都不发）。
-                        crate::buzz::harness::SyncTurnOutcome::Cancelled => None,
-                        // 其余（超时/句柄关闭/终态失败）：叫停在途回合防迟发，再落超时文案
-                        // （维持既有行为，避免顺带改文案）。
-                        crate::buzz::harness::SyncTurnOutcome::Timeout
-                        | crate::buzz::harness::SyncTurnOutcome::Closed
-                        | crate::buzz::harness::SyncTurnOutcome::Failed(_) => {
-                            let _ = h.cancel(channel_id).await;
-                            Some("⏰ 定时任务执行超时（agent 无回复）".to_string())
-                        }
+                    // 超时臂要在途叫停（防真回复迟发成第二条消息）；Closed/Cancelled 不需要。
+                    if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Timeout) {
+                        let _ = h.cancel(channel_id).await;
                     }
+                    if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Closed) {
+                        // 等待者被同会话更新的任务顶替（每 channel 一个 waiter 槽），
+                        // 或句柄已关闭（服务在关停）——都不是「agent 没回」，静默收尾。
+                        crate::log!(
+                            "[bot:{bot_key}] 任务 {} 的等待者已被顶替或句柄已关闭 → 静默收尾（不发超时文案）",
+                            &job.id[..8]
+                        );
+                    }
+                    job_outcome_reply(&outcome)
                 }
                 None => Some("⏰ 定时任务执行失败：agent 未装配".to_string()),
             }
@@ -1885,6 +1906,33 @@ mod tests {
             targets: Vec::new(),
             role,
         }
+    }
+
+    /// #321：job 轮次结局 → 文案映射。`Closed` 是「等待者被同会话更新的任务顶替 /
+    /// 句柄已关闭」，**不是**「agent 无回复」——不能再共用超时文案（同 chat 并发 job 时，
+    /// 在跑那条的 waiter 会被后登记那条顶替，历史上因此误报「执行超时」）。
+    #[test]
+    fn job_outcome_reply_does_not_mislabel_closed_as_timeout() {
+        use crate::buzz::harness::SyncTurnOutcome as O;
+        assert_eq!(
+            job_outcome_reply(&O::Ok("done".to_string())),
+            Some("done".to_string())
+        );
+        assert_eq!(job_outcome_reply(&O::Cancelled), None, "叫停 → 静默");
+        assert_eq!(
+            job_outcome_reply(&O::Closed),
+            None,
+            "Closed（等待者被顶替/句柄关闭）不得报超时"
+        );
+        assert_eq!(
+            job_outcome_reply(&O::Timeout),
+            Some("⏰ 定时任务执行超时（agent 无回复）".to_string())
+        );
+        assert_eq!(
+            job_outcome_reply(&O::Failed("boom".to_string())),
+            Some("⏰ 定时任务执行失败：boom".to_string()),
+            "Failed 是「终态失败」→ 带原因回报，不得复用超时文案"
+        );
     }
 
     #[test]
