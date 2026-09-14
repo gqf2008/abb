@@ -680,6 +680,12 @@ mod tests {
     /// 这条用例锁的是 #306 的卖点本身：「异步跑、完成后经 deliver 投递、默认回创建者」。
     /// 把它拆成「只测状态机」会让最容易断的那截（投递信封的 in_session/自环组合）无人看守。
     #[tokio::test]
+    // 与仓库既有 17 处同款：mock agent fixture 依赖 python3，Windows runner 没装。
+    // 缺了这条会在 windows CI 上挂满回合预算才红（#328 让 main 红了 38 分钟）。
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
     async fn task_runs_end_to_end_and_delivers_to_creator() {
         let root = tmp_root("e2e");
         let paths = crate::task_store::TaskPaths::with_root(&root, "b");
@@ -688,7 +694,10 @@ mod tests {
         let states = TaskStateStore::new_at(&root, bot);
 
         let chat = format!("wx_{}", uuid::Uuid::new_v4());
-        let task = now_task(bot, "tk_e2e", &chat);
+        let mut task = now_task(bot, "tk_e2e", &chat);
+        // 用例自带短预算：mock 拉不起来时 30s 内红，不占满生产默认的 30 分钟
+        // （#328 的教训：一个没自限的用例能把 CI job 拖到 38 分钟）。
+        task.limits.timeout_secs = 30;
         store.add(task.clone()).unwrap();
         states.set("tk_e2e", TaskRuntime::default()).unwrap();
 

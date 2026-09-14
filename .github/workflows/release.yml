@@ -159,6 +159,29 @@ jobs:
       - name: Build forked buzz-agent
         run: cargo build --release --manifest-path crates/buzz-agent/Cargo.toml
 
+      # #331 守卫：**分发的产物**不许依赖 VC++ Redistributable。
+      # 背景：用户首次安装即报「找不到 VCRUNTIME140.dll」——MSVC 默认动态 CRT，
+      # 而这两个 DLL 来自 Redist，干净 Windows 上没有。修法见 .cargo/config.toml
+      # 的 +crt-static；这条守卫保证「修完不许回退」。**两个 exe 都要查**：
+      # buzz-agent.exe 由 agent-bridge 派生运行，缺 DLL 会在第一次跑 agent 时才炸。
+      # 守卫本身已用「坏样本/好样本」在本机验过会红/会绿（tools/check_dynamic_crt.sh）。
+      - name: Assert no dynamic CRT dependency (#331)
+        shell: bash
+        run: |
+          bash tools/check_dynamic_crt.sh \
+            target/release/agent-bridge.exe \
+            crates/buzz-agent/target/release/buzz-agent.exe
+          # 可见性：把真实导入表打出来（llvm-objdump 随 rustup，取不到就跳过，不阻塞）
+          if rustup component add llvm-tools-preview >/dev/null 2>&1; then
+            OBJDUMP=$(find "$(rustc --print sysroot)" -type f -name 'llvm-objdump*' 2>/dev/null | head -1)
+            if [ -n "$OBJDUMP" ]; then
+              for f in target/release/agent-bridge.exe crates/buzz-agent/target/release/buzz-agent.exe; do
+                echo "── $f 的导入表："
+                "$OBJDUMP" -p "$f" | grep -i "DLL Name" || true
+              done
+            fi
+          fi
+
       - name: Fetch bundled tools
         shell: pwsh
         run: ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist

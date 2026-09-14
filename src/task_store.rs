@@ -757,7 +757,11 @@ mod tests {
             "日志目录不能落在工作区内：{}",
             p.logs_dir().display()
         );
-        assert!(p.definitions().to_string_lossy().contains("/tasks/"));
+        // 用 Path 逐段比较，**不要写字符串字面量 "/tasks/"**：Windows 的分隔符是 `\`，
+        // 字符串断言会在 windows CI 上假红（#328 真实踩到，main 红了 38 分钟）。
+        assert_eq!(p.dir, crate::bridge_dir().join("tasks").join(bot));
+        assert_eq!(p.definitions().parent(), Some(p.dir.as_path()));
+        assert_eq!(p.logs_dir().parent(), Some(p.dir.as_path()));
     }
 
     #[test]

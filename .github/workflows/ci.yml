@@ -102,6 +102,15 @@ jobs:
       - name: test（全量测试）
         run: cargo test
 
+      # #331：Windows 分发靠 `.cargo/config.toml` 的 +crt-static 自带 CRT。
+      # 在 PR 阶段就拦住「配置被删/被 RUSTFLAGS 覆盖」——否则用户装完才发现
+      # 「找不到 VCRUNTIME140.dll」。release job 里对**发布产物**再拦一次。
+      - name: Assert no dynamic CRT dependency (#331)
+        shell: bash
+        run: |
+          cargo build
+          bash tools/check_dynamic_crt.sh target/debug/agent-bridge.exe
+
       # #317：Windows 上有一批依赖 python3（tests/mock_acp_agent.py）的端到端用例会被
       # `cfg_attr(windows, ignore)` 跳过——把清单显式列出来，让「绿但没跑」可见。
       # 它们由下面的 test-macos job 真实执行。
