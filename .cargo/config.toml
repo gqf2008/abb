@@ -1,0 +1,18 @@
+# ── Windows 分发必须自带 CRT（#331）───────────────────────────────────────────
+#
+# 现象：用户首次安装后启动 agent-bridge.exe 直接弹
+#   「由于找不到 VCRUNTIME140.dll，无法继续执行代码」
+#
+# 根因：MSVC 工具链**默认动态链接 CRT** —— 可执行文件导入表里带
+# `VCRUNTIME140.dll` / `MSVCP140.dll`，而这两个 DLL 来自 **Visual C++
+# Redistributable**，干净 Windows 上并不存在（`ucrtbase.dll` 是系统自带，不属此列）。
+# 于是分发版在没装过 VS/Redist 的机器上直接起不来。
+#
+# 修法：`+crt-static` 把 CRT 静态链进可执行文件 → 安装包不再依赖任何运行时分发库。
+# 注意 `crates/buzz-agent`（自维护 fork）在同一个仓库目录树下，Cargo 会沿目录向上
+# 发现本配置，所以随包的 buzz-agent.exe 也一并静态——这很必要：它由 agent-bridge
+# 派生运行，缺 DLL 会在第一次真正跑 agent 时以同样方式失败。
+#
+# 只对 Windows target 生效：macOS / Linux 构建不受影响。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
