@@ -1479,7 +1479,7 @@ export component SettingsWindow inherits Window {
                                     clicked => { root.current-page = 2; }
                                 }
                                 if root.missing-perms > 0: ProblemRow {
-                                    text: "有 " + root.missing-perms + " 项系统权限未授权";
+                                    text: "有 " + root.missing-perms + " 项系统权限不可用";
                                     clicked => { root.current-page = 2; }
                                 }
                                 if root.bot-count - root.online-count > 0: ProblemRow {
@@ -2453,7 +2453,7 @@ export component SettingsWindow inherits Window {
                                             if root.perm-microphone != 2 && root.perm-microphone != 3: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("microphone"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos" && (root.perm-full-disk != 2 || root.perm-screen != 2 || root.perm-camera != 2 || root.perm-microphone != 2): Text {
-                                            text: "💡 未授权项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。改完可能需要重启服务生效。";
+                                            text: "💡 不可用项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。显示「受策略限制」则不弹框也授不了，需改 MDM / 屏幕使用时间策略。改完可能需要重启服务生效。";
                                             font-size: 12px;
                                             color: UiTokens.warn;
                                             wrap: word-wrap;
