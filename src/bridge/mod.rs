@@ -3923,7 +3923,9 @@ mod tests {
                 crate::buzz::queue::InboundMsg {
                     id_hex: "m_job".to_string(),
                     author_role: "owner".to_string(),
-                    text: "长任务".to_string(),
+                    // 唯一标记：不能用「长任务」这类词——base prompt 里有「长任务分步推进」，
+                    // 断言 contains 会误报（实测踩到）。
+                    text: "QUEUED_JOB_PAYLOAD_7f3a".to_string(),
                     ts_secs: 0,
                     prompt_tag: "job_message".to_string(),
                 },
@@ -3951,6 +3953,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             waited_ms += 50;
         }
+
+        // 3b) 直接锁定「是丢弃生效」而不是「别的回合终态把 waiter 叫醒」：
+        //     被丢弃的 job 原文**从未**进入 agent。
+        let prompts = read_prompts(&rec);
+        assert!(
+            !prompts
+                .iter()
+                .any(|p| p.contains("QUEUED_JOB_PAYLOAD_7f3a")),
+            "被丢弃的排队 job 原文不得进入 agent（实际 prompts 条数={}）",
+            prompts.len()
+        );
 
         // 4) 被丢弃的排队 job：等待者立刻拿到取消终态（run_job 据此静默收尾）
         let out = tokio::time::timeout(std::time::Duration::from_secs(10), job_waiter)

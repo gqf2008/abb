@@ -155,8 +155,9 @@ enum Cmd {
         channel_id: Uuid,
         reply: oneshot::Sender<bool>,
     },
-    /// **丢弃排队中的定时任务消息**（#309 PR-B）：只按 `prompt_tag == "job_message"`
-    /// 过滤丢弃该频道的排队事件，**不动**用户消息、也不动 in-flight 轮次。
+    /// **丢弃排队中的定时任务消息**（#309 PR-B）：只按 `prompt_tag ==
+    /// crate::schedule::JOB_PROMPT_TAG` 过滤丢弃该频道的排队事件，**不动**用户消息、
+    /// 也不动 in-flight 轮次。
     /// 排队中的 job 被丢弃后不会有任何回合结局，因此同时给同步 waiter 回取消终态
     /// （否则 run_job 要挂到超时）。reply 回被丢弃的条数。
     DropQueuedJobs {
@@ -566,7 +567,9 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
             let _ = reply.send(fired);
         }
         Cmd::DropQueuedJobs { channel_id, reply } => {
-            let dropped = l.queue.drain_channel_tagged(channel_id, "job_message");
+            let dropped = l
+                .queue
+                .drain_channel_tagged(channel_id, crate::schedule::JOB_PROMPT_TAG);
             if !dropped.is_empty() {
                 // 被丢弃的排队 job 不会再产生回合结局 → 主动给等待者取消终态，
                 // 让 run_job 立刻静默收尾（而不是挂到超时）。

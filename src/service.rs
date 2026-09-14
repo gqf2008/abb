@@ -1401,7 +1401,7 @@ async fn run_job(
                                 author_role: job.role.as_str().to_string(),
                                 text: prompt.clone(),
                                 ts_secs: crate::chrono_lite::unix_secs() as i64,
-                                prompt_tag: "job_message".to_string(),
+                                prompt_tag: crate::schedule::JOB_PROMPT_TAG.to_string(),
                             },
                             // 预算与 chat 回合同款（harness 单回合硬上限 + 余量）：
                             // 报告类任务实测 3~7 分钟，60s 必超时且回合在途仍会
