@@ -219,3 +219,206 @@ pub fn request_lock_permissions() {
     request_listen_event();
     crate::log!("[perm] 锁屏控制权限请求流程结束");
 }
+
+// ── #305 Step 0：相机探测（判定「ABB 派生的子进程是否继承 ABB 的 TCC 授权」）──
+
+/// `ffmpeg` 抓帧的参数（抽出来是为了单测能钉死这串 flag，防后续手滑改坏）。
+/// `avfoundation` 的 `index` 形如 `"0"` / `"0:none"`（视频[:音频]）。
+///
+/// 刻意**不带 `-y`**：本探测是诊断用，不该静默覆盖调用方指定的路径；抓帧前由
+/// [`camera_probe`] 先删旧文件，仍存在时 ffmpeg 会报错——错误照样进报告，比误报成功好。
+pub fn camera_probe_args(index: &str, out: &str) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "avfoundation",
+        "-framerate",
+        "30",
+        "-i",
+        index,
+        "-frames:v",
+        "1",
+        out,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// 判定文案（纯函数，便于单测覆盖三条分支——防「分支永远走不到」这类回归：
+/// 上一版就写了 `parent_state == "Restricted"`，而当时 `PermState` 根本没有该状态）。
+fn camera_verdict(parent_state: &str, ok: bool) -> &'static str {
+    if ok {
+        return "✅ 抓到一帧：ABB 派生进程能拿到相机 → **TCC 继承成立**（#305 方向可行）。\n";
+    }
+    if parent_state == "Denied" || parent_state == "Restricted" {
+        return "⚠️ 本次实验**无效**：ABB 的相机授权已是被拒/受限状态（不会弹框，也必然抓不到帧）。\n\
+                先重置再重跑：`tccutil reset Camera com.sqb.abb`，然后重新执行本命令。\n";
+    }
+    "⚠️ 没抓到帧。请回看刚才是否弹过系统授权框：\n\
+     - 弹框且归属方写着 **ABB** → 继承成立（点允许后重跑即出图）；\n\
+     - 弹框写着 Terminal / iTerm / 其它 → 本次无效（必须用 `open -n -a ABB.app` 起）；\n\
+     - 父进程相机态是 NotDetermined 且确实没弹框 → **继承不成立**，#305 需改方向。\n"
+}
+
+/// 判定：只有 ffmpeg **退出成功**且**确实产出了非空文件**才算成功。
+/// （抓帧前由 [`camera_probe`] 先删旧文件，所以 `size > 0` 一定来自本次——不会拿残留文件
+/// 冒充成功。）
+fn camera_probe_ok(status_ok: bool, size: u64) -> bool {
+    status_ok && size > 0
+}
+
+/// 报告落盘路径：`~/.agent-bridge/logs/camera-probe.log`。
+///
+/// **必须落盘**：用 `open -n -a ABB.app` 起的实例，stdout/stderr 都指向 `/dev/null`
+/// （`src/platform.rs` / `src/ui.rs` 都有同样的已知事实），只 println 等于什么都没留下。
+pub fn camera_probe_log_path() -> std::path::PathBuf {
+    crate::bridge_dir().join("logs").join("camera-probe.log")
+}
+
+/// #305 Step 0：**在 ABB 自己的进程名下**派生 `ffmpeg` 抓一帧，据此判定 TCC 继承。
+///
+/// 关键用法（裸二进制从终端跑会把 TCC 归属算到终端，实验就无效）：
+/// ```text
+/// open -n -a /Applications/ABB.app --args --camera-probe 0 /tmp/abb-camera-probe.jpg
+/// ```
+/// `open -n` 让 LaunchServices 新起一个 ABB 实例（responsible process = ABB.app），
+/// 该实例再派 `ffmpeg` 子进程 —— 正是 #305 要验证的那条链。
+///
+/// 返回 `(报告, 是否成功)`：报告同时写到 [`camera_probe_log_path`]（因上述 /dev/null），
+/// 调用方按 bool 决定退出码。
+pub fn camera_probe(index: &str, out: &str) -> Result<(String, bool), String> {
+    // **先看父进程（= ABB 自己）当前的相机 TCC 状态**：结论必须先看它。
+    // 若已是 Denied/Restricted，则「不弹框也不出图」只说明授权记录陈旧，
+    // **不能**据此判「继承不成立、#305 要改方向」——那是误判（同 LESSON 里
+    // 设置面板/历史记录与当前 code identity 不一致的坑）。
+    let parent_state = crate::deps::detect_permissions()
+        .into_iter()
+        .find(|p| p.id == "camera")
+        .map(|p| format!("{:?}", p.state))
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let ffmpeg = crate::deps::find_in_path("ffmpeg")
+        .ok_or_else(|| "找不到 ffmpeg（请先安装，如 brew install ffmpeg）".to_string())?;
+
+    // 抓帧前先删旧文件：否则一个残留文件会让 bytes>0 看起来「成功」。
+    let _ = std::fs::remove_file(out);
+
+    let output = std::process::Command::new(&ffmpeg)
+        .args(camera_probe_args(index, out))
+        .output()
+        .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
+    let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    let ok = camera_probe_ok(output.status.success(), size);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+
+    let mut r = String::new();
+    r.push_str("# ABB camera-probe（#305 Step 0）\n");
+    r.push_str(&format!("index        = {index}\n"));
+    r.push_str(&format!("out          = {out}\n"));
+    r.push_str(&format!(
+        "父进程相机态 = {parent_state}（这是 ABB 自己的 TCC 状态）\n"
+    ));
+    r.push_str(&format!("ffmpeg       = {}\n", ffmpeg.display()));
+    r.push_str(&format!("exit         = {:?}\n", output.status.code()));
+    r.push_str(&format!("bytes        = {size}\n"));
+    if !stderr.is_empty() {
+        r.push_str(&format!("ffmpeg stderr:\n{stderr}\n"));
+    }
+    r.push_str("\n## 判定\n");
+    r.push_str(camera_verdict(&parent_state, ok));
+    if ok {
+        r.push_str(&format!("（本次使用的父进程相机态：{parent_state}）\n"));
+    }
+
+    let log = camera_probe_log_path();
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // 该文件是规定调用方式下**唯一**的交付通道（open -n 起的实例 stdout/stderr 都是
+    // /dev/null），写失败必须显式失败，不能静默。
+    if let Err(e) = std::fs::write(&log, &r) {
+        // 写盘失败 ≠ 抓帧失败：图可能已经成功落在 out 了，错误串必须带上结论与图片路径，
+        // 否则调用方会误读成「实验失败」。同时把报告打到 stdout，保住终端直跑
+        // （非 `open -n`）时仍能看到完整判定。
+        print!("{r}");
+        return Err(format!(
+            "报告写入失败（{}）：{e}；本次抓帧 ok={ok}，图见 {out}",
+            log.display()
+        ));
+    }
+    r.push_str(&format!("\n（报告已写入 {}\n）", log.display()));
+    Ok((r, ok))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #305 Step 0：钉死探测用的 ffmpeg 参数串——设备类型、帧数与输出路径任一被改坏，
+    /// 探测就会变成「跑了个别的命令却以为验过了」。刻意**不含 `-y`**（诊断命令不该静默
+    /// 覆盖调用方指定路径；抓帧前由 camera_probe 先删旧文件）。
+    #[test]
+    fn camera_probe_args_pins_avfoundation_single_frame() {
+        let a = camera_probe_args("0", "/tmp/x.jpg");
+        assert_eq!(
+            a,
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "avfoundation",
+                "-framerate",
+                "30",
+                "-i",
+                "0",
+                "-frames:v",
+                "1",
+                "/tmp/x.jpg",
+            ]
+        );
+        // 设备串支持 avfoundation 的 `视频[:音频]` 形态，必须原样透传给 -i
+        let b = camera_probe_args("1:none", "/tmp/y.jpg");
+        let i = b.iter().position(|x| x == "-i").unwrap();
+        assert_eq!(b[i + 1], "1:none");
+        assert!(
+            b.contains(&"/tmp/y.jpg".to_string()),
+            "输出路径必须原样透传"
+        );
+    }
+
+    /// #305 Step 0：判定三条分支必须都能走到（上一版 `Restricted` 是死代码：当时
+    /// `PermState` 没有该状态、`av_state` 把 AVAuthorizationStatus=1 折成了 NotDetermined）。
+    #[test]
+    fn camera_verdict_covers_all_cases() {
+        assert!(camera_verdict("Granted", true).contains("继承成立"));
+        assert!(camera_verdict("NotDetermined", true).contains("继承成立"));
+        for st in ["Denied", "Restricted"] {
+            let v = camera_verdict(st, false);
+            assert!(v.contains("本次实验**无效**"), "{st} → {v}");
+            assert!(v.contains("tccutil reset Camera"), "{st} 应给出重置指引");
+        }
+        let v = camera_verdict("NotDetermined", false);
+        assert!(v.contains("继承不成立"), "未授权且无弹框才判继承不成立");
+        assert!(
+            !v.contains("本次实验**无效**"),
+            "NotDetermined 不该被说成无效实验"
+        );
+    }
+
+    /// #305 Step 0：成功判定必须「退出码绿 **且** 有非空产出」——防旧文件残留/空文件冒充成功。
+    #[test]
+    fn camera_probe_ok_requires_success_and_nonempty_file() {
+        assert!(camera_probe_ok(true, 1));
+        assert!(!camera_probe_ok(true, 0), "空文件不算成功");
+        assert!(
+            !camera_probe_ok(false, 1024),
+            "ffmpeg 失败不算成功（哪怕有残留文件）"
+        );
+        assert!(!camera_probe_ok(false, 0));
+    }
+}

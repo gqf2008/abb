@@ -1208,7 +1208,8 @@ export component SettingsWindow inherits Window {
     // 最近一次一键安装的失败项数（>0 = 首页「待处理」卡显示安装失败行，点击切环境配置页）。
     in-out property <int> dep-failed-count: 0;
 
-    // 系统权限（仅 macOS）：完全磁盘/辅助功能/屏幕录制/自动化/摄像头/麦克风。0=未授权 1=被拒绝 2=已授权
+    // 系统权限（仅 macOS）：完全磁盘/辅助功能/屏幕录制/自动化/摄像头/麦克风。
+    // 0=未授权 1=被拒绝 2=已授权 3=受系统策略限制（MDM/家长控制，面板里授不了，不给「去授权」）
     in-out property <int> perm-full-disk: 0;
     in-out property <int> perm-accessibility: 0;
     in-out property <int> perm-screen: 0;
@@ -1478,7 +1479,7 @@ export component SettingsWindow inherits Window {
                                     clicked => { root.current-page = 2; }
                                 }
                                 if root.missing-perms > 0: ProblemRow {
-                                    text: "有 " + root.missing-perms + " 项系统权限未授权";
+                                    text: "有 " + root.missing-perms + " 项系统权限不可用";
                                     clicked => { root.current-page = 2; }
                                 }
                                 if root.bot-count - root.online-count > 0: ProblemRow {
@@ -2430,27 +2431,29 @@ export component SettingsWindow inherits Window {
                                             spacing: 10px;
                                             Text { text: "摄像头"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
-                                                text: root.perm-camera == 2 ? "已授权" : (root.perm-camera == 1 ? "被拒绝" : "未授权");
+                                                text: root.perm-camera == 2 ? "已授权" : (root.perm-camera == 3 ? "受策略限制" : (root.perm-camera == 1 ? "被拒绝" : "未授权"));
                                                 ok: root.perm-camera == 2;
-                                                warn: root.perm-camera == 1;
+                                                warn: root.perm-camera == 1 || root.perm-camera == 3;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-camera != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("camera"); } }
+                                            if root.perm-camera == 3: Text { text: "受 MDM / 家长控制限制"; font-size: 12px; color: UiTokens.warn; vertical-alignment: center; }
+                                            if root.perm-camera != 2 && root.perm-camera != 3: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("camera"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos": HorizontalBox {
                                             height: 34px;
                                             spacing: 10px;
                                             Text { text: "麦克风"; width: 130px; font-weight: 600; font-size: 13px; vertical-alignment: center; color: PixelTheme.text; }
                                             StatusPill {
-                                                text: root.perm-microphone == 2 ? "已授权" : (root.perm-microphone == 1 ? "被拒绝" : "未授权");
+                                                text: root.perm-microphone == 2 ? "已授权" : (root.perm-microphone == 3 ? "受策略限制" : (root.perm-microphone == 1 ? "被拒绝" : "未授权"));
                                                 ok: root.perm-microphone == 2;
-                                                warn: root.perm-microphone == 1;
+                                                warn: root.perm-microphone == 1 || root.perm-microphone == 3;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if root.perm-microphone != 2: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("microphone"); } }
+                                            if root.perm-microphone == 3: Text { text: "受 MDM / 家长控制限制"; font-size: 12px; color: UiTokens.warn; vertical-alignment: center; }
+                                            if root.perm-microphone != 2 && root.perm-microphone != 3: PixelButton { text: "去授权"; clicked => { root.open-perm-settings("microphone"); } }
                                         }
                                         if root.perms-supported && root.platform == "macos" && (root.perm-full-disk != 2 || root.perm-screen != 2 || root.perm-camera != 2 || root.perm-microphone != 2): Text {
-                                            text: "💡 未授权项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。改完可能需要重启服务生效。";
+                                            text: "💡 不可用项：「完全磁盘访问」可点「去授权」后在面板里 ＋ 添加本程序；「屏幕录制/摄像头/麦克风」须先点上方「📹 请求…」按钮触发系统弹框（否则设置列表里看不到本程序）。显示「受策略限制」则不弹框也授不了，需改 MDM / 屏幕使用时间策略。改完可能需要重启服务生效。";
                                             font-size: 12px;
                                             color: UiTokens.warn;
                                             wrap: word-wrap;

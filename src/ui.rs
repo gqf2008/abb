@@ -1377,7 +1377,9 @@ fn push_deps_to_window(w: &SettingsWindow) {
     w.set_dep_failed_count(0);
 }
 
-/// 把系统权限状态回填到设置窗（0=未授权 1=被拒绝 2=已授权）。
+/// 把系统权限状态回填到设置窗（0=未授权 1=被拒绝 2=已授权 3=受系统策略限制）。
+/// 3 只由 [`crate::deps::PermState::Restricted`] 产生（家长控制 / MDM / 屏幕使用时间），
+/// 单列一档是因为它和「被拒绝」虽然都拿不到设备，但**点「去授权」没有用**。
 /// macOS 六项 TCC 权限；Windows 一项管理员身份；Linux 不显示。
 fn push_perms_to_window(w: &SettingsWindow) {
     // 平台标识（UI 据此决定显示哪套权限）
@@ -1398,6 +1400,8 @@ fn push_perms_to_window(w: &SettingsWindow) {
             .map(|p| match p.state {
                 PermState::Granted => 2,
                 PermState::Denied => 1,
+                // 受限机器在隐私面板里授不了，展示成「被拒绝 + 去授权」会把人引到死路。
+                PermState::Restricted => 3,
                 PermState::NotDetermined => 0,
             })
             .unwrap_or(0)
