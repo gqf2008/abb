@@ -605,6 +605,30 @@ impl EventQueue {
         ids
     }
 
+    /// 丢弃该频道**排队中**（未在跑）且 `prompt_tag == tag` 的事件，返回被丢弃的 event id。
+    ///
+    /// 与 [`Self::drain_channel`] 的区别：**只按 tag 过滤**，不碰该频道其它排队事件
+    /// （典型用途 #309：停掉排队中的定时任务，但**不能吞掉用户还没被受理的消息**），
+    /// 也不清 retry/取消账——该频道可能还有别的活要跑。
+    pub fn drain_channel_tagged(&mut self, channel_id: Uuid, tag: &str) -> Vec<String> {
+        let mut dropped = Vec::new();
+        if let Some(q) = self.queues.get_mut(&channel_id) {
+            q.retain(|e| {
+                if e.msg.prompt_tag == tag {
+                    dropped.push(e.msg.id_hex.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        // 全空则摘掉该 channel 条目（与 push/flush 的空表语义一致，避免残留空队列）
+        if self.queues.get(&channel_id).is_some_and(|q| q.is_empty()) {
+            self.queues.remove(&channel_id);
+        }
+        dropped
+    }
+
     /// Whether a prompt is currently in-flight for the given channel.
     pub fn is_channel_in_flight(&self, channel_id: Uuid) -> bool {
         self.in_flight_channels.contains(&channel_id)
@@ -1187,4 +1211,60 @@ impl MergeFraming {
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
     (framing.new_tag, framing.closing_note)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queued(channel_id: Uuid, id: &str, tag: &str) -> QueuedEvent {
+        QueuedEvent {
+            channel_id,
+            msg: InboundMsg {
+                id_hex: id.to_string(),
+                author_role: "user".to_string(),
+                text: format!("text-{id}"),
+                ts_secs: 0,
+                prompt_tag: tag.to_string(),
+            },
+            received_at: Instant::now(),
+        }
+    }
+
+    /// #309 PR-B：按 tag 丢弃排队事件时**只丢该 tag**，用户消息必须原样保留
+    /// （chat 的取消语义是「只停正在跑的那一轮，不吞用户还没被受理的消息」）。
+    #[test]
+    fn drain_channel_tagged_drops_only_matching_tag() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        q.push(queued(ch, "u1", "user_message"));
+        q.push(queued(ch, "j1", "job_message"));
+        q.push(queued(ch, "j2", "job_message"));
+        q.push(queued(ch, "u2", "user_message"));
+        q.push(queued(other, "j3", "job_message"));
+
+        let dropped = q.drain_channel_tagged(ch, "job_message");
+        assert_eq!(dropped, vec!["j1".to_string(), "j2".to_string()]);
+
+        // 该频道剩下的仍可 flush（用户消息没被吞）
+        let batch = q.flush_next().expect("用户消息仍在队列");
+        assert_eq!(batch.channel_id, ch);
+        let ids: Vec<_> = batch.events.iter().map(|e| e.msg.id_hex.clone()).collect();
+        assert_eq!(ids, vec!["u1".to_string(), "u2".to_string()]);
+
+        // 别的频道不受影响
+        let b2 = q.flush_next().expect("另一频道的 job 消息仍在");
+        assert_eq!(b2.channel_id, other);
+    }
+
+    /// 没有匹配项时是 no-op（不动队列、不报错）。
+    #[test]
+    fn drain_channel_tagged_no_match_is_noop() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(queued(ch, "u1", "user_message"));
+        assert!(q.drain_channel_tagged(ch, "job_message").is_empty());
+        assert_eq!(q.pending_channels(), 1);
+    }
 }
