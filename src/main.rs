@@ -304,13 +304,24 @@ fn main() {
     // 算到终端，实验无效）。判定标准见 permreq::camera_probe 的文档。
     #[cfg(target_os = "macos")]
     if let Some(pos) = args.iter().position(|a| a == "--camera-probe") {
-        let index = args.get(pos + 1).map(String::as_str).unwrap_or("0");
-        let out = args
-            .get(pos + 2)
-            .map(String::as_str)
-            .unwrap_or("/tmp/abb-camera-probe.jpg");
+        // 参数边界：下一 token 若以 `-` 开头视为「没给」（否则 `--camera-probe --service`
+        // 会把 `--service` 当设备号传给 ffmpeg）。
+        let arg_after = |n: usize| -> Option<&str> {
+            args.get(pos + n)
+                .map(String::as_str)
+                .filter(|v| !v.starts_with('-'))
+        };
+        let index = arg_after(1).unwrap_or("0");
+        let out = arg_after(2).unwrap_or("/tmp/abb-camera-probe.jpg");
         match permreq::camera_probe(index, out) {
-            Ok(msg) => print!("{msg}"),
+            // 报告已落盘（open -n 起的实例 stdout/stderr 是 /dev/null，println 只是终端直跑时的
+            // best-effort）；抓不到帧返回非 0，脚本可据此判定。
+            Ok((report, ok)) => {
+                print!("{report}");
+                if !ok {
+                    std::process::exit(2);
+                }
+            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(1);
