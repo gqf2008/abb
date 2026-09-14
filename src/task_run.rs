@@ -230,7 +230,7 @@ pub(crate) async fn run_attempt(
     let _ = states.set(&id, rt.clone());
 
     // 日志：任务本身就是「跑久/跑丢也看不见」的痛点，落盘 + 出口都要有（D6 的基础项）。
-    write_log(bot_key, &task, &rt, &text);
+    write_log(states.paths(), &task, &rt, &text);
     crate::log!(
         "[task:{bot_key}] {short} 结束：{:?}{}",
         if failed {
@@ -353,8 +353,7 @@ fn delivery_chat(task: &Task) -> Option<String> {
 
 /// 把一条任务的结局追加到 `task-logs/<id>.log`（超 `log_max_bytes` 时不写，避免吃满盘；
 /// 轮转是 P4）。
-fn write_log(bot_key: &str, task: &Task, rt: &TaskRuntime, text: &str) {
-    let paths = crate::task_store::TaskPaths::for_bot(bot_key);
+fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime, text: &str) {
     if paths.ensure().is_err() {
         return;
     }
@@ -456,6 +455,13 @@ mod tests {
     use super::*;
     use crate::task_store::{CreatedBy, TaskDelivery, TaskLimits, TaskPayload, TaskTrigger};
 
+    /// 每个用例一个 temp 根目录：**绝不碰用户真实的 `~/.agent-bridge`**。
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("abb-task-test-{tag}-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    }
+
     fn now_task(bot: &str, id: &str, chat: &str) -> Task {
         Task {
             schema_version: crate::task_store::TASK_SCHEMA_VERSION,
@@ -549,13 +555,13 @@ mod tests {
     /// 已结束的也不重跑（否则每次轮询都会重跑成功过的任务）。
     #[test]
     fn only_now_and_pending_is_claimed() {
-        let bot = format!("tclaim-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
+        let root = tmp_root("claim");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
 
-        let a = now_task(&bot, "tk_now", "c");
+        let a = now_task(bot, "tk_now", "c");
         store.add(a.clone()).unwrap();
         assert_eq!(
             next_pending(&store, &states).map(|t| t.id),
@@ -575,7 +581,7 @@ mod tests {
         assert!(next_pending(&store, &states).is_none());
 
         // cron 档不认领
-        let mut b = now_task(&bot, "tk_cron", "c");
+        let mut b = now_task(bot, "tk_cron", "c");
         b.trigger = TaskTrigger {
             kind: TriggerKind::Cron,
             expr: "0 9 * * *".to_string(),
@@ -591,12 +597,12 @@ mod tests {
     /// 否则任务会永远卡在「运行中」。
     #[test]
     fn orphaned_running_is_requeued() {
-        let bot = format!("torphan-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
-        store.add(now_task(&bot, "tk_run", "c")).unwrap();
+        let root = tmp_root("orphan");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+        store.add(now_task(bot, "tk_run", "c")).unwrap();
         states
             .set(
                 "tk_run",
@@ -675,26 +681,26 @@ mod tests {
     /// 把它拆成「只测状态机」会让最容易断的那截（投递信封的 in_session/自环组合）无人看守。
     #[tokio::test]
     async fn task_runs_end_to_end_and_delivers_to_creator() {
-        let bot = format!("te2e-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
+        let root = tmp_root("e2e");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
 
         let chat = format!("wx_{}", uuid::Uuid::new_v4());
-        let task = now_task(&bot, "tk_e2e", &chat);
+        let task = now_task(bot, "tk_e2e", &chat);
         store.add(task.clone()).unwrap();
         states.set("tk_e2e", TaskRuntime::default()).unwrap();
 
         let msgr = Arc::new(RecordingMsgr::default());
         let mut msgs: std::collections::HashMap<String, Arc<dyn crate::messenger::Messenger>> =
             std::collections::HashMap::new();
-        msgs.insert(bot.clone(), msgr.clone());
+        msgs.insert(bot.to_string(), msgr.clone());
         let mut bots = std::collections::HashMap::new();
         bots.insert(
-            bot.clone(),
+            bot.to_string(),
             crate::config::BotConfig {
-                name: bot.clone(),
+                name: bot.to_string(),
                 kind: "feishu".into(),
                 ..Default::default()
             },
@@ -706,7 +712,7 @@ mod tests {
         let rec = std::env::temp_dir().join(format!("abb-task-e2e-{}.jsonl", uuid::Uuid::new_v4()));
         let stop = tokio_util::sync::CancellationToken::new();
         run_attempt(
-            &bot,
+            bot,
             task,
             mock_cfg(&rec),
             std::env::temp_dir().display().to_string(),
@@ -759,12 +765,12 @@ mod tests {
     /// Failed。走的是真实状态机（不再手工跳过认领），所以能挡住「计数被清零」这类回归。
     #[test]
     fn rerun_bound_holds_across_claim_cycle() {
-        let bot = format!("tcycle-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
-        let mut t = now_task(&bot, "tk_cycle", "c");
+        let root = tmp_root("cycle");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+        let mut t = now_task(bot, "tk_cycle", "c");
         t.limits.max_restarts = 1;
         store.add(t).unwrap();
 
@@ -794,12 +800,12 @@ mod tests {
     /// 否则「prompt 能把 ABB 跑挂」会变成崩溃—重启—再崩的循环。
     #[test]
     fn orphan_rerun_is_bounded_by_max_restarts() {
-        let bot = format!("tbounded-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
-        let mut t = now_task(&bot, "tk_bound", "c");
+        let root = tmp_root("bounded");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+        let mut t = now_task(bot, "tk_bound", "c");
         t.limits.max_restarts = 2;
         store.add(t).unwrap();
 
@@ -845,11 +851,11 @@ mod tests {
     /// 启动清理要顺手删掉（否则状态文件与日志目录无限堆积）。
     #[test]
     fn requeue_orphans_drops_state_without_definition() {
-        let bot = format!("tghost-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
+        let root = tmp_root("ghost");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
         states
             .set(
                 "tk_ghost",
@@ -884,16 +890,16 @@ mod tests {
     /// 日志必须落盘（跑久/跑丢看不见是任务的头号痛点），且超上限后不再增长。
     #[test]
     fn log_is_written_and_capped() {
-        let bot = format!("tlog-{}", std::process::id());
-        let paths = crate::task_store::TaskPaths::for_bot(&bot);
-        let _ = std::fs::remove_dir_all(&paths.dir);
-        let t = now_task(&bot, "tk_log", "c");
+        let root = tmp_root("log");
+        let bot = "b";
+        let paths = crate::task_store::TaskPaths::with_root(&root, bot);
+        let t = now_task(bot, "tk_log", "c");
         let rt = TaskRuntime {
             kind: TaskStateKind::Succeeded,
             finished_at: Some(1),
             ..Default::default()
         };
-        write_log(&bot, &t, &rt, "hello");
+        write_log(&paths, &t, &rt, "hello");
         let body = std::fs::read_to_string(paths.log_file("tk_log")).unwrap();
         assert!(body.contains("hello"), "{body}");
         assert!(body.contains("Succeeded"), "{body}");
@@ -902,7 +908,7 @@ mod tests {
         let mut tiny = t.clone();
         tiny.limits.log_max_bytes = 1;
         let before = std::fs::read_to_string(paths.log_file("tk_log")).unwrap();
-        write_log(&bot, &tiny, &rt, "should-not-appear");
+        write_log(&paths, &tiny, &rt, "should-not-appear");
         let after = std::fs::read_to_string(paths.log_file("tk_log")).unwrap();
         assert_eq!(before, after, "超上限不该继续写");
 
