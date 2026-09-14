@@ -227,6 +227,41 @@ pub(crate) fn oneshot_agent_config(
     }
 }
 
+/// 一次性同步回合的 agent 配置（**按角色**选剖面）——task 执行专用。
+///
+/// 与 [`oneshot_agent_config`] 的关键差别：那个是**内部维护任务**（owner 语义：
+/// session_gc / 角色生成 / 团队生成），granted 的强制 Restricted 剖面「不适用于此」
+/// 是有意的。任务不一样——任务是**用户会话里的 agent 建的**，必须按创建者角色选剖面：
+/// granted 建的任务要和 granted 聊天/job 一样走强制 Restricted + `BUZZ_AGENT_NO_HINTS=1`。
+///
+/// 不这么做的后果（安全审查 B1，真实可达）：`$ABB_BIN task add` 对 granted 会话是
+/// **放行**的，于是 granted 会话里的 agent 只要 `task add --prompt "读 ~/.ssh"`，
+/// worker 就会用**无沙箱**（`SandboxMode::Auto` → `None` = FullAccess）跑那条 prompt，
+/// 把「授权者会话的受限剖面」整个绕过去。`run_job` 走的是 `restrict_granted` + granted
+/// 剖面，task 必须同判据。
+///
+/// 能力硬闸：oneshot 的句柄是函数内新建的，没法像 `run_job` 那样先查
+/// `sandbox_support()`；档位不支持时由 fork 侧建会话前的硬闸报
+/// `AcpError::SandboxUnsupported` → 回合结局是 `Failed(原因)`。**fail-closed**，
+/// 不会静默降级成无闸全权限。
+pub(crate) fn oneshot_agent_config_for_role(
+    bot: &crate::config::BotConfig,
+    cfg: &Config,
+    restricted: bool,
+) -> crate::buzz::harness::AgentConfig {
+    let mut c = oneshot_agent_config(bot, cfg);
+    if !restricted {
+        return c;
+    }
+    c.session_sandbox = Some(granted_sandbox_profile(bot));
+    // 进程级收口：fork 的 hints 扫盘发生在 session/new **之前**，per-session `_meta`
+    // 管不到（与 build_bot_acp_handles 的 granted 实例同一条理由）。先摘再补，防重复。
+    c.extra_env.retain(|(k, _)| k != "BUZZ_AGENT_NO_HINTS");
+    c.extra_env
+        .push(("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string()));
+    c
+}
+
 pub async fn run() {
     crate::log!("=== ABB 启动（Rust 内置 WS 版 · 多 bot）===");
     let cfg = match Config::load() {
@@ -1661,6 +1696,59 @@ mod tests {
             c
         };
         assert!(buzz_env_for_bot(&cfg3.bots[1], &cfg3).is_empty());
+    }
+
+    /// #306/安全审查 B1：任务的执行剖面必须**按创建者角色**选——granted 建的任务
+    /// 要拿 granted 剖面（workspace-write + restricted shell + NO_HINTS），
+    /// owner 建的任务才跟 bot 配置档走。这条一旦回退，`$ABB_BIN task add`（对
+    /// granted 会话是放行的）就成了「借任务拿全权限」的提权通道。
+    #[test]
+    fn task_agent_config_follows_creator_role() {
+        let bot = crate::config::BotConfig {
+            name: "taskrole".into(),
+            kind: "feishu".into(),
+            ..Default::default()
+        };
+        let cfg = Config::default();
+
+        // granted → 强制 Restricted 剖面 + 进程级 NO_HINTS
+        let g = oneshot_agent_config_for_role(&bot, &cfg, true);
+        let sb = g
+            .session_sandbox
+            .expect("granted 任务必须有档位载荷（None = FullAccess）");
+        assert_eq!(sb.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            sb.shell.as_deref(),
+            Some("restricted"),
+            "granted 必须带受限 shell 白名单"
+        );
+        assert!(
+            sb.abb_bin.as_deref().is_some_and(|p| !p.is_empty()),
+            "granted 剖面要给 $ABB_BIN 实体路径"
+        );
+        assert_eq!(
+            g.extra_env
+                .iter()
+                .filter(|(k, _)| k == "BUZZ_AGENT_NO_HINTS")
+                .count(),
+            1,
+            "NO_HINTS 必须恰好一份（重复注入会漂移）"
+        );
+        assert!(g
+            .extra_env
+            .iter()
+            .any(|(k, v)| k == "BUZZ_AGENT_NO_HINTS" && v == "1"));
+
+        // owner → 跟 bot 配置档（默认 Auto → None = FullAccess 照旧），且不注入 NO_HINTS
+        let o = oneshot_agent_config_for_role(&bot, &cfg, false);
+        assert!(
+            o.session_sandbox.is_none(),
+            "默认档位是 Auto → None（不额外收紧 owner）"
+        );
+        assert!(
+            !o.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"),
+            "owner 任务不该带授权者的进程级收口"
+        );
     }
 
     /// P2.2：normal handle 的 `_meta` 档位映射——sandbox_mode 解析成具体档。

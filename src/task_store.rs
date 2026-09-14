@@ -30,6 +30,12 @@ pub const TASK_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 /// 默认单文件日志上限（Q4 待定前的保守值）。
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// 默认「被进程退出中断后允许自动重跑」的次数（审查 B3）。
+///
+/// 取 1 而不是 0：ABB 升级/重启打断任务是很常见的，完全不让恢复会让任务白跑；
+/// 取 1 而不是更多：重跑的是**整条 prompt**（副作用整体重放），必须有界，
+/// 否则「prompt 能把 ABB 跑挂」会变成崩溃—重启—再崩的循环。
+pub const DEFAULT_MAX_RESTARTS: u32 = 1;
 
 /// 任务的两种载荷。两条轴的取值一样多，但**执行引擎完全不同**：
 /// `Agent` 走 ACP（`buzz::oneshot`），`Proc` 走进程超管（P3 落地）。
@@ -141,7 +147,7 @@ pub struct CreatedBy {
 pub struct TaskLimits {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_max_restarts")]
     pub max_restarts: u32,
     #[serde(default = "default_log_max")]
     pub log_max_bytes: u64,
@@ -149,6 +155,9 @@ pub struct TaskLimits {
 
 fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_SECS
+}
+fn default_max_restarts() -> u32 {
+    DEFAULT_MAX_RESTARTS
 }
 fn default_log_max() -> u64 {
     DEFAULT_LOG_MAX_BYTES
@@ -158,7 +167,7 @@ impl Default for TaskLimits {
     fn default() -> Self {
         TaskLimits {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
-            max_restarts: 0,
+            max_restarts: DEFAULT_MAX_RESTARTS,
             log_max_bytes: DEFAULT_LOG_MAX_BYTES,
         }
     }
@@ -236,6 +245,25 @@ impl Task {
             if t.chat_id.trim().is_empty() {
                 bail!("投递目标的 chat_id 不能为空");
             }
+            // 审查 N1：执行侧目前只投 `targets[0]` 且忽略 `bot_key`（按本 bot 投）。
+            // 与其静默截断/投错 bot，不如显式拒绝——等 `--to` 与跨 bot 投递真落地再放开。
+            if !t.bot_key.trim().is_empty() && t.bot_key != self.bot_key {
+                bail!(
+                    "暂不支持跨 bot 投递目标（{}），请留空或与任务同 bot",
+                    t.bot_key
+                );
+            }
+        }
+        if self.delivery.targets.len() > 1 {
+            bail!(
+                "暂不支持多投递目标（给了 {} 个）——当前只投创建者会话",
+                self.delivery.targets.len()
+            );
+        }
+        // 审查：log_max_bytes=0 会让 write_log 在文件存在后静默不再写（任务日志是
+        // 排障唯一入口，静默不写比报错更坏）→ 直接拒绝，别给「看着像开了」的配置。
+        if self.limits.log_max_bytes == 0 {
+            bail!("limits.log_max_bytes 不能为 0（日志是排障入口；要禁用请删任务）");
         }
         Ok(())
     }
@@ -417,6 +445,11 @@ impl TaskStateStore {
         }
     }
 
+    /// 当前有运行态记录的任务 id（清「有状态无定义」的孤儿条目用）。
+    pub fn ids(&self) -> Vec<String> {
+        self.data.lock().unwrap().keys().cloned().collect()
+    }
+
     pub fn get(&self, id: &str) -> TaskRuntime {
         self.data
             .lock()
@@ -474,12 +507,19 @@ fn read_states(p: &std::path::Path) -> Option<BTreeMap<String, TaskRuntime>> {
     }
 }
 
-/// 原子落盘：唯一 tmp 名（pid + 线程序号）避免并发共用同一 tmp 名互相踩。
+/// 原子落盘：唯一 tmp 名（pid + 进程内自增序号）避免并发共用同一 tmp 名互相踩。
+/// 只带 pid 不够——同进程两个线程（store 与 state store 之间也共享命名空间）会撞名。
 fn save_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    let tmp = path.with_extension(format!(
+        "json.tmp{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let text = serde_json::to_string_pretty(value)?;
     fs::write(&tmp, text).with_context(|| format!("写临时文件失败：{}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("替换失败：{}", path.display()))?;
@@ -580,6 +620,46 @@ mod tests {
         assert!(t2.validate().is_err());
     }
 
+    /// 审查：投递目标与日志上限的边界要在 `validate` 就拒掉——执行侧只投
+    /// `targets[0]` 且忽略 `bot_key`，静默截断/投错 bot 比报错糟得多；
+    /// `log_max_bytes=0` 则会让写日志在文件已存在后静默不再写。
+    #[test]
+    fn validate_rejects_unsupported_delivery_and_zero_log_cap() {
+        let mut t = agent_task("b");
+
+        t.delivery.targets = vec![
+            TaskTarget {
+                bot_key: String::new(),
+                chat_id: "a".into(),
+            },
+            TaskTarget {
+                bot_key: String::new(),
+                chat_id: "b".into(),
+            },
+        ];
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("多投递目标"), "{e}");
+
+        t.delivery.targets = vec![TaskTarget {
+            bot_key: "other".into(),
+            chat_id: "a".into(),
+        }];
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("跨 bot"), "{e}");
+
+        // 同 bot 显式写 bot_key 是允许的
+        t.delivery.targets = vec![TaskTarget {
+            bot_key: "b".into(),
+            chat_id: "a".into(),
+        }];
+        assert!(t.validate().is_ok());
+
+        t.delivery = TaskDelivery::default();
+        t.limits.log_max_bytes = 0;
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("log_max_bytes"), "{e}");
+    }
+
     #[test]
     fn serde_roundtrip_keeps_every_field() {
         let t = agent_task("bot-x");
@@ -604,6 +684,7 @@ mod tests {
         assert_eq!(t.delivery.default, "creator");
         assert_eq!(t.limits.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(t.limits.log_max_bytes, DEFAULT_LOG_MAX_BYTES);
+        assert_eq!(t.limits.max_restarts, DEFAULT_MAX_RESTARTS);
         assert_eq!(t.created_by.role, crate::config::SenderRole::Owner);
     }
 

@@ -129,7 +129,7 @@ async fn run_one(
         task_workspace(bot_key, &task)
     );
 
-    let agent_cfg = crate::service::oneshot_agent_config(bot, cfg);
+    let agent_cfg = agent_cfg_for_task(bot, cfg, &task);
     let workspace = task_workspace(bot_key, &task);
     run_attempt(bot_key, task, agent_cfg, workspace, router, states, stop).await;
 }
@@ -245,9 +245,12 @@ pub(crate) async fn run_attempt(
         }
     );
 
-    // 取消/超时/失败也有必要回投——用户看不到结果才是真痛点；但**关停联动**触发的
-    // 取消不回投（进程正在退出，投递通道也在关，回了多半发不出去还刷日志）。
-    if cancelled && stop.is_cancelled() {
+    // 取消/超时/失败也有必要回投——用户看不到结果才是真痛点。但今天唯一能产生
+    // `Cancelled` 的路径是**service 关停联动**（oneshot 的 external_cancel 只接了关停
+    // 令牌），此时投递通道也在关，回了多半发不出去还刷日志 → 不回投。
+    // 审查 N4：所以下面「🛑 已取消」那条抬头当前**不可达**，不要把它当已实现的验收项；
+    // 等 Q3 的 `task cancel`（用户主动取消）落地后，那条路要带自己的回报语义。
+    if cancelled {
         return;
     }
     let Some(chat) = delivery_chat(&task) else {
@@ -285,6 +288,21 @@ pub(crate) async fn run_attempt(
         in_session: true,
     };
     router.deliver(&item).await;
+}
+
+/// **选执行剖面并装配 agent 配置**——这是「这条任务用什么权限跑」的唯一定点。
+///
+/// 安全审查 B1：剖面必须按**创建者角色**选，不能一律用 owner 的内部任务配置。
+/// `$ABB_BIN task add` 对 granted 会话是放行的（与 `job add` 同一条信任链），
+/// 选错就等于 granted 会话里的 agent 能借任务拿全权限。
+/// 判据与 `run_job` 完全一致：`config::restrict_granted(role, bot_key)`。
+fn agent_cfg_for_task(
+    bot: &crate::config::BotConfig,
+    cfg: &crate::config::Config,
+    task: &Task,
+) -> crate::buzz::harness::AgentConfig {
+    let restricted = crate::config::restrict_granted(task.created_by.role, task.bot_key.as_str());
+    crate::service::oneshot_agent_config_for_role(bot, cfg, restricted)
 }
 
 /// 任务的工作目录：定义里显式给了就用它，否则回落该 bot 的工作区。
@@ -352,22 +370,58 @@ fn next_pending(store: &TaskStore, states: &TaskStateStore) -> Option<Task> {
     })
 }
 
-/// 上次进程残留的 `Running` 是孤儿（执行器随进程一起没了）→ 标回 `Pending` 重跑。
+/// 启动清理：上次进程残留的 `Running` 是孤儿（执行器随进程一起没了）。
+///
+/// **必须有上界**（审查 B3）：重跑的是**整条 prompt**，不是只重投结果——发消息、
+/// 改文件、推流这些副作用会整体重放；若某条 prompt 正好能把 ABB 跑挂（OOM/自杀
+/// 命令），无上界重跑就会变成「崩溃→重启→再崩」的循环。
+/// 故用 `limits.max_restarts` 定上界（默认 [`crate::task_store::DEFAULT_MAX_RESTARTS`]）：
+/// 未超限 → 归位 `Pending` 并 `restarts += 1`；超限 → `Failed`，由用户显式重跑。
+///
+/// 同时清掉「有运行态但没有定义」的孤儿条目（`task rm` 与 worker 认领的竞态会留下）。
 fn requeue_orphans(store: &TaskStore, states: &TaskStateStore) {
-    for t in store.list() {
+    let tasks = store.list();
+    for t in &tasks {
         let rt = states.get(&t.id);
-        if rt.kind == TaskStateKind::Running {
+        if rt.kind != TaskStateKind::Running {
+            continue;
+        }
+        let short = &t.id[..t.id.len().min(12)];
+        if rt.restarts < t.limits.max_restarts {
             crate::log!(
-                "[task] 上次运行残留 Running（{}）→ 归位 Pending 重跑",
-                &t.id[..t.id.len().min(12)]
+                "[task] 上次运行残留 Running（{short}）→ 归位 Pending 重跑（第 {} 次，上限 {}）",
+                rt.restarts + 1,
+                t.limits.max_restarts
             );
             let _ = states.set(
                 &t.id,
                 TaskRuntime {
                     kind: TaskStateKind::Pending,
+                    restarts: rt.restarts + 1,
                     ..rt
                 },
             );
+        } else {
+            crate::log!(
+                "[task] 上次运行残留 Running（{short}）→ 重跑已达上限 {}，标记 Failed",
+                t.limits.max_restarts
+            );
+            let _ = states.set(
+                &t.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Failed,
+                    finished_at: Some(crate::chrono_lite::unix_secs()),
+                    last_error: "上次运行被进程退出中断（未自动重跑，可手动重跑）".to_string(),
+                    ..rt
+                },
+            );
+        }
+    }
+    // 无定义的残留运行态：删掉，别让 task-logs/状态文件无限堆积。
+    let known: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    for id in states.ids() {
+        if !known.contains(id.as_str()) {
+            let _ = states.remove(&id);
         }
     }
 }
@@ -400,6 +454,46 @@ mod tests {
             delivery: TaskDelivery::default(),
             limits: TaskLimits::default(),
         }
+    }
+
+    /// 安全审查 B1 的回归锁：granted 建的任务必须拿 granted 剖面（workspace-write +
+    /// restricted shell + NO_HINTS），owner 的才跟 bot 配置档走。
+    /// 这条锁的是**装配处的接线**——只测 `oneshot_agent_config_for_role` 本身
+    /// 无法证明 `run_one` 真的把 `created_by.role` 传下去了。
+    #[test]
+    fn granted_task_gets_restricted_profile() {
+        let bot = crate::config::BotConfig {
+            name: "taskrole-wire".into(),
+            kind: "feishu".into(),
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        // 未知 bot_key → restrict_granted 对 Granted 取安全默认 true（不依赖本机 config 内容）
+        let bot_key = "no-such-bot-for-taskrole-test";
+
+        let mut g = now_task(bot_key, "tk_g", "c");
+        g.created_by.role = crate::config::SenderRole::Granted;
+        let gc = agent_cfg_for_task(&bot, &cfg, &g);
+        let sb = gc
+            .session_sandbox
+            .expect("granted 任务必须有档位载荷（None = FullAccess，等于提权）");
+        assert_eq!(sb.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(sb.shell.as_deref(), Some("restricted"));
+        assert!(
+            gc.extra_env
+                .iter()
+                .any(|(k, v)| k == "BUZZ_AGENT_NO_HINTS" && v == "1"),
+            "granted 任务要带进程级 hints 收口"
+        );
+
+        let mut o = g.clone();
+        o.created_by.role = crate::config::SenderRole::Owner;
+        let oc = agent_cfg_for_task(&bot, &cfg, &o);
+        assert!(
+            oc.session_sandbox.is_none(),
+            "owner 任务不该被额外收紧（默认档位 Auto → None）"
+        );
+        assert!(!oc.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"));
     }
 
     #[test]
@@ -492,8 +586,10 @@ mod tests {
             "Running 不该被当待认领"
         );
 
+        // max_restarts 默认 1：第一次中断允许归位重跑，并记一次 restarts
         requeue_orphans(&store, &states);
         assert_eq!(states.get("tk_run").kind, TaskStateKind::Pending);
+        assert_eq!(states.get("tk_run").restarts, 1);
         assert_eq!(
             next_pending(&store, &states).map(|t| t.id),
             Some("tk_run".into())
@@ -613,6 +709,86 @@ mod tests {
         assert!(log.contains("Succeeded"), "日志要落盘：{log}");
 
         let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查 B3：重跑的是**整条 prompt**（副作用整体重放），必须有上界——超限转 Failed，
+    /// 否则「prompt 能把 ABB 跑挂」会变成崩溃—重启—再崩的循环。
+    #[test]
+    fn orphan_rerun_is_bounded_by_max_restarts() {
+        let bot = format!("tbounded-{}", std::process::id());
+        let paths = crate::task_store::TaskPaths::for_bot(&bot);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+        let store = TaskStore::new(&bot);
+        let states = TaskStateStore::new(&bot);
+        let mut t = now_task(&bot, "tk_bound", "c");
+        t.limits.max_restarts = 2;
+        store.add(t).unwrap();
+
+        // 第 1、2 次中断 → 归位重跑
+        for want in 1..=2u32 {
+            states
+                .set(
+                    "tk_bound",
+                    TaskRuntime {
+                        kind: TaskStateKind::Running,
+                        restarts: want - 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            requeue_orphans(&store, &states);
+            let rt = states.get("tk_bound");
+            assert_eq!(rt.kind, TaskStateKind::Pending, "第 {want} 次应归位");
+            assert_eq!(rt.restarts, want);
+        }
+
+        // 第 3 次：已达上限 → Failed，且**不再**被认领
+        states
+            .set(
+                "tk_bound",
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    restarts: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        requeue_orphans(&store, &states);
+        let rt = states.get("tk_bound");
+        assert_eq!(rt.kind, TaskStateKind::Failed);
+        assert!(rt.last_error.contains("中断"), "{}", rt.last_error);
+        assert!(next_pending(&store, &states).is_none(), "Failed 不该被认领");
+
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查 N5：`task rm` 与 worker 认领的竞态会留下「有运行态、无定义」的孤儿条目，
+    /// 启动清理要顺手删掉（否则状态文件与日志目录无限堆积）。
+    #[test]
+    fn requeue_orphans_drops_state_without_definition() {
+        let bot = format!("tghost-{}", std::process::id());
+        let paths = crate::task_store::TaskPaths::for_bot(&bot);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+        let store = TaskStore::new(&bot);
+        let states = TaskStateStore::new(&bot);
+        states
+            .set(
+                "tk_ghost",
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        requeue_orphans(&store, &states);
+        assert!(
+            states.ids().is_empty(),
+            "无定义的残留运行态应被清掉：{:?}",
+            states.ids()
+        );
+
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 

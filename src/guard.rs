@@ -650,7 +650,10 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
                     "task 仅允许 add（list/status/logs 会暴露任务内容，rm 可删任务）".into(),
                 );
             }
-            if rest.iter().any(|a| a == "--proc" || a.starts_with("--cmd")) {
+            if rest
+                .iter()
+                .any(|a| a.starts_with("--proc") || a.starts_with("--cmd"))
+            {
                 return Decision::Deny(
                     "不允许 agent 创建 proc 任务（Q8：任意命令执行入口仅限 GUI/人工）".into(),
                 );

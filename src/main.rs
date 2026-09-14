@@ -763,7 +763,7 @@ fn resolve_bot_key() -> Result<String, String> {
         0 => Err("config.json 没有配置任何 bot".into()),
         1 => Ok(cfg.bots[0].key()),
         n => Err(format!(
-            "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请设该环境变量为某个 bot 的 name）"
+            "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）"
         )),
     }
 }
@@ -900,6 +900,7 @@ fn run_task_cli(args: &[String]) -> i32 {
             let mut name = String::new();
             let mut cwd = String::new();
             let mut timeout_secs = task_store::DEFAULT_TIMEOUT_SECS;
+            let mut max_restarts = task_store::DEFAULT_MAX_RESTARTS;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -937,6 +938,16 @@ fn run_task_cli(args: &[String]) -> i32 {
                         }
                         i += 2;
                     }
+                    "--max-restarts" => {
+                        match args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+                            Some(n) => max_restarts = n,
+                            None => {
+                                eprintln!("--max-restarts 需要一个非负整数");
+                                return 1;
+                            }
+                        }
+                        i += 2;
+                    }
                     other => {
                         eprintln!("task add 不认识的参数：{other}");
                         return 1;
@@ -944,11 +955,23 @@ fn run_task_cli(args: &[String]) -> i32 {
                 }
             }
             let Some(prompt) = prompt else {
-                eprintln!("用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N]");
+                eprintln!("用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N]");
                 return 1;
             };
-            // 创建者会话：桥注入的 env（任务结果默认回这里，见 D2）。
-            let chat_id = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+            // 创建者会话：优先桥注入的 env；手动 CLI 回落该 bot 的主会话（与 job add 同款）。
+            // 审查 B2：这里若留空，任务会「跑完但没人看得到」——而 CLI 却印着「结果回创建者会话」。
+            // 所以两条路都给不出目标时**直接拒绝登记**，不接受一个永远发不出结果的任务。
+            let chat_id = std::env::var("AGENT_BRIDGE_CHAT_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| config::Config::primary_chat(&bot_key));
+            if chat_id.is_empty() {
+                eprintln!(
+                    "无法确定结果投递目标：AGENT_BRIDGE_CHAT_ID 为空且该 bot 主会话未建立\n\
+                     （先在对应 IM 私聊该 bot 发一句话，或从 bot 会话内调用本命令）"
+                );
+                return 1;
+            }
             let task = task_store::Task {
                 schema_version: task_store::TASK_SCHEMA_VERSION,
                 id: task_store::new_id(chrono_lite::unix_secs()),
@@ -974,6 +997,7 @@ fn run_task_cli(args: &[String]) -> i32 {
                 delivery: task_store::TaskDelivery::default(),
                 limits: task_store::TaskLimits {
                     timeout_secs,
+                    max_restarts,
                     ..Default::default()
                 },
             };
@@ -1002,7 +1026,7 @@ fn run_task_cli(args: &[String]) -> i32 {
             }
             eprintln!(
                 "用法：agent-bridge task <list|status|logs|rm|add> …\n\
-                 \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N]\n\
+                 \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N]\n\
                  \n  task list                         列出本 bot 的任务\n\
                  \n  task status <id前缀>              看一条任务的详情与运行态\n\
                  \n  task logs <id前缀> [--tail N]     看任务日志（缺省末 200 行）\n\
