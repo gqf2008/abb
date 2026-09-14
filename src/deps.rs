@@ -939,6 +939,11 @@ pub enum PermState {
     Denied,
     /// 从未请求 / 未授权（auth_value=0 或无行）
     NotDetermined,
+    /// 被系统策略限制（macOS `AVAuthorizationStatusRestricted`=1：家长控制 / MDM /
+    /// 屏幕使用时间等）——**不是**「从未请求」：这种机器上不会弹框、也必然拿不到设备。
+    /// 历史实现把它折进 `NotDetermined`，会让「不弹框也抓不到」被误读成「未授权」。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    Restricted,
 }
 
 // ═══════════════════════ Windows 管理员提权 ═══════════════════════
@@ -1116,7 +1121,8 @@ fn av_state(sym: &std::ffi::CStr) -> PermState {
         ) {
             3 => PermState::Granted,
             2 => PermState::Denied,
-            _ => PermState::NotDetermined, // 0 / 1
+            1 => PermState::Restricted,
+            _ => PermState::NotDetermined, // 0 / 未知
         }
     }
 }

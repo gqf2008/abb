@@ -247,6 +247,22 @@ pub fn camera_probe_args(index: &str, out: &str) -> Vec<String> {
     .collect()
 }
 
+/// 判定文案（纯函数，便于单测覆盖三条分支——防「分支永远走不到」这类回归：
+/// 上一版就写了 `parent_state == "Restricted"`，而当时 `PermState` 根本没有该状态）。
+fn camera_verdict(parent_state: &str, ok: bool) -> &'static str {
+    if ok {
+        return "✅ 抓到一帧：ABB 派生进程能拿到相机 → **TCC 继承成立**（#305 方向可行）。\n";
+    }
+    if parent_state == "Denied" || parent_state == "Restricted" {
+        return "⚠️ 本次实验**无效**：ABB 的相机授权已是被拒/受限状态（不会弹框，也必然抓不到帧）。\n\
+                先重置再重跑：`tccutil reset Camera com.sqb.abb`，然后重新执行本命令。\n";
+    }
+    "⚠️ 没抓到帧。请回看刚才是否弹过系统授权框：\n\
+     - 弹框且归属方写着 **ABB** → 继承成立（点允许后重跑即出图）；\n\
+     - 弹框写着 Terminal / iTerm / 其它 → 本次无效（必须用 `open -n -a ABB.app` 起）；\n\
+     - 父进程相机态是 NotDetermined 且确实没弹框 → **继承不成立**，#305 需改方向。\n"
+}
+
 /// 判定：只有 ffmpeg **退出成功**且**确实产出了非空文件**才算成功。
 /// （抓帧前由 [`camera_probe`] 先删旧文件，所以 `size > 0` 一定来自本次——不会拿残留文件
 /// 冒充成功。）
@@ -313,27 +329,18 @@ pub fn camera_probe(index: &str, out: &str) -> Result<(String, bool), String> {
         r.push_str(&format!("ffmpeg stderr:\n{stderr}\n"));
     }
     r.push_str("\n## 判定\n");
+    r.push_str(camera_verdict(&parent_state, ok));
     if ok {
-        r.push_str("✅ 抓到一帧：ABB 派生进程能拿到相机 → **TCC 继承成立**（#305 方向可行）。\n");
-    } else if parent_state == "Denied" || parent_state == "Restricted" {
-        r.push_str(
-            "⚠️ 本次实验**无效**：ABB 的相机授权已是被拒/受限状态，所以既不会弹框也抓不到帧。\n\
-             先重置再重跑：`tccutil reset Camera com.sqb.abb`，然后重新执行本命令。\n",
-        );
-    } else {
-        r.push_str(
-            "⚠️ 没抓到帧。请回看刚才是否弹过系统授权框：\n\
-             - 弹框且归属方写着 **ABB** → 继承成立（点允许后重跑即出图）；\n\
-             - 弹框写着 Terminal / iTerm / 其它 → 本次无效（必须用 `open -n -a ABB.app` 起）；\n\
-             - 父进程相机态是 NotDetermined 且确实没弹框 → **继承不成立**，#305 需改方向。\n",
-        );
+        r.push_str(&format!("（本次使用的父进程相机态：{parent_state}）\n"));
     }
 
     let log = camera_probe_log_path();
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&log, &r);
+    // 该文件是规定调用方式下**唯一**的交付通道（open -n 起的实例 stdout/stderr 都是
+    // /dev/null），写失败必须显式失败，不能静默。
+    std::fs::write(&log, &r).map_err(|e| format!("报告写入失败（{}）：{e}", log.display()))?;
     r.push_str(&format!("\n（报告已写入 {}\n", log.display()));
     Ok((r, ok))
 }
@@ -372,6 +379,25 @@ mod tests {
         assert!(
             b.contains(&"/tmp/y.jpg".to_string()),
             "输出路径必须原样透传"
+        );
+    }
+
+    /// #305 Step 0：判定三条分支必须都能走到（上一版 `Restricted` 是死代码：当时
+    /// `PermState` 没有该状态、`av_state` 把 AVAuthorizationStatus=1 折成了 NotDetermined）。
+    #[test]
+    fn camera_verdict_covers_all_cases() {
+        assert!(camera_verdict("Granted", true).contains("继承成立"));
+        assert!(camera_verdict("NotDetermined", true).contains("继承成立"));
+        for st in ["Denied", "Restricted"] {
+            let v = camera_verdict(st, false);
+            assert!(v.contains("本次实验**无效**"), "{st} → {v}");
+            assert!(v.contains("tccutil reset Camera"), "{st} 应给出重置指引");
+        }
+        let v = camera_verdict("NotDetermined", false);
+        assert!(v.contains("继承不成立"), "未授权且无弹框才判继承不成立");
+        assert!(
+            !v.contains("本次实验**无效**"),
+            "NotDetermined 不该被说成无效实验"
         );
     }
 

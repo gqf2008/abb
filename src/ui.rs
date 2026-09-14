@@ -1397,7 +1397,9 @@ fn push_perms_to_window(w: &SettingsWindow) {
             .find(|p| p.id == id)
             .map(|p| match p.state {
                 PermState::Granted => 2,
-                PermState::Denied => 1,
+                // Restricted（家长控制/MDM 限制）等同「拿不到设备」，归到「被拒绝」这一档展示：
+                // 它和 Denied 一样不会弹框，用户唯一出路是系统设置里改策略，不是点「去授权」。
+                PermState::Denied | PermState::Restricted => 1,
                 PermState::NotDetermined => 0,
             })
             .unwrap_or(0)
