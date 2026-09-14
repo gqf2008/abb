@@ -616,6 +616,11 @@ impl EventQueue {
     /// 死信臂与 `drain_channel()` 的口径）。
     pub fn drain_channel_tagged(&mut self, channel_id: Uuid, tag: &str) -> Vec<String> {
         let mut dropped = Vec::new();
+        // 该频道此前是否有任何在册事件（决定清空后要不要连退避账一起清）
+        let had_any = self.queues.contains_key(&channel_id)
+            || self.withheld_native_steer.contains_key(&channel_id)
+            || self.cancelled_batches.contains_key(&channel_id);
+
         if let Some(q) = self.queues.get_mut(&channel_id) {
             q.retain(|e| {
                 if e.msg.prompt_tag == tag {
@@ -626,6 +631,31 @@ impl EventQueue {
                 }
             });
         }
+        // **两个中转站也要扫**（#320）：native steer 的 ack 窗口会把事件从 queues
+        // 挪到 `withheld_native_steer`；Steer 合并待重提示会把事件放进
+        // `cancelled_batches`（持续到该频道下次 flush）。只扫 queues 时，job 消息落在
+        // 这些窗口里就丢不到——停止词有回执但 job 之后仍会跑。
+        if let Some(v) = self.withheld_native_steer.get_mut(&channel_id) {
+            v.retain(|e| {
+                if e.msg.prompt_tag == tag {
+                    dropped.push(e.msg.id_hex.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Some(v) = self.cancelled_batches.get_mut(&channel_id) {
+            v.retain(|e| {
+                if e.msg.prompt_tag == tag {
+                    dropped.push(e.msg.id_hex.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
         // 全空则摘掉该 channel 条目（与 push/flush 的空表语义一致，避免残留空队列）。
         //
         // **必须同时清 retry 账**：`requeue()` 会把失败批次推回 queues **并**置
@@ -634,8 +664,19 @@ impl EventQueue {
         // 的 `retry_after` 判据把**后续新消息**（含用户消息）静默拖到退避到期（最长
         // MAX_RETRY_DELAY_SECS = 300s）。同 `requeue()` 死信臂与 `drain_channel()`
         // 的口径：丢弃 poison batch 后不得用它的退避拖住新鲜流量。
-        if self.queues.get(&channel_id).is_some_and(|q| q.is_empty()) {
+        let empty_now = self.queues.get(&channel_id).is_none_or(|q| q.is_empty())
+            && self
+                .withheld_native_steer
+                .get(&channel_id)
+                .is_none_or(|v| v.is_empty())
+            && self
+                .cancelled_batches
+                .get(&channel_id)
+                .is_none_or(|v| v.is_empty());
+        if had_any && empty_now {
             self.queues.remove(&channel_id);
+            self.withheld_native_steer.remove(&channel_id);
+            self.cancelled_batches.remove(&channel_id);
             self.retry_after.remove(&channel_id);
             self.retry_counts.remove(&channel_id);
         }
@@ -1319,6 +1360,78 @@ mod tests {
             Some(&2),
             "队列没空 → 账目可能对应仍在排队的事件，不该清"
         );
+    }
+
+    // BatchEvent 不带 channel_id（它属于所属 map 的 key），故本 helper 不需要该参数
+    fn batch_event(id: &str, tag: &str) -> BatchEvent {
+        BatchEvent {
+            msg: InboundMsg {
+                id_hex: id.to_string(),
+                author_role: "user".to_string(),
+                text: format!("text-{id}"),
+                ts_secs: 0,
+                prompt_tag: tag.to_string(),
+            },
+            received_at: Instant::now(),
+        }
+    }
+
+    /// #320：丢弃必须**同时扫两个中转站**——`withheld_native_steer`（native steer 的
+    /// ack 窗口）与 `cancelled_batches`（Steer 合并待重提示窗口，持续到下次 flush）。
+    /// 只扫 `queues` 时，job 消息落在这些窗口里丢不到 → 停止词有回执但 job 之后仍会跑。
+    #[test]
+    fn drain_channel_tagged_covers_withheld_and_cancelled_windows() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.withheld_native_steer.insert(
+            ch,
+            vec![
+                queued(ch, "j1", "job_message"),
+                queued(ch, "u1", "user_message"),
+            ],
+        );
+        q.cancelled_batches.insert(
+            ch,
+            vec![
+                batch_event("j2", "job_message"),
+                batch_event("u2", "user_message"),
+            ],
+        );
+
+        let mut dropped = q.drain_channel_tagged(ch, "job_message");
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            vec!["j1".to_string(), "j2".to_string()],
+            "两个窗口里的 job 消息都要被丢"
+        );
+        let w = q.withheld_native_steer.get(&ch).expect("窗口仍在");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].msg.id_hex, "u1", "窗口里的用户消息不得被吞");
+        let c = q.cancelled_batches.get(&ch).expect("合并批次仍在");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].msg.id_hex, "u2", "合并批次里的用户消息不得被吞");
+    }
+
+    /// 两个中转站被清空后同样算「该频道已无排队内容」→ 退避账要一并清
+    /// （否则陈旧退避会拖住后续新消息，同 B1 的教训）。
+    #[test]
+    fn drain_channel_tagged_clears_retry_when_windows_become_empty() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.withheld_native_steer
+            .insert(ch, vec![queued(ch, "j1", "job_message")]);
+        q.retry_after
+            .insert(ch, Instant::now() + std::time::Duration::from_secs(300));
+        q.retry_counts.insert(ch, 1);
+
+        assert_eq!(
+            q.drain_channel_tagged(ch, "job_message"),
+            vec!["j1".to_string()]
+        );
+        assert!(!q.withheld_native_steer.contains_key(&ch), "空窗口应摘除");
+        assert!(!q.retry_after.contains_key(&ch), "清空后不得残留退避账");
+        assert!(!q.retry_counts.contains_key(&ch));
     }
 
     /// 没有匹配项时是 no-op（不动队列、不报错）。
