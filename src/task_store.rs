@@ -341,9 +341,19 @@ pub struct TaskPaths {
 }
 
 impl TaskPaths {
+    /// 生产入口：任务数据落在 `~/.agent-bridge/tasks/<bot>/`。
     pub fn for_bot(bot_key: &str) -> TaskPaths {
+        TaskPaths::with_root(crate::bridge_dir().join("tasks"), bot_key)
+    }
+
+    /// **注入缝**：根目录由调用方给。测试一律走这里 + temp 目录——绝不能借
+    /// [`TaskPaths::for_bot`] 往用户真实的 `~/.agent-bridge` 里写测试数据
+    /// （既有经验：单测不得写用户真实运行数据，见 `LESSON_单测不得写用户真实运行数据须拆出注入缝.md`；
+    /// 用 Drop 守卫清理治不了 Ctrl-C/OOM 中途退出留下的残留）。
+    /// 生产入口只是「解析根目录 + 委托本函数」，两者共享同一段实现。
+    pub fn with_root(root: impl AsRef<std::path::Path>, bot_key: &str) -> TaskPaths {
         TaskPaths {
-            dir: crate::bridge_dir().join("tasks").join(bot_key),
+            dir: root.as_ref().join(bot_key),
         }
     }
     pub fn definitions(&self) -> PathBuf {
@@ -378,7 +388,12 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub fn new(bot_key: &str) -> TaskStore {
-        let paths = TaskPaths::for_bot(bot_key);
+        TaskStore::new_at(crate::bridge_dir().join("tasks"), bot_key)
+    }
+
+    /// **注入缝**（测试用 temp 根目录）；与 [`TaskStore::new`] 共享全部实现。
+    pub fn new_at(root: impl AsRef<std::path::Path>, bot_key: &str) -> TaskStore {
+        let paths = TaskPaths::with_root(root, bot_key);
         let _ = paths.ensure();
         let data = read_defs(&paths.definitions()).unwrap_or_default();
         let mtime = mtime_of(&paths.definitions());
@@ -442,19 +457,29 @@ impl TaskStore {
 
 /// 运行态存储。**只由 service 写**（CLI 只读），因此不需要 CAS：单写者。
 pub struct TaskStateStore {
-    path: PathBuf,
+    paths: TaskPaths,
     data: Mutex<BTreeMap<String, TaskRuntime>>,
 }
 
 impl TaskStateStore {
     pub fn new(bot_key: &str) -> TaskStateStore {
-        let paths = TaskPaths::for_bot(bot_key);
+        TaskStateStore::new_at(crate::bridge_dir().join("tasks"), bot_key)
+    }
+
+    /// **注入缝**（测试用 temp 根目录）；与 [`TaskStateStore::new`] 共享全部实现。
+    pub fn new_at(root: impl AsRef<std::path::Path>, bot_key: &str) -> TaskStateStore {
+        let paths = TaskPaths::with_root(root, bot_key);
         let _ = paths.ensure();
         let data = read_states(&paths.states()).unwrap_or_default();
         TaskStateStore {
-            path: paths.states(),
+            paths,
             data: Mutex::new(data),
         }
+    }
+
+    /// 该 bot 的任务路径（日志读写用同一条解析链，测试才能全程留在 temp 里）。
+    pub fn paths(&self) -> &TaskPaths {
+        &self.paths
     }
 
     /// 当前有运行态记录的任务 id（清「有状态无定义」的孤儿条目用）。
@@ -478,7 +503,7 @@ impl TaskStateStore {
             d.insert(id.to_string(), rt);
             d.clone()
         };
-        save_json(&self.path, &snap)
+        save_json(&self.paths.states(), &snap)
     }
 
     /// 删掉一条运行态（删任务时一并清，避免 file 里留孤儿）。
@@ -488,7 +513,7 @@ impl TaskStateStore {
             d.remove(id);
             d.clone()
         };
-        save_json(&self.path, &snap)
+        save_json(&self.paths.states(), &snap)
     }
 }
 
@@ -737,14 +762,13 @@ mod tests {
 
     #[test]
     fn store_add_get_remove_roundtrip() {
-        // 用独立 bot 名避免与真实数据撞车；测完清理自己写的那一份
-        let bot = format!("tstore-{}", std::process::id());
-        let store = TaskStore::new(&bot);
-        let t = agent_task(&bot);
+        // 全程 temp 根目录：**不碰用户真实的 ~/.agent-bridge**
+        let root = std::env::temp_dir().join(format!("abb-tstore-{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&root);
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let t = agent_task(bot);
         let id = t.id.clone();
-
-        // 先清干净（同一 pid 重复跑测试时）
-        store.remove(&id);
         store.add(t.clone()).unwrap();
         assert!(store.list().iter().any(|x| x.id == id));
         assert_eq!(store.list().len(), 1);
@@ -754,7 +778,7 @@ mod tests {
         assert!(e.contains("已存在"), "{e}");
 
         // 校验不过的定义 → 拒绝
-        let mut bad = agent_task(&bot);
+        let mut bad = agent_task(bot);
         bad.id = "tk_bad_1".to_string();
         bad.payload.prompt = String::new();
         assert!(store.add(bad).is_err());
@@ -764,18 +788,17 @@ mod tests {
         assert!(!store.list().iter().any(|x| x.id == id));
         assert!(!store.remove(&id), "重复删除应为 false");
 
-        // 清理本测试产生的目录
-        let _ = fs::remove_dir_all(TaskPaths::for_bot(&bot).dir);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn state_store_keeps_runtime_out_of_definitions() {
-        let bot = format!("tstate-{}", std::process::id());
-        let paths = TaskPaths::for_bot(&bot);
-        let _ = fs::remove_dir_all(&paths.dir);
-        let store = TaskStore::new(&bot);
-        let states = TaskStateStore::new(&bot);
-        let t = agent_task(&bot);
+        let root = std::env::temp_dir().join(format!("abb-tstate-{}", uuid::Uuid::new_v4()));
+        let bot = "b";
+        let paths = TaskPaths::with_root(&root, bot);
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+        let t = agent_task(bot);
         let id = t.id.clone();
         store.add(t).unwrap();
 
@@ -802,7 +825,7 @@ mod tests {
         states.remove(&id).unwrap();
         assert_eq!(states.get(&id).kind, TaskStateKind::Pending);
 
-        let _ = fs::remove_dir_all(&paths.dir);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
