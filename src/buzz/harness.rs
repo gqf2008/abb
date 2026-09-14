@@ -159,10 +159,14 @@ enum Cmd {
     /// crate::schedule::JOB_PROMPT_TAG` 过滤丢弃该频道的排队事件，**不动**用户消息、
     /// 也不动 in-flight 轮次。
     ///
-    /// **已知残留**（follow-up #320）：只扫 `queues`，不扫 `withheld_native_steer`
-    ///（native steer ack 窗口）与 `cancelled_batches`（Steer 合并待重提示窗口，持续到该
-    /// 频道下次 flush）——job 消息落在这些窗口时 drop=0，之后 `cancel` 多半返回 false，
-    /// 停止词**有回执但 job 不会被停**（不是静默吞）。
+    /// 覆盖三个存放点（#320）：`queues`（普通排队）、`withheld_native_steer`（native steer
+    /// 的 ack 窗口）、`cancelled_batches`（Steer 合并待重提示窗口）——只扫 `queues` 时，
+    /// job 消息落在后两个窗口会 drop=0，停止词有回执但 job 之后仍会跑。
+    ///
+    /// ⚠️ `withheld_native_steer` 的 **Success 子情形**：ack 回来前，steer 请求可能**已经被
+    /// 写进 agent 并并入在跑回合**（`handle_steer_ack` 的 Success 臂就是「drop withheld，
+    /// 已投递防重投」）。所以本命令对那种情形只能防**重投/重排**，**撤不回**已并入的内容——
+    /// 真正让 job 停下来的是随后的 `cancel(channel)` 腿（`cancel_job_turns_for_chat` 两腿都跑）。
     /// 排队中的 job 被丢弃后不会有任何回合结局，因此同时给同步 waiter 回取消终态
     /// （否则 run_job 要挂到超时）。reply 回被丢弃的条数。
     DropQueuedJobs {
