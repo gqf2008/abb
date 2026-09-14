@@ -608,8 +608,12 @@ impl EventQueue {
     /// 丢弃该频道**排队中**（未在跑）且 `prompt_tag == tag` 的事件，返回被丢弃的 event id。
     ///
     /// 与 [`Self::drain_channel`] 的区别：**只按 tag 过滤**，不碰该频道其它排队事件
-    /// （典型用途 #309：停掉排队中的定时任务，但**不能吞掉用户还没被受理的消息**），
-    /// 也不清 retry/取消账——该频道可能还有别的活要跑。
+    /// （典型用途 #309：停掉排队中的定时任务，但**不能吞掉用户还没被受理的消息**）。
+    ///
+    /// retry 账的处置分两种情形：队列**非空**时不动（账目可能对应仍在排队的其它事件）；
+    /// 若本次丢弃把该频道排队内容**清空**，则一并清 `retry_after` / `retry_counts`——
+    /// 留着会让 `flush_next` 的退避判据把后续新消息静默拖到退避到期（同 `requeue()`
+    /// 死信臂与 `drain_channel()` 的口径）。
     pub fn drain_channel_tagged(&mut self, channel_id: Uuid, tag: &str) -> Vec<String> {
         let mut dropped = Vec::new();
         if let Some(q) = self.queues.get_mut(&channel_id) {

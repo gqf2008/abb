@@ -158,6 +158,11 @@ enum Cmd {
     /// **丢弃排队中的定时任务消息**（#309 PR-B）：只按 `prompt_tag ==
     /// crate::schedule::JOB_PROMPT_TAG` 过滤丢弃该频道的排队事件，**不动**用户消息、
     /// 也不动 in-flight 轮次。
+    ///
+    /// **已知残留**（follow-up #320）：只扫 `queues`，不扫 `withheld_native_steer`
+    ///（native steer ack 窗口）与 `cancelled_batches`（Steer 合并待重提示窗口，持续到该
+    /// 频道下次 flush）——job 消息落在这些窗口时 drop=0，之后 `cancel` 多半返回 false，
+    /// 停止词**有回执但 job 不会被停**（不是静默吞）。
     /// 排队中的 job 被丢弃后不会有任何回合结局，因此同时给同步 waiter 回取消终态
     /// （否则 run_job 要挂到超时）。reply 回被丢弃的条数。
     DropQueuedJobs {
@@ -356,7 +361,8 @@ impl BuzzHandle {
     }
 
     /// **丢弃排队中的定时任务消息**（#309 PR-B）：返回被丢弃条数；`None` = 句柄已关闭。
-    /// 只影响 `prompt_tag == "job_message"` 的排队事件，用户消息与在跑轮次不受影响。
+    /// 只影响 `prompt_tag == crate::schedule::JOB_PROMPT_TAG` 的排队事件，用户消息与
+    /// 在跑轮次不受影响。
     pub async fn drop_queued_jobs(&self, channel_id: Uuid) -> Option<usize> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx

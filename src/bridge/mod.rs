@@ -235,7 +235,8 @@ impl Bridge {
     ///
     /// 两种情况都算叫停成功：
     /// - **在跑**：`handle.cancel` 返回 `Some(true)`（信号送达在跑轮次）；
-    /// - **排队中**（#309 PR-B）：`drop_queued_jobs` 丢弃了 `prompt_tag="job_message"`
+    /// - **排队中**（#309 PR-B）：`drop_queued_jobs` 丢弃了
+    ///   `prompt_tag == crate::schedule::JOB_PROMPT_TAG`
     ///   的排队消息（只丢 job 消息，**不吞用户消息**）并给等待者回取消终态。
     ///
     /// 注意这里是 **best-effort**：A1 的语义是「自然完成优先」，极端竞速下（cancel 信号
@@ -255,7 +256,7 @@ impl Bridge {
             // 那个**在跑的别人的轮次**并返回 Some(true)；若据此就 continue，排队的 job
             // 反而没人处理、之后照跑（实测踩到过）。
             //
-            // 丢排队消息只按 `prompt_tag == "job_message"` 过滤，**不吞用户消息**。
+            // 丢排队消息只按 `prompt_tag == JOB_PROMPT_TAG` 过滤，**不吞用户消息**。
             let dropped = turn
                 .handle
                 .drop_queued_jobs(turn.channel_id)
@@ -3927,7 +3928,7 @@ mod tests {
                     // 断言 contains 会误报（实测踩到）。
                     text: "QUEUED_JOB_PAYLOAD_7f3a".to_string(),
                     ts_secs: 0,
-                    prompt_tag: "job_message".to_string(),
+                    prompt_tag: crate::schedule::JOB_PROMPT_TAG.to_string(),
                 },
                 std::time::Duration::from_secs(600),
             )
@@ -3974,6 +3975,14 @@ mod tests {
             out,
             crate::buzz::harness::SyncTurnOutcome::Cancelled,
             "排队中被丢弃的 job 必须拿到取消终态"
+        );
+
+        // 4b) 再丢一次必须是 0：确认上一步真的由 **drop 腿**处理掉了这条排队 job
+        //（而不是 cancel 腿命中占用者、job 仍留在队列里等下一次 flush）。
+        assert_eq!(
+            buzz.drop_queued_jobs(channel_id).await,
+            Some(0),
+            "被丢弃的排队 job 不应再次出现在队列里"
         );
 
         bridge.unregister_job_turn("job-queued-1");
