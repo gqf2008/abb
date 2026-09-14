@@ -8,6 +8,12 @@ rec_file = os.environ.get("MOCK_RECORD_FILE", "/tmp/mock-acp-record.jsonl")
 with open(rec_file, "a") as _f:
     _f.write(json.dumps({"event": "started"}) + "\n")
 
+# 模拟「冷启动 / 高负载」下的慢启动：在应答 initialize 之前先睡一会儿。
+# 供 #309 的端到端用例确定性复现「登记可见 ≠ 回合已在跑」的时序窗口。
+_delay_ms = int(os.environ.get("MOCK_STARTUP_DELAY_MS", "0") or "0")
+if _delay_ms > 0:
+    time.sleep(_delay_ms / 1000.0)
+
 def record(entry):
     with open(rec_file, "a") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")

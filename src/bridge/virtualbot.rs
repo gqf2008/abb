@@ -365,7 +365,13 @@ impl Bridge {
             // #309：该 chat 上有定时任务轮次在跑 → 送到**它自己的** handle 与 channel。
             // 只有确实命中在跑轮次（Some(true)）才算叫停成功：queued/已完成返回 false，
             // 此时不能吞掉这条指令（否则就是「假取消」，用户以为停了其实还在跑）。
+            //
+            // 显式命令要**有回执**（`/cancel` 的既有契约是「有任务必答」）：job 侧是静默
+            // 收尾、不会自己发消息，所以这里补一句；自然停止词则保持静默（见下）。
             if self.cancel_job_turns(&ev).await {
+                if let Err(e) = self.send_reply(&ev, "⏹ 已叫停当前定时任务。").await {
+                    crate::log!("[bridge] /cancel 定时任务回执发送失败: {e:#}");
+                }
                 return;
             }
             // #124 团队创建流程进行中：/cancel 也中止（WaitingGoal/WaitingConfirm 通用），

@@ -236,6 +236,9 @@ impl Bridge {
     /// 注意这里是 **best-effort**：A1 的语义是「自然完成优先」，极端竞速下（cancel 信号
     /// 发出时该轮其实已以 `Ok` 收尾）任务仍会正常投递结果，而用户的「停」不会得到回复。
     /// queued 取消见 #309 PR-B。
+    ///
+    /// 语义是**一停全停**：该 chat 上所有在跑的 job 轮次都会被叫停（停止词不带任务 id，
+    /// 无法区分「停哪一个」）。
     pub(crate) async fn cancel_job_turns_for_chat(&self, chat_id: &str) -> bool {
         let turns = self.job_turns_for_chat(chat_id);
         let mut cancelled = false;
@@ -3737,7 +3740,13 @@ mod tests {
             rec.clone(),
             &registry,
             None,
-            vec![("MOCK_HANG_PROMPT".to_string(), "1".to_string())],
+            vec![
+                ("MOCK_HANG_PROMPT".to_string(), "1".to_string()),
+                // 确定性复现「慢启动」：agent 延迟应答 initialize。旧等待条件
+                // （只等登记出现）在这个窗口里发停止词会落回透传 → 用例假红；
+                // 现等待条件（等 agent 记录到 prompt）不受影响。
+                ("MOCK_STARTUP_DELAY_MS".to_string(), "1200".to_string()),
+            ],
         );
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
@@ -3769,13 +3778,28 @@ mod tests {
             crate::service::run_job_for_test(b, router, job).await;
         });
 
-        // 等登记出现 = run_job 已 dispatch、回合在跑
+        // 等「回合确已 in-flight」——注意**不能只等登记出现**：`register_job_turn` 发生在
+        // `wait_turn_outcome`（→ push_message → run_loop 懒启动 agent → dispatch_pending
+        // 建 task_map 条目）**之前**，登记可见 ≠ 回合在跑。慢启动（冷启动/高负载 runner）
+        // 下若此时发停止词，`handle.cancel` 命中不到在跑任务 → 返回 Some(false) → 停止词
+        // 落回普通消息透传（queued 语义）→ job 挂到硬上限 → 本用例假红。
+        //
+        // 以 mock agent 是否**记录到 prompt** 为准：记录必发生在 task_map 建条目之后，
+        // 故该条件成立即保证 handle.cancel 返回 Some(true)。
         let mut waited_ms = 0u64;
-        while bridge.job_turns_for_chat(&chat_id).is_empty() {
-            assert!(waited_ms < 20_000, "job 未进入登记表（未 dispatch？）");
+        while read_prompts(&rec).is_empty() {
+            assert!(
+                waited_ms < 20_000,
+                "job prompt 未被 agent 接收（未 dispatch）"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             waited_ms += 50;
         }
+        // 登记也应已就位（run_job 先登记再 dispatch）
+        assert!(
+            !bridge.job_turns_for_chat(&chat_id).is_empty(),
+            "dispatch 后应有 job 登记"
+        );
 
         // 走**生产的停止词入口**：Bridge::handle → is_cancel_keyword →
         // cancel_flags 检查 → cancel_job_turns_for_chat。
