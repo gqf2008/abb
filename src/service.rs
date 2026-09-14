@@ -1290,18 +1290,17 @@ fn job_prompt(job: &crate::schedule::Job, bot_key: &str) -> String {
 /// - **`Closed`：等待者被同会话更新的任务顶替（每 channel 一个 waiter 槽）、或句柄已
 ///   关闭（服务在关停）——这**不是**「agent 无回复」**，不能共用超时文案（#321）。
 ///   静默收尾：被顶替时那一轮的真实结果由接管它的等待者负责投递，本轮再发一条只会重复；
-/// - `Failed(reason)`：沿用既有超时文案（不在本改动范围内顺带改文案）。
+/// - `Failed(reason)`：agent 终态失败（认证失效/多次重试耗尽等，由 `notify_channel`
+///   旁路回传）——**不是**「agent 无回复」，带原因回报而非复用超时文案（#321 同类的误标）。
+///
+/// 本函数**无副作用**（纯映射）；Closed 的诊断日志由调用方打。
 fn job_outcome_reply(outcome: &crate::buzz::harness::SyncTurnOutcome) -> Option<String> {
     use crate::buzz::harness::SyncTurnOutcome as O;
     match outcome {
         O::Ok(text) => Some(text.clone()),
-        O::Cancelled | O::Closed => {
-            if matches!(outcome, O::Closed) {
-                crate::log!("[job] 轮次等待者已被顶替或句柄关闭（Closed）→ 静默收尾，不发超时文案");
-            }
-            None
-        }
-        O::Timeout | O::Failed(_) => Some("⏰ 定时任务执行超时（agent 无回复）".to_string()),
+        O::Cancelled | O::Closed => None,
+        O::Timeout => Some("⏰ 定时任务执行超时（agent 无回复）".to_string()),
+        O::Failed(reason) => Some(format!("⏰ 定时任务执行失败：{reason}")),
     }
 }
 
@@ -1437,6 +1436,14 @@ async fn run_job(
                     // 超时臂要在途叫停（防真回复迟发成第二条消息）；Closed/Cancelled 不需要。
                     if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Timeout) {
                         let _ = h.cancel(channel_id).await;
+                    }
+                    if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Closed) {
+                        // 等待者被同会话更新的任务顶替（每 channel 一个 waiter 槽），
+                        // 或句柄已关闭（服务在关停）——都不是「agent 没回」，静默收尾。
+                        crate::log!(
+                            "[bot:{bot_key}] 任务 {} 的等待者已被顶替或句柄已关闭 → 静默收尾（不发超时文案）",
+                            &job.id[..8]
+                        );
                     }
                     job_outcome_reply(&outcome)
                 }
@@ -1923,8 +1930,8 @@ mod tests {
         );
         assert_eq!(
             job_outcome_reply(&O::Failed("boom".to_string())),
-            Some("⏰ 定时任务执行超时（agent 无回复）".to_string()),
-            "Failed 沿用既有文案（不在本改动范围内顺带改）"
+            Some("⏰ 定时任务执行失败：boom".to_string()),
+            "Failed 是「终态失败」→ 带原因回报，不得复用超时文案"
         );
     }
 

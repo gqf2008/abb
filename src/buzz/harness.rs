@@ -132,9 +132,12 @@ pub enum SyncTurnOutcome {
     /// 调用方预算先到（在途回合可能仍在跑——调用方负责 cancel 防迟发）。
     Timeout,
     /// 句柄已关闭，消息 push 不进主循环。另见 `wait_turn_outcome` 的
-    /// `Ok(None)` 臂：同 channel_id 并发两次等待时后注册者顶替前者，
-    /// 被顶替方的回传端消失也归本臂（当前调用方 job 每 chat 串行 /
-    /// oneshot fresh Uuid，触不到；与旧实现同构）。
+    /// `Ok(None)` 臂：同 channel_id 并发两次等待时后注册者**顶替**前者，
+    /// 被顶替方的回传端消失也归本臂。
+    ///
+    /// **可达**：调度按 `job.id` 防重入，同一 chat 的两条 job 可并发进入 `run_job`
+    /// 并共用同一 channel → 后登记那条顶掉在跑那条的 waiter（#321）。job 侧对
+    /// `Closed` 的处理见 `service::job_outcome_reply`（静默收尾，不复用超时文案）。
     Closed,
     /// 取消**终态**（#309 PR-A1）：该轮以取消收尾，且其批次已被丢弃、不会重提示
     /// ——不是「取消信号已发出」这种中间态。与 Timeout 同款 teardown 已完成。
