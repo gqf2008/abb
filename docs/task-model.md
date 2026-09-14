@@ -47,7 +47,9 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 **B. 同 channel 的等待者只有一个**
 
-`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/buzz/harness.rs:287-301`）：同一 channel 上多个等待者会互相顶掉；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递（`src/buzz/harness.rs:1036-1043`）。
+`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/buzz/harness.rs:287-301`）：同一 channel 上多个等待者会**互相顶掉**（后登记者接管，前者拿到 `Closed`）；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递。
+
+> 现状（#321）：同 chat **并发两条 job** 时，后登记那条会顶掉在跑那条的 waiter。job 侧已按 #321 处理——`Closed` 不再复用「执行超时」文案（那是误导），改为**静默收尾**（被顶替那一轮的真实结果由接管它的等待者投递，避免重复）。彻底修法（waiter 多路化 / 或每 job 独立 channel）与执行容量决策（Q7）一起定，见 #321。
 
 **C. 会话上下文挂在哪**
 
