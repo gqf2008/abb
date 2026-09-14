@@ -177,7 +177,7 @@ jobs:
             if [ -n "$OBJDUMP" ]; then
               for f in target/release/agent-bridge.exe crates/buzz-agent/target/release/buzz-agent.exe; do
                 echo "── $f 的导入表："
-                "$OBJDUMP" -p "$f" | grep "DLL Name" || true
+                "$OBJDUMP" -p "$f" | grep -i "DLL Name" || true
               done
             fi
           fi

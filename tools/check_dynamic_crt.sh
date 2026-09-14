@@ -22,8 +22,12 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-# 只列**来自 Redist** 的那些；ucrtbase 是 Windows 自带组件，不在此列。
-FORBIDDEN=("VCRUNTIME140.dll" "VCRUNTIME140_1.dll" "MSVCP140.dll")
+# 只列**来自 Redist** 的那些，且用**前缀**匹配（审查 B1）：
+# `MSVCP140.dll` 之外还有 `MSVCP140_1.dll` / `_2.dll`（VS2017+ 拆分的 STL），
+# `VCRUNTIME140.dll` 之外有 `VCRUNTIME140_1.dll`；按精确文件名列举会漏报这些变体。
+# 前缀查 `VCRUNTIME140` 同时覆盖 `.dll` 与 `_1.dll` 两种形态。
+# ucrtbase 不在列：它是 Windows 自带组件（且 /MT 会把静态 UCRT 一起链进去）。
+FORBIDDEN=("VCRUNTIME140" "MSVCP140" "CONCRT140")
 
 fail=0
 for f in "$@"; do
@@ -34,7 +38,7 @@ for f in "$@"; do
   hits=""
   for pat in "${FORBIDDEN[@]}"; do
     # -a：把二进制当文本搜（Git Bash 的 grep 也认）；命中即记下。
-    if LC_ALL=C grep -q -a -- "$pat" "$f" 2>/dev/null; then
+    if LC_ALL=C grep -q -i -a -- "$pat" "$f" 2>/dev/null; then
       hits="$hits $pat"
     fi
   done
