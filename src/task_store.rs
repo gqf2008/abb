@@ -368,6 +368,10 @@ impl TaskPaths {
 /// 进程写、service 靠它看到新任务），写盘走「唯一 tmp 名 + rename」的原子替换。
 pub struct TaskStore {
     paths: TaskPaths,
+    /// 本 store 归属的 bot（目录名）。`add` 校验定义里的 `bot_key` 与它一致：
+    /// 否则手改 JSON 就能把任务挂到别的 bot 名下，执行侧按 bot 选的受限/全权限
+    /// 剖面也会跟着被带偏（安全审查：剖面判据已改用 worker 的 bot_key，这里是第二道）。
+    bot_key: String,
     data: Mutex<Vec<Task>>,
     loaded_mtime: Mutex<Option<std::time::SystemTime>>,
 }
@@ -380,6 +384,7 @@ impl TaskStore {
         let mtime = mtime_of(&paths.definitions());
         TaskStore {
             paths,
+            bot_key: bot_key.to_string(),
             data: Mutex::new(data),
             loaded_mtime: Mutex::new(mtime),
         }
@@ -405,6 +410,13 @@ impl TaskStore {
     /// 登记一条任务。校验失败 / id 重复 → Err（不覆盖已有定义）。
     pub fn add(&self, task: Task) -> Result<()> {
         task.validate()?;
+        if task.bot_key != self.bot_key {
+            bail!(
+                "任务归属（{}）与所在 bot 目录（{}）不一致——不接受跨 bot 的任务定义",
+                task.bot_key,
+                self.bot_key
+            );
+        }
         self.refresh();
         let mut d = self.data.lock().unwrap();
         if d.iter().any(|t| t.id == task.id) {

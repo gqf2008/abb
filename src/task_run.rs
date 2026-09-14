@@ -116,20 +116,14 @@ async fn run_one(
     }
 
     let started = crate::chrono_lite::unix_secs();
-    let _ = states.set(
-        &id,
-        TaskRuntime {
-            kind: TaskStateKind::Running,
-            started_at: Some(started),
-            ..Default::default()
-        },
-    );
+    let prev = states.get(&id);
+    let _ = states.set(&id, claim(&prev, started));
     crate::log!(
         "[task:{bot_key}] {short} 开跑（workspace={}）",
         task_workspace(bot_key, &task)
     );
 
-    let agent_cfg = agent_cfg_for_task(bot, cfg, &task);
+    let agent_cfg = agent_cfg_for_task(bot, cfg, &task, bot_key);
     let workspace = task_workspace(bot_key, &task);
     run_attempt(bot_key, task, agent_cfg, workspace, router, states, stop).await;
 }
@@ -170,6 +164,9 @@ pub(crate) async fn run_attempt(
     .await;
 
     let finished = crate::chrono_lite::unix_secs();
+    // 终态也要带住 restarts（否则 `task status` 看不到重跑过几次）。
+    let prev = states.get(&id);
+    let restarts = prev.restarts;
     let (rt, text) = match outcome {
         crate::buzz::harness::SyncTurnOutcome::Ok(text) => (
             TaskRuntime {
@@ -177,6 +174,7 @@ pub(crate) async fn run_attempt(
                 started_at: Some(started),
                 finished_at: Some(finished),
                 last_exit_code: Some(0),
+                restarts,
                 ..Default::default()
             },
             text,
@@ -187,6 +185,7 @@ pub(crate) async fn run_attempt(
                 started_at: Some(started),
                 finished_at: Some(finished),
                 last_error: "已取消".to_string(),
+                restarts,
                 ..Default::default()
             },
             String::new(),
@@ -197,6 +196,7 @@ pub(crate) async fn run_attempt(
                 started_at: Some(started),
                 finished_at: Some(finished),
                 last_error: format!("执行超时（预算 {}s）", budget.as_secs()),
+                restarts,
                 ..Default::default()
             },
             String::new(),
@@ -207,6 +207,7 @@ pub(crate) async fn run_attempt(
                 started_at: Some(started),
                 finished_at: Some(finished),
                 last_error: "agent 不可用（执行器未能拉起）".to_string(),
+                restarts,
                 ..Default::default()
             },
             String::new(),
@@ -217,6 +218,7 @@ pub(crate) async fn run_attempt(
                 started_at: Some(started),
                 finished_at: Some(finished),
                 last_error: reason.clone(),
+                restarts,
                 ..Default::default()
             },
             String::new(),
@@ -257,10 +259,10 @@ pub(crate) async fn run_attempt(
         crate::log!("[task:{bot_key}] {short} 无投递目标（创建者会话为空），结果未发送");
         return;
     };
+    // 注意：这里没有「已取消」抬头——见上 `if cancelled { return; }` 的说明，
+    // 今天唯一能产生 Cancelled 的路径是关停联动，它压根走不到投递。
     let header = if failed {
         "⚠️ 后台任务失败".to_string()
-    } else if cancelled {
-        "🛑 后台任务已取消".to_string()
     } else {
         format!("🤖 后台任务完成：{}", task.display_name())
     };
@@ -290,6 +292,21 @@ pub(crate) async fn run_attempt(
     router.deliver(&item).await;
 }
 
+/// 认领一条任务：把运行态推进到 `Running`。
+///
+/// **必须把 `restarts` 带走**。这里原先是 `..Default::default()`——认领即把计数清零，
+/// 于是 `requeue_orphans` 的上界判定 `rt.restarts < max_restarts` 永远成立，
+/// 「有界重跑」在生产路径上失效（崩溃 → 重启 → 归位 → 认领清零 → 再崩 → 无限）。
+/// 单测直接锁这个纯函数，防「测试里手工构造 restarts 所以绿、生产里被清零」再次发生。
+fn claim(prev: &TaskRuntime, started: u64) -> TaskRuntime {
+    TaskRuntime {
+        kind: TaskStateKind::Running,
+        started_at: Some(started),
+        restarts: prev.restarts,
+        ..Default::default()
+    }
+}
+
 /// **选执行剖面并装配 agent 配置**——这是「这条任务用什么权限跑」的唯一定点。
 ///
 /// 安全审查 B1：剖面必须按**创建者角色**选，不能一律用 owner 的内部任务配置。
@@ -300,8 +317,12 @@ fn agent_cfg_for_task(
     bot: &crate::config::BotConfig,
     cfg: &crate::config::Config,
     task: &Task,
+    bot_key: &str,
 ) -> crate::buzz::harness::AgentConfig {
-    let restricted = crate::config::restrict_granted(task.created_by.role, task.bot_key.as_str());
+    // 用 **worker 自己的 bot_key**（不是定义文件里的 `task.bot_key`）判剖面：定义文件
+    // 可被手改，拿它当判据的话，改成一台 `restrict_granted_agent = false` 的 bot
+    // 就能选到更松的档。`TaskStore::add` 另有一道「归属必须与所在目录一致」的校验。
+    let restricted = crate::config::restrict_granted(task.created_by.role, bot_key);
     crate::service::oneshot_agent_config_for_role(bot, cfg, restricted)
 }
 
@@ -473,7 +494,7 @@ mod tests {
 
         let mut g = now_task(bot_key, "tk_g", "c");
         g.created_by.role = crate::config::SenderRole::Granted;
-        let gc = agent_cfg_for_task(&bot, &cfg, &g);
+        let gc = agent_cfg_for_task(&bot, &cfg, &g, bot_key);
         let sb = gc
             .session_sandbox
             .expect("granted 任务必须有档位载荷（None = FullAccess，等于提权）");
@@ -488,7 +509,7 @@ mod tests {
 
         let mut o = g.clone();
         o.created_by.role = crate::config::SenderRole::Owner;
-        let oc = agent_cfg_for_task(&bot, &cfg, &o);
+        let oc = agent_cfg_for_task(&bot, &cfg, &o, bot_key);
         assert!(
             oc.session_sandbox.is_none(),
             "owner 任务不该被额外收紧（默认档位 Auto → None）"
@@ -709,6 +730,59 @@ mod tests {
         assert!(log.contains("Succeeded"), "日志要落盘：{log}");
 
         let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查 B3 的**真正的**回归锁：认领（`claim`）不得清空 `restarts`。
+    ///
+    /// 上一版把归位侧写对了，但 `run_one` 认领时用 `..Default::default()` 把计数
+    /// 清零 → 上界在生产路径上永不触发，而当时的用例**手工构造 restarts**、从不
+    /// 经过认领，所以照样绿。这里直接锁认领这一步。
+    #[test]
+    fn claim_preserves_restarts() {
+        let prev = TaskRuntime {
+            kind: TaskStateKind::Pending,
+            restarts: 3,
+            ..Default::default()
+        };
+        let rt = claim(&prev, 1_700_000_000);
+        assert_eq!(rt.kind, TaskStateKind::Running);
+        assert_eq!(rt.restarts, 3, "认领必须带着计数，否则重跑上界永远到不了");
+        assert_eq!(rt.started_at, Some(1_700_000_000));
+    }
+
+    /// 端到端循环：`归位 → 认领 → 中断 → 归位`，`max_restarts = 1` 时第二步必须落
+    /// Failed。走的是真实状态机（不再手工跳过认领），所以能挡住「计数被清零」这类回归。
+    #[test]
+    fn rerun_bound_holds_across_claim_cycle() {
+        let bot = format!("tcycle-{}", std::process::id());
+        let paths = crate::task_store::TaskPaths::for_bot(&bot);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+        let store = TaskStore::new(&bot);
+        let states = TaskStateStore::new(&bot);
+        let mut t = now_task(&bot, "tk_cycle", "c");
+        t.limits.max_restarts = 1;
+        store.add(t).unwrap();
+
+        // 第 1 次中断（进程重启时残留 Running）
+        states
+            .set("tk_cycle", claim(&TaskRuntime::default(), 1))
+            .unwrap();
+        requeue_orphans(&store, &states);
+        assert_eq!(states.get("tk_cycle").kind, TaskStateKind::Pending);
+        assert_eq!(states.get("tk_cycle").restarts, 1);
+
+        // worker 认领（真实路径）
+        let prev = states.get("tk_cycle");
+        states.set("tk_cycle", claim(&prev, 2)).unwrap();
+        assert_eq!(states.get("tk_cycle").restarts, 1, "认领不得清零");
+
+        // 第 2 次中断 → 已达上限，落 Failed 且不再被认领
+        requeue_orphans(&store, &states);
+        let rt = states.get("tk_cycle");
+        assert_eq!(rt.kind, TaskStateKind::Failed);
+        assert!(next_pending(&store, &states).is_none(), "Failed 不该被认领");
+
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
