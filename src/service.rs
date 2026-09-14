@@ -474,6 +474,19 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = crate::tasks::shutdown_token();
         let router = router.clone();
+        // 任务执行 worker（#326 P2b / #306）：每 bot 一个，串行认领 = Q7 的「超限排队」。
+        // 执行层是 `buzz::oneshot`（自起 handle）——这正是 Q7 拍板的 B1「task 独立 handle」，
+        // 所以任务不会占聊天句柄的 slot（后台任务跑着，聊天照常回）。
+        {
+            let bot = bot.clone();
+            let cfg = cfg.clone();
+            let router = router.clone();
+            let stop = crate::tasks::shutdown_token();
+            let name: &'static str = Box::leak(format!("task:{}", bot.key()).into_boxed_str());
+            crate::tasks::tasks().spawn_forever(name, async move {
+                crate::task_run::task_worker(bot, cfg, router, stop).await;
+            });
+        }
         // ACP 执行层命令（随包 buzz-agent；None=开发/自签无随包 → run_bot 内落
         // PATH pi-acp 全路径兜底）。句柄对按 bot 在 run_bot 内构造（P2.1）。
         let buzz_cmd = buzz_cmd.clone();

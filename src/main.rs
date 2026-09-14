@@ -36,6 +36,8 @@ mod session_manage;
 mod session_state;
 mod sessions;
 mod single_instance;
+mod task_run;
+mod task_store;
 mod tasks;
 mod teambuilder;
 mod teamflow;
@@ -377,6 +379,15 @@ fn main() {
     // chat_id 从 AGENT_BRIDGE_CHAT_ID env 读（桥 spawn claude 时注入），缺省回落主会话。
     if args.len() >= 2 && args[1] == "job" {
         std::process::exit(run_job_cli(&args[2..]));
+    }
+
+    // 任务 CLI（#326 / #306）：`agent-bridge task <子命令>`。
+    //   task add --prompt "做什么" [--name 名字] [--cwd 路径] [--timeout-secs N]
+    //   task list | task status <id前缀> | task logs <id前缀> [--tail N] | task rm <id前缀>
+    // 与 job 的差别：任务**不等时刻**——登记后由 service 的 task worker 立刻认领执行
+    // （trigger=now 的 agent 任务就是「后台子代理」，跑在自己的 handle 上、不占聊天 slot）。
+    if args.len() >= 2 && args[1] == "task" {
+        std::process::exit(run_task_cli(&args[2..]));
     }
 
     // guard-check：claude PreToolUse hook 的决策子进程（授权者受限会话的强制闸）。
@@ -754,6 +765,290 @@ fn resolve_bot_key() -> Result<String, String> {
         n => Err(format!(
             "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请设该环境变量为某个 bot 的 name）"
         )),
+    }
+}
+
+/// 任务 CLI（#326 / #306）。退出码 0=成功 1=失败。
+///
+/// 与 `job` 的分工：`job` 是「到点唤起一个回合」，本命令是「**立刻**登记一个后台任务」——
+/// 登记后不阻塞调用方，由 service 的 task worker 认领执行，结果回创建者会话。
+fn run_task_cli(args: &[String]) -> i32 {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    let bot_key = match resolve_bot_key() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let store = task_store::TaskStore::new(&bot_key);
+    let states = task_store::TaskStateStore::new(&bot_key);
+    match sub {
+        "list" => {
+            let tasks = store.list();
+            if tasks.is_empty() {
+                println!("（还没有任务）");
+                return 0;
+            }
+            for t in &tasks {
+                let rt = states.get(&t.id);
+                println!(
+                    "{}  {}  [{:?}]  {}",
+                    t.id,
+                    t.display_name(),
+                    rt.kind,
+                    describe_trigger(&t.trigger)
+                );
+            }
+            0
+        }
+        "status" => {
+            let Some(t) = resolve_task(&store, args.get(1)) else {
+                return 1;
+            };
+            let rt = states.get(&t.id);
+            println!("id        = {}", t.id);
+            println!("name      = {}", t.display_name());
+            println!("bot       = {}", t.bot_key);
+            println!("载荷      = {:?}", t.payload.kind);
+            println!("触发      = {}", describe_trigger(&t.trigger));
+            println!(
+                "创建者    = {} / {}（角色 {}）",
+                t.created_by.bot_key,
+                t.created_by.chat_id,
+                t.created_by.role.as_str()
+            );
+            println!("运行态    = {:?}", rt.kind);
+            if let Some(s) = rt.started_at {
+                println!("开始      = {s}");
+            }
+            if let Some(f) = rt.finished_at {
+                println!("结束      = {f}");
+            }
+            if let Some(c) = rt.last_exit_code {
+                println!("退出码    = {c}");
+            }
+            if !rt.last_error.is_empty() {
+                println!("最近错误  = {}", rt.last_error);
+            }
+            let log = task_store::TaskPaths::for_bot(&bot_key).log_file(&t.id);
+            if log.exists() {
+                println!("日志      = {}", log.display());
+            }
+            0
+        }
+        "logs" => {
+            let Some(t) = resolve_task(&store, args.get(1)) else {
+                return 1;
+            };
+            // --tail N（缺省 200 行）
+            let mut tail = 200usize;
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--tail" {
+                    match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                        Some(n) => tail = n,
+                        None => {
+                            eprintln!("--tail 需要一个数字");
+                            return 1;
+                        }
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let path = task_store::TaskPaths::for_bot(&bot_key).log_file(&t.id);
+            match std::fs::read_to_string(&path) {
+                Ok(body) => {
+                    let lines: Vec<&str> = body.lines().collect();
+                    let start = lines.len().saturating_sub(tail);
+                    for l in &lines[start..] {
+                        println!("{l}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("读日志失败（{}）：{e}", path.display());
+                    1
+                }
+            }
+        }
+        // del 是 rm 的别名（job 用的是 del，两边都认，减少踩空）
+        "rm" | "del" => {
+            let Some(t) = resolve_task(&store, args.get(1)) else {
+                return 1;
+            };
+            // 运行中的任务不允许直接删定义：worker 还在跑，删了定义会让结局无处落
+            // （状态文件会变成孤儿）。先 cancel 或等它跑完。
+            let rt = states.get(&t.id);
+            if rt.kind == task_store::TaskStateKind::Running {
+                eprintln!(
+                    "任务 {} 正在运行，不能直接删除（等它跑完，或先让 service 停止）",
+                    t.id
+                );
+                return 1;
+            }
+            store.remove(&t.id);
+            let _ = states.remove(&t.id);
+            let _ = std::fs::remove_file(task_store::TaskPaths::for_bot(&bot_key).log_file(&t.id));
+            println!("已删除任务 {}", t.id);
+            0
+        }
+        "add" => {
+            let mut prompt: Option<String> = None;
+            let mut name = String::new();
+            let mut cwd = String::new();
+            let mut timeout_secs = task_store::DEFAULT_TIMEOUT_SECS;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--prompt" | "--text" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--prompt 缺内容");
+                            return 1;
+                        };
+                        prompt = Some(v.clone());
+                        i += 2;
+                    }
+                    "--name" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--name 缺内容");
+                            return 1;
+                        };
+                        name = v.clone();
+                        i += 2;
+                    }
+                    "--cwd" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--cwd 缺路径");
+                            return 1;
+                        };
+                        cwd = v.clone();
+                        i += 2;
+                    }
+                    "--timeout-secs" => {
+                        match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                            Some(n) => timeout_secs = n,
+                            None => {
+                                eprintln!("--timeout-secs 需要一个数字（0 = 不限）");
+                                return 1;
+                            }
+                        }
+                        i += 2;
+                    }
+                    other => {
+                        eprintln!("task add 不认识的参数：{other}");
+                        return 1;
+                    }
+                }
+            }
+            let Some(prompt) = prompt else {
+                eprintln!("用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N]");
+                return 1;
+            };
+            // 创建者会话：桥注入的 env（任务结果默认回这里，见 D2）。
+            let chat_id = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+            let task = task_store::Task {
+                schema_version: task_store::TASK_SCHEMA_VERSION,
+                id: task_store::new_id(chrono_lite::unix_secs()),
+                name,
+                bot_key: bot_key.clone(),
+                created_by: task_store::CreatedBy {
+                    role: config::SenderRole::from_env(),
+                    bot_key: bot_key.clone(),
+                    chat_id,
+                },
+                payload: task_store::TaskPayload {
+                    kind: task_store::PayloadKind::Agent,
+                    prompt,
+                    cwd,
+                    cmd: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                },
+                trigger: task_store::TaskTrigger {
+                    kind: task_store::TriggerKind::Now,
+                    expr: String::new(),
+                    timezone: String::new(),
+                },
+                delivery: task_store::TaskDelivery::default(),
+                limits: task_store::TaskLimits {
+                    timeout_secs,
+                    ..Default::default()
+                },
+            };
+            match store.add(task.clone()) {
+                Ok(()) => {
+                    // 运行态显式落 Pending：worker 只认「定义存在 + 状态 Pending」，
+                    // 没有状态行时 get() 也返回默认 Pending，两处等价、不靠隐式。
+                    let _ = states.set(&task.id, task_store::TaskRuntime::default());
+                    println!(
+                        "🤖 后台任务已登记：{}（{}）\n   执行状态：agent-bridge task status {}\n   结果回创建者会话（若 service 未运行则不会开跑）",
+                        task.id,
+                        task.display_name(),
+                        task.id
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("登记失败：{e}");
+                    1
+                }
+            }
+        }
+        other => {
+            if !other.is_empty() {
+                eprintln!("task 不认识的子命令：{other}");
+            }
+            eprintln!(
+                "用法：agent-bridge task <list|status|logs|rm|add> …\n\
+                 \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N]\n\
+                 \n  task list                         列出本 bot 的任务\n\
+                 \n  task status <id前缀>              看一条任务的详情与运行态\n\
+                 \n  task logs <id前缀> [--tail N]     看任务日志（缺省末 200 行）\n\
+                 \n  task rm <id前缀>                  删除任务（运行中不允许）"
+            );
+            1
+        }
+    }
+}
+
+/// 把触发档渲染成人话（列表/详情共用）。
+fn describe_trigger(t: &task_store::TaskTrigger) -> String {
+    match t.kind {
+        task_store::TriggerKind::Now => "立即".to_string(),
+        task_store::TriggerKind::Once => format!("一次性 {}", t.expr),
+        task_store::TriggerKind::Cron => format!("周期 {}", t.expr),
+        task_store::TriggerKind::Interval => format!("每 {} 秒", t.expr),
+        task_store::TriggerKind::Keepalive => "常驻".to_string(),
+    }
+}
+
+/// 按 id 前缀解析出唯一一条任务（沿用 job 的前缀语义：0 条/多条都报错）。
+fn resolve_task(
+    store: &task_store::TaskStore,
+    prefix: Option<&String>,
+) -> Option<task_store::Task> {
+    let prefix = prefix.map(|s| s.trim()).unwrap_or("");
+    if prefix.is_empty() {
+        eprintln!("用法：agent-bridge task <status|logs|rm> <id前缀>（用 task list 查看 id）");
+        return None;
+    }
+    let hit: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|t| t.id.starts_with(prefix))
+        .collect();
+    match hit.len() {
+        0 => {
+            eprintln!("没找到 id 以「{prefix}」开头的任务");
+            None
+        }
+        1 => Some(hit.into_iter().next().unwrap()),
+        n => {
+            eprintln!("「{prefix}」匹配到 {n} 个任务，请给更长的 id 前缀");
+            None
+        }
     }
 }
 
