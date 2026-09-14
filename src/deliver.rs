@@ -39,8 +39,10 @@ pub struct DeliveryItem {
     /// 附件元数据（#21 附件跨投递）：转发本地路径/元数据，接收端按能力处理。
     #[serde(default)]
     pub attachments: Vec<crate::attachments::AttachmentMeta>,
-    /// 来源定时任务 id（#21）：非空 = 定时任务投递，跳过防循环去重（周期任务是合法重复），
-    /// 也豁免 Router 自环拒绝（任务回发本 bot 原会话是既有行为）。
+    /// 来源**计划类**任务 id（#21 定时任务；#326 起 `tk_*` 后台任务也从这里流过——
+    /// 复用同一口径是因为语义相同：非空 = 跳过防循环去重（周期任务/重跑任务是合法重复），
+    /// 也豁免 Router 自环拒绝（回发本 bot 原会话是既有行为）。P1b 的 DeliveryOrigin
+    /// 落地后由那个枚举取代这个「借字段」）。
     #[serde(default)]
     pub job_id: String,
     /// 「发给当前会话」显式声明（CLI `--to-current`）：目标恒等于来源，语义是**发送**

@@ -123,9 +123,9 @@ pub fn check_restricted(command: &str, roots: &[PathBuf], abb_bin: Option<&str>)
     }
 }
 
-/// $ABB_BIN 子命令白名单（与 ABB CLI 参数形态同构）：job add / session reset
-///（不得指定其它 chat）/ deliver（--file 必须域内）。job list/del 会暴露/删除
-/// owner 任务——拒绝。
+/// $ABB_BIN 子命令白名单（与 ABB CLI 参数形态同构）：job add / task add / session reset
+///（不得指定其它 chat）/ deliver（--file 必须域内）。job list/del 与 task
+/// list/status/logs/rm 会暴露/删除 owner 任务——拒绝；task 的 proc 载荷一律拒绝（Q8）。
 fn check_abb_bin(rest: &[String], roots: &[PathBuf]) -> Decision {
     match rest.first().map(|s| s.as_str()) {
         Some("job") => {
@@ -141,6 +141,19 @@ fn check_abb_bin(rest: &[String], roots: &[PathBuf]) -> Decision {
             } else {
                 Decision::Deny("session 仅允许 reset（且不得指定其它 chat）".into())
             }
+        }
+        // 任务（#326）：与宿主 guard.rs 的 check_abb_bin 同构——只放行 add，
+        // 且不许 agent 建 proc 载荷（Q8：任意命令执行入口仅限 GUI/人工）。
+        Some("task") => {
+            if rest.get(1).map(|s| s.as_str()) != Some("add") {
+                return Decision::Deny(
+                    "task 仅允许 add（list/status/logs 会暴露任务内容，rm 可删任务）".into(),
+                );
+            }
+            if rest.iter().any(|a| a.starts_with("--proc") || a.starts_with("--cmd")) {
+                return Decision::Deny("不允许 agent 创建 proc 任务（Q8）".into());
+            }
+            Decision::Allow
         }
         Some("deliver") => {
             let mut i = 0;
@@ -337,6 +350,23 @@ mod tests {
             check_restricted("/usr/local/bin/agent-bridge job add 提醒", &r, abb),
             Decision::Allow
         );
+        // 任务（#326）：add 放行；list/logs/rm 拒绝；proc 载荷拒绝（Q8）
+        assert_eq!(
+            check_restricted("$ABB_BIN task add --prompt hi", &r, abb),
+            Decision::Allow
+        );
+        assert!(matches!(
+            check_restricted("$ABB_BIN task list", &r, abb),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            check_restricted("$ABB_BIN task rm tk_1", &r, abb),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            check_restricted("$ABB_BIN task add --proc --cmd pkill", &r, abb),
+            Decision::Deny(_)
+        ));
         assert_eq!(
             check_restricted("$ABB_BIN session reset", &r, abb),
             Decision::Allow
