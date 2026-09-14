@@ -294,6 +294,10 @@ pub(crate) async fn run_attempt(
 
 /// 认领一条任务：把运行态推进到 `Running`。
 ///
+/// **认领的唯一入口就是这里**（`run_one` 调它）：任何想写 `Running` 的地方都必须走
+/// 本函数，别再内联一个 `TaskRuntime { kind: Running, ..Default::default() }`——
+/// 那正是上一版把 `restarts` 清零、让重跑上界失效的写法。
+///
 /// **必须把 `restarts` 带走**。这里原先是 `..Default::default()`——认领即把计数清零，
 /// 于是 `requeue_orphans` 的上界判定 `rt.restarts < max_restarts` 永远成立，
 /// 「有界重跑」在生产路径上失效（崩溃 → 重启 → 归位 → 认领清零 → 再崩 → 无限）。

@@ -828,6 +828,8 @@ fn run_task_cli(args: &[String]) -> i32 {
             if let Some(c) = rt.last_exit_code {
                 println!("退出码    = {c}");
             }
+            // 重跑次数（#326 审查：中断后自动归位重跑是有上界的，得让人看得到用了几次）
+            println!("重跑次数  = {}", rt.restarts);
             if !rt.last_error.is_empty() {
                 println!("最近错误  = {}", rt.last_error);
             }
