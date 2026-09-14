@@ -1114,16 +1114,29 @@ fn av_state(sym: &std::ffi::CStr) -> PermState {
         }
         let f: unsafe extern "C" fn(Id, Sel, Id) -> i64 =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        match f(
+        let code = f(
             cls,
             sel_registerName(c"authorizationStatusForMediaType:".as_ptr()),
             media,
-        ) {
-            3 => PermState::Granted,
-            2 => PermState::Denied,
-            1 => PermState::Restricted,
-            _ => PermState::NotDetermined, // 0 / 未知
-        }
+        );
+        av_status_to_state(code)
+    }
+}
+
+/// AVAuthorizationStatus 数值 → [`PermState`] 的**纯**映射（0 NotDetermined / 1 Restricted /
+/// 2 Denied / 3 Authorized）。数值定义见 Apple `AVAuthorizationStatus`。
+///
+/// 单独抽出来的原因：这里曾经把 `1` 折进 `NotDetermined`，而 `camera_verdict` 又按
+/// 「`Restricted` 不弹框也抓不到」分支处理——状态压根产不出来，那条分支就成了死代码，
+/// 受限机器会被误判成「未授权 → TCC 继承不成立」。把映射做成纯函数 + 单测，
+/// 才能挡住「有人把 1 改回去」这类回归（光测 `camera_verdict` 的字符串输入测不到）。
+#[cfg(target_os = "macos")]
+fn av_status_to_state(code: i64) -> PermState {
+    match code {
+        3 => PermState::Granted,
+        2 => PermState::Denied,
+        1 => PermState::Restricted,
+        _ => PermState::NotDetermined, // 0 / 未知
     }
 }
 
@@ -1580,6 +1593,18 @@ mod tests {
         assert_eq!(state_of(Some(0)), PermState::NotDetermined);
         assert_eq!(state_of(None), PermState::NotDetermined);
         assert_eq!(state_of(Some(5)), PermState::NotDetermined); // 未知码按未授权
+    }
+
+    /// #305 Step 0：`AVAuthorizationStatus` 数值映射必须逐个钉死——尤其 `1` 必须是
+    /// `Restricted` 而非 `NotDetermined`（后者会让受限机器被误判成「未授权 → 继承不成立」）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn av_status_mapping_covers_apple_enum() {
+        assert_eq!(av_status_to_state(3), PermState::Granted);
+        assert_eq!(av_status_to_state(2), PermState::Denied);
+        assert_eq!(av_status_to_state(1), PermState::Restricted);
+        assert_eq!(av_status_to_state(0), PermState::NotDetermined);
+        assert_eq!(av_status_to_state(9), PermState::NotDetermined); // 未知码
     }
 
     #[test]

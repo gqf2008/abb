@@ -340,8 +340,17 @@ pub fn camera_probe(index: &str, out: &str) -> Result<(String, bool), String> {
     }
     // 该文件是规定调用方式下**唯一**的交付通道（open -n 起的实例 stdout/stderr 都是
     // /dev/null），写失败必须显式失败，不能静默。
-    std::fs::write(&log, &r).map_err(|e| format!("报告写入失败（{}）：{e}", log.display()))?;
-    r.push_str(&format!("\n（报告已写入 {}\n", log.display()));
+    if let Err(e) = std::fs::write(&log, &r) {
+        // 写盘失败 ≠ 抓帧失败：图可能已经成功落在 out 了，错误串必须带上结论与图片路径，
+        // 否则调用方会误读成「实验失败」。同时把报告打到 stdout，保住终端直跑
+        // （非 `open -n`）时仍能看到完整判定。
+        print!("{r}");
+        return Err(format!(
+            "报告写入失败（{}）：{e}；本次抓帧 ok={ok}，图见 {out}",
+            log.display()
+        ));
+    }
+    r.push_str(&format!("\n（报告已写入 {}\n）", log.display()));
     Ok((r, ok))
 }
 
