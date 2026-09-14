@@ -155,6 +155,20 @@ enum Cmd {
         channel_id: Uuid,
         reply: oneshot::Sender<bool>,
     },
+    /// **丢弃排队中的定时任务消息**（#309 PR-B）：只按 `prompt_tag ==
+    /// crate::schedule::JOB_PROMPT_TAG` 过滤丢弃该频道的排队事件，**不动**用户消息、
+    /// 也不动 in-flight 轮次。
+    ///
+    /// **已知残留**（follow-up #320）：只扫 `queues`，不扫 `withheld_native_steer`
+    ///（native steer ack 窗口）与 `cancelled_batches`（Steer 合并待重提示窗口，持续到该
+    /// 频道下次 flush）——job 消息落在这些窗口时 drop=0，之后 `cancel` 多半返回 false，
+    /// 停止词**有回执但 job 不会被停**（不是静默吞）。
+    /// 排队中的 job 被丢弃后不会有任何回合结局，因此同时给同步 waiter 回取消终态
+    /// （否则 run_job 要挂到超时）。reply 回被丢弃的条数。
+    DropQueuedJobs {
+        channel_id: Uuid,
+        reply: oneshot::Sender<usize>,
+    },
     /// 根频道全量同步（service 每 2s 从 vb 存储扫描）。diff 应用：新增
     /// 注册，消失的根频道排空队列、失效会话、其后的失败批次直接丢弃。
     SyncRoots(Vec<ChannelMeta>),
@@ -339,6 +353,20 @@ impl BuzzHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Cmd::Cancel {
+                channel_id,
+                reply: tx,
+            })
+            .ok()?;
+        rx.await.ok()
+    }
+
+    /// **丢弃排队中的定时任务消息**（#309 PR-B）：返回被丢弃条数；`None` = 句柄已关闭。
+    /// 只影响 `prompt_tag == crate::schedule::JOB_PROMPT_TAG` 的排队事件，用户消息与
+    /// 在跑轮次不受影响。
+    pub async fn drop_queued_jobs(&self, channel_id: Uuid) -> Option<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::DropQueuedJobs {
                 channel_id,
                 reply: tx,
             })
@@ -543,6 +571,17 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
                 l.cancel_requested.insert(channel_id);
             }
             let _ = reply.send(fired);
+        }
+        Cmd::DropQueuedJobs { channel_id, reply } => {
+            let dropped = l
+                .queue
+                .drain_channel_tagged(channel_id, crate::schedule::JOB_PROMPT_TAG);
+            if !dropped.is_empty() {
+                // 被丢弃的排队 job 不会再产生回合结局 → 主动给等待者取消终态，
+                // 让 run_job 立刻静默收尾（而不是挂到超时）。
+                let _ = deliver_sync_wait_msg(handle, channel_id, SyncWaitMsg::Cancelled);
+            }
+            let _ = reply.send(dropped.len());
         }
         Cmd::SyncRoots(roots) => {
             // diff：对比登记表里 thread_id == None 的根频道。

@@ -605,6 +605,43 @@ impl EventQueue {
         ids
     }
 
+    /// 丢弃该频道**排队中**（未在跑）且 `prompt_tag == tag` 的事件，返回被丢弃的 event id。
+    ///
+    /// 与 [`Self::drain_channel`] 的区别：**只按 tag 过滤**，不碰该频道其它排队事件
+    /// （典型用途 #309：停掉排队中的定时任务，但**不能吞掉用户还没被受理的消息**）。
+    ///
+    /// retry 账的处置分两种情形：队列**非空**时不动（账目可能对应仍在排队的其它事件）；
+    /// 若本次丢弃把该频道排队内容**清空**，则一并清 `retry_after` / `retry_counts`——
+    /// 留着会让 `flush_next` 的退避判据把后续新消息静默拖到退避到期（同 `requeue()`
+    /// 死信臂与 `drain_channel()` 的口径）。
+    pub fn drain_channel_tagged(&mut self, channel_id: Uuid, tag: &str) -> Vec<String> {
+        let mut dropped = Vec::new();
+        if let Some(q) = self.queues.get_mut(&channel_id) {
+            q.retain(|e| {
+                if e.msg.prompt_tag == tag {
+                    dropped.push(e.msg.id_hex.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        // 全空则摘掉该 channel 条目（与 push/flush 的空表语义一致，避免残留空队列）。
+        //
+        // **必须同时清 retry 账**：`requeue()` 会把失败批次推回 queues **并**置
+        // `retry_after`；若该频道排队内容只剩一条 job 消息（job 独占频道很常见），
+        // 这次丢弃就把队列清空了——此时退避/重试计数已无所指，留着会按 `flush_next`
+        // 的 `retry_after` 判据把**后续新消息**（含用户消息）静默拖到退避到期（最长
+        // MAX_RETRY_DELAY_SECS = 300s）。同 `requeue()` 死信臂与 `drain_channel()`
+        // 的口径：丢弃 poison batch 后不得用它的退避拖住新鲜流量。
+        if self.queues.get(&channel_id).is_some_and(|q| q.is_empty()) {
+            self.queues.remove(&channel_id);
+            self.retry_after.remove(&channel_id);
+            self.retry_counts.remove(&channel_id);
+        }
+        dropped
+    }
+
     /// Whether a prompt is currently in-flight for the given channel.
     pub fn is_channel_in_flight(&self, channel_id: Uuid) -> bool {
         self.in_flight_channels.contains(&channel_id)
@@ -1187,4 +1224,110 @@ impl MergeFraming {
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
     (framing.new_tag, framing.closing_note)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queued(channel_id: Uuid, id: &str, tag: &str) -> QueuedEvent {
+        QueuedEvent {
+            channel_id,
+            msg: InboundMsg {
+                id_hex: id.to_string(),
+                author_role: "user".to_string(),
+                text: format!("text-{id}"),
+                ts_secs: 0,
+                prompt_tag: tag.to_string(),
+            },
+            received_at: Instant::now(),
+        }
+    }
+
+    /// #309 PR-B：按 tag 丢弃排队事件时**只丢该 tag**，用户消息必须原样保留
+    /// （chat 的取消语义是「只停正在跑的那一轮，不吞用户还没被受理的消息」）。
+    #[test]
+    fn drain_channel_tagged_drops_only_matching_tag() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        q.push(queued(ch, "u1", "user_message"));
+        q.push(queued(ch, "j1", "job_message"));
+        q.push(queued(ch, "j2", "job_message"));
+        q.push(queued(ch, "u2", "user_message"));
+        q.push(queued(other, "j3", "job_message"));
+
+        let dropped = q.drain_channel_tagged(ch, "job_message");
+        assert_eq!(dropped, vec!["j1".to_string(), "j2".to_string()]);
+
+        // 该频道剩下的仍可 flush（用户消息没被吞）
+        let batch = q.flush_next().expect("用户消息仍在队列");
+        assert_eq!(batch.channel_id, ch);
+        let ids: Vec<_> = batch.events.iter().map(|e| e.msg.id_hex.clone()).collect();
+        assert_eq!(ids, vec!["u1".to_string(), "u2".to_string()]);
+
+        // 别的频道不受影响
+        let b2 = q.flush_next().expect("另一频道的 job 消息仍在");
+        assert_eq!(b2.channel_id, other);
+    }
+
+    /// 丢弃把该频道排队内容清空时，**必须同时清 retry 账**——否则残留退避会按
+    /// `flush_next` 的 retry_after 判据把后续新消息静默拖到退避到期（最长 300s）。
+    /// 构造：频道只剩一条 job 消息 + 已置位的 retry 账 → 丢弃 → 新用户消息必须立刻可 flush。
+    #[test]
+    fn drain_channel_tagged_clears_retry_account_when_queue_becomes_empty() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(queued(ch, "j1", "job_message"));
+        // 模拟「该 job 批次失败被 requeue」后的退避账（requeue 会同时置这两个）
+        q.retry_after
+            .insert(ch, Instant::now() + std::time::Duration::from_secs(300));
+        q.retry_counts.insert(ch, 3);
+
+        assert_eq!(
+            q.drain_channel_tagged(ch, "job_message"),
+            vec!["j1".to_string()]
+        );
+        assert!(
+            !q.retry_after.contains_key(&ch),
+            "队列被清空后不得残留 retry_after（会把后续新消息拖到退避到期）"
+        );
+        assert!(!q.retry_counts.contains_key(&ch), "retry_counts 同理");
+
+        // 新消息必须立刻能 flush（不被陈旧退避挡住）
+        q.push(queued(ch, "u1", "user_message"));
+        let batch = q.flush_next().expect("新用户消息不应被陈旧退避挡住");
+        assert_eq!(batch.channel_id, ch);
+        assert_eq!(batch.events[0].msg.id_hex, "u1");
+    }
+
+    /// 队列**还有别的活**时不得清 retry 账（那些账可能属于仍在排队的其它事件）。
+    #[test]
+    fn drain_channel_tagged_keeps_retry_account_when_queue_not_empty() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(queued(ch, "j1", "job_message"));
+        q.push(queued(ch, "u1", "user_message"));
+        q.retry_counts.insert(ch, 2);
+
+        assert_eq!(
+            q.drain_channel_tagged(ch, "job_message"),
+            vec!["j1".to_string()]
+        );
+        assert_eq!(
+            q.retry_counts.get(&ch),
+            Some(&2),
+            "队列没空 → 账目可能对应仍在排队的事件，不该清"
+        );
+    }
+
+    /// 没有匹配项时是 no-op（不动队列、不报错）。
+    #[test]
+    fn drain_channel_tagged_no_match_is_noop() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(queued(ch, "u1", "user_message"));
+        assert!(q.drain_channel_tagged(ch, "job_message").is_empty());
+        assert_eq!(q.pending_channels(), 1);
+    }
 }

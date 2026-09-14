@@ -19,6 +19,11 @@ pub enum JobKind {
     Cron, // 周期：cron = "分 时 日 月 周"
 }
 
+/// 定时任务消息的 `InboundMsg.prompt_tag`。**生产者（run_job）与消费者
+/// （harness 的排队丢弃、桥的停止词路由）必须共用同一个值**——硬编码两处时
+/// 任一处改动都会静默断链（停止词返回 false、落回透传且 job 照跑，无编译报错）。
+pub const JOB_PROMPT_TAG: &str = "job_message";
+
 /// 一个投递目标（#21 定时任务多目标）。bot_key 空 = 本 bot（创建任务的那个 bot）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobTarget {

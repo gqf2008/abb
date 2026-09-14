@@ -233,16 +233,46 @@ impl Bridge {
     /// 让调用方吞掉该停止词；`Some(false)`（排队中/已完成/无轮次）与 `None`（句柄关闭）
     /// 都返回 false，落回原路径——避免「假取消」把停止词吞掉而任务照跑。
     ///
+    /// 两种情况都算叫停成功：
+    /// - **在跑**：`handle.cancel` 返回 `Some(true)`（信号送达在跑轮次）；
+    /// - **排队中**（#309 PR-B）：`drop_queued_jobs` 丢弃了
+    ///   `prompt_tag == crate::schedule::JOB_PROMPT_TAG`
+    ///   的排队消息（只丢 job 消息，**不吞用户消息**）并给等待者回取消终态。
+    ///
     /// 注意这里是 **best-effort**：A1 的语义是「自然完成优先」，极端竞速下（cancel 信号
     /// 发出时该轮其实已以 `Ok` 收尾）任务仍会正常投递结果，而用户的「停」不会得到回复。
-    /// queued 取消见 #309 PR-B。
     ///
-    /// 语义是**一停全停**：该 chat 上所有在跑的 job 轮次都会被叫停（停止词不带任务 id，
-    /// 无法区分「停哪一个」）。
+    /// 语义是**一停全停**：该 chat 上所有在跑/排队的 job 轮次都会被叫停（停止词不带任务
+    /// id，无法区分「停哪一个」）。
+    ///
+    /// 已知边界：若该 chat 同时有 **chat 回合**在跑，停止词会在更前面的 `cancel_flags`
+    /// 检查处被 chat 回合消费，排队的 job 不在本轮取消（与 chat cancel 同口径）。
     pub(crate) async fn cancel_job_turns_for_chat(&self, chat_id: &str) -> bool {
         let turns = self.job_turns_for_chat(chat_id);
         let mut cancelled = false;
         for turn in turns {
+            // 顺序有讲究：**先丢排队中的 job 消息**。因为「job 还在排队」的前提正是
+            // 该 channel 上有别的回合在跑（单 slot）——此时 `cancel(channel)` 会命中
+            // 那个**在跑的别人的轮次**并返回 Some(true)；若据此就 continue，排队的 job
+            // 反而没人处理、之后照跑（实测踩到过）。
+            //
+            // 丢排队消息只按 `prompt_tag == JOB_PROMPT_TAG` 过滤，**不吞用户消息**。
+            let dropped = turn
+                .handle
+                .drop_queued_jobs(turn.channel_id)
+                .await
+                .unwrap_or(0);
+            if dropped > 0 {
+                cancelled = true;
+                crate::log!(
+                    "[bridge] 停止指令 → 丢弃排队中的定时任务 {} 条 chat={} channel={}",
+                    dropped,
+                    crate::agent::truncate(chat_id, 16),
+                    turn.channel_id
+                );
+            }
+            // 再叫停该 channel 在跑的轮次：job 在跑时命中它；同 channel 另有 job 在跑时
+            // 也一并叫停（语义是**一停全停**）。
             if turn.handle.cancel(turn.channel_id).await == Some(true) {
                 cancelled = true;
                 crate::log!(
@@ -3825,6 +3855,137 @@ mod tests {
             bridge.job_turns_for_chat(&chat_id).is_empty(),
             "收尾必须摘除 job 登记"
         );
+        cleanup_bridge(&bridge);
+    }
+
+    /// #309 PR-B：job 还在**排队**时（同频道被别的回合占着单 slot），停止词也必须能停掉它。
+    /// 路由回落到 `drop_queued_jobs`（**只丢 `job_message`，不吞用户消息**），并让等待者
+    /// 拿到 `Cancelled` 终态 → `run_job` 静默收尾（不会挂到超时）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn stop_word_drops_queued_job_turn() {
+        let runner = Arc::new(MockAgentRunner::immediate("x"));
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        // MOCK_HANG_PROMPT：占位回合会一直挂住 → 该 channel 始终 in-flight，
+        // 后面那条 job 消息必然进**队列**而不是被 dispatch。
+        let (buzz, handles) = make_test_harness_full(
+            rec.clone(),
+            &registry,
+            None,
+            vec![("MOCK_HANG_PROMPT".to_string(), "1".to_string())],
+        );
+        let (bridge, _msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("claude"),
+            Some((buzz.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+
+        let chat_id = format!("oc_queued_{}", uuid::Uuid::new_v4());
+        let channel_id = uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+            &bridge.bot.key(),
+            &chat_id,
+        ))
+        .unwrap();
+
+        // 1) 用一条用户消息占住 channel，等 agent 真的收到它（= in-flight）。
+        //    这里用 **fire-and-forget 的 push_message**（真实 chat 回合就是这样：只有
+        //    入站 dispatch，不注册同步 waiter）——否则它会占掉该 channel 唯一的
+        //    sync_waiters 槽，把后面 job 的等待者顶掉。
+        assert!(
+            buzz.push_message(
+                channel_id,
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m_user".to_string(),
+                    author_role: "user".to_string(),
+                    text: "占住频道".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "user_message".to_string(),
+                }
+            ),
+            "占位消息应能入队"
+        );
+        let mut waited_ms = 0u64;
+        while read_prompts(&rec).is_empty() {
+            assert!(waited_ms < 20_000, "占位回合未进入 in-flight");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waited_ms += 50;
+        }
+
+        // 2) 排一条 job 消息（channel 忙 → 进队列），并模拟 run_job 的登记
+        let h2 = buzz.clone();
+        let job_waiter = tokio::spawn(async move {
+            h2.wait_turn_outcome(
+                channel_id,
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m_job".to_string(),
+                    author_role: "owner".to_string(),
+                    // 唯一标记：不能用「长任务」这类词——base prompt 里有「长任务分步推进」，
+                    // 断言 contains 会误报（实测踩到）。
+                    text: "QUEUED_JOB_PAYLOAD_7f3a".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: crate::schedule::JOB_PROMPT_TAG.to_string(),
+                },
+                std::time::Duration::from_secs(600),
+            )
+            .await
+        });
+        bridge.register_job_turn(
+            "job-queued-1",
+            JobTurn {
+                chat_id: chat_id.clone(),
+                handle: buzz.clone(),
+                channel_id,
+            },
+        );
+
+        // 3) 走生产停止词路由。重试直到那条 job 消息确实进了队列——判据就是被测行为
+        //    本身（在跑则 cancel 成功、排队则 drop 成功），不是时序代理量。
+        let mut waited_ms = 0u64;
+        loop {
+            if bridge.cancel_job_turns_for_chat(&chat_id).await {
+                break;
+            }
+            assert!(waited_ms < 20_000, "排队中的 job 未被停止词停掉");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waited_ms += 50;
+        }
+
+        // 3b) 直接锁定「是丢弃生效」而不是「别的回合终态把 waiter 叫醒」：
+        //     被丢弃的 job 原文**从未**进入 agent。
+        let prompts = read_prompts(&rec);
+        assert!(
+            !prompts
+                .iter()
+                .any(|p| p.contains("QUEUED_JOB_PAYLOAD_7f3a")),
+            "被丢弃的排队 job 原文不得进入 agent（实际 prompts 条数={}）",
+            prompts.len()
+        );
+
+        // 4) 被丢弃的排队 job：等待者立刻拿到取消终态（run_job 据此静默收尾）
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), job_waiter)
+            .await
+            .expect("排队 job 被丢弃后等待者应立刻收尾")
+            .unwrap();
+        assert_eq!(
+            out,
+            crate::buzz::harness::SyncTurnOutcome::Cancelled,
+            "排队中被丢弃的 job 必须拿到取消终态"
+        );
+
+        // 4b) 再丢一次必须是 0：确认上一步真的由 **drop 腿**处理掉了这条排队 job
+        //（而不是 cancel 腿命中占用者、job 仍留在队列里等下一次 flush）。
+        assert_eq!(
+            buzz.drop_queued_jobs(channel_id).await,
+            Some(0),
+            "被丢弃的排队 job 不应再次出现在队列里"
+        );
+
+        bridge.unregister_job_turn("job-queued-1");
         cleanup_bridge(&bridge);
     }
 
