@@ -297,6 +297,28 @@ fn main() {
         return;
     }
 
+    // #305 Step 0：相机探测。**必须**用
+    //   open -n -a /Applications/ABB.app --args --camera-probe 0 /tmp/abb-camera-probe.jpg
+    // 触发——让 LaunchServices 把新实例的 responsible process 设成 ABB.app，
+    // 这样它派生的 ffmpeg 才落在 ABB 的 TCC 责任面内（裸二进制从终端跑会把归属
+    // 算到终端，实验无效）。判定标准见 permreq::camera_probe 的文档。
+    #[cfg(target_os = "macos")]
+    if let Some(pos) = args.iter().position(|a| a == "--camera-probe") {
+        let index = args.get(pos + 1).map(String::as_str).unwrap_or("0");
+        let out = args
+            .get(pos + 2)
+            .map(String::as_str)
+            .unwrap_or("/tmp/abb-camera-probe.jpg");
+        match permreq::camera_probe(index, out) {
+            Ok(msg) => print!("{msg}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // 隐藏诊断：确认随包工具与宿主 PATH 的最终解析结果。
     if args.iter().any(|a| a == "--dump-tools") {
         let strict = args.iter().any(|a| a == "--require-bundled-tools");

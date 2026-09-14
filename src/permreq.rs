@@ -219,3 +219,102 @@ pub fn request_lock_permissions() {
     request_listen_event();
     crate::log!("[perm] 锁屏控制权限请求流程结束");
 }
+
+// ── #305 Step 0：相机探测（判定「ABB 派生的子进程是否继承 ABB 的 TCC 授权」）──
+
+/// `ffmpeg` 抓帧的参数（抽出来是为了单测能钉死这串 flag，防后续手滑改坏）。
+/// `avfoundation` 的 `index` 形如 `"0"` / `"0:none"`（视频[:音频]）。
+pub fn camera_probe_args(index: &str, out: &str) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "avfoundation",
+        "-framerate",
+        "30",
+        "-i",
+        index,
+        "-frames:v",
+        "1",
+        "-y",
+        out,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// #305 Step 0：**在 ABB 自己的进程名下**派生 `ffmpeg` 抓一帧，据此判定 TCC 继承。
+///
+/// 关键用法（裸二进制从终端跑会把 TCC 归属算到终端，实验就无效）：
+/// ```text
+/// open -n -a /Applications/ABB.app --args --camera-probe 0 /tmp/abb-camera-probe.jpg
+/// ```
+/// `open -n` 让 LaunchServices 新起一个 ABB 实例（responsible process = ABB.app），
+/// 该实例再派 `ffmpeg` 子进程 —— 正是 #305 要验证的那条链。
+///
+/// 判定：
+/// - **弹授权框**：看归属方名字是不是 **ABB**（是 → 子进程落在 ABB 的责任面内，继承成立）；
+/// - **已授权**：能出非空图片文件 → 继承成立；
+/// - 直接 I/O error 且不弹框 → 继承不成立（多半责任面没落上），#305 需改方向。
+pub fn camera_probe(index: &str, out: &str) -> Result<String, String> {
+    let ffmpeg = crate::deps::find_in_path("ffmpeg")
+        .ok_or_else(|| "找不到 ffmpeg（请先安装，或用随包工具补上）".to_string())?;
+    let status = std::process::Command::new(&ffmpeg)
+        .args(camera_probe_args(index, out))
+        .status()
+        .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
+    let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    let mut msg = format!(
+        "camera-probe: index={index} out={out} exit={:?} bytes={size}\n",
+        status.code()
+    );
+    if status.success() && size > 0 {
+        msg.push_str("✅ 抓到一帧：说明 ABB 派生进程能拿到相机（TCC 继承成立）。\n");
+    } else {
+        msg.push_str(
+            "⚠️ 没抓到帧。请回看刚才是否有系统授权框：\n  - 若弹框且归属方写着 ABB → 继承成立（点允许后重跑本命令即可出图）；\n  - 若弹框写着 Terminal/iTerm/其它 → 本次实验无效（必须用 open -n -a ABB 起）；\n  - 若既没弹框也无图 → 继承不成立（#305 需改方向）。\n",
+        );
+    }
+    msg.push_str(&format!("ffmpeg: {}\n", ffmpeg.display()));
+    Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #305 Step 0：钉死探测用的 ffmpeg 参数串——设备类型、帧数与输出路径任一被改坏，
+    /// 探测就会变成「跑了个别的命令却以为验过了」。
+    #[test]
+    fn camera_probe_args_pins_avfoundation_single_frame() {
+        let a = camera_probe_args("0", "/tmp/x.jpg");
+        assert_eq!(
+            a,
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "avfoundation",
+                "-framerate",
+                "30",
+                "-i",
+                "0",
+                "-frames:v",
+                "1",
+                "-y",
+                "/tmp/x.jpg",
+            ]
+        );
+        // 设备串支持 avfoundation 的 `视频[:音频]` 形态，必须原样透传给 -i
+        let b = camera_probe_args("1:none", "/tmp/y.jpg");
+        let i = b.iter().position(|x| x == "-i").unwrap();
+        assert_eq!(b[i + 1], "1:none");
+        assert!(
+            b.contains(&"/tmp/y.jpg".to_string()),
+            "输出路径必须原样透传"
+        );
+    }
+}
