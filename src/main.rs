@@ -774,6 +774,14 @@ fn resolve_bot_key() -> Result<String, String> {
 /// 登记后不阻塞调用方，由 service 的 task worker 认领执行，结果回创建者会话。
 fn run_task_cli(args: &[String]) -> i32 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    // 帮助请求**先于** `resolve_bot_key()`（#312 审查）：`task --help` 是通用习惯，也是
+    // 工作区指引写给 agent 的那条命令；落到下面的 `other` 臂会先多打一行「不认识的
+    // 子命令」，而放到解析 bot 之后又会让「还没配 bot」的环境连帮助都看不了
+    // （`task --help` → 「config.json 没有配置任何 bot」，实测）。退出码 0（不是错误）。
+    if matches!(sub, "-h" | "--help" | "help") {
+        eprintln!("{TASK_CLI_HELP}");
+        return 0;
+    }
     let bot_key = match resolve_bot_key() {
         Ok(k) => k,
         Err(e) => {
@@ -1126,8 +1134,9 @@ fn run_task_cli(args: &[String]) -> i32 {
 /// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
 const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]";
 
-/// `task` 的总帮助（**单一真源**：#312 的指引 v7 要与它逐字对齐）。
-const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
+/// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
+/// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
+pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
      \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\
@@ -1819,6 +1828,30 @@ fn trash_bot_key(args: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_task_to, session_reset_chat_id};
+
+    /// #312 审查：`task --help` / `-h` / `help` 必须**真**走帮助臂——落到 `other` 会先
+    /// 多打一行「不认识的子命令」，而放到 `resolve_bot_key()` 之后又会让未配置 bot 的
+    /// 环境连帮助都看不了。
+    ///
+    /// **真调 `run_task_cli`**（不是重写一遍 `matches!`）：这条断言在删掉帮助臂时必红
+    /// ——那正是上一版「空转假绿」被审查否掉的原因（把臂删掉，自证式断言照样绿）。
+    #[test]
+    fn task_help_returns_zero_without_configured_bot() {
+        // 帮助必须在解析 bot **之前**返回：这里不设任何 env、也不碰磁盘。
+        for a in ["-h", "--help", "help"] {
+            assert_eq!(
+                super::run_task_cli(&[a.to_string()]),
+                0,
+                "task {a} 应打印帮助并 exit 0（且不得要求先配好 bot）"
+            );
+        }
+        // 反面：不存在的子命令仍是失败（1）——证明上面那条不是「恒返回 0」。
+        assert_ne!(
+            super::run_task_cli(&["definitely-not-a-subcommand".to_string()]),
+            0,
+            "未知子命令不应伪装成功"
+        );
+    }
 
     /// #306：`task add --to` 的值解析只按**第一个**冒号切，缺 bot_key 段 = 本 bot；
     /// 空 chat 段留给调用方报错（这里把语义钉死，别让 CLI 与指引各写一套）。
