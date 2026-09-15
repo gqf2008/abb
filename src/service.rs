@@ -2035,9 +2035,10 @@ mod tests {
         }
     }
 
-    /// #321：job 轮次结局 → 文案映射。`Closed` 是「等待者被同会话更新的任务顶替 /
-    /// 句柄已关闭」，**不是**「agent 无回复」——不能再共用超时文案（同 chat 并发 job 时，
-    /// 在跑那条的 waiter 会被后登记那条顶替，历史上因此误报「执行超时」）。
+    /// #321：job 轮次结局 → 文案映射。`Closed` 是「句柄已关闭（服务在关停）」，
+    /// **不是**「agent 无回复」——不能共用超时文案。（历史上它还有第二个来源：
+    /// 同 chat 并发 job 时后登记那条顶掉在跑那条的 waiter，从而误报「执行超时」；
+    /// 该路径已由同 chat 单飞串行关闭，见 `docs/task-model.md` §B。）
     #[test]
     fn job_outcome_reply_does_not_mislabel_closed_as_timeout() {
         use crate::buzz::harness::SyncTurnOutcome as O;
@@ -2049,7 +2050,7 @@ mod tests {
         assert_eq!(
             job_outcome_reply(&O::Closed),
             None,
-            "Closed（等待者被顶替/句柄关闭）不得报超时"
+            "Closed（句柄已关闭）不得报超时"
         );
         assert_eq!(
             job_outcome_reply(&O::Timeout),

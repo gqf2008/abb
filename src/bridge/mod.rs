@@ -275,11 +275,16 @@ impl Bridge {
     /// 检查处被 chat 回合消费，排队的 job 不在本轮取消（与 chat cancel 同口径）。
     pub(crate) async fn cancel_job_turns_for_chat(&self, chat_id: &str) -> bool {
         let turns = self.job_turns_for_chat(chat_id);
-        let mut cancelled = false;
-        for turn in turns {
-            // 先置任务级标记：等在 job 串行闸上、尚未 dispatch 的 job 拿到闸后会直接退出。
+        // **先整批置位、再逐条 await**（审查：#321 单飞串行引入的窄竞态）。若边置位边
+        // drop/cancel，快照里靠前那条被 `await` 叫停后可能立刻收尾并释放 job 闸，而靠后的
+        // 排队 job 此时**还没被置位** → 它会顺利过闸前检查、照跑（用户的「停」漏掉它）。
+        // 两趟走完，任何排队中的 job 在闸被释放前都已经是「已取消」。
+        for turn in &turns {
             turn.cancel
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut cancelled = false;
+        for turn in turns {
             // 顺序有讲究：**先丢排队中的 job 消息**。因为「job 还在排队」的前提正是
             // 该 channel 上有别的回合在跑（单 slot）——此时 `cancel(channel)` 会命中
             // 那个**在跑的别人的轮次**并返回 Some(true)；若据此就 continue，排队的 job
