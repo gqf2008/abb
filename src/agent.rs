@@ -887,10 +887,21 @@ mod tests {
                 .contains("sandbox_mode"),
             "默认无限制档不应落盘"
         );
+        assert_eq!(
+            crate::config::BotConfig::default().sandbox_mode,
+            SandboxMode::FullAccess
+        );
         // 旧 config 显式 auto 仍可读；owner 行为与 full-access 一致
         let legacy: crate::config::BotConfig =
             serde_json::from_str(r#"{"name":"b1","sandbox_mode":"auto"}"#).unwrap();
         assert_eq!(legacy.sandbox_mode, SandboxMode::Auto);
+        // 更老的 codex_sandbox alias 继续兼容：auto 为不受限 legacy，read-only 仍生效
+        let alias_auto: crate::config::BotConfig =
+            serde_json::from_str(r#"{"name":"b1","codex_sandbox":"auto"}"#).unwrap();
+        assert_eq!(alias_auto.sandbox_mode, SandboxMode::Auto);
+        let alias_ro: crate::config::BotConfig =
+            serde_json::from_str(r#"{"name":"b1","codex_sandbox":"read-only"}"#).unwrap();
+        assert_eq!(alias_ro.sandbox_mode, SandboxMode::ReadOnly);
     }
 
     /// SpawnRetiredRunner：生产占位必须如实报错（绝不 panic——任务治理捕获 panic
