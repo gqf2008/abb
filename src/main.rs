@@ -1126,8 +1126,9 @@ fn run_task_cli(args: &[String]) -> i32 {
 /// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
 const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]";
 
-/// `task` 的总帮助（**单一真源**：#312 的指引 v7 要与它逐字对齐）。
-const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
+/// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
+/// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
+pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
      \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\

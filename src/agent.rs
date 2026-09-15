@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v6";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v7";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -53,6 +53,8 @@ pub(crate) const GUIDE_MARKER: &str = "abb-guide-v6";
 /// 只读不写（审查 P3-1）。
 pub(crate) fn ensure_workspace_guide(workspace: &std::path::Path) {
     let _ = std::fs::create_dir_all(workspace);
+    // `task_help` 直接内嵌 CLI 的单一真源（`crate::TASK_CLI_HELP`）——#312 的验收要求
+    // 「指引里的 CLI 与 `task --help` 逐字一致」，靠内嵌而不是手抄来保证。
     let guide = format!(
         "# ABB 工作区（{GUIDE_MARKER}）
 
@@ -73,6 +75,35 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
   裸调用会 command not found。`ABB_BIN` 由桥 spawn 时注入，保证调的是当前安装的同一个程序。
 
 目标会话与 bot 已由桥通过环境变量注入：`AGENT_BRIDGE_CHAT_ID`、`AGENT_BRIDGE_BOT_KEY`，CLI 会自动取用，无需手填。
+
+## 后台子代理 → 长任务丢后台，别堵会话
+
+用户要的东西**要跑很久**（超过一两分钟）或明确说「后台跑 / 慢慢跑 / 跑完告诉我 / 别占着
+会话」时，别在本回合里干等：用 `\"$ABB_BIN\" task add` 把它丢到后台，回一句「已丢后台，跑完发你」
+就结束本回合。反过来，需要多轮澄清、要边做边确认、几步就能做完的，自己做完，不要委派。
+
+**用法**（下面是 `task --help` 的输出原文；改了 CLI，这里会跟着变）：
+
+```
+{task_help}
+```
+
+上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
+- 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
+  用户可以继续聊别的。
+- **同一 bot 的任务串行排队执行**（一次只跑一条）：同时丢多条不会更快，别把它当并发池。
+- 子代理在后台跑完一轮 agent，**不产生中间可见回复**——用户只在完成时收到一条结果。
+- 别在本回合里 sleep/while 等它跑完（那正是要避免的「堵会话」）。
+
+**结果投递**：
+
+- **缺省 = 投回创建者会话**（谁创建投给谁），无需手填 bot_key / chat_id；
+- 要发到别处：`--to bot_key:chat_id`（跨 bot 需用户在设置里打开「跨会话投递」开关）；
+  `--to-current` 显式发回本会话；
+- 投递失败会把原因写进任务运行态并回落到该 bot 主会话告警，**不静默丢**；
+- 用户取消（`task cancel <id>`）后不再投递结果。
+- 受限（授权者）会话里只放行 `task add`——`list` / `status` / `logs` / `cancel` / `rm` 会被闸
+  拒绝（它们能暴露或删改别的任务）。需要查状态或取消时，让用户在自己的终端/owner 会话里做。
 
 ## 把文件发到当前会话（附件必须走这条）
 
@@ -112,7 +143,8 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 - 任务完成（产出最终回复）后**立即退出**，不要持续运行或等待。
 - 普通问答、查资料、改文件等直接做即可，做完输出结论。
 - 你只能读写本工作区；不要假设有公网入站（消息靠桥转）。
-"
+",
+        task_help = crate::TASK_CLI_HELP
     );
     for name in ["CLAUDE.md", "AGENTS.md"] {
         let p = workspace.join(name);
@@ -810,6 +842,11 @@ mod tests {
                 text.contains("--to-current"),
                 "{name} 必须写明把附件发到当前会话的用法"
             );
+            // #312：v7 新增的「后台子代理」小节必须在，且要写清委派决策规则。
+            assert!(
+                text.contains("## 后台子代理 → 长任务丢后台，别堵会话"),
+                "{name} 缺 v7 的后台子代理小节"
+            );
             for needle in ["随包工具优先", "rg", "jq", "uv", "gh"] {
                 assert!(text.contains(needle), "{name} 应写明随包工具 {needle}");
             }
@@ -827,6 +864,97 @@ mod tests {
         assert_eq!(before, (m("CLAUDE.md"), m("AGENTS.md")));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #312 验收①：指引里的 CLI 与 `"$ABB_BIN" task --help` **逐字一致**——靠
+    /// `crate::TASK_CLI_HELP`（CLI 单一真源）内嵌实现，这条锁住「不要再手抄一份」。
+    #[test]
+    fn workspace_guide_embeds_task_cli_help_verbatim() {
+        let dir = std::env::temp_dir().join(format!("abb-guide-help-{}", uuid::Uuid::new_v4()));
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                text.contains(crate::TASK_CLI_HELP),
+                "{name} 必须逐字内嵌 task --help 的输出"
+            );
+            // 内嵌的是 CLI 自己打印的那份（含全部子命令），不是精简重写。
+            for needle in [
+                "task add --prompt",
+                "task list",
+                "task status <id前缀>",
+                "task logs <id前缀>",
+                "task cancel <id前缀>",
+                "task rm <id前缀>",
+            ] {
+                assert!(text.contains(needle), "{name} 缺子命令说明：{needle}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺——当前每个 bot 只有
+    /// 1 个 task worker（超限排队，不并发），也没有 `--proc` 载荷（Q8 只给 GUI/人工）。
+    #[test]
+    fn workspace_guide_does_not_overpromise_task_semantics() {
+        let dir = std::env::temp_dir().join(format!("abb-guide-neg-{}", uuid::Uuid::new_v4()));
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                !text.contains("--proc"),
+                "{name} 不得把未开放的 proc 载荷写进指引"
+            );
+            assert!(
+                !text.contains("可并发") && !text.contains("并行"),
+                "{name} 不得承诺并发（Q7：每 bot 1 个 worker，超限排队）"
+            );
+            assert!(
+                text.contains("串行排队"),
+                "{name} 应写明任务串行排队（否则误导 agent 一次丢十条）"
+            );
+            assert!(
+                text.contains("独立会话"),
+                "{name} 应写明子代理跑独立会话（不带聊天上下文）"
+            );
+            assert!(
+                text.contains("不产生中间可见回复"),
+                "{name} 应写明后台任务不产生中间可见回复"
+            );
+            // 受限会话只能 add（guard 白名单），指引要说清，免得 agent 反复撞闸。
+            assert!(
+                text.contains("只放行 `task add`"),
+                "{name} 应写明受限会话只有 task add 可用"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #312 验收②：marker v6 → v7 触发**存量**工作区自动覆盖升级（且只升一次）。
+    #[test]
+    fn workspace_guide_upgrades_v6_marker_to_v7() {
+        let dir = std::env::temp_dir().join(format!("abb-guide-v6-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v6 = "# ABB 工作区（abb-guide-v6）\n\n## 其它\n\n- 旧 v6 正文\n";
+        std::fs::write(dir.join("CLAUDE.md"), v6).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), v6).unwrap();
+
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains("abb-guide-v7"), "{name} 应升到 v7");
+            assert!(!text.contains("abb-guide-v6"), "{name} 不应留 v6 marker");
+            assert!(!text.contains("旧 v6 正文"), "{name} 旧正文应被整体替换");
+            assert!(text.contains("## 后台子代理"), "{name} 应含 v7 新小节");
+        }
+
+        // 幂等：已是 v7 不再重写（mtime 不变）
+        let m = |n: &str| std::fs::metadata(dir.join(n)).unwrap().modified().unwrap();
+        let before = (m("CLAUDE.md"), m("AGENTS.md"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ensure_workspace_guide(&dir);
+        assert_eq!(before, (m("CLAUDE.md"), m("AGENTS.md")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// P4.4（审查 P2-1）：工作区目录可能**还不存在**——全新 bot 的
