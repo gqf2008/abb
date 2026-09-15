@@ -14,25 +14,24 @@ static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::PathBuf;
 
-/// #168/#172 通用权限档位（每 bot 可配置，默认 auto；三后端 claude/codex/pi 按档位翻译）：
-/// - Auto（默认）：owner 会话**全权限直跑**（老板拍板 2026-08-29：不跑沙箱）——claude
-///   skip-permissions、codex bypass；受限会话（授权者隔离）read-only 保留
+/// 内部执行档位（普通 UI 不再暴露；保留旧 config 兼容与高级 JSON 能力）：
+/// - Auto（legacy alias）：owner 会话全权限直跑；granted 仍由角色闸强制受限
+/// - FullAccess（默认）：owner 会话**全权限直跑**（私人助理与用户同权限）
 /// - ReadOnly：claude 白名单只剩读/查工具；codex `--sandbox read-only`（全盘只读）
 /// - WorkspaceWrite：claude 工作区可写白名单；codex `--sandbox workspace-write` + bridge_dir 可写根
-/// - FullAccess：claude --dangerously-skip-permissions；codex --dangerously-bypass-...（全权限，UI 有警示）
 /// - pi 无 OS 沙箱/权限体系，档位不翻译（保持现状）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
-    #[default]
     Auto,
     ReadOnly,
     WorkspaceWrite,
+    #[default]
     FullAccess,
 }
 
 impl SandboxMode {
-    /// config 落盘值（kebab-case，与 serde rename 一致）。
+    /// config/会话提示里的稳定字符串（与 serde kebab-case 一致）。
     pub fn as_str(&self) -> &'static str {
         match self {
             SandboxMode::Auto => "auto",
@@ -41,21 +40,11 @@ impl SandboxMode {
             SandboxMode::FullAccess => "full-access",
         }
     }
-
-    /// 从字符串解析（GUI 下拉值/配置读取）。未知值回落 auto（宽松容错，与 backend 同款）。
-    pub fn parse(s: &str) -> SandboxMode {
-        match s {
-            "read-only" => SandboxMode::ReadOnly,
-            "workspace-write" => SandboxMode::WorkspaceWrite,
-            "full-access" => SandboxMode::FullAccess,
-            _ => SandboxMode::Auto,
-        }
-    }
 }
 
-/// #168 默认权限档位（auto）。
+/// 默认权限档位（full-access）：owner 私人助理默认与用户同权限。
 fn default_sandbox_mode() -> SandboxMode {
-    SandboxMode::Auto
+    SandboxMode::FullAccess
 }
 
 /// 单个 bot 的配置。name 是隔离键（决定 workspace/jobs/sessions 子目录）。
@@ -87,12 +76,12 @@ pub struct BotConfig {
     /// per-bot 独立：改飞书 bot 的后端不会再动到微信 bot。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
-    /// #168 通用权限档位（auto 默认；旧 config 的 codex_sandbox 字段经 alias 兼容读入）。
-    /// 三后端（claude/codex/pi）按档位内部翻译；旧 config 无字段 → auto，兼容不落盘。
+    /// 内部执行档位：普通 UI 已下架，保留旧 config 的 codex_sandbox alias 与高级 JSON
+    /// 配置能力。旧 config 无字段 → full-access，兼容不落盘；显式限制档才会写盘。
     #[serde(
         alias = "codex_sandbox",
         default = "default_sandbox_mode",
-        skip_serializing_if = "is_auto_sandbox"
+        skip_serializing_if = "is_unrestricted_sandbox"
     )]
     pub sandbox_mode: SandboxMode,
     /// #174 同名自动区分后缀（-2/-3…；空 = 唯一/首个）。assign_unique_keys 分配——
@@ -235,7 +224,7 @@ impl Default for BotConfig {
             bot_open_id: String::new(),
             primary_chat_id: String::new(),
             backend: String::new(),
-            sandbox_mode: SandboxMode::Auto,
+            sandbox_mode: SandboxMode::FullAccess,
             key_suffix: String::new(),
             owner_open_id: String::new(),
             wx_token: String::new(),
@@ -311,9 +300,9 @@ fn not_open(b: &bool) -> bool {
     !*b
 }
 
-/// #168：sandbox_mode = auto 时不落盘（旧 config 兼容；显示默认值）。
-fn is_auto_sandbox(m: &SandboxMode) -> bool {
-    *m == SandboxMode::Auto
+/// Auto（legacy）与 FullAccess 对 owner 都是不额外收窄，按默认省略；限制档才落盘。
+fn is_unrestricted_sandbox(m: &SandboxMode) -> bool {
+    matches!(m, SandboxMode::Auto | SandboxMode::FullAccess)
 }
 
 /// #91：mention_default 默认 false（需要 @），false 不落盘（旧 config 兼容）。

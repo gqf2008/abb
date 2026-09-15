@@ -97,8 +97,8 @@ fn buzz_env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String
 /// 随 `session/new` `_meta` 下发的具体档。
 /// - ReadOnly → `read-only` + 读/写域根 = 该 bot 工作区（域闸收口到 workspace）；
 /// - WorkspaceWrite → `workspace-write` + 同域根；
-/// - Auto / FullAccess → None = fork 缺省 FullAccess（今天字节级行为，回归锁；
-///   auto 不作中间档——fork 无 auto 语义，None 即"照旧"）。
+/// - Auto（legacy）/ FullAccess（默认）→ None = fork 缺省 FullAccess
+///   （owner 与用户同权限；Auto 只作旧 config 兼容）。
 ///
 /// 域根先 canonicalize（symlink 归一），失败回落原路径（目录尚不存在时 canonicalize 会
 /// Err——build_bot_acp_handles 已 ensure，这里是防御兜底）。
@@ -236,7 +236,7 @@ pub(crate) fn oneshot_agent_config(
 ///
 /// 不这么做的后果（安全审查 B1，真实可达）：`$ABB_BIN task add` 对 granted 会话是
 /// **放行**的，于是 granted 会话里的 agent 只要 `task add --prompt "读 ~/.ssh"`，
-/// worker 就会用**无沙箱**（`SandboxMode::Auto` → `None` = FullAccess）跑那条 prompt，
+/// worker 就会用**无沙箱**（`SandboxMode::FullAccess/Auto` → `None`）跑那条 prompt，
 /// 把「授权者会话的受限剖面」整个绕过去。`run_job` 走的是 `restrict_granted` + granted
 /// 剖面，task 必须同判据。
 ///
@@ -1739,11 +1739,11 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "BUZZ_AGENT_NO_HINTS" && v == "1"));
 
-        // owner → 跟 bot 配置档（默认 Auto → None = FullAccess 照旧），且不注入 NO_HINTS
+        // owner → 跟 bot 配置档（默认 FullAccess → None），且不注入 NO_HINTS
         let o = oneshot_agent_config_for_role(&bot, &cfg, false);
         assert!(
             o.session_sandbox.is_none(),
-            "默认档位是 Auto → None（不额外收紧 owner）"
+            "默认档位是 FullAccess → None（不额外收紧 owner）"
         );
         assert!(
             !o.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"),
@@ -1753,8 +1753,8 @@ mod tests {
 
     /// P2.2：normal handle 的 `_meta` 档位映射——sandbox_mode 解析成具体档。
     /// ReadOnly→read-only、WorkspaceWrite→workspace-write（域根=该 bot 工作区，
-    /// canonicalize 归一），Auto/FullAccess→None（fork 缺省 FullAccess 今天行为，
-    /// auto 不作中间档）。域根必须落在本 bot 工作区（隔离语义）。
+    /// canonicalize 归一），Auto（legacy）/FullAccess（默认）→None。
+    /// 域根必须落在本 bot 工作区（隔离语义）。
     #[test]
     fn resolve_sandbox_meta_maps_modes() {
         let mk_bot = |mode: crate::config::SandboxMode| crate::config::BotConfig {
