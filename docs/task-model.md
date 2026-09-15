@@ -52,13 +52,22 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
   1. **per-channel in-flight 队列**：`src/buzz/queue.rs`——队列层支持不同频道各自积压/公平选择，但**当前单 slot harness 下，同一 handle 最终仍是全局串行**（真并行要么 B1 独立 handle，要么 B2 多 slot）；
   2. **每个 handle 的单 slot 懒池**：`let pool = AgentPool::from_slots(vec![None]);`（`src/buzz/harness.rs:413-416`）。
 - **`run_job` 不取 chat_lock**，直接用 `channel_uuid(bot_key, job.chat_id)`（`src/service.rs:1341`）——**和聊天是同一个 channel**，于是两者在同一个 slot 池里排队。
-- 调度侧防重入按 **`job.id`** 键控（`src/service.rs:813-854`），不是按 chat：不同 job 可以在 Rust 层并发进入 `run_job`，然后一起在 harness 队列里排队。
+- 调度侧防重入按 **`job.id`** 键控（`src/service.rs`），不是按 chat：同 chat 的多个 job 可以同时到点被 spawn。但它们**不再并发进入 harness**——`run_job` 全程持 `Bridge::job_gate(chat_id)`（#321 定的「同 chat 单飞串行」，见 B 节），后到的 job 在闸上排队。
 
-**B. 同 channel 的等待者只有一个**
+**B. 同 channel 的等待者只有一个 ⇒ 同 chat 的 job 单飞串行**
 
-`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/buzz/harness.rs:287-301`）：同一 channel 上多个等待者会**互相顶掉**（后登记者接管，前者拿到 `Closed`）；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递。
+`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/buzz/harness.rs`）：同一 channel 上多个等待者会**互相顶掉**（后登记者接管，前者拿到 `Closed`）；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递。
 
-> 现状（#321）：同 chat **并发两条 job** 时，后登记那条会顶掉在跑那条的 waiter。job 侧已按 #321 处理——`Closed` 不再复用「执行超时」文案（那是误导），改为**静默收尾**（被顶替那一轮的真实结果由接管它的等待者投递，避免重复）。彻底修法（waiter 多路化 / 或每 job 独立 channel）与执行容量决策（Q7）一起定，见 #321。
+**已定语义（#321，2026-09-15 拍板）：同 chat 多 job = 单飞串行（single-flight serial）**，不允许第二条 job 顶掉第一条的 waiter。落点在**生产者侧**，不改 harness 的 waiter 表：
+
+- `Bridge::job_gate(chat_id)`（`src/bridge/mod.rs`，字段 `job_gates`）——按 **`job.chat_id`（群根频道）** 分片的一把异步锁，跨 normal/granted 两个实例（同 chat 的两条不同 role 的 job 也要串行）。
+- `run_job`（`src/service.rs`）在**整段轮次**持有它：`register_job_turn` → 取闸 → `upsert_channel` → `wait_turn_outcome` → 摘登记 → 生成 header/targets → **投递完成**才释放。后到的 job 因此停在闸上，而不是抢进 waiter 表。
+- 与 `chat_lock` **分开**：`chat_lock` 是 chat 回合的会话/历史串行锁，让一个可能跑满 `MAX_TURN_DURATION` 的 job 占着它会把同 chat 的用户消息与 `deliver_turn_reply`/`flush_outbox` 一起卡住。
+- `JobTurn` 必须在**取闸之前**登记，否则排队中的 job 对停止词不可见（停止词只命中在跑那条，排队的会在之后照跑）。`JobTurn.cancel` 标记即「排队期取消」：取到闸后先查它，命中就静默收尾。
+
+因此 `Closed` 现在只剩**句柄已关闭（服务在关停）**这一个来源，仍按静默收尾处理、不复用「执行超时」文案。
+
+> 仍未闭环（同源、但**不在**本批次）：job 与它所在 chat 的**普通聊天回合**共用同一 channel，若某个聊天回合正在 in-flight，job 的 waiter 会先取走那条聊天回合的文本（反向亦然）。单飞闸只覆盖 job↔job，堵不住 job↔chat——要关这条得改成「每 job 独立 channel」（丢掉与 chat 共享的 ACP session）或让 job 先等 channel 空闲，属独立决策，见 #321 评论。
 
 **C. 会话上下文挂在哪**
 
@@ -108,7 +117,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 | # | 问题 | 后果 |
 |---|---|---|
 | S1 | `job` / `task` / `spawn` 术语混用，`tasks.rs` 已被占用 | CLI 与模块撞名，说不清「task 指哪个」 |
-| S2 | **执行容量是单 slot，且 job 与聊天共用 channel** | 后台能力天然抢同一 slot；同 channel 的 waiter 还会互相顶掉 |
+| S2 | **执行容量是单 slot，且 job 与聊天共用 channel** | 后台能力天然抢同一 slot；同 chat 的 job 已按 #321 单飞串行，但 job↔chat 仍共用 waiter 槽 |
 | S3 | 会话身份只有 channel UUID 一条线 | 想隔离就得造独立 channel + ChannelMeta，只改 `sessions.json` 无效 |
 | S4 | 投递目标三套模型 + 自环豁免是硬编码第三态 | 新任务类型要重想一遍投递语义，默认值无处安放 |
 | S5 | 生命周期只有「一次回合」 | 常驻/长跑只能 `nohup`/launchd（还丢 TCC，见 #251） |

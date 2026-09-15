@@ -1335,9 +1335,10 @@ fn job_prompt(job: &crate::schedule::Job, bot_key: &str) -> String {
 /// - `Ok(text)`：正常结果；
 /// - `Cancelled`（#309）：用户叫停，静默；
 /// - `Timeout`：agent 没回 → 超时文案（既有行为）；
-/// - **`Closed`：等待者被同会话更新的任务顶替（每 channel 一个 waiter 槽）、或句柄已
-///   关闭（服务在关停）——这**不是**「agent 无回复」**，不能共用超时文案（#321）。
-///   静默收尾：被顶替时那一轮的真实结果由接管它的等待者负责投递，本轮再发一条只会重复；
+/// - **`Closed`：句柄已关闭（服务在关停）**——这**不是**「agent 无回复」**，不能共用
+///   超时文案（#321）。曾经还有第二个来源「等待者被同 chat 更新的 job 顶替」（每 channel
+///   一个 waiter 槽），#321 已用同 chat 单飞串行（`run_job` 持 `Bridge::job_gate`）关掉
+///   那条路径：同 chat 的 job 依次跑，不再有顶替。措辞与 `run_job` 的日志保持一致；
 /// - `Failed(reason)`：agent 终态失败（认证失效/多次重试耗尽等，由 `notify_channel`
 ///   旁路回传）——**不是**「agent 无回复」，带原因回报而非复用超时文案（#321 同类的误标）。
 ///
@@ -1399,28 +1400,65 @@ async fn run_job(
     // 历史上这里注册过一个没有读者的 flag，反而让停止词命中后直接 return，把真实叫停
     // 短路掉（#309 的根因）。现在的路径：下面 register_job_turn(...) 登记本轮 → 会话内
     // 发停止词时由 virtualbot 的 cancel_job_turns() 把取消送到**本 job 的 handle/channel**。
-    // ACP 单轨：job 也走 dispatch（同步等待回合文本，60s 上限）——不依赖
+    // ACP 单轨：job 也走 dispatch（同步等待回合文本）——不依赖
     // spawn 同步路径。回退（harness 未装配/超时/入队失败）按失败文案。
     // P2.2/P2.3：按 job 角色选实例——granted 任务路由 granted 实例（强制受限剖面），
     // 且经能力协商硬闸：能力位已判不支持 ⇒ 拒跑（绝不静默降级成无闸 FullAccess）；
     // Unknown（懒启动未起）放行到 session 创建处的真闸。
+    let granted = crate::config::restrict_granted(job.role, &bot_key);
+    let handle = bridge.acp_handles.as_ref().map(|hs| {
+        if granted {
+            hs.granted.clone()
+        } else {
+            hs.normal.clone()
+        }
+    });
+    // granted 能力闸：仅在有句柄可判时求值（None=未装配，走下面"agent 未装配"臂）。
+    let granted_blocked = handle.as_ref().is_some_and(|h| {
+        granted && h.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
+    });
+    // job 恒跑该 chat 的**群根频道**（与聊天回合同源；话题另开命名空间）。
+    let channel_id =
+        uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(&bot_key, &job.chat_id))
+            .expect("channel_uuid output must parse as Uuid");
+    // #309 PR-A2 + #321：登记本轮，供会话内的停止词/`/cancel` 把取消送到**本 job 实际
+    // 使用的 handle 与 channel**（不是停止词发送者的角色）。登记必须**早于取 job 闸**：
+    // 排队等闸的 job 也要让停止词看得见，否则停止词只命中在跑那条、排队的照跑。返回的
+    // `cancel` 标记即「排队期取消」信号——取到闸后先查它，再决定要不要 dispatch。
+    let queued_cancel = match &handle {
+        Some(h) => {
+            let turn = crate::bridge::JobTurn::new(job.chat_id.clone(), h.clone(), channel_id);
+            let flag = turn.cancel.clone();
+            bridge.register_job_turn(&job.id, turn);
+            Some(flag)
+        }
+        None => None,
+    };
+    // #321：同 chat 多 job **单飞串行**。harness 的 `sync_waiters` 每 channel 只有一个
+    // waiter 槽（`docs/task-model.md`）：并发注册会让后到者把在跑者的回传端顶掉，在跑
+    // 那条拿到 `Closed` 被误标成「执行超时」。已定产品语义是**排队**而非顶替——后到的
+    // job 停在这里，等前一条跑完轮次**并投递完**才轮到它。闸按 `job.chat_id`（群根
+    // 频道）分片，跨 normal/granted 两实例（同 chat 的两条不同 role 的 job 也要串行）。
+    let job_gate = bridge.job_gate(&job.chat_id);
+    let _job_gate_guard = job_gate.lock().await;
+    // 排队期间被停止词叫停：静默收尾，不 dispatch、不投递（与在跑取消同语义，#309）。
+    if queued_cancel
+        .as_ref()
+        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        bridge.unregister_job_turn(&job.id);
+        crate::log!(
+            "[bot:{bot_key}] 任务 {} 在排队期间被叫停，静默收尾（不投递）",
+            &job.id[..8]
+        );
+        if job.kind == crate::schedule::JobKind::Once {
+            bridge.jobs.remove(&job.id);
+        }
+        return;
+    }
     let reply: Option<String> = {
-        let granted = crate::config::restrict_granted(job.role, &bot_key);
-        let handle = bridge.acp_handles.as_ref().map(|hs| {
-            if granted {
-                hs.granted.clone()
-            } else {
-                hs.normal.clone()
-            }
-        });
-        // granted 能力闸：仅在有句柄可判时求值（None=未装配，走下方"agent 未装配"臂）。
-        let granted_blocked = handle.as_ref().is_some_and(|h| {
-            granted && h.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
-        });
-        let channel_id =
-            uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(&bot_key, &job.chat_id))
-                .expect("channel_uuid output must parse as Uuid");
         if granted_blocked {
+            bridge.unregister_job_turn(&job.id);
             crate::log!(
                 "[bot:{bot_key}] 任务 {} 拒跑：granted 受限实例未就绪或随包 agent 版本过旧（无 _meta.abbSandbox 能力）",
                 &job.id[..8]
@@ -1449,20 +1487,7 @@ async fn run_job(
                             adhoc: true,
                         },
                     );
-                    // #309 PR-A2：登记本轮，供会话内的停止词/`/cancel` 把取消送到
-                    // **本 job 实际使用的 handle 与 channel**（不是停止词发送者的角色）。
-                    // 登记在 dispatch 之前。注意这只保证**不会假吞停止词**：
-                    // starting/queued 阶段（waiter 尚未注册、handle.cancel 返回 false）
-                    // 的停止请求会落回原路径、job 之后仍会跑——那属于 queued 取消，
-                    // 见 #309 PR-B。
-                    bridge.register_job_turn(
-                        &job.id,
-                        crate::bridge::JobTurn {
-                            chat_id: job.chat_id.clone(),
-                            handle: h.clone(),
-                            channel_id,
-                        },
-                    );
+                    // 单飞串行下本 channel 至多一个 job waiter（闸保证），不会再被顶替。
                     let outcome = h
                         .wait_turn_outcome(
                             channel_id,
@@ -1486,10 +1511,11 @@ async fn run_job(
                         let _ = h.cancel(channel_id).await;
                     }
                     if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Closed) {
-                        // 等待者被同会话更新的任务顶替（每 channel 一个 waiter 槽），
-                        // 或句柄已关闭（服务在关停）——都不是「agent 没回」，静默收尾。
+                        // 单飞串行后等待者不再会被同 chat 的别的 job 顶替（#321 已修），
+                        // 走到这里只剩「句柄已关闭」（服务在关停）——不是「agent 没回」，
+                        // 按静默收尾（不发超时文案）。
                         crate::log!(
-                            "[bot:{bot_key}] 任务 {} 的等待者已被顶替或句柄已关闭 → 静默收尾（不发超时文案）",
+                            "[bot:{bot_key}] 任务 {} 的句柄已关闭 → 静默收尾（不发超时文案）",
                             &job.id[..8]
                         );
                     }
@@ -2009,9 +2035,10 @@ mod tests {
         }
     }
 
-    /// #321：job 轮次结局 → 文案映射。`Closed` 是「等待者被同会话更新的任务顶替 /
-    /// 句柄已关闭」，**不是**「agent 无回复」——不能再共用超时文案（同 chat 并发 job 时，
-    /// 在跑那条的 waiter 会被后登记那条顶替，历史上因此误报「执行超时」）。
+    /// #321：job 轮次结局 → 文案映射。`Closed` 是「句柄已关闭（服务在关停）」，
+    /// **不是**「agent 无回复」——不能共用超时文案。（历史上它还有第二个来源：
+    /// 同 chat 并发 job 时后登记那条顶掉在跑那条的 waiter，从而误报「执行超时」；
+    /// 该路径已由同 chat 单飞串行关闭，见 `docs/task-model.md` §B。）
     #[test]
     fn job_outcome_reply_does_not_mislabel_closed_as_timeout() {
         use crate::buzz::harness::SyncTurnOutcome as O;
@@ -2023,7 +2050,7 @@ mod tests {
         assert_eq!(
             job_outcome_reply(&O::Closed),
             None,
-            "Closed（等待者被顶替/句柄关闭）不得报超时"
+            "Closed（句柄已关闭）不得报超时"
         );
         assert_eq!(
             job_outcome_reply(&O::Timeout),

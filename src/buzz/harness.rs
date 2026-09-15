@@ -131,13 +131,14 @@ pub enum SyncTurnOutcome {
     Ok(String),
     /// 调用方预算先到（在途回合可能仍在跑——调用方负责 cancel 防迟发）。
     Timeout,
-    /// 句柄已关闭，消息 push 不进主循环。另见 `wait_turn_outcome` 的
-    /// `Ok(None)` 臂：同 channel_id 并发两次等待时后注册者**顶替**前者，
-    /// 被顶替方的回传端消失也归本臂。
+    /// 句柄已关闭，消息 push 不进主循环。`wait_turn_outcome` 的 `Ok(None)` 臂
+    /// （等待者回传端消失）也折叠到本变体。
     ///
-    /// **可达**：调度按 `job.id` 防重入，同一 chat 的两条 job 可并发进入 `run_job`
-    /// 并共用同一 channel → 后登记那条顶掉在跑那条的 waiter（#321）。job 侧对
-    /// `Closed` 的处理见 `service::job_outcome_reply`（静默收尾，不复用超时文案）。
+    /// **可达**：`Ok(None)` 那条曾由「同一 chat 的两条 job 并发进入 `run_job`、
+    /// 后登记那条顶掉在跑那条的 waiter」触发（#321）；job 侧已改为**同 chat 单飞
+    /// 串行**（`run_job` 全程持 `Bridge::job_gate`，见 `docs/task-model.md` §B），
+    /// 该来源不再可达——现在只剩「句柄已关闭（服务在关停）」。job 侧对 `Closed`
+    /// 的处理见 `service::job_outcome_reply`（静默收尾，不复用超时文案）。
     Closed,
     /// 取消**终态**（#309 PR-A1）：该轮以取消收尾，且其批次已被丢弃、不会重提示
     /// ——不是「取消信号已发出」这种中间态。与 Timeout 同款 teardown 已完成。

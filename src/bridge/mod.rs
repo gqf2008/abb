@@ -60,13 +60,30 @@ pub struct BotAcpHandles {
 ///   再选一次可能选到另一个实例，取消就打偏了；
 /// - 存 job 自己的 `channel_id`（job 恒跑群根频道），而查询按 `chat_id` 做——停止词可能
 ///   从该 chat 的任意话题发来；
-/// - `JobTurn` 不持有取消信号：取消走 `handle.cancel(channel_id)`，A1 已让该频道的同步
-///   waiter 拿到 `SyncTurnOutcome::Cancelled` 终态。
+/// - `cancel` 标记用于**在 job 串行闸前**登记的 job（#321 单飞串行）：同 chat 后续
+///   job 会先登记、再等闸；停止词必须能让尚未 dispatch 的排队 job 也静默退出，
+///   不能只取消在跑那条。
 #[derive(Clone)]
 pub(crate) struct JobTurn {
     pub chat_id: String,
     pub handle: Arc<crate::buzz::harness::BuzzHandle>,
     pub channel_id: uuid::Uuid,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl JobTurn {
+    pub(crate) fn new(
+        chat_id: String,
+        handle: Arc<crate::buzz::harness::BuzzHandle>,
+        channel_id: uuid::Uuid,
+    ) -> Self {
+        Self {
+            chat_id,
+            handle,
+            channel_id,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 }
 
 pub struct Bridge {
@@ -96,6 +113,9 @@ pub struct Bridge {
     /// 每个 chat_id 一把 tokio 异步锁；锁 Arc 从 std Mutex 的 HashMap 取出后再 await，
     /// 不跨 await 持有 std 锁。
     chat_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// #321：同 chat 多 job 单飞串行的闸表（见 `job_gate`）。与 `chat_locks` 分开：
+    /// job 的持闸时长可达 `MAX_TURN_DURATION`，不能拖住 chat 回合的串行锁。
+    job_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 正在跑的**定时任务轮次**（#309 PR-A2）：job_id → JobTurn。
     /// 键用 job id（调度按 job.id 防重入，同一 chat 可以有多个 job 同时在册，用 chat_id
     /// 当键会互相覆盖）；停止词查询时按 chat_id 扫描（条目数极小）。
@@ -255,6 +275,14 @@ impl Bridge {
     /// 检查处被 chat 回合消费，排队的 job 不在本轮取消（与 chat cancel 同口径）。
     pub(crate) async fn cancel_job_turns_for_chat(&self, chat_id: &str) -> bool {
         let turns = self.job_turns_for_chat(chat_id);
+        // **先整批置位、再逐条 await**（审查：#321 单飞串行引入的窄竞态）。若边置位边
+        // drop/cancel，快照里靠前那条被 `await` 叫停后可能立刻收尾并释放 job 闸，而靠后的
+        // 排队 job 此时**还没被置位** → 它会顺利过闸前检查、照跑（用户的「停」漏掉它）。
+        // 两趟走完，任何排队中的 job 在闸被释放前都已经是「已取消」。
+        for turn in &turns {
+            turn.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut cancelled = false;
         for turn in turns {
             // 顺序有讲究：**先丢排队中的 job 消息**。因为「job 还在排队」的前提正是
@@ -403,6 +431,7 @@ impl Bridge {
             bot,
             seen: Mutex::new(HashSet::new()),
             chat_locks: Mutex::new(HashMap::new()),
+            job_gates: Mutex::new(HashMap::new()),
             job_turns: Mutex::new(HashMap::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             history_epochs: Mutex::new(HashMap::new()),
@@ -445,6 +474,21 @@ impl Bridge {
     fn chat_lock(&self, chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.chat_locks.lock().unwrap();
         locks
+            .entry(chat_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// #321：取某 chat 的**定时任务串行闸**（get-or-create）。按 `job.chat_id`（群根
+    /// 频道）分片——job 恒跑群根频道，停止词路由与查询也按 `chat_id` 做。`run_job`
+    /// 在整段轮次（登记 → 等待 → 投递）持闸，同 chat 的后到 job 在此排队。
+    ///
+    /// 刻意**不复用** `chat_lock`：后者是 chat 回合的会话/历史串行锁，让一个可能跑
+    /// 一小时（`MAX_TURN_DURATION`）的 job 占着它，会把同 chat 的用户消息卡在
+    /// `virtualbot::handle` 的锁上（且 `deliver_turn_reply`/`flush_outbox` 也会被拖住）。
+    pub(crate) fn job_gate(&self, chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.job_gates.lock().unwrap();
+        gates
             .entry(chat_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -1020,6 +1064,10 @@ mod tests {
         }
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
+        }
+        /// (chat_id, text) 全量记录（按目标断言用；#321 的多目标投递用例依赖它）。
+        fn sent_chats(&self) -> Vec<(String, String)> {
+            self.sent_chats.lock().unwrap().clone()
         }
     }
     #[async_trait]
@@ -3688,22 +3736,8 @@ mod tests {
         let h = tiny_buzz_handle();
         let c1 = uuid::Uuid::new_v4();
         let c2 = uuid::Uuid::new_v4();
-        bridge.register_job_turn(
-            "jobA",
-            JobTurn {
-                chat_id: "oc_multi".into(),
-                handle: h.clone(),
-                channel_id: c1,
-            },
-        );
-        bridge.register_job_turn(
-            "jobB",
-            JobTurn {
-                chat_id: "oc_multi".into(),
-                handle: h.clone(),
-                channel_id: c2,
-            },
-        );
+        bridge.register_job_turn("jobA", JobTurn::new("oc_multi".into(), h.clone(), c1));
+        bridge.register_job_turn("jobB", JobTurn::new("oc_multi".into(), h.clone(), c2));
         assert_eq!(
             bridge.job_turns_for_chat("oc_multi").len(),
             2,
@@ -3732,11 +3766,7 @@ mod tests {
         tokio::spawn(crate::buzz::harness::run_loop(h.clone()));
         bridge.register_job_turn(
             "jobIdle",
-            JobTurn {
-                chat_id: "oc_idlejob".into(),
-                handle: h.clone(),
-                channel_id: uuid::Uuid::new_v4(),
-            },
+            JobTurn::new("oc_idlejob".into(), h.clone(), uuid::Uuid::new_v4()),
         );
 
         bridge.handle(test_ev("m1", "oc_idlejob", "停")).await;
@@ -3939,11 +3969,7 @@ mod tests {
         });
         bridge.register_job_turn(
             "job-queued-1",
-            JobTurn {
-                chat_id: chat_id.clone(),
-                handle: buzz.clone(),
-                channel_id,
-            },
+            JobTurn::new(chat_id.clone(), buzz.clone(), channel_id),
         );
 
         // 3) 走生产停止词路由。重试直到那条 job 消息确实进了队列——判据就是被测行为
@@ -3989,6 +4015,275 @@ mod tests {
         );
 
         bridge.unregister_job_turn("job-queued-1");
+        cleanup_bridge(&bridge);
+    }
+
+    /// #321：同 chat 多 job **单飞串行**——A 在跑 + B 同 chat 到期时，B 在 `job_gate`
+    /// 上**排队**，不再像从前那样在 harness 的 `sync_waiters`（每 channel 一个槽）里
+    /// 顶掉 A 的回传端。
+    ///
+    /// 修前症状（本用例存在的理由）：B 的注册把 A 的 tx drop 掉 → A 拿到 `Closed` →
+    /// 走「等待者被顶替」臂；A 那条轮次的真实文本还会被 B 的等待者取走、按 **B 的**
+    /// header/targets 投递（串目标），两条 job 都可能既不投自己的目标也不留痕。
+    ///
+    /// 断言：A、B 各按**自己的** header 与 targets 恰好投一条、顺序 A→B、且全场无
+    /// 「执行超时」文案（那正是用户在 #321 里看到的误导性报错）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn same_chat_jobs_single_flight_serial_own_targets() {
+        let runner = Arc::new(MockAgentRunner::immediate("x"));
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        // A 收到 prompt 后延迟应答 → 造出确定的「A 在跑」窗口，好在其中启动 B。
+        //（只等「登记可见」不够：登记在取闸之前，此时 A 可能还没 dispatch。）
+        let (buzz, handles) = make_test_harness_full(
+            rec.clone(),
+            &registry,
+            None,
+            vec![("MOCK_PROMPT_DELAY_MS".to_string(), "1500".to_string())],
+        );
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("claude"),
+            Some((buzz.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+        let bot_key = bridge.bot.key();
+
+        let uniq = uuid::Uuid::new_v4();
+        let chat_id = format!("oc_serial_{uniq}");
+        let target_a = format!("oc_target_a_{uniq}");
+        let target_b = format!("oc_target_b_{uniq}");
+        let mk_job = |id: &str, kind: crate::schedule::JobKind, prompt: &str, target: &str| {
+            crate::schedule::Job {
+                id: id.to_string(),
+                kind,
+                schedule: String::new(),
+                prompt: prompt.to_string(),
+                chat_id: chat_id.clone(),
+                note: String::new(),
+                targets: vec![crate::schedule::JobTarget {
+                    bot_key: String::new(), // 空 = 本 bot
+                    chat_id: target.to_string(),
+                }],
+                role: crate::config::SenderRole::Owner,
+            }
+        };
+        let job_a = mk_job(
+            "job-serial-a",
+            crate::schedule::JobKind::Once,
+            "PROMPT_MARKER_ALPHA",
+            &target_a,
+        );
+        let job_b = mk_job(
+            "job-serial-b",
+            crate::schedule::JobKind::Cron,
+            "PROMPT_MARKER_BETA",
+            &target_b,
+        );
+
+        // 多目标走 Router：目标即本 bot 的另一个会话，messenger 复用同一挡板。
+        let router = Arc::new(crate::deliver::Router::new(
+            true,
+            std::collections::HashMap::from([(
+                bot_key.clone(),
+                msgr.clone() as Arc<dyn crate::messenger::Messenger>,
+            )]),
+            std::collections::HashMap::from([(bot_key.clone(), bridge.bot.clone())]),
+            None,
+        ));
+
+        let b = bridge.clone();
+        let r = router.clone();
+        let a = tokio::spawn(async move {
+            crate::service::run_job_for_test(b, r, job_a).await;
+        });
+        // 等 A 的 prompt 真的进了 agent（= A 的 waiter 已注册、轮次在跑）。
+        let mut waited_ms = 0u64;
+        while !read_prompts(&rec)
+            .iter()
+            .any(|p| p.contains("PROMPT_MARKER_ALPHA"))
+        {
+            assert!(waited_ms < 20_000, "job A 的 prompt 未被 agent 接收");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited_ms += 25;
+        }
+        // A 在跑期间启动 B：修前后差异就发生在这里（B 会/不会顶掉 A 的 waiter）。
+        let b2 = bridge.clone();
+        let r2 = router.clone();
+        let bt = tokio::spawn(async move {
+            crate::service::run_job_for_test(b2, r2, job_b).await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            a.await.expect("job A 任务不应 panic");
+            bt.await.expect("job B 任务不应 panic");
+        })
+        .await
+        .expect("同 chat 两条 job 必须都能收尾（不得互相顶替后挂死）");
+
+        let chats = msgr.sent_chats();
+        let to_a: Vec<&(String, String)> = chats.iter().filter(|(c, _)| c == &target_a).collect();
+        let to_b: Vec<&(String, String)> = chats.iter().filter(|(c, _)| c == &target_b).collect();
+        assert_eq!(to_a.len(), 1, "A 的目标会话必须恰好收到 1 条：{chats:?}");
+        assert_eq!(to_b.len(), 1, "B 的目标会话必须恰好收到 1 条：{chats:?}");
+        assert!(
+            to_a[0].1.starts_with("⏰ 定时提醒"),
+            "A 是 Once，header 必须属 A：{:?}",
+            to_a[0].1
+        );
+        assert!(
+            to_a[0].1.contains("PROMPT_MARKER_ALPHA"),
+            "A 的目标必须收到 A 自己轮次的文本（串目标回归）：{:?}",
+            to_a[0].1
+        );
+        assert!(
+            to_b[0].1.starts_with("⏰ 定时任务"),
+            "B 是 Cron，header 必须属 B：{:?}",
+            to_b[0].1
+        );
+        assert!(
+            to_b[0].1.contains("PROMPT_MARKER_BETA"),
+            "B 的目标必须收到 B 自己轮次的文本（串目标回归）：{:?}",
+            to_b[0].1
+        );
+        assert!(
+            !chats.iter().any(|(_, t)| t.contains("执行超时")),
+            "#321 的误导性超时文案必须彻底消失：{chats:?}"
+        );
+        let ia = chats.iter().position(|(c, _)| c == &target_a).unwrap();
+        let ib = chats.iter().position(|(c, _)| c == &target_b).unwrap();
+        assert!(ia < ib, "单飞串行：A 必须先投递完才轮到 B：{chats:?}");
+
+        // 两条 job 的 prompt 各进 agent 恰一次：不重复、也不因顶替而缺失。
+        let prompts = read_prompts(&rec);
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|p| p.contains("PROMPT_MARKER_ALPHA"))
+                .count(),
+            1,
+            "A 的轮次应恰跑一次"
+        );
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|p| p.contains("PROMPT_MARKER_BETA"))
+                .count(),
+            1,
+            "B 的轮次应恰跑一次（排队后照跑，不丢）"
+        );
+        assert!(
+            bridge.job_turns_for_chat(&chat_id).is_empty(),
+            "收尾必须摘除 job 登记"
+        );
+        cleanup_bridge(&bridge);
+    }
+
+    /// #321 × #309：**排队在单飞闸上**的 job 也必须能被停止词叫停。
+    ///
+    /// 单飞串行让「排队」从 harness 的队列（`drop_queued_jobs` 能看见）前移到了
+    /// `job_gate`（harness 完全看不见）——所以 `JobTurn` 必须在**取闸之前**登记，停止词
+    /// 才能看到这条还没 dispatch 的 job；取到闸后再按 `cancel` 标记静默退出。
+    /// 否则停止词只命中在跑的 A，B 会在 A 收尾后**照跑**（用户明明已经叫停）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn stop_word_cancels_job_queued_behind_single_flight_gate() {
+        let runner = Arc::new(MockAgentRunner::immediate("x"));
+        let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
+        let registry: crate::bridge::BridgeRegistry = Default::default();
+        let (buzz, handles) = make_test_harness_full(
+            rec.clone(),
+            &registry,
+            None,
+            // 给 A 一段确定的「在跑」时长，好在其中把 B 排上闸并发停止词。
+            vec![("MOCK_PROMPT_DELAY_MS".to_string(), "2500".to_string())],
+        );
+        let (bridge, msgr) = build_test_bridge_full(
+            runner.clone(),
+            backend_bot("claude"),
+            Some((buzz.clone(), handles)),
+        );
+        registry.register(&bridge.bot.key(), &bridge);
+
+        let chat_id = format!("oc_gatecancel_{}", uuid::Uuid::new_v4());
+        let mk_job = |id: &str, prompt: &str| crate::schedule::Job {
+            id: id.to_string(),
+            kind: crate::schedule::JobKind::Once,
+            schedule: String::new(),
+            prompt: prompt.to_string(),
+            chat_id: chat_id.clone(),
+            note: String::new(),
+            targets: Vec::new(), // 单目标：直接 send_text 到原会话
+            role: crate::config::SenderRole::Owner,
+        };
+        let job_a = mk_job("job-gate-a", "PROMPT_MARKER_ALPHA");
+        let job_b = mk_job("job-gate-b", "PROMPT_MARKER_BETA");
+        let router = Arc::new(crate::deliver::Router::new(
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+        ));
+
+        let b = bridge.clone();
+        let r = router.clone();
+        let a = tokio::spawn(async move {
+            crate::service::run_job_for_test(b, r, job_a).await;
+        });
+        let mut waited_ms = 0u64;
+        while !read_prompts(&rec)
+            .iter()
+            .any(|p| p.contains("PROMPT_MARKER_ALPHA"))
+        {
+            assert!(waited_ms < 20_000, "job A 的 prompt 未被 agent 接收");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited_ms += 25;
+        }
+        let b2 = bridge.clone();
+        let r2 = router.clone();
+        let bt = tokio::spawn(async move {
+            crate::service::run_job_for_test(b2, r2, job_b).await;
+        });
+        // B 的登记在**取闸之前**完成 ⇒ 登记出现即证明「B 已入闸排队且停止词可见」。
+        waited_ms = 0;
+        while bridge.job_turns_for_chat(&chat_id).len() < 2 {
+            assert!(waited_ms < 20_000, "job B 未在取闸前完成登记");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited_ms += 25;
+        }
+
+        // 走**生产的停止词入口**（Bridge::handle → cancel_job_turns_for_chat）。
+        bridge.handle(test_ev("m_stop_gate", &chat_id, "停")).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            a.await.expect("job A 任务不应 panic");
+            bt.await.expect("job B 任务不应 panic");
+        })
+        .await
+        .expect("被叫停后两条 job 都必须及时收尾（B 不得在 A 之后偷跑）");
+
+        assert!(
+            msgr.sent().is_empty(),
+            "被叫停的 job 不得投递任何东西（含被叫停的排队 job）：{:?}",
+            msgr.sent()
+        );
+        assert!(
+            !read_prompts(&rec)
+                .iter()
+                .any(|p| p.contains("PROMPT_MARKER_BETA")),
+            "排队期间被叫停的 job 不得进入 agent"
+        );
+        assert!(
+            bridge.job_turns_for_chat(&chat_id).is_empty(),
+            "两条 job 都必须摘除登记"
+        );
         cleanup_bridge(&bridge);
     }
 
