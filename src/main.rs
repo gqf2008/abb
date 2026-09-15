@@ -893,7 +893,7 @@ fn run_task_cli(args: &[String]) -> i32 {
             }
             if rt.kind == K::Running {
                 println!(
-                    "任务 {} 正在运行，已请求终止（数秒内收尾，结果不再投递）",
+                    "任务 {} 正在运行，已请求终止（数秒内生效、结果不再投递；若该轮刚好已收尾则本条无效）",
                     t.id
                 );
             } else {

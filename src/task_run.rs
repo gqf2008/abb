@@ -51,6 +51,11 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 用户主动取消的落盘原因（`task status` 展示 + 日志留痕）。
 const CANCEL_REASON: &str = "已取消（用户 task cancel）";
 
+/// service 关停联动取消的落盘原因。与 [`CANCEL_REASON`] 分开：两者都走
+/// `SyncTurnOutcome::Cancelled`，但「谁取消的」是排障首先要看的信息（审查指出
+/// 关停被记成「用户 task cancel」是错的）。
+const CANCEL_REASON_SHUTDOWN: &str = "已取消（service 关停）";
+
 /// 尚未开跑就被取消的落盘原因。
 const CANCEL_REASON_BEFORE_START: &str = "已取消（task cancel，尚未开跑）";
 
@@ -173,8 +178,11 @@ pub(crate) async fn run_attempt(
     // 「service 关停 ∪ 用户取消请求」的合并——`child_token()` 随父（关停）取消，
     // watcher 命中取消请求时再单独 cancel 这个子令牌（不反cancel 父，关停语义不变）。
     let attempt_cancel = stop.child_token();
+    // 记录「这一轮的取消究竟是谁发的」：两种来源都折叠成 Cancelled，落盘原因要分开。
+    let user_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_watch = {
         let token = attempt_cancel.clone();
+        let user_cancelled = user_cancelled.clone();
         let req = states.paths().cancel_file(&id);
         tokio::spawn(async move {
             loop {
@@ -183,6 +191,7 @@ pub(crate) async fn run_attempt(
                 }
                 if req.exists() {
                     crate::log!("[task] 收到取消请求（{}），终止在跑轮次", req.display());
+                    user_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                     token.cancel();
                     return;
                 }
@@ -227,7 +236,11 @@ pub(crate) async fn run_attempt(
                 kind: TaskStateKind::Cancelled,
                 started_at: Some(started),
                 finished_at: Some(finished),
-                last_error: CANCEL_REASON.to_string(),
+                last_error: if user_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    CANCEL_REASON.to_string()
+                } else {
+                    CANCEL_REASON_SHUTDOWN.to_string()
+                },
                 restarts,
                 ..Default::default()
             },
