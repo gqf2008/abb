@@ -129,6 +129,9 @@ pub struct Bridge {
     /// 一键创建团队·聊天入口的会话态（#124 P1）：按 chat key 持久化
     /// `workspaces/<bot>/teamflow.json`，重启不丢（确认/改/取消可跨重启）。
     team_flows: crate::teamflow::TeamFlowStore,
+    /// 团队登记表路径（#147）：生产指向 `~/.agent-bridge/teams.json`；测试注入 temp，
+    /// 团队确认/解散流程不得借 `TeamStore::new()` 改写用户整表。
+    team_store: crate::teamreg::TeamStore,
     /// 团队方案生成器（#124 测试可测性）：生产 RealTeamPlanGenerator 转发 teambuilder；
     /// 测试注入挡板返回固定方案/错误（仿 agent_runner 设计）。
     team_gen: Arc<dyn crate::teamflow::TeamPlanGenerator>,
@@ -164,6 +167,9 @@ pub struct Bridge {
     /// 三级 AGENTS.md / 会话摘要的注入根（生产 = `~/.agent-bridge`；测试注入 temp 根，
     /// 不碰真实 ~/.agent-bridge/AGENTS.md）。session_gc::run_once 与 bridge 注入点共用。
     pub agents_md_root: std::path::PathBuf,
+    /// bridge 运行数据根：生产 = `~/.agent-bridge`，测试 = 每次唯一的 temp 根。
+    /// 所有持久化 store 从它派生，保证测试既能走生产构造路径、又不碰真实运行数据。
+    bridge_root: std::path::PathBuf,
 }
 
 #[derive(Debug)]
@@ -364,6 +370,17 @@ impl Bridge {
         cfg: &Config,
         agent_runner: Arc<dyn AgentRunner>,
     ) -> Bridge {
+        Self::build_at(msgr, bot, cfg, agent_runner, &crate::bridge_dir())
+    }
+
+    /// [`Bridge::build`] 的隔离根版本：所有持久化 store 都从 `bridge_root` 派生。
+    fn build_at(
+        msgr: Arc<dyn Messenger>,
+        bot: BotConfig,
+        cfg: &Config,
+        agent_runner: Arc<dyn AgentRunner>,
+        bridge_root: &std::path::Path,
+    ) -> Bridge {
         // 单后端化（P4.1）：会话槽位恒选 buzz（老配置 backend/default_backend 字段
         // 直接忽略——serde 无 deny_unknown_fields 天然容错；槽位折叠在 P4.2）。
         let key = bot.key();
@@ -371,7 +388,10 @@ impl Bridge {
         // 直接用它的 mention_modes 种子化，无需再扫 cfg.bots（两份来源可能漂移）。
         let cfg_snapshot = cfg.clone();
         let mention_seed = bot.mention_modes.clone();
-        let sessions = SessionStore::new(&key);
+        let workspace = bridge_root.join("workspaces").join(&key);
+        let _ = std::fs::create_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(bridge_root.join("logs"));
+        let sessions = SessionStore::at(workspace.join("sessions.json"));
         Bridge {
             msgr,
             cfg_snapshot,
@@ -379,7 +399,7 @@ impl Bridge {
             acp_handles: None, // service run_bot 按 bot 注入句柄对；None=未装配（测试/回落）
             turn_registry: Mutex::new(HashMap::new()), // #206 回合登记（内存态）
             vb_sessions: Mutex::new(HashMap::new()),
-            jobs: JobStore::new(&bot.key()),
+            jobs: JobStore::at(workspace.join("jobs.json")),
             bot,
             seen: Mutex::new(HashSet::new()),
             chat_locks: Mutex::new(HashMap::new()),
@@ -387,15 +407,19 @@ impl Bridge {
             cancel_flags: Mutex::new(HashMap::new()),
             history_epochs: Mutex::new(HashMap::new()),
             mention_snapshot: Mutex::new(mention_seed),
-            outbox: OutboxStore::new(&key),
-            pending: PendingStore::new(&key),
-            team_flows: crate::teamflow::TeamFlowStore::new(&key),
+            outbox: OutboxStore::new_at(workspace.join("pending_outbox.json")),
+            pending: PendingStore::at(workspace.join("pending.json")),
+            team_flows: crate::teamflow::TeamFlowStore::at(workspace.join("teamflow.json")),
+            team_store: crate::teamreg::TeamStore::new_at(bridge_root.join("teams.json")),
             team_gen: Arc::new(crate::teamflow::RealTeamPlanGenerator),
             agent_runner,
             // #75：启动即加载登记快照 + 记录文件签名（后续由 refresh_virtual_bots 懒刷新）
-            virtual_bots: Mutex::new(crate::virtualbot::VirtualBotStore::new().load()),
+            virtual_bots: Mutex::new(
+                crate::virtualbot::VirtualBotStore::new_at(bridge_root.join("virtual-bots.json"))
+                    .load(),
+            ),
             virtual_bots_mtime: Mutex::new(
-                std::fs::metadata(crate::bridge_dir().join("virtual-bots.json"))
+                std::fs::metadata(bridge_root.join("virtual-bots.json"))
                     .ok()
                     .map(|m| {
                         (
@@ -405,11 +429,16 @@ impl Bridge {
                     }),
             ),
             chat_info_cache: crate::virtualbot::ChatInfoCache::new(),
-            msgstore: crate::msgstore::MsgStore::production(),
-            unread: crate::unread::UnreadStore::production(),
-            vb_store: crate::virtualbot::VirtualBotStore::new(),
-            session_state: crate::session_state::SessionState::production(),
-            agents_md_root: crate::bridge_dir(),
+            msgstore: crate::msgstore::MsgStore::at(bridge_root.join("messages.sqlite")),
+            unread: crate::unread::UnreadStore::at(bridge_root.join("logs").join("unread.json")),
+            vb_store: crate::virtualbot::VirtualBotStore::new_at(
+                bridge_root.join("virtual-bots.json"),
+            ),
+            session_state: crate::session_state::SessionState::at(
+                bridge_root.join("session_state.json"),
+            ),
+            agents_md_root: bridge_root.to_path_buf(),
+            bridge_root: bridge_root.to_path_buf(),
         }
     }
 
@@ -1517,28 +1546,12 @@ mod tests {
         }];
         test_cfg.default_provider = "test-prov".into();
         test_cfg.bots = vec![bot.clone()]; // provider_for_bot_key_of 按 key 找 bot
-        let mut bridge = Bridge::build(msgr.clone(), bot, &test_cfg, runner);
+        let key = bot.key();
+        let test_root = std::env::temp_dir().join(format!("abb-bridge-test-{key}"));
+        let mut bridge = Bridge::build_at(msgr.clone(), bot, &test_cfg, runner, &test_root);
         if let Some((_, handles)) = acp {
             bridge.acp_handles = Some(handles);
         }
-        // 按 bot key 命名（key 本身唯一），cleanup_bridge 可按 key 回收
-        let key = bridge.bot.key();
-        bridge.msgstore = crate::msgstore::MsgStore::at(
-            std::env::temp_dir().join(format!("abb-msgstore-test-{key}")),
-        );
-        bridge.unread = crate::unread::UnreadStore::at(
-            std::env::temp_dir().join(format!("abb-unread-test-{key}")),
-        );
-        bridge.vb_store = crate::virtualbot::VirtualBotStore::new_at(
-            std::env::temp_dir().join(format!("abb-vb-test-{key}.json")),
-        );
-        // #87 会话管控状态注入临时路径：不碰真实 ~/.agent-bridge/session_state.json
-        bridge.session_state = crate::session_state::SessionState::at(
-            std::env::temp_dir().join(format!("abb-sessstate-test-{key}.json")),
-        );
-        // 三级 AGENTS.md 注入根注入临时目录：不碰真实 ~/.agent-bridge/AGENTS.md
-        //（现有测试断言 prompt 精确相等，真实 abb 级文件会破坏它们）
-        bridge.agents_md_root = std::env::temp_dir().join(format!("abb-agentsmd-root-{key}"));
         (Arc::new(bridge), msgr)
     }
 
@@ -1581,25 +1594,11 @@ mod tests {
     }
 
     fn cleanup_bridge(bridge: &Bridge) {
-        // 跑完删整个工作目录：sessions.json / jobs.json / outbox 一并清理
+        // 每个测试 Bridge 的全部持久化 store 都在唯一 temp 根下；整树回收。
+        debug_assert!(bridge.bridge_root.starts_with(std::env::temp_dir()));
+        let _ = std::fs::remove_dir_all(&bridge.bridge_root);
+        // history 仍按既有生产 API 走 `workspace_dir`；测试 bot key 唯一，按 key 回收。
         let _ = std::fs::remove_dir_all(crate::workspace_dir(&bridge.bot.key()));
-        // #74：回收测试注入的临时消息库/未读文件（按 bot key 命名 + WAL 伴生文件，
-        // 见 build_test_bridge_with_bot）
-        let key = bridge.bot.key();
-        for (prefix, suffix) in [
-            ("abb-msgstore-test-", ""),
-            ("abb-msgstore-test-", "-wal"),
-            ("abb-msgstore-test-", "-shm"),
-            ("abb-unread-test-", ""),
-            ("abb-vb-test-", ".json"),
-            ("abb-agentsmd-root-", ""),
-        ] {
-            let _ =
-                std::fs::remove_file(std::env::temp_dir().join(format!("{prefix}{key}{suffix}")));
-        }
-        // agents_md_root 是目录（workspaces/<key>/ 含子目录），整树删除
-        let _ =
-            std::fs::remove_dir_all(std::env::temp_dir().join(format!("abb-agentsmd-root-{key}")));
     }
 
     #[tokio::test]
@@ -1732,9 +1731,13 @@ mod tests {
     async fn restart_reinjects_history_on_harness_path() {
         let bot = backend_bot("buzz");
         let chat = format!("oc_restart_{}", uuid::Uuid::new_v4());
+        let key = bot.key();
+        let test_root = std::env::temp_dir().join(format!("abb-bridge-test-{key}"));
+        let workspace = test_root.join("workspaces").join(&key);
+        let _ = std::fs::create_dir_all(workspace.join("history"));
         // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 buzz 槽）
         {
-            let sessions = crate::sessions::SessionStore::new(&bot.key());
+            let sessions = crate::sessions::SessionStore::at(workspace.join("sessions.json"));
             let sid = sessions.ensure_with_started(&chat).0;
             assert!(sessions.mark_started_if(&chat, &sid));
             let hist = crate::history::History::open(&bot.key(), &chat);
@@ -4844,11 +4847,14 @@ https://b.com/y"
             ..Default::default()
         };
         let msgr = Arc::new(MockMessenger::new());
-        let bridge = Arc::new(Bridge::build(
+        let key = bot.key();
+        let root = std::env::temp_dir().join(format!("abb-bridge-test-{key}"));
+        let bridge = Arc::new(Bridge::build_at(
             msgr.clone(),
             bot,
             &Config::default(),
             runner.clone(),
+            &root,
         ));
 
         let b1 = bridge.clone();
@@ -4875,11 +4881,14 @@ https://b.com/y"
             ..Default::default()
         };
         let msgr = Arc::new(MockMessenger::new());
-        let bridge = Arc::new(Bridge::build(
+        let key = bot.key();
+        let root = std::env::temp_dir().join(format!("abb-bridge-test-{key}"));
+        let bridge = Arc::new(Bridge::build_at(
             msgr.clone(),
             bot,
             &Config::default(),
             runner.clone(),
+            &root,
         ));
 
         let b1 = bridge.clone();
@@ -4899,11 +4908,14 @@ https://b.com/y"
             ..Default::default()
         };
         let msgr = Arc::new(MockMessenger::new());
-        let bridge = Arc::new(Bridge::build(
+        let key = bot.key();
+        let root = std::env::temp_dir().join(format!("abb-bridge-test-{key}"));
+        let bridge = Arc::new(Bridge::build_at(
             msgr.clone(),
             bot,
             &Config::default(),
             runner.clone(),
+            &root,
         ));
 
         let b1 = bridge.clone();

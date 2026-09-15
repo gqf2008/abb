@@ -200,16 +200,15 @@ impl Bridge {
         // #147：建群完成后登记团队（聊天入口 ↔ GUI 同一份数据源；部分成功也登记，
         // 重试「确认」时 register_created 按角色名合并补建成功的角色）。登记失败不阻断。
         if outcomes.iter().any(|o| o.ok) {
-            let regs = crate::teamreg::role_regs_from_plan(
-                plan,
-                &crate::virtualbot::VirtualBotStore::new(),
-                &self.bot.key(),
+            // 重新读登记表（而不是复用 build 时快照）：GUI/另一进程刚补的群也要解析到。
+            let vb_store = crate::virtualbot::VirtualBotStore::new_at(
+                self.bridge_root.join("virtual-bots.json"),
             );
-            if let Err(e) = crate::teamreg::TeamStore::new().register_created(
-                &self.bot.key(),
-                &plan.team_name,
-                regs,
-            ) {
+            let regs = crate::teamreg::role_regs_from_plan(plan, &vb_store, &self.bot.key());
+            if let Err(e) = self
+                .team_store
+                .register_created(&self.bot.key(), &plan.team_name, regs)
+            {
                 crate::log!(
                     "[bridge] 团队登记失败 bot={} team={}: {e}",
                     self.bot.key(),

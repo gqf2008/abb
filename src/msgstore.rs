@@ -58,11 +58,8 @@ impl MsgStore {
         MsgStore { path: db_path() }
     }
 
-    /// 按指定路径构造（测试注入临时路径，先例：DeliveryStore::new_at / PendingStore::at）。
-    /// cfg(test)：只有测试构建需要（bridge 测试注入隔离路径），非测试构建不编译，
-    /// 避免 dead_code。
-    #[cfg(test)]
-    pub fn at(path: PathBuf) -> MsgStore {
+    /// 按指定路径构造（bridge 根注入 / 测试隔离共用）。
+    pub(crate) fn at(path: PathBuf) -> MsgStore {
         MsgStore { path }
     }
 
