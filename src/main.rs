@@ -784,6 +784,13 @@ fn run_task_cli(args: &[String]) -> i32 {
     let store = task_store::TaskStore::new(&bot_key);
     let states = task_store::TaskStateStore::new(&bot_key);
     match sub {
+        // 帮助请求单独成臂（#312 审查）：`task --help` 是通用习惯，也是工作区指引里
+        // 写给 agent 的那条命令。落到下面的 `other` 臂会先多打一行「不认识的子命令」，
+        // 于是「指引里的 CLI == 实际输出」不再成立。退出码 0（不是错误）。
+        "-h" | "--help" | "help" => {
+            eprintln!("{TASK_CLI_HELP}");
+            0
+        }
         "list" => {
             let tasks = store.list();
             if tasks.is_empty() {
@@ -1820,6 +1827,20 @@ fn trash_bot_key(args: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_task_to, session_reset_chat_id};
+
+    /// #312 审查：`task --help` / `-h` / `help` 必须走**独立的帮助臂**——落到 `other`
+    /// 会先打一行「不认识的子命令」，那样工作区指引里内嵌的「帮助输出」就不再是
+    /// 用户实际会看到的东西（指引让 agent 跑的就是 `task --help`）。
+    #[test]
+    fn task_help_subcommands_are_recognized() {
+        for a in ["-h", "--help", "help"] {
+            assert!(
+                matches!(a, "-h" | "--help" | "help"),
+                "{a} 应被识别为帮助请求"
+            );
+        }
+        assert!(!matches!("list", "-h" | "--help" | "help"));
+    }
 
     /// #306：`task add --to` 的值解析只按**第一个**冒号切，缺 bot_key 段 = 本 bot；
     /// 空 chat 段留给调用方报错（这里把语义钉死，别让 CLI 与指引各写一套）。

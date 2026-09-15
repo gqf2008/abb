@@ -82,7 +82,7 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 会话」时，别在本回合里干等：用 `\"$ABB_BIN\" task add` 把它丢到后台，回一句「已丢后台，跑完发你」
 就结束本回合。反过来，需要多轮澄清、要边做边确认、几步就能做完的，自己做完，不要委派。
 
-**用法**（下面是 `task --help` 的输出原文；改了 CLI，这里会跟着变）：
+**用法**（下面是 `\"$ABB_BIN\" task --help` 的输出原文；改了 CLI，这里会跟着变）：
 
 ```
 {task_help}
@@ -98,7 +98,8 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 **结果投递**：
 
 - **缺省 = 投回创建者会话**（谁创建投给谁），无需手填 bot_key / chat_id；
-- 要发到别处：`--to bot_key:chat_id`（跨 bot 需用户在设置里打开「跨会话投递」开关）；
+- 要发到别处：`--to bot_key:chat_id`（`bot_key` 省略 = 本 bot）。**投到任何非创建者会话**
+  ——含跨 bot 与同 bot 的其它会话——都需要用户先在设置里打开「跨会话投递」开关；
   `--to-current` 显式发回本会话；
 - 投递失败会把原因写进任务运行态并回落到该 bot 主会话告警，**不静默丢**；
 - 用户取消（`task cancel <id>`）后不再投递结果。
@@ -925,6 +926,16 @@ mod tests {
             assert!(
                 text.contains("只放行 `task add`"),
                 "{name} 应写明受限会话只有 task add 可用"
+            );
+            // 跨会话开关门禁的是**所有非创建者会话**（含同 bot 其它 chat），
+            // 不是只有跨 bot——写窄了会让 agent 以为同 bot 转发不需要开关（审查指出）。
+            assert!(
+                text.contains("投到任何非创建者会话"),
+                "{name} 应写明跨会话投递开关的真实适用范围"
+            );
+            assert!(
+                text.contains("task --help"),
+                "{name} 应给出可执行的帮助命令（`task --help` 已是真命令）"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
