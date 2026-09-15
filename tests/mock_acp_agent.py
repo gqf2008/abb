@@ -60,6 +60,12 @@ for line in sys.stdin:
         chunks = params.get("prompt", [])
         text = "".join(c.get("text", "") for c in chunks if isinstance(c, dict))
         record({"event": "prompt", "sessionId": params.get("sessionId"), "text": text})
+        # 可选：记录 prompt 之后、应答之前再睡一会儿，造出确定的「回合已 in-flight
+        # 但尚未收尾」窗口（#321 的「A 在跑 + B 排队」时序用例需要它；默认 0 不影响
+        # 其它用例）。
+        _prompt_delay_ms = int(os.environ.get("MOCK_PROMPT_DELAY_MS", "0") or "0")
+        if _prompt_delay_ms > 0:
+            time.sleep(_prompt_delay_ms / 1000.0)
         sid = params.get("sessionId")
         if os.environ.get("MOCK_HANG_PROMPT"):
             # P3.1 oneshot Timeout 路径：只记录不应答（session/cancel 照收，
