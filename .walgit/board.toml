@@ -7,6 +7,23 @@ by = "ts"
 direction = "desc"
 
 [[column]]
+name = "merged"
+status = "merged"
+
+[[column]]
+name = "closed"
+status = "closed"
+
+# Surface PRs whose patch fails review/merge policy.
+[[column]]
+name = "merge-blocked"
+merge = "blocked"
+
+[[column]]
+name = "unverified"
+unverified = true
+
+[[column]]
 name = "open"
 status = "open"
 
@@ -25,23 +42,6 @@ status = "blocked"
 [[column]]
 name = "needs-human"
 status = "needs-human"
-
-[[column]]
-name = "merged"
-status = "merged"
-
-[[column]]
-name = "closed"
-status = "closed"
-
-# Surface PRs whose patch fails review/merge policy.
-[[column]]
-name = "merge-blocked"
-merge = "blocked"
-
-[[column]]
-name = "unverified"
-unverified = true
 
 # Catch-all: never hide a thread with a status this board does not know yet.
 [[column]]
