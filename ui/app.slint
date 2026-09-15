@@ -28,8 +28,10 @@ export global UiTokens {
     in property <color> banner-bg: PixelTheme.scheme == "dark" ? #332b0a : #fff3cd;  // 环境横幅底色
     in property <color> error-bg: PixelTheme.scheme == "dark" ? #3a1212 : #fff1f0;   // 安装失败详情底色
     // 窗口描边（no-frame 自绘窗）：**纯黑**（用户明确要求，不用灰）。
-    // 说明取舍：纯黑在白底/浅底上界限最清楚；压在近黑桌面（如深色终端）上会与底色接近，
-    // 那时靠 2px 的厚度区分。集中在本令牌，想换色只改这一处。
+    // 已知代价（审查实测，别当成已解决）：纯黑只在浅底上成立——白底对比 21:1，但压在
+    // #1a1a1a 深色桌面上只有 1.21:1，纯黑桌面则为 1:1（描边与底色重合时**加粗不会**产生
+    // 对比，只会让同色区域更大）。那种情况下窗口边界主要靠白色内容区与桌面的反差。
+    // 想换色只改这一处；若日后要兼顾深色桌面，得换亮色或加第二圈亮色描边。
     in property <color> window-frame: #000000;
     // 文字层级
     in property <color> text-dim: PixelTheme.scheme == "dark" ? #9a9a9a : #5c5c5c;        // 次要说明/占位（替代 #888）
