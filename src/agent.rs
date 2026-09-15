@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn sandbox_mode_mode_serde_roundtrip_and_defaults() {
-        // #163：kebab-case 反序列化 + auto 默认（旧 config 无字段兼容）+ 非 auto 落盘
+        // kebab-case 反序列化 + full-access 默认（旧 config 无字段兼容）+ Auto legacy 可读
         use crate::config::SandboxMode;
         // 枚举 serde：kebab-case
         let v: SandboxMode = serde_json::from_str("\"workspace-write\"").unwrap();
@@ -877,10 +877,20 @@ mod tests {
             serde_json::to_string(&SandboxMode::ReadOnly).unwrap(),
             "\"read-only\""
         );
-        // BotConfig 无该字段 → auto（旧 config 兼容）
+        // BotConfig 无该字段 → full-access（私人助理默认用户权限）
         let cfg: crate::config::BotConfig =
             serde_json::from_str(r#"{"name":"b1","app_id":"cli_app","app_secret":"s"}"#).unwrap();
-        assert_eq!(cfg.sandbox_mode, SandboxMode::Auto);
+        assert_eq!(cfg.sandbox_mode, SandboxMode::FullAccess);
+        assert!(
+            !serde_json::to_string(&cfg)
+                .unwrap()
+                .contains("sandbox_mode"),
+            "默认无限制档不应落盘"
+        );
+        // 旧 config 显式 auto 仍可读；owner 行为与 full-access 一致
+        let legacy: crate::config::BotConfig =
+            serde_json::from_str(r#"{"name":"b1","sandbox_mode":"auto"}"#).unwrap();
+        assert_eq!(legacy.sandbox_mode, SandboxMode::Auto);
     }
 
     /// SpawnRetiredRunner：生产占位必须如实报错（绝不 panic——任务治理捕获 panic

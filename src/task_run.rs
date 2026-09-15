@@ -522,7 +522,7 @@ mod tests {
         let oc = agent_cfg_for_task(&bot, &cfg, &o, bot_key);
         assert!(
             oc.session_sandbox.is_none(),
-            "owner 任务不该被额外收紧（默认档位 Auto → None）"
+            "owner 任务不该被额外收紧（默认档位 FullAccess → None）"
         );
         assert!(!oc.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"));
     }

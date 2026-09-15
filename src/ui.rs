@@ -849,9 +849,6 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         name: b.name.clone().into(),
         kind: b.kind.clone().into(),
         enabled: b.enabled,
-        // #168 权限档位（auto 默认）：单后端化后统一由随包 agent 执行（session/new
-        // `_meta` 下发）；UI 不再提供后端选择（P4.3 下架）。
-        sandbox_mode: b.sandbox_mode.as_str().into(),
         owner_open_id: b.owner_open_id.clone().into(),
         wx_owner_configured: !b.wx_user_id.is_empty(),
         owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
@@ -1291,7 +1288,7 @@ fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_mention_options(mk(bot.map(|b| b.mention_default).unwrap_or(false)));
 }
 
-/// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/类型/权限档位/供应商/Owner/
+/// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/类型/供应商/Owner/
 /// App ID/App Secret/钉钉机器人编码/钉钉 Owner）。输入/选择交互同样移除 text/index/value
 /// 绑定（与 checkbox 同源坑），直接绑 model 行属性会在切 bot 后残留上一 bot 的值；
 /// 整体替换 model → for 循环重建实例，绑定全新。密码框按现有语义回填原值（bot_to_row 已如此）。
@@ -1300,9 +1297,8 @@ fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     let b = bots.get(w.get_selected() as usize);
     let mk = |v: &str| -> slint::ModelRc<EditorRow> { single_model(EditorRow { value: v.into() }) };
     w.set_name_editor_options(mk(b.map(|b| b.name.as_str()).unwrap_or("")));
-    // 类型/权限档位下拉同款重建（PixelComboBox 点选内部赋值 index 同样断绑，残留上一 bot）
+    // 类型下拉同款重建（PixelComboBox 点选内部赋值 index 同样断绑，残留上一 bot）
     w.set_kind_editor_options(mk(b.map(|b| b.kind.as_str()).unwrap_or("")));
-    w.set_sandbox_editor_options(mk(b.map(|b| b.sandbox_mode.as_str()).unwrap_or("")));
     w.set_provider_editor_options(mk(b.map(|b| b.provider.as_str()).unwrap_or("")));
     w.set_owner_editor_options(mk(b.map(|b| b.owner_open_id.as_str()).unwrap_or("")));
     w.set_app_id_editor_options(mk(b.map(|b| b.app_id.as_str()).unwrap_or("")));
@@ -4484,27 +4480,6 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
-    // #168 权限档位下拉（每 bot，随包 agent 执行）：写 work + dirty + 同步 model
-    //（下拉 index 绑 model，不重建的话切 bot 后仍显示旧值）。
-    // full-access 警示行由 slint 按 model 值条件显示。
-    {
-        let work = work.clone();
-        let model = bots_model.clone();
-        let dirty = dirty.clone();
-        settings.on_sandbox_mode_changed(move |idx, opt| {
-            dirty.set(true);
-            let val = ["auto", "read-only", "workspace-write", "full-access"][opt as usize];
-            {
-                let mut b = work.borrow_mut();
-                if let Some(bot) = b.get_mut(idx as usize) {
-                    bot.sandbox_mode = crate::config::SandboxMode::parse(val);
-                }
-            }
-            // 同步回写 model：下拉 index 与警示行都绑 model，不刷新显示旧值
-            let b = work.borrow();
-            sync_model(&model, &b);
-        });
-    }
     {
         let work = work.clone();
         let sw = settings.as_weak();
