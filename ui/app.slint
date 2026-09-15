@@ -1337,12 +1337,19 @@ export component SettingsWindow inherits Window {
         width: 100%;
         height: 100%;
         background: PixelTheme.panel;
+        // 窗口边框：no-frame 自绘窗没有系统边框，浅色桌面上白底窗与其它白底窗相邻时
+        // 边界不可辨（用户反馈）。用主题的 border 令牌画 1px 内描边——颜色随
+        // PixelTheme.scheme 自动切（light=#1a1a1a / dark=#7f7f7f），不硬编码。
+        border-width: 1px;
+        border-color: PixelTheme.edge;
 
         VerticalBox {
             // 关键：VerticalBox/HorizontalBox 自带 StyleMetrics.layout-padding（fluent=8px），
-            // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。全部归零，
-            // 由各分区自己的 padding 精确控制。
-            padding: 0;
+            // 不归零会让内容四周多出 16px，顶部透出根背景形成「标题栏白条」。这里**只**
+            // 留 1px：正好让根 Rectangle 的 1px 边框露出四周（Slint 的 Rectangle 不会
+            // 为子元素自动让开 border-width，子元素铺满会把边框盖掉——实测只剩左右两侧
+            // 露线），其余分区仍由各自 padding 精确控制。
+            padding: 1px;
             // ── 像素自绘标题栏（no-frame）：拖拽/最小化/最大化/关闭（窗口可缩放，三按钮全开）──
             PixelTitleBar {
                 title: root.window-title;
