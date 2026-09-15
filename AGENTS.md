@@ -15,6 +15,23 @@ Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that b
 
 Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bridge/workspaces/<bot_key>/`.
 
+## Walgit Collaboration
+
+- **Canonical development remote**: `origin` is the local walgit repository at
+  `http://127.0.0.1:8081/gqf2008/abb.git`; `github` is a mirror/release remote only.
+- **All work tracking lives in walgit**: create/update issues, patches, reviews,
+  merge results and status transitions with `walgit collab` entries under
+  `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
+- **Standard flow**: signed `issue` -> `status: in-progress` with worktree/branch ->
+  `patch` -> `status: needs-review` -> independent `review` -> local merge ->
+  `merge_result` x2 -> `status: closed`.
+- **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
+  the tested tree. Move cards only by appending a signed `status` entry; never edit
+  the board to represent a state change.
+- **Mirror discipline**: push normal heads/tags to `origin` only. The local
+  walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
+  used for mirror/release artifacts, not day-to-day collaboration.
+
 ## Build, Test, and Development Commands
 
 - `cargo build` — debug build.
