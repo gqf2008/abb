@@ -15,6 +15,33 @@ Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that b
 
 Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bridge/workspaces/<bot_key>/`.
 
+## Walgit Collaboration
+
+- **Canonical development remote**: `origin` is the local walgit repository at
+  `http://127.0.0.1:8081/gqf2008/abb.git`; `github` is a mirror/release remote only.
+- **All work tracking lives in walgit**: create/update issues, patches, reviews,
+  merge results and status transitions with `walgit collab` entries under
+  `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
+- **Entry contract**: `issue` starts a thread; `comment` + `status: in-progress`
+  records owner/worktree/branch; `patch` uses `--base refs/heads/main --head
+  refs/heads/<branch>`; `review` uses `decision` (`approve` / `needs-changes`),
+  `agent`, and `note`; `needs-changes` returns to `status: in-progress`; approve
+  keeps `status: needs-review` until merge; after pushing the local merge, append
+  `merge_result` with the merged oid and then a second `merge_result` with
+  `merged=true`; finish with `status: closed`.
+- **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
+  the tested tree. Move cards only by appending a signed `status` entry; never edit
+  the board to represent a state change.
+- **Walgit CI runner**: `ci.toml` is only a declaration; the server does not execute
+  it. Start/supervise the local runner in screen `walgit-ci-abb` with the stable
+  main checkout:
+  `walgit --config ~/.walgit/walgit.toml ci run --repo /Volumes/DataExt/GitHub/abb --remote origin --actor ci-runner --key ~/.walgit/keys/ci-runner.ed25519`.
+  Check results with `walgit ci status --repo .`; a missing runner or zero runs is
+  not a pass.
+- **Mirror discipline**: push normal heads/tags to `origin` only. The local
+  walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
+  used for mirror/release artifacts, not day-to-day collaboration.
+
 ## Build, Test, and Development Commands
 
 - `cargo build` — debug build.
@@ -42,7 +69,12 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 
 - History is short; use imperative, concise subjects, optionally prefixed with the affected area (e.g., `feishu: …`).
 - Keep commits focused and explain *why* in the body.
-- PRs: describe what and why, link the issue, and run `cargo fmt --check`, `cargo clippy`, and `cargo test` locally. Include before/after screenshots for UI changes.
+- Walgit patch/PR entries: describe what and why, link the issue thread, and run
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --locked`, and `tools/check_test_isolation.sh` (the isolated test
+  runner is the full-test gate; do not substitute a bare `cargo test` because it
+  can write the real `~/.agent-bridge`). Include before/after screenshots for UI
+  changes. GitHub PRs are only for mirror/release maintenance.
 
 ## Security & Configuration
 

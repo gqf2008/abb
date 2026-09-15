@@ -1,0 +1,66 @@
+# walgit decentralized CI task declaration. The runner executes these commands
+# from the commit under test; local GitHub Actions remain the release mirror.
+version = 1
+
+claim_ttl = "75m"
+timeout = "60m"
+max_attempts = 1
+
+[[task]]
+name = "fmt"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo fmt --check"
+timeout = "10m"
+env_allow = ["CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER", "CARGO_TARGET_DIR"]
+
+[[task]]
+name = "clippy"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo clippy --all-targets -- -D warnings"
+timeout = "30m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
+
+[[task]]
+name = "build"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo build --locked"
+timeout = "30m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
+
+[[task]]
+name = "test"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "tools/check_test_isolation.sh"
+timeout = "45m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
+
+[[task]]
+name = "fork-lint"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo fmt --manifest-path crates/buzz-agent/Cargo.toml -- --check && cargo clippy --manifest-path crates/buzz-agent/Cargo.toml --all-targets --locked -- -D warnings && cargo test --manifest-path crates/buzz-agent/Cargo.toml --no-run --locked"
+timeout = "45m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
