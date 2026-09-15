@@ -187,6 +187,27 @@ impl DeliveryStore {
         self.len() == 0
     }
 }
+/// [`Router::deliver`] 的结局。
+///
+/// 引入动机（#306）：task worker 需要知道「结果到底有没有送到创建者会话」才能
+/// 决定要不要走**第二告警通道**（创建者会话失效时 `notify_source` 的回源目标就是
+/// 那个失效会话，等于没有告警）。不需要该信息的调用方照旧忽略返回值即可。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// 文本与全部附件都已送达目标会话。
+    Delivered,
+    /// 未送达（开关关闭 / 自环拒投 / 防循环跳过 / 目标 bot 不存在 / 目标已暂停 /
+    /// 发送失败 / 附件部分失败）。原因已进日志，该回源告警的也已回源；字符串是给
+    /// 调用方复用的简述（不含平台错误明细，明细看日志）。
+    NotDelivered(String),
+}
+
+impl DeliveryOutcome {
+    pub fn is_delivered(&self) -> bool {
+        matches!(self, DeliveryOutcome::Delivered)
+    }
+}
+
 /// 跨会话投递路由：service 启动时按所有已启用 bot 构建，投递循环持引用消费队列。
 pub struct Router {
     /// 总开关（Config.cross_delivery_enabled）。false 时任何投递直接拒绝（不发出）。
@@ -224,7 +245,10 @@ impl Router {
     /// 同时回源 bot/会话报错（best-effort，不静默丢失）。未知目标/开关关闭也回源提示。
     /// 防循环：非定时任务的同指纹（来源/目标/文本+附件 sha256）在窗口内重复投递会跳过并回源提示；
     /// 定时任务（job_id 非空）是合法重复，不走去重，也豁免自环拒绝（任务回发本 bot 原会话是既有行为）。
-    pub async fn deliver(&self, item: &DeliveryItem) {
+    ///
+    /// 返回 [`DeliveryOutcome`]：#306 的 task worker 用它判断是否需要第二告警通道；
+    /// 其余调用方忽略即可（返回值不带 `#[must_use]`）。
+    pub async fn deliver(&self, item: &DeliveryItem) -> DeliveryOutcome {
         // 日志截断必须按字符（agent::truncate）：bot key/chat_id 可含中文，按字节切会 panic，
         // 而 deliver_loop 在 tokio::spawn 里，panic = 投递消费线程静默死亡（#21 审查 Critical）。
         let tb = crate::agent::truncate(&item.target_bot, 16);
@@ -249,7 +273,7 @@ impl Router {
                 "⚠️ 跨会话投递未开启：请在 ABB 设置里打开「跨会话投递」开关后重试。",
             )
             .await;
-            return;
+            return DeliveryOutcome::NotDelivered("跨会话投递未开启".to_string());
         }
         // 自环防护（Router 级兜底，防手改队列绕过 CLI）：来源==目标 且非定时任务 → 拒绝。
         // 两处豁免：① 定时任务（既有）；② `in_session`（CLI `--to-current` 显式声明的
@@ -264,7 +288,7 @@ impl Router {
             );
             self.notify_source(item, "⚠️ 跨会话投递失败：来源与目标相同（自环），已拒绝。")
                 .await;
-            return;
+            return DeliveryOutcome::NotDelivered("来源与目标相同（自环）".to_string());
         }
         // 防循环（消息循环防护 #21）：非定时任务同指纹窗口内重复 → 跳过 + 回源说明。
         // 注意：MutexGuard 必须在任何 await 前 drop（std 锁不是 Send，跨 await 会编译失败）。
@@ -282,7 +306,7 @@ impl Router {
                 "⚠️ 相同内容刚投递过，已跳过（防循环）。如需再次投递请稍后（10 分钟内抑制重复）。",
             )
             .await;
-            return;
+            return DeliveryOutcome::NotDelivered("命中防循环去重（10 分钟窗口）".to_string());
         }
         let Some(msgr) = self.messengers.get(&item.target_bot) else {
             crate::log!(
@@ -297,7 +321,10 @@ impl Router {
                 ),
             )
             .await;
-            return;
+            return DeliveryOutcome::NotDelivered(format!(
+                "目标 bot「{}」不存在或未启用",
+                item.target_bot
+            ));
         };
         // #87 暂停拦截：目标会话被 pause → 拒绝投递并回源提示（不静默丢）。
         // 覆盖 deliver CLI 与定时任务多目标（job_target_items）两条路径；
@@ -319,7 +346,7 @@ impl Router {
                 ),
             )
             .await;
-            return;
+            return DeliveryOutcome::NotDelivered(format!("目标会话 {} 已暂停", item.target_chat));
         }
         // 先发文本，再逐个发附件。**每个附件独立成败**：某个失败要上报但绝不
         // 吞掉后面的附件（审查 #254：真发送引入了多种新失败模式——超大/格式
@@ -328,7 +355,7 @@ impl Router {
         if !item.text.is_empty() {
             if let Err(e) = msgr.send_text(&item.target_chat, &item.text).await {
                 self.fail_text(item, &e).await;
-                return;
+                return DeliveryOutcome::NotDelivered(format!("发送失败：{e:#}"));
             }
         }
         let mut failed: Vec<String> = Vec::new();
@@ -388,7 +415,11 @@ impl Router {
         // 防循环指纹只在**完全成功**时登记：部分失败也记会让 10 分钟内的合法
         // 重试被「防循环」挡掉，失败的那件永远补不回来（审查 #254）。
         if !failed.is_empty() {
-            return;
+            return DeliveryOutcome::NotDelivered(format!(
+                "{}/{} 个附件发送失败",
+                failed.len(),
+                item.attachments.len()
+            ));
         }
         crate::log!(
             "[deliver] 已投递 bot={} chat={} id={} 文本长度={} 附件数={}",
@@ -401,6 +432,7 @@ impl Router {
         if item.job_id.is_empty() && !in_session_ok {
             self.mark_delivered(item);
         }
+        DeliveryOutcome::Delivered
     }
 
     /// 防循环去重：同（来源 bot/会话, 目标 bot/会话, 文本, 附件 sha256 列表）在窗口内只投一次。

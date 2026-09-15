@@ -622,7 +622,7 @@ fn is_path_arg(arg: &str) -> bool {
 
 /// $ABB_BIN 子命令白名单：job add（创建者角色已由 env 追溯，执行时走受限分支；
 /// list/del 拒绝——job list 会暴露 owner 任务的 prompt/note，job del 可删 owner 任务）、
-/// task add（同上；**proc 载荷拒绝**见 Q8；list/status/logs/rm 拒绝）、
+/// task add（同上；**proc 载荷拒绝**见 Q8；list/status/logs/rm/cancel 拒绝）、
 /// session reset（仅限不带显式 chat 参数——缺省取本会话 env，防抹掉其它会话槽位）、
 /// deliver（--file 必须工作区内——堵「把任意文件哈希+路径投递到其它会话」外泄通道）。
 fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
@@ -643,7 +643,9 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
         }
         // 任务（#326）：`add` 放行（创建者角色随定义落盘，执行时按角色走受限/全权限
         // 分支——与 job add 同一条信任链）；**其余子命令一律拒绝**：list/status/logs
-        // 会暴露任务 prompt / 目标会话 / 进程输出，rm 能删别人的任务。
+        // 会暴露任务 prompt / 目标会话 / 进程输出，rm 能删别人的任务，cancel（#306）
+        // 可按 id 掐掉**别的会话**的任务（id 是 `tk_yyyyMMdd_xxxxxx`，6 位 hex 可枚举
+        // → 属可用性攻击面）。人要停自己在跑的任务走 owner 会话/终端，不受此闸影响。
         //
         // Q8：**agent 不得创建 proc 任务**。当前 CLI 的 add 只能建 agent 载荷，这里
         // 仍按参数显式拒绝一次——P3 真加 `--proc` 时这条是唯一挡得住 agent 的闸
@@ -652,7 +654,8 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
         Some("task") => {
             if rest.get(1).map(|s| s.as_str()) != Some("add") {
                 return Decision::Deny(
-                    "task 仅允许 add（list/status/logs 会暴露任务内容，rm 可删任务）".into(),
+                    "task 仅允许 add（list/status/logs 会暴露任务内容，rm 可删任务，cancel 可掐别的任务）"
+                        .into(),
                 );
             }
             if rest
@@ -1364,6 +1367,12 @@ mod tests {
         assert_ne!(decide(r#"$ABB_BIN task status tk_1"#), Decision::Allow);
         assert_ne!(decide(r#"$ABB_BIN task logs tk_1"#), Decision::Allow);
         assert_ne!(decide(r#"$ABB_BIN task rm tk_1"#), Decision::Allow);
+        // #306：`task cancel` 同样拒绝——id 可枚举，放行等于给受限会话一个掐掉
+        // 别的会话任务的可用性攻击面（人要停自己的任务走 owner 会话/终端）。
+        assert_ne!(
+            decide(r#"$ABB_BIN task cancel tk_20260915_abc123"#),
+            Decision::Allow
+        );
         // Q8：agent 不得创建 proc 任务（任意命令执行入口只给 GUI/人工）
         assert_ne!(
             decide(r#"$ABB_BIN task add --proc --cmd "pkill agent-bridge""#),

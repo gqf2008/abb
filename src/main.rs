@@ -876,6 +876,57 @@ fn run_task_cli(args: &[String]) -> i32 {
                 }
             }
         }
+        // Q3 `task cancel`：**CLI 只投取消请求**，运行态由 service 侧的 task worker
+        // 消费（单写者）。所以这里既不改 tasks-state.json，也不假装「已取消」——
+        // 只保证请求已落盘，真正的结局由 worker 写。
+        "cancel" | "stop" => {
+            let Some(t) = resolve_task(&store, args.get(1)) else {
+                return 1;
+            };
+            let rt = states.get(&t.id);
+            use task_store::TaskStateKind as K;
+            if matches!(rt.kind, K::Succeeded | K::Failed | K::Cancelled) {
+                // 已经结束的任务不要再投取消请求：worker 侧虽有终态保护，但在这里
+                // 就说清楚，免得用户以为「取消」改变了什么。
+                println!("任务 {} 已结束（{:?}），无需取消", t.id, rt.kind);
+                return 0;
+            }
+            if rt.kind == K::Running {
+                println!(
+                    "任务 {} 正在运行，已请求终止（数秒内生效、结果不再投递；若该轮刚好已收尾则本条无效）",
+                    t.id
+                );
+            } else {
+                println!(
+                    "任务 {} 尚未开跑，已请求取消（不会再开跑，也不会投递结果）",
+                    t.id
+                );
+            }
+            let paths = task_store::TaskPaths::for_bot(&bot_key);
+            if let Err(e) = std::fs::create_dir_all(paths.cancel_requests_dir()) {
+                eprintln!(
+                    "写取消请求失败（{}）：{e}",
+                    paths.cancel_requests_dir().display()
+                );
+                return 1;
+            }
+            let req = paths.cancel_file(&t.id);
+            let body = serde_json::json!({
+                "task_id": t.id,
+                "requested_at": chrono_lite::unix_secs(),
+                "requested_by": bot_key,
+            });
+            if let Err(e) = std::fs::write(&req, body.to_string()) {
+                eprintln!("写取消请求失败（{}）：{e}", req.display());
+                return 1;
+            }
+            if !crate::install::status().running {
+                eprintln!(
+                    "⚠️ 未检测到运行中的 service：取消请求已落盘，service 下次启动时会立即消费它"
+                );
+            }
+            0
+        }
         // del 是 rm 的别名（job 用的是 del，两边都认，减少踩空）
         "rm" | "del" => {
             let Some(t) = resolve_task(&store, args.get(1)) else {
@@ -903,6 +954,9 @@ fn run_task_cli(args: &[String]) -> i32 {
             let mut cwd = String::new();
             let mut timeout_secs = task_store::DEFAULT_TIMEOUT_SECS;
             let mut max_restarts = task_store::DEFAULT_MAX_RESTARTS;
+            // `--to bot_key:chat_id`（bot_key 可省 = 本 bot）/ `--to-current`。
+            let mut to_target: Option<String> = None;
+            let mut to_current = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -950,6 +1004,18 @@ fn run_task_cli(args: &[String]) -> i32 {
                         }
                         i += 2;
                     }
+                    "--to" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--to 缺目标（形如 bot_key:chat_id，bot_key 可省）");
+                            return 1;
+                        };
+                        to_target = Some(v.clone());
+                        i += 2;
+                    }
+                    "--to-current" => {
+                        to_current = true;
+                        i += 1;
+                    }
                     other => {
                         eprintln!("task add 不认识的参数：{other}");
                         return 1;
@@ -957,9 +1023,13 @@ fn run_task_cli(args: &[String]) -> i32 {
                 }
             }
             let Some(prompt) = prompt else {
-                eprintln!("用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N]");
+                eprintln!("{TASK_ADD_USAGE}");
                 return 1;
             };
+            if to_current && to_target.is_some() {
+                eprintln!("--to-current 与 --to 互斥（前者 = 显式发回创建者会话）");
+                return 1;
+            }
             // 创建者会话：优先桥注入的 env；手动 CLI 回落该 bot 的主会话（与 job add 同款）。
             // 审查 B2：这里若留空，任务会「跑完但没人看得到」——而 CLI 却印着「结果回创建者会话」。
             // 所以两条路都给不出目标时**直接拒绝登记**，不接受一个永远发不出结果的任务。
@@ -974,6 +1044,23 @@ fn run_task_cli(args: &[String]) -> i32 {
                 );
                 return 1;
             }
+            // 显式 `--to`：`bot_key:chat_id`（bot_key 可省 = 本 bot）。`--to-current`
+            // 与缺省同义，都落成「无 targets ⇒ 回创建者会话」，这里只做互斥校验。
+            let targets = match to_target {
+                Some(raw) => {
+                    let (tbot, tchat) = parse_task_to(&raw);
+                    if tchat.trim().is_empty() {
+                        eprintln!("--to 的 chat_id 不能为空：{raw}");
+                        return 1;
+                    }
+                    vec![task_store::TaskTarget {
+                        bot_key: tbot,
+                        chat_id: tchat,
+                    }]
+                }
+                None => Vec::new(),
+            };
+            let targets = if to_current { Vec::new() } else { targets };
             let task = task_store::Task {
                 schema_version: task_store::TASK_SCHEMA_VERSION,
                 id: task_store::new_id(chrono_lite::unix_secs()),
@@ -982,7 +1069,7 @@ fn run_task_cli(args: &[String]) -> i32 {
                 created_by: task_store::CreatedBy {
                     role: config::SenderRole::from_env(),
                     bot_key: bot_key.clone(),
-                    chat_id,
+                    chat_id: chat_id.clone(),
                 },
                 payload: task_store::TaskPayload {
                     kind: task_store::PayloadKind::Agent,
@@ -996,7 +1083,10 @@ fn run_task_cli(args: &[String]) -> i32 {
                     expr: String::new(),
                     timezone: String::new(),
                 },
-                delivery: task_store::TaskDelivery::default(),
+                delivery: task_store::TaskDelivery {
+                    targets,
+                    ..Default::default()
+                },
                 limits: task_store::TaskLimits {
                     timeout_secs,
                     max_restarts,
@@ -1009,10 +1099,11 @@ fn run_task_cli(args: &[String]) -> i32 {
                     // 没有状态行时 get() 也返回默认 Pending，两处等价、不靠隐式。
                     let _ = states.set(&task.id, task_store::TaskRuntime::default());
                     println!(
-                        "🤖 后台任务已登记：{}（{}）\n   执行状态：agent-bridge task status {}\n   结果回创建者会话（若 service 未运行则不会开跑）",
+                        "🤖 后台任务已登记：{}（{}）\n   执行状态：agent-bridge task status {}\n   结果投递：{}（若 service 未运行则不会开跑）",
                         task.id,
                         task.display_name(),
-                        task.id
+                        task.id,
+                        describe_task_delivery(&task),
                     );
                     0
                 }
@@ -1026,16 +1117,39 @@ fn run_task_cli(args: &[String]) -> i32 {
             if !other.is_empty() {
                 eprintln!("task 不认识的子命令：{other}");
             }
-            eprintln!(
-                "用法：agent-bridge task <list|status|logs|rm|add> …\n\
-                 \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N]\n\
-                 \n  task list                         列出本 bot 的任务\n\
-                 \n  task status <id前缀>              看一条任务的详情与运行态\n\
-                 \n  task logs <id前缀> [--tail N]     看任务日志（缺省末 200 行）\n\
-                 \n  task rm <id前缀>                  删除任务（运行中不允许）"
-            );
+            eprintln!("{TASK_CLI_HELP}");
             1
         }
+    }
+}
+
+/// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
+const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]";
+
+/// `task` 的总帮助（**单一真源**：#312 的指引 v7 要与它逐字对齐）。
+const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
+     \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]\n\
+     \n  task list                         列出本 bot 的任务\n\
+     \n  task status <id前缀>              看一条任务的详情与运行态\n\
+     \n  task logs <id前缀> [--tail N]     看任务日志（缺省末 200 行）\n\
+     \n  task cancel <id前缀>              取消任务（在跑的中止且不投递结果；未开跑的不再开跑）\n\
+     \n  task rm <id前缀>                  删除任务（运行中不允许）";
+
+/// 解析 `--to` 的值：`bot_key:chat_id`（`bot_key` 可省）。只按**第一个**冒号切，
+/// 留空段按语义校验（chat_id 必须非空，bot_key 空 = 本 bot）。
+fn parse_task_to(raw: &str) -> (String, String) {
+    match raw.split_once(':') {
+        Some((b, c)) => (b.trim().to_string(), c.trim().to_string()),
+        None => (String::new(), raw.trim().to_string()),
+    }
+}
+
+/// 人话描述这条任务的结果去向（登记成功回执用）。
+fn describe_task_delivery(t: &task_store::Task) -> String {
+    match t.delivery.targets.first() {
+        None => format!("回创建者会话（{}）", t.created_by.chat_id),
+        Some(tg) if tg.bot_key.trim().is_empty() => format!("显式指定 {}", tg.chat_id),
+        Some(tg) => format!("显式指定 {}:{}", tg.bot_key, tg.chat_id),
     }
 }
 
@@ -1704,7 +1818,30 @@ fn trash_bot_key(args: &[String]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::session_reset_chat_id;
+    use super::{parse_task_to, session_reset_chat_id};
+
+    /// #306：`task add --to` 的值解析只按**第一个**冒号切，缺 bot_key 段 = 本 bot；
+    /// 空 chat 段留给调用方报错（这里把语义钉死，别让 CLI 与指引各写一套）。
+    #[test]
+    fn task_to_parses_bot_and_chat() {
+        assert_eq!(
+            parse_task_to("wx_bot:oc_abc"),
+            ("wx_bot".to_string(), "oc_abc".to_string())
+        );
+        // 只给 chat_id：bot_key 空 = 本 bot
+        assert_eq!(
+            parse_task_to("oc_abc"),
+            (String::new(), "oc_abc".to_string())
+        );
+        // `:oc_abc` 同义（显式留空 bot_key）
+        assert_eq!(
+            parse_task_to(":oc_abc"),
+            (String::new(), "oc_abc".to_string())
+        );
+        // chat_id 里再出现冒号不当作分隔（只按第一个切）
+        assert_eq!(parse_task_to("b:c:d"), ("b".to_string(), "c:d".to_string()));
+        assert_eq!(parse_task_to("b:"), ("b".to_string(), String::new()));
+    }
 
     #[test]
     fn atomic_write_text_concurrent_no_race() {
