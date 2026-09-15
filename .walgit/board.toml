@@ -14,6 +14,9 @@ status = "merged"
 name = "closed"
 status = "closed"
 
+# These are global alert lanes and deliberately precede active workflow lanes
+# (first-match-wins): a card that is merge-blocked/unverified is more actionable
+# there than in open/in-progress/needs-review. Terminal lanes still win first.
 # Surface PRs whose patch fails review/merge policy.
 [[column]]
 name = "merge-blocked"

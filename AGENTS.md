@@ -33,9 +33,11 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
 - **Walgit CI runner**: `ci.toml` is only a declaration; the server does not execute
-  it. The local runner is supervised in screen `walgit-ci-abb`:
-  `walgit --config ~/.walgit/walgit.toml ci run --repo . --remote origin --actor ci-runner --key ~/.walgit/keys/ci-runner.ed25519`.
-  Check results with `walgit ci status --repo .`; zero runs is not a pass.
+  it. Start/supervise the local runner in screen `walgit-ci-abb` with the stable
+  main checkout:
+  `walgit --config ~/.walgit/walgit.toml ci run --repo /Volumes/DataExt/GitHub/abb --remote origin --actor ci-runner --key ~/.walgit/keys/ci-runner.ed25519`.
+  Check results with `walgit ci status --repo .`; a missing runner or zero runs is
+  not a pass.
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.
@@ -68,8 +70,10 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 - History is short; use imperative, concise subjects, optionally prefixed with the affected area (e.g., `feishu: …`).
 - Keep commits focused and explain *why* in the body.
 - Walgit patch/PR entries: describe what and why, link the issue thread, and run
-  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
-  and `tools/check_test_isolation.sh`. Include before/after screenshots for UI
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --locked`, and `tools/check_test_isolation.sh` (the isolated test
+  runner is the full-test gate; do not substitute a bare `cargo test` because it
+  can write the real `~/.agent-bridge`). Include before/after screenshots for UI
   changes. GitHub PRs are only for mirror/release maintenance.
 
 ## Security & Configuration
