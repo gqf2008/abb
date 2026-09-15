@@ -245,18 +245,14 @@ impl Task {
             if t.chat_id.trim().is_empty() {
                 bail!("投递目标的 chat_id 不能为空");
             }
-            // 审查 N1：执行侧目前只投 `targets[0]` 且忽略 `bot_key`（按本 bot 投）。
-            // 与其静默截断/投错 bot，不如显式拒绝——等 `--to` 与跨 bot 投递真落地再放开。
-            if !t.bot_key.trim().is_empty() && t.bot_key != self.bot_key {
-                bail!(
-                    "暂不支持跨 bot 投递目标（{}），请留空或与任务同 bot",
-                    t.bot_key
-                );
-            }
+            // `bot_key` 留空 = 本 bot（`task add --to` 的缺省写法）；非空则按它投，
+            // 跨 bot 由 `Router::deliver` 的「跨会话投递」开关在投递时判定（关着就
+            // 拒绝并回源告警——那是开关的既有语义，不在定义校验里越权代替）。
+            // 审查 N1 的旧禁令（执行侧忽略 bot_key）已随 #306 的 `--to` 落地解除。
         }
         if self.delivery.targets.len() > 1 {
             bail!(
-                "暂不支持多投递目标（给了 {} 个）——当前只投创建者会话",
+                "暂不支持多投递目标（给了 {} 个）——当前一条任务只投一个目标",
                 self.delivery.targets.len()
             );
         }
@@ -367,6 +363,17 @@ impl TaskPaths {
     }
     pub fn log_file(&self, id: &str) -> PathBuf {
         self.logs_dir().join(format!("{id}.log"))
+    }
+    /// 取消请求目录（Q3 的 `task cancel`）。
+    ///
+    /// **方向必须是 CLI 写、service 读**：运行态的唯一写者是 service 侧的 task
+    /// worker（`docs/task-model.md` Q12 的单写者约束）。CLI 只投一个「请求」文件，
+    /// 由 worker 在轮询点消费，因此不存在两个进程同时改 `tasks-state.json` 的竞态。
+    pub fn cancel_requests_dir(&self) -> PathBuf {
+        self.dir.join("cancel-requests")
+    }
+    pub fn cancel_file(&self, id: &str) -> PathBuf {
+        self.cancel_requests_dir().join(id)
     }
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.dir)
@@ -677,19 +684,31 @@ mod tests {
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("多投递目标"), "{e}");
 
+        // #306：跨 bot 目标**不再是定义校验的拒绝项**——执行侧（`delivery_target`）
+        // 已按 `targets[0].bot_key` 真投，跨会话开关由 Router 在投递时判定。
         t.delivery.targets = vec![TaskTarget {
             bot_key: "other".into(),
             chat_id: "a".into(),
         }];
-        let e = t.validate().unwrap_err().to_string();
-        assert!(e.contains("跨 bot"), "{e}");
+        assert!(
+            t.validate().is_ok(),
+            "跨 bot 目标应通过定义校验（旧实现忽略 bot_key 才需要拒绝）"
+        );
 
-        // 同 bot 显式写 bot_key 是允许的
+        // 同 bot 显式写 bot_key 照旧允许
         t.delivery.targets = vec![TaskTarget {
             bot_key: "b".into(),
             chat_id: "a".into(),
         }];
         assert!(t.validate().is_ok());
+
+        // chat_id 为空仍拒绝（无论 bot_key 怎么写）
+        t.delivery.targets = vec![TaskTarget {
+            bot_key: "other".into(),
+            chat_id: "  ".into(),
+        }];
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("chat_id"), "{e}");
 
         t.delivery = TaskDelivery::default();
         t.limits.log_max_bytes = 0;

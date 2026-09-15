@@ -11,7 +11,9 @@
 //!   `channel_uuid(bot, chat_id)`，因此不会把 `sessions.json` / ACP 会话槽位
 //!   和聊天搅在一起（D1 的隔离要求）。
 //! - **真取消**：`external_cancel` 触发走 oneshot 的 Timeout 同款拆栈（cancel 回执 +
-//!   杀进程组），不是「置个标志然后假装停了」——D1c 要求的就是这条。
+//!   杀进程组），不是「置个标志然后假装停了」——D1c 要求的就是这条。Q3 的
+//!   `task cancel` 用「关停令牌 ∪ 取消请求文件」的合并令牌接进同一条通路；取消后
+//!   **不再投递结果**（与「服务关停联动取消」同口径）。
 //!
 //! ## 本轮范围
 //!
@@ -41,6 +43,16 @@ pub const TASK_PROMPT_TAG: &str = "task_message";
 /// 轮询间隔：worker 每这么久看一眼有没有待认领的任务。
 /// `trigger=now` 的任务是「登记后立刻跑」，所以这是**登记到开跑**的延迟上限。
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `task cancel` 请求的轮询间隔：CLI 只投一个请求文件，worker 在**运行中**也要定期
+/// 看它一眼才能真把取消送进 oneshot。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 用户主动取消的落盘原因（`task status` 展示 + 日志留痕）。
+const CANCEL_REASON: &str = "已取消（用户 task cancel）";
+
+/// 尚未开跑就被取消的落盘原因。
+const CANCEL_REASON_BEFORE_START: &str = "已取消（task cancel，尚未开跑）";
 
 /// 每个 bot 一个 task worker：
 /// Q7 定的是「每 bot 默认 1 个 worker，超限**排队**（不拒绝）」——单 worker 串行
@@ -74,6 +86,9 @@ pub(crate) async fn task_worker_with_poll(
         if stop.is_cancelled() {
             return;
         }
+        // 取消请求先于认领处理：排队等着的任务被 cancel 掉之后**不该再开跑**
+        // （否则用户看到的是「已取消却仍然跑了一轮并投递结果」）。
+        consume_cancel_requests(&store, &states);
         // 每轮只认领一条：跑完再认领下一条 = 串行排队（Q7）。
         if let Some(task) = next_pending(&store, &states) {
             run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await;
@@ -154,14 +169,42 @@ pub(crate) async fn run_attempt(
     let budget = task
         .timeout()
         .unwrap_or(crate::buzz::harness::MAX_TURN_DURATION + Duration::from_secs(30));
+    // Q3 `task cancel`：`oneshot_turn` 的 external_cancel 只接一个令牌，所以这里做
+    // 「service 关停 ∪ 用户取消请求」的合并——`child_token()` 随父（关停）取消，
+    // watcher 命中取消请求时再单独 cancel 这个子令牌（不反cancel 父，关停语义不变）。
+    let attempt_cancel = stop.child_token();
+    let cancel_watch = {
+        let token = attempt_cancel.clone();
+        let req = states.paths().cancel_file(&id);
+        tokio::spawn(async move {
+            loop {
+                if token.is_cancelled() {
+                    return;
+                }
+                if req.exists() {
+                    crate::log!("[task] 收到取消请求（{}），终止在跑轮次", req.display());
+                    token.cancel();
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {}
+                    _ = token.cancelled() => return,
+                }
+            }
+        })
+    };
     let outcome = crate::buzz::oneshot::oneshot_turn(
         agent_cfg,
         Some(workspace),
         msg,
         budget,
-        Some(stop.clone()),
+        Some(attempt_cancel.clone()),
     )
     .await;
+    cancel_watch.abort();
+    // 消费掉请求文件（无论这轮是被它取消的还是正常跑完）——不消费的话，同一 id 的
+    // 下一次重跑会立刻又被自己上一次的请求取消。
+    let _ = std::fs::remove_file(states.paths().cancel_file(&id));
 
     let finished = crate::chrono_lite::unix_secs();
     // 终态也要带住 restarts（否则 `task status` 看不到重跑过几次）。
@@ -184,7 +227,7 @@ pub(crate) async fn run_attempt(
                 kind: TaskStateKind::Cancelled,
                 started_at: Some(started),
                 finished_at: Some(finished),
-                last_error: "已取消".to_string(),
+                last_error: CANCEL_REASON.to_string(),
                 restarts,
                 ..Default::default()
             },
@@ -247,20 +290,19 @@ pub(crate) async fn run_attempt(
         }
     );
 
-    // 取消/超时/失败也有必要回投——用户看不到结果才是真痛点。但今天唯一能产生
-    // `Cancelled` 的路径是**service 关停联动**（oneshot 的 external_cancel 只接了关停
-    // 令牌），此时投递通道也在关，回了多半发不出去还刷日志 → 不回投。
-    // 审查 N4：所以下面「🛑 已取消」那条抬头当前**不可达**，不要把它当已实现的验收项；
-    // 等 Q3 的 `task cancel`（用户主动取消）落地后，那条路要带自己的回报语义。
+    // 取消**不回投**——这是 `task cancel` 的明确语义（用户已经说了不要结果）：
+    // 两种来源都适用 — ① service 关停联动（投递通道也在关，回了多半发不出去）；
+    // ② 用户 `task cancel`（Q3，已落地）。所以下面「🛑 已取消」那条抬头仍然
+    // **不可达**，不要把它当已实现的验收项：取消一律静默收尾 + 日志/运行态留痕。
     if cancelled {
         return;
     }
-    let Some(chat) = delivery_chat(&task) else {
+    let Some((target_bot, chat)) = delivery_target(&task, bot_key) else {
         crate::log!("[task:{bot_key}] {short} 无投递目标（创建者会话为空），结果未发送");
         return;
     };
     // 注意：这里没有「已取消」抬头——见上 `if cancelled { return; }` 的说明，
-    // 今天唯一能产生 Cancelled 的路径是关停联动，它压根走不到投递。
+    // 被取消的轮次（关停联动 / 用户 task cancel）压根走不到投递。
     let header = if failed {
         "⚠️ 后台任务失败".to_string()
     } else {
@@ -275,21 +317,83 @@ pub(crate) async fn run_attempt(
     } else {
         text
     };
+    let created_chat = task.created_by.chat_id.clone();
+    // `in_session`（= 走 Router 自环豁免的那条可信通路）只在**目标确实就是创建者
+    // 会话**时成立；`--to` 指到别处时必须显式跨会话，否则等于伪造豁免（审查 P2）。
+    let in_session = target_bot == bot_key && chat == created_chat;
     let item = DeliveryItem {
         id: uuid::Uuid::new_v4().to_string(),
-        target_bot: bot_key.to_string(),
+        target_bot: target_bot.clone(),
         target_chat: chat.clone(),
         text: format!("{header}\n\n{body}"),
         source_bot: bot_key.to_string(),
-        source_chat: chat,
+        source_chat: created_chat,
         created_at: finished,
         attachments: Vec::new(),
         // 非空 = 跳过防循环去重（同一任务重跑两次是合法重复）；同时也是 P1b 之前
         // 「定时/任务类投递」的既有标记口径。
         job_id: task.id.clone(),
-        in_session: true,
+        in_session,
     };
-    router.deliver(&item).await;
+    let outcome = router.deliver(&item).await;
+    if outcome.is_delivered() {
+        return;
+    }
+    // 第二告警通道（#306 验收）：默认投递目标 = 创建者会话，`Router` 的回源告警也就
+    // 发回那个**已失效**的会话 —— 等于没有告警。这里补一条独立通道：把失败写进运行态
+    // （`task status` 可见）并投该 bot 的主会话（owner 私聊，与 run_job 的回落同源）。
+    let reason = match outcome {
+        crate::deliver::DeliveryOutcome::NotDelivered(r) => r,
+        crate::deliver::DeliveryOutcome::Delivered => String::new(),
+    };
+    let note = format!("结果投递失败：{reason}");
+    let mut rt2 = states.get(&id);
+    rt2.last_error = if rt2.last_error.is_empty() {
+        note.clone()
+    } else {
+        format!("{}；{note}", rt2.last_error)
+    };
+    let _ = states.set(&id, rt2);
+    crate::log!("[task:{bot_key}] {short} {note}（目标 bot={target_bot} chat={chat}）");
+    alert_primary_chat(router, bot_key, &target_bot, &chat, &note).await;
+}
+
+/// 第二告警通道（#306）：把投递失败告诉该 bot 的**主会话**（owner 私聊）。
+///
+/// 只在主会话与失败目标不同时发——相同就说明主会话正是那个失效目标，再发一次没有
+/// 意义（那种情况只剩日志与 `task-logs` 留痕）。best-effort：发不出去只记日志。
+async fn alert_primary_chat(
+    router: &Arc<Router>,
+    bot_key: &str,
+    target_bot: &str,
+    target_chat: &str,
+    note: &str,
+) {
+    // 主会话取路由表里的 BotConfig（= 同一份配置的 bots[]）而不是再读 config.json：
+    // 生产同源，测试可注入（`Config::primary_chat` 直读盘，单测里拿不到）。
+    let primary = router
+        .bots
+        .get(bot_key)
+        .map(|b| b.primary_chat_id.clone())
+        .unwrap_or_default();
+    if primary.is_empty() {
+        crate::log!("[task:{bot_key}] 无主会话可回落，投递失败仅留日志 + task-logs");
+        return;
+    }
+    if target_bot == bot_key && primary == target_chat {
+        return;
+    }
+    let Some(msgr) = router.messengers.get(bot_key) else {
+        crate::log!("[task:{bot_key}] 主会话回落失败：本 bot messenger 不在路由表里");
+        return;
+    };
+    let text = format!("⚠️ 后台任务结果投递失败（{note}）\n\n目标：{target_bot}:{target_chat}");
+    if let Err(e) = msgr.send_text(&primary, &text).await {
+        crate::log!(
+            "[task:{bot_key}] 主会话回落也失败 chat={}: {e:#}",
+            crate::agent::truncate(&primary, 16)
+        );
+    }
 }
 
 /// 认领一条任务：把运行态推进到 `Running`。
@@ -339,15 +443,72 @@ fn task_workspace(bot_key: &str, task: &Task) -> String {
     }
 }
 
-/// 默认投递目标 = 创建者会话；显式 targets 优先。
-fn delivery_chat(task: &Task) -> Option<String> {
+/// 投递目标 `(bot_key, chat_id)`：显式 `targets` 优先，否则回创建者会话。
+///
+/// `targets[i].bot_key` 留空 = 本 bot（`task add --to` 的缺省写法）；#306 之前执行侧
+/// 忽略它、按本 bot 投，`Task::validate` 于是显式拒绝跨 bot——现在两处一起解除。
+fn delivery_target(task: &Task, bot_key: &str) -> Option<(String, String)> {
     if let Some(t) = task.delivery.targets.first() {
-        return Some(t.chat_id.clone());
+        let target_bot = if t.bot_key.trim().is_empty() {
+            bot_key.to_string()
+        } else {
+            t.bot_key.clone()
+        };
+        return Some((target_bot, t.chat_id.clone()));
     }
     if task.created_by.chat_id.trim().is_empty() {
         None
     } else {
-        Some(task.created_by.chat_id.clone())
+        Some((bot_key.to_string(), task.created_by.chat_id.clone()))
+    }
+}
+
+/// 消费取消请求文件（Q3 `task cancel` 的 service 侧）。
+///
+/// 方向是**CLI 写请求、service 消费**（运行态只有一个写者）。这里只处理「此刻没在跑」
+/// 的那类：`Pending` → 直接判 `Cancelled`（不再开跑）；已是终态 → 只清 requests 文件
+/// （CLI 侧已拦，但手写的文件不该把已成功的任务改写成取消）；`Running` → **留着不删**，
+/// 由在跑那轮的 watcher 消费，否则等于把取消信号从它嘴里抢走。
+fn consume_cancel_requests(store: &TaskStore, states: &TaskStateStore) {
+    let dir = states.paths().cancel_requests_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(id) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let rt = states.get(&id);
+        let known = store.list().iter().any(|t| t.id == id);
+        if !known {
+            // 定义已经没了（task rm / 孤儿清理）：请求没有意义，清掉别堆积。
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if rt.kind == TaskStateKind::Running {
+            continue;
+        }
+        if rt.kind == TaskStateKind::Pending {
+            crate::log!("[task] {id} 尚未开跑即被取消");
+            let _ = states.set(
+                &id,
+                TaskRuntime {
+                    kind: TaskStateKind::Cancelled,
+                    finished_at: Some(crate::chrono_lite::unix_secs()),
+                    last_error: CANCEL_REASON_BEFORE_START.to_string(),
+                    ..rt
+                },
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -530,7 +691,10 @@ mod tests {
     #[test]
     fn default_delivery_is_creator_session() {
         let t = now_task("b", "tk_x", "wx_chat");
-        assert_eq!(delivery_chat(&t).as_deref(), Some("wx_chat"));
+        assert_eq!(
+            delivery_target(&t, "b"),
+            Some(("b".to_string(), "wx_chat".to_string()))
+        );
     }
 
     #[test]
@@ -540,7 +704,26 @@ mod tests {
             bot_key: String::new(),
             chat_id: "other".to_string(),
         }];
-        assert_eq!(delivery_chat(&t).as_deref(), Some("other"));
+        assert_eq!(
+            delivery_target(&t, "b"),
+            Some(("b".to_string(), "other".to_string())),
+            "targets.bot_key 留空 = 本 bot"
+        );
+    }
+
+    /// #306：`--to other_bot:oc_x` 必须**真的投到那个 bot**（旧实现忽略 bot_key 一律
+    /// 按本 bot 投，所以 validate 里曾显式拒绝跨 bot；两处必须一起改）。
+    #[test]
+    fn explicit_cross_bot_target_is_honored() {
+        let mut t = now_task("b", "tk_x", "wx_chat");
+        t.delivery.targets = vec![crate::task_store::TaskTarget {
+            bot_key: "other_bot".to_string(),
+            chat_id: "oc_x".to_string(),
+        }];
+        assert_eq!(
+            delivery_target(&t, "b"),
+            Some(("other_bot".to_string(), "oc_x".to_string()))
+        );
     }
 
     /// 没有创建者会话（人工 CLI 建的）时必须**返回 None**，让调用方明确报「没目标」，
@@ -548,7 +731,7 @@ mod tests {
     #[test]
     fn no_creator_and_no_target_means_no_delivery() {
         let t = now_task("b", "tk_x", "");
-        assert_eq!(delivery_chat(&t), None);
+        assert_eq!(delivery_target(&t, "b"), None);
     }
 
     /// 只认领 `now` + `Pending`。别的触发档不认领（编排器是 P3/P5），
@@ -630,14 +813,19 @@ mod tests {
     }
 
     /// 记录型 messenger：只记 send_text 的 (chat, text)，供投递断言。
+    /// `fail_chats` 里的会话返回 Err（模拟「创建者会话已失效」——群解散/bot 被移出）。
     #[derive(Default)]
     struct RecordingMsgr {
         sent: std::sync::Mutex<Vec<(String, String)>>,
+        fail_chats: Vec<String>,
     }
 
     #[async_trait::async_trait]
     impl crate::messenger::Messenger for RecordingMsgr {
         async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
+            if self.fail_chats.iter().any(|c| c == chat_id) {
+                anyhow::bail!("模拟会话失效");
+            }
             self.sent
                 .lock()
                 .unwrap()
@@ -768,6 +956,257 @@ mod tests {
         assert_eq!(rt.kind, TaskStateKind::Running);
         assert_eq!(rt.restarts, 3, "认领必须带着计数，否则重跑上界永远到不了");
         assert_eq!(rt.started_at, Some(1_700_000_000));
+    }
+
+    /// #306 `task cancel`：**尚未开跑**的任务被取消后，不得再开跑，也不得投递结果。
+    /// CLI 只写请求文件，运行态由 worker 侧的 `consume_cancel_requests` 落账（单写者）。
+    #[test]
+    fn cancel_before_start_marks_cancelled_and_is_not_claimed() {
+        let root = tmp_root("cancel_pending");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+        store.add(now_task(bot, "tk_cancel_me", "c")).unwrap();
+        assert!(next_pending(&store, &states).is_some(), "取消前应可认领");
+
+        // CLI 侧的动作：只落一个请求文件。
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file("tk_cancel_me"), b"{}").unwrap();
+
+        consume_cancel_requests(&store, &states);
+        assert_eq!(states.get("tk_cancel_me").kind, TaskStateKind::Cancelled);
+        assert!(
+            states
+                .get("tk_cancel_me")
+                .last_error
+                .contains("task cancel"),
+            "取消原因要留痕：{}",
+            states.get("tk_cancel_me").last_error
+        );
+        assert!(
+            !paths.cancel_file("tk_cancel_me").exists(),
+            "请求文件必须被消费掉（否则下次重跑会立刻又被自己取消）"
+        );
+        assert!(
+            next_pending(&store, &states).is_none(),
+            "已取消的任务不得再被认领"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// #306：取消请求**不得**把已经跑完的任务改写成取消（手写/竞态残留的请求文件
+    /// 不能吃掉一条成功结果）；请求文件本身要被清掉。
+    #[test]
+    fn cancel_request_never_rewrites_a_finished_task() {
+        let root = tmp_root("cancel_terminal");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+        store.add(now_task(bot, "tk_done", "c")).unwrap();
+        states
+            .set(
+                "tk_done",
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file("tk_done"), b"{}").unwrap();
+
+        consume_cancel_requests(&store, &states);
+        assert_eq!(
+            states.get("tk_done").kind,
+            TaskStateKind::Succeeded,
+            "终态不得被取消请求改写"
+        );
+        assert!(!paths.cancel_file("tk_done").exists());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// #306 `task cancel` **运行中**：请求文件必须真把在跑轮次叫停（走 oneshot 的
+    /// external_cancel 拆栈），且**不投递结果**（用户已明确不要了）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn cancel_mid_run_aborts_and_delivers_nothing() {
+        let root = tmp_root("cancel_running");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+
+        let chat = format!("wx_{}", uuid::Uuid::new_v4());
+        let mut task = now_task(bot, "tk_slow", &chat);
+        task.limits.timeout_secs = 60; // 足够长：正常跑不会在本例结束时超时
+        store.add(task.clone()).unwrap();
+        states.set("tk_slow", TaskRuntime::default()).unwrap();
+
+        let msgr = Arc::new(RecordingMsgr::default());
+        let mut msgs: std::collections::HashMap<String, Arc<dyn crate::messenger::Messenger>> =
+            std::collections::HashMap::new();
+        msgs.insert(bot.to_string(), msgr.clone());
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            bot.to_string(),
+            crate::config::BotConfig {
+                name: bot.to_string(),
+                kind: "feishu".into(),
+                ..Default::default()
+            },
+        );
+        let router = Arc::new(Router::new(false, msgs, bots, None));
+
+        let rec =
+            std::env::temp_dir().join(format!("abb-task-cancel-{}.jsonl", uuid::Uuid::new_v4()));
+        // 让 mock agent 记录 prompt 之后延迟应答：造出确定的「已进 agent、尚未收尾」
+        // 窗口，取消请求才有东西可打断（否则 mock 快到请求写下去时这轮已经跑完了）。
+        let mut cfg = mock_cfg(&rec);
+        cfg.extra_env
+            .push(("MOCK_PROMPT_DELAY_MS".to_string(), "3000".to_string()));
+        let stop = tokio_util::sync::CancellationToken::new();
+
+        // 取消请求由另一个任务在「这轮真的进了 agent」之后投递（= 跑到一半取消）；
+        // 主流程前台跑 `run_attempt`，这样 `states` 不必跨任务移动。
+        let rec_for_watch = rec.clone();
+        let req = paths.cancel_file("tk_slow");
+        let watcher = tokio::spawn(async move {
+            let mut waited_ms = 0u64;
+            loop {
+                let seen = std::fs::read_to_string(&rec_for_watch)
+                    .map(|s| s.contains("prompt"))
+                    .unwrap_or(false);
+                if seen {
+                    break;
+                }
+                assert!(waited_ms < 30_000, "任务未进入 agent 提示阶段");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                waited_ms += 50;
+            }
+            if let Some(dir) = req.parent() {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(&req, b"{}").unwrap();
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_attempt(
+                bot,
+                task,
+                cfg,
+                std::env::temp_dir().display().to_string(),
+                &router,
+                &states,
+                &stop,
+            ),
+        )
+        .await
+        .expect("取消请求必须在预算内拆栈收尾");
+        watcher.await.unwrap();
+
+        assert_eq!(
+            states.get("tk_slow").kind,
+            TaskStateKind::Cancelled,
+            "运行中被取消 → Cancelled"
+        );
+        assert!(
+            msgr.sent.lock().unwrap().is_empty(),
+            "取消后不得投递任何结果：{:?}",
+            msgr.sent.lock().unwrap()
+        );
+        assert!(
+            !paths.cancel_file("tk_slow").exists(),
+            "在跑那轮结束时必须消费掉自己的取消请求"
+        );
+        let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// #306 验收「创建者会话失效时投递失败要回源告警，不静默丢」：默认目标就是创建者
+    /// 会话，Router 回源也发回那个失效会话（等于没告警）⇒ 必须有**第二通道**——
+    /// 该 bot 的主会话，并把失败写进运行态（`task status` 可见）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn delivery_failure_alerts_primary_chat_and_records_error() {
+        let root = tmp_root("alert_fallback");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let bot = "b";
+        let store = TaskStore::new_at(&root, bot);
+        let states = TaskStateStore::new_at(&root, bot);
+
+        let dead_chat = format!("oc_dead_{}", uuid::Uuid::new_v4());
+        let primary = format!("ou_owner_{}", uuid::Uuid::new_v4());
+        let mut task = now_task(bot, "tk_alert", &dead_chat);
+        task.limits.timeout_secs = 30;
+        store.add(task.clone()).unwrap();
+        states.set("tk_alert", TaskRuntime::default()).unwrap();
+
+        let msgr = Arc::new(RecordingMsgr {
+            sent: Default::default(),
+            fail_chats: vec![dead_chat.clone()],
+        });
+        let mut msgs: std::collections::HashMap<String, Arc<dyn crate::messenger::Messenger>> =
+            std::collections::HashMap::new();
+        msgs.insert(bot.to_string(), msgr.clone());
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            bot.to_string(),
+            crate::config::BotConfig {
+                name: bot.to_string(),
+                kind: "feishu".into(),
+                primary_chat_id: primary.clone(),
+                ..Default::default()
+            },
+        );
+        let router = Arc::new(Router::new(false, msgs, bots, None));
+
+        let rec =
+            std::env::temp_dir().join(format!("abb-task-alert-{}.jsonl", uuid::Uuid::new_v4()));
+        let stop = tokio_util::sync::CancellationToken::new();
+        run_attempt(
+            bot,
+            task,
+            mock_cfg(&rec),
+            std::env::temp_dir().display().to_string(),
+            &router,
+            &states,
+            &stop,
+        )
+        .await;
+
+        let sent = msgr.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "失效创建者会话发不出去 → 必须有一条告警落到主会话：{sent:?}"
+        );
+        assert_eq!(sent[0].0, primary, "告警要落主会话：{sent:?}");
+        assert!(
+            sent[0].1.contains("投递失败"),
+            "告警要说明是投递失败：{}",
+            sent[0].1
+        );
+        let rt = states.get("tk_alert");
+        assert!(
+            rt.last_error.contains("结果投递失败"),
+            "运行态要留痕（task status 可见）：{}",
+            rt.last_error
+        );
+        assert_eq!(
+            rt.kind,
+            TaskStateKind::Succeeded,
+            "投递失败不该把任务本身改判成失败（agent 那一轮是成功的）"
+        );
+        let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// 端到端循环：`归位 → 认领 → 中断 → 归位`，`max_restarts = 1` 时第二步必须落

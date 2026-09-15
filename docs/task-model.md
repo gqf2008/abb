@@ -219,6 +219,22 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 同时在会话内提供显式的 `task cancel <id>`（见 Q3）。
 
+**已落地（#306，2026-09-15）**：`task` 走的是 `buzz::oneshot`（自起独立 handle + 独立
+频道，不是聊天 channel），所以上表里的 `queued` 行退化成「任务还在 `next_pending` 待
+认领」——实现比原设想简单：
+
+- **通道方向 = CLI 写请求、service 消费**（运行态单写者，Q12）。`task cancel <id>`
+  只往 `~/.agent-bridge/tasks/<bot>/cancel-requests/<id>` 落一个请求文件，不改
+  `tasks-state.json`；
+- 运行中：task worker 在 `run_attempt` 里起一个 watcher 轮询该文件（1s），命中即
+  `child_token().cancel()`；子令牌与「service 关停」父令牌合并后交给
+  `oneshot::oneshot_turn(..., external_cancel)`，走同一条拆栈通路（cancel 回执 + 杀进程组）；
+- 未开跑：worker 每轮 loop 开头 `consume_cancel_requests` 把 `Pending` 任务直接判
+  `Cancelled`（不再被认领）；已是终态的任务**不被改写**，只清请求文件；
+- 轮次结束时消费掉自己的请求文件（否则同 id 的下一次重跑会立刻又被自己取消）；
+- **取消后一律不投递**（用户已明确不要结果；与服务关停联动同口径），只留运行态
+  `last_error` + `task-logs`。
+
 **配套（容易漏的）**：
 
 - `session_manage.rs` / `session_gc.rs` 会枚举 `chat_keys`——内部 task channel 必须**排除**，否则会被当成聊天会话列出/回收；
@@ -227,6 +243,20 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 #### D2 默认投递 = 创建者会话（但不要改自环豁免的判据）
 
 老板已拍板：`spawn` / `job` / `deliver` / `task` 缺省**一律回创建者会话**，来源取桥注入的 `AGENT_BRIDGE_BOT_KEY` + `AGENT_BRIDGE_CHAT_ID`；显式 `--to` / `--to-current` 优先。
+
+**已落地（#306，2026-09-15）**：
+
+- `task add --to bot_key:chat_id`（只按第一个冒号切；省略 `bot_key` = 本 bot）/ `--to-current`；
+  仍**只支持一个投递目标**（多目标由 `Task::validate` 显式拒绝，等真需求再放开）；
+- 执行侧按 `targets[0].bot_key` **真投那个 bot**（旧实现忽略 `bot_key`、一律按本 bot 投，
+  于是 `validate` 只能显式拒绝跨 bot；两处一并解除）。`in_session` 豁免只在
+  「目标确实等于创建者会话」时置位，`--to` 指到别处一律走显式跨会话（受
+  `cross_delivery_enabled` 约束）；
+- **第二告警通道**：默认目标 = 创建者会话，`Router` 的回源告警也就发回那个**已失效**的
+  会话 ⇒ 等于没有告警。`Router::deliver` 现在返回 `DeliveryOutcome`，task worker 据此在
+  投递失败时把原因写进运行态 `last_error`（`task status` 可见）并投该 bot 的
+  **主会话**（`bots[bot_key].primary_chat_id`，与 `run_job` 的回落同源）；主会话与失败
+  目标相同时跳过（再发一次没有意义），发不出去只记日志。
 
 ⚠️ **不要**按 v1 的想法把豁免改成「同一 (bot, chat) 即视为 in_session」——那会让任何同地址项自动绕过 `cross_delivery_enabled` 与 10 分钟防循环去重，而 Router 现在**专门防伪造 `in_session`**（`src/deliver.rs:252-256`）。
 
@@ -335,7 +365,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | # | 问题 | 建议默认 / 说明 |
 |---|---|---|
 | Q2 | 后台 agent 是否支持「带聊天上下文」模式 | **先不做**，观察需求 |
-| Q3 | 会话内能否停后台任务 | **能**，但须显式 `task cancel <id>`（避免误杀） |
+| Q3 | 会话内能否停后台任务 | **能**，但须显式 `task cancel <id>`（避免误杀）——已落地（#306）：CLI 落取消请求文件，worker 消费；在跑的真拆栈、未开跑的不再开跑，取消后不投递 |
 | Q4 | 日志上限与保留份数 | 单文件 10MB / 保留 3 份（待定） |
 | Q5 | ABB 重启后是否恢复常驻任务 | **恢复** |
 | Q6 | 是否允许跨 bot 建 `proc` | **不允许**（bot 归属即权限面） |
