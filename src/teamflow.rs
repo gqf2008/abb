@@ -86,13 +86,7 @@ pub struct TeamFlowStore {
 }
 
 impl TeamFlowStore {
-    pub fn new(bot_key: &str) -> TeamFlowStore {
-        let dir = crate::workspace_dir(bot_key);
-        let _ = fs::create_dir_all(&dir);
-        Self::at(dir.join("teamflow.json"))
-    }
-
-    fn at(path: PathBuf) -> TeamFlowStore {
+    pub(crate) fn at(path: PathBuf) -> TeamFlowStore {
         let data = match fs::read_to_string(&path) {
             Ok(t) => serde_json::from_str::<HashMap<String, TeamFlow>>(&t).unwrap_or_default(),
             Err(_) => HashMap::new(),

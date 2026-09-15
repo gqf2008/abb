@@ -65,7 +65,11 @@ impl JobStore {
     pub fn new(bot_key: &str) -> JobStore {
         let dir = crate::bridge_dir().join("workspaces").join(bot_key);
         let _ = fs::create_dir_all(&dir);
-        let path = dir.join("jobs.json");
+        Self::at(dir.join("jobs.json"))
+    }
+
+    /// 按指定路径构造（生产入口委托 / 测试在隔离根下构造）。
+    pub(crate) fn at(path: PathBuf) -> JobStore {
         let data = if path.exists() {
             fs::read_to_string(&path)
                 .ok()

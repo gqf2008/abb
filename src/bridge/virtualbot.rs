@@ -262,7 +262,7 @@ impl Bridge {
                 trunc(chat_id, 12)
             );
             // #147 双向一致：团队条目对应角色 chat_id 清空（状态转「部分失败」）
-            crate::teamreg::TeamStore::new().clear_chat(&self.bot.key(), chat_id);
+            self.team_store.clear_chat(&self.bot.key(), chat_id);
             // 会话历史归档（用户决策：解散后不删除，移入工作区 archive/）
             crate::virtualbot::VirtualBotStore::archive_chat_history(&self.bot.key(), chat_id);
         } else {
@@ -278,12 +278,15 @@ impl Bridge {
     /// 两次连续写入（文件系统时间戳 tick 相同）漏刷新。
     pub(super) fn refresh_virtual_bots(&self) {
         use std::time::SystemTime;
-        let sig = std::fs::metadata(crate::bridge_dir().join("virtual-bots.json"))
+        let sig = std::fs::metadata(self.bridge_root.join("virtual-bots.json"))
             .ok()
             .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
         let mut cached = self.virtual_bots_mtime.lock().unwrap();
         if *cached != sig {
-            *self.virtual_bots.lock().unwrap() = crate::virtualbot::VirtualBotStore::new().load();
+            *self.virtual_bots.lock().unwrap() = crate::virtualbot::VirtualBotStore::new_at(
+                self.bridge_root.join("virtual-bots.json"),
+            )
+            .load();
             *cached = sig;
         }
     }

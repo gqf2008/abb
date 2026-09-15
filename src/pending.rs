@@ -72,16 +72,10 @@ pub struct PendingStore {
 }
 
 impl PendingStore {
-    pub fn new(bot_key: &str) -> PendingStore {
-        let dir = crate::workspace_dir(bot_key);
-        let _ = fs::create_dir_all(&dir);
-        Self::at(dir.join("pending.json"))
-    }
-
     /// 按指定路径构造（生产/测试共用）。解析失败（半截写/手工编辑损坏）必须留痕：
     /// 静默空置会让下一条 add/set_reply 覆盖损坏文件、全部残留（含已落盘的 reply）
     /// 永久丢失——恢复路径的「补发不重跑」依赖这个文件，丢了就退化为静默丢消息。
-    fn at(path: PathBuf) -> PendingStore {
+    pub(crate) fn at(path: PathBuf) -> PendingStore {
         let data = match fs::read_to_string(&path) {
             Ok(t) => match serde_json::from_str::<Vec<PendingItem>>(&t) {
                 Ok(v) => v,

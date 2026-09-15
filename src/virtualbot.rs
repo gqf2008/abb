@@ -897,7 +897,9 @@ mod tests {
             "sid-legacy",
             "槽位必须迁入 vb"
         );
-        let bot_store = crate::sessions::SessionStore::new(bot_key);
+        let bot_store = crate::sessions::SessionStore::at(
+            base.join("workspaces").join(bot_key).join("sessions.json"),
+        );
         assert!(
             bot_store.chat_entry(chat).is_none(),
             "bot 级槽位必须移除（不双写）"

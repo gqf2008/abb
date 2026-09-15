@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::Path;
 
 pub struct SingleInstance {
     _file: File, // 持有 fd 即持有锁；drop 时内核释放
@@ -20,8 +21,12 @@ impl SingleInstance {
     /// 尝试对 ~/.agent-bridge/.<name>.lock 拿排他非阻塞锁。
     /// 成功返回 guard；**已有实例在跑返回 Err**（调用方应退出）。
     pub fn acquire(name: &str) -> Result<SingleInstance> {
-        let dir = crate::bridge_dir();
-        std::fs::create_dir_all(&dir).ok();
+        Self::acquire_at(&crate::bridge_dir(), name)
+    }
+
+    /// 指定目录的锁实现；生产入口传 `~/.agent-bridge`，测试传唯一 temp 目录。
+    fn acquire_at(dir: &Path, name: &str) -> Result<SingleInstance> {
+        std::fs::create_dir_all(dir).ok();
         let path = dir.join(format!(".{name}.lock"));
         // 锁文件只是 flock 的锚点，从不读写内容——无需 truncate/append
         #[cfg(unix)]
@@ -84,17 +89,21 @@ mod tests {
 
     #[test]
     fn second_acquire_fails() {
-        let g1 = SingleInstance::acquire("test").expect("第一次应拿到");
-        let g2 = SingleInstance::acquire("test");
+        let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
+        let g1 = SingleInstance::acquire_at(&dir, "test").expect("第一次应拿到");
+        let g2 = SingleInstance::acquire_at(&dir, "test");
         assert!(g2.is_err(), "第二次拿同名锁应失败");
         drop(g1);
-        let g3 = SingleInstance::acquire("test");
+        let g3 = SingleInstance::acquire_at(&dir, "test");
         assert!(g3.is_ok(), "释放后应能再拿到");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn different_names_independent() {
-        let _a = SingleInstance::acquire("test-a").expect("a");
-        let _b = SingleInstance::acquire("test-b").expect("b 与 a 不同名，应独立拿到");
+        let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
+        let _a = SingleInstance::acquire_at(&dir, "test-a").expect("a");
+        let _b = SingleInstance::acquire_at(&dir, "test-b").expect("b 与 a 不同名，应独立拿到");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

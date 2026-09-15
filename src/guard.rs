@@ -21,7 +21,12 @@ use std::path::{Path, PathBuf};
 
 /// guard 文件目录：~/.agent-bridge/guard/<bot_key>/（工作区外，防受限 agent 篡改）。
 fn guard_dir(bot_key: &str) -> PathBuf {
-    crate::bridge_dir().join("guard").join(bot_key)
+    guard_dir_at(&crate::bridge_dir(), bot_key)
+}
+
+/// 指定 bridge 根目录下的 guard 文件目录（测试注入临时根，生产入口见 [`guard_dir`]）。
+fn guard_dir_at(bridge_root: &Path, bot_key: &str) -> PathBuf {
+    bridge_root.join("guard").join(bot_key)
 }
 
 /// 受限 claude spawn 时 `--settings` 指向的 settings.json 绝对路径。
@@ -42,9 +47,9 @@ pub fn owner_guard_settings_path(bot_key: &str) -> PathBuf {
     guard_dir(bot_key).join("owner-settings.json")
 }
 
-/// 待确认的危险删除登记文件（工作区外，与 guard 文件同目录；/trash confirm 消费）。
-pub fn pending_dangerous_path(bot_key: &str) -> PathBuf {
-    guard_dir(bot_key).join("pending-dangerous.json")
+/// 指定 bridge 根目录下的待确认登记路径（测试注入临时根）。
+fn pending_dangerous_path_at(bridge_root: &Path, bot_key: &str) -> PathBuf {
+    guard_dir_at(bridge_root, bot_key).join("pending-dangerous.json")
 }
 
 /// 幂等生成受限会话的 guard 文件（受限 spawn 前调用；内容静态，同内容跳过写盘防
@@ -695,6 +700,17 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
 /// - 复合语法（管道/重定向等）：owner 保持放行——删除保护是增量拦截，不因解析不了
 ///   就把 owner 的合法命令全卡死（与受限会话的 fail-closed 白名单语义不同）。
 fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
+    let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+    check_owner_bash_at(input, workspace, &crate::bridge_dir(), bot_key.as_deref())
+}
+
+/// [`check_owner_bash`] 的实现体：bridge 根目录与 bot key 都可注入，测试不碰真实 guard 目录。
+fn check_owner_bash_at(
+    input: &serde_json::Value,
+    workspace: &Path,
+    bridge_root: &Path,
+    bot_key: Option<&str>,
+) -> Decision {
     let Some(cmd) = input["command"].as_str() else {
         return Decision::Allow;
     };
@@ -768,9 +784,10 @@ fn check_owner_bash(input: &serde_json::Value, workspace: &Path) -> Decision {
     }
     // 危险删除：拒绝 + 登记待确认（不移动、不删除——等 /trash confirm）
     if !dangerous.is_empty() {
-        if let Ok(k) = std::env::var("AGENT_BRIDGE_BOT_KEY") {
-            register_pending(
-                &k,
+        if let Some(k) = bot_key {
+            register_pending_at(
+                bridge_root,
+                k,
                 &dangerous.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             );
         }
@@ -873,8 +890,8 @@ struct PendingDangerous {
 
 /// 登记待确认的危险删除（/trash confirm 消费）。路径去重，重复登记只留最新。
 /// 存 pretty 形态（去 \\?\ 前缀），与 take_pending 的比对口径一致。
-fn register_pending(bot_key: &str, paths: &[PathBuf]) {
-    let p = pending_dangerous_path(bot_key);
+fn register_pending_at(bridge_root: &Path, bot_key: &str, paths: &[PathBuf]) {
+    let p = pending_dangerous_path_at(bridge_root, bot_key);
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent); // guard 目录可能尚不存在（首次危险拦截）
     }
@@ -901,9 +918,9 @@ fn register_pending(bot_key: &str, paths: &[PathBuf]) {
 }
 
 /// 消费一条待确认危险删除（/trash confirm）：路径精确匹配（绝对路径或工作区相对），
-/// 匹配后移除登记。返回是否命中。
-pub fn take_pending(bot_key: &str, workspace: &Path, path: &str) -> bool {
-    let p = pending_dangerous_path(bot_key);
+/// 匹配后移除登记。bridge 根可注入，测试不碰真实 guard 目录。
+fn take_pending_at(bridge_root: &Path, bot_key: &str, workspace: &Path, path: &str) -> bool {
+    let p = pending_dangerous_path_at(bridge_root, bot_key);
     let mut list: Vec<PendingDangerous> = std::fs::read_to_string(&p)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -928,7 +945,12 @@ pub fn take_pending(bot_key: &str, workspace: &Path, path: &str) -> bool {
 
 /// 待确认清单（/trash list 展示用）。
 pub fn list_pending(bot_key: &str) -> Vec<(String, u64)> {
-    let p = pending_dangerous_path(bot_key);
+    list_pending_at(&crate::bridge_dir(), bot_key)
+}
+
+/// [`list_pending`] 的实现体：测试注入临时 bridge 根。
+fn list_pending_at(bridge_root: &Path, bot_key: &str) -> Vec<(String, u64)> {
+    let p = pending_dangerous_path_at(bridge_root, bot_key);
     std::fs::read_to_string(&p)
         .ok()
         .and_then(|t| serde_json::from_str::<Vec<PendingDangerous>>(&t).ok())
@@ -945,7 +967,17 @@ pub fn confirm_dangerous_delete(
     workspace: &std::path::Path,
     path: &str,
 ) -> Result<crate::trash::TrashItem, String> {
-    if !take_pending(bot_key, workspace, path) {
+    confirm_dangerous_delete_at(&crate::bridge_dir(), bot_key, workspace, path)
+}
+
+/// [`confirm_dangerous_delete`] 的实现体：测试注入临时 bridge 根。
+fn confirm_dangerous_delete_at(
+    bridge_root: &Path,
+    bot_key: &str,
+    workspace: &std::path::Path,
+    path: &str,
+) -> Result<crate::trash::TrashItem, String> {
+    if !take_pending_at(bridge_root, bot_key, workspace, path) {
         return Err(format!(
             "没有待确认的危险删除匹配：{path}（/trash list 查看）"
         ));
@@ -1128,7 +1160,12 @@ mod tests {
         std::fs::write(ws.join("a.txt"), "hello").unwrap();
         std::fs::write(ws.join("sub/b.txt"), "world").unwrap();
         // 工作区内小文件删除 → 移入回收站 + deny
-        let d = check_owner_bash(&serde_json::json!({"command": "rm a.txt sub/b.txt"}), &ws);
+        let d = check_owner_bash_at(
+            &serde_json::json!({"command": "rm a.txt sub/b.txt"}),
+            &ws,
+            &root,
+            None,
+        );
         match d {
             Decision::Deny(r) => {
                 assert!(r.contains("回收站"), "reason 应告知移入回收站：{r}");
@@ -1146,7 +1183,12 @@ mod tests {
     fn owner_bash_dangerous_delete_denied_and_pending() {
         let (root, ws) = owner_delete_env();
         std::fs::write(ws.join("main.rs"), "fn main() {}").unwrap();
-        let d = check_owner_bash(&serde_json::json!({"command": "rm main.rs"}), &ws);
+        let d = check_owner_bash_at(
+            &serde_json::json!({"command": "rm main.rs"}),
+            &ws,
+            &root,
+            None,
+        );
         match d {
             Decision::Deny(r) => assert!(r.contains("危险删除已拦截"), "{r}"),
             Decision::Allow => panic!("代码文件删除必须拦截"),
@@ -1170,27 +1212,36 @@ mod tests {
             "mv a.txt b.txt",
             "cp a.txt c.txt",
         ] {
-            let d = check_owner_bash(&serde_json::json!({"command": cmd}), &ws);
+            let d = check_owner_bash_at(&serde_json::json!({"command": cmd}), &ws, &root, None);
             assert_eq!(d, Decision::Allow, "{cmd} 应直通放行");
         }
         // 复合语法：owner 放行（不因解析不了卡死合法命令）
         assert_eq!(
-            check_owner_bash(
+            check_owner_bash_at(
                 &serde_json::json!({"command": "rm a.txt | tee /tmp/x"}),
-                &ws
+                &ws,
+                &root,
+                None,
             ),
             Decision::Allow
         );
         // 工作区外删除：owner 自由
         assert_eq!(
-            check_owner_bash(&serde_json::json!({"command": "rm /tmp/x.txt"}), &ws),
+            check_owner_bash_at(
+                &serde_json::json!({"command": "rm /tmp/x.txt"}),
+                &ws,
+                &root,
+                None,
+            ),
             Decision::Allow
         );
         // find -delete：显式拒绝（无法可靠提取目标）
         assert_ne!(
-            check_owner_bash(
+            check_owner_bash_at(
                 &serde_json::json!({"command": "find . -name '*.tmp' -delete"}),
-                &ws
+                &ws,
+                &root,
+                None,
             ),
             Decision::Allow
         );
@@ -1202,7 +1253,12 @@ mod tests {
         let (root, ws) = owner_delete_env();
         // rm -f 不存在目标（工作区内）：无事可做 → 放行（agent 正常流程不被打断）
         assert_eq!(
-            check_owner_bash(&serde_json::json!({"command": "rm -f nope.txt"}), &ws),
+            check_owner_bash_at(
+                &serde_json::json!({"command": "rm -f nope.txt"}),
+                &ws,
+                &root,
+                None,
+            ),
             Decision::Allow
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1213,23 +1269,21 @@ mod tests {
         let (root, ws) = owner_delete_env();
         std::fs::write(ws.join("x.rs"), "fn x() {}").unwrap();
         let key = format!("test-bot-{}", uuid::Uuid::new_v4());
-        let prev = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
-        std::env::set_var("AGENT_BRIDGE_BOT_KEY", &key);
-        let d = check_owner_bash(&serde_json::json!({"command": "rm x.rs"}), &ws);
+        let d = check_owner_bash_at(
+            &serde_json::json!({"command": "rm x.rs"}),
+            &ws,
+            &root,
+            Some(&key),
+        );
         assert!(matches!(d, Decision::Deny(_)));
-        assert_eq!(list_pending(&key).len(), 1);
+        assert_eq!(list_pending_at(&root, &key).len(), 1);
         // 未匹配路径 → 消费失败
-        assert!(!take_pending(&key, &ws, "yyy.rs"));
+        assert!(!take_pending_at(&root, &key, &ws, "yyy.rs"));
         // confirm 完整动作：消费登记 + 移入回收站（条目记 dangerous）
-        let it = confirm_dangerous_delete(&key, &ws, "x.rs").unwrap();
+        let it = confirm_dangerous_delete_at(&root, &key, &ws, "x.rs").unwrap();
         assert!(it.dangerous);
         assert!(!ws.join("x.rs").exists());
-        assert_eq!(list_pending(&key).len(), 0);
-        // 恢复 env（并行测试隔离）
-        match prev {
-            Some(v) => std::env::set_var("AGENT_BRIDGE_BOT_KEY", v),
-            None => std::env::remove_var("AGENT_BRIDGE_BOT_KEY"),
-        }
+        assert_eq!(list_pending_at(&root, &key).len(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
