@@ -163,7 +163,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
     "capability_hash": ""                  // 若是 capability 方案：只存 hash（明文不进任何 agent 可读文件）
   },
   "payload": { "kind": "agent", "prompt": "……", "cwd": "", "cmd": [], "env": {} },
-  "trigger": { "kind": "cron", "expr": "0 9 * * *", "timezone": "Asia/Shanghai" },
+  "trigger": { "kind": "cron", "expr": "0 9 * * *", "timezone": "" },   // timezone 暂不支持（非空会被 validate 拒）
   "delivery": { "targets": [], "default": "creator" },
   "channel": { "mode": "dedicated", "channel_id": "……" },   // 见 D1a
   "limits": { "timeout_secs": 0, "max_restarts": 3, "backoff": "exponential", "log_max_bytes": 10485760 },

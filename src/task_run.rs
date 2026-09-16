@@ -684,8 +684,19 @@ fn gc_logs(store: &TaskStore, states: &TaskStateStore, now: u64) {
         if now.saturating_sub(finished) < retention {
             continue;
         }
-        if paths.log_file(&task.id).exists() {
-            crate::task_store::remove_task_logs(paths, &task.id);
+        // **不能**以「当前 id.log 存在」为前置：轮转之后可能只剩 `.1/.2`（当前文件被删过/
+        // 轮转过），那样它们会被永久遗留（审查实测）。这里直接按统一入口清（不存在即 no-op），
+        // 只在确实清掉了东西时打日志。
+        let had_any = (0..LOG_KEEP_FILES).any(|i| {
+            let p = if i == 0 {
+                paths.log_file(&task.id)
+            } else {
+                std::path::PathBuf::from(format!("{}.{i}", paths.log_file(&task.id).display()))
+            };
+            p.exists()
+        });
+        crate::task_store::remove_task_logs(paths, &task.id);
+        if had_any {
             crate::log!(
                 "[task] {} 的日志已超保留期（{} 天）→ 回收（定义与运行态保留）",
                 &task.id[..task.id.len().min(12)],
@@ -756,8 +767,16 @@ fn requeue_orphans(store: &TaskStore, states: &TaskStateStore) {
     for id in states.ids() {
         if !known.contains(id.as_str()) {
             let _ = states.remove(&id);
-            // 当前文件 + 轮转历史一起清（只删当前会留下 .1/.2 永久孤儿）
-            crate::task_store::remove_task_logs(states.paths(), &id);
+            // 只有**合法 id** 才按它删日志：状态文件的键不受 `validate_task_id` 约束，
+            // 而 `safe_path_component` 是**有损映射**（`a/b` → `a_b`）——若照它删日志，
+            // 一个恶意/损坏的键 `a/b` 会把**活任务 `a_b` 的日志**删掉（审查实测）。
+            // 非法键只丢状态行，不碰任何文件。
+            if crate::task_store::validate_task_id(&id).is_ok() {
+                // 当前文件 + 轮转历史一起清（只删当前会留下 .1/.2 永久孤儿）
+                crate::task_store::remove_task_logs(states.paths(), &id);
+            } else {
+                crate::log!("[task] 丢弃非法 id 的运行态（{id:?}）：不按它拼路径删日志");
+            }
         }
     }
 }
@@ -1167,6 +1186,77 @@ mod tests {
             states.get(&once.id).kind,
             TaskStateKind::Succeeded,
             "一次性任务的终态不得被取消请求改写"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查回归（阻塞）：**非法的状态键不得按清洗后的名字去删活任务的日志**。
+    ///
+    /// `safe_path_component` 是有损映射（`a/b` → `a_b`），若孤儿清理照它删日志，
+    /// 一个损坏/恶意的状态键 `a/b` 会删掉**活任务 `a_b`** 的日志（审查实测）。
+    #[test]
+    fn orphan_state_key_without_traversal_must_not_delete_other_task_logs() {
+        let root = tmp_root("statekey_collision");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        // 活任务 a_b + 它的日志
+        let live = now_task("b", "a_b", "c");
+        store.add(live.clone()).unwrap();
+        let rt = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            ..Default::default()
+        };
+        write_log(&paths, &live, &rt, "live-log");
+        assert!(paths.log_file("a_b").exists(), "前置：活任务日志已写");
+        // 恶意/损坏的状态键：清洗后与活任务同名
+        states.set("a/b", rt.clone()).unwrap();
+
+        requeue_orphans(&store, &states);
+
+        assert!(
+            paths.log_file("a_b").exists(),
+            "活任务 a_b 的日志不得被他人的非法状态键 a/b 连坐删除"
+        );
+        assert!(
+            states.get("a/b").kind == TaskStateKind::Pending,
+            "非法状态键应被丢弃（回到默认态）"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查回归：终态 GC 在**只剩轮转文件**（当前 `.log` 不存在）时也必须清干净。
+    #[test]
+    fn gc_logs_removes_rotated_files_even_without_current() {
+        let root = tmp_root("gc_rotated_only");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let t = now_task("b", "tk_rot_only", "c");
+        store.add(t.clone()).unwrap();
+        let now = crate::chrono_lite::unix_secs();
+        states
+            .set(
+                &t.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    finished_at: Some(now - (LOG_RETENTION_DAYS + 1) * 86_400),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        let base = paths.log_file(&t.id);
+        // 只留轮转历史（当前文件不存在）
+        std::fs::write(base.with_file_name("tk_rot_only.log.1"), b"old1").unwrap();
+        std::fs::write(base.with_file_name("tk_rot_only.log.2"), b"old2").unwrap();
+
+        gc_logs(&store, &states, now);
+
+        assert!(
+            !base.with_file_name("tk_rot_only.log.1").exists()
+                && !base.with_file_name("tk_rot_only.log.2").exists(),
+            "只剩轮转文件时也必须按保留期清掉（否则永久遗留）"
         );
         let _ = std::fs::remove_dir_all(&paths.dir);
     }

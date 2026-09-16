@@ -741,15 +741,20 @@ fn read_defs(p: &std::path::Path) -> Option<Vec<Task>> {
     // 坏文件不静默当空（否则「任务凭空消失」无从排查）——上报到日志，调用方自行兜底。
     match serde_json::from_str::<Vec<Task>>(&text) {
         Ok(v) => {
-            // 手改过的定义文件可能带非法 id（会拼进文件路径）→ 加载时挡掉并留痕，
-            // 不让它进入 store（否则 rm/GC 会按它拼路径）。
+            // `tasks.json` 是**用户可写**的：手改过的文件必须跟 `task add` 走同一道闸。
+            // 逐条跑完整 `Task::validate`（含 id 的文件名安全、once 严格日历、now 不带 expr、
+            // keepalive 未支持、timezone 未实现…），非法定义跳过并留痕——否则会出现
+            // 「CLI 拒绝但手改能塞进去」的绕过面（审查实测：now+expr / keepalive /
+            // timezone 都能被加载）。
             let (ok, bad): (Vec<Task>, Vec<Task>) =
-                v.into_iter().partition(|t| validate_task_id(&t.id).is_ok());
+                v.into_iter().partition(|t| t.validate().is_ok());
             for t in &bad {
-                crate::log!(
-                    "[task] 忽略 id 非法的任务定义（{:?}）：id 只能是字母/数字/下划线/连字符",
-                    t.id
-                );
+                let why = t
+                    .validate()
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                crate::log!("[task] 忽略不合法的任务定义（{:?}）：{why}", t.id);
             }
             Some(ok)
         }
@@ -934,6 +939,68 @@ mod tests {
         t.limits.log_max_bytes = 0;
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("log_max_bytes"), "{e}");
+    }
+
+    /// 审查回归：**手改 `tasks.json` 也必须过完整 `Task::validate`**——否则会出现
+    /// 「CLI 拒绝但手改能塞进去」的绕过面（now+expr / keepalive / timezone 实测都能加载）。
+    #[test]
+    fn load_defs_skips_invalid_definitions_not_just_bad_ids() {
+        let root = std::env::temp_dir().join(format!("abb-task-defs-{}", uuid::Uuid::new_v4()));
+        let paths = TaskPaths::with_root(&root, "b");
+        paths.ensure().unwrap();
+        let base = |id: &str, trigger: serde_json::Value| {
+            serde_json::json!({
+                "schema_version": TASK_SCHEMA_VERSION,
+                "id": id,
+                "name": "",
+                "bot_key": "b",
+                "created_by": {"role": "owner", "bot_key": "b", "chat_id": "c"},
+                "payload": {"kind": "agent", "prompt": "x"},
+                "trigger": trigger,
+                "delivery": {"targets": [], "default": "creator"},
+                "limits": {"timeout_secs": 60, "max_restarts": 1, "log_max_bytes": 1024},
+            })
+        };
+        let defs = serde_json::json!([
+            base(
+                "tk_good",
+                serde_json::json!({"kind": "cron", "expr": "30 9 * * *", "timezone": ""})
+            ),
+            base(
+                "tk_now_expr",
+                serde_json::json!({"kind": "now", "expr": "30 9 * * *", "timezone": ""})
+            ),
+            base(
+                "tk_keepalive",
+                serde_json::json!({"kind": "keepalive", "expr": "", "timezone": ""})
+            ),
+            base(
+                "tk_tz",
+                serde_json::json!({"kind": "cron", "expr": "0 9 * * *", "timezone": "Asia/Tokyo"})
+            ),
+            base(
+                "../../evil",
+                serde_json::json!({"kind": "now", "expr": "", "timezone": ""})
+            ),
+            base(
+                "tk_bad_date",
+                serde_json::json!({"kind": "once", "expr": "2026-02-31 09:00", "timezone": ""})
+            ),
+        ]);
+        std::fs::write(
+            paths.definitions(),
+            serde_json::to_string_pretty(&defs).unwrap(),
+        )
+        .unwrap();
+
+        let store = TaskStore::new_at(&root, "b");
+        let ids: Vec<String> = store.list().into_iter().map(|t| t.id).collect();
+        assert_eq!(
+            ids,
+            vec!["tk_good".to_string()],
+            "只有合法定义能被加载（其余 5 条都必须被 validate 挡掉），实际：{ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// 审查回归（严重）：任务 id 必须挡目录穿越——id 会拼进日志/取消请求路径，
