@@ -67,6 +67,156 @@ impl TriggerKind {
             TriggerKind::Once | TriggerKind::Cron | TriggerKind::Interval
         )
     }
+
+    /// 是否是**可重复触发**的档（跑完一轮后回到可认领状态，而不是终态）。
+    /// `keepalive` 也是重复档，但本批尚未支持（见 `task_run` 的认领判定）。
+    pub fn is_repeating(self) -> bool {
+        matches!(self, TriggerKind::Cron | TriggerKind::Interval)
+    }
+}
+
+/// 任务 id 必须是**单一文件名组件**：只允许 `[A-Za-z0-9_-]`，长度 1..=64。
+///
+/// 为什么要硬校验（审查实测）：id 会直接拼进文件路径（`TaskPaths::log_file` / `cancel_file`），
+/// 而 `tasks.json` 是**用户可写**的——一个 `../../other/victim` 形式的 id 能让 `task rm`、
+/// 孤儿回收、日志回收删到**别的 bot 的目录**（实测把别的 bot 的日志删掉了）。
+pub fn validate_task_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("任务 id 不能为空");
+    }
+    if id.len() > 64 {
+        bail!("任务 id 过长（{} 字符，上限 64）", id.len());
+    }
+    if id == "." || id == ".." {
+        bail!("任务 id 不能是 {id:?}（会被当成上级目录）");
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        bail!("任务 id 含非法字符 {bad:?}（只允许字母/数字/下划线/连字符：{id:?}）");
+    }
+    Ok(())
+}
+
+/// 把任意字符串收敛成**安全的文件名组件**（防御纵深：即使某个 id 绕过校验走到路径拼接，
+/// 也不可能穿出目录）。非法字符一律替换成 `_`，空串回落 `unnamed`。
+pub fn safe_path_component(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 删除一条任务的**全部**日志（当前 `id.log` + 轮转 `.1`/`.2`）。
+///
+/// 统一入口：`task rm`、孤儿回收、保留期回收三处都必须走这里——审查实测「只删当前文件」
+/// 会把 `.1/.2` 留成永久孤儿（`task rm` 之后没有任何入口能再看到它们）。
+pub fn remove_task_logs(paths: &TaskPaths, id: &str) {
+    let base = paths.log_file(id);
+    let _ = fs::remove_file(&base);
+    for i in 1..8 {
+        let _ = fs::remove_file(std::path::PathBuf::from(format!("{}.{i}", base.display())));
+    }
+}
+
+/// 严格解析 `once` 的 `YYYY-MM-DD HH:MM`：
+/// 必须是**恰好两段**、日期三段/时间两段、且日历合法（含闰年 2 月）。
+///
+/// `schedule::parse_once` 是给 job 用的宽松实现（接受 `2026-02-31`、`09:00:99`、
+/// `2026-09-20-extra 09:00` 这类垃圾），task 这里在**登记期**就要挡掉——坏表达式落到运行时
+/// 只表现为「永远不触发」，用户看不到任何错误。
+pub fn parse_once_strict(expr: &str) -> Option<(i64, u32, u32, u32, u32)> {
+    let t = expr.trim();
+    let mut fields = t.split_whitespace();
+    let date = fields.next()?;
+    let time = fields.next()?;
+    if fields.next().is_some() {
+        return None; // 多余字段（trailing token）
+    }
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let mut h = time.split(':');
+    let hour: u32 = h.next()?.parse().ok()?;
+    let minute: u32 = h.next()?.parse().ok()?;
+    if h.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || hour > 23 || minute > 59 {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+    Some((year, month, day, hour, minute))
+}
+
+/// 解析 `interval` 的间隔表达式：`30`（纯秒）/ `30s` / `5m` / `2h` / `1d`。
+///
+/// **硬下限 5 秒**：worker 轮询间隔是 2s，比它更密的周期没有意义，只会把 LLM 打成
+/// 忙循环（也是"误配一条 `--every 1s` 就把额度烧光"的护栏）。上限不限（`1d` 也合法）。
+pub fn parse_interval_secs(expr: &str) -> Option<u64> {
+    const MIN_INTERVAL_SECS: u64 = 5;
+    let t = expr.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (num, unit) = match t.chars().last()? {
+        's' | 'S' => (&t[..t.len() - 1], 1u64),
+        'm' | 'M' => (&t[..t.len() - 1], 60),
+        'h' | 'H' => (&t[..t.len() - 1], 3600),
+        'd' | 'D' => (&t[..t.len() - 1], 86400),
+        c if c.is_ascii_digit() => (t, 1),
+        _ => return None,
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    let secs = n.checked_mul(unit)?;
+    if secs < MIN_INTERVAL_SECS {
+        return None;
+    }
+    Some(secs)
+}
+
+/// 把秒数渲染成人话（`task list/status` 用）。
+pub fn human_interval(secs: u64) -> String {
+    if secs.is_multiple_of(86_400) {
+        format!("{} 天", secs / 86_400)
+    } else if secs.is_multiple_of(3_600) {
+        format!("{} 小时", secs / 3_600)
+    } else if secs.is_multiple_of(60) {
+        format!("{} 分钟", secs / 60)
+    } else {
+        format!("{secs} 秒")
+    }
 }
 
 /// 载荷：`agent` 用 prompt（+cwd），`proc` 用 cmd（+cwd/env）。
@@ -208,9 +358,7 @@ impl Task {
                 TASK_SCHEMA_VERSION
             );
         }
-        if self.id.trim().is_empty() {
-            bail!("任务 id 不能为空");
-        }
+        validate_task_id(&self.id)?;
         if self.bot_key.trim().is_empty() {
             bail!("任务缺少 bot_key（任务按 bot 归属，不允许无主）");
         }
@@ -219,6 +367,56 @@ impl Task {
                 "触发方式 {:?} 需要 expr（时间/表达式/间隔）",
                 self.trigger.kind
             );
+        }
+        // 表达式**登记期**就要校验：坏表达式留到运行时只会表现为「永远不触发」，
+        // 用户看不到任何错误（这类静默失效在本仓库踩过，宁可当场拒绝）。
+        // `timezone` 目前**未参与调度**（调度一律按本地 UTC+8）。留着它只会让人以为
+        // 写了时区就按那个时区跑——宁可拒绝，也不要有这种静默无效的字段。
+        if !self.trigger.timezone.trim().is_empty() {
+            bail!(
+                "trigger.timezone 暂不支持（当前一律按本地时区调度，收到 {:?}）",
+                self.trigger.timezone
+            );
+        }
+        match self.trigger.kind {
+            TriggerKind::Once => {
+                if parse_once_strict(&self.trigger.expr).is_none() {
+                    bail!(
+                        "once 需要 `YYYY-MM-DD HH:MM` 形式且日历合法的时间点（收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            TriggerKind::Cron => {
+                if crate::schedule::CronExpr::parse(&self.trigger.expr).is_none() {
+                    bail!(
+                        "cron 需要 5 段表达式 `分 时 日 月 周`（收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            TriggerKind::Interval => {
+                if parse_interval_secs(&self.trigger.expr).is_none() {
+                    bail!(
+                        "interval 需要 `30`/`30s`/`5m`/`2h`/`1d` 形式且不小于 5 秒（收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            // `now` 不该带表达式（带了会被静默忽略）——直接拒绝，别让用户以为设了什么。
+            TriggerKind::Now => {
+                if !self.trigger.expr.trim().is_empty() {
+                    bail!(
+                        "trigger=now 不接受 expr（立即任务无需表达式，收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            // `keepalive` 要的是「重启恢复 + 信号/退出语义」（Q5/Q14），本批未实现：
+            // 放行只会让它在列表里显示「常驻」却永远不触发（静默失效）——显式拒绝。
+            TriggerKind::Keepalive => {
+                bail!("keepalive 触发档尚未支持（待 Q5/Q14 拍板后再放开）");
+            }
         }
         match self.payload.kind {
             PayloadKind::Agent => {
@@ -329,6 +527,14 @@ pub struct TaskRuntime {
     /// 最近一次失败/取消的原因（给人看的一句话）。
     #[serde(default)]
     pub last_error: String,
+    /// 最近一次**触发**的 unix 秒（P2b-C 调度记账）。
+    ///
+    /// 用途有二：① `interval` 任务按它 + 间隔算下次到点；② `cron` 任务按它的**分钟桶**
+    /// 去重——worker 每 2s 轮询一次，没有这笔记账同一个 cron 分钟会被反复触发。
+    /// 语义是「认领时刻」而不是「跑完时刻」：认领即记账，与 `Running` 状态共同保证
+    /// 同一任务不会并发跑两轮。
+    #[serde(default)]
+    pub last_fired_at: Option<u64>,
 }
 
 /// 任务的三个落盘路径（定义 / 运行态 / 日志目录）。
@@ -362,7 +568,9 @@ impl TaskPaths {
         self.dir.join("task-logs")
     }
     pub fn log_file(&self, id: &str) -> PathBuf {
-        self.logs_dir().join(format!("{id}.log"))
+        // 防御纵深：id 即便绕过 `validate_task_id` 也**不可能**穿出目录
+        self.logs_dir()
+            .join(format!("{}.log", safe_path_component(id)))
     }
     /// 取消请求目录（Q3 的 `task cancel`）。
     ///
@@ -373,7 +581,7 @@ impl TaskPaths {
         self.dir.join("cancel-requests")
     }
     pub fn cancel_file(&self, id: &str) -> PathBuf {
-        self.cancel_requests_dir().join(id)
+        self.cancel_requests_dir().join(safe_path_component(id))
     }
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.dir)
@@ -532,7 +740,24 @@ fn read_defs(p: &std::path::Path) -> Option<Vec<Task>> {
     let text = fs::read_to_string(p).ok()?;
     // 坏文件不静默当空（否则「任务凭空消失」无从排查）——上报到日志，调用方自行兜底。
     match serde_json::from_str::<Vec<Task>>(&text) {
-        Ok(v) => Some(v),
+        Ok(v) => {
+            // `tasks.json` 是**用户可写**的：手改过的文件必须跟 `task add` 走同一道闸。
+            // 逐条跑完整 `Task::validate`（含 id 的文件名安全、once 严格日历、now 不带 expr、
+            // keepalive 未支持、timezone 未实现…），非法定义跳过并留痕——否则会出现
+            // 「CLI 拒绝但手改能塞进去」的绕过面（审查实测：now+expr / keepalive /
+            // timezone 都能被加载）。
+            let (ok, bad): (Vec<Task>, Vec<Task>) =
+                v.into_iter().partition(|t| t.validate().is_ok());
+            for t in &bad {
+                let why = t
+                    .validate()
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                crate::log!("[task] 忽略不合法的任务定义（{:?}）：{why}", t.id);
+            }
+            Some(ok)
+        }
         Err(e) => {
             crate::log!("[task] 定义文件解析失败（{}）：{e}", p.display());
             None
@@ -714,6 +939,230 @@ mod tests {
         t.limits.log_max_bytes = 0;
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("log_max_bytes"), "{e}");
+    }
+
+    /// 审查回归：**手改 `tasks.json` 也必须过完整 `Task::validate`**——否则会出现
+    /// 「CLI 拒绝但手改能塞进去」的绕过面（now+expr / keepalive / timezone 实测都能加载）。
+    #[test]
+    fn load_defs_skips_invalid_definitions_not_just_bad_ids() {
+        let root = std::env::temp_dir().join(format!("abb-task-defs-{}", uuid::Uuid::new_v4()));
+        let paths = TaskPaths::with_root(&root, "b");
+        paths.ensure().unwrap();
+        let base = |id: &str, trigger: serde_json::Value| {
+            serde_json::json!({
+                "schema_version": TASK_SCHEMA_VERSION,
+                "id": id,
+                "name": "",
+                "bot_key": "b",
+                "created_by": {"role": "owner", "bot_key": "b", "chat_id": "c"},
+                "payload": {"kind": "agent", "prompt": "x"},
+                "trigger": trigger,
+                "delivery": {"targets": [], "default": "creator"},
+                "limits": {"timeout_secs": 60, "max_restarts": 1, "log_max_bytes": 1024},
+            })
+        };
+        let defs = serde_json::json!([
+            base(
+                "tk_good",
+                serde_json::json!({"kind": "cron", "expr": "30 9 * * *", "timezone": ""})
+            ),
+            base(
+                "tk_now_expr",
+                serde_json::json!({"kind": "now", "expr": "30 9 * * *", "timezone": ""})
+            ),
+            base(
+                "tk_keepalive",
+                serde_json::json!({"kind": "keepalive", "expr": "", "timezone": ""})
+            ),
+            base(
+                "tk_tz",
+                serde_json::json!({"kind": "cron", "expr": "0 9 * * *", "timezone": "Asia/Tokyo"})
+            ),
+            base(
+                "../../evil",
+                serde_json::json!({"kind": "now", "expr": "", "timezone": ""})
+            ),
+            base(
+                "tk_bad_date",
+                serde_json::json!({"kind": "once", "expr": "2026-02-31 09:00", "timezone": ""})
+            ),
+        ]);
+        std::fs::write(
+            paths.definitions(),
+            serde_json::to_string_pretty(&defs).unwrap(),
+        )
+        .unwrap();
+
+        let store = TaskStore::new_at(&root, "b");
+        let ids: Vec<String> = store.list().into_iter().map(|t| t.id).collect();
+        assert_eq!(
+            ids,
+            vec!["tk_good".to_string()],
+            "只有合法定义能被加载（其余 5 条都必须被 validate 挡掉），实际：{ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查回归（严重）：任务 id 必须挡目录穿越——id 会拼进日志/取消请求路径，
+    /// `../../other/victim` 形式能让 rm/GC 删到别的 bot 目录。
+    #[test]
+    fn task_id_rejects_path_traversal_and_weird_chars() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../other/victim",
+            "a/b",
+            "a\\b",
+            "tk x",
+            "tk\u{4e2d}",
+        ] {
+            assert!(
+                validate_task_id(bad).is_err(),
+                "非法 id 必须被拒：{bad:?}（否则能穿出任务目录删别人的文件）"
+            );
+        }
+        for ok in ["tk_20260916_abcdef", "job-queued-1", "A1_-z"] {
+            assert!(validate_task_id(ok).is_ok(), "合法 id 应放行：{ok:?}");
+        }
+
+        // **防御纵深**：即便某条非法 id 绕过校验走到路径拼接，也不能穿出目录
+        let paths = TaskPaths::with_root("/tmp/abb-id-guard", "b");
+        let evil = paths.log_file("../../other/victim");
+        assert!(
+            evil.starts_with(paths.logs_dir()),
+            "日志路径必须仍在 logs_dir 内（实际 {}）",
+            evil.display()
+        );
+        assert!(
+            !evil.to_string_lossy().contains(".."),
+            "sanitize 后不应残留 ..：{}",
+            evil.display()
+        );
+    }
+
+    /// 审查回归（中）：`once` 登记期必须是**严格**日历校验，宽松解析会放进
+    /// `2026-02-31` / `09:00:99` / trailing token 这类"永远不触发"的垃圾。
+    #[test]
+    fn once_expr_is_strictly_validated() {
+        for ok in ["2026-09-20 09:00", "2024-02-29 00:00", " 2026-1-1 9:5 "] {
+            assert!(parse_once_strict(ok).is_some(), "合法 once 应通过：{ok:?}");
+        }
+        for bad in [
+            "2026-02-31 09:00",       // 2 月没有 31 号
+            "2025-02-29 09:00",       // 非闰年
+            "2026-13-01 09:00",       // 月份越界
+            "2026-09-20 24:00",       // 小时越界
+            "2026-09-20 09:60",       // 分钟越界
+            "2026-09-20 09:00:99",    // 多一段
+            "2026-09-20-extra 09:00", // 日期里多一段
+            "2026-09-20",             // 少时间
+            "2026-09-20 09:00 extra", // trailing token
+            "下周三 09:00",
+        ] {
+            assert!(
+                parse_once_strict(bad).is_none(),
+                "非法 once 必须被拒：{bad:?}"
+            );
+        }
+
+        // validate 层同样要挡住（这是 CLI/定义文件共用的闸）
+        let mut t = agent_task("b");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "2026-02-31 09:00".into(),
+            ..Default::default()
+        };
+        assert!(t.validate().is_err(), "非法日历的 once 不得通过 validate");
+
+        // now 不该带 expr；keepalive 未支持；timezone 未实现 —— 三者都必须显式拒绝
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Now,
+            expr: "30 9 * * *".into(),
+            ..Default::default()
+        };
+        assert!(
+            t.validate().is_err(),
+            "now 带 expr 必须拒绝（否则被静默忽略）"
+        );
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Keepalive,
+            ..Default::default()
+        };
+        assert!(t.validate().is_err(), "keepalive 未支持必须显式拒绝");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "0 9 * * *".into(),
+            timezone: "Asia/Tokyo".into(),
+        };
+        assert!(t.validate().is_err(), "timezone 未参与调度必须拒绝");
+    }
+
+    /// P2b-C：interval 表达式解析（单位 / 下限 5 秒）。
+    #[test]
+    fn interval_expr_parses_units_and_enforces_floor() {
+        assert_eq!(parse_interval_secs("30"), Some(30), "纯数字 = 秒");
+        assert_eq!(parse_interval_secs("30s"), Some(30));
+        assert_eq!(parse_interval_secs("5m"), Some(300));
+        assert_eq!(parse_interval_secs("2h"), Some(7200));
+        assert_eq!(parse_interval_secs("1d"), Some(86400));
+        assert_eq!(parse_interval_secs(" 10M "), Some(600), "允许空白与大小写");
+        // 下限护栏：比 worker 轮询（2s）还密的周期会把 LLM 打成忙循环
+        assert_eq!(parse_interval_secs("4"), None, "小于 5 秒应拒绝");
+        assert_eq!(parse_interval_secs("1s"), None);
+        assert_eq!(parse_interval_secs("s"), None, "缺数字");
+        assert_eq!(parse_interval_secs("5x"), None, "未知单位");
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("99999999999999999999"), None, "溢出");
+
+        assert_eq!(human_interval(90), "90 秒");
+        assert_eq!(human_interval(300), "5 分钟");
+        assert_eq!(human_interval(7200), "2 小时");
+        assert_eq!(human_interval(86400), "1 天");
+    }
+
+    /// P2b-C：坏表达式必须在**登记期**被拒（留到运行时只会表现为「永远不触发」的静默失效）。
+    #[test]
+    fn validate_rejects_bad_trigger_exprs() {
+        let mut t = agent_task("b");
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "下周三".into(),
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("once"), "{e}");
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "每天九点".into(),
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("cron"), "{e}");
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Interval,
+            expr: "1s".into(),
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("interval"), "{e}");
+
+        // 合法三档都放行
+        for (kind, expr) in [
+            (TriggerKind::Once, "2026-09-20 09:00"),
+            (TriggerKind::Cron, "30 9 * * *"),
+            (TriggerKind::Interval, "5m"),
+        ] {
+            t.trigger = TaskTrigger {
+                kind,
+                expr: expr.into(),
+                ..Default::default()
+            };
+            assert!(t.validate().is_ok(), "{kind:?} {expr} 应放行");
+        }
     }
 
     #[test]
