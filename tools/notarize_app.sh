@@ -18,7 +18,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENT="$REPO/app-assets/abb.entitlements"
-GUARD="$REPO/tools/check_entitlements.sh"
+# 守卫路径可覆盖：只为 self-test 用 mock，生产默认仓库内真脚本（**没有**跳过开关——
+# 生产路径不允许静默绕过守卫）。
+GUARD="${GUARD:-$REPO/tools/check_entitlements.sh}"
 
 # 公证脚本路径可覆盖（self-test 用 mock；生产默认 ~/scripts/notarize.sh）。
 notarize_sh() { echo "${NOTARIZE_SH:-$HOME/scripts/notarize.sh}"; }
@@ -26,29 +28,50 @@ notarize_sh() { echo "${NOTARIZE_SH:-$HOME/scripts/notarize.sh}"; }
 run_self_test() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/abb-notarize-selftest.XXXXXX")"
   trap 'rm -rf -- "$tmp"' EXIT
-  # mock：只记录收到的参数，不签名不联网
-  mock="$tmp/mock-notarize.sh"
-  cat >"$mock" <<'MOCK'
+  log="$tmp/log.txt"
+  : >"$log"
+  # 两个 mock：只往同一个日志追加"谁被调用、收到什么参数"，不签名不联网。
+  mock_notarize="$tmp/mock-notarize.sh"
+  cat >"$mock_notarize" <<'MOCK'
 #!/usr/bin/env bash
-printf '%s\n' "$@" >"${MOCK_RECORD:?}"
+printf 'notarize %s\n' "$*" >>"${MOCK_LOG:?}"
 MOCK
-  chmod +x "$mock"
+  mock_guard="$tmp/mock-guard.sh"
+  cat >"$mock_guard" <<'MOCK'
+#!/usr/bin/env bash
+printf 'guard %s\n' "$*" >>"${MOCK_LOG:?}"
+exit "${MOCK_GUARD_RC:-0}"
+MOCK
+  chmod +x "$mock_notarize" "$mock_guard"
   fake_app="$tmp/Fake.app"
   mkdir -p "$fake_app"
-  # 守卫会被调用，这里用"跳过守卫"的开关把自测聚焦在参数转发上
-  MOCK_RECORD="$tmp/args.txt" NOTARIZE_SH="$mock" SKIP_ENTITLEMENT_GUARD=1 \
+
+  # 用例 1（正）：公证 mock 必须收到 --entitlements；守卫 mock 必须被调用；顺序 = 公证 → 守卫
+  MOCK_LOG="$log" NOTARIZE_SH="$mock_notarize" GUARD="$mock_guard" \
     "$0" "$fake_app" >/dev/null
-  got="$(tr '\n' ' ' <"$tmp/args.txt")"
-  case "$got" in
-    *"--entitlements $ENT"*)
-      echo "✅ self-test：公证脚本收到的参数含 --entitlements $ENT"
-      echo "   实际：$got"
-      ;;
-    *)
-      echo "❌ self-test：公证脚本没收到 --entitlements（实际：$got）" >&2
-      exit 1
-      ;;
+  if ! grep -q -- "--entitlements $ENT" "$log"; then
+    echo "❌ self-test：公证脚本没收到 --entitlements（实际：$(tr '\n' '|' <"$log")）" >&2
+    exit 1
+  fi
+  if ! grep -q "^guard .*Fake.app" "$log"; then
+    echo "❌ self-test：守卫没被调用（实际：$(tr '\n' '|' <"$log")）" >&2
+    exit 1
+  fi
+  first="$(head -1 "$log")"
+  case "$first" in
+    notarize*) ;;
+    *) echo "❌ self-test：调用顺序不对（首行应为 notarize，实际：$first）" >&2; exit 1 ;;
   esac
+
+  # 用例 2（反）：守卫失败必须让 wrapper 失败（不能被静默吞掉）
+  : >"$log"
+  if MOCK_LOG="$log" MOCK_GUARD_RC=1 NOTARIZE_SH="$mock_notarize" GUARD="$mock_guard" \
+       "$0" "$fake_app" >/dev/null 2>&1; then
+    echo "❌ self-test：守卫失败时 wrapper 仍返回 0（失败被吞）" >&2
+    exit 1
+  fi
+
+  echo "✅ self-test：转发 --entitlements ✔ / 守卫被调用 ✔ / 顺序 公证→守卫 ✔ / 守卫失败会传播 ✔"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -63,6 +86,7 @@ fi
 APP="$1"
 [ -d "$APP" ] || { echo "❌ 不是 .app 目录：$APP" >&2; exit 2; }
 [ -f "$ENT" ] || { echo "❌ 未找到 entitlements：$ENT" >&2; exit 2; }
+[ -x "$GUARD" ] || { echo "❌ 守卫不可执行：$GUARD" >&2; exit 2; }
 NOTARY_SH="$(notarize_sh)"
 if [ ! -x "$NOTARY_SH" ]; then
   echo "❌ 未找到可执行的公证脚本：$NOTARY_SH（可用 NOTARIZE_SH 覆盖）" >&2
@@ -73,7 +97,5 @@ fi
 "$NOTARY_SH" "$APP" --entitlements "$ENT"
 
 # 最终产物自检：三项 TCC entitlements 必须真在（bundle + 内部可执行）
-if [ "${SKIP_ENTITLEMENT_GUARD:-0}" != "1" ]; then
-  "$GUARD" "$APP"
-fi
+"$GUARD" "$APP"
 echo "✅ 公证 + 装订完成，entitlements 已核：$APP"

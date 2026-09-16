@@ -44,20 +44,37 @@ for app in "$@"; do
     [ -f "$app/Contents/MacOS/$exe" ] && targets+=("$app/Contents/MacOS/$exe")
   done
   for t in "${targets[@]}"; do
-    # **必须是布尔 true，且类型要对**（两轮审查各抓到一个假绿）：
+    # **必须按 plist 语义精确判断：key 完全相等 且 值是布尔 true**（三轮审查各抓到
+    # 一个假绿，都不是"格式"问题而是"语义"问题）：
     #   · 只匹配 key 文本 → 值为 `false` 也判绿（TCC 不授权）；
-    #   · 只比较 PlistBuddy 的文本输出 → 字符串 `"true"` 也判绿（类型错，TCC 不认）。
-    # 故这里取 XML plist（`:-`）、去掉所有空白后按 `<key>K</key><true/>` 精确匹配：
-    # 布尔 true 才命中；`<false/>`、`<string>true</string>`、缺失 key、空输出都不命中。
-    # 不落临时文件、不依赖 jq/python，Bash 3.2 下即可跑。
-    dump="$(codesign -d --entitlements :- "$t" 2>/dev/null | tr -d '[:space:]' || true)"
+    #   · 只比较 PlistBuddy 文本 → 字符串 `"true"` / 数字 `1` / `"YES"` 也判绿（类型错）；
+    #   · 对整份 XML 做 `tr -d '[:space:]'` → 会把 key **内部的**空格也删掉，于是
+    #     `com.apple.security.device. camera`（非法 key，codesign 照收）被归一成合法 key。
+    # 故改用 plistlib 解析后按键取值 + `is True` 判断：key 精确匹配、类型必须是布尔，
+    # 缺失 / false / 字符串 / 数字 / 空输出 / 解析失败一律算缺。
+    missing="$(
+      codesign -d --entitlements :- "$t" 2>/dev/null | python3 -c '
+import plistlib, sys
+required = sys.argv[1:]
+try:
+    # 注意：必须 loads(read())，不能用 plistlib.load(stdin)——后者要求流可 seek，
+    # 管道 stdin 会抛 UnsupportedOperation，被 except 吞掉后表现为"全部缺项"（假红）。
+    got = plistlib.loads(sys.stdin.buffer.read())
+except Exception:
+    got = None
+if not isinstance(got, dict):
+    got = {}
+for key in required:
+    if got.get(key) is not True:
+        print(key)
+' "${REQUIRED[@]}"
+    )"
+    # 上面用行输出"缺哪些"，这里还原成数组（保持下游报错格式不变）
+    missing_list="$missing"
     missing=()
-    for key in "${REQUIRED[@]}"; do
-      case "$dump" in
-        *"<key>${key}</key><true/>"*) ;;
-        *) missing+=("$key") ;;
-      esac
-    done
+    while IFS= read -r line; do
+      [ -n "$line" ] && missing+=("$line")
+    done <<<"$missing_list"
     if [ "${#missing[@]}" -gt 0 ]; then
       fail=1
       echo "❌ ${t}：缺 entitlements → ${missing[*]}" >&2
