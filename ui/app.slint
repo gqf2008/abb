@@ -1139,7 +1139,10 @@ export component SettingsWindow inherits Window {
     preferred-height: 680px;
     min-width: 880px;
     min-height: 620px;
-    background: PixelTheme.panel;
+    // **透明**：根 Rectangle 带圆角，圆角外的区域必须透出桌面。若这里给不透明色，
+    // 圆角外会露出该色的方块（圆角等于白做）。Slint 的 winit 后端据此把窗口设为
+    // 非不透明（macOS 实测有效）；整窗可见区域由下面铺满的根 Rectangle 提供。
+    background: transparent;
 
     in-out property <string> window-title: "ABB 设置";
     // 应用版本号（Rust 侧 env!("CARGO_PKG_VERSION") 注入；空 = 不显示）
@@ -1348,6 +1351,10 @@ export component SettingsWindow inherits Window {
         background: PixelTheme.panel;
         border-width: 2px;
         border-color: UiTokens.window-frame;
+        // 一点点圆角（用户要求）。圆角会把根背景裁成圆角矩形，圆角外由上面的透明窗口
+        // 透出桌面。子元素里只有标题栏/底部状态条贴到边缘，它们与面板同为白色，
+        // 因此圆角处不会出现「方角白色缺口」（暗色主题下若两者不同色需重新评估）。
+        border-radius: 10px;
 
         VerticalBox {
             // 关键：VerticalBox/HorizontalBox 自带 StyleMetrics.layout-padding（fluent=8px），
@@ -1361,6 +1368,11 @@ export component SettingsWindow inherits Window {
                 title: root.window-title;
                 logo: @image-url("../app-assets/icon-1024.png");
                 has-logo: true;
+                // 标题栏是贴着窗口上边的**子元素**，它自己的直角会把根 Rectangle 的圆角
+                // 内圈盖成直角（现象：边框看着圆、背景看着方，实测确认白角来自子元素而非
+                // 根背景）。这里给等值的内圈圆角：外圆角 10px − 描边 2px = 8px。
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
                 drag-start => { root.drag-start(); }
                 minimize => { root.minimize(); }
                 toggle-maximize => { root.toggle-maximize(); }
@@ -2814,6 +2826,9 @@ export component SettingsWindow inherits Window {
             Rectangle {
                 height: 46px;
                 background: PixelTheme.bg;
+                // 同标题栏：贴窗口下边的状态条也要跟着圆（内圈 8px）
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
                 HorizontalBox {
                     padding-left: 22px;
                     padding-right: 22px;
