@@ -1139,7 +1139,13 @@ export component SettingsWindow inherits Window {
     preferred-height: 680px;
     min-width: 880px;
     min-height: 620px;
-    background: PixelTheme.panel;
+    // **透明**：根 Rectangle 带圆角，圆角外的区域必须透出桌面。若这里给不透明色，
+    // 圆角外会露出该色的方块（圆角等于白做）。
+    // 归因要准确（审查核对过 winit 后端）：窗口在 Slint 的 winit 后端**本来**就是非
+    // 不透明的（`window_attributes()` 无条件 `with_transparent(true)`）；这里给
+    // `transparent` 的实际作用是**不再铺一层不透明填充**，四角的 alpha=0 才能透出去。
+    // 整窗可见区域仍由下面铺满的根 Rectangle 提供。
+    background: transparent;
 
     in-out property <string> window-title: "ABB 设置";
     // 应用版本号（Rust 侧 env!("CARGO_PKG_VERSION") 注入；空 = 不显示）
@@ -1348,6 +1354,14 @@ export component SettingsWindow inherits Window {
         background: PixelTheme.panel;
         border-width: 2px;
         border-color: UiTokens.window-frame;
+        // 一点点圆角（用户要求）。圆角会把根背景裁成圆角矩形，圆角外由上面的透明窗口
+        // 透出桌面。**但只加这一处不够**：Slint 不会把子元素裁到父的圆角内，贴窗口
+        // 上/下边的标题栏与底部状态条各自的直角会盖住圆角内圈（现象：「边框看着圆、
+        // 背景看着方」，审查用「去掉子元素圆角」的对照渲染复核过）。所以这两处子元素
+        // 也各加了等值内圈圆角（外 10px − 描边 2px = 8px，见下）。
+        // 注：暗色主题下 panel(#242424) 与标题栏/状态条的 bg(#1a1a1a) 不同色，届时
+        // 圆角内侧会有轻微接缝——该路径当前 app 内不可达（scheme 恒为 light）。
+        border-radius: 10px;
 
         VerticalBox {
             // 关键：VerticalBox/HorizontalBox 自带 StyleMetrics.layout-padding（fluent=8px），
@@ -1361,6 +1375,11 @@ export component SettingsWindow inherits Window {
                 title: root.window-title;
                 logo: @image-url("../app-assets/icon-1024.png");
                 has-logo: true;
+                // 标题栏是贴着窗口上边的**子元素**，它自己的直角会把根 Rectangle 的圆角
+                // 内圈盖成直角（现象：边框看着圆、背景看着方，实测确认白角来自子元素而非
+                // 根背景）。这里给等值的内圈圆角：外圆角 10px − 描边 2px = 8px。
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
                 drag-start => { root.drag-start(); }
                 minimize => { root.minimize(); }
                 toggle-maximize => { root.toggle-maximize(); }
@@ -2814,6 +2833,9 @@ export component SettingsWindow inherits Window {
             Rectangle {
                 height: 46px;
                 background: PixelTheme.bg;
+                // 同标题栏：贴窗口下边的状态条也要跟着圆（内圈 8px）
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
                 HorizontalBox {
                     padding-left: 22px;
                     padding-right: 22px;
