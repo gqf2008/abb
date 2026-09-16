@@ -1140,8 +1140,11 @@ export component SettingsWindow inherits Window {
     min-width: 880px;
     min-height: 620px;
     // **透明**：根 Rectangle 带圆角，圆角外的区域必须透出桌面。若这里给不透明色，
-    // 圆角外会露出该色的方块（圆角等于白做）。Slint 的 winit 后端据此把窗口设为
-    // 非不透明（macOS 实测有效）；整窗可见区域由下面铺满的根 Rectangle 提供。
+    // 圆角外会露出该色的方块（圆角等于白做）。
+    // 归因要准确（审查核对过 winit 后端）：窗口在 Slint 的 winit 后端**本来**就是非
+    // 不透明的（`window_attributes()` 无条件 `with_transparent(true)`）；这里给
+    // `transparent` 的实际作用是**不再铺一层不透明填充**，四角的 alpha=0 才能透出去。
+    // 整窗可见区域仍由下面铺满的根 Rectangle 提供。
     background: transparent;
 
     in-out property <string> window-title: "ABB 设置";
@@ -1352,8 +1355,12 @@ export component SettingsWindow inherits Window {
         border-width: 2px;
         border-color: UiTokens.window-frame;
         // 一点点圆角（用户要求）。圆角会把根背景裁成圆角矩形，圆角外由上面的透明窗口
-        // 透出桌面。子元素里只有标题栏/底部状态条贴到边缘，它们与面板同为白色，
-        // 因此圆角处不会出现「方角白色缺口」（暗色主题下若两者不同色需重新评估）。
+        // 透出桌面。**但只加这一处不够**：Slint 不会把子元素裁到父的圆角内，贴窗口
+        // 上/下边的标题栏与底部状态条各自的直角会盖住圆角内圈（现象：「边框看着圆、
+        // 背景看着方」，审查用「去掉子元素圆角」的对照渲染复核过）。所以这两处子元素
+        // 也各加了等值内圈圆角（外 10px − 描边 2px = 8px，见下）。
+        // 注：暗色主题下 panel(#242424) 与标题栏/状态条的 bg(#1a1a1a) 不同色，届时
+        // 圆角内侧会有轻微接缝——该路径当前 app 内不可达（scheme 恒为 light）。
         border-radius: 10px;
 
         VerticalBox {
