@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 // ═══════════ 设计令牌（UI/UX 审查）：语义色集中定义，替换全部硬编码彩色 ═══════════
@@ -1148,6 +1148,13 @@ export component SettingsWindow inherits Window {
     background: transparent;
 
     in-out property <string> window-title: "ABB 设置";
+    // 无边框窗口的缩放入口（Windows/Linux 没有系统缩放边框，靠自绘热区触发；
+    // Rust 侧用 `slint_pixel::install_window_resize` 接到 winit 的 drag_resize_window）。
+    callback begin-resize(string);
+    // 是否启用自绘缩放热区。**由 Rust 侧按目标平台显式设置**（`!cfg!(macos)`），
+    // 不用 `platform` 属性——那个是权限页回填路径顺带设的，将来重构容易忘，
+    // 一旦没设到，Windows 的缩放热区会静默消失（这类静默失效在本仓库踩过）。
+    in-out property <bool> resize-hit-areas: false;
     // 应用版本号（Rust 侧 env!("CARGO_PKG_VERSION") 注入；空 = 不显示）
     in-out property <string> version: "";
     // 当前页：0=首页 1=机器人配置 2=环境配置 3=模型供应商
@@ -1351,17 +1358,22 @@ export component SettingsWindow inherits Window {
     Rectangle {
         width: 100%;
         height: 100%;
-        background: PixelTheme.panel;
-        border-width: 2px;
-        border-color: UiTokens.window-frame;
-        // 一点点圆角（用户要求）。圆角会把根背景裁成圆角矩形，圆角外由上面的透明窗口
-        // 透出桌面。**但只加这一处不够**：Slint 不会把子元素裁到父的圆角内，贴窗口
-        // 上/下边的标题栏与底部状态条各自的直角会盖住圆角内圈（现象：「边框看着圆、
-        // 背景看着方」，审查用「去掉子元素圆角」的对照渲染复核过）。所以这两处子元素
-        // 也各加了等值内圈圆角（外 10px − 描边 2px = 8px，见下）。
-        // 注：暗色主题下 panel(#242424) 与标题栏/状态条的 bg(#1a1a1a) 不同色，届时
-        // 圆角内侧会有轻微接缝——该路径当前 app 内不可达（scheme 恒为 light）。
+        // 描边用**两层圆角填充**画，不用 Rectangle 的 border-width/border-color：
+        // Windows 上 border-* 那条渲染路径没跟着 border-radius 走（用户实测：白底圆了、
+        // 黑边还是直角），而「背景 + 圆角」是各平台都在走的路。外黑内白同心（10px / 8px，
+        // 内缩 2px）等价于 2px 描边，且天然贴边。
+        background: UiTokens.window-frame;
         border-radius: 10px;
+
+        // 内层面板：白底、内缩 2px、圆角 8px（= 10px − 2px 描边），与上面共同构成描边环
+        Rectangle {
+            x: 2px;
+            y: 2px;
+            width: parent.width - 4px;
+            height: parent.height - 4px;
+            background: PixelTheme.panel;
+            border-radius: 8px;
+        }
 
         VerticalBox {
             // 关键：VerticalBox/HorizontalBox 自带 StyleMetrics.layout-padding（fluent=8px），
@@ -2858,5 +2870,17 @@ export component SettingsWindow inherits Window {
                 }
             }
         }
-    }   // 关闭根 Rectangle（包内容防塌缩）
+
+        // 无边框窗口的缩放热区：Windows/Linux 没有系统缩放边框，必须自绘 6px 边/角热区，
+        // 按下时由 Rust 侧调 winit 的 drag_resize_window 进入系统缩放循环。
+        // macOS **刻意不加**：系统对 no-frame 窗口自带边角缩放，自绘热区会抢掉它。
+        // 放在 VerticalBox 之后（更晚声明 = 更上层），保证边角热区优先于内容命中。
+        if root.resize-hit-areas : PixelWindowResize {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            begin-resize(dir) => { root.begin-resize(dir); }
+        }
+    }   // 关闭根 Rectangle（外层纯黑圆角填充 + 包内容防塌缩）
 }
