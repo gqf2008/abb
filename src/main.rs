@@ -893,9 +893,14 @@ fn run_task_cli(args: &[String]) -> i32 {
             };
             let rt = states.get(&t.id);
             use task_store::TaskStateKind as K;
-            if matches!(rt.kind, K::Succeeded | K::Failed | K::Cancelled) {
-                // 已经结束的任务不要再投取消请求：worker 侧虽有终态保护，但在这里
-                // 就说清楚，免得用户以为「取消」改变了什么。
+            // 重复档（cron/interval）跑完一轮是 Succeeded/Failed，但**不是终态**：下一分钟/
+            // 下一个间隔还会再跑，所以这里必须继续投取消请求（否则用户看到「已结束，无需
+            // 取消」而任务照跑——审查实测）。只有 Cancelled、或一次性档的
+            // Succeeded/Failed 才算真结束。
+            let repeating = t.trigger.kind.is_repeating();
+            let terminal = matches!(rt.kind, K::Cancelled)
+                || (matches!(rt.kind, K::Succeeded | K::Failed) && !repeating);
+            if terminal {
                 println!("任务 {} 已结束（{:?}），无需取消", t.id, rt.kind);
                 return 0;
             }
@@ -903,6 +908,11 @@ fn run_task_cli(args: &[String]) -> i32 {
                 println!(
                     "任务 {} 正在运行，已请求终止（数秒内生效、结果不再投递；若该轮刚好已收尾则本条无效）",
                     t.id
+                );
+            } else if repeating && matches!(rt.kind, K::Succeeded | K::Failed) {
+                println!(
+                    "任务 {} 是周期任务（当前空闲，{:?}）：已请求取消，后续不再触发",
+                    t.id, rt.kind
                 );
             } else {
                 println!(
@@ -952,7 +962,9 @@ fn run_task_cli(args: &[String]) -> i32 {
             }
             store.remove(&t.id);
             let _ = states.remove(&t.id);
-            let _ = std::fs::remove_file(task_store::TaskPaths::for_bot(&bot_key).log_file(&t.id));
+            // 当前日志 + 轮转历史（.1/.2）一起删——只删当前文件会把轮转历史留成永久孤儿
+            // （状态行已删，孤儿回收再也枚举不到它）。
+            task_store::remove_task_logs(&task_store::TaskPaths::for_bot(&bot_key), &t.id);
             println!("已删除任务 {}", t.id);
             0
         }

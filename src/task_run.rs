@@ -141,12 +141,17 @@ async fn run_one(
     if task.payload.kind != PayloadKind::Agent {
         // proc 载荷要到 P3 才落地：**显式失败**，不静默跳过（否则「登记了却永远
         // pending」会被当成调度坏了）。
+        // 带住 prev 的 restarts / last_fired_at：proc 本批还不能跑，但**记账不能被清掉**
+        // （将来放开 proc 时，这里清零会让重复档重复触发/重跑上界失效——审查指出过）。
+        let prev = states.get(&id);
         let _ = states.set(
             &id,
             TaskRuntime {
                 kind: TaskStateKind::Failed,
                 finished_at: Some(crate::chrono_lite::unix_secs()),
                 last_error: "proc 载荷尚未支持（P3 进程超管落地后可用）".to_string(),
+                restarts: prev.restarts,
+                last_fired_at: prev.last_fired_at,
                 ..Default::default()
             },
         );
@@ -516,17 +521,25 @@ fn consume_cancel_requests(store: &TaskStore, states: &TaskStateStore) {
             continue;
         };
         let rt = states.get(&id);
-        let known = store.list().iter().any(|t| t.id == id);
-        if !known {
+        let Some(task) = store.list().into_iter().find(|t| t.id == id) else {
             // 定义已经没了（task rm / 孤儿清理）：请求没有意义，清掉别堆积。
             let _ = std::fs::remove_file(&path);
             continue;
-        }
+        };
         if rt.kind == TaskStateKind::Running {
-            continue;
+            continue; // 在跑那轮由 watcher 消费（见 run_attempt 的取消令牌）
         }
-        if rt.kind == TaskStateKind::Pending {
-            crate::log!("[task] {id} 尚未开跑即被取消");
+        // 可取消的两类「非在跑」状态：
+        //   ① Pending（还没开跑）；
+        //   ② **重复档**（cron/interval）的 Succeeded/Failed——跑完一轮并不代表结束，
+        //      下一分钟/下一个间隔还会再跑；用户此时取消必须能停掉后续触发
+        //      （审查实测：只处理 Pending 时会回「已结束，无需取消」然后照跑）。
+        // 一次性档（now/once）的 Succeeded/Failed 是真终态，不动。
+        let cancellable = rt.kind == TaskStateKind::Pending
+            || (task.trigger.kind.is_repeating()
+                && matches!(rt.kind, TaskStateKind::Succeeded | TaskStateKind::Failed));
+        if cancellable {
+            crate::log!("[task] {id} 收到取消请求（{:?}）→ 标记 Cancelled", rt.kind);
             let _ = states.set(
                 &id,
                 TaskRuntime {
@@ -671,15 +684,8 @@ fn gc_logs(store: &TaskStore, states: &TaskStateStore, now: u64) {
         if now.saturating_sub(finished) < retention {
             continue;
         }
-        let file = paths.log_file(&task.id);
-        if file.exists() {
-            let _ = std::fs::remove_file(&file);
-            for i in 1..LOG_KEEP_FILES {
-                let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                    "{}.{i}",
-                    file.display()
-                )));
-            }
+        if paths.log_file(&task.id).exists() {
+            crate::task_store::remove_task_logs(paths, &task.id);
             crate::log!(
                 "[task] {} 的日志已超保留期（{} 天）→ 回收（定义与运行态保留）",
                 &task.id[..task.id.len().min(12)],
@@ -750,14 +756,8 @@ fn requeue_orphans(store: &TaskStore, states: &TaskStateStore) {
     for id in states.ids() {
         if !known.contains(id.as_str()) {
             let _ = states.remove(&id);
-            let file = states.paths().log_file(&id);
-            let _ = std::fs::remove_file(&file);
-            for i in 1..LOG_KEEP_FILES {
-                let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                    "{}.{i}",
-                    file.display()
-                )));
-            }
+            // 当前文件 + 轮转历史一起清（只删当前会留下 .1/.2 永久孤儿）
+            crate::task_store::remove_task_logs(states.paths(), &id);
         }
     }
 }
@@ -1102,6 +1102,100 @@ mod tests {
 
         let _ = std::fs::remove_file(&rec);
         let _ = std::fs::remove_dir_all(&states.paths().dir);
+    }
+
+    /// 审查回归：**周期任务跑完一轮后（Succeeded）也必须能被取消**，否则下一分钟又跑。
+    #[test]
+    fn cancel_request_stops_idle_repeating_task() {
+        let root = tmp_root("cancel_idle_cron");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let mut t = now_task("b", "tk_cron_idle", "c");
+        t.trigger = crate::task_store::TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".to_string(),
+            ..Default::default()
+        };
+        store.add(t.clone()).unwrap();
+        // 跑完一轮的空闲态（**非** Running、非 Pending）
+        states
+            .set(
+                &t.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    last_fired_at: Some(crate::chrono_lite::unix_secs()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&t.id), b"{}").unwrap();
+
+        consume_cancel_requests(&store, &states);
+
+        assert_eq!(
+            states.get(&t.id).kind,
+            TaskStateKind::Cancelled,
+            "周期任务空闲态收到取消请求 → 必须转 Cancelled（否则后续触发停不掉）"
+        );
+        assert!(
+            !is_due_for_claim(&t, &states.get(&t.id), crate::chrono_lite::unix_secs()),
+            "取消后不得再被认领"
+        );
+
+        // 一次性档的 Succeeded 是真终态：取消请求不得把它改成 Cancelled
+        let mut once = now_task("b", "tk_once_done", "c");
+        once.trigger = crate::task_store::TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "2026-01-01 00:00".to_string(),
+            ..Default::default()
+        };
+        store.add(once.clone()).unwrap();
+        states
+            .set(
+                &once.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(paths.cancel_file(&once.id), b"{}").unwrap();
+        consume_cancel_requests(&store, &states);
+        assert_eq!(
+            states.get(&once.id).kind,
+            TaskStateKind::Succeeded,
+            "一次性任务的终态不得被取消请求改写"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 审查回归：`remove_task_logs` 必须把轮转历史一并清掉（`task rm` 只删当前文件会留孤儿）。
+    #[test]
+    fn remove_task_logs_drops_rotated_history() {
+        let root = tmp_root("rmlogs");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let t = now_task("b", "tk_rm", "c");
+        let rt = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            ..Default::default()
+        };
+        let mut tiny = t.clone();
+        tiny.limits.log_max_bytes = 1;
+        for i in 0..4 {
+            write_log(&paths, &tiny, &rt, &format!("round-{i}-xxxxxxxxxx"));
+        }
+        let base = paths.log_file(&t.id);
+        assert!(base.exists() && base.with_file_name("tk_rm.log.1").exists());
+        crate::task_store::remove_task_logs(&paths, &t.id);
+        assert!(!base.exists(), "当前日志应被删");
+        assert!(
+            !base.with_file_name("tk_rm.log.1").exists(),
+            "轮转历史也必须一起删（否则成永久孤儿）"
+        );
+        assert!(!base.with_file_name("tk_rm.log.2").exists());
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// P2b-D：日志超上限**轮转**（保留 3 份），不再「超限静默不写」。

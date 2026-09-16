@@ -75,6 +75,111 @@ impl TriggerKind {
     }
 }
 
+/// 任务 id 必须是**单一文件名组件**：只允许 `[A-Za-z0-9_-]`，长度 1..=64。
+///
+/// 为什么要硬校验（审查实测）：id 会直接拼进文件路径（`TaskPaths::log_file` / `cancel_file`），
+/// 而 `tasks.json` 是**用户可写**的——一个 `../../other/victim` 形式的 id 能让 `task rm`、
+/// 孤儿回收、日志回收删到**别的 bot 的目录**（实测把别的 bot 的日志删掉了）。
+pub fn validate_task_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("任务 id 不能为空");
+    }
+    if id.len() > 64 {
+        bail!("任务 id 过长（{} 字符，上限 64）", id.len());
+    }
+    if id == "." || id == ".." {
+        bail!("任务 id 不能是 {id:?}（会被当成上级目录）");
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        bail!("任务 id 含非法字符 {bad:?}（只允许字母/数字/下划线/连字符：{id:?}）");
+    }
+    Ok(())
+}
+
+/// 把任意字符串收敛成**安全的文件名组件**（防御纵深：即使某个 id 绕过校验走到路径拼接，
+/// 也不可能穿出目录）。非法字符一律替换成 `_`，空串回落 `unnamed`。
+pub fn safe_path_component(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 删除一条任务的**全部**日志（当前 `id.log` + 轮转 `.1`/`.2`）。
+///
+/// 统一入口：`task rm`、孤儿回收、保留期回收三处都必须走这里——审查实测「只删当前文件」
+/// 会把 `.1/.2` 留成永久孤儿（`task rm` 之后没有任何入口能再看到它们）。
+pub fn remove_task_logs(paths: &TaskPaths, id: &str) {
+    let base = paths.log_file(id);
+    let _ = fs::remove_file(&base);
+    for i in 1..8 {
+        let _ = fs::remove_file(std::path::PathBuf::from(format!("{}.{i}", base.display())));
+    }
+}
+
+/// 严格解析 `once` 的 `YYYY-MM-DD HH:MM`：
+/// 必须是**恰好两段**、日期三段/时间两段、且日历合法（含闰年 2 月）。
+///
+/// `schedule::parse_once` 是给 job 用的宽松实现（接受 `2026-02-31`、`09:00:99`、
+/// `2026-09-20-extra 09:00` 这类垃圾），task 这里在**登记期**就要挡掉——坏表达式落到运行时
+/// 只表现为「永远不触发」，用户看不到任何错误。
+pub fn parse_once_strict(expr: &str) -> Option<(i64, u32, u32, u32, u32)> {
+    let t = expr.trim();
+    let mut fields = t.split_whitespace();
+    let date = fields.next()?;
+    let time = fields.next()?;
+    if fields.next().is_some() {
+        return None; // 多余字段（trailing token）
+    }
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let mut h = time.split(':');
+    let hour: u32 = h.next()?.parse().ok()?;
+    let minute: u32 = h.next()?.parse().ok()?;
+    if h.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || hour > 23 || minute > 59 {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+    Some((year, month, day, hour, minute))
+}
+
 /// 解析 `interval` 的间隔表达式：`30`（纯秒）/ `30s` / `5m` / `2h` / `1d`。
 ///
 /// **硬下限 5 秒**：worker 轮询间隔是 2s，比它更密的周期没有意义，只会把 LLM 打成
@@ -253,9 +358,7 @@ impl Task {
                 TASK_SCHEMA_VERSION
             );
         }
-        if self.id.trim().is_empty() {
-            bail!("任务 id 不能为空");
-        }
+        validate_task_id(&self.id)?;
         if self.bot_key.trim().is_empty() {
             bail!("任务缺少 bot_key（任务按 bot 归属，不允许无主）");
         }
@@ -267,11 +370,19 @@ impl Task {
         }
         // 表达式**登记期**就要校验：坏表达式留到运行时只会表现为「永远不触发」，
         // 用户看不到任何错误（这类静默失效在本仓库踩过，宁可当场拒绝）。
+        // `timezone` 目前**未参与调度**（调度一律按本地 UTC+8）。留着它只会让人以为
+        // 写了时区就按那个时区跑——宁可拒绝，也不要有这种静默无效的字段。
+        if !self.trigger.timezone.trim().is_empty() {
+            bail!(
+                "trigger.timezone 暂不支持（当前一律按本地时区调度，收到 {:?}）",
+                self.trigger.timezone
+            );
+        }
         match self.trigger.kind {
             TriggerKind::Once => {
-                if crate::schedule::parse_once(&self.trigger.expr).is_none() {
+                if parse_once_strict(&self.trigger.expr).is_none() {
                     bail!(
-                        "once 需要 `YYYY-MM-DD HH:MM` 形式的时间点（收到 {:?}）",
+                        "once 需要 `YYYY-MM-DD HH:MM` 形式且日历合法的时间点（收到 {:?}）",
                         self.trigger.expr
                     );
                 }
@@ -292,7 +403,20 @@ impl Task {
                     );
                 }
             }
-            TriggerKind::Now | TriggerKind::Keepalive => {}
+            // `now` 不该带表达式（带了会被静默忽略）——直接拒绝，别让用户以为设了什么。
+            TriggerKind::Now => {
+                if !self.trigger.expr.trim().is_empty() {
+                    bail!(
+                        "trigger=now 不接受 expr（立即任务无需表达式，收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            // `keepalive` 要的是「重启恢复 + 信号/退出语义」（Q5/Q14），本批未实现：
+            // 放行只会让它在列表里显示「常驻」却永远不触发（静默失效）——显式拒绝。
+            TriggerKind::Keepalive => {
+                bail!("keepalive 触发档尚未支持（待 Q5/Q14 拍板后再放开）");
+            }
         }
         match self.payload.kind {
             PayloadKind::Agent => {
@@ -444,7 +568,9 @@ impl TaskPaths {
         self.dir.join("task-logs")
     }
     pub fn log_file(&self, id: &str) -> PathBuf {
-        self.logs_dir().join(format!("{id}.log"))
+        // 防御纵深：id 即便绕过 `validate_task_id` 也**不可能**穿出目录
+        self.logs_dir()
+            .join(format!("{}.log", safe_path_component(id)))
     }
     /// 取消请求目录（Q3 的 `task cancel`）。
     ///
@@ -455,7 +581,7 @@ impl TaskPaths {
         self.dir.join("cancel-requests")
     }
     pub fn cancel_file(&self, id: &str) -> PathBuf {
-        self.cancel_requests_dir().join(id)
+        self.cancel_requests_dir().join(safe_path_component(id))
     }
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.dir)
@@ -614,7 +740,19 @@ fn read_defs(p: &std::path::Path) -> Option<Vec<Task>> {
     let text = fs::read_to_string(p).ok()?;
     // 坏文件不静默当空（否则「任务凭空消失」无从排查）——上报到日志，调用方自行兜底。
     match serde_json::from_str::<Vec<Task>>(&text) {
-        Ok(v) => Some(v),
+        Ok(v) => {
+            // 手改过的定义文件可能带非法 id（会拼进文件路径）→ 加载时挡掉并留痕，
+            // 不让它进入 store（否则 rm/GC 会按它拼路径）。
+            let (ok, bad): (Vec<Task>, Vec<Task>) =
+                v.into_iter().partition(|t| validate_task_id(&t.id).is_ok());
+            for t in &bad {
+                crate::log!(
+                    "[task] 忽略 id 非法的任务定义（{:?}）：id 只能是字母/数字/下划线/连字符",
+                    t.id
+                );
+            }
+            Some(ok)
+        }
         Err(e) => {
             crate::log!("[task] 定义文件解析失败（{}）：{e}", p.display());
             None
@@ -796,6 +934,101 @@ mod tests {
         t.limits.log_max_bytes = 0;
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("log_max_bytes"), "{e}");
+    }
+
+    /// 审查回归（严重）：任务 id 必须挡目录穿越——id 会拼进日志/取消请求路径，
+    /// `../../other/victim` 形式能让 rm/GC 删到别的 bot 目录。
+    #[test]
+    fn task_id_rejects_path_traversal_and_weird_chars() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../other/victim",
+            "a/b",
+            "a\\b",
+            "tk x",
+            "tk\u{4e2d}",
+        ] {
+            assert!(
+                validate_task_id(bad).is_err(),
+                "非法 id 必须被拒：{bad:?}（否则能穿出任务目录删别人的文件）"
+            );
+        }
+        for ok in ["tk_20260916_abcdef", "job-queued-1", "A1_-z"] {
+            assert!(validate_task_id(ok).is_ok(), "合法 id 应放行：{ok:?}");
+        }
+
+        // **防御纵深**：即便某条非法 id 绕过校验走到路径拼接，也不能穿出目录
+        let paths = TaskPaths::with_root("/tmp/abb-id-guard", "b");
+        let evil = paths.log_file("../../other/victim");
+        assert!(
+            evil.starts_with(paths.logs_dir()),
+            "日志路径必须仍在 logs_dir 内（实际 {}）",
+            evil.display()
+        );
+        assert!(
+            !evil.to_string_lossy().contains(".."),
+            "sanitize 后不应残留 ..：{}",
+            evil.display()
+        );
+    }
+
+    /// 审查回归（中）：`once` 登记期必须是**严格**日历校验，宽松解析会放进
+    /// `2026-02-31` / `09:00:99` / trailing token 这类"永远不触发"的垃圾。
+    #[test]
+    fn once_expr_is_strictly_validated() {
+        for ok in ["2026-09-20 09:00", "2024-02-29 00:00", " 2026-1-1 9:5 "] {
+            assert!(parse_once_strict(ok).is_some(), "合法 once 应通过：{ok:?}");
+        }
+        for bad in [
+            "2026-02-31 09:00",       // 2 月没有 31 号
+            "2025-02-29 09:00",       // 非闰年
+            "2026-13-01 09:00",       // 月份越界
+            "2026-09-20 24:00",       // 小时越界
+            "2026-09-20 09:60",       // 分钟越界
+            "2026-09-20 09:00:99",    // 多一段
+            "2026-09-20-extra 09:00", // 日期里多一段
+            "2026-09-20",             // 少时间
+            "2026-09-20 09:00 extra", // trailing token
+            "下周三 09:00",
+        ] {
+            assert!(
+                parse_once_strict(bad).is_none(),
+                "非法 once 必须被拒：{bad:?}"
+            );
+        }
+
+        // validate 层同样要挡住（这是 CLI/定义文件共用的闸）
+        let mut t = agent_task("b");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "2026-02-31 09:00".into(),
+            ..Default::default()
+        };
+        assert!(t.validate().is_err(), "非法日历的 once 不得通过 validate");
+
+        // now 不该带 expr；keepalive 未支持；timezone 未实现 —— 三者都必须显式拒绝
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Now,
+            expr: "30 9 * * *".into(),
+            ..Default::default()
+        };
+        assert!(
+            t.validate().is_err(),
+            "now 带 expr 必须拒绝（否则被静默忽略）"
+        );
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Keepalive,
+            ..Default::default()
+        };
+        assert!(t.validate().is_err(), "keepalive 未支持必须显式拒绝");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "0 9 * * *".into(),
+            timezone: "Asia/Tokyo".into(),
+        };
+        assert!(t.validate().is_err(), "timezone 未参与调度必须拒绝");
     }
 
     /// P2b-C：interval 表达式解析（单位 / 下限 5 秒）。
