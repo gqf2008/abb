@@ -621,6 +621,9 @@ fn is_due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> bool {
             };
             match rt.last_fired_at {
                 None => true,
+                // 记账时刻在**未来**（系统时钟回拨、或手改状态文件）→ 不信这笔记账，
+                // 按"到点"处理；否则任务会一直不跑，直到墙钟追上那个未来时间点。
+                Some(last) if last > now => true,
                 Some(last) => now >= last.saturating_add(secs),
             }
         }
@@ -967,6 +970,16 @@ mod tests {
         assert!(
             is_due_for_claim(&t, &just_ran, now + 300),
             "满一个间隔后可认领"
+        );
+        // 时钟回拨/手改状态文件：记账时刻在"未来"时不能死等（否则任务一直不跑）
+        let future = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(now + 86_400),
+            ..Default::default()
+        };
+        assert!(
+            is_due_for_claim(&t, &future, now),
+            "last_fired_at 在未来 → 不信记账，按到点处理（时钟回拨护栏）"
         );
 
         // keepalive：本批明确不认领（Q5/Q14 未拍板）
