@@ -67,6 +67,51 @@ impl TriggerKind {
             TriggerKind::Once | TriggerKind::Cron | TriggerKind::Interval
         )
     }
+
+    /// 是否是**可重复触发**的档（跑完一轮后回到可认领状态，而不是终态）。
+    /// `keepalive` 也是重复档，但本批尚未支持（见 `task_run` 的认领判定）。
+    pub fn is_repeating(self) -> bool {
+        matches!(self, TriggerKind::Cron | TriggerKind::Interval)
+    }
+}
+
+/// 解析 `interval` 的间隔表达式：`30`（纯秒）/ `30s` / `5m` / `2h` / `1d`。
+///
+/// **硬下限 5 秒**：worker 轮询间隔是 2s，比它更密的周期没有意义，只会把 LLM 打成
+/// 忙循环（也是"误配一条 `--every 1s` 就把额度烧光"的护栏）。上限不限（`1d` 也合法）。
+pub fn parse_interval_secs(expr: &str) -> Option<u64> {
+    const MIN_INTERVAL_SECS: u64 = 5;
+    let t = expr.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (num, unit) = match t.chars().last()? {
+        's' | 'S' => (&t[..t.len() - 1], 1u64),
+        'm' | 'M' => (&t[..t.len() - 1], 60),
+        'h' | 'H' => (&t[..t.len() - 1], 3600),
+        'd' | 'D' => (&t[..t.len() - 1], 86400),
+        c if c.is_ascii_digit() => (t, 1),
+        _ => return None,
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    let secs = n.checked_mul(unit)?;
+    if secs < MIN_INTERVAL_SECS {
+        return None;
+    }
+    Some(secs)
+}
+
+/// 把秒数渲染成人话（`task list/status` 用）。
+pub fn human_interval(secs: u64) -> String {
+    if secs.is_multiple_of(86_400) {
+        format!("{} 天", secs / 86_400)
+    } else if secs.is_multiple_of(3_600) {
+        format!("{} 小时", secs / 3_600)
+    } else if secs.is_multiple_of(60) {
+        format!("{} 分钟", secs / 60)
+    } else {
+        format!("{secs} 秒")
+    }
 }
 
 /// 载荷：`agent` 用 prompt（+cwd），`proc` 用 cmd（+cwd/env）。
@@ -220,6 +265,35 @@ impl Task {
                 self.trigger.kind
             );
         }
+        // 表达式**登记期**就要校验：坏表达式留到运行时只会表现为「永远不触发」，
+        // 用户看不到任何错误（这类静默失效在本仓库踩过，宁可当场拒绝）。
+        match self.trigger.kind {
+            TriggerKind::Once => {
+                if crate::schedule::parse_once(&self.trigger.expr).is_none() {
+                    bail!(
+                        "once 需要 `YYYY-MM-DD HH:MM` 形式的时间点（收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            TriggerKind::Cron => {
+                if crate::schedule::CronExpr::parse(&self.trigger.expr).is_none() {
+                    bail!(
+                        "cron 需要 5 段表达式 `分 时 日 月 周`（收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            TriggerKind::Interval => {
+                if parse_interval_secs(&self.trigger.expr).is_none() {
+                    bail!(
+                        "interval 需要 `30`/`30s`/`5m`/`2h`/`1d` 形式且不小于 5 秒（收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+            }
+            TriggerKind::Now | TriggerKind::Keepalive => {}
+        }
         match self.payload.kind {
             PayloadKind::Agent => {
                 if self.payload.prompt.trim().is_empty() {
@@ -329,6 +403,14 @@ pub struct TaskRuntime {
     /// 最近一次失败/取消的原因（给人看的一句话）。
     #[serde(default)]
     pub last_error: String,
+    /// 最近一次**触发**的 unix 秒（P2b-C 调度记账）。
+    ///
+    /// 用途有二：① `interval` 任务按它 + 间隔算下次到点；② `cron` 任务按它的**分钟桶**
+    /// 去重——worker 每 2s 轮询一次，没有这笔记账同一个 cron 分钟会被反复触发。
+    /// 语义是「认领时刻」而不是「跑完时刻」：认领即记账，与 `Running` 状态共同保证
+    /// 同一任务不会并发跑两轮。
+    #[serde(default)]
+    pub last_fired_at: Option<u64>,
 }
 
 /// 任务的三个落盘路径（定义 / 运行态 / 日志目录）。
@@ -714,6 +796,73 @@ mod tests {
         t.limits.log_max_bytes = 0;
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("log_max_bytes"), "{e}");
+    }
+
+    /// P2b-C：interval 表达式解析（单位 / 下限 5 秒）。
+    #[test]
+    fn interval_expr_parses_units_and_enforces_floor() {
+        assert_eq!(parse_interval_secs("30"), Some(30), "纯数字 = 秒");
+        assert_eq!(parse_interval_secs("30s"), Some(30));
+        assert_eq!(parse_interval_secs("5m"), Some(300));
+        assert_eq!(parse_interval_secs("2h"), Some(7200));
+        assert_eq!(parse_interval_secs("1d"), Some(86400));
+        assert_eq!(parse_interval_secs(" 10M "), Some(600), "允许空白与大小写");
+        // 下限护栏：比 worker 轮询（2s）还密的周期会把 LLM 打成忙循环
+        assert_eq!(parse_interval_secs("4"), None, "小于 5 秒应拒绝");
+        assert_eq!(parse_interval_secs("1s"), None);
+        assert_eq!(parse_interval_secs("s"), None, "缺数字");
+        assert_eq!(parse_interval_secs("5x"), None, "未知单位");
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("99999999999999999999"), None, "溢出");
+
+        assert_eq!(human_interval(90), "90 秒");
+        assert_eq!(human_interval(300), "5 分钟");
+        assert_eq!(human_interval(7200), "2 小时");
+        assert_eq!(human_interval(86400), "1 天");
+    }
+
+    /// P2b-C：坏表达式必须在**登记期**被拒（留到运行时只会表现为「永远不触发」的静默失效）。
+    #[test]
+    fn validate_rejects_bad_trigger_exprs() {
+        let mut t = agent_task("b");
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "下周三".into(),
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("once"), "{e}");
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "每天九点".into(),
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("cron"), "{e}");
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Interval,
+            expr: "1s".into(),
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("interval"), "{e}");
+
+        // 合法三档都放行
+        for (kind, expr) in [
+            (TriggerKind::Once, "2026-09-20 09:00"),
+            (TriggerKind::Cron, "30 9 * * *"),
+            (TriggerKind::Interval, "5m"),
+        ] {
+            t.trigger = TaskTrigger {
+                kind,
+                expr: expr.into(),
+                ..Default::default()
+            };
+            assert!(t.validate().is_ok(), "{kind:?} {expr} 应放行");
+        }
     }
 
     #[test]

@@ -59,6 +59,17 @@ const CANCEL_REASON_SHUTDOWN: &str = "已取消（service 关停）";
 /// 尚未开跑就被取消的落盘原因。
 const CANCEL_REASON_BEFORE_START: &str = "已取消（task cancel，尚未开跑）";
 
+/// 日志轮转保留的**总份数**（含当前 `id.log`）：Q4 拟定的默认值是「单文件 10MB /
+/// 保留 3 份」，本批先按该默认值实现，Q4 正式拍板后改这一处即可。
+const LOG_KEEP_FILES: usize = 3;
+
+/// 终态任务的日志保留期（天）。Q4 只约束单文件大小，这里补一个**时间**上界，
+/// 免得「跑过一次就再没人看」的任务把日志目录长期堆着。
+const LOG_RETENTION_DAYS: u64 = 30;
+
+/// 日志回收扫描间隔（秒）：worker 每 2s 轮询任务，日志回收每小时一次就够。
+const LOG_GC_INTERVAL_SECS: u64 = 3600;
+
 /// 每个 bot 一个 task worker：
 /// Q7 定的是「每 bot 默认 1 个 worker，超限**排队**（不拒绝）」——单 worker 串行
 /// 消费就是排队语义，无需另造队列。
@@ -86,6 +97,8 @@ pub(crate) async fn task_worker_with_poll(
     // agent 任务在 oneshot 里跑，没有可复活的 pid 账本，重跑是唯一安全的归位
     // （副作用幂等性由任务 prompt 自己负责——文档 §风险表已记「结果重复投递」）。
     requeue_orphans(&store, &states);
+    // 上次回收时间（0 = 启动后先扫一遍）
+    let mut last_gc = 0u64;
 
     loop {
         if stop.is_cancelled() {
@@ -94,8 +107,14 @@ pub(crate) async fn task_worker_with_poll(
         // 取消请求先于认领处理：排队等着的任务被 cancel 掉之后**不该再开跑**
         // （否则用户看到的是「已取消却仍然跑了一轮并投递结果」）。
         consume_cancel_requests(&store, &states);
+        // P2b-D：日志回收每小时扫一次（纯文件操作；不在每个 2s 轮询里做）。
+        let now = crate::chrono_lite::unix_secs();
+        if now.saturating_sub(last_gc) >= LOG_GC_INTERVAL_SECS {
+            last_gc = now;
+            gc_logs(&store, &states, now);
+        }
         // 每轮只认领一条：跑完再认领下一条 = 串行排队（Q7）。
-        if let Some(task) = next_pending(&store, &states) {
+        if let Some(task) = next_due_task(&store, &states, now) {
             run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await;
             continue; // 立刻看下一条，不等轮询间隔
         }
@@ -216,66 +235,60 @@ pub(crate) async fn run_attempt(
     let _ = std::fs::remove_file(states.paths().cancel_file(&id));
 
     let finished = crate::chrono_lite::unix_secs();
-    // 终态也要带住 restarts（否则 `task status` 看不到重跑过几次）。
+    // 终态运行态要**带住两样跨轮次记账**，否则重复档会被自己坑（审查/自查踩到过）：
+    //   · `restarts`：不带住 → `task status` 看不到重跑次数，且重跑上界失效；
+    //   · `last_fired_at`：**清零会让 cron 在同一分钟内立刻再触发一次**（分钟去重靠它），
+    //     interval 也会退化成"跑完立刻再来一轮"。
     let prev = states.get(&id);
-    let restarts = prev.restarts;
+    let base = TaskRuntime {
+        started_at: Some(started),
+        finished_at: Some(finished),
+        restarts: prev.restarts,
+        last_fired_at: prev.last_fired_at,
+        ..Default::default()
+    };
     let (rt, text) = match outcome {
         crate::buzz::harness::SyncTurnOutcome::Ok(text) => (
             TaskRuntime {
                 kind: TaskStateKind::Succeeded,
-                started_at: Some(started),
-                finished_at: Some(finished),
                 last_exit_code: Some(0),
-                restarts,
-                ..Default::default()
+                ..base.clone()
             },
             text,
         ),
         crate::buzz::harness::SyncTurnOutcome::Cancelled => (
             TaskRuntime {
                 kind: TaskStateKind::Cancelled,
-                started_at: Some(started),
-                finished_at: Some(finished),
                 last_error: if user_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     CANCEL_REASON.to_string()
                 } else {
                     CANCEL_REASON_SHUTDOWN.to_string()
                 },
-                restarts,
-                ..Default::default()
+                ..base.clone()
             },
             String::new(),
         ),
         crate::buzz::harness::SyncTurnOutcome::Timeout => (
             TaskRuntime {
                 kind: TaskStateKind::Failed,
-                started_at: Some(started),
-                finished_at: Some(finished),
                 last_error: format!("执行超时（预算 {}s）", budget.as_secs()),
-                restarts,
-                ..Default::default()
+                ..base.clone()
             },
             String::new(),
         ),
         crate::buzz::harness::SyncTurnOutcome::Closed => (
             TaskRuntime {
                 kind: TaskStateKind::Failed,
-                started_at: Some(started),
-                finished_at: Some(finished),
                 last_error: "agent 不可用（执行器未能拉起）".to_string(),
-                restarts,
-                ..Default::default()
+                ..base.clone()
             },
             String::new(),
         ),
         crate::buzz::harness::SyncTurnOutcome::Failed(reason) => (
             TaskRuntime {
                 kind: TaskStateKind::Failed,
-                started_at: Some(started),
-                finished_at: Some(finished),
                 last_error: reason.clone(),
-                restarts,
-                ..Default::default()
+                ..base.clone()
             },
             String::new(),
         ),
@@ -424,6 +437,9 @@ fn claim(prev: &TaskRuntime, started: u64) -> TaskRuntime {
         kind: TaskStateKind::Running,
         started_at: Some(started),
         restarts: prev.restarts,
+        // P2b-C 调度记账：**认领时刻**（不是跑完时刻）——cron 按它的分钟桶去重、
+        // interval 按它 + 间隔算下次到点；与 Running 状态一起防同任务并发。
+        last_fired_at: Some(started),
         ..Default::default()
     }
 }
@@ -525,8 +541,11 @@ fn consume_cancel_requests(store: &TaskStore, states: &TaskStateStore) {
     }
 }
 
-/// 把一条任务的结局追加到 `task-logs/<id>.log`（超 `log_max_bytes` 时不写，避免吃满盘；
-/// 轮转是 P4）。
+/// 把一条任务的结局追加到 `task-logs/<id>.log`。
+///
+/// P2b-D：超过 `log_max_bytes` 时**轮转**（`id.log` → `id.log.1` → `id.log.2`，最老丢弃，
+/// 共 `LOG_KEEP_FILES` 份）。旧实现是「超上限就静默不再写」——日志是任务排障的唯一入口，
+/// 静默停写比丢弃最老历史更坏（用户不知道日志断了）。
 fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime, text: &str) {
     if paths.ensure().is_err() {
         return;
@@ -540,7 +559,7 @@ fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime
     }
     if let Ok(meta) = std::fs::metadata(&file) {
         if meta.len() >= task.limits.log_max_bytes {
-            return;
+            rotate_logs(&file, LOG_KEEP_FILES);
         }
     }
     let stamp = rt.finished_at.unwrap_or_else(crate::chrono_lite::unix_secs);
@@ -559,13 +578,120 @@ fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime
     let _ = ok;
 }
 
-/// 认领下一条：只认 `trigger=now` 且运行态为 `Pending` 的任务。
-/// 其余触发档（once/cron/interval/keepalive）要的是编排器，属 P3/P5——这里**不认领**，
-/// 免得把它们跑成「登记即执行」。
-fn next_pending(store: &TaskStore, states: &TaskStateStore) -> Option<Task> {
-    store.list().into_iter().find(|t| {
-        t.trigger.kind == TriggerKind::Now && states.get(&t.id).kind == TaskStateKind::Pending
-    })
+/// 该任务此刻是否可被认领（P2b-C 编排判定，纯函数便于单测）。
+///
+/// 语义（与 `docs/task-model.md` 的 P2b-C 一节一致）：
+/// - `now`：登记即跑一次（#306 的后台子代理，行为不变）；
+/// - `once`：到点跑；**错过后补跑**（与 `job` 调度器 `Job::is_due` 一致，`t <= now`）；
+/// - `cron`：当前分钟匹配表达式才跑，且**同一分钟只触发一次**（worker 每 2s 轮询，
+///   没有 `last_fired_at` 的分钟去重会在一分钟内反复触发）；
+/// - `interval`：`last_fired_at` 为空（首次）即跑，之后每 N 秒一次；
+/// - `keepalive`：**不认领**——重启恢复/信号语义（Q5/Q14）未拍板，本批不假装支持；
+/// - 任何触发档在 `Running` 时都不认领（同任务不并发），`Cancelled` 是用户明确的终态
+///   （要再跑就重新登记）；重复档（cron/interval）跑完一轮后回到可认领状态。
+fn is_due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> bool {
+    let kind = task.trigger.kind;
+    match rt.kind {
+        TaskStateKind::Running | TaskStateKind::Cancelled => return false,
+        TaskStateKind::Pending => {}
+        TaskStateKind::Succeeded | TaskStateKind::Failed => {
+            // 一次性任务跑过就是跑过了；重复档等下一次到点
+            if !kind.is_repeating() {
+                return false;
+            }
+        }
+    }
+    match kind {
+        TriggerKind::Now => rt.kind == TaskStateKind::Pending,
+        TriggerKind::Once => crate::schedule::parse_once(&task.trigger.expr)
+            .map(|t| t.to_unix().max(0) as u64 <= now)
+            .unwrap_or(false),
+        TriggerKind::Cron => {
+            let Some(expr) = crate::schedule::CronExpr::parse(&task.trigger.expr) else {
+                return false;
+            };
+            if !expr.matches(&crate::schedule::DateTime::from_unix(now as i64)) {
+                return false;
+            }
+            rt.last_fired_at.map(|t| t / 60) != Some(now / 60)
+        }
+        TriggerKind::Interval => {
+            let Some(secs) = crate::task_store::parse_interval_secs(&task.trigger.expr) else {
+                return false;
+            };
+            match rt.last_fired_at {
+                None => true,
+                Some(last) => now >= last.saturating_add(secs),
+            }
+        }
+        TriggerKind::Keepalive => false,
+    }
+}
+
+/// 日志轮转：`id.log` → `id.log.1` → …，共保留 `keep` 份（含当前；最老的丢弃）。
+fn rotate_logs(file: &std::path::Path, keep: usize) {
+    let suffixed = |i: usize| std::path::PathBuf::from(format!("{}.{i}", file.display()));
+    if keep < 2 {
+        // 只留当前一份：直接清空/删除，下一轮 append 会重建
+        let _ = std::fs::remove_file(file);
+        return;
+    }
+    // 丢弃最老那份，再把 .1..keep-2 依次后移，最后当前 → .1
+    let _ = std::fs::remove_file(suffixed(keep - 1));
+    for i in (1..keep - 1).rev() {
+        let from = suffixed(i);
+        if from.exists() {
+            let _ = std::fs::rename(&from, suffixed(i + 1));
+        }
+    }
+    let _ = std::fs::rename(file, suffixed(1));
+}
+
+/// P2b-D 日志回收：终态任务超过 [`LOG_RETENTION_DAYS`] 的日志删掉。
+///
+/// **只删日志**：任务定义与运行态都保留（`task status` 仍要能看到结果与错误），
+/// 也绝不自动删用户登记的任务——那属于用户资产，删了没法恢复。
+fn gc_logs(store: &TaskStore, states: &TaskStateStore, now: u64) {
+    let paths = states.paths();
+    let retention = LOG_RETENTION_DAYS * 86_400;
+    for task in store.list() {
+        let rt = states.get(&task.id);
+        if !matches!(
+            rt.kind,
+            TaskStateKind::Succeeded | TaskStateKind::Failed | TaskStateKind::Cancelled
+        ) {
+            continue;
+        }
+        let Some(finished) = rt.finished_at else {
+            continue;
+        };
+        if now.saturating_sub(finished) < retention {
+            continue;
+        }
+        let file = paths.log_file(&task.id);
+        if file.exists() {
+            let _ = std::fs::remove_file(&file);
+            for i in 1..LOG_KEEP_FILES {
+                let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                    "{}.{i}",
+                    file.display()
+                )));
+            }
+            crate::log!(
+                "[task] {} 的日志已超保留期（{} 天）→ 回收（定义与运行态保留）",
+                &task.id[..task.id.len().min(12)],
+                LOG_RETENTION_DAYS
+            );
+        }
+    }
+}
+
+/// 认领下一条到点的任务（`now` 注入便于单测）。
+fn next_due_task(store: &TaskStore, states: &TaskStateStore, now: u64) -> Option<Task> {
+    store
+        .list()
+        .into_iter()
+        .find(|t| is_due_for_claim(t, &states.get(&t.id), now))
 }
 
 /// 启动清理：上次进程残留的 `Running` 是孤儿（执行器随进程一起没了）。
@@ -615,11 +741,20 @@ fn requeue_orphans(store: &TaskStore, states: &TaskStateStore) {
             );
         }
     }
-    // 无定义的残留运行态：删掉，别让 task-logs/状态文件无限堆积。
+    // 无定义的残留运行态：状态行与**日志一起**清掉（P2b-D：只删定义会留下孤儿日志，
+    // 而 `task rm` 之外没有任何入口能再看到它们）。
     let known: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
     for id in states.ids() {
         if !known.contains(id.as_str()) {
             let _ = states.remove(&id);
+            let file = states.paths().log_file(&id);
+            let _ = std::fs::remove_file(&file);
+            for i in 1..LOG_KEEP_FILES {
+                let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                    "{}.{i}",
+                    file.display()
+                )));
+            }
         }
     }
 }
@@ -747,45 +882,297 @@ mod tests {
         assert_eq!(delivery_target(&t, "b"), None);
     }
 
-    /// 只认领 `now` + `Pending`。别的触发档不认领（编排器是 P3/P5），
-    /// 已结束的也不重跑（否则每次轮询都会重跑成功过的任务）。
+    /// 触发档 → 认领判定（P2b-C 编排的**核心语义**，纯函数逐个锁死）。
     #[test]
-    fn only_now_and_pending_is_claimed() {
-        let root = tmp_root("claim");
-        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+    fn trigger_claim_semantics_per_kind() {
+        let mut t = now_task("b", "tk_x", "c");
+        let pending = TaskRuntime::default();
+        // now：登记即跑一次；跑过就是跑过了
+        assert!(
+            is_due_for_claim(&t, &pending, 1_000),
+            "now + Pending 应可认领"
+        );
+        let done = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            ..Default::default()
+        };
+        assert!(!is_due_for_claim(&t, &done, 1_000), "now 跑过不再认领");
+
+        // once：到点才跑；**过期补跑**（与 job 调度器 is_due 语义一致）
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "2026-09-20 09:00".to_string(),
+            ..Default::default()
+        };
+        let due = crate::schedule::parse_once("2026-09-20 09:00")
+            .unwrap()
+            .to_unix() as u64;
+        assert!(
+            !is_due_for_claim(&t, &pending, due - 60),
+            "once 未到点不认领"
+        );
+        assert!(is_due_for_claim(&t, &pending, due), "once 到点认领");
+        assert!(is_due_for_claim(&t, &pending, due + 3600), "once 过期补跑");
+        assert!(
+            !is_due_for_claim(&t, &done, due + 3600),
+            "once 跑过不再认领"
+        );
+
+        // cron：当前分钟匹配才跑，且同一分钟只触发一次
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".to_string(),
+            ..Default::default()
+        };
+        let now = 1_700_000_030u64; // 固定时刻，避免跨分钟抖动
+        assert!(
+            is_due_for_claim(&t, &pending, now),
+            "cron 匹配分钟且未跑过 → 认领"
+        );
+        let fired_this_minute = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(now - 10),
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &fired_this_minute, now),
+            "同一分钟内不得重复触发（worker 每 2s 轮询）"
+        );
+        assert!(
+            is_due_for_claim(&t, &fired_this_minute, now + 60),
+            "下一个分钟桶应再次可认领"
+        );
+        // 不匹配的分钟：用「当前分钟 +1」构造表达式（同一小时内，不会与本分钟相等）
+        let dt = crate::schedule::DateTime::from_unix(now as i64);
+        t.trigger.expr = format!("{} {} * * *", (dt.minute + 1) % 60, dt.hour);
+        assert!(
+            !is_due_for_claim(&t, &pending, now),
+            "cron 不匹配当前分钟不认领（expr={}）",
+            t.trigger.expr
+        );
+
+        // interval：首次即跑，之后每 N 秒
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Interval,
+            expr: "5m".to_string(),
+            ..Default::default()
+        };
+        assert!(is_due_for_claim(&t, &pending, now), "interval 首次即跑");
+        let just_ran = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(now),
+            ..Default::default()
+        };
+        assert!(!is_due_for_claim(&t, &just_ran, now + 60), "间隔未到不认领");
+        assert!(
+            is_due_for_claim(&t, &just_ran, now + 300),
+            "满一个间隔后可认领"
+        );
+
+        // keepalive：本批明确不认领（Q5/Q14 未拍板）
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Keepalive,
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &pending, now),
+            "keepalive 不认领（待 Q5/Q14）"
+        );
+
+        // 任何档在 Running 时都不认领（同任务不并发）；Cancelled 是用户终态
+        let running = TaskRuntime {
+            kind: TaskStateKind::Running,
+            ..Default::default()
+        };
+        assert!(!is_due_for_claim(&t, &running, now), "Running 不认领");
+        let cancelled = TaskRuntime {
+            kind: TaskStateKind::Cancelled,
+            ..Default::default()
+        };
+        assert!(!is_due_for_claim(&t, &cancelled, now), "Cancelled 不认领");
+    }
+
+    /// 认领即记 `last_fired_at`（调度记账），且必须带走 `restarts`（既有回归）。
+    #[test]
+    fn claim_records_last_fired_at_and_preserves_restarts() {
+        let prev = TaskRuntime {
+            restarts: 2,
+            ..Default::default()
+        };
+        let rt = claim(&prev, 1_700_000_000);
+        assert_eq!(rt.kind, TaskStateKind::Running);
+        assert_eq!(rt.started_at, Some(1_700_000_000));
+        assert_eq!(
+            rt.last_fired_at,
+            Some(1_700_000_000),
+            "认领时刻必须记账（cron 分钟去重 / interval 间隔都靠它）"
+        );
+        assert_eq!(rt.restarts, 2, "restarts 必须带走（重跑上界）");
+    }
+
+    /// 回归（自查抓到）：**跑完一轮不得把 `last_fired_at` 清掉**。
+    ///
+    /// 终态运行态若用 `..Default::default()` 直接构造，`last_fired_at` 会被清成 None →
+    /// cron 的分钟去重失效（同一分钟立刻再触发一轮）、interval 退化成「跑完立刻再来」。
+    /// 这条用真 `run_attempt`（mock agent）走完整轮次再断言记账还在。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn run_attempt_preserves_last_fired_at_for_repeating_triggers() {
+        let root = tmp_root("lastfired");
         let bot = "b";
         let store = TaskStore::new_at(&root, bot);
         let states = TaskStateStore::new_at(&root, bot);
-
-        let a = now_task(bot, "tk_now", "c");
-        store.add(a.clone()).unwrap();
-        assert_eq!(
-            next_pending(&store, &states).map(|t| t.id),
-            Some("tk_now".into())
-        );
-
-        // 跑完（Succeeded）后不再被认领
+        let mut task = now_task(bot, "tk_cron", "c0");
+        task.trigger = crate::task_store::TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".to_string(),
+            ..Default::default()
+        };
+        task.limits.timeout_secs = 30;
+        store.add(task.clone()).unwrap();
+        // 取「当前分钟的第 5 秒」而不是裸 `unix_secs()`：断言里要比较"同一分钟"与
+        // "下一分钟"，贴着分钟边界取时间会让 `+5s` 跨桶（本用例第一版就这么偶发红过）。
+        let fired_at = (crate::chrono_lite::unix_secs() / 60) * 60 + 5;
         states
             .set(
-                "tk_now",
+                &task.id,
                 TaskRuntime {
-                    kind: TaskStateKind::Succeeded,
+                    kind: TaskStateKind::Running,
+                    started_at: Some(fired_at),
+                    last_fired_at: Some(fired_at),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert!(next_pending(&store, &states).is_none());
 
-        // cron 档不认领
-        let mut b = now_task(bot, "tk_cron", "c");
-        b.trigger = TaskTrigger {
-            kind: TriggerKind::Cron,
-            expr: "0 9 * * *".to_string(),
-            timezone: String::new(),
+        let msgr = Arc::new(RecordingMsgr::default());
+        let router = Arc::new(Router::new(
+            false,
+            std::collections::HashMap::from([(
+                bot.to_string(),
+                msgr.clone() as Arc<dyn crate::messenger::Messenger>,
+            )]),
+            std::collections::HashMap::new(),
+            None,
+        ));
+        let rec = std::env::temp_dir().join(format!("abb-task-lf-{}.jsonl", uuid::Uuid::new_v4()));
+        let stop = tokio_util::sync::CancellationToken::new();
+        run_attempt(
+            bot,
+            task.clone(),
+            mock_cfg(&rec),
+            std::env::temp_dir().display().to_string(),
+            &router,
+            &states,
+            &stop,
+        )
+        .await;
+
+        let rt = states.get(&task.id);
+        assert_eq!(rt.kind, TaskStateKind::Succeeded, "mock agent 正常应答");
+        assert_eq!(
+            rt.last_fired_at,
+            Some(fired_at),
+            "跑完一轮后调度记账必须还在（否则 cron 同分钟重复触发）"
+        );
+        assert!(
+            !is_due_for_claim(&task, &rt, fired_at + 5),
+            "同一分钟内不得因记账被清掉而重复触发"
+        );
+        assert!(
+            is_due_for_claim(&task, &rt, fired_at + 60),
+            "下一分钟桶应恢复可触发"
+        );
+
+        let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&states.paths().dir);
+    }
+
+    /// P2b-D：日志超上限**轮转**（保留 3 份），不再「超限静默不写」。
+    #[test]
+    fn log_rotates_and_keeps_bounded_files() {
+        let root = tmp_root("logrotate");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let mut t = now_task("b", "tk_log", "c");
+        t.limits.log_max_bytes = 40; // 小上限，几轮就触发
+        let rt = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            finished_at: Some(1_700_000_000),
+            ..Default::default()
         };
-        store.add(b).unwrap();
-        assert!(next_pending(&store, &states).is_none());
+        for i in 0..6 {
+            write_log(&paths, &t, &rt, &format!("payload-{i}-xxxxxxxxxxxxxxxx"));
+        }
+        let f = paths.log_file("tk_log");
+        assert!(f.exists(), "当前日志必须存在");
+        assert!(f.with_file_name("tk_log.log.1").exists(), "应有第 1 份轮转");
+        assert!(f.with_file_name("tk_log.log.2").exists(), "应有第 2 份轮转");
+        assert!(
+            !f.with_file_name("tk_log.log.3").exists(),
+            "只保留 {} 份（含当前），不得无限增长",
+            LOG_KEEP_FILES
+        );
+        let newest = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            newest.contains("payload-5"),
+            "最新一轮必须写在当前日志里（否则等于丢最新记录）：{newest}"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
 
+    /// P2b-D：终态任务超保留期的**日志**回收，但定义与运行态保留（`task status` 仍可看）。
+    #[test]
+    fn gc_logs_drops_expired_logs_but_keeps_task_and_state() {
+        let root = tmp_root("loggc");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let t = now_task("b", "tk_old", "c");
+        store.add(t.clone()).unwrap();
+        let now = crate::chrono_lite::unix_secs();
+        states
+            .set(
+                &t.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    finished_at: Some(now - (LOG_RETENTION_DAYS + 1) * 86_400),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        write_log(&paths, &t, &states.get(&t.id), "old run");
+        assert!(paths.log_file(&t.id).exists(), "前置：日志已写入");
+
+        gc_logs(&store, &states, now);
+
+        assert!(!paths.log_file(&t.id).exists(), "超保留期的日志应被回收");
+        assert!(
+            store.list().iter().any(|x| x.id == t.id),
+            "任务定义绝不能被自动删（用户资产）"
+        );
+        assert_eq!(
+            states.get(&t.id).kind,
+            TaskStateKind::Succeeded,
+            "运行态要保留（task status 仍显示上次结果）"
+        );
+
+        // 未超期的终态日志不动
+        states
+            .set(
+                &t.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Succeeded,
+                    finished_at: Some(now - 3600),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        write_log(&paths, &t, &states.get(&t.id), "recent run");
+        gc_logs(&store, &states, now);
+        assert!(paths.log_file(&t.id).exists(), "保留期内的日志不得被回收");
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
@@ -809,7 +1196,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            next_pending(&store, &states).is_none(),
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
             "Running 不该被当待认领"
         );
 
@@ -818,7 +1205,7 @@ mod tests {
         assert_eq!(states.get("tk_run").kind, TaskStateKind::Pending);
         assert_eq!(states.get("tk_run").restarts, 1);
         assert_eq!(
-            next_pending(&store, &states).map(|t| t.id),
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).map(|t| t.id),
             Some("tk_run".into())
         );
 
@@ -981,7 +1368,10 @@ mod tests {
         let store = TaskStore::new_at(&root, bot);
         let states = TaskStateStore::new_at(&root, bot);
         store.add(now_task(bot, "tk_cancel_me", "c")).unwrap();
-        assert!(next_pending(&store, &states).is_some(), "取消前应可认领");
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_some(),
+            "取消前应可认领"
+        );
 
         // CLI 侧的动作：只落一个请求文件。
         std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
@@ -1002,7 +1392,7 @@ mod tests {
             "请求文件必须被消费掉（否则下次重跑会立刻又被自己取消）"
         );
         assert!(
-            next_pending(&store, &states).is_none(),
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
             "已取消的任务不得再被认领"
         );
         let _ = std::fs::remove_dir_all(&paths.dir);
@@ -1252,7 +1642,10 @@ mod tests {
         requeue_orphans(&store, &states);
         let rt = states.get("tk_cycle");
         assert_eq!(rt.kind, TaskStateKind::Failed);
-        assert!(next_pending(&store, &states).is_none(), "Failed 不该被认领");
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "Failed 不该被认领"
+        );
 
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
@@ -1303,7 +1696,10 @@ mod tests {
         let rt = states.get("tk_bound");
         assert_eq!(rt.kind, TaskStateKind::Failed);
         assert!(rt.last_error.contains("中断"), "{}", rt.last_error);
-        assert!(next_pending(&store, &states).is_none(), "Failed 不该被认领");
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "Failed 不该被认领"
+        );
 
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
@@ -1365,13 +1761,25 @@ mod tests {
         assert!(body.contains("hello"), "{body}");
         assert!(body.contains("Succeeded"), "{body}");
 
-        // 上限设成 1 字节 → 已有文件超限，不再追加
+        // 上限设成 1 字节 → 已有文件超限，**轮转**而不是停写（P2b-D 行为变更）：
+        // 旧实现「超上限就静默不再写」会让用户以为日志断了；现在把历史挪到 .1、当前文件重新开始。
         let mut tiny = t.clone();
         tiny.limits.log_max_bytes = 1;
-        let before = std::fs::read_to_string(paths.log_file("tk_log")).unwrap();
-        write_log(&paths, &tiny, &rt, "should-not-appear");
+        write_log(&paths, &tiny, &rt, "second-run");
+        // 注意：路径要用 with_file_name 拼（`log_file("tk_log.log.1")` 会再补一个 `.log`）
+        let rotated_path = paths.log_file("tk_log").with_file_name("tk_log.log.1");
+        let rotated =
+            std::fs::read_to_string(&rotated_path).expect("超上限时应轮转出 .1（历史保留）");
+        assert!(
+            rotated.contains("hello"),
+            "历史内容应在轮转文件里：{rotated}"
+        );
         let after = std::fs::read_to_string(paths.log_file("tk_log")).unwrap();
-        assert_eq!(before, after, "超上限不该继续写");
+        assert!(
+            after.contains("second-run"),
+            "轮转后当前日志必须继续写（不得静默停写）：{after}"
+        );
+        assert!(!after.contains("hello"), "当前日志应是新的一份：{after}");
 
         let _ = std::fs::remove_dir_all(&paths.dir);
     }

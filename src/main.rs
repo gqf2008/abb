@@ -965,6 +965,10 @@ fn run_task_cli(args: &[String]) -> i32 {
             // `--to bot_key:chat_id`（bot_key 可省 = 本 bot）/ `--to-current`。
             let mut to_target: Option<String> = None;
             let mut to_current = false;
+            // P2b-C 触发档：三者互斥，缺省 = 立即（now）
+            let mut once: Option<String> = None;
+            let mut cron: Option<String> = None;
+            let mut every: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1012,6 +1016,30 @@ fn run_task_cli(args: &[String]) -> i32 {
                         }
                         i += 2;
                     }
+                    "--once" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--once 缺时间点（形如 \"2026-09-20 09:00\"）");
+                            return 1;
+                        };
+                        once = Some(v.clone());
+                        i += 2;
+                    }
+                    "--cron" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--cron 缺表达式（5 段：分 时 日 月 周，如 \"30 9 * * *\"）");
+                            return 1;
+                        };
+                        cron = Some(v.clone());
+                        i += 2;
+                    }
+                    "--every" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--every 缺间隔（如 30s / 5m / 2h / 1d）");
+                            return 1;
+                        };
+                        every = Some(v.clone());
+                        i += 2;
+                    }
                     "--to" => {
                         let Some(v) = args.get(i + 1) else {
                             eprintln!("--to 缺目标（形如 bot_key:chat_id，bot_key 可省）");
@@ -1038,6 +1066,33 @@ fn run_task_cli(args: &[String]) -> i32 {
                 eprintln!("--to-current 与 --to 互斥（前者 = 显式发回创建者会话）");
                 return 1;
             }
+            // 触发档三选一：全不给 = 立即跑（#306 的后台子代理语义）
+            let chosen = [
+                once.as_ref().map(|v| (task_store::TriggerKind::Once, v)),
+                cron.as_ref().map(|v| (task_store::TriggerKind::Cron, v)),
+                every
+                    .as_ref()
+                    .map(|v| (task_store::TriggerKind::Interval, v)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if chosen.len() > 1 {
+                eprintln!("--once / --cron / --every 三者只能给一个");
+                return 1;
+            }
+            let trigger = match chosen.first() {
+                Some((kind, expr)) => task_store::TaskTrigger {
+                    kind: *kind,
+                    expr: (*expr).clone(),
+                    timezone: String::new(),
+                },
+                None => task_store::TaskTrigger {
+                    kind: task_store::TriggerKind::Now,
+                    expr: String::new(),
+                    timezone: String::new(),
+                },
+            };
             // 创建者会话：优先桥注入的 env；手动 CLI 回落该 bot 的主会话（与 job add 同款）。
             // 审查 B2：这里若留空，任务会「跑完但没人看得到」——而 CLI 却印着「结果回创建者会话」。
             // 所以两条路都给不出目标时**直接拒绝登记**，不接受一个永远发不出结果的任务。
@@ -1086,11 +1141,7 @@ fn run_task_cli(args: &[String]) -> i32 {
                     cmd: Vec::new(),
                     env: std::collections::BTreeMap::new(),
                 },
-                trigger: task_store::TaskTrigger {
-                    kind: task_store::TriggerKind::Now,
-                    expr: String::new(),
-                    timezone: String::new(),
-                },
+                trigger,
                 delivery: task_store::TaskDelivery {
                     targets,
                     ..Default::default()
@@ -1132,12 +1183,12 @@ fn run_task_cli(args: &[String]) -> i32 {
 }
 
 /// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
-const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]";
+const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]";
 
 /// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
 /// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
 pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
-     \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current]\n\
+     \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\
      \n  task logs <id前缀> [--tail N]     看任务日志（缺省末 200 行）\n\
@@ -1168,7 +1219,10 @@ fn describe_trigger(t: &task_store::TaskTrigger) -> String {
         task_store::TriggerKind::Now => "立即".to_string(),
         task_store::TriggerKind::Once => format!("一次性 {}", t.expr),
         task_store::TriggerKind::Cron => format!("周期 {}", t.expr),
-        task_store::TriggerKind::Interval => format!("每 {} 秒", t.expr),
+        task_store::TriggerKind::Interval => match task_store::parse_interval_secs(&t.expr) {
+            Some(secs) => format!("每 {}", task_store::human_interval(secs)),
+            None => format!("每 {}（表达式无法解析）", t.expr),
+        },
         task_store::TriggerKind::Keepalive => "常驻".to_string(),
     }
 }
@@ -1827,7 +1881,7 @@ fn trash_bot_key(args: &[String]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_task_to, session_reset_chat_id};
+    use super::{describe_trigger, parse_task_to, session_reset_chat_id};
 
     /// #312 审查：`task --help` / `-h` / `help` 必须**真**走帮助臂——落到 `other` 会先
     /// 多打一行「不认识的子命令」，而放到 `resolve_bot_key()` 之后又会让未配置 bot 的
@@ -1851,6 +1905,32 @@ mod tests {
             0,
             "未知子命令不应伪装成功"
         );
+    }
+
+    /// P2b-C：`task list/status` 的触发档描述（interval 要说人话）。
+    #[test]
+    fn describe_trigger_renders_all_kinds() {
+        use crate::task_store::{TaskTrigger, TriggerKind};
+        let mk = |kind, expr: &str| TaskTrigger {
+            kind,
+            expr: expr.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(describe_trigger(&mk(TriggerKind::Now, "")), "立即");
+        assert_eq!(
+            describe_trigger(&mk(TriggerKind::Once, "2026-09-20 09:00")),
+            "一次性 2026-09-20 09:00"
+        );
+        assert_eq!(
+            describe_trigger(&mk(TriggerKind::Cron, "30 9 * * *")),
+            "周期 30 9 * * *"
+        );
+        assert_eq!(
+            describe_trigger(&mk(TriggerKind::Interval, "5m")),
+            "每 5 分钟",
+            "interval 要渲染成人话而不是裸 expr"
+        );
+        assert_eq!(describe_trigger(&mk(TriggerKind::Keepalive, "")), "常驻");
     }
 
     /// #306：`task add --to` 的值解析只按**第一个**冒号切，缺 bot_key 段 = 本 bot；
