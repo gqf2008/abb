@@ -93,6 +93,10 @@ jobs:
           done
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
+          # #251 守卫：三项 TCC entitlements（相机/麦克风/自动化）必须真的签进产物——
+          # 缺任一项在 hardened runtime 下会被**静默拒绝**（连授权弹窗都没有），
+          # 历史上只有真机点相机才发现。分发包与内部可执行都要查。
+          bash tools/check_entitlements.sh ABB.app
           ./ABB.app/Contents/MacOS/agent-bridge --dump-tools --require-bundled-tools
 
       - name: Notarize + staple app
