@@ -44,16 +44,20 @@ for app in "$@"; do
     [ -f "$app/Contents/MacOS/$exe" ] && targets+=("$app/Contents/MacOS/$exe")
   done
   for t in "${targets[@]}"; do
-    # `codesign -d --entitlements -` 对无签名/无 entitlements 的目标会输出空或报错，
-    # 两种都按"缺"处理（不靠退出码，直接看文本里有没有那三个 key）。
-    dump="$(codesign -d --entitlements - "$t" 2>/dev/null || true)"
+    # **必须校验值，不能只查 key 文本**（审查实测的假阴性）：entitlement 存在但值为
+    # `false` 时 TCC 照样不授权，而字符串匹配会判绿。故取 XML plist（`:-`）后用
+    # PlistBuddy 逐个读布尔值，只有 `true` 才算带；缺失/`false`/解析失败（未签名、
+    # 空输出、格式异常）一律算缺。
+    plist="$(mktemp)"
+    codesign -d --entitlements :- "$t" >"$plist" 2>/dev/null || true
     missing=()
     for key in "${REQUIRED[@]}"; do
-      case "$dump" in
-        *"$key"*) ;;
-        *) missing+=("$key") ;;
-      esac
+      value="$(/usr/libexec/PlistBuddy -c "Print :${key}" "$plist" 2>/dev/null || true)"
+      if [ "$value" != "true" ]; then
+        missing+=("$key")
+      fi
     done
+    rm -f "$plist"
     if [ "${#missing[@]}" -gt 0 ]; then
       fail=1
       echo "❌ ${t}：缺 entitlements → ${missing[*]}" >&2
