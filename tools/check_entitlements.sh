@@ -52,29 +52,46 @@ for app in "$@"; do
     #     `com.apple.security.device. camera`（非法 key，codesign 照收）被归一成合法 key。
     # 故改用 plistlib 解析后按键取值 + `is True` 判断：key 精确匹配、类型必须是布尔，
     # 缺失 / false / 字符串 / 数字 / 空输出 / 解析失败一律算缺。
-    missing="$(
-      codesign -d --entitlements :- "$t" 2>/dev/null | python3 -c '
+    # 解析必须 **fail closed**（审查实测的 fail-open）：若 python3 缺失/启动失败/
+    # 解析抛异常，管道输出为空 & 退出码非 0——绝不能把"空输出"当成"三项都齐"。
+    # 故让 python 结尾打印哨兵 `__OK__`，shell 只在「管道成功 **且** 看到哨兵」时才
+    # 认为解析可信；否则一律按"三项全缺"处理（宁红不绿）。
+    parsed=""
+    if parsed="$(codesign -d --entitlements :- "$t" 2>/dev/null | python3 -c '
 import plistlib, sys
-required = sys.argv[1:]
+# 必须 loads(read())：plistlib.load(stdin) 要求流可 seek，管道会抛 UnsupportedOperation
 try:
-    # 注意：必须 loads(read())，不能用 plistlib.load(stdin)——后者要求流可 seek，
-    # 管道 stdin 会抛 UnsupportedOperation，被 except 吞掉后表现为"全部缺项"（假红）。
     got = plistlib.loads(sys.stdin.buffer.read())
 except Exception:
     got = None
 if not isinstance(got, dict):
     got = {}
-for key in required:
+for key in sys.argv[1:]:
     if got.get(key) is not True:
         print(key)
-' "${REQUIRED[@]}"
-    )"
-    # 上面用行输出"缺哪些"，这里还原成数组（保持下游报错格式不变）
-    missing_list="$missing"
+print("__OK__")
+' "${REQUIRED[@]}")"; then
+      present="$(printf '%s\n' "$parsed" | grep -Fx '__OK__' || true)"
+      if [ -z "$present" ]; then
+        parsed=""
+      fi
+    else
+      parsed=""
+    fi
     missing=()
-    while IFS= read -r line; do
-      [ -n "$line" ] && missing+=("$line")
-    done <<<"$missing_list"
+    if [ -z "$parsed" ]; then
+      # 解析不可信 → 全缺（fail closed），并在报错里说明原因
+      for key in "${REQUIRED[@]}"; do
+        missing+=("$key")
+      done
+      echo "⚠️ 无法解析 entitlements（python3 缺失/失败或输出异常）→ 按缺项处理：${t}" >&2
+    else
+      while IFS= read -r line; do
+        if [ -n "$line" ] && [ "$line" != "__OK__" ]; then
+          missing+=("$line")
+        fi
+      done <<<"$parsed"
+    fi
     if [ "${#missing[@]}" -gt 0 ]; then
       fail=1
       echo "❌ ${t}：缺 entitlements → ${missing[*]}" >&2

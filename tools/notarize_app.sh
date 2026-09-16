@@ -27,7 +27,9 @@ notarize_sh() { echo "${NOTARIZE_SH:-$HOME/scripts/notarize.sh}"; }
 
 run_self_test() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/abb-notarize-selftest.XXXXXX")"
-  trap 'rm -rf -- "$tmp"' EXIT
+  # trap 必须保留原退出码：否则 rm 成功后会把失败的 self-test 变成 rc=0（审查实测踩到）
+  rc=0
+  trap 'rc=$?; rm -rf -- "$tmp"; exit "$rc"' EXIT
   log="$tmp/log.txt"
   : >"$log"
   # 两个 mock：只往同一个日志追加"谁被调用、收到什么参数"，不签名不联网。
@@ -60,7 +62,7 @@ MOCK
   first="$(head -1 "$log")"
   case "$first" in
     notarize*) ;;
-    *) echo "❌ self-test：调用顺序不对（首行应为 notarize，实际：$first）" >&2; exit 1 ;;
+    *) printf '❌ self-test：调用顺序不对（首行应为 notarize，实际：%s）\n' "$first" >&2; exit 1 ;;
   esac
 
   # 用例 2（反）：守卫失败必须让 wrapper 失败（不能被静默吞掉）
@@ -89,7 +91,7 @@ APP="$1"
 [ -x "$GUARD" ] || { echo "❌ 守卫不可执行：$GUARD" >&2; exit 2; }
 NOTARY_SH="$(notarize_sh)"
 if [ ! -x "$NOTARY_SH" ]; then
-  echo "❌ 未找到可执行的公证脚本：$NOTARY_SH（可用 NOTARIZE_SH 覆盖）" >&2
+  printf '❌ 未找到可执行的公证脚本：%s（可用 NOTARIZE_SH 覆盖）\n' "$NOTARY_SH" >&2
   exit 2
 fi
 
