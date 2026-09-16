@@ -44,20 +44,20 @@ for app in "$@"; do
     [ -f "$app/Contents/MacOS/$exe" ] && targets+=("$app/Contents/MacOS/$exe")
   done
   for t in "${targets[@]}"; do
-    # **必须校验值，不能只查 key 文本**（审查实测的假阴性）：entitlement 存在但值为
-    # `false` 时 TCC 照样不授权，而字符串匹配会判绿。故取 XML plist（`:-`）后用
-    # PlistBuddy 逐个读布尔值，只有 `true` 才算带；缺失/`false`/解析失败（未签名、
-    # 空输出、格式异常）一律算缺。
-    plist="$(mktemp)"
-    codesign -d --entitlements :- "$t" >"$plist" 2>/dev/null || true
+    # **必须是布尔 true，且类型要对**（两轮审查各抓到一个假绿）：
+    #   · 只匹配 key 文本 → 值为 `false` 也判绿（TCC 不授权）；
+    #   · 只比较 PlistBuddy 的文本输出 → 字符串 `"true"` 也判绿（类型错，TCC 不认）。
+    # 故这里取 XML plist（`:-`）、去掉所有空白后按 `<key>K</key><true/>` 精确匹配：
+    # 布尔 true 才命中；`<false/>`、`<string>true</string>`、缺失 key、空输出都不命中。
+    # 不落临时文件、不依赖 jq/python，Bash 3.2 下即可跑。
+    dump="$(codesign -d --entitlements :- "$t" 2>/dev/null | tr -d '[:space:]' || true)"
     missing=()
     for key in "${REQUIRED[@]}"; do
-      value="$(/usr/libexec/PlistBuddy -c "Print :${key}" "$plist" 2>/dev/null || true)"
-      if [ "$value" != "true" ]; then
-        missing+=("$key")
-      fi
+      case "$dump" in
+        *"<key>${key}</key><true/>"*) ;;
+        *) missing+=("$key") ;;
+      esac
     done
-    rm -f "$plist"
     if [ "${#missing[@]}" -gt 0 ]; then
       fail=1
       echo "❌ ${t}：缺 entitlements → ${missing[*]}" >&2
