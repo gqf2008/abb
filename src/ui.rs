@@ -1438,6 +1438,11 @@ fn configure_backend() -> Result<()> {
     Ok(())
 }
 
+// 无边框窗口缩放需要 `ResizeUi` 契约（`slint-pixel` 提供）：为生成的 SettingsWindow
+// 实现 `on_begin_resize`，再由 `install_window_resize` 接到 winit 的 drag_resize_window。
+// 宏必须在模块作用域调用（impl 块）。
+slint_pixel::impl_resize_ui!(SettingsWindow);
+
 pub fn run_gui() -> Result<()> {
     configure_backend()?;
 
@@ -1459,6 +1464,13 @@ pub fn run_gui() -> Result<()> {
     let settings = SettingsWindow::new()?;
     // 像素自绘窗口：PixelTitleBar 窗口控制接线（关闭=隐藏，托盘应用惯例）
     slint_pixel::install_title_bar_controls_no_quit(&settings);
+    // 无边框窗口缩放：把 `PixelWindowResize` 热区的方向回调接到 winit 的
+    // `drag_resize_window`（系统级缩放循环）。macOS 的系统缩放本来就可用，且 .slint 里
+    // 刻意没给 macOS 放热区，所以这里装上也无副作用（回调不会被触发）。
+    slint_pixel::install_window_resize(&settings);
+    // 缩放热区开关：**按目标平台显式给**（Windows/Linux 无系统缩放边框 → 自绘；
+    // macOS 交给系统）。不用 `platform` 属性门控，避免依赖权限回填路径。
+    settings.set_resize_hit_areas(!cfg!(target_os = "macos"));
     // 版本号随编译注入（Cargo.toml 单一事实源），侧栏底部展示
     settings.set_version(env!("CARGO_PKG_VERSION").into());
     // 托盘菜单的版本项也常驻当前版本（updater::CURRENT 同源）
