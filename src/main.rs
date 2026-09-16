@@ -677,7 +677,16 @@ fn run_job_cli(args: &[String]) -> i32 {
                             }
                         };
                         match schedule::parse_job_target(&raw) {
-                            Ok(t) => targets.push(t),
+                            Ok(t) => {
+                                if crate::buzz::keys::looks_like_channel_uuid(t.chat_id.trim()) {
+                                    eprintln!(
+                                        "--to 的 chat_id「{}」形如 buzz 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
+                                        t.chat_id.trim()
+                                    );
+                                    return 1;
+                                }
+                                targets.push(t);
+                            }
                             Err(e) => {
                                 eprintln!("{e:#}");
                                 return 1;
@@ -706,11 +715,10 @@ fn run_job_cli(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            // chat_id：优先 env（桥注入），否则回落该 bot 主会话
-            let chat_id = std::env::var("AGENT_BRIDGE_CHAT_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| config::Config::primary_chat(&bot_key));
+            // chat_id：优先 env（桥注入），否则回落该 bot 主会话。桥注入值若形如 buzz
+            // 频道 UUID（非平台 receive_id），同样回落主会话并 loud 提示——否则任务
+            // 「跑完也发不出」（见 resolve_injected_chat）。
+            let chat_id = resolve_injected_chat(&bot_key);
             if chat_id.is_empty() {
                 eprintln!("无法确定 chat_id：AGENT_BRIDGE_CHAT_ID 为空且主会话未建立（先在飞书私聊 bot 发一句话）");
                 return 1;
@@ -766,6 +774,28 @@ fn resolve_bot_key() -> Result<String, String> {
             "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）"
         )),
     }
+}
+
+/// 解析「桥注入的当前会话」chat_id（`job add` / `task add` 缺省回创建者会话走这条路）。
+///
+/// 返回 `AGENT_BRIDGE_CHAT_ID`；为空时回落该 bot 主会话；**形如 buzz 频道 UUID** 时
+/// 同样回落主会话并 loud 提示。背景：ACP 架构下 agent 是每 bot 长驻进程，桥无法按频道
+/// 注入 `AGENT_BRIDGE_CHAT_ID`；外部启动器喂进来的可能是 buzz 频道 UUID——它不是平台
+/// receive_id，直发必被平台拒（飞书 230001 invalid receive_id），不校正则任务
+/// 「跑完但没人看得到」。
+fn resolve_injected_chat(bot_key: &str) -> String {
+    let raw = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+    let primary = config::Config::primary_chat(bot_key);
+    if raw.is_empty() {
+        return primary;
+    }
+    let (chat, fell_back) = deliver::correct_injected_chat(&raw, &primary);
+    if fell_back {
+        eprintln!(
+            "⚠️ AGENT_BRIDGE_CHAT_ID「{raw}」形如 buzz 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）；要在指定群/话题回投，请显式指定真实 chat_id"
+        );
+    }
+    chat
 }
 
 /// 任务 CLI（#326 / #306）。退出码 0=成功 1=失败。
@@ -1108,10 +1138,8 @@ fn run_task_cli(args: &[String]) -> i32 {
             // 创建者会话：优先桥注入的 env；手动 CLI 回落该 bot 的主会话（与 job add 同款）。
             // 审查 B2：这里若留空，任务会「跑完但没人看得到」——而 CLI 却印着「结果回创建者会话」。
             // 所以两条路都给不出目标时**直接拒绝登记**，不接受一个永远发不出结果的任务。
-            let chat_id = std::env::var("AGENT_BRIDGE_CHAT_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| config::Config::primary_chat(&bot_key));
+            // 桥注入值若形如 buzz 频道 UUID（非平台 receive_id），回落主会话并 loud 提示。
+            let chat_id = resolve_injected_chat(&bot_key);
             if chat_id.is_empty() {
                 eprintln!(
                     "无法确定结果投递目标：AGENT_BRIDGE_CHAT_ID 为空且该 bot 主会话未建立\n\
@@ -1126,6 +1154,13 @@ fn run_task_cli(args: &[String]) -> i32 {
                     let (tbot, tchat) = parse_task_to(&raw);
                     if tchat.trim().is_empty() {
                         eprintln!("--to 的 chat_id 不能为空：{raw}");
+                        return 1;
+                    }
+                    if crate::buzz::keys::looks_like_channel_uuid(tchat.trim()) {
+                        eprintln!(
+                            "--to 的 chat_id「{}」形如 buzz 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
+                            tchat.trim()
+                        );
                         return 1;
                     }
                     vec![task_store::TaskTarget {
@@ -1280,7 +1315,26 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         }
     };
     let env_bot = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
-    let env_chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+    let env_chat_raw = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+    // 注入的当前会话若是 buzz 频道 UUID（非平台 receive_id），回落到该 bot 主会话并
+    // loud 提示——直发必被平台拒（飞书 230001）。回落需要 bot 已解析（按其 key 查主会话）。
+    let env_chat = if env_bot.is_empty() || env_chat_raw.is_empty() {
+        env_chat_raw
+    } else {
+        let primary = cfg
+            .bots
+            .iter()
+            .find(|b| b.key() == env_bot)
+            .map(|b| b.primary_chat_id.clone())
+            .unwrap_or_default();
+        let (chat, fell_back) = deliver::correct_injected_chat(&env_chat_raw, &primary);
+        if fell_back {
+            eprintln!(
+                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat_raw}」形如 buzz 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
+            );
+        }
+        chat
+    };
     // @角色名寻址（#75 虚拟 Bot）：--chat @后端开发 → 查登记表解析成 chat_id；
     // 找不到报错并列出该 bot 可用角色。登记表与 service 注入判定共用同一份。
     let roles = crate::virtualbot::VirtualBotStore::new();
