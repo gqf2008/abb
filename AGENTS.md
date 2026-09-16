@@ -78,6 +78,13 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 
 ## Security & Configuration
 
+- **macOS entitlements 是分发的硬前提**（#251）：`app-assets/abb.entitlements` 必须随签名带上
+  （bundle 与内部可执行都要），否则 hardened runtime 下相机/麦克风/自动化会被**静默拒绝**
+  （连授权弹窗都没有）。`scripts/` 被 `.gitignore` 排除、不在版本控制内，所以本机
+  **本机公证统一走仓库内入口 `tools/notarize_app.sh <App.app>`**（`tools/notarize_app.sh --self-test`
+  可自测参数转发）：它强制把 `app-assets/abb.entitlements` 传给 `~/scripts/notarize.sh`
+  —— 后者用 `--deep --force` 重签，不传就把授权签没 —— 并在重签后跑
+  `tools/check_entitlements.sh` 断言最终产物。CI 的 release.yml 同样已接入该守卫。
 - `config.json` (contains App Secret) and `*.secret` are gitignored — never commit credentials.
 - Don't commit `logs/`, `target/`, or generated `.app` bundles.
 - Before touching signing, read `scripts/sign.sh`: usage-description entitlements on the bare binary can cause a startup `SIGKILL`.
