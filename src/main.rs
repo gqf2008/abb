@@ -383,7 +383,7 @@ fn main() {
 
     // 任务 CLI（#326 / #306）：`agent-bridge task <子命令>`。
     //   task add --prompt "做什么" [--name 名字] [--cwd 路径] [--timeout-secs N]
-    //   task list | task status <id前缀> | task logs <id前缀> [--tail N] | task rm <id前缀>
+    //   task list | task status <id前缀> | task logs <id前缀> [--tail N] [--all] | task rm <id前缀>
     // 与 job 的差别：任务**不等时刻**——登记后由 service 的 task worker 立刻认领执行
     // （trigger=now 的 agent 任务就是「后台子代理」，跑在自己的 handle 上、不占聊天 slot）。
     if args.len() >= 2 && args[1] == "task" {
@@ -815,6 +815,22 @@ fn resolve_injected_chat(bot_key: &str) -> String {
     chat
 }
 
+/// 读取任务日志：先按 `all` 决定是否拼接轮转历史，再对完整内容取末 `tail` 行。
+///
+/// 读取/拼接由 [`task_store::read_task_logs`] 负责；这里只做 CLI 层的 `--tail`
+/// 截断，便于直接单测「先合并、后截断」的语义。
+fn read_task_logs(
+    paths: &task_store::TaskPaths,
+    id: &str,
+    all: bool,
+    tail: usize,
+) -> Result<String, String> {
+    let body = task_store::read_task_logs(paths, id, all).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    Ok(lines[start..].join("\n"))
+}
+
 /// 任务 CLI（#326 / #306）。退出码 0=成功 1=失败。
 ///
 /// 与 `job` 的分工：`job` 是「到点唤起一个回合」，本命令是「**立刻**登记一个后台任务」——
@@ -898,35 +914,41 @@ fn run_task_cli(args: &[String]) -> i32 {
             let Some(t) = resolve_task(&store, args.get(1)) else {
                 return 1;
             };
-            // --tail N（缺省 200 行）
+            // --tail N（缺省 200 行）；--all 先拼接轮转历史，再对完整内容取末 N 行。
             let mut tail = 200usize;
+            let mut all = false;
             let mut i = 2;
             while i < args.len() {
-                if args[i] == "--tail" {
-                    match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
-                        Some(n) => tail = n,
-                        None => {
-                            eprintln!("--tail 需要一个数字");
-                            return 1;
+                match args[i].as_str() {
+                    "--tail" => {
+                        match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                            Some(n) => tail = n,
+                            None => {
+                                eprintln!("--tail 需要一个数字");
+                                return 1;
+                            }
                         }
+                        i += 2;
                     }
-                    i += 2;
-                } else {
-                    i += 1;
+                    "--all" => {
+                        all = true;
+                        i += 1;
+                    }
+                    _ => i += 1,
                 }
             }
-            let path = task_store::TaskPaths::for_bot(&bot_key).log_file(&t.id);
-            match std::fs::read_to_string(&path) {
+            let paths = task_store::TaskPaths::for_bot(&bot_key);
+            // 默认语义（只读当前文件、取末 N 行）与历史完全一致；`--all` 只是先把轮转
+            // 历史拼进来，再对完整内容取末 N 行。
+            match read_task_logs(&paths, &t.id, all, tail) {
                 Ok(body) => {
-                    let lines: Vec<&str> = body.lines().collect();
-                    let start = lines.len().saturating_sub(tail);
-                    for l in &lines[start..] {
+                    for l in body.lines() {
                         println!("{l}");
                     }
                     0
                 }
                 Err(e) => {
-                    eprintln!("读日志失败（{}）：{e}", path.display());
+                    eprintln!("{e}");
                     1
                 }
             }
@@ -1255,7 +1277,7 @@ pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|
      \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\
-     \n  task logs <id前缀> [--tail N]     看任务日志（缺省末 200 行）\n\
+     \n  task logs <id前缀> [--tail N] [--all]  看任务日志（缺省末 200 行；--all 先按 .2→.1→当前拼接轮转历史再取末 N 行）\n\
      \n  task cancel <id前缀>              取消任务（在跑的中止且不投递结果；未开跑的不再开跑）\n\
      \n  task rm <id前缀>                  删除任务（运行中不允许）";
 
@@ -1964,7 +1986,7 @@ fn trash_bot_key(args: &[String]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe_trigger, parse_task_to, session_reset_chat_id};
+    use super::{describe_trigger, parse_task_to, read_task_logs, session_reset_chat_id};
 
     /// #312 审查：`task --help` / `-h` / `help` 必须**真**走帮助臂——落到 `other` 会先
     /// 多打一行「不认识的子命令」，而放到 `resolve_bot_key()` 之后又会让未配置 bot 的
@@ -1988,6 +2010,34 @@ mod tests {
             0,
             "未知子命令不应伪装成功"
         );
+    }
+
+    /// P4：`task logs --all` 从 `.2` 到当前按最老→最新拼接，`--tail` 在完整
+    /// 拼接结果上截末尾；默认仍只读当前 `.log`。
+    #[test]
+    fn task_logs_all_orders_rotated_files_and_tails_merged_output() {
+        let root = std::env::temp_dir().join(format!("abb-task-logs-all-{}", uuid::Uuid::new_v4()));
+        let paths = crate::task_store::TaskPaths::with_root(&root, "bot");
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        let current = paths.log_file("tk_log");
+        std::fs::write(&current, "current-1\ncurrent-2\n").unwrap();
+        std::fs::write(format!("{}.1", current.display()), "middle-1\nmiddle-2\n").unwrap();
+        std::fs::write(format!("{}.2", current.display()), "old-1\nold-2\n").unwrap();
+
+        assert_eq!(
+            read_task_logs(&paths, "tk_log", false, 200).unwrap(),
+            "current-1\ncurrent-2"
+        );
+        assert_eq!(
+            read_task_logs(&paths, "tk_log", true, 200).unwrap(),
+            "old-1\nold-2\nmiddle-1\nmiddle-2\ncurrent-1\ncurrent-2"
+        );
+        assert_eq!(
+            read_task_logs(&paths, "tk_log", true, 3).unwrap(),
+            "middle-2\ncurrent-1\ncurrent-2"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// P2b-C：`task list/status` 的触发档描述（interval 要说人话）。
