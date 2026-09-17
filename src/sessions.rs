@@ -20,6 +20,7 @@ use crate::config::SandboxMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -87,6 +88,17 @@ pub struct SessionStore {
     /// sessions.json.legacy.bak 再覆盖（用户数据零丢失）；归档失败则不写盘，
     /// 置位保留到下次写盘重试。
     pending_archive: Mutex<bool>,
+    /// 本次 pending 周期内是否已就归档失败告警过一次——同一故障只响亮报一次，
+    /// 避免每轮入站重试都刷一行把日志噪声顶上去（abb-sessions-archive-exfat
+    /// 线上累计 363 次同因告警即此类）。归档成功后复位，下次再失败会重新告警。
+    pending_archive_warned: Mutex<bool>,
+    /// 「建硬链接」动作（生产恒为 `hard_link_native`；单测可注入「不支持」假实现
+    /// 逼出 rename 回退档，无需真挂 exFAT）。
+    archive_linker: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+    /// 「落盘」动作（生产恒为 `fsync_native` = `File::sync_all`；单测可换成计数实现，
+    /// 用来证明归档路径**确实调用了 fsync**——这是单进程单测唯一能观测的部分，
+    /// 耐久性本身需要真断电/崩溃注入）。
+    fsync_hook: fn(&fs::File) -> io::Result<()>,
 }
 
 // #194：手写 Clone——句柄式拷贝（path 复制，内存缓存清空）。
@@ -99,6 +111,9 @@ impl Clone for SessionStore {
             data: Mutex::new(HashMap::new()),
             loaded_sig: Mutex::new(None),
             pending_archive: Mutex::new(false),
+            pending_archive_warned: Mutex::new(false),
+            archive_linker: hard_link_native,
+            fsync_hook: fsync_native,
         }
     }
 }
@@ -115,15 +130,37 @@ fn file_sig(path: &std::path::Path) -> Option<(SystemTime, u64)> {
 /// junction）时退化为 `fs::rename`：tmp 与 bak 同目录同卷，rename 原子；调用前已由
 /// [`SessionStore::archive_original`] 确认 bak 不存在，故不会覆盖任何既有备份。
 ///
-/// 返回 true = 已完成归档（含并发下「已存在」）。`link_or_rename_with` 把「建硬链接」
-/// 抽成可注入的 `linker`，便于单测模拟「硬链接不可用」的文件系统（不必真去挂 exFAT）。
-fn link_or_rename(tmp: &std::path::Path, bak: &std::path::Path) -> bool {
+/// 返回 `Ok(())` = 已完成归档（含并发下「已存在」）。**回退链全失败时返回带原因的
+/// `io::Error`**，而不是吞成裸 `false`——调用方要把它打进日志，排障时能直接看到
+/// `Permission denied` / `ENOSPC` 这类真因，不必再靠猜（缺陷 abb-sessions-archive-exfat）。
+/// `link_or_rename_with` 把「建硬链接」抽成可注入的 `linker`，便于单测模拟「硬链接
+/// 不可用」的文件系统（不必真去挂 exFAT）。
+#[cfg(test)]
+fn link_or_rename(tmp: &std::path::Path, bak: &std::path::Path) -> io::Result<()> {
     link_or_rename_with(tmp, bak, hard_link_native)
+}
+
+/// 生产用「同步落盘」动作：把 `File::sync_all` 包成具名 `fn`，好在单测里换成会
+/// 计数的实现——`sync_all` 的**耐久性**本身无法在单进程单测里观测（要真断电/崩溃
+/// 注入），但「归档路径确实调用了 fsync」可以被观测，这正是本缝要证明的。
+fn fsync_native(f: &fs::File) -> io::Result<()> {
+    f.sync_all()
+}
+
+/// 单测专用：fsync 被调用的次数（0 表示归档路径没调 fsync）。`fsync_native` 自身不
+/// 计数，只有在 `archive_syncs_backup_before_commit` 里显式传入的计数实现才写它。
+#[cfg(test)]
+static FSYNC_SEAM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn fsync_counting(f: &fs::File) -> io::Result<()> {
+    FSYNC_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    f.sync_all()
 }
 
 /// 生产用「建硬链接」动作：包一层具名 `fn`，好让泛型的 `fs::hard_link` 退化为
 /// 具体的 `fn(&Path, &Path) -> io::Result<()>` 指针（可直接传给 `link_or_rename_with`）。
-fn hard_link_native(tmp: &std::path::Path, bak: &std::path::Path) -> std::io::Result<()> {
+fn hard_link_native(tmp: &std::path::Path, bak: &std::path::Path) -> io::Result<()> {
     fs::hard_link(tmp, bak)
 }
 
@@ -132,14 +169,40 @@ fn hard_link_native(tmp: &std::path::Path, bak: &std::path::Path) -> std::io::Re
 fn link_or_rename_with(
     tmp: &std::path::Path,
     bak: &std::path::Path,
-    linker: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
-) -> bool {
+    linker: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+) -> io::Result<()> {
     match linker(tmp, bak) {
-        Ok(()) => true,
-        // 并发/重入已建：视为已归档（保留最老原件）——与开头 bak.exists() 短路同义
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
-        // 硬链接不可用（exFAT/FAT32/网络盘/跨设备）等：退化为原子 rename
-        Err(_) => fs::rename(tmp, bak).is_ok(),
+        Ok(()) => Ok(()),
+        // 并发/重入已建：**仅当目标确实是普通文件**才视为已归档（保留最老原件）；
+        // `bak` 位若被占成目录/其它类型，内核同样回 AlreadyExists，但那是「目标位不可
+        // 承载归档」，不能当已备份放行——否则调用方会覆盖原件且实际没有备份。
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // 用 symlink_metadata：`metadata` 会跟随符号链接，`bak` 若是指向普通文件的
+            // 符号链接会被误判成「已归档」放行——本判定的本意是目录/符号链接/其它类型
+            // 统统不算已归档（符号链接的目标可能随时消失或被改指）。
+            if fs::symlink_metadata(bak)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("备份位已被占用但不是普通文件：{}", bak.display()),
+                ))
+            }
+        }
+        // 硬链接不可用（exFAT/FAT32/网络盘/跨设备）等：退化为原子 rename。
+        // rename 也失败时把 rename 的错因报出去（比硬链接那个 ENOTSUP 更接近真因）。
+        Err(e) => fs::rename(tmp, bak).map_err(|rename_err| {
+            io::Error::new(
+                rename_err.kind(),
+                format!(
+                    "回退 rename 失败：{rename_err}（硬链接亦不可用：{e}；目标 {}）",
+                    bak.display()
+                ),
+            )
+        }),
     }
 }
 
@@ -150,6 +213,36 @@ impl SessionStore {
         Self::at(dir.join("sessions.json"))
     }
 
+    /// 单测专用：折叠迁移前就把「建硬链接」动作注入好（构造期 reload 即折叠，
+    /// 构造后再注会错过那次迁移）。生产 `at()` 恒用 `hard_link_native`。
+    #[cfg(test)]
+    fn at_with_archive_linker(
+        path: PathBuf,
+        linker: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+    ) -> SessionStore {
+        Self::at_with_archive_hooks(path, linker, fsync_native)
+    }
+
+    /// 单测专用：构造期同时注入「建硬链接」与「落盘」两个动作。
+    #[cfg(test)]
+    fn at_with_archive_hooks(
+        path: PathBuf,
+        linker: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+        fsync: fn(&fs::File) -> io::Result<()>,
+    ) -> SessionStore {
+        let store = SessionStore {
+            path,
+            data: Mutex::new(HashMap::new()),
+            loaded_sig: Mutex::new(None),
+            pending_archive: Mutex::new(false),
+            pending_archive_warned: Mutex::new(false),
+            archive_linker: linker,
+            fsync_hook: fsync,
+        };
+        store.reload();
+        store
+    }
+
     /// 按指定路径构造（生产/测试共用；会话归纳清理测试注入 temp workspace）。
     pub(crate) fn at(path: PathBuf) -> SessionStore {
         let store = SessionStore {
@@ -157,6 +250,9 @@ impl SessionStore {
             data: Mutex::new(HashMap::new()),
             loaded_sig: Mutex::new(None),
             pending_archive: Mutex::new(false),
+            pending_archive_warned: Mutex::new(false),
+            archive_linker: hard_link_native,
+            fsync_hook: fsync_native,
         };
         store.reload();
         store
@@ -285,22 +381,76 @@ impl SessionStore {
     /// 永不折叠、每轮入站再失败一次（线上累计 363 次，两个 bot 的 sessions.json
     /// 至今停在老四槽格式、无 .legacy.bak）。故硬链接只作**优先**手段，不可用时在
     /// [`link_or_rename`] 里退化为同目录同卷的原子 rename（tmp → bak）。
-    fn archive_original(&self) -> bool {
+    fn archive_original(&self) -> io::Result<()> {
+        self.archive_original_full(self.archive_linker, self.fsync_hook)
+    }
+
+    /// 单测入口：注入「建硬链接」动作 + 「落盘」动作（生产见 `archive_original`）。
+    #[cfg(test)]
+    fn archive_original_with(
+        &self,
+        linker: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.archive_original_full(linker, fsync_native)
+    }
+
+    /// [`Self::archive_original`] 的可注入内核：`linker` = 「建硬链接」的动作。
+    /// 生产传 `hard_link_native`；单测传「不支持硬链接」的假实现，逼出 rename 回退档
+    /// （exFAT/FAT32/网络盘的真实行为），无需真挂非支持卷。`fsync` = 落盘动作，
+    /// 单测可换成计数实现以证明归档路径**确实调用了 fsync**。
+    fn archive_original_full(
+        &self,
+        linker: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+        fsync: fn(&fs::File) -> io::Result<()>,
+    ) -> io::Result<()> {
         let bak = self.path.with_extension("json.legacy.bak");
-        // 已归档（含「上次已建」）→ 直接放行，绝不覆盖更老备份
-        if bak.exists() {
-            return true;
+        // 已归档（含「上次已建」）→ 直接放行，绝不覆盖更老备份。
+        // **只认普通文件**：bak 位若被占成目录/符号链接/套接字等，它承载不了归档内容，
+        // 不能当成「已备份」放行——否则 save_locked 会覆盖原件且实际没有备份。
+        // 同上：只认真正的普通文件，符号链接不算（symlink_metadata 不跟随链接）
+        if fs::symlink_metadata(&bak)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return Ok(());
         }
-        let Ok(bytes) = fs::read(&self.path) else {
-            return true;
+        let bytes = match fs::read(&self.path) {
+            Ok(b) => b,
+            // 盘上无原件（全新工作区）→ 按已归档放行
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         };
         let tmp = self
             .path
             .with_extension(format!("json.legacy.tmp.{}", uuid::Uuid::new_v4()));
-        let ok = fs::write(&tmp, bytes).is_ok() && link_or_rename(&tmp, &bak);
-        // rename 成功后 tmp 已不存在；hard_link 成功后 tmp 仍在——这里一并清掉（忽略错误）
+        // ② 先 fsync 再交给 link_or_rename：rename/hard_link 是原子提交点，但「名字已
+        // 提交、内容还在页缓存」在断电后可能留下被截断的 .legacy.bak（正是「用户数据
+        // 零丢失」的最后一道保险）。落盘顺序 = 写全 → fsync → 提交名字。
+        //
+        // 口径：单测只能证明 fsync **被调用**（`archive_syncs_backup_before_commit`
+        // 用计数缝断言），不能证明断电安全——后者要真断电/崩溃注入。
+        let write_ok = (|| -> io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            io::Write::write_all(&mut f, &bytes)?;
+            // 走注入缝：生产 = File::sync_all；单测可换成计数实现证明这道 fsync 真的在
+            fsync(&f)
+        })();
+        let res = write_ok.and_then(|()| link_or_rename_with(&tmp, &bak, linker));
+        // rename 成功后 tmp 已不存在；hard_link 成功后 tmp 仍在——失败/半途也一并清掉，
+        // 不留半截副本
         let _ = fs::remove_file(&tmp);
-        ok
+        // ② 单测观测点：走到过 tmp 落盘这一档（注入硬链接不可用时用它防假绿）。
+        // 成功时清掉，保证归档收尾无残留。
+        #[cfg(test)]
+        {
+            let marker = self.path.with_extension("json.legacy.tmpbuilt");
+            if res.is_ok() {
+                let _ = fs::remove_file(&marker);
+            } else {
+                let _ = fs::write(&marker, b"1");
+            }
+        }
+        res
     }
 
     fn save_locked(&self, data: &HashMap<String, ChatEntry>) -> bool {
@@ -309,14 +459,26 @@ impl SessionStore {
         {
             let mut pending = self.pending_archive.lock().unwrap();
             if *pending {
-                if !self.archive_original() {
-                    crate::log!(
-                        "[sessions] ⚠️ 原件归档失败，本次不写盘（保留老格式原件，下轮重试）: {}",
-                        self.path.display()
-                    );
-                    return false;
+                match self.archive_original() {
+                    Ok(()) => {
+                        *pending = false;
+                        *self.pending_archive_warned.lock().unwrap() = false;
+                    }
+                    Err(e) => {
+                        // ③ 带 io::Error 原因告警（不再吞成裸 false）；
+                        // ① 同一 pending 周期只报一次，避免每轮入站刷同一行。
+                        let mut warned = self.pending_archive_warned.lock().unwrap();
+                        if !*warned {
+                            *warned = true;
+                            crate::log!(
+                                "[sessions] ⚠️ 原件归档失败：{e}；本次不写盘（保留老格式原件，下轮重试）{}: {}",
+                                "（同一故障不再重复告警）",
+                                self.path.display()
+                            );
+                        }
+                        return false;
+                    }
                 }
-                *pending = false;
             }
         }
         // 原子写：唯一 tmp + rename（崩溃不留半截；唯一 tmp 避免 CLI reset 与 service
@@ -631,6 +793,14 @@ impl SessionStore {
 mod tests {
     use super::*;
 
+    /// 假 linker：模拟 exFAT/FAT32/网络盘的「不支持硬链接」（必须是 fn 指针，非闭包）。
+    fn deny_hardlink(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exFAT 不支持硬链接",
+        ))
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("abb-sessions-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -827,7 +997,7 @@ mod tests {
         let store = SessionStore::at(path.clone()); // 空目录 → 无 pending，不自动归档
         let original = r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#;
         std::fs::write(&path, original).unwrap();
-        assert!(store.archive_original(), "归档应成功");
+        assert!(store.archive_original().is_ok(), "归档应成功");
         assert_eq!(
             std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap(),
             original,
@@ -845,7 +1015,10 @@ mod tests {
         std::fs::write(&path, "新原件").unwrap();
         let bak = path.with_extension("json.legacy.bak");
         std::fs::write(&bak, "最老原件").unwrap();
-        assert!(store.archive_original(), "已有备份视为已归档");
+        assert!(
+            store.archive_original().is_ok(),
+            "bak 是普通文件时视为已归档"
+        );
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), "最老原件");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -865,7 +1038,7 @@ mod tests {
             ))
         };
         assert!(
-            link_or_rename_with(&tmp, &bak, deny_link),
+            link_or_rename_with(&tmp, &bak, deny_link).is_ok(),
             "应退化为 rename 成功"
         );
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), "payload");
@@ -880,15 +1053,383 @@ mod tests {
         let tmp = dir.join("tmp");
         let bak = dir.join("bak");
         std::fs::write(&tmp, b"x").unwrap();
-        assert!(link_or_rename(&tmp, &bak));
+        assert!(link_or_rename(&tmp, &bak).is_ok());
         assert!(
             tmp.exists() && bak.exists(),
             "hard_link 保留 tmp，由 archive_original 收尾删除"
         );
         std::fs::write(&bak, "已存在").unwrap();
-        assert!(link_or_rename(&tmp, &bak), "AlreadyExists 视为已归档");
+        assert!(
+            link_or_rename(&tmp, &bak).is_ok(),
+            "AlreadyExists 视为已归档"
+        );
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), "已存在", "不覆盖");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 加固（abb-sessions-archive-hardening-20260917）：main 修复之上的 4 点 ──
+
+    /// ④ bak 位被占成**目录**时不得当成「已归档」放行——那会让 save_locked 覆盖
+    /// 原件却没有真正的备份。必须报错且原件不动。
+    #[test]
+    fn bak_directory_is_not_treated_as_archived() {
+        let dir = temp_dir("bakdir");
+        let path = dir.join("sessions.json");
+        let legacy = r#"{"oc_a": {"buzz": {"session_id": "keep-sid", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let bak = path.with_extension("json.legacy.bak");
+        std::fs::create_dir_all(&bak).unwrap();
+
+        let store = SessionStore::at(path.clone());
+        let err = store
+            .archive_original()
+            .expect_err("bak 是目录时必须报错，不得当成已归档");
+        assert!(
+            !err.to_string().is_empty(),
+            "错误必须带可读原因（io::Error）: {err:?}"
+        );
+        // 原件逐字不动，未落盘半截新格式
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+        assert!(bak.is_dir(), "bak 目录不得被覆盖成文件");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ③ 回退链全失败必须返回 `Err` 且带原因（不是吞成裸 false/true），原件保持不动。
+    #[test]
+    fn archive_failure_returns_err_with_reason_and_keeps_original() {
+        let dir = temp_dir("archfail-err");
+        let path = dir.join("sessions.json");
+        let legacy = r#"{"oc_a": {"buzz": {"session_id": "keep-sid", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // 只读目录：读得到原件，但 tmp / rename 目标一律建不出来 → 回退链全失败
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if std::fs::File::create(dir.join("perm-probe")).is_ok() {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                eprintln!("skip: 当前用户不受目录权限约束（root？）");
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+
+            let store = SessionStore::at(path.clone());
+            let err = store
+                .archive_original()
+                .expect_err("只读目录下归档必须失败");
+            assert!(
+                !err.to_string().is_empty(),
+                "失败必须带 io::Error 原因，而不是裸 false: {err}"
+            );
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // 原件不动（下轮重试的前提），也没有留下半截 tmp
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+            let leftovers: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".tmp."))
+                .collect();
+            assert!(leftovers.is_empty(), "不得留半截 tmp: {leftovers:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ① 同一 pending 周期内连续失败只出一条告警（线上 363 次即没有这道门）；
+    /// 归档成功后门复位，下次再失败仍会告警。
+    #[test]
+    fn archive_failure_warns_once_per_pending_cycle() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = temp_dir("warnonce");
+            let path = dir.join("sessions.json");
+            let legacy = r#"{"oc_a": {"buzz": {"session_id": "keep-sid", "started": true}}}"#;
+            std::fs::write(&path, legacy).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if std::fs::File::create(dir.join("perm-probe")).is_ok() {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                eprintln!("skip: 当前用户不受目录权限约束（root？）");
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+
+            let store = SessionStore::at(path.clone());
+            *store.pending_archive.lock().unwrap() = true;
+            let data = HashMap::new();
+            for _ in 0..3 {
+                assert!(!store.save_locked(&data), "归档失败必须返回失败");
+            }
+            assert!(
+                *store.pending_archive_warned.lock().unwrap(),
+                "失败门应已置位（只放行一条告警）"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                legacy,
+                "归档失败时原件不动"
+            );
+
+            // 故障消除 → 下一轮成功，pending 与告警门都复位
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(store.save_locked(&data), "故障消除后归档+写盘应成功");
+            assert!(!*store.pending_archive.lock().unwrap(), "成功即清 pending");
+            assert!(
+                !*store.pending_archive_warned.lock().unwrap(),
+                "成功即复位告警门（下次再失败仍会告警）"
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap(),
+                legacy
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// ② 归档路径**确实调用了 fsync**：用计数实现替换落盘动作，断言折叠迁移期间
+    /// `FSYNC_SEAM_CALLS` 涨过。反向验证：把 `fsync(&f)` 那行去掉，本用例即红
+    /// （实测 31 passed / 1 failed），其余用例仍绿——所以这条测试是**唯一**能区分
+    /// 「有没有调 fsync」的证据，其余 tmp 档用例只证明结构。
+    ///
+    /// 边界：证明的是 fsync **被调用**，不是断电安全（后者需真断电/崩溃注入）。
+    #[test]
+    fn archive_syncs_backup_before_commit() {
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir("fsyncseam");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#,
+        )
+        .unwrap();
+        FSYNC_SEAM_CALLS.store(0, Ordering::SeqCst);
+        // 构造期折叠迁移即归档 → 这条链必须调 fsync；硬链接仍用真实实现
+        let store =
+            SessionStore::at_with_archive_hooks(path.clone(), hard_link_native, fsync_counting);
+        assert_eq!(store.chat_entry("oc_a").unwrap().session_id, "b1");
+        let calls = FSYNC_SEAM_CALLS.load(Ordering::SeqCst);
+        assert!(
+            calls >= 1,
+            "归档路径必须调用 fsync（落盘后再改名），实际调用 {calls} 次"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap(),
+            r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ④ bak 是**指向普通文件的符号链接**时同样不得当成「已归档」：`fs::metadata`
+    /// 会跟随链接、把符号链接误判成普通文件（审查 Russell 实测 metadata_is_file=true /
+    /// symlink_metadata_is_file=false），必须用不跟随链接的判定。改回 `fs::metadata`
+    /// 本测试即红（会 Ok 放行 → expect_err panic）。
+    #[cfg(unix)]
+    #[test]
+    fn bak_symlink_to_regular_file_is_not_treated_as_archived() {
+        let dir = temp_dir("baksymlink");
+        let path = dir.join("sessions.json");
+        let legacy = r#"{"oc_a": {"buzz": {"session_id": "keep-sid", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // bak 是符号链接 → 指向另一个普通文件
+        let real = dir.join("attacker-target.json");
+        std::fs::write(&real, "被指向的普通文件").unwrap();
+        let bak = path.with_extension("json.legacy.bak");
+        std::os::unix::fs::symlink(&real, &bak).unwrap();
+        // 前提确认：该路径 metadata 跟随链接后确是普通文件，symlink_metadata 不是
+        assert!(
+            std::fs::metadata(&bak)
+                .map(|m| m.is_file())
+                .unwrap_or(false),
+            "前提：fs::metadata 跟随链接后会误判为普通文件"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&bak)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false),
+            "前提：symlink_metadata 不跟随链接，不应判为普通文件"
+        );
+
+        let store = SessionStore::at(path.clone());
+        let err = store
+            .archive_original()
+            .expect_err("bak 是指向普通文件的符号链接时必须报错，不得当已归档放行");
+        assert!(
+            err.to_string().contains("不是普通文件"),
+            "错误应指明备份位不是普通文件: {err}"
+        );
+        // 符号链接与其目标都不得被当成归档写坏
+        assert!(std::fs::symlink_metadata(&bak)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "被指向的普通文件",
+            "不得写到符号链接的目标"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            legacy,
+            "原件不得被覆盖"
+        );
+
+        // 反向对照：把符号链接换成真正的普通文件 → 才允许视为已归档
+        std::fs::remove_file(&bak).unwrap();
+        std::fs::write(&bak, "最老原件").unwrap();
+        assert!(
+            store.archive_original().is_ok(),
+            "bak 换成真正的普通文件后才应放行"
+        );
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "最老原件");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ② 折叠迁移确实走「tmp 落盘 → 原子提交 bak」这条链，而不是直写 bak：注入
+    /// 「硬链接不可用」逼出 rename 档，断言 ① 该档被走到 ② bak 逐字等于原件
+    /// ③ 收尾不留任何半截 tmp。
+    ///
+    /// 口径（别过度声明）：本用例证明的是**结构**——写全一个独立 tmp 再原子改名，
+    /// 因此崩溃只可能留下完整 bak 或没有 bak。它**不证明** fsync 存在，也**不证明**
+    /// 断电安全；「确实调用了 fsync」由 `archive_syncs_backup_before_commit`
+    /// （计数缝）负责，真正的耐久性需要真断电/崩溃注入，单测覆盖不到。
+    #[test]
+    fn archive_fallback_goes_through_tmp_and_fsync_before_rename() {
+        let dir = temp_dir("syncpath");
+        let path = dir.join("sessions.json");
+        let legacy = r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // 先取原件字节：`SessionStore::at` 会立刻折叠迁移，之后盘上已是新格式
+        let bytes = std::fs::read(&path).unwrap();
+
+        // 走被注入「硬链接不可用」的折叠迁移（构造期 reload 即折叠 + 归档 + 落盘）
+        let store = SessionStore::at_with_archive_linker(path.clone(), deny_hardlink);
+        assert_eq!(store.chat_entry("oc_a").unwrap().session_id, "b1");
+        let bak = path.with_extension("json.legacy.bak");
+        assert_eq!(std::fs::read(&bak).unwrap(), bytes, "bak 必须逐字等于原件");
+        assert!(
+            !path.with_extension("json.legacy.tmpbuilt").exists(),
+            "归档成功后 tmp 档观测标记应被清掉（无残留）"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "不得留半截 tmp: {leftovers:?}");
+        // 折叠真的落盘（新格式）
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"buzz\""), "应折叠为新格式: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ② 归档**确实**经 tmp 落盘档再提交：用「bak 位被目录占住」让提交必然失败，
+    /// 断言该档已被走到（观测标记为证）且失败收尾不留任何半截 tmp——这条能变色：
+    /// 若将来有人退回「直接 fs::write(bak)」，标记不会出现，测试即红。
+    #[test]
+    fn archive_reaches_tmp_tier_before_commit() {
+        let dir = temp_dir("tmptier");
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#,
+        )
+        .unwrap();
+        // bak 位是目录 → 提交必失败（且 ④ 已保证不会被当成「已归档」）
+        std::fs::create_dir_all(path.with_extension("json.legacy.bak")).unwrap();
+        let store = SessionStore::at(path.clone());
+        assert!(
+            store.archive_original_with(deny_hardlink).is_err(),
+            "bak 被目录占住时归档必须失败"
+        );
+        assert!(
+            path.with_extension("json.legacy.tmpbuilt").exists(),
+            "必须先经 tmp 落盘档（标记应出现）"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败收尾也不得留半截 tmp: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ② 回退档（硬链接不可用）原子提交后：「完整 bak + 没有 tmp」；再走一次不得
+    /// 改写既有备份（幂等、保留最老原件）。
+    #[test]
+    fn fallback_archive_is_all_or_nothing() {
+        let dir = temp_dir("allornothing");
+        let tmp = dir.join("tmp");
+        let bak = dir.join("bak");
+        std::fs::write(&tmp, b"payload").unwrap();
+        let deny_link = |_: &std::path::Path, _: &std::path::Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "exFAT 不支持硬链接",
+            ))
+        };
+        assert!(link_or_rename_with(&tmp, &bak, deny_link).is_ok());
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "payload");
+        assert!(!tmp.exists(), "rename 成功后 tmp 已不存在");
+        assert!(std::fs::metadata(&bak).unwrap().is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真机口径（**不加 `#[ignore]`**，靠运行时前置检查决定跑还是跳过）：在**不支持
+    /// 硬链接的卷**上跑整条折叠路径，而不是靠注入假 linker。`#[ignore]` 会让它永不执行，
+    /// 等于没有测试（`RULE_可达性.md`）。
+    ///
+    /// 前置条件（本机 mac 手工准备；没有卷时本用例运行时跳过、**不变红**）：
+    /// ```sh
+    /// hdiutil create -size 20m -fs exFAT -volname ABBEXFAT /tmp/abbexfat.dmg
+    /// hdiutil attach -nobrowse /tmp/abbexfat.dmg     # → /Volumes/ABBEXFAT
+    /// cargo test sessions::tests::fold_succeeds_on_exfat_without_hardlink_support -- --nocapture
+    /// hdiutil detach /Volumes/ABBEXFAT
+    /// ```
+    /// exFAT 上 `fs::hard_link` 返回 `ENOTSUP`(45)，正好命中回退档；测试先断言该卷
+    /// 确实不支持硬链接，避免在支持硬链接的卷上跑成假绿。
+    #[test]
+    fn fold_succeeds_on_exfat_without_hardlink_support() {
+        let mount = std::path::Path::new("/Volumes/ABBEXFAT");
+        if !mount.is_dir() {
+            eprintln!("skip: /Volumes/ABBEXFAT 未挂载（需 exFAT 卷复现硬链接不可用）");
+            return;
+        }
+        let dir = mount.join("abb-sessions-hlregress");
+        let _ = std::fs::remove_dir_all(&dir);
+        // 卷在但不可写（权限/只读挂载）→ 运行时跳过，别把环境问题当代码失败
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("skip: 无法在 /Volumes/ABBEXFAT 下建目录（{e}）");
+            return;
+        }
+        let path = dir.join("sessions.json");
+        let legacy = r#"{"oc_x": {"buzz": {"session_id": "b-uuid", "started": true}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        // 先确认该卷真不支持硬链接，否则本测试的断言没有意义（不得假绿）
+        let probe = dir.join("probe");
+        if std::fs::write(&probe, "x").is_err() {
+            eprintln!("skip: exFAT 卷不可写，跳过真机回归");
+            return;
+        }
+        if std::fs::hard_link(&probe, dir.join("probe.lnk")).is_ok() {
+            eprintln!("skip: /Volumes/ABBEXFAT 支持硬链接，不是本用例要覆盖的卷类型");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let store = SessionStore::at(path.clone());
+        assert_eq!(store.chat_entry("oc_x").unwrap().session_id, "b-uuid");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap(),
+            legacy,
+            "exFAT 上备份必须逐字等于原件"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"buzz\""), "exFAT 上也必须折叠落盘: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
