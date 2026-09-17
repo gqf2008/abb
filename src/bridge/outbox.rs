@@ -17,12 +17,19 @@ impl Bridge {
     /// 把一条待发消息落盘积压（仅微信：主动推送被拒时缓存，等下次入站补发）。
     /// 其它通道主动推送不受 token 活跃度约束，继续走既有「失败回落主会话」路径，不入队。
     pub fn queue_outbox(&self, chat_id: &str, text: &str, job_id: &str) {
-        if !self.bot.is_wechat() || chat_id.is_empty() || text.is_empty() {
+        if !self.bot.is_wechat() || text.is_empty() {
+            return;
+        }
+        // 归一化入队键：任务的 created_by.chat_id 可能是注入的 bot key / buzz 频道 UUID，
+        // 直接入队会与补发侧的平台 receive_id 键错位（缺陷 abb-wx-outbox-flush-mismatch-20260917）。
+        // 入队与补发共用同一归一化函数，保证 store.take 命中。
+        let chat_id = crate::outbox::resolve_delivery_chat(&self.bot.key(), chat_id);
+        if chat_id.is_empty() {
             return;
         }
         self.outbox.add(OutboxItem {
             id: uuid::Uuid::new_v4().to_string(),
-            chat_id: chat_id.to_string(),
+            chat_id: chat_id.clone(),
             text: text.to_string(),
             created_at: crate::chrono_lite::unix_secs(),
             attempts: 0,
@@ -31,7 +38,7 @@ impl Bridge {
         crate::log!(
             "[bot:{}] [outbox] 任务报告写入待发积压 chat={} 长度={}（当前积压 {} 条）",
             self.bot.key(),
-            trunc(chat_id, 10),
+            trunc(&chat_id, 10),
             text.chars().count(),
             self.outbox.len()
         );
@@ -43,9 +50,15 @@ impl Bridge {
         if !self.bot.is_wechat() {
             return;
         }
-        let lock = self.chat_lock(chat_id);
+        // 与入队侧共用归一化：入站 from_user_id（平台 id）幂等；若拿到的是 bot key /
+        // 频道 UUID 也归一到平台 receive_id，杜绝「入队键 ≠ 补发键」的黑洞。
+        let chat_id = crate::outbox::resolve_delivery_chat(&self.bot.key(), chat_id);
+        if chat_id.is_empty() {
+            return;
+        }
+        let lock = self.chat_lock(&chat_id);
         let _guard = lock.lock().await;
-        crate::outbox::flush_pending(self.msgr.as_ref(), &self.outbox, chat_id).await;
+        crate::outbox::flush_pending(self.msgr.as_ref(), &self.outbox, &chat_id).await;
     }
 
     /// 群消息 mentions 里是否 @了本机器人（name/app_id/open_id 三重冗余）。
