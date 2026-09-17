@@ -1422,6 +1422,68 @@ impl Config {
         v
     }
 
+    /// 把外部传入的 bot 标识收敛成**规范 key**（`BotConfig::key()`）。
+    ///
+    /// issue abb-task-botkey-dir-1：`AGENT_BRIDGE_BOT_KEY` 等入口的值会被直接当目录名用
+    /// （`tasks/<key>/`、`sessions`、`workspaces/<key>`、`outbox`…），而 service 只扫规范
+    /// key。传显示名 / `app_id` 之类别名时若原样使用，就会「登记成功」到 service 永远不看的
+    /// 目录 → 任务静默停在 Pending、零报错（现场 3 条任务停摆 12 分钟无人发现）。
+    ///
+    /// 因此别名一律在这里解析；解析不到 → 显式报错（**绝不**把未知串原样当目录名），
+    /// 命中多个 → 报歧义（不猜）。所有「外部 key → 目录」的入口都应走本函数。
+    ///
+    /// 接受：规范 key / 显示名 `name` / 运行时 bot 名 `bot_name` / `app_id` / `bot_open_id`。
+    pub fn resolve_bot_key(&self, input: &str) -> Result<String, String> {
+        let want = input.trim();
+        if want.is_empty() {
+            return Err("bot key 为空".into());
+        }
+        // 规范 key 优先且精确匹配：任何情况下都不得把输入 sanitize 后再当别名匹配，
+        // 否则会凭空造出「和别的 bot 撞名」的新别名（key_base 已负责 sanitize + -2 去重）。
+        if let Some(b) = self.bots.iter().find(|b| b.key() == want) {
+            return Ok(b.key());
+        }
+        let hits: Vec<&BotConfig> = self
+            .bots
+            .iter()
+            .filter(|b| {
+                b.name == want || b.bot_name == want || b.app_id == want || b.bot_open_id == want
+            })
+            .collect();
+        match hits.as_slice() {
+            [] => Err(format!(
+                "{want:?} 不是任何已配置 bot 的 key 或别名——\n\
+                 若照原样使用，任务会落进 service 永不扫描的目录并**静默停在 Pending**，故直接拒绝。\n\
+                 可用：{}",
+                self.bot_key_list()
+            )),
+            [one] => {
+                crate::log!("[botkey] {want:?} 是别名，已解析为规范 key {}", one.key());
+                Ok(one.key())
+            }
+            many => Err(format!(
+                "{want:?} 命中 {} 个 bot（歧义）：{}——请改用规范 key",
+                many.len(),
+                many.iter().map(|b| b.key()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    /// 列出规范 key（错误提示用）：`key（显示名）`，同名 bot 带 `-2` 后缀便于对号。
+    pub fn bot_key_list(&self) -> String {
+        self.bots
+            .iter()
+            .map(|b| {
+                if b.name.is_empty() {
+                    b.key()
+                } else {
+                    format!("{}（{}）", b.key(), b.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn is_configured(&self) -> bool {
         self.missing().is_empty()
     }
@@ -3029,4 +3091,104 @@ fn migrate_keys_swap_cycle_resolves_via_tmp() {
     assert_eq!(vb[0]["bot_key"], "a1", "bot1 登记归 a1");
     assert_eq!(vb[1]["bot_key"], "b2", "bot2 登记归 b2");
     let _ = std::fs::remove_dir_all(&base);
+}
+/// issue abb-task-botkey-dir-1：外部传进来的 bot 标识必须收敛成**规范 key**。
+///
+/// 传显示名等别名时要解析到规范 key（否则任务落进 service 不扫的目录、静默 Pending）；
+/// 解析不到要**明确报错并列可选 key**，绝不 verbatim 当目录名用。
+#[test]
+fn resolve_bot_key_accepts_aliases_and_rejects_unknown() {
+    fn bot(name: &str, app_id: &str) -> BotConfig {
+        BotConfig {
+            name: name.to_string(),
+            app_id: app_id.to_string(),
+            bot_name: format!("{name}-bot"),
+            bot_open_id: format!("ou_{app_id}"),
+            ..Default::default()
+        }
+    }
+    // bots[0]：飞书式（key 由 app_id 派生）；bots[1]：未登录/微信兜底（key 由 name 派生）
+    // bots[2]：app_id 与 sanitize 后的规范 key **不同**——只有它能证明「app_id 别名」真的走
+    // 了别名分支（若输入本身就是规范 key，会在规范 key 分支命中，测不到 app_id 谓词）。
+    let cfg = Config {
+        bots: vec![
+            bot("微信龙虾", "o9cq806Ewechat"),
+            BotConfig {
+                name: "拾言总管".to_string(),
+                ..Default::default()
+            },
+            bot("冒号", "app:alias"),
+        ],
+        ..Default::default()
+    };
+    let canonical0 = cfg.bots[0].key();
+    let canonical1 = cfg.bots[1].key();
+    let canonical2 = cfg.bots[2].key();
+    assert_eq!(canonical0, "o9cq806Ewechat", "key 由 app_id 派生（不变量）");
+    assert_eq!(
+        canonical1, "拾言总管",
+        "无 app_id 时 key 由显示名派生（不变量）"
+    );
+    assert_eq!(canonical2, "appalias", "sanitize 滤掉冒号（本用例前提）");
+    assert_ne!(
+        canonical2, cfg.bots[2].app_id,
+        "本用例前提：app_id 不等于规范 key"
+    );
+
+    // 规范 key 原样通过
+    assert_eq!(cfg.resolve_bot_key(&canonical0).unwrap(), canonical0);
+    assert_eq!(cfg.resolve_bot_key(&canonical1).unwrap(), canonical1);
+    // 显示名 / bot_name / app_id / open_id 都要能解析到规范 key
+    for alias in [
+        "微信龙虾".to_string(),
+        "微信龙虾-bot".to_string(),
+        "o9cq806Ewechat".to_string(),
+        "ou_o9cq806Ewechat".to_string(),
+    ] {
+        assert_eq!(
+            cfg.resolve_bot_key(&alias).unwrap(),
+            canonical0,
+            "别名 {alias:?} 应解析到规范 key"
+        );
+    }
+    // app_id 别名：输入 != 规范 key（见上面的 assert_ne），所以这里真走别名分支
+    assert_eq!(cfg.resolve_bot_key("app:alias").unwrap(), canonical2);
+    // 未知值：必须报错，且把可选 key 列出来（否则用户只能看到「任务没反应」）
+    let err = cfg.resolve_bot_key("隔壁老王").unwrap_err();
+    assert!(err.contains("不是任何已配置 bot"), "{err}");
+    assert!(
+        err.contains(&canonical0) && err.contains(&canonical1) && err.contains(&canonical2),
+        "错误提示必须列出可选 key：{err}"
+    );
+    assert!(
+        err.contains("PENDING") || err.contains("Pending"),
+        "要说明后果：{err}"
+    );
+    // 空白 → 明确报错；首尾空白要 trim（env 里带空格很常见）
+    assert!(cfg.resolve_bot_key("   ").is_err());
+    assert_eq!(cfg.resolve_bot_key("  微信龙虾  ").unwrap(), canonical0);
+
+    // 歧义（两个 bot 同显示名、同 app_id）→ 报错不猜
+    let dup = Config {
+        bots: vec![
+            bot("同名", "app_same"),
+            BotConfig {
+                key_suffix: "-2".to_string(),
+                ..bot("同名", "app_same")
+            },
+        ],
+        ..Default::default()
+    };
+    let err = dup.resolve_bot_key("同名").unwrap_err();
+    assert!(err.contains("歧义"), "{err}");
+    // 歧义时**规范 key**（带 -2 后缀）仍必须能唯一解析
+    assert_eq!(dup.resolve_bot_key("app_same-2").unwrap(), "app_same-2");
+
+    // 目录穿越 / 非法串绝不能原样通过（否则会写出 tasks/<越权路径>）
+    for evil in ["../../evil", "/tmp/evil", "a/b", "CON"] {
+        assert!(
+            cfg.resolve_bot_key(evil).is_err(),
+            "{evil:?} 必须被拒绝，不得当目录名"
+        );
+    }
 }
