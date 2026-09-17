@@ -33,11 +33,13 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
 - **Walgit CI runner**: `ci.toml` is only a declaration; the server does not execute
-  it. Start/supervise the local runner in screen `walgit-ci-abb` with the stable
-  main checkout:
-  `walgit --config ~/.walgit/walgit.toml ci run --repo /Volumes/DataExt/GitHub/abb --remote origin --actor ci-runner --key ~/.walgit/keys/ci-runner.ed25519`.
-  Check results with `walgit ci status --repo .`; a missing runner or zero runs is
-  not a pass.
+  it. Start/supervise the local runner with `tools/run_ci_runner.sh` from the stable
+  main checkout — it puts `TMPDIR` and `CARGO_TARGET_DIR` on the data volume, which is
+  **required**: each run otherwise builds a full `target/` tree in `$TMPDIR` on the
+  228 GiB boot volume and eventually dies with `errno=28 (No space left on device)`
+  mid-link (observed 2026-09-17). Run **exactly one** runner per host (two runners race
+  to claim the same run's tasks). Check results with `walgit ci status --repo .`; a
+  missing runner or zero runs is not a pass.
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.
