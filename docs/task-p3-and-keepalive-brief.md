@@ -1,6 +1,6 @@
 # P3 `proc` supervisor 与 keepalive：拍板决策简报
 
-> **基线**：`origin/main@0967c90`（2026-09-17）。本文只冻结决策，不改源码。下文所有 `文件:行号` 都以该 commit 为准；rebase 后必须重新核对行号。
+> **基线**：`origin/main@1850e38`（2026-09-17；复审时已按独立审查意见把引用行号校到该 commit）。本文只冻结决策，不改源码。下文所有 `文件:行号` 都以该 commit 为准；rebase 后必须重新核对行号。
 > **关联**：`docs/task-model.md`（权威任务模型，§2.3 D5/D6、§2.4 阶段表、§4 决策表）、#326（批次 issue）、#305（常驻进程）、#306（后台子任务）。
 > **阅读方式**：每个 Q 都是「问题 → 现状（可指到行）→ 选项（含代价）→ 推荐 → 验收标准」。验收标准全部是命令/断言级，不接受「体验更好」这类措辞。
 
@@ -30,7 +30,7 @@
 | 轮转链 `.log → .log.1 → .log.2`，最老丢弃 | `src/task_run.rs:678-694`（`rotate_logs`） |
 | 触发条件：写前 `meta.len() >= log_max_bytes` | `src/task_run.rs:604-606` |
 | 终态保留期 30 天 | `src/task_run.rs:68`（`LOG_RETENTION_DAYS: u64 = 30`） |
-| 30 天后只删日志，保留定义与运行态 | `src/task_run.rs:700-736`（`gc_logs`），注释 `:701-703` |
+| 30 天后只删日志，保留定义与运行态 | `src/task_run.rs:696-736`（`gc_logs`），「只删日志」注释 `:697-699` |
 | GC 每小时扫一次 | `src/task_run.rs:71`（`LOG_GC_INTERVAL_SECS`）、调用点 `:112-116` |
 | **日志是「回合结束后整段写一次」** | 唯一生产调用点 `src/task_run.rs:307`，实现 `src/task_run.rs:592-621`（`write_log`） |
 
@@ -133,7 +133,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | 该近窗去重**只查不记**（避免挡住合法重试） | `src/deliver.rs:477-479`（注释引 #254） |
 | 崩溃后恢复对 agent 载荷是**重跑整条 prompt** | `src/task_run.rs:756-793`（`requeue_orphans`），上界 `max_restarts`（`src/task_store.rs:38`） |
 | 结果投递失败只写运行态 + 告警，**不重投** | `src/task_run.rs:384-395`（`outcome.is_delivered()` 为假 → 写 `last_error` + 主会话告警） |
-| 风险表已记"任务结果重复投递" | `docs/task-model.md:381` |
+| 风险表已记"任务结果重复投递" | `docs/task-model.md:377` |
 
 **当前的实际行为**：`requeue_orphans` 只处理 `Running`（`src/task_run.rs:760-762` 的 `if rt.kind != TaskStateKind::Running { continue; }`）。任务跑完写终态后崩溃 → 状态不是 `Running` → **既不重跑也不重投** → 结果**静默丢失**（只有 `last_error` 留痕，用户要主动 `task status` 才看得到）。这是 Q11 要修的核心。
 
@@ -150,7 +150,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 **Q11 选 C：`task_id + run_seq` 作为稳定幂等键，并把"已投递"做成可恢复的持久状态。**
 
-同时必须**明确不承诺 exactly-once**：三个 IM 平台都没有已验证的端到端幂等 API，能做到的上限是「本地不重复入队 + 对平台 at-least-once 投递」。`docs/task-model.md:381` 的风险表口径保持不动。
+同时必须**明确不承诺 exactly-once**：三个 IM 平台都没有已验证的端到端幂等 API，能做到的上限是「本地不重复入队 + 对平台 at-least-once 投递」。`docs/task-model.md:377` 的风险表口径保持不动。
 
 落地要点：
 
@@ -295,7 +295,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 ### B1（P3a）proc supervisor 最小可用 ⭐ 先拍 Q14 + Q13
 
-- **范围**：新增 `proc` 执行路径（spawn / 流式 stdout+stderr drain / 等你退出 / 回收退出码），`src/task_run.rs:141-159` 的 `PayloadKind::Proc` 显式失败分支改为真实现；`src/main.rs:1184-1185` 的硬编码 `PayloadKind::Agent` 增加仅人工可用的 `--proc --cmd` 路径；`src/guard.rs:651-665` 与 `crates/buzz-agent/src/shell_policy.rs:146-157` 的拒绝测试保持（Q8 已拍板：agent 不得创建 proc）。
+- **范围**：新增 `proc` 执行路径（spawn / 流式 stdout+stderr drain / 等你退出 / 回收退出码），`src/task_run.rs:141-159` 的 `PayloadKind::Proc` 显式失败分支改为真实现；`src/main.rs:1201-1202（main@1850e38；该处只硬编码 PayloadKind::Agent，需按锚点而非行号读）` 的硬编码 `PayloadKind::Agent` 增加仅人工可用的 `--proc --cmd` 路径；`src/guard.rs:651-665` 与 `crates/buzz-agent/src/shell_policy.rs:146-157` 的拒绝测试保持（Q8 已拍板：agent 不得创建 proc）。
 - **前置**：Q14 的 grace/组信号口径；Q13 的 Windows 策略（A 或 D）。
 - **机器验收**：见 Q14 与 Q13 的验收块；外加 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo build --locked`、`tools/check_test_isolation.sh` 全绿。
 - **规模**：约 700–1200 LOC（含测试与平台适配），中高风险。主要风险是 Windows Job Object 的 `unsafe` 与 pid 身份。
