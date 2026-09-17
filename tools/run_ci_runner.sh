@@ -4,7 +4,8 @@
 # 为什么必须设 TMPDIR/CARGO_TARGET_DIR：runner 把待测 commit 检出到 $TMPDIR 下并在那里跑
 # cargo。默认 $TMPDIR 在 228 GiB 内盘上，每个 run 一份完整 target/ 树，内盘很快见底，链接期
 # 报 `errno=28 (No space left on device)`（2026-09-17 实测：内盘 97%、6 GiB 可用，
-# docs/p3-keepalive-brief 的 build 任务即因此失败）。两者都指到数据卷后构建不再吃内盘。
+# docs/p3-keepalive-brief 的 build 任务即因此失败；同日稍后内盘一度只剩 206 MiB）。
+# 约定：内盘只放系统与用户数据，**所有编译中间产物一律落 /Volumes/DataExt/tmp**。
 #
 # 用法：
 #   tools/run_ci_runner.sh              # 用 screen 托管（已在跑则直接复用，不重复启动）
@@ -15,8 +16,8 @@
 set -eu
 
 repo=${ABB_REPO:-/Volumes/DataExt/GitHub/abb}
-tmp=${ABB_CI_TMP:-/Volumes/DataExt/ci-tmp}
-target=${ABB_CI_TARGET:-$repo/target-ci}
+tmp=${ABB_CI_TMP:-/Volumes/DataExt/tmp}
+target=${ABB_CI_TARGET:-/Volumes/DataExt/tmp/abb-ci-target}
 config=${WALGIT_CONFIG:-$HOME/.walgit/walgit.toml}
 key=${ABB_CI_KEY:-$HOME/.walgit/keys/ci-runner.ed25519}
 screen_name=${ABB_CI_SCREEN:-walgit-ci-abb}
@@ -53,10 +54,10 @@ case "${1:-}" in
         ;;
     "")
         if screen -ls 2>/dev/null | grep -q "[.]${screen_name}[[:space:]]"; then
-            echo "runner 已在 screen $screen_name 中运行（不重复启动）"
+            echo "runner 已在 screen ${screen_name} 中运行（不重复启动）"
             exit 0
         fi
         screen -dmS "$screen_name" "$launcher"
-        echo "CI runner 已启动：screen -r $screen_name（TMPDIR=$tmp CARGO_TARGET_DIR=$target）"
+        echo "CI runner 已启动：screen -r ${screen_name}（TMPDIR=${tmp} CARGO_TARGET_DIR=${target}）"
         ;;
 esac

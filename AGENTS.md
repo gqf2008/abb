@@ -32,27 +32,52 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 - **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
+- **Build intermediates go to `/Volumes/DataExt/tmp`** (user policy, 2026-09-17): the
+  228 GiB boot volume must not hold build output. Use
+  `CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target` for local gates and
+  `export TMPDIR=/Volumes/DataExt/tmp` for anything that makes temp trees. Falling back
+  to the default `target/` or `$TMPDIR` fills the boot volume and manifests as an
+  `errno=28 (No space left on device)` link failure — not as a code failure.
 - **Walgit CI runner**: `ci.toml` is only a declaration; the server does not execute
   it. Start/supervise the local runner with `tools/run_ci_runner.sh` from the stable
-  main checkout — it puts `TMPDIR` and `CARGO_TARGET_DIR` on the data volume, which is
-  **required**: each run otherwise builds a full `target/` tree in `$TMPDIR` on the
-  228 GiB boot volume and eventually dies with `errno=28 (No space left on device)`
-  mid-link (observed 2026-09-17). Run **exactly one** runner per host (two runners race
-  to claim the same run's tasks). Check results with `walgit ci status --repo .`; a
-  missing runner or zero runs is not a pass.
+  main checkout — it sets `TMPDIR=/Volumes/DataExt/tmp` and
+  `CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-ci-target` (required, see above). Run
+  **exactly one** runner per host (two runners race to claim the same run's tasks).
+  Check results with `walgit ci status --repo .`; a missing runner or zero runs is not
+  a pass.
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.
 
 ## Build, Test, and Development Commands
 
+Every cargo command below **must** carry the build-intermediate env prefix (user policy:
+build output never lands on the 228 GiB boot volume):
+
+```sh
+export TMPDIR=/Volumes/DataExt/tmp
+export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
+```
+
 - `cargo build` — debug build.
 - `cargo run` — run the tray app; `cargo run -- --service` runs the headless daemon.
-- `cargo test` — run all unit tests.
+- `cargo test` — run all unit tests (**do not** run this directly on a live machine: it
+  writes the real `~/.agent-bridge`; use `tools/check_test_isolation.sh` instead).
 - `cargo clippy --all-targets -- -D warnings` — lint.
 - `cargo fmt --check` — verify formatting.
+- `tools/check_test_isolation.sh` — the full-test gate (isolated HOME; never substitute
+  a bare `cargo test`).
 - `scripts/build.sh` — build the release macOS bundle into `~/Applications/ABB.app`.
 - `scripts/sign.sh` — re-sign with the `agent-bridge-dev` certificate so TCC privacy grants survive rebuilds.
+
+With the two exports above in the shell, the four gate commands are verbatim:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo build --locked
+tools/check_test_isolation.sh
+```
 
 ## Coding Style & Naming Conventions
 
@@ -73,9 +98,11 @@ Runtime data lives in `~/.agent-bridge/`; per-bot workspaces under `~/.agent-bri
 - Keep commits focused and explain *why* in the body.
 - Walgit patch/PR entries: describe what and why, link the issue thread, and run
   `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo build --locked`, and `tools/check_test_isolation.sh` (the isolated test
-  runner is the full-test gate; do not substitute a bare `cargo test` because it
-  can write the real `~/.agent-bridge`). Include before/after screenshots for UI
+  `cargo build --locked`, and `tools/check_test_isolation.sh` **with
+  `TMPDIR=/Volumes/DataExt/tmp CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target`
+  exported** (see Build/Test above). The isolated test runner is the full-test gate;
+  do not substitute a bare `cargo test` because it can write the real
+  `~/.agent-bridge`. Include before/after screenshots for UI
   changes. GitHub PRs are only for mirror/release maintenance.
 
 ## Security & Configuration
