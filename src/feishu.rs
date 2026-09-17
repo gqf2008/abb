@@ -271,33 +271,75 @@ impl FeishuClient {
             } else {
                 chunk
             };
-            let resp: serde_json::Value = self
-                .http
-                .post(self.url("/im/v1/messages?receive_id_type=chat_id"))
-                .bearer_auth(&token)
-                .json(&json!({
-                    "receive_id": chat_id,
-                    "msg_type": "interactive",
-                    // 卡片 markdown 元素：飞书渲染 markdown 成富文本（对齐微信原生渲染）
-                    "content": serde_json::to_string(&json!({
-                        "elements": [{"tag":"markdown","content": body_text}]
-                    }))?,
-                }))
-                .send()
-                .await?
-                .json()
+            // 卡片 markdown + 纯文本降级（见 post_text_card_with_fallback：
+            // API 级失败必须上报，不能让调用方以为发成功了；卡片被拒时还要保证内容能落地）。
+            self.post_text_card_with_fallback(&token, "chat_id", chat_id, &body_text)
                 .await?;
-            if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-                // API 级失败必须上报（不能只 log 返回 Ok）：否则调用方以为发成功了，
-                // 定时任务回落主会话等重试路径全成死代码，用户收不到回复也无任何痕迹。
-                anyhow::bail!(
-                    "发送失败 code={:?} msg={:?}",
-                    resp.get("code"),
-                    resp.get("msg")
-                );
-            }
         }
         Ok(())
+    }
+
+    /// 发一段文本：**先卡片 markdown，失败则降级纯文本重发一次**。
+    ///
+    /// 为什么要降级（2026-09-17 实测）：ABB 的文本都走 `interactive` 卡片的 markdown
+    /// 元素，而卡片对内容有额外约束——例如 markdown 里出现图片（`![alt](url)`）但没有
+    /// `image_key` 时，服务端直接拒整条消息：
+    /// `code=230099 … ext=ErrCode: 11310 the card contains images but no imagekey is passed in`。
+    /// 调用方是任务结果/回复投递，被拒 = 用户什么都收不到，所以必须有兜底。
+    /// 纯文本没有这些约束；降级成功会记一行日志（排障时能看到「这条是降级发出去的」）。
+    async fn post_text_card_with_fallback(
+        &self,
+        token: &str,
+        receive_id_type: &str,
+        receive_id: &str,
+        body_text: &str,
+    ) -> Result<()> {
+        let url = self.url(&format!(
+            "/im/v1/messages?receive_id_type={receive_id_type}"
+        ));
+        let card: serde_json::Value = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&json!({
+                "receive_id": receive_id,
+                "msg_type": "interactive",
+                // 卡片 markdown 元素：飞书渲染 markdown 成富文本（对齐微信原生渲染）
+                "content": serde_json::to_string(&json!({
+                    "elements": [{"tag":"markdown","content": sanitize_card_markdown(body_text)}]
+                }))?,
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if card.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok(());
+        }
+        let card_err = format!("code={:?} msg={:?}", card.get("code"), card.get("msg"));
+        let plain: serde_json::Value = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&json!({
+                "receive_id": receive_id,
+                "msg_type": "text",
+                "content": serde_json::to_string(&json!({ "text": body_text }))?,
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if plain.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            crate::log!("[feishu] 卡片发送失败（{card_err}）→ 已降级为纯文本发出");
+            return Ok(());
+        }
+        // 两条路都失败：如实上报（含卡片侧原因），调用方据此走回落/告警
+        anyhow::bail!(
+            "发送失败（卡片：{card_err}；纯文本降级亦失败：code={:?} msg={:?}）",
+            plain.get("code"),
+            plain.get("msg")
+        );
     }
 
     /// 回复指定消息（飞书话题消息回复走这里）：以 message_id 为回复目标，
@@ -323,12 +365,31 @@ impl FeishuClient {
                 .json()
                 .await?;
             if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-                // API 级失败必须上报（同 send_text）：否则调用方以为回复成功，
-                // 用户在话题里收不到任何回复也无痕迹。
+                // 话题回复同样要兜底：卡片被拒（例如漏网的图片语法触发 230099/11310）
+                // 时，用户在话题里会**一个字都收不到**。降级纯文本再试一次，
+                // 两条都失败才如实上报（调用方据此走回落/告警）。
+                let card_err = format!("code={:?} msg={:?}", resp.get("code"), resp.get("msg"));
+                let plain: serde_json::Value = self
+                    .http
+                    .post(self.url(&format!("/im/v1/messages/{message_id}/reply")))
+                    .bearer_auth(&token)
+                    .json(&json!({
+                        "msg_type": "text",
+                        "content": serde_json::to_string(&json!({ "text": body_text }))?,
+                        "reply_in_thread": true,
+                    }))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                if plain.get("code").and_then(|c| c.as_i64()) == Some(0) {
+                    crate::log!("[feishu] 话题回复卡片失败（{card_err}）→ 已降级为纯文本发出");
+                    continue;
+                }
                 anyhow::bail!(
-                    "回复失败 code={:?} msg={:?}",
-                    resp.get("code"),
-                    resp.get("msg")
+                    "回复失败（卡片：{card_err}；纯文本降级亦失败：code={:?} msg={:?}）",
+                    plain.get("code"),
+                    plain.get("msg")
                 );
             }
         }
@@ -828,28 +889,10 @@ impl FeishuClient {
             } else {
                 chunk
             };
-            let resp: serde_json::Value = self
-                .http
-                .post(self.url("/im/v1/messages?receive_id_type=open_id"))
-                .bearer_auth(&token)
-                .json(&json!({
-                    "receive_id": open_id,
-                    "msg_type": "interactive",
-                    "content": serde_json::to_string(&json!({
-                        "elements": [{"tag":"markdown","content": body_text}]
-                    }))?,
-                }))
-                .send()
-                .await?
-                .json()
+            // 同 send_text：卡片优先 + 纯文本降级（授权指引这类关键通知更不能因为
+            // 「卡片里带了图片语法」整条被拒）。
+            self.post_text_card_with_fallback(&token, "open_id", open_id, &body_text)
                 .await?;
-            if resp.get("code").and_then(|c| c.as_i64()) != Some(0) {
-                anyhow::bail!(
-                    "发给用户失败 code={:?} msg={:?}",
-                    resp.get("code"),
-                    resp.get("msg")
-                );
-            }
         }
         Ok(())
     }
@@ -895,7 +938,7 @@ fn reply_markdown_body(body_text: &str) -> serde_json::Value {
     json!({
         "msg_type": "interactive",
         "content": serde_json::to_string(&json!({
-            "elements": [{"tag":"markdown","content": body_text}]
+            "elements": [{"tag":"markdown","content": sanitize_card_markdown(body_text)}]
         })).unwrap_or_default(),
         "reply_in_thread": true,
     })
@@ -905,6 +948,155 @@ fn reply_markdown_body(body_text: &str) -> serde_json::Value {
 /// 代码块 fence（```）保护：超限时只在非代码块状态切，避免代码块跨段断裂
 /// （飞书/微信分段发多条时，代码块被切到两条会破坏渲染）。三端共用此分段
 /// （飞书/微信 3500、钉钉 8000），故保护对三端均生效。
+/// 卡片 markdown 的安全化：把**图片节点**降级成文字。
+///
+/// 为什么必须做（2026-09-17 实测）：ABB 所有文本都走飞书 `interactive` 卡片的 markdown
+/// 元素，而卡片里的图片必须先用 `im/v1/images` 上传换到 `image_key`。`![alt](url)` /
+/// `<img src=…>` 这种「URL 型图片」服务端不认——它判定「卡片包含图片但没有 imagekey」，
+/// **整条消息被拒**：
+/// ```text
+/// code=Some(Number(230099)) … ext=ErrCode: 11310
+/// the card contains images but no imagekey is passed in
+/// ```
+/// 任务结果/回复一旦被拒，用户就**什么都收不到**（只剩一条投递失败告警）。
+///
+/// 实现方式：**用 CommonMark parser 定位图片节点，再按字节区间回填**——不再手写词法扫描。
+/// 手写版连续两轮被独立审查证伪（多反引号行内代码、四反引号围栏里嵌三反引号、行中三反引号
+/// 误开围栏、代码块里的 `<!--` 污染注释状态、引用式图片误吞普通文本……），根因是「markdown
+/// 惰性上下文」本身就是 CommonMark 语法，必须交给 parser：
+/// - `Parser::new(text).into_offset_iter()` 给出每个事件的**源字节区间**；
+/// - 只有 `Tag::Image` 与内含 `<img` 的 HTML 事件才改写，其余区间**逐字照抄**——
+///   代码围栏 / 行内代码 / 转义 / 注释里的 `![` 因此天然不会被误改（parser 不把它们当图片）；
+/// - 引用式 `![a][ref]`、shortcut `![a]` 也由 parser 统一识别，不会漏也不会误吞正文。
+///
+/// 保留与闭合约定：
+/// - `![hover](img_v3_xxx)` 是「已上传图片」的合法写法，**原样保留**（只降级 URL/未知引用）；
+/// - 回填的 alt/url 都先经 `neutralize_image_syntax`，保证一次 sanitize 之后输出里不再有
+///   可解析的 `![` / `<img`（含 `![<img src=x>](url)` 这种 alt 逃逸）。
+///
+/// 真要发图请走 `deliver --file`（那条通道会真的上传并拿 image_key）。
+pub(crate) fn sanitize_card_markdown(text: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0usize; // 已照抄到的字节位置
+    let mut img_start = 0usize;
+    let mut img_url = String::new();
+    let mut alt = String::new();
+    let mut depth = 0usize; // >0 = 正在图片节点内部
+
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        if depth > 0 {
+            match event {
+                Event::Start(Tag::Image { .. }) => depth += 1,
+                Event::Text(t) | Event::Code(t) => alt.push_str(&t),
+                Event::SoftBreak | Event::HardBreak => alt.push(' '),
+                Event::End(TagEnd::Image) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if is_real_image_key(&img_url) {
+                            out.push_str(&text[img_start..range.end]);
+                        } else {
+                            emit_image_text(&mut out, alt.trim(), &img_url);
+                        }
+                        alt.clear();
+                        copied = range.end;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match &event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                out.push_str(&text[copied..range.start]);
+                img_start = range.start;
+                img_url = dest_url.to_string();
+                alt.clear();
+                depth = 1;
+            }
+            // HTML 形式的内联/块级 `<img …>`：pulldown-cmark 不把它当图片节点，
+            // 但飞书卡片会（11310 就是这么来的），所以同样要中和。
+            // ⚠️ **只中和 `<img`，不能整块替换**：`Event::Html` 的区间可能是一整段
+            // 块级 HTML（含注释/多个标签），整块换成「（图片）」会**丢正文**（独立审查指出）。
+            Event::InlineHtml(raw) | Event::Html(raw)
+                if raw.to_ascii_lowercase().contains("<img") =>
+            {
+                out.push_str(&text[copied..range.start]);
+                // 只中和 HTML 标签形式的 `<img`：这段区间里的 `![` 是**字面量**
+                // （HTML 块/注释不是 markdown），一起改写就是内容损坏（独立审查 P1）。
+                out.push_str(&neutralize_html_img_tags(raw));
+                copied = range.end;
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// `img_` 开头的、没有空白的引用 = 已经上传好的 image_key（卡片规范允许），原样保留。
+fn is_real_image_key(url: &str) -> bool {
+    let u = url.trim();
+    u.starts_with("img_") && !u.chars().any(char::is_whitespace)
+}
+
+/// 把图片改写成文字，并**中和**回填内容里的图片语法（保证一次 sanitize 之后闭合）。
+fn emit_image_text(out: &mut String, alt: &str, url: &str) {
+    let alt = neutralize_image_syntax(alt.trim());
+    out.push_str(if alt.is_empty() {
+        "图片"
+    } else {
+        alt.as_str()
+    });
+    out.push_str("（图片：");
+    out.push_str(&neutralize_image_syntax(url.trim()));
+    out.push('）');
+}
+
+/// 只中和 HTML 标签形式的 `<img`（大小写不敏感 → `< img`），**不动 `![`**。
+/// 用于 HTML 事件区间：那里的 `![a](b)` 是字面量文本，不是 markdown 图片。
+fn neutralize_html_img_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < s.len() {
+        if bytes[i] == b'<' && s.len() - i >= 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"<img") {
+            out.push_str("< img");
+            i += 4;
+            continue;
+        }
+        let ch = s[i..].chars().next().expect("i 落在字符边界");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 把可能残留的图片语法中和成纯文本（`![` → `[`，`<img` → `< img`）。
+/// alt 与 url 回填都要过这一关，否则 sanitizer 自己会把图片节点放回卡片。
+fn neutralize_image_syntax(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < s.len() {
+        if bytes[i] == b'!' && bytes.get(i + 1) == Some(&b'[') {
+            out.push('[');
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'<' && s.len() - i >= 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"<img") {
+            out.push_str("< img");
+            i += 4;
+            continue;
+        }
+        let ch = s[i..].chars().next().expect("i 落在字符边界");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub fn split_text(text: &str, limit: usize) -> Vec<String> {
     let char_count = text.chars().count();
     if char_count <= limit {
@@ -1390,6 +1582,262 @@ mod tests {
         assert!(up.body.contains("pdf"), "file_type 应为 pdf");
         assert!(up.body.contains("report.pdf"), "应含文件名");
         assert!(up.body.contains("PDF-CONTENT-001"), "应含文件字节");
+    }
+
+    /// 卡片 markdown 安全化：图片语法必须被改写成文字（否则飞书整条卡片被拒，
+    /// 报 `230099 / ext 11310 the card contains images but no imagekey is passed in`）。
+    #[test]
+    fn sanitize_card_markdown_neutralizes_image_syntax() {
+        // markdown 图片（有 alt / 无 alt）
+        assert_eq!(
+            sanitize_card_markdown("![截图](/tmp/a.png)"),
+            "截图（图片：/tmp/a.png）"
+        );
+        assert_eq!(
+            sanitize_card_markdown("![](http://x/y.png)"),
+            "图片（图片：http://x/y.png）"
+        );
+        // 裸 HTML img：**就地中和**（`<img` → `< img`，判定不再是标签），
+        // 不整块替换、不丢正文（独立审查指出块级 HTML 整块替换会丢内容）
+        assert_eq!(
+            sanitize_card_markdown(r#"看这个 <img src="x.png"> 图"#),
+            r#"看这个 < img src="x.png"> 图"#
+        );
+        // URL 里带括号（只吃一层嵌套括号）
+        assert_eq!(
+            sanitize_card_markdown("![a](http://x/(y).png)"),
+            "a（图片：http://x/(y).png）"
+        );
+        // 普通文本 / 普通链接不受影响
+        assert_eq!(
+            sanitize_card_markdown("[链接](https://a) 与 `代码!` 与 a![b"),
+            "[链接](https://a) 与 `代码!` 与 a![b"
+        );
+        // 语法不完整时**原样保留**（宁可少改写，也不能吞内容）
+        assert_eq!(sanitize_card_markdown("![未闭合"), "![未闭合");
+        assert_eq!(sanitize_card_markdown("![a](没右括号"), "![a](没右括号");
+        // 多字节字符不能被按字节切断
+        assert_eq!(
+            sanitize_card_markdown("中文![图](a.png)中文"),
+            "中文图（图片：a.png）中文"
+        );
+        // 多个图片
+        assert_eq!(
+            sanitize_card_markdown("![一](1.png)和![二](2.png)"),
+            "一（图片：1.png）和二（图片：2.png）"
+        );
+    }
+
+    /// 审查边界矩阵（两轮）：惰性上下文不得被改写、引用式/短式图片必须覆盖、
+    /// alt 也不得把 `<img>` 放回去、输出必须闭合（无 `![` / `<img`）。
+    /// 全部由 CommonMark parser 保证——手写词法版在这些用例上连续被证伪。
+    #[test]
+    fn sanitize_card_markdown_respects_inert_contexts_and_image_keys() {
+        // ① 惰性上下文：代码围栏 / 行内代码（含多反引号）/ 转义 / HTML 注释
+        for keep in [
+            "```text\n![a](b)\n```",
+            "`![a](b)`",
+            "``![a](b)``",
+            r"\![a](b)",
+            "<!-- ![a](b) -->",
+            // 四反引号围栏里嵌三反引号：不得提前关闭
+            "````\n```\n![a](b)\n````",
+            // 行中三反引号不是围栏；行首围栏里的 `foo ``` …` 也不是关闭行
+            "```\nfoo ``` ![a](b)\n```",
+            // 围栏里的 `<!--` 是字面量（不污染注释状态）
+            "```\n<!-- ![a](b) -->\n```",
+        ] {
+            assert_eq!(
+                sanitize_card_markdown(keep),
+                keep,
+                "惰性上下文不得改写：{keep:?}"
+            );
+        }
+        // 围栏关闭后恢复正常改写
+        assert_eq!(
+            sanitize_card_markdown("```\ncode\n```\n![a](b)"),
+            "```\ncode\n```\na（图片：b）"
+        );
+        // 围栏内的 `<!--` 不污染注释状态：围栏关闭后，后面的真实图片**必须**被安全化
+        // （旧手写版因为把代码块里的 `<!--` 记成「注释开始」，这里会漏改）
+        assert_eq!(
+            sanitize_card_markdown("```\n<!--\n```\n![a](b)\n```"),
+            "```\n<!--\n```\na（图片：b）\n```"
+        );
+        // 行中三反引号不是围栏 → 后面的图片照常安全化
+        assert_eq!(
+            sanitize_card_markdown("x ``` ![a](b)"),
+            "x ``` a（图片：b）"
+        );
+        // ② 合法 image_key 保留（那是「已上传图片」的正确写法）
+        assert_eq!(
+            sanitize_card_markdown("![hover](img_v3_abc)"),
+            "![hover](img_v3_abc)"
+        );
+        // ③ 引用式 / 短式图片：解析出真实 URL 并降级
+        assert_eq!(
+            sanitize_card_markdown("![图][ref]\n\n[ref]: https://x/y.png"),
+            "图（图片：https://x/y.png）\n\n[ref]: https://x/y.png"
+        );
+        assert_eq!(
+            sanitize_card_markdown("![图]\n\n[图]: https://x/y.png"),
+            "图（图片：https://x/y.png）\n\n[图]: https://x/y.png"
+        );
+        // ④ 畸形文本不得被误吞（旧手写版会把这两条改坏）
+        assert_eq!(sanitize_card_markdown("![a]x]"), "![a]x]");
+        assert_eq!(
+            sanitize_card_markdown("![a]\n\n[b]: https://x/y"),
+            "![a]\n\n[b]: https://x/y"
+        );
+        // ⑤ 闭合性：URL 与 **alt** 里的图片语法都要被中和
+        let out = sanitize_card_markdown("![a](x![b](c))");
+        assert!(!out.contains("!["), "一次 sanitize 后不得再有 ![：{out}");
+        let alt_escape = sanitize_card_markdown("![<img src=x>](url)");
+        assert!(
+            !alt_escape.to_ascii_lowercase().contains("<img"),
+            "alt 回填不得把 <img> 放回卡片：{alt_escape}"
+        );
+        // ⑥ 非字符边界不得 panic（审查最小复现：`<😀`）
+        assert_eq!(sanitize_card_markdown("<😀"), "<😀");
+        assert_eq!(sanitize_card_markdown("<😀![a](b)"), "<😀a（图片：b）");
+        // ⑥b 块级 HTML 里含 `<img>`：只中和图片标签，**其余文字不能丢**
+        let html_block = sanitize_card_markdown("<div>保留这段文字 <img src=x> 结尾</div>");
+        assert!(
+            !html_block.to_ascii_lowercase().contains("<img"),
+            "不得再把 <img> 放回卡片：{html_block}"
+        );
+        assert!(
+            html_block.contains("保留这段文字") && html_block.contains("结尾"),
+            "块级 HTML 只该中和 <img，不得整块替换丢正文：{html_block}"
+        );
+        // ⑥c HTML 区间里只中和 `<img`，**字面量 `![` 必须原样保留**（审查 P1：
+        // 之前误用完整 neutralize，把 HTML 块/注释里的 `![a](b)` 也改成了 `[a](b)`）
+        assert_eq!(
+            sanitize_card_markdown("<div>literal ![a](b) <img src=x></div>"),
+            "<div>literal ![a](b) < img src=x></div>"
+        );
+        assert_eq!(
+            sanitize_card_markdown("<!-- ![a](b) <img src=x> -->"),
+            "<!-- ![a](b) < img src=x> -->"
+        );
+        // ⑦ 大小写 / 跨行 img：同样就地中和（大小写不敏感、跨行也覆盖）
+        assert_eq!(
+            sanitize_card_markdown("<IMG src=\"x\"/>"),
+            "< img src=\"x\"/>"
+        );
+        assert_eq!(sanitize_card_markdown("<img\n src=x>"), "< img\n src=x>");
+    }
+
+    /// 卡片成功时**不得**多发一条降级消息。
+    #[tokio::test]
+    async fn send_text_card_success_sends_exactly_one_message() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/messages".to_string()),
+            json!({"code": 0, "msg": "success", "data": {"message_id": "om_1"}}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        fs.send_text("oc_1", "![截图](/tmp/a.png)").await.unwrap();
+        let msgs: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/im/v1/messages")
+            .cloned()
+            .collect();
+        assert_eq!(msgs.len(), 1, "卡片成功就不该有降级重发");
+        assert_eq!(msgs[0].query, "receive_id_type=chat_id");
+        let body: serde_json::Value = serde_json::from_str(&msgs[0].body).unwrap();
+        assert_eq!(body["msg_type"], "interactive");
+        let content = body["content"].as_str().unwrap();
+        assert!(
+            !content.contains("!["),
+            "卡片内容不得再带 markdown 图片语法：{content}"
+        );
+        assert!(
+            content.contains("图片：/tmp/a.png"),
+            "应保留图片链接文字：{content}"
+        );
+    }
+
+    /// 话题回复同样要有兜底：卡片被拒时必须再发一条 `msg_type=text` 的回复
+    /// （否则用户在话题里一个字都收不到）。
+    #[tokio::test]
+    async fn reply_text_falls_back_to_plain_text_when_card_rejected() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            (
+                "POST".to_string(),
+                "/im/v1/messages/om_root/reply".to_string(),
+            ),
+            json!({"code": 230099, "msg": "ext=ErrCode: 11310; the card contains images but no imagekey"}),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        let err = fs
+            .reply_text("om_root", "![图](/tmp/a.png)")
+            .await
+            .unwrap_err();
+        let replies: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/im/v1/messages/om_root/reply")
+            .cloned()
+            .collect();
+        assert_eq!(replies.len(), 2, "卡片失败后必须再尝试一条纯文本回复");
+        let first: serde_json::Value = serde_json::from_str(&replies[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&replies[1].body).unwrap();
+        assert_eq!(first["msg_type"], "interactive");
+        assert_eq!(second["msg_type"], "text");
+        assert_eq!(second["reply_in_thread"], true, "降级回复仍要在话题里");
+        assert!(err.to_string().contains("11310"), "{err}");
+    }
+
+    /// 卡片被拒（230099/11310 这一类）时，必须**自动降级为纯文本**再发一次。
+    #[tokio::test]
+    async fn send_text_falls_back_to_plain_text_when_card_rejected() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            ("POST".to_string(), "/im/v1/messages".to_string()),
+            json!({
+                "code": 230099,
+                "msg": "Failed to create card content, ext=ErrCode: 11310; ErrMsg: the card contains images but no imagekey is passed in; "
+            }),
+        );
+        let server = mock_server(routes).await;
+        let fs = FeishuClient::with_base("cli_a", "secret", &server.base);
+        // mock 对同一路由始终返回同一响应 → 降级也会失败，于是整体返回 Err；
+        // 这里要验证的是「确实尝试了降级且第二条是纯文本」+ 错误里带两侧原因。
+        let err = fs
+            .send_text("oc_1", "![截图](/tmp/a.png)")
+            .await
+            .unwrap_err();
+        let msgs: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/im/v1/messages")
+            .cloned()
+            .collect();
+        assert_eq!(msgs.len(), 2, "卡片失败后必须再尝试一条纯文本");
+        let first: serde_json::Value = serde_json::from_str(&msgs[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&msgs[1].body).unwrap();
+        assert_eq!(first["msg_type"], "interactive");
+        assert_eq!(second["msg_type"], "text", "降级必须是纯文本");
+        let plain: serde_json::Value =
+            serde_json::from_str(second["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            plain["text"], "![截图](/tmp/a.png)",
+            "降级文本必须保留原始内容（纯文本不会被卡片校验拒）"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("11310"), "错误应带卡片侧原因：{msg}");
+        assert!(msg.contains("纯文本降级"), "错误应说明降级也失败：{msg}");
     }
 
     #[tokio::test]
