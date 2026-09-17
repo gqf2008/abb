@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v7";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v8";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -81,6 +81,35 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 用户要的东西**要跑很久**（超过一两分钟）或明确说「后台跑 / 慢慢跑 / 跑完告诉我 / 别占着
 会话」时，别在本回合里干等：用 `\"$ABB_BIN\" task add` 把它丢到后台，回一句「已丢后台，跑完发你」
 就结束本回合。反过来，需要多轮澄清、要边做边确认、几步就能做完的，自己做完，不要委派。
+
+**编程类长任务尤其要走子代理**：改代码、跨文件重构、跑测试/门禁、大范围排查这类活，单回合
+硬做往往十几分钟起步，用户在这期间既看不到进度、也发不进新消息。一律 `task add` 交给后台
+子代理，本回合只做三件事——**拆任务、写清验收标准、点明关键文件**——然后立刻结束回合。
+不要「我自己做更快」：更快的前提是用户能看见你，而这个通道一次只承载一个回合。
+
+**委派了就必须立刻告诉用户**：只要这条活是子代理/后台任务在干，本回合最后一句必须**明确
+写清「已经交给子代理在后台跑」**（跑到哪一步、跑完会自动发回来），不能让用户以为还捏在你手里。
+用户问进度时，用 `\"$ABB_BIN\" task status <id>` / `task logs <id>`（要历史段加 `--all`）如实回答；
+**不要**为了「盯一下」就在本回合 sleep/while 轮询。
+
+**要持续监控 → 建定时监控任务，别挂循环**：需要「每 N 分钟看一眼、异常就报」时，用 `job add`
+建一条定时任务去做这件事，自己退出：
+
+```sh
+\"$ABB_BIN\" job add --cron \"*/10 * * * *\" --prompt \"检查后台任务 <id> 的状态与日志（task status / task logs <id> --all）：若失败、超时或长时间 Pending，用一句话把原因与建议报给我；正常就只回一行当前状态。\"
+```
+
+（`task` 是「一次性把活干完」，`job` 是「到点唤起一个回合」——监控属于后者；两者都不要在本回合里等。）
+
+**⚠️ 权限边界（受限/授权者会话必读）**：受限会话的 `$ABB_BIN` 白名单**只放行 `task add` 与 `job add`**——
+`task list/status/logs/rm/cancel`、`job list/del` 会被闸直接拒（它们能暴露或删改 owner 的任务）。
+所以在受限会话里：
+
+- **只能建、不能查**：上面的「每 10 分钟查 `task status`」监控任务**建不了也别建**（执行时会一遍遍撞闸）。
+  受限会话要盯进度，只能靠**任务完成时自动回投的那条结果**——本回合说清「交给子代理了、跑完自动发你」就够。
+- 需要真正的周期巡检（含读状态），请让 **owner 在自己的会话/终端**里建与查。
+
+owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` / `task cancel <id>` 都能用。
 
 **用法**（下面是 `\"$ABB_BIN\" task --help` 的输出原文；改了 CLI，这里会跟着变）：
 
@@ -941,9 +970,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #312 验收②：marker v6 → v7 触发**存量**工作区自动覆盖升级（且只升一次）。
+    /// #312 验收② / v8：marker v6 → v8 触发**存量**工作区自动覆盖升级（且只升一次）。
+    /// v8 新增「编程类长任务走子代理 + 委派必须立刻告知用户 + 用定时任务监控」三条硬规则。
     #[test]
-    fn workspace_guide_upgrades_v6_marker_to_v7() {
+    fn workspace_guide_upgrades_v6_marker_to_v8() {
         let dir = std::env::temp_dir().join(format!("abb-guide-v6-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let v6 = "# ABB 工作区（abb-guide-v6）\n\n## 其它\n\n- 旧 v6 正文\n";
@@ -953,13 +983,53 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v7"), "{name} 应升到 v7");
+            assert!(text.contains("abb-guide-v8"), "{name} 应升到 v8");
             assert!(!text.contains("abb-guide-v6"), "{name} 不应留 v6 marker");
             assert!(!text.contains("旧 v6 正文"), "{name} 旧正文应被整体替换");
-            assert!(text.contains("## 后台子代理"), "{name} 应含 v7 新小节");
+            assert!(text.contains("## 后台子代理"), "{name} 应含子代理小节");
+            // v8 三条硬规则必须真的落进指引（缺任意一条都退回「用户看不见进度」的老问题）
+            assert!(
+                text.contains("编程类长任务尤其要走子代理"),
+                "{name} 缺「编程类长任务走子代理」"
+            );
+            assert!(
+                text.contains("委派了就必须立刻告诉用户"),
+                "{name} 缺「委派要立刻告知用户」"
+            );
+            assert!(
+                text.contains("要持续监控 → 建定时监控任务"),
+                "{name} 缺「定时监控任务」"
+            );
+            // 审查补充：监控指引必须带**权限边界**——受限会话白名单只放行 task add / job add，
+            // 「每 10 分钟查 task status」在受限会话里会一遍遍撞闸（删掉这段即红）。
+            assert!(
+                text.contains("权限边界（受限/授权者会话必读）") && text.contains("只能建、不能查"),
+                "{name} 缺「受限会话只能建不能查」的权限边界"
+            );
         }
 
-        // 幂等：已是 v7 不再重写（mtime 不变）
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 审查补充：**存量 v7 工作区**（这次升级真正要覆盖的那批）也必须被升到 v8——
+        // 只种 v6 的用例证明不了「从上一个版本升上来」这条路径。
+        let dir = std::env::temp_dir().join(format!("abb-guide-v7-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v7 = "# ABB 工作区（abb-guide-v7）\n\n## 后台子代理 → 长任务丢后台，别堵会话\n\n- 旧 v7 正文\n";
+        std::fs::write(dir.join("CLAUDE.md"), v7).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), v7).unwrap();
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains("abb-guide-v8"), "{name} 应从 v7 升到 v8");
+            assert!(!text.contains("abb-guide-v7"), "{name} 不应留 v7 marker");
+            assert!(!text.contains("旧 v7 正文"), "{name} 旧正文应被整体替换");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = std::env::temp_dir().join(format!("abb-guide-v8-idem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ensure_workspace_guide(&dir);
+        // 幂等：已是 v8 不再重写（mtime 不变）
         let m = |n: &str| std::fs::metadata(dir.join(n)).unwrap().modified().unwrap();
         let before = (m("CLAUDE.md"), m("AGENTS.md"));
         std::thread::sleep(std::time::Duration::from_millis(20));
