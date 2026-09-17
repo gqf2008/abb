@@ -110,6 +110,39 @@ fn file_sig(path: &std::path::Path) -> Option<(SystemTime, u64)> {
         .and_then(|m| Some((m.modified().ok()?, m.len())))
 }
 
+/// 「不存在才建」的落地动作：优先 `hard_link`（NTFS 同卷零拷贝、原子且天然不覆盖），
+/// **硬链接不可用**（exFAT/FAT32/网络盘、跨设备等——如 ~/.agent-bridge → F: exFAT
+/// junction）时退化为 `fs::rename`：tmp 与 bak 同目录同卷，rename 原子；调用前已由
+/// [`SessionStore::archive_original`] 确认 bak 不存在，故不会覆盖任何既有备份。
+///
+/// 返回 true = 已完成归档（含并发下「已存在」）。`link_or_rename_with` 把「建硬链接」
+/// 抽成可注入的 `linker`，便于单测模拟「硬链接不可用」的文件系统（不必真去挂 exFAT）。
+fn link_or_rename(tmp: &std::path::Path, bak: &std::path::Path) -> bool {
+    link_or_rename_with(tmp, bak, hard_link_native)
+}
+
+/// 生产用「建硬链接」动作：包一层具名 `fn`，好让泛型的 `fs::hard_link` 退化为
+/// 具体的 `fn(&Path, &Path) -> io::Result<()>` 指针（可直接传给 `link_or_rename_with`）。
+fn hard_link_native(tmp: &std::path::Path, bak: &std::path::Path) -> std::io::Result<()> {
+    fs::hard_link(tmp, bak)
+}
+
+/// [`link_or_rename`] 的可注入内核：`linker` 为「尝试建硬链接」的动作（生产 =
+/// `fs::hard_link`；单测可传返回「不支持」错误的假实现，模拟 exFAT/FAT32/网络盘）。
+fn link_or_rename_with(
+    tmp: &std::path::Path,
+    bak: &std::path::Path,
+    linker: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> bool {
+    match linker(tmp, bak) {
+        Ok(()) => true,
+        // 并发/重入已建：视为已归档（保留最老原件）——与开头 bak.exists() 短路同义
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+        // 硬链接不可用（exFAT/FAT32/网络盘/跨设备）等：退化为原子 rename
+        Err(_) => fs::rename(tmp, bak).is_ok(),
+    }
+}
+
 impl SessionStore {
     pub fn new(bot_key: &str) -> SessionStore {
         let dir = crate::bridge_dir().join("workspaces").join(bot_key);
@@ -240,11 +273,21 @@ impl SessionStore {
     }
 
     /// 折叠后首次写盘前归档原件：<file>.legacy.bak（sessions.json.legacy.bak）。
-    /// 「不存在才建」（tmp + hard_link 原子语意）：并发进程/崩溃重入都不覆盖已有
-    /// 备份——保留最老原件。盘上无原件（全新工作区）按已归档放行。归档失败返回
-    /// false——save_locked 据此不写盘（绝不无备份覆盖用户数据）。
+    /// 「不存在才建」：先把原件逐字写进唯一 tmp，再原子落到 bak——并发进程/崩溃
+    /// 重入都不覆盖已有备份（保留最老原件）。盘上无原件（全新工作区）按已归档放行。
+    /// 归档失败返回 false——save_locked 据此不写盘（绝不无备份覆盖用户数据）。
+    ///
+    /// 为何不硬依赖 hard_link（缺陷 abb-sessions-archive-exfat-20260917）：此前用
+    /// `fs::hard_link` 实现「不存在才建」的原子语意，但**硬链接并非所有文件系统都
+    /// 支持**——exFAT / FAT32 / 多数网络盘与跨设备链接都不支持。本机 ~/.agent-bridge
+    /// 是指向 F:（exFAT）的 junction，`hard_link` 必然失败 → 归档返回 false →
+    /// save_locked 直接不写盘、pending 保持置位「下轮重试」→ 老格式 sessions.json
+    /// 永不折叠、每轮入站再失败一次（线上累计 363 次，两个 bot 的 sessions.json
+    /// 至今停在老四槽格式、无 .legacy.bak）。故硬链接只作**优先**手段，不可用时在
+    /// [`link_or_rename`] 里退化为同目录同卷的原子 rename（tmp → bak）。
     fn archive_original(&self) -> bool {
         let bak = self.path.with_extension("json.legacy.bak");
+        // 已归档（含「上次已建」）→ 直接放行，绝不覆盖更老备份
         if bak.exists() {
             return true;
         }
@@ -254,12 +297,8 @@ impl SessionStore {
         let tmp = self
             .path
             .with_extension(format!("json.legacy.tmp.{}", uuid::Uuid::new_v4()));
-        let ok = fs::write(&tmp, bytes).is_ok()
-            && match fs::hard_link(&tmp, &bak) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
-                Err(_) => false,
-            };
+        let ok = fs::write(&tmp, bytes).is_ok() && link_or_rename(&tmp, &bak);
+        // rename 成功后 tmp 已不存在；hard_link 成功后 tmp 仍在——这里一并清掉（忽略错误）
         let _ = fs::remove_file(&tmp);
         ok
     }
@@ -774,6 +813,81 @@ mod tests {
             "最老原件",
             "已有备份不得被覆盖"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 缺陷 abb-sessions-archive-exfat-20260917：归档不得硬依赖 hard_link ──
+
+    #[test]
+    fn archive_original_creates_bak_when_absent() {
+        // 「bak 不存在 → 归档成功并逐字生成 .legacy.bak」（本机 temp 在 NTFS，
+        // hard_link 可用，走优先路径；下面的 fallback 测试覆盖硬链接不可用路径）
+        let dir = temp_dir("arch-new");
+        let path = dir.join("sessions.json");
+        let store = SessionStore::at(path.clone()); // 空目录 → 无 pending，不自动归档
+        let original = r#"{"oc_a": {"buzz": {"session_id": "b1", "started": true}}}"#;
+        std::fs::write(&path, original).unwrap();
+        assert!(store.archive_original(), "归档应成功");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.legacy.bak")).unwrap(),
+            original,
+            "备份必须逐字等于原件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_original_keeps_existing_bak_and_never_overwrites() {
+        // 「bak 已存在 → 直接放行且不覆盖」（最老原件优先）
+        let dir = temp_dir("arch-keep2");
+        let path = dir.join("sessions.json");
+        let store = SessionStore::at(path.clone());
+        std::fs::write(&path, "新原件").unwrap();
+        let bak = path.with_extension("json.legacy.bak");
+        std::fs::write(&bak, "最老原件").unwrap();
+        assert!(store.archive_original(), "已有备份视为已归档");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "最老原件");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_or_rename_falls_back_to_rename_when_hardlink_unavailable() {
+        // 根因回归：exFAT/FAT32/网络盘不支持硬链接 → hard_link 必然失败。
+        // 注入「硬链接不可用」的假 linker（不必真去挂 exFAT），断言退化为原子 rename 后归档成功。
+        let dir = temp_dir("arch-exfat");
+        let tmp = dir.join("tmp");
+        let bak = dir.join("bak");
+        std::fs::write(&tmp, b"payload").unwrap();
+        let deny_link = |_: &std::path::Path, _: &std::path::Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "exFAT 不支持硬链接",
+            ))
+        };
+        assert!(
+            link_or_rename_with(&tmp, &bak, deny_link),
+            "应退化为 rename 成功"
+        );
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "payload");
+        assert!(!tmp.exists(), "rename 成功后 tmp 已不存在");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_or_rename_uses_hardlink_and_respects_already_exists() {
+        // 硬链接可用（NTFS）：正常建链；再建一次命中 AlreadyExists → 视为已归档且不覆盖
+        let dir = temp_dir("arch-hl");
+        let tmp = dir.join("tmp");
+        let bak = dir.join("bak");
+        std::fs::write(&tmp, b"x").unwrap();
+        assert!(link_or_rename(&tmp, &bak));
+        assert!(
+            tmp.exists() && bak.exists(),
+            "hard_link 保留 tmp，由 archive_original 收尾删除"
+        );
+        std::fs::write(&bak, "已存在").unwrap();
+        assert!(link_or_rename(&tmp, &bak), "AlreadyExists 视为已归档");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "已存在", "不覆盖");
         std::fs::remove_dir_all(&dir).ok();
     }
 
