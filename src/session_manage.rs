@@ -51,25 +51,61 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 /// 解析 bot：--bot 显式 → env AGENT_BRIDGE_BOT_KEY → 唯一 bot。
 fn resolve_bot(args: &[String], cfg: &Config) -> Result<String, String> {
+    let env = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+    resolve_bot_with(args, env.as_deref(), cfg)
+}
+
+/// 解析实现（env 可注入，单测不读写进程环境或真实 HOME）。
+fn resolve_bot_with(args: &[String], env: Option<&str>, cfg: &Config) -> Result<String, String> {
     if let Some(v) = flag_value(args, "--bot") {
-        let v = v.trim().to_string();
-        if cfg.bots.iter().any(|b| b.key() == v) {
-            return Ok(v);
-        }
-        return Err(format!("bot「{v}」不在 config 中"));
+        return cfg.resolve_bot_key(&v);
     }
-    if let Ok(k) = std::env::var("AGENT_BRIDGE_BOT_KEY") {
-        if !k.is_empty() {
-            return Ok(k);
+    if let Some(k) = env {
+        if !k.trim().is_empty() {
+            return cfg.resolve_bot_key(k);
         }
     }
     match cfg.bots.len() {
         0 => Err("config.json 没有配置任何 bot".into()),
-        1 => Ok(cfg.bots[0].key()),
+        1 => cfg.resolve_bot_key(&cfg.bots[0].key()),
         n => Err(format!(
-            "有 {n} 个 bot 但未指定目标（用 --bot <bot名> 指定，或用 AGENT_BRIDGE_BOT_KEY env）"
+            "有 {n} 个 bot 但未指定目标（用 --bot <bot名> 指定，或用 AGENT_BRIDGE_BOT_KEY env）\n可用：{}",
+            cfg.bot_key_list()
         )),
     }
+}
+
+/// `session list --bot <名>`：显式过滤才解析；未给 `--bot` 保持列出全部 bot。
+fn resolve_bot_filter(args: &[String], cfg: &Config) -> Result<Option<String>, String> {
+    flag_value(args, "--bot")
+        .map(|v| cfg.resolve_bot_key(&v).map(Some))
+        .unwrap_or(Ok(None))
+}
+
+/// `session list` 实际扫描的 bot：显式过滤只查目标；全量分支也必须逐个收敛，
+/// 配置里的不安全 key（如 CON）不得绕过统一校验。
+fn selected_list_bots<'a>(
+    cfg: &'a Config,
+    filter: Option<&str>,
+) -> Result<Vec<(&'a crate::config::BotConfig, String)>, String> {
+    if let Some(filter) = filter {
+        let key = cfg.resolve_bot_key(filter)?;
+        let bot = cfg
+            .bots
+            .iter()
+            .find(|b| b.key() == key)
+            .ok_or_else(|| format!("没有 bot key {key:?}"))?;
+        return Ok(vec![(bot, key)]);
+    }
+    cfg.bots
+        .iter()
+        .map(|bot| {
+            let raw = bot.key();
+            cfg.resolve_bot_key(&raw)
+                .map(|key| (bot, key))
+                .map_err(|e| format!("bot key {raw:?} 校验失败：{e}"))
+        })
+        .collect()
 }
 
 /// 解析 chat：位置参数优先，缺省回落 env AGENT_BRIDGE_CHAT_ID。
@@ -226,7 +262,13 @@ fn cmd_list(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let bot_filter = flag_value(args, "--bot").map(|s| s.trim().to_string());
+    let bot_filter = match resolve_bot_filter(args, &cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     let state_filter = if has_flag(args, "--paused") {
         Some("paused".to_string())
     } else {
@@ -242,6 +284,14 @@ fn cmd_list(args: &[String]) -> i32 {
         }
     }
 
+    let selected_bots = match selected_list_bots(&cfg, bot_filter.as_deref()) {
+        Ok(bots) => bots,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
     let state = SessionState::production();
     let stats = MsgStore::production().chat_stats();
     let vbs = crate::virtualbot::VirtualBotStore::new().load();
@@ -250,13 +300,7 @@ fn cmd_list(args: &[String]) -> i32 {
     let cutoff_gc = now.saturating_sub(gc_days * 86400);
 
     let mut rows: Vec<SessionRow> = Vec::new();
-    for bot in &cfg.bots {
-        let key = bot.key();
-        if let Some(f) = &bot_filter {
-            if key != *f {
-                continue;
-            }
-        }
+    for (bot, key) in selected_bots {
         let backend = bot.effective_backend(&cfg.default_backend).to_string();
         let ws = crate::workspace_dir(&key);
         // 暂停态一次取齐（避免每会话热刷新）；话题 key 回落 chat 前缀判定

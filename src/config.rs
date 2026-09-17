@@ -988,6 +988,78 @@ pub(crate) fn sanitize(s: &str) -> String {
         .collect::<String>()
 }
 
+fn is_windows_reserved_component(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// 外部 bot 选择串：既可能是别名，也可能是恶意路径串。这里先挡掉明确的危险形态，
+/// 再由解析后的规范 key 做更严格的文件名组件校验；别名本身不必等于最终目录名。
+fn unsafe_bot_key_input_reason(value: &str) -> Option<&'static str> {
+    if value != value.trim_end() {
+        return Some("结尾不能是空白");
+    }
+    if value == "." || value == ".." || value.ends_with('.') {
+        return Some("不能是 . / .. 或以点结尾");
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Some("不能包含路径分隔符");
+    }
+    if value.chars().any(|c| c == '\0' || c.is_control()) {
+        return Some("不能包含控制字符");
+    }
+    if is_windows_reserved_component(value) {
+        return Some("不能是 Windows 保留设备名");
+    }
+    None
+}
+
+/// 最终规范 key 会被直接 `join()` 到 tasks/workspaces/guard 等目录下，因此按跨平台
+/// 文件名组件的最严口径校验。Unicode 字母/数字仍允许（现有 bot key 支持中文）。
+fn unsafe_path_component_reason(value: &str) -> Option<&'static str> {
+    if value.is_empty() || value == "." || value == ".." {
+        return Some("不能为空或 . / ..");
+    }
+    if value != value.trim() || value.ends_with('.') {
+        return Some("首尾不能是空白或以点结尾");
+    }
+    if value.chars().any(|c| {
+        c == '\0'
+            || c.is_control()
+            || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Some("包含跨平台非法文件名字符");
+    }
+    if is_windows_reserved_component(value) {
+        return Some("不能是 Windows 保留设备名");
+    }
+    None
+}
+
 /// #51：Config::set_mention_mode 的写入结果（三态：落盘 / bot 不在 config / 写失败）。
 pub enum MentionModeSave {
     /// 已写入 config.json（或值未变化、无需写盘）
@@ -1433,15 +1505,24 @@ impl Config {
     /// 命中多个 → 报歧义（不猜）。所有「外部 key → 目录」的入口都应走本函数。
     ///
     /// 接受：规范 key / 显示名 `name` / 运行时 bot 名 `bot_name` / `app_id` / `bot_open_id`。
+    /// 外部输入与最终规范 key 都必须能安全作为单一路径组件（拒绝 `../`、分隔符、
+    /// Windows 保留名、结尾空格/点），防止调用方把未收敛字符串直接 `join()`。
     pub fn resolve_bot_key(&self, input: &str) -> Result<String, String> {
         let want = input.trim();
         if want.is_empty() {
             return Err("bot key 为空".into());
         }
+        if let Some(reason) = unsafe_bot_key_input_reason(input) {
+            return Err(self.unsafe_bot_key_error(input, reason));
+        }
         // 规范 key 优先且精确匹配：任何情况下都不得把输入 sanitize 后再当别名匹配，
         // 否则会凭空造出「和别的 bot 撞名」的新别名（key_base 已负责 sanitize + -2 去重）。
         if let Some(b) = self.bots.iter().find(|b| b.key() == want) {
-            return Ok(b.key());
+            let key = b.key();
+            if let Some(reason) = unsafe_path_component_reason(&key) {
+                return Err(self.unsafe_bot_key_error(&key, reason));
+            }
+            return Ok(key);
         }
         let hits: Vec<&BotConfig> = self
             .bots
@@ -1458,8 +1539,12 @@ impl Config {
                 self.bot_key_list()
             )),
             [one] => {
-                crate::log!("[botkey] {want:?} 是别名，已解析为规范 key {}", one.key());
-                Ok(one.key())
+                let key = one.key();
+                if let Some(reason) = unsafe_path_component_reason(&key) {
+                    return Err(self.unsafe_bot_key_error(&key, reason));
+                }
+                crate::log!("[botkey] {want:?} 是别名，已解析为规范 key {key}");
+                Ok(key)
             }
             many => Err(format!(
                 "{want:?} 命中 {} 个 bot（歧义）：{}——请改用规范 key",
@@ -1467,6 +1552,13 @@ impl Config {
                 many.iter().map(|b| b.key()).collect::<Vec<_>>().join(", ")
             )),
         }
+    }
+
+    fn unsafe_bot_key_error(&self, shown: &str, reason: &str) -> String {
+        format!(
+            "{shown:?} 不是安全的单一路径组件（{reason}）——拒绝作为目录名。\n可用：{}",
+            self.bot_key_list()
+        )
     }
 
     /// 列出规范 key（错误提示用）：`key（显示名）`，同名 bot 带 `-2` 后缀便于对号。
@@ -3164,9 +3256,9 @@ fn resolve_bot_key_accepts_aliases_and_rejects_unknown() {
         err.contains("PENDING") || err.contains("Pending"),
         "要说明后果：{err}"
     );
-    // 空白 → 明确报错；首尾空白要 trim（env 里带空格很常见）
+    // 空白 → 明确报错；外部输入不得把尾部空白带进目录名（Windows 会静默规范化）
     assert!(cfg.resolve_bot_key("   ").is_err());
-    assert_eq!(cfg.resolve_bot_key("  微信龙虾  ").unwrap(), canonical0);
+    assert!(cfg.resolve_bot_key("  微信龙虾  ").is_err());
 
     // 歧义（两个 bot 同显示名、同 app_id）→ 报错不猜
     let dup = Config {
@@ -3184,11 +3276,26 @@ fn resolve_bot_key_accepts_aliases_and_rejects_unknown() {
     // 歧义时**规范 key**（带 -2 后缀）仍必须能唯一解析
     assert_eq!(dup.resolve_bot_key("app_same-2").unwrap(), "app_same-2");
 
-    // 目录穿越 / 非法串绝不能原样通过（否则会写出 tasks/<越权路径>）
-    for evil in ["../../evil", "/tmp/evil", "a/b", "CON"] {
-        assert!(
-            cfg.resolve_bot_key(evil).is_err(),
-            "{evil:?} 必须被拒绝，不得当目录名"
-        );
+    // 目录穿越 / 非法串绝不能原样通过（否则会写出 tasks/<越权路径>）。
+    for evil in ["../../evil", "/tmp/evil", "a/b", "CON", "evil ", "evil."] {
+        let err = cfg.resolve_bot_key(evil).unwrap_err();
+        assert!(err.contains("安全的单一路径组件"), "{evil:?}: {err}");
+        assert!(err.contains(&canonical0), "错误仍须列出可选 key：{err}");
     }
+}
+
+#[test]
+fn resolve_bot_key_rejects_unsafe_resolved_key() {
+    let cfg = Config {
+        bots: vec![BotConfig {
+            name: "安全别名".to_string(),
+            app_id: "safe_app".to_string(),
+            key_suffix: ".".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = cfg.resolve_bot_key("安全别名").unwrap_err();
+    assert!(err.contains("安全的单一路径组件"), "{err}");
+    assert!(err.contains("safe_app"), "错误须列出可用 key：{err}");
 }

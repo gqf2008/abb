@@ -761,31 +761,29 @@ fn run_job_cli(args: &[String]) -> i32 {
 
 /// 解析 job CLI 的目标 bot：AGENT_BRIDGE_BOT_KEY env → 唯一 bot → 报错提示。
 fn resolve_bot_key() -> Result<String, String> {
-    let cfg = config::Config::load();
-    if let Ok(k) = std::env::var("AGENT_BRIDGE_BOT_KEY") {
-        let k = k.trim().to_string();
-        if !k.is_empty() {
-            // **必须收敛成规范 key**（issue abb-task-botkey-dir-1）：这个值会被直接当目录名
-            // 用（`tasks/<key>/`、sessions、outbox…），而 service 只扫规范 key。传显示名/
-            // app_id 之类别名时若原样使用，就会「登记成功」到 service 永远不看的目录 →
-            // 任务静默停在 Pending、零报错（现场 3 条任务停摆 12 分钟无人发现）。
-            return match &cfg {
-                Ok(c) if !c.bots.is_empty() => c.resolve_bot_key(&k),
-                Ok(_) => Err(format!(
-                    "无法校验 AGENT_BRIDGE_BOT_KEY={k:?}：config.json 里没有任何 bot——\n\
-                     该 key 对应的目录不会被任何 service 扫描（任务会永远停在 Pending）。\n\
-                     请先在设置窗添加 bot，或在 bot 会话里调用本命令。"
-                )),
-                Err(e) => Err(format!(
-                    "读 config 失败，无法校验 AGENT_BRIDGE_BOT_KEY={k:?}: {e:#}"
-                )),
-            };
+    let raw = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+    let cfg = config::Config::load().map_err(|e| format!("读 config 失败: {e:#}"))?;
+    resolve_env_bot_key_from(&cfg, raw.as_deref())
+}
+
+/// env→唯一 bot 的纯解析实现；凡把 env 值当目录/隔离键的入口都应复用这里。
+fn resolve_env_bot_key_from(cfg: &config::Config, raw: Option<&str>) -> Result<String, String> {
+    if let Some(raw) = raw.filter(|v| !v.trim().is_empty()) {
+        if cfg.bots.is_empty() {
+            let shown = raw.trim();
+            return Err(format!(
+                "无法校验 AGENT_BRIDGE_BOT_KEY={shown:?}：config.json 里没有任何 bot——\n\
+                 该 key 对应的目录不会被任何 service 扫描（任务会永远停在 Pending）。\n\
+                 请先在设置窗添加 bot，或在 bot 会话里调用本命令。"
+            ));
         }
+        // **必须收敛成规范 key**：这个值会被直接当目录名用（tasks/<key>/、sessions、
+        // workspaces、outbox…），service 只扫规范 key。
+        return cfg.resolve_bot_key(raw);
     }
-    let cfg = cfg.map_err(|e| format!("读 config 失败: {e:#}"))?;
     match cfg.bots.len() {
         0 => Err("config.json 没有配置任何 bot".into()),
-        1 => Ok(cfg.bots[0].key()),
+        1 => cfg.resolve_bot_key(&cfg.bots[0].key()),
         n => Err(format!(
             "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）\n可用：{}",
             cfg.bot_key_list()
@@ -1341,6 +1339,42 @@ fn resolve_task(
     }
 }
 
+/// parser 已按既有优先级选出最终来源后，再收敛来源 bot；显式 --source-bot 因此可以
+/// 覆盖坏 env，而真正采用 env 时仍在入队前失败。env chat 若形如 buzz UUID，也按
+/// 最终来源 bot 的主会话校正（仅当 parser 确实采用了 env chat）。
+fn converge_deliver_source(
+    cfg: &config::Config,
+    item: &mut deliver::DeliveryItem,
+    env_chat: &str,
+) -> Result<(), String> {
+    if item.source_bot.is_empty() {
+        return Ok(());
+    }
+    item.source_bot = cfg.resolve_bot_key(&item.source_bot)?;
+    if item.in_session {
+        item.target_bot = item.source_bot.clone();
+    }
+    if !env_chat.is_empty() && item.source_chat == env_chat {
+        let primary = cfg
+            .bots
+            .iter()
+            .find(|b| b.key() == item.source_bot)
+            .map(|b| b.primary_chat_id.clone())
+            .unwrap_or_default();
+        let (chat, fell_back) = deliver::correct_injected_chat(env_chat, &primary);
+        if fell_back {
+            eprintln!(
+                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat}」形如 buzz 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
+            );
+        }
+        item.source_chat = chat.clone();
+        if item.in_session {
+            item.target_chat = chat;
+        }
+    }
+    Ok(())
+}
+
 /// 跨会话投递 CLI（供 claude 用 Bash 调用，也可人用）。退出码 0=已入队 1=失败。
 /// 来源缺省取 AGENT_BRIDGE_BOT_KEY / AGENT_BRIDGE_CHAT_ID（桥 spawn agent 时注入）。
 /// 目标缺省 = 创建者会话（不给 --bot/--chat/--to-current 时，等价 --to-current）。
@@ -1353,31 +1387,17 @@ fn run_deliver_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let env_bot = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
+    let env_bot_raw = std::env::var("AGENT_BRIDGE_BOT_KEY").unwrap_or_default();
     let env_chat_raw = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
-    // 注入的当前会话若是 buzz 频道 UUID（非平台 receive_id），回落到该 bot 主会话并
-    // loud 提示——直发必被平台拒（飞书 230001）。回落需要 bot 已解析（按其 key 查主会话）。
-    let env_chat = if env_bot.is_empty() || env_chat_raw.is_empty() {
-        env_chat_raw
-    } else {
-        let primary = cfg
-            .bots
-            .iter()
-            .find(|b| b.key() == env_bot)
-            .map(|b| b.primary_chat_id.clone())
-            .unwrap_or_default();
-        let (chat, fell_back) = deliver::correct_injected_chat(&env_chat_raw, &primary);
-        if fell_back {
-            eprintln!(
-                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat_raw}」形如 buzz 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
-            );
-        }
-        chat
-    };
     // @角色名寻址（#75 虚拟 Bot）：--chat @后端开发 → 查登记表解析成 chat_id；
     // 找不到报错并列出该 bot 可用角色。登记表与 service 注入判定共用同一份。
     let roles = crate::virtualbot::VirtualBotStore::new();
-    let item = match deliver::parse_deliver_args_with_store(args, &env_bot, &env_chat, &roles) {
+    let mut item = match deliver::parse_deliver_args_with_store(
+        args,
+        &env_bot_raw,
+        &env_chat_raw,
+        &roles,
+    ) {
         Ok(i) => i,
         Err(e) => {
             eprintln!(
@@ -1386,6 +1406,10 @@ fn run_deliver_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if let Err(e) = converge_deliver_source(&cfg, &mut item, &env_chat_raw) {
+        eprintln!("{e}");
+        return 1;
+    }
     // 「跨会话投递」开关只管控**跨会话**：`--to-current` 是发给当前会话（等价于
     // 「回复带附件」），不跨会话、也不是新风险面，不该逼用户为一个"给自己发文件"
     // 去打开跨会话开关（冒烟测试暴露：原先开关检查在解析之前，把 in_session 一起挡了）。
@@ -1411,14 +1435,38 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         eprintln!("--to-current 只能在 bot 会话内使用（来源与目标必须一致），已拒绝。");
         return 1;
     }
-    // 授权者（受限会话）纵深防御：--file 只能投递工作区内文件。
-    // guard hook 是第一道（已在调用链上校验命令），这里 CLI 侧再兜一层——
-    // 即使 hook 配置被绕过/误配，受限会话的 deliver 也投不出工作区外文件内容。
-    if config::SenderRole::from_env() == config::SenderRole::Granted {
+    // 授权者（受限会话）纵深防御：--file 只能投递**桥注入身份**的工作区内文件。
+    // 显式 --source-bot 在 owner 会话仍是合法覆盖；granted 会话不能用它切换附件边界。
+    let sender_role = config::SenderRole::from_env();
+    let session_bot = if sender_role == config::SenderRole::Granted {
+        let raw = env_bot_raw.trim();
+        if raw.is_empty() {
+            eprintln!("受限会话缺少 AGENT_BRIDGE_BOT_KEY，无法确认附件工作区边界，已拒绝");
+            return 1;
+        }
+        match cfg.resolve_bot_key(raw) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    if sender_role == config::SenderRole::Granted {
+        let session_bot = session_bot.as_deref().expect("granted session bot");
+        if item.source_bot != session_bot {
+            eprintln!(
+                "受限会话不能修改来源身份（env={session_bot:?}，实际 source_bot={:?}），已拒绝",
+                item.source_bot
+            );
+            return 1;
+        }
         // 工作区先 canonicalize：a.path 已按真实路径规范化，若 ~/.agent-bridge
         // 含符号链接组件（数据目录挪盘等），原始路径比较会误拒所有合法投递。
-        let ws = std::fs::canonicalize(crate::workspace_dir(&env_bot))
-            .unwrap_or_else(|_| crate::workspace_dir(&env_bot));
+        let ws = std::fs::canonicalize(crate::workspace_dir(session_bot))
+            .unwrap_or_else(|_| crate::workspace_dir(session_bot));
         for a in &item.attachments {
             if !guard::canonical_in_workspace(&a.path, &ws) {
                 eprintln!("受限会话不能投递工作区外文件（已拒绝）：{}", a.path);
@@ -1487,6 +1535,21 @@ fn run_deps_install_cli() -> i32 {
     }
 }
 
+/// session-import 的 bot 列表收敛：显式 --bot 走唯一解析点；否则枚举所有规范 key。
+fn session_import_bot_keys(
+    cfg: &config::Config,
+    explicit: Option<&str>,
+) -> Result<Vec<String>, String> {
+    match explicit {
+        Some(key) => Ok(vec![cfg.resolve_bot_key(key)?]),
+        None => cfg
+            .bots
+            .iter()
+            .map(|b| cfg.resolve_bot_key(&b.key()))
+            .collect(),
+    }
+}
+
 /// 历史会话迁移 CLI（#33）。退出码 0=全部成功 1=有失败/跳过。
 fn run_session_import_cli(args: &[String]) -> i32 {
     let mut bot_key: Option<String> = None;
@@ -1510,7 +1573,7 @@ fn run_session_import_cli(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    // 枚举 bot：--bot 指定单个；否则全部 enabled 的 bot
+    // 枚举 bot：--bot 指定单个；否则全部 bot。显式值必须在任何 import 副作用前收敛。
     let cfg = match config::Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -1518,9 +1581,12 @@ fn run_session_import_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let keys: Vec<String> = match &bot_key {
-        Some(k) => vec![k.clone()],
-        None => cfg.bots.iter().map(|b| b.key()).collect(),
+    let keys = match session_import_bot_keys(&cfg, bot_key.as_deref()) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
     };
     let mut any_issue = false;
     let mut found = false;
@@ -1969,19 +2035,28 @@ fn run_team_cli(args: &[String]) -> i32 {
 
 /// 解析 bot key：优先命令行 --bot，回落 AGENT_BRIDGE_BOT_KEY env。
 fn trash_bot_key(args: &[String]) -> Result<String, String> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--bot" {
-            if let Some(v) = args.get(i + 1) {
-                return Ok(v.clone());
-            }
-        }
-        i += 1;
+    let cfg = config::Config::load().map_err(|e| format!("读 config 失败: {e:#}"))?;
+    let env = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+    trash_bot_key_with(args, env.as_deref(), &cfg)
+}
+
+/// trash/wsver 共用的纯解析实现（env/cfg 可注入，单测不碰真实 HOME）。
+fn trash_bot_key_with(
+    args: &[String],
+    env: Option<&str>,
+    cfg: &config::Config,
+) -> Result<String, String> {
+    if let Some(i) = args.iter().position(|a| a == "--bot") {
+        let value = args.get(i + 1).ok_or_else(|| "--bot 缺少值".to_string())?;
+        return cfg.resolve_bot_key(value);
     }
-    std::env::var("AGENT_BRIDGE_BOT_KEY").map_err(|_| {
+    if let Some(value) = env.filter(|v| !v.trim().is_empty()) {
+        return cfg.resolve_bot_key(value);
+    }
+    Err(
         "缺少 bot key：请用 --bot <key> 指定，或在桥注入环境（AGENT_BRIDGE_BOT_KEY）下调用"
-            .to_string()
-    })
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
