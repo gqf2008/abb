@@ -1443,6 +1443,109 @@ fn configure_backend() -> Result<()> {
 // 宏必须在模块作用域调用（impl 块）。
 slint_pixel::impl_resize_ui!(SettingsWindow);
 
+// ── Windows：圆角窗口区域（SetWindowRgn） ─────────────────────────────────────
+// 现象（用户实测）：`ui/app.slint` 根 Rectangle 已经画了 10px 圆角、圆角外 alpha=0，
+// 但 Windows 上看着仍是直角方块。
+// 归因：Slint 的 winit 后端在 Windows 上开的是**普通（非分层）窗口**——DWM 对普通窗口的
+// 重定向位图按不透明处理，圆角外那圈 alpha=0 会被铺成实心；winit 唯一的 per-pixel alpha
+// 路径 `DwmEnableBlurBehindWindow` 依赖系统「透明效果」（`HKCU\...\Personalize\`
+// `EnableTransparency`），关掉时即失效。
+// 修法：`SetWindowRgn` 是窗口管理器层面的**硬裁剪**，不经过 DWM 的 alpha 合成——区域外的
+// 像素根本不属于窗口，桌面直接露出来，与系统透明效果开关无关（Win10/Win11 都成立）。
+// 半径必须与 .slint 侧 `border-radius` 同值：不一致会在弧线外残留黑边或露底
+//（两边同值 → 硬裁剪弧与绘制弧重合，这是本方案成立的前提）。
+/// Windows 窗口圆角半径（**逻辑 px**，与 `ui/app.slint` 根 Rectangle 的
+/// `border-radius: 10px` 必须同值）。
+#[cfg(target_os = "windows")]
+const WINDOW_CORNER_RADIUS: f64 = 10.0;
+
+/// 取 winit 窗口的 Win32 HWND。
+#[cfg(target_os = "windows")]
+fn win32_hwnd(window: &slint::winit_030::winit::window::Window) -> Option<*mut std::ffi::c_void> {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get() as *mut std::ffi::c_void),
+        // 非 Win32 句柄只在 Windows 上不可达（后端就是 winit-win32），防御性返回
+        _ => None,
+    }
+}
+
+/// 把设置窗的窗口区域裁成圆角矩形。幂等：每次按当前尺寸/DPI 重算，尺寸变化后重调即刷新。
+///
+/// 最大化时清掉区域（贴满屏幕的窗口不该有圆角）。`SetWindowRgn` 成功后区域**归系统所有**，
+/// 调用方不得再 `DeleteObject`；只有失败（返回 0）时才由本函数自行释放。
+#[cfg(target_os = "windows")]
+fn apply_round_window_region(window: &slint::Window) {
+    use slint::winit_030::WinitWindowAccessor;
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetWindowRgn(hWnd: *mut c_void, hRgn: *mut c_void, bRedraw: i32) -> i32;
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> *mut c_void;
+        fn DeleteObject(ho: *mut c_void) -> i32;
+    }
+
+    let _ = window.with_winit_window(|w| {
+        let Some(hwnd) = win32_hwnd(w) else { return };
+        // 最大化：清区域恢复整窗矩形（region = NULL 即「无区域」）
+        if w.is_maximized() {
+            // SAFETY: hwnd 取自 winit 窗口；NULL 区域是 SetWindowRgn 的合法入参（清除区域）
+            unsafe { SetWindowRgn(hwnd, std::ptr::null_mut(), 1) };
+            return;
+        }
+        let size = w.inner_size();
+        let (width, height) = (size.width as i32, size.height as i32);
+        if width <= 0 || height <= 0 {
+            return; // 最小化等 0 尺寸：保持现有区域不动
+        }
+        // 物理 px = 逻辑 px × scale_factor（.slint 侧写的是逻辑 10px）
+        let radius = (WINDOW_CORNER_RADIUS * w.scale_factor()).round() as i32;
+        // 区域坐标是窗口坐标，右下角为开区间 → 各 +1 才能铺满整窗；
+        // CreateRoundRectRgn 的椭圆宽高 = 直径 = 半径 × 2。
+        // SAFETY: 纯 GDI 调用，参数为常量与窗口尺寸
+        let rgn =
+            unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2) };
+        if rgn.is_null() {
+            return;
+        }
+        // bRedraw=1：区域变化立刻重绘（否则要等下一次内容刷新才见效）
+        // SAFETY: rgn 是刚创建的合法区域；成功后所有权移交系统（不能再 DeleteObject）
+        if unsafe { SetWindowRgn(hwnd, rgn, 1) } == 0 {
+            // SAFETY: 失败时系统未接管该区域，必须自己释放，否则泄漏 GDI 对象
+            unsafe { DeleteObject(rgn) };
+        }
+    });
+}
+
+/// 平台相关的窗口事件副作用（挂在 `run_gui` 里**同一个** winit window-event filter 上——
+/// `on_winit_window_event` 是单槽 `set`，另注册一个会把 `CloseRequested` 那条整个顶掉）。
+/// - Windows：尺寸/DPI 变化后重算圆角窗口区域（窗口创建后的首个 `Resized` 也走这里，
+///   即首帧拿到真实尺寸后补上圆角）。
+/// - 其它平台：无（macOS 圆角由系统按 `border-radius` 合成，Linux 暂不处理）。
+fn handle_platform_window_event(
+    window: &slint::Window,
+    event: &slint::winit_030::winit::event::WindowEvent,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        use slint::winit_030::winit::event::WindowEvent;
+        if matches!(
+            event,
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            apply_round_window_region(window);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, event);
+    }
+}
+
 pub fn run_gui() -> Result<()> {
     configure_backend()?;
 
@@ -1509,7 +1612,7 @@ pub fn run_gui() -> Result<()> {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
         let dirty = dirty.clone();
         let dlg = unsaved_dialog.as_weak();
-        settings.window().on_winit_window_event(move |_w, ev| {
+        settings.window().on_winit_window_event(move |w, ev| {
             if matches!(ev, WindowEvent::CloseRequested) {
                 if dirty.get() {
                     if let Some(d) = dlg.upgrade() {
@@ -1520,6 +1623,7 @@ pub fn run_gui() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 platform::hide_dock();
             }
+            handle_platform_window_event(w, ev);
             EventResult::Propagate // 让 Slint 照常把窗口 hide
         });
         qr_dialog.window().on_winit_window_event(|_w, ev| {

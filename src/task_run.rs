@@ -328,10 +328,23 @@ pub(crate) async fn run_attempt(
     if cancelled {
         return;
     }
-    let Some((target_bot, chat)) = delivery_target(&task, bot_key) else {
+    let Some((target_bot, chat_raw)) = delivery_target(&task, bot_key) else {
         crate::log!("[task:{bot_key}] {short} 无投递目标（创建者会话为空），结果未发送");
         return;
     };
+    // 存量坏任务自愈：创建者会话若存的是 buzz 频道 UUID（外部注入的 AGENT_BRIDGE_CHAT_ID），
+    // 直发必被平台拒（飞书 230001）——回落到该 bot 主会话，loud，让结果真送达。
+    let primary = router
+        .bots
+        .get(&target_bot)
+        .map(|b| b.primary_chat_id.clone())
+        .unwrap_or_default();
+    let (chat, healed) = heal_delivery_chat(&chat_raw, &primary);
+    if healed {
+        crate::log!(
+            "[task:{bot_key}] {short} 投递目标 chat={chat_raw} 形如 buzz 频道 UUID（非平台 chat_id），已回落主会话 {chat}"
+        );
+    }
     // 注意：这里没有「已取消」抬头——见上 `if cancelled { return; }` 的说明，
     // 被取消的轮次（关停联动 / 用户 task cancel）压根走不到投递。
     let header = if failed {
@@ -351,14 +364,16 @@ pub(crate) async fn run_attempt(
     let created_chat = task.created_by.chat_id.clone();
     // `in_session`（= 走 Router 自环豁免的那条可信通路）只在**目标确实就是创建者
     // 会话**时成立；`--to` 指到别处时必须显式跨会话，否则等于伪造豁免（审查 P2）。
-    let in_session = target_bot == bot_key && chat == created_chat;
+    // 回落主会话时，回源也指向那个会话（创建者会话已失效），维持「目标==来源」的自环语义。
+    let source_chat = if healed { chat.clone() } else { created_chat };
+    let in_session = target_bot == bot_key && chat == source_chat;
     let item = DeliveryItem {
         id: uuid::Uuid::new_v4().to_string(),
         target_bot: target_bot.clone(),
         target_chat: chat.clone(),
         text: format!("{header}\n\n{body}"),
         source_bot: bot_key.to_string(),
-        source_chat: created_chat,
+        source_chat,
         created_at: finished,
         attachments: Vec::new(),
         // 非空 = 跳过防循环去重（同一任务重跑两次是合法重复）；同时也是 P1b 之前
@@ -494,6 +509,21 @@ fn delivery_target(task: &Task, bot_key: &str) -> Option<(String, String)> {
         None
     } else {
         Some((bot_key.to_string(), task.created_by.chat_id.clone()))
+    }
+}
+
+/// 投递目标校正（纯函数，可测）：目标 chat 形如 buzz 频道 UUID 时回落到该 bot 主会话。
+///
+/// 背景：ACP 架构下 agent 是每 bot 长驻进程，桥无法按频道注入 `AGENT_BRIDGE_CHAT_ID`；
+/// 外部启动器注入的若是 buzz 频道 UUID，会经 `task add` 原样存进 `created_by.chat_id`。
+/// 该值不是平台 receive_id，直发必被平台拒（飞书 230001 invalid receive_id）——这里
+/// 回落到 `primary`（真实平台会话），让**存量坏任务**的结果也能真送达。返回
+/// `(生效 chat, 是否发生回落)`；`primary` 为空时原样返回（交由投递侧 loud 失败）。
+fn heal_delivery_chat(chat: &str, primary: &str) -> (String, bool) {
+    if !primary.is_empty() && crate::buzz::keys::looks_like_channel_uuid(chat) {
+        (primary.to_string(), true)
+    } else {
+        (chat.to_string(), false)
     }
 }
 
@@ -1407,6 +1437,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 回归锁（本次修复的核心）：创建者会话存的是 buzz 频道 UUID（历史坏数据）时，
+    /// 投递目标回落到该 bot 主会话——绝不把频道 UUID 当平台 receive_id。
+    #[test]
+    fn delivery_heals_channel_uuid_to_primary_chat() {
+        let uuid = crate::buzz::keys::channel_uuid(
+            "cli_a8a27ff268b8900e",
+            "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
+        );
+        assert!(crate::buzz::keys::looks_like_channel_uuid(&uuid));
+        let (chat, healed) = heal_delivery_chat(&uuid, "oc_1f097b843c4d12b3bc8b91205cfe4dd8");
+        assert!(healed);
+        assert_eq!(chat, "oc_1f097b843c4d12b3bc8b91205cfe4dd8");
+        // 真实平台 id：不动
+        let (chat, healed) = heal_delivery_chat("oc_1f097b843c4d12b3bc8b91205cfe4dd8", "oc_other");
+        assert!(!healed);
+        assert_eq!(chat, "oc_1f097b843c4d12b3bc8b91205cfe4dd8");
+        // 频道 UUID 但无主会话可回落：原样（交由投递侧 loud 失败）
+        let (chat, healed) = heal_delivery_chat(&uuid, "");
+        assert!(!healed);
+        assert_eq!(chat, uuid);
     }
 
     /// 记录型 messenger：只记 send_text 的 (chat, text)，供投递断言。

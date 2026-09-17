@@ -48,3 +48,47 @@ pub fn channel_uuid(bot_key: &str, chat_id: &str) -> String {
 pub fn topic_channel_uuid(bot_key: &str, chat_id: &str, thread_id: &str) -> String {
     fnv128_uuid(&format!("abb-relay:{bot_key}:{chat_id}:thread:{thread_id}"))
 }
+
+/// 该字符串是否「形如 buzz 频道 UUID」——即 [`channel_uuid`] 的产物形态（canonical uuid）。
+///
+/// 用途（投递侧硬闸）：真实平台的会话 id（飞书 `oc_…`/`ou_…`、微信 `wxid…`/`o9cq…`、
+/// 钉钉 `cid…`）**都不是**裸 UUID；而 `AGENT_BRIDGE_CHAT_ID` 这类跨进程注入值在 ACP
+/// 架构下曾实际被填成频道 UUID。目标一旦命中本判据，就绝不可能是任何平台可用的
+/// receive_id，直发必被平台拒（飞书 `230001 invalid receive_id`）——应当 fail loud
+/// 或回落主会话，而不是静默发出注定失败的请求。**只做形态判定**，不承诺能反解回
+/// chat_id（fnv128 不可逆，登记表是内存态）。
+pub fn looks_like_channel_uuid(s: &str) -> bool {
+    uuid::Uuid::parse_str(s).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 频道 UUID 形态判定：`channel_uuid` 的产物命中；真实平台 id 一律不命中。
+    /// 这是「绝不把频道 UUID 当 receive_id 直发」的形态锁（deliver / task 两条链共用）。
+    #[test]
+    fn looks_like_channel_uuid_only_matches_uuid_shape() {
+        let uuid = channel_uuid(
+            "cli_a8a27ff268b8900e",
+            "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
+        );
+        // 与线上坏值逐一吻合（三个 bot 的频道 UUID 皆是此形态）
+        assert_eq!(uuid, "f72338af-1402-7f76-4520-189911e0d106");
+        assert!(looks_like_channel_uuid(&uuid));
+        // 话题频道 uuid 同形态
+        assert!(looks_like_channel_uuid(&topic_channel_uuid(
+            "b", "oc_x", "t1"
+        )));
+        // 三个平台的真实 chat_id：都不是裸 UUID
+        assert!(!looks_like_channel_uuid(
+            "oc_1f097b843c4d12b3bc8b91205cfe4dd8"
+        ));
+        assert!(!looks_like_channel_uuid("ou_abc123"));
+        assert!(!looks_like_channel_uuid(
+            "o9cq806Evm1T9LW4PNihIL11j2cEimwechat"
+        ));
+        assert!(!looks_like_channel_uuid("cid_something"));
+        assert!(!looks_like_channel_uuid(""));
+    }
+}

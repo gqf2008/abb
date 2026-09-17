@@ -260,6 +260,28 @@ impl Router {
                                                     // `AGENT_BRIDGE_BOT_KEY=… CHAT_ID=…` 覆盖 env 后调 --to-current）就能把
                                                     // `cross_delivery_enabled` 关着的跨会话投递和 10 分钟防循环窗口一起绕掉（审查 P2）。
         let in_session_ok = item.in_session && is_self_loop(item);
+        // 平台形状硬闸：目标必须是平台的 receive_id。若目标形如 buzz 频道 UUID
+        // （`keys::looks_like_channel_uuid`），说明上游把**频道 UUID** 当成了 chat_id——
+        // 历史上桥注入的 `AGENT_BRIDGE_CHAT_ID` 就是那个值（ACP 架构下 agent 是每 bot
+        // 长驻进程，桥无法按频道注入，外部启动器喂进来的是频道 UUID）。这类值绝不是任何
+        // 平台的 receive_id，直发必被平台拒（飞书 230001 invalid receive_id）。此处
+        // **fail loud** 并回源报错，不再静默发出注定失败的请求。放在最前，任何开关都绕不过。
+        if crate::buzz::keys::looks_like_channel_uuid(&item.target_chat) {
+            crate::log!(
+                "[deliver] 拒绝投递：目标 chat={} 形如 buzz 频道 UUID，不是平台 chat_id（bot={} id={}）",
+                item.target_chat,
+                tb,
+                tid
+            );
+            let hint = format!(
+                "⚠️ 投递失败：目标会话「{}」形如 buzz 频道 UUID，不是任何平台可用的 receive_id（直发会被平台拒，如飞书 230001 invalid receive_id）。请改用真实 chat_id：飞书 oc_…／微信 wxid… 或 o9cq…／钉钉 cid…。",
+                item.target_chat
+            );
+            self.notify_source(item, &hint).await;
+            return DeliveryOutcome::NotDelivered(
+                "目标不是平台 chat_id（形如 buzz 频道 UUID）".to_string(),
+            );
+        }
         // 开关只管跨会话；`in_session` 等价于「回复带附件」，不受它限制（CLI 侧同判）。
         if !self.enabled && !in_session_ok {
             crate::log!(
@@ -533,6 +555,26 @@ impl Router {
                 crate::agent::truncate(&item.source_chat, 16)
             );
         }
+    }
+}
+
+/// 校正「桥注入的当前会话」chat_id（`--to-current` / 缺省回创建者会话走这条路）。
+///
+/// 背景：ACP 架构下 agent 是**每 bot 一个长驻进程**，桥没法按频道注入
+/// `AGENT_BRIDGE_CHAT_ID`；该值若由外部启动器提供，可能是 buzz **频道 UUID**——
+/// 它绝不是任何平台的 receive_id（直发飞书 = 230001 invalid receive_id）。此情形回落
+/// 该 bot 的**主会话**（真实平台 id）。
+///
+/// 返回 `(生效 chat_id, 是否发生回落)`。`primary` 为空（主会话尚未建立）时保持原值，
+/// 让上层照旧报「缺目标」，不硬造一个目标。
+pub fn correct_injected_chat(env_chat: &str, primary: &str) -> (String, bool) {
+    if !env_chat.is_empty()
+        && !primary.is_empty()
+        && crate::buzz::keys::looks_like_channel_uuid(env_chat)
+    {
+        (primary.to_string(), true)
+    } else {
+        (env_chat.to_string(), false)
     }
 }
 
@@ -1263,6 +1305,61 @@ mod tests {
             outbox_dir,
         );
         (router, target, source)
+    }
+
+    /// 注入会话校正（纯函数）：频道 UUID → 回落主会话（loud 提示由调用方打）；
+    /// 真实平台 id / 空值 / 无主会话可回落 一律原样返回。
+    #[test]
+    fn correct_injected_chat_only_rewrites_channel_uuid() {
+        let uuid = crate::buzz::keys::channel_uuid(
+            "cli_a8a27ff268b8900e",
+            "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
+        );
+        // 频道 UUID + 有主会话 → 回落
+        assert_eq!(
+            correct_injected_chat(&uuid, "oc_1f097b843c4d12b3bc8b91205cfe4dd8"),
+            ("oc_1f097b843c4d12b3bc8b91205cfe4dd8".to_string(), true)
+        );
+        // 真实平台 id → 不动
+        assert_eq!(
+            correct_injected_chat("oc_1f097b843c4d12b3bc8b91205cfe4dd8", "oc_other"),
+            ("oc_1f097b843c4d12b3bc8b91205cfe4dd8".to_string(), false)
+        );
+        // 空 env → 不动（调用方自行回落主会话）
+        assert_eq!(
+            correct_injected_chat("", "oc_other"),
+            (String::new(), false)
+        );
+        // 频道 UUID 但无主会话可回落 → 原样（交由投递侧 loud 失败）
+        assert_eq!(correct_injected_chat(&uuid, ""), (uuid.clone(), false));
+    }
+
+    /// 回归锁（本次修复的核心）：目标形如 buzz 频道 UUID 时**绝不直发**——不发给目标，
+    /// 且回源 loud 报错，说明它不是平台 receive_id（历史上会被当飞书 receive_id 发 →
+    /// 230001 invalid receive_id）。三个平台共用这条硬闸。
+    #[tokio::test]
+    async fn router_rejects_channel_uuid_target_loudly() {
+        let (router, target, source) = router_with(true, None);
+        let uuid = crate::buzz::keys::channel_uuid(
+            "cli_a8a27ff268b8900e",
+            "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
+        );
+        let mut d = item("a", "wechat", &uuid, "hi");
+        d.source_bot = "feishu".into();
+        d.source_chat = "c1".into();
+        let outcome = router.deliver(&d).await;
+        assert!(
+            target.sent.lock().unwrap().is_empty(),
+            "绝不该把频道 UUID 当 receive_id 直发"
+        );
+        assert!(!outcome.is_delivered());
+        let notif = source.sent.lock().unwrap().clone();
+        assert_eq!(notif.len(), 1, "必须回源报错（不静默）: {notif:?}");
+        assert!(
+            notif[0].1.contains("频道 UUID"),
+            "提示要说明原因: {}",
+            notif[0].1
+        );
     }
 
     #[tokio::test]

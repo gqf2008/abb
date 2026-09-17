@@ -1363,6 +1363,11 @@ export component SettingsWindow inherits Window {
         // 黑边还是直角），而「背景 + 圆角」是各平台都在走的路。外黑内白同心（10px / 8px，
         // 内缩 2px）等价于 2px 描边，且天然贴边。
         background: UiTokens.window-frame;
+        // ⚠ Windows：这个圆角**不能只靠 Slint 画出来**。DWM 对普通（非分层）窗口按不透明
+        // 合成，圆角外 alpha=0 的那圈会被铺成实心 → 看起来仍是直角方块（用户实测）。
+        // 真正把角「切掉」的是 Rust 侧 `apply_round_window_region`（`SetWindowRgn` 硬裁剪，
+        // 与系统透明效果开关无关，Win10/Win11 都成立）。**两边半径必须同值**：
+        // 不一致会在弧线外残留黑边或露底（ui.rs 的 `WINDOW_CORNER_RADIUS` = 这里的 10px）。
         border-radius: 10px;
 
         // 内层面板：白底、内缩 2px、圆角 8px（= 10px − 2px 描边），与上面共同构成描边环
