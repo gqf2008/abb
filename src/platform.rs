@@ -604,10 +604,49 @@ pub fn heal_autostart() {
     let _ = set_autostart(true);
 }
 
-/// 非 macOS 无「登录项指向哪个二进制」这回事（Windows 的 Run 键每次由
-/// `current_exe()` 覆写；Linux 未实现）。
-#[cfg(not(target_os = "macos"))]
+/// 非 macOS、非 Windows（Linux）自启未实现，无自愈可言。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn heal_autostart() {}
+
+/// 自愈判据（纯函数，便于单测）：**只在**「用户意图为开」且「注册表实际缺失」时为真。
+/// 两个方向都不能判错：意图开+实际也在 = 无需动作；意图关 = 用户自己关的，绝不能替他
+/// 打开。任一方向判反，都会把「用户主动关掉自启」变成「每次启动被偷偷打开」。
+#[cfg(target_os = "windows")]
+fn autostart_heal_needed(desired: bool, registered: bool) -> bool {
+    desired && !registered
+}
+
+/// Windows GUI 启动时自愈：用户开过自启（有意图标记）但 Run 键不见了 → 按意图补写。
+/// 只动「用户开过」的配置：没有标记就是没开过，绝不擅自给人开（与 macOS 侧同一条纪律）。
+///
+/// 为什么 Run 键会「自己不见」：`HKCU\...\Run` 是每用户可写的启动项位置，安全软件 /
+/// 系统清理工具会把它当可疑启动项**静默**删除（本机实测：火绒 HIPS 在跑时 `reg add`
+/// 当场成功、重启后该值消失），而 GUI 每次刷新读的是 Run 键真值 → 托盘显示「关」、
+/// 用户以为设置没生效。注册表本身无法区分「被删」与「用户关掉」，故用意图标记区分。
+///
+/// 已知边界：只判 Run 值**在不在**，不解析它指向哪个二进制（见上面 Windows 段注释）；
+/// 升级器原地替换二进制、安装位置由 Inno 固定，故不存在 macOS 那种「指向旧副本」的漂移。
+#[cfg(target_os = "windows")]
+pub fn heal_autostart() {
+    let logs = crate::bridge_dir().join("logs");
+    let desired = autostart_desired_at(&logs);
+    let registered = autostart_enabled();
+    // 存量用户（升级前就开了自启、没留下意图标记）：只要键还在就补记意图，让以后被
+    // 回滚时能自愈。此处只在「键在」时补记，不写注册表，无副作用。
+    if !desired && registered {
+        let _ = set_autostart_desired_at(&logs, true);
+        log_autostart_event("自愈：Run 键已开但无意图记录（升级前存量），补记用户意图");
+        return;
+    }
+    if !autostart_heal_needed(desired, registered) {
+        return;
+    }
+    crate::log!("[autostart] Run 键缺失（疑被安全软件回滚），按用户意图补写");
+    log_autostart_event(
+        "自愈：用户意图为开但 HKCU Run 键缺失（疑被安全软件/清理工具回滚），发起补写",
+    );
+    let _ = set_autostart(true);
+}
 
 /// 设置开机自启的**唯一公开入口**：成败一律在这里落审计。
 ///
@@ -832,6 +871,40 @@ pub fn autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 「用户意图开自启」持久标记（与 `logs/service.desired` 同款：存在 = 开，不存在 = 关/
+/// 没开过）。Run 键没有「谁改的」信息，被安全软件静默删除时与「用户自己关掉」不可
+/// 区分；没有这个标记就没法既自愈、又不擅自替人开自启。
+#[cfg(target_os = "windows")]
+fn autostart_desired_flag_at(logs: &std::path::Path) -> std::path::PathBuf {
+    logs.join("autostart.desired")
+}
+
+/// 写 / 清意图标记。base 可注入，单测不碰真实 `~/.agent-bridge`。
+#[cfg(target_os = "windows")]
+fn set_autostart_desired_at(logs: &std::path::Path, enable: bool) -> Result<()> {
+    let f = autostart_desired_flag_at(logs);
+    if enable {
+        std::fs::create_dir_all(logs)
+            .with_context(|| format!("建自启标记目录失败: {}", logs.display()))?;
+        std::fs::write(&f, b"1").with_context(|| format!("写自启意图标记失败: {}", f.display()))?;
+    } else {
+        match std::fs::remove_file(&f) {
+            Ok(()) => {}
+            // 本来就不存在 = 已经是「关」，幂等，不算错。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!("删自启意图标记失败 {}: {e}", f.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn autostart_desired_at(logs: &std::path::Path) -> bool {
+    autostart_desired_flag_at(logs).exists()
+}
+
 #[cfg(target_os = "windows")]
 fn set_autostart_impl(enable: bool) -> Result<()> {
     let exe = current_exe()?;
@@ -852,12 +925,17 @@ fn set_autostart_impl(enable: bool) -> Result<()> {
         run_reg(&["delete", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE, "/f"])
     }
     .context("reg 命令执行失败")?;
-    if out.status.success() {
-        Ok(())
-    } else {
+    if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("设置开机自启失败: {}", msg.trim())
     }
+    // 注册表动作成功后再落意图标记。顺序要紧：标记是「用户想要开/关」的唯一判据，
+    // 若标记先落而注册表失败，下次自愈就会拿一个未兑现的意图去改用户配置。
+    // 标记写失败不回滚注册表（用户要的效果已达成），但响亮留痕——否则自愈会静默失效。
+    if let Err(e) = set_autostart_desired_at(&crate::bridge_dir().join("logs"), enable) {
+        log_autostart_event(&format!("⚠️ 自启意图标记写入失败（自愈将失效）: {e:#}"));
+    }
+    Ok(())
 }
 #[cfg(target_os = "linux")]
 pub fn autostart_enabled() -> bool {
@@ -1032,6 +1110,40 @@ fn rewrite_workspace_guides(workspaces: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows 自启自愈判据：只在「意图为开 + 注册表缺失」时为真。这条纯函数是
+    /// 「既不擅自替人开、又能补回被回滚的项」的唯一闸门，两个方向都要锁死。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn autostart_heal_only_when_desired_and_missing() {
+        assert!(autostart_heal_needed(true, false), "意图开 + 缺失 → 补写");
+        assert!(!autostart_heal_needed(true, true), "意图开 + 也在 → 不动作");
+        assert!(
+            !autostart_heal_needed(false, true),
+            "无意图 → 别动（可能是用户自己关的）"
+        );
+        assert!(!autostart_heal_needed(false, false), "没开过 → 绝不擅自开");
+    }
+
+    /// 意图标记落盘 / 清除（base 注入，不碰真实 ~/.agent-bridge）；开启幂等、关闭幂等。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn autostart_desired_flag_roundtrip() {
+        let dir =
+            std::env::temp_dir().join(format!("abb-autostart-desired-{}", uuid::Uuid::new_v4()));
+        let logs = dir.join("logs");
+        assert!(!autostart_desired_at(&logs), "初始无标记 = 没开过");
+        // 父目录不存在也要能建（首次开启场景）
+        set_autostart_desired_at(&logs, true).unwrap();
+        assert!(autostart_desired_at(&logs));
+        set_autostart_desired_at(&logs, true).unwrap();
+        assert!(autostart_desired_at(&logs), "重复开启幂等");
+        set_autostart_desired_at(&logs, false).unwrap();
+        assert!(!autostart_desired_at(&logs));
+        set_autostart_desired_at(&logs, false).unwrap();
+        assert!(!autostart_desired_at(&logs), "重复关闭幂等（不存在不算错）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 审计行格式：一行一条、带时间戳前缀，供 logs/autostart.log 事后排查
     /// （GUI 由 open 起时 stdout 指 /dev/null，这是唯一留得下的证据）。
