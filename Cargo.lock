@@ -187,6 +187,7 @@ dependencies = [
  "chrono",
  "dirs",
  "fastrand",
+ "femtovg",
  "fs2",
  "futures-util",
  "git2",
@@ -1761,12 +1762,18 @@ dependencies = [
  "bytemuck",
  "fnv",
  "glow",
+ "image",
  "imgref",
  "itertools 0.14.0",
  "log",
+ "lru 0.18.4",
  "rgb",
+ "rustybuzz",
  "slotmap",
  "swash",
+ "ttf-parser",
+ "unicode-bidi",
+ "unicode-segmentation",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -3588,6 +3595,12 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 dependencies = [
  "hashbrown 0.16.1",
 ]
+
+[[package]]
+name = "lru"
+version = "0.18.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
 
 [[package]]
 name = "lru-slab"
@@ -6293,7 +6306,7 @@ dependencies = [
  "itertools 0.14.0",
  "levenshtein_automata",
  "log",
- "lru",
+ "lru 0.16.4",
  "lz4_flex",
  "measure_time",
  "memmap2",

@@ -1454,10 +1454,19 @@ slint_pixel::impl_resize_ui!(SettingsWindow);
 // 像素根本不属于窗口，桌面直接露出来，与系统透明效果开关无关（Win10/Win11 都成立）。
 // 半径必须与 .slint 侧 `border-radius` 同值：不一致会在弧线外残留黑边或露底
 //（两边同值 → 硬裁剪弧与绘制弧重合，这是本方案成立的前提）。
+// 追加修复（用户实测）：圆角出来了，但**圆角弧上的黑色描边被砍掉一截**。
+// 归因：`CreateRoundRectRgn` 用椭圆离散化生成弧线，其边界比理想圆弧**内切 1–3px**
+//（scale=1.5 时顶行内切 3px，逐行实测），硬裁剪于是吃掉了设计里的外圈描边。
+// 修法：不再用 `CreateRoundRectRgn`，改为逐行扫描线圆角矩形的**矩形带并集**
+//（`round_rect_bands` 用与 Slint 绘制弧同一套栅格化规则 → 边界逐行重合，描边完整）。
 /// Windows 窗口圆角半径（**逻辑 px**，与 `ui/app.slint` 根 Rectangle 的
 /// `border-radius: 10px` 必须同值）。
 #[cfg(target_os = "windows")]
 const WINDOW_CORNER_RADIUS: f64 = 10.0;
+
+/// `CombineRgn` 的并集模式（`RGN_OR`）。
+#[cfg(target_os = "windows")]
+const RGN_OR: i32 = 2;
 
 /// 取 winit 窗口的 Win32 HWND。
 #[cfg(target_os = "windows")]
@@ -1468,6 +1477,73 @@ fn win32_hwnd(window: &slint::winit_030::winit::window::Window) -> Option<*mut s
         // 非 Win32 句柄只在 Windows 上不可达（后端就是 winit-win32），防御性返回
         _ => None,
     }
+}
+
+/// 逐行扫描线圆角矩形 → 单像素高矩形带（窗口坐标，右下为开区间）。
+///
+/// 为什么不用 `CreateRoundRectRgn`：它按椭圆离散化生成弧线，边界会**切进**理想圆弧
+/// 1–3px（实测 scale=1.5 时顶行内切 3px），窗口区域于是把设计里的外圈描边吃掉一截，
+/// 弧上的黑边看起来「被砍掉」。这里改用**像素中心落在理想圆弧内**的规则
+/// `xl(y) = ceil(R - sqrt(R² - cy²) - 0.5)`（`cy = R - (y + 0.5)`，`R` 为物理半径，
+/// 可为小数）——与 Slint 绘制圆角边框时的栅格化规则一致（实测白面板弧与同规则
+/// `r=12` 的预测逐行吻合）——再用逐行
+/// 矩形并集精确表达，区域边界与设计弧线重合，描边不再被切。
+///
+/// 相邻等宽行会并成一条带，返回的矩形两两不重叠（可安全 OR 进同一区域）。
+///
+/// `cfg(any(test, windows))`：这是**纯数学**函数（唯一的平台相关性只是它紧挨着 Win32 调用），
+/// 让它在 `cargo test` 下也编译，才可能在 macOS 上给它写单测——否则这段边界逻辑只在
+/// Windows 上被编译，CI 与本地都覆盖不到（审查意见）。
+#[cfg(any(test, target_os = "windows"))]
+fn round_rect_bands(width: i32, height: i32, radius: f64) -> Vec<(i32, i32, i32, i32)> {
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    // 有效半径按**半宽/半高**钳制（独立审查建议）。只钳 `xl` 不够：
+    // ① `width < 2r` 时 `width - xl` 会小于 `xl` → `CreateRectRgn` 收到反向矩形并被规范化，
+    //    形状与绘制弧不符（枚举实测 w=1,h=1,r=7.5 → (5,0,-4,1)）；
+    // ② `height < 2r` 时上下圆角区**重叠**，`if y < r` 分支恒先命中，上下不再对称。
+    // 钳到半宽半高后两个问题一起消失，且弧只在放得下的范围内生成。
+    let r = radius
+        .max(1.0)
+        .min(width as f64 / 2.0)
+        .min(height as f64 / 2.0);
+    let inset = |y: i32| -> i32 {
+        // 该行像素中心到圆心 (R, R) 的竖直距离
+        let cy = r - (y as f64 + 0.5);
+        if cy <= 0.0 {
+            return 0; // 已进入直边区
+        }
+        let dx = (r * r - cy * cy).max(0.0).sqrt();
+        // 像素中心落在圆内的最小 x 列
+        ((r - dx) - 0.5).ceil().max(0.0) as i32
+    };
+    let mut bands: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(height as usize);
+    for y in 0..height {
+        let xl = if (y as f64) < r {
+            inset(y)
+        } else if (y as f64) >= height as f64 - r {
+            inset(height - 1 - y) // 下边缘与上边缘对称
+        } else {
+            0
+        };
+        // 退化保护：窗口比圆角直径还窄时（极小窗 / 将来改小 min-width / 复用本函数），
+        // `xl` 可能大到让 `width - xl <= xl` —— `CreateRectRgn` 收到反向矩形会把它规范化成
+        // 「从右往里」的一条，形状与绘制弧不符（审查用枚举脚本扫出 width < 2r 时存在反向
+        // 矩形）。这种尺寸本来就放不下圆角，直接**整行铺满**：既是良定义形状，也保证返回的
+        // 矩形永远 l < r、t < b（注意不能钳成 width/2——那会得到零宽带）。
+        let xl = if xl.saturating_mul(2) >= width { 0 } else { xl };
+        debug_assert!(xl < width - xl, "带必须非空：xl={xl} width={width}");
+        let band = (xl, y, width - xl, y + 1);
+        match bands.last_mut() {
+            // 连续（上一带下沿 == 当前行）且同宽 → 并入
+            Some(last) if last.0 == band.0 && last.2 == band.2 && last.3 == band.1 => {
+                last.3 = band.3;
+            }
+            _ => bands.push(band),
+        }
+    }
+    bands
 }
 
 /// 把设置窗的窗口区域裁成圆角矩形。幂等：每次按当前尺寸/DPI 重算，尺寸变化后重调即刷新。
@@ -1485,7 +1561,8 @@ fn apply_round_window_region(window: &slint::Window) {
     }
     #[link(name = "gdi32")]
     unsafe extern "system" {
-        fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> *mut c_void;
+        fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) -> *mut c_void;
+        fn CombineRgn(dst: *mut c_void, src1: *mut c_void, src2: *mut c_void, mode: i32) -> i32;
         fn DeleteObject(ho: *mut c_void) -> i32;
     }
 
@@ -1502,20 +1579,37 @@ fn apply_round_window_region(window: &slint::Window) {
         if width <= 0 || height <= 0 {
             return; // 最小化等 0 尺寸：保持现有区域不动
         }
-        // 物理 px = 逻辑 px × scale_factor（.slint 侧写的是逻辑 10px）
-        let radius = (WINDOW_CORNER_RADIUS * w.scale_factor()).round() as i32;
-        // 区域坐标是窗口坐标，右下角为开区间 → 各 +1 才能铺满整窗；
-        // CreateRoundRectRgn 的椭圆宽高 = 直径 = 半径 × 2。
-        // SAFETY: 纯 GDI 调用，参数为常量与窗口尺寸
-        let rgn =
-            unsafe { CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2) };
+        // 物理半径 = 逻辑半径 × scale_factor（.slint 侧写的是逻辑 10px）。用浮点不做整数
+        // 取整：绘制弧本就在 10×scale 处（如 1.5 → 15.0，1.25 → 12.5），取整会与绘制弧
+        // 差半像素；逐行扫描线规则天然支持浮点半径，边界可与绘制弧精确重合。
+        let radius = WINDOW_CORNER_RADIUS * w.scale_factor();
+        // 圆角用逐行矩形带并集表达（见 round_rect_bands：与绘制弧逐行重合，
+        // 不像 CreateRoundRectRgn 那样内切 1–3px 把描边吃掉）。
+        // SAFETY: 纯 GDI 调用，参数为窗口尺寸与常量
+        let rgn = unsafe { CreateRectRgn(0, 0, 0, 0) };
         if rgn.is_null() {
             return;
         }
+        let mut ok = true;
+        for (l, t, r, b) in round_rect_bands(width, height, radius) {
+            // SAFETY: 同上；band 用完即释放
+            let band = unsafe { CreateRectRgn(l, t, r, b) };
+            if band.is_null() {
+                ok = false;
+                break;
+            }
+            // SAFETY: rgn/band 均为本函数创建的合法区域；RGN_OR 就地求并
+            let rc = unsafe { CombineRgn(rgn, rgn, band, RGN_OR) };
+            unsafe { DeleteObject(band) };
+            if rc == 0 {
+                ok = false;
+                break;
+            }
+        }
         // bRedraw=1：区域变化立刻重绘（否则要等下一次内容刷新才见效）
         // SAFETY: rgn 是刚创建的合法区域；成功后所有权移交系统（不能再 DeleteObject）
-        if unsafe { SetWindowRgn(hwnd, rgn, 1) } == 0 {
-            // SAFETY: 失败时系统未接管该区域，必须自己释放，否则泄漏 GDI 对象
+        if !ok || unsafe { SetWindowRgn(hwnd, rgn, 1) } == 0 {
+            // SAFETY: 失败（或区域没建好）时系统未接管，必须自己释放，否则泄漏 GDI 对象
             unsafe { DeleteObject(rgn) };
         }
     });
@@ -5469,6 +5563,199 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `round_rect_bands` 的形状不变量：**穷举**小尺寸 × 多个半径，断言
+    /// ①没有任何反向矩形（`x2 <= x1` / `y2 <= y1`）②不越界 ③带与带首尾相接且互不重叠。
+    ///
+    /// 背景（独立审查）：窗口比圆角直径还窄时，`xl` 可能超过 `width - xl`，
+    /// `CreateRectRgn` 收到反向矩形会把它规范化成「从右往里」的一条，形状与绘制弧不符。
+    /// 设置窗 `min-width: 880px` 让这条今天够不到，但函数是通用的，必须锁住。
+    #[test]
+    fn round_rect_bands_never_invert_or_overflow() {
+        for width in 1..=40 {
+            for height in 1..=40 {
+                for radius in [1.0_f64, 7.5, 10.0, 12.5, 15.0] {
+                    let bands = round_rect_bands(width, height, radius);
+                    assert!(
+                        !bands.is_empty(),
+                        "w={width} h={height} r={radius} 不该为空"
+                    );
+                    let mut expect_y = 0;
+                    for (l, t, r, b) in &bands {
+                        assert!(
+                            l < r,
+                            "反向矩形 l={l} r={r}（w={width} h={height} r={radius}）"
+                        );
+                        assert!(
+                            t < b,
+                            "反向矩形 t={t} b={b}（w={width} h={height} r={radius}）"
+                        );
+                        assert!(*l >= 0 && *r <= width, "越界 x：l={l} r={r} width={width}");
+                        assert!(
+                            *t >= 0 && *b <= height,
+                            "越界 y：t={t} b={b} height={height}"
+                        );
+                        assert_eq!(
+                            *t, expect_y,
+                            "带必须逐行相接、不重叠（w={width} h={height}）"
+                        );
+                        expect_y = *b;
+                    }
+                    assert_eq!(expect_y, height, "带必须铺满整高（w={width} h={height}）");
+                }
+            }
+        }
+    }
+
+    /// 直边区必须是整宽（`xl == 0`）：圆角只该发生在上下各 r 行内。
+    #[test]
+    fn round_rect_bands_has_full_width_straight_edges() {
+        let (w, h, r) = (800, 600, 15.0_f64);
+        let bands = round_rect_bands(w, h, r);
+        // 行 r 到 h-r-1 是直边区：这些行只能出现在 xl == 0 的带里
+        for (l, t, rr, b) in &bands {
+            let overlaps_straight = *b > r as i32 && (*t as f64) < (h as f64 - r);
+            if overlaps_straight {
+                // 直边区的带必须是整宽（否则圆心附近还留着内缩）
+                assert!(t < b);
+                if (*t as f64) >= r && (*b as f64) <= h as f64 - r {
+                    assert_eq!(*l, 0, "直边区带必须整宽：l={l} t={t}");
+                    assert_eq!(*rr, w, "直边区带必须整宽：r={rr} t={t}");
+                }
+            }
+        }
+        // 顶行与底行必须内缩（否则圆角没生效）
+        let top = bands.first().copied().unwrap();
+        let bottom = bands.last().copied().unwrap();
+        assert!(top.0 > 0, "顶行必须内缩：{top:?}");
+        assert!(bottom.0 > 0, "底行必须内缩：{bottom:?}");
+        assert_eq!(top.0, bottom.0, "上下圆角必须对称：{top:?} vs {bottom:?}");
+    }
+
+    /// 上下对称 + 内缩逐行单调不减（圆角弧的固有性质），并且小数半径（1.25×10=12.5、1.5×10=15）
+    /// 不能 panic、不能产生非整数误差导致的抖动。
+    #[test]
+    fn round_rect_bands_is_symmetric_and_monotone_for_fractional_radius() {
+        for radius in [10.0_f64, 12.5, 15.0] {
+            let (w, h) = (400, 300);
+            let mut insets = vec![0_i32; h as usize];
+            for (l, t, _r, b) in round_rect_bands(w, h, radius) {
+                for y in t..b {
+                    insets[y as usize] = l;
+                }
+            }
+            for y in 0..(radius.ceil() as usize).min(h as usize) {
+                let mirror = h as usize - 1 - y;
+                assert_eq!(
+                    insets[y], insets[mirror],
+                    "上下不对称 radius={radius} y={y}"
+                );
+                if y > 0 {
+                    assert!(
+                        insets[y] <= insets[y - 1],
+                        "圆角内缩必须逐行单调不减 radius={radius} y={y}"
+                    );
+                }
+            }
+            // 弧之外的直边必须是 0
+            assert_eq!(insets[(h / 2) as usize], 0, "直边必须内缩为 0");
+        }
+    }
+
+    /// 相邻同宽行必须真的并成一条带（否则每次重算会退化成 O(height) 次 GDI 调用）。
+    #[test]
+    fn round_rect_bands_merges_adjacent_rows() {
+        let (w, h, r) = (800, 600, 15.0_f64);
+        let bands = round_rect_bands(w, h, r);
+        assert!(
+            bands.len() <= (4.0 * r) as usize + 4,
+            "带数应约等于 4r，实际 {}（合并失效？）",
+            bands.len()
+        );
+        // 同一带内不能有相邻可合并的断点：任意相邻带的宽度必须不同
+        for pair in bands.windows(2) {
+            let (l1, _, r1, b1) = pair[0];
+            let (l2, _, r2, _) = pair[1];
+            assert!(b1 == pair[1].1, "带必须逐行相接");
+            assert!(l1 != l2 || r1 != r2, "相邻同宽带应已合并：{pair:?}");
+        }
+    }
+
+    /// **渲染侧 oracle**（独立审查要求）：Slint 默认 femtovg 用的是三次贝塞尔
+    /// `Path::rounded_rect` + 展平，**不是**理想圆——所以不能用「与理想圆重合」当验收。
+    /// 这里直接用同一版 femtovg 当 oracle，逐行拿到「绘制路径首个被覆盖的像素」，
+    /// 断言我们的圆角区域满足**安全方向**：区域绝不比实际绘制路径更窄（更窄就会把
+    /// 描边切掉，正是用户报的那个 bug），同时外扩不超过 1px（避免出现明显黑边）。
+    ///
+    /// 已知残留（如实记录，不粉饰）：理想圆公式与贝塞尔展平在个别行差 1px（例如
+    /// scale=2.0/r=20 有 4 行、scale=1.0/r=10 有 2 行），方向是**区域更宽**，因此不会切
+    /// 描边；要彻底逐像素重合需要直接拿展平后的路径生成区域，属后续优化。
+    #[cfg(test)]
+    fn femto_oracle_first_pixels(r: f32, dpi: f32, w: i32, h: i32) -> Vec<i32> {
+        use femtovg::{renderer::Void, Canvas, FillRule, Path};
+        let mut canvas = Canvas::new(Void).expect("femtovg canvas");
+        canvas.set_size(w as u32, h as u32, dpi);
+        let mut path = Path::new();
+        path.rounded_rect(0.0, 0.0, w as f32, h as f32, r);
+        (0..r.ceil() as i32)
+            .map(|y| {
+                (0..(2.0 * r.ceil()) as i32 + 2)
+                    .find(|&x| {
+                        canvas.contains_point(
+                            &path,
+                            x as f32 + 0.5,
+                            y as f32 + 0.5,
+                            FillRule::NonZero,
+                        )
+                    })
+                    .unwrap_or(-1)
+            })
+            .collect()
+    }
+
+    /// 区域的安全性：**永不比绘制路径窄**（否则切描边），且外扩 ≤1px。
+    #[test]
+    fn round_rect_bands_never_narrower_than_femtovg_path() {
+        let (w, h) = (1671, 1067);
+        for scale in [1.0_f64, 1.25, 1.5, 1.75, 2.0] {
+            let r = 10.0 * scale; // .slint 侧重逻辑 10px
+            let dpi = scale.ceil() as f32;
+            let oracle = femto_oracle_first_pixels(r as f32, dpi, w, h);
+            let mut insets = vec![0_i32; h as usize];
+            for (l, t, _r, b) in round_rect_bands(w, h, r) {
+                for y in t..b {
+                    insets[y as usize] = l;
+                }
+            }
+            for (y, want) in oracle.iter().enumerate() {
+                if *want < 0 {
+                    continue;
+                }
+                let got = insets[y];
+                assert!(
+                    got <= *want,
+                    "scale={scale} y={y}: 区域 xl={got} 比绘制路径首像素 {want} 更窄 → 会切描边"
+                );
+                assert!(
+                    *want - got <= 1,
+                    "scale={scale} y={y}: 区域外扩 {}px（>1px 会露出明显黑边）",
+                    *want - got
+                );
+            }
+        }
+    }
+
+    /// 极小窗口（宽高 < 圆角直径）必须退化成良定义的整窗矩形，不得出现反向矩形。
+    #[test]
+    fn round_rect_bands_degenerates_for_tiny_window() {
+        assert_eq!(round_rect_bands(1, 1, 10.0), vec![(0, 0, 1, 1)]);
+        assert_eq!(round_rect_bands(4, 3, 10.0), vec![(0, 0, 4, 3)]);
+        // 宽度够、高度极小：也必须是良定义矩形
+        let bands = round_rect_bands(400, 2, 15.0);
+        assert!(bands
+            .iter()
+            .all(|(l, t, r, b)| l < r && t < b && *r <= 400 && *b <= 2));
+    }
 
     /// #300：预置类型（openrouter/deepseek）留空 base_url 时，「测试连接」也要用预置端点；
     /// 显式填的覆盖预置并去掉尾部斜杠；无预置且留空 → None。
