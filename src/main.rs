@@ -761,17 +761,34 @@ fn run_job_cli(args: &[String]) -> i32 {
 
 /// 解析 job CLI 的目标 bot：AGENT_BRIDGE_BOT_KEY env → 唯一 bot → 报错提示。
 fn resolve_bot_key() -> Result<String, String> {
+    let cfg = config::Config::load();
     if let Ok(k) = std::env::var("AGENT_BRIDGE_BOT_KEY") {
+        let k = k.trim().to_string();
         if !k.is_empty() {
-            return Ok(k);
+            // **必须收敛成规范 key**（issue abb-task-botkey-dir-1）：这个值会被直接当目录名
+            // 用（`tasks/<key>/`、sessions、outbox…），而 service 只扫规范 key。传显示名/
+            // app_id 之类别名时若原样使用，就会「登记成功」到 service 永远不看的目录 →
+            // 任务静默停在 Pending、零报错（现场 3 条任务停摆 12 分钟无人发现）。
+            return match &cfg {
+                Ok(c) if !c.bots.is_empty() => c.resolve_bot_key(&k),
+                Ok(_) => Err(format!(
+                    "无法校验 AGENT_BRIDGE_BOT_KEY={k:?}：config.json 里没有任何 bot——\n\
+                     该 key 对应的目录不会被任何 service 扫描（任务会永远停在 Pending）。\n\
+                     请先在设置窗添加 bot，或在 bot 会话里调用本命令。"
+                )),
+                Err(e) => Err(format!(
+                    "读 config 失败，无法校验 AGENT_BRIDGE_BOT_KEY={k:?}: {e:#}"
+                )),
+            };
         }
     }
-    let cfg = config::Config::load().map_err(|e| format!("读 config 失败: {e:#}"))?;
+    let cfg = cfg.map_err(|e| format!("读 config 失败: {e:#}"))?;
     match cfg.bots.len() {
         0 => Err("config.json 没有配置任何 bot".into()),
         1 => Ok(cfg.bots[0].key()),
         n => Err(format!(
-            "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）"
+            "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）\n可用：{}",
+            cfg.bot_key_list()
         )),
     }
 }

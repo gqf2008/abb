@@ -504,6 +504,28 @@ pub async fn run() {
             history_gc_loop(stop).await;
         });
     }
+    // 「幽灵任务目录」告警（issue abb-task-botkey-dir-1 的反馈回路）：tasks/ 下若存在
+    // **不属于任何已配置 bot** 的目录且里面有任务定义，说明有 CLI 用了非法 key（例如 bot
+    // 显示名）登记任务——那些任务永远不会被本 service 认领。旧行为是完全静默：CLI 报
+    // 「登记成功」、`task list`（在错 key 下）也能列出来，用户只看到「任务没反应」。
+    {
+        // 必须用**全部已配置 bot**（含停用/暂无凭证/未就绪的）：`ready` 只含启用且就绪的，
+        // 拿它当 known 会把「已配置但停用」的 bot 目录误报成「不属于任何已配置 bot」
+        // （独立审查 a9c9f0b 复现：app_off 被误报）。
+        let known = configured_keys(&cfg);
+        let ghosts = ghost_task_dirs(&crate::bridge_dir().join("tasks"), &known);
+        {
+            if !ghosts.is_empty() {
+                crate::log!(
+                    "⚠️ tasks/ 下有 {} 个目录不属于任何已配置 bot（这些任务**永远不会被认领**）：{}\n\
+                     ↳ 多半是 AGENT_BRIDGE_BOT_KEY 用了 bot 显示名等别名；请用规范 key 重新登记（`task list` 在对应 key 下可见）",
+                    ghosts.len(),
+                    ghosts.join(", ")
+                );
+            }
+        }
+    }
+
     let mut handles = Vec::new();
     for (bot, msgr) in ready {
         let cfg = cfg.clone();
@@ -1274,6 +1296,44 @@ fn fnv(s: &str) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// 扫出「不属于任何已配置 bot」的任务目录（issue abb-task-botkey-dir-1）。
+///
+/// 只认可**目录 + 内含 `tasks.json`** 的条目：这类目录代表「有人用别的 key 登记过任务」，
+/// 而本 service 永远不会去扫它（每个 bot 的 worker 只认 `tasks/<bot.key()>/`）。
+/// 抽出纯函数是为了能在单测里覆盖（生产调用点只需要一个 known key 集合）。
+/// 「哪些 key 属于已配置的 bot」的**唯一**定义：全部 `cfg.bots`，不看 enabled/是否就绪。
+///
+/// ghost 告警的语义是「这个目录不属于任何已配置 bot」，所以判据必须是配置本身。
+/// 若将来想额外提醒「已配置但当前跑不起来」的任务，那是另一条消息、另一个判据。
+fn configured_keys(cfg: &crate::config::Config) -> std::collections::HashSet<String> {
+    cfg.bots.iter().map(|b| b.key()).collect()
+}
+
+fn ghost_task_dirs(
+    root: &std::path::Path,
+    known: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = path.file_name().and_then(|s| s.to_str())?.to_string();
+            if known.contains(&name) || !path.join("tasks.json").exists() {
+                return None;
+            }
+            Some(name)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// 维护循环 24h 门判定：自上次运行（门=落盘标记种子）满 24h 即到点。
@@ -2061,6 +2121,64 @@ mod tests {
             Some("⏰ 定时任务执行失败：boom".to_string()),
             "Failed 是「终态失败」→ 带原因回报，不得复用超时文案"
         );
+    }
+
+    /// issue abb-task-botkey-dir-1：`tasks/` 下不属于任何已配置 bot 的目录要被点出来
+    /// （否则那些任务「登记成功但永不被认领」，且完全静默）。
+    #[test]
+    fn ghost_task_dirs_flags_only_unknown_dirs_with_definitions() {
+        let root = std::env::temp_dir().join(format!("abb-ghost-{}", uuid::Uuid::new_v4()));
+        let tasks = root.join("tasks");
+        std::fs::create_dir_all(tasks.join("b_ok")).unwrap();
+        std::fs::create_dir_all(tasks.join("微信龙虾")).unwrap(); // 幽灵：显示名当 key
+        std::fs::create_dir_all(tasks.join("empty_dir")).unwrap(); // 无定义 → 不算
+        std::fs::write(tasks.join("b_ok").join("tasks.json"), "[]").unwrap();
+        std::fs::write(tasks.join("微信龙虾").join("tasks.json"), "[]").unwrap();
+        std::fs::write(tasks.join("stray.txt"), "x").unwrap(); // 非目录
+
+        let known: std::collections::HashSet<String> = ["b_ok".to_string()].into_iter().collect();
+        assert_eq!(
+            ghost_task_dirs(&tasks, &known),
+            vec!["微信龙虾".to_string()],
+            "只应点出「未知目录 + 含定义」的那一个"
+        );
+        // 根目录不存在 → 空（不 panic）
+        assert!(ghost_task_dirs(&root.join("nope"), &known).is_empty());
+
+        // 生产用的 known 集合来自「全部已配置 bot」：停用/未就绪的 bot **不得**被判成幽灵。
+        // 独立审查 a9c9f0b 复现过：拿 ready（启用且就绪）当 known 会把 enabled=false 的
+        // 已配置 bot 目录误报成「不属于任何已配置 bot」。
+        let mut cfg = crate::config::Config::default();
+        cfg.bots = vec![
+            crate::config::BotConfig {
+                app_id: "app_ok".into(),
+                ..Default::default()
+            },
+            crate::config::BotConfig {
+                app_id: "app_off".into(),
+                enabled: false, // 停用，但确实已配置
+                ..Default::default()
+            },
+            crate::config::BotConfig {
+                app_id: "b_ok".into(), // 上面那个含定义的目录，在本 cfg 下是合法 bot
+                ..Default::default()
+            },
+        ];
+        let cfg_keys = configured_keys(&cfg);
+        assert!(
+            cfg_keys.contains("app_ok")
+                && cfg_keys.contains("app_off")
+                && cfg_keys.contains("b_ok")
+        );
+        std::fs::create_dir_all(tasks.join("app_off")).unwrap();
+        std::fs::write(tasks.join("app_off").join("tasks.json"), "[]").unwrap();
+        assert_eq!(
+            ghost_task_dirs(&tasks, &cfg_keys),
+            vec!["微信龙虾".to_string()],
+            "停用但已配置的 bot 目录不得被报成幽灵"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
