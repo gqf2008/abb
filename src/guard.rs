@@ -126,7 +126,8 @@ fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<
 }
 
 /// guard-check 子命令入口（main.rs 分发）：读 stdin 的 hook 事件 JSON，输出决策 JSON。
-/// 返回进程退出码（0；决策在 stdout，hook 不看退出码）。
+/// 正常决策返回 0；env 存在但无法收敛时输出 deny 并返回 2（fail-closed，且满足
+/// CLI 非法 key 非零退出契约）。
 pub fn guard_check_main() -> i32 {
     // 前置：非 granted 会话不再直接放行——owner 会话也要删除保护（#88）。
     // 角色分派：granted → 现有白名单闸；owner → 只拦删除类 Bash（其它命令直通）。
@@ -134,20 +135,23 @@ pub fn guard_check_main() -> i32 {
     // 全量闸 + 双区：写域 = 自己的 vb/<uuid>/，读域 = 写域 ∪ bot 工作区（可读 bot
     // 工作目录、不可写他人目录/bot 根）。
     let role = crate::config::SenderRole::from_env();
-    let Some(zones) = resolve_workspaces() else {
-        // 无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）：granted 拒绝（fail-closed），
-        // owner 放行（无工作区上下文可拦，保持原行为）。
-        if role == crate::config::SenderRole::Granted {
-            println!(
-                "{}",
-                decision_json(&Decision::Deny(
-                    "无法解析工作区（AGENT_BRIDGE_BOT_KEY 缺失）".into()
-                ))
-            );
-        } else {
-            println!("{}", decision_json(&Decision::Allow));
+    let zones = match resolve_workspaces() {
+        Ok(zones) => zones,
+        Err(e) => {
+            // env 缺失时 owner 保持放行；env 存在但非法/不可解析时 fail-closed，
+            // 避免 owner 删除保护因别名指错作用域而把危险删除当“工作区外”放行。
+            let env_present = std::env::var("AGENT_BRIDGE_BOT_KEY")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let reason = format!("无法解析工作区：{e}");
+            if role == crate::config::SenderRole::Granted || env_present {
+                eprintln!("[guard-check] {reason}");
+                println!("{}", decision_json(&Decision::Deny(reason)));
+            } else {
+                println!("{}", decision_json(&Decision::Allow));
+            }
+            return if env_present { 2 } else { 0 };
         }
-        return 0;
     };
     let (workspace, read_workspace, vb_confined) = match zones {
         WsZones::Single(ws) => (ws, None, false),
@@ -263,6 +267,7 @@ fn decision_json(d: &Decision) -> String {
 }
 
 /// 工作区解析结果（#194）。
+#[derive(Debug)]
 enum WsZones {
     /// 非虚拟会话：单区（写=读=bot 工作区，行为与历史版本一致）。
     Single(PathBuf),
@@ -273,32 +278,47 @@ enum WsZones {
     Broken,
 }
 
-/// 解析工作区双区。
-fn resolve_workspaces() -> Option<WsZones> {
-    let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY").ok()?;
-    let bot_ws = std::fs::canonicalize(crate::workspace_dir(&bot_key)).ok()?;
+/// 解析工作区双区。bot key 必须先经 Config::resolve_bot_key 收敛（service 正常注入
+/// 规范 key；手工/异常环境传别名或路径串时不得把原值拼进目录）。
+fn resolve_workspaces() -> Result<WsZones, String> {
+    let bot_key = std::env::var("AGENT_BRIDGE_BOT_KEY")
+        .map_err(|_| "AGENT_BRIDGE_BOT_KEY 缺失".to_string())?;
     let chat = std::env::var("AGENT_BRIDGE_CHAT_ID").unwrap_or_default();
+    let cfg = crate::config::Config::load().map_err(|e| format!("读 config 失败: {e:#}"))?;
+    resolve_workspaces_at(&cfg, &bot_key, &chat, &crate::bridge_dir())
+}
+
+/// 可注入 bridge 根的实现（单测使用临时根，绝不碰真实 ~/.agent-bridge）。
+fn resolve_workspaces_at(
+    cfg: &crate::config::Config,
+    bot_input: &str,
+    chat: &str,
+    bridge_root: &Path,
+) -> Result<WsZones, String> {
+    let bot_key = cfg.resolve_bot_key(bot_input)?;
+    let bot_ws = std::fs::canonicalize(bridge_root.join("workspaces").join(&bot_key))
+        .map_err(|e| format!("bot「{bot_key}」工作区不可解析: {e}"))?;
     if chat.is_empty() {
-        return Some(WsZones::Single(bot_ws));
+        return Ok(WsZones::Single(bot_ws));
     }
-    let Some(vb) = crate::virtualbot::vb_dir_for(&bot_key, &chat) else {
-        return Some(WsZones::Single(bot_ws));
+    let Some(vb) = crate::virtualbot::vb_dir_for(&bot_key, chat) else {
+        return Ok(WsZones::Single(bot_ws));
     };
     // vb 目录理论上由 agent spawn 前建好；不可解析（被删/竞态）先重建再 canonicalize，
     // 仍失败 → Broken（fail-closed 全拒）。
     match std::fs::canonicalize(&vb) {
-        Ok(v) => Some(WsZones::Dual {
+        Ok(v) => Ok(WsZones::Dual {
             write: v,
             read: bot_ws,
         }),
         Err(_) => {
             let _ = std::fs::create_dir_all(&vb);
             match std::fs::canonicalize(&vb) {
-                Ok(v) => Some(WsZones::Dual {
+                Ok(v) => Ok(WsZones::Dual {
                     write: v,
                     read: bot_ws,
                 }),
-                Err(_) => Some(WsZones::Broken),
+                Err(_) => Ok(WsZones::Broken),
             }
         }
     }
@@ -1078,6 +1098,69 @@ mod tests {
 
     fn workspace_canon(dir: &Path) -> PathBuf {
         std::fs::canonicalize(dir).unwrap()
+    }
+
+    /// 独立审查要求锁住的裁决：`guard-check` 在 **env 存在但工作区解析不出来** 时 fail-closed
+    /// （输出 deny 且 exit=2），并且必须能区分两类原因——
+    /// ①「合法规范 key、只是工作区目录还不存在」；②「key 根本不是已配置 bot / 不是安全路径组件」。
+    /// 前者是 fail-closed 的有意行为（判不了边界就不放行），后者是输入非法；两者的处置与排障方向不同，
+    /// 错误文案因此不能混成一句。
+    #[test]
+    fn workspace_resolution_distinguishes_missing_workspace_from_unknown_key() {
+        let root = std::env::temp_dir().join(format!("abb-guard-miss-{}", uuid::Uuid::new_v4()));
+        let mut cfg = crate::config::Config::default();
+        cfg.bots = vec![crate::config::BotConfig {
+            name: "显示名".to_string(),
+            app_id: "app_safe".to_string(),
+            ..Default::default()
+        }];
+
+        // ① 合法规范 key + 工作区目录不存在 → 报「工作区不可解析」，且不得说成「不是已配置 bot」
+        let missing = resolve_workspaces_at(&cfg, "app_safe", "", &root).unwrap_err();
+        assert!(
+            missing.contains("工作区不可解析"),
+            "合法 key 但目录缺失必须报工作区不可解析：{missing}"
+        );
+        assert!(
+            !missing.contains("不是任何已配置 bot"),
+            "不得把「目录缺失」误报成「key 不认识」：{missing}"
+        );
+
+        // ② 非法 key → 报的是完全不同的原因
+        let unknown = resolve_workspaces_at(&cfg, "隔壁老王", "", &root).unwrap_err();
+        assert!(
+            unknown.contains("不是任何已配置 bot"),
+            "非法 key 必须报不认识：{unknown}"
+        );
+        assert_ne!(missing, unknown, "两类失败原因必须可区分");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_resolution_rejects_unsafe_alias_before_touching_temp_root() {
+        let root = std::env::temp_dir().join(format!("abb-guard-key-{}", uuid::Uuid::new_v4()));
+        let mut cfg = crate::config::Config::default();
+        cfg.bots = vec![crate::config::BotConfig {
+            name: "显示名".to_string(),
+            app_id: "app_safe".to_string(),
+            ..Default::default()
+        }];
+        let err = resolve_workspaces_at(&cfg, "../../evil", "", &root).unwrap_err();
+        assert!(err.contains("安全的单一路径组件"), "{err}");
+        assert!(err.contains("app_safe"), "错误须列出可选 key：{err}");
+        assert!(!root.exists(), "解析失败不得创建/访问工作区");
+
+        // service 正常注入规范 key 时路径保持可用；别名也收敛到同一路径。
+        std::fs::create_dir_all(root.join("workspaces/app_safe")).unwrap();
+        let expected = std::fs::canonicalize(root.join("workspaces/app_safe")).unwrap();
+        for input in ["app_safe", "显示名"] {
+            match resolve_workspaces_at(&cfg, input, "", &root).unwrap() {
+                WsZones::Single(ws) => assert_eq!(ws, expected, "input={input}"),
+                _ => panic!("非虚拟会话应为 Single"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
