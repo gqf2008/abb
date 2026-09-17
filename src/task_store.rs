@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// 定义文件 schema 版本。读取时高于本版本 → 拒绝（不猜测未来字段语义）。
@@ -129,6 +129,57 @@ pub fn remove_task_logs(paths: &TaskPaths, id: &str) {
     for i in 1..8 {
         let _ = fs::remove_file(std::path::PathBuf::from(format!("{}.{i}", base.display())));
     }
+}
+
+/// 日志轮转保留的**总份数**（含当前 `id.log`）：Q4 拟定的默认值是「单文件 10MB /
+/// 保留 3 份」，本批先按该默认值实现，Q4 正式拍板后改这一处即可。
+///
+/// 放在存储层（而不是写日志的 `task_run`）：它同时决定轮转**写**几份与 `task logs --all`
+/// 往回**读**几段，两边的边界必须是同一个数，否则会把已经落盘的历史读漏。
+pub(crate) const LOG_KEEP_FILES: usize = 3;
+
+/// 读取一条任务的日志文本（CLI `task logs` 的纯函数内核，便于单测）。
+///
+/// - `all = false`：只读当前 `id.log`——与历史行为逐字一致。
+/// - `all = true`：按 `.N → … → .1 → 当前`（**最老 → 最新**）拼接，把轮转历史一次展开。
+///   缺失的段**直接跳过**：轮转只保留 [`LOG_KEEP_FILES`] 份，早期任务可能根本没有 `.2`，
+///   把「不存在」当错误会让 `--all` 对多数任务直接报错。
+///
+/// 只有**一段都读不到**时才回报错误，且错误文案与「只读当前文件」时完全一致
+/// （`读日志失败（<路径>）：<原因>`），CLI 侧原样打印即可。
+pub fn read_task_logs(paths: &TaskPaths, id: &str, all: bool) -> Result<String> {
+    let current = paths.log_file(id);
+    if !all {
+        return fs::read_to_string(&current).map_err(|e| log_read_err(&current, &e));
+    }
+
+    let rotated = |i: usize| PathBuf::from(format!("{}.{i}", current.display()));
+    let mut body = String::new();
+    let mut found = false;
+    // 序号越大越老：从 `LOG_KEEP_FILES - 1` 倒着读到 1，拼出来才是时间顺序。
+    for path in (1..LOG_KEEP_FILES).rev().map(rotated) {
+        match fs::read_to_string(&path) {
+            Ok(part) => {
+                found = true;
+                body.push_str(&part);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(log_read_err(&path, &e)),
+        }
+    }
+    // 当前段单独读：命中就接在最后；缺失时只有「历史也一段都没有」才算错——这时用当前
+    // 文件**真实**的 `io::Error` 拼提示，保证与不带 `--all` 时逐字一致。
+    match fs::read_to_string(&current) {
+        Ok(part) => body.push_str(&part),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && found => {}
+        Err(e) => return Err(log_read_err(&current, &e)),
+    }
+    Ok(body)
+}
+
+/// `task logs` 的读日志错误：文案与旧实现（`读日志失败（路径）：原因`）逐字一致。
+fn log_read_err(path: &Path, e: &std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!("读日志失败（{}）：{e}", path.display())
 }
 
 /// 严格解析 `once` 的 `YYYY-MM-DD HH:MM`：
@@ -1307,5 +1358,84 @@ mod tests {
         assert!(t.timeout().is_none());
         t.limits.timeout_secs = 7;
         assert_eq!(t.timeout().unwrap().as_secs(), 7);
+    }
+
+    /// P4：`task logs` 的纯函数内核——默认（`all=false`）只读当前段，`--all` 才拼历史。
+    #[test]
+    fn read_task_logs_default_reads_only_current_segment() {
+        let root = std::env::temp_dir().join(format!("abb-rlog-cur-{}", uuid::Uuid::new_v4()));
+        let paths = TaskPaths::with_root(&root, "b");
+        fs::create_dir_all(paths.logs_dir()).unwrap();
+        let current = paths.log_file("tk");
+        fs::write(&current, "cur-1\ncur-2\n").unwrap();
+
+        // 只有当前段：两种模式都只看到当前内容
+        assert_eq!(
+            read_task_logs(&paths, "tk", false).unwrap(),
+            "cur-1\ncur-2\n"
+        );
+        assert_eq!(
+            read_task_logs(&paths, "tk", true).unwrap(),
+            "cur-1\ncur-2\n"
+        );
+
+        // 补上 .1/.2 后：`all=false` 仍**不含**历史（默认行为一点没变）
+        fs::write(current.with_file_name("tk.log.1"), "mid-1\n").unwrap();
+        fs::write(current.with_file_name("tk.log.2"), "old-1\n").unwrap();
+        assert_eq!(
+            read_task_logs(&paths, "tk", false).unwrap(),
+            "cur-1\ncur-2\n"
+        );
+        // `all=true` 按 .2 → .1 → 当前（最老 → 最新）拼接
+        assert_eq!(
+            read_task_logs(&paths, "tk", true).unwrap(),
+            "old-1\nmid-1\ncur-1\ncur-2\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 段缺失（早期任务没有 `.2`、当前文件被删过只剩历史）→ 跳过而不是报错。
+    #[test]
+    fn read_task_logs_skips_missing_segments() {
+        let root = std::env::temp_dir().join(format!("abb-rlog-gap-{}", uuid::Uuid::new_v4()));
+        let paths = TaskPaths::with_root(&root, "b");
+        fs::create_dir_all(paths.logs_dir()).unwrap();
+        let current = paths.log_file("tk");
+
+        // 只有 .2：.1 与当前都缺 → 仍能读到 .2
+        fs::write(current.with_file_name("tk.log.2"), "old-2\n").unwrap();
+        assert_eq!(read_task_logs(&paths, "tk", true).unwrap(), "old-2\n");
+
+        // 当前 + .2（缺 .1）：跳过后按序拼接
+        fs::write(&current, "cur\n").unwrap();
+        assert_eq!(read_task_logs(&paths, "tk", true).unwrap(), "old-2\ncur\n");
+        // `all=false` 只认当前段，存在历史也不影响
+        assert_eq!(read_task_logs(&paths, "tk", false).unwrap(), "cur\n");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 当前段不存在且没有任何历史时，提示与「只读当前文件」逐字一致（`--all` 也一样）。
+    #[test]
+    fn read_task_logs_missing_current_keeps_legacy_error() {
+        let root = std::env::temp_dir().join(format!("abb-rlog-miss-{}", uuid::Uuid::new_v4()));
+        let paths = TaskPaths::with_root(&root, "b");
+        fs::create_dir_all(paths.logs_dir()).unwrap();
+        let current = paths.log_file("tk");
+
+        // 拿一次真实的读失败 `io::Error` 拼参照，锁住「与现状一致」的提示
+        let io_err = fs::read_to_string(&current).unwrap_err();
+        let expected = format!("读日志失败（{}）：{io_err}", current.display());
+        assert_eq!(
+            read_task_logs(&paths, "tk", false).unwrap_err().to_string(),
+            expected
+        );
+        assert_eq!(
+            read_task_logs(&paths, "tk", true).unwrap_err().to_string(),
+            expected
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

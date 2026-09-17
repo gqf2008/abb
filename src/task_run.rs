@@ -34,6 +34,7 @@ use std::time::Duration;
 use crate::deliver::{DeliveryItem, Router};
 use crate::task_store::{
     PayloadKind, Task, TaskRuntime, TaskStateKind, TaskStateStore, TaskStore, TriggerKind,
+    LOG_KEEP_FILES,
 };
 
 /// 任务提示的 `prompt_tag`。与 `schedule::JOB_PROMPT_TAG` 分开：任务不是定时任务，
@@ -58,10 +59,6 @@ const CANCEL_REASON_SHUTDOWN: &str = "已取消（service 关停）";
 
 /// 尚未开跑就被取消的落盘原因。
 const CANCEL_REASON_BEFORE_START: &str = "已取消（task cancel，尚未开跑）";
-
-/// 日志轮转保留的**总份数**（含当前 `id.log`）：Q4 拟定的默认值是「单文件 10MB /
-/// 保留 3 份」，本批先按该默认值实现，Q4 正式拍板后改这一处即可。
-const LOG_KEEP_FILES: usize = 3;
 
 /// 终态任务的日志保留期（天）。Q4 只约束单文件大小，这里补一个**时间**上界，
 /// 免得「跑过一次就再没人看」的任务把日志目录长期堆着。
