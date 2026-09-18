@@ -771,8 +771,24 @@ fn run_job_cli(args: &[String]) -> i32 {
 
 /// 解析 job CLI 的目标 bot：AGENT_BRIDGE_BOT_KEY env → 唯一 bot → 报错提示。
 fn resolve_bot_key() -> Result<String, String> {
-    let raw = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
+    resolve_bot_key_with(None)
+}
+
+/// 解析 task CLI 的目标 bot：显式 `--bot` 优先，其次 AGENT_BRIDGE_BOT_KEY env，
+/// 最后单 bot 回落。显式入口让多 bot 下的人类终端不必设置 agent 环境变量。
+fn resolve_bot_key_with(explicit: Option<&str>) -> Result<String, String> {
     let cfg = config::Config::load().map_err(|e| format!("读 config 失败: {e:#}"))?;
+    if let Some(key) = explicit {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("--bot 缺少 key".into());
+        }
+        if cfg.bots.is_empty() {
+            return Err("--bot 无法解析：config.json 里没有任何 bot".into());
+        }
+        return cfg.resolve_bot_key(key);
+    }
+    let raw = std::env::var("AGENT_BRIDGE_BOT_KEY").ok();
     resolve_env_bot_key_from(&cfg, raw.as_deref())
 }
 
@@ -795,7 +811,7 @@ fn resolve_env_bot_key_from(cfg: &config::Config, raw: Option<&str>) -> Result<S
         0 => Err("config.json 没有配置任何 bot".into()),
         1 => cfg.resolve_bot_key(&cfg.bots[0].key()),
         n => Err(format!(
-            "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；手动用请把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）\n可用：{}",
+            "有 {n} 个 bot 但未指定目标（桥正常调用会注入 AGENT_BRIDGE_BOT_KEY；task add 人类入口请用 --bot <key>，其它手动调用可把该环境变量设成某个 bot 的 **key**，同名 bot 会带 -2 后缀）\n可用：{}",
             cfg.bot_key_list()
         )),
     }
@@ -848,6 +864,41 @@ fn take_proc_cmd(args: &[String], cmd_index: usize) -> Result<Vec<String>, Strin
     Ok(args[cmd_index + 1..].to_vec())
 }
 
+/// 在解析 agent 上下文前提取 `task add --bot <key>`。扫描必须按参数 arity 跳过
+/// 其它选项的值，并在 `--cmd` 处停止——`--cmd` 后面全是 argv，`--bot` 只是命令参数。
+fn task_add_bot_arg(args: &[String]) -> Result<Option<String>, String> {
+    if args.first().map(String::as_str) != Some("add") {
+        return Ok(None);
+    }
+    let mut bot: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bot" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("--bot 缺少 key".into());
+                };
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err("--bot 缺少 key".into());
+                }
+                if bot.is_some() {
+                    return Err("--bot 只能指定一次".into());
+                }
+                bot = Some(value.to_string());
+                i += 2;
+            }
+            "--cmd" => break,
+            "--prompt" | "--text" | "--env" | "--name" | "--cwd" | "--timeout-secs"
+            | "--max-restarts" | "--grace-secs" | "--once" | "--cron" | "--every" | "--to" => {
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(bot)
+}
+
 /// proc 创建参数的粗粒度识别：在解析 bot / 初始化 store 之前先拦 agent，
 /// 避免“参数最终才报错”的路径留下任何任务目录或运行态副作用。
 fn task_add_requests_proc(args: &[String]) -> bool {
@@ -872,17 +923,24 @@ fn run_task_cli(args: &[String]) -> i32 {
         eprintln!("{TASK_CLI_HELP}");
         return 0;
     }
+    let explicit_bot = match task_add_bot_arg(args) {
+        Ok(bot) => bot,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     // Q8 纵深防御：hook 之外，CLI 本身也不接受 agent 上下文创建 proc。真实 ACP shell
     // 由 buzz-agent 的 apply_passthrough_env 注入 ABB_AGENT_CONTEXT=1；legacy
-    // AGENT_BRIDGE_* 仅作旧 hook/调试路径兜底。人类终端与 GUI 不带这些标记，仍可走进
-    // 下面的 `--proc` 分支。owner FullAccess 仍可绕过，见 task-model D5。
+    // AGENT_BRIDGE_* 仅作旧 hook/调试路径兜底。多 bot 人类终端用 task add --bot 选 bot，
+    // 不必伪装 agent 注入；无标记仍可走进下面的 `--proc` 分支。owner FullAccess 仍可绕过。
     if task_add_requests_proc(args) {
         if let Some(reason) = task_proc::agent_context_rejection() {
             eprintln!("{reason}");
             return 1;
         }
     }
-    let bot_key = match resolve_bot_key() {
+    let bot_key = match resolve_bot_key_with(explicit_bot.as_deref()) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("{e}");
@@ -1094,6 +1152,10 @@ fn run_task_cli(args: &[String]) -> i32 {
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--bot" => {
+                        // 已在 task_add_bot_arg 中解析并用于选择 TaskStore。
+                        i += 2;
+                    }
                     "--prompt" | "--text" => {
                         let Some(v) = args.get(i + 1) else {
                             eprintln!("--prompt 缺内容");
@@ -1377,13 +1439,13 @@ fn run_task_cli(args: &[String]) -> i32 {
 }
 
 /// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
-const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n     agent-bridge task add --proc [上述公共选项] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>（--cmd 必须最后，后续参数原样作为 argv）";
+const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n     agent-bridge task add --proc [上述公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>（--cmd 必须最后，后续参数原样作为 argv；--bot 用于多 bot 人类入口选择目标任务 bot）";
 
 /// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
 /// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
 pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
-    \n  task add --prompt \"做什么\" [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
-     \n  task add --proc [公共选项] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>  人工/GUI 专用；argv 不经过 shell，--cmd 必须放最后\n\
+    \n  task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
+     \n  task add --proc [公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>  人工/GUI 专用；--bot 供多 bot 人类入口选目标任务 bot；argv 不经过 shell，--cmd 必须放最后\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\
      \n  task logs <id前缀> [--tail N] [--all]  看任务日志（缺省末 200 行；--all 先按 .2→.1→当前拼接轮转历史再取末 N 行）\n\

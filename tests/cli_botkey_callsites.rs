@@ -588,3 +588,70 @@ fn task_add_proc_allows_human_entry_without_agent_env() {
     assert_eq!(items[0]["payload"]["kind"], "proc");
     assert_eq!(items[0]["created_by"]["role"], "owner");
 }
+
+#[cfg(unix)]
+#[test]
+fn task_add_proc_human_multibot_uses_explicit_bot() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot(), other_bot()]));
+    let out = home.run_minimal(
+        &[
+            "task",
+            "add",
+            "--bot",
+            "other_bot",
+            "--proc",
+            "--cmd",
+            "/bin/true",
+        ],
+        &[],
+    );
+    assert_ok(&out);
+
+    let path = home.bridge_dir().join("tasks/other_bot/tasks.json");
+    let tasks: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let items = tasks.as_array().expect("tasks.json 应为数组");
+    assert_eq!(items.len(), 1, "多 bot 人类入口应登记到 --bot 指定目录");
+    assert_eq!(items[0]["bot_key"], "other_bot");
+    assert_eq!(items[0]["payload"]["kind"], "proc");
+    assert_eq!(items[0]["created_by"]["role"], "owner");
+    assert!(
+        !home.bridge_dir().join("tasks/app_safe/tasks.json").exists(),
+        "不能误写到默认/另一个 bot 的任务目录"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn task_add_proc_acp_context_cannot_bypass_with_explicit_bot() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot(), other_bot()]));
+    let out = home.run_minimal(
+        &[
+            "task",
+            "add",
+            "--bot",
+            "other_bot",
+            "--proc",
+            "--cmd",
+            "/bin/true",
+        ],
+        &[("ABB_AGENT_CONTEXT", "1")],
+    );
+    assert!(
+        !out.status.success(),
+        "显式 --bot 不得绕过真实 ACP agent 上下文拒绝"
+    );
+    assert!(
+        stderr(&out).contains("proc 只允许 GUI/人工入口"),
+        "stderr={}",
+        stderr(&out)
+    );
+    assert!(
+        !home
+            .bridge_dir()
+            .join("tasks/other_bot/tasks.json")
+            .exists(),
+        "被拒绝的 agent proc 不得落盘"
+    );
+}
