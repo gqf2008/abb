@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v8";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v9";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -163,6 +163,48 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - 投递是异步的：CLI 只入队，service 侧实际发送；失败会回源到当前会话报错，不会静默丢。
 - 开关关闭时 CLI 会直接报错——提示用户先去设置打开，不要反复重试。
 - **防循环**：不要把收到的跨会话消息再原样转发回去（同一来源/目标/内容 10 分钟内会被 service 抑制并回源提示）。
+
+## 改本仓代码 → 走 walgit 记账（**仅 owner 会话**）
+
+在 ABB 本仓改代码、或与其它 agent 分工协作时，用**本机 walgit 的协同记账**把每一步留在
+`refs/collab/*`，不要只在对话里说「我做完了」。契约（缺一不可）：
+
+- **开线程** `issue`（`--parent \"\"`）
+- **认领** `comment`（写清 owner/worktree/branch）+ `status: in-progress`
+- **交补丁** `patch`（带 `--base refs/heads/main --head refs/heads/<branch>`）
+- **评审** `review`（带 `decision: approve|needs-changes`、`agent`、`note`）；needs-changes 要退回 in-progress
+- **合并** `merge_result`（先写合并点 oid，再补一条 `merged=true`）
+- **收尾** `status: closed`；看板卡片只能靠追加 `status` 条目移动，别改看板文件
+
+命令形态（下面的 `$WALGIT` 指**探测到的 walgit 可执行路径**；`--parent` 必须取上一条命令
+返回的 oid；中文 body 用 python3 生成 JSON 再 `--body \"$(cat f)\"`，别在 shell 里手写转义）：
+
+```sh
+\"$WALGIT\" --config ~/.walgit/walgit.toml collab entry --kind patch --id <线程> \
+    --actor <你的 principal> --parent <上一条 oid> --body \"$(cat body.json)\" \
+    --base refs/heads/main --head refs/heads/<branch> \
+  --key ~/.walgit/keys/<principal>.ed25519 --push origin
+```
+
+**谁签什么**：**实现者**签自己的 `comment`/`patch` 与**实现侧的 `status` 流转**
+（`in-progress` / `needs-review` / `needs-changes` 退回 in-progress）；**审查者**签自己的
+`review`；**集成方**签 `merge_result` ×2 与 `status: closed`。**不要用别人的 key 代签**——
+签名就是为了让审计链能区分「谁做的 / 谁审的 / 谁合的」。新 agent 要 key：`~/.walgit/new-agent-key.sh <principal> --repo <仓库>`
+（生成 key + 注册 principal，幂等）。
+
+**可达性：先探测，别硬写**（写死的命令在这个环境里调不到是踩过的坑）：
+
+1. `walgit` **不随包**（安装包里没有它）。按顺序探测：
+   `command -v walgit` → `$HOME/.local/bin/walgit` → `/Applications/walgit-tray.app/Contents/Resources/walgit`
+   （本机 PATH 通常已含 `~/.local/bin`，别假设）。三个都没有 → **明确告诉用户「本机没有 walgit CLI，
+   无法记账」**，把要记的内容留成文本，别假装记了。
+2. 仓库 `origin` 必须是本机 walgit（`git remote -v` 里能看到 `127.0.0.1:8081`），否则条目推不上去。
+3. 查状态：`\"$WALGIT\" collab board`（看板）、`collab thread <id>`（单线程）、`collab report`（总览）。
+
+**受限（授权者）会话里用不了**：白名单里**没有 walgit**（实测 `walgit --version` 直接 deny）。
+白名单只放行 `$ABB_BIN` 的少数子命令（`job add` / `task add` / `session reset` / `deliver`）和一批
+**只读**命令（`git status`/`diff`/`ls-files`/`branch`/`remote`/`rev-parse`…、`ls`/`cat`/`grep`/`find`/`head`/`tail`…）。
+所以要提交、推分支、记账这些**写操作**，请在 owner 会话（或自己的终端）里做。
 
 ## 其它
 
@@ -970,10 +1012,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #312 验收② / v8：marker v6 → v8 触发**存量**工作区自动覆盖升级（且只升一次）。
+    /// #312 验收② / v9：marker v6/v7/v8 → v9 触发**存量**工作区自动覆盖升级（且只升一次）。
     /// v8 新增「编程类长任务走子代理 + 委派必须立刻告知用户 + 用定时任务监控」三条硬规则。
     #[test]
-    fn workspace_guide_upgrades_v6_marker_to_v8() {
+    fn workspace_guide_upgrades_v6_marker_to_v9() {
         let dir = std::env::temp_dir().join(format!("abb-guide-v6-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let v6 = "# ABB 工作区（abb-guide-v6）\n\n## 其它\n\n- 旧 v6 正文\n";
@@ -983,7 +1025,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v8"), "{name} 应升到 v8");
+            assert!(text.contains("abb-guide-v9"), "{name} 应升到 v9");
             assert!(!text.contains("abb-guide-v6"), "{name} 不应留 v6 marker");
             assert!(!text.contains("旧 v6 正文"), "{name} 旧正文应被整体替换");
             assert!(text.contains("## 后台子代理"), "{name} 应含子代理小节");
@@ -1006,12 +1048,43 @@ mod tests {
                 text.contains("权限边界（受限/授权者会话必读）") && text.contains("只能建、不能查"),
                 "{name} 缺「受限会话只能建不能查」的权限边界"
             );
+            // v9：walgit 协作段必须带「可达性先探测」与「受限会话用不了」两条口径，
+            // 否则 agent 会照着一个调不到的命令硬写（v7 踩过的坑）。
+            assert!(
+                text.contains("走 walgit 记账")
+                    && text.contains("必须取上一条命令")
+                    && text.contains("谁签什么"),
+                "{name} 缺 walgit 协作契约"
+            );
+            assert!(
+                text.contains("command -v walgit") && text.contains("无法记账"),
+                "{name} 缺 walgit 可达性探测"
+            );
+            assert!(
+                text.contains("受限（授权者）会话里用不了"),
+                "{name} 缺 walgit 的受限会话边界说明"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
 
-        // 审查补充：**存量 v7 工作区**（这次升级真正要覆盖的那批）也必须被升到 v8——
+        // 审查补充：**存量 v7 工作区**（这次升级真正要覆盖的那批）也必须被升到 v9——
         // 只种 v6 的用例证明不了「从上一个版本升上来」这条路径。
+        // 审查补充：v8 才是「上一个版本」，必须有专门的 v8 → v9 存量用例
+        let dir = std::env::temp_dir().join(format!("abb-guide-v8-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v8 = "# ABB 工作区（abb-guide-v8）\n\n## 后台子代理 → 长任务丢后台，别堵会话\n\n- 旧 v8 正文\n";
+        std::fs::write(dir.join("CLAUDE.md"), v8).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), v8).unwrap();
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains("abb-guide-v9"), "{name} 应从 v8 升到 v9");
+            assert!(!text.contains("abb-guide-v8"), "{name} 不应留 v8 marker");
+            assert!(!text.contains("旧 v8 正文"), "{name} 旧正文应被整体替换");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
         let dir = std::env::temp_dir().join(format!("abb-guide-v7-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let v7 = "# ABB 工作区（abb-guide-v7）\n\n## 后台子代理 → 长任务丢后台，别堵会话\n\n- 旧 v7 正文\n";
@@ -1020,16 +1093,16 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v8"), "{name} 应从 v7 升到 v8");
+            assert!(text.contains("abb-guide-v9"), "{name} 应从 v7 升到 v9");
             assert!(!text.contains("abb-guide-v7"), "{name} 不应留 v7 marker");
             assert!(!text.contains("旧 v7 正文"), "{name} 旧正文应被整体替换");
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        let dir = std::env::temp_dir().join(format!("abb-guide-v8-idem-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("abb-guide-v9-idem-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         ensure_workspace_guide(&dir);
-        // 幂等：已是 v8 不再重写（mtime 不变）
+        // 幂等：已是 v9 不再重写（mtime 不变）
         let m = |n: &str| std::fs::metadata(dir.join(n)).unwrap().modified().unwrap();
         let before = (m("CLAUDE.md"), m("AGENTS.md"));
         std::thread::sleep(std::time::Duration::from_millis(20));
