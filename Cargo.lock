@@ -195,6 +195,7 @@ dependencies = [
  "libc",
  "md5",
  "nix",
+ "pulldown-cmark",
  "qrcode",
  "reqwest",
  "rusqlite",

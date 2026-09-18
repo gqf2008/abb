@@ -18,6 +18,10 @@ slint-pixel = "0.2.1"
 # 30 分钟级）+ 二进制更小。software 渲染器仍在默认特性里，可用
 # SLINT_BACKEND=winit-software 兜底排查（BackendSelector 原生支持，全平台一致）。
 slint = { version = "1.17", features = ["unstable-winit-030"] }
+# 飞书卡片内容安全化：图片节点必须由 CommonMark parser 定位（手写词法扫描在代码围栏/
+# 行内代码/引用式图片等惰性上下文上连续两轮被独立审查证伪）。该版本已在依赖树里
+# （i-slint-common 依赖它），不引入新的下载或编译单元。
+pulldown-cmark = { version = "0.13.4", default-features = false }
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "process", "time", "sync", "io-util", "signal"] }
 # #69 后台任务治理：TaskTracker（rt 特性）+ CancellationToken 优雅关闭
