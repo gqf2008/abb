@@ -704,11 +704,42 @@ fn path_in_workspace(cwd: &str, workspace: &std::path::Path) -> bool {
     if !candidate.is_absolute() {
         return false;
     }
-    let workspace_abs =
-        std::fs::canonicalize(workspace).unwrap_or_else(|_| normalize_lexical(workspace));
-    let candidate_abs =
-        std::fs::canonicalize(candidate).unwrap_or_else(|_| normalize_lexical(candidate));
+    let workspace_abs = canonicalize_allow_missing(workspace);
+    let candidate_abs = canonicalize_allow_missing(candidate);
     candidate_abs.starts_with(workspace_abs)
+}
+
+/// canonicalize 路径；路径（或其后缀）尚不存在时，解析最近的已存在祖先并拼回缺失后缀。
+///
+/// 不能只对不存在路径做词法归一化：macOS 的 `/var` → `/private/var` 这类祖先符号链接
+/// 会让同一个工作区出现“真实路径 canonical、候选路径词法”两种形态，从而把合法 cwd
+/// 误判为越界。先解析祖先仍保留 symlink-escape 防线，因为真实祖先会先被 canonicalize。
+fn canonicalize_allow_missing(path: &std::path::Path) -> PathBuf {
+    let normalized = normalize_lexical(path);
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return canonical;
+    }
+
+    let mut missing = Vec::new();
+    let mut ancestor = normalized.as_path();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return normalize_lexical(&canonical);
+        }
+        let Some(parent) = ancestor.parent() else {
+            return normalized;
+        };
+        if parent == ancestor {
+            return normalized;
+        }
+        if let Some(name) = ancestor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        ancestor = parent;
+    }
 }
 
 /// 词法归一化 `.` / `..`；不访问文件系统，也不让根目录的 `..` 越界。
@@ -1280,6 +1311,27 @@ mod tests {
         assert!(
             validate_proc_payload(&payload, &workspace).is_err(),
             "工作区内 symlink 指向外部也必须拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_cwd_accepts_missing_descendant_under_symlinked_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("abb-proc-link-ws-{}", uuid::Uuid::new_v4()));
+        let real = root.join("real");
+        let workspace = real.join("b");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let linked_root = root.join("linked");
+        symlink(&real, &linked_root).unwrap();
+        let linked_workspace = linked_root.join("b");
+        let missing_cwd = linked_workspace.join("missing").join("sub");
+
+        assert!(
+            path_in_workspace(&missing_cwd.display().to_string(), &linked_workspace),
+            "祖先符号链接不应让尚不存在的工作区内 cwd 误判为越界"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
