@@ -93,6 +93,14 @@ pub(crate) const PASSTHROUGH_ENV: &[&str] = &[
     "BUZZ_ACP_DISPLAY_NAME",
 ];
 
+/// 每次 `apply_passthrough_env()` 生成的子进程都携带的 agent 上下文标记。
+///
+/// ABB 的真实 ACP 主路径不会把 `AGENT_BRIDGE_BOT_KEY` / `CHAT_ID` /
+/// `SENDER_ROLE` 透传给 `dev__shell`；这个标记必须由 buzz-agent 自己写入，
+/// 才能让 `agent-bridge task add --proc` 在真实 shell 里识别 agent 来源。
+/// 它不是安全边界：owner FullAccess 仍可清除环境或直接改 tasks.json。
+pub(crate) const AGENT_CONTEXT_ENV: &str = "ABB_AGENT_CONTEXT";
+
 // Windows has no $TMPDIR/$HOME. TMP/TEMP/USERPROFILE are what
 // std::env::temp_dir() consults — without them it falls back to C:\Windows,
 // which child processes can't write to (PermissionDenied). USERPROFILE is the
@@ -129,6 +137,12 @@ pub(crate) fn apply_passthrough_env(cmd: &mut Command) {
             cmd.env(k, v);
         }
     }
+    mark_agent_context(cmd);
+}
+
+/// 给子进程打上“由 buzz-agent 的 agent 工具链派生”的上下文标记。
+pub(crate) fn mark_agent_context(cmd: &mut Command) {
+    cmd.env(AGENT_CONTEXT_ENV, "1");
 }
 
 type Client = RunningService<RoleClient, ()>;
@@ -1326,6 +1340,20 @@ mod content_tests {
     #[test]
     fn passthrough_includes_buzz_owner_attestation() {
         assert!(PASSTHROUGH_ENV.contains(&"BUZZ_AUTH_TAG"));
+    }
+
+    #[test]
+    fn passthrough_marks_agent_context() {
+        let mut cmd = Command::new("unused");
+        cmd.env(AGENT_CONTEXT_ENV, "0");
+        apply_passthrough_env(&mut cmd);
+        let value = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(AGENT_CONTEXT_ENV))
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+        assert_eq!(value, Some("1"), "agent child must carry context marker");
     }
 
     #[test]

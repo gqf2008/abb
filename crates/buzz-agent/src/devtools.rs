@@ -367,6 +367,10 @@ async fn run_shell(
     // "取 key 后先剥壳再派生"的中间层，buzz/nostr 身份私钥若放行，模型一条
     // `echo $NOSTR_PRIVATE_KEY` 就能读走——这里显式剔除。
     crate::mcp::apply_passthrough_env(&mut cmd);
+    // Q8：真实 ACP 的 dev__shell 没有 AGENT_BRIDGE_* 会话变量。共享函数已经写入
+    // ABB_AGENT_CONTEXT；这里在 shell 的专属 env 清理之后再显式确认一次，保证
+    // agent-bridge CLI 在真实 shell 中能把 task add --proc 识别为 agent 来源。
+    crate::mcp::mark_agent_context(&mut cmd);
     cmd.env_remove("NOSTR_PRIVATE_KEY");
     cmd.env_remove("BUZZ_PRIVATE_KEY");
     #[cfg(unix)]

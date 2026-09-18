@@ -495,10 +495,20 @@ fn check_patterns_zoned(
 /// read_zone（#194）：虚拟 Bot 群的读区（bot 工作区）——只读命令的路径参数落在
 /// 写区或读区都放行；None = 单区（非虚拟会话，行为不变）。
 fn is_abb_program(program: &str) -> bool {
-    program == "$ABB_BIN"
-        || std::env::current_exe()
-            .ok()
-            .is_some_and(|exe| program == exe.to_string_lossy())
+    if program == "$ABB_BIN" {
+        return true;
+    }
+    let Some(exe) = std::env::current_exe().ok() else {
+        return false;
+    };
+    if program == exe.to_string_lossy() {
+        return true;
+    }
+    // 旧 hook 也能见到 `./agent-bridge` / symlink alias：按真实路径收敛。
+    std::fs::canonicalize(program)
+        .ok()
+        .zip(std::fs::canonicalize(exe).ok())
+        .is_some_and(|(candidate, target)| candidate == target)
 }
 
 fn check_bash(input: &serde_json::Value, workspace: &Path, read_zone: Option<&Path>) -> Decision {
@@ -668,10 +678,9 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
         // 可按 id 掐掉**别的会话**的任务（id 是 `tk_yyyyMMdd_xxxxxx`，6 位 hex 可枚举
         // → 属可用性攻击面）。人要停自己在跑的任务走 owner 会话/终端，不受此闸影响。
         //
-        // Q8：**agent 不得创建 proc 任务**。当前 CLI 的 add 只能建 agent 载荷，这里
-        // 仍按参数显式拒绝一次——P3 真加 `--proc` 时这条是唯一挡得住 agent 的闸
-        //（owner 会话里的 agent 角色**也是 owner**，光靠 owner-only 挡不住它写
-        //  `pkill` / `kill <ABB pid>` 这类自伤命令，见 docs/task-model.md D5）。
+        // Q8：**agent 不得创建 proc 任务**。这里保留旧 hook/受限路径的显式拒绝；
+        // 真实 ACP shell 的主判据是 buzz-agent 注入的 ABB_AGENT_CONTEXT（CLI 侧检查）。
+        // owner FullAccess 仍可绕开一切 shell 级检查，见 docs/task-model.md D5。
         Some("task") => {
             if rest.get(1).map(|s| s.as_str()) != Some("add") {
                 return Decision::Deny(
@@ -755,7 +764,7 @@ fn check_owner_bash_at(
         return Decision::Allow; // 复合语法：owner 保持原行为
     };
     let program = argv[0].as_str();
-    if is_abb_program(program) {
+    if is_abb_program(program) || crate::task_proc::agent_context_marker().is_some() {
         if let Some(deny) = deny_agent_proc_task_add(&argv[1..]) {
             return deny;
         }

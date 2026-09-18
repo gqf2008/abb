@@ -300,6 +300,12 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
   2. `proc` 创建必须经过**不可绕过的二次确认**；
   3. 用 **OS sandbox / 独立用户 / 受限 syscall** 做硬隔离；
   4. 对命令与信号能力做**可执行白名单**（含禁止向 ABB 自身 pid / 进程组发信号）。
+- Q8 本批落地的是选项 1，但口径必须说清：真实 ACP 的 `dev__shell` 由
+  `crates/buzz-agent/src/mcp.rs::apply_passthrough_env()` 注入 `ABB_AGENT_CONTEXT=1`，
+  `agent-bridge task add --proc` 以该标记拒绝；旧 Claude hook 的 owner guard 只作纵深。
+  ⚠️ 这**不是对敌意 owner agent 的安全边界**：owner 默认 FullAccess，本来就能任意执行、
+  清除注入环境，甚至直接改 `tasks.json`。它是合规/纵深闸，硬隔离仍需 OS sandbox / 独立用户 /
+  不可绕过的二次确认。
 - 以上都做不到，就**明确接受该风险并写进文档**，不要声称存在「防自杀边界」。**不要用「pid 大小」这类伪规则**判父子。
 
 #### D6 可观测与日志
@@ -388,7 +394,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 |---|---|---|
 | Q1 | CLI 命名 | **`abb task`**；`job` 保留为兼容别名；内部 `src/tasks.rs` → `src/svc_tasks.rs` 让出命名 |
 | Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）；每 bot 默认 1 个 task worker，上限可配 |
-| Q8 | **`proc` 权限边界**：owner-only？还是允许 granted 在 OS sandbox 内？ | **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）；受限会话完全不进白名单。理由：owner 会话里的 agent 角色**也是 owner**，光靠 owner-only 挡不住 agent 写出 `pkill`/`kill <ABB pid>` 这类自伤命令（见 D5） |
+| Q8 | **`proc` 权限边界**：owner-only？还是允许 granted 在 OS sandbox 内？ | **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）；受限会话完全不进白名单。真实 ACP shell 由 buzz-agent 注入 `ABB_AGENT_CONTEXT=1` 作为 CLI 主判据，旧 Claude hook 的 owner guard 仅作纵深。⚠️ owner FullAccess agent 仍可清除环境或直接改 `tasks.json`，因此这是纵深防御/合规闸，不是安全边界（见 D5） |
 | Q9 | **「自己创建的」身份粒度** | **owner-only 管理**，不引入 capability token；后续确有跨用户需求再议 |
 
 **✅ P3 / keepalive 已拍板**（2026-09-18，来源：`abb-p3-b1-proc-supervisor-20260918`）

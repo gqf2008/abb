@@ -54,6 +54,7 @@ impl TempHome {
             "AGENT_BRIDGE_CHAT_ID",
             "AGENT_BRIDGE_SENDER_ROLE",
             "AGENT_BRIDGE_HOME",
+            "ABB_AGENT_CONTEXT",
         ] {
             cmd.env_remove(key);
         }
@@ -82,6 +83,31 @@ impl TempHome {
     fn run_owned(&self, args: &[String], envs: &[(&str, &str)], stdin: &str) -> Output {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run(&refs, envs, stdin)
+    }
+
+    /// 模拟 buzz-agent `dev__shell` 的干净子进程环境：只有 HOME/PATH/TMPDIR，
+    /// 再加调用方显式注入的 ACP 标记；不带 AGENT_BRIDGE_HOME（Unix 下 HOME 足够）。
+    #[cfg(unix)]
+    fn run_minimal(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+        cmd.env_clear();
+        cmd.env("HOME", &self.root);
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            cmd.env("TMPDIR", tmpdir);
+        }
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"").unwrap();
+        child.wait_with_output().unwrap()
     }
 }
 
@@ -523,20 +549,19 @@ fn guard_check_owner_rejects_abb_proc_creation() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn task_add_proc_rejects_agent_context_without_creating_task() {
+fn task_add_proc_rejects_acp_agent_context_without_creating_task() {
     let home = TempHome::new();
     home.write_config(json!([standard_bot()]));
-    let out = home.run(
+    let out = home.run_minimal(
         &["task", "add", "--proc", "--cmd", "/bin/true"],
-        &[
-            ("AGENT_BRIDGE_BOT_KEY", "app_safe"),
-            ("AGENT_BRIDGE_CHAT_ID", "oc_agent"),
-            ("AGENT_BRIDGE_SENDER_ROLE", "owner"),
-        ],
-        "",
+        &[("ABB_AGENT_CONTEXT", "1")],
     );
-    assert!(!out.status.success(), "agent 上下文不得创建 proc 任务");
+    assert!(
+        !out.status.success(),
+        "真实 ACP dev__shell 的 agent 上下文不得创建 proc 任务"
+    );
     assert!(
         stderr(&out).contains("proc 只允许 GUI/人工入口"),
         "stderr={}",
@@ -553,7 +578,7 @@ fn task_add_proc_rejects_agent_context_without_creating_task() {
 fn task_add_proc_allows_human_entry_without_agent_env() {
     let home = TempHome::new();
     home.write_config(json!([standard_bot()]));
-    let out = home.run(&["task", "add", "--proc", "--cmd", "/bin/true"], &[], "");
+    let out = home.run_minimal(&["task", "add", "--proc", "--cmd", "/bin/true"], &[]);
     assert_ok(&out);
 
     let path = home.bridge_dir().join("tasks/app_safe/tasks.json");

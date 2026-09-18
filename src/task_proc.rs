@@ -34,18 +34,18 @@ pub(crate) fn platform_error() -> Option<&'static str> {
     platform_error_for_target(std::env::consts::OS)
 }
 
-/// 判断是否处于桥注入的 agent 上下文。
+/// 判断是否处于 agent 上下文。
 ///
-/// 人类/GUI 入口的定义是：进程环境中没有桥为 agent 注入的
-/// `AGENT_BRIDGE_BOT_KEY` / `AGENT_BRIDGE_CHAT_ID` / `AGENT_BRIDGE_SENDER_ROLE`。
-/// GUI 直接在本进程内登记任务；人类终端通常也不带这些变量。反过来，只要存在任一非空
-/// 桥变量，就按 agent 处理并拒绝 `--proc`，宁可误伤“从 agent shell 手工调试”的场景，
-/// 也不把任意命令执行入口暴露给 agent。
+/// 真实 ACP 主路径的 `dev__shell` 看不到 `AGENT_BRIDGE_BOT_KEY` / `CHAT_ID` /
+/// `SENDER_ROLE`：它们经 `crates/buzz-agent/src/devtools.rs` →
+/// `mcp::apply_passthrough_env()` 的 `env_clear()` 白名单后被剥掉。因此 buzz-agent
+/// 在该共享入口为每个派生 shell 注入 `ABB_AGENT_CONTEXT=1`；CLI 以它作为**主判据**。
+/// 旧的 `AGENT_BRIDGE_*` 继续作为 legacy hook/手工调试路径的兜底判据。
 ///
-/// 这不是针对“已经能手改环境并直接执行任意程序”的恶意 agent 的沙箱：agent 可以清除
-/// 环境变量后绕过这层启发式判断。它是 owner/受限 Bash guard 之外的纵深防御，不能替代
-/// OS sandbox 或不可绕过的二次确认。
-const AGENT_CONTEXT_ENV_KEYS: &[&str] = &[
+/// 这不是对敌意 owner agent 的安全边界：owner 默认 FullAccess，本来就能任意执行、
+/// 清除注入环境并直接改 `tasks.json`。它是纵深防御/合规闸，不能替代 OS sandbox。
+pub(crate) const ACP_AGENT_CONTEXT_ENV: &str = "ABB_AGENT_CONTEXT";
+const LEGACY_AGENT_CONTEXT_ENV_KEYS: &[&str] = &[
     "AGENT_BRIDGE_BOT_KEY",
     "AGENT_BRIDGE_CHAT_ID",
     "AGENT_BRIDGE_SENDER_ROLE",
@@ -55,7 +55,10 @@ fn first_nonempty_env<F>(mut get: F) -> Option<&'static str>
 where
     F: FnMut(&str) -> Option<std::ffi::OsString>,
 {
-    AGENT_CONTEXT_ENV_KEYS
+    if get(ACP_AGENT_CONTEXT_ENV).is_some_and(|value| !value.is_empty()) {
+        return Some(ACP_AGENT_CONTEXT_ENV);
+    }
+    LEGACY_AGENT_CONTEXT_ENV_KEYS
         .iter()
         .copied()
         .find(|key| get(key).is_some_and(|value| !value.is_empty()))
@@ -70,6 +73,11 @@ fn agent_context_rejection_for(marker: Option<&str>) -> Option<String> {
 /// `run_task_cli` 的 proc 入口闸：agent 环境存在时返回可展示的拒绝原因。
 pub(crate) fn agent_context_rejection() -> Option<String> {
     agent_context_rejection_for(first_nonempty_env(|key| std::env::var_os(key)))
+}
+
+/// 当前进程是否带 agent 上下文标记（ACP 主标记或 legacy 标记）。
+pub(crate) fn agent_context_marker() -> Option<&'static str> {
+    first_nonempty_env(|key| std::env::var_os(key))
 }
 
 #[cfg(unix)]
@@ -547,15 +555,20 @@ mod tests {
     }
 
     #[test]
-    fn agent_context_gate_covers_all_bridge_injected_env_markers() {
-        for expected in AGENT_CONTEXT_ENV_KEYS {
+    fn agent_context_gate_covers_acp_and_legacy_markers() {
+        for expected in [
+            ACP_AGENT_CONTEXT_ENV,
+            "AGENT_BRIDGE_BOT_KEY",
+            "AGENT_BRIDGE_CHAT_ID",
+            "AGENT_BRIDGE_SENDER_ROLE",
+        ] {
             let found = first_nonempty_env(|key| {
-                (key == *expected).then(|| std::ffi::OsString::from("set"))
+                (key == expected).then(|| std::ffi::OsString::from("set"))
             });
             assert_eq!(
                 found,
-                Some(*expected),
-                "每个桥注入变量都必须单独构成 agent 上下文"
+                Some(expected),
+                "每个注入变量都必须单独构成 agent 上下文"
             );
         }
         assert_eq!(
@@ -565,10 +578,9 @@ mod tests {
         );
         assert_eq!(first_nonempty_env(|_| None), None);
 
-        let reason = agent_context_rejection_for(Some("AGENT_BRIDGE_SENDER_ROLE")).unwrap();
+        let reason = agent_context_rejection_for(Some(ACP_AGENT_CONTEXT_ENV)).unwrap();
         assert!(
-            reason.contains("proc 只允许 GUI/人工入口")
-                && reason.contains("AGENT_BRIDGE_SENDER_ROLE"),
+            reason.contains("proc 只允许 GUI/人工入口") && reason.contains(ACP_AGENT_CONTEXT_ENV),
             "拒绝原因必须说明入口限制与命中的 agent 标记：{reason}"
         );
         assert_eq!(agent_context_rejection_for(None), None);

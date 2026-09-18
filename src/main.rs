@@ -872,9 +872,10 @@ fn run_task_cli(args: &[String]) -> i32 {
         eprintln!("{TASK_CLI_HELP}");
         return 0;
     }
-    // Q8 纵深防御：hook 之外，CLI 本身也不接受 agent 上下文创建 proc。桥为每个 agent
-    // 注入 AGENT_BRIDGE_BOT_KEY/CHAT_ID/SENDER_ROLE；任一存在即按 agent 处理。人类终端
-    // 与 GUI 不带这些变量，仍可走进下面的 `--proc` 分支。
+    // Q8 纵深防御：hook 之外，CLI 本身也不接受 agent 上下文创建 proc。真实 ACP shell
+    // 由 buzz-agent 的 apply_passthrough_env 注入 ABB_AGENT_CONTEXT=1；legacy
+    // AGENT_BRIDGE_* 仅作旧 hook/调试路径兜底。人类终端与 GUI 不带这些标记，仍可走进
+    // 下面的 `--proc` 分支。owner FullAccess 仍可绕过，见 task-model D5。
     if task_add_requests_proc(args) {
         if let Some(reason) = task_proc::agent_context_rejection() {
             eprintln!("{reason}");
