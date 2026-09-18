@@ -30,6 +30,12 @@ pub const TASK_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 /// 默认单文件日志上限（Q4 待定前的保守值）。
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// proc 停止语义的默认 SIGTERM 宽限（秒），Q14 拍板值。
+pub const DEFAULT_GRACE_SECS: u64 = 10;
+/// 逐任务宽限的合法范围。0 会让 SIGTERM 与 SIGKILL 之间没有观察窗口，过大则拖垮
+/// service 的关停路径；越界在登记期直接拒绝。
+pub const MIN_GRACE_SECS: u64 = 1;
+pub const MAX_GRACE_SECS: u64 = 300;
 /// 默认「被进程退出中断后允许自动重跑」的次数（审查 B3）。
 ///
 /// 取 1 而不是 0：ABB 升级/重启打断任务是很常见的，完全不让恢复会让任务白跑；
@@ -129,6 +135,114 @@ pub fn remove_task_logs(paths: &TaskPaths, id: &str) {
     for i in 1..8 {
         let _ = fs::remove_file(std::path::PathBuf::from(format!("{}.{i}", base.display())));
     }
+}
+
+/// 追加一段日志字节，并在写入过程中按 `max_bytes` 轮转。
+///
+/// 这是 agent 回合末写日志与 proc 流式 drain 共用的入口。proc 的 stdout/stderr 不会
+/// 提前组成一个完整字符串，因此不能沿用“写前看一次大小”的旧逻辑；这里按剩余容量切开
+/// 每一段，达到上限立即轮转，保证连续写入后当前段不会超过上限。
+#[cfg(unix)]
+pub(crate) fn append_task_log_bytes(
+    paths: &TaskPaths,
+    id: &str,
+    max_bytes: u64,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    if max_bytes == 0 || bytes.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&paths.dir)?;
+    let file = paths.log_file(id);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let mut len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        if len >= max_bytes {
+            rotate_task_logs(&file, LOG_KEEP_FILES);
+            len = 0;
+        }
+        let room = max_bytes.saturating_sub(len);
+        let remaining = (bytes.len() - offset) as u64;
+        let take = room.min(remaining).min(usize::MAX as u64) as usize;
+        if take == 0 {
+            rotate_task_logs(&file, LOG_KEEP_FILES);
+            continue;
+        }
+
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)?;
+        use std::io::Write;
+        f.write_all(&bytes[offset..offset + take])?;
+        f.flush()?;
+        offset += take;
+
+        if len.saturating_add(take as u64) >= max_bytes {
+            rotate_task_logs(&file, LOG_KEEP_FILES);
+            // 轮转后保留一个空的当前段，随后续写入/`task logs` 都能继续 append。
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)?;
+        }
+    }
+    Ok(())
+}
+
+/// 追加一条完整日志记录（agent 回合末/write_log 路径）。
+///
+/// 与流式入口不同：这里允许**先**在旧记录已经达到上限时轮转，再整条追加新记录。这样
+/// `log_max_bytes=1` 这类既有边界测试仍有「旧内容完整进 `.1`、新内容完整进当前段」的
+/// 语义；proc 的持续输出不走这里。
+pub(crate) fn append_task_log_record(
+    paths: &TaskPaths,
+    id: &str,
+    max_bytes: u64,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    if max_bytes == 0 || bytes.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&paths.dir)?;
+    let file = paths.log_file(id);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if std::fs::metadata(&file)
+        .map(|meta| meta.len() >= max_bytes)
+        .unwrap_or(false)
+    {
+        rotate_task_logs(&file, LOG_KEEP_FILES);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?;
+    use std::io::Write;
+    f.write_all(bytes)?;
+    f.flush()
+}
+
+/// 日志轮转：`id.log` → `id.log.1` → …，共保留 `keep` 份（含当前；最老丢弃）。
+fn rotate_task_logs(file: &std::path::Path, keep: usize) {
+    let suffixed = |i: usize| PathBuf::from(format!("{}.{i}", file.display()));
+    if keep < 2 {
+        let _ = fs::remove_file(file);
+        return;
+    }
+    let _ = fs::remove_file(suffixed(keep - 1));
+    for i in (1..keep - 1).rev() {
+        let from = suffixed(i);
+        if from.exists() {
+            let _ = fs::rename(&from, suffixed(i + 1));
+        }
+    }
+    let _ = fs::rename(file, suffixed(1));
 }
 
 /// 日志轮转保留的**总份数**（含当前 `id.log`）：Q4 拟定的默认值是「单文件 10MB /
@@ -352,6 +466,9 @@ pub struct TaskLimits {
     pub max_restarts: u32,
     #[serde(default = "default_log_max")]
     pub log_max_bytes: u64,
+    /// proc 收到 SIGTERM 后等待退出的时间；到期仍存活则对进程组 SIGKILL。
+    #[serde(default = "default_grace")]
+    pub grace_secs: u64,
 }
 
 fn default_timeout() -> u64 {
@@ -363,6 +480,9 @@ fn default_max_restarts() -> u32 {
 fn default_log_max() -> u64 {
     DEFAULT_LOG_MAX_BYTES
 }
+fn default_grace() -> u64 {
+    DEFAULT_GRACE_SECS
+}
 
 impl Default for TaskLimits {
     fn default() -> Self {
@@ -370,6 +490,7 @@ impl Default for TaskLimits {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_restarts: DEFAULT_MAX_RESTARTS,
             log_max_bytes: DEFAULT_LOG_MAX_BYTES,
+            grace_secs: DEFAULT_GRACE_SECS,
         }
     }
 }
@@ -476,11 +597,9 @@ impl Task {
                 }
             }
             PayloadKind::Proc => {
-                if self.payload.cmd.is_empty() {
-                    bail!("proc 任务需要 cmd（argv 数组）");
-                }
-                if self.payload.cmd[0].trim().is_empty() {
-                    bail!("proc 任务的 cmd[0]（可执行文件）不能为空");
+                validate_proc_payload(&self.payload, &crate::workspace_dir(&self.bot_key))?;
+                if let Some(reason) = crate::task_proc::platform_error() {
+                    bail!("{reason}");
                 }
             }
         }
@@ -510,6 +629,14 @@ impl Task {
         if self.limits.log_max_bytes == 0 {
             bail!("limits.log_max_bytes 不能为 0（日志是排障入口；要禁用请删任务）");
         }
+        if !(MIN_GRACE_SECS..=MAX_GRACE_SECS).contains(&self.limits.grace_secs) {
+            bail!(
+                "limits.grace_secs 必须在 {}..={} 秒之间（收到 {}）",
+                MIN_GRACE_SECS,
+                MAX_GRACE_SECS,
+                self.limits.grace_secs
+            );
+        }
         Ok(())
     }
 
@@ -530,6 +657,75 @@ impl Task {
             Some(std::time::Duration::from_secs(self.limits.timeout_secs))
         }
     }
+}
+
+/// proc 载荷的登记期校验。工作区显式注入，单测可拿 temp 目录验证边界，不碰真实 HOME。
+fn validate_proc_payload(payload: &TaskPayload, workspace: &std::path::Path) -> anyhow::Result<()> {
+    if payload.cmd.is_empty() {
+        bail!("proc 任务需要 cmd（argv 数组）");
+    }
+    if payload.cmd[0].trim().is_empty() {
+        bail!("proc 任务的 cmd[0]（可执行文件）不能为空");
+    }
+    if payload.cmd.iter().any(|arg| arg.contains('\0')) {
+        bail!("proc 任务的 cmd 参数不能包含 NUL");
+    }
+    if payload.cwd.contains('\0') {
+        bail!("proc 任务的 cwd 不能包含 NUL");
+    }
+    if !payload.cwd.trim().is_empty() && !path_in_workspace(&payload.cwd, workspace) {
+        bail!(
+            "proc 任务的 cwd 必须位于该 bot 工作区内（workspace={}，收到 {:?}）",
+            workspace.display(),
+            payload.cwd
+        );
+    }
+    for (key, value) in &payload.env {
+        if key.is_empty() {
+            bail!("proc 任务的 env 键不能为空");
+        }
+        if key.chars().any(|c| c == '=' || c == '\0') {
+            bail!("proc 任务的 env 键不能包含 '=' 或 NUL（收到 {key:?}）");
+        }
+        if value.contains('\0') {
+            bail!("proc 任务的 env[{key:?}] 值不能包含 NUL");
+        }
+    }
+    Ok(())
+}
+
+/// cwd 是否落在工作区内。空 cwd 在调用点按工作区处理；非空必须是绝对路径。
+///
+/// 已存在路径先 canonicalize，挡住“工作区内 symlink 指向外部”的绕过；尚不存在的
+/// 路径用词法归一化检查，确保 `..` 不能穿出工作区。工作站目录本身不存在时也走词法
+/// 分支，因此 `Task::validate` 不依赖目录已经创建。
+fn path_in_workspace(cwd: &str, workspace: &std::path::Path) -> bool {
+    let candidate = std::path::Path::new(cwd);
+    if !candidate.is_absolute() {
+        return false;
+    }
+    let workspace_abs =
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| normalize_lexical(workspace));
+    let candidate_abs =
+        std::fs::canonicalize(candidate).unwrap_or_else(|_| normalize_lexical(candidate));
+    candidate_abs.starts_with(workspace_abs)
+}
+
+/// 词法归一化 `.` / `..`；不访问文件系统，也不让根目录的 `..` 越界。
+fn normalize_lexical(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// 生成任务 id：`tk_<YYYYMMDD>_<6 位小写 hex>`（本地时区日期，便于人肉按天找）。
@@ -589,6 +785,7 @@ pub struct TaskRuntime {
 }
 
 /// 任务的三个落盘路径（定义 / 运行态 / 日志目录）。
+#[derive(Clone)]
 pub struct TaskPaths {
     pub dir: PathBuf,
 }
@@ -990,6 +1187,101 @@ mod tests {
         t.limits.log_max_bytes = 0;
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("log_max_bytes"), "{e}");
+    }
+
+    #[test]
+    fn grace_defaults_to_ten_and_rejects_out_of_range() {
+        let limits: TaskLimits = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(limits.grace_secs, DEFAULT_GRACE_SECS);
+        assert_eq!(DEFAULT_GRACE_SECS, 10);
+
+        let mut t = agent_task("b");
+        t.limits.grace_secs = MIN_GRACE_SECS;
+        assert!(t.validate().is_ok());
+        t.limits.grace_secs = MAX_GRACE_SECS;
+        assert!(t.validate().is_ok());
+
+        for bad in [0, MAX_GRACE_SECS + 1] {
+            t.limits.grace_secs = bad;
+            let e = t.validate().unwrap_err().to_string();
+            assert!(e.contains("grace_secs"), "越界宽限必须在登记期拒绝：{e}");
+        }
+    }
+
+    #[test]
+    fn proc_payload_requires_workspace_cwd_and_safe_env() {
+        let root = std::env::temp_dir().join(format!("abb-proc-validate-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspaces").join("b");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let mut payload = TaskPayload {
+            kind: PayloadKind::Proc,
+            cmd: vec!["true".to_string()],
+            ..Default::default()
+        };
+        assert!(validate_proc_payload(&payload, &workspace).is_ok());
+
+        payload.cwd = workspace.join("sub").display().to_string();
+        assert!(validate_proc_payload(&payload, &workspace).is_ok());
+
+        payload.cwd = outside.display().to_string();
+        let e = validate_proc_payload(&payload, &workspace)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("工作区"), "工作区外 cwd 必须拒绝：{e}");
+
+        payload.cwd = "relative/path".to_string();
+        assert!(validate_proc_payload(&payload, &workspace).is_err());
+
+        payload.cwd.clear();
+        for bad_key in ["", "A=B", "A\0B"] {
+            payload.env.clear();
+            payload.env.insert(bad_key.to_string(), "v".to_string());
+            assert!(
+                validate_proc_payload(&payload, &workspace).is_err(),
+                "非法 env 键必须拒绝：{bad_key:?}"
+            );
+        }
+        payload.env.clear();
+        payload.env.insert("A\0B".to_string(), "v".to_string());
+        assert!(validate_proc_payload(&payload, &workspace).is_err());
+        payload.env.clear();
+        payload.env.insert("OK".to_string(), "v\0".to_string());
+        assert!(validate_proc_payload(&payload, &workspace).is_err());
+
+        payload.env.clear();
+        payload.cmd.clear();
+        assert!(validate_proc_payload(&payload, &workspace).is_err());
+        payload.cmd = vec!["  ".to_string()];
+        assert!(validate_proc_payload(&payload, &workspace).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_cwd_rejects_symlink_escape() {
+        let root = std::env::temp_dir().join(format!("abb-proc-link-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let payload = TaskPayload {
+            kind: PayloadKind::Proc,
+            cmd: vec!["true".to_string()],
+            cwd: link.display().to_string(),
+            ..Default::default()
+        };
+        assert!(
+            validate_proc_payload(&payload, &workspace).is_err(),
+            "工作区内 symlink 指向外部也必须拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 审查回归：**手改 `tasks.json` 也必须过完整 `Task::validate`**——否则会出现

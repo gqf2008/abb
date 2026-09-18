@@ -1,4 +1,4 @@
-//! 任务执行（#326 / `docs/task-model.md` P2b 的 **agent 载荷**落地，即 #306）。
+//! 任务执行（#326 / `docs/task-model.md` P2b/P3 的 agent 与 proc 载荷落地）。
 //!
 //! ## 为什么直接复用 `buzz::oneshot`
 //!
@@ -15,11 +15,11 @@
 //!   `task cancel` 用「关停令牌 ∪ 取消请求文件」的合并令牌接进同一条通路；取消后
 //!   **不再投递结果**（与「服务关停联动取消」同口径）。
 //!
-//! ## 本轮范围
+//! ## 载荷路径
 //!
-//! 只做 `agent` 载荷。`proc` 载荷要的是**进程超管**（pid 账本 / 进程树终止 / Windows
-//! Job Object / 退出码回收），与 ACP 执行层无共用件，属 P3；这里对 `proc` 显式拒绝，
-//! 不静默降级。
+//! `agent` 走上面的 `buzz::oneshot`；`proc` 走 [`crate::task_proc`] 的 Unix 进程组
+//! 超管（流式日志、退出码、超时/取消整组停止）。Windows Job Object 尚未接入，proc
+//! 在登记与执行两处显式拒绝，不静默降级。
 //!
 //! ## 投递语义
 //!
@@ -135,27 +135,6 @@ async fn run_one(
     let id = task.id.clone();
     let short = id[..id.len().min(12)].to_string();
 
-    if task.payload.kind != PayloadKind::Agent {
-        // proc 载荷要到 P3 才落地：**显式失败**，不静默跳过（否则「登记了却永远
-        // pending」会被当成调度坏了）。
-        // 带住 prev 的 restarts / last_fired_at：proc 本批还不能跑，但**记账不能被清掉**
-        // （将来放开 proc 时，这里清零会让重复档重复触发/重跑上界失效——审查指出过）。
-        let prev = states.get(&id);
-        let _ = states.set(
-            &id,
-            TaskRuntime {
-                kind: TaskStateKind::Failed,
-                finished_at: Some(crate::chrono_lite::unix_secs()),
-                last_error: "proc 载荷尚未支持（P3 进程超管落地后可用）".to_string(),
-                restarts: prev.restarts,
-                last_fired_at: prev.last_fired_at,
-                ..Default::default()
-            },
-        );
-        crate::log!("[task:{bot_key}] {short} 跳过：proc 载荷未支持");
-        return;
-    }
-
     let started = crate::chrono_lite::unix_secs();
     let prev = states.get(&id);
     let _ = states.set(&id, claim(&prev, started));
@@ -164,9 +143,24 @@ async fn run_one(
         task_workspace(bot_key, &task)
     );
 
-    let agent_cfg = agent_cfg_for_task(bot, cfg, &task, bot_key);
     let workspace = task_workspace(bot_key, &task);
-    run_attempt(bot_key, task, agent_cfg, workspace, router, states, stop).await;
+    match task.payload.kind {
+        PayloadKind::Agent => {
+            let agent_cfg = agent_cfg_for_task(bot, cfg, &task, bot_key);
+            run_attempt(bot_key, task, agent_cfg, workspace, router, states, stop).await;
+        }
+        PayloadKind::Proc => {
+            let rt = crate::task_proc::run_proc_attempt(&task, &workspace, states, stop).await;
+            let text = if rt.kind == TaskStateKind::Succeeded {
+                rt.last_exit_code
+                    .map(|code| format!("进程退出码 {code}"))
+                    .unwrap_or_else(|| "进程正常退出".to_string())
+            } else {
+                rt.last_error.clone()
+            };
+            finish_task_attempt(bot_key, &task, rt, text, router, states).await;
+        }
+    }
 }
 
 /// 真正跑一轮并把结局落盘/投递。`agent_cfg`/`workspace` 由调用方给——测试因此能用
@@ -182,7 +176,6 @@ pub(crate) async fn run_attempt(
     stop: &tokio_util::sync::CancellationToken,
 ) {
     let id = task.id.clone();
-    let short = id[..id.len().min(12)].to_string();
     let started = crate::chrono_lite::unix_secs();
 
     let msg = crate::buzz::queue::InboundMsg {
@@ -295,13 +288,31 @@ pub(crate) async fn run_attempt(
             String::new(),
         ),
     };
+    finish_task_attempt(bot_key, &task, rt, text, router, states).await;
+}
+
+/// 公共收尾：落终态、追加终态摘要日志、输出 service 日志并投递结果。
+///
+/// proc 的 stdout/stderr 已在执行期流式落盘；这里的 `text` 只是最后一行摘要，不复制整段
+/// 输出。取消轮次仍走原有契约：留状态/日志，不投递。
+async fn finish_task_attempt(
+    bot_key: &str,
+    task: &Task,
+    rt: TaskRuntime,
+    text: String,
+    router: &Arc<Router>,
+    states: &TaskStateStore,
+) {
+    let id = task.id.clone();
+    let short = id[..id.len().min(12)].to_string();
     let failed = rt.kind == TaskStateKind::Failed;
     let cancelled = rt.kind == TaskStateKind::Cancelled;
     let reason = rt.last_error.clone();
+    let finished = rt.finished_at.unwrap_or_else(crate::chrono_lite::unix_secs);
     let _ = states.set(&id, rt.clone());
 
     // 日志：任务本身就是「跑久/跑丢也看不见」的痛点，落盘 + 出口都要有（D6 的基础项）。
-    write_log(states.paths(), &task, &rt, &text);
+    write_log(states.paths(), task, &rt, &text);
     crate::log!(
         "[task:{bot_key}] {short} 结束：{:?}{}",
         if failed {
@@ -325,7 +336,7 @@ pub(crate) async fn run_attempt(
     if cancelled {
         return;
     }
-    let Some((target_bot, chat_raw)) = delivery_target(&task, bot_key) else {
+    let Some((target_bot, chat_raw)) = delivery_target(task, bot_key) else {
         crate::log!("[task:{bot_key}] {short} 无投递目标（创建者会话为空），结果未发送");
         return;
     };
@@ -587,35 +598,20 @@ fn consume_cancel_requests(store: &TaskStore, states: &TaskStateStore) {
 /// 共 `LOG_KEEP_FILES` 份）。旧实现是「超上限就静默不再写」——日志是任务排障的唯一入口，
 /// 静默停写比丢弃最老历史更坏（用户不知道日志断了）。
 fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime, text: &str) {
-    if paths.ensure().is_err() {
-        return;
-    }
-    let file = paths.log_file(&task.id);
-    // 日志目录要单独建（`TaskPaths::ensure` 只保证任务根目录）
-    if let Some(dir) = file.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-    }
-    if let Ok(meta) = std::fs::metadata(&file) {
-        if meta.len() >= task.limits.log_max_bytes {
-            rotate_logs(&file, LOG_KEEP_FILES);
-        }
-    }
+    use std::io::Write;
+
     let stamp = rt.finished_at.unwrap_or_else(crate::chrono_lite::unix_secs);
-    let ok = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file)
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "[{}] {:?} {}", stamp, rt.kind, rt.last_error)?;
-            if !text.trim().is_empty() {
-                writeln!(f, "{text}\n")?;
-            }
-            Ok(())
-        });
-    let _ = ok;
+    let mut body = Vec::new();
+    let _ = writeln!(body, "[{}] {:?} {}", stamp, rt.kind, rt.last_error);
+    if !text.trim().is_empty() {
+        let _ = writeln!(body, "{text}\n");
+    }
+    let _ = crate::task_store::append_task_log_record(
+        paths,
+        &task.id,
+        task.limits.log_max_bytes,
+        &body,
+    );
 }
 
 /// 该任务此刻是否可被认领（P2b-C 编排判定，纯函数便于单测）。
@@ -669,25 +665,6 @@ fn is_due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> bool {
         }
         TriggerKind::Keepalive => false,
     }
-}
-
-/// 日志轮转：`id.log` → `id.log.1` → …，共保留 `keep` 份（含当前；最老的丢弃）。
-fn rotate_logs(file: &std::path::Path, keep: usize) {
-    let suffixed = |i: usize| std::path::PathBuf::from(format!("{}.{i}", file.display()));
-    if keep < 2 {
-        // 只留当前一份：直接清空/删除，下一轮 append 会重建
-        let _ = std::fs::remove_file(file);
-        return;
-    }
-    // 丢弃最老那份，再把 .1..keep-2 依次后移，最后当前 → .1
-    let _ = std::fs::remove_file(suffixed(keep - 1));
-    for i in (1..keep - 1).rev() {
-        let from = suffixed(i);
-        if from.exists() {
-            let _ = std::fs::rename(&from, suffixed(i + 1));
-        }
-    }
-    let _ = std::fs::rename(file, suffixed(1));
 }
 
 /// P2b-D 日志回收：终态任务超过 [`LOG_RETENTION_DAYS`] 的日志删掉。

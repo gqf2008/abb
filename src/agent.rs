@@ -202,7 +202,8 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 3. 查状态：`\"$WALGIT\" collab board`（看板）、`collab thread <id>`（单线程）、`collab report`（总览）。
 
 **受限（授权者）会话里用不了**：白名单里**没有 walgit**（实测 `walgit --version` 直接 deny）。
-白名单只放行 `$ABB_BIN` 的少数子命令（`job add` / `task add` / `session reset` / `deliver`）和一批
+白名单只放行 `$ABB_BIN` 的少数子命令（`job add` / `task add` / `session reset` / `deliver`；其中
+`task add --proc` 对 agent 明确拒绝，proc 只允许 GUI/人工入口）和一批
 **只读**命令（`git status`/`diff`/`ls-files`/`branch`/`remote`/`rev-parse`…、`ls`/`cat`/`grep`/`find`/`head`/`tail`…）。
 所以要提交、推分支、记账这些**写操作**，请在 owner 会话（或自己的终端）里做。
 
@@ -966,7 +967,8 @@ mod tests {
     }
 
     /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺——当前每个 bot 只有
-    /// 1 个 task worker（超限排队，不并发），也没有 `--proc` 载荷（Q8 只给 GUI/人工）。
+    /// 1 个 task worker（超限排队，不并发）；`--proc` 虽写入 CLI 帮助，但须明确标注 agent
+    /// 侧拒绝，不能让人误以为受限会话也能创建任意命令任务。
     #[test]
     fn workspace_guide_does_not_overpromise_task_semantics() {
         let dir = std::env::temp_dir().join(format!("abb-guide-neg-{}", uuid::Uuid::new_v4()));
@@ -974,8 +976,8 @@ mod tests {
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             assert!(
-                !text.contains("--proc"),
-                "{name} 不得把未开放的 proc 载荷写进指引"
+                text.contains("`task add --proc` 对 agent 明确拒绝"),
+                "{name} 必须写明 agent 侧不能创建 proc 载荷"
             );
             assert!(
                 !text.contains("可并发") && !text.contains("并行"),
