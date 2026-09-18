@@ -5,7 +5,7 @@
 //! Windows system tray backend using the `Shell_NotifyIconW` API directly.
 //!
 //! Everything here runs on the Slint event-loop thread, which on Windows is the
-//! same thread that owns the winit message pump. The hidden message-only window
+//! same thread that owns the winit message pump. The hidden top-level window
 //! we create for tray callbacks therefore delivers its messages through the
 //! usual `PeekMessage` loop that winit already spins.
 
@@ -111,7 +111,7 @@ impl PlatformTray {
             Error::PlatformError(crate::platform::PlatformError::Other(e.message()))
         })?;
 
-        // A hidden message-only window: invisible to the user, its only job is to
+        // A hidden top-level window: invisible to the user, its only job is to
         // receive `Shell_NotifyIcon` callbacks (`WM_TRAYICON`) and the
         // `TaskbarCreated` broadcast. Wrapped in a scope guard so any `?` or
         // early return below destroys it; defused by `into_inner` on success.

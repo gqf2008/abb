@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.92"
 name = "i-slint-core"
-version = "1.17.1"
+version = "1.18.0"
 authors = ["Slint Developers <info@slint.dev>"]
 build = false
 autolib = false
@@ -45,13 +45,22 @@ rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
 32-bit-color = []
+accessibility-text = [
+    "std",
+    "shared-parley",
+    "dep:accesskit",
+    "parley?/accesskit",
+]
 box-shadow-cache = []
 default = [
     "std",
     "unicode",
     "shared-parley",
 ]
-ffi = ["dep:static_assertions"]
+ffi = [
+    "dep:static_assertions",
+    "i-slint-core-macros/ffi",
+]
 image-decoders = [
     "dep:image",
     "dep:clru",
@@ -63,7 +72,6 @@ libm = [
 ]
 log = ["dep:log"]
 path = [
-    "dep:auto_enums",
     "dep:lyon_path",
     "dep:lyon_geom",
     "dep:lyon_algorithms",
@@ -83,8 +91,6 @@ std = [
     "euclid/std",
     "once_cell/std",
     "dep:web-time",
-    "image-decoders",
-    "svg",
     "path",
     "raw-window-handle-06?/std",
     "chrono/std",
@@ -114,10 +120,10 @@ unicode = [
     "unicode-linebreak",
 ]
 unsafe-single-threaded = []
-unstable-wgpu-28 = ["wgpu-28"]
 unstable-wgpu-29 = ["wgpu-29"]
-wgpu-28 = ["dep:wgpu-28"]
+unstable-wgpu-30 = ["wgpu-30"]
 wgpu-29 = ["dep:wgpu-29"]
+wgpu-30 = ["dep:wgpu-30"]
 
 [lib]
 name = "i_slint_core"
@@ -128,8 +134,8 @@ name = "string"
 path = "benches/string.rs"
 harness = false
 
-[dependencies.auto_enums]
-version = "0.8.0"
+[dependencies.accesskit]
+version = "0.24"
 optional = true
 
 [dependencies.bitflags]
@@ -173,12 +179,12 @@ version = "0.22.1"
 default-features = false
 
 [dependencies.i-slint-common]
-version = "=1.17.1"
+version = "=1.18.0"
 features = ["default"]
 default-features = false
 
 [dependencies.i-slint-core-macros]
-version = "=1.17.1"
+version = "=1.18.0"
 features = ["default"]
 default-features = false
 
@@ -230,11 +236,6 @@ version = "1.5"
 features = ["critical-section"]
 default-features = false
 
-[dependencies.parley]
-version = "0.10.0"
-features = ["complex-scripts"]
-optional = true
-
 [dependencies.pin-project]
 version = "1"
 
@@ -253,10 +254,11 @@ optional = true
 package = "raw-window-handle"
 
 [dependencies.resvg]
-version = "0.47.0"
+version = "0.48.1"
 features = [
     "text",
     "raster-images",
+    "svgz",
 ]
 optional = true
 default-features = false
@@ -275,7 +277,7 @@ optional = true
 default-features = false
 
 [dependencies.skrifa]
-version = "0.42"
+version = "0.44"
 optional = true
 
 [dependencies.slab]
@@ -328,16 +330,16 @@ optional = true
 version = "1.12.0"
 
 [dependencies.vtable]
-version = "0.4"
+version = "0.5"
 
-[dependencies.wgpu-28]
-version = "28"
+[dependencies.wgpu-29]
+version = "29.0.4"
 optional = true
 default-features = false
 package = "wgpu"
 
-[dependencies.wgpu-29]
-version = "29.0.4"
+[dependencies.wgpu-30]
+version = "30"
 optional = true
 default-features = false
 package = "wgpu"
@@ -349,7 +351,7 @@ version = "0.2.4"
 version = "0.8"
 
 [dev-dependencies.fontique]
-version = "0.10.0"
+version = "0.11.1"
 
 [dev-dependencies.rustybuzz]
 version = "0.20.0"
@@ -385,6 +387,23 @@ version = "0.3.3"
 optional = true
 default-features = false
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.parley]
+version = "0.11.1"
+features = ["complex-scripts"]
+optional = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.clru]
+version = "0.6.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.js-sys]
+version = "0.3"
+features = ["std"]
+default-features = false
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.parley]
+version = "0.11.1"
+optional = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies.wasm-bindgen]
 version = "0.2"
 
@@ -393,6 +412,13 @@ version = "0.3.72"
 features = [
     "HtmlImageElement",
     "Navigator",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "DomParser",
+    "SupportedType",
+    "Document",
+    "Element",
 ]
 default-features = false
 

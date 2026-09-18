@@ -6,9 +6,9 @@ license = "MIT"
 build = "build.rs"
 
 [dependencies]
-# GUI：Slint 1.17 托盘应用。
+# GUI：Slint 1.18 托盘应用。
 # 视觉改造（像素风）：slint-pixel 组件库（@slint_pixel 导入，Pixel* 控件）。
-slint-pixel = "0.2.1"
+slint-pixel = "0.2.2"
 # 渲染器：用默认 femtovg（OpenGL）。历史：曾固定 renderer-skia——旧注释记录 femtovg 在
 # macOS accessory 进程 + 先 hide 后 show 的窗口上渲染全黑；2026-08-15 实测（slint 1.17.1 /
 # macOS 15.x）该症状不复现：femtovg 设置窗渲染正常、托盘图标正常。
@@ -17,7 +17,7 @@ slint-pixel = "0.2.1"
 # 拉取预编译二进制（失败会回退源码编译而非构建失败，但 skia C++ 源码编译冷跑达
 # 30 分钟级）+ 二进制更小。software 渲染器仍在默认特性里，可用
 # SLINT_BACKEND=winit-software 兜底排查（BackendSelector 原生支持，全平台一致）。
-slint = { version = "1.17", features = ["unstable-winit-030"] }
+slint = { version = "1.18", features = ["unstable-winit-030"] }
 # 飞书卡片内容安全化：图片节点必须由 CommonMark parser 定位（手写词法扫描在代码围栏/
 # 行内代码/引用式图片等惰性上下文上连续两轮被独立审查证伪）。该版本已在依赖树里
 # （i-slint-common 依赖它），不引入新的下载或编译单元。
@@ -69,8 +69,8 @@ sha2 = "0.10"
 winit = "0.30"
 
 [build-dependencies]
-slint-build = "1.17"
-slint-pixel = "0.2.1"
+slint-build = "1.18"
+slint-pixel = "0.2.2"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
@@ -93,12 +93,13 @@ strip = true
 tokio = { version = "1", features = ["test-util"] }
 # 圆角窗口区域的 oracle：Slint 默认的 femtovg 渲染器就是用它栅格化圆角路径
 # （`Path::rounded_rect` + `Canvas::contains_point`）。版本与 Cargo.lock 中 slint 依赖的
-# 一致（0.25.1），不引入新的下载；仅测试构建编译。
-femtovg = "0.25.1"
+# 一致（0.27.0），不引入新的下载；仅测试构建编译。
+femtovg = "0.27.0"
 
 # #111 本地补丁：i-slint-core 的 Windows 托盘窗口从 message-only 改为顶层隐藏窗口，
 # 使 Slint 内置的 TaskbarCreated 图标重建逻辑真正生效（explorer 重启后托盘自动恢复）。
-# 上游 1.17.1 用 HWND_MESSAGE 收不到 HWND_BROADCAST 广播（spike 已验证）。
-# 升级 slint 时需同步核对 third_party/i-slint-core 是否仍需要该补丁。
+# 上游 1.18.0 仍未修复：其 windows.rs 与 1.17.1 对应文件逐字节相同，
+# 仍导入 HWND_MESSAGE 并以 Some(HWND_MESSAGE) 创建窗口；message-only 窗口收不到
+# HWND_BROADCAST 的 TaskbarCreated 广播（spike 已验证）。因此 1.18.0 继续重新应用该补丁。
 [patch.crates-io]
 i-slint-core = { path = "third_party/i-slint-core" }
