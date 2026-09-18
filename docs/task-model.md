@@ -8,8 +8,9 @@
 >
 > v2 说明：v1 对执行链的事实判断有误（把串行归因于 per-chat 锁、把 cancel 标志当有效机制、把
 > `sessions.json` 当 ACP 会话的事实源）。经独立评审逐条核对后重写第 1、2 章。
-> v3 说明：§4 的 Q1 / Q7 / Q8 / Q9 已按建议拍板（2026-09-14），见下表；其余 Q 保留待定，
-> 不阻塞 P2a。
+> v3 说明：§4 的 Q1 / Q7 / Q8 / Q9 已按建议拍板（2026-09-14）。P3 / keepalive 的
+> Q4 / Q5 / Q11 / Q14 与 Windows 进程树 Q15 已于 2026-09-18 拍板（来源：
+> `abb-p3-b1-proc-supervisor-20260918`）；其余 Q 仍待定。
 
 ---
 
@@ -164,11 +165,12 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
   },
   "payload": { "kind": "agent", "prompt": "……", "cwd": "", "cmd": [], "env": {} },
   "trigger": { "kind": "cron", "expr": "0 9 * * *", "timezone": "" },   // timezone 暂不支持（非空会被 validate 拒）
+  "resume_on_boot": true,                                                // false = 逐任务 opt-out 自动恢复
   "delivery": { "targets": [], "default": "creator" },
   "channel": { "mode": "dedicated", "channel_id": "……" },   // 见 D1a
-  "limits": { "timeout_secs": 0, "max_restarts": 3, "backoff": "exponential", "log_max_bytes": 10485760 },
+  "limits": { "timeout_secs": 0, "grace_secs": 10, "max_restarts": 3, "backoff": "exponential", "log_max_bytes": 10485760 },
   // state 是运行态投影：实际落在 tasks-state.json，不回写本定义文件（见 Q12）
-  "state": { "kind": "idle", "pid": null, "started_at": null, "last_exit_code": null, "restarts": 0 }
+  "state": { "kind": "idle", "pid": null, "run_seq": 0, "started_at": null, "last_exit_code": null, "restarts": 0 }
 }
 ```
 
@@ -264,7 +266,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 另外两条：
 
-- 给 task 结果带上稳定 `task_id`（幂等键），避免「任务完成但投递失败后重试」重复投递；
+- 给 task 结果带上稳定的 `task_id + run_seq` 幂等键，并把「已投递」持久化；恢复时**只重投、不重跑**。对外只承诺 at-least-once，避免把 IM 平台能力写成 exactly-once；
 - `DeliveryItem` 目前只有 bot + chat，**没有 thread/topic 维度**——默认回创建者时要明确落群根，还是扩展 thread（见 Q10）。
 
 #### D3 proc 由 ABB 派生以继承 TCC（**待验证，验不过就改方向**）
@@ -288,9 +290,9 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 #### D5 进程生命周期（需要真正的 supervisor，不能复用 legacy）
 
-- **Windows 目前没有 Job Object**（`src/buzz/acp.rs:1958-1963` 只杀直接子进程）——要在 `proc` 落地时**新做**，否则 Windows 上的 proc 任务停不干净。
+- **Windows 目前没有 Job Object**（`src/buzz/acp.rs:1958-1963` 只杀直接子进程）。Q15 已拍板以真做 Job Object 为目标；真机验收通过前，Windows 上 `task add --proc` **显式非零拒绝**，不静默降级、不假装支持。
 - `agent-pids.json` 是 legacy 只读且只认 claude/codex/pi 命令行，**不能复用**（`src/agent.rs:446-452`、`:477-490`）。
-- 需要定义：SIGTERM 宽限 → SIGKILL；进程组/Job Object 归属；退出码与退出回收；ABB 崩溃后下次启动的清理（**Unix 上父进程被 SIGKILL 不会自动带走独立进程组**）。
+- 停止语义已拍板：默认 10s 宽限（`limits.grace_secs` 可逐任务覆盖）→ SIGKILL，并**对进程组 / Job Object 整体发信号**；仍需落地退出码回收与 ABB 崩溃后下次启动的清理（**Unix 上父进程被 SIGKILL 不会自动带走独立进程组**）。
 - 防自杀：#164 是动机，但现有保障只是 prompt 护栏（`src/agents_md.rs:107-114`）+ 恢复次数冻结（`src/bridge/recover.rs:6-10`、`:137-160`），**不是进程级边界**。
 - ⚠️ **owner-only 不等于「禁止 owner 会话里的 agent 建自杀命令」**：owner 会话里的 agent 角色同样是 owner，仍可 `task add --proc` 出 `pkill` / `taskkill` / `kill <ABB pid>`。
 - 所以 P3 开工前必须在下面几条里**选一条能落地的**（Q8），而不是只写「supervisor 保证」：
@@ -302,7 +304,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 #### D6 可观测与日志
 
-基础能力（pid / 退出码 / 日志 sink）**必须与 supervisor 同期落地**，不能留到后面阶段——没有日志 drain 和退出记录的 proc supervisor 不可运行。轮转/告警/更完整视图可以后续补（Q4 定上限）。
+基础能力（pid / 退出码 / 日志 sink）**必须与 supervisor 同期落地**，不能留到后面阶段——没有日志 drain 和退出记录的 proc supervisor 不可运行。Q4 已封板 10 MiB × 3 份 / 终态 30 天；`proc` / keepalive 必须 spawn 后**流式写盘**并按字节累计轮转，这是 P3 准入项而非可选项。轮转总量告警/更完整视图仍可后续补。
 
 #### D7 与现有 `job` 的关系
 
@@ -325,8 +327,8 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | **P1a** | 统一默认投递目标（`deliver` / `job`） | D2 | 低 | ✅ 已完成（#310） |
 | **P1b** | 可信 `DeliveryOrigin` + 豁免重构（含防循环回归） | D2 | **中**——碰防循环安全，不能当顺手改 | 待开工 |
 | **P2a** | task store + CLI + 权限/身份模型 | D4 | 中 | ✅ 已完成（task store/CLI/guard 白名单，#326） |
-| **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q7 | **高**（动共享执行层） | 🔶 部分：A(agent 载荷)/B(cancel)/C(触发编排)/D(GC) 已完成；**keepalive 未做**（待 Q5/Q14 拍板） |
-| **P3** | `proc` supervisor（含 Windows Job Object、基础日志/退出记录） | D3 Step 0、D5 | 中高 | 待开工 |
+| **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q7 | **高**（动共享执行层） | 🔶 部分：A(agent 载荷)/B(cancel)/C(触发编排)/D(GC) 已完成；**keepalive 未做**（Q5/Q14 已拍板，待 B2 实现） |
+| **P3** | `proc` supervisor（含 Windows Job Object、基础日志/退出记录） | D3 Step 0、D5 | 中高 | 🔶 **进行中（B1 proc supervisor 已开工，`abb-p3-b1-proc-supervisor-20260918`）** |
 | **P4** | 日志轮转 / 熔断告警 / 更完整可观测 | D6 | 低 | 待开工 |
 | **P5** | `job` → `task` 迁移（别名保留） | D7 | 中（兼容面广） | 待开工 |
 
@@ -344,7 +346,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | `once` | `expr` 时间点 `<= now` | **错过后补跑**（与 `job` 的 `Job::is_due` 同语义）；跑过即终态，不重复 |
 | `cron` | 当前分钟匹配 5 段表达式 | **同一分钟只触发一次**（`last_fired_at` 分钟桶去重；worker 每 2s 轮询，无此记账会反复触发） |
 | `interval` | 首次即跑，之后每 N 秒 | `expr` 支持 `30`/`30s`/`5m`/`2h`/`1d`，**下限 5 秒**（比轮询还密只会把模型打成忙循环） |
-| `keepalive` | **不认领** | 重启恢复/信号语义（Q5/Q14）未拍板，本批不做，也不假装支持 |
+| `keepalive` | **不认领** | B1 不做；重启恢复/信号语义（Q5/Q14）已拍板，按 B2 实现，不假装支持 |
 
 记账字段：`TaskRuntime.last_fired_at`（**认领时刻**，serde default 向后兼容）；与 `Running`
 状态共同保证同一任务不会并发跑两轮。重复档（cron/interval）跑完一轮回到可认领状态；
@@ -357,7 +359,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 
 - **日志轮转**：单文件超 `limits.log_max_bytes`（默认 10MB）时 `id.log → id.log.1 → id.log.2`，
   共保留 3 份（含当前）。旧实现是「超上限就静默不再写」——日志是排障唯一入口，静默停写更坏。
-  （份数是 Q4 拟定默认值，正式拍板后改 `LOG_KEEP_FILES` 一处。）
+  （Q4 已封板为 10 MiB × 3 / 终态 30 天；份数仍由 `LOG_KEEP_FILES` 单点维护。）
 - **孤儿清理**：运行态无对应定义（`task rm` 竞态/手改文件）时，状态行与**日志一起**清。
 - **终态日志保留期**：终态任务的日志超 30 天（`LOG_RETENTION_DAYS`）回收，**定义与运行态保留**
   （`task status` 仍能看到上次结果与错误）。
@@ -374,7 +376,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | 会话隔离的体验落差 | 后台任务看不到聊天上下文 | 文档写明；`--with-context` 观察需求后再做 |
 | 迁移破坏 `job` 使用者 | skill 与用户脚本依赖 `job` CLI | 别名保留 + 三件套迁移测试 |
 | proc 变成提权入口 | 任意命令 + ABB 权限面 | owner-only + 两份白名单 + 状态文件保护 |
-| 任务结果重复投递 | 完成但投递失败后重试 | 稳定 `task_id` 幂等键 |
+| 任务结果重复投递 | 完成但投递失败后重试 | `task_id + run_seq` 幂等键 + 持久化已投递；只重投不重跑，仅承诺 at-least-once |
 
 ---
 
@@ -389,20 +391,26 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | Q8 | **`proc` 权限边界**：owner-only？还是允许 granted 在 OS sandbox 内？ | **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）；受限会话完全不进白名单。理由：owner 会话里的 agent 角色**也是 owner**，光靠 owner-only 挡不住 agent 写出 `pkill`/`kill <ABB pid>` 这类自伤命令（见 D5） |
 | Q9 | **「自己创建的」身份粒度** | **owner-only 管理**，不引入 capability token；后续确有跨用户需求再议 |
 
+**✅ P3 / keepalive 已拍板**（2026-09-18，来源：`abb-p3-b1-proc-supervisor-20260918`）
+
+| # | 问题 | 结论 |
+|---|---|---|
+| Q4 | 日志上限、保留份数与长跑载荷写盘 | **10 MiB × 3 / 终态 30 天封板**；`proc` / keepalive **必须流式写盘**（spawn 后持续 drain stdout/stderr，按字节累计判轮转），这是 P3 准入项，不是可选项 |
+| Q5 | ABB 重启后是否恢复常驻任务 | **默认恢复 + 逐任务 `resume_on_boot=false` opt-out + 不补历史周期**。恢复走独立路径（不复用 `requeue_orphans`）；记录进程代际身份；恢复必须经过 backoff + 熔断；`cancel` 后不得自动拉起 |
+| Q11 | 任务完成但投递前崩溃 | **`task_id + run_seq` 稳定键 + 持久化「已投递」+ 只重投不重跑**；对外只承诺 **at-least-once**，不承诺 exactly-once |
+| Q14 | 进程退出/信号/补跑语义 | 默认宽限 **10s**（`limits.grace_secs` 可覆盖）→ **SIGKILL**；**对进程组 / Job Object 整体发信号**。补跑保持现状：once 补 1 次，cron/interval 不补历史周期 |
+| Q15 | Windows 进程树 / Job Object | **A 为目标 + D 兜底**：Windows 真做 Job Object；未通过真机验收前，`task add --proc` 在 Windows 上**显式非零拒绝**，不许假装支持 |
+
 **⏳ 待定**（有建议默认值，不阻塞 P2a；定稿在对应阶段开工前）
 
 | # | 问题 | 建议默认 / 说明 |
 |---|---|---|
 | Q2 | 后台 agent 是否支持「带聊天上下文」模式 | **先不做**，观察需求 |
 | Q3 | 会话内能否停后台任务 | **能**，但须显式 `task cancel <id>`（避免误杀）——已落地（#306）：CLI 落取消请求文件，worker 消费；在跑的真拆栈、未开跑的不再开跑，取消后不投递 |
-| Q4 | 日志上限与保留份数 | 单文件 10MB / 保留 3 份（待定） |
-| Q5 | ABB 重启后是否恢复常驻任务 | **恢复** |
 | Q6 | 是否允许跨 bot 建 `proc` | **不允许**（bot 归属即权限面） |
 | Q10 | **topic/thread 投递**：默认回创建者时回群根还是原话题？`DeliveryItem` 是否要加 thread 维度？ | 现在根本没有 thread 字段，回错地方是静默的 |
-| Q11 | **任务完成但投递前崩溃**：如何不重跑副作用又可重试投递？ | 涉及幂等键与恢复语义 |
 | Q12 | **定义与运行态存储**：`tasks.json` 是否单写者？CLI 与 service 严格分离读写？ | 决定并发写与迁移原子性 |
 | Q13 | **`payload.agent` 如何承接 #306 的 backend/模型供应商参数** | 现在模型只有 prompt/cwd，接不了供应商 |
-| Q14 | **进程退出/信号/补跑语义**：SIGTERM 宽限、SIGKILL、进程组归属；once/cron 错过触发点是否补跑 | supervisor 的核心契约 |
 
 ---
 

@@ -6,11 +6,11 @@
 
 ## 0. Q 编号说明（先看这一条，避免拍错题）
 
-本简报覆盖的 **Q4 / Q5 / Q11 / Q14** 与 `docs/task-model.md:398-399`、`:402`、`:405` 的同名条目一致。
+本简报覆盖的 **Q4 / Q5 / Q11 / Q14 / Q15** 均已写回 `docs/task-model.md` 决策表；其中 Q4 / Q5 / Q11 / Q14 与该表的同名条目一致。
 
-本简报的 **Q13 指「Windows 无 Job Object 的进程树管理缺口」**；而 `docs/task-model.md:404` 当前把 Q13 记为「`payload.agent` 如何承接 #306 的 backend/模型供应商参数」。**这是两个不同的问题**，本文不覆盖后者。
+本简报的 **Q15 指「Windows 无 Job Object 的进程树管理缺口」**；`docs/task-model.md` 的 **Q13** 仍专指「`payload.agent` 如何承接 #306 的 backend/模型供应商参数」，本文不覆盖后者。
 
-> 拍板后必须回写 `docs/task-model.md`：把「Windows 进程树缺口」补一个独立 Q 号（或明确它归属 Q14），否则编号会漂移成「同一个 Q13 指两件事」。
+> ✅ **已完成编号回写**（2026-09-18，来源：`abb-p3-b1-proc-supervisor-20260918`）：原简报中曾撞用 Q13 的「Windows 进程树/Job Object」已作为独立 **Q15** 写入 `docs/task-model.md` 决策表；Q13 不再表示 Windows 进程树问题。
 
 ---
 
@@ -34,7 +34,7 @@
 | GC 每小时扫一次 | `src/task_run.rs:71`（`LOG_GC_INTERVAL_SECS`）、调用点 `:112-116` |
 | **日志是「回合结束后整段写一次」** | 唯一生产调用点 `src/task_run.rs:307`，实现 `src/task_run.rs:592-621`（`write_log`） |
 
-**关键缺口**：`write_log` 只在一次运行**结束后**被调用一次（`src/task_run.rs:307`）。keepalive/proc 是「进程活着就一直在写 stdout/stderr」，没有「结束」这个点 —— 现状的日志实现**不可能**给 keepalive 落任何日志。这不是调参问题，是 P3 必须补的能力（D6 已写「基础能力必须与 supervisor 同期落地」，`docs/task-model.md:305`）。
+**关键缺口**：`write_log` 只在一次运行**结束后**被调用一次（`src/task_run.rs:307`）。keepalive/proc 是「进程活着就一直在写 stdout/stderr」，没有「结束」这个点 —— 现状的日志实现**不可能**给 keepalive 落任何日志。这不是调参问题，是 P3 必须补的能力（D6 已写「基础能力必须与 supervisor 同期落地」，`docs/task-model.md` §2.3/D6）。
 
 ### 选项
 
@@ -52,7 +52,7 @@
 1. `proc`/keepalive 的日志改为**流式写盘**（spawn 后持续 drain stdout/stderr），每次写入前按字节累计判轮转，而不是只在结束写一次。这是 P3 的准入项，不是 P4。
 2. `rotate_logs` 的**份数与上限抽成一处常量**（现已是 `src/task_run.rs:64`），将来若按 D 分档，只改这一处 + `TaskLimits` 默认值。
 
-理由：现状值已经在 `docs/task-model.md:360` 被记为「Q4 拟定默认值」，且轮转/GC 已有实测回归测试锚点（`src/task_run.rs:1307`、`:1334`、`:1260`、`:1355`），先封板能解锁 P3，磁盘观测数据不足时再按 D 分档，避免在没有观测前拍一个拍脑袋的大值。
+理由：写回前现状值已经在 `docs/task-model.md` 被记为「Q4 拟定默认值」，且轮转/GC 已有实测回归测试锚点（`src/task_run.rs:1307`、`:1334`、`:1260`、`:1355`），先封板能解锁 P3，磁盘观测数据不足时再按 D 分档，避免在没有观测前拍一个拍脑袋的大值。
 
 ### 验收标准
 
@@ -82,7 +82,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | 运行态无"代际/进程身份"字段 | `src/task_store.rs:514-537`（`TaskRuntime` 只有 `pid`/`started_at`/`finished_at`/`last_exit_code`/`restarts`/`last_error`/`last_fired_at`） |
 | 无 `Backoff`/`Interrupted`/`Stopping` 状态 | `src/task_store.rs:502-510`（`TaskStateKind` 只有 Pending/Running/Succeeded/Failed/Cancelled） |
 
-**注意 `requeue_orphans` 的语义与 keepalive 直接冲突**：它现在对所有残留 `Running` 一律"归位 Pending 重跑"（`src/task_run.rs:756-793`）。对 agent 载荷这是对的（重跑一轮便宜且幂等由 prompt 自负）；对 keepalive 是**错**的——keepalive 的旧进程可能还活着（ABB 被 SIGKILL 时 Unix 上独立进程组不会自动被带走，见 `docs/task-model.md:293`），盲目归位 Pending 会拉起**第二个实例**，变成双写。
+**注意 `requeue_orphans` 的语义与 keepalive 直接冲突**：它现在对所有残留 `Running` 一律"归位 Pending 重跑"（`src/task_run.rs:756-793`）。对 agent 载荷这是对的（重跑一轮便宜且幂等由 prompt 自负）；对 keepalive 是**错**的——keepalive 的旧进程可能还活着（ABB 被 SIGKILL 时 Unix 上独立进程组不会自动被带走，见 `docs/task-model.md` §2.3/D5），盲目归位 Pending 会拉起**第二个实例**，变成双写。
 
 ### 选项
 
@@ -103,7 +103,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 3. 恢复必须过 **backoff + 熔断**：连续拉起失败达上限进入 `Failed`，不再自动拉起。否则 C 与 B 的差别只剩"补跑次数"。
 4. `task cancel` / service 正常关停后**不得**自动拉起（用户停止是终态）。
 
-理由：`docs/task-model.md:399` 已经把 Q5 的建议值写成「**恢复**」，C 是该建议的可落地形态；B 在没有 backoff 前不可接受（会把 ABB 重启变成风暴）。
+理由：`docs/task-model.md` §4 决策表（Q5）已经把“默认恢复”收敛为 C；B 在没有 backoff 前不可接受（会把 ABB 重启变成风暴）。
 
 ### 验收标准
 
@@ -133,7 +133,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | 该近窗去重**只查不记**（避免挡住合法重试） | `src/deliver.rs:477-479`（注释引 #254） |
 | 崩溃后恢复对 agent 载荷是**重跑整条 prompt** | `src/task_run.rs:756-793`（`requeue_orphans`），上界 `max_restarts`（`src/task_store.rs:38`） |
 | 结果投递失败只写运行态 + 告警，**不重投** | `src/task_run.rs:384-395`（`outcome.is_delivered()` 为假 → 写 `last_error` + 主会话告警） |
-| 风险表已记"任务结果重复投递" | `docs/task-model.md:377` |
+| 风险表已记"任务结果重复投递" | `docs/task-model.md` §3 风险（任务结果重复投递） |
 
 **当前的实际行为**：`requeue_orphans` 只处理 `Running`（`src/task_run.rs:760-762` 的 `if rt.kind != TaskStateKind::Running { continue; }`）。任务跑完写终态后崩溃 → 状态不是 `Running` → **既不重跑也不重投** → 结果**静默丢失**（只有 `last_error` 留痕，用户要主动 `task status` 才看得到）。这是 Q11 要修的核心。
 
@@ -150,7 +150,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 **Q11 选 C：`task_id + run_seq` 作为稳定幂等键，并把"已投递"做成可恢复的持久状态。**
 
-同时必须**明确不承诺 exactly-once**：三个 IM 平台都没有已验证的端到端幂等 API，能做到的上限是「本地不重复入队 + 对平台 at-least-once 投递」。`docs/task-model.md:377` 的风险表口径保持不动。
+同时必须**明确不承诺 exactly-once**：三个 IM 平台都没有已验证的端到端幂等 API，能做到的上限是「本地不重复入队 + 对平台 at-least-once 投递」。`docs/task-model.md` §3 风险（任务结果重复投递）的口径保持不动。
 
 落地要点：
 
@@ -168,7 +168,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 ---
 
-## 4. Q13 Windows 无 Job Object 的代价
+## 4. Q15 Windows 无 Job Object 的代价
 
 ### 问题
 
@@ -185,7 +185,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | Windows 上停止只做单 pid 强杀 | `src/install.rs:204-212`（`taskkill /PID <pid> /F`） |
 | Windows 上清理残留 agent 同样是单 pid | `src/agent.rs:570-574`（`taskkill /PID ... /F`） |
 | Windows 分支**无宽限期**（`grace` 被丢弃） | `src/install.rs:204-205`（`let _ = grace;` + 注释「无宽限期语义」） |
-| doc 已记该缺口 | `docs/task-model.md:291`（「Windows 目前没有 Job Object——要在 proc 落地时新做，否则 Windows 上的 proc 任务停不干净」） |
+| doc 已记该缺口 | `docs/task-model.md` §2.3/D5（Windows 无 Job Object） |
 
 **四条具体缺口**：
 
@@ -201,25 +201,30 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | **A 真做 Job Object** | 用 `windows` crate：`CreateJobObjectW` + `SetInformationJobObject(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)` + `AssignProcessToJobObject`；终止走 `TerminateJobObject` 或关闭句柄 | 新依赖 `windows` crate 的 Win32 feature；新增 `unsafe` + `#[cfg(windows)]` 分支；需要 Windows 真机/CI 验收；若 ABB 自身已被父 Job 包住，需 `CREATE_BREAKAWAY_FROM_JOB` 才能再建 Job |
 | **B 手动遍历 + `taskkill /T /F`** | 用 Toolhelp32 快照枚举 pid 树，再 `taskkill /T /F /PID` | 竞态（pid 复用、树在遍历中变化）；比 Job 弱；胜在无新依赖，但仍是 `unsafe` win32 调用 |
 | **C 宽限期尽力而为** | 不做树归属，只对直接子进程发 `GenerateConsoleCtrlEvent`，宽限后强杀 | 孙进程仍孤儿；等于把"停不干净"写成已知行为，不是修复 |
-| **D 补齐前显式拒绝** | Windows 上 `task add --proc` 直接报错，不静默降级 | 功能缺失，但**不制造静默失效**；符合 `docs/task-model.md:291` 的「不静默降级」取向 |
+| **D 补齐前显式拒绝** | Windows 上 `task add --proc` 直接报错，不静默降级 | 功能缺失，但**不制造静默失效**；符合 `docs/task-model.md` §2.3/D5 的「不静默降级」取向 |
 
 ### 推荐
 
-**Q13 选 A 作为目标实现，并在 A 完成前用 D 兜底。**
+**Q15 选 A 作为目标实现，并在 A 完成前用 D 兜底。**
 
-- P3a 在 Unix 上直接开工（pgid 语义已存在，`src/buzz/acp.rs:1941-1956` 可参考）。
-- Windows 分支：**Job Object 未通过真机验收前，`task add --proc` 在 Windows 上显式拒绝**（D），而不是退回 C 假装支持。
+- B1 在 Unix 上直接开工（pgid 语义已存在，`src/buzz/acp.rs:1941-1956` 可参考）；Windows 上只实现 D 兜底。
+- Windows Job Object 归独立的 **B1b**；真机验收通过前，`task add --proc` 在 Windows 上显式拒绝（D），而不是退回 C 假装支持。
 - B 仅作为 Job Object 不可用（如嵌套 Job 限制无法绕过）时的**降级 fallback**，且必须在驳回时明确告知用户"孙进程可能残留"。
 
-理由：C 会把一个已知缺陷伪装成已支持；D 是诚实的最小面；A 才是 D5（`docs/task-model.md:289-303`）要求的真 supervisor 语义。
+理由：C 会把一个已知缺陷伪装成已支持；D 是诚实的最小面；A 才是 `docs/task-model.md` §2.3/D5 要求的真 supervisor 语义。
 
 ### 验收标准
+
+**B1（本批：Unix pgid + Windows D 兜底）**
+
+- [ ] **Windows 不静默降级**：Job Object 未接入时，`agent-bridge task add --proc ...` 返回非 0 并打印明确原因，**不**创建任务。
+- [ ] **Unix 回归**：`killpg` 覆盖孙进程的现有用例保持通过（`src/buzz/acp.rs:1941-1956` 附近）。
+
+**B1b Windows Job Object（独立批次）**
 
 - [ ] **阳性用例（Windows）**：探针进程写自己的 pid、再 spawn 一个孙进程并写孙 pid。取消任务后断言父 pid 与孙 pid **均不存在**（`tasklist /FI "PID eq <pid>"` 命中 0）。
 - [ ] **宿主退出**：ABB 被强制结束（模拟看门狗 SIGKILL/ `taskkill /F`）后，因 `KILL_ON_JOB_CLOSE` 子进程树也全部消失。
 - [ ] **阴性对照（必红）**：**未接 Job Object 时**，Windows 上的"取消后孙进程消失"用例必须**失败**，不得用 `#[ignore]` / skip 把它写成绿（`RULE_可达性.md` 第 3 条禁 skip 凑绿）。
-- [ ] **不静默降级**：Windows 未接 Job Object 时，`agent-bridge task add --proc ...` 返回非 0 并打印明确原因，**不**创建任务。
-- [ ] **Unix 回归**：`killpg` 覆盖孙进程的现有用例保持通过（`src/buzz/acp.rs:1941-1956` 附近）。
 - [ ] **依赖可达**：`windows` crate 的 Win32 JobObjects feature 在 CI 中有实际编译的 job（`RULE_可达性.md` 第 1 条）。
 
 ---
@@ -244,7 +249,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | once：到期即跑，`t <= now` → **会补跑** | `src/task_run.rs:649-651` |
 | cron：只匹配当前分钟 + 分钟桶去重 → **不补历史** | `src/task_run.rs:652-660` |
 | interval：`last_fired_at + N` → **不补历史**，且对未来记账有回拨护栏 | `src/task_run.rs:661-672` |
-| keepalive：恒 `false`（待 Q5/Q14） | `src/task_run.rs:673` |
+| keepalive：恒 `false`（Q5/Q14 已拍板，待 B2 实现） | `src/task_run.rs:673` |
 
 ### 选项
 
@@ -259,7 +264,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 **② 到期是否 SIGKILL**：现状是（`src/install.rs:198`）。备选"只报错不强杀"会让卡死进程永久占着任务槽位（单 worker 串行 → 整个队列停摆），**不建议**。
 
-**③ 是否整组发信号**：Unix 现状 service 是单 pid、ACP 是整组。proc supervisor 必须**整组**，否则与 Q13 的缺口重复踩一遍。
+**③ 是否整组发信号**：Unix 现状 service 是单 pid、ACP 是整组。proc supervisor 必须**整组**，否则与 Q15 的缺口重复踩一遍。
 
 **④ 补跑口径**
 
@@ -280,56 +285,64 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 ### 验收标准
 
-- [ ] **忽略 SIGTERM 探针**：探针进程显式忽略 SIGTERM → 宽限（测试注入 300ms）后必须被杀，断言升级链路有效（复用 `src/install.rs:252-265` 的既有测试形态）。
-- [ ] **进程组/Job 覆盖孙进程**：取消后 pgid/Job 内**所有** pid 消失（Unix + Windows 各一条）。
-- [ ] **强杀前复查存活**：单测断言"宽限内已退出的 pid"不再收到第二次信号（防 pid 复用误杀）。
-- [ ] **优雅路径**：探针进程正常退出码 7 → `TaskRuntime.last_exit_code == 7`，`pid` 清空，状态按退出码落 Succeeded/Failed。
-- [ ] **补跑口径可执行**：可注入时钟下，once 过期 1 次 → 恰好 1 次执行；cron 错过 10 分钟 → 0 次历史补跑；interval 跨 5 个周期 → ≤1 次执行。
-- [ ] **取消不投递**：取消的任务不产生任何 `DeliveryItem`（现有 `src/task_run.rs:324-330` 的口径保持，加断言）。
+- [ ] **[B1/Unix] 忽略 SIGTERM 探针**：探针进程显式忽略 SIGTERM → 宽限（测试注入 300ms）后必须被杀，断言升级链路有效（复用 `src/install.rs:252-265` 的既有测试形态）。
+- [ ] **[B1/Unix] 进程组覆盖孙进程**：取消后 pgid 内**所有** pid 消失。
+- [ ] **[B1b/Windows] Job Object 覆盖孙进程**：取消后 Job 内**所有** pid 消失。
+- [ ] **[B1/Unix] 强杀前复查存活**：单测断言"宽限内已退出的 pid"不再收到第二次信号（防 pid 复用误杀）。
+- [ ] **[B1/Unix] 优雅路径**：探针进程正常退出码 7 → `TaskRuntime.last_exit_code == 7`，`pid` 清空，状态按退出码落 Succeeded/Failed。
+- [ ] **[B1] 补跑口径可执行**：可注入时钟下，once 过期 1 次 → 恰好 1 次执行；cron 错过 10 分钟 → 0 次历史补跑；interval 跨 5 个周期 → ≤1 次执行。
+- [ ] **[B1] 取消不投递**：取消的任务不产生任何 `DeliveryItem`（现有 `src/task_run.rs:324-330` 的口径保持，加断言）。
 
 ---
 
 ## 6. 建议的批次拆分
 
-> 依赖关系：`B1 → B2`；`B3` 可与 `B1/B2` 并行；`B4` 在 `B1` 之后。每个批次一个 issue + 一个 PR，独立审查。
+> 依赖关系：`B1 → B2`；`B1 → B1b`（Windows Job Object 独立批次）；`B3` 可与 `B1/B2` 并行；`B4` 在 `B1` 之后。每个批次一个 issue + 一个 PR，独立审查。
 
-### B1（P3a）proc supervisor 最小可用 ⭐ 先拍 Q14 + Q13
+### B1（P3a）proc supervisor 最小可用 ⭐ 按已拍板 Q14 + Q15-D
 
-- **范围**：新增 `proc` 执行路径（spawn / 流式 stdout+stderr drain / 等你退出 / 回收退出码），`src/task_run.rs:141-159` 的 `PayloadKind::Proc` 显式失败分支改为真实现；`src/main.rs:1201-1202（main@1850e38；该处只硬编码 PayloadKind::Agent，需按锚点而非行号读）` 的硬编码 `PayloadKind::Agent` 增加仅人工可用的 `--proc --cmd` 路径；`src/guard.rs:651-665` 与 `crates/buzz-agent/src/shell_policy.rs:146-157` 的拒绝测试保持（Q8 已拍板：agent 不得创建 proc）。
-- **前置**：Q14 的 grace/组信号口径；Q13 的 Windows 策略（A 或 D）。
-- **机器验收**：见 Q14 与 Q13 的验收块；外加 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo build --locked`、`tools/check_test_isolation.sh` 全绿。
-- **规模**：约 700–1200 LOC（含测试与平台适配），中高风险。主要风险是 Windows Job Object 的 `unsafe` 与 pid 身份。
+- **范围**：Unix `proc` 执行路径（spawn / 流式 stdout+stderr drain / 等你退出 / 回收退出码 / pgid 整组停止）；Windows 仅实现 Q15-D 显式拒绝。`src/task_run.rs:141-159` 的 `PayloadKind::Proc` 显式失败分支改为真实现；`src/main.rs:1201-1202（main@1850e38；该处只硬编码 PayloadKind::Agent，需按锚点而非行号读）` 的硬编码 `PayloadKind::Agent` 增加仅人工可用的 `--proc --cmd` 路径；`src/guard.rs:651-665` 与 `crates/buzz-agent/src/shell_policy.rs:146-157` 的拒绝测试保持（Q8 已拍板：agent 不得创建 proc）。
+- **前置**：Q14 的 grace/组信号口径；Q15-D 的 Windows 显式拒绝口径。
+- **机器验收**：见 Q14 验收中标为 `[B1]` / `[B1/Unix]` 的条款及 Q15 的「B1（本批）」验收；外加 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo build --locked`、`tools/check_test_isolation.sh` 全绿。
+- **规模**：约 500–900 LOC，中高风险。主要风险是 Unix pgid / pid 身份与停止竞态；Windows Job Object 的 `unsafe` 不在本批。
+
+### B1b（Windows Job Object，独立批次）
+
+- **范围**：用 Job Object 承载 Windows proc 的进程树归属，替换 B1 的 D 兜底；实现整组停止与 `KILL_ON_JOB_CLOSE`。
+- **前置**：B1 完成；Q15-A；Windows 真机可用。
+- **机器验收**：见 Q15 的「B1b Windows Job Object」验收块；外加 `windows` crate Win32 JobObjects feature 的 CI 触达。
+- **规模**：约 300–600 LOC，中高风险。主要风险是 Win32 `unsafe`、嵌套 Job 限制与真机验收覆盖。
 
 ### B2（P3b）keepalive 状态机 + Q5 恢复
 
 - **范围**：`src/task_store.rs` 增加 `Backoff`/`Interrupted` 状态、`resume_on_boot`、backoff/重启窗口字段；`src/task_run.rs:756-793` 拆出 keepalive 专属恢复路径（**不复用** `requeue_orphans`）；`src/task_store.rs:415-419` 放开 keepalive 登记；`src/task_run.rs:673` 的认领分支实现真语义。
-- **前置**：B1 完成；Q5 拍板。
+- **前置**：B1 完成；Q5 已拍板。
 - **机器验收**：见 Q5 的验收块；必须用真实子进程测，不接受只测纯函数。
 - **规模**：约 500–900 LOC，中高风险（进程身份 / pid 复用 / 快速退出风暴）。
 
 ### B3（P1b 之后）结果持久化与恢复重投
 
 - **范围**：`TaskRuntime` 增加 `run_seq`；结果投递记录持久化 + 启动扫描；`src/task_run.rs:371` 的随机 uuid 改为 `task_id+run_seq` 派生键或与之关联的稳定键。
-- **前置**：Q11 拍板；不阻塞 B1/B2。
+- **前置**：Q11 已拍板；不阻塞 B1/B2。
 - **机器验收**：见 Q11 的验收块。
 - **规模**：约 300–600 LOC。
 
 ### B4（P4）日志总量 / 告警 / 可观测
 
-- **范围**：Q4 若选 D 才需要分档；per-bot 日志总量统计、告警、面板。
+- **范围**：Q4 已选 A，本批不做分档；per-bot 日志总量统计、告警、面板。
 - **前置**：B1（流式日志）落地并跑出真实观测数据。
 - **机器验收**：观测脚本能报出每个 bot 的 `task-logs/` 实际占用；超阈值告警有阳性对照。
 
 ---
 
-## 7. 必须先用户拍板的问题清单
+## 7. 用户拍板问题清单（2026-09-18 已拍板）
 
-以下 5 条**不定就不能开工**（B1/B2 会直接依赖它们；B3 依赖第 5 条）：
+以下 5 条已在 `abb-p3-b1-proc-supervisor-20260918` 拍板并回写 `docs/task-model.md`；下方保留原始问题与选项，便于审计：
 
 1. **Q14**：宽限期取 10s（可 `limits.grace_secs` 覆盖）？到期 SIGKILL？对进程组/Job 整体发信号？补跑保留「once 补 1 次、cron/interval 不补历史」？
 2. **Q5**：选 C（默认恢复 + `resume_on_boot` opt-out + 不补历史周期）？还是 A（不恢复）/ B（恢复并补跑）？
-3. **Q13**：Windows 走 A（Job Object）并在完成前用 D（显式拒绝 proc）兜底？还是接受 C（尽力而为并写明可能残留孤儿）？
+3. **Q15**：Windows 走 A（Job Object）并在完成前用 D（显式拒绝 proc）兜底？还是接受 C（尽力而为并写明可能残留孤儿）？
 4. **Q4**：冻结 10 MiB × 3 / 30 天？还是直接上 D（分档）？（**无论选哪个，proc 流式写盘都是 P3 准入项**，不是可选项。）
 5. **Q11**：选 C（`task_id + run_seq` 稳定键 + 持久化重投），并确认对外只承诺 at-least-once？
 
-> 另需顺手拍一条**文档口径**：`docs/task-model.md:404` 的 Q13（`payload.agent` 承接 backend/供应商）与本简报的 Q13（Windows 进程树）撞号，拍板后要回写编号，避免后续引用歧义。
+> 文档口径已收口：`docs/task-model.md` 的 Q13 专指 `payload.agent` 承接 backend/供应商；Windows 进程树问题已回写为独立 **Q15**，后续引用不再共用编号。
