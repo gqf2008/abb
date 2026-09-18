@@ -52,10 +52,19 @@ mod wechat;
 mod ws;
 mod wsver;
 
-/// 运行时数据目录：~/.agent-bridge（隐藏目录，与 ~/.claude 同款）。
+/// 运行数据目录的环境变量覆盖；空字符串按未设置处理。
+pub(crate) fn bridge_home_override() -> Option<std::path::PathBuf> {
+    std::env::var_os("AGENT_BRIDGE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// 运行时数据目录：默认 ~/.agent-bridge（隐藏目录，与 ~/.claude 同款）；
+/// `AGENT_BRIDGE_HOME` 非空时直接作为整个数据目录。
 /// 老路径 ~/feishu-bridge 由 platform::migrate_to_agent_bridge() 一次性迁移过来（main 启动时跑）。
 pub fn bridge_dir() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".agent-bridge")
+    bridge_home_override()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".agent-bridge"))
 }
 
 /// 某 bot 的工作目录：~/.agent-bridge/workspaces/<bot_key>/。约定 agent 只在此读写。

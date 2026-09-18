@@ -1050,6 +1050,10 @@ fn migrate_legacy_state_at(
 ///   - logs/service.pid 绝不能迁：stale pid 可能被系统复用，看门 svc_stop 会误杀无辜进程 → 迁后删掉。
 ///   - .gui.lock/.service.lock 不迁：flock 是 fd 锚点，旧进程死后锁已释放，新位置由 single_instance 自建。
 pub fn migrate_to_agent_bridge() {
+    // 自定义运行数据目录：不探测或搬动真实用户目录里的旧数据，避免测试/多实例串数据。
+    if crate::bridge_home_override().is_some() {
+        return;
+    }
     let old = dirs::home_dir().unwrap_or_default().join("feishu-bridge");
     let new = crate::bridge_dir(); // ~/.agent-bridge
     if !old.is_dir() {

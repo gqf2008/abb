@@ -2,7 +2,7 @@
 //! “非法 key 不落盘 / 显式来源优先 / alias 收敛到规范 key”。
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde_json::{json, Value};
@@ -37,15 +37,28 @@ impl TempHome {
     }
 
     fn run(&self, args: &[&str], envs: &[(&str, &str)], stdin: &str) -> Output {
+        self.run_at(&self.root, &self.bridge_dir(), args, envs, stdin)
+    }
+
+    fn run_at(
+        &self,
+        home: &Path,
+        bridge_home: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        stdin: &str,
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
         for key in [
             "AGENT_BRIDGE_BOT_KEY",
             "AGENT_BRIDGE_CHAT_ID",
             "AGENT_BRIDGE_SENDER_ROLE",
+            "AGENT_BRIDGE_HOME",
         ] {
             cmd.env_remove(key);
         }
-        cmd.env("HOME", &self.root);
+        cmd.env("HOME", home);
+        cmd.env("AGENT_BRIDGE_HOME", bridge_home);
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             cmd.env("TMPDIR", tmpdir);
         }
@@ -76,6 +89,33 @@ impl Drop for TempHome {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// Windows 的 `dirs::home_dir()` 不读 `HOME`；运行数据目录必须由
+/// `AGENT_BRIDGE_HOME` 独立覆盖，否则测试会落到真实用户目录并读到空配置。
+#[test]
+fn agent_bridge_home_overrides_platform_home() {
+    let data_home = TempHome::new();
+    data_home.write_config(json!([standard_bot()]));
+    let unrelated_home = TempHome::new();
+
+    let out = data_home.run_at(
+        &unrelated_home.root,
+        &data_home.bridge_dir(),
+        &[
+            "deliver", "--bot", "app_safe", "--chat", "oc_main", "--text", "hi",
+        ],
+        &[],
+        "",
+    );
+
+    assert_ok(&out);
+    let queued = data_home.bridge_dir().join("deliveries.json");
+    assert!(queued.is_file(), "投递应写入 AGENT_BRIDGE_HOME: {queued:?}");
+    assert!(
+        !unrelated_home.bridge_dir().join("deliveries.json").exists(),
+        "不得回落到 HOME 下的运行数据目录"
+    );
 }
 
 fn standard_bot() -> Value {
