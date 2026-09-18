@@ -704,41 +704,57 @@ fn path_in_workspace(cwd: &str, workspace: &std::path::Path) -> bool {
     if !candidate.is_absolute() {
         return false;
     }
-    let workspace_abs = canonicalize_allow_missing(workspace);
-    let candidate_abs = canonicalize_allow_missing(candidate);
+    let Some(workspace_abs) = canonicalize_allow_missing(workspace) else {
+        return false;
+    };
+    let Some(candidate_abs) = canonicalize_allow_missing(candidate) else {
+        return false;
+    };
     candidate_abs.starts_with(workspace_abs)
 }
 
-/// canonicalize 路径；路径（或其后缀）尚不存在时，解析最近的已存在祖先并拼回缺失后缀。
+/// 安全地 canonicalize 路径；路径（或其后缀）尚不存在时，解析最近的已存在祖先并拼回缺失后缀。
 ///
-/// 不能只对不存在路径做词法归一化：macOS 的 `/var` → `/private/var` 这类祖先符号链接
-/// 会让同一个工作区出现“真实路径 canonical、候选路径词法”两种形态，从而把合法 cwd
-/// 误判为越界。先解析祖先仍保留 symlink-escape 防线，因为真实祖先会先被 canonicalize。
-fn canonicalize_allow_missing(path: &std::path::Path) -> PathBuf {
-    let normalized = normalize_lexical(path);
-    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
-        return canonical;
+/// 顺序必须是：先 canonicalize **原始路径**，只有失败后才退到祖先 + 原始缺失后缀。
+/// 先做词法归一化会把 `link/..` 折叠成父目录，绕过 symlink 的真实解析；而 symlink
+/// 指向工作区外时，POSIX `link/..` 实际会落在那条链接的目标父目录。
+fn canonicalize_allow_missing(path: &std::path::Path) -> Option<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(canonical);
     }
 
-    let mut missing = Vec::new();
-    let mut ancestor = normalized.as_path();
+    let mut ancestor = path;
     loop {
-        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
-            for component in missing.iter().rev() {
-                canonical.push(component);
-            }
-            return normalize_lexical(&canonical);
-        }
-        let Some(parent) = ancestor.parent() else {
-            return normalized;
-        };
+        let parent = ancestor.parent()?;
         if parent == ancestor {
-            return normalized;
-        }
-        if let Some(name) = ancestor.file_name() {
-            missing.push(name.to_os_string());
+            return None;
         }
         ancestor = parent;
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            let suffix = path.strip_prefix(ancestor).ok()?;
+            for component in suffix.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        canonical.pop();
+                    }
+                    std::path::Component::Normal(name) => {
+                        let next = canonical.join(name);
+                        if std::fs::symlink_metadata(&next)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        canonical.push(name);
+                    }
+                    std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                        return None;
+                    }
+                }
+            }
+            return Some(normalize_lexical(&canonical));
+        }
     }
 }
 
@@ -1311,6 +1327,56 @@ mod tests {
         assert!(
             validate_proc_payload(&payload, &workspace).is_err(),
             "工作区内 symlink 指向外部也必须拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_cwd_rejects_symlink_parent_dir_escape() {
+        let root =
+            std::env::temp_dir().join(format!("abb-proc-link-parent-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("inside")).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        let link = workspace.join("escape");
+        std::os::unix::fs::symlink(outside.join("sub"), &link).unwrap();
+
+        let payload = TaskPayload {
+            kind: PayloadKind::Proc,
+            cmd: vec!["true".to_string()],
+            cwd: link.join("..").display().to_string(),
+            ..Default::default()
+        };
+        assert!(
+            validate_proc_payload(&payload, &workspace).is_err(),
+            "link/.. 必须按 POSIX 解析真实目标，不能词法折叠回工作区"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_cwd_rejects_dangling_symlink_escape() {
+        let root =
+            std::env::temp_dir().join(format!("abb-proc-link-dangling-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("dangling");
+        std::os::unix::fs::symlink(outside.join("missing"), &link).unwrap();
+
+        let payload = TaskPayload {
+            kind: PayloadKind::Proc,
+            cmd: vec!["true".to_string()],
+            cwd: link.join("..").display().to_string(),
+            ..Default::default()
+        };
+        assert!(
+            validate_proc_payload(&payload, &workspace).is_err(),
+            "指向工作区外的悬空 symlink 必须 fail-closed，不能接受 link/.."
         );
         let _ = std::fs::remove_dir_all(&root);
     }

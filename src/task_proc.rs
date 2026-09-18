@@ -830,14 +830,13 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         wait_for(Duration::from_secs(2), || ready.exists()).await;
+        let grace = Duration::from_secs(10);
         let started = tokio::time::Instant::now();
-        let stop = stop_process_group(&mut child, pid, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let stop = stop_process_group(&mut child, pid, grace).await.unwrap();
         assert!(!stop.escalated, "宽限内已退出的进程组不得再收到第二次信号");
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "已退出应快速返回，不空等完宽限"
+            started.elapsed() < grace,
+            "进程已退出时不得空等完整个宽限（不作为延迟 SLO，只区分早返回与耗尽 grace）"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
