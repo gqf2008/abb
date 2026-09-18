@@ -9,19 +9,22 @@ use crate::api::{
     CloseRequestResponse, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize,
     PlatformError, Window, WindowPosition, WindowSize,
 };
+use crate::cursor::MouseCursorInner;
 use crate::input::{
-    ClickState, DragData, FocusEvent, FocusReason, InternalKeyEvent, KeyEventResult, KeyEventType,
-    Keys, MouseEvent, MouseInputState, PointerEventButton, TextCursorBlinker, TouchPhase,
-    TouchState, key_codes,
+    BackendDragEvent, ClickState, DragData, FocusEvent, FocusReason, InternalKeyEvent,
+    KeyEventResult, KeyEventType, Keys, MouseEvent, MouseInputState, PointerEventButton,
+    TextCursorBlinker, TouchPhase, TouchState, key_codes,
 };
 use crate::item_tree::{
     ItemRc, ItemTreeRc, ItemTreeRef, ItemTreeRefPin, ItemTreeVTable, ItemTreeWeak, ItemWeak,
     ParentItemTraversalMode,
 };
-use crate::items::{InputType, ItemRef, MenuEntry, MouseCursor, PopupClosePolicy};
+use crate::items::{
+    BuiltInMouseCursor, InputMethodHints, InputType, ItemRef, MenuEntry, PopupClosePolicy,
+};
 use crate::lengths::{LogicalLength, LogicalPoint, LogicalRect, LogicalVector, SizeLengths};
 use crate::menus::MenuVTable;
-use crate::properties::{Property, PropertyTracker};
+use crate::properties::{ChangeTracker, Property, PropertyTracker};
 use crate::renderer::Renderer;
 use crate::{Callback, Coord, SharedString, SharedVector};
 use alloc::boxed::Box;
@@ -62,7 +65,7 @@ pub enum WindowKind {
 ///
 /// - When receiving messages from the windowing system about state changes, such as the window being resized,
 ///   the user requested the window to be closed, input being received, etc. you need to create a
-///   [`WindowEvent`](crate::platform::WindowEvent) and send it to Slint via [`Window::try_dispatch_event()`].
+///   [`WindowEvent`](crate::platform::WindowEvent) and send it to Slint via [`Window::dispatch_event_with_result()`].
 ///
 /// - Slint sends requests to change visibility, position, size, etc. via functions such as [`Self::set_visible`],
 ///   [`Self::set_size`], [`Self::set_position`], or [`Self::update_window_properties()`]. Re-implement these functions
@@ -169,6 +172,51 @@ pub trait WindowAdapter {
     }
 }
 
+/// What a `DragArea` offers to start a native (OS-level) drag, passed to
+/// [`WindowAdapterInternal::start_drag`].
+///
+/// A read-only view: the backend reads the payload, allowed actions, and drag image; the source
+/// item and other routing data stay in the core.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct DragRequest {
+    pub(crate) data: crate::data_transfer::DataTransfer,
+    pub(crate) allowed: crate::items::AllowedDragActions,
+    pub(crate) drag_image: crate::graphics::Image,
+    pub(crate) drag_image_offset: euclid::default::Vector2D<i32>,
+}
+
+impl DragRequest {
+    /// The data being transferred.
+    pub fn data(&self) -> &crate::data_transfer::DataTransfer {
+        &self.data
+    }
+    /// The set of actions the drag source permits.
+    pub fn allowed_actions(&self) -> crate::items::AllowedDragActions {
+        self.allowed
+    }
+    /// The image to show under the cursor while dragging.
+    pub fn drag_image(&self) -> &crate::graphics::Image {
+        &self.drag_image
+    }
+    /// The offset of the drag image relative to the cursor, in pixels.
+    pub fn drag_image_offset(&self) -> euclid::default::Vector2D<i32> {
+        self.drag_image_offset
+    }
+}
+
+/// A drag a `DragArea` started, tracked by the core while in flight.
+/// The backend sees only the [`DragRequest`]; the source and seed position stay here to report
+/// completion and to arm the in-window fallback.
+#[derive(Clone)]
+pub(crate) struct NativePendingDrag {
+    pub(crate) request: DragRequest,
+    /// The `DragArea` that initiated the drag.
+    pub(crate) source: ItemWeak,
+    /// The pointer position that crossed the drag threshold, used to seed the in-window drag.
+    pub(crate) seed_position: LogicalPosition,
+}
+
 /// Implementation details behind [`WindowAdapter`], but since this
 /// trait is not exported in the public API, it is not possible for the
 /// users to call or re-implement these functions.
@@ -207,7 +255,7 @@ pub trait WindowAdapterInternal: core::any::Any {
 
     /// Set the mouse cursor
     // TODO: Make the enum public and make public
-    fn set_mouse_cursor(&self, _cursor: MouseCursor) {}
+    fn set_mouse_cursor(&self, _cursor: MouseCursorInner) {}
 
     /// This method allow editable input field to communicate with the platform about input methods
     fn input_method_request(&self, _: InputMethodRequest) {}
@@ -263,6 +311,26 @@ pub trait WindowAdapterInternal: core::any::Any {
     fn safe_area_inset(&self) -> crate::lengths::PhysicalEdges {
         Default::default()
     }
+
+    /// Start a native (OS-level) drag-and-drop operation.
+    ///
+    /// Returns `true` if the backend took the drag over (it may defer the actual start).
+    /// Returns `false` (the default) when native drag is unsupported; the caller then arms the
+    /// in-window drag.
+    ///
+    /// On completion the backend calls [`WindowInner::report_drag_finished`]
+    /// (`DragAction::None` if cancelled), or [`WindowInner::start_in_window_drag`] if a native
+    /// start fails after returning `true`.
+    fn start_drag(&self, _request: &DragRequest) -> bool {
+        false
+    }
+
+    /// Ask the windowing system to start an interactive, user-driven move of the window,
+    /// as if the user had dragged the window's title bar.
+    ///
+    /// This is called while the user holds a mouse button pressed.
+    /// The default implementation does nothing; backends without support ignore the request.
+    fn start_window_move(&self) {}
 }
 
 /// This is the parameter from [`WindowAdapterInternal::input_method_request()`] which lets the editable text input field
@@ -305,6 +373,8 @@ pub struct InputMethodProperties {
     pub anchor_point: LogicalPosition,
     /// The type of input for the text edit.
     pub input_type: InputType,
+    /// The hints for the input method for the text edit.
+    pub input_method_hints: InputMethodHints,
     /// The clip rect in window coordinates
     pub clip_rect: Option<LogicalRect>,
 }
@@ -387,11 +457,15 @@ struct WindowPropertiesTracker {
 impl crate::properties::PropertyDirtyHandler for WindowPropertiesTracker {
     fn notify(self: Pin<&Self>) {
         let win = self.window_adapter_weak.clone();
-        crate::timers::Timer::single_shot(Default::default(), move || {
-            if let Some(window_adapter) = win.upgrade() {
-                WindowInner::from_pub(window_adapter.window()).update_window_properties();
-            };
-        })
+        let Some(adapter) = win.upgrade() else { return };
+        WindowInner::from_pub(adapter.window()).context().single_shot(
+            Default::default(),
+            move || {
+                if let Some(window_adapter) = win.upgrade() {
+                    WindowInner::from_pub(window_adapter.window()).update_window_properties();
+                };
+            },
+        )
     }
 }
 
@@ -406,13 +480,18 @@ impl crate::properties::PropertyDirtyHandler for PopupWindowPropertiesTracker {
     fn notify(self: Pin<&Self>) {
         let parent = self.parent_window_adapter_weak.clone();
         let popup_id = self.popup_id;
+        let Some(parent_adapter) = parent.upgrade() else { return };
         // Use a timer here, so if we change multiple properties at the same time not multiple notifications are send
         // This timer will delay for the next evaluation
-        crate::timers::Timer::single_shot(Default::default(), move || {
-            if let Some(parent_adapter) = parent.upgrade() {
-                WindowInner::from_pub(parent_adapter.window()).update_popup_properties(popup_id);
-            }
-        });
+        WindowInner::from_pub(parent_adapter.window()).context().single_shot(
+            Default::default(),
+            move || {
+                if let Some(parent_adapter) = parent.upgrade() {
+                    WindowInner::from_pub(parent_adapter.window())
+                        .update_popup_properties(popup_id);
+                }
+            },
+        );
     }
 }
 
@@ -496,7 +575,7 @@ struct WindowPinnedFields {
 
 /// The outcome of dispatching a [`MouseEvent`] through [`WindowInner::process_mouse_input`].
 #[derive(Copy, Clone, Debug)]
-pub struct MouseDispatchResult {
+pub(crate) struct MouseDispatchResult {
     /// For `MouseEvent::DragMove` / `MouseEvent::Drop` events, the action negotiated with
     /// the accepting `DropArea` (or `None` if no `DropArea` accepted). Always `None` for
     /// other event kinds.
@@ -504,6 +583,61 @@ pub struct MouseDispatchResult {
     /// `true` if an item consumed the event (`EventAccepted`, `GrabMouse`, `StartDrag`, or
     /// a `DropArea` accepting a drag/drop). `false` if the event fell through without a taker.
     pub accepted: bool,
+}
+
+/// The program a path names, without its directory or the Windows `.exe` suffix.
+/// `None` for a path that names no file, or an empty name.
+#[cfg(feature = "std")]
+fn program_name(path: &std::path::Path) -> Option<SharedString> {
+    // A Windows program is called "foo", not "foo.exe"
+    let is_exe = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    let name = if is_exe { path.file_stem()? } else { path.file_name()? };
+    let name = name.to_string_lossy();
+    (!name.is_empty()).then(|| name.as_ref().into())
+}
+
+/// The name of the running program, used as the window title when the application doesn't set one.
+///
+/// It comes from argument zero, which is also what winit derives the X11 `WM_CLASS` from, so the
+/// two agree even when the program is started through a symlink.
+/// Empty where the platform names the program neither way, such as on the web.
+pub fn application_name() -> SharedString {
+    #[cfg(feature = "std")]
+    {
+        static NAME: std::sync::LazyLock<SharedString> = std::sync::LazyLock::new(|| {
+            std::env::args_os()
+                .next()
+                .and_then(|arg| program_name(std::path::Path::new(&arg)))
+                .or_else(|| std::env::current_exe().ok().as_deref().and_then(program_name))
+                .unwrap_or_default()
+        });
+        NAME.clone()
+    }
+    #[cfg(not(feature = "std"))]
+    SharedString::default()
+}
+
+crate::thread_local! {
+    static DEFAULT_WINDOW_TITLE: core::cell::RefCell<Option<SharedString>> = Default::default();
+}
+
+/// Override what [`default_window_title`] returns, for this thread.
+///
+/// A tool that hosts someone else's component, like the Slint viewer, says here what its windows
+/// are called.
+/// A window reads the title when it first applies its properties, so this only reaches windows
+/// that have yet to be shown.
+pub fn set_default_window_title(title: SharedString) {
+    DEFAULT_WINDOW_TITLE.with(|slot| slot.replace(Some(title)));
+}
+
+/// The title a window shows when the application doesn't set one: [`set_default_window_title`]
+/// if a host called it on this thread, otherwise the application name.
+///
+/// This is what the compiler binds `Window.title` to, through
+/// `BuiltinFunction::DefaultWindowTitle`.
+pub fn default_window_title() -> SharedString {
+    DEFAULT_WINDOW_TITLE.with(|slot| slot.borrow().clone()).unwrap_or_else(application_name)
 }
 
 /// Inner datastructure for the [`crate::api::Window`]
@@ -517,6 +651,8 @@ pub struct WindowInner {
 
     /// ItemRC that currently have the focus (possibly an instance of TextInput)
     pub focus_item: RefCell<crate::item_tree::ItemWeak>,
+    focus_item_visibility_tracker: ChangeTracker,
+    focus_item_position_tracker: ChangeTracker,
     /// The last text that was sent to the input method
     pub(crate) last_ime_text: RefCell<SharedString>,
     /// Don't let ComponentContainers's instantiation change the focus.
@@ -537,6 +673,11 @@ pub struct WindowInner {
     close_requested: Callback<(), CloseRequestResponse>,
     click_state: ClickState,
     ctx: core::cell::OnceCell<crate::SlintContext>,
+    /// The native drag we started, if one is in flight.
+    /// It holds the source and seed position to report completion and to arm the in-window
+    /// fallback, and lets a drop back onto this same window restore the source's `DataTransfer`:
+    /// the OS round-trip can't carry in-app `user_data`.
+    native_drag: RefCell<Option<NativePendingDrag>>,
 }
 
 impl Drop for WindowInner {
@@ -589,6 +730,8 @@ impl WindowInner {
                 ),
             }),
             focus_item: Default::default(),
+            focus_item_visibility_tracker: Default::default(),
+            focus_item_position_tracker: Default::default(),
             last_ime_text: Default::default(),
             cursor_blinker: Default::default(),
             active_popups: Default::default(),
@@ -599,6 +742,7 @@ impl WindowInner {
             prevent_focus_change: Default::default(),
             ctx: Default::default(),
             menubar: Default::default(),
+            native_drag: Default::default(),
         }
     }
 
@@ -606,6 +750,8 @@ impl WindowInner {
     /// done with that component.
     pub fn set_component(&self, component: &ItemTreeRc) {
         self.close_all_popups();
+        self.focus_item_visibility_tracker.clear();
+        self.focus_item_position_tracker.clear();
         self.focus_item.replace(Default::default());
         self.mouse_input_state.replace(Default::default());
         self.touch_state.replace(Default::default());
@@ -622,7 +768,7 @@ impl WindowInner {
         self.set_window_item_safe_area(inset.to_logical(scale_factor));
         window_adapter.request_redraw();
         let weak = Rc::downgrade(&window_adapter);
-        crate::timers::Timer::single_shot(Default::default(), move || {
+        self.context().single_shot(Default::default(), move || {
             if let Some(window_adapter) = weak.upgrade() {
                 WindowInner::from_pub(window_adapter.window()).update_window_properties();
             }
@@ -672,6 +818,11 @@ impl WindowInner {
     /// Receive a mouse event and pass it to the items of the component to
     /// change their state.
     ///
+    /// This is the runtime's entry point for pointer input.
+    /// Backends don't call it directly, they dispatch [`crate::platform::InternalEvent::Mouse`]
+    /// through [`crate::api::Window::dispatch_event_with_result()`],
+    /// so that every event they deliver takes the same path and is observed by the window event hook.
+    ///
     /// Returns `None` when there is no component to dispatch to; otherwise returns a
     /// [`MouseDispatchResult`] carrying:
     /// - `accepted`: whether an item consumed the event, and
@@ -682,20 +833,31 @@ impl WindowInner {
     /// `Drop` (if a `DropArea` had previously accepted the matching `DragMove`) or an
     /// `Exit` (if not). The reported `accepted` reflects the rewritten event, so a
     /// `Released` that completes a drop on a non-accepting target reports `accepted = false`.
-    pub fn process_mouse_input(&self, mut event: MouseEvent) -> Option<MouseDispatchResult> {
-        crate::animations::update_animations();
+    pub(crate) fn process_mouse_input(&self, mut event: MouseEvent) -> Option<MouseDispatchResult> {
+        crate::animations::update_animations(crate::animations::Instant::now(self.context()));
 
         let item_tree = self.try_component()?;
         self.ensure_tree_instantiated();
 
+        // If the focused item became invisible (e.g. a TabWidget switched away from
+        // the tab holding it), drop the focus so that input methods get torn down.
+        // The key-event handler does the same, but a tab is switched with a pointer
+        // tap, not a key press, so it must also happen here.
+        if self.focus_item.borrow().upgrade().is_some_and(|i| !i.is_visible()) {
+            self.take_focus_item(&FocusEvent::FocusOut(FocusReason::TabNavigation));
+        }
+
         // handle multiple press release
-        event = self.click_state.check_repeat(event, self.context().platform().click_interval());
+        event = self.click_state.check_repeat(event, self.context());
 
         let window_adapter = self.window_adapter();
         let mut mouse_input_state = self.mouse_input_state.take();
 
         let was_dragging = mouse_input_state.drag_data.is_some();
-        let old_cursor = core::mem::replace(&mut mouse_input_state.cursor, MouseCursor::Default);
+        let old_cursor = core::mem::replace(
+            &mut mouse_input_state.cursor,
+            MouseCursorInner::BuiltIn(BuiltInMouseCursor::Default),
+        );
 
         // drag-finished firing is deferred until after dispatch so the DropArea has had
         // a chance to fire its own `dropped` callback first; that callback returns the
@@ -755,7 +917,8 @@ impl WindowInner {
                         d.event.position = drop_event.position;
                         d.event.proposed_action = drop_event.proposed_action;
                     }
-                    mouse_input_state.cursor = MouseCursor::NoDrop;
+                    mouse_input_state.cursor =
+                        MouseCursorInner::BuiltIn(BuiltInMouseCursor::NoDrop);
                     event = MouseEvent::DragMove { event: drop_event, allowed };
                 }
                 MouseEvent::Exit => {
@@ -766,6 +929,15 @@ impl WindowInner {
                     }
                 }
                 _ => {}
+            }
+        } else if let MouseEvent::DragMove { event, .. } | MouseEvent::Drop { event, .. } =
+            &mut event
+        {
+            // An incoming native drag while our own is in flight: the same operation looping
+            // back onto the source window. Restore the full source data so a same-window drop
+            // sees the `user_data` the OS round-trip dropped.
+            if let Some(pending) = self.native_drag.borrow().as_ref() {
+                event.data = pending.request.data.clone();
             }
         }
 
@@ -914,7 +1086,7 @@ impl WindowInner {
 
         if last_top_item != mouse_input_state.top_item_including_delayed() {
             self.click_state.reset();
-            self.click_state.check_repeat(event, self.context().platform().click_interval());
+            self.click_state.check_repeat(event, self.context());
         }
 
         if !had_delay && mouse_input_state.has_delayed_event() {
@@ -923,7 +1095,7 @@ impl WindowInner {
         } else if old_cursor != mouse_input_state.cursor
             && let Some(window_adapter) = window_adapter.internal(crate::InternalToken)
         {
-            window_adapter.set_mouse_cursor(mouse_input_state.cursor);
+            window_adapter.set_mouse_cursor(mouse_input_state.cursor.clone());
         }
 
         let is_dragging = mouse_input_state.drag_data.is_some();
@@ -938,6 +1110,11 @@ impl WindowInner {
             window_adapter.request_redraw();
         }
 
+        if pending_drag_finished.is_some() {
+            // A drag ended in-window (including after a native start fell back), so drop the
+            // stash.
+            self.native_drag.borrow_mut().take();
+        }
         if let Some((source_weak, target_weak)) = pending_drag_finished
             && let Some(source) = source_weak.upgrade()
             && let Some(drag_area) = source.downcast::<crate::items::DragArea>()
@@ -951,12 +1128,7 @@ impl WindowInner {
                 .as_ref()
                 .map(|d| d.as_pin_ref().current_action())
                 .unwrap_or(crate::items::DragAction::None);
-            let drag_area = drag_area.as_pin_ref();
-            drag_area.dragging.set(false);
-            crate::items::DragArea::FIELD_OFFSETS
-                .drag_finished()
-                .apply_pin(drag_area)
-                .call(&(action,));
+            drag_area.as_pin_ref().finish_drag(action);
             // The drag is over: reset the target's `current_action` so it matches
             // `has_drag` and the docstring ("none when no drag is hovering").
             if let Some(target) = target {
@@ -973,6 +1145,62 @@ impl WindowInner {
         Some(MouseDispatchResult { drag_action, accepted })
     }
 
+    /// Dispatch a drag and drop event.
+    /// Returns the action negotiated with the accepting `DropArea`, or `None` when none accepted.
+    ///
+    /// Drag and drop is the one kind of input that backends don't deliver through
+    /// [`crate::api::Window::dispatch_event_with_result()`]:
+    /// they need the negotiated action back, which [`crate::platform::WindowEventDispatchResult`] can't express,
+    /// and a drag leaving the window isn't the pointer leaving the window.
+    /// [`BackendDragEvent`] keeps this entry point to drag and drop,
+    /// so that nothing else bypasses the window event hook.
+    pub fn process_drag_event(&self, event: BackendDragEvent) -> Option<crate::items::DragAction> {
+        self.process_mouse_input(event.into()).and_then(|result| result.drag_action)
+    }
+
+    /// Remember (or clear) the in-flight native drag, so a backend can report completion or fall
+    /// back, and a drop back onto this window can restore the data. Set by `offer_native_drag`.
+    pub(crate) fn set_native_drag(&self, drag: Option<NativePendingDrag>) {
+        *self.native_drag.borrow_mut() = drag;
+    }
+
+    /// Report that the in-flight native drag finished with `action`.
+    ///
+    /// Backends call this when the OS drag completes (`DragAction::None` if cancelled); the
+    /// source `DragArea` clears `dragging` and fires `drag-finished`.
+    pub fn report_drag_finished(&self, action: crate::items::DragAction) {
+        let Some(pending) = self.native_drag.borrow_mut().take() else {
+            return;
+        };
+        if let Some(drag_area) =
+            pending.source.upgrade().and_then(|i| i.downcast::<crate::items::DragArea>())
+        {
+            drag_area.as_pin_ref().finish_drag(action);
+        }
+    }
+
+    /// Fall back to the in-window drag for the in-flight native drag.
+    ///
+    /// Backends call this when a native start fails after taking the drag over; subsequent mouse
+    /// moves then drive `DragMove`/`Drop` and the drag-image overlay, in-process.
+    pub fn start_in_window_drag(&self) {
+        let (source, seed_position) = {
+            let native_drag = self.native_drag.borrow();
+            let Some(drag) = native_drag.as_ref() else {
+                return;
+            };
+            (drag.source.clone(), drag.seed_position)
+        };
+        let Some(drag_area) = source.upgrade().and_then(|i| i.downcast::<crate::items::DragArea>())
+        else {
+            return;
+        };
+        let mut state = self.mouse_input_state.take();
+        state.arm_in_window_drag(drag_area.as_pin_ref(), source, seed_position);
+        self.mouse_input_state.set(state);
+        self.window_adapter().request_redraw();
+    }
+
     /// Receive a raw touch event from a backend and either forward it as a mouse
     /// event (single finger) or synthesize `PinchGesture`/`RotationGesture` events
     /// (two fingers), producing the same events as platform gesture recognition.
@@ -985,7 +1213,7 @@ impl WindowInner {
     /// `drag_action` reflects the current drop-target negotiation, not a per-event
     /// verdict to aggregate. For touch sequences that never produce a `DragMove`/`Drop`
     /// (the common case), this stays `None` throughout.
-    pub fn process_touch_input(
+    pub(crate) fn process_touch_input(
         &self,
         id: i32,
         position: LogicalPoint,
@@ -1017,7 +1245,7 @@ impl WindowInner {
     ///
     /// Arguments:
     /// * `event`: The key event received by the windowing system.
-    pub fn process_key_input(
+    pub(crate) fn process_key_input(
         &self,
         mut internal_key_event: InternalKeyEvent,
     ) -> crate::input::KeyEventResult {
@@ -1214,11 +1442,8 @@ impl WindowInner {
             new_blinker
         });
 
-        TextCursorBlinker::set_binding(
-            blinker,
-            prop,
-            self.context().platform().cursor_flash_cycle(),
-        );
+        let ctx = self.context();
+        TextCursorBlinker::set_binding(blinker, prop, ctx, ctx.platform().cursor_flash_cycle());
     }
 
     /// Sets the focus to the item pointed to by item_ptr. This will remove the focus from any
@@ -1267,6 +1492,8 @@ impl WindowInner {
     ///
     /// This sends the event which must be either FocusOut or WindowLostFocus for popups
     fn take_focus_item(&self, event: &FocusEvent) -> Option<ItemRc> {
+        self.focus_item_visibility_tracker.clear();
+        self.focus_item_position_tracker.clear();
         let focus_item = self.focus_item.take();
         assert!(matches!(event, FocusEvent::FocusOut(_)));
 
@@ -1300,15 +1527,64 @@ impl WindowInner {
                 );
                 // Reveal offscreen item when it gains focus
                 if result == crate::input::FocusEventResult::FocusAccepted {
+                    self.track_focus_item(item);
                     item.try_scroll_into_visible();
                 }
 
                 result
             }
             None => {
+                self.focus_item_visibility_tracker.clear();
+                self.focus_item_position_tracker.clear();
                 *self.focus_item.borrow_mut() = Default::default();
                 crate::input::FocusEventResult::FocusAccepted // We were removing the focus, treat that as OK
             }
+        }
+    }
+
+    fn track_focus_item(&self, item: &ItemRc) {
+        // Track visibility
+        let visibility_clips = item.visibility_clips();
+        self.focus_item_visibility_tracker.init(
+            (item.downgrade(), self.window_adapter_weak.clone(), visibility_clips),
+            |(_, _, visibility_clips)| {
+                visibility_clips
+                    .iter()
+                    .all(|clip| clip.upgrade().is_some_and(|clip| !clip.as_pin_ref().clip()))
+            },
+            |(item, window_adapter, _), visible| {
+                if *visible {
+                    return;
+                }
+                let Some(item) = item.upgrade() else { return };
+                let Some(window_adapter) = window_adapter.upgrade() else { return };
+                WindowInner::from_pub(window_adapter.window()).set_focus_item(
+                    &item,
+                    false,
+                    FocusReason::Programmatic,
+                );
+            },
+        );
+
+        // Track position
+        if item.downcast::<crate::items::TextInput>().is_some() {
+            self.focus_item_position_tracker.init(
+                (item.downgrade(), self.window_adapter_weak.clone()),
+                |(item, _)| {
+                    let Some(item) = item.upgrade() else { return Default::default() };
+                    Some(item.map_to_native_window(item.geometry().origin))
+                },
+                |(item, window_adapter), _| {
+                    let (Some(item), Some(window_adapter)) =
+                        (item.upgrade(), window_adapter.upgrade())
+                    else {
+                        return;
+                    };
+                    if let Some(text_input) = item.downcast::<crate::items::TextInput>() {
+                        text_input.as_pin_ref().update_ime(&window_adapter, &item);
+                    }
+                },
+            );
         }
     }
 
@@ -1318,8 +1594,13 @@ impl WindowInner {
         forward: impl Fn(ItemRc) -> ItemRc,
         reason: FocusReason,
     ) -> Option<ItemRc> {
-        let mut current_item = start_item;
-        let mut visited = Vec::new();
+        let mut current_item = start_item.clone();
+        // The walk normally comes back to `start_item`, but ends in a cycle that misses it
+        // when the tree changed under it, e.g. when the focus was on a removed item.
+        // Comparing against a checkpoint (Brent's cycle detection) still terminates then.
+        let mut checkpoint = start_item.clone();
+        let mut steps = 0usize;
+        let mut next_checkpoint = 1usize;
 
         loop {
             let can_receive_focus = match reason {
@@ -1333,11 +1614,16 @@ impl WindowInner {
             {
                 return Some(current_item); // Item was just published.
             }
-            visited.push(current_item.clone());
             current_item = forward(current_item);
 
-            if visited.contains(&current_item) {
+            if current_item == start_item || current_item == checkpoint {
                 return None; // Nothing to do: We took the focus_item already
+            }
+            steps += 1;
+            if steps == next_checkpoint {
+                checkpoint = current_item.clone();
+                steps = 0;
+                next_checkpoint *= 2;
             }
         }
     }
@@ -1472,7 +1758,10 @@ impl WindowInner {
                             let layout_info_h = component
                                 .as_ref()
                                 .layout_info(crate::layout::Orientation::Horizontal);
-                            let w = layout_info_h.min.min(layout_info_h.max);
+                            let w = layout_info_h
+                                .preferred
+                                .max(layout_info_h.min)
+                                .min(layout_info_h.max);
                             window_item.width.set(LogicalLength::new(w));
                             w
                         };
@@ -1481,7 +1770,10 @@ impl WindowInner {
                             let layout_info_v = component
                                 .as_ref()
                                 .layout_info(crate::layout::Orientation::Vertical);
-                            let h = layout_info_v.min.min(layout_info_v.max);
+                            let h = layout_info_v
+                                .preferred
+                                .max(layout_info_v.min)
+                                .min(layout_info_v.max);
                             window_item.height.set(LogicalLength::new(h));
                             h
                         };
@@ -1552,6 +1844,10 @@ impl WindowInner {
         ) -> T,
     ) -> Option<T> {
         crate::properties::evaluate_no_tracking(|| self.ensure_tree_instantiated());
+        #[cfg(feature = "shared-parley")]
+        if let Some(cache) = self.window_adapter().renderer().text_layout_cache() {
+            cache.begin_frame();
+        }
         let component_weak = ItemTreeRc::downgrade(&self.try_component()?);
         let post_render = |renderer: &mut dyn crate::item_rendering::ItemRenderer| {
             self.render_drag_image_overlay(renderer);
@@ -2243,10 +2539,13 @@ pub mod ffi {
     #![allow(missing_docs)]
 
     use super::*;
+    #[cfg(feature = "std")]
     use crate::SharedVector;
     use crate::api::{RenderingNotifier, RenderingState, SetRenderingNotifierError};
+    use crate::graphics::IntSize;
+    #[cfg(feature = "std")]
+    use crate::graphics::Rgba8Pixel;
     use crate::graphics::Size;
-    use crate::graphics::{IntSize, Rgba8Pixel};
     use crate::items::WindowItem;
     use core::ffi::c_void;
 
@@ -2295,6 +2594,12 @@ pub mod ffi {
     /// Same layout as WindowAdapterRc
     #[repr(C)]
     pub struct WindowAdapterRcOpaque(*const c_void, *const c_void);
+
+    /// The title a window shows when the application doesn't set one
+    #[unsafe(no_mangle)]
+    pub extern "C" fn slint_default_window_title(out: &mut SharedString) {
+        *out = super::default_window_title();
+    }
 
     /// Releases the reference to the windowrc held by handle.
     #[unsafe(no_mangle)]
@@ -2559,10 +2864,10 @@ pub mod ffi {
                     let cpp_graphics_api = match graphics_api {
                         crate::api::GraphicsAPI::NativeOpenGL { .. } => GraphicsAPI::NativeOpenGL,
                         crate::api::GraphicsAPI::WebGL { .. } => unreachable!(), // We don't support wasm with C++
-                        #[cfg(feature = "unstable-wgpu-28")]
-                        crate::api::GraphicsAPI::WGPU28 { .. } => GraphicsAPI::Inaccessible, // There is no C++ API for wgpu (maybe wgpu c in the future?)
                         #[cfg(feature = "unstable-wgpu-29")]
                         crate::api::GraphicsAPI::WGPU29 { .. } => GraphicsAPI::Inaccessible, // There is no C++ API for wgpu (maybe wgpu c in the future?)
+                        #[cfg(feature = "unstable-wgpu-30")]
+                        crate::api::GraphicsAPI::WGPU30 { .. } => GraphicsAPI::Inaccessible, // There is no C++ API for wgpu (maybe wgpu c in the future?)
                     };
                     (self.callback)(state, cpp_graphics_api, self.user_data)
                 }
@@ -2756,15 +3061,17 @@ pub mod ffi {
     ) {
         unsafe {
             let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
-            window_adapter.window().0.process_key_input(InternalKeyEvent {
-                event_type,
-                key_event: crate::items::KeyEvent {
-                    text: text.clone(),
-                    repeat,
+            window_adapter.window().dispatch_event(crate::platform::WindowEvent::internal(
+                InternalKeyEvent {
+                    event_type,
+                    key_event: crate::items::KeyEvent {
+                        text: text.clone(),
+                        repeat,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            });
+            ));
         }
     }
 
@@ -2772,11 +3079,11 @@ pub mod ffi {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn slint_windowrc_dispatch_pointer_event(
         handle: *const WindowAdapterRcOpaque,
-        event: &crate::input::MouseEvent,
+        event: &crate::input::BackendMouseEvent,
     ) {
         unsafe {
             let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
-            window_adapter.window().0.process_mouse_input(event.clone());
+            window_adapter.window().dispatch_event(crate::platform::WindowEvent::internal(*event));
         }
     }
 
@@ -2856,6 +3163,7 @@ pub mod ffi {
     }
 
     /// Takes a snapshot of the window contents and returns it as RGBA8 encoded pixel buffer.
+    #[cfg(feature = "std")]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn slint_windowrc_take_snapshot(
         handle: *const WindowAdapterRcOpaque,
@@ -2994,5 +3302,40 @@ pub mod ffi_window {
         } else {
             null_mut()
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    fn name_of(path: &str) -> Option<SharedString> {
+        program_name(std::path::Path::new(path))
+    }
+
+    #[test]
+    fn a_program_name_is_the_bare_file_name() {
+        assert_eq!(name_of("/usr/bin/gallery").as_deref(), Some("gallery"));
+        assert_eq!(name_of("gallery").as_deref(), Some("gallery"));
+        assert_eq!(name_of("./gallery").as_deref(), Some("gallery"));
+        assert_eq!(name_of("/opt/my-tool.v2").as_deref(), Some("my-tool.v2"));
+        // Windows spells the suffix either way, and its file names don't care
+        assert_eq!(name_of("gallery.exe").as_deref(), Some("gallery"));
+        assert_eq!(name_of("GALLERY.EXE").as_deref(), Some("GALLERY"));
+        // A leading dot makes it the whole name, not a suffix
+        assert_eq!(name_of(".exe").as_deref(), Some(".exe"));
+        assert_eq!(name_of(""), None);
+        assert_eq!(name_of("/"), None);
+        assert_eq!(name_of("some/dir/").as_deref(), Some("dir"));
+    }
+
+    #[test]
+    fn a_host_overrides_the_default_title() {
+        // The test binary is the running program, so the name is never empty here
+        assert!(!default_window_title().is_empty());
+        set_default_window_title("Some Viewer".into());
+        assert_eq!(default_window_title(), "Some Viewer");
+        DEFAULT_WINDOW_TITLE.with(|slot| slot.replace(None));
+        assert_eq!(default_window_title(), application_name());
     }
 }
