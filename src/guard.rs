@@ -494,6 +494,13 @@ fn check_patterns_zoned(
 /// Bash：shell 分词后按白名单校验（ABB_BIN / 只读 git / 只读命令 + 路径参数校验）。
 /// read_zone（#194）：虚拟 Bot 群的读区（bot 工作区）——只读命令的路径参数落在
 /// 写区或读区都放行；None = 单区（非虚拟会话，行为不变）。
+fn is_abb_program(program: &str) -> bool {
+    program == "$ABB_BIN"
+        || std::env::current_exe()
+            .ok()
+            .is_some_and(|exe| program == exe.to_string_lossy())
+}
+
 fn check_bash(input: &serde_json::Value, workspace: &Path, read_zone: Option<&Path>) -> Decision {
     let Some(cmd) = input["command"].as_str() else {
         return Decision::Deny("Bash 缺 command".into());
@@ -509,13 +516,7 @@ fn check_bash(input: &serde_json::Value, workspace: &Path, read_zone: Option<&Pa
             || read_zone.is_some_and(|z| canonical_in_workspace(arg, z))
     };
     // $ABB_BIN（桥注入的本程序绝对路径）：job/session/deliver 白名单
-    let exe = std::env::current_exe().ok();
-    let is_abb = exe
-        .as_ref()
-        .map(|e| program == e.to_string_lossy())
-        .unwrap_or(false)
-        || program == "$ABB_BIN";
-    if is_abb {
+    if is_abb_program(program) {
         return check_abb_bin(rest, workspace);
     }
     match program {
@@ -678,13 +679,8 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
                         .into(),
                 );
             }
-            if rest
-                .iter()
-                .any(|a| a.starts_with("--proc") || a.starts_with("--cmd"))
-            {
-                return Decision::Deny(
-                    "不允许 agent 创建 proc 任务（Q8：任意命令执行入口仅限 GUI/人工）".into(),
-                );
+            if let Some(deny) = deny_agent_proc_task_add(rest) {
+                return deny;
             }
             Decision::Allow
         }
@@ -714,7 +710,25 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
     }
 }
 
+/// proc 入口的同一道拒绝逻辑：受限路径与 owner 路径共用，避免 owner 分支再次漏掉 Q8。
+fn deny_agent_proc_task_add(rest: &[String]) -> Option<Decision> {
+    let is_task_add = rest.first().map(String::as_str) == Some("task")
+        && rest.get(1).map(String::as_str) == Some("add");
+    if !is_task_add
+        || !rest
+            .iter()
+            .any(|a| a.starts_with("--proc") || a.starts_with("--cmd"))
+    {
+        return None;
+    }
+    Some(Decision::Deny(
+        "不允许 agent 创建 proc 任务（Q8：任意命令执行入口仅限 GUI/人工）".into(),
+    ))
+}
+
 /// 删除保护（#88）：owner 会话 Bash 钩子的决策。
+/// - 指向 `$ABB_BIN`/当前 exe 的 `task add --proc|--cmd`：拒绝（Q8，owner 会话里的 agent
+///   同样是 agent；仅阻断这个任意命令入口，不收紧 owner 的其它命令）
 /// - 非删除类命令 → 直通 Allow（owner 全权限行为保持，零额外卡顿）
 /// - 删除类命令（rm/rmdir/unlink/del/erase）：解析目标路径 →
 ///   工作区外 → 放行（owner 自由）；.trash 内 → 拒绝（走 restore/purge）；
@@ -741,6 +755,11 @@ fn check_owner_bash_at(
         return Decision::Allow; // 复合语法：owner 保持原行为
     };
     let program = argv[0].as_str();
+    if is_abb_program(program) {
+        if let Some(deny) = deny_agent_proc_task_add(&argv[1..]) {
+            return deny;
+        }
+    }
     const DELETE_CMDS: &[&str] = &["rm", "rmdir", "unlink", "del", "erase"];
     if !DELETE_CMDS.contains(&program) {
         // find -delete/-exec 形态：显式拒绝（无法可靠提取目标做回收站移动）
@@ -1331,6 +1350,36 @@ mod tests {
             ),
             Decision::Allow
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_bash_rejects_agent_proc_creation_without_tightening_other_commands() {
+        let (root, ws) = owner_delete_env();
+        for cmd in [
+            "$ABB_BIN task add --proc --cmd /bin/true",
+            r#""$ABB_BIN" task add --cmd /bin/true"#,
+        ] {
+            match check_owner_bash_at(&serde_json::json!({"command": cmd}), &ws, &root, None) {
+                Decision::Deny(reason) => assert!(
+                    reason.contains("Q8") && reason.contains("GUI/人工"),
+                    "owner 的 proc 拒绝必须复用 Q8 文案：{reason}"
+                ),
+                Decision::Allow => panic!("owner guard 漏放 proc 创建：{cmd}"),
+            }
+        }
+
+        // owner guard 只新增 proc 例外；普通 task add / list 仍保持历史直通。
+        for cmd in [
+            "$ABB_BIN task add --prompt \"后台跑一下\"",
+            "$ABB_BIN task list",
+        ] {
+            assert_eq!(
+                check_owner_bash_at(&serde_json::json!({"command": cmd}), &ws, &root, None),
+                Decision::Allow,
+                "owner 非 proc 命令不应被误伤：{cmd}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

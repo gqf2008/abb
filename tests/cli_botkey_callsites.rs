@@ -496,3 +496,70 @@ fn guard_check_legal_key_missing_workspace_fails_closed_and_existing_allows() {
         stdout(&present)
     );
 }
+
+#[test]
+fn guard_check_owner_rejects_abb_proc_creation() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot()]));
+    std::fs::create_dir_all(home.bridge_dir().join("workspaces/app_safe")).unwrap();
+    let out = home.run(
+        &["guard-check"],
+        &[
+            ("AGENT_BRIDGE_BOT_KEY", "app_safe"),
+            ("AGENT_BRIDGE_CHAT_ID", "oc_agent"),
+            ("AGENT_BRIDGE_SENDER_ROLE", "owner"),
+        ],
+        r#"{"tool_name":"Bash","tool_input":{"command":"$ABB_BIN task add --proc --cmd /bin/true"}}"#,
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr={}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(r#""permissionDecision":"deny""#),
+        "owner guard 必须拒绝 proc 创建：{text}"
+    );
+    assert!(
+        text.contains("不允许 agent 创建 proc 任务"),
+        "拒绝原因应复用 Q8 文案：{text}"
+    );
+}
+
+#[test]
+fn task_add_proc_rejects_agent_context_without_creating_task() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot()]));
+    let out = home.run(
+        &["task", "add", "--proc", "--cmd", "/bin/true"],
+        &[
+            ("AGENT_BRIDGE_BOT_KEY", "app_safe"),
+            ("AGENT_BRIDGE_CHAT_ID", "oc_agent"),
+            ("AGENT_BRIDGE_SENDER_ROLE", "owner"),
+        ],
+        "",
+    );
+    assert!(!out.status.success(), "agent 上下文不得创建 proc 任务");
+    assert!(
+        stderr(&out).contains("proc 只允许 GUI/人工入口"),
+        "stderr={}",
+        stderr(&out)
+    );
+    assert!(
+        !home.bridge_dir().join("tasks/app_safe/tasks.json").exists(),
+        "被拒绝的 agent proc 创建不得留下 tasks.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn task_add_proc_allows_human_entry_without_agent_env() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot()]));
+    let out = home.run(&["task", "add", "--proc", "--cmd", "/bin/true"], &[], "");
+    assert_ok(&out);
+
+    let path = home.bridge_dir().join("tasks/app_safe/tasks.json");
+    let tasks: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let items = tasks.as_array().expect("tasks.json 应为数组");
+    assert_eq!(items.len(), 1, "人类入口应正常登记一条任务：{tasks}");
+    assert_eq!(items[0]["payload"]["kind"], "proc");
+    assert_eq!(items[0]["created_by"]["role"], "owner");
+}

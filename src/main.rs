@@ -848,6 +848,16 @@ fn take_proc_cmd(args: &[String], cmd_index: usize) -> Result<Vec<String>, Strin
     Ok(args[cmd_index + 1..].to_vec())
 }
 
+/// proc 创建参数的粗粒度识别：在解析 bot / 初始化 store 之前先拦 agent，
+/// 避免“参数最终才报错”的路径留下任何任务目录或运行态副作用。
+fn task_add_requests_proc(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("add")
+        && args
+            .iter()
+            .skip(1)
+            .any(|a| a.starts_with("--proc") || a.starts_with("--cmd"))
+}
+
 /// 任务 CLI（#326 / #306）。退出码 0=成功 1=失败。
 ///
 /// 与 `job` 的分工：`job` 是「到点唤起一个回合」，本命令是「**立刻**登记一个后台任务」——
@@ -861,6 +871,15 @@ fn run_task_cli(args: &[String]) -> i32 {
     if matches!(sub, "-h" | "--help" | "help") {
         eprintln!("{TASK_CLI_HELP}");
         return 0;
+    }
+    // Q8 纵深防御：hook 之外，CLI 本身也不接受 agent 上下文创建 proc。桥为每个 agent
+    // 注入 AGENT_BRIDGE_BOT_KEY/CHAT_ID/SENDER_ROLE；任一存在即按 agent 处理。人类终端
+    // 与 GUI 不带这些变量，仍可走进下面的 `--proc` 分支。
+    if task_add_requests_proc(args) {
+        if let Some(reason) = task_proc::agent_context_rejection() {
+            eprintln!("{reason}");
+            return 1;
+        }
     }
     let bot_key = match resolve_bot_key() {
         Ok(k) => k,

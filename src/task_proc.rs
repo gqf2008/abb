@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::task_store::{Task, TaskRuntime, TaskStateKind, TaskStateStore};
 
 const WINDOWS_PROC_REJECTION: &str =
-    "Windows 暂不支持 proc 任务：Q13: Job Object 尚未接入（拒绝创建，避免进程树无法完整停止）";
+    "Windows 暂不支持 proc 任务：Q15: Job Object 尚未接入（拒绝创建，避免进程树无法完整停止）";
 #[cfg(unix)]
 const PROC_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(unix)]
@@ -29,9 +29,47 @@ pub(crate) fn platform_error_for_target(target_os: &str) -> Option<&'static str>
     (target_os == "windows").then_some(WINDOWS_PROC_REJECTION)
 }
 
-/// 当前平台是否必须拒绝 proc。Windows 返回 Q13-D 的明确错误。
+/// 当前平台是否必须拒绝 proc。Windows 返回 Q15-D 的明确错误。
 pub(crate) fn platform_error() -> Option<&'static str> {
     platform_error_for_target(std::env::consts::OS)
+}
+
+/// 判断是否处于桥注入的 agent 上下文。
+///
+/// 人类/GUI 入口的定义是：进程环境中没有桥为 agent 注入的
+/// `AGENT_BRIDGE_BOT_KEY` / `AGENT_BRIDGE_CHAT_ID` / `AGENT_BRIDGE_SENDER_ROLE`。
+/// GUI 直接在本进程内登记任务；人类终端通常也不带这些变量。反过来，只要存在任一非空
+/// 桥变量，就按 agent 处理并拒绝 `--proc`，宁可误伤“从 agent shell 手工调试”的场景，
+/// 也不把任意命令执行入口暴露给 agent。
+///
+/// 这不是针对“已经能手改环境并直接执行任意程序”的恶意 agent 的沙箱：agent 可以清除
+/// 环境变量后绕过这层启发式判断。它是 owner/受限 Bash guard 之外的纵深防御，不能替代
+/// OS sandbox 或不可绕过的二次确认。
+const AGENT_CONTEXT_ENV_KEYS: &[&str] = &[
+    "AGENT_BRIDGE_BOT_KEY",
+    "AGENT_BRIDGE_CHAT_ID",
+    "AGENT_BRIDGE_SENDER_ROLE",
+];
+
+fn first_nonempty_env<F>(mut get: F) -> Option<&'static str>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    AGENT_CONTEXT_ENV_KEYS
+        .iter()
+        .copied()
+        .find(|key| get(key).is_some_and(|value| !value.is_empty()))
+}
+
+fn agent_context_rejection_for(marker: Option<&str>) -> Option<String> {
+    marker.map(|key| {
+        format!("proc 只允许 GUI/人工入口（Q8）；检测到 agent 上下文环境变量 {key}，已拒绝创建")
+    })
+}
+
+/// `run_task_cli` 的 proc 入口闸：agent 环境存在时返回可展示的拒绝原因。
+pub(crate) fn agent_context_rejection() -> Option<String> {
+    agent_context_rejection_for(first_nonempty_env(|key| std::env::var_os(key)))
 }
 
 #[cfg(unix)]
@@ -502,10 +540,38 @@ mod tests {
     fn windows_proc_rejection_is_explicit() {
         let reason = platform_error_for_target("windows").unwrap();
         assert!(
-            reason.contains("Q13: Job Object 尚未接入"),
-            "Windows 拒绝原因必须点名 Q13 缺口：{reason}"
+            reason.contains("Q15: Job Object 尚未接入"),
+            "Windows 拒绝原因必须点名 Q15 缺口：{reason}"
         );
         assert_eq!(platform_error_for_target("macos"), None);
+    }
+
+    #[test]
+    fn agent_context_gate_covers_all_bridge_injected_env_markers() {
+        for expected in AGENT_CONTEXT_ENV_KEYS {
+            let found = first_nonempty_env(|key| {
+                (key == *expected).then(|| std::ffi::OsString::from("set"))
+            });
+            assert_eq!(
+                found,
+                Some(*expected),
+                "每个桥注入变量都必须单独构成 agent 上下文"
+            );
+        }
+        assert_eq!(
+            first_nonempty_env(|_| Some(std::ffi::OsString::new())),
+            None,
+            "空值不应误判为 agent 上下文"
+        );
+        assert_eq!(first_nonempty_env(|_| None), None);
+
+        let reason = agent_context_rejection_for(Some("AGENT_BRIDGE_SENDER_ROLE")).unwrap();
+        assert!(
+            reason.contains("proc 只允许 GUI/人工入口")
+                && reason.contains("AGENT_BRIDGE_SENDER_ROLE"),
+            "拒绝原因必须说明入口限制与命中的 agent 标记：{reason}"
+        );
+        assert_eq!(agent_context_rejection_for(None), None);
     }
 
     #[cfg(unix)]
