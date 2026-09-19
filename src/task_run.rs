@@ -32,9 +32,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::deliver::{DeliveryItem, Router};
+use crate::task_identity::IdentityStatus;
 use crate::task_store::{
     PayloadKind, Task, TaskRuntime, TaskStateKind, TaskStateStore, TaskStore, TriggerKind,
-    LOG_KEEP_FILES,
+    KEEPALIVE_MAX_CONSECUTIVE_FAILURES, LOG_KEEP_FILES,
 };
 
 /// 任务提示的 `prompt_tag`。与 `schedule::JOB_PROMPT_TAG` 分开：任务不是定时任务，
@@ -59,6 +60,12 @@ const CANCEL_REASON_SHUTDOWN: &str = "已取消（service 关停）";
 
 /// 尚未开跑就被取消的落盘原因。
 const CANCEL_REASON_BEFORE_START: &str = "已取消（task cancel，尚未开跑）";
+
+/// keepalive 退出后的退避序列（秒）。连续失败越久退避越长，避免崩溃风暴。
+const KEEPALIVE_BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 30];
+/// keepalive 进程至少稳定运行这么久才把退出视为健康；短命退出即使是 0 也计入熔断，
+/// 防止“启动即退出”的配置把 worker 变成忙循环。
+const KEEPALIVE_STABLE_SECS: u64 = 10;
 
 /// 终态任务的日志保留期（天）。Q4 只约束单文件大小，这里补一个**时间**上界，
 /// 免得「跑过一次就再没人看」的任务把日志目录长期堆着。
@@ -90,7 +97,23 @@ pub(crate) async fn task_worker_with_poll(
     let bot_key = bot.key();
     let store = TaskStore::new(&bot_key);
     let states = TaskStateStore::new(&bot_key);
-    // 启动清理：上次进程留下的 Running 是孤儿（进程已死），标回 Pending 让它重跑。
+    task_worker_with_stores(bot, cfg, router, store, states, stop, poll).await;
+}
+
+/// 注入 store/state 的 worker 主体，测试可直接驱动真实启动/关停路径而不碰真实 HOME。
+async fn task_worker_with_stores(
+    bot: crate::config::BotConfig,
+    cfg: Arc<crate::config::Config>,
+    router: Arc<Router>,
+    store: TaskStore,
+    states: TaskStateStore,
+    stop: tokio_util::sync::CancellationToken,
+    poll: Duration,
+) {
+    let bot_key = bot.key();
+    // keepalive 必须先走独立恢复：它的 Running 可能对应一个仍存活、只是失去父
+    // service 的进程；先把它移出 Running，后面的通用 orphan 重跑才不会制造双实例。
+    recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
     // agent 任务在 oneshot 里跑，没有可复活的 pid 账本，重跑是唯一安全的归位
     // （副作用幂等性由任务 prompt 自己负责——文档 §风险表已记「结果重复投递」）。
     requeue_orphans(&store, &states);
@@ -99,6 +122,7 @@ pub(crate) async fn task_worker_with_poll(
 
     loop {
         if stop.is_cancelled() {
+            finalize_keepalives_on_shutdown(&store, &states);
             return;
         }
         // 取消请求先于认领处理：排队等着的任务被 cancel 掉之后**不该再开跑**
@@ -117,7 +141,12 @@ pub(crate) async fn task_worker_with_poll(
         }
         tokio::select! {
             _ = tokio::time::sleep(poll) => {}
-            _ = stop.cancelled() => return,
+            _ = stop.cancelled() => {
+                // Backoff/Pending 没有正在执行的 run_one 负责收尾；在正常关停出口统一落终态，
+                // 否则下次启动会把它们当成待恢复任务重新拉起。
+                finalize_keepalives_on_shutdown(&store, &states);
+                return;
+            }
         }
     }
 }
@@ -149,6 +178,9 @@ async fn run_one(
             let agent_cfg = agent_cfg_for_task(bot, cfg, &task, bot_key);
             run_attempt(bot_key, task, agent_cfg, workspace, router, states, stop).await;
         }
+        PayloadKind::Proc if task.trigger.kind == TriggerKind::Keepalive => {
+            run_keepalive_attempt(&task, &workspace, states, stop).await;
+        }
         PayloadKind::Proc => {
             let rt = crate::task_proc::run_proc_attempt(&task, &workspace, states, stop).await;
             let text = if rt.kind == TaskStateKind::Succeeded {
@@ -161,6 +193,127 @@ async fn run_one(
             finish_task_attempt(bot_key, &task, rt, text, router, states).await;
         }
     }
+}
+
+/// keepalive 的一次进程代际执行与退出后的状态机推进。
+///
+/// 首次由 Pending 认领；进程退出后这里只把状态推到 Pending（正常退出）或
+/// Backoff（失败未熔断），主 worker 再按轮询/退避重新认领。这样退避期间 service
+/// 仍可响应 cancel/stop，不会把阻塞睡在单次 run_one 里。
+async fn run_keepalive_attempt(
+    task: &Task,
+    workspace: &str,
+    states: &TaskStateStore,
+    stop: &tokio_util::sync::CancellationToken,
+) {
+    let id = task.id.clone();
+    let rt = crate::task_proc::run_proc_attempt(task, workspace, states, stop).await;
+
+    // 正常关停优先于“进程恰好自行退出”的竞态：只要 stop 已触发，本次代际绝不排队重启。
+    if stop.is_cancelled() && rt.kind != TaskStateKind::Cancelled {
+        let cancelled = TaskRuntime {
+            kind: TaskStateKind::Cancelled,
+            last_error: CANCEL_REASON_SHUTDOWN.to_string(),
+            next_retry_at: None,
+            ..rt
+        };
+        let _ = states.set(&id, cancelled);
+        return;
+    }
+    if rt.kind == TaskStateKind::Cancelled {
+        return; // task cancel / service 关停已是终态，不再拉起。
+    }
+
+    let now = crate::chrono_lite::unix_secs();
+    let rapid_exit = rt
+        .started_at
+        .zip(rt.finished_at)
+        .is_some_and(|(started, finished)| {
+            finished.saturating_sub(started) < KEEPALIVE_STABLE_SECS
+        });
+    let failed = rt.kind == TaskStateKind::Failed || rapid_exit;
+    let failure_reason = if !rt.last_error.trim().is_empty() {
+        rt.last_error.clone()
+    } else if rapid_exit {
+        format!("进程启动后 {KEEPALIVE_STABLE_SECS}s 内退出（未达到稳定运行阈值）")
+    } else {
+        String::new()
+    };
+    let consecutive = if failed {
+        rt.consecutive_failures.saturating_add(1)
+    } else {
+        0
+    };
+    let mut next = TaskRuntime {
+        kind: TaskStateKind::Pending,
+        pid: None,
+        proc_identity: None,
+        next_retry_at: None,
+        restarts: rt.restarts.saturating_add(1),
+        consecutive_failures: consecutive,
+        finished_at: Some(now),
+        ..rt.clone()
+    };
+
+    let note = if failed && consecutive >= KEEPALIVE_MAX_CONSECUTIVE_FAILURES {
+        next.kind = TaskStateKind::Failed;
+        next.last_error = format!(
+            "keepalive 连续启动失败达到熔断上限 {}，已停止自动拉起；最近错误：{}",
+            KEEPALIVE_MAX_CONSECUTIVE_FAILURES, failure_reason
+        );
+        crate::log!(
+            "[task:{}] {} keepalive 熔断（连续失败 {} 次）：{}",
+            task.bot_key,
+            short_id(&id),
+            consecutive,
+            next.last_error
+        );
+        format!("[keepalive] {}\n", next.last_error)
+    } else if failed {
+        let backoff = keepalive_backoff_secs(consecutive);
+        next.kind = TaskStateKind::Backoff;
+        next.next_retry_at = Some(now.saturating_add(backoff));
+        crate::log!(
+            "[task:{}] {} keepalive 退避 {}s（连续失败 {} 次）：{}",
+            task.bot_key,
+            short_id(&id),
+            backoff,
+            consecutive,
+            failure_reason
+        );
+        format!(
+            "[keepalive] 第 {} 次连续失败，{}s 后重试：{}\n",
+            consecutive, backoff, failure_reason
+        )
+    } else {
+        // 常驻任务正常退出也要重新拉起；不延迟，状态机仍经 Pending 统一进入 claim。
+        crate::log!(
+            "[task:{}] {} keepalive 正常退出，立即重新拉起",
+            task.bot_key,
+            short_id(&id)
+        );
+        "[keepalive] 进程正常退出，立即重新拉起\n".to_string()
+    };
+
+    let _ = states.set(&id, next);
+    let _ = crate::task_store::append_task_log_record(
+        states.paths(),
+        &id,
+        task.limits.log_max_bytes,
+        note.as_bytes(),
+    );
+}
+
+fn keepalive_backoff_secs(consecutive_failures: u32) -> u64 {
+    let idx = consecutive_failures.saturating_sub(1) as usize;
+    KEEPALIVE_BACKOFF_SECS
+        .get(idx)
+        .copied()
+        .unwrap_or_else(|| *KEEPALIVE_BACKOFF_SECS.last().unwrap_or(&30))
+}
+
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(12)]
 }
 
 /// 真正跑一轮并把结局落盘/投递。`agent_cfg`/`workspace` 由调用方给——测试因此能用
@@ -495,6 +648,7 @@ fn claim(prev: &TaskRuntime, started: u64) -> TaskRuntime {
         kind: TaskStateKind::Running,
         started_at: Some(started),
         restarts: prev.restarts,
+        consecutive_failures: prev.consecutive_failures,
         // P2b-C 调度记账：**认领时刻**（不是跑完时刻）——cron 按它的分钟桶去重、
         // interval 按它 + 间隔算下次到点；与 Running 状态一起防同任务并发。
         last_fired_at: Some(started),
@@ -603,9 +757,11 @@ fn consume_cancel_requests(store: &TaskStore, states: &TaskStateStore) {
         //      下一分钟/下一个间隔还会再跑；用户此时取消必须能停掉后续触发
         //      （审查实测：只处理 Pending 时会回「已结束，无需取消」然后照跑）。
         // 一次性档（now/once）的 Succeeded/Failed 是真终态，不动。
-        let cancellable = rt.kind == TaskStateKind::Pending
-            || (task.trigger.kind.is_repeating()
-                && matches!(rt.kind, TaskStateKind::Succeeded | TaskStateKind::Failed));
+        let cancellable = matches!(
+            rt.kind,
+            TaskStateKind::Pending | TaskStateKind::Backoff | TaskStateKind::Interrupted
+        ) || (task.trigger.kind.is_repeating()
+            && matches!(rt.kind, TaskStateKind::Succeeded | TaskStateKind::Failed));
         if cancellable {
             crate::log!("[task] {id} 收到取消请求（{:?}）→ 标记 Cancelled", rt.kind);
             let _ = states.set(
@@ -652,14 +808,22 @@ fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime
 /// - `cron`：当前分钟匹配表达式才跑，且**同一分钟只触发一次**（worker 每 2s 轮询，
 ///   没有 `last_fired_at` 的分钟去重会在一分钟内反复触发）；
 /// - `interval`：`last_fired_at` 为空（首次）即跑，之后每 N 秒一次；
-/// - `keepalive`：**不认领**——重启恢复/信号语义（Q5/Q14）未拍板，本批不假装支持；
+/// - `keepalive`：Pending 或退避到期时认领；带进程代际身份的 Backoff 必须等恢复
+///   路径确认旧代际已死，不能在 Running 直接再拉一个；
 /// - 任何触发档在 `Running` 时都不认领（同任务不并发），`Cancelled` 是用户明确的终态
 ///   （要再跑就重新登记）；重复档（cron/interval）跑完一轮后回到可认领状态。
 fn is_due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> bool {
     let kind = task.trigger.kind;
     match rt.kind {
-        TaskStateKind::Running | TaskStateKind::Cancelled => return false,
+        TaskStateKind::Running | TaskStateKind::Cancelled | TaskStateKind::Interrupted => {
+            return false
+        }
         TaskStateKind::Pending => {}
+        TaskStateKind::Backoff => {
+            return kind == TriggerKind::Keepalive
+                && rt.proc_identity.is_none()
+                && rt.next_retry_at.map(|t| t <= now).unwrap_or(true);
+        }
         TaskStateKind::Succeeded | TaskStateKind::Failed => {
             // 一次性任务跑过就是跑过了；重复档等下一次到点
             if !kind.is_repeating() {
@@ -693,7 +857,251 @@ fn is_due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> bool {
                 Some(last) => now >= last.saturating_add(secs),
             }
         }
-        TriggerKind::Keepalive => false,
+        // Pending 是新登记/正常退出后的入口；Succeeded 是旧状态或旁路写入的“未在跑”。
+        // Failed 只由熔断产生，Interrupted 表示旧代际未安全接管，两者都不得自动拉起。
+        TriggerKind::Keepalive => {
+            matches!(rt.kind, TaskStateKind::Pending | TaskStateKind::Succeeded)
+                && rt.proc_identity.is_none()
+        }
+    }
+}
+
+/// service 正常关停出口：Pending/Backoff/Succeeded 没有在跑的 `run_proc_attempt`
+/// 负责落终态，必须在这里统一置 `Cancelled`；否则下次启动会被重新认领。
+fn finalize_keepalives_on_shutdown(store: &TaskStore, states: &TaskStateStore) {
+    let now = crate::chrono_lite::unix_secs();
+    for task in store
+        .list()
+        .into_iter()
+        .filter(|t| t.trigger.kind == TriggerKind::Keepalive)
+    {
+        let rt = states.get(&task.id);
+        let (pid, proc_identity) = match rt.kind {
+            TaskStateKind::Running => (rt.pid, rt.proc_identity.clone()),
+            TaskStateKind::Pending | TaskStateKind::Backoff | TaskStateKind::Succeeded => {
+                (None, None)
+            }
+            TaskStateKind::Failed | TaskStateKind::Cancelled | TaskStateKind::Interrupted => {
+                continue;
+            }
+        };
+        let _ = states.set(
+            &task.id,
+            TaskRuntime {
+                kind: TaskStateKind::Cancelled,
+                pid,
+                proc_identity,
+                finished_at: Some(now),
+                next_retry_at: None,
+                last_error: CANCEL_REASON_SHUTDOWN.to_string(),
+                ..rt
+            },
+        );
+        crate::log!(
+            "[task:{}] {} keepalive service 关停 → Cancelled",
+            task.bot_key,
+            short_id(&task.id)
+        );
+    }
+}
+
+/// service 启动时的 keepalive 独立恢复路径。**不能复用 `requeue_orphans`**：后者把
+/// 残留 Running 当作进程已死，会为仍存活的 keepalive 制造第二个实例。
+async fn recover_keepalives(store: &TaskStore, states: &TaskStateStore, now: u64) {
+    for task in store
+        .list()
+        .into_iter()
+        .filter(|t| t.trigger.kind == TriggerKind::Keepalive)
+    {
+        let rt = states.get(&task.id);
+        let short = short_id(&task.id).to_string();
+
+        if !task.resume_on_boot {
+            if matches!(
+                rt.kind,
+                TaskStateKind::Cancelled | TaskStateKind::Failed | TaskStateKind::Interrupted
+            ) {
+                continue;
+            }
+            if matches!(
+                rt.kind,
+                TaskStateKind::Pending
+                    | TaskStateKind::Running
+                    | TaskStateKind::Backoff
+                    | TaskStateKind::Succeeded
+            ) {
+                let interrupted = stop_keepalive_for_opt_out(&task, rt, now, states).await;
+                let _ = states.set(&task.id, interrupted);
+                crate::log!(
+                    "[task:{}] {short} keepalive 按 resume_on_boot=false 保持停止",
+                    task.bot_key
+                );
+            }
+            continue;
+        }
+
+        match rt.kind {
+            TaskStateKind::Running => {
+                let Some(identity) = rt.proc_identity.clone() else {
+                    let interrupted = interrupted_runtime(
+                        rt,
+                        now,
+                        "旧 keepalive 进程缺少代际身份，只清理不 adopt（不重复拉起）",
+                        false,
+                    );
+                    let _ = states.set(&task.id, interrupted);
+                    crate::log!(
+                        "[task:{}] {short} keepalive 无进程代际身份，已清理但不 adopt",
+                        task.bot_key
+                    );
+                    continue;
+                };
+                match crate::task_identity::verify(&identity) {
+                    IdentityStatus::Alive => {
+                        let why = "旧 keepalive 进程仍存活，拒绝 adopt 且不重复拉起（避免双实例）";
+                        let interrupted = interrupted_runtime(rt, now, why, true);
+                        let _ = states.set(&task.id, interrupted);
+                        crate::log!("[task:{}] {short} {why}", task.bot_key);
+                    }
+                    IdentityStatus::Unknown => {
+                        let why = "旧 keepalive 进程身份无法核验，按可能存活处理：拒绝 adopt 且不重复拉起";
+                        let interrupted = interrupted_runtime(rt, now, why, true);
+                        let _ = states.set(&task.id, interrupted);
+                        crate::log!("[task:{}] {short} {why}", task.bot_key);
+                    }
+                    IdentityStatus::Dead => {
+                        let backoff = keepalive_backoff_secs(rt.consecutive_failures.max(1));
+                        let resumed = TaskRuntime {
+                            kind: TaskStateKind::Backoff,
+                            pid: None,
+                            proc_identity: None,
+                            next_retry_at: Some(now.saturating_add(backoff)),
+                            restarts: rt.restarts.saturating_add(1),
+                            finished_at: Some(now),
+                            last_error: "service 重启：旧进程代际已确认结束，等待恢复".to_string(),
+                            ..rt
+                        };
+                        let _ = states.set(&task.id, resumed);
+                        crate::log!(
+                            "[task:{}] {short} keepalive 旧代际已死，{}s 后恢复",
+                            task.bot_key,
+                            backoff
+                        );
+                    }
+                }
+            }
+            TaskStateKind::Pending | TaskStateKind::Backoff => {
+                // Pending 是新登记/已安全归位的恢复入口；Backoff 保留原到期时刻。
+            }
+            TaskStateKind::Succeeded
+            | TaskStateKind::Failed
+            | TaskStateKind::Cancelled
+            | TaskStateKind::Interrupted => {}
+        }
+    }
+}
+
+async fn stop_keepalive_for_opt_out(
+    task: &Task,
+    rt: TaskRuntime,
+    now: u64,
+    states: &TaskStateStore,
+) -> TaskRuntime {
+    let Some(identity) = rt.proc_identity.clone() else {
+        return interrupted_runtime(
+            rt,
+            now,
+            "resume_on_boot=false：service 重启后不恢复，运行态已清理",
+            false,
+        );
+    };
+
+    match crate::task_identity::verify(&identity) {
+        IdentityStatus::Dead => interrupted_runtime(
+            rt,
+            now,
+            "resume_on_boot=false：旧代际已确认结束，运行态已清理",
+            false,
+        ),
+        IdentityStatus::Unknown => interrupted_runtime(
+            rt,
+            now,
+            "resume_on_boot=false：旧进程身份无法核验，保留身份但不 adopt、不拉起",
+            true,
+        ),
+        IdentityStatus::Alive => {
+            let grace = Duration::from_secs(task.limits.grace_secs);
+            match crate::task_proc::stop_orphan_process_group(identity.pid, grace).await {
+                Ok(stop) if !stop.alive_after => {
+                    let how = if stop.escalated {
+                        "SIGTERM→宽限→SIGKILL"
+                    } else {
+                        "SIGTERM"
+                    };
+                    let why = format!(
+                        "resume_on_boot=false：service 重启时已按 {how} 收掉旧进程，运行态已清理"
+                    );
+                    let note = format!("[keepalive] {why}\n");
+                    let _ = crate::task_store::append_task_log_record(
+                        states.paths(),
+                        &task.id,
+                        task.limits.log_max_bytes,
+                        note.as_bytes(),
+                    );
+                    crate::log!("[task:{}] {} {why}", task.bot_key, short_id(&task.id));
+                    interrupted_runtime(rt, now, &why, false)
+                }
+                Ok(stop) => {
+                    let why = format!(
+                        "resume_on_boot=false：旧进程组停止后仍有存活成员（escalated={}），保留身份供人工处理",
+                        stop.escalated
+                    );
+                    let note = format!("[keepalive] {why}\n");
+                    let _ = crate::task_store::append_task_log_record(
+                        states.paths(),
+                        &task.id,
+                        task.limits.log_max_bytes,
+                        note.as_bytes(),
+                    );
+                    crate::log!("[task:{}] {} {why}", task.bot_key, short_id(&task.id));
+                    interrupted_runtime(rt, now, &why, true)
+                }
+                Err(e) => {
+                    let why =
+                        format!("resume_on_boot=false：停止旧进程组失败：{e}；保留身份供人工处理");
+                    let note = format!("[keepalive] {why}\n");
+                    let _ = crate::task_store::append_task_log_record(
+                        states.paths(),
+                        &task.id,
+                        task.limits.log_max_bytes,
+                        note.as_bytes(),
+                    );
+                    crate::log!("[task:{}] {} {why}", task.bot_key, short_id(&task.id));
+                    interrupted_runtime(rt, now, &why, true)
+                }
+            }
+        }
+    }
+}
+
+fn interrupted_runtime(
+    rt: TaskRuntime,
+    now: u64,
+    why: &str,
+    preserve_live_process: bool,
+) -> TaskRuntime {
+    TaskRuntime {
+        kind: TaskStateKind::Interrupted,
+        pid: preserve_live_process.then_some(rt.pid).flatten(),
+        proc_identity: if preserve_live_process {
+            rt.proc_identity.clone()
+        } else {
+            None
+        },
+        next_retry_at: None,
+        finished_at: (!preserve_live_process).then_some(now),
+        last_error: why.to_string(),
+        ..rt
     }
 }
 
@@ -847,8 +1255,100 @@ mod tests {
                 kind: TriggerKind::Now,
                 ..Default::default()
             },
+            resume_on_boot: crate::task_store::DEFAULT_RESUME_ON_BOOT,
             delivery: TaskDelivery::default(),
             limits: TaskLimits::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn keepalive_task(
+        bot: &str,
+        id: &str,
+        _workspace: &std::path::Path,
+        script: String,
+        resume_on_boot: bool,
+    ) -> Task {
+        let mut task = now_task(bot, id, "c0");
+        task.payload.kind = PayloadKind::Proc;
+        task.payload.prompt.clear();
+        task.payload.cmd = vec!["/bin/sh".into(), "-c".into(), script];
+        task.trigger = TaskTrigger {
+            kind: TriggerKind::Keepalive,
+            ..Default::default()
+        };
+        task.resume_on_boot = resume_on_boot;
+        // 常驻测试由 stop/cancel 收尾，不走生产默认的 30 分钟回合预算。
+        task.limits.timeout_secs = 0;
+        task
+    }
+
+    #[cfg(unix)]
+    fn pgrep_count(tag: &str) -> usize {
+        let pattern = format!("[{}]{}", &tag[..1], &tag[1..]);
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("pgrep -f '{pattern}' || true"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    }
+
+    #[cfg(unix)]
+    fn spawn_probe(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script).process_group(0);
+        command.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn kill_probe_group(pid: u32) {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+
+        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_count(tag: &str, want: usize, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if pgrep_count(tag) == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "等待 pgrep tag={tag} count={want} 超时，实际 {}",
+                pgrep_count(tag)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_count_sync(tag: &str, want: usize, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while pgrep_count(tag) != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "等待 pgrep tag={tag} count={want} 超时，实际 {}",
+                pgrep_count(tag)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn dead_identity(pid: u32) -> crate::task_identity::ProcIdentity {
+        crate::task_identity::ProcIdentity {
+            pid,
+            start_token: "dead-start".into(),
+            command_line: "dead-command".into(),
         }
     }
 
@@ -1075,14 +1575,41 @@ mod tests {
             "last_fired_at 在未来 → 不信记账，按到点处理（时钟回拨护栏）"
         );
 
-        // keepalive：本批明确不认领（Q5/Q14 未拍板）
+        // keepalive：Pending 可拉起；Backoff 到期且无旧代际时才可拉起
         t.trigger = TaskTrigger {
             kind: TriggerKind::Keepalive,
             ..Default::default()
         };
+        t.payload.kind = PayloadKind::Proc;
+        t.payload.prompt.clear();
+        t.payload.cmd = vec!["/bin/true".into()];
         assert!(
-            !is_due_for_claim(&t, &pending, now),
-            "keepalive 不认领（待 Q5/Q14）"
+            is_due_for_claim(&t, &pending, now),
+            "keepalive Pending 应可拉起"
+        );
+        let waiting = TaskRuntime {
+            kind: TaskStateKind::Backoff,
+            next_retry_at: Some(now + 10),
+            ..Default::default()
+        };
+        assert!(!is_due_for_claim(&t, &waiting, now), "退避未到不拉起");
+        assert!(
+            is_due_for_claim(&t, &waiting, now + 10),
+            "退避到期应可重新拉起"
+        );
+        let held = TaskRuntime {
+            kind: TaskStateKind::Backoff,
+            next_retry_at: Some(now),
+            proc_identity: Some(crate::task_identity::ProcIdentity {
+                pid: 999_999,
+                start_token: "dead-start".into(),
+                command_line: "dead-command".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &held, now),
+            "仍带代际身份时不得在 Backoff 直接再拉一个"
         );
 
         // 任何档在 Running 时都不认领（同任务不并发）；Cancelled 是用户终态
@@ -1096,6 +1623,532 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_due_for_claim(&t, &cancelled, now), "Cancelled 不认领");
+    }
+
+    #[test]
+    fn missed_schedules_do_not_backfill_history() {
+        let mut t = now_task("b", "tk_schedule", "c");
+        let pending = TaskRuntime::default();
+
+        let due = crate::schedule::parse_once("2026-09-20 09:00")
+            .unwrap()
+            .to_unix() as u64;
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Once,
+            expr: "2026-09-20 09:00".into(),
+            ..Default::default()
+        };
+        assert!(is_due_for_claim(&t, &pending, due + 10 * 60));
+        let once_done = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &once_done, due + 10 * 60),
+            "once 过期只补 1 次，跑过后不得再次认领"
+        );
+
+        let cron_105 = crate::schedule::parse_once("2026-09-20 10:05")
+            .unwrap()
+            .to_unix() as u64;
+        let cron_1100 = crate::schedule::parse_once("2026-09-20 11:00")
+            .unwrap()
+            .to_unix() as u64;
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "0 * * * *".into(),
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &pending, cron_105),
+            "cron 错过 10 分钟不得补 10 次历史触发"
+        );
+        assert!(
+            is_due_for_claim(&t, &pending, cron_1100),
+            "cron 到下一个当前匹配分钟只认领一次"
+        );
+
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Interval,
+            expr: "5m".into(),
+            ..Default::default()
+        };
+        let base = 1_700_000_000;
+        let idle = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(base),
+            ..Default::default()
+        };
+        assert!(
+            is_due_for_claim(&t, &idle, base + 20 * 60),
+            "interval 跨多周期后应补一轮"
+        );
+        let claimed = claim(&idle, base + 20 * 60);
+        assert!(
+            !is_due_for_claim(&t, &claimed, base + 20 * 60),
+            "interval 跨多周期最多补一轮，不能在同一轮内连续补"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_resume_false_cleans_stale_runtime_without_process() {
+        let root = tmp_root("ka_no_resume");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let tag = format!("ABB_KEEPALIVE_{}", uuid::Uuid::new_v4().simple());
+        let task = keepalive_task(
+            "b",
+            "tk_ka_no_resume",
+            &root,
+            format!("echo {tag}; while :; do sleep 1; done"),
+            false,
+        );
+        store.add(task.clone()).unwrap();
+        states
+            .set(
+                &task.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    pid: Some(999_999),
+                    proc_identity: Some(dead_identity(999_999)),
+                    started_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
+
+        let rt = states.get(&task.id);
+        assert_eq!(rt.kind, TaskStateKind::Interrupted);
+        assert!(rt.pid.is_none() && rt.proc_identity.is_none());
+        assert!(rt.last_error.contains("resume_on_boot=false"));
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "resume_on_boot=false 的 keepalive 重启后不得自动拉起"
+        );
+        assert_eq!(pgrep_count(&tag), 0, "不得产生任务进程");
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_resume_false_stops_live_old_generation() {
+        let root = tmp_root("ka_no_resume_live");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let tag = format!("ABB_KEEPALIVE_{}", uuid::Uuid::new_v4().simple());
+        let pidfile = root.join("probe.pid");
+        let script = format!(
+            "echo $$ > {}; echo {tag}; while :; do sleep 1; done",
+            pidfile.display()
+        );
+        let mut task = keepalive_task("b", "tk_ka_no_resume_live", &root, script.clone(), false);
+        task.limits.grace_secs = 1;
+        store.add(task.clone()).unwrap();
+        let mut child = spawn_probe(&script);
+        wait_for_count_sync(&tag, 1, Duration::from_secs(3));
+        let pid = child.id();
+        let identity = crate::task_identity::capture(pid).expect("探针进程必须可采集代际身份");
+        states
+            .set(
+                &task.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    pid: Some(pid),
+                    proc_identity: Some(identity),
+                    started_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // 测试进程仍由本测试持有；并发 reap，复现生产里 orphan 被 launchd 回收后的
+        // “进程组消失”语义，否则僵尸会让 group_alive 一直为真。
+        let waiter = tokio::task::spawn_blocking(move || child.wait());
+        let recovery = recover_keepalives(&store, &states, crate::chrono_lite::unix_secs());
+        let (_, wait_result) = tokio::join!(recovery, waiter);
+        assert!(wait_result.unwrap().is_ok(), "探针必须被停止链回收");
+
+        let rt = states.get(&task.id);
+        let count = pgrep_count(&tag);
+        assert_eq!(rt.kind, TaskStateKind::Interrupted);
+        assert!(rt.pid.is_none() && rt.proc_identity.is_none());
+        assert!(rt.last_error.contains("收掉旧进程"), "{}", rt.last_error);
+        assert_eq!(
+            count, 0,
+            "resume_on_boot=false 必须在重启恢复时收干净旧进程"
+        );
+        assert!(next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_resume_false_does_not_kill_reused_unrelated_pid() {
+        let root = tmp_root("ka_no_resume_reuse");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let task = keepalive_task(
+            "b",
+            "tk_ka_no_resume_reuse",
+            &root,
+            "while :; do sleep 1; done".into(),
+            false,
+        );
+        store.add(task.clone()).unwrap();
+        let mut child = spawn_probe("while :; do sleep 1; done");
+        states
+            .set(
+                &task.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    pid: Some(child.id()),
+                    // 同 PID 但启动标记/命令行是旧代际：verify 必须判 Dead，不能误杀无关进程。
+                    proc_identity: Some(crate::task_identity::ProcIdentity {
+                        pid: child.id(),
+                        start_token: "stale-start-token".into(),
+                        command_line: "stale-command".into(),
+                    }),
+                    started_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
+
+        let unrelated_alive = child.try_wait().unwrap().is_none();
+        kill_probe_group(child.id());
+        let _ = child.wait();
+        assert!(unrelated_alive, "PID 已复用为无关进程时不得误杀");
+        let rt = states.get(&task.id);
+        assert_eq!(rt.kind, TaskStateKind::Interrupted);
+        assert!(rt.pid.is_none() && rt.proc_identity.is_none());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_cancels_pending_and_backoff_keepalives() {
+        let root = tmp_root("ka_shutdown");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        for (id, kind) in [
+            ("tk_ka_shutdown_pending", TaskStateKind::Pending),
+            ("tk_ka_shutdown_backoff", TaskStateKind::Backoff),
+        ] {
+            let mut task = now_task("b", id, "c");
+            task.payload.kind = PayloadKind::Proc;
+            task.payload.prompt.clear();
+            task.payload.cmd = vec!["/bin/true".into()];
+            task.trigger = TaskTrigger {
+                kind: TriggerKind::Keepalive,
+                ..Default::default()
+            };
+            store.add(task.clone()).unwrap();
+            states
+                .set(
+                    &task.id,
+                    TaskRuntime {
+                        kind,
+                        next_retry_at: (kind == TaskStateKind::Backoff).then_some(9_999_999_999),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let bot = crate::config::BotConfig {
+            name: "b".into(),
+            kind: "feishu".into(),
+            app_id: "b".into(),
+            ..Default::default()
+        };
+        let router = Arc::new(Router::new(
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+        ));
+        task_worker_with_stores(
+            bot,
+            Arc::new(crate::config::Config::default()),
+            router,
+            store,
+            states,
+            stop,
+            Duration::from_millis(10),
+        )
+        .await;
+
+        // 从盘上重新加载，证明终态化由真实 worker 关停路径落盘，而不是只在内存里。
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+
+        for id in ["tk_ka_shutdown_pending", "tk_ka_shutdown_backoff"] {
+            assert_eq!(states.get(id).kind, TaskStateKind::Cancelled, "{id}");
+            assert!(states.get(id).next_retry_at.is_none(), "{id}");
+        }
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "Pending/Backoff keepalive 正常关停后重启不得拉起"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_resume_true_without_identity_only_cleans_does_not_adopt() {
+        let root = tmp_root("ka_no_identity");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let tag = format!("ABB_KEEPALIVE_{}", uuid::Uuid::new_v4().simple());
+        let task = keepalive_task(
+            "b",
+            "tk_ka_no_identity",
+            &root,
+            format!("echo {tag}; while :; do sleep 1; done"),
+            true,
+        );
+        store.add(task.clone()).unwrap();
+        states
+            .set(
+                &task.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    pid: Some(999_999),
+                    started_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
+        let rt = states.get(&task.id);
+        assert_eq!(rt.kind, TaskStateKind::Interrupted);
+        assert!(rt.pid.is_none() && rt.proc_identity.is_none());
+        assert!(rt.last_error.contains("缺少代际身份"));
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "无身份时只清理不 adopt，也不得自动拉起"
+        );
+        assert_eq!(pgrep_count(&tag), 0);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[test]
+    fn keepalive_backoff_schedule_is_bounded_and_monotonic() {
+        assert_eq!(keepalive_backoff_secs(1), 1);
+        assert_eq!(keepalive_backoff_secs(2), 2);
+        assert_eq!(keepalive_backoff_secs(3), 4);
+        assert_eq!(keepalive_backoff_secs(4), 8);
+        assert_eq!(keepalive_backoff_secs(5), 30);
+        assert_eq!(keepalive_backoff_secs(99), 30, "退避封顶，防止无限增长");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_resume_true_starts_exactly_one_and_updates_generation() {
+        let root = tmp_root("ka_resume");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let tag = format!("ABB_KEEPALIVE_{}", uuid::Uuid::new_v4().simple());
+        let pidfile = root.join("probe.pid");
+        let script = format!(
+            "echo $$ > {}; echo {tag}; while :; do sleep 1; done",
+            pidfile.display()
+        );
+        let task = keepalive_task("b", "tk_ka_resume", &root, script, true);
+        store.add(task.clone()).unwrap();
+        // 模拟 service 上次崩溃：状态残留 Running，但代际身份对应的 pid 已死。
+        states
+            .set(
+                &task.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    pid: Some(999_999),
+                    proc_identity: Some(dead_identity(999_999)),
+                    started_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        recover_keepalives(&store, &states, 2).await;
+        let resumed = states.get(&task.id);
+        assert_eq!(resumed.kind, TaskStateKind::Backoff);
+        assert_eq!(resumed.restarts, 1, "恢复本身计入 keepalive 重拉次数");
+        let mut due = resumed;
+        due.next_retry_at = Some(0);
+        states.set(&task.id, due).unwrap();
+        let due_task = next_due_task(&store, &states, 2).expect("退避到期应可认领");
+        let prev = states.get(&task.id);
+        states.set(&task.id, claim(&prev, 3)).unwrap();
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        let workspace = root.display().to_string();
+        let attempt = run_keepalive_attempt(&due_task, &workspace, &states, &stop);
+        tokio::pin!(attempt);
+        tokio::select! {
+            _ = &mut attempt => panic!("常驻探针不应自行退出"),
+            _ = wait_for_count(&tag, 1, Duration::from_secs(5)) => {}
+        }
+
+        let rt = states.get(&task.id);
+        assert_eq!(rt.kind, TaskStateKind::Running);
+        assert_eq!(pgrep_count(&tag), 1, "恰好一个新实例");
+        assert!(
+            rt.started_at.is_some_and(|t| t > 1),
+            "恢复后 started_at 必须更新"
+        );
+        assert_eq!(
+            rt.restarts, 1,
+            "keepalive 恢复次数与 agent orphan 语义分开记账"
+        );
+        assert!(rt.proc_identity.is_some(), "新代际必须落盘身份");
+
+        stop.cancel();
+        attempt.await;
+        assert_eq!(states.get(&task.id).kind, TaskStateKind::Cancelled);
+        assert_eq!(pgrep_count(&tag), 0, "关停后探针必须被整组收掉");
+        recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
+        assert_eq!(
+            states.get(&task.id).kind,
+            TaskStateKind::Cancelled,
+            "service 正常关停后模拟重启不得自动拉起"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_live_old_generation_is_not_adopted_or_duplicated() {
+        let root = tmp_root("ka_live");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let tag = format!("ABB_KEEPALIVE_{}", uuid::Uuid::new_v4().simple());
+        let pidfile = root.join("probe.pid");
+        let script = format!(
+            "echo $$ > {}; echo {tag}; while :; do sleep 1; done",
+            pidfile.display()
+        );
+        let task = keepalive_task("b", "tk_ka_live", &root, script.clone(), true);
+        store.add(task.clone()).unwrap();
+        let mut child = spawn_probe(&script);
+        wait_for_count_sync(&tag, 1, Duration::from_secs(3));
+        let identity =
+            crate::task_identity::capture(child.id()).expect("探针进程必须可采集代际身份");
+        states
+            .set(
+                &task.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    pid: Some(child.id()),
+                    proc_identity: Some(identity),
+                    started_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
+        let rt = states.get(&task.id);
+        let due = next_due_task(&store, &states, crate::chrono_lite::unix_secs());
+        let count = pgrep_count(&tag);
+        kill_probe_group(child.id());
+        let _ = child.wait();
+
+        assert_eq!(rt.kind, TaskStateKind::Interrupted);
+        assert!(rt.last_error.contains("仍存活"));
+        assert!(due.is_none(), "活进程未被 adopt 时不得再拉起第二个");
+        assert_eq!(count, 1, "旧进程仍应恰好一个，不能出现双实例");
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_circuit_breaker_stops_after_three_fast_crashes() {
+        let root = tmp_root("ka_breaker");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let tag = format!("ABB_KEEPALIVE_{}", uuid::Uuid::new_v4().simple());
+        let pidfile = root.join("crashes.pid");
+        let script = format!("echo $$ >> {}; echo {tag}; exit 7", pidfile.display());
+        let task = keepalive_task("b", "tk_ka_breaker", &root, script, true);
+        store.add(task.clone()).unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let workspace = root.display().to_string();
+
+        for attempt in 1..=3u64 {
+            let prev = states.get(&task.id);
+            states.set(&task.id, claim(&prev, attempt)).unwrap();
+            run_keepalive_attempt(&task, &workspace, &states, &stop).await;
+            let rt = states.get(&task.id);
+            if attempt < 3 {
+                assert_eq!(rt.kind, TaskStateKind::Backoff);
+                let mut due = rt;
+                due.next_retry_at = Some(0);
+                states.set(&task.id, due).unwrap();
+            }
+        }
+
+        let rt = states.get(&task.id);
+        assert_eq!(rt.kind, TaskStateKind::Failed);
+        assert!(
+            rt.last_error.contains("熔断"),
+            "last_error 必须写明熔断原因：{}",
+            rt.last_error
+        );
+        assert_eq!(rt.consecutive_failures, 3);
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "第 4 次不得再拉起"
+        );
+        let launches = std::fs::read_to_string(&pidfile).unwrap().lines().count();
+        assert_eq!(launches, 3, "实际只允许启动 3 次");
+        assert_eq!(pgrep_count(&tag), 0);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_cancel_before_boot_recovery_stays_cancelled() {
+        let root = tmp_root("ka_cancel");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let mut task = now_task("b", "tk_ka_cancel", "c");
+        task.payload.kind = PayloadKind::Proc;
+        task.payload.prompt.clear();
+        task.payload.cmd = vec!["/bin/true".into()];
+        task.trigger = TaskTrigger {
+            kind: TriggerKind::Keepalive,
+            ..Default::default()
+        };
+        store.add(task.clone()).unwrap();
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&task.id), b"{}").unwrap();
+
+        consume_cancel_requests(&store, &states);
+        recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
+
+        assert_eq!(states.get(&task.id).kind, TaskStateKind::Cancelled);
+        assert!(
+            next_due_task(&store, &states, crate::chrono_lite::unix_secs()).is_none(),
+            "Cancelled 是终态，模拟重启后仍不得拉起"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// 认领即记 `last_fired_at`（调度记账），且必须带走 `restarts`（既有回归）。
@@ -1888,6 +2941,16 @@ mod tests {
         assert!(
             sent[0].1.contains("投递失败"),
             "告警要说明是投递失败：{}",
+            sent[0].1
+        );
+        assert!(
+            sent[0].1.contains("tk_alert"),
+            "告警要带任务 id，便于从通知反查：{}",
+            sent[0].1
+        );
+        assert!(
+            sent[0].1.contains("`task status tk_alert`"),
+            "告警要带可直接执行的排查入口：{}",
             sent[0].1
         );
         let rt = states.get("tk_alert");

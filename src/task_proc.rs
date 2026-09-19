@@ -133,6 +133,9 @@ async fn run_proc_attempt_with_grace(
     let mut running = states.get(&id);
     running.kind = TaskStateKind::Running;
     running.pid = Some(pid);
+    // 进程执行细节保持不变；这里只在 spawn 成功后冻结代际身份，供 service 重启后的
+    // fail-closed 恢复判定使用。
+    running.proc_identity = crate::task_identity::capture(pid);
     running.started_at = Some(started);
     running.finished_at = None;
     running.last_exit_code = None;
@@ -364,6 +367,62 @@ struct GroupStop {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrphanGroupStop {
+    pub escalated: bool,
+    pub alive_after: bool,
+}
+
+/// 收掉一个不再由本进程 `Child` 持有的旧进程组。顺序与在线停止链一致：
+/// SIGTERM → grace → 复查 → SIGKILL，并在升级后短暂等待组内成员消失。
+///
+/// 调用方必须先核验进程代际身份；本函数只按已验证的 pgid 发信号，避免 PID 复用误杀。
+#[cfg(unix)]
+pub(crate) async fn stop_orphan_process_group(
+    pgid: u32,
+    grace: Duration,
+) -> std::io::Result<OrphanGroupStop> {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let pid = Pid::from_raw(pgid as i32);
+    if !group_alive(pid) {
+        return Ok(OrphanGroupStop {
+            escalated: false,
+            alive_after: false,
+        });
+    }
+
+    let _ = killpg(pid, Signal::SIGTERM);
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut escalated = false;
+    loop {
+        if !group_alive(pid) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if group_alive(pid) {
+                let _ = killpg(pid, Signal::SIGKILL);
+                escalated = true;
+            }
+            break;
+        }
+        tokio::time::sleep(PROC_POLL_INTERVAL).await;
+    }
+
+    if escalated {
+        let wait_until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while group_alive(pid) && tokio::time::Instant::now() < wait_until {
+            tokio::time::sleep(PROC_POLL_INTERVAL).await;
+        }
+    }
+    Ok(OrphanGroupStop {
+        escalated,
+        alive_after: group_alive(pid),
+    })
+}
+
+#[cfg(unix)]
 async fn stop_process_group(
     child: &mut tokio::process::Child,
     pgid: u32,
@@ -446,6 +505,25 @@ pub(crate) async fn run_proc_attempt(
     )
 }
 
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrphanGroupStop {
+    pub escalated: bool,
+    pub alive_after: bool,
+}
+
+/// Windows 尚无 Job Object，proc 在登记期已拒绝；保留同签名只为让跨平台恢复代码编译。
+#[cfg(not(unix))]
+pub(crate) async fn stop_orphan_process_group(
+    _pgid: u32,
+    _grace: std::time::Duration,
+) -> std::io::Result<OrphanGroupStop> {
+    Ok(OrphanGroupStop {
+        escalated: false,
+        alive_after: true,
+    })
+}
+
 fn terminal_runtime(
     states: &TaskStateStore,
     id: &str,
@@ -462,8 +540,11 @@ fn terminal_runtime(
         finished_at: Some(crate::chrono_lite::unix_secs()),
         last_exit_code,
         restarts: prev.restarts,
+        consecutive_failures: prev.consecutive_failures,
+        next_retry_at: prev.next_retry_at,
         last_error,
         last_fired_at: prev.last_fired_at,
+        proc_identity: None,
     };
     let _ = states.set(id, runtime.clone());
     runtime
@@ -503,6 +584,7 @@ mod tests {
                 ..Default::default()
             },
             trigger: Default::default(),
+            resume_on_boot: crate::task_store::DEFAULT_RESUME_ON_BOOT,
             delivery: Default::default(),
             limits: TaskLimits {
                 log_max_bytes,
