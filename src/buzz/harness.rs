@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::buzz::acp::{AcpClient, AcpError};
+use crate::buzz::acp::{AcpClient, AcpError, EnvVar, McpServer};
 use crate::buzz::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
@@ -253,12 +253,56 @@ pub struct BuzzHandle {
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
 
+/// ACP session 的标准 MCP server：当前 ABB 可执行文件 + `mcp-events` 子命令。
+pub(crate) fn events_mcp_server() -> McpServer {
+    events_mcp_server_with_repo(crate::config::Config::events_walgit_repo())
+}
+
+/// `events_mcp_server` 的显式仓库注入缝（测试与真实 fork 实验共用）。
+pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> McpServer {
+    let command = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "agent-bridge".to_string());
+    let mut env = Vec::new();
+    if let Some(repo) = repo {
+        if repo.is_absolute() {
+            env.push(EnvVar {
+                name: "ABB_EVENTS_REPO".to_string(),
+                value: repo.display().to_string(),
+            });
+        }
+    }
+    let bridge_home = crate::bridge_dir();
+    let bridge_home = if bridge_home.is_absolute() {
+        bridge_home
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(bridge_home)
+    };
+    env.push(EnvVar {
+        name: "AGENT_BRIDGE_HOME".to_string(),
+        value: bridge_home.display().to_string(),
+    });
+    env.push(EnvVar {
+        // walgit 条目按本地 refs 读取；采集时以 2s 节流 fetch，避免各会话落后。
+        name: "ABB_EVENTS_WALGIT_REMOTE".to_string(),
+        value: "origin".to_string(),
+    });
+    McpServer {
+        name: "abb-events".to_string(),
+        command,
+        args: vec!["mcp-events".to_string()],
+        env,
+    }
+}
+
 impl BuzzHandle {
     /// 新建句柄。不拉起任何进程——agent 懒启动，首条消息到达才 spawn。
     /// `cwd` = agent 子进程工作目录（ABB 启动时的当前目录）。
     pub fn new(cfg: AgentConfig, stop: CancellationToken, cwd: String) -> Arc<Self> {
         let ctx = Arc::new(PromptContext {
-            mcp_servers: Vec::new(),
+            mcp_servers: vec![events_mcp_server()],
             initial_message: None,
             idle_timeout: IDLE_TIMEOUT,
             max_turn_duration: MAX_TURN_DURATION,
