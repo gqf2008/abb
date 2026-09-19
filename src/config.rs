@@ -863,6 +863,20 @@ pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
             .unwrap_or(true)
 }
 
+/// MCP 事件订阅配置。空对象不落盘，旧配置无缝兼容。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventsConfig {
+    /// walgit 仓库绝对路径；空 = 未配置。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub walgit_repo: String,
+}
+
+impl EventsConfig {
+    fn is_empty(&self) -> bool {
+        self.walgit_repo.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -932,6 +946,9 @@ pub struct Config {
     /// 与其它字段同走「保存」写盘。#[serde(default)] 兼容旧 config（无此字段）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_roles: Vec<crate::virtualbot::RoleTemplate>,
+    /// MCP 事件订阅的 walgit 仓库等配置。
+    #[serde(default, skip_serializing_if = "EventsConfig::is_empty")]
+    pub events: EventsConfig,
 
     // ── 旧单 bot 字段（仅用于自动迁移，迁移后清空）──
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -970,6 +987,7 @@ impl Default for Config {
             providers: Vec::new(),
             default_provider: String::new(),
             custom_roles: Vec::new(), // #75 自定义角色模板
+            events: EventsConfig::default(),
             app_id: String::new(),
             app_secret: String::new(),
             bot_name: String::new(),
@@ -1073,6 +1091,25 @@ pub enum MentionModeSave {
 impl Config {
     pub fn path() -> PathBuf {
         crate::bridge_dir().join("config.json")
+    }
+
+    /// 读取 `events.walgit_repo` 的纯查询路径：只解析 JSON，不做 legacy migration、
+    /// 不写日志。MCP server 的 stdout 是协议流，不能经 `load()` 混入任何日志。
+    ///
+    /// 返回绝对路径；相对路径按 ABB 进程当前目录展开。空/缺失/坏配置返回 None。
+    pub fn events_walgit_repo() -> Option<PathBuf> {
+        let text = fs::read_to_string(Self::path()).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let raw = value.get("events")?.get("walgit_repo")?.as_str()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            std::env::current_dir().ok().map(|cwd| cwd.join(path))
+        }
     }
 
     pub fn load() -> Result<Config> {

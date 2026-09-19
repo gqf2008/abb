@@ -2320,6 +2320,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_new_payload_includes_abb_events_mcp_server() {
+        let expected_command = std::env::current_exe()
+            .expect("current exe")
+            .display()
+            .to_string();
+        let server = crate::buzz::harness::events_mcp_server();
+        assert_eq!(server.name, "abb-events");
+        assert_eq!(server.args, vec!["mcp-events".to_string()]);
+        assert_eq!(server.command, expected_command);
+
+        let script = vec![
+            ReadLine(2_000),
+            Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
+            ReadLine(2_000),
+            Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_events","_receivedRequest":{captured}}}"#.to_string()),
+            SleepMs(1_000),
+        ];
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        let resp = client
+            .session_new_full("/tmp", vec![server], None, None)
+            .await
+            .expect("session_new_full should succeed");
+
+        let got = &resp.raw["_receivedRequest"]["params"]["mcpServers"][0];
+        assert_eq!(got["name"], "abb-events");
+        assert_eq!(got["command"], expected_command);
+        assert_eq!(got["args"], serde_json::json!(["mcp-events"]));
+        let env = got["env"].as_array().expect("env array");
+        assert!(env.iter().any(|item| {
+            item["name"] == "AGENT_BRIDGE_HOME"
+                && item["value"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+        }));
+        assert!(env.iter().any(|item| {
+            item["name"] == "ABB_EVENTS_WALGIT_REMOTE" && item["value"] == "origin"
+        }));
+
+        let repo = std::path::PathBuf::from("/tmp/abb-events-repo");
+        let with_repo = crate::buzz::harness::events_mcp_server_with_repo(Some(repo.clone()));
+        assert!(with_repo.env.iter().any(|item| {
+            item.name == "ABB_EVENTS_REPO" && item.value == repo.display().to_string()
+        }));
+        assert!(with_repo
+            .env
+            .iter()
+            .any(|item| item.name == "AGENT_BRIDGE_HOME"));
+    }
+
     #[test]
     fn session_prompt_request_format() {
         let prompt_text = "[Buzz @mention]\nChannel: test\nFrom: npub1...\nMessage: hello";

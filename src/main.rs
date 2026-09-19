@@ -21,6 +21,7 @@ mod history;
 mod install;
 mod larkskills;
 mod lockctl;
+mod mcp_events;
 mod messenger;
 mod msgstore;
 mod outbox;
@@ -254,14 +255,23 @@ pub mod chrono_lite {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // MCP 子进程必须零 stdout 噪声：在任何迁移/配置日志之前分流。
+    if args.get(1).map(String::as_str) == Some("mcp-events") {
+        if args.len() > 2 {
+            eprintln!("用法：agent-bridge mcp-events（不接受额外参数）");
+            std::process::exit(2);
+        }
+        std::process::exit(mcp_events::run_stdio());
+    }
+
     // 改名一次性迁移（feishu-bridge → agent-bridge，~/feishu-bridge → ~/.agent-bridge）。
     // 必须在最顶：args 解析、单实例加锁、job CLI 读 config/jobs 都依赖数据已在新位置。幂等。
     platform::migrate_to_agent_bridge();
     // 定位收敛（2026-08）：GitHub 协作整体迁出本产品——存量配置中的 kind=github
     // bot 在此移除（幂等；GUI/service/CLI 谁先启动谁迁移，两进程并发原子写无破坏）。
     crate::config::Config::migrate_strip_github();
-
-    let args: Vec<String> = std::env::args().collect();
 
     // 权限请求（GUI「请求权限」按钮拉起）：逐项触发屏幕录制/摄像头/麦克风授权弹框，
     // #129 追加辅助功能/输入监控（锁屏控制前置）。独立子进程跑（不阻塞托盘），
