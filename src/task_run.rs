@@ -2943,6 +2943,16 @@ mod tests {
             "告警要说明是投递失败：{}",
             sent[0].1
         );
+        assert!(
+            sent[0].1.contains("tk_alert"),
+            "告警要带任务 id，便于从通知反查：{}",
+            sent[0].1
+        );
+        assert!(
+            sent[0].1.contains("`task status tk_alert`"),
+            "告警要带可直接执行的排查入口：{}",
+            sent[0].1
+        );
         let rt = states.get("tk_alert");
         assert!(
             rt.last_error.contains("结果投递失败"),
