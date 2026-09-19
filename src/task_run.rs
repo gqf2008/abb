@@ -355,11 +355,7 @@ async fn finish_task_attempt(
     }
     // 注意：这里没有「已取消」抬头——见上 `if cancelled { return; }` 的说明，
     // 被取消的轮次（关停联动 / 用户 task cancel）压根走不到投递。
-    let header = if failed {
-        "⚠️ 后台任务失败".to_string()
-    } else {
-        format!("🤖 后台任务完成：{}", task.display_name())
-    };
+    let header = delivery_header(task, failed);
     let body = if text.trim().is_empty() {
         if reason.is_empty() {
             "（无输出）".to_string()
@@ -409,7 +405,36 @@ async fn finish_task_attempt(
     };
     let _ = states.set(&id, rt2);
     crate::log!("[task:{bot_key}] {short} {note}（目标 bot={target_bot} chat={chat}）");
-    alert_primary_chat(router, bot_key, &target_bot, &chat, &note).await;
+    alert_primary_chat(
+        router,
+        bot_key,
+        &target_bot,
+        &chat,
+        &task.id,
+        &task.display_name(),
+        &note,
+    )
+    .await;
+}
+
+/// 结果投递的抬头。
+///
+/// **失败时必须带任务身份与排查入口**：原来失败只有一句「⚠️ 后台任务失败」，用户
+/// （尤其跨机器、或多任务并发时）根本不知道是哪条任务失败、去哪看原因——「执行超时
+/// （预算 7200s）」那条通知只能靠人反问就是这个原因。成功抬头保持原样（带任务名）。
+/// 抽成纯函数是为了能直接断言，不必为一个字符串走完整 agent 回合。
+fn delivery_header(task: &Task, failed: bool) -> String {
+    if failed {
+        format!(
+            "⚠️ 后台任务失败：{}\n{}（`task status {}` 看原因 · `task logs {}` 看输出）",
+            task.display_name(),
+            task.id,
+            task.id,
+            task.id
+        )
+    } else {
+        format!("🤖 后台任务完成：{}", task.display_name())
+    }
 }
 
 /// 第二告警通道（#306）：把投递失败告诉该 bot 的**主会话**（owner 私聊）。
@@ -421,6 +446,8 @@ async fn alert_primary_chat(
     bot_key: &str,
     target_bot: &str,
     target_chat: &str,
+    task_id: &str,
+    task_name: &str,
     note: &str,
 ) {
     // 主会话取路由表里的 BotConfig（= 同一份配置的 bots[]）而不是再读 config.json：
@@ -441,7 +468,10 @@ async fn alert_primary_chat(
         crate::log!("[task:{bot_key}] 主会话回落失败：本 bot messenger 不在路由表里");
         return;
     };
-    let text = format!("⚠️ 后台任务结果投递失败（{note}）\n\n目标：{target_bot}:{target_chat}");
+    // 同样带任务身份：投递失败时用户看到的这条就是唯一线索，没 id 无法自查
+    let text = format!(
+        "⚠️ 后台任务结果投递失败（{note}）\n\n任务：{task_name}\n{task_id} · `task status {task_id}` 看原因\n目标：{target_bot}:{target_chat}"
+    );
     if let Err(e) = msgr.send_text(&primary, &text).await {
         crate::log!(
             "[task:{bot_key}] 主会话回落也失败 chat={}: {e:#}",
@@ -820,6 +850,46 @@ mod tests {
             delivery: TaskDelivery::default(),
             limits: TaskLimits::default(),
         }
+    }
+
+    /// 失败抬头必须带**任务身份 + 排查入口**（跨机器/多任务时唯一的定位线索）。
+    /// 这条针对的是线上真事：只收到「执行超时（预算 7200s）」这种通知，人无法判断
+    /// 是哪条任务失败、去哪看原因。
+    #[test]
+    fn delivery_header_carries_task_identity_on_failure() {
+        let mut t = now_task("b", "tk_20260918_abc123", "oc_1");
+        t.name = "长跑探针".to_string();
+
+        let failed = delivery_header(&t, true);
+        assert!(failed.contains("后台任务失败"), "{failed}");
+        assert!(failed.contains("长跑探针"), "要带任务名：{failed}");
+        assert!(
+            failed.contains("tk_20260918_abc123"),
+            "要带任务 id：{failed}"
+        );
+        // 审查抓到的假绿：只断言「id 出现在某处」会被后面命令里的同一个 id 满足——
+        // 删掉独立的「<id>（…）」那一段测试照样绿。这里锁住**独立 id 段**本身。
+        assert!(
+            failed.contains(&format!("\n{}（", t.id)),
+            "独立的 task id 段缺失（不是只在命令里出现）：{failed}"
+        );
+        assert!(
+            failed.contains("task status tk_20260918_abc123"),
+            "要给排查入口：{failed}"
+        );
+        assert!(
+            failed.contains("task logs tk_20260918_abc123"),
+            "要给日志入口：{failed}"
+        );
+
+        // 成功抬头保持原样（含任务名）；无 name 时回落 id 前 12 位
+        let ok = delivery_header(&t, false);
+        assert!(ok.starts_with("🤖 后台任务完成：长跑探针"), "{ok}");
+        let anon = now_task("b", "tk_20260918_abcdef", "oc_1"); // name 默认是 "t"
+        let mut anon = anon;
+        anon.name = String::new();
+        let text = delivery_header(&anon, false);
+        assert!(text.contains("tk_20260918"), "无 name 用 id：{text}");
     }
 
     /// 安全审查 B1 的回归锁：granted 建的任务必须拿 granted 剖面（workspace-write +
