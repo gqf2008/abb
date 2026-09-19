@@ -42,6 +42,10 @@ pub const MAX_GRACE_SECS: u64 = 300;
 /// 取 1 而不是更多：重跑的是**整条 prompt**（副作用整体重放），必须有界，
 /// 否则「prompt 能把 ABB 跑挂」会变成崩溃—重启—再崩的循环。
 pub const DEFAULT_MAX_RESTARTS: u32 = 1;
+/// keepalive 默认随 service 启动恢复；逐任务可显式 opt-out。
+pub const DEFAULT_RESUME_ON_BOOT: bool = true;
+/// keepalive 连续启动失败的熔断上限（Q5 验收固定为 3）。
+pub const KEEPALIVE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// 任务的两种载荷。两条轴的取值一样多，但**执行引擎完全不同**：
 /// `Agent` 走 ACP（`buzz::oneshot`），`Proc` 走进程超管（P3 落地）。
@@ -75,9 +79,11 @@ impl TriggerKind {
     }
 
     /// 是否是**可重复触发**的档（跑完一轮后回到可认领状态，而不是终态）。
-    /// `keepalive` 也是重复档，但本批尚未支持（见 `task_run` 的认领判定）。
     pub fn is_repeating(self) -> bool {
-        matches!(self, TriggerKind::Cron | TriggerKind::Interval)
+        matches!(
+            self,
+            TriggerKind::Cron | TriggerKind::Interval | TriggerKind::Keepalive
+        )
     }
 }
 
@@ -508,6 +514,9 @@ pub struct Task {
     pub created_by: CreatedBy,
     pub payload: TaskPayload,
     pub trigger: TaskTrigger,
+    /// 仅 keepalive 生效：service 重启后是否恢复。默认 true；false 时启动恢复只清状态。
+    #[serde(default = "default_resume_on_boot")]
+    pub resume_on_boot: bool,
     #[serde(default)]
     pub delivery: TaskDelivery,
     #[serde(default)]
@@ -516,6 +525,10 @@ pub struct Task {
 
 fn default_schema() -> u32 {
     TASK_SCHEMA_VERSION
+}
+
+fn default_resume_on_boot() -> bool {
+    DEFAULT_RESUME_ON_BOOT
 }
 
 impl Task {
@@ -584,11 +597,20 @@ impl Task {
                     );
                 }
             }
-            // `keepalive` 要的是「重启恢复 + 信号/退出语义」（Q5/Q14），本批未实现：
-            // 放行只会让它在列表里显示「常驻」却永远不触发（静默失效）——显式拒绝。
             TriggerKind::Keepalive => {
-                bail!("keepalive 触发档尚未支持（待 Q5/Q14 拍板后再放开）");
+                if !self.trigger.expr.trim().is_empty() {
+                    bail!(
+                        "trigger=keepalive 不接受 expr（常驻任务无需表达式，收到 {:?}）",
+                        self.trigger.expr
+                    );
+                }
+                if self.payload.kind != PayloadKind::Proc {
+                    bail!("keepalive 只支持 proc 载荷；agent 载荷的常驻语义未开放");
+                }
             }
+        }
+        if !self.resume_on_boot && self.trigger.kind != TriggerKind::Keepalive {
+            bail!("resume_on_boot=false 只对 keepalive 有效");
         }
         match self.payload.kind {
             PayloadKind::Agent => {
@@ -798,6 +820,10 @@ pub enum TaskStateKind {
     #[default]
     Pending,
     Running,
+    /// keepalive 进程退出后等待下一次退避拉起。
+    Backoff,
+    /// service 重启后发现旧进程不可安全接管，保留诊断但不再自动拉起。
+    Interrupted,
     Succeeded,
     Failed,
     Cancelled,
@@ -810,6 +836,9 @@ pub struct TaskRuntime {
     pub kind: TaskStateKind,
     #[serde(default)]
     pub pid: Option<u32>,
+    /// proc 的进程代际身份；无此字段的旧状态在恢复时只清理、不 adopt。
+    #[serde(default)]
+    pub proc_identity: Option<crate::task_identity::ProcIdentity>,
     #[serde(default)]
     pub started_at: Option<u64>,
     #[serde(default)]
@@ -818,6 +847,12 @@ pub struct TaskRuntime {
     pub last_exit_code: Option<i32>,
     #[serde(default)]
     pub restarts: u32,
+    /// keepalive 连续失败次数；成功退出清零，熔断后不再自动拉起。
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// keepalive 的下一次最早拉起时刻（unix 秒）。
+    #[serde(default)]
+    pub next_retry_at: Option<u64>,
     /// 最近一次失败/取消的原因（给人看的一句话）。
     #[serde(default)]
     pub last_error: String,
@@ -1038,9 +1073,8 @@ fn read_defs(p: &std::path::Path) -> Option<Vec<Task>> {
         Ok(v) => {
             // `tasks.json` 是**用户可写**的：手改过的文件必须跟 `task add` 走同一道闸。
             // 逐条跑完整 `Task::validate`（含 id 的文件名安全、once 严格日历、now 不带 expr、
-            // keepalive 未支持、timezone 未实现…），非法定义跳过并留痕——否则会出现
-            // 「CLI 拒绝但手改能塞进去」的绕过面（审查实测：now+expr / keepalive /
-            // timezone 都能被加载）。
+            // keepalive 必须 proc + resume_on_boot 约束、timezone 未实现…），非法定义
+            // 跳过并留痕——否则会出现「CLI 拒绝但手改能塞进去」的绕过面。
             let (ok, bad): (Vec<Task>, Vec<Task>) =
                 v.into_iter().partition(|t| t.validate().is_ok());
             for t in &bad {
@@ -1117,6 +1151,7 @@ mod tests {
                 expr: String::new(),
                 timezone: String::new(),
             },
+            resume_on_boot: DEFAULT_RESUME_ON_BOOT,
             delivery: TaskDelivery::default(),
             limits: TaskLimits::default(),
         }
@@ -1422,11 +1457,19 @@ mod tests {
                 "limits": {"timeout_secs": 60, "max_restarts": 1, "log_max_bytes": 1024},
             })
         };
+        let mut valid_keepalive = base(
+            "tk_keepalive_valid",
+            serde_json::json!({"kind": "keepalive", "expr": "", "timezone": ""}),
+        );
+        valid_keepalive["payload"] =
+            serde_json::json!({"kind": "proc", "cmd": ["/bin/echo", "keepalive"]});
+
         let defs = serde_json::json!([
             base(
                 "tk_good",
                 serde_json::json!({"kind": "cron", "expr": "30 9 * * *", "timezone": ""})
             ),
+            valid_keepalive,
             base(
                 "tk_now_expr",
                 serde_json::json!({"kind": "now", "expr": "30 9 * * *", "timezone": ""})
@@ -1458,7 +1501,7 @@ mod tests {
         let ids: Vec<String> = store.list().into_iter().map(|t| t.id).collect();
         assert_eq!(
             ids,
-            vec!["tk_good".to_string()],
+            vec!["tk_good".to_string(), "tk_keepalive_valid".to_string()],
             "只有合法定义能被加载（其余 5 条都必须被 validate 挡掉），实际：{ids:?}"
         );
         let _ = std::fs::remove_dir_all(&paths.dir);
@@ -1536,7 +1579,7 @@ mod tests {
         };
         assert!(t.validate().is_err(), "非法日历的 once 不得通过 validate");
 
-        // now 不该带 expr；keepalive 未支持；timezone 未实现 —— 三者都必须显式拒绝
+        // now 不该带 expr；agent keepalive 未开放；timezone 未实现 —— 都必须显式拒绝
         t.trigger = TaskTrigger {
             kind: TriggerKind::Now,
             expr: "30 9 * * *".into(),
@@ -1550,7 +1593,7 @@ mod tests {
             kind: TriggerKind::Keepalive,
             ..Default::default()
         };
-        assert!(t.validate().is_err(), "keepalive 未支持必须显式拒绝");
+        assert!(t.validate().is_err(), "agent 载荷的 keepalive 必须显式拒绝");
         t.trigger = TaskTrigger {
             kind: TriggerKind::Cron,
             expr: "0 9 * * *".into(),
@@ -1651,7 +1694,32 @@ mod tests {
         assert_eq!(t.limits.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(t.limits.log_max_bytes, DEFAULT_LOG_MAX_BYTES);
         assert_eq!(t.limits.max_restarts, DEFAULT_MAX_RESTARTS);
+        assert!(t.resume_on_boot, "旧定义缺 resume_on_boot 时必须默认 true");
         assert_eq!(t.created_by.role, crate::config::SenderRole::Owner);
+    }
+
+    #[test]
+    fn keepalive_validation_requires_proc_and_scopes_resume_opt_out() {
+        let mut t = agent_task("b");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Keepalive,
+            ..Default::default()
+        };
+        let e = t.validate().unwrap_err().to_string();
+        assert!(e.contains("只支持 proc"), "{e}");
+
+        t.payload.kind = PayloadKind::Proc;
+        t.payload.prompt.clear();
+        t.payload.cmd = vec!["/bin/echo".into(), "ok".into()];
+        assert!(t.validate().is_ok(), "合法 keepalive proc 必须放行");
+
+        t.resume_on_boot = false;
+        assert!(t.validate().is_ok(), "keepalive 可逐任务 opt-out 恢复");
+
+        let mut agent = agent_task("b");
+        agent.resume_on_boot = false;
+        let e = agent.validate().unwrap_err().to_string();
+        assert!(e.contains("只对 keepalive"), "{e}");
     }
 
     #[test]

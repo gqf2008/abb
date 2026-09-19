@@ -333,7 +333,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | **P1a** | 统一默认投递目标（`deliver` / `job`） | D2 | 低 | ✅ 已完成（#310） |
 | **P1b** | 可信 `DeliveryOrigin` + 豁免重构（含防循环回归） | D2 | **中**——碰防循环安全，不能当顺手改 | 待开工 |
 | **P2a** | task store + CLI + 权限/身份模型 | D4 | 中 | ✅ 已完成（task store/CLI/guard 白名单，#326） |
-| **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q7 | **高**（动共享执行层） | 🔶 部分：A(agent 载荷)/B(cancel)/C(触发编排)/D(GC) 已完成；**keepalive 未做**（Q5/Q14 已拍板，待 B2 实现） |
+| **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q7 | **高**（动共享执行层） | ✅ A/B/C/D 已完成；B2 keepalive 已实现默认恢复、`resume_on_boot` opt-out、代际身份与 backoff/熔断 |
 | **P3** | `proc` supervisor（含 Windows Job Object、基础日志/退出记录） | D3 Step 0、D5 | 中高 | 🔶 **进行中（B1 proc supervisor 已开工，`abb-p3-b1-proc-supervisor-20260918`）** |
 | **P4** | 日志轮转 / 熔断告警 / 更完整可观测 | D6 | 低 | 待开工 |
 | **P5** | `job` → `task` 迁移（别名保留） | D7 | 中（兼容面广） | 待开工 |
@@ -352,7 +352,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | `once` | `expr` 时间点 `<= now` | **错过后补跑**（与 `job` 的 `Job::is_due` 同语义）；跑过即终态，不重复 |
 | `cron` | 当前分钟匹配 5 段表达式 | **同一分钟只触发一次**（`last_fired_at` 分钟桶去重；worker 每 2s 轮询，无此记账会反复触发） |
 | `interval` | 首次即跑，之后每 N 秒 | `expr` 支持 `30`/`30s`/`5m`/`2h`/`1d`，**下限 5 秒**（比轮询还密只会把模型打成忙循环） |
-| `keepalive` | **不认领** | B1 不做；重启恢复/信号语义（Q5/Q14）已拍板，按 B2 实现，不假装支持 |
+| `keepalive` | Pending / backoff 到期且无旧代际身份时认领 | 默认随 service 恢复；`resume_on_boot=false` 会先收掉已确认存活的旧代际后停用；cancel、正常关停均不再拉起；恢复时旧进程身份存活则不 adopt、不重复拉起 |
 
 记账字段：`TaskRuntime.last_fired_at`（**认领时刻**，serde default 向后兼容）；与 `Running`
 状态共同保证同一任务不会并发跑两轮。重复档（cron/interval）跑完一轮回到可认领状态；
@@ -402,7 +402,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | # | 问题 | 结论 |
 |---|---|---|
 | Q4 | 日志上限、保留份数与长跑载荷写盘 | **10 MiB × 3 / 终态 30 天封板**；`proc` / keepalive **必须流式写盘**（spawn 后持续 drain stdout/stderr，按字节累计判轮转），这是 P3 准入项，不是可选项 |
-| Q5 | ABB 重启后是否恢复常驻任务 | **默认恢复 + 逐任务 `resume_on_boot=false` opt-out + 不补历史周期**。恢复走独立路径（不复用 `requeue_orphans`）；记录进程代际身份；恢复必须经过 backoff + 熔断；`cancel` 后不得自动拉起 |
+| Q5 | ABB 重启后是否恢复常驻任务 | **默认恢复 + 逐任务 `resume_on_boot=false` opt-out + 不补历史周期**。恢复走独立路径（不复用 `requeue_orphans`）；记录进程代际身份；恢复必须经过 backoff + 熔断；`cancel`、service 正常关停（含 Pending/Backoff）后均落 `Cancelled`，不得自动拉起 |
 | Q11 | 任务完成但投递前崩溃 | **`task_id + run_seq` 稳定键 + 持久化「已投递」+ 只重投不重跑**；对外只承诺 **at-least-once**，不承诺 exactly-once |
 | Q14 | 进程退出/信号/补跑语义 | 默认宽限 **10s**（`limits.grace_secs` 可覆盖）→ **SIGKILL**；**对进程组 / Job Object 整体发信号**。补跑保持现状：once 补 1 次，cron/interval 不补历史周期 |
 | Q15 | Windows 进程树 / Job Object | **A 为目标 + D 兜底**：Windows 真做 Job Object；未通过真机验收前，`task add --proc` 在 Windows 上**显式非零拒绝**，不许假装支持 |

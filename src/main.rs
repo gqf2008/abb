@@ -36,6 +36,7 @@ mod session_manage;
 mod session_state;
 mod sessions;
 mod single_instance;
+mod task_identity;
 mod task_proc;
 mod task_run;
 mod task_store;
@@ -890,7 +891,8 @@ fn task_add_bot_arg(args: &[String]) -> Result<Option<String>, String> {
             }
             "--cmd" => break,
             "--prompt" | "--text" | "--env" | "--name" | "--cwd" | "--timeout-secs"
-            | "--max-restarts" | "--grace-secs" | "--once" | "--cron" | "--every" | "--to" => {
+            | "--max-restarts" | "--grace-secs" | "--once" | "--cron" | "--every" | "--to"
+            | "--resume-on-boot" => {
                 i += 2;
             }
             _ => i += 1,
@@ -978,6 +980,12 @@ fn run_task_cli(args: &[String]) -> i32 {
             println!("bot       = {}", t.bot_key);
             println!("载荷      = {:?}", t.payload.kind);
             println!("触发      = {}", describe_trigger(&t.trigger));
+            if t.trigger.kind == task_store::TriggerKind::Keepalive {
+                println!(
+                    "重启恢复  = {}",
+                    if t.resume_on_boot { "true" } else { "false" }
+                );
+            }
             println!(
                 "创建者    = {} / {}（角色 {}）",
                 t.created_by.bot_key,
@@ -985,6 +993,9 @@ fn run_task_cli(args: &[String]) -> i32 {
                 t.created_by.role.as_str()
             );
             println!("运行态    = {:?}", rt.kind);
+            if let Some(pid) = rt.pid {
+                println!("进程 pid  = {pid}");
+            }
             if let Some(s) = rt.started_at {
                 println!("开始      = {s}");
             }
@@ -996,6 +1007,18 @@ fn run_task_cli(args: &[String]) -> i32 {
             }
             // 重跑次数（#326 审查：中断后自动归位重跑是有上界的，得让人看得到用了几次）
             println!("重跑次数  = {}", rt.restarts);
+            if t.trigger.kind == task_store::TriggerKind::Keepalive {
+                println!("连续失败  = {}", rt.consecutive_failures);
+                if let Some(next) = rt.next_retry_at {
+                    println!("下次重试  = {next}");
+                }
+                if let Some(identity) = &rt.proc_identity {
+                    println!(
+                        "代际身份  = pid {} / {} / {}",
+                        identity.pid, identity.start_token, identity.command_line
+                    );
+                }
+            }
             if !rt.last_error.is_empty() {
                 println!("最近错误  = {}", rt.last_error);
             }
@@ -1117,9 +1140,13 @@ fn run_task_cli(args: &[String]) -> i32 {
             // 运行中的任务不允许直接删定义：worker 还在跑，删了定义会让结局无处落
             // （状态文件会变成孤儿）。先 cancel 或等它跑完。
             let rt = states.get(&t.id);
-            if rt.kind == task_store::TaskStateKind::Running {
+            let orphan_alive = t.trigger.kind == task_store::TriggerKind::Keepalive
+                && rt.proc_identity.as_ref().is_some_and(|identity| {
+                    crate::task_identity::verify(identity) != task_identity::IdentityStatus::Dead
+                });
+            if rt.kind == task_store::TaskStateKind::Running || orphan_alive {
                 eprintln!(
-                    "任务 {} 正在运行，不能直接删除（等它跑完，或先让 service 停止）",
+                    "任务 {} 仍有受管/孤儿进程存活，不能直接删除（先 task cancel 终止）",
                     t.id
                 );
                 return 1;
@@ -1142,13 +1169,15 @@ fn run_task_cli(args: &[String]) -> i32 {
             let mut timeout_secs = task_store::DEFAULT_TIMEOUT_SECS;
             let mut max_restarts = task_store::DEFAULT_MAX_RESTARTS;
             let mut grace_secs = task_store::DEFAULT_GRACE_SECS;
+            let mut resume_on_boot = task_store::DEFAULT_RESUME_ON_BOOT;
             // `--to bot_key:chat_id`（bot_key 可省 = 本 bot）/ `--to-current`。
             let mut to_target: Option<String> = None;
             let mut to_current = false;
-            // P2b-C 触发档：三者互斥，缺省 = 立即（now）
+            // P2b-C 触发档：四者互斥，缺省 = 立即（now）
             let mut once: Option<String> = None;
             let mut cron: Option<String> = None;
             let mut every: Option<String> = None;
+            let mut keepalive = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1266,6 +1295,43 @@ fn run_task_cli(args: &[String]) -> i32 {
                         every = Some(v.clone());
                         i += 2;
                     }
+                    "--keepalive" => {
+                        keepalive = true;
+                        i += 1;
+                    }
+                    "--no-resume-on-boot" => {
+                        resume_on_boot = false;
+                        i += 1;
+                    }
+                    "--resume-on-boot" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--resume-on-boot 需要 true 或 false");
+                            return 1;
+                        };
+                        match v.as_str() {
+                            "true" => resume_on_boot = true,
+                            "false" => resume_on_boot = false,
+                            _ => {
+                                eprintln!("--resume-on-boot 只接受 true 或 false（收到 {v:?}）");
+                                return 1;
+                            }
+                        }
+                        i += 2;
+                    }
+                    other if other.starts_with("--resume-on-boot=") => {
+                        let value = other.trim_start_matches("--resume-on-boot=");
+                        match value {
+                            "true" => resume_on_boot = true,
+                            "false" => resume_on_boot = false,
+                            _ => {
+                                eprintln!(
+                                    "--resume-on-boot 只接受 true 或 false（收到 {value:?}）"
+                                );
+                                return 1;
+                            }
+                        }
+                        i += 1;
+                    }
                     "--to" => {
                         let Some(v) = args.get(i + 1) else {
                             eprintln!("--to 缺目标（形如 bot_key:chat_id，bot_key 可省）");
@@ -1299,6 +1365,10 @@ fn run_task_cli(args: &[String]) -> i32 {
                     return 1;
                 }
             } else {
+                if keepalive {
+                    eprintln!("--keepalive 只支持 proc 载荷：请同时给 --proc --cmd");
+                    return 1;
+                }
                 if !cmd.is_empty() || !env.is_empty() {
                     eprintln!("--cmd/--env 只能与 --proc 一起使用");
                     return 1;
@@ -1308,23 +1378,29 @@ fn run_task_cli(args: &[String]) -> i32 {
                     return 1;
                 }
             }
+            if !resume_on_boot && !keepalive {
+                eprintln!("--no-resume-on-boot / --resume-on-boot=false 只对 --keepalive 有效");
+                return 1;
+            }
             if to_current && to_target.is_some() {
                 eprintln!("--to-current 与 --to 互斥（前者 = 显式发回创建者会话）");
                 return 1;
             }
-            // 触发档三选一：全不给 = 立即跑（#306 的后台子代理语义）
+            // 触发档四选一：全不给 = 立即跑（#306 的后台子代理语义）
+            let keepalive_expr = String::new();
             let chosen = [
                 once.as_ref().map(|v| (task_store::TriggerKind::Once, v)),
                 cron.as_ref().map(|v| (task_store::TriggerKind::Cron, v)),
                 every
                     .as_ref()
                     .map(|v| (task_store::TriggerKind::Interval, v)),
+                keepalive.then_some((task_store::TriggerKind::Keepalive, &keepalive_expr)),
             ]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
             if chosen.len() > 1 {
-                eprintln!("--once / --cron / --every 三者只能给一个");
+                eprintln!("--once / --cron / --every / --keepalive 只能给一个");
                 return 1;
             }
             let trigger = match chosen.first() {
@@ -1397,6 +1473,7 @@ fn run_task_cli(args: &[String]) -> i32 {
                     env,
                 },
                 trigger,
+                resume_on_boot,
                 delivery: task_store::TaskDelivery {
                     targets,
                     ..Default::default()
@@ -1439,13 +1516,14 @@ fn run_task_cli(args: &[String]) -> i32 {
 }
 
 /// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
-const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n     agent-bridge task add --proc [上述公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>（--cmd 必须最后，后续参数原样作为 argv；--bot 用于多 bot 人类入口选择目标任务 bot）";
+const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n     agent-bridge task add --proc [上述公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>（--cmd 必须最后，后续参数原样作为 argv；--bot 用于多 bot 人类入口选择目标任务 bot）\n     agent-bridge task add --keepalive --proc [--no-resume-on-boot] [公共选项] --cmd <argv…>";
 
 /// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
 /// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
 pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
     \n  task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
      \n  task add --proc [公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>  人工/GUI 专用；--bot 供多 bot 人类入口选目标任务 bot；argv 不经过 shell，--cmd 必须放最后\n\
+     \n  task add --keepalive --proc [--no-resume-on-boot | --resume-on-boot true|false] [公共选项] [--env KEY=VALUE] --cmd <argv…>  常驻进程；默认 service 重启后恢复，--no-resume-on-boot 仅清理旧状态\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\
      \n  task logs <id前缀> [--tail N] [--all]  看任务日志（缺省末 200 行；--all 先按 .2→.1→当前拼接轮转历史再取末 N 行）\n\
@@ -2282,8 +2360,11 @@ mod tests {
         );
         assert!(take_proc_cmd(&["--cmd".to_string()], 0).is_err());
         assert!(
-            TASK_ADD_USAGE.contains("--proc") && TASK_ADD_USAGE.contains("--cmd <argv…>"),
-            "usage 必须暴露人工/GUI proc 入口"
+            TASK_ADD_USAGE.contains("--proc")
+                && TASK_ADD_USAGE.contains("--cmd <argv…>")
+                && TASK_ADD_USAGE.contains("--keepalive")
+                && TASK_ADD_USAGE.contains("--no-resume-on-boot"),
+            "usage 必须暴露人工/GUI proc 与 keepalive 入口"
         );
     }
 

@@ -623,6 +623,63 @@ fn task_add_proc_human_multibot_uses_explicit_bot() {
 
 #[cfg(unix)]
 #[test]
+fn task_add_keepalive_proc_persists_default_and_opt_out_semantics() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot()]));
+    let out = home.run_minimal(
+        &["task", "add", "--keepalive", "--proc", "--cmd", "/bin/true"],
+        &[],
+    );
+    assert_ok(&out);
+    let out = home.run_minimal(
+        &[
+            "task",
+            "add",
+            "--keepalive",
+            "--proc",
+            "--no-resume-on-boot",
+            "--cmd",
+            "/bin/true",
+        ],
+        &[],
+    );
+    assert_ok(&out);
+
+    let path = home.bridge_dir().join("tasks/app_safe/tasks.json");
+    let tasks: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let items = tasks.as_array().expect("tasks.json 应为数组");
+    assert_eq!(items.len(), 2, "两条 keepalive 都应登记：{tasks}");
+    for item in items {
+        assert_eq!(item["payload"]["kind"], "proc");
+        assert_eq!(item["trigger"]["kind"], "keepalive");
+    }
+    assert_eq!(items[0]["resume_on_boot"], true, "缺省必须恢复");
+    assert_eq!(items[1]["resume_on_boot"], false, "opt-out 必须落 schema");
+}
+
+#[cfg(unix)]
+#[test]
+fn task_add_keepalive_agent_payload_is_rejected() {
+    let home = TempHome::new();
+    home.write_config(json!([standard_bot()]));
+    let out = home.run_minimal(
+        &["task", "add", "--keepalive", "--prompt", "常驻 agent"],
+        &[],
+    );
+    assert!(!out.status.success(), "agent 载荷的 keepalive 必须拒绝");
+    assert!(
+        stderr(&out).contains("只支持 proc"),
+        "stderr={}",
+        stderr(&out)
+    );
+    assert!(
+        !home.bridge_dir().join("tasks/app_safe/tasks.json").exists(),
+        "拒绝路径不得落任务定义"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn task_add_proc_acp_context_cannot_bypass_with_explicit_bot() {
     let home = TempHome::new();
     home.write_config(json!([standard_bot(), other_bot()]));
