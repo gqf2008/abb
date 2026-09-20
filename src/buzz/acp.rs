@@ -2363,11 +2363,32 @@ mod tests {
             item["name"] == "ABB_EVENTS_WALGIT_REMOTE" && item["value"] == "origin"
         }));
 
-        let repo = std::path::PathBuf::from("/tmp/abb-events-repo");
+        // 夹具必须用**平台绝对路径**：生产侧只在 `repo.is_absolute()` 时才注入
+        // ABB_EVENTS_REPO，mcp-events 侧也只认绝对仓库路径（validate_walgit_repo）。
+        // 写死 unix 风格 `/tmp/...` 在 Windows 上既无盘符也无 UNC 前缀、不是绝对路径，
+        // env 项因此根本不出现——是夹具预期写错，不是生产 bug。用 temp_dir()（两平台
+        // 都返回绝对路径）替代。
+        let repo = std::env::temp_dir().join("abb-events-repo");
+        assert!(
+            repo.is_absolute(),
+            "夹具仓库路径必须是绝对路径：{}",
+            repo.display()
+        );
         let with_repo = crate::buzz::harness::events_mcp_server_with_repo(Some(repo.clone()));
         assert!(with_repo.env.iter().any(|item| {
             item.name == "ABB_EVENTS_REPO" && item.value == repo.display().to_string()
         }));
+        // 反向断言：非绝对路径不得注入（注入到子进程会被按子进程 cwd 解析、语义漂移）。
+        let relative = crate::buzz::harness::events_mcp_server_with_repo(Some(
+            std::path::PathBuf::from("abb-events-repo"),
+        ));
+        assert!(
+            !relative
+                .env
+                .iter()
+                .any(|item| item.name == "ABB_EVENTS_REPO"),
+            "非绝对路径不得注入 ABB_EVENTS_REPO"
+        );
         assert!(with_repo
             .env
             .iter()

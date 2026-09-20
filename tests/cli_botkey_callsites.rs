@@ -466,6 +466,10 @@ fn session_pause_resume_and_list_converge_alias_and_reject_bad_env() {
 fn guard_check_rejects_unsafe_canonical_key() {
     let home = TempHome::new();
     home.write_config(json!([unsafe_bot()]));
+    // 前置条件「工作区已存在」只在 unix 搭得起来：Windows 的文件系统禁止创建名为 `CON`
+    // 的目录（保留设备名，CreateDirectory 直接 ERROR_DIRECTORY=267）。deny 断言与平台
+    // 无关——保留 key 在任何平台都不得放行；工作区缺失只会让它更该拒绝（fail-closed）。
+    #[cfg(unix)]
     std::fs::create_dir_all(home.bridge_dir().join("workspaces/CON")).unwrap();
     let out = home.run(
         &["guard-check"],
