@@ -1,6 +1,6 @@
 # ABB bundled tools
 
-ABB 安装包内置四个固定版本的工具：
+ABB 安装包内置五个固定版本的工具：
 
 | tool | version | purpose | license |
 |---|---:|---|---|
@@ -8,6 +8,7 @@ ABB 安装包内置四个固定版本的工具：
 | `jq` | 1.8.2 | JSON 处理 | MIT |
 | `uv` | 0.12.13 | Python 环境/依赖管理 | MIT / Apache-2.0 |
 | `gh` | 2.100.0 | GitHub CLI | MIT |
+| `wassette` | 0.7.1 | 沙箱化 MCP 工具宿主（wasmtime 运行 Wasm Component） | MIT（另含 Apache-2.0 组件，见 `wassette-NOTICE.txt`） |
 
 传递依赖许可也随包：
 
@@ -31,7 +32,7 @@ macOS 的 `jq 1.8.2` 不使用官方预编译包（其 minOS 为 14），而是�
 
 ```text
 tools/
-  bin/        rg, jq, uv, gh
+  bin/        rg, jq, uv, gh, wassette
   licenses/   对应许可证全文
 ```
 
@@ -52,6 +53,7 @@ tools-dist/test/bin/rg --version
 tools-dist/test/bin/jq --version
 tools-dist/test/bin/uv --version
 tools-dist/test/bin/gh --version
+tools-dist/test/bin/wassette --version
 ```
 
 Windows：
@@ -61,4 +63,4 @@ Windows：
 ```
 
 发布前必须在干净 PATH 下运行 `agent-bridge --dump-tools --require-bundled-tools`，
-确认四个命令都解析到随包路径；普通 `--dump-tools` 会显示 `bundled/system/missing` 来源。
+确认五个命令都解析到随包路径；普通 `--dump-tools` 会显示 `bundled/system/missing` 来源。
