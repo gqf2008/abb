@@ -1072,8 +1072,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
 
-        // 审查补充：**存量 v7 工作区**（这次升级真正要覆盖的那批）也必须被升到 v9——
-        // 只种 v6 的用例证明不了「从上一个版本升上来」这条路径。
+        // 审查补充：**存量 v7 工作区**（旧版本升级路径）也必须被升到 v10——
+        // 只种 v6 的用例证明不了「从旧版本升上来」这条路径。
         // 审查补充：v8 存量用例（v9 → v10 的专门用例见下方新增段）
         let dir = std::env::temp_dir().join(format!("abb-guide-v8-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
