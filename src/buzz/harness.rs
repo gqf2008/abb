@@ -258,6 +258,31 @@ pub(crate) fn events_mcp_server() -> McpServer {
     events_mcp_server_with_repo(crate::config::Config::events_walgit_repo())
 }
 
+/// wassette MCP server（沙箱化 Wasm Component 工具宿主，sidecar 随包）。
+/// 命令解析：随包 tools/bin 优先 → 宿主 PATH 回落（`bundled_tool_status` 同一机制）；
+/// 都找不到返回 None（bot 开关开着但二进制缺失 → 会话不注入，装配侧 log 告警）。
+///
+/// `component_dir` = 该 bot 的组件目录（per-bot 隔离：组件与 policy 都落在 bot 工作区
+/// 下，一个 bot 的 load/grant 不会污染另一个 bot 的沙箱面）。
+pub(crate) fn wassette_mcp_server(component_dir: &std::path::Path) -> Option<McpServer> {
+    let command = crate::deps::bundled_tool_status("wassette").1;
+    command.map(|path| wassette_mcp_server_with(component_dir, &path.display().to_string()))
+}
+
+/// `wassette_mcp_server` 的显式命令注入缝（测试用）；参数构造与真实路径同源。
+pub(crate) fn wassette_mcp_server_with(component_dir: &std::path::Path, command: &str) -> McpServer {
+    McpServer {
+        name: "wassette".to_string(),
+        command: command.to_string(),
+        args: vec![
+            "run".to_string(),
+            "--component-dir".to_string(),
+            component_dir.display().to_string(),
+        ],
+        env: Vec::new(),
+    }
+}
+
 /// `events_mcp_server` 的显式仓库注入缝（测试与真实 fork 实验共用）。
 pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> McpServer {
     let command = std::env::current_exe()
@@ -300,9 +325,18 @@ pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> M
 impl BuzzHandle {
     /// 新建句柄。不拉起任何进程——agent 懒启动，首条消息到达才 spawn。
     /// `cwd` = agent 子进程工作目录（ABB 启动时的当前目录）。
-    pub fn new(cfg: AgentConfig, stop: CancellationToken, cwd: String) -> Arc<Self> {
+    /// `extra_mcp` = 除 abb-events 外的额外会话级 MCP server（normal handle 按 bot
+    /// 开关注入 wassette；granted/oneshot 传空）。
+    pub fn new(
+        cfg: AgentConfig,
+        stop: CancellationToken,
+        cwd: String,
+        extra_mcp: Vec<McpServer>,
+    ) -> Arc<Self> {
+        let mut mcp_servers = vec![events_mcp_server()];
+        mcp_servers.extend(extra_mcp);
         let ctx = Arc::new(PromptContext {
-            mcp_servers: vec![events_mcp_server()],
+            mcp_servers,
             initial_message: None,
             idle_timeout: IDLE_TIMEOUT,
             max_turn_duration: MAX_TURN_DURATION,
@@ -1595,6 +1629,7 @@ mod channel_info_tests {
             },
             CancellationToken::new(),
             ".".to_string(),
+            Vec::new(),
         );
         // 模拟 run_loop 曾取走接收端后退出（生产上 Closed 只在此情形发生）。
         drop(handle.take_cmd_rx());
@@ -1629,6 +1664,7 @@ mod channel_info_tests {
             },
             CancellationToken::new(),
             ".".to_string(),
+            Vec::new(),
         );
         let _cmd_rx = handle.take_cmd_rx();
         let channel_id = Uuid::new_v4();
@@ -1738,6 +1774,7 @@ mod channel_info_tests {
             },
             CancellationToken::new(),
             ".".to_string(),
+            Vec::new(),
         );
         let channel_id = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncWaitMsg>();

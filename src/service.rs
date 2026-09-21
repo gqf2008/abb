@@ -169,8 +169,27 @@ fn build_bot_acp_handles(
         .to_string();
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
+    // wassette：bot 开关开且二进制可解析才注入，且只进 normal（owner）会话。
+    // granted（授权者）会话不注入：wassette 的 load-component + grant-* 是 agent
+    // 可调 builtin tools，限制档会话经它可绕过自身沙箱（读工作区 + 放行网络外发）。
+    let wassette_dir = crate::workspace_dir(&bot.key()).join("wassette");
+    let extra_mcp = if bot.wassette {
+        match crate::buzz::harness::wassette_mcp_server(&wassette_dir) {
+            Some(srv) => vec![srv],
+            None => {
+                crate::log!(
+                    "[wassette] bot={} 已启用但随包/PATH 都找不到 wassette，会话不注入（brew install wassette 或等随包版本）",
+                    bot.key()
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let mk = |extra_env: Vec<(String, String)>,
-              session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>| {
+              session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+              extra_mcp: Vec<crate::buzz::acp::McpServer>| {
         crate::buzz::harness::BuzzHandle::new(
             crate::buzz::harness::AgentConfig {
                 command: command.clone(),
@@ -184,14 +203,16 @@ fn build_bot_acp_handles(
             },
             stop.clone(),
             cwd.clone(),
+            extra_mcp,
         )
     };
-    let normal = mk(env.clone(), normal_meta);
+    let normal = mk(env.clone(), normal_meta, extra_mcp);
     let granted = mk(
         env.into_iter()
             .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
             .collect(),
         Some(granted_meta),
+        Vec::new(),
     );
     crate::log!(
         "[acp] harness 装配 bot={} cmd={command}（normal+granted）",

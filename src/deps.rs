@@ -13,9 +13,11 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-/// 安装包内置、优先于宿主 PATH 的四个工具。这里故意不含 git/bun/sed/find：
+/// 安装包内置、优先于宿主 PATH 的五个工具。这里故意不含 git/bun/sed/find：
 /// git 仍为宿主依赖；sed/find 用系统版；bun 不随包。
-pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh"];
+/// wassette（沙箱化 MCP 工具宿主）也是随包工具：agent 会话按 bot 开关注入为
+/// MCP server（见 buzz/harness::wassette_mcp_server），随包优先、PATH 回落。
+pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh", "wassette"];
 
 /// 根据主程序路径推导随包工具 bin（不检查存在性，便于单测）。
 fn bundled_tools_dir_for(exe: &std::path::Path) -> Option<PathBuf> {
