@@ -1832,6 +1832,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
+    // Windows 未接入 Job Object，proc 载荷在 validate 里就被平台闸拒绝；本用例的
+    // keepalive 任务全是 proc 载荷（keepalive 只支持 proc），在该平台连构造都做不到。
+    // 与同文件其它 proc/进程组用例一致按 unix 门控。
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn graceful_shutdown_cancels_pending_and_backoff_keepalives() {
         let root = tmp_root("ka_shutdown");

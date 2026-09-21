@@ -1499,9 +1499,16 @@ mod tests {
 
         let store = TaskStore::new_at(&root, "b");
         let ids: Vec<String> = store.list().into_iter().map(|t| t.id).collect();
+        // 期望的"合法集合"随平台走：`tk_keepalive_valid` 是 **proc 载荷**的 keepalive，
+        // Windows 未接入 Job Object、proc 载荷一律被 validate 挡掉，因此它在该平台也必须
+        // 落进"被拒"那一拨；unix 侧必须原样保留它的"放行"覆盖（不得为了过 Windows 而
+        // 把这条期望删空）。其余 5 条在任何平台都必须被拒。
+        #[cfg(unix)]
+        let expected = vec!["tk_good".to_string(), "tk_keepalive_valid".to_string()];
+        #[cfg(not(unix))]
+        let expected = vec!["tk_good".to_string()];
         assert_eq!(
-            ids,
-            vec!["tk_good".to_string(), "tk_keepalive_valid".to_string()],
+            ids, expected,
             "只有合法定义能被加载（其余 5 条都必须被 validate 挡掉），实际：{ids:?}"
         );
         let _ = std::fs::remove_dir_all(&paths.dir);
@@ -1711,10 +1718,32 @@ mod tests {
         t.payload.kind = PayloadKind::Proc;
         t.payload.prompt.clear();
         t.payload.cmd = vec!["/bin/echo".into(), "ok".into()];
+        // 平台语义：Windows 未接入 Job Object，proc 载荷过不了平台闸（与 keepalive 语义
+        // 无关）。unix 侧必须原样保留"合法 keepalive proc 放行"这条覆盖。
+        #[cfg(unix)]
         assert!(t.validate().is_ok(), "合法 keepalive proc 必须放行");
+        #[cfg(not(unix))]
+        {
+            let e = t.validate().unwrap_err().to_string();
+            assert!(
+                e.contains("Job Object"),
+                "Windows 上 proc 载荷必须被平台闸拒绝：{e}"
+            );
+        }
 
         t.resume_on_boot = false;
+        #[cfg(unix)]
         assert!(t.validate().is_ok(), "keepalive 可逐任务 opt-out 恢复");
+        // Windows：整体仍被平台闸拒，但拒绝理由必须是平台闸、**不能**是
+        // "只对 keepalive"——证明 keepalive 的逐任务 resume opt-out 在规则层是被放行的。
+        #[cfg(not(unix))]
+        {
+            let e = t.validate().unwrap_err().to_string();
+            assert!(
+                e.contains("Job Object") && !e.contains("只对 keepalive"),
+                "keepalive 的 resume opt-out 应被规则层放行，实际拒绝理由：{e}"
+            );
+        }
 
         let mut agent = agent_task("b");
         agent.resume_on_boot = false;
