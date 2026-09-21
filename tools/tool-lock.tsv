@@ -7,3 +7,5 @@ uv	0.12.13	macos-arm64	tar.gz	https://github.com/astral-sh/uv/releases/download/
 uv	0.12.13	windows-x64	zip	https://github.com/astral-sh/uv/releases/download/0.12.13/uv-x86_64-pc-windows-msvc.zip	a86c9dc7bad9b03f388583b7187c05fe9951c2e0d392217e8fd43d97787f6ec2	uv.exe	uv.exe
 gh	2.100.0	macos-arm64	zip	https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_macOS_arm64.zip	45f9a62da2f6e641a7fad57e2ce39656dfd7ef331372d80a2a2aed65abb01642	bin/gh	gh
 gh	2.100.0	windows-x64	zip	https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_windows_amd64.zip	227e35230b25db3fa1b997bab7cf4d67df0470a3b75b99e4ee66bce1a7cd4e72	bin/gh.exe	gh.exe
+wassette	0.7.1	macos-arm64	tar.gz	https://github.com/microsoft/wassette/releases/download/v0.7.1/wassette_0.7.1_darwin_arm64.tar.gz	43b2bee25eb214a0672de4c9777b6e6e21049afd59e7acd372e9f3535ed0ab72	wassette	wassette
+wassette	0.7.1	windows-x64	cargo-src	https://github.com/microsoft/wassette/archive/refs/tags/v0.7.1.tar.gz	805dc0e3201694e6589a73dc6705b5b3cada01ef4c0ac7b532e140dda7bff77e	-	wassette.exe

@@ -70,7 +70,7 @@ pub async fn oneshot_turn(
         .unwrap_or_default()
         .display()
         .to_string();
-    let handle = BuzzHandle::new(cfg, stop.clone(), cwd);
+    let handle = BuzzHandle::new(cfg, stop.clone(), cwd, Vec::new());
     let mut run_task = tokio::spawn(super::harness::run_loop(handle.clone()));
 
     let channel_id = Uuid::new_v4();

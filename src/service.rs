@@ -146,6 +146,34 @@ fn granted_sandbox_profile(bot: &crate::config::BotConfig) -> crate::buzz::acp::
     }
 }
 
+/// bot 开关 → normal handle 的 extra MCP 列表（决议与解析分离的注入缝）。
+/// 开关开且二进制可解析才注入；否则空 + 告警（fail-visible，不静默降级）。
+/// granted/oneshot 不调用本函数——恒空（v1 收口 owner，见调用点注释）。
+fn bot_wassette_mcp(bot: &crate::config::BotConfig) -> Vec<crate::buzz::acp::McpServer> {
+    bot_wassette_mcp_with(bot, crate::buzz::harness::wassette_mcp_server)
+}
+
+/// `bot_wassette_mcp` 的显式解析注入缝（测试用）；开关关时不得触碰 resolver。
+fn bot_wassette_mcp_with(
+    bot: &crate::config::BotConfig,
+    resolve: impl FnOnce(&std::path::Path) -> Option<crate::buzz::acp::McpServer>,
+) -> Vec<crate::buzz::acp::McpServer> {
+    if !bot.wassette {
+        return Vec::new();
+    }
+    let dir = crate::workspace_dir(&bot.key()).join("wassette");
+    match resolve(&dir) {
+        Some(srv) => vec![srv],
+        None => {
+            crate::log!(
+                "[wassette] bot={} 已启用但随包/PATH 都找不到 wassette，会话不注入（brew install wassette 或等随包版本）",
+                bot.key()
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// 按 bot 构造 ACP 句柄对（P2.1/P2.2）：normal 与 granted 同命令同 env，差异在
 /// ① env：granted 多 `BUZZ_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、
 /// ~/.agents/skills 扫盘）发生在 session/new **之前**，per-session `_meta` 管不到，
@@ -169,8 +197,14 @@ fn build_bot_acp_handles(
         .to_string();
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
+    // wassette：只进 normal（owner）会话。granted（授权者）实例不注入：wassette 的
+    // load-component + grant-* 是 agent 可调 builtin tools，限制档会话经它可绕过自身
+    // 沙箱（读工作区 + 放行网络外发）。注意依赖：restrict_granted_agent=false 时授权者
+    // 按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
+    let extra_mcp = bot_wassette_mcp(bot);
     let mk = |extra_env: Vec<(String, String)>,
-              session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>| {
+              session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+              extra_mcp: Vec<crate::buzz::acp::McpServer>| {
         crate::buzz::harness::BuzzHandle::new(
             crate::buzz::harness::AgentConfig {
                 command: command.clone(),
@@ -184,14 +218,16 @@ fn build_bot_acp_handles(
             },
             stop.clone(),
             cwd.clone(),
+            extra_mcp,
         )
     };
-    let normal = mk(env.clone(), normal_meta);
+    let normal = mk(env.clone(), normal_meta, extra_mcp);
     let granted = mk(
         env.into_iter()
             .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
             .collect(),
         Some(granted_meta),
+        Vec::new(),
     );
     crate::log!(
         "[acp] harness 装配 bot={} cmd={command}（normal+granted）",
@@ -1672,6 +1708,33 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wassette 注入决议：开关关 → resolver 不得被触碰；开关开 + 解析失败 → 空；
+    /// 解析成功 → 注入一条。resolver 短路的阳性对照用 panic 桩（开关关时一碰就红）。
+    #[test]
+    fn bot_wassette_mcp_decision() {
+        let bot = crate::config::BotConfig {
+            name: "wst".into(),
+            wassette: false,
+            ..Default::default()
+        };
+        assert!(bot_wassette_mcp_with(&bot, |_| panic!("开关关时不得解析 wassette")).is_empty());
+
+        let bot = crate::config::BotConfig {
+            wassette: true,
+            ..bot
+        };
+        assert!(bot_wassette_mcp_with(&bot, |_| None).is_empty());
+        let srv = crate::buzz::acp::McpServer {
+            name: "wassette".into(),
+            command: "w".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+        };
+        let out = bot_wassette_mcp_with(&bot, |_| Some(srv));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "wassette");
+    }
 
     #[test]
     fn resolve_buzz_agent_prefers_valid_override_and_falls_back() {

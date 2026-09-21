@@ -164,6 +164,15 @@ pub struct BotConfig {
     /// 需 owner 在 bot 配置页显式打开。false（默认）不落盘，旧 config 兼容。
     #[serde(default, skip_serializing_if = "tidy_off")]
     pub tidy_enabled: bool,
+    /// wassette 沙箱工具开关（默认关）：true=该 bot 的 normal（owner）会话随 session/new
+    /// 注入 wassette MCP server（wasmtime 沙箱运行 Wasm Component 的工具宿主）。
+    /// granted（授权者）实例与 oneshot 内部任务不注入：wassette 的 load-component +
+    /// grant-* 是 agent 可调的 builtin tools，限制档会话经它可绕过自身沙箱——
+    /// 故只有 owner 会话可用（v1 收口）。注意依赖：restrict_granted_agent=false 时
+    /// 授权者按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
+    /// false（默认）不落盘，旧 config 兼容。
+    #[serde(default, skip_serializing_if = "wassette_off")]
+    pub wassette: bool,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
     /// 缺省（无条目）= 需要 @（默认，向后兼容旧 config）。仅顶层群聊 chat_id 记录；
     /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
@@ -246,6 +255,7 @@ impl Default for BotConfig {
             open_access: false,
             restrict_granted_agent: true,
             tidy_enabled: false,
+            wassette: false,
             mention_modes: std::collections::HashMap::new(),
             mention_default: false,
             delete_protect_enabled: true,
@@ -317,6 +327,11 @@ fn restrict_on(b: &bool) -> bool {
 
 /// skip_serializing_if：tidy_enabled 为 false（默认关）不落盘，旧 config 兼容。
 fn tidy_off(b: &bool) -> bool {
+    !*b
+}
+
+/// skip_serializing_if：wassette 为 false（默认关）不落盘，旧 config 兼容。
+fn wassette_off(b: &bool) -> bool {
     !*b
 }
 
@@ -2243,6 +2258,28 @@ mod tests {
             !bot.access_allows("ou_unknown"),
             "fail-closed：公开字段不再放行"
         );
+    }
+
+    #[test]
+    fn wassette_serde_default_and_skip() {
+        // 默认关（第三方沙箱工具 opt-in）+ 旧 config 无字段兼容
+        assert!(!BotConfig::default().wassette);
+        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
+        assert!(!bot.wassette, "旧 config 无字段 → 默认关");
+        // round-trip：默认 false 不落盘（skip_serializing_if = wassette_off）
+        let s = serde_json::to_string(&bot).unwrap();
+        assert!(!s.contains("wassette"));
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert!(!back.wassette);
+        // 显式开启（GUI 勾选）→ 落盘并往返保真
+        let on = BotConfig {
+            wassette: true,
+            ..BotConfig::default()
+        };
+        let s = serde_json::to_string(&on).unwrap();
+        assert!(s.contains("\"wassette\":true"));
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert!(back.wassette);
     }
 
     #[test]
