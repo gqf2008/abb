@@ -88,7 +88,7 @@ jobs:
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
-          for tool in rg jq uv gh; do
+          for tool in rg jq uv gh wassette; do
             codesign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
           done
           codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
@@ -189,6 +189,13 @@ jobs:
       - name: Fetch bundled tools
         shell: pwsh
         run: ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist
+
+      # #331 守卫延伸：wassette.exe 是上游源码在发布机上现构建的（上游预编译资产
+      # 依赖 VCRUNTIME140.dll，干净 Windows 起不来），守卫断言它确实静态了 CRT——
+      # 否则这条「源码构建」路径将来静默回退到预编译也不会被发现。
+      - name: Assert wassette.exe has no dynamic CRT (#331)
+        shell: bash
+        run: bash tools/check_dynamic_crt.sh tools-dist/bin/wassette.exe
 
       - name: Install Inno Setup
         shell: pwsh

@@ -21,7 +21,7 @@ Copy-Item (Join-Path $Root "tools/licenses/*") $LicenseDir -Force
 try {
     $rows = $Lock | Where-Object { $_.platform -eq $Platform }
     if (-not $rows) { throw "lock 中没有平台 $Platform 的工具" }
-    if ($rows.Count -ne 4) { throw "lock 中 $Platform 应恰好有 4 个工具，实际 $($rows.Count)" }
+    if ($rows.Count -ne 5) { throw "lock 中 $Platform 应恰好有 5 个工具，实际 $($rows.Count)" }
 
     foreach ($row in $rows) {
         Write-Host "  [tools] $($row.tool) $($row.version) -> $($row.output_name)"
@@ -49,6 +49,28 @@ try {
                     [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $out, $true)
                 }
                 finally { $zip.Dispose() }
+            }
+            "cargo-src" {
+                # wassette：上游预编译 exe 动态链接 VCRUNTIME140.dll（#331 禁），必须从
+                # 官方源码以 +crt-static 构建。build 用上游自带 rust-toolchain.toml
+                #（rustup 自动装）；关 fat LTO——wasmtime 依赖树大，full LTO 会显著拖长发版 job。
+                $src = Join-Path $Tmp ("extract\" + $row.tool)
+                New-Item -ItemType Directory -Force -Path $src | Out-Null
+                tar -xzf $file -C $src
+                $srcRoot = Get-ChildItem $src -Directory | Select-Object -First 1
+                if (-not $srcRoot) { throw "源码包解压失败：$($row.tool)" }
+                # aws-lc-sys 在 Windows x64 上需要 NASM；runner 镜像未保证预装。
+                if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+                    choco install nasm -y --no-progress
+                }
+                Push-Location $srcRoot.FullName
+                try {
+                    $env:RUSTFLAGS = "-C target-feature=+crt-static"
+                    cargo build --release --locked --package wassette-mcp-server --config 'profile.release.lto="off"'
+                    if ($LASTEXITCODE -ne 0) { throw "源码构建失败：$($row.tool)" }
+                }
+                finally { Pop-Location }
+                Copy-Item (Join-Path $srcRoot.FullName "target\release\wassette.exe") $out -Force
             }
             default { throw "不支持的 package 类型：$($row.package)（$($row.tool)）" }
         }

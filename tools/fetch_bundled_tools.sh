@@ -12,7 +12,7 @@ usage() {
   cat <<'EOF'
 用法: tools/fetch_bundled_tools.sh --platform <macos-arm64> --dest <目录>
 
-下载 rg/jq/uv/gh 到 <目录>/bin，并复制许可证到 <目录>/licenses。
+下载 rg/jq/uv/gh/wassette 到 <目录>/bin，并复制许可证到 <目录>/licenses。
 版本、URL、SHA256、包内路径全部来自 tools/tool-lock.tsv。
 EOF
 }
@@ -116,5 +116,5 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
   "$DEST/bin/$output_name" --version >/dev/null
 done < tools/tool-lock.tsv
 
-[ "$found" -eq 4 ] || { echo "lock 中 $PLATFORM 应恰好有 4 个工具，实际 $found" >&2; exit 1; }
+[ "$found" -eq 5 ] || { echo "lock 中 $PLATFORM 应恰好有 5 个工具，实际 $found" >&2; exit 1; }
 echo "  [tools] 已准备 $found 个工具到 $DEST"
