@@ -2259,6 +2259,29 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn wassette_serde_default_and_skip() {
+        // 默认关（第三方沙箱工具 opt-in）+ 旧 config 无字段兼容
+        assert!(!BotConfig::default().wassette);
+        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
+        assert!(!bot.wassette, "旧 config 无字段 → 默认关");
+        // round-trip：默认 false 不落盘（skip_serializing_if = wassette_off）
+        let s = serde_json::to_string(&bot).unwrap();
+        assert!(!s.contains("wassette"));
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert!(!back.wassette);
+        // 显式开启（GUI 勾选）→ 落盘并往返保真
+        let on = BotConfig {
+            wassette: true,
+            ..BotConfig::default()
+        };
+        let s = serde_json::to_string(&on).unwrap();
+        assert!(s.contains("\"wassette\":true"));
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert!(back.wassette);
+    }
+
+    #[test]
     fn tidy_enabled_serde_default_and_skip() {
         // 手动 Default 与旧 config 反序列化都落到默认关（破坏性/磁盘操作 opt-in）
         assert!(!BotConfig::default().tidy_enabled);

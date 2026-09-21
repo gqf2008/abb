@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn base_prompt_mentions_bundled_tools_and_exclusions() {
         let prompt = include_str!("buzz/base_prompt.md");
-        for needle in ["# 环境与工具", "`rg`", "`jq`", "`uv`", "`gh`"] {
+        for needle in ["# 环境与工具", "`rg`", "`jq`", "`uv`", "`gh`", "`wassette`", "load-component"] {
             assert!(prompt.contains(needle), "base prompt 缺 {needle}");
         }
         assert!(prompt.contains("`git` / `bun` / `sed` / `find` **不随包**"));

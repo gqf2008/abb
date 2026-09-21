@@ -1424,6 +1424,8 @@ mod tests {
             ("uv", "windows-x64", "uv.exe"),
             ("gh", "macos-arm64", "gh"),
             ("gh", "windows-x64", "gh.exe"),
+            ("wassette", "macos-arm64", "wassette"),
+            ("wassette", "windows-x64", "wassette.exe"),
         ]);
         assert_eq!(matrix, expected, "随包工具矩阵必须精确锁定");
     }

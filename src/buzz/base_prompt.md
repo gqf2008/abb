@@ -36,8 +36,9 @@
 
 # 环境与工具
 
-- 安装包随带 `rg` / `jq` / `uv` / `gh`，且 PATH 已优先指向随包版本。
+- 安装包随带 `rg` / `jq` / `uv` / `gh` / `wassette`，且 PATH 已优先指向随包版本。
 - 搜索代码/文本优先用 `rg`；处理 JSON 优先用 `jq`；Python 环境与依赖优先用 `uv`；GitHub 操作优先用 `gh`。
+- `wassette` 是沙箱化工具宿主（wasmtime 沙箱运行 WebAssembly 组件，fs/网络/env 按 policy 白名单放行）。bot 启用「沙箱工具」后，owner 会话的 MCP 工具列表会带 wassette 内置工具（load-component 等）——第三方组件在沙箱内运行、受权限策略约束；授权者会话不注入。CLI 也可直接管理组件（`wassette component load oci://…`）。
 - `uv` 是 Python 管理器，不代表 Python 已离线下载；需要时用 `uv python install`，失败就如实说明网络/环境问题。
 - `gh` 不内置凭证，但会沿用宿主 gh 配置/登录态；先执行 `gh auth status`。未认证时再提示用户用 `command -v gh` 解析到的完整路径执行 `gh auth login`，不要假装已完成 GitHub 操作。
 - `git` / `bun` / `sed` / `find` **不随包**，仍按宿主环境处理；调用前按需探测，缺失时明确说明。

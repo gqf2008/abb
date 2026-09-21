@@ -5888,6 +5888,23 @@ mod tests {
         assert_eq!(bots_struct_sig(&d), bots_struct_sig(&e), "顺序无关");
     }
 
+    /// wassette 开关是 handle 启动快照（会话 MCP 注入在 run_bot 时装配），
+    /// 翻开关必须翻签名触发 svc_restart——否则勾了沙箱工具但会话不生效。
+    #[test]
+    fn bots_struct_sig_covers_wassette() {
+        let mut c = Config::default();
+        c.bots = vec![crate::config::BotConfig {
+            name: "bot1".into(),
+            ..Default::default()
+        }];
+        let s1 = bots_struct_sig(&c);
+        c.bots[0].wassette = true;
+        assert_ne!(s1, bots_struct_sig(&c), "开 wassette 必须翻签名（触发重启）");
+        let s2 = bots_struct_sig(&c);
+        c.bots[0].wassette = false;
+        assert_ne!(s2, bots_struct_sig(&c), "关 wassette 也必须翻签名");
+    }
+
     #[test]
     fn team_plan_rows_flattens_roles() {
         // #141：TeamPlan → 预览行（role_name/member/duty），member 空 = 待任命占位

@@ -1571,6 +1571,20 @@ fn redact_skill_paths(text: &str) -> String {
 mod spawn_lifecycle_tests {
     use super::*;
 
+    /// wassette MCP 参数构造：name/command/args/env 与装配语义同源（component-dir
+    /// 为 per-bot 隔离目录）。用注入缝构造，不依赖本机是否装了 wassette。
+    #[test]
+    fn wassette_mcp_server_args_bind_component_dir() {
+        let srv = wassette_mcp_server_with(std::path::Path::new("/ws/bot1/wassette"), "/opt/wassette");
+        assert_eq!(srv.name, "wassette");
+        assert_eq!(srv.command, "/opt/wassette");
+        assert_eq!(
+            srv.args,
+            vec!["run", "--component-dir", "/ws/bot1/wassette"]
+        );
+        assert!(srv.env.is_empty());
+    }
+
     #[test]
     fn agent_start_failure_is_emitted_with_spawn_detail() {
         let mut out = Vec::new();
