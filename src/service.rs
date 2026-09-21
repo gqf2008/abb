@@ -197,9 +197,10 @@ fn build_bot_acp_handles(
         .to_string();
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
-    // wassette：只进 normal（owner）会话。granted（授权者）会话不注入：wassette 的
+    // wassette：只进 normal（owner）会话。granted（授权者）实例不注入：wassette 的
     // load-component + grant-* 是 agent 可调 builtin tools，限制档会话经它可绕过自身
-    // 沙箱（读工作区 + 放行网络外发）。
+    // 沙箱（读工作区 + 放行网络外发）。注意依赖：restrict_granted_agent=false 时授权者
+    // 按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
     let extra_mcp = bot_wassette_mcp(bot);
     let mk = |extra_env: Vec<(String, String)>,
               session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,

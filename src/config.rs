@@ -166,9 +166,11 @@ pub struct BotConfig {
     pub tidy_enabled: bool,
     /// wassette 沙箱工具开关（默认关）：true=该 bot 的 normal（owner）会话随 session/new
     /// 注入 wassette MCP server（wasmtime 沙箱运行 Wasm Component 的工具宿主）。
-    /// granted（授权者）会话与 oneshot 内部任务不注入：wassette 的 load-component +
+    /// granted（授权者）实例与 oneshot 内部任务不注入：wassette 的 load-component +
     /// grant-* 是 agent 可调的 builtin tools，限制档会话经它可绕过自身沙箱——
-    /// 故只有 owner 会话可用（v1 收口）。false（默认）不落盘，旧 config 兼容。
+    /// 故只有 owner 会话可用（v1 收口）。注意依赖：restrict_granted_agent=false 时
+    /// 授权者按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
+    /// false（默认）不落盘，旧 config 兼容。
     #[serde(default, skip_serializing_if = "wassette_off")]
     pub wassette: bool,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
