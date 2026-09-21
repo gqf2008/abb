@@ -770,7 +770,7 @@ fn bots_struct_sig(c: &Config) -> String {
         .iter()
         .map(|b| {
             format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 b.key(),
                 b.enabled,
                 b.kind,
@@ -779,7 +779,8 @@ fn bots_struct_sig(c: &Config) -> String {
                 b.wx_token,
                 b.wx_user_id,
                 b.ding_user_id,
-                b.ding_robot_code
+                b.ding_robot_code,
+                b.wassette
             )
         })
         .collect();
@@ -865,6 +866,7 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_robot_code: b.ding_robot_code.clone().into(),
         restrict_granted: b.restrict_granted_agent,
         tidy_enabled: b.tidy_enabled,
+        wassette_enabled: b.wassette,
     }
 }
 
@@ -1284,6 +1286,7 @@ fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_enabled_options(mk(bot.map(|b| b.enabled).unwrap_or(false)));
     w.set_restrict_options(mk(bot.map(|b| b.restrict_granted_agent).unwrap_or(false)));
     w.set_tidy_options(mk(bot.map(|b| b.tidy_enabled).unwrap_or(false)));
+    w.set_wassette_options(mk(bot.map(|b| b.wassette).unwrap_or(false)));
     // #91 群聊提及默认（bot 级）：true=免 @ 参与
     w.set_mention_options(mk(bot.map(|b| b.mention_default).unwrap_or(false)));
 }
@@ -3352,6 +3355,31 @@ pub fn run_gui() -> Result<()> {
                 let mut b = work.borrow_mut();
                 if let Some(bot) = b.get_mut(idx as usize) {
                     bot.tidy_enabled = enabled;
+                }
+            }
+            // 同步回写 model：勾选框状态绑 model，不刷新会显示旧值
+            let b = work.borrow();
+            sync_model(&model, &b);
+            // 重建单元素 model → for 重建实例（交互断绑后实例不跟随，必须重建）
+            if let Some(w) = sw.upgrade() {
+                refresh_toggle_checks(&w, &work);
+            }
+        });
+    }
+    // wassette 沙箱工具开关（默认关）：true=该 bot 的 owner 会话注入 wassette MCP
+    // server（granted/oneshot 不注入）。随包二进制缺失时保存不报错——装配侧只告警，
+    // 会话不注入（fail-visible：bridge.out 有 [wassette] 告警行）。同独立 bool callback 模式。
+    {
+        let work = work.clone();
+        let model = bots_model.clone();
+        let dirty = dirty.clone();
+        let sw = settings.as_weak();
+        settings.on_set_wassette_enabled(move |idx, enabled| {
+            dirty.set(true);
+            {
+                let mut b = work.borrow_mut();
+                if let Some(bot) = b.get_mut(idx as usize) {
+                    bot.wassette = enabled;
                 }
             }
             // 同步回写 model：勾选框状态绑 model，不刷新会显示旧值
