@@ -5899,7 +5899,11 @@ mod tests {
         }];
         let s1 = bots_struct_sig(&c);
         c.bots[0].wassette = true;
-        assert_ne!(s1, bots_struct_sig(&c), "开 wassette 必须翻签名（触发重启）");
+        assert_ne!(
+            s1,
+            bots_struct_sig(&c),
+            "开 wassette 必须翻签名（触发重启）"
+        );
         let s2 = bots_struct_sig(&c);
         c.bots[0].wassette = false;
         assert_ne!(s2, bots_struct_sig(&c), "关 wassette 也必须翻签名");

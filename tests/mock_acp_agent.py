@@ -52,7 +52,7 @@ for line in sys.stdin:
         session_counter += 1
         sid = f"mock-ses-{session_counter}"
         record({"event": "session_new", "cwd": params.get("cwd"), "sessionId": sid,
-                "meta": params.get("_meta")})
+                "meta": params.get("_meta"), "mcpServers": params.get("mcpServers")})
         send({"jsonrpc": "2.0", "id": rid,
               "result": {"sessionId": sid, "modes": {"currentModeId": "default",
                           "availableModes": [{"id": "default", "name": "default"}]}}})

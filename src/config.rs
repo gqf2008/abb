@@ -2259,7 +2259,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn wassette_serde_default_and_skip() {
         // 默认关（第三方沙箱工具 opt-in）+ 旧 config 无字段兼容
         assert!(!BotConfig::default().wassette);

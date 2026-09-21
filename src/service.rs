@@ -150,7 +150,7 @@ fn granted_sandbox_profile(bot: &crate::config::BotConfig) -> crate::buzz::acp::
 /// 开关开且二进制可解析才注入；否则空 + 告警（fail-visible，不静默降级）。
 /// granted/oneshot 不调用本函数——恒空（v1 收口 owner，见调用点注释）。
 fn bot_wassette_mcp(bot: &crate::config::BotConfig) -> Vec<crate::buzz::acp::McpServer> {
-    bot_wassette_mcp_with(bot, |dir| crate::buzz::harness::wassette_mcp_server(dir))
+    bot_wassette_mcp_with(bot, crate::buzz::harness::wassette_mcp_server)
 }
 
 /// `bot_wassette_mcp` 的显式解析注入缝（测试用）；开关关时不得触碰 resolver。
@@ -1712,12 +1712,17 @@ mod tests {
     /// 解析成功 → 注入一条。resolver 短路的阳性对照用 panic 桩（开关关时一碰就红）。
     #[test]
     fn bot_wassette_mcp_decision() {
-        let mut bot = crate::config::BotConfig::default();
-        bot.name = "wst".into();
-        bot.wassette = false;
+        let bot = crate::config::BotConfig {
+            name: "wst".into(),
+            wassette: false,
+            ..Default::default()
+        };
         assert!(bot_wassette_mcp_with(&bot, |_| panic!("开关关时不得解析 wassette")).is_empty());
 
-        bot.wassette = true;
+        let bot = crate::config::BotConfig {
+            wassette: true,
+            ..bot
+        };
         assert!(bot_wassette_mcp_with(&bot, |_| None).is_empty());
         let srv = crate::buzz::acp::McpServer {
             name: "wassette".into(),

@@ -270,7 +270,10 @@ pub(crate) fn wassette_mcp_server(component_dir: &std::path::Path) -> Option<Mcp
 }
 
 /// `wassette_mcp_server` 的显式命令注入缝（测试用）；参数构造与真实路径同源。
-pub(crate) fn wassette_mcp_server_with(component_dir: &std::path::Path, command: &str) -> McpServer {
+pub(crate) fn wassette_mcp_server_with(
+    component_dir: &std::path::Path,
+    command: &str,
+) -> McpServer {
     McpServer {
         name: "wassette".to_string(),
         command: command.to_string(),
@@ -323,6 +326,16 @@ pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> M
 }
 
 impl BuzzHandle {
+    /// 测试访问器：会话级 MCP server 名单（events + extra 注入后的 PromptContext 快照）。
+    #[cfg(test)]
+    pub(crate) fn mcp_server_names(&self) -> Vec<String> {
+        self.ctx
+            .mcp_servers
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
     /// 新建句柄。不拉起任何进程——agent 懒启动，首条消息到达才 spawn。
     /// `cwd` = agent 子进程工作目录（ABB 启动时的当前目录）。
     /// `extra_mcp` = 除 abb-events 外的额外会话级 MCP server（normal handle 按 bot
@@ -1575,7 +1588,8 @@ mod spawn_lifecycle_tests {
     /// 为 per-bot 隔离目录）。用注入缝构造，不依赖本机是否装了 wassette。
     #[test]
     fn wassette_mcp_server_args_bind_component_dir() {
-        let srv = wassette_mcp_server_with(std::path::Path::new("/ws/bot1/wassette"), "/opt/wassette");
+        let srv =
+            wassette_mcp_server_with(std::path::Path::new("/ws/bot1/wassette"), "/opt/wassette");
         assert_eq!(srv.name, "wassette");
         assert_eq!(srv.command, "/opt/wassette");
         assert_eq!(
@@ -1583,6 +1597,129 @@ mod spawn_lifecycle_tests {
             vec!["run", "--component-dir", "/ws/bot1/wassette"]
         );
         assert!(srv.env.is_empty());
+    }
+
+    /// extra_mcp 注入句柄后必须与 abb-events 一并出现在会话 MCP 名单；空 extra
+    /// 时名单只有 abb-events（granted/oneshot 的默认形状）。
+    #[test]
+    fn extra_mcp_attached_to_prompt_context() {
+        let mk = |extra: Vec<McpServer>| {
+            BuzzHandle::new(
+                AgentConfig {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    extra_env: Vec::new(),
+                    backend: "test".to_string(),
+                    session_sandbox: None,
+                },
+                CancellationToken::new(),
+                ".".to_string(),
+                extra,
+            )
+        };
+        let h = mk(vec![wassette_mcp_server_with(
+            std::path::Path::new("/ws/b1/wassette"),
+            "/opt/wassette",
+        )]);
+        let names = h.mcp_server_names();
+        assert!(names.iter().any(|n| n == "abb-events"));
+        assert!(names.iter().any(|n| n == "wassette"));
+        // 空 extra（granted/oneshot）→ 只有 abb-events
+        assert_eq!(mk(Vec::new()).mcp_server_names(), vec!["abb-events"]);
+    }
+
+    /// e2e smoke（环境依赖）：wassette 可解析（随包/PATH）时，extra_mcp 注入的
+    /// server 必须出现在真实 ACP session/new 的 mcpServers 载荷里。本机无
+    /// wassette 时打印 SKIP 返回（detect-and-return，不 ignore 凑绿）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn wassette_mcp_reaches_session_new_payload() {
+        let Some(srv) =
+            crate::buzz::harness::wassette_mcp_server(std::path::Path::new("/ws/b1/wassette"))
+        else {
+            eprintln!("SKIP: wassette 不在 PATH/随包，跳过注入 e2e（环境依赖）");
+            return;
+        };
+        let rec = std::env::temp_dir().join(format!("abb-wassette-e2e-{}.jsonl", Uuid::new_v4()));
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let stop = CancellationToken::new();
+        let handle = BuzzHandle::new(
+            AgentConfig {
+                command: python3,
+                args: vec![script.display().to_string()],
+                extra_env: vec![
+                    ("PATH".to_string(), crate::deps::composed_path()),
+                    ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+                ],
+                backend: "mock".to_string(),
+                session_sandbox: None,
+            },
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            vec![srv],
+        );
+        let run = tokio::spawn(super::run_loop(handle.clone()));
+        let cid = Uuid::new_v4();
+        handle.upsert_channel(
+            cid,
+            ChannelMeta {
+                bot_key: "wst".to_string(),
+                chat_id: "oc_x".to_string(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: "e2e".to_string(),
+                anchor_mid: None,
+                adhoc: true,
+                workspace: None,
+            },
+        );
+        let outcome = handle
+            .wait_turn_outcome(
+                cid,
+                crate::buzz::queue::InboundMsg {
+                    id_hex: "m1".to_string(),
+                    author_role: "owner".to_string(),
+                    text: "hi".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        stop.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
+        // mock agent 会把整段 prompt 原样回显，只断言回合成功收尾（text 内容非断言点）
+        assert!(
+            matches!(outcome, SyncTurnOutcome::Ok(_)),
+            "回合应收尾 Ok，实际 {outcome:?}"
+        );
+        let log = std::fs::read_to_string(&rec).expect("record file 可读");
+        let session_new = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["event"] == "session_new")
+            .expect("必须有一次 session/new");
+        let servers = session_new["mcpServers"]
+            .as_array()
+            .expect("mcpServers 为数组");
+        let wassette = servers
+            .iter()
+            .find(|s| s["name"] == "wassette")
+            .expect("mcpServers 必须含 wassette");
+        assert_eq!(wassette["args"][0], "run");
+        assert_eq!(wassette["args"][1], "--component-dir");
+        assert_eq!(wassette["args"][2], "/ws/b1/wassette");
+        let _ = std::fs::remove_file(&rec);
     }
 
     #[test]
