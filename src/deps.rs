@@ -1,5 +1,5 @@
 //! 依赖检测与安装 —— nodejs / lark-cli / dingtalk-cli / git（python3 为信息项），
-//! 以及安装包内置工具 rg/jq/uv/gh 的 PATH 注入与体检。
+//! 以及安装包内置工具 rg/jq/uv/gh/wassette 的 PATH 注入与体检。
 //! 单后端化 P4.3：claude / codex / pi 三后端 CLI 与 ACP 适配器三件套的探测+安装臂
 //! 已随 UI 下架删除——执行层收口随包 buzz-agent（零安装），本机不再要求任何 agent CLI。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
