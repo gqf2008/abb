@@ -83,19 +83,35 @@ jobs:
           # 随包工具：版本/URL/SHA256 锁在 tools/tool-lock.tsv；不含 git/bun/sed/find。
           bash tools/fetch_bundled_tools.sh --platform macos-arm64 \
             --dest ABB.app/Contents/Resources/tools
+          # 2026-09-22：GitHub runner 出网到 Apple 时间戳服务器偶发挂起，codesign
+          # --timestamp 无界重试（实测挂 96 分钟烧穿 job；本机同 URL 正常，属 runner
+          # 侧网络）。给每次签名加 180s 看门狗（perl alarm 随 exec 继承）+ 一次重试：
+          # 失败快速显式退出，重跑 job 而不是静默烧时间。
+          sign() {
+            local attempt
+            for attempt in 1 2; do
+              if perl -e 'alarm shift; exec @ARGV' 180 codesign "$@"; then
+                return 0
+              fi
+              echo "⚠️ codesign 失败/超时（第 ${attempt}/2 次），10s 后重试：$*" >&2
+              sleep 10
+            done
+            echo "❌ codesign 两次失败（签名或 Apple 时间戳服务不可达）" >&2
+            return 1
+          }
           # #251：--options runtime（hardened runtime）必须与 --entitlements 配套——
           # 缺 camera/audio-input/apple-events entitlement 时 tccd 对摄像头/麦克风
           # 直接 deny 且不允许弹窗。主可执行与 bundle 双层都带（codesign 对 bundle
           # 的 entitlements 不会从内层继承；TCC 责任进程链在 macOS 各版本上取
           # 主可执行与 bundle 签名不一，双层带最稳）。
           ENT="app-assets/abb.entitlements"
-          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
-          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
-          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
           for tool in rg jq uv gh wassette; do
-            codesign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
+            sign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
           done
-          codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
           codesign --verify --deep --strict --verbose=2 ABB.app
           # #251 守卫：三项 TCC entitlements（相机/麦克风/自动化）必须真的签进产物——
           # 缺任一项在 hardened runtime 下会被**静默拒绝**（连授权弹窗都没有），
@@ -126,8 +142,13 @@ jobs:
           cp -R ABB.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
           hdiutil create -volname "ABB" -srcfolder dmg-staging -ov -format UDZO "ABB-$VERSION.dmg"
-          # DMG 也要签名 + 公证（只公证 app 不够，分发的盘片本身要过 Gatekeeper）
-          codesign --force --sign "$IDENTITY" --timestamp "ABB-$VERSION.dmg"
+          # DMG 也要签名 + 公证（只公证 app 不够，分发的盘片本身要过 Gatekeeper）。
+          # 同 Assemble 步：codesign 经 180s 看门狗（Apple 时间戳服务偶发挂起）。
+          if ! perl -e 'alarm 180; exec @ARGV' codesign --force --sign "$IDENTITY" --timestamp "ABB-$VERSION.dmg"; then
+            echo "⚠️ DMG 签名失败/超时，重试一次" >&2
+            sleep 10
+            perl -e 'alarm 180; exec @ARGV' codesign --force --sign "$IDENTITY" --timestamp "ABB-$VERSION.dmg" || exit 1
+          fi
           xcrun notarytool submit "ABB-$VERSION.dmg" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple "ABB-$VERSION.dmg"
