@@ -13,6 +13,10 @@ jobs:
   # ─────────────────────────── macOS（Apple Silicon）───────────────────────────
   macos:
     runs-on: macos-14 # Apple Silicon（arm64），与本地 aarch64 产物一致
+    # 2.23.63 教训：随包工具里 wassette 改源码构建后本 job 时长显著增加（3 核
+    # runner 上 codegen-units=1 单线程代码生成），曾跑 2.5h+ 无进展。加硬超时让
+    # 异常快速失败（正常应在 ~60min 内），而不是烧到 GitHub 默认 6h。
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 

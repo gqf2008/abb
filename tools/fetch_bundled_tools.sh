@@ -109,7 +109,8 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       (
         cd "$build"
         MACOSX_DEPLOYMENT_TARGET=12.0 cargo build --release --locked \
-          --package wassette-mcp-server --config 'profile.release.lto="off"'
+          --package wassette-mcp-server --config 'profile.release.lto="off"' \
+          --config 'profile.release.codegen-units=4'
       ) >"$build_log" 2>&1 || {
         tail -120 "$build_log" >&2
         echo "源码构建失败：$tool" >&2
