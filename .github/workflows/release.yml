@@ -12,7 +12,12 @@ permissions:
 jobs:
   # ─────────────────────────── macOS（Apple Silicon）───────────────────────────
   macos:
-    runs-on: macos-14 # Apple Silicon（arm64），与本地 aarch64 产物一致
+    # 2026-09-22：macos-14 镜像更新到 14.8.9 后，codesign 对大二进制（~150MB
+    # agent-bridge）签名时 SecKeyCreateSignature 在 securityd 内无界挂起（sample
+    # 栈实证：SGN_SignAll → SecKeyCreateSignature → SecKeyCopyDigestForMessage；
+    # 小文件/preflight 秒过，同一二进制在旧镜像 2.23.62 秒签）。切 macos-15
+    # （arm64）绕开该 securityd 回归。
+    runs-on: macos-15 # Apple Silicon（arm64），与本地 aarch64 产物一致
     # 2.23.63 教训：随包工具里 wassette 改源码构建后本 job 时长显著增加（3 核
     # runner 上 codegen-units=1 单线程代码生成），曾跑 2.5h+ 无进展。加硬超时让
     # 异常快速失败（正常应在 ~60min 内），而不是烧到 GitHub 默认 6h。
