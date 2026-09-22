@@ -108,6 +108,12 @@ jobs:
           sign() {
             local attempt
             for attempt in 1 2 3; do
+              # 临时 keychain 可能在导入后 20+ 分钟自动锁定：securityd 等解锁提示 =
+              # 无头 CI 里静默挂起（与 diag3 sample 栈一致：SecKeyCreateSignature 挂
+              # 等 securityd；preflight 紧贴导入时秒过、真签名 25 分钟后挂）。
+              # 每次尝试前强制解锁 + 禁用自动锁。
+              security unlock-keychain -p temp /tmp/temp.keychain 2>/dev/null || true
+              security set-keychain-settings -lut 21600 /tmp/temp.keychain 2>/dev/null || true
               if perl -e 'alarm shift; exec @ARGV' 180 codesign "$@"; then
                 return 0
               fi
