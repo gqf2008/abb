@@ -91,6 +91,38 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       fi
       cp "$src" "$DEST/bin/$output_name"
       ;;
+    cargo-src)
+      # wassette（macOS）：上游官方预编译资产在 hardened runtime 签名下执行组件时，
+      # 被 macOS 26 代码签名强制以「Code Signature Invalid / Invalid Page」SIGKILL
+      #（allow-jit entitlement 也救不了，wasmtime 47 的 JIT 不走 MAP_JIT 协议）。
+      # 改为官方源码构建 + tools/wassette-pulley.patch：wasmtime +pulley feature +
+      # macOS 默认 Pulley 解释器（无 JIT 页、无签名页问题；WASSETTE_INTERPRETER=0
+      # 可切回 JIT）。pulley-interpreter 本就在 v0.7.1 依赖树里，零新增依赖。
+      mkdir -p "$tmp/extract/$tool"
+      tar -xzf "$file" -C "$tmp/extract/$tool"
+      build="$tmp/extract/$tool/wassette-${version}"
+      patch -p2 -d "$build" < tools/wassette-pulley.patch || {
+        echo "wassette-pulley.patch 应用失败（上游版本变了？）" >&2
+        exit 1
+      }
+      build_log="$tmp/wassette-build.log"
+      (
+        cd "$build"
+        MACOSX_DEPLOYMENT_TARGET=12.0 cargo build --release --locked \
+          --package wassette-mcp-server --config 'profile.release.lto="off"'
+      ) >"$build_log" 2>&1 || {
+        tail -120 "$build_log" >&2
+        echo "源码构建失败：$tool" >&2
+        exit 1
+      }
+      src="$build/target/release/wassette"
+      if [ ! -x "$src" ]; then
+        tail -60 "$build_log" >&2
+        echo "源码构建未产出 wassette（$tool）" >&2
+        exit 1
+      fi
+      cp "$src" "$DEST/bin/$output_name"
+      ;;
     *)
       echo "不支持的 package 类型：$package（$tool）" >&2
       exit 1

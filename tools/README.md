@@ -25,6 +25,13 @@ ABB 安装包内置五个固定版本的工具：
 macOS 的 `jq 1.8.2` 不使用官方预编译包（其 minOS 为 14），而是从官方源码以
 `MACOSX_DEPLOYMENT_TARGET=12.0` 静态构建，保持 ABB 当前 `LSMinimumSystemVersion=12.0`。
 
+macOS 的 `wassette 0.7.1` 同样不走官方预编译包：官方资产在 hardened runtime 签名下执行
+组件时被 macOS 26 代码签名强制以「Code Signature Invalid」SIGKILL（wasmtime 47 的 JIT
+不走 MAP_JIT，allow-jit entitlement 也救不了）。改为官方源码构建并打
+`tools/wassette-pulley.patch`（wasmtime +pulley feature，macOS 默认 Pulley 解释器、
+无 JIT 页；`WASSETTE_INTERPRETER=0` 可切回 JIT）。Windows 继续源码构建但**不打**该补丁
+（无此问题，保留 JIT 性能）。
+
 ## 布局
 
 构建时由 `fetch_bundled_tools.sh` / `fetch_bundled_tools.ps1` 按
