@@ -1,0 +1,35 @@
+--- a/wassette-0.7.1/crates/wassette/Cargo.toml	2026-09-12 11:30:35
++++ b/wassette-0.7.1/crates/wassette/Cargo.toml	2026-09-22 09:42:06
+@@ -27,7 +27,7 @@
+ tokio-util = { workspace = true, features = ["io"] }
+ tracing = { workspace = true, features = ["attributes"] }
+ url = "2.5"
+-wasmtime = { workspace = true }
++wasmtime = { workspace = true, features = ["pulley"] }
+ wasmtime-wasi = { workspace = true }
+ wasmtime-wasi-http = { workspace = true }
+ wasmtime-wasi-config = { workspace = true }
+--- a/wassette-0.7.1/crates/wassette/src/runtime_context.rs	2026-09-12 11:30:35
++++ b/wassette-0.7.1/crates/wassette/src/runtime_context.rs	2026-09-22 09:57:30
+@@ -33,6 +33,21 @@
+         let mut config = wasmtime::Config::new();
+         config.wasm_component_model(true);
+         config.wasm_component_model_map(true);
++        // macOS 26 代码签名强制（CSM）会 SIGKILL 执行 JIT 页的 hardened 签名进程
++        // （Code Signature Invalid / Invalid Page；allow-jit entitlement 无效，
++        // wasmtime 47 的 JIT 不走 MAP_JIT 协议）。故 macOS 默认走 Pulley 解释器：
++        // 不生成机器码、无可执行页，绕开该强制，代价是执行变慢（MCP 短调用无感）。
++        // wasmtime 47 没有 Config::interpreter 公开方法，Pulley 经 target 选择。
++        // WASSETTE_INTERPRETER=0/1 可强制切回 JIT / 强制解释器。
++        let interpreter = match std::env::var("WASSETTE_INTERPRETER").ok().as_deref() {
++            Some("0") | Some("false") | Some("FALSE") => false,
++            Some("1") | Some("true") | Some("TRUE") => true,
++            _ => cfg!(target_os = "macos"),
++        };
++        if interpreter {
++            config.target("pulley64")?;
++            tracing::info!("Pulley interpreter mode（无 JIT 页；WASSETTE_INTERPRETER 可覆盖）");
++        }
+ 
+         let engine = Arc::new(Engine::new(&config)?);
+ 
