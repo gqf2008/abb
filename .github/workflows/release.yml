@@ -61,6 +61,17 @@ jobs:
           IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')
           echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
 
+      # 2026-09-22 实锤（诊断日志）：GitHub macOS 宿主机约半数到 Apple 签名设施的
+      # 链路坏（codesign --timestamp 无界挂起；同机 ad-hoc/真证书签小文件实测秒过，
+      # 坏宿主机的连接被拒后 codesign 内部无界重试）。构建前用真证书 + --timestamp
+      # 签一个探针文件：坏宿主机 2 分钟内显式失败（重跑 job 即可换宿主机），
+      # 不再烧 15 分钟构建再挂在签名上。
+      - name: Sign preflight（真证书 + --timestamp 快速探针；坏宿主机在此快速失败）
+        run: |
+          printf 'x' > /tmp/sign-preflight
+          perl -e 'alarm 120; exec @ARGV' codesign --force --options runtime --timestamp --sign "$IDENTITY" /tmp/sign-preflight
+          codesign -v --verbose=1 /tmp/sign-preflight | head -3
+
       - name: Assemble ABB.app and sign (hardened runtime + timestamp)
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
@@ -84,12 +95,12 @@ jobs:
           bash tools/fetch_bundled_tools.sh --platform macos-arm64 \
             --dest ABB.app/Contents/Resources/tools
           # 2026-09-22：GitHub runner 出网到 Apple 时间戳服务器偶发挂起，codesign
-          # --timestamp 无界重试（实测挂 96 分钟烧穿 job；本机同 URL 正常，属 runner
-          # 侧网络）。给每次签名加 180s 看门狗（perl alarm 随 exec 继承）+ 一次重试：
-          # 失败快速显式退出，重跑 job 而不是静默烧时间。
+          # --timestamp 无界重试（实测挂 96 分钟烧穿 job；诊断确认：坏宿主机连接被拒
+          # 后 codesign 内部无界重试，约半数宿主机受影响）。给每次签名加 180s 看门狗
+          # （perl alarm 随 exec 继承）+ 两次重试：失败快速显式退出，重跑 job 换宿主机。
           sign() {
             local attempt
-            for attempt in 1 2; do
+            for attempt in 1 2 3; do
               if perl -e 'alarm shift; exec @ARGV' 180 codesign "$@"; then
                 return 0
               fi
