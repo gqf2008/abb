@@ -36,15 +36,9 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Build release (aarch64)
-        run: cargo build --release --target aarch64-apple-darwin
-
-      # #200 buzz 默认后端执行层：自维护 fork crates/buzz-agent 构建随包（不再拉上游
-      # block/buzz——本地 manifest 独立自持，CI 与主程序同一次 build 环境内完成；
-      # 上游同步经 git diff 人工合入 fork）。buzz-acp 已随 #200 进程内化退役，不入包。
-      - name: Build forked buzz-agent (aarch64)
-        run: cargo build --release --manifest-path crates/buzz-agent/Cargo.toml --target aarch64-apple-darwin
-
+      # 证书导入 + 签名预检必须在两次 cargo build 之前（评审 needs-changes 修正）：
+      # 坏宿主机 2 分钟内显式失败（重跑 job 即可换宿主机），不再烧 15 分钟构建
+      # 再挂在签名上。
       - name: Import Developer ID certificate (temporary keychain)
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
@@ -64,13 +58,21 @@ jobs:
       # 2026-09-22 实锤（诊断日志）：GitHub macOS 宿主机约半数到 Apple 签名设施的
       # 链路坏（codesign --timestamp 无界挂起；同机 ad-hoc/真证书签小文件实测秒过，
       # 坏宿主机的连接被拒后 codesign 内部无界重试）。构建前用真证书 + --timestamp
-      # 签一个探针文件：坏宿主机 2 分钟内显式失败（重跑 job 即可换宿主机），
-      # 不再烧 15 分钟构建再挂在签名上。
+      # 签一个探针文件：坏宿主机 2 分钟内显式失败（重跑 job 即可换宿主机）。
       - name: Sign preflight（真证书 + --timestamp 快速探针；坏宿主机在此快速失败）
         run: |
           printf 'x' > /tmp/sign-preflight
           perl -e 'alarm 120; exec @ARGV' codesign --force --options runtime --timestamp --sign "$IDENTITY" /tmp/sign-preflight
           codesign -v --verbose=1 /tmp/sign-preflight | head -3
+
+      - name: Build release (aarch64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      # #200 buzz 默认后端执行层：自维护 fork crates/buzz-agent 构建随包（不再拉上游
+      # block/buzz——本地 manifest 独立自持，CI 与主程序同一次 build 环境内完成；
+      # 上游同步经 git diff 人工合入 fork）。buzz-acp 已随 #200 进程内化退役，不入包。
+      - name: Build forked buzz-agent (aarch64)
+        run: cargo build --release --manifest-path crates/buzz-agent/Cargo.toml --target aarch64-apple-darwin
 
       - name: Assemble ABB.app and sign (hardened runtime + timestamp)
         run: |
