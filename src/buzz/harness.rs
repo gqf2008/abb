@@ -277,33 +277,59 @@ pub(crate) fn wassette_mcp_server(component_dir: &std::path::Path) -> Option<Mcp
 pub fn wassette_components_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
-        windows_wassette_components_dir(
+        let dir = windows_wassette_components_dir(
             std::env::var_os("APPDATA").as_deref(),
             std::env::var_os("HOME").as_deref(),
-        )
+        );
+        if dir.as_path() == std::path::Path::new("components") {
+            crate::log!("[wassette] 无有效 APPDATA/HOME，组件目录回落 ./components（与上游一致）");
+        }
+        dir
     }
     #[cfg(not(target_os = "windows"))]
     {
-        unix_wassette_components_dir(
+        let dir = unix_wassette_components_dir(
             std::env::var_os("XDG_DATA_HOME").as_deref(),
             std::env::var_os("HOME").as_deref(),
-        )
+        );
+        if dir.as_path() == std::path::Path::new("components") {
+            crate::log!(
+                "[wassette] 无有效 XDG_DATA_HOME/HOME，组件目录回落 ./components（与上游一致）"
+            );
+        }
+        dir
     }
 }
 
-/// Unix/macOS：`$XDG_DATA_HOME` 否则 `$HOME/.local/share`，+ `wassette/components`。
+/// 环境变量路径取值规则（对齐上游 etcetera）：只接受**非空且绝对**的值，
+/// 相对/空串一律按未设置处理。
+fn env_path_if_abs(v: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(v?);
+    if p.as_os_str().is_empty() || !p.is_absolute() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Unix/macOS：`$XDG_DATA_HOME` 否则 `$HOME/.local/share`，+ `wassette/components`；
+/// 两者都无效 → 上游同款兜底 `./components`（上游 get_component_dir Err 分支）。
+/// `cfg(any(test, not(windows)))`：与 windows 臂对称，Windows 非测试构建不编译本函数。
+#[cfg(any(test, not(target_os = "windows")))]
 fn unix_wassette_components_dir(
     xdg_data_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> std::path::PathBuf {
-    let base = xdg_data_home
-        .map(std::path::PathBuf::from)
-        .or_else(|| home.map(|h| std::path::PathBuf::from(h).join(".local").join("share")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("wassette").join("components")
+    match env_path_if_abs(xdg_data_home)
+        .or_else(|| env_path_if_abs(home).map(|h| h.join(".local").join("share")))
+    {
+        Some(base) => base.join("wassette").join("components"),
+        None => std::path::PathBuf::from("components"),
+    }
 }
 
-/// Windows：`%APPDATA%` 否则 `%HOME%\AppData\Roaming`，+ `wassette\components`。
+/// Windows：`%APPDATA%` 否则 `%HOME%\AppData\Roaming`，+ `wassette\components`；
+/// 两者都无效 → 上游同款兜底 `./components`。
 /// `cfg(any(test, windows))`：纯路径函数，让它在 `cargo test` 下也编译，
 /// 才可能在 macOS 上给 Windows 臂写单测（同 ui.rs 的 round_rect_bands 先例）。
 #[cfg(any(test, target_os = "windows"))]
@@ -311,11 +337,12 @@ fn windows_wassette_components_dir(
     appdata: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> std::path::PathBuf {
-    let base = appdata
-        .map(std::path::PathBuf::from)
-        .or_else(|| home.map(|h| std::path::PathBuf::from(h).join("AppData").join("Roaming")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("wassette").join("components")
+    match env_path_if_abs(appdata)
+        .or_else(|| env_path_if_abs(home).map(|h| h.join("AppData").join("Roaming")))
+    {
+        Some(base) => base.join("wassette").join("components"),
+        None => std::path::PathBuf::from("components"),
+    }
 }
 
 /// `wassette_mcp_server` 的显式命令注入缝（测试用）；参数构造与真实路径同源。
@@ -1653,6 +1680,7 @@ mod spawn_lifecycle_tests {
     /// ~\AppData\Roaming。纯函数（含 Windows 臂），macOS 上即可全测。
     #[test]
     fn wassette_components_dir_matches_upstream_defaults() {
+        // unix：XDG_DATA_HOME 绝对路径优先；相对/空串一律忽略（上游 etcetera 规则）
         assert_eq!(
             unix_wassette_components_dir(
                 Some(std::ffi::OsStr::new("/xdg")),
@@ -1664,25 +1692,64 @@ mod spawn_lifecycle_tests {
             unix_wassette_components_dir(None, Some(std::ffi::OsStr::new("/home/u"))),
             std::path::PathBuf::from("/home/u/.local/share/wassette/components")
         );
-        // Windows 臂断言用 PathBuf::join 拼期望值：测试跑在 macOS 上时 join 用
-        // "/" 作分隔符（函数本身在 Windows 上编译，分隔符自然正确）；这里只锁
-        // APPDATA 优先 / HOME\AppData\Roaming 回落的逻辑。
+        assert_eq!(
+            unix_wassette_components_dir(
+                Some(std::ffi::OsStr::new("relxdg")),
+                Some(std::ffi::OsStr::new("/home/u"))
+            ),
+            std::path::PathBuf::from("/home/u/.local/share/wassette/components"),
+            "相对 XDG_DATA_HOME 必须被忽略"
+        );
+        assert_eq!(
+            unix_wassette_components_dir(
+                Some(std::ffi::OsStr::new("")),
+                Some(std::ffi::OsStr::new("/home/u"))
+            ),
+            std::path::PathBuf::from("/home/u/.local/share/wassette/components"),
+            "空串 XDG_DATA_HOME 必须被忽略"
+        );
+        assert_eq!(
+            unix_wassette_components_dir(None, None),
+            std::path::PathBuf::from("components"),
+            "全无效 → 上游同款兜底 ./components"
+        );
+        // Windows 臂断言用 PathBuf::join 拼期望值，且入参取**宿主平台绝对**的路径
+        //（测试跑在 macOS 上，is_absolute 按宿主语义判定；函数本身在 Windows 上
+        // 编译，绝对性语义自然正确）。这里锁 APPDATA 优先 / HOME\AppData\Roaming
+        // 回落 / 相对值忽略 的逻辑。
         assert_eq!(
             windows_wassette_components_dir(
-                Some(std::ffi::OsStr::new(r"C:\Users\u\AppData\Roaming")),
-                Some(std::ffi::OsStr::new(r"C:\Users\u"))
+                Some(std::ffi::OsStr::new("/ap")),
+                Some(std::ffi::OsStr::new("/home/u"))
             ),
-            std::path::PathBuf::from(r"C:\Users\u\AppData\Roaming")
+            std::path::PathBuf::from("/ap")
                 .join("wassette")
                 .join("components")
         );
         assert_eq!(
-            windows_wassette_components_dir(None, Some(std::ffi::OsStr::new(r"C:\Users\u"))),
-            std::path::PathBuf::from(r"C:\Users\u")
+            windows_wassette_components_dir(None, Some(std::ffi::OsStr::new("/home/u"))),
+            std::path::PathBuf::from("/home/u")
                 .join("AppData")
                 .join("Roaming")
                 .join("wassette")
                 .join("components")
+        );
+        assert_eq!(
+            windows_wassette_components_dir(
+                Some(std::ffi::OsStr::new("relappdata")),
+                Some(std::ffi::OsStr::new("/home/u"))
+            ),
+            std::path::PathBuf::from("/home/u")
+                .join("AppData")
+                .join("Roaming")
+                .join("wassette")
+                .join("components"),
+            "相对 APPDATA 必须被忽略"
+        );
+        assert_eq!(
+            windows_wassette_components_dir(None, None),
+            std::path::PathBuf::from("components"),
+            "全无效 → 上游同款兜底 ./components"
         );
     }
 
