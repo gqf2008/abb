@@ -172,7 +172,7 @@ export struct BotRow {
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
     restrict-granted: bool, // 授权者 agent 会话隔离（true=受限模式，安全默认；false=与 owner 同权限）
     tidy-enabled: bool, // 每日工作目录整理（默认关：孤儿会话/临时文件/超期历史/文档归档 + git 留痕）
-    wassette-enabled: bool, // wassette 沙箱工具（默认关：只进 owner 会话的 MCP 工具宿主，随包二进制）
+    wassette-enabled: bool, // wassette 沙箱工具（默认开：只进 owner 会话的 MCP 工具宿主，随包二进制；可手动关闭）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -1294,7 +1294,7 @@ export component SettingsWindow inherits Window {
     callback set-bot-enabled(int, bool); // 启用/停用某 bot（保存重启后生效）
     callback set-restrict-granted(int, bool); // 授权者 agent 隔离开关（true=受限模式，保存后即时生效）
     callback set-tidy-enabled(int, bool); // 每日工作目录整理开关（默认关，保存后即时生效）
-    callback set-wassette-enabled(int, bool); // wassette 沙箱工具开关（默认关，保存后重启生效）
+    callback set-wassette-enabled(int, bool); // wassette 沙箱工具开关（默认开，保存后重启生效）
     callback set-mention-default(int, bool); // #91 群聊提及默认开关（true=免 @ 参与，保存后即时生效）
     callback virtual-bot-mention-toggle(int); // #91 虚拟 Bot 免 @ 开关（按行索引切换 mention_modes[chat-id]）
     callback set-cross-delivery(bool);   // 跨会话投递总开关（保存重启后生效）
@@ -1745,8 +1745,9 @@ export component SettingsWindow inherits Window {
                                                         }
                                                     }
                                                 }
-                                                // wassette 沙箱工具（默认关）：bot 的 owner 会话注入 wassette MCP
+                                                // wassette 沙箱工具（默认开）：bot 的 owner 会话注入 wassette MCP
                                                 // server（wasmtime 沙箱运行 Wasm Component）。granted 会话不注入。
+                                                // 关闭 = 人类逃生阀。
                                                 // 勾选态走独立 callback（同 set-tidy-enabled 模式）。
                                                 if root.selected >= 0 && root.selected < root.bots.length: Row {
                                                     Text { text: "沙箱工具"; width: 80px; vertical-alignment: center; }

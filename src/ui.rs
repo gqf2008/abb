@@ -3366,7 +3366,7 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // wassette 沙箱工具开关（默认关）：true=该 bot 的 owner 会话注入 wassette MCP
+    // wassette 沙箱工具开关（默认开）：true=该 bot 的 owner 会话注入 wassette MCP
     // server（granted/oneshot 不注入）。随包二进制缺失时保存不报错——装配侧只告警，
     // 会话不注入（fail-visible：bridge.out 有 [wassette] 告警行）。同独立 bool callback 模式。
     {
@@ -5898,15 +5898,17 @@ mod tests {
             ..Default::default()
         }];
         let s1 = bots_struct_sig(&c);
-        c.bots[0].wassette = true;
+        // 默认开 → 显式关：人类逃生阀必须生效（翻签名触发重启）
+        c.bots[0].wassette = false;
         assert_ne!(
             s1,
             bots_struct_sig(&c),
-            "开 wassette 必须翻签名（触发重启）"
+            "关 wassette 必须翻签名（触发重启）"
         );
         let s2 = bots_struct_sig(&c);
-        c.bots[0].wassette = false;
-        assert_ne!(s2, bots_struct_sig(&c), "关 wassette 也必须翻签名");
+        // 关 → 开：同样翻签名
+        c.bots[0].wassette = true;
+        assert_ne!(s2, bots_struct_sig(&c), "开 wassette 也必须翻签名");
     }
 
     #[test]
