@@ -161,7 +161,9 @@ fn bot_wassette_mcp_with(
     if !bot.wassette {
         return Vec::new();
     }
-    let dir = crate::workspace_dir(&bot.key()).join("wassette");
+    // 方案 B（2026-09-23）：组件目录应用级统一（与 CLI 默认目录一致），
+    // 不再 per-bot——CLI 加载与 MCP 宿主读同一仓库，装一次全会话可见。
+    let dir = crate::buzz::harness::wassette_components_dir();
     match resolve(&dir) {
         Some(srv) => vec![srv],
         None => {
@@ -201,6 +203,7 @@ fn build_bot_acp_handles(
     // load-component + grant-* 是 agent 可调 builtin tools，限制档会话经它可绕过自身
     // 沙箱（读工作区 + 放行网络外发）。注意依赖：restrict_granted_agent=false 时授权者
     // 按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
+    // 组件仓库为应用级共享（方案 B）：跨 bot 的组件与 grant 策略耦合由 owner 拍板接受。
     let extra_mcp = bot_wassette_mcp(bot);
     let mk = |extra_env: Vec<(String, String)>,
               session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
@@ -1734,6 +1737,17 @@ mod tests {
         let out = bot_wassette_mcp_with(&bot, |_| Some(srv));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "wassette");
+        // 方案 B：装配传应用级仓库（与 CLI 默认目录一致），不再 per-bot
+        let mut captured: Option<std::path::PathBuf> = None;
+        bot_wassette_mcp_with(&bot, |dir| {
+            captured = Some(dir.to_path_buf());
+            None
+        });
+        assert_eq!(
+            captured.as_deref(),
+            Some(crate::buzz::harness::wassette_components_dir().as_path()),
+            "装配必须传应用级组件仓库"
+        );
     }
 
     #[test]

@@ -212,7 +212,7 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - **随包工具优先**：安装包内置 `rg` / `jq` / `uv` / `gh` / `wassette`，PATH 已优先指向它们。
   - 搜索优先 `rg`，JSON 优先 `jq`，Python 环境优先 `uv`，GitHub 操作优先 `gh`。
   - `uv` 只管 Python 环境/依赖，不保证 Python 已下载；`gh` 会沿用宿主登录态，先查 `gh auth status`，未认证时给出 `command -v gh` 解析到的完整路径让用户执行 `gh auth login`。
-  - `wassette` 是沙箱化工具宿主（wasmtime 沙箱运行 WebAssembly 组件）：bot 开启「沙箱工具」后，owner 会话的 MCP 工具列表会带它的内置工具（load-component 等），第三方组件在沙箱内运行、受权限策略约束。
+  - `wassette` 是沙箱化工具宿主（wasmtime 沙箱运行 WebAssembly 组件）：「沙箱工具」默认开启，owner 会话的 MCP 工具列表会带它的内置工具（load-component 等），第三方组件在沙箱内运行、受权限策略约束。组件仓库为**应用级共享**：CLI 与 MCP 工具读写同一目录，装一次全会话可见。
   - `git` / `bun` / `sed` / `find` **不随包**，仍按宿主环境处理，缺失时明确说明。
 - 任务完成（产出最终回复）后**立即退出**，不要持续运行或等待。
 - 普通问答、查资料、改文件等直接做即可，做完输出结论。
