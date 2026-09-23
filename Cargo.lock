@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bridge"
-version = "2.23.69"
+version = "2.23.70"
 dependencies = [
  "aes",
  "anyhow",
