@@ -164,14 +164,17 @@ pub struct BotConfig {
     /// 需 owner 在 bot 配置页显式打开。false（默认）不落盘，旧 config 兼容。
     #[serde(default, skip_serializing_if = "tidy_off")]
     pub tidy_enabled: bool,
-    /// wassette 沙箱工具开关（默认关）：true=该 bot 的 normal（owner）会话随 session/new
-    /// 注入 wassette MCP server（wasmtime 沙箱运行 Wasm Component 的工具宿主）。
+    /// wassette 沙箱工具开关（**默认开**，owner 2026-09-23 产品决策：人类授权安装并
+    /// 与 agent 共用设备/空间，agent 获得与人类同等的工具权利；沙箱（wasmtime +
+    /// policy 白名单）才是安全边界，开关不是）。true=该 bot 的 normal（owner）会话
+    /// 随 session/new 注入 wassette MCP server（wasmtime 沙箱运行 Wasm Component
+    /// 的工具宿主）。
     /// granted（授权者）实例与 oneshot 内部任务不注入：wassette 的 load-component +
     /// grant-* 是 agent 可调的 builtin tools，限制档会话经它可绕过自身沙箱——
-    /// 故只有 owner 会话可用（v1 收口）。注意依赖：restrict_granted_agent=false 时
+    /// 故只有 owner 会话可用。注意依赖：restrict_granted_agent=false 时
     /// 授权者按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
-    /// false（默认）不落盘，旧 config 兼容。
-    #[serde(default, skip_serializing_if = "wassette_off")]
+    /// true（默认）不落盘；显式 false 才落盘，旧 config 无字段 → 默认开。
+    #[serde(default = "default_true", skip_serializing_if = "wassette_on")]
     pub wassette: bool,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
     /// 缺省（无条目）= 需要 @（默认，向后兼容旧 config）。仅顶层群聊 chat_id 记录；
@@ -255,7 +258,7 @@ impl Default for BotConfig {
             open_access: false,
             restrict_granted_agent: true,
             tidy_enabled: false,
-            wassette: false,
+            wassette: true,
             mention_modes: std::collections::HashMap::new(),
             mention_default: false,
             delete_protect_enabled: true,
@@ -330,9 +333,9 @@ fn tidy_off(b: &bool) -> bool {
     !*b
 }
 
-/// skip_serializing_if：wassette 为 false（默认关）不落盘，旧 config 兼容。
-fn wassette_off(b: &bool) -> bool {
-    !*b
+/// skip_serializing_if：wassette 为 true（默认开）不落盘；显式 false 才落盘，旧 config 兼容。
+fn wassette_on(b: &bool) -> bool {
+    *b
 }
 
 /// 授权码有效期（秒）：30 分钟。过期码仍保留在 pending_codes 里直到被消费/重新生成，
@@ -2262,24 +2265,25 @@ mod tests {
 
     #[test]
     fn wassette_serde_default_and_skip() {
-        // 默认关（第三方沙箱工具 opt-in）+ 旧 config 无字段兼容
-        assert!(!BotConfig::default().wassette);
+        // 默认开（owner 产品决策：授权安装即同等权利；沙箱是安全边界）+
+        // 旧 config 无字段兼容（无字段 → 默认开）
+        assert!(BotConfig::default().wassette);
         let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
-        assert!(!bot.wassette, "旧 config 无字段 → 默认关");
-        // round-trip：默认 false 不落盘（skip_serializing_if = wassette_off）
+        assert!(bot.wassette, "旧 config 无字段 → 默认开");
+        // round-trip：默认 true 不落盘（skip_serializing_if = wassette_on）
         let s = serde_json::to_string(&bot).unwrap();
         assert!(!s.contains("wassette"));
         let back: BotConfig = serde_json::from_str(&s).unwrap();
-        assert!(!back.wassette);
-        // 显式开启（GUI 勾选）→ 落盘并往返保真
-        let on = BotConfig {
-            wassette: true,
+        assert!(back.wassette);
+        // 显式关闭（GUI 取消勾选）→ 落盘 false 并往返保真（逃生阀语义）
+        let off = BotConfig {
+            wassette: false,
             ..BotConfig::default()
         };
-        let s = serde_json::to_string(&on).unwrap();
-        assert!(s.contains("\"wassette\":true"));
+        let s = serde_json::to_string(&off).unwrap();
+        assert!(s.contains("\"wassette\":false"));
         let back: BotConfig = serde_json::from_str(&s).unwrap();
-        assert!(back.wassette);
+        assert!(!back.wassette);
     }
 
     #[test]
