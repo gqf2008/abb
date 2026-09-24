@@ -3,7 +3,6 @@
 //! 本模块只负责：持久化（~/.agent-bridge/workspaces/<bot>/jobs.json）+ 判断「到点了吗/下次何时」。
 //! 不引 cron 解析依赖：标准 5 段中文 cron（分 时 日 月 周）手写求值，够用且可测。
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -62,12 +61,6 @@ pub struct JobStore {
 }
 
 impl JobStore {
-    pub fn new(bot_key: &str) -> JobStore {
-        let dir = crate::bridge_dir().join("workspaces").join(bot_key);
-        let _ = fs::create_dir_all(&dir);
-        Self::at(dir.join("jobs.json"))
-    }
-
     /// 按指定路径构造（生产入口委托 / 测试在隔离根下构造）。
     pub(crate) fn at(path: PathBuf) -> JobStore {
         let data = if path.exists() {
@@ -112,12 +105,6 @@ impl JobStore {
         }
     }
 
-    pub fn add(&self, job: Job) {
-        let mut d = self.data.lock().unwrap();
-        d.push(job);
-        self.save_locked(&d);
-    }
-
     pub fn remove(&self, id: &str) -> bool {
         let mut d = self.data.lock().unwrap();
         let before = d.len();
@@ -127,10 +114,6 @@ impl JobStore {
             self.save_locked(&d);
         }
         changed
-    }
-
-    pub fn list(&self) -> Vec<Job> {
-        self.data.lock().unwrap().clone()
     }
 
     /// 取出所有「现在已到点」的任务（once: time<=now；cron: 当前分钟匹配且非本分钟刚触发过）。
@@ -231,36 +214,6 @@ impl Job {
                 None => false,
             },
         }
-    }
-
-    /// 人类可读的一行描述（列表用）。
-    pub fn describe(&self) -> String {
-        let kind = match self.kind {
-            JobKind::Once => "一次性",
-            JobKind::Cron => "周期",
-        };
-        let mut s = format!(
-            "[{}] {} {} → {}",
-            &self.id[..self.id.len().min(8)],
-            kind,
-            self.schedule,
-            self.prompt
-        );
-        if !self.targets.is_empty() {
-            let targets: Vec<String> = self
-                .targets
-                .iter()
-                .map(|t| {
-                    if t.bot_key.is_empty() {
-                        t.chat_id.clone()
-                    } else {
-                        format!("{}:{}", t.bot_key, t.chat_id)
-                    }
-                })
-                .collect();
-            s.push_str(&format!("（多目标：{}）", targets.join(", ")));
-        }
-        s
     }
 }
 
@@ -372,65 +325,6 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Option<Field> {
     Some(Field { any: false, vals })
 }
 
-/// claude 结构化输出的校验 + 归一成 Job（唯一调用方：main.rs 的 job add CLI）。
-/// 创建者角色（role）由调用方从 AGENT_BRIDGE_SENDER_ROLE env 解析后传入。
-#[allow(clippy::too_many_arguments)]
-pub fn job_from_parsed(
-    kind: &str,
-    time: Option<&str>,
-    cron: Option<&str>,
-    prompt: &str,
-    chat_id: &str,
-    note: &str,
-    targets: Vec<JobTarget>,
-    role: crate::config::SenderRole,
-) -> Result<Job> {
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        anyhow::bail!("没解析出要做什么（prompt 为空）");
-    }
-    let (jk, schedule) = match kind {
-        "once" => {
-            let t = time.context("一次性任务缺 time")?;
-            parse_once(t).with_context(|| format!("time 格式不对（要 YYYY-MM-DD HH:MM）：{t}"))?;
-            (JobKind::Once, t.trim().to_string())
-        }
-        "cron" => {
-            let c = cron.context("周期任务缺 cron")?;
-            CronExpr::parse(c).with_context(|| format!("cron 表达式不合法：{c}"))?;
-            (JobKind::Cron, c.trim().to_string())
-        }
-        other => anyhow::bail!("未知任务类型：{other}"),
-    };
-    Ok(Job {
-        id: uuid::Uuid::new_v4().to_string(),
-        kind: jk,
-        schedule,
-        prompt: prompt.to_string(),
-        chat_id: chat_id.to_string(),
-        note: note.to_string(),
-        targets,
-        role,
-    })
-}
-
-/// 解析 job add 的 --to 目标：`bot_key:chat_id`（跨 bot）或裸 `chat_id`（本 bot）。
-/// 校验 chat_id 非空；bot_key 可为空（= 本 bot，与 JobTarget 语义一致）。
-pub fn parse_job_target(s: &str) -> Result<JobTarget> {
-    let s = s.trim();
-    if s.is_empty() {
-        anyhow::bail!("--to 目标不能为空");
-    }
-    let (bot_key, chat_id) = match s.split_once(':') {
-        Some((b, c)) => (b.trim().to_string(), c.trim().to_string()),
-        None => (String::new(), s.to_string()),
-    };
-    if chat_id.is_empty() {
-        anyhow::bail!("--to 目标 chat_id 不能为空：{s}");
-    }
-    Ok(JobTarget { bot_key, chat_id })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,95 +397,24 @@ mod tests {
         assert!(CronExpr::parse("0 9 * * * *").is_none()); // 6段
     }
 
+    /// P5 调整（语义不变）：原来借 `job_from_parsed` 当构造器，该函数随「jobs.json
+    /// 只读化」删除（见 docs/task-model.md §D7）→ 改为直接构造 `Job`。断言的仍是
+    /// 同一件事：once 到点即 due、错过后仍补跑。
     #[test]
     fn once_is_due() {
-        let j = job_from_parsed(
-            "once",
-            Some("2026-08-05 09:00"),
-            None,
-            "看邮件",
-            "oc_x",
-            "原句",
-            Vec::new(),
-            crate::config::SenderRole::Owner,
-        )
-        .unwrap();
+        let j = Job {
+            id: "a".into(),
+            kind: JobKind::Once,
+            schedule: "2026-08-05 09:00".into(),
+            prompt: "看邮件".into(),
+            chat_id: "oc_x".into(),
+            note: "原句".into(),
+            targets: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+        };
         assert!(!j.is_due(&dt(2026, 8, 5, 8, 59)));
         assert!(j.is_due(&dt(2026, 8, 5, 9, 0)));
         assert!(j.is_due(&dt(2026, 8, 5, 9, 1)));
-    }
-
-    #[test]
-    fn job_from_parsed_validates() {
-        assert!(job_from_parsed(
-            "cron",
-            None,
-            Some("0 9 * * *"),
-            "提醒",
-            "oc",
-            "n",
-            Vec::new(),
-            crate::config::SenderRole::Granted,
-        )
-        .is_ok());
-        assert!(job_from_parsed(
-            "cron",
-            None,
-            Some("bad"),
-            "提醒",
-            "oc",
-            "n",
-            Vec::new(),
-            crate::config::SenderRole::Owner
-        )
-        .is_err());
-        assert!(job_from_parsed(
-            "once",
-            None,
-            None,
-            "提醒",
-            "oc",
-            "n",
-            Vec::new(),
-            crate::config::SenderRole::Owner
-        )
-        .is_err()); // 缺 time
-        assert!(job_from_parsed(
-            "x",
-            None,
-            None,
-            "提醒",
-            "oc",
-            "n",
-            Vec::new(),
-            crate::config::SenderRole::Owner
-        )
-        .is_err());
-        assert!(job_from_parsed(
-            "cron",
-            None,
-            Some("0 9 * * *"),
-            "",
-            "oc",
-            "n",
-            Vec::new(),
-            crate::config::SenderRole::Owner
-        )
-        .is_err());
-        // 空 prompt
-    }
-
-    #[test]
-    fn parse_job_target_forms() {
-        let t = parse_job_target("feishu:oc_123").unwrap();
-        assert_eq!(t.bot_key, "feishu");
-        assert_eq!(t.chat_id, "oc_123");
-        let t2 = parse_job_target("oc_456").unwrap();
-        assert_eq!(t2.bot_key, "");
-        assert_eq!(t2.chat_id, "oc_456");
-        assert!(parse_job_target("").is_err());
-        assert!(parse_job_target("bot:").is_err());
-        assert!(parse_job_target(":oc").is_ok()); // bot 可空
     }
 
     #[test]

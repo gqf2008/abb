@@ -576,6 +576,7 @@ mod tests {
             schema_version: crate::task_store::TASK_SCHEMA_VERSION,
             id: id.to_string(),
             name: String::new(),
+            legacy_job_id: String::new(),
             bot_key: "b".to_string(),
             created_by: Default::default(),
             payload: TaskPayload {

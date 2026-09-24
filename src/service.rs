@@ -910,8 +910,24 @@ async fn run_bot(
         });
     }
 
+    // P5（#326）：job → task 一次性幂等迁移。**必须在启动旧 job 调度循环之前**跑：
+    // 迁移完成（或先前已完成）⇒ 旧循环不启动，由 task worker 独占执行（防双跑）；
+    // 迁移没能完成 ⇒ jobs.json 未动、旧循环照旧（任何时刻同一 job 只有一条执行路径）。
+    // 实现与不变量见 `src/task_migrate.rs`，设计见 `docs/task-model.md` §D7。
+    let migrate = crate::task_migrate::migrate_bot_if_needed(&key);
+    match &migrate.outcome {
+        crate::task_migrate::MigrateOutcome::Done => crate::log!(
+            "[bot:{key}] job→task 迁移完成（本次导入 {} 条 / 跳过 {} 条 / 标记{}）；旧 job 调度循环不启动",
+            migrate.imported,
+            migrate.skipped,
+            if migrate.marker_written { "已就位" } else { "待补写" }
+        ),
+        crate::task_migrate::MigrateOutcome::LegacyKept(reason) => crate::log!(
+            "[bot:{key}] ⚠️ job→task 迁移未完成：{reason}；jobs.json 未改动，旧 job 调度循环照旧启动"
+        ),
+    }
     // 定时任务调度循环（独立于事件循环，共享关停令牌）。#69：长驻，登记 spawn_forever。
-    {
+    if migrate.legacy_job_loop_allowed() {
         let bridge = bridge.clone();
         let key = key.clone();
         let stop = stop.clone();
@@ -965,6 +981,8 @@ async fn run_bot(
             }
             crate::log!("[bot:{key}] 调度循环退出");
         });
+    } else {
+        crate::log!("[bot:{key}] 旧 job 调度循环未启动（job→task 迁移已接管执行）");
     }
 
     // 每日工作目录整理循环（per-bot 开关 tidy_enabled，默认关）：24h 门 + 配置热读。

@@ -39,6 +39,7 @@ mod sessions;
 mod single_instance;
 mod svc_tasks;
 mod task_identity;
+mod task_migrate;
 mod task_proc;
 mod task_run;
 mod task_store;
@@ -610,173 +611,120 @@ fn diag_tray_image() {
     }
 }
 
-/// 定时任务 CLI（供 claude 用 Bash 调用，也可人用）。退出码 0=成功 1=失败。
-/// bot 解析：AGENT_BRIDGE_BOT_KEY env（桥 spawn claude 时注入）→ 唯一 bot → 报错。
-/// chat_id 解析：AGENT_BRIDGE_CHAT_ID env → 该 bot 主会话。
+/// `job` CLI —— **P5 起是 `task` 的兼容别名**（#326，设计见 `docs/task-model.md` §D7）。
+///
+/// 旧参数语法（`job add --once/--cron … --prompt … [--note …] [--to …]`、`job list`、
+/// `job del <id前缀>`）保持不变，实现**全部转发到 task CLI**：迁移后 `job` 只写 task
+/// store（`tasks/<bot>/tasks.json`），`jobs.json` 降级为只读迁移源。别名至少保留一个
+/// 大版本（skill `schedule` 与用户脚本依赖它），删除要等下一个大版本。
+/// 退出码 0=成功 1=失败（与旧实现一致）。
 fn run_job_cli(args: &[String]) -> i32 {
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
-    // 确定目标 bot
-    let bot_key = match resolve_bot_key() {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("{e}");
-            return 1;
+    match job_cli_to_task_args(args) {
+        Ok(task_args) => run_task_cli(&task_args),
+        Err(msg) => {
+            eprintln!("{msg}");
+            1
         }
-    };
-    let store = schedule::JobStore::new(&bot_key);
+    }
+}
+
+/// `job` 的用法行（错误提示用；真正执行见 task CLI）。
+const JOB_CLI_USAGE: &str = "用法（job 是 task 的兼容别名，语义等价）：\n  agent-bridge job list\n  agent-bridge job del <id前缀>\n  agent-bridge job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"做什么\" [--note \"原句\"] [--to bot_key:chat_id]";
+
+/// 把旧 `job` 参数**纯翻译**成 task 子命令行（不触盘、不查 config——便于单测锁死语法）。
+///
+/// 逐条对应：
+/// - `job list` → `task list`；`job del <前缀>` → `task rm <前缀>`（task 侧 rm/del 同义）。
+/// - `job add …`：`--once`/`--cron`/`--prompt` 原样透传；`--note` → `--name`（旧「原句」
+///   在 task 模型里就是展示名）；`--to bot:chat` 透传（语法同构）。
+/// - **已知收紧（不静默丢语义）**：旧 job 的 `--to` 可重复（多目标），task 模型只支持
+///   单目标 → 第二次 `--to` 直接报错；多目标任务请在 job 侧拆分，或改用 `task add`。
+fn job_cli_to_task_args(args: &[String]) -> Result<Vec<String>, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
     match sub {
-        "list" => {
-            let jobs = store.list();
-            if jobs.is_empty() {
-                println!("（还没有定时任务）");
-            } else {
-                for j in &jobs {
-                    println!("{}", j.describe());
-                }
-            }
-            0
-        }
-        "del" => {
+        "list" => Ok(vec!["list".to_string()]),
+        "del" | "rm" => {
             let prefix = args.get(1).map(|s| s.trim()).unwrap_or("");
             if prefix.is_empty() {
-                eprintln!("用法：agent-bridge job del <id前缀>（用 job list 查看 id）");
-                return 1;
+                return Err(
+                    "用法：agent-bridge job del <id前缀>（用 job list 查看 id）".to_string()
+                );
             }
-            let jobs = store.list();
-            let hit: Vec<_> = jobs.iter().filter(|j| j.id.starts_with(prefix)).collect();
-            match hit.len() {
-                0 => {
-                    eprintln!("没找到 id 以「{prefix}」开头的任务");
-                    1
-                }
-                1 => {
-                    let desc = hit[0].describe();
-                    store.remove(&hit[0].id);
-                    println!("已删除：{desc}");
-                    0
-                }
-                n => {
-                    eprintln!("「{prefix}」匹配到 {n} 个任务，请给更长的 id 前缀");
-                    1
-                }
-            }
+            Ok(vec!["rm".to_string(), prefix.to_string()])
         }
         "add" => {
+            let mut out = vec!["add".to_string()];
             let mut once: Option<String> = None;
             let mut cron: Option<String> = None;
             let mut prompt: Option<String> = None;
-            let mut note: Option<String> = None;
-            let mut targets: Vec<schedule::JobTarget> = Vec::new();
+            let mut has_to = false;
             let mut i = 1;
             while i < args.len() {
                 let flag = args[i].as_str();
                 let val = args.get(i + 1).map(|s| s.as_str());
                 match flag {
-                    "--once" => {
-                        once = val.map(|s| s.to_string());
-                        i += 2;
-                    }
-                    "--cron" => {
-                        cron = val.map(|s| s.to_string());
-                        i += 2;
-                    }
-                    "--prompt" => {
-                        prompt = val.map(|s| s.to_string());
-                        i += 2;
-                    }
-                    "--note" => {
-                        note = val.map(|s| s.to_string());
-                        i += 2;
-                    }
-                    // 多投递目标（#21）：可重复，`bot_key:chat_id` 跨 bot，裸 `chat_id` 本 bot
-                    "--to" => {
-                        let raw = match val {
-                            Some(v) => v.to_string(),
-                            None => {
-                                eprintln!("--to 缺少值（格式：bot_key:chat_id 或 chat_id）");
-                                return 1;
-                            }
+                    "--once" | "--cron" | "--prompt" | "--note" | "--to" => {
+                        let Some(v) = val else {
+                            return Err(format!("{flag} 缺少值"));
                         };
-                        match schedule::parse_job_target(&raw) {
-                            Ok(t) => {
-                                if crate::buzz::keys::looks_like_channel_uuid(t.chat_id.trim()) {
-                                    eprintln!(
-                                        "--to 的 chat_id「{}」形如 buzz 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
-                                        t.chat_id.trim()
-                                    );
-                                    return 1;
+                        match flag {
+                            "--once" => {
+                                if once.is_some() {
+                                    return Err("--once 只能给一次".to_string());
                                 }
-                                targets.push(t);
+                                once = Some(v.to_string());
+                                out.push("--once".to_string());
+                                out.push(v.to_string());
                             }
-                            Err(e) => {
-                                eprintln!("{e:#}");
-                                return 1;
+                            "--cron" => {
+                                if cron.is_some() {
+                                    return Err("--cron 只能给一次".to_string());
+                                }
+                                cron = Some(v.to_string());
+                                out.push("--cron".to_string());
+                                out.push(v.to_string());
                             }
+                            "--prompt" => {
+                                prompt = Some(v.to_string());
+                                out.push("--prompt".to_string());
+                                out.push(v.to_string());
+                            }
+                            "--note" => {
+                                out.push("--name".to_string());
+                                out.push(v.to_string());
+                            }
+                            "--to" => {
+                                if has_to {
+                                    return Err(
+                                        "job 的 --to 只支持一个目标（task 模型单目标；旧 job 的多目标不会自动展开，也不静默丢目标）"
+                                            .to_string(),
+                                    );
+                                }
+                                has_to = true;
+                                out.push("--to".to_string());
+                                out.push(v.to_string());
+                            }
+                            _ => unreachable!(),
                         }
-                        i += 2;
                     }
-                    other => {
-                        eprintln!("未知参数：{other}");
-                        return 1;
-                    }
+                    other => return Err(format!("job add 不认识的参数：{other}")),
                 }
+                i += 2;
             }
-            let prompt = match prompt {
-                Some(p) if !p.trim().is_empty() => p,
-                _ => {
-                    eprintln!("缺 --prompt（到点要做什么）");
-                    return 1;
-                }
-            };
-            let (kind, time_arg, cron_arg) = match (once, cron) {
-                (Some(t), None) => ("once", Some(t), None),
-                (None, Some(c)) => ("cron", None, Some(c)),
-                _ => {
-                    eprintln!("--once 和 --cron 必须二选一（且只给一个）");
-                    return 1;
-                }
-            };
-            // chat_id：优先 env（桥注入），否则回落该 bot 主会话。桥注入值若形如 buzz
-            // 频道 UUID（非平台 receive_id），同样回落主会话并 loud 提示——否则任务
-            // 「跑完也发不出」（见 resolve_injected_chat）。
-            let chat_id = resolve_injected_chat(&bot_key);
-            if chat_id.is_empty() {
-                eprintln!("无法确定 chat_id：AGENT_BRIDGE_CHAT_ID 为空且主会话未建立（先在飞书私聊 bot 发一句话）");
-                return 1;
+            if prompt
+                .as_deref()
+                .map(|p| p.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err("缺 --prompt（到点要做什么）".to_string());
             }
-            let note = note.unwrap_or_else(|| prompt.clone());
-            // 创建者角色：agent 会话 spawn 时注入 env（桥 → claude/codex → $ABB_BIN）。
-            // 授权者建的任务落 granted，执行时走受限分支——否则可借 owner 全权限跑
-            // 「读敏感文件」任务绕过隔离。手动跑 CLI 无 env → Owner（与现状一致）。
-            let role = config::SenderRole::from_env();
-            match schedule::job_from_parsed(
-                kind,
-                time_arg.as_deref(),
-                cron_arg.as_deref(),
-                &prompt,
-                &chat_id,
-                &note,
-                targets,
-                role,
-            ) {
-                Ok(job) => {
-                    let desc = job.describe();
-                    store.add(job);
-                    println!("⏰ 定时任务已创建：{desc}");
-                    0
-                }
-                Err(e) => {
-                    eprintln!("没建成定时任务：{e:#}");
-                    1
-                }
+            match (&once, &cron) {
+                (Some(_), None) | (None, Some(_)) => {}
+                _ => return Err("--once 和 --cron 必须二选一（且只给一个）".to_string()),
             }
+            Ok(out)
         }
-        _ => {
-            eprintln!(
-                "用法：\n  agent-bridge job list\n  agent-bridge job del <id前缀>\n  agent-bridge job add (--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\") --prompt \"做什么\" [--note \"原句\"] [--to bot_key:chat_id]…（--to 可重复，跨 bot 多目标）"
-            );
-            1
-        }
+        _ => Err(JOB_CLI_USAGE.to_string()),
     }
 }
 
@@ -1465,6 +1413,7 @@ fn run_task_cli(args: &[String]) -> i32 {
                 schema_version: task_store::TASK_SCHEMA_VERSION,
                 id: task_store::new_id(chrono_lite::unix_secs()),
                 name,
+                legacy_job_id: String::new(),
                 bot_key: bot_key.clone(),
                 created_by: task_store::CreatedBy {
                     role: config::SenderRole::from_env(),
@@ -2327,8 +2276,8 @@ fn trash_bot_key_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_trigger, parse_task_to, read_task_logs, session_reset_chat_id, take_proc_cmd,
-        TASK_ADD_USAGE,
+        describe_trigger, job_cli_to_task_args, parse_task_to, read_task_logs,
+        session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
     };
 
     /// #312 审查：`task --help` / `-h` / `help` 必须**真**走帮助臂——落到 `other` 会先
@@ -2529,5 +2478,92 @@ mod tests {
     #[test]
     fn session_reset_chat_requires_target() {
         assert!(session_reset_chat_id(&[], "").is_err());
+    }
+
+    fn jargs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// P5：`job` 三件套（list/del/add）的**纯翻译**。这里锁的是「旧参数语法不变、
+    /// 转发目标正确」；真正落盘由 task CLI 负责（其单测另行覆盖）。
+    #[test]
+    fn job_cli_list_and_del_forward_to_task() {
+        assert_eq!(
+            job_cli_to_task_args(&jargs(&["list"])).unwrap(),
+            jargs(&["list"])
+        );
+        assert_eq!(
+            job_cli_to_task_args(&jargs(&["del", "tk_1"])).unwrap(),
+            jargs(&["rm", "tk_1"])
+        );
+        assert!(
+            job_cli_to_task_args(&jargs(&["del"])).is_err(),
+            "缺 id 前缀要报错"
+        );
+    }
+
+    #[test]
+    fn job_cli_add_keeps_legacy_syntax_and_maps_note_to_name() {
+        assert_eq!(
+            job_cli_to_task_args(&jargs(&[
+                "add",
+                "--once",
+                "2030-01-02 09:00",
+                "--prompt",
+                "提醒我",
+                "--note",
+                "原句",
+                "--to",
+                "feishu:oc_x",
+            ]))
+            .unwrap(),
+            jargs(&[
+                "add",
+                "--once",
+                "2030-01-02 09:00",
+                "--prompt",
+                "提醒我",
+                "--name",
+                "原句",
+                "--to",
+                "feishu:oc_x",
+            ])
+        );
+        // cron 形态 + 省略 --note/--to 也照转
+        assert_eq!(
+            job_cli_to_task_args(&jargs(&["add", "--cron", "0 9 * * *", "--prompt", "p"])).unwrap(),
+            jargs(&["add", "--cron", "0 9 * * *", "--prompt", "p"])
+        );
+    }
+
+    #[test]
+    fn job_cli_add_refuses_bad_forms_without_silent_loss() {
+        // 缺 prompt / once+cron 同给 / 未知参数 / 未知子命令
+        assert!(job_cli_to_task_args(&jargs(&["add", "--once", "2030-01-02 09:00"])).is_err());
+        assert!(job_cli_to_task_args(&jargs(&[
+            "add",
+            "--once",
+            "2030-01-02 09:00",
+            "--cron",
+            "0 9 * * *",
+            "--prompt",
+            "p",
+        ]))
+        .is_err());
+        assert!(job_cli_to_task_args(&jargs(&["add", "--nope", "x", "--prompt", "p"])).is_err());
+        assert!(job_cli_to_task_args(&jargs(&["frobnicate"])).is_err());
+        // 多目标：旧 job 允许多个 --to，task 单目标 → 第二个直接报错（不静默丢目标）
+        assert!(job_cli_to_task_args(&jargs(&[
+            "add",
+            "--cron",
+            "0 9 * * *",
+            "--prompt",
+            "p",
+            "--to",
+            "a:oc1",
+            "--to",
+            "b:oc2",
+        ]))
+        .is_err());
     }
 }
