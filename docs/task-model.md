@@ -369,6 +369,22 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | `interval` | 首次即跑，之后每 N 秒 | `expr` 支持 `30`/`30s`/`5m`/`2h`/`1d`，**下限 5 秒**（比轮询还密只会把模型打成忙循环） |
 | `keepalive` | Pending / backoff 到期且无旧代际身份时认领 | 默认随 service 恢复；`resume_on_boot=false` 会先收掉已确认存活的旧代际后停用；cancel、正常关停均不再拉起；恢复时旧进程身份存活则不 adopt、不重复拉起 |
 
+> **agent 载荷不开放 `keepalive`**（2026-09-24 决议；`src/task_store.rs::validate` 拒绝，
+> `task add --keepalive --prompt …` CLI 非 0 退出）。
+> - **理由**：`keepalive` 的落地件全部以**进程**为载体——代际身份
+>   （`ProcIdentity{pid, start_token, command_line}`）、存活校验（`verify` fail-closed）、
+>   `rapid_exit`（`KEEPALIVE_STABLE_SECS=10s` 内退出即计失败）、backoff/熔断，以及面向进程的
+>   Q5/Q14（恢复、`resume_on_boot`、宽限/信号）。agent 载荷没有代际与存活语义，这三件套在 agent
+>   上全是空壳，只剩「既不结束也不被核验的运行态」。
+> - **替代路径**：立即用 `now`；定时用 `once`；周期用 `cron` / `interval`（**下限 5s**）；
+>   重启后按档位续跑（`cron`/`interval` 时间驱动；残留 `Running` 由 `requeue_orphans` 重跑，
+>   上界 `limits.max_restarts`，默认 1）。想「无固定周期连续跑」只能自拼 `interval 5s`——
+>   **注意 token 成本无上界（每轮都是真模型调用）与每轮一条投递的刷屏**。
+> - **重开条件**：出现真实场景（无固定周期连续跑 / 跨回合保持会话）且能接受成本上界，并先落
+>   四项前置：① per-task 成本预算；② 投递节流/合并；③ 与单 worker（Q7）的让位/优先级；
+>   ④ agent `keepalive` 的身份/恢复/投递裁决（Q5/Q14 现仅定义 proc 语义）。见 #326 剩余项
+>   「agent 任务的 keepalive/interval 触发档（Q5/Q14）」。
+
 记账字段：`TaskRuntime.last_fired_at`（**认领时刻**，serde default 向后兼容）；与 `Running`
 状态共同保证同一任务不会并发跑两轮。重复档（cron/interval）跑完一轮回到可认领状态；
 `Cancelled` 是用户终态，要再跑得重新登记。
