@@ -11,9 +11,9 @@
 //! 输出——放进工作区就等于任何受限会话 `cat` 一下全拿到，「只限 owner 管理」形同虚设。
 //! 所以这两份文件必须在 agent 读域**之外**，只经受权的 `$ABB_BIN task …` 暴露过滤视图。
 //!
-//! ## 术语（与 `src/tasks.rs` 区分）
+//! ## 术语（与 `src/svc_tasks.rs` 区分）
 //!
-//! `src/tasks.rs` 是 service 内部的 async 任务治理（`TaskGovernance`），与用户可见的
+//! `src/svc_tasks.rs` 是 service 内部的 async 任务治理（`TaskGovernance`），与用户可见的
 //! 「任务」无关；本模块是后者。内部模块改名（`tasks.rs` → `svc_tasks.rs`）见 #326。
 
 use anyhow::{bail, Context, Result};

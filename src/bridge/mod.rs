@@ -1464,7 +1464,7 @@ mod tests {
                     backend: "mock".to_string(),
                     session_sandbox: session_sandbox.clone(),
                 },
-                crate::tasks::shutdown_token(),
+                crate::svc_tasks::shutdown_token(),
                 std::env::current_dir()
                     .unwrap_or_default()
                     .display()
@@ -1484,7 +1484,7 @@ mod tests {
         {
             let probe = buzz.clone();
             let rf = record_file.clone();
-            crate::tasks::tasks().spawn("acp-test-probe", async move {
+            crate::svc_tasks::tasks().spawn("acp-test-probe", async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 let line = format!(
                     "{{\"probe\": {{\"dead\": {}}}}}\n",
@@ -1496,13 +1496,13 @@ mod tests {
         // 主循环 + 回合消费（生产 service 同款）：没有它们 Cmd::Message 无人消费，
         // queue 永不 dispatch、prompt 永不到 mock agent。
         let run_handle = buzz.clone();
-        crate::tasks::tasks().spawn("acp-test-run", async move {
+        crate::svc_tasks::tasks().spawn("acp-test-run", async move {
             crate::buzz::harness::run_loop(run_handle).await;
         });
         let turn_handle = buzz.clone();
         let registry = registry.clone();
-        crate::tasks::tasks().spawn("acp-test-turns", async move {
-            let stop = crate::tasks::shutdown_token();
+        crate::svc_tasks::tasks().spawn("acp-test-turns", async move {
+            let stop = crate::svc_tasks::shutdown_token();
             let Some(mut turn_rx) = turn_handle.take_turn_rx() else {
                 return;
             };

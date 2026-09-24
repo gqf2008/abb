@@ -1118,7 +1118,7 @@ async fn run_conn(
                                     if let Some(msg) = parse_message(&frame) {
                                         let b = bridge.clone();
                                         // #69 审计：短/中命、有 owner（bridge chat_lock +
-                                        // pending.json 恢复），不登记（见 tasks.rs 登记口径）——
+                                        // pending.json 恢复），不登记（见 svc_tasks.rs 登记口径）——
                                         // 关停后由进程退出兜底，agent 子进程下次启动清理。
                                         tokio::spawn(async move { b.on_dingtalk(msg).await; });
                                     }
