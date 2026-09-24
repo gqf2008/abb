@@ -400,8 +400,10 @@ fn read_string(h: Hkey, name: &str) -> Result<Option<String>, u32> {
     match ty {
         REG_SZ | REG_EXPAND_SZ => {
             let units: Vec<u16> = buf
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             let s = String::from_utf16_lossy(&units);
             Ok(Some(s.trim_end_matches('\0').to_string()))
