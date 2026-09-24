@@ -323,6 +323,21 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 迁移测试要覆盖旧 skill 的 `add / list / del` 三件套在**迁移后仍可用**。
 
+#### D7 落地（P5，2026-09-24，#326 —— 四问逐条作答）
+
+| D7 问题 | 落地口径 |
+|---|---|
+| 兼容期 `job add/del` 写哪个文件 | **只写 task store**（`tasks/<bot>/tasks.json`）：`job` CLI 已是 `task` 的纯转发别名（`src/main.rs job_cli_to_task_args`），参数语法不变。`jobs.json` 降级为**只读迁移源**，其写入口已随本批删除 |
+| service 如何双读 / 谁是单写者 | **不双读**：启动时一次性迁移（`src/task_migrate.rs`）后由 task worker 独占执行；定义单写者 = CLI（原子落盘），运行态单写者 = task worker（Q12 既有约束） |
+| 定义与运行态是否分离 | 沿用 P2a：`tasks.json`（定义）× `tasks-state.json`（运行态）×`task-logs/`。迁移只转定义，运行态以 `Pending` 起步 |
+| 迁移原子性与回滚 | 迁移前把 `jobs.json` 复制为 `jobs.json.migrated.bak`（**永不删除源文件**）；任一 job 无法无损转换即**整体放弃**（不写半截）；task store 用单次原子落盘；失败 → 源文件不动、旧循环照旧 |
+
+**防双跑（执行路径唯一）**：迁移完成后写标记 `jobs.json.migrated`；标记存在 ⇒ service **不启动**旧 job 调度循环（`src/service.rs run_bot`）。标记缺失但数据已在 store（崩溃窗口）仍判「已迁移」——靠 task 的 `legacy_job_id` 去重键，重复启动既不双跑也不重复导入。任何时刻同一 job 只有一条执行路径。
+
+**别名保留**：`job add --once/--cron … --prompt … [--note …] [--to …]`、`job list`、`job del <前缀>` 全量转发到 `task` CLI，**至少保留一个大版本**（skill `schedule` 与用户脚本依赖它），删除要等下一个大版本。
+
+**已知收紧/限制（不静默丢语义）**：① 旧 job 的 `--to` 可重复（多目标），task 模型只支持单目标 → 第二次 `--to`/多目标 job 直接报错，迁移整体放弃（不降级成「只投第一个」）；② `job del` 现转发到 `task rm`，运行中的任务要先 `task cancel`；③ 一次性时间点按 task 的严格日历校验（旧 `parse_once` 宽松，如 `02-30` 会被拒）。
+
 ### 2.4 分阶段落地
 
 > 落地追踪：**#326**（批次 issue，含 checklist 与逐阶段验收）。
@@ -336,7 +351,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 | **P2b** | task channel + 执行容量方案 + cancel/GC/workspace 接入 | D1a/b/c、Q7 | **高**（动共享执行层） | ✅ A/B/C/D 已完成；B2 keepalive 已实现默认恢复、`resume_on_boot` opt-out、代际身份与 backoff/熔断 |
 | **P3** | `proc` supervisor（含 Windows Job Object、基础日志/退出记录） | D3 Step 0、D5 | 中高 | 🔶 **进行中（B1 proc supervisor 已开工，`abb-p3-b1-proc-supervisor-20260918`）** |
 | **P4** | 日志轮转 / 熔断告警 / 更完整可观测 | D6 | 低 | 待开工 |
-| **P5** | `job` → `task` 迁移（别名保留） | D7 | 中（兼容面广） | 待开工 |
+| **P5** | `job` → `task` 迁移（别名保留） | D7 | 中（兼容面广） | ✅ 已完成（`src/task_migrate.rs` + 别名转发 + 防双跑/幂等/原子性测试，#326） |
 
 > 顺序建议：**P1a 已完成**（#310）；此后按 **#326** 的 checklist 推进——**P3 的 TCC Step 0 先行**（一条命令 + 一次真机验证，决定 P3 是否继续），P1b/P2a 可视情况并行。P2/P3 **共用** task store / CLI / 投递 / 状态层，但**不共用执行引擎**（agent 走 ACP/pool，proc 走 supervisor）。
 >
@@ -438,7 +453,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | 定时任务执行 | `src/service.rs:1285 run_job`（channel 见 `:1341`） |
 | ~~cancel 标志（失效）~~ 已由 #309 删除 | 复盘时 `src/service.rs:1316-1321`；真实取消 `src/bridge/virtualbot.rs:1180` |
 | 停止词处理 | `src/bridge/virtualbot.rs:358` |
-| `job` CLI | `src/main.rs:345`（分发）、`:549`（`run_job_cli`） |
+| `job` CLI | `src/main.rs` 的 `run_job_cli`（P5 起转发 `run_task_cli`）；迁移见 `src/task_migrate.rs` |
 | 投递目标 / 自环判据 / 防伪造 | `src/deliver.rs:231`、`:252`、`:531`、`:542` |
 | `$ABB_BIN` 白名单（两份） | `src/guard.rs:618`、`crates/buzz-agent/src/shell_policy.rs:126` |
 | 桥状态文件写保护 | `src/guard.rs:359` |

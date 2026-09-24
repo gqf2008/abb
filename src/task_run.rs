@@ -1257,6 +1257,7 @@ mod tests {
             schema_version: crate::task_store::TASK_SCHEMA_VERSION,
             id: id.to_string(),
             name: "t".to_string(),
+            legacy_job_id: String::new(),
             bot_key: bot.to_string(),
             created_by: CreatedBy {
                 role: crate::config::SenderRole::Owner,

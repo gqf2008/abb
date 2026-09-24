@@ -509,6 +509,13 @@ pub struct Task {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    /// 若本任务由旧 `jobs.json` 的 job 一次性迁移而来，这里是原 `Job::id`（P5）。
+    ///
+    /// **只读溯源 + 迁移幂等键**：迁移重跑靠它去重（已在 store 里的 job 不再导入），
+    /// 所以「数据写完但标记没写」时重复启动也不会产生第二份；正常登记的任务为空。
+    /// serde default 兼容既有 `tasks.json`。
+    #[serde(default)]
+    pub legacy_job_id: String,
     /// 归属 bot（权限面：不允许跨 bot 建任务）。
     pub bot_key: String,
     pub created_by: CreatedBy,
@@ -986,6 +993,39 @@ impl TaskStore {
         save_json(&self.paths.definitions(), &*d)
     }
 
+    /// 批量登记（P5 迁移用）：**先整体校验/查重，再一次性原子落盘**。
+    ///
+    /// 任一条不合法、归属不符、id 重复（与已有定义或批内）→ 整体拒绝、**不落盘**
+    /// ——迁移的「失败不留半截」就靠这里：单次 `save_json` 即全有或全无。
+    pub fn add_many(&self, tasks: Vec<Task>) -> Result<()> {
+        for t in &tasks {
+            t.validate()?;
+            if t.bot_key != self.bot_key {
+                bail!(
+                    "任务归属（{}）与所在 bot 目录（{}）不一致——不接受跨 bot 的任务定义",
+                    t.bot_key,
+                    self.bot_key
+                );
+            }
+        }
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        self.refresh();
+        let mut d = self.data.lock().unwrap();
+        let mut batch_ids = std::collections::HashSet::new();
+        for t in &tasks {
+            if d.iter().any(|e| e.id == t.id) {
+                bail!("任务 id 已存在：{}", t.id);
+            }
+            if !batch_ids.insert(t.id.as_str()) {
+                bail!("批内任务 id 重复：{}", t.id);
+            }
+        }
+        d.extend(tasks);
+        save_json(&self.paths.definitions(), &*d)
+    }
+
     /// 删除一条定义（不动运行态——由调用方决定是否一并清）。返回是否删到了。
     pub fn remove(&self, id: &str) -> bool {
         self.refresh();
@@ -1133,6 +1173,7 @@ mod tests {
             schema_version: TASK_SCHEMA_VERSION,
             id: "tk_test_000001".to_string(),
             name: "试跑".to_string(),
+            legacy_job_id: String::new(),
             bot_key: bot.to_string(),
             created_by: CreatedBy {
                 role: crate::config::SenderRole::Owner,
@@ -1942,6 +1983,53 @@ mod tests {
             read_task_logs(&paths, "tk", true).unwrap_err().to_string(),
             expected
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// P5：旧 `tasks.json`（无 `legacy_job_id`）必须照常加载——新字段是 serde default；
+    /// 有值时往返不丢（迁移的幂等去重键就靠它）。
+    #[test]
+    fn legacy_job_id_is_serde_default_and_roundtrips() {
+        let old = r#"{"id":"tk_1","name":"n","bot_key":"b","created_by":{},"payload":{"kind":"agent","prompt":"p"},"trigger":{"kind":"now"}}"#;
+        let t: Task = serde_json::from_str(old).unwrap();
+        assert!(t.legacy_job_id.is_empty(), "旧文件无该字段 → 默认空");
+
+        let mut migrated = t.clone();
+        migrated.legacy_job_id = "job-9".to_string();
+        let back: Task = serde_json::from_str(&serde_json::to_string(&migrated).unwrap()).unwrap();
+        assert_eq!(back.legacy_job_id, "job-9");
+    }
+
+    /// P5：`add_many` 是**全有或全无**——批内任一条不合法/重复即整体拒绝，不留半截。
+    #[test]
+    fn add_many_is_all_or_nothing() {
+        let root = std::env::temp_dir().join(format!("abb-add-many-{}", uuid::Uuid::new_v4()));
+        let store = TaskStore::new_at(&root, "b");
+
+        let mut a = agent_task("b");
+        a.id = "tk_a".to_string();
+        let mut b = agent_task("b");
+        b.id = "tk_b".to_string();
+        store.add_many(vec![a.clone(), b.clone()]).unwrap();
+        assert_eq!(store.list().len(), 2);
+
+        // 批内重复 id → 整体拒绝，store 不变
+        let mut dup = agent_task("b");
+        dup.id = "tk_b".to_string();
+        let mut c = agent_task("b");
+        c.id = "tk_c".to_string();
+        assert!(store.add_many(vec![dup, c]).is_err());
+        assert_eq!(store.list().len(), 2, "拒绝时不得落盘半截");
+
+        // 批内一条非法（空 prompt 的 agent 任务）→ 整体拒绝
+        let mut bad = agent_task("b");
+        bad.id = "tk_bad".to_string();
+        bad.payload.prompt = "  ".to_string();
+        let mut d = agent_task("b");
+        d.id = "tk_d".to_string();
+        assert!(store.add_many(vec![d, bad]).is_err());
+        assert_eq!(store.list().len(), 2);
 
         let _ = fs::remove_dir_all(&root);
     }
