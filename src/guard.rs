@@ -401,6 +401,12 @@ fn check_file_paths(tool: &str, input: &serde_json::Value, workspace: &Path) -> 
 /// 桥状态/指令文件判定（文件名 + 路径组件，大小写不敏感——macOS 文件系统不区分大小写）：
 /// - 文件名命中清单：jobs.json / pending.json / sessions.json / CLAUDE.md / AGENTS.md /
 ///   .mcp.json（`sub/../jobs.json` 式穿越由 file_name 取最终文件名天然覆盖）
+/// - 迁移标记族按**前缀** `jobs.json.migrated` 拦截（覆盖 `jobs.json.migrated` 与
+///   `jobs.json.migrated.bak`）：标记是「已迁移、旧 job 循环不启动」的执行时信任凭据，
+///   落在 agent 自己的工作区，受限会话 Write 一个出来就能让该 bot 旧 job 静默搁浅
+///   （#326 F1）。选前缀而非两个精确名的理由：① 一次性覆盖当前两个名字 + 未来派生的
+///   同族名（尾随点/空格变体已在上面归一后落入本判定）；② 误伤面仅限「本就是桥状态
+///   保留名」的命名族，agent 无正当写需求；③ 与 jobs.json 一样只禁写不禁读
 /// - 文件名后缀 `.agents.md` / `.claude.md`：会话级 AGENTS.md（`<escaped>.AGENTS.md`）会被
 ///   注入每个会话 prompt（含 owner 全权限会话）——granted 能写 = 持久化提权，与裸
 ///   AGENTS.md 同列；顺带覆盖任何 `x.agents.md` 形态（安全优先，改名即可）
@@ -429,7 +435,8 @@ fn is_bridge_state_path(p: &str) -> bool {
                 | "claude.md"
                 | "agents.md"
                 | ".mcp.json"
-        ) || name.ends_with(".agents.md")
+        ) || name.starts_with("jobs.json.migrated")
+            || name.ends_with(".agents.md")
             || name.ends_with(".claude.md")
         {
             return true;
@@ -1734,6 +1741,54 @@ mod tests {
             check_file_paths("Write", &serde_json::json!({"file_path": "a.txt"}), &ws),
             Decision::Allow
         );
+        let _ = root;
+    }
+
+    /// #326 F1a：P5 迁移标记族（`jobs.json.migrated` / `.bak`）落在 agent 自己的
+    /// 工作区，是「已迁移 ⇒ 旧 job 循环不启动」的执行时信任凭据；受限会话 Write 一个
+    /// 出来即可让该 bot 旧 job 静默搁浅。故纳入桥状态名单（含尾随点归一变体）。
+    /// 只禁写不禁读；普通 `misc.json` 不受前缀误伤。
+    #[test]
+    fn file_paths_deny_migration_marker_family() {
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        for p in [
+            "jobs.json.migrated",
+            "jobs.json.migrated.bak",
+            "./jobs.json.migrated",
+            // APFS/NTFS 剥离文件名末尾 '.'：落盘即 jobs.json.migrated（/ .bak）
+            "jobs.json.migrated.",
+            "jobs.json.migrated.bak.",
+            "sub/../jobs.json.migrated",
+        ] {
+            assert_ne!(
+                check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p:?} 迁移标记族写应拒绝"
+            );
+            assert_ne!(
+                check_file_paths("Edit", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p:?} 迁移标记族编辑应拒绝"
+            );
+        }
+        // 只禁写不禁读（与 jobs.json 同 doctrine）
+        assert_eq!(
+            check_file_paths(
+                "Read",
+                &serde_json::json!({"file_path": "jobs.json.migrated"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        // 前缀不误伤普通工作区文件
+        for ok in ["misc.json", "jobs.js"] {
+            assert_eq!(
+                check_file_paths("Write", &serde_json::json!({"file_path": ok}), &ws),
+                Decision::Allow,
+                "{ok:?} 应放行"
+            );
+        }
         let _ = root;
     }
 

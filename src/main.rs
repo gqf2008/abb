@@ -1388,24 +1388,13 @@ fn run_task_cli(args: &[String]) -> i32 {
             // 显式 `--to`：`bot_key:chat_id`（bot_key 可省 = 本 bot）。`--to-current`
             // 与缺省同义，都落成「无 targets ⇒ 回创建者会话」，这里只做互斥校验。
             let targets = match to_target {
-                Some(raw) => {
-                    let (tbot, tchat) = parse_task_to(&raw);
-                    if tchat.trim().is_empty() {
-                        eprintln!("--to 的 chat_id 不能为空：{raw}");
+                Some(raw) => match parse_task_to_target(&raw) {
+                    Ok(t) => vec![t],
+                    Err(msg) => {
+                        eprintln!("{msg}");
                         return 1;
                     }
-                    if crate::buzz::keys::looks_like_channel_uuid(tchat.trim()) {
-                        eprintln!(
-                            "--to 的 chat_id「{}」形如 buzz 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
-                            tchat.trim()
-                        );
-                        return 1;
-                    }
-                    vec![task_store::TaskTarget {
-                        bot_key: tbot,
-                        chat_id: tchat,
-                    }]
-                }
+                },
                 None => Vec::new(),
             };
             let targets = if to_current { Vec::new() } else { targets };
@@ -1496,6 +1485,27 @@ fn parse_task_to(raw: &str) -> (String, String) {
         Some((b, c)) => (b.trim().to_string(), c.trim().to_string()),
         None => (String::new(), raw.trim().to_string()),
     }
+}
+
+/// `task add --to` 的值解析 + 两道硬闸（纯函数，CLI 与测试共用一条路径）：
+/// ① chat_id 非空（空目标 = 任务跑完没人看得到）；② chat_id 不形如 buzz 频道 UUID
+/// （频道 UUID 不是任何平台可用的 receive_id，直发会被平台拒，如飞书 230001）。
+/// `bot_key` 缺省 = 本 bot（空串）。返回 `Err(用户可读文案)`，调用方原样打印后 exit 1。
+fn parse_task_to_target(raw: &str) -> Result<task_store::TaskTarget, String> {
+    let (tbot, tchat) = parse_task_to(raw);
+    if tchat.trim().is_empty() {
+        return Err(format!("--to 的 chat_id 不能为空：{raw}"));
+    }
+    if crate::buzz::keys::looks_like_channel_uuid(tchat.trim()) {
+        return Err(format!(
+            "--to 的 chat_id「{}」形如 buzz 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
+            tchat.trim()
+        ));
+    }
+    Ok(task_store::TaskTarget {
+        bot_key: tbot,
+        chat_id: tchat,
+    })
 }
 
 /// 人话描述这条任务的结果去向（登记成功回执用）。
@@ -2276,8 +2286,8 @@ fn trash_bot_key_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_trigger, job_cli_to_task_args, parse_task_to, read_task_logs,
-        session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
+        describe_trigger, job_cli_to_task_args, parse_task_to, parse_task_to_target,
+        read_task_logs, session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
     };
 
     /// #312 审查：`task --help` / `-h` / `help` 必须**真**走帮助臂——落到 `other` 会先
@@ -2406,6 +2416,39 @@ mod tests {
         // chat_id 里再出现冒号不当作分隔（只按第一个切）
         assert_eq!(parse_task_to("b:c:d"), ("b".to_string(), "c:d".to_string()));
         assert_eq!(parse_task_to("b:"), ("b".to_string(), String::new()));
+    }
+
+    /// #326 F4：被删的 `parse_job_target_forms` 覆盖过 `--to ""` / `--to bot:` 的拒绝；
+    /// 等价拒绝分支现落在 `task add`（`parse_task_to_target`）。这里补对照用例，钉死
+    /// 「空 chat_id」「频道 UUID」两条硬闸，并确认正常 receive_id 仍放行。
+    #[test]
+    fn task_to_rejects_empty_chat_and_channel_uuid() {
+        // 空 chat_id（裸 `--to ""` / `--to b:` / `--to :`）→ 拒绝
+        for raw in ["", "b:", ":", "b:   "] {
+            assert!(
+                parse_task_to_target(raw).is_err(),
+                "{raw:?} 空 chat_id 应拒绝"
+            );
+        }
+        // 频道 UUID（裸值 / 带 bot 前缀）→ 拒绝：它不是平台 receive_id
+        let uuid = crate::buzz::keys::channel_uuid(
+            "cli_a8a27ff268b8900e",
+            "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
+        );
+        assert!(crate::buzz::keys::looks_like_channel_uuid(&uuid));
+        for raw in [uuid.clone(), format!("feishu:{uuid}")] {
+            assert!(
+                parse_task_to_target(&raw).is_err(),
+                "{raw:?} 频道 UUID 应拒绝"
+            );
+        }
+        // 正常 receive_id（三个平台形态）→ 放行，段位拆解正确
+        let t = parse_task_to_target("wx_bot:oc_abc").unwrap();
+        assert_eq!(t.bot_key, "wx_bot");
+        assert_eq!(t.chat_id, "oc_abc");
+        let t = parse_task_to_target("cid_something").unwrap();
+        assert_eq!(t.bot_key, "");
+        assert_eq!(t.chat_id, "cid_something");
     }
 
     #[test]
