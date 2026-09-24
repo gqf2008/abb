@@ -327,7 +327,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 | D7 问题 | 落地口径 |
 |---|---|
-| 兼容期 `job add/del` 写哪个文件 | **只写 task store**（`tasks/<bot>/tasks.json`）：`job` CLI 已是 `task` 的纯转发别名（`src/main.rs job_cli_to_task_args`），参数语法不变。`jobs.json` 降级为**只读迁移源**，其写入口已随本批删除 |
+| 兼容期 `job add/del` 写哪个文件 | **只写 task store**（`tasks/<bot>/tasks.json`）：`job` CLI 已是 `task` 的纯转发别名（`src/main.rs job_cli_to_task_args`），参数语法不变。`jobs.json` 降级为**只读迁移源**，其 **CLI 写入口已删**（legacy 循环在 `LegacyKept` 分支仍会经 `JobStore::remove` 写一次 once 清理） |
 | service 如何双读 / 谁是单写者 | **不双读**：启动时一次性迁移（`src/task_migrate.rs`）后由 task worker 独占执行；定义单写者 = CLI（原子落盘），运行态单写者 = task worker（Q12 既有约束） |
 | 定义与运行态是否分离 | 沿用 P2a：`tasks.json`（定义）× `tasks-state.json`（运行态）×`task-logs/`。迁移只转定义，运行态以 `Pending` 起步 |
 | 迁移原子性与回滚 | 迁移前把 `jobs.json` 复制为 `jobs.json.migrated.bak`（**永不删除源文件**）；任一 job 无法无损转换即**整体放弃**（不写半截）；task store 用单次原子落盘；失败 → 源文件不动、旧循环照旧 |
@@ -336,7 +336,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 **别名保留**：`job add --once/--cron … --prompt … [--note …] [--to …]`、`job list`、`job del <前缀>` 全量转发到 `task` CLI，**至少保留一个大版本**（skill `schedule` 与用户脚本依赖它），删除要等下一个大版本。
 
-**已知收紧/限制（不静默丢语义）**：① 旧 job 的 `--to` 可重复（多目标），task 模型只支持单目标 → 第二次 `--to`/多目标 job 直接报错，迁移整体放弃（不降级成「只投第一个」）；② `job del` 现转发到 `task rm`，运行中的任务要先 `task cancel`；③ 一次性时间点按 task 的严格日历校验（旧 `parse_once` 宽松，如 `02-30` 会被拒）。
+**已知收紧/限制（不静默丢语义）**：① 旧 job 的 `--to` 可重复（多目标），task 模型只支持单目标 → 第二次 `--to`/多目标 job 直接报错，迁移整体放弃（不降级成「只投第一个」）；② `job del` 现转发到 `task rm`，运行中的任务要先 `task cancel`；③ 一次性时间点按 task 的严格日历校验（旧 `parse_once` 宽松，如 `02-30` 会被拒）；④ 迁移后的 job 由 task worker 执行，**在跑轮次不再被会话停止词打断**（`task_run` 走 `TASK_PROMPT_TAG` + 取消请求文件，不注册 `cancel_flags`/`job_turn`），要停需 `task cancel <id>`——与 §Q3/§D1c 一致。
 
 ### 2.4 分阶段落地
 

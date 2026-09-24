@@ -77,16 +77,41 @@ pub fn migrate_bot_if_needed(bot_key: &str) -> MigrateReport {
 }
 
 /// **注入缝**（测试用 temp 目录）：`workspace` = `workspaces/<bot>/`，
-/// `tasks_root` = `tasks/` 的根（`TaskPaths::with_root` 同款）。
+/// `tasks_root` = `tasks/` 的根（`TaskPaths::with_root` 同款）。告警落 service stdout。
 pub(crate) fn migrate_with_paths(
     workspace: &Path,
     tasks_root: &Path,
     bot_key: &str,
 ) -> MigrateReport {
+    migrate_with_paths_warned(workspace, tasks_root, bot_key, &mut std::io::stdout())
+}
+
+/// 同上，但注入告警 sink（测试捕获告警文本，验证「伪造标记」路径**不静默**，#326 F1b）。
+pub(crate) fn migrate_with_paths_warned(
+    workspace: &Path,
+    tasks_root: &Path,
+    bot_key: &str,
+    warn: &mut dyn std::io::Write,
+) -> MigrateReport {
     let marker = workspace.join(MIGRATION_MARKER);
     // 已迁移：直接收工（幂等第一道门，也挡住「重复启动重复导入」）。
+    //
+    // **但标记是执行时信任凭据**（存在 ⇒ 旧 job 循环不启动），它落在 agent 自己的工作区，
+    // 受限会话可 Write 出一个空文件/`{}` 把它造出来 ⇒ 该 bot 全部旧 job 静默搁浅
+    // （`Done(imported=0)`、旧循环也不启动，用户只看到「迁移完成 0 条」；#326 F1b）。
+    // 故这里不只看存在性：内容校验不过即**视为未迁移**，继续走导入路径
+    // （导入失败仍 LegacyKept、jobs.json 原样保留），并向 service stdout 发 loud 告警。
     if marker.exists() {
-        return MigrateReport::done(0, 0, true);
+        match validate_marker(&marker) {
+            Ok(()) => return MigrateReport::done(0, 0, true),
+            Err(e) => {
+                crate::log_to!(
+                    warn,
+                    "[migrate:{bot_key}] ⚠️ 迁移标记 {} 内容无效（{e:#}）：视为未迁移，继续走导入路径（jobs.json 原样保留；迁移成功后会重写标记）",
+                    marker.display()
+                );
+            }
+        }
     }
     let src = workspace.join(LEGACY_JOBS_FILE);
     let jobs = match read_legacy_jobs(&src) {
@@ -139,7 +164,8 @@ pub(crate) fn migrate_with_paths(
     let marker_written = match write_marker(&marker, jobs.len(), to_add.len()) {
         Ok(()) => true,
         Err(e) => {
-            crate::log!(
+            crate::log_to!(
+                warn,
                 "[migrate:{bot_key}] ⚠️ 迁移标记写入失败（数据已导入，旧 job 循环仍不启动；下次启动补写）：{e:#}"
             );
             false
@@ -180,6 +206,25 @@ fn write_marker(marker: &Path, jobs: usize, imported: usize) -> Result<()> {
     .to_string();
     crate::atomic_write_text(marker, &body)
         .with_context(|| format!("写迁移标记 {} 失败", marker.display()))
+}
+
+/// 校验一个**已存在**的迁移标记：必须是可解析的 JSON，且带数字型 `migrated_at`
+/// （`write_marker` 的产物形态）。只判「可信」，不判 job 数——数字字段即「本进程写的」。
+///
+/// 任何读失败/解析失败/字段缺失或类型不符都返回 Err，调用方据此把标记**当作不存在**
+/// 处理（走导入路径），从而把「受限会话伪造标记 ⇒ 静默搁浅」降级为「照常迁移 + 告警」。
+fn validate_marker(marker: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(marker)
+        .with_context(|| format!("读迁移标记 {} 失败", marker.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("迁移标记 {} 不是合法 JSON", marker.display()))?;
+    match value.get("migrated_at") {
+        Some(serde_json::Value::Number(n)) if n.as_f64().is_some() => Ok(()),
+        _ => bail!(
+            "迁移标记 {} 缺 `migrated_at` 数字字段（非本进程写入的标记）",
+            marker.display()
+        ),
+    }
 }
 
 /// 一条旧 `job` → `task` 定义（四问里「定义文件与运行态分离」的落点：只转定义，
@@ -391,23 +436,120 @@ mod tests {
         );
     }
 
+    /// 迁移并捕获告警 sink（验证「伪造标记」路径不静默）。返回 (报告, 告警全文)。
+    fn migrate_warned(ws: &Path, root: &Path, bot: &str) -> (MigrateReport, String) {
+        let mut sink: Vec<u8> = Vec::new();
+        let report = migrate_with_paths_warned(ws, root, bot, &mut sink);
+        (report, String::from_utf8_lossy(&sink).into_owned())
+    }
+
+    /// 合法标记（本进程 `write_marker` 的形态）→ 幂等收工：不导入、旧循环不启动、无告警。
     #[test]
-    fn marker_alone_blocks_import_and_legacy_loop() {
+    fn valid_marker_short_circuits_and_blocks_legacy_loop() {
         let ws = tmp("marker-ws");
         let root = tmp("marker-tasks");
         write_jobs(
             &ws,
             &[job("job-a", JobKind::Once, "2030-01-02 09:00", "p", vec![])],
         );
-        std::fs::write(ws.join(MIGRATION_MARKER), "{}").unwrap();
+        std::fs::write(
+            ws.join(MIGRATION_MARKER),
+            serde_json::json!({"migrated_at": 1_790_000_000u64}).to_string(),
+        )
+        .unwrap();
 
-        let report = migrate_with_paths(&ws, &root, "b");
+        let (report, warns) = migrate_warned(&ws, &root, "b");
         assert!(matches!(report.outcome, MigrateOutcome::Done));
         assert_eq!(report.imported, 0);
-        assert!(read_tasks(&root, "b").is_empty(), "标记存在不导入");
+        assert!(read_tasks(&root, "b").is_empty(), "合法标记存在不导入");
         assert!(
             !report.legacy_job_loop_allowed(),
             "防双跑：标记存在旧循环不启动"
+        );
+        assert!(warns.is_empty(), "合法标记不该告警，实测：{warns}");
+    }
+
+    /// #326 F1b：伪造的无效标记（受限会话可 Write）**不得**让旧 job 静默搁浅——
+    /// 必须发 loud 告警并**照常走导入路径**，导入成功后再重写为合法标记。
+    #[test]
+    fn forged_invalid_marker_is_ignored_import_proceeds_with_warning() {
+        for forged in [
+            "{}",                               // 空对象：无 migrated_at
+            "not json at all",                  // 非 JSON
+            r#"{"migrated_at": "1700000000"}"#, // 类型不符（字符串）
+            r#"{"jobs": 2}"#,                   // 缺字段
+        ] {
+            let ws = tmp("forge-ws");
+            let root = tmp("forge-tasks");
+            write_jobs(
+                &ws,
+                &[job("job-a", JobKind::Once, "2030-01-02 09:00", "p", vec![])],
+            );
+            std::fs::write(ws.join(MIGRATION_MARKER), forged).unwrap();
+
+            let (report, warns) = migrate_warned(&ws, &root, "b");
+            assert!(
+                matches!(report.outcome, MigrateOutcome::Done),
+                "伪造标记 {forged:?} 应走导入后 Done"
+            );
+            assert_eq!(
+                report.imported, 1,
+                "伪造标记 {forged:?} 不得静默搁浅：必须照常导入"
+            );
+            assert!(
+                !report.legacy_job_loop_allowed(),
+                "数据已入 store，旧循环不得启动"
+            );
+            assert_eq!(read_tasks(&root, "b").len(), 1);
+            assert!(
+                warns.contains("无效") && warns.contains("视为未迁移"),
+                "伪造标记 {forged:?} 必须发 loud 告警，实测：{warns:?}"
+            );
+            // 收尾把标记重写为可信形态（自愈），后续启动可正常短路。
+            assert!(validate_marker(&ws.join(MIGRATION_MARKER)).is_ok());
+            assert!(
+                migrate_with_paths(&ws, &root, "b").imported == 0,
+                "重写后幂等"
+            );
+        }
+    }
+
+    /// 伪造标记 + 无 jobs.json：仍判未迁移、告警、并补写合法标记（不静默）。
+    #[test]
+    fn forged_marker_without_jobs_file_rewrites_marker_with_warning() {
+        let ws = tmp("forge-empty-ws");
+        let root = tmp("forge-empty-tasks");
+        std::fs::write(ws.join(MIGRATION_MARKER), "{}").unwrap();
+
+        let (report, warns) = migrate_warned(&ws, &root, "b");
+        assert!(matches!(report.outcome, MigrateOutcome::Done));
+        assert!(!report.legacy_job_loop_allowed());
+        assert!(warns.contains("视为未迁移"), "实测：{warns:?}");
+        assert!(
+            validate_marker(&ws.join(MIGRATION_MARKER)).is_ok(),
+            "标记已自愈"
+        );
+    }
+
+    /// 校验函数本身：合法/非法形态直判（与迁移路径解耦的单元锁）。
+    #[test]
+    fn validate_marker_accepts_only_trusted_shape() {
+        let ws = tmp("vm-ws");
+        let m = ws.join(MIGRATION_MARKER);
+        std::fs::write(&m, r#"{"migrated_at": 1}"#).unwrap();
+        assert!(validate_marker(&m).is_ok());
+        for bad in [
+            r#"{}"#,
+            r#"{"migrated_at": "1"}"#,
+            "nope",
+            r#"{"migrated_at": null}"#,
+        ] {
+            std::fs::write(&m, bad).unwrap();
+            assert!(validate_marker(&m).is_err(), "{bad:?} 应判无效");
+        }
+        assert!(
+            validate_marker(&ws.join("absent.marker")).is_err(),
+            "缺失标记判无效"
         );
     }
 
