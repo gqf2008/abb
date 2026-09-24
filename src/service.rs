@@ -363,7 +363,7 @@ pub async fn run() {
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
     if cfg.bots.iter().any(|b| b.enabled && b.kind == "feishu") {
-        crate::tasks::tasks().spawn("larkskills", async {
+        crate::svc_tasks::tasks().spawn("larkskills", async {
             crate::larkskills::ensure_lark_setup().await;
         });
     }
@@ -378,12 +378,12 @@ pub async fn run() {
     // 它 → 收尾恒烧满 20s 总期限强退。令牌已取消即让位退出（不记信号日志，cancel
     // 幂等无害）。代价：收尾窗口内再来的 SIGTERM 走默认处置立即终止进程——与
     // systemd「第二次信号=立即杀」惯例一致，且强退本就是该窗口的兜底终点。
-    crate::tasks::tasks().spawn_forever("signal", async {
-        let _cancel_guard = crate::tasks::CancelOnShutdown::default();
-        if wait_exit_signal_or_shutdown(crate::tasks::shutdown_token()).await {
+    crate::svc_tasks::tasks().spawn_forever("signal", async {
+        let _cancel_guard = crate::svc_tasks::CancelOnShutdown::default();
+        if wait_exit_signal_or_shutdown(crate::svc_tasks::shutdown_token()).await {
             crate::log!("[service] 收到退出信号");
         }
-        crate::tasks::shutdown_token().cancel();
+        crate::svc_tasks::shutdown_token().cancel();
     });
 
     // 每个 bot 一个事件循环 + Bridge + 定时调度，并行跑。
@@ -448,8 +448,8 @@ pub async fn run() {
         let active_bots: std::collections::HashSet<String> = messengers.keys().cloned().collect();
         let registry_for_sweep = bridge_registry.clone();
         let name: &'static str = "acp-channel-sync";
-        crate::tasks::tasks().spawn(name, async move {
-            let stop = crate::tasks::shutdown_token();
+        crate::svc_tasks::tasks().spawn(name, async move {
+            let stop = crate::svc_tasks::shutdown_token();
             let path = crate::bridge_dir().join("virtual-bots.json");
             let store = crate::virtualbot::VirtualBotStore::new_at(path.clone());
             let mut last_sig: Option<(u64, u64)> = None;
@@ -530,16 +530,16 @@ pub async fn run() {
     // 跨会话投递消费循环（独立于 bot 循环，共享关停令牌）。#69：长驻，登记 spawn_forever。
     {
         let router = router.clone();
-        let stop = crate::tasks::shutdown_token();
-        crate::tasks::tasks().spawn_forever("deliver", async move {
+        let stop = crate::svc_tasks::shutdown_token();
+        crate::svc_tasks::tasks().spawn_forever("deliver", async move {
             deliver_loop(router, stop).await;
         });
     }
     // #74 消息历史维护（长驻）：每 2s 消费 GUI 命令文件（手动清除 / 弹窗已读），
     // 每 24h 按保留期清理 messages.sqlite（启动即跑一次）。
     {
-        let stop = crate::tasks::shutdown_token();
-        crate::tasks::tasks().spawn_forever("history-gc", async move {
+        let stop = crate::svc_tasks::shutdown_token();
+        crate::svc_tasks::tasks().spawn_forever("history-gc", async move {
             history_gc_loop(stop).await;
         });
     }
@@ -568,7 +568,7 @@ pub async fn run() {
     let mut handles = Vec::new();
     for (bot, msgr) in ready {
         let cfg = cfg.clone();
-        let stop = crate::tasks::shutdown_token();
+        let stop = crate::svc_tasks::shutdown_token();
         let router = router.clone();
         // 任务执行 worker（#326 P2b / #306）：每 bot 一个，串行认领 = Q7 的「超限排队」。
         // 执行层是 `buzz::oneshot`（自起 handle）——这正是 Q7 拍板的 B1「task 独立 handle」，
@@ -577,9 +577,9 @@ pub async fn run() {
             let bot = bot.clone();
             let cfg = cfg.clone();
             let router = router.clone();
-            let stop = crate::tasks::shutdown_token();
+            let stop = crate::svc_tasks::shutdown_token();
             let name: &'static str = Box::leak(format!("task:{}", bot.key()).into_boxed_str());
-            crate::tasks::tasks().spawn_forever(name, async move {
+            crate::svc_tasks::tasks().spawn_forever(name, async move {
                 crate::task_run::task_worker(bot, cfg, router, stop).await;
             });
         }
@@ -591,7 +591,7 @@ pub async fn run() {
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
-        handles.push(crate::tasks::tasks().spawn_forever(name, async move {
+        handles.push(crate::svc_tasks::tasks().spawn_forever(name, async move {
             run_bot(bot, cfg, msgr, router, stop, buzz_cmd, registry).await;
         }));
     }
@@ -603,7 +603,7 @@ pub async fn run() {
     // 先无期限等服务期结束（关停广播或全部 bot 自行退出），进入收尾后才逐 handle 限时。
     wait_bots_or_shutdown(
         &mut handles,
-        crate::tasks::shutdown_token(),
+        crate::svc_tasks::shutdown_token(),
         std::time::Duration::from_secs(30),
     )
     .await;
@@ -615,7 +615,7 @@ pub async fn run() {
     //（#184 初版真机事故，2026-08-29 同日修正）。
     // 到期 process::exit 强退：进程退出即释放 flock，看门 2s 内拉起新实例；
     // 残留任务随进程消亡（block_on 返回后 runtime drop 也会等残留任务，不能依赖它收尾）。
-    if crate::tasks::tasks()
+    if crate::svc_tasks::tasks()
         .shutdown_wait_bounded(std::time::Duration::from_secs(20))
         .await
         .is_err()
@@ -752,14 +752,14 @@ async fn run_bot(
     ] {
         let name: &'static str = Box::leak(format!("acp-harness:{key}:{label}").into_boxed_str());
         let run_handle = handle.clone();
-        crate::tasks::tasks().spawn(name, async move {
+        crate::svc_tasks::tasks().spawn(name, async move {
             crate::buzz::harness::run_loop(run_handle).await;
         });
         let name: &'static str = Box::leak(format!("acp-turns:{key}:{label}").into_boxed_str());
         let registry_for_turns = bridge_registry.clone();
         let bot_key_log = key.clone();
-        crate::tasks::tasks().spawn(name, async move {
-            let stop = crate::tasks::shutdown_token();
+        crate::svc_tasks::tasks().spawn(name, async move {
+            let stop = crate::svc_tasks::shutdown_token();
             let mut turn_rx = match handle.take_turn_rx() {
                 Some(rx) => rx,
                 None => {
@@ -815,7 +815,7 @@ async fn run_bot(
         let key = key.clone();
         let enabled = cfg.workspace_git_enabled;
         let name: &'static str = Box::leak(format!("wsver-init:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn(name, async move {
+        crate::svc_tasks::tasks().spawn(name, async move {
             if !enabled {
                 return;
             }
@@ -836,7 +836,7 @@ async fn run_bot(
     {
         let bridge = bridge.clone();
         let name: &'static str = Box::leak(format!("history-backfill:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn(name, async move {
+        crate::svc_tasks::tasks().spawn(name, async move {
             let missing = bridge.msgstore.chats_missing_type();
             if missing.is_empty() {
                 return;
@@ -872,7 +872,7 @@ async fn run_bot(
         let bridge = bridge.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("recover:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn(name, async move {
+        crate::svc_tasks::tasks().spawn(name, async move {
             bridge.recover_pending(&stop).await;
         });
     }
@@ -889,7 +889,7 @@ async fn run_bot(
     {
         let key = key.clone();
         let name: &'static str = Box::leak(format!("session-import:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn(name, async move {
+        crate::svc_tasks::tasks().spawn(name, async move {
             let kb = key.clone(); // 闭包内另持一份（日志用）
             let report =
                 tokio::task::spawn_blocking(move || crate::session_import::import_bot(&kb, false))
@@ -916,7 +916,7 @@ async fn run_bot(
         let key = key.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("schedule:{}", key).into_boxed_str());
-        crate::tasks::tasks().spawn_forever(name, async move {
+        crate::svc_tasks::tasks().spawn_forever(name, async move {
             crate::log!("[bot:{key}] 调度循环启动");
             let mut last_min: Option<String> = None;
             // 在跑任务集合：cron 周期短于任务耗时时，跳过重叠的新一轮（防同任务并发堆积、
@@ -975,7 +975,7 @@ async fn run_bot(
         let key = key.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("tidy:{key}").into_boxed_str());
-        crate::tasks::tasks().spawn_forever(name, async move {
+        crate::svc_tasks::tasks().spawn_forever(name, async move {
             crate::log!("[tidy:{key}] 工作目录整理循环启动");
             let workspace = crate::workspace_dir(&key);
             // 上次运行标记（重启不丢 24h 门）：损坏/缺失 → 回退内存门
@@ -1054,7 +1054,7 @@ async fn run_bot(
         let key = key.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("trash-gc:{key}").into_boxed_str());
-        crate::tasks::tasks().spawn_forever(name, async move {
+        crate::svc_tasks::tasks().spawn_forever(name, async move {
             crate::log!("[trash-gc:{key}] 回收站 TTL 清理循环启动");
             let workspace = crate::workspace_dir(&key);
             // 上次运行标记（重启不丢 24h 门，同 tidy）
@@ -1125,7 +1125,7 @@ async fn run_bot(
         let key = key.clone();
         let stop = stop.clone();
         let name: &'static str = Box::leak(format!("session-gc:{key}").into_boxed_str());
-        crate::tasks::tasks().spawn_forever(name, async move {
+        crate::svc_tasks::tasks().spawn_forever(name, async move {
             crate::log!("[session-gc:{key}] 会话归纳清理循环启动");
             let workspace = crate::workspace_dir(&key);
             // 上次运行标记（重启不丢 24h 门）：损坏/缺失 → 回退内存门
@@ -1249,7 +1249,7 @@ async fn weixin_loop(
                         // chat_lock 保证，而「停止词」等控制消息须能与运行中的任务**并发**处理，
                         // 若在此串行 await，长任务会把它（及其后的新消息）全部堵到跑完为止。
                         // #69 审计：短/中命、有 owner（bridge chat_lock + pending.json 恢复），
-                        // 不登记——关停语义靠进程退出兜底（见 tasks.rs 登记口径）。
+                        // 不登记——关停语义靠进程退出兜底（见 svc_tasks.rs 登记口径）。
                         for msg in msgs {
                             let b = bridge.clone();
                             tokio::spawn(async move {

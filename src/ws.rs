@@ -258,7 +258,7 @@ async fn run_conn(
                                     let b = bridge.clone();
                                     let payload = f.payload.clone();
                                     // #69 审计：短/中命、有 owner（bridge chat_lock +
-                                    // pending.json 恢复），不登记（见 tasks.rs 登记口径）。
+                                    // pending.json 恢复），不登记（见 svc_tasks.rs 登记口径）。
                                     tokio::spawn(async move {
                                         b.on_payload(&payload).await;
                                     });
