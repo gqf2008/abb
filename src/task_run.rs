@@ -31,7 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::deliver::{DeliveryItem, Router};
+use crate::deliver::{DeliveryItem, DeliveryOrigin, Router};
 use crate::task_identity::IdentityStatus;
 use crate::task_store::{
     PayloadKind, Task, TaskRuntime, TaskStateKind, TaskStateStore, TaskStore, TriggerKind,
@@ -524,6 +524,7 @@ async fn finish_task_attempt(
     // 回落主会话时，回源也指向那个会话（创建者会话已失效），维持「目标==来源」的自环语义。
     let source_chat = if healed { chat.clone() } else { created_chat };
     let in_session = target_bot == bot_key && chat == source_chat;
+    let origin = task_delivery_origin(in_session);
     let item = DeliveryItem {
         id: uuid::Uuid::new_v4().to_string(),
         target_bot: target_bot.clone(),
@@ -533,10 +534,11 @@ async fn finish_task_attempt(
         source_chat,
         created_at: finished,
         attachments: Vec::new(),
-        // 非空 = 跳过防循环去重（同一任务重跑两次是合法重复）；同时也是 P1b 之前
-        // 「定时/任务类投递」的既有标记口径。
+        // 非空仅供 outbox tag / 日志（P1b 起豁免判据走 origin，不再借本字段）；
+        // 同时保住存量 `deliveries.json` 兼容口径。
         job_id: task.id.clone(),
         in_session,
+        origin,
     };
     let outcome = router.deliver(&item).await;
     if outcome.is_delivered() {
@@ -688,6 +690,21 @@ fn task_workspace(bot_key: &str, task: &Task) -> String {
 ///
 /// `targets[i].bot_key` 留空 = 本 bot（`task add --to` 的缺省写法）；#306 之前执行侧
 /// 忽略它、按本 bot 投，`Task::validate` 于是显式拒绝跨 bot——现在两处一起解除。
+/// P1b 投递来源（#326）：目标**确实就是创建者会话**（自环）→ `InSession`——正是改前
+/// `in_session=true` 的那条可信通路，护栏豁免面（开关 + 自环 + 去重）与旧行为逐条一致；
+/// 投到别处 → `TaskCompletion`（豁免自环 + 去重，跨会话开关照旧约束）。
+///
+/// 待确认（见 patch body）：设计文字写「task_run → TaskCompletion」；若自环也强制记
+/// `TaskCompletion`，跨会话开关（默认关）会开始拦截「任务完成回发创建者会话」这一默认
+/// 投递目标，属线上行为变更——按「拿不准即保持旧行为」暂不采用，等设计确认。
+fn task_delivery_origin(in_session: bool) -> DeliveryOrigin {
+    if in_session {
+        DeliveryOrigin::InSession
+    } else {
+        DeliveryOrigin::TaskCompletion
+    }
+}
+
 fn delivery_target(task: &Task, bot_key: &str) -> Option<(String, String)> {
     if let Some(t) = task.delivery.targets.first() {
         let target_bot = if t.bot_key.trim().is_empty() {
@@ -1430,6 +1447,20 @@ mod tests {
             "owner 任务不该被额外收紧（默认档位 FullAccess → None）"
         );
         assert!(!oc.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"));
+    }
+
+    /// P1b：任务完成投递的来源——自环（目标==创建者会话）记 `InSession`（保持旧行为），
+    /// 显式跨会话记 `TaskCompletion`。
+    #[test]
+    fn task_delivery_origin_is_in_session_only_for_self_loop() {
+        assert_eq!(
+            task_delivery_origin(true),
+            crate::deliver::DeliveryOrigin::InSession
+        );
+        assert_eq!(
+            task_delivery_origin(false),
+            crate::deliver::DeliveryOrigin::TaskCompletion
+        );
     }
 
     #[test]

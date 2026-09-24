@@ -17,6 +17,27 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// 投递来源（可信标记，P1b / #326）。取代 `job_id` 借字段承载的「豁免意图」——
+/// 护栏只看**显式来源**，不再从某个字段非空反推。serde snake_case；缺省 `Manual`
+/// （存量 `deliveries.json` 条目没有本字段）。
+///
+/// 各来源的豁免面（与 #326 P1b 设计一致，`deliver()` 里逐条对应）：
+/// - `Manual`：普通跨会话投递，受**全部**护栏（开关 / 自环 / 防循环去重）；
+/// - `InSession`：CLI `--to-current`（发给当前会话）——**必须**来源确实等于目标才成立
+///   （`in_session_ok`），豁免开关 + 自环 + 去重（语义=「回复带附件」，不是跨会话中继）；
+/// - `Scheduled`：#21 定时任务（`job`）投递——豁免自环 + 去重，**不**豁免跨会话开关；
+/// - `TaskCompletion`：#326 后台任务（`tk_*`）完成投递——同上，豁免自环 + 去重，
+///   **不**豁免跨会话开关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOrigin {
+    #[default]
+    Manual,
+    InSession,
+    Scheduled,
+    TaskCompletion,
+}
+
 /// 一条待投递消息。来源（source_bot/source_chat）用于投递失败时回源报错，不静默丢失。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryItem {
@@ -60,6 +81,31 @@ pub struct DeliveryItem {
     /// 自己发的消息推回」。那天若变了，需在 `on_dingtalk` 补一条与飞书同款的丢弃。
     #[serde(default)]
     pub in_session: bool,
+    /// 可信投递来源（P1b / #326）。**护栏不要直接读它**——统一走
+    /// [`DeliveryItem::effective_origin`]，那样才能把只有 `in_session`/`job_id` 的
+    /// 存量条目与显式来源纳入同一口径。
+    #[serde(default)]
+    pub origin: DeliveryOrigin,
+}
+
+impl DeliveryItem {
+    /// 生效来源（**单一真相**，P1b / #326）：显式非 `Manual` 用显式；否则回落存量
+    /// 借字段口径——`in_session == true → InSession`；`job_id 非空 → Scheduled`
+    /// （存量旧条目分不出 Scheduled / TaskCompletion，一律归 Scheduled）；否则 `Manual`。
+    ///
+    /// 护栏（开关 / 自环 / 去重 / 指纹登记）只读本函数，**不**读裸 `in_session`/`job_id`。
+    pub fn effective_origin(&self) -> DeliveryOrigin {
+        if self.origin != DeliveryOrigin::Manual {
+            return self.origin;
+        }
+        if self.in_session {
+            return DeliveryOrigin::InSession;
+        }
+        if !self.job_id.is_empty() {
+            return DeliveryOrigin::Scheduled;
+        }
+        DeliveryOrigin::Manual
+    }
 }
 
 /// 投递请求落盘队列（CLI 写、service 消费）。
@@ -243,8 +289,9 @@ impl Router {
 
     /// 投递一条消息。成功只留日志；失败：微信目标落其 outbox 等下次入站补发，
     /// 同时回源 bot/会话报错（best-effort，不静默丢失）。未知目标/开关关闭也回源提示。
-    /// 防循环：非定时任务的同指纹（来源/目标/文本+附件 sha256）在窗口内重复投递会跳过并回源提示；
-    /// 定时任务（job_id 非空）是合法重复，不走去重，也豁免自环拒绝（任务回发本 bot 原会话是既有行为）。
+    /// 护栏只看 `item.effective_origin()`（P1b）：`Manual` 受全部护栏；`InSession`（须来源确实
+    /// 等于目标）豁免开关/自环/去重；`Scheduled` / `TaskCompletion` 豁免自环+去重（周期/重跑任务是
+    /// 合法重复，回发本 bot 原会话是既有行为），**不**豁免跨会话开关（那才是"跨会话"需要的授权）。
     ///
     /// 返回 [`DeliveryOutcome`]：#306 的 task worker 用它判断是否需要第二告警通道；
     /// 其余调用方忽略即可（返回值不带 `#[must_use]`）。
@@ -259,7 +306,16 @@ impl Router {
                                                     // `in_session:true` 但来源≠目标的项（手改 deliveries.json，或 owner 会话用
                                                     // `AGENT_BRIDGE_BOT_KEY=… CHAT_ID=…` 覆盖 env 后调 --to-current）就能把
                                                     // `cross_delivery_enabled` 关着的跨会话投递和 10 分钟防循环窗口一起绕掉（审查 P2）。
-        let in_session_ok = item.in_session && is_self_loop(item);
+                                                    // P1b 起判据升级为 `effective_origin()==InSession`（显式来源优先，
+                                                    // 存量条目回落 in_session/job_id 口径）；生效来源与豁免面只此一处，
+                                                    // 后面的开关 / 自环 / 去重 / 指纹登记四处共用。
+        let origin = item.effective_origin();
+        let in_session_ok = origin == DeliveryOrigin::InSession && is_self_loop(item);
+        // Scheduled / TaskCompletion：豁免自环 + 去重（周期/重跑任务合法重复），但不豁免开关。
+        let session_exempt = matches!(
+            origin,
+            DeliveryOrigin::Scheduled | DeliveryOrigin::TaskCompletion
+        );
         // 平台形状硬闸：目标必须是平台的 receive_id。若目标形如 buzz 频道 UUID
         // （`keys::looks_like_channel_uuid`），说明上游把**频道 UUID** 当成了 chat_id——
         // 历史上桥注入的 `AGENT_BRIDGE_CHAT_ID` 就是那个值（ACP 架构下 agent 是每 bot
@@ -301,7 +357,7 @@ impl Router {
         // 两处豁免：① 定时任务（既有）；② `in_session`（CLI `--to-current` 显式声明的
         // 「发给当前会话」）——但它**只在来源确实等于目标时**才构成豁免；手改队列塞
         // in_session 却把来源写成别的会话，下面这条判定照旧拒（自环硬规则不退化）。
-        if !in_session_ok && item.job_id.is_empty() && is_self_loop(item) {
+        if !in_session_ok && !session_exempt && is_self_loop(item) {
             crate::log!(
                 "[deliver] 跳过投递：自环（来源==目标）bot={} chat={} id={}",
                 tb,
@@ -316,7 +372,7 @@ impl Router {
         // 注意：MutexGuard 必须在任何 await 前 drop（std 锁不是 Send，跨 await 会编译失败）。
         // `in_session` 也豁免去重：10 分钟内说两次「再发我一次」应该都能发出去
         //（直发语义，不是跨会话中继）。
-        if item.job_id.is_empty() && !in_session_ok && self.is_duplicate(item) {
+        if !in_session_ok && !session_exempt && self.is_duplicate(item) {
             crate::log!(
                 "[deliver] 跳过重复投递（防循环）bot={} chat={} id={}",
                 tb,
@@ -451,7 +507,7 @@ impl Router {
             item.text.chars().count(),
             item.attachments.len()
         );
-        if item.job_id.is_empty() && !in_session_ok {
+        if !in_session_ok && !session_exempt {
             self.mark_delivered(item);
         }
         DeliveryOutcome::Delivered
@@ -698,6 +754,12 @@ pub fn parse_deliver_args(
         attachments,
         job_id: String::new(),
         in_session,
+        // --to-current（或 #310 的缺省回创建者）→ 显式 InSession；其余 Manual。
+        origin: if in_session {
+            DeliveryOrigin::InSession
+        } else {
+            DeliveryOrigin::Manual
+        },
     })
 }
 
@@ -809,6 +871,8 @@ pub fn job_target_items(
             attachments: Vec::new(),
             job_id: job_id.to_string(),
             in_session: false,
+            // #21 定时任务投递：显式 Scheduled（豁免自环+去重，不豁免开关）。
+            origin: DeliveryOrigin::Scheduled,
         })
         .collect()
 }
@@ -850,6 +914,7 @@ mod tests {
             attachments: Vec::new(),
             job_id: String::new(),
             in_session: false,
+            origin: DeliveryOrigin::Manual,
         }
     }
 
@@ -1523,6 +1588,10 @@ mod tests {
         assert_eq!(items[1].source_bot, "wechat");
         assert_eq!(items[1].source_chat, "oc_src");
         assert_eq!(items[1].text, "结果");
+        // P1b：定时任务投递显式记 Scheduled（不再只靠 job_id 借字段）
+        assert_eq!(items[0].origin, DeliveryOrigin::Scheduled);
+        assert_eq!(items[0].effective_origin(), DeliveryOrigin::Scheduled);
+        assert_eq!(items[1].origin, DeliveryOrigin::Scheduled);
     }
 
     #[tokio::test]
@@ -1880,5 +1949,277 @@ mod tests {
         d.source_chat = "c1".into();
         router.deliver(&d).await; // 未知目标 → 回源提示，但绝不能 panic
         assert_eq!(source.sent.lock().unwrap().len(), 1);
+    }
+
+    // ── P1b 可信 DeliveryOrigin（#326）：单一真相 + 防循环矩阵 ────────────────
+
+    /// `effective_origin`：显式非 Manual 用显式；否则回落存量借字段口径
+    ///（in_session → InSession；job_id → Scheduled）。
+    #[test]
+    fn effective_origin_prefers_explicit_then_legacy_fields() {
+        let mut d = item("a", "wechat", "u1", "hi");
+        assert_eq!(
+            d.effective_origin(),
+            DeliveryOrigin::Manual,
+            "裸条目=Manual"
+        );
+
+        // 只带 in_session（存量 `--to-current` 条目）→ InSession
+        d.in_session = true;
+        assert_eq!(d.effective_origin(), DeliveryOrigin::InSession);
+
+        // 只带 job_id（存量定时/任务条目）→ Scheduled（续不上 TaskCompletion，一律归 Scheduled）
+        d.in_session = false;
+        d.job_id = "job-1".into();
+        assert_eq!(d.effective_origin(), DeliveryOrigin::Scheduled);
+
+        // 显式非 Manual 优先于两个借字段（存量条目带脏字段也不被误判）
+        d.in_session = true;
+        for o in [
+            DeliveryOrigin::Scheduled,
+            DeliveryOrigin::TaskCompletion,
+            DeliveryOrigin::InSession,
+        ] {
+            d.origin = o;
+            assert_eq!(d.effective_origin(), o, "显式 {o:?} 必须胜过借字段");
+        }
+        // 显式回 Manual → 再回落借字段口径
+        d.origin = DeliveryOrigin::Manual;
+        assert_eq!(d.effective_origin(), DeliveryOrigin::InSession);
+    }
+
+    /// 存量 `deliveries.json` 兼容：缺 `origin` → Manual；显式值 serde snake_case 往返不丢。
+    #[test]
+    fn origin_serde_defaults_to_manual_and_roundtrips() {
+        let legacy =
+            r#"{"id":"a","target_bot":"wechat","target_chat":"u1","text":"hi","in_session":false}"#;
+        let d: DeliveryItem = serde_json::from_str(legacy).unwrap();
+        assert_eq!(d.origin, DeliveryOrigin::Manual);
+        assert_eq!(d.effective_origin(), DeliveryOrigin::Manual);
+
+        let legacy_job =
+            r#"{"id":"a","target_bot":"wechat","target_chat":"u1","text":"hi","job_id":"tk_1"}"#;
+        let dj: DeliveryItem = serde_json::from_str(legacy_job).unwrap();
+        assert_eq!(dj.origin, DeliveryOrigin::Manual);
+        assert_eq!(
+            dj.effective_origin(),
+            DeliveryOrigin::Scheduled,
+            "存量 job_id 条目归 Scheduled（与改前同一豁免面）"
+        );
+
+        let mut d2 = item("b", "wechat", "u1", "hi");
+        d2.origin = DeliveryOrigin::TaskCompletion;
+        let text = serde_json::to_string(&d2).unwrap();
+        assert!(text.contains("\"origin\":\"task_completion\""), "{text}");
+        let back: DeliveryItem = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.origin, DeliveryOrigin::TaskCompletion);
+    }
+
+    /// 矩阵 ①：**跨会话开关**。Manual 受约束；InSession（来源==目标）豁免；
+    /// Scheduled / TaskCompletion **不**豁免（跨会话授权照旧，不因任务身份放行）。
+    #[tokio::test]
+    async fn origin_matrix_cross_delivery_switch() {
+        let (router, target, source) = router_with(false, None);
+
+        // Manual：开关关 + 跨会话 → 拒
+        let mut manual = item("a", "wechat", "u1", "hi");
+        manual.source_bot = "feishu".into();
+        manual.source_chat = "c1".into();
+        router.deliver(&manual).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 0, "Manual 受开关约束");
+        assert!(source.sent.lock().unwrap()[0]
+            .1
+            .contains("跨会话投递未开启"));
+
+        // InSession（来源==目标）→ 豁免开关（等价「回复带附件」）
+        let mut ins = item("b", "wechat", "u1", "报告");
+        ins.source_bot = "wechat".into();
+        ins.source_chat = "u1".into();
+        ins.origin = DeliveryOrigin::InSession;
+        router.deliver(&ins).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            1,
+            "InSession 不受跨会话开关限制"
+        );
+
+        // Scheduled / TaskCompletion（即使自环）→ 仍受开关约束：自环时回源提示也落在同一
+        // messenger，故按「正文没发出、只有『未开启』提示」判定。
+        for (i, o) in [DeliveryOrigin::Scheduled, DeliveryOrigin::TaskCompletion]
+            .into_iter()
+            .enumerate()
+        {
+            let mut it = item(&format!("c{i}"), "wechat", "u1", "hi");
+            it.source_bot = "wechat".into();
+            it.source_chat = "u1".into();
+            it.origin = o;
+            router.deliver(&it).await;
+            let sent = target.sent.lock().unwrap();
+            assert!(
+                !sent.iter().any(|(c, t)| c == "u1" && t == "hi"),
+                "{o:?} 不豁免跨会话开关，正文不得投出: {sent:?}"
+            );
+            assert!(
+                sent.iter().any(|(_, t)| t.contains("跨会话投递未开启")),
+                "{o:?} 应回源「未开启」提示: {sent:?}"
+            );
+        }
+    }
+
+    /// 矩阵 ②：**自环**。Manual 自环 → 拒；InSession（来源==目标）→ 豁免；
+    /// Scheduled / TaskCompletion → 豁免（既有行为：任务回发本 bot 原会话）；
+    /// 伪造 InSession（来源≠目标）→ 根本不是自环，按普通投递走（不产生额外豁免）。
+    #[tokio::test]
+    async fn origin_matrix_self_loop() {
+        let (router, target, source) = router_with(true, None);
+
+        // Manual 自环 → 拒（自环硬规则不退化）
+        let mut manual = item("a", "wechat", "u1", "hi");
+        manual.source_bot = "wechat".into();
+        manual.source_chat = "u1".into();
+        router.deliver(&manual).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 1); // 只发回源「自环」提示
+        assert!(target.sent.lock().unwrap()[0].1.contains("自环"));
+
+        // InSession / Scheduled / TaskCompletion 自环 → 放行
+        for (i, o) in [
+            DeliveryOrigin::InSession,
+            DeliveryOrigin::Scheduled,
+            DeliveryOrigin::TaskCompletion,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut it = item(&format!("b{i}"), "wechat", "u1", "hi");
+            it.source_bot = "wechat".into();
+            it.source_chat = "u1".into();
+            it.origin = o;
+            router.deliver(&it).await;
+        }
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            4,
+            "三种来源的自环投递都应放行（1 条提示 + 3 条投递）"
+        );
+
+        // 伪造 InSession（来源≠目标）：不是自环，按普通投递照发（无额外豁免）
+        let mut forged = item("z", "wechat", "u9", "hi");
+        forged.source_bot = "feishu".into();
+        forged.source_chat = "c1".into();
+        forged.origin = DeliveryOrigin::InSession;
+        assert!(!is_self_loop(&forged));
+        router.deliver(&forged).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 5);
+        assert!(source.sent.lock().unwrap().is_empty());
+    }
+
+    /// 矩阵 ③：**防循环去重**。Manual 同指纹第二次被抑制；
+    /// InSession / Scheduled / TaskCompletion 豁免（周期/重跑任务与「再发我一次」是合法重复）。
+    #[tokio::test]
+    async fn origin_matrix_dedup_window() {
+        let (router, target, source) = router_with(true, None);
+
+        // Manual：同指纹连投两次，第二次被去重拦下
+        let mut manual = item("a", "wechat", "u1", "manual-text");
+        manual.source_bot = "feishu".into();
+        manual.source_chat = "c1".into();
+        router.deliver(&manual).await;
+        router.deliver(&manual).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 1, "Manual 受防循环去重");
+        assert!(source
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, t)| t.contains("防循环")));
+
+        // InSession（来源==目标）：两次都要出去
+        let mut ins = item("b", "wechat", "u1", "in-session-text");
+        ins.source_bot = "wechat".into();
+        ins.source_chat = "u1".into();
+        ins.origin = DeliveryOrigin::InSession;
+        router.deliver(&ins).await;
+        router.deliver(&ins).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            3,
+            "InSession 的两次发送都该出去（1+2）"
+        );
+
+        // Scheduled / TaskCompletion（非自环）：跳过指纹登记 + 跳过查重，各自两次都出去
+        for (i, o) in [DeliveryOrigin::Scheduled, DeliveryOrigin::TaskCompletion]
+            .into_iter()
+            .enumerate()
+        {
+            let mut it = item(&format!("c{i}"), "wechat", "u1", &format!("job-text-{i}"));
+            it.source_bot = "feishu".into();
+            it.source_chat = "c1".into();
+            it.origin = o;
+            router.deliver(&it).await;
+            router.deliver(&it).await;
+        }
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            7,
+            "Scheduled / TaskCompletion 各 2 条（3+2+2）"
+        );
+    }
+
+    /// 矩阵 ①③ 的伪造臂：显式 `InSession` 但**来源≠目标** → 不是 `in_session_ok`，
+    /// 开关 / 去重两处照旧按普通投递判（防「显式枚举」变成新的绕行口）。
+    #[tokio::test]
+    async fn forged_explicit_in_session_still_obeys_guards() {
+        // 开关关 → 拒
+        let (router, target, source) = router_with(false, None);
+        let mut forged = item("a", "wechat", "u3", "hi");
+        forged.source_bot = "feishu".into();
+        forged.source_chat = "c1".into();
+        forged.origin = DeliveryOrigin::InSession;
+        router.deliver(&forged).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            0,
+            "伪造 InSession 不豁免开关"
+        );
+        assert!(source.sent.lock().unwrap()[0]
+            .1
+            .contains("跨会话投递未开启"));
+
+        // 开关开 → 仍受去重约束（第二次被抑制）
+        let (router2, target2, _src2) = router_with(true, None);
+        router2.deliver(&forged).await;
+        router2.deliver(&forged).await;
+        assert_eq!(
+            target2.sent.lock().unwrap().len(),
+            1,
+            "伪造 InSession 的第二次投递应被防循环抑制"
+        );
+    }
+
+    /// 存量条目行为等价（端到端）：只带借字段的旧 JSON 条目，走完 `deliver()` 的
+    /// 豁免面与改前一致——`in_session` 自环放行且豁免去重；`job_id` 非自环豁免去重。
+    #[tokio::test]
+    async fn legacy_json_items_keep_pre_p1b_behavior() {
+        let (router, target, _source) = router_with(true, None);
+
+        let legacy_ins = r#"{"id":"a","target_bot":"wechat","target_chat":"u1","text":"legacy-ins","source_bot":"wechat","source_chat":"u1","in_session":true}"#;
+        let mut d: DeliveryItem = serde_json::from_str(legacy_ins).unwrap();
+        // 与 CLI 产物一致：显式 origin 缺省 → 回落 in_session
+        assert_eq!(d.effective_origin(), DeliveryOrigin::InSession);
+        router.deliver(&d).await;
+        router.deliver(&d).await;
+        assert_eq!(target.sent.lock().unwrap().len(), 2, "自环 + 去重双豁免");
+        d.job_id = String::new(); // 明确：旧条目本就没有 job_id
+
+        let legacy_job = r#"{"id":"b","target_bot":"wechat","target_chat":"u1","text":"legacy-job","source_bot":"feishu","source_chat":"c1","job_id":"job-9"}"#;
+        let j: DeliveryItem = serde_json::from_str(legacy_job).unwrap();
+        assert_eq!(j.effective_origin(), DeliveryOrigin::Scheduled);
+        router.deliver(&j).await;
+        router.deliver(&j).await;
+        assert_eq!(
+            target.sent.lock().unwrap().len(),
+            4,
+            "Scheduled 豁免去重（2+2）"
+        );
     }
 }
