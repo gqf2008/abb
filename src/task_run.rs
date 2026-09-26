@@ -2437,6 +2437,12 @@ mod tests {
     }
 
     /// 起一条通道的 worker 跑一小会儿再正常关停（供上面的维护动作用例驱动真实循环）。
+    ///
+    /// `#[cfg(unix)]` 必须与唯一调用方 `schedule_channel_does_not_run_housekeeping` 一致
+    /// ——那个用例自身就是 `#[cfg(unix)]`（它用到的 `keepalive_task`/`pgrep_count` 等助手
+    /// 也是 unix-only）。助手若在两边都编译，Windows 上就是**只出现在测试目标里的死代码**：
+    /// clippy `-D warnings` 会把它判 error（2026-09-26 实测，GitHub CI windows 作业）。
+    #[cfg(unix)]
     async fn run_channel_once(
         root: &std::path::Path,
         channel: Channel,
