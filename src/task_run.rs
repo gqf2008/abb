@@ -282,12 +282,15 @@ async fn task_worker_with_stores(
             last_gc = now;
             gc_logs(&store, &states, now);
         }
-        // 每个 worker 每轮只认领一条。找到候选就立刻处理，**不等轮询间隔**：
-        // 认领成功 → 接着看下一条；没抢到（同通道别的 worker 刚认领）→ 立刻重扫一次，
-        // 而不是白等 2s（评审 D5）。确实没活时下一轮 `next_due_task` 返回 None → 落到 sleep。
+        // 每个 worker 每轮只认领一条：**认领成功**才立刻续扫（不白等轮询）；没抢到就落到 sleep。
+        // 注意别写成「找到候选就 continue」——候选判据（`next_due_task`）与认领判据
+        // （`claim_if_due`，锁内还会查取消请求文件）一旦不一致，就会出现「候选恒在、认领恒失败」
+        // → worker 打满 CPU 的忙循环（评审 D5' 实测：21.5 万次/秒）。两处判据已对齐（见
+        // `next_due_task` 对取消请求的过滤），这里的「只有成功才续扫」是第二道保险。
         if let Some(task) = next_due_task(&store, &states, now, worker.channel) {
-            let _claimed = run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await;
-            continue;
+            if run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await {
+                continue;
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(poll) => {}
@@ -1447,6 +1450,9 @@ fn next_due_task(
         .list()
         .into_iter()
         .filter(|t| Channel::of(t.trigger.kind) == channel)
+        // 挂住取消请求的任务**不算候选**：认领侧 `claim_if_due` 在锁内也会拒绝它。
+        // 两处判据必须一致，否则「候选恒在、认领恒失败」会把 worker 打成忙循环（评审 D5'）。
+        .filter(|t| !states.paths().cancel_file(&t.id).exists())
         .find(|t| is_due_for_claim(t, &states.get(&t.id), now))
 }
 
@@ -2380,6 +2386,44 @@ mod tests {
             "既有文案要保留：{}",
             next.last_error
         );
+    }
+
+    /// 候选判据必须与认领判据一致：挂着取消请求的任务**不算候选**。
+    /// 不一致的后果是「候选恒在、认领恒失败」→ 没抢到也 continue → worker 打满 CPU
+    /// （评审 D5' 实测 21.5 万次/秒）。这条锁的就是那个根因。
+    #[test]
+    fn next_due_task_skips_tasks_with_pending_cancel_request() {
+        let root = tmp_root("cancel_not_candidate");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let mut t = now_task("b", "tk_cancel_cand", "c");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".into(),
+            ..Default::default()
+        };
+        store.add(t.clone()).unwrap();
+        let now = crate::chrono_lite::unix_secs();
+
+        assert!(
+            next_due_task(&store, &states, now, Channel::Schedule).is_some(),
+            "无取消请求时它是正常候选"
+        );
+
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&t.id), b"{}").unwrap();
+        assert!(
+            next_due_task(&store, &states, now, Channel::Schedule).is_none(),
+            "挂着取消请求的任务不得作为候选（否则与认领判据冲突 → 忙循环）"
+        );
+
+        std::fs::remove_file(paths.cancel_file(&t.id)).unwrap();
+        assert!(
+            next_due_task(&store, &states, now, Channel::Schedule).is_some(),
+            "请求被消费后重新成为候选"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// 有未消费的取消请求时不认领：请求由另一条通道消费，两条循环并发之下本通道可能

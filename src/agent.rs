@@ -1164,7 +1164,7 @@ mod tests {
         // 定时档默认改成 2 worker → 那句默认即错。存量 v11 工作区必须能被升到 v12 更正过来。
         let dir = std::env::temp_dir().join(format!("abb-guide-v11-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let v11 = "# ABB 工作区（abb-guide-v11）\n\n## 后台子代理\n\n- **同一通道内串行排队**（一次只跑一条）：定时档与手动档各有自己的队列——跨通道互不阻塞，但同一档里同时丢多条不会更快，别把它当并发池。\n";
+        let v11 = "# ABB 工作区（abb-guide-v11）\n\n## 后台子代理\n\n- **同一通道内串行排队**（一次只跑一条）：定时档（`once`/`cron`/`interval`）与手动档\n  （`now`/`keepalive`）各有自己的队列——跨通道互不阻塞（定时任务不会被后台子代理挡在后面），\n  但同一档里同时丢多条不会更快，别把它当并发池。\n";
         std::fs::write(dir.join("CLAUDE.md"), v11).unwrap();
         std::fs::write(dir.join("AGENTS.md"), v11).unwrap();
         ensure_workspace_guide(&dir);

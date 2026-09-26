@@ -1040,7 +1040,9 @@ impl TaskStore {
     }
 }
 
-/// 运行态存储。**只由 service 写**（CLI 只读），因此不需要 CAS：单写者。
+/// 运行态存储。**只由 service 写**（CLI 只读）；service 内可能有多条通道/多个 worker
+/// 并发写，因此所有读-改-写都走 [`TaskStateStore::update_if`]（单锁内判定+落盘），
+/// 不再依赖「单写者」这一前提。
 pub struct TaskStateStore {
     paths: TaskPaths,
     data: Mutex<BTreeMap<String, TaskRuntime>>,
@@ -1084,8 +1086,7 @@ impl TaskStateStore {
     /// 覆盖写一条运行态并落盘。**落盘在锁内**（同 [`Self::update_if`] 的理由：避免旧快照
     /// 后落地覆盖新改动）。
     pub fn set(&self, id: &str, rt: TaskRuntime) -> Result<()> {
-        let d = self.data.lock().unwrap();
-        let mut d = d;
+        let mut d = self.data.lock().unwrap();
         d.insert(id.to_string(), rt);
         save_json(&self.paths.states(), &*d)
     }
