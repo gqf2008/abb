@@ -913,14 +913,25 @@ pub struct TaskWorkers {
     pub manual: usize,
 }
 
+/// 每通道 worker 数的**上限**：防止手写 `{"schedule":100000}` 起出十万个轮询任务。
+/// 超过按上限生效并告警（不静默）。
+pub const MAX_TASK_WORKERS_PER_CHANNEL: usize = 8;
+
 impl TaskWorkers {
-    /// 该通道生效的 worker 数（0 → 1 兜底）。
+    /// 该通道生效的 worker 数：0 → 1 兜底；超过 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警。
     pub fn for_channel(&self, channel: crate::task_run::Channel) -> usize {
-        let n = match channel {
+        let raw = match channel {
             crate::task_run::Channel::Schedule => self.schedule,
             crate::task_run::Channel::Manual => self.manual,
         };
-        n.max(1)
+        let n = raw.clamp(1, MAX_TASK_WORKERS_PER_CHANNEL);
+        if raw != n {
+            crate::log!(
+                "[task] task_workers.{} = {raw} 超出可用范围 1..={MAX_TASK_WORKERS_PER_CHANNEL}，按 {n} 生效",
+                channel.label()
+            );
+        }
+        n
     }
 }
 
@@ -2002,6 +2013,20 @@ mod tests {
         };
         assert_eq!(wide.for_channel(crate::task_run::Channel::Schedule), 4);
         assert_eq!(wide.for_channel(crate::task_run::Channel::Manual), 3);
+
+        // 上限：离谱的大值按 MAX 生效（不静默按原值起 N 个轮询任务）
+        let huge = TaskWorkers {
+            schedule: 100_000,
+            manual: 99,
+        };
+        assert_eq!(
+            huge.for_channel(crate::task_run::Channel::Schedule),
+            MAX_TASK_WORKERS_PER_CHANNEL
+        );
+        assert_eq!(
+            huge.for_channel(crate::task_run::Channel::Manual),
+            MAX_TASK_WORKERS_PER_CHANNEL
+        );
 
         // 空 JSON（老 config.json）→ 全部走默认
         let cfg: Config = serde_json::from_str("{}").expect("空 JSON 应能用默认值构造");

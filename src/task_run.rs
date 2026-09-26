@@ -31,7 +31,9 @@
 //! ## 执行通道（2026-09-26 拆档）
 //!
 //! Q7 的容量方案落地成**两条通道**（[`Channel`]）：定时档（`once`/`cron`/`interval`）与
-//! 手动档（`now`/`keepalive`）各一个 worker，通道内串行排队、跨通道互不阻塞。
+//! 手动档（`now`/`keepalive`）；每条通道按 `Config::task_workers` 起 N 个 worker
+//! （默认 schedule 2 / manual 1，0 按 1 兜底），通道内排队、跨通道互不阻塞，同一条任务
+//! 永不自我重叠（认领是单锁 check-and-set）。
 //! 拆的理由是：`now` 的后台子代理与 keepalive 常驻进程都是长任务，共用一条队列时
 //! 定时触发会被饿死（cron 落在被占用分钟点上的那次会整次消失）。两条通道共享同一对
 //! store/state 实例，认领走 [`claim_if_due`] 的单锁 check-and-set（多线程 runtime 下
@@ -188,6 +190,21 @@ impl TaskHandles {
     }
 }
 
+/// 按配置算出「这个 bot 要起哪些 worker」：`(线程名, worker 身份)`，顺序为
+/// Schedule#0..N、Manual#0..M。抽成**纯函数**是为了让这层接线有单测（此前只有代码审查）。
+pub fn worker_specs(cfg: &crate::config::Config, bot_key: &str) -> Vec<(String, WorkerId)> {
+    let mut out = Vec::new();
+    for channel in [Channel::Schedule, Channel::Manual] {
+        for index in 0..cfg.task_workers.for_channel(channel) {
+            out.push((
+                format!("task:{}:{index}:{bot_key}", channel.label()),
+                WorkerId::new(channel, index),
+            ));
+        }
+    }
+    out
+}
+
 /// 一条通道的 worker：`channel` 决定它认领哪一档触发，`worker_index` 是它在同通道内的序号。
 ///
 /// 同一通道可以有多个 worker（`Config::task_workers`，默认 Schedule 2 / Manual 1）：它们
@@ -265,12 +282,12 @@ async fn task_worker_with_stores(
             last_gc = now;
             gc_logs(&store, &states, now);
         }
-        // 每通道每轮只认领一条：跑完再认领下一条 = 通道内串行排队（Q7）。
+        // 每个 worker 每轮只认领一条。找到候选就立刻处理，**不等轮询间隔**：
+        // 认领成功 → 接着看下一条；没抢到（同通道别的 worker 刚认领）→ 立刻重扫一次，
+        // 而不是白等 2s（评审 D5）。确实没活时下一轮 `next_due_task` 返回 None → 落到 sleep。
         if let Some(task) = next_due_task(&store, &states, now, worker.channel) {
-            if run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await {
-                continue; // 认领成功：立刻看本通道的下一条，不等轮询间隔
-            }
-            // 适才那条已被并发者（另一条通道）抢走或状态已变：不空转，落到下面的等待。
+            let _claimed = run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await;
+            continue;
         }
         tokio::select! {
             _ = tokio::time::sleep(poll) => {}
@@ -2201,6 +2218,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 接线层（service 起几个 worker）的单测：默认 schedule 2 + manual 1，顺序与命名稳定；
+    /// 配置成 1/0/超大值时的行为也在这里锁住（评审 D4）。
+    #[test]
+    fn worker_specs_follow_config() {
+        let bot = "b";
+        let specs = worker_specs(&crate::config::Config::default(), bot);
+        let got: Vec<(String, Channel, usize)> = specs
+            .iter()
+            .map(|(name, w)| (name.clone(), w.channel, w.index))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("task:schedule:0:b".to_string(), Channel::Schedule, 0),
+                ("task:schedule:1:b".to_string(), Channel::Schedule, 1),
+                ("task:manual:0:b".to_string(), Channel::Manual, 0),
+            ],
+            "默认：定时档 2 条并行、手动档 1 条"
+        );
+
+        let mut cfg = crate::config::Config::default();
+        cfg.task_workers.schedule = 1;
+        cfg.task_workers.manual = 0; // 0 → 1 兜底
+        let got: Vec<(String, Channel, usize)> = worker_specs(&cfg, bot)
+            .iter()
+            .map(|(name, w)| (name.clone(), w.channel, w.index))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("task:schedule:0:b".to_string(), Channel::Schedule, 0),
+                ("task:manual:0:b".to_string(), Channel::Manual, 0),
+            ],
+            "schedule=1 / manual=0：回到每通道 1 条（manual 的 0 兜底成 1）"
+        );
+    }
+
     /// 通道可配多 worker 的核心收益：**不同**任务能在同一档同时被认领（同一条任务仍只认领一次，
     /// 见 `concurrent_claim_admits_exactly_one`）。
     #[test]
@@ -2397,9 +2451,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
-    /// 全局维护动作只由手动档执行（`Channel::owns_housekeeping`）：调度档不得消费取消请求、
-    /// 不得归位孤儿、也不得在关停时 finalize keepalive——双做会把 restarts 双记（吃掉
-    /// 有界重跑预算），或把「已取消」的任务重新拉起。手动档做**阳性对照**。
+    /// 全局维护动作**只由手动档 0 号**执行（`WorkerId::owns_housekeeping`）：调度档、以及
+    /// 手动档的其它序号都不得消费取消请求、归位孤儿、或在关停时 finalize keepalive——
+    /// 双做会把 restarts 双记（吃掉有界重跑预算），或把「已取消」的任务重新拉起。
+    /// 手动档 0 号做**阳性对照**。
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn schedule_channel_does_not_run_housekeeping() {

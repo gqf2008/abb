@@ -399,8 +399,10 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 > - **定时档（`Schedule`）**：`once` / `cron` / `interval`；
 > - **手动档（`Manual`）**：`now`（后台子代理）与 `keepalive`（常驻进程天然是长任务，与 now 同档）。
 >
-> 两条通道各一个 worker，**通道内**仍是串行排队（Q7 的「超限排队、不拒绝」按通道成立），
-> **跨通道互不阻塞**：now 档的长任务不再饿死定时档，反之亦然。三条实现约束：
+> 每条通道按 `Config::task_workers` 起 **N 个 worker**（默认 schedule 2 / manual 1），
+> **通道内**超限排队（Q7 的「排队、不拒绝」按通道成立）、**跨通道互不阻塞**：now 档的长任务
+> 不再饿死定时档，反之亦然；同一条任务**永不自我重叠**（认领是单锁 check-and-set）。
+> 三条实现约束：
 > 1. **认领必须原子**：`TaskStateStore::try_claim` 在同一把锁内完成「读运行态 → 判据 → 写 Running」。
 >    改前是「`next_due_task` 读 + `set(claim)` 写」两步，单 worker 时靠「只有一个认领者」成立；
 >    两条通道 + 多线程 runtime 下会被插进来 → 同一任务双跑（回归锁 `concurrent_claim_admits_exactly_one`）。
@@ -410,7 +412,8 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 >    整表级动作（`Channel::owns_housekeeping`），否则会被做两遍。
 >
 > **同通道多 worker（2026-09-26 同批接线，Q7 的「上限可配」）**：`config.json#task_workers`
-> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":1}`，0 按 1 兜底）。要点：
+> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":1}`；每通道 1–8，0 按 1 兜底、
+> 超过上限按 `MAX_TASK_WORKERS_PER_CHANNEL` 截断并在日志告警）。要点：
 > - 同一通道的多个 worker **共享同一对 store/states**，认领是单锁 check-and-set →
 >   **同一条任务不会双跑**；多出来的并发只让**不同任务**能同档同时执行（定时档默认 2 条：
 >   不再出现「Crystal 长巡检占着，tau 到点跑不了」这种同档排队）。

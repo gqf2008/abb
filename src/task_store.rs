@@ -1081,14 +1081,13 @@ impl TaskStateStore {
             .unwrap_or_default()
     }
 
-    /// 覆盖写一条运行态并落盘。
+    /// 覆盖写一条运行态并落盘。**落盘在锁内**（同 [`Self::update_if`] 的理由：避免旧快照
+    /// 后落地覆盖新改动）。
     pub fn set(&self, id: &str, rt: TaskRuntime) -> Result<()> {
-        let snap = {
-            let mut d = self.data.lock().unwrap();
-            d.insert(id.to_string(), rt);
-            d.clone()
-        };
-        save_json(&self.paths.states(), &snap)
+        let d = self.data.lock().unwrap();
+        let mut d = d;
+        d.insert(id.to_string(), rt);
+        save_json(&self.paths.states(), &*d)
     }
 
     /// **条件写**：在同一把锁内完成「读运行态 → 判定 → 写回 + 落盘」，返回写入后的运行态；
@@ -1102,16 +1101,16 @@ impl TaskStateStore {
     where
         F: FnOnce(&TaskRuntime) -> Option<TaskRuntime>,
     {
-        let (next, snap) = {
-            let mut d = self.data.lock().unwrap();
-            let prev = d.get(id).cloned().unwrap_or_default();
-            let next = f(&prev)?;
-            d.insert(id.to_string(), next.clone());
-            (next, d.clone())
-        };
-        if let Err(e) = save_json(&self.paths.states(), &snap) {
-            // 与 `set` 同口径：落盘失败只记日志，不假装没写（内存态已推进，下次成功
-            // 落盘会覆盖；回退反而会让 running 的任务被再次拉起）。
+        let mut d = self.data.lock().unwrap();
+        let prev = d.get(id).cloned().unwrap_or_default();
+        let next = f(&prev)?;
+        d.insert(id.to_string(), next.clone());
+        // **落盘也在锁内**（评审 D6）：快照若在锁外写，两个写者会各自拿着旧快照去 rename，
+        // 后落地的那个把先写的改动覆盖掉（多 worker 后写者从 1 变 N，窗口被放大）。
+        // 锁内只做一次序列化 + 原子替换，量级是毫秒，换掉一整类丢更新。
+        if let Err(e) = save_json(&self.paths.states(), &*d) {
+            // 落盘失败只记日志，不假装没写（内存态已推进，下次成功落盘会覆盖；
+            // 回退反而会让 running 的任务被再次拉起）。
             crate::log!("[task] 运行态落盘失败（{id}）：{e:#}");
         }
         Some(next)
@@ -1137,12 +1136,9 @@ impl TaskStateStore {
 
     /// 删掉一条运行态（删任务时一并清，避免 file 里留孤儿）。
     pub fn remove(&self, id: &str) -> Result<()> {
-        let snap = {
-            let mut d = self.data.lock().unwrap();
-            d.remove(id);
-            d.clone()
-        };
-        save_json(&self.paths.states(), &snap)
+        let mut d = self.data.lock().unwrap();
+        d.remove(id);
+        save_json(&self.paths.states(), &*d)
     }
 }
 
