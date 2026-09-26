@@ -695,18 +695,7 @@ async fn finish_task_attempt(
     // **条件写**，不是 get+set：取消请求由另一条通道并发消费，若这中间把状态置成
     // Cancelled，这里的回写会把取消盖回 Succeeded/Failed（请求文件已删）→ 取消永久
     // 丢失、周期任务继续触发。取消是用户明确的终态，投递失败只补错误文案、不许改档。
-    let _ = states.update_if(&id, |prev| {
-        if prev.kind == TaskStateKind::Cancelled {
-            return None;
-        }
-        let mut next = prev.clone();
-        next.last_error = if next.last_error.is_empty() {
-            note.clone()
-        } else {
-            format!("{}；{note}", next.last_error)
-        };
-        Some(next)
-    });
+    let _ = states.update_if(&id, |prev| record_delivery_failure(prev, &note));
     crate::log!("[task:{bot_key}] {short} {note}（目标 bot={target_bot} chat={chat}）");
     alert_primary_chat(
         router,
@@ -718,6 +707,25 @@ async fn finish_task_attempt(
         &note,
     )
     .await;
+}
+
+/// 投递失败时的运行态回写规则：**只补错误文案、不改运行档**。
+///
+/// 为什么不能顺手改档：取消请求由另一条通道并发消费，`get` 到 `set` 之间状态可能已被
+/// 置成 `Cancelled`（且请求文件已删）——回写把它盖回 Succeeded/Failed 就等于「取消被
+/// 静默吞掉、周期任务继续触发」。返回 `None` = 不改（[`TaskStateStore::update_if`] 的
+/// 契约）。抽成纯函数便于直接单测这条规则。
+fn record_delivery_failure(prev: &TaskRuntime, note: &str) -> Option<TaskRuntime> {
+    if prev.kind == TaskStateKind::Cancelled {
+        return None;
+    }
+    let mut next = prev.clone();
+    next.last_error = if next.last_error.is_empty() {
+        note.to_string()
+    } else {
+        format!("{}；{note}", next.last_error)
+    };
+    Some(next)
 }
 
 /// 结果投递的抬头。
@@ -2197,6 +2205,83 @@ mod tests {
             "认领后运行态必须是 Running 且只有一份"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 投递失败的回写不得把「已取消」盖回 Succeeded/Failed（否则取消永久丢失、周期任务
+    /// 继续触发）；正常/失败终态则只补错误文案、不改档。
+    #[test]
+    fn delivery_failure_writeback_never_clobbers_cancelled() {
+        let cancelled = TaskRuntime {
+            kind: TaskStateKind::Cancelled,
+            last_error: CANCEL_REASON_BEFORE_START.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            record_delivery_failure(&cancelled, "结果投递失败：x").is_none(),
+            "取消是用户明确的终态，回写必须让位（否则取消被静默吞掉）"
+        );
+
+        let ok = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            ..Default::default()
+        };
+        let next = record_delivery_failure(&ok, "结果投递失败：x").expect("正常终态要留痕");
+        assert_eq!(next.kind, TaskStateKind::Succeeded, "不得改档");
+        assert!(
+            next.last_error.contains("结果投递失败：x"),
+            "{}",
+            next.last_error
+        );
+
+        let failed = TaskRuntime {
+            kind: TaskStateKind::Failed,
+            last_error: "原始错误".to_string(),
+            ..Default::default()
+        };
+        let next = record_delivery_failure(&failed, "结果投递失败：x").expect("失败态也要留痕");
+        assert!(
+            next.last_error.starts_with("原始错误；"),
+            "既有文案要保留：{}",
+            next.last_error
+        );
+    }
+
+    /// 有未消费的取消请求时不认领：请求由另一条通道消费，两条循环并发之下本通道可能
+    /// 抢在消费之前认领（proc 载荷先起子进程）→「用户已取消，却仍然起了一轮」。
+    #[test]
+    fn claim_refuses_while_cancel_request_pending() {
+        let root = tmp_root("claim_cancel_first");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let mut t = now_task("b", "tk_cancel_first", "c");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".into(),
+            ..Default::default()
+        };
+        store.add(t.clone()).unwrap();
+        let now = crate::chrono_lite::unix_secs();
+
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&t.id), b"{}").unwrap();
+        assert!(
+            claim_if_due(&states, &t, now).is_none(),
+            "取消请求在先 → 不得认领"
+        );
+        assert_eq!(
+            states.get(&t.id).kind,
+            TaskStateKind::Pending,
+            "被取消请求挂住时不得写 Running"
+        );
+
+        std::fs::remove_file(paths.cancel_file(&t.id)).unwrap();
+        assert!(
+            claim_if_due(&states, &t, now).is_some(),
+            "取消请求被消费后照常认领"
+        );
+        assert_eq!(states.get(&t.id).kind, TaskStateKind::Running);
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// 本进程刚认领的 Running **不是**孤儿：两条通道并发启动时，定时档可能已经跑在

@@ -266,7 +266,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | 30s | 数据安全更足，但 service 关停会被拖长，看门狗/shutdown 超时窗口要同步放宽 |
 | per-task 可配（`limits.grace_secs`，默认 10s） | 配置面 +1 字段；`TaskLimits` 已是 per-task 结构（`src/task_store.rs:296-303`），扩展成本低 |
 
-**② 到期是否 SIGKILL**：现状是（`src/install.rs:198`）。备选"只报错不强杀"会让卡死进程永久占着任务槽位（单 worker 串行 → 整个队列停摆），**不建议**。
+**② 到期是否 SIGKILL**：现状是（`src/install.rs:198`）。备选"只报错不强杀"会让卡死进程永久占着任务槽位（单 worker 串行 → 整个队列停摆），**不建议**。（**2026-09-26 补注**：task 侧已拆成两条通道——定时档与手动档各自串行、跨档不阻塞；本行"整个队列停摆"是当时单 worker 的口径，权威表述见 `docs/task-model.md` §P2b-C 的「执行通道拆分」块。）
 
 **③ 是否整组发信号**：Unix 现状 service 是单 pid、ACP 是整组。proc supervisor 必须**整组**，否则与 Q15 的缺口重复踩一遍。
 
