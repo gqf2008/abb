@@ -390,7 +390,24 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 > **已知代价**：当某条 cron 的周期短于它自己的单轮耗时时，逾期认领会让它「跑完立刻再补一轮」形成连轴转
 > （这正是「到点就该执行」的取舍）；要限制资源占用需配合并发上限/单轮上限，属后续单元。
 > 另一处量级提醒：service 停机后重启时，凡在 48h 窗口内错过过分钟点的 cron 任务都会被逐个认领
-> （仍走单 worker 串行排队，每条各打一行逾期日志）——重启后短时间内出现多行「逾期认领」属预期，不是故障。
+> （在定时档通道内串行排队，每条各打一行逾期日志）——重启后短时间内出现多行「逾期认领」属预期，不是故障。
+
+> **执行通道拆分（2026-09-26 修订，线程 `abb-task-worker-cron-parallel-20260926` 单元 2）**：
+> 改前每 bot 只有一个 task worker，**所有**触发档共用一条串行队列，于是 `trigger=now` 的后台子代理
+> 或 keepalive 常驻进程一跑，定时触发就得排在它后面（cron 那次落在被占用分钟点上会整次消失）。
+> 现在拆成两条通道（`src/task_run.rs::Channel`）：
+> - **定时档（`Schedule`）**：`once` / `cron` / `interval`；
+> - **手动档（`Manual`）**：`now`（后台子代理）与 `keepalive`（常驻进程天然是长任务，与 now 同档）。
+>
+> 两条通道各一个 worker，**通道内**仍是串行排队（Q7 的「超限排队、不拒绝」按通道成立），
+> **跨通道互不阻塞**：now 档的长任务不再饿死定时档，反之亦然。三条实现约束：
+> 1. **认领必须原子**：`TaskStateStore::try_claim` 在同一把锁内完成「读运行态 → 判据 → 写 Running」。
+>    改前是「`next_due_task` 读 + `set(claim)` 写」两步，单 worker 时靠「只有一个认领者」成立；
+>    两条通道 + 多线程 runtime 下会被插进来 → 同一任务双跑（回归锁 `concurrent_claim_admits_exactly_one`）。
+> 2. **store/state 必须是同一对实例**：`TaskStateStore` 每次写都是整表快照，两个实例并存会丢更新；
+>    两条通道因此共享 `Arc<TaskStore>` / `Arc<TaskStateStore>`。
+> 3. **全局维护动作只由一条通道执行**：keepalive 恢复、孤儿归位、取消请求消费、日志 GC、关停收尾都是
+>    整表级动作（`Channel::owns_housekeeping`，目前固定在手动档），否则会被做两遍。
 
 > **agent 载荷不开放 `keepalive`**（2026-09-24 决议；`src/task_store.rs::validate` 拒绝，
 > `task add --keepalive --prompt …` CLI 非 0 退出）。
@@ -404,7 +421,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 >   上界 `limits.max_restarts`，默认 1）。想「无固定周期连续跑」只能自拼 `interval 5s`——
 >   **注意 token 成本无上界（每轮都是真模型调用）与每轮一条投递的刷屏**。
 > - **重开条件**：出现真实场景（无固定周期连续跑 / 跨回合保持会话）且能接受成本上界，并先落
->   四项前置：① per-task 成本预算；② 投递节流/合并；③ 与单 worker（Q7）的让位/优先级；
+>   四项前置：① per-task 成本预算；② 投递节流/合并；③ 与手动档（Q7 的 `now`/`keepalive` 通道）的让位/优先级；
 >   ④ agent `keepalive` 的身份/恢复/投递裁决（Q5/Q14 现仅定义 proc 语义）。见 #326 剩余项
 >   「agent 任务的 keepalive/interval 触发档（Q5/Q14）」。
 
@@ -447,7 +464,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | # | 问题 | 结论 |
 |---|---|---|
 | Q1 | CLI 命名 | **`abb task`**；`job` 保留为兼容别名；内部 `src/tasks.rs` → `src/svc_tasks.rs` 让出命名 |
-| Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）；每 bot 默认 1 个 task worker，上限可配 |
+| Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）。**2026-09-26 修订：每 bot 两条执行通道**——定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`）各 1 个 worker，**通道内**串行排队、**跨通道互不阻塞**（否则 now 档的长任务会把定时触发饿死）；每通道上限可配（尚未接线） |
 | Q8 | **`proc` 权限边界**：owner-only？还是允许 granted 在 OS sandbox 内？ | **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）；受限会话完全不进白名单。真实 ACP shell 由 buzz-agent 注入 `ABB_AGENT_CONTEXT=1` 作为 CLI 主判据，旧 Claude hook 的 owner guard 仅作纵深。⚠️ owner FullAccess agent 仍可清除环境或直接改 `tasks.json`，因此这是纵深防御/合规闸，不是安全边界（见 D5） |
 | Q9 | **「自己创建的」身份粒度** | **owner-only 管理**，不引入 capability token；后续确有跨用户需求再议 |
 
