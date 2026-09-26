@@ -407,7 +407,19 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 > 2. **store/state 必须是同一对实例**：`TaskStateStore` 每次写都是整表快照，两个实例并存会丢更新；
 >    两条通道因此共享 `Arc<TaskStore>` / `Arc<TaskStateStore>`。
 > 3. **全局维护动作只由一条通道执行**：keepalive 恢复、孤儿归位、取消请求消费、日志 GC、关停收尾都是
->    整表级动作（`Channel::owns_housekeeping`，目前固定在手动档），否则会被做两遍。
+>    整表级动作（`Channel::owns_housekeeping`），否则会被做两遍。
+>
+> **同通道多 worker（2026-09-26 同批接线，Q7 的「上限可配」）**：`config.json#task_workers`
+> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":1}`，0 按 1 兜底）。要点：
+> - 同一通道的多个 worker **共享同一对 store/states**，认领是单锁 check-and-set →
+>   **同一条任务不会双跑**；多出来的并发只让**不同任务**能同档同时执行（定时档默认 2 条：
+>   不再出现「Crystal 长巡检占着，tau 到点跑不了」这种同档排队）。
+> - 维护动作判据带上序号：**只有手动档 0 号**做（`owns_housekeeping(channel, worker_index)`）——
+>   只按通道判会让手动档的每个 worker 都去做一遍。
+> - 代价（照实说）：并发 = 同时多个真模型回合（token 成本随并发上升，仍无 per-task 预算），
+>   且未显式指定 `workspace` 的任务**共用 bot 工作区**（旧 job 循环时代就承认的风险）；
+>   想回到「每通道 1 条」把 `task_workers` 写成 `{"schedule":1,"manual":1}` 即可（与拆通道前
+>   的两通道行为逐条等价）。
 
 > **agent 载荷不开放 `keepalive`**（2026-09-24 决议；`src/task_store.rs::validate` 拒绝，
 > `task add --keepalive --prompt …` CLI 非 0 退出）。
@@ -464,7 +476,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | # | 问题 | 结论 |
 |---|---|---|
 | Q1 | CLI 命名 | **`abb task`**；`job` 保留为兼容别名；内部 `src/tasks.rs` → `src/svc_tasks.rs` 让出命名 |
-| Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）。**2026-09-26 修订：每 bot 两条执行通道**——定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`）各 1 个 worker，**通道内**串行排队、**跨通道互不阻塞**（否则 now 档的长任务会把定时触发饿死）；每通道上限可配（尚未接线） |
+| Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）。**2026-09-26 修订：每 bot 两条执行通道**——定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`），**通道内**串行排队、**跨通道互不阻塞**（否则 now 档的长任务会把定时触发饿死）；**同通道 worker 数可配**（`config.json#task_workers`，默认 `schedule: 2 / manual: 1`，0 按 1 兜底）——定时档默认并行 2 条，到点即执行；**同一条任务永不自我重叠**（认领是单锁 check-and-set），并发只作用于**不同**任务 |
 | Q8 | **`proc` 权限边界**：owner-only？还是允许 granted 在 OS sandbox 内？ | **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）；受限会话完全不进白名单。真实 ACP shell 由 buzz-agent 注入 `ABB_AGENT_CONTEXT=1` 作为 CLI 主判据，旧 Claude hook 的 owner guard 仅作纵深。⚠️ owner FullAccess agent 仍可清除环境或直接改 `tasks.json`，因此这是纵深防御/合规闸，不是安全边界（见 D5） |
 | Q9 | **「自己创建的」身份粒度** | **owner-only 管理**，不引入 capability token；后续确有跨用户需求再议 |
 

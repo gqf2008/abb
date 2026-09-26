@@ -133,6 +133,7 @@ cd abb && cargo build --release
 ## 开发者文档
 
 - [任务模型（复盘 + 重新设计）](docs/task-model.md)：`job` / 后台子代理 / 常驻进程三层的统一术语、数据模型与分阶段落地（草案，#307）。
+- 任务执行并发（Q7「上限可配」）：`config.json#task_workers` = `{"schedule":2,"manual":1}`（默认）。定时档（`once`/`cron`/`interval`）默认 **2** —— 到点即执行，不再因为同档另一条长任务排队；手动档（`now` 后台子代理 / `keepalive`）默认 **1**。同一条任务**永远不会**自我重叠（认领是单锁 check-and-set）；调大的代价是同时跑的真模型回合变多、且未显式指定 `workspace` 的任务会共用 bot 工作区。
 - [会话隔离机制（群 / 话题 / 用户）](docs/session-isolation.md)：三平台 chat_id 规则、隔离矩阵、话题维度结论与最小改动方案。
 - 跨会话投递（issue #21）：开关 `config.json#cross_delivery_enabled`（设置窗可勾选，默认关）；agent 用 `$ABB_BIN deliver` 投递，CLI 入队 `~/.agent-bridge/deliveries.json`（0600），service 消费循环经路由表发送；微信目标失败落其 outbox 补发、其余失败回源报错；同来源/目标/文本（+附件 sha256）10 分钟防循环去重，定时任务（`job add --to`）豁免。
 

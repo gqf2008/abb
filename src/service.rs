@@ -580,20 +580,43 @@ pub async fn run() {
             let bot_key = bot.key();
             // 句柄只构造一次、按通道 clone：两条通道必须共享同一对 store/states。
             let handles = crate::task_run::TaskHandles::new(&bot_key);
+            crate::log!(
+                "[task:{bot_key}] 通道 worker 数：schedule={} manual={}（Config.task_workers，0 按 1 兜底）",
+                cfg.task_workers
+                    .for_channel(crate::task_run::Channel::Schedule),
+                cfg.task_workers
+                    .for_channel(crate::task_run::Channel::Manual)
+            );
             for channel in [
                 crate::task_run::Channel::Schedule,
                 crate::task_run::Channel::Manual,
             ] {
-                let bot = bot.clone();
-                let cfg = cfg.clone();
-                let router = router.clone();
-                let stop = crate::svc_tasks::shutdown_token();
-                let handles = handles.clone();
-                let name: &'static str =
-                    Box::leak(format!("task:{}:{}", channel.label(), bot_key).into_boxed_str());
-                crate::svc_tasks::tasks().spawn_forever(name, async move {
-                    crate::task_run::task_worker(bot, cfg, router, handles, stop, channel).await;
-                });
+                // Q7 的「上限可配」（`Config::task_workers`）：同一通道起 N 个 worker。
+                // 认领是单锁 check-and-set，所以**同一条任务不会双跑**；多出来的并发只让
+                // 不同任务能在同一档同时执行（0 按 1 兜底）。
+                let workers = cfg.task_workers.for_channel(channel);
+                for worker_index in 0..workers {
+                    let bot = bot.clone();
+                    let cfg = cfg.clone();
+                    let router = router.clone();
+                    let stop = crate::svc_tasks::shutdown_token();
+                    let handles = handles.clone();
+                    let name: &'static str = Box::leak(
+                        format!("task:{}:{worker_index}:{}", channel.label(), bot_key)
+                            .into_boxed_str(),
+                    );
+                    crate::svc_tasks::tasks().spawn_forever(name, async move {
+                        crate::task_run::task_worker(
+                            bot,
+                            cfg,
+                            router,
+                            handles,
+                            stop,
+                            crate::task_run::WorkerId::new(channel, worker_index),
+                        )
+                        .await;
+                    });
+                }
             }
         }
         // ACP 执行层命令（随包 buzz-agent；None=开发/自签无随包 → run_bot 内落

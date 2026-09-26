@@ -895,12 +895,61 @@ impl EventsConfig {
     }
 }
 
+/// 每 bot **每条执行通道**的 task worker 数——Q7「每 bot 默认 1 个 task worker，**上限可配**」
+/// 的接线（2026-09-26 落地；此前只实现了「默认 1」，可配部分没接线）。
+///
+/// - `schedule`（`once`/`cron`/`interval`）默认 **2**：定时任务到点即执行，不再因为同档
+///   另一条长任务而排队（同一条任务**不会**自我重叠——认领是单锁 check-and-set）。
+/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）默认 **1**：这两类都是长任务且由人类或
+///   模型主动发起，保持串行更可控。
+/// - 0 按 1 兜底（写 0 不会把通道关掉）。
+/// - 调大的代价：同 bot 同时跑的真模型回合变多（token 成本随并发上升），且并发任务在
+///   未显式指定 `workspace` 时**共用同一个 bot 工作区**（旧 job 循环时代就承认的风险）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWorkers {
+    #[serde(default = "default_task_workers_schedule")]
+    pub schedule: usize,
+    #[serde(default = "default_task_workers_manual")]
+    pub manual: usize,
+}
+
+impl TaskWorkers {
+    /// 该通道生效的 worker 数（0 → 1 兜底）。
+    pub fn for_channel(&self, channel: crate::task_run::Channel) -> usize {
+        let n = match channel {
+            crate::task_run::Channel::Schedule => self.schedule,
+            crate::task_run::Channel::Manual => self.manual,
+        };
+        n.max(1)
+    }
+}
+
+impl Default for TaskWorkers {
+    fn default() -> Self {
+        Self {
+            schedule: default_task_workers_schedule(),
+            manual: default_task_workers_manual(),
+        }
+    }
+}
+
+fn default_task_workers_schedule() -> usize {
+    2
+}
+
+fn default_task_workers_manual() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub owner_open_id: String,
     #[serde(default)]
     pub default_backend: String,
+    /// 每通道 task worker 上限（Q7「上限可配」；见 [`TaskWorkers`]）。
+    #[serde(default)]
+    pub task_workers: TaskWorkers,
     /// 跨会话投递总开关（#21）：默认关闭。开启后 agent 可通过 `$ABB_BIN deliver`
     /// 把消息投递到其它 bot 的会话（服务侧路由投递 + 失败兜底）。
     #[serde(default)]
@@ -990,6 +1039,7 @@ impl Default for Config {
         Self {
             owner_open_id: String::new(),
             default_backend: String::new(),
+            task_workers: TaskWorkers::default(),
             cross_delivery_enabled: false,
             workspace_git_enabled: true, // #209 工作区版本管理默认开
             buzz_agent_exe: String::new(),
@@ -1922,6 +1972,65 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual 1，0 按 1 兜底，
+    /// 且老的 config.json（缺字段 / 只给一半）都能正常解析。
+    #[test]
+    fn task_workers_defaults_floor_and_partial_json() {
+        let d = TaskWorkers::default();
+        assert_eq!(
+            d.for_channel(crate::task_run::Channel::Schedule),
+            2,
+            "定时档默认并行 2：到点即执行，不再被同档长任务排队"
+        );
+        assert_eq!(
+            d.for_channel(crate::task_run::Channel::Manual),
+            1,
+            "手动档（now/keepalive）默认串行"
+        );
+
+        let zero = TaskWorkers {
+            schedule: 0,
+            manual: 0,
+        };
+        assert_eq!(zero.for_channel(crate::task_run::Channel::Schedule), 1);
+        assert_eq!(zero.for_channel(crate::task_run::Channel::Manual), 1);
+
+        let wide = TaskWorkers {
+            schedule: 4,
+            manual: 3,
+        };
+        assert_eq!(wide.for_channel(crate::task_run::Channel::Schedule), 4);
+        assert_eq!(wide.for_channel(crate::task_run::Channel::Manual), 3);
+
+        // 空 JSON（老 config.json）→ 全部走默认
+        let cfg: Config = serde_json::from_str("{}").expect("空 JSON 应能用默认值构造");
+        assert_eq!(
+            cfg.task_workers
+                .for_channel(crate::task_run::Channel::Schedule),
+            2
+        );
+        assert_eq!(
+            cfg.task_workers
+                .for_channel(crate::task_run::Channel::Manual),
+            1
+        );
+
+        // 只给一半 → 另一半走默认（serde 字段级 default）
+        let cfg: Config =
+            serde_json::from_str(r#"{"task_workers":{"manual":3}}"#).expect("部分字段应可解析");
+        assert_eq!(
+            cfg.task_workers
+                .for_channel(crate::task_run::Channel::Schedule),
+            2,
+            "未给出的字段仍走默认"
+        );
+        assert_eq!(
+            cfg.task_workers
+                .for_channel(crate::task_run::Channel::Manual),
+            3
+        );
+    }
 
     #[test]
     fn missing_detection() {
