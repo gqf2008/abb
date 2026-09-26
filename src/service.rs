@@ -570,18 +570,31 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = crate::svc_tasks::shutdown_token();
         let router = router.clone();
-        // 任务执行 worker（#326 P2b / #306）：每 bot 一个，串行认领 = Q7 的「超限排队」。
-        // 执行层是 `buzz::oneshot`（自起 handle）——这正是 Q7 拍板的 B1「task 独立 handle」，
-        // 所以任务不会占聊天句柄的 slot（后台任务跑着，聊天照常回）。
+        // 任务执行 worker（#326 P2b / #306）：每 bot **两条通道**——定时档
+        // （once/cron/interval）与手动档（now/keepalive）各一个 worker；通道内串行认领
+        // = Q7 的「超限排队」，跨通道互不阻塞（否则 now 档的长任务会把定时触发饿死，
+        // cron 落在被占用分钟点的那次会整次消失）。执行层是 `buzz::oneshot`（自起 handle）
+        // ——Q7 拍板的 B1「task 独立 handle」，任务不占聊天句柄 slot。
+        // store/states 两条通道**共享同一对实例**：两个实例并存会让运行态读-改-写丢更新。
         {
-            let bot = bot.clone();
-            let cfg = cfg.clone();
-            let router = router.clone();
-            let stop = crate::svc_tasks::shutdown_token();
-            let name: &'static str = Box::leak(format!("task:{}", bot.key()).into_boxed_str());
-            crate::svc_tasks::tasks().spawn_forever(name, async move {
-                crate::task_run::task_worker(bot, cfg, router, stop).await;
-            });
+            let bot_key = bot.key();
+            // 句柄只构造一次、按通道 clone：两条通道必须共享同一对 store/states。
+            let handles = crate::task_run::TaskHandles::new(&bot_key);
+            for channel in [
+                crate::task_run::Channel::Schedule,
+                crate::task_run::Channel::Manual,
+            ] {
+                let bot = bot.clone();
+                let cfg = cfg.clone();
+                let router = router.clone();
+                let stop = crate::svc_tasks::shutdown_token();
+                let handles = handles.clone();
+                let name: &'static str =
+                    Box::leak(format!("task:{}:{}", channel.label(), bot_key).into_boxed_str());
+                crate::svc_tasks::tasks().spawn_forever(name, async move {
+                    crate::task_run::task_worker(bot, cfg, router, handles, stop, channel).await;
+                });
+            }
         }
         // ACP 执行层命令（随包 buzz-agent；None=开发/自签无随包 → run_bot 内落
         // PATH pi-acp 全路径兜底）。句柄对按 bot 在 run_bot 内构造（P2.1）。
