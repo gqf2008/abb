@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v11";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v12";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -120,9 +120,10 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
 - 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
   用户可以继续聊别的。
-- **同一通道内串行排队**（一次只跑一条）：定时档（`once`/`cron`/`interval`）与手动档
-  （`now`/`keepalive`）各有自己的队列——跨通道互不阻塞（定时任务不会被后台子代理挡在后面），
-  但同一档里同时丢多条不会更快，别把它当并发池。
+- **同一通道默认并行 N 条**（`config.json#task_workers`，默认 `{{\"schedule\":2,\"manual\":1}}`，0 按 1 兜底）：
+  定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`）各有自己的队列，跨通道互不阻塞；
+  **同一条任务永远不会自我重叠**（认领是单锁 check-and-set，跑到一半不会被再拉起）。
+  并发额度有限：一次丢十条仍只会按该档的 worker 数排队，超出就排队——它不是不限量的池子。
 - 子代理在后台跑完一轮 agent，**不产生中间可见回复**——用户只在完成时收到一条结果。
 - 别在本回合里 sleep/while 等它跑完（那正是要避免的「堵会话」）。
 
@@ -969,11 +970,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺——每个 bot 两条通道
-    /// （定时档 once/cron/interval、手动档 now/keepalive），**通道内**串行排队、跨通道互不
-    /// 阻塞（2026-09-26 拆通道前的口径是「每 bot 1 个 worker」，措辞已同步）；
-    /// `--proc` 虽写入 CLI 帮助，但须明确标注 agent 侧拒绝，不能让人误以为受限会话也能
-    /// 创建任意命令任务。
+    /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺。
+    /// 2026-09-26 两批修订后的真实口径：每个 bot 两条通道（定时档 once/cron/interval、
+    /// 手动档 now/keepalive），**同通道默认并行 N 条**（`task_workers`，默认 schedule 2 /
+    /// manual 1）、跨通道互不阻塞、**同一条任务永远不自我重叠**；并发额度有限，不得写成
+    /// 「无限并发」。`--proc` 虽写入 CLI 帮助，但须明确标注 agent 侧拒绝。
     #[test]
     fn workspace_guide_does_not_overpromise_task_semantics() {
         let dir = std::env::temp_dir().join(format!("abb-guide-neg-{}", uuid::Uuid::new_v4()));
@@ -985,16 +986,20 @@ mod tests {
                 "{name} 必须写明 agent 侧不能创建 proc 载荷"
             );
             assert!(
-                !text.contains("可并发") && !text.contains("并行"),
-                "{name} 不得承诺并发（Q7：每条通道 1 个 worker，通道内超限排队）"
+                text.contains("同一通道默认并行") && text.contains("task_workers"),
+                "{name} 应写明「同通道默认并行 N 条」与配置键（Q7 上限可配已接线）"
             );
             assert!(
-                text.contains("串行排队"),
-                "{name} 应写明通道内串行排队（否则误导 agent 一次丢十条）"
+                text.contains("同一条任务永远不会自我重叠"),
+                "{name} 应写明「同一条任务永不自我重叠」（否则会被读成同任务可并发）"
             );
             assert!(
                 text.contains("互不阻塞"),
                 "{name} 应写明跨通道互不阻塞（否则把「定时任务不会被后台子代理挡住」说没了）"
+            );
+            assert!(
+                !text.contains("无限并发") && !text.contains("一次只跑一条"),
+                "{name} 不得承诺无限并发，也不得留旧的「一次只跑一条」口径"
             );
             assert!(
                 text.contains("独立会话"),
@@ -1037,7 +1042,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v11"), "{name} 应升到 v11");
+            assert!(text.contains("abb-guide-v12"), "{name} 应升到 v12");
             assert!(!text.contains("abb-guide-v6"), "{name} 不应留 v6 marker");
             assert!(!text.contains("旧 v6 正文"), "{name} 旧正文应被整体替换");
             assert!(text.contains("## 后台子代理"), "{name} 应含子代理小节");
@@ -1091,7 +1096,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v11"), "{name} 应从 v8 升到 v11");
+            assert!(text.contains("abb-guide-v12"), "{name} 应从 v8 升到 v12");
             assert!(!text.contains("abb-guide-v8"), "{name} 不应留 v8 marker");
             assert!(!text.contains("旧 v8 正文"), "{name} 旧正文应被整体替换");
         }
@@ -1105,7 +1110,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v11"), "{name} 应从 v7 升到 v11");
+            assert!(text.contains("abb-guide-v12"), "{name} 应从 v7 升到 v12");
             assert!(!text.contains("abb-guide-v7"), "{name} 不应留 v7 marker");
             assert!(!text.contains("旧 v7 正文"), "{name} 旧正文应被整体替换");
         }
@@ -1121,7 +1126,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v11"), "{name} 应从 v9 升到 v11");
+            assert!(text.contains("abb-guide-v12"), "{name} 应从 v9 升到 v12");
             assert!(!text.contains("abb-guide-v9"), "{name} 不应留 v9 marker");
             assert!(!text.contains("旧 v9 正文"), "{name} 旧正文应被整体替换");
             assert!(text.contains("wassette"), "{name} 应含 wassette 随包工具");
@@ -1141,17 +1146,40 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v11"), "{name} 应从 v10 升到 v11");
+            assert!(text.contains("abb-guide-v12"), "{name} 应从 v10 升到 v12");
             assert!(!text.contains("abb-guide-v10"), "{name} 不应留 v10 marker");
             assert!(
                 !text.contains("同一 bot 的任务串行排队执行"),
                 "{name} 存量 v10 的旧容量模型必须被替换掉"
             );
             assert!(
-                text.contains("同一通道内串行排队"),
-                "{name} 应写明「同一通道内串行排队」"
+                text.contains("同一通道默认并行"),
+                "{name} 应写明「同一通道默认并行 N 条」"
             );
             assert!(text.contains("互不阻塞"), "{name} 应写明「跨通道互不阻塞」");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // v11 是**上一个版本**（正文写着「同一通道内串行排队（一次只跑一条）」），而本批把
+        // 定时档默认改成 2 worker → 那句默认即错。存量 v11 工作区必须能被升到 v12 更正过来。
+        let dir = std::env::temp_dir().join(format!("abb-guide-v11-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v11 = "# ABB 工作区（abb-guide-v11）\n\n## 后台子代理\n\n- **同一通道内串行排队**（一次只跑一条）：定时档（`once`/`cron`/`interval`）与手动档\n  （`now`/`keepalive`）各有自己的队列——跨通道互不阻塞（定时任务不会被后台子代理挡在后面），\n  但同一档里同时丢多条不会更快，别把它当并发池。\n";
+        std::fs::write(dir.join("CLAUDE.md"), v11).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), v11).unwrap();
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains("abb-guide-v12"), "{name} 应从 v11 升到 v12");
+            assert!(!text.contains("abb-guide-v11"), "{name} 不应留 v11 marker");
+            assert!(
+                !text.contains("一次只跑一条"),
+                "{name} 存量 v11 的「一次只跑一条」必须被替换（定时档默认已是 2 条）"
+            );
+            assert!(
+                text.contains("同一条任务永远不会自我重叠"),
+                "{name} 应写明「同一条任务永远不会自我重叠」"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
 

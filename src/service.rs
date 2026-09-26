@@ -570,29 +570,38 @@ pub async fn run() {
         let cfg = cfg.clone();
         let stop = crate::svc_tasks::shutdown_token();
         let router = router.clone();
-        // 任务执行 worker（#326 P2b / #306）：每 bot **两条通道**——定时档
-        // （once/cron/interval）与手动档（now/keepalive）各一个 worker；通道内串行认领
-        // = Q7 的「超限排队」，跨通道互不阻塞（否则 now 档的长任务会把定时触发饿死，
-        // cron 落在被占用分钟点的那次会整次消失）。执行层是 `buzz::oneshot`（自起 handle）
-        // ——Q7 拍板的 B1「task 独立 handle」，任务不占聊天句柄 slot。
+        // 任务执行 worker（#326 P2b / #306 / Q7「上限可配」）：每 bot **两条通道**——定时档
+        // （once/cron/interval）与手动档（now/keepalive）；每条通道按 `Config::task_workers`
+        // 起 N 个 worker（默认 schedule 2 / manual 1，0 按 1 兜底）。同通道内超限排队（Q7 的
+        // 「排队、不拒绝」），跨通道互不阻塞（否则 now 档的长任务会把定时触发饿死）；
+        // 同一条任务**永不自我重叠**（认领是单锁 check-and-set），并发只作用于不同任务。
+        // 执行层是 `buzz::oneshot`（自起 handle）——Q7 拍板的 B1「task 独立 handle」，
+        // 任务不占聊天句柄 slot。
         // store/states 两条通道**共享同一对实例**：两个实例并存会让运行态读-改-写丢更新。
         {
             let bot_key = bot.key();
             // 句柄只构造一次、按通道 clone：两条通道必须共享同一对 store/states。
             let handles = crate::task_run::TaskHandles::new(&bot_key);
-            for channel in [
-                crate::task_run::Channel::Schedule,
-                crate::task_run::Channel::Manual,
-            ] {
+            crate::log!(
+                "[task:{bot_key}] 通道 worker 数：schedule={} manual={}（Config.task_workers，0 按 1 兜底）",
+                cfg.task_workers
+                    .for_channel(crate::task_run::Channel::Schedule),
+                cfg.task_workers
+                    .for_channel(crate::task_run::Channel::Manual)
+            );
+            // Q7 的「上限可配」（`Config::task_workers`）：同一通道起 N 个 worker。
+            // 认领是单锁 check-and-set，所以**同一条任务不会双跑**；多出来的并发只让不同
+            // 任务能在同一档同时执行（0 按 1 兜底、上限见 `MAX_TASK_WORKERS_PER_CHANNEL`）。
+            // 清单抽成纯函数 `worker_specs`，让这层接线可单测。
+            for (name, worker) in crate::task_run::worker_specs(&cfg, &bot_key) {
                 let bot = bot.clone();
                 let cfg = cfg.clone();
                 let router = router.clone();
                 let stop = crate::svc_tasks::shutdown_token();
                 let handles = handles.clone();
-                let name: &'static str =
-                    Box::leak(format!("task:{}:{}", channel.label(), bot_key).into_boxed_str());
+                let name: &'static str = Box::leak(name.into_boxed_str());
                 crate::svc_tasks::tasks().spawn_forever(name, async move {
-                    crate::task_run::task_worker(bot, cfg, router, handles, stop, channel).await;
+                    crate::task_run::task_worker(bot, cfg, router, handles, stop, worker).await;
                 });
             }
         }

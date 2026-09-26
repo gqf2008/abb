@@ -31,7 +31,9 @@
 //! ## 执行通道（2026-09-26 拆档）
 //!
 //! Q7 的容量方案落地成**两条通道**（[`Channel`]）：定时档（`once`/`cron`/`interval`）与
-//! 手动档（`now`/`keepalive`）各一个 worker，通道内串行排队、跨通道互不阻塞。
+//! 手动档（`now`/`keepalive`）；每条通道按 `Config::task_workers` 起 N 个 worker
+//! （默认 schedule 2 / manual 1，0 按 1 兜底），通道内排队、跨通道互不阻塞，同一条任务
+//! 永不自我重叠（认领是单锁 check-and-set）。
 //! 拆的理由是：`now` 的后台子代理与 keepalive 常驻进程都是长任务，共用一条队列时
 //! 定时触发会被饿死（cron 落在被占用分钟点上的那次会整次消失）。两条通道共享同一对
 //! store/state 实例，认领走 [`claim_if_due`] 的单锁 check-and-set（多线程 runtime 下
@@ -125,11 +127,40 @@ impl Channel {
         }
     }
 
-    /// 该通道是否负责**全局维护动作**（keepalive 恢复、孤儿归位、取消请求消费、日志 GC、
-    /// 关停收尾）。这些动作是整表/全 bot 级的，**只能有一条通道执行**，否则会被做两遍
-    /// （恢复两遍、GC 两遍、取消请求被重复消费）。目前固定由手动档承担。
+    /// 该通道的**第 `worker_index` 号 worker** 是否负责全局维护动作（keepalive 恢复、
+    /// 孤儿归位、取消请求消费、日志 GC、关停收尾）。这些动作是整表/全 bot 级的，
+    /// **全 bot 只能有一个执行者**，否则会被做多遍（恢复两遍、GC 两遍、取消请求被重复消费）。
+    ///
+    /// 归属：手动档的 **0 号** worker。通道可配多 worker（Q7 的「上限可配」），所以判据
+    /// 必须带上序号——只按通道判会让手动档的每个 worker 都去做一遍维护动作。
+    fn owns_housekeeping(self, worker_index: usize) -> bool {
+        matches!(self, Channel::Manual) && worker_index == 0
+    }
+}
+
+/// 一个执行 worker 的身份：**哪条通道 + 通道内序号**。
+///
+/// 合成一个类型有两个原因：① 参数个数收敛（clippy `too_many_arguments` 是门禁）；
+/// ② 维护动作的归属判据必须带序号（只有手动档 0 号做），把两者绑在一起就不会漏传。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerId {
+    pub channel: Channel,
+    pub index: usize,
+}
+
+impl WorkerId {
+    pub fn new(channel: Channel, index: usize) -> WorkerId {
+        WorkerId { channel, index }
+    }
+
+    /// 该 worker 是否承担全局维护动作（见 [`Channel::owns_housekeeping`]）。
     fn owns_housekeeping(self) -> bool {
-        matches!(self, Channel::Manual)
+        self.channel.owns_housekeeping(self.index)
+    }
+
+    /// 日志/线程名里的标签，如 `schedule#1`。
+    pub fn label(self) -> String {
+        format!("{}#{}", self.channel.label(), self.index)
     }
 }
 
@@ -159,16 +190,35 @@ impl TaskHandles {
     }
 }
 
-/// 一条通道的 worker：`channel` 决定它认领哪一档触发。
+/// 按配置算出「这个 bot 要起哪些 worker」：`(线程名, worker 身份)`，顺序为
+/// Schedule#0..N、Manual#0..M。抽成**纯函数**是为了让这层接线有单测（此前只有代码审查）。
+pub fn worker_specs(cfg: &crate::config::Config, bot_key: &str) -> Vec<(String, WorkerId)> {
+    let mut out = Vec::new();
+    for channel in [Channel::Schedule, Channel::Manual] {
+        for index in 0..cfg.task_workers.for_channel(channel) {
+            out.push((
+                format!("task:{}:{index}:{bot_key}", channel.label()),
+                WorkerId::new(channel, index),
+            ));
+        }
+    }
+    out
+}
+
+/// 一条通道的 worker：`channel` 决定它认领哪一档触发，`worker_index` 是它在同通道内的序号。
+///
+/// 同一通道可以有多个 worker（`Config::task_workers`，默认 Schedule 2 / Manual 1）：它们
+/// 共享同一对 store/states，认领是单锁 check-and-set，所以**同一条任务不会双跑**；多出来的
+/// 并发只让**不同任务**能在同一档同时执行。
 pub async fn task_worker(
     bot: crate::config::BotConfig,
     cfg: Arc<crate::config::Config>,
     router: Arc<Router>,
     handles: TaskHandles,
     stop: tokio_util::sync::CancellationToken,
-    channel: Channel,
+    worker: WorkerId,
 ) {
-    task_worker_with_poll(bot, cfg, router, handles, stop, channel, POLL_INTERVAL).await
+    task_worker_with_poll(bot, cfg, router, handles, stop, worker, POLL_INTERVAL).await
 }
 
 /// `poll` 可注入版（测试用；生产走 [`task_worker`] 的固定间隔）。
@@ -178,10 +228,10 @@ pub(crate) async fn task_worker_with_poll(
     router: Arc<Router>,
     handles: TaskHandles,
     stop: tokio_util::sync::CancellationToken,
-    channel: Channel,
+    worker: WorkerId,
     poll: Duration,
 ) {
-    task_worker_with_stores(bot, cfg, router, handles, stop, channel, poll).await;
+    task_worker_with_stores(bot, cfg, router, handles, stop, worker, poll).await;
 }
 
 /// 注入 store/state 的 worker 主体，测试可直接驱动真实启动/关停路径而不碰真实 HOME。
@@ -191,14 +241,15 @@ async fn task_worker_with_stores(
     router: Arc<Router>,
     handles: TaskHandles,
     stop: tokio_util::sync::CancellationToken,
-    channel: Channel,
+    worker: WorkerId,
     poll: Duration,
 ) {
     let bot_key = bot.key();
     let store = handles.store;
     let states = handles.states;
     let process_start = handles.process_start;
-    if channel.owns_housekeeping() {
+    crate::log!("[task:{}:{bot_key}] worker 启动", worker.label());
+    if worker.owns_housekeeping() {
         // keepalive 必须先走独立恢复：它的 Running 可能对应一个仍存活、只是失去父
         // service 的进程；先把它移出 Running，后面的通用 orphan 重跑才不会制造双实例。
         recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
@@ -213,35 +264,38 @@ async fn task_worker_with_stores(
 
     loop {
         if stop.is_cancelled() {
-            if channel.owns_housekeeping() {
+            if worker.owns_housekeeping() {
                 // Backoff/Pending 没有正在执行的 run_one 负责收尾；在正常关停出口统一落终态，
                 // 否则下次启动会把它们当成待恢复任务重新拉起。
                 finalize_keepalives_on_shutdown(&store, &states);
             }
             return;
         }
-        if channel.owns_housekeeping() {
+        if worker.owns_housekeeping() {
             // 取消请求先于认领处理：排队等着的任务被 cancel 掉之后**不该再开跑**
             // （否则用户看到的是「已取消却仍然跑了一轮并投递结果」）。
             consume_cancel_requests(&store, &states);
         }
         // P2b-D：日志回收每小时扫一次（纯文件操作；不在每个 2s 轮询里做）。
         let now = crate::chrono_lite::unix_secs();
-        if channel.owns_housekeeping() && now.saturating_sub(last_gc) >= LOG_GC_INTERVAL_SECS {
+        if worker.owns_housekeeping() && now.saturating_sub(last_gc) >= LOG_GC_INTERVAL_SECS {
             last_gc = now;
             gc_logs(&store, &states, now);
         }
-        // 每通道每轮只认领一条：跑完再认领下一条 = 通道内串行排队（Q7）。
-        if let Some(task) = next_due_task(&store, &states, now, channel) {
+        // 每个 worker 每轮只认领一条：**认领成功**才立刻续扫（不白等轮询）；没抢到就落到 sleep。
+        // 注意别写成「找到候选就 continue」——候选判据（`next_due_task`）与认领判据
+        // （`claim_if_due`，锁内还会查取消请求文件）一旦不一致，就会出现「候选恒在、认领恒失败」
+        // → worker 打满 CPU 的忙循环（评审 D5' 实测：21.5 万次/秒）。两处判据已对齐（见
+        // `next_due_task` 对取消请求的过滤），这里的「只有成功才续扫」是第二道保险。
+        if let Some(task) = next_due_task(&store, &states, now, worker.channel) {
             if run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await {
-                continue; // 认领成功：立刻看本通道的下一条，不等轮询间隔
+                continue;
             }
-            // 适才那条已被并发者（另一条通道）抢走或状态已变：不空转，落到下面的等待。
         }
         tokio::select! {
             _ = tokio::time::sleep(poll) => {}
             _ = stop.cancelled() => {
-                if channel.owns_housekeeping() {
+                if worker.owns_housekeeping() {
                     finalize_keepalives_on_shutdown(&store, &states);
                 }
                 return;
@@ -1396,6 +1450,9 @@ fn next_due_task(
         .list()
         .into_iter()
         .filter(|t| Channel::of(t.trigger.kind) == channel)
+        // 挂住取消请求的任务**不算候选**：认领侧 `claim_if_due` 在锁内也会拒绝它。
+        // 两处判据必须一致，否则「候选恒在、认领恒失败」会把 worker 打成忙循环（评审 D5'）。
+        .filter(|t| !states.paths().cancel_file(&t.id).exists())
         .find(|t| is_due_for_claim(t, &states.get(&t.id), now))
 }
 
@@ -2167,6 +2224,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 接线层（service 起几个 worker）的单测：默认 schedule 2 + manual 1，顺序与命名稳定；
+    /// 配置成 1/0/超大值时的行为也在这里锁住（评审 D4）。
+    #[test]
+    fn worker_specs_follow_config() {
+        let bot = "b";
+        let specs = worker_specs(&crate::config::Config::default(), bot);
+        let got: Vec<(String, Channel, usize)> = specs
+            .iter()
+            .map(|(name, w)| (name.clone(), w.channel, w.index))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("task:schedule:0:b".to_string(), Channel::Schedule, 0),
+                ("task:schedule:1:b".to_string(), Channel::Schedule, 1),
+                ("task:manual:0:b".to_string(), Channel::Manual, 0),
+            ],
+            "默认：定时档 2 条并行、手动档 1 条"
+        );
+
+        let mut cfg = crate::config::Config::default();
+        cfg.task_workers.schedule = 1;
+        cfg.task_workers.manual = 0; // 0 → 1 兜底
+        let got: Vec<(String, Channel, usize)> = worker_specs(&cfg, bot)
+            .iter()
+            .map(|(name, w)| (name.clone(), w.channel, w.index))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("task:schedule:0:b".to_string(), Channel::Schedule, 0),
+                ("task:manual:0:b".to_string(), Channel::Manual, 0),
+            ],
+            "schedule=1 / manual=0：回到每通道 1 条（manual 的 0 兜底成 1）"
+        );
+    }
+
+    /// 通道可配多 worker 的核心收益：**不同**任务能在同一档同时被认领（同一条任务仍只认领一次，
+    /// 见 `concurrent_claim_admits_exactly_one`）。
+    #[test]
+    fn same_channel_claims_two_different_tasks_concurrently() {
+        let root = tmp_root("chan_two_tasks");
+        let store = TaskStore::new_at(&root, "b");
+        let states = Arc::new(TaskStateStore::new_at(&root, "b"));
+        let now = crate::chrono_lite::unix_secs();
+        let mk = |id: &str| {
+            let mut t = now_task("b", id, "c");
+            t.trigger = TaskTrigger {
+                kind: TriggerKind::Cron,
+                expr: "* * * * *".into(),
+                ..Default::default()
+            };
+            t
+        };
+        let a = mk("tk_two_a");
+        let b = mk("tk_two_b");
+        store.add(a.clone()).unwrap();
+        store.add(b.clone()).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|task| {
+                let states = Arc::clone(&states);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_if_due(&states, &task, now).is_some()
+                })
+            })
+            .collect();
+        let claimed = handles
+            .into_iter()
+            .map(|h| h.join().expect("认领线程不得 panic"))
+            .filter(|won| *won)
+            .count();
+        assert_eq!(claimed, 2, "两个不同任务应能同时被认领（多 worker 的意义）");
+        assert_eq!(states.get(&a.id).kind, TaskStateKind::Running);
+        assert_eq!(states.get(&b.id).kind, TaskStateKind::Running);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 认领必须原子：多个并发认领者（模拟两条通道 + 多线程 runtime）里**只能有一个**成功。
     /// 改前是「先读运行态（next_due_task）再写 Running（set）」两步，第二个认领者会同时
     /// 看到 Pending → 同一任务双跑；这条用例就是那个回归锁。
@@ -2249,6 +2388,44 @@ mod tests {
         );
     }
 
+    /// 候选判据必须与认领判据一致：挂着取消请求的任务**不算候选**。
+    /// 不一致的后果是「候选恒在、认领恒失败」→ 没抢到也 continue → worker 打满 CPU
+    /// （评审 D5' 实测 21.5 万次/秒）。这条锁的就是那个根因。
+    #[test]
+    fn next_due_task_skips_tasks_with_pending_cancel_request() {
+        let root = tmp_root("cancel_not_candidate");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let mut t = now_task("b", "tk_cancel_cand", "c");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".into(),
+            ..Default::default()
+        };
+        store.add(t.clone()).unwrap();
+        let now = crate::chrono_lite::unix_secs();
+
+        assert!(
+            next_due_task(&store, &states, now, Channel::Schedule).is_some(),
+            "无取消请求时它是正常候选"
+        );
+
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&t.id), b"{}").unwrap();
+        assert!(
+            next_due_task(&store, &states, now, Channel::Schedule).is_none(),
+            "挂着取消请求的任务不得作为候选（否则与认领判据冲突 → 忙循环）"
+        );
+
+        std::fs::remove_file(paths.cancel_file(&t.id)).unwrap();
+        assert!(
+            next_due_task(&store, &states, now, Channel::Schedule).is_some(),
+            "请求被消费后重新成为候选"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
     /// 有未消费的取消请求时不认领：请求由另一条通道消费，两条循环并发之下本通道可能
     /// 抢在消费之前认领（proc 载荷先起子进程）→「用户已取消，却仍然起了一轮」。
     #[test]
@@ -2318,9 +2495,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
-    /// 全局维护动作只由手动档执行（`Channel::owns_housekeeping`）：调度档不得消费取消请求、
-    /// 不得归位孤儿、也不得在关停时 finalize keepalive——双做会把 restarts 双记（吃掉
-    /// 有界重跑预算），或把「已取消」的任务重新拉起。手动档做**阳性对照**。
+    /// 全局维护动作**只由手动档 0 号**执行（`WorkerId::owns_housekeeping`）：调度档、以及
+    /// 手动档的其它序号都不得消费取消请求、归位孤儿、或在关停时 finalize keepalive——
+    /// 双做会把 restarts 双记（吃掉有界重跑预算），或把「已取消」的任务重新拉起。
+    /// 手动档 0 号做**阳性对照**。
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn schedule_channel_does_not_run_housekeeping() {
@@ -2380,6 +2558,7 @@ mod tests {
         run_channel_once(
             &root,
             Channel::Schedule,
+            0,
             Arc::clone(&store),
             Arc::clone(&states),
             now,
@@ -2405,10 +2584,38 @@ mod tests {
             "调度档关停不得 finalize keepalive"
         );
 
-        // —— 手动档：同样三条，必须都被处理（阳性对照） ——
+        // —— 手动档 **1 号** worker：与调度档一样不得做维护动作 ——
+        // 通道可配多 worker（默认 schedule 2 / manual 1，可调大），所以判据必须带序号：
+        // 手动档的维护动作只归 0 号，1 号只是个普通认领者。
         run_channel_once(
             &root,
             Channel::Manual,
+            1,
+            Arc::clone(&store),
+            Arc::clone(&states),
+            now,
+        )
+        .await;
+        assert!(
+            paths.cancel_file(&cron.id).exists(),
+            "手动档 1 号 worker 不得消费取消请求（只归 0 号）"
+        );
+        assert_eq!(
+            states.get(&orphan.id).kind,
+            TaskStateKind::Running,
+            "手动档 1 号 worker 不得归位孤儿"
+        );
+        assert_eq!(
+            states.get(&ka.id).kind,
+            TaskStateKind::Backoff,
+            "手动档 1 号 worker 关停不得 finalize keepalive"
+        );
+
+        // —— 手动档 **0 号**：同样三条，必须都被处理（阳性对照） ——
+        run_channel_once(
+            &root,
+            Channel::Manual,
+            0,
             Arc::clone(&store),
             Arc::clone(&states),
             now,
@@ -2446,6 +2653,7 @@ mod tests {
     async fn run_channel_once(
         root: &std::path::Path,
         channel: Channel,
+        worker_index: usize,
         store: Arc<TaskStore>,
         states: Arc<TaskStateStore>,
         process_start: u64,
@@ -2472,7 +2680,7 @@ mod tests {
                     router,
                     handles,
                     stop,
-                    channel,
+                    WorkerId::new(channel, worker_index),
                     Duration::from_millis(10),
                 )
                 .await;
@@ -2685,9 +2893,9 @@ mod tests {
                 process_start: crate::chrono_lite::unix_secs(),
             },
             stop,
-            // keepalive 的恢复/关停收尾只在手动档推进（`owns_housekeeping`），
+            // keepalive 的恢复/关停收尾只在手动档 0 号推进（`WorkerId::owns_housekeeping`），
             // 本用例驱动的正是这条路径。
-            Channel::Manual,
+            WorkerId::new(Channel::Manual, 0),
             Duration::from_millis(10),
         )
         .await;
