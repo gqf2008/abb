@@ -1091,6 +1091,32 @@ impl TaskStateStore {
         save_json(&self.paths.states(), &snap)
     }
 
+    /// **条件写**：在同一把锁内完成「读运行态 → 判定 → 写回 + 落盘」，返回写入后的运行态；
+    /// `f` 返回 `None` 表示不改（不写盘）。
+    ///
+    /// 凡是「读一份运行态、改一点、再写回去」的地方都必须走这里。P2b 起每 bot 有两条
+    /// 并发通道（定时档 / 手动档），`get` + `set` 两步之间另一条通道的写会被静默覆盖
+    /// ——典型受害者是「取消置 `Cancelled` 后又被投递失败的回写盖回 Succeeded/Failed」，
+    /// 那会让取消永久丢失、周期任务继续触发。
+    pub fn update_if<F>(&self, id: &str, f: F) -> Option<TaskRuntime>
+    where
+        F: FnOnce(&TaskRuntime) -> Option<TaskRuntime>,
+    {
+        let (next, snap) = {
+            let mut d = self.data.lock().unwrap();
+            let prev = d.get(id).cloned().unwrap_or_default();
+            let next = f(&prev)?;
+            d.insert(id.to_string(), next.clone());
+            (next, d.clone())
+        };
+        if let Err(e) = save_json(&self.paths.states(), &snap) {
+            // 与 `set` 同口径：落盘失败只记日志，不假装没写（内存态已推进，下次成功
+            // 落盘会覆盖；回退反而会让 running 的任务被再次拉起）。
+            crate::log!("[task] 运行态落盘失败（{id}）：{e:#}");
+        }
+        Some(next)
+    }
+
     /// **认领的唯一互斥点**：在同一把锁内完成「读运行态 → 判据 → 写 Running + 落盘」，
     /// 返回写入后的运行态；`decide` 返回 `None` 表示这条此刻不该认领（不写盘）。
     ///
@@ -1105,19 +1131,7 @@ impl TaskStateStore {
     where
         F: FnOnce(&TaskRuntime) -> Option<TaskRuntime>,
     {
-        let (next, snap) = {
-            let mut d = self.data.lock().unwrap();
-            let prev = d.get(id).cloned().unwrap_or_default();
-            let next = decide(&prev)?;
-            d.insert(id.to_string(), next.clone());
-            (next, d.clone())
-        };
-        if let Err(e) = save_json(&self.paths.states(), &snap) {
-            // 与 `set` 同口径：落盘失败只记日志，不假装没认领（内存态已经推进，
-            // 下次成功落盘会覆盖；丢掉这轮反而会让 running 的任务被再次拉起）。
-            crate::log!("[task] 认领落盘失败（{id}）：{e:#}");
-        }
-        Some(next)
+        self.update_if(id, decide)
     }
 
     /// 删掉一条运行态（删任务时一并清，避免 file 里留孤儿）。

@@ -120,7 +120,9 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
 - 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
   用户可以继续聊别的。
-- **同一 bot 的任务串行排队执行**（一次只跑一条）：同时丢多条不会更快，别把它当并发池。
+- **同一通道内串行排队**（一次只跑一条）：定时档（`once`/`cron`/`interval`）与手动档
+  （`now`/`keepalive`）各有自己的队列——跨通道互不阻塞（定时任务不会被后台子代理挡在后面），
+  但同一档里同时丢多条不会更快，别把它当并发池。
 - 子代理在后台跑完一轮 agent，**不产生中间可见回复**——用户只在完成时收到一条结果。
 - 别在本回合里 sleep/while 等它跑完（那正是要避免的「堵会话」）。
 
@@ -967,9 +969,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺——当前每个 bot 只有
-    /// 1 个 task worker（超限排队，不并发）；`--proc` 虽写入 CLI 帮助，但须明确标注 agent
-    /// 侧拒绝，不能让人误以为受限会话也能创建任意命令任务。
+    /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺——每个 bot 两条通道
+    /// （定时档 once/cron/interval、手动档 now/keepalive），**通道内**串行排队、跨通道互不
+    /// 阻塞（2026-09-26 拆通道前的口径是「每 bot 1 个 worker」，措辞已同步）；
+    /// `--proc` 虽写入 CLI 帮助，但须明确标注 agent 侧拒绝，不能让人误以为受限会话也能
+    /// 创建任意命令任务。
     #[test]
     fn workspace_guide_does_not_overpromise_task_semantics() {
         let dir = std::env::temp_dir().join(format!("abb-guide-neg-{}", uuid::Uuid::new_v4()));
@@ -982,11 +986,15 @@ mod tests {
             );
             assert!(
                 !text.contains("可并发") && !text.contains("并行"),
-                "{name} 不得承诺并发（Q7：每 bot 1 个 worker，超限排队）"
+                "{name} 不得承诺并发（Q7：每条通道 1 个 worker，通道内超限排队）"
             );
             assert!(
                 text.contains("串行排队"),
-                "{name} 应写明任务串行排队（否则误导 agent 一次丢十条）"
+                "{name} 应写明通道内串行排队（否则误导 agent 一次丢十条）"
+            );
+            assert!(
+                text.contains("互不阻塞"),
+                "{name} 应写明跨通道互不阻塞（否则把「定时任务不会被后台子代理挡住」说没了）"
             );
             assert!(
                 text.contains("独立会话"),

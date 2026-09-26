@@ -142,6 +142,9 @@ impl Channel {
 pub struct TaskHandles {
     pub store: Arc<TaskStore>,
     pub states: Arc<TaskStateStore>,
+    /// 本进程开始接管的时刻（秒）。`requeue_orphans` 用它区分「上次进程残留的 Running」
+    /// 与「本进程刚刚认领、正在跑」——两条通道并发启动时后者会被误判成孤儿并归位 → 双跑。
+    pub process_start: u64,
 }
 
 impl TaskHandles {
@@ -151,6 +154,7 @@ impl TaskHandles {
         TaskHandles {
             store: Arc::new(TaskStore::new(bot_key)),
             states: Arc::new(TaskStateStore::new(bot_key)),
+            process_start: crate::chrono_lite::unix_secs(),
         }
     }
 }
@@ -193,13 +197,16 @@ async fn task_worker_with_stores(
     let bot_key = bot.key();
     let store = handles.store;
     let states = handles.states;
+    let process_start = handles.process_start;
     if channel.owns_housekeeping() {
         // keepalive 必须先走独立恢复：它的 Running 可能对应一个仍存活、只是失去父
         // service 的进程；先把它移出 Running，后面的通用 orphan 重跑才不会制造双实例。
         recover_keepalives(&store, &states, crate::chrono_lite::unix_secs()).await;
         // agent 任务在 oneshot 里跑，没有可复活的 pid 账本，重跑是唯一安全的归位
         // （副作用幂等性由任务 prompt 自己负责——文档 §风险表已记「结果重复投递」）。
-        requeue_orphans(&store, &states);
+        // `process_start` 是必需的：定时档可能已经抢在归位之前认领并跑起来了（两条通道
+        // 并发启动），那种 Running 是**本进程**的，不是孤儿。
+        requeue_orphans(&store, &states, process_start);
     }
     // 上次回收时间（0 = 启动后先扫一遍）
     let mut last_gc = 0u64;
@@ -315,6 +322,12 @@ fn claim_if_due(states: &TaskStateStore, task: &Task, now: u64) -> Option<u64> {
     let mut due = None;
     states
         .try_claim(&task.id, |prev| {
+            // 有未消费的取消请求就先不认领：取消请求由**另一条通道**消费，而两条通道
+            // 现在是并发的——本通道可能抢在消费之前认领（proc 载荷会先把子进程起起来，
+            // 于是出现「用户已取消，却仍然起了一轮」）。取消请求优先，认领方让位。
+            if states.paths().cancel_file(&task.id).exists() {
+                return None;
+            }
             let d = due_for_claim(task, prev, now)?;
             due = Some(d);
             Some(claim(prev, now))
@@ -679,13 +692,21 @@ async fn finish_task_attempt(
         crate::deliver::DeliveryOutcome::Delivered => String::new(),
     };
     let note = format!("结果投递失败：{reason}");
-    let mut rt2 = states.get(&id);
-    rt2.last_error = if rt2.last_error.is_empty() {
-        note.clone()
-    } else {
-        format!("{}；{note}", rt2.last_error)
-    };
-    let _ = states.set(&id, rt2);
+    // **条件写**，不是 get+set：取消请求由另一条通道并发消费，若这中间把状态置成
+    // Cancelled，这里的回写会把取消盖回 Succeeded/Failed（请求文件已删）→ 取消永久
+    // 丢失、周期任务继续触发。取消是用户明确的终态，投递失败只补错误文案、不许改档。
+    let _ = states.update_if(&id, |prev| {
+        if prev.kind == TaskStateKind::Cancelled {
+            return None;
+        }
+        let mut next = prev.clone();
+        next.last_error = if next.last_error.is_empty() {
+            note.clone()
+        } else {
+            format!("{}；{note}", next.last_error)
+        };
+        Some(next)
+    });
     crate::log!("[task:{bot_key}] {short} {note}（目标 bot={target_bot} chat={chat}）");
     alert_primary_chat(
         router,
@@ -1379,11 +1400,16 @@ fn next_due_task(
 /// 未超限 → 归位 `Pending` 并 `restarts += 1`；超限 → `Failed`，由用户显式重跑。
 ///
 /// 同时清掉「有运行态但没有定义」的孤儿条目（`task rm` 与 worker 认领的竞态会留下）。
-fn requeue_orphans(store: &TaskStore, states: &TaskStateStore) {
+fn requeue_orphans(store: &TaskStore, states: &TaskStateStore, process_start: u64) {
     let tasks = store.list();
     for t in &tasks {
         let rt = states.get(&t.id);
         if rt.kind != TaskStateKind::Running {
+            continue;
+        }
+        // 本进程刚认领、正在跑的 Running **不是**孤儿：两条通道并发启动时，定时档可能
+        // 已经跑在归位前面（P2b 拆通道引入的新交错）。归位它 = 让同一条任务再跑一轮。
+        if rt.started_at.map(|s| s >= process_start).unwrap_or(false) {
             continue;
         }
         let short = &t.id[..t.id.len().min(12)];
@@ -2173,6 +2199,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 本进程刚认领的 Running **不是**孤儿：两条通道并发启动时，定时档可能已经跑在
+    /// 归位前面；把它当孤儿归位 = 让同一条任务再跑一轮（新交错，P2b 拆通道引入）。
+    #[test]
+    fn requeue_orphans_skips_running_claimed_by_this_process() {
+        let root = tmp_root("orphan_own");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let t = now_task("b", "tk_own", "c");
+        store.add(t.clone()).unwrap();
+        let started = crate::chrono_lite::unix_secs();
+        states
+            .set(&t.id, claim(&TaskRuntime::default(), started))
+            .unwrap();
+
+        requeue_orphans(&store, &states, started);
+        assert_eq!(
+            states.get(&t.id).kind,
+            TaskStateKind::Running,
+            "认领时刻不早于本进程启动 → 是本进程在跑的那轮，不得归位"
+        );
+
+        requeue_orphans(&store, &states, started + 1);
+        assert_eq!(
+            states.get(&t.id).kind,
+            TaskStateKind::Pending,
+            "认领时刻早于本进程启动（上次进程残留）→ 仍须归位重跑"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 全局维护动作只由手动档执行（`Channel::owns_housekeeping`）：调度档不得消费取消请求、
+    /// 不得归位孤儿、也不得在关停时 finalize keepalive——双做会把 restarts 双记（吃掉
+    /// 有界重跑预算），或把「已取消」的任务重新拉起。手动档做**阳性对照**。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schedule_channel_does_not_run_housekeeping() {
+        let root = tmp_root("chan_housekeeping");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = TaskStateStore::new_at(&root, "b");
+        let now = crate::chrono_lite::unix_secs();
+
+        // ① 一条 Pending 的 cron + 已落盘的取消请求（只该由手动档消费）
+        let mut cron = now_task("b", "tk_hk_cancel", "c");
+        cron.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "*/10 * * * *".into(),
+            ..Default::default()
+        };
+        store.add(cron.clone()).unwrap();
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&cron.id), b"{}").unwrap();
+
+        // ② 上次进程残留的 Running 孤儿，且重跑预算已耗尽（归位 → Failed，不再可认领）
+        let mut orphan = now_task("b", "tk_hk_orphan", "c");
+        orphan.limits.max_restarts = 0;
+        store.add(orphan.clone()).unwrap();
+        states
+            .set(
+                &orphan.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Running,
+                    started_at: Some(now - 3600),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // ③ 退避中的 keepalive（退避未到 → 不可认领，避免测试里真的起进程）
+        let mut ka = keepalive_task("b", "tk_hk_ka", &root, "sleep 60".into(), true);
+        ka.limits.timeout_secs = 0;
+        store.add(ka.clone()).unwrap();
+        states
+            .set(
+                &ka.id,
+                TaskRuntime {
+                    kind: TaskStateKind::Backoff,
+                    next_retry_at: Some(now + 3600),
+                    consecutive_failures: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // 两条通道共享同一对实例（`Arc`），与生产一致。
+        let store = Arc::new(store);
+        let states = Arc::new(states);
+
+        // —— 调度档：只认领、不做任何维护动作 ——
+        run_channel_once(
+            &root,
+            Channel::Schedule,
+            Arc::clone(&store),
+            Arc::clone(&states),
+            now,
+        )
+        .await;
+        assert!(
+            paths.cancel_file(&cron.id).exists(),
+            "调度档不得消费取消请求（那是手动档的活）"
+        );
+        assert_eq!(
+            states.get(&cron.id).kind,
+            TaskStateKind::Pending,
+            "调度档不得改写被取消请求挂住的运行态"
+        );
+        assert_eq!(
+            states.get(&orphan.id).kind,
+            TaskStateKind::Running,
+            "调度档不得归位孤儿"
+        );
+        assert_eq!(
+            states.get(&ka.id).kind,
+            TaskStateKind::Backoff,
+            "调度档关停不得 finalize keepalive"
+        );
+
+        // —— 手动档：同样三条，必须都被处理（阳性对照） ——
+        run_channel_once(
+            &root,
+            Channel::Manual,
+            Arc::clone(&store),
+            Arc::clone(&states),
+            now,
+        )
+        .await;
+        assert!(
+            !paths.cancel_file(&cron.id).exists(),
+            "手动档必须消费取消请求"
+        );
+        assert_eq!(
+            states.get(&cron.id).kind,
+            TaskStateKind::Cancelled,
+            "取消请求应把重复档置为 Cancelled"
+        );
+        assert_eq!(
+            states.get(&orphan.id).kind,
+            TaskStateKind::Failed,
+            "手动档必须归位孤儿（这里是重跑预算耗尽 → Failed）"
+        );
+        assert_eq!(
+            states.get(&ka.id).kind,
+            TaskStateKind::Cancelled,
+            "手动档关停必须 finalize keepalive"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// 起一条通道的 worker 跑一小会儿再正常关停（供上面的维护动作用例驱动真实循环）。
+    async fn run_channel_once(
+        root: &std::path::Path,
+        channel: Channel,
+        store: Arc<TaskStore>,
+        states: Arc<TaskStateStore>,
+        process_start: u64,
+    ) {
+        let bot = crate::config::BotConfig::default();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handles = TaskHandles {
+            store,
+            states,
+            process_start,
+        };
+        let router = Arc::new(Router::new(
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+        ));
+        let worker = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                task_worker_with_poll(
+                    bot,
+                    Arc::new(crate::config::Config::default()),
+                    router,
+                    handles,
+                    stop,
+                    channel,
+                    Duration::from_millis(10),
+                )
+                .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        stop.cancel();
+        let _ = worker.await;
+        let _ = root;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn keepalive_resume_false_cleans_stale_runtime_without_process() {
@@ -2371,6 +2588,7 @@ mod tests {
             TaskHandles {
                 store: Arc::new(store),
                 states: Arc::new(states),
+                process_start: crate::chrono_lite::unix_secs(),
             },
             stop,
             // keepalive 的恢复/关停收尾只在手动档推进（`owns_housekeeping`），
@@ -2831,7 +3049,7 @@ mod tests {
         // 恶意/损坏的状态键：清洗后与活任务同名
         states.set("a/b", rt.clone()).unwrap();
 
-        requeue_orphans(&store, &states);
+        requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
 
         assert!(
             paths.log_file("a_b").exists(),
@@ -3017,7 +3235,7 @@ mod tests {
         );
 
         // max_restarts 默认 1：第一次中断允许归位重跑，并记一次 restarts
-        requeue_orphans(&store, &states);
+        requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
         assert_eq!(states.get("tk_run").kind, TaskStateKind::Pending);
         assert_eq!(states.get("tk_run").restarts, 1);
         assert_eq!(
@@ -3477,7 +3695,7 @@ mod tests {
         states
             .set("tk_cycle", claim(&TaskRuntime::default(), 1))
             .unwrap();
-        requeue_orphans(&store, &states);
+        requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
         assert_eq!(states.get("tk_cycle").kind, TaskStateKind::Pending);
         assert_eq!(states.get("tk_cycle").restarts, 1);
 
@@ -3487,7 +3705,7 @@ mod tests {
         assert_eq!(states.get("tk_cycle").restarts, 1, "认领不得清零");
 
         // 第 2 次中断 → 已达上限，落 Failed 且不再被认领
-        requeue_orphans(&store, &states);
+        requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
         let rt = states.get("tk_cycle");
         assert_eq!(rt.kind, TaskStateKind::Failed);
         assert!(
@@ -3523,7 +3741,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            requeue_orphans(&store, &states);
+            requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
             let rt = states.get("tk_bound");
             assert_eq!(rt.kind, TaskStateKind::Pending, "第 {want} 次应归位");
             assert_eq!(rt.restarts, want);
@@ -3540,7 +3758,7 @@ mod tests {
                 },
             )
             .unwrap();
-        requeue_orphans(&store, &states);
+        requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
         let rt = states.get("tk_bound");
         assert_eq!(rt.kind, TaskStateKind::Failed);
         assert!(rt.last_error.contains("中断"), "{}", rt.last_error);
@@ -3571,7 +3789,7 @@ mod tests {
             )
             .unwrap();
 
-        requeue_orphans(&store, &states);
+        requeue_orphans(&store, &states, crate::chrono_lite::unix_secs());
         assert!(
             states.ids().is_empty(),
             "无定义的残留运行态应被清掉：{:?}",
