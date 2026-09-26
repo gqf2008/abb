@@ -1027,7 +1027,7 @@ mod tests {
     /// v8 新增「编程类长任务走子代理 + 委派必须立刻告知用户 + 用定时任务监控」三条硬规则。
     /// v10 新增 wassette（随包工具 4→5，与 base_prompt 口径一致）。
     #[test]
-    fn workspace_guide_upgrades_v6_marker_to_v10() {
+    fn workspace_guide_upgrades_old_markers_to_latest() {
         let dir = std::env::temp_dir().join(format!("abb-guide-v6-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let v6 = "# ABB 工作区（abb-guide-v6）\n\n## 其它\n\n- 旧 v6 正文\n";
