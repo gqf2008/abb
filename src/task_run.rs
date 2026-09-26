@@ -81,7 +81,7 @@ const OVERDUE_LOG_SECS: u64 = 60;
 /// cron 逾期认领的扫描窗口（秒）。
 ///
 /// 执行位被长任务占住而错过的分钟点，只要还在这个窗口内就补跑一次；
-/// 更早的错过点不再追溯（沿用 Q14「不补历史周期」），同时也把
+/// 更早的错过点不再追溯（只补最近一次、不重放整段历史周期），同时也把
 /// 「表达式永远不命中」这类任务每次轮询的扫描代价钉在上界。
 const CRON_CATCHUP_WINDOW_SECS: u64 = 48 * 3600;
 
@@ -185,8 +185,11 @@ async fn run_one(
     if let Some(due) = due {
         let late = started.saturating_sub(due);
         if late >= OVERDUE_LOG_SECS {
+            // 迟到可能是「执行位被占」「service 停过」「登记时时间点已过」——日志只如实记
+            // 应到时刻与迟到时长，不替用户下因果结论。
             crate::log!(
-                "[task:{bot_key}] {short} 逾期认领：应到 {}，迟到 {late}s（执行位此前被占）",
+                "[task:{bot_key}] {short} 逾期认领（{}档）：应到 {}，迟到 {late}s",
+                trigger_label(task.trigger.kind),
                 fmt_local(due)
             );
         }
@@ -922,14 +925,17 @@ fn due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> Option<u64> {
 ///   占住而错过时，会在 worker 空出来后**补跑一次**。只补一次：认领即刷新
 ///   `last_fired_at`，不会重放整段历史；
 /// - 同一分钟桶已记账 → 不认领（保留「同一分钟只触发一次」，防 2s 轮询重复触发）；
-/// - 记账时刻在**未来**（时钟回拨/手改状态文件）→ 不信这笔记账，回落为当前分钟匹配；
-/// - 超过 [`CRON_CATCHUP_WINDOW_SECS`] 的错过点不补（沿用 Q14「不补历史周期」）。
+/// - 记账时刻在**未来且不在同一分钟桶**（时钟回拨/手改状态文件）→ 不信这笔记账，
+///   回落为当前分钟匹配；同一分钟桶仍按去重不认领（最坏推迟到下一分钟，不会卡死）；
+/// - 超过 [`CRON_CATCHUP_WINDOW_SECS`] 的错过点不补（只补窗口内最近一次，不重放整段历史周期）。
 fn cron_due(expr: &crate::schedule::CronExpr, last_fired_at: Option<u64>, now: u64) -> Option<u64> {
     let now_dt = crate::schedule::DateTime::from_unix(now as i64);
     let Some(last) = last_fired_at else {
         return expr.matches(&now_dt).then_some(now);
     };
-    // 同一分钟只触发一次（worker 每 2s 轮询，没有这条会在一分钟内反复触发）
+    // 同一分钟只触发一次（worker 每 2s 轮询，没有这条会在一分钟内反复触发）。
+    // 这条是**纵深防御**：性质其实由下面的扫描起点结构性保证（起点是「上次记账的下一分钟」，
+    // 当前分钟永远不会被扫到）。保留它显式表达契约，也防止将来改动扫描起点时静默破坏它。
     if last / 60 == now / 60 {
         return None;
     }
@@ -952,6 +958,17 @@ fn cron_due(expr: &crate::schedule::CronExpr, last_fired_at: Option<u64>, now: u
 fn fmt_local(secs: u64) -> String {
     let (y, mo, d, h, mi, s) = crate::chrono_lite::epoch_to_ymd(secs);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// 触发档的短标签（日志用），与 CLI 的档位名保持一致。
+fn trigger_label(kind: TriggerKind) -> &'static str {
+    match kind {
+        TriggerKind::Now => "now",
+        TriggerKind::Once => "once",
+        TriggerKind::Cron => "cron",
+        TriggerKind::Interval => "interval",
+        TriggerKind::Keepalive => "keepalive",
+    }
 }
 
 /// service 正常关停出口：Pending/Backoff/Succeeded 没有在跑的 `run_proc_attempt`
