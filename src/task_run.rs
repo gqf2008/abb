@@ -74,6 +74,17 @@ const LOG_RETENTION_DAYS: u64 = 30;
 /// 日志回收扫描间隔（秒）：worker 每 2s 轮询任务，日志回收每小时一次就够。
 const LOG_GC_INTERVAL_SECS: u64 = 3600;
 
+/// 逾期认领的记日志阈值（秒）：认领时刻比「应到时刻」晚这么多才写一行，
+/// 免得把 2s 轮询的正常抖动也当成逾期刷日志。
+const OVERDUE_LOG_SECS: u64 = 60;
+
+/// cron 逾期认领的扫描窗口（秒）。
+///
+/// 执行位被长任务占住而错过的分钟点，只要还在这个窗口内就补跑一次；
+/// 更早的错过点不再追溯（沿用 Q14「不补历史周期」），同时也把
+/// 「表达式永远不命中」这类任务每次轮询的扫描代价钉在上界。
+const CRON_CATCHUP_WINDOW_SECS: u64 = 48 * 3600;
+
 /// 每个 bot 一个 task worker：
 /// Q7 定的是「每 bot 默认 1 个 worker，超限**排队**（不拒绝）」——单 worker 串行
 /// 消费就是排队语义，无需另造队列。
@@ -166,7 +177,20 @@ async fn run_one(
 
     let started = crate::chrono_lite::unix_secs();
     let prev = states.get(&id);
+    // 先按**认领前**的运行态算出应到时刻，再认领（claim 会刷新 last_fired_at）。
+    let due = due_for_claim(&task, &prev, started);
     let _ = states.set(&id, claim(&prev, started));
+    // 逾期认领必须留痕：过去「执行位被长任务占住 → 该分钟点永久消失」是**完全静默**的，
+    // 用户看不到「定时任务为什么没跑」。这里如实记一笔应到时刻与迟到秒数。
+    if let Some(due) = due {
+        let late = started.saturating_sub(due);
+        if late >= OVERDUE_LOG_SECS {
+            crate::log!(
+                "[task:{bot_key}] {short} 逾期认领：应到 {}，迟到 {late}s（执行位此前被占）",
+                fmt_local(due)
+            );
+        }
+    }
     crate::log!(
         "[task:{bot_key}] {short} 开跑（workspace={}）",
         task_workspace(bot_key, &task)
@@ -822,65 +846,112 @@ fn write_log(paths: &crate::task_store::TaskPaths, task: &Task, rt: &TaskRuntime
 /// 语义（与 `docs/task-model.md` 的 P2b-C 一节一致）：
 /// - `now`：登记即跑一次（#306 的后台子代理，行为不变）；
 /// - `once`：到点跑；**错过后补跑**（与 `job` 调度器 `Job::is_due` 一致，`t <= now`）；
-/// - `cron`：当前分钟匹配表达式才跑，且**同一分钟只触发一次**（worker 每 2s 轮询，
-///   没有 `last_fired_at` 的分钟去重会在一分钟内反复触发）；
+/// - `cron`：**上次记账之后应到期的那个分钟点已过**即认领（详见 [`cron_due`]）——
+///   执行位被长任务占住而错过的分钟点会补跑一次，且同一分钟只触发一次；
 /// - `interval`：`last_fired_at` 为空（首次）即跑，之后每 N 秒一次；
 /// - `keepalive`：Pending 或退避到期时认领；带进程代际身份的 Backoff 必须等恢复
 ///   路径确认旧代际已死，不能在 Running 直接再拉一个；
 /// - 任何触发档在 `Running` 时都不认领（同任务不并发），`Cancelled` 是用户明确的终态
 ///   （要再跑就重新登记）；重复档（cron/interval）跑完一轮后回到可认领状态。
 fn is_due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> bool {
+    due_for_claim(task, rt, now).is_some()
+}
+
+/// 「此刻应被认领」的应到时刻（秒）；`None` = 不该认领。
+///
+/// 把应到时刻**返回**出来（而不是只回 bool）是为了可观测性：认领方拿它与当前时刻
+/// 比对，就能如实记下「逾期 N 秒才轮到它（执行位此前被占）」——cron 档过去的
+/// 完全静默正是缺这一笔（见 `run_one` 里的逾期日志）。
+fn due_for_claim(task: &Task, rt: &TaskRuntime, now: u64) -> Option<u64> {
     let kind = task.trigger.kind;
     match rt.kind {
         TaskStateKind::Running | TaskStateKind::Cancelled | TaskStateKind::Interrupted => {
-            return false
+            return None
         }
         TaskStateKind::Pending => {}
         TaskStateKind::Backoff => {
-            return kind == TriggerKind::Keepalive
+            let due = kind == TriggerKind::Keepalive
                 && rt.proc_identity.is_none()
                 && rt.next_retry_at.map(|t| t <= now).unwrap_or(true);
+            return due.then_some(rt.next_retry_at.unwrap_or(now));
         }
         TaskStateKind::Succeeded | TaskStateKind::Failed => {
             // 一次性任务跑过就是跑过了；重复档等下一次到点
             if !kind.is_repeating() {
-                return false;
+                return None;
             }
         }
     }
     match kind {
-        TriggerKind::Now => rt.kind == TaskStateKind::Pending,
+        TriggerKind::Now => (rt.kind == TaskStateKind::Pending).then_some(now),
         TriggerKind::Once => crate::schedule::parse_once(&task.trigger.expr)
-            .map(|t| t.to_unix().max(0) as u64 <= now)
-            .unwrap_or(false),
+            .map(|t| t.to_unix().max(0) as u64)
+            .filter(|t| *t <= now),
         TriggerKind::Cron => {
-            let Some(expr) = crate::schedule::CronExpr::parse(&task.trigger.expr) else {
-                return false;
-            };
-            if !expr.matches(&crate::schedule::DateTime::from_unix(now as i64)) {
-                return false;
-            }
-            rt.last_fired_at.map(|t| t / 60) != Some(now / 60)
+            let expr = crate::schedule::CronExpr::parse(&task.trigger.expr)?;
+            cron_due(&expr, rt.last_fired_at, now)
         }
         TriggerKind::Interval => {
-            let Some(secs) = crate::task_store::parse_interval_secs(&task.trigger.expr) else {
-                return false;
-            };
+            let secs = crate::task_store::parse_interval_secs(&task.trigger.expr)?;
             match rt.last_fired_at {
-                None => true,
+                None => Some(now),
                 // 记账时刻在**未来**（系统时钟回拨、或手改状态文件）→ 不信这笔记账，
                 // 按"到点"处理；否则任务会一直不跑，直到墙钟追上那个未来时间点。
-                Some(last) if last > now => true,
-                Some(last) => now >= last.saturating_add(secs),
+                Some(last) if last > now => Some(now),
+                Some(last) => {
+                    let due = last.saturating_add(secs);
+                    (due <= now).then_some(due)
+                }
             }
         }
         // Pending 是新登记/正常退出后的入口；Succeeded 是旧状态或旁路写入的“未在跑”。
         // Failed 只由熔断产生，Interrupted 表示旧代际未安全接管，两者都不得自动拉起。
         TriggerKind::Keepalive => {
-            matches!(rt.kind, TaskStateKind::Pending | TaskStateKind::Succeeded)
-                && rt.proc_identity.is_none()
+            (matches!(rt.kind, TaskStateKind::Pending | TaskStateKind::Succeeded)
+                && rt.proc_identity.is_none())
+            .then_some(now)
         }
     }
+}
+
+/// cron 的应到时刻：**上次记账之后应到期的那个命中分钟点**。
+///
+/// - 从未跑过（`last_fired_at` 为空）：维持原语义——当前分钟命中表达式即可跑，
+///   新登记的任务不追溯历史周期（`missed_schedules_do_not_backfill_history` 锁的就是这条）；
+/// - 已跑过：判据放宽为「上次记账之后存在一个已到期的命中分钟点」→ 该点被长任务
+///   占住而错过时，会在 worker 空出来后**补跑一次**。只补一次：认领即刷新
+///   `last_fired_at`，不会重放整段历史；
+/// - 同一分钟桶已记账 → 不认领（保留「同一分钟只触发一次」，防 2s 轮询重复触发）；
+/// - 记账时刻在**未来**（时钟回拨/手改状态文件）→ 不信这笔记账，回落为当前分钟匹配；
+/// - 超过 [`CRON_CATCHUP_WINDOW_SECS`] 的错过点不补（沿用 Q14「不补历史周期」）。
+fn cron_due(expr: &crate::schedule::CronExpr, last_fired_at: Option<u64>, now: u64) -> Option<u64> {
+    let now_dt = crate::schedule::DateTime::from_unix(now as i64);
+    let Some(last) = last_fired_at else {
+        return expr.matches(&now_dt).then_some(now);
+    };
+    // 同一分钟只触发一次（worker 每 2s 轮询，没有这条会在一分钟内反复触发）
+    if last / 60 == now / 60 {
+        return None;
+    }
+    if last > now {
+        return expr.matches(&now_dt).then_some(now);
+    }
+    // 从「上次记账所在分钟」的下一分钟起，按分钟扫描到当前分钟：
+    // 命中即说明该点应当被跑而没跑（执行位被占），补跑一次。
+    let from = (last / 60 + 1) * 60;
+    let start = from.max(now.saturating_sub(CRON_CATCHUP_WINDOW_SECS));
+    if start > now {
+        return None;
+    }
+    (start..=now)
+        .step_by(60)
+        .find(|t| expr.matches(&crate::schedule::DateTime::from_unix(*t as i64)))
+}
+
+/// 本地时区（UTC+8）的 `YYYY-MM-DD HH:MM:SS`——日志里给人看的应到时刻。
+fn fmt_local(secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = crate::chrono_lite::epoch_to_ymd(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
 /// service 正常关停出口：Pending/Backoff/Succeeded 没有在跑的 `run_proc_attempt`
@@ -1546,7 +1617,7 @@ mod tests {
             "once 跑过不再认领"
         );
 
-        // cron：当前分钟匹配才跑，且同一分钟只触发一次
+        // cron：新登记（无记账）当前分钟匹配才跑，且同一分钟只触发一次
         t.trigger = TaskTrigger {
             kind: TriggerKind::Cron,
             expr: "* * * * *".to_string(),
@@ -1719,6 +1790,149 @@ mod tests {
         assert!(
             !is_due_for_claim(&t, &claimed, base + 20 * 60),
             "interval 跨多周期最多补一轮，不能在同一轮内连续补"
+        );
+    }
+
+    /// cron 逾期认领：执行位被长任务占住而错过的分钟点，要在 worker 空出来后补跑一次，
+    /// 且不重放整段历史、不在同一分钟里重复触发。这条是「定时任务被静默吞掉」的核心回归锁。
+    #[test]
+    fn cron_catches_up_missed_minute_once() {
+        let mut t = now_task("b", "tk_cron_late", "c");
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "*/10 * * * *".into(),
+            ..Default::default()
+        };
+        // 10:00 那一轮正常跑过（认领时记账 10:00:05）
+        let base = crate::schedule::parse_once("2026-09-20 10:00")
+            .unwrap()
+            .to_unix() as u64;
+        let fired_1000 = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(base + 5),
+            ..Default::default()
+        };
+        // 执行位被长任务占住到 10:25 → 10:10 与 10:20 两个分钟点都没轮到
+        let busy_until = base + 25 * 60;
+        assert_eq!(
+            due_for_claim(&t, &fired_1000, busy_until),
+            Some(base + 10 * 60),
+            "应到的时刻取最近一次错过的分钟点（用于日志里如实记「迟到多久」）"
+        );
+        assert!(
+            is_due_for_claim(&t, &fired_1000, busy_until),
+            "逾期后必须可认领（改前这里恒为 false = 静默丢弃）"
+        );
+
+        // 补跑的那一轮跑完了（10:25 认领、记账在 10:25）→ 同一分钟不再认领
+        let after_catch_up = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(busy_until),
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &after_catch_up, busy_until + 30),
+            "补跑后同一分钟内不得重复触发"
+        );
+        // 只补一次：不会把 10:20 那一轮也补出来，下一轮按 10:30 的正常到点走
+        assert_eq!(
+            due_for_claim(&t, &after_catch_up, base + 30 * 60),
+            Some(base + 30 * 60),
+            "跨越多个错过的分钟点也只认领一次"
+        );
+        assert!(
+            is_due_for_claim(&t, &after_catch_up, base + 30 * 60),
+            "补跑不影响后续正常到点"
+        );
+    }
+
+    /// cron 逾期认领的边界：新登记不追溯历史周期；无命中点不认领；
+    /// 记账在未来（时钟回拨/手改状态文件）按当前分钟匹配。
+    #[test]
+    fn cron_catch_up_boundaries() {
+        let mut t = now_task("b", "tk_cron_edge", "c");
+        let base = crate::schedule::parse_once("2026-09-20 10:00")
+            .unwrap()
+            .to_unix() as u64;
+
+        // ① 新登记（无记账）不追溯：10:05 登记 → 10:10 才跑
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "*/10 * * * *".into(),
+            ..Default::default()
+        };
+        let pending = TaskRuntime::default();
+        assert!(
+            !is_due_for_claim(&t, &pending, base + 5 * 60),
+            "新登记的任务不补它登记之前的历史周期"
+        );
+        assert!(
+            is_due_for_claim(&t, &pending, base + 10 * 60),
+            "到下一个命中分钟照常认领"
+        );
+
+        // ② 窗口内最近一次错过点会补：每天 09:00 的任务，09:00 那轮被占住 → 12:00 补跑一次
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "0 9 * * *".into(),
+            ..Default::default()
+        };
+        let yesterday_9 = crate::schedule::parse_once("2026-09-19 09:00")
+            .unwrap()
+            .to_unix() as u64;
+        let fired_yesterday = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(yesterday_9),
+            ..Default::default()
+        };
+        let today_9 = crate::schedule::parse_once("2026-09-20 09:00")
+            .unwrap()
+            .to_unix() as u64;
+        assert_eq!(
+            due_for_claim(&t, &fired_yesterday, base + 2 * 3600),
+            Some(today_9),
+            "当天 09:00 被占住 → 12:00 认领时补这一轮"
+        );
+
+        // ③ 扫描窗口（{}h）内没有命中点就不补：周期长于窗口的任务（如每年 1 月 1 日）
+        //    在非命中时刻不得因为「一年前有一轮」而被拉起来补跑。
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "0 0 1 1 *".into(),
+            ..Default::default()
+        };
+        let long_ago = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(today_9 - 365 * 86400),
+            ..Default::default()
+        };
+        assert!(
+            !is_due_for_claim(&t, &long_ago, base + 2 * 3600),
+            "窗口（{}h）内没有命中点 → 不认领，不追溯更早的周期",
+            CRON_CATCHUP_WINDOW_SECS / 3600
+        );
+        let new_year = crate::schedule::parse_once("2027-01-01 00:00")
+            .unwrap()
+            .to_unix() as u64;
+        assert!(
+            is_due_for_claim(&t, &long_ago, new_year),
+            "命中分钟照常认领"
+        );
+
+        // ④ 记账在未来（时钟回拨）→ 不信这笔记账，按当前分钟匹配
+        t.trigger = TaskTrigger {
+            kind: TriggerKind::Cron,
+            expr: "* * * * *".into(),
+            ..Default::default()
+        };
+        let skewed = TaskRuntime {
+            kind: TaskStateKind::Succeeded,
+            last_fired_at: Some(base + 3600),
+            ..Default::default()
+        };
+        assert!(
+            is_due_for_claim(&t, &skewed, base),
+            "未来记账不得把任务卡死，按当前分钟匹配处理"
         );
     }
 
