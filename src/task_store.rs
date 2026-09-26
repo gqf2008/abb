@@ -1125,8 +1125,9 @@ impl TaskStateStore {
     /// 且 service 跑多线程 runtime，两步之间会被另一条通道插进来 → 同一任务双跑。
     /// 判据收进锁里之后，谁先拿到锁谁认领，另一个必然看见 Running。
     ///
-    /// `decide` 在持锁期间执行，**不要**在里面做 IO/await；判据本身是纯函数（含 cron 的
-    /// 分钟扫描，最坏 2880 次比较，量级远小于一次落盘）。
+    /// `decide` 在持锁期间执行：只允许纯计算与**极小的本地检查**（例如一次 `stat` 量级的
+    /// 取消请求探测，`claim_if_due` 就是这么用的），**不要** `await`、不要做网络或批量 IO
+    /// ——持锁时间越短越好（判据含 cron 的分钟扫描，最坏 2880 次比较，量级仍远小于一次落盘）。
     pub fn try_claim<F>(&self, id: &str, decide: F) -> Option<TaskRuntime>
     where
         F: FnOnce(&TaskRuntime) -> Option<TaskRuntime>,

@@ -1411,44 +1411,47 @@ fn next_due_task(
 fn requeue_orphans(store: &TaskStore, states: &TaskStateStore, process_start: u64) {
     let tasks = store.list();
     for t in &tasks {
-        let rt = states.get(&t.id);
-        if rt.kind != TaskStateKind::Running {
-            continue;
-        }
-        // 本进程刚认领、正在跑的 Running **不是**孤儿：两条通道并发启动时，定时档可能
-        // 已经跑在归位前面（P2b 拆通道引入的新交错）。归位它 = 让同一条任务再跑一轮。
-        if rt.started_at.map(|s| s >= process_start).unwrap_or(false) {
-            continue;
-        }
         let short = &t.id[..t.id.len().min(12)];
-        if rt.restarts < t.limits.max_restarts {
-            crate::log!(
-                "[task] 上次运行残留 Running（{short}）→ 归位 Pending 重跑（第 {} 次，上限 {}）",
-                rt.restarts + 1,
-                t.limits.max_restarts
-            );
-            let _ = states.set(
-                &t.id,
-                TaskRuntime {
+        // **判定与写必须在同一把锁内**（`update_if`）：拆通道后调度档会并发认领，而
+        // `get`→`set` 两步之间那条通道可能刚把任务认领成 Running——两步写法会把它盖回
+        // Pending/Failed → 同一条任务再被认领一轮（Q7 的「同一任务不并发」被破坏）。
+        // 判据与写都收进 `update_if` 的锁里：谁先拿锁谁生效，后到者看见的已经是对方的结果。
+        let updated = states.update_if(&t.id, |prev| {
+            if prev.kind != TaskStateKind::Running {
+                return None; // 不是残留 Running（含「本进程刚认领」的 Running，见下一行）
+            }
+            // 本进程刚认领、正在跑的 Running **不是**孤儿：两条通道并发启动时，定时档可能
+            // 已经跑在归位前面。归位它 = 让同一条任务再跑一轮。
+            if prev.started_at.map(|s| s >= process_start).unwrap_or(false) {
+                return None;
+            }
+            if prev.restarts < t.limits.max_restarts {
+                Some(TaskRuntime {
                     kind: TaskStateKind::Pending,
-                    restarts: rt.restarts + 1,
-                    ..rt
-                },
-            );
-        } else {
-            crate::log!(
-                "[task] 上次运行残留 Running（{short}）→ 重跑已达上限 {}，标记 Failed",
-                t.limits.max_restarts
-            );
-            let _ = states.set(
-                &t.id,
-                TaskRuntime {
+                    restarts: prev.restarts + 1,
+                    ..prev.clone()
+                })
+            } else {
+                Some(TaskRuntime {
                     kind: TaskStateKind::Failed,
                     finished_at: Some(crate::chrono_lite::unix_secs()),
                     last_error: "上次运行被进程退出中断（未自动重跑，可手动重跑）".to_string(),
-                    ..rt
-                },
-            );
+                    ..prev.clone()
+                })
+            }
+        });
+        // 日志放在锁外（`log!` 要写文件，不该占用锁）。
+        match updated {
+            Some(rt) if rt.kind == TaskStateKind::Pending => crate::log!(
+                "[task] 上次运行残留 Running（{short}）→ 归位 Pending 重跑（第 {} 次，上限 {}）",
+                rt.restarts,
+                t.limits.max_restarts
+            ),
+            Some(rt) if rt.kind == TaskStateKind::Failed => crate::log!(
+                "[task] 上次运行残留 Running（{short}）→ 重跑已达上限 {}，标记 Failed",
+                t.limits.max_restarts
+            ),
+            _ => {}
         }
     }
     // 无定义的残留运行态：状态行与**日志一起**清掉（P2b-D：只删定义会留下孤儿日志，
