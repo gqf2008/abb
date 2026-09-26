@@ -22,6 +22,10 @@
 
 ### 现状（文件:行号）
 
+> **冻结快照**（自述 baseline `1850e38`，行号会漂）。其中 **task 侧 cron 行已过时**：cron 认领语义
+> 已按 2026-09-26 修订改为**逾期认领**（48h 窗口内补最近一次错过的分钟点、逾期必记日志），
+> 权威表述见 `docs/task-model.md` §P2b-C 的修订块；下表保留当时口径以便对照。
+
 | 事实 | 位置 |
 |---|---|
 | 单文件上限默认 10 MiB | `src/task_store.rs:32`（`DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024`） |
@@ -280,7 +284,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 1. **宽限期默认 10s**，并用 `TaskLimits.grace_secs` 允许逐任务覆盖（默认值只落一处常量）。
 2. **到期 SIGKILL**（等价语义；Windows 走 `TerminateJobObject`），保留 `src/install.rs:192-198` 的"杀前复查存活"。
 3. **对进程组 / Job Object 整体发信号**：Unix `SIGTERM → pgid`，宽限后 `SIGKILL → pgid`；Windows 先尽力 `GenerateConsoleCtrlEvent`，宽限后 `TerminateJobObject`。
-4. **补跑保留现状口径**：once 补 1 次（`:649-651`）；cron/interval 不补历史周期（`:652-672`）；keepalive 按 Q5-C。
+4. **补跑保留现状口径**：once 补 1 次（`:649-651`）；cron/interval 不补历史周期（`:652-672`；**cron 已于 2026-09-26 修订为逾期认领，见 `docs/task-model.md` §P2b-C，本行为冻结快照原文**）；keepalive 按 Q5-C。
 5. **Windows 无优雅退出等价物时，文档如实写明"尽力优雅 / 大概率强杀"**，不留"优雅退出"的假承诺（对齐 `src/install.rs:204-205` 的既有诚实口径）。
 
 ### 验收标准
