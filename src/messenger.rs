@@ -146,6 +146,12 @@ pub struct QuotedMessage {
     /// 被引用文本（含链接 URL；飞书 post 的 href 已拼进文本）。
     pub text: String,
     pub attachments: Vec<crate::attachments::AttachmentDesc>,
+    /// 被引用消息的**类型**（平台原样给；取不到为空）。内容为空时它是唯一线索
+    /// （例如被引用的是 merge_forward / sticker / 卡片类消息）。
+    pub msg_type: String,
+    /// 平台端内容里**未解析的元素 tag**（飞书 post 富文本；空 = 无）。用于把
+    /// 「拉到了但读不出内容」变成可观测，而不是静默降级。
+    pub unparsed_tags: Vec<String>,
 }
 
 /// 引用消息内容（附件已下载为元数据）。随 `Ev` 进 handle / 随 pending.json 持久化。
@@ -275,6 +281,8 @@ impl Messenger for FeishuMessenger {
                         file_name: r.file_name,
                     })
                     .collect(),
+                msg_type: parsed.msg_type,
+                unparsed_tags: parsed.unparsed_tags,
             }),
             Err(e) => {
                 crate::log!("[feishu] 拉取引用消息失败 mid={}: {e:#}", message_id);

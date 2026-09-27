@@ -704,7 +704,10 @@ impl Bridge {
         }
 
         // 入站字段诊断：覆盖「没有 parent_id」这一原先无法观测的情形（见 inbound_field_diag）。
-        crate::log!("{}", inbound_field_diag(&ev.mid, message));
+        crate::log!(
+            "{}",
+            inbound_field_diag(&ev.mid, message, &parsed.unparsed_tags)
+        );
 
         // 引用/回复场景：parent_id 是被引用（回复）的消息 id。事件体不带被引用内容，
         // 需按 id 拉取（飞书 API，文本 + 资源引用），再下载引用附件；best-effort——
@@ -713,6 +716,8 @@ impl Bridge {
         if !parent_id.is_empty() && parent_id != ev.mid {
             match self.msgr.get_quoted_message(parent_id).await {
                 Some(q) => {
+                    // 先算好「读不出内容」时的告警行（后面 q.attachments 会被消费掉）
+                    let unreadable_note = quoted_unreadable_note(parent_id, &q);
                     let mut quoted = crate::messenger::QuotedContent {
                         text: q.text.trim().to_string(),
                         attachments: Vec::new(),
@@ -729,11 +734,18 @@ impl Bridge {
                     if !quoted.text.is_empty() || !quoted.attachments.is_empty() {
                         ev.quoted = quoted;
                         crate::log!(
-                            "[bridge] 引用消息 parent={} 文本长度={} 附件数={}",
+                            "[bridge] 引用消息 parent={} 文本长度={} 附件数={} type={}",
                             trunc(parent_id, 12),
                             ev.quoted.text.chars().count(),
-                            ev.quoted.attachments.len()
+                            ev.quoted.attachments.len(),
+                            if q.msg_type.is_empty() {
+                                "-"
+                            } else {
+                                q.msg_type.as_str()
+                            }
                         );
+                    } else {
+                        crate::log!("{unreadable_note}");
                     }
                 }
                 None => crate::log!(
@@ -795,6 +807,24 @@ fn trunc(s: impl AsRef<str>, n: usize) -> String {
     s.as_ref().chars().take(n).collect()
 }
 
+/// 「引用了、也拉到了，但读不出内容」的告警行（纯函数便于单测）。
+///
+/// 旧实现对这种情况**完全静默**（`Some(q)` 但 text 与附件都空 → 不设 `ev.quoted`、不打日志），
+/// 于是「被引用的是合并转发/表情/卡片，或内容元素我们不认」与「用户根本没引用」在日志上
+/// 长得一模一样（2026-09-27 owner 实测提问）。类型与未解析元素是这里唯一的线索。
+fn quoted_unreadable_note(parent_id: &str, q: &crate::messenger::QuotedMessage) -> String {
+    format!(
+        "[bridge] 引用消息无可读内容 parent={} type={} 未解析元素={:?}",
+        trunc(parent_id, 12),
+        if q.msg_type.is_empty() {
+            "-"
+        } else {
+            q.msg_type.as_str()
+        },
+        q.unparsed_tags
+    )
+}
+
 /// 飞书入站事件的字段诊断（一行）：`message_type` + 三个 id 的**存在性**。
 ///
 /// 为什么需要它：引用/回复上下文**只由 `parent_id` 触发**（见 `on_payload`），而事件里
@@ -804,15 +834,20 @@ fn trunc(s: impl AsRef<str>, n: usize) -> String {
 /// 只记**存在性**与消息类型：不记消息内容、不记 id 原文，避免把内容/标识写进日志。
 /// 判读：有引用 → 必有一行 `[bridge] 引用消息 …` 或 `拉取引用消息失败/无内容 …`；
 /// 两行都没有时，看本行的 `parent_id=false` 即可确认「事件里根本没带被引用消息 id」。
-fn inbound_field_diag(mid: &str, message: &serde_json::Value) -> String {
+fn inbound_field_diag(mid: &str, message: &serde_json::Value, unparsed: &[String]) -> String {
     // 存在性 = 非空字符串（飞书缺字段时会省略键，也可能给空串）；非字符串值按存在处理。
     let present = |k: &str| match message.get(k) {
         Some(serde_json::Value::String(s)) => !s.is_empty(),
         Some(serde_json::Value::Null) | None => false,
         Some(_) => true,
     };
+    let unparsed_str = if unparsed.is_empty() {
+        "-".to_string()
+    } else {
+        format!("[{}]", unparsed.join(","))
+    };
     format!(
-        "[bridge] 入站字段 mid={} type={} parent_id={} root_id={} thread_id={}",
+        "[bridge] 入站字段 mid={} type={} parent_id={} root_id={} thread_id={} unparsed={}",
         trunc(mid, 12),
         message
             .get("message_type")
@@ -820,7 +855,8 @@ fn inbound_field_diag(mid: &str, message: &serde_json::Value) -> String {
             .unwrap_or(""),
         present("parent_id"),
         present("root_id"),
-        present("thread_id")
+        present("thread_id"),
+        unparsed_str
     )
 }
 
@@ -1085,6 +1121,7 @@ mod tests {
                 crate::messenger::QuotedMessage {
                     text: text.to_string(),
                     attachments: Vec::new(),
+                    ..Default::default()
                 },
             );
         }
@@ -4429,6 +4466,27 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
+    /// 「引用了、也拉到了，但读不出内容」必须留一行（旧实现完全静默）：
+    /// 类型与未解析元素是唯一线索。
+    #[test]
+    fn quoted_unreadable_note_reports_type_and_unparsed_tags() {
+        let q = crate::messenger::QuotedMessage {
+            text: String::new(),
+            attachments: Vec::new(),
+            msg_type: "merge_forward".to_string(),
+            unparsed_tags: vec!["quote".to_string()],
+        };
+        let line = quoted_unreadable_note("om_parent_abcdefghijkl", &q);
+        assert!(line.contains("引用消息无可读内容"), "{line}");
+        assert!(line.contains("type=merge_forward"), "{line}");
+        assert!(line.contains("未解析元素=[\"quote\"]"), "{line}");
+        // 类型缺失时用 - 占位，不出现空字段
+        let q2 = crate::messenger::QuotedMessage::default();
+        let line2 = quoted_unreadable_note("om_parent_abcdefghijkl", &q2);
+        assert!(line2.contains("type=-"), "{line2}");
+        assert!(line2.contains("未解析元素=[]"), "{line2}");
+    }
+
     /// 入站字段诊断：只报存在性（不落内容/不落 id 原文），且缺字段不 panic。
     #[test]
     fn inbound_field_diag_reports_presence_only() {
@@ -4440,10 +4498,10 @@ mod tests {
             "root_id": "",
             "thread_id": ""
         });
-        let line = inbound_field_diag("om_diag_none", &msg);
+        let line = inbound_field_diag("om_diag_none", &msg, &[]);
         assert_eq!(
             line,
-            "[bridge] 入站字段 mid=om_diag_none type=text parent_id=false root_id=false thread_id=false",
+            "[bridge] 入站字段 mid=om_diag_none type=text parent_id=false root_id=false thread_id=false unparsed=-",
             "空串应按不存在处理（mid 只保留 12 字符）"
         );
 
@@ -4455,11 +4513,12 @@ mod tests {
             "root_id": "om_root_xxx",
             "thread_id": "omt_thread_xxx"
         });
-        let line = inbound_field_diag("om_diag_all", &msg);
+        let line = inbound_field_diag("om_diag_all", &msg, &[]);
         assert!(
             line.contains("type=post parent_id=true root_id=true thread_id=true"),
             "{line}"
         );
+        assert!(line.contains("unparsed=-"), "无未解析元素时记 -：{line}");
         // 只报存在性：不得把 id 原文写进日志
         for raw in ["om_parent_xxx", "om_root_xxx", "omt_thread_xxx"] {
             assert!(!line.contains(raw), "诊断行不得落 id 原文：{line}");
@@ -4474,7 +4533,11 @@ mod tests {
             "root_id": 0,
             "thread_id": ["omt_x"]
         });
-        let line = inbound_field_diag("om_diag_kinds", &msg);
+        let line = inbound_field_diag("om_diag_kinds", &msg, &["quote".to_string()]);
+        assert!(
+            line.contains("unparsed=[quote]"),
+            "未解析元素要出现在诊断行里：{line}"
+        );
         assert!(
             line.contains("parent_id=false root_id=true thread_id=true"),
             "null 按不存在、非字符串按存在：{line}"
@@ -4482,7 +4545,7 @@ mod tests {
 
         // ④ 字段整个缺失（不是空串）→ 同样按不存在，且不 panic
         let msg = serde_json::json!({"message_id": "om_diag_missing"});
-        let line = inbound_field_diag("om_diag_missing", &msg);
+        let line = inbound_field_diag("om_diag_missing", &msg, &[]);
         assert!(
             line.contains("type= parent_id=false root_id=false thread_id=false"),
             "{line}"
@@ -5067,6 +5130,7 @@ mod tests {
                     kind: "image".into(),
                     file_name: "截图.png".into(),
                 }],
+                ..Default::default()
             },
         );
 
