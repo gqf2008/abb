@@ -703,6 +703,9 @@ impl Bridge {
             return;
         }
 
+        // 入站字段诊断：覆盖「没有 parent_id」这一原先无法观测的情形（见 inbound_field_diag）。
+        crate::log!("{}", inbound_field_diag(&ev.mid, message));
+
         // 引用/回复场景：parent_id 是被引用（回复）的消息 id。事件体不带被引用内容，
         // 需按 id 拉取（飞书 API，文本 + 资源引用），再下载引用附件；best-effort——
         // 拉取/下载失败只记日志，不阻塞本条回复。
@@ -790,6 +793,35 @@ pub fn strip_bot_mention(text: &str, bot_name: &str) -> String {
 /// key/chat_id 可能含非 ASCII（话题、群名等），日志一律走字符级。
 fn trunc(s: impl AsRef<str>, n: usize) -> String {
     s.as_ref().chars().take(n).collect()
+}
+
+/// 飞书入站事件的字段诊断（一行）：`message_type` + 三个 id 的**存在性**。
+///
+/// 为什么需要它：引用/回复上下文**只由 `parent_id` 触发**（见 `on_payload`），而事件里
+/// 没有 `parent_id` 时旧代码一行日志都不打——于是「用户引用了消息但 bot 读不到」与
+/// 「用户根本没引用」在日志上长得一模一样，无法区分（2026-09-27 owner 实测提问）。
+///
+/// 只记**存在性**与消息类型：不记消息内容、不记 id 原文，避免把内容/标识写进日志。
+/// 判读：有引用 → 必有一行 `[bridge] 引用消息 …` 或 `拉取引用消息失败/无内容 …`；
+/// 两行都没有时，看本行的 `parent_id=false` 即可确认「事件里根本没带被引用消息 id」。
+fn inbound_field_diag(mid: &str, message: &serde_json::Value) -> String {
+    // 存在性 = 非空字符串（飞书缺字段时会省略键，也可能给空串）；非字符串值按存在处理。
+    let present = |k: &str| match message.get(k) {
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
+    };
+    format!(
+        "[bridge] 入站字段 mid={} type={} parent_id={} root_id={} thread_id={}",
+        trunc(mid, 12),
+        message
+            .get("message_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        present("parent_id"),
+        present("root_id"),
+        present("thread_id")
+    )
 }
 
 /// #49 历史条目的用户轮文本：用户文本 + （引用）被引用文本 + （附件）元数据行。
@@ -4394,6 +4426,112 @@ mod tests {
             runner.prompts()[0]
         );
         assert!(msgr.sent().iter().any(|t| t == "done"));
+        cleanup_bridge(&bridge);
+    }
+
+    /// 入站字段诊断：只报存在性（不落内容/不落 id 原文），且缺字段不 panic。
+    #[test]
+    fn inbound_field_diag_reports_presence_only() {
+        // ① 三个 id 都是空串（飞书常见形态：字段在但为空）+ message_type=text
+        let msg = serde_json::json!({
+            "message_id": "om_diag_none",
+            "message_type": "text",
+            "parent_id": "",
+            "root_id": "",
+            "thread_id": ""
+        });
+        let line = inbound_field_diag("om_diag_none", &msg);
+        assert_eq!(
+            line,
+            "[bridge] 入站字段 mid=om_diag_none type=text parent_id=false root_id=false thread_id=false",
+            "空串应按不存在处理（mid 只保留 12 字符）"
+        );
+
+        // ② 三个 id 齐（引用 + 话题 + 回复树），且类型是 post
+        let msg = serde_json::json!({
+            "message_id": "om_diag_all",
+            "message_type": "post",
+            "parent_id": "om_parent_xxx",
+            "root_id": "om_root_xxx",
+            "thread_id": "omt_thread_xxx"
+        });
+        let line = inbound_field_diag("om_diag_all", &msg);
+        assert!(
+            line.contains("type=post parent_id=true root_id=true thread_id=true"),
+            "{line}"
+        );
+        // 只报存在性：不得把 id 原文写进日志
+        for raw in ["om_parent_xxx", "om_root_xxx", "omt_thread_xxx"] {
+            assert!(!line.contains(raw), "诊断行不得落 id 原文：{line}");
+        }
+
+        // ③ null / 非字符串值：null 按不存在；非字符串（数字、数组）按「字段在」处理。
+        // （评审建议补的边界：`present()` 用 `get()` 取，缺字段返回 None 不会 panic。）
+        let msg = serde_json::json!({
+            "message_id": "om_diag_kinds",
+            "message_type": 123,
+            "parent_id": serde_json::Value::Null,
+            "root_id": 0,
+            "thread_id": ["omt_x"]
+        });
+        let line = inbound_field_diag("om_diag_kinds", &msg);
+        assert!(
+            line.contains("parent_id=false root_id=true thread_id=true"),
+            "null 按不存在、非字符串按存在：{line}"
+        );
+
+        // ④ 字段整个缺失（不是空串）→ 同样按不存在，且不 panic
+        let msg = serde_json::json!({"message_id": "om_diag_missing"});
+        let line = inbound_field_diag("om_diag_missing", &msg);
+        assert!(
+            line.contains("type= parent_id=false root_id=false thread_id=false"),
+            "{line}"
+        );
+    }
+
+    /// 只有 `root_id`（回复树根）时**不**触发引用拉取：引用上下文只认 `parent_id`。
+    /// 这条同时锁住「诊断行能区分『没带 parent_id』」所依赖的前提。
+    #[tokio::test]
+    async fn root_id_alone_does_not_trigger_quote_fetch() {
+        let runner = Arc::new(MockAgentRunner::immediate("done"));
+        let bot = BotConfig {
+            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
+            kind: "feishu".into(),
+            bot_name: "庆小丰".into(),
+            bot_open_id: "ou_bot".into(),
+            owner_open_id: "ou_owner".into(),
+            ..Default::default()
+        };
+        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
+        // 把内容挂在 root_id 上：若代码错按 root_id 拉取，prompt 里就会出现引用块
+        msgr.set_quoted("om_root_only", "不该被拉取的内容");
+
+        let payload = serde_json::json!({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_owner"}},
+                "message": {
+                    "message_id": "om_only_root",
+                    "chat_id": "oc_p2p",
+                    "chat_type": "p2p",
+                    "thread_id": "",
+                    "parent_id": "",
+                    "root_id": "om_root_only",
+                    "message_type": "text",
+                    "content": serde_json::json!({"text": "只有 root_id"}).to_string(),
+                    "mentions": []
+                }
+            }
+        })
+        .to_string();
+        bridge.on_payload(payload.as_bytes()).await;
+
+        let prompt = &runner.prompts()[0];
+        assert!(
+            !prompt.contains("[引用消息]"),
+            "root_id 不得触发引用拉取：{prompt}"
+        );
+        assert!(prompt.ends_with("只有 root_id"), "{prompt}");
         cleanup_bridge(&bridge);
     }
 
