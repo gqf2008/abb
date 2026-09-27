@@ -99,6 +99,11 @@ pub(crate) async fn run_proc_attempt(
 const PTY_ROWS: u16 = 30;
 #[cfg(unix)]
 const PTY_COLS: u16 = 120;
+/// 单条 stdin 请求的写入上界（字节）。PTY master 写可能阻塞（子进程不读就填满缓冲），
+/// 所以既不能无界写、也不把超大 payload 塞进轮询循环里。
+#[cfg(unix)]
+const PTY_STDIN_MAX_BYTES: usize = 8192;
+
 /// PTY 模式的轮询间隔（收 stdin 请求 / 看退出 / 看 stop）。
 #[cfg(unix)]
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -180,6 +185,7 @@ fn drain_proc_stdin(
     writer: &mut std::fs::File,
     log_max_bytes: u64,
     log_id: &str,
+    log_lock: &std::sync::Mutex<()>,
 ) -> usize {
     use std::io::Write as _;
     let dir = paths.proc_stdin_dir(id);
@@ -210,6 +216,16 @@ fn drain_proc_stdin(
         if !req.raw && req.enter {
             payload.push(b'\r');
         }
+        if payload.len() > PTY_STDIN_MAX_BYTES {
+            crate::log!(
+                "[proc:{}] stdin 请求过大（{} 字节 > {PTY_STDIN_MAX_BYTES}），已丢弃：{}",
+                short_id(log_id),
+                payload.len(),
+                f.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let _ = std::fs::remove_file(&f);
+            continue;
+        }
         if !payload.is_empty() {
             if let Err(e) = writer.write_all(&payload) {
                 crate::log!("[proc:{}] 写入 PTY 失败：{e:#}", short_id(log_id));
@@ -224,12 +240,16 @@ fn drain_proc_stdin(
             f.file_name().unwrap_or_default().to_string_lossy(),
             payload.len()
         );
-        let _ = crate::task_store::append_task_log_record(
-            paths,
-            log_id,
-            log_max_bytes,
-            note.as_bytes(),
-        );
+        {
+            // 与读线程共用同一把日志锁（否则轮转/追加会交错）
+            let _guard = log_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = crate::task_store::append_task_log_record(
+                paths,
+                log_id,
+                log_max_bytes,
+                note.as_bytes(),
+            );
+        }
         let _ = std::fs::remove_file(&f);
     }
     written
@@ -358,6 +378,10 @@ async fn run_proc_attempt_pty(
     let log_max_bytes = task.limits.log_max_bytes;
     let log_paths = paths.clone();
     let log_id = id.clone();
+    // 读线程与主循环（drain 的「收到请求」注记）都会写同一个日志文件 → 共用一把锁，
+    // 否则轮转/追加会交错（管道模式也是这么做的）。
+    let log_lock = Arc::new(std::sync::Mutex::new(()));
+    let reader_lock = log_lock.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -366,6 +390,7 @@ async fn run_proc_attempt_pty(
                 Ok(n) => {
                     let clean = strip_ansi(&buf[..n]);
                     if !clean.is_empty() {
+                        let _guard = reader_lock.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = crate::task_store::append_task_log_record(
                             &log_paths,
                             &log_id,
@@ -402,14 +427,21 @@ async fn run_proc_attempt_pty(
             break;
         }
         if stop.is_cancelled() {
-            stop_reason = Some("已取消（service 关停 / task cancel）".to_string());
+            stop_reason = Some("已取消（service 关停）".to_string());
+            break;
+        }
+        // 用户 `task cancel`：与管道路径的 cancel watcher 同语义（consume_cancel_requests 对
+        // Running 一律 continue，运行中这一轮必须由本循环自己认这个请求文件——
+        // 否则 PTY 会话会「静默不受取消」，reviewer-34 反证实测 5s 不生效）。
+        if paths.cancel_file(&id).exists() {
+            stop_reason = Some("已取消（用户 task cancel）".to_string());
             break;
         }
         if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
             stop_reason = Some(format!("执行超时（预算 {}s）", task.limits.timeout_secs));
             break;
         }
-        let _ = drain_proc_stdin(&paths, &id, &mut writer, log_max_bytes, &id);
+        let _ = drain_proc_stdin(&paths, &id, &mut writer, log_max_bytes, &id, &log_lock);
         tokio::time::sleep(PTY_POLL_INTERVAL).await;
     }
 

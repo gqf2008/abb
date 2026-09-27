@@ -1090,20 +1090,39 @@ fn run_task_cli(args: &[String]) -> i32 {
                 eprintln!("创建输入目录失败：{e:#}");
                 return 1;
             }
-            // seq 用「毫秒时间戳 + 冲突递增」，保证消费方按文件名排序即是提交顺序
+            // seq 用「毫秒时间戳 + 冲突递增」；**用 create_new 原子占坑**（reviewer #3：
+            // 先 exists 再写会与并发的另一次 send 抢同一个 seq）。文件权限 0600：
+            // 输入可能是密码。
             let mut seq = chrono_lite::unix_secs() * 1000;
+            let body = serde_json::json!({"text": text, "enter": enter, "raw": raw}).to_string();
             let path = loop {
                 let p = states.paths().proc_stdin_file(&t.id, seq);
-                if !p.exists() {
-                    break p;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.mode(0o600);
                 }
-                seq += 1;
+                match opts.open(&p) {
+                    Ok(mut f) => {
+                        use std::io::Write as _;
+                        if let Err(e) = f.write_all(body.as_bytes()) {
+                            eprintln!("写入输入请求失败：{e:#}");
+                            return 1;
+                        }
+                        break p;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        seq += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("写入输入请求失败：{e:#}");
+                        return 1;
+                    }
+                }
             };
-            let body = serde_json::json!({"text": text, "enter": enter, "raw": raw});
-            if let Err(e) = std::fs::write(&path, body.to_string()) {
-                eprintln!("写入输入请求失败：{e:#}");
-                return 1;
-            }
             println!(
                 "已提交输入请求（{}）：{} 字节{}{}",
                 path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1565,7 +1584,7 @@ const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什�
 
 /// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
 /// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
-pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
+pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm|send> …\n\
     \n  task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
      \n  task add --proc [公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>  人工/GUI 专用；--bot 供多 bot 人类入口选目标任务 bot；argv 不经过 shell，--cmd 必须放最后\n\
   task add --proc --pty [公共选项] --cmd <argv…>  把 proc 跑在 PTY 里（claude/codex/pi 这类 TUI 需要 isatty + 行缓冲 + 可交互）；\n                                                  默认 120x30、TERM=xterm-256color（可用 --env TERM=… 覆盖），日志自动去掉控制序列\n  task send <id> --text \"…\" [--no-enter] [--raw]  向运行中的 proc(PTY) 会话写入输入（raw=原样写入，可带控制字符）\n\
