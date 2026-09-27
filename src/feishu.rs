@@ -24,8 +24,9 @@ pub struct FeishuResource {
 pub struct FeishuParsed {
     pub text: String,
     pub resources: Vec<FeishuResource>,
-    /// 消息**类型**（`msg_type`/`message_type`）。`parse_content` 本身不知道类型 —— 由拿到整条
-    /// 消息对象的调用方填（引用拉取填 `items[0].msg_type`，入站填 `message.message_type`）。
+    /// 消息**类型**（`msg_type`/`message_type`）。`parse_content` 不知道类型，恒留空；
+    /// 由拿到整条消息对象的调用方填：引用拉取填 `items[0].msg_type`，入站路径在 `on_payload`
+    /// 里用 `message.message_type` 补。
     pub msg_type: String,
     /// `post` 富文本里**未识别**的元素 tag（去重、保序、最多记 8 个）。
     ///
@@ -1248,6 +1249,28 @@ mod tests {
         assert!(
             p.msg_type.is_empty(),
             "parse_content 不知道类型，留空由调用方填"
+        );
+
+        // tag 缺失 / 非字符串 / 空串 → 不记（不能记成空 tag）
+        let p = parse_content(r#"{"content":[[{"text":"无 tag"},{"tag":7},{"tag":""}]]}"#);
+        assert!(p.unparsed_tags.is_empty(), "{:?}", p.unparsed_tags);
+
+        // 上限：超过 UNPARSED_TAG_CAP 后不再记（保序、只记前 8 个）
+        let many: Vec<serde_json::Value> = (0..12)
+            .map(|i| serde_json::json!({"tag": format!("x{i}")}))
+            .collect();
+        let raw = serde_json::json!({"content": [many]}).to_string();
+        let p = parse_content(&raw);
+        assert_eq!(
+            p.unparsed_tags.len(),
+            UNPARSED_TAG_CAP,
+            "{:?}",
+            p.unparsed_tags
+        );
+        assert_eq!(p.unparsed_tags[0], "x0");
+        assert_eq!(
+            p.unparsed_tags[UNPARSED_TAG_CAP - 1],
+            format!("x{}", UNPARSED_TAG_CAP - 1)
         );
     }
 
