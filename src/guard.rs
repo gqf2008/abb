@@ -728,6 +728,15 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
 
 /// proc 入口的同一道拒绝逻辑：受限路径与 owner 路径共用，避免 owner 分支再次漏掉 Q8。
 fn deny_agent_proc_task_add(rest: &[String]) -> Option<Decision> {
+    // `task send`：向运行中的 proc(PTY) 会话写输入 = 变相驱动任意进程（Q8 同一入口），
+    // agent 一律拒绝；人类/GUI 入口不受影响（本函数只在 agent 上下文里被调用）。
+    if rest.first().map(String::as_str) == Some("task")
+        && rest.get(1).map(String::as_str) == Some("send")
+    {
+        return Some(Decision::Deny(
+            "不允许 agent 向 proc 会话写入输入（Q8：任意命令执行入口仅限 GUI/人工）".into(),
+        ));
+    }
     let is_task_add = rest.first().map(String::as_str) == Some("task")
         && rest.get(1).map(String::as_str) == Some("add");
     if !is_task_add

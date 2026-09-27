@@ -1032,6 +1032,110 @@ fn run_task_cli(args: &[String]) -> i32 {
         // Q3 `task cancel`：**CLI 只投取消请求**，运行态由 service 侧的 task worker
         // 消费（单写者）。所以这里既不改 tasks-state.json，也不假装「已取消」——
         // 只保证请求已落盘，真正的结局由 worker 写。
+        "send" => {
+            // proc(PTY) 会话的输入通道：把文本写进 `proc-stdin/<id>/<seq>.json`，
+            // 运行中的 PTY 会话按序消费（详见 src/task_proc.rs::drain_proc_stdin）。
+            let Some(t) = resolve_task(&store, args.get(1)) else {
+                return 1;
+            };
+            if t.payload.kind != task_store::PayloadKind::Proc || !t.payload.pty {
+                eprintln!(
+                    "task send 只对 proc + --pty 的会话有意义（当前 kind={:?} pty={}）；agent 载荷请直接在聊天里发消息",
+                    t.payload.kind, t.payload.pty
+                );
+                return 1;
+            }
+            let mut text: Option<String> = None;
+            let mut enter = true;
+            let mut raw = false;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--text" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--text 缺内容");
+                            return 1;
+                        };
+                        text = Some(v.clone());
+                        i += 2;
+                    }
+                    "--no-enter" => {
+                        enter = false;
+                        i += 1;
+                    }
+                    "--raw" => {
+                        raw = true;
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("task send 未知参数：{other}（用法：task send <id> --text \"…\" [--no-enter] [--raw]）");
+                        return 1;
+                    }
+                }
+            }
+            let Some(text) = text else {
+                eprintln!("task send 需要 --text \"…\"");
+                return 1;
+            };
+            let rt = states.get(&t.id);
+            if rt.kind != task_store::TaskStateKind::Running {
+                eprintln!(
+                    "任务 {} 当前不是运行中（{:?}），没有可写入的 PTY 会话",
+                    t.id, rt.kind
+                );
+                return 1;
+            }
+            let dir = states.paths().proc_stdin_dir(&t.id);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("创建输入目录失败：{e:#}");
+                return 1;
+            }
+            // seq 用「毫秒时间戳 + 冲突递增」；**用 create_new 原子占坑**（reviewer #3：
+            // 先 exists 再写会与并发的另一次 send 抢同一个 seq）。文件权限 0600：
+            // 输入可能是密码。
+            let mut seq = chrono_lite::unix_secs() * 1000;
+            let body = serde_json::json!({"text": text, "enter": enter, "raw": raw}).to_string();
+            let path = loop {
+                let p = states.paths().proc_stdin_file(&t.id, seq);
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.mode(0o600);
+                }
+                match opts.open(&p) {
+                    Ok(mut f) => {
+                        use std::io::Write as _;
+                        if let Err(e) = f.write_all(body.as_bytes()) {
+                            eprintln!("写入输入请求失败：{e:#}");
+                            return 1;
+                        }
+                        break p;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        seq += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("写入输入请求失败：{e:#}");
+                        return 1;
+                    }
+                }
+            };
+            println!(
+                "已提交输入请求（{}）：{} 字节{}{}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                text.len(),
+                if raw { "（raw，原样写入）" } else { "" },
+                if !raw && enter {
+                    "（末尾补回车）"
+                } else {
+                    ""
+                }
+            );
+            0
+        }
         "cancel" | "stop" => {
             let Some(t) = resolve_task(&store, args.get(1)) else {
                 return 1;
@@ -1120,6 +1224,7 @@ fn run_task_cli(args: &[String]) -> i32 {
         "add" => {
             let mut prompt: Option<String> = None;
             let mut proc_mode = false;
+            let mut pty_mode = false;
             let mut cmd: Vec<String> = Vec::new();
             let mut env = std::collections::BTreeMap::new();
             let mut name = String::new();
@@ -1153,6 +1258,12 @@ fn run_task_cli(args: &[String]) -> i32 {
                     }
                     "--proc" => {
                         proc_mode = true;
+                        i += 1;
+                    }
+                    "--pty" => {
+                        // proc 的 PTY 模式：给 claude/codex/pi 这类 TUI 用（isatty 语义 +
+                        // 行缓冲 + 可交互）。与 --proc 的校验放在下面统一做。
+                        pty_mode = true;
                         i += 1;
                     }
                     "--cmd" => {
@@ -1317,6 +1428,10 @@ fn run_task_cli(args: &[String]) -> i32 {
                     eprintln!("--proc 与 --prompt 互斥：proc 只接受 --cmd argv");
                     return 1;
                 }
+                if pty_mode && !proc_mode {
+                    eprintln!("--pty 只能与 --proc 一起用（agent 载荷走 ACP，不能上 PTY）");
+                    return 1;
+                }
                 if cmd.is_empty() {
                     eprintln!("--proc 需要 --cmd <argv…>（arg0 必填，不接 shell 串）");
                     eprintln!("{TASK_ADD_USAGE}");
@@ -1418,6 +1533,7 @@ fn run_task_cli(args: &[String]) -> i32 {
                     prompt: prompt.unwrap_or_default(),
                     cwd,
                     cmd,
+                    pty: pty_mode,
                     env,
                 },
                 trigger,
@@ -1464,13 +1580,14 @@ fn run_task_cli(args: &[String]) -> i32 {
 }
 
 /// `task add` 的用法行（错误提示与总帮助共用，避免两处漂移）。
-const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n     agent-bridge task add --proc [上述公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>（--cmd 必须最后，后续参数原样作为 argv；--bot 用于多 bot 人类入口选择目标任务 bot）\n     agent-bridge task add --keepalive --proc [--no-resume-on-boot] [公共选项] --cmd <argv…>";
+const TASK_ADD_USAGE: &str = "用法：agent-bridge task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n     agent-bridge task add --proc [上述公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] [--pty] --cmd <argv…>（--cmd 必须最后，后续参数原样作为 argv；--bot 用于多 bot 人类入口选择目标任务 bot）\n     agent-bridge task add --keepalive --proc [--no-resume-on-boot] [公共选项] --cmd <argv…>";
 
 /// `task` 的总帮助（**单一真源**：#312 的指引 v7 逐字内嵌它，防文档漂移——
 /// 改了分派分支/参数就必须同步改这里，`agent::tests` 有一条断言锁住两边一致）。
-pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm> …\n\
+pub(crate) const TASK_CLI_HELP: &str = "用法：agent-bridge task <list|status|logs|add|cancel|rm|send> …\n\
     \n  task add --prompt \"做什么\" [--bot <key>] [--name 名字] [--cwd 路径] [--timeout-secs N] [--max-restarts N] [--to bot_key:chat_id | --to-current] [--once \"YYYY-MM-DD HH:MM\" | --cron \"分 时 日 月 周\" | --every 5m]\n\
      \n  task add --proc [公共选项] [--bot <key>] [--env KEY=VALUE] [--grace-secs 1..=300] --cmd <argv…>  人工/GUI 专用；--bot 供多 bot 人类入口选目标任务 bot；argv 不经过 shell，--cmd 必须放最后\n\
+  task add --proc --pty [公共选项] --cmd <argv…>  把 proc 跑在 PTY 里（claude/codex/pi 这类 TUI 需要 isatty + 行缓冲 + 可交互）；\n                                                  默认 120x30、TERM=xterm-256color（可用 --env TERM=… 覆盖），日志自动去掉控制序列\n  task send <id> --text \"…\" [--no-enter] [--raw]  向运行中的 proc(PTY) 会话写入输入（raw=原样写入，可带控制字符）\n\
      \n  task add --keepalive --proc [--no-resume-on-boot | --resume-on-boot true|false] [公共选项] [--env KEY=VALUE] --cmd <argv…>  常驻进程；默认 service 重启后恢复，--no-resume-on-boot 仅清理旧状态\n\
      \n  task list                         列出本 bot 的任务\n\
      \n  task status <id前缀>              看一条任务的详情与运行态\n\

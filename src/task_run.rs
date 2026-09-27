@@ -2426,6 +2426,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
+    /// PTY 会话的 `task cancel` 必须生效 —— 经**生产分派**（`run_one` → `task_proc::run_proc_attempt`
+    /// 的 pty 分支）验证，而不是直接调内层函数（reviewer-34 的反证：只管 stop token 时取消静默无效）。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_proc_task_cancel_via_request_file_takes_effect() {
+        // `run_one` 内部按该 bot 的工作区解析 cwd（没有可注入的缝），所以本用例只允许在
+        // **隔离 HOME** 下跑（仓库唯一测试入口 tools/check_test_isolation.sh）；直接
+        // `cargo test` 时自我跳过，避免往真实 ~/.agent-bridge 写东西。
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        if real_home == "/Users/sqb" {
+            eprintln!("skip: 非隔离 HOME（请用 tools/check_test_isolation.sh 跑全量）");
+            return;
+        }
+        let ws = crate::workspace_dir("b");
+        std::fs::create_dir_all(&ws).unwrap();
+        let root = tmp_root("pty_cancel_dispatch");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = Arc::new(TaskStateStore::new_at(&root, "b"));
+        let mut task = now_task("b", "tk_pty_cancel", "c");
+        task.payload.kind = crate::task_store::PayloadKind::Proc;
+        task.payload.prompt.clear();
+        task.payload.pty = true;
+        task.payload.cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'READY\\n'; while :; do sleep 0.2; done".into(),
+        ];
+        task.limits.timeout_secs = 0;
+        store.add(task.clone()).unwrap();
+
+        let router = Arc::new(Router::new(
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+        ));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handle = {
+            let states = Arc::clone(&states);
+            let task = task.clone();
+            let stop = stop.clone();
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                run_one(
+                    &crate::config::BotConfig::default(),
+                    &Arc::new(crate::config::Config::default()),
+                    &router,
+                    &states,
+                    task,
+                    "b",
+                    &stop,
+                )
+                .await
+            })
+        };
+
+        // 等会话真的起来（READY 出现在日志里）
+        let log_path = states.paths().log_file(&task.id);
+        let mut log = String::new();
+        for _ in 0..100 {
+            log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.contains("READY") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(log.contains("READY"), "PTY 会话未起来：{log:?}");
+
+        // 与 `task cancel` CLI 同一约定：写取消请求文件 → 必须生效（这是被反证的回归点）
+        std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
+        std::fs::write(paths.cancel_file(&task.id), b"{}").unwrap();
+        let claimed = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("取消请求必须 10s 内生效（否则就是静默无效）")
+            .expect("join");
+        assert!(claimed, "run_one 应认领成功");
+        assert_eq!(
+            states.get(&task.id).kind,
+            TaskStateKind::Cancelled,
+            "运行中的 PTY 会话必须能被 task cancel 停掉"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
     /// 有未消费的取消请求时不认领：请求由另一条通道消费，两条循环并发之下本通道可能
     /// 抢在消费之前认领（proc 载荷先起子进程）→「用户已取消，却仍然起了一轮」。
     #[test]
