@@ -87,7 +87,382 @@ pub(crate) async fn run_proc_attempt(
     states: &TaskStateStore,
     stop: &tokio_util::sync::CancellationToken,
 ) -> TaskRuntime {
+    #[cfg(unix)]
+    if task.payload.pty {
+        return run_proc_attempt_pty(task, workspace, states, stop).await;
+    }
     run_proc_attempt_with_grace(task, workspace, states, stop, None).await
+}
+
+/// PTY 默认尺寸（TUI 工具对 0×0 会异常；80×24 太窄，给 120×30）。
+#[cfg(unix)]
+const PTY_ROWS: u16 = 30;
+#[cfg(unix)]
+const PTY_COLS: u16 = 120;
+/// PTY 模式的轮询间隔（收 stdin 请求 / 看退出 / 看 stop）。
+#[cfg(unix)]
+const PTY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 去掉终端控制序列（CSI/OSC 等），只留可读文本 —— PTY 输出会带颜色/光标控制，
+/// 直接写日志既臃肿又难看。纯函数，便于单测。
+///
+/// `#[cfg(unix)]`：只有 PTY 路径用它；Windows 上 proc 本就显式拒绝，留在这里会变死代码。
+#[cfg(unix)]
+pub(crate) fn strip_ansi(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        if b != 0x1b {
+            // 去掉 CR（PTY 把行尾写成 CRLF）：保留 LF 即可
+            if b != b'\r' {
+                out.push(b);
+            }
+            i += 1;
+            continue;
+        }
+        // ESC
+        match input.get(i + 1) {
+            Some(b'[') => {
+                // CSI: ESC [ 参数 中间 最终字节（0x40..=0x7e）
+                let mut j = i + 2;
+                while j < input.len() && !(0x40..=0x7e).contains(&input[j]) {
+                    j += 1;
+                }
+                i = (j + 1).min(input.len());
+            }
+            Some(b']') => {
+                // OSC: ESC ] ... (BEL | ESC \)
+                let mut j = i + 2;
+                while j < input.len() {
+                    if input[j] == 0x07 {
+                        j += 1;
+                        break;
+                    }
+                    if input[j] == 0x1b && input.get(j + 1) == Some(&b'\\') {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            _ => i += 2, // 单个 ESC / 未知序列：丢掉转义本身
+        }
+    }
+    out
+}
+
+/// 一条 stdin 输入请求（`task send` 写、PTY 会话读）。
+#[cfg(unix)]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProcStdinRequest {
+    #[serde(default)]
+    text: String,
+    /// 写完是否补一个回车（默认 true；raw 模式下忽略）。
+    #[serde(default = "default_true")]
+    enter: bool,
+    /// true = 原样写入（可带控制字符，如 \u0003 表示 Ctrl-C），不补回车。
+    #[serde(default)]
+    raw: bool,
+}
+
+#[cfg(unix)]
+fn default_true() -> bool {
+    true
+}
+
+/// 消费该任务的 stdin 请求（按文件名升序，处理完即删）。返回写入的字节数合计。
+#[cfg(unix)]
+fn drain_proc_stdin(
+    paths: &crate::task_store::TaskPaths,
+    id: &str,
+    writer: &mut std::fs::File,
+    log_max_bytes: u64,
+    log_id: &str,
+) -> usize {
+    use std::io::Write as _;
+    let dir = paths.proc_stdin_dir(id);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    let mut written = 0;
+    for f in files {
+        let Ok(raw) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let Ok(req) = serde_json::from_str::<ProcStdinRequest>(&raw) else {
+            crate::log!(
+                "[proc:{}] stdin 请求解析失败，已丢弃：{}",
+                short_id(log_id),
+                f.display()
+            );
+            let _ = std::fs::remove_file(&f);
+            continue;
+        };
+        let mut payload = req.text.clone().into_bytes();
+        if !req.raw && req.enter {
+            payload.push(b'\r');
+        }
+        if !payload.is_empty() {
+            if let Err(e) = writer.write_all(&payload) {
+                crate::log!("[proc:{}] 写入 PTY 失败：{e:#}", short_id(log_id));
+            } else {
+                let _ = writer.flush();
+                written += payload.len();
+            }
+        }
+        // 只记「写了多少字节」，不记内容（可能是密码）
+        let note = format!(
+            "[proc] 收到 stdin 请求 {}（{} 字节）\n",
+            f.file_name().unwrap_or_default().to_string_lossy(),
+            payload.len()
+        );
+        let _ = crate::task_store::append_task_log_record(
+            paths,
+            log_id,
+            log_max_bytes,
+            note.as_bytes(),
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+    written
+}
+
+/// PTY 模式：把 proc 载荷跑在伪终端里。
+///
+/// 与管道模式的区别只在「怎么起、怎么读、怎么喂 stdin」：收尾（SIGTERM → grace →
+/// SIGKILL 进程组）、状态机、日志轮转全部复用既有实现。
+#[cfg(unix)]
+async fn run_proc_attempt_pty(
+    task: &Task,
+    workspace: &str,
+    states: &TaskStateStore,
+    stop: &tokio_util::sync::CancellationToken,
+) -> TaskRuntime {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let id = task.id.clone();
+    let started = crate::chrono_lite::unix_secs();
+    let paths = states.paths().clone();
+    // 全新会话：清掉上一轮可能残留的输入请求（否则会被当成「用户早就想输入的内容」）
+    let stale_dir = paths.proc_stdin_dir(&id);
+    if let Ok(entries) = std::fs::read_dir(&stale_dir) {
+        let mut n = 0;
+        for e in entries.flatten() {
+            if e.path().is_file() && std::fs::remove_file(e.path()).is_ok() {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            crate::log!(
+                "[proc:{}] PTY 会话启动时清理了 {n} 条陈旧 stdin 请求",
+                short_id(&id)
+            );
+        }
+    }
+
+    let ws = nix::pty::Winsize {
+        ws_row: PTY_ROWS,
+        ws_col: PTY_COLS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = match nix::pty::openpty(Some(&ws), None) {
+        Ok(p) => p,
+        Err(e) => {
+            return terminal_runtime(
+                states,
+                &id,
+                started,
+                TaskStateKind::Failed,
+                None,
+                format!("PTY 创建失败：{e}"),
+            );
+        }
+    };
+    let master: OwnedFd = pty.master;
+    let slave: OwnedFd = pty.slave;
+    let stdin_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(slave.as_raw_fd())) };
+    let stdout_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(slave.as_raw_fd())) };
+    let stderr_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(slave.as_raw_fd())) };
+
+    let mut command = Command::new(&task.payload.cmd[0]);
+    command
+        .args(&task.payload.cmd[1..])
+        .current_dir(workspace)
+        .envs(&task.payload.env)
+        .stdin(Stdio::from(stdin_fd))
+        .stdout(Stdio::from(stdout_fd))
+        .stderr(Stdio::from(stderr_fd));
+    // TUI 需要 TERM；调用方没给就用一个通用值（否则 claude/codex/pi 会按 dumb 终端降级）
+    if !task.payload.env.contains_key("TERM") {
+        command.env("TERM", "xterm-256color");
+    }
+    // 新会话 + 把 pty 设为控制终端：pgid==pid（整组可杀），且子进程看到真 TTY。
+    // pre_exec 里只调 libc（多线程 fork 后碰 allocator 会死锁）。
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return terminal_runtime(
+                states,
+                &id,
+                started,
+                TaskStateKind::Failed,
+                None,
+                format!("进程启动失败：{e}"),
+            );
+        }
+    };
+    let pid = child.id();
+
+    let mut running = states.get(&id);
+    running.kind = TaskStateKind::Running;
+    running.pid = Some(pid);
+    running.proc_identity = crate::task_identity::capture(pid);
+    running.started_at = Some(started);
+    running.finished_at = None;
+    running.last_exit_code = None;
+    running.last_error.clear();
+    let _ = states.set(&id, running);
+    crate::log!(
+        "[task:{}] {} proc(pty) 已启动 pid={pid} size={PTY_ROWS}x{PTY_COLS}",
+        task.bot_key,
+        short_id(&id)
+    );
+
+    // 读线程：master → 去控制序列 → 日志（轮转交给 append_task_log_record）
+    let mut reader = std::fs::File::from(master);
+    let mut writer =
+        std::fs::File::from(unsafe { OwnedFd::from_raw_fd(libc::dup(reader.as_raw_fd())) });
+    let log_max_bytes = task.limits.log_max_bytes;
+    let log_paths = paths.clone();
+    let log_id = id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let clean = strip_ansi(&buf[..n]);
+                    if !clean.is_empty() {
+                        let _ = crate::task_store::append_task_log_record(
+                            &log_paths,
+                            &log_id,
+                            log_max_bytes,
+                            &clean,
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    // 等待线程：child.wait() 在阻塞线程里做，主循环只轮询（绝不在 wait 上无超时死等）
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<std::process::ExitStatus>();
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(
+            child
+                .wait()
+                .unwrap_or_else(|_| std::process::ExitStatus::default()),
+        );
+    });
+
+    let deadline = if task.limits.timeout_secs == 0 {
+        None
+    } else {
+        Some(tokio::time::Instant::now() + Duration::from_secs(task.limits.timeout_secs))
+    };
+
+    let mut stop_reason: Option<String> = None;
+    let mut exited: Option<std::process::ExitStatus> = None;
+    loop {
+        if let Ok(st) = exit_rx.try_recv() {
+            exited = Some(st);
+            break;
+        }
+        if stop.is_cancelled() {
+            stop_reason = Some("已取消（service 关停 / task cancel）".to_string());
+            break;
+        }
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            stop_reason = Some(format!("执行超时（预算 {}s）", task.limits.timeout_secs));
+            break;
+        }
+        let _ = drain_proc_stdin(&paths, &id, &mut writer, log_max_bytes, &id);
+        tokio::time::sleep(PTY_POLL_INTERVAL).await;
+    }
+
+    let grace = Duration::from_secs(task.limits.grace_secs);
+    let mut escalated = false;
+    if stop_reason.is_some() || group_alive(nix::unistd::Pid::from_raw(pid as i32)) {
+        // 停止链与管道模式一致：SIGTERM → grace → 复查 → SIGKILL（整组）
+        match stop_orphan_process_group(pid, grace).await {
+            Ok(stop) => escalated = stop.escalated,
+            Err(e) => {
+                stop_reason = Some(format!(
+                    "{}；停止进程组失败：{e}",
+                    stop_reason.unwrap_or_else(|| "进程组残留清理".to_string())
+                ));
+            }
+        }
+        if exited.is_none() {
+            // 给等待线程一点时间把退出码送回来（SIGKILL 后应很快）
+            for _ in 0..50 {
+                if let Ok(st) = exit_rx.try_recv() {
+                    exited = Some(st);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(paths.cancel_file(&id));
+
+    let exit_code = exited.as_ref().and_then(|s| s.code());
+    let note = match (&stop_reason, &exited) {
+        (Some(reason), _) => reason.clone(),
+        (None, Some(st)) if st.success() => String::new(),
+        (None, Some(st)) => format!("进程退出码 {}", st.code().unwrap_or(-1)),
+        (None, None) => "进程已退出（未取到退出码）".to_string(),
+    };
+    let kind = if stop_reason.is_some() {
+        TaskStateKind::Cancelled
+    } else if exited.map(|s| s.success()).unwrap_or(false) {
+        TaskStateKind::Succeeded
+    } else {
+        TaskStateKind::Failed
+    };
+    let tail = format!("[proc] 结束：{note}\n");
+    let _ = crate::task_store::append_task_log_record(&paths, &id, log_max_bytes, tail.as_bytes());
+    if escalated {
+        crate::log!(
+            "[task:{}] {} proc(pty) 宽限后仍存活，已 SIGKILL 进程组",
+            task.bot_key,
+            short_id(&id)
+        );
+    }
+    terminal_runtime(states, &id, started, kind, exit_code, note)
 }
 
 /// 测试可注入毫秒级宽限；生产走 `TaskLimits.grace_secs`。
@@ -557,6 +932,121 @@ fn short_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ANSI/控制序列清洗：颜色、光标控制、OSC 标题都要去掉，正文与换行保留。
+    #[cfg(unix)]
+    #[test]
+    fn strip_ansi_removes_control_sequences() {
+        let raw = b"\x1b[31mred\x1b[0m plain\r\n\x1b]0;title\x07tail";
+        assert_eq!(strip_ansi(raw), b"red plain\ntail".to_vec());
+        // 没有控制字符时逐字节不变
+        assert_eq!(strip_ansi(b"hello\n"), b"hello\n".to_vec());
+        // 非 UTF-8 字节原样保留（日志不因编码崩）
+        assert_eq!(strip_ansi(&[0xff, 0xfe]), vec![0xff, 0xfe]);
+    }
+
+    /// PTY 端到端：跑一条需要 **TTY + 交互输入** 的 proc 任务，从输入通道喂文本，
+    /// 断言日志里出现交互回显，再取消收尾。这条锁住「claude/codex/pi 这类 TUI 能跑」的核心。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_proc_session_is_interactive() {
+        let root = tmp_root("pty-e2e");
+        let store = crate::task_store::TaskStore::new_at(&root, "b");
+        // TaskStateStore 不可 Clone：跑会话用 Arc，读日志另开一个实例（盘是真相）
+        let states = std::sync::Arc::new(crate::task_store::TaskStateStore::new_at(&root, "b"));
+        let reader_states = crate::task_store::TaskStateStore::new_at(&root, "b");
+        let task = crate::task_store::Task {
+            schema_version: crate::task_store::TASK_SCHEMA_VERSION,
+            id: "tk_pty_e2e".to_string(),
+            name: "pty".to_string(),
+            legacy_job_id: String::new(),
+            bot_key: "b".to_string(),
+            created_by: crate::task_store::CreatedBy {
+                role: crate::config::SenderRole::Owner,
+                bot_key: "b".to_string(),
+                chat_id: "c".to_string(),
+            },
+            payload: TaskPayload {
+                kind: PayloadKind::Proc,
+                pty: true,
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "test -t 0 && printf 'TTY=yes\n' || printf 'TTY=no\n'; printf 'READY\n'; read x; printf 'GOT=%s\n' \"$x\"; while :; do sleep 0.2; done".into(),
+                ],
+                ..Default::default()
+            },
+            trigger: Default::default(),
+            resume_on_boot: crate::task_store::DEFAULT_RESUME_ON_BOOT,
+            delivery: Default::default(),
+            limits: TaskLimits {
+                timeout_secs: 0,
+                grace_secs: 1,
+                ..Default::default()
+            },
+        };
+        task.validate().expect("pty proc 任务应合法");
+        store.add(task.clone()).unwrap();
+
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handle = {
+            let task = task.clone();
+            let states = std::sync::Arc::clone(&states);
+            let stop = stop.clone();
+            let ws = workspace.to_string_lossy().to_string();
+            tokio::spawn(async move { run_proc_attempt_pty(&task, &ws, &states, &stop).await })
+        };
+
+        let log_path = reader_states.paths().log_file(&task.id);
+        let read_log = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        let mut log = String::new();
+        for _ in 0..100 {
+            log = read_log(&log_path);
+            if log.contains("READY") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            log.contains("TTY=yes"),
+            "proc(pty) 下 stdin 必须是 TTY：{log:?}"
+        );
+        assert!(log.contains("READY"), "未在 5s 内看到 READY：{log:?}");
+
+        // 通过输入通道喂文本（与 `task send` 写的是同一个文件约定）
+        let dir = reader_states.paths().proc_stdin_dir(&task.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            reader_states.paths().proc_stdin_file(&task.id, 1),
+            r#"{"text":"hello","enter":true}"#,
+        )
+        .unwrap();
+        for _ in 0..100 {
+            log = read_log(&log_path);
+            if log.contains("GOT=hello") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(log.contains("GOT=hello"), "输入未生效：{log:?}");
+
+        // 取消收尾：脚本在 GOT 之后长驻（模拟 claude/codex/pi 那种交互会话），
+        // 所以这里必须由 cancel 收尾 —— 断言 Cancelled 同时证明「整组杀 + 不挂」
+        stop.cancel();
+        let rt = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("PTY 会话取消后应迅速收尾")
+            .expect("join");
+        assert_eq!(
+            rt.kind,
+            crate::task_store::TaskStateKind::Cancelled,
+            "{rt:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     use crate::task_store::{PayloadKind, TaskLimits, TaskPayload};
     #[cfg(unix)]

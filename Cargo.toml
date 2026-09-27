@@ -55,7 +55,7 @@ futures-util = "0.3"
 libc = "0.2"
 # buzz harness 移植（#200）：ACP 会话/回合协议、killpg 进程组终止、tracing 日志
 tracing = "0.1"
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process", "term"] }
 chrono = "0.4"
 thiserror = "2"
 aes = "0.8"

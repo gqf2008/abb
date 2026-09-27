@@ -406,6 +406,13 @@ pub struct TaskPayload {
     /// kind=proc：追加环境变量。用 BTreeMap 保证序列化确定性（同 HashMap 的坑见经验库）。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// kind=proc：是否用 **PTY** 跑（默认 false = 现在的管道行为）。
+    ///
+    /// 为什么需要：claude/codex/pi 这类 TUI 会按 `isatty()` 改变行为，管道下要么拒绝、
+    /// 要么把输出攒到退出才吐（长任务看起来像卡住）；PTY 下才有行缓冲 + 可交互。
+    /// 只有 `kind=proc` 支持（agent 载荷走 ACP，协议本身要求非 TTY 的 stdio）。
+    #[serde(default)]
+    pub pty: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -624,6 +631,11 @@ impl Task {
                 if self.payload.prompt.trim().is_empty() {
                     bail!("agent 任务需要 prompt");
                 }
+                // PTY 只对 proc 载荷有意义：agent 载荷走 ACP，协议本身要求非 TTY 的 stdio，
+                // 给它套 PTY 会破坏 JSON-RPC 分帧（宁可登记期拒绝，不要静默忽略）。
+                if self.payload.pty {
+                    bail!("pty 只支持 proc 载荷（agent 载荷走 ACP，stdin/stdout 必须是管道）");
+                }
             }
             PayloadKind::Proc => {
                 validate_proc_payload(&self.payload, &crate::workspace_dir(&self.bot_key))?;
@@ -690,6 +702,9 @@ impl Task {
 
 /// proc 载荷的登记期校验。工作区显式注入，单测可拿 temp 目录验证边界，不碰真实 HOME。
 fn validate_proc_payload(payload: &TaskPayload, workspace: &std::path::Path) -> anyhow::Result<()> {
+    if payload.pty && cfg!(not(unix)) {
+        bail!("pty 目前只在 unix 上支持（Windows ConPTY 未实现；proc 在 Windows 本就显式拒绝）");
+    }
     if payload.cmd.is_empty() {
         bail!("proc 任务需要 cmd（argv 数组）");
     }
@@ -919,6 +934,14 @@ impl TaskPaths {
     }
     pub fn cancel_file(&self, id: &str) -> PathBuf {
         self.cancel_requests_dir().join(safe_path_component(id))
+    }
+    /// proc 输入请求目录（PTY 会话的 stdin 通道；一个请求一个文件，按 seq 排序消费）。
+    pub fn proc_stdin_dir(&self, id: &str) -> PathBuf {
+        self.dir.join("proc-stdin").join(safe_path_component(id))
+    }
+    /// 单个输入请求文件（seq 单调递增，消费方按名字排序取最早的）。
+    pub fn proc_stdin_file(&self, id: &str, seq: u64) -> PathBuf {
+        self.proc_stdin_dir(id).join(format!("{seq:020}.json"))
     }
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.dir)
@@ -1209,6 +1232,29 @@ fn save_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// PTY 只对 proc 载荷有意义：agent 载荷走 ACP，stdin/stdout 必须是管道（否则 JSON-RPC
+    /// 分帧被 TTY 破坏）——登记期就要拒绝，不能静默忽略这个字段。
+    #[test]
+    fn pty_rejected_for_agent_payload() {
+        let mut task = agent_task("b");
+        task.payload.pty = true;
+        let err = task
+            .validate()
+            .expect_err("agent + pty 必须被拒")
+            .to_string();
+        assert!(err.contains("pty 只支持 proc 载荷"), "{err}");
+
+        // proc + pty 合法（cmd 存在即可；pty 的平台限制在 validate_proc_payload 里）
+        let mut task = agent_task("b");
+        task.payload.kind = PayloadKind::Proc;
+        task.payload.prompt.clear();
+        task.payload.cmd = vec!["/bin/sh".into(), "-c".into(), "echo hi".into()];
+        task.payload.pty = true;
+        // unix 上 proc+pty 应合法；Windows 上 proc 本身就被 platform_error 拒（不在此断言）
+        #[cfg(unix)]
+        task.validate().expect("unix 上 proc + pty 应合法");
+    }
+
     fn agent_task(bot: &str) -> Task {
         Task {
             schema_version: TASK_SCHEMA_VERSION,
@@ -1227,6 +1273,7 @@ mod tests {
                 cwd: String::new(),
                 cmd: Vec::new(),
                 env: BTreeMap::new(),
+                pty: false,
             },
             trigger: TaskTrigger {
                 kind: TriggerKind::Now,
