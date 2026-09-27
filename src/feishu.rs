@@ -24,7 +24,21 @@ pub struct FeishuResource {
 pub struct FeishuParsed {
     pub text: String,
     pub resources: Vec<FeishuResource>,
+    /// 消息**类型**（`msg_type`/`message_type`）。`parse_content` 不知道类型，恒留空；
+    /// 由拿到整条消息对象的调用方填：引用拉取填 `items[0].msg_type`，入站路径在 `on_payload`
+    /// 里用 `message.message_type` 补。
+    pub msg_type: String,
+    /// `post` 富文本里**未识别**的元素 tag（去重、保序、最多记 8 个）。
+    ///
+    /// 为什么要有：旧实现对未知 tag 是 `_ => {}` **静默丢弃** —— 若被引用内容/入站消息把
+    /// 「引用块」之类元素以内嵌 tag 下发，日志上看不出任何痕迹，表现就是「读不到原消息」
+    /// （2026-09-27 owner 实测提问）。记下来才能在日志里区分「没带 parent_id」与
+    /// 「带了但内容元素我们不认」。
+    pub unparsed_tags: Vec<String>,
 }
+
+/// 未识别元素 tag 的登记上限（防一条畸形消息刷爆日志）。
+const UNPARSED_TAG_CAP: usize = 8;
 
 /// 从消息 content（JSON 字符串）解析文本与资源引用。
 /// - image：`{"image_key":"img_xxx"}`
@@ -40,17 +54,22 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
         return FeishuParsed {
             text: String::new(),
             resources: vec![r],
+            msg_type: String::new(),
+            unparsed_tags: Vec::new(),
         };
     }
     if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
         return FeishuParsed {
             text: t.to_string(),
             resources: Vec::new(),
+            msg_type: String::new(),
+            unparsed_tags: Vec::new(),
         };
     }
     // post 富文本
     let mut text = String::new();
     let mut imgs: Vec<FeishuResource> = Vec::new();
+    let mut unparsed: Vec<String> = Vec::new();
     if let Some(title) = v.get("title").and_then(|x| x.as_str()) {
         if !title.is_empty() {
             text.push_str(title);
@@ -89,7 +108,17 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
                             }
                         }
                     }
-                    _ => {}
+                    other => {
+                        // 未识别元素：记下来（去重、限量），别静默丢掉——「引用块」这类元素
+                        // 若以内嵌 tag 下发，正是「读不到原消息」的一种成因。
+                        let tag = other.unwrap_or("").to_string();
+                        if !tag.is_empty()
+                            && !unparsed.contains(&tag)
+                            && unparsed.len() < UNPARSED_TAG_CAP
+                        {
+                            unparsed.push(tag);
+                        }
+                    }
                 }
             }
             text.push('\n');
@@ -98,6 +127,8 @@ pub fn parse_content(raw: &str) -> FeishuParsed {
     FeishuParsed {
         text: text.trim().to_string(),
         resources: imgs,
+        msg_type: String::new(),
+        unparsed_tags: unparsed,
     }
 }
 
@@ -421,7 +452,11 @@ impl FeishuClient {
         // items 非数组时 item=Null → raw="" → parse_content 返回空 → 桥按「无引用内容」跳过。
         let item = &resp["data"]["items"][0];
         let raw = item["body"]["content"].as_str().unwrap_or("");
-        Ok(parse_content(raw))
+        let mut parsed = parse_content(raw);
+        // 被引用消息的类型：内容解析不出东西时，这行是唯一能说明「为什么读不到」的线索
+        // （例如 merge_forward / sticker / 卡片类消息）。
+        parsed.msg_type = item["msg_type"].as_str().unwrap_or("").to_string();
+        Ok(parsed)
     }
 
     /// 下载消息内资源（图片/文件/音视频，≤100MB）。返回 (字节, Content-Type)。
@@ -1180,6 +1215,63 @@ mod tests {
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
         assert_eq!(content["elements"][0]["tag"], "markdown");
         assert_eq!(content["elements"][0]["content"], "你好");
+    }
+
+    /// 未识别的 post 元素 tag 必须被记下来（去重），而不是静默丢弃 ——
+    /// 「引用块」这类元素若以内嵌 tag 下发，正是「读不到原消息」的成因之一。
+    #[test]
+    fn parse_content_reports_unparsed_post_tags() {
+        let raw = r#"{"title":"","content":[[
+            {"tag":"text","text":"看这条 "},
+            {"tag":"quote","text":"被引用的内容"},
+            {"tag":"sticker","file_key":"stk_1"},
+            {"tag":"quote","text":"重复的 quote 不再记一次"},
+            {"tag":"a","text":"链接","href":"https://example.com"}
+        ]]}"#;
+        let p = parse_content(raw);
+        assert!(
+            p.text.contains("看这条"),
+            "known tags 仍要抽文本：{}",
+            p.text
+        );
+        assert!(p.text.contains("链接"), "a 标签仍要抽文本：{}", p.text);
+        assert_eq!(
+            p.unparsed_tags,
+            vec!["quote".to_string(), "sticker".to_string()],
+            "未识别 tag 去重、保序"
+        );
+
+        // 全是已知 tag → 不记；非 post（text）→ 不记
+        let p = parse_content(r#"{"title":"","content":[[{"tag":"text","text":"只有已知"}]}]}"#);
+        assert!(p.unparsed_tags.is_empty(), "{:?}", p.unparsed_tags);
+        let p = parse_content(r#"{"text":"普通文本"}"#);
+        assert!(p.unparsed_tags.is_empty());
+        assert!(
+            p.msg_type.is_empty(),
+            "parse_content 不知道类型，留空由调用方填"
+        );
+
+        // tag 缺失 / 非字符串 / 空串 → 不记（不能记成空 tag）
+        let p = parse_content(r#"{"content":[[{"text":"无 tag"},{"tag":7},{"tag":""}]]}"#);
+        assert!(p.unparsed_tags.is_empty(), "{:?}", p.unparsed_tags);
+
+        // 上限：超过 UNPARSED_TAG_CAP 后不再记（保序、只记前 8 个）
+        let many: Vec<serde_json::Value> = (0..12)
+            .map(|i| serde_json::json!({"tag": format!("x{i}")}))
+            .collect();
+        let raw = serde_json::json!({"content": [many]}).to_string();
+        let p = parse_content(&raw);
+        assert_eq!(
+            p.unparsed_tags.len(),
+            UNPARSED_TAG_CAP,
+            "{:?}",
+            p.unparsed_tags
+        );
+        assert_eq!(p.unparsed_tags[0], "x0");
+        assert_eq!(
+            p.unparsed_tags[UNPARSED_TAG_CAP - 1],
+            format!("x{}", UNPARSED_TAG_CAP - 1)
+        );
     }
 
     #[test]
