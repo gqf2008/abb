@@ -4465,7 +4465,22 @@ mod tests {
             assert!(!line.contains(raw), "诊断行不得落 id 原文：{line}");
         }
 
-        // ③ 字段整个缺失（不是空串）→ 同样按不存在，且不 panic
+        // ③ null / 非字符串值：null 按不存在；非字符串（数字、数组）按「字段在」处理。
+        // （评审建议补的边界：`present()` 用 `get()` 取，缺字段返回 None 不会 panic。）
+        let msg = serde_json::json!({
+            "message_id": "om_diag_kinds",
+            "message_type": 123,
+            "parent_id": serde_json::Value::Null,
+            "root_id": 0,
+            "thread_id": ["omt_x"]
+        });
+        let line = inbound_field_diag("om_diag_kinds", &msg);
+        assert!(
+            line.contains("parent_id=false root_id=true thread_id=true"),
+            "null 按不存在、非字符串按存在：{line}"
+        );
+
+        // ④ 字段整个缺失（不是空串）→ 同样按不存在，且不 panic
         let msg = serde_json::json!({"message_id": "om_diag_missing"});
         let line = inbound_field_diag("om_diag_missing", &msg);
         assert!(
