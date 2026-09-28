@@ -71,6 +71,12 @@ pub const OP_SET_AUTO_LOGIN: &str = "set-auto-login";
 pub const OP_CLEAR_AUTO_LOGIN: &str = "clear-auto-login";
 /// 操作：`get-auto-login`。
 pub const OP_GET_AUTO_LOGIN: &str = "get-auto-login";
+/// 操作：`install-bridge-task`（注册 bridge 常驻计划任务，需管理员）。
+pub const OP_INSTALL_BRIDGE_TASK: &str = "install-bridge-task";
+/// 操作：`remove-bridge-task`（删除该任务，需管理员）。
+pub const OP_REMOVE_BRIDGE_TASK: &str = "remove-bridge-task";
+/// 操作：`stop-bridge-task`（停掉任务当前实例 = 停止服务，需管理员）。
+pub const OP_STOP_BRIDGE_TASK: &str = "stop-bridge-task";
 /// 审计里给「解析不出 op」的请求用的占位名。
 pub const OP_UNKNOWN: &str = "<unknown>";
 
@@ -83,11 +89,24 @@ pub enum Op {
     ClearAutoLogin,
     /// 只读：返回 `enabled` + `username`（**永不返回密码**）。
     GetAutoLogin,
+    /// 注册/覆盖 bridge 常驻计划任务（`agent-bridge --service`，AtLogon + HighestAvailable）。
+    InstallBridgeTask,
+    /// 删除 bridge 常驻计划任务。
+    RemoveBridgeTask,
+    /// 停止 bridge 常驻任务当前实例（= 停止服务；owner 要求停止必须授权）。
+    StopBridgeTask,
 }
 
 impl Op {
     /// 全部白名单操作（遍历用）。
-    pub const ALL: [Op; 3] = [Op::SetAutoLogin, Op::ClearAutoLogin, Op::GetAutoLogin];
+    pub const ALL: [Op; 6] = [
+        Op::SetAutoLogin,
+        Op::ClearAutoLogin,
+        Op::GetAutoLogin,
+        Op::InstallBridgeTask,
+        Op::RemoveBridgeTask,
+        Op::StopBridgeTask,
+    ];
 
     /// 线上名字（协议里就是它）。
     pub fn name(self) -> &'static str {
@@ -95,6 +114,9 @@ impl Op {
             Op::SetAutoLogin => OP_SET_AUTO_LOGIN,
             Op::ClearAutoLogin => OP_CLEAR_AUTO_LOGIN,
             Op::GetAutoLogin => OP_GET_AUTO_LOGIN,
+            Op::InstallBridgeTask => OP_INSTALL_BRIDGE_TASK,
+            Op::RemoveBridgeTask => OP_REMOVE_BRIDGE_TASK,
+            Op::StopBridgeTask => OP_STOP_BRIDGE_TASK,
         }
     }
 
@@ -105,6 +127,9 @@ impl Op {
             "set-auto-login" => Some(Op::SetAutoLogin),
             "clear-auto-login" => Some(Op::ClearAutoLogin),
             "get-auto-login" => Some(Op::GetAutoLogin),
+            "install-bridge-task" => Some(Op::InstallBridgeTask),
+            "remove-bridge-task" => Some(Op::RemoveBridgeTask),
+            "stop-bridge-task" => Some(Op::StopBridgeTask),
             _ => None,
         }
     }
@@ -242,6 +267,21 @@ pub trait SysBackend {
     fn clear_auto_login(&self) -> Result<(), SysError>;
     /// 只读两个值（永不读密码）。
     fn get_auto_login(&self) -> Result<AutoLoginState, SysError>;
+    /// 与本 helper **同目录**的 `agent-bridge.exe` 绝对路径。
+    ///
+    /// 刻意不接受调用方给路径：任务会在登录时以**高完整性**拉起这个 exe，若路径可被调用方
+    /// 指定，等于把「一次授权」换成「任意程序开机自启提权执行」的持久化原语。
+    /// 同用户的管道客户端拿不到别的路径 ⇒ fail-closed。
+    fn bridge_exe_path(&self) -> Result<String, SysError>;
+    /// 调用方进程所属用户（实现返回 **SID 字符串**）——计划任务的 UserId 用它，
+    /// **不听调用方自报**；SID 不受本地化/同名账号影响，Task Scheduler 的 XML 直接接受。
+    fn user_for_pid(&self, pid: u32) -> Result<String, SysError>;
+    /// 注册/覆盖 bridge 常驻计划任务（AtLogon + HighestAvailable + RestartOnFailure）。
+    fn install_bridge_task(&self, exe: &str, user: &str) -> Result<(), SysError>;
+    /// 删除该任务（幂等）。
+    fn remove_bridge_task(&self) -> Result<(), SysError>;
+    /// 停掉该任务当前实例（幂等：没在跑不算错）。
+    fn stop_bridge_task(&self) -> Result<(), SysError>;
 }
 
 // ─────────────────────────── 审计 ───────────────────────────
@@ -329,6 +369,9 @@ pub fn redact_params(op: Op, username: Option<&str>) -> serde_json::Value {
         }),
         // 清 / 读不带参数，审计也就没有可脱敏的东西。
         Op::ClearAutoLogin | Op::GetAutoLogin => serde_json::json!({}),
+        // bridge 任务三连：**不使用**调用方给的任何字段（exe 取 helper 自己同目录、用户名取
+        // 调用方进程的 token），所以审计里没有可脱敏项——这条设计本身就是反注入面。
+        Op::InstallBridgeTask | Op::RemoveBridgeTask | Op::StopBridgeTask => serde_json::json!({}),
     }
 }
 
@@ -512,6 +555,9 @@ fn ok_reason(op: Op) -> &'static str {
         Op::SetAutoLogin => "已写入自动登录配置",
         Op::ClearAutoLogin => "已清除自动登录配置",
         Op::GetAutoLogin => "读取成功",
+        Op::InstallBridgeTask => "已注册 bridge 常驻计划任务（登录后常驻，托盘退出不影响）",
+        Op::RemoveBridgeTask => "已删除 bridge 常驻计划任务",
+        Op::StopBridgeTask => "已停止 bridge 常驻任务",
     }
 }
 
@@ -617,6 +663,58 @@ fn clear_auto_login(ctx: &AuditCtx<'_>, backend: &dyn SysBackend) -> Response {
     conclude(ctx, op, params, backend.clear_auto_login().map(|()| None))
 }
 
+/// 注册 bridge 常驻计划任务。
+///
+/// 安全要点（三条都刻意「不听调用方」）：
+/// 1. **exe 路径**取 [`SysBackend::bridge_exe_path`]（helper 自己同目录的 `agent-bridge.exe`），
+///    请求里给什么都不看；
+/// 2. **用户名**取调用方进程的 token（[`SysBackend::user_for_pid`] + `ctx.pid`），不信任自报；
+/// 3. 失败一律 fail-closed（拿不到 exe/用户名 → 不触达系统调用）。
+///
+/// 为什么值得这么严：任务会在**登录时以高完整性**拉起该 exe —— 若这两个字段可被调用方左右，
+/// 一次 UAC 授权就变成「任意程序开机提权自启」的持久化原语。
+fn install_bridge_task(ctx: &AuditCtx<'_>, backend: &dyn SysBackend) -> Response {
+    let op = Op::InstallBridgeTask;
+    let params = redact_params(op, None);
+    if audit_attempt(ctx, op, &params).is_err() {
+        return resp_err(codes::AUDIT_FAILED, AUDIT_FAILED_REASON);
+    }
+    let exe = match backend.bridge_exe_path() {
+        Ok(p) => p,
+        Err(err) => return conclude(ctx, op, params, Err(err)),
+    };
+    let user = match backend.user_for_pid(ctx.pid) {
+        Ok(u) => u,
+        Err(err) => return conclude(ctx, op, params, Err(err)),
+    };
+    conclude(
+        ctx,
+        op,
+        params,
+        backend.install_bridge_task(&exe, &user).map(|()| None),
+    )
+}
+
+/// 删除 bridge 常驻计划任务（幂等）。
+fn remove_bridge_task(ctx: &AuditCtx<'_>, backend: &dyn SysBackend) -> Response {
+    let op = Op::RemoveBridgeTask;
+    let params = redact_params(op, None);
+    if audit_attempt(ctx, op, &params).is_err() {
+        return resp_err(codes::AUDIT_FAILED, AUDIT_FAILED_REASON);
+    }
+    conclude(ctx, op, params, backend.remove_bridge_task().map(|()| None))
+}
+
+/// 停掉 bridge 常驻任务当前实例（= 停止服务；owner 要求这一步必须授权）。
+fn stop_bridge_task(ctx: &AuditCtx<'_>, backend: &dyn SysBackend) -> Response {
+    let op = Op::StopBridgeTask;
+    let params = redact_params(op, None);
+    if audit_attempt(ctx, op, &params).is_err() {
+        return resp_err(codes::AUDIT_FAILED, AUDIT_FAILED_REASON);
+    }
+    conclude(ctx, op, params, backend.stop_bridge_task().map(|()| None))
+}
+
 fn get_auto_login(ctx: &AuditCtx<'_>, backend: &dyn SysBackend) -> Response {
     let op = Op::GetAutoLogin;
     let params = redact_params(op, None);
@@ -684,6 +782,9 @@ pub fn handle_request(
         Op::SetAutoLogin => set_auto_login(req, ctx, backend),
         Op::ClearAutoLogin => clear_auto_login(ctx, backend),
         Op::GetAutoLogin => get_auto_login(ctx, backend),
+        Op::InstallBridgeTask => install_bridge_task(ctx, backend),
+        Op::RemoveBridgeTask => remove_bridge_task(ctx, backend),
+        Op::StopBridgeTask => stop_bridge_task(ctx, backend),
     }
 }
 
@@ -704,6 +805,8 @@ mod tests {
         set_calls: Mutex<Vec<(String, String)>>,
         clear_calls: Mutex<usize>,
         get_calls: Mutex<usize>,
+        /// bridge 任务三连的调用记录（`install <exe> <user>` / `remove` / `stop`）。
+        task_calls: Mutex<Vec<String>>,
         fail: Option<SysError>,
     }
 
@@ -725,6 +828,7 @@ mod tests {
             self.set_calls.lock().unwrap().len()
                 + *self.clear_calls.lock().unwrap()
                 + *self.get_calls.lock().unwrap()
+                + self.task_calls.lock().unwrap().len()
         }
     }
 
@@ -758,6 +862,52 @@ mod tests {
             }
             *self.get_calls.lock().unwrap() += 1;
             Ok(self.state.lock().unwrap().clone())
+        }
+
+        /// 假 helper 的「自身目录」：固定串，便于断言「任务用的是 helper 给的路径而不是调用方给的」。
+        fn bridge_exe_path(&self) -> Result<String, SysError> {
+            if let Some(err) = self.fail {
+                return Err(err);
+            }
+            Ok(r"C:\Program Files\ABB\agent-bridge.exe".to_string())
+        }
+
+        /// 假实现：任何 pid（非 0）都解析成固定 SID（真机走 OpenProcess + token）。
+        fn user_for_pid(&self, pid: u32) -> Result<String, SysError> {
+            if let Some(err) = self.fail {
+                return Err(err);
+            }
+            if pid == 0 {
+                return Err(SysError::Failed);
+            }
+            Ok("S-1-5-21-111-222-333-1001".to_string())
+        }
+
+        fn install_bridge_task(&self, exe: &str, user: &str) -> Result<(), SysError> {
+            if let Some(err) = self.fail {
+                return Err(err);
+            }
+            self.task_calls
+                .lock()
+                .unwrap()
+                .push(format!("install {exe} {user}"));
+            Ok(())
+        }
+
+        fn remove_bridge_task(&self) -> Result<(), SysError> {
+            if let Some(err) = self.fail {
+                return Err(err);
+            }
+            self.task_calls.lock().unwrap().push("remove".to_string());
+            Ok(())
+        }
+
+        fn stop_bridge_task(&self) -> Result<(), SysError> {
+            if let Some(err) = self.fail {
+                return Err(err);
+            }
+            self.task_calls.lock().unwrap().push("stop".to_string());
+            Ok(())
         }
     }
 
@@ -831,8 +981,13 @@ mod tests {
     // ───────────────────────── 白名单 ─────────────────────────
 
     #[test]
-    fn whitelist_is_exactly_three_ops() {
-        assert_eq!(Op::ALL.len(), 3);
+    /// 白名单**数量**也被钉住：任何新增 op 都必须同步改这条测试——提权出口每多一个操作
+    /// 都是攻击面，评审要能一眼看到 diff。
+    ///
+    /// 2026-09-28（批 abb-svc-persist-password-gate）：3 → 6，新增
+    /// `install-bridge-task` / `remove-bridge-task` / `stop-bridge-task`（bridge 常驻计划任务）。
+    fn whitelist_is_exactly_the_known_ops() {
+        assert_eq!(Op::ALL.len(), 6);
         for op in Op::ALL {
             assert_eq!(Op::from_name(op.name()), Some(op));
         }
@@ -840,6 +995,68 @@ mod tests {
         assert_eq!(Op::ClearAutoLogin.name(), "clear-auto-login");
         assert_eq!(Op::GetAutoLogin.name(), "get-auto-login");
         assert_eq!(Op::SetAutoLogin.name(), OP_SET_AUTO_LOGIN);
+        // 本批新增的三个 bridge 任务操作也在白名单里，且名字精确。
+        assert_eq!(Op::InstallBridgeTask.name(), "install-bridge-task");
+        assert_eq!(Op::RemoveBridgeTask.name(), "remove-bridge-task");
+        assert_eq!(Op::StopBridgeTask.name(), "stop-bridge-task");
+    }
+
+    /// **反注入（关键）**：注册任务时 helper 只用「自己同目录的 exe」+「调用方进程的真实用户」，
+    /// 请求里塞进来的 `exe`/`user` 一律被忽略 —— 否则一次授权就变成「任意程序开机提权自启」。
+    #[test]
+    fn install_bridge_task_ignores_caller_supplied_path_and_user() {
+        let dir = std::env::temp_dir().join(format!("abb-elev-task-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = Fake::default();
+        let tok = "t".repeat(32);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "token": tok,
+            "op": "install-bridge-task",
+            // 攻击者能控制的字段：全都不该生效
+            "params": {
+                "exe": r"C:\Users\attacker\evil.exe",
+                "user": r"DESKTOP-ABC\attacker",
+                "args": "--do-bad-things",
+            },
+        }))
+        .unwrap();
+        let resp = handle_request(&body, &tok, &ctx(&dir), &backend);
+        assert!(resp.ok, "{resp:?}");
+        let calls = backend.task_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].contains(r"C:\Program Files\ABB\agent-bridge.exe"),
+            "必须用 helper 同目录的 exe：{calls:?}"
+        );
+        assert!(
+            calls[0].contains("S-1-5-21-111-222-333-1001"),
+            "必须用调用方进程的真实用户（SID）：{calls:?}"
+        );
+        assert!(
+            !calls[0].contains("evil.exe") && !calls[0].contains("attacker"),
+            "调用方自报的路径/用户名不得生效：{calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删除/停止走白名单同样的审计与幂等路径（各触达一次后端）。
+    #[test]
+    fn remove_and_stop_bridge_task_dispatch() {
+        let dir = std::env::temp_dir().join(format!("abb-elev-task2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = Fake::default();
+        let tok = "t".repeat(32);
+        for (op, want) in [
+            ("remove-bridge-task", "remove"),
+            ("stop-bridge-task", "stop"),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({ "token": tok, "op": op })).unwrap();
+            let resp = handle_request(&body, &tok, &ctx(&dir), &backend);
+            assert!(resp.ok, "{op}: {resp:?}");
+            let calls = backend.task_calls.lock().unwrap().clone();
+            assert_eq!(calls.last().map(String::as_str), Some(want), "{calls:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

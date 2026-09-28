@@ -627,38 +627,6 @@ fn login_item_state_at(plist: &std::path::Path, current: &std::path::Path) -> Lo
     }
 }
 
-#[cfg(target_os = "macos")]
-fn login_item_state() -> LoginItem {
-    match current_exe() {
-        Ok(exe) => login_item_state_at(&login_item_plist(), &exe),
-        Err(_) => LoginItem::Absent,
-    }
-}
-
-/// bridge job 的状态：二进制要对，**参数必须是 `--service`**（旧版/写错的 job 判 Drifted
-/// 并按当前意图重建）。
-#[cfg(target_os = "macos")]
-fn service_item_state() -> LoginItem {
-    let Ok(exe) = current_exe() else {
-        return LoginItem::Absent;
-    };
-    let plist = service_item_plist();
-    match login_item_state_at(&plist, &exe) {
-        LoginItem::Matches => {
-            let text = std::fs::read_to_string(&plist).unwrap_or_default();
-            if plist_program_arguments(&text)
-                .iter()
-                .any(|a| a == "--service")
-            {
-                LoginItem::Matches
-            } else {
-                LoginItem::Drifted
-            }
-        }
-        other => other,
-    }
-}
-
 /// 自启的**合并状态**：托盘 job 与 bridge job 必须都在且都指向当前二进制。
 ///
 /// 刻意把「一侧在、另一侧缺」判成 [`LoginItem::Drifted`]（而不是 Absent）：存量用户只有
@@ -755,6 +723,15 @@ pub fn heal_autostart() {
     let logs = crate::bridge_dir().join("logs");
     let desired = autostart_desired_at(&logs);
     let registered = autostart_enabled();
+    // 服务常驻（计划任务）状态如实入审计：注册/删除任务都需要管理员授权，**自愈不弹授权框**
+    // （否则每次启动都弹 UAC）。所以这里只记录「用户想开自启、但常驻任务还没生效」，让他从
+    // autostart.log 看得出下一步是「开一次开关（会走一次 UAC）」。
+    if desired && service_persist_state() != "matches" {
+        log_autostart_event(&format!(
+            "服务常驻未生效（计划任务 {}）：注册需管理员授权，开一次「开机自启」开关即可补齐",
+            service_persist_state()
+        ));
+    }
     // 存量用户（升级前就开了自启、没留下意图标记）：只要键还在就补记意图，让以后被
     // 回滚时能自愈。此处只在「键在」时补记，不写注册表，无副作用。
     if !desired && registered {
@@ -1114,40 +1091,117 @@ fn run_reg(args: &[&str]) -> std::io::Result<std::process::Output> {
     crate::spawn::command("reg").args(args).output()
 }
 
-/// bridge 常驻计划任务名（B1b：`schtasks` 注册，跑 `<exe> --service`）。
-///
-/// **Windows 侧尚未接线**（批 `abb-svc-persist-password-gate-20260928` 的 B1b）：
-/// 计划任务注册（`RunLevel=HighestAvailable` + `RestartOnFailure`，一次性 UAC）与
-/// 「停止需 UAC」的 helper 白名单 op 都还没写。在那之前 `service_supervised()` 恒假 ⇒
-/// 行为与今天完全一致（bridge 仍是托盘子进程），**不会**因为本片而出现半吊子状态。
+/// 跑 schtasks（CREATE_NO_WINDOW：GUI 进程 spawn 控制台程序不弹黑框）。
 #[cfg(target_os = "windows")]
-#[allow(dead_code)]
-const SVC_TASK_NAME: &str = "ABB-Bridge";
+fn run_schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
+    crate::spawn::command("schtasks").args(args).output()
+}
 
-/// Windows：是否已交给计划任务托管（B1b 之前恒假，见 [`SVC_TASK_NAME`] 的说明）。
+/// bridge 常驻计划任务的状态（与 macOS 的 `LoginItem` 三态同构）。
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum SvcTask {
+    /// 任务不存在（没开过 / 被删）或查不出来。
+    Absent,
+    /// 任务在，且登记的 exe + `--service` 与当前二进制一致。
+    Matches,
+    /// 任务在但指向旧安装路径 / 缺 `--service`（升级换过目录、旧版任务）。
+    Drifted,
+}
+
+/// 查询任务：`schtasks /query /tn … /xml`，再按**字节**判 exe 与 `--service`
+/// （输出编码可能是 UTF-8 或 UTF-16LE；判据只需回答「是不是当前这套」，不解析 XML）。
+#[cfg(target_os = "windows")]
+fn svc_task_state() -> SvcTask {
+    let Ok(exe) = current_exe() else {
+        return SvcTask::Absent;
+    };
+    match run_schtasks(&["/query", "/tn", agent_bridge::svc_task::TASK_NAME, "/xml"]) {
+        Ok(o) if o.status.success() => {
+            if agent_bridge::svc_task::task_output_matches_exe(&o.stdout, &exe.to_string_lossy()) {
+                SvcTask::Matches
+            } else {
+                SvcTask::Drifted
+            }
+        }
+        // 任务不存在时 schtasks 非 0 退出（错误在 stderr）——当 Absent。
+        Ok(_) | Err(_) => SvcTask::Absent,
+    }
+}
+
+/// Windows：bridge 是否已交给计划任务托管（任务在且指向当前二进制）。
+///
+/// 托管后托盘不再自己 spawn/杀 bridge（见 `install::svc_start` / `svc_restart`）：计划任务带
+/// `RunLevel=HighestAvailable`（高完整性，同用户的中完整性进程杀不掉）与 `RestartOnFailure`，
+/// 比托盘的 2 秒看门狗更硬。
 #[cfg(target_os = "windows")]
 pub fn service_supervised() -> bool {
-    false
+    svc_task_state() == SvcTask::Matches
 }
 
-/// Windows：让计划任务重启 bridge（B1b 接线前不会被调用，因为 `service_supervised()` 恒假）。
+/// Windows：让计划任务重启 bridge（`/end` 再 `/run`）。
+///
+/// 不需要提权：任务属于当前用户，`/run`/`/end` 普通权限即可（与「停止服务」不同——后者是
+/// owner 要求的**授权动作**，走提权 helper）。
 #[cfg(target_os = "windows")]
 pub fn restart_service_supervised() -> Result<()> {
-    anyhow::bail!(
-        "Windows 计划任务托管尚未接线（批 abb-svc-persist-password-gate-20260928 的 B1b）"
-    )
+    let _ = run_schtasks(&["/end", "/tn", agent_bridge::svc_task::TASK_NAME]);
+    let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
+        .context("执行 schtasks /run 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "schtasks /run 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
-/// Windows：停止服务需要 UAC 授权（owner 2026-09-28 要求）。
+/// 调提权 helper 执行一个 op（UAC 由 helper 的 `runas` 触发）。
 ///
-/// **B1b 待接线**：走 `abb-elev-helper` 的新白名单 op（`schtasks /end` + 杀 pid + 审计）。
-/// 在那之前这里**明确报错**而不是静默降级成「无授权停止」——否则「停止要授权」这条需求
-/// 会在 Windows 上被悄悄绕过。
+/// 结果双重校验：**退出码必须为 0**（提权包装必须透传子进程退出码）**且**响应 `ok`——
+/// 只看响应会把「helper 崩了但管道里残留半截数据」当成成功。
+#[cfg(target_os = "windows")]
+fn call_elev(op: agent_bridge::elev::Op) -> Result<agent_bridge::elev::Response> {
+    let outcome = agent_bridge::elev::win::call_helper(
+        op,
+        &serde_json::json!({}),
+        std::time::Duration::from_secs(120),
+    )
+    .map_err(|e| anyhow::anyhow!("拉起提权 helper 失败：{e}"))?;
+    if outcome.exit_code != 0 {
+        anyhow::bail!("提权 helper 退出码 {}（响应不可信）", outcome.exit_code);
+    }
+    let resp: agent_bridge::elev::Response =
+        serde_json::from_slice(&outcome.response).context("提权 helper 响应不是合法 JSON")?;
+    if !resp.ok {
+        anyhow::bail!("提权操作被拒绝/失败：{}（{}）", resp.reason, resp.code);
+    }
+    Ok(resp)
+}
+
+/// Windows：停止服务 —— **需要 UAC 授权**（owner 2026-09-28：不能被随便杀死）。
+///
+/// 走提权 helper 的白名单 op `stop-bridge-task`（`schtasks /end` + 审计）。用户取消 UAC 时
+/// helper 起不来 ⇒ 这里报错，调用方据此提示「未停止」（**不会**静默降级成无授权停止）。
 #[cfg(target_os = "windows")]
 pub fn stop_service_authorized() -> Result<()> {
-    anyhow::bail!(
-        "Windows 侧「授权停止服务」尚未接线（批 abb-svc-persist-password-gate-20260928 的 B1b）"
-    )
+    call_elev(agent_bridge::elev::Op::StopBridgeTask)?;
+    Ok(())
+}
+
+/// Windows：服务常驻（计划任务）当前是否生效——供状态展示/自愈判断用。
+///
+/// 与 [`autostart_enabled`]（托盘自启 = Run 键）刻意分开：存量用户只有 Run 键，判据若耦合会
+/// 让他的开关突然显示「关」。补任务要显式动作（开自启开关）——注册任务需要 UAC，而自愈阶段
+/// **不弹**授权框（那会变成每次启动都弹）。
+#[cfg(target_os = "windows")]
+pub fn service_persist_state() -> &'static str {
+    match svc_task_state() {
+        SvcTask::Matches => "matches",
+        SvcTask::Drifted => "drifted",
+        SvcTask::Absent => "absent",
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1194,6 +1248,12 @@ fn autostart_desired_at(logs: &std::path::Path) -> bool {
 #[cfg(target_os = "windows")]
 fn set_autostart_impl(enable: bool) -> Result<()> {
     let exe = current_exe()?;
+    if enable {
+        // 顺序要紧：**先**注册常驻计划任务（要管理员授权），用户取消就整件事不成立——
+        // 不写 Run 键、不落意图标记（否则开关会显示「开」，而常驻其实没生效）。
+        call_elev(agent_bridge::elev::Op::InstallBridgeTask)
+            .context("注册 bridge 常驻计划任务失败（需要管理员授权）")?;
+    }
     let out = if enable {
         let val = format!("\"{}\"", exe.display());
         run_reg(&[
@@ -1214,6 +1274,16 @@ fn set_autostart_impl(enable: bool) -> Result<()> {
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("设置开机自启失败: {}", msg.trim())
+    }
+    if !enable {
+        // 关自启 = 连常驻任务一起撤（否则「关了自启，服务还在后台跑」）。
+        // 用户取消授权时 Run 键已经删了，这里如实报错 + 落审计，让人知道任务还留着。
+        if let Err(e) = call_elev(agent_bridge::elev::Op::RemoveBridgeTask) {
+            log_autostart_event(&format!(
+                "⚠️ 删除 bridge 常驻计划任务失败（任务可能仍在，登录后会拉起服务）: {e:#}"
+            ));
+            return Err(e).context("删除 bridge 常驻计划任务失败（需要管理员授权）");
+        }
     }
     // 注册表动作成功后再落意图标记。顺序要紧：标记是「用户想要开/关」的唯一判据，
     // 若标记先落而注册表失败，下次自愈就会拿一个未兑现的意图去改用户配置。

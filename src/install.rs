@@ -428,10 +428,17 @@ mod upgrade_call_site_tests {
              若只是中间的注释变长了，把这个常量一起调大并在此说明",
             call_line - log_line
         );
-        // 反向护栏：用户手动停 / 托盘退出仍走清意图的 `svc_stop()`（升级路径不得把两处语义混回去）。
+        // 反向护栏（2026-09-28 语义变更后重写）：托盘侧的「停止」**必须**走授权路径
+        // `svc_stop_authorized()`，**不得**出现直接的无授权 `svc_stop();`
+        // （owner 要求：停止服务需要密码授权；这条守卫就是防止哪天有人把它改回去）。
         assert!(
-            ui.matches("svc_stop();").count() >= 1,
-            "手动停/退出路径仍应调用 svc_stop()；若全仓不再有它，说明语义被合并了，请重审本条守卫"
+            ui.matches("svc_stop_authorized()").count() >= 1,
+            "托盘「停止」必须走 install::svc_stop_authorized()（需要授权）"
+        );
+        assert_eq!(
+            ui.matches("install::svc_stop();").count(),
+            0,
+            "托盘侧不得再直接调无授权的 install::svc_stop()——那等于绕过密码授权（本守卫的立身之本）"
         );
     }
 
