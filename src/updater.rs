@@ -431,7 +431,7 @@ fn log_update_at(logs_dir: &std::path::Path, msg: &str) {
 /// （无控制台、由安装器 `[Run]`/资源管理器拉起）与 macOS（`open` 拉起时 0/1/2 指 /dev/null）
 /// 上都会蒸发——「sha256 不符已拒绝安装」这种最该被看见的告警也会一起消失。
 /// 复核 reviewer-40 的问题 3 就是这一条（B1 的同类病）。
-fn log_update(msg: &str) {
+pub(crate) fn log_update(msg: &str) {
     log_stdout(msg);
     log_update_event(msg);
 }
@@ -557,21 +557,25 @@ fn windows_install(setup: &Path) -> Result<()> {
     // crate::spawn）避免闪控制台。
     let args = windows_silent_args();
     let line = format!(
-        "已静默启动安装包 {}（参数 {}；无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
+        "正在静默启动安装包 {}（参数 {}；无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
         setup.display(),
         args.join(" ")
     );
     // 先留痕再 spawn：安装器带 /CLOSEAPPLICATIONS，理论上本进程可能在 spawn 后被立刻关掉，
-    // 那样这条记录就丢了（复核 reviewer-40 的问题 1）。顺序反过来零成本、无副作用。
+    // 那样这条记录就丢了（复核 reviewer-40 的问题 1）。措辞刻意用「正在…」：此时还没启动成功，
+    // 若 spawn 失败，下面是失败分支补的第二条记录（复核 reviewer-41 的问题 2）。
     log_update_event(&line);
-    crate::spawn::command("cmd")
+    if let Err(e) = crate::spawn::command("cmd")
         .arg("/c")
         .arg("start")
         .arg("")
         .arg(setup)
         .args(args)
         .spawn()
-        .context("启动安装包失败")?;
+    {
+        log_update_event(&format!("启动安装包失败：{e:#}"));
+        return Err(anyhow::Error::from(e)).context("启动安装包失败");
+    }
     Ok(())
 }
 
@@ -603,9 +607,10 @@ mod tests {
     /// 注释行（含 `///` 文档）不计——那里出现 `crate::log!` 只是说明文字。
     #[test]
     fn update_logs_never_use_bare_crate_log() {
-        // 针在运行时拼出来：本测试自己的字符串/文档里也会出现这个宏名，写成字面量会把
-        // 匹配数抬高（本批首跑就被自己的守卫抓红一次，与 F1 守卫的「按字节算距离」同源）。
-        let needle = ["crate::", "log!"].concat();
+        // 针在运行时拼出来，且**不含完整字面量**：本测试自己的字符串若出现这个宏名，会被同一个
+        // 针命中（首版用 `crate::log!` 字面量时就自匹配过）。针取「宏名」而不是全路径，是为了
+        // 连 `use crate::log; log!(…)` 这种绕过形式一起拦住（复核 reviewer-41 的 M3）。
+        let needle = ["lo", "g!"].concat();
         let src = include_str!("updater.rs");
         let hits: Vec<(usize, &str)> = src
             .lines()
@@ -616,13 +621,39 @@ mod tests {
         assert_eq!(
             hits.len(),
             1,
-            "只允许 log_update() 里那一处直写 stdout 的日志宏（双写的 stdout 半），实得 {hits:?}；\
-             update 链路的新日志请走 log_update()/log_update_event()"
+            "只允许 log_stdout() 里那一处直写 stdout 的日志宏（双写的 stdout 半），实得 {hits:?}；\
+             update 链路的新日志请走 log_update()/log_update_event()（`use crate::log;` 这类引入也会被本守卫拦下）"
         );
+        // 唯一那处必须在 log_stdout 体内：往上看最近的非空行应是它的签名。
+        let idx = hits[0].0;
+        let all: Vec<&str> = src.lines().collect();
+        let prev = all[..idx]
+            .iter()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .copied()
+            .unwrap_or("");
         assert!(
-            hits[0].1.trim_start().starts_with(&needle),
-            "唯一那处应当就是 log_update 的 stdout 半，实得：{}",
-            hits[0].1.trim()
+            prev.contains("fn log_stdout(msg: &str)"),
+            "唯一那处必须在 log_stdout() 体内，实得上一行：{prev:?}"
+        );
+    }
+
+    /// **生产接线守卫**：`verify_sha256` 必须把 `<bridge_dir>/logs` 交给可注入版
+    /// （复核 reviewer-41 的问题 3：把它改成 `None` 后全套测试仍绿，等于生产侧静默只剩 stdout）。
+    #[test]
+    fn verify_sha256_production_seam_wires_the_file_log() {
+        let src = include_str!("updater.rs");
+        let head = src.find("pub fn verify_sha256(").expect("生产入口存在");
+        let tail = src[head..]
+            .find("\n}\n")
+            .map(|i| head + i)
+            .expect("函数体结束");
+        let body = &src[head..tail];
+        let seam = ["Some(&crate::bridge_dir().join(\"lo", "gs\"))"].concat();
+        assert!(
+            body.contains("verify_sha256_at(") && body.contains(&seam),
+            "pub fn verify_sha256 必须调用 verify_sha256_at 并把 {seam} 传进去（生产侧否则只剩 stdout）\n{body}"
         );
     }
 
