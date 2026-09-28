@@ -135,7 +135,9 @@ impl Updater {
                     None => SumsState::Missing, // 清单在但没有本平台条目（发版配置错误）
                 },
                 Err(e) => {
-                    crate::log!("[update] 拉 SHA256SUMS 失败（网络问题，可重试）：{e:#}");
+                    log_update(&format!(
+                        "[update] 拉 SHA256SUMS 失败（网络问题，可重试）：{e:#}"
+                    ));
                     SumsState::FetchFailed(e.to_string())
                 }
             },
@@ -182,7 +184,7 @@ impl Updater {
             match self.download_once(url, dest, on_progress).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    crate::log!("[update] 下载第 {attempt}/3 次失败：{e:#}");
+                    log_update(&format!("[update] 下载第 {attempt}/3 次失败：{e:#}"));
                     last_err = Some(e);
                     if attempt < 3 {
                         tokio::time::sleep(std::time::Duration::from_secs(5 * u64::from(attempt)))
@@ -273,6 +275,26 @@ pub fn verify_sha256(
     name_for_log: &str,
     expected: Option<&str>,
 ) -> Result<()> {
+    verify_sha256_at(
+        file,
+        name_for_log,
+        expected,
+        Some(&crate::bridge_dir().join("logs")),
+    )
+}
+
+/// [`verify_sha256`] 的目录可注入版；`logs_dir = None` = 只写 stdout、不落盘。
+///
+/// 单测走 `None`：隔离门禁里测试进程的 `bridge_dir` 是隔离 HOME，往那儿写文件会被判成
+/// 「测试写入运行数据」（本批首跑就被隔离守卫抓到 `…/.agent-bridge/logs/update.log`），
+/// 这正是 `LESSON_单测不得写用户真实运行数据须拆出注入缝.md` 说的缝。落盘那半由
+/// `log_update_at` 自己的单测用临时目录钉住。
+fn verify_sha256_at(
+    file: &std::path::Path,
+    name_for_log: &str,
+    expected: Option<&str>,
+    logs_dir: Option<&std::path::Path>,
+) -> Result<()> {
     use sha2::Digest;
     let expected = expected.ok_or_else(|| {
         anyhow!(
@@ -288,12 +310,11 @@ pub fn verify_sha256(
     std::io::copy(&mut reader, &mut h).context("流式读取安装包失败")?;
     let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if actual != expected.to_ascii_lowercase() {
-        crate::log!(
-            "[update] 校验失败 {}: 期望 {} 实得 {}",
-            name_for_log,
-            expected,
-            actual
-        );
+        let line = format!("[update] 校验失败 {name_for_log}: 期望 {expected} 实得 {actual}");
+        log_stdout(&line);
+        if let Some(dir) = logs_dir {
+            log_update_at(dir, &line);
+        }
         bail!(
             "安装包 sha256 与 {} 不符（下载损坏或被篡改），已拒绝安装",
             SHASUMS_NAME
@@ -392,7 +413,37 @@ pub fn install_and_relaunch(file: &Path) -> Result<()> {
 /// 注意边界：**跑这次升级的是旧版二进制**，所以这行日志只从「装了本改动之后再升级」
 /// 才存在；随后那次升级的失败原因同样要等下一次升级才有 update.log 可看。
 fn log_update_event(msg: &str) {
-    crate::platform::append_event_log(&crate::bridge_dir().join("logs"), "update.log", msg);
+    log_update_at(&crate::bridge_dir().join("logs"), msg);
+}
+
+/// [`log_update_event`] 的目录可注入版（单测用临时目录，不写真实 `~/.agent-bridge`）。
+///
+/// 「双写」里 stdout 那半在本机测试里无法断言（`crate::log!` 没有注入缝），能钉的是文件这半：
+/// 因此单测断言的是「`logs/update.log` 里真的有这条」，另一半由 `log_update` 的源码守卫
+/// （`updater.rs` 里除该 helper 外不许出现裸 `crate::log!`）兜底。
+fn log_update_at(logs_dir: &std::path::Path, msg: &str) {
+    crate::platform::append_event_log(logs_dir, "update.log", msg);
+}
+
+/// 升级链路的「两处都留痕」日志：stdout（有人在终端里跑时看得到）**加上** `logs/update.log`。
+///
+/// 为什么不要单用 `crate::log!`：升级发生在 GUI 进程里，而 GUI 的 stdout 在 Windows
+/// （无控制台、由安装器 `[Run]`/资源管理器拉起）与 macOS（`open` 拉起时 0/1/2 指 /dev/null）
+/// 上都会蒸发——「sha256 不符已拒绝安装」这种最该被看见的告警也会一起消失。
+/// 复核 reviewer-40 的问题 3 就是这一条（B1 的同类病）。
+fn log_update(msg: &str) {
+    log_stdout(msg);
+    log_update_event(msg);
+}
+
+/// 升级链路里**唯一**允许直写 stdout 的出口（源码守卫 `update_logs_never_use_bare_crate_log`
+/// 按数量 + 位置钉住它：全文件的裸日志宏只许出现在这里）。
+///
+/// 「只想写 stdout」的调用点必须显式写 `log_stdout(...)`——评审一眼能看出这条日志在 GUI 下会
+/// 蒸发；要留痕就用 `log_update(...)`。守卫拦的是「顺手又写一个裸宏」，不拦显式的 `log_stdout`
+/// （后者是刻意的、review 看得见的选择）。
+fn log_stdout(msg: &str) {
+    crate::log!("{msg}");
 }
 
 /// macOS：dmg → 替换当前 bundle → 分离脚本等本进程死后 open 新实例。
@@ -477,11 +528,13 @@ fn macos_install_from_mnt(mnt: &Path, bundle: &Path) -> Result<()> {
 /// - `/SUPPRESSMSGBOXES`：任何对话框都不弹（失败也只留日志）；
 /// - `/NORESTART`：不许安装器重启系统（app 的重启由安装脚本 `[Run]` 段完成）；
 /// - `/CLOSEAPPLICATIONS`：若本进程还没退干净，直接关掉占用的实例，避免「文件占用」弹窗。
-/// - `/LOG`：让安装器把过程写进 `%TEMP%\Setup Log YYYY-MM-DD #N.txt`。**刻意用不带值的裸
-///   `/LOG`**：官方文档明写 `/LOG="<固定路径>"` 在「文件建不出来」时会让 Setup 直接 abort——
-///   而这条命令行要经 `cmd /c start` 转发（见 `windows_install`），带引号/空格的参数在这条链上
-///   有被拆碎的风险（同 `LESSON_系列_Windows与安装包.md` 的 cmd/start 元字符坑）；裸 `/LOG`
-///   不引入任何引号/空格，参数形状与其余四个一致。静默安装失败时这就是唯一的归因面：
+/// - `/LOG`：让安装器把过程写进**用户 TEMP 目录**下的日志。官方文档只说「按当前日期取唯一
+///   文件名、不覆盖不追加」，具体形如 `Setup Log YYYY-MM-DD #N.txt` 是 Inno 的**惯例**
+///   （不是文档承诺），所以排查时按 `%TEMP%\Setup Log *.txt` 这个宽口径找。**刻意用不带值的
+///   裸 `/LOG`**：官方文档明写 `/LOG="<固定路径>"` 在「文件建不出来」时会让 Setup 直接
+///   abort——而这条命令行要经 `cmd /c start` 转发（见 `windows_install`），带引号/空格的参数
+///   在这条链上有被拆碎的风险（同 `LESSON_系列_Windows与安装包.md` 的 cmd/start 元字符坑）；
+///   裸 `/LOG` 不引入任何引号/空格，参数形状与其余四个一致。静默安装失败时这就是唯一的归因面：
 ///   更新器拿不到安装器退出码（`cmd /c start` 派生后立即返回），本进程又已退出。
 ///
 /// 抽成纯函数是为了让参数被单测钉住（漏掉 `/VERYSILENT` 就会退回「弹安装界面」的老行为，
@@ -502,28 +555,76 @@ fn windows_silent_args() -> Vec<&'static str> {
 fn windows_install(setup: &Path) -> Result<()> {
     // start 把首个带引号参数当窗口标题，故先给空标题；CREATE_NO_WINDOW（统一走
     // crate::spawn）避免闪控制台。
+    let args = windows_silent_args();
+    let line = format!(
+        "已静默启动安装包 {}（参数 {}；无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
+        setup.display(),
+        args.join(" ")
+    );
+    // 先留痕再 spawn：安装器带 /CLOSEAPPLICATIONS，理论上本进程可能在 spawn 后被立刻关掉，
+    // 那样这条记录就丢了（复核 reviewer-40 的问题 1）。顺序反过来零成本、无副作用。
+    log_update_event(&line);
     crate::spawn::command("cmd")
         .arg("/c")
         .arg("start")
         .arg("")
         .arg(setup)
-        .args(windows_silent_args())
+        .args(args)
         .spawn()
         .context("启动安装包失败")?;
-    // 失败排查入口：静默安装期间/之后本进程已退出，只有安装器自己的日志能说明发生了什么。
-    // 必须走 `log_update_event`（写 logs/update.log）——`crate::log!` 在这条链路上会蒸发
-    // （GUI 进程无控制台、stdout 未重定向），复核 reviewer-39 的 B1 就是这条。
-    log_update_event(&format!(
-        "已静默启动安装包 {}（参数 {}；无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
-        setup.display(),
-        windows_silent_args().join(" ")
-    ));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「双写」的文件半：给定临时目录时必须真的写出 `update.log`（追加、一行一记录）。
+    #[test]
+    fn log_update_at_writes_into_the_given_dir() {
+        let dir = std::env::temp_dir().join(format!("abb-updater-log-{}", uuid::Uuid::new_v4()));
+        log_update_at(&dir, "[update] 校验失败 x: 期望 a 实得 b");
+        log_update_at(&dir, "[update] 已静默启动安装包 setup.exe");
+        let text = std::fs::read_to_string(dir.join("update.log")).expect("update.log 应写出");
+        assert_eq!(text.lines().count(), 2, "两次调用 = 两条记录：{text}");
+        assert!(text.contains("校验失败"), "安全告警必须落盘：{text}");
+        assert!(text.contains("已静默启动安装包"), "{text}");
+        assert!(!text.contains("\n\n"), "记录之间不得夹空行：{text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **源码护栏**：`updater.rs` 里除 `log_update` 自身外，不许再出现裸 `crate::log!`。
+    ///
+    /// 为什么：升级发生在 GUI 进程里，stdout 在 Windows（无控制台）与 macOS（`open` 拉起）
+    /// 都会蒸发——单用 `crate::log!` 等于不留痕。复核 reviewer-40 的问题 3 指出「sha256 不符，
+    /// 已拒绝安装」这条安全告警原本就是这么消失的；本守卫把「必须双写」变成可机器检查的不变量
+    /// （与 `src/spawn.rs` 的 `creation_flags` 护栏同一模式）。
+    ///
+    /// 注释行（含 `///` 文档）不计——那里出现 `crate::log!` 只是说明文字。
+    #[test]
+    fn update_logs_never_use_bare_crate_log() {
+        // 针在运行时拼出来：本测试自己的字符串/文档里也会出现这个宏名，写成字面量会把
+        // 匹配数抬高（本批首跑就被自己的守卫抓红一次，与 F1 守卫的「按字节算距离」同源）。
+        let needle = ["crate::", "log!"].concat();
+        let src = include_str!("updater.rs");
+        let hits: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains(&needle))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "只允许 log_update() 里那一处直写 stdout 的日志宏（双写的 stdout 半），实得 {hits:?}；\
+             update 链路的新日志请走 log_update()/log_update_event()"
+        );
+        assert!(
+            hits[0].1.trim_start().starts_with(&needle),
+            "唯一那处应当就是 log_update 的 stdout 半，实得：{}",
+            hits[0].1.trim()
+        );
+    }
 
     /// 静默升级参数必须齐全（尤其 `/VERYSILENT`：漏了就会弹安装界面、装完不自动起来）。
     /// 另钉两条：① `/LOG` 必须在（静默安装失败时它是唯一归因面）；
@@ -596,8 +697,10 @@ mod tests {
                 .collect::<String>()
         };
         assert!(verify_sha256(&f, "x.dmg", Some(&hash)).is_ok());
-        // 不匹配 → 拒绝
-        assert!(verify_sha256(&f, "x.dmg", Some(&"0".repeat(64))).is_err());
+        // 不匹配 → 拒绝。走可注入版并传 None：这条会触发「校验失败」留痕，用公开入口
+        // 会把 update.log 写进隔离 HOME（隔离守卫判红），落盘那半由 log_update_at 的
+        // 单测（临时目录）覆盖。
+        assert!(verify_sha256_at(&f, "x.dmg", Some(&"0".repeat(64)), None).is_err());
         let _ = std::fs::remove_file(&f);
     }
 
