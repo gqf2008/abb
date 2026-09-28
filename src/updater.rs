@@ -457,6 +457,12 @@ fn macos_install_from_mnt(mnt: &Path, bundle: &Path) -> Result<()> {
 /// - `/SUPPRESSMSGBOXES`：任何对话框都不弹（失败也只留日志）；
 /// - `/NORESTART`：不许安装器重启系统（app 的重启由安装脚本 `[Run]` 段完成）；
 /// - `/CLOSEAPPLICATIONS`：若本进程还没退干净，直接关掉占用的实例，避免「文件占用」弹窗。
+/// - `/LOG`：让安装器把过程写进 `%TEMP%\Setup Log YYYY-MM-DD #N.txt`。**刻意用不带值的裸
+///   `/LOG`**：官方文档明写 `/LOG="<固定路径>"` 在「文件建不出来」时会让 Setup 直接 abort——
+///   而这条命令行要经 `cmd /c start` 转发（见 `windows_install`），带引号/空格的参数在这条链上
+///   有被拆碎的风险（同 `LESSON_系列_Windows与安装包.md` 的 cmd/start 元字符坑）；裸 `/LOG`
+///   不引入任何引号/空格，参数形状与其余四个一致。静默安装失败时这就是唯一的归因面：
+///   更新器拿不到安装器退出码（`cmd /c start` 派生后立即返回），本进程又已退出。
 ///
 /// 抽成纯函数是为了让参数被单测钉住（漏掉 `/VERYSILENT` 就会退回「弹安装界面」的老行为，
 /// 2026-09-28 owner 报的就是这个：装完了但没自动起来）。
@@ -467,6 +473,7 @@ fn windows_silent_args() -> Vec<&'static str> {
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/CLOSEAPPLICATIONS",
+        "/LOG",
     ]
 }
 
@@ -483,6 +490,11 @@ fn windows_install(setup: &Path) -> Result<()> {
         .args(windows_silent_args())
         .spawn()
         .context("启动安装包失败")?;
+    // 失败排查入口：静默安装期间/之后本进程已退出，只有安装器自己的日志能说明发生了什么。
+    crate::log!(
+        "[update] 已静默启动安装包 {}（无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
+        setup.display()
+    );
     Ok(())
 }
 
@@ -491,6 +503,9 @@ mod tests {
     use super::*;
 
     /// 静默升级参数必须齐全（尤其 `/VERYSILENT`：漏了就会弹安装界面、装完不自动起来）。
+    /// 另钉两条：① `/LOG` 必须在（静默安装失败时它是唯一归因面）；
+    /// ② **任何参数都不得含空白或引号**——这批参数要经 `cmd /c start` 转发，带空白/引号的
+    ///    参数在那条链上可能被拆成多个参数（`/LOG=<带空格的路径>` 就会被拆碎）。
     #[test]
     fn windows_silent_args_are_locked() {
         let args = windows_silent_args();
@@ -499,10 +514,17 @@ mod tests {
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
+            "/LOG",
         ] {
             assert!(args.contains(&need), "缺参数 {need}：{args:?}");
         }
-        assert_eq!(args.len(), 4, "不要夹带其它参数：{args:?}");
+        assert_eq!(args.len(), 5, "不要夹带其它参数：{args:?}");
+        for a in &args {
+            assert!(
+                !a.chars().any(|c| c.is_whitespace() || c == '"'),
+                "参数 {a:?} 含空白/引号：经 cmd /c start 转发时可能被拆碎"
+            );
+        }
     }
 
     #[test]

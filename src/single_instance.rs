@@ -18,6 +18,15 @@ pub struct SingleInstance {
     name: String,
 }
 
+/// 重试间隔下限。
+///
+/// `interval = 0` 时 `sleep(0)` 立即返回，重试循环会在 `timeout` 用尽前**忙等自旋烧满一核**
+/// （复核 reviewer-38 的 F2）。调用点传 0 属编程错误，但代价不该是 CPU 满载，所以在入口夹一个
+/// 1ms 地板：既不影响正常调用（250ms），也让 0 退化成「尽力重试」而不是「空转」。
+fn retry_interval(interval: Duration) -> Duration {
+    interval.max(Duration::from_millis(1))
+}
+
 impl SingleInstance {
     /// 尝试对 ~/.agent-bridge/.<name>.lock 拿排他非阻塞锁。
     /// 成功返回 guard；**已有实例在跑返回 Err**（调用方应退出）。
@@ -50,6 +59,7 @@ impl SingleInstance {
         interval: Duration,
     ) -> Result<SingleInstance> {
         let deadline = std::time::Instant::now() + timeout;
+        let interval = retry_interval(interval);
         let mut waited = false;
         loop {
             match Self::acquire_at(dir, name) {
@@ -202,6 +212,44 @@ mod tests {
             "超时后必须尽快返回，实际 {:?}",
             t.elapsed()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2 复核项：`interval=0` 必须被抬到 1ms 地板，否则重试循环在 deadline 前忙等自旋。
+    #[test]
+    fn zero_interval_is_floored_to_avoid_busy_spin() {
+        assert_eq!(
+            retry_interval(Duration::ZERO),
+            Duration::from_millis(1),
+            "interval=0 必须被抬到 1ms（sleep(0) 会让重试循环烧满一核）"
+        );
+        assert_eq!(
+            retry_interval(Duration::from_millis(250)),
+            Duration::from_millis(250),
+            "正常间隔不得被改动"
+        );
+        assert!(retry_interval(Duration::ZERO) > Duration::ZERO);
+    }
+
+    /// 端到端：传 `interval=0` 时仍必须**有界**返回（既不忙等到底，也不提前放弃）。
+    #[test]
+    fn zero_interval_still_terminates_within_timeout() {
+        let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
+        let _holder = SingleInstance::acquire_at(&dir, "test").expect("持锁");
+        let t = std::time::Instant::now();
+        let r = SingleInstance::acquire_at_with_retry(
+            &dir,
+            "test",
+            Duration::from_millis(150),
+            Duration::ZERO,
+        );
+        assert!(r.is_err(), "持有者不放锁必须超时失败");
+        let took = t.elapsed();
+        assert!(
+            took >= Duration::from_millis(100),
+            "应当真的等到 deadline（实际 {took:?}），否则说明 0 间隔被当成「只试一次」"
+        );
+        assert!(took < Duration::from_secs(3), "有界返回，实际 {took:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

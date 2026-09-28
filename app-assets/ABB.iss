@@ -19,7 +19,8 @@ DefaultGroupName=ABB
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ; 静默升级：自动关闭仍在运行的实例（配合更新器的 /CLOSEAPPLICATIONS），
-; 但**不要**让安装器自己重启——重启由上面的 [Run] 段负责，避免双开。
+; 但**不要**让安装器自己重启——重启由本文件末尾的 [Run] 段负责（安装成功后再执行），
+; 若这里也让它重启、而 ABB 又注册了 RegisterApplicationRestart，就会与 [Run] 双开。
 CloseApplications=yes
 RestartApplications=no
 OutputDir=Output

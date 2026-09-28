@@ -350,3 +350,50 @@ mod stop_intent_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// 升级**调用点**守卫（`ui.rs`）。
+///
+/// 为什么必须是它：本文件的 `stop_intent_tests` 只钉「意图标记怎么处置」，覆盖不到调用点接线。
+/// 独立评审的反证实测过——把 `ui.rs` 升级成功分支改回 `svc_stop()`，整仓 bin 套件仍
+/// 873 passed / 0 failed 全绿，也就是「升级把用户的运行意图抹掉」这个缺陷可以静默回归。
+///
+/// 手段按本仓既有惯例（`include_str!` 源码断言，见 `agent.rs`/`harness.rs`/`deps.rs`）：
+/// 钉「升级成功分支里恰好一处 `svc_stop_keep_desired()`，且紧跟在升级完成日志之后」。
+#[cfg(test)]
+mod upgrade_call_site_tests {
+    /// 升级成功分支的日志串（`ui.rs` 里「安装完成，退出并重启到新版本」那句）。
+    const UPGRADE_LOG: &str = "安装完成，退出并重启到新版本";
+    const KEEP_DESIRED_CALL: &str = "svc_stop_keep_desired()";
+    /// 日志与调用之间的允许跨度（**行**，不是字节——那段之间是中文注释，按字节算会随字数漂移）。
+    /// 两者目前同在一个 `slint::invoke_from_event_loop` 闭包里、相隔 7 行；留一倍余量。
+    const MAX_LINE_GAP: usize = 15;
+
+    #[test]
+    fn upgrade_path_uses_svc_stop_keep_desired() {
+        let ui = include_str!("ui.rs");
+        let calls = ui.matches(KEEP_DESIRED_CALL).count();
+        let why = "这是复核 reviewer-38 F1 的守卫：升级成功分支必须用「保留意图」的停服务，改动升级链时请连同本条一起改，别把它删掉";
+        assert_eq!(calls, 1, "{why}（现在 {calls} 处 {KEEP_DESIRED_CALL}）");
+        let log_at = ui
+            .find(UPGRADE_LOG)
+            .expect("ui.rs 里应有升级成功的日志行（改文案要同步这里）");
+        let call_at = ui.find(KEEP_DESIRED_CALL).expect("上面已断言存在");
+        let log_line = ui[..log_at].matches('\n').count();
+        let call_line = ui[..call_at].matches('\n').count();
+        assert!(
+            call_line > log_line,
+            "{KEEP_DESIRED_CALL} 必须出现在升级成功分支内（当前在日志之前，可能匹配到了别处）"
+        );
+        assert!(
+            call_line - log_line <= MAX_LINE_GAP,
+            "日志与 {KEEP_DESIRED_CALL} 应相邻（相隔 {} 行 > {MAX_LINE_GAP}），否则这条守卫可能盯错了地方；\
+             若只是中间的注释变长了，把这个常量一起调大并在此说明",
+            call_line - log_line
+        );
+        // 反向护栏：用户手动停 / 托盘退出仍走清意图的 `svc_stop()`（升级路径不得把两处语义混回去）。
+        assert!(
+            ui.matches("svc_stop();").count() >= 1,
+            "手动停/退出路径仍应调用 svc_stop()；若全仓不再有它，说明语义被合并了，请重审本条守卫"
+        );
+    }
+}
