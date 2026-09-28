@@ -396,4 +396,27 @@ mod upgrade_call_site_tests {
             "手动停/退出路径仍应调用 svc_stop()；若全仓不再有它，说明语义被合并了，请重审本条守卫"
         );
     }
+
+    /// 升级链路的日志必须走 `crate::updater::log_update`（stdout + `logs/update.log` 双写）。
+    ///
+    /// 为什么：GUI 进程的 stdout 在 Windows（无控制台）与 macOS（`open` 拉起时 0/1/2 指
+    /// /dev/null）都会蒸发，而 macOS 侧 `macos_install` 的多个 `bail!`（hdiutil attach /
+    /// ditto / 重启辅助脚本）**只有** `ui.rs` 那条「安装失败」日志留下原因文本
+    /// （复核 reviewer-41 的问题 1）。本条把它钉成红/绿。
+    #[test]
+    fn upgrade_path_logs_go_through_update_log() {
+        let ui = include_str!("ui.rs");
+        // `[update]` 前缀的日志不允许再用裸宏（`crate::log!`）——那在 GUI 下等于不留痕。
+        let bare = ui.matches("crate::log!(\"[update]").count();
+        assert_eq!(
+            bare, 0,
+            "ui.rs 里 {bare} 处 `[update]` 日志仍用裸 crate::log!（GUI 下会蒸发）；请改走 crate::updater::log_update"
+        );
+        // 正向：四条关键日志（发现新版本 / 检查失败 / 安装完成 / 安装失败）都在。
+        let via = ui.matches("crate::updater::log_update(").count();
+        assert!(
+            via >= 4,
+            "ui.rs 里应至少有 4 处升级日志走 crate::updater::log_update（实际 {via}）"
+        );
+    }
 }

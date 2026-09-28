@@ -2169,11 +2169,14 @@ pub fn run_gui() -> Result<()> {
                                         crate::updater::CURRENT,
                                     );
                                     if newer {
-                                        crate::log!(
+                                        // 升级链路的日志一律走 updater::log_update：GUI 进程的
+                                        // stdout 在 Windows（无控制台）与 macOS（open 拉起）都会
+                                        // 蒸发，只有 logs/update.log 留得下（复核 reviewer-41 问题 1）。
+                                        crate::updater::log_update(&format!(
                                             "[update] 发现新版本 v{}（当前 v{}）",
                                             rel.version,
                                             crate::updater::CURRENT
-                                        );
+                                        ));
                                     }
                                     let ver = rel.version.clone();
                                     let can = rel.asset_url.is_some();
@@ -2190,10 +2193,10 @@ pub fn run_gui() -> Result<()> {
                                 }
                                 Err(e) => {
                                     // 静默检查（启动/周期）失败不打扰：保持原状态
-                                    crate::log!(
+                                    crate::updater::log_update(&format!(
                                         "[update] 检查失败{}：{e:#}",
                                         if silent { "（静默）" } else { "" }
-                                    );
+                                    ));
                                     if !silent {
                                         let _ = slint::invoke_from_event_loop(move || {
                                             if let Some(t) = tw.upgrade() {
@@ -2275,10 +2278,10 @@ pub fn run_gui() -> Result<()> {
                             .await;
                             match r {
                                 Ok(()) => {
-                                    crate::log!(
+                                    crate::updater::log_update(&format!(
                                         "[update] v{} 安装完成，退出并重启到新版本",
                                         rel.version
-                                    );
+                                    ));
                                     let _ = slint::invoke_from_event_loop(move || {
                                         // 用 keep_desired：这次停是为了让安装器换文件，不是
                                         // 「用户不要 bridge 了」。清掉标记的话，重启后的新实例
@@ -2288,7 +2291,9 @@ pub fn run_gui() -> Result<()> {
                                     });
                                 }
                                 Err(e) => {
-                                    crate::log!("[update] 安装失败：{e:#}");
+                                    // 这条尤其重要：macOS 侧 macos_install 的多个 bail!（hdiutil
+                                    // attach / ditto / 重启辅助脚本）只在这里留下原因文本。
+                                    crate::updater::log_update(&format!("[update] 安装失败：{e:#}"));
                                     let _ = slint::invoke_from_event_loop(move || {
                                         if let Some(t) = tw.upgrade() {
                                             // 明确的失败态（不是退回"升级"，避免看起来像没发生过）
