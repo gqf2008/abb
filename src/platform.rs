@@ -15,11 +15,7 @@ pub fn open_path(path: &std::path::Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("explorer")
-            .arg(path)
-            .creation_flags(0x0800_0000)
-            .spawn();
+        let _ = crate::spawn::command("explorer").arg(path).spawn();
     }
     #[cfg(target_os = "linux")]
     {
@@ -35,12 +31,10 @@ pub fn open_url(url: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         // start 把首个带引号参数当窗口标题，故先给空标题再给 url；
-        // CREATE_NO_WINDOW 避免 cmd 闪控制台。
-        let _ = std::process::Command::new("cmd")
+        // CREATE_NO_WINDOW（统一走 crate::spawn）避免 cmd 闪控制台。
+        let _ = crate::spawn::command("cmd")
             .args(["/c", "start", "", url])
-            .creation_flags(0x0800_0000)
             .spawn();
     }
     #[cfg(target_os = "linux")]
@@ -58,12 +52,7 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("pbcopy");
     #[cfg(target_os = "windows")]
-    let mut cmd = {
-        use std::os::windows::process::CommandExt;
-        let mut c = std::process::Command::new("clip");
-        c.creation_flags(0x0800_0000);
-        c
-    };
+    let mut cmd = crate::spawn::command("clip");
     #[cfg(target_os = "linux")]
     let mut cmd = {
         // Wayland 用 wl-copy，X11 用 xclip，都缺则失败
@@ -857,11 +846,7 @@ const AUTOSTART_VALUE: &str = "ABB";
 /// 跑 reg.exe（CREATE_NO_WINDOW：GUI 进程 spawn 控制台程序不弹窗）。
 #[cfg(target_os = "windows")]
 fn run_reg(args: &[&str]) -> std::io::Result<std::process::Output> {
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new("reg")
-        .args(args)
-        .creation_flags(0x0800_0000)
-        .output()
+    crate::spawn::command("reg").args(args).output()
 }
 
 #[cfg(target_os = "windows")]

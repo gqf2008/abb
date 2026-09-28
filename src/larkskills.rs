@@ -259,13 +259,9 @@ async fn run(
     timeout: Option<std::time::Duration>,
 ) -> Result<String, String> {
     let path = crate::deps::find_in_path(prog).ok_or_else(|| format!("找不到 {prog}"))?;
-    let mut cmd = tokio::process::Command::new(path);
-    // Windows：避免 npm/npx/git 子进程弹控制台窗口
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.as_std_mut().creation_flags(0x0800_0000);
-    }
+    // 构造即已抑制控制台窗口（Windows CREATE_NO_WINDOW；非 Windows no-op）：
+    // 避免 npm/npx/git 子进程在 GUI 下弹黑框。
+    let mut cmd = crate::spawn::tokio_command(&path.to_string_lossy());
     cmd.args(args)
         .env("PATH", crate::deps::composed_path())
         .env("CI", "1") // 双保险防交互

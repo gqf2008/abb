@@ -37,6 +37,7 @@ mod session_manage;
 mod session_state;
 mod sessions;
 mod single_instance;
+mod spawn;
 mod svc_tasks;
 mod task_identity;
 mod task_migrate;

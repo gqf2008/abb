@@ -357,7 +357,8 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
-        let mut cmd = tokio::process::Command::new(command);
+        // 统一入口：Windows 上「构造即已抑制控制台窗口」（见 src/spawn.rs）
+        let mut cmd = crate::spawn::tokio_command(command);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -380,10 +381,6 @@ impl AcpClient {
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
         #[cfg(unix)]
         cmd.process_group(0);
-
-        // Suppress the console window that Windows otherwise allocates for every
-        // console-subsystem child process spawned from a GUI/non-console parent.
-        configure_no_window(&mut cmd);
 
         let mut child = cmd.spawn()?;
 
@@ -1960,19 +1957,6 @@ fn kill_process_group(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) -> bool {
     false
-}
-
-/// Suppress the console window that Windows otherwise allocates for every
-/// console-subsystem child process spawned from a GUI (non-console) parent.
-/// No-op on non-Windows platforms.
-fn configure_no_window(cmd: &mut tokio::process::Command) {
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = cmd;
 }
 
 #[cfg(test)]

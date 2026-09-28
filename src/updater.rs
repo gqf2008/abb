@@ -452,14 +452,13 @@ fn macos_install_from_mnt(mnt: &Path, bundle: &Path) -> Result<()> {
 /// Windows：启动 Inno 安装包（per-user 安装免 UAC；安装器装完按其 [Run] 段拉起新实例）。
 #[cfg(target_os = "windows")]
 fn windows_install(setup: &Path) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    // start 把首个带引号参数当窗口标题，故先给空标题；CREATE_NO_WINDOW 避免闪控制台。
-    std::process::Command::new("cmd")
+    // start 把首个带引号参数当窗口标题，故先给空标题；CREATE_NO_WINDOW（统一走
+    // crate::spawn）避免闪控制台。
+    crate::spawn::command("cmd")
         .arg("/c")
         .arg("start")
         .arg("")
         .arg(setup)
-        .creation_flags(0x0800_0000)
         .spawn()
         .context("启动安装包失败")?;
     Ok(())

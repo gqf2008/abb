@@ -66,14 +66,10 @@ pub fn bundled_tool_status(tool: &str) -> (&'static str, Option<PathBuf>) {
 }
 
 /// Windows：spawn 外部子进程时抑制控制台窗口（CREATE_NO_WINDOW）。
-/// 桥/服务是 GUI 子系统，spawn reg/npm/cmd/taskkill 等控制台程序默认会弹黑框——
-/// 所有「会 spawn 子进程」的地方统一调它（agent 子进程另在 run_once 里对 tokio Command
-/// 设置，此处管 std::process::Command 的零散调用）。
+/// 实现已统一收口到唯一模块 `crate::spawn`；这里保留旧名 *别名*，deps 内既有调用点
+/// 与历史引用无需改动。cfg 语义与旧实现一致（Windows-only）。
 #[cfg(windows)]
-pub fn apply_no_window(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x0800_0000);
-}
+pub use crate::spawn::no_window as apply_no_window;
 
 /// 组 PATH：claude 在 ~/.local/bin，codex/lark-cli 在 ~/.npm-global/bin；launchd 环境精简须显式带。
 /// 分平台：分隔符 win 用 `;`、unix 用 `:`；常见安装目录各平台不同。

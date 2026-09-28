@@ -25,6 +25,17 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// 统一的 git 子进程构造入口。
+///
+/// 本程序是 GUI 子系统二进制（见 `main.rs` 的 `windows_subsystem`），自身没有
+/// 控制台；直接 `Command::new("git")` 时 Windows 会为 git.exe 新分配一个**可见**
+/// 控制台窗口（`cat-file --batch` 为长驻进程时窗口会持续停留）。故所有 git 调用
+/// 一律经此构造，避免再漏设 `CREATE_NO_WINDOW`。
+fn git_command() -> Command {
+    // 「构造即已抑制」：统一入口，避免这里再手写 no_window。
+    crate::spawn::command("git")
+}
+
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "abb-events";
 const EVENTS_FILE: &str = "events.ndjson";
@@ -1133,7 +1144,7 @@ fn validate_walgit_repo(path: &Path, source: &str, warnings: &mut Vec<String>) -
         warnings.push(format!("{source} 路径不存在：{}", path.display()));
         return None;
     }
-    let git_dir = Command::new("git")
+    let git_dir = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--git-dir"])
@@ -1142,7 +1153,7 @@ fn validate_walgit_repo(path: &Path, source: &str, warnings: &mut Vec<String>) -
         warnings.push(format!("{source} 不是 git 仓库：{}", path.display()));
         return None;
     }
-    let origin = Command::new("git")
+    let origin = git_command()
         .arg("-C")
         .arg(path)
         .args(["remote", "get-url", "origin"])
@@ -1203,7 +1214,7 @@ impl EventCollectors {
             *last_fetch = Some(Instant::now());
         }
         let refspec = "+refs/collab/inbox/*:refs/collab/inbox/*";
-        match Command::new("git")
+        match git_command()
             .arg("-C")
             .arg(repo)
             .args(["fetch", "--quiet", "--no-tags", remote, refspec])
@@ -1601,7 +1612,7 @@ fn git_cat_file_batch(repo: &Path, object_ids: &[String]) -> Result<BTreeMap<Str
             temp.path.display()
         )
     })?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(["cat-file", "--batch"])
@@ -1655,7 +1666,7 @@ fn git_cat_file_batch(repo: &Path, object_ids: &[String]) -> Result<BTreeMap<Str
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -1727,7 +1738,7 @@ mod tests {
     }
 
     fn run_git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -1742,7 +1753,7 @@ mod tests {
     }
 
     fn write_walgit_entry(repo: &Path, json: &str) -> String {
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .arg("-C")
             .arg(repo)
             .args(["hash-object", "-w", "--stdin"])
@@ -1796,7 +1807,7 @@ mod tests {
             }
         }
         let input = File::open(&paths_input.path).unwrap();
-        let output = Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(repo)
             .args(["hash-object", "-w", "--stdin-paths"])
@@ -1822,7 +1833,7 @@ mod tests {
             }
         }
         let input = File::open(&refs_input.path).unwrap();
-        let output = Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(repo)
             .args(["update-ref", "--stdin"])
