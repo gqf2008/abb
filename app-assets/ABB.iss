@@ -18,6 +18,10 @@ DefaultDirName={localappdata}\Programs\ABB
 DefaultGroupName=ABB
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
+; 静默升级：自动关闭仍在运行的实例（配合更新器的 /CLOSEAPPLICATIONS），
+; 但**不要**让安装器自己重启——重启由上面的 [Run] 段负责，避免双开。
+CloseApplications=yes
+RestartApplications=no
 OutputDir=Output
 OutputBaseFilename=ABB-Setup-{#MyAppVersion}
 SetupIconFile=ABB.ico
@@ -53,6 +57,13 @@ Source: "..\tools-dist\licenses\*"; DestDir: "{app}\tools\licenses"; Flags: igno
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\ABB.ico"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\ABB.ico"; Tasks: desktopicon
 
+; 交互安装：完成页的「运行 ABB」勾选项（skipifsilent：静默安装时这一条不跑）。
+; 静默升级：必须**也**拉起新实例 —— 下面第二条用 Check: WizardSilent 只在 /SILENT|/VERYSILENT
+; 下生效；2026-09-28 owner 报「升级装完但没自动运行」就是缺这一条（旧行为只靠上面的 postinstall）。
+;
+; 两条都用 --wait-lock 拉起：安装器关掉旧实例与本进程拿「gui」独占锁之间有极短窗口，
+; 没有它新实例会按「已有实例在跑」立刻静默退出（表现为「装完没起来」）。
+; 该参数只在被安装器拉起时生效，用户手点图标仍是即退语义。
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
-
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Flags: nowait; Check: WizardSilent

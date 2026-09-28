@@ -5,7 +5,7 @@
 //! 日志：service 的 stdout/stderr 追加到 logs/bridge.out（对齐旧 launchd 行为）。
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub struct ServiceStatus {
@@ -21,21 +21,45 @@ fn logs_dir() -> PathBuf {
     crate::bridge_dir().join("logs")
 }
 
-/// 「用户意图让 service 跑」标记文件。存在=崩溃时看门应重拉；不存在=用户手动停，别拉。
-fn desired_flag() -> PathBuf {
-    logs_dir().join("service.desired")
-}
+/// 「用户意图让 service 跑」标记文件名。存在=崩溃时看门应重拉；不存在=用户手动停，别拉。
+///
+/// 名字抽成常量而非 `desired_flag()` 单点：`set_desired_at` / `is_desired_at` 是目录
+/// 可注入的入口（单测传临时目录），路径拼接由它们自己做，少一层「只有真实目录能用」的包装。
+const DESIRED_FILE: &str = "service.desired";
+
 pub fn set_desired(running: bool) {
-    let f = desired_flag();
-    std::fs::create_dir_all(logs_dir()).ok();
+    set_desired_at(&logs_dir(), running);
+}
+pub fn is_desired() -> bool {
+    is_desired_at(&logs_dir())
+}
+
+/// [`set_desired`] 的目录可注入版（单测不碰真实 `~/.agent-bridge`）。
+fn set_desired_at(logs: &Path, running: bool) {
+    let f = logs.join(DESIRED_FILE);
+    std::fs::create_dir_all(logs).ok();
     if running {
         std::fs::write(&f, b"1").ok();
     } else {
         let _ = std::fs::remove_file(&f);
     }
 }
-pub fn is_desired() -> bool {
-    desired_flag().exists()
+
+/// [`is_desired`] 的目录可注入版。
+fn is_desired_at(logs: &Path) -> bool {
+    logs.join(DESIRED_FILE).exists()
+}
+
+/// 停 service 时怎么处置「意图=运行」标记——抽成纯函数是为了让升级重启的语义被单测钉住。
+///
+/// `keep_desired=true` 只用于**升级重启**：旧实例必须先把 service 停掉（否则安装器
+/// 换 exe 时文件被占用），但这次停不是「用户不要它跑了」。若按手动停的语义清掉标记，
+/// 新实例起来后看门狗（`ui.rs` 每 2s `is_desired() && !running → svc_start()`）不会把
+/// bridge 拉回来，表现就是「托盘起来了、bridge 却不在」。
+fn apply_stop_intent(logs: &Path, keep_desired: bool) {
+    if !keep_desired {
+        set_desired_at(logs, false);
+    }
 }
 
 /// 探测 pid 是否存活（跨平台）。注意：**zombie（已死但父进程未 wait）也算「不存活」**——
@@ -155,11 +179,32 @@ pub fn svc_start() -> Result<()> {
 
 /// 停止 service（按 pid 文件终止 + 清文件 + 清「意图」标记——用户手动停，看门不再重拉）。
 pub fn svc_stop() {
-    set_desired(false);
+    svc_stop_impl(false);
+}
+
+/// 升级重启前停 service：**保留**「意图=运行」标记，让重启后的新实例把 bridge 拉回来。
+///
+/// 与 [`svc_stop`] 的唯一差别是不动 desired 标记（该清 pid 文件仍要清，否则新实例
+/// 会把一个已退出的 pid 当真值）。语义边界：升级前用户本来就是停掉状态（标记不存在）
+/// 时，这里同样保持不存在——升级不替用户改主意，只让「本来在跑」的意图活过这次重启。
+pub fn svc_stop_keep_desired() {
+    svc_stop_impl(true);
+}
+
+/// [`svc_stop`] / [`svc_stop_keep_desired`] 的共同实现。
+fn svc_stop_impl(keep_desired: bool) {
+    apply_stop_intent(&logs_dir(), keep_desired);
     let st = status();
     if st.running && st.pid != 0 {
         terminate(st.pid);
-        crate::log!("[watchdog] 已停止 service pid={}", st.pid);
+        if keep_desired {
+            crate::log!(
+                "[watchdog] 已停止 service pid={}（升级重启：保留「意图=运行」，新实例看门狗会拉回）",
+                st.pid
+            );
+        } else {
+            crate::log!("[watchdog] 已停止 service pid={}", st.pid);
+        }
     }
     let _ = std::fs::remove_file(pid_file());
 }
@@ -263,5 +308,45 @@ mod tests {
             "忽略 TERM 的进程必须在宽限+SIGKILL 内被杀，实际 {:?}",
             t.elapsed()
         );
+    }
+}
+
+/// 升级重启的「意图」语义：平台无关的纯文件逻辑，单独一组用例（目录注入 → 不碰真实
+/// `~/.agent-bridge`，也就不会在开发机裸跑 `cargo test` 时误伤正在跑的 service 进程——
+/// 这组用例刻意不调 `svc_stop_impl` 的 terminate 分支，只钉标记处置）。
+#[cfg(test)]
+mod stop_intent_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("abb-stop-intent-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// 升级重启路径必须保留「意图=运行」：清了它，新实例的看门狗就不会把 bridge 拉回来
+    /// （2026-09-28 owner 报的「升级完成后无法自动运行」里的一环）。
+    #[test]
+    fn upgrade_stop_keeps_desired_flag() {
+        let dir = tmpdir("keep");
+        set_desired_at(&dir, true);
+        assert!(is_desired_at(&dir), "前置：标记已落盘");
+        apply_stop_intent(&dir, true);
+        assert!(
+            is_desired_at(&dir),
+            "升级重启停 service 不得清「意图=运行」，否则新实例不会自动把 bridge 拉回来"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用户手动停必须清标记（看门不再重拉），并且升级路径不能把「升级前就是停的」改成开的。
+    #[test]
+    fn manual_stop_clears_and_upgrade_stop_does_not_invent_intent() {
+        let dir = tmpdir("manual");
+        set_desired_at(&dir, true);
+        apply_stop_intent(&dir, false);
+        assert!(!is_desired_at(&dir), "手动停必须清标记");
+        // 标记本来就不存在（用户升级前没在跑）：升级路径保持不存在，不替用户改主意
+        apply_stop_intent(&dir, true);
+        assert!(!is_desired_at(&dir), "升级不得凭空造出「意图=运行」");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

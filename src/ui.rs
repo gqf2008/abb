@@ -2280,7 +2280,10 @@ pub fn run_gui() -> Result<()> {
                                         rel.version
                                     );
                                     let _ = slint::invoke_from_event_loop(move || {
-                                        install::svc_stop();
+                                        // 用 keep_desired：这次停是为了让安装器换文件，不是
+                                        // 「用户不要 bridge 了」。清掉标记的话，重启后的新实例
+                                        // 看门狗不会把 service 拉回来 —— 升级完看着像「ABB 没运行」。
+                                        install::svc_stop_keep_desired();
                                         let _ = slint::quit_event_loop();
                                     });
                                 }
