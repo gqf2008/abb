@@ -642,10 +642,8 @@ pub fn kill_stale_agents(bot_key: &str) -> bool {
             }
             #[cfg(windows)]
             {
-                use std::os::windows::process::CommandExt;
-                let _ = std::process::Command::new("taskkill")
+                let _ = crate::spawn::command("taskkill")
                     .args(["/PID", &pid.to_string(), "/F"])
-                    .creation_flags(0x0800_0000)
                     .spawn();
             }
         } else {

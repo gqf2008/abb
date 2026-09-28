@@ -204,10 +204,8 @@ fn terminate_with_grace(pid: u32, grace: std::time::Duration) {
         // Windows：taskkill /F 即强杀（无宽限期语义），grace 仅 unix 分支消费
         let _ = grace;
         // Windows：taskkill（stub）；CREATE_NO_WINDOW 避免停服务时闪控制台
-        use std::os::windows::process::CommandExt;
-        let _ = Command::new("taskkill")
+        let _ = crate::spawn::command("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
-            .creation_flags(0x0800_0000)
             .spawn();
     }
 }
