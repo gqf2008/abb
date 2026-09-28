@@ -810,15 +810,29 @@ fn login_item_plist() -> PathBuf {
 /// 内容只有动作、路径与 launchctl 回显文本，绝不含密钥（同类行早已落在 bridge.out）。
 /// best-effort：写失败只丢审计，绝不影响自启动作本身。
 pub fn log_autostart_event(msg: &str) {
+    append_event_log(&crate::bridge_dir().join("logs"), "autostart.log", msg);
+}
+
+/// 把一条审计事件追加到 `<logs_dir>/<file>`（时间戳 + 压平换行的单行记录）。
+///
+/// 与 [`log_autostart_event`] 同一套机制、同一份 [`autostart_record`] 格式，供其它
+/// 「GUI 进程里发生、但消息可能蒸发」的链路复用（当前：升级动作 → `logs/update.log`）。
+/// 目录作为参数传入是为了让单测用临时目录，不写真实 `~/.agent-bridge`
+/// （见 `LESSON_单测不得写用户真实运行数据须拆出注入缝.md`）。
+///
+/// best-effort：写失败只丢审计，不影响调用方的动作本身。
+pub fn append_event_log(logs_dir: &std::path::Path, file: &str, msg: &str) {
     use std::io::Write;
-    let dir = crate::bridge_dir().join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(logs_dir);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("autostart.log"))
+        .open(logs_dir.join(file))
     {
-        let _ = writeln!(f, "{}", autostart_record(&crate::chrono_lite::now(), msg));
+        // `autostart_record` 自己已经带结尾换行（它的单测就断言「一条记录只允许一个换行」），
+        // 这里必须用 `write!`：早先用 `writeln!` 会在每条记录之间多落一个空行（本批新加的
+        // 「一行一记录」断言把它抓出来了）。
+        let _ = write!(f, "{}", autostart_record(&crate::chrono_lite::now(), msg));
     }
 }
 
@@ -1160,6 +1174,38 @@ mod tests {
         );
         // 独立 CR（不带 LF）也得留痕：直接剥掉会把 "a\rb" 无声粘成 "ab"，丢分隔语义。
         assert_eq!(autostart_record("T", "a\rb"), "[T] a⏎b\n");
+    }
+
+    /// 事件落盘（升级审计复用同一机制）：目录不存在要自建、两次调用要**追加**（不覆盖）、
+    /// 每行都是一个带时间戳的单行记录——这是 GUI 进程里唯一留得下的证据
+    /// （`crate::log!` 只写 stdout，GUI 由安装器/资源管理器拉起时它会蒸发）。
+    #[test]
+    fn append_event_log_creates_appends_and_stays_single_line() {
+        let dir = std::env::temp_dir().join(format!("abb-update-log-{}", uuid::Uuid::new_v4()));
+        let logs = dir.join("logs");
+        assert!(!logs.exists(), "前置：目标目录不存在，用来验「自建」");
+        append_event_log(&logs, "update.log", "开始安装升级包 ABB-Setup-2.23.75.exe");
+        append_event_log(&logs, "update.log", "多行错误链\n第二行不得另起一条");
+        let text = std::fs::read_to_string(logs.join("update.log")).expect("日志应写出");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "两次调用 = 两条单行记录（追加而非覆盖；空行也不许有）：{text}"
+        );
+        assert!(
+            !text.contains("\n\n"),
+            "记录之间不得夹空行（`autostart_record` 自带结尾换行，写入时不能再用 writeln!）：{text:?}"
+        );
+        assert!(text.contains("开始安装升级包"), "第一条记录应保留：{text}");
+        assert!(
+            text.contains("第二行不得另起一条"),
+            "多行内容应被压平进同一条记录，而不是丢掉：{text}"
+        );
+        assert!(
+            text.lines().all(|l| l.starts_with('[')),
+            "每行都要有时间戳前缀：{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 自启 plist 解析（macOS）：只认自己写的 schema；读不出参数一律 None（调用方

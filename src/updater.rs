@@ -360,6 +360,11 @@ pub fn asset_file_name(version: &str) -> String {
 /// 安装并重启。成功返回后**调用方负责退出本进程**（macOS 由分离 sh 等进程死后拉起新实例；
 /// Windows 安装器装完自己拉起）。Linux 不应被调用（无资产）。
 pub fn install_and_relaunch(file: &Path) -> Result<()> {
+    log_update_event(&format!(
+        "开始安装升级包 {}（当前版本 v{})",
+        file.display(),
+        CURRENT
+    ));
     #[cfg(target_os = "macos")]
     {
         macos_install(file)
@@ -373,6 +378,21 @@ pub fn install_and_relaunch(file: &Path) -> Result<()> {
         let _ = file;
         bail!("Linux 暂无预编译包，请 git pull && cargo build --release 手动升级")
     }
+}
+
+/// 升级动作的**文件**留痕（`<bridge_dir>/logs/update.log`）。
+///
+/// 为什么不能只靠 `crate::log!`：它只写 stdout（`main.rs` 的 `write_log`），而升级是在
+/// **GUI 进程**里发起的——Windows 下那是 `windows_subsystem = "windows"`（无控制台）、
+/// 由安装器 `[Run]`/资源管理器拉起，macOS 下由 `open` 拉起时 0/1/2 全指 /dev/null，
+/// 这条最需要留证据的信息会当场蒸发（同一结论的成文先例：`platform::log_autostart_event`，
+/// 那里就是为自启自愈改成写文件的）。升级一旦静默失败，更新器又拿不到安装器退出码、
+/// 本进程已退出，所以只能靠自己落盘。
+///
+/// 注意边界：**跑这次升级的是旧版二进制**，所以这行日志只从「装了本改动之后再升级」
+/// 才存在；随后那次升级的失败原因同样要等下一次升级才有 update.log 可看。
+fn log_update_event(msg: &str) {
+    crate::platform::append_event_log(&crate::bridge_dir().join("logs"), "update.log", msg);
 }
 
 /// macOS：dmg → 替换当前 bundle → 分离脚本等本进程死后 open 新实例。
@@ -491,10 +511,13 @@ fn windows_install(setup: &Path) -> Result<()> {
         .spawn()
         .context("启动安装包失败")?;
     // 失败排查入口：静默安装期间/之后本进程已退出，只有安装器自己的日志能说明发生了什么。
-    crate::log!(
-        "[update] 已静默启动安装包 {}（无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
-        setup.display()
-    );
+    // 必须走 `log_update_event`（写 logs/update.log）——`crate::log!` 在这条链路上会蒸发
+    // （GUI 进程无控制台、stdout 未重定向），复核 reviewer-39 的 B1 就是这条。
+    log_update_event(&format!(
+        "已静默启动安装包 {}（参数 {}；无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
+        setup.display(),
+        windows_silent_args().join(" ")
+    ));
     Ok(())
 }
 
