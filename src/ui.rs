@@ -2040,7 +2040,10 @@ pub fn run_gui() -> Result<()> {
                         refresh(&tray_weak_bg);
                     }
                     UiCmd::Stop => {
-                        install::svc_stop();
+                        // 本批起「停止」需要授权（owner：服务不能被随便杀死）。
+                        if let Err(e) = install::svc_stop_authorized() {
+                            crate::log!("[watchdog] 停止服务未完成：{e:#}");
+                        }
                         refresh(&tray_weak_bg);
                     }
                     UiCmd::Restart => {
@@ -3167,7 +3170,10 @@ pub fn run_gui() -> Result<()> {
         });
     }
     tray.on_quit_app(|| {
-        install::svc_stop();
+        // 语义变更（owner 2026-09-28）：**退出托盘 ≠ 停止服务**。bridge 由 launchd/计划任务
+        // 托管，托盘只是客户端；这里不再 `svc_stop()`（那会顺手杀掉 bridge 并清掉「意图=运行」）。
+        // 真要停服务请走「停止服务」（需要授权）；退出托盘只关掉这个控制台。
+        crate::log!("[gui] 退出托盘（服务保持运行，停止服务需要授权）");
         let _ = slint::quit_event_loop();
     });
 

@@ -140,6 +140,12 @@ pub fn status() -> ServiceStatus {
 /// 启动 service 子进程（若已在跑则先停），并起线程收割（防僵尸）。
 /// 会顺带把「意图=运行」标记置上（看门据此在崩溃时重拉）。
 pub fn svc_start() -> Result<()> {
+    // 托管形态（macOS launchd / Windows 计划任务）：起停交给 supervisor，托盘不再自己
+    // spawn —— 两边同时管会抢单实例锁，表现为反复拉起-退出（见 platform::service_supervised）。
+    if crate::platform::service_supervised() {
+        set_desired(true);
+        return crate::platform::restart_service_supervised();
+    }
     let st = status();
     if st.running {
         svc_stop();
@@ -210,12 +216,44 @@ fn svc_stop_impl(keep_desired: bool) {
 }
 
 pub fn svc_restart() {
+    if crate::platform::service_supervised() {
+        // 托管形态：交给 supervisor 重启（不经过「先杀后起」的托盘子进程路径）。
+        set_desired(true);
+        if let Err(e) = crate::platform::restart_service_supervised() {
+            crate::log!("[watchdog] 托管重启失败: {e:#}");
+        }
+        return;
+    }
     svc_stop();
     // 稍等子进程退出再拉
     std::thread::sleep(std::time::Duration::from_millis(300));
     if let Err(e) = svc_start() {
         crate::log!("[watchdog] 重启失败: {e:#}");
     }
+}
+
+/// 停止服务 —— **需要授权**（本批 owner 要求：托盘退出不影响服务，停止必须授权）。
+///
+/// 平台侧各自取授权：macOS = 系统密码框后 `launchctl bootout`；Windows = UAC 提权 helper
+/// 执行计划任务 `/end` + 杀 pid（B1b 接线）。
+///
+/// 顺序要紧：**授权通过、平台侧真停了之后**才清「意图=运行」标记与 pid 文件。用户取消授权
+/// 时必须什么都不变——否则看门狗会把「取消授权」误当成「用户想停」而不再拉回服务。
+pub fn svc_stop_authorized() -> Result<()> {
+    crate::platform::stop_service_authorized()?;
+    apply_stop_intent(&logs_dir(), false);
+    let _ = std::fs::remove_file(pid_file());
+    crate::log!("[watchdog] 已按授权停止 service（意图标记已清）");
+    Ok(())
+}
+
+/// bridge（`--service`）启动时自己登记 pid。
+///
+/// 本批起 bridge 由 launchd/计划任务托管，托盘不再持有它的 pid —— `status()` 与看门狗只能
+/// 靠这个文件判活（否则会误判「没在跑」并反复 spawn 出抢锁即退的短命进程）。
+pub fn write_own_pid_file() {
+    let _ = std::fs::create_dir_all(logs_dir());
+    let _ = std::fs::write(pid_file(), std::process::id().to_string());
 }
 
 /// 跨平台终止进程。

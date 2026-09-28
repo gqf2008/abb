@@ -386,6 +386,9 @@ fn main() {
                 std::process::exit(0); // 优雅退出，不报错（避免 launchd KeepAlive 刷屏重试日志）
             }
         };
+        // 自己登记 pid：本批起 bridge 由 launchd/计划任务托管（不再由托盘 spawn），
+        // 托盘侧的 status()/看门狗只能靠这个文件判活。
+        crate::install::write_own_pid_file();
         // 守护进程：纯 tokio
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
