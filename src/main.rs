@@ -567,7 +567,18 @@ fn main() {
         diag_tray_image();
         return;
     }
-    let _gui_guard = match single_instance::SingleInstance::acquire("gui") {
+    // 升级重启（安装器 [Run] 段拉起本进程，带 --wait-lock）要容忍旧实例还在收尾：
+    // 见 single_instance::acquire_with_retry 的注释。用户手点第二份图标仍立刻退出。
+    let gui_lock = if args.iter().any(|a| a == "--wait-lock") {
+        single_instance::SingleInstance::acquire_with_retry(
+            "gui",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(250),
+        )
+    } else {
+        single_instance::SingleInstance::acquire("gui")
+    };
+    let _gui_guard = match gui_lock {
         Ok(g) => g,
         Err(e) => {
             crate::log!("{e:#}");

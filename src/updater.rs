@@ -6,7 +6,9 @@
 //! - macOS：hdiutil 挂载 dmg → 旧 bundle 改名留备份 → ditto 新 bundle 原位 →
 //!   分离式 sh 等本进程退出后 `open` 新实例（单实例锁随进程死亡释放，见 single_instance.rs）。
 //! - Windows：直接启动 Inno Setup 安装包（PrivilegesRequired=lowest 免 UAC），
-//!   安装器自己处理覆盖与装完重启；本进程随即退出让出文件锁。
+//!   **静默**参数装（用户点了升级就只有进度提示，不再走安装向导）+ 安装器 `[Run]` 段
+//!   拉起新实例（见 `app-assets/ABB.iss` 的 `Check: WizardSilent` 那一条）；本进程随即
+//!   退出让出文件锁。
 //! - Linux：CI 不出包，调用方拿到 asset_url=None，UI 提示手动构建。
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -449,7 +451,26 @@ fn macos_install_from_mnt(mnt: &Path, bundle: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows：启动 Inno 安装包（per-user 安装免 UAC；安装器装完按其 [Run] 段拉起新实例）。
+/// 静默升级参数（点「升级」后**不再**让用户跑安装程序）。
+///
+/// - `/VERYSILENT`：无界面（连进度条都不显示）；
+/// - `/SUPPRESSMSGBOXES`：任何对话框都不弹（失败也只留日志）；
+/// - `/NORESTART`：不许安装器重启系统（app 的重启由安装脚本 `[Run]` 段完成）；
+/// - `/CLOSEAPPLICATIONS`：若本进程还没退干净，直接关掉占用的实例，避免「文件占用」弹窗。
+///
+/// 抽成纯函数是为了让参数被单测钉住（漏掉 `/VERYSILENT` 就会退回「弹安装界面」的老行为，
+/// 2026-09-28 owner 报的就是这个：装完了但没自动起来）。
+#[cfg(any(target_os = "windows", test))]
+fn windows_silent_args() -> Vec<&'static str> {
+    vec![
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+    ]
+}
+
+/// Windows：启动 Inno 安装包（per-user 安装免 UAC；静默装完由安装脚本 `[Run]` 段拉起新实例）。
 #[cfg(target_os = "windows")]
 fn windows_install(setup: &Path) -> Result<()> {
     // start 把首个带引号参数当窗口标题，故先给空标题；CREATE_NO_WINDOW（统一走
@@ -459,6 +480,7 @@ fn windows_install(setup: &Path) -> Result<()> {
         .arg("start")
         .arg("")
         .arg(setup)
+        .args(windows_silent_args())
         .spawn()
         .context("启动安装包失败")?;
     Ok(())
@@ -467,6 +489,21 @@ fn windows_install(setup: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 静默升级参数必须齐全（尤其 `/VERYSILENT`：漏了就会弹安装界面、装完不自动起来）。
+    #[test]
+    fn windows_silent_args_are_locked() {
+        let args = windows_silent_args();
+        for need in [
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+        ] {
+            assert!(args.contains(&need), "缺参数 {need}：{args:?}");
+        }
+        assert_eq!(args.len(), 4, "不要夹带其它参数：{args:?}");
+    }
 
     #[test]
     fn shasums_parse() {

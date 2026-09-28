@@ -11,6 +11,7 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Duration;
 
 pub struct SingleInstance {
     _file: File, // 持有 fd 即持有锁；drop 时内核释放
@@ -22,6 +23,60 @@ impl SingleInstance {
     /// 成功返回 guard；**已有实例在跑返回 Err**（调用方应退出）。
     pub fn acquire(name: &str) -> Result<SingleInstance> {
         Self::acquire_at(&crate::bridge_dir(), name)
+    }
+
+    /// 带重试地拿锁，给「升级重启」路径用（安装器 `[Run]` 段拉起新实例时加 `--wait-lock`）。
+    ///
+    /// 为什么需要：普通 [`acquire`](Self::acquire) 是「已有实例在跑 → 本实例立刻退出」的
+    /// 语义，而升级重启瞬间旧实例刚被安装器关掉或自己 quit——**锁句柄释放与进程彻底退出
+    /// 之间还有一小段**（Windows 侧 `share_mode(0)` 独占句柄要等内核回收）。即退会把这次
+    /// 重启静默吞掉：用户看到「升级装完但 ABB 没起来」，日志只有一行「已有一个实例在运行」。
+    /// 这里按 `interval` 重试直到 `timeout` 用尽，把那一小段等过去。
+    ///
+    /// 只在升级重启的显式路径上启用：用户手点第二份图标仍然立刻退出（不排队、不等待）。
+    pub fn acquire_with_retry(
+        name: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<SingleInstance> {
+        Self::acquire_at_with_retry(&crate::bridge_dir(), name, timeout, interval)
+    }
+
+    /// [`acquire_with_retry`](Self::acquire_with_retry) 的目录可注入版（单测用）。
+    fn acquire_at_with_retry(
+        dir: &Path,
+        name: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<SingleInstance> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut waited = false;
+        loop {
+            match Self::acquire_at(dir, name) {
+                Ok(g) => {
+                    if waited {
+                        crate::log!("[single-instance] 等到 {name} 锁释放（升级重启路径）");
+                    }
+                    return Ok(g);
+                }
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(e.context(format!(
+                            "等待 {name} 锁超时（{}s 内旧实例没退出），本实例退出",
+                            timeout.as_secs()
+                        )));
+                    }
+                    if !waited {
+                        waited = true;
+                        crate::log!(
+                            "[single-instance] {name} 锁被占用（升级重启：等旧实例退干净，最多 {}s）：{e:#}",
+                            timeout.as_secs()
+                        );
+                    }
+                    std::thread::sleep(interval);
+                }
+            }
+        }
     }
 
     /// 指定目录的锁实现；生产入口传 `~/.agent-bridge`，测试传唯一 temp 目录。
@@ -104,6 +159,49 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
         let _a = SingleInstance::acquire_at(&dir, "test-a").expect("a");
         let _b = SingleInstance::acquire_at(&dir, "test-b").expect("b 与 a 不同名，应独立拿到");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 升级重启路径：持有者正在退出（还没释放锁）时，重试版必须等到它放锁再拿到。
+    #[test]
+    fn retry_acquire_takes_over_after_holder_releases() {
+        let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
+        let holder = SingleInstance::acquire_at(&dir, "test").expect("旧实例持锁");
+        // 模拟旧实例收尾：300ms 后才退出（drop guard = 释放锁）
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holder);
+        });
+        let g = SingleInstance::acquire_at_with_retry(
+            &dir,
+            "test",
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .expect("等旧实例退出后必须拿到锁（否则升级重启被静默吞掉）");
+        t.join().unwrap();
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 反面：持有者一直不放锁时必须超时失败，不能无限等（否则托盘会挂住不退出）。
+    #[test]
+    fn retry_acquire_gives_up_after_timeout() {
+        let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
+        let _holder = SingleInstance::acquire_at(&dir, "test").expect("持锁");
+        let t = std::time::Instant::now();
+        let r = SingleInstance::acquire_at_with_retry(
+            &dir,
+            "test",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        );
+        assert!(r.is_err(), "持有者不放锁必须超时失败");
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "超时后必须尽快返回，实际 {:?}",
+            t.elapsed()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
