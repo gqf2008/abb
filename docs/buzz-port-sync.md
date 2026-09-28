@@ -63,3 +63,4 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 2. `steer_rejected_on_empty_prompt`（断言 `tests/fake_llm.rs:1459`）——空 prompt 的 -32602 拒绝帧在争用下落后于 prompt 响应帧，先 break → `saw_reject=false`。自移植初始提交 be46634 存在、从未改动；仅全量并发下偶发（整文件 20 轮 0 出现）。
 
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
+

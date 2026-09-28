@@ -18,6 +18,15 @@ pub struct SingleInstance {
     name: String,
 }
 
+/// 重试间隔下限。
+///
+/// `interval = 0` 时 `sleep(0)` 立即返回，重试循环会在 `timeout` 用尽前**忙等自旋烧满一核**
+/// （复核 reviewer-38 的 F2）。调用点传 0 属编程错误，但代价不该是 CPU 满载，所以在入口夹一个
+/// 1ms 地板：既不影响正常调用（250ms），也让 0 退化成「尽力重试」而不是「空转」。
+fn retry_interval(interval: Duration) -> Duration {
+    interval.max(Duration::from_millis(1))
+}
+
 impl SingleInstance {
     /// 尝试对 ~/.agent-bridge/.<name>.lock 拿排他非阻塞锁。
     /// 成功返回 guard；**已有实例在跑返回 Err**（调用方应退出）。
@@ -49,22 +58,42 @@ impl SingleInstance {
         timeout: Duration,
         interval: Duration,
     ) -> Result<SingleInstance> {
+        Self::acquire_at_with_retry_counted(dir, name, timeout, interval).0
+    }
+
+    /// 与 [`acquire_at_with_retry`](Self::acquire_at_with_retry) 同一实现，额外回传**尝试次数**。
+    ///
+    /// 回传计数是为了让单测能观测「地板真的夹在调用点上了」：忙等自旋与 1ms 地板在同样 150ms
+    /// 里差三个数量级（前者几十万次 flock，后者 ~150 次）。只测 `retry_interval()` 这个纯函数
+    /// 是不够的——复核 reviewer-39 的反证 4 实测：**把地板那一行删掉，纯函数用例照样绿**。
+    fn acquire_at_with_retry_counted(
+        dir: &Path,
+        name: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> (Result<SingleInstance>, usize) {
         let deadline = std::time::Instant::now() + timeout;
+        let interval = retry_interval(interval);
         let mut waited = false;
+        let mut attempts = 0usize;
         loop {
+            attempts += 1;
             match Self::acquire_at(dir, name) {
                 Ok(g) => {
                     if waited {
                         crate::log!("[single-instance] 等到 {name} 锁释放（升级重启路径）");
                     }
-                    return Ok(g);
+                    return (Ok(g), attempts);
                 }
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
-                        return Err(e.context(format!(
-                            "等待 {name} 锁超时（{}s 内旧实例没退出），本实例退出",
-                            timeout.as_secs()
-                        )));
+                        return (
+                            Err(e.context(format!(
+                                "等待 {name} 锁超时（{}s 内旧实例没退出），本实例退出",
+                                timeout.as_secs()
+                            ))),
+                            attempts,
+                        );
                     }
                     if !waited {
                         waited = true;
@@ -202,6 +231,61 @@ mod tests {
             "超时后必须尽快返回，实际 {:?}",
             t.elapsed()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2 复核项（单元层）：`retry_interval()` 把 0 抬到 1ms 地板。
+    ///
+    /// 只钉函数语义，**不**证明调用点夹了地板——那一层由下面的计数用例负责
+    /// （reviewer-39 的反证 4：删掉调用点那一行，本用例照样绿）。
+    #[test]
+    fn zero_interval_is_floored_by_the_helper() {
+        assert_eq!(
+            retry_interval(Duration::ZERO),
+            Duration::from_millis(1),
+            "interval=0 必须被抬到 1ms（sleep(0) 会让重试循环空转）"
+        );
+        assert_eq!(
+            retry_interval(Duration::from_millis(250)),
+            Duration::from_millis(250),
+            "正常间隔不得被改动"
+        );
+        assert!(retry_interval(Duration::ZERO) > Duration::ZERO);
+    }
+
+    /// F2 复核项（**调用点**层）：`acquire_at_with_retry` 入口确实夹了地板 ⇒ 传 `interval=0`
+    /// 时不能空转。
+    ///
+    /// 判据是**尝试次数**而不是耗时：耗时在有界返回这点上无法区分「1ms 地板」与「sleep(0)
+    /// 空转」，而同一段 150ms 里两者相差三个数量级（地板 ≈150 次；空转几万次以上）。
+    /// 删掉入口那一行 `let interval = retry_interval(interval);` ⇒ 本条必红（评审可复现）。
+    #[test]
+    fn zero_interval_does_not_busy_spin_at_the_call_site() {
+        let dir = std::env::temp_dir().join(format!("abb-single-{}", uuid::Uuid::new_v4()));
+        let _holder = SingleInstance::acquire_at(&dir, "test").expect("持锁");
+        let t = std::time::Instant::now();
+        let (r, attempts) = SingleInstance::acquire_at_with_retry_counted(
+            &dir,
+            "test",
+            Duration::from_millis(150),
+            Duration::ZERO,
+        );
+        assert!(r.is_err(), "持有者不放锁必须超时失败");
+        let took = t.elapsed();
+        assert!(
+            attempts >= 2,
+            "至少要重试一次才算「等待」，实际 {attempts} 次"
+        );
+        assert!(
+            attempts < 1000,
+            "150ms 内尝试了 {attempts} 次 ⇒ 入口没夹 1ms 地板，`sleep(0)` 在空转，\
+             请检查 acquire_at_with_retry 里的 retry_interval 调用"
+        );
+        assert!(
+            took >= Duration::from_millis(100),
+            "应当真的等到 deadline 附近（实际 {took:?}），否则说明 0 间隔被当成「只试一次」"
+        );
+        assert!(took < Duration::from_secs(3), "有界返回，实际 {took:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

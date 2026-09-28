@@ -360,6 +360,11 @@ pub fn asset_file_name(version: &str) -> String {
 /// 安装并重启。成功返回后**调用方负责退出本进程**（macOS 由分离 sh 等进程死后拉起新实例；
 /// Windows 安装器装完自己拉起）。Linux 不应被调用（无资产）。
 pub fn install_and_relaunch(file: &Path) -> Result<()> {
+    log_update_event(&format!(
+        "开始安装升级包 {}（当前版本 v{})",
+        file.display(),
+        CURRENT
+    ));
     #[cfg(target_os = "macos")]
     {
         macos_install(file)
@@ -373,6 +378,21 @@ pub fn install_and_relaunch(file: &Path) -> Result<()> {
         let _ = file;
         bail!("Linux 暂无预编译包，请 git pull && cargo build --release 手动升级")
     }
+}
+
+/// 升级动作的**文件**留痕（`<bridge_dir>/logs/update.log`）。
+///
+/// 为什么不能只靠 `crate::log!`：它只写 stdout（`main.rs` 的 `write_log`），而升级是在
+/// **GUI 进程**里发起的——Windows 下那是 `windows_subsystem = "windows"`（无控制台）、
+/// 由安装器 `[Run]`/资源管理器拉起，macOS 下由 `open` 拉起时 0/1/2 全指 /dev/null，
+/// 这条最需要留证据的信息会当场蒸发（同一结论的成文先例：`platform::log_autostart_event`，
+/// 那里就是为自启自愈改成写文件的）。升级一旦静默失败，更新器又拿不到安装器退出码、
+/// 本进程已退出，所以只能靠自己落盘。
+///
+/// 注意边界：**跑这次升级的是旧版二进制**，所以这行日志只从「装了本改动之后再升级」
+/// 才存在；随后那次升级的失败原因同样要等下一次升级才有 update.log 可看。
+fn log_update_event(msg: &str) {
+    crate::platform::append_event_log(&crate::bridge_dir().join("logs"), "update.log", msg);
 }
 
 /// macOS：dmg → 替换当前 bundle → 分离脚本等本进程死后 open 新实例。
@@ -457,6 +477,12 @@ fn macos_install_from_mnt(mnt: &Path, bundle: &Path) -> Result<()> {
 /// - `/SUPPRESSMSGBOXES`：任何对话框都不弹（失败也只留日志）；
 /// - `/NORESTART`：不许安装器重启系统（app 的重启由安装脚本 `[Run]` 段完成）；
 /// - `/CLOSEAPPLICATIONS`：若本进程还没退干净，直接关掉占用的实例，避免「文件占用」弹窗。
+/// - `/LOG`：让安装器把过程写进 `%TEMP%\Setup Log YYYY-MM-DD #N.txt`。**刻意用不带值的裸
+///   `/LOG`**：官方文档明写 `/LOG="<固定路径>"` 在「文件建不出来」时会让 Setup 直接 abort——
+///   而这条命令行要经 `cmd /c start` 转发（见 `windows_install`），带引号/空格的参数在这条链上
+///   有被拆碎的风险（同 `LESSON_系列_Windows与安装包.md` 的 cmd/start 元字符坑）；裸 `/LOG`
+///   不引入任何引号/空格，参数形状与其余四个一致。静默安装失败时这就是唯一的归因面：
+///   更新器拿不到安装器退出码（`cmd /c start` 派生后立即返回），本进程又已退出。
 ///
 /// 抽成纯函数是为了让参数被单测钉住（漏掉 `/VERYSILENT` 就会退回「弹安装界面」的老行为，
 /// 2026-09-28 owner 报的就是这个：装完了但没自动起来）。
@@ -467,6 +493,7 @@ fn windows_silent_args() -> Vec<&'static str> {
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/CLOSEAPPLICATIONS",
+        "/LOG",
     ]
 }
 
@@ -483,6 +510,14 @@ fn windows_install(setup: &Path) -> Result<()> {
         .args(windows_silent_args())
         .spawn()
         .context("启动安装包失败")?;
+    // 失败排查入口：静默安装期间/之后本进程已退出，只有安装器自己的日志能说明发生了什么。
+    // 必须走 `log_update_event`（写 logs/update.log）——`crate::log!` 在这条链路上会蒸发
+    // （GUI 进程无控制台、stdout 未重定向），复核 reviewer-39 的 B1 就是这条。
+    log_update_event(&format!(
+        "已静默启动安装包 {}（参数 {}；无窗口、不重启系统；安装器日志在 %TEMP%\\Setup Log *.txt）",
+        setup.display(),
+        windows_silent_args().join(" ")
+    ));
     Ok(())
 }
 
@@ -491,6 +526,9 @@ mod tests {
     use super::*;
 
     /// 静默升级参数必须齐全（尤其 `/VERYSILENT`：漏了就会弹安装界面、装完不自动起来）。
+    /// 另钉两条：① `/LOG` 必须在（静默安装失败时它是唯一归因面）；
+    /// ② **任何参数都不得含空白或引号**——这批参数要经 `cmd /c start` 转发，带空白/引号的
+    ///    参数在那条链上可能被拆成多个参数（`/LOG=<带空格的路径>` 就会被拆碎）。
     #[test]
     fn windows_silent_args_are_locked() {
         let args = windows_silent_args();
@@ -499,10 +537,17 @@ mod tests {
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
+            "/LOG",
         ] {
             assert!(args.contains(&need), "缺参数 {need}：{args:?}");
         }
-        assert_eq!(args.len(), 4, "不要夹带其它参数：{args:?}");
+        assert_eq!(args.len(), 5, "不要夹带其它参数：{args:?}");
+        for a in &args {
+            assert!(
+                !a.chars().any(|c| c.is_whitespace() || c == '"'),
+                "参数 {a:?} 含空白/引号：经 cmd /c start 转发时可能被拆碎"
+            );
+        }
     }
 
     #[test]
