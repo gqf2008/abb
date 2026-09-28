@@ -799,6 +799,27 @@ fn login_item_plist() -> PathBuf {
 
 // ─────────────────────────── 自启变更审计（全平台） ───────────────────────────
 
+/// 把 `include_str!` 进来的源码按 LF 归一。
+///
+/// **为什么必须有这一层**：本仓**没有** `.gitattributes` 强制换行（规则文档里那句「强制源码 LF」
+/// 与实际不符），Windows 检出（GitHub Actions `windows-latest`，`core.autocrlf=true`）里源码是
+/// **CRLF**。于是任何按 `\n` 拼接的片段匹配——例如 `find("\n}\n")` 取函数体——在 Windows 上匹配
+/// 不到：CI run `36396786020` 实测 `updater::tests::verify_sha256_production_seam_wires_the_file_log`
+/// 因此 panic（`.expect("函数体结束")`），而 macOS 本地全绿。
+///
+/// 按行扫描（`str::lines()`）本身对 CRLF 是安全的（它会吃掉行尾 `\r`）；**只有**「把 `\n` 写进
+/// 模式串」或「按字节切片跨行」的守卫需要先过这一层。
+///
+/// 仅在测试构建里存在（所有源码守卫都在 `#[cfg(test)]` 模块内）。
+#[cfg(test)]
+pub(crate) fn src_lf(s: &'static str) -> std::borrow::Cow<'static, str> {
+    if s.contains("\r\n") {
+        std::borrow::Cow::Owned(s.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// 把一次自启配置变更/自愈结果追加到 `<bridge_dir>/logs/autostart.log`。
 ///
 /// 为什么不能只靠 `crate::log!`：它只写 stdout（`main.rs:147`），而 GUI 由

@@ -643,7 +643,9 @@ mod tests {
     /// （复核 reviewer-41 的问题 3：把它改成 `None` 后全套测试仍绿，等于生产侧静默只剩 stdout）。
     #[test]
     fn verify_sha256_production_seam_wires_the_file_log() {
-        let src = include_str!("updater.rs");
+        // 必须过 `src_lf`：Windows 检出是 CRLF，而下面按 `\n` 拼接取函数体
+        // ——CI run 36396786020 就是因为漏了这一步在 windows-latest 上 panic（本地 macOS 全绿）。
+        let src = crate::platform::src_lf(include_str!("updater.rs"));
         let head = src.find("pub fn verify_sha256(").expect("生产入口存在");
         let tail = src[head..]
             .find("\n}\n")
