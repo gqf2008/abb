@@ -1262,6 +1262,29 @@ pub fn stop_service_authorized() -> Result<()> {
     Ok(())
 }
 
+/// **安装器专用**：以管理员身份登记 bridge 常驻任务（`agent-bridge.exe --install-bridge-task`）。
+///
+/// 为什么放在应用里而不是在 Inno 脚本里拼 XML：任务 XML 的单一定义在 `src/svc_task.rs`
+/// （UTF-16LE+BOM、转义、逐项设置都有单测）；安装器只是调这个隐藏子命令，避免两份 XML 漂移。
+///
+/// 用户取**本进程**（安装器已提权）的 SID：同用户 UAC 下就是安装者本人 ✓；over-the-shoulder
+/// 提权（标准用户 + 管理员凭据）时会落到管理员账号名下 —— 已知边界，运行时那条路（helper 的
+/// 「同用户」硬闸）会拒绝这种提权，故这里也只在装机时出现一次，不影响后续安全判定。
+#[cfg(target_os = "windows")]
+pub fn install_bridge_task_elevated() -> Result<()> {
+    use agent_bridge::elev::SysBackend;
+    let backend = agent_bridge::elev::win::WinlogonBackend;
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .context("拿不到当前可执行文件路径")?;
+    let sid = backend
+        .own_sid()
+        .map_err(|_| anyhow::anyhow!("拿不到当前用户 SID（提权了吗？）"))?;
+    backend
+        .install_bridge_task(&exe, &sid)
+        .map_err(|_| anyhow::anyhow!("schtasks 注册 bridge 常驻任务失败"))
+}
+
 /// Windows：服务常驻（计划任务）当前是否生效——供状态展示/自愈判断用。
 ///
 /// 与 [`autostart_enabled`]（托盘自启 = Run 键）刻意分开：存量用户只有 Run 键，判据若耦合会

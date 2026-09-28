@@ -14,10 +14,17 @@ AppId={{0EEFF4CA-5184-4FBB-81D7-EEB910AB0FE7}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\ABB
+; 2026-09-28（批 abb-svc-persist-password-gate）：改为 **per-machine** 安装。
+;
+; 为什么必须改：常驻服务以 `RunLevel=HighestAvailable`（高完整性）由计划任务拉起，
+; 而高完整性进程要真正"不可被普通用户摆布"，它执行的 exe 必须放在**普通用户不可写**的位置
+; —— 否则普通进程在一次 UAC 同意后改写 exe，之后每次登录都会静默以高完整性执行被改过的文件
+; （经典的"计划任务 UAC 绕过/持久化"形态）。`{localappdata}` 是用户可写的，故改到 `{autopf}`
+; （Program Files），并让安装器需要管理员权限（升级时多一次 UAC，安装过程仍是静默无向导）。
+DefaultDirName={autopf}\ABB
 DefaultGroupName=ABB
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ; 静默升级：自动关闭仍在运行的实例（配合更新器的 /CLOSEAPPLICATIONS），
 ; 但**不要**让安装器自己重启——重启由本文件末尾的 [Run] 段负责（安装成功后再执行）。
 ; （ABB **当前未注册** RegisterApplicationRestart，Inno 的 restart 本来也不会生效；
@@ -66,6 +73,56 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 ; 两条都用 --wait-lock 拉起：安装器关掉旧实例与本进程拿「gui」独占锁之间有极短窗口，
 ; 没有它新实例会按「已有实例在跑」立刻静默退出（表现为「装完没起来」）。
 ; 该参数只在被安装器拉起时生效，用户手点图标仍是即退语义。
+; runasoriginaluser（2026-09-28）：安装器现在以管理员运行（PrivilegesRequired=admin），
+; 若不加这个标志，[Run] 会用**管理员令牌**拉起托盘 —— 托盘再 spawn 的 claude/codex 就会带着
+; 管理员权限跑（本批要避免的事）。加它 ⇒ 托盘回到「启动安装的那个普通用户」身份；
+; 需要高完整性的 bridge 由下面的 [Code] 注册的计划任务以 HighestAvailable 拉起，各就各位。
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Flags: nowait; Check: WizardSilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Flags: nowait; Check: WizardSilent; runasoriginaluser
+
+; ─────────────────────────── 常驻计划任务（per-machine 安装的附带动作）───────────
+;
+; 安装器此时已是管理员：顺手把**高完整性**的 bridge 常驻任务登记好，装完即生效，
+; 用户不需要在应用里再点一次、也不会多一次 UAC（这正是 per-machine 安装换来的好处）。
+;
+; 任务指向 `{app}`（Program Files，普通用户不可写）里的 exe —— 与"高完整性常驻"配套；
+; 卸载时删掉任务，别给系统留孤儿。
+[Code]
+const
+  BridgeTaskName = 'ABB-Bridge';
+
+/// 注册常驻任务（幂等：/f 覆盖）。失败只记日志，不打断安装 —— 应用侧仍能在用户开自启时补建。
+///
+/// **不在这里拼 XML**：任务 XML 的单一定义在 `src/svc_task.rs::task_xml`（UTF-16LE+BOM 落盘、
+/// 转义、逐项设置都有单测）。安装器只是以管理员身份调一次我们自己的隐藏子命令
+/// `agent-bridge.exe --install-bridge-task`，由 Rust 侧走同一条注册路径 —— 免得两份 XML 漂移。
+procedure RegisterBridgeTask;
+var
+  Rc: Integer;
+begin
+  Exec(ExpandConstant('{app}\{#MyAppExeName}'), '--install-bridge-task', '',
+       SW_HIDE, ewWaitUntilTerminated, Rc);
+  if Rc = 0 then
+    Log('ABB: 已登记 bridge 常驻计划任务（HighestAvailable）')
+  else
+    Log('ABB: 计划任务登记失败 rc=' + IntToStr(Rc) + '（应用侧开自启时会重试）');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RegisterBridgeTask;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Rc: Integer;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    Exec('schtasks.exe', '/delete /tn ' + BridgeTaskName + ' /f', '', SW_HIDE,
+         ewWaitUntilTerminated, Rc);
+    Log('ABB: 卸载时删除常驻计划任务 rc=' + IntToStr(Rc));
+  end;
+end;
