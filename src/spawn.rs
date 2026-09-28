@@ -58,6 +58,65 @@ pub fn tokio_command(program: &str) -> tokio::process::Command {
 mod tests {
     use super::*;
 
+    /// 递归收集 `dir` 下的 .rs 源码（含子目录；只用于下面的源码护栏）。
+    fn rust_sources(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    if let Ok(text) = std::fs::read_to_string(&p) {
+                        out.push((p, text));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **跨平台护栏**：`creation_flags` 只允许出现在本模块。
+    ///
+    /// 为什么必须用源码扫描：`creation_flags` 是 setter，std/tokio 都没有 getter，而
+    /// Windows 分支在非 Windows 主机上**根本不参与编译**——「漏设」在本机所有门禁下都
+    /// 不可判别（独立评审 abb-reviewer-36 的突变反证：把 `command()`/`tokio_command()`
+    /// 里的 `no_window` 调用删掉，全量隔离门禁仍 869 passed / 0 failed 全绿）。本批的立论
+    /// 是「漏一处就漏一个黑框」，这条把该契约变成可机器检查的不变量：任何新增 spawn 点
+    /// 想抑制控制台窗口，只能走 [`command`] / [`tokio_command`] / [`no_window`]。
+    ///
+    /// 注释里提到方法名不算（按 `//` 切掉注释再判定）；本模块内部当然允许。
+    #[test]
+    fn creation_flags_only_in_this_module() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/spawn.rs");
+        let mut checked = 0usize;
+        for (path, text) in rust_sources(&root) {
+            if path == this {
+                continue;
+            }
+            checked += 1;
+            for (i, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                assert!(
+                    !code.contains("creation_flags"),
+                    "{}:{} 直接内联了 creation_flags —— 请改走 crate::spawn::command / \
+                     tokio_command（Windows 上漏设会闪控制台窗口，且本机门禁判别不了）",
+                    path.display(),
+                    i + 1
+                );
+            }
+        }
+        assert!(
+            checked > 20,
+            "只扫到 {checked} 个文件，路径算错了？护栏会假绿"
+        );
+    }
+
     /// 跨主机：在任意平台调用都不能 panic（非 Windows 走 `let _ = cmd` 的 no-op 分支，
     /// Windows 走 `creation_flags` 设置器；两者都不 panic 即契约成立）。
     #[test]
