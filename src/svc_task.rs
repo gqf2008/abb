@@ -104,12 +104,13 @@ pub fn task_xml(exe: &str, user: &str) -> String {
 /// 这里只在「换过安装路径/旧版任务」时判 Drifted 并触发重建。
 pub fn task_output_matches_exe(output: &[u8], exe: &str) -> bool {
     let has = |needle: &str| {
-        let utf8 = needle.as_bytes();
-        let utf16: Vec<u8> = needle
-            .encode_utf16()
-            .flat_map(|u| u.to_le_bytes())
-            .collect();
-        contains_bytes(output, utf8) || contains_bytes(output, &utf16)
+        // 两种形态各试：XML 里会转义 `&<>`（评审 P6——以前只比裸串，含这些字符的路径永远
+        // 判 Drifted），而 `--service` 这种无特殊字符的串转义后与原串相同、不会重复匹配。
+        [needle.to_string(), xml_escape(needle)].iter().any(|n| {
+            let utf8 = n.as_bytes();
+            let utf16: Vec<u8> = n.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            contains_bytes(output, utf8) || contains_bytes(output, &utf16)
+        })
     };
     has(exe) && has(SERVICE_ARG)
 }
@@ -151,10 +152,9 @@ mod tests {
             assert!(xml.contains(needle), "缺 {needle}：\n{xml}");
         }
         assert!(xml.contains(EXE), "必须直接跑当前二进制：\n{xml}");
-        assert!(
-            xml.contains("ABB-Bridge") || true,
-            "任务名在 schtasks 参数里"
-        );
+        // 任务名不在 XML 里（它在 `schtasks /tn` 参数上）。评审 P8 指出原来那条
+        // `assert!(xml.contains("ABB-Bridge") || true, …)` 恒真、零判别力 —— 直接删掉，
+        // 「注册时确实带着 TASK_NAME」由 `svc_task::TASK_NAME` 的调用点（platform/elev）保证。
     }
 
     /// exe / 用户名里的 `&`、`<` 必须转义，否则 `schtasks /create /xml` 会拒绝整份 XML。

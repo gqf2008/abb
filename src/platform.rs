@@ -700,6 +700,27 @@ pub fn heal_autostart() {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn heal_autostart() {}
 
+/// Linux：尚未实现「平台级托管」（没有 launchd/计划任务的对应物），如实 stub。
+///
+/// 与 [`heal_autostart`] 的 Linux stub 同一惯例：**宁可显式说未实现**，也不让调用方
+/// 在非 mac/win 上编译不过或静默走错分支（评审 P7）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn service_supervised() -> bool {
+    false
+}
+
+/// Linux：无托管则无托管重启。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn restart_service_supervised() -> Result<()> {
+    anyhow::bail!("Linux 暂未实现平台级托管（bridge 由托盘看门狗代管）")
+}
+
+/// Linux：授权停止未实现——**不静默降级成无授权停止**。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn stop_service_authorized() -> Result<()> {
+    anyhow::bail!("Linux 暂未实现「授权停止服务」（bridge 由托盘生命周期管理）")
+}
+
 /// 自愈判据（纯函数，便于单测）：**只在**「用户意图为开」且「注册表实际缺失」时为真。
 /// 两个方向都不能判错：意图开+实际也在 = 无需动作；意图关 = 用户自己关的，绝不能替他
 /// 打开。任一方向判反，都会把「用户主动关掉自启」变成「每次启动被偷偷打开」。
@@ -969,6 +990,11 @@ pub fn stop_service_authorized() -> Result<()> {
         let msg = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("未获得管理员授权，服务未停止：{}", msg.trim());
     }
+    // 复核（评审 P8）：脚本里的 `2>/dev/null || true` 会把 bootout 的失败也吞成成功，于是
+    // 「用户被告知已停止、服务还在跑」。授权已到手，这里直接回读 job 是否还在域里。
+    if job_loaded(&target) {
+        anyhow::bail!("launchctl bootout 未生效（job 仍在域里），服务未停止");
+    }
     log_autostart_event(&format!(
         "管理员授权通过：已 bootout {target}（停止 bridge）"
     ));
@@ -988,9 +1014,15 @@ pub fn service_supervised() -> bool {
 ///
 /// `kickstart -k` = 杀掉当前实例并立刻重起；这是「重启」这个动作在托管形态下的正确实现
 /// （用户没有要求给重启加授权，故不加）。
+///
+/// 评审 P5 的两点修正：① job 已不在域里（例如刚被授权停止过）时 `kickstart -k` 会失败 ⇒
+/// 退回 [`start_service_supervised`]；② 「启动」与「重启」是两件事，看门狗只该调前者。
 #[cfg(target_os = "macos")]
 pub fn restart_service_supervised() -> Result<()> {
     let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+    if !job_loaded(&target) {
+        return start_service_supervised();
+    }
     let out = std::process::Command::new("launchctl")
         .args(["kickstart", "-k", &target])
         .output()
@@ -1002,6 +1034,46 @@ pub fn restart_service_supervised() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// 托管形态下的「启动」：job 不在域里就 `bootstrap`，已在就什么都不做。
+///
+/// 与 [`restart_service_supervised`] 的区别是**不杀**正在跑的实例——看门狗「意图=运行但判活失败」
+/// 时走这条（评审 P5：以前走 kickstart -k，pid 文件滞后或冷启动 >2s 就形成抖动）。
+#[cfg(target_os = "macos")]
+pub fn start_service_supervised() -> Result<()> {
+    let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+    if job_loaded(&target) {
+        return Ok(());
+    }
+    let plist = service_item_plist();
+    if !plist.exists() {
+        anyhow::bail!("bridge 登录项不存在（未开自启？）：{}", plist.display());
+    }
+    let domain = format!("gui/{}", uid());
+    let out = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist.display().to_string()])
+        .output()
+        .context("执行 launchctl bootstrap 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// job 是否已在 launchd 域里（`launchctl print <target>` 成功 = 在）。
+#[cfg(target_os = "macos")]
+fn job_loaded(target: &str) -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ─────────────────────────── 自启变更审计（全平台） ───────────────────────────
@@ -1195,6 +1267,20 @@ pub fn stop_service_authorized() -> Result<()> {
 /// 与 [`autostart_enabled`]（托盘自启 = Run 键）刻意分开：存量用户只有 Run 键，判据若耦合会
 /// 让他的开关突然显示「关」。补任务要显式动作（开自启开关）——注册任务需要 UAC，而自愈阶段
 /// **不弹**授权框（那会变成每次启动都弹）。
+/// Windows：托管形态下的「启动」= `schtasks /run`（任务在跑时 IgnoreNew 策略保证不重复起）。
+#[cfg(target_os = "windows")]
+pub fn start_service_supervised() -> Result<()> {
+    let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
+        .context("执行 schtasks /run 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "schtasks /run 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 pub fn service_persist_state() -> &'static str {
     match svc_task_state() {

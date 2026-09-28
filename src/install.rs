@@ -144,7 +144,10 @@ pub fn svc_start() -> Result<()> {
     // spawn —— 两边同时管会抢单实例锁，表现为反复拉起-退出（见 platform::service_supervised）。
     if crate::platform::service_supervised() {
         set_desired(true);
-        return crate::platform::restart_service_supervised();
+        // 「启动」不等于「重启」：托管形态下只确保它在跑（job 没加载才 bootstrap / `/run`），
+        // 不能用 kickstart -k —— 那会杀掉正在跑的实例，看门狗每 2s 判活失败就再来一次，
+        // 形成「拉起即被杀」的抖动（评审 P5）。
+        return crate::platform::start_service_supervised();
     }
     let st = status();
     if st.running {
@@ -240,7 +243,27 @@ pub fn svc_restart() {
 /// 顺序要紧：**授权通过、平台侧真停了之后**才清「意图=运行」标记与 pid 文件。用户取消授权
 /// 时必须什么都不变——否则看门狗会把「取消授权」误当成「用户想停」而不再拉回服务。
 pub fn svc_stop_authorized() -> Result<()> {
-    crate::platform::stop_service_authorized()?;
+    // 平台侧拿授权并停 supervisor（macOS=bootout / Windows=schtasks /end，均经 UAC/密码框）。
+    let platform = crate::platform::stop_service_authorized();
+    // 评审 P4：**非托管形态**（例如刚关掉自启、bridge 又被看门狗拉成托盘子进程）时，平台侧
+    // 没有 supervisor 对象可停 ⇒ 必须把 pid 文件里那个进程也停掉，否则「用户被告知已停止、
+    // 服务还在跑」。只在授权**成功**后才动它：取消授权时绝不能用 pid 兜底绕开密码门。
+    let st = status();
+    if platform.is_ok() && st.running && st.pid != 0 {
+        terminate(st.pid);
+        crate::log!(
+            "[watchdog] 授权停止：已终止 pid={}（非托管形态兜底）",
+            st.pid
+        );
+    }
+    if let Err(e) = platform {
+        // 授权被取消 / 平台侧失败：只有确认进程真的没了才算停成功，否则如实报错。
+        let still = status();
+        if still.running {
+            return Err(e);
+        }
+        crate::log!("[watchdog] 平台侧返回失败，但 service 已不在运行：按成功处理（{e:#}）");
+    }
     apply_stop_intent(&logs_dir(), false);
     let _ = std::fs::remove_file(pid_file());
     crate::log!("[watchdog] 已按授权停止 service（意图标记已清）");

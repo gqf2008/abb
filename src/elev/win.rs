@@ -457,6 +457,11 @@ impl SysBackend for WinlogonBackend {
         sid_string_for_pid(pid).map_err(|_| SysError::Failed)
     }
 
+    /// 本 helper 自己的用户 SID（handler 用它做「同用户」硬闸）。
+    fn own_sid(&self) -> Result<String, SysError> {
+        current_user_sid_string().map_err(|_| SysError::Failed)
+    }
+
     /// 注册/覆盖计划任务：把 XML 落临时文件 → `schtasks /create /xml … /f` → 删临时文件。
     fn install_bridge_task(&self, exe: &str, user: &str) -> Result<(), SysError> {
         Self::require_elevated()?;
@@ -499,33 +504,45 @@ impl SysBackend for WinlogonBackend {
     /// 删除任务（不存在 = 幂等成功）。
     fn remove_bridge_task(&self) -> Result<(), SysError> {
         Self::require_elevated()?;
+        // 幂等判据用**查询**而不是退出码：直接看 `/delete` 的退出码会把「任务不存在」（1）
+        // 与「删除失败」（也是 1）混为一谈 —— 那是评审 P3 的「失败却回成功」。
+        let exists = crate::spawn::command("schtasks")
+            .args(["/query", "/tn", crate::svc_task::TASK_NAME, "/xml"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            return Ok(()); // 本来就没有：幂等成功
+        }
         let out = crate::spawn::command("schtasks")
             .args(["/delete", "/tn", crate::svc_task::TASK_NAME, "/f"])
             .output();
         match out {
             Ok(o) if o.status.success() => Ok(()),
             Ok(o) => {
-                // 任务本来就不存在（schtasks 退出码 1）也算成功——「删已删」是幂等的。
-                let code = o.status.code().unwrap_or(1);
-                if code == 1 {
-                    Ok(())
-                } else {
-                    log_fail("schtasks /delete", code as u32);
-                    Err(SysError::Failed)
-                }
+                log_fail("schtasks /delete", o.status.code().unwrap_or(1) as u32);
+                Err(SysError::Failed)
             }
             Err(_) => Err(SysError::Failed),
         }
     }
 
-    /// 停掉任务当前实例（= 停止服务）。没在跑时 schtasks 也返回失败，按幂等处理。
+    /// 停掉任务当前实例（= 停止服务）。
+    ///
+    /// **`/end` 非 0 一律报错**（评审 P3）：`schtasks /end` 在任务不存在/名称错/权限不足时都返回 1，
+    /// 把它当成功会让调用方清掉「意图=运行」与 pid 文件、UI 显示「已停止」，而服务其实还在跑。
+    /// 幂等由调用方兜底（`install::svc_stop_authorized` 在成功/失败两侧都复核 pid 存活）。
     fn stop_bridge_task(&self) -> Result<(), SysError> {
         Self::require_elevated()?;
         let out = crate::spawn::command("schtasks")
             .args(["/end", "/tn", crate::svc_task::TASK_NAME])
             .output();
         match out {
-            Ok(_) => Ok(()),
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                log_fail("schtasks /end", o.status.code().unwrap_or(1) as u32);
+                Err(SysError::Failed)
+            }
             Err(_) => Err(SysError::Failed),
         }
     }

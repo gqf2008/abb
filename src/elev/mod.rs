@@ -276,6 +276,10 @@ pub trait SysBackend {
     /// 调用方进程所属用户（实现返回 **SID 字符串**）——计划任务的 UserId 用它，
     /// **不听调用方自报**；SID 不受本地化/同名账号影响，Task Scheduler 的 XML 直接接受。
     fn user_for_pid(&self, pid: u32) -> Result<String, SysError>;
+    /// 本 helper 进程自己的用户 SID —— 与 [`SysBackend::user_for_pid`] 比对，确保「调用方与
+    /// 提权 helper 是同一个用户」。不等（over-the-shoulder 提权）时**拒绝**注册常驻任务：
+    /// 否则任务会登记到管理员账号名下、Action 却指向请求方用户可写目录里的 exe（评审 P1/P2）。
+    fn own_sid(&self) -> Result<String, SysError>;
     /// 注册/覆盖 bridge 常驻计划任务（AtLogon + HighestAvailable + RestartOnFailure）。
     fn install_bridge_task(&self, exe: &str, user: &str) -> Result<(), SysError>;
     /// 删除该任务（幂等）。
@@ -687,6 +691,21 @@ fn install_bridge_task(ctx: &AuditCtx<'_>, backend: &dyn SysBackend) -> Response
         Ok(u) => u,
         Err(err) => return conclude(ctx, op, params, Err(err)),
     };
+    // 「同用户」硬闸：over-the-shoulder 提权（标准用户 + 管理员凭据）时 helper 跑在管理员
+    // 账号下，若把任务登记到该账号名下、Action 却指向请求方用户可写的 exe，就是持久化提权面。
+    // 宁可拒绝并要求用户以「同一用户的 UAC 同意」重试（评审 P1）。
+    match backend.own_sid() {
+        Ok(own) if own == user => {}
+        Ok(_) => {
+            return deny(
+                ctx,
+                op.name(),
+                codes::DENIED,
+                "提权 helper 与调用方不是同一个用户（over-the-shoulder 提权），已拒绝注册常驻任务",
+            );
+        }
+        Err(err) => return conclude(ctx, op, params, Err(err)),
+    }
     conclude(
         ctx,
         op,
@@ -807,6 +826,8 @@ mod tests {
         get_calls: Mutex<usize>,
         /// bridge 任务三连的调用记录（`install <exe> <user>` / `remove` / `stop`）。
         task_calls: Mutex<Vec<String>>,
+        /// `Some(sid)` = 模拟「调用方属于另一个用户」（over-the-shoulder 提权）。
+        foreign_user: Option<String>,
         fail: Option<SysError>,
     }
 
@@ -820,6 +841,13 @@ mod tests {
         fn failing(err: SysError) -> Self {
             Fake {
                 fail: Some(err),
+                ..Fake::default()
+            }
+        }
+        /// 模拟 over-the-shoulder：调用方解析出来是**另一个**用户（helper 仍是原用户）。
+        fn foreign_caller() -> Self {
+            Fake {
+                foreign_user: Some("S-1-5-21-999-888-777-1002".to_string()),
                 ..Fake::default()
             }
         }
@@ -879,6 +907,17 @@ mod tests {
             }
             if pid == 0 {
                 return Err(SysError::Failed);
+            }
+            Ok(self
+                .foreign_user
+                .clone()
+                .unwrap_or_else(|| "S-1-5-21-111-222-333-1001".to_string()))
+        }
+
+        /// 本 helper 的用户 SID：固定值；`foreign_user` 用来模拟「调用方与 helper 不同用户」。
+        fn own_sid(&self) -> Result<String, SysError> {
+            if let Some(err) = self.fail {
+                return Err(err);
             }
             Ok("S-1-5-21-111-222-333-1001".to_string())
         }
@@ -1040,6 +1079,30 @@ mod tests {
     }
 
     /// 删除/停止走白名单同样的审计与幂等路径（各触达一次后端）。
+    ///
+    /// 评审 P1 的回归：**over-the-shoulder 提权**（调用方是标准用户、helper 跑在管理员账号下）
+    /// 必须被拒 —— 否则任务会登记到管理员账号名下，Action 却指向请求方用户可写目录里的 exe。
+    #[test]
+    fn install_bridge_task_rejects_foreign_caller_user() {
+        let dir = std::env::temp_dir().join(format!("abb-elev-foreign-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = Fake::foreign_caller();
+        let tok = "t".repeat(32);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "token": tok,
+            "op": "install-bridge-task",
+        }))
+        .unwrap();
+        let resp = handle_request(&body, &tok, &ctx(&dir), &backend);
+        assert!(!resp.ok, "调用方与 helper 不同用户时必须拒绝：{resp:?}");
+        assert_eq!(resp.code, codes::DENIED, "{resp:?}");
+        assert!(
+            backend.task_calls.lock().unwrap().is_empty(),
+            "拒绝路径不得触达系统调用（不得注册任务）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn remove_and_stop_bridge_task_dispatch() {
         let dir = std::env::temp_dir().join(format!("abb-elev-task2-{}", uuid::Uuid::new_v4()));
