@@ -32,9 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// 控制台窗口（`cat-file --batch` 为长驻进程时窗口会持续停留）。故所有 git 调用
 /// 一律经此构造，避免再漏设 `CREATE_NO_WINDOW`。
 fn git_command() -> Command {
-    let mut cmd = Command::new("git");
-    crate::spawn::no_window(&mut cmd);
-    cmd
+    // 「构造即已抑制」：统一入口，避免这里再手写 no_window。
+    crate::spawn::command("git")
 }
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
