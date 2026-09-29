@@ -458,8 +458,18 @@ mod win {
                 s.starts_with("\"C:\\Program Files\\x.exe\" --flag \"a b\""),
                 "{s}"
             );
-            // 尾部反斜杠 + 引号：反斜杠必须加倍（否则会把结尾引号转义掉）
-            let s = String::from_utf16_lossy(&build_command_line("C:\\dir with space\\", &[]));
+            // 尾部反斜杠 + 引号：反斜杠必须加倍（否则会把结尾引号转义掉）。
+            // 注意 `build_command_line` 返回的是**NUL 结尾**的 UTF-16 缓冲（`CommandLineToArgvW`
+            // 的输入契约），所以比较前必须先切掉结尾的 0，否则等于拿 "…\"\0" 去比 "…\""。
+            // 这条断言原先就是漏了这个 0：Windows 上必然红（Windows-only 测试，本机跑不到，
+            // 直到 CI 才暴露 —— main CI run 36535165443 的 `test` job）。
+            let buf = build_command_line("C:\\dir with space\\", &[]);
+            assert_eq!(
+                buf.last().copied(),
+                Some(0),
+                "命令行缓冲必须以 NUL 结尾（CommandLineToArgvW 的输入要求）"
+            );
+            let s = String::from_utf16_lossy(&buf[..buf.len() - 1]);
             assert_eq!(s, "\"C:\\dir with space\\\\\"");
         }
     }
