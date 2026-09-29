@@ -260,22 +260,26 @@ pub fn svc_restart() -> Result<()> {
     if crate::platform::service_supervised() {
         // 托管形态：交给 supervisor 重启（不经过「先杀后起」的托盘子进程路径）。
         set_desired(true);
-        crate::log!("[watchdog] 托管重启：schtasks /end + /run");
+        // 旧 pid：判据必须落在「**换了一个实例**」上 —— 只看「有进程在跑」会把
+        // 「/end 没生效 + /run 被 IgnoreNew 拒」的空转报成重启成功（2026-09-29 复评 F1）。
+        let prev = status().pid;
+        crate::log!("[watchdog] 托管重启：schtasks /end + /run（旧 pid={prev}）");
         crate::platform::restart_service_supervised()
             .context("托管重启失败（计划任务 /end 或 /run）")?;
-        if !wait_service_up(std::time::Duration::from_secs(10)) {
+        if !wait_service_restarted(prev, std::time::Duration::from_secs(10)) {
             anyhow::bail!(
-                "已让计划任务 /end + /run，但 10s 内没看到 bridge 跑起来（查 logs/bridge.out 与任务计划程序里的 ABB-Bridge）"
+                "已让计划任务 /end + /run，但 10s 内没看到**新**实例（旧 pid={prev} 仍在或没有新进程）；这通常说明 /end 没生效 —— 查任务计划程序里的 ABB-Bridge 与 logs/bridge.out"
             );
         }
         return Ok(());
     }
+    let prev = status().pid;
     svc_stop()?;
     // 稍等子进程退出再拉
     std::thread::sleep(std::time::Duration::from_millis(300));
     svc_start()?;
-    if !wait_service_up(std::time::Duration::from_secs(5)) {
-        anyhow::bail!("重启后 5s 内进程没起来（查 logs/bridge.out）");
+    if !wait_service_restarted(prev, std::time::Duration::from_secs(5)) {
+        anyhow::bail!("重启后 5s 内没看到新实例（旧 pid={prev}；查 logs/bridge.out）");
     }
     Ok(())
 }
@@ -360,6 +364,28 @@ pub fn wait_service_up(timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if status().running {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 重启成功的判据：**换了一个实例**（有实例在跑，且不是重启前那个 pid）。
+///
+/// 只看 status().running 会把「/end 没生效 + /run 被 IgnoreNew 拒」这种空转判成功——
+/// 用户点「重启」看到的是一句成功，而进程还是原来那个（2026-09-29 复评 F1）。纯函数，便于单测。
+fn is_restarted(prev_pid: u32, st: &ServiceStatus) -> bool {
+    st.running && st.pid != 0 && st.pid != prev_pid
+}
+
+/// 有界等待「换了一个实例」（判据见 is_restarted）。
+fn wait_service_restarted(prev_pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if is_restarted(prev_pid, &status()) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -698,6 +724,56 @@ mod svc_action_guards {
             "重启臂必须检查错误：{arm}"
         );
         assert!(arm.contains("svc_toast"), "重启失败必须弹 toast：{arm}");
+    }
+
+    /// 重启判据：必须**换了一个实例**，而不是「有个进程在跑」（复评 F1 的行为守卫）。
+    #[test]
+    fn is_restarted_requires_a_different_pid() {
+        let st = |running: bool, pid: u32| super::ServiceStatus { running, pid };
+        assert!(
+            super::is_restarted(100, &st(true, 200)),
+            "旧 100 → 新 200 = 重启成功"
+        );
+        assert!(
+            !super::is_restarted(100, &st(true, 100)),
+            "还是原来那个 pid = 没重启（旧实现会判成功）"
+        );
+        assert!(
+            !super::is_restarted(100, &st(false, 0)),
+            "没实例在跑 = 没起来"
+        );
+        assert!(
+            !super::is_restarted(100, &st(false, 100)),
+            "pid 文件还在但进程死了 = 没起来"
+        );
+        assert!(
+            super::is_restarted(0, &st(true, 7)),
+            "重启前没在跑 → 任何新实例都算成功"
+        );
+    }
+
+    /// 源码守卫：托管/非托管两条重启路径都必须按「新 pid」判成功，不得退回只看 running。
+    #[test]
+    fn restart_waits_for_a_new_pid() {
+        let src = crate::platform::src_lf(include_str!("install.rs"));
+        let body = src
+            .split("pub fn svc_restart()")
+            .nth(1)
+            .expect("install.rs 应有 svc_restart");
+        // 以「下一个函数」为界，别把后面整个文件圈进来（守卫自匹配）。
+        let body = body
+            .split("pub fn svc_stop_authorized")
+            .next()
+            .unwrap_or("");
+        assert_eq!(
+            body.matches("wait_service_restarted(").count(),
+            2,
+            "托管路径与非托管路径都要按「新 pid」确认（只看 running 会把空转报成成功）：{body}"
+        );
+        assert!(
+            !body.contains("wait_service_up("),
+            "重启判据不得退回 wait_service_up（它只问「有没有进程在跑」）：{body}"
+        );
     }
 }
 

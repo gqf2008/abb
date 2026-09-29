@@ -961,11 +961,21 @@ async fn spawn_and_init_agent(cfg: &AgentConfig) -> SpawnOutcome {
         }
         Ok(Err(e)) => {
             acp.shutdown().await;
-            SpawnOutcome::Err(format!("agent initialize failed: {e}"))
+            // stderr 尾巴（shutdown 已给它收尾窗口）：把「真正的病句」带给用户——
+            // 只说「进程意外退出」等于什么都没说（见 BuzzHandle::last_start_error）。
+            let detail = crate::redact::error_with_stderr_tail(
+                format!("agent initialize failed: {e}"),
+                acp.stderr_tail().as_deref(),
+            );
+            SpawnOutcome::Err(detail)
         }
         Err(_) => {
             acp.shutdown().await;
-            SpawnOutcome::Err("agent initialize timed out (60s)".to_string())
+            let detail = crate::redact::error_with_stderr_tail(
+                "agent initialize timed out (60s)".to_string(),
+                acp.stderr_tail().as_deref(),
+            );
+            SpawnOutcome::Err(detail)
         }
     }
 }
