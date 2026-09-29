@@ -55,8 +55,9 @@ mod win {
     };
     use windows::Win32::System::Threading::{
         CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
-        OpenProcessToken, WaitForSingleObject, CREATE_NO_WINDOW, LOGON_WITH_PROFILE,
-        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+        OpenProcessToken, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+        CREATE_SUSPENDED, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
@@ -301,7 +302,10 @@ mod win {
                 LOGON_WITH_PROFILE,
                 PCWSTR::null(),
                 PWSTR(cmdline.as_mut_ptr()),
-                CREATE_NO_WINDOW,
+                // CREATE_SUSPENDED：先挂起创建，等 job 指派完成再放它跑 —— 否则 agent 可能
+                // 在 AssignProcessToJobObject 之前就 fork 出孙进程，那些孙进程不属 job，
+                // shim 死后不会被连带杀掉（复评 R24 §7-G3）。
+                CREATE_NO_WINDOW | CREATE_SUSPENDED,
                 None,
                 PCWSTR::null(),
                 &si,
@@ -318,19 +322,47 @@ mod win {
             // 评审 R23 §3.2：把 agent 放进「句柄关闭即杀」的 Job Object —— bridge 侧 kill 的是
             // **本 shim**，shim 一死 job 句柄由内核关闭 ⇒ agent 随之被杀，不会变孤儿。
             // 这也是 ACP 的 kill_on_drop 语义在多一层进程后仍成立的关键。
-            if let Ok(job) = CreateJobObjectW(None, PCWSTR::null()) {
-                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                let _ = SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const core::ffi::c_void,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
-                let _ = AssignProcessToJobObject(job, pi.hProcess);
-                // job 句柄**故意不关**（HANDLE 是 Copy，`mem::forget` 无意义）：本进程退出
-                // 或被 kill 时，内核回收句柄表项 ⇒ KILL_ON_JOB_CLOSE 生效 ⇒ agent 随之被杀。
-                let _ = job;
+            match CreateJobObjectW(None, PCWSTR::null()) {
+                Ok(job) => {
+                    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    let set_ok = SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        &info as *const _ as *const core::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    );
+                    let assign_ok = AssignProcessToJobObject(job, pi.hProcess);
+                    if set_ok.is_err() || assign_ok.is_err() {
+                        // 复评 R24 §7-G3：job 没设成/没指派成功 ⇒ 杀树语义不成立，宁可明确失败
+                        // （杀掉刚创建的挂起进程）也不留一个"以为会被连带杀"的 agent。
+                        eprintln!(
+                            "abb-spawner: Job Object 设置/指派失败（set={set_ok:?} assign={assign_ok:?}），已终止 {program}"
+                        );
+                        let _ = TerminateProcess(pi.hProcess, 1);
+                        let _ = CloseHandle(pi.hThread);
+                        let _ = CloseHandle(pi.hProcess);
+                        return EXIT_SPAWN;
+                    }
+                    // job 句柄**故意不关**（HANDLE 是 Copy）：本进程退出或被 kill 时内核回收
+                    // 句柄表项 ⇒ KILL_ON_JOB_CLOSE 生效 ⇒ agent 随之被杀。
+                    let _ = job;
+                }
+                Err(e) => {
+                    eprintln!("abb-spawner: CreateJobObjectW 失败（{e}），已终止 {program}");
+                    let _ = TerminateProcess(pi.hProcess, 1);
+                    let _ = CloseHandle(pi.hThread);
+                    let _ = CloseHandle(pi.hProcess);
+                    return EXIT_SPAWN;
+                }
+            }
+            // 放它跑（创建时是挂起的）。
+            if ResumeThread(pi.hThread) == u32::MAX {
+                eprintln!("abb-spawner: ResumeThread 失败，已终止 {program}");
+                let _ = TerminateProcess(pi.hProcess, 1);
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+                return EXIT_SPAWN;
             }
             // 等它结束并透传退出码：bridge 侧看到的仍是同一条管道 + 同一个"子进程"。
             let _ = WaitForSingleObject(pi.hProcess, u32::MAX);

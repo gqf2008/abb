@@ -50,6 +50,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+; B2（批 abb-svc-persist-password-gate）：Windows「降权启动器」必须随包 —— bridge 以高完整性
+; 跑时用它把 agent 降到桌面 shell 身份；缺了它 agent 会**起不来**（fail-closed，见 agent_spawn.rs）。
+; 文件名必须是 `abb-spawner.exe`（与 `agent_spawn::spawner_exe()` 同源假设），别改名。
+Source: "..\target\release\abb-spawner.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; #200 fork buzz-agent：与主程序同目录（运行时按 current_exe 同目录解析；
 ; buzz_agent_exe 空时先查同目录）。分叉 Apache-2.0，再分发附 LICENSE。

@@ -12,6 +12,12 @@
 //!
 //! fail-closed：已提权却找不到 `abb-spawner.exe` 时**不退回直接 spawn**（那等于静默提权），
 //! 而是让 spawn 明确失败并留下日志 —— 宁可 agent 起不来，也不要它带着管理员权限跑。
+//!
+//! **边界（评审 R23 B2-e，如实登记）**：本入口只覆盖 **ACP agent**（claude/codex/pi 等，
+//! 经 `buzz/acp.rs` 启动）。bridge 里其它子进程仍是高完整性 —— 例如 `larkskills` 的
+//! `npx`、`mcp_events`/`tidy` 的 `git`、`platform` 的 `cmd`/`clip`。它们的输入不来自模型
+//! 输出（命令与参数都是代码里写死的常量），风险面与「agent 可能被诱导」不同，故本轮不扩到
+//! 它们；发布说明里也要按这句口径写，别让「agent 已降权」被读成「所有子进程都已降权」。
 
 /// `abb-spawner.exe`（与本二进制同目录，装机时随包）；找不到返回 `None`。
 ///

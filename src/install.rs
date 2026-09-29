@@ -565,6 +565,26 @@ mod installer_guards {
         }
     }
 
+    /// **B2 的必需二进制必须随包**（复评 R24 的阻塞项）：`abb-spawner.exe` 是 bridge 以
+    /// 高完整性跑时把 agent 降到桌面 shell 身份的唯一手段 —— 没打进安装包的话，装机版上
+    /// agent 会全部起不来（fail-closed 生效，不是静默提权，但功能不可用）。
+    #[test]
+    fn installer_ships_the_de_elevation_shim() {
+        assert!(
+            code_lines()
+                .iter()
+                .any(|l| l.contains("abb-spawner.exe") && l.contains("DestDir")),
+            "安装包必须随带 abb-spawner.exe（B2 的降权启动器；缺了 agent 起不来）"
+        );
+        // 名字不能改：`agent_spawn::spawner_exe()` 按同目录的 `abb-spawner.exe` 找它。
+        assert!(
+            code_lines()
+                .iter()
+                .any(|l| l.contains(r#"..\target\release\abb-spawner.exe"#)),
+            "源路径必须是 target\\release\\abb-spawner.exe（与 bin 名一致）"
+        );
+    }
+
     /// 装机即登记常驻任务，且**不在 Pascal 里重写 XML**（XML 单一定义在 src/svc_task.rs）：
     /// 这里只允许出现一次 `--install-bridge-task` 调用与一次卸载删除。
     #[test]
