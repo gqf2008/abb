@@ -233,6 +233,13 @@ pub struct BuzzHandle {
     registry: Arc<Mutex<Registry>>,
     /// agent 进程不可用（bridge 预检读）。
     dead: AtomicBool,
+    /// 最近一次 agent **起不来**的原因：启动失败（`spawn`/`initialize`）或运行中崩溃。
+    ///
+    /// 为什么要留一份：预检只会给用户一句「agent 未就绪（启动失败/崩溃退避中）」，
+    /// 真实原因（缺 `abb-spawner.exe`、取不到桌面令牌、被 EDR 拦、供应商初始化失败…）
+    /// 此前只写进 `bridge.out`——用户端完全无从下手（2026-09-29 owner 实报
+    /// 「Windows 全都不回消息，也没有任何提示」）。启动成功即清空，避免旧原因误导。
+    last_start_error: std::sync::Mutex<Option<String>>,
     /// fork `_meta.abbSandbox` 能力位（单后端化 P2.3）：initialize 成功后由
     /// handle_spawn_outcome 写入；新一轮 spawn 发起时复位 Unknown。
     /// 桥侧预检据此对「已知不支持」的 granted 消息提前拒答；**真闸**在
@@ -451,6 +458,7 @@ impl BuzzHandle {
             ctx,
             registry: Arc::new(Mutex::new(Registry::default())),
             dead: AtomicBool::new(false),
+            last_start_error: std::sync::Mutex::new(None),
             sandbox_supported: std::sync::atomic::AtomicU8::new(SandboxSupport::Unknown as u8),
             cmd_tx,
             cmd_rx: std::sync::Mutex::new(Some(cmd_rx)),
@@ -496,6 +504,18 @@ impl BuzzHandle {
     /// 会被预检拒绝（避免用户以为已受理）。
     pub fn is_agent_available(&self) -> bool {
         !self.dead.load(Ordering::Relaxed)
+    }
+
+    /// 最近一次启动失败的原因（给用户看的；无失败过则为 None）。
+    pub fn last_start_error(&self) -> Option<String> {
+        self.last_start_error.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// 记录/清除「最近一次启动失败原因」（内核入口：spawn 结局两条臂）。
+    fn set_last_start_error(&self, detail: Option<String>) {
+        if let Ok(mut g) = self.last_start_error.lock() {
+            *g = detail;
+        }
     }
 
     /// fork `_meta.abbSandbox` 能力位（P2.3）。桥侧预检只在 **Unsupported**
@@ -842,10 +862,13 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome
                 Ordering::Relaxed,
             );
             l.pool.return_agent(agent);
+            // 起来了就清掉旧失败原因：否则用户会拿着上一次的旧原因排查现在的故障。
+            handle.set_last_start_error(None);
             tracing::info!("agent process ready");
         }
         SpawnOutcome::Err(detail) => {
             handle.dead.store(true, Ordering::Relaxed);
+            handle.set_last_start_error(Some(detail.clone()));
             l.crash_backoff = l.crash_backoff.saturating_add(1);
             let delay = respawn_delay(l.crash_backoff);
             emit_agent_start_failure(&mut std::io::stdout(), &detail, delay);
@@ -1364,6 +1387,8 @@ fn schedule_death_respawn(
     l.crash_backoff = l.crash_backoff.saturating_add(1);
     let delay = respawn_delay(l.crash_backoff);
     handle.dead.store(true, Ordering::Relaxed);
+    // 运行中崩溃也要留因：否则用户看到的是「未就绪」却不带任何原因。
+    handle.set_last_start_error(Some(format!("运行中崩溃：{outcome_label}")));
     tracing::warn!(
         agent = old_agent.index,
         outcome = outcome_label,

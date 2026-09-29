@@ -64,3 +64,10 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
 
+## 移植区变更追加登记（不逐个改写上表长行）
+
+上表每行都是超长单行，追加说明容易改坏原行；新变更登记在本节，格式与上表同义（文件 / 处置 / 说明）。
+
+| 文件 | 处置 | 说明 |
+|---|---|---|
+| `harness.rs` | ABB 扩展字段（追加） | **失败原因留存（2026-09-29，批 abb-win-failure-visibility）**：新增 `BuzzHandle.last_start_error`（`Mutex<Option<String>>`）+ `last_start_error()` / `set_last_start_error()`——`handle_spawn_outcome` 的 `SpawnOutcome::Err` 臂与 `schedule_death_respawn`（运行中崩溃）写入真实原因，启动成功臂清空；桥侧预检 `AgentDown` 的回复据此把原因带给用户（旧文案只有「未就绪（启动失败/崩溃退避中）」，用户看不出是缺 `abb-spawner.exe`、取不到桌面令牌、被 EDR 拦还是初始化失败）。上游无此概念，同步时保留。 |

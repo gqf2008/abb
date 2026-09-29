@@ -71,7 +71,15 @@ fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         if unsafe { libc::kill(pid as i32, 0) } != 0 {
-            return false; // 进程不存在
+            let err = std::io::Error::last_os_error();
+            // EPERM = 进程**存在**但我们无权给它发信号 → 必须算存活。
+            // 旧实现把所有非 0 返回都当「不存在」，于是「以更高权限运行的 bridge」在状态里
+            // 显示成「未运行」：托盘给的是「启动」而不是「停止」，用户点了自然没反应
+            //（与 2026-09-29 owner 实报同型）。ESRCH 才是真不存在。
+            if err.raw_os_error() == Some(libc::EPERM) {
+                return true;
+            }
+            return false; // ESRCH / 其它
         }
         // 存在但可能是 zombie → 查 /proc（Linux）或用 sysctl（macOS）判 state
         !is_zombie(pid)
@@ -151,7 +159,7 @@ pub fn svc_start() -> Result<()> {
     }
     let st = status();
     if st.running {
-        svc_stop();
+        svc_stop()?;
     }
     set_desired(true);
     let exe = crate::platform::current_exe()?;
@@ -186,9 +194,23 @@ pub fn svc_start() -> Result<()> {
     Ok(())
 }
 
+/// 「启动」的用户可见版本：起完还要**确认它真的在跑**（起完即退 = 单实例锁被占，
+/// 静默返回正是「点了启动/重启没反应」的来源）。只给后台线程用（最多阻塞 `timeout`）。
+pub fn svc_start_verified(timeout: std::time::Duration) -> Result<()> {
+    svc_start()?;
+    if !wait_service_up(timeout) {
+        anyhow::bail!(
+            "已发起启动，但 {timeout:?} 内没看到 service 跑起来（多半已有实例占着单实例锁；查 logs/bridge.out）"
+        );
+    }
+    Ok(())
+}
+
 /// 停止 service（按 pid 文件终止 + 清文件 + 清「意图」标记——用户手动停，看门不再重拉）。
-pub fn svc_stop() {
-    svc_stop_impl(false);
+///
+/// 失败**必须**如实返回（2026-09-29 owner 实报：Windows 上「停不了也没任何提示」）。
+pub fn svc_stop() -> Result<()> {
+    svc_stop_impl(false)
 }
 
 /// 升级重启前停 service：**保留**「意图=运行」标记，让重启后的新实例把 bridge 拉回来。
@@ -196,16 +218,26 @@ pub fn svc_stop() {
 /// 与 [`svc_stop`] 的唯一差别是不动 desired 标记（该清 pid 文件仍要清，否则新实例
 /// 会把一个已退出的 pid 当真值）。语义边界：升级前用户本来就是停掉状态（标记不存在）
 /// 时，这里同样保持不存在——升级不替用户改主意，只让「本来在跑」的意图活过这次重启。
-pub fn svc_stop_keep_desired() {
-    svc_stop_impl(true);
+pub fn svc_stop_keep_desired() -> Result<()> {
+    svc_stop_impl(true)
 }
 
 /// [`svc_stop`] / [`svc_stop_keep_desired`] 的共同实现。
-fn svc_stop_impl(keep_desired: bool) {
-    apply_stop_intent(&logs_dir(), keep_desired);
+///
+/// 顺序：**先确认真的停掉，再改意图标记与 pid 文件**。反过来的话，kill 失败时盘上会留下
+/// 「标记=已停、pid 文件已删、进程还在跑」的错位状态，看门狗也不会把它拉回来 —— 用户看到
+/// 的就是「点了停止，什么都没发生，也没有任何提示」。
+fn svc_stop_impl(keep_desired: bool) -> Result<()> {
     let st = status();
+    // 诊断先行：下次再出现「点了没反应」，日志里至少能看出当时判成了什么形态。
+    crate::log!(
+        "[watchdog] 停止 service 请求：keep_desired={keep_desired} supervised={} running={} pid={}",
+        crate::platform::service_supervised(),
+        st.running,
+        st.pid
+    );
     if st.running && st.pid != 0 {
-        terminate(st.pid);
+        terminate(st.pid)?;
         if keep_desired {
             crate::log!(
                 "[watchdog] 已停止 service pid={}（升级重启：保留「意图=运行」，新实例看门狗会拉回）",
@@ -215,24 +247,37 @@ fn svc_stop_impl(keep_desired: bool) {
             crate::log!("[watchdog] 已停止 service pid={}", st.pid);
         }
     }
+    apply_stop_intent(&logs_dir(), keep_desired);
     let _ = std::fs::remove_file(pid_file());
+    Ok(())
 }
 
-pub fn svc_restart() {
+/// 重启 service（**带验证**）：起没起来要确认，否则「重启不了」同样是静默失败。
+///
+/// 只从后台线程调用（GUI 的 UiCmd 循环 / 保存后的热重启）——内含最长 ~10s 的轮询，
+/// 不能放到 UI 线程的 2s 看门狗里。
+pub fn svc_restart() -> Result<()> {
     if crate::platform::service_supervised() {
         // 托管形态：交给 supervisor 重启（不经过「先杀后起」的托盘子进程路径）。
         set_desired(true);
-        if let Err(e) = crate::platform::restart_service_supervised() {
-            crate::log!("[watchdog] 托管重启失败: {e:#}");
+        crate::log!("[watchdog] 托管重启：schtasks /end + /run");
+        crate::platform::restart_service_supervised()
+            .context("托管重启失败（计划任务 /end 或 /run）")?;
+        if !wait_service_up(std::time::Duration::from_secs(10)) {
+            anyhow::bail!(
+                "已让计划任务 /end + /run，但 10s 内没看到 bridge 跑起来（查 logs/bridge.out 与任务计划程序里的 ABB-Bridge）"
+            );
         }
-        return;
+        return Ok(());
     }
-    svc_stop();
+    svc_stop()?;
     // 稍等子进程退出再拉
     std::thread::sleep(std::time::Duration::from_millis(300));
-    if let Err(e) = svc_start() {
-        crate::log!("[watchdog] 重启失败: {e:#}");
+    svc_start()?;
+    if !wait_service_up(std::time::Duration::from_secs(5)) {
+        anyhow::bail!("重启后 5s 内进程没起来（查 logs/bridge.out）");
     }
+    Ok(())
 }
 
 /// 停止服务 —— **需要授权**（本批 owner 要求：托盘退出不影响服务，停止必须授权）。
@@ -249,13 +294,26 @@ pub fn svc_stop_authorized() -> Result<()> {
     // 没有 supervisor 对象可停 ⇒ 必须把 pid 文件里那个进程也停掉，否则「用户被告知已停止、
     // 服务还在跑」。只在授权**成功**后才动它：取消授权时绝不能用 pid 兜底绕开密码门。
     let st = status();
-    if platform.is_ok() && st.running && st.pid != 0 {
-        terminate(st.pid);
-        crate::log!(
-            "[watchdog] 授权停止：已终止 pid={}（非托管形态兜底）",
-            st.pid
-        );
-    }
+    // 授权已通过时，把非托管形态那个进程也真停掉 —— 但**终止结果必须检查**：
+    // 高完整性进程普通权限杀不掉（Access Denied），旧实现静默吞掉，用户端就成了
+    // 「点了停止什么都没发生、也没有任何提示」（2026-09-29 owner 实报）。
+    let killed = if platform.is_ok() && st.running && st.pid != 0 {
+        match terminate(st.pid) {
+            Ok(()) => {
+                crate::log!(
+                    "[watchdog] 授权停止：已终止 pid={}（非托管形态兜底）",
+                    st.pid
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.context(format!(
+                "授权已通过，但 pid={} 停不掉（非托管形态兜底）",
+                st.pid
+            ))),
+        }
+    } else {
+        Ok(())
+    };
     if let Err(e) = platform {
         // 授权被取消 / 平台侧失败：只有确认进程真的没了才算停成功，否则如实报错。
         let still = status();
@@ -264,6 +322,7 @@ pub fn svc_stop_authorized() -> Result<()> {
         }
         crate::log!("[watchdog] 平台侧返回失败，但 service 已不在运行：按成功处理（{e:#}）");
     }
+    killed?;
     apply_stop_intent(&logs_dir(), false);
     let _ = std::fs::remove_file(pid_file());
     crate::log!("[watchdog] 已按授权停止 service（意图标记已清）");
@@ -279,40 +338,102 @@ pub fn write_own_pid_file() {
     let _ = std::fs::write(pid_file(), std::process::id().to_string());
 }
 
-/// 跨平台终止进程。
-fn terminate(pid: u32) {
-    terminate_with_grace(pid, std::time::Duration::from_secs(3));
+/// 有界等待 pid 消失（terminate 之后的**确认**）。
+///
+/// 为什么必须确认：Windows 上 `taskkill` 对高完整性进程返回 Access Denied，而旧实现
+/// `.spawn()` 之后既不 wait 也不看退出码 —— 于是「停止」静默失败（owner 2026-09-29 实报）。
+fn wait_pid_gone(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !pid_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return !pid_alive(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 有界等待 service 起来（状态以 pid 文件 + 存活为准；托管形态下由 service 自己登记 pid）。
+pub fn wait_service_up(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if status().running {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 跨平台终止进程（**检查型**：真的停掉才算 Ok）。
+fn terminate(pid: u32) -> Result<()> {
+    terminate_with_grace(pid, std::time::Duration::from_secs(3))
 }
 
 /// terminate 的实现（grace 可注入，单测用短宽限验证升级链路不拖慢测试）。
-fn terminate_with_grace(pid: u32, grace: std::time::Duration) {
+///
+/// 返回值语义：`Ok(())` = 调用返回时该 pid **已不在**（本来就不在也算）；`Err` = 还在跑，
+/// 调用方必须把原因交给用户（权限不足最常见），绝不能静默吞掉。
+fn terminate_with_grace(pid: u32, grace: std::time::Duration) -> Result<()> {
+    if pid == 0 || !pid_alive(pid) {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH = 我们判活之后它自己退了：算成功。
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "SIGTERM 失败（{err}）：pid={pid} 以更高权限运行，普通权限停不掉（需要管理员授权）"
+            );
         }
         // #179：优雅关闭可能卡死（如 WS 发送挂起）→ SIGTERM 杀不死、锁占着 → 新实例
-        // 无限拉起失败。SIGTERM 后 grace 未退 → SIGKILL 兜底（后台线程，不阻塞调用方）。
-        std::thread::spawn(move || {
-            std::thread::sleep(grace);
-            // #183（PR #181 审查 P1 补强）：SIGKILL 前复查存活——grace 内已优雅退出
-            // （含 zombie）时 pid 可能被系统复用，盲发 SIGKILL 会误杀无辜进程。
-            if !pid_alive(pid) {
-                return;
-            }
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        });
+        // 无限拉起失败。SIGTERM 后 grace 内没退 → SIGKILL 兜底。
+        if wait_pid_gone(pid, grace) {
+            return Ok(());
+        }
+        // #183：SIGKILL 前复查存活（wait_pid_gone 刚刚确认过还在），避免对已退出的 pid 盲发
+        // （pid 复用后误杀无辜进程）。
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        if wait_pid_gone(pid, std::time::Duration::from_secs(1)) {
+            Ok(())
+        } else {
+            anyhow::bail!("SIGKILL 之后 pid={pid} 仍在运行（不可能？请查进程状态）")
+        }
     }
     #[cfg(not(unix))]
     {
         // Windows：taskkill /F 即强杀（无宽限期语义），grace 仅 unix 分支消费
         let _ = grace;
-        // Windows：taskkill（stub）；CREATE_NO_WINDOW 避免停服务时闪控制台
-        let _ = crate::spawn::command("taskkill")
+        // CREATE_NO_WINDOW 避免停服务时闪控制台。**必须 `.output()` 收集输出并校验退出码**：
+        // 旧实现火并忘，高完整性进程被拒（Access Denied）时用户端完全没有反馈。
+        let out = crate::spawn::command("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
-            .spawn();
+            .output()
+            .context("执行 taskkill 失败")?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let err = err.trim();
+            anyhow::bail!(
+                "taskkill 失败（{}）：{}；若为「拒绝访问」说明该进程以更高权限运行，普通权限停不掉（需要管理员授权）",
+                out.status,
+                if err.is_empty() { "无输出" } else { err }
+            );
+        }
+        if wait_pid_gone(pid, std::time::Duration::from_secs(2)) {
+            Ok(())
+        } else {
+            anyhow::bail!("taskkill 报成功但 pid={pid} 仍在运行")
+        }
     }
 }
 
@@ -361,13 +482,50 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        terminate_with_grace(pid, std::time::Duration::from_millis(300));
+        let res = terminate_with_grace(pid, std::time::Duration::from_millis(300));
         let t = std::time::Instant::now();
         let _ = child.wait(); // 阻塞到被杀
         assert!(
             t.elapsed() < std::time::Duration::from_secs(3),
             "忽略 TERM 的进程必须在宽限+SIGKILL 内被杀，实际 {:?}",
             t.elapsed()
+        );
+        assert!(res.is_ok(), "进程确实被杀掉时必须返回 Ok：{res:?}");
+    }
+
+    /// 已经不在的 pid 不算失败（调用方拿到 Ok 就不该报错打扰用户）。
+    #[test]
+    fn terminate_checked_is_ok_for_dead_pid() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let mut child = child;
+        let pid = child.id();
+        let _ = child.wait();
+        assert!(!pid_alive(pid), "前置：进程已退出");
+        assert!(
+            terminate_with_grace(pid, std::time::Duration::from_millis(100)).is_ok(),
+            "已退出的 pid 必须判 Ok（否则「停止」会对着一个不存在的进程报错）"
+        );
+    }
+
+    /// 停不掉的进程必须**报错**，不能像旧实现那样静默返回。
+    ///
+    /// 用 `launchd`（pid 1）当靶子：普通用户 `kill(1)` 会 EPERM，正好等价于 Windows 上
+    /// 「taskkill 拒绝访问」这一类形态。**以 root 运行时跳过**（那时真的会杀掉 launchd）。
+    #[test]
+    fn terminate_checked_reports_failure_when_permission_denied() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip：以 root 运行，kill(1) 真的会生效，不能拿它当靶子");
+            return;
+        }
+        let res = terminate_with_grace(1, std::time::Duration::from_millis(50));
+        let err = res.expect_err("无权限终止的 pid 必须返回 Err（旧实现的静默就在这里）");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("权限") || msg.contains("SIGTERM"),
+            "错误信息要能让人知道是权限问题：{msg}"
         );
     }
 }
@@ -486,6 +644,59 @@ mod upgrade_call_site_tests {
             via >= 4,
             "ui.rs 里应至少有 4 处升级日志走 crate::updater::log_update（实际 {via}）"
         );
+    }
+}
+
+/// 安装器（`app-assets/ABB.iss`）的**安全前提**守卫 —— 平台无关（纯文本断言），任何平台都能跑。
+///
+/// 为什么值得钉：这几条不是"配置偏好"，而是本批「登录后服务不能被随便杀死」能成立的前提 ——
+/// 一旦有人在改安装脚本时把它们删掉，Windows 上就会静默退回「高完整性常驻 + 用户可写 exe」
+/// 的持久化提权形态，而门禁全绿、CI 全绿（`.iss` 只在发版时编译，跑不到单测）。评审 R22 的
+/// P2 就是这么被发现的，故补成可红可绿的断言。
+/// 「服务动作失败不得静默」的源码守卫（2026-09-29 owner 实报：Windows 上停不了/重启不了也没提示）。
+///
+/// 为什么用源码守卫：两条缺陷都在**异侧/异路径**（Windows 的 taskkill 分支、GUI 的重启命令臂），
+/// 本机 macOS 根本执行不到 —— 但它们的**形状**是文本事实，钉住形状就能防回归。
+#[cfg(test)]
+mod svc_action_guards {
+    /// `terminate_with_grace` 的 Windows 分支必须收集输出并校验退出码。
+    #[test]
+    fn windows_terminate_checks_taskkill_result() {
+        let src = include_str!("install.rs");
+        // 只看 taskkill **那一条语句**的调用链（到第一个 `;` 为止）与它后面一小段窗口：
+        // 直接切「到下一个 fn 为止」会把后面的测试模块一起圈进来（.spawn() 是测试在起进程），
+        // 属于守卫自匹配——本项目已经踩过一次（子串式守卫顶住自己）。
+        let idx = src.find("\"taskkill\"").expect("应调用 taskkill");
+        let window = &src[idx..(idx + 900).min(src.len())];
+        let stmt = window.find(';').map(|i| &window[..i]).unwrap_or(window);
+        assert!(
+            stmt.contains(".output()"),
+            "taskkill 必须用 .output() 收集输出（火并忘的 .spawn() 会让 Access Denied 静默）：{stmt}"
+        );
+        assert!(
+            !stmt.contains(".spawn()"),
+            "不得再对 taskkill 火并忘（.spawn()）：2026-09-29 owner 实报的静默缺陷就是这么来的"
+        );
+        assert!(
+            window.contains("status.success()"),
+            "必须校验 taskkill 退出码，失败要 bail"
+        );
+    }
+
+    /// GUI 的「重启」命令臂必须把错误放进 toast（只 log! = 用户看到「点了没反应」）。
+    #[test]
+    fn gui_restart_arm_surfaces_failure() {
+        let ui = include_str!("ui.rs");
+        let arm = ui
+            .split("UiCmd::Restart =>")
+            .nth(1)
+            .expect("ui.rs 应有 UiCmd::Restart 命令臂");
+        let arm = &arm[..arm.find("UiCmd::OpenLogs").unwrap_or(400)];
+        assert!(
+            arm.contains("if let Err(e) = install::svc_restart()"),
+            "重启臂必须检查错误：{arm}"
+        );
+        assert!(arm.contains("svc_toast"), "重启失败必须弹 toast：{arm}");
     }
 }
 
