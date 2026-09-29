@@ -86,7 +86,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 ; 需要高完整性的 bridge 由下面的 [Code] 注册的计划任务以 HighestAvailable 拉起，各就各位。
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Flags: nowait; Check: WizardSilent; runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 ; ─────────────────────────── 常驻计划任务（per-machine 安装的附带动作）───────────
 ;
