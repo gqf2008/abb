@@ -46,9 +46,10 @@ mod win {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, TRUE};
     use windows::Win32::System::Threading::{
-        CreateProcessWithTokenW, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-        WaitForSingleObject, CREATE_NO_WINDOW, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+        CreateProcessAsUserW, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+        WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
@@ -209,11 +210,23 @@ mod win {
             };
             let mut pi = PROCESS_INFORMATION::default();
             let mut cmdline = build_command_line(&program, &args);
-            let r = CreateProcessWithTokenW(
+            // 三个 std 句柄必须是**可继承**的，子进程才拿得到（否则 agent 的 stdio 全空）。
+            for h in [si.hStdInput, si.hStdOutput, si.hStdError] {
+                if !h.is_invalid() {
+                    let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+                }
+            }
+            // 用 CreateProcessAsUserW 而不是 CreateProcessWithTokenW：后者**没有 bInheritHandles
+            // 参数**（子进程继承不到我们的 std 句柄，agent 的 stdio 会全空）—— 这是本程序的关键点。
+            // 它要求 SeAssignPrimaryTokenPrivilege + SeIncreaseQuotaPrivilege；管理员令牌默认具备
+            // （本地策略「替换一个进程级令牌」/「调整进程的内存配额」），故这里不再显式提权启用。
+            let r = CreateProcessAsUserW(
                 token,
-                LOGON_WITH_PROFILE,
                 PCWSTR::null(),
                 PWSTR(cmdline.as_mut_ptr()),
+                None,
+                None,
+                TRUE,
                 CREATE_NO_WINDOW,
                 None,
                 PCWSTR::null(),
@@ -223,7 +236,7 @@ mod win {
             let _ = CloseHandle(token);
             if r.is_err() {
                 eprintln!(
-                    "abb-spawner: CreateProcessWithTokenW 失败（{}），未启动 {program}",
+                    "abb-spawner: CreateProcessAsUserW 失败（{}），未启动 {program}",
                     windows::core::Error::from_win32()
                 );
                 return EXIT_SPAWN;
