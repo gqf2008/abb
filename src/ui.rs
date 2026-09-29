@@ -2024,6 +2024,12 @@ pub fn run_gui() -> Result<()> {
 
     // ── 后台 tokio 线程：处理慢操作（HTTP/起停），结果回主线程 ──
     let tray_weak_bg = tray.as_weak();
+    // 评审 R22 的 P8c：授权停止**失败/被取消**时要看得见（否则点了「停止」像没反应）。
+    // `slint::Timer`/`Rc<Cell<_>>` 都不是 Send，不能进后台线程 —— 这里只跨线程传字符串，
+    // 由 UI 线程的 2s 定时器负责弹出（复用未读提醒那套 toast + 5s 自动收起）。
+    let stop_fail_toast: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let stop_fail_toast_bg = stop_fail_toast.clone();
     // 版本升级：最近一次检查发现的可用新版本（CheckUpdate 写，InstallUpdate 读）
     let latest_rel =
         std::sync::Arc::new(std::sync::Mutex::new(None::<crate::updater::LatestRelease>));
@@ -2043,6 +2049,10 @@ pub fn run_gui() -> Result<()> {
                         // 本批起「停止」需要授权（owner：服务不能被随便杀死）。
                         if let Err(e) = install::svc_stop_authorized() {
                             crate::log!("[watchdog] 停止服务未完成：{e:#}");
+                            // 交给 UI 线程弹 toast（见上面的 stop_fail_toast 说明）。
+                            if let Ok(mut slot) = stop_fail_toast_bg.lock() {
+                                *slot = Some(format!("停止未完成：{e}"));
+                            }
                         }
                         refresh(&tray_weak_bg);
                     }
@@ -4947,6 +4957,8 @@ pub fn run_gui() -> Result<()> {
         let notif_weak = notifications.as_weak();
         let notif_showing = notif_showing.clone();
         let notif_timer = notif_timer.clone();
+        // P8c：后台线程只在 `stop_fail_toast` 里放一句话，这里负责弹（见其定义处注释）。
+        let stop_fail_toast = stop_fail_toast.clone();
         // 虚拟 Bot 确认弹窗 weak（#75：解散/取消登记结果回填——成功关窗/失败可见）
         let vb_confirm_weak = vb_confirm.as_weak();
         // 确认弹窗待执行操作（失败重试时保留；成功才 take 清空）
@@ -4962,6 +4974,30 @@ pub fn run_gui() -> Result<()> {
                 let wk = wk.clone();
                 move || {
                     let _keep = &tray_hold;
+                    // P8c：授权停止失败/被取消 → 弹一次可见提示（与未读提醒同一套 toast + 5s 收起）
+                    let pending_toast = stop_fail_toast.lock().ok().and_then(|mut s| s.take());
+                    if let Some(msg) = pending_toast {
+                        if let Some(n) = notif_weak.upgrade() {
+                            n.set_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+                                NotifyRow {
+                                    sender: "ABB".into(),
+                                    bot: "服务".into(),
+                                    preview: msg.into(),
+                                    time: "".into(),
+                                },
+                            ]))));
+                            show_notifications_window(&n);
+                            notif_showing.set(true);
+                            let nw2 = notif_weak.clone();
+                            let sw2 = settings_weak.clone();
+                            let sh2 = notif_showing.clone();
+                            notif_timer.start(
+                                slint::TimerMode::SingleShot,
+                                Duration::from_secs(5),
+                                move || hide_notifications_window(&nw2, &sw2, &sh2),
+                            );
+                        }
+                    }
                     // 每 tick 只查一次进程状态（install::status 内部 fork ps，别重复查）
                     let st = install::status();
                     // 看门：意图=运行但进程不在 → 崩溃，重拉（用户手动停止会清 desired，不覆盖）
