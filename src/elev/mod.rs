@@ -80,6 +80,15 @@ pub const OP_STOP_BRIDGE_TASK: &str = "stop-bridge-task";
 /// 审计里给「解析不出 op」的请求用的占位名。
 pub const OP_UNKNOWN: &str = "<unknown>";
 
+/// 用户在 UAC 弹框上点「否」时，[`win::call_helper`] 返回的错误消息前缀。
+///
+/// **必须单一来源**（复评 R24/R25 观察项 O3）：产生方（`win::call_helper`）与消费方
+/// （`platform::stop_service_authorized` 用它判定「明确拒绝授权」）都引用本常量。
+/// 两边各写一份字面量时，只要有一边改了措辞，`contains()` 就会静默失配 —— 而失配的
+/// 后果是**把「用户拒绝授权」误判成「已授权」**（安全方向上的静默降级），所以这里用
+/// `const` 共享 + 守卫单测（见文件末尾 `elevation_cancelled_error_has_single_source`）堵死。
+pub const ERR_ELEVATION_CANCELLED: &str = "提权被取消";
+
 /// 提权出口允许执行的**全部**操作。表外一律 `invalid_op`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -1541,5 +1550,31 @@ mod tests {
             Some(v) => std::env::set_var(AUDIT_DIR_ENV, v),
             None => std::env::remove_var(AUDIT_DIR_ENV),
         }
+    }
+
+    /// 复评 R24/R25 观察项 O3：**「取消授权」的判据串必须单一来源**。
+    ///
+    /// 产生方 `win::call_helper` 与消费方 `platform::stop_service_authorized` 分处两个文件，
+    /// 任一边把措辞改成自己的字面量，`contains()` 就会静默失配 ⇒「用户拒绝授权」被当成
+    /// 「已授权」⇒ 停止服务不再需要授权。这是安全方向上的静默降级，所以做成源码级守卫：
+    /// 两侧都必须引用 [`ERR_ELEVATION_CANCELLED`]，且消费侧不允许再出现裸字面量。
+    #[test]
+    fn elevation_cancelled_error_has_single_source() {
+        let producer = include_str!("win.rs");
+        let consumer = include_str!("../platform.rs");
+        assert!(
+            producer.contains("ERR_ELEVATION_CANCELLED"),
+            "产生方（elev/win.rs）必须引用 ERR_ELEVATION_CANCELLED"
+        );
+        assert!(
+            consumer.contains("ERR_ELEVATION_CANCELLED"),
+            "消费方（platform.rs）必须引用 ERR_ELEVATION_CANCELLED"
+        );
+        assert!(
+            !consumer.contains("\"提权被取消"),
+            "消费方不得自带字面量（两侧会漂移）；请引用 ERR_ELEVATION_CANCELLED"
+        );
+        // 常量本身非空：否则 `contains("")` 恒真，判据会退化成「一律取消」。
+        assert!(!ERR_ELEVATION_CANCELLED.trim().is_empty());
     }
 }

@@ -1012,7 +1012,8 @@ pub struct HelperOutcome {
 
 /// 调用方侧：`runas` 拉起 helper → 连管道 → 发一个请求 → 读回响应 → 等 helper 退出。
 ///
-/// 本批**不接线**到 GUI/CLI（只在库内可用，尚无调用点）；真机执行需要 UAC 交互，留给
+/// 现已接线：`platform.rs` 的 Windows 分支用它执行 `stop-bridge-task` / `install-bridge-task` /
+/// `remove-bridge-task`（批 `abb-svc-persist-password-gate`）；真机执行需要 UAC 交互，留给
 /// owner 验证——本机不跑。
 pub fn call_helper(
     op: super::Op,
@@ -1061,7 +1062,11 @@ pub fn call_helper(
         let rc = unsafe { ffi::GetLastError() };
         // 用户在 UAC 弹框上点了「否」：这是明确的拒绝，不是故障。
         if rc == ERROR_CANCELLED {
-            return Err("提权被取消（用户在 UAC 弹框上拒绝）".to_string());
+            // 前缀必须用 `super::ERR_ELEVATION_CANCELLED`（单一来源）：调用方按它判「明确拒绝授权」。
+            return Err(format!(
+                "{}（用户在 UAC 弹框上拒绝）",
+                super::ERR_ELEVATION_CANCELLED
+            ));
         }
         return Err(format!("ShellExecuteExW(runas) 失败 rc={rc}"));
     }

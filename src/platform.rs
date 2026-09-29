@@ -1274,7 +1274,10 @@ pub fn stop_service_authorized() -> Result<()> {
         Err(e) => {
             // 复评 R24 §7-G2：**用户取消 UAC** 是明确拒绝，绝不能被下面「任务不存在」那条当成
             // 「已授权」—— 否则「停止要授权」在非托管形态下会被绕过（哪怕只能杀中完整性进程）。
-            let cancelled = e.to_string().contains("提权被取消");
+            // 复评 R25 观察项 O3：判据串与产生方共享同一常量，避免措辞漂移导致静默失配。
+            let cancelled = e
+                .to_string()
+                .contains(agent_bridge::elev::ERR_ELEVATION_CANCELLED);
             if !cancelled && svc_task_state() == SvcTask::Absent {
                 crate::log!(
                     "[svc] 常驻任务不存在（非托管形态）：已取得授权，交由调用方按 pid 停止（{e:#}）"

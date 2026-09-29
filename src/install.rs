@@ -565,23 +565,46 @@ mod installer_guards {
         }
     }
 
-    /// **B2 的必需二进制必须随包**（复评 R24 的阻塞项）：`abb-spawner.exe` 是 bridge 以
-    /// 高完整性跑时把 agent 降到桌面 shell 身份的唯一手段 —— 没打进安装包的话，装机版上
-    /// agent 会全部起不来（fail-closed 生效，不是静默提权，但功能不可用）。
+    /// **随包清单的守卫（系统性）**：`Cargo.toml` 里每个**非 macOS-only** 的 bin，
+    /// 都必须在安装脚本的 `[Files]` 里出现同名 `.exe`。
+    ///
+    /// 为什么做成通用规则：这个缺口连着被抓两轮 —— 先是 B2 的 `abb-spawner.exe`（复评 R24），
+    /// 再是授权停止要用的 `abb-elev-helper.exe`（复评 R25）。两者都是「代码里 spawn 同目录的
+    /// helper，但打包清单没带」⇒ 安装版上对应功能必然报「helper 不存在」。硬编码两条只能防这两
+    /// 个名字，通用规则能防下一个。
+    ///
+    /// 例外面（必须写清理由）：`abb-helper` 是 macOS 锁屏助手（非 macOS 平台只有占位 main），
+    /// Windows 包不需要它。
     #[test]
-    fn installer_ships_the_de_elevation_shim() {
+    fn installer_ships_every_non_macos_bin() {
+        const MACOS_ONLY_BINS: [&str; 1] = ["abb-helper"];
+        let manifest = include_str!("../Cargo.toml");
+        let mut checked = 0usize;
+        for block in manifest.split("[[bin]]").skip(1) {
+            let name = block
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("name = "))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .expect("[[bin]] 段必须有 name");
+            if MACOS_ONLY_BINS.contains(&name.as_str()) {
+                continue;
+            }
+            checked += 1;
+            let want_src = format!("release\\{name}.exe");
+            assert!(
+                code_lines()
+                    .iter()
+                    .any(|l| l.contains(&format!("{name}.exe")) && l.contains("DestDir")),
+                "安装包必须随带 {name}.exe（代码里会 spawn 同目录的这个二进制）"
+            );
+            assert!(
+                code_lines().iter().any(|l| l.contains(&want_src)),
+                "源路径必须是 target\\release\\{name}.exe"
+            );
+        }
         assert!(
-            code_lines()
-                .iter()
-                .any(|l| l.contains("abb-spawner.exe") && l.contains("DestDir")),
-            "安装包必须随带 abb-spawner.exe（B2 的降权启动器；缺了 agent 起不来）"
-        );
-        // 名字不能改：`agent_spawn::spawner_exe()` 按同目录的 `abb-spawner.exe` 找它。
-        assert!(
-            code_lines()
-                .iter()
-                .any(|l| l.contains(r#"..\target\release\abb-spawner.exe"#)),
-            "源路径必须是 target\\release\\abb-spawner.exe（与 bin 名一致）"
+            checked >= 2,
+            "至少应检查 abb-elev-helper 与 abb-spawner，实得 {checked}"
         );
     }
 
