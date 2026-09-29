@@ -40,6 +40,17 @@ fn need_de_elevate() -> bool {
     false
 }
 
+/// 「缺 shim」时用的占位路径：绝对路径 + **必然不存在**（评审 R23 B2-b）。
+///
+/// 用它而不是裸名，是为了避免 CreateProcess 的搜索顺序命中同名的其它程序；
+/// 也让单测能断言「绝对 && 不存在」（比只断言「不等于 program」有判别力）。
+fn missing_shim_path() -> String {
+    std::env::temp_dir()
+        .join(format!("abb-spawner-missing-{}.exe", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// 取「启动 agent 要用的程序 + 前置参数」：需要降权时是 `abb-spawner.exe -- <program>`，
 /// 否则就是 `<program>` 本身。
 ///
@@ -50,10 +61,14 @@ fn resolve(need: bool, shim: Option<std::path::PathBuf>, program: &str) -> (Stri
             shim.to_string_lossy().into_owned(),
             vec!["--".to_string(), program.to_string()],
         ),
-        // 已提权但没有 shim：故意指向一个必然不存在的路径 —— spawn 会明确失败，
+        // 已提权但没有 shim：指向一个**绝对且必然不存在**的路径 —— spawn 会明确失败，
         // 而不是「成功但带着管理员权限」（fail-closed）。
+        //
+        // 评审 R23 B2-b：原来用裸相对名 `abb-spawner.exe` 会被 CreateProcess 的搜索顺序
+        // （应用目录 → 当前目录 → System32 → PATH）先命中**别人**的同名程序 —— 那就等于
+        // 用未知程序去启动 agent。绝对路径 + 带 pid 的唯一名把这个面收掉。
         (true, None) => (
-            "abb-spawner.exe".to_string(),
+            missing_shim_path(),
             vec!["--".to_string(), program.to_string()],
         ),
         (false, _) => (program.to_string(), Vec::new()),
@@ -95,13 +110,18 @@ mod tests {
         assert_eq!(pre, vec!["--".to_string(), "claude".to_string()]);
     }
 
-    /// 已提权但**没有 shim**：fail-closed —— 仍指向 shim（必然不存在 ⇒ spawn 失败），
-    /// 绝不退化成「直接启动、继承管理员权限」。
+    /// 已提权但**没有 shim**：fail-closed —— 指向绝对且必然不存在的占位路径（spawn 必失败），
+    /// 绝不退化成「直接启动、继承管理员权限」，也不会命中 PATH 里的同名程序。
     #[test]
     fn elevated_without_shim_is_fail_closed() {
         let (exe, pre) = resolve(true, None, "claude");
-        assert_eq!(exe, "abb-spawner.exe");
         assert_eq!(pre, vec!["--".to_string(), "claude".to_string()]);
+        let path = std::path::Path::new(&exe);
+        assert!(
+            path.is_absolute(),
+            "必须是绝对路径（避免命中 PATH 同名程序）：{exe}"
+        );
+        assert!(!path.exists(), "占位路径必须不存在（fail-closed）：{exe}");
         assert!(
             !exe.contains("claude"),
             "不能退化成直接启动被降权对象：{exe}"

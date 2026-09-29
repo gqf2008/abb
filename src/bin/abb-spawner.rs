@@ -34,10 +34,12 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod win {
     use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::{
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+    };
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-        TOKEN_QUERY,
+        DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenPrimary, TokenUser,
+        TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
     };
     use windows::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -46,12 +48,17 @@ mod win {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, TRUE};
-    use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-        WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION,
-        PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+    use windows::Win32::System::Threading::{
+        CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
+        OpenProcessToken, WaitForSingleObject, CREATE_NO_WINDOW, LOGON_WITH_PROFILE,
+        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
     /// 退出码：用法错（没给 `--`/程序）。
     const EXIT_USAGE: i32 = 2;
@@ -76,12 +83,9 @@ mod win {
         Some((program, rest))
     }
 
-    /// 当前进程 pid 对应的会话里，找到 explorer.exe 的 pid。
-    ///
-    /// 为什么要 explorer：它由系统在用户登录会话里以**普通（中）完整性**启动，是"这台机器上
-    /// 该用户的普通权限身份"的权威代表（UAC 提权进程的令牌不是）。
+    /// toolhelp 扫全机找第一个 explorer.exe（`GetShellWindow` 的兜底路径）。
     fn explorer_pid() -> Option<u32> {
-        // SAFETY: 只读快照 + 固定大小结构体；句柄在本函数内关闭。
+        // SAFETY: 只读快照 + 固定大小结构体；句柄在函数内关闭。
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
             let mut entry = PROCESSENTRY32W {
@@ -91,13 +95,12 @@ mod win {
             let mut found = None;
             if Process32FirstW(snap, &mut entry).is_ok() {
                 loop {
-                    let name = String::from_utf16_lossy(
-                        &entry.szExeFile[..entry
-                            .szExeFile
-                            .iter()
-                            .position(|c| *c == 0)
-                            .unwrap_or(entry.szExeFile.len())],
-                    );
+                    let end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|c| *c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
                     if name.eq_ignore_ascii_case("explorer.exe") {
                         found = Some(entry.th32ProcessID);
                         break;
@@ -112,20 +115,93 @@ mod win {
         }
     }
 
-    /// 取 explorer 的**主令牌副本**（可跨进程用于 CreateProcessWithTokenW）。
+    /// 当前会话的**桌面 shell** pid：优先 `GetShellWindow()`（就是我们自己会话的 shell），
+    /// 取不到再退回 toolhelp 里第一个 explorer.exe。
+    ///
+    /// 评审 R23 B2-c：只按进程名找 explorer 会在多用户/快速切换的机器上选中**别人**的 shell，
+    /// 于是 agent 会以那个人的身份跑（读到别人的 `~/.claude`）。故这里①优先 GetShellWindow，
+    /// ②拿到令牌后**再校验 SID**（见 [`shell_token`]）。
+    fn shell_pid() -> Option<u32> {
+        // SAFETY: GetShellWindow 无参数；GetWindowThreadProcessId 只读。
+        unsafe {
+            let hwnd = GetShellWindow();
+            if !hwnd.is_invalid() {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid != 0 {
+                    return Some(pid);
+                }
+            }
+        }
+        explorer_pid()
+    }
+
+    /// 取某个**令牌句柄**里的用户 SID 的**原始字节**（用于「令牌是不是本用户」的硬校验）。
+    ///
+    /// 直接比字节而不是转字符串：少一次 LocalAlloc/格式转换（评审 R23 的「句柄生命周期最易错」），
+    /// SID 的内存布局是固定的（Revision/SubAuthorityCount/IdentifierAuthority/SubAuthority）。
+    fn token_user_sid_bytes(token: HANDLE) -> Option<Vec<u8>> {
+        // SAFETY: 两次 GetTokenInformation（第一次问长度），缓冲按 usize 对齐。
+        unsafe {
+            let mut len = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+            if len == 0 {
+                return None;
+            }
+            let words = (len as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buf = vec![0usize; words];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                len,
+                &mut len,
+            )
+            .ok()?;
+            // TOKEN_USER { User: SID_AND_ATTRIBUTES { Sid: PSID, .. } }
+            let sid = *(buf.as_ptr() as *const *const u8);
+            if sid.is_null() {
+                return None;
+            }
+            let count = *sid.add(1) as usize;
+            let size = 8 + 4 * count; // SID 头 8 字节 + 4 字节/子认证机构
+            Some(std::slice::from_raw_parts(sid, size).to_vec())
+        }
+    }
+
+    /// 本进程（当前用户）的 SID 字节。
+    fn own_sid() -> Option<Vec<u8>> {
+        // SAFETY: 打开自身令牌后立即关闭。
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+            let sid = token_user_sid_bytes(token);
+            let _ = CloseHandle(token);
+            sid
+        }
+    }
+
+    /// 取当前会话 shell 的**主令牌副本**，并校验它确实属于**本用户**（评审 R23 B2-c）。
     fn shell_token() -> Option<HANDLE> {
         // SAFETY: 句柄在失败路径逐个关闭；成功时返回的令牌句柄由调用方关闭。
         unsafe {
-            let pid = explorer_pid()?;
+            let pid = shell_pid()?;
             let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
             let mut token = HANDLE::default();
             let opened = OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &mut token);
             let _ = CloseHandle(proc);
             opened.ok()?;
+            // 硬校验：shell 令牌的用户必须与本进程一致 —— 否则在多用户机器上会把 agent
+            // 跑成别人的身份（能读到别人的凭据/配置）。不等就 fail-closed。
+            let shell_sid = token_user_sid_bytes(token);
+            let mine = own_sid();
+            if shell_sid.is_none() || mine.is_none() || shell_sid != mine {
+                let _ = CloseHandle(token);
+                return None;
+            }
             let mut dup = HANDLE::default();
             let r = DuplicateTokenEx(
                 token,
-                // 主令牌 + 全权（新进程要能用它 CreateProcessWithTokenW）
                 TOKEN_ALL_ACCESS,
                 None,
                 SecurityImpersonation,
@@ -211,22 +287,20 @@ mod win {
             let mut pi = PROCESS_INFORMATION::default();
             let mut cmdline = build_command_line(&program, &args);
             // 三个 std 句柄必须是**可继承**的，子进程才拿得到（否则 agent 的 stdio 全空）。
+            // 评审 R23 B2-a：`CreateProcessWithTokenW` 在 STARTF_USESTDHANDLES 下把这三个字段
+            // **原样拷给子进程**，只要句柄可继承即可（.NET 的 Process、wez/EleDo 的 deelevate
+            // 都这么用）—— 不需要 `CreateProcessAsUser*` 那条需要额外特权（SeAssignPrimaryToken）
+            // 的路。句柄可继承位在此显式设置，别依赖调用方恰好设过。
             for h in [si.hStdInput, si.hStdOutput, si.hStdError] {
                 if !h.is_invalid() {
                     let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
                 }
             }
-            // 用 CreateProcessAsUserW 而不是 CreateProcessWithTokenW：后者**没有 bInheritHandles
-            // 参数**（子进程继承不到我们的 std 句柄，agent 的 stdio 会全空）—— 这是本程序的关键点。
-            // 它要求 SeAssignPrimaryTokenPrivilege + SeIncreaseQuotaPrivilege；管理员令牌默认具备
-            // （本地策略「替换一个进程级令牌」/「调整进程的内存配额」），故这里不再显式提权启用。
-            let r = CreateProcessAsUserW(
+            let r = CreateProcessWithTokenW(
                 token,
+                LOGON_WITH_PROFILE,
                 PCWSTR::null(),
                 PWSTR(cmdline.as_mut_ptr()),
-                None,
-                None,
-                TRUE,
                 CREATE_NO_WINDOW,
                 None,
                 PCWSTR::null(),
@@ -236,10 +310,27 @@ mod win {
             let _ = CloseHandle(token);
             if r.is_err() {
                 eprintln!(
-                    "abb-spawner: CreateProcessAsUserW 失败（{}），未启动 {program}",
+                    "abb-spawner: CreateProcessWithTokenW 失败（{}），未启动 {program}",
                     windows::core::Error::from_win32()
                 );
                 return EXIT_SPAWN;
+            }
+            // 评审 R23 §3.2：把 agent 放进「句柄关闭即杀」的 Job Object —— bridge 侧 kill 的是
+            // **本 shim**，shim 一死 job 句柄由内核关闭 ⇒ agent 随之被杀，不会变孤儿。
+            // 这也是 ACP 的 kill_on_drop 语义在多一层进程后仍成立的关键。
+            if let Ok(job) = CreateJobObjectW(None, PCWSTR::null()) {
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let _ = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                let _ = AssignProcessToJobObject(job, pi.hProcess);
+                // job 句柄**故意不关**（HANDLE 是 Copy，`mem::forget` 无意义）：本进程退出
+                // 或被 kill 时，内核回收句柄表项 ⇒ KILL_ON_JOB_CLOSE 生效 ⇒ agent 随之被杀。
+                let _ = job;
             }
             // 等它结束并透传退出码：bridge 侧看到的仍是同一条管道 + 同一个"子进程"。
             let _ = WaitForSingleObject(pi.hProcess, u32::MAX);
@@ -269,6 +360,53 @@ mod win {
             );
             assert_eq!(split_args(v(&["abb-spawner.exe", "--"])), None);
             assert_eq!(split_args(v(&["abb-spawner.exe"])), None);
+        }
+
+        /// B2-f：`--` 之后的参数里再出现 `--`、以及空串参数，都必须原样保留。
+        #[test]
+        fn split_args_keeps_after_dashdash_verbatim() {
+            let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            assert_eq!(
+                split_args(v(&["abb-spawner.exe", "--", "claude", "--", "-p", ""])),
+                Some(("claude".to_string(), v(&["--", "-p", ""])))
+            );
+        }
+
+        /// B2-f：用系统自己的 `CommandLineToArgvW` 做**构造性**往返校验（不是自比对期望串）。
+        #[test]
+        fn command_line_round_trips_through_commandlinetoargvw() {
+            use windows::Win32::UI::Shell::CommandLineToArgvW;
+            let cases: Vec<Vec<String>> = vec![
+                vec![
+                    "C:\\Program Files\\ABB\\agent-bridge.exe".into(),
+                    "--service".into(),
+                ],
+                vec!["claude".into(), "--acp".into(), "a b".into()],
+                vec!["x".into(), "".into(), "尾反斜杠\\".into(), "引\"号".into()],
+            ];
+            for (i, args) in cases.iter().enumerate() {
+                let prog = args[0].clone();
+                let mut line = build_command_line(&prog, &args[1..]);
+                // SAFETY: line 是 NUL 结尾的 UTF-16；返回的 argv 由 LocalFree 归还。
+                let mut n = 0i32;
+                let argv = unsafe { CommandLineToArgvW(PCWSTR(line.as_ptr()), &mut n) };
+                assert!(!argv.is_null(), "case {i}: CommandLineToArgvW 失败");
+                let got: Vec<String> = (0..n as isize)
+                    .map(|k| unsafe { (*argv.offset(k)).to_string().unwrap_or_default() })
+                    .collect();
+                unsafe {
+                    // LocalFree 收 HLOCAL（新类型）：直接构造，不再包 Option（0.58 的签名是
+                    // `LocalFree(hlocal: Option<HLOCAL>)`? —— 这里按编译错误给出的 Param 形态调）
+                    let _ = windows::Win32::Foundation::LocalFree(
+                        windows::Win32::Foundation::HLOCAL(argv as *mut core::ffi::c_void),
+                    );
+                }
+                assert_eq!(
+                    got, *args,
+                    "case {i}: 往返不一致（构造的命令行解析回来不同）"
+                );
+                line.clear();
+            }
         }
 
         #[test]

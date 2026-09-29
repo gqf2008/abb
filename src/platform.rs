@@ -715,6 +715,14 @@ pub fn restart_service_supervised() -> Result<()> {
     anyhow::bail!("Linux 暂未实现平台级托管（bridge 由托盘看门狗代管）")
 }
 
+/// Linux：无托管则无「托管启动」。
+///
+/// 评审 R23 §3.1：`install::svc_start` 无条件调本函数，缺这个 stub 会让非 mac/win 目标编译红。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn start_service_supervised() -> Result<()> {
+    anyhow::bail!("Linux 暂未实现平台级托管（bridge 由托盘看门狗代管）")
+}
+
 /// Linux：授权停止未实现——**不静默降级成无授权停止**。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn stop_service_authorized() -> Result<()> {
@@ -1258,8 +1266,21 @@ fn call_elev(op: agent_bridge::elev::Op) -> Result<agent_bridge::elev::Response>
 /// helper 起不来 ⇒ 这里报错，调用方据此提示「未停止」（**不会**静默降级成无授权停止）。
 #[cfg(target_os = "windows")]
 pub fn stop_service_authorized() -> Result<()> {
-    call_elev(agent_bridge::elev::Op::StopBridgeTask)?;
-    Ok(())
+    // 评审 R23 §3.4：**任务不存在**时 `schtasks /end` 必然失败（退出码 1），但这不是「没授权」——
+    // 那说明 bridge 现在不是计划任务管的（例如刚关过自启、bridge 被看门狗拉成托盘子进程）。
+    // 这种情形要把「已授权」交给调用方，由它走 pid 兜底真停掉（否则点「停止」永远失败、服务还在跑）。
+    match call_elev(agent_bridge::elev::Op::StopBridgeTask) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if svc_task_state() == SvcTask::Absent {
+                crate::log!(
+                    "[svc] 常驻任务不存在（非托管形态）：已取得授权，交由调用方按 pid 停止（{e:#}）"
+                );
+                return Ok(());
+            }
+            Err(e)
+        }
+    }
 }
 
 /// **安装器专用**：以管理员身份登记 bridge 常驻任务（`agent-bridge.exe --install-bridge-task`）。

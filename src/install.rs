@@ -499,17 +499,48 @@ mod upgrade_call_site_tests {
 mod installer_guards {
     const ISS: &str = include_str!("../app-assets/ABB.iss");
 
+    /// 安装脚本里的**代码行**（去掉注释行与行尾注释）。
+    ///
+    /// 评审 R23 §3.3：只对整份文本做子串匹配会被「注释里写一遍」顶住（假绿）——
+    /// 例如把 `PrivilegesRequired=lowest` 改回去、却在注释里保留 `PrivilegesRequired=admin`
+    /// 字样。故本组守卫一律只看代码行。
+    fn code_lines() -> Vec<&'static str> {
+        ISS.lines()
+            .filter(|l| !l.trim_start().starts_with(';'))
+            .collect()
+    }
+
+    /// 代码行里是否存在以 `key=` 开头（忽略缩进）的指令，且其值等于 `value`。
+    fn directive_is(key: &str, value: &str) -> bool {
+        code_lines().iter().any(|l| {
+            let t = l.trim();
+            if let Some(rest) = t.strip_prefix(key) {
+                rest.trim_start()
+                    .strip_prefix('=')
+                    .map(|v| v.trim() == value)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    }
+
     /// 程序必须装在**普通用户不可写**的位置、且安装需要管理员：这是「以 HighestAvailable 常驻」
     /// 的前提（否则普通进程一次 UAC 后改写 exe 即可持久化提权）。
     #[test]
     fn installer_requires_admin_and_installs_under_program_files() {
         assert!(
-            ISS.contains("PrivilegesRequired=admin"),
-            "安装器必须要求管理员（per-machine）；per-user 安装会让常驻 exe 落在用户可写目录：\n{ISS}"
+            directive_is("PrivilegesRequired", "admin"),
+            "安装器必须要求管理员（per-machine）；per-user 安装会让常驻 exe 落在用户可写目录"
         );
         assert!(
-            ISS.contains(r"DefaultDirName={autopf}\ABB"),
-            "程序必须装到 autopf（Program Files，普通用户不可写），不能再用 localappdata：\n{ISS}"
+            directive_is("DefaultDirName", r"{autopf}\ABB"),
+            "程序必须装到 autopf（Program Files，普通用户不可写），不能再用 localappdata"
+        );
+        // 反向：这两个值**不得**在代码行里出现（防「注释里写 admin、代码里偷偷改回 lowest」）
+        assert!(
+            !code_lines().iter().any(|l| l.contains("localappdata")),
+            "代码行里不得再出现 localappdata（per-machine 的前提）"
         );
     }
 
@@ -518,8 +549,8 @@ mod installer_guards {
     #[test]
     fn installer_relaunches_tray_as_original_user() {
         // 直接按"拉起托盘的 [Run] 行"的特征筛选（不依赖 `[Run]` 段头的位置：注释里也出现过这个词）。
-        let launches = ISS
-            .lines()
+        let launches = code_lines()
+            .into_iter()
             .filter(|l| {
                 let t = l.trim_start();
                 t.starts_with("Filename:") && t.contains("--wait-lock")
@@ -539,15 +570,19 @@ mod installer_guards {
     #[test]
     fn installer_registers_and_removes_the_bridge_task_via_our_binary() {
         assert!(
-            ISS.contains("'--install-bridge-task'"),
-            "安装器必须调用我们自己的隐藏子命令登记任务（XML 单一定义在 svc_task.rs）：\n{ISS}"
+            code_lines()
+                .iter()
+                .any(|l| l.contains("'--install-bridge-task'")),
+            "安装器必须调用我们自己的隐藏子命令登记任务（XML 单一定义在 svc_task.rs）"
         );
         assert!(
             !ISS.contains("<RunLevel>HighestAvailable</RunLevel>"),
             "安装脚本里不得重写一份任务 XML（会与 src/svc_task.rs 漂移）"
         );
         assert!(
-            ISS.contains("/delete /tn ' + BridgeTaskName"),
+            code_lines()
+                .iter()
+                .any(|l| l.contains("/delete /tn ' + BridgeTaskName")),
             "卸载时必须删掉常驻任务，别留孤儿"
         );
     }
