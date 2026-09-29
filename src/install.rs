@@ -546,6 +546,12 @@ mod installer_guards {
 
     /// 托盘必须用 `runasoriginaluser` 拉起：安装器已是管理员，否则管理员令牌会传染给托盘
     /// spawn 的 claude/codex（agent 带管理员权限）。bridge 的高完整性由计划任务单独负责。
+    ///
+    /// **必须钉「写在 `Flags:` 值里」而不是「这行出现过这个词」**：`runasoriginaluser` 在
+    /// Inno 里是**标志（flag）**，写成独立参数位（`… Flags: nowait; runasoriginaluser`）会被
+    /// ISCC 直接拒绝 —— 实测报 `Error on line 89 …: Unrecognized parameter name
+    /// "runasoriginaluser"`，整条 Build & Release 的 windows job 失败、release job 被跳过
+    /// （CI run `36545793263`）。旧写法只断言子串，所以这种「写错位置」的形态照样绿。
     #[test]
     fn installer_relaunches_tray_as_original_user() {
         // 直接按"拉起托盘的 [Run] 行"的特征筛选（不依赖 `[Run]` 段头的位置：注释里也出现过这个词）。
@@ -558,9 +564,15 @@ mod installer_guards {
             .collect::<Vec<_>>();
         assert_eq!(launches.len(), 2, "交互/静默两条拉起，实得：{launches:?}");
         for l in launches {
+            // 取 `Flags:` 的值（到该行下一个 `;` 为止，参数是 `;` 分隔的键值对）。
+            let flags = l
+                .split_once("Flags:")
+                .map(|(_, rest)| rest.split(';').next().unwrap_or(""))
+                .unwrap_or("");
             assert!(
-                l.contains("runasoriginaluser"),
-                "每条拉起都必须带 runasoriginaluser（否则托盘以管理员身份跑）：{l}"
+                flags.split_whitespace().any(|f| f == "runasoriginaluser"),
+                "每条拉起都必须把 runasoriginaluser 写在 `Flags:` 值里（写到参数位 ISCC 会报 \
+                 Unrecognized parameter name ⇒ 打包失败；缺了它托盘会以管理员身份跑）：{l}"
             );
         }
     }
