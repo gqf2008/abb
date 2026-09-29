@@ -6,6 +6,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod agent;
+mod agent_spawn;
 mod agents_md;
 mod attachments;
 mod botstatus;
