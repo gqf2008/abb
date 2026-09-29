@@ -5040,7 +5040,10 @@ pub fn run_gui() -> Result<()> {
                     // 看门：意图=运行但进程不在 → 崩溃，重拉（用户手动停止会清 desired，不覆盖）
                     if install::is_desired() && !st.running {
                         crate::log!("[watchdog] service 意外退出，自动重拉");
-                        let _ = install::svc_start();
+                        // 反评 R29 P3：自动重拉失败也不能零留痕（这是全仓最后一处 `let _ =` 丢弃 Err）。
+                        if let Err(e) = install::svc_start() {
+                            crate::log!("[watchdog] 自动重拉失败：{e:#}");
+                        }
                     }
                     if let Some(t) = tray_weak.upgrade() {
                         push_status(&t, &st);

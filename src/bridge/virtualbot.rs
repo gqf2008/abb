@@ -1459,10 +1459,15 @@ fn parse_trash_cmd(text: &str) -> Option<TrashCmd> {
 /// 被 EDR 拦还是初始化失败（2026-09-29 owner 实报）。
 fn agent_down_reason(detail: Option<String>) -> String {
     match detail {
-        Some(d) if !d.trim().is_empty() => format!(
-            "agent 未就绪（启动失败/崩溃退避中）：{}（详情见日志 logs/bridge.out 的 [acp] 行）",
-            crate::agent::truncate(d.trim(), 160)
-        ),
+        Some(d) if !d.trim().is_empty() => {
+            // 复评 R29 P3：detail 可能带换行/控制字符（多行错误、制表），直接进 IM 单行提示会
+            // 把消息撑成多行甚至被通道截断 —— 折成单空格再截断（按字符，UTF-8 安全）。
+            let flat = d.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(
+                "agent 未就绪（启动失败/崩溃退避中）：{}（详情见日志 logs/bridge.out 的 [acp] 行）",
+                crate::agent::truncate(&flat, 160)
+            )
+        }
         _ => "agent 未就绪（启动失败/崩溃退避中），本轮无法执行（详情见日志 logs/bridge.out 的 [acp] 行）"
             .to_string(),
     }
@@ -1498,6 +1503,17 @@ mod agent_down_reason_tests {
             "长原因必须截断（不能把几百行日志塞进一条 IM 回复）：{}",
             s.chars().count()
         );
+    }
+
+    /// 多行/带控制字符的原因必须折成单行（IM 提示是单行文案；多行会被通道截断或撑坏形态）。
+    #[test]
+    fn reason_flattens_multiline_cause() {
+        let s = agent_down_reason(Some("spawn 失败\n  caused by:\tEDR 拦截\r\n".into()));
+        assert!(
+            !s.contains('\n') && !s.contains('\r') && !s.contains('\t'),
+            "{s:?}"
+        );
+        assert!(s.contains("caused by: EDR 拦截"), "折叠后仍要保内容：{s:?}");
     }
 }
 

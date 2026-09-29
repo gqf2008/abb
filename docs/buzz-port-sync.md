@@ -14,6 +14,8 @@
 
 ## 文件处置表（相对 c3132c3）
 
+> 表中每行都是超长单行，后续追加说明统一记在文末「移植区变更追加登记」（同一张表的续页）。
+
 | 上游文件 | 处置 | 说明 |
 |---|---|---|
 | `queue.rs` / `pool.rs`（同步区） | ABB 扩展字段 | P0.B：`PromptChannelInfo.workspace` + `NewSessionChannelContext.workspace`——session/new 的 cwd 与 `<workspace>` 段按频道工作区（vb 群=vb/<uuid>、普通=bot 工作区）取真值，None 回落 handle cwd；上游同步时保留该字段与其透传 |
@@ -64,7 +66,7 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
 
-## 移植区变更追加登记（不逐个改写上表长行）
+# 移植区变更追加登记（不逐个改写上表长行）
 
 上表每行都是超长单行，追加说明容易改坏原行；新变更登记在本节，格式与上表同义（文件 / 处置 / 说明）。
 

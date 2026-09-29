@@ -647,12 +647,6 @@ mod upgrade_call_site_tests {
     }
 }
 
-/// 安装器（`app-assets/ABB.iss`）的**安全前提**守卫 —— 平台无关（纯文本断言），任何平台都能跑。
-///
-/// 为什么值得钉：这几条不是"配置偏好"，而是本批「登录后服务不能被随便杀死」能成立的前提 ——
-/// 一旦有人在改安装脚本时把它们删掉，Windows 上就会静默退回「高完整性常驻 + 用户可写 exe」
-/// 的持久化提权形态，而门禁全绿、CI 全绿（`.iss` 只在发版时编译，跑不到单测）。评审 R22 的
-/// P2 就是这么被发现的，故补成可红可绿的断言。
 /// 「服务动作失败不得静默」的源码守卫（2026-09-29 owner 实报：Windows 上停不了/重启不了也没提示）。
 ///
 /// 为什么用源码守卫：两条缺陷都在**异侧/异路径**（Windows 的 taskkill 分支、GUI 的重启命令臂），
@@ -662,13 +656,14 @@ mod svc_action_guards {
     /// `terminate_with_grace` 的 Windows 分支必须收集输出并校验退出码。
     #[test]
     fn windows_terminate_checks_taskkill_result() {
-        let src = include_str!("install.rs");
-        // 只看 taskkill **那一条语句**的调用链（到第一个 `;` 为止）与它后面一小段窗口：
-        // 直接切「到下一个 fn 为止」会把后面的测试模块一起圈进来（.spawn() 是测试在起进程），
-        // 属于守卫自匹配——本项目已经踩过一次（子串式守卫顶住自己）。
+        // **必须过 `src_lf`**：本仓没有 `.gitattributes` 强制 LF，Windows 检出（windows-latest +
+        // core.autocrlf）是 CRLF；而下面要按偏移取窗口。复评 R29 的 P1 实测：不过这一层时裸字节
+        // 切片会切在多字节字符中间 ⇒ windows 的 `cargo test` 直接 panic（本机 macOS 全绿）。
+        let src = crate::platform::src_lf(include_str!("install.rs"));
+        // 只看 taskkill **那一条语句**的调用链（到第一个 `;` 为止）：切到「下一个 fn」会把
+        // 后面的测试模块一起圈进来（`.spawn()` 是测试在起进程），属于守卫自匹配。
         let idx = src.find("\"taskkill\"").expect("应调用 taskkill");
-        let window = &src[idx..(idx + 900).min(src.len())];
-        let stmt = window.find(';').map(|i| &window[..i]).unwrap_or(window);
+        let stmt = src[idx..].split(';').next().unwrap_or("");
         assert!(
             stmt.contains(".output()"),
             "taskkill 必须用 .output() 收集输出（火并忘的 .spawn() 会让 Access Denied 静默）：{stmt}"
@@ -677,6 +672,8 @@ mod svc_action_guards {
             !stmt.contains(".spawn()"),
             "不得再对 taskkill 火并忘（.spawn()）：2026-09-29 owner 实报的静默缺陷就是这么来的"
         );
+        // 退出码校验在同一分支的后续几行：按**字符**取有界窗口，别用裸字节偏移（CRLF/多字节安全）。
+        let window: String = src[idx..].chars().take(600).collect();
         assert!(
             window.contains("status.success()"),
             "必须校验 taskkill 退出码，失败要 bail"
@@ -686,12 +683,16 @@ mod svc_action_guards {
     /// GUI 的「重启」命令臂必须把错误放进 toast（只 log! = 用户看到「点了没反应」）。
     #[test]
     fn gui_restart_arm_surfaces_failure() {
-        let ui = include_str!("ui.rs");
+        let ui = crate::platform::src_lf(include_str!("ui.rs"));
         let arm = ui
             .split("UiCmd::Restart =>")
             .nth(1)
             .expect("ui.rs 应有 UiCmd::Restart 命令臂");
-        let arm = &arm[..arm.find("UiCmd::OpenLogs").unwrap_or(400)];
+        // 到下一个命令臂为止；找不到就退回固定**字符**数窗口（不用字节偏移，CRLF 下不安全）。
+        let arm: String = match arm.find("UiCmd::OpenLogs") {
+            Some(end) => arm[..end].to_string(),
+            None => arm.chars().take(400).collect(),
+        };
         assert!(
             arm.contains("if let Err(e) = install::svc_restart()"),
             "重启臂必须检查错误：{arm}"
