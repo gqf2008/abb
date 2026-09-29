@@ -446,6 +446,15 @@ pub fn hide_dock() {}
 #[cfg(target_os = "macos")]
 const LOGIN_ITEM_LABEL: &str = "com.sqb.agent-bridge.gui";
 
+/// bridge 常驻 job 的标签（**新增**：与托盘 job 分开记账）。
+///
+/// 为什么要拆两个 job：本批要求「登录后 bridge 独立于托盘存活、托盘退出不受影响」。
+/// 旧形态是托盘拉起 `--service` 子进程，托盘一退（`on_quit_app`）子进程就被杀；改成
+/// launchd 直接托管 `--service` 之后，托盘只是客户端。launchd 按标签记账，**只能新增
+/// 不能更名**（更名会让存量用户的旧 job 变孤儿）。
+#[cfg(target_os = "macos")]
+const SERVICE_ITEM_LABEL: &str = "com.sqb.agent-bridge.service";
+
 /// 自启 plist 与当前二进制的关系（判定见 [`login_item_state_at`]）。
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
@@ -488,6 +497,35 @@ fn xml_unescape(s: &str) -> String {
 /// plist 留下的）就是这个键的产物，自愈重写 plist 时不能把它弄丢。
 #[cfg(target_os = "macos")]
 fn build_login_plist(exe: &std::path::Path, logs: &std::path::Path) -> String {
+    build_plist(LOGIN_ITEM_LABEL, exe, logs, &[], "gui")
+}
+
+/// bridge 常驻 job 的 plist：`ProgramArguments = [exe, --service]`。
+///
+/// 与托盘 job 的差别只有参数（以及日志文件名）：`KeepAlive` 两边都带，这正是本批
+/// 「登录后 bridge 不能被随便杀死」在 macOS 侧的答案——被 `kill -9` 也会被 launchd 拉回
+/// （`ThrottleInterval` 10s 内不重拉，防抖）。
+#[cfg(target_os = "macos")]
+fn build_service_plist(exe: &std::path::Path, logs: &std::path::Path) -> String {
+    build_plist(SERVICE_ITEM_LABEL, exe, logs, &["--service"], "service")
+}
+
+/// LaunchAgent plist 模板（托盘 job 与 bridge job 共用）。
+///
+/// `args` = `ProgramArguments` 里 exe 之后的参数；`log_stem` 决定 stdout/stderr 落到
+/// `logs/<stem>.out|.err`（托盘 gui.*、bridge service.*，便于分开排查）。
+#[cfg(target_os = "macos")]
+fn build_plist(
+    label: &str,
+    exe: &std::path::Path,
+    logs: &std::path::Path,
+    args: &[&str],
+    log_stem: &str,
+) -> String {
+    let extra: String = args
+        .iter()
+        .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
+        .collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -498,7 +536,7 @@ fn build_login_plist(exe: &std::path::Path, logs: &std::path::Path) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
-  </array>
+{extra}  </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -515,11 +553,39 @@ fn build_login_plist(exe: &std::path::Path, logs: &std::path::Path) -> String {
 </dict>
 </plist>
 "#,
-        label = xml_escape(LOGIN_ITEM_LABEL),
+        label = xml_escape(label),
         exe = xml_escape(&exe.display().to_string()),
-        out = xml_escape(&logs.join("gui.out").display().to_string()),
-        err = xml_escape(&logs.join("gui.err").display().to_string()),
+        out = xml_escape(&logs.join(format!("{log_stem}.out")).display().to_string()),
+        err = xml_escape(&logs.join(format!("{log_stem}.err")).display().to_string()),
     )
+}
+
+/// 取 `ProgramArguments` 里的**全部** `<string>`（已 XML 还原）。
+///
+/// 与 [`plist_program_argument`] 的区别：它只取第一个（判「登记的是不是当前二进制」），
+/// 本函数用于判 bridge job 的**参数**是否为 `--service`——只认自己的 schema，读不出就
+/// 返回空向量（调用方据此判 Drifted/Absent，绝不猜）。
+#[cfg(target_os = "macos")]
+fn plist_program_arguments(text: &str) -> Vec<String> {
+    let Some(rest) = text.split("<key>ProgramArguments</key>").nth(1) else {
+        return Vec::new();
+    };
+    let Some(arr) = rest
+        .split("<array>")
+        .nth(1)
+        .and_then(|a| a.split("</array>").next())
+    else {
+        return Vec::new();
+    };
+    arr.split("<string>")
+        .skip(1)
+        .filter_map(|s| s.split("</string>").next())
+        .map(|s| {
+            s.replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
+        })
+        .collect()
 }
 
 /// 取 plist 里 `ProgramArguments` 数组的第一个 `<string>`（已 XML 还原）。自己写的
@@ -561,11 +627,46 @@ fn login_item_state_at(plist: &std::path::Path, current: &std::path::Path) -> Lo
     }
 }
 
+/// 自启的**合并状态**：托盘 job 与 bridge job 必须都在且都指向当前二进制。
+///
+/// 刻意把「一侧在、另一侧缺」判成 [`LoginItem::Drifted`]（而不是 Absent）：存量用户只有
+/// 托盘 job，本批要给他补 bridge job —— 归到 Drifted 正好落进 `heal_autostart` 的自愈路径
+/// （「用户已经开过自启 → 按当前二进制重建」），开关也继续显示「开」，不会回显说谎。
 #[cfg(target_os = "macos")]
-fn login_item_state() -> LoginItem {
-    match current_exe() {
-        Ok(exe) => login_item_state_at(&login_item_plist(), &exe),
-        Err(_) => LoginItem::Absent,
+fn autostart_state() -> LoginItem {
+    let Ok(exe) = current_exe() else {
+        return LoginItem::Absent;
+    };
+    autostart_state_at(&login_item_plist(), &service_item_plist(), &exe)
+}
+
+/// [`autostart_state`] 的路径可注入版（单测不碰真实 `~/Library/LaunchAgents`）。
+#[cfg(target_os = "macos")]
+fn autostart_state_at(
+    tray_plist: &std::path::Path,
+    svc_plist: &std::path::Path,
+    exe: &std::path::Path,
+) -> LoginItem {
+    let svc = |p: &std::path::Path| -> LoginItem {
+        match login_item_state_at(p, exe) {
+            LoginItem::Matches => {
+                let text = std::fs::read_to_string(p).unwrap_or_default();
+                if plist_program_arguments(&text)
+                    .iter()
+                    .any(|a| a == "--service")
+                {
+                    LoginItem::Matches
+                } else {
+                    LoginItem::Drifted
+                }
+            }
+            other => other,
+        }
+    };
+    match (login_item_state_at(tray_plist, exe), svc(svc_plist)) {
+        (LoginItem::Matches, LoginItem::Matches) => LoginItem::Matches,
+        (LoginItem::Absent, LoginItem::Absent) => LoginItem::Absent,
+        _ => LoginItem::Drifted,
     }
 }
 
@@ -576,26 +677,57 @@ fn login_item_state() -> LoginItem {
 /// 回显说谎。
 #[cfg(target_os = "macos")]
 pub fn autostart_enabled() -> bool {
-    login_item_state() == LoginItem::Matches
+    autostart_state() == LoginItem::Matches
 }
 
 /// GUI 启动时自愈：plist 在但指向失效路径/旧副本 → 按当前二进制重建并 reload。
 /// 只动「用户已经开过自启」的配置——没有 plist 就是没开过，绝不擅自给人开。
 #[cfg(target_os = "macos")]
 pub fn heal_autostart() {
-    if login_item_state() != LoginItem::Drifted {
+    if autostart_state() != LoginItem::Drifted {
         return;
     }
-    crate::log!("[autostart] 自启项指向失效路径（App 被移动过？），按当前二进制重建");
+    crate::log!("[autostart] 自启项漂移/缺 bridge job，按当前二进制重建两个 job");
     // 只记「检测到漂移并发起重建」这一条事实；成没成由 `set_autostart` 单点自己记
     // （两处各写一遍早晚分叉，且这里写「已重载」在本会话跳过 bootout 时并不成立）。
-    log_autostart_event("自愈：自启项指向失效路径（App 被移动过？），发起按当前二进制重建");
+    log_autostart_event(
+        "自愈：自启项漂移或缺 bridge job（App 移动过/旧版只有托盘 job），发起按当前二进制重建",
+    );
     let _ = set_autostart(true);
 }
 
 /// 非 macOS、非 Windows（Linux）自启未实现，无自愈可言。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn heal_autostart() {}
+
+/// Linux：尚未实现「平台级托管」（没有 launchd/计划任务的对应物），如实 stub。
+///
+/// 与 [`heal_autostart`] 的 Linux stub 同一惯例：**宁可显式说未实现**，也不让调用方
+/// 在非 mac/win 上编译不过或静默走错分支（评审 P7）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn service_supervised() -> bool {
+    false
+}
+
+/// Linux：无托管则无托管重启。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn restart_service_supervised() -> Result<()> {
+    anyhow::bail!("Linux 暂未实现平台级托管（bridge 由托盘看门狗代管）")
+}
+
+/// Linux：无托管则无「托管启动」。
+///
+/// 评审 R23 §3.1：`install::svc_start` 无条件调本函数，缺这个 stub 会让非 mac/win 目标编译红。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn start_service_supervised() -> Result<()> {
+    anyhow::bail!("Linux 暂未实现平台级托管（bridge 由托盘看门狗代管）")
+}
+
+/// Linux：授权停止未实现——**不静默降级成无授权停止**。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn stop_service_authorized() -> Result<()> {
+    anyhow::bail!("Linux 暂未实现「授权停止服务」（bridge 由托盘生命周期管理）")
+}
 
 /// 自愈判据（纯函数，便于单测）：**只在**「用户意图为开」且「注册表实际缺失」时为真。
 /// 两个方向都不能判错：意图开+实际也在 = 无需动作；意图关 = 用户自己关的，绝不能替他
@@ -620,6 +752,15 @@ pub fn heal_autostart() {
     let logs = crate::bridge_dir().join("logs");
     let desired = autostart_desired_at(&logs);
     let registered = autostart_enabled();
+    // 服务常驻（计划任务）状态如实入审计：注册/删除任务都需要管理员授权，**自愈不弹授权框**
+    // （否则每次启动都弹 UAC）。所以这里只记录「用户想开自启、但常驻任务还没生效」，让他从
+    // autostart.log 看得出下一步是「开一次开关（会走一次 UAC）」。
+    if desired && service_persist_state() != "matches" {
+        log_autostart_event(&format!(
+            "服务常驻未生效（计划任务 {}）：注册需管理员授权，开一次「开机自启」开关即可补齐",
+            service_persist_state()
+        ));
+    }
     // 存量用户（升级前就开了自启、没留下意图标记）：只要键还在就补记意图，让以后被
     // 回滚时能自愈。此处只在「键在」时补记，不写注册表，无副作用。
     if !desired && registered {
@@ -672,12 +813,16 @@ pub fn set_autostart(enable: bool) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn set_autostart_impl(enable: bool) -> Result<()> {
     let plist = login_item_plist();
+    let svc_plist = service_item_plist();
     if !enable {
         // 顺序要紧：先删 plist（「下次登录不再自启」的硬判据，必须落定），再尽力摘掉
         // 本会话的 job。反过来先 bootout 会在「launchd 拉起的实例里点关」时当场把自己
         // 杀掉，删文件永远轮不到——用户看到 App 凭空退出而自启照旧（审查必修项）。
-        if plist.exists() {
-            std::fs::remove_file(&plist).with_context(|| "删除登录项失败")?;
+        for p in [&plist, &svc_plist] {
+            if p.exists() {
+                std::fs::remove_file(p)
+                    .with_context(|| format!("删除登录项失败: {}", p.display()))?;
+            }
         }
         // 再尽力摘本会话的 job；跑的是我们自己时 unload 内部会跳过（见其文档）。
         // 已知窄窗：跳过意味着 launchd 内存里那份定义还在——若它带 KeepAlive（本会话
@@ -685,6 +830,8 @@ fn set_autostart_impl(enable: bool) -> Result<()> {
         // 退出码 0 不复活，且 plist 已删 → 下次登录起彻底干净。宁可留这个窄窗，也不
         // 为改配置杀掉用户正在用的 App。
         unload_login_agent();
+        // bridge job 不是本进程（本进程是托盘）→ 直接 bootout，无自杀风险。
+        unload_agent_at(SERVICE_ITEM_LABEL, false);
         return Ok(());
     }
     let exe = current_exe()?;
@@ -697,8 +844,12 @@ fn set_autostart_impl(enable: bool) -> Result<()> {
     let _ = std::fs::create_dir_all(&logs);
     std::fs::write(&plist, build_login_plist(&exe, &logs))
         .with_context(|| format!("写登录项失败: {}", plist.display()))?;
+    // 本批新增：bridge 常驻 job（`--service`，KeepAlive）——托盘退出不再影响 bridge。
+    std::fs::write(&svc_plist, build_service_plist(&exe, &logs))
+        .with_context(|| format!("写 bridge 登录项失败: {}", svc_plist.display()))?;
     // reload 内部同样带防自杀保护：是我们自己就不重装载，新增的保活键下次登录生效。
-    reload_login_agent(&plist)
+    reload_login_agent(&plist)?;
+    reload_agent_at(SERVICE_ITEM_LABEL, &svc_plist, false)
 }
 
 /// 由 launchd 拉起的自启 job 是否就是本进程（**自杀保护的唯一判据**）。
@@ -737,7 +888,16 @@ fn parse_launchd_job_pid(print_out: &str) -> Option<u32> {
 /// 起的进程未必带它）。
 #[cfg(target_os = "macos")]
 fn reload_login_agent(plist: &std::path::Path) -> Result<()> {
-    if !unload_login_agent() {
+    reload_agent_at(LOGIN_ITEM_LABEL, plist, login_job_is_self())
+}
+
+/// 按标签重载一个 LaunchAgent（托盘 job 与 bridge job 共用）。
+///
+/// `is_self` = 「正在跑的那个 job 的进程就是本进程」——为真时跳过 bootout（摘它会杀掉
+/// 自己）。托盘 job 用 [`login_job_is_self`] 判；bridge job 由托盘调用时恒为 false。
+#[cfg(target_os = "macos")]
+fn reload_agent_at(label: &str, plist: &std::path::Path, is_self: bool) -> Result<()> {
+    if !unload_agent_at(label, is_self) {
         // 没摘成（正在跑的就是我们自己）→ 也别 bootstrap：同一 label 重复 bootstrap
         // 会失败。新写的文件已在磁盘上，下次登录 launchd 重读即生效。
         return Ok(());
@@ -765,14 +925,20 @@ fn reload_login_agent(plist: &std::path::Path) -> Result<()> {
 /// 保护做在这里而不是各调用点：以后谁再加一条 reload/unload 路径，不会绕开它。
 #[cfg(target_os = "macos")]
 fn unload_login_agent() -> bool {
-    if login_job_is_self() {
+    unload_agent_at(LOGIN_ITEM_LABEL, login_job_is_self())
+}
+
+/// 按标签 bootout（`is_self` 语义见 [`reload_agent_at`]）。
+#[cfg(target_os = "macos")]
+fn unload_agent_at(label: &str, is_self: bool) -> bool {
+    if is_self {
         crate::log!("[autostart] 跳过 bootout：该 job 正在运行的进程就是本进程（摘它会杀掉自己）");
         log_autostart_event(
             "跳过 launchctl bootout：正在跑的 job 进程就是本进程（摘它会杀掉自己）",
         );
         return false;
     }
-    let target = format!("gui/{}/{}", uid(), LOGIN_ITEM_LABEL);
+    let target = format!("gui/{}/{}", uid(), label);
     let _ = std::process::Command::new("launchctl")
         .args(["bootout", &target])
         .stdout(std::process::Stdio::null())
@@ -795,6 +961,127 @@ fn login_item_plist() -> PathBuf {
         .unwrap_or_default()
         .join("Library/LaunchAgents")
         .join(format!("{LOGIN_ITEM_LABEL}.plist"))
+}
+
+/// bridge job 的 plist 路径（文件名 == 标签名，同 [`login_item_plist`] 的约定）。
+#[cfg(target_os = "macos")]
+fn service_item_plist() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("Library/LaunchAgents")
+        .join(format!("{SERVICE_ITEM_LABEL}.plist"))
+}
+
+/// 停止由 launchd 托管的 bridge —— **需要管理员授权**。
+///
+/// 为什么停止要授权：owner 2026-09-28 要求「登录后服务不能被随便杀死，即使 tray 已经退出」。
+/// 托盘菜单里的「停止」若仍是单方面动作，就等于随手一停，与需求相反——所以走 macOS 系统
+/// 授权框（`osascript … with administrator privileges`，弹密码/Touch ID）。
+///
+/// 用户取消授权时 osascript 非 0 退出，这里**返回错误**而不是静默继续（调用方据此提示
+/// 「未停止」）；授权通过则记一条审计。
+///
+/// 诚实标注：launchd 本身允许同用户 bootout 自己的 agent，**加管理员授权是产品策略**
+/// （owner 2026-09-28 要求「停止必须授权」），不是技术必需。
+#[cfg(target_os = "macos")]
+pub fn stop_service_authorized() -> Result<()> {
+    let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+    let script = format!("launchctl bootout '{target}' 2>/dev/null || true");
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            "do shell script \"{script}\" with administrator privileges"
+        ))
+        .output()
+        .context("调 osascript 取管理员授权失败")?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("未获得管理员授权，服务未停止：{}", msg.trim());
+    }
+    // 复核（评审 P8）：脚本里的 `2>/dev/null || true` 会把 bootout 的失败也吞成成功，于是
+    // 「用户被告知已停止、服务还在跑」。授权已到手，这里直接回读 job 是否还在域里。
+    if job_loaded(&target) {
+        anyhow::bail!("launchctl bootout 未生效（job 仍在域里），服务未停止");
+    }
+    log_autostart_event(&format!(
+        "管理员授权通过：已 bootout {target}（停止 bridge）"
+    ));
+    Ok(())
+}
+
+/// bridge 是否已交给平台级 supervisor 托管（macOS=launchd job 存在；Windows=计划任务，B1b）。
+///
+/// 托管状态下**托盘不再自己起/杀 bridge**：起/杀都交给 supervisor，否则两边会抢
+/// `logs/service.pid` 与单实例锁（表现为反复拉起-退出）。
+#[cfg(target_os = "macos")]
+pub fn service_supervised() -> bool {
+    service_item_plist().exists()
+}
+
+/// 让 supervisor 重启 bridge（不经过托盘自己的 stop+start 路径）。
+///
+/// `kickstart -k` = 杀掉当前实例并立刻重起；这是「重启」这个动作在托管形态下的正确实现
+/// （用户没有要求给重启加授权，故不加）。
+///
+/// 评审 P5 的两点修正：① job 已不在域里（例如刚被授权停止过）时 `kickstart -k` 会失败 ⇒
+/// 退回 [`start_service_supervised`]；② 「启动」与「重启」是两件事，看门狗只该调前者。
+#[cfg(target_os = "macos")]
+pub fn restart_service_supervised() -> Result<()> {
+    let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+    if !job_loaded(&target) {
+        return start_service_supervised();
+    }
+    let out = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .output()
+        .context("执行 launchctl kickstart 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl kickstart 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// 托管形态下的「启动」：job 不在域里就 `bootstrap`，已在就什么都不做。
+///
+/// 与 [`restart_service_supervised`] 的区别是**不杀**正在跑的实例——看门狗「意图=运行但判活失败」
+/// 时走这条（评审 P5：以前走 kickstart -k，pid 文件滞后或冷启动 >2s 就形成抖动）。
+#[cfg(target_os = "macos")]
+pub fn start_service_supervised() -> Result<()> {
+    let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+    if job_loaded(&target) {
+        return Ok(());
+    }
+    let plist = service_item_plist();
+    if !plist.exists() {
+        anyhow::bail!("bridge 登录项不存在（未开自启？）：{}", plist.display());
+    }
+    let domain = format!("gui/{}", uid());
+    let out = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist.display().to_string()])
+        .output()
+        .context("执行 launchctl bootstrap 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// job 是否已在 launchd 域里（`launchctl print <target>` 成功 = 在）。
+#[cfg(target_os = "macos")]
+fn job_loaded(target: &str) -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ─────────────────────────── 自启变更审计（全平台） ───────────────────────────
@@ -884,6 +1171,175 @@ fn run_reg(args: &[&str]) -> std::io::Result<std::process::Output> {
     crate::spawn::command("reg").args(args).output()
 }
 
+/// 跑 schtasks（CREATE_NO_WINDOW：GUI 进程 spawn 控制台程序不弹黑框）。
+#[cfg(target_os = "windows")]
+fn run_schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
+    crate::spawn::command("schtasks").args(args).output()
+}
+
+/// bridge 常驻计划任务的状态（与 macOS 的 `LoginItem` 三态同构）。
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum SvcTask {
+    /// 任务不存在（没开过 / 被删）或查不出来。
+    Absent,
+    /// 任务在，且登记的 exe + `--service` 与当前二进制一致。
+    Matches,
+    /// 任务在但指向旧安装路径 / 缺 `--service`（升级换过目录、旧版任务）。
+    Drifted,
+}
+
+/// 查询任务：`schtasks /query /tn … /xml`，再按**字节**判 exe 与 `--service`
+/// （输出编码可能是 UTF-8 或 UTF-16LE；判据只需回答「是不是当前这套」，不解析 XML）。
+#[cfg(target_os = "windows")]
+fn svc_task_state() -> SvcTask {
+    let Ok(exe) = current_exe() else {
+        return SvcTask::Absent;
+    };
+    match run_schtasks(&["/query", "/tn", agent_bridge::svc_task::TASK_NAME, "/xml"]) {
+        Ok(o) if o.status.success() => {
+            if agent_bridge::svc_task::task_output_matches_exe(&o.stdout, &exe.to_string_lossy()) {
+                SvcTask::Matches
+            } else {
+                SvcTask::Drifted
+            }
+        }
+        // 任务不存在时 schtasks 非 0 退出（错误在 stderr）——当 Absent。
+        Ok(_) | Err(_) => SvcTask::Absent,
+    }
+}
+
+/// Windows：bridge 是否已交给计划任务托管（任务在且指向当前二进制）。
+///
+/// 托管后托盘不再自己 spawn/杀 bridge（见 `install::svc_start` / `svc_restart`）：计划任务带
+/// `RunLevel=HighestAvailable`（高完整性，同用户的中完整性进程杀不掉）与 `RestartOnFailure`，
+/// 比托盘的 2 秒看门狗更硬。
+#[cfg(target_os = "windows")]
+pub fn service_supervised() -> bool {
+    svc_task_state() == SvcTask::Matches
+}
+
+/// Windows：让计划任务重启 bridge（`/end` 再 `/run`）。
+///
+/// 不需要提权：任务属于当前用户，`/run`/`/end` 普通权限即可（与「停止服务」不同——后者是
+/// owner 要求的**授权动作**，走提权 helper）。
+#[cfg(target_os = "windows")]
+pub fn restart_service_supervised() -> Result<()> {
+    let _ = run_schtasks(&["/end", "/tn", agent_bridge::svc_task::TASK_NAME]);
+    let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
+        .context("执行 schtasks /run 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "schtasks /run 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// 调提权 helper 执行一个 op（UAC 由 helper 的 `runas` 触发）。
+///
+/// 结果双重校验：**退出码必须为 0**（提权包装必须透传子进程退出码）**且**响应 `ok`——
+/// 只看响应会把「helper 崩了但管道里残留半截数据」当成成功。
+#[cfg(target_os = "windows")]
+fn call_elev(op: agent_bridge::elev::Op) -> Result<agent_bridge::elev::Response> {
+    let outcome = agent_bridge::elev::win::call_helper(
+        op,
+        &serde_json::json!({}),
+        std::time::Duration::from_secs(120),
+    )
+    .map_err(|e| anyhow::anyhow!("拉起提权 helper 失败：{e}"))?;
+    if outcome.exit_code != 0 {
+        anyhow::bail!("提权 helper 退出码 {}（响应不可信）", outcome.exit_code);
+    }
+    let resp: agent_bridge::elev::Response =
+        serde_json::from_slice(&outcome.response).context("提权 helper 响应不是合法 JSON")?;
+    if !resp.ok {
+        anyhow::bail!("提权操作被拒绝/失败：{}（{}）", resp.reason, resp.code);
+    }
+    Ok(resp)
+}
+
+/// Windows：停止服务 —— **需要 UAC 授权**（owner 2026-09-28：不能被随便杀死）。
+///
+/// 走提权 helper 的白名单 op `stop-bridge-task`（`schtasks /end` + 审计）。用户取消 UAC 时
+/// helper 起不来 ⇒ 这里报错，调用方据此提示「未停止」（**不会**静默降级成无授权停止）。
+#[cfg(target_os = "windows")]
+pub fn stop_service_authorized() -> Result<()> {
+    // 评审 R23 §3.4：**任务不存在**时 `schtasks /end` 必然失败（退出码 1），但这不是「没授权」——
+    // 那说明 bridge 现在不是计划任务管的（例如刚关过自启、bridge 被看门狗拉成托盘子进程）。
+    // 这种情形要把「已授权」交给调用方，由它走 pid 兜底真停掉（否则点「停止」永远失败、服务还在跑）。
+    match call_elev(agent_bridge::elev::Op::StopBridgeTask) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // 复评 R24 §7-G2：**用户取消 UAC** 是明确拒绝，绝不能被下面「任务不存在」那条当成
+            // 「已授权」—— 否则「停止要授权」在非托管形态下会被绕过（哪怕只能杀中完整性进程）。
+            // 复评 R25 观察项 O3：判据串与产生方共享同一常量，避免措辞漂移导致静默失配。
+            let cancelled = e
+                .to_string()
+                .contains(agent_bridge::elev::ERR_ELEVATION_CANCELLED);
+            if !cancelled && svc_task_state() == SvcTask::Absent {
+                crate::log!(
+                    "[svc] 常驻任务不存在（非托管形态）：已取得授权，交由调用方按 pid 停止（{e:#}）"
+                );
+                return Ok(());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// **安装器专用**：以管理员身份登记 bridge 常驻任务（`agent-bridge.exe --install-bridge-task`）。
+///
+/// 为什么放在应用里而不是在 Inno 脚本里拼 XML：任务 XML 的单一定义在 `src/svc_task.rs`
+/// （UTF-16LE+BOM、转义、逐项设置都有单测）；安装器只是调这个隐藏子命令，避免两份 XML 漂移。
+///
+/// 用户取**本进程**（安装器已提权）的 SID：同用户 UAC 下就是安装者本人 ✓；over-the-shoulder
+/// 提权（标准用户 + 管理员凭据）时会落到管理员账号名下 —— 已知边界，运行时那条路（helper 的
+/// 「同用户」硬闸）会拒绝这种提权，故这里也只在装机时出现一次，不影响后续安全判定。
+#[cfg(target_os = "windows")]
+pub fn install_bridge_task_elevated() -> Result<()> {
+    use agent_bridge::elev::SysBackend;
+    let backend = agent_bridge::elev::win::WinlogonBackend;
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .context("拿不到当前可执行文件路径")?;
+    let sid = backend
+        .own_sid()
+        .map_err(|_| anyhow::anyhow!("拿不到当前用户 SID（提权了吗？）"))?;
+    backend
+        .install_bridge_task(&exe, &sid)
+        .map_err(|_| anyhow::anyhow!("schtasks 注册 bridge 常驻任务失败"))
+}
+
+/// Windows：服务常驻（计划任务）当前是否生效——供状态展示/自愈判断用。
+///
+/// 与 [`autostart_enabled`]（托盘自启 = Run 键）刻意分开：存量用户只有 Run 键，判据若耦合会
+/// 让他的开关突然显示「关」。补任务要显式动作（开自启开关）——注册任务需要 UAC，而自愈阶段
+/// **不弹**授权框（那会变成每次启动都弹）。
+/// Windows：托管形态下的「启动」= `schtasks /run`（任务在跑时 IgnoreNew 策略保证不重复起）。
+#[cfg(target_os = "windows")]
+pub fn start_service_supervised() -> Result<()> {
+    let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
+        .context("执行 schtasks /run 失败")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "schtasks /run 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn service_persist_state() -> &'static str {
+    match svc_task_state() {
+        SvcTask::Matches => "matches",
+        SvcTask::Drifted => "drifted",
+        SvcTask::Absent => "absent",
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn autostart_enabled() -> bool {
     run_reg(&["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
@@ -928,6 +1384,12 @@ fn autostart_desired_at(logs: &std::path::Path) -> bool {
 #[cfg(target_os = "windows")]
 fn set_autostart_impl(enable: bool) -> Result<()> {
     let exe = current_exe()?;
+    if enable {
+        // 顺序要紧：**先**注册常驻计划任务（要管理员授权），用户取消就整件事不成立——
+        // 不写 Run 键、不落意图标记（否则开关会显示「开」，而常驻其实没生效）。
+        call_elev(agent_bridge::elev::Op::InstallBridgeTask)
+            .context("注册 bridge 常驻计划任务失败（需要管理员授权）")?;
+    }
     let out = if enable {
         let val = format!("\"{}\"", exe.display());
         run_reg(&[
@@ -948,6 +1410,16 @@ fn set_autostart_impl(enable: bool) -> Result<()> {
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("设置开机自启失败: {}", msg.trim())
+    }
+    if !enable {
+        // 关自启 = 连常驻任务一起撤（否则「关了自启，服务还在后台跑」）。
+        // 用户取消授权时 Run 键已经删了，这里如实报错 + 落审计，让人知道任务还留着。
+        if let Err(e) = call_elev(agent_bridge::elev::Op::RemoveBridgeTask) {
+            log_autostart_event(&format!(
+                "⚠️ 删除 bridge 常驻计划任务失败（任务可能仍在，登录后会拉起服务）: {e:#}"
+            ));
+            return Err(e).context("删除 bridge 常驻计划任务失败（需要管理员授权）");
+        }
     }
     // 注册表动作成功后再落意图标记。顺序要紧：标记是「用户想要开/关」的唯一判据，
     // 若标记先落而注册表失败，下次自愈就会拿一个未兑现的意图去改用户配置。
@@ -1483,5 +1955,82 @@ mod tests {
             "contested 时不得为首 bot 建 dest（无其他可搬数据）"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 本批新增的 **bridge 常驻 job**：`ProgramArguments` 必须带 `--service`，且与托盘 job
+    /// 一样带 `KeepAlive`（被 kill 也拉回——这是「登录后服务不能被随便杀死」的 macOS 侧答案）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_plist_runs_service_with_keepalive() {
+        let built = build_service_plist(
+            std::path::Path::new("/Applications/ABB.app/Contents/MacOS/agent-bridge"),
+            std::path::Path::new("/logs"),
+        );
+        let args = plist_program_arguments(&built);
+        assert_eq!(
+            args,
+            vec![
+                "/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string(),
+                "--service".to_string()
+            ],
+            "bridge job 必须带 --service：{built}"
+        );
+        assert!(built.contains("<key>KeepAlive</key>"), "必须保活：{built}");
+        assert!(built.contains(SERVICE_ITEM_LABEL), "必须用新标签：{built}");
+        assert!(
+            built.contains("service.out") && built.contains("service.err"),
+            "bridge 日志要与托盘分开：{built}"
+        );
+        // 托盘 job 不受影响：仍然无参数、仍然保活。
+        let tray = build_login_plist(
+            std::path::Path::new("/Applications/ABB.app/Contents/MacOS/agent-bridge"),
+            std::path::Path::new("/logs"),
+        );
+        assert_eq!(plist_program_arguments(&tray).len(), 1, "{tray}");
+        assert!(tray.contains(LOGIN_ITEM_LABEL));
+        assert!(tray.contains("gui.out"), "{tray}");
+    }
+
+    /// 自启的**合并状态**：两个 job 都在才是「开」；只有托盘 job（存量用户）判 Drifted
+    /// ——归到 Drifted 才会落进 `heal_autostart` 自愈路径，给老用户补上 bridge job，
+    /// 同时托盘开关继续显示「开」（不回显说谎）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn autostart_state_requires_both_jobs_and_heals_legacy() {
+        let base = std::env::temp_dir().join(format!("abb-autostart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("agent-bridge");
+        std::fs::write(&exe, b"x").unwrap();
+        let tray = base.join("tray.plist");
+        let svc = base.join("svc.plist");
+        let logs = base.join("logs");
+
+        assert_eq!(autostart_state_at(&tray, &svc, &exe), LoginItem::Absent);
+
+        std::fs::write(&tray, build_login_plist(&exe, &logs)).unwrap();
+        assert_eq!(autostart_state_at(&tray, &svc, &exe), LoginItem::Drifted);
+
+        std::fs::write(&svc, build_service_plist(&exe, &logs)).unwrap();
+        assert_eq!(autostart_state_at(&tray, &svc, &exe), LoginItem::Matches);
+
+        std::fs::write(&svc, build_login_plist(&exe, &logs)).unwrap();
+        assert_eq!(autostart_state_at(&tray, &svc, &exe), LoginItem::Drifted);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `plist_program_arguments` 是多参解析 + XML 还原（`--service` 的判定依赖它）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_program_arguments_parses_all_and_unescapes() {
+        let text = "<key>ProgramArguments</key>\n  <array>\n    <string>/a &amp; b/ab</string>\n    <string>--service</string>\n  </array>\n";
+        assert_eq!(
+            plist_program_arguments(text),
+            vec!["/a & b/ab".to_string(), "--service".to_string()]
+        );
+        assert!(
+            plist_program_arguments("<dict/>").is_empty(),
+            "读不出就空，别猜"
+        );
     }
 }

@@ -75,6 +75,29 @@ slint-pixel = "0.2.2"
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
+# B2（批 abb-svc-persist-password-gate，2026-09-28）：把 bridge 拉起的 agent 子进程**降回
+# 普通权限**——bridge 由计划任务以 HighestAvailable 跑（高完整性），子进程会继承该完整性，
+# 于是 claude/codex 会带着管理员权限跑；要换成「桌面 shell（explorer）的身份」，只能走
+# 令牌复制 + CreateProcessWithTokenW + 管道。
+#
+# 为什么这里破例引依赖（本仓其余 Win32 访问都是手写 `unsafe extern "C"`，见 elev/win.rs）：
+# 这块最容易在**句柄生命周期**（令牌/管道泄漏）与结构体布局上出错，windows-rs 提供类型化句柄
+# 与 RAII 包装，值得换掉那部分手写 unsafe。只对 Windows target 生效，macOS/Linux 构建不受影响；
+# feature 只开实际用到的五项。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+] }
+
 # #129 锁屏控制 root 特权助手（macOS）：独立二进制，与主程序同目录打包/独立签名。
 # 非 macOS 平台为占位 main（拒绝运行），保证全平台构建一致（Windows CI 不炸）。
 [[bin]]
@@ -88,6 +111,13 @@ path = "src/bin/abb-helper.rs"
 [[bin]]
 name = "abb-elev-helper"
 path = "src/bin/abb-elev-helper.rs"
+
+# B2：Windows「降权启动器」—— bridge 由计划任务以高完整性跑，它拉起的 agent 会继承该完整性；
+# 本程序用桌面 shell（explorer）的令牌重建 agent 进程，把权限降回普通用户。
+# 非 Windows 平台为占位 main（拒绝运行），保证全平台构建一致。
+[[bin]]
+name = "abb-spawner"
+path = "src/bin/abb-spawner.rs"
 
 [profile.release]
 opt-level = "z"

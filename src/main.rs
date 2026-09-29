@@ -6,6 +6,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod agent;
+mod agent_spawn;
 mod agents_md;
 mod attachments;
 mod botstatus;
@@ -377,6 +378,31 @@ fn main() {
         return;
     }
 
+    // 隐藏子命令：安装器（已提权）装完调一次，登记 bridge 常驻计划任务。
+    // 任务 XML 的单一定义在 `src/svc_task.rs`，详见 `platform::install_bridge_task_elevated`。
+    if args.iter().any(|a| a == "--install-bridge-task") {
+        #[cfg(target_os = "windows")]
+        {
+            match platform::install_bridge_task_elevated() {
+                Ok(()) => {
+                    println!("已登记 bridge 常驻计划任务");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("登记 bridge 常驻计划任务失败：{e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            eprintln!(
+                "--install-bridge-task 仅 Windows 可用（本平台由 launchd/systemd 等价物托管）"
+            );
+            std::process::exit(1);
+        }
+    }
+
     if args.iter().any(|a| a == "--service") {
         // 单实例：已有一个 --service 在跑就直接退出（flock 拿不到锁）
         let _guard = match single_instance::SingleInstance::acquire("service") {
@@ -386,6 +412,9 @@ fn main() {
                 std::process::exit(0); // 优雅退出，不报错（避免 launchd KeepAlive 刷屏重试日志）
             }
         };
+        // 自己登记 pid：本批起 bridge 由 launchd/计划任务托管（不再由托盘 spawn），
+        // 托盘侧的 status()/看门狗只能靠这个文件判活。
+        crate::install::write_own_pid_file();
         // 守护进程：纯 tokio
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

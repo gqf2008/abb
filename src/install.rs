@@ -140,6 +140,15 @@ pub fn status() -> ServiceStatus {
 /// 启动 service 子进程（若已在跑则先停），并起线程收割（防僵尸）。
 /// 会顺带把「意图=运行」标记置上（看门据此在崩溃时重拉）。
 pub fn svc_start() -> Result<()> {
+    // 托管形态（macOS launchd / Windows 计划任务）：起停交给 supervisor，托盘不再自己
+    // spawn —— 两边同时管会抢单实例锁，表现为反复拉起-退出（见 platform::service_supervised）。
+    if crate::platform::service_supervised() {
+        set_desired(true);
+        // 「启动」不等于「重启」：托管形态下只确保它在跑（job 没加载才 bootstrap / `/run`），
+        // 不能用 kickstart -k —— 那会杀掉正在跑的实例，看门狗每 2s 判活失败就再来一次，
+        // 形成「拉起即被杀」的抖动（评审 P5）。
+        return crate::platform::start_service_supervised();
+    }
     let st = status();
     if st.running {
         svc_stop();
@@ -210,12 +219,64 @@ fn svc_stop_impl(keep_desired: bool) {
 }
 
 pub fn svc_restart() {
+    if crate::platform::service_supervised() {
+        // 托管形态：交给 supervisor 重启（不经过「先杀后起」的托盘子进程路径）。
+        set_desired(true);
+        if let Err(e) = crate::platform::restart_service_supervised() {
+            crate::log!("[watchdog] 托管重启失败: {e:#}");
+        }
+        return;
+    }
     svc_stop();
     // 稍等子进程退出再拉
     std::thread::sleep(std::time::Duration::from_millis(300));
     if let Err(e) = svc_start() {
         crate::log!("[watchdog] 重启失败: {e:#}");
     }
+}
+
+/// 停止服务 —— **需要授权**（本批 owner 要求：托盘退出不影响服务，停止必须授权）。
+///
+/// 平台侧各自取授权：macOS = 系统密码框后 `launchctl bootout`；Windows = UAC 提权 helper
+/// 执行计划任务 `/end` + 杀 pid（B1b 接线）。
+///
+/// 顺序要紧：**授权通过、平台侧真停了之后**才清「意图=运行」标记与 pid 文件。用户取消授权
+/// 时必须什么都不变——否则看门狗会把「取消授权」误当成「用户想停」而不再拉回服务。
+pub fn svc_stop_authorized() -> Result<()> {
+    // 平台侧拿授权并停 supervisor（macOS=bootout / Windows=schtasks /end，均经 UAC/密码框）。
+    let platform = crate::platform::stop_service_authorized();
+    // 评审 P4：**非托管形态**（例如刚关掉自启、bridge 又被看门狗拉成托盘子进程）时，平台侧
+    // 没有 supervisor 对象可停 ⇒ 必须把 pid 文件里那个进程也停掉，否则「用户被告知已停止、
+    // 服务还在跑」。只在授权**成功**后才动它：取消授权时绝不能用 pid 兜底绕开密码门。
+    let st = status();
+    if platform.is_ok() && st.running && st.pid != 0 {
+        terminate(st.pid);
+        crate::log!(
+            "[watchdog] 授权停止：已终止 pid={}（非托管形态兜底）",
+            st.pid
+        );
+    }
+    if let Err(e) = platform {
+        // 授权被取消 / 平台侧失败：只有确认进程真的没了才算停成功，否则如实报错。
+        let still = status();
+        if still.running {
+            return Err(e);
+        }
+        crate::log!("[watchdog] 平台侧返回失败，但 service 已不在运行：按成功处理（{e:#}）");
+    }
+    apply_stop_intent(&logs_dir(), false);
+    let _ = std::fs::remove_file(pid_file());
+    crate::log!("[watchdog] 已按授权停止 service（意图标记已清）");
+    Ok(())
+}
+
+/// bridge（`--service`）启动时自己登记 pid。
+///
+/// 本批起 bridge 由 launchd/计划任务托管，托盘不再持有它的 pid —— `status()` 与看门狗只能
+/// 靠这个文件判活（否则会误判「没在跑」并反复 spawn 出抢锁即退的短命进程）。
+pub fn write_own_pid_file() {
+    let _ = std::fs::create_dir_all(logs_dir());
+    let _ = std::fs::write(pid_file(), std::process::id().to_string());
 }
 
 /// 跨平台终止进程。
@@ -390,10 +451,17 @@ mod upgrade_call_site_tests {
              若只是中间的注释变长了，把这个常量一起调大并在此说明",
             call_line - log_line
         );
-        // 反向护栏：用户手动停 / 托盘退出仍走清意图的 `svc_stop()`（升级路径不得把两处语义混回去）。
+        // 反向护栏（2026-09-28 语义变更后重写）：托盘侧的「停止」**必须**走授权路径
+        // `svc_stop_authorized()`，**不得**出现直接的无授权 `svc_stop();`
+        // （owner 要求：停止服务需要密码授权；这条守卫就是防止哪天有人把它改回去）。
         assert!(
-            ui.matches("svc_stop();").count() >= 1,
-            "手动停/退出路径仍应调用 svc_stop()；若全仓不再有它，说明语义被合并了，请重审本条守卫"
+            ui.matches("svc_stop_authorized()").count() >= 1,
+            "托盘「停止」必须走 install::svc_stop_authorized()（需要授权）"
+        );
+        assert_eq!(
+            ui.matches("install::svc_stop();").count(),
+            0,
+            "托盘侧不得再直接调无授权的 install::svc_stop()——那等于绕过密码授权（本守卫的立身之本）"
         );
     }
 
@@ -417,6 +485,148 @@ mod upgrade_call_site_tests {
         assert!(
             via >= 4,
             "ui.rs 里应至少有 4 处升级日志走 crate::updater::log_update（实际 {via}）"
+        );
+    }
+}
+
+/// 安装器（`app-assets/ABB.iss`）的**安全前提**守卫 —— 平台无关（纯文本断言），任何平台都能跑。
+///
+/// 为什么值得钉：这几条不是"配置偏好"，而是本批「登录后服务不能被随便杀死」能成立的前提 ——
+/// 一旦有人在改安装脚本时把它们删掉，Windows 上就会静默退回「高完整性常驻 + 用户可写 exe」
+/// 的持久化提权形态，而门禁全绿、CI 全绿（`.iss` 只在发版时编译，跑不到单测）。评审 R22 的
+/// P2 就是这么被发现的，故补成可红可绿的断言。
+#[cfg(test)]
+mod installer_guards {
+    const ISS: &str = include_str!("../app-assets/ABB.iss");
+
+    /// 安装脚本里的**代码行**（去掉注释行与行尾注释）。
+    ///
+    /// 评审 R23 §3.3：只对整份文本做子串匹配会被「注释里写一遍」顶住（假绿）——
+    /// 例如把 `PrivilegesRequired=lowest` 改回去、却在注释里保留 `PrivilegesRequired=admin`
+    /// 字样。故本组守卫一律只看代码行。
+    fn code_lines() -> Vec<&'static str> {
+        ISS.lines()
+            .filter(|l| !l.trim_start().starts_with(';'))
+            .collect()
+    }
+
+    /// 代码行里是否存在以 `key=` 开头（忽略缩进）的指令，且其值等于 `value`。
+    fn directive_is(key: &str, value: &str) -> bool {
+        code_lines().iter().any(|l| {
+            let t = l.trim();
+            if let Some(rest) = t.strip_prefix(key) {
+                rest.trim_start()
+                    .strip_prefix('=')
+                    .map(|v| v.trim() == value)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    }
+
+    /// 程序必须装在**普通用户不可写**的位置、且安装需要管理员：这是「以 HighestAvailable 常驻」
+    /// 的前提（否则普通进程一次 UAC 后改写 exe 即可持久化提权）。
+    #[test]
+    fn installer_requires_admin_and_installs_under_program_files() {
+        assert!(
+            directive_is("PrivilegesRequired", "admin"),
+            "安装器必须要求管理员（per-machine）；per-user 安装会让常驻 exe 落在用户可写目录"
+        );
+        assert!(
+            directive_is("DefaultDirName", r"{autopf}\ABB"),
+            "程序必须装到 autopf（Program Files，普通用户不可写），不能再用 localappdata"
+        );
+        // 反向：这两个值**不得**在代码行里出现（防「注释里写 admin、代码里偷偷改回 lowest」）
+        assert!(
+            !code_lines().iter().any(|l| l.contains("localappdata")),
+            "代码行里不得再出现 localappdata（per-machine 的前提）"
+        );
+    }
+
+    /// 托盘必须用 `runasoriginaluser` 拉起：安装器已是管理员，否则管理员令牌会传染给托盘
+    /// spawn 的 claude/codex（agent 带管理员权限）。bridge 的高完整性由计划任务单独负责。
+    #[test]
+    fn installer_relaunches_tray_as_original_user() {
+        // 直接按"拉起托盘的 [Run] 行"的特征筛选（不依赖 `[Run]` 段头的位置：注释里也出现过这个词）。
+        let launches = code_lines()
+            .into_iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("Filename:") && t.contains("--wait-lock")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(launches.len(), 2, "交互/静默两条拉起，实得：{launches:?}");
+        for l in launches {
+            assert!(
+                l.contains("runasoriginaluser"),
+                "每条拉起都必须带 runasoriginaluser（否则托盘以管理员身份跑）：{l}"
+            );
+        }
+    }
+
+    /// **随包清单的守卫（系统性）**：`Cargo.toml` 里每个**非 macOS-only** 的 bin，
+    /// 都必须在安装脚本的 `[Files]` 里出现同名 `.exe`。
+    ///
+    /// 为什么做成通用规则：这个缺口连着被抓两轮 —— 先是 B2 的 `abb-spawner.exe`（复评 R24），
+    /// 再是授权停止要用的 `abb-elev-helper.exe`（复评 R25）。两者都是「代码里 spawn 同目录的
+    /// helper，但打包清单没带」⇒ 安装版上对应功能必然报「helper 不存在」。硬编码两条只能防这两
+    /// 个名字，通用规则能防下一个。
+    ///
+    /// 例外面（必须写清理由）：`abb-helper` 是 macOS 锁屏助手（非 macOS 平台只有占位 main），
+    /// Windows 包不需要它。
+    #[test]
+    fn installer_ships_every_non_macos_bin() {
+        const MACOS_ONLY_BINS: [&str; 1] = ["abb-helper"];
+        let manifest = include_str!("../Cargo.toml");
+        let mut checked = 0usize;
+        for block in manifest.split("[[bin]]").skip(1) {
+            let name = block
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("name = "))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .expect("[[bin]] 段必须有 name");
+            if MACOS_ONLY_BINS.contains(&name.as_str()) {
+                continue;
+            }
+            checked += 1;
+            let want_src = format!("release\\{name}.exe");
+            assert!(
+                code_lines()
+                    .iter()
+                    .any(|l| l.contains(&format!("{name}.exe")) && l.contains("DestDir")),
+                "安装包必须随带 {name}.exe（代码里会 spawn 同目录的这个二进制）"
+            );
+            assert!(
+                code_lines().iter().any(|l| l.contains(&want_src)),
+                "源路径必须是 target\\release\\{name}.exe"
+            );
+        }
+        assert!(
+            checked >= 2,
+            "至少应检查 abb-elev-helper 与 abb-spawner，实得 {checked}"
+        );
+    }
+
+    /// 装机即登记常驻任务，且**不在 Pascal 里重写 XML**（XML 单一定义在 src/svc_task.rs）：
+    /// 这里只允许出现一次 `--install-bridge-task` 调用与一次卸载删除。
+    #[test]
+    fn installer_registers_and_removes_the_bridge_task_via_our_binary() {
+        assert!(
+            code_lines()
+                .iter()
+                .any(|l| l.contains("'--install-bridge-task'")),
+            "安装器必须调用我们自己的隐藏子命令登记任务（XML 单一定义在 svc_task.rs）"
+        );
+        assert!(
+            !ISS.contains("<RunLevel>HighestAvailable</RunLevel>"),
+            "安装脚本里不得重写一份任务 XML（会与 src/svc_task.rs 漂移）"
+        );
+        assert!(
+            code_lines()
+                .iter()
+                .any(|l| l.contains("/delete /tn ' + BridgeTaskName")),
+            "卸载时必须删掉常驻任务，别留孤儿"
         );
     }
 }

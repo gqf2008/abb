@@ -358,7 +358,7 @@ impl AcpClient {
         use std::process::Stdio;
 
         // 统一入口：Windows 上「构造即已抑制控制台窗口」（见 src/spawn.rs）
-        let mut cmd = crate::spawn::tokio_command(command);
+        let mut cmd = crate::agent_spawn::tokio_command(command);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

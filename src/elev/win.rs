@@ -80,6 +80,7 @@ mod ffi {
         pub fn CloseHandle(h: *mut c_void) -> i32;
         pub fn GetCurrentProcess() -> *mut c_void;
         pub fn GetCurrentProcessId() -> u32;
+        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
         pub fn CreateNamedPipeW(
             name: *const u16,
             open_mode: u32,
@@ -434,6 +435,118 @@ impl WinlogonBackend {
 }
 
 impl SysBackend for WinlogonBackend {
+    /// helper 自己同目录的 `agent-bridge.exe`——任务要跑的就是它，**不接受调用方给路径**。
+    fn bridge_exe_path(&self) -> Result<String, SysError> {
+        let exe = std::env::current_exe().map_err(|_| SysError::Failed)?;
+        let dir = exe.parent().ok_or(SysError::Failed)?;
+        let target = dir.join("agent-bridge.exe");
+        if !target.is_file() {
+            // fail-closed：拿不到同目录的 agent-bridge.exe 就绝不注册任务（宁可失败也不猜路径）。
+            log_fail("bridge_exe_path", 0);
+            return Err(SysError::Failed);
+        }
+        Ok(target.to_string_lossy().into_owned())
+    }
+
+    /// 调用方进程的真实用户 **SID 字符串**（`S-1-5-21-…`）：查调用方进程的 token。
+    ///
+    /// 为什么不信调用方自报：任务会以高完整性在登录时拉起 exe，用户若可自报，同用户就能把
+    /// 别人的账号写进任务。返回 SID 而不是用户名：不受本地化/同名账号影响，Task Scheduler
+    /// 的 `<UserId>` 直接接受 SID 字符串。
+    fn user_for_pid(&self, pid: u32) -> Result<String, SysError> {
+        sid_string_for_pid(pid).map_err(|_| SysError::Failed)
+    }
+
+    /// 本 helper 自己的用户 SID（handler 用它做「同用户」硬闸）。
+    fn own_sid(&self) -> Result<String, SysError> {
+        current_user_sid_string().map_err(|_| SysError::Failed)
+    }
+
+    /// 注册/覆盖计划任务：把 XML 落临时文件 → `schtasks /create /xml … /f` → 删临时文件。
+    fn install_bridge_task(&self, exe: &str, user: &str) -> Result<(), SysError> {
+        Self::require_elevated()?;
+        let xml = crate::svc_task::task_xml(exe, user);
+        let tmp = std::env::temp_dir().join(format!(
+            "abb-bridge-task-{}-{}.xml",
+            std::process::id(),
+            crate::elev::gen_token()
+        ));
+        // 计划任务 XML 文件要求 UTF-16LE（含 BOM）：`schtasks /xml` 对 UTF-8 会解析失败。
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+        for u in xml.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        if std::fs::write(&tmp, &bytes).is_err() {
+            return Err(SysError::Failed);
+        }
+        let out = crate::spawn::command("schtasks")
+            .args([
+                "/create",
+                "/tn",
+                crate::svc_task::TASK_NAME,
+                "/xml",
+                &tmp.to_string_lossy(),
+                "/f",
+            ])
+            .output();
+        let _ = std::fs::remove_file(&tmp);
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let code = o.status.code().unwrap_or(1);
+                log_fail("schtasks /create", code as u32);
+                Err(SysError::Failed)
+            }
+            Err(_) => Err(SysError::Failed),
+        }
+    }
+
+    /// 删除任务（不存在 = 幂等成功）。
+    fn remove_bridge_task(&self) -> Result<(), SysError> {
+        Self::require_elevated()?;
+        // 幂等判据用**查询**而不是退出码：直接看 `/delete` 的退出码会把「任务不存在」（1）
+        // 与「删除失败」（也是 1）混为一谈 —— 那是评审 P3 的「失败却回成功」。
+        let exists = crate::spawn::command("schtasks")
+            .args(["/query", "/tn", crate::svc_task::TASK_NAME, "/xml"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            return Ok(()); // 本来就没有：幂等成功
+        }
+        let out = crate::spawn::command("schtasks")
+            .args(["/delete", "/tn", crate::svc_task::TASK_NAME, "/f"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                log_fail("schtasks /delete", o.status.code().unwrap_or(1) as u32);
+                Err(SysError::Failed)
+            }
+            Err(_) => Err(SysError::Failed),
+        }
+    }
+
+    /// 停掉任务当前实例（= 停止服务）。
+    ///
+    /// **`/end` 非 0 一律报错**（评审 P3）：`schtasks /end` 在任务不存在/名称错/权限不足时都返回 1，
+    /// 把它当成功会让调用方清掉「意图=运行」与 pid 文件、UI 显示「已停止」，而服务其实还在跑。
+    /// 幂等由调用方兜底（`install::svc_stop_authorized` 在成功/失败两侧都复核 pid 存活）。
+    fn stop_bridge_task(&self) -> Result<(), SysError> {
+        Self::require_elevated()?;
+        let out = crate::spawn::command("schtasks")
+            .args(["/end", "/tn", crate::svc_task::TASK_NAME])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                log_fail("schtasks /end", o.status.code().unwrap_or(1) as u32);
+                Err(SysError::Failed)
+            }
+            Err(_) => Err(SysError::Failed),
+        }
+    }
+
     fn set_auto_login(&self, username: &str, password: &str) -> Result<(), SysError> {
         Self::require_elevated()?;
         let h = open_winlogon(KEY_QUERY_VALUE | KEY_SET_VALUE).map_err(map_rc)?;
@@ -526,6 +639,64 @@ fn current_user_sid_string() -> Result<String, String> {
             ));
         }
         // `TOKEN_USER { User: SID_AND_ATTRIBUTES { Sid: PSID, Attributes: DWORD } }`
+        let sid = *(buf.as_ptr() as *const *mut c_void);
+        let mut sid_str: *mut u16 = std::ptr::null_mut();
+        if ffi::ConvertSidToStringSidW(sid, &mut sid_str) == 0 {
+            return Err(format!("ConvertSidToStringSidW rc={}", ffi::GetLastError()));
+        }
+        let mut n = 0usize;
+        while *sid_str.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, n));
+        ffi::LocalFree(sid_str as *mut c_void);
+        Ok(s)
+    }
+}
+
+/// 指定进程的用户 SID 字符串（`S-1-5-21-…`）。
+///
+/// 用途：注册 bridge 常驻计划任务时，`<UserId>` 用**调用方进程的真实 SID**——不用调用方自报的
+/// 用户名（那会是个注入面），也不用 `LookupAccountSidW` 取名字（SID 更稳：不受本地化/同名账号
+/// 影响，Task Scheduler 的 XML 也接受 SID 字符串）。
+///
+/// 提权 helper（高完整性）打开调用方（中完整性）进程只需 `PROCESS_QUERY_LIMITED_INFORMATION`。
+fn sid_string_for_pid(pid: u32) -> Result<String, String> {
+    // SAFETY: 与 `current_user_sid_string` 同一套调用约定；这里多一步 OpenProcess。
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        if pid == 0 {
+            return Err("调用方 pid 为 0".to_string());
+        }
+        let proc = ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if proc.is_null() {
+            return Err(format!("OpenProcess rc={}", ffi::GetLastError()));
+        }
+        let mut token: Handle = std::ptr::null_mut();
+        if ffi::OpenProcessToken(proc, TOKEN_QUERY, &mut token) == 0 {
+            let rc = ffi::GetLastError();
+            ffi::CloseHandle(proc);
+            return Err(format!("OpenProcessToken rc={rc}"));
+        }
+        ffi::CloseHandle(proc);
+        let mut len = 0u32;
+        ffi::GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
+        let words = (len as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let ok = ffi::GetTokenInformation(
+            token,
+            TOKEN_USER,
+            buf.as_mut_ptr() as *mut c_void,
+            len,
+            &mut len,
+        );
+        ffi::CloseHandle(token);
+        if ok == 0 {
+            return Err(format!(
+                "GetTokenInformation(TokenUser) rc={}",
+                ffi::GetLastError()
+            ));
+        }
         let sid = *(buf.as_ptr() as *const *mut c_void);
         let mut sid_str: *mut u16 = std::ptr::null_mut();
         if ffi::ConvertSidToStringSidW(sid, &mut sid_str) == 0 {
@@ -841,7 +1012,8 @@ pub struct HelperOutcome {
 
 /// 调用方侧：`runas` 拉起 helper → 连管道 → 发一个请求 → 读回响应 → 等 helper 退出。
 ///
-/// 本批**不接线**到 GUI/CLI（只在库内可用，尚无调用点）；真机执行需要 UAC 交互，留给
+/// 现已接线：`platform.rs` 的 Windows 分支用它执行 `stop-bridge-task` / `install-bridge-task` /
+/// `remove-bridge-task`（批 `abb-svc-persist-password-gate`）；真机执行需要 UAC 交互，留给
 /// owner 验证——本机不跑。
 pub fn call_helper(
     op: super::Op,
@@ -890,7 +1062,11 @@ pub fn call_helper(
         let rc = unsafe { ffi::GetLastError() };
         // 用户在 UAC 弹框上点了「否」：这是明确的拒绝，不是故障。
         if rc == ERROR_CANCELLED {
-            return Err("提权被取消（用户在 UAC 弹框上拒绝）".to_string());
+            // 前缀必须用 `super::ERR_ELEVATION_CANCELLED`（单一来源）：调用方按它判「明确拒绝授权」。
+            return Err(format!(
+                "{}（用户在 UAC 弹框上拒绝）",
+                super::ERR_ELEVATION_CANCELLED
+            ));
         }
         return Err(format!("ShellExecuteExW(runas) 失败 rc={rc}"));
     }

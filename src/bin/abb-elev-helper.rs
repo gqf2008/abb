@@ -101,8 +101,11 @@ fn run() -> ExitCode {
         eprintln!("[elev] 等客户端连接失败：{e}");
         return ExitCode::from(EXIT_PIPE);
     }
-    // 来源 = 调用方进程 pid（取不到才退化为 helper 自己），审计里用它回答「谁提的」。
-    let source = match server.client_pid() {
+    // 调用方进程 pid（管道对端）。审计用它回答「谁提的」，而 `install-bridge-task` 还要用它
+    // 解析**调用方**的用户 SID —— 不能用 helper 自己的 pid：over-the-shoulder 提权（标准用户 +
+    // 管理员凭据）时两者不同，用错会把计划任务登记到管理员账号名下（评审 P1）。
+    let client_pid = server.client_pid();
+    let source = match client_pid {
         Some(pid) => format!("pid:{pid}"),
         None => format!("pid:{}", std::process::id()),
     };
@@ -135,7 +138,9 @@ fn run() -> ExitCode {
         dir: &dir,
         ts: &ts,
         source: &source,
-        pid: std::process::id(),
+        // 取不到对端 pid 时退化为自身 pid —— 那时 `user_for_pid` 会解析成 helper 自己，
+        // 与 `own_sid()` 相同，于是「同用户」断言仍然成立（不会误拒），安全性由管道 DACL 兜底。
+        pid: client_pid.unwrap_or_else(std::process::id),
     };
     let response = elev::handle_request(&body, &args.token, &ctx, &win::WinlogonBackend);
     // 请求体（可能含密码）用完即擦。
