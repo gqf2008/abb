@@ -144,9 +144,10 @@ pub fn svc_start() -> Result<()> {
     // spawn —— 两边同时管会抢单实例锁，表现为反复拉起-退出（见 platform::service_supervised）。
     if crate::platform::service_supervised() {
         set_desired(true);
-        // 「启动」不等于「重启」：托管形态下只确保它在跑（job 没加载才 bootstrap / `/run`），
-        // 不能用 kickstart -k —— 那会杀掉正在跑的实例，看门狗每 2s 判活失败就再来一次，
-        // 形成「拉起即被杀」的抖动（评审 P5）。
+        // 「启动」不等于「重启」：托管形态下只确保它在跑 —— job 没加载才 bootstrap、
+        // **已加载但没在跑要 kickstart**（不带 -k；2026-09-30「升级后 mac 起不来」就是
+        // 只判「已加载」不管「在不在跑」造成的静止态），绝不能用 kickstart -k —— 那会杀掉
+        // 正在跑的实例，看门狗每 2s 判活失败就再来一次，形成「拉起即被杀」的抖动（评审 P5）。
         return crate::platform::start_service_supervised();
     }
     let st = status();

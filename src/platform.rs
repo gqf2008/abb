@@ -1044,44 +1044,135 @@ pub fn restart_service_supervised() -> Result<()> {
     Ok(())
 }
 
-/// 托管形态下的「启动」：job 不在域里就 `bootstrap`，已在就什么都不做。
-///
-/// 与 [`restart_service_supervised`] 的区别是**不杀**正在跑的实例——看门狗「意图=运行但判活失败」
-/// 时走这条（评审 P5：以前走 kickstart -k，pid 文件滞后或冷启动 >2s 就形成抖动）。
+/// job 在 launchd 里的形态。**「在域里」与「在跑」是两件事**，混为一谈会造出
+/// 「谁都以为它在跑」的静止态（见 [`supervised_start_action`]）。
 #[cfg(target_os = "macos")]
-pub fn start_service_supervised() -> Result<()> {
-    let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
-    if job_loaded(&target) {
-        return Ok(());
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum JobState {
+    /// `launchctl print` 失败：不在域里（没 bootstrap 过，或被 `bootout` 摘掉了）。
+    Absent,
+    /// 在域里但**没有运行中的进程**（`print` 输出里没有 `pid` 行）。
+    Stopped,
+    /// 在域里且有主进程 pid。
+    Running,
+}
+
+/// 托管形态下的「启动」该做什么（纯函数，便于单测锁死判据）。
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SupervisedStart {
+    /// 已经在跑：什么都不做（看门狗每 2s 走一次，绝不能顺手 `kickstart -k`）。
+    Noop,
+    /// 在域里但没在跑：`kickstart`（**不带 `-k`**）把它拉回来。
+    Kickstart,
+    /// 不在域里：按 plist `bootstrap`。
+    Bootstrap,
+}
+
+/// 「启动」的判据：**已加载 ≠ 在跑**。
+///
+/// 为什么必须有这条分支（2026-09-30 owner 实报「最新的版本 mac 上也启动不起来了」）：
+/// bridge job 的 plist 是 `KeepAlive = {SuccessfulExit: false}` —— **优雅退出（exit 0）
+/// 的 job launchd 不会重拉**。升级流程恰恰是「先优雅停 service（SIGTERM ⇒ 正常关停、
+/// exit 0）→ 换包 → 拉起新托盘」，于是 job 停在「在域里、not running、last exit = 0」；
+/// 托盘的看门狗虽然每 2s 判活失败，但旧实现只判 `job_loaded`（`launchctl print` 成功）
+/// 就直接 `Ok(())`，既不 kickstart 也不 bootstrap ⇒ **永久静止态**，机器人全离线而界面上
+/// 只看到「自动重拉」的日志（GUI 由 `open` 拉起时 stdout 还是 /dev/null）。
+#[cfg(target_os = "macos")]
+fn supervised_start_action(state: JobState) -> SupervisedStart {
+    match state {
+        JobState::Running => SupervisedStart::Noop,
+        JobState::Stopped => SupervisedStart::Kickstart,
+        JobState::Absent => SupervisedStart::Bootstrap,
     }
-    let plist = service_item_plist();
-    if !plist.exists() {
-        anyhow::bail!("bridge 登录项不存在（未开自启？）：{}", plist.display());
+}
+
+/// `launchctl` 的**唯一**调用点：所有需要可注入的实现都从这里出去，单测才能用假 runner
+/// 驱动真实逻辑而不 spawn 真的 launchctl。
+#[cfg(target_os = "macos")]
+fn launchctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("launchctl").args(args).output()
+}
+
+/// launchctl 调用缝（单测注入假 runner 用；生产走 [`launchctl`]）。
+#[cfg(target_os = "macos")]
+type LaunchctlRunner<'a> = dyn FnMut(&[&str]) -> std::io::Result<std::process::Output> + 'a;
+
+/// 读 job 形态：`launchctl print` 成功 = 在域里，输出里能解析出 pid 才算在跑。
+///
+/// pid 行复用 [`parse_launchd_job_pid`]（同一份格式假设，改格式时一处生效）。
+#[cfg(target_os = "macos")]
+fn job_state_with(run: &mut LaunchctlRunner<'_>, target: &str) -> JobState {
+    match run(&["print", target]) {
+        Ok(o) if o.status.success() => {
+            if parse_launchd_job_pid(&String::from_utf8_lossy(&o.stdout)).is_some() {
+                JobState::Running
+            } else {
+                JobState::Stopped
+            }
+        }
+        _ => JobState::Absent,
     }
-    let domain = format!("gui/{}", uid());
-    let out = std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist.display().to_string()])
-        .output()
-        .context("执行 launchctl bootstrap 失败")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "launchctl bootstrap 失败: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
 }
 
 /// job 是否已在 launchd 域里（`launchctl print <target>` 成功 = 在）。
+///
+/// **不要**把它当「在跑」用：判「要不要拉起来」见 [`supervised_start_action`]。
 #[cfg(target_os = "macos")]
 fn job_loaded(target: &str) -> bool {
-    std::process::Command::new("launchctl")
-        .args(["print", target])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    job_state_with(&mut launchctl, target) != JobState::Absent
+}
+
+/// 托管形态下的「启动」：确保 bridge **真的在跑**。
+///
+/// 与 [`restart_service_supervised`] 的区别是**不杀**正在跑的实例——看门狗「意图=运行但判活失败」
+/// 时走这条（评审 P5：以前走 kickstart -k，pid 文件滞后或冷启动 >2s 就形成抖动）；
+/// 「已加载但没在跑」则按 [`supervised_start_action`] 补一次 `kickstart`（不带 `-k`：
+/// 本机实测对正在跑的 job 是 rc=0、pid 不变，不会打断实例）。
+///
+/// 这里**不做多秒轮询**：本函数会被托盘看门狗的 2s tick（UI 线程）调用，阻塞它等于卡界面；
+/// 「起没起来」由下一拍判活复验。
+#[cfg(target_os = "macos")]
+pub fn start_service_supervised() -> Result<()> {
+    let plist = service_item_plist();
+    start_service_supervised_with(&mut launchctl, &plist)
+}
+
+/// [`start_service_supervised`] 的可注入实现（单测用假 runner + 临时 plist 路径驱动）。
+#[cfg(target_os = "macos")]
+fn start_service_supervised_with(
+    run: &mut LaunchctlRunner<'_>,
+    plist: &std::path::Path,
+) -> Result<()> {
+    let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+    match supervised_start_action(job_state_with(run, &target)) {
+        SupervisedStart::Noop => Ok(()),
+        SupervisedStart::Kickstart => {
+            let out = run(&["kickstart", &target]).context("执行 launchctl kickstart 失败")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "launchctl kickstart 失败: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+        SupervisedStart::Bootstrap => {
+            if !plist.exists() {
+                anyhow::bail!("bridge 登录项不存在（未开自启？）：{}", plist.display());
+            }
+            let domain = format!("gui/{}", uid());
+            let out = run(&["bootstrap", &domain, &plist.display().to_string()])
+                .context("执行 launchctl bootstrap 失败")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "launchctl bootstrap 失败: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 // ─────────────────────────── 自启变更审计（全平台） ───────────────────────────
@@ -1814,6 +1905,209 @@ mod tests {
         );
         // 含 `pid` 字样但不是主进程行的，不误配
         assert_eq!(parse_launchd_job_pid("\trespawn count = 3\n"), None);
+    }
+
+    /// 本机实测的两种 `launchctl print` 形态（2026-09-30 现场抄录，去掉易漂移字段）。
+    /// `job_state_with` 的判据全部落在这两份文本上：**只有 pid 行才算在跑**。
+    #[cfg(target_os = "macos")]
+    const PRINT_NOT_RUNNING: &str = "\tactive count = 0\n\tpath = /Users/x/Library/LaunchAgents/com.sqb.agent-bridge.service.plist\n\ttype = LaunchAgent\n\tstate = not running\n\truns = 1\n\tlast exit code = 0\n";
+    /// 同一 job 被 `kickstart` 拉起来之后（真实输出里 `state = running` + `pid = <n>`）。
+    #[cfg(target_os = "macos")]
+    const PRINT_RUNNING: &str = "\tactive count = 1\n\tpath = /Users/x/Library/LaunchAgents/com.sqb.agent-bridge.service.plist\n\ttype = LaunchAgent\n\tstate = running\n\tpid = 13603\n\tlast exit code = 0\n";
+
+    /// 假 `launchctl` 的签名与「收到的命令」账本（拆成别名只为压掉 clippy 的 type_complexity）。
+    #[cfg(target_os = "macos")]
+    type FakeRunner = Box<dyn FnMut(&[&str]) -> std::io::Result<std::process::Output>>;
+    #[cfg(target_os = "macos")]
+    type RecordedCalls = std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>;
+
+    /// 构造一个假的 `launchctl`：按**动词**前缀匹配预置应答，同时把收到的完整命令记下来。
+    /// 这样测的是真实判据与命令序，而不是 spawn 真的 launchctl（那会动到用户的 launchd 域）。
+    #[cfg(target_os = "macos")]
+    fn fake_launchctl(
+        plan: Vec<(&'static str, i32, &'static str, &'static str)>,
+    ) -> (FakeRunner, RecordedCalls) {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Vec<String>>::new()));
+        let seen = std::rc::Rc::clone(&calls);
+        let runner = Box::new(move |args: &[&str]| {
+            seen.borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect::<Vec<String>>());
+            let verb = args.first().copied().unwrap_or("");
+            let (_, code, stdout, stderr) = plan
+                .iter()
+                .find(|(v, ..)| *v == verb)
+                .unwrap_or_else(|| panic!("测试没预置 `launchctl {verb}` 的应答：{args:?}"));
+            Ok(fake_status(*code, stdout, stderr))
+        });
+        (runner, calls)
+    }
+
+    /// 假 `Output`（macOS 测试专用：unix 可以用 from_raw 造退出码）。
+    #[cfg(target_os = "macos")]
+    fn fake_status(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// 「启动」的判据三态：在跑=不动、**在域里没在跑=必须 kickstart**、不在域里=bootstrap。
+    ///
+    /// 中间那条是 2026-09-30 owner 实报（升级到 v2.23.77 后 mac 上 bridge 再没起来）的回归锁：
+    /// 旧实现只有「在域里 ⇒ Ok」一档，于是这个形态永远没人拉。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervised_start_action_kickstarts_loaded_but_stopped_job() {
+        assert_eq!(
+            supervised_start_action(JobState::Running),
+            SupervisedStart::Noop
+        );
+        assert_eq!(
+            supervised_start_action(JobState::Stopped),
+            SupervisedStart::Kickstart,
+            "已加载但没在跑 ⇒ 必须 kickstart（否则是永久静止态）"
+        );
+        assert_eq!(
+            supervised_start_action(JobState::Absent),
+            SupervisedStart::Bootstrap
+        );
+    }
+
+    /// 形态读取落在那两份实测文本上：`not running`/无 pid → Stopped；有 pid → Running；
+    /// `print` 非 0 → Absent。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn job_state_distinguishes_loaded_from_running() {
+        let (mut run, _) = fake_launchctl(vec![("print", 0, PRINT_NOT_RUNNING, "")]);
+        assert_eq!(job_state_with(&mut *run, "gui/501/x"), JobState::Stopped);
+
+        let (mut run, _) = fake_launchctl(vec![("print", 0, PRINT_RUNNING, "")]);
+        assert_eq!(job_state_with(&mut *run, "gui/501/x"), JobState::Running);
+
+        let (mut run, _) = fake_launchctl(vec![("print", 1, "", "Could not find service")]);
+        assert_eq!(job_state_with(&mut *run, "gui/501/x"), JobState::Absent);
+    }
+
+    /// 已是「在域里没在跑」时，「启动」必须发一次 `kickstart`——**不带 `-k`**（本机实测
+    /// 不带 -k 对正在跑的 job 是 rc=0、pid 不变；带 -k 会打断实例，看门狗每 2s 一次就成抖动）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_service_supervised_kickstarts_stopped_job_without_kill() {
+        let (mut run, calls) = fake_launchctl(vec![
+            ("print", 0, PRINT_NOT_RUNNING, ""),
+            ("kickstart", 0, "", ""),
+        ]);
+        // plist 故意给一个不存在的路径：kickstart 这一支不该依赖它（依赖了说明走到了 bootstrap）。
+        let plist = std::env::temp_dir().join("abb-not-exist-svc.plist");
+        start_service_supervised_with(&mut *run, &plist).expect("kickstart 应成功");
+
+        let calls = calls.borrow();
+        let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
+        assert_eq!(calls.len(), 2, "只该 print + kickstart，实得 {calls:?}");
+        assert_eq!(calls[0], vec!["print".to_string(), target.clone()]);
+        assert_eq!(calls[1], vec!["kickstart".to_string(), target]);
+        assert!(
+            !calls.iter().flatten().any(|a| a == "-k"),
+            "绝不能带 -k（会杀掉正在跑的实例）：{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("bootstrap")),
+            "已加载的 job 不该再 bootstrap：{calls:?}"
+        );
+    }
+
+    /// 已在跑 ⇒ 只查一次、不发任何命令（看门狗 2s 一拍，这里多发一条就是抖动源头）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_service_supervised_noops_when_running() {
+        let (mut run, calls) = fake_launchctl(vec![("print", 0, PRINT_RUNNING, "")]);
+        let plist = std::env::temp_dir().join("abb-not-exist-svc.plist");
+        start_service_supervised_with(&mut *run, &plist).expect("在跑 ⇒ Ok");
+        assert_eq!(calls.borrow().len(), 1, "在跑就不该再发命令");
+    }
+
+    /// 不在域里才 `bootstrap`（argv 形态一并锁住）；plist 缺失时如实报错且不发 bootstrap。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_service_supervised_bootstraps_only_when_job_absent() {
+        let base = std::env::temp_dir().join(format!("abb-svc-start-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let plist = base.join("com.sqb.agent-bridge.service.plist");
+        std::fs::write(&plist, b"<plist/>").unwrap();
+
+        let (mut run, calls) = fake_launchctl(vec![
+            ("print", 1, "", "Could not find service"),
+            ("bootstrap", 0, "", ""),
+        ]);
+        start_service_supervised_with(&mut *run, &plist).expect("bootstrap 应成功");
+        {
+            let calls = calls.borrow();
+            assert_eq!(calls.len(), 2, "print + bootstrap，实得 {calls:?}");
+            assert_eq!(
+                calls[1],
+                vec![
+                    "bootstrap".to_string(),
+                    format!("gui/{}", uid()),
+                    plist.display().to_string()
+                ]
+            );
+        }
+
+        // 没开自启（plist 不在）⇒ 如实报错，别静默 Ok 也别乱 bootstrap。
+        let (mut run, calls) = fake_launchctl(vec![("print", 1, "", "Could not find service")]);
+        let missing = base.join("absent.plist");
+        let err = start_service_supervised_with(&mut *run, &missing)
+            .expect_err("plist 缺失必须报错")
+            .to_string();
+        assert!(err.contains("bridge 登录项不存在"), "{err}");
+        assert_eq!(calls.borrow().len(), 1, "报错前不该发 bootstrap");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `kickstart` 自己失败（rc≠0）必须如实 Err —— 「拉不起来」不能报成成功。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_service_supervised_reports_kickstart_failure() {
+        let (mut run, _) = fake_launchctl(vec![
+            ("print", 0, PRINT_NOT_RUNNING, ""),
+            ("kickstart", 1, "", "Operation not permitted"),
+        ]);
+        let plist = std::env::temp_dir().join("abb-not-exist-svc.plist");
+        let err = start_service_supervised_with(&mut *run, &plist)
+            .expect_err("kickstart rc≠0 必须 Err")
+            .to_string();
+        assert!(err.contains("Operation not permitted"), "{err}");
+    }
+
+    /// **生产接线守卫**：`pub fn start_service_supervised()` 必须委托给上面那批用例覆盖的
+    /// `_with` 实现，并且把真实 `launchctl` 传进去（否则测试测的是旁路副本：判据改回
+    /// 「只看 job_loaded」时单测照样绿，而线上照旧起不来）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_start_prod_entry_delegates_to_tested_impl() {
+        // 必须过 `src_lf`：Windows 检出是 CRLF，按 `\n` 取函数体会匹配不到（CI 实测过）。
+        let src = src_lf(include_str!("platform.rs"));
+        let impl_at = src
+            .find("fn start_service_supervised_with(")
+            .expect("可注入实现存在");
+        // macOS 那一份生产入口在实现之前（文件后面还有 Linux 的 no-op stub，同名）
+        let head = src[..impl_at]
+            .rfind("pub fn start_service_supervised()")
+            .expect("生产入口存在");
+        let tail = src[head..]
+            .find("\n}\n")
+            .map(|i| head + i)
+            .expect("函数体结束");
+        let body = &src[head..tail];
+        assert!(
+            body.contains("start_service_supervised_with(") && body.contains("launchctl"),
+            "pub fn start_service_supervised 必须调 start_service_supervised_with 并传真实 launchctl\n{body}"
+        );
     }
 
     /// 漂移判定四态：无 plist / 指向当前二进制 / 指向已消失的旧路径 / 指向另一份
