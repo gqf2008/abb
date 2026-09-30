@@ -5041,9 +5041,17 @@ pub fn run_gui() -> Result<()> {
                     if install::is_desired() && !st.running {
                         crate::log!("[watchdog] service 意外退出，自动重拉");
                         // 反评 R29 P3：自动重拉失败也不能零留痕（这是全仓最后一处 `let _ =` 丢弃 Err）。
-                        if let Err(e) = install::svc_start() {
-                            crate::log!("[watchdog] 自动重拉失败：{e:#}");
-                        }
+                        // 2026-09-30（abb-mac-svc-supervised-start-20260930）：托管形态下这次
+                        // 「拉起来」会 spawn 外部命令，而本 tick 跑在 **UI 线程** —— 实测存在命令
+                        // 长时间不返回的形态（EX_CONFIG 的 job 上 `launchctl kickstart` >20s 挂住，
+                        // 见 platform.rs 的 LAUNCHCTL_TIMEOUT），同步做就会「bridge 起不来」连带
+                        // 「托盘冻死」（评审 R1 的 B1）。故两边都保留：放后台线程 + 失败留痕；
+                        // 起没起来由下一拍读 pid 文件复验（install::status）。
+                        std::thread::spawn(|| {
+                            if let Err(e) = install::svc_start() {
+                                crate::log!("[watchdog] 自动重拉失败：{e:#}");
+                            }
+                        });
                     }
                     if let Some(t) = tray_weak.upgrade() {
                         push_status(&t, &st);
