@@ -28,6 +28,13 @@
 //!
 //! 非 Windows 平台为占位 main（拒绝运行），对齐既有 `src/bin/abb-helper.rs` 的写法。
 
+// **GUI 子系统**：helper 只经命名管道通信、契约里没有 stdio；保持 console 子系统时，任何
+// 忘了 `SW_HIDE` 的调用方、或用户直接双击它，都会凭空弹一个控制台窗口（2026-09-30 owner 实报）。
+// 代价：无控制台时 stdout/stderr 句柄无效，`println!`/`eprintln!` 会 panic —— 故本文件内所有
+// 输出都改成 `let _ = writeln!(...)`（对齐 `main.rs` 里 `log!` 的写法：写失败即丢弃）。
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+use std::io::Write;
 use std::process::ExitCode;
 
 // 退出码只在 Windows 分支用到 → 必须 `cfg` 门控，否则 macOS/Linux 上会因
@@ -59,7 +66,7 @@ fn main() -> ExitCode {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        eprintln!("abb-elev-helper is Windows-only");
+        let _ = writeln!(std::io::stderr(), "abb-elev-helper is Windows-only");
         ExitCode::FAILURE
     }
 }
@@ -70,14 +77,21 @@ fn run() -> ExitCode {
 
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--version") {
-        println!("abb-elev-helper {}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(
+            std::io::stdout(),
+            "abb-elev-helper {}",
+            env!("CARGO_PKG_VERSION")
+        );
         return ExitCode::from(EXIT_OK);
     }
     let args = match parse_args(&argv) {
         Ok(args) => args,
         Err(msg) => {
-            eprintln!("{msg}");
-            eprintln!("usage: abb-elev-helper --pipe <pipe-name> --token <32-hex>");
+            let _ = writeln!(std::io::stderr(), "{msg}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "usage: abb-elev-helper --pipe <pipe-name> --token <32-hex>"
+            );
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -86,19 +100,23 @@ fn run() -> ExitCode {
     let watchdog = elev::HELPER_TIMEOUT;
     std::thread::spawn(move || {
         std::thread::sleep(watchdog);
-        eprintln!("[elev] 看门超时（{}s），退出", watchdog.as_secs());
+        let _ = writeln!(
+            std::io::stderr(),
+            "[elev] 看门超时（{}s），退出",
+            watchdog.as_secs()
+        );
         std::process::exit(EXIT_TIMEOUT.into());
     });
 
     let server = match win::PipeServer::create(&args.pipe) {
         Ok(server) => server,
         Err(e) => {
-            eprintln!("[elev] 创建管道失败：{e}");
+            let _ = writeln!(std::io::stderr(), "[elev] 创建管道失败：{e}");
             return ExitCode::from(EXIT_PIPE);
         }
     };
     if let Err(e) = server.accept() {
-        eprintln!("[elev] 等客户端连接失败：{e}");
+        let _ = writeln!(std::io::stderr(), "[elev] 等客户端连接失败：{e}");
         return ExitCode::from(EXIT_PIPE);
     }
     // 调用方进程 pid（管道对端）。审计用它回答「谁提的」，而 `install-bridge-task` 还要用它
@@ -113,7 +131,7 @@ fn run() -> ExitCode {
     let mut body = match server.read_frame(elev::MAX_BODY) {
         Ok(body) => body,
         Err(e) => {
-            eprintln!("[elev] 读请求失败：{e}");
+            let _ = writeln!(std::io::stderr(), "[elev] 读请求失败：{e}");
             return ExitCode::from(EXIT_PIPE);
         }
     };
@@ -126,7 +144,7 @@ fn run() -> ExitCode {
                 elev::codes::AUDIT_FAILED,
                 "审计目录不可用，已拒绝执行（fail-closed）",
             );
-            eprintln!("[elev] {e}");
+            let _ = writeln!(std::io::stderr(), "[elev] {e}");
             let _ = reply(&server, &resp);
             elev::wipe_bytes(&mut body);
             return ExitCode::from(EXIT_AUDIT);
@@ -150,7 +168,7 @@ fn run() -> ExitCode {
         Ok(()) => ExitCode::from(EXIT_OK),
         Err(e) => {
             // 审计已经落盘，但调用方拿不到回应 → 非 0 退出，让调用方知道「这次不算数」。
-            eprintln!("[elev] 写响应失败：{e}");
+            let _ = writeln!(std::io::stderr(), "[elev] 写响应失败：{e}");
             ExitCode::from(EXIT_REPLY)
         }
     }
