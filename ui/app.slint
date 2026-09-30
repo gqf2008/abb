@@ -2776,19 +2776,29 @@ export component SettingsWindow inherits Window {
                                         VerticalBox {
                                             spacing: 2px;
                                             for s[idx] in root.chat-sessions: Rectangle {
-                                                // 高度按**内容**走，不钉死：soft 预设下两行（标题 12px 粗 + 预览 12px）
-                                                // 实测需要 ~58px，钉死 52px 会让第二行溢出高亮带（错位）、且
-                                                // ScrollView 的内容高度按 52 记 ⇒ 末尾几像素永远滚不到（拉不到底）。
-                                                // min-height 只保证最小观感，内容更高时自动增高。
-                                                min-height: 52px;
+                                                // ⚠️ std-widgets 的 HorizontalBox/VerticalBox 默认 padding 是
+                                                //    StyleMetrics.layout-padding（本机 8px）：行内每个 HorizontalBox
+                                                //    光上下 padding 就 16px，一行文本实测 30px（8+14+8），两行 62px 塞进
+                                                //    52px 行框 ⇒ 布局压缩后第二行画到行外、选中高亮只盖第一行
+                                                //    （用户报的「会话列表错位」）。故行内 box 的 padding 全部显式归零，
+                                                //    行内留白只用 padding-left 表达（18px = 原 10px + HBox 的 8px）；
+                                                //    内容块 14+2+14 = 30px，在 52px 行内居中。
+                                                // 行高取**确定值**：ScrollView 的内容高度 = max(视口高, 内容布局
+                                                //    min-height)，而 min-height 求和使用每行的 min；行若「按内容自动
+                                                //    增高」，渲染高度就会大于参与换算的 min，末尾几行永远滚不到
+                                                //    （用户报的「拉不到底」）。
+                                                height: 52px;
                                                 vertical-stretch: 0;
                                                 background: idx == root.chat-selected ? PixelTheme.accent : transparent;
                                                 TouchArea {
                                                     clicked => { root.chat-selected = idx; root.history-selection-changed(idx); }
                                                     VerticalBox {
-                                                        padding-left: 10px;
+                                                        padding: 0px;
+                                                        padding-left: 18px;
                                                         spacing: 2px;
+                                                        alignment: LayoutAlignment.center;
                                                         HorizontalBox {
+                                                            padding: 0px;
                                                             spacing: 6px;
                                                             Text {
                                                                 text: (s.kind-tag == "" ? "" : "[" + s.kind-tag + "] ") + s.sender;
@@ -2806,6 +2816,7 @@ export component SettingsWindow inherits Window {
                                                             }
                                                         }
                                                         HorizontalBox {
+                                                            padding: 0px;
                                                             spacing: 6px;
                                                             Text {
                                                                 text: s.preview;
@@ -2865,7 +2876,15 @@ export component SettingsWindow inherits Window {
                                                     color: UiTokens.text-dim;
                                                 }
                                                 Text {
-                                                    width: 100%;
+                                                    // 宽度必须绑 **px 值**（parent.width），不能写 width: 100%：
+                                                    // ScrollView 的内容高度取内容布局的 min-height，而布局算子项
+                                                    // min/preferred 时给换行 Text 的横轴约束未定，百分比宽度在这条
+                                                    // 路径上解析不出来 —— Slint 按「整段一行」估高（每条消息少算一行），
+                                                    // 内容高度小于真实渲染高度 ⇒ 末尾几条消息永远滚不到
+                                                    // （用户报的「对话历史消息拉不到底」）。
+                                                    // 实测（2026-10-01，30 条）：100% → content-height 1160 / 实际渲染
+                                                    // 1272（末尾 3 条不可达）；parent.width → 1272。
+                                                    width: parent.width;
                                                     text: m.text;
                                                     font-size: 12px;
                                                     color: PixelTheme.text;
