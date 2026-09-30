@@ -72,6 +72,7 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 | 文件 | 处置 | 说明 |
 |---|---|---|
+| `acp.rs` | ABB 扩展字段（追加） | **agent 进程 job 守卫（2026-09-30，批 abb-win-mcp-orphan）**：`spawn()` 拿到子进程后经 `agent_spawn::assign_kill_on_close_job` 把它放进 `KILL_ON_JOB_CLOSE` job，守卫句柄存进 `AcpClient.job`，随客户端 Drop 关闭 ⇒ 内核连带杀掉 agent 的**整棵树**（含它为每个 session 起的 MCP 服务 `wassette` / `mcp-events`）。上游无此概念（unix 靠进程组 kill 表达同一语义），同步时保留该字段与调用。 |
 | `redact.rs` | 新增（**非**同步区） | **面向用户的错误文本卫生（2026-09-29，复评 F3）**：`mask_secrets`（≥32 连续十六进制 与 api_key/apikey/secret/token/password/Bearer 的**值**掩码，零正则）+ `flatten_line` + `error_with_stderr_tail`。它只服务「失败可见化」，上游无此概念、也不改任何协议行为。 |
 | `acp.rs` | ABB 扩展字段（追加） | **子进程 stderr 尾巴（2026-09-29，复评 F3）**：`spawn` 的 stderr 从 `inherit` 改 `piped`，后台任务逐行回显（等价旧 inherit，bridge 侧日志照旧可见）并收进有界环形缓冲 `stderr_tail`（12 行 / 每行 300 字符，见 `STDERR_TAIL_LINES`/`STDERR_LINE_CHARS`）；新增只读访问器 `AcpClient::stderr_tail()`；`shutdown` 给 reader 一个有界（300ms）收尾窗口，保证 kill 之后子进程的**临终输出**也进尾巴。上游同步时保留该差异。 |
 | `harness.rs` | ABB 扩展字段（追加） | **启动失败文案并上 stderr 尾巴（2026-09-29，复评 F3）**：`spawn_and_init_agent` 的两条失败臂（initialize 失败 / 60s 超时）经 `redact::error_with_stderr_tail` 把子进程 stderr 尾巴（脱敏 + 折行 + 截断）并进 `SpawnOutcome::Err`，从而进入 `last_start_error` 与用户提示——owner 实报的 elevated 场景里，真正的病句（`BUZZ_AGENT_PROVIDER is required`）正是**只**出现在 stderr。 |
