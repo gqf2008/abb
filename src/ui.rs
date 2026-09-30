@@ -5690,6 +5690,28 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
 #[cfg(test)]
 mod tests {
 
+    /// ABB 的观感固定为 slint-pixel 的 **soft（柔彩）预设**（owner 2026-09-30 指定「主题选 soft」）。
+    ///
+    /// 判别力：把 `ui/app.slint` 里那行 `init => { PixelPresets.soft(); }` 删掉、或改成别的预设
+    /// （例如库默认的 `classic()`），本用例即红。注意这**只**锁「我们调用的是 soft」这一事实；
+    /// `soft()` 自身的 token 值归 slint-pixel 仓库的守卫管（`every_preset_writes_every_token`）。
+    #[test]
+    fn app_theme_applies_slint_pixel_soft_preset() {
+        let src = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        assert!(
+            src.contains("PixelPresets"),
+            "ui/app.slint 必须从 @slint_pixel 导入 PixelPresets"
+        );
+        assert!(
+            src.contains("PixelPresets.soft()"),
+            "SettingsWindow 的 init 必须套用 soft 预设（owner 指定；换主题请连同本守卫与 Cargo.toml 注释一起改）"
+        );
+        assert!(
+            !src.contains("PixelPresets.classic()"),
+            "不得退回库默认的 classic（黑白直角）"
+        );
+    }
+
     /// `round_rect_bands` 的形状不变量：**穷举**小尺寸 × 多个半径，断言
     /// ①没有任何反向矩形（`x2 <= x1` / `y2 <= y1`）②不越界 ③带与带首尾相接且互不重叠。
     ///

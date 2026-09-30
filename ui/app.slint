@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelPresets, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 // ═══════════ 设计令牌（UI/UX 审查）：语义色集中定义，替换全部硬编码彩色 ═══════════
@@ -1126,6 +1126,15 @@ export component TeamDialog inherits Window {
 
 // 设置窗主体。
 export component SettingsWindow inherits Window {
+    // 主题：slint-pixel 0.3.0 的「soft（柔彩）」预设 —— 暖米底 + 墨黑硬描边 + 暖黄主色 + 8px 圆角
+    // （owner 2026-09-30 指定：主题选 soft）。预设只写 PixelTheme token，因此 ABB 自己的语义色
+    // （UiTokens 按 PixelTheme.scheme 分支）与各处对组件属性的覆盖都照旧生效。
+    // 为什么挂在 SettingsWindow 的 init：`init` 回调只有 Window 派生组件才有（Tray 继承的是
+    // SystemTrayIcon，构建期实测报 "init is not a callback in SystemTrayIcon"），而 SettingsWindow
+    // 是 GUI 启动时**无条件实例化**的窗口 ⇒ 这里套一次，全局 PixelTheme 对所有窗口生效。
+    // 以后要开放「主题选择」：把这行换成 `PixelPresets.apply(name)`（10 套清单见 PixelPresets.names）。
+    init => { PixelPresets.soft(); }
+
     // 像素风自绘窗口：无系统边框/红绿灯，PixelTitleBar 自绘标题栏（拖拽/最小化/最大化/关闭）
     no-frame: true;
     // 打开时由 Rust 侧提升为 regular 策略（带 dock 图标 + 置前聚焦），关掉降回 accessory。
