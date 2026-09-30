@@ -1093,7 +1093,13 @@ fn supervised_start_action(state: JobState) -> SupervisedStart {
 /// `kickstart` 对「在跑」/「优雅停下」两种 job 都是瞬时返回），但 job 处于 `EX_CONFIG` 形态
 /// （程序不存在：`state = spawn scheduled`、`runs = 1`、`last exit code = 78: EX_CONFIG`、
 /// **无 pid 行**）时 `launchctl kickstart` **>20s 不返回**（同批 `print`/`bootout` 仍瞬时）。
-/// 5s 给正常路径留了三个数量级余量，又不让异常路径无限期挂着。
+///
+/// 已知不精确处（评审 R2 实测，如实记下）：plist 带 `ThrottleInterval=10` 时，**会成功**的
+/// `kickstart` 也可能要等到节流窗口过去才返回（实测 9.006s；客户端被我们 kill 后，launchd 仍会
+/// 在 +10s 完成那次 spawn）。所以 5s 在「被节流的成功」这一支上会先报一次 `TimedOut` —— 表现为
+/// 一条 `[watchdog] 自动重拉失败` 日志 + 下一拍（2s）复验时 job 已在跑；**没有功能损失**
+/// （看门狗判活读的是 pid 文件），只是日志噪声。改成 >10s 会把「真挂住」那条路的线程寿命拉长
+/// （2s tick ⇒ 并发数 = 上界/tick），故取 5s 换更小的资源占用。
 #[cfg(target_os = "macos")]
 const LAUNCHCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -2181,6 +2187,12 @@ mod tests {
         assert!(
             body.contains("start_service_supervised_with(") && body.contains("launchctl"),
             "pub fn start_service_supervised 必须调 start_service_supervised_with 并传真实 launchctl\n{body}"
+        );
+        // 反向（评审 R1 的 O1 / R2 复测 M5）：保留上面两个受检子串、却塞回「已加载就早退」
+        // 的旧判据时，子串断言照样绿 —— 那正好是本批要修的 bug，故这里把旁路也钉住。
+        assert!(
+            !body.contains("job_loaded"),
+            "生产入口不得再判 job_loaded（「已加载」≠「在跑」，那是本批修掉的静止态根因）\n{body}"
         );
     }
 
