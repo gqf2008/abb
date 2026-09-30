@@ -9,6 +9,7 @@ use crate::auth::{PkceOAuthConfig, PkceOAuthTokenSource, StaticTokenSource, Toke
 use crate::config::{
     is_openai_host, normalize_effort_for_anthropic_route, normalize_effort_for_databricks_v2,
     normalize_effort_for_provider, Config, OpenAiApi, Provider, ThinkingEffort,
+    MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::types::{
     AgentError, HistoryItem, LlmResponse, ProviderStop, ToolCall, ToolDef, ToolResultContent,
@@ -587,9 +588,22 @@ fn anthropic_body(
             HistoryItem::Assistant {
                 text,
                 tool_calls,
-                reasoning_details: _,
+                reasoning_details,
             } => {
                 flush(&mut messages, &mut pending);
+                // #7840（上游 0cc63fe3e）：原生 Anthropic 块带签名 thinking，可能交错
+                // 出现。必须按**原始顺序**整块回放，而不是压平成 text + tool_calls ——
+                // 压平会改掉签名内容，provider 侧直接拒。
+                if let Some(blocks) = reasoning_details
+                    .as_ref()
+                    .and_then(|v| v.get("anthropic_content"))
+                    .and_then(Value::as_array)
+                {
+                    if !blocks.is_empty() {
+                        messages.push(json!({ "role": "assistant", "content": blocks }));
+                    }
+                    continue;
+                }
                 let mut content: Vec<Value> = Vec::new();
                 if !text.is_empty() {
                     content.push(json!({ "type": "text", "text": text }));
@@ -687,6 +701,9 @@ fn stamp_rolling_cache_breakpoint(messages: &mut [Value]) {
             .get_mut("content")
             .and_then(Value::as_array_mut)
             .and_then(|c| c.last_mut())
+            // #7840（上游 0cc63fe3e）：thinking / redacted_thinking 必须逐字节不变，
+            // 也不能挂显式 cache breakpoint。
+            .filter(|b| !matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
             .and_then(Value::as_object_mut)
         {
             block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
@@ -745,7 +762,9 @@ fn openai_body(
                 let mut msg = serde_json::Map::new();
                 msg.insert("role".into(), json!("assistant"));
                 msg.insert("content".into(), json!(text.as_str()));
-                if let Some(details) = reasoning_details {
+                // #7840（上游 0cc63fe3e）：OpenRouter 自己拥有 array 形状；会话中途换模型时
+                // 原生 Anthropic 状态不得泄漏进 Chat 请求。
+                if let Some(details) = reasoning_details.as_ref().filter(|v| v.is_array()) {
                     msg.insert("reasoning_details".into(), details.clone());
                 }
                 if !tool_calls.is_empty() {
@@ -1385,6 +1404,13 @@ fn parse_anthropic(v: Value) -> Result<LlmResponse, AgentError> {
             }
         }
     }
+    // #7840（上游 0cc63fe3e）：其它 provider 的超量调用是**截断**处理的；原生 content 必须
+    // 完整回放，所以这里在任何工具执行之前直接拒绝，而不是悄悄改动签名/交错状态。
+    if tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
+        return Err(AgentError::Llm(format!(
+            "Anthropic response exceeds {MAX_TOOL_CALLS_PER_TURN} tool calls; cannot truncate native content"
+        )));
+    }
     // anthropic_input_tokens() returns Option<SumUsageResult> because it sums
     // three fields that can collectively overflow u64. Propagate the overflow
     // signal via `input_tokens_overflowed` so the run loop can poison the
@@ -1414,7 +1440,13 @@ fn parse_anthropic(v: Value) -> Result<LlmResponse, AgentError> {
         // total from them. Always None for this provider.
         total_tokens: None,
         reasoning,
-        reasoning_details: None,
+        // #7840（上游 0cc63fe3e）：把有序原生 content 块存成 provider 自己的回放状态。
+        // 被截断（MaxTokens）的内容不是合法的签名 assistant 回合 —— 那时只保留 text。
+        reasoning_details: v
+            .get("content")
+            .filter(|v| v.is_array())
+            .filter(|_| stop != ProviderStop::MaxTokens)
+            .map(|blocks| json!({ "anthropic_content": blocks })),
         // Stamped by the dispatch layer (complete) after parse.
         request_model: None,
     })

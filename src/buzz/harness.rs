@@ -39,7 +39,12 @@ use crate::buzz::queue::{
 };
 
 /// 回合空闲超时：agent 静默（无 ACP 线活动）这么久判死。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+///
+/// 必须**长于** fork 的工具超时墙（`BUZZ_AGENT_TOOL_TIMEOUT_SECS`，默认 1260s，
+/// 上游 #7185）：工具墙先到，模型能拿到「工具超时」并在同一回合里换个做法；
+/// 空闲墙先到就变成整回合被杀，用户只看到一句笼统失败。排序：
+/// 工具 1260 < 空闲 1500 < 单回合硬上限 [`MAX_TURN_DURATION`] 3600。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(1_500);
 /// 单回合硬上限（chat 与 job 同款；job 同步等待预算 = 本值 + 小余量）。
 pub const MAX_TURN_DURATION: Duration = Duration::from_secs(3600);
 /// 崩溃重拉退避：2^level 秒封顶 [`RESPAWN_BACKOFF_MAX_SECS`]。
