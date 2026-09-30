@@ -1230,6 +1230,23 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                     &batch,
                     "⚠️ 处理失败：随包 agent 不支持受限执行档位（请升级 ABB 后重试）。".to_string(),
                 );
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_model_not_found(e)) {
+                // #7538（上游 051c3a270）：agent 报「配置的模型在 provider 端不存在」——
+                // **不可重试**：同一个不存在的模型重试多少次都不会自愈，只会把失败回复
+                // 拖到重试耗尽。当场死信并给可行动提示。走 notify_channel（而非上游的
+                // relay 发布面）：它会同时把终态 Err 旁路给同步等待者，job/oneshot 才不会
+                // 只表现为「挂到超时」。
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    "dead-lettering batch — model not found"
+                );
+                notify_channel(
+                    l,
+                    handle,
+                    &batch,
+                    "⚠️ 处理失败：当前配置的模型在 provider 端不存在。请在 ABB 配置里换用可用模型后重发。"
+                        .to_string(),
+                );
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // 认证错误不可重试：立即死信并提示重登。
                 tracing::warn!(
@@ -1480,6 +1497,19 @@ fn is_auth_error(error: &AcpError) -> bool {
         return false;
     };
     message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+/// #7538（上游 051c3a270）：agent 报「配置的模型在 provider 端不存在」——`-32002` 且
+/// message 含 `model not found`。**不可重试**：重试同一个不存在的模型不可能自愈。
+///
+/// 只认模型类 `-32002`：同码的其它 resource-not-found（如 `Resource not found: session
+/// no longer exists`）仍走原有 requeue —— 误判会把本可自愈的批次当场死信（上游为这条
+/// 专门加了回归 `non_model_resource_not_found_is_requeued`）。
+fn is_model_not_found(error: &AcpError) -> bool {
+    let AcpError::AgentError { code, message } = error else {
+        return false;
+    };
+    *code == -32002 && message.contains("model not found")
 }
 
 /// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
@@ -2171,5 +2201,38 @@ mod redact_tests {
         // 技能名带空格（异常形态）保守跳过
         let weird = "- /Users/x/skills/my skill/SKILL.md";
         assert_eq!(redact_skill_paths(weird), weird);
+    }
+}
+
+/// #7538（上游 051c3a270「report missing models without retrying」）的判据回归。
+///
+/// 为什么值得单测：这条判据决定一个批次是**当场死信**还是**继续重排**，而两者只差
+/// `-32002` 里的一句 message。上游为「同码不同因」专门加了回归，ABB 侧同样要钉住——
+/// 误判会把本可自愈的 session 过期类错误直接判死。
+#[cfg(test)]
+mod model_not_found_tests {
+    use super::*;
+
+    /// 模型缺失：-32002 + model not found ⇒ 不可重试。
+    #[test]
+    fn matches_missing_model() {
+        assert!(is_model_not_found(&AcpError::AgentError {
+            code: -32002,
+            message: "llm model not found: gpt-x".to_string(),
+        }));
+    }
+
+    /// 同码不同因（会话过期等其它 resource-not-found）**仍可重排**；
+    /// 码不同（-32000，如用量/额度类）也不归这条管。
+    #[test]
+    fn other_resource_not_found_is_still_retryable() {
+        assert!(!is_model_not_found(&AcpError::AgentError {
+            code: -32002,
+            message: "Resource not found: session no longer exists".to_string(),
+        }));
+        assert!(!is_model_not_found(&AcpError::AgentError {
+            code: -32000,
+            message: "model not found".to_string(),
+        }));
     }
 }

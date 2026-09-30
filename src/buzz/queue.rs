@@ -1089,7 +1089,7 @@ pub struct FormatPromptArgs<'a> {
     pub channel_info: Option<&'a PromptChannelInfo>,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
-    /// (legacy agents), they are injected as `<base>` and `<system>` sections.
+    /// (legacy agents), they are injected as `<base>` and `<agent-instructions>` sections.
     pub has_system_prompt_support: bool,
     /// Base prompt content for legacy agents (protocol_version < 2).
     pub base_prompt: Option<&'a str>,
@@ -1113,7 +1113,7 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// Format a [`FlushBatch`] into the per-section prompt blocks for the agent.
 ///
 /// Produces a stable prompt with these sections (in order):
-/// 0. Standing context — `<base>`, `<system>`. Legacy agents only (see
+/// 0. Standing context — `<base>`, `<agent-instructions>`. Legacy agents only (see
 ///    `has_system_prompt_support` / `standing_context_sent`).
 /// 1. `<context>` — scope, channel name, description, delivery note.
 /// 2. `<user-message>` / `<user-messages>` — the triggering message(s).
@@ -1144,7 +1144,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             sections.push(base_section(bp));
         }
         if let Some(sp) = args.system_prompt {
-            sections.push(crate::buzz::prompt_framing::semantic_section("system", sp));
+            sections.push(crate::buzz::prompt_framing::semantic_section(
+                "agent-instructions",
+                sp,
+            ));
         }
     }
 
