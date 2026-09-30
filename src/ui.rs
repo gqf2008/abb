@@ -305,6 +305,20 @@ fn display_name(name: &str, kind: &str) -> String {
     }
 }
 
+/// 服务动作（启动/停止/重启）失败时的 toast 文案。
+///
+/// 单行、给**动作 + 原因**：toast 是用户唯一能看到的反馈（细节留在 logs/bridge.out）。
+/// Windows 上追加可操作提示 —— 「权限不足」是高完整性形态最常见的失败原因，而这一态下
+/// 普通权限怎么点都不会生效，必须告诉用户往哪走（2026-09-29 owner 实报「停不了也没提示」）。
+fn svc_action_toast(action: &str, err: &anyhow::Error) -> String {
+    let hint = if cfg!(target_os = "windows") {
+        "（若为权限不足：用设置页「以管理员身份重启」，或检查任务计划程序里的 ABB-Bridge）"
+    } else {
+        ""
+    };
+    crate::agent::truncate(&format!("{action}：{err}{hint}"), 200)
+}
+
 fn push_status(tray: &Tray, st: &install::ServiceStatus) {
     tray.set_service_running(st.running);
     // 各 bot 运行态（来自 service 心跳）
@@ -2024,12 +2038,13 @@ pub fn run_gui() -> Result<()> {
 
     // ── 后台 tokio 线程：处理慢操作（HTTP/起停），结果回主线程 ──
     let tray_weak_bg = tray.as_weak();
-    // 评审 R22 的 P8c：授权停止**失败/被取消**时要看得见（否则点了「停止」像没反应）。
-    // `slint::Timer`/`Rc<Cell<_>>` 都不是 Send，不能进后台线程 —— 这里只跨线程传字符串，
-    // 由 UI 线程的 2s 定时器负责弹出（复用未读提醒那套 toast + 5s 自动收起）。
-    let stop_fail_toast: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+    // 评审 R22 的 P8c + 2026-09-29 owner 实报（Windows「停不了/重启不了也没提示」）：
+    // **启动/停止/重启三种服务动作失败都必须看得见**。`slint::Timer`/`Rc<Cell<_>>` 都不是
+    // Send，不能进后台线程 —— 这里只跨线程传字符串，由 UI 线程的 2s 定时器负责弹出
+    // （复用未读提醒那套 toast + 5s 自动收起）。
+    let svc_toast: std::sync::Arc<std::sync::Mutex<Option<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
-    let stop_fail_toast_bg = stop_fail_toast.clone();
+    let svc_toast_bg = svc_toast.clone();
     // 版本升级：最近一次检查发现的可用新版本（CheckUpdate 写，InstallUpdate 读）
     let latest_rel =
         std::sync::Arc::new(std::sync::Mutex::new(None::<crate::updater::LatestRelease>));
@@ -2042,22 +2057,36 @@ pub fn run_gui() -> Result<()> {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     UiCmd::Start => {
-                        let _ = install::svc_start();
+                        // 起没起来要确认：起完即退（单实例锁被占）在旧实现里是静默的。
+                        if let Err(e) =
+                            install::svc_start_verified(std::time::Duration::from_secs(5))
+                        {
+                            crate::log!("[watchdog] 启动服务未完成：{e:#}");
+                            if let Ok(mut slot) = svc_toast_bg.lock() {
+                                *slot = Some(svc_action_toast("启动未完成", &e));
+                            }
+                        }
                         refresh(&tray_weak_bg);
                     }
                     UiCmd::Stop => {
                         // 本批起「停止」需要授权（owner：服务不能被随便杀死）。
                         if let Err(e) = install::svc_stop_authorized() {
                             crate::log!("[watchdog] 停止服务未完成：{e:#}");
-                            // 交给 UI 线程弹 toast（见上面的 stop_fail_toast 说明）。
-                            if let Ok(mut slot) = stop_fail_toast_bg.lock() {
-                                *slot = Some(format!("停止未完成：{e}"));
+                            // 交给 UI 线程弹 toast（见上面的 svc_toast 说明）。
+                            if let Ok(mut slot) = svc_toast_bg.lock() {
+                                *slot = Some(svc_action_toast("停止未完成", &e));
                             }
                         }
                         refresh(&tray_weak_bg);
                     }
                     UiCmd::Restart => {
-                        install::svc_restart();
+                        // 旧实现只写日志不弹提示 ⇒ Windows 上「点了重启没反应」查无实据。
+                        if let Err(e) = install::svc_restart() {
+                            crate::log!("[watchdog] 重启服务未完成：{e:#}");
+                            if let Ok(mut slot) = svc_toast_bg.lock() {
+                                *slot = Some(svc_action_toast("重启未完成", &e));
+                            }
+                        }
                         refresh(&tray_weak_bg);
                     }
                     UiCmd::OpenLogs => platform::open_path(&crate::bridge_dir().join("logs")),
@@ -2075,7 +2104,10 @@ pub fn run_gui() -> Result<()> {
                             && install::status().running
                             && bots_struct_sig(&prev) != bots_struct_sig(&cfg)
                         {
-                            install::svc_restart();
+                            // 后台热重启：失败写日志即可（配置已保存；服务没起来时看门狗会再拉）。
+                            if let Err(e) = install::svc_restart() {
+                                crate::log!("[watchdog] 保存后热重启失败：{e:#}");
+                            }
                         }
                         // 接入飞书 bot → 后台自动装 lark-cli + lark 技能（幂等/best-effort）。
                         // GUI 路径免等 service 重启；装不上只 log 警告。只对飞书 bot 触发。
@@ -2299,7 +2331,12 @@ pub fn run_gui() -> Result<()> {
                                         // 用 keep_desired：这次停是为了让安装器换文件，不是
                                         // 「用户不要 bridge 了」。清掉标记的话，重启后的新实例
                                         // 看门狗不会把 service 拉回来 —— 升级完看着像「ABB 没运行」。
-                                        install::svc_stop_keep_desired();
+                                        // 停不掉也要继续走安装（装完会重启），但必须留痕。
+                                        if let Err(e) = install::svc_stop_keep_desired() {
+                                            crate::log!(
+                                                "[watchdog] 升级前停 service 失败（继续安装）：{e:#}"
+                                            );
+                                        }
                                         let _ = slint::quit_event_loop();
                                     });
                                 }
@@ -4957,8 +4994,8 @@ pub fn run_gui() -> Result<()> {
         let notif_weak = notifications.as_weak();
         let notif_showing = notif_showing.clone();
         let notif_timer = notif_timer.clone();
-        // P8c：后台线程只在 `stop_fail_toast` 里放一句话，这里负责弹（见其定义处注释）。
-        let stop_fail_toast = stop_fail_toast.clone();
+        // P8c：后台线程只在 `svc_toast` 里放一句话，这里负责弹（见其定义处注释）。
+        let svc_toast = svc_toast.clone();
         // 虚拟 Bot 确认弹窗 weak（#75：解散/取消登记结果回填——成功关窗/失败可见）
         let vb_confirm_weak = vb_confirm.as_weak();
         // 确认弹窗待执行操作（失败重试时保留；成功才 take 清空）
@@ -4974,8 +5011,8 @@ pub fn run_gui() -> Result<()> {
                 let wk = wk.clone();
                 move || {
                     let _keep = &tray_hold;
-                    // P8c：授权停止失败/被取消 → 弹一次可见提示（与未读提醒同一套 toast + 5s 收起）
-                    let pending_toast = stop_fail_toast.lock().ok().and_then(|mut s| s.take());
+                    // P8c：启动/停止/重启服务失败 → 弹一次可见提示（与未读提醒同一套 toast + 5s 收起）
+                    let pending_toast = svc_toast.lock().ok().and_then(|mut s| s.take());
                     if let Some(msg) = pending_toast {
                         if let Some(n) = notif_weak.upgrade() {
                             n.set_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
@@ -5003,7 +5040,10 @@ pub fn run_gui() -> Result<()> {
                     // 看门：意图=运行但进程不在 → 崩溃，重拉（用户手动停止会清 desired，不覆盖）
                     if install::is_desired() && !st.running {
                         crate::log!("[watchdog] service 意外退出，自动重拉");
-                        let _ = install::svc_start();
+                        // 反评 R29 P3：自动重拉失败也不能零留痕（这是全仓最后一处 `let _ =` 丢弃 Err）。
+                        if let Err(e) = install::svc_start() {
+                            crate::log!("[watchdog] 自动重拉失败：{e:#}");
+                        }
                     }
                     if let Some(t) = tray_weak.upgrade() {
                         push_status(&t, &st);

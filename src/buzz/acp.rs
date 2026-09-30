@@ -17,6 +17,30 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// agent stderr 尾巴保留的行数（用户提示只看得到一句，留太多没意义）。
+const STDERR_TAIL_LINES: usize = 12;
+/// stderr 单行进尾巴前的字符上限（防一条超长行把提示撑爆）。
+const STDERR_LINE_CHARS: usize = 300;
+
+/// 把一行 stderr 收进**有界环形缓冲**（只留最后 N 行，空白行丢弃）。
+///
+/// 为什么要这份尾巴：agent 起不来时真正的一句原因（例如 BUZZ_AGENT_PROVIDER is required）
+/// 是子进程写到 stderr 的；此前 stderr 直接 inherit，supervised（计划任务）形态没有重定向
+/// ⇒ 原因彻底丢失，用户端只剩「Agent process exited unexpectedly」。
+fn push_stderr_line(buf: &std::sync::Mutex<std::collections::VecDeque<String>>, line: &str) {
+    let trimmed = line.trim_end();
+    if trimmed.trim().is_empty() {
+        return;
+    }
+    let short: String = trimmed.chars().take(STDERR_LINE_CHARS).collect();
+    if let Ok(mut g) = buf.lock() {
+        if g.len() == STDERR_TAIL_LINES {
+            g.pop_front();
+        }
+        g.push_back(short);
+    }
+}
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -175,6 +199,11 @@ pub struct AcpClient {
     /// 进程内双工传输（测试 [`Self::connect`]）时为 `None`——无进程可杀，
     /// EOF 语义由对端半边 drop 产生（与子进程退出等价）。
     child: Option<Child>,
+    /// 子进程 stderr 的**有界尾巴**（最近 STDERR_TAIL_LINES 行）——只有生产 spawn 有；
+    /// 进程内双工（测试）恒空。启动失败时由 harness 并进错误文案（见 src/redact.rs）。
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// 读 stderr 的后台任务；shutdown 时给一个有界窗口收尾，保证临终输出也进尾巴。
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
     /// Write end of the agent's stdin pipe.
     /// Box 化以兼容子进程管道与测试 duplex 两种传输（协议层零分叉）。
     stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -345,6 +374,25 @@ impl AcpClient {
             Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
             Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
         }
+        // stderr reader 收尾：kill 之后子进程的临终输出（往往正是「为什么起不来」）
+        // 还在管道里，给一个有界窗口读完，尾巴才完整。超时即放弃（不阻塞关停）。
+        if let Some(task) = self.stderr_task.take() {
+            if tokio::time::timeout(std::time::Duration::from_millis(300), task)
+                .await
+                .is_err()
+            {
+                tracing::debug!("stderr reader did not finish within 300ms");
+            }
+        }
+    }
+
+    /// 子进程 stderr 尾巴（合并成单行；空 = 没有可给用户看的内容）。
+    pub fn stderr_tail(&self) -> Option<String> {
+        let g = self.stderr_tail.lock().ok()?;
+        if g.is_empty() {
+            return None;
+        }
+        Some(g.iter().cloned().collect::<Vec<_>>().join(" "))
     }
 
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
@@ -362,8 +410,9 @@ impl AcpClient {
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Inherit stderr so agent logs are visible in the harness terminal.
-            .stderr(Stdio::inherit())
+            // stderr 也 piped：既原样回显（等价旧的 inherit，日志仍在 bridge 侧可见），
+            // 又留一份有界尾巴给「agent 起不来」的用户提示（见 stderr_tail 字段）。
+            .stderr(Stdio::piped())
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
@@ -392,11 +441,27 @@ impl AcpClient {
             .stdout
             .take()
             .ok_or_else(|| AcpError::Protocol("failed to open agent stdout".into()))?;
+        let stderr_tail =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let stderr_task = child.stderr.take().map(|err| {
+            let buf = stderr_tail.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // 等价旧的 inherit：原样回显，bridge 侧日志/管道照旧看得见。
+                    eprintln!("{line}");
+                    push_stderr_line(&buf, &line);
+                }
+            })
+        });
 
         Ok(Self::from_transport(
             Some(child),
             Box::new(stdin),
             Box::new(stdout),
+            stderr_tail,
+            stderr_task,
         ))
     }
 
@@ -406,9 +471,13 @@ impl AcpClient {
         child: Option<Child>,
         stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        stderr_task: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
             child,
+            stderr_tail,
+            stderr_task,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -432,7 +501,14 @@ impl AcpClient {
     #[cfg(test)]
     fn connect(io: tokio::io::DuplexStream) -> Self {
         let (reader, stdin) = tokio::io::split(io);
-        Self::from_transport(None, Box::new(stdin), Box::new(reader))
+        Self::from_transport(
+            None,
+            Box::new(stdin),
+            Box::new(reader),
+            // 进程内双工没有子进程 stderr：尾巴恒空。
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            None,
+        )
     }
 
     /// Start a new turn: clear accumulated reply text. Must be called by the

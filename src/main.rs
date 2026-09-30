@@ -30,6 +30,7 @@ mod pending;
 mod permreq;
 mod platform;
 mod proto;
+mod redact;
 mod schedule;
 mod service;
 mod session_gc;
@@ -163,6 +164,62 @@ pub fn write_log(writer: &mut dyn std::io::Write, args: std::fmt::Arguments<'_>)
         writer,
         format_args!("[{}] {}\n", crate::chrono_lite::now(), args),
     );
+}
+
+/// 托管（计划任务 / launchd）形态的 Windows bridge **没有可用的 stdout/stderr 句柄**：
+/// `log!` 与 tracing 的写入会被静默丢弃，`logs/bridge.out` 停在「上次由托盘拉起时」的内容
+/// —— 排障时看着像「服务没跑、也没有日志」（2026-09-30 实报：托管形态出问题只能翻任务日志）。
+///
+/// 这里在**任何输出发生之前**把 stdout/stderr 接到 `logs/bridge.out`（追加），让托管形态与
+/// 托盘形态走同一条日志通道。判据是「句柄为空/无效」：托盘 spawn 时已经重定向到同一个文件，
+/// 那种情况**不动它**（否则同一文件被两条句柄交错写）。
+#[cfg(target_os = "windows")]
+fn attach_service_log_file() {
+    use std::os::windows::io::AsRawHandle;
+
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut core::ffi::c_void;
+        fn SetStdHandle(nStdHandle: u32, hHandle: *mut core::ffi::c_void) -> i32;
+    }
+
+    // SAFETY: 两次调用都只碰本进程的标准句柄表。
+    let usable = unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        !h.is_null() && h as isize != INVALID_HANDLE_VALUE
+    };
+    if usable {
+        return;
+    }
+    let path = crate::bridge_dir().join("logs").join("bridge.out");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    // `RawHandle` 本身就是 `*mut c_void`（Windows），无需再转。
+    let raw = file.as_raw_handle();
+    // SAFETY: `raw` 来自上面的 `file`；SetStdHandle 只把它登记进本进程的标准句柄表。
+    unsafe {
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, raw);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, raw);
+    }
+    // 句柄必须活到进程结束：服务进程本就和日志文件同生命周期，故显式泄漏（不关 File）。
+    std::mem::forget(file);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_service_log_file() {
+    // launchd/systemd 形态由 supervisor 的 StandardOutPath 负责，无需在此处理。
 }
 
 #[macro_export]
@@ -404,6 +461,9 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--service") {
+        // 托管形态没有可用 stdout 时，先把日志接到 logs/bridge.out（见函数文档）；
+        // 必须在任何输出之前调用，否则 Rust 已缓存旧句柄。
+        attach_service_log_file();
         // 单实例：已有一个 --service 在跑就直接退出（flock 拿不到锁）
         let _guard = match single_instance::SingleInstance::acquire("service") {
             Ok(g) => g,

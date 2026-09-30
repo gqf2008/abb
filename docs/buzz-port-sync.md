@@ -14,6 +14,8 @@
 
 ## 文件处置表（相对 c3132c3）
 
+> 表中每行都是超长单行，后续追加说明统一记在文末「移植区变更追加登记」（同一张表的续页）。
+
 | 上游文件 | 处置 | 说明 |
 |---|---|---|
 | `queue.rs` / `pool.rs`（同步区） | ABB 扩展字段 | P0.B：`PromptChannelInfo.workspace` + `NewSessionChannelContext.workspace`——session/new 的 cwd 与 `<workspace>` 段按频道工作区（vb 群=vb/<uuid>、普通=bot 工作区）取真值，None 回落 handle cwd；上游同步时保留该字段与其透传 |
@@ -64,3 +66,13 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
 
+# 移植区变更追加登记（不逐个改写上表长行）
+
+上表每行都是超长单行，追加说明容易改坏原行；新变更登记在本节，格式与上表同义（文件 / 处置 / 说明）。
+
+| 文件 | 处置 | 说明 |
+|---|---|---|
+| `redact.rs` | 新增（**非**同步区） | **面向用户的错误文本卫生（2026-09-29，复评 F3）**：`mask_secrets`（≥32 连续十六进制 与 api_key/apikey/secret/token/password/Bearer 的**值**掩码，零正则）+ `flatten_line` + `error_with_stderr_tail`。它只服务「失败可见化」，上游无此概念、也不改任何协议行为。 |
+| `acp.rs` | ABB 扩展字段（追加） | **子进程 stderr 尾巴（2026-09-29，复评 F3）**：`spawn` 的 stderr 从 `inherit` 改 `piped`，后台任务逐行回显（等价旧 inherit，bridge 侧日志照旧可见）并收进有界环形缓冲 `stderr_tail`（12 行 / 每行 300 字符，见 `STDERR_TAIL_LINES`/`STDERR_LINE_CHARS`）；新增只读访问器 `AcpClient::stderr_tail()`；`shutdown` 给 reader 一个有界（300ms）收尾窗口，保证 kill 之后子进程的**临终输出**也进尾巴。上游同步时保留该差异。 |
+| `harness.rs` | ABB 扩展字段（追加） | **启动失败文案并上 stderr 尾巴（2026-09-29，复评 F3）**：`spawn_and_init_agent` 的两条失败臂（initialize 失败 / 60s 超时）经 `redact::error_with_stderr_tail` 把子进程 stderr 尾巴（脱敏 + 折行 + 截断）并进 `SpawnOutcome::Err`，从而进入 `last_start_error` 与用户提示——owner 实报的 elevated 场景里，真正的病句（`BUZZ_AGENT_PROVIDER is required`）正是**只**出现在 stderr。 |
+| `harness.rs` | ABB 扩展字段（追加） | **失败原因留存（2026-09-29，批 abb-win-failure-visibility）**：新增 `BuzzHandle.last_start_error`（`Mutex<Option<String>>`）+ `last_start_error()` / `set_last_start_error()`——`handle_spawn_outcome` 的 `SpawnOutcome::Err` 臂与 `schedule_death_respawn`（运行中崩溃）写入真实原因，启动成功臂清空；桥侧预检 `AgentDown` 的回复据此把原因带给用户（旧文案只有「未就绪（启动失败/崩溃退避中）」，用户看不出是缺 `abb-spawner.exe`、取不到桌面令牌、被 EDR 拦还是初始化失败）。上游无此概念，同步时保留。 |

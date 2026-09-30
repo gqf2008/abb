@@ -1225,7 +1225,17 @@ pub fn service_supervised() -> bool {
 /// owner 要求的**授权动作**，走提权 helper）。
 #[cfg(target_os = "windows")]
 pub fn restart_service_supervised() -> Result<()> {
-    let _ = run_schtasks(&["/end", "/tn", agent_bridge::svc_task::TASK_NAME]);
+    // `/end` 是 best-effort（任务没在跑时它也会非 0），但**不能静默**：结果要留痕，
+    // 否则「重启没反应」在日志里看不出任何东西（2026-09-29 owner 实报）。
+    match run_schtasks(&["/end", "/tn", agent_bridge::svc_task::TASK_NAME]) {
+        Ok(o) if o.status.success() => crate::log!("[svc] schtasks /end 已发出（任务已停）"),
+        Ok(o) => crate::log!(
+            "[svc] schtasks /end 退出码 {}（任务未在跑也算正常）：{}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => crate::log!("[svc] schtasks /end 执行失败（继续尝试 /run）：{e:#}"),
+    }
     let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
         .context("执行 schtasks /run 失败")?;
     if !out.status.success() {
@@ -1278,7 +1288,13 @@ pub fn stop_service_authorized() -> Result<()> {
             let cancelled = e
                 .to_string()
                 .contains(agent_bridge::elev::ERR_ELEVATION_CANCELLED);
-            if !cancelled && svc_task_state() == SvcTask::Absent {
+            let state = svc_task_state();
+            // 诊断先落盘（owner 2026-09-29 实报「停不了也没提示」）：这一行能直接区分
+            // 「UAC 被取消 / helper 起不来 / 任务不在 ⇒ 走 pid 兜底」三种形态。
+            crate::log!(
+                "[svc] 授权停止未成功：task_state={state:?} cancelled={cancelled} err={e:#}"
+            );
+            if !cancelled && state == SvcTask::Absent {
                 crate::log!(
                     "[svc] 常驻任务不存在（非托管形态）：已取得授权，交由调用方按 pid 停止（{e:#}）"
                 );

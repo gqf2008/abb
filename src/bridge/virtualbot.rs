@@ -584,17 +584,27 @@ impl Bridge {
             // 预检话题感知（话题频道缺失不再拒绝——登记在全闸通过后做）。
             let precheck = self.buzz_dispatch_precheck(&ev);
             let reason = match &precheck {
-                Err(BuzzPrecheckFail::BuzzDisabled) => Some("服务未装配 agent（重启服务）"),
+                Err(BuzzPrecheckFail::BuzzDisabled) => {
+                    Some("服务未装配 agent（重启服务）".to_string())
+                }
                 // agent 不可用 = 启动失败/崩溃退避中：当场报错优于静默排队
                 //（失败批次会随重拉重试，死信积压见 harness queue 语义）。
                 Err(BuzzPrecheckFail::AgentDown) => {
-                    Some("agent 未就绪（启动失败/崩溃退避中），本轮无法执行")
+                    // 带上**真实原因**（截断后进对话）：只说「未就绪」等于什么都没说 ——
+                    // 用户既不知道是缺文件、取令牌失败、被 EDR 拦还是初始化失败，
+                    // 也不知道该去看哪份日志（2026-09-29 owner 实报）。
+                    let detail = self
+                        .acp_handle_for_role(ev.role)
+                        .and_then(|h| h.last_start_error());
+                    Some(agent_down_reason(detail))
                 }
-                Err(BuzzPrecheckFail::NoProvider) => {
-                    Some("未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存")
-                }
+                Err(BuzzPrecheckFail::NoProvider) => Some(
+                    "未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存"
+                        .to_string(),
+                ),
                 Err(BuzzPrecheckFail::SandboxUnsupported) => Some(
-                    "受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力——请升级 ABB 后重试",
+                    "受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力——请升级 ABB 后重试"
+                        .to_string(),
                 ),
                 Ok(_) => None,
             };
@@ -1439,6 +1449,71 @@ fn parse_trash_cmd(text: &str) -> Option<TrashCmd> {
         }
         Some("confirm") => parts.next().map(|p| TrashCmd::Confirm(p.to_string())),
         _ => None,
+    }
+}
+
+/// `AgentDown` 预检失败时给用户看的文案：**必须带真实原因**（有就贴、没有就指向日志）。
+///
+/// 为什么单独成函数 + 单测：这条文案是「Windows 全都不回消息」时用户唯一的线索。旧文案
+/// 只写「未就绪（启动失败/崩溃退避中）」，用户看不出是缺 `abb-spawner.exe`、取不到桌面令牌、
+/// 被 EDR 拦还是初始化失败（2026-09-29 owner 实报）。
+fn agent_down_reason(detail: Option<String>) -> String {
+    match detail {
+        Some(d) if !d.trim().is_empty() => {
+            // 复评 R29 P3：detail 可能带换行/控制字符（多行错误、制表），直接进 IM 单行提示会
+            // 把消息撑成多行甚至被通道截断 —— 折成单空格再截断（按字符，UTF-8 安全）。
+            let flat = d.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(
+                "agent 未就绪（启动失败/崩溃退避中）：{}（详情见日志 logs/bridge.out 的 [acp] 行）",
+                crate::agent::truncate(&flat, 160)
+            )
+        }
+        _ => "agent 未就绪（启动失败/崩溃退避中），本轮无法执行（详情见日志 logs/bridge.out 的 [acp] 行）"
+            .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod agent_down_reason_tests {
+    use super::agent_down_reason;
+
+    #[test]
+    fn reason_carries_real_cause_when_known() {
+        let s = agent_down_reason(Some(
+            "spawn abb-spawner.exe 失败：系统找不到指定的文件".into(),
+        ));
+        assert!(s.contains("abb-spawner.exe"), "必须把真实原因带给用户：{s}");
+        assert!(s.contains("bridge.out"), "还得告诉他去哪儿看细节：{s}");
+    }
+
+    #[test]
+    fn reason_falls_back_when_cause_unknown() {
+        for d in [None, Some(String::new()), Some("   ".into())] {
+            let s = agent_down_reason(d);
+            assert!(s.contains("未就绪"), "{s}");
+            assert!(s.contains("bridge.out"), "{s}");
+        }
+    }
+
+    #[test]
+    fn reason_truncates_very_long_cause() {
+        let s = agent_down_reason(Some("x".repeat(2000)));
+        assert!(
+            s.chars().count() < 400,
+            "长原因必须截断（不能把几百行日志塞进一条 IM 回复）：{}",
+            s.chars().count()
+        );
+    }
+
+    /// 多行/带控制字符的原因必须折成单行（IM 提示是单行文案；多行会被通道截断或撑坏形态）。
+    #[test]
+    fn reason_flattens_multiline_cause() {
+        let s = agent_down_reason(Some("spawn 失败\n  caused by:\tEDR 拦截\r\n".into()));
+        assert!(
+            !s.contains('\n') && !s.contains('\r') && !s.contains('\t'),
+            "{s:?}"
+        );
+        assert!(s.contains("caused by: EDR 拦截"), "折叠后仍要保内容：{s:?}");
     }
 }
 
