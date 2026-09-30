@@ -5590,9 +5590,9 @@ dependencies = [
 
 [[package]]
 name = "slint-pixel"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7da7d3d3a551df760c5b5cbdacc4455b06973c19b9d8f002afd915d6fcbf3b15"
+checksum = "ffd0a0db20e4c565682ea2b145f0398e39747506f49833993a36b1ba03325d59"
 dependencies = [
  "image",
  "raw-window-handle",

@@ -8,15 +8,22 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelPresets, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 // ═══════════ 设计令牌（UI/UX 审查）：语义色集中定义，替换全部硬编码彩色 ═══════════
-// 原则：基础层走 PixelTheme（黑白像素体系）；状态语义色/文字层级走本令牌。
+// 原则：基础层走 PixelTheme（2026-09-30 起主题 = soft 预设：暖米底 #fdf6e9 + 墨黑描边
+// #1c1a17 + 暖黄主色 #ffc61a）；状态语义色/文字层级走本令牌。
+// **accent 是「填色」不是「墨色」**：压在其上的前景必须用 PixelTheme.on-accent
+// （soft 下 #1c1a17 on #ffc61a = 11.0:1；库默认 classic 下 21:1）；要墨色的图标/文字/描边
+// 一律用 PixelTheme.text。这两条由评审 R1 的阻塞项踩出来：把 accent 当黑用的写法在 soft 下
+// 只有 1.46–1.57:1，首页主状态读数与三处列表选中项几乎看不见。
 // 全部色值收敛于此，改一处全局生效；已按 PixelTheme.scheme 内置暗色适配值
-// （未来开暗色模式时零改动兼容）。色值对比度按白底验算：
-//   ok #0b8a3e ≈4.5:1 / info #0a6fc2 ≈5.2:1 / warn #b86f00 ≈3.9:1（配加粗）/ error #d13438 ≈4.9:1
-//   text-dim #5c5c5c ≈4.6:1（替代原 #888/#aaa，原值不达 WCAG AA 正文 4.5:1）
+// （未来开暗色模式时零改动兼容）。下表对比度按**生效底色 #fdf6e9（soft）**验算：
+//   ok #0b8a3e ≈4.14:1 / info #0a6fc2 ≈4.80:1 / warn #b86f00 ≈3.68:1（配加粗）/ error #d13438 ≈4.59:1
+//   text-dim #5c5c5c ≈6.22:1（替代原 #888/#aaa）；text-disabled #9a9a9a ≈2.62:1（仅停用态）
+// 半径：库组件跟随 PixelTheme.radius（soft = 8px）；ABB 自绘处保留 4px 是刻意的「小件更紧」
+// 取舍（不跟随主题）——若要统一，把那 4 处 border-radius: 4px 改成 PixelTheme.radius 即可。
 export global UiTokens {
     // 语义状态色
     in property <color> ok: PixelTheme.scheme == "dark" ? #4caf50 : #0b8a3e;      // 成功/已安装/已授权
@@ -441,9 +448,9 @@ component QuickCard inherits Rectangle {
         title-color: PixelTheme.text;
         VerticalLayout {
             spacing: 6px;
-            ImageIcon { icon: root.icon; tint: PixelTheme.accent; }
+            ImageIcon { icon: root.icon; tint: PixelTheme.text; }
             Text { text: root.desc; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: word-wrap; }
-            Text { text: root.action-label; font-size: 12px; font-weight: 600; color: PixelTheme.accent; }
+            Text { text: root.action-label; font-size: 12px; font-weight: 600; color: PixelTheme.text; }
         }
     }
     TouchArea {
@@ -635,7 +642,7 @@ export component VirtualBotDialog inherits Window {
             // ── 标题行：归属 bot + 平台 ──
             HorizontalBox {
                 spacing: 8px;
-                ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.text; vertical-alignment: center; }
                 Text {
                     text: root.window-title + "（" + root.bot-label + " · " + root.platform-label + "）";
                     font-size: 15px;
@@ -721,7 +728,7 @@ export component VirtualBotDialog inherits Window {
                                 HorizontalBox {
                                     width: 100%; height: 100%;
                                     alignment: center;
-                                    ImageIcon { icon: @image-url("icons/bot.svg"); tint: #fff; }
+                                    ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.on-accent; }
                                 }
                             }
                             VerticalBox {
@@ -788,7 +795,7 @@ export component VirtualBotDialog inherits Window {
                     border-radius: 4px;
                     background: PixelTheme.bg;
                     border-width: 1px;
-                    border-color: PixelTheme.accent;
+                    border-color: PixelTheme.text;
                     VerticalBox {
                         padding: 8px;
                         spacing: 5px;
@@ -1005,7 +1012,7 @@ export component TeamDialog inherits Window {
             // ── 标题行 ──
             HorizontalBox {
                 spacing: 8px;
-                ImageIcon { icon: @image-url("icons/plus.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                ImageIcon { icon: @image-url("icons/plus.svg"); tint: PixelTheme.text; vertical-alignment: center; }
                 Text {
                     text: root.window-title + "（" + root.bot-label + "）";
                     font-size: 15px;
@@ -1126,6 +1133,15 @@ export component TeamDialog inherits Window {
 
 // 设置窗主体。
 export component SettingsWindow inherits Window {
+    // 主题：slint-pixel 0.3.0 的「soft（柔彩）」预设 —— 暖米底 + 墨黑硬描边 + 暖黄主色 + 8px 圆角
+    // （owner 2026-09-30 指定：主题选 soft）。预设只写 PixelTheme token，因此 ABB 自己的语义色
+    // （UiTokens 按 PixelTheme.scheme 分支）与各处对组件属性的覆盖都照旧生效。
+    // 为什么挂在 SettingsWindow 的 init：`init` 回调只有 Window 派生组件才有（Tray 继承的是
+    // SystemTrayIcon，构建期实测报 "init is not a callback in SystemTrayIcon"），而 SettingsWindow
+    // 是 GUI 启动时**无条件实例化**的窗口 ⇒ 这里套一次，全局 PixelTheme 对所有窗口生效。
+    // 以后要开放「主题选择」：把这行换成 `PixelPresets.apply(name)`（10 套清单见 PixelPresets.names）。
+    init => { PixelPresets.soft(); }
+
     // 像素风自绘窗口：无系统边框/红绿灯，PixelTitleBar 自绘标题栏（拖拽/最小化/最大化/关闭）
     no-frame: true;
     // 打开时由 Rust 侧提升为 regular 策略（带 dock 图标 + 置前聚焦），关掉降回 accessory。
@@ -1456,22 +1472,22 @@ export component SettingsWindow inherits Window {
                                             : "服务已停止";
                                         font-size: 19px;
                                         font-weight: 700;
-                                        color: PixelTheme.bg;
+                                        color: PixelTheme.on-accent;
                                     }
                                     Text {
                                         text: root.service-running
                                             ? "飞书 / 微信 / 钉钉消息自动转给随包 AI agent 处理（零安装）"
                                             : "点右侧「启动服务」，或在托盘菜单点「启动」";
                                         font-size: 13px;
-                                        color: PixelTheme.bg.with-alpha(0.75);
+                                        color: PixelTheme.on-accent.with-alpha(0.75);
                                         wrap: word-wrap;
                                     }
                                     // 状态点（Defender 式「一目了然」）：在线/离线一眼可见；用文字点而非胶囊，避免在 accent 底上发闷
                                     HorizontalBox {
                                         spacing: 12px;
-                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 12px; font-weight: 600; color: PixelTheme.bg; vertical-alignment: center; }
-                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 12px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
-                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 12px; color: PixelTheme.bg.with-alpha(0.85); vertical-alignment: center; }
+                                        Text { text: root.service-running ? "● 服务运行中" : "● 服务已停止"; font-size: 12px; font-weight: 600; color: PixelTheme.on-accent; vertical-alignment: center; }
+                                        if root.online-count > 0: Text { text: "● " + root.online-count + " 在线"; font-size: 12px; color: PixelTheme.on-accent.with-alpha(0.85); vertical-alignment: center; }
+                                        if root.bot-count - root.online-count > 0: Text { text: "● " + (root.bot-count - root.online-count) + " 离线"; font-size: 12px; color: PixelTheme.on-accent.with-alpha(0.85); vertical-alignment: center; }
                                     }
                                 }
                                 VerticalBox {
@@ -1491,10 +1507,10 @@ export component SettingsWindow inherits Window {
                                         width: 140px;
                                         height: 32px;
                                         border-radius: 4px;
-                                        background: PixelTheme.bg.with-alpha(0.15);
+                                        background: PixelTheme.on-accent.with-alpha(0.15);
                                         TouchArea {
                                             clicked => { root.open-logs(); }
-                                            Text { text: "打开日志"; color: PixelTheme.bg; font-size: 13px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            Text { text: "打开日志"; color: PixelTheme.on-accent; font-size: 13px; font-weight: 500; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         }
                                     }
                                 }
@@ -1566,7 +1582,7 @@ export component SettingsWindow inherits Window {
                                 horizontal-stretch: 1;
                                 VerticalLayout {
                                     spacing: 6px;
-                                    ImageIcon { icon: @image-url("icons/switch.svg"); tint: PixelTheme.accent; }
+                                    ImageIcon { icon: @image-url("icons/switch.svg"); tint: PixelTheme.text; }
                                     PixelCheckBox {
                                         text: "跨会话投递";
                                         checked: root.cross-delivery-enabled;
@@ -1617,13 +1633,13 @@ export component SettingsWindow inherits Window {
                                                         Text {
                                                             // 停用的 bot 前缀 ⚪ 并显灰，一眼可辨（启用的维持原色）
                                                             text: (bot.enabled ? "" : "⚪ ") + (bot.name == "" ? "(未命名)" : bot.name);
-                                                            color: idx == root.selected ? PixelTheme.bg : (bot.enabled ? PixelTheme.text : UiTokens.text-disabled);
+                                                            color: idx == root.selected ? PixelTheme.on-accent : (bot.enabled ? PixelTheme.text : UiTokens.text-disabled);
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: bot.kind + (bot.enabled ? "" : " · 停用");
                                                             font-size: 12px;
-                                                            color: idx == root.selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
+                                                            color: idx == root.selected ? PixelTheme.on-accent.with-alpha(0.85) : UiTokens.text-dim;
                                                         }
                                                     }
                                                 }
@@ -2178,7 +2194,7 @@ export component SettingsWindow inherits Window {
                                                         spacing: 6px;
                                                         HorizontalBox {
                                                             spacing: 8px;
-                                                            ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                                                            ImageIcon { icon: @image-url("icons/bot.svg"); tint: PixelTheme.text; vertical-alignment: center; }
                                                             Text { text: vb.role-name; font-weight: 600; font-size: 13px; color: PixelTheme.text; vertical-alignment: center; }
                                                             Text { text: vb.platform; font-size: 12px; color: UiTokens.text-dim; vertical-alignment: center; }
                                                             Rectangle { horizontal-stretch: 1; }
@@ -2212,7 +2228,7 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         padding: 10px;
                                                         spacing: 10px;
-                                                        ImageIcon { icon: @image-url("icons/plus.svg"); tint: PixelTheme.accent; vertical-alignment: center; }
+                                                        ImageIcon { icon: @image-url("icons/plus.svg"); tint: PixelTheme.text; vertical-alignment: center; }
                                                         VerticalBox {
                                                             horizontal-stretch: 1;
                                                             spacing: 2px;
@@ -2555,13 +2571,13 @@ export component SettingsWindow inherits Window {
                                                         spacing: 2px;
                                                         Text {
                                                             text: prov.name == "" ? "(未命名)" : prov.name;
-                                                            color: idx == root.provider-selected ? PixelTheme.bg : PixelTheme.text;
+                                                            color: idx == root.provider-selected ? PixelTheme.on-accent : PixelTheme.text;
                                                             font-weight: 600;
                                                         }
                                                         Text {
                                                             text: prov.kind + (prov.is-default ? " · 默认" : "");
                                                             font-size: 12px;
-                                                            color: idx == root.provider-selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
+                                                            color: idx == root.provider-selected ? PixelTheme.on-accent.with-alpha(0.85) : UiTokens.text-dim;
                                                         }
                                                     }
                                                 }
@@ -2775,13 +2791,13 @@ export component SettingsWindow inherits Window {
                                                                 font-weight: 600;
                                                                 overflow: elide;
                                                                 horizontal-stretch: 1;
-                                                                color: idx == root.chat-selected ? PixelTheme.bg : PixelTheme.text;
+                                                                color: idx == root.chat-selected ? PixelTheme.on-accent : PixelTheme.text;
                                                             }
                                                             Text {
                                                                 text: s.time;
                                                                 font-size: 11px;
                                                                 vertical-alignment: center;
-                                                                color: idx == root.chat-selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
+                                                                color: idx == root.chat-selected ? PixelTheme.on-accent.with-alpha(0.85) : UiTokens.text-dim;
                                                             }
                                                         }
                                                         HorizontalBox {
@@ -2791,13 +2807,13 @@ export component SettingsWindow inherits Window {
                                                                 font-size: 12px;
                                                                 overflow: elide;
                                                                 horizontal-stretch: 1;
-                                                                color: idx == root.chat-selected ? PixelTheme.bg.with-alpha(0.85) : PixelTheme.text.with-alpha(0.6);
+                                                                color: idx == root.chat-selected ? PixelTheme.on-accent.with-alpha(0.85) : PixelTheme.text.with-alpha(0.6);
                                                             }
                                                             Text {
                                                                 text: s.count;
                                                                 font-size: 11px;
                                                                 vertical-alignment: center;
-                                                                color: idx == root.chat-selected ? PixelTheme.bg.with-alpha(0.85) : UiTokens.text-dim;
+                                                                color: idx == root.chat-selected ? PixelTheme.on-accent.with-alpha(0.85) : UiTokens.text-dim;
                                                             }
                                                         }
                                                     }
