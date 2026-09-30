@@ -10,7 +10,7 @@ build = "build.rs"
 # 视觉改造（像素风）：slint-pixel 组件库（@slint_pixel 导入，Pixel* 控件）。
 slint-pixel = "0.3.0"
 # 0.3.0 起：十预设 + 皮肤色收编进 PixelTheme token + 全库统一 2px 线框。
-# ABB 的观感由 ui/app.slint 里 Tray 的 `init => { PixelPresets.soft(); }` 定，
+# ABB 的观感由 ui/app.slint 里 SettingsWindow 的 `init => { PixelPresets.soft(); }` 定
 # 没有预设调用时才是库默认（classic 黑白直角）。
 # 渲染器：用默认 femtovg（OpenGL）。历史：曾固定 renderer-skia——旧注释记录 femtovg 在
 # macOS accessory 进程 + 先 hide 后 show 的窗口上渲染全黑；2026-08-15 实测（slint 1.17.1 /

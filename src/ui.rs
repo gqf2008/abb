@@ -5697,17 +5697,30 @@ mod tests {
     /// `soft()` 自身的 token 值归 slint-pixel 仓库的守卫管（`every_preset_writes_every_token`）。
     #[test]
     fn app_theme_applies_slint_pixel_soft_preset() {
-        let src = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        // 只看**代码行**：按行剥掉 `//` 之后的注释再匹配（评审 R1 的 M-c 反证证明，不剥注释时
+        // 「把调用注释掉、字符串还在」照样能骗绿 —— 子串检查的经典洞，同族教训见
+        // `LESSON_子串式守卫会被同前缀常量顶住须逐项做阳性对照.md`）。
+        let code_line = |needle: &str| {
+            raw.lines().any(|l| {
+                let code = match l.find("//") {
+                    // `://` 是 URL 里的斜杠对，不是注释起点
+                    Some(i) if !l[..i].ends_with(':') => &l[..i],
+                    _ => l,
+                };
+                code.contains(needle)
+            })
+        };
         assert!(
-            src.contains("PixelPresets"),
+            code_line("PixelPresets"),
             "ui/app.slint 必须从 @slint_pixel 导入 PixelPresets"
         );
         assert!(
-            src.contains("PixelPresets.soft()"),
+            code_line("PixelPresets.soft()"),
             "SettingsWindow 的 init 必须套用 soft 预设（owner 指定；换主题请连同本守卫与 Cargo.toml 注释一起改）"
         );
         assert!(
-            !src.contains("PixelPresets.classic()"),
+            !code_line("PixelPresets.classic()"),
             "不得退回库默认的 classic（黑白直角）"
         );
     }
