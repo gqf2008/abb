@@ -3183,6 +3183,17 @@ pub fn run_gui() -> Result<()> {
         let pmodel = providers_model.clone();
         load_with_draft(&settings, &dirty, &work, &model, &pmodel, &wk);
         push_settings_status(&settings, &install::status());
+        // `--page N`（配合 --show-settings）：直接落在指定页。页序号同 ui/app.slint 的
+        // current-page：0 首页 / 1 机器人配置 / 2 环境配置 / 3 模型供应商 / 4 历史记录。
+        // 用途：UI 改动的 before/after 截图取证——不必靠合成点击去点标签（在提权窗口上
+        // 合成输入会被 UIPI 拦、多显示器 DPI 下坐标还会被虚拟化，实测不可靠）。
+        // 不带该参数时行为不变（首页）。
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(i) = argv.iter().position(|a| a == "--page") {
+            if let Some(page) = argv.get(i + 1).and_then(|v| v.parse::<i32>().ok()) {
+                settings.set_current_page(page.clamp(0, 4));
+            }
+        }
         show_window_and_focus(&settings);
     }
     {
