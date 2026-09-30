@@ -903,7 +903,10 @@ pub(crate) fn prepend_standing_for_legacy(
         sections.push(crate::buzz::queue::base_section(bp));
     }
     if let Some(sp) = system_prompt {
-        sections.push(crate::buzz::prompt_framing::semantic_section("system", sp));
+        sections.push(crate::buzz::prompt_framing::semantic_section(
+            "agent-instructions",
+            sp,
+        ));
     }
     if sections.is_empty() {
         return body.to_string();
@@ -917,7 +920,7 @@ pub(crate) fn prepend_standing_for_legacy(
 /// The static base remains first for prompt-prefix caching. When a base is
 /// present, the dynamic workspace anchor follows it and precedes the user-owned
 /// agent instructions. A persona-only agent still yields
-/// `<system>…</system>` rather than an unlabeled blob that would be mistaken
+/// `<agent-instructions>…</agent-instructions>` rather than an unlabeled blob that would be mistaken
 /// for `<base>`.
 fn framed_system_prompt(
     cwd: &str,
@@ -929,14 +932,17 @@ fn framed_system_prompt(
             "{}\n\n{}\n\n{}",
             crate::buzz::queue::base_section(bp),
             workspace_section(cwd),
-            crate::buzz::prompt_framing::semantic_section("system", sp),
+            crate::buzz::prompt_framing::semantic_section("agent-instructions", sp),
         )),
         (Some(bp), None) => Some(format!(
             "{}\n\n{}",
             crate::buzz::queue::base_section(bp),
             workspace_section(cwd)
         )),
-        (None, Some(sp)) => Some(crate::buzz::prompt_framing::semantic_section("system", sp)),
+        (None, Some(sp)) => Some(crate::buzz::prompt_framing::semantic_section(
+            "agent-instructions",
+            sp,
+        )),
         (None, None) => None,
     }
 }
@@ -948,7 +954,7 @@ fn workspace_section(cwd: &str) -> String {
     )
 }
 
-/// Append the team-owned instruction section after `<system>` and before core memory.
+/// Append the team-owned instruction section after `<agent-instructions>` and before core memory.
 fn with_team(prompt: Option<String>, instructions: Option<&str>) -> Option<String> {
     let instructions = instructions
         .map(str::trim)
@@ -1450,7 +1456,7 @@ pub async fn run_prompt_task(
             log_stop_reason(&source, &stop_reason);
 
             // Delivery state is committed only after ACP confirms success. The
-            // legacy standing-context flag gates the one-time `<base>`/`<system>`
+            // legacy standing-context flag gates the one-time `<base>`/`<agent-instructions>`
             // rendering inside `format_prompt`; system-prompt agents hold
             // standing context from session/new and need no flag.
             if !agent.has_system_prompt_support() {

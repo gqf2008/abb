@@ -72,8 +72,28 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 | 文件 | 处置 | 说明 |
 |---|---|---|
+| `harness.rs` | 上游增量（#7538 / `051c3a270`） | **模型缺失不再重试（2026-09-30，批 buzz-acp-sync-20260930）**：`handle_prompt_result` 在 sandbox 分支后、auth 分支前新增终态分支 —— `-32002` 且 message 含 `model not found` ⇒ 当场死信并提示「换用可用模型后重发」；同码的其它 resource-not-found（如 `session no longer exists`）**仍走 requeue**（误判会把本可自愈的批次判死）。告示走 ABB 的 `notify_channel`（旁路同步 waiter，保 job/oneshot 终态），**不**引入上游 `spawn_failure_notice` 的 relay 发布面。判据单测：`model_not_found_tests`。 |
+| `pool.rs` / `queue.rs` / `prompt_framing.rs` | 上游增量（#7332 / `ce9decb23`） | **`<system>` → `<agent-instructions>`（2026-09-30）**：7 处字面量（pool 906/932/939、queue 1147、prompt_framing 51/67/59）+ 注释/单测同步改名，零逻辑变化。已核实 fork `crates/buzz-agent` **不解析**该 tag（`wire.rs` 把 `systemPrompt` 当不透明 `Option<String>`、`llm.rs` 原样使用、全仓 0 命中），无 wire 兼容问题。 |
+| `base_prompt.md` | 上游增量（#7624 / `deda09c18`） | **「回合的信封」小节（2026-09-30）**：教 agent 从 `<buzz-event>` 的 `Content:` 读当前请求、多条在 `<buzz-events>`、合并回合看 `<new-message-arrived-while-you-were-working>`（先前请求在 `<what-you-were-working-on>`）、`<context>` 只是路由/会话元数据。按 ABB 真实 framing 中文化改写，**删掉**上游的 `<thread-context>` / `<conversation-context>` / `<new-request-supersedes-previous>`（ABB 不产出）。 |
 | `acp.rs` | ABB 扩展字段（追加） | **agent 进程 job 守卫（2026-09-30，批 abb-win-mcp-orphan）**：`spawn()` 拿到子进程后经 `agent_spawn::assign_kill_on_close_job` 把它放进 `KILL_ON_JOB_CLOSE` job，守卫句柄存进 `AcpClient.job`，随客户端 Drop 关闭 ⇒ 内核连带杀掉 agent 的**整棵树**（含它为每个 session 起的 MCP 服务 `wassette` / `mcp-events`）。上游无此概念（unix 靠进程组 kill 表达同一语义），同步时保留该字段与调用。 |
 | `redact.rs` | 新增（**非**同步区） | **面向用户的错误文本卫生（2026-09-29，复评 F3）**：`mask_secrets`（≥32 连续十六进制 与 api_key/apikey/secret/token/password/Bearer 的**值**掩码，零正则）+ `flatten_line` + `error_with_stderr_tail`。它只服务「失败可见化」，上游无此概念、也不改任何协议行为。 |
 | `acp.rs` | ABB 扩展字段（追加） | **子进程 stderr 尾巴（2026-09-29，复评 F3）**：`spawn` 的 stderr 从 `inherit` 改 `piped`，后台任务逐行回显（等价旧 inherit，bridge 侧日志照旧可见）并收进有界环形缓冲 `stderr_tail`（12 行 / 每行 300 字符，见 `STDERR_TAIL_LINES`/`STDERR_LINE_CHARS`）；新增只读访问器 `AcpClient::stderr_tail()`；`shutdown` 给 reader 一个有界（300ms）收尾窗口，保证 kill 之后子进程的**临终输出**也进尾巴。上游同步时保留该差异。 |
 | `harness.rs` | ABB 扩展字段（追加） | **启动失败文案并上 stderr 尾巴（2026-09-29，复评 F3）**：`spawn_and_init_agent` 的两条失败臂（initialize 失败 / 60s 超时）经 `redact::error_with_stderr_tail` 把子进程 stderr 尾巴（脱敏 + 折行 + 截断）并进 `SpawnOutcome::Err`，从而进入 `last_start_error` 与用户提示——owner 实报的 elevated 场景里，真正的病句（`BUZZ_AGENT_PROVIDER is required`）正是**只**出现在 stderr。 |
 | `harness.rs` | ABB 扩展字段（追加） | **失败原因留存（2026-09-29，批 abb-win-failure-visibility）**：新增 `BuzzHandle.last_start_error`（`Mutex<Option<String>>`）+ `last_start_error()` / `set_last_start_error()`——`handle_spawn_outcome` 的 `SpawnOutcome::Err` 臂与 `schedule_death_respawn`（运行中崩溃）写入真实原因，启动成功臂清空；桥侧预检 `AgentDown` 的回复据此把原因带给用户（旧文案只有「未就绪（启动失败/崩溃退避中）」，用户看不出是缺 `abb-spawner.exe`、取不到桌面令牌、被 EDR 拦还是初始化失败）。上游无此概念，同步时保留。 |
+
+### 未迁决策登记（2026-09-30，区间 `c3132c3` → `2664d1431`，**未整体重定基线**）
+
+区间内触及 `crates/buzz-acp/` 的提交 23 个（+12147/−1540）。上面三条按 commit 增量挑入，其余 20 个按下表**不迁**（给出等价能力与重新评估触发条件，避免下次重复分析）：
+
+| 上游提交 | 内容 | 不迁理由 / 等价能力 | 重新评估触发条件 |
+|---|---|---|---|
+| `674c173eb` #6732 | 每线程独立 session（`scope.rs` + 队列/pool 全量改键） | ABB 的每个飞书话题已由 `keys.rs::topic_channel_uuid` 派生为独立频道、`SessionState.sessions` 按 channel 键控（见 `docs/session-isolation.md`） | 需要在**同一频道内**再分多个 session |
+| `b17c0776b` #7337 / `86c189e85` #7340 | busy-owner hold / held deadline 唤醒 / fork generation fence | 前提（同频道多 session owner）在 ABB 不存在 | 引入 #6732 时一并评估 |
+| `4d08194ea` #7620 | 按 ACP 会话交付去重 thread context | 读侧随 relay 抓取层一并裁剪（`pool.rs` 仅留写账 `delivered_event_ids`） | 恢复 relay 抓取面 |
+| `ea1e97e65` #7851 | `buzz-acp run` 一次性任务（文件/stdin + 机器可读退出码） | ABB 已有等价 `oneshot.rs::oneshot_turn` | 需要外部自动化接口跑单个任务 |
+| `5621006bc` #7819 | git 身份/签名 bootstrap 进 ACP harness（`git.rs`） | 全部建立在 nostr Keys/relay 上；ABB 无 nostr，提示词明确 `git` 不随包 | ABB 要给 agent 注入受管 git 身份 |
+| `813bbd141` #7552 / `4beffef69` #7335 | Pi 适配器 fork 集成（`pi_launcher.rs`） | ABB 的 agent 是自维护 `crates/buzz-agent` fork，不走 Pi 适配器 | 产品决定支持 Pi |
+| `93237b4a7` #6953 / `40220d561` #7154 / `c045321a7` #7325 / `e09f715c9` #7010 / `2f3dd850d` #6961 | relay 作者门控 / 订阅水位 / overflow recovery / ack 频道 | 生产语义全在 `relay.rs`（本表处置 = 删除） | — |
+| `cae158ce7` #7185 | dev-mcp shell 超时 1200s + 外层预算对齐 | 无 dev-mcp；ABB idle 900s > fork 工具 660s，排序成立 | **留观**：fork 若采纳上游工具超时 1260s，必须把 `harness.rs` 的 `IDLE_TIMEOUT` 提到 ≥1500s |
+| `f463e726d` #6950 / `2af9773d6` #7250 / `e17cdd9d5` #7586 / `42aeb1571` #7208 / `6c35e82bd` #7594 / `47d068e21` #7259 | base_prompt 的 buzz CLI/平台段、desktop/CLI/Pi 装配面 | ABB 的 `base_prompt.md` 是重写的中文交付语义，这些段在 ABB 侧不存在 | — |
+
