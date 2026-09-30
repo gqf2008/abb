@@ -45,9 +45,20 @@ fn main() {
 const RELAY_FLAG: &str = "--relay";
 
 /// 退出码：中继读不到 / 读坏环境文件。
+///
+/// `#[cfg(target_os = "windows")]`：唯一调用点在 `mod win` 内（`super::EXIT_RELAY_ENV`），
+/// 不 gate 的话 macOS 构建里它就是死代码 —— 而 CI 的 `clippy -D warnings` 跑在 windows-latest，
+/// macOS 本地门禁（`AGENTS.md` 的四条命令）会先红（2026-09-30 实测，见线程
+/// `abb-macos-clippy-cfg-spawner-20260930`）。
+#[cfg(target_os = "windows")]
 const EXIT_RELAY_ENV: i32 = 5;
 
 /// 中继环境文件路径：`%TEMP%\abb-relay-<pid>-<nanos>.env`（唯一名，避免并发撞车）。
+///
+/// `test` 也在 cfg 里：本函数是**平台无关的纯逻辑**（pid + 纳秒拼临时路径），既有的
+/// `relay_tests::relay_env_path_is_unique_in_temp` 要能在 macOS 本地门禁上跑到（它测的是
+/// 「名字唯一、落在临时目录」，与 Windows 无关）；生产侧的调用点仍只有 `mod win`。
+#[cfg(any(target_os = "windows", test))]
 fn relay_env_path() -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -116,8 +127,14 @@ pub fn parse_relay_args(argv: Vec<String>) -> Option<(String, String, Vec<String
 ///
 /// 正常路径由中继自己「读完即删」；这个 guard 覆盖「中继根本没起来」的失败分支——
 /// 文件已被删时再删一次失败，无害。
+///
+/// `#[cfg(target_os = "windows")]`：与 [`EXIT_RELAY_ENV`] 同因 —— 只在 `mod win` 里构造，
+/// 不 gate 会让 macOS 侧编译成死代码（`clippy -D warnings` 红）。
+#[cfg(target_os = "windows")]
 struct EnvFileGuard(std::path::PathBuf);
 
+// impl 也是独立 item：type gate 了而 impl 没 gate 会直接编译错（E0425，本轮实测踩到）。
+#[cfg(target_os = "windows")]
 impl Drop for EnvFileGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
