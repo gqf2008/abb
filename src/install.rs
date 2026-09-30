@@ -488,6 +488,38 @@ mod upgrade_call_site_tests {
             "ui.rs 里应至少有 4 处升级日志走 crate::updater::log_update（实际 {via}）"
         );
     }
+
+    /// 看门狗那一拍（跑在 **UI 线程**）不得**同步**调 `svc_start`：托管形态（macOS launchd /
+    /// Windows 计划任务）下它会 spawn 外部命令，而 2026-09-30 实测存在长时间不返回的形态
+    /// （`EX_CONFIG` 的 job 上 `launchctl kickstart` >20s 挂住）——同步做就会「bridge 起不来」
+    /// 连带「托盘冻死」（评审 R1 的 B1）。必须放后台线程。
+    ///
+    /// 判别力（本守卫的边界，如实标注）：它能拦住「退回旧写法」与「spawn 写在调用之后」两种
+    /// 退化，属于子串+顺序断言——保留 `std::thread::spawn(` 却把调用挪到闭包外的写法它拦不住
+    /// （同族教训见 `LESSON_子串式守卫会被同前缀常量顶住须逐项做阳性对照.md`）。
+    #[test]
+    fn watchdog_tick_does_not_call_svc_start_on_the_ui_thread() {
+        // 必须过 `src_lf` 且按字符取窗口：Windows 检出是 CRLF，裸字节切片会切在字符中间 panic。
+        let ui = crate::platform::src_lf(include_str!("ui.rs"));
+        let at = ui
+            .find("[watchdog] service 意外退出，自动重拉")
+            .expect("看门狗日志行（改文案请同步这里）");
+        let window: String = ui[at..].chars().take(900).collect();
+        let call = window
+            .find("install::svc_start()")
+            .expect("看门狗应调 svc_start 把它拉回来");
+        let spawn = window
+            .find("std::thread::spawn(")
+            .expect("托管形态的拉起必须放后台线程（不得阻塞 UI 线程）");
+        assert!(
+            spawn < call,
+            "`install::svc_start()` 必须在 `std::thread::spawn(` 之后（即包在后台线程里）"
+        );
+        assert!(
+            !window.contains("let _ = install::svc_start();"),
+            "不得退回「同步调用 + 丢弃返回值」的旧写法（既阻塞 UI 又不留失败原因）"
+        );
+    }
 }
 
 /// 安装器（`app-assets/ABB.iss`）的**安全前提**守卫 —— 平台无关（纯文本断言），任何平台都能跑。

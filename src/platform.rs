@@ -1087,11 +1087,85 @@ fn supervised_start_action(state: JobState) -> SupervisedStart {
     }
 }
 
+/// `launchctl` 调用的上界。
+///
+/// 本机实测（2026-09-30，评审 R1 的 B1 独立复现）：正常路径都是**毫秒级**（`print` 0.01s；
+/// `kickstart` 对「在跑」/「优雅停下」两种 job 都是瞬时返回），但 job 处于 `EX_CONFIG` 形态
+/// （程序不存在：`state = spawn scheduled`、`runs = 1`、`last exit code = 78: EX_CONFIG`、
+/// **无 pid 行**）时 `launchctl kickstart` **>20s 不返回**（同批 `print`/`bootout` 仍瞬时）。
+/// 5s 给正常路径留了三个数量级余量，又不让异常路径无限期挂着。
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 有界跑一个子进程：到点就 `kill` 掉这个客户端并按 `TimedOut` 返回 —— **绝不把「没返回」当成功**。
+///
+/// 为什么不能直接用 `Command::output()`：它一直等到进程退出（上面那条实测就是 >20s），
+/// 而 `launchctl` 的调用点包括托盘 2s 看门狗（UI 线程）——挂住就等于托盘冻死。
+/// stdout/stderr 交给排水线程读，免得子进程写满管道缓冲后自己卡住。
+///
+/// 独立可测：传一个 `sleep` 进去就能验证「到点必回 Err」（见单测）。
+#[cfg(target_os = "macos")]
+fn run_bounded(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut p| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+                buf
+            })
+        })
+    }
+    let mut child = cmd.spawn()?;
+    let out_h = drain(child.stdout.take());
+    let err_h = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            // kill 之后管道 EOF，排水线程会自己收尾；join 只为不留悬空线程。
+            if let Some(h) = out_h {
+                let _ = h.join();
+            }
+            if let Some(h) = err_h {
+                let _ = h.join();
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("子进程超过 {timeout:?} 未退出，已终止"),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_h
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default(),
+        stderr: err_h
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default(),
+    })
+}
+
 /// `launchctl` 的**唯一**调用点：所有需要可注入的实现都从这里出去，单测才能用假 runner
-/// 驱动真实逻辑而不 spawn 真的 launchctl。
+/// 驱动真实逻辑而不 spawn 真的 launchctl。**走 [`run_bounded`]**（有界，见上）。
 #[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("launchctl").args(args).output()
+    let mut cmd = std::process::Command::new("launchctl");
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    run_bounded(cmd, LAUNCHCTL_TIMEOUT)
 }
 
 /// launchctl 调用缝（单测注入假 runner 用；生产走 [`launchctl`]）。
@@ -2107,6 +2181,65 @@ mod tests {
         assert!(
             body.contains("start_service_supervised_with(") && body.contains("launchctl"),
             "pub fn start_service_supervised 必须调 start_service_supervised_with 并传真实 launchctl\n{body}"
+        );
+    }
+
+    /// `run_bounded` 必须**到点就回 Err**，而不是陪着子进程挂住：用真 `sleep` 量时间。
+    ///
+    /// 判别力（评审 R1 的 B1）：把超时分支去掉/绕过，`sleep 5` 会跑完并以 `Ok` 返回 ⇒ 本用例红。
+    /// 另一半是正例，防「一律 Err」的假实现。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_bounded_reports_timeout_instead_of_hanging() {
+        let mut slow = std::process::Command::new("/bin/sleep");
+        slow.arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let t0 = std::time::Instant::now();
+        let err = run_bounded(slow, std::time::Duration::from_millis(300))
+            .expect_err("超时必须 Err（绝不能陪着挂住）");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(3),
+            "应在 ~300ms 内返回，实得 {:?}",
+            t0.elapsed()
+        );
+
+        let mut fast = std::process::Command::new("/bin/echo");
+        fast.arg("abb-run-bounded")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let out = run_bounded(fast, std::time::Duration::from_secs(5)).expect("echo 应成功");
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "abb-run-bounded",
+            "有界执行不能吞掉输出"
+        );
+    }
+
+    /// 接线守卫：`launchctl()` 必须走有界执行（B1 的修复点），不得退回无界的 `Command::output()`。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchctl_calls_go_through_the_bounded_runner() {
+        let src = src_lf(include_str!("platform.rs"));
+        let head = src
+            .find("fn launchctl(args: &[&str])")
+            .expect("launchctl 调用点存在");
+        let tail = src[head..]
+            .find("\n}\n")
+            .map(|i| head + i)
+            .expect("函数体结束");
+        let body = &src[head..tail];
+        assert!(
+            body.contains("run_bounded("),
+            "launchctl 必须走 run_bounded\n{body}"
+        );
+        assert!(
+            !body.contains(".output()"),
+            "不得退回无界的 .output()\n{body}"
         );
     }
 

@@ -5003,7 +5003,17 @@ pub fn run_gui() -> Result<()> {
                     // 看门：意图=运行但进程不在 → 崩溃，重拉（用户手动停止会清 desired，不覆盖）
                     if install::is_desired() && !st.running {
                         crate::log!("[watchdog] service 意外退出，自动重拉");
-                        let _ = install::svc_start();
+                        // 托管形态（macOS launchd / Windows 计划任务）下这次「拉起来」会 spawn
+                        // 外部命令，而本 tick 跑在 **UI 线程**：实测存在命令长时间不返回的形态
+                        // （EX_CONFIG 的 job 上 `launchctl kickstart` >20s 挂住，见
+                        // platform.rs 的 LAUNCHCTL_TIMEOUT），同步做就会「bridge 起不来」连带
+                        // 「托盘冻死」（2026-09-30 评审 R1 的 B1）。放后台线程，失败如实记日志；
+                        // 起没起来由下一拍读 pid 文件复验（install::status）。
+                        std::thread::spawn(|| {
+                            if let Err(e) = install::svc_start() {
+                                crate::log!("[watchdog] 自动重拉失败: {e:#}");
+                            }
+                        });
                     }
                     if let Some(t) = tray_weak.upgrade() {
                         push_status(&t, &st);
