@@ -9,11 +9,21 @@
 //! ```text
 //! abb-spawner.exe -- <program> [args...]
 //! ```
-//! 行为：
-//! 1. 取**当前会话 shell（explorer.exe）**的主令牌并复制一份 —— 它代表"登录用户的普通权限身份"；
-//! 2. 用该令牌 `CreateProcessWithTokenW` 拉起 `<program>`，把**本进程的 stdin/stdout/stderr**
-//!    原样交给它（bridge 侧看到的仍是同一条管道，ACP 的 stdio 协议不变）；
-//! 3. 等子进程结束，**透传退出码**。
+//! 行为（**两段式**）：
+//! 1. 第一段（本进程，高完整性）：取**当前会话 shell（explorer.exe）**的主令牌并复制一份 ——
+//!    它代表"登录用户的普通权限身份"；把自己的环境写进临时文件，再用该令牌
+//!    `CreateProcessWithTokenW` 拉起**本程序自己的中继模式**：
+//!    `abb-spawner.exe --relay <envfile> -- <program> [args...]`，把**本进程的
+//!    stdin/stdout/stderr** 原样交给它（bridge 侧看到的仍是同一条管道，ACP 的 stdio 协议不变）；
+//! 2. 第二段（中继，已被降回普通用户）：读环境文件、删掉它，再用**普通 `CreateProcess`**
+//!    以「环境全量接管 + stdio 继承」拉起 `<program>`，等它结束并把退出码透传给第一段。
+//!
+//! **为什么必须分两段**：`CreateProcessWithTokenW` / `CreateProcessAsUser` 在本机**拒收任何
+//! 非 NULL 的 `lpEnvironment`**——实测矩阵：自建块、`GetEnvironmentStringsW` 的系统块、
+//! `CreateEnvironmentBlock` 造的块、乃至单变量小块，一律 `0x80070057`（参数错误）；本机也没有
+//! `SeAssignPrimaryTokenPrivilege`。唯一可用的 NULL env 形态会让子进程环境取自**令牌 profile**，
+//! bridge 注入的 `BUZZ_AGENT_PROVIDER`/`PATH` 等全部丢失 ⇒ agent 一起来就退出、所有回合超时。
+//! 所以环境只能由**已经降权的中继**用普通 `CreateProcess` 注入。
 //!
 //! fail-closed：找不到 explorer 的令牌（无桌面会话/被安全软件拦）时**拒绝启动并报错**，
 //! 绝不"退回用继承来的管理员身份启动"——那正是本程序要防的事。
@@ -29,6 +39,89 @@ fn main() {
 #[cfg(target_os = "windows")]
 fn main() {
     std::process::exit(win::run());
+}
+
+/// 中继模式的隐藏开关（只由第一段自己传，不对外暴露）。
+const RELAY_FLAG: &str = "--relay";
+
+/// 退出码：中继读不到 / 读坏环境文件。
+const EXIT_RELAY_ENV: i32 = 5;
+
+/// 中继环境文件路径：`%TEMP%\abb-relay-<pid>-<nanos>.env`（唯一名，避免并发撞车）。
+fn relay_env_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("abb-relay-{}-{nanos}.env", std::process::id()))
+}
+
+/// 把 `(k, v)` 序列编码成环境文件内容：`k\0v\0k\0v\0…`。
+///
+/// 为什么用 NUL 分隔而不是 `k=v` 行：值里可能含空格/引号/`=`，NUL 是 Windows 环境值的
+/// 合法边界（环境值本身不能含 NUL），编码无需转义、解码零歧义。
+pub fn encode_env_pairs<I>(vars: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut out = Vec::new();
+    for (k, v) in vars {
+        out.extend_from_slice(k.as_bytes());
+        out.push(0);
+        out.extend_from_slice(v.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+/// 解码环境文件；字段数为奇数或含非法 UTF-8 一律判**损坏**（返回 None）。
+///
+/// 宁可不启动，也不要用半截环境把 agent 跑成「看起来起了、其实少了关键变量」——
+/// 那正是这次要修的故障形态。
+pub fn decode_env_pairs(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    let mut fields: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
+    // 结尾的 0 会切出一个空尾巴（正常现象），去掉它
+    if fields.last().map(|f| f.is_empty()).unwrap_or(false) {
+        fields.pop();
+    }
+    if !fields.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(fields.len() / 2);
+    for pair in fields.chunks(2) {
+        let k = std::str::from_utf8(pair[0]).ok()?.to_string();
+        let v = std::str::from_utf8(pair[1]).ok()?.to_string();
+        out.push((k, v));
+    }
+    Some(out)
+}
+
+/// 解析 `--relay <envfile> -- <program> [args...]`（argv[0] 是可执行文件）。
+/// 不是中继形态返回 None（交回普通降权启动路径）。
+pub fn parse_relay_args(argv: Vec<String>) -> Option<(String, String, Vec<String>)> {
+    let mut it = argv.into_iter();
+    let _exe = it.next()?;
+    if it.next()? != RELAY_FLAG {
+        return None;
+    }
+    let env_file = it.next()?;
+    if it.next()? != "--" {
+        return None;
+    }
+    let program = it.next()?;
+    Some((env_file, program, it.collect()))
+}
+
+/// 含密钥的临时环境文件的兜底清理。
+///
+/// 正常路径由中继自己「读完即删」；这个 guard 覆盖「中继根本没起来」的失败分支——
+/// 文件已被删时再删一次失败，无害。
+struct EnvFileGuard(std::path::PathBuf);
+
+impl Drop for EnvFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -261,8 +354,50 @@ mod win {
         line.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// 中继模式（第二段）：本进程已被降回**普通用户**（桌面 shell 令牌），负责用
+    /// **普通 `CreateProcess`** 拉起真 agent —— 环境由第一段经环境文件交给它，
+    /// 因为 `CreateProcessWithTokenW` 收不了非 NULL `lpEnvironment`（见模块头）。
+    pub fn run_relay(env_file: &str, program: &str, args: &[String]) -> i32 {
+        let bytes = match std::fs::read(env_file) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("abb-spawner: 中继读环境文件失败（{env_file}）：{e}");
+                return super::EXIT_RELAY_ENV;
+            }
+        };
+        // 读到手就删：密钥不留盘（第一段另有 Drop 兜底，删不动属正常）。
+        let _ = std::fs::remove_file(env_file);
+        let Some(pairs) = super::decode_env_pairs(&bytes) else {
+            eprintln!("abb-spawner: 中继环境文件损坏（{env_file}），拒绝以半截环境启动 {program}");
+            return super::EXIT_RELAY_ENV;
+        };
+        use std::os::windows::process::CommandExt;
+        // env_clear + envs = 子进程环境**恰好**是 bridge 交给我们的那一份；
+        // stdin/stdout/stderr 继承 = bridge 的管道原样传下去（ACP 协议不变）。
+        let status = std::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .envs(pairs)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .status();
+        match status {
+            Ok(st) => st.code().unwrap_or(1),
+            Err(e) => {
+                eprintln!("abb-spawner: 中继启动 {program} 失败：{e}");
+                EXIT_SPAWN
+            }
+        }
+    }
+
     pub fn run() -> i32 {
         let argv: Vec<String> = std::env::args().collect();
+        // 中继模式（只由第一段自己传，见模块头）：普通权限、普通 CreateProcess。
+        if let Some((env_file, program, args)) = super::parse_relay_args(argv.clone()) {
+            return run_relay(&env_file, &program, &args);
+        }
         let Some((program, args)) = split_args(argv) else {
             eprintln!("用法：abb-spawner.exe -- <program> [args...]");
             return EXIT_USAGE;
@@ -286,7 +421,37 @@ mod win {
                 ..Default::default()
             };
             let mut pi = PROCESS_INFORMATION::default();
-            let mut cmdline = build_command_line(&program, &args);
+            // 两段式第一段：环境不能在 CreateProcessWithTokenW 里直接传（见模块头），
+            // 所以写进临时文件，用桌面令牌拉起**自己**的中继模式去注入。
+            let self_exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "abb-spawner.exe".to_string());
+            let env_file = super::relay_env_path();
+            let env_pairs: Vec<(String, String)> = std::env::vars_os()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            if let Err(e) = std::fs::write(&env_file, super::encode_env_pairs(env_pairs)) {
+                eprintln!(
+                    "abb-spawner: 写中继环境文件失败（{}）：{e}",
+                    env_file.display()
+                );
+                return EXIT_SPAWN;
+            }
+            // 中继没跑起来时别把含密钥的文件留盘上（中继读过即删，删不动属正常）。
+            let _env_guard = super::EnvFileGuard(env_file.clone());
+            let mut relay_args: Vec<String> = vec![
+                super::RELAY_FLAG.to_string(),
+                env_file.to_string_lossy().into_owned(),
+                "--".to_string(),
+                program.clone(),
+            ];
+            relay_args.extend(args.iter().cloned());
+            let mut cmdline = build_command_line(&self_exe, &relay_args);
             // 三个 std 句柄必须是**可继承**的，子进程才拿得到（否则 agent 的 stdio 全空）。
             // 评审 R23 B2-a：`CreateProcessWithTokenW` 在 STARTF_USESTDHANDLES 下把这三个字段
             // **原样拷给子进程**，只要句柄可继承即可（.NET 的 Process、wez/EleDo 的 deelevate
@@ -314,7 +479,7 @@ mod win {
             let _ = CloseHandle(token);
             if r.is_err() {
                 eprintln!(
-                    "abb-spawner: CreateProcessWithTokenW 失败（{}），未启动 {program}",
+                    "abb-spawner: CreateProcessWithTokenW 拉起中继失败（{}），未启动 {program}",
                     windows::core::Error::from_win32()
                 );
                 return EXIT_SPAWN;
@@ -472,5 +637,100 @@ mod win {
             let s = String::from_utf16_lossy(&buf[..buf.len() - 1]);
             assert_eq!(s, "\"C:\\dir with space\\\\\"");
         }
+    }
+}
+/// 中继链路里**平台无关**的那半：环境文件编解码 + `--relay` 参数解析。
+///
+/// 为什么放顶层：这些是纯逻辑，mac 上的本地门禁也要跑到；真·两段 spawn 只有 Windows 能跑，
+/// 端到端由提权验证脚本覆盖（本轮实测矩阵见模块头）。
+#[cfg(test)]
+mod relay_tests {
+    use super::{decode_env_pairs, encode_env_pairs, parse_relay_args, relay_env_path, RELAY_FLAG};
+
+    fn pairs() -> Vec<(String, String)> {
+        vec![
+            ("BUZZ_AGENT_PROVIDER".to_string(), "openai".to_string()),
+            ("PATH".to_string(), "C:/a b;C:/中文 目录".to_string()),
+            ("EMPTY".to_string(), String::new()),
+            ("WITH_EQ".to_string(), "a=b=c".to_string()),
+        ]
+    }
+
+    /// 编码 → 解码必须逐字还原（含空格 / 中文 / 空值 / 值里的 `=`）。
+    #[test]
+    fn env_pairs_round_trip() {
+        let bytes = encode_env_pairs(pairs());
+        assert_eq!(decode_env_pairs(&bytes), Some(pairs()));
+    }
+
+    /// 空环境合法（中继会先 env_clear 再全量设置）：编码为空、解码回空表。
+    #[test]
+    fn empty_env_round_trips() {
+        let bytes = encode_env_pairs(Vec::new());
+        assert!(bytes.is_empty());
+        assert_eq!(decode_env_pairs(&bytes), Some(Vec::new()));
+    }
+
+    /// 字段数为奇数 = 损坏 ⇒ None（宁可不启动，也不用半截环境跑 agent）。
+    #[test]
+    fn odd_field_count_is_rejected() {
+        assert_eq!(decode_env_pairs(b"K\0V\0K2"), None);
+    }
+
+    /// 非法 UTF-8 = 损坏 ⇒ None。
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        assert_eq!(decode_env_pairs(b"\xff\xfe\0V\0"), None);
+    }
+
+    /// `--relay` 形态能被识别；其它形态一律 None（交回普通降权启动路径）。
+    #[test]
+    fn parse_relay_args_accepts_only_relay_form() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_relay_args(v(&[
+                "abb-spawner.exe",
+                RELAY_FLAG,
+                "C:/e.env",
+                "--",
+                "buzz-agent.exe",
+                "--acp"
+            ])),
+            Some((
+                "C:/e.env".to_string(),
+                "buzz-agent.exe".to_string(),
+                v(&["--acp"])
+            ))
+        );
+        // 普通形态（bridge 直接调用的那条）：不是中继
+        assert_eq!(
+            parse_relay_args(v(&["abb-spawner.exe", "--", "claude", "--acp"])),
+            None
+        );
+        // 中继形态但缺 `--` 分隔 / 缺程序名：拒绝（宁可报用法错，也不要猜）
+        assert_eq!(
+            parse_relay_args(v(&[
+                "abb-spawner.exe",
+                RELAY_FLAG,
+                "C:/e.env",
+                "buzz-agent.exe"
+            ])),
+            None
+        );
+        assert_eq!(
+            parse_relay_args(v(&["abb-spawner.exe", RELAY_FLAG, "C:/e.env", "--"])),
+            None
+        );
+    }
+
+    /// 环境文件落在临时目录、名字唯一（并发多个 agent 不撞车）。
+    #[test]
+    fn relay_env_path_is_unique_in_temp() {
+        let a = relay_env_path();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = relay_env_path();
+        assert!(a.starts_with(std::env::temp_dir()), "{}", a.display());
+        assert_ne!(a, b, "两次调用必须不同名（pid+纳秒）");
+        assert!(a.to_string_lossy().ends_with(".env"));
     }
 }
