@@ -371,17 +371,18 @@ mod win {
             eprintln!("abb-spawner: 中继环境文件损坏（{env_file}），拒绝以半截环境启动 {program}");
             return super::EXIT_RELAY_ENV;
         };
-        use std::os::windows::process::CommandExt;
         // env_clear + envs = 子进程环境**恰好**是 bridge 交给我们的那一份；
         // stdin/stdout/stderr 继承 = bridge 的管道原样传下去（ACP 协议不变）。
-        let status = std::process::Command::new(program)
+        //
+        // 必须走 crate::spawn 的唯一入口：agent 是控制台子系统程序，漏了 CREATE_NO_WINDOW
+        // 就会凭空弹一个黑框（src/spawn.rs 的源码护栏专门守这条，本文件不得内联 creation_flags）。
+        let status = agent_bridge::spawn::command(program)
             .args(args)
             .env_clear()
             .envs(pairs)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
-            .creation_flags(CREATE_NO_WINDOW.0)
             .status();
         match status {
             Ok(st) => st.code().unwrap_or(1),
