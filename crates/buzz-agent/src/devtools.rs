@@ -29,9 +29,18 @@ const STREAM_TAIL_BUDGET: usize = 2048; // 单流保留的末尾字节（错误�
 const STREAM_HEAD_BUDGET: usize = SHELL_OUT_CAP - STREAM_TAIL_BUDGET - 128; // 头部预算（余量给省略标记）
 const SHELL_TIMEOUT_DEFAULT: u64 = 120;
 const SHELL_TIMEOUT_MAX: u64 = 600;
-/// 委派编码回合（P1.5）：冷起秒级、回合分钟级，默认 30min、上限 60min。
-const DELEGATE_TIMEOUT_DEFAULT: u64 = 1800;
-const DELEGATE_TIMEOUT_MAX: u64 = 3600;
+/// 委派编码回合（P1.5）：冷起秒级、回合分钟级。
+///
+/// **上限由外层墙决定，不是产品口味**：每次工具调用都被 `agent.rs` 的
+/// `cfg.tool_timeout`（默认 1260s，上游 #7185）包一层 `tokio::time::timeout`，
+/// 而 ABB 侧还有回合空闲墙（`src/buzz/harness.rs::IDLE_TIMEOUT` = 1500s）。
+/// 原来声明 1800/3600 是**不可达**的：跑到外层墙就被杀，模型只会收到
+/// `tool: timeout after 1260s`（看不到「委派预算不够」这个真因）。
+/// 现值留 60s 余量：委派 1200 < 工具墙 1260 < 空闲 1500。
+/// 要放宽必须**同时**抬这两层墙（`BUZZ_AGENT_TOOL_TIMEOUT_SECS` 与 ABB 的
+/// `IDLE_TIMEOUT`），否则只是把同一个问题往后挪。
+const DELEGATE_TIMEOUT_DEFAULT: u64 = 1200;
+const DELEGATE_TIMEOUT_MAX: u64 = 1200;
 const READ_MAX_BYTES: usize = 256 * 1024;
 const READ_MAX_LINES: usize = 10_000;
 const WRITE_MAX_BYTES: usize = 512 * 1024;
@@ -234,8 +243,8 @@ pub fn defs() -> Vec<(Tool, ToolDef)> {
                         },
                         "task": { "type": "string", "description": "Self-contained coding task / instructions for the delegated agent." },
                         "timeout_secs": {
-                            "type": "integer", "minimum": 1, "maximum": 3600,
-                            "description": "Hard timeout in seconds (default 1800)."
+                            "type": "integer", "minimum": 1, "maximum": 1200,
+                            "description": "Hard timeout in seconds (default 1200)."
                         }
                     },
                     "required": ["backend", "task"]

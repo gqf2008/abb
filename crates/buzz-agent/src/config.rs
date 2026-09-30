@@ -715,7 +715,7 @@ impl Config {
             max_output_tokens: parse_env("BUZZ_AGENT_MAX_OUTPUT_TOKENS", 65_536)?,
             max_token_recoveries: parse_env("BUZZ_AGENT_MAX_TOKEN_RECOVERIES", 3u32)?,
             llm_timeout: Duration::from_secs(parse_env("BUZZ_AGENT_LLM_TIMEOUT_SECS", 240)?),
-            tool_timeout: Duration::from_secs(parse_env("BUZZ_AGENT_TOOL_TIMEOUT_SECS", 660)?),
+            tool_timeout: Duration::from_secs(parse_env("BUZZ_AGENT_TOOL_TIMEOUT_SECS", 1_260)?),
             mcp_init_timeout: Duration::from_secs(parse_env(
                 "BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS",
                 30,
@@ -2469,5 +2469,28 @@ mod tests {
     fn pricing_authority_unknown_host_returns_none() {
         assert_eq!(pricing_authority("https://api.databricks.com/v1"), None);
         assert_eq!(pricing_authority("https://custom.llm.corp/v1"), None);
+    }
+
+    #[test]
+    fn default_tool_timeout_is_1260_seconds() {
+        // 上游 #7185（cae158ce7）锁住生产默认值：工具超时必须 ≥ buzz-dev-mcp 的
+        // MAX_TIMEOUT_MS(1_200s)，否则 shell(timeout_ms=1_200_000) 会在完成前被
+        // buzz-agent 连 MCP server 一起杀掉。
+        //
+        // ABB 侧额外约束（见 src/buzz/harness.rs 的 IDLE_TIMEOUT 与 fork devtools.rs
+        // 的 DELEGATE_TIMEOUT_*）：这条墙必须**短于** ABB 的回合空闲墙，否则空闲墙会
+        // 先杀掉整个回合、模型拿不到「工具超时」这种可恢复的失败。
+        const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1_260;
+        const ABB_IDLE_TIMEOUT_SECS: u64 = 1_500; // src/buzz/harness.rs::IDLE_TIMEOUT
+        const {
+            assert!(
+                1_200u64 <= DEFAULT_TOOL_TIMEOUT_SECS,
+                "工具超时必须 ≥ dev-mcp shell 上限（1200s）"
+            );
+            assert!(
+                DEFAULT_TOOL_TIMEOUT_SECS < ABB_IDLE_TIMEOUT_SECS,
+                "工具墙必须短于 ABB 回合空闲墙，否则失败不可恢复"
+            );
+        }
     }
 }

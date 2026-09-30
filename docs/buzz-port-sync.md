@@ -50,6 +50,12 @@
 - 上游：github.com/block/buzz `crates/buzz-agent/`，基线 **eed74bde2**（2026-09-03 搬运时的最新触碰该 crate 的提交）。**2026-09-03 起自维护**：上游改动一律经 `git diff` 人工合入本 fork，禁止反向污染上游仓库。
 - 差异清单维护在 fork `Cargo.toml` 头部注释（当前：agent.rs 文本直答回合 EndTurn 前补最终 steer drain；workspace 继承展开为直接值；scripts/ 两 JSON 随包 vendor 并改指包内 include 路径）。
 - 许可：Apache-2.0，全文见 fork 内 `LICENSE`（随上游 LICENSE 原样复制）。再分发须附文本（release.yml/ABB.iss 拷为 `buzz-LICENSE.txt`）。
+- **2026-09-30 上游增量合入**（区间 `eed74bde2` → `2664d1431`；该区间触及本 crate 的提交 13 个）：
+  - 合入 `0cc63fe3e`（#7840）**provider 无关半边**：`llm.rs` 的 `anthropic_body` 按**原始顺序**回放原生 `anthropic_content` 块（签名 thinking 不再被压平成 text+tool_calls）、`stamp_rolling_cache_breakpoint` 跳过 `thinking`/`redacted_thinking`、`openai_body` 只吃 array 形状（防会话中途换模型时原生状态泄漏进 Chat 请求）、`parse_anthropic` 超 `MAX_TOOL_CALLS_PER_TURN`(64) **直接拒绝**而非截断签名内容、返回结构把原生块存进 `reasoning_details`；`types.rs` 文档改为「provider-owned replay state」。**未迁**同提交的 `model_capabilities.rs` 半边（Databricks UC exact record）。
+  - 合入 `cae158ce7`（#7185）：`tool_timeout` 默认 660 → **1260**（+ 锁值测试，并钉住 ABB 的排序约束：工具墙 < 回合空闲墙）。
+  - **未迁其余 11 个**：8 个 Databricks 专属（`#5545`/`#7606`/`#6407`/`#7358`/`#7829`/`#7844`/`#7213`/`#7135`）——ABB 只发 `BUZZ_AGENT_PROVIDER=anthropic|openai`（`src/agent.rs`），非 Databricks 的 `session/new` 在 fork `lib.rs` 原样回落 ⇒ 这些代码在 ABB 运行时不生效；`#7127`/`#7736` 只动 tests；`#7819` 只从 `PASSTHROUGH_ENV` 删 `NOSTR_PRIVATE_KEY`（ABB 不设该变量，语义空操作）。
+  - **依赖告警（将来要搬必须成组、按序）**：`#7358` → `#7829` → `#7840`(capabilities 半边) → `#7606` → `#5545` → `#7844`。`#7606`/`#7844` 的 `lib.rs` 插入点正是 ABB 的 `mod devtools;`（fork `lib.rs:7`）——**整文件覆盖会静默抹掉 devtools/shell_policy 挂载与 `_meta.abbSandbox` 能力广告**。
+- **ABB 本地配套（非上游，2026-09-30）**：`src/buzz/harness.rs::IDLE_TIMEOUT` 900 → **1500**（恢复「委派/工具 1260 < 空闲 1500 < 硬上限 3600」排序；空闲墙若先到，整回合被杀且模型拿不到可恢复的工具超时）；fork `devtools.rs` 的 `DELEGATE_TIMEOUT_DEFAULT`/`MAX` 1800/3600 → **1200/1200**、工具 schema `maximum` 同步 1200（原值**不可达**：外层工具墙先杀，模型只会收到 `tool: timeout after 1260s`，看不到「委派预算不够」的真因）。要放宽委派预算必须**同时**抬这两层墙。
 
 ## 构建与门禁
 
@@ -63,6 +69,8 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 1. `cancelled_turn_with_usage_emits_notification_before_response`（断言 `tests/fake_llm.rs:1376`，Null vs "cancelled"）——cancel 写 stdin 后 gate 立即放开、agent reader 未及处理，第 2 轮 fallback 错误臂在 biased select 中抢先（`agent.rs:406-410`）。修它要动同步区 cancel 优先级，**另案评估**。发生率：20 轮口径 1 轮。
 2. `steer_rejected_on_empty_prompt`（断言 `tests/fake_llm.rs:1459`）——空 prompt 的 -32602 拒绝帧在争用下落后于 prompt 响应帧，先 break → `saw_reject=false`。自移植初始提交 be46634 存在、从未改动；仅全量并发下偶发（整文件 20 轮 0 出现）。
+
+**本机（Windows）环境性红基线（2026-09-30 复核）**：本机跑 fork 全量是 `538 passed / 3 failed`，三条在**干净 `main` worktree** 上同样失败（已复核归因，与本次改动零交集，按纪律不重跑至绿）：`write_confinement_rejects_escape`（Windows 路径语义）、`discover_skills_dedup_by_name`（依赖本机 `~/.agents/skills` 布局）、`corpus_matches_generated_snapshot`（随包 `scripts/normative-corpus.json` 相对基线已漂移，需 `just regen-model-corpus`）。
 
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
 
