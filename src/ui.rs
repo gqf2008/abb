@@ -1015,14 +1015,30 @@ fn chat_stats_to_row(s: &crate::msgstore::ChatStats, cfg: &Config) -> ChatSessio
     }
 }
 
+/// #74 历史会话排序：**按真实时间戳**倒序（最近活跃在前）。
+///
+/// 为什么不能用显示字符串当键：`fmt_msg_time` 产出 `"MM-DD HH:MM"`（不带年），
+/// 跨年时 `"12-31 23:00" > "01-01 01:00"` 会把**旧的**排到前面；`last_ts` 缺失时
+/// 得到空串，语义也不稳。抽成纯函数是为了把这两条钉进单测（见文件末测试）。
+fn order_sessions_by_recency(
+    stats: &[crate::msgstore::ChatStats],
+) -> Vec<&crate::msgstore::ChatStats> {
+    let mut ordered: Vec<&crate::msgstore::ChatStats> = stats.iter().collect();
+    // None（从未有过时间戳）恒排最后；`sort_by_key` 稳定，时间相同的保持入参顺序。
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.last_ts.unwrap_or(i64::MIN)));
+    ordered
+}
+
 /// #74 历史会话列表 model 整体替换（2s 轮询刷新；last_ts 倒序——最近活跃在前）。
 fn sync_chat_sessions_model(
     model: &slint::VecModel<ChatSessionRow>,
     stats: &[crate::msgstore::ChatStats],
     cfg: &Config,
 ) {
-    let mut rows: Vec<ChatSessionRow> = stats.iter().map(|s| chat_stats_to_row(s, cfg)).collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.time.to_string()));
+    let rows: Vec<ChatSessionRow> = order_sessions_by_recency(stats)
+        .into_iter()
+        .map(|s| chat_stats_to_row(s, cfg))
+        .collect();
     model.set_vec(rows);
 }
 
@@ -5722,6 +5738,44 @@ mod tests {
         assert!(
             !code_line("PixelPresets.classic()"),
             "不得退回库默认的 classic（黑白直角）"
+        );
+    }
+
+    /// #74 会话列表排序：必须按**真实时间戳**，不能按显示字符串。
+    ///
+    /// 判别力（owner 2026-10-01 实报「历史记录面板错位」，这是查出的一条真缺陷）：
+    /// 旧实现 `sort_by_key(|r| Reverse(r.time.to_string()))` 用的是 `fmt_msg_time` 的
+    /// `"MM-DD HH:MM"`（函数把年份丢了）。下面两条数据里 `1_767_200_400`
+    /// （2026-01-01 01:00 +08）比 `1_767_193_200`（2025-12-31 23:00 +08）**新**，但显示串
+    /// `"12-31 23:00" > "01-01 01:00"` ⇒ 字符串倒序会把旧的排第一，本用例即红。
+    #[test]
+    fn history_sessions_order_by_real_timestamp_not_display_string() {
+        fn st(chat_id: &str, last_ts: Option<i64>) -> crate::msgstore::ChatStats {
+            crate::msgstore::ChatStats {
+                bot_key: "k".to_string(),
+                chat_id: chat_id.to_string(),
+                count_7d: 0,
+                count_total: 1,
+                last_ts,
+                last_sender: "u".to_string(),
+                last_sender_id: "u".to_string(),
+                last_text: "t".to_string(),
+                chat_type: "group".to_string(),
+                chat_name: String::new(),
+            }
+        }
+        let old_year = st("old", Some(1_767_193_200)); // 2025-12-31 23:00 (+08)
+        let new_year = st("new", Some(1_767_200_400)); // 2026-01-01 01:00 (+08)
+        let never = st("never", None); // 从未有过消息时间
+        let stats = vec![old_year, never, new_year];
+        let ids: Vec<&str> = order_sessions_by_recency(&stats)
+            .into_iter()
+            .map(|s| s.chat_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["new", "old", "never"],
+            "按真时间戳倒序，缺失时间戳排最后"
         );
     }
 

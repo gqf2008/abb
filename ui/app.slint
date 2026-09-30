@@ -2561,7 +2561,8 @@ export component SettingsWindow inherits Window {
                                             VerticalBox {
                                                 spacing: 2px;
                                                 for prov[idx] in root.providers: Rectangle {
-                                                height: 44px;
+                                                // 同历史页：两行内容按 min-height 走，别钉死（soft 预设下行高变大）
+                                                min-height: 44px;
                                                 background: idx == root.provider-selected ? PixelTheme.accent : transparent;
                                                 border-radius: 0px;
                                                 TouchArea {
@@ -2775,7 +2776,11 @@ export component SettingsWindow inherits Window {
                                         VerticalBox {
                                             spacing: 2px;
                                             for s[idx] in root.chat-sessions: Rectangle {
-                                                height: 52px;
+                                                // 高度按**内容**走，不钉死：soft 预设下两行（标题 12px 粗 + 预览 12px）
+                                                // 实测需要 ~58px，钉死 52px 会让第二行溢出高亮带（错位）、且
+                                                // ScrollView 的内容高度按 52 记 ⇒ 末尾几像素永远滚不到（拉不到底）。
+                                                // min-height 只保证最小观感，内容更高时自动增高。
+                                                min-height: 52px;
                                                 vertical-stretch: 0;
                                                 background: idx == root.chat-selected ? PixelTheme.accent : transparent;
                                                 TouchArea {
