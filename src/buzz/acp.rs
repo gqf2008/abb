@@ -204,6 +204,11 @@ pub struct AcpClient {
     stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// 读 stderr 的后台任务；shutdown 时给一个有界窗口收尾，保证临终输出也进尾巴。
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    /// Windows：本 agent 所在 job 的守卫。Drop 时关闭 job 句柄 ⇒ 内核连带杀掉 agent 的
+    /// **整棵树**（含它为每个 session 起的 MCP 服务 wassette / mcp-events）。
+    /// 非 Windows 恒 None（unix 用进程组 kill 表达同一语义）。
+    #[allow(dead_code)] // 只为 Drop 持有（关句柄 ⇒ 内核杀掉 agent 整棵树），不需要读
+    job: Option<crate::agent_spawn::KillOnCloseJob>,
     /// Write end of the agent's stdin pipe.
     /// Box 化以兼容子进程管道与测试 duplex 两种传输（协议层零分叉）。
     stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -432,6 +437,12 @@ impl AcpClient {
         cmd.process_group(0);
 
         let mut child = cmd.spawn()?;
+        // 把 agent 放进「句柄关闭即杀」的 job：agent 被杀 / bridge 退出时，它起的 MCP 服务
+        // （wassette 等**孙**进程）一起死 —— 否则 Windows 上只杀直接子进程，MCP 会变孤儿
+        // 常驻（2026-09-30 owner 实报「桌上 10 个 wassette」）。
+        let job = child
+            .id()
+            .and_then(crate::agent_spawn::assign_kill_on_close_job);
 
         let stdin = child
             .stdin
@@ -462,6 +473,7 @@ impl AcpClient {
             Box::new(stdout),
             stderr_tail,
             stderr_task,
+            job,
         ))
     }
 
@@ -473,11 +485,13 @@ impl AcpClient {
         stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
         stderr_task: Option<tokio::task::JoinHandle<()>>,
+        job: Option<crate::agent_spawn::KillOnCloseJob>,
     ) -> Self {
         Self {
             child,
             stderr_tail,
             stderr_task,
+            job,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -505,8 +519,9 @@ impl AcpClient {
             None,
             Box::new(stdin),
             Box::new(reader),
-            // 进程内双工没有子进程 stderr：尾巴恒空。
+            // 进程内双工没有子进程 stderr：尾巴恒空；也没有子进程可放进 job。
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            None,
             None,
         )
     }
