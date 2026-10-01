@@ -550,7 +550,32 @@ fn windows_silent_args() -> Vec<&'static str> {
     ]
 }
 
-/// Windows：启动 Inno 安装包（per-user 安装免 UAC；静默装完由安装脚本 `[Run]` 段拉起新实例）。
+/// 安装后兜底重启脚本（Windows，纯函数便于单测）。
+///
+/// **为什么需要**（owner 2026-10-01 实报「装好后还要手动启动（已选安装后启动）」）：
+/// 正常路径是安装器 `[Run]` 段以原用户拉起新实例，但本次实测那条路径**没有留下任何进程**
+/// ——`Setup Log` 显示 Run entry 已执行（11:41:51），而 11:42:46 一个 ABB 进程都没有；
+/// 且 2.23.78/2.23.79 两次升级是自动回来的 ⇒ 该路径本身不可靠，不能只靠它。
+///
+/// 兜底做法：更新器拉起安装包后，再挂一个**脱离本进程**的 cmd 看门狗 —— 等 90 秒，若仍没有
+/// `agent-bridge.exe` 在跑就把它拉起来，并把这件事写进 update.log（下次再出问题有据可查，
+/// 不必靠猜）。若安装器已经拉起来了，这里 `tasklist` 命中即直接退出，是 no-op。
+pub(crate) fn post_update_relaunch_script(exe: &Path, log_path: &Path) -> String {
+    format!(
+        "@echo off\r\n\
+         rem ABB 安装后兜底重启：安装器 [Run] 没把 APP 拉起来时用\r\n\
+         ping -n 91 127.0.0.1 >nul\r\n\
+         tasklist /FI \"IMAGENAME eq agent-bridge.exe\" | find /I \"agent-bridge.exe\" >nul\r\n\
+         if \"%ERRORLEVEL%\"==\"0\" goto :eof\r\n\
+         >>\"{log}\" echo [%DATE% %TIME%] [update] 安装后 90 秒仍无 agent-bridge 进程，兜底拉起\r\n\
+         start \"\" \"{exe}\"\r\n",
+        log = log_path.display(),
+        exe = exe.display()
+    )
+}
+
+/// Windows：启动 Inno 安装包（提权安装；静默装完先由安装脚本 `[Run]` 段拉新实例，失败由上面
+/// 的兜底看门狗补上）。
 #[cfg(target_os = "windows")]
 fn windows_install(setup: &Path) -> Result<()> {
     // start 把首个带引号参数当窗口标题，故先给空标题；CREATE_NO_WINDOW（统一走
@@ -576,12 +601,57 @@ fn windows_install(setup: &Path) -> Result<()> {
         log_update_event(&format!("启动安装包失败：{e:#}"));
         return Err(anyhow::Error::from(e)).context("启动安装包失败");
     }
+    // 兜底看门狗（见 post_update_relaunch_script）：本进程马上要退出让安装器换文件，
+    // 所以这一步必须 spawn 一个独立进程来做，不能在本进程里等。
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-bridge.exe"));
+    let log_path = crate::bridge_dir().join("logs").join("update.log");
+    let script_path = crate::bridge_dir()
+        .join("logs")
+        .join("post-update-relaunch.cmd");
+    if let Err(e) = std::fs::write(&script_path, post_update_relaunch_script(&exe, &log_path)) {
+        log_update_event(&format!("写安装后兜底脚本失败（不影响安装）：{e:#}"));
+    } else if let Err(e) = crate::spawn::command("cmd")
+        .arg("/c")
+        .arg(&script_path)
+        .spawn()
+    {
+        log_update_event(&format!("启动安装后兜底看门狗失败（不影响安装）：{e:#}"));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 安装后兜底脚本必须：等待 → 查有没有实例 → 没有才拉起 → 留痕。
+    ///
+    /// 判别力：把任一步删掉（不等就拉起会双开；不查就拉起会打断用户正在用的实例；
+    /// 不留痕则下次再出问题又只能靠猜）本用例即红。
+    #[test]
+    fn post_update_relaunch_script_waits_checks_starts_and_logs() {
+        let s = post_update_relaunch_script(
+            Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
+            Path::new(r"C:\Users\u\.agent-bridge\logs\update.log"),
+        );
+        assert!(
+            s.contains("ping -n 91"),
+            "必须先等约 90 秒让安装器装完：{s}"
+        );
+        assert!(
+            s.contains("tasklist") && s.contains("agent-bridge.exe"),
+            "必须查有没有实例在跑（有则 no-op，避免双开）：{s}"
+        );
+        let want = format!(
+            "start \"\" \"{}\"",
+            r"C:\Program Files\ABB\agent-bridge.exe"
+        );
+        assert!(
+            s.contains(&want),
+            "没有实例时必须把 APP 拉起来（期望含 {want:?}）：{s}"
+        );
+        assert!(s.contains("update.log"), "必须留痕，便于下次归因：{s}");
+    }
 
     /// 「双写」的文件半：给定临时目录时必须真的写出 `update.log`（追加、一行一记录）。
     #[test]

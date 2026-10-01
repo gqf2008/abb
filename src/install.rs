@@ -902,6 +902,21 @@ mod installer_guards {
             code.contains("'/change /tn ' + BridgeTaskName + ' /enable'"),
             "装完必须把常驻任务恢复启用（否则升级后 bridge 不再自启）"
         );
+        assert!(
+            code.contains("'/run /tn ' + BridgeTaskName"),
+            "装完必须把常驻服务 run 起来（不能只靠托盘看门狗带）"
+        );
+        // 顺序：恢复启用那条 [Run] 必须排在拉起 APP 的 [Run] **之前** —— 反了的话托盘启动那一刻
+        // 任务还是 disabled，看门狗启服务必失败（2026-10-01 实测顺序就是反的：11:41:51.172 拉起
+        // APP / 11:41:52.657 才 enable ⇒ 装完 APP 与 bridge 都没起来，用户得手动开）。
+        // 注意：[Run] 那条是 Inno 语法（任务名写死字面量），Pascal 里那条才是 `+ BridgeTaskName +`；
+        // 这里判的是 [Run] 段先后，故按字面量找。
+        let enable_at = code.find("/tn ABB-Bridge /enable").unwrap_or(usize::MAX);
+        let launch_at = code.find("--wait-lock").unwrap_or(usize::MAX);
+        assert!(
+            enable_at < launch_at,
+            "[Run] 里恢复启用任务必须排在拉起 APP 之前（否则装完 APP 起不来）"
+        );
     }
 
     /// 托盘必须用 `runasoriginaluser` 拉起：安装器已是管理员，否则管理员令牌会传染给托盘
