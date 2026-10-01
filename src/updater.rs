@@ -63,8 +63,29 @@ impl Updater {
         Ok(Self { client })
     }
 
-    /// 查 GitHub latest release。只取 tag_name + 资产名/URL，不解析 body。
+    /// 查 GitHub latest release：**先走 API**（能拿到资产列表），API 不可用时**退回 `releases/latest`
+    /// 跳转**（只用 Location 里的 tag）。
+    ///
+    /// 为什么必须有这条退路（2026-10-01 实测）：`api.github.com` 对匿名客户端限流
+    /// **60 次/小时/IP**，撞上就是 `403 Forbidden`；托盘每 30 分钟检查一次、同出口 IP 上还可能有
+    /// 别的进程/机器一起查，一小时就能把额度吃光 —— 用户端表现为「检查失败（静默）」、点升级没反应
+    /// （本机 11:43 的 update.log 就是 `GitHub API 返回 403 Forbidden`）。而
+    /// `https://github.com/<repo>/releases/latest` 只是普通网页跳转，**无此限流**，拿到 tag 足够
+    /// 推出资产（命名按本仓约定，见 `asset_file_name`）。
     pub async fn check_latest(&self) -> Result<LatestRelease> {
+        match self.check_latest_api().await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                log_update(&format!(
+                    "[update] GitHub API 检查失败（{e:#}），退回 releases/latest 跳转取版本（不限流）"
+                ));
+                self.check_latest_redirect().await
+            }
+        }
+    }
+
+    /// API 路径（原实现）：只取 tag_name + 资产名/URL，不解析 body。
+    async fn check_latest_api(&self) -> Result<LatestRelease> {
         let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
         let resp = self
             .client
@@ -118,7 +139,7 @@ impl Updater {
         // SHA256SUMS：release 附带则解析出本平台安装包的期望哈希（校验用）。
         // 拉取失败与清单缺失区分开：前者 FetchFailed（网络抖动可重试），
         // 后者 Missing（发版缺陷，fail-closed 拒装并如实上报）。
-        let sums_state = match v.get("assets").and_then(|a| a.as_array()).and_then(|arr| {
+        let sums_url = v.get("assets").and_then(|a| a.as_array()).and_then(|arr| {
             arr.iter().find_map(|a| {
                 let n = a.get("name").and_then(|n| n.as_str())?;
                 if n != SHASUMS_NAME {
@@ -128,21 +149,10 @@ impl Updater {
                     .and_then(|u| u.as_str())
                     .map(String::from)
             })
-        }) {
-            Some(u) => match self.fetch_shasums(&u).await {
-                Ok(map) => match asset_name.as_deref().and_then(|n| map.get(n)) {
-                    Some(h) => SumsState::Ok(h.clone()),
-                    None => SumsState::Missing, // 清单在但没有本平台条目（发版配置错误）
-                },
-                Err(e) => {
-                    log_update(&format!(
-                        "[update] 拉 SHA256SUMS 失败（网络问题，可重试）：{e:#}"
-                    ));
-                    SumsState::FetchFailed(e.to_string())
-                }
-            },
-            None => SumsState::Missing,
-        };
+        });
+        let sums_state = self
+            .resolve_sums(sums_url.as_deref(), asset_name.as_deref())
+            .await;
         Ok(LatestRelease {
             version,
             asset_url,
@@ -172,6 +182,89 @@ impl Updater {
     /// 流式下载到目标文件（逐块写盘，不把整个 dmg 堆进内存）。
     /// `on_progress(已下载字节, 总字节)`：总字节取 content-length，响应头没有时为 None。
     /// GitHub 资产会 302 到下载 CDN，部分网络下 connect 抖动（实测连续超时后重试又能下完）：
+    /// 解析 SHA256SUMS：区分「拉取失败（网络，可重试）」与「清单缺失（发版缺陷）」。
+    /// 抽出来是因为 API 路径与跳转退路都要用同一套判定。
+    async fn resolve_sums(&self, sums_url: Option<&str>, asset_name: Option<&str>) -> SumsState {
+        let Some(u) = sums_url else {
+            return SumsState::Missing;
+        };
+        match self.fetch_shasums(u).await {
+            Ok(map) => match asset_name.and_then(|n| map.get(n)) {
+                Some(h) => SumsState::Ok(h.clone()),
+                None => SumsState::Missing, // 清单在但没有本平台条目（发版配置错误）
+            },
+            Err(e) => {
+                log_update(&format!(
+                    "[update] 拉 SHA256SUMS 失败（网络问题，可重试）：{e:#}"
+                ));
+                SumsState::FetchFailed(e.to_string())
+            }
+        }
+    }
+
+    /// 退路：读 `releases/latest` 的 302 `Location`（形如 `…/releases/tag/v2.23.84`）拿版本号；
+    /// 资产名按本仓命名约定推出（`asset_file_name`），下载 URL 由 tag 拼。
+    ///
+    /// 注意**必须禁用重定向跟随**：跟随后 Location 就被 reqwest 吃掉了，读不到 tag。
+    async fn check_latest_redirect(&self) -> Result<LatestRelease> {
+        let url = format!("https://github.com/{REPO}/releases/latest");
+        let probe = reqwest::Client::builder()
+            .user_agent(concat!("abb-updater/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("构建重定向探测 client 失败")?;
+        let resp = probe
+            .get(&url)
+            .send()
+            .await
+            .context("请求 releases/latest 失败（网络/代理？）")?;
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "releases/latest 没有 Location（HTTP {}）——可能该仓库暂无 release",
+                    resp.status()
+                )
+            })?;
+        let tag = tag_from_location(loc)
+            .ok_or_else(|| anyhow!("Location 里找不到 tag（v 开头）：{loc}"))?;
+        let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+        // 资产：Linux 侧本就没有预编译包（保持既有 None 语义，UI 显示「请从源码更新」）。
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let (asset_name, asset_url, sums_url) = {
+            let name = asset_file_name(&version);
+            (
+                Some(name.clone()),
+                Some(format!(
+                    "https://github.com/{REPO}/releases/download/{tag}/{name}"
+                )),
+                Some(format!(
+                    "https://github.com/{REPO}/releases/download/{tag}/{SHASUMS_NAME}"
+                )),
+            )
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let (asset_name, asset_url, sums_url) = (None, None, None);
+        let sums_state = self
+            .resolve_sums(sums_url.as_deref(), asset_name.as_deref())
+            .await;
+        log_update(&format!(
+            "[update] 经 releases/latest 跳转取到版本 v{version}（API 限流退路）"
+        ));
+        Ok(LatestRelease {
+            version,
+            asset_url,
+            asset_sha256: match &sums_state {
+                SumsState::Ok(h) => Some(h.clone()),
+                _ => None,
+            },
+            sums_state,
+        })
+    }
+
     /// 最多 3 次、递增退避；不做断点续传（包不大，整体重下简单可靠）。
     pub async fn download_to(
         &self,
@@ -321,6 +414,19 @@ fn verify_sha256_at(
         );
     }
     Ok(())
+}
+
+/// 从 `releases/latest` 的 Location 里取 tag（纯函数，便于单测）。
+///
+/// 形如 `https://github.com/gqf2008/abb/releases/tag/v2.23.84` → `Some("v2.23.84")`；
+/// 只看**最后一段**且必须以 `v` 开头，避免把 `releases`/`tag` 之类的路径段当成版本号。
+pub fn tag_from_location(loc: &str) -> Option<String> {
+    let seg = loc.trim_end_matches('/').rsplit('/').next()?;
+    if seg.starts_with('v') && seg.len() > 1 {
+        Some(seg.to_string())
+    } else {
+        None
+    }
 }
 
 /// 按平台从资产名列表里挑安装包（纯函数，便于单测）：
@@ -818,8 +924,32 @@ mod tests {
         assert!(is_newer("2.15.0-beta1", "2.14.9")); // 后缀截断按数字段比
     }
 
-    #[cfg(target_os = "macos")]
+    /// 跳转退路的解析必须只认最后一段的 `v…`：把 `releases` 当版本号会让升级链指向不存在的资产。
     #[test]
+    fn tag_from_location_takes_last_v_segment_only() {
+        assert_eq!(
+            tag_from_location("https://github.com/gqf2008/abb/releases/tag/v2.23.84").as_deref(),
+            Some("v2.23.84")
+        );
+        assert_eq!(
+            tag_from_location("https://github.com/gqf2008/abb/releases/tag/v2.23.84/").as_deref(),
+            Some("v2.23.84"),
+            "尾斜杠不该影响"
+        );
+        assert_eq!(
+            tag_from_location("https://github.com/gqf2008/abb/releases").as_deref(),
+            None,
+            "`releases` 不是版本号"
+        );
+        assert_eq!(
+            tag_from_location("https://github.com/gqf2008/abb/releases/tag/latest").as_deref(),
+            None,
+            "不以 v 开头的不认"
+        );
+        assert_eq!(tag_from_location("").as_deref(), None);
+    }
+
+    #[cfg(target_os = "macos")]
     fn pick_asset_macos() {
         let names = vec![
             "ABB-2.15.0.dmg".to_string(),
