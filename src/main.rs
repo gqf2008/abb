@@ -167,15 +167,19 @@ pub fn write_log(writer: &mut dyn std::io::Write, args: std::fmt::Arguments<'_>)
     );
 }
 
-/// 托管（计划任务 / launchd）形态的 Windows bridge **没有可用的 stdout/stderr 句柄**：
-/// `log!` 与 tracing 的写入会被静默丢弃，`logs/bridge.out` 停在「上次由托盘拉起时」的内容
-/// —— 排障时看着像「服务没跑、也没有日志」（2026-09-30 实报：托管形态出问题只能翻任务日志）。
+/// Windows 下**没有可用的 stdout/stderr 句柄**的形态（托管服务、以及 GUI 托盘）把标准输出/
+/// 错误接到 `logs/<name>`（追加）：`log!` 与 tracing 的写入否则会被静默丢弃，排障时看着像
+/// 「进程没跑、也没有日志」。
 ///
-/// 这里在**任何输出发生之前**把 stdout/stderr 接到 `logs/bridge.out`（追加），让托管形态与
-/// 托盘形态走同一条日志通道。判据是「句柄为空/无效」：托盘 spawn 时已经重定向到同一个文件，
-/// 那种情况**不动它**（否则同一文件被两条句柄交错写）。
+/// 两个调用点：
+/// - 服务：`logs/bridge.out`（2026-09-30 实报：托管形态出问题只能翻任务日志）；
+/// - GUI 托盘：`logs/gui.out`（2026-10-01 实报：静默升级后托盘没回来，而 GUI 的 `log!` 全蒸发、
+///   连「拿不到 gui 锁而退出」这条都看不到，只能靠猜）。两文件分开，避免两条进程交错写。
+///
+/// 判据是「句柄为空/无效」：托盘 spawn 服务时已重定向到同一个文件，那种情况**不动它**。
+/// **必须在任何输出之前调用**：否则 Rust 已缓存旧句柄。
 #[cfg(target_os = "windows")]
-fn attach_service_log_file() {
+fn attach_log_file(name: &str) {
     use std::os::windows::io::AsRawHandle;
 
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
@@ -196,7 +200,7 @@ fn attach_service_log_file() {
     if usable {
         return;
     }
-    let path = crate::bridge_dir().join("logs").join("bridge.out");
+    let path = crate::bridge_dir().join("logs").join(name);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -219,8 +223,8 @@ fn attach_service_log_file() {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn attach_service_log_file() {
-    // launchd/systemd 形态由 supervisor 的 StandardOutPath 负责，无需在此处理。
+fn attach_log_file(_name: &str) {
+    // launchd/systemd 形态（服务）由 supervisor 的 StandardOutPath 负责；GUI 侧暂无对应机制。
 }
 
 #[macro_export]
@@ -464,7 +468,7 @@ fn main() {
     if args.iter().any(|a| a == "--service") {
         // 托管形态没有可用 stdout 时，先把日志接到 logs/bridge.out（见函数文档）；
         // 必须在任何输出之前调用，否则 Rust 已缓存旧句柄。
-        attach_service_log_file();
+        attach_log_file("bridge.out");
         // 存量孤儿回收：job 方案上线前（以及任何漏网的）agent 被杀时，它起的 MCP 服务
         // （wassette）会作为孙进程常驻。新起的由 agent_spawn 的 job 覆盖，存量在这里收一次。
         let reaped = crate::orphan_mcp::reap_wassette_orphans();
@@ -659,6 +663,11 @@ fn main() {
     }
 
     // GUI：托盘控制器（单实例：已在跑就不再开一个托盘）
+    //
+    // 先把 GUI 日志接到 logs/gui.out：GUI 同样是 windows_subsystem="windows"、没有可用 stdout，
+    // 不接的话 `log!` 全蒸发——「装完托盘没回来」这类问题连失败原因都留不下（2026-10-01 实报）。
+    // **必须在拿 gui 锁之前**：拿不到锁而退出正是最需要留痕的那条路径。
+    attach_log_file("gui.out");
     if args.iter().any(|a| a == "--diag-tray") {
         diag_tray_image();
         return;
@@ -2514,6 +2523,30 @@ mod tests {
         describe_trigger, job_cli_to_task_args, parse_task_to, parse_task_to_target,
         read_task_logs, session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
     };
+
+    /// GUI 必须把日志接到 `logs/gui.out`，且**在拿 gui 锁之前**。
+    ///
+    /// 为什么钉：GUI 是 `windows_subsystem="windows"`，没有可用 stdout ⇒ 不接日志时 `log!` 全蒸发，
+    /// 「装完托盘没回来」这类问题连失败原因都留不下（2026-10-01 实报，只能靠猜）。而拿锁失败
+    /// （`--wait-lock` 30s 超时后 `exit(0)`）正是最需要留痕的那条路径，所以顺序也在断言里。
+    #[test]
+    fn gui_attaches_log_file_before_taking_lock() {
+        let src = include_str!("main.rs");
+        let attach = src
+            .find("attach_log_file(\"gui.out\")")
+            .expect("GUI 路径必须调用 attach_log_file(\"gui.out\")（否则托盘日志无处可查）");
+        let take_lock = src
+            .find("SingleInstance::acquire_with_retry(")
+            .expect("GUI 升级重启路径应有 acquire_with_retry");
+        assert!(
+            attach < take_lock,
+            "接日志必须早于拿 gui 锁：拿不到锁而退出的那条路径正是要留痕的"
+        );
+        assert!(
+            src.contains("attach_log_file(\"bridge.out\")"),
+            "服务侧原有接日志不能丢"
+        );
+    }
 
     /// #312 审查：`task --help` / `-h` / `help` 必须**真**走帮助臂——落到 `other` 会先
     /// 多打一行「不认识的子命令」，而放到 `resolve_bot_key()` 之后又会让未配置 bot 的
