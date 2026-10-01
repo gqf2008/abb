@@ -85,6 +85,10 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 ; 管理员权限跑（本批要避免的事）。加它 ⇒ 托盘回到「启动安装的那个普通用户」身份；
 ; 需要高完整性的 bridge 由下面的 [Code] 注册的计划任务以 HighestAvailable 拉起，各就各位。
 [Run]
+; 顺序要紧：先把安装期间 `/disable` 掉的常驻任务**恢复启用**，再拉起 APP —— 反过来的话，
+; 托盘启动那一刻任务还是禁用的，它的看门狗启服务必然失败（2026-10-01 实测顺序就是反的：
+; 11:41:51.172 拉起 APP / 11:41:52.657 才 enable ⇒ 装完 APP 与 bridge 都没起来，用户得手动开）。
+Filename: "schtasks.exe"; Parameters: "/change /tn ABB-Bridge /enable"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-lock"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
@@ -167,6 +171,9 @@ begin
     Exec('schtasks.exe', '/change /tn ' + BridgeTaskName + ' /enable', '', SW_HIDE,
          ewWaitUntilTerminated, Rc);
     Log('ABB: 恢复启用常驻任务 rc=' + IntToStr(Rc));
+    // 直接把服务跑起来：不然它只靠托盘看门狗带，托盘没起来就两端都没起来（2026-10-01 实报）
+    Exec('schtasks.exe', '/run /tn ' + BridgeTaskName, '', SW_HIDE, ewWaitUntilTerminated, Rc);
+    Log('ABB: 启动常驻任务 rc=' + IntToStr(Rc));
   end;
 end;
 
