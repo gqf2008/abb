@@ -607,8 +607,11 @@ mod stop_intent_tests {
 /// 钉「升级成功分支里恰好一处 `svc_stop_keep_desired()`，且紧跟在升级完成日志之后」。
 #[cfg(test)]
 mod upgrade_call_site_tests {
-    /// 升级成功分支的日志串（`ui.rs` 里「安装完成，退出并重启到新版本」那句）。
-    const UPGRADE_LOG: &str = "安装完成，退出并重启到新版本";
+    /// 升级分支的日志串（`ui.rs` 里「已启动安装包…」那句）。
+    ///
+    /// 2026-10-01 改文案：原文案写「安装完成」，但更新器是 `cmd /c start` 派生的、**拿不到**
+    /// 安装器退出码，安装器随即回滚也照样先打这句 ⇒ 用户以为装好了其实没有（owner 实报）。
+    const UPGRADE_LOG: &str = "已启动安装包";
     const KEEP_DESIRED_CALL: &str = "svc_stop_keep_desired()";
     /// 日志与调用之间的允许跨度（**行**，不是字节——那段之间是中文注释，按字节算会随字数漂移）。
     /// 两者目前同在一个 `slint::invoke_from_event_loop` 闭包里、相隔 7 行；留一倍余量。
@@ -862,6 +865,42 @@ mod installer_guards {
         assert!(
             !code_lines().iter().any(|l| l.contains("localappdata")),
             "代码行里不得再出现 localappdata（per-machine 的前提）"
+        );
+    }
+
+    /// 安装器必须在**复制文件之前**把常驻服务真停掉（2026-10-01 owner 实报「安装程序杀不掉
+    /// 进程，必须手动杀才能装成功」）。
+    ///
+    /// 为什么钉这条：`CloseApplications=yes` 靠 Windows RestartManager，而 RM 只能关有窗口的
+    /// GUI 进程 —— 无窗口的常驻服务它关不掉；静默安装（`/SUPPRESSMSGBOXES`）下那个
+    /// Abort/Retry/Ignore 默认取 **Abort** ⇒ 安装回滚。少了下面任意一行，用户就又要手动杀进程；
+    /// 而 `.iss` 只在发版时编译、跑不到单测，只能靠源码断言兜住。
+    #[test]
+    fn installer_force_stops_bridge_before_copying_files() {
+        let code = code_lines().join("\n");
+        assert!(
+            code.contains("'/end /tn ' + BridgeTaskName"),
+            "必须先用 schtasks /end 停掉常驻任务当前实例"
+        );
+        assert!(
+            code.contains("'/change /tn ' + BridgeTaskName + ' /disable'"),
+            "必须临时禁用常驻任务：否则它的 RestartOnFailure 会在复制文件途中把服务拉回来、再次锁住 exe"
+        );
+        assert!(
+            code.contains("'/F /T /IM agent-bridge.exe'"),
+            "必须强杀 agent-bridge.exe（RM 关不掉它，这是安装失败的直接原因）"
+        );
+        assert!(
+            code.contains("function PrepareToInstall"),
+            "收工动作必须挂在 PrepareToInstall（复制文件之前），不能只放 ssPostInstall"
+        );
+        assert!(
+            code.contains("StopBridgeForInstall"),
+            "PrepareToInstall / ssInstall 必须真的调用 StopBridgeForInstall"
+        );
+        assert!(
+            code.contains("'/change /tn ' + BridgeTaskName + ' /enable'"),
+            "装完必须把常驻任务恢复启用（否则升级后 bridge 不再自启）"
         );
     }
 

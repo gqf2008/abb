@@ -2340,7 +2340,7 @@ pub fn run_gui() -> Result<()> {
                             match r {
                                 Ok(()) => {
                                     crate::updater::log_update(&format!(
-                                        "[update] v{} 安装完成，退出并重启到新版本",
+                                        "[update] v{} 已启动安装包（更新器拿不到安装器退出码；成败看 %TEMP%\\Setup Log *.txt），本进程退出让安装器换文件",
                                         rel.version
                                     ));
                                     let _ = slint::invoke_from_event_loop(move || {
