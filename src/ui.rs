@@ -1682,6 +1682,8 @@ pub fn run_gui() -> Result<()> {
     // flat 遗留是单 bot 时代产物，归首 bot；bot2+ 的迁移由 service 的 migrate_keys 负责。
     if let Ok(c) = Config::load() {
         platform::migrate_legacy_state(&c);
+        // 新模型（2026-10-04）：退役旧的高权限常驻计划任务，避免它和托盘的普通用户服务抢锁。
+        platform::retire_legacy_bridge_task();
     }
 
     let tray = Tray::new()?;

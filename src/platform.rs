@@ -1342,138 +1342,36 @@ fn run_reg(args: &[&str]) -> std::io::Result<std::process::Output> {
     crate::spawn::command("reg").args(args).output()
 }
 
-/// 跑 schtasks（CREATE_NO_WINDOW：GUI 进程 spawn 控制台程序不弹黑框）。
-#[cfg(target_os = "windows")]
-fn run_schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
-    crate::spawn::command("schtasks").args(args).output()
-}
-
-/// bridge 常驻计划任务的状态（与 macOS 的 `LoginItem` 三态同构）。
-#[cfg(target_os = "windows")]
-#[derive(Debug, PartialEq, Eq)]
-enum SvcTask {
-    /// 任务不存在（没开过 / 被删）或查不出来。
-    Absent,
-    /// 任务在，且登记的 exe + `--service` 与当前二进制一致。
-    Matches,
-    /// 任务在但指向旧安装路径 / 缺 `--service`（升级换过目录、旧版任务）。
-    Drifted,
-}
-
-/// 查询任务：`schtasks /query /tn … /xml`，再按**字节**判 exe 与 `--service`
-/// （输出编码可能是 UTF-8 或 UTF-16LE；判据只需回答「是不是当前这套」，不解析 XML）。
-#[cfg(target_os = "windows")]
-fn svc_task_state() -> SvcTask {
-    let Ok(exe) = current_exe() else {
-        return SvcTask::Absent;
-    };
-    match run_schtasks(&["/query", "/tn", agent_bridge::svc_task::TASK_NAME, "/xml"]) {
-        Ok(o) if o.status.success() => {
-            if agent_bridge::svc_task::task_output_matches_exe(&o.stdout, &exe.to_string_lossy()) {
-                SvcTask::Matches
-            } else {
-                SvcTask::Drifted
-            }
-        }
-        // 任务不存在时 schtasks 非 0 退出（错误在 stderr）——当 Absent。
-        Ok(_) | Err(_) => SvcTask::Absent,
-    }
-}
-
-/// Windows：bridge 是否已交给计划任务托管（任务在且指向当前二进制）。
+/// Windows：新模型（2026-10-04 owner 决定）下**没有 OS 级托管** —— 服务由托盘以普通用户身份
+/// 拉起并看守（`install::svc_start` + 2 秒看门狗），用户意图仍由 `service.desired` 表达。
 ///
-/// 托管后托盘不再自己 spawn/杀 bridge（见 `install::svc_start` / `svc_restart`）：计划任务带
-/// `RunLevel=HighestAvailable`（高完整性，同用户的中完整性进程杀不掉）与 `RestartOnFailure`，
-/// 比托盘的 2 秒看门狗更硬。
+/// 为什么要拆掉旧形态：以前是 `RunLevel=HighestAvailable` 的常驻计划任务（高完整性，普通权限
+/// 杀不掉）+ 一套提权件（`abb-spawner` / `abb-elev-helper` / `abb-helper`）。owner 2026-10-04
+/// 决定「全部以普通用户运行，启动/停止统一由管理密码把关」⇒ 计划任务与提权件一并退出历史舞台。
+/// 所以这里**恒 false**（调用方 `install::svc_start` 据此走托盘子进程那条路）。
 #[cfg(target_os = "windows")]
 pub fn service_supervised() -> bool {
-    svc_task_state() == SvcTask::Matches
+    false
 }
 
-/// Windows：让计划任务重启 bridge（`/end` 再 `/run`）。
+/// Windows：重启服务 = 让托盘那条用户级路径重拉（`install::svc_start` 自带「先停旧实例」）。
 ///
-/// 不需要提权：任务属于当前用户，`/run`/`/end` 普通权限即可（与「停止服务」不同——后者是
-/// owner 要求的**授权动作**，走提权 helper）。
+/// 新模型下没有计划任务可 `/end` `/run`：服务就是托盘的子进程（普通用户身份），
+/// 重启即「杀掉 + 重拉」，与「启动」走同一条代码，不再有两套语义。
 #[cfg(target_os = "windows")]
 pub fn restart_service_supervised() -> Result<()> {
-    // `/end` 是 best-effort（任务没在跑时它也会非 0），但**不能静默**：结果要留痕，
-    // 否则「重启没反应」在日志里看不出任何东西（2026-09-29 owner 实报）。
-    match run_schtasks(&["/end", "/tn", agent_bridge::svc_task::TASK_NAME]) {
-        Ok(o) if o.status.success() => crate::log!("[svc] schtasks /end 已发出（任务已停）"),
-        Ok(o) => crate::log!(
-            "[svc] schtasks /end 退出码 {}（任务未在跑也算正常）：{}",
-            o.status,
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => crate::log!("[svc] schtasks /end 执行失败（继续尝试 /run）：{e:#}"),
-    }
-    let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
-        .context("执行 schtasks /run 失败")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "schtasks /run 失败: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
+    crate::install::svc_start()
 }
 
-/// 调提权 helper 执行一个 op（UAC 由 helper 的 `runas` 触发）。
+/// Windows：停止服务 —— 新模型下**不需要提权**，就是真停掉那个用户级进程。
 ///
-/// 结果双重校验：**退出码必须为 0**（提权包装必须透传子进程退出码）**且**响应 `ok`——
-/// 只看响应会把「helper 崩了但管道里残留半截数据」当成成功。
-#[cfg(target_os = "windows")]
-fn call_elev(op: agent_bridge::elev::Op) -> Result<agent_bridge::elev::Response> {
-    let outcome = agent_bridge::elev::win::call_helper(
-        op,
-        &serde_json::json!({}),
-        std::time::Duration::from_secs(120),
-    )
-    .map_err(|e| anyhow::anyhow!("拉起提权 helper 失败：{e}"))?;
-    if outcome.exit_code != 0 {
-        anyhow::bail!("提权 helper 退出码 {}（响应不可信）", outcome.exit_code);
-    }
-    let resp: agent_bridge::elev::Response =
-        serde_json::from_slice(&outcome.response).context("提权 helper 响应不是合法 JSON")?;
-    if !resp.ok {
-        anyhow::bail!("提权操作被拒绝/失败：{}（{}）", resp.reason, resp.code);
-    }
-    Ok(resp)
-}
-
-/// Windows：停止服务 —— **需要 UAC 授权**（owner 2026-09-28：不能被随便杀死）。
-///
-/// 走提权 helper 的白名单 op `stop-bridge-task`（`schtasks /end` + 审计）。用户取消 UAC 时
-/// helper 起不来 ⇒ 这里报错，调用方据此提示「未停止」（**不会**静默降级成无授权停止）。
+/// 历史：以前走提权 helper 的白名单 op `stop-bridge-task`（UAC + 审计），因为服务当时跑在
+/// `HighestAvailable` 计划任务下、普通权限杀不掉。owner 2026-10-04 决定「全部以普通用户运行，
+/// 启动/停止统一由 ABB 管理密码把关」⇒ 提权那层退出，这里只负责**真停掉**；
+/// 「要不要停」由 UI 层的管理密码门决定（`admin_pass`）——两道门职责分开，别混。
 #[cfg(target_os = "windows")]
 pub fn stop_service_authorized() -> Result<()> {
-    // 评审 R23 §3.4：**任务不存在**时 `schtasks /end` 必然失败（退出码 1），但这不是「没授权」——
-    // 那说明 bridge 现在不是计划任务管的（例如刚关过自启、bridge 被看门狗拉成托盘子进程）。
-    // 这种情形要把「已授权」交给调用方，由它走 pid 兜底真停掉（否则点「停止」永远失败、服务还在跑）。
-    match call_elev(agent_bridge::elev::Op::StopBridgeTask) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            // 复评 R24 §7-G2：**用户取消 UAC** 是明确拒绝，绝不能被下面「任务不存在」那条当成
-            // 「已授权」—— 否则「停止要授权」在非托管形态下会被绕过（哪怕只能杀中完整性进程）。
-            // 复评 R25 观察项 O3：判据串与产生方共享同一常量，避免措辞漂移导致静默失配。
-            let cancelled = e
-                .to_string()
-                .contains(agent_bridge::elev::ERR_ELEVATION_CANCELLED);
-            let state = svc_task_state();
-            // 诊断先落盘（owner 2026-09-29 实报「停不了也没提示」）：这一行能直接区分
-            // 「UAC 被取消 / helper 起不来 / 任务不在 ⇒ 走 pid 兜底」三种形态。
-            crate::log!(
-                "[svc] 授权停止未成功：task_state={state:?} cancelled={cancelled} err={e:#}"
-            );
-            if !cancelled && state == SvcTask::Absent {
-                crate::log!(
-                    "[svc] 常驻任务不存在（非托管形态）：已取得授权，交由调用方按 pid 停止（{e:#}）"
-                );
-                return Ok(());
-            }
-            Err(e)
-        }
-    }
+    crate::install::svc_stop_keep_desired()
 }
 
 /// **安装器专用**：以管理员身份登记 bridge 常驻任务（`agent-bridge.exe --install-bridge-task`）。
@@ -1504,27 +1402,18 @@ pub fn install_bridge_task_elevated() -> Result<()> {
 /// 与 [`autostart_enabled`]（托盘自启 = Run 键）刻意分开：存量用户只有 Run 键，判据若耦合会
 /// 让他的开关突然显示「关」。补任务要显式动作（开自启开关）——注册任务需要 UAC，而自愈阶段
 /// **不弹**授权框（那会变成每次启动都弹）。
-/// Windows：托管形态下的「启动」= `schtasks /run`（任务在跑时 IgnoreNew 策略保证不重复起）。
+/// Windows：托管形态下的「启动」—— 新模型下等价于让托盘那条用户级路径重拉
+///（`install::svc_start` 自带「已在跑就先停」，故与重启同一入口，不再有两套语义）。
 #[cfg(target_os = "windows")]
 pub fn start_service_supervised() -> Result<()> {
-    let out = run_schtasks(&["/run", "/tn", agent_bridge::svc_task::TASK_NAME])
-        .context("执行 schtasks /run 失败")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "schtasks /run 失败: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
+    crate::install::svc_start()
 }
 
 #[cfg(target_os = "windows")]
 pub fn service_persist_state() -> &'static str {
-    match svc_task_state() {
-        SvcTask::Matches => "matches",
-        SvcTask::Drifted => "drifted",
-        SvcTask::Absent => "absent",
-    }
+    // 新模型（2026-10-04）：「服务常驻」不再由计划任务表达 —— 自启是**托盘的 Run 键**
+    // （见 autostart_enabled），服务由托盘的看门狗拉起。故恒 absent。
+    "absent"
 }
 
 #[cfg(target_os = "windows")]
@@ -1571,12 +1460,8 @@ fn autostart_desired_at(logs: &std::path::Path) -> bool {
 #[cfg(target_os = "windows")]
 fn set_autostart_impl(enable: bool) -> Result<()> {
     let exe = current_exe()?;
-    if enable {
-        // 顺序要紧：**先**注册常驻计划任务（要管理员授权），用户取消就整件事不成立——
-        // 不写 Run 键、不落意图标记（否则开关会显示「开」，而常驻其实没生效）。
-        call_elev(agent_bridge::elev::Op::InstallBridgeTask)
-            .context("注册 bridge 常驻计划任务失败（需要管理员授权）")?;
-    }
+    // 新模型（2026-10-04）：自启 = 只写用户的 Run 键（拉起**托盘**），服务由托盘的看门狗
+    // 以普通用户身份拉起 —— 不再注册常驻计划任务、不再要管理员授权。
     let out = if enable {
         let val = format!("\"{}\"", exe.display());
         run_reg(&[
@@ -1597,16 +1482,6 @@ fn set_autostart_impl(enable: bool) -> Result<()> {
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("设置开机自启失败: {}", msg.trim())
-    }
-    if !enable {
-        // 关自启 = 连常驻任务一起撤（否则「关了自启，服务还在后台跑」）。
-        // 用户取消授权时 Run 键已经删了，这里如实报错 + 落审计，让人知道任务还留着。
-        if let Err(e) = call_elev(agent_bridge::elev::Op::RemoveBridgeTask) {
-            log_autostart_event(&format!(
-                "⚠️ 删除 bridge 常驻计划任务失败（任务可能仍在，登录后会拉起服务）: {e:#}"
-            ));
-            return Err(e).context("删除 bridge 常驻计划任务失败（需要管理员授权）");
-        }
     }
     // 注册表动作成功后再落意图标记。顺序要紧：标记是「用户想要开/关」的唯一判据，
     // 若标记先落而注册表失败，下次自愈就会拿一个未兑现的意图去改用户配置。
@@ -1716,6 +1591,44 @@ fn migrate_legacy_state_at(
     }
     crate::log!("[migrate] 旧单 bot 数据已并入 workspaces/{new_key}/（幂等）");
 }
+
+/// 一次性退役：删除**旧的高权限常驻计划任务**（2026-10-04 新模型不再需要它）。
+///
+/// 为什么必须做：旧任务以 `RunLevel=HighestAvailable` 运行 ⇒ 它拉起的是**高完整性** service，
+/// 而新模型的 service 是托盘的普通用户子进程。两者抢同一个 `service` 单实例锁 ⇒ 谁先拿到谁跑，
+/// 表现为「有时是提权实例、有时不是」的随机状态（也会让「全部以普通用户运行」这条承诺失真）。
+/// 删掉任务后语义唯一：**服务只由托盘以普通用户身份看守**。
+///
+/// 权限：任务属当前用户（RunLevel 只影响启动后的完整性），`/delete` 不需要提权。
+/// best-effort：绝大多数机器本来就没有旧任务，静默返回；只在「确实存在但删不掉」时响亮留痕。
+#[cfg(target_os = "windows")]
+pub fn retire_legacy_bridge_task() {
+    let name = agent_bridge::svc_task::TASK_NAME;
+    let exists = crate::spawn::command("schtasks")
+        .args(["/query", "/tn", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return;
+    }
+    match crate::spawn::command("schtasks")
+        .args(["/delete", "/tn", name, "/f"])
+        .output()
+    {
+        Ok(o) if o.status.success() => crate::log!(
+            "[migrate] 已退役旧常驻计划任务 {name}（新模型：服务由托盘以普通用户身份看守）"
+        ),
+        Ok(o) => crate::log!(
+            "[migrate] ⚠️ 删除旧常驻计划任务失败（它可能仍会拉起高完整性实例）：{}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => crate::log!("[migrate] schtasks 执行失败（跳过旧任务退役）：{e:#}"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn retire_legacy_bridge_task() {}
 
 /// 一次性数据迁移：改名 feishu-bridge → agent-bridge，数据目录 `~/feishu-bridge` → `~/.agent-bridge`。
 /// 在 main() 最顶（args 解析、任何加锁/读写之前）调用。幂等、best-effort。
