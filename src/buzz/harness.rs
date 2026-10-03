@@ -1134,6 +1134,89 @@ fn try_native_steer(l: &mut Loop, channel_id: Uuid, msg: &InboundMsg) -> bool {
 
 // ── handle_prompt_result（上游移植；无 observer/心跳/rest） ───────────────────
 
+/// 死信（重试耗尽）给用户看的原因文案。
+///
+/// **为什么单独抽出来**（2026-10-04 owner 实报：机器人只回「多次重试后仍未处理成功（agent 进程
+/// 退出）」）：这条路径以前**既不写日志、也不带任何细节**，维护者和用户都只能猜。而 agent 的
+/// stderr 其实早就被有界缓存着（`AcpClient::stderr_tail`，与「agent 起不来」走的是同一份）——
+/// 只是这里没用它。现在 `AgentExited` 会把那份尾巴（经 `redact` 脱敏、折行、截断）带给用户，
+/// 让下一条失败回复自己说明原因。
+fn dead_letter_reason(outcome: &PromptOutcome, stderr_tail: Option<&str>) -> String {
+    match outcome {
+        // 超时同样带尾巴：卡死的 agent 往往是「还在等某个子进程/网络」，它最后几行 stderr
+        // 就是唯一线索（2026-10-04 那两组 0 CPU、零连接的 agent 就属于这种）。
+        PromptOutcome::Timeout(kind) => {
+            let base = match kind {
+                TimeoutKind::Idle => "回合超时".to_string(),
+                TimeoutKind::Hard { .. } => "回合超过时长上限".to_string(),
+            };
+            crate::redact::error_with_stderr_tail(base, stderr_tail)
+        }
+        PromptOutcome::AgentExited => {
+            crate::redact::error_with_stderr_tail("agent 进程退出".to_string(), stderr_tail)
+        }
+        PromptOutcome::Error(e) => format!("{e}"),
+        _ => "重复失败".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod dead_letter_reason_tests {
+    use super::*;
+
+    /// 判别力：删掉 stderr 尾巴那段，这条必红 —— 而它正是 2026-10-04 实报的那个坑
+    /// （机器人只回「agent 进程退出」，排查时只能靠进程快照倒推）。
+    #[test]
+    fn agent_exited_carries_stderr_tail() {
+        let r = dead_letter_reason(
+            &PromptOutcome::AgentExited,
+            Some("Error: Cannot find module 'x'"),
+        );
+        assert!(r.contains("agent 进程退出"), "{r}");
+        assert!(
+            r.contains("Cannot find module"),
+            "必须带出 agent 的 stderr 尾巴：{r}"
+        );
+    }
+
+    /// 没有尾巴时不许出现「；agent stderr：」这种悬空前半句（`redact` 已保证，这里钉住调用方）。
+    #[test]
+    fn agent_exited_without_tail_stays_plain() {
+        assert_eq!(
+            dead_letter_reason(&PromptOutcome::AgentExited, None),
+            "agent 进程退出"
+        );
+        assert_eq!(
+            dead_letter_reason(&PromptOutcome::AgentExited, Some("   ")),
+            "agent 进程退出"
+        );
+    }
+
+    /// 超时也要带尾巴（卡死的 agent 最后几行 stderr 是唯一线索）。
+    #[test]
+    fn timeout_carries_stderr_tail() {
+        let r = dead_letter_reason(
+            &PromptOutcome::Timeout(TimeoutKind::Idle),
+            Some("waiting for mcp server wassette"),
+        );
+        assert!(r.contains("回合超时"), "{r}");
+        assert!(r.contains("wassette"), "{r}");
+    }
+
+    /// 其它结局的文案不变（防这次改动顺手改了别的分支）。
+    #[test]
+    fn other_outcomes_unchanged() {
+        assert_eq!(
+            dead_letter_reason(&PromptOutcome::Timeout(TimeoutKind::Idle), None),
+            "回合超时"
+        );
+        assert_eq!(
+            dead_letter_reason(&PromptOutcome::Cancelled, None),
+            "重复失败"
+        );
+    }
+}
+
 fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptResult) {
     let agent_index = result.agent.index;
     // 该 agent 的任务元数据整体清出（单 agent：task_map 至多一条），并把成功
@@ -1265,15 +1348,15 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                     "⚠️ 处理失败：agent 认证失效。请重新登录对应 CLI 后再试。".to_string(),
                 );
             } else if let Some(dead) = l.queue.requeue(batch) {
-                let reason = match &result.outcome {
-                    PromptOutcome::Timeout(TimeoutKind::Idle) => "回合超时".to_string(),
-                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
-                        "回合超过时长上限".to_string()
-                    }
-                    PromptOutcome::AgentExited => "agent 进程退出".to_string(),
-                    PromptOutcome::Error(e) => format!("{e}"),
-                    _ => "重复失败".to_string(),
-                };
+                let reason =
+                    dead_letter_reason(&result.outcome, result.agent.acp.stderr_tail().as_deref());
+                // 这条路径以前**一行日志都没有**（2026-10-04 排查时 bridge.out 里查不到任何痕迹，
+                // 只能靠进程快照倒推）。死信是「用户看得见的失败」，必须留痕。
+                crate::log!(
+                    "[harness] 死信（重试耗尽）：channel={} → {}",
+                    dead.channel_id,
+                    reason
+                );
                 notify_channel(
                     l,
                     handle,
