@@ -50,10 +50,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
-; B2（批 abb-svc-persist-password-gate）：Windows「降权启动器」必须随包 —— bridge 以高完整性
-; 跑时用它把 agent 降到桌面 shell 身份；缺了它 agent 会**起不来**（fail-closed，见 agent_spawn.rs）。
-; 文件名必须是 `abb-spawner.exe`（与 `agent_spawn::spawner_exe()` 同源假设），别改名。
-Source: "..\target\release\abb-spawner.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; A1 起的 Windows 提权 helper：**授权停止服务 / 开自启（写计划任务）都经它**，
 ; 缺了它安装版上这些动作会直接失败（连 UAC 都弹不出来）。此前从未打进过包（复评 R25 阻塞项）。
 Source: "..\target\release\abb-elev-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -127,7 +123,6 @@ begin
   // /T 连子孙一起收；三次都是幂等的（进程不在也只是 rc<>0）
   Exec('taskkill.exe', '/F /T /IM agent-bridge.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Log('ABB: 结束 agent-bridge.exe rc=' + IntToStr(Rc));
-  Exec('taskkill.exe', '/F /T /IM abb-spawner.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Exec('taskkill.exe', '/F /T /IM abb-elev-helper.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Exec('taskkill.exe', '/F /T /IM buzz-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Sleep(1200);
