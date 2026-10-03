@@ -944,50 +944,28 @@ mod installer_guards {
         }
     }
 
-    /// **随包清单的守卫（系统性）**：`Cargo.toml` 里每个**非 macOS-only** 的 bin，
-    /// 都必须在安装脚本的 `[Files]` 里出现同名 `.exe`。
+    /// **随包 + 去提权守卫（2026-10-04 P4b 起）**：
     ///
-    /// 为什么做成通用规则：这个缺口连着被抓两轮 —— 先是 B2 的 `abb-spawner.exe`（复评 R24），
-    /// 再是授权停止要用的 `abb-elev-helper.exe`（复评 R25）。两者都是「代码里 spawn 同目录的
-    /// helper，但打包清单没带」⇒ 安装版上对应功能必然报「helper 不存在」。硬编码两条只能防这两
-    /// 个名字，通用规则能防下一个。
-    ///
-    /// 例外面（必须写清理由）：`abb-helper` 是 macOS 锁屏助手（非 macOS 平台只有占位 main），
-    /// Windows 包不需要它。
+    /// 历史：这条原来遍历 `Cargo.toml` 的每个非 macOS-only `[[bin]]`，要求安装脚本 `[Files]`
+    /// 里出现同名 `.exe` —— 那个缺口连着被抓两轮（`abb-spawner.exe` 复评 R24、`abb-elev-helper.exe`
+    /// 复评 R25）。现在**所有显式 `[[bin]]` 都已随去提权删除**（abb-spawner / abb-elev-helper /
+    /// abb-helper），于是本测试改成钉两件事：① 安装包必须带主程序；② **不得**再冒出提权/特权
+    /// helper 的可执行目标 —— 那等于把今天删掉的机制重新引进来。
     #[test]
-    fn installer_ships_every_non_macos_bin() {
-        const MACOS_ONLY_BINS: [&str; 1] = ["abb-helper"];
+    fn installer_ships_the_main_binary_and_no_privileged_helpers() {
+        assert!(
+            code_lines()
+                .iter()
+                .any(|l| l.contains("agent-bridge.exe") && l.contains("DestDir")),
+            "安装包必须随带 agent-bridge.exe"
+        );
         let manifest = include_str!("../Cargo.toml");
-        let mut checked = 0usize;
-        for block in manifest.split("[[bin]]").skip(1) {
-            let name = block
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("name = "))
-                .map(|v| v.trim().trim_matches('"').to_string())
-                .expect("[[bin]] 段必须有 name");
-            if MACOS_ONLY_BINS.contains(&name.as_str()) {
-                continue;
-            }
-            checked += 1;
-            let want_src = format!("release\\{name}.exe");
+        for banned in ["abb-spawner", "abb-elev-helper", "abb-helper"] {
             assert!(
-                code_lines()
-                    .iter()
-                    .any(|l| l.contains(&format!("{name}.exe")) && l.contains("DestDir")),
-                "安装包必须随带 {name}.exe（代码里会 spawn 同目录的这个二进制）"
-            );
-            assert!(
-                code_lines().iter().any(|l| l.contains(&want_src)),
-                "源路径必须是 target\\release\\{name}.exe"
+                !manifest.contains(&format!("name = \"{banned}\"")),
+                "提权/特权 helper 不得再作为可执行目标存在（已随 2026-10-04 去提权删除）：{banned}"
             );
         }
-        // 下限 = 「循环真的检查到了东西」这个 sanity check：2026-10-04 删掉 abb-spawner 后，
-        // 显式 [[bin]] 只剩 abb-elev-helper（abb-helper 是 macOS 专属，跳过）。到 P4 连
-        // abb-elev-helper 也删掉时，这里改为允许 0（届时主程序自身的打包由下面的守卫覆盖）。
-        assert!(
-            checked >= 1,
-            "至少应检查 abb-elev-helper（abb-spawner 已随去提权删除），实得 {checked}"
-        );
     }
 
     /// 2026-10-04 新模型：**装机不再注册常驻计划任务**（服务由托盘以普通用户身份拉起）。

@@ -10,7 +10,7 @@
 # 为什么要有这个脚本：签名产物是否正确**没有任何自动化断言**（漏带只在真机点相机时才
 # 暴露，且表现为"静默拒绝"）。这里把三件事钉死：
 #   1) bundle 本身带三项；
-#   2) bundle 内的可执行文件（agent-bridge / buzz-agent / abb-helper）也带
+#   2) bundle 内的可执行文件（agent-bridge / buzz-agent）也带
 #      —— 它们才是真正去碰设备/发 AppleEvent 的责任进程；
 #   3) 缺任意一项即失败（不静默放过）。
 #
@@ -25,7 +25,7 @@ REQUIRED=(
 )
 # 需要逐一带上上述 entitlements 的内部可执行（存在才检查；不存在不算失败——
 # 分发包可能不含 abb-helper，见 build.sh 的 `[ -f ... ]` 条件拷贝）。
-INNER=(agent-bridge buzz-agent abb-helper)
+INNER=(agent-bridge buzz-agent)
 
 if [ "$#" -eq 0 ]; then
   echo "用法：$0 <App.app> [<App.app>...]" >&2

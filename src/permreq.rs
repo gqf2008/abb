@@ -163,7 +163,7 @@ pub fn request_media_permissions() {
     crate::log!("[perm] 权限请求流程结束");
 }
 
-// ── #129 锁屏控制前置权限 ──
+// ── 键鼠自动化前置权限（原 #129 锁屏按键注入）──
 // 仿 ToDesk：agent 向锁屏 loginwindow 注入按键，需要 辅助功能（kTCCServicePostEvent，
 // 注入键鼠事件必需）＋ 输入监控（kTCCServiceListenEvent，可选但建议）两项授权。
 // 用 CoreGraphics 同步 API（CGRequest*EventAccess）：未决定时才弹系统授权框，
@@ -211,13 +211,13 @@ fn request_listen_event() {
     }
 }
 
-/// #129 锁屏控制前置权限：辅助功能 → 输入监控。
+/// 键鼠自动化前置权限：辅助功能 → 输入监控。
 /// 与 request_media_permissions 同流程由 GUI「请求权限」按钮统一拉起。
 pub fn request_lock_permissions() {
-    crate::log!("[perm] 开始逐项请求锁屏控制权限（辅助功能 → 输入监控）");
+    crate::log!("[perm] 开始逐项请求键鼠自动化权限（辅助功能 → 输入监控）");
     request_post_event();
     request_listen_event();
-    crate::log!("[perm] 锁屏控制权限请求流程结束");
+    crate::log!("[perm] 键鼠自动化权限请求流程结束");
 }
 
 // ── #305 Step 0：相机探测（判定「ABB 派生的子进程是否继承 ABB 的 TCC 授权」）──

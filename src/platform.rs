@@ -1598,6 +1598,27 @@ pub fn retire_legacy_bridge_task() {
 
 #[cfg(not(target_os = "windows"))]
 pub fn retire_legacy_bridge_task() {}
+/// 当前进程是否以管理员身份运行（**不再依赖已删的 elev lib**）。
+///
+/// 直接 extern 声明 IsUserAnAdmin（shell32）：本函数只要一个布尔答案，不值得引一整套 Win32
+/// 绑定 —— 与 macOS 侧「零依赖 raw FFI」的风格一致。
+///
+/// 用途只有一个：**告警**。新模型（2026-10-04）要求 ABB 以普通用户运行；若维护者手动提权
+/// 启动，agent 会继承管理员权限，这里让 spawn/服务启动时能响亮留痕。
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn IsUserAnAdmin() -> i32;
+    }
+    // SAFETY: 无参数、无副作用，返回值按 BOOL 解释。
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> bool {
+    false
+}
 
 /// 一次性数据迁移：改名 feishu-bridge → agent-bridge，数据目录 `~/feishu-bridge` → `~/.agent-bridge`。
 /// 在 main() 最顶（args 解析、任何加锁/读写之前）调用。幂等、best-effort。

@@ -21,6 +21,6 @@
   <key>NSMicrophoneUsageDescription</key>
   <string>ABB 的机器人技能（语音识别、录音）需要访问麦克风。</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>ABB 需要自动化控制本机应用（锁屏辅助、剪贴板与系统集成）。</string>
+  <string>ABB 需要自动化控制本机应用（剪贴板与系统集成）。</string>
 </dict>
 </plist>
