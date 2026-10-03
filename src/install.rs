@@ -989,9 +989,12 @@ mod installer_guards {
                 "源路径必须是 target\\release\\{name}.exe"
             );
         }
+        // 下限 = 「循环真的检查到了东西」这个 sanity check：2026-10-04 删掉 abb-spawner 后，
+        // 显式 [[bin]] 只剩 abb-elev-helper（abb-helper 是 macOS 专属，跳过）。到 P4 连
+        // abb-elev-helper 也删掉时，这里改为允许 0（届时主程序自身的打包由下面的守卫覆盖）。
         assert!(
-            checked >= 2,
-            "至少应检查 abb-elev-helper 与 abb-spawner，实得 {checked}"
+            checked >= 1,
+            "至少应检查 abb-elev-helper（abb-spawner 已随去提权删除），实得 {checked}"
         );
     }
 
