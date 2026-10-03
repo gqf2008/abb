@@ -22,7 +22,6 @@ mod guard;
 mod history;
 mod install;
 mod larkskills;
-mod lockctl;
 mod mcp_events;
 mod messenger;
 mod msgstore;
@@ -341,41 +340,12 @@ fn main() {
     crate::config::Config::migrate_strip_github();
 
     // 权限请求（GUI「请求权限」按钮拉起）：逐项触发屏幕录制/摄像头/麦克风授权弹框，
-    // #129 追加辅助功能/输入监控（锁屏控制前置）。独立子进程跑（不阻塞托盘），
+    // 追加辅助功能/输入监控（原 #129 锁屏按键注入前置）。独立子进程跑（不阻塞托盘），
     // 逐行打日志，GUI 逐行读进设置窗状态区。
     #[cfg(target_os = "macos")]
     if args.iter().any(|a| a == "--request-permissions") {
         permreq::request_media_permissions();
         permreq::request_lock_permissions();
-        return;
-    }
-
-    // #129 锁屏控制特权助手运维：status / install / uninstall（client 侧）。
-    // 安装弹显式管理员授权框（用户不点不同意则不装任何东西）；卸载完整移除。
-    #[cfg(target_os = "macos")]
-    if let Some(pos) = args.iter().position(|a| a == "--lockctl") {
-        let sub = args.get(pos + 1).map(String::as_str).unwrap_or("status");
-        match sub {
-            "status" => println!("{}", lockctl::status()),
-            "install" => match lockctl::install() {
-                Ok(msg) => println!("{msg}"),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            },
-            "uninstall" => match lockctl::uninstall() {
-                Ok(msg) => println!("{msg}"),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            },
-            other => {
-                eprintln!("用法: --lockctl status|install|uninstall（未知子命令: {other}）");
-                std::process::exit(2);
-            }
-        }
         return;
     }
 
@@ -450,7 +420,7 @@ fn main() {
         // 这一行会让下次登录改走托盘（普通用户）路径；随后把「仍在以高权限跑」留痕。
         platform::retire_legacy_bridge_task();
         #[cfg(target_os = "windows")]
-        if agent_bridge::elev::win::is_elevated() {
+        if platform::is_elevated() {
             crate::log!(
                 "[svc] ⚠️ 服务正以管理员权限运行（新模型要求普通用户）：可能来自旧常驻任务或手动提权；已尝试退役旧任务，重启 ABB 托盘即可由普通用户身份接管"
             );

@@ -50,9 +50,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
-; A1 起的 Windows 提权 helper：**授权停止服务 / 开自启（写计划任务）都经它**，
-; 缺了它安装版上这些动作会直接失败（连 UAC 都弹不出来）。此前从未打进过包（复评 R25 阻塞项）。
-Source: "..\target\release\abb-elev-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; #200 fork buzz-agent：与主程序同目录（运行时按 current_exe 同目录解析；
 ; buzz_agent_exe 空时先查同目录）。分叉 Apache-2.0，再分发附 LICENSE。

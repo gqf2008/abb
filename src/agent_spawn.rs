@@ -19,7 +19,7 @@
 /// 构造 agent 子进程命令（tokio 版，ACP 走这条）。
 pub fn tokio_command(program: &str) -> tokio::process::Command {
     #[cfg(windows)]
-    if agent_bridge::elev::win::is_elevated() {
+    if crate::platform::is_elevated() {
         crate::log!(
             "[spawn] 本进程正以管理员权限运行：agent「{program}」会继承该权限。新模型要求 ABB 以普通用户运行（退出后用普通身份启动即可）"
         );

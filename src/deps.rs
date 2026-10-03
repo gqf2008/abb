@@ -1271,18 +1271,18 @@ pub fn detect_permissions() -> Vec<PermStatus> {
             settings_url:
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         },
-        // #129 锁屏控制：辅助功能（kTCCServicePostEvent）与输入监控（kTCCServiceListenEvent）
+        // 键鼠自动化：辅助功能（kTCCServicePostEvent）与输入监控（kTCCServiceListenEvent）（原 #129 锁屏按键注入用；该功能已删，权限项保留）
         // 分开展示。权威检测用 CGPreflight*EventAccess（与系统设置同源，同 screen_state 模式）。
         PermStatus {
             id: "post-event",
-            label: "辅助功能·锁屏按键注入",
+            label: "辅助功能",
             state: post_event_state(),
             settings_url:
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         },
         PermStatus {
             id: "listen-event",
-            label: "输入监控·锁屏按键注入",
+            label: "输入监控",
             state: listen_event_state(),
             settings_url:
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
@@ -1612,7 +1612,7 @@ mod tests {
         let perms = detect_permissions();
         #[cfg(target_os = "macos")]
         {
-            // 8 项：辅助功能与输入监控分开展示（#129 锁屏按键注入需要两枚 TCC 权限）
+            // 8 项：辅助功能与输入监控分开展示（原 #129 锁屏按键注入需要两枚 TCC 权限）
             assert_eq!(perms.len(), 8);
             let ids: Vec<&str> = perms.iter().map(|p| p.id).collect();
             for want in [

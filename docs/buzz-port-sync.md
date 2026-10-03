@@ -41,7 +41,7 @@
 ## 验收相关
 
 - 真机 e2e 只允许在隔离 HOME 跑（`/tmp/abb-e2e-*`），禁碰真实 `~/.agent-bridge`。
-- 门禁红基线：`detect_permissions_shape`（macOS 权限探测恒红）环境性忽略；abb-helper ×3 / lockctl ×2 clippy 告警为基线。
+（历史上还有 abb-helper / lockctl 两条目标各带 clippy 告警；两者已随 2026-10-04 去提权一并删除，告警面归零。）
 
 # crates/buzz-agent 分叉（自维护 fork，不再跟上游）
 
