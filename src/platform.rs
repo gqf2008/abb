@@ -972,40 +972,35 @@ fn service_item_plist() -> PathBuf {
         .join(format!("{SERVICE_ITEM_LABEL}.plist"))
 }
 
-/// 停止由 launchd 托管的 bridge —— **需要管理员授权**。
+/// 停止由 launchd 托管的 bridge —— **用户级，不再要管理员授权**（2026-10-04 新模型，P3）。
 ///
-/// 为什么停止要授权：owner 2026-09-28 要求「登录后服务不能被随便杀死，即使 tray 已经退出」。
-/// 托盘菜单里的「停止」若仍是单方面动作，就等于随手一停，与需求相反——所以走 macOS 系统
-/// 授权框（`osascript … with administrator privileges`，弹密码/Touch ID）。
+/// 历史：2026-09-28 owner 要求「停止必须授权」，于是这里走 `osascript … with administrator
+/// privileges`（弹密码/Touch ID）。2026-10-04 owner 统一为「全部以普通用户运行，启动/停止
+/// 统一由 ABB 管理密码把关」⇒ 提权那层退出：这里直接用当前用户的 `launchctl bootout` 摘掉
+/// 自己的 LaunchAgent（技术上本来就允许）；要不要停由 UI 层的管理密码门决定（`admin_pass`）。
 ///
-/// 用户取消授权时 osascript 非 0 退出，这里**返回错误**而不是静默继续（调用方据此提示
-/// 「未停止」）；授权通过则记一条审计。
-///
-/// 诚实标注：launchd 本身允许同用户 bootout 自己的 agent，**加管理员授权是产品策略**
-/// （owner 2026-09-28 要求「停止必须授权」），不是技术必需。
+/// **诚实标注**（保留原注释的这份诚实）：这不是「更安全」的写法 —— 同用户进程仍能停掉该
+/// agent。「不能被随便停」现在由管理密码门（防误操作/防随手停）与用户的登录会话边界共同
+/// 表达，不再由 OS 授权表达。别把这条读成「停止变安全了」。
 #[cfg(target_os = "macos")]
 pub fn stop_service_authorized() -> Result<()> {
     let target = format!("gui/{}/{}", uid(), SERVICE_ITEM_LABEL);
-    let script = format!("launchctl bootout '{target}' 2>/dev/null || true");
-    let out = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
-            "do shell script \"{script}\" with administrator privileges"
-        ))
+    let out = std::process::Command::new("launchctl")
+        .args(["bootout", &target])
         .output()
-        .context("调 osascript 取管理员授权失败")?;
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("未获得管理员授权，服务未停止：{}", msg.trim());
+        .context("执行 launchctl bootout 失败")?;
+    // 评审 P8 的教训必须保留：**不看退出码**，回读 job 是否还在域里 —— 否则会出现
+    // 「用户被告知已停止、服务还在跑」。job 本来就没加载时 bootout 会非 0，这算成功。
+    if !out.status.success() && job_loaded(&target) {
+        anyhow::bail!(
+            "launchctl bootout 失败，服务未停止：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    // 复核（评审 P8）：脚本里的 `2>/dev/null || true` 会把 bootout 的失败也吞成成功，于是
-    // 「用户被告知已停止、服务还在跑」。授权已到手，这里直接回读 job 是否还在域里。
     if job_loaded(&target) {
         anyhow::bail!("launchctl bootout 未生效（job 仍在域里），服务未停止");
     }
-    log_autostart_event(&format!(
-        "管理员授权通过：已 bootout {target}（停止 bridge）"
-    ));
+    log_autostart_event(&format!("已 bootout {target}（bridge 已停止，用户级）"));
     Ok(())
 }
 
