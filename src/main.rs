@@ -442,31 +442,6 @@ fn main() {
         return;
     }
 
-    // 隐藏子命令：安装器（已提权）装完调一次，登记 bridge 常驻计划任务。
-    // 任务 XML 的单一定义在 `src/svc_task.rs`，详见 `platform::install_bridge_task_elevated`。
-    if args.iter().any(|a| a == "--install-bridge-task") {
-        #[cfg(target_os = "windows")]
-        {
-            match platform::install_bridge_task_elevated() {
-                Ok(()) => {
-                    println!("已登记 bridge 常驻计划任务");
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("登记 bridge 常驻计划任务失败：{e:#}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            eprintln!(
-                "--install-bridge-task 仅 Windows 可用（本平台由 launchd/systemd 等价物托管）"
-            );
-            std::process::exit(1);
-        }
-    }
-
     if args.iter().any(|a| a == "--service") {
         // 托管形态没有可用 stdout 时，先把日志接到 logs/bridge.out（见函数文档）；
         // 必须在任何输出之前调用，否则 Rust 已缓存旧句柄。

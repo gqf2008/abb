@@ -998,25 +998,25 @@ mod installer_guards {
         );
     }
 
-    /// 装机即登记常驻任务，且**不在 Pascal 里重写 XML**（XML 单一定义在 src/svc_task.rs）：
-    /// 这里只允许出现一次 `--install-bridge-task` 调用与一次卸载删除。
+    /// 2026-10-04 新模型：**装机不再注册常驻计划任务**（服务由托盘以普通用户身份拉起）。
+    ///
+    /// 这条守卫是**反向锁**：谁把「注册计划任务」那条路加回来（隐藏子命令 / 高权限 XML /
+    /// 任务名），这里立刻红。旧的 `--install-bridge-task` 子命令也已从 main.rs 删除。
     #[test]
-    fn installer_registers_and_removes_the_bridge_task_via_our_binary() {
+    fn installer_no_longer_registers_a_bridge_task() {
         assert!(
-            code_lines()
+            !code_lines()
                 .iter()
-                .any(|l| l.contains("'--install-bridge-task'")),
-            "安装器必须调用我们自己的隐藏子命令登记任务（XML 单一定义在 svc_task.rs）"
+                .any(|l| l.contains("--install-bridge-task")),
+            "安装器不得再调用登记常驻任务的隐藏子命令（新模型：服务由托盘看守）"
         );
         assert!(
             !ISS.contains("<RunLevel>HighestAvailable</RunLevel>"),
-            "安装脚本里不得重写一份任务 XML（会与 src/svc_task.rs 漂移）"
+            "安装脚本里不得再出现高权限计划任务的 XML"
         );
         assert!(
-            code_lines()
-                .iter()
-                .any(|l| l.contains("/delete /tn ' + BridgeTaskName")),
-            "卸载时必须删掉常驻任务，别留孤儿"
+            !code_lines().iter().any(|l| l.contains("ABB-Bridge")),
+            "安装脚本不得再注册/管理 ABB-Bridge 常驻任务（新模型不再有它）"
         );
     }
 }
