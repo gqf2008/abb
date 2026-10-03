@@ -1369,34 +1369,6 @@ pub fn stop_service_authorized() -> Result<()> {
     crate::install::svc_stop_keep_desired()
 }
 
-/// **安装器专用**：以管理员身份登记 bridge 常驻任务（`agent-bridge.exe --install-bridge-task`）。
-///
-/// 为什么放在应用里而不是在 Inno 脚本里拼 XML：任务 XML 的单一定义在 `src/svc_task.rs`
-/// （UTF-16LE+BOM、转义、逐项设置都有单测）；安装器只是调这个隐藏子命令，避免两份 XML 漂移。
-///
-/// 用户取**本进程**（安装器已提权）的 SID：同用户 UAC 下就是安装者本人 ✓；over-the-shoulder
-/// 提权（标准用户 + 管理员凭据）时会落到管理员账号名下 —— 已知边界，运行时那条路（helper 的
-/// 「同用户」硬闸）会拒绝这种提权，故这里也只在装机时出现一次，不影响后续安全判定。
-#[cfg(target_os = "windows")]
-pub fn install_bridge_task_elevated() -> Result<()> {
-    use agent_bridge::elev::SysBackend;
-    let backend = agent_bridge::elev::win::WinlogonBackend;
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .context("拿不到当前可执行文件路径")?;
-    let sid = backend
-        .own_sid()
-        .map_err(|_| anyhow::anyhow!("拿不到当前用户 SID（提权了吗？）"))?;
-    backend
-        .install_bridge_task(&exe, &sid)
-        .map_err(|_| anyhow::anyhow!("schtasks 注册 bridge 常驻任务失败"))
-}
-
-/// Windows：服务常驻（计划任务）当前是否生效——供状态展示/自愈判断用。
-///
-/// 与 [`autostart_enabled`]（托盘自启 = Run 键）刻意分开：存量用户只有 Run 键，判据若耦合会
-/// 让他的开关突然显示「关」。补任务要显式动作（开自启开关）——注册任务需要 UAC，而自愈阶段
-/// **不弹**授权框（那会变成每次启动都弹）。
 /// Windows：托管形态下的「启动」—— 新模型下等价于让托盘那条用户级路径重拉
 ///（`install::svc_start` 自带「已在跑就先停」，故与重启同一入口，不再有两套语义）。
 #[cfg(target_os = "windows")]
@@ -1598,7 +1570,9 @@ fn migrate_legacy_state_at(
 /// best-effort：绝大多数机器本来就没有旧任务，静默返回；只在「确实存在但删不掉」时响亮留痕。
 #[cfg(target_os = "windows")]
 pub fn retire_legacy_bridge_task() {
-    let name = agent_bridge::svc_task::TASK_NAME;
+    // 名字写字面量：新模型下已没有任务定义模块（`src/svc_task.rs` 已删），而**退役旧任务**
+    // 恰恰需要这个历史名字 —— 它是这段迁移代码唯一的用途，故就地固定。
+    let name = "ABB-Bridge";
     let exists = crate::spawn::command("schtasks")
         .args(["/query", "/tn", name])
         .output()
