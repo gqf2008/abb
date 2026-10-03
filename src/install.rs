@@ -878,44 +878,36 @@ mod installer_guards {
     #[test]
     fn installer_force_stops_bridge_before_copying_files() {
         let code = code_lines().join("\n");
-        assert!(
-            code.contains("'/end /tn ' + BridgeTaskName"),
-            "必须先用 schtasks /end 停掉常驻任务当前实例"
-        );
-        assert!(
-            code.contains("'/change /tn ' + BridgeTaskName + ' /disable'"),
-            "必须临时禁用常驻任务：否则它的 RestartOnFailure 会在复制文件途中把服务拉回来、再次锁住 exe"
-        );
+        // 2026-10-04 更新（P4a，新模型）：没有计划任务要停/禁用了（服务由托盘以普通用户身份
+        // 看守，自启 = Run 键）。这里只钉三件仍然成立的事 + 一条反向锁。
         assert!(
             code.contains("'/F /T /IM agent-bridge.exe'"),
             "必须强杀 agent-bridge.exe（RM 关不掉它，这是安装失败的直接原因）"
         );
         assert!(
+            code.contains("'/F /T /IM buzz-agent.exe'"),
+            "agent 进程也要收（它锁着 buzz-agent.exe）"
+        );
+        assert!(
             code.contains("function PrepareToInstall"),
-            "收工动作必须挂在 PrepareToInstall（复制文件之前），不能只放 ssPostInstall"
+            "收工动作必须挂在 PrepareToInstall（复制文件之前）"
         );
         assert!(
             code.contains("StopBridgeForInstall"),
             "PrepareToInstall / ssInstall 必须真的调用 StopBridgeForInstall"
         );
         assert!(
-            code.contains("'/change /tn ' + BridgeTaskName + ' /enable'"),
-            "装完必须把常驻任务恢复启用（否则升级后 bridge 不再自启）"
+            code.contains("Sleep("),
+            "杀完必须等句柄释放（kill 返回 ≠ 句柄已关）"
+        );
+        // 反向锁：新模型不再有常驻计划任务 —— 谁把 schtasks / 任务名加回安装脚本，这里就红。
+        assert!(
+            !code.contains("schtasks"),
+            "安装器不得再调 schtasks（新模型没有常驻计划任务）"
         );
         assert!(
-            code.contains("'/run /tn ' + BridgeTaskName"),
-            "装完必须把常驻服务 run 起来（不能只靠托盘看门狗带）"
-        );
-        // 顺序：恢复启用那条 [Run] 必须排在拉起 APP 的 [Run] **之前** —— 反了的话托盘启动那一刻
-        // 任务还是 disabled，看门狗启服务必失败（2026-10-01 实测顺序就是反的：11:41:51.172 拉起
-        // APP / 11:41:52.657 才 enable ⇒ 装完 APP 与 bridge 都没起来，用户得手动开）。
-        // 注意：[Run] 那条是 Inno 语法（任务名写死字面量），Pascal 里那条才是 `+ BridgeTaskName +`；
-        // 这里判的是 [Run] 段先后，故按字面量找。
-        let enable_at = code.find("/tn ABB-Bridge /enable").unwrap_or(usize::MAX);
-        let launch_at = code.find("--wait-lock").unwrap_or(usize::MAX);
-        assert!(
-            enable_at < launch_at,
-            "[Run] 里恢复启用任务必须排在拉起 APP 之前（否则装完 APP 起不来）"
+            !code.contains("ABB-Bridge"),
+            "安装器不得再管理 ABB-Bridge 任务"
         );
     }
 
