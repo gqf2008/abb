@@ -1203,6 +1203,23 @@ mod dead_letter_reason_tests {
         assert!(r.contains("wassette"), "{r}");
     }
 
+    /// 重生日志：必须带出退避级别与 agent 的 stderr 尾巴 —— 「为什么一直在重启」以前只能靠
+    /// 反复抓进程表倒推（tracing 从未接线，上游那句 `agent died — respawning` 被直接丢弃）。
+    #[test]
+    fn respawn_log_line_carries_backoff_and_tail() {
+        let s = respawn_log_line("exited", Some("BUZZ_AGENT_PROVIDER is required"), 3);
+        assert!(s.contains("退避级别 3"), "{s}");
+        assert!(s.contains("outcome=exited"), "{s}");
+        assert!(s.contains("BUZZ_AGENT_PROVIDER is required"), "{s}");
+    }
+
+    #[test]
+    fn respawn_log_line_without_tail_stays_plain() {
+        let s = respawn_log_line("idle_timeout", None, 0);
+        assert!(s.contains("agent 重生"), "{s}");
+        assert!(!s.contains("agent stderr"), "没尾巴不许留悬空前缀：{s}");
+    }
+
     /// 其它结局的文案不变（防这次改动顺手改了别的分支）。
     #[test]
     fn other_outcomes_unchanged() {
@@ -1215,6 +1232,20 @@ mod dead_letter_reason_tests {
             "重复失败"
         );
     }
+}
+
+/// agent 死掉/卡死后**重生**那一步的日志文案（纯函数，便于单测）。
+///
+/// **为什么必须显式写 `crate::log!` 而不是只留 `tracing::warn!`**（2026-10-04 owner 追问
+/// 「为什么 buzz-agent 一直在重启」）：本仓**从未安装 tracing subscriber**（`tracing = "0.1"`
+/// 只是个空壳），移植区所有 `tracing::*` 事件——包括上游那句 `agent died — respawning`——
+/// 全部被丢弃，`bridge.out` 里一个字都没有，只能靠反复抓进程表倒推。这行日志把「谁重生、
+/// 退避到第几级、agent 最后一次 stderr 说了什么」一次落盘。
+fn respawn_log_line(outcome_label: &str, stderr_tail: Option<&str>, backoff: u32) -> String {
+    crate::redact::error_with_stderr_tail(
+        format!("agent 重生（outcome={outcome_label}，退避级别 {backoff}）"),
+        stderr_tail,
+    )
 }
 
 fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptResult) {
@@ -1437,6 +1468,12 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 outcome = outcome_label,
                 "agent died — respawning"
             );
+            // 尾巴要在 schedule_death_respawn 取走 agent 之前读（它 move 掉 result.agent）。
+            let tail = result.agent.acp.stderr_tail();
+            crate::log!(
+                "[harness] {}",
+                respawn_log_line(outcome_label, tail.as_deref(), l.crash_backoff)
+            );
             schedule_death_respawn(l, handle, result.agent, outcome_label);
         }
         // CancelDrainTimeout：cancel 宽限内没停——进程不确定，同致命重拉。
@@ -1445,6 +1482,11 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 agent = agent_index,
                 outcome = outcome_label,
                 "cancel drain timeout — respawning agent"
+            );
+            let tail = result.agent.acp.stderr_tail();
+            crate::log!(
+                "[harness] {}",
+                respawn_log_line(outcome_label, tail.as_deref(), l.crash_backoff)
             );
             schedule_death_respawn(l, handle, result.agent, outcome_label);
         }
