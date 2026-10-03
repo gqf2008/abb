@@ -1378,6 +1378,29 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                     &batch,
                     "⚠️ 处理失败：agent 认证失效。请重新登录对应 CLI 后再试。".to_string(),
                 );
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_spawn_refused(e)) {
+                // 2026-10-04 owner 硬要求「不能死循环」：熔断期间**当场死信**，不进 requeue ——
+                // 重试只会再撞同一闸（还会把失败提示拖到重试耗尽）。agent 压根没起，故不记失败。
+                let msg = match &result.outcome {
+                    PromptOutcome::Error(e) => e.to_string(),
+                    _ => "agent spawn 被进程保护拦下".to_string(),
+                };
+                // 带上守卫快照（连续失败数 + 冷却剩余）：这条日志就是「为什么又没回」的答案。
+                let (fails, open) = crate::spawn_guard::SpawnGuard::global()
+                    .snapshot(crate::spawn_guard::AGENT_KEY);
+                crate::log!(
+                    "[harness] 死信（spawn 熔断）：channel={} 连续失败={} 冷却剩余={:?} → {}",
+                    batch.channel_id,
+                    fails,
+                    open,
+                    msg
+                );
+                notify_channel(
+                    l,
+                    handle,
+                    &batch,
+                    format!("⚠️ 暂时不再重试：{msg}。稍后（约一分钟后）再发即可。"),
+                );
             } else if let Some(dead) = l.queue.requeue(batch) {
                 let reason =
                     dead_letter_reason(&result.outcome, result.agent.acp.stderr_tail().as_deref());
@@ -1436,6 +1459,8 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
     match result.outcome {
         // 成功：收 agent + 同步投递捕获文本（空文本 = 纯工具回合，不投递）。
         PromptOutcome::Ok(_) => {
+            // 进程保护：健康回合把连续失败/熔断复位（否则历史失败会一直压着退避）。
+            crate::spawn_guard::SpawnGuard::global().record_success(crate::spawn_guard::AGENT_KEY);
             let PromptSource::Channel(channel_id) = &result.source;
             if let Some(text) = result.final_text.take() {
                 // 技能路径归一化：模型被问技能时会把 pi 自带系统提示里的
@@ -1468,6 +1493,9 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 outcome = outcome_label,
                 "agent died — respawning"
             );
+            // 进程保护：把这次死亡记进全局退避账（连续失败会推高等待，达到阈值直接熔断）。
+            crate::spawn_guard::SpawnGuard::global()
+                .record_failure(crate::spawn_guard::AGENT_KEY, std::time::Instant::now());
             // 尾巴要在 schedule_death_respawn 取走 agent 之前读（它 move 掉 result.agent）。
             let tail = result.agent.acp.stderr_tail();
             crate::log!(
@@ -1483,6 +1511,8 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 outcome = outcome_label,
                 "cancel drain timeout — respawning agent"
             );
+            crate::spawn_guard::SpawnGuard::global()
+                .record_failure(crate::spawn_guard::AGENT_KEY, std::time::Instant::now());
             let tail = result.agent.acp.stderr_tail();
             crate::log!(
                 "[harness] {}",
@@ -1649,6 +1679,11 @@ fn is_model_not_found(error: &AcpError) -> bool {
 /// 走独立变体 [`AcpError::SandboxUnsupported`] 而非 `Protocol`：后者在
 /// `is_transport_error` 之列，会把健康 agent 判为「管道可能坏」而
 /// `schedule_death_respawn`（杀进程 + 置 dead，后续消息全被预检拒掉）。
+/// spawn 守卫拒绝（熔断/限速）—— **不是** agent 病，重试只会再撞同一闸。
+fn is_spawn_refused(error: &AcpError) -> bool {
+    matches!(error, AcpError::SpawnRefused(_))
+}
+
 fn is_sandbox_unsupported(error: &AcpError) -> bool {
     matches!(error, AcpError::SandboxUnsupported(_))
 }
