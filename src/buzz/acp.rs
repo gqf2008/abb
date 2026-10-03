@@ -138,6 +138,14 @@ pub enum AcpError {
     #[error("Sandbox mode not supported: {0}")]
     SandboxUnsupported(String),
 
+    /// spawn 守卫拒绝（熔断/限速）：**不是 agent 的问题**，重试只会再撞同一闸。
+    ///
+    /// **刻意不算 transport error**（与 SandboxUnsupported 同一理据）：agent 进程根本还没起，
+    /// 把它当传输错误会走 schedule_death_respawn + 标记 dead，后续消息全被预检拒掉。
+    /// harness 用 is_spawn_refused 匹配它并当场死信一次 + 给可行动提示（等多久再试）。
+    #[error("Spawn refused by guard: {0}")]
+    SpawnRefused(String),
+
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
 }
@@ -435,6 +443,16 @@ impl AcpClient {
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
         #[cfg(unix)]
         cmd.process_group(0);
+
+        // 进程保护（owner 2026-10-04 硬要求）：全局限速 + 有界退避 + 熔断。
+        // acquire 是唯一入口：需要等就 await 等够，熔断打开就返回 Err —— 调用方绕不过去，
+        // 因此不存在「失败就立刻再 spawn」的裸循环。见 spawn_guard 模块文档。
+        if let Err(denied) = crate::spawn_guard::SpawnGuard::global()
+            .acquire(crate::spawn_guard::AGENT_KEY)
+            .await
+        {
+            return Err(AcpError::SpawnRefused(denied.message()));
+        }
 
         let mut child = cmd.spawn()?;
         // 把 agent 放进「句柄关闭即杀」的 job：agent 被杀 / bridge 退出时，它起的 MCP 服务
