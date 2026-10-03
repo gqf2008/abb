@@ -1011,6 +1011,16 @@ pub struct Config {
     /// ~/.npm-global/bin 等）。覆盖可指向任意 ACP agent 适配器（绝对路径优先）。
     #[serde(default)]
     pub buzz_agent_exe: String,
+    /// 「启动 / 停止 / 重启服务」的管理密码（2026-10-04 owner 要求：统一由 ABB 管理密码控制）。
+    ///
+    /// 存加盐迭代 SHA-256 记录（`sha256$<iters>$<salt_hex>$<hash_hex>`，见 `admin_pass`），
+    /// **从不存明文**；空 = 未设置（首次做服务动作时由 UI 引导设置）。忘记就把这里清空重设。
+    ///
+    /// 定位：这是**第二道门**（防误操作 / 防 agent 顺手停 / 防随手点）。它**不**负责让服务
+    /// 杀不掉——那是托管形态的事（Windows 计划任务 / macOS launchd）。两者互补，**不得互相替代**：
+    /// 同用户进程永远能改 config.json、能复位意图文件，所以「密码」挡不住有意绕过者。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub admin_password: String,
     #[serde(default)]
     pub bots: Vec<BotConfig>,
     /// 模型供应商列表。空 = 未配置（claude 走 CC Switch / codex 走自认证的旧行为）。
@@ -1054,7 +1064,8 @@ impl Default for Config {
             cross_delivery_enabled: false,
             workspace_git_enabled: true, // #209 工作区版本管理默认开
             buzz_agent_exe: String::new(),
-            lock_screen_control: false,     // #129 锁屏控制默认关
+            admin_password: String::new(), // 未设置（首次服务动作时由 UI 引导设置）
+            lock_screen_control: false,    // #129 锁屏控制默认关
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
             context_segment_size: default_ctx_segment_size(),

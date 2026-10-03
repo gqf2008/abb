@@ -1712,6 +1712,12 @@ pub fn run_gui() -> Result<()> {
     let team_dialog = TeamDialog::new()?; // #124 一键创建团队（P2，mock）
     let appoint_dialog = TeamAppointDialog::new()?; // #147 任命成员小表单
     let vb_confirm = ConfirmDialog::new()?;
+    // 「服务管理密码」确认框（2026-10-04 owner：启动/停止/重启服务统一由管理密码把关）。
+    // 与 vb_confirm 分开实例：文案与 need-password 状态互不干扰。
+    let svc_pw = ConfirmDialog::new()?;
+    svc_pw.set_confirm_text("确认".into());
+    svc_pw.set_cancel_text("取消".into());
+    svc_pw.set_danger(true);
     // #74 提醒弹窗：授权者私聊 toast（右上角、5s 自动收起）；创建后一直隐藏，
     // 2s 轮询发现未读时由 show_notifications_window 显示。
     let notifications = NotificationsWindow::new()?;
@@ -3086,26 +3092,115 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
+    // ── 受管理密码保护的服务动作（2026-10-04 owner：启动/停止/重启统一要密码）──
+    //
+    // 为什么在 UI 层：这是**第二道门**（防误操作 / 防 agent 顺手停）。让服务杀不掉的仍是
+    // 它的托管形态（Windows 计划任务 / macOS launchd）——两者互补，别互相替代：同用户进程
+    // 永远能改 config.json，所以「密码」挡不住有意绕过者（见 admin_pass 模块文档）。
+    let svc_pw_pending: Rc<RefCell<Option<UiCmd>>> = Rc::new(RefCell::new(None));
+    let ask_admin: Rc<dyn Fn(UiCmd)> = {
+        let dlg = svc_pw.as_weak();
+        let pending = svc_pw_pending.clone();
+        Rc::new(move |cmd: UiCmd| {
+            *pending.borrow_mut() = Some(cmd);
+            let record = crate::config::Config::load()
+                .map(|c| c.admin_password)
+                .unwrap_or_default();
+            if let Some(d) = dlg.upgrade() {
+                let first = !crate::admin_pass::is_set(&record);
+                d.set_need_password(true);
+                d.set_password_input("".into());
+                d.set_failed(false);
+                d.set_busy(false);
+                d.set_title_text(if first {
+                    "首次设置管理密码".into()
+                } else {
+                    "需要管理密码".into()
+                });
+                d.set_message(if first {
+                    "今后「启动 / 停止 / 重启服务」都要输它。只存哈希不存明文；忘了就把 config.json 里的 admin_password 清空重设。".into()
+                } else {
+                    "启动 / 停止 / 重启服务需要管理密码。".into()
+                });
+                let _ = d.show();
+            }
+        })
+    };
+    {
+        let dlg = svc_pw.as_weak();
+        let pending = svc_pw_pending.clone();
+        let tx = tx.clone();
+        svc_pw.on_confirmed(move || {
+            let Some(cmd) = pending.borrow_mut().take() else {
+                return;
+            };
+            let pw = dlg
+                .upgrade()
+                .map(|d| d.get_password_input().to_string())
+                .unwrap_or_default();
+            let mut cfg = match crate::config::Config::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(d) = dlg.upgrade() {
+                        d.set_failed(true);
+                        d.set_message(format!("读配置失败：{e:#}").into());
+                    }
+                    *pending.borrow_mut() = Some(cmd);
+                    return;
+                }
+            };
+            if crate::admin_pass::is_set(&cfg.admin_password) {
+                if !crate::admin_pass::verify_record(&cfg.admin_password, &pw) {
+                    crate::log!("[gui] 服务动作：管理密码错误，拒绝");
+                    if let Some(d) = dlg.upgrade() {
+                        d.set_failed(true);
+                        d.set_message("管理密码错误 —— 可重试或取消".into());
+                    }
+                    *pending.borrow_mut() = Some(cmd);
+                    return;
+                }
+            } else {
+                if pw.chars().count() < 4 {
+                    if let Some(d) = dlg.upgrade() {
+                        d.set_failed(true);
+                        d.set_message("密码太短（至少 4 位），请重输".into());
+                    }
+                    *pending.borrow_mut() = Some(cmd);
+                    return;
+                }
+                cfg.admin_password = crate::admin_pass::new_record(&pw);
+                if let Err(e) = cfg.save() {
+                    if let Some(d) = dlg.upgrade() {
+                        d.set_failed(true);
+                        d.set_message(format!("保存管理密码失败：{e:#}").into());
+                    }
+                    *pending.borrow_mut() = Some(cmd);
+                    return;
+                }
+                crate::log!("[gui] 已设置服务管理密码（启动/停止/重启都要密码）");
+            }
+            if let Some(d) = dlg.upgrade() {
+                let _ = d.hide();
+            }
+            let _ = tx.send(cmd);
+        });
+    }
+
     // ── 托盘回调 ──
     {
         let txc = || tx.clone();
+        // 三个动作都先过管理密码门（ask_admin 里校验/首设，通过后才发 UiCmd）。
         tray.on_start_service({
-            let tx = txc();
-            move || {
-                let _ = tx.send(UiCmd::Start);
-            }
+            let ask = ask_admin.clone();
+            move || ask(UiCmd::Start)
         });
         tray.on_stop_service({
-            let tx = txc();
-            move || {
-                let _ = tx.send(UiCmd::Stop);
-            }
+            let ask = ask_admin.clone();
+            move || ask(UiCmd::Stop)
         });
         tray.on_restart_service({
-            let tx = txc();
-            move || {
-                let _ = tx.send(UiCmd::Restart);
-            }
+            let ask = ask_admin.clone();
+            move || ask(UiCmd::Restart)
         });
         tray.on_open_logs({
             let tx = txc();
@@ -3254,23 +3349,18 @@ pub fn run_gui() -> Result<()> {
     // ── 设置窗首页 hero：启动/停止/重启服务 + 打开日志，复用托盘同一套 UiCmd（后台线程串行执行）──
     {
         let txc = || tx.clone();
+        // 设置窗首页同样过管理密码门（与托盘同一把门，避免绕过）。
         settings.on_start_service({
-            let tx = txc();
-            move || {
-                let _ = tx.send(UiCmd::Start);
-            }
+            let ask = ask_admin.clone();
+            move || ask(UiCmd::Start)
         });
         settings.on_stop_service({
-            let tx = txc();
-            move || {
-                let _ = tx.send(UiCmd::Stop);
-            }
+            let ask = ask_admin.clone();
+            move || ask(UiCmd::Stop)
         });
         settings.on_restart_service({
-            let tx = txc();
-            move || {
-                let _ = tx.send(UiCmd::Restart);
-            }
+            let ask = ask_admin.clone();
+            move || ask(UiCmd::Restart)
         });
         settings.on_open_logs({
             let tx = txc();

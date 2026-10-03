@@ -533,6 +533,10 @@ export component ConfirmDialog inherits Window {
     // failed（8-20）：操作失败态——主按钮变「重试」（action 保留可重发），
     // 取消按钮禁用（成功才能正常关闭；红点 X 仍是放弃出口）
     in-out property <bool> failed: false;
+    // 「停止 / 重启服务」的管理密码（2026-10-04 owner 要求）：need-password=true 时
+    // 多一个密码输入框；输入值由 Rust 侧读 password-input 校验（首设/校验两种文案由 Rust 定）。
+    in-out property <bool> need-password: false;
+    in-out property <string> password-input: "";
     callback confirmed();
     callback canceled();
 
@@ -556,6 +560,12 @@ export component ConfirmDialog inherits Window {
             color: PixelTheme.text.with-alpha(0.7);
             wrap: word-wrap;
             horizontal-alignment: center;
+        }
+        if root.need-password: LineEdit {
+            placeholder-text: "管理密码";
+            // std 的 LineEdit 要枚举值（ABB 自有 PixelTextInput 才收字符串，别抄错）
+            input-type: password;
+            text <=> root.password-input;
         }
         Rectangle { vertical-stretch: 1; }
         HorizontalBox {

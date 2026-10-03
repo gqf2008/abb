@@ -5,6 +5,7 @@
 // Windows：托盘 GUI 程序，不带控制台窗口（stdout/stderr 仍可被重定向到文件/管道）。
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod admin_pass;
 mod agent;
 mod agent_spawn;
 mod agents_md;
