@@ -471,6 +471,15 @@ fn main() {
         // 托管形态没有可用 stdout 时，先把日志接到 logs/bridge.out（见函数文档）；
         // 必须在任何输出之前调用，否则 Rust 已缓存旧句柄。
         attach_log_file("bridge.out");
+        // 新模型（2026-10-04）：退役旧的高权限常驻计划任务。若本次**就是**它拉起来的，
+        // 这一行会让下次登录改走托盘（普通用户）路径；随后把「仍在以高权限跑」留痕。
+        platform::retire_legacy_bridge_task();
+        #[cfg(target_os = "windows")]
+        if agent_bridge::elev::win::is_elevated() {
+            crate::log!(
+                "[svc] ⚠️ 服务正以管理员权限运行（新模型要求普通用户）：可能来自旧常驻任务或手动提权；已尝试退役旧任务，重启 ABB 托盘即可由普通用户身份接管"
+            );
+        }
         // 存量孤儿回收：job 方案上线前（以及任何漏网的）agent 被杀时，它起的 MCP 服务
         // （wassette）会作为孙进程常驻。新起的由 agent_spawn 的 job 覆盖，存量在这里收一次。
         let reaped = crate::orphan_mcp::reap_wassette_orphans();

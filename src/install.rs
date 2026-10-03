@@ -405,7 +405,7 @@ fn terminate(pid: u32) -> Result<()> {
 ///
 /// 返回值语义：`Ok(())` = 调用返回时该 pid **已不在**（本来就不在也算）；`Err` = 还在跑，
 /// 调用方必须把原因交给用户（权限不足最常见），绝不能静默吞掉。
-fn terminate_with_grace(pid: u32, grace: std::time::Duration) -> Result<()> {
+pub(crate) fn terminate_with_grace(pid: u32, grace: std::time::Duration) -> Result<()> {
     if pid == 0 || !pid_alive(pid) {
         return Ok(());
     }
