@@ -551,8 +551,15 @@ impl WeixinClient {
                 let status = r.status();
                 let txt = r.text().await.unwrap_or_default();
                 if txt.is_empty() {
-                    // 200 + 空体（部分错误路径）：当空轮询处理，不刷错误日志。
-                    return Ok((vec![], cursor.to_string(), timeout_ms));
+                    // 2026-10-05 审计 #20：空体**绝不**当成功空轮询。代理/网关/强制门户会对
+                    // getupdates 返回零长响应体（2xx 或 5xx 都可能），旧实现直接 `Ok(...)` ⇒
+                    // 调用方 `consec_timeouts` 被复位 ⇒「连续 3 次超时判假死并重连」的降级
+                    // 路径永不触发 ⇒ 托盘常绿而消息进不来（正是本文件上方注释禁止的半开假绿）。
+                    // 现在按失败上报，让连续超时计数与重连真正生效。
+                    crate::log!(
+                        "[wx] getupdates 返回空响应体(status={status})；按 PollTimeout 上报（不混进 Ok），让连续超时计数与重连生效"
+                    );
+                    return Err(WxError::PollTimeout);
                 }
                 let parsed: GetUpdatesResp = serde_json::from_str(&txt).map_err(|e| {
                     WxError::Other(anyhow!(
@@ -1609,5 +1616,25 @@ mod tests {
     fn percent_encode_query_works() {
         assert_eq!(percent_encode_query("a+b/c=="), "a%2Bb%2Fc%3D%3D");
         assert_eq!(percent_encode_query("simple-._~"), "simple-._~");
+    }
+}
+
+#[cfg(test)]
+mod empty_body_guard_tests {
+    /// getupdates 的空响应体不得被当成「成功空轮询」（审计 #20）。
+    ///
+    /// 判别力：把空体分支改回 `return Ok((vec![], cursor...))` ⇒ 第一条断言红。
+    #[test]
+    fn empty_body_is_never_treated_as_success() {
+        let src = include_str!("wechat.rs");
+        let empty_ok = concat!("if txt.is_empty() {\n                    // ", "200 + 空体");
+        assert!(
+            !src.contains(empty_ok),
+            "空体不得当成功空轮询：会让连续超时计数复位、假绿不自愈"
+        );
+        assert!(
+            src.contains("getupdates 返回空响应体"),
+            "空体必须按失败上报并留痕"
+        );
     }
 }
