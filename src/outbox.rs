@@ -125,8 +125,22 @@ impl OutboxStore {
     }
 
     /// 入队（幂等：同 id 已存在则跳过）。
+    ///
+    /// 落盘前**先合并磁盘上的现状**（2026-10-05 审计 #21）：本 store 的内存快照可能已陈旧
+    /// —— 长驻的 `Bridge.outbox` 与每次新建的 CLI store（deliver）同时写同一个
+    /// `pending_outbox.json`，而 `persist` 是**整文件覆盖** ⇒ 后写者会把先写者刚入队的项
+    /// 静默抹掉（微信任务报告/跨会话消息永远发不出去）。合并规则：磁盘 ∪ 本快照，按 id 去重。
     pub fn add(&self, item: OutboxItem) {
         let mut d = self.data.lock().unwrap();
+        if let Ok(text) = fs::read_to_string(&self.path) {
+            if let Ok(disk) = serde_json::from_str::<Vec<OutboxItem>>(&text) {
+                for it in disk {
+                    if !d.iter().any(|x| x.id == it.id) {
+                        d.push(it);
+                    }
+                }
+            }
+        }
         if d.iter().any(|x| x.id == item.id) {
             return;
         }
@@ -424,6 +438,27 @@ mod tests {
         assert!(
             no_match_note(store.len(), WX_PLATFORM).is_some(),
             "非空 store 零命中必须产生日志行（杜绝静默黑洞）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outbox_merge_guard_tests {
+    /// 入队必须先合并磁盘现状（否则长驻 store 会把 CLI 刚入队的项整文件覆盖掉）。
+    ///
+    /// 判别力（2026-10-05 审计 #21）：把 `add` 里那段合并删掉（退回「直接 push + persist」）
+    /// ⇒ 第一条断言红。
+    #[test]
+    fn add_merges_disk_state_before_persisting() {
+        let src = include_str!("outbox.rs");
+        assert!(
+            src.contains("落盘前**先合并磁盘上的现状**"),
+            "add 必须先合并磁盘现状再 persist（整文件覆盖会静默抹掉对方入队的项）"
+        );
+        let merge_read = concat!("if let Ok(text) = fs::read_to_string(&self.pa", "th) {");
+        assert!(
+            src.contains(merge_read),
+            "add 内部必须读一次磁盘：{merge_read}"
         );
     }
 }
