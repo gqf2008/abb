@@ -663,18 +663,44 @@ fn windows_silent_args() -> Vec<&'static str> {
 /// ——`Setup Log` 显示 Run entry 已执行（11:41:51），而 11:42:46 一个 ABB 进程都没有；
 /// 且 2.23.78/2.23.79 两次升级是自动回来的 ⇒ 该路径本身不可靠，不能只靠它。
 ///
-/// 兜底做法：更新器拉起安装包后，再挂一个**脱离本进程**的 cmd 看门狗 —— 等 90 秒，若仍没有
-/// `agent-bridge.exe` 在跑就把它拉起来，并把这件事写进 update.log（下次再出问题有据可查，
-/// 不必靠猜）。若安装器已经拉起来了，这里 `tasklist` 命中即直接退出，是 no-op。
+/// 兜底做法：更新器拉起安装包后，再挂一个**脱离本进程**的 cmd 看门狗 —— 每 2 秒轮询一次。
+///
+/// - `agent-bridge.exe` 已在跑 ⇒ 立刻退出（no-op，不双开）；
+/// - 安装器进程（`ABB-Setup*.exe`）已退出且没有 APP ⇒ **立刻**拉起（典型 5~15 秒）；
+/// - 硬上界 150 次轮询（约 300 秒），绝不无限等。
+///
+/// 并把这件事写进 update.log（下次再出问题有据可查，不必靠猜）。
+///
+/// **2026-10-05 改（owner：「不希望后面再出现这种很低级的问题」）**：旧实现是 `ping -n 91`
+/// 死等 90 秒。update.log 三次升级（23:48 / 00:11 / 00:36）显示**真正把 APP 拉回来的始终是
+/// 这个脚本**、而安装器 `[Run]` 在静默安装下从没成功过 —— 也就是说每次升级都要用户白等
+/// 一分半，且整个恢复只押在这个固定睡眠上（睡醒时安装器还没装完就彻底没人管）。
+/// 现在改为「安装器一退出就立刻拉起」，把空窗从 90 秒压到十几秒，并保留硬上界。
 pub(crate) fn post_update_relaunch_script(exe: &Path, log_path: &Path) -> String {
     format!(
         "@echo off\r\n\
-         rem ABB 安装后兜底重启：安装器 [Run] 没把 APP 拉起来时用\r\n\
-         ping -n 91 127.0.0.1 >nul\r\n\
-         tasklist /FI \"IMAGENAME eq agent-bridge.exe\" | find /I \"agent-bridge.exe\" >nul\r\n\
-         if \"%ERRORLEVEL%\"==\"0\" goto :eof\r\n\
-         >>\"{log}\" echo [%DATE% %TIME%] [update] 安装后 90 秒仍无 agent-bridge 进程，兜底拉起\r\n\
-         start \"\" \"{exe}\"\r\n",
+         rem ABB 安装后兜底重启：安装器 [Run] 在静默安装下不可靠（2026-10-01 / 10-05 两次实测\r\n\
+         rem Setup Log 显示 Run entry 已执行，但没有留下任何 ABB 进程）。本脚本是主路径。\r\n\
+         rem 每 2 秒轮询：已有 APP ⇒ 退出；安装器已退出且无 APP ⇒ 立刻拉起；硬上界 150 次。\r\n\
+         setlocal\r\n\
+         set \"EXE={exe}\"\r\n\
+         set \"LOG={log}\"\r\n\
+         for /L %%i in (1,1,150) do (\r\n\
+         rem 判「托盘是否已在跑」**不能按镜像名**：常驻服务就是同名的 agent-bridge.exe --service，
+         rem 服务活着时按名判活会误判「已起来」而永不拉起托盘（2026-10-05 审计发现）。
+         rem 这里按命令行是否带 --service 区分；不带 = 托盘在跑 ⇒ 直接退出。
+         powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }}); if ($t.Count -gt 0) {{ exit 0 }} else {{ exit 1 }}" && goto :done\r\n\
+         tasklist /FI \"IMAGENAME eq ABB-Setup-*.exe\" 2>nul | find /I \"ABB-Setup\" >nul\r\n\
+         if errorlevel 1 (\r\n\
+         >>\"%LOG%\" echo [%DATE% %TIME%] [update] 安装器已退出且无 agent-bridge 进程（第 %%i 次轮询），兜底拉起\r\n\
+         start \"\" \"%EXE%\"\r\n\
+         goto :done\r\n\
+         )\r\n\
+         ping -n 2 127.0.0.1 >nul\r\n\
+         )\r\n\
+         >>\"%LOG%\" echo [%DATE% %TIME%] [update] 兜底轮询超时（约 300 秒）仍未等到安装器退出，放弃拉起\r\n\
+         :done\r\n\
+         endlocal\r\n",
         log = log_path.display(),
         exe = exe.display()
     )
@@ -730,31 +756,44 @@ fn windows_install(setup: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 安装后兜底脚本必须：等待 → 查有没有实例 → 没有才拉起 → 留痕。
+    /// 安装后兜底脚本必须：**快速轮询**（不再死等 90 秒）→ 查有没有实例 → 安装器退出且无实例才拉起 → 留痕。
     ///
-    /// 判别力：把任一步删掉（不等就拉起会双开；不查就拉起会打断用户正在用的实例；
-    /// 不留痕则下次再出问题又只能靠猜）本用例即红。
+    /// 判别力（2026-10-05 owner：「不希望后面再出现这种很低级的问题」）：
+    ///   - 把轮询换回 `ping -n 91`（死等 90 秒）⇒ 第一条断言红 —— 那正是每次升级白等一分半的根源；
+    ///   - 删掉 `tasklist agent-bridge.exe` ⇒ 会双开；
+    ///   - 删掉安装器进程判定 ⇒ 可能在换文件中途对着半装状态拉起；
+    ///   - 删掉循环上界 ⇒ 变成无限等；
+    ///   - 删掉留痕 ⇒ 下次再出问题又只能靠猜。
     #[test]
-    fn post_update_relaunch_script_waits_checks_starts_and_logs() {
+    fn post_update_relaunch_polls_fast_and_only_starts_when_installer_done() {
         let s = post_update_relaunch_script(
             Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
             Path::new(r"C:\Users\u\.agent-bridge\logs\update.log"),
         );
         assert!(
-            s.contains("ping -n 91"),
-            "必须先等约 90 秒让安装器装完：{s}"
+            !s.contains("ping -n 91"),
+            "不得再死等 90 秒（每次升级白等一分半的根源）：{s}"
+        );
+        assert!(
+            s.contains("for /L %%i in (1,1,"),
+            "必须是带硬上界的轮询循环，绝不无限等：{s}"
+        );
+        assert!(
+            s.contains("ABB-Setup"),
+            "必须确认安装器进程已退出（否则可能对着半装的文件拉起）：{s}"
         );
         assert!(
             s.contains("tasklist") && s.contains("agent-bridge.exe"),
             "必须查有没有实例在跑（有则 no-op，避免双开）：{s}"
         );
-        let want = format!(
-            "start \"\" \"{}\"",
-            r"C:\Program Files\ABB\agent-bridge.exe"
+        let exe_literal = r"C:\Program Files\ABB\agent-bridge.exe";
+        assert!(
+            s.contains(&format!("set \"EXE={exe_literal}\"")),
+            "必须把要拉起的 exe 路径写进脚本（期望含 EXE={exe_literal}）：{s}"
         );
         assert!(
-            s.contains(&want),
-            "没有实例时必须把 APP 拉起来（期望含 {want:?}）：{s}"
+            s.contains("start \"\" \"%EXE%\""),
+            "没有实例时必须把 APP 拉起来（start \"\" \"%EXE%\"）：{s}"
         );
         assert!(s.contains("update.log"), "必须留痕，便于下次归因：{s}");
     }
