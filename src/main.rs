@@ -167,6 +167,17 @@ pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Re
 }
 
 /// 统一日志到 stdout（带时间戳，与 Python 版一致，落 logs/bridge.out）。
+/// 标准输出句柄能不能当日志目的地？（纯函数，单测点）
+///
+/// - `raw == 0`（空句柄）或 `raw == -1`（INVALID_HANDLE_VALUE）⇒ 不可用；
+/// - `file_type == FILE_TYPE_CHAR`（控制台 / NUL 设备）⇒ 不可用：Windows 上 NUL 是
+///   **有效句柄**，只看句柄真假会让「被 `Stdio::null()` 拉起」的进程把日志写进 NUL
+///   而 attach 提前返回 ⇒ 日志全丢（2026-10-05 审计 #13）。
+fn stdout_handle_usable(raw: isize, file_type: u32) -> bool {
+    const FILE_TYPE_CHAR: u32 = 0x0002;
+    raw != 0 && raw != -1 && file_type != FILE_TYPE_CHAR
+}
+
 /// 日志轮转上限（8 MiB）：超过就换成 `.1`，磁盘占用封在约 16 MiB。
 const LOG_ROTATE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -230,12 +241,22 @@ fn attach_log_file(name: &str) {
     unsafe extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> *mut core::ffi::c_void;
         fn SetStdHandle(nStdHandle: u32, hHandle: *mut core::ffi::c_void) -> i32;
+        fn GetFileType(hFile: *mut core::ffi::c_void) -> u32;
     }
 
     // SAFETY: 两次调用都只碰本进程的标准句柄表。
     let usable = unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE);
-        !h.is_null() && h as isize != INVALID_HANDLE_VALUE
+        let raw = h as isize;
+        // NUL 设备是 FILE_TYPE_CHAR：**有效句柄但不是可用的日志目的地**（2026-10-05 审计 #13）。
+        // 旧判据只看句柄真假，于是被 `Stdio::null()` 拉起的进程把日志写进 NUL 而自己以为
+        // 有 stdout ⇒ attach 提前 return ⇒ 日志（含 tracing）全部蒸发，偏偏升级空窗最需要它。
+        let ftype = if h.is_null() || raw == INVALID_HANDLE_VALUE {
+            0
+        } else {
+            GetFileType(h)
+        };
+        stdout_handle_usable(raw, ftype)
     };
     if usable {
         return;
@@ -3045,6 +3066,30 @@ mod log_rotation_tests {
         assert!(
             src.contains("rotate_log_if_large(&path, LOG_ROTATE_CAP_BYTES)"),
             "attach_log_file 必须真的调用轮转，否则上限形同虚设"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stdout_handle_guard_tests {
+    /// NUL 句柄（FILE_TYPE_CHAR）不得被当成可用的日志目的地。
+    ///
+    /// 判别力（2026-10-05 审计 #13）：去掉 `file_type != FILE_TYPE_CHAR`（退回只看句柄真假）
+    /// ⇒ 第四条断言红，而症状正是「升级空窗里 bridge.out 一行都没有」。
+    #[test]
+    fn nul_handle_is_not_a_usable_log_destination() {
+        assert!(
+            crate::stdout_handle_usable(1234, 0x0001),
+            "普通文件句柄可用"
+        );
+        assert!(!crate::stdout_handle_usable(0, 0), "空句柄不可用");
+        assert!(
+            !crate::stdout_handle_usable(-1, 0x0001),
+            "INVALID_HANDLE_VALUE 不可用"
+        );
+        assert!(
+            !crate::stdout_handle_usable(1234, 0x0002),
+            "NUL/控制台（FILE_TYPE_CHAR）不可用：否则日志写进 NUL 全部蒸发"
         );
     }
 }
