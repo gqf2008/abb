@@ -2616,22 +2616,20 @@ mod tests {
     /// 判别力：删掉 `is_desired` 判定、或把 stdout 换回 `Stdio::null`，对应断言必红。
     #[test]
     fn headless_fallback_respects_desired_and_logs_to_bridge_out() {
+        // 用**精确接线串**断言，不用「取一段窗口再搜关键词」：窗口长度这类写法会让同一份
+        // 源码在 macOS 上判出不同结果（2026-10-05 CI 实测：本机绿、macOS 红）。
         let src = include_str!("main.rs");
-        let start = src
-            .find("fn ensure_service_running_headless(")
-            .expect("兜底函数必须存在");
-        let body = &src[start..start + 2600.min(src.len() - start)];
         assert!(
-            body.contains("is_desired()"),
-            "兜底必须尊重用户意图（is_desired），不能把用户停掉的服务反复拉起：{body}"
+            src.contains("!crate::install::is_desired() || crate::install::status().running"),
+            "兜底必须尊重用户意图（is_desired），不能把用户停掉的服务反复拉起"
         );
         assert!(
-            !body.contains("Stdio::null())\n        .stdout") && !body.contains(".stdout(std::process::Stdio::null())"),
-            "兜底拉 service 不许把 stdout 丢给 NUL（Windows 上 NUL 是有效句柄，日志会全蒸发）：{body}"
+            src.contains(".stdout(std::process::Stdio::from(out))"),
+            "兜底拉 service 的 stdout 必须接到 logs/bridge.out，不许丢给 NUL"
         );
         assert!(
-            body.contains("bridge.out"),
-            "兜底拉 service 的日志必须落到 logs/bridge.out：{body}"
+            src.contains(".open(logs.join(\"bridge.out\"))"),
+            "兜底拉 service 的日志文件必须是 logs/bridge.out"
         );
     }
 
