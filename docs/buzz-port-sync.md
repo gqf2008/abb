@@ -77,7 +77,8 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 「外部取消后应向在途回合发 cancel: []」）与 `buzz::oneshot::tests::oneshot_timeout_cancels_and_teardown_bounded`。
 证据：CI run 37221361140（sha d5227fb）与 37221245958（sha f104237）的 `test-macos` 失败列表**只有**这两条；
 同两次 run 的 `fmt` / `clippy -D warnings`（test 作业）/ `fork-lint` / `check-macos` **全部 success**。
-归因状态：**未确认是否 pre-existing**（macOS 侧时序/行为差异，本机 Windows 全量是 886 passed / 0 failed ⇒ 平台相关）；
+归因状态（2026-10-05 复核，读码定论）：**产品行为正确、测试自身有时序竞态** —— `oneshot_external_cancel_returns_cancelled` 的三条断言里，前两条（outcome == Cancelled、started.elapsed() < 30s）在 macOS 上**都通过**，只有第三条『事件里必须有一条 event == cancel』读到**空列表** ⇒ 是 `read_records` 在记录任务落盘之前就读了（macOS 调度更慢/更易被抢占）。**不是 cancel 没生效**。处置建议：让该断言有界等待记录出现，或改为只断言 outcome + 有界耗时；属同步区改动，按纪律另案进行、不重跑至绿。
+（原归因保留：未确认是否 pre-existing；本机 Windows 全量截至该轮 886 passed / 0 failed，现 905 passed / 0 failed。）
 与本轮（2026-10-05）Windows 进程/安装/自启修复**零交集**。处置：另案评估，按纪律不重跑至绿。
 
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
