@@ -40,7 +40,7 @@
 12. per-user 迁 per-machine 无清理（两个卸载项、LOCALAPPDATA 残留 162MB、开始菜单快捷方式指向已不存在的旧 exe）
    位置：ABB.iss:24 / 51-57
    修法：迁移代码清理旧目录 + 其 _is1 卸载键 + 用户开始菜单链接
-13. attach_log_file 认不出 NUL 句柄（判据侧同 3）
+13. ✅ 已修（main e416242）attach_log_file 认不出 NUL 句柄（判据侧同 3）
    修法：把「句柄可用否」抽纯函数，NUL 句柄判不可用
 14. 兜底脚本按镜像名判托盘（服务就是同名 agent-bridge.exe --service，服务活着时永不拉起托盘；最坏结果是没有托盘图标，频道仍由服务活着）
    修法：按命令行是否带 --service 区分（现成 PowerShell 一行）
@@ -59,7 +59,7 @@
 19. 微信游标不持久化（每次重启从空游标开始，升级窗口内消息大概率丢）
    位置：src/service.rs:1259 / 1271 / 1280
    修法：游标落盘 workspaces/<bot>/wx_cursor.json，mock 断言重启后首个请求体游标等于上次保存值
-20. 微信把 2xx/5xx + 空 body 当成功空轮询（consec_timeouts 被复位、假绿不自愈）
+20. ✅ 已修（main c4c2a42）微信把 2xx/5xx + 空 body 当成功空轮询（consec_timeouts 被复位、假绿不自愈）
    位置：src/wechat.rs:553-555
    修法：mock 返回空体，断言 get_updates 返回 Err 而非 Ok
 21. 微信 outbox 两个写方各持内存快照（Router::fail_text 新建 OutboxStore 与 Bridge.outbox 互相整文件覆盖，积压项静默丢）
@@ -68,7 +68,7 @@
 22. ✅ 已修（main b4c6415）config.json 固定 tmp 名 + 只有进程内锁（GUI 与 service 并发写互踩，设置/授权静默回退）
    位置：src/config.rs:1710-1718 / 1783
    修法：源码守卫禁止 config.rs 出现 json.tmp，必须走 atomic_write_text/atomic_write_sensitive
-23. agent 回复发送失败仍无条件摘掉 pending（断网瞬间的回复永久丢；飞书/钉钉没有 outbox）
+23. ✅ 已修（main f06e88c）agent 回复发送失败仍无条件摘掉 pending（断网瞬间的回复永久丢；飞书/钉钉没有 outbox）
    位置：src/bridge/virtualbot.rs:1096-1102
    修法：失败时保留 pending（或转 outbox），下一轮/重启补发
 24. ✅ 已修（main 87d13fb）svc_start_verified 验证的是自己刚写的 pid（子进程随后才因抢锁 exit(0) 或 config exit(1)，点启动弹成功而服务已死）
