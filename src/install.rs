@@ -971,10 +971,26 @@ mod installer_guards {
             directive_is("DefaultDirName", r"{autopf}\ABB"),
             "程序必须装到 autopf（Program Files，普通用户不可写），不能再用 localappdata"
         );
-        // 反向：这两个值**不得**在代码行里出现（防「注释里写 admin、代码里偷偷改回 lowest」）
+        // 反向（2026-10-05 收窄）：**安装位置/复制/启动**类指令里不得再出现 localappdata
+        // （防「注释里写 admin、代码里偷偷改回 lowest」）。
+        //
+        // 为什么不再全禁：`[InstallDelete]` 里用 `{localappdata}\Programs\ABB` **清理旧 per-user
+        // 残留**是正当的（审计 #12，本机实测残留 162MB + 失效快捷方式），全禁会把正当用法判红。
+        // 收窄后判别力更强：定位/复制指令真被改回 localappdata 仍然红。
+        let offenders: Vec<&String> = code_lines()
+            .iter()
+            .filter(|l| l.contains("localappdata"))
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("DefaultDirName")
+                    || t.starts_with("DestDir")
+                    || t.starts_with("Source")
+                    || t.starts_with("Filename")
+            })
+            .collect();
         assert!(
-            !code_lines().iter().any(|l| l.contains("localappdata")),
-            "代码行里不得再出现 localappdata（per-machine 的前提）"
+            offenders.is_empty(),
+            "安装位置/复制/启动指令里不得出现 localappdata（per-machine 的前提）：{offenders:?}"
         );
     }
 
@@ -1088,6 +1104,27 @@ mod installer_guards {
     /// 文件被占用删不掉；且卸载不清 `HKCU\...\Run` ⇒ 下次登录去启动一个已不存在的 exe。
     ///
     /// 判别力：删掉 `[UninstallRun]` 段，或去掉任一条（两个 exe / Run 键），这里立刻红。
+    /// per-user 时代的残留必须清掉（2026-10-05 审计 #12）：本机实测
+    /// `%LOCALAPPDATA%\Programs\ABB` 留了 162MB，且 `{userprograms}\ABB.lnk` 指向一个
+    /// **已经不存在**的旧 exe（点了没反应，用户只会觉得「装坏了」）。
+    ///
+    /// 判别力：删掉任一条 ⇒ 立刻红。
+    #[test]
+    fn installer_cleans_the_legacy_per_user_install() {
+        let section = ISS
+            .split("[InstallDelete]")
+            .nth(1)
+            .expect("安装脚本必须有 [InstallDelete] 段");
+        assert!(
+            section.contains("{localappdata}\\Programs\\ABB"),
+            "必须清理旧 per-user 安装目录（本机实测残留 162MB）"
+        );
+        assert!(
+            section.contains("{userprograms}\\ABB.lnk"),
+            "必须清理指向已删除旧 exe 的开始菜单快捷方式"
+        );
+    }
+
     #[test]
     fn installer_uninstall_stops_processes_and_clears_the_run_key() {
         let section = ISS

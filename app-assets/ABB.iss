@@ -55,6 +55,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Type: files; Name: "{app}\abb-spawner.exe"
 Type: files; Name: "{app}\abb-elev-helper.exe"
 Type: files; Name: "{app}\abb-helper.exe"
+; 2026-10-05 审计 #12：per-user 时代（≤2.23.97，`{localappdata}\Programs\ABB`）迁到 per-machine
+; 后，旧目录与旧快捷方式都没人清 —— 本机实测残留 162MB，且 `{userprograms}\ABB.lnk` 指向一个
+; **已经不存在**的旧 exe（点了没反应）。这里在安装/升级时顺手清掉（不存在时为 no-op）。
+Type: filesandordirs; Name: "{localappdata}\Programs\ABB"
+Type: files; Name: "{userprograms}\ABB.lnk"
 
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
