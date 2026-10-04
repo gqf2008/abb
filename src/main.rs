@@ -484,6 +484,7 @@ fn main() {
         // 这一行会让下次登录改走托盘（普通用户）路径；随后把「仍在以高权限跑」留痕。
         platform::retire_legacy_bridge_task();
         platform::retire_legacy_per_user_files();
+        platform::retire_legacy_uninstall_keys();
         #[cfg(target_os = "windows")]
         if platform::is_elevated() {
             crate::log!(

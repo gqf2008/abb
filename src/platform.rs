@@ -2528,3 +2528,98 @@ mod legacy_files_guard_tests {
         );
     }
 }
+
+/// 这条卸载项的 InstallLocation 是否指向 per-user 时代的旧目录？（纯函数，单测点）
+///
+/// 刻意用**精确相等**判定：只有恰好是 `<LOCALAPPDATA>\Programs\ABB` 才动手 —— 宁可漏删，
+/// 也绝不误删别人的卸载项（这是注册表删键，出错代价高）。
+pub fn is_legacy_per_user_install(install_location: &str, local_appdata: &str) -> bool {
+    if install_location.trim().is_empty() {
+        return false;
+    }
+    let norm = |s: &str| {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .trim()
+            .to_ascii_lowercase()
+    };
+    norm(install_location) == norm(&format!("{local_appdata}\\Programs\\ABB"))
+}
+
+/// 清掉 per-user 时代的 HKCU 卸载项（2026-10-05 审计 #12b 的第二步）。
+///
+/// 只扫 HKCU（**绝不碰 HKLM**），逐条核对 `InstallLocation`，只删指向旧目录的那一条；
+/// 删除动作逐个留日志（成功/失败都记），失败不影响启动。
+#[cfg(target_os = "windows")]
+pub fn retire_legacy_uninstall_keys() {
+    let Some(local) = dirs::data_local_dir() else {
+        return;
+    };
+    let local_s = local.display().to_string();
+    let base = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall";
+    let Ok(o) = crate::spawn::command("reg")
+        .args(["query", base, "/s"])
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim_end();
+        if t.starts_with("HKEY_") {
+            current = Some(t.to_string());
+            continue;
+        }
+        if !t.contains("InstallLocation") || !t.contains("REG_SZ") {
+            continue;
+        }
+        let loc = t.split("REG_SZ").nth(1).unwrap_or("").trim();
+        let Some(key) = current.clone() else { continue };
+        if !is_legacy_per_user_install(loc, &local_s) {
+            continue;
+        }
+        match crate::spawn::command("reg")
+            .args(["delete", &key, "/f"])
+            .output()
+        {
+            Ok(d) if d.status.success() => {
+                crate::log!("[migrate] 已删除旧 per-user 卸载项 {key}")
+            }
+            _ => crate::log!("[migrate] 删除旧 per-user 卸载项失败（跳过）：{key}"),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn retire_legacy_uninstall_keys() {}
+
+#[cfg(test)]
+mod legacy_uninstall_guard_tests {
+    /// 只认「恰好等于 <LOCALAPPDATA>\Programs\ABB」这一种，绝不误删别的卸载项。
+    ///
+    /// 判别力（审计 #12b）：把判定改成 `contains("ABB")` 之类 ⇒ 第二、三条断言红。
+    #[test]
+    fn only_exact_legacy_dir_is_flagged() {
+        let local = r"C:\Users\u\AppData\Local";
+        assert!(crate::platform::is_legacy_per_user_install(
+            r"C:\Users\u\AppData\Local\Programs\ABB",
+            local
+        ));
+        assert!(!crate::platform::is_legacy_per_user_install(
+            r"C:\Program Files\ABB",
+            local
+        ));
+        assert!(
+            !crate::platform::is_legacy_per_user_install("", local),
+            "空值不动手"
+        );
+        assert!(
+            !crate::platform::is_legacy_per_user_install(
+                r"C:\Users\u\AppData\Local\Programs\ABB-other",
+                local
+            ),
+            "近似名字不得误删"
+        );
+    }
+}
