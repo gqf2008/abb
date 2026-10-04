@@ -1707,15 +1707,12 @@ impl Config {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = p.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self)?;
-        fs::write(&tmp, text)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(&tmp, &p)?;
+        // 走共享原子写（2026-10-05 审计 #22）：唯一 tmp 名（UUID）+ `rename_replace_retry`
+        // + 失败时清理临时文件。原来用的是**固定** `config.json.tmp` 加裸 `fs::rename`：
+        // GUI 与 service 两个进程同时保存时会互相踩 —— 先 rename 者胜、后者 ENOENT，
+        // 或更糟：把对方刚写了一半的内容抬成正式配置（用户刚保存的设置/刚生效的授权静默回退）。
+        crate::atomic_write_sensitive(&p, &text)?;
         Ok(())
     }
 
@@ -3515,4 +3512,27 @@ fn resolve_bot_key_rejects_unsafe_resolved_key() {
     let err = cfg.resolve_bot_key("安全别名").unwrap_err();
     assert!(err.contains("安全的单一路径组件"), "{err}");
     assert!(err.contains("safe_app"), "错误须列出可用 key：{err}");
+}
+
+#[cfg(test)]
+mod atomic_save_guard_tests {
+    /// 保存必须走共享原子写（唯一 tmp + replace 重试），不得再用固定的 `json.tmp`。
+    ///
+    /// 判别力（2026-10-05 审计 #22）：把 `save()` 改回固定 tmp 名 ⇒ 第一条红；
+    /// 把 `crate::atomic_write_sensitive` 换回裸 `fs::write` ⇒ 第二条红。
+    ///
+    /// 注意：待禁字面量用 `concat!` 拆开写，否则守卫自己的源码就会命中它（自证陷阱）。
+    #[test]
+    fn config_save_uses_the_shared_atomic_writer() {
+        let needle = concat!("with_extension(\"json", ".tmp\")");
+        let src = include_str!("config.rs");
+        assert!(
+            !src.contains(needle),
+            "不得再用固定的 config.json.tmp：GUI 与 service 并发保存会互踩（设置/授权静默回退）"
+        );
+        assert!(
+            src.contains("crate::atomic_write_sensitive(&p, &text)"),
+            "保存必须走共享原子写（唯一 tmp + rename_replace_retry）"
+        );
+    }
 }
