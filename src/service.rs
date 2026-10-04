@@ -1256,7 +1256,10 @@ async fn weixin_loop(
         bot.wx_cdn_base_url.as_str()
     };
     let client = crate::wechat::WeixinClient::new(base, &bot.wx_token, cdn);
-    let mut cursor = String::new();
+    // 游标持久化（2026-10-05 审计 #19）：原来每次启动都从空游标开始 ⇒ 升级/崩溃/看门狗
+    // 重拉任何一次重启都变成「消息黑洞」（停机窗口内用户发的消息大概率直接丢）。
+    // 从 workspaces/<key>/wx_cursor.json 恢复；缺失/损坏都退回空串，绝不因此启动失败。
+    let mut cursor = load_wx_cursor(&key);
     let mut timeout_ms: u64 = 35_000;
     crate::log!("[bot:{key}] 微信长轮询启动 base={base}");
     // 每次 poll 成功都重报一次「在线」（绑真实连通，非独立心跳）；snapshot 僵尸阈值已放宽到 180s。
@@ -1278,6 +1281,8 @@ async fn weixin_loop(
                             crate::log!("[bot:{key}] getupdates 返回 {} 条消息", msgs.len());
                         }
                         cursor = new_cursor;
+                        // 每次拿到新游标就落盘（尽力而为 + 原子写）：重启后能从这里续上。
+                        save_wx_cursor(&key, &cursor);
                         timeout_ms = new_timeout.max(5_000);
                         consec_timeouts = 0; // 成功响应 = 通道真通，复位假死计数
                         // 每次成功轮询都视为「在线」，但至多 10s 重报一次续命（对抗僵尸过滤）
@@ -2389,5 +2394,72 @@ mod tests {
         let p = job_prompt(&job, &bot_key);
         assert!(p.contains("简单提醒"));
         assert!(!p.starts_with("[受限模式]"));
+    }
+}
+
+/// 微信长轮询游标落盘位置：`workspaces/<bot_key>/wx_cursor.json`。
+fn wx_cursor_path(bot_key: &str) -> std::path::PathBuf {
+    crate::workspace_dir(bot_key).join("wx_cursor.json")
+}
+
+/// 读取持久化的微信游标（缺失/损坏 ⇒ 空串，绝不因此启动失败）。
+fn load_wx_cursor(bot_key: &str) -> String {
+    let path = wx_cursor_path(bot_key);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return String::new();
+    };
+    parse_wx_cursor(&text).unwrap_or_default()
+}
+
+/// 从 JSON 里取游标。损坏 ⇒ None（调用方退回空串）。
+fn parse_wx_cursor(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(v.get("buf")?.as_str()?.to_string())
+}
+
+/// 落盘游标（原子写 + 尽力而为：失败只记一条，绝不影响长轮询）。
+fn save_wx_cursor(bot_key: &str, cursor: &str) {
+    let path = wx_cursor_path(bot_key);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = serde_json::json!({ "buf": cursor }).to_string();
+    if let Err(e) = crate::atomic_write_text(&path, &body) {
+        crate::log!("[bot:{bot_key}] 微信游标落盘失败（不影响长轮询）：{e:#}");
+    }
+}
+
+#[cfg(test)]
+mod wx_cursor_guard_tests {
+    /// 游标必须能往返、且损坏输入不得 panic（审计 #19）。
+    ///
+    /// 判别力：把持久化删掉（`load_wx_cursor` 恒返回空串）⇒ 生产侧断言红。
+    #[test]
+    fn wx_cursor_roundtrip_and_corrupt_input() {
+        let body = serde_json::json!({ "buf": "CURSOR-123" }).to_string();
+        assert_eq!(
+            crate::service::parse_wx_cursor(&body).as_deref(),
+            Some("CURSOR-123")
+        );
+        assert_eq!(
+            crate::service::parse_wx_cursor("not-json"),
+            None,
+            "损坏输入退回 None"
+        );
+        assert_eq!(crate::service::parse_wx_cursor("{\"other\":1}"), None);
+    }
+
+    /// 生产侧必须真的载入与保存（否则游标只是一次性内存变量）。
+    #[test]
+    fn wechat_loop_loads_and_saves_the_cursor() {
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("let mut cursor = load_wx_cursor(&key)"),
+            "启动必须载入游标"
+        );
+        assert!(
+            src.contains("save_wx_cursor(&key, &cursor)"),
+            "拿到新游标必须落盘"
+        );
     }
 }
