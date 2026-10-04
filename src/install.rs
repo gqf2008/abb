@@ -1084,6 +1084,28 @@ mod installer_guards {
     /// 任务名），这里立刻红。旧的 `--install-bridge-task` 子命令也已从 main.rs 删除。
     /// 去提权的收尾：旧版本装过这三个提权件，升级时必须删掉 —— 否则它们永远留在
     /// Program Files 里（owner 2026-10-04 专门问过这三个文件还在不在）。
+    /// 卸载必须收工（2026-10-05 审计 #11）：服务是无窗口独立进程，Windows 卸载器关不掉它 ⇒
+    /// 文件被占用删不掉；且卸载不清 `HKCU\...\Run` ⇒ 下次登录去启动一个已不存在的 exe。
+    ///
+    /// 判别力：删掉 `[UninstallRun]` 段，或去掉任一条（两个 exe / Run 键），这里立刻红。
+    #[test]
+    fn installer_uninstall_stops_processes_and_clears_the_run_key() {
+        let section = ISS
+            .split("[UninstallRun]")
+            .nth(1)
+            .expect("安装脚本必须有 [UninstallRun] 段（卸载前收工，否则文件删不掉）");
+        for exe in ["agent-bridge.exe", "buzz-agent.exe"] {
+            assert!(
+                section.contains(exe),
+                "卸载必须结束 {exe}（否则文件被占用删不掉）"
+            );
+        }
+        assert!(
+            section.contains("/v ABB") && section.contains("/f"),
+            "卸载必须删掉 HKCU Run 的 ABB 值（否则下次登录去启动已删除的 exe）"
+        );
+    }
+
     #[test]
     fn installer_deletes_the_retired_privileged_helpers() {
         let section = ISS
@@ -1101,10 +1123,13 @@ mod installer_guards {
         // （它是语句分隔符）。我改 [Code] 时把一处注释写成 `; ...`，ISCC 直接报
         // `'BEGIN' expected` 编译失败 —— 而安装包只在 CI/release 里编，普通测试抓不到。
         // 这条守卫把这类错误钉在测试里（本地 ISCC 实测：修掉后 Successful compile）。
+        // 必须按**行首**锚定真正的段头：文件里别处的注释正文也会出现 `[Code]` 这个词
+        // （例如「由下面的 [Code] 注册的计划任务」），用 `split("[Code]")` 会从注释处切起，
+        // 把注释与段头之间的 `;` 注释算进来 —— 2026-10-05 加 [UninstallRun] 段时就这么误报过。
         let code_section = ISS
-            .split("[Code]")
+            .split("\n[Code]")
             .nth(1)
-            .expect("安装脚本必须有 [Code] 段");
+            .expect("安装脚本必须有 [Code] 段（行首）");
         // 只看到下一个段标题为止：`[Run]`/`[Registry]` 那些段里的 `;` 注释是**合法**的，
         // 把整个文件都算进来会误报（首版守卫就这么翻的车）。
         let code_section = code_section.split("\n[").next().unwrap_or(code_section);

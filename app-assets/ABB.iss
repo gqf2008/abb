@@ -85,6 +85,16 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 ; 若不加这个标志，[Run] 会用**管理员令牌**拉起托盘 —— 托盘再 spawn 的 claude/codex 就会带着
 ; 管理员权限跑（本批要避免的事）。加它 ⇒ 托盘回到「启动安装的那个普通用户」身份；
 ; 需要高完整性的 bridge 由下面的 [Code] 注册的计划任务以 HighestAvailable 拉起，各就各位。
+; ─────────────────────────── 卸载收工（2026-10-05 审计 #11）───────────────────
+;
+; 为什么必须有：常驻服务（agent-bridge.exe --service）是**无窗口独立进程**，Windows 的卸载器
+; （RestartManager）关不掉它 ⇒ 它锁着 {app}\agent-bridge.exe，卸载删不掉/要求重启系统；
+; 而卸载也不会动 HKCU\...\Run 的 ABB 值 ⇒ 下次登录去启动一个**已经不存在**的 exe（托盘永不出现）。
+[UninstallRun]
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM agent-bridge.exe"; Flags: runhidden; RunOnceId: "AbbKillBridge"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM buzz-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillBuzz"
+Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ABB /f"; Flags: runhidden; RunOnceId: "AbbDelRunKey"
+
 [Run]
 ; 顺序要紧：先把安装期间 `/disable` 掉的常驻任务**恢复启用**，再拉起 APP —— 反过来的话，
 ; 托盘启动那一刻任务还是禁用的，它的看门狗启服务必然失败（2026-10-01 实测顺序就是反的：
