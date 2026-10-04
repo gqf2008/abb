@@ -42,10 +42,20 @@ fn link_pi_skills() {
                 #[cfg(unix)]
                 let rel = PathBuf::from("../../../.agents/skills").join(&name);
                 #[cfg(unix)]
-                let _ = std::os::unix::fs::symlink(&rel, &link);
+                let res = std::os::unix::fs::symlink(&rel, &link);
                 #[cfg(windows)]
-                let _ = std::os::windows::fs::symlink_dir(ent.path(), &link);
-                linked += 1;
+                let res = std::os::windows::fs::symlink_dir(ent.path(), &link);
+                match res {
+                    Ok(()) => linked += 1,
+                    // 2026-10-05 审计 #17：原来是 `let _ = ...` 丢掉结果后**无条件**
+                    // `linked += 1` ⇒ 普通用户 + 未开开发者模式（symlink_dir 报 1314）时
+                    // 日志照样打印「已补链 N 个」，而技能目录其实什么都没链上 —— 谎报比
+                    // 不报更糟：用户以为已经好了，agent 侧却永久缺技能。现在只数成功，
+                    // 并把失败原因如实写出来（附带可操作的提示）。
+                    Err(e) => crate::log!(
+                        "[lark] 技能软链失败（{name}）：{e:#}；Windows 需开发者模式或管理员权限，或改用 junction/复制"
+                    ),
+                }
             }
         }
         if linked > 0 {
@@ -298,5 +308,29 @@ async fn run(
             Err(_) => Err(format!("超时（{}s）", d.as_secs())),
         },
         None => work.await,
+    }
+}
+
+#[cfg(test)]
+mod symlink_error_guard_tests {
+    /// 软链失败不得被静默吞掉，更不得照样计入「已补链 N 个」。
+    ///
+    /// 判别力（2026-10-05 审计 #17）：改回 `let _ = symlink_dir(...); linked += 1;` ⇒ 第一条红；
+    /// 删掉失败分支的日志 ⇒ 第二条红。
+    #[test]
+    fn skill_symlink_counts_only_successes_and_reports_failures() {
+        let src = include_str!("larkskills.rs");
+        let bad = concat!(
+            "symlink_dir(ent.path(), &link);\n                linked +",
+            "= 1;"
+        );
+        assert!(
+            !src.contains(bad),
+            "不许在 symlink_dir 之后无条件 linked += 1（会把失败也数成成功，谎报已补链）"
+        );
+        assert!(
+            src.contains("技能软链失败"),
+            "软链失败必须如实写日志，否则用户以为技能已就位"
+        );
     }
 }
