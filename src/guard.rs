@@ -125,6 +125,21 @@ fn ensure_owner_guard_files_at(guard_dir: &Path, exe: &Path) -> std::io::Result<
     Ok(())
 }
 
+/// 有界读 stdin：最多等 `timeout`，超时返回 `None`（调用方按「读不到事件」fail-closed）。
+///
+/// 为什么要另起线程 + 超时：std 的 stdin 读**没法设超时**，而钩子**绝不能挂住**（见
+/// `guard_check_main` 里那段事故注释）。超时后放弃那个读线程即可 —— 本进程随即输出决策
+/// 并退出，线程随进程一起消失，不会泄漏。
+fn read_stdin_bounded(timeout: std::time::Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
+        let _ = tx.send(buf);
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
 /// guard-check 子命令入口（main.rs 分发）：读 stdin 的 hook 事件 JSON，输出决策 JSON。
 /// 正常决策返回 0；env 存在但无法收敛时输出 deny 并返回 2（fail-closed，且满足
 /// CLI 非法 key 非零退出契约）。
@@ -168,22 +183,29 @@ pub fn guard_check_main() -> i32 {
             return 0;
         }
     };
-    let mut input = String::new();
-    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
-        // 读不到 hook 事件：granted 拒绝（fail-closed）；owner 放行（手动调用/异常形态
-        // 不拦——删除保护是增量拦截，读不到事件时保持无保护原行为，不扩大拒绝面）。
-        // #194：虚拟 Bot 群 fail-closed（写隔离是它的存在意义，读不到事件不放大拒绝面
-        // 的理由不成立）。
-        if role == crate::config::SenderRole::Granted || vb_confined {
-            println!(
-                "{}",
-                decision_json(&Decision::Deny("无法读取 hook 事件".into()))
-            );
-        } else {
-            println!("{}", decision_json(&Decision::Allow));
+    // 读 hook 事件 —— **必须有界**。
+    //
+    // 2026-10-04 实测事故（owner 实报 8 个僵死 agent-bridge 进程 + 30 条「执行超时」告警）：
+    // hook 调用方若「不喂 stdin、也不关闭」（旧 claude 会话被复用、外层 agent 的管道未收口等），
+    // 原先的 `read_to_string(stdin)` 会**永久阻塞** —— 进程 0% CPU / ~19MB 永远挂着，把它父
+    // agent 的整个回合一起拖死，而 agent 会不断重问模型 ⇒ LLM 风暴 ⇒ 定时任务每轮都跑满预算
+    // 超时。**钩子绝不能挂住**：超时按「读不到事件」走下面同一套 fail-closed 决策（语义与原
+    // read 失败分支完全一致，只是多了时间上界）。
+    let input = match read_stdin_bounded(std::time::Duration::from_secs(3)) {
+        Some(s) => s,
+        None => {
+            eprintln!("[guard-check] 等待 stdin 超时（调用方未喂 hook 事件），按读不到事件处理");
+            if role == crate::config::SenderRole::Granted || vb_confined {
+                println!(
+                    "{}",
+                    decision_json(&Decision::Deny("无法读取 hook 事件（等待超时）".into()))
+                );
+            } else {
+                println!("{}", decision_json(&Decision::Allow));
+            }
+            return 0;
         }
-        return 0;
-    }
+    };
     let v: serde_json::Value = match serde_json::from_str(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -1128,6 +1150,20 @@ fn split_shell(s: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    /// 钩子**绝不能挂住**：有界读无论 stdin 什么状态，都必须在超时附近返回。
+    ///
+    /// 2026-10-04 事故回归锁：无限读 stdin 把 agent 回合拖死（任务每轮跑满 30 分钟超时、
+    /// 进程 0% CPU 僵死）。这条测试保证「读」这条路不再有无限等待。
+    #[test]
+    fn stdin_read_is_bounded_and_never_blocks_forever() {
+        let t0 = std::time::Instant::now();
+        let _ = read_stdin_bounded(std::time::Duration::from_millis(300));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "有界读必须在超时附近返回，实得 {:?}",
+            t0.elapsed()
+        );
+    }
     use super::*;
 
     /// 建临时 guard 环境（真实目录，canonicalize 可用）：返回 (ws 根, ws, guard)。
