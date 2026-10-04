@@ -260,6 +260,17 @@ pub fn svc_start_verified(timeout: std::time::Duration) -> Result<()> {
             "已发起启动，但 {timeout:?} 内没看到 service 跑起来（多半已有实例占着单实例锁；查 logs/bridge.out）"
         );
     }
+    // 稳定窗口（2026-10-05 审计 #24）：`svc_start` 刚把 `child.id()` 写进 pid 文件，而
+    // `wait_service_up` 读的**正是这个文件** ⇒ 它第一拍就会「看到」服务在跑，哪怕子进程随后
+    // 立刻因抢不到单实例锁 / config 缺失而退出 ⇒ 用户点「启动」看到「成功」、服务却是死的。
+    // 所以再跨一小段窗口确认一次：pid 仍指向**我们的** agent-bridge（`status()` 已含身份
+    // 校验）才算真的 up。
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    if !status().running {
+        anyhow::bail!(
+            "service 起来后立刻退出（pid 文件已失效，或那个 pid 不是 agent-bridge）——多半是单实例锁被占或 config 缺失；查 logs/bridge.out"
+        );
+    }
     Ok(())
 }
 
@@ -1109,6 +1120,27 @@ mod installer_guards {
     /// **已经不存在**的旧 exe（点了没反应，用户只会觉得「装坏了」）。
     ///
     /// 判别力：删掉任一条 ⇒ 立刻红。
+    /// 「启动」必须验证**真的在跑**，不能只信自己刚写下的 pid（2026-10-05 审计 #24）。
+    ///
+    /// 判别力：把稳定窗口那段（`sleep` + 第二次 `status().running`）删掉 ⇒ 这里立刻红，
+    /// 而症状正是「点启动弹成功、服务已死」。
+    #[test]
+    fn svc_start_verified_has_a_stability_window() {
+        let src = include_str!("install.rs");
+        let i = src.find("pub fn svc_start_verified").expect("函数必须存在");
+        let end = src[i..].find("\n}\n").map(|e| i + e).unwrap_or(src.len());
+        let body = &src[i..end];
+        assert!(
+            body.contains("sleep"),
+            "启动验证必须有稳定窗口：pid 文件是它自己刚写的，第一拍必然「看到在跑」"
+        );
+        let after_sleep = body.split("sleep").nth(1).unwrap_or("");
+        assert!(
+            after_sleep.contains("status().running"),
+            "稳定窗口**之后**必须再确认一次 status().running（含身份校验），否则「起完即退」会被判成功"
+        );
+    }
+
     #[test]
     fn installer_cleans_the_legacy_per_user_install() {
         let section = ISS
