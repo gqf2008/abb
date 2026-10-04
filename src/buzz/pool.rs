@@ -490,6 +490,11 @@ impl AgentPool {
         self.agents.len()
     }
 
+    /// 取走某个槽位里的 agent（空闲回收用）。空槽位（在途/启动中）返回 `None`。
+    pub fn take_slot(&mut self, index: usize) -> Option<OwnedAgent> {
+        self.agents.get_mut(index).and_then(|slot| slot.take())
+    }
+
     /// 当前空闲（可立即投递）的 agent 数。
     pub fn idle_count(&self) -> usize {
         self.agents.iter().filter(|s| s.is_some()).count()

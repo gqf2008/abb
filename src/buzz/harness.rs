@@ -214,17 +214,68 @@ enum SpawnOutcome {
     },
 }
 
-/// 每个 bot 允许的 agent 槽位上限（会话级隔离的并发上限）。
+/// 空闲多久就回收一个**额外** agent（0 号槽位是热实例，永不回收）。
 ///
-/// 为什么是 8：每个槽位背后是一个真实的 `buzz-agent` 进程（+ 它的 MCP 子进程），上限是
-/// **内存护栏**而不是语义限制 —— 队列里有多少待跑会话就保底多少槽位（见
-/// `ensure_agent_capacity`），所以正常并发下每个会话都有自己的 agent，互不排队。
-/// 超过上限的会话仍会排队（这是有意的兜底：宁可排队，也不把机器撑爆）。
-const MAX_AGENT_SLOTS: usize = 8;
+/// 为什么按空闲回收、而不是限制并发数（owner 2026-10-04 指出）：会话本来就不常驻 ——
+/// 每个会话的 agent 只在它自己跑回合时活着，跑完就闲置。限制并发数会把「会话互不影响」
+/// 打折（第 9 个会话又得排在别人后面）；**回收闲置进程**才是真正的资源边界：稳态进程数
+/// 就等于「正在跑的会话数」。
+const IDLE_REAP_AFTER: Duration = Duration::from_secs(300);
 
-/// 需求 → 槽位数（纯函数，单测点）：至少 1（空闲时保持一个热 agent），至多 MAX_AGENT_SLOTS。
+/// 回收巡检间隔（主循环 select 里的一路定时器）。
+const REAP_TICK: Duration = Duration::from_secs(60);
+
+/// 需求 → 槽位数（纯函数，单测点）：**不设并发上限** —— 队列里有几个待跑会话就要几个 agent；
+/// 空闲时也保留 1 个热实例，避免每条消息都冷启动。
+///
+/// 资源边界不在这里：① 跑完闲置 IDLE_REAP_AFTER 的额外槽位会被回收（reap_idle_agents）；
+/// ② 起 agent 的速度由既有 spawn 守卫把关（spawn_guard：同 key ≥500ms 间隔 + 连续失败熔断，
+/// v2.23.89），所以「不限并发」不等于「可能瞬间起一堆」。
 fn wanted_slots(pending: usize) -> usize {
-    pending.clamp(1, MAX_AGENT_SLOTS)
+    pending.max(1)
+}
+
+/// 该不该回收这个槽位（纯函数，单测点）。
+///
+/// 0 号槽位是热实例（永不回收，保证下一条消息不必冷启动）；其余槽位只有**空闲**超时才收
+/// —— `idle_for = None` 表示它在途（被借走在跑回合）或正在启动，绝不能动。
+fn should_reap_slot(slot: usize, idle_for: Option<Duration>) -> bool {
+    slot > 0 && idle_for.is_some_and(|d| d >= IDLE_REAP_AFTER)
+}
+
+/// 回收闲置的额外 agent（保留 0 号热实例）。
+///
+/// 回收 = 从池里取走 + 优雅关停：agent 进程随 AcpClient 结束而死，job 句柄关闭连带清掉
+/// 它起的 MCP 孙进程（与崩溃路径同一套收尸语义）。槽位本身保留 —— 索引不变式不能破，
+/// 下次有需求时 ensure_agent_capacity 会把它重新拉起来。
+fn reap_idle_agents(l: &mut Loop) {
+    let now = Instant::now();
+    let mut reaped = 0usize;
+    for idx in 1..l.pool.slot_count() {
+        let idle_for = l
+            .idle_since
+            .get(&idx)
+            .map(|t| now.saturating_duration_since(*t));
+        if !should_reap_slot(idx, idle_for) {
+            continue;
+        }
+        // 空槽位 = 在途/启动中，不动（should_reap_slot 已挡掉在途，这里是防御）。
+        let Some(agent) = l.pool.take_slot(idx) else {
+            continue;
+        };
+        l.idle_since.remove(&idx);
+        reaped += 1;
+        tokio::spawn(async move {
+            let mut agent = agent;
+            agent.acp.shutdown().await;
+        });
+    }
+    if reaped > 0 {
+        crate::log!(
+            "[acp] 空闲回收：关停 {reaped} 个闲置 agent（保留热实例，槽位总数 {}）",
+            l.pool.slot_count()
+        );
+    }
 }
 
 /// 频道登记表（桥线程与主循环共用；ctx.channels 提示元数据同锁更新）。
@@ -656,6 +707,9 @@ struct Loop {
     /// 正在启动的槽位号（每个空槽位最多一个 attempt 在跑 —— 单槽位时代的 `bool` 在多槽位下
     /// 会把并发启动压成串行，等于没隔离）。
     spawning: std::collections::BTreeSet<usize>,
+    /// 各槽位「闲置起点」：agent 回到池子时记，被借走时删。缺项 = 在途/启动中。
+    /// 空闲回收（reap_idle_agents）据此判断谁能收。
+    idle_since: std::collections::HashMap<usize, Instant>,
     /// 日志活跃度。
     last_activity: Instant,
     /// 收到过取消请求、但结局尚未到达的频道（#309）：取消作用于**这一轮**，
@@ -680,6 +734,7 @@ impl Loop {
             removed_channels: HashSet::new(),
             crash_backoff: 0,
             spawning: std::collections::BTreeSet::new(),
+            idle_since: std::collections::HashMap::new(),
             last_activity: Instant::now(),
             cancel_requested: HashSet::new(),
         };
@@ -703,6 +758,8 @@ pub async fn run_loop(handle: Arc<BuzzHandle>) {
         handle.cfg.command
     );
 
+    // 空闲回收节拍（会话级隔离的资源边界：回收闲置 agent，而不是限制并发数）。
+    let mut reap_tick = tokio::time::interval(REAP_TICK);
     loop {
         // 事件收集：select 内借用 pool 的 rx/join_set，出块即归还，处理器再拿
         // &mut pool（上游同款 dance）。
@@ -711,6 +768,7 @@ pub async fn run_loop(handle: Arc<BuzzHandle>) {
             tokio::select! {
                 biased;
                 _ = handle.stop.cancelled() => break,
+                _ = reap_tick.tick() => Some(Evt::Reap),
                 cmd = cmd_rx.recv() => {
                     // None = 全部句柄已 drop（本循环持 Arc，正常不会发生）。
                     cmd.map(Evt::Cmd)
@@ -730,6 +788,7 @@ pub async fn run_loop(handle: Arc<BuzzHandle>) {
             Evt::Panic(join_error) => recover_panicked_agent(&mut l, &handle, join_error),
             Evt::SteerAck(ack) => handle_steer_ack(&mut l, ack),
             Evt::Life(outcome) => handle_spawn_outcome(&mut l, &handle, outcome),
+            Evt::Reap => reap_idle_agents(&mut l),
         }
         dispatch_pending(&mut l);
     }
@@ -746,6 +805,8 @@ enum Evt {
     Panic(Result<(), tokio::task::JoinError>),
     SteerAck(SteerAckEvent),
     Life(SpawnOutcome),
+    /// 回收巡检节拍：把闲置的额外 agent 收掉（保留 0 号热实例）。
+    Reap,
 }
 
 // ── Cmd 处理 ─────────────────────────────────────────────────────────────────
@@ -891,6 +952,7 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome
                 },
                 Ordering::Relaxed,
             );
+            l.idle_since.insert(agent.index, Instant::now());
             l.pool.return_agent(agent);
             // 起来了就清掉旧失败原因：否则用户会拿着上一次的旧原因排查现在的故障。
             handle.set_last_start_error(None);
@@ -1093,6 +1155,8 @@ fn dispatch_one(l: &mut Loop) -> bool {
         }
     };
     tracing::debug!(agent = agent.index, %channel_id, affinity_hit, "agent_claimed");
+    // 被借走 = 不再是闲置：回收巡检不得动它。
+    l.idle_since.remove(&agent.index);
 
     // Queue 模式：克隆进 TaskMeta 供 panic 恢复重拉。
     let recoverable_batch = match l.ctx.dedup_mode {
@@ -1634,6 +1698,8 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
 }
 
 fn return_agent(l: &mut Loop, agent: OwnedAgent, outcome_label: &str, log_line: &str) {
+    // 回到池子 = 开始计闲置时间（空闲回收据此收掉长期不用的额外 agent）。
+    l.idle_since.insert(agent.index, Instant::now());
     tracing::debug!(agent = agent.index, outcome = outcome_label, "{log_line}");
     l.pool.return_agent(agent);
 }
@@ -2481,9 +2547,12 @@ mod model_not_found_tests {
 mod isolation_capacity_tests {
     use super::*;
 
-    /// 会话级隔离的容量策略：至少 1（热 agent），随待跑会话数增长，且有内存上限。
+    /// 会话级隔离的容量策略：至少 1（热实例），**不设并发上限** —— 有几个待跑会话就几个 agent。
+    ///
+    /// 资源边界改由「空闲回收」表达（见下一条测试）：会话不常驻，跑完闲置就收，
+    /// 稳态进程数 = 正在跑的会话数。
     #[test]
-    fn wanted_slots_grows_with_pending_and_is_capped() {
+    fn wanted_slots_is_elastic_with_one_warm() {
         assert_eq!(
             wanted_slots(0),
             1,
@@ -2495,11 +2564,24 @@ mod isolation_capacity_tests {
             3,
             "三个待跑会话就该有三个 agent（互不排队）"
         );
-        assert_eq!(wanted_slots(MAX_AGENT_SLOTS), MAX_AGENT_SLOTS);
-        assert_eq!(
-            wanted_slots(MAX_AGENT_SLOTS + 10),
-            MAX_AGENT_SLOTS,
-            "上限是内存护栏：宁可排队，也不把机器撑爆"
+        assert_eq!(wanted_slots(9), 9, "第 9 个会话不该排队：不限并发");
+        assert_eq!(wanted_slots(50), 50, "没有任何人为上限");
+    }
+
+    /// 空闲回收策略：0 号热实例永不回收；其余只有**空闲超时**才收；在途（None）绝不动。
+    #[test]
+    fn idle_reap_only_touches_stale_extra_slots() {
+        let stale = Some(IDLE_REAP_AFTER + Duration::from_secs(1));
+        let fresh = Some(Duration::from_secs(1));
+        assert!(!should_reap_slot(0, stale), "0 号是热实例，永不回收");
+        assert!(
+            !should_reap_slot(3, fresh),
+            "刚跑完的额外槽位不收（还要接着服务它的会话）"
         );
+        assert!(
+            !should_reap_slot(3, None),
+            "在途/启动中（无闲置起点）绝不动"
+        );
+        assert!(should_reap_slot(3, stale), "闲置超时的额外槽位该收");
     }
 }

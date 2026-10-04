@@ -93,6 +93,7 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 
 | acp.rs | ABB 扩展字段（追加） | **探针可移植化（2026-10-04，v2.23.97）**：probe_real_mock_agent_roundtrip 原硬编码 macOS 解释器路径（/opt/homebrew/bin/python3）与 /tmp 记录文件，在 Windows 上必然失败。改为 crate::deps::find_in_path("python3") 退化到 python + 系统临时目录。动机：会话级隔离（v2.23.96）改了 dispatch_pending 语义，而这条（及同批 25 条）mock-agent 测试是唯一端到端验证手段，必须能在本机跑起来做回归验证。 |
+| harness.rs / pool.rs | ABB 扩展字段（追加） | **弹性池 + 空闲回收（2026-10-04，v2.23.98）**：owner 追问「为什么要并发限制」，遂取消 MAX_AGENT_SLOTS 并发上限 —— wanted_slots(pending) = max(pending, 1)（有几个待跑会话就几个 agent，空闲留 1 个热实例）。资源边界改为回收闲置：主循环 select 加 60s 定时器（Evt::Reap）→ reap_idle_agents 回收**闲置超过 5 分钟**的额外槽位（0 号热实例永不回收；在途/启动中不动），回收 = take_slot + AcpClient 优雅关停（job 句柄关闭连带清 MCP 孙进程），槽位保留以维持索引不变式，按需重新拉起 ⇒ 稳态进程数 = 正在跑的会话数。Loop 新增 idle_since 记账（借走删/归还记），策略抽成纯函数 should_reap_slot 并配单测；AgentPool 新增 take_slot。与既有 spawn 守卫（≥500ms 间隔 + 熔断）配合，使「不限并发」不会变成「瞬间起一堆」。 |
 ### 未迁决策登记（2026-09-30，区间 `c3132c3` → `2664d1431`，**未整体重定基线**）
 
 区间内触及 `crates/buzz-acp/` 的提交 23 个（+12147/−1540）。上面三条按 commit 增量挑入，其余 20 个按下表**不迁**（给出等价能力与重新评估触发条件，避免下次重复分析）：
