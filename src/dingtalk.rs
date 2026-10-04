@@ -1049,13 +1049,13 @@ async fn run_conn(
         tokio::select! {
             _ = stop.cancelled() => {
                 crate::log!("[dingtalk] 收到停止信号，关闭连接");
-                let _ = sink.send(Message::Close(None)).await;
+                let _ = send_with_timeout(&mut sink, Message::Close(None)).await;
                 return Ok(());
             }
             _ = keepalive.tick() => {
                 // 只发 Ping 不算「收到帧」：last_rx 仍只由入站刷新，
                 // 半开连接发 Ping 无 Pong → 看门狗照常兜底（不把假活当在线）。
-                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if send_with_timeout(&mut sink, Message::Ping(Vec::new().into())).await.is_err() {
                     return Err(anyhow!("keepalive 发 Ping 失败，连接已不可写"));
                 }
             }
@@ -1127,7 +1127,7 @@ async fn run_conn(
                             "EVENT" => {
                                 let ack =
                                     ack_json(mid, r#"{"status":"SUCCESS","message":"success"}"#);
-                                let _ = sink.send(Message::Text(ack.into())).await;
+                                let _ = send_with_timeout(&mut sink, Message::Text(ack.into())).await;
                             }
                             _ => {
                                 crate::log!(
@@ -1138,7 +1138,7 @@ async fn run_conn(
                     }
                     Some(Ok(Message::Binary(_))) => { /* 协议只推文本帧 */ }
                     Some(Ok(Message::Ping(p))) => {
-                        let _ = sink.send(Message::Pong(p)).await;
+                        let _ = send_with_timeout(&mut sink, Message::Pong(p)).await;
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Frame(_))) => {}
@@ -1712,5 +1712,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("限流"), "{err}");
+    }
+}
+
+/// 发送超时包装（2026-10-05 审计 #18，与 `ws.rs` 的 #179 修法同款）。
+///
+/// 为什么必须有：网络半死（代理/VPN TUN 抖动、睡眠唤醒）时 `sink.send()` 可能**永久挂起** ——
+/// 而 `tokio::select!` 已进入分支体，180s 半开看门狗分支不再被 poll ⇒ 永不重连 ⇒ bot 常显
+/// 「在线」却收不到任何消息（飞书侧 #179 已实锤修过，钉钉漏改）。超时 ⇒ Err ⇒ 外层重连。
+async fn send_with_timeout(
+    sink: &mut (impl futures_util::Sink<Message> + Unpin),
+    msg: Message,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), sink.send(msg))
+        .await
+        .context("发送超时（网络卡死）")?
+        .map_err(|_| anyhow::anyhow!("发送失败"))?;
+    Ok(())
+}
+#[cfg(test)]
+mod send_timeout_guard_tests {
+    /// 每个 `sink.send` 外层都必须有超时（审计 #18）。
+    ///
+    /// 判别力：把 `let _ = send_with_timeout(&mut sink, Message::Close(None)).await;` 改回裸
+    /// `sink.send(...)` ⇒ 对应断言红。
+    #[test]
+    fn dingtalk_sends_are_wrapped_with_timeout() {
+        let src = include_str!("dingtalk.rs");
+        assert!(
+            src.contains("async fn send_with_timeout("),
+            "必须有超时封装"
+        );
+        for expect in [
+            "send_with_timeout(&mut sink, Message::Close(None)).await",
+            "send_with_timeout(&mut sink, Message::Ping(Vec::new().into())).await",
+            "send_with_timeout(&mut sink, Message::Text(ack.into())).await;",
+            "send_with_timeout(&mut sink, Message::Pong(p)).await;",
+        ] {
+            assert!(src.contains(expect), "发送必须走超时封装：{expect}");
+        }
     }
 }
