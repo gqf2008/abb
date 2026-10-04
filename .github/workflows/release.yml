@@ -87,9 +87,8 @@ jobs:
           sed -i '' "s|<string>2\.[0-9]*\.[0-9]*</string>|<string>$VERSION</string>|g" app-assets/Info.plist
           mkdir -p ABB.app/Contents/MacOS ABB.app/Contents/Resources
           cp target/aarch64-apple-darwin/release/agent-bridge ABB.app/Contents/MacOS/
-          # #129 锁屏特权助手：必须与主程序同目录（lockctl install 从 current_exe 同目录
-          # 取 abb-helper），独立签名（嵌套二进制不随主程序签名自动覆盖）
-          cp target/aarch64-apple-darwin/release/abb-helper ABB.app/Contents/MacOS/
+          # 2026-10-04 去提权：abb-helper（#129 锁屏特权助手）已随 v2.23.95 删除 ——
+          # 这里不再拷贝它（旧写法是在这一步 cp 一个已不存在的产物，CI 直接失败）。
           # #200 fork buzz-agent 同目录同规约（buzz_agent_exe 空时运行时先查同目录）——
           # 逐个 hardened runtime + timestamp 签名后随包公证
           cp crates/buzz-agent/target/aarch64-apple-darwin/release/buzz-agent ABB.app/Contents/MacOS/
@@ -130,7 +129,8 @@ jobs:
           # 主可执行与 bundle 签名不一，双层带最稳）。
           ENT="app-assets/abb.entitlements"
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
-          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-helper
+          # （abb-helper 已删，不再签；留着会让 v2.23.95+ 的 macOS 作业必然失败——
+          #   2026-10-04 实测：Assemble ABB.app and sign 步骤找不到该文件，release 作业被跳过）
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
           for tool in rg jq uv gh wassette; do
             sign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
