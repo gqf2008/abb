@@ -1096,7 +1096,7 @@ async fn run_conn(
                                     .and_then(|v| v["opaque"].as_str().map(|s| s.to_string()))
                                     .unwrap_or_default();
                                 let ack = ack_json(mid, &json!({"opaque": opaque}).to_string());
-                                sink.send(Message::Text(ack.into()))
+                                send_with_timeout(&mut sink, Message::Text(ack.into()))
                                     .await
                                     .context("回 ping ack 失败")?;
                             }
@@ -1111,7 +1111,7 @@ async fn run_conn(
                             "CALLBACK" => {
                                 // 先 ack（fire-forget 消息也按协议回，防服务端诊断误判），再异步处理
                                 let ack = ack_json(mid, r#"{"response": null}"#);
-                                sink.send(Message::Text(ack.into()))
+                                send_with_timeout(&mut sink, Message::Text(ack.into()))
                                     .await
                                     .context("回 callback ack 失败")?;
                                 if topic == "/v1.0/im/bot/messages/get" {
@@ -1743,10 +1743,19 @@ mod send_timeout_guard_tests {
             src.contains("async fn send_with_timeout("),
             "必须有超时封装"
         );
+        // 收紧：除封装自身外**不得**再有裸 sink.send（半开连接会冻死 select ⇒ 永不重连）。
+        // 用 concat! 拆开字面量：否则守卫源码里的这串字会命中它自己（2026-10-05 踩过）。
+        let bare = concat!("sink.send(Message", "::");
+        let offenders: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains(bare))
+            .filter(|l| !l.contains("send_with_timeout(&mut sink, Message::"))
+            .collect();
+        assert!(offenders.is_empty(), "不得再有裸 sink.send：{offenders:?}");
         for expect in [
             "send_with_timeout(&mut sink, Message::Close(None)).await",
             "send_with_timeout(&mut sink, Message::Ping(Vec::new().into())).await",
-            "send_with_timeout(&mut sink, Message::Text(ack.into())).await;",
+            "send_with_timeout(&mut sink, Message::Text(ack.into()))",
             "send_with_timeout(&mut sink, Message::Pong(p)).await;",
         ] {
             assert!(src.contains(expect), "发送必须走超时封装：{expect}");
