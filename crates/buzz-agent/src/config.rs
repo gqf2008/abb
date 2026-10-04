@@ -390,6 +390,15 @@ pub const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_TOOL_RESULT_TEXT_BYTES: usize = 50 * 1024;
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 64;
 
+/// 同一个回合内，同一条工具调用（名字 + 参数）允许重复的次数。
+///
+/// 达到即判死循环、中止回合（`AgentError::LoopGuard`）。取 5 而不是更小，是为了
+/// 不误伤「同一命令本来就要多跑几次」的正常工作（分页读取、逐项确认等）；
+/// 真死循环（同一条命令一模一样地重复）几乎必然远超 5 次。
+///
+/// ABB 扩展（2026-10-04 事故：hook 挂死 ⇒ agent 无限重问模型 ⇒ 任务每轮跑满预算超时）。
+pub const REPEATED_CALL_LIMIT: u32 = 5;
+
 pub const HANDOFF_MAX_OUTPUT_TOKENS: u32 = 8192;
 
 pub const HANDOFF_ORIGINAL_TASK_MAX_BYTES: usize = 16 * 1024;
