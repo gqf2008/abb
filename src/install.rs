@@ -241,7 +241,9 @@ pub fn svc_start() -> Result<()> {
         .spawn()
         .context("启动 service 子进程失败")?;
     let pid = child.id();
-    std::fs::write(pid_file(), pid.to_string()).ok();
+    // 原子写（2026-10-05 审计 #25b）：唯一 tmp + rename 重试。裸 `fs::write` 是先截断再写，
+    // 并发的 `status()`／看门狗可能读到**空文件或半截 pid**（判成 0，或判成别人的号）。
+    let _ = crate::atomic_write_text(&pid_file(), &pid.to_string());
     crate::log!("[watchdog] 已启动 service pid={pid}");
     // 起个线程收割子进程：wait() 阻塞到退出并回收，避免僵尸进程累积
     // （GUI 是 service 的父进程，不 wait 就会留 <defunct>，导致 pid_alive 误判）。
@@ -429,7 +431,9 @@ pub fn svc_stop_authorized() -> Result<()> {
 /// 靠这个文件判活（否则会误判「没在跑」并反复 spawn 出抢锁即退的短命进程）。
 pub fn write_own_pid_file() {
     let _ = std::fs::create_dir_all(logs_dir());
-    let _ = std::fs::write(pid_file(), std::process::id().to_string());
+    // 同样走原子写（审计 #25b）：service 自写 pid 与托盘写子进程 pid 是两处写者，
+    // 任何一处非原子都会让并发读者看到半截内容。
+    let _ = crate::atomic_write_text(&pid_file(), &std::process::id().to_string());
 }
 
 /// 有界等待 pid 消失（terminate 之后的**确认**）。
@@ -1269,6 +1273,26 @@ mod pid_clear_guard_tests {
         assert!(
             !crate::install::should_clear_pid_file(Some(5678), 1234),
             "别的 pid（新实例）⇒ 绝不能删，否则托盘显示已停止而服务在跑"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pid_write_atomic_guard_tests {
+    /// pid 文件必须原子写（唯一 tmp + rename 重试），不得再用裸 `fs::write`。
+    ///
+    /// 判别力（2026-10-05 审计 #25b）：把任一处改回裸写 ⇒ 第一条断言红；删掉原子调用 ⇒ 第二条红。
+    #[test]
+    fn pid_file_is_written_atomically() {
+        let needle = concat!("fs::write(pid", "_file()");
+        let src = include_str!("install.rs");
+        assert!(
+            !src.contains(needle),
+            "pid 文件不得用裸 fs::write（先截断再写 ⇒ 并发读到空/半截 pid）"
+        );
+        assert!(
+            src.contains("crate::atomic_write_text(&pid_file()"),
+            "pid 文件必须走共享原子写"
         );
     }
 }
