@@ -74,7 +74,7 @@
 24. ✅ 已修（main 87d13fb）svc_start_verified 验证的是自己刚写的 pid（子进程随后才因抢锁 exit(0) 或 config exit(1)，点启动弹成功而服务已死）
    位置：src/install.rs:207 / 220 / 384
    修法：注入「立即 exit(1)」的假 service 断言返回 Err；或要求跨过稳定窗口后仍存活才算 up
-25. pid 文件写者不唯一且非原子 + svc_stop_impl 无条件删 pid 与并发 start 竞态（pid 指向死进程 / 删掉新实例的 pid）
+25. ✅ 已修（main 2c30d47 停止只清自己停掉的 pid + 00af32d 两处写入改原子写） pid 文件写者不唯一且非原子 + svc_stop_impl 无条件删 pid 与并发 start 竞态（pid 指向死进程 / 删掉新实例的 pid）
    位置：src/install.rs:208 / 271 / 361
    修法：pid 只允许 service 自写 + 原子 tmp+rename；读写纳入同一把锁
 
