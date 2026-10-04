@@ -48,6 +48,7 @@
    位置：src/deps.rs:202-234
    修法：抽 parse_reg_path(&[u8])，喂 GBK 字节断言条目保留
 16. bridge.out / gui.out 永不轮转（实机 17.5MB / 78275 行，同一文件半个月）
+   （2026-10-05 两次尝试的坑：helper 必须放 crate 根；且本仓 main.rs 的日志守卫测试在**嵌套** mod 里，use super::* 看不到根级项，要写 crate::xxx。别再把插入点选在别处 fn 的 #[test] 前——会把它的属性吞掉。）
    修法：仿 task_store.rs:237-259 的轮转单测，与任务日志共用上限常量
 17. 软链失败被 let _ = 吞掉还谎报「已补链 N 个」（普通用户 + 未开开发者模式则技能永久缺失）
    位置：src/larkskills.rs:46-53
