@@ -56,13 +56,13 @@
 18. ✅ 已修（main d92dcb5 第一批 + f1bab12 收尾） 钉钉 Stream 的 sink.send 无超时（半开连接冻死 select，180s 看门狗永不触发）
    位置：src/dingtalk.rs:1052/1058/1099/1114/1130/1141
    修法：参照 src/ws.rs:93-104 包 tokio::time::timeout；源码守卫断言每个 sink.send 外层有超时
-19. 微信游标不持久化（每次重启从空游标开始，升级窗口内消息大概率丢）
+19. ✅ 已修（main 169b725）微信游标不持久化（每次重启从空游标开始，升级窗口内消息大概率丢）
    位置：src/service.rs:1259 / 1271 / 1280
    修法：游标落盘 workspaces/<bot>/wx_cursor.json，mock 断言重启后首个请求体游标等于上次保存值
 20. ✅ 已修（main c4c2a42）微信把 2xx/5xx + 空 body 当成功空轮询（consec_timeouts 被复位、假绿不自愈）
    位置：src/wechat.rs:553-555
    修法：mock 返回空体，断言 get_updates 返回 Err 而非 Ok
-21. 微信 outbox 两个写方各持内存快照（Router::fail_text 新建 OutboxStore 与 Bridge.outbox 互相整文件覆盖，积压项静默丢）
+21. ✅ 已修（main a0e8303）微信 outbox 两个写方各持内存快照（Router::fail_text 新建 OutboxStore 与 Bridge.outbox 互相整文件覆盖，积压项静默丢）
    位置：src/outbox.rs:90-135 / src/deliver.rs:571-574 / src/bridge/mod.rs:439
    修法：单测两个同路径 store 各 add 一条，reload 断言两条都在；或源码守卫禁止 deliver.rs 再 new OutboxStore
 22. ✅ 已修（main b4c6415）config.json 固定 tmp 名 + 只有进程内锁（GUI 与 service 并发写互踩，设置/授权静默回退）
@@ -88,7 +88,7 @@
 
 ## 旁证待查
 
-26. **提权传染链**（2026-10-05 实测）：应用自己的日志每 5 分钟一条
+26. 🟡 部分已修（main 929f206 启动即告警）；**待办：主动降尊重启**——提权传染链（2026-10-05 实测）：应用自己的日志每 5 分钟一条
     `[spawn] 本进程正以管理员权限运行：agent「…\buzz-agent.exe」会继承该权限`；而同日诊断显示
     诊断 shell `elevated=False`、**无任何 ABB 计划任务**、Run 键指向 `C:\Program Files\ABB\agent-bridge.exe`（普通）
     ⇒ 最可能是**某一次托盘被从提权上下文启动**（早期安装器 `[Run]` 或人工/工具启动），此后服务与 agent 全部
