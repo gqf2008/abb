@@ -696,10 +696,35 @@ fn main() {
         crate::log!(
             "[gui] ⚠ 当前 ABB 以管理员权限运行：服务与 agent 会继承该权限（与「全部普通用户运行」模型相悖）；退出后用普通身份重新启动即可"
         );
+        // #26 安全降尊重启（定稿见 docs/windows-audit-2026-10-05.md）：
+        // 用 Explorer 拉起普通身份实例（Explorer 令牌是登录用户 ⇒ 天然降权），
+        // **只在收到握手标记后**才退出；超时未见确认 ⇒ 继续运行。
+        // 宁可继续以管理员跑，也绝不留下无人看守的后台（那正是要消灭的失败形态）。
+        if let Ok(exe) = crate::platform::current_exe() {
+            let requested_at = std::time::SystemTime::now();
+            let spawned = crate::spawn::command("explorer")
+                .arg(&exe)
+                .arg("--de-elevated-handoff")
+                .spawn()
+                .is_ok();
+            if spawned && wait_handoff_marker(requested_at, std::time::Duration::from_secs(10)) {
+                crate::log!("[gui] 已确认普通身份实例接管，本（管理员）实例退出");
+                std::process::exit(0);
+            }
+            crate::log!(
+                "[gui] 未确认降权实例接管：本实例继续运行（宁可不降权，也不留下无人看守的后台）"
+            );
+        }
     }
     if args.iter().any(|a| a == "--diag-tray") {
         diag_tray_image();
         return;
+    }
+    // ── #26 降权握手（新实例侧）──────────────────────────────────────────────
+    // 拿到 gui 锁后写标记：证明有一个普通身份实例真的活着、且在管事。提权实例据此才退出。
+    if args.iter().any(|a| a == "--de-elevated-handoff") {
+        write_handoff_marker();
+        crate::log!("[gui] 已写降权握手标记（本实例为普通身份，接管托盘看护）");
     }
     // 升级重启（安装器 [Run] 段拉起本进程，带 --wait-lock）要容忍旧实例还在收尾：
     // 见 single_instance::acquire_with_retry 的注释。用户手点第二份图标仍立刻退出。
@@ -3118,6 +3143,63 @@ mod elevation_notice_guard_tests {
         assert!(
             src.contains("以管理员权限运行：服务与 agent 会继承该权限"),
             "必须给出显式告警与可操作指令"
+        );
+    }
+}
+
+/// 降权握手标记路径（`logs/deelev-handoff`，内容 = 写下它的实例 pid）。
+fn handoff_marker_path() -> std::path::PathBuf {
+    crate::bridge_dir().join("logs").join("deelev-handoff")
+}
+
+/// 写下握手标记（普通身份实例拿到 gui 锁后调用）。失败只记日志，不影响运行。
+fn write_handoff_marker() {
+    let p = handoff_marker_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Err(e) = crate::atomic_write_text(&p, &std::process::id().to_string()) {
+        crate::log!("[gui] 写降权握手标记失败（不影响运行）：{e:#}");
+    }
+}
+
+/// 等待『在我们发起降权之后』写下的握手标记（最长 `timeout`）。
+///
+/// 为什么按 mtime 判：标记由**另一个进程**写，只有它晚于我们发起降权才算数 —— 陈旧标记
+/// 不能当作已接管的证据，否则提权实例会提前退出 ⇒ 没人看守。
+fn wait_handoff_marker(since: std::time::SystemTime, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(meta) = std::fs::metadata(handoff_marker_path()) {
+            if meta.modified().map(|t| t >= since).unwrap_or(false) {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
+#[cfg(test)]
+mod deelev_handoff_guard_tests {
+    /// 降权必须『先确认、后退出』——不得在未确认时自行退出（#26）。
+    ///
+    /// 判别力：把 `if spawned && wait_handoff_marker(...)` 改成 `if spawned` ⇒ 第一条断言红，
+    /// 而症状正是『弹一下就什么都没有了』。
+    #[test]
+    fn deelevation_exits_only_after_handoff_confirmation() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("if spawned && wait_handoff_marker(requested_at"),
+            "必须先确认握手再退出（未确认就退出 = 留下无人看守的后台）"
+        );
+        assert!(
+            src.contains("宁可不降权，也不留下无人看守的后台"),
+            "未确认时必须继续运行并留痕"
+        );
+        assert!(
+            src.contains("write_handoff_marker()"),
+            "普通身份实例必须写握手标记"
         );
     }
 }
