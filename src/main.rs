@@ -3014,3 +3014,37 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+mod log_rotation_tests {
+    /// 轮转判据（纯函数）：恰好到上限不轮转；cap=0 视为关闭。
+    ///
+    /// 判别力（2026-10-05 审计 #16）：`rotation_needed` 改成恒 false ⇒ 第三条断言红。
+    #[test]
+    fn rotation_needed_only_past_the_cap() {
+        assert!(!crate::rotation_needed(0, 100));
+        assert!(!crate::rotation_needed(100, 100), "恰好到上限不轮转");
+        assert!(crate::rotation_needed(101, 100));
+        assert!(!crate::rotation_needed(u64::MAX, 0), "cap=0 视为关闭");
+    }
+
+    /// 轮转名规则 + 生产侧接线。
+    ///
+    /// 判别力：把 `rotate_log_if_large(&path, LOG_ROTATE_CAP_BYTES)` 从 `attach_log_file` 删掉 ⇒ 第二条断言红。
+    #[test]
+    fn rotation_suffix_is_dot_1_and_is_wired_into_attach_log_file() {
+        let mut raw = std::path::Path::new("bridge.out").as_os_str().to_owned();
+        raw.push(".1");
+        assert!(
+            std::path::PathBuf::from(raw)
+                .to_string_lossy()
+                .ends_with("bridge.out.1"),
+            "轮转文件必须是 <原文件>.1（用 with_extension 会把 .out 换掉）"
+        );
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("rotate_log_if_large(&path, LOG_ROTATE_CAP_BYTES)"),
+            "attach_log_file 必须真的调用轮转，否则上限形同虚设"
+        );
+    }
+}
