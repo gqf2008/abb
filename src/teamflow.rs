@@ -1,3 +1,9 @@
+// Rust 1.99 的 clippy 新增 `double_must_use`：async_trait 生成 `Pin<Box<dyn Future>>` 时与
+// `#[must_use]` 叠加，会对本模块 15 个 trait 各报一次（本机 clippy 0.1.98 不报，CI 的 stable
+// 已是 1.99 ⇒ main 上 CI 红）。这是宏生成形态、不是我们能改的代码，故本模块整体 allow；
+// 等 async_trait 上游适配后可移除。
+#![allow(clippy::double_must_use)]
+
 //! 一键创建团队·聊天入口（#124 P1 后端）——触发词识别 + 会话态 + 预览/清单渲染。
 //!
 //! 定位：用户在聊天里发创建意图 → 方案预览 → 确认/修改/取消 → 建群开聊。
