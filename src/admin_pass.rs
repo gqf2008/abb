@@ -198,6 +198,23 @@ mod tests {
         );
     }
 
+    /// 「取消」必须真的取消：管理密码确认框得接 `canceled` 回调。
+    ///
+    /// 判别力：v2.23.88 只接了 `on_confirmed`（Slint 的取消按钮不会自己关窗）⇒ 点「取消」
+    /// 没有任何反应，窗不关、待执行的服务动作还挂着（owner 2026-10-04 实报）。
+    #[test]
+    fn admin_dialog_cancel_is_wired() {
+        let ui = include_str!("ui.rs");
+        assert!(
+            ui.contains("svc_pw.on_canceled"),
+            "管理密码确认框必须接 canceled：否则点「取消」不关窗、也不丢弃待执行动作"
+        );
+        assert!(
+            ui.contains("[gui] 服务动作已取消（未执行）"),
+            "取消要留痕（谁取消了哪个动作，日志里应能查到）"
+        );
+    }
+
     #[test]
     fn malformed_records_are_rejected_without_panicking() {
         for bad in [

@@ -3186,6 +3186,20 @@ pub fn run_gui() -> Result<()> {
             }
             let _ = tx.send(cmd);
         });
+        // 取消 = 丢弃待执行的服务动作 + 关窗。
+        //
+        // 2026-10-04 修（owner 问「那个取消按钮的作用是什么」）：此前**只接了 on_confirmed**，
+        // 而 Slint 的取消按钮只 `root.canceled()`、不会自己关窗 ⇒ 点「取消」没有任何反应：
+        // 窗不关、待动作还挂着。这里补齐，与 vb_confirm / team_action 的取消同一套语义。
+        let dlg = svc_pw.as_weak();
+        let pending = svc_pw_pending.clone();
+        svc_pw.on_canceled(move || {
+            pending.borrow_mut().take();
+            crate::log!("[gui] 服务动作已取消（未执行）");
+            if let Some(d) = dlg.upgrade() {
+                let _ = d.hide();
+            }
+        });
     }
 
     // ── 托盘回调 ──
