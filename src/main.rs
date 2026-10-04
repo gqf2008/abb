@@ -642,7 +642,19 @@ fn main() {
     let _gui_guard = match gui_lock {
         Ok(g) => g,
         Err(e) => {
+            // 2026-10-05 owner 实报「点了升级然后本机上啥也没有了」。
+            //
+            // 旧行为：安装器 `[Run]` 带 `--wait-lock` 拉起新实例，等不到 gui 锁就
+            // `exit(0)` —— 于是升级后可能**既没有托盘、也没有服务**（托盘是 service 的
+            // 看门狗），四个 bot 全部掉线，用户在屏幕上只能看到「啥也没有」。
+            //
+            // 结构性保证：等不到锁**也绝不留下没人管的频道**。升级路径下改为接管
+            // service 的看护（无 GUI 的兜底看门狗，有界 10 分钟），托盘缺席与频道掉线
+            // 从此彻底解耦。
             crate::log!("{e:#}");
+            if args.iter().any(|a| a == "--wait-lock") {
+                supervise_service_headless(std::time::Duration::from_secs(600));
+            }
             std::process::exit(0);
         }
     };
@@ -655,6 +667,86 @@ fn main() {
     if let Err(e) = ui::run_gui() {
         crate::log!("GUI 启动失败: {e:#}");
         std::process::exit(1);
+    }
+}
+
+/// 拿不到 gui 锁时的兜底：**只保证 service（频道）活着**，没有 GUI。
+///
+/// 为什么必须有它：托盘是 service 的看门狗，而升级路径（安装器 `[Run]` + `--wait-lock`）
+/// 在等不到锁时会整进程退出 —— 2026-10-05 的真实事故就是「升级后托盘没回来、服务也没人
+/// 拉」，四个 bot 全掉线、用户只看到「啥也没有」。把「托盘缺席」与「频道掉线」解耦：
+/// 这个兜底在 `window` 内每 5 秒检查一次，service 不在就补拉（service 自己有单实例锁，
+/// 重复调用会被挡回去，万无一失）。
+///
+/// 有界（默认 10 分钟）是刻意的：它只是**升级空窗期的桥**，不是第二个常驻守护进程；
+/// 到期即退出，把常态交回托盘（登录时 `Run` 键也会把托盘带回来）。
+fn supervise_service_headless(window: std::time::Duration) {
+    // 用户意图优先：如果服务意图是「停」（用户点过停止、或本来就没开），兜底**不许**把它拉起来。
+    // 2026-10-05 审计发现：只看 status().running 的兜底会把用户明确停掉的服务每 5 秒复活一次，
+    // 等于替用户改主意，而那时又没有托盘 UI 提示他为什么。
+    if !crate::install::is_desired() {
+        crate::log!("[gui] 服务意图为「停」：兜底看护不接管（不替用户改主意）");
+        return;
+    }
+    let deadline = std::time::Instant::now() + window;
+    crate::log!(
+        "[gui] 托盘未启动：接管 service 看护（无 GUI 兜底，最长 {}s，保证频道不断）",
+        window.as_secs()
+    );
+    loop {
+        ensure_service_running_headless();
+        if std::time::Instant::now() >= deadline {
+            crate::log!("[gui] 无 GUI 兜底看护到期退出；托盘应由登录自启或手动启动接管");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+/// 确保 `--service` 在跑（已在跑则不动）。失败只记日志，不 panic、不阻塞调用方。
+fn ensure_service_running_headless() {
+    if !crate::install::is_desired() || crate::install::status().running {
+        return;
+    }
+    let exe = match crate::platform::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::log!("[gui] 兜底拉 service 失败（取不到自身路径）：{e:#}");
+            return;
+        }
+    };
+    // 日志必须接到 logs/bridge.out —— **不能用 Stdio::null**：Windows 上 NUL 是「有效句柄」，
+    // attach_log_file 的判据（非空且非 INVALID_HANDLE_VALUE）会判为可用而直接 return，
+    // 于是 service 与 tracing 的日志全部蒸发，偏偏升级空窗是最需要日志的时刻（2026-10-05 审计）。
+    let logs = crate::bridge_dir().join("logs");
+    std::fs::create_dir_all(&logs).ok();
+    let out = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join("bridge.out"))
+    {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log!("[gui] 兜底拉 service 失败（打不开 bridge.out）：{e:#}");
+            return;
+        }
+    };
+    let out_err = match out.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log!("[gui] 兜底拉 service 失败（克隆日志句柄）：{e:#}");
+            return;
+        }
+    };
+    match std::process::Command::new(exe)
+        .arg("--service")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(out_err))
+        .spawn()
+    {
+        Ok(c) => crate::log!("[gui] 已补拉 service pid={}（托盘缺席兜底）", c.id()),
+        Err(e) => crate::log!("[gui] 补拉 service 失败：{e:#}"),
     }
 }
 
@@ -2479,6 +2571,63 @@ mod tests {
         describe_trigger, job_cli_to_task_args, parse_task_to, parse_task_to_target,
         read_task_logs, session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
     };
+
+    /// 升级路径拿不到 gui 锁时，**不允许留下没人管的频道**。
+    ///
+    /// 2026-10-05 owner 实报「点了升级然后本机上啥也没有了」：安装器 `[Run]` 带
+    /// `--wait-lock` 拉起新实例，旧行为是等不到锁就 `exit(0)` ⇒ 升级后**既没有托盘、
+    /// 也没有服务**（托盘正是 service 的看门狗），四个 bot 全部掉线，用户屏幕上只剩
+    /// 「啥也没有」。现在这条失败臂必须接管 service 看护。
+    ///
+    /// 判别力：把那个 `supervise_service_headless(...)` 调用删掉，这条必红。
+    #[test]
+    fn gui_wait_lock_failure_still_keeps_the_service_alive() {
+        let src = include_str!("main.rs");
+        let wait_lock = src
+            .find("a == \"--wait-lock\"")
+            .expect("GUI 路径应识别 --wait-lock（安装器升级重启）");
+        let supervise = src
+            .find("supervise_service_headless(std::time::Duration")
+            .expect("拿不到 gui 锁时必须接管 service 看护，否则升级后频道没人管");
+        assert!(
+            supervise > wait_lock,
+            "兜底看护必须挂在 --wait-lock 失败臂上（判定在前、兜底在后）"
+        );
+        assert!(
+            src.contains("fn supervise_service_headless(")
+                && src.contains("fn ensure_service_running_headless("),
+            "兜底看护与「真的拉起 service」两个函数都必须存在"
+        );
+    }
+
+    /// 兜底看护的两条硬要求（2026-10-05 审计发现，都是我自己第一版引入的）：
+    ///
+    /// 1. **必须读用户意图**（`is_desired`）：否则用户点过「停止服务」也会被每 5 秒复活，
+    ///    等于替用户改主意；
+    /// 2. **不许用 `Stdio::null`** 拉 service：Windows 上 NUL 是有效句柄，`attach_log_file`
+    ///    会判为可用直接 return ⇒ service/tracing 日志全部蒸发，而升级空窗正是最需要日志时。
+    ///
+    /// 判别力：删掉 `is_desired` 判定、或把 stdout 换回 `Stdio::null`，对应断言必红。
+    #[test]
+    fn headless_fallback_respects_desired_and_logs_to_bridge_out() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn ensure_service_running_headless(")
+            .expect("兜底函数必须存在");
+        let body = &src[start..start + 2600.min(src.len() - start)];
+        assert!(
+            body.contains("is_desired()"),
+            "兜底必须尊重用户意图（is_desired），不能把用户停掉的服务反复拉起：{body}"
+        );
+        assert!(
+            !body.contains("Stdio::null())\n        .stdout") && !body.contains(".stdout(std::process::Stdio::null())"),
+            "兜底拉 service 不许把 stdout 丢给 NUL（Windows 上 NUL 是有效句柄，日志会全蒸发）：{body}"
+        );
+        assert!(
+            body.contains("bridge.out"),
+            "兜底拉 service 的日志必须落到 logs/bridge.out：{body}"
+        );
+    }
 
     /// GUI 必须把日志接到 `logs/gui.out`，且**在拿 gui 锁之前**。
     ///
