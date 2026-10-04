@@ -1383,11 +1383,55 @@ pub fn service_persist_state() -> &'static str {
     "absent"
 }
 
+/// 从 `reg query` 输出里取出 Run 值指向的路径（取不到返回 None）。
+///
+/// 值名与类型之间是**多个空格**，故不按空白切分（会切出空段），而是锚定 `REG_SZ` 取其后内容。
+#[cfg(any(target_os = "windows", test))]
+fn parse_run_value(reg_query_stdout: &str) -> Option<String> {
+    for line in reg_query_stdout.lines() {
+        if let Some(i) = line.find("REG_SZ") {
+            let v = line[i + "REG_SZ".len()..].trim().trim_matches('"').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Run 值指向的可执行路径是不是**当前这份**二进制。
+///
+/// 为什么必须比对（2026-10-05 审计 #10）：per-user 装法（`{localappdata}` 时代）迁到
+/// per-machine 后，旧 Run 值仍指着 `%LOCALAPPDATA%` 下已经不存在的 exe —— 而原先只看
+/// `reg query` **成功** ⇒ 托盘显示「自启：开」、登录却什么都不发生，`heal_autostart` 又
+/// 认为「已注册」而不修（本机 2026-10-04 实测就是这种指向不存在路径的值）。
+#[cfg(any(target_os = "windows", test))]
+fn run_value_matches_exe(value: &str, exe: &std::path::Path) -> bool {
+    let norm = |s: &str| {
+        s.replace('/', "\\")
+            .trim_matches('"')
+            .trim()
+            .to_ascii_lowercase()
+    };
+    norm(value) == norm(&exe.display().to_string())
+}
+
 #[cfg(target_os = "windows")]
 pub fn autostart_enabled() -> bool {
-    run_reg(&["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let Ok(out) = run_reg(&["query", AUTOSTART_RUN_KEY, "/v", AUTOSTART_VALUE]) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    // 有值还不够：必须**指向当前这份二进制**，否则就是「显示开、登录没反应」的漂移态。
+    let Ok(exe) = current_exe() else {
+        return false;
+    };
+    match parse_run_value(&String::from_utf8_lossy(&out.stdout)) {
+        Some(v) => run_value_matches_exe(&v, &exe),
+        None => false,
+    }
 }
 
 /// 「用户意图开自启」持久标记（与 `logs/service.desired` 同款：存在 = 开，不存在 = 关/
@@ -1696,6 +1740,37 @@ fn rewrite_workspace_guides(workspaces: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自启判定必须「有值 **且** 指向当前二进制」才算开（2026-10-05 审计 #10）。
+    ///
+    /// 判别力：把 `run_value_matches_exe` 从 `autostart_enabled()` 去掉（退回「只看 reg query
+    /// 成功」）⇒ 最后一条断言的语义消失，用户看到「自启：开」但登录什么都不发生 —— 本机
+    /// 2026-10-04 真实遇到过指向不存在路径的值。
+    #[test]
+    fn run_value_parses_and_matches_only_the_current_exe() {
+        let sample = concat!(
+            "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n",
+            "    ABB    REG_SZ    C:\\Program Files\\ABB\\agent-bridge.exe\r\n\r\n"
+        );
+        assert_eq!(
+            parse_run_value(sample).as_deref(),
+            Some(r"C:\Program Files\ABB\agent-bridge.exe"),
+            "必须能从 reg query 输出取出路径（值名与类型之间是多空格）"
+        );
+        assert!(parse_run_value("HKEY_CURRENT_USER\\...\\Run\r\n").is_none());
+        let cur = std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe");
+        assert!(run_value_matches_exe(
+            r"C:\Program Files\ABB\agent-bridge.exe",
+            cur
+        ));
+        assert!(
+            !run_value_matches_exe(
+                r"C:\Users\gxh\AppData\Local\Programs\ABB\agent-bridge.exe",
+                cur
+            ),
+            "旧 per-user 路径必须判「不匹配」—— 这正是本机真实出现过的漂移态"
+        );
+    }
 
     /// Windows 自启自愈判据：只在「意图为开 + 注册表缺失」时为真。这条纯函数是
     /// 「既不擅自替人开、又能补回被回滚的项」的唯一闸门，两个方向都要锁死。
