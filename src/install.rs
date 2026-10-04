@@ -973,6 +973,27 @@ mod installer_guards {
     /// 这条守卫是**反向锁**：谁把「注册计划任务」那条路加回来（隐藏子命令 / 高权限 XML /
     /// 任务名），这里立刻红。旧的 `--install-bridge-task` 子命令也已从 main.rs 删除。
     #[test]
+    fn installer_pascal_section_has_no_semicolon_comments() {
+        // 2026-10-04 真实教训：`[Code]` 段是 **Pascal**，注释只能是 `//` 或 `{}`；`;` 不是注释
+        // （它是语句分隔符）。我改 [Code] 时把一处注释写成 `; ...`，ISCC 直接报
+        // `'BEGIN' expected` 编译失败 —— 而安装包只在 CI/release 里编，普通测试抓不到。
+        // 这条守卫把这类错误钉在测试里（本地 ISCC 实测：修掉后 Successful compile）。
+        let code_section = ISS
+            .split("[Code]")
+            .nth(1)
+            .expect("安装脚本必须有 [Code] 段");
+        // 只看到下一个段标题为止：`[Run]`/`[Registry]` 那些段里的 `;` 注释是**合法**的，
+        // 把整个文件都算进来会误报（首版守卫就这么翻的车）。
+        let code_section = code_section.split("\n[").next().unwrap_or(code_section);
+        for (i, line) in code_section.lines().enumerate() {
+            assert!(
+                !line.trim_start().starts_with(';'),
+                "[Code] 段第 {} 行用了分号注释（Pascal 里不是注释，ISCC 会编译失败）：{line}",
+                i + 1
+            );
+        }
+    }
+    #[test]
     fn installer_no_longer_registers_a_bridge_task() {
         assert!(
             !code_lines()
