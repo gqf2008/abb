@@ -47,10 +47,10 @@
 15. 控制台输出一律按 UTF-8 解码（非 65001 机器注册表 PATH 里的中文目录被解成 U+FFFD，工具判未安装）
    位置：src/deps.rs:202-234
    修法：抽 parse_reg_path(&[u8])，喂 GBK 字节断言条目保留
-16. bridge.out / gui.out 永不轮转（实机 17.5MB / 78275 行，同一文件半个月）
+16. ✅ 已修（main 29c6ef3 代码 + 03b96da 守卫）bridge.out / gui.out 永不轮转（实机 17.5MB / 78275 行，同一文件半个月）
    （2026-10-05 两次尝试的坑：helper 必须放 crate 根；且本仓 main.rs 的日志守卫测试在**嵌套** mod 里，use super::* 看不到根级项，要写 crate::xxx。别再把插入点选在别处 fn 的 #[test] 前——会把它的属性吞掉。）
    修法：仿 task_store.rs:237-259 的轮转单测，与任务日志共用上限常量
-17. 软链失败被 let _ = 吞掉还谎报「已补链 N 个」（普通用户 + 未开开发者模式则技能永久缺失）
+17. ✅ 已修（main 6cb3446）软链失败被 let _ = 吞掉还谎报「已补链 N 个」（普通用户 + 未开开发者模式则技能永久缺失）
    位置：src/larkskills.rs:46-53
    修法：注入「建链必失败」的 linker 断言成功计数为 0，或改用无需特权的 junction
 18. 钉钉 Stream 的 sink.send 无超时（半开连接冻死 select，180s 看门狗永不触发）
@@ -65,13 +65,13 @@
 21. 微信 outbox 两个写方各持内存快照（Router::fail_text 新建 OutboxStore 与 Bridge.outbox 互相整文件覆盖，积压项静默丢）
    位置：src/outbox.rs:90-135 / src/deliver.rs:571-574 / src/bridge/mod.rs:439
    修法：单测两个同路径 store 各 add 一条，reload 断言两条都在；或源码守卫禁止 deliver.rs 再 new OutboxStore
-22. config.json 固定 tmp 名 + 只有进程内锁（GUI 与 service 并发写互踩，设置/授权静默回退）
+22. ✅ 已修（main b4c6415）config.json 固定 tmp 名 + 只有进程内锁（GUI 与 service 并发写互踩，设置/授权静默回退）
    位置：src/config.rs:1710-1718 / 1783
    修法：源码守卫禁止 config.rs 出现 json.tmp，必须走 atomic_write_text/atomic_write_sensitive
 23. agent 回复发送失败仍无条件摘掉 pending（断网瞬间的回复永久丢；飞书/钉钉没有 outbox）
    位置：src/bridge/virtualbot.rs:1096-1102
    修法：失败时保留 pending（或转 outbox），下一轮/重启补发
-24. svc_start_verified 验证的是自己刚写的 pid（子进程随后才因抢锁 exit(0) 或 config exit(1)，点启动弹成功而服务已死）
+24. ✅ 已修（main 87d13fb）svc_start_verified 验证的是自己刚写的 pid（子进程随后才因抢锁 exit(0) 或 config exit(1)，点启动弹成功而服务已死）
    位置：src/install.rs:207 / 220 / 384
    修法：注入「立即 exit(1)」的假 service 断言返回 Err；或要求跨过稳定窗口后仍存活才算 up
 25. pid 文件写者不唯一且非原子 + svc_stop_impl 无条件删 pid 与并发 start 竞态（pid 指向死进程 / 删掉新实例的 pid）
