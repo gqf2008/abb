@@ -167,6 +167,39 @@ pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Re
 }
 
 /// 统一日志到 stdout（带时间戳，与 Python 版一致，落 logs/bridge.out）。
+/// 日志轮转上限（8 MiB）：超过就换成 `.1`，磁盘占用封在约 16 MiB。
+const LOG_ROTATE_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 超上限是否需要轮转（纯函数）。`cap == 0` 视为关闭轮转。
+fn rotation_needed(len: u64, cap: u64) -> bool {
+    cap > 0 && len > cap
+}
+
+/// 尽力而为的日志轮转：`<path>` → `<path>.1`（覆盖已有的 `.1`）。失败只记一条，
+/// 绝不影响日志本身 —— 轮转是维护动作，不是日志的前置条件。
+///
+/// 为什么需要（2026-10-05 审计 #16）：本机 `bridge.out` 已 17.5MB / 78275 行、从不轮转
+/// （服务进程长期持有句柄，外部脚本也没法安全 rot）。
+fn rotate_log_if_large(path: &std::path::Path, cap: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !rotation_needed(meta.len(), cap) {
+        return;
+    }
+    // 注意：不能对 `bridge.out` 用 `with_extension`（那会把 `.out` 换掉 ⇒ `bridge.1`）。
+    let mut raw = path.as_os_str().to_owned();
+    raw.push(".1");
+    let rotated = std::path::PathBuf::from(raw);
+    let _ = std::fs::remove_file(&rotated);
+    if std::fs::rename(path, &rotated).is_err() {
+        crate::log!(
+            "[log] 日志轮转失败（多半被服务进程持有且未共享删除），继续追加：{}",
+            path.display()
+        );
+    }
+}
+
 pub fn write_log(writer: &mut dyn std::io::Write, args: std::fmt::Arguments<'_>) {
     let _ = std::io::Write::write_fmt(
         writer,
@@ -211,6 +244,10 @@ fn attach_log_file(name: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // 轮转（2026-10-05 审计 #16）：超上限就把现有日志换成 `.1`，占用封在约 2×cap。
+    // 尽力而为：服务进程可能持有同一文件 ⇒ rename 被 Windows 拒绝只是这次没轮转，
+    // 绝不能因此影响日志本身。
+    rotate_log_if_large(&path, LOG_ROTATE_CAP_BYTES);
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
