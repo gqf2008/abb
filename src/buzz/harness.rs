@@ -200,9 +200,31 @@ enum SyncWaitMsg {
 }
 
 /// 懒启动 / 崩溃重拉的后台尝试结果。
+///
+/// 带 `index` = **预约的槽位号**：会话级隔离后池子里有多个槽位、启动是并发的（每个空槽位
+/// 一个 attempt），回执必须说明自己是谁，才能放回正确的槽位（`return_agent` 靠 index）。
 enum SpawnOutcome {
-    Ok(Box<OwnedAgent>),
-    Err(String),
+    Ok {
+        index: usize,
+        agent: Box<OwnedAgent>,
+    },
+    Err {
+        index: usize,
+        detail: String,
+    },
+}
+
+/// 每个 bot 允许的 agent 槽位上限（会话级隔离的并发上限）。
+///
+/// 为什么是 8：每个槽位背后是一个真实的 `buzz-agent` 进程（+ 它的 MCP 子进程），上限是
+/// **内存护栏**而不是语义限制 —— 队列里有多少待跑会话就保底多少槽位（见
+/// `ensure_agent_capacity`），所以正常并发下每个会话都有自己的 agent，互不排队。
+/// 超过上限的会话仍会排队（这是有意的兜底：宁可排队，也不把机器撑爆）。
+const MAX_AGENT_SLOTS: usize = 8;
+
+/// 需求 → 槽位数（纯函数，单测点）：至少 1（空闲时保持一个热 agent），至多 MAX_AGENT_SLOTS。
+fn wanted_slots(pending: usize) -> usize {
+    pending.clamp(1, MAX_AGENT_SLOTS)
 }
 
 /// 频道登记表（桥线程与主循环共用；ctx.channels 提示元数据同锁更新）。
@@ -631,8 +653,9 @@ struct Loop {
     removed_channels: HashSet<Uuid>,
     /// 连续失败次数（退避级别；成功回合/成功拉起清零）。
     crash_backoff: u32,
-    /// 是否有懒启动/重拉尝试在跑（防叠加）。
-    spawn_in_flight: bool,
+    /// 正在启动的槽位号（每个空槽位最多一个 attempt 在跑 —— 单槽位时代的 `bool` 在多槽位下
+    /// 会把并发启动压成串行，等于没隔离）。
+    spawning: std::collections::BTreeSet<usize>,
     /// 日志活跃度。
     last_activity: Instant,
     /// 收到过取消请求、但结局尚未到达的频道（#309）：取消作用于**这一轮**，
@@ -643,7 +666,8 @@ struct Loop {
 
 impl Loop {
     fn new(ctx: Arc<PromptContext>) -> (Self, mpsc::UnboundedReceiver<SteerAckEvent>) {
-        // 单 slot 懒池：from_slots 保留索引不变式（slot 0 ↔ index 0）。
+        // 懒池：起手 1 个槽位（热 agent），**队列里有更多待跑会话时按需追加**（会话级隔离）。
+        // from_slots 保留索引不变式（slot i ↔ index i）。
         let pool = AgentPool::from_slots(vec![None]);
         let queue =
             EventQueue::new(DedupMode::Queue).with_in_flight_deadline(MAX_TURN_DURATION.as_secs());
@@ -655,7 +679,7 @@ impl Loop {
             steer_ack_tx,
             removed_channels: HashSet::new(),
             crash_backoff: 0,
-            spawn_in_flight: false,
+            spawning: std::collections::BTreeSet::new(),
             last_activity: Instant::now(),
             cancel_requested: HashSet::new(),
         };
@@ -752,10 +776,8 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
                     }
                 }
             }
-            // 懒启动：slot 空且没有尝试在跑 → 立即拉起。
-            if !l.pool.slot_alive(0) && !l.spawn_in_flight {
-                schedule_agent_start(l, handle, Duration::ZERO, None);
-            }
+            // 会话级隔离：按「队列里有多少待跑会话」保证槽位与热 agent（上限内）。
+            ensure_agent_capacity(l, handle);
         }
         Cmd::Cancel { channel_id, reply } => {
             let fired = signal_in_flight_task(&mut l.pool, channel_id, ControlSignal::Cancel);
@@ -850,9 +872,12 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
 // ── agent 生命周期 ───────────────────────────────────────────────────────────
 
 fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome) {
-    l.spawn_in_flight = false;
+    let index = match &outcome {
+        SpawnOutcome::Ok { index, .. } | SpawnOutcome::Err { index, .. } => *index,
+    };
+    l.spawning.remove(&index);
     match outcome {
-        SpawnOutcome::Ok(agent) => {
+        SpawnOutcome::Ok { index: _, agent } => {
             let agent = *agent;
             l.crash_backoff = 0;
             handle.dead.store(false, Ordering::Relaxed);
@@ -871,13 +896,21 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome
             handle.set_last_start_error(None);
             tracing::info!("agent process ready");
         }
-        SpawnOutcome::Err(detail) => {
+        SpawnOutcome::Err { index, detail } => {
             handle.dead.store(true, Ordering::Relaxed);
             handle.set_last_start_error(Some(detail.clone()));
             l.crash_backoff = l.crash_backoff.saturating_add(1);
             let delay = respawn_delay(l.crash_backoff);
             emit_agent_start_failure(&mut std::io::stdout(), &detail, delay);
-            schedule_agent_start(l, handle, delay, None);
+            // 槽位 0 是保底热 agent：沿用原来的「退避后重试」语义。
+            // 额外槽位（会话级隔离按需加的）失败时**不再自己重试**：留空即可，
+            // 等下一次 ensure_agent_capacity 按真实需求决定要不要再拉 —— 否则一个
+            // 起不来的槽位会变成永不停止的重试循环（owner 2026-10-04 明确不要死循环）。
+            if index == 0 {
+                schedule_agent_start(l, handle, delay, None, 0);
+            } else {
+                crate::log!("[acp] 额外槽位 {index} 启动失败，暂不重试（按需再拉）：{detail}");
+            }
         }
     }
 }
@@ -907,9 +940,13 @@ fn schedule_agent_start(
     handle: &BuzzHandle,
     delay: Duration,
     old_agent: Option<OwnedAgent>,
+    index: usize,
 ) {
-    debug_assert!(!l.spawn_in_flight, "must not stack spawn attempts");
-    l.spawn_in_flight = true;
+    debug_assert!(
+        !l.spawning.contains(&index),
+        "must not stack spawn attempts for the same slot"
+    );
+    l.spawning.insert(index);
     // 新一轮 spawn 发起：能力位复位 Unknown（initialize 前任何读取都按
     // 「未就绪」拒答——绝不沿用上一次的判定给过旧 fork 开闸）。
     handle
@@ -928,7 +965,7 @@ fn schedule_agent_start(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            spawn_and_init_agent(&cfg).await
+            spawn_and_init_agent(&cfg, index).await
         };
         let result = tokio::select! {
             biased;
@@ -944,25 +981,33 @@ fn schedule_agent_start(
 
 /// 后台启动尝试本体：spawn + initialize（60s 超时，与上游一致），成功后构造
 /// OwnedAgent（全新会话状态——新进程的旧 session id 全部失效）。
-async fn spawn_and_init_agent(cfg: &AgentConfig) -> SpawnOutcome {
+async fn spawn_and_init_agent(cfg: &AgentConfig, index: usize) -> SpawnOutcome {
     let mut acp = match AcpClient::spawn(&cfg.command, &cfg.args, &cfg.extra_env).await {
         Ok(acp) => acp,
-        Err(e) => return SpawnOutcome::Err(format!("failed to spawn agent: {e}")),
+        Err(e) => {
+            return SpawnOutcome::Err {
+                index,
+                detail: format!("failed to spawn agent: {e}"),
+            }
+        }
     };
     match tokio::time::timeout(Duration::from_secs(60), acp.initialize()).await {
         Ok(Ok(init_result)) => {
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
             let agent_name = normalized_agent_name(&init_result);
             tracing::info!(name = %agent_name, protocol_version, "agent initialized");
-            SpawnOutcome::Ok(Box::new(OwnedAgent {
-                index: 0,
-                acp,
-                state: Default::default(),
-                agent_name,
-                goose_system_prompt_supported: None,
-                protocol_version,
-                session_sandbox: cfg.session_sandbox.clone(),
-            }))
+            SpawnOutcome::Ok {
+                index,
+                agent: Box::new(OwnedAgent {
+                    index,
+                    acp,
+                    state: Default::default(),
+                    agent_name,
+                    goose_system_prompt_supported: None,
+                    protocol_version,
+                    session_sandbox: cfg.session_sandbox.clone(),
+                }),
+            }
         }
         Ok(Err(e)) => {
             acp.shutdown().await;
@@ -972,7 +1017,7 @@ async fn spawn_and_init_agent(cfg: &AgentConfig) -> SpawnOutcome {
                 format!("agent initialize failed: {e}"),
                 acp.stderr_tail().as_deref(),
             );
-            SpawnOutcome::Err(detail)
+            SpawnOutcome::Err { index, detail }
         }
         Err(_) => {
             acp.shutdown().await;
@@ -980,7 +1025,7 @@ async fn spawn_and_init_agent(cfg: &AgentConfig) -> SpawnOutcome {
                 "agent initialize timed out (60s)".to_string(),
                 acp.stderr_tail().as_deref(),
             );
-            SpawnOutcome::Err(detail)
+            SpawnOutcome::Err { index, detail }
         }
     }
 }
@@ -998,11 +1043,39 @@ fn normalized_agent_name(init_result: &serde_json::Value) -> String {
 
 // ── dispatch_pending（上游移植；无 typing/心跳） ─────────────────────────────
 
-/// 把队列里的可跑批次投给空闲 agent（单 slot：至多一个批次在跑）。
+/// 会话级隔离的容量规划：**队列里有多少待跑会话，就保底多少 agent**（上限 `MAX_AGENT_SLOTS`）。
+///
+/// 为什么必须在这里做：单槽位时，一个会话的长回合会把整个 bot 的其它会话全部排在它后面
+/// （owner 2026-10-04 实报「全堵死了」）。按需求扩池后，每个待跑会话都有自己的 agent，
+/// 会话之间互不影响；同一会话内部仍由 per-chat 队列串行（语义不变）。
+///
+/// 槽位只追加不回收（保持 index 不变式；空槽位不占资源，agent 也仍留在池里当热实例）。
+fn ensure_agent_capacity(l: &mut Loop, handle: &BuzzHandle) {
+    let want = wanted_slots(l.queue.pending_channels());
+    while l.pool.slot_count() < want {
+        l.pool.push_slot();
+    }
+    // 给「有需求但还空着」的槽位各起一个 attempt（每槽位最多一个在跑）。
+    for idx in 0..want.min(l.pool.slot_count()) {
+        if !l.pool.slot_alive(idx) && !l.spawning.contains(&idx) {
+            schedule_agent_start(l, handle, Duration::ZERO, None, idx);
+        }
+    }
+}
+
+/// 把队列里的可跑批次投给空闲 agent（会话级隔离：**投满所有空闲 agent**）。
+///
+/// 单槽位时代这里「投一个就返回」；多槽位下那样写等于让扩出来的 agent 干等着、白隔离。
+/// 现在循环投递，直到没有可投批次或没有空闲 agent。
 fn dispatch_pending(l: &mut Loop) {
-    // 单 agent：至多一个批次在跑——投一个即返回，结果回来再 flush 下一个。
+    // `idle_count` 是防御性上界：正常情况下每轮要么投出一个、要么队列已空。
+    while l.pool.idle_count() > 0 && dispatch_one(l) {}
+}
+
+/// 投一个批次；返回是否真的投出去了（供 `dispatch_pending` 循环）。
+fn dispatch_one(l: &mut Loop) -> bool {
     let Some(batch) = l.queue.flush_next() else {
-        return;
+        return false;
     };
     let channel_id = batch.channel_id;
     let affinity_hit = l.pool.has_session_for(channel_id);
@@ -1016,7 +1089,7 @@ fn dispatch_pending(l: &mut Loop) {
             );
             l.queue.requeue_preserve_timestamps(batch);
             l.queue.mark_complete(channel_id);
-            return;
+            return false;
         }
     };
     tracing::debug!(agent = agent.index, %channel_id, affinity_hit, "agent_claimed");
@@ -1053,6 +1126,7 @@ fn dispatch_pending(l: &mut Loop) {
         },
     );
     l.last_activity = Instant::now();
+    true
 }
 
 // ── 中间轮次 steer / cancel 信号 ─────────────────────────────────────────────
@@ -1583,7 +1657,8 @@ fn schedule_death_respawn(
         "agent died — respawning in {}s",
         delay.as_secs()
     );
-    schedule_agent_start(l, handle, delay, Some(old_agent));
+    let dead_index = old_agent.index;
+    schedule_agent_start(l, handle, delay, Some(old_agent), dead_index);
 }
 
 /// 取消终态决策（#309 PR-A1）——纯函数，便于把分支钉死在单测里：
@@ -1736,7 +1811,7 @@ fn recover_panicked_agent(
         backoff_secs = delay.as_secs(),
         "respawn after panic"
     );
-    schedule_agent_start(l, handle, delay, None);
+    schedule_agent_start(l, handle, delay, None, i);
 }
 
 // ── steer ack（上游移植；无 typing） ─────────────────────────────────────────
@@ -2399,5 +2474,32 @@ mod model_not_found_tests {
             code: -32000,
             message: "model not found".to_string(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod isolation_capacity_tests {
+    use super::*;
+
+    /// 会话级隔离的容量策略：至少 1（热 agent），随待跑会话数增长，且有内存上限。
+    #[test]
+    fn wanted_slots_grows_with_pending_and_is_capped() {
+        assert_eq!(
+            wanted_slots(0),
+            1,
+            "空闲也要留一个热 agent，避免每条消息冷启动"
+        );
+        assert_eq!(wanted_slots(1), 1);
+        assert_eq!(
+            wanted_slots(3),
+            3,
+            "三个待跑会话就该有三个 agent（互不排队）"
+        );
+        assert_eq!(wanted_slots(MAX_AGENT_SLOTS), MAX_AGENT_SLOTS);
+        assert_eq!(
+            wanted_slots(MAX_AGENT_SLOTS + 10),
+            MAX_AGENT_SLOTS,
+            "上限是内存护栏：宁可排队，也不把机器撑爆"
+        );
     }
 }

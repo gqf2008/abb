@@ -441,6 +441,24 @@ pub struct PromptContext {
     pub max_turns_per_session: u32,
 }
 
+/// 会话级隔离的选槽规则（**纯函数**，单测点；`try_claim` 的唯一策略来源）。
+///
+/// 三档语义：
+/// 1. 会话在池里有空闲归属（`idle_home`）⇒ 用它：同一会话始终落在同一个 agent 上，
+///    ACP session（对话上下文）不会因为换 agent 而丢；
+/// 2. 会话有在途任务（`in_flight`）⇒ **None**：批次排队等它跑完，绝不用另一个空闲 agent
+///    顶替（顶替 = 换新会话重答，用户看到的是「失忆」）；
+/// 3. 会话没有任何归属（新会话 / 原 agent 已死）⇒ 任一空闲槽位。
+fn pick_slot(idle_home: Option<usize>, in_flight: bool, any_idle: Option<usize>) -> Option<usize> {
+    if let Some(i) = idle_home {
+        return Some(i);
+    }
+    if in_flight {
+        return None;
+    }
+    any_idle
+}
+
 impl AgentPool {
     /// Create a pool from pre-indexed slots (may contain None for failed startups).
     ///
@@ -459,28 +477,56 @@ impl AgentPool {
         }
     }
 
+    /// 追加一个空槽位（**会话级隔离**用：队列里有更多待跑会话时按需扩池）。
+    ///
+    /// 只追加、不重排：`OwnedAgent.index` ↔ `self.agents` 下标的索引不变式必须保持
+    /// （`return_agent` 靠它把 agent 放回原槽位）。
+    pub fn push_slot(&mut self) {
+        self.agents.push(None);
+    }
+
+    /// 槽位总数（含正在启动/已崩溃的空槽位）。
+    pub fn slot_count(&self) -> usize {
+        self.agents.len()
+    }
+
+    /// 当前空闲（可立即投递）的 agent 数。
+    pub fn idle_count(&self) -> usize {
+        self.agents.iter().filter(|s| s.is_some()).count()
+    }
+
     /// Try to claim an idle agent for the given channel (or heartbeat if `None`).
     ///
-    /// Pass 1: prefer an agent that already has a session for `channel_id`.
-    /// Pass 2: any idle agent.
+    /// **会话钉死（ABB 会话级隔离，2026-10-04）**：
+    /// - 频道在本池里已有会话 ⇒ **只允许**持有该会话的那个 agent 服务它；那个 agent 忙时
+    ///   返回 `None`（批次排队），**绝不**换别的空闲 agent —— 换过去等于丢掉这轮的对话上下文
+    ///   （ACP 的 session 活在具体 agent 进程里）。
+    /// - 频道还没有会话（新会话、或它的 agent 已死）⇒ 取任一空闲 agent。
     ///
-    /// Returns `None` if all agents are checked out.
+    /// 这样「一个会话一个 agent」：会话之间不抢、不互相阻塞（各占各的槽位），
+    /// 同一会话内部仍然串行（由 per-chat 队列保证语义）。
+    ///
+    /// Returns `None` if no usable agent is idle right now.
     pub fn try_claim(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
-        // Pass 1: prefer agent with existing session for this channel.
+        let any_idle = self.agents.iter().position(|slot| slot.is_some());
         if let Some(cid) = channel_id {
-            let idx = self.agents.iter().position(|slot| {
+            // 归属分两半看：**空闲归属**（agent 在池里且持有该会话）与**在途归属**
+            // （agent 被借走在跑该会话 —— 槽位是 None，只有 task_map 知道）。
+            // 漏掉在途那半会把它误判成「新会话」，于是同一会话换到另一个 agent 上重新
+            // 开始，直接丢掉这轮的对话上下文 —— 而「一个会话一个 agent」正是隔离的核心
+            // 不变量（owner 2026-10-04 要求）。
+            let idle_home = self.agents.iter().position(|slot| {
                 slot.as_ref()
                     .map(|a| a.state.sessions.contains_key(&cid))
                     .unwrap_or(false)
             });
-            if let Some(i) = idx {
-                return self.agents[i].take();
-            }
+            let in_flight = self.task_map.values().any(|m| m.channel_id == Some(cid));
+            return pick_slot(idle_home, in_flight, any_idle)
+                .map(|i| self.agents[i].take().unwrap());
         }
 
-        // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        // 心跳等无频道任务：取任一空闲 agent。
+        any_idle.map(|i| self.agents[i].take().unwrap())
     }
 
     /// Return an agent to its slot after a task completes.
@@ -1716,5 +1762,44 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
         StopReason::Refusal => {
             tracing::warn!(target: "pool::prompt", "turn refused for {label}");
         }
+    }
+}
+
+#[cfg(test)]
+mod isolation_policy_tests {
+    use super::*;
+
+    /// 会话钉死：会话正在别的 agent 上跑（在途归属）时**不许换人** —— 换人 = 用新会话重答，
+    /// 用户看到的是「失忆」。这正是 owner 2026-10-04 要的「一个会话一个 agent」。
+    #[test]
+    fn in_flight_session_waits_for_its_own_agent() {
+        // 有在途归属 + 别的槽位空闲 ⇒ 必须 None（排队），而不是「随便找个空闲的」。
+        assert_eq!(pick_slot(None, true, Some(3)), None);
+    }
+
+    /// 空闲归属优先：会话的 agent 空着就用它，哪怕别的槽位更靠前。
+    #[test]
+    fn idle_home_wins_over_other_slots() {
+        assert_eq!(pick_slot(Some(5), false, Some(0)), Some(5));
+        // 两个信号同时成立（理论边界）时仍以空闲归属为准。
+        assert_eq!(pick_slot(Some(2), true, Some(0)), Some(2));
+    }
+
+    /// 新会话（无任何归属）⇒ 任一空闲槽位；一个空闲都没有 ⇒ None（排队等）。
+    #[test]
+    fn fresh_session_takes_any_idle_or_waits() {
+        assert_eq!(pick_slot(None, false, Some(1)), Some(1));
+        assert_eq!(pick_slot(None, false, None), None);
+    }
+
+    /// 槽位只追加、不重排（OwnedAgent.index 与下标的不变式是 return_agent 的地基）。
+    #[test]
+    fn push_slot_appends_without_breaking_indices() {
+        let mut p = AgentPool::from_slots(vec![None]);
+        assert_eq!(p.slot_count(), 1);
+        p.push_slot();
+        p.push_slot();
+        assert_eq!(p.slot_count(), 3, "追加两个空槽位");
+        assert_eq!(p.idle_count(), 0, "空槽位不算空闲 agent");
     }
 }

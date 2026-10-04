@@ -379,3 +379,23 @@ mod tests {
         assert!(CANCEL_CMD_BUDGET < TEARDOWN_BUDGET);
     }
 }
+
+#[cfg(test)]
+mod isolation_guard_tests {
+    /// 「长任务必须独立会话」（owner 2026-10-04）：这些长任务入口只允许经 oneshot_turn ——
+    /// 它自建 BuzzHandle + run_loop + 独立池/独立 agent，跑完即收；一旦改成复用聊天会话的
+    /// harness，一个长任务就会占住某个聊天的 agent，把那个会话堵死。
+    #[test]
+    fn long_tasks_go_through_oneshot_turn() {
+        for (file, src) in [
+            ("task_run.rs", include_str!("../task_run.rs")),
+            ("session_gc.rs", include_str!("../session_gc.rs")),
+            ("teambuilder.rs", include_str!("../teambuilder.rs")),
+        ] {
+            assert!(
+                src.contains("oneshot_turn"),
+                "{file} 的长任务必须走 oneshot_turn（独立会话、独立 agent）"
+            );
+        }
+    }
+}
