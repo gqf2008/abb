@@ -260,6 +260,20 @@ jobs:
           }
           Write-Host "ISCC found: $((Get-Command ISCC.exe).Source)"
 
+      - name: Assert installer filename matches the version (#374)
+        # 2026-10-05 审计 #12：客户端按**文件名里的版本**取资产；`/D` 失效时产物会叫
+        # ABB-Setup-<旧版本>.exe，而 `pick_asset` 会回退「任意 ABB-Setup-*.exe」+ SHA256SUMS
+        # 同源 ⇒ 校验通过 ⇒ 把旧版当新版装，形成降级循环。这条断言让它在发版时就炸。
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' ).Matches[0].Groups[1].Value
+          $want = "app-assets/Output/ABB-Setup-$v.exe"
+          if (-not (Test-Path $want)) {
+            Write-Error "安装包文件名与版本不一致：期望 $want，实际 $(Get-ChildItem app-assets/Output/ABB-Setup-*.exe | Select-Object -ExpandProperty Name)"
+            exit 1
+          }
+          Write-Host "✓ 安装包名与版本一致：$want"
+
       - name: Build installer
         shell: pwsh
         run: |

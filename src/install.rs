@@ -140,8 +140,44 @@ pub fn status() -> ServiceStatus {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0);
     ServiceStatus {
-        running: pid_alive(pid),
+        // 存活 **且** 身份对得上才算「在跑」。只判存活会在 PID 被复用时把别人的进程当成
+        // service（2026-10-04 真实事故：`service.pid=12012` 被复用 ⇒ 看门狗永不重拉、四 bot
+        // 静默掉线，`svc_stop` 还会 `taskkill /F` 那个无辜进程）。
+        running: pid_alive(pid) && pid_is_agent_bridge(pid).unwrap_or(true),
         pid,
+    }
+}
+
+/// 这个 pid 是不是**我们的** agent-bridge？（2026-10-05 审计修复）
+///
+/// 为什么必须校验身份：Windows 会很快把刚释放的 PID 复用出去，而 `OpenProcess` 成功只证明
+/// 「有个进程占着这个号」，不证明它是 agent-bridge。`None` = 这次拿不到镜像名（例如 macOS
+/// 没有 /proc）⇒ 调用方**保持原判据**，宁可误判「在跑」（最多不重拉）也不误判「已停」
+/// （那会让看门狗把正在跑的服务再拉一个，或用户点停止时杀错进程）。
+fn pid_is_agent_bridge(pid: u32) -> Option<bool> {
+    if pid == 0 {
+        return Some(false);
+    }
+    #[cfg(windows)]
+    {
+        let path = crate::orphan_mcp::image_path(pid)?;
+        let name = std::path::Path::new(&path)
+            .file_name()?
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        Some(name == "agent-bridge.exe")
+    }
+    #[cfg(unix)]
+    {
+        // Linux 有 /proc；macOS 没有 ⇒ read_link 失败 ⇒ None（回落到原判据）。
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let name = exe.file_name()?.to_string_lossy().to_ascii_lowercase();
+        Some(name == "agent-bridge" || name.starts_with("agent-bridge"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -494,6 +530,36 @@ pub(crate) fn terminate_with_grace(pid: u32, grace: std::time::Duration) -> Resu
 #[cfg(test)]
 mod loop_guard_tests {
     use super::*;
+
+    /// 身份校验必须有判别力：**本测试进程**（测试二进制，不叫 agent-bridge.exe）必须被判
+    /// 「不是 agent-bridge」。
+    ///
+    /// 判别力：把 `pid_is_agent_bridge` 那一步从 `status()` 去掉，这条在 Windows 上必红
+    /// （OpenProcess 对任何活着的 pid 都成功）—— 而那正是「PID 复用 ⇒ 假运行 ⇒ 频道静默
+    /// 掉线 + 误杀无辜进程」的来源。
+    /// 接线守卫：`status()` 必须**真的用上**身份校验。
+    ///
+    /// 为什么单测不够：`pid_identity_rejects_a_foreign_process` 只测 helper，把
+    /// `pid_is_agent_bridge` 从 `status()` 里删掉它照样绿 ⇒ 必须单独钉接线。
+    #[test]
+    fn status_wires_the_pid_identity_check() {
+        let src = include_str!("install.rs");
+        assert!(
+            src.contains("pid_alive(pid) && pid_is_agent_bridge(pid)"),
+            "status() 必须以「存活 且 身份对得上」判定在跑，否则 PID 复用会造成假运行"
+        );
+    }
+
+    #[test]
+    fn pid_identity_rejects_a_foreign_process() {
+        assert_eq!(pid_is_agent_bridge(0), Some(false), "pid=0 一律不算");
+        #[cfg(windows)]
+        assert_eq!(
+            pid_is_agent_bridge(std::process::id()),
+            Some(false),
+            "测试进程不是 agent-bridge.exe，必须被判「不是我们的进程」"
+        );
+    }
 
     /// 升级后服务起不来的根因之一：`taskkill` 报「进程不存在」被判成停失败。
     /// 判别力：把 `taskkill_reports_missing` 改成恒 false，这条必红。

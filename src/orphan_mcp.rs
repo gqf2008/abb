@@ -132,7 +132,7 @@ pub fn process_snapshot() -> Vec<ProcEntry> {
 
 /// 取进程的镜像路径（读不到返回 None）。
 #[cfg(windows)]
-fn image_path(pid: u32) -> Option<String> {
+pub(crate) fn image_path(pid: u32) -> Option<String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
