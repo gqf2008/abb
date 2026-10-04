@@ -586,6 +586,14 @@ pub enum AgentError {
     /// replayed history and give the model a recoverable tool error.
     UnsupportedImageInput(String),
     Mcp(String),
+    /// 死循环熔断（ABB 扩展，2026-10-04）：同一个回合内**同一条工具调用**反复出现
+    /// 到 `config::REPEATED_CALL_LIMIT` 次 ⇒ 判定为不收敛的死循环，中止本回合。
+    ///
+    /// 为什么必须中止而不是继续重试：真实事故里 hook 无界读 stdin 把工具调用挂死，
+    /// agent 于是不断重问模型（LLM 风暴），定时任务每轮跑满预算超时、机器上堆出
+    /// 一排僵死进程。工具侧的挂死已在 ABB 修（guard-check 有界读），这里是通用兜底：
+    /// 无论什么原因导致「反复做同一件事却不收敛」，都不许无限跑下去。
+    LoopGuard(String),
     Cancelled,
 }
 
@@ -599,6 +607,7 @@ impl std::fmt::Display for AgentError {
             Self::LlmContextExceeded(s) => write!(f, "llm context exceeded: {s}"),
             Self::UnsupportedImageInput(s) => write!(f, "llm image input unsupported: {s}"),
             Self::Mcp(s) => write!(f, "mcp: {s}"),
+            Self::LoopGuard(s) => write!(f, "loop guard: {s}"),
             Self::Cancelled => write!(f, "cancelled"),
         }
     }

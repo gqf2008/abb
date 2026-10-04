@@ -369,6 +369,7 @@ fn catalog_error_kind(error: &AgentError) -> &'static str {
         AgentError::LlmContextExceeded(_) => "context-exceeded",
         AgentError::UnsupportedImageInput(_) => "unsupported-image",
         AgentError::Mcp(_) => "mcp",
+        AgentError::LoopGuard(_) => "loop-guard",
         AgentError::Cancelled => "cancelled",
     }
 }

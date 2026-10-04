@@ -272,6 +272,24 @@ fn fold_pricing_identity(
     }
 }
 
+/// 记一次工具调用签名，返回它在本回合内的第几次出现（纯函数，单测点）。
+///
+/// `\x1f` 作名字与参数的分隔符：它不可能出现在工具名或 JSON 参数里，避免
+/// 「名字 + 参数」直接拼接带来的歧义（例如 name="a", args="b|c" 与
+/// name="a|b", args="c" 撞成同一个签名）。
+///
+/// 达到 `config::REPEATED_CALL_LIMIT` 次即判死循环（见 `run` 里的熔断点）。
+fn record_call_signature(
+    seen: &mut std::collections::HashMap<String, u32>,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> u32 {
+    let sig = format!("{}\x1f{}", name, arguments);
+    let n = seen.entry(sig).or_insert(0);
+    *n = n.saturating_add(1);
+    *n
+}
+
 impl RunCtx<'_> {
     /// Send a session-cumulative `usage_update` reflecting everything observed
     /// up to and including the most recent LLM response.
@@ -369,6 +387,11 @@ impl RunCtx<'_> {
         // these successful provider requests consume a real round and are not
         // refunded; this counter only bounds the default-unlimited case.
         let mut max_tokens_recoveries = 0u32;
+        // 死循环熔断（ABB 扩展，2026-10-04 事故）：本回合内「同一条工具调用」的重复计数。
+        // 达到 `config::REPEATED_CALL_LIMIT` 次即中止本回合（`AgentError::LoopGuard`），
+        // 理由随错误文本带给用户与日志 —— 绝不静默继续重试。
+        let mut call_signatures: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         loop {
             if self.cfg.max_rounds > 0 && round >= self.cfg.max_rounds {
                 return Ok(StopReason::MaxTurnRequests);
@@ -796,6 +819,21 @@ impl RunCtx<'_> {
             // regardless of config.
             if !buzz_reply_call_seen {
                 buzz_reply_call_seen = calls.iter().any(|c| is_buzz_reply_call(c, self.mcp));
+            }
+            // 死循环熔断：截断之后统计（被丢掉的调用不会执行，不算重复）。
+            for call in &calls {
+                let seen = record_call_signature(&mut call_signatures, &call.name, &call.arguments);
+                if seen >= crate::config::REPEATED_CALL_LIMIT {
+                    tracing::warn!(
+                        tool = %call.name,
+                        repeats = seen,
+                        "repeated identical tool call — aborting turn (loop guard)"
+                    );
+                    return Err(AgentError::LoopGuard(format!(
+                        "检测到死循环：本回合内同一条工具调用「{}」已重复 {} 次，已中止本回合（避免无限重试烧模型调用）",
+                        call.name, seen
+                    )));
+                }
             }
             self.history.push(HistoryItem::Assistant {
                 text: response.text,
@@ -1401,6 +1439,41 @@ fn warn_if_silent_turn(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 死循环熔断的判据（纯函数）：**只有同一条调用**反复出现才计数；
+    /// 名字或参数不同都算另一条；分隔符保证「名字+参数」拼接不会撞签名。
+    ///
+    /// 2026-10-04 事故回归锁：没有这条熔断时，hook 挂死 ⇒ agent 无限重问模型，
+    /// 定时任务每轮跑满预算超时、机器堆一排僵死进程。
+    #[test]
+    fn repeated_call_signature_counts_only_identical_calls() {
+        let mut seen = std::collections::HashMap::new();
+        let a = json!({"command": "ls"});
+        let b = json!({"command": "pwd"});
+        for i in 1..=crate::config::REPEATED_CALL_LIMIT {
+            assert_eq!(
+                record_call_signature(&mut seen, "shell", &a),
+                i,
+                "同一条调用应线性累加（第 {i} 次）"
+            );
+        }
+        assert_eq!(
+            record_call_signature(&mut seen, "shell", &b),
+            1,
+            "参数不同算另一条"
+        );
+        assert_eq!(
+            record_call_signature(&mut seen, "other", &a),
+            1,
+            "工具名不同算另一条"
+        );
+        assert_eq!(record_call_signature(&mut seen, "a", &json!("b|c")), 1);
+        assert_eq!(
+            record_call_signature(&mut seen, "a|b", &json!("c")),
+            1,
+            "分隔符防拼接歧义"
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tracing_subscriber::layer::SubscriberExt;

@@ -321,6 +321,14 @@ impl AgentRunner for SpawnRetiredRunner {
 /// 支持 anthropic / openai-chat / openai-responses / openrouter / deepseek；
 /// 其余 kind → Err（用户可见）。
 /// provider 为 None → Ok(None)（纯继承宿主 env，旧行为——e2e 即靠宿主注入）。
+/// 单个回合允许的模型请求轮数上限（ABB 扩展）：注入 `BUZZ_AGENT_MAX_ROUNDS`。
+///
+/// 为什么要有：fork 默认 0 = 无上限；而「工具卡住 ⇒ agent 反复重问」是真实发生过的
+/// 事故（2026-10-04），那时唯一的边界只有外层任务预算（30 分钟），中途会烧掉大量
+/// 模型调用。200 轮足够任何正常长任务（含分页读取、逐项确认、多步重构），
+/// 又能在失控时几分钟内收住。
+const BUZZ_AGENT_MAX_ROUNDS: u32 = 200;
+
 pub(crate) fn buzz_provider_env(
     provider: Option<&crate::config::ProviderConfig>,
 ) -> Result<Option<HashMap<String, String>>, String> {
@@ -328,6 +336,15 @@ pub(crate) fn buzz_provider_env(
         return Ok(None);
     };
     let mut env = HashMap::new();
+    // 回合护栏（ABB 扩展，2026-10-04）：fork 的 `max_rounds` 默认 0 = **无上限**，
+    // 于是「无限重问模型」在协议上没有任何边界（事故形态：hook 挂死 ⇒ 工具永不返回 ⇒
+    // agent 反复问模型 ⇒ 定时任务每轮跑满预算超时、机器堆一排僵死进程）。这里给一个
+    // 明确上界：单个回合作多 200 轮（一轮 = 一次模型请求），超过即由 fork 以
+    // `StopReason::MaxTurnRequests` 收尾，不再无限跑。
+    env.insert(
+        "BUZZ_AGENT_MAX_ROUNDS".into(),
+        BUZZ_AGENT_MAX_ROUNDS.to_string(),
+    );
     match p.kind.as_str() {
         "anthropic" => {
             env.insert("BUZZ_AGENT_PROVIDER".into(), "anthropic".into());
