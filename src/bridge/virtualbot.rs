@@ -1097,9 +1097,20 @@ impl Bridge {
                     self.pending.set_reply(&ev.mid, &sent_text);
                 }
                 let send_result = self.send_reply(&ev, &sent_text).await;
-                // remove 统一一处（审查：原 Ok/Err 两臂各自复制——未来只改一臂会
-                // 破坏「发送后摘 pending」的 W2 不变式）
-                self.pending.remove(&ev.mid);
+                // 只有**送成功**才摘 pending（2026-10-05 审计 #23）。
+                //
+                // 旧写法在 Ok/Err 两臂之外统一 remove：发送失败时也把条目摘掉 ⇒ 断网瞬间
+                // （睡眠唤醒/代理切换最易撞上半开连接）刚写进 pending 的回复被同一步删掉，
+                // 重启补发的最后机会也没了。微信有 outbox 兜底，飞书/钉钉没有 ⇒ 用户永远
+                // 收不到，且没有任何提示。失败时**保留**条目（reply 已在上面落盘），让
+                // `recover_pending` 在重启后补发。
+                match &send_result {
+                    Ok(()) => self.pending.remove(&ev.mid),
+                    Err(e) => crate::log!(
+                        "[vb] 回复发送失败，保留 pending 以便重启补发（mid={}）：{e:#}",
+                        ev.mid
+                    ),
+                }
                 match send_result {
                     Ok(()) => {
                         // #74：bot 回复落历史库（与用户轮同条件：granted 私聊，见 record_granted）。
@@ -1580,5 +1591,29 @@ mod tests {
             );
             assert!(text.contains("ABB_BIN"), "{name} 应引导用 $ABB_BIN");
         }
+    }
+}
+
+#[cfg(test)]
+mod send_failure_keeps_pending_guard_tests {
+    /// 发送失败不得摘 pending（否则断网瞬间的回复永久丢，飞书/钉钉没有 outbox 兜底）。
+    ///
+    /// 判别力（2026-10-05 审计 #23）：把 `self.pending.remove(&ev.mid)` 挪回 match 之外
+    /// （即退回「两臂统一 remove」）⇒ 第一条断言红；删掉失败分支的保留逻辑 ⇒ 第二条红。
+    #[test]
+    fn reply_send_failure_keeps_pending_for_retry() {
+        let src = include_str!("virtualbot.rs");
+        let needle = concat!(
+            "let send_result = self.send_reply(&ev, &sent_text).await;\n                // remove ",
+            "统一一处"
+        );
+        assert!(
+            !src.contains(needle),
+            "不得再在发送后无条件摘 pending：失败也要保留，等重启补发"
+        );
+        assert!(
+            src.contains("回复发送失败，保留 pending 以便重启补发"),
+            "失败分支必须留痕并保留条目"
+        );
     }
 }
