@@ -72,6 +72,14 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 
 **本机（Windows）环境性红基线（2026-09-30 复核）**：本机跑 fork 全量是 `538 passed / 3 failed`，三条在**干净 `main` worktree** 上同样失败（已复核归因，与本次改动零交集，按纪律不重跑至绿）：`write_confinement_rejects_escape`（Windows 路径语义）、`discover_skills_dedup_by_name`（依赖本机 `~/.agents/skills` 布局）、`corpus_matches_generated_snapshot`（随包 `scripts/normative-corpus.json` 相对基线已漂移，需 `just regen-model-corpus`）。
 
+**GitHub CI（macOS）稳定红基线（2026-10-05 登记）**：`test-macos` 作业稳定失败在两条 oneshot 用例上 ——
+`buzz::oneshot::tests::oneshot_external_cancel_returns_cancelled`（断言 `src/buzz/oneshot.rs:353`：
+「外部取消后应向在途回合发 cancel: []」）与 `buzz::oneshot::tests::oneshot_timeout_cancels_and_teardown_bounded`。
+证据：CI run 37221361140（sha d5227fb）与 37221245958（sha f104237）的 `test-macos` 失败列表**只有**这两条；
+同两次 run 的 `fmt` / `clippy -D warnings`（test 作业）/ `fork-lint` / `check-macos` **全部 success**。
+归因状态：**未确认是否 pre-existing**（macOS 侧时序/行为差异，本机 Windows 全量是 886 passed / 0 failed ⇒ 平台相关）；
+与本轮（2026-10-05）Windows 进程/安装/自启修复**零交集**。处置：另案评估，按纪律不重跑至绿。
+
 已修复案例（修法口径参考）：`steer_folds_into_active_turn_without_cancelling` 于 **093451a** 修复——根因是 fixture 容量（2 条 canned）与合法时序（end_turn 后收尾 drain `agent.rs:777` 合法多跑第 3 轮 → 队列空 → 500 → wire::err 无 `result`）不匹配，修法仅补第 3 条 canned，未动任何 timeout/sleep/断言；修后 20/20 轮 0 失败。
 
 # 移植区变更追加登记（不逐个改写上表长行）
