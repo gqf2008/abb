@@ -686,10 +686,10 @@ pub(crate) fn post_update_relaunch_script(exe: &Path, log_path: &Path) -> String
          set \"EXE={exe}\"\r\n\
          set \"LOG={log}\"\r\n\
          for /L %%i in (1,1,150) do (\r\n\
-         rem 判「托盘是否已在跑」**不能按镜像名**：常驻服务就是同名的 agent-bridge.exe --service，
-         rem 服务活着时按名判活会误判「已起来」而永不拉起托盘（2026-10-05 审计发现）。
-         rem 这里按命令行是否带 --service 区分；不带 = 托盘在跑 ⇒ 直接退出。
-         powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }}); if ($t.Count -gt 0) {{ exit 0 }} else {{ exit 1 }}" && goto :done\r\n\
+         rem 判托盘是否已在跑不能按镜像名：常驻服务就是同名的 agent-bridge.exe --service\r\n\
+         rem 服务活着时按名判活会误判已起来而永不拉起托盘（2026-10-05 审计发现）\r\n\
+         rem 这里按命令行是否带 --service 区分；不带 = 托盘在跑 ⇒ 直接退出\r\n\
+         powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }}); if ($t.Count -gt 0) {{ exit 0 }} else {{ exit 1 }}\" && goto :done\r\n\
          tasklist /FI \"IMAGENAME eq ABB-Setup-*.exe\" 2>nul | find /I \"ABB-Setup\" >nul\r\n\
          if errorlevel 1 (\r\n\
          >>\"%LOG%\" echo [%DATE% %TIME%] [update] 安装器已退出且无 agent-bridge 进程（第 %%i 次轮询），兜底拉起\r\n\
