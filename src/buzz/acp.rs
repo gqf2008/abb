@@ -2776,11 +2776,17 @@ mod tests {
     #[ignore = "探针：真 spawn tests/mock_acp_agent.py 验证 spawn/init/prompt 全链（手动跑）"]
     async fn probe_real_mock_agent_roundtrip() {
         let script = format!("{}/tests/mock_acp_agent.py", env!("CARGO_MANIFEST_DIR"));
-        let rec = "/tmp/mock-probe.jsonl";
+        // 可移植（2026-10-04）：原先是 macOS 硬编码（/opt/homebrew/bin/python3 + /tmp 记录
+        // 文件），于是这条探针在 Windows 上必然 spawn 失败、失去验证价值。改为经 PATH 解析
+        // 解释器（找不到 python3 退到 python），记录文件走系统临时目录。
+        let python = crate::deps::find_in_path("python3")
+            .or_else(|| crate::deps::find_in_path("python"))
+            .expect("找不到 python3/python —— 这条探针需要本机有 python");
+        let rec = std::env::temp_dir().join("mock-probe.jsonl");
         let mut client = AcpClient::spawn(
-            "/opt/homebrew/bin/python3",
+            &python.display().to_string(),
             &[script],
-            &[("MOCK_RECORD_FILE".to_string(), rec.to_string())],
+            &[("MOCK_RECORD_FILE".to_string(), rec.display().to_string())],
         )
         .await
         .expect("spawn mock agent");

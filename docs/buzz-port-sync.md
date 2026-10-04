@@ -92,6 +92,7 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 | `harness.rs` / `acp.rs` | ABB 扩展字段（追加） | **spawn 进程保护（2026-10-04，v2.23.89）**：新增 `src/spawn_guard.rs`（ABB 私有，**非**同步区）——全局限速（`MIN_INTERVAL` 500ms）+ 有界指数退避（`FAIL_BASE` 1s → `FAIL_MAX` 60s）+ 熔断（连续 5 次失败 ⇒ 冷却 60s，之后半开试一次，成功复位）+ 静默衰减（120s）。**唯一入口 `async acquire()` 内部 sleep，调用方绕不过去**（owner 硬要求「不能死循环」）。接线：`AcpClient::spawn()` 在 `cmd.spawn()` 前 `acquire`，拒绝返回新变体 `AcpError::SpawnRefused` —— **刻意不算 transport error**（与 `SandboxUnsupported` 同一理据：agent 根本没起，当传输错误会 `schedule_death_respawn` + 标记 dead，后续消息全被预检拒掉）；`harness.rs` 在 `Ok(_)` 记成功复位、在 `AgentExited\|Timeout` / `CancelDrainTimeout` 记失败，并对 `SpawnRefused` **当场死信**（不进 requeue）+ 日志带守卫快照（连续失败数 / 冷却剩余）。上游无此概念，同步时保留。判据单测：`spawn_guard::tests`（8 例）。 |
 
 
+| acp.rs | ABB 扩展字段（追加） | **探针可移植化（2026-10-04，v2.23.97）**：probe_real_mock_agent_roundtrip 原硬编码 macOS 解释器路径（/opt/homebrew/bin/python3）与 /tmp 记录文件，在 Windows 上必然失败。改为 crate::deps::find_in_path("python3") 退化到 python + 系统临时目录。动机：会话级隔离（v2.23.96）改了 dispatch_pending 语义，而这条（及同批 25 条）mock-agent 测试是唯一端到端验证手段，必须能在本机跑起来做回归验证。 |
 ### 未迁决策登记（2026-09-30，区间 `c3132c3` → `2664d1431`，**未整体重定基线**）
 
 区间内触及 `crates/buzz-acp/` 的提交 23 个（+12147/−1540）。上面三条按 commit 增量挑入，其余 20 个按下表**不迁**（给出等价能力与重新评估触发条件，避免下次重复分析）：
