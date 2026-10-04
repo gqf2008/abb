@@ -483,6 +483,7 @@ fn main() {
         // 新模型（2026-10-04）：退役旧的高权限常驻计划任务。若本次**就是**它拉起来的，
         // 这一行会让下次登录改走托盘（普通用户）路径；随后把「仍在以高权限跑」留痕。
         platform::retire_legacy_bridge_task();
+        platform::retire_legacy_per_user_files();
         #[cfg(target_os = "windows")]
         if platform::is_elevated() {
             crate::log!(

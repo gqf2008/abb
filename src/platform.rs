@@ -2467,3 +2467,64 @@ mod tests {
         );
     }
 }
+
+/// 退役 per-user 时代的**文件**残留（2026-10-05 审计 #12b）。
+///
+/// 旧装法（≤2.23.97）把 ABB 装在 `%LOCALAPPDATA%\Programs\ABB` 并在开始菜单放 `ABB.lnk`；
+/// 迁到 per-machine 后那条快捷方式仍指向**已不存在**的旧 exe（用户点了没反应，只会觉得
+/// 「装坏了」）。这里做运行时兜底：文件只在存在时删；注册表**只检测不删**（清 HKCU 卸载项
+/// 需要精确枚举 + 删键，风险更高，按审计 #12b 的配方单列）。
+#[cfg(target_os = "windows")]
+pub fn retire_legacy_per_user_files() {
+    let Some(roaming) = dirs::config_dir() else {
+        return;
+    };
+    let lnk = roaming
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("ABB.lnk");
+    if lnk.exists() {
+        match std::fs::remove_file(&lnk) {
+            Ok(()) => crate::log!("[migrate] 已删除失效的旧开始菜单快捷方式 {}", lnk.display()),
+            Err(e) => crate::log!("[migrate] 删除旧快捷方式失败（跳过）：{e:#}"),
+        }
+    }
+    // 检测（不删）：旧 per-user 卸载项还在时点出来，便于人工或后续版本精确清理。
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall";
+    if let Ok(o) = crate::spawn::command("reg")
+        .args(["query", key, "/s"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&o.stdout);
+        if text.contains("Programs\\ABB") {
+            crate::log!(
+                "[migrate] 检测到旧 per-user 卸载项残留（InstallLocation 指向 Programs\\ABB）；本版只提示、未删键"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn retire_legacy_per_user_files() {}
+#[cfg(test)]
+mod legacy_files_guard_tests {
+    /// 旧 per-user 文件退役必须存在，且被启动路径调用（审计 #12b）。
+    ///
+    /// 判别力：删掉 `retire_legacy_per_user_files` 或它的调用 ⇒ 对应断言红。
+    #[test]
+    fn legacy_per_user_files_are_retired_on_startup() {
+        let src = include_str!("platform.rs");
+        assert!(
+            src.contains("pub fn retire_legacy_per_user_files()"),
+            "退役函数必须存在"
+        );
+        assert!(src.contains("ABB.lnk"), "必须处理失效的旧开始菜单快捷方式");
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("platform::retire_legacy_per_user_files()"),
+            "启动路径必须调用它（否则残留永远不会被清）"
+        );
+    }
+}
