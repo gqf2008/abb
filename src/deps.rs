@@ -199,35 +199,117 @@ pub fn composed_path() -> String {
 /// 通过 `reg query` 读取（零依赖；GUI 环境也能跑 reg.exe）。REG_EXPAND_SZ 里的
 /// %VAR% 不展开——多数是绝对路径，够用；展开交给 find_in_path 的逐段探测。
 #[cfg(windows)]
+/// 把注册表 Path 值切成目录列表（纯函数，单测点）。
+///
+/// **不做任何编码转换**：值本身已是 Unicode（见 `registry_string_value` 为何绕开控制台）。
+fn split_path_value(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
+}
+
+/// 直接读注册表字符串值（UTF-16），**不经过控制台**。
+///
+/// 为什么不用 `reg query`（2026-10-05 审计 #15）：`reg.exe` 是控制台程序，输出按**控制台
+/// 代码页**编码，而旧实现用 `from_utf8_lossy` 硬当 UTF-8 ⇒ 中文 Windows（默认 936）下
+/// PATH 里含中文的目录（如 `D:\软件\bin`）被解成 U+FFFD ⇒ 该目录从 composed_path 消失
+/// ⇒ find_in_path 判「工具未安装」，且没有任何原因提示。本机 ACP=65001 纯属配置侥幸。
+#[cfg(windows)]
+fn registry_string_value(scope: &str, value: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            hkey: *mut core::ffi::c_void,
+            sub: *const u16,
+            opt: u32,
+            access: u32,
+            out: *mut *mut core::ffi::c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: *mut core::ffi::c_void,
+            name: *const u16,
+            reserved: *mut u32,
+            ty: *mut u32,
+            data: *mut u8,
+            len: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hkey: *mut core::ffi::c_void) -> i32;
+    }
+    const HKEY_CURRENT_USER: usize = 0x8000_0001;
+    const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+    const KEY_READ: u32 = 0x2_0019;
+    let (root, sub) = scope.split_once('\\')?;
+    let hkey = match root {
+        "HKCU" => HKEY_CURRENT_USER,
+        "HKLM" => HKEY_LOCAL_MACHINE,
+        _ => return None,
+    } as *mut core::ffi::c_void;
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let sub_w = wide(sub);
+    let name_w = wide(value);
+    // SAFETY: 句柄在函数内关闭；缓冲区长度由 API 回填（不足则失败 ⇒ None）。
+    unsafe {
+        let mut key: *mut core::ffi::c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(hkey, sub_w.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+            return None;
+        }
+        let mut len: u32 = 0;
+        let mut ty: u32 = 0;
+        let rc = RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            std::ptr::null_mut(),
+            &mut len,
+        );
+        if rc != 0 || len == 0 {
+            RegCloseKey(key);
+            return None;
+        }
+        let mut buf: Vec<u8> = vec![0; len as usize + 2];
+        let rc2 = RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            buf.as_mut_ptr(),
+            &mut len,
+        );
+        RegCloseKey(key);
+        if rc2 != 0 {
+            return None;
+        }
+        // 不用 `chunks_exact(2)`（clippy 对常量尺寸有意见）——下标构造同样清晰。
+        let n = len as usize / 2;
+        let words: Vec<u16> = (0..n)
+            .map(|i| u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]))
+            .collect();
+        Some(
+            String::from_utf16_lossy(&words)
+                .trim_end_matches('\0')
+                .to_string(),
+        )
+    }
+}
+
 fn windows_registry_paths() -> Vec<String> {
     let mut out = Vec::new();
     for scope in [
         "HKCU\\Environment",
         "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
     ] {
-        let mut reg = std::process::Command::new("reg");
-        reg.args(["query", scope, "/v", "Path"]);
-        apply_no_window(&mut reg);
-        let Ok(o) = reg.output() else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&o.stdout);
-        // reg query 行格式：`    Path    REG_EXPAND_SZ    C:\a;C:\b`
-        if let Some(line) = text
-            .lines()
-            .find(|l| l.contains("REG_") && l.contains("Path"))
-        {
-            if let Some(value) = line
-                .split_once("REG_")
-                .and_then(|(_, v)| v.split_once(' ').map(|(_, r)| r))
-            {
-                for part in value.split(';') {
-                    let p = part.trim();
-                    if !p.is_empty() {
-                        out.push(p.to_string());
-                    }
-                }
-            }
+        if let Some(v) = registry_string_value(scope, "Path") {
+            out.extend(split_path_value(&v));
         }
     }
     out
@@ -1745,5 +1827,33 @@ mod tests {
         let s2 = format_all_summary(&long);
         assert!(s2.contains(&"长".repeat(100)), "截断至 100 字");
         assert!(!s2.contains(&"长".repeat(101)), "不超 100 字: {s2}");
+    }
+}
+
+#[cfg(test)]
+mod registry_path_guard_tests {
+    /// 切分不得做任何编码转换：中文目录必须原样保留（审计 #15）。
+    ///
+    /// 判别力：改用 `from_utf8_lossy` 之类先解码再切的写法 ⇒ 中文目录会被毁成 U+FFFD，断言红。
+    #[test]
+    fn split_keeps_non_ascii_dirs_verbatim() {
+        let v = crate::deps::split_path_value(r"C:\a;D:\软件\bin ; ;E:\b");
+        assert_eq!(v.len(), 3, "空段要丢掉：{v:?}");
+        assert!(
+            v.contains(&r"D:\软件\bin".to_string()),
+            "中文目录必须原样保留：{v:?}"
+        );
+    }
+
+    /// 生产侧必须直读注册表（UTF-16），不得再 spawn `reg query` + lossy 解码。
+    #[test]
+    fn registry_path_is_read_as_unicode_not_via_console() {
+        let src = include_str!("deps.rs");
+        assert!(src.contains("RegQueryValueExW"), "必须直读注册表（UTF-16）");
+        let bad = concat!("String::from_utf8_", "lossy(&o.stdout)");
+        assert!(
+            !src.contains(bad),
+            "不得再把控制台输出当 UTF-8 解（中文目录会变 U+FFFD）"
+        );
     }
 }
