@@ -972,6 +972,19 @@ mod installer_guards {
     ///
     /// 这条守卫是**反向锁**：谁把「注册计划任务」那条路加回来（隐藏子命令 / 高权限 XML /
     /// 任务名），这里立刻红。旧的 `--install-bridge-task` 子命令也已从 main.rs 删除。
+    /// 去提权的收尾：旧版本装过这三个提权件，升级时必须删掉 —— 否则它们永远留在
+    /// Program Files 里（owner 2026-10-04 专门问过这三个文件还在不在）。
+    #[test]
+    fn installer_deletes_the_retired_privileged_helpers() {
+        let section = ISS
+            .split("[InstallDelete]")
+            .nth(1)
+            .expect("安装脚本必须有 [InstallDelete] 段（清理已下线的提权件）");
+        for exe in ["abb-spawner.exe", "abb-elev-helper.exe", "abb-helper.exe"] {
+            assert!(section.contains(exe), "升级时必须删除已下线的提权件：{exe}");
+        }
+    }
+
     #[test]
     fn installer_pascal_section_has_no_semicolon_comments() {
         // 2026-10-04 真实教训：`[Code]` 段是 **Pascal**，注释只能是 `//` 或 `{}`；`;` 不是注释

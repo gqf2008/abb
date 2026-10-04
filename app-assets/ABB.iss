@@ -48,6 +48,14 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; 2026-10-04 去提权收尾：这三个提权件已从产品中删除（Cargo.toml 里 0 个 [[bin]]），但旧版本
+; 装过它们 —— 升级时必须删掉，否则永远留在 Program Files 里（owner 2026-10-04 专门问过）。
+; abb-helper 是 macOS 专用，旧版 Windows 包也带着它，故一并清。
+Type: files; Name: "{app}\abb-spawner.exe"
+Type: files; Name: "{app}\abb-elev-helper.exe"
+Type: files; Name: "{app}\abb-helper.exe"
+
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
