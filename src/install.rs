@@ -977,20 +977,20 @@ mod installer_guards {
         // 为什么不再全禁：`[InstallDelete]` 里用 `{localappdata}\Programs\ABB` **清理旧 per-user
         // 残留**是正当的（审计 #12，本机实测残留 162MB + 失效快捷方式），全禁会把正当用法判红。
         // 收窄后判别力更强：定位/复制指令真被改回 localappdata 仍然红。
-        let offenders: Vec<&String> = code_lines()
-            .iter()
-            .filter(|l| l.contains("localappdata"))
-            .filter(|l| {
-                let t = l.trim_start();
-                t.starts_with("DefaultDirName")
-                    || t.starts_with("DestDir")
-                    || t.starts_with("Source")
-                    || t.starts_with("Filename")
-            })
-            .collect();
+        // 单表达式完成判定：`code_lines()` 的返回值借用于临时值，跨语句存引用会 E0716。
+        let offending = code_lines().iter().any(|l| {
+            if !l.contains("localappdata") {
+                return false;
+            }
+            let t = l.trim_start();
+            t.starts_with("DefaultDirName")
+                || t.starts_with("DestDir")
+                || t.starts_with("Source")
+                || t.starts_with("Filename")
+        });
         assert!(
-            offenders.is_empty(),
-            "安装位置/复制/启动指令里不得出现 localappdata（per-machine 的前提）：{offenders:?}"
+            !offending,
+            "安装位置/复制/启动指令里不得出现 localappdata（per-machine 的前提）"
         );
     }
 
