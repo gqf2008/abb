@@ -295,6 +295,19 @@ pub fn svc_stop_keep_desired() -> Result<()> {
 /// 顺序：**先确认真的停掉，再改意图标记与 pid 文件**。反过来的话，kill 失败时盘上会留下
 /// 「标记=已停、pid 文件已删、进程还在跑」的错位状态，看门狗也不会把它拉回来 —— 用户看到
 /// 的就是「点了停止，什么都没发生，也没有任何提示」。
+/// 停止之后该不该删 pid 文件？（纯函数，单测点）
+///
+/// - 记录值 == 我们刚停掉的 pid ⇒ 该删（正常路径）；
+/// - 记录值为空 / 解析不出 ⇒ 也该删（清掉垃圾）；
+/// - 记录值是**别的** pid ⇒ 说明窗口内已有新实例把自己的 pid 写了进去 ⇒ **绝不能删**
+///   （删了会让托盘「显示已停止」而服务其实在跑 —— 与 owner 反复报的「点了停止没反应」同型）。
+fn should_clear_pid_file(recorded: Option<u32>, stopped_pid: u32) -> bool {
+    match recorded {
+        Some(p) => p == stopped_pid,
+        None => true,
+    }
+}
+
 fn svc_stop_impl(keep_desired: bool) -> Result<()> {
     let st = status();
     // 诊断先行：下次再出现「点了没反应」，日志里至少能看出当时判成了什么形态。
@@ -316,7 +329,16 @@ fn svc_stop_impl(keep_desired: bool) -> Result<()> {
         }
     }
     apply_stop_intent(&logs_dir(), keep_desired);
-    let _ = std::fs::remove_file(pid_file());
+    // 只清「我们刚停掉的那个 pid」的 pid 文件（2026-10-05 审计 #25）。原来是无条件删：
+    // 停止路径走到 terminate 结束才清 desired，这段窗口里看门狗可能已经新建 service 并
+    // 写好自己的 pid ⇒ 无条件删会把**新实例**的 pid 文件删掉 ⇒ 托盘显示「已停止」而服务
+    // 其实在跑（诊断日志里也会出现「已启动 service pid=」与「已停止」交替的怪象）。
+    let recorded = std::fs::read_to_string(pid_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    if should_clear_pid_file(recorded, st.pid) {
+        let _ = std::fs::remove_file(pid_file());
+    }
     Ok(())
 }
 
@@ -1225,6 +1247,28 @@ mod installer_guards {
         assert!(
             !code_lines().iter().any(|l| l.contains("ABB-Bridge")),
             "安装脚本不得再注册/管理 ABB-Bridge 常驻任务（新模型不再有它）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pid_clear_guard_tests {
+    /// 停止只能清「自己停掉的那个 pid」的文件，绝不能删掉窗口内新实例写进去的 pid。
+    ///
+    /// 判别力（2026-10-05 审计 #25）：把判据改成恒 true（即退回无条件删）⇒ 第三条断言红。
+    #[test]
+    fn stop_clears_only_the_pid_it_stopped() {
+        assert!(
+            crate::install::should_clear_pid_file(Some(1234), 1234),
+            "同一个 pid ⇒ 删"
+        );
+        assert!(
+            crate::install::should_clear_pid_file(None, 0),
+            "空/坏文件 ⇒ 清掉"
+        );
+        assert!(
+            !crate::install::should_clear_pid_file(Some(5678), 1234),
+            "别的 pid（新实例）⇒ 绝不能删，否则托盘显示已停止而服务在跑"
         );
     }
 }
