@@ -13,6 +13,42 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
+/// 这个 Windows 打开失败是不是**确实**有别的实例在跑？
+///
+/// 只有 `ERROR_SHARING_VIOLATION(32)` 才算：`share_mode(0)` 的独占打开在「别人持有」时返回它。
+/// 其它错误（安全软件/索引器/备份工具短暂持有、权限、路径异常）**不能**当已有实例 ——
+/// 否则托盘会静默不启动：用户双击图标「什么都没发生」，日志却说「已有一个实例在运行」
+/// （2026-10-05 审计 #9；本机自述在跑火绒 HIPS，属真实前提）。
+#[cfg(any(windows, test))]
+fn is_already_running(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(32)
+}
+
+#[cfg(test)]
+mod share_violation_tests {
+    use super::*;
+
+    /// 只有「共享冲突」才算已有实例；其它打开失败必须如实上报。
+    ///
+    /// 判别力（2026-10-05 审计 #9）：把判据退回「任何 io 错误都算已有实例」⇒ 第二、三条断言必红。
+    #[test]
+    fn only_sharing_violation_means_already_running() {
+        use std::io::{Error, ErrorKind};
+        assert!(
+            is_already_running(&Error::from_raw_os_error(32)),
+            "ERROR_SHARING_VIOLATION(32) 才是真的有实例在跑"
+        );
+        assert!(
+            !is_already_running(&Error::from_raw_os_error(5)),
+            "拒绝访问不是「已有实例」——吞掉它会让托盘静默不启动"
+        );
+        assert!(
+            !is_already_running(&Error::new(ErrorKind::PermissionDenied, "x")),
+            "没有 os error 的失败更不是「已有实例」"
+        );
+    }
+}
+
 pub struct SingleInstance {
     _file: File, // 持有 fd 即持有锁；drop 时内核释放
     name: String,
@@ -124,17 +160,42 @@ impl SingleInstance {
         // 关句柄或进程崩溃即由内核释放，不残留假锁。
         #[cfg(windows)]
         #[allow(clippy::suspicious_open_options)]
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .share_mode(0)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "已有一个 agent-bridge「{name}」实例在运行（无法独占锁文件 {}）。本实例退出。",
-                    path.display()
-                )
-            })?;
+        let file = {
+            let mut attempt = 0u32;
+            loop {
+                match OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&path)
+                {
+                    Ok(f) => break f,
+                    Err(e) if is_already_running(&e) => {
+                        anyhow::bail!(
+                            "已有一个 agent-bridge「{name}」实例在运行（无法独占锁文件 {}）。本实例退出。",
+                            path.display()
+                        );
+                    }
+                    // 其它错误：**不能**当「已有实例」。短暂占用（杀软/索引/备份）重试几次；
+                    // 仍失败就把真实原因抛出去，让上层能看见，而不是假装「已经在跑」。
+                    Err(e) if attempt < 5 => {
+                        attempt += 1;
+                        crate::log!(
+                            "[single-instance] 打开锁文件失败（第 {attempt} 次，将重试）：{e:#}"
+                        );
+                        std::thread::sleep(Duration::from_millis(120));
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "打开锁文件失败（不是「已有实例」，是真实错误）：{}",
+                                path.display()
+                            )
+                        });
+                    }
+                }
+            }
+        };
         #[cfg(unix)]
         {
             let fd = file.as_raw_fd();
