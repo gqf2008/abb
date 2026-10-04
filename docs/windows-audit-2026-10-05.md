@@ -53,7 +53,7 @@
 17. ✅ 已修（main 6cb3446）软链失败被 let _ = 吞掉还谎报「已补链 N 个」（普通用户 + 未开开发者模式则技能永久缺失）
    位置：src/larkskills.rs:46-53
    修法：注入「建链必失败」的 linker 断言成功计数为 0，或改用无需特权的 junction
-18. 钉钉 Stream 的 sink.send 无超时（半开连接冻死 select，180s 看门狗永不触发）
+18. ✅ 已修（main d92dcb5 第一批 + f1bab12 收尾） 钉钉 Stream 的 sink.send 无超时（半开连接冻死 select，180s 看门狗永不触发）
    位置：src/dingtalk.rs:1052/1058/1099/1114/1130/1141
    修法：参照 src/ws.rs:93-104 包 tokio::time::timeout；源码守卫断言每个 sink.send 外层有超时
 19. 微信游标不持久化（每次重启从空游标开始，升级窗口内消息大概率丢）
