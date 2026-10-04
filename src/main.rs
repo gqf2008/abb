@@ -688,6 +688,14 @@ fn main() {
     // 不接的话 `log!` 全蒸发——「装完托盘没回来」这类问题连失败原因都留不下（2026-10-01 实报）。
     // **必须在拿 gui 锁之前**：拿不到锁而退出正是最需要留痕的那条路径。
     attach_log_file("gui.out");
+    // #26（2026-10-05 审计实测）：高完整性实例会把管理员令牌**传染给服务与 agent**。
+    // 此前只有 agent spawn 那一刻才提示「本进程正以管理员权限运行」，用户很难注意到；
+    // 这里启动即显式告警并给出可操作指令。绝不允许「悄悄以管理员跑」。
+    if crate::platform::is_elevated() {
+        crate::log!(
+            "[gui] ⚠ 当前 ABB 以管理员权限运行：服务与 agent 会继承该权限（与「全部普通用户运行」模型相悖）；退出后用普通身份重新启动即可"
+        );
+    }
     if args.iter().any(|a| a == "--diag-tray") {
         diag_tray_image();
         return;
@@ -3090,6 +3098,25 @@ mod stdout_handle_guard_tests {
         assert!(
             !crate::stdout_handle_usable(1234, 0x0002),
             "NUL/控制台（FILE_TYPE_CHAR）不可用：否则日志写进 NUL 全部蒸发"
+        );
+    }
+}
+
+#[cfg(test)]
+mod elevation_notice_guard_tests {
+    /// 启动时必须检查并告警「高完整性运行」（#26）。
+    ///
+    /// 判别力：删掉 `is_elevated()` 那段告警 ⇒ 第一条断言红。
+    #[test]
+    fn gui_warns_loudly_when_running_elevated() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("crate::platform::is_elevated()"),
+            "启动路径必须检测高完整性运行（否则管理员令牌会悄悄传染给 agent）"
+        );
+        assert!(
+            src.contains("以管理员权限运行：服务与 agent 会继承该权限"),
+            "必须给出显式告警与可操作指令"
         );
     }
 }
