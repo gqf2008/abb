@@ -1,3 +1,9 @@
+// Rust 1.99 的 clippy 新增 `double_must_use`：`async_trait` 生成的 `Pin<Box<dyn Future>>` 与
+// `#[must_use]` 叠加，会对本 crate 里每个 async_trait 各报一次（2026-10-04 实测 14 处，分布在
+// teamflow / session_gc 等多处；本机 clippy 0.1.98 不报、CI 的 stable 已是 1.99 ⇒ main 的 CI 红）。
+// 这是**宏生成形态**、不是我们能改的代码，故在 crate 级 allow 一次；等 async_trait 上游适配后移除。
+// （比逐个模块 allow 更稳：以后新增 async_trait 不会再漏。）
+#![allow(clippy::double_must_use)]
 // ABB — Rust + Slint 单二进制双模式
 //   agent-bridge            → 托盘控制器（Slint GUI）
 //   agent-bridge --service  → 无头桥守护进程（纯 tokio，LaunchAgent 跑）
