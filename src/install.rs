@@ -145,6 +145,15 @@ pub fn status() -> ServiceStatus {
     }
 }
 
+/// `taskkill` 的「进程不存在」判定（Windows 退出码 128 + `ERROR: The process "N" not found.`）。
+///
+/// 抽成纯函数是为了能单测：这条路径踩过「把已经消失的进程当成停失败」的坑，
+/// 而它一旦被判成失败，会顺着 `svc_start` 把「启动服务」整个挡死（2026-10-05 事故）。
+fn taskkill_reports_missing(taskkill_stderr: &str) -> bool {
+    let s = taskkill_stderr.to_ascii_lowercase();
+    s.contains("not found") || s.contains("不存在") || s.contains("没有找到")
+}
+
 /// 启动 service 子进程（若已在跑则先停），并起线程收割（防僵尸）。
 /// 会顺带把「意图=运行」标记置上（看门据此在崩溃时重拉）。
 pub fn svc_start() -> Result<()> {
@@ -160,7 +169,18 @@ pub fn svc_start() -> Result<()> {
     }
     let st = status();
     if st.running {
-        svc_stop()?;
+        // 先停旧实例 —— 但**停不掉绝不能挡住启动**。
+        //
+        // 2026-10-05 owner 实报「渠道连不上了」：升级时安装器已经杀掉服务，而 pid 文件
+        // 里还留着旧值、那个旧 pid 又被系统**复用**给了别的进程 ⇒ `status()` 判「在跑」⇒
+        // 这里 `svc_stop()?` 因 taskkill 报「进程不存在」把整个 `svc_start` 打成 Err ⇒
+        // 服务永远起不来、四个 bot 全掉线（看门狗每 2s 重试一次、每次都失败）。
+        //
+        // 现在：停失败只记一条日志，继续启动。若旧实例**真的**还在跑，新进程会撞上
+        // 单实例锁并立刻退出，由 `svc_start_verified` 如实报告失败 —— 不会静默「假启动」。
+        if let Err(e) = svc_stop() {
+            crate::log!("[watchdog] 启动前停旧 service 失败（继续启动）：{e:#}");
+        }
     }
     set_desired(true);
     let exe = crate::platform::current_exe()?;
@@ -450,6 +470,13 @@ pub(crate) fn terminate_with_grace(pid: u32, grace: std::time::Duration) -> Resu
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let err = err.trim();
+            // 「进程不存在」不是失败：目标本来就没了 = 「停」的目的已经达到。
+            // 旧实现把它当错误，再叠加 `svc_start` 里的 `svc_stop()?`，直接把「启动」挡死
+            // —— 2026-10-05 四个 bot 全掉线的根因之一（升级后服务再也起不来）。
+            if taskkill_reports_missing(err) {
+                crate::log!("[watchdog] taskkill 目标 pid={pid} 已不存在，视为已停止");
+                return Ok(());
+            }
             anyhow::bail!(
                 "taskkill 失败（{}）：{}；若为「拒绝访问」说明该进程以更高权限运行，普通权限停不掉（需要管理员授权）",
                 out.status,
@@ -461,6 +488,23 @@ pub(crate) fn terminate_with_grace(pid: u32, grace: std::time::Duration) -> Resu
         } else {
             anyhow::bail!("taskkill 报成功但 pid={pid} 仍在运行")
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_guard_tests {
+    use super::*;
+
+    /// 升级后服务起不来的根因之一：`taskkill` 报「进程不存在」被判成停失败。
+    /// 判别力：把 `taskkill_reports_missing` 改成恒 false，这条必红。
+    #[test]
+    fn taskkill_missing_process_is_not_a_stop_failure() {
+        assert!(taskkill_reports_missing(
+            "ERROR: The process \"12012\" not found."
+        ));
+        assert!(taskkill_reports_missing("错误: 没有找到进程 \"12012\"。"));
+        assert!(!taskkill_reports_missing("ERROR: Access is denied."));
+        assert!(!taskkill_reports_missing(""));
     }
 }
 
