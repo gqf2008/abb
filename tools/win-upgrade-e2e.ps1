@@ -47,7 +47,14 @@ if (-not $Setup -or -not (Test-Path $Setup)) { Write-Host '✗ 需要 -Setup <�
 Write-Host ('== 静默升级：' + $Setup + ' ==')
 $t0 = Get-Date
 $p = Start-Process -FilePath $Setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -PassThru
-$p.WaitForExit()
+# 有界等待（2026-10-05 实测教训）：安装器需要 UAC 提权，若无人点「是」它会一直等 ⇒
+# 旧写法 WaitForExit() 会把整个验证脚本无限挂起（实测挂了 10 分钟以上、无任何提示）。
+# 现在最多等 5 分钟，超时即响亮失败 ——「绝不无限挂起」是本次审计对全仓的要求。
+if (-not $p.WaitForExit(300000)) {
+  Write-Host '✗ 安装器 5 分钟内未完成：多半是 UAC 授权弹窗没人点（per-machine 安装需要管理员）'
+  try { $p.Kill() } catch { }
+  exit 3
+}
 Say ('安装器退出码=' + $p.ExitCode)
 $dl = (Get-Date).AddSeconds($RecoverTimeoutSec)
 while ((Get-Date) -lt $dl) { $r = Get-Roles; if ($r.Tray.Count -ge 1 -and $r.Svc.Count -ge 1) { break }; Start-Sleep -Seconds 3 }
