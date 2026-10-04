@@ -38,8 +38,6 @@ if (-not $SkipBuild) {
   Say '构建根程序（release）…'
   & cargo build --release --locked --bin agent-bridge | Out-Host
   if ($LASTEXITCODE -ne 0) { Fail '根程序构建失败' }
-  Remove-Item $rootExe -ErrorAction SilentlyContinue
-  Copy-Item 'target\release\agent-bridge.exe' $rootExe -ErrorAction SilentlyContinue
 
   Say '构建 fork buzz-agent（release，用 fork 自己的 target 目录）…'
   & cargo build --release --manifest-path crates/buzz-agent/Cargo.toml | Out-Host
