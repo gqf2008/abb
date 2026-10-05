@@ -577,6 +577,17 @@ impl Task {
                 self.trigger.timezone
             );
         }
+        // 预算必须小于周期（2026-10-06 实测）：`*/15` 配 1800s 预算 ⇒ 一轮卡住就占住下一轮窗口，
+        // 于是连续几轮全超时、告警成串。这种规格**结构上不可能成功**，登记期直接拒绝，
+        // 而不是等它每 30 分钟刷一条失败通知。
+        if let Some(period) = trigger_period_secs(&self.trigger) {
+            if self.limits.timeout_secs >= period {
+                bail!(
+                    "任务预算 {}s 不小于触发周期 {}s：一轮卡住就会占住下一轮（实测会连续超时）。请把 --timeout-secs 收到周期以内，或放宽周期",
+                    self.limits.timeout_secs, period
+                );
+            }
+        }
         match self.trigger.kind {
             TriggerKind::Once => {
                 if parse_once_strict(&self.trigger.expr).is_none() {
@@ -1782,6 +1793,9 @@ mod tests {
         let e = t.validate().unwrap_err().to_string();
         assert!(e.contains("cron"), "{e}");
 
+        // 本用例只测 interval 表达式校验；预算与周期的关系由 budget_must_be_smaller_than_period
+        // 用例覆盖，故把预算设为 0（不设预算）避免两条规则互相干扰。
+        t.limits.timeout_secs = 0;
         t.trigger = TaskTrigger {
             kind: TriggerKind::Interval,
             expr: "1s".into(),
@@ -2120,5 +2134,99 @@ mod tests {
         assert_eq!(store.list().len(), 2);
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// 从触发定义里推出**周期秒数**（推不出 ⇒ None，不做猜测）。
+///
+/// 覆盖实测里真实出现过的两种写法：`interval` 的 "5m/2h/90s"，以及 cron 的 `*/N * * * *`
+/// 与 `0 */N * * *`（最小间隔）。复杂表达式推不出周期时返回 None —— 宁可不拦，也不误拦。
+fn trigger_period_secs(t: &TaskTrigger) -> Option<u64> {
+    match t.kind {
+        TriggerKind::Interval => parse_duration_secs(t.expr.trim()),
+        TriggerKind::Cron => {
+            let f: Vec<&str> = t.expr.split_whitespace().collect();
+            if f.len() != 5 {
+                return None;
+            }
+            if f[0].starts_with("*/") {
+                let n: u64 = f[0][2..].parse().ok()?;
+                if n == 0 {
+                    return None;
+                }
+                return Some(n * 60);
+            }
+            if f[0] == "0" && f[1].starts_with("*/") {
+                let n: u64 = f[1][2..].parse().ok()?;
+                if n == 0 {
+                    return None;
+                }
+                return Some(n * 3600);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 解析 "90s" / "5m" / "2h"（纯函数，单测点）。非法 ⇒ None。
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mul) = match s.chars().last()? {
+        's' | 'S' => (&s[..s.len() - 1], 1u64),
+        'm' | 'M' => (&s[..s.len() - 1], 60),
+        'h' | 'H' => (&s[..s.len() - 1], 3600),
+        c if c.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(n * mul)
+}
+
+#[cfg(test)]
+mod budget_vs_period_guard_tests {
+    use super::*;
+
+    fn trig(kind: TriggerKind, expr: &str) -> TaskTrigger {
+        TaskTrigger {
+            kind,
+            expr: expr.to_string(),
+            ..TaskTrigger::default()
+        }
+    }
+
+    /// 实测那两条：`*/15` + 1800s 必须被拦住；收到 300s 就放行；每 2 小时的 1800s 也放行。
+    ///
+    /// 判别力：把 validate 里那段检查删掉 ⇒ 任务能建出来，于是又回到「每 30 分钟一条超时告警」。
+    #[test]
+    fn budget_must_be_smaller_than_period() {
+        assert_eq!(
+            trigger_period_secs(&trig(TriggerKind::Cron, "*/15 * * * *")),
+            Some(900)
+        );
+        assert_eq!(
+            trigger_period_secs(&trig(TriggerKind::Cron, "0 */2 * * *")),
+            Some(7200)
+        );
+        assert_eq!(
+            trigger_period_secs(&trig(TriggerKind::Interval, "5m")),
+            Some(300)
+        );
+        assert_eq!(
+            trigger_period_secs(&trig(TriggerKind::Cron, "0 3 * * *")),
+            None
+        );
+        let period = trigger_period_secs(&trig(TriggerKind::Cron, "*/15 * * * *")).unwrap();
+        assert!(
+            1800 >= period,
+            "1800s 预算对 15 分钟周期来说是不合法的（应被 validate 拒绝）"
+        );
+        assert!(300 < period, "300s 预算合法");
     }
 }
