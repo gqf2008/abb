@@ -2623,3 +2623,88 @@ mod legacy_uninstall_guard_tests {
         );
     }
 }
+
+/// 自愈脚本内容：每 5 分钟由计划任务调用；没有托盘就拉起（判活排除 --service / mcp-events）。
+///
+/// 为什么需要它：2026-10-05 实测安装器 `[Run]` 拉起的实例**连 main() 都没到**（boot.log 无记录），
+/// 升级时那个一次性 .cmd 也可能静默放弃 ⇒ 必须有常驻自愈兜底，最坏 5 分钟内把托盘拉回来。
+pub fn ensure_tray_cmd(exe: &std::path::Path, log: &std::path::Path) -> String {
+    let lines: [&str; 12] = [
+        "@echo off",
+        "rem ABB 自愈：没有托盘就拉起（每 5 分钟一次）。判活必须排除 --service 与 mcp-events，",
+        "rem 否则会把常驻服务或每个会话的 MCP 辅助进程误判成托盘（2026-10-05 实测：装完 23 分钟无人接手）。",
+        "setlocal enabledelayedexpansion",
+        "set \"EXE=__EXE__\"",
+        "set \"LOG=__LOG__\"",
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' -and $_.CommandLine -notmatch 'mcp-events' }); if ($t.Count -gt 0) { 'TRAY' } else { 'NONE' }\" > \"%TEMP%\\abb-ensureprobe.txt\" 2>nul",
+        "set /p PROBE=<\"%TEMP%\\abb-ensureprobe.txt\"",
+        "if /I \"!PROBE!\"==\"TRAY\" exit /b 0",
+        ">>\"%LOG%\" echo [%DATE% %TIME%] [ensure] 未检测到托盘 ⇒ 自愈拉起",
+        "start \"\" \"%EXE%\"",
+        "exit /b 0",
+    ];
+    lines
+        .join("\r\n")
+        .replace("__EXE__", &exe.display().to_string())
+        .replace("__LOG__", &log.display().to_string())
+        + "\r\n"
+}
+
+/// 写自愈脚本并注册/刷新计划任务（当前用户、每 5 分钟、低权限、无需管理员）。失败只记日志。
+#[cfg(target_os = "windows")]
+pub fn ensure_running_task() {
+    let logs = crate::bridge_dir().join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    // 注意：名字不能用 ensure-running.cmd —— 本机该路径已存在且是个目录（实测写入 EISDIR）。
+    let script = logs.join("ensure-tray.cmd");
+    let log = logs.join("update.log");
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agent-bridge.exe"));
+    if let Err(e) = std::fs::write(&script, ensure_tray_cmd(&exe, &log)) {
+        crate::log!("[ensure] 写自愈脚本失败（跳过注册）：{e:#}");
+        return;
+    }
+    let action = format!("cmd /c \"{}\"", script.display());
+    match crate::spawn::command("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            "ABB-EnsureRunning",
+            "/tr",
+            &action,
+            "/sc",
+            "minute",
+            "/mo",
+            "5",
+            "/f",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => crate::log!(
+            "[ensure] 注册自愈任务失败（不影响运行）：{}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => crate::log!("[ensure] schtasks 执行失败（跳过自愈任务）：{e:#}"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ensure_running_task() {}
+
+#[cfg(test)]
+mod ensure_tray_guard_tests {
+    /// 自愈脚本必须精确判活（排除 mcp-events / --service）且未在跑就拉起并留痕。
+    ///
+    /// 判别力：把 `mcp-events` 排除去掉 ⇒ 第一条断言红（2026-10-05 实测事故就是这个）。
+    #[test]
+    fn ensure_tray_cmd_is_precise_and_self_healing() {
+        let s = crate::platform::ensure_tray_cmd(
+            std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
+            std::path::Path::new(r"C:\x\update.log"),
+        );
+        assert!(s.contains("mcp-events"), "判活必须排除 mcp-events：{s}");
+        assert!(s.contains("--service"), "判活必须排除 --service");
+        assert!(s.contains("自愈拉起"), "未在跑必须拉起并留痕");
+    }
+}

@@ -488,6 +488,8 @@ fn main() {
         platform::retire_legacy_bridge_task();
         platform::retire_legacy_per_user_files();
         platform::retire_legacy_uninstall_keys();
+        // 常驻自愈：2026-10-05 实测安装器 [Run] 拉起的实例连 main 都没到 ⇒ 必须有常驻兜底
+        platform::ensure_running_task();
         #[cfg(target_os = "windows")]
         if platform::is_elevated() {
             crate::log!(
