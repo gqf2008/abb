@@ -36,6 +36,7 @@ mod outbox;
 mod pending;
 mod permreq;
 mod platform;
+mod proc_group;
 mod proto;
 mod redact;
 mod schedule;
