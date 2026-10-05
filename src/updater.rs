@@ -682,19 +682,34 @@ pub(crate) fn post_update_relaunch_script(exe: &Path, log_path: &Path) -> String
          rem ABB 安装后兜底重启：安装器 [Run] 在静默安装下不可靠（2026-10-01 / 10-05 两次实测\r\n\
          rem Setup Log 显示 Run entry 已执行，但没有留下任何 ABB 进程）。本脚本是主路径。\r\n\
          rem 每 2 秒轮询：已有 APP ⇒ 退出；安装器已退出且无 APP ⇒ 立刻拉起；硬上界 150 次。\r\n\
-         setlocal\r\n\
+         setlocal enabledelayedexpansion\r\n\
          set \"EXE={exe}\"\r\n\
          set \"LOG={log}\"\r\n\
+         set /a TRAY=0\r\n\
+         >>\"%LOG%\" echo [%DATE% %TIME%] [update] 兜底看门狗启动：顶替安装器 [Run]（每 2 秒轮询，硬上界 150 次）\r\n\
          for /L %%i in (1,1,150) do (\r\n\
          rem 判托盘是否已在跑不能按镜像名：常驻服务就是同名的 agent-bridge.exe --service\r\n\
          rem 服务活着时按名判活会误判已起来而永不拉起托盘（2026-10-05 审计发现）\r\n\
          rem 这里按命令行是否带 --service 区分；不带 = 托盘在跑 ⇒ 直接退出\r\n\
-         powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }}); if ($t.Count -gt 0) {{ exit 0 }} else {{ exit 1 }}\" && goto :done\r\n\
+         rem 2026-10-05 加固（实测：安装成功后 23 分钟无人接手、update.log 干净、零证据）：\r\n\
+         rem 原先是「探到托盘 ⇒ 静默 goto :done」⇒ 旧托盘退出中的那一瞬被当成「已在跑」，看门狗直接放弃。\r\n\
+         rem 现在：探测结果落文件 + 延迟展开读取；连续两次探到托盘才判定已接手；每一步都写日志。\r\n\
+         powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }}); if ($t.Count -gt 0) {{ 'TRAY' }} else {{ 'NONE' }}\" > \"%TEMP%\\abb-trayprobe.txt\" 2>nul\r\n\
+         set /p PROBE=<\"%TEMP%\\abb-trayprobe.txt\"\r\n\
+         if /I \"!PROBE!\"==\"TRAY\" ( set /a TRAY+=1 ) else ( set /a TRAY=0 )\r\n\
          tasklist /FI \"IMAGENAME eq ABB-Setup-*.exe\" 2>nul | find /I \"ABB-Setup\" >nul\r\n\
-         if errorlevel 1 (\r\n\
-         >>\"%LOG%\" echo [%DATE% %TIME%] [update] 安装器已退出且无 agent-bridge 进程（第 %%i 次轮询），兜底拉起\r\n\
+         if not errorlevel 1 (\r\n\
+         rem 安装器还在跑：继续等（不判活、不拉起）\r\n\
+         ) else (\r\n\
+         if !TRAY! GEQ 2 (\r\n\
+         >>\"%LOG%\" echo [%DATE% %TIME%] [update] 连续 !TRAY! 次探到托盘在跑（第 %%i 次轮询）⇒ 判定已接手，看门狗退出\r\n\
+         goto :done\r\n\
+         )\r\n\
+         if !TRAY! EQU 0 (\r\n\
+         >>\"%LOG%\" echo [%DATE% %TIME%] [update] 安装器已退出且无托盘在跑（第 %%i 次轮询）⇒ 兜底拉起\r\n\
          start \"\" \"%EXE%\"\r\n\
          goto :done\r\n\
+         )\r\n\
          )\r\n\
          ping -n 2 127.0.0.1 >nul\r\n\
          )\r\n\
@@ -1027,5 +1042,27 @@ mod tests {
     fn pick_asset_linux_none() {
         let names = vec!["ABB-2.15.0.dmg".to_string()];
         assert_eq!(pick_asset(&names, "2.15.0"), None);
+    }
+}
+
+#[cfg(test)]
+mod relaunch_watchdog_guard_tests {
+    /// 兜底看门狗必须：启动即留痕、连续两次才判「已接手」、任何分支都写日志（2026-10-05 实测事故）。
+    ///
+    /// 判别力：把静默放弃（探到托盘直接 goto :done）改回去 ⇒ 第三条断言红。
+    #[test]
+    fn fallback_watchdog_logs_every_branch_and_debounces() {
+        let s = crate::updater::post_update_relaunch_script(
+            std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
+            std::path::Path::new(r"C:\x\update.log"),
+        );
+        assert!(s.contains("兜底看门狗启动"), "启动就要留痕：{s}");
+        assert!(
+            s.contains("set /a TRAY=0") && s.contains("GEQ 2"),
+            "必须连续两次才判已接手"
+        );
+        let silent = concat!("if ($t.Count -gt 0) {{ exit 0 }}", " && goto :done");
+        assert!(!s.contains(silent), "不得再有「探到托盘就静默放弃」的分支");
+        assert!(s.contains("判定已接手"), "判活分支必须写日志");
     }
 }
