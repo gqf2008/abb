@@ -260,10 +260,16 @@ jobs:
           }
           Write-Host "ISCC found: $((Get-Command ISCC.exe).Source)"
 
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & ISCC.exe /DMyAppVersion=$version app-assets\ABB.iss
+
       - name: Assert installer filename matches the version (#374)
-        # 2026-10-05 审计 #12：客户端按**文件名里的版本**取资产；`/D` 失效时产物会叫
-        # ABB-Setup-<旧版本>.exe，而 `pick_asset` 会回退「任意 ABB-Setup-*.exe」+ SHA256SUMS
-        # 同源 ⇒ 校验通过 ⇒ 把旧版当新版装，形成降级循环。这条断言让它在发版时就炸。
+        # 2026-10-05 发版实测：这一步原先排在 "Build installer" **之前** ⇒ Test-Path 必然
+        # 失败，任何 tag 发版都会在 windows 上红。断言必须在产物生成后再跑。
         shell: pwsh
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' ).Matches[0].Groups[1].Value
@@ -273,13 +279,6 @@ jobs:
             exit 1
           }
           Write-Host "✓ 安装包名与版本一致：$want"
-
-      - name: Build installer
-        shell: pwsh
-        run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & ISCC.exe /DMyAppVersion=$version app-assets\ABB.iss
 
       # Windows 代码签名：有证书时启用（Azure Trusted Signing 或 EV），否则跳过。
       # 注意：secrets 不能出现在 if 条件里（workflow 会解析失败），所以运行时判断。

@@ -194,12 +194,10 @@ pub fn composed_path() -> String {
     parts.join(";")
 }
 
-/// Windows 持久 PATH（注册表）：HKCU\Environment（用户级）与
-/// HKLM\...\Session Manager\Environment（系统级）的 Path 值，分号分隔。
-/// 通过 `reg query` 读取（零依赖；GUI 环境也能跑 reg.exe）。REG_EXPAND_SZ 里的
-/// %VAR% 不展开——多数是绝对路径，够用；展开交给 find_in_path 的逐段探测。
-#[cfg(windows)]
 /// 把注册表 Path 值切成目录列表（纯函数，单测点）。
+///
+/// 可见性：`#[cfg(any(windows, test))]` —— 此前误把 `#[cfg(windows)]` 挂在这里，
+/// 导致 macOS 构建报 `cannot find function split_path_value`（2026-10-05 发版实测）。
 ///
 /// **不做任何编码转换**：值本身已是 Unicode（见 `registry_string_value` 为何绕开控制台）。
 fn split_path_value(value: &str) -> Vec<String> {
@@ -302,6 +300,11 @@ fn registry_string_value(scope: &str, value: &str) -> Option<String> {
     }
 }
 
+/// Windows 持久 PATH（注册表）：HKCU\Environment（用户级）与
+/// HKLM\...\Session Manager\Environment（系统级）的 Path 值，分号分隔。
+/// REG_EXPAND_SZ 里的 %VAR% 不展开——多数是绝对路径，够用；展开交给 find_in_path 的
+/// 逐段探测。值由 `registry_string_value` 直读 UTF-16，不经控制台代码页（审计 #15）。
+#[cfg(windows)]
 fn windows_registry_paths() -> Vec<String> {
     let mut out = Vec::new();
     for scope in [
