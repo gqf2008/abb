@@ -386,6 +386,9 @@ pub mod chrono_lite {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 启动取证（2026-10-05 实测）：安装器 [Run] 拉起的实例出现过「开了 gui.out 却一行不写就死 / 卡死」
+    // ⇒ 零证据无法定位。这里在任何子系统之前先留一行；就算下一行就崩，也留下尸体。
+    bootstrap_log(&args);
 
     // MCP 子进程必须零 stdout 噪声：在任何迁移/配置日志之前分流。
     if args.get(1).map(String::as_str) == Some("mcp-events") {
@@ -3202,5 +3205,48 @@ mod deelev_handoff_guard_tests {
             src.contains("write_handoff_marker()"),
             "普通身份实例必须写握手标记"
         );
+    }
+}
+
+/// 最早的启动取证：向 `logs/boot.log` 追加一行（pid / 参数 / exe / 时间）。尽力而为，绝不 panic、不阻塞。
+fn bootstrap_log(args: &[String]) {
+    use std::io::Write as _;
+    let logs = crate::bridge_dir().join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    let path = logs.join("boot.log");
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 2_000_000)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&path, logs.join("boot.log.1"));
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "[{ts}] pid={} args={:?} exe={:?}\n",
+        std::process::id(),
+        args,
+        std::env::current_exe().ok()
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_log_guard_tests {
+    /// 启动第一件事必须留痕（否则「装好了没人接手」永远零证据）。
+    #[test]
+    fn bootstrap_log_is_written_first() {
+        let src = include_str!("main.rs");
+        let call = ["bootstrap_log(&", "args);"].concat();
+        assert!(src.contains(&call), "必须调用 bootstrap_log");
+        assert!(src.contains("boot.log"), "必须写 boot.log");
     }
 }

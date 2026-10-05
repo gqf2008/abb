@@ -694,7 +694,7 @@ pub(crate) fn post_update_relaunch_script(exe: &Path, log_path: &Path) -> String
          rem 2026-10-05 加固（实测：安装成功后 23 分钟无人接手、update.log 干净、零证据）：\r\n\
          rem 原先是「探到托盘 ⇒ 静默 goto :done」⇒ 旧托盘退出中的那一瞬被当成「已在跑」，看门狗直接放弃。\r\n\
          rem 现在：探测结果落文件 + 延迟展开读取；连续两次探到托盘才判定已接手；每一步都写日志。\r\n\
-         powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }}); if ($t.Count -gt 0) {{ 'TRAY' }} else {{ 'NONE' }}\" > \"%TEMP%\\abb-trayprobe.txt\" 2>nul\r\n\
+         powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service|mcp-events' }}); if ($t.Count -gt 0) {{ 'TRAY' }} else {{ 'NONE' }}\" > \"%TEMP%\\abb-trayprobe.txt\" 2>nul\r\n\
          set /p PROBE=<\"%TEMP%\\abb-trayprobe.txt\"\r\n\
          if /I \"!PROBE!\"==\"TRAY\" ( set /a TRAY+=1 ) else ( set /a TRAY=0 )\r\n\
          tasklist /FI \"IMAGENAME eq ABB-Setup-*.exe\" 2>nul | find /I \"ABB-Setup\" >nul\r\n\
@@ -1064,5 +1064,24 @@ mod relaunch_watchdog_guard_tests {
         let silent = concat!("if ($t.Count -gt 0) {{ exit 0 }}", " && goto :done");
         assert!(!s.contains(silent), "不得再有「探到托盘就静默放弃」的分支");
         assert!(s.contains("判定已接手"), "判活分支必须写日志");
+    }
+}
+
+#[cfg(test)]
+mod tray_probe_guard_tests {
+    /// 判活必须排除 `mcp-events`（每个 agent 会话的 MCP 辅助进程）与 `--service`：
+    /// 否则兜底看门狗会误以为「托盘已在跑」而放弃拉起（2026-10-05 实测发现）。
+    #[test]
+    fn fallback_probe_excludes_mcp_events_and_service() {
+        let s = crate::updater::post_update_relaunch_script(
+            std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
+            std::path::Path::new(r"C:\x\update.log"),
+        );
+        assert!(s.contains("mcp-events"), "探测必须排除 mcp-events：{s}");
+        assert!(s.contains("--service"), "探测必须排除 --service");
+        assert!(
+            !s.contains("-notmatch '--service'}}"),
+            "不得只排除 --service"
+        );
     }
 }
