@@ -4237,3 +4237,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 }
+
+/// 任务 Agent 的回合上限：**由任务自己的预算推导**（保守按 4 秒/回合，夹在 [4, 200]）。
+///
+/// 为什么（2026-10-06 实测）：看护类任务 300s 预算下，agent 在 03:15~03:19 每 1~2 秒调一次 LLM，
+/// 用满了 `BUZZ_AGENT_MAX_ROUNDS=200` 的全局上限、把预算烧光 ⇒ 每轮都报「执行超时（预算 300s）」。
+/// 把上限与**任务自己的预算**绑定后：300s 任务最多 75 回合、60s 任务最多 15 回合，烧不满预算。
+///
+/// 第一步只落地这个纯函数（含单测）；接线（spawn 时把它注入 `BUZZ_AGENT_MAX_ROUNDS`，覆盖
+/// agent.rs 的全局 200）留作下一步 —— 跨进程 env 装配一次只动一处，便于回滚。
+#[allow(dead_code)] // 第一步先落地推导函数，第二步才接线（未接线前不该报 dead_code）。
+pub(crate) fn task_round_cap(budget_secs: u64) -> u32 {
+    (budget_secs / 4).clamp(4, 200) as u32
+}
+
+#[cfg(test)]
+mod task_round_cap_guard_tests {
+    /// 小任务必须被收成小上限（否则又回到「烧满预算再报超时」）。
+    ///
+    /// 判别力：把 `clamp(4, 200)` 改成常量 200 ⇒ 第二、三条断言红。
+    #[test]
+    fn round_cap_follows_task_budget() {
+        assert_eq!(
+            crate::task_run::task_round_cap(1800),
+            200,
+            "30 分钟任务保持全局上限"
+        );
+        assert_eq!(
+            crate::task_run::task_round_cap(300),
+            75,
+            "5 分钟任务 75 回合"
+        );
+        assert_eq!(
+            crate::task_run::task_round_cap(60),
+            15,
+            "1 分钟任务 15 回合"
+        );
+        assert_eq!(
+            crate::task_run::task_round_cap(1),
+            4,
+            "再小的预算也有下限 4"
+        );
+    }
+}
