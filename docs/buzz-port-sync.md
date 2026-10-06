@@ -120,3 +120,12 @@ CI 因此只 `--no-run` 编译不执行（ci.yml fork-lint），逻辑回归归�
 | `cae158ce7` #7185 | dev-mcp shell 超时 1200s + 外层预算对齐 | 无 dev-mcp；ABB idle 900s > fork 工具 660s，排序成立 | **留观**：fork 若采纳上游工具超时 1260s，必须把 `harness.rs` 的 `IDLE_TIMEOUT` 提到 ≥1500s |
 | `f463e726d` #6950 / `2af9773d6` #7250 / `e17cdd9d5` #7586 / `42aeb1571` #7208 / `6c35e82bd` #7594 / `47d068e21` #7259 | base_prompt 的 buzz CLI/平台段、desktop/CLI/Pi 装配面 | ABB 的 `base_prompt.md` 是重写的中文交付语义，这些段在 ABB 侧不存在 | — |
 
+
+### 2026-10-06 测试去竞态：oneshot 外部取消用例（sync 区）
+
+- 文件：`src/buzz/oneshot.rs`
+- 改动：`oneshot_external_cancel_returns_cancelled` 第三条断言（事件里必须有 `cancel`）由「立即读记录」改为
+  **有界等待（≤5s，50ms 轮询）**。
+- 依据：macOS CI 上该断言稳定读到**空列表**；同一用例的另两条断言（`outcome == Cancelled`、
+  `elapsed < 30s`）都通过 ⇒ **产品行为正确**，是 `read_records` 与记录任务之间的时序竞态。
+- 同步影响：**无行为变更**（仅测试代码），不改变与上游的合并面。

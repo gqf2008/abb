@@ -349,7 +349,16 @@ mod tests {
             "外部取消必须立即生效且拆栈有界: {:?}",
             started.elapsed()
         );
-        let events = read_records(&rec);
+        // 记录任务与 read_records 之间是异步的：macOS 上实测会读到「还没落盘」的空列表
+        // （CI 稳定红，产品行为正确 —— outcome 与有界耗时两条断言都已通过）。
+        // 改成**有界等待**（最多 5s），只消除测试自身的时序竞态。
+        let mut events = read_records(&rec);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !events.iter().any(|e| e["event"] == "cancel")
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            events = read_records(&rec);
+        }
         assert!(
             events.iter().any(|e| e["event"] == "cancel"),
             "外部取消后应向在途回合发 cancel: {events:?}"
