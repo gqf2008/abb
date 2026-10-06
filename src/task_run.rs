@@ -2600,6 +2600,9 @@ mod tests {
             expr: "*/10 * * * *".into(),
             ..Default::default()
         };
+        // 预算必须小于周期（2.23.112 起 register 期硬校验）：默认 1800s 配 */10(600s) 会被拒．
+        // 本用例只关心「调度档不做 housekeeping」，故把预算收到周期以内。
+        cron.limits.timeout_secs = 300;
         store.add(cron.clone()).unwrap();
         std::fs::create_dir_all(paths.cancel_requests_dir()).unwrap();
         std::fs::write(paths.cancel_file(&cron.id), b"{}").unwrap();

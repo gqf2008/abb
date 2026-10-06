@@ -308,7 +308,14 @@ mod tests {
             "Timeout 后拆栈（cancel 排水 5s + 杀进程组 5s + 余量）必须有界: {:?}",
             started.elapsed()
         );
-        let events = read_records(&rec);
+        // 与外部取消那条同款：记录任务异步落盘，macOS 上立即读会读到空列表 ⇒ 改**有界等待**（≤20s）。
+        let mut events = read_records(&rec);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !events.iter().any(|e| e["event"] == "cancel")
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            events = read_records(&rec);
+        }
         assert!(
             events.iter().any(|e| e["event"] == "cancel"),
             "超时后应向在途回合发 cancel: {events:?}"
@@ -353,7 +360,7 @@ mod tests {
         // （CI 稳定红，产品行为正确 —— outcome 与有界耗时两条断言都已通过）。
         // 改成**有界等待**（最多 5s），只消除测试自身的时序竞态。
         let mut events = read_records(&rec);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while std::time::Instant::now() < deadline && !events.iter().any(|e| e["event"] == "cancel")
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
