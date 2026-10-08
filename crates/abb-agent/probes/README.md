@@ -45,10 +45,14 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   让 `session/new` 吃掉 35s 且期间 `session/cancel` 与 `initialize` 各被拖 19s（abb 的「停止」
   只有 5s 宽限）。场景 3 用**两个**挂死 server 顶到 30s 总预算，并在装配已跑 1s 之后才发
   `initialize`（避开「恰好赶在装配开始前答完」的假通过）。
-- `mcp_image_result_reaches_model.py`（配 `fake_mcp_server.py --image-data`）：假 OpenAI 网关第一跳
-  回 `tool_calls`、第二跳抓请求体，断言 MCP 回的图片以 `data:image/png;base64,…` 真的进了模型
-  请求，且没有被换成 `(see attached image)` / `(tool image omitted: …)` 占位文本。
-  **修前表现**：`Model::new` 只给 `input=[Text]`，rpi 按 `Model::input` 门控图片，两条 provider
-  路径都把图片换成了占位文本（仅图片的结果甚至比修前「base64 正文」信息更少）。
+- `mcp_image_result_reaches_model.py`（配 `fake_mcp_server.py --image-data`）两个场景：
+  ①假 OpenAI 网关第一跳回 `tool_calls`、第二跳抓请求体，断言 MCP 回的图片以
+  `data:image/png;base64,…` 真的进了模型请求，且没有被换成 `(see attached image)`；
+  ②假 anthropic 端点（`/v1/messages` 事件流）断言走 anthropic 时**没有**这个误导性占位，
+  而是本包自己写的 `[image 未传给模型：…]`。
+  **修前表现**：`Model::new` 只给 `input=[Text]` ⇒ openai 路径图片被换成占位（图真丢）；
+  把 `input` 改成 `[Text, Image]` 后 anthropic 路径反而变成「指着一张不存在的图」（上游把
+  `Content::Image` 硬编码成 `(see attached image)`）。所以两条路径现在分开处理。
+  **未覆盖**：openai **responses** 路径的图片（仅有源码依据，无端到端）。
 
 全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。

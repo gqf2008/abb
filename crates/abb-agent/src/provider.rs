@@ -135,6 +135,24 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
+    /// 本后端的 agent 层能否**真的**把工具结果里的图片交给模型。
+    ///
+    /// 不能只看 `Model.input`：rpi-ai 0.3.16 的 anthropic 序列化层把 `Content::Image`
+    /// **硬编码**成 `Text("(see attached image)")`（该枚举只有 `Text`/`ToolReference` 两个
+    /// 变体，上游注释写明 emit image block 仍是 TODO）——于是声明了
+    /// `InputModality::Image` 反而会把「如实说明被省略」换成「指着一张不存在的图」。
+    /// 所以本包自己记住这个能力，供 MCP 工具决定「发 image part」还是「发如实的一行文本」。
+    ///
+    /// openai 家族（chat / responses）在 rpi 里是**真**发图的（`flush_tool_result_images` ⇒
+    /// 跟随的 `image_url` 消息、`responses_tool_result_output` ⇒ `input_image`）；
+    /// chat 路径已端到端实测，responses 路径仅有源码依据（未端到端验，README 记档）。
+    pub fn delivers_tool_result_images(&self) -> bool {
+        match self {
+            Backend::OpenAiCompletions { .. } | Backend::OpenAiResponses { .. } => true,
+            Backend::Anthropic { .. } | Backend::Faux { .. } => false,
+        }
+    }
+
     pub fn id(&self) -> &'static str {
         match self {
             Backend::Faux { .. } => "faux",
@@ -240,6 +258,10 @@ fn anthropic_backend(env: &dyn EnvSource) -> Result<Backend, String> {
         "anthropic",
         &base_url,
         output_cap(env),
+        // anthropic 的 agent 层目前拿不到工具结果图片（rpi-ai 上游 TODO）⇒ 声明 `[Text]`，
+        // 让「图片到不了模型」这件事由本包自己以**如实**的文本交代（见
+        // `Backend::delivers_tool_result_images`）。
+        false,
     );
     let provider = AnthropicProvider::with_models_without_env_api_key(
         Some(api_key),
@@ -267,7 +289,15 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
     } else {
         Api::OpenaiCompletions
     };
-    let model = custom_model(&model_id, api, "openai", &base_url, output_cap(env));
+    let model = custom_model(
+        &model_id,
+        api,
+        "openai",
+        &base_url,
+        output_cap(env),
+        // openai 家族在 rpi 里真发图（chat 已端到端实测）。
+        true,
+    );
     if responses {
         let provider = OpenAiResponsesProvider::with_models_without_env_api_key(
             "openai",
@@ -295,19 +325,29 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
 
 /// **显式构造**模型：id / 端点全由调用方给定，不查内置目录。
 ///
-/// `input` **必须显式声明支持图片**：rpi 按 `Model::input` 对工具结果里的图片做能力门控
-/// （anthropic 的 `build_params.rs::supports_images`、openai 的
-/// `openai_completions.rs` 都看 `input.contains(&InputModality::Image)`）。而
-/// `Model::new` 只给 `vec![Text]` ⇒ 不声明的话，MCP 工具回回来的图片在两条 provider
-/// 路径上都会被 rpi 换成占位文本（`(see attached image)` / `(tool image omitted: …)`），
-/// 模型既看不到图、又被指去看一个不存在的东西。
+/// `input` 必须与「本 provider 的 agent 层能否真把图片交给模型」一致：rpi 按
+/// `Model::input` 做能力门控（anthropic `build_params.rs::supports_images`、openai
+/// `openai_completions.rs`），而 `Model::new` 只给 `vec![Text]`。
 ///
-/// 为什么默认开：图片只会在「MCP 工具确实返回了图」时出现，与 abb 把图片当工具结果传下来的
-/// 意图一致；真不支持的模型会在上游如实报错，比默默替模型决定了强。
-fn custom_model(id: &str, api: Api, provider_id: &str, base_url: &str, max_tokens: u64) -> Model {
+/// 两者对不上的后果不一样，所以要分开处理：
+/// - openai 家族：声明 `Image` 才会真发图（不声明就被换成 `(see attached image)` 占位）；
+/// - anthropic：声明了也发不出去（上游硬编码占位），只会把其他 provider 上那种
+///   【如实说明被省略】换成 `(see attached image)` ⇒ **反而更差**，故保持 `[Text]`。
+fn custom_model(
+    id: &str,
+    api: Api,
+    provider_id: &str,
+    base_url: &str,
+    max_tokens: u64,
+    delivers_tool_result_images: bool,
+) -> Model {
     let mut model = Model::new(id, id, api, provider_id, base_url);
     model.max_tokens = max_tokens;
-    model.input = vec![InputModality::Text, InputModality::Image];
+    model.input = if delivers_tool_result_images {
+        vec![InputModality::Text, InputModality::Image]
+    } else {
+        vec![InputModality::Text]
+    };
     model
 }
 
@@ -463,6 +503,38 @@ mod tests {
         let backend = select_with(&FakeEnv::anthropic(&[])).expect("anthropic 应可选");
         assert_eq!(backend.id(), "anthropic");
         assert_eq!(backend.model().id, "claude-sonnet-4-5");
+    }
+
+    /// 图片能力必须与「后端 agent 层能不能真把图交给模型」一致。
+    ///
+    /// 两者错配的后果不同，所以不能一刀切：
+    /// - openai 家族：不声明 `Image` ⇒ 图片被换成 `(see attached image)` 占位（图真丢了）；
+    /// - anthropic：声明了也发不出去（rpi-ai 0.3.16 把 `Content::Image` 硬编码成占位文本），
+    ///   只会把「如实说明被省略」换成「指着一张不存在的图」⇒ 必须保持 `[Text]`。
+    #[test]
+    fn image_modality_follows_what_the_backend_can_actually_deliver() {
+        let anthropic = select_with(&FakeEnv::anthropic(&[])).expect("anthropic 应可选");
+        assert!(
+            !anthropic.delivers_tool_result_images(),
+            "anthropic 的 agent 层目前搬不动工具结果图片"
+        );
+        assert_eq!(
+            anthropic.model().input,
+            vec![InputModality::Text],
+            "声明 Image 只会换来与事实不符的占位"
+        );
+
+        let env = FakeEnv::new(&[
+            ("BUZZ_AGENT_PROVIDER", "openai"),
+            ("OPENAI_COMPAT_API_KEY", "sk-x"),
+            ("OPENAI_COMPAT_MODEL", "vendor-id"),
+        ]);
+        let openai = select_with(&env).expect("openai 应可选");
+        assert!(openai.delivers_tool_result_images());
+        assert!(
+            openai.model().input.contains(&InputModality::Image),
+            "openai 必须声明 Image，否则图片被换成占位"
+        );
     }
 
     /// **任意厂商模型 id 都要能用**：自定义网关（one-api 等）常用厂商原生 id，

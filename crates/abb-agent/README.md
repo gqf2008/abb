@@ -130,16 +130,22 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
   **白名单是「可用性 vs 凭据面」的取舍**（与被替代组件同源）：`HTTP(S)_PROXY`/`ALL_PROXY`
   可能带凭据、`SSH_AUTH_SOCK` 会让子进程能用用户的 SSH agent——对「能出网、能用 git」是必需的，
   但意味着 wassette 这类第三方宿主也拿到它们。要收紧就得改 `PASSTHROUGH_ENV`。
-- 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。**两个例外**：
-  ①本进程自己**优雅退出**（stdin EOF）时，不理会 EOF 的 MCP 子进程会被留下（`PPID=1`）——关子
-  进程的 kill 任务 spawn 在块 `block_on` 已返回的 runtime 上，没被 poll；
-  ②装配超时被放弃的子进程是**异步**回收（实测约 8–10s 才消失），这个窗口内退出同样留孤儿。
+- 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。**例外**：本
+  进程自己**优雅退出**（stdin EOF）时不成立——不理会 EOF 的 MCP 子进程会被留下（`PPID=1`）：
+  关子进程的 kill 任务 spawn 在块 `block_on` 已返回的 runtime 上，没被 poll。
+  （装配超时被放弃的子进程不属此列：实测在预算到期的**同一瞬间**就被 `kill()`，无窗口。）
   abb 的监督路径（`shutdown()` / `Drop` 都是 `killpg`）不受影响，单独启动本包时要自己收尾。
 - MCP `isError: true` 走 `Err(AgentError::Tool)` 路径，让 loop 编码成错误工具结果（不伪装成功）；
-  **图片保留成真 image part**、且模型真能看见它——这要求模型的 `input` 声明 `Image`（`provider.rs`
-  的 `custom_model` 已声明）：rpi 按 `Model::input` 门控，不声明就被换成
-  `(see attached image)` / `(tool image omitted: …)` 占位文本。单个工具结果受预算约束
-  （**文本 + 图片合计** 8 MiB、文本 50 KiB，超限中间省略），超预算的图片降级成一行说明；
+  工具结果里的图片分两种情形处理，**都不会出现与事实不符的占位文本**：
+  - **openai 家族**（chat / responses）：真发图（chat 已端到端抓包；responses 仅有源码依据，**未端到端验**）。
+    这要求模型的 `input` 声明 `Image`（`provider.rs` 的 `custom_model` 已声明）——rpi 按 `Model::input`
+    门控，不声明就被换成 `(see attached image)` 占位。
+  - **anthropic**：目前**发不出去**（rpi-ai 0.3.16 把 `Content::Image` 硬编码成 `Text("(see attached
+    image)")`，上游注释写明 emit image block 仍是 TODO）⇒ 本包自己降级成**如实**的一行文本
+    （`[image 未传给模型：…]`），并把 `input` 保持为 `[Text]`。声明 `Image` 反而更差：那会把「如实
+    说明被省略」换成「指着一张不存在的图」。上游修好后把 `delivers_tool_result_images` 翻真即可。
+  单个工具结果受预算约束：**文本 + 图片合计** 8 MiB、**整条结果的文本** 50 KiB（两个额度都
+  **累计**，与 fork 的 `used`/`text_used` 同义），超限中间省略；超预算的图片降级成一行说明；
   音频等 rpi 侧无对应 part 的类型同样留一行痕迹，不静默吞。
 
 握手仍然「先装配、再应答」（abb 在 `session/new` 应答之后才发 prompt，工具必须在 prompt 之前
@@ -218,7 +224,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。四个探针各自对应一条被评审反证过的行为：
+单测用替身，探针跑**真二进制**——两者职责不同。七条探针各自对应一条被评审反证过的行为：
 
 | 探针 | 覆盖 |
 | --- | --- |
@@ -226,6 +232,9 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `cancel_same_burst.py` | prompt 与 cancel 在同一次 write（0 间隔）时取消不被丢弃（修前 6/6 丢弃） |
 | `provider_error_is_visible.py` | provider 失败回 JSON-RPC error，而非「成功 + 空文本」 |
 | `openai_family_round_trip.py` | openai 家族端到端：URL 拼法、鉴权头、任意厂商模型 id、文本送达 |
+| `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
+| `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
+| `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
 被算作通过」的假通过窗口。

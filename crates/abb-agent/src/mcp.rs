@@ -62,11 +62,11 @@ const MAX_TOOLS_PER_SESSION: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 1024;
 const MAX_SCHEMA_BYTES: usize = 4096;
 
-/// 单个工具结果的字节预算：`total` 管全部内容（文本 + 图片），`text` 只管文本。
+/// 单个工具结果的字节预算：`total` 管全部内容（文本 + 图片），`text` 管**整条结果**里的文本。
 ///
 /// 取值对齐被替代组件的生产默认（`MAX_TOOL_RESULT_BYTES = 8 MiB`、
-/// `DEFAULT_TOOL_RESULT_TEXT_BYTES = 50 KiB`）。文本是失控输出的来源（构建日志、文件
-/// 转储），图片本身自限，所以只给文本单独设一个更紧的界。
+/// `DEFAULT_TOOL_RESULT_TEXT_BYTES = 50 KiB`）。两个额度都**累计**（与 fork 的 `used`/`text_used`
+/// 同义）：只按“每段”算的话，多段交替内容能线性堆出任意大的结果。
 const TOOL_RESULT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const TOOL_RESULT_TEXT_BYTES: usize = 50 * 1024;
 
@@ -174,7 +174,11 @@ impl McpSession {
     ///
     /// 两个上界同时生效：单 server [`CONNECT_BUDGET_PER_SERVER`]、全体
     /// [`CONNECT_BUDGET_TOTAL`]（取小者）。`cwd` 是会话工作区，透传给子进程。
-    pub async fn connect_all(specs: &[McpServerSpec], cwd: &str) -> McpSession {
+    pub async fn connect_all(
+        specs: &[McpServerSpec],
+        cwd: &str,
+        images_deliverable: bool,
+    ) -> McpSession {
         let mut servers = Vec::new();
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
         let mut seen_qnames: Vec<String> = Vec::new();
@@ -233,6 +237,7 @@ impl McpSession {
                             qualified: def.qualified,
                             bare: def.bare,
                             schema: def.schema,
+                            images_deliverable,
                             client: Arc::clone(&client),
                         }));
                     }
@@ -372,6 +377,10 @@ struct McpTool {
     qualified: String,
     bare: String,
     schema: Tool,
+    /// 本会话的 provider 能否**真的**把图片交给模型（见
+    /// `provider::Backend::delivers_tool_result_images`）。不能时图片降级成**如实**的一行文本，
+    /// 而不是交给 rpi 换成 `(see attached image)` 那种「指着一张不存在的图」的占位。
+    images_deliverable: bool,
     client: Arc<Client>,
 }
 
@@ -459,9 +468,9 @@ impl AgentTool for McpTool {
             }));
         }
         Ok(AgentToolResult {
-            // 图片保留成真 image part（rpi 会作为 image content 发给模型），
-            // 不降级成 base64 正文。
-            content: tool_result_content(&result.content),
+            // 图片要么真发出去，要么以**如实**的一行文本交代（取决于本会话 provider 的
+            // agent 层能不能发图）——两种都不会出现「图没附上却说 attached」的占位文本。
+            content: tool_result_content(&result.content, self.images_deliverable),
             details: Value::Null,
             usage: None,
             added_tool_names: Vec::new(),
@@ -499,22 +508,41 @@ fn flatten_text(content: &[rmcp::model::Content]) -> String {
 /// 把 MCP 的 content 数组转成 rpi 的工具结果内容。
 ///
 /// 与被替代组件同构：
-/// - **图片保留成真 image part**（`TextContentOrImage::Image`，rpi 侧会作为 image content
-///   发给模型）。若降级成 `[image 内容] {base64}` 文本，模型看不到图，那串 base64 还会
-///   永久留在会话历史里、每次请求重发。
-/// - 图片合计受 [`TOOL_RESULT_TOTAL_BYTES`] 约束，文本受 [`TOOL_RESULT_TEXT_BYTES`]
-///   约束；超预算的图片降级成一行说明（不静默丢）。
+/// - 当 `images_deliverable` 为真时，图片保留成真 image part（rpi 会把它交给模型）；
+///   为假时降级成**如实**的一行文本（“未传给模型”），而**不是**交给 rpi 换成
+///   `(see attached image)` / `(tool image omitted: …)` 这类与事实不符的占位。
+/// - 文本与图片**合计**受 [`TOOL_RESULT_TOTAL_BYTES`] 约束，整条结果的文本另受
+///   [`TOOL_RESULT_TEXT_BYTES`] **累计**约束；超预算的部分降级成一行说明（不静默丢）。
 /// - rpi 侧没有对应 part 的类型（音频等）以一行说明保留痕迹。
-fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrImage> {
+fn tool_result_content(
+    content: &[rmcp::model::Content],
+    images_deliverable: bool,
+) -> Vec<TextContentOrImage> {
+    tool_result_content_with(
+        content,
+        images_deliverable,
+        TOOL_RESULT_TOTAL_BYTES,
+        TOOL_RESULT_TEXT_BYTES,
+    )
+}
+
+/// 预算可注入的版本：单测用极小的额度就能锁住「文本计入合计」与「文本额度累计」两件事，
+/// 不必真造 8 MiB 的 fixture（造小了就锁不住——评审实测过这种“空锁”）。
+fn tool_result_content_with(
+    content: &[rmcp::model::Content],
+    images_deliverable: bool,
+    total_bytes: usize,
+    text_bytes: usize,
+) -> Vec<TextContentOrImage> {
     let mut out: Vec<TextContentOrImage> = Vec::new();
     let mut text = String::new();
-    // `used` 记的是**文本 + 图片合计**的用量（与文档注释、被替代组件的 `ResultBudget.total`
-    // 同义）。只记图片的话，文本额度会随每次 flush 重新拿满，多段交替内容能线性堆出任意大
-    // 的工具结果（实测 `[image, 200 KiB text] × 300` ⇒ 15.3 MB 真的被发出去）。
+    // `used` 与 `text_used` 都是**累计**的：只按“每段”算的话，多段交替内容能线性堆出任意大
+    // 的工具结果（评审实测 `[image, 200 KiB text] × 300` ⇒ 15.3 MB 真的被发出去）。
     let mut used = 0usize;
+    let mut text_used = 0usize;
     let mut truncated = false;
     for item in content {
-        if used >= TOOL_RESULT_TOTAL_BYTES {
+        if used >= total_bytes {
             truncated = true;
             break;
         }
@@ -532,7 +560,14 @@ fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrIma
                 }
             }
             "image" => {
-                flush_text(&mut out, &mut text, &mut used);
+                flush_text(
+                    &mut out,
+                    &mut text,
+                    &mut used,
+                    &mut text_used,
+                    total_bytes,
+                    text_bytes,
+                );
                 let data = value
                     .get("data")
                     .and_then(Value::as_str)
@@ -542,7 +577,16 @@ fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrIma
                     .and_then(Value::as_str)
                     .unwrap_or("application/octet-stream");
                 let bytes = data.len() + mime_type.len();
-                if used.saturating_add(bytes) <= TOOL_RESULT_TOTAL_BYTES {
+                if !images_deliverable {
+                    // 如实交代，不交给 rpi 去编一个与事实不符的占位。
+                    push_line(
+                        &mut text,
+                        &format!(
+                            "[image 未传给模型：{mime_type}，{} 字节 base64（本会话的 provider agent 层搬不动工具结果图片）]",
+                            data.len()
+                        ),
+                    );
+                } else if used.saturating_add(bytes) <= total_bytes {
                     used += bytes;
                     out.push(TextContentOrImage::Image(ImageContent {
                         kind: ImageContentType,
@@ -562,24 +606,40 @@ fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrIma
             other => push_line(&mut text, &format!("[{other} 内容] {value}")),
         }
     }
-    flush_text(&mut out, &mut text, &mut used);
+    flush_text(
+        &mut out,
+        &mut text,
+        &mut used,
+        &mut text_used,
+        total_bytes,
+        text_bytes,
+    );
     if truncated {
         out.push(TextContentOrImage::text(format!(
-            "[... 工具结果已达总预算（{} 字节），其余内容已省略 ...]",
-            TOOL_RESULT_TOTAL_BYTES
+            "[... 工具结果已达总预算（{total_bytes} 字节），其余内容已省略 ...]"
         )));
     }
     out
 }
 
-/// 累积的文本按行拼接，收尾时按**剩余合计预算**与文本预算的较小者省略中间。
-fn flush_text(out: &mut Vec<TextContentOrImage>, text: &mut String, used: &mut usize) {
+/// 累积的文本按行拼接，收尾时按**文本额度（累计）**与**合计预算剩余**的较小者省略中间。
+fn flush_text(
+    out: &mut Vec<TextContentOrImage>,
+    text: &mut String,
+    used: &mut usize,
+    text_used: &mut usize,
+    total_bytes: usize,
+    text_bytes: usize,
+) {
     if text.is_empty() {
         return;
     }
-    let allowance = TOOL_RESULT_TEXT_BYTES.min(TOOL_RESULT_TOTAL_BYTES.saturating_sub(*used));
+    let allowance = text_bytes
+        .saturating_sub(*text_used)
+        .min(total_bytes.saturating_sub(*used));
     let piece = elide_middle(text, allowance);
     *used = used.saturating_add(piece.len());
+    *text_used = text_used.saturating_add(piece.len());
     out.push(TextContentOrImage::text(piece));
     text.clear();
 }
@@ -730,7 +790,7 @@ mod tests {
             "mimeType": "image/png",
         }))
         .expect("image 内容应能反序列化");
-        let parts = tool_result_content(&[rmcp::model::Content::text("看图"), image]);
+        let parts = tool_result_content(&[rmcp::model::Content::text("看图"), image], true);
         assert_eq!(parts.len(), 2, "文本 + 图片：{parts:?}");
         assert!(matches!(parts[0], TextContentOrImage::Text(_)));
         match &parts[1] {
@@ -742,37 +802,102 @@ mod tests {
         }
     }
 
-    /// 回归锁：文本必须计入**合计**预算。
+    /// 回归锁（第一把）：文本必须计入**合计**预算。
     ///
-    /// 修前的实现只把图片字节记进 `used`，于是每段文本都能重新拿满一份 50 KiB 额度，
-    /// `[image, text] × N` 能线性堆出任意大的工具结果（评审实测 15.3 MB 真的被发出去）。
+    /// 上一版的这把锁是**空锁**（评审用「把实现换回旧版」的方式证伪：`3×(3 MiB 图 + 200 KiB
+    /// 文本)` 两种实现输出逐字节相同，断言恒真）。现在用**可注入的小预算**造出真正能区分
+    /// 两种实现的形状：图片很小、文本很多 ⇒ 旧实现（文本不计入合计）会堆出远超总预算的文本。
     #[test]
-    fn total_budget_counts_text_and_images_together() {
-        let image_data = "A".repeat(3 * 1024 * 1024);
+    fn total_budget_counts_text_towards_the_total() {
         let mut content = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..20 {
             content.push(
                 serde_json::from_value::<rmcp::model::Content>(serde_json::json!({
                     "type": "image",
-                    "data": image_data,
+                    "data": "AA",
                     "mimeType": "image/png",
                 }))
                 .expect("image 内容应能反序列化"),
             );
-            content.push(rmcp::model::Content::text("T".repeat(200 * 1024)));
+            content.push(rmcp::model::Content::text("T".repeat(60)));
         }
-        let parts = tool_result_content(&content);
-        let total: usize = parts
+        // 总预算 1000、文本额度 800（都远小于「20 段 × 60 字节 + 图片」的裸和 1200+）。
+        let parts = tool_result_content_with(&content, true, 1000, 800);
+        let total = parts_bytes(&parts);
+        assert!(
+            total <= 1000 + 256,
+            "文本必须计入合计预算：{total} 超过 1000"
+        );
+    }
+
+    /// 回归锁（第二把）：文本额度是**整条结果累计**的，不是“每段都有一份”。
+    /// 旧实现下 20 段 × 60 字节 ≈ 1200 字节文本会全部留下（而额度声称 800）。
+    #[test]
+    fn text_budget_is_cumulative_across_segments() {
+        let mut content = Vec::new();
+        for _ in 0..20 {
+            content.push(
+                serde_json::from_value::<rmcp::model::Content>(serde_json::json!({
+                    "type": "image",
+                    "data": "AA",
+                    "mimeType": "image/png",
+                }))
+                .expect("image 内容应能反序列化"),
+            );
+            content.push(rmcp::model::Content::text("T".repeat(60)));
+        }
+        // 总预算给得很宽，只让文本额度起作用。
+        let parts = tool_result_content_with(&content, true, 64 * 1024, 800);
+        let text_total: usize = parts
+            .iter()
+            .map(|part| match part {
+                TextContentOrImage::Text(text) => text.text.len(),
+                TextContentOrImage::Image(_) => 0,
+            })
+            .sum();
+        assert!(
+            text_total <= 800 + 256,
+            "文本额度必须累计：{text_total} 超过 800"
+        );
+    }
+
+    /// 图片不可交付时（例如 anthropic：rpi 的 agent 层搬不动工具结果图片），必须留下
+    /// **如实**的一行文本，而不是交给 rpi 换成 `(see attached image)` 那种与事实不符的占位。
+    #[test]
+    fn images_not_deliverable_leave_an_honest_note() {
+        let image: rmcp::model::Content = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "data": "aGVsbG8=",
+            "mimeType": "image/png",
+        }))
+        .expect("image 内容应能反序列化");
+        let parts = tool_result_content(&[rmcp::model::Content::text("看图"), image], false);
+        let text: String = parts
+            .iter()
+            .filter_map(|part| match part {
+                TextContentOrImage::Text(text) => Some(text.text.clone()),
+                TextContentOrImage::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!parts
+            .iter()
+            .any(|p| matches!(p, TextContentOrImage::Image(_))));
+        assert!(text.contains("image 未传给模型"), "要如实交代：{text}");
+        assert!(
+            !text.contains("attached"),
+            "不能出现与事实不符的占位：{text}"
+        );
+    }
+
+    fn parts_bytes(parts: &[TextContentOrImage]) -> usize {
+        parts
             .iter()
             .map(|part| match part {
                 TextContentOrImage::Text(text) => text.text.len(),
                 TextContentOrImage::Image(image) => image.data.len() + image.mime_type.len(),
             })
-            .sum();
-        assert!(
-            total <= TOOL_RESULT_TOTAL_BYTES + 4096,
-            "合计预算必须把文本算进去：{total} > {TOOL_RESULT_TOTAL_BYTES}"
-        );
+            .sum()
     }
 
     #[test]
@@ -783,7 +908,7 @@ mod tests {
             "mimeType": "audio/wav",
         }))
         .expect("audio 内容应能反序列化");
-        let parts = tool_result_content(&[audio]);
+        let parts = tool_result_content(&[audio], true);
         match &parts[0] {
             TextContentOrImage::Text(text) => {
                 assert!(text.text.contains("audio"), "要留下类型痕迹：{}", text.text)

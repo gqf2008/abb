@@ -195,7 +195,16 @@ impl Server {
         // —— `dispatch` 把它丢进了独立任务，所以 `session/cancel` / `initialize` 不会被拖住。
         // 工具必须在 prompt 之前就位（abb 是应答后才发 prompt，而装配就在应答之前），
         // 所以这里仍然是「先装配、再应答」。
-        let mcp = McpSession::connect_all(&parsed.mcp_servers, &parsed.cwd).await;
+        // 图片能不能真到模型取决于 provider 的 agent 层（anthropic 目前不能，
+        // 见 `provider::Backend::delivers_tool_result_images`）：不能时由本包自己
+        // 以如实的文本交代，而不是交给 rpi 编一个与事实不符的占位。
+        let images_deliverable = self
+            .backend
+            .as_ref()
+            .map(|backend| backend.delivers_tool_result_images())
+            .unwrap_or(false);
+        let mcp =
+            McpSession::connect_all(&parsed.mcp_servers, &parsed.cwd, images_deliverable).await;
         let tools = mcp.tools();
         tracing::info!(
             "会话 {session_id}：mcp server {:?}，工具 {} 个，systemPrompt={}，cwd={}",

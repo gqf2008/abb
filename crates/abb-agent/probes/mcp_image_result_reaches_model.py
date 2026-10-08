@@ -164,8 +164,149 @@ if len(bodies) >= 2:
                  if isinstance(m, dict) and m.get("role") == "tool"]
     check("工具文本结果也在", bool(tool_msgs) and "echo" in json.dumps(tool_msgs, ensure_ascii=False))
 
+
+# ---------------------------------------------------------------------------
+# 场景 2：anthropic —— 图片**本来**到不了模型（rpi-ai 0.3.16 把 `Content::Image` 硬编码成
+# 占位文本），所以本包必须自己给出**如实**的一行说明，而不是让模型看到
+# `(see attached image)`（指着一张不存在的图，比修前更差）。
+# ---------------------------------------------------------------------------
+PORT_ANTHROPIC = 18108
+anth_bodies = []
+
+
+class AnthropicGateway(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", 0) or 0)
+        raw = self.rfile.read(length).decode() if length else ""
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"_raw": raw}
+        anth_bodies.append(body)
+        has_tool_result = any(
+            blk.get("type") == "tool_result"
+            for m in body.get("messages", [])
+            for blk in (m.get("content") if isinstance(m.get("content"), list) else [])
+        )
+        events = [("message_start", {"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [], "stop_reason": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1}}})]
+        if not has_tool_result:
+            events += [
+                ("content_block_start", {"type": "content_block_start", "index": 0,
+                                         "content_block": {"type": "tool_use", "id": "toolu_1",
+                                                           "name": TOOL_NAME, "input": {}}}),
+                ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                         "delta": {"type": "input_json_delta",
+                                                   "partial_json": json.dumps({"q": "看图"})}}),
+                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                ("message_delta", {"type": "message_delta",
+                                   "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                                   "usage": {"output_tokens": 1}}),
+            ]
+        else:
+            events += [
+                ("content_block_start", {"type": "content_block_start", "index": 0,
+                                         "content_block": {"type": "text", "text": ""}}),
+                ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                         "delta": {"type": "text_delta", "text": "收到"}}),
+                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                ("message_delta", {"type": "message_delta",
+                                   "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                   "usage": {"output_tokens": 1}}),
+            ]
+        events.append(("message_stop", {"type": "message_stop"}))
+        payload = "".join(f"event: {t}\ndata: {json.dumps(d)}\n\n" for t, d in events)
+        data = payload.encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+httpd2 = HTTPServer(("127.0.0.1", PORT_ANTHROPIC), AnthropicGateway)
+threading.Thread(target=httpd2.serve_forever, daemon=True).start()
+
+env2 = dict(os.environ)
+env2.update({
+    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT_ANTHROPIC}",
+    "ANTHROPIC_MODEL": "probe-model",
+    "ANTHROPIC_API_KEY": "sk-probe",
+    "RUST_LOG": "info",
+})
+for key in ("ABB_AGENT_FAUX_TEXT", "ABB_AGENT_FAUX_TOOL", "OPENAI_COMPAT_MODEL"):
+    env2.pop(key, None)
+
+proc2 = subprocess.Popen(BIN, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env2, text=True, bufsize=1)
+out2 = []
+t0 = time.time()
+threading.Thread(target=lambda: [out2.append((time.time() - t0, l.strip())) for l in proc2.stdout],
+                 daemon=True).start()
+
+
+def send2(obj):
+    proc2.stdin.write(json.dumps(obj) + "\n")
+    proc2.stdin.flush()
+
+
+def wait2(msg_id, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        for elapsed, line in list(out2):
+            if f'"id":{msg_id}' in line.replace(" ", ""):
+                return elapsed, json.loads(line)
+        time.sleep(0.02)
+    return None, None
+
+
+print()
+print("=== 场景 2：anthropic —— 图片到不了模型时必须如实交代 ===")
+send2({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+wait2(1, 10)
+send2({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {
+    "cwd": workdir,
+    "mcpServers": [{
+        "name": "fakemcp",
+        "command": sys.executable,
+        "args": [SERVER, "--image-data", IMAGE_BASE64],
+        "env": [],
+    }],
+}})
+_, resp2 = wait2(2, 30)
+send2({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {
+    "sessionId": (resp2 or {}).get("result", {}).get("sessionId", "abb-1"),
+    "prompt": [{"type": "text", "text": "看图"}],
+}})
+wait2(3, 60)
+time.sleep(0.5)
+try:
+    proc2.stdin.close()
+except Exception:
+    pass
+time.sleep(0.3)
+proc2.kill()
+
+print(f"假 anthropic 端点收到 {len(anth_bodies)} 次请求")
+check("工具确实被调用了（有第二跳请求）", len(anth_bodies) >= 2, f"{len(anth_bodies)} 次")
+if len(anth_bodies) >= 2:
+    second = json.dumps(anth_bodies[1], ensure_ascii=False)
+    check("没有 `(see attached image)` 这种「指着一张不存在的图」的占位",
+          "(see attached image)" not in second)
+    check("给出如实说明（image 未传给模型）",
+          "image 未传给模型" in second,
+          "anthropic 的 agent 层搬不动工具结果图片，必须自己交代")
+
 print()
 if failures:
     print(f"⇒ 判定：❌ 失败 {len(failures)} 项：{failures}")
     sys.exit(1)
-print("⇒ 判定：✅ 工具结果里的图片真到了模型（真 image part，无占位文本）")
+print("⇒ 判定：✅ openai 路径图片真到模型；anthropic 路径如实交代（无与事实不符的占位）")
