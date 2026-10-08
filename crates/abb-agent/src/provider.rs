@@ -43,6 +43,7 @@ use rpi_ai::providers::anthropic::AnthropicProvider;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 use rpi_ai::providers::openai_completions::OpenAiCompletionsProvider;
 use rpi_ai::providers::openai_responses::OpenAiResponsesProvider;
+use rpi_ai::types::InputModality;
 use rpi_ai::{Api, Model, Provider};
 
 /// abb 回合作数的环境变量名（abb 恒送，默认 200）。
@@ -71,6 +72,13 @@ pub const MAX_OUTPUT_TOKENS_ENV: &str = "BUZZ_AGENT_MAX_OUTPUT_TOKENS";
 /// 另：不能给 0。`clamp_max_tokens_to_context` 在 `context_window == 0`（我们不知道上下文
 /// 窗口）时返回 `max(1, max_tokens)`，所以 `0` 会变成「只准回 1 个 token」。
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 65_536;
+
+/// 离线通道：固定文本回复。
+pub const FAUX_TEXT_ENV: &str = "ABB_AGENT_FAUX_TEXT";
+
+/// 离线通道：先发一次工具调用（JSON `{"name":…,"arguments":…}`），再把
+/// [`FAUX_TEXT_ENV`] 当作文本回复。
+pub const FAUX_TOOL_ENV: &str = "ABB_AGENT_FAUX_TOOL";
 
 /// 环境读取缝。
 ///
@@ -127,6 +135,24 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
+    /// 本后端的 agent 层能否**真的**把工具结果里的图片交给模型。
+    ///
+    /// 不能只看 `Model.input`：rpi-ai 0.3.16 的 anthropic 序列化层把 `Content::Image`
+    /// **硬编码**成 `Text("(see attached image)")`（该枚举只有 `Text`/`ToolReference` 两个
+    /// 变体，上游注释写明 emit image block 仍是 TODO）——于是声明了
+    /// `InputModality::Image` 反而会把「如实说明被省略」换成「指着一张不存在的图」。
+    /// 所以本包自己记住这个能力，供 MCP 工具决定「发 image part」还是「发如实的一行文本」。
+    ///
+    /// openai 家族（chat / responses）在 rpi 里是**真**发图的（`flush_tool_result_images` ⇒
+    /// 跟随的 `image_url` 消息、`responses_tool_result_output` ⇒ `input_image`）；
+    /// chat 路径已端到端实测，responses 路径仅有源码依据（未端到端验，README 记档）。
+    pub fn delivers_tool_result_images(&self) -> bool {
+        match self {
+            Backend::OpenAiCompletions { .. } | Backend::OpenAiResponses { .. } => true,
+            Backend::Anthropic { .. } | Backend::Faux { .. } => false,
+        }
+    }
+
     pub fn id(&self) -> &'static str {
         match self {
             Backend::Faux { .. } => "faux",
@@ -163,6 +189,35 @@ pub fn select() -> Result<Backend, String> {
 
 /// [`select`] 的可注入版本（环境来源显式传入）。
 pub fn select_with(env: &dyn EnvSource) -> Result<Backend, String> {
+    // 离线**工具**路径：先发一次工具调用，再把 `ABB_AGENT_FAUX_TEXT` 当作文本回复。
+    // 用于无 key、无网验证「模型 → 工具 → 结果回灌」整条链（`probes/mcp_tool_round_trip.py` 靠它）。
+    if let Some(raw) = env.get(FAUX_TOOL_ENV) {
+        let spec: serde_json::Value = serde_json::from_str(raw.trim())
+            .map_err(|error| format!("{FAUX_TOOL_ENV} 不是合法 JSON：{error}"))?;
+        let name = spec
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("{FAUX_TOOL_ENV} 缺少 name"))?
+            .to_string();
+        let arguments = spec
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let follow_up = env
+            .get("ABB_AGENT_FAUX_TEXT")
+            .unwrap_or_else(|| "工具已执行。".to_string());
+        let provider = FauxProvider::new(
+            FauxScript::new()
+                .with_tool_call(name, arguments)
+                .with_text(follow_up),
+        );
+        let model = provider
+            .models()
+            .first()
+            .cloned()
+            .ok_or_else(|| "faux provider 没有可用模型".to_string())?;
+        return Ok(Backend::Faux { provider, model });
+    }
     if let Some(text) = env.get("ABB_AGENT_FAUX_TEXT") {
         let provider = FauxProvider::new(FauxScript::new().with_text(text));
         let model = provider
@@ -203,6 +258,10 @@ fn anthropic_backend(env: &dyn EnvSource) -> Result<Backend, String> {
         "anthropic",
         &base_url,
         output_cap(env),
+        // anthropic 的 agent 层目前拿不到工具结果图片（rpi-ai 上游 TODO）⇒ 声明 `[Text]`，
+        // 让「图片到不了模型」这件事由本包自己以**如实**的文本交代（见
+        // `Backend::delivers_tool_result_images`）。
+        false,
     );
     let provider = AnthropicProvider::with_models_without_env_api_key(
         Some(api_key),
@@ -230,7 +289,15 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
     } else {
         Api::OpenaiCompletions
     };
-    let model = custom_model(&model_id, api, "openai", &base_url, output_cap(env));
+    let model = custom_model(
+        &model_id,
+        api,
+        "openai",
+        &base_url,
+        output_cap(env),
+        // openai 家族在 rpi 里真发图（chat 已端到端实测）。
+        true,
+    );
     if responses {
         let provider = OpenAiResponsesProvider::with_models_without_env_api_key(
             "openai",
@@ -257,9 +324,30 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
 }
 
 /// **显式构造**模型：id / 端点全由调用方给定，不查内置目录。
-fn custom_model(id: &str, api: Api, provider_id: &str, base_url: &str, max_tokens: u64) -> Model {
+///
+/// `input` 必须与「本 provider 的 agent 层能否真把图片交给模型」一致：rpi 按
+/// `Model::input` 做能力门控（anthropic `build_params.rs::supports_images`、openai
+/// `openai_completions.rs`），而 `Model::new` 只给 `vec![Text]`。
+///
+/// 两者对不上的后果不一样，所以要分开处理：
+/// - openai 家族：声明 `Image` 才会真发图（不声明就被换成 `(see attached image)` 占位）；
+/// - anthropic：声明了也发不出去（上游硬编码占位），只会把其他 provider 上那种
+///   【如实说明被省略】换成 `(see attached image)` ⇒ **反而更差**，故保持 `[Text]`。
+fn custom_model(
+    id: &str,
+    api: Api,
+    provider_id: &str,
+    base_url: &str,
+    max_tokens: u64,
+    delivers_tool_result_images: bool,
+) -> Model {
     let mut model = Model::new(id, id, api, provider_id, base_url);
     model.max_tokens = max_tokens;
+    model.input = if delivers_tool_result_images {
+        vec![InputModality::Text, InputModality::Image]
+    } else {
+        vec![InputModality::Text]
+    };
     model
 }
 
@@ -379,6 +467,27 @@ mod tests {
         assert_eq!(backend.id(), "faux");
     }
 
+    /// 离线**工具**通道：`ABB_AGENT_FAUX_TOOL` 应选 faux，且优先于纯文本通道。
+    #[test]
+    fn faux_tool_env_selects_faux_and_wins_over_text() {
+        let env = FakeEnv::new(&[
+            (
+                FAUX_TOOL_ENV,
+                r#"{"name":"abb-events__query","arguments":{"q":1}}"#,
+            ),
+            (FAUX_TEXT_ENV, "收尾文本"),
+        ]);
+        assert_eq!(select_with(&env).expect("faux 工具通道应可选").id(), "faux");
+    }
+
+    /// 非法 JSON 要报错，不能静默降级成纯文本（那样 E2E 会「通过」却根本没调工具）。
+    #[test]
+    fn faux_tool_env_rejects_malformed_json() {
+        let err = select_with(&FakeEnv::new(&[(FAUX_TOOL_ENV, "{not json")]))
+            .expect_err("非法 JSON 应报错");
+        assert!(err.contains(FAUX_TOOL_ENV), "{err}");
+    }
+
     #[test]
     fn faux_wins_over_provider_env() {
         let env = FakeEnv::new(&[
@@ -394,6 +503,38 @@ mod tests {
         let backend = select_with(&FakeEnv::anthropic(&[])).expect("anthropic 应可选");
         assert_eq!(backend.id(), "anthropic");
         assert_eq!(backend.model().id, "claude-sonnet-4-5");
+    }
+
+    /// 图片能力必须与「后端 agent 层能不能真把图交给模型」一致。
+    ///
+    /// 两者错配的后果不同，所以不能一刀切：
+    /// - openai 家族：不声明 `Image` ⇒ 图片被换成 `(see attached image)` 占位（图真丢了）；
+    /// - anthropic：声明了也发不出去（rpi-ai 0.3.16 把 `Content::Image` 硬编码成占位文本），
+    ///   只会把「如实说明被省略」换成「指着一张不存在的图」⇒ 必须保持 `[Text]`。
+    #[test]
+    fn image_modality_follows_what_the_backend_can_actually_deliver() {
+        let anthropic = select_with(&FakeEnv::anthropic(&[])).expect("anthropic 应可选");
+        assert!(
+            !anthropic.delivers_tool_result_images(),
+            "anthropic 的 agent 层目前搬不动工具结果图片"
+        );
+        assert_eq!(
+            anthropic.model().input,
+            vec![InputModality::Text],
+            "声明 Image 只会换来与事实不符的占位"
+        );
+
+        let env = FakeEnv::new(&[
+            ("BUZZ_AGENT_PROVIDER", "openai"),
+            ("OPENAI_COMPAT_API_KEY", "sk-x"),
+            ("OPENAI_COMPAT_MODEL", "vendor-id"),
+        ]);
+        let openai = select_with(&env).expect("openai 应可选");
+        assert!(openai.delivers_tool_result_images());
+        assert!(
+            openai.model().input.contains(&InputModality::Image),
+            "openai 必须声明 Image，否则图片被换成占位"
+        );
     }
 
     /// **任意厂商模型 id 都要能用**：自定义网关（one-api 等）常用厂商原生 id，

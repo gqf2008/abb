@@ -68,7 +68,12 @@ token**。若 cancel 在回合任务**被 poll 之前**就到，那一次 abort 
 | `BUZZ_AGENT_MAX_ROUNDS` | 回合上界（abb 默认送 200） |
 | `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 可选；单回合输出上限。abb **今天不注入**，但被替代的 fork 会读它（默认 65536），故同样认 |
 | `ABB_AGENT_FAUX_TEXT` | **本包自己的离线通道**：命中即用 rpi faux provider（不联网、无凭据），供 smoke 与测试 |
+| `ABB_AGENT_FAUX_TOOL` | 离线通道之二：JSON `{"name":…,"arguments":…}`，先发一次工具调用再把 `ABB_AGENT_FAUX_TEXT` 当文本回复。用于无 key 验证「模型 → 工具 → 结果回灌」 |
 | `RUST_LOG` | 日志级别（默认 `info`；**日志只走 stderr**，stdout 是 ACP 协议通道） |
+
+⚠️ 两个 `ABB_AGENT_FAUX_*` 是**进程级覆盖**：只要环境里存在，就会**静默**把生产从真供应商切到
+离线 faux（abb 起 agent 时只 `env(k, v)` 注入、不 `env_clear()`，所以外部导出的变量会一路透传）。
+abb 主体零引用它们，但排查时先确认它们不存在。
 
 ### 模型 id 不查目录（重要）
 
@@ -98,6 +103,60 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 `/chat/completions`（对 host 根才补 `/v1/chat/completions`）——所以能正确拼成
 `https://api.deepseek.com/v1/chat/completions`。
 
+## MCP（刀 1）
+
+rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 的 tool surface 主要
+就是两个 MCP server：`abb-events`（= abb 二进制自身 `mcp-events` 子命令）与 `wassette`
+（Wasm 组件工具宿主）。本包用 **`rmcp`**（与被替代的 `crates/buzz-agent` 同源）接上它们。
+
+- 入口是 `session/new` 的 `params.mcpServers`（形状与 `src/buzz/acp.rs` 的 `McpServer` 逐字对应：
+  `{name, command, args, env:[{name,value}]}`）。**第一刀连 `params` 都不读**，abb 送的 server
+  列表被静默丢弃——现在会解析、`mcpServers` 形状不对则回 `-32005` 而不是当成空列表。
+- 工具以 **`{server}__{tool}`** 的限定名暴露给模型（与被替代组件一致：其 `SEP` 即 `__`，
+  且它同样拒绝 bare 名含 `__` 的工具），调用时回退到 bare 名发给 MCP。名字/描述/schema 的
+  上界（名字 ≤128、限定名 ≤64、工具数 ≤128、描述 ≤1024B、schema ≤4096B）逐条对齐
+  被替代组件；**一处有意差异**：那边遇到非法名字或重名是 `Err`（整轮 session 失败），
+  这边是**记 ERROR 后跳过**（与 abb「一个坏插件不能阻断其余」同取向）。重名不再静默：
+  第二个同名工具会打 ERROR 说明它永不可达（rpi 按 `find` 取首个匹配，重名不报错）。
+- **装配有界**：单 server 20s（`initialize` 与 `tools/list` **合计**）、全体 30s（取小者）。
+  **单个 server 连不上不拖垮整轮装配**，记 ERROR 后跳过。两个上界都落在 abb 的
+  `session/new` RPC 预算（60s）之内；装配本身**不再占用读循环**（`session/new` 与回合一样
+  走独立任务，否则 abb 那边只有 5s 宽限的「停止」会被拖过）。
+- 子进程环境是白名单（`env_clear()` + [`PASSTHROUGH_ENV`] + abb 按 server 下发的
+  `spec.env`）：否则每个 MCP server（含 wassette 这类第三方组件宿主）默认就能看到 abb 注入的
+  供应商 API key。工作目录取会话工作区（`session/new` 的 `cwd`，不存在时**如实报 cwd 错**而不是
+  把它读成「命令不存在」），server 的 stderr **继承**（落到 /dev/null 的话，「server 起不来」
+  的原因只剩我们那句 spawn 错误）。
+  **白名单是「可用性 vs 凭据面」的取舍**（与被替代组件同源）：`HTTP(S)_PROXY`/`ALL_PROXY`
+  可能带凭据、`SSH_AUTH_SOCK` 会让子进程能用用户的 SSH agent——对「能出网、能用 git」是必需的，
+  但意味着 wassette 这类第三方宿主也拿到它们。要收紧就得改 `PASSTHROUGH_ENV`。
+- 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。**例外**：本
+  进程自己**优雅退出**（stdin EOF）时不成立——不理会 EOF 的 MCP 子进程会被留下（`PPID=1`）：
+  关子进程的 kill 任务 spawn 在块 `block_on` 已返回的 runtime 上，没被 poll。
+  （装配超时被放弃的子进程不属此列：实测在预算到期的**同一瞬间**就被 `kill()`，无窗口。）
+  abb 的监督路径（`shutdown()` / `Drop` 都是 `killpg`）不受影响，单独启动本包时要自己收尾。
+- MCP `isError: true` 走 `Err(AgentError::Tool)` 路径，让 loop 编码成错误工具结果（不伪装成功）；
+  工具结果里的图片分两种情形处理，**都不会出现与事实不符的占位文本**：
+  - **openai 家族**（chat / responses）：真发图（chat 已端到端抓包；responses 仅有源码依据，**未端到端验**）。
+    这要求模型的 `input` 声明 `Image`（`provider.rs` 的 `custom_model` 已声明）——rpi 按 `Model::input`
+    门控，不声明就被换成 `(see attached image)` 占位。
+  - **anthropic**：目前**发不出去**（rpi-ai 0.3.16 把 `Content::Image` 硬编码成 `Text("(see attached
+    image)")`，上游注释写明 emit image block 仍是 TODO）⇒ 本包自己降级成**如实**的一行文本
+    （`[image 未传给模型：…]`），并把 `input` 保持为 `[Text]`。声明 `Image` 反而更差：那会把「如实
+    说明被省略」换成「指着一张不存在的图」。上游修好后把 `delivers_tool_result_images` 翻真即可。
+  单个工具结果受预算约束：**文本 + 图片合计** 8 MiB、**整条结果的文本** 50 KiB（两个额度都
+  **累计**，与 fork 的 `used`/`text_used` 同义），超限中间省略；超预算的图片降级成一行说明；
+  音频等 rpi 侧无对应 part 的类型同样留一行痕迹，不静默吞。
+
+握手仍然「先装配、再应答」（abb 在 `session/new` 应答之后才发 prompt，工具必须在 prompt 之前
+就位），但装配已经在独立任务里，读循环全程可读。
+
+尚未做（刀 2 之后视需要）：`notifications/tools/list_changed` 的刷新、每个 `tools/call` 的独立超时、
+断线重连、`session/close`（本包没有这个渠道：`session/close` 回 `-32601`，MCP 子进程随会话线性
+累积——与被替代组件同构）。另注意：MCP 子进程的孤儿回收（abb 侧有 `src/orphan_mcp.rs` 专治
+wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 abb 的 `killpg` 兜住，单独启动或
+外部单个 pid 被杀时会留孤儿（见上文「例外」）。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -119,11 +178,11 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 
 **已实现并验证**：`initialize`、`session/new`、`session/prompt`（回文本）、`session/cancel`
 （回合中可用，含同 burst）、`session/update` 的 `agent_message_chunk`、provider 失败如实报错、
-anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）。
+anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**`session/new` 的三项契约
+（`cwd` / `systemPrompt` / `mcpServers`）**、**MCP 客户端（工具经 MCP 真执行并回灌）**。
 
 **尚未实现（第二刀）**：
 
-- **MCP 客户端**——`abb-events` 与 wassette 两个 tool surface 现在会**缺失**；
 - **内置工具接线**（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv` 的 cwd）；
 - **约定链**：`~/AGENTS.md` 作为全局层 + cwd→root 逐级；技能目录对齐
   `~/.agents/skills` / `<cwd>/.agents/skills`（buzz `hints.rs` 的现状）。
@@ -165,7 +224,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。四个探针各自对应一条被评审反证过的行为：
+单测用替身，探针跑**真二进制**——两者职责不同。七条探针各自对应一条被评审反证过的行为：
 
 | 探针 | 覆盖 |
 | --- | --- |
@@ -173,6 +232,9 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `cancel_same_burst.py` | prompt 与 cancel 在同一次 write（0 间隔）时取消不被丢弃（修前 6/6 丢弃） |
 | `provider_error_is_visible.py` | provider 失败回 JSON-RPC error，而非「成功 + 空文本」 |
 | `openai_family_round_trip.py` | openai 家族端到端：URL 拼法、鉴权头、任意厂商模型 id、文本送达 |
+| `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
+| `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
+| `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
 被算作通过」的假通过窗口。

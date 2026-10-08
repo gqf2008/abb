@@ -50,11 +50,18 @@ rpi-ai = { version = "0.3.16", features = ["providers"] }
 # 第二刀接工具时再加回，避免死依赖。
 
 tokio = { version = "1", features = [
-    "rt-multi-thread", "macros", "time", "sync", "io-util", "io-std"] }
+    "rt-multi-thread", "macros", "time", "sync", "io-util", "io-std", "process"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+# MCP 客户端（owner 决策：用 rmcp，与被替代的 buzz-agent 同源）。
+# 只开 client + 子进程传输：不需要 server 侧与其它传输。
+rmcp = { version = "1", default-features = false, features = [
+    "client", "transport-child-process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }

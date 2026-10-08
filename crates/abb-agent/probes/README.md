@@ -29,4 +29,30 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   **任意厂商 id**，且文本被发成 `session/update` 并以 `end_turn` 收尾。这条覆盖的是 abb 把
   `openai-chat`/`openrouter`/`deepseek` 全归并成 `BUZZ_AGENT_PROVIDER=openai` 的真实路径。
 
+- `mcp_tool_round_trip.py`（配 `fake_mcp_server.py`）：刀 1 的核心验收。按 `session/new` 的
+  `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
+  工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分
+  「工具被调用」与「模型自己编了答案」。
+- `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。
+  另有 `--dump-env <path>`（落盘自己的 cwd + 全量 env）与 `--hang-init`（`initialize` 永不回包）
+  两个开关，供下面那条隔离/预算探针使用。
+- `mcp_isolation_and_budget.py`（配 `fake_mcp_server.py`）：第四轮评审（`abb-reviewer-61`）判
+  needs-changes 的两类偏离的复现实验。场景 1 断言**子进程真的没继承供应商凭据**（判据是假
+  server 自己写下的 env，不是读代码）、`spec.env` 生效、`cwd` 落在会话工作区；场景 2 用一个
+  `--hang-init` 的 server 把装配预算耗满，断言同一时刻发出的 `initialize` **0.0x 秒**就拿到应答
+  （读循环没被占）且 `session/new` 在单 server 预算（20s）附近收尾。
+  **修前表现**：子进程 env 里有 `ANTHROPIC_API_KEY`、cwd 是 abb-agent 自己的；挂住的 server
+  让 `session/new` 吃掉 35s 且期间 `session/cancel` 与 `initialize` 各被拖 19s（abb 的「停止」
+  只有 5s 宽限）。场景 3 用**两个**挂死 server 顶到 30s 总预算，并在装配已跑 1s 之后才发
+  `initialize`（避开「恰好赶在装配开始前答完」的假通过）。
+- `mcp_image_result_reaches_model.py`（配 `fake_mcp_server.py --image-data`）两个场景：
+  ①假 OpenAI 网关第一跳回 `tool_calls`、第二跳抓请求体，断言 MCP 回的图片以
+  `data:image/png;base64,…` 真的进了模型请求，且没有被换成 `(see attached image)`；
+  ②假 anthropic 端点（`/v1/messages` 事件流）断言走 anthropic 时**没有**这个误导性占位，
+  而是本包自己写的 `[image 未传给模型：…]`。
+  **修前表现**：`Model::new` 只给 `input=[Text]` ⇒ openai 路径图片被换成占位（图真丢）；
+  把 `input` 改成 `[Text, Image]` 后 anthropic 路径反而变成「指着一张不存在的图」（上游把
+  `Content::Image` 硬编码成 `(see attached image)`）。所以两条路径现在分开处理。
+  **未覆盖**：openai **responses** 路径的图片（仅有源码依据，无端到端）。
+
 全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。
