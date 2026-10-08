@@ -258,32 +258,43 @@ rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝�
 
 ## 工具调用通知（刀 2 第四批）
 
-`session/update` 的 `tool_call` / `tool_call_update` 与**被替代组件的四个发射点逐字同形**
-（`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）：
+`session/update` 的 `tool_call` / `tool_call_update`：**字段名、状态取值与 `content` 的嵌套形状**对齐
+被替代组件的四个发射点（`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/
+emit_completed/emit_failed`）。**但不是逐字等价**——下面把可达状态与三处差异一并写清。
 
-| 时机 | 载荷 |
-| --- | --- |
-| 模型刚发出调用 | `tool_call`：`toolCallId` / `title`（模型看到的**限定名**）/ `kind: "other"` / `status: "pending"` / `rawInput` |
-| 开始执行 | `tool_call_update`：`toolCallId` / `status: "in_progress"` |
-| 执行成功 | `tool_call_update`：`status: "completed"` + `content: [{type:"content",content:{type:"text",text}}]` + `rawOutput: {isError:false}` |
-| 执行失败 | `tool_call_update`：`status: "failed"` + `rawOutput: {error}` |
+| 时机 | 载荷 | 本包是否可达 |
+| --- | --- | --- |
+| 模型刚发出调用 | `tool_call`：`toolCallId` / `title`（模型看到的**限定名**）/ `kind: "other"` / `status: "pending"` / `rawInput` | ✅ 每条调用 |
+| 开始执行 | `tool_call_update`：`toolCallId` / `status: "in_progress"` | ✅ 每条调用（见差异 1） |
+| 调用执行过 | `tool_call_update`：`status: "completed"` + `content: [{type:"content",content:{type:"text",text}}]` + `rawOutput: {isError}` | ✅ 成功与「工具自己报错」都走这条 |
+| 压根没执行 / 传输失败 | `tool_call_update`：`status: "failed"` + `rawOutput: {error}` | ❌ **本包产不出**（见差异 1） |
 
-终态语义与参照物一致：`completed` = 「调用**执行过**」（工具自己报错也算，错误在 `rawOutput.isError`），
-`failed`（`rawOutput.error`）= 「压根没执行 / 传输失败」；图片等非文本结果按参照物的 `as_text_lossy`
-渲染成一行占位（`[image: <mime>, <n> base64 bytes]`），不静默丢。
+终态语义与参照物一致：`completed` = 「调用**执行过**」（工具自己报错也算，错误在 `rawOutput.isError`）；
+`failed` = 「压根没执行 / 传输失败」。非文本结果按参照物的 `as_text_lossy` 渲染成一行占位
+（`[image: <mime>, <n> base64 bytes]`），不静默丢。
 
 **不投影** `ToolExecutionUpdate`（工具进度）：参照物没有对应发射点，多发就是**新行为**而不是等价替换。
 
-⚠️ **两处已知边界**（根因在 rpi 的事件模型，不在投影逻辑）：
+### 与参照物的差异（三处，根因在 rpi 的事件模型，不在投影逻辑）
 
 1. rpi 只有「要执行了」一个前态、没有参照物那种「已识别 / 已开始执行」的分界 ⇒ 本包**总会**发
-   `in_progress`。参照物在「参数形状非法 / 未授权 / 被取消」这类**压根不执行**的形状上只发
-   `pending` + `failed`，因此本包也**几乎用不到 `failed`**。
-2. 输出被截断导致工具**未执行**时，参照物**不发任何通知**；rpi 仍会发 Start ⇒ 本包会看到
-   `pending → in_progress → completed(isError:true)`（内容是「未执行」的原因）。
-3. **取消**正在跑的工具调用：参照物补发 `failed: "cancelled"`；本包实测是 `completed`（rpi 在
-   中止时照常发 `ToolExecutionEnd`，终态里是工具自己的返回）——**没有悬空 `in_progress`**，
-   但状态取值不同（探针场景 4 实测）。
+   `in_progress`，且**从不发 `failed`**。参照物在「参数形状非法 / 未授权 / 被取消」这类**压根不执行**的
+   形状上只发 `pending` + `failed`（实测 unknown-tool 形状：参照物 2 条、本包 3 条）。
+2. 输出被截断导致工具**未执行**时，参照物**不发任何通知**；rpi 仍会发 Start ⇒ 本包发
+   `pending → in_progress → completed(isError:true)`（3 条 vs 参照物 0 条，内容是「未执行」的原因）。
+3. **取消**正在跑的工具调用：参照物补发 `failed: "cancelled"`；本包实测是 `completed`（rpi 中止时照常
+   发 `ToolExecutionEnd`，终态里是工具自己的返回）——**没有悬空 `in_progress`**，但状态取值不同
+   （探针场景 4 实测）。
+
+另有两处**正文层面**的差异（字段形状一致、语义一致，正文措辞不同）：①错误正文前缀不同（本包经 rpi 的
+工具错误路径会带 `tool error: `，参照物直接给文本）；②本包自建工具（如写入限定）的错误正文是中文，
+参照物对应实现是英文。**未登记为一致**，按实际告警。
+
+**`agent_message_chunk` 少一个 `messageId`**：参照物的文本投影带 `messageId`，本包不带（abb 侧不读它）；
+这条属刀 2 第一批的范围，在此一并登记。
+
+**未验证**：参照物「**未授权**（permission denied）」形状的条数只有源码依据（它的 `emit_failed`），
+本机没有能触发该形状的客户端；同一「压根不执行」类已由 unknown-tool 形状实测覆盖。
 
 ## 失败与取消的语义
 

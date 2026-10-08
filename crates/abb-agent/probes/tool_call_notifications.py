@@ -9,9 +9,9 @@
 1. 成功的工具调用（`dev__write` 写一个文件）⇒ 必须看到 `tool_call`（`status: pending`、
    `title` 是**限定名**、带 `rawInput`）与 `tool_call_update`（`in_progress` → `completed`，
    完成那条带 `content` 与 `rawOutput.isError: false`）；
-2. **工具自己报错**（写工作区外 ⇒ 被拒）⇒ 收到 `completed` + `rawOutput.isError: true`（参照物
-   的 `emit_completed` 语义：`failed` 只用于「压根没执行」；本包因 rpi 事件模型的边界，这条
-   形状上会多一条 `in_progress`，已在 README 登记）；
+2. **工具自己报错**（写工作区外 ⇒ 被拒）⇒ 收到 `completed` + `rawOutput.isError: true` + 错误正文
+   （参照物语义：`failed` 只用于「压根没执行」；本包受 rpi 事件模型限制**产不出 `failed`**、且这条
+   形状上会多一条 `in_progress`——两处差异已在 README 登记）；
 3. MCP 工具同样有通知（证明不是只给内置工具打的补丁）；
 4. **取消**一个正在跑的长工具调用（`dev__shell` 里 `sleep`）⇒ 已发出的调用必须有**终态**，
    不许留悬空 `in_progress`（参照物在取消时会补发 `failed: cancelled`）。
