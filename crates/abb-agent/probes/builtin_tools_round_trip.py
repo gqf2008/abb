@@ -3,12 +3,16 @@
 
 判据是**文件系统**（不是 agent 的文本输出）：工具调用到底有没有真落盘、逃逸尝试有没有真被拦住。
 
-四个场景：
+六个场景：
 1. `dev__write` 写入相对路径 ⇒ 文件真出现且内容一致（含自动创建父目录）；
 2. `dev__write` 用 `../escape.txt` ⇒ 工作区外**不得**出现该文件；工作区外绝对路径同样被拒；
 3. `dev__shell` 跑一条真命令（`echo … > shell.txt`）⇒ 文件真出现、内容一致；
 4. `BUZZ_AGENT_DEV_TOOLS=0` ⇒ `dev__*` 工具不存在（模型调用它会得到「工具不存在」），
-   且**不产生任何文件**（与 fork 的开关语义一致）。
+   且**不产生任何文件**（与 fork 的开关语义一致）；
+5. **末段符号链接**（`workspace/link.txt -> 工作区外文件`）⇒ `dev__write` 必须被拒，
+   工作区外的目标文件**内容原封不动**（修前会跟随链接写穿）；
+6. **shell 不得继承宿主环境**：`env > env.txt` 后断言 `ANTHROPIC_API_KEY`（探针设的哨兵）
+   **不在**子进程环境里，而 `PATH` 在（对照）。
 
 用法：`python3 builtin_tools_round_trip.py <abb-agent 二进制>`
 """
@@ -153,6 +157,57 @@ check("回合完成", ok)
 check("开关关闭时不产生文件", not os.path.exists(os.path.join(workspace, "should-not-exist.txt")))
 check("日志如实说明内置工具已关闭", "内置工具已关闭" in stderr, "stderr 里有没有那句关闭说明")
 check("也确实没有装配内置工具（对数）", "内置工具 7 个" not in stderr)
+
+print()
+print("=== 场景 5：末段符号链接（写穿工作区）必须被拒 ===")
+workspace = tempdir("symlink-file")
+outside_dir = tempdir("symlink-target")
+outside_file = os.path.join(outside_dir, "target.txt")
+with open(outside_file, "w", encoding="utf-8") as fh:
+    fh.write("ORIGINAL-CONTENT")
+link = os.path.join(workspace, "link.txt")
+try:
+    os.symlink(outside_file, link)
+    ok, _ = run_turn(workspace, {
+        "name": "dev__write",
+        "arguments": {"path": "link.txt", "content": "WRITTEN-THROUGH-LINK"},
+    })
+    check("回合完成（拒绝是工具错误，不把回合打挂）", ok)
+    with open(outside_file, encoding="utf-8") as fh:
+        check("工作区外目标文件**内容原封不动**", fh.read() == "ORIGINAL-CONTENT")
+except OSError:
+    print("  （本平台不支持建符号链接，跳过）")
+
+print()
+print("=== 场景 6：shell 不得继承宿主环境（含供应商凭据）===")
+workspace = tempdir("shellenv")
+ok, _ = run_turn(
+    workspace,
+    {"name": "dev__shell", "arguments": {"command": "env > env.txt", "timeout_secs": 30}},
+    extra_env={"ANTHROPIC_API_KEY": "sk-probe-should-not-leak"},
+)
+check("回合完成", ok)
+dump = os.path.join(workspace, "env.txt")
+check("shell 真的跑起来并落盘了环境快照", os.path.isfile(dump), dump)
+if os.path.isfile(dump):
+    with open(dump, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    check("凭据**不在** shell 环境里", "sk-probe-should-not-leak" not in text)
+    check("PATH 仍在（工具要能跑）", "PATH=" in text)
+
+print()
+print("=== 场景 7：dev__edit 真改文件（能力真到位，判据是文件内容）===")
+workspace = tempdir("edit")
+target = os.path.join(workspace, "doc.txt")
+with open(target, "w", encoding="utf-8") as fh:
+    fh.write("hello OLD world")
+ok, _ = run_turn(workspace, {
+    "name": "dev__edit",
+    "arguments": {"path": "doc.txt", "edits": [{"oldText": "OLD", "newText": "NEW"}]},
+})
+check("回合完成", ok)
+with open(target, encoding="utf-8") as fh:
+    check("文件内容真被改", fh.read() == "hello NEW world")
 
 print()
 if failures:

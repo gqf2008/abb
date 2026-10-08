@@ -9,13 +9,19 @@
 //!
 //! | 维度 | 被替代组件 | 本包 |
 //! | --- | --- | --- |
-//! | 集合 | `shell`/`read`/`write`/`ls` | 同上 + `edit`/`grep`/`find`（rpi-native 增量） |
+//! | 集合 | `shell`/`read`/`write`/`ls`/`glob`/**`delegate`**（6 个） | 前五个**同名**（`glob` 由 rpi 的 `find` 工具提供——它的入参就是 glob 模式）+ `edit`/`grep`（rpi 增量）；**`delegate`（子代理委派）本包没有**，见下 |
 //! | shell 工具 | `{command, timeout_secs}` | 同名前缀 `dev__shell`，schema 也把 `timeout` 改回 `timeout_secs` |
 //! | read 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；模型看得到 description，自洽但不通用） |
 //! | 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸） | **不放宽**：同样限定（见 [`confine_write_path`]） |
 //! | 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 与 FullAccess 一致（**受限档的 roots 策略仍由 abb 的闸门承担**，本包不实现档位） |
+//! | shell 超时 | 默认 120s、clamp 1..=600 | 同（`default_timeout=120`，模型给的 `timeout_secs` 也 clamp 进 1..=600） |
+//! | shell 的环境 | 白名单（供应商凭据不进子进程） | 同：`inherit_env=false` + [`crate::child_env::passthrough_map`] |
+//! | shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）；登记，不改 |
 //! | 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一个环境变量、同一种读法（见 [`dev_tools_enabled_from`]） |
 //! | Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
+//!
+//! **`delegate` 未实现**：参照物有一个把子任务委派给子代理的工具，本包没有对应实现。
+//! 换执行层时这是**已知能力缺口**（不是等价替换），登记在 README，随需要再补。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,8 +33,8 @@ use rpi_agent::types::{AgentToolResult, ToolResultPartial};
 use rpi_ai::types::{Schema, Tool};
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
-    create_read_tool, create_write_tool, ExecutionEnv, ExecutionToolContext, MutatingEnv,
-    OsExecutionEnv,
+    create_read_tool, create_write_tool, BashToolOptions, ExecutionEnv, ExecutionToolContext,
+    MutatingEnv, OsExecutionEnv,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +43,11 @@ use crate::provider::EnvSource;
 
 /// 进程级开关：`0` 关闭整套内置工具（与 fork 同款环境变量）。
 pub const DEV_TOOLS_ENV: &str = "BUZZ_AGENT_DEV_TOOLS";
+
+/// shell 的默认超时与 clamp 区间（与被替代组件一致：默认 120s、clamp 1..=600）。
+const DEFAULT_SHELL_TIMEOUT_SECS: f64 = 120.0;
+const MIN_SHELL_TIMEOUT_SECS: f64 = 1.0;
+const MAX_SHELL_TIMEOUT_SECS: f64 = 600.0;
 
 /// 限定名命名空间（与被替代组件一致：它把这些工具挂在一个 `dev` 伪服务器下）。
 const DEV_NAMESPACE: &str = "dev";
@@ -73,11 +84,23 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
     let mutate_env: Arc<dyn MutatingEnv> = env;
     let context = ExecutionToolContext::new(read_env, Some(mutate_env));
 
+    // shell：默认超时与参照物对齐（120s；模型给的 timeout_secs 由 guard 再 clamp），并且
+    // **不继承宿主环境**——abb 把供应商凭据注入 agent 进程，shell 不该看得到它们。
+    let shell_options = BashToolOptions {
+        command_prefix: None,
+        default_timeout: Some(DEFAULT_SHELL_TIMEOUT_SECS),
+        prepare: Some(Arc::new(|execution| {
+            // 闭包体同步完成（只改两个字段），用 `ready` 的未来满足 `BashPrepare` 的形状。
+            execution.inherit_env = false;
+            execution.env = crate::child_env::passthrough_map();
+            Box::pin(std::future::ready(Ok(())))
+        })),
+    };
+
     let raw: Vec<Arc<dyn AgentTool>> = vec![
-        // shell 一行：`bash` 工具改成参照物的名字 `dev__shell`，并把 schema 里的
-        // `timeout` 改回参照物的 `timeout_secs`（调用时再翻回去）。
+        // `bash` 工具改成参照物的名字 `dev__shell`，schema 里把 `timeout` 改回 `timeout_secs`。
         exposed(
-            create_bash_tool(&context, None),
+            create_bash_tool(&context, Some(shell_options)),
             "shell",
             Guard::ShellTimeout,
             workspace,
@@ -107,9 +130,11 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
             Guard::None,
             workspace,
         ),
+        // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
+        // `dev__glob`，让写惯了 `dev__glob` 的约定/技能仍然有效。
         exposed(
             create_find_tool(&context, None),
-            "find",
+            "glob",
             Guard::None,
             workspace,
         ),
@@ -147,9 +172,17 @@ fn exposed(
     if guard == Guard::ShellTimeout {
         rename_param(&mut parameters, "timeout", "timeout_secs");
     }
+    let mut description = base.description.clone();
+    if guard == Guard::WritePath {
+        // 参照物的 description 里写明「只能写工作区内」——工具的说明与真实约束一致，
+        // 模型才不会白试几次（本包的约束与参照物同款，见 [`confine_write_path`]）。
+        description.push_str(
+            "\n\nPath is confined to the session workspace: paths escaping it              (absolute paths outside, `..`, symlinks) are rejected.",
+        );
+    }
     let schema = Tool {
         name: format!("{DEV_NAMESPACE}{SEP}{bare}"),
-        description: base.description.clone(),
+        description,
         parameters,
         constrained_sampling: base.constrained_sampling.clone(),
     };
@@ -231,14 +264,21 @@ impl Exposed {
     }
 }
 
-/// `timeout_secs` → `timeout`（rpi 的 bash 工具用这个名字）。
+/// `timeout_secs` → `timeout`（rpi 的 bash 工具用这个名字），并 clamp 进参照物的区间。
+///
+/// 模型给的超时可能是 `0`、负数、`1e9` 或非数字：参照物是 clamp 1..=600（默认 120），
+/// 这里同款——`0`/负数/非法值一律落回默认，过大截到上界（免得一条命令把回合挂到天荒地老）。
 fn rename_timeout_param(params: Value) -> Value {
     let Value::Object(mut map) = params else {
         return params;
     };
-    if let Some(value) = map.remove("timeout_secs") {
-        map.insert("timeout".to_string(), value);
-    }
+    let requested = map
+        .remove("timeout_secs")
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS);
+    let clamped = requested.clamp(MIN_SHELL_TIMEOUT_SECS, MAX_SHELL_TIMEOUT_SECS);
+    map.insert("timeout".to_string(), Value::from(clamped));
     Value::Object(map)
 }
 
@@ -280,6 +320,15 @@ async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, Stri
             "拒绝写入会话工作区之外：{raw}（工作区 {}）",
             base.display()
         ));
+    }
+    // 末段本身是符号链接时，`fs::write` 会**跟随链接**写到工作区外
+    // （上面只 canonicalize 了父目录）——参照物在同一形状上也是显式拒绝。
+    if let Ok(metadata) = tokio::fs::symlink_metadata(&target).await {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "拒绝跟随符号链接写入（可能写到会话工作区之外）：{raw}"
+            ));
+        }
     }
     Ok(target)
 }
@@ -333,7 +382,8 @@ mod tests {
             "dev__edit",
             "dev__ls",
             "dev__grep",
-            "dev__find",
+            // 参照物的工具名是 `glob`（rpi 那个工具叫 find，入参就是 glob 模式）⇒ 同名暴露。
+            "dev__glob",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
@@ -363,15 +413,40 @@ mod tests {
         assert!(props.contains(&"command".to_string()), "{props:?}");
     }
 
-    /// `timeout_secs` → `timeout` 的翻译（含两者同时出现时以 `timeout_secs` 为准）。
+    /// `timeout_secs` → `timeout` 的翻译 + clamp（参照物：默认 120、区间 1..=600）。
     #[test]
-    fn shell_timeout_param_is_translated_back() {
+    fn shell_timeout_param_is_translated_and_clamped() {
         let translated = rename_timeout_param(serde_json::json!({
             "command": "ls",
             "timeout_secs": 30,
         }));
-        assert_eq!(translated["timeout"], 30);
+        assert_eq!(translated["timeout"], 30.0);
         assert!(translated.get("timeout_secs").is_none());
+
+        // 缺失 / 0 / 负数 / 非法值 ⇒ 默认 120。
+        for params in [
+            serde_json::json!({"command": "ls"}),
+            serde_json::json!({"command": "ls", "timeout_secs": 0}),
+            serde_json::json!({"command": "ls", "timeout_secs": -5}),
+            serde_json::json!({"command": "ls", "timeout_secs": "soon"}),
+        ] {
+            assert_eq!(
+                rename_timeout_param(params)["timeout"],
+                120.0,
+                "应落回参照物的默认超时"
+            );
+        }
+        // 上界截断（免得一条命令把回合挂死）。
+        assert_eq!(
+            rename_timeout_param(serde_json::json!({"command": "ls", "timeout_secs": 1e9}))
+                ["timeout"],
+            600.0
+        );
+        assert_eq!(
+            rename_timeout_param(serde_json::json!({"command": "ls", "timeout_secs": 0.5}))
+                ["timeout"],
+            1.0
+        );
         // 非对象原样返回（内层工具会自己报形状错误）。
         assert_eq!(rename_timeout_param(Value::Null), Value::Null);
     }
@@ -396,6 +471,30 @@ mod tests {
         assert!(escape.is_err(), "`..` 逃逸必须被拒：{escape:?}");
         let outside = confine_write_path(&workspace, "/tmp/abb-escape-outside.txt").await;
         assert!(outside.is_err(), "工作区外绝对路径必须被拒：{outside:?}");
+    }
+
+    /// **末段是符号链接**时必须拒绝：`fs::write` 会跟随链接写到工作区外
+    /// （只 canonicalize 父目录挡不住这一形状）。参照物在同一形状上也是显式拒绝。
+    #[tokio::test]
+    async fn write_confinement_rejects_symlinked_file_escape() {
+        let workspace = temp_workspace("symlink-file");
+        let outside = temp_workspace("symlink-file-outside");
+        let outside_file = outside.join("target.txt");
+        std::fs::write(&outside_file, "ORIGINAL").expect("建工作区外文件");
+        let link = workspace.join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &link).expect("建符号链接文件");
+        #[cfg(not(unix))]
+        {
+            return; // Windows 建符号链接需特权，跳过（由父目录逃逸那条覆盖）
+        }
+        let attempt = confine_write_path(&workspace, "link.txt").await;
+        assert!(attempt.is_err(), "末段符号链接必须被拒：{attempt:?}");
+        // 目标文件必须原封不动（这条断言才是「没写穿」的判据）。
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).expect("读工作区外文件"),
+            "ORIGINAL"
+        );
     }
 
     /// 符号链接父目录指向工作区外时也要拦住（canonicalize 之后再比前缀）。

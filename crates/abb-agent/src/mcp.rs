@@ -70,64 +70,6 @@ const MAX_SCHEMA_BYTES: usize = 4096;
 const TOOL_RESULT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const TOOL_RESULT_TEXT_BYTES: usize = 50 * 1024;
 
-/// 传给 MCP 子进程的环境变量白名单（**先 `env_clear()` 再按此表注入**）。
-///
-/// 子工具需要的是「能不能出网、能不能用 git、临时目录在哪」，**不是**凭据。
-/// 白名单内容与被替代组件同源（去掉那边 buzz 专属的几条）。
-const PASSTHROUGH_ENV: &[&str] = &[
-    // 基础
-    "PATH",
-    "HOME",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "TMPDIR",
-    "XDG_CONFIG_HOME",
-    // SSH：git clone/push over SSH（git@github.com:…）要用
-    "SSH_AUTH_SOCK",
-    "SSH_AGENT_PID",
-    // Git：运维配置的 helper 与传输覆盖
-    "GIT_ASKPASS",
-    "GIT_SSH_COMMAND",
-    "GIT_CONFIG_GLOBAL",
-    // 代理：唯一出口是 CONNECT 代理的机器上，丢掉这几条不是「降级」而是让工具瞎掉
-    // （apt/curl/pip/git 会直连，然后被出口防火墙 reset，看起来像「没有网络」）。
-    // 大小写都要：curl/git 读小写，多数 Go/Python 工具读大写，而 libcurl 故意忽略
-    // 大写的 `HTTP_PROXY`——只留一种会静默坏掉半个工具链。
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-    "all_proxy",
-    // TLS 信任：终止 TLS 的代理自带 CA，镜像的信任库没有它 ⇒ 每次 https 都验签失败
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-];
-
-/// Windows 没有 $TMPDIR/$HOME：`std::env::temp_dir()` 看 TMP/TEMP，缺了就回落到子进程
-/// 写不进去的 `C:\Windows`；USERPROFILE 是恒存在的兜底，APPDATA 带子工具配置。
-#[cfg(windows)]
-const PASSTHROUGH_ENV_WINDOWS: &[&str] = &["TMP", "TEMP", "USERPROFILE", "APPDATA"];
-
-/// `env_clear()` + 白名单。调用方随后应用 `spec.env`（它优先级最高）。
-fn apply_passthrough_env(cmd: &mut tokio::process::Command) {
-    cmd.env_clear();
-    for key in PASSTHROUGH_ENV {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
-        }
-    }
-    #[cfg(windows)]
-    for key in PASSTHROUGH_ENV_WINDOWS {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
-        }
-    }
-}
-
 /// abb 在 `session/new` 里下发的 MCP server 规格。
 ///
 /// 形状与 `src/buzz/acp.rs` 的 `McpServer`/`EnvVar` 逐字对应（那是唯一生产方）：
@@ -284,7 +226,8 @@ async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<Too
     // 第三方组件宿主）默认都能看到 abb 注入给 agent 的供应商 API key。
     // `spec.env` 是 abb 按 server 下发的（`AGENT_BRIDGE_HOME`、`ABB_EVENTS_REPO` 等），
     // 最后应用、优先级最高。
-    apply_passthrough_env(&mut cmd);
+    // 白名单在 `child_env`（MCP 子进程与内置工具的 shell 共用同一份）。
+    crate::child_env::apply_passthrough_env(&mut cmd);
     for env in &spec.env {
         cmd.env(&env.name, &env.value);
     }
