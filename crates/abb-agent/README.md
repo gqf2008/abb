@@ -214,7 +214,12 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   的硬链接**。这两条不拦，因为参照物的判据也只到这一层。
 - **无技能时不暴露 `load_skill`**（参照物只在 `!skills.is_empty()` 时 push）；支持文件成功结果的
   **外框**与参照物逐字一致（`# Loaded: skill/rel → File loaded into context.`）；`{name}/`（相对
-  路径为空）走**支持文件**分支并报错列出可用文件（`split_once('/')` 的语义）。
+  路径为空）走**支持文件**分支并报错列出可用文件（`split_once('/')` 的语义）；越界拒绝
+  （`refusing to load … resolves outside the skill directory`）与读取失败
+  （`could not read "skill/rel": …`，**不回显绝对路径**）的措辞同样逐字对齐。
+- **平台层差异（如实登记）**：`load_skill: missing required argument "name"` 这条在本包**端到端不可达**
+  ——rpi 会先按 schema 校验拦下（模型看到的是 `schema error: Validation failed …`），本包这句只在
+  直接调工具对象时出现（所有工具同款）。
 - ⚠️ **`BUZZ_AGENT_NO_HINTS` 同时关掉技能清单与 `load_skill`**（参照物：hints 关时 skills 是空 vec ⇒
   工具拿不到任何技能）。**未实现**：参照物在受限档还有 `read_roots` 校验（技能常在 `~/.agents/skills`，
   在工作区之外）——本包不实现档位，与「授权责任不变」一致，见上文 granted 隔离待办。

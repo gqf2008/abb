@@ -236,8 +236,10 @@ pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
         });
     };
 
-    // 越界保护：预枚举清单是按发现时的路径算的，读取前再核一次**真实路径**仍在技能目录内
-    // （防「发现之后目录被替换成符号链接」这类竞态；参照物在受限档另有 read_roots 校验）。
+    // 越界保护：预枚举清单是按发现时的路径算的，读取前再核一次**真实路径**仍在技能目录内。
+    // 它拦的是「**支持文件本身**是/被换成指向外面的符号链接」；**整个技能目录**被换成符号链接、
+    // 或支持文件是与外部同 inode 的**硬链接**，这两种形状这里拦不住（与参照物同形，见模块文档
+    // 的残留限制）。参照物在受限档另有 `read_roots` 校验，本包不实现档位。
     let canonical_dir = skill_dir.canonicalize().map_err(|error| {
         format!("load_skill: could not canonicalize skill directory for {skill_name:?}: {error}")
     })?;
@@ -246,11 +248,14 @@ pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
         .map_err(|error| format!("load_skill: could not canonicalize {file:?}: {error}"))?;
     if !canonical_file.starts_with(&canonical_dir) {
         return Err(format!(
-            "load_skill: file {rel_path:?} of skill {skill_name:?} is outside this skill's directory"
+            "load_skill: refusing to load {skill_name:?}/{rel_path}: \
+             resolves outside the skill directory"
         ));
     }
-    let content = std::fs::read_to_string(&canonical_file)
-        .map_err(|error| format!("load_skill: could not read {file:?}: {error}"))?;
+    let content = std::fs::read_to_string(&canonical_file).map_err(|error| {
+        // 措辞与参照物逐字一致：**不**回显绝对路径（评审实测两端文本不同）。
+        format!("load_skill: could not read {skill_name:?}/{rel_path}: {error}")
+    })?;
     // 成功结果的**外框**与参照物逐字一致（模型据此知道这份内容已经进上下文）。
     let output =
         format!("# Loaded: {skill_name}/{rel_path}\n\n{content}\n\n---\nFile loaded into context.");
@@ -491,7 +496,7 @@ mod tests {
             result.is_err()
                 && result
                     .unwrap_err()
-                    .contains("outside this skill's directory"),
+                    .contains("resolves outside the skill directory"),
             "越界读必须拒绝"
         );
     }
