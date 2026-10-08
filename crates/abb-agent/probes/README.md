@@ -54,6 +54,12 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   把 `input` 改成 `[Text, Image]` 后 anthropic 路径反而变成「指着一张不存在的图」（上游把
   `Content::Image` 硬编码成 `(see attached image)`）。所以两条路径现在分开处理。
   **未覆盖**：openai **responses** 路径的图片（仅有源码依据，无端到端）。
+- `builtin_tools_round_trip.py`：内置工具（`dev__*`）的端到端验收，**判据是文件系统**而不是
+  agent 的文本：`dev__write` 写相对路径必须真出现文件（含自动建父目录），`../` 逃逸与工作区外
+  绝对路径必须**不落盘**，`dev__shell` 必须真执行命令（`echo … > shell.txt`），
+  `BUZZ_AGENT_DEV_TOOLS=0` 时既没有内置工具也没有文件产出；末段符号链接指向工作区外时写入必须被拒
+  且目标文件内容原封不动；`dev__shell` 的 `env` 快照里**不得**出现宿主凭据（`ANTHROPIC_API_KEY`
+  探针哨兵）而 `PATH` 仍在；`dev__edit` 真改文件内容。
 - `hints_and_no_hints.py`：约定链的端到端证据（判据是假 anthropic 端点收到的 `system` 字段）。
   场景 1 断言会话目录的 `AGENTS.md` 与 `$HOME/AGENTS.md` 都进了请求、且全局层在前；场景 2
   断言 `BUZZ_AGENT_NO_HINTS=1`（abb 给 granted 会话的进程级收口）时**两者都不得出现**而默认

@@ -35,7 +35,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 | `session/request_permission` | **不发问** | 授权约定由 `AGENTS.md` 承担 |
 | `_meta.steering` | **声明 `supported: false`** | 本刀未实现 `_session/steering`；abb 那边该标志是写该方法的唯一闸门，报 true 只会让「回合中追加消息」多一次无效往返 |
 | LLM 层 / agent loop | 交给 rpi（`rpi-ai` / `rpi-agent`） | 不自持 7.9k 行 `llm.rs` |
-| 内置工具 | 第二刀接 `rpi-tools` | 尚未使用，故当前不在依赖里 |
+| 内置工具 | 第二刀已接 `rpi-tools`（`dev__*`，见下节） | `rpi-tools = "0.3.16"`，与参照物同源 |
 | 输出上限 | 默认 **65_536**，认 `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
 
 `initialize` 因此**不含** `_meta.abbSandbox`：abb 侧 `parse_abb_sandbox_modes` 得到
@@ -184,13 +184,49 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   空白串当**相对路径**处理，其结果依赖进程 cwd（评审实测：进程 cwd 是 git 根时为 1 层，不是固定 0 层），
   即「空白串 ≠ 空串」这一点两边不同，方向随环境而变；③env 值非 UTF-8 时两边都因 `var().ok()` 落到默认值（= 开），这一格与参照物**相同**
   但同样是 fail-open 方向，未测。
-- ⚠️ 已知边界：`NO_HINTS=1` 只关**自动注入**，不关「agent 自己主动去读」。首批没有内置工具、granted
-  会话的 MCP 也只有 abb-events，所以暂时封住；**内置工具（read/grep/bash）落地后需要按工具面重新论证
-  授权者会话的约定隔离**。且今天 granted 会话其实先被 abb 的 P2.3 硬闸拒建（abb-agent 如实不声明
-  `_meta.abbSandbox`），这个开关是拒建之外的**双保险**——它的价值在 abb-agent 声明档位之后才真正兑现。
+- **白名单相对上一版（刀 2 首批）对 MCP 子进程是加宽**：共享白名单把 `EDITOR`/`VISUAL`/`PAGER`/
+  `GIT_PAGER` 也给了 MCP 子进程（它们是非凭据的 git/编辑器变量，为内置工具的 shell 加的）。
+  另外 `session/new` 的 `spec.env` 在标记之后应用、优先级更高 ⇒ 若 abb 将来在该处声明
+  `ABB_AGENT_CONTEXT`（含设成空串）可覆盖标记；次序与参照物完全同形，abb 今天不下发它，如实登记。
+- ⚠️ **已知边界（内置工具落地后已按工具面重核，结论如下）**：内置工具已经上线（`dev__read`/`dev__shell`
+  等能主动读文件与跑命令），所以「`NO_HINTS=1` 只关**自动注入**、不关 agent 主动读」这条现在是**实的**：
+  今天它不构成泄漏，靠的是 abb 的 P2.3 硬闸（未声明 `_meta.abbSandbox` 的 agent 一律不接受限会话）把
+  granted 会话拦在门外，而不是靠本包的读面限制（本包读面只与参照物 FullAccess 档持平）。
+  **若将来 abb-agent 声明档位**，必须连同 `read_roots`/写入 roots 一起实现，不能只补声明——这条仍未做，
+  如实登记为待办（`src/task_proc.rs` 的 proc 闸同理：靠 `ABB_AGENT_CONTEXT` 标记，不是安全边界）。
 
 **尚未做**：技能目录发现（`~/.agents/skills`、`<cwd>/.agents/skills` 等）与 `load_skill` 工具
-—— 二者要有内置工具才能读，随内置工具那批一起落地。
+—— 内置工具已到位，这一块可以按需补；另见上文 granted 隔离待办。
+
+## 内置工具（刀 2 第二批）
+
+用 `rpi-tools`（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv`）补上被替代组件的
+能力面：第一刀只有 MCP 工具（abb-events / wassette），模型**没有文件读写与 shell**。
+`OsExecutionEnv::with_cwd(会话 cwd)` → `ExecutionToolContext` → `create_*_tool`，全部以
+**`dev__{name}` 限定名**暴露（沿用被替代组件的 `dev` 伪命名空间，避免 owner 约定/技能里写过的
+工具名静默失效）。
+
+与被替代组件的差异（逐条登记，不假装同形）：
+
+| 维度 | 被替代组件 | 本包 |
+| --- | --- | --- |
+| 集合 | **6 个**：`shell`/`read`/`write`/`ls`/`glob`/`delegate` | 前五个**同名**（`glob` 由 rpi 的 `find` 工具提供——它的入参就是 glob 模式）+ `edit`/`grep`（rpi 增量）；**`delegate`（子代理委派）本包没有** |
+| shell 工具参数 | `{command, timeout_secs}` | 同名同形：schema 里把 rpi 的 `timeout` 改名成 `timeout_secs`，调用时再翻回去 |
+| shell 超时 | 默认 120s、clamp 1..=600 | 同（`default_timeout=120`；模型给的 `timeout_secs` 也 clamp 进 1..=600，`0`/负数/非法值落回 120） |
+| shell 的环境 | 白名单（凭据不进子进程）+ **写入 `ABB_AGENT_CONTEXT=1`** | 同：`inherit_env=false` + `child_env::passthrough_map()`（与 MCP 子进程共用同一份白名单），且**标记由我们写入**（abb 的 Q8 proc 闸以它为主判据：少了它「agent 派生的 shell 去建 `--proc` 任务」会 fail-open） |
+| shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）并把路径给模型；该文件在 `TMPDIR` 下实测 `644`/目录 `755`（TMPDIR 若是共享目录，同机其它用户可读）；登记未改 |
+| `read` 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；description 里写得明白，模型自洽） |
+| 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸，**并拒绝末段符号链接**） | **不放宽**：父目录先建后 canonicalize 再比前缀，末段是符号链接直接拒；`..`、符号链接父目录/文件、工作区外绝对路径一律拒 |
+| 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 与 FullAccess 一致；**受限档的 roots 策略仍由 abb 的闸门承担**（本包不实现档位） |
+| 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
+| Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
+
+**已知能力缺口**：`delegate`（子代理委派）本包没有对应实现 —— 换执行层时这是**能力缺口**而不是等价替换。
+另外 `dev__write`/`dev__edit` 的 description 里明写了「路径限定在会话工作区」，与真实约束一致。
+
+与参照物**有意更紧**的一处：本包允许**落在工作区内**的绝对路径（参照物一律拒绝绝对路径）——
+rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝对路径反而会破坏正常写入；
+「不得出工作区」这条本身没有放宽。
 
 ## 失败与取消的语义
 
@@ -218,7 +254,6 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 
 **尚未实现（第二刀）**：
 
-- **内置工具接线**（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv` 的 cwd）；
 - **技能目录与 `load_skill`**：`~/.agents/skills` / `<cwd>/.agents/skills` 等的发现与按需读取
   （fork 的 `hints.rs` + `builtin.rs` 现状）。注意**不能**沿用 rpi 的默认位
   （`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），否则既有用户的约定会静默失效；
@@ -255,7 +290,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。八条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。九条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -267,6 +302,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
+| `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
