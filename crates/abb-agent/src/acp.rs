@@ -200,10 +200,12 @@ impl Server {
         }
         // 抢到 `in_flight` 之后才清取消标记：这样它不可能清掉一个正在生效的取消。
         session.turn.cancelled.store(false, Ordering::SeqCst);
+        // 用 RAII 守卫解锁：`run_turn` 万一是**因为 panic**才没走到收尾，裸的
+        // `store(false)` 不会执行，该会话就会带着 in_flight=true 永久卡死
+        // （后续每个 prompt 都被 -32004 拒掉）。Drop 不受 panic 影响。
+        let _unlock = InFlightGuard(Arc::clone(&session.turn));
 
-        let result = self.run_turn(&session, &session_id, id, &params).await;
-        session.turn.in_flight.store(false, Ordering::SeqCst);
-        result
+        self.run_turn(&session, &session_id, id, &params).await
     }
 
     async fn run_turn(
@@ -342,6 +344,15 @@ impl Server {
             // grep/find/ls），env 用 OsExecutionEnv::with_cwd(工作目录)。
             .build()
             .map_err(|error| format!("agent 构建失败：{error}"))
+    }
+}
+
+/// 回合结束时解锁会话（`Drop` 不受 panic 影响）。
+struct InFlightGuard(Arc<TurnState>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::SeqCst);
     }
 }
 
