@@ -638,10 +638,15 @@ fn flush_text(
         .saturating_sub(*text_used)
         .min(total_bytes.saturating_sub(*used));
     let piece = elide_middle(text, allowance);
+    text.clear();
+    if piece.is_empty() {
+        // 额度用尽时不丢一块空的 text part（与被替代组件的 `if !kept.is_empty()` 同义）：
+        // 空片段只会白占模型上下文里的位置。
+        return;
+    }
     *used = used.saturating_add(piece.len());
     *text_used = text_used.saturating_add(piece.len());
     out.push(TextContentOrImage::text(piece));
-    text.clear();
 }
 
 fn push_line(text: &mut String, line: &str) {
@@ -804,13 +809,15 @@ mod tests {
 
     /// 回归锁（第一把）：文本必须计入**合计**预算。
     ///
-    /// 上一版的这把锁是**空锁**（评审用「把实现换回旧版」的方式证伪：`3×(3 MiB 图 + 200 KiB
-    /// 文本)` 两种实现输出逐字节相同，断言恒真）。现在用**可注入的小预算**造出真正能区分
-    /// 两种实现的形状：图片很小、文本很多 ⇒ 旧实现（文本不计入合计）会堆出远超总预算的文本。
+    /// 形状要**让合计预算成为唯一的约束**，否则这把锁又是空的（上一版用「总预算 1000 /
+    /// 文本额度 800」，两种实现只差 22 字节，被断言余量淹了——评审用「单独去掉文本计入」
+    /// 的反例证实过）。现在：文本额度给得很宽（5000）、合计只有 1000、文本裸和 3000 ⇒
+    /// 只有「文本计入合计」的实现会收在 1000 附近；不记的实现会堆出 ~3000。
     #[test]
     fn total_budget_counts_text_towards_the_total() {
         let mut content = Vec::new();
-        for _ in 0..20 {
+        for _ in 0..3 {
+            content.push(rmcp::model::Content::text("T".repeat(1000)));
             content.push(
                 serde_json::from_value::<rmcp::model::Content>(serde_json::json!({
                     "type": "image",
@@ -819,14 +826,12 @@ mod tests {
                 }))
                 .expect("image 内容应能反序列化"),
             );
-            content.push(rmcp::model::Content::text("T".repeat(60)));
         }
-        // 总预算 1000、文本额度 800（都远小于「20 段 × 60 字节 + 图片」的裸和 1200+）。
-        let parts = tool_result_content_with(&content, true, 1000, 800);
+        let parts = tool_result_content_with(&content, true, 1000, 5000);
         let total = parts_bytes(&parts);
         assert!(
             total <= 1000 + 256,
-            "文本必须计入合计预算：{total} 超过 1000"
+            "文本必须计入合计预算：{total} 明显超过 1000"
         );
     }
 
@@ -887,6 +892,42 @@ mod tests {
         assert!(
             !text.contains("attached"),
             "不能出现与事实不符的占位：{text}"
+        );
+    }
+
+    /// 回归锁（**走真路径**）：两个预算常量必须接到正确的参位上。
+    ///
+    /// 两把小锁都直接调 `tool_result_content_with`，于是「`TOOL_RESULT_TOTAL_BYTES` /
+    /// `TOOL_RESULT_TEXT_BYTES` 在真路径里写反」不会被任何测试发现（评审指出真路径常量
+    /// 零断言覆盖）。这条把两个方向都钉住：
+    /// - 文本 200 KiB ⇒ 真路径必须把它裁到 **50 KiB** 量级（若文本额度被写成了 8 MiB，会原样留下 ⇒ 红）；
+    /// - 图片 6 MiB ⇒ 真路径必须**当作图片保留**（若合计额度被写成了 50 KiB，会被降级成一行文本 ⇒ 红）。
+    #[test]
+    fn real_path_wires_both_budgets_to_the_right_slots() {
+        let text = rmcp::model::Content::text("T".repeat(200 * 1024));
+        let parts = tool_result_content(&[text], true);
+        let text_len = parts_bytes(&parts);
+        assert!(
+            text_len <= TOOL_RESULT_TEXT_BYTES + 256,
+            "真路径的文本额度应是 50 KiB 量级，实际 {text_len}"
+        );
+        assert!(
+            text_len > TOOL_RESULT_TEXT_BYTES / 2,
+            "不能把预算写小到把正文全丢掉：{text_len}"
+        );
+
+        let image = serde_json::from_value::<rmcp::model::Content>(serde_json::json!({
+            "type": "image",
+            "data": "A".repeat(6 * 1024 * 1024),
+            "mimeType": "image/png",
+        }))
+        .expect("image 内容应能反序列化");
+        let parts = tool_result_content(&[image], true);
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, TextContentOrImage::Image(_))),
+            "6 MiB 的图片必须落在合计额度（8 MiB）内并被保留"
         );
     }
 
