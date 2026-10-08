@@ -18,7 +18,8 @@
 //!   `parse_abb_sandbox_modes` 因此得到 `None` → `SandboxSupport::Unsupported`。
 //!   这是**如实声明**：声明支持却不执行，正是 abb 注释里点名的事故形态。
 //! - **不发 `session/request_permission`**：授权约定由 AGENTS.md 承担。
-//! - **不发 `tool_call` / `tool_call_update`**：留第二刀。
+//! - **发 `tool_call` / `tool_call_update`**（刀 2 第四批）：工具调用要可见，
+//!   载荷与参照物的四个发射点对齐，见 [`tool_updates`] 的边界说明。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -745,9 +746,15 @@ fn event_updates(event: &AgentEvent) -> Vec<Value> {
     }
 }
 
-/// 工具调用的 `session/update` 载荷，**逐字对齐**被替代组件的四个发射点
-/// （`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）：
-/// 字段名、状态取值、`content` 的嵌套形状都一样，abb 侧与其它 ACP 客户端看到的没有差异。
+/// 工具调用的 `session/update` 载荷，**字段与状态取值对齐**被替代组件的四个发射点
+/// （`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）。
+///
+/// **两处已知边界**（根因在 rpi 的事件模型，不在投影逻辑；已在 README 登记）：
+/// 1. rpi 只有「要执行了（Start）」一个前态、没有参照物那种「已识别 / 已开始执行」的分界
+///    ⇒ 本包**总会**发 `in_progress`；参照物在「参数形状非法 / 未授权 / 被取消」这类
+///    **压根不执行**的形状上只发 `pending` + `failed`（因此本包也几乎用不到 `failed`）。
+/// 2. 输出被截断导致工具**未执行**时，参照物不发任何通知；rpi 仍会发 Start ⇒ 本包会看到
+///    `pending → in_progress → completed(isError:true)`（内容是「未执行」的原因）。
 fn tool_updates(
     tool_call_id: &str,
     tool_name: &str,
@@ -772,32 +779,35 @@ fn tool_updates(
                 "status": "in_progress",
             }),
         ],
-        (None, Some((result, true))) => vec![json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": tool_call_id,
-            "status": "failed",
-            "rawOutput": { "error": tool_result_text(result) },
-        })],
-        (None, Some((result, false))) => vec![json!({
+        // 终态与参照物**同语义**：`completed` 表示「调用执行过（不管工具自己报没报错）」，
+        // 错误信息放在 `rawOutput.isError` 里（参照物的 `emit_completed` 就是这么发的——
+        // 它的 `failed` 只用于「压根没执行」：参数形状非法 / 未授权 / 被取消 / 传输失败）。
+        (None, Some((result, is_error))) => vec![json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": tool_call_id,
             "status": "completed",
             "content": [{ "type": "content", "content": { "type": "text", "text": tool_result_text(result) } }],
-            "rawOutput": { "isError": false },
+            "rawOutput": { "isError": is_error },
         })],
         _ => Vec::new(),
     }
 }
 
-/// 工具结果的文本（对齐参照物的 `ToolResult::text()`：把文本块拼起来；没有文本就是空串）。
+/// 工具结果的文本：与参照物的 `ToolResult::text()`（`ToolResultContent::as_text_lossy`）
+/// **同形**——文本块原样、图片渲染成一行占位说明（`[image: <mime>, <n> base64 bytes]`），
+/// 非文本内容不许静默消失（早先这里直接丢图 ⇒ 通知里变成空串，与参照物不同形）。
 fn tool_result_text(result: &AgentToolResult) -> String {
     use rpi_agent::types::TextContentOrImage;
     result
         .content
         .iter()
-        .filter_map(|part| match part {
-            TextContentOrImage::Text(text) => Some(text.text.clone()),
-            TextContentOrImage::Image(_) => None,
+        .map(|part| match part {
+            TextContentOrImage::Text(text) => text.text.clone(),
+            TextContentOrImage::Image(image) => format!(
+                "[image: {}, {} base64 bytes]",
+                image.mime_type,
+                image.data.len()
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -931,15 +941,45 @@ mod tests {
             })
         );
 
-        let failed = tool_updates("call_1", "dev__shell", None, Some((&ok, true)));
+        // 工具**跑完报错**走 `completed` + `rawOutput.isError: true`（参照物 `emit_completed`
+        // 的语义；它的 `failed` 只用于「压根没执行」）。
+        let errored = tool_updates("call_1", "dev__shell", None, Some((&ok, true)));
         assert_eq!(
-            failed[0],
+            errored[0],
             serde_json::json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call_1",
-                "status": "failed",
-                "rawOutput": {"error": "文件已写入"},
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "文件已写入"}}],
+                "rawOutput": {"isError": true},
             })
+        );
+    }
+
+    /// 图片不许静默丢：文本形态要与参照物的 `as_text_lossy` 同形（否则通知里是空串）。
+    #[test]
+    fn tool_result_text_renders_images_like_the_replaced_component() {
+        use rpi_agent::types::TextContentOrImage;
+        use rpi_ai::types::{ImageContent, ImageContentType};
+        let result = AgentToolResult {
+            content: vec![
+                TextContentOrImage::text("看图"),
+                TextContentOrImage::Image(ImageContent {
+                    kind: ImageContentType,
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: Value::Null,
+            usage: None,
+            added_tool_names: Vec::new(),
+            terminate: false,
+        };
+        let text = tool_result_text(&result);
+        assert!(text.contains("看图"), "{text}");
+        assert!(
+            text.contains("[image: image/png, 8 base64 bytes]"),
+            "图片要留一行占位（与参照物 as_text_lossy 同形）：{text}"
         );
     }
 

@@ -268,7 +268,22 @@ rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝�
 | 执行成功 | `tool_call_update`：`status: "completed"` + `content: [{type:"content",content:{type:"text",text}}]` + `rawOutput: {isError:false}` |
 | 执行失败 | `tool_call_update`：`status: "failed"` + `rawOutput: {error}` |
 
+终态语义与参照物一致：`completed` = 「调用**执行过**」（工具自己报错也算，错误在 `rawOutput.isError`），
+`failed`（`rawOutput.error`）= 「压根没执行 / 传输失败」；图片等非文本结果按参照物的 `as_text_lossy`
+渲染成一行占位（`[image: <mime>, <n> base64 bytes]`），不静默丢。
+
 **不投影** `ToolExecutionUpdate`（工具进度）：参照物没有对应发射点，多发就是**新行为**而不是等价替换。
+
+⚠️ **两处已知边界**（根因在 rpi 的事件模型，不在投影逻辑）：
+
+1. rpi 只有「要执行了」一个前态、没有参照物那种「已识别 / 已开始执行」的分界 ⇒ 本包**总会**发
+   `in_progress`。参照物在「参数形状非法 / 未授权 / 被取消」这类**压根不执行**的形状上只发
+   `pending` + `failed`，因此本包也**几乎用不到 `failed`**。
+2. 输出被截断导致工具**未执行**时，参照物**不发任何通知**；rpi 仍会发 Start ⇒ 本包会看到
+   `pending → in_progress → completed(isError:true)`（内容是「未执行」的原因）。
+3. **取消**正在跑的工具调用：参照物补发 `failed: "cancelled"`；本包实测是 `completed`（rpi 在
+   中止时照常发 `ToolExecutionEnd`，终态里是工具自己的返回）——**没有悬空 `in_progress`**，
+   但状态取值不同（探针场景 4 实测）。
 
 ## 失败与取消的语义
 
