@@ -256,6 +256,20 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝对路径反而会破坏正常写入；
 「不得出工作区」这条本身没有放宽。
 
+## 工具调用通知（刀 2 第四批）
+
+`session/update` 的 `tool_call` / `tool_call_update` 与**被替代组件的四个发射点逐字同形**
+（`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）：
+
+| 时机 | 载荷 |
+| --- | --- |
+| 模型刚发出调用 | `tool_call`：`toolCallId` / `title`（模型看到的**限定名**）/ `kind: "other"` / `status: "pending"` / `rawInput` |
+| 开始执行 | `tool_call_update`：`toolCallId` / `status: "in_progress"` |
+| 执行成功 | `tool_call_update`：`status: "completed"` + `content: [{type:"content",content:{type:"text",text}}]` + `rawOutput: {isError:false}` |
+| 执行失败 | `tool_call_update`：`status: "failed"` + `rawOutput: {error}` |
+
+**不投影** `ToolExecutionUpdate`（工具进度）：参照物没有对应发射点，多发就是**新行为**而不是等价替换。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -283,7 +297,6 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 **尚未实现（第二刀）**：
 
 - `_session/steering`（现在如实声明为不支持，走 abb 的 cancel+merge 回退）；
-- `tool_call` / `tool_call_update` 通知；
 - 逐 token 流式（当前与 buzz-agent 一致：非流式，整条 `agent_message_chunk`）；
 - `StopReason::Length`（截断）目前会被报成 `end_turn`（abb 的 `max_tokens` 分支收不到）。
 - **openai-chat + 官方 OpenAI 推理模型**可能因字段名被拒：rpi 默认发 `max_tokens`，而被替代的
@@ -315,7 +328,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。十条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。十一条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -328,6 +341,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 | `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
+| `tool_call_notifications.py` | 工具调用通知真发出（`pending → in_progress → completed/failed`，含 MCP 工具）；成功那条带 `content`/`rawOutput` |
 | `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 

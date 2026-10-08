@@ -30,6 +30,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex;
 
 use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::types::AgentToolResult;
 
 use crate::mcp::{McpServerSpec, McpSession};
 use crate::provider::{self, Backend};
@@ -695,33 +696,111 @@ impl TurnAccum {
     }
 }
 
-/// 把一条事件按需投影成 `session/update`（第一刀只投影 assistant 文本）。
+/// 把一条事件按需投影成 `session/update`。
 ///
-/// 刻意在 `MessageEnd` 整条发、而不是逐 delta 发：buzz-agent 自己就是
+/// 文本刻意在 `MessageEnd` 整条发、而不是逐 delta 发：buzz-agent 自己就是
 /// 「Non-streaming」的（见其 Cargo.toml 描述），abb 侧只是把 chunk 文本累加，
 /// 整条发与逐字发对它等价；逐 delta 需要再摸一层 `AssistantMessageEvent` 形状。
+///
+/// 工具调用则**必须**投影（参照物有、abb 侧会解析并记日志）：见 [`tool_updates`]。
 async fn write_event(writer: &Writer, session_id: &str, event: &AgentEvent) {
-    let AgentEvent::MessageEnd { message } = event else {
-        return;
-    };
-    let Some(text) = assistant_text(message) else {
-        return;
-    };
-    if let Err(error) = writer
-        .notify(
-            "session/update",
-            json!({
-                "sessionId": session_id,
-                "update": {
+    for update in event_updates(event) {
+        if let Err(error) = writer
+            .notify(
+                "session/update",
+                json!({ "sessionId": session_id, "update": update }),
+            )
+            .await
+        {
+            tracing::warn!("session/update 写出失败，已忽略：{error}");
+        }
+    }
+}
+
+/// 一条事件对应的零到多条 `session/update` 载荷（纯函数，便于单测钉形状）。
+fn event_updates(event: &AgentEvent) -> Vec<Value> {
+    match event {
+        AgentEvent::MessageEnd { message } => assistant_text(message)
+            .map(|text| {
+                vec![json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": { "type": "text", "text": text },
-                },
-            }),
-        )
-        .await
-    {
-        tracing::warn!("session/update 写出失败，已忽略：{error}");
+                })]
+            })
+            .unwrap_or_default(),
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => tool_updates(tool_call_id, tool_name, Some(args), None),
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => tool_updates(tool_call_id, tool_name, None, Some((result, *is_error))),
+        // 参照物没有「工具进度」这一发射点（它只有 pending/in_progress/completed/failed 四个），
+        // 所以这里**不**投影 `ToolExecutionUpdate`——多发的通知是新行为，不是等价替换。
+        _ => Vec::new(),
     }
+}
+
+/// 工具调用的 `session/update` 载荷，**逐字对齐**被替代组件的四个发射点
+/// （`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）：
+/// 字段名、状态取值、`content` 的嵌套形状都一样，abb 侧与其它 ACP 客户端看到的没有差异。
+fn tool_updates(
+    tool_call_id: &str,
+    tool_name: &str,
+    args: Option<&Value>,
+    finished: Option<(&AgentToolResult, bool)>,
+) -> Vec<Value> {
+    match (args, finished) {
+        (Some(args), None) => vec![
+            // pending：模型刚发出调用（带原始入参，UI 可以显示「要做什么」）。
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_call_id,
+                "title": tool_name,
+                "kind": "other",
+                "status": "pending",
+                "rawInput": args,
+            }),
+            // in_progress：真正开始执行（参照物把这两个状态分成两条发）。
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": "in_progress",
+            }),
+        ],
+        (None, Some((result, true))) => vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": "failed",
+            "rawOutput": { "error": tool_result_text(result) },
+        })],
+        (None, Some((result, false))) => vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": tool_result_text(result) } }],
+            "rawOutput": { "isError": false },
+        })],
+        _ => Vec::new(),
+    }
+}
+
+/// 工具结果的文本（对齐参照物的 `ToolResult::text()`：把文本块拼起来；没有文本就是空串）。
+fn tool_result_text(result: &AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
+    result
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            TextContentOrImage::Text(text) => Some(text.text.clone()),
+            TextContentOrImage::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 取 assistant 消息里的文本内容；非 assistant / 无文本返回 `None`。
@@ -813,6 +892,69 @@ mod tests {
     /// 这条锁钉的是 `acp.rs` 的**接线处**（上一版 bug 就在这里，而只钉 `hints_section` 的
     /// 单测在那种回归下依然全绿——评审实测：把接线改回 `current_dir()`，62 单测 + 8 探针全绿）。
     /// 与内置工具撞名的 MCP 工具必须被摘掉（rpi 按名字取首个 ⇒ 否则静默不可达）。
+    /// 工具调用通知的四种载荷必须与被替代组件的发射点**逐字同形**。
+    #[test]
+    fn tool_call_updates_match_the_replaced_component() {
+        let args = serde_json::json!({"command": "ls"});
+        let started = tool_updates("call_1", "dev__shell", Some(&args), None);
+        assert_eq!(started.len(), 2, "参照物分两条发：pending 然后 in_progress");
+        assert_eq!(
+            started[0],
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "title": "dev__shell",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"command": "ls"},
+            })
+        );
+        assert_eq!(
+            started[1],
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+            })
+        );
+
+        let ok = AgentToolResult::text("文件已写入");
+        let completed = tool_updates("call_1", "dev__shell", None, Some((&ok, false)));
+        assert_eq!(
+            completed[0],
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "文件已写入"}}],
+                "rawOutput": {"isError": false},
+            })
+        );
+
+        let failed = tool_updates("call_1", "dev__shell", None, Some((&ok, true)));
+        assert_eq!(
+            failed[0],
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "failed",
+                "rawOutput": {"error": "文件已写入"},
+            })
+        );
+    }
+
+    /// 只投影参照物有的东西：`ToolExecutionUpdate`（工具进度）参照物没有对应发射点 ⇒ 不发。
+    #[test]
+    fn tool_progress_events_are_not_projected() {
+        let event = rpi_agent::events::AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "call_1".to_string(),
+            tool_name: "dev__shell".to_string(),
+            args: serde_json::json!({}),
+            partial_result: Arc::new(AgentToolResult::text("半截输出")),
+        };
+        assert!(event_updates(&event).is_empty(), "参照物没有进度发射点");
+    }
+
     #[test]
     fn mcp_tools_colliding_with_builtin_names_are_dropped() {
         struct Stub(Tool);
