@@ -58,6 +58,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
+# 跨平台 home（与 fork 同源：Windows 只有 USERPROFILE，手写单一 env 读法会丢掉
+# `~/AGENTS.md` 全局层与 `~/.agents/skills`）。
+dirs = "6"
+
 # MCP 客户端（owner 决策：用 rmcp，与被替代的 buzz-agent 同源）。
 # 只开 client + 子进程传输：不需要 server 侧与其它传输。
 rmcp = { version = "1", default-features = false, features = [

@@ -33,8 +33,7 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
   工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分
   「工具被调用」与「模型自己编了答案」。
-- `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。
-  另有 `--dump-env <path>`（落盘自己的 cwd + 全量 env）与 `--hang-init`（`initialize` 永不回包）
+- `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。  另有 `--dump-env <path>`（落盘自己的 cwd + 全量 env）与 `--hang-init`（`initialize` 永不回包）
   两个开关，供下面那条隔离/预算探针使用。
 - `mcp_isolation_and_budget.py`（配 `fake_mcp_server.py`）：第四轮评审（`abb-reviewer-61`）判
   needs-changes 的两类偏离的复现实验。场景 1 断言**子进程真的没继承供应商凭据**（判据是假
@@ -54,5 +53,12 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   把 `input` 改成 `[Text, Image]` 后 anthropic 路径反而变成「指着一张不存在的图」（上游把
   `Content::Image` 硬编码成 `(see attached image)`）。所以两条路径现在分开处理。
   **未覆盖**：openai **responses** 路径的图片（仅有源码依据，无端到端）。
+- `hints_and_no_hints.py`：约定链的端到端证据（判据是假 anthropic 端点收到的 `system` 字段）。
+  场景 1 断言会话目录的 `AGENTS.md` 与 `$HOME/AGENTS.md` 都进了请求、且全局层在前；场景 2
+  断言 `BUZZ_AGENT_NO_HINTS=1`（abb 给 granted 会话的进程级收口）时**两者都不得出现**而默认
+  系统提示仍在；场景 3 断言没有 `AGENTS.md` 时不注入空标题。
+  **修前表现**：没有任何约定链（系统提示里只有 abb 下发的或默认那一句），granted 会话与 owner
+  会话完全同形（本该被区分）。探针自带隔离的 `HOME`/`USERPROFILE`，不会读跑测机器的真实
+  `~/AGENTS.md`。
 
 全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。

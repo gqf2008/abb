@@ -54,6 +54,10 @@ pub struct Server {
     backend: Result<Backend, String>,
     /// abb 注入的回合上界（`BUZZ_AGENT_MAX_ROUNDS`，默认 200）。
     max_rounds: u64,
+    /// 约定链是否开启（`BUZZ_AGENT_NO_HINTS==1` 时关）。**装配时定一次**：
+    /// abb 对 granted 会话只在**进程级**收口这个变量（见 `hints` 模块文档），
+    /// 与 fork 同语义。
+    hints_enabled: bool,
     seq: AtomicU64,
 }
 
@@ -89,14 +93,34 @@ impl Server {
     /// 注入式构造：把后端选择与进程 env 解耦，便于测试直接给一个 faux 后端
     /// （不在测试里改进程全局 env——那会让并行用例互相踩）。
     pub fn with_backend(writer: Writer, backend: Result<Backend, String>) -> Self {
+        Self::with_backend_and_hints(
+            writer,
+            backend,
+            crate::hints::hints_enabled(&provider::ProcessEnv),
+        )
+    }
+
+    /// 可注入约定链开关的构造（单测用：不改进程全局 env）。
+    pub fn with_backend_and_hints(
+        writer: Writer,
+        backend: Result<Backend, String>,
+        hints_enabled: bool,
+    ) -> Self {
         if let Err(reason) = &backend {
             tracing::error!("provider 装配失败（会话建立时会如实报错）：{reason}");
+        }
+        if !hints_enabled {
+            tracing::info!(
+                "约定链已关闭（{}==1）：不加载 ~/AGENTS.md 与会话目录链",
+                crate::hints::NO_HINTS_ENV
+            );
         }
         Self {
             writer,
             state: Mutex::new(State::default()),
             backend,
             max_rounds: provider::max_rounds(&provider::ProcessEnv),
+            hints_enabled,
             seq: AtomicU64::new(1),
         }
     }
@@ -222,7 +246,24 @@ impl Server {
             }
         );
 
-        let agent = match self.build_agent(&session_id, parsed.system_prompt, tools) {
+        // 约定链：用**会话工作目录**（不是进程 cwd）——abb 的 cwd 就是频道工作区
+        // （`src/buzz/pool.rs` 的 `channel.workspace.unwrap_or(cwd)`），同一台机器上
+        // 不同会话本就该看不同目录的约定。为真时结果可能为空（没有任何 AGENTS.md）。
+        let hints = if self.hints_enabled {
+            let cwd = if parsed.cwd.is_empty() {
+                std::env::current_dir().unwrap_or_default()
+            } else {
+                std::path::PathBuf::from(&parsed.cwd)
+            };
+            crate::hints::hints_section(&cwd)
+        } else {
+            String::new()
+        };
+        if !hints.is_empty() {
+            tracing::info!("会话 {session_id}：约定链已注入 {} 字节", hints.len());
+        }
+
+        let agent = match self.build_agent(&session_id, parsed.system_prompt, &hints, tools) {
             Ok(agent) => agent,
             Err(reason) => return self.writer.fail(id, -32000, reason).await,
         };
@@ -425,17 +466,26 @@ impl Server {
         &self,
         session_id: &str,
         system_prompt: Option<String>,
+        hints: &str,
         tools: Vec<Arc<dyn AgentTool>>,
     ) -> Result<Agent, String> {
         let backend = self.backend.as_ref().map_err(|reason| reason.clone())?;
+        // 约定链拼在 abb 下发的系统提示**之后**：紧贴模型的那一端是用户自己的约定，
+        // 与 fork 的 `format!("{base}\n\n{hints_text}")` 同序。
+        let base = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        let system_prompt = if hints.is_empty() {
+            base
+        } else {
+            format!("{base}\n\n{hints}")
+        };
         AgentBuilder::new()
             .model(backend.model().clone())
-            .system_prompt(system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()))
+            .system_prompt(system_prompt)
             .session_id(session_id)
             .stream_fn(backend.stream_fn())
             .tools(tools)
             // TODO(刀 2)：接 rpi-tools 的内置工具（read/write/edit/bash/
-            // grep/find/ls），env 用 OsExecutionEnv::with_cwd(session/new 的 cwd)。
+            // grep/find/ls），env 用 `OsExecutionEnv::with_cwd(session/new 的 cwd)`。
             .build()
             .map_err(|error| format!("agent 构建失败：{error}"))
     }

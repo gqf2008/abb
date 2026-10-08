@@ -16,6 +16,7 @@
 //! 那个应用层。所以「装哪个目录」是我们自己的决定，不是要迁就的约束。
 
 pub mod acp;
+pub mod hints;
 pub mod mcp;
 pub mod provider;
 pub mod wire;
