@@ -30,3 +30,7 @@ logs/
 app-assets/Output/
 .claude/worktrees/
 tools-dist/
+
+# rpi（本仓的开发用 harness）会在项目里落 .rpi/sessions 等本机运行期数据；
+# 它不是仓库内容，且 rpi 自身的调试会持续改写它。
+.rpi/
