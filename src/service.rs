@@ -1968,12 +1968,71 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 必须把「带档位的 owner 会话」
+    /// 放到旧执行层槽上。这条曾经缺——评审用变异（把 `normal_meta.is_some()` 改成 `false`）
+    /// 实测全量门禁仍全绿，等于「owner 配 read-only 的会话会被 abb 的硬闸拒建」这个 bug
+    /// 可以静默回归。
+    #[test]
+    fn chat_handles_route_sandboxed_sessions_to_the_old_layer() {
+        let cmds = ("/bin/abb-agent", "/bin/buzz-agent");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let cfg = Config::default();
+        let mk_bot = |mode: crate::config::SandboxMode| crate::config::BotConfig {
+            name: "wire".into(),
+            sandbox_mode: mode,
+            ..crate::config::BotConfig::default()
+        };
+
+        // owner 带档位（read-only / workspace-write）⇒ normal 句柄必须用旧执行层槽。
+        for mode in [
+            crate::config::SandboxMode::ReadOnly,
+            crate::config::SandboxMode::WorkspaceWrite,
+        ] {
+            let handles = build_bot_acp_handles(&mk_bot(mode), &cfg, cmds, stop.clone());
+            assert_eq!(
+                handles.normal.agent_command(),
+                "/bin/buzz-agent",
+                "带档位的 owner 会话必须走旧执行层（否则被 abb 的 P2.3 硬闸拒建）"
+            );
+            assert!(
+                handles.normal.session_sandbox().is_some(),
+                "带档位的会话必须真的把档位载荷发出去"
+            );
+        }
+
+        // owner 无档位（Auto / FullAccess）⇒ normal 句柄用新执行层。
+        for mode in [
+            crate::config::SandboxMode::Auto,
+            crate::config::SandboxMode::FullAccess,
+        ] {
+            let handles = build_bot_acp_handles(&mk_bot(mode), &cfg, cmds, stop.clone());
+            assert_eq!(
+                handles.normal.agent_command(),
+                "/bin/abb-agent",
+                "无档位的 owner 会话应走新执行层"
+            );
+            assert!(handles.normal.session_sandbox().is_none());
+        }
+
+        // granted 句柄永远走旧执行层、且永远带档位。
+        let handles = build_bot_acp_handles(
+            &mk_bot(crate::config::SandboxMode::FullAccess),
+            &cfg,
+            cmds,
+            stop,
+        );
+        assert_eq!(handles.granted.agent_command(), "/bin/buzz-agent");
+        assert!(handles.granted.session_sandbox().is_some());
+    }
+
     /// **不变量**：只要会话需要受限档（granted，或 owner 的 read-only/workspace-write），
     /// 就必须落在旧执行层——abb-agent 如实不声明 `_meta.abbSandbox`，abb 对带
     /// `session_sandbox` 的会话是 fail-closed（`pool.rs` 拒建）。
     ///
-    /// 三条建会话路径（聊天句柄 / oneshot / task 角色剖面）都经这个纯函数，所以钉它 + 各自
-    /// 的接线测试就覆盖了「档位 ⇒ 命令槽」这条不变量。
+    /// 三条建会话路径（聊天句柄 / oneshot / task 角色剖面）都经这个纯函数；**每条路径各有一条
+    /// 接线测试**（`chat_handles_route_sandboxed_sessions_to_the_old_layer`、
+    /// `oneshot_paths_follow_the_sandbox_invariant`），所以「档位 ⇒ 命令槽」这条不变量有
+    /// 可复跑的锁，而不只是纯函数层面的约定。
     #[test]
     fn sessions_needing_a_sandbox_always_use_the_old_layer() {
         let cmds = ("/bin/abb-agent", "/bin/buzz-agent");

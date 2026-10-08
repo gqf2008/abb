@@ -98,6 +98,31 @@ jobs:
       - name: test（abb-agent）
         run: cargo test --locked --manifest-path crates/abb-agent/Cargo.toml
 
+  # abb-agent 已是 **Windows 的 owner 默认执行层**，而它此前只在 release tag 时被
+  # Windows 编译到（tag 才跑 release.yml）⇒ PR 级必须补一次 Windows 编译覆盖。
+  # 与 fork-lint 同款纪律：cfg(windows) 分支在 macOS 上根本不编译（既有盲区）。
+  abb-agent-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/abb-agent
+
+      - name: build（abb-agent，Windows）
+        run: cargo build --locked --manifest-path crates/abb-agent/Cargo.toml
+
+      - name: clippy（abb-agent，Windows）
+        run: cargo clippy --locked --manifest-path crates/abb-agent/Cargo.toml --all-targets -- -D warnings
+
+      - name: test 编译（abb-agent，Windows，--no-run）
+        run: cargo test --locked --manifest-path crates/abb-agent/Cargo.toml --no-run
+
   test:
     runs-on: windows-latest
     steps:

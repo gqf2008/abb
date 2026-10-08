@@ -487,6 +487,23 @@ pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> M
 }
 
 impl BuzzHandle {
+    /// 测试访问器：**该句柄实际会 spawn 的执行层命令**。
+    ///
+    /// 为什么需要它：执行层按角色 + 档位分流（`service::pick_command_by_sandbox`），
+    /// 而「命令槽是否选对」**只有接线测试能钉住**——评审用变异实测过：把
+    /// `normal_meta.is_some()` 改成 `false`（等于把「带档位的 owner 会话送去 abb-agent
+    /// 被硬闸拒建」这个 bug 放回去），全量门禁依然全绿。
+    #[cfg(test)]
+    pub(crate) fn agent_command(&self) -> &str {
+        &self.cfg.command
+    }
+
+    /// 测试访问器：该句柄的 `session_sandbox` 档位载荷（`None` = FullAccess/Auto）。
+    #[cfg(test)]
+    pub(crate) fn session_sandbox(&self) -> Option<&crate::buzz::acp::SessionSandboxMeta> {
+        self.cfg.session_sandbox.as_ref()
+    }
+
     /// 测试访问器：会话级 MCP server 名单（events + extra 注入后的 PromptContext 快照）。
     #[cfg(test)]
     pub(crate) fn mcp_server_names(&self) -> Vec<String> {
