@@ -35,7 +35,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 | `session/request_permission` | **不发问** | 授权约定由 `AGENTS.md` 承担 |
 | `_meta.steering` | **声明 `supported: false`** | 本刀未实现 `_session/steering`；abb 那边该标志是写该方法的唯一闸门，报 true 只会让「回合中追加消息」多一次无效往返 |
 | LLM 层 / agent loop | 交给 rpi（`rpi-ai` / `rpi-agent`） | 不自持 7.9k 行 `llm.rs` |
-| 内置工具 | 第二刀接 `rpi-tools` | 尚未使用，故当前不在依赖里 |
+| 内置工具 | 第二刀已接 `rpi-tools`（`dev__*`，见下节） | `rpi-tools = "0.3.16"`，与参照物同源 |
 | 输出上限 | 默认 **65_536**，认 `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
 
 `initialize` 因此**不含** `_meta.abbSandbox`：abb 侧 `parse_abb_sandbox_modes` 得到
@@ -184,13 +184,19 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   空白串当**相对路径**处理，其结果依赖进程 cwd（评审实测：进程 cwd 是 git 根时为 1 层，不是固定 0 层），
   即「空白串 ≠ 空串」这一点两边不同，方向随环境而变；③env 值非 UTF-8 时两边都因 `var().ok()` 落到默认值（= 开），这一格与参照物**相同**
   但同样是 fail-open 方向，未测。
-- ⚠️ 已知边界：`NO_HINTS=1` 只关**自动注入**，不关「agent 自己主动去读」。首批没有内置工具、granted
-  会话的 MCP 也只有 abb-events，所以暂时封住；**内置工具（read/grep/bash）落地后需要按工具面重新论证
-  授权者会话的约定隔离**。且今天 granted 会话其实先被 abb 的 P2.3 硬闸拒建（abb-agent 如实不声明
-  `_meta.abbSandbox`），这个开关是拒建之外的**双保险**——它的价值在 abb-agent 声明档位之后才真正兑现。
+- **白名单相对上一版（刀 2 首批）对 MCP 子进程是加宽**：共享白名单把 `EDITOR`/`VISUAL`/`PAGER`/
+  `GIT_PAGER` 也给了 MCP 子进程（它们是非凭据的 git/编辑器变量，为内置工具的 shell 加的）。
+  另外 `session/new` 的 `spec.env` 在标记之后应用、优先级更高 ⇒ 若 abb 将来在该处声明
+  `ABB_AGENT_CONTEXT`（含设成空串）可覆盖标记；次序与参照物完全同形，abb 今天不下发它，如实登记。
+- ⚠️ **已知边界（内置工具落地后已按工具面重核，结论如下）**：内置工具已经上线（`dev__read`/`dev__shell`
+  等能主动读文件与跑命令），所以「`NO_HINTS=1` 只关**自动注入**、不关 agent 主动读」这条现在是**实的**：
+  今天它不构成泄漏，靠的是 abb 的 P2.3 硬闸（未声明 `_meta.abbSandbox` 的 agent 一律不接受限会话）把
+  granted 会话拦在门外，而不是靠本包的读面限制（本包读面只与参照物 FullAccess 档持平）。
+  **若将来 abb-agent 声明档位**，必须连同 `read_roots`/写入 roots 一起实现，不能只补声明——这条仍未做，
+  如实登记为待办（`src/task_proc.rs` 的 proc 闸同理：靠 `ABB_AGENT_CONTEXT` 标记，不是安全边界）。
 
 **尚未做**：技能目录发现（`~/.agents/skills`、`<cwd>/.agents/skills` 等）与 `load_skill` 工具
-—— 二者要有内置工具才能读，随内置工具那批一起落地。
+—— 内置工具已到位，这一块可以按需补；另见上文 granted 隔离待办。
 
 ## 内置工具（刀 2 第二批）
 
@@ -210,7 +216,7 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 | shell 的环境 | 白名单（凭据不进子进程）+ **写入 `ABB_AGENT_CONTEXT=1`** | 同：`inherit_env=false` + `child_env::passthrough_map()`（与 MCP 子进程共用同一份白名单），且**标记由我们写入**（abb 的 Q8 proc 闸以它为主判据：少了它「agent 派生的 shell 去建 `--proc` 任务」会 fail-open） |
 | shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）并把路径给模型；该文件在 `TMPDIR` 下实测 `644`/目录 `755`（TMPDIR 若是共享目录，同机其它用户可读）；登记未改 |
 | `read` 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；description 里写得明白，模型自洽） |
-| 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸） | **不放宽**：父目录先建后 canonicalize，再比前缀；`..`、符号链接父目录、工作区外绝对路径一律拒 |
+| 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸，**并拒绝末段符号链接**） | **不放宽**：父目录先建后 canonicalize 再比前缀，末段是符号链接直接拒；`..`、符号链接父目录/文件、工作区外绝对路径一律拒 |
 | 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 与 FullAccess 一致；**受限档的 roots 策略仍由 abb 的闸门承担**（本包不实现档位） |
 | 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
 | Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |

@@ -216,6 +216,15 @@ fn describe_timeout_bounds(schema: &mut Schema) {
     };
     timeout.insert("minimum".to_string(), Value::from(MIN_SHELL_TIMEOUT_SECS));
     timeout.insert("maximum".to_string(), Value::from(MAX_SHELL_TIMEOUT_SECS));
+    // **参数级** description 也是模型可见面：rpi 的原文写着「no default timeout」，与本包
+    // 实际设的 120s/clamp 矛盾——只改工具级那句是不够的（评审实测抓到这一点）。
+    timeout.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Timeout in seconds (default {:.0}, clamped to {:.0}..={:.0}).",
+            DEFAULT_SHELL_TIMEOUT_SECS, MIN_SHELL_TIMEOUT_SECS, MAX_SHELL_TIMEOUT_SECS
+        )),
+    );
 }
 
 /// 把 JSON Schema 里 `properties` 下的某个字段改名（用于 `timeout` → `timeout_secs`）。
@@ -464,6 +473,13 @@ mod tests {
         let timeout = &shell.parameters.0["properties"]["timeout_secs"];
         assert_eq!(timeout["minimum"], 1.0, "{timeout}");
         assert_eq!(timeout["maximum"], 600.0, "{timeout}");
+        // 关键：**参数级** description 也是模型可见的，rpi 原文那句「no default timeout」必须没了。
+        let param_desc = timeout["description"].as_str().unwrap_or_default();
+        assert!(
+            !param_desc.contains("no default timeout"),
+            "参数级说明与真实默认超时矛盾：{param_desc}"
+        );
+        assert!(param_desc.contains("default 120"), "{param_desc}");
 
         for name in ["dev__write", "dev__edit"] {
             let schema = by_name(name).schema().clone();
