@@ -4,11 +4,14 @@
 判据分两处：①假 CLI 自己写下的「我被调用了 + 收到的参数」（子进程侧证据）；
 ②假 anthropic 端点第二跳请求体里出现的报告正文（模型侧证据）。
 
-三个场景：
+五个场景：
 1. 正常委派（`BUZZ_AGENT_DELEGATE_CLAUDE_BIN` 指向假 CLI）⇒ 第二跳里出现报告标记，
    且假 CLI 记录的参数含 `--` 分隔与 task；
 2. CLI 不可用（覆盖指向不存在路径 + PATH 清空）⇒ 工具结果里是**可纠偏**错误（列出可用后端）；
-3. 取消（假 CLI 里 sleep）⇒ 回合以 `cancelled` 收尾，且不留下挂死的子进程（可观察回合结束）。
+3. 取消（假 CLI 里 sleep）⇒ 回合以 `cancelled` 收尾，且不留下挂死的子进程（可观察回合结束）；
+4. **非零退出** ⇒ 工具结果是**错误**（模型侧看到 `tool error:` + exit 码 + 报告正文），不是成功；
+5. **孙进程攥着管道**（假 CLI 后台 sleep 后自己退出）⇒ 工具在宽限内返回并标注 `output incomplete`，
+   回合**不挂死**。
 
 用法：`python3 delegate_round_trip.py <abb-agent 二进制>`
 """
@@ -94,13 +97,16 @@ def check(label, ok, detail=""):
         failures.append(label)
 
 
-def make_fake_cli(dir_path, sleep_secs=0):
-    path = os.path.join(dir_path, "fake-claude")
+def make_fake_cli(dir_path, sleep_secs=0, exit_code=0, lingering=False, tag="fake-claude"):
+    path = os.path.join(dir_path, tag)
     body = "#!/bin/sh\n"
     body += f'echo "argv: $*" >> "{os.path.join(dir_path, "calls.txt")}"\n'
+    if lingering:
+        body += "sleep 30 &\n"           # 后台孙进程继承管道
     if sleep_secs:
         body += f"sleep {sleep_secs}\n"
     body += f'echo "{REPORT}"\n'
+    body += f"exit {exit_code}\n"
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(body)
     os.chmod(path, 0o755)
@@ -189,20 +195,40 @@ if os.path.isfile(calls_path):
 check("工具通知里出现 dev__delegate", "dev__delegate" in json.dumps(first, ensure_ascii=False))
 
 print()
-print("=== 场景 2：CLI 不可用时给可纠偏错误 ===")
+print("=== 场景 2：某个后端不可用时给可纠偏错误 ===")
+# claude 可用（保证工具被暴露）而 codex 不可用 ⇒ 请求 codex 应得到可纠偏错误。
 workspace = tempfile.mkdtemp(prefix="abb-delegate-nocli-")
+good_cli = make_fake_cli(workspace, tag="good-claude")
 first, second, _ = run_turn(
     workspace,
     {"backend": "codex", "task": "x"},
     extra_env={
+        "BUZZ_AGENT_DELEGATE_CLAUDE_BIN": good_cli,
         "BUZZ_AGENT_DELEGATE_CODEX_BIN": "/definitely/not/here-codex",
         "PATH": "/nonexistent-dir-for-probe",
     },
 )
 second_text = json.dumps(second, ensure_ascii=False)
 check("工具结果里是「CLI 不可用」而不是静默成功",
-      "not available" in second_text, second_text[-300:])
-check("错误里列出可用后端（可纠偏）", "available:" in second_text)
+      "not available" in second_text, second_text[-200:])
+check("错误里列出可用后端（可纠偏）", "available: claude" in second_text, second_text[-200:])
+
+print()
+print("=== 场景 2b：两个 CLI 都没有 ⇒ 不暴露 dev__delegate ===")
+workspace = tempfile.mkdtemp(prefix="abb-delegate-none-")
+first, _, _ = run_turn(
+    workspace,
+    {"backend": "claude", "task": "x"},
+    extra_env={
+        "BUZZ_AGENT_DELEGATE_CLAUDE_BIN": "/definitely/not/here-claude",
+        "BUZZ_AGENT_DELEGATE_CODEX_BIN": "/definitely/not/here-codex",
+        "PATH": "/nonexistent-dir-for-probe",
+    },
+)
+names = [t.get("name") for t in first.get("tools", []) if isinstance(t, dict)]
+check("工具表里没有 dev__delegate（没有可用后端时不暴露）",
+      "dev__delegate" not in names, f"{names}")
+check("其它内置工具仍在", "dev__shell" in names, f"{names}")
 
 print()
 print("=== 场景 3：取消长委派 ⇒ 回合收尾为 cancelled ===")
@@ -217,6 +243,37 @@ first, second, answer = run_turn(
 check("回合应答到了（没有挂死）", answer is not None)
 check("收尾为 cancelled", answer is not None and '"cancelled"' in answer.replace(" ", ""),
       (answer or "")[-160:])
+
+print()
+print("=== 场景 4：非零退出必须是错误结果（fail 位不能丢）===")
+workspace = tempfile.mkdtemp(prefix="abb-delegate-exit-")
+cli = make_fake_cli(workspace, exit_code=3, tag="failing-claude")
+first, second, answer = run_turn(
+    workspace,
+    {"backend": "claude", "task": "会失败的任务", "timeout_secs": 60},
+    extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
+)
+second_text = json.dumps(second, ensure_ascii=False)
+check("模型侧看到的是工具**错误**（tool error …）", "tool error:" in second_text, second_text[-200:])
+check("错误里带 exit 码", "exit: 3" in second_text)
+check("报告正文仍随错误带回（模型能看到输出）", REPORT in second_text)
+
+print()
+print("=== 场景 5：孙进程攥着管道时回合不挂死 ===")
+workspace = tempfile.mkdtemp(prefix="abb-delegate-linger-")
+cli = make_fake_cli(workspace, lingering=True, tag="linger-claude")
+started = time.time()
+first, second, answer = run_turn(
+    workspace,
+    {"backend": "claude", "task": "留下孙进程", "timeout_secs": 60},
+    extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
+)
+elapsed = time.time() - started
+check("回合在宽限内有应答（不挂死）", answer is not None and elapsed < 40, f"{elapsed:.1f}s")
+second_text = json.dumps(second, ensure_ascii=False)
+check("如实标注输出不完整", "output incomplete" in second_text, second_text[-200:])
+# 清掉假 CLI 留下的 sleep（探针纪律）。
+os.system("pkill -f 'sleep 30' >/dev/null 2>&1")
 
 print()
 if failures:

@@ -259,9 +259,17 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 - 命令行：claude `-p --output-format text --dangerously-skip-permissions -- <task>`；
   codex `exec --skip-git-repo-check --sandbox workspace-write -C <cwd> -- <task>`（`--` 分隔，
   防 task 被当选项/子命令）；
-- 二进制：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` 覆盖 → PATH；找不到时给**可纠偏**错误（列出可用后端）；
+- 二进制：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` **覆盖即唯一来源**（指错不回落 PATH——与参照物
+  `resolve_delegate_cli` 同取向：运维要的就是确定性）→ 未设覆盖时查 PATH；找不到时给**可纠偏**错误
+  （`available: claude, codex` / `available: none (neither claude nor codex found in PATH)`）；
+- **两个 CLI 都没装时不暴露这个工具**（参照物 `cli_available` 腿同取向：工具表里不该出现只会报错的工具）；
 - 超时默认 **1200s**、clamp 1..=1200，到点杀进程；`session/cancel` 也杀（unix 连同进程组）；
+- **抽干管道有上界（5s）**：孙进程若仍攥着管道，如实标注 `output incomplete` 而不是把回合挂死；
+- 输出按**头 16 KiB + 尾 16 KiB + 省略标记**有界保留（不会整段丢掉 stderr）；
+- **非零退出是错误结果**（rpi 按 `Ok`/`Err` 推 `is_error`）：委派失败不会被当成成功工具结果回灌给模型，
+  但 exit 码与输出仍随错误正文带回；
 - env 走**白名单**（供应商凭据不进子进程）+ claude 的 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`；
+  Windows 上 `CREATE_NO_WINDOW`（与 MCP/shell 子进程同款，不弹控制台窗）；
 - ⚠️ **授权差异（如实登记）**：参照物在受限档（read-only / granted）**拒绝**这个工具（它按
   `policy.sandbox.allow_shell()` 与 shell 模式判定）；本包不实现档位，而受限会话根本不会跑到本包上
   （abb 的 P2.3 硬闸拒建）⇒ **结构上满足，但没有独立闸门**。
@@ -384,7 +392,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 | `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
 | `tool_call_notifications.py` | 工具调用通知真发出（`pending → in_progress → completed/failed`，含 MCP 工具）；成功那条带 `content`/`rawOutput` |
-| `delegate_round_trip.py` | `dev__delegate` 真调用本机 CLI（假 CLI 记录 argv）／报告回灌到模型请求体／CLI 不可用时可纠偏／取消长委派收尾为 `cancelled` |
+| `delegate_round_trip.py` | `dev__delegate` 真调用本机 CLI（假 CLI 记录 argv）／报告回灌／不可用时可纠偏／无可用后端时不暴露／非零退出是错误结果／孙进程攥管道不挂死／取消收尾 `cancelled` |
 | `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 

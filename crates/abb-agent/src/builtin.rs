@@ -97,7 +97,7 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
         })),
     };
 
-    let raw: Vec<Arc<dyn AgentTool>> = vec![
+    let mut tools: Vec<Arc<dyn AgentTool>> = vec![
         // `bash` 工具改成参照物的名字 `dev__shell`，schema 里把 `timeout` 改回 `timeout_secs`。
         exposed(
             create_bash_tool(&context, Some(shell_options)),
@@ -138,15 +138,19 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
             Guard::None,
             workspace,
         ),
-        // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
-        exposed(
+    ];
+    // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
+    // **两个 CLI 都没装时不暴露**：与参照物的 `cli_available` 腿同取向——工具表里不该出现
+    // 一个只会报错的工具（评审 F8）。
+    if crate::delegate::any_backend_available(&crate::provider::ProcessEnv) {
+        tools.push(exposed(
             Arc::new(crate::delegate::DelegateTool::new(workspace)),
             crate::delegate::DELEGATE_BARE_NAME,
             Guard::None,
             workspace,
-        ),
-    ];
-    raw
+        ));
+    }
+    tools
 }
 
 /// 工具执行前要做的那点额外事。

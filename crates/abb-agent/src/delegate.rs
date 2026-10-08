@@ -109,15 +109,17 @@ pub fn delegate_cli_path(backend: DelegateBackend, env: &dyn EnvSource) -> Optio
             if is_executable_file(&path) {
                 return Some(path);
             }
-            // 覆盖指错不静默回落：记 ERROR 后仍按 PATH 找（与参照物同取向）。
+            // **覆盖即唯一来源，绝不回落 PATH**（与参照物 `resolve_delegate_cli` 同取向：
+            // 「运维要的就是确定性」——配了就该用它，找不到就如实报错，而不是偷偷换一个）。
             tracing::error!(
-                "{} 指向的 {} 不可执行，回落 PATH 查找",
+                "{} 指向的 {} 不可执行（按覆盖语义不再回落 PATH）",
                 backend.bin_override_env(),
                 trimmed
             );
+            return None;
         }
     }
-    find_in_path(backend.cli())
+    find_in_path(backend.cli(), env)
 }
 
 /// 可用的后端清单（错误信息用：让模型知道能改用哪个）。
@@ -127,6 +129,22 @@ pub fn available_backends(env: &dyn EnvSource) -> Vec<&'static str> {
         .filter(|backend| delegate_cli_path(*backend, env).is_some())
         .map(|backend| backend.cli())
         .collect()
+}
+
+/// 有任意后端可用吗（用于**决定要不要暴露这个工具**，与参照物的 `cli_available` 腿同取向：
+/// 两个 CLI 都没装时，工具表里不该出现一个只会报错的工具）。
+pub fn any_backend_available(env: &dyn EnvSource) -> bool {
+    !available_backends(env).is_empty()
+}
+
+/// 错误信息里的可用后端描述（与参照物逐字同：`claude, codex` / `none (…)`）。
+pub fn available_backends_desc(env: &dyn EnvSource) -> String {
+    let available = available_backends(env);
+    if available.is_empty() {
+        "none (neither claude nor codex found in PATH)".to_string()
+    } else {
+        available.join(", ")
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -148,9 +166,12 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// PATH 里找可执行文件（Windows 上补 `.exe`）。
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+///
+/// PATH 从**注入的环境源**读（而不是直接读进程 env）：这样「找不到 CLI」的形状可以确定性
+/// 地测出来，生产侧 `ProcessEnv` 读到的仍是真 PATH。
+fn find_in_path(name: &str, env: &dyn EnvSource) -> Option<PathBuf> {
+    let path = env.get("PATH")?;
+    for dir in std::env::split_paths(std::ffi::OsStr::new(&path)) {
         let candidate = dir.join(name);
         if is_executable_file(&candidate) {
             return Some(candidate);
@@ -166,8 +187,13 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 输出上限（与工具结果预算同量级：报告是文本，不需要无限大）。
-const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+/// 每个流的**头/尾**各留多少字节（与参照物 `CappedStream` 同量级：16 KiB）。
+const STREAM_HEAD_BYTES: usize = 16 * 1024;
+const STREAM_TAIL_BYTES: usize = 16 * 1024;
+/// 抽干管道的宽限：超过就判定「有孙进程还攥着管道」，如实告知模型输出不完整
+/// （**参照物同款 5s drain**；早先这里无限等 ⇒ 一条攥着管道的孙进程能把整个回合挂死，
+/// 连 `session/cancel` 都拉不回来——评审实测）。
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn truncate_at_boundary(text: &str, max: usize) -> &str {
     if text.len() <= max {
@@ -178,6 +204,78 @@ fn truncate_at_boundary(text: &str, max: usize) -> &str {
         cut -= 1;
     }
     &text[..cut]
+}
+
+/// 有界捕获：头 16 KiB + 尾 16 KiB，中间省略并**显式标注**省略了多少字节。
+///
+/// 为什么不能简单 `read_to_end` 后截断：①内存无上界（评审 F7）；②一刀切会**整段丢掉 stderr**
+/// 且不留痕迹（评审 F2）。参照物对每个流都是「头+尾+省略标记」。
+#[derive(Default)]
+struct Capped {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: usize,
+}
+
+impl Capped {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len();
+        let head_room = STREAM_HEAD_BYTES.saturating_sub(self.head.len());
+        let take = head_room.min(chunk.len());
+        self.head.extend_from_slice(&chunk[..take]);
+        for byte in &chunk[take..] {
+            if self.tail.len() == STREAM_TAIL_BYTES {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(*byte);
+        }
+    }
+
+    /// 渲染成文本（超限时带省略标记；按字符边界切）。
+    fn render(&self) -> String {
+        let head = String::from_utf8_lossy(&self.head).into_owned();
+        let tail: String =
+            String::from_utf8_lossy(&self.tail.iter().copied().collect::<Vec<u8>>()).into_owned();
+        let kept = self.head.len() + self.tail.len();
+        if self.total <= kept {
+            return head;
+        }
+        let elided = self.total - kept;
+        format!(
+            "{}\n[... {} of {} bytes elided from delegate output ...]\n{}",
+            truncate_at_boundary(&head, STREAM_HEAD_BYTES),
+            elided,
+            self.total,
+            truncate_at_boundary(&tail, STREAM_TAIL_BYTES)
+        )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
+/// 读尽一个管道（**有界**），期间也认取消。
+async fn read_pipe(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+    signal: CancellationToken,
+) -> Option<Capped> {
+    use tokio::io::AsyncReadExt;
+    let mut pipe = pipe?;
+    let mut capped = Capped::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = tokio::select! {
+            biased;
+            _ = signal.cancelled() => return None,
+            result = pipe.read(&mut buf) => result,
+        };
+        match read {
+            Ok(0) => return Some(capped),
+            Ok(n) => capped.push(&buf[..n]),
+            Err(_) => return Some(capped),
+        }
+    }
 }
 
 /// 跑一次委派（`bin` 显式传入，便于单测用假 CLI）。
@@ -198,9 +296,15 @@ pub async fn run_with_bin(
         // 实测必需（fork #7）：关掉 claude headless 的非必要遥测/更新流量。
         cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
     }
-    // 孙进程控制台窗抑制（Windows）+ 独立进程组（unix）：取消时能整组收掉。
+    // 独立进程组（unix）：取消/超时能整组收掉；Windows 抑制控制台窗。
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW（与 MCP/shell 子进程同款；参照物 delegate 也显式调 configure_no_window）。
+        // 注：`tokio::process::Command` 在 Windows 上直接有 `creation_flags`（无需 import trait）。
+        cmd.creation_flags(0x0800_0000);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -212,8 +316,8 @@ pub async fn run_with_bin(
 
     let stdout = child.child.stdout.take();
     let stderr = child.child.stderr.take();
-    let out_task = tokio::spawn(read_pipe(stdout));
-    let err_task = tokio::spawn(read_pipe(stderr));
+    let out_task = tokio::spawn(read_pipe(stdout, signal.clone()));
+    let err_task = tokio::spawn(read_pipe(stderr, signal.clone()));
 
     let status = tokio::select! {
         biased;
@@ -224,29 +328,50 @@ pub async fn run_with_bin(
         result = child.child.wait() => result.map_err(|error| format!("delegate: 等待 `{}` 失败：{error}", backend.cli()))?,
         _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
             child.kill().await;
-            return Err(format!(
-                "delegate: `{}` 超时（{timeout_secs}s）",
-                backend.cli()
-            ));
+            return Err(format!("delegate: `{}` 超时（{timeout_secs}s）", backend.cli()));
         }
     };
 
-    let stdout = out_task.await.unwrap_or_default();
-    let stderr = err_task.await.unwrap_or_default();
+    // 抽干**有上界**：孙进程（脱离进程组的后台子进程）可能仍攥着管道，无限等会把回合挂死
+    // 且 cancel 也无效（评审 F1：cancel 后 20s 无 stopReason）。超时就如实标注输出不完整。
+    let mut lingering = false;
+    let stdout = match tokio::time::timeout(DRAIN_GRACE, out_task).await {
+        Ok(Ok(capped)) => capped.unwrap_or_default(),
+        _ => {
+            lingering = true;
+            Capped::default()
+        }
+    };
+    let stderr = match tokio::time::timeout(DRAIN_GRACE, err_task).await {
+        Ok(Ok(capped)) => capped.unwrap_or_default(),
+        _ => {
+            lingering = true;
+            Capped::default()
+        }
+    };
+
     let code = status
         .code()
         .map(|code| code.to_string())
         .unwrap_or_else(|| "killed".to_string());
     let mut text = format!("delegate({}) exit: {code}", backend.cli());
+    if lingering {
+        text.push_str("\n(output incomplete: a grandchild process still holds the pipe)");
+    }
     if !stdout.is_empty() {
         text.push_str("\noutput:\n");
-        text.push_str(&stdout);
+        text.push_str(&stdout.render());
     }
     if !stderr.is_empty() {
         text.push_str("\nstderr:\n");
-        text.push_str(&stderr);
+        text.push_str(&stderr.render());
     }
-    Ok(truncate_at_boundary(&text, MAX_OUTPUT_BYTES).to_string())
+    // F3：非零退出必须是**错误结果**（rpi 按 Ok/Err 推 `is_error`），否则委派失败会被当成
+    // 成功工具结果回灌给模型。文本仍然完整带回（模型能看到 exit 码与输出）。
+    if !status.success() {
+        return Err(text);
+    }
+    Ok(text)
 }
 
 /// 子进程守卫：Drop 时兜底 kill（取消/超时路径已显式 kill 过）。
@@ -260,8 +385,7 @@ impl ChildGuard {
         #[cfg(unix)]
         {
             if let Some(pid) = self.child.id() {
-                // 与 MCP/shell 同款：负 pid = 整个进程组。
-                let _ = nix_kill_group(pid as i32);
+                let _ = kill_group(pid as i32);
             }
         }
         let _ = self.child.kill().await;
@@ -269,12 +393,12 @@ impl ChildGuard {
 }
 
 #[cfg(unix)]
-fn nix_kill_group(pid: i32) -> std::io::Result<()> {
-    // 直接用 libc 的 kill，避免为一个调用引依赖。
+fn kill_group(pid: i32) -> std::io::Result<()> {
+    // 直接声明 libc 的 kill，避免为一个调用引依赖。
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-    // SIGKILL = 9
+    // SIGKILL = 9；负 pid = 整个进程组（子进程在 process_group(0) 里自成一组的组长）。
     let rc = unsafe { kill(-pid, 9) };
     if rc == 0 {
         Ok(())
@@ -288,18 +412,6 @@ impl Drop for ChildGuard {
         // 尽力而为：真需要确定性收尾的路径都显式 kill 过。
         let _ = self.child.start_kill();
     }
-}
-
-/// 读尽一个管道（有界），超限就截断并标注。
-async fn read_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> String {
-    use tokio::io::AsyncReadExt;
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf).await;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    truncate_at_boundary(&text, MAX_OUTPUT_BYTES).to_string()
 }
 
 /// `dev__delegate` 的 rpi 工具（schema 与参照物同形）。
@@ -381,9 +493,9 @@ impl AgentTool for DelegateTool {
         };
         let Some(bin) = delegate_cli_path(backend, &crate::provider::ProcessEnv) else {
             return Err(AgentError::Tool(format!(
-                "delegate: `{}` CLI not available; available: {:?}",
+                "delegate: `{}` CLI not available; available: {}",
                 backend.cli(),
-                available_backends(&crate::provider::ProcessEnv)
+                available_backends_desc(&crate::provider::ProcessEnv)
             )));
         };
         let timeout = parse_timeout(params.get("timeout_secs").and_then(Value::as_u64));
@@ -497,13 +609,51 @@ mod tests {
             "有覆盖时 claude 必须在可用清单里"
         );
 
-        // 覆盖指向不可执行路径 ⇒ 回落 PATH（未必找得到，但不得 panic）。
+        // 覆盖指向不可执行路径 ⇒ **不回落 PATH**（与参照物 `resolve_delegate_cli` 同取向：
+        // 「覆盖 = 唯一来源，运维要的就是确定性」）。这条曾被写成回落，评审 F4 证伪。
         let bad = fake_env(&[(
             "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
             "/definitely/not/here-claude",
         )]);
-        let resolved = delegate_cli_path(DelegateBackend::Claude, &bad);
-        assert!(resolved.is_none() || resolved.expect("可选").is_file());
+        assert_eq!(
+            delegate_cli_path(DelegateBackend::Claude, &bad),
+            None,
+            "覆盖即唯一来源，不得偷偷回落 PATH"
+        );
+        // 「都没有」的形状要能确定性造出来（PATH 空/不指向任何 CLI）。
+        let none = fake_env(&[
+            ("PATH", "/nonexistent-dir-for-probe"),
+            (
+                "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
+                "/definitely/not/here-claude",
+            ),
+            (
+                "BUZZ_AGENT_DELEGATE_CODEX_BIN",
+                "/definitely/not/here-codex",
+            ),
+        ]);
+        assert_eq!(
+            available_backends_desc(&none),
+            "none (neither claude nor codex found in PATH)"
+        );
+        assert!(!any_backend_available(&none), "两个都不可用时不暴露工具");
+
+        // PATH 里有假 CLI ⇒ 描述是逗号列表（参照物同款）。
+        let dir2 = std::env::temp_dir().join(format!("abb-delegate-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).expect("建目录");
+        let fake_codex = dir2.join("codex");
+        std::fs::write(&fake_codex, b"#!/bin/sh\n").expect("写假 CLI");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_codex).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, perms).expect("chmod");
+        }
+        let on_path = fake_env(&[("PATH", dir2.to_str().expect("path"))]);
+        assert_eq!(available_backends_desc(&on_path), "codex");
+        assert!(any_backend_available(&on_path));
+        std::fs::remove_dir_all(&dir2).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -539,6 +689,91 @@ mod tests {
         assert!(text.contains("delegate(claude) exit: 0"), "{text}");
         assert!(text.contains("DELEGATE-REPORT-MARKER"), "{text}");
         assert!(text.contains("stderr:"), "stderr 尾部也要带上：{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 非零退出必须是**错误结果**（rpi 按 Ok/Err 推 `is_error`；否则委派失败被当成功回灌）。
+    #[tokio::test]
+    async fn non_zero_exit_is_an_error_result() {
+        let dir = std::env::temp_dir().join(format!("abb-delegate-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let fake = dir.join("failing-cli");
+        std::fs::write(
+            &fake,
+            b"#!/bin/sh
+echo \"BOOM-REPORT\"\nexit 3\n",
+        )
+        .expect("写假 CLI");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).expect("chmod");
+        }
+        let error = run_with_bin(
+            &fake,
+            DelegateBackend::Claude,
+            "会失败的任务",
+            30,
+            &dir,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("非零退出要报错（fail 位不能丢）");
+        assert!(error.contains("exit: 3"), "{error}");
+        assert!(
+            error.contains("BOOM-REPORT"),
+            "报告正文要随错误一起带回：{error}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **抽干有上界**：孙进程攥着管道时，工具必须在宽限（5s）后返回并**如实标注输出不完整**，
+    /// 而不是把整个回合挂死（评审 F1 实测：cancel 后 20s 都没有 stopReason）。
+    #[tokio::test]
+    async fn grandchild_holding_the_pipe_does_not_hang_the_call() {
+        let dir = std::env::temp_dir().join(format!("abb-delegate-linger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let fake = dir.join("linger-cli");
+        // 后台 sleep 继承 stdout ⇒ 父进程退出后管道仍被攥着。
+        std::fs::write(
+            &fake,
+            b"#!/bin/sh
+sleep 30 &\necho \"parent done\"\nexit 0\n",
+        )
+        .expect("写假 CLI");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).expect("chmod");
+        }
+        let started = std::time::Instant::now();
+        let text = run_with_bin(
+            &fake,
+            DelegateBackend::Claude,
+            "留下孙进程",
+            30,
+            &dir,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("父进程成功退出");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "抽干必须有上界（实测 {:?}）",
+            started.elapsed()
+        );
+        assert!(
+            text.contains("output incomplete"),
+            "攥着管道时要如实标注输出不完整：{text}"
+        );
+        // 清掉可能残留的 sleep（探针纪律：别留挂死进程）。
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "sleep 30"])
+            .status();
         std::fs::remove_dir_all(&dir).ok();
     }
 
