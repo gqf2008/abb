@@ -61,13 +61,10 @@ fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> 
 /// **这是切换的第二个开关**：abb-agent 如实不声明 `_meta.abbSandbox`，而 abb 对带
 /// `session_sandbox` 的会话 fail-closed ⇒ owner 配了受限档时必须留在旧执行层，否则
 /// 那些会话会被拒建（不是 abb-agent 的缺陷，是「不碰权限」决策的必然结果）。
-fn pick_normal_command<'a>(
-    owner_cmd: &'a str,
-    granted_cmd: &'a str,
-    owner_needs_sandbox: bool,
-) -> &'a str {
-    if owner_needs_sandbox {
-        granted_cmd
+fn pick_command_by_sandbox<'a>(role_cmds: (&'a str, &'a str), needs_sandbox: bool) -> &'a str {
+    let (owner_cmd, old_layer_cmd) = role_cmds;
+    if needs_sandbox {
+        old_layer_cmd
     } else {
         owner_cmd
     }
@@ -255,12 +252,14 @@ fn build_bot_acp_handles(
     // `session_sandbox` 的会话是 fail-closed（`pool.rs` 拒建「发不出档位」的会话）。所以
     // owner 会话若配了 read-only / workspace-write 档，也必须留在 buzz-agent——否则那些
     // 会话会直接起不来（这不是 abb-agent 的缺陷，是「不碰权限」这条产品决策的必然结果）。
-    let normal_command = pick_normal_command(command, granted_command, normal_meta.is_some());
+    let normal_command = pick_command_by_sandbox((command, granted_command), normal_meta.is_some());
     if normal_meta.is_some() {
-        // 日志可见：让「为什么这个 bot 还走旧执行层」一眼可查。
+        // 日志可见：让「为什么这个 bot 的 normal 会话没走新层」一眼可查。注意**不能**写成
+        // 「留在旧执行层」——当覆盖把两条都指向同一个可执行文件时，这句会是假话（评审实测）。
         crate::log!(
-            "[acp] bot={} 的 owner 档位需要受限沙箱 ⇒ normal 会话留在旧执行层（abb-agent 不声明档位）",
-            bot.key()
+            "[acp] bot={} 的 owner 档位需要受限沙箱 ⇒ normal 会话用「旧执行层候选槽」{}（abb-agent 不声明档位）",
+            bot.key(),
+            normal_command
         );
     }
 
@@ -312,8 +311,26 @@ pub(crate) fn oneshot_agent_config(
 ) -> crate::buzz::harness::AgentConfig {
     // 命令解析与 build_bot_acp_handles 同链（覆盖指错告警一回/调用——gc 是
     // 日频任务，GUI 是低频点击，重复解析可接受）。
-    // oneshot 是 owner 角色（见函数文档），走 normal 那条命令。
-    let (command, _) = resolve_acp_commands(&cfg.buzz_agent_exe);
+    let role_cmds = resolve_acp_commands(&cfg.buzz_agent_exe);
+    let sandbox = resolve_sandbox_meta(bot);
+    oneshot_agent_config_inner(bot, cfg, role_cmds, sandbox)
+}
+
+/// [`oneshot_agent_config`] 的可注入内层（role_cmds / 档位由调用方给，便于把
+/// 「档位 ⇒ 命令槽」这条不变量钉成单测）。
+fn oneshot_agent_config_inner(
+    bot: &crate::config::BotConfig,
+    cfg: &Config,
+    role_cmds: (String, String),
+    sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+) -> crate::buzz::harness::AgentConfig {
+    // **与聊天句柄同一条判据**：需要档位的会话（owner 的 read-only/workspace-write、granted）
+    // 必须落在旧执行层，否则 abb 的 P2.3 硬闸会拒建（评审实测：这条路径原来没做分流）。
+    let command = pick_command_by_sandbox(
+        (role_cmds.0.as_str(), role_cmds.1.as_str()),
+        sandbox.is_some(),
+    )
+    .to_string();
     let env = buzz_env_for_bot(bot, cfg);
     crate::buzz::harness::AgentConfig {
         command,
@@ -323,7 +340,7 @@ pub(crate) fn oneshot_agent_config(
             .chain(env)
             .collect(),
         backend: "buzz".to_string(),
-        session_sandbox: resolve_sandbox_meta(bot),
+        session_sandbox: sandbox,
     }
 }
 
@@ -349,11 +366,30 @@ pub(crate) fn oneshot_agent_config_for_role(
     cfg: &Config,
     restricted: bool,
 ) -> crate::buzz::harness::AgentConfig {
-    let mut c = oneshot_agent_config(bot, cfg);
+    oneshot_agent_config_for_role_inner(
+        bot,
+        cfg,
+        resolve_acp_commands(&cfg.buzz_agent_exe),
+        restricted,
+    )
+}
+
+/// [`oneshot_agent_config_for_role`] 的可注入内层（单测用）。
+fn oneshot_agent_config_for_role_inner(
+    bot: &crate::config::BotConfig,
+    cfg: &Config,
+    role_cmds: (String, String),
+    restricted: bool,
+) -> crate::buzz::harness::AgentConfig {
+    let sandbox = if restricted {
+        Some(granted_sandbox_profile(bot))
+    } else {
+        resolve_sandbox_meta(bot)
+    };
+    let mut c = oneshot_agent_config_inner(bot, cfg, role_cmds, sandbox);
     if !restricted {
         return c;
     }
-    c.session_sandbox = Some(granted_sandbox_profile(bot));
     // 进程级收口：fork 的 hints 扫盘发生在 session/new **之前**，per-session `_meta`
     // 管不到（与 build_bot_acp_handles 的 granted 实例同一条理由）。先摘再补，防重复。
     c.extra_env.retain(|(k, _)| k != "BUZZ_AGENT_NO_HINTS");
@@ -423,8 +459,10 @@ pub async fn run() {
     // 结构消灭旧共享句柄集「env_for 取第一个 enabled bot 供应商」的多 bot 串台）。
     // 装配零等待（不 spawn 进程、不碰盘）——handle 同步可得，无启动竞态；agent
     // 懒启动 + 崩溃退避重拉（harness 内闭环），启动失败只影响本 bot 的 ACP 频道。
-    // 命令解析每进程一次（buzz_agent_exe 指错只告警一回）；None = 开发/自签构建
-    // 无随包 → run_bot 内落 PATH pi-acp 全路径兜底（Windows .cmd shim 见 #246④）。
+    // 命令按**角色**解析（两条：owner 优先 abb-agent / 旧执行层候选），每进程一次
+    // （`buzz_agent_exe` 指错只告警一回）；两条都可能回落 PATH `pi-acp`（开发/自签构建
+    // 无随包；Windows .cmd shim 见 #246④）。**带受限档的会话一律用旧层候选**（见
+    // `pick_command_by_sandbox`）。
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -1930,17 +1968,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// owner 需要受限档时，normal 会话必须留在旧执行层（abb-agent 不声明档位 ⇒ 会被拒建）。
+    /// **不变量**：只要会话需要受限档（granted，或 owner 的 read-only/workspace-write），
+    /// 就必须落在旧执行层——abb-agent 如实不声明 `_meta.abbSandbox`，abb 对带
+    /// `session_sandbox` 的会话是 fail-closed（`pool.rs` 拒建）。
+    ///
+    /// 三条建会话路径（聊天句柄 / oneshot / task 角色剖面）都经这个纯函数，所以钉它 + 各自
+    /// 的接线测试就覆盖了「档位 ⇒ 命令槽」这条不变量。
     #[test]
-    fn normal_sessions_stay_on_the_old_layer_when_a_sandbox_mode_is_required() {
+    fn sessions_needing_a_sandbox_always_use_the_old_layer() {
+        let cmds = ("/bin/abb-agent", "/bin/buzz-agent");
+        assert_eq!(pick_command_by_sandbox(cmds, false), "/bin/abb-agent");
         assert_eq!(
-            pick_normal_command("/bin/abb-agent", "/bin/buzz-agent", false),
-            "/bin/abb-agent"
-        );
-        assert_eq!(
-            pick_normal_command("/bin/abb-agent", "/bin/buzz-agent", true),
+            pick_command_by_sandbox(cmds, true),
             "/bin/buzz-agent",
-            "带受限档的 owner 会话必须留在旧执行层，否则 abb 的 P2.3 硬闸会拒建"
+            "需要受限档的会话必须留在旧执行层，否则会被 abb 的 P2.3 硬闸拒建"
+        );
+    }
+
+    /// oneshot / task 角色路径也必须遵守「需要档位 ⇒ 旧执行层」（评审实测的阻塞项：
+    /// 这两条路径原来直接用 owner 命令，会把带档位的会话送去 abb-agent 被拒建）。
+    #[test]
+    fn oneshot_paths_follow_the_sandbox_invariant() {
+        use crate::config::BotConfig;
+        let bot = BotConfig {
+            name: "invariant".into(),
+            sandbox_mode: crate::config::SandboxMode::ReadOnly,
+            ..BotConfig::default()
+        };
+        let cfg = Config::default();
+        let cmds = ("/bin/abb-agent".to_string(), "/bin/buzz-agent".to_string());
+
+        // owner 配了 read-only ⇒ 档位存在 ⇒ 必须用旧执行层。
+        let c = oneshot_agent_config_inner(&bot, &cfg, cmds.clone(), resolve_sandbox_meta(&bot));
+        assert!(c.session_sandbox.is_some(), "read-only 档必须带档位");
+        assert_eq!(
+            c.command, "/bin/buzz-agent",
+            "带档位的 oneshot 必须用旧执行层"
+        );
+
+        // owner 无档位 ⇒ 用新执行层。
+        let full = BotConfig {
+            sandbox_mode: crate::config::SandboxMode::FullAccess,
+            ..bot.clone()
+        };
+        let c = oneshot_agent_config_inner(&full, &cfg, cmds.clone(), resolve_sandbox_meta(&full));
+        assert!(c.session_sandbox.is_none());
+        assert_eq!(c.command, "/bin/abb-agent", "无档位时 oneshot 用新执行层");
+
+        // granted（restricted=true）⇒ 强制档位 ⇒ 必须用旧执行层。
+        let c = oneshot_agent_config_for_role_inner(&bot, &cfg, cmds, true);
+        assert!(c.session_sandbox.is_some());
+        assert_eq!(
+            c.command, "/bin/buzz-agent",
+            "granted 任务的档位必须落在旧执行层"
         );
     }
 

@@ -61,7 +61,7 @@
 
 - 独立 manifest、独立 `Cargo.lock`：`cargo +1.98.0 build --release --manifest-path crates/buzz-agent/Cargo.toml`（产物在 `crates/buzz-agent/target/`，不污染仓库根 target）。
 - 测试：`cargo +1.98.0 test --manifest-path crates/buzz-agent/Cargo.toml`（642+ 全绿含 corpus drift gate）。
-- 分发：release.yml（macOS/Windows）+ ABB.iss 构建 fork 随包；运行时执行层解析（`service.rs::resolve_buzz_agent`）：`buzz_agent_exe` 覆盖（绝对路径或 PATH 名，指错告警并回落）→ 主程序同目录 `buzz-agent`/`buzz-agent.exe`（ABB.app/Contents/MacOS/）→ PATH `pi-acp` 兜底（开发/自签构建无随包时）。
+- 分发：release.yml（macOS/Windows）+ ABB.iss 构建 fork 随包；运行时执行层解析（`service.rs::resolve_acp_commands` + `pick_command_by_sandbox`，2026-10-08 切换后）：`buzz_agent_exe` 覆盖（绝对路径或 PATH 名，指错告警并回落；**兼作回滚开关**）→ 主程序同目录——owner 且**无受限档**的会话优先 `abb-agent`（新执行层），**带受限档的会话与授权者会话一律 `buzz-agent`**（abb-agent 如实不声明 `_meta.abbSandbox`，切过去会被 abb 的 P2.3 硬闸拒建）→ PATH `pi-acp` 兜底（开发/自签构建无随包时）。两条命令都随包：`ABB.app/Contents/MacOS/{abb-agent,buzz-agent}` 与 Windows 安装目录同名。
 
 ## 已知 flaky（fork 测试）
 
