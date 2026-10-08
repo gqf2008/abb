@@ -2,21 +2,35 @@
 //!
 //! ## env 契约以 abb 侧真值为准
 //!
-//! 来源：`src/agent.rs::buzz_provider_env`（唯一注入点，经 `service.rs` 组装进
-//! 子进程 env）。**第一版把词表写错了**（照抄了配置 kind 的名字），评审据此指出
-//! 「照此匹配永不命中」——这里按 abb 实际发送的值重写：
+//! 来源：`src/agent.rs::buzz_provider_env`（唯一注入点，经 `service.rs` 组装进子进程 env）。
 //!
 //! | 供应商 | `BUZZ_AGENT_PROVIDER` | 其余 |
 //! | --- | --- | --- |
-//! | anthropic | `"anthropic"` | `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`(可选)、`ANTHROPIC_MODEL`(可选) |
+//! | anthropic | `"anthropic"` | `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` |
 //! | openai 家族 | `"openai"` | `OPENAI_COMPAT_API_KEY`、`OPENAI_COMPAT_BASE_URL`、`OPENAI_COMPAT_MODEL`、`OPENAI_COMPAT_API`(`chat`/`responses`) |
 //!
-//! 注意 `openai-chat` / `openai-responses` / `openrouter` / `deepseek` 是**配置里的
-//! kind**，不是 env 里 `BUZZ_AGENT_PROVIDER` 的取值——它们都会被 abb 归并成
-//! `"openai"`（API 形态另走 `OPENAI_COMPAT_API`）。
+//! `openai-chat` / `openai-responses` / `openrouter` / `deepseek` 是**配置里的 kind**，
+//! 不是 env 里 `BUZZ_AGENT_PROVIDER` 的取值——它们都会被 abb 归并成 `"openai"`
+//! （API 形态另走 `OPENAI_COMPAT_API`）。
 //!
-//! `ANTHROPIC_API_KEY` 我们自己不读：abb 已经把它注入子进程 env，而 rpi 的
-//! anthropic provider 默认允许回落到该 env（`allow_env_api_key: true`）。
+//! ## 模型是「显式构造」的，不查任何内置目录
+//!
+//! 这是 rpi 的官方做法：`rpi-cli/src/config.rs::provider_to_models` 对 models.json
+//! 条目就是 `Model::new(id, name, api, provider, base_url)`——**模型 id 由调用方给，
+//! rpi 不限制命名空间**（`rpi --help` 的 `--model` 也写着支持 `models.json id`）。
+//!
+//! 本包第一版却去查 `AnthropicProvider` 内置的 7 项模型表，于是自定义网关（one-api 等）
+//! 用厂商原生 id 就会失败、缺失时还会静默落到表首（Opus 档）。**那是我实现里的偷懒，
+//! 不是 rpi 的能力边界**——现已改为显式构造。
+//!
+//! 另有一个必须绕开的库内行为：`clamp_max_tokens_to_context` 在
+//! `model.context_window == 0` 时返回 `max(MIN_MAX_TOKENS=1, max_tokens)`，
+//! 于是 `max_tokens = 0` 会变成「只准回 1 个 token」。abb 的契约里没有这个字段，
+//! 故 [`custom_model`] 给一个保守默认（见 [`DEFAULT_MAX_OUTPUT_TOKENS`]）。
+//!
+//! `ANTHROPIC_API_KEY` / `OPENAI_COMPAT_API_KEY` 都是**显式取用**的（不依赖 rpi 的
+//! env 兜底）：`with_models_without_env_api_key` 关掉了兜底，避免把机器上无关的
+//! `OPENAI_API_KEY` 之类的凭据发给自定义网关。
 //!
 //! 另有**离线**通道 `ABB_AGENT_FAUX_TEXT=<文本>`：命中即用 rpi 的 faux provider
 //! （不联网、无凭据、逐字可复现），供 smoke 与集成测试用。它是本包自己的调试开关，
@@ -27,13 +41,25 @@ use std::sync::Arc;
 use rpi_agent::StreamFn;
 use rpi_ai::providers::anthropic::AnthropicProvider;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
-use rpi_ai::{Model, Provider};
+use rpi_ai::providers::openai_completions::OpenAiCompletionsProvider;
+use rpi_ai::providers::openai_responses::OpenAiResponsesProvider;
+use rpi_ai::{Api, Model, Provider};
 
 /// abb 回合作数的环境变量名（abb 恒送，默认 200）。
 pub const MAX_ROUNDS_ENV: &str = "BUZZ_AGENT_MAX_ROUNDS";
 
 /// abb 未指定时我们采用的回合上界，与其 `BUZZ_AGENT_MAX_ROUNDS` 默认值一致。
 pub const DEFAULT_MAX_ROUNDS: u64 = 200;
+
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+
+/// 未指定时的单回合输出上限。
+///
+/// 为什么必须有值：`clamp_max_tokens_to_context` 在 `context_window == 0`（我们不知道
+/// 上下文窗口）时返回 `max(1, max_tokens)`，所以 `0` 会让模型只回 1 个 token。
+/// 8_192 是保守值（与 rpi-ai 自身单测里用的量级一致）。
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8_192;
 
 /// 环境读取缝。
 ///
@@ -53,7 +79,7 @@ impl EnvSource for ProcessEnv {
     }
 }
 
-/// 选中的执行后端（provider + 已解析好的 model）。
+/// 选中的执行后端（provider + 已构造好的 model）。
 ///
 /// 刻意用**具体类型**而不是 `Arc<dyn Provider>`：`Provider::stream_simple` 是
 /// `async fn`（AFIT），直接做 trait 对象不稳；这里用泛型助手构造 `StreamFn`，
@@ -67,12 +93,20 @@ pub enum Backend {
         provider: Arc<AnthropicProvider>,
         model: Model,
     },
+    OpenAiCompletions {
+        provider: Arc<OpenAiCompletionsProvider>,
+        model: Model,
+    },
+    OpenAiResponses {
+        provider: Arc<OpenAiResponsesProvider>,
+        model: Model,
+    },
 }
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 手写而非 derive：provider 内部（reqwest client 等）没有 Debug，
-        // 而我们真正想看到的就是「选了哪个后端、哪个模型」。
+        // 而我们真正想看到的就是「选了哪个后端、哪个模型、打到哪」。
         f.debug_struct("Backend")
             .field("id", &self.id())
             .field("model", &self.model().id)
@@ -86,12 +120,16 @@ impl Backend {
         match self {
             Backend::Faux { .. } => "faux",
             Backend::Anthropic { .. } => "anthropic",
+            Backend::OpenAiCompletions { .. } | Backend::OpenAiResponses { .. } => "openai",
         }
     }
 
     pub fn model(&self) -> &Model {
         match self {
-            Backend::Faux { model, .. } | Backend::Anthropic { model, .. } => model,
+            Backend::Faux { model, .. }
+            | Backend::Anthropic { model, .. }
+            | Backend::OpenAiCompletions { model, .. }
+            | Backend::OpenAiResponses { model, .. } => model,
         }
     }
 
@@ -100,6 +138,8 @@ impl Backend {
         match self {
             Backend::Faux { provider, .. } => make_stream_fn(Arc::clone(provider)),
             Backend::Anthropic { provider, .. } => make_stream_fn(Arc::clone(provider)),
+            Backend::OpenAiCompletions { provider, .. } => make_stream_fn(Arc::clone(provider)),
+            Backend::OpenAiResponses { provider, .. } => make_stream_fn(Arc::clone(provider)),
         }
     }
 }
@@ -123,22 +163,11 @@ pub fn select_with(env: &dyn EnvSource) -> Result<Backend, String> {
     }
 
     match env.get("BUZZ_AGENT_PROVIDER").unwrap_or_default().trim() {
-        "anthropic" => {
-            // 不读 API key：abb 已经把 ANTHROPIC_API_KEY 注入子进程 env，rpi 的
-            // anthropic provider 默认允许回落到它。
-            let provider = Arc::new(AnthropicProvider::from_env());
-            let model = anthropic_model(&provider, env)?;
-            Ok(Backend::Anthropic { provider, model })
-        }
-        // abb 真值里 openai 家族一律归并成 "openai"；本刀未接。
-        "openai" => Err("供应商 openai 尚未接入（第二刀：接 rpi-ai 的 openai 适配器并翻译 \
-             OPENAI_COMPAT_API_KEY / OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_MODEL / OPENAI_COMPAT_API）"
-            .to_string()),
-        "" => Err(
-            "未设置 BUZZ_AGENT_PROVIDER（abb 会送 anthropic 或 openai；\
+        "anthropic" => anthropic_backend(env),
+        "openai" => openai_backend(env),
+        "" => Err("未设置 BUZZ_AGENT_PROVIDER（abb 会送 anthropic 或 openai；\
              离线 smoke 可用 ABB_AGENT_FAUX_TEXT）"
-                .to_string(),
-        ),
+            .to_string()),
         other => Err(format!(
             "未知的 BUZZ_AGENT_PROVIDER「{other}」（abb 只送 anthropic 或 openai；\
              openai-chat/openrouter/deepseek 等是配置 kind，env 里会被归并成 openai）"
@@ -146,39 +175,92 @@ pub fn select_with(env: &dyn EnvSource) -> Result<Backend, String> {
     }
 }
 
-/// 解析 anthropic 的模型与端点。
-///
-/// `ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL` 是 abb 的既有契约，**必须认**：
-/// 不认就会把用户选的（可能是便宜的）模型静默换成模型表第一个，自定义网关
-/// 也会被忽略。第一版正是如此，评审实测反证。
-fn anthropic_model(provider: &AnthropicProvider, env: &dyn EnvSource) -> Result<Model, String> {
-    let wanted = env.get("ANTHROPIC_MODEL").unwrap_or_default();
-    let wanted = wanted.trim();
-    let mut model = if wanted.is_empty() {
-        provider
-            .models()
-            .first()
-            .cloned()
-            .ok_or_else(|| "anthropic provider 没有可用模型".to_string())?
+fn anthropic_backend(env: &dyn EnvSource) -> Result<Backend, String> {
+    let api_key = required(env, "ANTHROPIC_API_KEY")?;
+    let base_url = optional(env, "ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string());
+    let model_id = required(env, "ANTHROPIC_MODEL")?;
+    let http = rpi_ai::http::build_client(&base_url, None, None)
+        .map_err(|error| format!("构建 HTTP 客户端失败：{error}"))?;
+    let model = custom_model(&model_id, Api::AnthropicMessages, "anthropic", &base_url);
+    let provider = AnthropicProvider::with_models_without_env_api_key(
+        Some(api_key),
+        http,
+        vec![model.clone()],
+    );
+    Ok(Backend::Anthropic {
+        provider: Arc::new(provider),
+        model,
+    })
+}
+
+fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
+    let api_key = required(env, "OPENAI_COMPAT_API_KEY")?;
+    let base_url = optional(env, "OPENAI_COMPAT_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
+    let model_id = required(env, "OPENAI_COMPAT_MODEL")?;
+    let http = rpi_ai::http::build_client(&base_url, None, None)
+        .map_err(|error| format!("构建 HTTP 客户端失败：{error}"))?;
+    // abb 只把 `openai-responses` 标成 responses，其余（含 openrouter/deepseek 两个
+    // 预置端点）都是 chat。
+    let responses = optional(env, "OPENAI_COMPAT_API").as_deref() == Some("responses");
+    let api = if responses {
+        Api::OpenaiResponses
     } else {
-        provider
-            .models()
-            .iter()
-            .find(|m| m.id == wanted || m.name == wanted)
-            .cloned()
-            .ok_or_else(|| {
-                format!("ANTHROPIC_MODEL={wanted} 不在 rpi-ai 的 anthropic 模型表里（不静默改选）")
-            })?
+        Api::OpenaiCompletions
     };
-    if let Some(base_url) = env.get("ANTHROPIC_BASE_URL") {
-        let base_url = base_url.trim();
-        if !base_url.is_empty() {
-            // rpi 的 anthropic provider 按 `model.base_url` 发请求，所以覆盖这里
-            // 就等于支持自定义网关。
-            model.base_url = base_url.to_string();
-        }
+    let model = custom_model(&model_id, api, "openai", &base_url);
+    if responses {
+        let provider = OpenAiResponsesProvider::with_models_without_env_api_key(
+            "openai",
+            Some(api_key),
+            http,
+            vec![model.clone()],
+        );
+        Ok(Backend::OpenAiResponses {
+            provider: Arc::new(provider),
+            model,
+        })
+    } else {
+        let provider = OpenAiCompletionsProvider::with_models_without_env_api_key(
+            "openai",
+            Some(api_key),
+            http,
+            vec![model.clone()],
+        );
+        Ok(Backend::OpenAiCompletions {
+            provider: Arc::new(provider),
+            model,
+        })
     }
-    Ok(model)
+}
+
+/// **显式构造**模型：id / 端点全由调用方给定，不查内置目录。
+fn custom_model(id: &str, api: Api, provider_id: &str, base_url: &str) -> Model {
+    let mut model = Model::new(id, id, api, provider_id, base_url);
+    model.max_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
+    model
+}
+
+/// 取必填 env；缺失或全空白即报错。
+///
+/// 「缺失就报错」不是苛刻，是与被替代的 fork 对齐：`crates/buzz-agent/src/config.rs`
+/// 在 `ANTHROPIC_MODEL` 缺失时直接 `"config: ANTHROPIC_MODEL required"`（agent 起不来，
+/// abb 如实看到 AgentDown）。静默替用户挑一个模型，等于替用户花他的钱。
+fn required(env: &dyn EnvSource, key: &str) -> Result<String, String> {
+    match env.get(key) {
+        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        _ => Err(format!(
+            "缺少 {key}（abb 在未配置该项时不会注入；被替代的 buzz-agent 同样在此硬失败）"
+        )),
+    }
+}
+
+/// 取可选 env；缺失或全空白视作未设置。
+fn optional(env: &dyn EnvSource, key: &str) -> Option<String> {
+    env.get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// abb 注入的回合上界；缺失或不可解析时用 [`DEFAULT_MAX_ROUNDS`]。
@@ -230,9 +312,23 @@ mod tests {
             )
         }
 
-        /// 只要 anthropic 那一组键（避免每个用例都抄一遍）。
         fn anthropic(extra: &[(&str, &str)]) -> Self {
-            let mut base = vec![("BUZZ_AGENT_PROVIDER", "anthropic")];
+            let mut base = vec![
+                ("BUZZ_AGENT_PROVIDER", "anthropic"),
+                ("ANTHROPIC_API_KEY", "sk-ant-probe"),
+                ("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+            ];
+            base.extend_from_slice(extra);
+            Self::new(&base)
+        }
+
+        fn openai(extra: &[(&str, &str)]) -> Self {
+            let mut base = vec![
+                ("BUZZ_AGENT_PROVIDER", "openai"),
+                ("OPENAI_COMPAT_API_KEY", "sk-compat-probe"),
+                ("OPENAI_COMPAT_MODEL", "deepseek-chat"),
+                ("OPENAI_COMPAT_BASE_URL", "https://gateway.example.com"),
+            ];
             base.extend_from_slice(extra);
             Self::new(&base)
         }
@@ -249,7 +345,6 @@ mod tests {
         let env = FakeEnv::new(&[("ABB_AGENT_FAUX_TEXT", "hello")]);
         let backend = select_with(&env).expect("faux 应可选");
         assert_eq!(backend.id(), "faux");
-        assert_eq!(backend.model().id, backend.model().id); // 有模型即可
     }
 
     #[test]
@@ -266,31 +361,48 @@ mod tests {
     fn anthropic_value_is_accepted() {
         let backend = select_with(&FakeEnv::anthropic(&[])).expect("anthropic 应可选");
         assert_eq!(backend.id(), "anthropic");
+        assert_eq!(backend.model().id, "claude-sonnet-4-5");
     }
 
-    /// `ANTHROPIC_MODEL` 必须真的改选模型——不认就会静默换成模型表第一个。
+    /// **任意厂商模型 id 都要能用**：自定义网关（one-api 等）常用厂商原生 id，
+    /// rpi 不限制命名空间。第一版去查内置目录，会把这条判成错误——那是实现偷懒。
     #[test]
-    fn anthropic_model_env_actually_selects() {
-        let all = AnthropicProvider::from_env();
-        let wanted = all.models()[1].id.clone(); // 表里第二个（非默认项）
-        let backend =
-            select_with(&FakeEnv::anthropic(&[("ANTHROPIC_MODEL", wanted.as_str())])).unwrap();
-        assert_eq!(backend.model().id, wanted, "ANTHROPIC_MODEL 未被采纳");
+    fn arbitrary_model_id_on_custom_gateway_is_accepted() {
+        let backend = select_with(&FakeEnv::anthropic(&[
+            ("ANTHROPIC_MODEL", "my-vendor-internal-model-v3"),
+            ("ANTHROPIC_BASE_URL", "https://one-api.internal.example/v1"),
+            ("ANTHROPIC_API_KEY", "sk-gateway"),
+        ]))
+        .expect("自定义网关 + 任意 id 必须可用");
+        assert_eq!(backend.model().id, "my-vendor-internal-model-v3");
+        assert_eq!(
+            backend.model().base_url,
+            "https://one-api.internal.example/v1"
+        );
     }
 
-    /// 未知模型 id 要**报错**，不能静默回退到第一个（第一版就是这样把用户的
-    /// 便宜模型换成 Opus 档的）。
+    /// 未给模型**必须报错**：被替代的 fork 在这条路径硬失败（AgentDown，可见），
+    /// 静默挑一个（库表首是 Opus 档）等于替用户花钱。
     #[test]
-    fn unknown_anthropic_model_is_an_error_not_a_silent_fallback() {
-        let err = select_with(&FakeEnv::anthropic(&[(
-            "ANTHROPIC_MODEL",
-            "totally-bogus-model",
-        )]))
-        .expect_err("未知模型应报错");
-        assert!(err.contains("totally-bogus-model"), "{err}");
+    fn missing_anthropic_model_is_an_error_not_a_silent_default() {
+        let env = FakeEnv::new(&[
+            ("BUZZ_AGENT_PROVIDER", "anthropic"),
+            ("ANTHROPIC_API_KEY", "sk-ant-probe"),
+        ]);
+        let err = select_with(&env).expect_err("缺模型应报错");
+        assert!(err.contains("ANTHROPIC_MODEL"), "{err}");
     }
 
-    /// `ANTHROPIC_BASE_URL` 必须真的改端点（自定义网关）。
+    #[test]
+    fn missing_anthropic_key_is_an_error() {
+        let env = FakeEnv::new(&[
+            ("BUZZ_AGENT_PROVIDER", "anthropic"),
+            ("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+        ]);
+        let err = select_with(&env).expect_err("缺 key 应报错");
+        assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+    }
+
     #[test]
     fn anthropic_base_url_env_overrides_endpoint() {
         let backend = select_with(&FakeEnv::anthropic(&[(
@@ -301,17 +413,74 @@ mod tests {
         assert_eq!(backend.model().base_url, "https://gateway.example.com");
     }
 
-    /// `BUZZ_AGENT_PROVIDER=openai` 是 abb 真值；本刀未接，必须如实报「未接入」
-    /// 且点明是 openai（而不是把 `openai-chat` 之类的配置 kind 当成取值）。
+    /// 未给 base_url 时用官方端点。
     #[test]
-    fn openai_is_reported_as_not_yet_wired() {
-        let err = select_with(&FakeEnv::new(&[("BUZZ_AGENT_PROVIDER", "openai")]))
-            .expect_err("openai 本刀未接，应报错");
-        assert!(err.contains("openai"), "{err}");
-        assert!(
-            err.contains("OPENAI_COMPAT_"),
-            "应指出待翻译的 env 契约：{err}"
-        );
+    fn anthropic_defaults_to_official_endpoint() {
+        let backend = select_with(&FakeEnv::anthropic(&[])).unwrap();
+        assert_eq!(backend.model().base_url, DEFAULT_ANTHROPIC_BASE_URL);
+    }
+
+    /// **openai 家族必须可用**：abb 把 `openai-chat`/`openai-responses`/`openrouter`/
+    /// `deepseek` 全归并成 `BUZZ_AGENT_PROVIDER=openai`（本机 config 就是
+    /// `openai-chat` + `deepseek-flash`）。
+    #[test]
+    fn openai_chat_family_is_wired() {
+        let backend = select_with(&FakeEnv::openai(&[])).expect("openai 家族应可用");
+        assert_eq!(backend.id(), "openai");
+        assert_eq!(backend.model().id, "deepseek-chat");
+        assert_eq!(backend.model().base_url, "https://gateway.example.com");
+        assert_eq!(backend.model().api, Api::OpenaiCompletions);
+    }
+
+    #[test]
+    fn openai_responses_style_is_wired() {
+        let backend = select_with(&FakeEnv::openai(&[("OPENAI_COMPAT_API", "responses")])).unwrap();
+        assert_eq!(backend.model().api, Api::OpenaiResponses);
+        assert!(matches!(backend, Backend::OpenAiResponses { .. }));
+    }
+
+    /// `OPENAI_COMPAT_API` 缺省是 chat（abb 只有 `openai-responses` 才标 responses）。
+    #[test]
+    fn openai_missing_api_style_defaults_to_chat() {
+        let backend = select_with(&FakeEnv::openai(&[("OPENAI_COMPAT_API", "chat")])).unwrap();
+        assert_eq!(backend.model().api, Api::OpenaiCompletions);
+    }
+
+    #[test]
+    fn missing_openai_model_is_an_error() {
+        let env = FakeEnv::new(&[
+            ("BUZZ_AGENT_PROVIDER", "openai"),
+            ("OPENAI_COMPAT_API_KEY", "sk-compat-probe"),
+        ]);
+        let err = select_with(&env).expect_err("缺模型应报错");
+        assert!(err.contains("OPENAI_COMPAT_MODEL"), "{err}");
+    }
+
+    #[test]
+    fn missing_openai_key_is_an_error() {
+        let env = FakeEnv::new(&[
+            ("BUZZ_AGENT_PROVIDER", "openai"),
+            ("OPENAI_COMPAT_MODEL", "deepseek-chat"),
+        ]);
+        let err = select_with(&env).expect_err("缺 key 应报错");
+        assert!(err.contains("OPENAI_COMPAT_API_KEY"), "{err}");
+    }
+
+    /// **回归锁**：`max_tokens` 不能是 0。
+    ///
+    /// `clamp_max_tokens_to_context` 在 `context_window == 0` 时返回
+    /// `max(1, max_tokens)`，所以 0 会静默变成「只回 1 个 token」——回复被截成
+    /// 一个字，而日志里看不出任何异常。
+    #[test]
+    fn constructed_model_has_a_positive_output_cap() {
+        for env in [FakeEnv::anthropic(&[]), FakeEnv::openai(&[])] {
+            let backend = select_with(&env).unwrap();
+            assert!(
+                backend.model().max_tokens > 0,
+                "max_tokens=0 会被夹成 1（只回 1 个 token）"
+            );
+            assert_eq!(backend.model().max_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+        }
     }
 
     /// 配置 kind（`deepseek` 等）从来不是 `BUZZ_AGENT_PROVIDER` 的取值；

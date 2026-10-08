@@ -48,6 +48,9 @@ env.update({
     "BUZZ_AGENT_PROVIDER": "anthropic",
     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{BLACKHOLE_PORT}",
     "ANTHROPIC_API_KEY": "dummy-key-for-blackhole",
+    # 必填：abb 未配置模型时不注入 ANTHROPIC_MODEL，而 abb-agent 按被替代 fork 的语义
+    # **硬失败**（不静默挑一个）——所以探针必须显式给。
+    "ANTHROPIC_MODEL": "claude-sonnet-4-5",
     "RUST_LOG": "info",
 })
 

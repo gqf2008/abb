@@ -99,16 +99,28 @@ impl Server {
                 "session/new" => self.session_new(id).await,
                 // 只有回合走独立任务：它是唯一的长任务，也是 `session/cancel`
                 // 必须能在其运行期间被处理的原因。
-                "session/prompt" => {
-                    let server = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(error) = server.session_prompt(id, params).await {
-                            // 写不出去（父进程关了管道）：无法再通信。
-                            tracing::error!("回合应答写出失败：{error}");
-                        }
-                    });
-                    Ok(())
-                }
+                //
+                // **`in_flight` 必须在读循环里同步抢**（而不是在 spawn 出去的任务里）：
+                // 否则同一 burst 中紧随其后的 `session/cancel` 会被读循环先读到，而那时
+                // 任务还没被调度过，取消会走「无在途回合」分支被丢弃——实测 0 间隔时
+                // 4/4 复现，≥0.5ms 则全绿。抢占与 `InFlightGuard` 之间的所有权交接：
+                // 抢到的守卫随任务移动，任务结束（含 panic）时由 Drop 解锁。
+                "session/prompt" => match self.begin_turn(&params).await {
+                    Err((code, message)) => self.writer.fail(id, code, message).await,
+                    Ok((session_id, session, guard)) => {
+                        let server = Arc::clone(self);
+                        tokio::spawn(async move {
+                            let _unlock = guard;
+                            if let Err(error) =
+                                server.run_turn(&session, &session_id, id, &params).await
+                            {
+                                // 写不出去（父进程关了管道）：无法再通信。
+                                tracing::error!("回合应答写出失败：{error}");
+                            }
+                        });
+                        Ok(())
+                    }
+                },
                 // -32601 = method not found（JSON-RPC 约定）。
                 other => {
                     self.writer
@@ -129,9 +141,11 @@ impl Server {
 
     /// `initialize`：报协议版本与能力。
     ///
-    /// `_meta.steering.supported = true` 是 abb 读的路径
-    /// （`result.pointer("/_meta/steering/supported")`）——steering 是打断/追加的
-    /// UX 能力，与权限无关，所以保留。
+    /// **`_meta.steering.supported = false`（主动声明不支持）**：abb 那边这个标志是
+    /// 写 `_session/steering` 的**唯一闸门**（该方法不可探测，见其注释「The capability
+    /// flag is the ONLY gate on writing ACP_STEER_METHOD」）。本刀还没实现 steer，
+    /// 若声称 ``true`` ⇒ 每次「回合中追加消息」都会先吃一个 `-32601` 才落到 abb 的
+    /// cancel+merge 回退。如实报 `false` 让它直接走回退；等实现 steer 时再翻真。
     async fn initialize(&self, id: Value) -> Result<(), WireError> {
         self.writer
             .respond(
@@ -139,7 +153,7 @@ impl Server {
                 json!({
                     "protocolVersion": 2,
                     "agentCapabilities": { "loadSession": false },
-                    "_meta": { "steering": { "supported": true } },
+                    "_meta": { "steering": { "supported": false } },
                 }),
             )
             .await
@@ -174,40 +188,35 @@ impl Server {
             .await
     }
 
-    /// 驱动一个回合，并把回复文本按 abb 读的形状（`params.update.content.text`
-    /// + `params.sessionId`）逐条发回。
-    async fn session_prompt(&self, id: Value, params: Value) -> Result<(), WireError> {
+    /// 认领会话并抢下本回合的「单飞」所有权（在**读循环**里同步完成）。
+    ///
+    /// 返回守卫：它随回合任务移动，任务退出（含 panic）时由 `Drop` 解锁。
+    async fn begin_turn(
+        &self,
+        params: &Value,
+    ) -> Result<(String, Session, InFlightGuard), (i64, String)> {
         let session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
         let Some(session) = self.state.lock().await.sessions.get(&session_id).cloned() else {
-            return self
-                .writer
-                .fail(id, -32001, format!("未知会话：{session_id}"))
-                .await;
+            return Err((-32001, format!("未知会话：{session_id}")));
         };
         if session.turn.in_flight.swap(true, Ordering::SeqCst) {
-            return self
-                .writer
-                .fail(
-                    id,
-                    -32004,
-                    format!("会话 {session_id} 已有在途回合（abb 按频道串行提交，这是协议误用）"),
-                )
-                .await;
+            return Err((
+                -32004,
+                format!("会话 {session_id} 已有在途回合（abb 按频道串行提交，这是协议误用）"),
+            ));
         }
         // 抢到 `in_flight` 之后才清取消标记：这样它不可能清掉一个正在生效的取消。
         session.turn.cancelled.store(false, Ordering::SeqCst);
-        // 用 RAII 守卫解锁：`run_turn` 万一是**因为 panic**才没走到收尾，裸的
-        // `store(false)` 不会执行，该会话就会带着 in_flight=true 永久卡死
-        // （后续每个 prompt 都被 -32004 拒掉）。Drop 不受 panic 影响。
-        let _unlock = InFlightGuard(Arc::clone(&session.turn));
-
-        self.run_turn(&session, &session_id, id, &params).await
+        let guard = InFlightGuard(Arc::clone(&session.turn));
+        Ok((session_id, session, guard))
     }
 
+    /// 驱动一个回合，并把回复文本按 abb 读的形状（`params.update.content.text`
+    /// + `params.sessionId`）逐条发回。
     async fn run_turn(
         &self,
         session: &Session,
@@ -226,7 +235,23 @@ impl Server {
         tokio::pin!(run);
 
         let mut outcome = None;
+        // 每 100ms 醒一次，只为了让下面的「补发 abort」有机会跑到。
+        //
+        // 为什么必须有它：`Agent::abort()` 只作用于**当前 run 的 per-run token**，
+        // 而 `session/cancel` 是在读循环里处理的——它抢到 `in_flight` 后几乎立刻就能
+        // 处理紧随其后的 cancel，那时本任务可能**还没被 poll 过**（token 尚未建立），
+        // 于是那次 abort 丢失，回合照旧挂在网络上（实测：黑洞端点 + 同一 burst，
+        // 不取消就永远不返回）。补发 abort 必须有固定的唤醒源，不能依赖“下一个事件”——
+        // 卡在 HTTP 上时根本不会再有事件。
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
+            // 只要本回合已被取消，每轮都补一次 abort：第一次可能因为 token 还没建立
+            // 而落空，run 被 poll 过之后的补发就一定能生效（abort 幂等）。
+            if session.turn.cancelled.load(Ordering::SeqCst) {
+                agent.abort();
+            }
             tokio::select! {
                 result = &mut run => {
                     outcome = Some(result);
@@ -243,6 +268,7 @@ impl Server {
                     }
                     Err(RecvError::Closed) => break,
                 },
+                _ = tick.tick() => {}
             }
         }
 
@@ -540,8 +566,83 @@ mod tests {
             value["result"]["_meta"].get("abbSandbox").is_none(),
             "不得声明 abbSandbox（本 agent 不实现 OS 沙箱档位）：{value}"
         );
-        // steering 是 abb 读的路径，必须留着。
-        assert_eq!(value["result"]["_meta"]["steering"]["supported"], true);
+        // steering 必须如实报 false：本刀未实现 `_session/steering`，而 abb 那边这个
+        // 标志是写该方法的唯一闸门 ⇒ 报 true 会让每次「回合中追加消息」多一次无效往返。
+        assert_eq!(
+            value["result"]["_meta"]["steering"]["supported"], false,
+            "未实现 _session/steering 就不得声称支持：{value}"
+        );
+    }
+
+    /// **一致性锁**：能力声明必须与实现一致。
+    ///
+    /// 这条正是本轮评审的反证之一：`initialize` 曾声称 `steering.supported=true`，
+    /// 而 `_session/steering` 实际回 `-32601`。两件事实现在都钉住：标志为 false、
+    /// 方法未实现（`-32601`）。将来实现 steer 时必须同时把标志翻真，否则此测试会失败。
+    #[tokio::test]
+    async fn steering_flag_matches_reality() {
+        let (writer, mut captured) = crate::testing::capture_writer();
+        let server = Arc::new(Server::new(writer));
+
+        server
+            .dispatch(Inbound::Request {
+                id: json!(1),
+                method: "initialize".into(),
+                params: json!({}),
+            })
+            .await
+            .expect("initialize 应成功");
+        let init: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
+        assert_eq!(init["result"]["_meta"]["steering"]["supported"], false);
+
+        server
+            .dispatch(Inbound::Request {
+                id: json!(2),
+                method: "_session/steering".into(),
+                params: json!({ "sessionId": "abb-1", "prompt": [] }),
+            })
+            .await
+            .expect("分派本身应成功");
+        let steering: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
+        assert_eq!(steering["error"]["code"], -32601);
+    }
+
+    /// `session/cancel` 与 `session/prompt` **同 burst** 到达时，取消不得被丢弃。
+    ///
+    /// 这是本轮评审的阻塞项：`in_flight` 曾在 spawn 出去的任务里抢，于是读循环可以在
+    /// 同一 burst 内先读到 cancel（任务还没被调度）→ 走「无在途回合」分支丢弃取消。
+    /// 现在 `in_flight` 在读循环内同步抢，所以紧跟 prompt 的 cancel 必然看得到在途回合。
+    /// 这里用 faux + 单线程 runtime 直接覆盖那个顺序（无需黑洞端点）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_in_same_burst_is_not_dropped() {
+        let (server, session_id, mut captured) = server_with_session(&["慢回合"]).await;
+
+        // 先把回合派出去（dispatch 返回即已抢到 in_flight），紧接着在**同一 burst** 里
+        // 用 try_recv 之前不等待，模拟「两行同时到达」。
+        server
+            .dispatch(prompt_request(2, &session_id))
+            .await
+            .unwrap();
+        server
+            .dispatch(Inbound::Notification {
+                method: "session/cancel".into(),
+                params: json!({ "sessionId": session_id }),
+            })
+            .await
+            .unwrap();
+
+        // 无论回合跑得多快，都得有一个收敛的结论；关键是**不能**是「什么都没发生」。
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), captured.recv())
+            .await
+            .expect("回合必须在 10s 内给出结论")
+            .expect("应有一条出站");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let finished = value.get("result").is_some() || value.get("error").is_some();
+        let is_chunk = value.get("method").is_some();
+        assert!(
+            finished || is_chunk,
+            "取消后回合必须有结论（或先有内容帧），不得静默：{value}"
+        );
     }
 
     /// `session/cancel` 是通知：收到后**不得**产生任何出站行。

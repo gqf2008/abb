@@ -21,4 +21,12 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   **修前表现**：`stopReason:"end_turn"` + 零文本 + 零日志 ⇒ abb 当「纯工具回合」不投递
   并 `record_success`。
 
-两条都只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。
+- `cancel_same_burst.py`：把 `session/prompt` 与 `session/cancel` 放进**同一次 write**
+  （0 间隔）配黑洞端点。修前 `in_flight` 在被派出的任务里抢，读循环能在任务被调度前先读到
+  cancel ⇒ 取消被静默丢弃（0 间隔 6/6）；修后 8/8 收敛成 `cancelled`。
+- `openai_family_round_trip.py`：起一个假 OpenAI 兼容网关（回最小 SSE），断言请求打到
+  `{base}/v1/chat/completions`、鉴权头是 abb 注入的 key、请求体里的 model 就是我们给的
+  **任意厂商 id**，且文本被发成 `session/update` 并以 `end_turn` 收尾。这条覆盖的是 abb 把
+  `openai-chat`/`openrouter`/`deepseek` 全归并成 `BUZZ_AGENT_PROVIDER=openai` 的真实路径。
+
+全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。

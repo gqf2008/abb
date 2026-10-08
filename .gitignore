@@ -31,6 +31,9 @@ app-assets/Output/
 .claude/worktrees/
 tools-dist/
 
-# rpi（本仓的开发用 harness）会在项目里落 .rpi/sessions 等本机运行期数据；
-# 它不是仓库内容，且 rpi 自身的调试会持续改写它。
-.rpi/
+# rpi（本仓的开发用 harness）的运行期数据。**只收运行期子路径**：rpi 把 `.rpi/` 同时
+# 当作项目级共享资源目录（SYSTEM.md / APPEND_SYSTEM.md / settings.json / skills/ /
+# prompts/ / themes/ / extensions/ 都可能需要提交），无锚点地忽略整个 `.rpi/` 会把
+# 那些一起静默吞掉——与本文件里 `/scripts/` 那条注释记过的是同类事故。
+.rpi/sessions/
+.rpi/extensions/.dev/
