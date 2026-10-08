@@ -29,16 +29,18 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex;
 
+use rpi_agent::agent_tool::AgentTool;
+
+use crate::mcp::{McpServerSpec, McpSession};
 use crate::provider::{self, Backend};
 use crate::wire::{Inbound, WireError, Writer};
 
-/// 系统提示（第一刀从简）。
+/// 系统提示的默认值（abb 未下发 `systemPrompt` 时用）。
 ///
-/// TODO(第二刀)：接约定链——`~/AGENTS.md` 作为全局层 + cwd→root 逐级，
-/// 技能目录对齐 `~/.agents/skills` / `<cwd>/.agents/skills`（buzz `hints.rs`
-/// 的现状）。注意**不能**直接用 rpi 的默认位（`<agent_dir>/AGENTS.md` +
-/// `~/.rpi/agent/skills`），否则既有用户的约定会静默失效。
-const SYSTEM_PROMPT: &str = "你是 ABB（agent-bridge）的执行层 agent，在用户本机上运行。";
+/// abb 的**生产路径确实会下发** `session/new` 的 `params.systemPrompt`
+/// （`src/buzz/pool.rs::session_new_system_prompt` 在 protocol_version≥2 且非 goose 时走
+/// `Field` 传输），所以这个常量只是兼底——第一刀忽略了该参数，等于把 abb 的指令丢了。
+const DEFAULT_SYSTEM_PROMPT: &str = "你是 ABB（agent-bridge）的执行层 agent，在用户本机上运行。";
 
 pub struct Server {
     writer: Writer,
@@ -60,6 +62,9 @@ struct State {
 struct Session {
     agent: Arc<Agent>,
     turn: Arc<TurnState>,
+    /// **持有本会话的 MCP 连接**：连接一断，它贡献的工具就失效；所以生命周期绑在
+    /// session 上，而不是只靠 agent 里那几份 `AgentTool` clone。
+    _mcp: Arc<McpSession>,
 }
 
 /// 每会话的回合状态。常驻（不每回合新建），由 `in_flight` 保证单飞。
@@ -96,7 +101,7 @@ impl Server {
         match inbound {
             Inbound::Request { id, method, params } => match method.as_str() {
                 "initialize" => self.initialize(id).await,
-                "session/new" => self.session_new(id).await,
+                "session/new" => self.session_new(id, params).await,
                 // 只有回合走独立任务：它是唯一的长任务，也是 `session/cancel`
                 // 必须能在其运行期间被处理的原因。
                 //
@@ -159,9 +164,37 @@ impl Server {
             .await
     }
 
-    async fn session_new(&self, id: Value) -> Result<(), WireError> {
+    async fn session_new(&self, id: Value, params: Value) -> Result<(), WireError> {
         let session_id = format!("abb-{}", self.seq.fetch_add(1, Ordering::SeqCst));
-        let agent = match self.build_agent(&session_id) {
+
+        let parsed = match SessionNewParams::parse(&params) {
+            Ok(parsed) => parsed,
+            Err(reason) => return self.writer.fail(id, -32005, reason).await,
+        };
+
+        // 握手有界（每 server 最多 HANDSHAKE_TIMEOUT），且**有意**同步做：abb 在
+        // `session/new` 应答之后才发 prompt，而工具必须在 prompt 之前就位。
+        // 代价：握手期间读循环被占用（会延迟其它会话的 cancel）——若将来需要非阻塞，
+        // 应拆成任务并对 prompt 加就绪门。
+        let mcp = McpSession::connect_all(&parsed.mcp_servers).await;
+        let tools = mcp.tools();
+        tracing::info!(
+            "会话 {session_id}：mcp server {:?}，工具 {} 个，systemPrompt={}，cwd={}",
+            mcp.server_names(),
+            tools.len(),
+            if parsed.system_prompt.is_some() {
+                "abb 下发"
+            } else {
+                "默认"
+            },
+            if parsed.cwd.is_empty() {
+                "(未给)"
+            } else {
+                &parsed.cwd
+            }
+        );
+
+        let agent = match self.build_agent(&session_id, parsed.system_prompt, tools) {
             Ok(agent) => agent,
             Err(reason) => return self.writer.fail(id, -32000, reason).await,
         };
@@ -181,6 +214,7 @@ impl Server {
             Session {
                 agent: Arc::new(agent),
                 turn: Arc::new(TurnState::default()),
+                _mcp: Arc::new(mcp),
             },
         );
         self.writer
@@ -359,17 +393,61 @@ impl Server {
         }
     }
 
-    fn build_agent(&self, session_id: &str) -> Result<Agent, String> {
+    fn build_agent(
+        &self,
+        session_id: &str,
+        system_prompt: Option<String>,
+        tools: Vec<Arc<dyn AgentTool>>,
+    ) -> Result<Agent, String> {
         let backend = self.backend.as_ref().map_err(|reason| reason.clone())?;
         AgentBuilder::new()
             .model(backend.model().clone())
-            .system_prompt(SYSTEM_PROMPT)
+            .system_prompt(system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()))
             .session_id(session_id)
             .stream_fn(backend.stream_fn())
-            // TODO(第二刀)：接 rpi-tools 的内置工具（read/write/edit/bash/
-            // grep/find/ls），env 用 OsExecutionEnv::with_cwd(工作目录)。
+            .tools(tools)
+            // TODO(刀 2)：接 rpi-tools 的内置工具（read/write/edit/bash/
+            // grep/find/ls），env 用 OsExecutionEnv::with_cwd(session/new 的 cwd)。
             .build()
             .map_err(|error| format!("agent 构建失败：{error}"))
+    }
+}
+
+/// `session/new` 里 abb 下发的三项契约（`cwd` / `systemPrompt` / `mcpServers`）。
+///
+/// 抽成纯函数是为了可测：这三项在第一刀里**全部被静默忽略**（连 `params` 都不读），
+/// 属于「abb 给了、agent 不看」的典型失效。
+#[derive(Debug, Default)]
+struct SessionNewParams {
+    cwd: String,
+    system_prompt: Option<String>,
+    mcp_servers: Vec<McpServerSpec>,
+}
+
+impl SessionNewParams {
+    fn parse(params: &Value) -> Result<Self, String> {
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_default()
+            .to_string();
+        let system_prompt = params
+            .get("systemPrompt")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let mcp_servers = match params.get("mcpServers") {
+            // 形状不对就要说清楚：静默丢掉 server 列表正是第一刀的缺陷形态。
+            Some(raw) => serde_json::from_value(raw.clone())
+                .map_err(|error| format!("mcpServers 解析失败：{error}"))?,
+            None => Vec::new(),
+        };
+        Ok(Self {
+            cwd,
+            system_prompt,
+            mcp_servers,
+        })
     }
 }
 
@@ -700,6 +778,54 @@ mod tests {
         let line = captured.recv().await.expect("应写出一条错误应答");
         let value: Value = serde_json::from_str(&line).expect("应答是 JSON");
         assert_eq!(value["error"]["code"], -32601);
+    }
+
+    /// `session/new` 的三项契约都要真的读进来——第一刀全部被静默忽略。
+    #[test]
+    fn session_new_params_are_parsed() {
+        let params = json!({
+            "cwd": "/ws/bot",
+            "systemPrompt": "你是 ABB 的执行层。",
+            "mcpServers": [{
+                "name": "abb-events",
+                "command": "/Applications/ABB.app/Contents/MacOS/agent-bridge",
+                "args": ["mcp-events"],
+                "env": [{ "name": "ABB_EVENTS_REPO", "value": "/repo" }],
+            }],
+        });
+        let parsed = SessionNewParams::parse(&params).expect("应能解析");
+        assert_eq!(parsed.cwd, "/ws/bot");
+        assert_eq!(parsed.system_prompt.as_deref(), Some("你是 ABB 的执行层。"));
+        assert_eq!(parsed.mcp_servers.len(), 1);
+        assert_eq!(parsed.mcp_servers[0].name, "abb-events");
+        assert_eq!(parsed.mcp_servers[0].args, vec!["mcp-events"]);
+    }
+
+    /// 三项都是可选的：一个都不给也要能建会话（空 cwd / 默认提示 / 无 server）。
+    #[test]
+    fn session_new_params_tolerate_empty_object() {
+        let parsed = SessionNewParams::parse(&json!({})).expect("空 params 应可用");
+        assert!(parsed.cwd.is_empty());
+        assert!(parsed.system_prompt.is_none());
+        assert!(parsed.mcp_servers.is_empty());
+    }
+
+    /// 空白串不算「给了」——abb 的空值不该覆盖默认提示或当成 cwd。
+    #[test]
+    fn session_new_params_treat_blank_as_absent() {
+        let parsed =
+            SessionNewParams::parse(&json!({ "cwd": "   ", "systemPrompt": "  " })).unwrap();
+        assert!(parsed.cwd.is_empty());
+        assert!(parsed.system_prompt.is_none());
+    }
+
+    /// `mcpServers` 形状不对必须报错（-32005），不能静默当成空列表——
+    /// 那正是第一刀「abb 送了 server 却没人看」的失效形态。
+    #[test]
+    fn malformed_mcp_servers_is_an_error() {
+        let err = SessionNewParams::parse(&json!({ "mcpServers": "not-an-array" }))
+            .expect_err("形状不对应报错");
+        assert!(err.contains("mcpServers"), "{err}");
     }
 
     /// 未建立会话就 prompt：结构化错误，不是 panic。

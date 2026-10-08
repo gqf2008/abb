@@ -29,4 +29,10 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   **任意厂商 id**，且文本被发成 `session/update` 并以 `end_turn` 收尾。这条覆盖的是 abb 把
   `openai-chat`/`openrouter`/`deepseek` 全归并成 `BUZZ_AGENT_PROVIDER=openai` 的真实路径。
 
+- `mcp_tool_round_trip.py`（配 `fake_mcp_server.py`）：刀 1 的核心验收。按 `session/new` 的
+  `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
+  工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分
+  「工具被调用」与「模型自己编了答案」。
+- `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。
+
 全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。

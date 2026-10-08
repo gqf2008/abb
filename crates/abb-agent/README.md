@@ -68,6 +68,7 @@ token**。若 cancel 在回合任务**被 poll 之前**就到，那一次 abort 
 | `BUZZ_AGENT_MAX_ROUNDS` | 回合上界（abb 默认送 200） |
 | `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 可选；单回合输出上限。abb **今天不注入**，但被替代的 fork 会读它（默认 65536），故同样认 |
 | `ABB_AGENT_FAUX_TEXT` | **本包自己的离线通道**：命中即用 rpi faux provider（不联网、无凭据），供 smoke 与测试 |
+| `ABB_AGENT_FAUX_TOOL` | 离线通道之二：JSON `{"name":…,"arguments":…}`，先发一次工具调用再把 `ABB_AGENT_FAUX_TEXT` 当文本回复。用于无 key 验证「模型 → 工具 → 结果回灌」 |
 | `RUST_LOG` | 日志级别（默认 `info`；**日志只走 stderr**，stdout 是 ACP 协议通道） |
 
 ### 模型 id 不查目录（重要）
@@ -98,6 +99,30 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 `/chat/completions`（对 host 根才补 `/v1/chat/completions`）——所以能正确拼成
 `https://api.deepseek.com/v1/chat/completions`。
 
+## MCP（刀 1）
+
+rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 的 tool surface 主要
+就是两个 MCP server：`abb-events`（= abb 二进制自身 `mcp-events` 子命令）与 `wassette`
+（Wasm 组件工具宿主）。本包用 **`rmcp`**（与被替代的 `crates/buzz-agent` 同源）接上它们。
+
+- 入口是 `session/new` 的 `params.mcpServers`（形状与 `src/buzz/acp.rs` 的 `McpServer` 逐字对应：
+  `{name, command, args, env:[{name,value}]}`）。**第一刀连 `params` 都不读**，abb 送的 server
+  列表被静默丢弃——现在会解析、`mcpServers` 形状不对则回 `-32005` 而不是当成空列表。
+- 工具以 **`{server}__{tool}`** 的限定名暴露给模型（与被替代组件一致：其 `SEP` 即 `__`，
+  且它同样拒绝 bare 名含 `__` 的工具），调用时回退到 bare 名发给 MCP。
+- `initialize` + `tools/list` 有界（每个 server 20s）；**单个 server 连不上不拖垮整轮装配**，
+  记 ERROR 后跳过（与 abb 对「一个坏插件不能阻断其余」的取向一致）。
+- 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。
+- MCP `isError: true` 走 `Err(AgentError::Tool)` 路径，让 loop 编码成错误工具结果（不伪装成功）；
+  非文本内容（图片/资源）**不静默吞掉**，以 `[image 内容] {…}` 形式留在文本里。
+
+握手是**有意同步**做的：abb 在 `session/new` 应答之后才发 prompt，工具必须在 prompt 之前就位；
+代价是握手期间读循环被占用（会延迟其它会话的 cancel），若将来需要非阻塞应对 prompt 加就绪门。
+
+尚未做（刀 2 之后视需要）：`notifications/tools/list_changed` 的刷新、每个 `tools/call` 的独立超时、
+断线重连。另注意：MCP 子进程的孤儿回收（abb 侧有 `src/orphan_mcp.rs` 专治 wassette 孤儿）本包
+未处理——子进程随 session 的 `RunningService` 一起走，但异常路径下的残留待测。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -119,11 +144,11 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 
 **已实现并验证**：`initialize`、`session/new`、`session/prompt`（回文本）、`session/cancel`
 （回合中可用，含同 burst）、`session/update` 的 `agent_message_chunk`、provider 失败如实报错、
-anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）。
+anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**`session/new` 的三项契约
+（`cwd` / `systemPrompt` / `mcpServers`）**、**MCP 客户端（工具经 MCP 真执行并回灌）**。
 
 **尚未实现（第二刀）**：
 
-- **MCP 客户端**——`abb-events` 与 wassette 两个 tool surface 现在会**缺失**；
 - **内置工具接线**（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv` 的 cwd）；
 - **约定链**：`~/AGENTS.md` 作为全局层 + cwd→root 逐级；技能目录对齐
   `~/.agents/skills` / `<cwd>/.agents/skills`（buzz `hints.rs` 的现状）。

@@ -72,6 +72,13 @@ pub const MAX_OUTPUT_TOKENS_ENV: &str = "BUZZ_AGENT_MAX_OUTPUT_TOKENS";
 /// 窗口）时返回 `max(1, max_tokens)`，所以 `0` 会变成「只准回 1 个 token」。
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 65_536;
 
+/// 离线通道：固定文本回复。
+pub const FAUX_TEXT_ENV: &str = "ABB_AGENT_FAUX_TEXT";
+
+/// 离线通道：先发一次工具调用（JSON `{"name":…,"arguments":…}`），再把
+/// [`FAUX_TEXT_ENV`] 当作文本回复。
+pub const FAUX_TOOL_ENV: &str = "ABB_AGENT_FAUX_TOOL";
+
 /// 环境读取缝。
 ///
 /// **为什么不在测试里 `set_var`**：env 是进程全局的，并行用例会互相踩
@@ -163,6 +170,35 @@ pub fn select() -> Result<Backend, String> {
 
 /// [`select`] 的可注入版本（环境来源显式传入）。
 pub fn select_with(env: &dyn EnvSource) -> Result<Backend, String> {
+    // 离线**工具**路径：先发一次工具调用，再把 `ABB_AGENT_FAUX_TEXT` 当作文本回复。
+    // 用于无 key、无网验证「模型 → 工具 → 结果回灌」整条链（`probes/mcp_tool_round_trip.py` 靠它）。
+    if let Some(raw) = env.get(FAUX_TOOL_ENV) {
+        let spec: serde_json::Value = serde_json::from_str(raw.trim())
+            .map_err(|error| format!("{FAUX_TOOL_ENV} 不是合法 JSON：{error}"))?;
+        let name = spec
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("{FAUX_TOOL_ENV} 缺少 name"))?
+            .to_string();
+        let arguments = spec
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let follow_up = env
+            .get("ABB_AGENT_FAUX_TEXT")
+            .unwrap_or_else(|| "工具已执行。".to_string());
+        let provider = FauxProvider::new(
+            FauxScript::new()
+                .with_tool_call(name, arguments)
+                .with_text(follow_up),
+        );
+        let model = provider
+            .models()
+            .first()
+            .cloned()
+            .ok_or_else(|| "faux provider 没有可用模型".to_string())?;
+        return Ok(Backend::Faux { provider, model });
+    }
     if let Some(text) = env.get("ABB_AGENT_FAUX_TEXT") {
         let provider = FauxProvider::new(FauxScript::new().with_text(text));
         let model = provider
@@ -377,6 +413,27 @@ mod tests {
         let env = FakeEnv::new(&[("ABB_AGENT_FAUX_TEXT", "hello")]);
         let backend = select_with(&env).expect("faux 应可选");
         assert_eq!(backend.id(), "faux");
+    }
+
+    /// 离线**工具**通道：`ABB_AGENT_FAUX_TOOL` 应选 faux，且优先于纯文本通道。
+    #[test]
+    fn faux_tool_env_selects_faux_and_wins_over_text() {
+        let env = FakeEnv::new(&[
+            (
+                FAUX_TOOL_ENV,
+                r#"{"name":"abb-events__query","arguments":{"q":1}}"#,
+            ),
+            (FAUX_TEXT_ENV, "收尾文本"),
+        ]);
+        assert_eq!(select_with(&env).expect("faux 工具通道应可选").id(), "faux");
+    }
+
+    /// 非法 JSON 要报错，不能静默降级成纯文本（那样 E2E 会「通过」却根本没调工具）。
+    #[test]
+    fn faux_tool_env_rejects_malformed_json() {
+        let err = select_with(&FakeEnv::new(&[(FAUX_TOOL_ENV, "{not json")]))
+            .expect_err("非法 JSON 应报错");
+        assert!(err.contains(FAUX_TOOL_ENV), "{err}");
     }
 
     #[test]
