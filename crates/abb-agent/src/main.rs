@@ -3,6 +3,12 @@
 //! 进程契约与 `buzz-agent` 一致（abb 的 `src/buzz/acp.rs` 是客户端）：
 //! stdin 收请求/通知，stdout 出应答/通知。**stdout 只跑协议**——日志一律 stderr，
 //! 否则会直接破坏帧。
+//!
+//! 读循环**必须保持可读**：回合由 [`Server::dispatch`] 内部派到独立任务里，
+//! 这样回合进行中送进来的 `session/cancel` 才能被立刻处理（第一版这里是
+//! `dispatch().await` 串行，cancel 完全失效——评审反证 (b)）。
+
+use std::sync::Arc;
 
 use abb_agent::acp::Server;
 use abb_agent::wire::{parse_line, Reader, Writer};
@@ -11,7 +17,7 @@ use abb_agent::wire::{parse_line, Reader, Writer};
 async fn main() -> std::process::ExitCode {
     init_logging();
 
-    let server = Server::new(Writer::new(Box::new(tokio::io::stdout())));
+    let server = Arc::new(Server::new(Writer::new(Box::new(tokio::io::stdout()))));
     let mut reader = Reader::new(Box::new(tokio::io::stdin()));
 
     loop {

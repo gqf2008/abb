@@ -10,8 +10,8 @@
 #   - agent **不碰权限**：不实现 OS 沙箱档位，`initialize` 响应**不声明**
 #     `_meta.abbSandbox`（如实声明，不伪装能力）；
 #   - **不发** `session/request_permission`：授权约定由 AGENTS.md 承担；
-#   - LLM 层与 agent loop 不再自持，改为依赖 rpi 库（rpi-ai / rpi-agent /
-#     rpi-tools），删掉原 7.9k 行 llm.rs 与 1.9k 行 agent.rs 的自持实现。
+#   - LLM 层与 agent loop 不再自持，改为依赖 rpi 库（rpi-ai / rpi-agent）；
+#     内置工具（rpi-tools）第二刀接入。删掉原 7.9k 行 llm.rs 与 1.9k 行 agent.rs。
 #
 # 构建：cargo build --release --manifest-path crates/abb-agent/Cargo.toml
 #
@@ -44,11 +44,13 @@ rpi-agent = "0.3.16"
 # feature 后面——那是它「测试不可能悄悄依赖网络」的设计。本包需要真 LLM，故显式打开；
 # faux provider 不受影响（它不在该 feature 下），所以离线 smoke 仍然不联网。
 rpi-ai = { version = "0.3.16", features = ["providers"] }
-rpi-tools = "0.3.16"
+
+# 注意：`rpi-tools`（内置工具）与 `tokio-util` **尚未使用**，故不在此列出。
+# 评审指出第一版把它们写进依赖却零引用（注释还说成「内置工具来源」），
+# 第二刀接工具时再加回，避免死依赖。
 
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "time", "sync", "io-util", "io-std"] }
-tokio-util = { version = "0.7", features = ["rt"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
