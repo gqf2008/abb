@@ -366,6 +366,84 @@ async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, Stri
     Ok(target)
 }
 
+/// `load_skill` 的工具名：**裸名**（不经 `dev__` 命名空间）。
+///
+/// 参照物是把这个工具直接 push 进工具表（`agent.rs` 里 `tools.push(builtin::load_skill_def())`），
+/// 所以模型看到的就是 `load_skill`——本包照做，改名会让既有的技能约定/技能正文里的
+/// `load_skill(name: …)` 提示全部失效。
+pub const LOAD_SKILL_TOOL: &str = "load_skill";
+
+/// 造本会话的 `load_skill` 工具。
+///
+/// 技能清单来自 [`crate::skills::discover`]，**只在约定链开启且真有技能时**才暴露（参照物：
+/// hints 关掉时 skills 是空 vec、且 `agent.rs` 只在 `!skills.is_empty()` 时 push 这个工具）。
+/// 无技能时仍然暴露的话，模型会看到一个指向不存在段落的工具（评审实测到的对外可见偏离）。
+pub fn load_skill_tool(skills: Vec<crate::skills::SkillEntry>) -> Arc<dyn AgentTool> {
+    let schema = Tool {
+        name: LOAD_SKILL_TOOL.to_string(),
+        description: "Load the full content of a skill by name. \
+            Call this before using a skill — the system prompt lists skill names \
+            and descriptions only; the full instructions are loaded on demand. \
+            To load a supporting file within a skill, use the form \
+            \"skill-name/relative/path\" (e.g. \"my-skill/references/foo.md\")."
+            .to_string(),
+        parameters: Schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The skill name as listed in the Available Skills section, \
+                        or \"skill-name/relative/path\" to load a supporting file."
+                }
+            },
+            "required": ["name"]
+        })),
+        constrained_sampling: None,
+    };
+    Arc::new(LoadSkillTool { schema, skills })
+}
+
+struct LoadSkillTool {
+    schema: Tool,
+    skills: Vec<crate::skills::SkillEntry>,
+}
+
+#[async_trait]
+impl AgentTool for LoadSkillTool {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+
+    fn label(&self) -> &str {
+        LOAD_SKILL_TOOL
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        _signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return Err(AgentError::Tool(
+                "load_skill: missing required argument \"name\"".to_string(),
+            ));
+        };
+        // 读取是同步文件 IO：放进 blocking 池，别占住 runtime（沙箱/加载都可能慢）。
+        let skills = self.skills.clone();
+        let request = name.to_string();
+        let loaded = tokio::task::spawn_blocking(move || crate::skills::load(&request, &skills))
+            .await
+            .map_err(|error| AgentError::Tool(format!("load_skill: 任务失败：{error}")))?;
+        match loaded {
+            Ok(text) => Ok(AgentToolResult::text(text)),
+            // 找不到/越界都走「错误工具结果」（与参照物一致）：模型据此自我纠偏。
+            Err(reason) => Err(AgentError::Tool(reason)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +574,49 @@ mod tests {
                 schema.description
             );
         }
+    }
+
+    /// `load_skill`：**裸名**（不带 `dev__`）+ 缺参/找不到都有可纠偏的错误。
+    #[tokio::test]
+    async fn load_skill_tool_is_bare_named_and_reports_actionable_errors() {
+        let tool = load_skill_tool(Vec::new());
+        assert_eq!(
+            tool.schema().name,
+            "load_skill",
+            "参照物是裸名，不能加 dev__ 前缀"
+        );
+        assert!(
+            tool.schema().parameters.0["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|v| v == "name")),
+            "name 必填：{}",
+            tool.schema().parameters.0
+        );
+
+        let no_param = tool
+            .execute(
+                "call",
+                serde_json::json!({}),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect_err("缺 name 必须报错");
+        assert!(no_param.to_string().contains("name"), "{no_param}");
+
+        let not_found = tool
+            .execute(
+                "call",
+                serde_json::json!({ "name": "nope" }),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect_err("找不到技能必须报错");
+        assert!(
+            not_found.to_string().contains("not found"),
+            "错误要可纠偏：{not_found}"
+        );
     }
 
     /// `timeout_secs` → `timeout` 的翻译 + clamp（参照物：默认 120、区间 1..=600）。

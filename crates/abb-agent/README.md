@@ -195,8 +195,36 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   **若将来 abb-agent 声明档位**，必须连同 `read_roots`/写入 roots 一起实现，不能只补声明——这条仍未做，
   如实登记为待办（`src/task_proc.rs` 的 proc 闸同理：靠 `ABB_AGENT_CONTEXT` 标记，不是安全边界）。
 
-**尚未做**：技能目录发现（`~/.agents/skills`、`<cwd>/.agents/skills` 等）与 `load_skill` 工具
-—— 内置工具已到位，这一块可以按需补；另见上文 granted 隔离待办。
+### 技能与 `load_skill`（同一批落地）
+
+系统提示按被替代组件的三段结构给出：`# Additional Instructions` → `## Project Hints`（`AGENTS.md`
+链）→ `## Available Skills`（技能名 + 描述）→ 一行「用 `load_skill` 读正文」。两边都空时**不产出任何
+标题**（不留空壳段落）。
+
+- 发现（对齐 `crates/buzz-agent/src/hints.rs`）：`<cwd>/.agents/skills`、`.goose/skills`、`.claude/skills`
+  + `~/.agents/skills`；`SKILL.md` 的 YAML frontmatter 取 `name`/`description`（**无 `name` 不成技能**）；
+  **同名先发现的赢**；子目录自带 `SKILL.md` 的不再下钻（那是另一个技能）；支持文件全部预枚举。
+- 读取（对齐 `crates/buzz-agent/src/builtin.rs`）：工具名是**裸名 `load_skill`**（参照物直接 push 进
+  工具表，不经 `dev__` —— 改名会让技能正文里写的 `load_skill(name: …)` 提示失效）；`{name}` 取整个技能
+  （**剥掉 frontmatter**、附 `## Supporting Files` 清单），`{name}/relative/path` 取支持文件；
+  两者合计 **32 KiB** 上限（按字符边界截断）；找不到/越界给出带「可用技能/可用文件」清单的错误结果。
+- **越界保护**：支持文件必须**已在预枚举清单里**，且读取前 canonicalize 后仍在**技能目录（发现时的
+  真实路径）**内 —— 拦的是「支持文件本身是/被换成指向外面的符号链接」。**残留限制**（与参照物
+  **同形**，已登记）：①整个**技能目录**被换成指向外面的符号链接；②支持文件是与外部文件**同 inode
+  的硬链接**。这两条不拦，因为参照物的判据也只到这一层。
+- **无技能时不暴露 `load_skill`**（参照物只在 `!skills.is_empty()` 时 push）；支持文件成功结果的
+  **外框**与参照物逐字一致（`# Loaded: skill/rel → File loaded into context.`）；`{name}/`（相对
+  路径为空）走**支持文件**分支并报错列出可用文件（`split_once('/')` 的语义）；越界拒绝
+  （`refusing to load … resolves outside the skill directory`）与读取失败
+  （`could not read "skill/rel": …`，**不回显绝对路径**）的措辞同样逐字对齐。
+- **平台层差异（如实登记）**：`load_skill: missing required argument "name"` 这条在本包**端到端不可达**
+  ——rpi 会先按 schema 校验拦下（模型看到的是 `schema error: Validation failed …`），本包这句只在
+  直接调工具对象时出现（所有工具同款）。
+- ⚠️ **`BUZZ_AGENT_NO_HINTS` 同时关掉技能清单与 `load_skill`**（参照物：hints 关时 skills 是空 vec ⇒
+  工具拿不到任何技能）。**未实现**：参照物在受限档还有 `read_roots` 校验（技能常在 `~/.agents/skills`，
+  在工作区之外）——本包不实现档位，与「授权责任不变」一致，见上文 granted 隔离待办。
+- 与 MCP 工具**同名**时（比如某个 server 也叫 `load_skill`）：摘掉 MCP 侧并打 ERROR（rpi 按名字取首个，
+  不处理就会静默遮蔽）。
 
 ## 内置工具（刀 2 第二批）
 
@@ -254,9 +282,6 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 
 **尚未实现（第二刀）**：
 
-- **技能目录与 `load_skill`**：`~/.agents/skills` / `<cwd>/.agents/skills` 等的发现与按需读取
-  （fork 的 `hints.rs` + `builtin.rs` 现状）。注意**不能**沿用 rpi 的默认位
-  （`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），否则既有用户的约定会静默失效；
 - `_session/steering`（现在如实声明为不支持，走 abb 的 cancel+merge 回退）；
 - `tool_call` / `tool_call_update` 通知；
 - 逐 token 流式（当前与 buzz-agent 一致：非流式，整条 `agent_message_chunk`）；
@@ -290,7 +315,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。九条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。十条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -303,6 +328,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 | `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
+| `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
