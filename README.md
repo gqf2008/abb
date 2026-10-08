@@ -11,7 +11,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 ## 为什么选 ABB
 
 - **就在你聊天的地方干活**：不用在浏览器和聊天软件之间来回切。微信里 @ 一下，它立刻回复。
-- **开箱即用**：执行层随包自带（buzz-agent），装完 ABB 就能聊，不需要再装任何命令行工具。
+- **开箱即用**：执行层随包自带（owner 会话用 `abb-agent`，授权者会话用 `buzz-agent`），装完 ABB 就能聊，不需要再装任何命令行工具。
 - **用的是你自己的模型**：接任意 Anthropic 原生 / OpenAI 兼容供应商（DeepSeek、通义、Kimi……），
   想用哪个用哪个。
 - **数据不出本机**：消息和模型都在你的电脑上流转，不经过第三方中转。
@@ -48,7 +48,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 能力 | 说明 |
 |---|---|
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
-| 随包执行层 | 内置 buzz-agent，零安装；模型走 Anthropic 原生 / OpenAI 兼容供应商（设置里自助添加） |
+| 随包执行层 | 内置 `abb-agent`（owner 且无受限档的会话）与 `buzz-agent`（授权者会话、owner 的 read-only/workspace-write 档、回滚），零安装；模型走 Anthropic 原生 / OpenAI 兼容供应商（设置里自助添加）。改回旧执行层：把 `config.buzz_agent_exe` 指向 `buzz-agent` 即可（对两种角色都生效） |
 | 模型供应商 | 设置 →「供应商」里可选并预置：`anthropic`（原生）、`openai-chat`（任意 OpenAI 兼容端点，含本地 Ollama / 自建网关）、`openai-responses`、`openrouter`（免填 `https://openrouter.ai/api/v1`）、`deepseek`（免填 `https://api.deepseek.com/v1`）；预置端点留空即用官方，填了以你填的为准（代理/网关） |
 | 内置开发工具 | 安装包随带固定版本 `rg` / `jq` / `uv` / `gh` / `wassette`，仅注入 agent 子进程 PATH；`git` / `bun` / `sed` / `find` 仍使用系统或用户环境 |
 | 多轮会话 | 每个 bot 独立记忆，不会串味；任务进行中发 `/cancel`（或「停止」等自然词）立即取消，无任务时发 `/cancel` 会给明确提示；聊天发 `/new` 立即新建会话（清空上下文，无需重启） |
@@ -144,7 +144,8 @@ ABB 本体采用 **MIT**，全文见 [LICENSE](LICENSE)。
 随包/内嵌的第三方组件保留各自的许可证，不适用本仓库的 MIT。**安装包里附带的**：
 
 - `ABB-LICENSE.txt` — ABB 本体（MIT）
-- `buzz-LICENSE.txt` — `crates/buzz-agent/`（buzz 分叉，Apache-2.0）
+- `buzz-LICENSE.txt` — `crates/buzz-agent/`（buzz 分叉，Apache-2.0；现役授权路径与回滚用）
+- `crates/abb-agent` 为 MIT（与 ABB 本体同一许可，附 `ABB-LICENSE.txt`）
 - `tools/licenses/` — 随包工具 `rg` / `jq` / `uv` / `gh` / `wassette` 及其传递依赖
 
 **只在源码树里**（不出现在安装包中）：

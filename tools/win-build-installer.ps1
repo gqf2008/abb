@@ -33,6 +33,8 @@ if ($env:CARGO_TARGET_DIR) {
 
 $rootExe = Join-Path $repo 'target\release\agent-bridge.exe'
 $forkExe = Join-Path $repo 'crates\buzz-agent\target\release\buzz-agent.exe'
+# 新执行层（owner 会话优先用它；授权者会话仍走 buzz-agent）。
+$abbAgentExe = Join-Path $repo 'crates\abb-agent\target\release\abb-agent.exe'
 
 if (-not $SkipBuild) {
   Say '构建根程序（release）…'
@@ -42,6 +44,10 @@ if (-not $SkipBuild) {
   Say '构建 fork buzz-agent（release，用 fork 自己的 target 目录）…'
   & cargo build --release --manifest-path crates/buzz-agent/Cargo.toml | Out-Host
   if ($LASTEXITCODE -ne 0) { Fail 'fork 构建失败' }
+
+  Say '构建 abb-agent（release，用本包自己的 target 目录）…'
+  & cargo build --release --manifest-path crates/abb-agent/Cargo.toml | Out-Host
+  if ($LASTEXITCODE -ne 0) { Fail 'abb-agent 构建失败' }
 }
 
 # ② 新鲜度断言：产物必须比各自源码新（源码改了却取到旧产物 = 打错包）
@@ -59,6 +65,7 @@ function Assert-Fresh($exe, $srcDir, $label) {
 }
 Assert-Fresh $rootExe (Join-Path $repo 'src') '根程序'
 Assert-Fresh $forkExe (Join-Path $repo 'crates\buzz-agent\src') 'fork buzz-agent'
+Assert-Fresh $abbAgentExe (Join-Path $repo 'crates\abb-agent\src') 'abb-agent'
 
 # 运行期同目录解析：确保 .iss 取到的就是这两份
 $version = [regex]::Match((Get-Content (Join-Path $repo 'Cargo.toml') -Raw), 'version = "([^"]+)"').Groups[1].Value

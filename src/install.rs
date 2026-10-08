@@ -1049,7 +1049,11 @@ mod installer_guards {
         );
         assert!(
             code.contains("'/F /T /IM buzz-agent.exe'"),
-            "agent 进程也要收（它锁着 buzz-agent.exe）"
+            "旧执行层也要收（它锁着 buzz-agent.exe）"
+        );
+        assert!(
+            code.contains("'/F /T /IM abb-agent.exe'"),
+            "新执行层 abb-agent 也要收（它锁着自己的 exe，且可能正跑工具子进程）"
         );
         assert!(
             code.contains("function PrepareToInstall"),
@@ -1122,6 +1126,16 @@ mod installer_guards {
                 .any(|l| l.contains("agent-bridge.exe") && l.contains("DestDir")),
             "安装包必须随带 agent-bridge.exe"
         );
+        // 执行层是两个：abb-agent（owner 会话优先）+ buzz-agent（授权者会话与回滚）。
+        // 运行时按 current_exe 同目录解析 ⇒ 少装哪一个都会在真机上表现为「agent 起不来」。
+        for exe in ["abb-agent.exe", "buzz-agent.exe"] {
+            assert!(
+                code_lines()
+                    .iter()
+                    .any(|l| l.contains(exe) && l.contains("DestDir")),
+                "安装包必须随带 {exe}（解析链按角色，两者都要在）"
+            );
+        }
         let manifest = include_str!("../Cargo.toml");
         for banned in ["abb-spawner", "abb-elev-helper", "abb-helper"] {
             assert!(
@@ -1189,7 +1203,7 @@ mod installer_guards {
             .split("[UninstallRun]")
             .nth(1)
             .expect("安装脚本必须有 [UninstallRun] 段（卸载前收工，否则文件删不掉）");
-        for exe in ["agent-bridge.exe", "buzz-agent.exe"] {
+        for exe in ["agent-bridge.exe", "buzz-agent.exe", "abb-agent.exe"] {
             assert!(
                 section.contains(exe),
                 "卸载必须结束 {exe}（否则文件被占用删不掉）"

@@ -79,6 +79,11 @@ jobs:
       - name: Build forked buzz-agent (aarch64)
         run: cargo build --release --manifest-path crates/buzz-agent/Cargo.toml --target aarch64-apple-darwin
 
+      # abb-agent（新执行层，随包线程 abb-switch-agent-exe-20261008）：owner/FullAccess 会话
+      # 优先用它；授权者（受限）会话仍走 buzz-agent（授权承担者不变），所以两个都随包。
+      - name: Build abb-agent (aarch64)
+        run: cargo build --release --manifest-path crates/abb-agent/Cargo.toml --target aarch64-apple-darwin
+
       - name: Assemble ABB.app and sign (hardened runtime + timestamp)
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
@@ -92,6 +97,9 @@ jobs:
           # #200 fork buzz-agent 同目录同规约（buzz_agent_exe 空时运行时先查同目录）——
           # 逐个 hardened runtime + timestamp 签名后随包公证
           cp crates/buzz-agent/target/aarch64-apple-darwin/release/buzz-agent ABB.app/Contents/MacOS/
+          # 新执行层同目录同规约（解析链按角色：normal 先查 abb-agent）——
+          # 与 abb-agent 自身的 Cargo.lock 一起构建；缺它则 owner 会话回落 buzz-agent。
+          cp crates/abb-agent/target/aarch64-apple-darwin/release/abb-agent ABB.app/Contents/MacOS/
           # 分叉 Apache-2.0，再分发须附 LICENSE 文本
           cp crates/buzz-agent/LICENSE ABB.app/Contents/Resources/buzz-LICENSE.txt
           cp LICENSE ABB.app/Contents/Resources/ABB-LICENSE.txt
@@ -132,6 +140,8 @@ jobs:
           # （abb-helper 已删，不再签；留着会让 v2.23.95+ 的 macOS 作业必然失败——
           #   2026-10-04 实测：Assemble ABB.app and sign 步骤找不到该文件，release 作业被跳过）
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/buzz-agent
+          # abb-agent 也会 spawn shell / MCP 子进程并可能触发 TCC（与 buzz-agent 同待遇：#251）。
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-agent
           for tool in rg jq uv gh wassette; do
             sign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
           done
@@ -212,6 +222,10 @@ jobs:
       - name: Build forked buzz-agent
         run: cargo build --release --manifest-path crates/buzz-agent/Cargo.toml
 
+      # abb-agent（新执行层）：owner 会话优先用它，授权者会话仍走 buzz-agent。
+      - name: Build abb-agent
+        run: cargo build --release --manifest-path crates/abb-agent/Cargo.toml
+
       # #331 守卫：**分发的产物**不许依赖 VC++ Redistributable。
       # 背景：用户首次安装即报「找不到 VCRUNTIME140.dll」——MSVC 默认动态 CRT，
       # 而这两个 DLL 来自 Redist，干净 Windows 上没有。修法见 .cargo/config.toml
@@ -223,12 +237,13 @@ jobs:
         run: |
           bash tools/check_dynamic_crt.sh \
             target/release/agent-bridge.exe \
-            crates/buzz-agent/target/release/buzz-agent.exe
+            crates/buzz-agent/target/release/buzz-agent.exe \
+            crates/abb-agent/target/release/abb-agent.exe
           # 可见性：把真实导入表打出来（llvm-objdump 随 rustup，取不到就跳过，不阻塞）
           if rustup component add llvm-tools-preview >/dev/null 2>&1; then
             OBJDUMP=$(find "$(rustc --print sysroot)" -type f -name 'llvm-objdump*' 2>/dev/null | head -1)
             if [ -n "$OBJDUMP" ]; then
-              for f in target/release/agent-bridge.exe crates/buzz-agent/target/release/buzz-agent.exe; do
+              for f in target/release/agent-bridge.exe crates/buzz-agent/target/release/buzz-agent.exe crates/abb-agent/target/release/abb-agent.exe; do
                 echo "── $f 的导入表："
                 "$OBJDUMP" -p "$f" | grep -i "DLL Name" || true
               done

@@ -68,6 +68,9 @@ Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; buzz_agent_exe 空时先查同目录）。分叉 Apache-2.0，再分发附 LICENSE。
 ; fake-mcp 是测试桩，不入包。buzz-acp 已随 #200 进程内化退役，不入包。
 Source: "..\crates\buzz-agent\target\release\buzz-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+; abb-agent（新执行层）：owner 会话优先用它；授权者会话仍走 buzz-agent。运行时按
+; current_exe 同目录解析（解析链按角色），所以必须与主程序同目录。
+Source: "..\crates\abb-agent\target\release\abb-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\crates\buzz-agent\LICENSE"; DestDir: "{app}"; DestName: "buzz-LICENSE.txt"; Flags: ignoreversion
 ; ABB 本体 MIT：再分发需附副本。
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "ABB-LICENSE.txt"; Flags: ignoreversion
@@ -98,6 +101,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM agent-bridge.exe"; Flags: runhidden; RunOnceId: "AbbKillBridge"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM buzz-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillBuzz"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillNewAgent"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ABB /f"; Flags: runhidden; RunOnceId: "AbbDelRunKey"
 
 [Run]
@@ -135,6 +139,8 @@ begin
   Exec('taskkill.exe', '/F /T /IM agent-bridge.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Log('ABB: 结束 agent-bridge.exe rc=' + IntToStr(Rc));
   Exec('taskkill.exe', '/F /T /IM buzz-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
+  // abb-agent（新执行层）也要收：它可能正跑着工具/shell 子进程。
+  Exec('taskkill.exe', '/F /T /IM abb-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Sleep(1200);
 end;
 
