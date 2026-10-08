@@ -138,6 +138,13 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
             Guard::None,
             workspace,
         ),
+        // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
+        exposed(
+            Arc::new(crate::delegate::DelegateTool::new(workspace)),
+            crate::delegate::DELEGATE_BARE_NAME,
+            Guard::None,
+            workspace,
+        ),
     ];
     raw
 }

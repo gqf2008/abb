@@ -60,6 +60,9 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   `BUZZ_AGENT_DEV_TOOLS=0` 时既没有内置工具也没有文件产出；末段符号链接指向工作区外时写入必须被拒
   且目标文件内容原封不动；`dev__shell` 的 `env` 快照里**不得**出现宿主凭据（`ANTHROPIC_API_KEY`
   探针哨兵）而 `PATH` 仍在；`dev__edit` 真改文件内容。
+- `delegate_round_trip.py`：`dev__delegate` 的端到端验收。判据分两处：**假 CLI 自己写下的 argv**
+  （子进程侧：必须含 `--` 分隔与 task）与**假网关第二跳里的报告正文**（模型侧）。另有「CLI 不可用
+  时给可纠偏错误」与「取消长委派 ⇒ 回合 `cancelled`、不挂死」两个场景。
 - `tool_call_notifications.py`：工具调用通知的端到端验收，**判据是 abb-agent 自己的 stdout**
   （abb 会收到的那些 `session/update`）：成功调用必须看到 `tool_call`（`pending` + `title` 限定名 +
   `rawInput`）→ `in_progress` → `completed`（带 `content` 与 `rawOutput.isError:false`）；工具**自己报错**时
