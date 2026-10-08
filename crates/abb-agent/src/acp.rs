@@ -108,7 +108,8 @@ impl Server {
                 // 与回合同理：`session/new` 里要装配 MCP（连不上的 server 会耗尽预算，
                 // 单 session 上界 20s、全体 30s），而读循环必须保持可读——abb 的
                 // 「停止」只有 5s 宽限，而且 `initialize` 也走同一条读循环。
-                // 顺序无虞：abb 在收到 `session/new` 应答之前不会发 `session/prompt`。
+                // 顺序无虞：abb 在收到 `session/new` 应答之前不会发 `session/prompt`
+                // （真提前发了会得到 `-32001 未知会话`，属协议误用）。
                 "session/new" => {
                     let server = Arc::clone(self);
                     tokio::spawn(async move {
@@ -119,8 +120,8 @@ impl Server {
                     });
                     Ok(())
                 }
-                // 只有回合走独立任务：它是唯一的长任务，也是 `session/cancel`
-                // 必须能在其运行期间被处理的原因。
+                // 长任务（回合、装配）都走独立任务：它们是 `session/cancel` 必须在
+                // 其运行期间仍可被处理的原因（读循环保持可读）。
                 //
                 // **`in_flight` 必须在读循环里同步抢**（而不是在 spawn 出去的任务里）：
                 // 否则同一 burst 中紧随其后的 `session/cancel` 会被读循环先读到，而那时

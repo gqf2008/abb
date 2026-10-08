@@ -286,6 +286,11 @@ async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<Too
     // 工作目录 = 会话工作区（abb 在 `session/new` 里下发的 `cwd`）。不设的话子进程落在
     // abb-agent 自己的 cwd 上，工具做相对路径 / git 操作会静默打错目标。
     if !cwd.is_empty() {
+        // 先验一次：不验的话，cwd 不存在时 spawn 的报错是「No such file or directory」，
+        // 会被读成「命令不存在」，排查时指错方向。
+        if !std::path::Path::new(cwd).is_dir() {
+            return Err(format!("会话工作区不是目录：cwd={cwd}"));
+        }
         cmd.current_dir(cwd);
     }
     // 关掉继承来的 stdin/stdout 语义：MCP 的 stdio 传输要独占这三个管道，
@@ -296,8 +301,8 @@ async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<Too
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
 
-    let transport =
-        TokioChildProcess::new(cmd).map_err(|error| format!("spawn {}: {error}", spec.command))?;
+    let transport = TokioChildProcess::new(cmd)
+        .map_err(|error| format!("spawn {} (cwd={cwd}): {error}", spec.command))?;
     // 超时不在这里做：调用方用 [`CONNECT_BUDGET_PER_SERVER`] 包住整个装配，
     // 这样 initialize 花掉的时间会从 tools/list 的额度里扣——「每 server 20s」才是真话。
     let client: Client = ().serve(transport).await.map_err(|error| format!("initialize: {error}"))?;
@@ -503,8 +508,16 @@ fn flatten_text(content: &[rmcp::model::Content]) -> String {
 fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrImage> {
     let mut out: Vec<TextContentOrImage> = Vec::new();
     let mut text = String::new();
+    // `used` 记的是**文本 + 图片合计**的用量（与文档注释、被替代组件的 `ResultBudget.total`
+    // 同义）。只记图片的话，文本额度会随每次 flush 重新拿满，多段交替内容能线性堆出任意大
+    // 的工具结果（实测 `[image, 200 KiB text] × 300` ⇒ 15.3 MB 真的被发出去）。
     let mut used = 0usize;
+    let mut truncated = false;
     for item in content {
+        if used >= TOOL_RESULT_TOTAL_BYTES {
+            truncated = true;
+            break;
+        }
         let Ok(value) = serde_json::to_value(item) else {
             continue;
         };
@@ -519,7 +532,7 @@ fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrIma
                 }
             }
             "image" => {
-                flush_text(&mut out, &mut text);
+                flush_text(&mut out, &mut text, &mut used);
                 let data = value
                     .get("data")
                     .and_then(Value::as_str)
@@ -549,19 +562,25 @@ fn tool_result_content(content: &[rmcp::model::Content]) -> Vec<TextContentOrIma
             other => push_line(&mut text, &format!("[{other} 内容] {value}")),
         }
     }
-    flush_text(&mut out, &mut text);
+    flush_text(&mut out, &mut text, &mut used);
+    if truncated {
+        out.push(TextContentOrImage::text(format!(
+            "[... 工具结果已达总预算（{} 字节），其余内容已省略 ...]",
+            TOOL_RESULT_TOTAL_BYTES
+        )));
+    }
     out
 }
 
-/// 累积的文本按行拼接，收尾时按文本预算省略中间。
-fn flush_text(out: &mut Vec<TextContentOrImage>, text: &mut String) {
+/// 累积的文本按行拼接，收尾时按**剩余合计预算**与文本预算的较小者省略中间。
+fn flush_text(out: &mut Vec<TextContentOrImage>, text: &mut String, used: &mut usize) {
     if text.is_empty() {
         return;
     }
-    out.push(TextContentOrImage::text(elide_middle(
-        text,
-        TOOL_RESULT_TEXT_BYTES,
-    )));
+    let allowance = TOOL_RESULT_TEXT_BYTES.min(TOOL_RESULT_TOTAL_BYTES.saturating_sub(*used));
+    let piece = elide_middle(text, allowance);
+    *used = used.saturating_add(piece.len());
+    out.push(TextContentOrImage::text(piece));
     text.clear();
 }
 
@@ -721,6 +740,39 @@ mod tests {
             }
             other => panic!("图片必须保留成 image part，实际：{other:?}"),
         }
+    }
+
+    /// 回归锁：文本必须计入**合计**预算。
+    ///
+    /// 修前的实现只把图片字节记进 `used`，于是每段文本都能重新拿满一份 50 KiB 额度，
+    /// `[image, text] × N` 能线性堆出任意大的工具结果（评审实测 15.3 MB 真的被发出去）。
+    #[test]
+    fn total_budget_counts_text_and_images_together() {
+        let image_data = "A".repeat(3 * 1024 * 1024);
+        let mut content = Vec::new();
+        for _ in 0..3 {
+            content.push(
+                serde_json::from_value::<rmcp::model::Content>(serde_json::json!({
+                    "type": "image",
+                    "data": image_data,
+                    "mimeType": "image/png",
+                }))
+                .expect("image 内容应能反序列化"),
+            );
+            content.push(rmcp::model::Content::text("T".repeat(200 * 1024)));
+        }
+        let parts = tool_result_content(&content);
+        let total: usize = parts
+            .iter()
+            .map(|part| match part {
+                TextContentOrImage::Text(text) => text.text.len(),
+                TextContentOrImage::Image(image) => image.data.len() + image.mime_type.len(),
+            })
+            .sum();
+        assert!(
+            total <= TOOL_RESULT_TOTAL_BYTES + 4096,
+            "合计预算必须把文本算进去：{total} > {TOOL_RESULT_TOTAL_BYTES}"
+        );
     }
 
     #[test]

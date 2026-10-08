@@ -14,7 +14,9 @@
 - `--dump-env <path>`：启动时把自己的 **cwd 与全量环境** 写成 JSON，供探针断言
   「白名单 `/ spec.env` 生效」与「供应商凭据没被继承」；
 - `--hang-init`：收到 `initialize` 后**永不回包**，用来把装配预算耗满
-  （验证这期间读循环仍然可读、且 `session/new` 会在预算内收尾）。
+  （验证这期间读循环仍然可读、且 `session/new` 会在预算内收尾）；
+- `--image-data <base64>`：`tools/call` 的结果里除文本外再带一个 `image/png` 内容块
+  （验证工具结果里的图片真能到模型，而不是被降级成 base64 正文或占位文本）。
 """
 import json
 import os
@@ -42,6 +44,7 @@ def dump_env(path):
 def main():
     record_path = None
     dump_path = None
+    image_data = None
     hang_init = False
     argv = sys.argv[1:]
     for i, item in enumerate(argv):
@@ -49,6 +52,8 @@ def main():
             record_path = argv[i + 1]
         elif item == "--dump-env" and i + 1 < len(argv):
             dump_path = argv[i + 1]
+        elif item == "--image-data" and i + 1 < len(argv):
+            image_data = argv[i + 1]
         elif item == "--hang-init":
             hang_init = True
 
@@ -101,15 +106,15 @@ def main():
             params = msg.get("params") or {}
             arguments = params.get("arguments") or {}
             record(record_path, {"tool": params.get("name"), "arguments": arguments})
+            content = [
+                {"type": "text", "text": f"echo: {json.dumps(arguments, ensure_ascii=False)}"}
+            ]
+            if image_data:
+                content.append({"type": "image", "data": image_data, "mimeType": "image/png"})
             reply = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": f"echo: {json.dumps(arguments, ensure_ascii=False)}"}
-                    ],
-                    "isError": False,
-                },
+                "result": {"content": content, "isError": False},
             }
         elif method and method.startswith("notifications/"):
             continue  # 通知无需应答

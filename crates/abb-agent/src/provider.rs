@@ -43,6 +43,7 @@ use rpi_ai::providers::anthropic::AnthropicProvider;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 use rpi_ai::providers::openai_completions::OpenAiCompletionsProvider;
 use rpi_ai::providers::openai_responses::OpenAiResponsesProvider;
+use rpi_ai::types::InputModality;
 use rpi_ai::{Api, Model, Provider};
 
 /// abb 回合作数的环境变量名（abb 恒送，默认 200）。
@@ -293,9 +294,20 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
 }
 
 /// **显式构造**模型：id / 端点全由调用方给定，不查内置目录。
+///
+/// `input` **必须显式声明支持图片**：rpi 按 `Model::input` 对工具结果里的图片做能力门控
+/// （anthropic 的 `build_params.rs::supports_images`、openai 的
+/// `openai_completions.rs` 都看 `input.contains(&InputModality::Image)`）。而
+/// `Model::new` 只给 `vec![Text]` ⇒ 不声明的话，MCP 工具回回来的图片在两条 provider
+/// 路径上都会被 rpi 换成占位文本（`(see attached image)` / `(tool image omitted: …)`），
+/// 模型既看不到图、又被指去看一个不存在的东西。
+///
+/// 为什么默认开：图片只会在「MCP 工具确实返回了图」时出现，与 abb 把图片当工具结果传下来的
+/// 意图一致；真不支持的模型会在上游如实报错，比默默替模型决定了强。
 fn custom_model(id: &str, api: Api, provider_id: &str, base_url: &str, max_tokens: u64) -> Model {
     let mut model = Model::new(id, id, api, provider_id, base_url);
     model.max_tokens = max_tokens;
+    model.input = vec![InputModality::Text, InputModality::Image];
     model
 }
 

@@ -163,6 +163,34 @@ if elapsed_new:
 agent.close()
 
 print()
+print("=== 场景 3：两个挂死的 server ⇒ 被总预算（30s）截断，且 initialize 延迟后仍可读 ===")
+agent = Agent(base_env())
+agent.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+agent.wait(1, 10)
+agent.send({
+    "jsonrpc": "2.0", "id": 2, "method": "session/new",
+    "params": {
+        "cwd": WORKDIR,
+        "mcpServers": [
+            {"name": "hung1", "command": sys.executable, "args": [SERVER, "--hang-init"], "env": []},
+            {"name": "hung2", "command": sys.executable, "args": [SERVER, "--hang-init"], "env": []},
+        ],
+    },
+})
+# 装配**已经开始之后**再发（避免「它恰好在装配开始前就应答了」的假通过）。
+time.sleep(1.0)
+agent.send({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})
+elapsed_init, resp_init = agent.wait(3, 45)
+elapsed_new, resp_new = agent.wait(2, 45)
+check("装配已开始后 initialize 仍被处理",
+      bool(resp_init) and elapsed_init is not None and elapsed_init < 5,
+      f"{elapsed_init:.2f}s（装配已跑 1s）" if elapsed_init else "无应答")
+check("两个挂死 server 被总预算截断（≤ 30s + 余量）",
+      bool(resp_new) and elapsed_new is not None and elapsed_new <= 35,
+      f"{elapsed_new:.2f}s（修前同形状 70.1s）" if elapsed_new else "无应答")
+agent.close()
+
+print()
 if failures:
     print(f"⇒ 判定：❌ 失败 {len(failures)} 项：{failures}")
     sys.exit(1)
