@@ -478,6 +478,10 @@ mod tests {
     }
 
     /// 支持文件发现后被换成指向技能目录外的符号链接 ⇒ 读取时必须拒绝。
+    ///
+    /// 整条挂 `#[cfg(unix)]`：体内 `#[cfg(not(unix))] return` 会在 Windows 上留下
+    /// unused variable + unreachable statement，而 Windows 作业 clippy 是 `-D warnings`。
+    #[cfg(unix)]
     #[test]
     fn load_refuses_supporting_file_swapped_to_outside_symlink() {
         let cwd = temp_dir("symlink");
@@ -488,13 +492,8 @@ mod tests {
 
         let outside = temp_dir("symlink-outside").join("secret.md");
         std::fs::write(&outside, "工作区外的秘密").expect("写");
-        #[cfg(unix)]
-        {
-            std::fs::remove_file(skill_dir.join("ref.md")).expect("删原文件");
-            std::os::unix::fs::symlink(&outside, skill_dir.join("ref.md")).expect("建链接");
-        }
-        #[cfg(not(unix))]
-        return;
+        std::fs::remove_file(skill_dir.join("ref.md")).expect("删原文件");
+        std::os::unix::fs::symlink(&outside, skill_dir.join("ref.md")).expect("建链接");
 
         let result = load("demo/ref.md", &skills);
         assert!(

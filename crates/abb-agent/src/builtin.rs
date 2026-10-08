@@ -681,6 +681,11 @@ mod tests {
 
     /// **末段是符号链接**时必须拒绝：`fs::write` 会跟随链接写到工作区外
     /// （只 canonicalize 父目录挡不住这一形状）。参照物在同一形状上也是显式拒绝。
+    ///
+    /// **整条挂 `#[cfg(unix)]`**（而不是在体内 `#[cfg(not(unix))] return`）：后者在 Windows 上
+    /// 会留下「只被 cfg(unix) 块用到的 `let link`」与 `return` 之后的不可达语句，而
+    /// `abb-agent-windows` 作业的 clippy 是 `-D warnings` ⇒ 直接把 CI 弄红（评审实测 7 条）。
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_confinement_rejects_symlinked_file_escape() {
         let workspace = temp_workspace("symlink-file");
@@ -688,12 +693,7 @@ mod tests {
         let outside_file = outside.join("target.txt");
         std::fs::write(&outside_file, "ORIGINAL").expect("建工作区外文件");
         let link = workspace.join("link.txt");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_file, &link).expect("建符号链接文件");
-        #[cfg(not(unix))]
-        {
-            return; // Windows 建符号链接需特权，跳过（由父目录逃逸那条覆盖）
-        }
         let attempt = confine_write_path(&workspace, "link.txt").await;
         assert!(attempt.is_err(), "末段符号链接必须被拒：{attempt:?}");
         // 目标文件必须原封不动（这条断言才是「没写穿」的判据）。
@@ -704,18 +704,13 @@ mod tests {
     }
 
     /// 符号链接父目录指向工作区外时也要拦住（canonicalize 之后再比前缀）。
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_confinement_rejects_symlinked_parent_escape() {
         let workspace = temp_workspace("symlink");
         let outside = temp_workspace("symlink-outside");
         let link = workspace.join("link");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, &link).expect("建符号链接");
-        #[cfg(not(unix))]
-        {
-            // Windows 上建目录符号链接需要特权：跳过这条，由前缀判据那条覆盖。
-            return;
-        }
         let attempt = confine_write_path(&workspace, "link/escape.txt").await;
         assert!(attempt.is_err(), "符号链接逃逸必须被拒：{attempt:?}");
     }

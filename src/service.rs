@@ -70,19 +70,30 @@ fn pick_command_by_sandbox<'a>(role_cmds: (&'a str, &'a str), needs_sandbox: boo
     }
 }
 
+/// **切换的核心映射**：角色 → 随包候选名（按顺序试）。
+///
+/// `owner = true`（无受限档的 owner 会话）：优先新执行层 `abb-agent`，回落旧层（回滚形态）；
+/// `owner = false`（授权者会话，或 owner 带受限档）：**只认旧层** `buzz-agent`。
+/// 抽成函数是为了让「哪条角色配哪些名字」有可断言的锁——此前它内联在 `resolve_acp_commands` 里，
+/// 只有一条用**测试自写名字数组**的测试间接覆盖（评审 M6 实测：把角色两边的名字对调，全量门禁全绿）。
+fn bundled_names_for_role(owner: bool) -> &'static [&'static str] {
+    if owner {
+        &[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT]
+    } else {
+        &[GRANTED_BUNDLED_AGENT]
+    }
+}
+
 /// 按**角色**解析出两条命令（normal / granted）。覆盖对两者都生效；
 /// 随包缺失时各自回落 PATH `pi-acp`（开发/自签构建）。
 fn resolve_acp_commands(override_exe: &str) -> (String, String) {
+    // **必须经 `bundled_names_for_role`**：映射若被内联回数组，那个函数就 dead（root clippy
+    // 会以 dead_code 报红），而「角色 → 名字」这条锁也就落空了（评审 M6 实测过这种缝）。
     let normal = resolve_acp_command(
-        resolve_buzz_agent_in_dir(
-            override_exe,
-            &[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT],
-            None,
-        )
-        .as_deref(),
+        resolve_buzz_agent_in_dir(override_exe, bundled_names_for_role(true), None).as_deref(),
     );
     let granted = resolve_acp_command(
-        resolve_buzz_agent_in_dir(override_exe, &[GRANTED_BUNDLED_AGENT], None).as_deref(),
+        resolve_buzz_agent_in_dir(override_exe, bundled_names_for_role(false), None).as_deref(),
     );
     (normal, granted)
 }
@@ -2029,10 +2040,11 @@ mod tests {
     /// 就必须落在旧执行层——abb-agent 如实不声明 `_meta.abbSandbox`，abb 对带
     /// `session_sandbox` 的会话是 fail-closed（`pool.rs` 拒建）。
     ///
-    /// 三条建会话路径（聊天句柄 / oneshot / task 角色剖面）都经这个纯函数；**每条路径各有一条
-    /// 接线测试**（`chat_handles_route_sandboxed_sessions_to_the_old_layer`、
-    /// `oneshot_paths_follow_the_sandbox_invariant`），所以「档位 ⇒ 命令槽」这条不变量有
-    /// 可复跑的锁，而不只是纯函数层面的约定。
+    /// 三条建会话路径（聊天句柄 / oneshot 公共包装 / task 角色剖面）都经这个纯函数，且**各自
+    /// 都有接线测试**：`chat_handles_route_sandboxed_sessions_to_the_old_layer`（聊天句柄，四种
+    /// `sandbox_mode`）、`oneshot_paths_follow_the_sandbox_invariant`（注入式内层，覆盖 oneshot
+    /// 与 granted 任务两种角色）、`public_oneshot_wrapper_keeps_the_sandbox_and_the_right_slot`
+    /// （公共包装不丢档位）。评审用变异实测过：任一条路径的接线被改坏，对应的那条测试立刻红。
     #[test]
     fn sessions_needing_a_sandbox_always_use_the_old_layer() {
         let cmds = ("/bin/abb-agent", "/bin/buzz-agent");
@@ -2080,6 +2092,48 @@ mod tests {
         assert_eq!(
             c.command, "/bin/buzz-agent",
             "granted 任务的档位必须落在旧执行层"
+        );
+    }
+
+    /// M6 的锁：角色 → 随包候选名（owner 优先 abb-agent；granted 只认 buzz-agent）。
+    #[test]
+    fn role_to_bundled_names_mapping_is_locked() {
+        assert_eq!(
+            bundled_names_for_role(true),
+            [NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT],
+            "owner 会话必须优先新执行层、并能回落旧层"
+        );
+        assert_eq!(
+            bundled_names_for_role(false),
+            [GRANTED_BUNDLED_AGENT],
+            "授权者/带档位会话只认旧层——把 abb-agent 放进来就会被 abb 的硬闸拒建"
+        );
+    }
+
+    /// M5 的锁：**公共薄包装** `oneshot_agent_config` 不许丢档位、也不许用错命令槽。
+    ///
+    /// 诚实说明判据强度：`command` 这一半在本机（无随包目录）两条槽都回落 `pi-acp`，
+    /// 所以它只能证明「包装确实走了 `pick_command_by_sandbox`」；真正区分两条槽的是
+    /// `chat_handles_route_sandboxed_sessions_to_the_old_layer` 与
+    /// `oneshot_paths_follow_the_sandbox_invariant`（注入式内层）。**档位那半是非空断言、不空转**。
+    #[test]
+    fn public_oneshot_wrapper_keeps_the_sandbox_and_the_right_slot() {
+        let bot = crate::config::BotConfig {
+            name: "wrapper".into(),
+            sandbox_mode: crate::config::SandboxMode::ReadOnly,
+            ..crate::config::BotConfig::default()
+        };
+        let cfg = Config::default();
+        let c = oneshot_agent_config(&bot, &cfg);
+        assert!(
+            c.session_sandbox.is_some(),
+            "公共薄包装丢掉档位 ⇒ owner 的 read-only 维护任务会静默变成无闸（评审 M5 实测全绿的那种缝）"
+        );
+        let (owner_cmd, old_cmd) = resolve_acp_commands(&cfg.buzz_agent_exe);
+        assert_eq!(
+            c.command,
+            pick_command_by_sandbox((&owner_cmd, &old_cmd), true),
+            "带档位的 oneshot 必须走旧执行层槽"
         );
     }
 
