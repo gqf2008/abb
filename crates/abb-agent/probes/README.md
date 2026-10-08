@@ -33,7 +33,8 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
   工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分
   「工具被调用」与「模型自己编了答案」。
-- `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。  另有 `--dump-env <path>`（落盘自己的 cwd + 全量 env）与 `--hang-init`（`initialize` 永不回包）
+- `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。
+  另有 `--dump-env <path>`（落盘自己的 cwd + 全量 env）与 `--hang-init`（`initialize` 永不回包）
   两个开关，供下面那条隔离/预算探针使用。
 - `mcp_isolation_and_budget.py`（配 `fake_mcp_server.py`）：第四轮评审（`abb-reviewer-61`）判
   needs-changes 的两类偏离的复现实验。场景 1 断言**子进程真的没继承供应商凭据**（判据是假

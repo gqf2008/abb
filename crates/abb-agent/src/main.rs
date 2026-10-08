@@ -17,7 +17,15 @@ use abb_agent::wire::{parse_line, Reader, Writer};
 async fn main() -> std::process::ExitCode {
     init_logging();
 
-    let server = Arc::new(Server::new(Writer::new(Box::new(tokio::io::stdout()))));
+    // 配置错误要**响亮失败**（与被替代组件的 `die()` 同款，exit 2）：`BUZZ_AGENT_NO_HINTS`
+    // 只在进程级收口「授权者看不到 owner 私有约定」，读不懂就不能拿它赌。
+    let server = match Server::try_new(Writer::new(Box::new(tokio::io::stdout()))) {
+        Ok(server) => Arc::new(server),
+        Err(reason) => {
+            tracing::error!("启动拒绝：{reason}");
+            return std::process::ExitCode::from(2);
+        }
+    };
     let mut reader = Reader::new(Box::new(tokio::io::stdin()));
 
     loop {

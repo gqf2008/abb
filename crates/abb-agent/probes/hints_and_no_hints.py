@@ -91,8 +91,14 @@ def system_text(body):
     return ""
 
 
+rc = {"last": None}
+
+
 def run_turn(cwd, home, extra_env):
-    """起一个 abb-agent，跑一次 initialize/session/new/prompt，返回那条回合请求体。"""
+    """起一个 abb-agent，跑一次 initialize/session/new/prompt。
+
+    返回该回合的请求体（没有则 None）；进程退出码见 `rc["last"]`（配置错误场景用）。
+    """
     before = len(bodies)
     env = dict(os.environ)
     env.update({
@@ -118,8 +124,13 @@ def run_turn(cwd, home, extra_env):
     ).start()
 
     def send(obj):
-        proc.stdin.write(json.dumps(obj) + "\n")
-        proc.stdin.flush()
+        """写一行；进程已退出（配置错误场景）时返回 False 而不是抛 BrokenPipe。"""
+        try:
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
 
     def wait(msg_id, timeout):
         end = time.time() + timeout
@@ -130,22 +141,28 @@ def run_turn(cwd, home, extra_env):
             time.sleep(0.02)
         return None, None
 
-    send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    wait(1, 10)
-    send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-          "params": {"cwd": cwd, "mcpServers": []}})
-    _, resp = wait(2, 20)
-    session_id = (resp or {}).get("result", {}).get("sessionId", "abb-1")
-    send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
-          "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]}})
-    wait(3, 30)
+    if send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}):
+        wait(1, 10)
+        if send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                 "params": {"cwd": cwd, "mcpServers": []}}):
+            _, resp = wait(2, 20)
+            session_id = (resp or {}).get("result", {}).get("sessionId", "abb-1")
+            send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                  "params": {"sessionId": session_id,
+                             "prompt": [{"type": "text", "text": "你好"}]}})
+            wait(3, 30)
     try:
         proc.stdin.close()
     except Exception:
         pass
-    time.sleep(0.3)
-    proc.kill()
-    return bodies[before] if len(bodies) > before else None
+    try:
+        code = proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+        code = None
+    rc["last"] = code
+    body = bodies[before] if len(bodies) > before else None
+    return body
 
 
 def make_cwd(with_agents_md):
@@ -199,6 +216,25 @@ else:
     check("不出现空标题/噪声",
           "# Additional Instructions" not in system and "Project Hints" not in system)
     check("默认系统提示仍在", "ABB（agent-bridge）的执行层 agent" in system)
+
+print()
+print("=== 场景 4：读法对齐 fork（非零即关）===")
+body = run_turn(make_cwd(True), make_home(True), {"BUZZ_AGENT_NO_HINTS": "2"})
+if not body:
+    check("回合请求到达假端点", False)
+else:
+    system = system_text(body)
+    check("NO_HINTS=2 也判为关闭（fork 是 parse u8 + 非零即关）",
+          CWD_MARKER not in system and HOME_MARKER not in system)
+    check("默认系统提示仍在", "ABB（agent-bridge）的执行层 agent" in system)
+
+print()
+print("=== 场景 5：读不懂的取值必须响亮失败（不能静默当「没关」）===")
+for bad in ("true", "yes", "-1", "256", " 1 "):
+    body = run_turn(make_cwd(True), make_home(True), {"BUZZ_AGENT_NO_HINTS": bad})
+    check(f"NO_HINTS={bad!r} 时不发任何模型请求（约定不可能外泄）", body is None)
+    check(f"NO_HINTS={bad!r} 时进程以 2 退出（与 fork 的 die() 同款）",
+          rc["last"] == 2, f"rc={rc['last']}")
 
 print()
 if failures:

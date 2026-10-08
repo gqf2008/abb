@@ -25,17 +25,34 @@ const MAX_HINTS_BYTES: usize = 128 * 1024;
 /// 相对会话工作目录的约定文件名。
 const HINTS_FILE: &str = "AGENTS.md";
 
-/// `BUZZ_AGENT_NO_HINTS` 的读法：只有字面 `1` 表示关闭。
+/// `BUZZ_AGENT_NO_HINTS` 的读法：**逐条对齐 fork**。
 ///
-/// 与 fork 一致（它把该变量解析成 u8 并判 `== 0`）：任何其它取值（含 `0`、空串、非法值）
-/// 都视为「没关」。**为什么不把 `true`/`yes` 也算关闭**：abb 只发 `1`，多认形式会让
-/// 「gate 是否生效」多出没人维护的分支；要扩就与 abb 一起扩。
-pub fn hints_enabled_from(value: Option<&str>) -> bool {
-    value.map(|raw| raw.trim()) != Some("1")
+/// fork 是 `parse_env("BUZZ_AGENT_NO_HINTS", 0u8)? == 0`，而 `parse_env` 用 `str::parse`
+/// 且**不 trim**；读不懂的值在 `Config::from_env()` 里被 `die()`（= `exit(2)`）。
+/// 也就是：「未设置 / `0` ⇒ 开；任何**非零**（`1`/`2`/`01`/`+1`/` 1 `）⇒ 关；读不懂 ⇒ 响亮失败」。
+///
+/// 本包为什么不能只认字面 `1`（上一版就是那么写的，被评审实测证伪）：那个写法把
+/// `2`/`01`/`true`/`""` 全当「没关」，而 `true`/`2`/`01` 在 fork 下是关——方向是
+/// **静默 fail-open**（owner 的 `~/AGENTS.md` 会被发给授权者）。
+/// 回到「非零即关 + 读不懂就拒绝启动」，两边就不再有「关与不关」的判定差。
+pub fn hints_enabled_from(value: Option<&str>) -> Result<bool, String> {
+    // fork 的 `env()` 对未设置返回 default（默认值 0）而不是报错。
+    let raw = value.unwrap_or("0");
+    match raw.parse::<u8>() {
+        Ok(0) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(format!(
+            "{NO_HINTS_ENV}={raw:?} 无法解析为 0..=255（{error}）——按被替代组件同款口径拒绝启动：\
+             该变量只在进程级收口「授权者看不到 owner 私有约定」，读不懂就不能拿它赌"
+        )),
+    }
 }
 
-/// 从环境源判约定链开关（可注入版本，便于单测不改进程全局 env）。
-pub fn hints_enabled(env: &dyn EnvSource) -> bool {
+/// 从环境源判定约定链开关（可注入版本，便于单测不改进程全局 env）。
+///
+/// `Err` = 配置错误，调用方应当**响亮失败**（`main` 里退出，与 fork 的 `die()` 同款）：
+/// 静默降级会把「授权者会不会看到 owner 私有约定」变成掷骰子。
+pub fn hints_enabled(env: &dyn EnvSource) -> Result<bool, String> {
     hints_enabled_from(env.get(NO_HINTS_ENV).as_deref())
 }
 
@@ -123,6 +140,10 @@ fn load_hint_files(cwd: &Path, home: Option<&Path>) -> String {
 /// **不给标题**：fork 的 `# Additional Instructions` 段里还含技能列表，
 /// 本包首批只做约定链（技能与 `load_skill` 随内置工具那批落地），所以标题交给调用方
 /// 按「有没有内容」决定，避免出现一个空标题。
+///
+/// `cwd` 按调用方给的原值使用（**包括空串**）：空串时与 fork 同行为——`chain` 退化成
+/// `[""]`，只读进程工作目录那一层，**不**向其祖先链扩散。上一版在这里用
+/// `current_dir()` 回落，实测会多读进程 cwd 的 git 根到 cwd 整条链（与参照物不同）。
 pub fn hints_section(cwd: &Path) -> String {
     hints_section_with_home(cwd, home_dir().as_deref())
 }
@@ -156,19 +177,57 @@ mod tests {
         std::fs::write(path, content).expect("写文件");
     }
 
+    /// 读法逐条对齐 fork：`parse::<u8>()`（不 trim + 非零即关 + 读不懂就报错）。
+    ///
+    /// 上一版「只认字面 1」被评审实测证伪：`2`/`01`/`true`/`""` 在 fork 下是**关**、在本包
+    /// 是「开」，方向是静默 fail-open（owner 的约定会被发给授权者）。
     #[test]
-    fn only_literal_one_disables_hints() {
-        assert!(hints_enabled_from(None), "默认必须开启（与 fork 同）");
-        assert!(hints_enabled_from(Some("0")));
-        assert!(hints_enabled_from(Some("")));
-        assert!(
-            hints_enabled_from(Some("true")),
-            "多认形式会多出没人维护的分支"
+    fn no_hints_reading_matches_the_replaced_component() {
+        assert_eq!(
+            hints_enabled_from(None),
+            Ok(true),
+            "未设置必须开启（fork 默认 0）"
         );
-        assert!(!hints_enabled_from(Some("1")));
+        assert_eq!(hints_enabled_from(Some("0")), Ok(true));
+        for off in ["1", "2", "255", "01", "+1", "0001"] {
+            assert_eq!(
+                hints_enabled_from(Some(off)),
+                Ok(false),
+                "{off:?} 应判为关闭"
+            );
+        }
+        // fork 的 `parse::<u8>()` 不 trim ⇒ 带空白的 `" 1 "` 也是配置错误（不是「关」）。
+        for bad in ["", "true", "yes", "-1", "256", "1\n", " 1 "] {
+            assert!(
+                hints_enabled_from(Some(bad)).is_err(),
+                "{bad:?} 在 fork 下是配置错误（exit 2），本包不能静默当没关"
+            );
+        }
+    }
+
+    /// 空 cwd 的回落必须与 fork 同行为：只读**进程工作目录那一层**，不向祖先链扩散。
+    ///
+    /// 上一版在 acp.rs 里用 `current_dir()` 回落，实测会多读「进程 cwd 的 git 根 → cwd」
+    /// 整条链（评审用差分台比出来）。这里把回落目标本身钉住：传 `""` 时链退化成 `[""]`。
+    #[test]
+    fn empty_cwd_reads_only_one_layer_like_the_replaced_component() {
+        let root = temp_dir("emptycwd");
+        std::fs::create_dir_all(root.join(".git")).expect("建 .git");
+        let sub = root.join("inner");
+        std::fs::create_dir_all(&sub).expect("建子目录");
+        write(&root.join("AGENTS.md"), "根约定不该被空 cwd 读到");
+        write(&sub.join("AGENTS.md"), "单层约定");
+
+        let previous = std::env::current_dir().expect("取进程 cwd");
+        // 把进程 cwd 换到 sub：模拟「空 cwd ⇒ 相对路径读当前目录」。
+        std::env::set_current_dir(&sub).expect("切 cwd");
+        let text = hints_section_with_home(Path::new(""), None);
+        std::env::set_current_dir(previous).expect("还原 cwd");
+
+        assert!(text.contains("单层约定"), "{text}");
         assert!(
-            !hints_enabled_from(Some(" 1 ")),
-            "abb 发的是精确的 \"1\"，两端空白不该改变判定"
+            !text.contains("根约定不该被空 cwd 读到"),
+            "空 cwd 不得向祖先链扩散：{text}"
         );
     }
 

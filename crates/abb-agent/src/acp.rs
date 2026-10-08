@@ -93,11 +93,25 @@ impl Server {
     /// 注入式构造：把后端选择与进程 env 解耦，便于测试直接给一个 faux 后端
     /// （不在测试里改进程全局 env——那会让并行用例互相踩）。
     pub fn with_backend(writer: Writer, backend: Result<Backend, String>) -> Self {
-        Self::with_backend_and_hints(
+        Self::with_backend_and_hints(writer, backend, true)
+    }
+
+    /// 生产入口：读进程环境决定约定链开关。
+    ///
+    /// `BUZZ_AGENT_NO_HINTS` 读不懂时**响亮失败**（`Err`，`main` 据此 exit 2）——与被替代
+    /// 组件的 `die()` 同款。静默降级会把「授权者会不会看到 owner 私有约定」变成掷骰子。
+    pub fn try_new(writer: Writer) -> Result<Self, String> {
+        Self::try_new_with(writer, &provider::ProcessEnv)
+    }
+
+    /// [`Self::try_new`] 的可注入版本（单测不改进程全局 env）。
+    pub fn try_new_with(writer: Writer, env: &dyn provider::EnvSource) -> Result<Self, String> {
+        let hints_enabled = crate::hints::hints_enabled(env)?;
+        Ok(Self::with_backend_and_hints(
             writer,
-            backend,
-            crate::hints::hints_enabled(&provider::ProcessEnv),
-        )
+            provider::select_with(env),
+            hints_enabled,
+        ))
     }
 
     /// 可注入约定链开关的构造（单测用：不改进程全局 env）。
@@ -250,11 +264,9 @@ impl Server {
         // （`src/buzz/pool.rs` 的 `channel.workspace.unwrap_or(cwd)`），同一台机器上
         // 不同会话本就该看不同目录的约定。为真时结果可能为空（没有任何 AGENTS.md）。
         let hints = if self.hints_enabled {
-            let cwd = if parsed.cwd.is_empty() {
-                std::env::current_dir().unwrap_or_default()
-            } else {
-                std::path::PathBuf::from(&parsed.cwd)
-            };
+            // 用**原值**（含空串）：空 cwd 时与被替代组件同行为——只读进程工作目录那一层，
+            // 不向祖先链扩散（上一版在这里 `current_dir()` 回落，实测评审会多读整条链）。
+            let cwd = std::path::PathBuf::from(&parsed.cwd);
             crate::hints::hints_section(&cwd)
         } else {
             String::new()
