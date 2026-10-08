@@ -71,6 +71,10 @@ token**。若 cancel 在回合任务**被 poll 之前**就到，那一次 abort 
 | `ABB_AGENT_FAUX_TOOL` | 离线通道之二：JSON `{"name":…,"arguments":…}`，先发一次工具调用再把 `ABB_AGENT_FAUX_TEXT` 当文本回复。用于无 key 验证「模型 → 工具 → 结果回灌」 |
 | `RUST_LOG` | 日志级别（默认 `info`；**日志只走 stderr**，stdout 是 ACP 协议通道） |
 
+⚠️ 两个 `ABB_AGENT_FAUX_*` 是**进程级覆盖**：只要环境里存在，就会**静默**把生产从真供应商切到
+离线 faux（abb 起 agent 时只 `env(k, v)` 注入、不 `env_clear()`，所以外部导出的变量会一路透传）。
+abb 主体零引用它们，但排查时先确认它们不存在。
+
 ### 模型 id 不查目录（重要）
 
 模型是用 `Model::new(id, name, api, provider, base_url)` **显式构造**的，与 rpi 官方对
@@ -109,19 +113,36 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
   `{name, command, args, env:[{name,value}]}`）。**第一刀连 `params` 都不读**，abb 送的 server
   列表被静默丢弃——现在会解析、`mcpServers` 形状不对则回 `-32005` 而不是当成空列表。
 - 工具以 **`{server}__{tool}`** 的限定名暴露给模型（与被替代组件一致：其 `SEP` 即 `__`，
-  且它同样拒绝 bare 名含 `__` 的工具），调用时回退到 bare 名发给 MCP。
-- `initialize` + `tools/list` 有界（每个 server 20s）；**单个 server 连不上不拖垮整轮装配**，
-  记 ERROR 后跳过（与 abb 对「一个坏插件不能阻断其余」的取向一致）。
-- 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。
+  且它同样拒绝 bare 名含 `__` 的工具），调用时回退到 bare 名发给 MCP。名字/描述/schema 的
+  上界（名字 ≤128、限定名 ≤64、工具数 ≤128、描述 ≤1024B、schema ≤4096B）逐条对齐
+  被替代组件；**一处有意差异**：那边遇到非法名字或重名是 `Err`（整轮 session 失败），
+  这边是**记 ERROR 后跳过**（与 abb「一个坏插件不能阻断其余」同取向）。重名不再静默：
+  第二个同名工具会打 ERROR 说明它永不可达（rpi 按 `find` 取首个匹配，重名不报错）。
+- **装配有界**：单 server 20s（`initialize` 与 `tools/list` **合计**）、全体 30s（取小者）。
+  **单个 server 连不上不拖垮整轮装配**，记 ERROR 后跳过。两个上界都落在 abb 的
+  `session/new` RPC 预算（60s）之内；装配本身**不再占用读循环**（`session/new` 与回合一样
+  走独立任务，否则 abb 那边只有 5s 宽限的「停止」会被拖过）。
+- **子进程环境是白名单**（`env_clear()` + [`PASSTHROUGH_ENV`] + abb 按 server 下发的
+  `spec.env`）：否则每个 MCP server（含 wassette 这类第三方组件宿主）默认就能看到 abb 注入的
+  供应商 API key。工作目录取会话工作区（`session/new` 的 `cwd`），server 的 stderr **继承**
+  （落到 /dev/null 的话，「server 起不来」的原因只剩我们那句 spawn 错误）。
+- 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。**例外**：本
+  进程自己**优雅退出**（stdin EOF）时不成立——不理会 EOF 的 MCP 子进程会被留下（`PPID=1`）：
+  关子进程的 kill 任务 spawn 在块 `block_on` 已返回的 runtime 上，没被 poll。abb 的监督路径
+  （`shutdown()` / `Drop` 都是 `killpg`）不受影响，单独启动本包时要自己收尾。
 - MCP `isError: true` 走 `Err(AgentError::Tool)` 路径，让 loop 编码成错误工具结果（不伪装成功）；
-  非文本内容（图片/资源）**不静默吞掉**，以 `[image 内容] {…}` 形式留在文本里。
+  **图片保留成真 image part**（rpi 会作为 image content 发给模型），不降级成 base64 正文；
+  单个工具结果受预算约束（合计 8 MiB、文本 50 KiB，超限中间省略），超预算的图片降级成一行
+  说明；音频等 rpi 侧无对应 part 的类型同样留一行痕迹，不静默吞。
 
-握手是**有意同步**做的：abb 在 `session/new` 应答之后才发 prompt，工具必须在 prompt 之前就位；
-代价是握手期间读循环被占用（会延迟其它会话的 cancel），若将来需要非阻塞应对 prompt 加就绪门。
+握手仍然「先装配、再应答」（abb 在 `session/new` 应答之后才发 prompt，工具必须在 prompt 之前
+就位），但装配已经在独立任务里，读循环全程可读。
 
 尚未做（刀 2 之后视需要）：`notifications/tools/list_changed` 的刷新、每个 `tools/call` 的独立超时、
-断线重连。另注意：MCP 子进程的孤儿回收（abb 侧有 `src/orphan_mcp.rs` 专治 wassette 孤儿）本包
-未处理——子进程随 session 的 `RunningService` 一起走，但异常路径下的残留待测。
+断线重连、`session/close`（本包没有这个渠道：`session/close` 回 `-32601`，MCP 子进程随会话线性
+累积——与被替代组件同构）。另注意：MCP 子进程的孤儿回收（abb 侧有 `src/orphan_mcp.rs` 专治
+wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 abb 的 `killpg` 兜住，单独启动或
+外部单个 pid 被杀时会留孤儿（见上文「例外」）。
 
 ## 失败与取消的语义
 

@@ -40,6 +40,10 @@ use crate::wire::{Inbound, WireError, Writer};
 /// abb 的**生产路径确实会下发** `session/new` 的 `params.systemPrompt`
 /// （`src/buzz/pool.rs::session_new_system_prompt` 在 protocol_version≥2 且非 goose 时走
 /// `Field` 传输），所以这个常量只是兼底——第一刀忽略了该参数，等于把 abb 的指令丢了。
+///
+/// ⚠️ 刀 2 做**约定链**（`~/AGENTS.md` + `~/.agents/skills`）时**不能**沿用 rpi 的默认位
+/// （`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），否则既有用户的约定会静默失效。
+/// 这句话原本写在这里的注释里，第三轮被一句话连注释一起删掉了——在此补回。
 const DEFAULT_SYSTEM_PROMPT: &str = "你是 ABB（agent-bridge）的执行层 agent，在用户本机上运行。";
 
 pub struct Server {
@@ -101,7 +105,20 @@ impl Server {
         match inbound {
             Inbound::Request { id, method, params } => match method.as_str() {
                 "initialize" => self.initialize(id).await,
-                "session/new" => self.session_new(id, params).await,
+                // 与回合同理：`session/new` 里要装配 MCP（连不上的 server 会耗尽预算，
+                // 单 session 上界 20s、全体 30s），而读循环必须保持可读——abb 的
+                // 「停止」只有 5s 宽限，而且 `initialize` 也走同一条读循环。
+                // 顺序无虞：abb 在收到 `session/new` 应答之前不会发 `session/prompt`。
+                "session/new" => {
+                    let server = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(error) = server.session_new(id, params).await {
+                            // 写不出去（父进程关了管道）：无法再通信。
+                            tracing::error!("session/new 应答写出失败：{error}");
+                        }
+                    });
+                    Ok(())
+                }
                 // 只有回合走独立任务：它是唯一的长任务，也是 `session/cancel`
                 // 必须能在其运行期间被处理的原因。
                 //
@@ -172,11 +189,12 @@ impl Server {
             Err(reason) => return self.writer.fail(id, -32005, reason).await,
         };
 
-        // 握手有界（每 server 最多 HANDSHAKE_TIMEOUT），且**有意**同步做：abb 在
-        // `session/new` 应答之后才发 prompt，而工具必须在 prompt 之前就位。
-        // 代价：握手期间读循环被占用（会延迟其它会话的 cancel）——若将来需要非阻塞，
-        // 应拆成任务并对 prompt 加就绪门。
-        let mcp = McpSession::connect_all(&parsed.mcp_servers).await;
+        // 装配有界：单 server CONNECT_BUDGET_PER_SERVER、全体 CONNECT_BUDGET_TOTAL（取小），
+        // 两者都在 abb 的 `session/new` RPC 预算（60s）之内。装配本身已**不再占用读循环**
+        // —— `dispatch` 把它丢进了独立任务，所以 `session/cancel` / `initialize` 不会被拖住。
+        // 工具必须在 prompt 之前就位（abb 是应答后才发 prompt，而装配就在应答之前），
+        // 所以这里仍然是「先装配、再应答」。
+        let mcp = McpSession::connect_all(&parsed.mcp_servers, &parsed.cwd).await;
         let tools = mcp.tools();
         tracing::info!(
             "会话 {session_id}：mcp server {:?}，工具 {} 个，systemPrompt={}，cwd={}",

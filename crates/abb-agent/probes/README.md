@@ -34,5 +34,15 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分
   「工具被调用」与「模型自己编了答案」。
 - `fake_mcp_server.py`：上述探针用的最小 MCP server（`initialize` / `tools/list` / `tools/call`）。
+  另有 `--dump-env <path>`（落盘自己的 cwd + 全量 env）与 `--hang-init`（`initialize` 永不回包）
+  两个开关，供下面那条隔离/预算探针使用。
+- `mcp_isolation_and_budget.py`（配 `fake_mcp_server.py`）：第四轮评审（`abb-reviewer-61`）判
+  needs-changes 的两类偏离的复现实验。场景 1 断言**子进程真的没继承供应商凭据**（判据是假
+  server 自己写下的 env，不是读代码）、`spec.env` 生效、`cwd` 落在会话工作区；场景 2 用一个
+  `--hang-init` 的 server 把装配预算耗满，断言同一时刻发出的 `initialize` **0.0x 秒**就拿到应答
+  （读循环没被占）且 `session/new` 在单 server 预算（20s）附近收尾。
+  **修前表现**：子进程 env 里有 `ANTHROPIC_API_KEY`、cwd 是 abb-agent 自己的；挂住的 server
+  让 `session/new` 吃掉 35s（init 20s + list 20s 中的一部分）且期间 `session/cancel` 与
+  `initialize` 各被拖 19s（abb 的「停止」只有 5s 宽限）。
 
 全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。

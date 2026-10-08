@@ -8,9 +8,18 @@
 「模型自己编了答案」）。
 
 用法：`python3 fake_mcp_server.py --record /tmp/mcp-calls.jsonl`
+
+另有两个给「环境/工作目录隔离」与「装配预算」探针用的开关：
+
+- `--dump-env <path>`：启动时把自己的 **cwd 与全量环境** 写成 JSON，供探针断言
+  「白名单 `/ spec.env` 生效」与「供应商凭据没被继承」；
+- `--hang-init`：收到 `initialize` 后**永不回包**，用来把装配预算耗满
+  （验证这期间读循环仍然可读、且 `session/new` 会在预算内收尾）。
 """
 import json
+import os
 import sys
+import time
 
 TOOL_NAME = "echo_query"
 
@@ -22,12 +31,28 @@ def record(path, entry):
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def dump_env(path):
+    """把启动时的 cwd 与全量环境落盘（探针据此断言隔离是否生效）。"""
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"cwd": os.getcwd(), "env": dict(os.environ)}, fh, ensure_ascii=False)
+
+
 def main():
     record_path = None
+    dump_path = None
+    hang_init = False
     argv = sys.argv[1:]
     for i, item in enumerate(argv):
         if item == "--record" and i + 1 < len(argv):
             record_path = argv[i + 1]
+        elif item == "--dump-env" and i + 1 < len(argv):
+            dump_path = argv[i + 1]
+        elif item == "--hang-init":
+            hang_init = True
+
+    dump_env(dump_path)
 
     for line in sys.stdin:
         line = line.strip()
@@ -41,6 +66,10 @@ def main():
         msg_id = msg.get("id")
 
         if method == "initialize":
+            if hang_init:
+                # 永不回包：把 agent 的装配预算耗满（读循环必须仍然可读）。
+                time.sleep(3600)
+                continue
             reply = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
