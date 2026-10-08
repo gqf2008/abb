@@ -1,0 +1,60 @@
+# abb-agent —— ABB 的 ACP 执行层（rpi 库驱动），用于替换 crates/buzz-agent。
+#
+# 设计依据：walgit 线程 `abb-agent-rpi-acp-20261008`。
+#
+# 为什么是独立包（与 crates/buzz-agent 同构）：root Cargo.toml 没有 [workspace]，
+# 所以本包自带 Cargo.lock，root 的 cargo fmt/clippy/test 不会碰到它；CI 走
+# `--manifest-path`（同现有 fork-lint 任务的做法）。
+#
+# 与 buzz-agent 的关键差异（产品决策，见线程「已决」）：
+#   - agent **不碰权限**：不实现 OS 沙箱档位，`initialize` 响应**不声明**
+#     `_meta.abbSandbox`（如实声明，不伪装能力）；
+#   - **不发** `session/request_permission`：授权约定由 AGENTS.md 承担；
+#   - LLM 层与 agent loop 不再自持，改为依赖 rpi 库（rpi-ai / rpi-agent）；
+#     内置工具（rpi-tools）第二刀接入。删掉原 7.9k 行 llm.rs 与 1.9k 行 agent.rs。
+#
+# 构建：cargo build --release --manifest-path crates/abb-agent/Cargo.toml
+#
+[package]
+name = "abb-agent"
+version = "0.1.0"
+edition = "2021"
+# rpi 库的 MSRV 是 1.78，跟它对齐。
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/gqf2008/abb"
+description = "ABB 的 ACP 执行层：由 rpi 库驱动的独立 agent 进程（替代 buzz-agent）"
+readme = "README.md"
+keywords = ["acp", "agent", "abb", "rpi"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "abb_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abb-agent"
+path = "src/main.rs"
+
+[dependencies]
+# rpi 库（library-first）：agent loop / LLM 协议适配 / 内置工具。
+# 版本与 crates.io 上的发布保持一致；本地锁文件固定实际解析结果。
+rpi-agent = "0.3.16"
+# 真实 HTTP provider（anthropic 等）在 rpi-ai 里**默认不编**，gated 在 `providers`
+# feature 后面——那是它「测试不可能悄悄依赖网络」的设计。本包需要真 LLM，故显式打开；
+# faux provider 不受影响（它不在该 feature 下），所以离线 smoke 仍然不联网。
+rpi-ai = { version = "0.3.16", features = ["providers"] }
+
+# 注意：`rpi-tools`（内置工具）与 `tokio-util` **尚未使用**，故不在此列出。
+# 评审指出第一版把它们写进依赖却零引用（注释还说成「内置工具来源」），
+# 第二刀接工具时再加回，避免死依赖。
+
+tokio = { version = "1", features = [
+    "rt-multi-thread", "macros", "time", "sync", "io-util", "io-std"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }

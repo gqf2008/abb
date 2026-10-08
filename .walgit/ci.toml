@@ -64,3 +64,21 @@ env_allow = [
   "RUSTC_WRAPPER",
   "CARGO_TARGET_DIR",
 ]
+
+# abb-agent 是独立包（root 无 [workspace]），root 的 fmt/clippy/build/test 编不到它。
+# 没有这条任务，分支上的代码会烂掉而不被任何门禁发现。
+# 与 fork-lint 的差别：这里**真的跑测试**（fork-lint 是 --no-run）。abb-agent 的用例
+# 全部离线（faux provider / 捕获式 Writer / 注入式 env），跑得起；而 --no-run 会让
+# 「回合顺序/漏文本」这类回归锁在 CI 永不执行——评审据此提过反证 (d)。
+[[task]]
+name = "abb-agent-lint"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo fmt --manifest-path crates/abb-agent/Cargo.toml -- --check && cargo clippy --manifest-path crates/abb-agent/Cargo.toml --all-targets --locked -- -D warnings && cargo test --manifest-path crates/abb-agent/Cargo.toml --locked"
+timeout = "45m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
