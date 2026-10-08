@@ -25,7 +25,7 @@ REQUIRED=(
 )
 # 需要逐一带上上述 entitlements 的内部可执行（存在才检查；不存在不算失败——
 # 分发包可能不含 abb-helper，见 build.sh 的 `[ -f ... ]` 条件拷贝）。
-INNER=(agent-bridge buzz-agent)
+INNER=(agent-bridge buzz-agent abb-agent)
 
 if [ "$#" -eq 0 ]; then
   echo "用法：$0 <App.app> [<App.app>...]" >&2

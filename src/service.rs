@@ -7,30 +7,20 @@ use crate::config::Config;
 use crate::messenger;
 use std::sync::Arc;
 
-/// 随包 buzz-agent 同目录候选（Windows 包名带 .exe，两个都试；无则 None——
-/// 开发/自签构建不随包）。
-fn bundled_buzz_agent() -> Option<String> {
-    std::env::current_exe().ok().and_then(|me| {
-        let dir = me.parent()?;
-        let plain = dir.join("buzz-agent");
-        if plain.is_file() {
-            Some(plain)
-        } else {
-            let exe = dir.join("buzz-agent.exe");
-            exe.is_file().then_some(exe)
-        }
-        .map(|p| p.display().to_string())
-    })
-}
-
 /// 解析 ACP 执行层命令（纯函数便于单测）。
 /// 决议链 = 文档承诺的顺序（#206 字段义）：
 /// ① `config.buzz_agent_exe` 覆盖（绝对路径是文件 → 直用；否则按 PATH 探测）——
-///    开发机指自己 build 的 fork、也作装了原生适配器的用户的逃生阀；
-/// ② 主程序同目录随包 `buzz-agent[.exe]`；
+///    开发机指自己 build 的执行层、也作装了原生适配器的用户的逃生阀；
+/// ② 主程序同目录随包——**按角色**分：owner/FullAccess 优先 `abb-agent`（新执行层），
+///    授权者（受限）会话仍走 `buzz-agent`（授权链路的承担者按 owner 裁定
+///    「原来谁现在还是谁」保持不变）；
 /// ③ 都没有 → None（调用方回落 PATH `pi-acp` 兜底）。
 /// 覆盖配了但找不到 → 告警并落回 ②（宁可用随包版也不要起不来的进程）。
-fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
+fn resolve_buzz_agent_in_dir(
+    override_exe: &str,
+    bundled: &[&str],
+    exe_dir: Option<&std::path::Path>,
+) -> Option<String> {
     if !override_exe.trim().is_empty() {
         let p = std::path::Path::new(override_exe.trim());
         if p.is_file() {
@@ -44,7 +34,60 @@ fn resolve_buzz_agent(override_exe: &str) -> Option<String> {
             override_exe.trim()
         );
     }
-    bundled_buzz_agent()
+    bundled_agent_in_dir(bundled, exe_dir)
+}
+
+/// 随包执行层的文件名（同一个二进制名在两平台一致，Windows 追加 `.exe` 由调用方处理）。
+const NORMAL_BUNDLED_AGENT: &str = "abb-agent";
+const GRANTED_BUNDLED_AGENT: &str = "buzz-agent";
+
+/// 按给定顺序在「主程序同目录」找随包执行层（找不到该名字就试下一个）。
+fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> Option<String> {
+    let dir = match exe_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_exe().ok()?.parent()?.to_path_buf(),
+    };
+    for name in bundled {
+        let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if candidate.is_file() {
+            return Some(candidate.display().to_string());
+        }
+    }
+    None
+}
+
+/// 给定（owner 命令、授权者命令）与该 bot 的 owner 档位，选出 normal 会话实际用哪条。
+///
+/// **这是切换的第二个开关**：abb-agent 如实不声明 `_meta.abbSandbox`，而 abb 对带
+/// `session_sandbox` 的会话 fail-closed ⇒ owner 配了受限档时必须留在旧执行层，否则
+/// 那些会话会被拒建（不是 abb-agent 的缺陷，是「不碰权限」决策的必然结果）。
+fn pick_normal_command<'a>(
+    owner_cmd: &'a str,
+    granted_cmd: &'a str,
+    owner_needs_sandbox: bool,
+) -> &'a str {
+    if owner_needs_sandbox {
+        granted_cmd
+    } else {
+        owner_cmd
+    }
+}
+
+/// 按**角色**解析出两条命令（normal / granted）。覆盖对两者都生效；
+/// 随包缺失时各自回落 PATH `pi-acp`（开发/自签构建）。
+fn resolve_acp_commands(override_exe: &str) -> (String, String) {
+    let normal = resolve_acp_command(
+        resolve_buzz_agent_in_dir(
+            override_exe,
+            &[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT],
+            None,
+        )
+        .as_deref(),
+    );
+    let granted = resolve_acp_command(
+        resolve_buzz_agent_in_dir(override_exe, &[GRANTED_BUNDLED_AGENT], None).as_deref(),
+    );
+    (normal, granted)
 }
 
 /// 无随包时解析 `pi-acp` 的最终命令。Windows 上 npm 生成的是 `.cmd` shim，
@@ -186,12 +229,15 @@ fn bot_wassette_mcp_with(
 fn build_bot_acp_handles(
     bot: &crate::config::BotConfig,
     cfg: &Config,
-    buzz_cmd: Option<&str>,
+    commands: (&str, &str),
     stop: tokio_util::sync::CancellationToken,
 ) -> crate::bridge::BotAcpHandles {
     // 开发/自签构建无随包 → PATH pi-acp 全路径兜底（Windows .cmd shim 不能裸名 spawn；
     // 都没装则保留裸名，spawn 失败 → AgentDown，如实可见，见 #246④）。
-    let command = resolve_acp_command(buzz_cmd);
+    //
+    // 两条命令**按角色**分：normal 优先随包 `abb-agent`（新执行层），granted 仍走
+    // `buzz-agent`（授权链路的承担者不变）。两者都可能回落同一条 pi-acp。
+    let (command, granted_command) = commands;
     let env = buzz_env_for_bot(bot, cfg);
     let cwd = std::env::current_dir()
         .unwrap_or_default()
@@ -205,12 +251,26 @@ fn build_bot_acp_handles(
     // 按设计共用 normal 实例（配置语义即「与 owner 同权限」），wassette 随之可见。
     // 组件仓库为应用级共享（方案 B）：跨 bot 的组件与 grant 策略耦合由 owner 拍板接受。
     let extra_mcp = bot_wassette_mcp(bot);
-    let mk = |extra_env: Vec<(String, String)>,
+    // 分流第二刀（**关键**）：abb-agent 如实**不**声明 `_meta.abbSandbox`，而 abb 侧对带
+    // `session_sandbox` 的会话是 fail-closed（`pool.rs` 拒建「发不出档位」的会话）。所以
+    // owner 会话若配了 read-only / workspace-write 档，也必须留在 buzz-agent——否则那些
+    // 会话会直接起不来（这不是 abb-agent 的缺陷，是「不碰权限」这条产品决策的必然结果）。
+    let normal_command = pick_normal_command(command, granted_command, normal_meta.is_some());
+    if normal_meta.is_some() {
+        // 日志可见：让「为什么这个 bot 还走旧执行层」一眼可查。
+        crate::log!(
+            "[acp] bot={} 的 owner 档位需要受限沙箱 ⇒ normal 会话留在旧执行层（abb-agent 不声明档位）",
+            bot.key()
+        );
+    }
+
+    let mk = |command: &str,
+              extra_env: Vec<(String, String)>,
               session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
               extra_mcp: Vec<crate::buzz::acp::McpServer>| {
         crate::buzz::harness::BuzzHandle::new(
             crate::buzz::harness::AgentConfig {
-                command: command.clone(),
+                command: command.to_string(),
                 args: Vec::new(),
                 extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
                     .into_iter()
@@ -224,8 +284,9 @@ fn build_bot_acp_handles(
             extra_mcp,
         )
     };
-    let normal = mk(env.clone(), normal_meta, extra_mcp);
+    let normal = mk(normal_command, env.clone(), normal_meta, extra_mcp);
     let granted = mk(
+        granted_command,
         env.into_iter()
             .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
             .collect(),
@@ -233,7 +294,7 @@ fn build_bot_acp_handles(
         Vec::new(),
     );
     crate::log!(
-        "[acp] harness 装配 bot={} cmd={command}（normal+granted）",
+        "[acp] harness 装配 bot={} cmd(normal)={normal_command} cmd(granted)={granted_command}",
         bot.key()
     );
     crate::bridge::BotAcpHandles { normal, granted }
@@ -251,8 +312,8 @@ pub(crate) fn oneshot_agent_config(
 ) -> crate::buzz::harness::AgentConfig {
     // 命令解析与 build_bot_acp_handles 同链（覆盖指错告警一回/调用——gc 是
     // 日频任务，GUI 是低频点击，重复解析可接受）。
-    let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
-    let command = resolve_acp_command(buzz_cmd.as_deref());
+    // oneshot 是 owner 角色（见函数文档），走 normal 那条命令。
+    let (command, _) = resolve_acp_commands(&cfg.buzz_agent_exe);
     let env = buzz_env_for_bot(bot, cfg);
     crate::buzz::harness::AgentConfig {
         command,
@@ -351,14 +412,19 @@ pub async fn run() {
 
     let cfg = Arc::new(cfg);
 
-    // #200 Phase 3 + 单后端化 P2.1：执行层只有随包 buzz-agent——每 bot
+    // ACP 执行层命令**按角色**两条：owner 优先随包 `abb-agent`，授权者（受限）会话仍走
+    // `buzz-agent`（授权链路的承担者不变）。每进程解析一次；两条都可能回落 PATH `pi-acp`
+    // （开发/自签构建无随包）。
+    let (normal_cmd, granted_cmd) = resolve_acp_commands(&cfg.buzz_agent_exe);
+
+    // #200 Phase 3 + 单后端化 P2.1：执行层随包（owner 优先 abb-agent；授权者会话仍走
+    // buzz-agent）——每 bot
     // normal+granted 双进程实例，在 run_bot 内按 bot 构造（env 带本 bot 供应商，
     // 结构消灭旧共享句柄集「env_for 取第一个 enabled bot 供应商」的多 bot 串台）。
     // 装配零等待（不 spawn 进程、不碰盘）——handle 同步可得，无启动竞态；agent
     // 懒启动 + 崩溃退避重拉（harness 内闭环），启动失败只影响本 bot 的 ACP 频道。
     // 命令解析每进程一次（buzz_agent_exe 指错只告警一回）；None = 开发/自签构建
     // 无随包 → run_bot 内落 PATH pi-acp 全路径兜底（Windows .cmd shim 见 #246④）。
-    let buzz_cmd = resolve_buzz_agent(&cfg.buzz_agent_exe);
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -605,16 +671,17 @@ pub async fn run() {
                 });
             }
         }
-        // ACP 执行层命令（随包 buzz-agent；None=开发/自签无随包 → run_bot 内落
-        // PATH pi-acp 全路径兜底）。句柄对按 bot 在 run_bot 内构造（P2.1）。
-        let buzz_cmd = buzz_cmd.clone();
+        // ACP 执行层命令**按角色**两条（owner 优先随包 abb-agent；授权者会话仍走
+        // buzz-agent，授权承担者不变）。两者都可能回落 PATH pi-acp（开发/自签无随包）。
+        // 句柄对按 bot 在 run_bot 内构造（P2.1）。
+        let role_cmds = (normal_cmd.clone(), granted_cmd.clone());
         // #206：回合投递路由注册表（全部 bot 共享同一份）
         let registry = bridge_registry.clone();
         // 任务名带 bot key（Box::leak：每次进程启动每 bot 一行小字符串，换取
         // errors/panic 告警可定位到具体 bot——审查 Minor 3）
         let name: &'static str = Box::leak(format!("bot:{}", bot.key()).into_boxed_str());
         handles.push(crate::svc_tasks::tasks().spawn_forever(name, async move {
-            run_bot(bot, cfg, msgr, router, stop, buzz_cmd, registry).await;
+            run_bot(bot, cfg, msgr, router, stop, role_cmds, registry).await;
         }));
     }
     // 等所有 bot 循环结束。⚠️ 服务期的常态就是等在这里（等关停广播），**绝不能包超时**：
@@ -746,7 +813,7 @@ async fn run_bot(
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
-    buzz_cmd: Option<String>, // ACP 执行层命令（None=无随包 → PATH pi-acp 全路径兜底）
+    role_cmds: (String, String), // ACP 执行层命令 (normal, granted)
     bridge_registry: crate::bridge::BridgeRegistry, // #206：回合投递路由用
 ) {
     let key = bot.key();
@@ -764,7 +831,8 @@ async fn run_bot(
     // 的话这次写入会 NotFound 被静默吞掉（审查 P2-1，回归测试在 agent.rs）。
     crate::agent::ensure_workspace_guide(&crate::workspace_dir(&key));
     // ACP 句柄对（P2.1）：normal+granted 按本 bot 构造，env 带本 bot 供应商。
-    let acp_handles = build_bot_acp_handles(&bot, &cfg, buzz_cmd.as_deref(), stop.clone());
+    let (normal_cmd, granted_cmd) = role_cmds;
+    let acp_handles = build_bot_acp_handles(&bot, &cfg, (&normal_cmd, &granted_cmd), stop.clone());
     // 任务族随句柄对下沉（旧 service 级任务①②）：每实例一个主循环（agent 懒启动 +
     // 崩溃退避重拉）+ 一个回合投递消费（TurnOutput → meta.bot_key → Bridge 注册表
     // 路由；逐条 await 保 per-chat 发送顺序）。任务名带 bot key 与实例标签。
@@ -1803,15 +1871,100 @@ mod tests {
         let fake = dir.join("my-agent");
         std::fs::write(&fake, b"x").unwrap();
         let expect = fake.display().to_string();
-        assert_eq!(resolve_buzz_agent(&expect), Some(expect.clone()));
+        let names = [NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT];
+        assert_eq!(
+            resolve_buzz_agent_in_dir(&expect, &names, None),
+            Some(expect.clone())
+        );
         // ② 覆盖指向不存在路径 → 回落随包（本机 dev 构建通常 None，不炸即正确）
-        let r = resolve_buzz_agent("/definitely/not/here-buzz");
+        let r = resolve_buzz_agent_in_dir("/definitely/not/here-buzz", &names, None);
         assert!(
-            r == bundled_buzz_agent(),
+            r == bundled_agent_in_dir(&names, None),
             "无效覆盖必须落回随包链，got {r:?}"
         );
         // ③ 空覆盖 = 纯随包链
-        assert_eq!(resolve_buzz_agent(""), bundled_buzz_agent());
+        assert_eq!(
+            resolve_buzz_agent_in_dir("", &names, None),
+            bundled_agent_in_dir(&names, None)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 按角色的随包解析：owner 优先 `abb-agent`，授权者会话**仍走** `buzz-agent`。
+    ///
+    /// 这条是本次切换的核心判据——授权链路的承担者按 owner 裁定「原来谁现在还是谁」
+    /// 保持不变，不因换执行层而改授权语义。
+    #[test]
+    fn bundled_agent_resolution_is_role_aware() {
+        let dir = std::env::temp_dir().join(format!("abb-role-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abb = dir.join(format!("abb-agent{}", std::env::consts::EXE_SUFFIX));
+        let buzz = dir.join(format!("buzz-agent{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&abb, b"x").unwrap();
+        std::fs::write(&buzz, b"x").unwrap();
+
+        // 两个都在：normal 取 abb-agent，granted 取 buzz-agent。
+        assert_eq!(
+            bundled_agent_in_dir(&[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT], Some(&dir)),
+            Some(abb.display().to_string())
+        );
+        assert_eq!(
+            bundled_agent_in_dir(&[GRANTED_BUNDLED_AGENT], Some(&dir)),
+            Some(buzz.display().to_string()),
+            "授权者会话不得切到 abb-agent"
+        );
+
+        // 只有 buzz-agent：normal 回落它（回滚形态），granted 照旧。
+        std::fs::remove_file(&abb).unwrap();
+        assert_eq!(
+            bundled_agent_in_dir(&[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT], Some(&dir)),
+            Some(buzz.display().to_string())
+        );
+
+        // 谁都没有 ⇒ None（调用方回落 pi-acp）。
+        std::fs::remove_file(&buzz).unwrap();
+        assert_eq!(
+            bundled_agent_in_dir(&[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT], Some(&dir)),
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// owner 需要受限档时，normal 会话必须留在旧执行层（abb-agent 不声明档位 ⇒ 会被拒建）。
+    #[test]
+    fn normal_sessions_stay_on_the_old_layer_when_a_sandbox_mode_is_required() {
+        assert_eq!(
+            pick_normal_command("/bin/abb-agent", "/bin/buzz-agent", false),
+            "/bin/abb-agent"
+        );
+        assert_eq!(
+            pick_normal_command("/bin/abb-agent", "/bin/buzz-agent", true),
+            "/bin/buzz-agent",
+            "带受限档的 owner 会话必须留在旧执行层，否则 abb 的 P2.3 硬闸会拒建"
+        );
+    }
+
+    /// 覆盖对**两条**命令都生效（运维显式指定 / 回滚开关）。
+    #[test]
+    fn override_applies_to_both_role_commands() {
+        let dir = std::env::temp_dir().join(format!("abb-ovr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pinned = dir.join("pinned-agent");
+        std::fs::write(&pinned, b"x").unwrap();
+        let expect = pinned.display().to_string();
+        assert_eq!(
+            resolve_buzz_agent_in_dir(
+                &expect,
+                &[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT],
+                Some(&dir)
+            ),
+            Some(expect.clone())
+        );
+        assert_eq!(
+            resolve_buzz_agent_in_dir(&expect, &[GRANTED_BUNDLED_AGENT], Some(&dir)),
+            Some(expect),
+            "授权路径也必须认覆盖（回滚开关）"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
