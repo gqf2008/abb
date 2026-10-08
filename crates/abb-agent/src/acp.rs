@@ -275,13 +275,19 @@ impl Server {
         // 约定链：用**会话工作目录**（不是进程 cwd）——abb 的 cwd 就是频道工作区
         // （`src/buzz/pool.rs` 的 `channel.workspace.unwrap_or(cwd)`），同一台机器上
         // 不同会话本就该看不同目录的约定。为真时结果可能为空（没有任何 AGENTS.md）。
-        let hints = if self.hints_enabled {
-            crate::hints::hints_section(&hints_cwd(&parsed.cwd))
+        // 约定链与技能清单一次算出：系统提示要用，`load_skill` 也要用同一份技能表。
+        // **约定链关闭时两者都没有**（参照物：hints 关 ⇒ skills 是空 vec ⇒ 工具也拿不到技能）。
+        let (hints, skills) = if self.hints_enabled {
+            crate::hints::hints_and_skills(&hints_cwd(&parsed.cwd))
         } else {
-            String::new()
+            (String::new(), Vec::new())
         };
         if !hints.is_empty() {
-            tracing::info!("会话 {session_id}：约定链已注入 {} 字节", hints.len());
+            tracing::info!(
+                "会话 {session_id}：约定链已注入 {} 字节，技能 {} 个",
+                hints.len(),
+                skills.len()
+            );
         }
 
         // 内置工具（dev__*）与会话工作区绑定：read/shell/glob/ls 以它为基准，
@@ -313,6 +319,19 @@ impl Server {
             }
             tools = kept;
             tools.extend(builtin);
+        }
+        if self.hints_enabled {
+            // `load_skill` 用**裸名**（参照物把它直接 push 进工具表，不经 `dev__`）。
+            // 裸名同样会与 MCP 工具撞：rpi 按名字取首个 ⇒ 这里先摘掉同名 MCP 工具。
+            let (kept, dropped) =
+                drop_mcp_collisions(std::mem::take(&mut tools), &["load_skill".to_string()]);
+            if !dropped.is_empty() {
+                tracing::error!(
+                    "MCP 工具与 load_skill 撞名，已跳过 MCP 侧（内置 load_skill 取胜）：{dropped:?}"
+                );
+            }
+            tools = kept;
+            tools.push(crate::builtin::load_skill_tool(skills));
         }
 
         let agent = match self.build_agent(&session_id, parsed.system_prompt, &hints, tools) {

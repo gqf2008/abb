@@ -21,6 +21,7 @@ pub mod child_env;
 pub mod hints;
 pub mod mcp;
 pub mod provider;
+pub mod skills;
 pub mod wire;
 
 /// 测试用的传输替身：把出站行捕获到 channel，避免测试依赖真实 stdout。

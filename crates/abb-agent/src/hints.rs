@@ -138,6 +138,43 @@ fn load_hint_files(cwd: &Path, home: Option<&Path>) -> String {
     result
 }
 
+/// 约定链 + 技能清单（一次把两者算出来：系统提示要用，`load_skill` 也要用同一份技能表）。
+///
+/// 结构与被替代组件一致：`# Additional Instructions` → `## Project Hints`（AGENTS.md 链）→
+/// `## Available Skills`（名字 + 描述）→ 一句「用 `load_skill` 读正文」。
+/// **两边都空时不产出任何标题**（避免一个空壳段落占上下文）。
+pub fn hints_and_skills(cwd: &Path) -> (String, Vec<crate::skills::SkillEntry>) {
+    hints_and_skills_with_home(cwd, home_dir().as_deref())
+}
+
+/// 可注入 home 的版本（单测用）。
+pub fn hints_and_skills_with_home(
+    cwd: &Path,
+    home: Option<&Path>,
+) -> (String, Vec<crate::skills::SkillEntry>) {
+    let hints_text = load_hint_files(cwd, home);
+    let skills = crate::skills::discover_with_home(cwd, home);
+    if hints_text.is_empty() && skills.is_empty() {
+        return (String::new(), skills);
+    }
+    let mut out = String::from("# Additional Instructions\n");
+    if !hints_text.is_empty() {
+        out.push_str("\n## Project Hints\n");
+        out.push_str(&hints_text);
+        out.push('\n');
+    }
+    if !skills.is_empty() {
+        out.push_str("\n## Available Skills\n");
+        for skill in &skills {
+            out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+        }
+        out.push_str(
+            "\nUse the `load_skill` tool to read the full content of a skill before using it.\n",
+        );
+    }
+    (out, skills)
+}
+
 /// 直接产出要给模型的约定段落（空串 = 没有任何约定需要注入）。
 ///
 /// **不给标题**：fork 的 `# Additional Instructions` 段里还含技能列表，
