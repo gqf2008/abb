@@ -209,7 +209,7 @@ pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
     })?;
 
     let Some(rel_path) = rel_path else {
-        return Ok(render_skill(entry));
+        return render_skill(entry);
     };
 
     let matched = entry.supporting_files.iter().find(|file| {
@@ -243,9 +243,10 @@ pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
     let canonical_dir = skill_dir.canonicalize().map_err(|error| {
         format!("load_skill: could not canonicalize skill directory for {skill_name:?}: {error}")
     })?;
-    let canonical_file = file
-        .canonicalize()
-        .map_err(|error| format!("load_skill: could not canonicalize {file:?}: {error}"))?;
+    let canonical_file = file.canonicalize().map_err(|error| {
+        // 与参照物同形：不回显绝对路径。
+        format!("load_skill: could not resolve {skill_name:?}/{rel_path}: {error}")
+    })?;
     if !canonical_file.starts_with(&canonical_dir) {
         return Err(format!(
             "load_skill: refusing to load {skill_name:?}/{rel_path}: \
@@ -267,10 +268,13 @@ pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
 }
 
 /// 技能正文 + `## Supporting Files` 段（合计受 32 KiB 上限约束）。
-fn render_skill(entry: &SkillEntry) -> String {
+///
+/// 读不出来必须**报错**：早先这里用 `unwrap_or_default()` 把失败变成空正文，于是「技能存在但
+/// `SKILL.md` 读不了」会**静默成功**（模型拿到空内容还可能以为自己读过了）——参照物在同一形状上
+/// 返回错误结果（评审实测到的行为面差异）。
+fn render_skill(entry: &SkillEntry) -> Result<String, String> {
     let raw = std::fs::read_to_string(&entry.path)
-        .map_err(|error| format!("load_skill: could not read {:?}: {error}", entry.path))
-        .unwrap_or_default();
+        .map_err(|error| format!("load_skill: could not read {:?}: {error}", entry.path))?;
     let mut output = strip_frontmatter(&raw).to_string();
     if !entry.supporting_files.is_empty() {
         let skill_dir = entry.path.parent().unwrap_or(&entry.path);
@@ -285,10 +289,11 @@ fn render_skill(entry: &SkillEntry) -> String {
             }
         }
     }
-    if output.len() > MAX_SKILL_BODY_BYTES {
-        return truncate_at_boundary(&output, MAX_SKILL_BODY_BYTES).to_string();
-    }
-    output
+    Ok(if output.len() > MAX_SKILL_BODY_BYTES {
+        truncate_at_boundary(&output, MAX_SKILL_BODY_BYTES).to_string()
+    } else {
+        output
+    })
 }
 
 #[cfg(test)]
@@ -499,6 +504,28 @@ mod tests {
                     .contains("resolves outside the skill directory"),
             "越界读必须拒绝"
         );
+    }
+
+    /// 技能存在但 `SKILL.md` 读不出来 ⇒ 必须**报错**（不能静默返回空正文）。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_skill_body_is_an_error_not_silent_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = temp_dir("unreadable");
+        let skill_md = write_skill(&cwd, "demo", "demo", "描述", "正文");
+        let skills = discover_with_home(&cwd, None);
+        // 发现之后再改权限：模拟「读的一刻读不到」（root 会绕过权限位，故非 root 才有意义）。
+        let original = std::fs::metadata(&skill_md).expect("stat").permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&skill_md, locked).expect("chmod 000");
+        let result = load("demo", &skills);
+        std::fs::set_permissions(&skill_md, original).expect("还原权限");
+        if result.is_ok() && result.as_ref().expect("ok").is_empty() {
+            panic!("读失败被静默成空正文：{result:?}");
+        }
+        let error = result.expect_err("读失败要报错");
+        assert!(error.contains("could not read"), "{error}");
     }
 
     #[test]
