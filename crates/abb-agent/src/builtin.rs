@@ -169,15 +169,24 @@ fn exposed(
 ) -> Arc<dyn AgentTool> {
     let base = inner.schema();
     let mut parameters = base.parameters.clone();
+    let mut description = base.description.clone();
     if guard == Guard::ShellTimeout {
         rename_param(&mut parameters, "timeout", "timeout_secs");
+        // rpi 的原文写着「no default timeout」，而本包设了 120s 并把值 clamp 进 1..=600
+        // ——工具的说明必须与真实行为一致，否则模型会按错的默认值规划命令。
+        let hint = format!(
+            "Optional timeout in seconds (default {:.0}, clamped to {:.0}..={:.0}).",
+            DEFAULT_SHELL_TIMEOUT_SECS, MIN_SHELL_TIMEOUT_SECS, MAX_SHELL_TIMEOUT_SECS
+        );
+        description = description.replace("Optionally provide a timeout in seconds.", &hint);
+        describe_timeout_bounds(&mut parameters);
     }
-    let mut description = base.description.clone();
     if guard == Guard::WritePath {
         // 参照物的 description 里写明「只能写工作区内」——工具的说明与真实约束一致，
         // 模型才不会白试几次（本包的约束与参照物同款，见 [`confine_write_path`]）。
         description.push_str(
-            "\n\nPath is confined to the session workspace: paths escaping it              (absolute paths outside, `..`, symlinks) are rejected.",
+            "\n\nPath is confined to the session workspace: paths escaping it \
+             (absolute paths outside the workspace, `..` traversal, symlinks) are rejected.",
         );
     }
     let schema = Tool {
@@ -192,6 +201,21 @@ fn exposed(
         guard,
         workspace: workspace.to_path_buf(),
     })
+}
+
+/// 给 `timeout_secs` 补上真实边界（clamp 区间），让 schema 与实现自洽。
+fn describe_timeout_bounds(schema: &mut Schema) {
+    let Value::Object(root) = &mut schema.0 else {
+        return;
+    };
+    let Some(Value::Object(properties)) = root.get_mut("properties") else {
+        return;
+    };
+    let Some(Value::Object(timeout)) = properties.get_mut("timeout_secs") else {
+        return;
+    };
+    timeout.insert("minimum".to_string(), Value::from(MIN_SHELL_TIMEOUT_SECS));
+    timeout.insert("maximum".to_string(), Value::from(MAX_SHELL_TIMEOUT_SECS));
 }
 
 /// 把 JSON Schema 里 `properties` 下的某个字段改名（用于 `timeout` → `timeout_secs`）。
@@ -411,6 +435,51 @@ mod tests {
             "rpi 的字段名不得泄漏给模型：{props:?}"
         );
         assert!(props.contains(&"command".to_string()), "{props:?}");
+    }
+
+    /// 模型看到的说明必须与真实行为一致：超时默认 120、区间 1..=600；写类工具声明写入限定。
+    #[test]
+    fn exposed_schemas_match_real_behavior() {
+        let workspace = temp_workspace("docs");
+        let tools = dev_tools(&workspace);
+        let by_name = |name: &str| -> Arc<dyn AgentTool> {
+            tools
+                .iter()
+                .find(|tool| tool.schema().name == name)
+                .unwrap_or_else(|| panic!("缺 {name}"))
+                .clone()
+        };
+
+        let shell = by_name("dev__shell").schema().clone();
+        assert!(
+            !shell.description.contains("no default timeout"),
+            "rpi 原文与新行为矛盾：{}",
+            shell.description
+        );
+        assert!(
+            shell.description.contains("default 120"),
+            "{}",
+            shell.description
+        );
+        let timeout = &shell.parameters.0["properties"]["timeout_secs"];
+        assert_eq!(timeout["minimum"], 1.0, "{timeout}");
+        assert_eq!(timeout["maximum"], 600.0, "{timeout}");
+
+        for name in ["dev__write", "dev__edit"] {
+            let schema = by_name(name).schema().clone();
+            assert!(
+                schema
+                    .description
+                    .contains("confined to the session workspace"),
+                "{name} 的说明未声明写入限定：{}",
+                schema.description
+            );
+            assert!(
+                !schema.description.contains("  "),
+                "{name} 的说明里有多余空格（形如格式化残留）：{:?}",
+                schema.description
+            );
+        }
     }
 
     /// `timeout_secs` → `timeout` 的翻译 + clamp（参照物：默认 120、区间 1..=600）。

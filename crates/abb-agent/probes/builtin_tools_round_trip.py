@@ -184,7 +184,8 @@ workspace = tempdir("shellenv")
 ok, _ = run_turn(
     workspace,
     {"name": "dev__shell", "arguments": {"command": "env > env.txt", "timeout_secs": 30}},
-    extra_env={"ANTHROPIC_API_KEY": "sk-probe-should-not-leak"},
+    extra_env={"ANTHROPIC_API_KEY": "sk-probe-should-not-leak",
+               "ABB_AGENT_CONTEXT": "host-value"},
 )
 check("回合完成", ok)
 dump = os.path.join(workspace, "env.txt")
@@ -194,6 +195,11 @@ if os.path.isfile(dump):
         text = fh.read()
     check("凭据**不在** shell 环境里", "sk-probe-should-not-leak" not in text)
     check("PATH 仍在（工具要能跑）", "PATH=" in text)
+    # abb 的 proc 闸（Q8）以这个变量为**主判据**：少了它，「agent 派生的 shell 去建 --proc 任务」
+    # 就会 fail-open（参照物在同一个共享入口里写它）。
+    check("agent 上下文标记由我们写入（ABB_AGENT_CONTEXT=1）",
+          "ABB_AGENT_CONTEXT=1" in text, "shell 里没有该标记 ⇒ abb 的 proc 闸会 fail-open")
+    check("宿主里若有别的标记值也被覆盖成 1", "ABB_AGENT_CONTEXT=host-value" not in text)
 
 print()
 print("=== 场景 7：dev__edit 真改文件（能力真到位，判据是文件内容）===")

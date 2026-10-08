@@ -207,8 +207,8 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 | 集合 | **6 个**：`shell`/`read`/`write`/`ls`/`glob`/`delegate` | 前五个**同名**（`glob` 由 rpi 的 `find` 工具提供——它的入参就是 glob 模式）+ `edit`/`grep`（rpi 增量）；**`delegate`（子代理委派）本包没有** |
 | shell 工具参数 | `{command, timeout_secs}` | 同名同形：schema 里把 rpi 的 `timeout` 改名成 `timeout_secs`，调用时再翻回去 |
 | shell 超时 | 默认 120s、clamp 1..=600 | 同（`default_timeout=120`；模型给的 `timeout_secs` 也 clamp 进 1..=600，`0`/负数/非法值落回 120） |
-| shell 的环境 | 白名单（凭据不进子进程） | 同：`inherit_env=false` + `child_env::passthrough_map()`（与 MCP 子进程共用同一份白名单） |
-| shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）；登记，未改 |
+| shell 的环境 | 白名单（凭据不进子进程）+ **写入 `ABB_AGENT_CONTEXT=1`** | 同：`inherit_env=false` + `child_env::passthrough_map()`（与 MCP 子进程共用同一份白名单），且**标记由我们写入**（abb 的 Q8 proc 闸以它为主判据：少了它「agent 派生的 shell 去建 `--proc` 任务」会 fail-open） |
+| shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）并把路径给模型；该文件在 `TMPDIR` 下实测 `644`/目录 `755`（TMPDIR 若是共享目录，同机其它用户可读）；登记未改 |
 | `read` 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；description 里写得明白，模型自洽） |
 | 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸） | **不放宽**：父目录先建后 canonicalize，再比前缀；`..`、符号链接父目录、工作区外绝对路径一律拒 |
 | 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 与 FullAccess 一致；**受限档的 roots 策略仍由 abb 的闸门承担**（本包不实现档位） |
