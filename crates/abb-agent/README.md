@@ -192,6 +192,30 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 **尚未做**：技能目录发现（`~/.agents/skills`、`<cwd>/.agents/skills` 等）与 `load_skill` 工具
 —— 二者要有内置工具才能读，随内置工具那批一起落地。
 
+## 内置工具（刀 2 第二批）
+
+用 `rpi-tools`（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv`）补上被替代组件的
+能力面：第一刀只有 MCP 工具（abb-events / wassette），模型**没有文件读写与 shell**。
+`OsExecutionEnv::with_cwd(会话 cwd)` → `ExecutionToolContext` → `create_*_tool`，全部以
+**`dev__{name}` 限定名**暴露（沿用被替代组件的 `dev` 伪命名空间，避免 owner 约定/技能里写过的
+工具名静默失效）。
+
+与被替代组件的差异（逐条登记，不假装同形）：
+
+| 维度 | 被替代组件 | 本包 |
+| --- | --- | --- |
+| 集合 | `shell`/`read`/`write`/`ls` | 同上 + `edit`/`grep`/`find`（rpi-native 增量） |
+| shell 工具参数 | `{command, timeout_secs}` | 同名同形：schema 里把 rpi 的 `timeout` 改名成 `timeout_secs`，调用时再翻回去 |
+| `read` 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；description 里写得明白，模型自洽） |
+| 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸） | **不放宽**：父目录先建后 canonicalize，再比前缀；`..`、符号链接父目录、工作区外绝对路径一律拒 |
+| 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 与 FullAccess 一致；**受限档的 roots 策略仍由 abb 的闸门承担**（本包不实现档位） |
+| 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
+| Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
+
+与参照物**有意更紧**的一处：本包允许**落在工作区内**的绝对路径（参照物一律拒绝绝对路径）——
+rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝对路径反而会破坏正常写入；
+「不得出工作区」这条本身没有放宽。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -218,7 +242,6 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 
 **尚未实现（第二刀）**：
 
-- **内置工具接线**（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv` 的 cwd）；
 - **技能目录与 `load_skill`**：`~/.agents/skills` / `<cwd>/.agents/skills` 等的发现与按需读取
   （fork 的 `hints.rs` + `builtin.rs` 现状）。注意**不能**沿用 rpi 的默认位
   （`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），否则既有用户的约定会静默失效；
@@ -255,7 +278,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。八条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。九条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -267,6 +290,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
+| `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论

@@ -58,6 +58,8 @@ pub struct Server {
     /// abb 对 granted 会话只在**进程级**收口这个变量（见 `hints` 模块文档），
     /// 与 fork 同语义。
     hints_enabled: bool,
+    /// 内置工具（`dev__*`）是否开启（`BUZZ_AGENT_DEV_TOOLS=0` 时关，与 fork 同）。
+    dev_tools_enabled: bool,
     seq: AtomicU64,
 }
 
@@ -93,7 +95,7 @@ impl Server {
     /// 注入式构造：把后端选择与进程 env 解耦，便于测试直接给一个 faux 后端
     /// （不在测试里改进程全局 env——那会让并行用例互相踩）。
     pub fn with_backend(writer: Writer, backend: Result<Backend, String>) -> Self {
-        Self::with_backend_and_hints(writer, backend, true)
+        Self::with_backend_and_switches(writer, backend, true, true)
     }
 
     /// 生产入口：读进程环境决定约定链开关。
@@ -107,18 +109,21 @@ impl Server {
     /// [`Self::try_new`] 的可注入版本（单测不改进程全局 env）。
     pub fn try_new_with(writer: Writer, env: &dyn provider::EnvSource) -> Result<Self, String> {
         let hints_enabled = crate::hints::hints_enabled(env)?;
-        Ok(Self::with_backend_and_hints(
+        let dev_tools_enabled = crate::builtin::dev_tools_enabled(env)?;
+        Ok(Self::with_backend_and_switches(
             writer,
             provider::select_with(env),
             hints_enabled,
+            dev_tools_enabled,
         ))
     }
 
-    /// 可注入约定链开关的构造（单测用：不改进程全局 env）。
-    pub fn with_backend_and_hints(
+    /// 可注入两个进程级开关的构造（单测用：不改进程全局 env）。
+    pub fn with_backend_and_switches(
         writer: Writer,
         backend: Result<Backend, String>,
         hints_enabled: bool,
+        dev_tools_enabled: bool,
     ) -> Self {
         if let Err(reason) = &backend {
             tracing::error!("provider 装配失败（会话建立时会如实报错）：{reason}");
@@ -129,12 +134,19 @@ impl Server {
                 crate::hints::NO_HINTS_ENV
             );
         }
+        if !dev_tools_enabled {
+            tracing::info!(
+                "内置工具已关闭（{}=0）：不暴露 dev__* 工具",
+                crate::builtin::DEV_TOOLS_ENV
+            );
+        }
         Self {
             writer,
             state: Mutex::new(State::default()),
             backend,
             max_rounds: provider::max_rounds(&provider::ProcessEnv),
             hints_enabled,
+            dev_tools_enabled,
             seq: AtomicU64::new(1),
         }
     }
@@ -270,6 +282,23 @@ impl Server {
         };
         if !hints.is_empty() {
             tracing::info!("会话 {session_id}：约定链已注入 {} 字节", hints.len());
+        }
+
+        // 内置工具（dev__*）与会话工作区绑定：read/bash/grep/find/ls 以它为基准，
+        // write/edit 也以它为**写入边界**（见 builtin 模块文档）。
+        let mut tools = tools;
+        if self.dev_tools_enabled {
+            let workspace = workspace_for_tools(&parsed.cwd);
+            let builtin = crate::builtin::dev_tools(&workspace);
+            tracing::info!(
+                "会话 {session_id}：内置工具 {} 个：{:?}",
+                builtin.len(),
+                builtin
+                    .iter()
+                    .map(|tool| tool.schema().name.clone())
+                    .collect::<Vec<_>>()
+            );
+            tools.extend(builtin);
         }
 
         let agent = match self.build_agent(&session_id, parsed.system_prompt, &hints, tools) {
@@ -492,9 +521,8 @@ impl Server {
             .system_prompt(system_prompt)
             .session_id(session_id)
             .stream_fn(backend.stream_fn())
+            // 工具 = MCP 工具（`{server}__{tool}`）+ 内置工具（`dev__*`，见 `builtin`）。
             .tools(tools)
-            // TODO(刀 2)：接 rpi-tools 的内置工具（read/write/edit/bash/
-            // grep/find/ls），env 用 `OsExecutionEnv::with_cwd(session/new 的 cwd)`。
             .build()
             .map_err(|error| format!("agent 构建失败：{error}"))
     }
@@ -508,6 +536,20 @@ impl Server {
 /// 所以锁必须钉在接线处，而不是只钉 `hints_section`）。
 fn hints_cwd(parsed_cwd: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(parsed_cwd)
+}
+
+/// 内置工具的工作区：`session/new` 的 `cwd` 原值优先。
+///
+/// 与约定链不同，这里**不能**留空串：`OsExecutionEnv` 需要一个真目录作基准（空串会被当成
+/// 相对路径解析到哪都说不准）。abb 生产恒下发非空 cwd；真为空时回落到进程 cwd，并留着
+/// 日志可见（不静默）。
+fn workspace_for_tools(parsed_cwd: &str) -> std::path::PathBuf {
+    if parsed_cwd.is_empty() {
+        tracing::warn!("session/new 未给 cwd：内置工具回落到进程工作目录");
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        std::path::PathBuf::from(parsed_cwd)
+    }
 }
 
 /// `session/new` 里 abb 下发的三项契约（`cwd` / `systemPrompt` / `mcpServers`）。
