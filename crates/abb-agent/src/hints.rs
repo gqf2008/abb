@@ -9,14 +9,17 @@
 //! `session/new` 之前，per-session 的 `_meta` 管不到（`src/service.rs:180-234` 的注释写得很
 //! 明白，它给 granted 的 agent 进程多塞一个 `BUZZ_AGENT_NO_HINTS=1`）。
 //! 本包若不认它，owner 的 `~/AGENTS.md` 与技能就会静默泄漏给授权者——所以这个变量是
-//! **硬前置**，不是可选优化：读法与语义都按 fork（`parse_env("BUZZ_AGENT_NO_HINTS", 0) == 0`
-//! ⇒ 默认开、只认字面 `1` 之外的值也同样只是「没关」，见 [`hints_enabled`]）。
+//! **硬前置**，不是可选优化。读法与语义**逐条对齐** fork 的 `parse_env(…, 0u8)? == 0`：
+//! 未设置/`0` ⇒ 开；**任何非零** ⇒ 关；读不懂 ⇒ 拒绝启动（见 [`hints_enabled_from`]）。
+//! 注意方向：**不能**退化成「只认字面 `1`」——那会把 `true`/`2`/`01` 当「没关」，属静默
+//! fail-open（评审实测过这条退化路径）。
 
 use std::path::{Path, PathBuf};
 
 use crate::provider::EnvSource;
 
-/// 进程级开关：值为 `1` 时**完全不加载**约定链（授权者会话用）。
+/// 进程级开关：**任何非零值**都表示完全不加载约定链（授权者会话用）；
+/// 读不懂的值按参照物口径**拒绝启动**（见 [`hints_enabled_from`]）。
 pub const NO_HINTS_ENV: &str = "BUZZ_AGENT_NO_HINTS";
 
 /// 约定文本的字节上限（与 fork 同值）。

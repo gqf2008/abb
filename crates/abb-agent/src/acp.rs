@@ -264,10 +264,7 @@ impl Server {
         // （`src/buzz/pool.rs` 的 `channel.workspace.unwrap_or(cwd)`），同一台机器上
         // 不同会话本就该看不同目录的约定。为真时结果可能为空（没有任何 AGENTS.md）。
         let hints = if self.hints_enabled {
-            // 用**原值**（含空串）：空 cwd 时与被替代组件同行为——只读进程工作目录那一层，
-            // 不向祖先链扩散（上一版在这里 `current_dir()` 回落，实测评审会多读整条链）。
-            let cwd = std::path::PathBuf::from(&parsed.cwd);
-            crate::hints::hints_section(&cwd)
+            crate::hints::hints_section(&hints_cwd(&parsed.cwd))
         } else {
             String::new()
         };
@@ -503,6 +500,16 @@ impl Server {
     }
 }
 
+/// 约定链用哪个目录：**原值透传**（含空串）。
+///
+/// 抽成函数是为了能钉住这个决定本身：空 cwd 时链退化成「进程工作目录那一层」，
+/// 与被替代组件的链函数同行为；若在这里「好心」回落成 `current_dir()`，就会多读
+/// 「进程 cwd 的 git 根 → cwd」整条链（评审实测过这条回归，且当时**没有任何测试会红**——
+/// 所以锁必须钉在接线处，而不是只钉 `hints_section`）。
+fn hints_cwd(parsed_cwd: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(parsed_cwd)
+}
+
 /// `session/new` 里 abb 下发的三项契约（`cwd` / `systemPrompt` / `mcpServers`）。
 ///
 /// 抽成纯函数是为了可测：这三项在第一刀里**全部被静默忽略**（连 `params` 都不读），
@@ -700,6 +707,22 @@ mod tests {
                 "prompt": [{ "type": "text", "text": "你好" }],
             }),
         }
+    }
+
+    /// 约定链目录必须**原值透传**：空 cwd 不得被「好心」回落成 `current_dir()`。
+    ///
+    /// 这条锁钉的是 `acp.rs` 的**接线处**（上一版 bug 就在这里，而只钉 `hints_section` 的
+    /// 单测在那种回归下依然全绿——评审实测：把接线改回 `current_dir()`，62 单测 + 8 探针全绿）。
+    #[test]
+    fn hints_cwd_passes_the_session_cwd_through_unchanged() {
+        assert_eq!(hints_cwd(""), std::path::Path::new(""));
+        assert_eq!(hints_cwd("/tmp/ws"), std::path::Path::new("/tmp/ws"));
+        // 空白串由 `SessionNewParams::parse` 规范化为空串后再进来（见 parse 的单测）。
+        assert_ne!(
+            hints_cwd(""),
+            std::env::current_dir().unwrap_or_default(),
+            "空 cwd 必须原样透传，不能回落成进程 cwd（那会多读整条祖先链）"
+        );
     }
 
     #[test]

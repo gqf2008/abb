@@ -237,6 +237,37 @@ for bad in ("true", "yes", "-1", "256", " 1 "):
           rc["last"] == 2, f"rc={rc['last']}")
 
 print()
+print("=== 场景 6：空 cwd 不得向祖先链扩散（钉住 acp 的接线处）===")
+# 进程 cwd 设成 git 子目录；根与 cwd 各有一份 AGENTS.md。空 cwd 时只该读到 cwd 那一层。
+root = tempfile.mkdtemp(prefix="abb-hints-root-")
+os.makedirs(os.path.join(root, ".git"), exist_ok=True)
+inner = os.path.join(root, "inner")
+os.makedirs(inner, exist_ok=True)
+ROOT_MARKER = "ROOT-LAYER-MARKER-b7e2"
+INNER_MARKER = "INNER-LAYER-MARKER-3d19"
+with open(os.path.join(root, "AGENTS.md"), "w", encoding="utf-8") as fh:
+    fh.write(f"{ROOT_MARKER}\n")
+with open(os.path.join(inner, "AGENTS.md"), "w", encoding="utf-8") as fh:
+    fh.write(f"{INNER_MARKER}\n")
+
+home = make_home(False)
+previous = os.getcwd()
+os.chdir(inner)
+try:
+    body = run_turn("", home, {})
+finally:
+    os.chdir(previous)
+if not body:
+    check("回合请求到达假端点（空 cwd + 进程 cwd 在 git 子目录）", False)
+else:
+    system = system_text(body)
+    check("空 cwd 时读到进程工作目录那一层", INNER_MARKER in system)
+    check("空 cwd 时**不得**向祖先链扩散（读不到 git 根的 AGENTS.md）",
+          ROOT_MARKER not in system,
+          "根层标记是否出现在请求体里")
+    check("空 cwd 时也不读 $HOME（home 未给约定）", HOME_MARKER not in system)
+
+print()
 if failures:
     print(f"⇒ 判定：❌ 失败 {len(failures)} 项：{failures}")
     sys.exit(1)

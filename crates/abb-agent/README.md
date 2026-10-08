@@ -176,8 +176,13 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   「只认字面 `1`」，实测方向是**静默 fail-open**（`true`/`2`/`01` 会把 owner 的约定发给授权者），
   已按参照物改正。关掉时默认系统提示照旧（关的是约定链，不是提示）。
 - `session/new` 不带 `cwd`（空串）时按**原值**处理：链退化成「进程工作目录那一层」，**不**向祖先链
-  扩散——与参照物同行为（上一版用 `current_dir()` 回落，实测会多读进程 cwd 的 git 根到 cwd 整条链）。
-  abb 的生产路径恒下发非空 cwd（`src/buzz/pool.rs` 的 `session_cwd`），这条只是对齐边界。
+  扩散——与参照物的**链函数**同行为（上一版用 `current_dir()` 回落，实测会多读进程 cwd 的 git 根到 cwd
+  整条链）。abb 的生产路径恒下发非空 cwd（`src/buzz/pool.rs` 的 `session_cwd`），这条只是对齐边界。
+  **三处如实登记的残差**（评审实测、当前均不可达）：①参照物在 `session/new` 层就**拒建**空/空白/相对
+  `cwd`（`INVALID_PARAMS`），本包不拒、按上面那条读一层——若将来 abb 真下发空 cwd，两边行为不同；
+  ②空白串在本包 `SessionNewParams::parse` 里被规范化为空串 ⇒ 对 `"   "` 读一层，而参照物的链函数对
+  `"   "` 读 0 层；③env 值非 UTF-8 时两边都因 `var().ok()` 落到默认值（= 开），这一格与参照物**相同**
+  但同样是 fail-open 方向，未测。
 - ⚠️ 已知边界：`NO_HINTS=1` 只关**自动注入**，不关「agent 自己主动去读」。首批没有内置工具、granted
   会话的 MCP 也只有 abb-events，所以暂时封住；**内置工具（read/grep/bash）落地后需要按工具面重新论证
   授权者会话的约定隔离**。且今天 granted 会话其实先被 abb 的 P2.3 硬闸拒建（abb-agent 如实不声明
