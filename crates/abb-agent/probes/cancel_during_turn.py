@@ -104,6 +104,7 @@ print(f"[t={time.time()-t0:.1f}s] 回合在途（id=3 未应答）：{in_flight}
 t_probe = time.time()
 send({"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {"protocolVersion": 2}})
 el, line = wait_for(lambda l: '"id":4,' in l, 10)
+init_served_during_turn = line is not None
 print(f"[t={time.time()-t0:.1f}s] 回合中 initialize 应答："
       f"{'有' if line else '**超时：读循环被占死**'}（回合开始于 t={t_prompt-t0:.1f}s，"
       f"应答到达 t={el:.1f}s ⇒ 延迟 {el-(t_prompt-t0):.1f}s）" if line else
@@ -113,11 +114,16 @@ print(f"[t={time.time()-t0:.1f}s] 回合中 initialize 应答："
 t_cancel = time.time()
 send({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
 el, line = wait_for(lambda l: '"id":3,' in l, 25)
+ok = False
 if line:
+    ok = '"cancelled"' in line.replace(" ", "")
     print(f"[t={time.time()-t0:.1f}s] 取消后回合收尾（取消发出于 t={t_cancel-t0:.1f}s，"
           f"延迟 {el-(t_cancel-t0):.1f}s）：{line}")
 else:
     print(f"[t={time.time()-t0:.1f}s] 取消后回合仍未收尾（超时）")
+probe_ok = bool(line) and ok and init_served_during_turn
+print(f"\n⇒ 判定：{'取消链路正常 ✅' if probe_ok else '❌ 有断言未满足'}"
+      f"（回合中 initialize 被服务={init_served_during_turn}；收尾为 cancelled={ok}）")
 
 stop.set()
 proc.stdin.close()

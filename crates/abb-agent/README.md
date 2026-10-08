@@ -36,6 +36,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 | `_meta.steering` | **声明 `supported: false`** | 本刀未实现 `_session/steering`；abb 那边该标志是写该方法的唯一闸门，报 true 只会让「回合中追加消息」多一次无效往返 |
 | LLM 层 / agent loop | 交给 rpi（`rpi-ai` / `rpi-agent`） | 不自持 7.9k 行 `llm.rs` |
 | 内置工具 | 第二刀接 `rpi-tools` | 尚未使用，故当前不在依赖里 |
+| 输出上限 | 默认 **65_536**，认 `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
 
 `initialize` 因此**不含** `_meta.abbSandbox`：abb 侧 `parse_abb_sandbox_modes` 得到
 `None` → `SandboxSupport::Unsupported`。这是**如实声明**——声明支持却不执行，正是
@@ -59,12 +60,13 @@ token**。若 cancel 在回合任务**被 poll 之前**就到，那一次 abort 
 | --- | --- |
 | `BUZZ_AGENT_PROVIDER` | `anthropic` 或 `openai`（`openai-chat`/`openai-responses`/`openrouter`/`deepseek` 是**配置 kind**，env 里一律归并成 `openai`） |
 | `ANTHROPIC_API_KEY` | 必填（显式取用，不依赖 rpi 的 env 兜底） |
-| `ANTHROPIC_BASE_URL` | 可选；自定义/自建网关。缺省 `https://api.anthropic.com` |
+| `ANTHROPIC_BASE_URL` | 可选；自定义/自建网关，**填主机根**（如 `https://gw.example.com`）。缺省 `https://api.anthropic.com` |
 | `ANTHROPIC_MODEL` | **必填**；任意 id（见下） |
 | `OPENAI_COMPAT_API_KEY` / `OPENAI_COMPAT_MODEL` | **必填**（openai 家族） |
 | `OPENAI_COMPAT_BASE_URL` | 可选；缺省 `https://api.openai.com` |
 | `OPENAI_COMPAT_API` | `responses` 走 responses 端点，其余（含 `openrouter`/`deepseek` 两个预置）都是 chat |
 | `BUZZ_AGENT_MAX_ROUNDS` | 回合上界（abb 默认送 200） |
+| `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 可选；单回合输出上限。abb **今天不注入**，但被替代的 fork 会读它（默认 65536），故同样认 |
 | `ABB_AGENT_FAUX_TEXT` | **本包自己的离线通道**：命中即用 rpi faux provider（不联网、无凭据），供 smoke 与测试 |
 | `RUST_LOG` | 日志级别（默认 `info`；**日志只走 stderr**，stdout 是 ACP 协议通道） |
 
@@ -82,7 +84,14 @@ token**。若 cancel 在回合任务**被 poll 之前**就到，那一次 abort 
 `crates/buzz-agent/src/config.rs` 在同路径就是 `"config: ANTHROPIC_MODEL required"` 硬失败。
 静默替用户挑模型等于替用户花钱。
 
-### base_url 语义（两边一致，已核）
+### base_url 语义（anthropic 与 openai 不一样！）
+
+**anthropic：填主机根。** rpi 自己拼 `/v1/messages`（`format!("{base}/v1/messages")`），所以
+`https://gw.example.com` → `/v1/messages`，而 `https://gw.example.com/v1` → **`/v1/v1/messages`**。
+这与被替代的 fork 同构（它也是 `{base}/v1/messages`），不是回归，但是个陷阱：
+单元测试一度拿 `…/v1` 当「可用网关」的样本，那是在示范一个会坏掉的形状（评审指出后已改）。
+
+**openai：两边一致。**
 
 abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrouter.ai/api/v1`，
 `deepseek` → `https://api.deepseek.com/v1`），而 rpi 对 `/v1` 结尾只再补
@@ -100,6 +109,9 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 - **取消**：`session/cancel`（通知，无 `id`，**不产生应答**）置位正在跑的回合并 `abort()`，
   回合以 `stopReason: "cancelled"` 收尾。无在途回合时忽略。
 - 并发提交同一会话的第二个回合会被拒（`-32004`）：abb 按频道串行，这是协议误用。
+- **超过输出上限是静默截断**：rpi 把 `StopReason::Length` 归入 `Completed`、`error_message`
+  为空 ⇒ 本包只能报成 `stopReason: "end_turn"`，abb 看到 `end_turn` 就 `record_success`。
+  所以上限**必须**与被替代组件对齐（65_536），写小了就是「长回答被截半截而系统记成功」。
 - **stdin EOF 即退出**：父进程关掉 stdin 视为收摊，**在途回合的应答不会被等**。
   写 smoke / 手测时要注意（见下）。
 
@@ -124,9 +136,13 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）。
 - `tool_call` / `tool_call_update` 通知；
 - 逐 token 流式（当前与 buzz-agent 一致：非流式，整条 `agent_message_chunk`）；
 - `StopReason::Length`（截断）目前会被报成 `end_turn`（abb 的 `max_tokens` 分支收不到）。
+- **openai-chat + 官方 OpenAI 推理模型**可能因字段名被拒：rpi 默认发 `max_tokens`，而被替代的
+  fork 对 openai 发 `max_completion_tokens`。**未实测**（无 key/无网络），仅登记为风险。
 
-`BUZZ_AGENT_MAX_ROUNDS` 的护栏代码已就位，但**当前不可达**：没有工具时一个回合只会有 1 轮
-模型请求（`TurnStart` 恒 1），所以超界分支不会被触发。接上工具后才成为实际护栏。
+`BUZZ_AGENT_MAX_ROUNDS` 的护栏代码已就位且**边界与被替代组件对齐**（在 `TurnStart` 即本轮
+请求之前按**已完成**的请求数判，做满 `max_rounds` 次就不再开新一轮），但**当前不可达**：
+没有工具时一个回合只会有 1 次模型请求（评审用计数探针实测：3 个回合共 3 次 POST），
+超界分支不会被触发。接上工具后才成为实际护栏。
 
 ## 离线 smoke
 
@@ -157,5 +173,8 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `cancel_same_burst.py` | prompt 与 cancel 在同一次 write（0 间隔）时取消不被丢弃（修前 6/6 丢弃） |
 | `provider_error_is_visible.py` | provider 失败回 JSON-RPC error，而非「成功 + 空文本」 |
 | `openai_family_round_trip.py` | openai 家族端到端：URL 拼法、鉴权头、任意厂商模型 id、文本送达 |
+
+判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
+被算作通过」的假通过窗口。
 
 详见 `probes/README.md`。

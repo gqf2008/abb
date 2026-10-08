@@ -115,5 +115,10 @@ for c in held:
 print(f"同 burst（0 间隔）× {ROUNDS}：")
 for i, r in enumerate(results, 1):
     print(f"  run {i}: {r}")
-dropped = sum(1 for r in results if "丢弃" in r)
-print(f"\n⇒ 丢弃 {dropped}/{ROUNDS}；{'✅ 竞态已修' if dropped == 0 else '❌ 仍有丢弃'}")
+# 判定必须**只认 cancelled**：早先的写法把「非 cancelled 的其它结论」算作通过，
+# 于是「取消无效但回合自然收尾」会被误报成「竞态已修」（评审指出）。
+ok = sum(1 for r in results if r == "cancelled")
+bad = [f"run {i}: {r}" for i, r in enumerate(results, 1) if r != "cancelled"]
+print(f"\n⇒ cancelled {ok}/{ROUNDS}；{'✅ 竞态已修' if not bad else '❌ 有未生效的取消'}")
+for line in bad:
+    print(f"   {line}")

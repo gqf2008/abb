@@ -37,3 +37,5 @@ tools-dist/
 # 那些一起静默吞掉——与本文件里 `/scripts/` 那条注释记过的是同类事故。
 .rpi/sessions/
 .rpi/extensions/.dev/
+# rpi-todo 扩展写的每会话待办（项目级运行期数据，同 sessions/）。
+.rpi/todos/

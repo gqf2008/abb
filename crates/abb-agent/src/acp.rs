@@ -388,8 +388,8 @@ struct TurnAccum {
     /// 最后一个 assistant 终态的 `error_message`。每个 `MessageEnd` 都**覆盖**：
     /// 由最后一条 assistant 消息决定本回合有没有 provider 级失败。
     error: Option<String>,
-    /// `TurnStart` 计数（1 轮 ≈ 1 次模型请求），对应 abb 的 `max_rounds` 语义。
-    turns: u64,
+    /// **已完成**的模型请求数（每条 assistant 终态 = 1 次请求）。
+    completed_requests: u64,
     /// 是否已超过上界（超了就 abort，让 loop 尽快收尾）。
     over_budget: bool,
 }
@@ -397,17 +397,25 @@ struct TurnAccum {
 impl TurnAccum {
     fn observe(&mut self, event: &AgentEvent, max_rounds: u64, agent: &Agent) {
         match event {
+            // 与 fork 语义对齐：`crates/buzz-agent/src/agent.rs` 是
+            // `if cfg.max_rounds > 0 && round >= cfg.max_rounds`，即**请求前判**、
+            // 最多允许 max_rounds 次模型请求。这里同样在 `TurnStart`（先于本轮请求）
+            // 看**已完成**的请求数：做满就不再开新一轮 ⇒ 恰好 max_rounds 次。
+            // （早先按 `turns > max_rounds` 计数是「差一」的写法，评审指出后已改。）
             AgentEvent::TurnStart => {
-                self.turns += 1;
-                if self.turns > max_rounds && !self.over_budget {
+                if self.completed_requests >= max_rounds && !self.over_budget {
                     self.over_budget = true;
-                    tracing::warn!("回合已进行 {} 轮，超过上界 {max_rounds}，中止", self.turns);
+                    tracing::warn!(
+                        "回合已完成 {} 次模型请求，达到上界 {max_rounds}，不再开新一轮",
+                        self.completed_requests
+                    );
                     agent.abort();
                 }
             }
             AgentEvent::MessageEnd {
                 message: AgentMessage::Assistant(assistant),
             } => {
+                self.completed_requests += 1;
                 self.error = assistant.error_message.clone();
             }
             _ => {}
@@ -631,17 +639,25 @@ mod tests {
             .await
             .unwrap();
 
-        // 无论回合跑得多快，都得有一个收敛的结论；关键是**不能**是「什么都没发生」。
-        let line = tokio::time::timeout(std::time::Duration::from_secs(10), captured.recv())
-            .await
-            .expect("回合必须在 10s 内给出结论")
-            .expect("应有一条出站");
-        let value: Value = serde_json::from_str(&line).unwrap();
-        let finished = value.get("result").is_some() || value.get("error").is_some();
-        let is_chunk = value.get("method").is_some();
-        assert!(
-            finished || is_chunk,
-            "取消后回合必须有结论（或先有内容帧），不得静默：{value}"
+        // 必须收敛成 **cancelled**：只要有任意一条出站（例如回合自然跑完的
+        // end_turn）就算过，就无法区分「取消生效」与「取消被丢弃后回合恰好跑完」
+        // ——评审指出这正是本用例（以及 `probes/cancel_same_burst.py`）的假通过窗口。
+        let deadline = std::time::Duration::from_secs(10);
+        let terminal = tokio::time::timeout(deadline, async {
+            loop {
+                let line = captured.recv().await.expect("应有一条出站");
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value.get("method").is_some() {
+                    continue; // 内容帧：继续等结论
+                }
+                return value;
+            }
+        })
+        .await
+        .expect("回合必须在 10s 内给出结论");
+        assert_eq!(
+            terminal["result"]["stopReason"], "cancelled",
+            "同 burst 的取消必须真的生效（而非回合自然收尾）：{terminal}"
         );
     }
 

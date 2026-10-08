@@ -54,12 +54,23 @@ pub const DEFAULT_MAX_ROUNDS: u64 = 200;
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 
+/// 单回合输出上限的环境变量名。
+///
+/// abb 的 `buzz_provider_env` **今天不注入**它，但被替代的 fork 会读它
+/// （`crates/buzz-agent/src/config.rs` 的 `parse_env("BUZZ_AGENT_MAX_OUTPUT_TOKENS", 65_536)`），
+/// 所以这里同样认——将来 abb 一旦注入就自动生效。
+pub const MAX_OUTPUT_TOKENS_ENV: &str = "BUZZ_AGENT_MAX_OUTPUT_TOKENS";
+
 /// 未指定时的单回合输出上限。
 ///
-/// 为什么必须有值：`clamp_max_tokens_to_context` 在 `context_window == 0`（我们不知道
-/// 上下文窗口）时返回 `max(1, max_tokens)`，所以 `0` 会让模型只回 1 个 token。
-/// 8_192 是保守值（与 rpi-ai 自身单测里用的量级一致）。
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8_192;
+/// **必须对齐被替代组件的默认值**：fork 的默认就是 65_536，而我第一版写成 8_192——
+/// 把输出上限悄悄缩了 8 倍，而且超限的失败形态是**静默截断**（rpi 把 `StopReason::Length`
+/// 归入 `Completed`、`error_message` 为空 ⇒ 上报成 `end_turn`，abb 会 `record_success`）。
+/// 长回答被截半截而系统记成功，是静默失败。
+///
+/// 另：不能给 0。`clamp_max_tokens_to_context` 在 `context_window == 0`（我们不知道上下文
+/// 窗口）时返回 `max(1, max_tokens)`，所以 `0` 会变成「只准回 1 个 token」。
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 65_536;
 
 /// 环境读取缝。
 ///
@@ -177,12 +188,22 @@ pub fn select_with(env: &dyn EnvSource) -> Result<Backend, String> {
 
 fn anthropic_backend(env: &dyn EnvSource) -> Result<Backend, String> {
     let api_key = required(env, "ANTHROPIC_API_KEY")?;
+    // 语义：**主机根**（如 `https://gateway.example.com`）。rpi 自己拼 `/v1/messages`，
+    // 所以写成 `…/v1` 会得到 `/v1/v1/messages`。这与被替代的 fork 同构
+    // （`crates/buzz-agent/src/llm.rs` 也是 `{base}/v1/messages`），不是回归；
+    // README 已把它写成使用约束。
     let base_url = optional(env, "ANTHROPIC_BASE_URL")
         .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string());
     let model_id = required(env, "ANTHROPIC_MODEL")?;
     let http = rpi_ai::http::build_client(&base_url, None, None)
         .map_err(|error| format!("构建 HTTP 客户端失败：{error}"))?;
-    let model = custom_model(&model_id, Api::AnthropicMessages, "anthropic", &base_url);
+    let model = custom_model(
+        &model_id,
+        Api::AnthropicMessages,
+        "anthropic",
+        &base_url,
+        output_cap(env),
+    );
     let provider = AnthropicProvider::with_models_without_env_api_key(
         Some(api_key),
         http,
@@ -209,7 +230,7 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
     } else {
         Api::OpenaiCompletions
     };
-    let model = custom_model(&model_id, api, "openai", &base_url);
+    let model = custom_model(&model_id, api, "openai", &base_url, output_cap(env));
     if responses {
         let provider = OpenAiResponsesProvider::with_models_without_env_api_key(
             "openai",
@@ -236,10 +257,21 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
 }
 
 /// **显式构造**模型：id / 端点全由调用方给定，不查内置目录。
-fn custom_model(id: &str, api: Api, provider_id: &str, base_url: &str) -> Model {
+fn custom_model(id: &str, api: Api, provider_id: &str, base_url: &str, max_tokens: u64) -> Model {
     let mut model = Model::new(id, id, api, provider_id, base_url);
-    model.max_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
+    model.max_tokens = max_tokens;
     model
+}
+
+/// 单回合输出上限：认 [`MAX_OUTPUT_TOKENS_ENV`]，缺省 [`DEFAULT_MAX_OUTPUT_TOKENS`]。
+///
+/// 非法/0 一律回落默认值而不报错：abb 今天不注入这个变量，将来注入也该是「调优」
+/// 而非「必须正确」，没必要因此让 agent 起不来。
+fn output_cap(env: &dyn EnvSource) -> u64 {
+    env.get(MAX_OUTPUT_TOKENS_ENV)
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
 }
 
 /// 取必填 env；缺失或全空白即报错。
@@ -366,19 +398,46 @@ mod tests {
 
     /// **任意厂商模型 id 都要能用**：自定义网关（one-api 等）常用厂商原生 id，
     /// rpi 不限制命名空间。第一版去查内置目录，会把这条判成错误——那是实现偷懒。
+    ///
+    /// 注意 base_url 用的是**主机根**形状：rpi 自己拼路径，给 anthropic 写 `…/v1`
+    /// 会得到 `/v1/v1/messages`（与被替代的 fork 同构，不是回归）。这条测试曾经拿
+    /// `…/v1` 当「可用网关」的样本——那是在示范一个会坏掉的形状。
     #[test]
     fn arbitrary_model_id_on_custom_gateway_is_accepted() {
         let backend = select_with(&FakeEnv::anthropic(&[
             ("ANTHROPIC_MODEL", "my-vendor-internal-model-v3"),
-            ("ANTHROPIC_BASE_URL", "https://one-api.internal.example/v1"),
+            ("ANTHROPIC_BASE_URL", "https://one-api.internal.example"),
             ("ANTHROPIC_API_KEY", "sk-gateway"),
         ]))
         .expect("自定义网关 + 任意 id 必须可用");
         assert_eq!(backend.model().id, "my-vendor-internal-model-v3");
+        assert_eq!(backend.model().base_url, "https://one-api.internal.example");
+    }
+
+    /// 输出上限：默认对齐被替代组件的 65_536；认 `BUZZ_AGENT_MAX_OUTPUT_TOKENS`；
+    /// 非法/0 回落默认值。
+    #[test]
+    fn output_cap_defaults_to_fork_parity_and_honors_env() {
         assert_eq!(
-            backend.model().base_url,
-            "https://one-api.internal.example/v1"
+            DEFAULT_MAX_OUTPUT_TOKENS, 65_536,
+            "必须与被替代组件的默认一致（写 8192 会把输出上限静默缩 8 倍）"
         );
+        assert_eq!(output_cap(&FakeEnv::new(&[])), 65_536);
+        assert_eq!(
+            output_cap(&FakeEnv::new(&[(MAX_OUTPUT_TOKENS_ENV, "1024")])),
+            1024
+        );
+        assert_eq!(
+            output_cap(&FakeEnv::new(&[(MAX_OUTPUT_TOKENS_ENV, "0")])),
+            65_536
+        );
+        assert_eq!(
+            output_cap(&FakeEnv::new(&[(MAX_OUTPUT_TOKENS_ENV, "abc")])),
+            65_536
+        );
+        // 端到端：env 真的进了请求模型。
+        let backend = select_with(&FakeEnv::anthropic(&[(MAX_OUTPUT_TOKENS_ENV, "4096")])).unwrap();
+        assert_eq!(backend.model().max_tokens, 4096);
     }
 
     /// 未给模型**必须报错**：被替代的 fork 在这条路径硬失败（AgentDown，可见），

@@ -89,7 +89,7 @@ el, line = wait_for(lambda l: '"id":3,' in l, 90)
 print(f"[t={el if line else -1:.1f}s] 回合应答：{line}")
 if line:
     text = line.replace(" ", "")
-    contains_error = '"error"' in text
+    contains_error = '"error"' in text and '"result"' not in text
     if contains_error:
         print("  ⇒ 判定：如实报错 ✅（不是成功空回合）")
     else:
