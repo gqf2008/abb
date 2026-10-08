@@ -175,6 +175,16 @@ pub fn hints_and_skills_with_home(
     (out, skills)
 }
 
+/// **仅测试用**：只含 `AGENTS.md` 链、**不含技能段**。
+///
+/// 生产路径走 [`hints_and_skills`]（技能清单与技能表必须来自同一次发现）。这里保留是因为
+/// 链路语义的单测要能单独钉住「只读 AGENTS.md」的行为；`#[cfg(test)]` 是为了让将来的调用点
+/// 不可能误用它而**静默丢技能段**（评审指出的风险）。
+#[cfg(test)]
+pub fn hints_section(cwd: &Path) -> String {
+    hints_section_with_home(cwd, home_dir().as_deref())
+}
+
 /// 直接产出要给模型的约定段落（空串 = 没有任何约定需要注入）。
 ///
 /// **不给标题**：fork 的 `# Additional Instructions` 段里还含技能列表，
@@ -184,11 +194,8 @@ pub fn hints_and_skills_with_home(
 /// `cwd` 按调用方给的原值使用（**包括空串**）：空串时与 fork 同行为——`chain` 退化成
 /// `[""]`，只读进程工作目录那一层，**不**向其祖先链扩散。上一版在这里用
 /// `current_dir()` 回落，实测会多读进程 cwd 的 git 根到 cwd 整条链（与参照物不同）。
-pub fn hints_section(cwd: &Path) -> String {
-    hints_section_with_home(cwd, home_dir().as_deref())
-}
-
 /// 可注入 home 的版本（单测用，避免依赖跑测机器的 `~`）。
+#[cfg(test)]
 pub fn hints_section_with_home(cwd: &Path, home: Option<&Path>) -> String {
     load_hint_files(cwd, home)
 }

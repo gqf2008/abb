@@ -208,8 +208,13 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   工具表，不经 `dev__` —— 改名会让技能正文里写的 `load_skill(name: …)` 提示失效）；`{name}` 取整个技能
   （**剥掉 frontmatter**、附 `## Supporting Files` 清单），`{name}/relative/path` 取支持文件；
   两者合计 **32 KiB** 上限（按字符边界截断）；找不到/越界给出带「可用技能/可用文件」清单的错误结果。
-- **越界保护**：支持文件必须**已在预枚举清单里**，且读取前 canonicalize 后仍在技能目录内
-  （防「发现之后目录被换成指向外面的符号链接」）。
+- **越界保护**：支持文件必须**已在预枚举清单里**，且读取前 canonicalize 后仍在**技能目录（发现时的
+  真实路径）**内 —— 拦的是「支持文件本身是/被换成指向外面的符号链接」。**残留限制**（与参照物
+  **同形**，已登记）：①整个**技能目录**被换成指向外面的符号链接；②支持文件是与外部文件**同 inode
+  的硬链接**。这两条不拦，因为参照物的判据也只到这一层。
+- **无技能时不暴露 `load_skill`**（参照物只在 `!skills.is_empty()` 时 push）；支持文件成功结果的
+  **外框**与参照物逐字一致（`# Loaded: skill/rel → File loaded into context.`）；`{name}/`（相对
+  路径为空）走**支持文件**分支并报错列出可用文件（`split_once('/')` 的语义）。
 - ⚠️ **`BUZZ_AGENT_NO_HINTS` 同时关掉技能清单与 `load_skill`**（参照物：hints 关时 skills 是空 vec ⇒
   工具拿不到任何技能）。**未实现**：参照物在受限档还有 `read_roots` 校验（技能常在 `~/.agents/skills`，
   在工作区之外）——本包不实现档位，与「授权责任不变」一致，见上文 granted 隔离待办。
@@ -318,7 +323,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 | `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
-| `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／`NO_HINTS=1` 时技能与约定链同关 |
+| `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论

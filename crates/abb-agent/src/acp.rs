@@ -320,7 +320,7 @@ impl Server {
             tools = kept;
             tools.extend(builtin);
         }
-        if self.hints_enabled {
+        if self.hints_enabled && !skills.is_empty() {
             // `load_skill` 用**裸名**（参照物把它直接 push 进工具表，不经 `dev__`）。
             // 裸名同样会与 MCP 工具撞：rpi 按名字取首个 ⇒ 这里先摘掉同名 MCP 工具。
             let (kept, dropped) =

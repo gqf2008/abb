@@ -8,8 +8,12 @@
 //!   子目录自己带 `SKILL.md` 的不再下钻（那是另一个技能）；支持文件全部预枚举。
 //! - 读取：`name` 取整个技能（剥掉 frontmatter），`name/rel/path` 取支持文件；
 //!   两者合计 32 KiB 上限（按**字符边界**截断）。
-//! - 越界保护：支持文件必须**已经在预枚举清单里**且 canonicalize 后仍在技能目录内
-//!   （参照物另有受限档 `read_roots` 校验，本包不实现档位——见 README 的登记）。
+//! - 越界保护：支持文件必须**已经在预枚举清单里**且 canonicalize 后仍在**技能目录（发现时的
+//!   真实路径）**内。**它拦的是「支持文件本身是/被换成指向外面的符号链接」**，**不是**
+//!   「技能目录整体被换成指向外面的符号链接」（那时两边 canonicalize 都落到外面、前缀照样成立）
+//!   或「支持文件是与外部同 inode 的硬链接」——这两条与参照物**同形**，如实登记为残留限制。
+//! - 参照物另有受限档 `read_roots` 校验（技能常在 `~/.agents/skills`，在工作区之外），本包
+//!   不实现档位（owner 裁定「授权责任不变」），见 README 的登记。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -185,10 +189,13 @@ pub fn discover_with_home(cwd: &Path, home: Option<&Path>) -> Vec<SkillEntry> {
 /// `request` 形如 `name` 或 `name/relative/path`。错误信息里带可用技能名/支持文件清单
 /// （与参照物同款：模型据此自我纠偏，而不是拿到一句干巴巴的失败）。
 pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
-    let request = request.replace('\\', "/");
+    // 切分与归一化的**次序与参照物逐条一致**：先 `split_once('/')`，再只对**相对路径**那半
+    // 把 `\` 归一成 `/`（技能名不归一）。
+    // 次序反了会有两个可观测差异：全反斜杠的路径本包能读而参照物读不到；技能名里含 `\` 的
+    // 技能本包读不到而参照物能读（评审实测）。
     let (skill_name, rel_path) = match request.split_once('/') {
-        Some((name, rest)) if !rest.is_empty() => (name.to_string(), Some(rest.to_string())),
-        _ => (request.clone(), None),
+        Some((name, rest)) => (name.to_string(), Some(rest.replace('\\', "/"))),
+        None => (request.to_string(), None),
     };
     let entry = skills
         .iter()
@@ -221,32 +228,37 @@ pub fn load(request: &str, skills: &[SkillEntry]) -> Result<String, String> {
             })
             .collect();
         return Err(if available.is_empty() {
-            format!("load_skill: skill {skill_name:?} has no supporting files")
+            format!("load_skill: skill {skill_name:?} has no supporting files.")
         } else {
-            format!("load_skill: {rel_path:?} not found in skill {skill_name:?}. Available: {available:?}")
+            format!(
+                "load_skill: file {rel_path:?} not found in skill {skill_name:?}. Available: {available:?}"
+            )
         });
     };
 
     // 越界保护：预枚举清单是按发现时的路径算的，读取前再核一次**真实路径**仍在技能目录内
     // （防「发现之后目录被替换成符号链接」这类竞态；参照物在受限档另有 read_roots 校验）。
-    let canonical_dir = skill_dir
-        .canonicalize()
-        .map_err(|error| format!("load_skill: skill dir not accessible: {error}"))?;
+    let canonical_dir = skill_dir.canonicalize().map_err(|error| {
+        format!("load_skill: could not canonicalize skill directory for {skill_name:?}: {error}")
+    })?;
     let canonical_file = file
         .canonicalize()
-        .map_err(|error| format!("load_skill: could not read {file:?}: {error}"))?;
+        .map_err(|error| format!("load_skill: could not canonicalize {file:?}: {error}"))?;
     if !canonical_file.starts_with(&canonical_dir) {
         return Err(format!(
-            "load_skill: supporting file {rel_path:?} of skill {skill_name:?} is outside the skill directory"
+            "load_skill: file {rel_path:?} of skill {skill_name:?} is outside this skill's directory"
         ));
     }
-    let raw = std::fs::read_to_string(&canonical_file)
+    let content = std::fs::read_to_string(&canonical_file)
         .map_err(|error| format!("load_skill: could not read {file:?}: {error}"))?;
-    let mut output = raw;
-    if output.len() > MAX_SKILL_BODY_BYTES {
-        output = truncate_at_boundary(&output, MAX_SKILL_BODY_BYTES).to_string();
-    }
-    Ok(output)
+    // 成功结果的**外框**与参照物逐字一致（模型据此知道这份内容已经进上下文）。
+    let output =
+        format!("# Loaded: {skill_name}/{rel_path}\n\n{content}\n\n---\nFile loaded into context.");
+    Ok(if output.len() > MAX_SKILL_BODY_BYTES {
+        truncate_at_boundary(&output, MAX_SKILL_BODY_BYTES).to_string()
+    } else {
+        output
+    })
 }
 
 /// 技能正文 + `## Supporting Files` 段（合计受 32 KiB 上限约束）。
@@ -389,7 +401,19 @@ mod tests {
         );
 
         let sub = load("demo/references/foo.md", &skills).expect("读支持文件");
-        assert_eq!(sub, "参考内容 REF");
+        // 外框与参照物逐字一致。
+        assert_eq!(
+            sub,
+            "# Loaded: demo/references/foo.md\n\n参考内容 REF\n\n---\nFile loaded into context."
+        );
+        // 归一化只作用在**相对路径**那半、且切分只认 `/`（与参照物逐条同）：
+        // `demo/references\foo.md` 能读到；而整条都用反斜杠的 `demo\references\foo.md`
+        // 连切分都发生不了 ⇒ 两边都判「技能不存在」（不是本包更宽）。
+        let mixed = load("demo/references\\foo.md", &skills).expect("混合分隔符");
+        assert!(mixed.contains("参考内容 REF"), "{mixed}");
+        let all_backslash =
+            load("demo\\references\\foo.md", &skills).expect_err("整体反斜杠不切分（与参照物同）");
+        assert!(all_backslash.contains("not found"), "{all_backslash}");
     }
 
     #[test]
@@ -417,11 +441,30 @@ mod tests {
         let absolute = load("demo/../../etc/hosts", &skills).expect_err("越界要报错");
         assert!(absolute.contains("not found"), "{absolute}");
 
-        // 没有任何支持文件时的错误也要说清。
+        // 没有任何支持文件时的错误也要说清（措辞与参照物逐字一致，含句号）。
         write_skill(&cwd, "bare", "bare", "无支持文件", "正文");
         let skills = discover_with_home(&cwd, None);
         let no_files = load("bare/whatever.md", &skills).expect_err("要报错");
-        assert!(no_files.contains("no supporting files"), "{no_files}");
+        assert!(no_files.contains("has no supporting files."), "{no_files}");
+
+        // `demo/`（相对路径为空）走**支持文件**分支、不是整技能分支 ⇒ 报错并列出可用文件
+        // （参照物 `split_once('/')` 的语义；上一版把它当成整技能读了）。
+        let trailing = load("demo/", &skills).expect_err("空相对路径要报错");
+        assert!(trailing.contains("file \"\" not found"), "{trailing}");
+        assert!(trailing.contains("ref.md"), "{trailing}");
+    }
+
+    /// 技能名**不**做反斜杠归一（参照物只归一相对路径那半）：名字里带 `\\` 的技能能按原名读到。
+    #[test]
+    fn skill_names_are_not_backslash_normalized() {
+        let cwd = temp_dir("backslash-name");
+        write_skill(&cwd, "bs", r"we\ird", "名字里有反斜杠", "正文 BS");
+        let skills = discover_with_home(&cwd, None);
+        assert_eq!(skills.len(), 1);
+        let loaded = load(r"we\ird", &skills).expect("按原名读");
+        assert!(loaded.contains("正文 BS"), "{loaded}");
+        // 归一化过的那半（`we/ird`）不是这个名字 ⇒ 找不到。
+        assert!(load("we/ird", &skills).is_err());
     }
 
     /// 支持文件发现后被换成指向技能目录外的符号链接 ⇒ 读取时必须拒绝。
@@ -445,7 +488,10 @@ mod tests {
 
         let result = load("demo/ref.md", &skills);
         assert!(
-            result.is_err() && result.unwrap_err().contains("outside the skill directory"),
+            result.is_err()
+                && result
+                    .unwrap_err()
+                    .contains("outside this skill's directory"),
             "越界读必须拒绝"
         );
     }

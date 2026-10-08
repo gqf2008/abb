@@ -63,8 +63,9 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
 - `load_skill_round_trip.py`：技能发现 + `load_skill` 的端到端验收，判据是**假 anthropic 端点抓到的
   请求体**（第一跳看工具表与 system，第二跳看模型拿到的工具结果）：技能清单/描述真进系统提示、工具名是
   **裸名** `load_skill`、正文被读到且 **frontmatter 被剥掉**、支持文件按 `demo/references/foo.md` 读到、
-  越界形式 `demo/../../secrets.md` **拿不到工作区外内容**且给出可纠偏错误、`BUZZ_AGENT_NO_HINTS=1` 时
-  工具表里没有 `load_skill` 且技能正文标记在整个请求体里都不出现。
+  越界形式 `demo/../../secrets.md` **拿不到工作区外内容**且给出可纠偏错误、**无技能的工作区里不暴露
+  `load_skill`**、`BUZZ_AGENT_NO_HINTS=1` 时工具表里没有 `load_skill` 且技能正文标记在整个请求体里
+  都不出现。
 - `hints_and_no_hints.py`：约定链的端到端证据（判据是假 anthropic 端点收到的 `system` 字段）。
   场景 1 断言会话目录的 `AGENTS.md` 与 `$HOME/AGENTS.md` 都进了请求、且全局层在前；场景 2
   断言 `BUZZ_AGENT_NO_HINTS=1`（abb 给 granted 会话的进程级收口）时**两者都不得出现**而默认

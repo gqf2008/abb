@@ -375,8 +375,9 @@ pub const LOAD_SKILL_TOOL: &str = "load_skill";
 
 /// 造本会话的 `load_skill` 工具。
 ///
-/// 技能清单来自 [`crate::skills::discover`]，**只在约定链开启时才有**（参照物：hints 关掉时
-/// skills 直接是空 vec ⇒ 这个工具拿不到任何技能，等于同关）。
+/// 技能清单来自 [`crate::skills::discover`]，**只在约定链开启且真有技能时**才暴露（参照物：
+/// hints 关掉时 skills 是空 vec、且 `agent.rs` 只在 `!skills.is_empty()` 时 push 这个工具）。
+/// 无技能时仍然暴露的话，模型会看到一个指向不存在段落的工具（评审实测到的对外可见偏离）。
 pub fn load_skill_tool(skills: Vec<crate::skills::SkillEntry>) -> Arc<dyn AgentTool> {
     let schema = Tool {
         name: LOAD_SKILL_TOOL.to_string(),
@@ -426,7 +427,7 @@ impl AgentTool for LoadSkillTool {
     ) -> Result<AgentToolResult, AgentError> {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return Err(AgentError::Tool(
-                "load_skill: 缺少 name 参数（应为技能名，或 \"skill/relative/path\"）".to_string(),
+                "load_skill: missing required argument \"name\"".to_string(),
             ));
         };
         // 读取是同步文件 IO：放进 blocking 池，别占住 runtime（沙箱/加载都可能慢）。

@@ -4,12 +4,14 @@
 判据是**假 anthropic 端点抓到的请求体**：第二跳里带着 `load_skill` 的工具结果（模型看到的内容），
 第一跳里带着工具表与 system 字段。
 
-四个场景：
+五个场景：
 1. 默认：system 里有 `# Additional Instructions` + `## Available Skills`（技能名与描述），
    工具表里有**裸名** `load_skill`；用它读技能正文 ⇒ 第二跳结果里有正文标记、**没有** frontmatter；
 2. 支持文件形式 `demo/references/foo.md` ⇒ 结果里有支持文件内容与 `## Supporting Files` 清单；
 3. 越界形式 `demo/../../secret.md` ⇒ 结果是错误（`not found`），且工作区外的秘密内容**不出现**；
-4. `BUZZ_AGENT_NO_HINTS=1` ⇒ 工具表里**没有** `load_skill`、system 里没有 `## Available Skills`，
+4. **工作区里没有任何技能**时不暴露 `load_skill`（参照物只在 `skills` 非空时注册），
+   system 里也没有 `## Available Skills`；
+5. `BUZZ_AGENT_NO_HINTS=1` ⇒ 工具表里**没有** `load_skill`、system 里没有 `## Available Skills`，
    且技能正文标记在整个请求体里都不出现（技能与约定链同关）。
 
 用法：`python3 load_skill_round_trip.py <abb-agent 二进制>`
@@ -226,7 +228,16 @@ check("越界读**没有**拿到秘密内容", SECRET_MARKER not in second_text)
 check("第二跳里有可纠偏的错误信息（not found）", "not found" in second_text)
 
 print()
-print("=== 场景 4：BUZZ_AGENT_NO_HINTS=1 时技能与约定链同关 ===")
+print("=== 场景 4：没有任何技能时不暴露 load_skill ===")
+bare_ws = tempfile.mkdtemp(prefix="abb-skills-bare-")
+first, _ = run_turn(bare_ws, "load_skill", {"name": "demo"})
+names = tool_names(first)
+check("工具表里没有 load_skill（无技能时不暴露）", "load_skill" not in names, f"{names}")
+check("system 里没有技能段", "## Available Skills" not in system_text(first))
+check("内置工具仍在（只少了 load_skill）", "dev__read" in names, f"{names}")
+
+print()
+print("=== 场景 5：BUZZ_AGENT_NO_HINTS=1 时技能与约定链同关 ===")
 workspace = make_workspace()
 first, second = run_turn(workspace, "load_skill", {"name": "demo"},
                          extra_env={"BUZZ_AGENT_NO_HINTS": "1"})
