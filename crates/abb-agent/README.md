@@ -157,6 +157,41 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 abb 的 `killpg` 兜住，单独启动或
 外部单个 pid 被杀时会留孤儿（见上文「例外」）。
 
+## 约定链（刀 2 首批）
+
+`AGENTS.md` 逐级加载 + `~/AGENTS.md` 全局层，语义/上限/截断**逐条对齐**被替代的
+`crates/buzz-agent/src/hints.rs`（同一份用户约定，换执行层不该换行为）：
+
+- 链路 = **git 根 → … → 会话工作目录**（`session/new` 的 `cwd`，即频道工作区；**不是**进程 cwd
+  ——同机器上不同频道本就该看不同目录的约定），再把 `$HOME/AGENTS.md` 作为**全局层插在最前**
+  （home 已在链上时不重复插）；非 git 目录退化成「cwd + 全局层」；
+- 上限 **128 KiB**、**按字符边界**截断（UTF-8 安全）；内容拼在 abb 下发的系统提示**之后**
+  （与 fork 的 `format!("{base}\n\n{hints_text}")` 同序）；没有任何约定时不注入空标题；
+  诚实说明：与 fork 一样是「**逐层留额度**」的写法，所以真实上界是 ≤128 KiB **+2 字节**（分隔符）；
+- ⚠️ **`BUZZ_AGENT_NO_HINTS=1` 是硬前提**：abb 对 **granted（授权者）** 会话只能在**进程级**
+  收口它（`src/service.rs:180-234`：hints 发生在 `session/new` 之前，per-session 的 `_meta`
+  管不到）⇒ 本包不认它就等于**把 owner 的 `~/AGENTS.md` 静默泄漏给授权者**。
+  读法**逐条对齐 fork**（`parse::<u8>()`，不 trim）：未设置/`0` ⇒ 开；**任何非零**（`1`/`2`/`01`/`+1`）
+  ⇒ 关；**读不懂的取值 ⇒ 拒绝启动（exit 2）**，与 fork 的 `die()` 同款——这一条曾被写成
+  「只认字面 `1`」，实测方向是**静默 fail-open**（`true`/`2`/`01` 会把 owner 的约定发给授权者），
+  已按参照物改正。关掉时默认系统提示照旧（关的是约定链，不是提示）。
+- `session/new` 不带 `cwd`（空串）时按**原值**处理：链退化成「进程工作目录那一层」，**不**向祖先链
+  扩散——与参照物的**链函数**同行为（上一版用 `current_dir()` 回落，实测会多读进程 cwd 的 git 根到 cwd
+  整条链）。abb 的生产路径恒下发非空 cwd（`src/buzz/pool.rs` 的 `session_cwd`），这条只是对齐边界。
+  **三处如实登记的残差**（评审实测、当前均不可达）：①参照物在 `session/new` 层就**拒建**空/空白/相对
+  `cwd`（`INVALID_PARAMS`），本包不拒、按上面那条读一层——若将来 abb 真下发空 cwd，两边行为不同；
+  ②空白串在本包 `SessionNewParams::parse` 里被规范化为空串 ⇒ 对 `"   "` 读一层；参照物的链函数则把
+  空白串当**相对路径**处理，其结果依赖进程 cwd（评审实测：进程 cwd 是 git 根时为 1 层，不是固定 0 层），
+  即「空白串 ≠ 空串」这一点两边不同，方向随环境而变；③env 值非 UTF-8 时两边都因 `var().ok()` 落到默认值（= 开），这一格与参照物**相同**
+  但同样是 fail-open 方向，未测。
+- ⚠️ 已知边界：`NO_HINTS=1` 只关**自动注入**，不关「agent 自己主动去读」。首批没有内置工具、granted
+  会话的 MCP 也只有 abb-events，所以暂时封住；**内置工具（read/grep/bash）落地后需要按工具面重新论证
+  授权者会话的约定隔离**。且今天 granted 会话其实先被 abb 的 P2.3 硬闸拒建（abb-agent 如实不声明
+  `_meta.abbSandbox`），这个开关是拒建之外的**双保险**——它的价值在 abb-agent 声明档位之后才真正兑现。
+
+**尚未做**：技能目录发现（`~/.agents/skills`、`<cwd>/.agents/skills` 等）与 `load_skill` 工具
+—— 二者要有内置工具才能读，随内置工具那批一起落地。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -184,13 +219,9 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 **尚未实现（第二刀）**：
 
 - **内置工具接线**（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv` 的 cwd）；
-- **约定链**：`~/AGENTS.md` 作为全局层 + cwd→root 逐级；技能目录对齐
-  `~/.agents/skills` / `<cwd>/.agents/skills`（buzz `hints.rs` 的现状）。
-  **不能**沿用 rpi 的默认位（`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），
-  否则既有用户的约定会静默失效。
-  ⚠️ **前置条件**：约定链一落地就**必须同时认 `BUZZ_AGENT_NO_HINTS`**（或等价的 per-session
-  开关）——abb 用它把「授权者看不到 owner 私有约定」这件事在进程级收口，忽略它会造成
-  owner 的 `~/AGENTS.md` 与技能泄漏给授权者；
+- **技能目录与 `load_skill`**：`~/.agents/skills` / `<cwd>/.agents/skills` 等的发现与按需读取
+  （fork 的 `hints.rs` + `builtin.rs` 现状）。注意**不能**沿用 rpi 的默认位
+  （`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），否则既有用户的约定会静默失效；
 - `_session/steering`（现在如实声明为不支持，走 abb 的 cancel+merge 回退）；
 - `tool_call` / `tool_call_update` 通知；
 - 逐 token 流式（当前与 buzz-agent 一致：非流式，整条 `agent_message_chunk`）；
@@ -224,7 +255,8 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。七条探针各自对应一条被评审反证过的行为：
+单测用替身，探针跑**真二进制**——两者职责不同。八条探针各自对应一条被评审反证过的行为
+（计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
 | --- | --- |
@@ -235,6 +267,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
+| `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
 被算作通过」的假通过窗口。
