@@ -256,6 +256,48 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝对路径反而会破坏正常写入；
 「不得出工作区」这条本身没有放宽。
 
+## 工具调用通知（刀 2 第四批）
+
+`session/update` 的 `tool_call` / `tool_call_update`：**字段名、状态取值与 `content` 的嵌套形状**对齐
+被替代组件的四个发射点（`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/
+emit_completed/emit_failed`）。**但不是逐字等价**——下面把可达状态与三处差异一并写清。
+
+| 时机 | 载荷 | 本包是否可达 |
+| --- | --- | --- |
+| 模型刚发出调用 | `tool_call`：`toolCallId` / `title`（模型看到的**限定名**）/ `kind: "other"` / `status: "pending"` / `rawInput` | ✅ 每条调用 |
+| 开始执行 | `tool_call_update`：`toolCallId` / `status: "in_progress"` | ✅ 每条调用（见差异 1） |
+| 调用执行过 | `tool_call_update`：`status: "completed"` + `content: [{type:"content",content:{type:"text",text}}]` + `rawOutput: {isError}` | ✅ 成功与「工具自己报错」都走这条 |
+| 压根没执行 / 传输失败 | `tool_call_update`：`status: "failed"` + `rawOutput: {error}` | ❌ **本包产不出**（见差异 1） |
+
+终态语义与参照物一致：`completed` = 「调用**执行过**」（工具自己报错也算，错误在 `rawOutput.isError`）；
+`failed` = 「压根没执行 / 传输失败」。非文本结果按参照物的 `as_text_lossy` 渲染成一行占位
+（`[image: <mime>, <n> base64 bytes]`），不静默丢。
+
+**不投影** `ToolExecutionUpdate`（工具进度）：参照物没有对应发射点，多发就是**新行为**而不是等价替换。
+
+### 与参照物的差异（三处，根因在 rpi 的事件模型，不在投影逻辑）
+
+1. rpi 只有「要执行了」一个前态、没有参照物那种「已识别 / 已开始执行」的分界 ⇒ 本包**总会**发
+   `in_progress`，且**从不发 `failed`**。参照物在「参数形状非法 / 未授权 / 被取消」这类**压根不执行**的
+   形状上只发 `pending` + `failed`（实测 unknown-tool 形状：参照物 2 条、本包 3 条）。
+2. 输出被截断导致工具**未执行**时，参照物**不发任何通知**；rpi 仍会发 Start ⇒ 本包发
+   `pending → in_progress → completed(isError:true)`（3 条 vs 参照物 0 条，内容是「未执行」的原因）。
+3. **取消**正在跑的工具调用：参照物补发 `failed: "cancelled"`；本包实测是 `completed`（rpi 中止时照常
+   发 `ToolExecutionEnd`，终态里是工具自己的返回）——**没有悬空 `in_progress`**，但状态取值不同
+   （探针场景 4 实测）。
+
+**另有多处正文层面的差异**（字段形状与语义一致、**正文措辞不同**，故**不得**当作同形）；至少两类：
+①错误正文——本包经 rpi 的工具错误路径会带 `tool error: ` 前缀，参照物直接给文本；本包自建工具
+（写入限定等）的错误正文是中文，参照物对应实现是英文；②**成功回执**——同状态同字段下正文也不同
+（例如本包 `dev__write` 回 "Successfully wrote to <绝对路径>"、`dev__shell` 回 rpi 的截断/退出摘要，
+参照物是它自己的措辞）。这里只举两例、不穷举：**`content.text` 不做逐字对齐**。
+
+**`agent_message_chunk` 少一个 `messageId`**：参照物的文本投影带 `messageId`，本包不带（abb 侧不读它）；
+这条属刀 2 第一批的范围，在此一并登记。
+
+**未验证**：参照物「**未授权**（permission denied）」形状的条数只有源码依据（它的 `emit_failed`），
+本机没有能触发该形状的客户端；同一「压根不执行」类已由 unknown-tool 形状实测覆盖。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -283,7 +325,6 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 **尚未实现（第二刀）**：
 
 - `_session/steering`（现在如实声明为不支持，走 abb 的 cancel+merge 回退）；
-- `tool_call` / `tool_call_update` 通知；
 - 逐 token 流式（当前与 buzz-agent 一致：非流式，整条 `agent_message_chunk`）；
 - `StopReason::Length`（截断）目前会被报成 `end_turn`（abb 的 `max_tokens` 分支收不到）。
 - **openai-chat + 官方 OpenAI 推理模型**可能因字段名被拒：rpi 默认发 `max_tokens`，而被替代的
@@ -315,7 +356,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。十条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。十一条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -328,6 +369,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 | `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
+| `tool_call_notifications.py` | 工具调用通知真发出（`pending → in_progress → completed/failed`，含 MCP 工具）；成功那条带 `content`/`rawOutput` |
 | `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 

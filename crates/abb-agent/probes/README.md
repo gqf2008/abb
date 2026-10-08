@@ -60,6 +60,12 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   `BUZZ_AGENT_DEV_TOOLS=0` 时既没有内置工具也没有文件产出；末段符号链接指向工作区外时写入必须被拒
   且目标文件内容原封不动；`dev__shell` 的 `env` 快照里**不得**出现宿主凭据（`ANTHROPIC_API_KEY`
   探针哨兵）而 `PATH` 仍在；`dev__edit` 真改文件内容。
+- `tool_call_notifications.py`：工具调用通知的端到端验收，**判据是 abb-agent 自己的 stdout**
+  （abb 会收到的那些 `session/update`）：成功调用必须看到 `tool_call`（`pending` + `title` 限定名 +
+  `rawInput`）→ `in_progress` → `completed`（带 `content` 与 `rawOutput.isError:false`）；工具**自己报错**时
+  仍是 `completed` + `rawOutput.isError:true`（参照物语义：`failed` 只用于「压根不执行」，而本包受 rpi
+  事件模型限制产不出 `failed`——差异已在 README 登记）；MCP 工具同样有通知（证明不是只给内置工具打的
+  补丁）；取消长工具调用时**没有悬空 `in_progress`**（实测终态是 `completed`）。
 - `load_skill_round_trip.py`：技能发现 + `load_skill` 的端到端验收，判据是**假 anthropic 端点抓到的
   请求体**（第一跳看工具表与 system，第二跳看模型拿到的工具结果）：技能清单/描述真进系统提示、工具名是
   **裸名** `load_skill`、正文被读到且 **frontmatter 被剥掉**、支持文件按 `demo/references/foo.md` 读到、

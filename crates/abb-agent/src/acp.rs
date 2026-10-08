@@ -18,7 +18,8 @@
 //!   `parse_abb_sandbox_modes` 因此得到 `None` → `SandboxSupport::Unsupported`。
 //!   这是**如实声明**：声明支持却不执行，正是 abb 注释里点名的事故形态。
 //! - **不发 `session/request_permission`**：授权约定由 AGENTS.md 承担。
-//! - **不发 `tool_call` / `tool_call_update`**：留第二刀。
+//! - **发 `tool_call` / `tool_call_update`**（刀 2 第四批）：工具调用要可见，
+//!   载荷与参照物的四个发射点对齐，见 [`tool_updates`] 的边界说明。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +31,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex;
 
 use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::types::AgentToolResult;
 
 use crate::mcp::{McpServerSpec, McpSession};
 use crate::provider::{self, Backend};
@@ -695,33 +697,120 @@ impl TurnAccum {
     }
 }
 
-/// 把一条事件按需投影成 `session/update`（第一刀只投影 assistant 文本）。
+/// 把一条事件按需投影成 `session/update`。
 ///
-/// 刻意在 `MessageEnd` 整条发、而不是逐 delta 发：buzz-agent 自己就是
+/// 文本刻意在 `MessageEnd` 整条发、而不是逐 delta 发：buzz-agent 自己就是
 /// 「Non-streaming」的（见其 Cargo.toml 描述），abb 侧只是把 chunk 文本累加，
 /// 整条发与逐字发对它等价；逐 delta 需要再摸一层 `AssistantMessageEvent` 形状。
+///
+/// 工具调用则**必须**投影（参照物有、abb 侧会解析并记日志）：见 [`tool_updates`]。
 async fn write_event(writer: &Writer, session_id: &str, event: &AgentEvent) {
-    let AgentEvent::MessageEnd { message } = event else {
-        return;
-    };
-    let Some(text) = assistant_text(message) else {
-        return;
-    };
-    if let Err(error) = writer
-        .notify(
-            "session/update",
-            json!({
-                "sessionId": session_id,
-                "update": {
+    for update in event_updates(event) {
+        if let Err(error) = writer
+            .notify(
+                "session/update",
+                json!({ "sessionId": session_id, "update": update }),
+            )
+            .await
+        {
+            tracing::warn!("session/update 写出失败，已忽略：{error}");
+        }
+    }
+}
+
+/// 一条事件对应的零到多条 `session/update` 载荷（纯函数，便于单测钉形状）。
+fn event_updates(event: &AgentEvent) -> Vec<Value> {
+    match event {
+        AgentEvent::MessageEnd { message } => assistant_text(message)
+            .map(|text| {
+                vec![json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": { "type": "text", "text": text },
-                },
-            }),
-        )
-        .await
-    {
-        tracing::warn!("session/update 写出失败，已忽略：{error}");
+                })]
+            })
+            .unwrap_or_default(),
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => tool_updates(tool_call_id, tool_name, Some(args), None),
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => tool_updates(tool_call_id, tool_name, None, Some((result, *is_error))),
+        // 参照物没有「工具进度」这一发射点（它只有 pending/in_progress/completed/failed 四个），
+        // 所以这里**不**投影 `ToolExecutionUpdate`——多发的通知是新行为，不是等价替换。
+        _ => Vec::new(),
     }
+}
+
+/// 工具调用的 `session/update` 载荷，**字段与状态取值对齐**被替代组件的四个发射点
+/// （`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）。
+///
+/// **两处已知边界**（根因在 rpi 的事件模型，不在投影逻辑；已在 README 登记）：
+/// 1. rpi 只有「要执行了（Start）」一个前态、没有参照物那种「已识别 / 已开始执行」的分界
+///    ⇒ 本包**总会**发 `in_progress`；参照物在「参数形状非法 / 未授权 / 被取消」这类
+///    **压根不执行**的形状上只发 `pending` + `failed`（因此本包也几乎用不到 `failed`）。
+/// 2. 输出被截断导致工具**未执行**时，参照物不发任何通知；rpi 仍会发 Start ⇒ 本包会看到
+///    `pending → in_progress → completed(isError:true)`（内容是「未执行」的原因）。
+fn tool_updates(
+    tool_call_id: &str,
+    tool_name: &str,
+    args: Option<&Value>,
+    finished: Option<(&AgentToolResult, bool)>,
+) -> Vec<Value> {
+    match (args, finished) {
+        (Some(args), None) => vec![
+            // pending：模型刚发出调用（带原始入参，UI 可以显示「要做什么」）。
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_call_id,
+                "title": tool_name,
+                "kind": "other",
+                "status": "pending",
+                "rawInput": args,
+            }),
+            // in_progress：真正开始执行（参照物把这两个状态分成两条发）。
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": "in_progress",
+            }),
+        ],
+        // 终态与参照物**同语义**：`completed` 表示「调用执行过（不管工具自己报没报错）」，
+        // 错误信息放在 `rawOutput.isError` 里（参照物的 `emit_completed` 就是这么发的——
+        // 它的 `failed` 只用于「压根没执行」：参数形状非法 / 未授权 / 被取消 / 传输失败）。
+        (None, Some((result, is_error))) => vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": tool_result_text(result) } }],
+            "rawOutput": { "isError": is_error },
+        })],
+        _ => Vec::new(),
+    }
+}
+
+/// 工具结果的文本：与参照物的 `ToolResult::text()`（`ToolResultContent::as_text_lossy`）
+/// **同形**——文本块原样、图片渲染成一行占位说明（`[image: <mime>, <n> base64 bytes]`），
+/// 非文本内容不许静默消失（早先这里直接丢图 ⇒ 通知里变成空串，与参照物不同形）。
+fn tool_result_text(result: &AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
+    result
+        .content
+        .iter()
+        .map(|part| match part {
+            TextContentOrImage::Text(text) => text.text.clone(),
+            TextContentOrImage::Image(image) => format!(
+                "[image: {}, {} base64 bytes]",
+                image.mime_type,
+                image.data.len()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 取 assistant 消息里的文本内容；非 assistant / 无文本返回 `None`。
@@ -813,6 +902,99 @@ mod tests {
     /// 这条锁钉的是 `acp.rs` 的**接线处**（上一版 bug 就在这里，而只钉 `hints_section` 的
     /// 单测在那种回归下依然全绿——评审实测：把接线改回 `current_dir()`，62 单测 + 8 探针全绿）。
     /// 与内置工具撞名的 MCP 工具必须被摘掉（rpi 按名字取首个 ⇒ 否则静默不可达）。
+    /// 工具调用通知的四种载荷必须与被替代组件的发射点**逐字同形**。
+    #[test]
+    fn tool_call_updates_match_the_replaced_component() {
+        let args = serde_json::json!({"command": "ls"});
+        let started = tool_updates("call_1", "dev__shell", Some(&args), None);
+        assert_eq!(started.len(), 2, "参照物分两条发：pending 然后 in_progress");
+        assert_eq!(
+            started[0],
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "title": "dev__shell",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"command": "ls"},
+            })
+        );
+        assert_eq!(
+            started[1],
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+            })
+        );
+
+        let ok = AgentToolResult::text("文件已写入");
+        let completed = tool_updates("call_1", "dev__shell", None, Some((&ok, false)));
+        assert_eq!(
+            completed[0],
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "文件已写入"}}],
+                "rawOutput": {"isError": false},
+            })
+        );
+
+        // 工具**跑完报错**走 `completed` + `rawOutput.isError: true`（参照物 `emit_completed`
+        // 的语义；它的 `failed` 只用于「压根没执行」）。
+        let errored = tool_updates("call_1", "dev__shell", None, Some((&ok, true)));
+        assert_eq!(
+            errored[0],
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "文件已写入"}}],
+                "rawOutput": {"isError": true},
+            })
+        );
+    }
+
+    /// 图片不许静默丢：文本形态要与参照物的 `as_text_lossy` 同形（否则通知里是空串）。
+    #[test]
+    fn tool_result_text_renders_images_like_the_replaced_component() {
+        use rpi_agent::types::TextContentOrImage;
+        use rpi_ai::types::{ImageContent, ImageContentType};
+        let result = AgentToolResult {
+            content: vec![
+                TextContentOrImage::text("看图"),
+                TextContentOrImage::Image(ImageContent {
+                    kind: ImageContentType,
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: Value::Null,
+            usage: None,
+            added_tool_names: Vec::new(),
+            terminate: false,
+        };
+        let text = tool_result_text(&result);
+        assert!(text.contains("看图"), "{text}");
+        assert!(
+            text.contains("[image: image/png, 8 base64 bytes]"),
+            "图片要留一行占位（与参照物 as_text_lossy 同形）：{text}"
+        );
+    }
+
+    /// 只投影参照物有的东西：`ToolExecutionUpdate`（工具进度）参照物没有对应发射点 ⇒ 不发。
+    #[test]
+    fn tool_progress_events_are_not_projected() {
+        let event = rpi_agent::events::AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "call_1".to_string(),
+            tool_name: "dev__shell".to_string(),
+            args: serde_json::json!({}),
+            partial_result: Arc::new(AgentToolResult::text("半截输出")),
+        };
+        assert!(event_updates(&event).is_empty(), "参照物没有进度发射点");
+    }
+
     #[test]
     fn mcp_tools_colliding_with_builtin_names_are_dropped() {
         struct Stub(Tool);
