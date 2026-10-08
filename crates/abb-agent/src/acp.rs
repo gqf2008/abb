@@ -54,7 +54,7 @@ pub struct Server {
     backend: Result<Backend, String>,
     /// abb 注入的回合上界（`BUZZ_AGENT_MAX_ROUNDS`，默认 200）。
     max_rounds: u64,
-    /// 约定链是否开启（`BUZZ_AGENT_NO_HINTS==1` 时关）。**装配时定一次**：
+    /// 约定链是否开启（`BUZZ_AGENT_NO_HINTS` **非零**时关）。**装配时定一次**：
     /// abb 对 granted 会话只在**进程级**收口这个变量（见 `hints` 模块文档），
     /// 与 fork 同语义。
     hints_enabled: bool,
@@ -125,7 +125,7 @@ impl Server {
         }
         if !hints_enabled {
             tracing::info!(
-                "约定链已关闭（{}==1）：不加载 ~/AGENTS.md 与会话目录链",
+                "约定链已关闭（{} 非零）：不加载 ~/AGENTS.md 与会话目录链",
                 crate::hints::NO_HINTS_ENV
             );
         }

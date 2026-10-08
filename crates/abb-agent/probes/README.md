@@ -57,7 +57,9 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
 - `hints_and_no_hints.py`：约定链的端到端证据（判据是假 anthropic 端点收到的 `system` 字段）。
   场景 1 断言会话目录的 `AGENTS.md` 与 `$HOME/AGENTS.md` 都进了请求、且全局层在前；场景 2
   断言 `BUZZ_AGENT_NO_HINTS=1`（abb 给 granted 会话的进程级收口）时**两者都不得出现**而默认
-  系统提示仍在；场景 3 断言没有 `AGENTS.md` 时不注入空标题。
+  系统提示仍在；场景 3 断言没有 `AGENTS.md` 时不注入空标题；场景 4 断言 `NO_HINTS=2` 也判关；
+  场景 5 断言 `true`/`yes`/`-1`/`256`/`" 1 "` 这类取值**不发任何模型请求且以 2 退出**（不能静默
+  fail-open）；场景 6 断言空 cwd 时只读进程工作目录那一层、不向祖先链扩散（钉 `acp.rs` 接线）。
   **修前表现**：没有任何约定链（系统提示里只有 abb 下发的或默认那一句），granted 会话与 owner
   会话完全同形（本该被区分）。探针自带隔离的 `HOME`/`USERPROFILE`，不会读跑测机器的真实
   `~/AGENTS.md`。

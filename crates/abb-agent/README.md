@@ -180,8 +180,9 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   整条链）。abb 的生产路径恒下发非空 cwd（`src/buzz/pool.rs` 的 `session_cwd`），这条只是对齐边界。
   **三处如实登记的残差**（评审实测、当前均不可达）：①参照物在 `session/new` 层就**拒建**空/空白/相对
   `cwd`（`INVALID_PARAMS`），本包不拒、按上面那条读一层——若将来 abb 真下发空 cwd，两边行为不同；
-  ②空白串在本包 `SessionNewParams::parse` 里被规范化为空串 ⇒ 对 `"   "` 读一层，而参照物的链函数对
-  `"   "` 读 0 层；③env 值非 UTF-8 时两边都因 `var().ok()` 落到默认值（= 开），这一格与参照物**相同**
+  ②空白串在本包 `SessionNewParams::parse` 里被规范化为空串 ⇒ 对 `"   "` 读一层；参照物的链函数则把
+  空白串当**相对路径**处理，其结果依赖进程 cwd（评审实测：进程 cwd 是 git 根时为 1 层，不是固定 0 层），
+  即「空白串 ≠ 空串」这一点两边不同，方向随环境而变；③env 值非 UTF-8 时两边都因 `var().ok()` 落到默认值（= 开），这一格与参照物**相同**
   但同样是 fail-open 方向，未测。
 - ⚠️ 已知边界：`NO_HINTS=1` 只关**自动注入**，不关「agent 自己主动去读」。首批没有内置工具、granted
   会话的 MCP 也只有 abb-events，所以暂时封住；**内置工具（read/grep/bash）落地后需要按工具面重新论证
@@ -266,7 +267,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
-| `hints_and_no_hints.py` | 约定链真进请求体（会话目录 + `$HOME/AGENTS.md`，全局层在前）；`BUZZ_AGENT_NO_HINTS=1` 时两者都不得出现 |
+| `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
 被算作通过」的假通过窗口。

@@ -7,11 +7,16 @@
 所以 abb-agent 不认这个变量 = **owner 的 `~/AGENTS.md` 会静默泄漏给授权者**。
 判据是**假 anthropic 端点收到的请求体里的 `system` 字段**，不是读代码。
 
-三个场景（同一进程两份二进制调用、完全隔离的 HOME 与会话目录）：
+六个场景（每个场景起一份真二进制进程；HOME/`USERPROFILE` 与会话目录都隔离）：
 1. 默认：会话 cwd 的 `AGENTS.md` + `$HOME/AGENTS.md`（全局层）都必须出现在 `system` 里；
 2. `BUZZ_AGENT_NO_HINTS=1`：两个标记都**不得**出现（且默认系统提示仍在——是关约定链，
    不是把提示也弄丢）；
-3. 没有任何 `AGENTS.md`：`system` 就是默认提示，不出现空标题之类的噪声。
+3. 没有任何 `AGENTS.md`：`system` 就是默认提示，不出现空标题之类的噪声；
+4. `BUZZ_AGENT_NO_HINTS=2`：也判为**关闭**（参照物是 `parse::<u8>()` + 非零即关）；
+5. `true`/`yes`/`-1`/`256`/`" 1 "` 这类读不懂的取值：进程**不发任何模型请求**且以 **2** 退出
+   （与参照物 `die()` 同款）——这是「不能静默 fail-open」的端到端证据；
+6. 空 cwd + 进程 cwd 位于 git 子目录（根与 cwd 各一份 `AGENTS.md`）：只许读到 cwd 那一层，
+   钉住 `acp.rs` 的接线处（退回 `current_dir()` 回落时本场景会红）。
 
 用法：`python3 hints_and_no_hints.py <abb-agent 二进制>`
 """
