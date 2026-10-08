@@ -64,3 +64,19 @@ env_allow = [
   "RUSTC_WRAPPER",
   "CARGO_TARGET_DIR",
 ]
+
+# abb-agent 是独立包（root 无 [workspace]），root 的 fmt/clippy/build/test 编不到它。
+# 没有这条任务，分支上的代码会烂掉而不被任何门禁发现。
+# 与 fork-lint 同构：fmt + clippy(-D warnings, --all-targets) + test 编译。
+[[task]]
+name = "abb-agent-lint"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo fmt --manifest-path crates/abb-agent/Cargo.toml -- --check && cargo clippy --manifest-path crates/abb-agent/Cargo.toml --all-targets --locked -- -D warnings && cargo test --manifest-path crates/abb-agent/Cargo.toml --no-run --locked"
+timeout = "45m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
