@@ -411,9 +411,8 @@ pub async fn run() {
     // 幂等（新目录存在跳过）；失败只 log 不阻塞（数据仍在旧目录，日志指明）。
     cfg.migrate_keys();
     crate::log!(
-        "[service] 只响应: {}  默认后端: {}  bot数: {}",
+        "[service] 只响应: {}  bot数: {}",
         cfg.owner_open_id,
-        cfg.default_backend,
         cfg.bots.len()
     );
 

@@ -250,7 +250,6 @@ struct SessionRow {
     state: String,
     count_7d: i64,
     count_total: i64,
-    backend: String,
 }
 
 /// session list：全部 bot × 会话，字段齐全，默认最近活跃倒序。
@@ -301,7 +300,6 @@ fn cmd_list(args: &[String]) -> i32 {
 
     let mut rows: Vec<SessionRow> = Vec::new();
     for (bot, key) in selected_bots {
-        let backend = bot.effective_backend(&cfg.default_backend).to_string();
         let ws = crate::workspace_dir(&key);
         // 暂停态一次取齐（避免每会话热刷新）；话题 key 回落 chat 前缀判定
         let paused_keys: Vec<String> = state
@@ -345,7 +343,6 @@ fn cmd_list(args: &[String]) -> i32 {
                 state: st,
                 count_7d: s.map(|x| x.count_7d).unwrap_or(0),
                 count_total: s.map(|x| x.count_total).unwrap_or(0),
-                backend: backend.clone(),
             });
         }
     }
@@ -363,8 +360,8 @@ fn cmd_list(args: &[String]) -> i32 {
             "-".to_string()
         };
         println!(
-            "[{}] {} 名={} 平台={} 状态={} 最近活跃={} 消息7d/总={} 后端={}",
-            r.bot, r.chat, r.display, r.platform, r.state, active, msgs, r.backend
+            "[{}] {} 名={} 平台={} 状态={} 最近活跃={} 消息7d/总={}",
+            r.bot, r.chat, r.display, r.platform, r.state, active, msgs
         );
     }
     0
@@ -402,7 +399,6 @@ fn cmd_show(args: &[String]) -> i32 {
         })
         .unwrap_or(0);
     let bot = cfg.bots.iter().find(|b| b.key() == bot_key).unwrap();
-    let backend = bot.effective_backend(&cfg.default_backend).to_string();
     // #194：虚拟 Bot 群的会话/历史/指令在独立工作区 vb/<uuid>/
     let ws = ws_for_chat(&bot_key, &chat);
     let state = SessionState::production();
@@ -421,7 +417,7 @@ fn cmd_show(args: &[String]) -> i32 {
         .map(fmt_ts)
         .unwrap_or_else(|| "-".to_string());
     println!(
-        "会话：bot={bot_key} chat={chat} 平台={} 状态={} 后端={backend}",
+        "会话：bot={bot_key} chat={chat} 平台={} 状态={}",
         platform_name(&bot.kind),
         if paused { "paused" } else { "active" }
     );

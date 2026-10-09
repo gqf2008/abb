@@ -1774,9 +1774,10 @@ mod tests {
 
     /// 构造指定后端的 bot（随机 key 隔离工作目录）。
     fn backend_bot(backend: &str) -> BotConfig {
+        // backend 字段已随单后端化删除（刀 4b）；参数保留仅作历史出处标注的语义可读性。
+        let _ = backend;
         BotConfig {
             name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            backend: backend.into(),
             ..Default::default()
         }
     }

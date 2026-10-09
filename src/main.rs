@@ -645,9 +645,8 @@ fn main() {
         match config::Config::load() {
             Ok(c) => {
                 println!(
-                    "owner={} default_backend={} bot数={} missing={:?}",
+                    "owner={} bot数={} missing={:?}",
                     c.owner_open_id,
-                    c.default_backend,
                     c.bots.len(),
                     c.missing()
                 );

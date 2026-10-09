@@ -1,7 +1,6 @@
 //! 配置 —— 读写 ~/.agent-bridge/config.json（0600）。多 bot 结构。
 //!
-//! 新 schema：{owner_open_id, default_backend, bots:[{name, kind, enabled, backend, app_id, app_secret, bot_name, bot_open_id, primary_chat_id, wx_*, ding_*}]}
-//! backend 是 per-bot 默认后端（空=跟随全局 default_backend）。
+//! 新 schema：{owner_open_id, bots:[{name, kind, enabled, app_id, app_secret, bot_name, bot_open_id, primary_chat_id, wx_*, ding_*}]}
 //! 兼容：load() 自动把旧单 bot 字段（顶层 app_id/app_secret/bot_name/bot_open_id）迁移成 bots[0]。
 
 use anyhow::{Context, Result};
@@ -72,10 +71,6 @@ pub struct BotConfig {
     /// 该 bot 的主会话（与 owner 的私聊 p2p）chat_id —— 定时任务会话失效时的回落目标。
     #[serde(default)]
     pub primary_chat_id: String,
-    /// 该 bot 的默认后端（claude|codex）。空 = 跟随全局 default_backend（向后兼容旧 config）。
-    /// per-bot 独立：改飞书 bot 的后端不会再动到微信 bot。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub backend: String,
     /// 内部执行档位：普通 UI 已下架，保留旧 config 的 codex_sandbox alias 与高级 JSON
     /// 配置能力。旧 config 无字段 → full-access，兼容不落盘；显式限制档才会写盘。
     #[serde(
@@ -235,7 +230,6 @@ impl Default for BotConfig {
             bot_name: String::new(),
             bot_open_id: String::new(),
             primary_chat_id: String::new(),
-            backend: String::new(),
             sandbox_mode: SandboxMode::FullAccess,
             key_suffix: String::new(),
             owner_open_id: String::new(),
@@ -643,15 +637,6 @@ impl BotConfig {
         }
     }
 
-    /// 该 bot 的生效后端：自身 backend 非空用之，否则回落全局默认。返回值保证是 claude/codex。
-    pub fn effective_backend<'a>(&'a self, global_default: &'a str) -> &'a str {
-        if self.backend.is_empty() {
-            global_default
-        } else {
-            &self.backend
-        }
-    }
-
     /// 统一访问判定（不矛盾的单一入口）：只放行 owner ∪ 授权者白名单成员
     /// （#118：公开开关已从判定链移除，open_access / ding_open_access 字段仅保留兼容旧 config，
     /// 不再被读取——未经授权一律拦截，fail-closed）。
@@ -984,8 +969,6 @@ fn default_task_workers_manual() -> usize {
 pub struct Config {
     #[serde(default)]
     pub owner_open_id: String,
-    #[serde(default)]
-    pub default_backend: String,
     /// 每通道 task worker 上限（Q7「上限可配」；见 [`TaskWorkers`]）。
     #[serde(default)]
     pub task_workers: TaskWorkers,
@@ -1078,7 +1061,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             owner_open_id: String::new(),
-            default_backend: String::new(),
             task_workers: TaskWorkers::default(),
             cross_delivery_enabled: false,
             workspace_git_enabled: true,    // #209 工作区版本管理默认开
@@ -1229,9 +1211,6 @@ impl Config {
             .with_context(|| format!("读 config.json 失败: {}", p.display()))?;
         let mut cfg: Config =
             serde_json::from_str(&text).with_context(|| "config.json 不是合法 JSON")?;
-        if cfg.default_backend.is_empty() {
-            cfg.default_backend = "claude".into();
-        }
         cfg.migrate_legacy();
         cfg.migrate_ding_owner();
         // #174：内存分配同名 suffix（确定性；GUI 保存时落盘固化）
@@ -1755,9 +1734,6 @@ impl Config {
         }
         let text = std::fs::read_to_string(&p).ok()?;
         let mut cfg: Config = serde_json::from_str(&text).ok()?;
-        if cfg.default_backend.is_empty() {
-            cfg.default_backend = "claude".into();
-        }
         cfg.migrate_legacy();
         Some(cfg)
     }
@@ -2836,7 +2812,7 @@ mod tests {
     #[test]
     fn provider_serde_defaults() {
         // 旧 config 无 providers/default_provider 字段 → 反序列化为空，不报错
-        let text = r#"{"owner_open_id":"o","default_backend":"claude","bots":[]}"#;
+        let text = r#"{"owner_open_id":"o","bots":[]}"#;
         let c: Config = serde_json::from_str(text).unwrap();
         assert!(c.providers.is_empty());
         assert!(c.default_provider.is_empty());
@@ -2861,7 +2837,7 @@ mod tests {
         let c = Config::default();
         assert!(!c.cross_delivery_enabled);
         // 旧 config 无该字段 → 反序列化为 false，不报错
-        let text = r#"{"owner_open_id":"o","default_backend":"claude","bots":[]}"#;
+        let text = r#"{"owner_open_id":"o","bots":[]}"#;
         let c2: Config = serde_json::from_str(text).unwrap();
         assert!(!c2.cross_delivery_enabled);
         // 显式打开 → 序列化/反序列化往返不丢
