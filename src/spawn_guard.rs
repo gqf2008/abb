@@ -100,16 +100,51 @@ struct KeyState {
 }
 
 /// 全局 spawn 守卫（进程内单例）。
-#[derive(Debug, Default)]
+///
+/// **测试进程里禁用**（`#[cfg(test)]` 返回 no-op 守卫）：大量测试故意造「agent 超时/崩溃」
+/// 场景，若共享生产熔断/限速，全量并行时会被计满 `BREAK_AFTER` 触发熔断，波及其它无辜
+/// 测试的 spawn（实测：`oneshot_external_cancel` / `oneshot_timeout` 两条 flaky 就是被
+/// 其它测试的故意失败打满熔断后连累）。进程保护防的是「真实部署上 agent 二进制起不来」
+/// 的风暴，测试进程无此风险。
+#[derive(Debug)]
 pub struct SpawnGuard {
     keys: Mutex<HashMap<String, KeyState>>,
+    /// true = 完全不禁（测试进程）：`check` 恒放行、失败/成功记录 no-op。
+    unlimited: bool,
+}
+
+impl Default for SpawnGuard {
+    fn default() -> Self {
+        Self {
+            keys: Mutex::new(HashMap::new()),
+            unlimited: false,
+        }
+    }
 }
 
 impl SpawnGuard {
-    /// 进程内单例。
+    /// 进程内单例。测试构建返回**无限制**守卫（见结构体注释），生产构建才是真守卫。
     pub fn global() -> &'static SpawnGuard {
         static G: OnceLock<SpawnGuard> = OnceLock::new();
-        G.get_or_init(SpawnGuard::default)
+        G.get_or_init(|| {
+            #[cfg(test)]
+            {
+                SpawnGuard::unlimited()
+            }
+            #[cfg(not(test))]
+            {
+                SpawnGuard::default()
+            }
+        })
+    }
+
+    /// 测试用的无限制守卫：`check` 恒放行、失败/成功记录均为 no-op。
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self {
+            keys: Mutex::new(HashMap::new()),
+            unlimited: true,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, KeyState>> {
@@ -124,6 +159,9 @@ impl SpawnGuard {
     /// 预约语义：调用时就把它自己排到「next_slot + 退避」这个位置，**并发调用者会拿到各自的
     /// 槽位**（而不是同时通过检查、一起 spawn）。
     pub fn check(&self, key: &str, now: Instant) -> Result<Duration, Denied> {
+        if self.unlimited {
+            return Ok(Duration::ZERO);
+        }
         let mut map = self.lock();
         let st = map.entry(key.to_string()).or_default();
 
@@ -167,6 +205,9 @@ impl SpawnGuard {
 
     /// 报告一次 spawn 后**很快失败**（agent 起了就死 / 起不来）：累加连续失败，必要时熔断。
     pub fn record_failure(&self, key: &str, now: Instant) {
+        if self.unlimited {
+            return;
+        }
         let mut map = self.lock();
         let st = map.entry(key.to_string()).or_default();
         st.failures = st.failures.saturating_add(1);
@@ -183,6 +224,9 @@ impl SpawnGuard {
 
     /// 报告一次**健康**运行（回合成功 / 进程存活够久）：连续失败清零、熔断复位。
     pub fn record_success(&self, key: &str) {
+        if self.unlimited {
+            return;
+        }
         let mut map = self.lock();
         if let Some(st) = map.get_mut(key) {
             st.failures = 0;
@@ -193,6 +237,9 @@ impl SpawnGuard {
 
     /// 只读快照（诊断用：日志/测试）。
     pub fn snapshot(&self, key: &str) -> (u32, Option<Duration>) {
+        if self.unlimited {
+            return (0, None);
+        }
         let now = Instant::now();
         let map = self.lock();
         match map.get(key) {
