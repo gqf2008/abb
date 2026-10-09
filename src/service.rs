@@ -306,13 +306,22 @@ fn build_bot_acp_handles(
             extra_mcp,
         )
     };
-    let normal = mk(normal_command, env.clone(), normal_meta, extra_mcp);
     // granted 实例：NO_HINTS + Jev 门禁 env（受限会话的工具调用要先问 Jev）。
+    // normal 实例：owner 配了受限档（read-only/workspace-write）时同样套 Jev 门禁
+    // （abb-agent 的 `restricted()` 判定含 sandbox=read-only/workspace-write），所以
+    // normal 也要带 JEV_* env；owner 全权限会话不套门禁、多带几个 env 无害。
+    let jev = jev_env(cfg);
+    let normal = mk(
+        normal_command,
+        env.clone().into_iter().chain(jev.clone()).collect(),
+        normal_meta,
+        extra_mcp,
+    );
     let granted = mk(
         granted_command,
         env.into_iter()
             .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
-            .chain(jev_env(cfg))
+            .chain(jev)
             .collect(),
         Some(granted_meta),
         Vec::new(),
@@ -349,8 +358,8 @@ fn oneshot_agent_config_inner(
     role_cmds: (String, String),
     sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
 ) -> crate::buzz::harness::AgentConfig {
-    // **与聊天句柄同一条判据**：需要档位的会话（owner 的 read-only/workspace-write、granted）
-    // 必须落在旧执行层，否则 abb 的 P2.3 硬闸会拒建（评审实测：这条路径原来没做分流）。
+    // 统一迁移刀 4a：需要档位的会话（owner 的 read-only/workspace-write、granted）也走
+    // abb-agent（已声明档位），且套 Jev 门禁——所以带档位时注入 JEV_* env。
     let command = pick_command_by_sandbox(
         (role_cmds.0.as_str(), role_cmds.1.as_str()),
         sandbox.is_some(),
@@ -363,6 +372,7 @@ fn oneshot_agent_config_inner(
         extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
             .into_iter()
             .chain(env)
+            .chain(jev_env(cfg))
             .collect(),
         backend: "buzz".to_string(),
         session_sandbox: sandbox,
