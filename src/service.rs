@@ -58,30 +58,25 @@ fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> 
 
 /// 给定（owner 命令、授权者命令）与该 bot 的 owner 档位，选出 normal 会话实际用哪条。
 ///
-/// **这是切换的第二个开关**：abb-agent 如实不声明 `_meta.abbSandbox`，而 abb 对带
-/// `session_sandbox` 的会话 fail-closed ⇒ owner 配了受限档时必须留在旧执行层，否则
-/// 那些会话会被拒建（不是 abb-agent 的缺陷，是「不碰权限」决策的必然结果）。
-fn pick_command_by_sandbox<'a>(role_cmds: (&'a str, &'a str), needs_sandbox: bool) -> &'a str {
-    let (owner_cmd, old_layer_cmd) = role_cmds;
-    if needs_sandbox {
-        old_layer_cmd
-    } else {
-        owner_cmd
-    }
+/// 统一迁移刀 4a：abb-agent **已声明** `_meta.abbSandbox` 三档并实现受限执行（Jev 门禁 +
+/// 读域闸 + 档位工具面），所以「需要档位的会话必须留旧层」这条旧判据**不再成立**——
+/// 受限会话现在可以、也应该走 abb-agent。函数简化为恒取 owner 槽（两条槽都已指向
+/// abb-agent，旧层只剩「覆盖回滚」一个用途）。保留函数签名是为了让三条建会话路径的
+/// 接线测试仍然能钉住「走哪个槽」。
+fn pick_command_by_sandbox<'a>(role_cmds: (&'a str, &'a str), _needs_sandbox: bool) -> &'a str {
+    let (owner_cmd, _old_layer_cmd) = role_cmds;
+    owner_cmd
 }
 
 /// **切换的核心映射**：角色 → 随包候选名（按顺序试）。
 ///
-/// `owner = true`（无受限档的 owner 会话）：优先新执行层 `abb-agent`，回落旧层（回滚形态）；
-/// `owner = false`（授权者会话，或 owner 带受限档）：**只认旧层** `buzz-agent`。
+/// 统一迁移刀 4a：两种角色都优先 abb-agent（它已声明 `_meta.abbSandbox` 三档 + Jev 门禁 +
+/// 读域闸），回落 buzz-agent（**仅作回滚**：abb-agent 缺失/被覆盖时）。
 /// 抽成函数是为了让「哪条角色配哪些名字」有可断言的锁——此前它内联在 `resolve_acp_commands` 里，
 /// 只有一条用**测试自写名字数组**的测试间接覆盖（评审 M6 实测：把角色两边的名字对调，全量门禁全绿）。
 fn bundled_names_for_role(owner: bool) -> &'static [&'static str] {
-    if owner {
-        &[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT]
-    } else {
-        &[GRANTED_BUNDLED_AGENT]
-    }
+    let _ = owner;
+    &[NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT]
 }
 
 /// 按**角色**解析出两条命令（normal / granted）。覆盖对两者都生效；
@@ -122,6 +117,23 @@ fn resolve_acp_command(buzz_cmd: Option<&str>) -> String {
 ///（P4.1：原 `uses_buzz_agent=false` 臂走已删的 `build_injection`——经核对该臂本就
 /// 解析到 buzz_provider_env（Buzz 臂）殊途同归；`build_injection` 矩阵随 Backend 一并
 /// 删除后，两臂并一为单一路径，`uses_buzz_agent` 形参随之摘除。）
+/// Jev 决策门禁的 env 注入（统一迁移刀 4a）：从 config 的 `jev` 段转成 `JEV_*`。
+/// 未配置（api_key 空）时注入空——abb-agent 在受限会话建会话时会 fail-closed 拒答。
+fn jev_env(cfg: &Config) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let j = &cfg.jev;
+    if !j.api_key.trim().is_empty() {
+        env.push(("JEV_API_KEY".to_string(), j.api_key.clone()));
+    }
+    if !j.base_url.trim().is_empty() {
+        env.push(("JEV_BASE_URL".to_string(), j.base_url.clone()));
+    }
+    if !j.model.trim().is_empty() {
+        env.push(("JEV_MODEL".to_string(), j.model.clone()));
+    }
+    env
+}
+
 fn buzz_env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String, String)> {
     let prov = cfg.resolve_provider(bot).cloned();
     if let Some(p) = prov.as_ref() {
@@ -294,11 +306,22 @@ fn build_bot_acp_handles(
             extra_mcp,
         )
     };
-    let normal = mk(normal_command, env.clone(), normal_meta, extra_mcp);
+    // granted 实例：NO_HINTS + Jev 门禁 env（受限会话的工具调用要先问 Jev）。
+    // normal 实例：owner 配了受限档（read-only/workspace-write）时同样套 Jev 门禁
+    // （abb-agent 的 `restricted()` 判定含 sandbox=read-only/workspace-write），所以
+    // normal 也要带 JEV_* env；owner 全权限会话不套门禁、多带几个 env 无害。
+    let jev = jev_env(cfg);
+    let normal = mk(
+        normal_command,
+        env.clone().into_iter().chain(jev.clone()).collect(),
+        normal_meta,
+        extra_mcp,
+    );
     let granted = mk(
         granted_command,
         env.into_iter()
             .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
+            .chain(jev)
             .collect(),
         Some(granted_meta),
         Vec::new(),
@@ -335,21 +358,26 @@ fn oneshot_agent_config_inner(
     role_cmds: (String, String),
     sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
 ) -> crate::buzz::harness::AgentConfig {
-    // **与聊天句柄同一条判据**：需要档位的会话（owner 的 read-only/workspace-write、granted）
-    // 必须落在旧执行层，否则 abb 的 P2.3 硬闸会拒建（评审实测：这条路径原来没做分流）。
+    // 统一迁移刀 4a：需要档位的会话（owner 的 read-only/workspace-write、granted）也走
+    // abb-agent（已声明档位），且套 Jev 门禁——所以带档位时注入 JEV_* env。
     let command = pick_command_by_sandbox(
         (role_cmds.0.as_str(), role_cmds.1.as_str()),
         sandbox.is_some(),
     )
     .to_string();
     let env = buzz_env_for_bot(bot, cfg);
+    // Jev 门禁 env **只在带档位（受限）时注入**：sandbox=None（owner 全权限维护任务，
+    // 如 session_gc/角色生成）不套 Jev 门禁、不需要 key，多注一个凭证只扩大暴露面（评审 D1）。
+    let mut extra_env: Vec<(String, String)> =
+        vec![("PATH".to_string(), crate::deps::composed_path())];
+    extra_env.extend(env);
+    if sandbox.is_some() {
+        extra_env.extend(jev_env(cfg));
+    }
     crate::buzz::harness::AgentConfig {
         command,
         args: Vec::new(),
-        extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
-            .into_iter()
-            .chain(env)
-            .collect(),
+        extra_env,
         backend: "buzz".to_string(),
         session_sandbox: sandbox,
     }
@@ -1979,13 +2007,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 必须把「带档位的 owner 会话」
-    /// 放到旧执行层槽上。这条曾经缺——评审用变异（把 `normal_meta.is_some()` 改成 `false`）
-    /// 实测全量门禁仍全绿，等于「owner 配 read-only 的会话会被 abb 的硬闸拒建」这个 bug
-    /// 可以静默回归。
+    /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 把 owner 会话（无论档位）
+    /// 与 granted 会话都放上 abb-agent 槽（统一迁移刀 4a：abb-agent 已声明 abbSandbox
+    /// 三档 + Jev 门禁 + 读域闸，受限会话也能走）。旧层只作回滚。
     #[test]
     fn chat_handles_route_sandboxed_sessions_to_the_old_layer() {
-        let cmds = ("/bin/abb-agent", "/bin/buzz-agent");
+        // 刀 4a 后两个槽都解析到 abb-agent（bundled_names_for_role 对两种角色都优先 abb-agent）。
+        let cmds = ("/bin/abb-agent", "/bin/abb-agent");
         let stop = tokio_util::sync::CancellationToken::new();
         let cfg = Config::default();
         let mk_bot = |mode: crate::config::SandboxMode| crate::config::BotConfig {
@@ -1994,7 +2022,7 @@ mod tests {
             ..crate::config::BotConfig::default()
         };
 
-        // owner 带档位（read-only / workspace-write）⇒ normal 句柄必须用旧执行层槽。
+        // owner 带档位（read-only / workspace-write）⇒ normal 句柄也走 abb-agent（它已支持档位）。
         for mode in [
             crate::config::SandboxMode::ReadOnly,
             crate::config::SandboxMode::WorkspaceWrite,
@@ -2002,8 +2030,8 @@ mod tests {
             let handles = build_bot_acp_handles(&mk_bot(mode), &cfg, cmds, stop.clone());
             assert_eq!(
                 handles.normal.agent_command(),
-                "/bin/buzz-agent",
-                "带档位的 owner 会话必须走旧执行层（否则被 abb 的 P2.3 硬闸拒建）"
+                "/bin/abb-agent",
+                "带档位的 owner 会话现在也走 abb-agent（已声明 abbSandbox 三档）"
             );
             assert!(
                 handles.normal.session_sandbox().is_some(),
@@ -2025,39 +2053,37 @@ mod tests {
             assert!(handles.normal.session_sandbox().is_none());
         }
 
-        // granted 句柄永远走旧执行层、且永远带档位。
+        // granted 句柄也走 abb-agent（已支持受限档）、且永远带档位。
         let handles = build_bot_acp_handles(
             &mk_bot(crate::config::SandboxMode::FullAccess),
             &cfg,
             cmds,
             stop,
         );
-        assert_eq!(handles.granted.agent_command(), "/bin/buzz-agent");
+        assert_eq!(handles.granted.agent_command(), "/bin/abb-agent");
         assert!(handles.granted.session_sandbox().is_some());
     }
 
-    /// **不变量**：只要会话需要受限档（granted，或 owner 的 read-only/workspace-write），
-    /// 就必须落在旧执行层——abb-agent 如实不声明 `_meta.abbSandbox`，abb 对带
-    /// `session_sandbox` 的会话是 fail-closed（`pool.rs` 拒建）。
+    /// **不变量**（统一迁移刀 4a 已改）：所有会话（含受限档）都走 abb-agent——它已声明
+    /// `_meta.abbSandbox` 三档 + Jev 门禁 + 读域闸，旧层只作回滚。
     ///
     /// 三条建会话路径（聊天句柄 / oneshot 公共包装 / task 角色剖面）都经这个纯函数，且**各自
     /// 都有接线测试**：`chat_handles_route_sandboxed_sessions_to_the_old_layer`（聊天句柄，四种
     /// `sandbox_mode`）、`oneshot_paths_follow_the_sandbox_invariant`（注入式内层，覆盖 oneshot
     /// 与 granted 任务两种角色）、`public_oneshot_wrapper_keeps_the_sandbox_and_the_right_slot`
-    /// （公共包装不丢档位）。评审用变异实测过：任一条路径的接线被改坏，对应的那条测试立刻红。
+    /// （公共包装不丢档位）。
     #[test]
     fn sessions_needing_a_sandbox_always_use_the_old_layer() {
         let cmds = ("/bin/abb-agent", "/bin/buzz-agent");
         assert_eq!(pick_command_by_sandbox(cmds, false), "/bin/abb-agent");
         assert_eq!(
             pick_command_by_sandbox(cmds, true),
-            "/bin/buzz-agent",
-            "需要受限档的会话必须留在旧执行层，否则会被 abb 的 P2.3 硬闸拒建"
+            "/bin/abb-agent",
+            "受限档会话现在也走 abb-agent（已声明 abbSandbox 三档）"
         );
     }
 
-    /// oneshot / task 角色路径也必须遵守「需要档位 ⇒ 旧执行层」（评审实测的阻塞项：
-    /// 这两条路径原来直接用 owner 命令，会把带档位的会话送去 abb-agent 被拒建）。
+    /// oneshot / task 角色路径也遵守「受限档 ⇒ abb-agent」（刀 4a 后同一命令槽）。
     #[test]
     fn oneshot_paths_follow_the_sandbox_invariant() {
         use crate::config::BotConfig;
@@ -2069,12 +2095,12 @@ mod tests {
         let cfg = Config::default();
         let cmds = ("/bin/abb-agent".to_string(), "/bin/buzz-agent".to_string());
 
-        // owner 配了 read-only ⇒ 档位存在 ⇒ 必须用旧执行层。
+        // owner 配了 read-only ⇒ 档位存在，也走 abb-agent（已支持档位）。
         let c = oneshot_agent_config_inner(&bot, &cfg, cmds.clone(), resolve_sandbox_meta(&bot));
         assert!(c.session_sandbox.is_some(), "read-only 档必须带档位");
         assert_eq!(
-            c.command, "/bin/buzz-agent",
-            "带档位的 oneshot 必须用旧执行层"
+            c.command, "/bin/abb-agent",
+            "带档位的 oneshot 也走 abb-agent"
         );
 
         // owner 无档位 ⇒ 用新执行层。
@@ -2086,16 +2112,13 @@ mod tests {
         assert!(c.session_sandbox.is_none());
         assert_eq!(c.command, "/bin/abb-agent", "无档位时 oneshot 用新执行层");
 
-        // granted（restricted=true）⇒ 强制档位 ⇒ 必须用旧执行层。
+        // granted（restricted=true）⇒ 强制档位，也走 abb-agent。
         let c = oneshot_agent_config_for_role_inner(&bot, &cfg, cmds, true);
         assert!(c.session_sandbox.is_some());
-        assert_eq!(
-            c.command, "/bin/buzz-agent",
-            "granted 任务的档位必须落在旧执行层"
-        );
+        assert_eq!(c.command, "/bin/abb-agent", "granted 任务也走 abb-agent");
     }
 
-    /// M6 的锁：角色 → 随包候选名（owner 优先 abb-agent；granted 只认 buzz-agent）。
+    /// M6 的锁：角色 → 随包候选名（两种角色都优先 abb-agent、回落 buzz-agent）。
     #[test]
     fn role_to_bundled_names_mapping_is_locked() {
         assert_eq!(
@@ -2105,8 +2128,8 @@ mod tests {
         );
         assert_eq!(
             bundled_names_for_role(false),
-            [GRANTED_BUNDLED_AGENT],
-            "授权者/带档位会话只认旧层——把 abb-agent 放进来就会被 abb 的硬闸拒建"
+            [NORMAL_BUNDLED_AGENT, GRANTED_BUNDLED_AGENT],
+            "授权者会话也优先 abb-agent（已支持受限档）、回落旧层作回滚"
         );
     }
 
@@ -2133,7 +2156,7 @@ mod tests {
         assert_eq!(
             c.command,
             pick_command_by_sandbox((&owner_cmd, &old_cmd), true),
-            "带档位的 oneshot 必须走旧执行层槽"
+            "带档位的 oneshot 走 owner 槽（abb-agent）"
         );
     }
 

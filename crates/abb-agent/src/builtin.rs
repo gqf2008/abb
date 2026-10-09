@@ -41,6 +41,50 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider::EnvSource;
 
+/// 会话执行档位（`session/new` 的 `_meta.sandbox` 解析产物，统一迁移刀 3）。
+///
+/// 决定「哪些内置工具对模型可见」——与参照物 `crates/buzz-agent/src/wire.rs::Sandbox`
+/// 同词表、同语义：
+/// - `ReadOnly`：write/shell **不注入**（模型看不见；`allow_write`/`allow_shell` 为假）；
+/// - `WorkspaceWrite`：全工具可用，写限工作区、读限工作区；
+/// - `FullAccess`：读任意路径、写限工作区（写限是无条件的既有行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+impl SandboxMode {
+    /// 宽松解析：未知/缺失回落 `FullAccess`（与参照物 `parse_opt` 同口径——协议噪音不挂会话）。
+    /// `shell == restricted`（granted 承诺语义）与 workspace-write 同档位处理。
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "read-only" => Self::ReadOnly,
+                "workspace-write" => Self::WorkspaceWrite,
+                _ => Self::FullAccess,
+            },
+            None => Self::FullAccess,
+        }
+    }
+
+    /// read-only 档不写。
+    pub fn allow_write(self) -> bool {
+        self != Self::ReadOnly
+    }
+
+    /// read-only 档不跑 shell。
+    pub fn allow_shell(self) -> bool {
+        self != Self::ReadOnly
+    }
+
+    /// 非 FullAccess 档读要限工作区（对齐参照物 `read_roots`）。
+    pub fn restrict_read(self) -> bool {
+        self != Self::FullAccess
+    }
+}
+
 /// 进程级开关：`0` 关闭整套内置工具（与 fork 同款环境变量）。
 pub const DEV_TOOLS_ENV: &str = "BUZZ_AGENT_DEV_TOOLS";
 
@@ -78,7 +122,22 @@ pub fn dev_tools_enabled(env: &dyn EnvSource) -> Result<bool, String> {
 ///
 /// `workspace` 是会话工作区（`session/new` 的 `cwd`）：read/bash/grep/find/ls 的基准目录，
 /// 也是 write/edit 的**写入边界**。
-pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
+///
+/// `mode`（统一迁移刀 3）：决定哪些工具对模型可见（与参照物档位过滤同语义）：
+/// - `ReadOnly`：**不注入** `dev__shell` / `dev__write` / `dev__edit`（模型看不见），
+///   read/ls/grep/find 限工作区（读域闸）；
+/// - `WorkspaceWrite`：全工具可用，读写均限工作区；
+/// - `FullAccess`：读任意路径（对齐参照物 `read_roots=None`），写仍限工作区（无条件）。
+///
+/// `shell_restricted`（granted 承诺语义）另成独立维度：不改变 shell/write/read 的可见性
+/// （granted 会话能写工作区、有 shell——shell 的**内容**由 Jev 门禁判断），但**摘除
+/// `delegate`**（对齐参照物 `delegate_def_visible` 的 `shell != Restricted` 腿：委派 CLI
+/// 天生不受域闸约束，给了 = 白名单白做）。
+pub fn dev_tools(
+    workspace: &Path,
+    mode: SandboxMode,
+    shell_restricted: bool,
+) -> Vec<Arc<dyn AgentTool>> {
     let env: Arc<OsExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(workspace.to_path_buf()));
     let read_env: Arc<dyn ExecutionEnv> = env.clone();
     let mutate_env: Arc<dyn MutatingEnv> = env;
@@ -97,52 +156,70 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
         })),
     };
 
-    let mut tools: Vec<Arc<dyn AgentTool>> = vec![
+    let read_guard = if mode.restrict_read() {
+        Guard::ReadPath
+    } else {
+        Guard::None
+    };
+    let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+    if mode.allow_shell() {
         // `bash` 工具改成参照物的名字 `dev__shell`，schema 里把 `timeout` 改回 `timeout_secs`。
-        exposed(
+        tools.push(exposed(
             create_bash_tool(&context, Some(shell_options)),
             "shell",
             Guard::ShellTimeout,
             workspace,
-        ),
-        exposed(
-            create_read_tool(&context, None),
-            "read",
-            Guard::None,
-            workspace,
-        ),
-        exposed(
+        ));
+    }
+    tools.push(exposed(
+        create_read_tool(&context, None),
+        "read",
+        read_guard,
+        workspace,
+    ));
+    if mode.allow_write() {
+        tools.push(exposed(
             create_write_tool(&context),
             "write",
             Guard::WritePath,
             workspace,
-        ),
-        exposed(
+        ));
+        tools.push(exposed(
             create_edit_tool(&context),
             "edit",
             Guard::WritePath,
             workspace,
-        ),
-        exposed(create_ls_tool(&context, None), "ls", Guard::None, workspace),
-        exposed(
-            create_grep_tool(&context, None),
-            "grep",
-            Guard::None,
-            workspace,
-        ),
-        // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
-        // `dev__glob`，让写惯了 `dev__glob` 的约定/技能仍然有效。
-        exposed(
-            create_find_tool(&context, None),
-            "glob",
-            Guard::None,
-            workspace,
-        ),
-    ];
+        ));
+    }
+    tools.push(exposed(
+        create_ls_tool(&context, None),
+        "ls",
+        read_guard,
+        workspace,
+    ));
+    tools.push(exposed(
+        create_grep_tool(&context, None),
+        "grep",
+        read_guard,
+        workspace,
+    ));
+    // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
+    // `dev__glob`，让写惯了 `dev__glob` 的约定/技能仍然有效。
+    tools.push(exposed(
+        create_find_tool(&context, None),
+        "glob",
+        read_guard,
+        workspace,
+    ));
     // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
     // **两个 CLI 都没装时不暴露**：与参照物的 `cli_available` 腿同取向——工具表里不该出现
-    // 一个只会报错的工具（评审 F8）。
-    if crate::delegate::any_backend_available(&crate::provider::ProcessEnv) {
+    // 一个只会报错的工具（评审 F8）。read-only（无 shell）与 granted（shell=restricted）档
+    // 也不暴露：对齐参照物 `delegate_def_visible` = `allow_shell && shell != Restricted &&
+    // cli_available`（委派 CLI 天生不受域闸约束，给了 = 白名单白做）。
+    let delegate_visible = mode.allow_shell()
+        && !shell_restricted
+        && crate::delegate::any_backend_available(&crate::provider::ProcessEnv);
+    if delegate_visible {
         tools.push(exposed(
             Arc::new(crate::delegate::DelegateTool::new(workspace)),
             crate::delegate::DELEGATE_BARE_NAME,
@@ -160,6 +237,9 @@ enum Guard {
     None,
     /// 写类工具：把 `path` 限定到会话工作区内（见 [`confine_write_path`]）。
     WritePath,
+    /// 读类工具：把 `path` 限定到会话工作区内（见 [`confine_read_path`]）。
+    /// 仅受限会话套用；owner 全权限用 `None`（对齐参照物 FullAccess 读任意路径）。
+    ReadPath,
     /// shell：把 schema 的 `timeout_secs` 翻回 rpi 的 `timeout`。
     ShellTimeout,
 }
@@ -198,6 +278,12 @@ fn exposed(
         description.push_str(
             "\n\nPath is confined to the session workspace: paths escaping it \
              (absolute paths outside the workspace, `..` traversal, symlinks) are rejected.",
+        );
+    }
+    if guard == Guard::ReadPath {
+        description.push_str(
+            "\n\nPath is confined to the session workspace: paths outside it \
+             (absolute paths, `..` traversal, symlinks) are rejected.",
         );
     }
     let schema = Tool {
@@ -279,6 +365,7 @@ impl AgentTool for Exposed {
         let params = match self.guard {
             Guard::None => params,
             Guard::WritePath => self.confine(&params).await?,
+            Guard::ReadPath => self.confine_read(&params).await?,
             Guard::ShellTimeout => rename_timeout_param(params),
         };
         self.inner
@@ -295,6 +382,28 @@ impl Exposed {
             return Ok(params.clone());
         };
         let target = confine_write_path(&self.workspace, raw)
+            .await
+            .map_err(AgentError::Tool)?;
+        let mut params = params.clone();
+        if let Value::Object(map) = &mut params {
+            map.insert(
+                "path".to_string(),
+                Value::String(target.to_string_lossy().into_owned()),
+            );
+        }
+        Ok(params)
+    }
+
+    /// 把读类工具的 `path` 限定到会话工作区（受限会话），并把**已解析的绝对路径**传给内层。
+    ///
+    /// 读类工具（read/ls/grep/find）的 `path` 是**可选**的：缺省 = 工作区（安全，原样委托），
+    /// 给了才做 canonicalize + 前缀校验（与参照物受限档 `read_roots` 同语义）。
+    async fn confine_read(&self, params: &Value) -> Result<Value, AgentError> {
+        let Some(raw) = params.get("path").and_then(Value::as_str) else {
+            // 缺省 path（ls/grep/find 都不必填）= 工作区本身，无需拦。
+            return Ok(params.clone());
+        };
+        let target = confine_read_path(&self.workspace, raw)
             .await
             .map_err(AgentError::Tool)?;
         let mut params = params.clone();
@@ -375,6 +484,34 @@ async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, Stri
         }
     }
     Ok(target)
+}
+
+/// 读取路径限定：`path`（相对或绝对）解析 + canonicalize 后必须落在会话工作区内。
+///
+/// 与参照物 `crates/buzz-agent/src/devtools.rs::resolve_read_path` 的受限档 `read_roots`
+/// 分支同语义：相对路径按工作区为基准解、绝对路径原样，都 canonicalize 后再前缀比对。
+/// 符号链接同样被解掉（canonicalize 还原真实路径）——所以「工作区内指向工作区外的链接」
+/// 也读不到。与写域闸不同：读不创建父目录、不拒绝对路径（只要落在工作区内就放行）。
+async fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
+    let base = tokio::fs::canonicalize(workspace)
+        .await
+        .map_err(|error| format!("会话工作区不可访问：{}（{error}）", workspace.display()))?;
+    let path = Path::new(raw);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let canon = tokio::fs::canonicalize(&candidate)
+        .await
+        .map_err(|error| format!("路径不可访问：{raw}（{error}）"))?;
+    if !canon.starts_with(&base) {
+        return Err(format!(
+            "拒绝读取会话工作区之外：{raw}（工作区 {}）",
+            base.display()
+        ));
+    }
+    Ok(canon)
 }
 
 /// `load_skill` 的工具名：**裸名**（不经 `dev__` 命名空间）。
@@ -495,7 +632,7 @@ mod tests {
     #[test]
     fn tools_are_exposed_under_dev_namespace_with_replaced_component_shapes() {
         let workspace = temp_workspace("names");
-        let tools = dev_tools(&workspace);
+        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
         let names: Vec<String> = tools.iter().map(|t| t.schema().name.clone()).collect();
         for expected in [
             "dev__shell",
@@ -535,11 +672,94 @@ mod tests {
         assert!(props.contains(&"command".to_string()), "{props:?}");
     }
 
+    /// 档位决定工具面（统一迁移刀 3 整改 C1）：read-only 下 write/shell/delegate **不注入**
+    /// （模型看不见），read/ls/grep/find 仍在；workspace-write 与 full-access 全工具可见。
+    #[test]
+    fn tool_surface_follows_sandbox_mode() {
+        let workspace = temp_workspace("mode");
+
+        let read_only = dev_tools(&workspace, crate::builtin::SandboxMode::ReadOnly, false);
+        let ro_names: Vec<String> = read_only.iter().map(|t| t.schema().name.clone()).collect();
+        for absent in ["dev__shell", "dev__write", "dev__edit", "dev__delegate"] {
+            assert!(
+                !ro_names.contains(&absent.to_string()),
+                "read-only 档不得暴露 {absent}：{ro_names:?}"
+            );
+        }
+        for present in ["dev__read", "dev__ls", "dev__grep", "dev__glob"] {
+            assert!(
+                ro_names.contains(&present.to_string()),
+                "read-only 档应保留 {present}：{ro_names:?}"
+            );
+        }
+
+        let ww = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::WorkspaceWrite,
+            false,
+        );
+        let ww_names: Vec<String> = ww.iter().map(|t| t.schema().name.clone()).collect();
+        for present in ["dev__shell", "dev__write", "dev__edit", "dev__read"] {
+            assert!(
+                ww_names.contains(&present.to_string()),
+                "workspace-write 档应保留 {present}：{ww_names:?}"
+            );
+        }
+
+        let full = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
+        let full_names: Vec<String> = full.iter().map(|t| t.schema().name.clone()).collect();
+        assert!(full_names.contains(&"dev__shell".to_string()));
+
+        // granted（shell=restricted）档：delegate 不注入（对齐参照物 delegate_def_visible
+        // 的 `shell != Restricted` 腿）；shell/write 仍在（内容由 Jev 门禁判断）。
+        let granted = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::WorkspaceWrite,
+            true,
+        );
+        let granted_names: Vec<String> = granted.iter().map(|t| t.schema().name.clone()).collect();
+        assert!(
+            !granted_names.contains(&"dev__delegate".to_string()),
+            "granted 档不得暴露 delegate：{granted_names:?}"
+        );
+        for present in ["dev__shell", "dev__write", "dev__read"] {
+            assert!(
+                granted_names.contains(&present.to_string()),
+                "granted 档应保留 {present}：{granted_names:?}"
+            );
+        }
+    }
+
+    /// `SandboxMode::parse` 词表与 abb 下发一致：未知/缺失回落 FullAccess。
+    #[test]
+    fn sandbox_mode_parse_matches_abb_vocabulary() {
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("read-only")),
+            crate::builtin::SandboxMode::ReadOnly
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("workspace-write")),
+            crate::builtin::SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("full-access")),
+            crate::builtin::SandboxMode::FullAccess
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(None),
+            crate::builtin::SandboxMode::FullAccess
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("bogus")),
+            crate::builtin::SandboxMode::FullAccess
+        );
+    }
+
     /// 模型看到的说明必须与真实行为一致：超时默认 120、区间 1..=600；写类工具声明写入限定。
     #[test]
     fn exposed_schemas_match_real_behavior() {
         let workspace = temp_workspace("docs");
-        let tools = dev_tools(&workspace);
+        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
         let by_name = |name: &str| -> Arc<dyn AgentTool> {
             tools
                 .iter()
@@ -724,5 +944,46 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).expect("建符号链接");
         let attempt = confine_write_path(&workspace, "link/escape.txt").await;
         assert!(attempt.is_err(), "符号链接逃逸必须被拒：{attempt:?}");
+    }
+
+    /// 读域闸（统一迁移刀 3）：工作区内可读、`..` 与工作区外绝对路径被拒。
+    #[tokio::test]
+    async fn read_confinement_rejects_escapes() {
+        let workspace = temp_workspace("read-conf");
+        std::fs::write(workspace.join("inside.txt"), "IN").expect("建工作区内文件");
+        let canon = tokio::fs::canonicalize(&workspace).await.expect("canon");
+
+        let inside = confine_read_path(&workspace, "inside.txt")
+            .await
+            .expect("工作区内相对路径应可读");
+        assert!(inside.starts_with(&canon), "{inside:?}");
+        let absolute_inside = confine_read_path(
+            &workspace,
+            &format!("{}/inside.txt", canon.to_string_lossy()),
+        )
+        .await
+        .expect("工作区内绝对路径应可读");
+        assert!(absolute_inside.starts_with(&canon));
+
+        let escape = confine_read_path(&workspace, "../escape.txt").await;
+        assert!(escape.is_err(), "`..` 逃逸必须被拒：{escape:?}");
+        let outside = confine_read_path(&workspace, "/etc/passwd").await;
+        assert!(outside.is_err(), "工作区外绝对路径必须被拒：{outside:?}");
+    }
+
+    /// 读域闸把符号链接解掉：工作区内指向工作区外的链接也读不到（canonicalize 还原真实路径）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_confinement_rejects_symlink_escape() {
+        let workspace = temp_workspace("read-symlink");
+        let outside = temp_workspace("read-symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "SECRET").expect("建工作区外文件");
+        let link = workspace.join("link.txt");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &link).expect("建符号链接");
+        let attempt = confine_read_path(&workspace, "link.txt").await;
+        assert!(
+            attempt.is_err(),
+            "指向工作区外的符号链接必须被拒：{attempt:?}"
+        );
     }
 }

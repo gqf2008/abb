@@ -245,7 +245,7 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 | shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）并把路径给模型；该文件在 `TMPDIR` 下实测 `644`/目录 `755`（TMPDIR 若是共享目录，同机其它用户可读）；登记未改 |
 | `read` 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；description 里写得明白，模型自洽） |
 | 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸，**并拒绝末段符号链接**） | **不放宽**：父目录先建后 canonicalize 再比前缀，末段是符号链接直接拒；`..`、符号链接父目录/文件、工作区外绝对路径一律拒 |
-| 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 与 FullAccess 一致；**受限档的 roots 策略仍由 abb 的闸门承担**（本包不实现档位） |
+| 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 同：**受限会话（`sandbox`=read-only/workspace-write 或 `shell`=restricted）读/ls/grep/find 限定工作区**（canonicalize + 前缀校验）；owner 全权限仍读任意路径（对齐 FullAccess `read_roots=None`） |
 | 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
 | Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
 
@@ -386,7 +386,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。十二条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。十四条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -403,6 +403,8 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `delegate_round_trip.py` | `dev__delegate` 真调用本机 CLI（假 CLI 记录 argv）／报告回灌／不可用时可纠偏／无可用后端时不暴露／非零退出是错误结果／孙进程攥管道不挂死／取消收尾 `cancelled` |
 | `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
+| `jev_gate_round_trip.py` | 受限会话工具调用受 Jev 门禁：allow 真执行／deny 不执行 + 拒绝 reason／不可用 fail-closed／全权限零开销；Jev 收到 Decisions 形状（noul + state 带 workspace） |
+| `read_confinement_round_trip.py` | 受限会话读/ls 域闸：工作区外绝对路径被拒且越界内容不进模型；owner 全权限读同一路径放行 |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
 被算作通过」的假通过窗口。

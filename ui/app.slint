@@ -1274,6 +1274,10 @@ export component SettingsWindow inherits Window {
     in-out property <[ProviderRow]> providers: [];
     in-out property <int> provider-selected: -1;
     in-out property <[string]> provider-names: [];   // 供 bot 页的供应商下拉（[""] + 各 name）
+    // 决策模型（Jev）：授权者/受限会话的工具调用门禁（独立于主 LLM 的 key）。
+    in-out property <string> jev-api-key: "";
+    in-out property <string> jev-base-url: "";
+    in-out property <string> jev-model: "";
     // 当前选中 bot 的未过期授权码展示：owner-code-info=管理员码行、grant-code-info=普通授权码行
     // （"授权码：xxxx（剩 N 分钟）"；无则空）。生成后/热刷新更新。
     in-out property <string> owner-code-info: "";
@@ -1346,6 +1350,8 @@ export component SettingsWindow inherits Window {
     callback remove-provider(int);
     callback set-default-provider(int);
     callback test-provider(int);
+    // 决策模型（Jev）配置回写（per-field，与供应商同纪律）。
+    callback jev-field-edited(string, string);
 
     // 虚拟 Bot（#75）：登记列表操作（i=virtual-bots 行下标；create 用选中 bot 下标）
     callback virtual-bot-create(int);     // 「＋ 创建虚拟 Bot」→ 弹窗（自定义/模板/登记）
@@ -2686,6 +2692,52 @@ export component SettingsWindow inherits Window {
                                                 font-size: 12px;
                                                 color: UiTokens.text-dim;
                                                 wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ── 决策模型（Jev）：授权者/受限会话的工具调用门禁 ──
+                                VerticalBox {
+                                    spacing: 8px;
+                                    width: 300px;
+                                    padding: 10px;
+                                    Rectangle {
+                                        background: PixelTheme.panel;
+                                        border-radius: 4px;
+                                        vertical-stretch: 0;
+                                        VerticalBox {
+                                            spacing: 8px;
+                                            padding: 10px;
+                                            Text {
+                                                text: "决策模型（Jev）";
+                                                font-weight: 600;
+                                                color: PixelTheme.text;
+                                            }
+                                            Text {
+                                                text: "授权者（受限）会话的工具调用门禁：每个工具调用前由 Jev 判定是否放行。不配置时受限会话会拒答。";
+                                                font-size: 12px;
+                                                color: UiTokens.text-dim;
+                                                wrap: word-wrap;
+                                            }
+                                            Text { text: "API Key"; font-size: 12px; color: UiTokens.text-dim; }
+                                            PixelTextInput {
+                                                text: root.jev-api-key;
+                                                input-type: "password";
+                                                placeholder: "OpenRouter key（留空 = 保留已存密钥）";
+                                                edited => { root.jev-field-edited("api_key", self.text); }
+                                            }
+                                            Text { text: "Base URL"; font-size: 12px; color: UiTokens.text-dim; }
+                                            PixelTextInput {
+                                                text: root.jev-base-url;
+                                                placeholder: "默认 https://openrouter.ai/api/alpha/decisions";
+                                                edited => { root.jev-field-edited("base_url", self.text); }
+                                            }
+                                            Text { text: "模型"; font-size: 12px; color: UiTokens.text-dim; }
+                                            PixelTextInput {
+                                                text: root.jev-model;
+                                                placeholder: "默认 typesafe/jev-latest";
+                                                edited => { root.jev-field-edited("model", self.text); }
                                             }
                                         }
                                     }

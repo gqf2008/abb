@@ -34,7 +34,7 @@ enum UiCmd {
     Start,
     Stop,
     Restart,
-    Save(Config),
+    Save(Box<Config>),
     /// 对某个 bot 拉 name/open_id（仅飞书支持；微信走扫码）
     FetchBotInfo {
         idx: i32,
@@ -458,6 +458,8 @@ struct SettingsWork {
     /// #78 会话归纳清理：全局开关（默认关）+ 过期天数（默认 7）。
     session_gc: Rc<RefCell<bool>>,
     session_gc_days: Rc<RefCell<u32>>,
+    /// Jev 决策模型（授权者/受限会话门禁）。
+    jev: Rc<RefCell<crate::config::JevConfig>>,
 }
 
 /// 把设置窗工作副本汇总成待写盘的 Config（「保存」与「草稿自动保存」共用同一份逻辑，
@@ -522,6 +524,13 @@ fn snapshot_config(work: &RefCell<Vec<BotConfig>>, wk: &SettingsWork) -> (Config
     };
     // 虚拟 Bot 自定义角色模板（#75）：弹窗里管理的工作副本，随保存写盘
     c.custom_roles = wk.templates.borrow().clone();
+    // Jev 决策模型：api_key 留空 = 保留旧值（密码框不回显，编辑其它字段不该清密钥）。
+    let old_jev = std::mem::take(&mut c.jev);
+    let mut new_jev = wk.jev.borrow().clone();
+    if new_jev.api_key.is_empty() {
+        new_jev.api_key = old_jev.api_key.clone();
+    }
+    c.jev = new_jev;
     // #174：同名 bot 自动分配唯一 key suffix 并**落盘固化**（load 只做内存分配）
     c.assign_unique_keys();
     (c, dropped)
@@ -1971,6 +1980,7 @@ pub fn run_gui() -> Result<()> {
         notify: Rc::new(RefCell::new(true)),
         session_gc: Rc::new(RefCell::new(false)),
         session_gc_days: Rc::new(RefCell::new(7)),
+        jev: Rc::new(RefCell::new(crate::config::JevConfig::default())),
     });
     // 历史记录页：会话列表 + 选中会话的消息流双 model（2s 轮询整体替换）+
     // 选中会话快照（轮询期消息新增时标题/条数随 tick 更新，消息流重查）。
@@ -2020,6 +2030,11 @@ pub fn run_gui() -> Result<()> {
         w.set_session_gc_enabled(c.session_gc_enabled);
         *wk.session_gc_days.borrow_mut() = c.session_gc_days;
         w.set_session_gc_days(c.session_gc_days as i32);
+        // Jev 决策模型：工作副本装载 + 控件状态（key 不回显，只回显 base_url/model）。
+        *wk.jev.borrow_mut() = c.jev.clone();
+        w.set_jev_api_key("".into()); // 密码框不回显已存 key
+        w.set_jev_base_url(c.jev.base_url.clone().into());
+        w.set_jev_model(c.jev.model.clone().into());
         sync_providers_model(providers_model, &c.providers, &c.default_provider);
         w.set_provider_names(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             build_provider_names(&c.providers),
@@ -4448,7 +4463,7 @@ pub fn run_gui() -> Result<()> {
                 dirty.set(false);
                 if let Some(w) = sw.upgrade() {
                     let (c, dropped) = snapshot_config(&work, &wk);
-                    let _ = tx.send(UiCmd::Save(c));
+                    let _ = tx.send(UiCmd::Save(Box::new(c)));
                     // 保存后窗口保持打开（用户要求）：给个绿色确认，方便继续编辑或手动关闭。
                     w.set_status_is_error(false);
                     let mut msg =
@@ -4988,6 +5003,21 @@ pub fn run_gui() -> Result<()> {
                     "model" => p.model = value.trim().to_string(),
                     _ => {}
                 }
+            }
+        });
+    }
+    {
+        // Jev 决策模型配置（授权者/受限会话门禁）：per-field 回写，与供应商同纪律。
+        let jwork = wk.jev.clone();
+        let dirty2 = dirty.clone();
+        settings.on_jev_field_edited(move |field, value| {
+            dirty2.set(true);
+            let mut j = jwork.borrow_mut();
+            match field.as_str() {
+                "api_key" => j.api_key = value.to_string(), // 密钥不 trim
+                "base_url" => j.base_url = value.trim().to_string(),
+                "model" => j.model = value.trim().to_string(),
+                _ => {}
             }
         });
     }
