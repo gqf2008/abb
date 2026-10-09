@@ -2565,10 +2565,10 @@ fn run_team_cli(args: &[String]) -> i32 {
             }
             "--backend" => {
                 // 单后端化 P3.4：仍解析该 flag（兼容旧脚本），但接受并忽略——
-                // 统一由随包 buzz-agent 执行。
+                // 统一由随包 abb-agent 执行。
                 i += 1;
                 if args.get(i).is_some() {
-                    eprintln!("⚠️ --backend 已忽略：单后端化后统一由随包 buzz-agent 执行");
+                    eprintln!("⚠️ --backend 已忽略：单后端化后统一由随包 abb-agent 执行");
                 }
             }
             "--template" => {
