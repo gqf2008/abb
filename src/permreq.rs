@@ -222,12 +222,31 @@ pub fn request_lock_permissions() {
 
 // ── #305 Step 0：相机探测（判定「ABB 派生的子进程是否继承 ABB 的 TCC 授权」）──
 
+/// 首次抓帧用的帧率：多数 Mac 摄像头支持，且与历史行为一致（不做无谓的首轮失败）。
+const CAMERA_PROBE_FRAMERATE: &str = "30";
+
+/// 一次抓帧尝试（[`camera_probe`] 用它拼报告：成功那次，以及失败后被回退掉的那次）。
+struct ProbeAttempt {
+    framerate: String,
+    exit: Option<i32>,
+    bytes: u64,
+    ok: bool,
+    stderr: String,
+}
+
 /// `ffmpeg` 抓帧的参数（抽出来是为了单测能钉死这串 flag，防后续手滑改坏）。
 /// `avfoundation` 的 `index` 形如 `"0"` / `"0:none"`（视频[:音频]）。
 ///
+/// `framerate` 必须**精确等于**设备某个模式的 maxFrameRate：ffmpeg
+/// （`libavdevice/avfoundation.m::configure_video_device`）按
+/// `fabs(framerate - max_framerate) < 0.01` 匹配，不等就报
+/// `Selected framerate ... is not supported by the device.`。**不能**靠省略 `-framerate`
+/// 来「退化成设备默认」——该选项默认值就是 `ntsc`(29.97) 且恒生效，只支持 60fps 的机型照样失败
+/// （回退见 [`parse_supported_framerates`] 与 [`camera_probe`]）。
+///
 /// 刻意**不带 `-y`**：本探测是诊断用，不该静默覆盖调用方指定的路径；抓帧前由
 /// [`camera_probe`] 先删旧文件，仍存在时 ffmpeg 会报错——错误照样进报告，比误报成功好。
-pub fn camera_probe_args(index: &str, out: &str) -> Vec<String> {
+pub fn camera_probe_args(index: &str, out: &str, framerate: &str) -> Vec<String> {
     [
         "-hide_banner",
         "-loglevel",
@@ -235,7 +254,7 @@ pub fn camera_probe_args(index: &str, out: &str) -> Vec<String> {
         "-f",
         "avfoundation",
         "-framerate",
-        "30",
+        framerate,
         "-i",
         index,
         "-frames:v",
@@ -245,6 +264,50 @@ pub fn camera_probe_args(index: &str, out: &str) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// 从 ffmpeg 打印的 `Supported modes:` 列表里解析设备**真实**支持的帧率（取每行 max）。
+///
+/// 匹配失败时 ffmpeg 会打印（`avfoundation.m::unsupported_format`）：
+/// ```text
+/// Selected framerate (30.000000) is not supported by the device.
+/// Supported modes:
+///   1920x1080@[60.000000 60.000000]fps
+/// ```
+/// 每行形如 `  宽x高@[min max]fps`（`%f`，6 位小数）。判定用的是 **maxFrameRate**，故回退值
+/// 取 max；`"60.000000"` 归一成 `"60"` 再交回 ffmpeg。返回顺序 = ffmpeg 打印顺序（= 设备
+/// mode 顺序），首个即首选。
+pub fn parse_supported_framerates(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|line| {
+            let range = line.split_once("@[")?.1.split_once("]fps")?.0;
+            let max = range.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+            Some(format!("{max}"))
+        })
+        .collect()
+}
+
+/// 跑一次抓帧（含「先删旧文件」——保证 `bytes > 0` 只可能来自本次尝试）。
+fn run_camera_probe_once(
+    ffmpeg: &std::path::Path,
+    index: &str,
+    out: &str,
+    framerate: &str,
+) -> Result<ProbeAttempt, String> {
+    let _ = std::fs::remove_file(out);
+    let output = std::process::Command::new(ffmpeg)
+        .args(camera_probe_args(index, out, framerate))
+        .output()
+        .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
+    let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    Ok(ProbeAttempt {
+        framerate: framerate.to_string(),
+        exit: output.status.code(),
+        bytes,
+        ok: camera_probe_ok(output.status.success(), bytes),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
 }
 
 /// 判定文案（纯函数，便于单测覆盖三条分支——防「分支永远走不到」这类回归：
@@ -290,6 +353,19 @@ pub fn camera_probe_log_path() -> std::path::PathBuf {
 /// 返回 `(报告, 是否成功)`：报告同时写到 [`camera_probe_log_path`]（因上述 /dev/null），
 /// 调用方按 bool 决定退出码。
 pub fn camera_probe(index: &str, out: &str) -> Result<(String, bool), String> {
+    let ffmpeg = crate::deps::find_in_path("ffmpeg")
+        .ok_or_else(|| "找不到 ffmpeg（请先安装，如 brew install ffmpeg）".to_string())?;
+    camera_probe_with_ffmpeg(&ffmpeg, index, out, &camera_probe_log_path())
+}
+
+/// [`camera_probe`] 的实现主体：ffmpeg 路径与报告路径可注入，单测能用 stub ffmpeg 走完整
+/// 调用链，验证「帧率不被设备支持 → 按设备能力重试」这条回退真的跑通。
+fn camera_probe_with_ffmpeg(
+    ffmpeg: &std::path::Path,
+    index: &str,
+    out: &str,
+    log: &std::path::Path,
+) -> Result<(String, bool), String> {
     // **先看父进程（= ABB 自己）当前的相机 TCC 状态**：结论必须先看它。
     // 若已是 Denied/Restricted，则「不弹框也不出图」只说明授权记录陈旧，
     // **不能**据此判「继承不成立、#305 要改方向」——那是误判（同 LESSON 里
@@ -300,20 +376,26 @@ pub fn camera_probe(index: &str, out: &str) -> Result<(String, bool), String> {
         .map(|p| format!("{:?}", p.state))
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let ffmpeg = crate::deps::find_in_path("ffmpeg")
-        .ok_or_else(|| "找不到 ffmpeg（请先安装，如 brew install ffmpeg）".to_string())?;
-
-    // 抓帧前先删旧文件：否则一个残留文件会让 bytes>0 看起来「成功」。
-    let _ = std::fs::remove_file(out);
-
-    let output = std::process::Command::new(&ffmpeg)
-        .args(camera_probe_args(index, out))
-        .output()
-        .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
-    let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
-    let ok = camera_probe_ok(output.status.success(), size);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
+    let mut attempts = vec![run_camera_probe_once(
+        ffmpeg,
+        index,
+        out,
+        CAMERA_PROBE_FRAMERATE,
+    )?];
+    // 帧率不被设备支持时（实测：只支持 `1920x1080@60` 的机型上固定 30 必然失败），按 ffmpeg
+    // 报出的设备能力重试一次；仍失败才判「抓不到帧」。
+    if !attempts[0].ok {
+        if let Some(fps) = parse_supported_framerates(&attempts[0].stderr)
+            .into_iter()
+            .find(|fps| fps != CAMERA_PROBE_FRAMERATE)
+        {
+            attempts.push(run_camera_probe_once(ffmpeg, index, out, &fps)?);
+        }
+    }
+    let last = attempts
+        .last()
+        .expect("attempts 至少一条（上面刚 push 过）");
+    let ok = last.ok;
 
     let mut r = String::new();
     r.push_str("# ABB camera-probe（#305 Step 0）\n");
@@ -323,24 +405,33 @@ pub fn camera_probe(index: &str, out: &str) -> Result<(String, bool), String> {
         "父进程相机态 = {parent_state}（这是 ABB 自己的 TCC 状态）\n"
     ));
     r.push_str(&format!("ffmpeg       = {}\n", ffmpeg.display()));
-    r.push_str(&format!("exit         = {:?}\n", output.status.code()));
-    r.push_str(&format!("bytes        = {size}\n"));
-    if !stderr.is_empty() {
-        r.push_str(&format!("ffmpeg stderr:\n{stderr}\n"));
+    let attempt_lines: Vec<String> = attempts
+        .iter()
+        .map(|a| format!("帧率 {}（exit {:?} / {}B）", a.framerate, a.exit, a.bytes))
+        .collect();
+    r.push_str(&format!("尝试         = {}\n", attempt_lines.join(" → ")));
+    r.push_str(&format!("exit         = {:?}\n", last.exit));
+    r.push_str(&format!("bytes        = {}\n", last.bytes));
+    if let Some(a) = attempts.iter().rev().find(|a| !a.stderr.is_empty()) {
+        r.push_str(&format!(
+            "ffmpeg stderr（帧率 {}）:\n{}\n",
+            a.framerate, a.stderr
+        ));
     }
     r.push_str("\n## 判定\n");
     r.push_str(camera_verdict(&parent_state, ok));
     if ok {
         r.push_str(&format!("（本次使用的父进程相机态：{parent_state}）\n"));
     }
-
-    let log = camera_probe_log_path();
+    if !ok && attempts.len() > 1 {
+        r.push_str("（已按设备报告的可用帧率重试过，仍抓不到帧 → 不是帧率不匹配的问题）\n");
+    }
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     // 该文件是规定调用方式下**唯一**的交付通道（open -n 起的实例 stdout/stderr 都是
     // /dev/null），写失败必须显式失败，不能静默。
-    if let Err(e) = std::fs::write(&log, &r) {
+    if let Err(e) = std::fs::write(log, &r) {
         // 写盘失败 ≠ 抓帧失败：图可能已经成功落在 out 了，错误串必须带上结论与图片路径，
         // 否则调用方会误读成「实验失败」。同时把报告打到 stdout，保住终端直跑
         // （非 `open -n`）时仍能看到完整判定。
@@ -363,7 +454,7 @@ mod tests {
     /// 覆盖调用方指定路径；抓帧前由 camera_probe 先删旧文件）。
     #[test]
     fn camera_probe_args_pins_avfoundation_single_frame() {
-        let a = camera_probe_args("0", "/tmp/x.jpg");
+        let a = camera_probe_args("0", "/tmp/x.jpg", "30");
         assert_eq!(
             a,
             vec![
@@ -382,13 +473,16 @@ mod tests {
             ]
         );
         // 设备串支持 avfoundation 的 `视频[:音频]` 形态，必须原样透传给 -i
-        let b = camera_probe_args("1:none", "/tmp/y.jpg");
+        let b = camera_probe_args("1:none", "/tmp/y.jpg", "60");
         let i = b.iter().position(|x| x == "-i").unwrap();
         assert_eq!(b[i + 1], "1:none");
         assert!(
             b.contains(&"/tmp/y.jpg".to_string()),
             "输出路径必须原样透传"
         );
+        // 帧率必须原样落到 `-framerate`（回退值就是从这条通道传下去的）
+        let j = b.iter().position(|x| x == "-framerate").unwrap();
+        assert_eq!(b[j + 1], "60");
     }
 
     /// #305 Step 0：判定三条分支必须都能走到（上一版 `Restricted` 是死代码：当时
@@ -420,5 +514,122 @@ mod tests {
             "ffmpeg 失败不算成功（哪怕有残留文件）"
         );
         assert!(!camera_probe_ok(false, 0));
+    }
+
+    /// 帧率回退的数据源：**本机真实 stderr**（只支持 `1920x1080@60` 的摄像头，2026-10-09
+    /// 实测原文）。拿现场原文当 fixture，免得解析器只对「想象中的格式」成立。
+    const REAL_FRAMERATE_STDERR: &str = "\
+Selected framerate (30.000000) is not supported by the device.
+Supported modes:
+  1920x1080@[60.000000 60.000000]fps
+[in#0 @ 0x9906c14000] Error opening input: Input/output error
+Error opening input file 0.
+";
+
+    #[test]
+    fn parse_supported_framerates_picks_max_of_each_mode() {
+        assert_eq!(
+            parse_supported_framerates(REAL_FRAMERATE_STDERR),
+            vec!["60"]
+        );
+        // min≠max 取 max（ffmpeg 匹配用的是 maxFrameRate）；多 mode 保持打印顺序
+        let multi = "\
+Supported modes:
+  640x480@[15.000000 30.000000]fps
+  1920x1080@[29.970000 29.970000]fps
+";
+        assert_eq!(parse_supported_framerates(multi), vec!["30", "29.97"]);
+        // 没有 modes 列表（或输出被裁剪）时不得凭空造出帧率
+        assert!(parse_supported_framerates("Input/output error\n").is_empty());
+        assert!(parse_supported_framerates("").is_empty());
+    }
+
+    /// 造一个 stub ffmpeg：把每次调用的参数追加到 `<dir>/calls.txt`；`-framerate` 不是 30
+    /// 且 `always_fail=false` 时写一个非空假图并退出 0，否则按 `modes` 打印
+    /// `Selected framerate ... Supported modes:` 后退 1。
+    fn write_stub_ffmpeg(
+        dir: &std::path::Path,
+        modes: &str,
+        always_fail: bool,
+    ) -> std::path::PathBuf {
+        let stub = dir.join("ffmpeg");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{calls}"
+fps=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-framerate" ]; then fps="$a"; fi
+  prev="$a"
+done
+last=""
+for a in "$@"; do last="$a"; done
+if [ "$fps" != "30" ] && [ "{always_fail}" != "1" ]; then
+  printf 'fake-jpeg' > "$last"
+  exit 0
+fi
+printf 'Selected framerate (%s) is not supported by the device.\n' "$fps" >&2
+printf 'Supported modes:\n{modes}' >&2
+exit 1
+"#,
+            calls = dir.join("calls.txt").display(),
+            always_fail = u8::from(always_fail),
+            modes = modes,
+        );
+        std::fs::write(&stub, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    /// 走 [`camera_probe_with_ffmpeg`] 完整调用链（stub ffmpeg，不用真相机）：
+    /// ① 30 不被支持 → 用 modes 里的 60 重试并成功；② 无 modes 可回退 → 只跑一次；
+    /// ③ 回退后仍失败 → 结论为「抓不到帧」且报告点明「不是帧率问题」。
+    #[test]
+    fn camera_probe_retries_with_device_framerate() {
+        let dir = std::env::temp_dir().join(format!("abb-camprobe-stub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("frame.jpg");
+        let log = dir.join("probe.log");
+        let calls = |dir: &std::path::Path| -> Vec<String> {
+            std::fs::read_to_string(dir.join("calls.txt"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+
+        // ① 本机真实情形：只支持 60fps → 回退后抓到帧
+        let stub = write_stub_ffmpeg(&dir, "  1920x1080@[60.000000 60.000000]fps\n", false);
+        let (report, ok) =
+            camera_probe_with_ffmpeg(&stub, "0", out.to_str().unwrap(), &log).unwrap();
+        assert!(ok, "回退到设备帧率后应成功：\n{report}");
+        let c = calls(&dir);
+        assert_eq!(c.len(), 2, "应恰好两次尝试：{c:?}");
+        assert!(c[0].contains("-framerate 30"), "{:?}", c[0]);
+        assert!(c[1].contains("-framerate 60"), "{:?}", c[1]);
+        assert!(report.contains("帧率 60"), "{report}");
+        assert!(log.exists(), "报告必须落盘");
+
+        // ② 没有 Supported modes 可回退 → 只跑一次（不引入无谓的第二次 ffmpeg）
+        let _ = std::fs::remove_file(dir.join("calls.txt"));
+        let stub = write_stub_ffmpeg(&dir, "", false);
+        let (report, ok) =
+            camera_probe_with_ffmpeg(&stub, "0", out.to_str().unwrap(), &log).unwrap();
+        assert!(!ok);
+        assert_eq!(calls(&dir).len(), 1, "无可用帧率时不该重试");
+        assert!(report.contains("尝试         = 帧率 30"), "{report}");
+
+        // ③ 回退后仍失败 → 两次尝试，且报告把「不是帧率问题」说清楚
+        let _ = std::fs::remove_file(dir.join("calls.txt"));
+        let stub = write_stub_ffmpeg(&dir, "  1920x1080@[60.000000 60.000000]fps\n", true);
+        let (report, ok) =
+            camera_probe_with_ffmpeg(&stub, "0", out.to_str().unwrap(), &log).unwrap();
+        assert!(!ok);
+        assert_eq!(calls(&dir).len(), 2);
+        assert!(report.contains("不是帧率不匹配的问题"), "{report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
