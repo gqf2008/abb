@@ -318,7 +318,7 @@ impl Server {
         let mut tools = tools;
         if self.dev_tools_enabled {
             let workspace = workspace_for_tools(&parsed.cwd);
-            let builtin = crate::builtin::dev_tools(&workspace, parsed.restricted());
+            let builtin = crate::builtin::dev_tools(&workspace, parsed.sandbox_mode());
             tracing::info!(
                 "会话 {session_id}：内置工具 {} 个：{:?}",
                 builtin.len(),
@@ -730,6 +730,15 @@ impl SessionNewParams {
             self.sandbox.as_deref(),
             Some("read-only") | Some("workspace-write")
         ) || self.shell.as_deref() == Some("restricted")
+    }
+
+    /// 执行档位（决定内置工具面）：`shell == restricted`（granted 承诺语义）与
+    /// workspace-write 同档位处理——granted 会话能写工作区、有 shell（Jev 判断内容）。
+    fn sandbox_mode(&self) -> crate::builtin::SandboxMode {
+        if self.shell.as_deref() == Some("restricted") {
+            return crate::builtin::SandboxMode::WorkspaceWrite;
+        }
+        crate::builtin::SandboxMode::parse(self.sandbox.as_deref())
     }
 }
 

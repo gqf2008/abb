@@ -41,6 +41,50 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider::EnvSource;
 
+/// 会话执行档位（`session/new` 的 `_meta.sandbox` 解析产物，统一迁移刀 3）。
+///
+/// 决定「哪些内置工具对模型可见」——与参照物 `crates/buzz-agent/src/wire.rs::Sandbox`
+/// 同词表、同语义：
+/// - `ReadOnly`：write/shell **不注入**（模型看不见；`allow_write`/`allow_shell` 为假）；
+/// - `WorkspaceWrite`：全工具可用，写限工作区、读限工作区；
+/// - `FullAccess`：读任意路径、写限工作区（写限是无条件的既有行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+impl SandboxMode {
+    /// 宽松解析：未知/缺失回落 `FullAccess`（与参照物 `parse_opt` 同口径——协议噪音不挂会话）。
+    /// `shell == restricted`（granted 承诺语义）与 workspace-write 同档位处理。
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "read-only" => Self::ReadOnly,
+                "workspace-write" => Self::WorkspaceWrite,
+                _ => Self::FullAccess,
+            },
+            None => Self::FullAccess,
+        }
+    }
+
+    /// read-only 档不写。
+    pub fn allow_write(self) -> bool {
+        self != Self::ReadOnly
+    }
+
+    /// read-only 档不跑 shell。
+    pub fn allow_shell(self) -> bool {
+        self != Self::ReadOnly
+    }
+
+    /// 非 FullAccess 档读要限工作区（对齐参照物 `read_roots`）。
+    pub fn restrict_read(self) -> bool {
+        self != Self::FullAccess
+    }
+}
+
 /// 进程级开关：`0` 关闭整套内置工具（与 fork 同款环境变量）。
 pub const DEV_TOOLS_ENV: &str = "BUZZ_AGENT_DEV_TOOLS";
 
@@ -79,11 +123,12 @@ pub fn dev_tools_enabled(env: &dyn EnvSource) -> Result<bool, String> {
 /// `workspace` 是会话工作区（`session/new` 的 `cwd`）：read/bash/grep/find/ls 的基准目录，
 /// 也是 write/edit 的**写入边界**。
 ///
-/// `restricted`（统一迁移刀 3）：受限会话时 read/ls/grep/find 额外套**读域闸**
-/// （`Guard::ReadPath`，只能读工作区内，与参照物受限档 `read_roots` 同语义）；owner
-/// 全权限会话保持读任意路径（对齐参照物 FullAccess `read_roots=None`）。写类工具的
-/// `Guard::WritePath` 是无条件的（连 owner 都限，这是既有行为，见模块文档）。
-pub fn dev_tools(workspace: &Path, restricted: bool) -> Vec<Arc<dyn AgentTool>> {
+/// `mode`（统一迁移刀 3）：决定哪些工具对模型可见（与参照物档位过滤同语义）：
+/// - `ReadOnly`：**不注入** `dev__shell` / `dev__write` / `dev__edit`（模型看不见），
+///   read/ls/grep/find 限工作区（读域闸）；
+/// - `WorkspaceWrite`：全工具可用，读写均限工作区；
+/// - `FullAccess`：读任意路径（对齐参照物 `read_roots=None`），写仍限工作区（无条件）。
+pub fn dev_tools(workspace: &Path, mode: SandboxMode) -> Vec<Arc<dyn AgentTool>> {
     let env: Arc<OsExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(workspace.to_path_buf()));
     let read_env: Arc<dyn ExecutionEnv> = env.clone();
     let mutate_env: Arc<dyn MutatingEnv> = env;
@@ -102,57 +147,66 @@ pub fn dev_tools(workspace: &Path, restricted: bool) -> Vec<Arc<dyn AgentTool>> 
         })),
     };
 
-    let read_guard = if restricted {
+    let read_guard = if mode.restrict_read() {
         Guard::ReadPath
     } else {
         Guard::None
     };
-    let mut tools: Vec<Arc<dyn AgentTool>> = vec![
+    let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+    if mode.allow_shell() {
         // `bash` 工具改成参照物的名字 `dev__shell`，schema 里把 `timeout` 改回 `timeout_secs`。
-        exposed(
+        tools.push(exposed(
             create_bash_tool(&context, Some(shell_options)),
             "shell",
             Guard::ShellTimeout,
             workspace,
-        ),
-        exposed(
-            create_read_tool(&context, None),
-            "read",
-            read_guard,
-            workspace,
-        ),
-        exposed(
+        ));
+    }
+    tools.push(exposed(
+        create_read_tool(&context, None),
+        "read",
+        read_guard,
+        workspace,
+    ));
+    if mode.allow_write() {
+        tools.push(exposed(
             create_write_tool(&context),
             "write",
             Guard::WritePath,
             workspace,
-        ),
-        exposed(
+        ));
+        tools.push(exposed(
             create_edit_tool(&context),
             "edit",
             Guard::WritePath,
             workspace,
-        ),
-        exposed(create_ls_tool(&context, None), "ls", read_guard, workspace),
-        exposed(
-            create_grep_tool(&context, None),
-            "grep",
-            read_guard,
-            workspace,
-        ),
-        // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
-        // `dev__glob`，让写惯了 `dev__glob` 的约定/技能仍然有效。
-        exposed(
-            create_find_tool(&context, None),
-            "glob",
-            read_guard,
-            workspace,
-        ),
-    ];
+        ));
+    }
+    tools.push(exposed(
+        create_ls_tool(&context, None),
+        "ls",
+        read_guard,
+        workspace,
+    ));
+    tools.push(exposed(
+        create_grep_tool(&context, None),
+        "grep",
+        read_guard,
+        workspace,
+    ));
+    // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
+    // `dev__glob`，让写惯了 `dev__glob` 的约定/技能仍然有效。
+    tools.push(exposed(
+        create_find_tool(&context, None),
+        "glob",
+        read_guard,
+        workspace,
+    ));
     // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
     // **两个 CLI 都没装时不暴露**：与参照物的 `cli_available` 腿同取向——工具表里不该出现
-    // 一个只会报错的工具（评审 F8）。
-    if crate::delegate::any_backend_available(&crate::provider::ProcessEnv) {
+    // 一个只会报错的工具（评审 F8）。read-only / restricted 档也不暴露（参照物同语义：
+    // delegate 在「无 shell / granted」档永不放行）。
+    if mode.allow_shell() && crate::delegate::any_backend_available(&crate::provider::ProcessEnv) {
         tools.push(exposed(
             Arc::new(crate::delegate::DelegateTool::new(workspace)),
             crate::delegate::DELEGATE_BARE_NAME,
@@ -565,7 +619,7 @@ mod tests {
     #[test]
     fn tools_are_exposed_under_dev_namespace_with_replaced_component_shapes() {
         let workspace = temp_workspace("names");
-        let tools = dev_tools(&workspace, false);
+        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess);
         let names: Vec<String> = tools.iter().map(|t| t.schema().name.clone()).collect();
         for expected in [
             "dev__shell",
@@ -605,11 +659,71 @@ mod tests {
         assert!(props.contains(&"command".to_string()), "{props:?}");
     }
 
+    /// 档位决定工具面（统一迁移刀 3 整改 C1）：read-only 下 write/shell/delegate **不注入**
+    /// （模型看不见），read/ls/grep/find 仍在；workspace-write 与 full-access 全工具可见。
+    #[test]
+    fn tool_surface_follows_sandbox_mode() {
+        let workspace = temp_workspace("mode");
+
+        let read_only = dev_tools(&workspace, crate::builtin::SandboxMode::ReadOnly);
+        let ro_names: Vec<String> = read_only.iter().map(|t| t.schema().name.clone()).collect();
+        for absent in ["dev__shell", "dev__write", "dev__edit", "dev__delegate"] {
+            assert!(
+                !ro_names.contains(&absent.to_string()),
+                "read-only 档不得暴露 {absent}：{ro_names:?}"
+            );
+        }
+        for present in ["dev__read", "dev__ls", "dev__grep", "dev__glob"] {
+            assert!(
+                ro_names.contains(&present.to_string()),
+                "read-only 档应保留 {present}：{ro_names:?}"
+            );
+        }
+
+        let ww = dev_tools(&workspace, crate::builtin::SandboxMode::WorkspaceWrite);
+        let ww_names: Vec<String> = ww.iter().map(|t| t.schema().name.clone()).collect();
+        for present in ["dev__shell", "dev__write", "dev__edit", "dev__read"] {
+            assert!(
+                ww_names.contains(&present.to_string()),
+                "workspace-write 档应保留 {present}：{ww_names:?}"
+            );
+        }
+
+        let full = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess);
+        let full_names: Vec<String> = full.iter().map(|t| t.schema().name.clone()).collect();
+        assert!(full_names.contains(&"dev__shell".to_string()));
+    }
+
+    /// `SandboxMode::parse` 词表与 abb 下发一致：未知/缺失回落 FullAccess。
+    #[test]
+    fn sandbox_mode_parse_matches_abb_vocabulary() {
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("read-only")),
+            crate::builtin::SandboxMode::ReadOnly
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("workspace-write")),
+            crate::builtin::SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("full-access")),
+            crate::builtin::SandboxMode::FullAccess
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(None),
+            crate::builtin::SandboxMode::FullAccess
+        );
+        assert_eq!(
+            crate::builtin::SandboxMode::parse(Some("bogus")),
+            crate::builtin::SandboxMode::FullAccess
+        );
+    }
+
     /// 模型看到的说明必须与真实行为一致：超时默认 120、区间 1..=600；写类工具声明写入限定。
     #[test]
     fn exposed_schemas_match_real_behavior() {
         let workspace = temp_workspace("docs");
-        let tools = dev_tools(&workspace, false);
+        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess);
         let by_name = |name: &str| -> Arc<dyn AgentTool> {
             tools
                 .iter()

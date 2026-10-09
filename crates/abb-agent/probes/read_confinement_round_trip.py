@@ -205,6 +205,59 @@ second = run_turn(ws, restricted=False, read_path=outside_file)
 check("全权限会话能读到任意路径", OUTSIDE_MARKER in second, second[-200:])
 
 print()
+print("=== 场景 3：read-only 档工具面——shell/write/edit 不注入（模型看不见）===")
+ws = tempfile.mkdtemp(prefix="abb-read-ro-")
+created_dirs.append(ws)
+ro_bodies_before = len(bodies)
+tool_name["name"] = "dev__read"
+tool_name["args"] = {"path": "whatever.txt"}
+env = dict(os.environ)
+env.update({
+    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
+    "ANTHROPIC_MODEL": "probe-model",
+    "ANTHROPIC_API_KEY": "sk-probe",
+    "JEV_API_KEY": "sk-jev-probe",
+    "JEV_BASE_URL": f"http://127.0.0.1:{JEV_PORT}",
+    "HOME": tempfile.mkdtemp(prefix="abb-read-ro-home-"),
+    "RUST_LOG": "info",
+})
+env["USERPROFILE"] = env["HOME"]
+for key in ("ABB_AGENT_FAUX_TEXT", "ABB_AGENT_FAUX_TOOL", "OPENAI_COMPAT_MODEL"):
+    env.pop(key, None)
+proc = subprocess.Popen(BIN, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
+out_lines = []
+threading.Thread(target=lambda: [out_lines.append(l.strip()) for l in proc.stdout],
+                 daemon=True).start()
+
+def ro_send(obj):
+    try:
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+        return True
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+ro_send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+time.sleep(0.5)
+ro_send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+         "params": {"cwd": ws, "mcpServers": [], "_meta": {"sandbox": "read-only"}}})
+time.sleep(0.5)
+ro_send({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+         "params": {"sessionId": "abb-1", "prompt": [{"type": "text", "text": "读"}]}})
+time.sleep(3)
+proc.kill()
+# 第一跳请求体里是模型看到的 tools 定义：read-only 下不该有 shell/write/edit。
+ro_hops = bodies[ro_bodies_before:]
+first = ro_hops[0] if ro_hops else {}
+tools_seen = [t.get("name") for t in first.get("tools", [])]
+for absent in ("dev__shell", "dev__write", "dev__edit"):
+    check(f"read-only 档不暴露 {absent}", absent not in tools_seen, str(tools_seen))
+for present in ("dev__read", "dev__ls"):
+    check(f"read-only 档保留 {present}", present in tools_seen, str(tools_seen))
+
+print()
 if failures:
     print(f"⇒ 判定：❌ {len(failures)} 项失败：{failures}")
     sys.exit(1)
