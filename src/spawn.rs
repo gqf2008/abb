@@ -136,7 +136,7 @@ mod tests {
 
     /// Windows：`creation_flags(CREATE_NO_WINDOW)` 必须被接受，且不改变命令的可执行性契约。
     /// 设置器无 getter（std/tokio 都不提供），故「构造 + 设置不 panic、可继续链式配置」即
-    /// 完整契约（对齐 `crates/buzz-agent/src/mcp.rs` 的两个既有用例）。
+    /// 完整契约（对齐既有 ACP 子进程实现的用例）。
     #[cfg(windows)]
     #[test]
     fn no_window_sets_flag_on_windows() {

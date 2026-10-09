@@ -1490,8 +1490,8 @@ mod agent_down_reason_tests {
 
     #[test]
     fn reason_carries_real_cause_when_known() {
-        let s = agent_down_reason(Some("spawn buzz-agent 失败：系统找不到指定的文件".into()));
-        assert!(s.contains("buzz-agent"), "必须把真实原因带给用户：{s}");
+        let s = agent_down_reason(Some("spawn abb-agent 失败：系统找不到指定的文件".into()));
+        assert!(s.contains("abb-agent"), "必须把真实原因带给用户：{s}");
         assert!(s.contains("bridge.out"), "还得告诉他去哪儿看细节：{s}");
     }
 

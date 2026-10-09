@@ -9,7 +9,7 @@
 //!    成员不重复分配 / prompt 长度对齐群介绍限制）
 //! 2. 组建方法论提示词 + 内置 3 份起手式模板（软件产品 / 自媒体 / OPC）
 //! 3. LLM 生成链路（单后端化 P3.4）：`buzz::oneshot::oneshot_turn` 一次性同步
-//!    回合（随包 buzz-agent，与聊天同一执行层），强制 JSON 解析 + schema
+//!    回合（随包 abb-agent，与聊天同一执行层），强制 JSON 解析 + schema
 //!    校验——**校验失败提示重试/手动编辑，不直接建群**
 //!    （非确定性兜底，与需求「先预览确认再执行创建」一致）
 //!
@@ -200,7 +200,7 @@ pub fn validate_team_plan_json(text: &str) -> Result<TeamPlan, String> {
     Ok(plan)
 }
 
-/// 一次性同步回合生成团队方案（单后端化 P3.4：随包 buzz-agent，与聊天同一执行层）。
+/// 一次性同步回合生成团队方案（单后端化 P3.4：随包 abb-agent，与聊天同一执行层）。
 /// 外层薄包装：`service::oneshot_agent_config` 装配（与 normal handle 同命令同 env
 /// 同档位载荷）+ bot 工作区目录，内层 [`generate_team_plan_with`] 是可测缝
 /// （mock agent 驱动全链路）。返回解析 + 校验后的 [`TeamPlan`]，失败给用户可操作

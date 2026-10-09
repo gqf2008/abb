@@ -32,18 +32,13 @@ if ($env:CARGO_TARGET_DIR) {
 }
 
 $rootExe = Join-Path $repo 'target\release\agent-bridge.exe'
-$forkExe = Join-Path $repo 'crates\buzz-agent\target\release\buzz-agent.exe'
-# 新执行层（owner 会话优先用它；授权者会话仍走 buzz-agent）。
+# 单一执行层（刀 4b 后 buzz-agent 已删）。
 $abbAgentExe = Join-Path $repo 'crates\abb-agent\target\release\abb-agent.exe'
 
 if (-not $SkipBuild) {
   Say '构建根程序（release）…'
   & cargo build --release --locked --bin agent-bridge | Out-Host
   if ($LASTEXITCODE -ne 0) { Fail '根程序构建失败' }
-
-  Say '构建 fork buzz-agent（release，用 fork 自己的 target 目录）…'
-  & cargo build --release --manifest-path crates/buzz-agent/Cargo.toml | Out-Host
-  if ($LASTEXITCODE -ne 0) { Fail 'fork 构建失败' }
 
   Say '构建 abb-agent（release，用本包自己的 target 目录）…'
   & cargo build --release --manifest-path crates/abb-agent/Cargo.toml | Out-Host
@@ -64,7 +59,6 @@ function Assert-Fresh($exe, $srcDir, $label) {
   Say ($label + ' 新鲜度 ✓  ' + (Split-Path -Leaf $exe) + '  ' + [string][int]((Get-Item $exe).Length/1KB) + 'KB  ' + (Get-Item $exe).LastWriteTime.ToString('MM-dd HH:mm:ss'))
 }
 Assert-Fresh $rootExe (Join-Path $repo 'src') '根程序'
-Assert-Fresh $forkExe (Join-Path $repo 'crates\buzz-agent\src') 'fork buzz-agent'
 Assert-Fresh $abbAgentExe (Join-Path $repo 'crates\abb-agent\src') 'abb-agent'
 
 # 运行期同目录解析：确保 .iss 取到的就是这两份

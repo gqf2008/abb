@@ -183,7 +183,7 @@ fn build_initialize_params() -> serde_json::Value {
 /// that shape is the bug this parser exists to catch, and v2.23.24 implements
 /// only the defs filter — no domain roots, no shell whitelist — so honoring a
 /// nested declaration would silently drop `shell: "restricted"` and void the
-/// granted promise. A pinned old fork via `buzz_agent_exe` therefore gets an
+/// granted promise. A pinned agent that omits the sandbox declaration therefore gets an
 /// honest refusal, not a weakened sandbox.
 ///
 /// Absent key / non-array / empty array ⇒ `None` (= unsupported). Fail-closed:
@@ -2145,8 +2145,8 @@ mod tests {
         assert!(!client.abb_sandbox_supports("workspace-write"));
     }
 
-    /// SessionSandboxMeta 的 camelCase 键名必须逐字节等于 fork `SessionNewMeta`
-    ///（`rename_all = "camelCase"`，crates/buzz-agent/src/wire.rs）——sandbox /
+    /// SessionSandboxMeta 的 camelCase 键名必须逐字节等于执行层 `SessionNewMeta`
+    ///（`rename_all = "camelCase"`）——sandbox /
     /// writableRoots / shell / abbBin。任一字段 None ⇒ 该 `_meta` 成员整体缺省
     ///（适配器区分缺省成员与 null，fork 对缺省回落 FullAccess/今天行为）。
     #[test]

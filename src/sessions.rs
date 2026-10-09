@@ -1,5 +1,5 @@
 //! 会话持久化 —— ~/.agent-bridge/workspaces/<bot>/sessions.json。
-//! 单后端（buzz-agent）单槽 schema（单后端化 P4.2）：
+//! 单后端（abb-agent）单槽 schema（单后端化 P4.2）：
 //! {chat_id: {session_id, started, sandbox_mode?}}
 //!
 //! 历史 schema（load 时一次性折叠迁移，写盘只写新格式）：

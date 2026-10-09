@@ -1352,7 +1352,7 @@ fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
 /// 重算对话权限互斥 CheckBox 的勾选态（飞书/钉钉同模型）。
 /// 切 bot / 装载设置窗时调用。整体替换 option model → for 循环重建 CheckBox 实例，
 /// 绕开 slint「用户交互移除 checked 绑定、状态残留到其它 bot」的坑。
-/// （P4.3：后端三选一组已随 UI 下架删除——执行层收口随包 buzz-agent。）
+/// （P4.3：后端三选一组已随 UI 下架删除——执行层收口随包 abb-agent。）
 fn refresh_exclusive_checks(w: &SettingsWindow, _work: &RefCell<Vec<BotConfig>>) {
     // #118：访问控制收紧后无「公开」一档，对话权限固定为「仅授权用户」
     // （open_access / ding_open_access 字段保留兼容旧 config，判定链已不读）。
@@ -1389,7 +1389,7 @@ fn refresh_owner_code_info(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
 }
 
 /// 跑一次依赖检测并把全部依赖状态回填到设置窗（node/python3/lark-cli/dingtalk-cli/git）。
-/// P4.3：claude/codex/pi 与 ACP 适配器探测已下架——执行层收口随包 buzz-agent（零安装），
+/// P4.3：claude/codex/pi 与 ACP 适配器探测已下架——执行层收口随包 abb-agent（零安装），
 /// 余下为 agent 扩展能力依赖（缺失不阻断聊天）。
 fn push_deps_to_window(w: &SettingsWindow) {
     let all = crate::deps::detect_all();
@@ -3302,7 +3302,7 @@ pub fn run_gui() -> Result<()> {
     // --show-settings 调试参数：启动即弹出设置窗。复用托盘打开同一条路径
     //（load_into → 状态行），保证窗口内容完整（不只是空窗）。
     // P4.3：「缺 claude/codex/pi → 启动自动弹窗引导安装」已随三后端 CLI 下架删除——
-    // 执行层收口随包 buzz-agent（零安装），新装用户开箱即可聊天。
+    // 执行层收口随包 abb-agent（零安装），新装用户开箱即可聊天。
     if std::env::args().any(|a| a == "--show-settings") {
         let work = work.clone();
         let model = bots_model.clone();

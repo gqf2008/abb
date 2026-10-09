@@ -1027,21 +1027,6 @@ pub struct Config {
     /// 关闭 = ABB 完全不 init、不快照（工作区已有仓库也不写入，由用户自主管理）。
     #[serde(default = "default_true")]
     pub workspace_git_enabled: bool,
-    /// #206：agent ACP 适配器可执行文件（harness 直接 spawn 的对象）。
-    ///
-    /// 空 = **按角色**的随包解析（`src/service.rs::resolve_acp_commands`）：
-    /// - owner 且**无受限档**（FullAccess/Auto）的会话：同目录 `abb-agent`（新执行层）→
-    ///   `buzz-agent`（回滚）→ PATH `pi-acp`；
-    /// - 授权者（受限）会话，以及 **owner 自己配了 read-only / workspace-write 档** 的会话：
-    ///   同目录 `buzz-agent` → PATH `pi-acp`（**不切** abb-agent——abb-agent 如实不声明
-    ///   `_meta.abbSandbox`，切过去会被 abb 的 fail-closed 闸门拒建；授权链路的承担者按 owner
-    ///   裁定「原来谁现在还是谁」保持不变）。
-    ///
-    /// 两平台都在 ABB.app/Contents/MacOS 与安装目录下与 agent-bridge 同目录。
-    /// **覆盖对两种角色都生效**（绝对路径优先；否则按 PATH 探测），指错则告警并落回随包链——
-    /// 它同时是运维显式指定与**回滚开关**。
-    #[serde(default)]
-    pub buzz_agent_exe: String,
     /// 「启动 / 停止 / 重启服务」的管理密码（2026-10-04 owner 要求：统一由 ABB 管理密码控制）。
     ///
     /// 存加盐迭代 SHA-256 记录（`sha256$<iters>$<salt_hex>$<hash_hex>`，见 `admin_pass`），
@@ -1096,9 +1081,8 @@ impl Default for Config {
             default_backend: String::new(),
             task_workers: TaskWorkers::default(),
             cross_delivery_enabled: false,
-            workspace_git_enabled: true, // #209 工作区版本管理默认开
-            buzz_agent_exe: String::new(),
-            admin_password: String::new(), // 未设置（首次服务动作时由 UI 引导设置）
+            workspace_git_enabled: true,    // #209 工作区版本管理默认开
+            admin_password: String::new(),  // 未设置（首次服务动作时由 UI 引导设置）
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
             context_segment_size: default_ctx_segment_size(),

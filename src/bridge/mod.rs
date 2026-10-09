@@ -43,8 +43,7 @@ impl BridgeRegistry {
     }
 }
 
-/// 单后端化（P2.1）：按 bot 构造的 ACP 句柄对——执行层随包（owner 无档位优先 `abb-agent`，
-/// 带受限档与授权者会话用 `buzz-agent`；见 `service::resolve_acp_commands` / `pick_command_by_sandbox`），
+/// 单后端化（P2.1）：按 bot 构造的 ACP 句柄对——执行层随包（单一执行层 `abb-agent`，两种角色都走它；见 `service::resolve_acp_commands`），
 /// normal 与 granted（授权者受限会话）各一个**进程级**实例。
 /// granted 与 normal 差在 env（`BUZZ_AGENT_NO_HINTS=1`——fork 的 hints
 ///（~/AGENTS.md、~/.agents/skills 扫盘）发生在 session/new **之前**，per-session

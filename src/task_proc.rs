@@ -37,8 +37,7 @@ pub(crate) fn platform_error() -> Option<&'static str> {
 /// 判断是否处于 agent 上下文。
 ///
 /// 真实 ACP 主路径的 `dev__shell` 看不到 `AGENT_BRIDGE_BOT_KEY` / `CHAT_ID` /
-/// `SENDER_ROLE`：它们经 `crates/buzz-agent/src/devtools.rs` →
-/// `mcp::apply_passthrough_env()` 的 `env_clear()` 白名单后被剥掉。因此 buzz-agent
+/// `SENDER_ROLE`：它们经执行层的子进程 env 白名单（`env_clear()`）被剥掉。因此执行层
 /// 在该共享入口为每个派生 shell 注入 `ABB_AGENT_CONTEXT=1`；CLI 以它作为**主判据**。
 /// 旧的 `AGENT_BRIDGE_*` 继续作为 legacy hook/手工调试路径的兜底判据。
 ///

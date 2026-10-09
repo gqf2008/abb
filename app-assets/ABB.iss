@@ -64,14 +64,8 @@ Type: files; Name: "{userprograms}\ABB.lnk"
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
-; #200 fork buzz-agent：与主程序同目录（运行时按 current_exe 同目录解析；
-; buzz_agent_exe 空时先查同目录）。分叉 Apache-2.0，再分发附 LICENSE。
-; fake-mcp 是测试桩，不入包。buzz-acp 已随 #200 进程内化退役，不入包。
-Source: "..\crates\buzz-agent\target\release\buzz-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
-; abb-agent（新执行层）：owner 会话优先用它；授权者会话仍走 buzz-agent。运行时按
-; current_exe 同目录解析（解析链按角色），所以必须与主程序同目录。
+; abb-agent（单一执行层，刀 4b 后 buzz-agent 已删）：运行时按 current_exe 同目录解析。
 Source: "..\crates\abb-agent\target\release\abb-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\crates\buzz-agent\LICENSE"; DestDir: "{app}"; DestName: "buzz-LICENSE.txt"; Flags: ignoreversion
 ; ABB 本体 MIT：再分发需附副本。
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "ABB-LICENSE.txt"; Flags: ignoreversion
 ; 随包工具：rg/jq/uv/gh/wassette；git/bun/sed/find 明确不随包。

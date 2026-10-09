@@ -1126,16 +1126,20 @@ mod installer_guards {
                 .any(|l| l.contains("agent-bridge.exe") && l.contains("DestDir")),
             "安装包必须随带 agent-bridge.exe"
         );
-        // 执行层是两个：abb-agent（owner 会话优先）+ buzz-agent（授权者会话与回滚）。
-        // 运行时按 current_exe 同目录解析 ⇒ 少装哪一个都会在真机上表现为「agent 起不来」。
-        for exe in ["abb-agent.exe", "buzz-agent.exe"] {
-            assert!(
-                code_lines()
-                    .iter()
-                    .any(|l| l.contains(exe) && l.contains("DestDir")),
-                "安装包必须随带 {exe}（解析链按角色，两者都要在）"
-            );
-        }
+        // 执行层仅 abb-agent（刀 4b 后 buzz-agent 已删）。运行时按 current_exe 同目录解析。
+        assert!(
+            code_lines()
+                .iter()
+                .any(|l| l.contains("abb-agent.exe") && l.contains("DestDir")),
+            "安装包必须随带 abb-agent.exe"
+        );
+        // 反向锁：buzz-agent 不再随包（但卸载/升级仍会 taskkill 旧进程，见 [UninstallRun]）。
+        assert!(
+            !code_lines()
+                .iter()
+                .any(|l| l.contains("buzz-agent.exe") && l.contains("DestDir")),
+            "buzz-agent 已删，安装包不得再随带它"
+        );
         let manifest = include_str!("../Cargo.toml");
         for banned in ["abb-spawner", "abb-elev-helper", "abb-helper"] {
             assert!(
