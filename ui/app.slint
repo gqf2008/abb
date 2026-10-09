@@ -2736,7 +2736,7 @@ export component SettingsWindow inherits Window {
                                             Text { text: "模型"; font-size: 12px; color: UiTokens.text-dim; }
                                             PixelTextInput {
                                                 text: root.jev-model;
-                                                placeholder: "默认 typesafe/jev-latest";
+                                                placeholder: "默认 ~typesafe/jev-latest";
                                                 edited => { root.jev-field-edited("model", self.text); }
                                             }
                                         }

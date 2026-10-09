@@ -38,13 +38,16 @@ use crate::provider::EnvSource;
 pub const JEV_API_KEY_ENV: &str = "JEV_API_KEY";
 /// Jev Decisions API 端点（默认 OpenRouter 的 alpha decisions 端点）。
 pub const JEV_BASE_URL_ENV: &str = "JEV_BASE_URL";
-/// Jev 模型 id（默认 `typesafe/jev-latest` 别名，跟踪最新发布）。
+/// Jev 模型 id（默认 `~typesafe/jev-latest` 别名，跟踪最新发布）。
+///
+/// ⚠️ 实测（2026-10-09）：Decisions API 下 `typesafe/jev-latest`（不带波浪号）返回
+/// 400「Model does not exist」；必须用 `~typesafe/jev-latest`（或固定版本 `typesafe/jev-1.13`）。
 pub const JEV_MODEL_ENV: &str = "JEV_MODEL";
 /// 放行概率阈值环境变量名（0~1，默认 0.5；低于阈值 = 拒绝）。
 pub const JEV_ALLOW_THRESHOLD_ENV: &str = "JEV_ALLOW_THRESHOLD";
 
 pub const DEFAULT_JEV_BASE_URL: &str = "https://openrouter.ai/api/alpha/decisions";
-pub const DEFAULT_JEV_MODEL: &str = "typesafe/jev-latest";
+pub const DEFAULT_JEV_MODEL: &str = "~typesafe/jev-latest";
 pub const DEFAULT_ALLOW_THRESHOLD: f64 = 0.5;
 /// 每次决策请求的超时：决策在工具执行路径上，不能拖垮会话（fail-closed 下超时 = 拒绝）。
 pub const DECISION_TIMEOUT: Duration = Duration::from_secs(10);
