@@ -62,6 +62,9 @@ pub struct Server {
     hints_enabled: bool,
     /// 内置工具（`dev__*`）是否开启（`BUZZ_AGENT_DEV_TOOLS=0` 时关，与 fork 同）。
     dev_tools_enabled: bool,
+    /// Jev 决策门禁（统一迁移刀 2）：装配结果在启动时定一次。受限会话建会话时
+    /// 若为 `Err`（缺 key 等）则**拒绝对话**（fail-closed，不降级成放行）。
+    jev: Result<crate::decision::JevClient, String>,
     seq: AtomicU64,
 }
 
@@ -96,8 +99,15 @@ impl Server {
 
     /// 注入式构造：把后端选择与进程 env 解耦，便于测试直接给一个 faux 后端
     /// （不在测试里改进程全局 env——那会让并行用例互相踩）。
+    /// Jev 门禁默认装配失败（测试里不碰网络/进程 env；受限会话路径单独测）。
     pub fn with_backend(writer: Writer, backend: Result<Backend, String>) -> Self {
-        Self::with_backend_and_switches(writer, backend, true, true)
+        Self::with_backend_and_switches(
+            writer,
+            backend,
+            true,
+            true,
+            Err("Jev 未装配（测试构造）".to_string()),
+        )
     }
 
     /// 生产入口：读进程环境决定约定链开关。
@@ -117,6 +127,7 @@ impl Server {
             provider::select_with(env),
             hints_enabled,
             dev_tools_enabled,
+            crate::decision::JevClient::from_env(env),
         ))
     }
 
@@ -126,6 +137,7 @@ impl Server {
         backend: Result<Backend, String>,
         hints_enabled: bool,
         dev_tools_enabled: bool,
+        jev: Result<crate::decision::JevClient, String>,
     ) -> Self {
         if let Err(reason) = &backend {
             tracing::error!("provider 装配失败（会话建立时会如实报错）：{reason}");
@@ -149,6 +161,7 @@ impl Server {
             max_rounds: provider::max_rounds(&provider::ProcessEnv),
             hints_enabled,
             dev_tools_enabled,
+            jev,
             seq: AtomicU64::new(1),
         }
     }
@@ -221,6 +234,11 @@ impl Server {
     /// flag is the ONLY gate on writing ACP_STEER_METHOD」）。本刀还没实现 steer，
     /// 若声称 ``true`` ⇒ 每次「回合中追加消息」都会先吃一个 `-32601` 才落到 abb 的
     /// cancel+merge 回退。如实报 `false` 让它直接走回退；等实现 steer 时再翻真。
+    ///
+    /// **`_meta.abbSandbox` 声明三档**（统一迁移刀 2）：abb 对带 `session_sandbox`
+    /// 的会话是 fail-closed——不声明这词表，受限会话会被 `pool.rs` 拒建，永远到不了
+    /// 本 agent。声明后 abb 才会把 `_meta.sandbox` / `shell` 随 `session/new` 下发，
+    /// 本包据此判断受限并套 Jev 门禁（见 `GuardedTool`）。
     async fn initialize(&self, id: Value) -> Result<(), WireError> {
         self.writer
             .respond(
@@ -228,7 +246,10 @@ impl Server {
                 json!({
                     "protocolVersion": 2,
                     "agentCapabilities": { "loadSession": false },
-                    "_meta": { "steering": { "supported": false } },
+                    "_meta": {
+                        "steering": { "supported": false },
+                        "abbSandbox": ["read-only", "workspace-write", "full-access"],
+                    },
                 }),
             )
             .await
@@ -334,6 +355,42 @@ impl Server {
             }
             tools = kept;
             tools.push(crate::builtin::load_skill_tool(skills));
+        }
+
+        // 受限会话套 Jev 门禁（统一迁移刀 2）：每个工具调用都包一层 GuardedTool，
+        // 执行前问 Jev。Jev 装配失败（缺 key 等）→ **拒绝对话**（fail-closed，不降级
+        // 成放行）。owner 全权限会话不包，零开销。
+        if parsed.restricted() {
+            let jev = match &self.jev {
+                Ok(jev) => jev.clone(),
+                Err(reason) => {
+                    tracing::error!("受限会话 {session_id} 拒绝建立：{reason}");
+                    return self
+                        .writer
+                        .fail(
+                            id,
+                            -32000,
+                            format!("受限会话需要 Jev 决策门禁，但装配失败：{reason}"),
+                        )
+                        .await;
+                }
+            };
+            let workspace = workspace_for_tools(&parsed.cwd).display().to_string();
+            let guarded: Vec<Arc<dyn AgentTool>> = tools
+                .into_iter()
+                .map(|tool| {
+                    Arc::new(crate::decision::GuardedTool::new(
+                        tool,
+                        jev.clone(),
+                        workspace.clone(),
+                    )) as Arc<dyn AgentTool>
+                })
+                .collect();
+            tracing::info!(
+                "受限会话 {session_id}：{} 个工具已套 Jev 门禁",
+                guarded.len()
+            );
+            tools = guarded;
         }
 
         let agent = match self.build_agent(&session_id, parsed.system_prompt, &hints, tools) {
@@ -609,7 +666,8 @@ fn workspace_for_tools(parsed_cwd: &str) -> std::path::PathBuf {
     }
 }
 
-/// `session/new` 里 abb 下发的三项契约（`cwd` / `systemPrompt` / `mcpServers`）。
+/// `session/new` 里 abb 下发的三项契约（`cwd` / `systemPrompt` / `mcpServers`）
+/// 与 `_meta` 扩展（`sandbox` / `shell`，统一迁移刀 2 新增）。
 ///
 /// 抽成纯函数是为了可测：这三项在第一刀里**全部被静默忽略**（连 `params` 都不读），
 /// 属于「abb 给了、agent 不看」的典型失效。
@@ -618,6 +676,10 @@ struct SessionNewParams {
     cwd: String,
     system_prompt: Option<String>,
     mcp_servers: Vec<McpServerSpec>,
+    /// `_meta.sandbox`："read-only" | "workspace-write" | "full-access"（缺省 = 全权限）。
+    sandbox: Option<String>,
+    /// `_meta.shell`："restricted" = argv 白名单（granted 承诺语义）；缺省 = Full。
+    shell: Option<String>,
 }
 
 impl SessionNewParams {
@@ -639,11 +701,35 @@ impl SessionNewParams {
                 .map_err(|error| format!("mcpServers 解析失败：{error}"))?,
             None => Vec::new(),
         };
+        let meta = params.get("_meta");
+        let sandbox = meta
+            .and_then(|m| m.get("sandbox"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let shell = meta
+            .and_then(|m| m.get("shell"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
         Ok(Self {
             cwd,
             system_prompt,
             mcp_servers,
+            sandbox,
+            shell,
         })
+    }
+
+    /// 是否受限会话：`sandbox` 是 read-only / workspace-write，或 `shell == restricted`。
+    ///
+    /// 只有受限会话才套 Jev 门禁；owner 全权限（`sandbox` 缺省 / full-access 且
+    /// `shell` 非 restricted）不套，零开销。
+    fn restricted(&self) -> bool {
+        matches!(
+            self.sandbox.as_deref(),
+            Some("read-only") | Some("workspace-write")
+        ) || self.shell.as_deref() == Some("restricted")
     }
 }
 
@@ -1063,10 +1149,10 @@ mod tests {
         assert_eq!(prompt_text(&json!({})), "");
     }
 
-    /// `initialize` 响应**不得**出现 `_meta.abbSandbox`：一旦声明，abb 会把
-    /// granted 会话路由成「档位受限」并期待执行，而本 agent 不执行任何档位。
+    /// `initialize` 必须声明 `_meta.abbSandbox` 三档：abb 对带 `session_sandbox`
+    /// 的会话 fail-closed，不声明词表则受限会话永远到不了本 agent（统一迁移刀 2）。
     #[tokio::test]
-    async fn initialize_does_not_declare_abb_sandbox() {
+    async fn initialize_declares_abb_sandbox() {
         let (writer, mut captured) = crate::testing::capture_writer();
         let server = Arc::new(Server::new(writer));
         server
@@ -1081,9 +1167,10 @@ mod tests {
         let line = captured.recv().await.expect("应写出一条应答");
         let value: Value = serde_json::from_str(&line).expect("应答是 JSON");
         assert_eq!(value["result"]["protocolVersion"], 2);
-        assert!(
-            value["result"]["_meta"].get("abbSandbox").is_none(),
-            "不得声明 abbSandbox（本 agent 不实现 OS 沙箱档位）：{value}"
+        assert_eq!(
+            value["result"]["_meta"]["abbSandbox"],
+            json!(["read-only", "workspace-write", "full-access"]),
+            "必须声明 abbSandbox 三档（否则受限会话 fail-closed）：{value}"
         );
         // steering 必须如实报 false：本刀未实现 `_session/steering`，而 abb 那边这个
         // 标志是写该方法的唯一闸门 ⇒ 报 true 会让每次「回合中追加消息」多一次无效往返。
@@ -1250,6 +1337,37 @@ mod tests {
             SessionNewParams::parse(&json!({ "cwd": "   ", "systemPrompt": "  " })).unwrap();
         assert!(parsed.cwd.is_empty());
         assert!(parsed.system_prompt.is_none());
+    }
+
+    /// 受限判定（统一迁移刀 2）：sandbox 是 read-only / workspace-write，或
+    /// shell=restricted，都算受限；缺省 / full-access 且非 restricted 则全权限。
+    #[test]
+    fn restricted_session_detection() {
+        assert!(
+            SessionNewParams::parse(&json!({ "_meta": { "sandbox": "workspace-write" } }))
+                .unwrap()
+                .restricted()
+        );
+        assert!(
+            SessionNewParams::parse(&json!({ "_meta": { "sandbox": "read-only" } }))
+                .unwrap()
+                .restricted()
+        );
+        assert!(
+            SessionNewParams::parse(&json!({ "_meta": { "shell": "restricted" } }))
+                .unwrap()
+                .restricted()
+        );
+        assert!(
+            !SessionNewParams::parse(&json!({})).unwrap().restricted(),
+            "缺省 = 全权限"
+        );
+        assert!(
+            !SessionNewParams::parse(&json!({ "_meta": { "sandbox": "full-access" } }))
+                .unwrap()
+                .restricted(),
+            "full-access 不限制"
+        );
     }
 
     /// `mcpServers` 形状不对必须报错（-32005），不能静默当成空列表——

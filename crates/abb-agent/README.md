@@ -386,7 +386,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。十二条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。十三条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -403,6 +403,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `delegate_round_trip.py` | `dev__delegate` 真调用本机 CLI（假 CLI 记录 argv）／报告回灌／不可用时可纠偏／无可用后端时不暴露／非零退出是错误结果／孙进程攥管道不挂死／取消收尾 `cancelled` |
 | `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
+| `jev_gate_round_trip.py` | 受限会话工具调用受 Jev 门禁：allow 真执行／deny 不执行 + 拒绝 reason／不可用 fail-closed／全权限零开销；Jev 收到 Decisions 形状（noul + state 带 workspace） |
 
 判定已收紧（只认 `cancelled`／断言不得出现 `result`）——早先出现过「非 cancelled 的其它结论
 被算作通过」的假通过窗口。

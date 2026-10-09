@@ -20,10 +20,17 @@
 //! `noul` 是「yes 的概率」：1.0 = 明确该放行，0.0 = 明确该拒绝。默认阈值 0.5
 //! （`JEV_ALLOW_THRESHOLD` 可调），**低于阈值 = 拒绝**（fail-closed 倾向从严）。
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_agent::types::{AgentToolResult, ToolResultPartial};
+use rpi_ai::types::Tool;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::provider::EnvSource;
 
@@ -80,6 +87,9 @@ struct NoulAnswer {
 }
 
 /// Jev 决策客户端：持有端点 / key / 模型 / 阈值，`check` 发一次决策请求。
+///
+/// `Clone` 便宜（`reqwest::Client` 内部是 `Arc`），供 `GuardedTool` 每会话持有一份。
+#[derive(Clone)]
 pub struct JevClient {
     base_url: String,
     api_key: String,
@@ -194,6 +204,71 @@ impl JevClient {
                 )
             },
         })
+    }
+}
+
+/// 决策模型门禁包装：把 Jev 的 allow/deny 强加到**任意** `AgentTool` 外面。
+///
+/// 为什么是包装器而不是 rpi 的 `before_tool_call` hook：rpi-agent 0.3.16 的
+/// `AgentBuilder` **没有暴露** `before_tool_call` setter（`build_config` 里硬编码
+/// `None`）。而包装器把同样的拦截放在 `execute` 入口，每个工具调用都会过——语义等价、
+/// 不碰 rpi 库，且天然覆盖 MCP 工具 / 内置工具 / `load_skill`（都是 `Arc<dyn AgentTool>`）。
+///
+/// 评审意见 1 的落实：`state` 里带 `tool`（工具名）+ `args`（参数）+ `workspace`
+/// （会话工作区），Jev 据此判断越界。
+///
+/// fail-closed：`check` 返回 `Err`（Jev 不可用）或 `deny` 时，一律返回工具错误
+/// （`AgentError::Tool`，模型看到可纠偏的 reason），**绝不委托内层执行**。
+pub struct GuardedTool {
+    inner: Arc<dyn AgentTool>,
+    jev: JevClient,
+    workspace: String,
+}
+
+impl GuardedTool {
+    /// 包一层决策门禁。`workspace` 是会话工作区（进 Jev 的 state）。
+    pub fn new(inner: Arc<dyn AgentTool>, jev: JevClient, workspace: impl Into<String>) -> Self {
+        Self {
+            inner,
+            jev,
+            workspace: workspace.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTool for GuardedTool {
+    fn schema(&self) -> &Tool {
+        self.inner.schema()
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: Value,
+        signal: CancellationToken,
+        on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        let state = json!({
+            "tool": self.inner.schema().name,
+            "args": params,
+            "workspace": self.workspace,
+        });
+        match self.jev.check(state).await {
+            Ok(decision) if decision.allowed => {
+                self.inner
+                    .execute(tool_call_id, params, signal, on_update)
+                    .await
+            }
+            Ok(decision) => Err(AgentError::tool(decision.reason)),
+            Err(reason) => Err(AgentError::tool(format!(
+                "决策门禁不可用，已拒绝该工具调用（fail-closed）：{reason}"
+            ))),
+        }
     }
 }
 
@@ -340,5 +415,125 @@ mod tests {
         assert_eq!(client.base_url, DEFAULT_JEV_BASE_URL);
         assert_eq!(client.model, DEFAULT_JEV_MODEL);
         assert_eq!(client.threshold, DEFAULT_ALLOW_THRESHOLD);
+    }
+
+    // ── GuardedTool ────────────────────────────────────────────────
+
+    /// 假内层工具：记录「execute 是否被调用」，并返回固定文本。
+    struct ProbeTool {
+        name: &'static str,
+        executed: std::sync::atomic::AtomicBool,
+    }
+
+    impl ProbeTool {
+        fn new(name: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                executed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentTool for ProbeTool {
+        fn schema(&self) -> &Tool {
+            // 借用临时值的生命周期问题：这里用 Box::leak 制造一个 'static schema。
+            Box::leak(Box::new(Tool {
+                name: self.name.to_string(),
+                description: String::new(),
+                parameters: rpi_ai::types::Schema(serde_json::json!({})),
+                constrained_sampling: None,
+            }))
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: Value,
+            _signal: CancellationToken,
+            _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+        ) -> Result<AgentToolResult, AgentError> {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(AgentToolResult::text("probe executed"))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_allow_delegates_to_inner() {
+        let (base, _rx) = spawn_fake_jev(
+            "200 OK",
+            r#"{"model":"typesafe/jev-1.13","answers":{"allowed":{"type":"noul","noul":0.9}},"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let env = fake_env(&[("JEV_API_KEY", "sk-test"), ("JEV_BASE_URL", &base)]);
+        let jev = JevClient::from_env(&env).expect("装配");
+        let probe = ProbeTool::new("dev__probe");
+        let guarded = GuardedTool::new(probe.clone(), jev, "/ws");
+        let result = guarded
+            .execute(
+                "id-1",
+                json!({}),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("放行应委托执行");
+        assert!(probe.executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            matches!(&result.content[0], rpi_agent::types::TextContentOrImage::Text(t) if t.text == "probe executed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_deny_blocks_inner() {
+        let (base, _rx) = spawn_fake_jev(
+            "200 OK",
+            r#"{"model":"typesafe/jev-1.13","answers":{"allowed":{"type":"noul","noul":0.1}},"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let env = fake_env(&[("JEV_API_KEY", "sk-test"), ("JEV_BASE_URL", &base)]);
+        let jev = JevClient::from_env(&env).expect("装配");
+        let probe = ProbeTool::new("dev__probe");
+        let guarded = GuardedTool::new(probe.clone(), jev, "/ws");
+        let err = guarded
+            .execute(
+                "id-1",
+                json!({}),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !probe.executed.load(std::sync::atomic::Ordering::SeqCst),
+            "deny 时内层不得执行"
+        );
+        assert!(err.to_string().contains("不应放行"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_unavailable_blocks_inner_fail_closed() {
+        let (base, _rx) = spawn_fake_jev("500 Internal Server Error", "{}");
+        let env = fake_env(&[("JEV_API_KEY", "sk-test"), ("JEV_BASE_URL", &base)]);
+        let jev = JevClient::from_env(&env).expect("装配");
+        let probe = ProbeTool::new("dev__probe");
+        let guarded = GuardedTool::new(probe.clone(), jev, "/ws");
+        let err = guarded
+            .execute(
+                "id-1",
+                json!({}),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !probe.executed.load(std::sync::atomic::Ordering::SeqCst),
+            "Jev 不可用时内层不得执行（fail-closed）"
+        );
+        assert!(err.to_string().contains("fail-closed"), "{err}");
     }
 }
