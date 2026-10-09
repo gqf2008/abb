@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dirs 6.0.0",
+ "reqwest",
  "rmcp",
  "rpi-agent",
  "rpi-ai",

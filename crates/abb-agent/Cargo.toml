@@ -67,6 +67,9 @@ dirs = "6"
 # 只开 client + 子进程传输：不需要 server 侧与其它传输。
 rmcp = { version = "1", default-features = false, features = [
     "client", "transport-child-process"] }
+# Jev 决策模型（Typesafe System One，OpenRouter Decisions API）：HTTP POST + JSON。
+# 与 rpi-ai 同版本线/同 feature（rustls + json），不引 stream（决策非流式）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }
