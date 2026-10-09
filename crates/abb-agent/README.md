@@ -238,7 +238,7 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 
 | 维度 | 被替代组件 | 本包 |
 | --- | --- | --- |
-| 集合 | **6 个**：`shell`/`read`/`write`/`ls`/`glob`/`delegate` | 前五个**同名**（`glob` 由 rpi 的 `find` 工具提供——它的入参就是 glob 模式）+ `edit`/`grep`（rpi 增量）；**`delegate`（子代理委派）本包没有** |
+| 集合 | **6 个**：`shell`/`read`/`write`/`ls`/`glob`/`delegate` | **六个同名**：前五个由 rpi-tools 提供（`glob` 由 rpi 的 `find` 提供——入参就是 glob 模式），`delegate` 由本包自己实现（rpi 没有，见 `src/delegate.rs`）+ `edit`/`grep`（rpi 增量） |
 | shell 工具参数 | `{command, timeout_secs}` | 同名同形：schema 里把 rpi 的 `timeout` 改名成 `timeout_secs`，调用时再翻回去 |
 | shell 超时 | 默认 120s、clamp 1..=600 | 同（`default_timeout=120`；模型给的 `timeout_secs` 也 clamp 进 1..=600，`0`/负数/非法值落回 120） |
 | shell 的环境 | 白名单（凭据不进子进程）+ **写入 `ABB_AGENT_CONTEXT=1`** | 同：`inherit_env=false` + `child_env::passthrough_map()`（与 MCP 子进程共用同一份白名单），且**标记由我们写入**（abb 的 Q8 proc 闸以它为主判据：少了它「agent 派生的 shell 去建 `--proc` 任务」会 fail-open） |
@@ -249,8 +249,38 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 | 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
 | Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
 
-**已知能力缺口**：`delegate`（子代理委派）本包没有对应实现 —— 换执行层时这是**能力缺口**而不是等价替换。
-另外 `dev__write`/`dev__edit` 的 description 里明写了「路径限定在会话工作区」，与真实约束一致。
+`dev__write`/`dev__edit` 的 description 里明写了「路径限定在会话工作区」，与真实约束一致。
+
+### `dev__delegate`（委派给本机 claude/codex CLI）
+
+把自包含的编码任务交给**本机安装的** `claude` / `codex` CLI 跑（子进程、cwd = 会话工作区、
+最终报告作为工具结果回灌），与 `crates/buzz-agent/src/devtools.rs::run_delegate` 对齐：
+
+- 命令行：claude `-p --output-format text --dangerously-skip-permissions -- <task>`；
+  codex `exec --skip-git-repo-check --sandbox workspace-write -C <cwd> -- <task>`（`--` 分隔，
+  防 task 被当选项/子命令）；
+- 二进制：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` **覆盖即唯一来源**（指错**不回落** PATH——与参照物
+  `resolve_delegate_cli` 同取向：运维要的就是确定性）；**空串/纯空白 = 显式禁用**该后端（也不回落）；
+  未设覆盖时才查 PATH；找不到时给**可纠偏**错误
+  （`available: claude, codex` / `available: none (neither claude nor codex found in PATH)`）；
+  覆盖值会 **`trim()` 首尾空白**（参照物 `PathBuf::from(raw)` 不 trim——带首尾空格的路径参照物
+  解析不出、本包能解析，属有意更宽松，登记）；
+- **两个 CLI 都没装时不暴露这个工具**（参照物 `cli_available` 腿同取向：工具表里不该出现只会报错的工具）；
+- 超时默认 **1200s**、clamp 1..=1200，到点杀进程；`session/cancel` 也杀（unix 连同进程组）；
+- **抽干管道有上界**：**每条流各 5s**（两条都被攥时最坏 ~10s）；孙进程若仍攥着管道，如实标注
+  `output incomplete` 而不是把回合挂死（被攥的那条流的**已读部分也会丢**——与参照物同构，登记）；
+- 输出按**头 16 KiB + 尾 16 KiB + 省略标记**有界保留（不会整段丢掉 stderr）；**尾预算有意放大**：
+  参照物 tail=2048 B（head≈14 KiB，合计展示 ~16 KiB），本包 tail=16 KiB（head+tail 合计 32 KiB，
+  委派报告的最终结论通常在结尾，多留一段尾不伤身），且 `total <= kept` 时（≤32 KiB）整段带回、
+  不带省略标记；
+- **非零退出是错误结果**（rpi 按 `Ok`/`Err` 推 `is_error`）：委派失败不会被当成成功工具结果回灌给模型，
+  但 exit 码与输出仍随错误正文带回；
+- env 走**白名单**（供应商凭据不进子进程）+ claude 的 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`；
+  Windows 上 `CREATE_NO_WINDOW`（只与内置 **shell** 腿同款；MCP 腿没设——rmcp 1.8 的子进程传输
+  不暴露 `creation_flags`）；
+- ⚠️ **授权差异（如实登记）**：参照物在受限档（read-only / granted）**拒绝**这个工具（它按
+  `policy.sandbox.allow_shell()` 与 shell 模式判定）；本包不实现档位，而受限会话根本不会跑到本包上
+  （abb 的 P2.3 硬闸拒建）⇒ **结构上满足，但没有独立闸门**。
 
 与参照物**有意更紧**的一处：本包允许**落在工作区内**的绝对路径（参照物一律拒绝绝对路径）——
 rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝对路径反而会破坏正常写入；
@@ -356,7 +386,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。十一条探针各自对应一条被评审反证过的行为
+单测用替身，探针跑**真二进制**——两者职责不同。十二条探针各自对应一条被评审反证过的行为
 （计数以 `probes/*.py` 里的 `main` 脚本为准）：
 
 | 探针 | 覆盖 |
@@ -370,6 +400,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |
 | `builtin_tools_round_trip.py` | 内置工具真落盘（文件系统判据）／`..` 与工作区外绝对路径写不出去／`dev__shell` 真执行／`DEV_TOOLS=0` 真关 |
 | `tool_call_notifications.py` | 工具调用通知真发出（`pending → in_progress → completed/failed`，含 MCP 工具）；成功那条带 `content`/`rawOutput` |
+| `delegate_round_trip.py` | `dev__delegate` 真调用本机 CLI（假 CLI 记录 argv）／报告回灌／不可用时可纠偏／无可用后端时不暴露／非零退出是错误结果／孙进程攥管道不挂死／取消收尾 `cancelled` |
 | `load_skill_round_trip.py` | 技能清单进系统提示（三段结构）／裸名 `load_skill` 真读到正文与支持文件／越界读被拒／无技能时不暴露该工具／`NO_HINTS=1` 时技能与约定链同关 |
 | `hints_and_no_hints.py` | 六个场景：约定链真进请求体（全局层在前）／非零即关／读不懂的取值不发请求且 exit 2／空 cwd 只读一层 |
 

@@ -18,6 +18,7 @@
 pub mod acp;
 pub mod builtin;
 pub mod child_env;
+pub mod delegate;
 pub mod hints;
 pub mod mcp;
 pub mod provider;
