@@ -78,7 +78,12 @@ pub fn dev_tools_enabled(env: &dyn EnvSource) -> Result<bool, String> {
 ///
 /// `workspace` 是会话工作区（`session/new` 的 `cwd`）：read/bash/grep/find/ls 的基准目录，
 /// 也是 write/edit 的**写入边界**。
-pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
+///
+/// `restricted`（统一迁移刀 3）：受限会话时 read/ls/grep/find 额外套**读域闸**
+/// （`Guard::ReadPath`，只能读工作区内，与参照物受限档 `read_roots` 同语义）；owner
+/// 全权限会话保持读任意路径（对齐参照物 FullAccess `read_roots=None`）。写类工具的
+/// `Guard::WritePath` 是无条件的（连 owner 都限，这是既有行为，见模块文档）。
+pub fn dev_tools(workspace: &Path, restricted: bool) -> Vec<Arc<dyn AgentTool>> {
     let env: Arc<OsExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(workspace.to_path_buf()));
     let read_env: Arc<dyn ExecutionEnv> = env.clone();
     let mutate_env: Arc<dyn MutatingEnv> = env;
@@ -97,6 +102,11 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
         })),
     };
 
+    let read_guard = if restricted {
+        Guard::ReadPath
+    } else {
+        Guard::None
+    };
     let mut tools: Vec<Arc<dyn AgentTool>> = vec![
         // `bash` 工具改成参照物的名字 `dev__shell`，schema 里把 `timeout` 改回 `timeout_secs`。
         exposed(
@@ -108,7 +118,7 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
         exposed(
             create_read_tool(&context, None),
             "read",
-            Guard::None,
+            read_guard,
             workspace,
         ),
         exposed(
@@ -123,11 +133,11 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
             Guard::WritePath,
             workspace,
         ),
-        exposed(create_ls_tool(&context, None), "ls", Guard::None, workspace),
+        exposed(create_ls_tool(&context, None), "ls", read_guard, workspace),
         exposed(
             create_grep_tool(&context, None),
             "grep",
-            Guard::None,
+            read_guard,
             workspace,
         ),
         // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
@@ -135,7 +145,7 @@ pub fn dev_tools(workspace: &Path) -> Vec<Arc<dyn AgentTool>> {
         exposed(
             create_find_tool(&context, None),
             "glob",
-            Guard::None,
+            read_guard,
             workspace,
         ),
     ];
@@ -160,6 +170,9 @@ enum Guard {
     None,
     /// 写类工具：把 `path` 限定到会话工作区内（见 [`confine_write_path`]）。
     WritePath,
+    /// 读类工具：把 `path` 限定到会话工作区内（见 [`confine_read_path`]）。
+    /// 仅受限会话套用；owner 全权限用 `None`（对齐参照物 FullAccess 读任意路径）。
+    ReadPath,
     /// shell：把 schema 的 `timeout_secs` 翻回 rpi 的 `timeout`。
     ShellTimeout,
 }
@@ -198,6 +211,12 @@ fn exposed(
         description.push_str(
             "\n\nPath is confined to the session workspace: paths escaping it \
              (absolute paths outside the workspace, `..` traversal, symlinks) are rejected.",
+        );
+    }
+    if guard == Guard::ReadPath {
+        description.push_str(
+            "\n\nPath is confined to the session workspace: paths outside it \
+             (absolute paths, `..` traversal, symlinks) are rejected.",
         );
     }
     let schema = Tool {
@@ -279,6 +298,7 @@ impl AgentTool for Exposed {
         let params = match self.guard {
             Guard::None => params,
             Guard::WritePath => self.confine(&params).await?,
+            Guard::ReadPath => self.confine_read(&params).await?,
             Guard::ShellTimeout => rename_timeout_param(params),
         };
         self.inner
@@ -295,6 +315,28 @@ impl Exposed {
             return Ok(params.clone());
         };
         let target = confine_write_path(&self.workspace, raw)
+            .await
+            .map_err(AgentError::Tool)?;
+        let mut params = params.clone();
+        if let Value::Object(map) = &mut params {
+            map.insert(
+                "path".to_string(),
+                Value::String(target.to_string_lossy().into_owned()),
+            );
+        }
+        Ok(params)
+    }
+
+    /// 把读类工具的 `path` 限定到会话工作区（受限会话），并把**已解析的绝对路径**传给内层。
+    ///
+    /// 读类工具（read/ls/grep/find）的 `path` 是**可选**的：缺省 = 工作区（安全，原样委托），
+    /// 给了才做 canonicalize + 前缀校验（与参照物受限档 `read_roots` 同语义）。
+    async fn confine_read(&self, params: &Value) -> Result<Value, AgentError> {
+        let Some(raw) = params.get("path").and_then(Value::as_str) else {
+            // 缺省 path（ls/grep/find 都不必填）= 工作区本身，无需拦。
+            return Ok(params.clone());
+        };
+        let target = confine_read_path(&self.workspace, raw)
             .await
             .map_err(AgentError::Tool)?;
         let mut params = params.clone();
@@ -375,6 +417,34 @@ async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, Stri
         }
     }
     Ok(target)
+}
+
+/// 读取路径限定：`path`（相对或绝对）解析 + canonicalize 后必须落在会话工作区内。
+///
+/// 与参照物 `crates/buzz-agent/src/devtools.rs::resolve_read_path` 的受限档 `read_roots`
+/// 分支同语义：相对路径按工作区为基准解、绝对路径原样，都 canonicalize 后再前缀比对。
+/// 符号链接同样被解掉（canonicalize 还原真实路径）——所以「工作区内指向工作区外的链接」
+/// 也读不到。与写域闸不同：读不创建父目录、不拒绝对路径（只要落在工作区内就放行）。
+async fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
+    let base = tokio::fs::canonicalize(workspace)
+        .await
+        .map_err(|error| format!("会话工作区不可访问：{}（{error}）", workspace.display()))?;
+    let path = Path::new(raw);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let canon = tokio::fs::canonicalize(&candidate)
+        .await
+        .map_err(|error| format!("路径不可访问：{raw}（{error}）"))?;
+    if !canon.starts_with(&base) {
+        return Err(format!(
+            "拒绝读取会话工作区之外：{raw}（工作区 {}）",
+            base.display()
+        ));
+    }
+    Ok(canon)
 }
 
 /// `load_skill` 的工具名：**裸名**（不经 `dev__` 命名空间）。
@@ -495,7 +565,7 @@ mod tests {
     #[test]
     fn tools_are_exposed_under_dev_namespace_with_replaced_component_shapes() {
         let workspace = temp_workspace("names");
-        let tools = dev_tools(&workspace);
+        let tools = dev_tools(&workspace, false);
         let names: Vec<String> = tools.iter().map(|t| t.schema().name.clone()).collect();
         for expected in [
             "dev__shell",
@@ -539,7 +609,7 @@ mod tests {
     #[test]
     fn exposed_schemas_match_real_behavior() {
         let workspace = temp_workspace("docs");
-        let tools = dev_tools(&workspace);
+        let tools = dev_tools(&workspace, false);
         let by_name = |name: &str| -> Arc<dyn AgentTool> {
             tools
                 .iter()
@@ -724,5 +794,46 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).expect("建符号链接");
         let attempt = confine_write_path(&workspace, "link/escape.txt").await;
         assert!(attempt.is_err(), "符号链接逃逸必须被拒：{attempt:?}");
+    }
+
+    /// 读域闸（统一迁移刀 3）：工作区内可读、`..` 与工作区外绝对路径被拒。
+    #[tokio::test]
+    async fn read_confinement_rejects_escapes() {
+        let workspace = temp_workspace("read-conf");
+        std::fs::write(workspace.join("inside.txt"), "IN").expect("建工作区内文件");
+        let canon = tokio::fs::canonicalize(&workspace).await.expect("canon");
+
+        let inside = confine_read_path(&workspace, "inside.txt")
+            .await
+            .expect("工作区内相对路径应可读");
+        assert!(inside.starts_with(&canon), "{inside:?}");
+        let absolute_inside = confine_read_path(
+            &workspace,
+            &format!("{}/inside.txt", canon.to_string_lossy()),
+        )
+        .await
+        .expect("工作区内绝对路径应可读");
+        assert!(absolute_inside.starts_with(&canon));
+
+        let escape = confine_read_path(&workspace, "../escape.txt").await;
+        assert!(escape.is_err(), "`..` 逃逸必须被拒：{escape:?}");
+        let outside = confine_read_path(&workspace, "/etc/passwd").await;
+        assert!(outside.is_err(), "工作区外绝对路径必须被拒：{outside:?}");
+    }
+
+    /// 读域闸把符号链接解掉：工作区内指向工作区外的链接也读不到（canonicalize 还原真实路径）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_confinement_rejects_symlink_escape() {
+        let workspace = temp_workspace("read-symlink");
+        let outside = temp_workspace("read-symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "SECRET").expect("建工作区外文件");
+        let link = workspace.join("link.txt");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &link).expect("建符号链接");
+        let attempt = confine_read_path(&workspace, "link.txt").await;
+        assert!(
+            attempt.is_err(),
+            "指向工作区外的符号链接必须被拒：{attempt:?}"
+        );
     }
 }
