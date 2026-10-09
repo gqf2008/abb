@@ -318,7 +318,11 @@ impl Server {
         let mut tools = tools;
         if self.dev_tools_enabled {
             let workspace = workspace_for_tools(&parsed.cwd);
-            let builtin = crate::builtin::dev_tools(&workspace, parsed.sandbox_mode());
+            let builtin = crate::builtin::dev_tools(
+                &workspace,
+                parsed.sandbox_mode(),
+                parsed.shell.as_deref() == Some("restricted"),
+            );
             tracing::info!(
                 "会话 {session_id}：内置工具 {} 个：{:?}",
                 builtin.len(),

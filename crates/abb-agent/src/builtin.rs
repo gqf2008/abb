@@ -128,7 +128,16 @@ pub fn dev_tools_enabled(env: &dyn EnvSource) -> Result<bool, String> {
 ///   read/ls/grep/find 限工作区（读域闸）；
 /// - `WorkspaceWrite`：全工具可用，读写均限工作区；
 /// - `FullAccess`：读任意路径（对齐参照物 `read_roots=None`），写仍限工作区（无条件）。
-pub fn dev_tools(workspace: &Path, mode: SandboxMode) -> Vec<Arc<dyn AgentTool>> {
+///
+/// `shell_restricted`（granted 承诺语义）另成独立维度：不改变 shell/write/read 的可见性
+/// （granted 会话能写工作区、有 shell——shell 的**内容**由 Jev 门禁判断），但**摘除
+/// `delegate`**（对齐参照物 `delegate_def_visible` 的 `shell != Restricted` 腿：委派 CLI
+/// 天生不受域闸约束，给了 = 白名单白做）。
+pub fn dev_tools(
+    workspace: &Path,
+    mode: SandboxMode,
+    shell_restricted: bool,
+) -> Vec<Arc<dyn AgentTool>> {
     let env: Arc<OsExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(workspace.to_path_buf()));
     let read_env: Arc<dyn ExecutionEnv> = env.clone();
     let mutate_env: Arc<dyn MutatingEnv> = env;
@@ -204,9 +213,13 @@ pub fn dev_tools(workspace: &Path, mode: SandboxMode) -> Vec<Arc<dyn AgentTool>>
     ));
     // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
     // **两个 CLI 都没装时不暴露**：与参照物的 `cli_available` 腿同取向——工具表里不该出现
-    // 一个只会报错的工具（评审 F8）。read-only / restricted 档也不暴露（参照物同语义：
-    // delegate 在「无 shell / granted」档永不放行）。
-    if mode.allow_shell() && crate::delegate::any_backend_available(&crate::provider::ProcessEnv) {
+    // 一个只会报错的工具（评审 F8）。read-only（无 shell）与 granted（shell=restricted）档
+    // 也不暴露：对齐参照物 `delegate_def_visible` = `allow_shell && shell != Restricted &&
+    // cli_available`（委派 CLI 天生不受域闸约束，给了 = 白名单白做）。
+    let delegate_visible = mode.allow_shell()
+        && !shell_restricted
+        && crate::delegate::any_backend_available(&crate::provider::ProcessEnv);
+    if delegate_visible {
         tools.push(exposed(
             Arc::new(crate::delegate::DelegateTool::new(workspace)),
             crate::delegate::DELEGATE_BARE_NAME,
@@ -619,7 +632,7 @@ mod tests {
     #[test]
     fn tools_are_exposed_under_dev_namespace_with_replaced_component_shapes() {
         let workspace = temp_workspace("names");
-        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess);
+        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
         let names: Vec<String> = tools.iter().map(|t| t.schema().name.clone()).collect();
         for expected in [
             "dev__shell",
@@ -665,7 +678,7 @@ mod tests {
     fn tool_surface_follows_sandbox_mode() {
         let workspace = temp_workspace("mode");
 
-        let read_only = dev_tools(&workspace, crate::builtin::SandboxMode::ReadOnly);
+        let read_only = dev_tools(&workspace, crate::builtin::SandboxMode::ReadOnly, false);
         let ro_names: Vec<String> = read_only.iter().map(|t| t.schema().name.clone()).collect();
         for absent in ["dev__shell", "dev__write", "dev__edit", "dev__delegate"] {
             assert!(
@@ -680,7 +693,11 @@ mod tests {
             );
         }
 
-        let ww = dev_tools(&workspace, crate::builtin::SandboxMode::WorkspaceWrite);
+        let ww = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::WorkspaceWrite,
+            false,
+        );
         let ww_names: Vec<String> = ww.iter().map(|t| t.schema().name.clone()).collect();
         for present in ["dev__shell", "dev__write", "dev__edit", "dev__read"] {
             assert!(
@@ -689,9 +706,28 @@ mod tests {
             );
         }
 
-        let full = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess);
+        let full = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
         let full_names: Vec<String> = full.iter().map(|t| t.schema().name.clone()).collect();
         assert!(full_names.contains(&"dev__shell".to_string()));
+
+        // granted（shell=restricted）档：delegate 不注入（对齐参照物 delegate_def_visible
+        // 的 `shell != Restricted` 腿）；shell/write 仍在（内容由 Jev 门禁判断）。
+        let granted = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::WorkspaceWrite,
+            true,
+        );
+        let granted_names: Vec<String> = granted.iter().map(|t| t.schema().name.clone()).collect();
+        assert!(
+            !granted_names.contains(&"dev__delegate".to_string()),
+            "granted 档不得暴露 delegate：{granted_names:?}"
+        );
+        for present in ["dev__shell", "dev__write", "dev__read"] {
+            assert!(
+                granted_names.contains(&present.to_string()),
+                "granted 档应保留 {present}：{granted_names:?}"
+            );
+        }
     }
 
     /// `SandboxMode::parse` 词表与 abb 下发一致：未知/缺失回落 FullAccess。
@@ -723,7 +759,7 @@ mod tests {
     #[test]
     fn exposed_schemas_match_real_behavior() {
         let workspace = temp_workspace("docs");
-        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess);
+        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
         let by_name = |name: &str| -> Arc<dyn AgentTool> {
             tools
                 .iter()
