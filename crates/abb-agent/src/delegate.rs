@@ -104,20 +104,23 @@ pub fn args_for(backend: DelegateBackend, task: &str, cwd: &str) -> Vec<String> 
 pub fn delegate_cli_path(backend: DelegateBackend, env: &dyn EnvSource) -> Option<PathBuf> {
     if let Some(raw) = env.get(backend.bin_override_env()) {
         let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            if is_executable_file(&path) {
-                return Some(path);
-            }
-            // **覆盖即唯一来源，绝不回落 PATH**（与参照物 `resolve_delegate_cli` 同取向：
-            // 「运维要的就是确定性」——配了就该用它，找不到就如实报错，而不是偷偷换一个）。
-            tracing::error!(
-                "{} 指向的 {} 不可执行（按覆盖语义不再回落 PATH）",
-                backend.bin_override_env(),
-                trimmed
-            );
+        if trimmed.is_empty() {
+            // **空串 = 显式禁用这个后端**（与参照物同：`override = Some` 即唯一来源，
+            // 空串解析不出可执行文件 ⇒ 该后端不可用），**不**回落 PATH。
             return None;
         }
+        let path = PathBuf::from(trimmed);
+        if is_executable_file(&path) {
+            return Some(path);
+        }
+        // **覆盖即唯一来源，绝不回落 PATH**（与参照物 `resolve_delegate_cli` 同取向：
+        // 「运维要的就是确定性」——配了就该用它，找不到就如实报错，而不是偷偷换一个）。
+        tracing::error!(
+            "{} 指向的 {} 不可执行（按覆盖语义不再回落 PATH）",
+            backend.bin_override_env(),
+            trimmed
+        );
+        return None;
     }
     find_in_path(backend.cli(), env)
 }
@@ -190,9 +193,9 @@ fn find_in_path(name: &str, env: &dyn EnvSource) -> Option<PathBuf> {
 /// 每个流的**头/尾**各留多少字节（与参照物 `CappedStream` 同量级：16 KiB）。
 const STREAM_HEAD_BYTES: usize = 16 * 1024;
 const STREAM_TAIL_BYTES: usize = 16 * 1024;
-/// 抽干管道的宽限：超过就判定「有孙进程还攥着管道」，如实告知模型输出不完整
-/// （**参照物同款 5s drain**；早先这里无限等 ⇒ 一条攥着管道的孙进程能把整个回合挂死，
-/// 连 `session/cancel` 都拉不回来——评审实测）。
+/// 抽干管道的宽限：**每条流**各 5s（stdout/stderr 串行等 ⇒ 两条都被攥时最坏 ~10s）。
+/// 超过就判定「有孙进程还攥着管道」，如实告知模型输出不完整（参照物同款 5s drain；
+/// 早先这里无限等 ⇒ 一条攥着管道的孙进程能把整个回合挂死，连 `session/cancel` 都拉不回来）。
 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn truncate_at_boundary(text: &str, max: usize) -> &str {
@@ -301,7 +304,9 @@ pub async fn run_with_bin(
     cmd.process_group(0);
     #[cfg(windows)]
     {
-        // CREATE_NO_WINDOW（与 MCP/shell 子进程同款；参照物 delegate 也显式调 configure_no_window）。
+        // CREATE_NO_WINDOW（参照物 delegate 显式调 `configure_no_window`）。**只与内置 shell 腿同款**：
+        // rpi-tools 的 `OsExecutionEnv` 真设这个 flag，而 abb-agent 的 MCP 腿没设（rmcp 1.8 的
+        // 子进程传输不暴露 `creation_flags`）——别把两处说成一样。
         // 注：`tokio::process::Command` 在 Windows 上直接有 `creation_flags`（无需 import trait）。
         cmd.creation_flags(0x0800_0000);
     }
@@ -380,7 +385,9 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
-    /// 杀进程（unix 上连同进程组；Windows 上 taskkill /T）。
+    /// 杀进程：unix 上先按进程组整组杀（孙进程一起收），再补 `child.kill()`；
+    /// Windows 上只有 `child.kill()`（与被替代组件的 non-unix 分支一致——它同样没有
+    /// `taskkill /T`；进程组语义在 Windows 上由 Job Object 承担，本包未接）。
     async fn kill(&mut self) {
         #[cfg(unix)]
         {
@@ -620,6 +627,17 @@ mod tests {
             None,
             "覆盖即唯一来源，不得偷偷回落 PATH"
         );
+        // **空串覆盖 = 显式禁用**（不回落 PATH）——评审 g1：这条洞曾让「禁用」变成「回落」。
+        let disabled = fake_env(&[
+            ("PATH", fake.to_str().expect("path")),
+            ("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", "   "),
+        ]);
+        assert_eq!(
+            delegate_cli_path(DelegateBackend::Claude, &disabled),
+            None,
+            "空串/纯空白覆盖 = 禁用该后端，不得回落 PATH"
+        );
+
         // 「都没有」的形状要能确定性造出来（PATH 空/不指向任何 CLI）。
         let none = fake_env(&[
             ("PATH", "/nonexistent-dir-for-probe"),
@@ -736,11 +754,15 @@ echo \"BOOM-REPORT\"\nexit 3\n",
         let dir = std::env::temp_dir().join(format!("abb-delegate-linger-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("建目录");
         let fake = dir.join("linger-cli");
-        // 后台 sleep 继承 stdout ⇒ 父进程退出后管道仍被攥着。
+        // 后台 sleep 继承 stdout ⇒ 父进程退出后管道仍被攥着。**把孙进程 PID 写下来**，
+        // 收尾按 PID 杀（`pkill -f 'sleep 30'` 会连坐别人的进程——评审 g6）。
+        let pid_file = dir.join("grandchild.pid");
         std::fs::write(
             &fake,
-            b"#!/bin/sh
-sleep 30 &\necho \"parent done\"\nexit 0\n",
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > {}\necho \"parent done\"\nexit 0\n",
+                pid_file.display()
+            ),
         )
         .expect("写假 CLI");
         #[cfg(unix)]
@@ -770,10 +792,14 @@ sleep 30 &\necho \"parent done\"\nexit 0\n",
             text.contains("output incomplete"),
             "攥着管道时要如实标注输出不完整：{text}"
         );
-        // 清掉可能残留的 sleep（探针纪律：别留挂死进程）。
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "sleep 30"])
-            .status();
+        // 按记录的 PID 收掉孙进程（收尾纪律：别留挂死进程，也别连坐别人的）。
+        if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = raw.trim().parse::<i32>() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

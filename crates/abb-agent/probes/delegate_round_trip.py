@@ -4,14 +4,18 @@
 判据分两处：①假 CLI 自己写下的「我被调用了 + 收到的参数」（子进程侧证据）；
 ②假 anthropic 端点第二跳请求体里出现的报告正文（模型侧证据）。
 
-五个场景：
+六个场景：
 1. 正常委派（`BUZZ_AGENT_DELEGATE_CLAUDE_BIN` 指向假 CLI）⇒ 第二跳里出现报告标记，
    且假 CLI 记录的参数含 `--` 分隔与 task；
 2. CLI 不可用（覆盖指向不存在路径 + PATH 清空）⇒ 工具结果里是**可纠偏**错误（列出可用后端）；
+2b. **两个 CLI 都没有** ⇒ 工具表里**不暴露** `dev__delegate`（其余内置工具仍在）；
 3. 取消（假 CLI 里 sleep）⇒ 回合以 `cancelled` 收尾，且不留下挂死的子进程（可观察回合结束）；
 4. **非零退出** ⇒ 工具结果是**错误**（模型侧看到 `tool error:` + exit 码 + 报告正文），不是成功；
 5. **孙进程攥着管道**（假 CLI 后台 sleep 后自己退出）⇒ 工具在宽限内返回并标注 `output incomplete`，
    回合**不挂死**。
+
+收尾：本探针只清自己 `mkdtemp` 出来的目录（`_cleanup` 逐条断言目标在系统临时目录之下），
+并按记录下的 PID 收掉假 CLI 的孙进程——不用 `pkill -f`（会连坐别人的进程）。
 
 用法：`python3 delegate_round_trip.py <abb-agent 二进制>`
 """
@@ -89,6 +93,14 @@ class Gateway(BaseHTTPRequestHandler):
 
 threading.Thread(target=HTTPServer(("127.0.0.1", PORT), Gateway).serve_forever, daemon=True).start()
 failures = []
+created_dirs = []
+
+
+def tempdir(tag):
+    """建临时会话目录，并登记以便收尾清理（评审 g6：探针一次跑会留 ~10 个目录）。"""
+    path = tempfile.mkdtemp(prefix=f"abb-delegate-{tag}-")
+    created_dirs.append(path)
+    return path
 
 
 def check(label, ok, detail=""):
@@ -103,6 +115,7 @@ def make_fake_cli(dir_path, sleep_secs=0, exit_code=0, lingering=False, tag="fak
     body += f'echo "argv: $*" >> "{os.path.join(dir_path, "calls.txt")}"\n'
     if lingering:
         body += "sleep 30 &\n"           # 后台孙进程继承管道
+        body += f'echo $! > "{os.path.join(dir_path, "grandchild.pid")}"\n'
     if sleep_secs:
         body += f"sleep {sleep_secs}\n"
     body += f'echo "{REPORT}"\n'
@@ -123,7 +136,7 @@ def run_turn(workspace, args, extra_env=None, cancel_after=None):
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
         "ANTHROPIC_MODEL": "probe-model",
         "ANTHROPIC_API_KEY": "sk-probe",
-        "HOME": tempfile.mkdtemp(prefix="abb-delegate-home-"),
+        "HOME": tempdir("home"),
         "RUST_LOG": "info",
     })
     env["USERPROFILE"] = env["HOME"]
@@ -177,7 +190,7 @@ def run_turn(workspace, args, extra_env=None, cancel_after=None):
 
 
 print("=== 场景 1：正常委派（假 claude CLI）===")
-workspace = tempfile.mkdtemp(prefix="abb-delegate-ws-")
+workspace = tempdir("ws")
 cli = make_fake_cli(workspace)
 first, second, answer = run_turn(
     workspace,
@@ -185,7 +198,7 @@ first, second, answer = run_turn(
     extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
 )
 second_text = json.dumps(second, ensure_ascii=False)
-check("模型侧看到了委派报告", REPORT in second_text, "第二跳里没有报告正文")
+check("模型侧看到了委派报告", REPORT in second_text, "报告标记是否出现在第二跳请求体里")
 calls_path = os.path.join(workspace, "calls.txt")
 check("假 CLI 真被调用过", os.path.isfile(calls_path))
 if os.path.isfile(calls_path):
@@ -197,7 +210,7 @@ check("工具通知里出现 dev__delegate", "dev__delegate" in json.dumps(first
 print()
 print("=== 场景 2：某个后端不可用时给可纠偏错误 ===")
 # claude 可用（保证工具被暴露）而 codex 不可用 ⇒ 请求 codex 应得到可纠偏错误。
-workspace = tempfile.mkdtemp(prefix="abb-delegate-nocli-")
+workspace = tempdir("nocli")
 good_cli = make_fake_cli(workspace, tag="good-claude")
 first, second, _ = run_turn(
     workspace,
@@ -209,13 +222,14 @@ first, second, _ = run_turn(
     },
 )
 second_text = json.dumps(second, ensure_ascii=False)
-check("工具结果里是「CLI 不可用」而不是静默成功",
-      "not available" in second_text, second_text[-200:])
-check("错误里列出可用后端（可纠偏）", "available: claude" in second_text, second_text[-200:])
+check("工具结果里是「CLI 不可用」而不是静默成功", "not available" in second_text,
+      "第二跳里是否出现 not available")
+check("错误里列出可用后端（可纠偏）", "available: claude" in second_text,
+      "第二跳里是否出现 available: claude")
 
 print()
 print("=== 场景 2b：两个 CLI 都没有 ⇒ 不暴露 dev__delegate ===")
-workspace = tempfile.mkdtemp(prefix="abb-delegate-none-")
+workspace = tempdir("none")
 first, _, _ = run_turn(
     workspace,
     {"backend": "claude", "task": "x"},
@@ -232,7 +246,7 @@ check("其它内置工具仍在", "dev__shell" in names, f"{names}")
 
 print()
 print("=== 场景 3：取消长委派 ⇒ 回合收尾为 cancelled ===")
-workspace = tempfile.mkdtemp(prefix="abb-delegate-cancel-")
+workspace = tempdir("cancel")
 cli = make_fake_cli(workspace, sleep_secs=30)
 first, second, answer = run_turn(
     workspace,
@@ -246,7 +260,7 @@ check("收尾为 cancelled", answer is not None and '"cancelled"' in answer.repl
 
 print()
 print("=== 场景 4：非零退出必须是错误结果（fail 位不能丢）===")
-workspace = tempfile.mkdtemp(prefix="abb-delegate-exit-")
+workspace = tempdir("exit")
 cli = make_fake_cli(workspace, exit_code=3, tag="failing-claude")
 first, second, answer = run_turn(
     workspace,
@@ -254,13 +268,14 @@ first, second, answer = run_turn(
     extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
 )
 second_text = json.dumps(second, ensure_ascii=False)
-check("模型侧看到的是工具**错误**（tool error …）", "tool error:" in second_text, second_text[-200:])
+check("模型侧看到的是工具**错误**（tool error …）", "tool error:" in second_text,
+      "第二跳里是否出现 tool error:")
 check("错误里带 exit 码", "exit: 3" in second_text)
 check("报告正文仍随错误带回（模型能看到输出）", REPORT in second_text)
 
 print()
 print("=== 场景 5：孙进程攥着管道时回合不挂死 ===")
-workspace = tempfile.mkdtemp(prefix="abb-delegate-linger-")
+workspace = tempdir("linger")
 cli = make_fake_cli(workspace, lingering=True, tag="linger-claude")
 started = time.time()
 first, second, answer = run_turn(
@@ -271,9 +286,31 @@ first, second, answer = run_turn(
 elapsed = time.time() - started
 check("回合在宽限内有应答（不挂死）", answer is not None and elapsed < 40, f"{elapsed:.1f}s")
 second_text = json.dumps(second, ensure_ascii=False)
-check("如实标注输出不完整", "output incomplete" in second_text, second_text[-200:])
-# 清掉假 CLI 留下的 sleep（探针纪律）。
-os.system("pkill -f 'sleep 30' >/dev/null 2>&1")
+check("如实标注输出不完整", "output incomplete" in second_text,
+      "第二跳里是否出现 output incomplete")
+# 按记录的 PID 收掉假 CLI 留下的孙进程（别用 `pkill -f` 连坐别人的进程）。
+pid_file = os.path.join(workspace, "grandchild.pid")
+if os.path.isfile(pid_file):
+    try:
+        with open(pid_file, encoding="utf-8") as fh:
+            os.kill(int(fh.read().strip()), 9)
+    except Exception:
+        pass
+
+# 收尾：**只**清本探针自己建的临时目录，并且逐条断言目标在 temp 目录之下。
+# （绝不允许出现「按 HOME 变量删目录」这种写法——一次 `rmtree(os.environ["HOME"])`
+#   会删掉用户整个家目录；这里把守卫做成结构性检查，而不是靠记性。）
+import shutil
+
+def _cleanup(path):
+    resolved = os.path.realpath(path)
+    if not resolved.startswith(os.path.realpath(tempfile.gettempdir()) + os.sep):
+        print(f"  （拒绝清理非临时目录：{resolved}）")
+        return
+    shutil.rmtree(resolved, ignore_errors=True)
+
+for path in created_dirs:
+    _cleanup(path)
 
 print()
 if failures:

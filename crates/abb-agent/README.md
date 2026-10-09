@@ -259,17 +259,20 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 - 命令行：claude `-p --output-format text --dangerously-skip-permissions -- <task>`；
   codex `exec --skip-git-repo-check --sandbox workspace-write -C <cwd> -- <task>`（`--` 分隔，
   防 task 被当选项/子命令）；
-- 二进制：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` **覆盖即唯一来源**（指错不回落 PATH——与参照物
-  `resolve_delegate_cli` 同取向：运维要的就是确定性）→ 未设覆盖时查 PATH；找不到时给**可纠偏**错误
+- 二进制：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` **覆盖即唯一来源**（指错**不回落** PATH——与参照物
+  `resolve_delegate_cli` 同取向：运维要的就是确定性）；**空串/纯空白 = 显式禁用**该后端（也不回落）；
+  未设覆盖时才查 PATH；找不到时给**可纠偏**错误
   （`available: claude, codex` / `available: none (neither claude nor codex found in PATH)`）；
 - **两个 CLI 都没装时不暴露这个工具**（参照物 `cli_available` 腿同取向：工具表里不该出现只会报错的工具）；
 - 超时默认 **1200s**、clamp 1..=1200，到点杀进程；`session/cancel` 也杀（unix 连同进程组）；
-- **抽干管道有上界（5s）**：孙进程若仍攥着管道，如实标注 `output incomplete` 而不是把回合挂死；
+- **抽干管道有上界**：**每条流各 5s**（两条都被攥时最坏 ~10s）；孙进程若仍攥着管道，如实标注
+  `output incomplete` 而不是把回合挂死（被攥的那条流的**已读部分也会丢**——与参照物同构，登记）；
 - 输出按**头 16 KiB + 尾 16 KiB + 省略标记**有界保留（不会整段丢掉 stderr）；
 - **非零退出是错误结果**（rpi 按 `Ok`/`Err` 推 `is_error`）：委派失败不会被当成成功工具结果回灌给模型，
   但 exit 码与输出仍随错误正文带回；
 - env 走**白名单**（供应商凭据不进子进程）+ claude 的 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`；
-  Windows 上 `CREATE_NO_WINDOW`（与 MCP/shell 子进程同款，不弹控制台窗）；
+  Windows 上 `CREATE_NO_WINDOW`（只与内置 **shell** 腿同款；MCP 腿没设——rmcp 1.8 的子进程传输
+  不暴露 `creation_flags`）；
 - ⚠️ **授权差异（如实登记）**：参照物在受限档（read-only / granted）**拒绝**这个工具（它按
   `policy.sandbox.allow_shell()` 与 shell 模式判定）；本包不实现档位，而受限会话根本不会跑到本包上
   （abb 的 P2.3 硬闸拒建）⇒ **结构上满足，但没有独立闸门**。
