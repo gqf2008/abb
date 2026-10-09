@@ -366,14 +366,18 @@ fn oneshot_agent_config_inner(
     )
     .to_string();
     let env = buzz_env_for_bot(bot, cfg);
+    // Jev 门禁 env **只在带档位（受限）时注入**：sandbox=None（owner 全权限维护任务，
+    // 如 session_gc/角色生成）不套 Jev 门禁、不需要 key，多注一个凭证只扩大暴露面（评审 D1）。
+    let mut extra_env: Vec<(String, String)> =
+        vec![("PATH".to_string(), crate::deps::composed_path())];
+    extra_env.extend(env);
+    if sandbox.is_some() {
+        extra_env.extend(jev_env(cfg));
+    }
     crate::buzz::harness::AgentConfig {
         command,
         args: Vec::new(),
-        extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
-            .into_iter()
-            .chain(env)
-            .chain(jev_env(cfg))
-            .collect(),
+        extra_env,
         backend: "buzz".to_string(),
         session_sandbox: sandbox,
     }
