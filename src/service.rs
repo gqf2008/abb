@@ -2042,7 +2042,9 @@ mod tests {
     fn override_applies_to_both_role_commands() {
         let dir = std::env::temp_dir().join(format!("abb-ovr-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pinned = dir.join("abb-agent");
+        // bundled_agent_in_dir 按 `{name}{EXE_SUFFIX}` 查（Windows 上即 abb-agent.exe），
+        // 造的文件名必须带后缀，否则 Windows CI 上找不到（刀 4b 改测试时遗漏）。
+        let pinned = dir.join(format!("abb-agent{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&pinned, b"x").unwrap();
         let expect = pinned.display().to_string();
         assert_eq!(
