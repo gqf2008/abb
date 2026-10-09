@@ -190,8 +190,11 @@ fn find_in_path(name: &str, env: &dyn EnvSource) -> Option<PathBuf> {
     None
 }
 
-/// 每个流的**头/尾**各留多少字节（与参照物 `CappedStream` 同量级：16 KiB）。
+/// 每个流保留的**头**字节数（与参照物 `CappedStream` 的 head 预算同量级）。
 const STREAM_HEAD_BYTES: usize = 16 * 1024;
+/// 每个流保留的**尾**字节数。**有意放大**：参照物 tail=2048 B（head≈14 KiB，合计展示 ~16 KiB）；
+/// 本包 head+tail 合计 32 KiB。委派报告的最终结论通常在结尾，多留一段尾不伤身，且
+/// `total <= kept` 时（≤32 KiB）能整段带回、无需省略标记。
 const STREAM_TAIL_BYTES: usize = 16 * 1024;
 /// 抽干管道的宽限：**每条流**各 5s（stdout/stderr 串行等 ⇒ 两条都被攥时最坏 ~10s）。
 /// 超过就判定「有孙进程还攥着管道」，如实告知模型输出不完整（参照物同款 5s drain；
@@ -241,7 +244,10 @@ impl Capped {
             String::from_utf8_lossy(&self.tail.iter().copied().collect::<Vec<u8>>()).into_owned();
         let kept = self.head.len() + self.tail.len();
         if self.total <= kept {
-            return head;
+            // 未省略（全部塞进了 head+tail）：head 与 tail 都该带回（与参照物
+            // `elided == 0` 分支同）。曾在这里只返回 head，把 16 KiB~32 KiB 区间的
+            // 尾段静默丢掉（评审 B1）。
+            return format!("{head}{tail}");
         }
         let elided = self.total - kept;
         format!(
@@ -553,6 +559,28 @@ mod tests {
         assert_eq!(parse_timeout(Some(0)), 1, "0 要 clamp 到下界");
         assert_eq!(parse_timeout(Some(30)), 30);
         assert_eq!(parse_timeout(Some(99_999)), DELEGATE_TIMEOUT_MAX);
+    }
+
+    /// `Capped::render` 在「未省略」分支必须带回 tail（评审 B1：曾只返回 head，
+    /// 16 KiB~32 KiB 区间的尾段被静默丢掉）。
+    #[test]
+    fn capped_render_keeps_tail_when_nothing_was_elided() {
+        let mut capped = Capped::default();
+        // 20 KiB：16 KiB 头 + 4 KiB 尾。total <= kept（= 20 KiB），应整段带回。
+        capped.push(&vec![b'A'; STREAM_HEAD_BYTES]);
+        capped.push(&vec![b'B'; 4 * 1024]);
+        let rendered = capped.render();
+        assert!(
+            rendered.contains('B'),
+            "未省略时 tail 必须保留，实际长度 {} 字符（应为头 16 KiB + 尾 4 KiB）",
+            rendered.len()
+        );
+        assert!(rendered.contains('A'), "头段也要在");
+        // 超过 head+tail（32 KiB）时走省略分支，仍要有省略标记。
+        let mut over = Capped::default();
+        over.push(&vec![b'C'; STREAM_HEAD_BYTES + STREAM_TAIL_BYTES + 1]);
+        let over_rendered = over.render();
+        assert!(over_rendered.contains("elided"), "超出 32 KiB 要有省略标记");
     }
 
     /// 命令行必须带 `--` 分隔（task 以 `-` 开头/是子命令名时不被当选项）。

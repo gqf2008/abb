@@ -263,11 +263,16 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
   `resolve_delegate_cli` 同取向：运维要的就是确定性）；**空串/纯空白 = 显式禁用**该后端（也不回落）；
   未设覆盖时才查 PATH；找不到时给**可纠偏**错误
   （`available: claude, codex` / `available: none (neither claude nor codex found in PATH)`）；
+  覆盖值会 **`trim()` 首尾空白**（参照物 `PathBuf::from(raw)` 不 trim——带首尾空格的路径参照物
+  解析不出、本包能解析，属有意更宽松，登记）；
 - **两个 CLI 都没装时不暴露这个工具**（参照物 `cli_available` 腿同取向：工具表里不该出现只会报错的工具）；
 - 超时默认 **1200s**、clamp 1..=1200，到点杀进程；`session/cancel` 也杀（unix 连同进程组）；
 - **抽干管道有上界**：**每条流各 5s**（两条都被攥时最坏 ~10s）；孙进程若仍攥着管道，如实标注
   `output incomplete` 而不是把回合挂死（被攥的那条流的**已读部分也会丢**——与参照物同构，登记）；
-- 输出按**头 16 KiB + 尾 16 KiB + 省略标记**有界保留（不会整段丢掉 stderr）；
+- 输出按**头 16 KiB + 尾 16 KiB + 省略标记**有界保留（不会整段丢掉 stderr）；**尾预算有意放大**：
+  参照物 tail=2048 B（head≈14 KiB，合计展示 ~16 KiB），本包 tail=16 KiB（head+tail 合计 32 KiB，
+  委派报告的最终结论通常在结尾，多留一段尾不伤身），且 `total <= kept` 时（≤32 KiB）整段带回、
+  不带省略标记；
 - **非零退出是错误结果**（rpi 按 `Ok`/`Err` 推 `is_error`）：委派失败不会被当成成功工具结果回灌给模型，
   但 exit 码与输出仍随错误正文带回；
 - env 走**白名单**（供应商凭据不进子进程）+ claude 的 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`；
