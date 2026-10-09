@@ -895,6 +895,34 @@ impl EventsConfig {
     }
 }
 
+/// Jev 决策模型配置（统一迁移刀 4a）：授权者/受限会话的工具调用门禁。
+///
+/// 与 [`ProviderConfig`]（主 LLM）分开：Jev 不是聊天模型，是 Typesafe 的 System One
+/// 决策模型（OpenRouter Decisions API，输入文本返回类型化概率），key 独立配置、独立注入
+/// 成 `JEV_API_KEY`/`JEV_BASE_URL`/`JEV_MODEL`。未配置（api_key 空）时 abb-agent 对受限会话
+/// fail-closed 拒答（不会静默降级成无门禁）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JevConfig {
+    /// OpenRouter API key（凭证，随 config.json 0600 保存，绝不进日志）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    /// Decisions API 端点；空 = 默认 `https://openrouter.ai/api/alpha/decisions`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    /// 模型 id；空 = 默认 `typesafe/jev-latest`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+}
+
+impl JevConfig {
+    /// 三字段全空 = 未配置（config.json 里不写这段）。
+    fn is_empty(&self) -> bool {
+        self.api_key.trim().is_empty()
+            && self.base_url.trim().is_empty()
+            && self.model.trim().is_empty()
+    }
+}
+
 /// 每 bot **每条执行通道**的 task worker 数——Q7「每 bot 默认 1 个 task worker，**上限可配**」
 /// 的接线（2026-09-26 落地；此前只实现了「默认 1」，可配部分没接线）。
 ///
@@ -1040,6 +1068,9 @@ pub struct Config {
     /// MCP 事件订阅的 walgit 仓库等配置。
     #[serde(default, skip_serializing_if = "EventsConfig::is_empty")]
     pub events: EventsConfig,
+    /// Jev 决策模型（授权者/受限会话工具门禁）。
+    #[serde(default, skip_serializing_if = "JevConfig::is_empty")]
+    pub jev: JevConfig,
 
     // ── 旧单 bot 字段（仅用于自动迁移，迁移后清空）──
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1080,6 +1111,7 @@ impl Default for Config {
             default_provider: String::new(),
             custom_roles: Vec::new(), // #75 自定义角色模板
             events: EventsConfig::default(),
+            jev: JevConfig::default(),
             app_id: String::new(),
             app_secret: String::new(),
             bot_name: String::new(),
