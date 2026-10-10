@@ -1,6 +1,6 @@
 # ABB bundled tools
 
-ABB 安装包内置五个固定版本的工具：
+ABB 安装包内置四个固定版本的工具：
 
 | tool | version | purpose | license |
 |---|---:|---|---|
@@ -8,7 +8,6 @@ ABB 安装包内置五个固定版本的工具：
 | `jq` | 1.8.2 | JSON 处理 | MIT |
 | `uv` | 0.12.13 | Python 环境/依赖管理 | MIT / Apache-2.0 |
 | `gh` | 2.100.0 | GitHub CLI | MIT |
-| `wassette` | 0.7.1 | 沙箱化 MCP 工具宿主（wasmtime 运行 Wasm Component） | MIT（另含 Apache-2.0 组件，见 `wassette-NOTICE.txt`） |
 
 传递依赖许可也随包：
 
@@ -25,13 +24,6 @@ ABB 安装包内置五个固定版本的工具：
 macOS 的 `jq 1.8.2` 不使用官方预编译包（其 minOS 为 14），而是从官方源码以
 `MACOSX_DEPLOYMENT_TARGET=12.0` 静态构建，保持 ABB 当前 `LSMinimumSystemVersion=12.0`。
 
-macOS 的 `wassette 0.7.1` 同样不走官方预编译包：官方资产在 hardened runtime 签名下执行
-组件时被 macOS 26 代码签名强制以「Code Signature Invalid」SIGKILL（wasmtime 47 的 JIT
-不走 MAP_JIT，allow-jit entitlement 也救不了）。改为官方源码构建并打
-`tools/wassette-pulley.patch`（wasmtime +pulley feature，macOS 默认 Pulley 解释器、
-无 JIT 页；`WASSETTE_INTERPRETER=0` 可切回 JIT）。Windows 继续源码构建但**不打**该补丁
-（无此问题，保留 JIT 性能）。
-
 ## 布局
 
 构建时由 `fetch_bundled_tools.sh` / `fetch_bundled_tools.ps1` 按
@@ -39,7 +31,7 @@ macOS 的 `wassette 0.7.1` 同样不走官方预编译包：官方资产在 hard
 
 ```text
 tools/
-  bin/        rg, jq, uv, gh, wassette
+  bin/        rg, jq, uv, gh
   licenses/   对应许可证全文
 ```
 
@@ -60,7 +52,6 @@ tools-dist/test/bin/rg --version
 tools-dist/test/bin/jq --version
 tools-dist/test/bin/uv --version
 tools-dist/test/bin/gh --version
-tools-dist/test/bin/wassette --version
 ```
 
 Windows：
@@ -70,4 +61,4 @@ Windows：
 ```
 
 发布前必须在干净 PATH 下运行 `agent-bridge --dump-tools --require-bundled-tools`，
-确认五个命令都解析到随包路径；普通 `--dump-tools` 会显示 `bundled/system/missing` 来源。
+确认四个命令都解析到随包路径；普通 `--dump-tools` 会显示 `bundled/system/missing` 来源。

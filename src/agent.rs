@@ -37,7 +37,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v12";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v13";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -212,10 +212,9 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 
 ## 其它
 
-- **随包工具优先**：安装包内置 `rg` / `jq` / `uv` / `gh` / `wassette`，PATH 已优先指向它们。
+- **随包工具优先**：安装包内置 `rg` / `jq` / `uv` / `gh`，PATH 已优先指向它们。
   - 搜索优先 `rg`，JSON 优先 `jq`，Python 环境优先 `uv`，GitHub 操作优先 `gh`。
   - `uv` 只管 Python 环境/依赖，不保证 Python 已下载；`gh` 会沿用宿主登录态，先查 `gh auth status`，未认证时给出 `command -v gh` 解析到的完整路径让用户执行 `gh auth login`。
-  - `wassette` 是沙箱化工具宿主（wasmtime 沙箱运行 WebAssembly 组件）：「沙箱工具」默认开启，owner 会话的 MCP 工具列表会带它的内置工具（load-component 等），第三方组件在沙箱内运行、受权限策略约束。组件仓库为**应用级共享**：CLI 与 MCP 工具读写同一目录，装一次全会话可见。
   - `git` / `bun` / `sed` / `find` **不随包**，仍按宿主环境处理，缺失时明确说明。
 - 任务完成（产出最终回复）后**立即退出**，不要持续运行或等待。
 - 普通问答、查资料、改文件等直接做即可，做完输出结论。
@@ -939,7 +938,7 @@ mod tests {
                 text.contains("## 后台子代理 → 长任务丢后台，别堵会话"),
                 "{name} 缺 v7 的后台子代理小节"
             );
-            for needle in ["随包工具优先", "rg", "jq", "uv", "gh", "wassette"] {
+            for needle in ["随包工具优先", "rg", "jq", "uv", "gh"] {
                 assert!(text.contains(needle), "{name} 应写明随包工具 {needle}");
             }
             assert!(
@@ -1043,9 +1042,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #312 验收② / v10：marker v6/v7/v8/v9 → v10 触发**存量**工作区自动覆盖升级（且只升一次）。
+    /// #312 验收② / v10：marker v6/v7/v8/v9 → 最新版触发**存量**工作区自动覆盖升级（且只升一次）。
     /// v8 新增「编程类长任务走子代理 + 委派必须立刻告知用户 + 用定时任务监控」三条硬规则。
-    /// v10 新增 wassette（随包工具 4→5，与 base_prompt 口径一致）。
+    /// v10 新增 wassette（随包工具 4→5）；v13 又把它撤了（2026-10-10 废弃 wassette，随包工具回到 4 个）。
     #[test]
     fn workspace_guide_upgrades_old_markers_to_latest() {
         let dir = std::env::temp_dir().join(format!("abb-guide-v6-{}", uuid::Uuid::new_v4()));
@@ -1057,7 +1056,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v12"), "{name} 应升到 v12");
+            assert!(text.contains("abb-guide-v13"), "{name} 应升到 v13");
             assert!(!text.contains("abb-guide-v6"), "{name} 不应留 v6 marker");
             assert!(!text.contains("旧 v6 正文"), "{name} 旧正文应被整体替换");
             assert!(text.contains("## 后台子代理"), "{name} 应含子代理小节");
@@ -1111,7 +1110,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v12"), "{name} 应从 v8 升到 v12");
+            assert!(text.contains("abb-guide-v13"), "{name} 应从 v8 升到 v13");
             assert!(!text.contains("abb-guide-v8"), "{name} 不应留 v8 marker");
             assert!(!text.contains("旧 v8 正文"), "{name} 旧正文应被整体替换");
         }
@@ -1125,14 +1124,14 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v12"), "{name} 应从 v7 升到 v12");
+            assert!(text.contains("abb-guide-v13"), "{name} 应从 v7 升到 v13");
             assert!(!text.contains("abb-guide-v7"), "{name} 不应留 v7 marker");
             assert!(!text.contains("旧 v7 正文"), "{name} 旧正文应被整体替换");
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        // 审查补充：v9 是「上一个版本」（wassette 随包上线前的存量），必须有专门的
-        // v9 → v10 用例——只种 v6/v7/v8 证明不了上一版升级路径。
+        // 审查补充：v9 是「当时的上一个版本」，必须有专门的 v9 升级用例——
+        // 只种 v6/v7/v8 证明不了上一版升级路径。
         let dir = std::env::temp_dir().join(format!("abb-guide-v9-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let v9 = "# ABB 工作区（abb-guide-v9）\n\n## 其它\n\n- 旧 v9 正文\n";
@@ -1141,10 +1140,13 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v12"), "{name} 应从 v9 升到 v12");
+            assert!(text.contains("abb-guide-v13"), "{name} 应从 v9 升到 v13");
             assert!(!text.contains("abb-guide-v9"), "{name} 不应留 v9 marker");
             assert!(!text.contains("旧 v9 正文"), "{name} 旧正文应被整体替换");
-            assert!(text.contains("wassette"), "{name} 应含 wassette 随包工具");
+            assert!(
+                !text.contains("wassette"),
+                "{name} 升级后不得再提 wassette（该工具已废弃）"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1161,7 +1163,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v12"), "{name} 应从 v10 升到 v12");
+            assert!(text.contains("abb-guide-v13"), "{name} 应从 v10 升到 v13");
             assert!(!text.contains("abb-guide-v10"), "{name} 不应留 v10 marker");
             assert!(
                 !text.contains("同一 bot 的任务串行排队执行"),
@@ -1175,8 +1177,8 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        // v11 是**上一个版本**（正文写着「同一通道内串行排队（一次只跑一条）」），而本批把
-        // 定时档默认改成 2 worker → 那句默认即错。存量 v11 工作区必须能被升到 v12 更正过来。
+        // v11 是**上一版之前**的版本（正文写着「同一通道内串行排队（一次只跑一条）」），而本批把
+        // 定时档默认改成 2 worker → 那句默认即错。存量 v11 工作区必须能被升到 v13 更正过来。
         let dir = std::env::temp_dir().join(format!("abb-guide-v11-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let v11 = "# ABB 工作区（abb-guide-v11）\n\n## 后台子代理\n\n- **同一通道内串行排队**（一次只跑一条）：定时档（`once`/`cron`/`interval`）与手动档\n  （`now`/`keepalive`）各有自己的队列——跨通道互不阻塞（定时任务不会被后台子代理挡在后面），\n  但同一档里同时丢多条不会更快，别把它当并发池。\n";
@@ -1185,7 +1187,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v12"), "{name} 应从 v11 升到 v12");
+            assert!(text.contains("abb-guide-v13"), "{name} 应从 v11 升到 v13");
             assert!(!text.contains("abb-guide-v11"), "{name} 不应留 v11 marker");
             assert!(
                 !text.contains("一次只跑一条"),
@@ -1194,6 +1196,25 @@ mod tests {
             assert!(
                 text.contains("同一条任务永远不会自我重叠"),
                 "{name} 应写明「同一条任务永远不会自我重叠」"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // v12 是**上一个已发布版**（正文含「安装包内置 rg/jq/uv/gh/wassette」）。本批
+        // 废弃 wassette，存量 v12 工作区必须能被升到 v13，且不得再提该工具。
+        let dir = std::env::temp_dir().join(format!("abb-guide-v12-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v12 = "# ABB 工作区（abb-guide-v12）\n\n## 其它\n\n- 安装包内置 `rg` / `jq` / `uv` / `gh` / `wassette`，PATH 已优先指向它们。\n- `wassette` 是沙箱化工具宿主。\n";
+        std::fs::write(dir.join("CLAUDE.md"), v12).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), v12).unwrap();
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains("abb-guide-v13"), "{name} 应从 v12 升到 v13");
+            assert!(!text.contains("abb-guide-v12"), "{name} 不应留 v12 marker");
+            assert!(
+                !text.contains("wassette"),
+                "{name} 升级后不得再提 wassette（该工具已废弃）"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1234,15 +1255,7 @@ mod tests {
     #[test]
     fn base_prompt_mentions_bundled_tools_and_exclusions() {
         let prompt = include_str!("buzz/base_prompt.md");
-        for needle in [
-            "# 环境与工具",
-            "`rg`",
-            "`jq`",
-            "`uv`",
-            "`gh`",
-            "`wassette`",
-            "load-component",
-        ] {
+        for needle in ["# 环境与工具", "`rg`", "`jq`", "`uv`", "`gh`"] {
             assert!(prompt.contains(needle), "base prompt 缺 {needle}");
         }
         assert!(prompt.contains("`git` / `bun` / `sed` / `find` **不随包**"));

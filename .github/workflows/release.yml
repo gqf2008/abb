@@ -18,9 +18,9 @@ jobs:
     # 小文件/preflight 秒过，同一二进制在旧镜像 2.23.62 秒签）。切 macos-15
     # （arm64）绕开该 securityd 回归。
     runs-on: macos-15 # Apple Silicon（arm64），与本地 aarch64 产物一致
-    # 2.23.63 教训：随包工具里 wassette 改源码构建后本 job 时长显著增加（3 核
-    # runner 上 codegen-units=1 单线程代码生成），曾跑 2.5h+ 无进展。加硬超时让
-    # 异常快速失败（正常应在 ~60min 内），而不是烧到 GitHub 默认 6h。
+    # 2.23.63 教训：随包工具改为发布机源码构建后本 job 时长曾显著增加（3 核 runner 上
+    # codegen-units=1 单线程代码生成，曾跑 2.5h+ 无进展）。加硬超时让异常快速失败
+    # （正常应在 ~60min 内），而不是烧到 GitHub 默认 6h。
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +126,7 @@ jobs:
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
           # abb-agent 也会 spawn shell / MCP 子进程并可能触发 TCC（#251）。
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-agent
-          for tool in rg jq uv gh wassette; do
+          for tool in rg jq uv gh; do
             sign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
           done
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app
@@ -231,13 +231,6 @@ jobs:
       - name: Fetch bundled tools
         shell: pwsh
         run: ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist
-
-      # #331 守卫延伸：wassette.exe 是上游源码在发布机上现构建的（上游预编译资产
-      # 依赖 VCRUNTIME140.dll，干净 Windows 起不来），守卫断言它确实静态了 CRT——
-      # 否则这条「源码构建」路径将来静默回退到预编译也不会被发现。
-      - name: Assert wassette.exe has no dynamic CRT (#331)
-        shell: bash
-        run: bash tools/check_dynamic_crt.sh tools-dist/bin/wassette.exe
 
       - name: Install Inno Setup
         shell: pwsh

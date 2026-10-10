@@ -31,7 +31,6 @@ mod larkskills;
 mod mcp_events;
 mod messenger;
 mod msgstore;
-mod orphan_mcp;
 mod outbox;
 mod pending;
 mod permreq;
@@ -496,12 +495,6 @@ fn main() {
             crate::log!(
                 "[svc] ⚠️ 服务正以管理员权限运行（新模型要求普通用户）：可能来自旧常驻任务或手动提权；已尝试退役旧任务，重启 ABB 托盘即可由普通用户身份接管"
             );
-        }
-        // 存量孤儿回收：job 方案上线前（以及任何漏网的）agent 被杀时，它起的 MCP 服务
-        // （wassette）会作为孙进程常驻。新起的由 agent_spawn 的 job 覆盖，存量在这里收一次。
-        let reaped = crate::orphan_mcp::reap_wassette_orphans();
-        if reaped > 0 {
-            crate::log!("[reap] 启动回收 {reaped} 个孤儿 wassette（父进程已退出的 MCP 宿主）");
         }
         // 单实例：已有一个 --service 在跑就直接退出（flock 拿不到锁）
         let _guard = match single_instance::SingleInstance::acquire("service") {

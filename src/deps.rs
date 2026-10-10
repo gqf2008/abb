@@ -1,5 +1,5 @@
 //! 依赖检测与安装 —— nodejs / lark-cli / dingtalk-cli / git（python3 为信息项），
-//! 以及安装包内置工具 rg/jq/uv/gh/wassette 的 PATH 注入与体检。
+//! 以及安装包内置工具 rg/jq/uv/gh 的 PATH 注入与体检。
 //! 单后端化 P4.3：claude / codex / pi 三后端 CLI 与 ACP 适配器三件套的探测+安装臂
 //! 已随 UI 下架删除——执行层收口随包 abb-agent（零安装），本机不再要求任何 agent CLI。
 //! 跨平台（win/mac/linux）：检测组 PATH 分平台（分隔符、PATHEXT、常见安装目录），
@@ -13,11 +13,9 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-/// 安装包内置、优先于宿主 PATH 的五个工具。这里故意不含 git/bun/sed/find：
+/// 安装包内置、优先于宿主 PATH 的四个工具。这里故意不含 git/bun/sed/find：
 /// git 仍为宿主依赖；sed/find 用系统版；bun 不随包。
-/// wassette（沙箱化 MCP 工具宿主）也是随包工具：agent 会话按 bot 开关注入为
-/// MCP server（见 buzz/harness::wassette_mcp_server），随包优先、PATH 回落。
-pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh", "wassette"];
+pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh"];
 
 /// 根据主程序路径推导随包工具 bin（不检查存在性，便于单测）。
 fn bundled_tools_dir_for(exe: &std::path::Path) -> Option<PathBuf> {
@@ -1505,8 +1503,6 @@ mod tests {
             ("uv", "windows-x64", "uv.exe"),
             ("gh", "macos-arm64", "gh"),
             ("gh", "windows-x64", "gh.exe"),
-            ("wassette", "macos-arm64", "wassette"),
-            ("wassette", "windows-x64", "wassette.exe"),
         ]);
         assert_eq!(matrix, expected, "随包工具矩阵必须精确锁定");
     }

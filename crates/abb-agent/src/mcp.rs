@@ -1,9 +1,9 @@
 //! MCP 客户端：把 abb 通过 `session/new` 下发的 `mcpServers` 变成 rpi 的 `AgentTool`。
 //!
 //! 为什么必须有它：rpi **没有 MCP**（全仓零命中，`rpi-mcp` workspace 成员已被删除），
-//! 而 abb 的 tool surface 主要就是两个 MCP server——
-//! `abb-events`（= abb 二进制自身 `mcp-events` 子命令）与 `wassette`（Wasm 组件工具宿主）。
-//! 不接 MCP 就等于把 abb 的能力面砍掉大半。
+//! 而 abb 下发的 MCP server 就是 `abb-events`（= abb 二进制自身 `mcp-events` 子命令，
+//! agent 订阅 walgit/任务事件的唯一通道）。不接 MCP 就等于丢掉事件订阅面。
+//! （原 `wassette`（Wasm 组件工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 //!
 //! 实现按 owner 决策用 `rmcp`（与被替代的 `crates/buzz-agent/src/mcp.rs` 同源），
 //! 调用形状也沿用它的写法：`().serve(transport)` → `peer().list_all_tools()` /
@@ -222,8 +222,8 @@ struct ToolDef {
 async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<ToolDef>), String> {
     let mut cmd = tokio::process::Command::new(&spec.command);
     cmd.args(&spec.args);
-    // **先清空再白名单**：不经 `env_clear()` 的话，每个 MCP server（包括 wassette 这类
-    // 第三方组件宿主）默认都能看到 abb 注入给 agent 的供应商 API key。
+    // **先清空再白名单**：不经 `env_clear()` 的话，每个 MCP server 默认都能看到
+    // abb 注入给 agent 的供应商 API key。
     // `spec.env` 是 abb 按 server 下发的（`AGENT_BRIDGE_HOME`、`ABB_EVENTS_REPO` 等），
     // 最后应用、优先级最高。
     // 白名单在 `child_env`（MCP 子进程与内置工具的 shell 共用同一份）。

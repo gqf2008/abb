@@ -213,7 +213,7 @@ pub struct AcpClient {
     /// 读 stderr 的后台任务；shutdown 时给一个有界窗口收尾，保证临终输出也进尾巴。
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     /// Windows：本 agent 所在 job 的守卫。Drop 时关闭 job 句柄 ⇒ 内核连带杀掉 agent 的
-    /// **整棵树**（含它为每个 session 起的 MCP 服务 wassette / mcp-events）。
+    /// **整棵树**（含它为每个 session 起的 MCP 服务 mcp-events）。
     /// 非 Windows 恒 None（unix 用进程组 kill 表达同一语义）。
     #[allow(dead_code)] // 只为 Drop 持有（关句柄 ⇒ 内核杀掉 agent 整棵树），不需要读
     job: Option<crate::agent_spawn::KillOnCloseJob>,
@@ -456,8 +456,8 @@ impl AcpClient {
 
         let mut child = cmd.spawn()?;
         // 把 agent 放进「句柄关闭即杀」的 job：agent 被杀 / bridge 退出时，它起的 MCP 服务
-        // （wassette 等**孙**进程）一起死 —— 否则 Windows 上只杀直接子进程，MCP 会变孤儿
-        // 常驻（2026-09-30 owner 实报「桌上 10 个 wassette」）。
+        // （mcp-events 等**孙**进程）一起死 —— 否则 Windows 上只杀直接子进程，MCP 会变孤儿
+        // 常驻（2026-09-30 owner 实报「桌上 10 个 MCP 孙进程」）。
         let job = child
             .id()
             .and_then(crate::agent_spawn::assign_kill_on_close_job);

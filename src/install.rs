@@ -160,7 +160,7 @@ fn pid_is_agent_bridge(pid: u32) -> Option<bool> {
     }
     #[cfg(windows)]
     {
-        let path = crate::orphan_mcp::image_path(pid)?;
+        let path = image_path(pid)?;
         let name = std::path::Path::new(&path)
             .file_name()?
             .to_string_lossy()
@@ -178,6 +178,35 @@ fn pid_is_agent_bridge(pid: u32) -> Option<bool> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// 取进程的镜像路径（读不到返回 None）。
+///
+/// 原属 `orphan_mcp`（已于 2026-10-10 随 wassette 废弃删除）。这里保留是因为
+/// `pid_is_agent_bridge` 靠它验证 PID 身份（2026-10-05 审计：PID 复用会把别人的进程
+/// 当成 service）——与 wassette 无关，不能跟着一起删。
+#[cfg(windows)]
+fn image_path(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: 句柄在函数内关闭；缓冲区长度由 API 回填（不足则失败 → 返回 None）。
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
     }
 }
 

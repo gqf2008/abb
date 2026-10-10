@@ -105,9 +105,10 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 
 ## MCP（刀 1）
 
-rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 的 tool surface 主要
-就是两个 MCP server：`abb-events`（= abb 二进制自身 `mcp-events` 子命令）与 `wassette`
-（Wasm 组件工具宿主）。本包用 **`rmcp`**（与被替代的 `crates/buzz-agent` 同源）接上它们。
+rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 下发的 MCP server 就是
+`abb-events`（= abb 二进制自身 `mcp-events` 子命令，agent 订阅 walgit/任务事件的唯一通道）。
+本包用 **`rmcp`**（与被替代的 `crates/buzz-agent` 同源）接上它。（原 `wassette`（Wasm 组件
+工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 
 - 入口是 `session/new` 的 `params.mcpServers`（形状与 `src/buzz/acp.rs` 的 `McpServer` 逐字对应：
   `{name, command, args, env:[{name,value}]}`）。**第一刀连 `params` 都不读**，abb 送的 server
@@ -123,13 +124,13 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
   `session/new` RPC 预算（60s）之内；装配本身**不再占用读循环**（`session/new` 与回合一样
   走独立任务，否则 abb 那边只有 5s 宽限的「停止」会被拖过）。
 - 子进程环境是白名单（`env_clear()` + [`PASSTHROUGH_ENV`] + abb 按 server 下发的
-  `spec.env`）：否则每个 MCP server（含 wassette 这类第三方组件宿主）默认就能看到 abb 注入的
+  `spec.env`）：否则每个 MCP server 默认就能看到 abb 注入的
   供应商 API key。工作目录取会话工作区（`session/new` 的 `cwd`，不存在时**如实报 cwd 错**而不是
   把它读成「命令不存在」），server 的 stderr **继承**（落到 /dev/null 的话，「server 起不来」
   的原因只剩我们那句 spawn 错误）。
   **白名单是「可用性 vs 凭据面」的取舍**（与被替代组件同源）：`HTTP(S)_PROXY`/`ALL_PROXY`
   可能带凭据、`SSH_AUTH_SOCK` 会让子进程能用用户的 SSH agent——对「能出网、能用 git」是必需的，
-  但意味着 wassette 这类第三方宿主也拿到它们。要收紧就得改 `PASSTHROUGH_ENV`。
+  但意味着 MCP 子进程也拿到它们。要收紧就得改 `PASSTHROUGH_ENV`。
 - 连接的生命周期绑在 session 上（`RunningService` 一旦 drop 就会关掉子进程）。**例外**：本
   进程自己**优雅退出**（stdin EOF）时不成立——不理会 EOF 的 MCP 子进程会被留下（`PPID=1`）：
   关子进程的 kill 任务 spawn 在块 `block_on` 已返回的 runtime 上，没被 poll。
@@ -153,8 +154,9 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 
 尚未做（刀 2 之后视需要）：`notifications/tools/list_changed` 的刷新、每个 `tools/call` 的独立超时、
 断线重连、`session/close`（本包没有这个渠道：`session/close` 回 `-32601`，MCP 子进程随会话线性
-累积——与被替代组件同构）。另注意：MCP 子进程的孤儿回收（abb 侧有 `src/orphan_mcp.rs` 专治
-wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 abb 的 `killpg` 兜住，单独启动或
+累积——与被替代组件同构）。另注意：MCP 子进程的孤儿回收原本只有一个专治模块（abb 侧
+`src/orphan_mcp.rs`，且只管 wassette、windows-only），该模块已随 2026-10-10 废弃 wassette
+删除，本包同样未处理；被 abb 监督时靠 abb 的 `killpg` / job 兜住，单独启动或
 外部单个 pid 被杀时会留孤儿（见上文「例外」）。
 
 ## 约定链（刀 2 首批）
@@ -229,7 +231,7 @@ wassette 孤儿，且是 windows-only）本包未处理；被 abb 监督时靠 a
 ## 内置工具（刀 2 第二批）
 
 用 `rpi-tools`（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv`）补上被替代组件的
-能力面：第一刀只有 MCP 工具（abb-events / wassette），模型**没有文件读写与 shell**。
+能力面：第一刀只有 MCP 工具（abb-events），模型**没有文件读写与 shell**。
 `OsExecutionEnv::with_cwd(会话 cwd)` → `ExecutionToolContext` → `create_*_tool`，全部以
 **`dev__{name}` 限定名**暴露（沿用被替代组件的 `dev` 伪命名空间，避免 owner 约定/技能里写过的
 工具名静默失效）。
