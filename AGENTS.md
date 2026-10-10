@@ -9,7 +9,7 @@ Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that b
 - `app-assets/` — macOS bundle assets (`Info.plist`, `AppIcon.icns`, tray icons).
 - `scripts/` — macOS helpers: `build.sh` (bundle + sign + install), `sign.sh` (re-sign), `make-certs.sh` (dev cert).
 - `reference/` — protocol references (e.g., `feishu_ws_protocol.py`).
-- `crates/abb-agent/` — **唯一执行层**（owner 与授权者会话都走它；由 rpi 库驱动；MCP / 约定链 / 内置工具 / 技能 / 工具通知已对齐被替代组件）。独立包（自带 manifest + lock，root 的 fmt/clippy/test 不碰它）；**GitHub Actions** 里有 `abb-agent-lint`（macOS）与 `abb-agent-windows` 两个 job（`.walgit/ci.toml` 只有 `abb-agent-lint` 一条，不等同于覆盖 Windows）；命令用 `--manifest-path crates/abb-agent/Cargo.toml`。角色不再决定执行层：`src/service.rs::pick_command_by_sandbox` 已退化为恒选 **owner 槽**（两槽已同一；随包 `abb-agent` 缺失时两槽同回落 PATH `pi-acp`），`_meta.abbSandbox` 三档由 abb-agent 自己实现并声明；原用于回滚的执行层覆盖开关（fork 时代的 config 字段）已一并删除。
+- `crates/abb-agent/` — **唯一执行层**（owner 与授权者会话都走它；由 rpi 库驱动；MCP / 约定链 / 内置工具 / 技能 / 工具通知已对齐被替代组件）。独立包（自带 manifest + lock，root 的 fmt/clippy/test 不碰它）；**GitHub Actions** 里有 `abb-agent-lint`（macOS）与 `abb-agent-windows` 两个 job（这是 abb-agent 的两个 job；`ci.yml` 共六个，其余为 fmt / test / check-macos / test-macos）；`.walgit/ci.toml` 里 abb-agent 只有 `abb-agent-lint` 一条，不等同于覆盖 Windows；命令用 `--manifest-path crates/abb-agent/Cargo.toml`。角色不再决定执行层：`src/service.rs::pick_command_by_sandbox` 已退化为恒选 **owner 槽**（两槽已同一；随包 `abb-agent` 缺失时两槽同回落 PATH `pi-acp`），`_meta.abbSandbox` 三档由 abb-agent 自己实现并声明；原用于回滚的执行层覆盖开关（fork 时代的 config 字段）已一并删除。
 - `third_party/i-slint-core/` — vendored `i-slint-core` wired via `[patch.crates-io]`. The only local patch is the Windows tray window (message-only → top-level hidden; see `Cargo.toml` comment). Its published tree does not ship everything upstream's repo has — `benches/string.rs` and a font its lib tests `include_bytes!` are missing, so standalone `--all-targets` / `--lib --tests` builds fail for reasons unrelated to the patch; compile coverage of the patch comes from root CI building it as a dependency on windows-latest.
 - `src/buzz/**` — 从 buzz harness 移植的桥/会话层。移植已完成：当年的自维护 fork（独立包）与它的处置台账已在 0685e66 一并删除；`src/buzz/mod.rs` 头部保留的上游 pin 只是**历史出处标注**（不要据此把 ABB 定制反推为上游行为，也不要重开 rsync 流程）。此处改动按普通代码改动对待——在提交信息与 walgit patch 说明里写清动机与影响面即可，没有额外的台账文件。
 
@@ -56,10 +56,13 @@ entire runtime directory; empty means default); per-bot workspaces under
   to the default `target/` or `$TMPDIR` fills the boot volume and manifests as an
   `errno=28 (No space left on device)` link failure — not as a code failure.
 - **CI**: merge gate = the local gate set below (fmt / clippy / build / `tools/check_test_isolation.sh`)
-  + independent review. This repo intentionally keeps **no local walgit CI runner** — do not start
-  `tools/run_ci_runner.sh`; `walgit ci` results are simply absent here, and that is not a pass. GitHub
-  Actions covers `ci.yml` at PR/mirror level and `release.yml` at tag/release time (the release path is
-  where the full build/sign/notarize happens).
+  + independent review — `merge_rule_eval` on this repo requires no CI run (`base is not protected`).
+  This repo keeps **no resident local walgit CI runner**: do not start `tools/run_ci_runner.sh`. Historical
+  runs do exist in the collab log (the last one is from 2026-10-09, produced by the `ci-runner` principal),
+  so `walgit ci status` may answer with old runs — treat them as **history, not verification of your head**.
+  GitHub Actions covers `ci.yml` at PR/mirror level (six jobs) and `release.yml` at tag/release time
+  (`anti-spam.yml` / `release-on-acceptance.yml` cover their own narrow paths); the full
+  build/sign/notarize path lives in `release.yml`.
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.
@@ -103,7 +106,7 @@ tools/check_test_isolation.sh
 
 ## Testing Guidelines
 
-- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package has no Rust integration tests — `tests/` only holds Python mock helper scripts (e.g. `tests/mock_acp_agent.py`). `crates/abb-agent` carries its own Rust tests (`cargo test --manifest-path crates/abb-agent/Cargo.toml`) plus Python probes under `crates/abb-agent/probes/`; it has no `tests/` directory.
+- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package also has two Rust integration tests — `tests/cli_botkey_callsites.rs` and `tests/mcp_events_stdio.rs` — alongside Python mock helpers (e.g. `tests/mock_acp_agent.py`). `crates/abb-agent` carries its own Rust tests (`cargo test --manifest-path crates/abb-agent/Cargo.toml`) plus Python probes under `crates/abb-agent/probes/`; it has no `tests/` directory.
 - Name tests with `snake_case`, behavior-focused names (e.g., `codex_single_message_no_progress`, `strip_user_mentions`).
 - Add tests alongside the code you change and run `cargo test` before pushing.
 

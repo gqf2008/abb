@@ -102,8 +102,8 @@ impl ChannelMeta {
 pub struct AgentConfig {
     pub command: String,
     pub args: Vec<String>,
-    /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同，
-    ///）、见 `AgentConfig`。
+    /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同：
+    /// service 用它对子进程 PATH 做全量接管）。
     pub extra_env: Vec<(String, String)>,
     /// ABB 后端标识（单后端化后恒 "buzz"）。P4.3 删除回复尾部「── 后端：X」
     /// 标注后暂无消费方——字段保留作配置透传（service → handle）与将来日志
