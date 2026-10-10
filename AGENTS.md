@@ -9,10 +9,9 @@ Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that b
 - `app-assets/` — macOS bundle assets (`Info.plist`, `AppIcon.icns`, tray icons).
 - `scripts/` — macOS helpers: `build.sh` (bundle + sign + install), `sign.sh` (re-sign), `make-certs.sh` (dev cert).
 - `reference/` — protocol references (e.g., `feishu_ws_protocol.py`).
-- `crates/abb-agent/` — **owner/FullAccess 会话的执行层**（由 rpi 库驱动；MCP / 约定链 / 内置工具 / 技能 / 工具通知已对齐被替代组件）。独立包（自带 manifest + lock，root 的 fmt/clippy/test 不碰它），CI 有 `abb-agent-lint` 任务；命令用 `--manifest-path crates/abb-agent/Cargo.toml`。授权者（受限）会话**不**走它——那条链路仍是 `crates/buzz-agent`（owner 裁定「原来谁现在还是谁」）。
-- `crates/buzz-agent/` — self-maintained fork（**授权者会话的执行层 + 回滚**）。 Independent package: own manifest + lock, **not** a member of the root package (root `Cargo.toml` has no `[workspace]`), so root `cargo clippy/fmt/test` never touches it — CI has a dedicated `fork-lint` job; run commands with `--manifest-path crates/buzz-agent/Cargo.toml`. The bundled agent executable is resolved **per role and sandbox need** (`src/service.rs::resolve_acp_commands` + `pick_command_by_sandbox`, used by **all three session-creating paths** — chat handles, `oneshot_agent_config`, and the task role profile): owner sessions **without** a sandbox mode prefer `abb-agent`; granted sessions **and** owner sessions configured with read-only / workspace-write stay on `buzz-agent` (abb-agent honestly does not declare `_meta.abbSandbox`, so abb's fail-closed gate would refuse them). `config.buzz_agent_exe` overrides both and doubles as the rollback switch.
+- `crates/abb-agent/` — **唯一执行层**（owner 与授权者会话都走它；由 rpi 库驱动；MCP / 约定链 / 内置工具 / 技能 / 工具通知已对齐被替代组件）。独立包（自带 manifest + lock，root 的 fmt/clippy/test 不碰它），CI 有 `abb-agent-lint`（macOS）与 `abb-agent-windows` 两个任务；命令用 `--manifest-path crates/abb-agent/Cargo.toml`。角色不再决定执行层：`src/service.rs::pick_command_by_sandbox` 已退化为恒选 `abb-agent`，`_meta.abbSandbox` 三档由 abb-agent 自己实现并声明；原用于回滚的执行层覆盖开关（fork 时代的 config 字段）已一并删除。
 - `third_party/i-slint-core/` — vendored `i-slint-core` wired via `[patch.crates-io]`. The only local patch is the Windows tray window (message-only → top-level hidden; see `Cargo.toml` comment). Its published tree does not ship everything upstream's repo has — `benches/string.rs` and a font its lib tests `include_bytes!` are missing, so standalone `--all-targets` / `--lib --tests` builds fail for reasons unrelated to the patch; compile coverage of the patch comes from root CI building it as a dependency on windows-latest.
-- `src/buzz/**` — upstream-sync zone (ported buzz harness). Every change there must be logged in the ledger `docs/buzz-port-sync.md` (处置表); that file also records the fork's known-flaky tests and sync constraints.
+- `src/buzz/**` — 从 buzz harness 移植的桥/会话层。移植已完成：当年的自维护 fork（独立包）与它的处置台账已在 0685e66 一并删除。此处改动按普通代码改动对待——在提交信息与 walgit patch 说明里写清动机与影响面即可，没有额外的台账文件。
 
 Runtime data lives in `~/.agent-bridge/` (the non-empty `AGENT_BRIDGE_HOME` env var overrides the
 entire runtime directory; empty means default); per-bot workspaces under
@@ -91,7 +90,7 @@ tools/check_test_isolation.sh
 
 ## Testing Guidelines
 
-- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package has no Rust integration tests — `tests/` only holds Python mock helper scripts (e.g. `tests/mock_acp_agent.py`). The fork `crates/buzz-agent` does have Rust integration tests in `crates/buzz-agent/tests/`.
+- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package has no Rust integration tests — `tests/` only holds Python mock helper scripts (e.g. `tests/mock_acp_agent.py`). `crates/abb-agent` carries its own Rust tests (`cargo test --manifest-path crates/abb-agent/Cargo.toml`) plus Python probes under `crates/abb-agent/probes/`; it has no `tests/` directory.
 - Name tests with `snake_case`, behavior-focused names (e.g., `codex_single_message_no_progress`, `strip_user_mentions`).
 - Add tests alongside the code you change and run `cargo test` before pushing.
 
