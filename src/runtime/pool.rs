@@ -710,12 +710,13 @@ const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// treat it as absent.
 const UNKNOWN_CHANNEL_NAME: &str = "unknown";
 
-/// Channel-derived input for a new session — the channel-qualified title hint.
-/// — from **one** metadata resolve.
+/// Channel-derived input for a new session — the channel-qualified title hint,
+/// from **one** metadata resolve.
 ///
-/// Both new-session consumers need the same lookup: the MCP git-origin env
-/// derives `channel_type`, and the session title is qualified with the channel
-/// name. `title_channel` is `None` whenever the channel can't usefully identify
+/// Single consumer now: the session title is qualified with the channel name
+/// (the old MCP git-origin env that also needed `channel_type` was removed with
+/// ABB's own MCP server, 2026-10-11). The hint is `None` whenever the channel
+/// can't usefully identify
 /// the session: an unresolved channel, a DM (no meaningful name), or the
 /// literal `"unknown"` metadata name. Composing that sentinel would title every
 /// unnamed channel identically (`Agent · #unknown`).

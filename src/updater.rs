@@ -1078,9 +1078,13 @@ mod tray_probe_guard_tests {
             std::path::Path::new(r"C:\x\update.log"),
         );
         assert!(s.contains("--service"), "探测必须排除 --service");
-        assert!(
-            !s.contains("-notmatch '--service'}}"),
-            "不得只排除 --service"
+        // 判别力：探针只允许「排除 --service」这一个 notmatch 子句（多排除别的进程名会漏判托盘）。
+        // 注意判据要按**生成产物**写：产物里是 `-notmatch '--service' }}`（`'` 与 `}}` 间有空格），
+        // 早先写的 `-notmatch '--service'}}` 在产物里根本不可能出现 ⇒ 空转断言（评审指出）。
+        assert_eq!(
+            s.matches("-notmatch").count(),
+            1,
+            "探针只应有一个 notmatch 子句（只排除 --service）：{s}"
         );
     }
 }

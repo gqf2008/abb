@@ -477,6 +477,9 @@ fn snapshot_config(work: &RefCell<Vec<BotConfig>>, wk: &SettingsWork) -> (Config
             // work 可能是打开 GUI 时的旧快照、不含之后新增的免@开关——从最新 config 补回，
             // 避免 GUI 保存其它字段时用旧 work 覆盖清空 mention_modes（重启后免@开关丢失）。
             nb.mention_modes = ob.mention_modes.clone();
+            // 同一先例：mcp_servers 今天只能手改 config.json（设置页还没有它的 UI，D 卡才做），
+            // GUI 的 work 快照里必然为空——不回填就会在「保存其它字段」时静默清空用户配置。
+            nb.mcp_servers = ob.mcp_servers.clone();
             if nb.bot_name.is_empty() {
                 nb.bot_name = ob.bot_name.clone();
             }

@@ -244,9 +244,11 @@ fn build_bot_acp_handles(
         .to_string();
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
-    // 会话级 MCP 名单：**全部来自该 bot 的用户配置**（`bots[].mcp_servers`）。
-    // ABB 只声明形状、不解释语义；granted/oneshot 路径同样带上它（同一 bot 的会话
-    // 应看到同一份外部 server 名单）。
+    // 会话级 MCP 名单：来自该 bot 的用户配置（`bots[].mcp_servers`），ABB 只声明不解释语义。
+    //
+    // **只进 normal（owner/普通）会话**：外部 MCP server 提供的工具面会绕过受限档的沙箱，
+    // 与当初 wassette 的口径一致（限制档会话经组件宿主可读工作区/放行网络）——所以
+    // granted 与 oneshot 保持空名单，宁可少给能力也不给绕闸路径。
     let extra_mcp = bot_mcp_servers(bot);
     // 刀 4b：abb-agent 已声明 `_meta.abbSandbox` 三档并实现受限执行，owner 受限档也走它。
     let normal_command = pick_command_by_sandbox((command, granted_command), normal_meta.is_some());
@@ -1909,6 +1911,52 @@ mod tests {
         assert!(servers[1].args.is_empty() && servers[1].env.is_empty());
         // 空配置 → 空名单（ABB 不再自带任何 server）
         assert!(bot_mcp_servers(&crate::config::BotConfig::default()).is_empty());
+    }
+
+    /// **接线测试**：`build_bot_acp_handles` 必须把 `bots[].mcp_servers` 接到 **normal** 句柄
+    /// 的 MCP 名单上（granted 保持空：外部 server 的工具面会绕过受限档沙箱，见该函数注释）。
+    ///
+    /// 判别力：把 `service.rs` 里的 `let extra_mcp = bot_mcp_servers(bot);` 换回 `Vec::new()`
+    /// （= 接了又丢）⇒ 本用例红；此前这类改动全仓 1006 条用例仍全绿（评审实测）。
+    #[test]
+    fn chat_handles_carry_bot_mcp_servers_to_normal_only() {
+        let bot = crate::config::BotConfig {
+            name: "mcpwire".into(),
+            mcp_servers: vec![
+                crate::config::McpServerConfig {
+                    name: "notes".into(),
+                    command: "/opt/notes-mcp".into(),
+                    args: vec!["--root".into(), "/tmp".into()],
+                    env: vec![crate::config::McpEnvVar {
+                        name: "TOKEN".into(),
+                        value: "t-1".into(),
+                    }],
+                },
+                crate::config::McpServerConfig {
+                    name: "second".into(),
+                    command: "true".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let cfg = Config::default();
+        let handles = build_bot_acp_handles(
+            &bot,
+            &cfg,
+            ("/bin/abb-agent", "/bin/abb-agent"),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert_eq!(
+            handles.normal.mcp_server_names(),
+            vec!["notes".to_string(), "second".to_string()],
+            "normal 句柄必须带上 bot 配置的外部 MCP server（顺序保持）"
+        );
+        assert!(
+            handles.granted.mcp_server_names().is_empty(),
+            "granted 句柄不得带外部 MCP server（否则可绕过受限档沙箱）"
+        );
     }
 
     /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 把 owner 会话（无论档位）
