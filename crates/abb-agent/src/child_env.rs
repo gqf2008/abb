@@ -7,7 +7,7 @@
 //! 为什么必须清空：abb 把供应商凭据（`ANTHROPIC_API_KEY` / `OPENAI_COMPAT_API_KEY` 等）注入
 //! **agent 进程**，那是 agent 自己要用的；但 MCP server 与 shell 都不是 abb 的 agent，默认继承
 //! 就等于把用户的付费 key 交给每一个被 spawn 的组件与每一条 shell 命令。
-//! 白名单内容与被替代的 `crates/buzz-agent/src/mcp.rs::PASSTHROUGH_ENV` 同源
+//! 白名单内容与被替代的 `参照物 mcp.rs::PASSTHROUGH_ENV` 同源
 //! （去掉那边 buzz 专属的几条）：子工具需要的是「能不能出网、能不能用 git、临时目录在哪」。
 
 /// agent 上下文标记：**必须**由我们写入，不能指望从宿主继承。
@@ -105,7 +105,7 @@ mod tests {
         for key in [
             "ANTHROPIC_API_KEY",
             "OPENAI_COMPAT_API_KEY",
-            "BUZZ_AGENT_PROVIDER",
+            "ABB_AGENT_PROVIDER",
             "ANTHROPIC_MODEL",
             "OPENAI_COMPAT_MODEL",
             "RUST_LOG",

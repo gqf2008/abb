@@ -1,4 +1,4 @@
-//! buzz harness —— 进程内 ACP agent 管理与投递主循环（ABB 单进程形态）。
+//! runtime —— 进程内 ACP agent 管理与投递主循环（ABB 单进程形态）。
 //!
 //! 上游 buzz-acp（`crates/buzz-acp` @ c3132c3）的 relay 形态整个被替换为进程内
 //! 消息总线：ABB 桥把聊天消息 `push` 进来，harness 排队 → 投给唯一一个 pi-acp
@@ -7,7 +7,7 @@
 //! 裁剪对照（相对上游 lib.rs 主循环）：
 //! - **懒池**：单 slot，首条消息才拉起 agent 子进程；崩溃后指数退避自动重拉
 //!   （2s → 封顶 60s，成功即清零）。上游的熔断开闸/全池退出不适用——ABB 是宿主
-//!   进程，buzz 后端不可用只影响 buzz 频道，不该拖垮整进程。
+//!   进程，runtime 后端不可用只影响该频道，不该拖垮整进程。
 //! - **无心跳/无 relay/无 observer**：没有周期性唤醒与 REST 上下文，通知全部
 //!   走 [`TurnOutput`] 出站（agent 回复与 harness 失败告示同管道，桥侧一视同仁
 //!   写历史并发送）。
@@ -28,19 +28,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::buzz::acp::{AcpClient, AcpError, EnvVar, McpServer};
-use crate::buzz::pool::{
+use crate::runtime::acp::{AcpClient, AcpError, EnvVar, McpServer};
+use crate::runtime::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
 };
-use crate::buzz::queue::{
+use crate::runtime::queue::{
     BatchEvent, CancelReason, DedupMode, EventQueue, FlushBatch, InboundMsg, PromptChannelInfo,
     QueuedEvent,
 };
 
 /// 回合空闲超时：agent 静默（无 ACP 线活动）这么久判死。
 ///
-/// 必须**长于** fork 的工具超时墙（`BUZZ_AGENT_TOOL_TIMEOUT_SECS`，默认 1260s，
+/// 必须**长于** fork 的工具超时墙（`ABB_AGENT_TOOL_TIMEOUT_SECS`，默认 1260s，
 /// 上游 #7185）：工具墙先到，模型能拿到「工具超时」并在同一回合里换个做法；
 /// 空闲墙先到就变成整回合被杀，用户只看到一句笼统失败。排序：
 /// 工具 1260 < 空闲 1500 < 单回合硬上限 [`MAX_TURN_DURATION`] 3600。
@@ -105,7 +105,9 @@ pub struct AgentConfig {
     /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同：
     /// service 用它对子进程 PATH 做全量接管）。
     pub extra_env: Vec<(String, String)>,
-    /// ABB 后端标识（单后端化后恒 "buzz"）。P4.3 删除回复尾部「── 后端：X」
+    /// ABB 后端标识（单后端化后恒 "buzz"）。**该字面量是持久值**：history 条目与
+    /// session marker 里都按它写出处标注（老数据也写的是 "buzz"），改名要迁移落盘
+    /// 数据，故保留。P4.3 删除回复尾部「── 后端：X」
     /// 标注后暂无消费方——字段保留作配置透传（service → handle）与将来日志
     /// 标注用；移除它要牵动 service/测试全部构造点，留给后续清理批次。
     #[allow(dead_code)] // 暂无读方（P4.3 后缀标注已删），见上行注释——后续批次移除
@@ -115,7 +117,7 @@ pub struct AgentConfig {
     /// None=FullAccess 今天行为）；granted handle = 强制 Restricted 剖面
     ///（workspace-write + shell 白名单 + `$ABB_BIN`）——同群 owner/granted
     /// 混合频道的档位只能绑进程，不能绑会话（角色 per-event）。
-    pub session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+    pub session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
 }
 
 /// 出站回合/告示：桥侧消费（写历史 + 发送）。
@@ -128,7 +130,7 @@ pub struct TurnOutput {
     pub text: String,
 }
 
-/// 同步回合结局（P3.1，[`BuzzHandle::wait_turn_outcome`]）：oneshot 路径需要
+/// 同步回合结局（P3.1，[`RuntimeHandle::wait_turn_outcome`]）：oneshot 路径需要
 /// 区分超时/关闭/agent 错误/取消终态；调用方按需自行折叠。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncTurnOutcome {
@@ -293,7 +295,7 @@ struct SteerAckEvent {
 
 /// 桥侧句柄。
 /// fork `_meta.abbSandbox` 能力协商结果（单后端化 P2.3）。存储为 AtomicU8
-/// （判别值见 BuzzHandle::sandbox_support）。
+/// （判别值见 RuntimeHandle::sandbox_support）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxSupport {
     /// agent 未启动/启动中——能力未知。
@@ -304,7 +306,7 @@ pub enum SandboxSupport {
     Unsupported = 2,
 }
 
-pub struct BuzzHandle {
+pub struct RuntimeHandle {
     cfg: AgentConfig,
     stop: CancellationToken,
     ctx: Arc<PromptContext>,
@@ -381,7 +383,7 @@ pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> M
     }
 }
 
-impl BuzzHandle {
+impl RuntimeHandle {
     /// 测试访问器：**该句柄实际会 spawn 的执行层命令**。
     ///
     /// 为什么需要它：执行层按角色 + 档位分流（`service::pick_command_by_sandbox`），
@@ -395,7 +397,7 @@ impl BuzzHandle {
 
     /// 测试访问器：该句柄的 `session_sandbox` 档位载荷（`None` = FullAccess/Auto）。
     #[cfg(test)]
-    pub(crate) fn session_sandbox(&self) -> Option<&crate::buzz::acp::SessionSandboxMeta> {
+    pub(crate) fn session_sandbox(&self) -> Option<&crate::runtime::acp::SessionSandboxMeta> {
         self.cfg.session_sandbox.as_ref()
     }
 
@@ -656,7 +658,7 @@ impl Loop {
 
 /// harness 主循环任务体（service 以 spawn_forever 驱动；退出 = 关停 token 触发
 /// 后的优雅收尾完成）。
-pub async fn run_loop(handle: Arc<BuzzHandle>) {
+pub async fn run_loop(handle: Arc<RuntimeHandle>) {
     let mut cmd_rx = handle
         .take_cmd_rx()
         .expect("run_loop must own the cmd receiver (call once)");
@@ -666,7 +668,7 @@ pub async fn run_loop(handle: Arc<BuzzHandle>) {
     let (mut l, mut steer_ack_rx) = Loop::new(handle.ctx.clone());
 
     tracing::info!(
-        "buzz harness started (lazy pool, agent command = {})",
+        "runtime started (lazy pool, agent command = {})",
         handle.cfg.command
     );
 
@@ -691,7 +693,7 @@ pub async fn run_loop(handle: Arc<BuzzHandle>) {
             }
         };
         let Some(evt) = evt else {
-            tracing::error!("buzz harness event channel closed — exiting loop");
+            tracing::error!("runtime event channel closed — exiting loop");
             break;
         };
         match evt {
@@ -706,7 +708,7 @@ pub async fn run_loop(handle: Arc<BuzzHandle>) {
     }
 
     shutdown(&mut l).await;
-    tracing::info!("buzz harness stopped");
+    tracing::info!("runtime stopped");
 }
 
 enum Evt {
@@ -723,7 +725,7 @@ enum Evt {
 
 // ── Cmd 处理 ─────────────────────────────────────────────────────────────────
 
-fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
+fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
     match cmd {
         Cmd::Message { channel_id, msg } => {
             let accepted = l.queue.push(QueuedEvent {
@@ -791,7 +793,7 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
             let mut next: HashMap<(String, String), Uuid> = HashMap::new();
             for meta in roots {
                 let key = (meta.bot_key.clone(), meta.chat_id.clone());
-                let uuid = Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+                let uuid = Uuid::parse_str(&crate::runtime::keys::channel_uuid(
                     &meta.bot_key,
                     &meta.chat_id,
                 ))
@@ -844,7 +846,7 @@ fn handle_cmd(l: &mut Loop, handle: &BuzzHandle, cmd: Cmd) {
 
 // ── agent 生命周期 ───────────────────────────────────────────────────────────
 
-fn handle_spawn_outcome(l: &mut Loop, handle: &BuzzHandle, outcome: SpawnOutcome) {
+fn handle_spawn_outcome(l: &mut Loop, handle: &RuntimeHandle, outcome: SpawnOutcome) {
     let index = match &outcome {
         SpawnOutcome::Ok { index, .. } | SpawnOutcome::Err { index, .. } => *index,
     };
@@ -911,7 +913,7 @@ fn respawn_delay(level: u32) -> Duration {
 /// 尝试全程对 stop token 让步：关停途中不残留新子进程。
 fn schedule_agent_start(
     l: &mut Loop,
-    handle: &BuzzHandle,
+    handle: &RuntimeHandle,
     delay: Duration,
     old_agent: Option<OwnedAgent>,
     index: usize,
@@ -986,7 +988,7 @@ async fn spawn_and_init_agent(cfg: &AgentConfig, index: usize) -> SpawnOutcome {
         Ok(Err(e)) => {
             acp.shutdown().await;
             // stderr 尾巴（shutdown 已给它收尾窗口）：把「真正的病句」带给用户——
-            // 只说「进程意外退出」等于什么都没说（见 BuzzHandle::last_start_error）。
+            // 只说「进程意外退出」等于什么都没说（见 RuntimeHandle::last_start_error）。
             let detail = crate::redact::error_with_stderr_tail(
                 format!("agent initialize failed: {e}"),
                 acp.stderr_tail().as_deref(),
@@ -1024,7 +1026,7 @@ fn normalized_agent_name(init_result: &serde_json::Value) -> String {
 /// 会话之间互不影响；同一会话内部仍由 per-chat 队列串行（语义不变）。
 ///
 /// 槽位只追加不回收（保持 index 不变式；空槽位不占资源，agent 也仍留在池里当热实例）。
-fn ensure_agent_capacity(l: &mut Loop, handle: &BuzzHandle) {
+fn ensure_agent_capacity(l: &mut Loop, handle: &RuntimeHandle) {
     let want = wanted_slots(l.queue.pending_channels());
     while l.pool.slot_count() < want {
         l.pool.push_slot();
@@ -1087,12 +1089,12 @@ fn dispatch_one(l: &mut Loop) -> bool {
     let (control_tx, control_rx) = oneshot::channel::<ControlSignal>();
 
     let abort_handle = l.pool.join_set.spawn(async move {
-        crate::buzz::pool::run_prompt_task(agent, batch, ctx_clone, result_tx, Some(control_rx))
+        crate::runtime::pool::run_prompt_task(agent, batch, ctx_clone, result_tx, Some(control_rx))
             .await;
     });
     l.pool.task_map_mut().insert(
         abort_handle.id(),
-        crate::buzz::pool::TaskMeta {
+        crate::runtime::pool::TaskMeta {
             agent_index,
             channel_id: Some(channel_id),
             recoverable_batch,
@@ -1127,15 +1129,15 @@ fn signal_in_flight_task(pool: &mut AgentPool, channel_id: Uuid, mode: ControlSi
 /// 调用方必须走 cancel+merge 回退。语义与上游 try_native_steer 逐条对齐
 /// （/tmp/up_lib_dispatch.txt；withhold 先于 watcher 关闭竞态）。
 fn try_native_steer(l: &mut Loop, channel_id: Uuid, msg: &InboundMsg) -> bool {
-    let (tag, closing) = crate::buzz::queue::native_steer_framing();
+    let (tag, closing) = crate::runtime::queue::native_steer_framing();
     let be = BatchEvent {
         msg: msg.clone(),
         received_at: Instant::now(),
     };
-    let event_block = crate::buzz::queue::format_event_block(channel_id, None, &be);
-    let new_message = crate::buzz::prompt_framing::semantic_section(tag, "");
-    let event_section = crate::buzz::prompt_framing::semantic_section_with_attributes(
-        "buzz-event",
+    let event_block = crate::runtime::queue::format_event_block(channel_id, None, &be);
+    let new_message = crate::runtime::prompt_framing::semantic_section(tag, "");
+    let event_section = crate::runtime::prompt_framing::semantic_section_with_attributes(
+        "abb-event",
         &[("type", msg.prompt_tag.as_str())],
         &event_block,
     );
@@ -1257,10 +1259,10 @@ mod dead_letter_reason_tests {
     /// 反复抓进程表倒推（tracing 从未接线，上游那句 `agent died — respawning` 被直接丢弃）。
     #[test]
     fn respawn_log_line_carries_backoff_and_tail() {
-        let s = respawn_log_line("exited", Some("BUZZ_AGENT_PROVIDER is required"), 3);
+        let s = respawn_log_line("exited", Some("ABB_AGENT_PROVIDER is required"), 3);
         assert!(s.contains("退避级别 3"), "{s}");
         assert!(s.contains("outcome=exited"), "{s}");
-        assert!(s.contains("BUZZ_AGENT_PROVIDER is required"), "{s}");
+        assert!(s.contains("ABB_AGENT_PROVIDER is required"), "{s}");
     }
 
     #[test]
@@ -1287,7 +1289,7 @@ mod dead_letter_reason_tests {
 /// agent 死掉/卡死后**重生**那一步的日志文案（纯函数，便于单测）。
 ///
 /// **为什么必须显式写 `crate::log!` 而不是只留 `tracing::warn!`**（2026-10-04 owner 追问
-/// 「为什么 buzz-agent 一直在重启」）：本仓**从未安装 tracing subscriber**（`tracing = "0.1"`
+/// 「为什么执行层一直在重启」）：本仓**从未安装 tracing subscriber**（`tracing = "0.1"`
 /// 只是个空壳），移植区所有 `tracing::*` 事件——包括上游那句 `agent died — respawning`——
 /// 全部被丢弃，`bridge.out` 里一个字都没有，只能靠反复抓进程表倒推。这行日志把「谁重生、
 /// 退避到第几级、agent 最后一次 stderr 说了什么」一次落盘。
@@ -1298,7 +1300,7 @@ fn respawn_log_line(outcome_label: &str, stderr_tail: Option<&str>, backoff: u32
     )
 }
 
-fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptResult) {
+fn handle_prompt_result(l: &mut Loop, handle: &RuntimeHandle, mut result: PromptResult) {
     let agent_index = result.agent.index;
     // 该 agent 的任务元数据整体清出（单 agent：task_map 至多一条），并把成功
     // steer 交付并入存活会话的账本（防迟到 ack 污染换代会话）。
@@ -1520,7 +1522,7 @@ fn handle_prompt_result(l: &mut Loop, handle: &BuzzHandle, mut result: PromptRes
                 // 只有纯路径行会命中，正常提及路径的叙述不受影响）。
                 let text = redact_skill_paths(&text);
                 // P4.3：后端标识后缀（`── 后端：X`）已删——执行层收口随包
-                // buzz-agent 单一后端，路由核验维度消亡，回复正文即最终文本。
+                // 单一执行层后路由核验维度消亡，回复正文即最终文本。
                 let meta = handle.channel_meta(channel_id);
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
                 // 同步等待者（job/oneshot 路径）旁路：文本直接回传，不产生 chat 投递
@@ -1619,7 +1621,7 @@ fn return_agent(l: &mut Loop, agent: OwnedAgent, outcome_label: &str, log_line: 
 /// 致命结局统一入口：退避升级 + 置 Dead（新消息预检拒绝）+ 后台重拉。
 fn schedule_death_respawn(
     l: &mut Loop,
-    handle: &BuzzHandle,
+    handle: &RuntimeHandle,
     old_agent: OwnedAgent,
     outcome_label: &str,
 ) {
@@ -1670,7 +1672,7 @@ fn cancel_waiter_terminal(
 }
 
 /// 把消息投给该频道的同步 waiter（取走条目）。返回是否确实有一个 waiter 收到。
-fn deliver_sync_wait_msg(handle: &BuzzHandle, channel_id: Uuid, msg: SyncWaitMsg) -> bool {
+fn deliver_sync_wait_msg(handle: &RuntimeHandle, channel_id: Uuid, msg: SyncWaitMsg) -> bool {
     match handle.sync_waiters.lock().unwrap().remove(&channel_id) {
         Some(tx) => {
             let _ = tx.send(msg);
@@ -1683,7 +1685,7 @@ fn deliver_sync_wait_msg(handle: &BuzzHandle, channel_id: Uuid, msg: SyncWaitMsg
 /// 失败批次死信/重试耗尽时的频道告示（出站 TurnOutput，桥侧写历史并发送）。
 /// 同步等待者旁路（P3.1）：该频道有 waiter 时同文以 Err 回传——agent 终态失败
 /// （死信/认证失效/档位不支持）对 job/oneshot 路径不再只表现为「挂到超时」。
-fn notify_channel(l: &mut Loop, handle: &BuzzHandle, batch: &FlushBatch, text: String) {
+fn notify_channel(l: &mut Loop, handle: &RuntimeHandle, batch: &FlushBatch, text: String) {
     if l.removed_channels.contains(&batch.channel_id) {
         return;
     }
@@ -1745,7 +1747,7 @@ fn is_sandbox_unsupported(error: &AcpError) -> bool {
 
 fn recover_panicked_agent(
     l: &mut Loop,
-    handle: &BuzzHandle,
+    handle: &RuntimeHandle,
     joined: Result<(), tokio::task::JoinError>,
 ) {
     let join_error = match joined {
@@ -1948,7 +1950,7 @@ mod spawn_lifecycle_tests {
     #[test]
     fn extra_mcp_attached_to_prompt_context() {
         let mk = |extra: Vec<McpServer>| {
-            BuzzHandle::new(
+            RuntimeHandle::new(
                 AgentConfig {
                     command: "true".to_string(),
                     args: Vec::new(),
@@ -1995,7 +1997,7 @@ mod spawn_lifecycle_tests {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
         let stop = CancellationToken::new();
-        let handle = BuzzHandle::new(
+        let handle = RuntimeHandle::new(
             AgentConfig {
                 command: python3,
                 args: vec![script.display().to_string()],
@@ -2031,7 +2033,7 @@ mod spawn_lifecycle_tests {
         let outcome = handle
             .wait_turn_outcome(
                 cid,
-                crate::buzz::queue::InboundMsg {
+                crate::runtime::queue::InboundMsg {
                     id_hex: "m1".to_string(),
                     author_role: "owner".to_string(),
                     text: "hi".to_string(),
@@ -2113,7 +2115,7 @@ mod channel_info_tests {
     /// 得 Closed——不挂预算、不留等待者。纯单测（不起 agent、不跑 run_loop）。
     #[tokio::test]
     async fn wait_turn_outcome_closed_when_loop_gone() {
-        let handle = BuzzHandle::new(
+        let handle = RuntimeHandle::new(
             AgentConfig {
                 command: "true".to_string(),
                 args: Vec::new(),
@@ -2130,7 +2132,7 @@ mod channel_info_tests {
         let outcome = handle
             .wait_turn_outcome(
                 Uuid::new_v4(),
-                crate::buzz::queue::InboundMsg {
+                crate::runtime::queue::InboundMsg {
                     id_hex: "m1".to_string(),
                     author_role: "owner".to_string(),
                     text: "x".to_string(),
@@ -2148,7 +2150,7 @@ mod channel_info_tests {
     /// 不是 Timeout，也不等重提示后的文本。纯单测：直接拨 sync_waiters 表。
     #[tokio::test]
     async fn sync_wait_cancelled_maps_to_cancelled_outcome() {
-        let handle = BuzzHandle::new(
+        let handle = RuntimeHandle::new(
             AgentConfig {
                 command: "true".to_string(),
                 args: Vec::new(),
@@ -2167,7 +2169,7 @@ mod channel_info_tests {
             tokio::spawn(async move {
                 h.wait_turn_outcome(
                     channel_id,
-                    crate::buzz::queue::InboundMsg {
+                    crate::runtime::queue::InboundMsg {
                         id_hex: "m1".to_string(),
                         author_role: "owner".to_string(),
                         text: "x".to_string(),
@@ -2237,7 +2239,7 @@ mod channel_info_tests {
             cancel_waiter_terminal(
                 true,
                 false,
-                &PromptOutcome::Ok(crate::buzz::acp::StopReason::EndTurn)
+                &PromptOutcome::Ok(crate::runtime::acp::StopReason::EndTurn)
             ),
             None,
             "Ok 结局 → 不发取消终态，让等待方拿真实文本"
@@ -2258,7 +2260,7 @@ mod channel_info_tests {
     /// 没有 waiter 时是 no-op（不误伤、不 panic）。
     #[tokio::test]
     async fn deliver_sync_wait_msg_sets_terminal_state() {
-        let handle = BuzzHandle::new(
+        let handle = RuntimeHandle::new(
             AgentConfig {
                 command: "true".to_string(),
                 args: Vec::new(),

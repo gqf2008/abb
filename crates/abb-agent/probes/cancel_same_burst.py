@@ -43,7 +43,7 @@ threading.Thread(target=accept_loop, daemon=True).start()
 
 env = dict(os.environ)
 env.update({
-    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ABB_AGENT_PROVIDER": "anthropic",
     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
     "ANTHROPIC_API_KEY": "dummy",
     "ANTHROPIC_MODEL": "claude-sonnet-4-5",

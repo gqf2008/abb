@@ -5,10 +5,10 @@
 //! 后端 agent 归纳成摘要存档（`summaries/<escaped>.md`），再清理工作区内历史/后端
 //! 会话文件；摘要在下一次会话（/new 后或清理后的首条消息）里注入衔接上下文。
 //!
-//! 执行层（单后端化 P3.2）：归纳回合走 `buzz::oneshot::oneshot_turn`——与聊天同一
-//! 执行层（随包 buzz-agent），一次性句柄用完即弃，不碰常驻聊天句柄的队列与 slot。
-//! 取代旧的 CLI spawn（`agent::run` → claude/pi）与 #200 的 buzz 整轮跳过——buzz bot
-//! 的每日归纳自此可用。buzz 会话不在工作区落转录文件（fork 无 .pi-sessions 写入），
+//! 执行层（单后端化 P3.2）：归纳回合走 `runtime::oneshot::oneshot_turn`——与聊天同一
+//! 执行层（随包 abb-agent），一次性句柄用完即弃，不碰常驻聊天句柄的队列与 slot。
+//! 取代旧的 CLI spawn（`agent::run` → claude/pi）与 #200 的整轮跳过——bot
+//! 的每日归纳自此可用。执行层会话不在工作区落转录文件（无 .pi-sessions 写入），
 //! 故归纳回合自身无转录清理。P4.2 后 sessions.json 折叠为单槽（老 pi 槽位 sid 在
 //! load 折叠时舍弃），legacy pi 转录不再能被精确匹配删除——残留由 tidy 孤儿清理
 //! （live 集 + 24h mtime 护栏）兜底。
@@ -50,7 +50,7 @@ pub struct GcReport {
     pub skipped: usize,
 }
 
-/// 归纳执行缝（P3.2）：生产 = [`ServiceSummarizer`]（buzz 一次性同步回合）；
+/// 归纳执行缝（P3.2）：生产 = [`ServiceSummarizer`]（执行层一次性同步回合）；
 /// 测试 = Stub（编排挡板）。返回 Ok(摘要文本，无后端标识后缀) / Err(失败或
 /// 中断原因)——失败与中断同臂处理（宁留不删，下轮重试）。
 #[async_trait::async_trait]
@@ -62,10 +62,10 @@ pub(crate) trait Summarizer: Send + Sync {
     ) -> Result<String, String>;
 }
 
-/// 生产归纳执行器：buzz 一次性同步回合（与聊天同一执行层）。配置在构造时
+/// 生产归纳执行器：执行层一次性同步回合（与聊天同一执行层）。配置在构造时
 /// 解析（per bot 命令/env/档位），每次 summarize 自起句柄用完即弃。
 pub(crate) struct ServiceSummarizer {
-    agent_cfg: crate::buzz::harness::AgentConfig,
+    agent_cfg: crate::runtime::harness::AgentConfig,
     workspace: String,
     budget: std::time::Duration,
 }
@@ -77,7 +77,7 @@ impl ServiceSummarizer {
             workspace: crate::workspace_dir(&bot.key()).display().to_string(),
             // 预算与 run_job 同款（硬上限 + 小余量：让 harness 死信先于调用方预算
             // 落地，拿到可行动的 Failed 原因）。
-            budget: crate::buzz::harness::MAX_TURN_DURATION + std::time::Duration::from_secs(30),
+            budget: crate::runtime::harness::MAX_TURN_DURATION + std::time::Duration::from_secs(30),
         }
     }
 
@@ -85,7 +85,7 @@ impl ServiceSummarizer {
     /// 短预算防 mock 拉不起时测试悬挂）。
     #[cfg(test)]
     fn for_test(
-        agent_cfg: crate::buzz::harness::AgentConfig,
+        agent_cfg: crate::runtime::harness::AgentConfig,
         workspace: String,
         budget: std::time::Duration,
     ) -> Self {
@@ -104,7 +104,7 @@ impl Summarizer for ServiceSummarizer {
         prompt: &str,
         stop: &tokio_util::sync::CancellationToken,
     ) -> Result<String, String> {
-        let msg = crate::buzz::queue::InboundMsg {
+        let msg = crate::runtime::queue::InboundMsg {
             id_hex: uuid::Uuid::new_v4().to_string(),
             author_role: crate::config::SenderRole::Owner.as_str().to_string(),
             text: prompt.to_string(),
@@ -112,7 +112,7 @@ impl Summarizer for ServiceSummarizer {
             prompt_tag: "gc_summary".to_string(),
         };
         // 外部取消只 watch，oneshot 绝不反 cancel（#69 关停联动）。
-        match crate::buzz::oneshot::oneshot_turn(
+        match crate::runtime::oneshot::oneshot_turn(
             self.agent_cfg.clone(),
             Some(self.workspace.clone()),
             msg,
@@ -121,11 +121,13 @@ impl Summarizer for ServiceSummarizer {
         )
         .await
         {
-            crate::buzz::harness::SyncTurnOutcome::Ok(text) => Ok(text),
-            crate::buzz::harness::SyncTurnOutcome::Cancelled => Err("已中断（关停）".to_string()),
-            crate::buzz::harness::SyncTurnOutcome::Timeout => Err("归纳超时".to_string()),
-            crate::buzz::harness::SyncTurnOutcome::Closed => Err("agent 不可用".to_string()),
-            crate::buzz::harness::SyncTurnOutcome::Failed(reason) => Err(reason),
+            crate::runtime::harness::SyncTurnOutcome::Ok(text) => Ok(text),
+            crate::runtime::harness::SyncTurnOutcome::Cancelled => {
+                Err("已中断（关停）".to_string())
+            }
+            crate::runtime::harness::SyncTurnOutcome::Timeout => Err("归纳超时".to_string()),
+            crate::runtime::harness::SyncTurnOutcome::Closed => Err("agent 不可用".to_string()),
+            crate::runtime::harness::SyncTurnOutcome::Failed(reason) => Err(reason),
         }
     }
 }
@@ -194,7 +196,7 @@ pub async fn run_once_with_days(
         let agents_block =
             crate::agents_md::collect_block_at(&bridge.agents_md_root, &bot_key, &key);
         let prompt = build_summary_prompt(&agents_block, &history_block);
-        // 一次性同步回合（owner 角色内部维护任务）：buzz 会话不落工作区转录，
+        // 一次性同步回合（owner 角色内部维护任务）：执行层会话不落工作区转录，
         // 失败/中断无清理负担；关停经外部取消立即中断（#69）。
         let reply = match summarizer.summarize(&prompt, stop).await {
             Ok(reply) => reply,
@@ -781,7 +783,7 @@ mod tests {
         std::fs::remove_dir_all(&ws).ok();
     }
 
-    /// P3.2 全链路：真 oneshot（mock ACP agent）驱动 run_once——buzz bot 的
+    /// P3.2 全链路：真 oneshot（mock ACP agent）驱动 run_once——bot 的
     /// 每日归纳端到端可用（候选 → oneshot 回合 → 摘要落盘 → 清理），且摘要
     /// 不含后端标识后缀。
     #[tokio::test]
@@ -798,7 +800,7 @@ mod tests {
         let python3 = crate::deps::find_in_path("python3")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
-        let agent_cfg = crate::buzz::harness::AgentConfig {
+        let agent_cfg = crate::runtime::harness::AgentConfig {
             command: python3,
             args: vec![script.display().to_string()],
             extra_env: vec![

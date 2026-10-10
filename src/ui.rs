@@ -807,7 +807,7 @@ fn bots_struct_sig(c: &Config) -> String {
         })
         .collect();
     // 供应商入签名：harness 的供应商 env 是 service 启动快照（run_bot 内
-    // buzz_env_for_bot 按 bot 装配时读盘），GUI 改供应商（含补填 API Key）后必须
+    // env_for_bot 按 bot 装配时读盘），GUI 改供应商（含补填 API Key）后必须
     // 重启才生效——Windows 实机：空 key 补填后不重启 → codex 持续报
     // `Missing environment variable: AGENT_BRIDGE_MODEL_KEY`。api_key 以 sha256
     // 摘要入签名（明文 key 绝不进字符串，它可能被日志/UI 侧读到）。
@@ -2902,7 +2902,7 @@ pub fn run_gui() -> Result<()> {
                                 crate::agent::truncate(&bot_key, 12),
                                 crate::agent::truncate(&name, 20)
                             );
-                            // 单后端化 P3.3：全 bot 收口 buzz oneshot（不再按 backend
+                            // 单后端化 P3.3：全 bot 收口 runtime oneshot（不再按 backend
                             // 分流 CLI spawn）；装配需要 bot 完整配置 + 全局 config。
                             let r = match Config::load() {
                                 Ok(cfg) => match cfg.bots.iter().find(|b| b.key() == bot_key) {

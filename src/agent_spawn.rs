@@ -32,7 +32,7 @@ pub fn tokio_command(program: &str) -> tokio::process::Command {
 /// 持有 job 句柄本身；**Drop 时关闭 ⇒ 内核连带杀掉 job 里仍活着的整棵树** —— 也就是
 /// agent 及其 spawn 出来的 MCP 服务等后代。语义 =「bridge 死，agent 树一起死」。
 ///
-/// 非 Windows 恒为空壳（unix 用进程组 kill 表达同一语义，见 `buzz/acp.rs::kill_process_group`）。
+/// 非 Windows 恒为空壳（unix 用进程组 kill 表达同一语义，见 `runtime/acp.rs::kill_process_group`）。
 pub struct KillOnCloseJob {
     #[cfg(windows)]
     handle: windows::Win32::Foundation::HANDLE,
@@ -57,7 +57,7 @@ impl Drop for KillOnCloseJob {
 /// 把 `pid` 放进一个 `KILL_ON_JOB_CLOSE` job，返回守卫（拿不到就返回 None）。
 ///
 /// **为什么需要**（2026-09-30 owner 实报「桌上堆了 10 个 MCP 孙进程」）：Windows 上杀 agent
-/// 只作用于**直接子进程**（`buzz/acp.rs` 的 `kill_process_group` 在非 unix 是 stub），而
+/// 只作用于**直接子进程**（`runtime/acp.rs` 的 `kill_process_group` 在非 unix 是 stub），而
 /// agent 为每个 session 起的 MCP 服务（`mcp-events`）是**孙**进程 —— 于是一次
 /// agent 崩溃/被杀就留下一个常驻孤儿。job 成员默认被后代继承，所以套一层就够。
 ///

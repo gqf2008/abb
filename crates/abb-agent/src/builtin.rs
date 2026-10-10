@@ -1,7 +1,7 @@
 //! 内置工具（`rpi-tools`）：`read` / `write` / `edit` / `bash` / `grep` / `find` / `ls`。
 //!
 //! 为什么需要：abb-agent 第一刀只有 MCP 工具（abb-events），**没有文件读写与
-//! shell**；被替代的 `crates/buzz-agent` 有 4 个内置 dev 工具（`shell`/`read`/`write`/`ls`，
+//! shell**；被替代的 `旧执行层（已删除）` 有 4 个内置 dev 工具（`shell`/`read`/`write`/`ls`，
 //! 挂在 `dev` 伪命名空间下 ⇒ 模型看到的是 `dev__shell`）。本模块把 rpi-tools 的那套工具
 //! 接上，并**沿用 `dev__` 限定名**，避免 owner 约定/技能里写过的工具名静默失效。
 //!
@@ -17,7 +17,7 @@
 //! | shell 超时 | 默认 120s、clamp 1..=600 | 同（`default_timeout=120`，模型给的 `timeout_secs` 也 clamp 进 1..=600） |
 //! | shell 的环境 | 白名单（供应商凭据不进子进程） | 同：`inherit_env=false` + [`crate::child_env::passthrough_map`] |
 //! | shell 截断后的全量输出 | — | rpi 会把全量输出写到临时文件（`full_output_path`）；登记，不改 |
-//! | 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一个环境变量、同一种读法（见 [`dev_tools_enabled_from`]） |
+//! | 开关 | `ABB_AGENT_DEV_TOOLS=0` 关闭 | 同一个环境变量、同一种读法（见 [`dev_tools_enabled_from`]） |
 //! | Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
 //!
 //! **`delegate` 未实现**：参照物有一个把子任务委派给子代理的工具，本包没有对应实现。
@@ -43,7 +43,7 @@ use crate::provider::EnvSource;
 
 /// 会话执行档位（`session/new` 的 `_meta.sandbox` 解析产物，统一迁移刀 3）。
 ///
-/// 决定「哪些内置工具对模型可见」——与参照物 `crates/buzz-agent/src/wire.rs::Sandbox`
+/// 决定「哪些内置工具对模型可见」——与参照物 `参照物 wire.rs::Sandbox`
 /// 同词表、同语义：
 /// - `ReadOnly`：write/shell **不注入**（模型看不见；`allow_write`/`allow_shell` 为假）；
 /// - `WorkspaceWrite`：全工具可用，写限工作区、读限工作区；
@@ -86,7 +86,7 @@ impl SandboxMode {
 }
 
 /// 进程级开关：`0` 关闭整套内置工具（与 fork 同款环境变量）。
-pub const DEV_TOOLS_ENV: &str = "BUZZ_AGENT_DEV_TOOLS";
+pub const DEV_TOOLS_ENV: &str = "ABB_AGENT_DEV_TOOLS";
 
 /// shell 的默认超时与 clamp 区间（与被替代组件一致：默认 120s、clamp 1..=600）。
 const DEFAULT_SHELL_TIMEOUT_SECS: f64 = 120.0;
@@ -97,7 +97,7 @@ const MAX_SHELL_TIMEOUT_SECS: f64 = 600.0;
 const DEV_NAMESPACE: &str = "dev";
 const SEP: &str = "__";
 
-/// `BUZZ_AGENT_DEV_TOOLS` 的读法：**逐条对齐 fork**（`parse_env(…, 1u8)? != 0`）。
+/// `ABB_AGENT_DEV_TOOLS` 的读法：**逐条对齐 fork**（`parse_env(…, 1u8)? != 0`）。
 ///
 /// 默认开；`0` 关；读不懂 ⇒ `Err`（调用方响亮失败，与 fork 的 `die()` 同款）。
 /// 与 `NO_HINTS` 不同，这个开关不是安全闸（工具面宽窄由 abb 的档位闸门兜底），所以
@@ -437,7 +437,7 @@ fn rename_timeout_param(params: Value) -> Value {
 
 /// 写入路径限定：**已经解析好的绝对目标**必须落在会话工作区内。
 ///
-/// 与参照物 `crates/buzz-agent/src/devtools.rs::confined_write_path` 同一套判据：
+/// 与参照物 `参照物 devtools.rs::confined_write_path` 同一套判据：
 /// 父目录先建后 canonicalize（这样 `..` 与符号链接都被解成真实路径再比对前缀），
 /// 从而拦掉「`../escape`」「指向工作区外的符号链接父目录」这两类逃逸。
 /// 与参照物的一处**有意更紧**：本包允许**落在工作区内的**绝对路径（参照物一律拒绝绝对
@@ -488,7 +488,7 @@ async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, Stri
 
 /// 读取路径限定：`path`（相对或绝对）解析 + canonicalize 后必须落在会话工作区内。
 ///
-/// 与参照物 `crates/buzz-agent/src/devtools.rs::resolve_read_path` 的受限档 `read_roots`
+/// 与参照物 `参照物 devtools.rs::resolve_read_path` 的受限档 `read_roots`
 /// 分支同语义：相对路径按工作区为基准解、绝对路径原样，都 canonicalize 后再前缀比对。
 /// 符号链接同样被解掉（canonicalize 还原真实路径）——所以「工作区内指向工作区外的链接」
 /// 也读不到。与写域闸不同：读不创建父目录、不拒绝对路径（只要落在工作区内就放行）。

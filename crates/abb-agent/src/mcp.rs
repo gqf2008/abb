@@ -5,7 +5,7 @@
 //! agent 订阅 walgit/任务事件的唯一通道）。不接 MCP 就等于丢掉事件订阅面。
 //! （原 `wassette`（Wasm 组件工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 //!
-//! 实现按 owner 决策用 `rmcp`（与被替代的 `crates/buzz-agent/src/mcp.rs` 同源），
+//! 实现按 owner 决策用 `rmcp`（与被替代的 `参照物 mcp.rs` 同源），
 //! 调用形状也沿用它的写法：`().serve(transport)` → `peer().list_all_tools()` /
 //! `send_cancellable_request`。
 //!
@@ -14,7 +14,7 @@
 //! 模型看到的名字是 **`{server}__{tool}`**（与被替代组件一致：其 `SEP` 即 `__`，
 //! 且它明确拒绝 bare 名里含 `__` 的工具以避免歧义）。调用时回退到 bare 名发给 MCP。
 //!
-//! 名字/描述/schema 的上界与「重名怎么办」都对齐被替代的 `crates/buzz-agent/src/mcp.rs`
+//! 名字/描述/schema 的上界与「重名怎么办」都对齐被替代的 `参照物 mcp.rs`
 //! （它与 rpi 的工具表是同一份契约的消费方）。**有意保留一处差异**：那边遇到非法名字或
 //! 重名是 `Err`（整轮 session 失败），这边是**记 ERROR 后跳过**——与 abb「一个坏插件不能
 //! 阻断其余」同取向。差异写在 README 里，别读成「完全同一条规则」。
@@ -51,7 +51,7 @@ const CONNECT_BUDGET_PER_SERVER: Duration = Duration::from_secs(20);
 ///
 /// 为什么必须有总预算：单 server 上界乘 server 数是无界的，而 abb 那一侧
 /// `session/new` 的 RPC 超时是 60s、用户「停止」的宽限只有 5s
-/// （`src/buzz/acp.rs` 的 `CONTROL_CANCEL_GRACE`）——装配必须在两者之内收尾。
+/// （`src/runtime/acp.rs` 的 `CONTROL_CANCEL_GRACE`）——装配必须在两者之内收尾。
 /// 读循环本身已不再被装配占用（`session/new` 走独立任务），但应答仍须在 RPC 预算内。
 const CONNECT_BUDGET_TOTAL: Duration = Duration::from_secs(30);
 
@@ -72,7 +72,7 @@ const TOOL_RESULT_TEXT_BYTES: usize = 50 * 1024;
 
 /// abb 在 `session/new` 里下发的 MCP server 规格。
 ///
-/// 形状与 `src/buzz/acp.rs` 的 `McpServer`/`EnvVar` 逐字对应（那是唯一生产方）：
+/// 形状与 `src/runtime/acp.rs` 的 `McpServer`/`EnvVar` 逐字对应（那是唯一生产方）：
 /// `{"name":…, "command":…, "args":[…], "env":[{"name":…,"value":…}]}`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerSpec {
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn server_spec_parses_abb_shape() {
-        // 与 src/buzz/acp.rs 的 McpServer 序列化形状逐字对应。
+        // 与 src/runtime/acp.rs 的 McpServer 序列化形状逐字对应。
         let raw = serde_json::json!({
             "name": "abb-events",
             "command": "/Applications/ABB.app/Contents/MacOS/agent-bridge",

@@ -64,7 +64,8 @@ Type: files; Name: "{userprograms}\ABB.lnk"
 [Files]
 Source: "..\target\release\agent-bridge.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
-; abb-agent（单一执行层，刀 4b 后 buzz-agent 已删）：运行时按 current_exe 同目录解析。
+; abb-agent（单一执行层；刀 4b 已删旧执行层）：运行时按 current_exe 同目录解析。
+; 下面两处 taskkill 的 buzz-agent.exe 是**历史产物名**，只为升级/卸载时收掉残留进程。
 Source: "..\crates\abb-agent\target\release\abb-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; ABB 本体 MIT：再分发需附副本。
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "ABB-LICENSE.txt"; Flags: ignoreversion
@@ -94,7 +95,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 ; 而卸载也不会动 HKCU\...\Run 的 ABB 值 ⇒ 下次登录去启动一个**已经不存在**的 exe（托盘永不出现）。
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM agent-bridge.exe"; Flags: runhidden; RunOnceId: "AbbKillBridge"
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM buzz-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillBuzz"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM buzz-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillRuntime"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillNewAgent"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ABB /f"; Flags: runhidden; RunOnceId: "AbbDelRunKey"
 

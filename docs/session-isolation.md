@@ -12,7 +12,7 @@
 ```
 sessions.json = { key: { session_id, started, sandbox_mode? } }   // P4.2 单槽
 （老四槽 {claude, codex, pi, buzz} 与旧扁平 {backend, ...} 在 load 时折叠迁移：
- buzz 槽逐字保留，其余后端槽位舍弃，原件归档 sessions.json.legacy.bak）
+ 历史槽位逐字保留，其余后端槽位舍弃，原件归档 sessions.json.legacy.bak）
 key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 ```
 

@@ -7,7 +7,7 @@
 1. `dev__write` 写入相对路径 ⇒ 文件真出现且内容一致（含自动创建父目录）；
 2. `dev__write` 用 `../escape.txt` ⇒ 工作区外**不得**出现该文件；工作区外绝对路径同样被拒；
 3. `dev__shell` 跑一条真命令（`echo … > shell.txt`）⇒ 文件真出现、内容一致；
-4. `BUZZ_AGENT_DEV_TOOLS=0` ⇒ `dev__*` 工具不存在（模型调用它会得到「工具不存在」），
+4. `ABB_AGENT_DEV_TOOLS=0` ⇒ `dev__*` 工具不存在（模型调用它会得到「工具不存在」），
    且**不产生任何文件**（与 fork 的开关语义一致）；
 5. **末段符号链接**（`workspace/link.txt -> 工作区外文件`）⇒ `dev__write` 必须被拒，
    工作区外的目标文件**内容原封不动**（修前会跟随链接写穿）；
@@ -45,7 +45,7 @@ def run_turn(workspace, tool_call, extra_env=None, timeout=40):
         "ABB_AGENT_FAUX_TEXT": "回合结束",
         "RUST_LOG": "info",
     })
-    for key in ("ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL", "BUZZ_AGENT_PROVIDER"):
+    for key in ("ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL", "ABB_AGENT_PROVIDER"):
         env.pop(key, None)
     env.update(extra_env or {})
 
@@ -146,12 +146,12 @@ if os.path.isfile(shell_target):
         check("内容一致", fh.read().strip() == "SHELL-MARKER-77c2")
 
 print()
-print("=== 场景 4：BUZZ_AGENT_DEV_TOOLS=0 时不该有内置工具 ===")
+print("=== 场景 4：ABB_AGENT_DEV_TOOLS=0 时不该有内置工具 ===")
 workspace = tempdir("off")
 ok, stderr = run_turn(
     workspace,
     {"name": "dev__write", "arguments": {"path": "should-not-exist.txt", "content": "X"}},
-    extra_env={"BUZZ_AGENT_DEV_TOOLS": "0"},
+    extra_env={"ABB_AGENT_DEV_TOOLS": "0"},
 )
 check("回合完成", ok)
 check("开关关闭时不产生文件", not os.path.exists(os.path.join(workspace, "should-not-exist.txt")))

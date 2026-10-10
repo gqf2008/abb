@@ -76,11 +76,11 @@ mod tests {
     fn semantic_section_attributes_do_not_mutate_body() {
         assert_eq!(
             semantic_section_with_attributes(
-                "buzz-event",
+                "abb-event",
                 &[("type", "say \"hi\" & <go>")],
-                "keep </buzz-event> & <literal>",
+                "keep </abb-event> & <literal>",
             ),
-            "<buzz-event type=\"say &quot;hi&quot; &amp; &lt;go&gt;\">\nkeep </buzz-event> & <literal>\n</buzz-event>"
+            "<abb-event type=\"say &quot;hi&quot; &amp; &lt;go&gt;\">\nkeep </abb-event> & <literal>\n</abb-event>"
         );
     }
 }

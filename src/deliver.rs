@@ -316,26 +316,26 @@ impl Router {
             origin,
             DeliveryOrigin::Scheduled | DeliveryOrigin::TaskCompletion
         );
-        // 平台形状硬闸：目标必须是平台的 receive_id。若目标形如 buzz 频道 UUID
+        // 平台形状硬闸：目标必须是平台的 receive_id。若目标形如 历史频道 UUID
         // （`keys::looks_like_channel_uuid`），说明上游把**频道 UUID** 当成了 chat_id——
         // 历史上桥注入的 `AGENT_BRIDGE_CHAT_ID` 就是那个值（ACP 架构下 agent 是每 bot
         // 长驻进程，桥无法按频道注入，外部启动器喂进来的是频道 UUID）。这类值绝不是任何
         // 平台的 receive_id，直发必被平台拒（飞书 230001 invalid receive_id）。此处
         // **fail loud** 并回源报错，不再静默发出注定失败的请求。放在最前，任何开关都绕不过。
-        if crate::buzz::keys::looks_like_channel_uuid(&item.target_chat) {
+        if crate::runtime::keys::looks_like_channel_uuid(&item.target_chat) {
             crate::log!(
-                "[deliver] 拒绝投递：目标 chat={} 形如 buzz 频道 UUID，不是平台 chat_id（bot={} id={}）",
+                "[deliver] 拒绝投递：目标 chat={} 形如 历史频道 UUID，不是平台 chat_id（bot={} id={}）",
                 item.target_chat,
                 tb,
                 tid
             );
             let hint = format!(
-                "⚠️ 投递失败：目标会话「{}」形如 buzz 频道 UUID，不是任何平台可用的 receive_id（直发会被平台拒，如飞书 230001 invalid receive_id）。请改用真实 chat_id：飞书 oc_…／微信 wxid… 或 o9cq…／钉钉 cid…。",
+                "⚠️ 投递失败：目标会话「{}」形如 历史频道 UUID，不是任何平台可用的 receive_id（直发会被平台拒，如飞书 230001 invalid receive_id）。请改用真实 chat_id：飞书 oc_…／微信 wxid… 或 o9cq…／钉钉 cid…。",
                 item.target_chat
             );
             self.notify_source(item, &hint).await;
             return DeliveryOutcome::NotDelivered(
-                "目标不是平台 chat_id（形如 buzz 频道 UUID）".to_string(),
+                "目标不是平台 chat_id（形如 历史频道 UUID）".to_string(),
             );
         }
         // 开关只管跨会话；`in_session` 等价于「回复带附件」，不受它限制（CLI 侧同判）。
@@ -572,7 +572,7 @@ impl Router {
                 Some(dir) => crate::outbox::OutboxStore::new_at(dir.join("pending_outbox.json")),
                 None => crate::outbox::OutboxStore::new(&item.target_bot),
             };
-            // 归一化入队键（bot key / buzz 频道 UUID / 空 → 平台 receive_id），与
+            // 归一化入队键（bot key / 历史频道 UUID / 空 → 平台 receive_id），与
             // Bridge::flush_outbox 共用同一函数，保证入站补发时 store.take 命中
             //（缺陷 abb-wx-outbox-flush-mismatch-20260917：本机现场积压 chat_id 实测
             //  就是 bot key，补发侧却用平台 id → 永远 attempts=0 且零日志）。
@@ -621,7 +621,7 @@ impl Router {
 /// 校正「桥注入的当前会话」chat_id（`--to-current` / 缺省回创建者会话走这条路）。
 ///
 /// 背景：ACP 架构下 agent 是**每 bot 一个长驻进程**，桥没法按频道注入
-/// `AGENT_BRIDGE_CHAT_ID`；该值若由外部启动器提供，可能是 buzz **频道 UUID**——
+/// `AGENT_BRIDGE_CHAT_ID`；该值若由外部启动器提供，可能是 历史 **频道 UUID**——
 /// 它绝不是任何平台的 receive_id（直发飞书 = 230001 invalid receive_id）。此情形回落
 /// 该 bot 的**主会话**（真实平台 id）。
 ///
@@ -630,7 +630,7 @@ impl Router {
 pub fn correct_injected_chat(env_chat: &str, primary: &str) -> (String, bool) {
     if !env_chat.is_empty()
         && !primary.is_empty()
-        && crate::buzz::keys::looks_like_channel_uuid(env_chat)
+        && crate::runtime::keys::looks_like_channel_uuid(env_chat)
     {
         (primary.to_string(), true)
     } else {
@@ -1380,7 +1380,7 @@ mod tests {
     /// 真实平台 id / 空值 / 无主会话可回落 一律原样返回。
     #[test]
     fn correct_injected_chat_only_rewrites_channel_uuid() {
-        let uuid = crate::buzz::keys::channel_uuid(
+        let uuid = crate::runtime::keys::channel_uuid(
             "cli_a8a27ff268b8900e",
             "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
         );
@@ -1403,13 +1403,13 @@ mod tests {
         assert_eq!(correct_injected_chat(&uuid, ""), (uuid.clone(), false));
     }
 
-    /// 回归锁（本次修复的核心）：目标形如 buzz 频道 UUID 时**绝不直发**——不发给目标，
+    /// 回归锁（本次修复的核心）：目标形如 历史频道 UUID 时**绝不直发**——不发给目标，
     /// 且回源 loud 报错，说明它不是平台 receive_id（历史上会被当飞书 receive_id 发 →
     /// 230001 invalid receive_id）。三个平台共用这条硬闸。
     #[tokio::test]
     async fn router_rejects_channel_uuid_target_loudly() {
         let (router, target, source) = router_with(true, None);
-        let uuid = crate::buzz::keys::channel_uuid(
+        let uuid = crate::runtime::keys::channel_uuid(
             "cli_a8a27ff268b8900e",
             "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
         );

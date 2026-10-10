@@ -48,7 +48,7 @@ pub const DEFAULT_RESUME_ON_BOOT: bool = true;
 pub const KEEPALIVE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// 任务的两种载荷。两条轴的取值一样多，但**执行引擎完全不同**：
-/// `Agent` 走 ACP（`buzz::oneshot`），`Proc` 走进程超管（P3 落地）。
+/// `Agent` 走 ACP（`runtime::oneshot`），`Proc` 走进程超管（P3 落地）。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadKind {

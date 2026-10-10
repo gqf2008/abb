@@ -1,24 +1,24 @@
-//! agent 执行辅助 —— 单后端化（buzz harness 唯一执行层）时代的残留面。
+//! agent 执行辅助 —— 单后端化（runtime 唯一执行层）时代的残留面。
 //!
 //! P4.1 大删除：CLI spawn 形态（claude -p / codex exec / pi --mode json）整体移除——
 //! `Backend` 枚举、`run`/`run_once`/`process_line`、三后端命令构造族、`build_injection`
-//! 注入矩阵、`RealAgentRunner` 全部删除（P2 起聊天全量走 buzz harness，P3.2-P3.4
+//! 注入矩阵、`RealAgentRunner` 全部删除（P2 起聊天全量走 runtime，P3.2-P3.4
 //! 归纳/角色生成/团队生成收口 oneshot_turn，生产代码已无 CLI spawn 调用方）。
 //! 本模块保留：
 //! - [`AgentRunner`] trait：bridge 92 个编排测试的挡板缝（**仅测试注入**；生产装配
 //!   [`SpawnRetiredRunner`]——生产 dispatch 恒走 harness，该路径不可达， stub 如实
 //!   报错而非 panic）；
-//! - [`buzz_provider_env`] / [`provider_ready`]：harness 句柄装配的供应商 env 与
+//! - [`abb_provider_env`] / [`provider_ready`]：harness 句柄装配的供应商 env 与
 //!   预检硬闸（service / dispatch 预检消费）；
 //! - [`remove_pi_transcripts`] 族：legacy pi 会话文件清理（session_gc / tidy 消费——
-//!   buzz fork 不落 .pi-sessions，这些只服务存量数据）；
+//!   旧执行层不落 .pi-sessions，这些只服务存量数据）；
 //! - [`ensure_workspace_guide`]：工作区指引（fork 经 hints 读 cwd AGENTS.md——
-//!   job/deliver CLI 的可发现性仍靠它；调用点已迁 service 启动与 buzz dispatch）；
+//!   job/deliver CLI 的可发现性仍靠它；调用点已迁 service 启动与 runtime dispatch）；
 //! - [`generate_role_prompt`]：「✨生成」角色提示词（oneshot_turn，P3.3）；
 //! - [`kill_stale_agents`]：legacy agent-pids.json 孤儿进程一次性清理（写端随
 //!   run_once 删除，读端保留消化升级前残留——文件清空后永不再触发）。
 //!
-//! **无超时**：桥是推送模型——等 agent 跑完即回发（harness 侧语义，见 buzz/harness）。
+//! **无超时**：桥是推送模型——等 agent 跑完即回发（harness 侧语义，见 runtime/harness）。
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
-/// 在每个 bot 的 workspace 里放指引（buzz fork 经 hints 机制读 cwd 的 AGENTS.md）。
+/// 在每个 bot 的 workspace 里放指引（旧执行层经 hints 机制读 cwd 的 AGENTS.md）。
 /// 关键：告诉 agent 定时/周期需求要用桥注入的 `$ABB_BIN`（本程序绝对路径）调 job CLI 建任务后
 /// **立即退出**，别自己写 sleep/while 循环挂着（会一直占着该聊天，期间新消息全部排队）。
 /// 版本化（GUIDE_MARKER）：老工作区里无标记的旧模板（写死 `agent-bridge job`、实际在
@@ -262,7 +262,7 @@ pub enum RunOutcome {
 }
 
 /// Agent 执行抽象（#23 测试可测性）：bridge 持 `Arc<dyn AgentRunner>`，按 `Messenger`
-/// 同款注入模式。**P4.1 起本 trait 仅为测试挡板缝**：生产 dispatch 恒走 buzz harness
+/// 同款注入模式。**P4.1 起本 trait 仅为测试挡板缝**：生产 dispatch 恒走 runtime
 ///（acp_handles 恒装配，见 service run_bot），Bridge 内 spawn 回落路径只剩测试驱动
 /// （MockAgentRunner 驱动「任务运行中」时序的编排断言）；生产装配
 /// [`SpawnRetiredRunner`]（如实报错占位）。P4.1 签名删除 `backend` 参数（Backend
@@ -290,7 +290,7 @@ pub trait AgentRunner: Send + Sync {
 }
 
 /// 生产占位实现（P4.1）：CLI spawn（RealAgentRunner）已删，Bridge 的 spawn 回落路径
-/// 在生产不可达（dispatch 恒被 buzz harness 短路——acp_handles 由 service 常驻装配，
+/// 在生产不可达（dispatch 恒被 runtime 短路——acp_handles 由 service 常驻装配，
 /// None 仅出现在测试）。如实返回错误而非 panic/unimplemented：任务治理会捕获 panic
 /// 只留 stderr，用户侧无声（LESSON：后端短路臂必须全部入口成守卫）。
 pub struct SpawnRetiredRunner;
@@ -314,21 +314,21 @@ impl AgentRunner for SpawnRetiredRunner {
     }
 }
 
-/// buzz 后端（共享 ACP agent 进程）的供应商 env 装配。命名空间与 pi 的宿主映射
-/// 无关：buzz-agent 的 OPENAI_COMPAT_BASE_URL / ANTHROPIC_BASE_URL 直接可指任意
+/// runtime 后端（共享 ACP agent 进程）的供应商 env 装配。命名空间与 pi 的宿主映射
+/// 无关：执行层的 OPENAI_COMPAT_BASE_URL / ANTHROPIC_BASE_URL 直接可指任意
 /// 端点，供应商配置的 base_url 原样透传（openrouter/deepseek 留空时回落各自预置端点）。
 /// 支持 anthropic / openai-chat / openai-responses / openrouter / deepseek；
 /// 其余 kind → Err（用户可见）。
 /// provider 为 None → Ok(None)（纯继承宿主 env，旧行为——e2e 即靠宿主注入）。
-/// 单个回合允许的模型请求轮数上限（ABB 扩展）：注入 `BUZZ_AGENT_MAX_ROUNDS`。
+/// 单个回合允许的模型请求轮数上限（ABB 扩展）：注入 `ABB_AGENT_MAX_ROUNDS`。
 ///
 /// 为什么要有：fork 默认 0 = 无上限；而「工具卡住 ⇒ agent 反复重问」是真实发生过的
 /// 事故（2026-10-04），那时唯一的边界只有外层任务预算（30 分钟），中途会烧掉大量
 /// 模型调用。200 轮足够任何正常长任务（含分页读取、逐项确认、多步重构），
 /// 又能在失控时几分钟内收住。
-const BUZZ_AGENT_MAX_ROUNDS: u32 = 200;
+const ABB_AGENT_MAX_ROUNDS: u32 = 200;
 
-pub(crate) fn buzz_provider_env(
+pub(crate) fn abb_provider_env(
     provider: Option<&crate::config::ProviderConfig>,
 ) -> Result<Option<HashMap<String, String>>, String> {
     let Some(p) = provider else {
@@ -341,12 +341,12 @@ pub(crate) fn buzz_provider_env(
     // 明确上界：单个回合作多 200 轮（一轮 = 一次模型请求），超过即由 fork 以
     // `StopReason::MaxTurnRequests` 收尾，不再无限跑。
     env.insert(
-        "BUZZ_AGENT_MAX_ROUNDS".into(),
-        BUZZ_AGENT_MAX_ROUNDS.to_string(),
+        "ABB_AGENT_MAX_ROUNDS".into(),
+        ABB_AGENT_MAX_ROUNDS.to_string(),
     );
     match p.kind.as_str() {
         "anthropic" => {
-            env.insert("BUZZ_AGENT_PROVIDER".into(), "anthropic".into());
+            env.insert("ABB_AGENT_PROVIDER".into(), "anthropic".into());
             env.insert("ANTHROPIC_API_KEY".into(), p.api_key.clone());
             if !p.base_url.is_empty() {
                 env.insert("ANTHROPIC_BASE_URL".into(), p.base_url.clone());
@@ -356,9 +356,9 @@ pub(crate) fn buzz_provider_env(
             }
         }
         "openai-chat" | "openai-responses" | "openrouter" | "deepseek" => {
-            env.insert("BUZZ_AGENT_PROVIDER".into(), "openai".into());
+            env.insert("ABB_AGENT_PROVIDER".into(), "openai".into());
             env.insert("OPENAI_COMPAT_API_KEY".into(), p.api_key.clone());
-            // 与 pi 不同：buzz-agent 的 base_url 就是请求端点，不是 provider 身份
+            // 与 pi 不同：执行层的 base_url 就是请求端点，不是 provider 身份
             // 判定——供应商配的什么 URL 就打什么（含自定义网关/本地端点）。
             // openrouter/deepseek 是预置端点：用户没填 base_url 时补默认值，填了以填的为准。
             let base_url = if p.base_url.is_empty() {
@@ -378,7 +378,7 @@ pub(crate) fn buzz_provider_env(
         }
         other => {
             return Err(format!(
-                "⚠️ 供应商「{}」类型 {other} 无法用于 buzz 后端（支持 anthropic / openai-chat / openai-responses / openrouter / deepseek）。",
+                "⚠️ 供应商「{}」类型 {other} 无法用于 runtime 后端（支持 anthropic / openai-chat / openai-responses / openrouter / deepseek）。",
                 p.name
             ))
         }
@@ -404,7 +404,7 @@ pub enum SidMatch {
 
 /// 删除 `.pi-sessions` 中的会话文件（文件名 `<ts>_<sid>.jsonl`，sid 用 contains 匹配——
 /// ts 是纯数字+下划线、sid 是 UUID，文件名无分隔歧义）。**legacy 数据清理**：
-/// buzz fork 不落 .pi-sessions，本函数只服务单后端化之前的存量 pi 会话文件
+/// 旧执行层不落 .pi-sessions，本函数只服务单后端化之前的存量 pi 会话文件
 ///（session_gc 精确清理 / tidy 孤儿清理消费）。
 /// `fresh_secs`：mtime 距今小于该值的文件保留（宁留不删——可能是运行中的轮次）；
 /// `None` = 不查 mtime（/new 的即时清理语义：被轮换的旧 sid 不可能再被使用）。
@@ -485,7 +485,7 @@ fn remove_transcripts_in<F: FnMut(&std::path::Path) -> bool>(
 /// 截断 100 字符（char 安全，truncate 语义）。
 ///
 /// 单后端化 P3.3：旧 CLI spawn 形态（claude -p / codex exec / pi --mode json）整体
-/// 删除，全 bot 收口 [`crate::buzz::oneshot::oneshot_turn`]——GUI 进程没有常驻 ACP
+/// 删除，全 bot 收口 [`crate::runtime::oneshot::oneshot_turn`]——GUI 进程没有常驻 ACP
 /// 句柄（句柄只活在 service 进程），oneshot 自起自拆；agent 装配与 normal handle
 /// 同链（[`crate::service::oneshot_agent_config`]），维护任务跟 bot 配置档走。
 pub async fn generate_role_prompt(
@@ -504,7 +504,7 @@ pub async fn generate_role_prompt(
 /// 配置走「oneshot_turn → mock 子进程」全链路）。预算 60s 与旧 CLI 超时同口径
 /// （按钮点击的 UX 上界）。
 async fn generate_role_prompt_with(
-    agent_cfg: crate::buzz::harness::AgentConfig,
+    agent_cfg: crate::runtime::harness::AgentConfig,
     workspace: &std::path::Path,
     role_name: &str,
 ) -> Result<String> {
@@ -512,14 +512,14 @@ async fn generate_role_prompt_with(
               系统提示词（群介绍），要求：不超过 100 个中文字符；直接输出提示词本体，\
               不要解释、不要引号、不要“角色名：”前缀。";
     let full = format!("{sys}\n\n角色/任务名称：{role_name}");
-    let msg = crate::buzz::queue::InboundMsg {
+    let msg = crate::runtime::queue::InboundMsg {
         id_hex: uuid::Uuid::new_v4().to_string(),
         author_role: crate::config::SenderRole::Owner.as_str().to_string(),
         text: full,
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "role_prompt".to_string(),
     };
-    let outcome = crate::buzz::oneshot::oneshot_turn(
+    let outcome = crate::runtime::oneshot::oneshot_turn(
         agent_cfg,
         Some(workspace.display().to_string()),
         msg,
@@ -528,14 +528,14 @@ async fn generate_role_prompt_with(
     )
     .await;
     let text = match outcome {
-        crate::buzz::harness::SyncTurnOutcome::Ok(text) => text,
-        crate::buzz::harness::SyncTurnOutcome::Timeout => anyhow::bail!("生成超时（60s）"),
-        crate::buzz::harness::SyncTurnOutcome::Closed => {
+        crate::runtime::harness::SyncTurnOutcome::Ok(text) => text,
+        crate::runtime::harness::SyncTurnOutcome::Timeout => anyhow::bail!("生成超时（60s）"),
+        crate::runtime::harness::SyncTurnOutcome::Closed => {
             anyhow::bail!("agent 不可用（会话未建起）")
         }
         // 无外部取消源（oneshot_turn 第四个参数恒 None），仅为穷尽匹配
-        crate::buzz::harness::SyncTurnOutcome::Cancelled => anyhow::bail!("生成已中断"),
-        crate::buzz::harness::SyncTurnOutcome::Failed(reason) => anyhow::bail!("{reason}"),
+        crate::runtime::harness::SyncTurnOutcome::Cancelled => anyhow::bail!("生成已中断"),
+        crate::runtime::harness::SyncTurnOutcome::Failed(reason) => anyhow::bail!("{reason}"),
     };
     let text = post_process_role_prompt(&text);
     if text.is_empty() {
@@ -573,7 +573,7 @@ fn first_content_line(text: &str) -> String {
 // workspaces/<bot>/agent-pids.json；service 崩溃时残留孤儿 agent，重启恢复 pending
 // 前先清掉（否则 resume 撞「already in use」）。写端（track/untrack）已随 run_once
 // 删除；读端 kill_stale_agents 保留消化**升级前最后一次崩溃**的残留文件——清空后
-// 文件永为空，本路径自此静默（buzz-agent 进程生命周期由 harness 自管）。
+// 文件永为空，本路径自此静默（执行层进程生命周期由 harness 自管）。
 // 清理时用 ps 校验「存活且命令行是 claude/codex」再 kill，防 pid 被系统复用误杀。
 
 static AGENT_PID_LOCK: Mutex<()> = Mutex::new(());
@@ -730,7 +730,7 @@ mod tests {
         let python3 = crate::deps::find_in_path("python3")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
-        let agent_cfg = crate::buzz::harness::AgentConfig {
+        let agent_cfg = crate::runtime::harness::AgentConfig {
             command: python3,
             args: vec![script.display().to_string()],
             extra_env: vec![
@@ -840,10 +840,10 @@ mod tests {
     }
 
     #[test]
-    fn buzz_provider_env_maps_anthropic() {
+    fn abb_provider_env_maps_anthropic() {
         let p = prov_bu("myant", "anthropic", "https://gateway.example.com");
-        let env = buzz_provider_env(Some(&p)).unwrap().unwrap();
-        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "anthropic");
+        let env = abb_provider_env(Some(&p)).unwrap().unwrap();
+        assert_eq!(env["ABB_AGENT_PROVIDER"], "anthropic");
         assert_eq!(env["ANTHROPIC_API_KEY"], "sk-secret");
         // buzz-agent 支持自定义 anthropic 网关：base_url 原样透传（区别于 pi 的固定端点）
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example.com");
@@ -852,26 +852,26 @@ mod tests {
     }
 
     #[test]
-    fn buzz_provider_env_maps_openai_chat_and_responses() {
+    fn abb_provider_env_maps_openai_chat_and_responses() {
         let p = prov_bu("ds", "openai-chat", "https://api.deepseek.com");
-        let env = buzz_provider_env(Some(&p)).unwrap().unwrap();
-        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "openai");
+        let env = abb_provider_env(Some(&p)).unwrap().unwrap();
+        assert_eq!(env["ABB_AGENT_PROVIDER"], "openai");
         assert_eq!(env["OPENAI_COMPAT_API_KEY"], "sk-secret");
         assert_eq!(env["OPENAI_COMPAT_BASE_URL"], "https://api.deepseek.com");
         assert_eq!(env["OPENAI_COMPAT_MODEL"], "some-model");
         assert_eq!(env["OPENAI_COMPAT_API"], "chat");
         let p2 = prov_bu("rs", "openai-responses", "https://api.openai.com/v1");
-        let env2 = buzz_provider_env(Some(&p2)).unwrap().unwrap();
+        let env2 = abb_provider_env(Some(&p2)).unwrap().unwrap();
         assert_eq!(env2["OPENAI_COMPAT_API"], "responses");
     }
 
     /// #300：openrouter / deepseek 是 OpenAI 兼容**预置端点**——base_url 留空时补官方
     /// 端点，填了以用户填的为准；协议路线都走 chat（不是 responses）。
     #[test]
-    fn buzz_provider_env_maps_openrouter_and_deepseek_presets() {
+    fn abb_provider_env_maps_openrouter_and_deepseek_presets() {
         let or = prov_bu("or", "openrouter", "");
-        let env = buzz_provider_env(Some(&or)).unwrap().unwrap();
-        assert_eq!(env["BUZZ_AGENT_PROVIDER"], "openai");
+        let env = abb_provider_env(Some(&or)).unwrap().unwrap();
+        assert_eq!(env["ABB_AGENT_PROVIDER"], "openai");
         assert_eq!(
             env["OPENAI_COMPAT_BASE_URL"], "https://openrouter.ai/api/v1",
             "openrouter 留空 base_url 必须补预置端点"
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(env["OPENAI_COMPAT_API"], "chat");
 
         let ds = prov_bu("ds", "deepseek", "");
-        let env2 = buzz_provider_env(Some(&ds)).unwrap().unwrap();
+        let env2 = abb_provider_env(Some(&ds)).unwrap().unwrap();
         assert_eq!(
             env2["OPENAI_COMPAT_BASE_URL"], "https://api.deepseek.com/v1",
             "deepseek 留空 base_url 必须补预置端点"
@@ -889,7 +889,7 @@ mod tests {
         // 显式 base_url 覆盖预置（自建网关 / 代理场景）——两种预置都要能覆盖
         for kind in ["openrouter", "deepseek"] {
             let custom = prov_bu("custom", kind, "https://proxy.example.com/v1");
-            let env3 = buzz_provider_env(Some(&custom)).unwrap().unwrap();
+            let env3 = abb_provider_env(Some(&custom)).unwrap().unwrap();
             assert_eq!(
                 env3["OPENAI_COMPAT_BASE_URL"], "https://proxy.example.com/v1",
                 "{kind} 用户填了 base_url 就不能被预置覆盖"
@@ -898,10 +898,10 @@ mod tests {
     }
 
     #[test]
-    fn buzz_provider_env_none_and_mismatch() {
-        assert!(buzz_provider_env(None).unwrap().is_none());
+    fn abb_provider_env_none_and_mismatch() {
+        assert!(abb_provider_env(None).unwrap().is_none());
         let p = prov("x", "gemini");
-        let err = buzz_provider_env(Some(&p)).unwrap_err();
+        let err = abb_provider_env(Some(&p)).unwrap_err();
         assert!(err.contains("gemini"), "未知 kind → 用户可见错误: {err}");
     }
 
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn base_prompt_mentions_bundled_tools_and_exclusions() {
-        let prompt = include_str!("buzz/base_prompt.md");
+        let prompt = include_str!("runtime/base_prompt.md");
         for needle in ["# 环境与工具", "`rg`", "`jq`", "`uv`", "`gh`"] {
             assert!(prompt.contains(needle), "base prompt 缺 {needle}");
         }

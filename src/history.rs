@@ -85,7 +85,7 @@ pub struct History {
     /// #130 上下文压缩块（压缩后注入优先用它；/new 清历史时一并删）。
     ctxsum_path: PathBuf,
     /// #206 跟进：历史代际 sidecar（`<key>.epoch`）。代际计数器原本只在内存
-    /// （bridge history_epochs），重启归零而 buzz 回复账本持久——跨重启对账把
+    /// （bridge history_epochs），重启归零而 runtime 回复账本持久——跨重启对账把
     /// 合法回复误判孤儿（只发不写）、/new 后崩溃的孤儿回复反被放行。sidecar
     /// 让代际跨重启延续（/new 锁内先落盘再清盘；clear **不**删它，见 clear）。
     epoch_path: PathBuf,

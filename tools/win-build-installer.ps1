@@ -3,8 +3,8 @@
 #
 # 为什么存在这个文件（2026-10-05 owner：「不希望后面再出现这种很低级的问题」）：
 #   我为发版手写的临时脚本里给 fork 构建加了 CARGO_TARGET_DIR，于是 cargo 把
-#   buzz-agent.exe 编到了别的目录，而 ABB.iss 仍从 crates/buzz-agent/target/release
-#   取件 —— 结果第一次打出的 2.23.103 安装包里是**上一版的 buzz-agent**（不含本次
+#   旧执行层可执行编到了别的目录，而 ABB.iss 仍从它旧的 target/release
+#   取件 —— 结果第一次打出的 2.23.103 安装包里是**上一版的旧执行层**（不含本次
 #   修复）。CI 的 release.yml 没这个问题（它不设 CARGO_TARGET_DIR），是这个脚本的问题。
 #
 # 本脚本用两条断言把这一类错误钉死：
@@ -32,7 +32,7 @@ if ($env:CARGO_TARGET_DIR) {
 }
 
 $rootExe = Join-Path $repo 'target\release\agent-bridge.exe'
-# 单一执行层（刀 4b 后 buzz-agent 已删）。
+# 单一执行层（刀 4b 后旧执行层 abb 侧已删）。
 $abbAgentExe = Join-Path $repo 'crates\abb-agent\target\release\abb-agent.exe'
 
 if (-not $SkipBuild) {

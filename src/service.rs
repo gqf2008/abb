@@ -32,7 +32,7 @@ fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> 
 
 /// 给定（owner 命令、授权者命令）与该 bot 的 owner 档位，选出 normal 会话实际用哪条。
 ///
-/// 统一迁移刀 4b：buzz-agent 已删除，两种角色只有一条执行层（abb-agent），两条命令
+/// 统一迁移刀 4b：旧执行层已删除，两种角色只有一条执行层（abb-agent），两条命令
 /// 解析结果相同。保留函数签名是为了让三条建会话路径的接线测试仍然能钉住「走哪个槽」。
 fn pick_command_by_sandbox<'a>(role_cmds: (&'a str, &'a str), _needs_sandbox: bool) -> &'a str {
     let (owner_cmd, _granted_cmd) = role_cmds;
@@ -62,27 +62,27 @@ fn resolve_acp_commands() -> (String, String) {
 /// 无随包时解析 `pi-acp` 的最终命令。Windows 上 npm 生成的是 `.cmd` shim，
 /// CreateProcess 裸名只试 `.exe`；`find_in_path` 命中后必须传全路径（#246④）。
 fn resolve_acp_command_with(
-    buzz_cmd: Option<&str>,
+    agent_cmd: Option<&str>,
     find_pi_acp: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> String {
-    buzz_cmd
+    agent_cmd
         .map(str::to_string)
         .or_else(|| find_pi_acp().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "pi-acp".to_string())
 }
 
-fn resolve_acp_command(buzz_cmd: Option<&str>) -> String {
-    resolve_acp_command_with(buzz_cmd, || crate::deps::find_in_path("pi-acp"))
+fn resolve_acp_command(agent_cmd: Option<&str>) -> String {
+    resolve_acp_command_with(agent_cmd, || crate::deps::find_in_path("pi-acp"))
 }
 
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
-/// buzz 语义：`BUZZ_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses/openrouter/deepseek 全系
-/// 兼容 env（buzz_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
+/// 执行层语义：`ABB_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses/openrouter/deepseek 全系
+/// 兼容 env（abb_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
 /// 装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
 /// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
-///（P4.1：原 `uses_buzz_agent=false` 臂走已删的 `build_injection`——经核对该臂本就
-/// 解析到 buzz_provider_env（Buzz 臂）殊途同归；`build_injection` 矩阵随 Backend 一并
-/// 删除后，两臂并一为单一路径，`uses_buzz_agent` 形参随之摘除。）
+///（P4.1：原 `uses_exec_agent=false` 臂走已删的 `build_injection`——经核对该臂本就
+/// 解析到 abb_provider_env（runtime 臂）殊途同归；`build_injection` 矩阵随 Backend 一并
+/// 删除后，两臂并一为单一路径，`uses_exec_agent` 形参随之摘除。）
 /// Jev 决策门禁的 env 注入（统一迁移刀 4a）：从 config 的 `jev` 段转成 `JEV_*`。
 /// 未配置（api_key 空）时注入空——abb-agent 在受限会话建会话时会 fail-closed 拒答。
 fn jev_env(cfg: &Config) -> Vec<(String, String)> {
@@ -100,7 +100,7 @@ fn jev_env(cfg: &Config) -> Vec<(String, String)> {
     env
 }
 
-fn buzz_env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String, String)> {
+fn env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String, String)> {
     let prov = cfg.resolve_provider(bot).cloned();
     if let Some(p) = prov.as_ref() {
         if p.api_key.trim().is_empty() {
@@ -112,7 +112,7 @@ fn buzz_env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String
             return Vec::new();
         }
     }
-    match crate::agent::buzz_provider_env(prov.as_ref()) {
+    match crate::agent::abb_provider_env(prov.as_ref()) {
         Ok(Some(env)) => env.into_iter().collect(),
         Ok(None) => Vec::new(), // 无供应商：agent 起来后回合报错（预检已引导配置）
         Err(e) => {
@@ -133,23 +133,25 @@ fn buzz_env_for_bot(bot: &crate::config::BotConfig, cfg: &Config) -> Vec<(String
 /// Err——build_bot_acp_handles 已 ensure，这里是防御兜底）。
 fn resolve_sandbox_meta(
     bot: &crate::config::BotConfig,
-) -> Option<crate::buzz::acp::SessionSandboxMeta> {
+) -> Option<crate::runtime::acp::SessionSandboxMeta> {
     let root = crate::workspace_dir(&bot.key());
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let root = root.display().to_string();
     match bot.sandbox_mode {
-        crate::config::SandboxMode::ReadOnly => Some(crate::buzz::acp::SessionSandboxMeta {
+        crate::config::SandboxMode::ReadOnly => Some(crate::runtime::acp::SessionSandboxMeta {
             sandbox: Some("read-only".to_string()),
             writable_roots: Some(vec![root]),
             shell: None,
             abb_bin: None,
         }),
-        crate::config::SandboxMode::WorkspaceWrite => Some(crate::buzz::acp::SessionSandboxMeta {
-            sandbox: Some("workspace-write".to_string()),
-            writable_roots: Some(vec![root]),
-            shell: None,
-            abb_bin: None,
-        }),
+        crate::config::SandboxMode::WorkspaceWrite => {
+            Some(crate::runtime::acp::SessionSandboxMeta {
+                sandbox: Some("workspace-write".to_string()),
+                writable_roots: Some(vec![root]),
+                shell: None,
+                abb_bin: None,
+            })
+        }
         crate::config::SandboxMode::Auto | crate::config::SandboxMode::FullAccess => None,
     }
 }
@@ -159,7 +161,9 @@ fn resolve_sandbox_meta(
 /// argv 白名单 shell + `$ABB_BIN`。同群 owner/granted 混合频道的档位只能绑进程，
 /// 不能绑会话（角色 per-event，计划决策 4），故 granted 独立实例强制最严剖面。
 /// `abb_bin` = ABB 主程序路径（`$ABB_BIN` 白名单展开实体，让 agent 可 `job`/`deliver`）。
-fn granted_sandbox_profile(bot: &crate::config::BotConfig) -> crate::buzz::acp::SessionSandboxMeta {
+fn granted_sandbox_profile(
+    bot: &crate::config::BotConfig,
+) -> crate::runtime::acp::SessionSandboxMeta {
     let root = crate::workspace_dir(&bot.key());
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let root = root.display().to_string();
@@ -167,7 +171,7 @@ fn granted_sandbox_profile(bot: &crate::config::BotConfig) -> crate::buzz::acp::
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    crate::buzz::acp::SessionSandboxMeta {
+    crate::runtime::acp::SessionSandboxMeta {
         sandbox: Some("workspace-write".to_string()),
         writable_roots: Some(vec![root]),
         shell: Some("restricted".to_string()),
@@ -176,7 +180,7 @@ fn granted_sandbox_profile(bot: &crate::config::BotConfig) -> crate::buzz::acp::
 }
 
 /// 按 bot 构造 ACP 句柄对（P2.1/P2.2）：normal 与 granted 同命令同 env，差异在
-/// ① env：granted 多 `BUZZ_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、
+/// ① env：granted 多 `ABB_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、
 /// ~/.agents/skills 扫盘）发生在 session/new **之前**，per-session `_meta` 管不到，
 /// 只能进程级收口（计划决策 4）；② `session_sandbox`：normal = bot `sandbox_mode`
 /// 解析产物（None=FullAccess 照旧），granted = 强制 Restricted 剖面。域闸/argv
@@ -193,7 +197,7 @@ fn build_bot_acp_handles(
     //
     // 两条命令**按角色**分，但刀 4b 后都解析到同一执行层 abb-agent（两种角色已统一）。
     let (command, granted_command) = commands;
-    let env = buzz_env_for_bot(bot, cfg);
+    let env = env_for_bot(bot, cfg);
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .display()
@@ -201,18 +205,18 @@ fn build_bot_acp_handles(
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
     // 会话级 extra MCP：2026-10-10 废弃 wassette 后不再有额外 server（abb-events
-    // 由 BuzzHandle::new 恒注入）。保留这个变量与参数是为了不破坏接线形状——
+    // 由 RuntimeHandle::new 恒注入）。保留这个变量与参数是为了不破坏接线形状——
     // granted/oneshot 本来就传空。
-    let extra_mcp: Vec<crate::buzz::acp::McpServer> = Vec::new();
+    let extra_mcp: Vec<crate::runtime::acp::McpServer> = Vec::new();
     // 刀 4b：abb-agent 已声明 `_meta.abbSandbox` 三档并实现受限执行，owner 受限档也走它。
     let normal_command = pick_command_by_sandbox((command, granted_command), normal_meta.is_some());
 
     let mk = |command: &str,
               extra_env: Vec<(String, String)>,
-              session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
-              extra_mcp: Vec<crate::buzz::acp::McpServer>| {
-        crate::buzz::harness::BuzzHandle::new(
-            crate::buzz::harness::AgentConfig {
+              session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
+              extra_mcp: Vec<crate::runtime::acp::McpServer>| {
+        crate::runtime::harness::RuntimeHandle::new(
+            crate::runtime::harness::AgentConfig {
                 command: command.to_string(),
                 args: Vec::new(),
                 extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
@@ -241,7 +245,7 @@ fn build_bot_acp_handles(
     let granted = mk(
         granted_command,
         env.into_iter()
-            .chain([("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string())])
+            .chain([("ABB_AGENT_NO_HINTS".to_string(), "1".to_string())])
             .chain(jev)
             .collect(),
         Some(granted_meta),
@@ -259,11 +263,11 @@ fn build_bot_acp_handles(
 /// 的内部任务，跟 bot 配置档走——维护任务必须能跟 bot 后端走）。granted 的
 /// 强制 Restricted 剖面与 NO_HINTS 不适用于此（那是授权者会话的进程级收口）。
 /// session_gc（service 进程）与 GUI 按钮（GUI 进程，同 binary）都经它装配，
-/// 配合 `buzz::oneshot::oneshot_turn` 用完即弃。
+/// 配合 `runtime::oneshot::oneshot_turn` 用完即弃。
 pub(crate) fn oneshot_agent_config(
     bot: &crate::config::BotConfig,
     cfg: &Config,
-) -> crate::buzz::harness::AgentConfig {
+) -> crate::runtime::harness::AgentConfig {
     // 命令解析与 build_bot_acp_handles 同链（覆盖指错告警一回/调用——gc 是
     // 日频任务，GUI 是低频点击，重复解析可接受）。
     let role_cmds = resolve_acp_commands();
@@ -277,8 +281,8 @@ fn oneshot_agent_config_inner(
     bot: &crate::config::BotConfig,
     cfg: &Config,
     role_cmds: (String, String),
-    sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
-) -> crate::buzz::harness::AgentConfig {
+    sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
+) -> crate::runtime::harness::AgentConfig {
     // 统一迁移刀 4a：需要档位的会话（owner 的 read-only/workspace-write、granted）也走
     // abb-agent（已声明档位），且套 Jev 门禁——所以带档位时注入 JEV_* env。
     let command = pick_command_by_sandbox(
@@ -286,7 +290,7 @@ fn oneshot_agent_config_inner(
         sandbox.is_some(),
     )
     .to_string();
-    let env = buzz_env_for_bot(bot, cfg);
+    let env = env_for_bot(bot, cfg);
     // Jev 门禁 env **只在带档位（受限）时注入**：sandbox=None（owner 全权限维护任务，
     // 如 session_gc/角色生成）不套 Jev 门禁、不需要 key，多注一个凭证只扩大暴露面（评审 D1）。
     let mut extra_env: Vec<(String, String)> =
@@ -295,7 +299,7 @@ fn oneshot_agent_config_inner(
     if sandbox.is_some() {
         extra_env.extend(jev_env(cfg));
     }
-    crate::buzz::harness::AgentConfig {
+    crate::runtime::harness::AgentConfig {
         command,
         args: Vec::new(),
         extra_env,
@@ -309,7 +313,7 @@ fn oneshot_agent_config_inner(
 /// 与 [`oneshot_agent_config`] 的关键差别：那个是**内部维护任务**（owner 语义：
 /// session_gc / 角色生成 / 团队生成），granted 的强制 Restricted 剖面「不适用于此」
 /// 是有意的。任务不一样——任务是**用户会话里的 agent 建的**，必须按创建者角色选剖面：
-/// granted 建的任务要和 granted 聊天/job 一样走强制 Restricted + `BUZZ_AGENT_NO_HINTS=1`。
+/// granted 建的任务要和 granted 聊天/job 一样走强制 Restricted + `ABB_AGENT_NO_HINTS=1`。
 ///
 /// 不这么做的后果（安全审查 B1，真实可达）：`$ABB_BIN task add` 对 granted 会话是
 /// **放行**的，于是 granted 会话里的 agent 只要 `task add --prompt "读 ~/.ssh"`，
@@ -325,7 +329,7 @@ pub(crate) fn oneshot_agent_config_for_role(
     bot: &crate::config::BotConfig,
     cfg: &Config,
     restricted: bool,
-) -> crate::buzz::harness::AgentConfig {
+) -> crate::runtime::harness::AgentConfig {
     oneshot_agent_config_for_role_inner(bot, cfg, resolve_acp_commands(), restricted)
 }
 
@@ -335,7 +339,7 @@ fn oneshot_agent_config_for_role_inner(
     cfg: &Config,
     role_cmds: (String, String),
     restricted: bool,
-) -> crate::buzz::harness::AgentConfig {
+) -> crate::runtime::harness::AgentConfig {
     let sandbox = if restricted {
         Some(granted_sandbox_profile(bot))
     } else {
@@ -347,9 +351,9 @@ fn oneshot_agent_config_for_role_inner(
     }
     // 进程级收口：fork 的 hints 扫盘发生在 session/new **之前**，per-session `_meta`
     // 管不到（与 build_bot_acp_handles 的 granted 实例同一条理由）。先摘再补，防重复。
-    c.extra_env.retain(|(k, _)| k != "BUZZ_AGENT_NO_HINTS");
+    c.extra_env.retain(|(k, _)| k != "ABB_AGENT_NO_HINTS");
     c.extra_env
-        .push(("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string()));
+        .push(("ABB_AGENT_NO_HINTS".to_string(), "1".to_string()));
     c
 }
 
@@ -403,7 +407,7 @@ pub async fn run() {
     let cfg = Arc::new(cfg);
 
     // ACP 执行层命令**按角色**两条：owner 优先随包 `abb-agent`，授权者（受限）会话仍走
-    // `buzz-agent`（授权链路的承担者不变）。每进程解析一次；两条都可能回落 PATH `pi-acp`
+    // 执行层（授权链路的承担者不变）。每进程解析一次；两条都可能回落 PATH `pi-acp`
     // （开发/自签构建无随包）。
     let (normal_cmd, granted_cmd) = resolve_acp_commands();
 
@@ -527,14 +531,14 @@ pub async fn run() {
                 // roots 按 bot 分组
                 let mut by_bot: std::collections::HashMap<
                     String,
-                    Vec<crate::buzz::harness::ChannelMeta>,
+                    Vec<crate::runtime::harness::ChannelMeta>,
                 > = std::collections::HashMap::new();
                 for vb in store.load() {
                     if !active_bots.contains(&vb.bot_key) {
                         continue;
                     }
                     by_bot.entry(vb.bot_key.clone()).or_default().push(
-                        crate::buzz::harness::ChannelMeta {
+                        crate::runtime::harness::ChannelMeta {
                             // vb 群的 agent 工作目录 = 其独立工作区（P0.B，与退役
                             // CLI 路径的 ensure_vb_dir 语义对齐）
                             workspace: Some(
@@ -630,7 +634,7 @@ pub async fn run() {
         // 起 N 个 worker（默认 schedule 2 / manual 1，0 按 1 兜底）。同通道内超限排队（Q7 的
         // 「排队、不拒绝」），跨通道互不阻塞（否则 now 档的长任务会把定时触发饿死）；
         // 同一条任务**永不自我重叠**（认领是单锁 check-and-set），并发只作用于不同任务。
-        // 执行层是 `buzz::oneshot`（自起 handle）——Q7 拍板的 B1「task 独立 handle」，
+        // 执行层是 `runtime::oneshot`（自起 handle）——Q7 拍板的 B1「task 独立 handle」，
         // 任务不占聊天句柄 slot。
         // store/states 两条通道**共享同一对实例**：两个实例并存会让运行态读-改-写丢更新。
         {
@@ -661,7 +665,7 @@ pub async fn run() {
             }
         }
         // ACP 执行层命令**按角色**两条（owner 优先随包 abb-agent；授权者会话仍走
-        // buzz-agent，授权承担者不变）。两者都可能回落 PATH pi-acp（开发/自签无随包）。
+        // 旧执行层，授权承担者不变）。两者都可能回落 PATH pi-acp（开发/自签无随包）。
         // 句柄对按 bot 在 run_bot 内构造（P2.1）。
         let role_cmds = (normal_cmd.clone(), granted_cmd.clone());
         // #206：回合投递路由注册表（全部 bot 共享同一份）
@@ -832,7 +836,7 @@ async fn run_bot(
         let name: &'static str = Box::leak(format!("acp-harness:{key}:{label}").into_boxed_str());
         let run_handle = handle.clone();
         crate::svc_tasks::tasks().spawn(name, async move {
-            crate::buzz::harness::run_loop(run_handle).await;
+            crate::runtime::harness::run_loop(run_handle).await;
         });
         let name: &'static str = Box::leak(format!("acp-turns:{key}:{label}").into_boxed_str());
         let registry_for_turns = bridge_registry.clone();
@@ -957,7 +961,7 @@ async fn run_bot(
     }
 
     // #206 启动对账已随账本/relay 架构删除：同步形态下回合表（turn_registry）纯内存，
-    // 崩溃即失——in-flight 回合不补发（at-most-once，见 buzzreply.rs 模块文档），
+    // 崩溃即失——in-flight 回合不补发（at-most-once，见 agentreply.rs 模块文档），
     // 未跑完的用户消息由上方 recover_pending 按 pending.json 重放续跑。
 
     // #33 历史会话迁移**自动触发**：每次启动把后端私有 session 里尚未导入的对话
@@ -1544,8 +1548,8 @@ fn job_prompt(job: &crate::schedule::Job, bot_key: &str) -> String {
 ///   旁路回传）——**不是**「agent 无回复」，带原因回报而非复用超时文案（#321 同类的误标）。
 ///
 /// 本函数**无副作用**（纯映射）；Closed 的诊断日志由调用方打。
-fn job_outcome_reply(outcome: &crate::buzz::harness::SyncTurnOutcome) -> Option<String> {
-    use crate::buzz::harness::SyncTurnOutcome as O;
+fn job_outcome_reply(outcome: &crate::runtime::harness::SyncTurnOutcome) -> Option<String> {
+    use crate::runtime::harness::SyncTurnOutcome as O;
     match outcome {
         O::Ok(text) => Some(text.clone()),
         O::Cancelled | O::Closed => None,
@@ -1587,7 +1591,7 @@ async fn run_job(
         return;
     }
     let prompt_preview = crate::agent::truncate(&job.prompt, 40); // 按字符截断（含中文）
-                                                                  //（P4.1：单执行层后 job 恒走随包 buzz-agent，`default_backend`/Backend 解析已删。）
+                                                                  //（P4.1：单执行层后 job 恒走随包 abb-agent，`default_backend`/Backend 解析已删。）
     crate::log!(
         "[bot:{bot_key}] 触发任务 {} → {}",
         &job.id[..8],
@@ -1616,11 +1620,11 @@ async fn run_job(
     });
     // granted 能力闸：仅在有句柄可判时求值（None=未装配，走下面"agent 未装配"臂）。
     let granted_blocked = handle.as_ref().is_some_and(|h| {
-        granted && h.sandbox_support() == crate::buzz::harness::SandboxSupport::Unsupported
+        granted && h.sandbox_support() == crate::runtime::harness::SandboxSupport::Unsupported
     });
     // job 恒跑该 chat 的**群根频道**（与聊天回合同源；话题另开命名空间）。
     let channel_id =
-        uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(&bot_key, &job.chat_id))
+        uuid::Uuid::parse_str(&crate::runtime::keys::channel_uuid(&bot_key, &job.chat_id))
             .expect("channel_uuid output must parse as Uuid");
     // #309 PR-A2 + #321：登记本轮，供会话内的停止词/`/cancel` 把取消送到**本 job 实际
     // 使用的 handle 与 channel**（不是停止词发送者的角色）。登记必须**早于取 job 闸**：
@@ -1671,7 +1675,7 @@ async fn run_job(
                     // 频道预注册：p2p/未知会话即时注册（job 消息无 Ev 上下文，用任务目标注册）
                     h.upsert_channel(
                         channel_id,
-                        crate::buzz::harness::ChannelMeta {
+                        crate::runtime::harness::ChannelMeta {
                             // job 频道工作区 = 该 chat 的工作区（vb 群用其目录）
                             workspace: Some(
                                 crate::virtualbot::ensure_vb_dir(&bot_key, &job.chat_id)
@@ -1692,7 +1696,7 @@ async fn run_job(
                     let outcome = h
                         .wait_turn_outcome(
                             channel_id,
-                            crate::buzz::queue::InboundMsg {
+                            crate::runtime::queue::InboundMsg {
                                 id_hex: uuid::Uuid::new_v4().to_string(),
                                 author_role: job.role.as_str().to_string(),
                                 text: prompt.clone(),
@@ -1702,16 +1706,16 @@ async fn run_job(
                             // 预算与 chat 回合同款（harness 单回合硬上限 + 余量）：
                             // 报告类任务实测 3~7 分钟，60s 必超时且回合在途仍会
                             // 迟发投递（超时文案 + 真回复双发）。
-                            crate::buzz::harness::MAX_TURN_DURATION
+                            crate::runtime::harness::MAX_TURN_DURATION
                                 + std::time::Duration::from_secs(30),
                         )
                         .await;
                     bridge.unregister_job_turn(&job.id);
                     // 超时臂要在途叫停（防真回复迟发成第二条消息）；Closed/Cancelled 不需要。
-                    if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Timeout) {
+                    if matches!(outcome, crate::runtime::harness::SyncTurnOutcome::Timeout) {
                         let _ = h.cancel(channel_id).await;
                     }
-                    if matches!(outcome, crate::buzz::harness::SyncTurnOutcome::Closed) {
+                    if matches!(outcome, crate::runtime::harness::SyncTurnOutcome::Closed) {
                         // 单飞串行后等待者不再会被同 chat 的别的 job 顶替（#321 已修），
                         // 走到这里只剩「句柄已关闭」（服务在关停）——不是「agent 没回」，
                         // 按静默收尾（不发超时文案）。
@@ -1881,7 +1885,7 @@ mod tests {
     /// （公共包装不丢档位）。
     #[test]
     fn sessions_needing_a_sandbox_always_use_the_old_layer() {
-        let cmds = ("/bin/abb-agent", "/bin/buzz-agent");
+        let cmds = ("/bin/abb-agent", "/bin/legacy-agent");
         assert_eq!(pick_command_by_sandbox(cmds, false), "/bin/abb-agent");
         assert_eq!(
             pick_command_by_sandbox(cmds, true),
@@ -1900,7 +1904,10 @@ mod tests {
             ..BotConfig::default()
         };
         let cfg = Config::default();
-        let cmds = ("/bin/abb-agent".to_string(), "/bin/buzz-agent".to_string());
+        let cmds = (
+            "/bin/abb-agent".to_string(),
+            "/bin/legacy-agent".to_string(),
+        );
 
         // owner 配了 read-only ⇒ 档位存在，也走 abb-agent（已支持档位）。
         let c = oneshot_agent_config_inner(&bot, &cfg, cmds.clone(), resolve_sandbox_meta(&bot));
@@ -2011,7 +2018,7 @@ mod tests {
             full.display().to_string(),
             "Windows .cmd shim 必须传 PATH 命中的全路径，不能裸名 spawn"
         );
-        assert!(looked_up, "无 buzz-agent 时必须探测 pi-acp");
+        assert!(looked_up, "无旧执行层可执行时必须探测 pi-acp");
 
         let mut looked_up = false;
         assert_eq!(
@@ -2028,7 +2035,7 @@ mod tests {
     /// enabled bot** 的供应商装配全部后端——多 bot 各配各供应商时全体串台。
     /// per-bot 化后：每个 bot 的 env 必须只来自自己的供应商。
     #[test]
-    fn buzz_env_for_bot_uses_own_bot_provider() {
+    fn env_for_bot_uses_own_bot_provider() {
         let mk_prov = |name: &str, key: &str| crate::config::ProviderConfig {
             name: name.into(),
             kind: "openai-chat".into(),
@@ -2047,9 +2054,9 @@ mod tests {
         cfg.bots = vec![mk_bot("bot-a", "prov-a"), mk_bot("bot-b", "prov-b")];
 
         let env_a: std::collections::HashMap<_, _> =
-            buzz_env_for_bot(&cfg.bots[0], &cfg).into_iter().collect();
+            env_for_bot(&cfg.bots[0], &cfg).into_iter().collect();
         let env_b: std::collections::HashMap<_, _> =
-            buzz_env_for_bot(&cfg.bots[1], &cfg).into_iter().collect();
+            env_for_bot(&cfg.bots[1], &cfg).into_iter().collect();
         assert_eq!(
             env_a.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
             Some("sk-a")
@@ -2066,14 +2073,14 @@ mod tests {
         // 空 API Key 硬闸：env 置空（预检按 NoProvider 拒答引导），不注入半截 env
         let mut cfg2 = cfg.clone();
         cfg2.providers[1].api_key = "  ".into();
-        assert!(buzz_env_for_bot(&cfg2.bots[1], &cfg2).is_empty());
+        assert!(env_for_bot(&cfg2.bots[1], &cfg2).is_empty());
         // 无供应商（provider 名指向不存在）→ 空 env 不炸
         let cfg3 = {
             let mut c = cfg.clone();
             c.bots[1].provider = "ghost".into();
             c
         };
-        assert!(buzz_env_for_bot(&cfg3.bots[1], &cfg3).is_empty());
+        assert!(env_for_bot(&cfg3.bots[1], &cfg3).is_empty());
     }
 
     /// #306/安全审查 B1：任务的执行剖面必须**按创建者角色**选——granted 建的任务
@@ -2107,7 +2114,7 @@ mod tests {
         assert_eq!(
             g.extra_env
                 .iter()
-                .filter(|(k, _)| k == "BUZZ_AGENT_NO_HINTS")
+                .filter(|(k, _)| k == "ABB_AGENT_NO_HINTS")
                 .count(),
             1,
             "NO_HINTS 必须恰好一份（重复注入会漂移）"
@@ -2115,7 +2122,7 @@ mod tests {
         assert!(g
             .extra_env
             .iter()
-            .any(|(k, v)| k == "BUZZ_AGENT_NO_HINTS" && v == "1"));
+            .any(|(k, v)| k == "ABB_AGENT_NO_HINTS" && v == "1"));
 
         // owner → 跟 bot 配置档（默认 FullAccess → None），且不注入 NO_HINTS
         let o = oneshot_agent_config_for_role(&bot, &cfg, false);
@@ -2124,7 +2131,7 @@ mod tests {
             "默认档位是 FullAccess → None（不额外收紧 owner）"
         );
         assert!(
-            !o.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"),
+            !o.extra_env.iter().any(|(k, _)| k == "ABB_AGENT_NO_HINTS"),
             "owner 任务不该带授权者的进程级收口"
         );
     }
@@ -2393,7 +2400,7 @@ mod tests {
     /// 该路径已由同 chat 单飞串行关闭，见 `docs/task-model.md` §B。）
     #[test]
     fn job_outcome_reply_does_not_mislabel_closed_as_timeout() {
-        use crate::buzz::harness::SyncTurnOutcome as O;
+        use crate::runtime::harness::SyncTurnOutcome as O;
         assert_eq!(
             job_outcome_reply(&O::Ok("done".to_string())),
             Some("done".to_string())

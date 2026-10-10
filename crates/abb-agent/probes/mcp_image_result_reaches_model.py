@@ -84,7 +84,7 @@ threading.Thread(target=httpd.serve_forever, daemon=True).start()
 workdir = tempfile.mkdtemp(prefix="abb-mcp-img-")
 env = dict(os.environ)
 env.update({
-    "BUZZ_AGENT_PROVIDER": "openai",
+    "ABB_AGENT_PROVIDER": "openai",
     "OPENAI_COMPAT_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
     "OPENAI_COMPAT_MODEL": "vendor-native-id-v9",
     "OPENAI_COMPAT_API_KEY": "sk-probe-gateway-key",
@@ -236,7 +236,7 @@ threading.Thread(target=httpd2.serve_forever, daemon=True).start()
 
 env2 = dict(os.environ)
 env2.update({
-    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ABB_AGENT_PROVIDER": "anthropic",
     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT_ANTHROPIC}",
     "ANTHROPIC_MODEL": "probe-model",
     "ANTHROPIC_API_KEY": "sk-probe",

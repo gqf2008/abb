@@ -44,7 +44,7 @@ use crate::wire::{Inbound, WireError, Writer};
 /// 系统提示的默认值（abb 未下发 `systemPrompt` 时用）。
 ///
 /// abb 的**生产路径确实会下发** `session/new` 的 `params.systemPrompt`
-/// （`src/buzz/pool.rs::session_new_system_prompt` 在 protocol_version≥2 且非 goose 时走
+/// （`src/runtime/pool.rs::session_new_system_prompt` 在 protocol_version≥2 且非 goose 时走
 /// `Field` 传输），所以这个常量只是兼底——第一刀忽略了该参数，等于把 abb 的指令丢了。
 ///
 /// ⚠️ 刀 2 做**约定链**（`~/AGENTS.md` + `~/.agents/skills`）时**不能**沿用 rpi 的默认位
@@ -58,13 +58,13 @@ pub struct Server {
     /// 装配结果在启动时定一次：供应商配错要在**起进程时**就可见，
     /// 而不是等第一条消息才炸。
     backend: Result<Backend, String>,
-    /// abb 注入的回合上界（`BUZZ_AGENT_MAX_ROUNDS`，默认 200）。
+    /// abb 注入的回合上界（`ABB_AGENT_MAX_ROUNDS`，默认 200）。
     max_rounds: u64,
-    /// 约定链是否开启（`BUZZ_AGENT_NO_HINTS` **非零**时关）。**装配时定一次**：
+    /// 约定链是否开启（`ABB_AGENT_NO_HINTS` **非零**时关）。**装配时定一次**：
     /// abb 对 granted 会话只在**进程级**收口这个变量（见 `hints` 模块文档），
     /// 与 fork 同语义。
     hints_enabled: bool,
-    /// 内置工具（`dev__*`）是否开启（`BUZZ_AGENT_DEV_TOOLS=0` 时关，与 fork 同）。
+    /// 内置工具（`dev__*`）是否开启（`ABB_AGENT_DEV_TOOLS=0` 时关，与 fork 同）。
     dev_tools_enabled: bool,
     /// Jev 决策门禁（统一迁移刀 2）：装配结果在启动时定一次。受限会话建会话时
     /// 若为 `Err`（缺 key 等）则**拒绝对话**（fail-closed，不降级成放行）。
@@ -116,7 +116,7 @@ impl Server {
 
     /// 生产入口：读进程环境决定约定链开关。
     ///
-    /// `BUZZ_AGENT_NO_HINTS` 读不懂时**响亮失败**（`Err`，`main` 据此 exit 2）——与被替代
+    /// `ABB_AGENT_NO_HINTS` 读不懂时**响亮失败**（`Err`，`main` 据此 exit 2）——与被替代
     /// 组件的 `die()` 同款。静默降级会把「授权者会不会看到 owner 私有约定」变成掷骰子。
     pub fn try_new(writer: Writer) -> Result<Self, String> {
         Self::try_new_with(writer, &provider::ProcessEnv)
@@ -300,7 +300,7 @@ impl Server {
         );
 
         // 约定链：用**会话工作目录**（不是进程 cwd）——abb 的 cwd 就是频道工作区
-        // （`src/buzz/pool.rs` 的 `channel.workspace.unwrap_or(cwd)`），同一台机器上
+        // （`src/runtime/pool.rs` 的 `channel.workspace.unwrap_or(cwd)`），同一台机器上
         // 不同会话本就该看不同目录的约定。为真时结果可能为空（没有任何 AGENTS.md）。
         // 约定链与技能清单一次算出：系统提示要用，`load_skill` 也要用同一份技能表。
         // **约定链关闭时两者都没有**（参照物：hints 关 ⇒ skills 是空 vec ⇒ 工具也拿不到技能）。
@@ -774,7 +774,7 @@ struct TurnAccum {
 impl TurnAccum {
     fn observe(&mut self, event: &AgentEvent, max_rounds: u64, agent: &Agent) {
         match event {
-            // 与 fork 语义对齐：`crates/buzz-agent/src/agent.rs` 是
+            // 与 fork 语义对齐：`参照物 agent.rs` 是
             // `if cfg.max_rounds > 0 && round >= cfg.max_rounds`，即**请求前判**、
             // 最多允许 max_rounds 次模型请求。这里同样在 `TurnStart`（先于本轮请求）
             // 看**已完成**的请求数：做满就不再开新一轮 ⇒ 恰好 max_rounds 次。
@@ -802,7 +802,7 @@ impl TurnAccum {
 
 /// 把一条事件按需投影成 `session/update`。
 ///
-/// 文本刻意在 `MessageEnd` 整条发、而不是逐 delta 发：buzz-agent 自己就是
+/// 文本刻意在 `MessageEnd` 整条发、而不是逐 delta 发：旧执行层自己就是
 /// 「Non-streaming」的（见其 Cargo.toml 描述），abb 侧只是把 chunk 文本累加，
 /// 整条发与逐字发对它等价；逐 delta 需要再摸一层 `AssistantMessageEvent` 形状。
 ///
@@ -850,7 +850,7 @@ fn event_updates(event: &AgentEvent) -> Vec<Value> {
 }
 
 /// 工具调用的 `session/update` 载荷，**字段与状态取值对齐**被替代组件的四个发射点
-/// （`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）。
+/// （`参照物 agent.rs::emit_pending/emit_in_progress/emit_completed/emit_failed`）。
 ///
 /// **两处已知边界**（根因在 rpi 的事件模型，不在投影逻辑；已在 README 登记）：
 /// 1. rpi 只有「要执行了（Start）」一个前态、没有参照物那种「已识别 / 已开始执行」的分界

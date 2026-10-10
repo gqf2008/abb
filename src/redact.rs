@@ -1,7 +1,7 @@
 //! 面向用户的错误文本卫生：脱敏 → 折行 → 组合子进程 stderr 尾巴。
 //!
 //! 为什么单独成模块：agent 起不来时，最有诊断价值的一句话往往来自**子进程 stderr**
-//! （例如 BUZZ_AGENT_PROVIDER is required）。这条文本会**进 IM 对话**，所以必须先脱敏
+//! （例如 ABB_AGENT_PROVIDER is required）。这条文本会**进 IM 对话**，所以必须先脱敏
 //! 再截断 —— 密钥/令牌不能因为「排障方便」被贴到聊天里。
 //!
 //! 零正则（与全仓 mention 解析同口径）：手写字符扫描，行为可单测、无依赖。
@@ -173,11 +173,11 @@ mod tests {
     fn tail_is_appended_masked_and_single_line() {
         let s = error_with_stderr_tail(
             "agent initialize failed: Agent process exited unexpectedly".to_string(),
-            Some("config: BUZZ_AGENT_PROVIDER is required\napi_key=sk-secret-value\n"),
+            Some("config: ABB_AGENT_PROVIDER is required\napi_key=sk-secret-value\n"),
         );
         assert!(s.contains("Agent process exited unexpectedly"), "{s}");
         assert!(
-            s.contains("BUZZ_AGENT_PROVIDER is required"),
+            s.contains("ABB_AGENT_PROVIDER is required"),
             "真实原因必须带上：{s}"
         );
         assert!(!s.contains("sk-secret-value"), "密钥不得进提示：{s}");

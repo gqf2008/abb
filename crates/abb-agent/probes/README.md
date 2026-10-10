@@ -27,7 +27,7 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
 - `openai_family_round_trip.py`：起一个假 OpenAI 兼容网关（回最小 SSE），断言请求打到
   `{base}/v1/chat/completions`、鉴权头是 abb 注入的 key、请求体里的 model 就是我们给的
   **任意厂商 id**，且文本被发成 `session/update` 并以 `end_turn` 收尾。这条覆盖的是 abb 把
-  `openai-chat`/`openrouter`/`deepseek` 全归并成 `BUZZ_AGENT_PROVIDER=openai` 的真实路径。
+  `openai-chat`/`openrouter`/`deepseek` 全归并成 `ABB_AGENT_PROVIDER=openai` 的真实路径。
 
 - `mcp_tool_round_trip.py`（配 `fake_mcp_server.py`）：刀 1 的核心验收。按 `session/new` 的
   `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
@@ -57,7 +57,7 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
 - `builtin_tools_round_trip.py`：内置工具（`dev__*`）的端到端验收，**判据是文件系统**而不是
   agent 的文本：`dev__write` 写相对路径必须真出现文件（含自动建父目录），`../` 逃逸与工作区外
   绝对路径必须**不落盘**，`dev__shell` 必须真执行命令（`echo … > shell.txt`），
-  `BUZZ_AGENT_DEV_TOOLS=0` 时既没有内置工具也没有文件产出；末段符号链接指向工作区外时写入必须被拒
+  `ABB_AGENT_DEV_TOOLS=0` 时既没有内置工具也没有文件产出；末段符号链接指向工作区外时写入必须被拒
   且目标文件内容原封不动；`dev__shell` 的 `env` 快照里**不得**出现宿主凭据（`ANTHROPIC_API_KEY`
   探针哨兵）而 `PATH` 仍在；`dev__edit` 真改文件内容。
 - `delegate_round_trip.py`：`dev__delegate` 的端到端验收。判据分两处：**假 CLI 自己写下的 argv**
@@ -73,11 +73,11 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   请求体**（第一跳看工具表与 system，第二跳看模型拿到的工具结果）：技能清单/描述真进系统提示、工具名是
   **裸名** `load_skill`、正文被读到且 **frontmatter 被剥掉**、支持文件按 `demo/references/foo.md` 读到、
   越界形式 `demo/../../secrets.md` **拿不到工作区外内容**且给出可纠偏错误、**无技能的工作区里不暴露
-  `load_skill`**、`BUZZ_AGENT_NO_HINTS=1` 时工具表里没有 `load_skill` 且技能正文标记在整个请求体里
+  `load_skill`**、`ABB_AGENT_NO_HINTS=1` 时工具表里没有 `load_skill` 且技能正文标记在整个请求体里
   都不出现。
 - `hints_and_no_hints.py`：约定链的端到端证据（判据是假 anthropic 端点收到的 `system` 字段）。
   场景 1 断言会话目录的 `AGENTS.md` 与 `$HOME/AGENTS.md` 都进了请求、且全局层在前；场景 2
-  断言 `BUZZ_AGENT_NO_HINTS=1`（abb 给 granted 会话的进程级收口）时**两者都不得出现**而默认
+  断言 `ABB_AGENT_NO_HINTS=1`（abb 给 granted 会话的进程级收口）时**两者都不得出现**而默认
   系统提示仍在；场景 3 断言没有 `AGENTS.md` 时不注入空标题；场景 4 断言 `NO_HINTS=2` 也判关；
   场景 5 断言 `true`/`yes`/`-1`/`256`/`" 1 "` 这类取值**不发任何模型请求且以 2 退出**（不能静默
   fail-open）；场景 6 断言空 cwd 时只读进程工作目录那一层、不向祖先链扩散（钉 `acp.rs` 接线）。

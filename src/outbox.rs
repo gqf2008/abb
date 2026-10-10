@@ -36,14 +36,14 @@ pub struct OutboxItem {
 /// 入站消息的 `from_user_id`——**微信平台 id**（`o9cq…@im.wechat`）。`OutboxStore::take`
 /// 是逐字相等 partition，两者不相等 → 永远 take 到 0 条、attempts 恒为 0、且此前对空
 /// items 静默 return → 积压成永久黑洞。修复：入队与补发共用本函数，把「bot key」
-/// 「buzz 频道 UUID」「空值」统一归一化为该 bot 的平台 receive_id，保证键命中。
+/// 「历史频道 UUID」「空值」统一归一化为该 bot 的平台 receive_id，保证键命中。
 ///
-/// 纯函数核心（可测，幂等）：`chat_id` 非空、非 bot key、且不形如 buzz 频道 UUID 时
+/// 纯函数核心（可测，幂等）：`chat_id` 非空、非 bot key、且不形如 历史频道 UUID 时
 /// 原样返回（真实平台 id 一律保留）；否则回落到 `platform`（该 bot 的平台 receive_id）。
 /// `platform` 为空（配置缺失 / 单测）时按原值返回——绝不把 chat 清空。
 pub fn normalize_delivery_chat(chat_id: &str, bot_key: &str, platform: &str) -> String {
     let c = chat_id.trim();
-    let suspect = c.is_empty() || c == bot_key || crate::buzz::keys::looks_like_channel_uuid(c);
+    let suspect = c.is_empty() || c == bot_key || crate::runtime::keys::looks_like_channel_uuid(c);
     if suspect && !platform.is_empty() {
         platform.to_string()
     } else {
@@ -375,12 +375,12 @@ mod tests {
 
     const WX_PLATFORM: &str = "o9cq806Evm1T9LW4PNihIL11j2cE@im.wechat";
     const WX_BOT_KEY: &str = "o9cq806Evm1T9LW4PNihIL11j2cEimwechat";
-    const BUZZ_UUID: &str = "a1466a78-1111-2222-3333-9f980edf9ee8";
+    const HIST_UUID: &str = "a1466a78-1111-2222-3333-9f980edf9ee8";
 
     #[test]
     fn normalize_maps_bot_key_uuid_and_empty_to_platform_id() {
-        // 三种「坏」写法（bot key / buzz 频道 UUID / 空）都归一化为平台 receive_id
-        for bad in [WX_BOT_KEY, BUZZ_UUID, ""] {
+        // 三种「坏」写法（bot key / 历史频道 UUID / 空）都归一化为平台 receive_id
+        for bad in [WX_BOT_KEY, HIST_UUID, ""] {
             assert_eq!(
                 normalize_delivery_chat(bad, WX_BOT_KEY, WX_PLATFORM),
                 WX_PLATFORM,

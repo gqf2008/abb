@@ -1,11 +1,11 @@
-//! Bridge 子模块：#206 同步投递——buzz 后端回合回复（harness TurnOutput）的桥侧
+//! Bridge 子模块：#206 同步投递——runtime 后端回合回复（harness TurnOutput）的桥侧
 //! 处理（#80 按功能面拆分，impl Bridge 分散到子模块——子模块是父模块后代，可访问
 //! mod.rs 私有字段，无需改可见性）。
 //!
-//! 单进程架构（#200 Phase 3）下 buzz 回复不再异步回流：harness 在回合结束时捕获
+//! 单进程架构（#200 Phase 3）下 runtime 回复不再异步回流：harness 在回合结束时捕获
 //! agent 文本，经出站通道送回桥，由本模块**同步投递**（写历史 + 发送）。与 CLI
 //! 路径的差异只在「回复何时产出」——CLI 的回复在 handle 的 per-chat 串行锁内
-//! 「写历史 + 发送」原子完成；buzz 的回复在 dispatch 返回之后才到（回合在 agent
+//! 「写历史 + 发送」原子完成；执行层的回复在 dispatch 返回之后才到（回合在 agent
 //! 侧跑），落在串行锁之外——所以这里显式重建两道锁语义：
 //! - **代际闸**：dispatch 在 history_lock 内快照 epoch 登记进回合表（见
 //!   [`super::Bridge::turn_registry`]）；回复到达时在 history_lock 内比对
@@ -43,17 +43,17 @@ pub(crate) struct TurnEntry {
 }
 
 impl Bridge {
-    /// buzz 回合投递入口（service 的 buzz-turn-consumer 任务按 TurnOutput 的
+    /// runtime 回合投递入口（service 的 turn-consumer 任务按 TurnOutput 的
     /// meta.bot_key → Bridge 路由调用）。回合表登记（定位 key/epoch/mid）→
     /// 写历史（代际闸）→ 发送（chat 串行锁）。顺序「先历史后发送」沿用旧
-    /// deliver_buzz_reply：发送失败只是用户侧可见缺失（同步形态无补发路径），
+    /// deliver_runtime_reply：发送失败只是用户侧可见缺失（同步形态无补发路径），
     /// 历史写入不得因发送失败而跳过。
-    pub async fn deliver_turn_reply(&self, out: crate::buzz::harness::TurnOutput) {
+    pub async fn deliver_turn_reply(&self, out: crate::runtime::harness::TurnOutput) {
         // TurnOutput 自带频道登记快照：None = 回合途中频道被移除（SyncRoots
         // diff）/登记异常——无法路由（chat_id/thread_id 都无从取），记日志丢弃。
         let Some(meta) = out.meta else {
             crate::log!(
-                "[bridge] buzz 回合输出缺频道登记（频道已移除/登记异常），丢弃 uuid={} len={}",
+                "[bridge] runtime 回合输出缺频道登记（频道已移除/登记异常），丢弃 uuid={} len={}",
                 out.channel_id,
                 out.text.chars().count()
             );
@@ -77,7 +77,7 @@ impl Bridge {
                     )
                 };
                 crate::log!(
-                    "[bridge] ⚠️ buzz 回合输出无 dispatch 登记（未登记频道/登记缺失？），按会话键兜底 key={} uuid={}",
+                    "[bridge] ⚠️ runtime 回合输出无 dispatch 登记（未登记频道/登记缺失？），按会话键兜底 key={} uuid={}",
                     crate::agent::truncate(&derived, 24),
                     channel_id
                 );
@@ -104,7 +104,7 @@ impl Bridge {
                     .append_assistant(mid, "buzz", &text);
             } else {
                 crate::log!(
-                    "[bridge] buzz 回合回复到达时会话已 /new（代际失配），跳过历史写入 chat={} uuid={}",
+                    "[bridge] runtime 回合回复到达时会话已 /new（代际失配），跳过历史写入 chat={} uuid={}",
                     crate::agent::truncate(&key, 16),
                     channel_id
                 );
@@ -161,7 +161,7 @@ impl Bridge {
                     self.msgr.done(emoji_mid).await;
                 }
                 crate::log!(
-                    "[bridge] buzz 回复已投递{} chat={} 长度={}",
+                    "[bridge] runtime 回复已投递{} chat={} 长度={}",
                     if entry.is_none() {
                         "（无 dispatch 登记兜底关联）"
                     } else {
@@ -175,7 +175,7 @@ impl Bridge {
                 // 发送失败：同步形态无账本补发路径（at-most-once）——如实留痕，
                 // 用户在场可重发。
                 crate::log!(
-                    "[bridge] ⚠️ buzz 回复发送失败（两级都败，无补发路径）chat={}: {e:#}",
+                    "[bridge] ⚠️ runtime 回复发送失败（两级都败，无补发路径）chat={}: {e:#}",
                     crate::agent::truncate(&meta.chat_id, 12)
                 );
             }

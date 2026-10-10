@@ -6,7 +6,7 @@
 //! - 后端命令行：claude `-p --output-format text --dangerously-skip-permissions -- <task>`；
 //!   codex `exec --skip-git-repo-check --sandbox workspace-write -C <cwd> -- <task>`
 //!   （`--` 分隔：task 以 `-` 开头或单词形（如 `review`）时不会被当成选项/子命令）；
-//! - 二进制解析：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` 覆盖 → PATH；
+//! - 二进制解析：`ABB_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` 覆盖 → PATH；
 //! - 超时：默认 1200s、clamp 1..=1200；到点杀进程（unix 连同进程组）；
 //! - 取消：`CancellationToken` 一取消就杀子进程；
 //! - env：**白名单**（供应商 key 绝不进子进程）+ claude 的
@@ -64,8 +64,8 @@ impl DelegateBackend {
     /// 二进制路径覆盖的环境变量名（测试缝 + 运维逃生阀，与参照物同名）。
     pub fn bin_override_env(self) -> &'static str {
         match self {
-            Self::Claude => "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
-            Self::Codex => "BUZZ_AGENT_DELEGATE_CODEX_BIN",
+            Self::Claude => "ABB_AGENT_DELEGATE_CLAUDE_BIN",
+            Self::Codex => "ABB_AGENT_DELEGATE_CODEX_BIN",
         }
     }
 }
@@ -630,7 +630,7 @@ mod tests {
         }
 
         let env = fake_env(&[(
-            "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
+            "ABB_AGENT_DELEGATE_CLAUDE_BIN",
             fake.to_str().expect("path"),
         )]);
         assert_eq!(
@@ -647,7 +647,7 @@ mod tests {
         // 覆盖指向不可执行路径 ⇒ **不回落 PATH**（与参照物 `resolve_delegate_cli` 同取向：
         // 「覆盖 = 唯一来源，运维要的就是确定性」）。这条曾被写成回落，评审 F4 证伪。
         let bad = fake_env(&[(
-            "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
+            "ABB_AGENT_DELEGATE_CLAUDE_BIN",
             "/definitely/not/here-claude",
         )]);
         assert_eq!(
@@ -658,7 +658,7 @@ mod tests {
         // **空串覆盖 = 显式禁用**（不回落 PATH）——评审 g1：这条洞曾让「禁用」变成「回落」。
         let disabled = fake_env(&[
             ("PATH", fake.to_str().expect("path")),
-            ("BUZZ_AGENT_DELEGATE_CLAUDE_BIN", "   "),
+            ("ABB_AGENT_DELEGATE_CLAUDE_BIN", "   "),
         ]);
         assert_eq!(
             delegate_cli_path(DelegateBackend::Claude, &disabled),
@@ -670,11 +670,11 @@ mod tests {
         let none = fake_env(&[
             ("PATH", "/nonexistent-dir-for-probe"),
             (
-                "BUZZ_AGENT_DELEGATE_CLAUDE_BIN",
+                "ABB_AGENT_DELEGATE_CLAUDE_BIN",
                 "/definitely/not/here-claude",
             ),
             (
-                "BUZZ_AGENT_DELEGATE_CODEX_BIN",
+                "ABB_AGENT_DELEGATE_CODEX_BIN",
                 "/definitely/not/here-codex",
             ),
         ]);

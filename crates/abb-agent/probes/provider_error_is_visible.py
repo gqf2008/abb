@@ -41,7 +41,7 @@ threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 env = dict(os.environ)
 env.update({
-    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ABB_AGENT_PROVIDER": "anthropic",
     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
     "ANTHROPIC_API_KEY": "sk-invalid-probe",
     "ANTHROPIC_MODEL": "claude-haiku-4-5",  # 顺带验证 ANTHROPIC_MODEL 生效

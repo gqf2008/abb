@@ -142,7 +142,7 @@ def run_turn(workspace, restricted):
     before = len(jev_mode.get("bodies", []))
     env = dict(os.environ)
     env.update({
-        "BUZZ_AGENT_PROVIDER": "anthropic",
+        "ABB_AGENT_PROVIDER": "anthropic",
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{LLM_PORT}",
         "ANTHROPIC_MODEL": "probe-model",
         "ANTHROPIC_API_KEY": "sk-probe",

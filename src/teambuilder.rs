@@ -8,7 +8,7 @@
 //! 1. 团队方案数据模型 + schema 校验（字段完整 / 角色数 2-10 / 重名拦截 /
 //!    成员不重复分配 / prompt 长度对齐群介绍限制）
 //! 2. 组建方法论提示词 + 内置 3 份起手式模板（软件产品 / 自媒体 / OPC）
-//! 3. LLM 生成链路（单后端化 P3.4）：`buzz::oneshot::oneshot_turn` 一次性同步
+//! 3. LLM 生成链路（单后端化 P3.4）：`runtime::oneshot::oneshot_turn` 一次性同步
 //!    回合（随包 abb-agent，与聊天同一执行层），强制 JSON 解析 + schema
 //!    校验——**校验失败提示重试/手动编辑，不直接建群**
 //!    （非确定性兜底，与需求「先预览确认再执行创建」一致）
@@ -223,7 +223,7 @@ pub async fn generate_team_plan(
 /// 模板/prompt 拼装 → oneshot 回合（120s 预算，与旧 CLI 版同口径）→ JSON 提取 +
 /// schema 校验（失败附原始输出片段——oneshot 无 stderr 概念，不再附 stderr）。
 async fn generate_team_plan_with(
-    agent_cfg: crate::buzz::harness::AgentConfig,
+    agent_cfg: crate::runtime::harness::AgentConfig,
     workspace: std::path::PathBuf,
     goal: &str,
     members: &[String],
@@ -234,14 +234,14 @@ async fn generate_team_plan_with(
     }
     let template = resolve_template(template_name);
     let prompt = build_generation_prompt(&template, goal, members);
-    let msg = crate::buzz::queue::InboundMsg {
+    let msg = crate::runtime::queue::InboundMsg {
         id_hex: uuid::Uuid::new_v4().to_string(),
         author_role: crate::config::SenderRole::Owner.as_str().to_string(),
         text: prompt,
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "team_plan".to_string(),
     };
-    let text = match crate::buzz::oneshot::oneshot_turn(
+    let text = match crate::runtime::oneshot::oneshot_turn(
         agent_cfg,
         Some(workspace.display().to_string()),
         msg,
@@ -250,15 +250,15 @@ async fn generate_team_plan_with(
     )
     .await
     {
-        crate::buzz::harness::SyncTurnOutcome::Ok(text) => text,
-        crate::buzz::harness::SyncTurnOutcome::Timeout => {
+        crate::runtime::harness::SyncTurnOutcome::Ok(text) => text,
+        crate::runtime::harness::SyncTurnOutcome::Timeout => {
             return Err("团队方案生成超时（120s）。请重试或改短目标。".to_string());
         }
-        crate::buzz::harness::SyncTurnOutcome::Closed => {
+        crate::runtime::harness::SyncTurnOutcome::Closed => {
             return Err("agent 不可用（会话未建起）".to_string());
         }
-        crate::buzz::harness::SyncTurnOutcome::Failed(reason) => return Err(reason),
-        crate::buzz::harness::SyncTurnOutcome::Cancelled => {
+        crate::runtime::harness::SyncTurnOutcome::Failed(reason) => return Err(reason),
+        crate::runtime::harness::SyncTurnOutcome::Cancelled => {
             return Err("生成已中断".to_string());
         }
     };
@@ -422,18 +422,18 @@ mod tests {
 
     // ── P3.4 mock 全链路：oneshot 回合 → JSON 提取 → schema 校验 ──
 
-    /// 与 buzz/oneshot.rs 测试同款的 mock 装配（python3 + tests/mock_acp_agent.py），
+    /// 与 runtime/oneshot.rs 测试同款的 mock 装配（python3 + tests/mock_acp_agent.py），
     /// MOCK_RESPOND_JSON 臂：session/prompt 不 echo，以 env 值作助手文本原样应答。
     fn mock_agent_cfg(
         record_file: &std::path::Path,
         respond_json: &str,
-    ) -> crate::buzz::harness::AgentConfig {
+    ) -> crate::runtime::harness::AgentConfig {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
-        crate::buzz::harness::AgentConfig {
+        crate::runtime::harness::AgentConfig {
             command: python3,
             args: vec![script.display().to_string()],
             extra_env: vec![

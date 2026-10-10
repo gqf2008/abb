@@ -1,5 +1,7 @@
 # ABB 任务模型（复盘 + 重新设计）
 
+> 注：本文是当时的**历史记录**；文中 `crates/buzz-agent/**` 路径对应的自维护 fork 已在 0685e66 删除，行号仅对当时版本有效。
+
 > 状态：**定稿 v3（P0 已完成）**。设计已评审收口、关键决策已拍板；**实现按 #326 批次推进**，
 > 本文描述「设计」，某条是否已落地以 #326 的 checklist 与代码为准（**不出现「文档说做了、代码没做」**）。
 > 关联：#326（落地批次）· #307（复盘 issue，已关）· #305（常驻进程托管）· #306（后台子代理）·
@@ -50,14 +52,14 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 - `chat_lock()`（`src/bridge/mod.rs:326`，字段 `:84`）在生产路径只覆盖**组装 prompt + push 进 harness**；push 成功后函数就返回（`src/bridge/virtualbot.rs:703-706` 起），**锁不覆盖整个 agent 回合**。
 - 真正的单频道串行是两层：
-  1. **per-channel in-flight 队列**：`src/buzz/queue.rs`——队列层支持不同频道各自积压/公平选择，但**当前单 slot harness 下，同一 handle 最终仍是全局串行**（真并行要么 B1 独立 handle，要么 B2 多 slot）；
-  2. **每个 handle 的单 slot 懒池**：`let pool = AgentPool::from_slots(vec![None]);`（`src/buzz/harness.rs:413-416`）。
+  1. **per-channel in-flight 队列**：`src/runtime/queue.rs`——队列层支持不同频道各自积压/公平选择，但**当前单 slot harness 下，同一 handle 最终仍是全局串行**（真并行要么 B1 独立 handle，要么 B2 多 slot）；
+  2. **每个 handle 的单 slot 懒池**：`let pool = AgentPool::from_slots(vec![None]);`（`src/runtime/harness.rs:413-416`）。
 - **`run_job` 不取 chat_lock**，直接用 `channel_uuid(bot_key, job.chat_id)`（`src/service.rs:1341`）——**和聊天是同一个 channel**，于是两者在同一个 slot 池里排队。
 - 调度侧防重入按 **`job.id`** 键控（`src/service.rs`），不是按 chat：同 chat 的多个 job 可以同时到点被 spawn。但它们**不再并发进入 harness**——`run_job` 全程持 `Bridge::job_gate(chat_id)`（#321 定的「同 chat 单飞串行」，见 B 节），后到的 job 在闸上排队。
 
 **B. 同 channel 的等待者只有一个 ⇒ 同 chat 的 job 单飞串行**
 
-`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/buzz/harness.rs`）：同一 channel 上多个等待者会**互相顶掉**（后登记者接管，前者拿到 `Closed`）；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递。
+`wait_turn_outcome` 的同步 waiter 是**每 channel 一个**（#309 前叫 `wait_turn_text`，已删）（`src/runtime/harness.rs`）：同一 channel 上多个等待者会**互相顶掉**（后登记者接管，前者拿到 `Closed`）；普通聊天回合结束时若该 channel 有 waiter，回合文本会先送给 waiter 而不是正常投递。
 
 **已定语义（#321，2026-09-15 拍板）：同 chat 多 job = 单飞串行（single-flight serial）**，不允许第二条 job 顶掉第一条的 waiter。落点在**生产者侧**，不改 harness 的 waiter 表：
 
@@ -72,7 +74,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 **C. 会话上下文挂在哪**
 
-- ACP 侧的真实状态是 `AgentPool::SessionState`，键是 **channel UUID**（`src/buzz/pool.rs:82-95`：`sessions: HashMap<Uuid, String>`）。
+- ACP 侧的真实状态是 `AgentPool::SessionState`，键是 **channel UUID**（`src/runtime/pool.rs:82-95`：`sessions: HashMap<Uuid, String>`）。
 - `sessions.json` 是 `{chat_id: {session_id, started, sandbox_mode?}}`（`src/sessions.rs:3`），属于 ABB 侧镜像。
 - **只改 `sessions.json` 的 key 不会改变 ACP 的 channel→session 映射**——v1 的 D1 就错在这。
 
@@ -80,7 +82,7 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 - `run_job` 注册了 `_cancel_flag`（`src/service.rs:1321`），但**从未把它传给 ACP 等待路径**；而且紧邻的注释自相矛盾（`:1316-1320` 先说「共用同一 key」，又说「不再注册」）。
 - 停止词处理只是置位 AtomicBool 后立即 return（`src/bridge/virtualbot.rs:358-364`），**因此反而不会走到真正的 cancel**。
-- 真正能取消 ACP 回合的是 `buzz_cancel_reply` → `handle.cancel(channel_id)`（`src/bridge/virtualbot.rs:1180-1215`）。
+- 真正能取消 ACP 回合的是 `cancel_reply` → `handle.cancel(channel_id)`（`src/bridge/virtualbot.rs:1180-1215`）。
 - ⇒ **复盘时 job 不能可靠被停止词打断**；这是当时的实际缺陷、不只是设计问题，当时单开了 **#309**。
   **该缺陷已修**（harness 取消终态 → job 接线 → queued 取消三批合入，见 **#309**）；此处保留原文
   是为记录「为什么 task 必须走真实 cancel token」，不代表今天的现状。
@@ -109,8 +111,8 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 **I. 进程终止与孤儿清理**
 
-- Unix：`process_group(0)` + `killpg`（`src/buzz/acp.rs:381-382`、`:1947-1955`）。
-- **Windows：没有 Job Object 实现**，非 Unix 分支只 `start_kill()` 杀直接子进程（`src/buzz/acp.rs:1958-1963`）。#158 是历史方案，**当前代码里没有**。
+- Unix：`process_group(0)` + `killpg`（`src/runtime/acp.rs:381-382`、`:1947-1955`）。
+- **Windows：没有 Job Object 实现**，非 Unix 分支只 `start_kill()` 杀直接子进程（`src/runtime/acp.rs:1958-1963`）。#158 是历史方案，**当前代码里没有**。
 - `agent-pids.json` 是 **legacy 只读**（写端已随 spawn 退役，`src/agent.rs:446-452`），且清理只认 claude/codex/pi 的命令行（`:477-490`）——**不能拿来托管任意 proc 任务**。
 
 ### 1.3 复盘结论：8 个结构性问题
@@ -196,12 +198,12 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 
 v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
-**D1a 独立 channel**：task 使用独立 channel UUID（例如由 `channel_uuid(bot, "task:<id>")` 派生），并显式定义对应的 `ChannelMeta`（workspace / cwd / 指令作用域）。在**当前共享 handle** 的模型下，独立 channel 是隔离 ACP session（`src/buzz/pool.rs:82-95`）的必要手段（走 B1 独立 handle 也能达到同样隔离）。
+**D1a 独立 channel**：task 使用独立 channel UUID（例如由 `channel_uuid(bot, "task:<id>")` 派生），并显式定义对应的 `ChannelMeta`（workspace / cwd / 指令作用域）。在**当前共享 handle** 的模型下，独立 channel 是隔离 ACP session（`src/runtime/pool.rs:82-95`）的必要手段（走 B1 独立 handle 也能达到同样隔离）。
 
-- ⚠️ **必须设 `adhoc: true`（或等价加入巡检登记）**：harness 频道巡检会删掉「不在 `sync_roots` 中且非 adhoc」的根频道（`src/buzz/harness.rs` 的 `Cmd::SyncRoots`，`:530` 起）。现有 `run_job` 正是这么做的（`src/service.rs:1353-1370` 的 `ChannelMeta { …, adhoc: true }`）。漏了这步，task channel 会在下次巡检被排空队列 / 失效 session。
+- ⚠️ **必须设 `adhoc: true`（或等价加入巡检登记）**：harness 频道巡检会删掉「不在 `sync_roots` 中且非 adhoc」的根频道（`src/runtime/harness.rs` 的 `Cmd::SyncRoots`，`:530` 起）。现有 `run_job` 正是这么做的（`src/service.rs:1353-1370` 的 `ChannelMeta { …, adhoc: true }`）。漏了这步，task channel 会在下次巡检被排空队列 / 失效 session。
 - task channel 的 UUID 命名空间不要与普通聊天 channel 混用——正式实现建议新增独立的 `task_channel_uuid()`（而不是直接复用 `keys.rs` 的聊天命名空间）。
 
-**D1b 独立执行容量**：当前每个 handle 是单 slot（`src/buzz/harness.rs:413-416`），且 task 与聊天会分到不同 channel 但**仍共享同一个 handle**。所以「不占线」与「同会话并发多个子代理」（#306 验收）在单 slot 下**不可能成立**。两个可选方案：
+**D1b 独立执行容量**：当前每个 handle 是单 slot（`src/runtime/harness.rs:413-416`），且 task 与聊天会分到不同 channel 但**仍共享同一个 handle**。所以「不占线」与「同会话并发多个子代理」（#306 验收）在单 slot 下**不可能成立**。两个可选方案：
 
 - **B1**：给 task 独立 handle / 独立 pool（聊天与 task 各一套）——改动小、语义清晰，但每套都是进程与内存开销；
 - **B2**：把 harness 扩成多 slot 池——更省资源，但动的是共享执行层，回归面大。
@@ -210,7 +212,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 **D1c 取消**：**不复用 `cancel_flags`**（§1.2 D 已证其失效），改用 `harness.cancel(task_channel)` / 每 task 独立 `CancellationToken`。
 
-但 `handle.cancel(channel_id)` **只作用于 in-flight 那一轮**——排队中的消息不在取消范围（`src/bridge/virtualbot.rs:1185-1193` 注释明说；实现见 `src/buzz/harness.rs:526-529` `signal_in_flight_task`）。后台 task 若因单 slot 排在聊天之后，`task cancel` 会回「没有在跑任务」，而它稍后仍会执行。取消语义必须按状态分别定义：
+但 `handle.cancel(channel_id)` **只作用于 in-flight 那一轮**——排队中的消息不在取消范围（`src/bridge/virtualbot.rs:1185-1193` 注释明说；实现见 `src/runtime/harness.rs:526-529` `signal_in_flight_task`）。后台 task 若因单 slot 排在聊天之后，`task cancel` 会回「没有在跑任务」，而它稍后仍会执行。取消语义必须按状态分别定义：
 
 | task 状态 | 取消动作 |
 |---|---|
@@ -221,7 +223,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 同时在会话内提供显式的 `task cancel <id>`（见 Q3）。
 
-**已落地（#306，2026-09-15）**：`task` 走的是 `buzz::oneshot`（自起独立 handle + 独立
+**已落地（#306，2026-09-15）**：`task` 走的是 `runtime::oneshot`（自起独立 handle + 独立
 频道，不是聊天 channel），所以上表里的 `queued` 行退化成「任务还在 `next_pending` 待
 认领」——实现比原设想简单：
 
@@ -290,7 +292,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 
 #### D5 进程生命周期（需要真正的 supervisor，不能复用 legacy）
 
-- **Windows 目前没有 Job Object**（`src/buzz/acp.rs:1958-1963` 只杀直接子进程）。Q15 已拍板以真做 Job Object 为目标；真机验收通过前，Windows 上 `task add --proc` **显式非零拒绝**，不静默降级、不假装支持。
+- **Windows 目前没有 Job Object**（`src/runtime/acp.rs:1958-1963` 只杀直接子进程）。Q15 已拍板以真做 Job Object 为目标；真机验收通过前，Windows 上 `task add --proc` **显式非零拒绝**，不静默降级、不假装支持。
 - `agent-pids.json` 是 legacy 只读且只认 claude/codex/pi 命令行，**不能复用**（`src/agent.rs:446-452`、`:477-490`）。
 - 停止语义已拍板：默认 10s 宽限（`limits.grace_secs` 可逐任务覆盖）→ SIGKILL，并**对进程组 / Job Object 整体发信号**；仍需落地退出码回收与 ABB 崩溃后下次启动的清理（**Unix 上父进程被 SIGKILL 不会自动带走独立进程组**）。
 - 防自杀：#164 是动机，但现有保障只是 prompt 护栏（`src/agents_md.rs:107-114`）+ 恢复次数冻结（`src/bridge/recover.rs:6-10`、`:137-160`），**不是进程级边界**。
@@ -515,10 +517,10 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 |---|---|
 | per-chat 锁字段 / 取锁 | `src/bridge/mod.rs:84`、`chat_lock():326` |
 | 锁只覆盖 push（生产路径） | `src/bridge/virtualbot.rs:703` 附近 |
-| per-channel in-flight 队列 | `src/buzz/queue.rs`（模块头注释） |
-| 单 slot 懒池 | `src/buzz/harness.rs:413`（`from_slots(vec![None])`）、`:732` 附近 |
-| 每 channel 单个同步 waiter | `src/buzz/harness.rs:287`、`:1036` |
-| ACP 会话状态（channel UUID 键控） | `src/buzz/pool.rs:82`（`SessionState.sessions`） |
+| per-channel in-flight 队列 | `src/runtime/queue.rs`（模块头注释） |
+| 单 slot 懒池 | `src/runtime/harness.rs:413`（`from_slots(vec![None])`）、`:732` 附近 |
+| 每 channel 单个同步 waiter | `src/runtime/harness.rs:287`、`:1036` |
+| ACP 会话状态（channel UUID 键控） | `src/runtime/pool.rs:82`（`SessionState.sessions`） |
 | ABB 侧会话镜像 | `src/sessions.rs:3` |
 | 定时任务定义 / 存储 / 热重载 | `src/schedule.rs:24`（`JobTarget`）、`:31`（`Job`）、`:56`（mtime）、`:80`（refresh） |
 | 定时任务执行 | `src/service.rs:1285 run_job`（channel 见 `:1341`） |
@@ -530,6 +532,6 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | 桥状态文件写保护 | `src/guard.rs:359` |
 | service 后台任务治理 | `src/tasks.rs:1` |
 | 待处理恢复语义 | `src/pending.rs:10` |
-| 进程组 / killpg（Unix） | `src/buzz/acp.rs:381`、`:1947` |
-| 非 Unix 只杀直接子进程 | `src/buzz/acp.rs:1958` |
+| 进程组 / killpg（Unix） | `src/runtime/acp.rs:381`、`:1947` |
+| 非 Unix 只杀直接子进程 | `src/runtime/acp.rs:1958` |
 | legacy agent-pids（只读） | `src/agent.rs:446`、`:477` |

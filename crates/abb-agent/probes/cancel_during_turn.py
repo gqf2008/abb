@@ -45,7 +45,7 @@ threading.Thread(target=accept_loop, daemon=True).start()
 
 env = dict(os.environ)
 env.update({
-    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ABB_AGENT_PROVIDER": "anthropic",
     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{BLACKHOLE_PORT}",
     "ANTHROPIC_API_KEY": "dummy-key-for-blackhole",
     # 必填：abb 未配置模型时不注入 ANTHROPIC_MODEL，而 abb-agent 按被替代 fork 的语义

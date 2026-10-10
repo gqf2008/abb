@@ -126,7 +126,7 @@ def run_turn(workspace, restricted, read_path):
     tool_name["args"] = {"path": read_path}
     env = dict(os.environ)
     env.update({
-        "BUZZ_AGENT_PROVIDER": "anthropic",
+        "ABB_AGENT_PROVIDER": "anthropic",
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
         "ANTHROPIC_MODEL": "probe-model",
         "ANTHROPIC_API_KEY": "sk-probe",
@@ -213,7 +213,7 @@ tool_name["name"] = "dev__read"
 tool_name["args"] = {"path": "whatever.txt"}
 env = dict(os.environ)
 env.update({
-    "BUZZ_AGENT_PROVIDER": "anthropic",
+    "ABB_AGENT_PROVIDER": "anthropic",
     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
     "ANTHROPIC_MODEL": "probe-model",
     "ANTHROPIC_API_KEY": "sk-probe",

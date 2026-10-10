@@ -1,4 +1,4 @@
-//! 频道 uuid 派生（从原 `buzzrelay.rs` 抽取，随 relay 删除迁移至此）。
+//! 频道 uuid 派生（从原 relay 模块抽取，随 relay 删除迁移至此）。
 //!
 //! 命名空间与算法**不得改动**：频道 uuid 是确定性映射（bot_key, chat_id[, thread]）
 //! ↔ uuid 的单一事实来源，历史话题路由、消息锚点、会话键控全部依赖它。新增
@@ -42,14 +42,14 @@ pub fn channel_uuid(bot_key: &str, chat_id: &str) -> String {
 
 /// #206 话题隔离：话题频道 uuid——命名空间在群根基础上加 thread 段
 ///（群根 uuid 算法不动：存量频道映射/话题路由全部不失效）。
-/// 「话题 = 独立 buzz 频道」而非「同频道 + 话题 tag」：会话/队列/轮次
+/// 「话题 = 独立频道」而非「同频道 + 话题 tag」：会话/队列/轮次
 /// 全按 channel_id 键控，频道方案根治同群话题串线，回复路由
 ///（#h → 话题频道 → chat+thread）自动正确。不同话题/不同 bot 互异。
 pub fn topic_channel_uuid(bot_key: &str, chat_id: &str, thread_id: &str) -> String {
     fnv128_uuid(&format!("abb-relay:{bot_key}:{chat_id}:thread:{thread_id}"))
 }
 
-/// 该字符串是否「形如 buzz 频道 UUID」——即 [`channel_uuid`] 的产物形态（canonical uuid）。
+/// 该字符串是否「形如 历史频道 UUID」——即 [`channel_uuid`] 的产物形态（canonical uuid）。
 ///
 /// 用途（投递侧硬闸）：真实平台的会话 id（飞书 `oc_…`/`ou_…`、微信 `wxid…`/`o9cq…`、
 /// 钉钉 `cid…`）**都不是**裸 UUID；而 `AGENT_BRIDGE_CHAT_ID` 这类跨进程注入值在 ACP

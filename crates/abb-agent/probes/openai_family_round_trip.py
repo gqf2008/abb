@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """验证 openai 家族端到端可用（abb 把 openai-chat/openrouter/deepseek 归并成
-`BUZZ_AGENT_PROVIDER=openai`；本机 config 就是 `openai-chat` + `deepseek-flash`）。
+`ABB_AGENT_PROVIDER=openai`；本机 config 就是 `openai-chat` + `deepseek-flash`）。
 
 做法：起一个假网关，记录请求（URL / 鉴权头 / model），并回一段最小可用的
 OpenAI chat-completions SSE。断言：
@@ -62,7 +62,7 @@ threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 env = dict(os.environ)
 env.update({
-    "BUZZ_AGENT_PROVIDER": "openai",
+    "ABB_AGENT_PROVIDER": "openai",
     "OPENAI_COMPAT_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
     "OPENAI_COMPAT_MODEL": "vendor-native-id-v9",   # 刻意用不在任何内置目录里的 id
     "OPENAI_COMPAT_API_KEY": "sk-probe-gateway-key",

@@ -1,13 +1,13 @@
-//! 约定链（`AGENTS.md` 逐级加载）与 `BUZZ_AGENT_NO_HINTS` 硬前置。
+//! 约定链（`AGENTS.md` 逐级加载）与 `ABB_AGENT_NO_HINTS` 硬前置。
 //!
-//! 语义与上限**逐条对齐**被替代的 `crates/buzz-agent/src/hints.rs`：这是「同一份用户约定，
+//! 语义与上限**逐条对齐**被替代的 `参照物 hints.rs`：这是「同一份用户约定，
 //! 换执行层不该换行为」的载体——链路顺序、全局层位置、128 KiB 上限、UTF-8 安全截断都一样。
 //!
-//! ## 为什么必须同时认 `BUZZ_AGENT_NO_HINTS`
+//! ## 为什么必须同时认 `ABB_AGENT_NO_HINTS`
 //!
 //! abb 对**授权者（granted）**会话只能**在进程级**收口这件事：fork 侧的 hints 发生在
 //! `session/new` 之前，per-session 的 `_meta` 管不到（`src/service.rs:180-234` 的注释写得很
-//! 明白，它给 granted 的 agent 进程多塞一个 `BUZZ_AGENT_NO_HINTS=1`）。
+//! 明白，它给 granted 的 agent 进程多塞一个 `ABB_AGENT_NO_HINTS=1`）。
 //! 本包若不认它，owner 的 `~/AGENTS.md` 与技能就会静默泄漏给授权者——所以这个变量是
 //! **硬前置**，不是可选优化。读法与语义**逐条对齐** fork 的 `parse_env(…, 0u8)? == 0`：
 //! 未设置/`0` ⇒ 开；**任何非零** ⇒ 关；读不懂 ⇒ 拒绝启动（见 [`hints_enabled_from`]）。
@@ -20,7 +20,7 @@ use crate::provider::EnvSource;
 
 /// 进程级开关：**任何非零值**都表示完全不加载约定链（授权者会话用）；
 /// 读不懂的值按参照物口径**拒绝启动**（见 [`hints_enabled_from`]）。
-pub const NO_HINTS_ENV: &str = "BUZZ_AGENT_NO_HINTS";
+pub const NO_HINTS_ENV: &str = "ABB_AGENT_NO_HINTS";
 
 /// 约定文本的字节上限（与 fork 同值）。
 const MAX_HINTS_BYTES: usize = 128 * 1024;
@@ -28,9 +28,9 @@ const MAX_HINTS_BYTES: usize = 128 * 1024;
 /// 相对会话工作目录的约定文件名。
 const HINTS_FILE: &str = "AGENTS.md";
 
-/// `BUZZ_AGENT_NO_HINTS` 的读法：**逐条对齐 fork**。
+/// `ABB_AGENT_NO_HINTS` 的读法：**逐条对齐 fork**。
 ///
-/// fork 是 `parse_env("BUZZ_AGENT_NO_HINTS", 0u8)? == 0`，而 `parse_env` 用 `str::parse`
+/// fork 是 `parse_env("ABB_AGENT_NO_HINTS", 0u8)? == 0`，而 `parse_env` 用 `str::parse`
 /// 且**不 trim**；读不懂的值在 `Config::from_env()` 里被 `die()`（= `exit(2)`）。
 /// 也就是：「未设置 / `0` ⇒ 开；任何**非零**（`1`/`2`/`01`/`+1`/` 1 `）⇒ 关；读不懂 ⇒ 响亮失败」。
 ///

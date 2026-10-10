@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""端到端：约定链真的进了模型请求，且 `BUZZ_AGENT_NO_HINTS=1` 真的把它关掉。
+"""端到端：约定链真的进了模型请求，且 `ABB_AGENT_NO_HINTS=1` 真的把它关掉。
 
 为什么这条必须有：abb 对**授权者（granted）**会话只能在**进程级**收口约定链
 （fork 的 hints 发生在 `session/new` 之前，per-session `_meta` 管不到 —— 见
-`src/service.rs:180-234`，它给 granted 的 agent 进程多塞一个 `BUZZ_AGENT_NO_HINTS=1`）。
+`src/service.rs:180-234`，它给 granted 的 agent 进程多塞一个 `ABB_AGENT_NO_HINTS=1`）。
 所以 abb-agent 不认这个变量 = **owner 的 `~/AGENTS.md` 会静默泄漏给授权者**。
 判据是**假 anthropic 端点收到的请求体里的 `system` 字段**，不是读代码。
 
 六个场景（每个场景起一份真二进制进程；HOME/`USERPROFILE` 与会话目录都隔离）：
 1. 默认：会话 cwd 的 `AGENTS.md` + `$HOME/AGENTS.md`（全局层）都必须出现在 `system` 里；
-2. `BUZZ_AGENT_NO_HINTS=1`：两个标记都**不得**出现（且默认系统提示仍在——是关约定链，
+2. `ABB_AGENT_NO_HINTS=1`：两个标记都**不得**出现（且默认系统提示仍在——是关约定链，
    不是把提示也弄丢）；
 3. 没有任何 `AGENTS.md`：`system` 就是默认提示，不出现空标题之类的噪声；
-4. `BUZZ_AGENT_NO_HINTS=2`：也判为**关闭**（参照物是 `parse::<u8>()` + 非零即关）；
+4. `ABB_AGENT_NO_HINTS=2`：也判为**关闭**（参照物是 `parse::<u8>()` + 非零即关）；
 5. `true`/`yes`/`-1`/`256`/`" 1 "` 这类读不懂的取值：进程**不发任何模型请求**且以 **2** 退出
    （与参照物 `die()` 同款）——这是「不能静默 fail-open」的端到端证据；
 6. 空 cwd + 进程 cwd 位于 git 子目录（根与 cwd 各一份 `AGENTS.md`）：只许读到 cwd 那一层，
@@ -107,7 +107,7 @@ def run_turn(cwd, home, extra_env):
     before = len(bodies)
     env = dict(os.environ)
     env.update({
-        "BUZZ_AGENT_PROVIDER": "anthropic",
+        "ABB_AGENT_PROVIDER": "anthropic",
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
         "ANTHROPIC_MODEL": "probe-model",
         "ANTHROPIC_API_KEY": "sk-probe",
@@ -200,8 +200,8 @@ else:
           "abb 未下发 systemPrompt 时应回落默认提示")
 
 print()
-print("=== 场景 2：BUZZ_AGENT_NO_HINTS=1（granted 会话的收口）===")
-body = run_turn(make_cwd(True), make_home(True), {"BUZZ_AGENT_NO_HINTS": "1"})
+print("=== 场景 2：ABB_AGENT_NO_HINTS=1（granted 会话的收口）===")
+body = run_turn(make_cwd(True), make_home(True), {"ABB_AGENT_NO_HINTS": "1"})
 if not body:
     check("回合请求到达假端点", False)
 else:
@@ -224,7 +224,7 @@ else:
 
 print()
 print("=== 场景 4：读法对齐 fork（非零即关）===")
-body = run_turn(make_cwd(True), make_home(True), {"BUZZ_AGENT_NO_HINTS": "2"})
+body = run_turn(make_cwd(True), make_home(True), {"ABB_AGENT_NO_HINTS": "2"})
 if not body:
     check("回合请求到达假端点", False)
 else:
@@ -236,7 +236,7 @@ else:
 print()
 print("=== 场景 5：读不懂的取值必须响亮失败（不能静默当「没关」）===")
 for bad in ("true", "yes", "-1", "256", " 1 "):
-    body = run_turn(make_cwd(True), make_home(True), {"BUZZ_AGENT_NO_HINTS": bad})
+    body = run_turn(make_cwd(True), make_home(True), {"ABB_AGENT_NO_HINTS": bad})
     check(f"NO_HINTS={bad!r} 时不发任何模型请求（约定不可能外泄）", body is None)
     check(f"NO_HINTS={bad!r} 时进程以 2 退出（与 fork 的 die() 同款）",
           rc["last"] == 2, f"rc={rc['last']}")

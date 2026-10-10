@@ -84,7 +84,7 @@ def base_env():
         "ABB_AGENT_FAUX_TEXT": "离线收尾文本",
         "ANTHROPIC_API_KEY": SECRET,          # 生产路径真会注入的凭据
         "ANTHROPIC_MODEL": "probe-model",
-        "BUZZ_AGENT_PROVIDER": "anthropic",
+        "ABB_AGENT_PROVIDER": "anthropic",
         "RUST_LOG": "info",
     })
     return env

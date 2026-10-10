@@ -32,7 +32,7 @@ fn guard_dir_at(bridge_root: &Path, bot_key: &str) -> PathBuf {
 /// 受限 claude spawn 时 `--settings` 指向的 settings.json 绝对路径。
 // P4.1：claude spawn 已删——本函数与其余 guard 文件生成器（owner_guard_settings_path/
 // ensure_guard_files/ensure_owner_guard_files 及 *_at 内层）同为 claude-only 死代码；
-// 删除保护已由 buzz harness 受限档（P2.2/P2.3 `_meta` 沙箱）取代。保留源供测试锚定，
+// 删除保护已由 runtime 受限档（P2.2/P2.3 `_meta` 沙箱）取代。保留源供测试锚定，
 // 后续清理批次连同测试一并删除。guard_check_main 分发路径不在此列（仍可能经旧 hook 被调）。
 #[allow(dead_code)]
 pub fn guard_settings_path(bot_key: &str) -> PathBuf {

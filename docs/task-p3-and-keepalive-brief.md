@@ -1,5 +1,7 @@
 # P3 `proc` supervisor 与 keepalive：拍板决策简报
 
+> 注：本文是当时的**历史记录**；文中 `crates/buzz-agent/**` 路径对应的自维护 fork 已在 0685e66 删除，行号仅对当时版本有效。
+
 > **基线**：`origin/main@1850e38`（2026-09-17；复审时已按独立审查意见把引用行号校到该 commit）。本文只冻结决策，不改源码。下文所有 `文件:行号` 都以该 commit 为准；rebase 后必须重新核对行号。
 > **关联**：`docs/task-model.md`（权威任务模型，§2.3 D5/D6、§2.4 阶段表、§4 决策表）、#326（批次 issue）、#305（常驻进程）、#306（后台子任务）。
 > **阅读方式**：每个 Q 都是「问题 → 现状（可指到行）→ 选项（含代价）→ 推荐 → 验收标准」。验收标准全部是命令/断言级，不接受「体验更好」这类措辞。
@@ -182,9 +184,9 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 | 事实 | 位置 |
 |---|---|
-| Unix：子进程 `process_group(0)`，pid == pgid | `src/buzz/acp.rs:378-382` |
-| Unix：整组 `killpg(SIGKILL)` | `src/buzz/acp.rs:1941-1956`（`kill_process_group`，#[cfg(unix)]） |
-| **非 Unix：直接返回 `false` → 退回只杀直接子进程** | `src/buzz/acp.rs:1958-1963`（`#[cfg(not(unix))] fn kill_process_group(_pid) -> bool { false }`） |
+| Unix：子进程 `process_group(0)`，pid == pgid | `src/runtime/acp.rs:378-382` |
+| Unix：整组 `killpg(SIGKILL)` | `src/runtime/acp.rs:1941-1956`（`kill_process_group`，#[cfg(unix)]） |
+| **非 Unix：直接返回 `false` → 退回只杀直接子进程** | `src/runtime/acp.rs:1958-1963`（`#[cfg(not(unix))] fn kill_process_group(_pid) -> bool { false }`） |
 | 全仓**无** `JobObject` / `CreateJobObject` 命中 | `grep -rn "JobObject\|CreateJobObject" src/ crates/` → 0 命中 |
 | Windows 上停止只做单 pid 强杀 | `src/install.rs:204-212`（`taskkill /PID <pid> /F`） |
 | Windows 上清理残留 agent 同样是单 pid | `src/agent.rs:570-574`（`taskkill /PID ... /F`） |
@@ -193,7 +195,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 **四条具体缺口**：
 
-1. **孙进程孤儿**：`proc` spawn 的进程再 spawn 子进程时，杀父进程不会带走孙子进程。Unix 靠 `process_group(0)` + `killpg` 覆盖（`src/buzz/acp.rs:378-382`、`:1941-1956`）；Windows 没有任何归属机制。
+1. **孙进程孤儿**：`proc` spawn 的进程再 spawn 子进程时，杀父进程不会带走孙子进程。Unix 靠 `process_group(0)` + `killpg` 覆盖（`src/runtime/acp.rs:378-382`、`:1941-1956`）；Windows 没有任何归属机制。
 2. **超时杀不干净**：`taskkill /PID /F` 只杀一个 pid（`src/install.rs:204-212`），timeout 到期后进程树其余部分继续跑。
 3. **无进程组归属**：Windows 无 POSIX pgid。`taskkill /T` 能按 pid 树杀，但依赖 pid 仍存活且树在遍历期间不变；Job Object 是内核级归属，从句柄层面保证"关掉即全杀"。
 4. **无优雅退出语义**：`src/install.rs:204-205` 明确丢弃 `grace`。Windows 没有 SIGTERM，只有 `GenerateConsoleCtrlEvent` / `WM_CLOSE` / `TerminateProcess`，语义与 Unix 不等价。
@@ -211,7 +213,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 
 **Q15 选 A 作为目标实现，并在 A 完成前用 D 兜底。**
 
-- B1 在 Unix 上直接开工（pgid 语义已存在，`src/buzz/acp.rs:1941-1956` 可参考）；Windows 上只实现 D 兜底。
+- B1 在 Unix 上直接开工（pgid 语义已存在，`src/runtime/acp.rs:1941-1956` 可参考）；Windows 上只实现 D 兜底。
 - Windows Job Object 归独立的 **B1b**；真机验收通过前，`task add --proc` 在 Windows 上显式拒绝（D），而不是退回 C 假装支持。
 - B 仅作为 Job Object 不可用（如嵌套 Job 限制无法绕过）时的**降级 fallback**，且必须在驳回时明确告知用户"孙进程可能残留"。
 
@@ -222,7 +224,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 **B1（本批：Unix pgid + Windows D 兜底）**
 
 - [ ] **Windows 不静默降级**：Job Object 未接入时，`agent-bridge task add --proc ...` 返回非 0 并打印明确原因，**不**创建任务。
-- [ ] **Unix 回归**：`killpg` 覆盖孙进程的现有用例保持通过（`src/buzz/acp.rs:1941-1956` 附近）。
+- [ ] **Unix 回归**：`killpg` 覆盖孙进程的现有用例保持通过（`src/runtime/acp.rs:1941-1956` 附近）。
 
 **B1b Windows Job Object（独立批次）**
 
@@ -247,7 +249,7 @@ ABB 因升级、看门狗重启、崩溃而重启后，登记过的 keepalive �
 | SIGKILL 前**复查存活**（防 pid 复用误杀） | `src/install.rs:192-198` |
 | Windows 分支**无宽限**，直接 `taskkill /F` | `src/install.rs:204-212` |
 | 只对**单个 pid** 发信号，非进程组 | `src/install.rs:178-212`（只有 `pid: u32`） |
-| ACP 子进程只发 **SIGKILL 整组**，无 SIGTERM 前置 | `src/buzz/acp.rs:1941-1956` |
+| ACP 子进程只发 **SIGKILL 整组**，无 SIGTERM 前置 | `src/runtime/acp.rs:1941-1956` |
 | 取消请求方向：CLI 写请求文件、service 消费 | `src/task_run.rs:536-585`（`consume_cancel_requests`；watcher 说明 `:534-535`、Running 留着不删 `:560`） |
 | 取消一律**静默收尾、不投递** | `src/task_run.rs:324-330`（`if cancelled { return; }` 及其说明） |
 | once：到期即跑，`t <= now` → **会补跑** | `src/task_run.rs:649-651` |

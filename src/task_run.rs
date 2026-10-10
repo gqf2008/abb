@@ -1,6 +1,6 @@
 //! 任务执行（#326 / `docs/task-model.md` P2b/P3 的 agent 与 proc 载荷落地）。
 //!
-//! ## 为什么直接复用 `buzz::oneshot`
+//! ## 为什么直接复用 `runtime::oneshot`
 //!
 //! Q7 拍板的是 **B1：task 用独立 handle/pool**（不与聊天共用单 slot）。`oneshot`
 //! 正好就是这件东西——自起 handle + `run_loop`，自带频道、自带取消、用完即弃：
@@ -17,7 +17,7 @@
 //!
 //! ## 载荷路径
 //!
-//! `agent` 走上面的 `buzz::oneshot`；`proc` 走 [`crate::task_proc`] 的 Unix 进程组
+//! `agent` 走上面的 `runtime::oneshot`；`proc` 走 [`crate::task_proc`] 的 Unix 进程组
 //! 超管（流式日志、退出码、超时/取消整组停止）。Windows Job Object 尚未接入，proc
 //! 在登记与执行两处显式拒绝，不静默降级。
 //!
@@ -516,7 +516,7 @@ fn short_id(id: &str) -> &str {
 pub(crate) async fn run_attempt(
     bot_key: &str,
     task: Task,
-    agent_cfg: crate::buzz::harness::AgentConfig,
+    agent_cfg: crate::runtime::harness::AgentConfig,
     workspace: String,
     router: &Arc<Router>,
     states: &TaskStateStore,
@@ -525,7 +525,7 @@ pub(crate) async fn run_attempt(
     let id = task.id.clone();
     let started = crate::chrono_lite::unix_secs();
 
-    let msg = crate::buzz::queue::InboundMsg {
+    let msg = crate::runtime::queue::InboundMsg {
         id_hex: uuid::Uuid::new_v4().to_string(),
         author_role: task.created_by.role.as_str().to_string(),
         text: task.payload.prompt.clone(),
@@ -534,7 +534,7 @@ pub(crate) async fn run_attempt(
     };
     let budget = task
         .timeout()
-        .unwrap_or(crate::buzz::harness::MAX_TURN_DURATION + Duration::from_secs(30));
+        .unwrap_or(crate::runtime::harness::MAX_TURN_DURATION + Duration::from_secs(30));
     // Q3 `task cancel`：`oneshot_turn` 的 external_cancel 只接一个令牌，所以这里做
     // 「service 关停 ∪ 用户取消请求」的合并——`child_token()` 随父（关停）取消，
     // watcher 命中取消请求时再单独 cancel 这个子令牌（不反cancel 父，关停语义不变）。
@@ -563,7 +563,7 @@ pub(crate) async fn run_attempt(
             }
         })
     };
-    let outcome = crate::buzz::oneshot::oneshot_turn(
+    let outcome = crate::runtime::oneshot::oneshot_turn(
         agent_cfg,
         Some(workspace),
         msg,
@@ -590,7 +590,7 @@ pub(crate) async fn run_attempt(
         ..Default::default()
     };
     let (rt, text) = match outcome {
-        crate::buzz::harness::SyncTurnOutcome::Ok(text) => (
+        crate::runtime::harness::SyncTurnOutcome::Ok(text) => (
             TaskRuntime {
                 kind: TaskStateKind::Succeeded,
                 last_exit_code: Some(0),
@@ -598,7 +598,7 @@ pub(crate) async fn run_attempt(
             },
             text,
         ),
-        crate::buzz::harness::SyncTurnOutcome::Cancelled => (
+        crate::runtime::harness::SyncTurnOutcome::Cancelled => (
             TaskRuntime {
                 kind: TaskStateKind::Cancelled,
                 last_error: if user_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -610,7 +610,7 @@ pub(crate) async fn run_attempt(
             },
             String::new(),
         ),
-        crate::buzz::harness::SyncTurnOutcome::Timeout => (
+        crate::runtime::harness::SyncTurnOutcome::Timeout => (
             TaskRuntime {
                 kind: TaskStateKind::Failed,
                 last_error: format!("执行超时（预算 {}s）", budget.as_secs()),
@@ -618,7 +618,7 @@ pub(crate) async fn run_attempt(
             },
             String::new(),
         ),
-        crate::buzz::harness::SyncTurnOutcome::Closed => (
+        crate::runtime::harness::SyncTurnOutcome::Closed => (
             TaskRuntime {
                 kind: TaskStateKind::Failed,
                 last_error: "agent 不可用（执行器未能拉起）".to_string(),
@@ -626,7 +626,7 @@ pub(crate) async fn run_attempt(
             },
             String::new(),
         ),
-        crate::buzz::harness::SyncTurnOutcome::Failed(reason) => (
+        crate::runtime::harness::SyncTurnOutcome::Failed(reason) => (
             TaskRuntime {
                 kind: TaskStateKind::Failed,
                 last_error: reason.clone(),
@@ -687,7 +687,7 @@ async fn finish_task_attempt(
         crate::log!("[task:{bot_key}] {short} 无投递目标（创建者会话为空），结果未发送");
         return;
     };
-    // 存量坏任务自愈：创建者会话若存的是 buzz 频道 UUID（外部注入的 AGENT_BRIDGE_CHAT_ID），
+    // 存量坏任务自愈：创建者会话若存的是 历史频道 UUID（外部注入的 AGENT_BRIDGE_CHAT_ID），
     // 直发必被平台拒（飞书 230001）——回落到该 bot 主会话，loud，让结果真送达。
     let primary = router
         .bots
@@ -697,7 +697,7 @@ async fn finish_task_attempt(
     let (chat, healed) = heal_delivery_chat(&chat_raw, &primary);
     if healed {
         crate::log!(
-            "[task:{bot_key}] {short} 投递目标 chat={chat_raw} 形如 buzz 频道 UUID（非平台 chat_id），已回落主会话 {chat}"
+            "[task:{bot_key}] {short} 投递目标 chat={chat_raw} 形如 历史频道 UUID（非平台 chat_id），已回落主会话 {chat}"
         );
     }
     // 注意：这里没有「已取消」抬头——见上 `if cancelled { return; }` 的说明，
@@ -879,7 +879,7 @@ fn agent_cfg_for_task(
     cfg: &crate::config::Config,
     task: &Task,
     bot_key: &str,
-) -> crate::buzz::harness::AgentConfig {
+) -> crate::runtime::harness::AgentConfig {
     // 用 **worker 自己的 bot_key**（不是定义文件里的 `task.bot_key`）判剖面：定义文件
     // 可被手改，拿它当判据的话，改成一台 `restrict_granted_agent = false` 的 bot
     // 就能选到更松的档。`TaskStore::add` 另有一道「归属必须与所在目录一致」的校验。
@@ -931,15 +931,15 @@ fn delivery_target(task: &Task, bot_key: &str) -> Option<(String, String)> {
     }
 }
 
-/// 投递目标校正（纯函数，可测）：目标 chat 形如 buzz 频道 UUID 时回落到该 bot 主会话。
+/// 投递目标校正（纯函数，可测）：目标 chat 形如 历史频道 UUID 时回落到该 bot 主会话。
 ///
 /// 背景：ACP 架构下 agent 是每 bot 长驻进程，桥无法按频道注入 `AGENT_BRIDGE_CHAT_ID`；
-/// 外部启动器注入的若是 buzz 频道 UUID，会经 `task add` 原样存进 `created_by.chat_id`。
+/// 外部启动器注入的若是 历史频道 UUID，会经 `task add` 原样存进 `created_by.chat_id`。
 /// 该值不是平台 receive_id，直发必被平台拒（飞书 230001 invalid receive_id）——这里
 /// 回落到 `primary`（真实平台会话），让**存量坏任务**的结果也能真送达。返回
 /// `(生效 chat, 是否发生回落)`；`primary` 为空时原样返回（交由投递侧 loud 失败）。
 fn heal_delivery_chat(chat: &str, primary: &str) -> (String, bool) {
-    if !primary.is_empty() && crate::buzz::keys::looks_like_channel_uuid(chat) {
+    if !primary.is_empty() && crate::runtime::keys::looks_like_channel_uuid(chat) {
         (primary.to_string(), true)
     } else {
         (chat.to_string(), false)
@@ -1736,7 +1736,7 @@ mod tests {
         assert!(
             gc.extra_env
                 .iter()
-                .any(|(k, v)| k == "BUZZ_AGENT_NO_HINTS" && v == "1"),
+                .any(|(k, v)| k == "ABB_AGENT_NO_HINTS" && v == "1"),
             "granted 任务要带进程级 hints 收口"
         );
 
@@ -1747,7 +1747,7 @@ mod tests {
             oc.session_sandbox.is_none(),
             "owner 任务不该被额外收紧（默认档位 FullAccess → None）"
         );
-        assert!(!oc.extra_env.iter().any(|(k, _)| k == "BUZZ_AGENT_NO_HINTS"));
+        assert!(!oc.extra_env.iter().any(|(k, _)| k == "ABB_AGENT_NO_HINTS"));
     }
 
     /// P1b：任务完成投递的来源——自环（目标==创建者会话）记 `InSession`（保持旧行为），
@@ -3636,15 +3636,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
-    /// 回归锁（本次修复的核心）：创建者会话存的是 buzz 频道 UUID（历史坏数据）时，
+    /// 回归锁（本次修复的核心）：创建者会话存的是 历史频道 UUID（历史坏数据）时，
     /// 投递目标回落到该 bot 主会话——绝不把频道 UUID 当平台 receive_id。
     #[test]
     fn delivery_heals_channel_uuid_to_primary_chat() {
-        let uuid = crate::buzz::keys::channel_uuid(
+        let uuid = crate::runtime::keys::channel_uuid(
             "cli_a8a27ff268b8900e",
             "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
         );
-        assert!(crate::buzz::keys::looks_like_channel_uuid(&uuid));
+        assert!(crate::runtime::keys::looks_like_channel_uuid(&uuid));
         let (chat, healed) = heal_delivery_chat(&uuid, "oc_1f097b843c4d12b3bc8b91205cfe4dd8");
         assert!(healed);
         assert_eq!(chat, "oc_1f097b843c4d12b3bc8b91205cfe4dd8");
@@ -3687,14 +3687,14 @@ mod tests {
         }
     }
 
-    /// 与 `buzz::oneshot` 测试同款的 mock 装配（`tests/mock_acp_agent.py`）。
-    fn mock_cfg(record_file: &std::path::Path) -> crate::buzz::harness::AgentConfig {
+    /// 与 `runtime::oneshot` 测试同款的 mock 装配（`tests/mock_acp_agent.py`）。
+    fn mock_cfg(record_file: &std::path::Path) -> crate::runtime::harness::AgentConfig {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
-        crate::buzz::harness::AgentConfig {
+        crate::runtime::harness::AgentConfig {
             command: python3,
             args: vec![script.display().to_string()],
             extra_env: vec![
@@ -4244,10 +4244,10 @@ mod tests {
 /// 任务 Agent 的回合上限：**由任务自己的预算推导**（保守按 4 秒/回合，夹在 [4, 200]）。
 ///
 /// 为什么（2026-10-06 实测）：看护类任务 300s 预算下，agent 在 03:15~03:19 每 1~2 秒调一次 LLM，
-/// 用满了 `BUZZ_AGENT_MAX_ROUNDS=200` 的全局上限、把预算烧光 ⇒ 每轮都报「执行超时（预算 300s）」。
+/// 用满了 `ABB_AGENT_MAX_ROUNDS=200` 的全局上限、把预算烧光 ⇒ 每轮都报「执行超时（预算 300s）」。
 /// 把上限与**任务自己的预算**绑定后：300s 任务最多 75 回合、60s 任务最多 15 回合，烧不满预算。
 ///
-/// 第一步只落地这个纯函数（含单测）；接线（spawn 时把它注入 `BUZZ_AGENT_MAX_ROUNDS`，覆盖
+/// 第一步只落地这个纯函数（含单测）；接线（spawn 时把它注入 `ABB_AGENT_MAX_ROUNDS`，覆盖
 /// agent.rs 的全局 200）留作下一步 —— 跨进程 env 装配一次只动一处，便于回滚。
 #[allow(dead_code)] // 第一步先落地推导函数，第二步才接线（未接线前不该报 dead_code）。
 pub(crate) fn task_round_cap(budget_secs: u64) -> u32 {

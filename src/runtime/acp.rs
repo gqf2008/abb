@@ -24,7 +24,7 @@ const STDERR_LINE_CHARS: usize = 300;
 
 /// 把一行 stderr 收进**有界环形缓冲**（只留最后 N 行，空白行丢弃）。
 ///
-/// 为什么要这份尾巴：agent 起不来时真正的一句原因（例如 BUZZ_AGENT_PROVIDER is required）
+/// 为什么要这份尾巴：agent 起不来时真正的一句原因（例如 ABB_AGENT_PROVIDER is required）
 /// 是子进程写到 stderr 的；此前 stderr 直接 inherit，supervised（计划任务）形态没有重定向
 /// ⇒ 原因彻底丢失，用户端只剩「Agent process exited unexpectedly」。
 fn push_stderr_line(buf: &std::sync::Mutex<std::collections::VecDeque<String>>, line: &str) {
@@ -168,7 +168,7 @@ fn build_initialize_params() -> serde_json::Value {
         "protocolVersion": 2,
         "clientCapabilities": build_client_capabilities(),
         "clientInfo": {
-            "name": "buzz-acp",
+            "name": "abb-acp",
             "version": env!("CARGO_PKG_VERSION")
         },
     })
@@ -248,7 +248,7 @@ pub struct AcpClient {
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
-    /// Both goose and buzz-agent emit `session_info_update` with this field;
+    /// Both goose 与旧执行层都会 emit `session_info_update` with this field;
     /// goose emits it whenever it starts or clears an active prompt run
     /// (`crates/goose/src/acp/server.rs:2277` `send_active_run_update`).
     /// Required as `expectedRunId` when calling the non-standard
@@ -256,7 +256,7 @@ pub struct AcpClient {
     /// in-flight turn without cancelling it.
     ///
     /// `None` until the first `session_info_update` arrives, or after the
-    /// run clears (goose/buzz-agent emit `activeRunId: null` at end of turn).
+    /// run clears (goose 与旧执行层都会在回合结束时发 `activeRunId: null`).
     /// Other agents may leave this unset — readers must treat `None` as
     /// "no active run to steer into" and fall back to cancel+merge.
     active_run_id: Option<String>,
@@ -287,7 +287,7 @@ pub struct AcpClient {
     /// is dropped at scope exit alongside the turn it served. `None`
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
-    steer_rx: Option<tokio::sync::mpsc::Receiver<crate::buzz::pool::SteerRequest>>,
+    steer_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::pool::SteerRequest>>,
     /// Accumulated agent reply text for the current turn (`agent_message_chunk`
     /// deltas, session-filtered). Cleared by [`AcpClient::begin_turn`]; drained
     /// by [`AcpClient::take_turn_text`] at turn completion. A turn with no text
@@ -302,7 +302,7 @@ pub struct AcpClient {
 
 /// goose's non-standard mid-turn steer method. Requires `expectedRunId`, so it
 /// is only usable once a `session_info_update` has supplied
-/// `_meta.goose.activeRunId`. Emitted by goose and buzz-agent only.
+/// `_meta.goose.activeRunId`. 仅由 goose 与旧执行层发出。
 const GOOSE_STEER_METHOD: &str = "_goose/unstable/session/steer";
 
 /// The cross-adapter mid-turn steer method, shipped by claude-agent-acp
@@ -311,11 +311,11 @@ const GOOSE_STEER_METHOD: &str = "_goose/unstable/session/steer";
 /// `{outcome}`. Gated on [`AcpClient::steering_supported`].
 const ACP_STEER_METHOD: &str = "_session/steering";
 
-/// `outcome` value meaning the steer was applied to the turn Buzz is waiting
+/// `outcome` value meaning the steer was applied to the turn Runtime is waiting
 /// on, which therefore keeps running.
 const STEER_OUTCOME_INJECTED: &str = "injected";
 
-/// `outcome` value meaning the turn Buzz was steering had already finished, so
+/// `outcome` value meaning the turn Runtime was steering had already finished, so
 /// the adapter began a fresh turn carrying the message. Still a delivery
 /// success, but the awaited turn is over — see the steer-response arm for why
 /// this must not renew the hard deadline.
@@ -334,8 +334,8 @@ enum SteerTransport {
 
 fn build_client_capabilities() -> serde_json::Value {
     serde_json::json!({
-        // Signal to ACP adapters that Buzz can hand users to terminal-native
-        // auth flows. Adapters decide which auth methods to expose; Buzz does
+        // Signal to ACP adapters that Runtime can hand users to terminal-native
+        // auth flows. Adapters decide which auth methods to expose; Runtime does
         // not hardcode vendor login commands from this capability.
         "auth": {
             "terminal": true
@@ -574,7 +574,7 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // 单后端化 P2.3：fork（buzz-agent ≥ P1.1）在 initialize 顶层 `_meta`
+        // 单后端化 P2.3：旧执行层（≥ P1.1）在 initialize 顶层 `_meta`
         // 声明 `_meta.abbSandbox`（支持的档位词表）= 认 `_meta.sandbox/shell`
         // 并执行档位。缺失（旧 fork / 其他适配器）→ None：受限会话的硬闸据此
         // 拒答，绝不把发不出的档位静默降级成 FullAccess。与 steering 同款
@@ -611,7 +611,7 @@ impl AcpClient {
     ///
     /// - `None` — no system-prompt field in the request (legacy framing).
     /// - `Some(SystemPromptTransport::Field(text))` — bare `systemPrompt` field
-    ///   (ACP protocol v2, buzz-agent, goose unused).
+    ///   (ACP 协议 v2；旧执行层实现，goose 未用).
     /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
     ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
     ///
@@ -718,7 +718,7 @@ impl AcpClient {
             serde_json::json!({
                 "sessionId": session_id,
                 "mode": "set",
-                "key": "buzz",
+                "key": "abb",
                 "text": text,
             }),
         )
@@ -750,7 +750,7 @@ impl AcpClient {
     ///
     /// Used for slash-command pass-through: ACP connectors detect commands via
     /// the **first** block's text starting with `/`, so the harness sends
-    /// `["/cmd args", "<buzz context>"]` instead of one wrapped block.
+    /// `["/cmd args", "<上下文>"]` instead of one wrapped block.
     pub async fn session_prompt_blocks_with_idle_timeout(
         &mut self,
         session_id: &str,
@@ -836,10 +836,10 @@ impl AcpClient {
     /// Most recently observed goose `_meta.goose.activeRunId` from a
     /// `session_info_update`, if any.
     ///
-    /// Both goose and buzz-agent emit `session_info_update`; other agents
+    /// Both goose 与旧执行层都会 emit `session_info_update`; other agents
     /// leave this `None` for the lifetime of the client. Read directly by
     /// `read_until_response_with_idle_timeout`'s
-    /// steer arm at write time (see [`crate::buzz::pool::SteerRequest`] for
+    /// steer arm at write time (see [`crate::runtime::pool::SteerRequest`] for
     /// why the read loop owns this); production callers do not need this
     /// accessor. Kept as `pub` so tests can introspect the field.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -872,7 +872,7 @@ impl AcpClient {
     /// dropped at scope exit before the next turn dispatches.
     pub fn install_steer_rx(
         &mut self,
-        rx: tokio::sync::mpsc::Receiver<crate::buzz::pool::SteerRequest>,
+        rx: tokio::sync::mpsc::Receiver<crate::runtime::pool::SteerRequest>,
     ) {
         assert!(
             self.steer_rx.is_none(),
@@ -1248,7 +1248,7 @@ impl AcpClient {
     /// `session_id` is threaded in lexically by callers so the goose-native
     /// steer arm can complete `sessionId` in the steer JSON-RPC params at
     /// write time without needing access to outer state. See
-    /// [`crate::buzz::pool::SteerRequest`] for why params are built here and not
+    /// [`crate::runtime::pool::SteerRequest`] for why params are built here and not
     /// in the main loop.
     async fn read_until_response_with_idle_timeout(
         &mut self,
@@ -1276,7 +1276,7 @@ impl AcpClient {
         let mut pending_steer: Option<(
             u64,
             SteerTransport,
-            tokio::sync::oneshot::Sender<crate::buzz::pool::SteerAck>,
+            tokio::sync::oneshot::Sender<crate::runtime::pool::SteerAck>,
         )> = None;
 
         let now = Instant::now();
@@ -1307,7 +1307,7 @@ impl AcpClient {
                     // PromptCompletedNeutral (no fallback signal: there is
                     // no in-flight turn to signal once we return, and
                     // normal dispatch handles redelivery).
-                    let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
+                    let _ = ack_tx.send(crate::runtime::pool::SteerAck::PromptCompletedNeutral);
                 }
                 if idle_fires_first {
                     tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
@@ -1384,8 +1384,8 @@ impl AcpClient {
                                 "steer: no active_run_id and agent did not advertise \
                                  {ACP_STEER_METHOD} — falling back to cancel+merge"
                             );
-                            let _ = req.ack_tx.send(crate::buzz::pool::SteerAck::Err(
-                                crate::buzz::pool::SteerError::ExpectedRunIdMissing,
+                            let _ = req.ack_tx.send(crate::runtime::pool::SteerAck::Err(
+                                crate::runtime::pool::SteerError::ExpectedRunIdMissing,
                             ));
                         }
                         Some((transport, method, params)) => {
@@ -1410,8 +1410,8 @@ impl AcpClient {
                                     tracing::warn!(
                                         "steer write failed ({method}): {e} — releasing withheld event"
                                     );
-                                    let _ = req.ack_tx.send(crate::buzz::pool::SteerAck::Err(
-                                        crate::buzz::pool::SteerError::Transport(e.to_string()),
+                                    let _ = req.ack_tx.send(crate::runtime::pool::SteerAck::Err(
+                                        crate::runtime::pool::SteerError::Transport(e.to_string()),
                                     ));
                                 }
                             }
@@ -1428,7 +1428,7 @@ impl AcpClient {
                     // here makes the wakeup immediate (no extra reader poll
                     // round-trip when stdout is idle).
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::runtime::pool::SteerAck::PromptCompletedNeutral);
                     }
                     if idle_fires_first {
                         tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
@@ -1452,13 +1452,13 @@ impl AcpClient {
             match read_result {
                 None => {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::runtime::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::AgentExited);
                 }
                 Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::runtime::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Protocol(
                         "agent stdout line exceeded 10MB limit".into(),
@@ -1466,7 +1466,7 @@ impl AcpClient {
                 }
                 Some(Err(e)) => {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
-                        let _ = ack_tx.send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
+                        let _ = ack_tx.send(crate::runtime::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Io(std::io::Error::other(e)));
                 }
@@ -1514,8 +1514,8 @@ impl AcpClient {
                                             .and_then(|c| c.as_i64())
                                             .unwrap_or(-1);
                                         let message = error.to_string();
-                                        crate::buzz::pool::SteerAck::Err(
-                                            crate::buzz::pool::SteerError::AgentError {
+                                        crate::runtime::pool::SteerAck::Err(
+                                            crate::runtime::pool::SteerError::AgentError {
                                                 code,
                                                 message,
                                             },
@@ -1523,7 +1523,7 @@ impl AcpClient {
                                     } else {
                                         // Success result. Whether it counts as
                                         // a delivered steer — and whether the
-                                        // turn Buzz awaits is still running —
+                                        // turn Runtime awaits is still running —
                                         // depends on the transport.
                                         let outcome = match transport {
                                             // goose returns no outcome field;
@@ -1560,7 +1560,7 @@ impl AcpClient {
                                                     "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
                                                      awaited turn had ended — hard deadline not renewed"
                                                 );
-                                                crate::buzz::pool::SteerAck::Success {
+                                                crate::runtime::pool::SteerAck::Success {
                                                     session_id: session_id.to_owned(),
                                                 }
                                             }
@@ -1574,7 +1574,7 @@ impl AcpClient {
                                                         "steer success: renewed hard deadline ({max_duration:?} from now)"
                                                     );
                                                 }
-                                                crate::buzz::pool::SteerAck::Success {
+                                                crate::runtime::pool::SteerAck::Success {
                                                     session_id: session_id.to_owned(),
                                                 }
                                             }
@@ -1595,8 +1595,8 @@ impl AcpClient {
                                                      unrecognized outcome {reported} — releasing \
                                                      withheld event for cancel+merge"
                                                 );
-                                                crate::buzz::pool::SteerAck::Err(
-                                                    crate::buzz::pool::SteerError::OutcomeRejected {
+                                                crate::runtime::pool::SteerAck::Err(
+                                                    crate::runtime::pool::SteerError::OutcomeRejected {
                                                         outcome: reported,
                                                     },
                                                 )
@@ -1611,14 +1611,15 @@ impl AcpClient {
                                 if let Some(error) = msg.get("error") {
                                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                                         let _ = ack_tx.send(
-                                            crate::buzz::pool::SteerAck::PromptCompletedNeutral,
+                                            crate::runtime::pool::SteerAck::PromptCompletedNeutral,
                                         );
                                     }
                                     return Err(agent_error_from_json(error));
                                 }
                                 if let Some((_, _, ack_tx)) = pending_steer.take() {
-                                    let _ = ack_tx
-                                        .send(crate::buzz::pool::SteerAck::PromptCompletedNeutral);
+                                    let _ = ack_tx.send(
+                                        crate::runtime::pool::SteerAck::PromptCompletedNeutral,
+                                    );
                                 }
                                 return Ok(msg["result"].clone());
                             }
@@ -1746,7 +1747,7 @@ impl AcpClient {
                 false
             }
             "session_info_update" => {
-                // Both goose and buzz-agent emit `session_info_update` with
+                // Both goose 与旧执行层都会 emit `session_info_update` with
                 // `_meta.goose.activeRunId`: the id of the currently-active
                 // prompt run, or `null` when the run has cleared. Other agents
                 // don't emit this field; for them `active_run_id` stays `None`
@@ -1754,7 +1755,7 @@ impl AcpClient {
                 //
                 // Per the ACP `SessionInfoUpdate` schema, `_meta` is a field
                 // on the update object itself — nested inside `update`, not
-                // alongside it at the params level. Goose and buzz-agent both
+                // alongside it at the params level. goose 与旧执行层都
                 // emit it at `params.update._meta.goose.activeRunId`.
                 let meta = msg["params"]["update"]
                     .get("_meta")
@@ -1915,7 +1916,7 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
 ///
 /// Called from the read-loop steer arm at write time so `expectedRunId`
 /// matches goose's *current* run (it advances on each `session/update`).
-/// See [`crate::buzz::pool::SteerRequest`] for why this is the read loop's job
+/// See [`crate::runtime::pool::SteerRequest`] for why this is the read loop's job
 /// and not the main loop's.
 fn build_goose_steer_params(
     session_id: &str,
@@ -2009,7 +2010,7 @@ pub struct SessionSandboxMeta {
 ///
 /// The two variants match the two mechanisms supported by current adapters:
 ///
-/// - **`Field`** — bare `systemPrompt` field (ACP protocol v2, buzz-agent).
+/// - **`Field`** — bare `systemPrompt` field (ACP protocol v2, 旧执行层实现).
 /// - **`ClaudeMeta`** — `_meta.systemPrompt: {"append": text}`, used by
 ///   `claude-agent-acp` to append to the adapter's own native system prompt
 ///   while keeping its tool-use preset intact.
@@ -2356,7 +2357,7 @@ mod tests {
                 "protocolVersion": 2,
                 "clientCapabilities": build_client_capabilities(),
                 "clientInfo": {
-                    "name": "buzz-acp",
+                    "name": "abb-acp",
                     "version": "0.1.0"
                 }
             }
@@ -2364,7 +2365,7 @@ mod tests {
         assert_eq!(msg["params"]["protocolVersion"].as_u64(), Some(2));
         assert_eq!(
             msg["params"]["clientInfo"]["name"].as_str(),
-            Some("buzz-acp")
+            Some("abb-acp")
         );
         assert!(msg["params"]["clientCapabilities"].is_object());
         assert_eq!(
@@ -2388,11 +2389,11 @@ mod tests {
             args: vec![],
             env: vec![
                 EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
+                    name: "ABB_RELAY_URL".into(),
                     value: "ws://localhost:3000".into(),
                 },
                 EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
+                    name: "ABB_RELAY_KEY".into(),
                     value: "nsec1abc".into(),
                 },
             ],
@@ -2407,10 +2408,7 @@ mod tests {
         assert_eq!(serialized["args"].as_array().unwrap().len(), 0);
         assert!(serialized["env"].is_array());
         assert_eq!(serialized["env"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            serialized["env"][0]["name"].as_str(),
-            Some("BUZZ_RELAY_URL")
-        );
+        assert_eq!(serialized["env"][0]["name"].as_str(), Some("ABB_RELAY_URL"));
     }
 
     #[tokio::test]
@@ -2419,7 +2417,7 @@ mod tests {
             .expect("current exe")
             .display()
             .to_string();
-        let server = crate::buzz::harness::events_mcp_server();
+        let server = crate::runtime::harness::events_mcp_server();
         assert_eq!(server.name, "abb-events");
         assert_eq!(server.args, vec!["mcp-events".to_string()]);
         assert_eq!(server.command, expected_command);
@@ -2467,12 +2465,12 @@ mod tests {
             "夹具仓库路径必须是绝对路径：{}",
             repo.display()
         );
-        let with_repo = crate::buzz::harness::events_mcp_server_with_repo(Some(repo.clone()));
+        let with_repo = crate::runtime::harness::events_mcp_server_with_repo(Some(repo.clone()));
         assert!(with_repo.env.iter().any(|item| {
             item.name == "ABB_EVENTS_REPO" && item.value == repo.display().to_string()
         }));
         // 反向断言：非绝对路径不得注入（注入到子进程会被按子进程 cwd 解析、语义漂移）。
-        let relative = crate::buzz::harness::events_mcp_server_with_repo(Some(
+        let relative = crate::runtime::harness::events_mcp_server_with_repo(Some(
             std::path::PathBuf::from("abb-events-repo"),
         ));
         assert!(
@@ -2490,7 +2488,7 @@ mod tests {
 
     #[test]
     fn session_prompt_request_format() {
-        let prompt_text = "[Buzz @mention]\nChannel: test\nFrom: npub1...\nMessage: hello";
+        let prompt_text = "[Runtime @mention]\nChannel: test\nFrom: npub1...\nMessage: hello";
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2u64,
@@ -2516,7 +2514,7 @@ mod tests {
             "sess_abc123",
             &[
                 "/goal ship it",
-                "[Buzz event: @mention]\nContent: @Eva /goal ship it",
+                "[Runtime event: @mention]\nContent: @Eva /goal ship it",
             ],
         );
         let prompt = params["prompt"].as_array().unwrap();
@@ -3193,7 +3191,7 @@ mod tests {
         );
         assert_eq!(received["params"]["sessionId"], "ses_goose");
         assert_eq!(received["params"]["mode"], "set");
-        assert_eq!(received["params"]["key"], "buzz");
+        assert_eq!(received["params"]["key"], "abb");
         assert_eq!(received["params"]["text"], "Be terse");
     }
 
@@ -3280,14 +3278,14 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
+            .session_new_full("/tmp", vec![], None, Some("Fizz · #dev"))
             .await
             .expect("session_new_full should succeed");
 
         let received = &resp.raw["_receivedRequest"];
         assert_eq!(
             received["params"]["_meta"]["sessionTitle"].as_str(),
-            Some("Fizz · #buzz-dev"),
+            Some("Fizz · #dev"),
             "title should ride in _meta.sessionTitle, out of band from the prompt"
         );
     }
@@ -3382,7 +3380,7 @@ mod tests {
                 "/tmp",
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
-                Some("Fizz · #buzz-dev"),
+                Some("Fizz · #dev"),
             )
             .await
             .expect("session_new_full should succeed");
@@ -3395,7 +3393,7 @@ mod tests {
         );
         assert_eq!(
             received["params"]["_meta"]["sessionTitle"].as_str(),
-            Some("Fizz · #buzz-dev"),
+            Some("Fizz · #dev"),
             "_meta.sessionTitle must be present alongside systemPrompt"
         );
     }
@@ -3415,7 +3413,7 @@ mod tests {
     /// Pass `None` to omit the `activeRunId` field entirely.
     ///
     /// `_meta` is nested inside the `update` object (per the ACP
-    /// `SessionInfoUpdate` schema), matching what goose and buzz-agent
+    /// `SessionInfoUpdate` schema), matching what goose 与旧执行层
     /// emit on the wire.
     fn session_info_update_msg(active_run_id: Option<serde_json::Value>) -> serde_json::Value {
         let mut goose = serde_json::Map::new();
@@ -3531,15 +3529,16 @@ mod tests {
             "precondition: active_run_id starts as None"
         );
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
         // Fire-and-forget: send a SteerRequest from a separate task so
         // the read loop picks it up via the select! arm.
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::runtime::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::buzz::pool::SteerRequest {
+                .send(crate::runtime::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
                     ack_tx,
                 })
@@ -3571,8 +3570,8 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::buzz::pool::SteerAck::Err(
-                crate::buzz::pool::SteerError::ExpectedRunIdMissing,
+            crate::runtime::pool::SteerAck::Err(
+                crate::runtime::pool::SteerError::ExpectedRunIdMissing,
             ) => {}
             other => panic!("expected SteerAck::Err(ExpectedRunIdMissing), got {other:?}"),
         }
@@ -3606,13 +3605,14 @@ mod tests {
         let _ = client.handle_session_update(&update);
         assert_eq!(client.active_run_id(), Some("run-42"));
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::runtime::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::buzz::pool::SteerRequest {
+                .send(crate::runtime::pool::SteerRequest {
                     prompt_blocks: vec!["test steer body".into()],
                     ack_tx,
                 })
@@ -3649,7 +3649,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::buzz::pool::SteerAck::Success { .. } => {}
+            crate::runtime::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -3680,13 +3680,14 @@ mod tests {
         let update = session_info_update_msg(Some(serde_json::json!("run-99")));
         let _ = client.handle_session_update(&update);
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::runtime::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::buzz::pool::SteerRequest {
+                .send(crate::runtime::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -3712,7 +3713,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::buzz::pool::SteerAck::Success { .. } => {}
+            crate::runtime::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -3754,14 +3755,15 @@ mod tests {
     async fn run_one_steer(
         client: &mut AcpClient,
         capture_path: &std::path::Path,
-    ) -> (Option<String>, crate::buzz::pool::SteerAck) {
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
+    ) -> (Option<String>, crate::runtime::pool::SteerAck) {
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::runtime::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::buzz::pool::SteerRequest {
+                .send(crate::runtime::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -3785,7 +3787,7 @@ mod tests {
 
     /// Unique temp path for one test's captured request bytes.
     fn capture_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("buzz-acp-steer-capture");
+        let dir = std::env::temp_dir().join("abb-acp-steer-capture");
         std::fs::create_dir_all(&dir).expect("create capture dir");
         let path = dir.join(format!("{name}.json"));
         let _ = std::fs::remove_file(&path);
@@ -3832,7 +3834,7 @@ mod tests {
         );
     }
 
-    /// Test 1b: no `_meta` at all (goose, buzz-agent, any older adapter) must
+    /// Test 1b: no `_meta` at all (goose / 旧执行层 / 任何老适配器) must
     /// leave the capability off — this is what keeps a steer off the wire for
     /// agents that never implemented it.
     #[tokio::test]
@@ -3899,7 +3901,7 @@ mod tests {
             "_session/steering must not carry expectedRunId; wrote: {written}"
         );
         assert!(
-            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::runtime::pool::SteerAck::Success { .. }),
             "injected outcome must ack Success, got {ack:?}"
         );
     }
@@ -3931,7 +3933,7 @@ mod tests {
         // no `outcome`) — the OutcomeRejected guard applies only to
         // `_session/steering`.
         assert!(
-            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::runtime::pool::SteerAck::Success { .. }),
             "goose success result must ack Success, got {ack:?}"
         );
     }
@@ -3952,9 +3954,9 @@ mod tests {
         let (_written, ack) = run_one_steer(&mut client, &capture).await;
 
         match ack {
-            crate::buzz::pool::SteerAck::Err(crate::buzz::pool::SteerError::OutcomeRejected {
-                outcome,
-            }) => {
+            crate::runtime::pool::SteerAck::Err(
+                crate::runtime::pool::SteerError::OutcomeRejected { outcome },
+            ) => {
                 assert_eq!(
                     outcome, "failed",
                     "rejected outcome must report what the agent said, unquoted"
@@ -3967,7 +3969,7 @@ mod tests {
     /// Test 8: **codex `extMethod` silent-loss regression guard.** codex-acp's
     /// ext dispatcher answers unrecognized methods with a bare `{}` — a
     /// JSON-RPC *success*, not `-32601` (`src/CodexAcpServer.ts:255-258`).
-    /// Buzz maps `SteerAck::Success` to `queue.remove_event`, so decoding
+    /// Runtime maps `SteerAck::Success` to `queue.remove_event`, so decoding
     /// `{}` as success would delete the user's message with no error, no
     /// fallback, and no log. An absent `outcome` must therefore be a
     /// rejection, which releases the event and fires cancel+merge.
@@ -3981,9 +3983,9 @@ mod tests {
         let (_written, ack) = run_one_steer(&mut client, &capture).await;
 
         match ack {
-            crate::buzz::pool::SteerAck::Err(crate::buzz::pool::SteerError::OutcomeRejected {
-                outcome,
-            }) => {
+            crate::runtime::pool::SteerAck::Err(
+                crate::runtime::pool::SteerError::OutcomeRejected { outcome },
+            ) => {
                 assert_eq!(
                     outcome, "<absent>",
                     "a result with no outcome field must be reported as absent"
@@ -4014,12 +4016,13 @@ mod tests {
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::runtime::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::buzz::pool::SteerRequest {
+                .send(crate::runtime::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4042,13 +4045,13 @@ mod tests {
         assert_eq!(result.unwrap()["done"], serde_json::json!(true));
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::runtime::pool::SteerAck::Success { .. }),
             "injected must ack Success, got {ack:?}"
         );
     }
 
     /// Test 6: **red/green for the no-renewal rule.** `startedNewTurn` means
-    /// the turn Buzz was steering had already ended and the adapter began a
+    /// the turn Runtime was steering had already ended and the adapter began a
     /// fresh, detached one. It acks `Success` (the message WAS delivered, so
     /// the event must not be redelivered) but must NOT renew the hard
     /// deadline — that clock belongs to a turn which is already settled.
@@ -4069,12 +4072,13 @@ mod tests {
         let mut client = spawn_script(script).await;
         set_steering_supported(&mut client);
 
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::buzz::pool::SteerRequest>(1);
+        let (steer_tx, steer_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::pool::SteerRequest>(1);
         client.install_steer_rx(steer_rx);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::buzz::pool::SteerAck>();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::runtime::pool::SteerAck>();
         let send_task = tokio::spawn(async move {
             steer_tx
-                .send(crate::buzz::pool::SteerRequest {
+                .send(crate::runtime::pool::SteerRequest {
                     prompt_blocks: vec!["steer body".into()],
                     ack_tx,
                 })
@@ -4101,7 +4105,7 @@ mod tests {
         // rather than released — hence Success, not an Err.
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::buzz::pool::SteerAck::Success { .. }),
+            matches!(ack, crate::runtime::pool::SteerAck::Success { .. }),
             "startedNewTurn is a delivery success, got {ack:?}"
         );
     }
@@ -4129,8 +4133,8 @@ mod tests {
             "no transport available must write nothing; wrote: {written:?}"
         );
         match ack {
-            crate::buzz::pool::SteerAck::Err(
-                crate::buzz::pool::SteerError::ExpectedRunIdMissing,
+            crate::runtime::pool::SteerAck::Err(
+                crate::runtime::pool::SteerError::ExpectedRunIdMissing,
             ) => {}
             other => panic!("expected Err(ExpectedRunIdMissing), got {other:?}"),
         }

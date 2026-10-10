@@ -1,4 +1,4 @@
-//! Inbound message queue for the ABB buzz harness.
+//! Inbound message queue for the ABB runtime.
 //!
 //! Manages per-channel message queues with per-channel in-flight tracking.
 //! When the harness is ready to prompt the agent, it flushes the channel with
@@ -8,7 +8,7 @@
 //!
 //! Ported from upstream buzz-acp `queue.rs` @ c3132c3 and trimmed to ABB's
 //! transport: upstream queued signed `nostr::Event`s
-//! and had the agent publish replies with the `buzz` CLI; ABB queues plain
+//! and had the agent publish replies through the upstream relay CLI; ABB queues plain
 //! chat messages ([`InboundMsg`]) and delivers the agent's turn text
 //! synchronously at turn end. The queue state machine itself (dedup modes,
 //! in-flight tracking, retry/backoff, cancel+steer merging, native-steer
@@ -1002,7 +1002,7 @@ fn append_channel_description(s: &mut String, channel_info: Option<&PromptChanne
     // Channel metadata is untrusted prompt content. Escape semantic delimiters
     // before embedding it in `<context>` so text such as `</context>` cannot
     // terminate the section or introduce another model-visible section.
-    let escaped = crate::buzz::prompt_framing::escape_semantic_text(&truncated);
+    let escaped = crate::runtime::prompt_framing::escape_semantic_text(&truncated);
     if escaped.contains('\n') {
         // Multi-line: indented block. Blank lines stay blank; content lines
         // are indented so field-like text remains visually subordinate.
@@ -1080,7 +1080,7 @@ fn format_context_hints(
          delivered to this chat by the bridge. Do NOT try to publish, send, or \
          execute anything to deliver it — just output the reply.",
     );
-    crate::buzz::prompt_framing::semantic_section("context", &s)
+    crate::runtime::prompt_framing::semantic_section("context", &s)
 }
 
 /// Arguments for [`format_prompt`] beyond the required [`FlushBatch`].
@@ -1107,7 +1107,7 @@ pub struct FormatPromptArgs<'a> {
 /// exactly one place across all dispatch paths (batch flush, heartbeat,
 /// initial message).
 pub(crate) fn base_section(base_prompt: &str) -> String {
-    crate::buzz::prompt_framing::semantic_section("base", base_prompt.trim_end())
+    crate::runtime::prompt_framing::semantic_section("base", base_prompt.trim_end())
 }
 
 /// Format a [`FlushBatch`] into the per-section prompt blocks for the agent.
@@ -1144,7 +1144,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             sections.push(base_section(bp));
         }
         if let Some(sp) = args.system_prompt {
-            sections.push(crate::buzz::prompt_framing::semantic_section(
+            sections.push(crate::runtime::prompt_framing::semantic_section(
                 "agent-instructions",
                 sp,
             ));
@@ -1181,7 +1181,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
                 format_event_block(batch.channel_id, args.channel_info, be)
             ));
         }
-        sections.push(crate::buzz::prompt_framing::semantic_section(
+        sections.push(crate::runtime::prompt_framing::semantic_section(
             framing.prior_tag,
             &body,
         ));
@@ -1191,7 +1191,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     let event_section = if batch.events.len() == 1 {
         let be = &batch.events[0];
         if has_cancelled {
-            crate::buzz::prompt_framing::semantic_section(
+            crate::runtime::prompt_framing::semantic_section(
                 framing.new_tag,
                 &format!(
                     "--- Message 1 ({}) ---\n{}",
@@ -1200,8 +1200,8 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
                 ),
             )
         } else {
-            crate::buzz::prompt_framing::semantic_section_with_attributes(
-                "buzz-event",
+            crate::runtime::prompt_framing::semantic_section_with_attributes(
+                "abb-event",
                 &[("type", be.msg.prompt_tag.as_str())],
                 &format_event_block(batch.channel_id, args.channel_info, be),
             )
@@ -1220,11 +1220,11 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             ));
         }
         let count = batch.events.len().to_string();
-        crate::buzz::prompt_framing::semantic_section_with_attributes(
+        crate::runtime::prompt_framing::semantic_section_with_attributes(
             if has_cancelled {
                 framing.new_tag
             } else {
-                "buzz-events"
+                "abb-events"
             },
             &[("count", count.as_str())],
             &body,

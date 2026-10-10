@@ -18,7 +18,6 @@ mod agents_md;
 mod attachments;
 mod botstatus;
 mod bridge;
-mod buzz;
 mod config;
 mod deliver;
 mod deps;
@@ -38,6 +37,7 @@ mod platform;
 mod proc_group;
 mod proto;
 mod redact;
+mod runtime;
 mod schedule;
 mod service;
 mod session_gc;
@@ -578,7 +578,7 @@ fn main() {
 
     // 一键创建团队 CLI（#100，P0）：LLM 按提示词生成团队方案（预览确认对象）。
     //   agent-bridge team generate "<团队目标>" [--members "小王,steven"] [--template 软件产品团队]
-    // （--backend 已废弃：单后端化 P3.4 后统一由随包 buzz-agent 执行，传入仅警告并忽略）
+    // （--backend 已废弃：单后端化 P3.4 后统一由随包 abb-agent 执行，传入仅警告并忽略）
     // 输出：校验后的团队方案 JSON（stdout），供上层预览确认/建群。
     if args.len() >= 2 && args[1] == "team" {
         std::process::exit(run_team_cli(&args[2..]));
@@ -1040,9 +1040,9 @@ fn resolve_env_bot_key_from(cfg: &config::Config, raw: Option<&str>) -> Result<S
 
 /// 解析「桥注入的当前会话」chat_id（`job add` / `task add` 缺省回创建者会话走这条路）。
 ///
-/// 返回 `AGENT_BRIDGE_CHAT_ID`；为空时回落该 bot 主会话；**形如 buzz 频道 UUID** 时
+/// 返回 `AGENT_BRIDGE_CHAT_ID`；为空时回落该 bot 主会话；**形如 历史频道 UUID** 时
 /// 同样回落主会话并 loud 提示。背景：ACP 架构下 agent 是每 bot 长驻进程，桥无法按频道
-/// 注入 `AGENT_BRIDGE_CHAT_ID`；外部启动器喂进来的可能是 buzz 频道 UUID——它不是平台
+/// 注入 `AGENT_BRIDGE_CHAT_ID`；外部启动器喂进来的可能是 历史频道 UUID——它不是平台
 /// receive_id，直发必被平台拒（飞书 230001 invalid receive_id），不校正则任务
 /// 「跑完但没人看得到」。
 fn resolve_injected_chat(bot_key: &str) -> String {
@@ -1054,7 +1054,7 @@ fn resolve_injected_chat(bot_key: &str) -> String {
     let (chat, fell_back) = deliver::correct_injected_chat(&raw, &primary);
     if fell_back {
         eprintln!(
-            "⚠️ AGENT_BRIDGE_CHAT_ID「{raw}」形如 buzz 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）；要在指定群/话题回投，请显式指定真实 chat_id"
+            "⚠️ AGENT_BRIDGE_CHAT_ID「{raw}」形如 历史频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）；要在指定群/话题回投，请显式指定真实 chat_id"
         );
     }
     chat
@@ -1153,7 +1153,7 @@ fn run_task_cli(args: &[String]) -> i32 {
         }
     };
     // Q8 纵深防御：hook 之外，CLI 本身也不接受 agent 上下文创建 proc。真实 ACP shell
-    // 由 buzz-agent 的 apply_passthrough_env 注入 ABB_AGENT_CONTEXT=1；legacy
+    // 由执行层的 apply_passthrough_env 注入 ABB_AGENT_CONTEXT=1；legacy
     // AGENT_BRIDGE_* 仅作旧 hook/调试路径兜底。多 bot 人类终端用 task add --bot 选 bot，
     // 不必伪装 agent 注入；无标记仍可走进下面的 `--proc` 分支。owner FullAccess 仍可绕过。
     if task_add_requests_proc(args) {
@@ -1753,7 +1753,7 @@ fn run_task_cli(args: &[String]) -> i32 {
             // 创建者会话：优先桥注入的 env；手动 CLI 回落该 bot 的主会话（与 job add 同款）。
             // 审查 B2：这里若留空，任务会「跑完但没人看得到」——而 CLI 却印着「结果回创建者会话」。
             // 所以两条路都给不出目标时**直接拒绝登记**，不接受一个永远发不出结果的任务。
-            // 桥注入值若形如 buzz 频道 UUID（非平台 receive_id），回落主会话并 loud 提示。
+            // 桥注入值若形如 历史频道 UUID（非平台 receive_id），回落主会话并 loud 提示。
             let chat_id = resolve_injected_chat(&bot_key);
             if chat_id.is_empty() {
                 eprintln!(
@@ -1867,7 +1867,7 @@ fn parse_task_to(raw: &str) -> (String, String) {
 }
 
 /// `task add --to` 的值解析 + 两道硬闸（纯函数，CLI 与测试共用一条路径）：
-/// ① chat_id 非空（空目标 = 任务跑完没人看得到）；② chat_id 不形如 buzz 频道 UUID
+/// ① chat_id 非空（空目标 = 任务跑完没人看得到）；② chat_id 不形如 历史频道 UUID
 /// （频道 UUID 不是任何平台可用的 receive_id，直发会被平台拒，如飞书 230001）。
 /// `bot_key` 缺省 = 本 bot（空串）。返回 `Err(用户可读文案)`，调用方原样打印后 exit 1。
 fn parse_task_to_target(raw: &str) -> Result<task_store::TaskTarget, String> {
@@ -1875,9 +1875,9 @@ fn parse_task_to_target(raw: &str) -> Result<task_store::TaskTarget, String> {
     if tchat.trim().is_empty() {
         return Err(format!("--to 的 chat_id 不能为空：{raw}"));
     }
-    if crate::buzz::keys::looks_like_channel_uuid(tchat.trim()) {
+    if crate::runtime::keys::looks_like_channel_uuid(tchat.trim()) {
         return Err(format!(
-            "--to 的 chat_id「{}」形如 buzz 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
+            "--to 的 chat_id「{}」形如 历史频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
             tchat.trim()
         ));
     }
@@ -1965,7 +1965,7 @@ fn converge_deliver_source(
         let (chat, fell_back) = deliver::correct_injected_chat(env_chat, &primary);
         if fell_back {
             eprintln!(
-                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat}」形如 buzz 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
+                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat}」形如 历史频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
             );
         }
         item.source_chat = chat.clone();
@@ -2522,7 +2522,7 @@ fn run_trash_cli(args: &[String]) -> i32 {
 
 /// 一键创建团队 CLI（#100 P0）：LLM 按提示词生成团队方案（预览确认对象）。
 /// 用法：agent-bridge team generate "<目标>" [--members "小王,steven"] [--template 软件产品团队]
-/// （--backend 已废弃：单后端化 P3.4 后统一由随包 buzz-agent 执行，传入仅警告并忽略）
+/// （--backend 已废弃：单后端化 P3.4 后统一由随包 abb-agent 执行，传入仅警告并忽略）
 /// 成功 → stdout 输出校验后的团队方案 JSON（缩进）；失败 → stderr 提示重试/手动编辑。
 fn run_team_cli(args: &[String]) -> i32 {
     match args.first().map(|s| s.as_str()) {
@@ -2889,11 +2889,11 @@ mod tests {
             );
         }
         // 频道 UUID（裸值 / 带 bot 前缀）→ 拒绝：它不是平台 receive_id
-        let uuid = crate::buzz::keys::channel_uuid(
+        let uuid = crate::runtime::keys::channel_uuid(
             "cli_a8a27ff268b8900e",
             "oc_1f097b843c4d12b3bc8b91205cfe4dd8",
         );
-        assert!(crate::buzz::keys::looks_like_channel_uuid(&uuid));
+        assert!(crate::runtime::keys::looks_like_channel_uuid(&uuid));
         for raw in [uuid.clone(), format!("feishu:{uuid}")] {
             assert!(
                 parse_task_to_target(&raw).is_err(),

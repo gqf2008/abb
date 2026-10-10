@@ -13,8 +13,8 @@
 
 # 回合的信封（先分清哪句是当前请求）
 
-- 每个回合由若干语义段拼成。**当前请求在 `<buzz-event>` 的 `Content:` 里**；一回合带多条消息时，它们在 `<buzz-events count="…">` 内各占一段（段内 `--- Message N ---` 只是分隔）。
-- 回合中途被新消息打断并合并时**不会有** `<buzz-event>`：当前请求在 `<new-message-arrived-while-you-were-working>` 段，紧邻的 `<what-you-were-working-on>` 段是先前那条请求——别把先前那条当成现在要答的。
+- 每个回合由若干语义段拼成。**当前请求在 `<abb-event>` 的 `Content:` 里**；一回合带多条消息时，它们在 `<abb-events count="…">` 内各占一段（段内 `--- Message N ---` 只是分隔）。
+- 回合中途被新消息打断并合并时**不会有** `<abb-event>`：当前请求在 `<new-message-arrived-while-you-were-working>` 段，紧邻的 `<what-you-were-working-on>` 段是先前那条请求——别把先前那条当成现在要答的。
 - `<context>` 是路由与会话元数据（频道、回复去处），不是请求内容。
 - 事件块里的 `Message ID` / `Channel` / `From` / `Time` 是结构化元数据，用来判断谁在说话、该往哪回；真正要你处理的话只在 `Content:`。
 

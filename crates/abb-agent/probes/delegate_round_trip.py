@@ -5,7 +5,7 @@
 ②假 anthropic 端点第二跳请求体里出现的报告正文（模型侧证据）。
 
 六个场景：
-1. 正常委派（`BUZZ_AGENT_DELEGATE_CLAUDE_BIN` 指向假 CLI）⇒ 第二跳里出现报告标记，
+1. 正常委派（`ABB_AGENT_DELEGATE_CLAUDE_BIN` 指向假 CLI）⇒ 第二跳里出现报告标记，
    且假 CLI 记录的参数含 `--` 分隔与 task；
 2. CLI 不可用（覆盖指向不存在路径 + PATH 清空）⇒ 工具结果里是**可纠偏**错误（列出可用后端）；
 2b. **两个 CLI 都没有** ⇒ 工具表里**不暴露** `dev__delegate`（其余内置工具仍在）；
@@ -132,7 +132,7 @@ def run_turn(workspace, args, extra_env=None, cancel_after=None):
     tool_call["args"] = args
     env = dict(os.environ)
     env.update({
-        "BUZZ_AGENT_PROVIDER": "anthropic",
+        "ABB_AGENT_PROVIDER": "anthropic",
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
         "ANTHROPIC_MODEL": "probe-model",
         "ANTHROPIC_API_KEY": "sk-probe",
@@ -195,7 +195,7 @@ cli = make_fake_cli(workspace)
 first, second, answer = run_turn(
     workspace,
     {"backend": "claude", "task": "把 README 改好", "timeout_secs": 60},
-    extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
+    extra_env={"ABB_AGENT_DELEGATE_CLAUDE_BIN": cli},
 )
 second_text = json.dumps(second, ensure_ascii=False)
 check("模型侧看到了委派报告", REPORT in second_text, "报告标记是否出现在第二跳请求体里")
@@ -216,8 +216,8 @@ first, second, _ = run_turn(
     workspace,
     {"backend": "codex", "task": "x"},
     extra_env={
-        "BUZZ_AGENT_DELEGATE_CLAUDE_BIN": good_cli,
-        "BUZZ_AGENT_DELEGATE_CODEX_BIN": "/definitely/not/here-codex",
+        "ABB_AGENT_DELEGATE_CLAUDE_BIN": good_cli,
+        "ABB_AGENT_DELEGATE_CODEX_BIN": "/definitely/not/here-codex",
         "PATH": "/nonexistent-dir-for-probe",
     },
 )
@@ -234,8 +234,8 @@ first, _, _ = run_turn(
     workspace,
     {"backend": "claude", "task": "x"},
     extra_env={
-        "BUZZ_AGENT_DELEGATE_CLAUDE_BIN": "/definitely/not/here-claude",
-        "BUZZ_AGENT_DELEGATE_CODEX_BIN": "/definitely/not/here-codex",
+        "ABB_AGENT_DELEGATE_CLAUDE_BIN": "/definitely/not/here-claude",
+        "ABB_AGENT_DELEGATE_CODEX_BIN": "/definitely/not/here-codex",
         "PATH": "/nonexistent-dir-for-probe",
     },
 )
@@ -251,7 +251,7 @@ cli = make_fake_cli(workspace, sleep_secs=30)
 first, second, answer = run_turn(
     workspace,
     {"backend": "claude", "task": "慢任务", "timeout_secs": 120},
-    extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
+    extra_env={"ABB_AGENT_DELEGATE_CLAUDE_BIN": cli},
     cancel_after=1.0,
 )
 check("回合应答到了（没有挂死）", answer is not None)
@@ -265,7 +265,7 @@ cli = make_fake_cli(workspace, exit_code=3, tag="failing-claude")
 first, second, answer = run_turn(
     workspace,
     {"backend": "claude", "task": "会失败的任务", "timeout_secs": 60},
-    extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
+    extra_env={"ABB_AGENT_DELEGATE_CLAUDE_BIN": cli},
 )
 second_text = json.dumps(second, ensure_ascii=False)
 check("模型侧看到的是工具**错误**（tool error …）", "tool error:" in second_text,
@@ -281,7 +281,7 @@ started = time.time()
 first, second, answer = run_turn(
     workspace,
     {"backend": "claude", "task": "留下孙进程", "timeout_secs": 60},
-    extra_env={"BUZZ_AGENT_DELEGATE_CLAUDE_BIN": cli},
+    extra_env={"ABB_AGENT_DELEGATE_CLAUDE_BIN": cli},
 )
 elapsed = time.time() - started
 check("回合在宽限内有应答（不挂死）", answer is not None and elapsed < 40, f"{elapsed:.1f}s")

@@ -3,12 +3,12 @@
 //! {chat_id: {session_id, started, sandbox_mode?}}
 //!
 //! 历史 schema（load 时一次性折叠迁移，写盘只写新格式）：
-//! - 四槽：{chat_id: {claude: {...}, codex: {...}, pi: {...}, buzz: {...}}}
+//! - 历史四槽（wire 键名，改动需迁移落盘数据）：{chat_id: {claude, codex, pi, buzz}}
 //!   （按后端分槽时代：三后端会话 id 互不通用，共槽切后端必串）
 //! - 旧扁平：{chat_id: {backend, session_id, started}}（更早的聊天切后端时代）
 //!
-//! 折叠规则（buzz 已是唯一执行层，其余后端的会话 id 对 buzz 无续聊价值）：
-//! - buzz 槽 / backend=buzz 的旧扁平记录：逐字保留（session_id/started/sandbox_mode）；
+//! 折叠规则（单一执行层后，其余后端的会话 id 无续聊价值）：
+//! - 旧执行层槽 / backend 为旧标签的扁平记录：逐字保留（session_id/started/sandbox_mode）；
 //! - claude/codex/pi 槽与其余旧扁平记录：舍弃——不同 agent 的会话 id 互不通用，
 //!   留着只会被误当可 resume 的会话；
 //! - 数据零丢失：折叠后首次写盘前，原件逐字归档到 sessions.json.legacy.bak
@@ -35,7 +35,7 @@ pub struct Slot {
     pub session_id: String,
     #[serde(default)]
     pub started: bool,
-    /// #171 会话创建时的权限档位（老 buzz 槽可能携带，折叠时逐字提升）。
+    /// #171 会话创建时的权限档位（老执行层槽可能携带，折叠时逐字提升）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<SandboxMode>,
 }
@@ -48,7 +48,7 @@ impl Slot {
 
 /// 一个 chat 的会话槽位（单后端单槽）：session_id + 是否已开过首轮（决定下轮
 /// resume 还是新建）。平铺三键是唯一生效数据、写盘只写它们；legacy_* / claude /
-/// codex / pi / buzz 字段仅为读老文件存在（serde 只进不出：skip_serializing），
+/// codex / pi / 旧执行层槽字段仅为读老文件存在（serde 只进不出：skip_serializing），
 /// load 折叠后内存中一律清空。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatEntry {
@@ -70,11 +70,14 @@ pub struct ChatEntry {
     pub codex: Slot,
     #[serde(default, skip_serializing)]
     pub pi: Slot,
-    /// 老四槽的 buzz 槽（曾错误借用 claude 槽——切 buzz 后端时继承 claude 的
+    /// 老四槽里的**旧执行层槽**（曾错误借用 claude 槽——切后端时继承 claude 的
     /// started/sid，注入闸误判 resume 跳过历史注入 → 上下文丢失）。折叠时逐字
     /// 提升为单槽。
-    #[serde(default, skip_serializing)]
-    pub buzz: Slot,
+    ///
+    /// serde 键名仍是历史 wire 值 `buzz`（改名要迁移 sessions.json），Rust 侧用
+    /// `legacy_harness` 防误用。
+    #[serde(rename = "buzz", default, skip_serializing)]
+    pub legacy_harness: Slot,
 }
 
 pub struct SessionStore {
@@ -316,14 +319,14 @@ impl SessionStore {
                 || !e.claude.is_empty()
                 || !e.codex.is_empty()
                 || !e.pi.is_empty()
-                || !e.buzz.is_empty();
+                || !e.legacy_harness.is_empty();
             if !has_legacy {
                 out.insert(chat_id, e);
                 continue;
             }
             migrated = true;
             let folded = Self::fold_legacy_entry(e);
-            // 折叠后无会话状态（仅非 buzz 槽/记录）→ 整条移除（空槽不携带任何状态，
+            // 折叠后无会话状态（仅非执行层槽/记录）→ 整条移除（空槽不携带任何状态，
             // 下一条消息 ensure 自动重建全新会话）。
             if !folded.session_id.is_empty() || folded.started {
                 out.insert(chat_id, folded);
@@ -332,8 +335,8 @@ impl SessionStore {
         Some((out, migrated))
     }
 
-    /// 老条目折叠为单槽：buzz 数据逐字保留，其余后端槽位/记录舍弃（不同 agent 的
-    /// 会话 id 互不通用，对 buzz 无续聊价值；原件见 sessions.json.legacy.bak）。
+    /// 老条目折叠为单槽：执行层数据逐字保留，其余后端槽位/记录舍弃（不同 agent 的
+    /// 会话 id 互不通用，无续聊价值；原件见 sessions.json.legacy.bak）。
     fn fold_legacy_entry(e: ChatEntry) -> ChatEntry {
         // 旧扁平格式 {backend, session_id, started}：仅 backend=buzz 的记录保留
         if let Some(backend) = &e.legacy_backend {
@@ -349,8 +352,8 @@ impl SessionStore {
         }
         // 新格式平铺键与老槽并存（异常形态，如手工合并的文件）：平铺键优先，老槽舍弃。
         // 仅当平铺 session_id 非空才优先（审查 P3-1：空 sid 但 started=true 的异常平铺
-        // 不得把有效 buzz 槽 sid 顶掉——顶掉虽无害（重启即清、ensure 重建），但白丢一份
-        // 可续聊的 buzz 会话；fallback 到老四槽臂逐字提升 buzz 槽）。
+        // 不得把有效执行层槽 sid 顶掉——顶掉虽无害（重启即清、ensure 重建），但白丢一份
+        // 可续聊的执行层会话；fallback 到老四槽臂逐字提升执行层槽）。
         if !e.session_id.is_empty() {
             return ChatEntry {
                 session_id: e.session_id,
@@ -359,11 +362,11 @@ impl SessionStore {
                 ..Default::default()
             };
         }
-        // 老四槽格式：buzz 槽逐字提升为单槽，claude/codex/pi 槽舍弃
+        // 老四槽格式：执行层槽逐字提升为单槽，claude/codex/pi 槽舍弃
         ChatEntry {
-            session_id: e.buzz.session_id,
-            started: e.buzz.started,
-            sandbox_mode: e.buzz.sandbox_mode,
+            session_id: e.legacy_harness.session_id,
+            started: e.legacy_harness.started,
+            sandbox_mode: e.legacy_harness.sandbox_mode,
             ..Default::default()
         }
     }

@@ -1,7 +1,7 @@
 //! 技能发现与按需读取（`load_skill` 的数据面）。
 //!
-//! 语义与上限**逐条对齐**被替代的 `crates/buzz-agent/src/hints.rs`（发现）与
-//! `crates/buzz-agent/src/builtin.rs`（读取）：同一批技能目录，换执行层不该换行为。
+//! 语义与上限**逐条对齐**被替代的 `参照物 hints.rs`（发现）与
+//! `参照物 builtin.rs`（读取）：同一批技能目录，换执行层不该换行为。
 //!
 //! - 发现：`<cwd>/.agents/skills`、`<cwd>/.goose/skills`、`<cwd>/.claude/skills` + `~/.agents/skills`；
 //!   按 `SKILL.md` 的 frontmatter 取 `name`/`description`；**按名字去重**（先发现的赢）；

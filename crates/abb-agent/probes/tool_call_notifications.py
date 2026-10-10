@@ -47,7 +47,7 @@ def run_turn(workspace, tool_call, extra_env=None, mcp=None, timeout=40):
         "ABB_AGENT_FAUX_TEXT": "回合结束",
         "RUST_LOG": "info",
     })
-    for key in ("ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL", "BUZZ_AGENT_PROVIDER"):
+    for key in ("ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL", "ABB_AGENT_PROVIDER"):
         env.pop(key, None)
     env.update(extra_env or {})
 
@@ -202,7 +202,7 @@ def run_cancel_turn(workspace):
         "ABB_AGENT_FAUX_TEXT": "回合结束",
         "RUST_LOG": "info",
     })
-    for key in ("ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL", "BUZZ_AGENT_PROVIDER"):
+    for key in ("ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL", "ABB_AGENT_PROVIDER"):
         env.pop(key, None)
     proc = subprocess.Popen(BIN, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, text=True, bufsize=1)

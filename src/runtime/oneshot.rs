@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::harness::{AgentConfig, BuzzHandle, ChannelMeta, SyncTurnOutcome};
+use super::harness::{AgentConfig, ChannelMeta, RuntimeHandle, SyncTurnOutcome};
 use super::queue::InboundMsg;
 
 /// 拆栈预算：正常路径 = 回合已毕、杀空闲 agent 进程组（≤5s）；Timeout 路径 =
@@ -70,7 +70,7 @@ pub async fn oneshot_turn(
         .unwrap_or_default()
         .display()
         .to_string();
-    let handle = BuzzHandle::new(cfg, stop.clone(), cwd, Vec::new());
+    let handle = RuntimeHandle::new(cfg, stop.clone(), cwd, Vec::new());
     let mut run_task = tokio::spawn(super::harness::run_loop(handle.clone()));
 
     let channel_id = Uuid::new_v4();
@@ -149,7 +149,7 @@ fn strip_backend_suffix(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buzz::harness::MAX_TURN_DURATION;
+    use crate::runtime::harness::MAX_TURN_DURATION;
 
     /// 与 bridge/mod.rs make_test_harness 同款的 mock 装配，但完全自含
     ///（oneshot 的卖点正是不借任何常驻件）。extra_env 追加 mock 触发臂。
@@ -399,7 +399,7 @@ mod tests {
 #[cfg(test)]
 mod isolation_guard_tests {
     /// 「长任务必须独立会话」（owner 2026-10-04）：这些长任务入口只允许经 oneshot_turn ——
-    /// 它自建 BuzzHandle + run_loop + 独立池/独立 agent，跑完即收；一旦改成复用聊天会话的
+    /// 它自建 RuntimeHandle + run_loop + 独立池/独立 agent，跑完即收；一旦改成复用聊天会话的
     /// harness，一个长任务就会占住某个聊天的 agent，把那个会话堵死。
     #[test]
     fn long_tasks_go_through_oneshot_turn() {

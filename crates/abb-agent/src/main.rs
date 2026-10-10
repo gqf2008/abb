@@ -1,6 +1,6 @@
 //! `abb-agent` 可执行入口：stdio 上跑 ACP（行分隔 JSON-RPC 2.0）。
 //!
-//! 进程契约与 `buzz-agent` 一致（abb 的 `src/buzz/acp.rs` 是客户端）：
+//! 进程契约与 `buzz-agent` 一致（abb 的 `src/runtime/acp.rs` 是客户端）：
 //! stdin 收请求/通知，stdout 出应答/通知。**stdout 只跑协议**——日志一律 stderr，
 //! 否则会直接破坏帧。
 //!
@@ -17,7 +17,7 @@ use abb_agent::wire::{parse_line, Reader, Writer};
 async fn main() -> std::process::ExitCode {
     init_logging();
 
-    // 配置错误要**响亮失败**（与被替代组件的 `die()` 同款，exit 2）：`BUZZ_AGENT_NO_HINTS`
+    // 配置错误要**响亮失败**（与被替代组件的 `die()` 同款，exit 2）：`ABB_AGENT_NO_HINTS`
     // 只在进程级收口「授权者看不到 owner 私有约定」，读不懂就不能拿它赌。
     let server = match Server::try_new(Writer::new(Box::new(tokio::io::stdout()))) {
         Ok(server) => Arc::new(server),

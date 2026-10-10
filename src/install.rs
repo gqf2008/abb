@@ -1155,19 +1155,19 @@ mod installer_guards {
                 .any(|l| l.contains("agent-bridge.exe") && l.contains("DestDir")),
             "安装包必须随带 agent-bridge.exe"
         );
-        // 执行层仅 abb-agent（刀 4b 后 buzz-agent 已删）。运行时按 current_exe 同目录解析。
+        // 执行层仅 abb-agent（刀 4b 后旧执行层可执行已删；下面那句 taskkill 只为清理老安装残留）。
         assert!(
             code_lines()
                 .iter()
                 .any(|l| l.contains("abb-agent.exe") && l.contains("DestDir")),
             "安装包必须随带 abb-agent.exe"
         );
-        // 反向锁：buzz-agent 不再随包（但卸载/升级仍会 taskkill 旧进程，见 [UninstallRun]）。
+        // 反向锁：旧执行层（buzz-agent.exe）不再随包——名字是**历史产物名**，保留只为升级/卸载清洁。
         assert!(
             !code_lines()
                 .iter()
                 .any(|l| l.contains("buzz-agent.exe") && l.contains("DestDir")),
-            "buzz-agent 已删，安装包不得再随带它"
+            "旧执行层可执行已删，安装包不得再随带它"
         );
         let manifest = include_str!("../Cargo.toml");
         for banned in ["abb-spawner", "abb-elev-helper", "abb-helper"] {

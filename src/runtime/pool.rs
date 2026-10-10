@@ -27,8 +27,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::buzz::acp::{AcpClient, AcpError, EnvVar, McpServer, StopReason, SystemPromptTransport};
-use crate::buzz::queue::{CancelReason, DedupMode, FlushBatch, PromptChannelInfo};
+use crate::runtime::acp::{
+    AcpClient, AcpError, EnvVar, McpServer, StopReason, SystemPromptTransport,
+};
+use crate::runtime::queue::{CancelReason, DedupMode, FlushBatch, PromptChannelInfo};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -148,7 +150,7 @@ pub struct OwnedAgent {
     /// 本进程全部会话的执行档位载荷（单后端化 P2.2，来自 AgentConfig）：
     /// `create_session_and_apply_model` 随 `session/new` `_meta` 下发。
     /// None = FullAccess（今天字节级行为）。
-    pub session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+    pub session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
 }
 
 /// Package name reported by `claude-agent-acp` in its `initialize` response.
@@ -911,13 +913,13 @@ fn mcp_servers_with_git_origin(
     let mut servers = servers.to_vec();
     let origin = match (channel_id, channel_type) {
         (Some(channel_id), Some("stream")) => Some(EnvVar {
-            name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
+            name: "ABB_SESSION_CHANNEL_ID".into(),
             value: channel_id.to_string(),
         }),
         (Some(_), _) => agent_name
             .filter(|name| !name.trim().is_empty())
             .map(|name| EnvVar {
-                name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
+                name: "ABB_SESSION_AGENT_NAME".into(),
                 value: name.trim().to_string(),
             }),
         (None, _) => None,
@@ -951,10 +953,10 @@ pub(crate) fn prepend_standing_for_legacy(
     }
     let mut sections: Vec<String> = Vec::with_capacity(2);
     if let Some(bp) = base_prompt {
-        sections.push(crate::buzz::queue::base_section(bp));
+        sections.push(crate::runtime::queue::base_section(bp));
     }
     if let Some(sp) = system_prompt {
-        sections.push(crate::buzz::prompt_framing::semantic_section(
+        sections.push(crate::runtime::prompt_framing::semantic_section(
             "agent-instructions",
             sp,
         ));
@@ -981,16 +983,16 @@ fn framed_system_prompt(
     match (base_prompt, system_prompt) {
         (Some(bp), Some(sp)) => Some(format!(
             "{}\n\n{}\n\n{}",
-            crate::buzz::queue::base_section(bp),
+            crate::runtime::queue::base_section(bp),
             workspace_section(cwd),
-            crate::buzz::prompt_framing::semantic_section("agent-instructions", sp),
+            crate::runtime::prompt_framing::semantic_section("agent-instructions", sp),
         )),
         (Some(bp), None) => Some(format!(
             "{}\n\n{}",
-            crate::buzz::queue::base_section(bp),
+            crate::runtime::queue::base_section(bp),
             workspace_section(cwd)
         )),
-        (None, Some(sp)) => Some(crate::buzz::prompt_framing::semantic_section(
+        (None, Some(sp)) => Some(crate::runtime::prompt_framing::semantic_section(
             "agent-instructions",
             sp,
         )),
@@ -999,7 +1001,7 @@ fn framed_system_prompt(
 }
 
 fn workspace_section(cwd: &str) -> String {
-    crate::buzz::prompt_framing::semantic_section(
+    crate::runtime::prompt_framing::semantic_section(
         "workspace",
         &format!("Current working directory: {cwd}"),
     )
@@ -1013,9 +1015,9 @@ fn with_team(prompt: Option<String>, instructions: Option<&str>) -> Option<Strin
     match (prompt, instructions) {
         (Some(prompt), Some(instructions)) => Some(format!(
             "{prompt}\n\n{}",
-            crate::buzz::prompt_framing::semantic_section("team-instructions", instructions)
+            crate::runtime::prompt_framing::semantic_section("team-instructions", instructions)
         )),
-        (None, Some(instructions)) => Some(crate::buzz::prompt_framing::semantic_section(
+        (None, Some(instructions)) => Some(crate::runtime::prompt_framing::semantic_section(
             "team-instructions",
             instructions,
         )),
@@ -1331,15 +1333,15 @@ pub async fn run_prompt_task(
 
     // `slash_command` holds the bare command. It is sent as the FIRST prompt
     // content block so ACP connectors' slash-command detection
-    // (`prompt[0].text.startsWith("/")`) fires; the wrapped Buzz context
+    // (`prompt[0].text.startsWith("/")`) fires; the wrapped Runtime context
     // follows as a second block.
     // Profile lookup was trimmed with the relay layer — no known display
     // names to strip, so slash-command detection handles bare commands.
     let known_names: &[&str] = &[];
-    let slash_command = crate::buzz::queue::slash_command_for_batch(&batch, known_names);
-    let prompt_sections: Vec<String> = crate::buzz::queue::format_prompt(
+    let slash_command = crate::runtime::queue::slash_command_for_batch(&batch, known_names);
+    let prompt_sections: Vec<String> = crate::runtime::queue::format_prompt(
         &batch,
-        &crate::buzz::queue::FormatPromptArgs {
+        &crate::runtime::queue::FormatPromptArgs {
             channel_info: resolved_channel_info.as_ref(),
             has_system_prompt_support: agent.has_system_prompt_support(),
             base_prompt: ctx.base_prompt,

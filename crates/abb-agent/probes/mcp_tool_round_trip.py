@@ -36,7 +36,7 @@ env.update({
     "RUST_LOG": "info",
 })
 # 清掉可能干扰的供应商配置（faux 优先，但不留噪声）。
-for key in ("BUZZ_AGENT_PROVIDER", "ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL"):
+for key in ("ABB_AGENT_PROVIDER", "ANTHROPIC_MODEL", "OPENAI_COMPAT_MODEL"):
     env.pop(key, None)
 
 proc = subprocess.Popen(BIN, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -71,7 +71,7 @@ def wait_for(pred, timeout):
 send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 2}})
 wait_for(lambda l: '"id":1,' in l, 15)
 
-# 关键：mcpServers 通过 session/new 下发（shape 与 src/buzz/acp.rs 的 McpServer 一致）。
+# 关键：mcpServers 通过 session/new 下发（shape 与 src/runtime/acp.rs 的 McpServer 一致）。
 send({
     "jsonrpc": "2.0",
     "id": 2,

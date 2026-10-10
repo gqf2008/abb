@@ -13,13 +13,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 mod access;
-mod buzzreply;
+mod agentreply;
 mod outbox;
 mod recover;
 mod teamflow;
 mod virtualbot;
 
-/// #206：bot_key → Bridge 弱引用注册表（service 的 buzz 回合投递任务按它把
+/// #206：bot_key → Bridge 弱引用注册表（service 的 runtime 回合投递任务按它把
 /// 回复路由给归属 bot 的 Bridge）。Weak 不阻止 bot 循环退出后 Bridge 析构；
 /// 注册在 run_bot 构造后即发生（早于事件循环），而 dispatch 依赖 Bridge 存在——
 /// 所以任何回复到达时注册必然已完成，无「回复先于注册」窗口。
@@ -45,14 +45,14 @@ impl BridgeRegistry {
 
 /// 单后端化（P2.1）：按 bot 构造的 ACP 句柄对——执行层随包（单一执行层 `abb-agent`，两种角色都走它；见 `service::resolve_acp_commands`），
 /// normal 与 granted（授权者受限会话）各一个**进程级**实例。
-/// granted 与 normal 差在 env（`BUZZ_AGENT_NO_HINTS=1`——fork 的 hints
+/// granted 与 normal 差在 env（`ABB_AGENT_NO_HINTS=1`——fork 的 hints
 ///（~/AGENTS.md、~/.agents/skills 扫盘）发生在 session/new **之前**，per-session
 /// `_meta` 管不到，只能进程级收口，计划决策 4）与 `session_sandbox`（granted
 /// 强制受限剖面）。域闸/argv 白名单经 `_meta` 随会话下发；dispatch/job 按角色
 /// 路由到对应实例（P2.2），granted 未路由时惰性待命（懒启动 = 零进程成本）。
 pub struct BotAcpHandles {
-    pub normal: Arc<crate::buzz::harness::BuzzHandle>,
-    pub granted: Arc<crate::buzz::harness::BuzzHandle>,
+    pub normal: Arc<crate::runtime::harness::RuntimeHandle>,
+    pub granted: Arc<crate::runtime::harness::RuntimeHandle>,
 }
 
 /// 一个正在跑的定时任务轮次（#309 PR-A2）。停止词靠它把取消送到**正确的**实例与频道：
@@ -66,7 +66,7 @@ pub struct BotAcpHandles {
 #[derive(Clone)]
 pub(crate) struct JobTurn {
     pub chat_id: String,
-    pub handle: Arc<crate::buzz::harness::BuzzHandle>,
+    pub handle: Arc<crate::runtime::harness::RuntimeHandle>,
     pub channel_id: uuid::Uuid,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -74,7 +74,7 @@ pub(crate) struct JobTurn {
 impl JobTurn {
     pub(crate) fn new(
         chat_id: String,
-        handle: Arc<crate::buzz::harness::BuzzHandle>,
+        handle: Arc<crate::runtime::harness::RuntimeHandle>,
         channel_id: uuid::Uuid,
     ) -> Self {
         Self {
@@ -93,14 +93,14 @@ pub struct Bridge {
     /// 装配）。None = 未装配（测试挡板/job 内部路径），dispatch 回落 spawn 同步路径——
     /// 语义同旧「空 HashMap」。桥内会话/历史/pending 语义与句柄拓扑无关。
     pub acp_handles: Option<BotAcpHandles>,
-    /// 构造时 config 快照（buzz 预检的供应商判定源——测试可注入，生产由 service
+    /// 构造时 config 快照（runtime 预检的供应商判定源——测试可注入，生产由 service
     /// 传入运行时 config；provider 变更伴随 harness env 重装需重启，快照语义一致）。
     pub cfg_snapshot: Config,
     /// #206 回合登记：channel uuid → dispatch 时的 (mid, key, epoch) 快照。
-    /// buzz 回复（TurnOutput）到达时按它定位会话 key、比对代际闸；消费即摘除
+    /// runtime 回复（TurnOutput）到达时按它定位会话 key、比对代际闸；消费即摘除
     ///（同步形态一回合一条回复）。内存态无持久面——崩溃语义 at-most-once
-    ///（文档接受，见 buzzreply.rs 模块注释）。
-    pub turn_registry: Mutex<HashMap<uuid::Uuid, buzzreply::TurnEntry>>,
+    ///（文档接受，见 agentreply.rs 模块注释）。
+    pub turn_registry: Mutex<HashMap<uuid::Uuid, agentreply::TurnEntry>>,
     /// #194：虚拟 Bot 群的独立会话存储（per-chat 缓存；键=chat_id）。
     vb_sessions: Mutex<HashMap<String, SessionStore>>,
     pub jobs: JobStore,
@@ -409,7 +409,7 @@ impl Bridge {
         agent_runner: Arc<dyn AgentRunner>,
         bridge_root: &std::path::Path,
     ) -> Bridge {
-        // 单后端化（P4.1）：会话槽位恒选 buzz（老配置 backend/default_backend 字段
+        // 单后端化（P4.1）：会话槽位恒选 runtime（老配置 backend/default_backend 字段
         // 直接忽略——serde 无 deny_unknown_fields 天然容错；槽位折叠在 P4.2）。
         let key = bot.key();
         // I2：快照与 access 快照（self.bot）同源——bot 就是 build 时从 config 复制的那份，
@@ -1172,7 +1172,7 @@ mod tests {
                 .push((chat_id.to_string(), text.to_string()));
             Ok(())
         }
-        /// 话题回复独立记录已随 buzz 账本/回流测试删除（send_thread_reply 走
+        /// 话题回复独立记录已随 回复侧账本/回流测试删除（send_thread_reply 走
         /// send_text 同路径——sent()/sent_chats 断言含失败注入不受影响）。
         async fn send_thread_reply(
             &self,
@@ -1492,11 +1492,11 @@ mod tests {
     }
 
     /// 测试 ACP harness：spawn tests/mock_acp_agent.py（prompt 记录到 record_file，
-    /// 回复 echo 回流），返回 (buzz 实例, 注入用句柄对)。record_file 每测唯一。
+    /// 回复 echo 回流），返回 (runtime 实例, 注入用句柄对)。record_file 每测唯一。
     fn make_test_harness(
         record_file: std::path::PathBuf,
         registry: &crate::bridge::BridgeRegistry,
-    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
+    ) -> (Arc<crate::runtime::harness::RuntimeHandle>, BotAcpHandles) {
         make_test_harness_full(record_file, registry, None, Vec::new())
     }
 
@@ -1506,8 +1506,8 @@ mod tests {
     fn make_test_harness_with_sandbox(
         record_file: std::path::PathBuf,
         registry: &crate::bridge::BridgeRegistry,
-        session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
-    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
+        session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
+    ) -> (Arc<crate::runtime::harness::RuntimeHandle>, BotAcpHandles) {
         make_test_harness_full(record_file, registry, session_sandbox, Vec::new())
     }
 
@@ -1516,17 +1516,17 @@ mod tests {
     fn make_test_harness_full(
         record_file: std::path::PathBuf,
         registry: &crate::bridge::BridgeRegistry,
-        session_sandbox: Option<crate::buzz::acp::SessionSandboxMeta>,
+        session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
         extra_env: Vec<(String, String)>,
-    ) -> (Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles) {
+    ) -> (Arc<crate::runtime::harness::RuntimeHandle>, BotAcpHandles) {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "python3".to_string());
         let mk = || {
-            crate::buzz::harness::BuzzHandle::new(
-                crate::buzz::harness::AgentConfig {
+            crate::runtime::harness::RuntimeHandle::new(
+                crate::runtime::harness::AgentConfig {
                     command: python3.clone(),
                     args: vec![script.display().to_string()],
                     extra_env: vec![
@@ -1550,17 +1550,17 @@ mod tests {
                 Vec::new(),
             )
         };
-        let buzz = mk();
+        let rt = mk();
         let handles = BotAcpHandles {
-            normal: buzz.clone(),
+            normal: rt.clone(),
             // 默认 granted 复用同一 mock 实例（多数测试不区分实例）；需要区分
             // normal/granted 的用例自行组装 BotAcpHandles（见
             // restricted_session_refused_* 的两个硬闸测试）
-            granted: buzz.clone(),
+            granted: rt.clone(),
         };
         // 诊断探针：3s 后快照 dead 状态（spawn 失败 = dead=true），写诊断文件供测试失败信息引用
         {
-            let probe = buzz.clone();
+            let probe = rt.clone();
             let rf = record_file.clone();
             crate::svc_tasks::tasks().spawn("acp-test-probe", async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -1573,11 +1573,11 @@ mod tests {
         }
         // 主循环 + 回合消费（生产 service 同款）：没有它们 Cmd::Message 无人消费，
         // queue 永不 dispatch、prompt 永不到 mock agent。
-        let run_handle = buzz.clone();
+        let run_handle = rt.clone();
         crate::svc_tasks::tasks().spawn("acp-test-run", async move {
-            crate::buzz::harness::run_loop(run_handle).await;
+            crate::runtime::harness::run_loop(run_handle).await;
         });
-        let turn_handle = buzz.clone();
+        let turn_handle = rt.clone();
         let registry = registry.clone();
         crate::svc_tasks::tasks().spawn("acp-test-turns", async move {
             let stop = crate::svc_tasks::shutdown_token();
@@ -1597,7 +1597,7 @@ mod tests {
                 }
             }
         });
-        (buzz, handles)
+        (rt, handles)
     }
 
     /// 等待异步回合回复到达（MockMessenger.sent() 出现目标片段），超时 10s panic。
@@ -1657,7 +1657,7 @@ mod tests {
     fn build_test_bridge_full(
         runner: Arc<dyn AgentRunner>,
         bot: BotConfig,
-        acp: Option<(Arc<crate::buzz::harness::BuzzHandle>, BotAcpHandles)>,
+        acp: Option<(Arc<crate::runtime::harness::RuntimeHandle>, BotAcpHandles)>,
     ) -> (Arc<Bridge>, Arc<MockMessenger>) {
         let msgr = Arc::new(MockMessenger::new());
         // 供应商硬闸（#219）需要生效供应商：测试统一注入 test-prov（mock agent
@@ -1799,7 +1799,8 @@ mod tests {
 
     /// T1/T2：新会话首轮注入 [历史上下文]（角色前缀、在当前消息之前）+ 回复尾部
     /// 带提示；第二轮同会话 resume → 不重复注入、无提示。（#49 后端切换迁移语义；
-    /// P4.1 后历史/marker 的 backend 字段恒记 "buzz"——它只是出处标注，不参与闸判定。）
+    /// P4.1 后历史/marker 的 backend 字段恒记 "buzz"——它是**写进 history/marker 的持久
+    /// 出处标注**（改名要迁移落盘数据），不参与闸判定。）
     #[tokio::test]
     async fn backend_switch_injects_history_once() {
         let runner = Arc::new(MockAgentRunner::immediate("pi 的回答"));
@@ -1846,8 +1847,8 @@ mod tests {
         cleanup_bridge(&bridge);
     }
 
-    /// 场景回放（实机 bug：13:51 切 buzz 后端后上下文丢失）：
-    /// 预置「上个进程」持久态（buzz 槽 started=true + marker 同 sid + 历史轮次）
+    /// 场景回放（实机 bug：13:51 切 runtime 后端后上下文丢失）：
+    /// 预置「上个进程」持久态（历史槽位 started=true + marker 同 sid + 历史轮次）
     /// → 模拟服务重启（新 harness 进程，会话归零）：
     /// - 无复位（旧行为）：注入闸误判 resume，mock agent 收不到 [历史上下文]
     /// - service 复位（新行为）：槽位清空 → 首轮注入历史，上下文接续
@@ -1863,7 +1864,7 @@ mod tests {
         let test_root = std::env::temp_dir().join(format!("abb-bridge-test-{key}"));
         let workspace = test_root.join("workspaces").join(&key);
         let _ = std::fs::create_dir_all(workspace.join("history"));
-        // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 buzz 槽）
+        // 预置「上个进程」持久态（与 seed_migrated_session 同构，但走 历史槽位）
         {
             let sessions = crate::sessions::SessionStore::at(workspace.join("sessions.json"));
             let sid = sessions.ensure_with_started(&chat).0;
@@ -1878,12 +1879,9 @@ mod tests {
         // ── 阶段 A：无复位（复现 bug）——started=true 误判 resume，零注入 ──
         let rec_a = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let reg_a: crate::bridge::BridgeRegistry = Default::default();
-        let (buzz_a, handles_a) = make_test_harness(rec_a.clone(), &reg_a);
-        let (bridge_a, _msgr_a) = build_test_bridge_full(
-            runner.clone(),
-            bot.clone(),
-            Some((buzz_a.clone(), handles_a)),
-        );
+        let (rt_a, handles_a) = make_test_harness(rec_a.clone(), &reg_a);
+        let (bridge_a, _msgr_a) =
+            build_test_bridge_full(runner.clone(), bot.clone(), Some((rt_a.clone(), handles_a)));
         reg_a.register(&bridge_a.bot.key(), &bridge_a);
         bridge_a.handle(test_ev("ma", &chat, "接着修")).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1907,12 +1905,9 @@ mod tests {
         // ── 阶段 B：service 复位（修复）——首轮注入历史 ──
         let rec_b = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let reg_b: crate::bridge::BridgeRegistry = Default::default();
-        let (buzz_b, handles_b) = make_test_harness(rec_b.clone(), &reg_b);
-        let (bridge_b, _msgr_b) = build_test_bridge_full(
-            runner.clone(),
-            bot.clone(),
-            Some((buzz_b.clone(), handles_b)),
-        );
+        let (rt_b, handles_b) = make_test_harness(rec_b.clone(), &reg_b);
+        let (bridge_b, _msgr_b) =
+            build_test_bridge_full(runner.clone(), bot.clone(), Some((rt_b.clone(), handles_b)));
         // 生产路径 service.rs 在 Bridge 构建后同款调用
         bridge_b.sessions.reset_slots_for_service_start();
         reg_b.register(&bridge_b.bot.key(), &bridge_b);
@@ -3794,9 +3789,9 @@ mod tests {
     }
 
     /// 造一个**不拉起任何进程**的 harness 句柄（测试 job 登记表用）。
-    fn tiny_buzz_handle() -> Arc<crate::buzz::harness::BuzzHandle> {
-        crate::buzz::harness::BuzzHandle::new(
-            crate::buzz::harness::AgentConfig {
+    fn tiny_runtime() -> Arc<crate::runtime::harness::RuntimeHandle> {
+        crate::runtime::harness::RuntimeHandle::new(
+            crate::runtime::harness::AgentConfig {
                 command: "true".to_string(),
                 args: Vec::new(),
                 extra_env: Vec::new(),
@@ -3814,7 +3809,7 @@ mod tests {
     #[tokio::test]
     async fn job_turn_registry_supports_multiple_jobs_per_chat() {
         let (bridge, _msgr) = build_test_bridge(Arc::new(MockAgentRunner::immediate("x")));
-        let h = tiny_buzz_handle();
+        let h = tiny_runtime();
         let c1 = uuid::Uuid::new_v4();
         let c2 = uuid::Uuid::new_v4();
         bridge.register_job_turn("jobA", JobTurn::new("oc_multi".into(), h.clone(), c1));
@@ -3842,9 +3837,9 @@ mod tests {
     async fn stop_word_not_swallowed_when_job_turn_not_in_flight() {
         let runner = Arc::new(MockAgentRunner::immediate("ok"));
         let (bridge, _msgr) = build_test_bridge(runner.clone());
-        let h = tiny_buzz_handle();
+        let h = tiny_runtime();
         // 句柄要有 run_loop 才能应答 cancel（否则 reply oneshot 永不回来）
-        tokio::spawn(crate::buzz::harness::run_loop(h.clone()));
+        tokio::spawn(crate::runtime::harness::run_loop(h.clone()));
         bridge.register_job_turn(
             "jobIdle",
             JobTurn::new("oc_idlejob".into(), h.clone(), uuid::Uuid::new_v4()),
@@ -3880,7 +3875,7 @@ mod tests {
         let registry: crate::bridge::BridgeRegistry = Default::default();
         // MOCK_HANG_PROMPT：agent 收到 prompt 后不应答但照收 session/cancel →
         // 回合留在 in-flight，`handle.cancel` 才会返回 Some(true)（真实的取消路径）。
-        let (buzz, handles) = make_test_harness_full(
+        let (rt, handles) = make_test_harness_full(
             rec.clone(),
             &registry,
             None,
@@ -3895,7 +3890,7 @@ mod tests {
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("claude"),
-            Some((buzz.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
 
@@ -3986,7 +3981,7 @@ mod tests {
         let registry: crate::bridge::BridgeRegistry = Default::default();
         // MOCK_HANG_PROMPT：占位回合会一直挂住 → 该 channel 始终 in-flight，
         // 后面那条 job 消息必然进**队列**而不是被 dispatch。
-        let (buzz, handles) = make_test_harness_full(
+        let (rt, handles) = make_test_harness_full(
             rec.clone(),
             &registry,
             None,
@@ -3995,12 +3990,12 @@ mod tests {
         let (bridge, _msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("claude"),
-            Some((buzz.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
 
         let chat_id = format!("oc_queued_{}", uuid::Uuid::new_v4());
-        let channel_id = uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+        let channel_id = uuid::Uuid::parse_str(&crate::runtime::keys::channel_uuid(
             &bridge.bot.key(),
             &chat_id,
         ))
@@ -4011,9 +4006,9 @@ mod tests {
         //    入站 dispatch，不注册同步 waiter）——否则它会占掉该 channel 唯一的
         //    sync_waiters 槽，把后面 job 的等待者顶掉。
         assert!(
-            buzz.push_message(
+            rt.push_message(
                 channel_id,
-                crate::buzz::queue::InboundMsg {
+                crate::runtime::queue::InboundMsg {
                     id_hex: "m_user".to_string(),
                     author_role: "user".to_string(),
                     text: "占住频道".to_string(),
@@ -4031,11 +4026,11 @@ mod tests {
         }
 
         // 2) 排一条 job 消息（channel 忙 → 进队列），并模拟 run_job 的登记
-        let h2 = buzz.clone();
+        let h2 = rt.clone();
         let job_waiter = tokio::spawn(async move {
             h2.wait_turn_outcome(
                 channel_id,
-                crate::buzz::queue::InboundMsg {
+                crate::runtime::queue::InboundMsg {
                     id_hex: "m_job".to_string(),
                     author_role: "owner".to_string(),
                     // 唯一标记：不能用「长任务」这类词——base prompt 里有「长任务分步推进」，
@@ -4050,7 +4045,7 @@ mod tests {
         });
         bridge.register_job_turn(
             "job-queued-1",
-            JobTurn::new(chat_id.clone(), buzz.clone(), channel_id),
+            JobTurn::new(chat_id.clone(), rt.clone(), channel_id),
         );
 
         // 3) 走生产停止词路由。重试直到那条 job 消息确实进了队列——判据就是被测行为
@@ -4083,14 +4078,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             out,
-            crate::buzz::harness::SyncTurnOutcome::Cancelled,
+            crate::runtime::harness::SyncTurnOutcome::Cancelled,
             "排队中被丢弃的 job 必须拿到取消终态"
         );
 
         // 4b) 再丢一次必须是 0：确认上一步真的由 **drop 腿**处理掉了这条排队 job
         //（而不是 cancel 腿命中占用者、job 仍留在队列里等下一次 flush）。
         assert_eq!(
-            buzz.drop_queued_jobs(channel_id).await,
+            rt.drop_queued_jobs(channel_id).await,
             Some(0),
             "被丢弃的排队 job 不应再次出现在队列里"
         );
@@ -4120,7 +4115,7 @@ mod tests {
         let registry: crate::bridge::BridgeRegistry = Default::default();
         // A 收到 prompt 后延迟应答 → 造出确定的「A 在跑」窗口，好在其中启动 B。
         //（只等「登记可见」不够：登记在取闸之前，此时 A 可能还没 dispatch。）
-        let (buzz, handles) = make_test_harness_full(
+        let (rt, handles) = make_test_harness_full(
             rec.clone(),
             &registry,
             None,
@@ -4129,7 +4124,7 @@ mod tests {
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("claude"),
-            Some((buzz.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
         let bot_key = bridge.bot.key();
@@ -4279,7 +4274,7 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("x"));
         let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (buzz, handles) = make_test_harness_full(
+        let (rt, handles) = make_test_harness_full(
             rec.clone(),
             &registry,
             None,
@@ -4289,7 +4284,7 @@ mod tests {
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("claude"),
-            Some((buzz.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
 
@@ -4668,9 +4663,9 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (buzz, handles) = make_test_harness(rec.clone(), &registry);
+        let (rt, handles) = make_test_harness(rec.clone(), &registry);
         let (bridge, _msgr) =
-            build_test_bridge_full(runner.clone(), backend_bot("claude"), Some((buzz, handles)));
+            build_test_bridge_full(runner.clone(), backend_bot("claude"), Some((rt, handles)));
         registry.register(&bridge.bot.key(), &bridge);
         let mut ev = test_ev("m1", "oc_q", "回复内容");
         ev.chat_type = "p2p".to_string(); // 单轨 dispatch：p2p 免登记直接进 harness
@@ -4696,7 +4691,7 @@ mod tests {
         assert_eq!(prompts.len(), 1);
         assert!(
             prompts[0].contains("[引用消息]\n被引用的原消息\n\n回复内容"),
-            "引用块应在 prompt 内（buzz base_prompt 包裹式，位置不限）: {}",
+            "引用块应在 prompt 内（runtime base_prompt 包裹式，位置不限）: {}",
             prompts[0]
         );
         cleanup_bridge(&bridge);
@@ -4714,11 +4709,11 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (buzz, handles) = make_test_harness(rec.clone(), &registry);
+        let (rt, handles) = make_test_harness(rec.clone(), &registry);
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("claude"),
-            Some((buzz.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
         // 随机 chat_id：绝不可能是登记表里的 vb 群（测试用临时 vb_store）
@@ -4741,13 +4736,13 @@ mod tests {
         };
         assert_eq!(prompts.len(), 1);
         // 群根频道自动登记（adhoc）
-        let uuid = uuid::Uuid::parse_str(&crate::buzz::keys::channel_uuid(
+        let uuid = uuid::Uuid::parse_str(&crate::runtime::keys::channel_uuid(
             &bridge.bot.key(),
             &chat_id,
         ))
         .unwrap();
-        assert!(buzz.channel_registered(&uuid), "未登记群应被自动登记");
-        let meta = buzz.channel_meta(&uuid).unwrap();
+        assert!(rt.channel_registered(&uuid), "未登记群应被自动登记");
+        let meta = rt.channel_meta(&uuid).unwrap();
         assert!(meta.adhoc, "自动登记的群应带 adhoc 标记");
         assert!(meta.name.starts_with("群聊·"), "回退群名: {}", meta.name);
         // 无拒答文案投递
@@ -4794,7 +4789,7 @@ mod tests {
         let (granted, _hg) = make_test_harness_with_sandbox(
             rec_granted.clone(),
             &registry,
-            Some(crate::buzz::acp::SessionSandboxMeta {
+            Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec!["/tmp/abb-granted-ws".to_string()]),
                 shell: Some("restricted".to_string()),
@@ -4882,7 +4877,7 @@ mod tests {
         let (old_fork, _h2) = make_test_harness_full(
             rec_granted.clone(),
             &registry,
-            Some(crate::buzz::acp::SessionSandboxMeta {
+            Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
                 shell: Some("restricted".to_string()),
@@ -4952,7 +4947,7 @@ mod tests {
         let (narrow, _h) = make_test_harness_full(
             rec.clone(),
             &registry,
-            Some(crate::buzz::acp::SessionSandboxMeta {
+            Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
                 shell: Some("restricted".to_string()),
@@ -5013,11 +5008,11 @@ mod tests {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
         let rec = std::env::temp_dir().join(format!("mock-rec-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (buzz, handles) = make_test_harness(rec.clone(), &registry);
+        let (rt, handles) = make_test_harness(rec.clone(), &registry);
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("claude"),
-            Some((buzz.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
         let chat = format!("oc_burst_{}", uuid::Uuid::new_v4());

@@ -11,7 +11,7 @@
 3. 越界形式 `demo/../../secret.md` ⇒ 结果是错误（`not found`），且工作区外的秘密内容**不出现**；
 4. **工作区里没有任何技能**时不暴露 `load_skill`（参照物只在 `skills` 非空时注册），
    system 里也没有 `## Available Skills`；
-5. `BUZZ_AGENT_NO_HINTS=1` ⇒ 工具表里**没有** `load_skill`、system 里没有 `## Available Skills`，
+5. `ABB_AGENT_NO_HINTS=1` ⇒ 工具表里**没有** `load_skill`、system 里没有 `## Available Skills`，
    且技能正文标记在整个请求体里都不出现（技能与约定链同关）。
 
 用法：`python3 load_skill_round_trip.py <abb-agent 二进制>`
@@ -127,7 +127,7 @@ def run_turn(workspace, tool_name, arguments, extra_env=None):
     current_tool_call["value"] = (tool_name, arguments)
     env = dict(os.environ)
     env.update({
-        "BUZZ_AGENT_PROVIDER": "anthropic",
+        "ABB_AGENT_PROVIDER": "anthropic",
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PORT}",
         "ANTHROPIC_MODEL": "probe-model",
         "ANTHROPIC_API_KEY": "sk-probe",
@@ -237,10 +237,10 @@ check("system 里没有技能段", "## Available Skills" not in system_text(firs
 check("内置工具仍在（只少了 load_skill）", "dev__read" in names, f"{names}")
 
 print()
-print("=== 场景 5：BUZZ_AGENT_NO_HINTS=1 时技能与约定链同关 ===")
+print("=== 场景 5：ABB_AGENT_NO_HINTS=1 时技能与约定链同关 ===")
 workspace = make_workspace()
 first, second = run_turn(workspace, "load_skill", {"name": "demo"},
-                         extra_env={"BUZZ_AGENT_NO_HINTS": "1"})
+                         extra_env={"ABB_AGENT_NO_HINTS": "1"})
 system = system_text(first)
 names = tool_names(first)
 check("工具表里没有 load_skill", "load_skill" not in names, f"{names}")

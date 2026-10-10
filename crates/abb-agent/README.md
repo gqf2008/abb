@@ -1,13 +1,13 @@
 # abb-agent
 
 ABB 的 **ACP 执行层**，由 [rpi](https://github.com/bigfish1913/pi-rust) 的库实现，用于替代
-`crates/buzz-agent`（自维护分叉，含 7.9k 行自持 LLM 层与 1.9k 行自持 agent loop）。
+`旧执行层（已删除）`（自维护分叉，含 7.9k 行自持 LLM 层与 1.9k 行自持 agent loop）。
 
 设计依据与决策记录：walgit 线程 **`abb-agent-rpi-acp-20261008`**。
 
 ## 为什么是独立包
 
-root `Cargo.toml` 没有 `[workspace]`，所以本包与 `crates/buzz-agent` 同构：自带
+root `Cargo.toml` 没有 `[workspace]`，所以本包与 `旧执行层（已删除）` 同构：自带
 `Cargo.lock`，root 的 `cargo fmt/clippy/test` 不会碰到它。构建与门禁一律走
 `--manifest-path`：
 
@@ -27,7 +27,7 @@ export TMPDIR=/Volumes/DataExt/tmp
 export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 ```
 
-## 与 buzz-agent 的语义差异（都是决策，不是遗漏）
+## 与 旧执行层的语义差异（都是决策，不是遗漏）
 
 | 面 | 处置 | 理由 |
 | --- | --- | --- |
@@ -36,7 +36,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 | `_meta.steering` | **声明 `supported: false`** | 本刀未实现 `_session/steering`；abb 那边该标志是写该方法的唯一闸门，报 true 只会让「回合中追加消息」多一次无效往返 |
 | LLM 层 / agent loop | 交给 rpi（`rpi-ai` / `rpi-agent`） | 不自持 7.9k 行 `llm.rs` |
 | 内置工具 | 第二刀已接 `rpi-tools`（`dev__*`，见下节） | `rpi-tools = "0.3.16"`，与参照物同源 |
-| 输出上限 | 默认 **65_536**，认 `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
+| 输出上限 | 默认 **65_536**，认 `ABB_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
 
 `initialize` 因此**不含** `_meta.abbSandbox`：abb 侧 `parse_abb_sandbox_modes` 得到
 `None` → `SandboxSupport::Unsupported`。这是**如实声明**——声明支持却不执行，正是
@@ -54,19 +54,19 @@ token**。若 cancel 在回合任务**被 poll 之前**就到，那一次 abort 
 取消标记**每轮补发 abort**，并挂一个 100ms 的 tick 作固定唤醒源（卡在网络上时不会再有事件
 来唤醒我们）。
 
-## 环境契约（以 abb 侧 `src/agent.rs::buzz_provider_env` 真值为准）
+## 环境契约（以 abb 侧 `src/agent.rs::abb_provider_env` 真值为准）
 
 | 变量 | 取值 / 作用 |
 | --- | --- |
-| `BUZZ_AGENT_PROVIDER` | `anthropic` 或 `openai`（`openai-chat`/`openai-responses`/`openrouter`/`deepseek` 是**配置 kind**，env 里一律归并成 `openai`） |
+| `ABB_AGENT_PROVIDER` | `anthropic` 或 `openai`（`openai-chat`/`openai-responses`/`openrouter`/`deepseek` 是**配置 kind**，env 里一律归并成 `openai`） |
 | `ANTHROPIC_API_KEY` | 必填（显式取用，不依赖 rpi 的 env 兜底） |
 | `ANTHROPIC_BASE_URL` | 可选；自定义/自建网关，**填主机根**（如 `https://gw.example.com`）。缺省 `https://api.anthropic.com` |
 | `ANTHROPIC_MODEL` | **必填**；任意 id（见下） |
 | `OPENAI_COMPAT_API_KEY` / `OPENAI_COMPAT_MODEL` | **必填**（openai 家族） |
 | `OPENAI_COMPAT_BASE_URL` | 可选；缺省 `https://api.openai.com` |
 | `OPENAI_COMPAT_API` | `responses` 走 responses 端点，其余（含 `openrouter`/`deepseek` 两个预置）都是 chat |
-| `BUZZ_AGENT_MAX_ROUNDS` | 回合上界（abb 默认送 200） |
-| `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | 可选；单回合输出上限。abb **今天不注入**，但被替代的 fork 会读它（默认 65536），故同样认 |
+| `ABB_AGENT_MAX_ROUNDS` | 回合上界（abb 默认送 200） |
+| `ABB_AGENT_MAX_OUTPUT_TOKENS` | 可选；单回合输出上限。abb **今天不注入**，但被替代的 fork 会读它（默认 65536），故同样认 |
 | `ABB_AGENT_FAUX_TEXT` | **本包自己的离线通道**：命中即用 rpi faux provider（不联网、无凭据），供 smoke 与测试 |
 | `ABB_AGENT_FAUX_TOOL` | 离线通道之二：JSON `{"name":…,"arguments":…}`，先发一次工具调用再把 `ABB_AGENT_FAUX_TEXT` 当文本回复。用于无 key 验证「模型 → 工具 → 结果回灌」 |
 | `RUST_LOG` | 日志级别（默认 `info`；**日志只走 stderr**，stdout 是 ACP 协议通道） |
@@ -86,7 +86,7 @@ abb 主体零引用它们，但排查时先确认它们不存在。
 于是 `0` 会静默变成「只准回 1 个 token」。故默认 `8192`（`DEFAULT_MAX_OUTPUT_TOKENS`）。
 
 模型/API key 缺失时**直接报错**（`session/new` 返回 -32000），不静默挑一个——被替代的
-`crates/buzz-agent/src/config.rs` 在同路径就是 `"config: ANTHROPIC_MODEL required"` 硬失败。
+`参照物 config.rs` 在同路径就是 `"config: ANTHROPIC_MODEL required"` 硬失败。
 静默替用户挑模型等于替用户花钱。
 
 ### base_url 语义（anthropic 与 openai 不一样！）
@@ -107,10 +107,10 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 
 rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 下发的 MCP server 就是
 `abb-events`（= abb 二进制自身 `mcp-events` 子命令，agent 订阅 walgit/任务事件的唯一通道）。
-本包用 **`rmcp`**（与被替代的 `crates/buzz-agent` 同源）接上它。（原 `wassette`（Wasm 组件
+本包用 **`rmcp`**（与被替代的 `旧执行层（已删除）` 同源）接上它。（原 `wassette`（Wasm 组件
 工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 
-- 入口是 `session/new` 的 `params.mcpServers`（形状与 `src/buzz/acp.rs` 的 `McpServer` 逐字对应：
+- 入口是 `session/new` 的 `params.mcpServers`（形状与 `src/runtime/acp.rs` 的 `McpServer` 逐字对应：
   `{name, command, args, env:[{name,value}]}`）。**第一刀连 `params` 都不读**，abb 送的 server
   列表被静默丢弃——现在会解析、`mcpServers` 形状不对则回 `-32005` 而不是当成空列表。
 - 工具以 **`{server}__{tool}`** 的限定名暴露给模型（与被替代组件一致：其 `SEP` 即 `__`，
@@ -162,7 +162,7 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 ## 约定链（刀 2 首批）
 
 `AGENTS.md` 逐级加载 + `~/AGENTS.md` 全局层，语义/上限/截断**逐条对齐**被替代的
-`crates/buzz-agent/src/hints.rs`（同一份用户约定，换执行层不该换行为）：
+`参照物 hints.rs`（同一份用户约定，换执行层不该换行为）：
 
 - 链路 = **git 根 → … → 会话工作目录**（`session/new` 的 `cwd`，即频道工作区；**不是**进程 cwd
   ——同机器上不同频道本就该看不同目录的约定），再把 `$HOME/AGENTS.md` 作为**全局层插在最前**
@@ -170,7 +170,7 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 - 上限 **128 KiB**、**按字符边界**截断（UTF-8 安全）；内容拼在 abb 下发的系统提示**之后**
   （与 fork 的 `format!("{base}\n\n{hints_text}")` 同序）；没有任何约定时不注入空标题；
   诚实说明：与 fork 一样是「**逐层留额度**」的写法，所以真实上界是 ≤128 KiB **+2 字节**（分隔符）；
-- ⚠️ **`BUZZ_AGENT_NO_HINTS=1` 是硬前提**：abb 对 **granted（授权者）** 会话只能在**进程级**
+- ⚠️ **`ABB_AGENT_NO_HINTS=1` 是硬前提**：abb 对 **granted（授权者）** 会话只能在**进程级**
   收口它（`src/service.rs:180-234`：hints 发生在 `session/new` 之前，per-session 的 `_meta`
   管不到）⇒ 本包不认它就等于**把 owner 的 `~/AGENTS.md` 静默泄漏给授权者**。
   读法**逐条对齐 fork**（`parse::<u8>()`，不 trim）：未设置/`0` ⇒ 开；**任何非零**（`1`/`2`/`01`/`+1`）
@@ -179,7 +179,7 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
   已按参照物改正。关掉时默认系统提示照旧（关的是约定链，不是提示）。
 - `session/new` 不带 `cwd`（空串）时按**原值**处理：链退化成「进程工作目录那一层」，**不**向祖先链
   扩散——与参照物的**链函数**同行为（上一版用 `current_dir()` 回落，实测会多读进程 cwd 的 git 根到 cwd
-  整条链）。abb 的生产路径恒下发非空 cwd（`src/buzz/pool.rs` 的 `session_cwd`），这条只是对齐边界。
+  整条链）。abb 的生产路径恒下发非空 cwd（`src/runtime/pool.rs` 的 `session_cwd`），这条只是对齐边界。
   **三处如实登记的残差**（评审实测、当前均不可达）：①参照物在 `session/new` 层就**拒建**空/空白/相对
   `cwd`（`INVALID_PARAMS`），本包不拒、按上面那条读一层——若将来 abb 真下发空 cwd，两边行为不同；
   ②空白串在本包 `SessionNewParams::parse` 里被规范化为空串 ⇒ 对 `"   "` 读一层；参照物的链函数则把
@@ -203,10 +203,10 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 链）→ `## Available Skills`（技能名 + 描述）→ 一行「用 `load_skill` 读正文」。两边都空时**不产出任何
 标题**（不留空壳段落）。
 
-- 发现（对齐 `crates/buzz-agent/src/hints.rs`）：`<cwd>/.agents/skills`、`.goose/skills`、`.claude/skills`
+- 发现（对齐 `参照物 hints.rs`）：`<cwd>/.agents/skills`、`.goose/skills`、`.claude/skills`
   + `~/.agents/skills`；`SKILL.md` 的 YAML frontmatter 取 `name`/`description`（**无 `name` 不成技能**）；
   **同名先发现的赢**；子目录自带 `SKILL.md` 的不再下钻（那是另一个技能）；支持文件全部预枚举。
-- 读取（对齐 `crates/buzz-agent/src/builtin.rs`）：工具名是**裸名 `load_skill`**（参照物直接 push 进
+- 读取（对齐 `参照物 builtin.rs`）：工具名是**裸名 `load_skill`**（参照物直接 push 进
   工具表，不经 `dev__` —— 改名会让技能正文里写的 `load_skill(name: …)` 提示失效）；`{name}` 取整个技能
   （**剥掉 frontmatter**、附 `## Supporting Files` 清单），`{name}/relative/path` 取支持文件；
   两者合计 **32 KiB** 上限（按字符边界截断）；找不到/越界给出带「可用技能/可用文件」清单的错误结果。
@@ -222,7 +222,7 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 - **平台层差异（如实登记）**：`load_skill: missing required argument "name"` 这条在本包**端到端不可达**
   ——rpi 会先按 schema 校验拦下（模型看到的是 `schema error: Validation failed …`），本包这句只在
   直接调工具对象时出现（所有工具同款）。
-- ⚠️ **`BUZZ_AGENT_NO_HINTS` 同时关掉技能清单与 `load_skill`**（参照物：hints 关时 skills 是空 vec ⇒
+- ⚠️ **`ABB_AGENT_NO_HINTS` 同时关掉技能清单与 `load_skill`**（参照物：hints 关时 skills 是空 vec ⇒
   工具拿不到任何技能）。**未实现**：参照物在受限档还有 `read_roots` 校验（技能常在 `~/.agents/skills`，
   在工作区之外）——本包不实现档位，与「授权责任不变」一致，见上文 granted 隔离待办。
 - 与 MCP 工具**同名**时（比如某个 server 也叫 `load_skill`）：摘掉 MCP 侧并打 ERROR（rpi 按名字取首个，
@@ -248,7 +248,7 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 | `read` 的 `offset` | **0-based** | **1-based**（rpi 工具的语义；description 里写得明白，模型自洽） |
 | 写入限定 | FullAccess 档也限定在会话 workspace（拒绝对路径与 `..` 逃逸，**并拒绝末段符号链接**） | **不放宽**：父目录先建后 canonicalize 再比前缀，末段是符号链接直接拒；`..`、符号链接父目录/文件、工作区外绝对路径一律拒 |
 | 读的限定 | FullAccess 档允许绝对路径；受限档按 `read_roots` | 同：**受限会话（`sandbox`=read-only/workspace-write 或 `shell`=restricted）读/ls/grep/find 限定工作区**（canonicalize + 前缀校验）；owner 全权限仍读任意路径（对齐 FullAccess `read_roots=None`） |
-| 开关 | `BUZZ_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
+| 开关 | `ABB_AGENT_DEV_TOOLS=0` 关闭 | 同一变量同一读法（`parse::<u8>()`，默认 1，读不懂拒绝启动） |
 | Windows | shell 经 git-bash | 同（rpi 的 bash 工具在 Windows 也是 bash/POSIX，无 cmd 回退）；不额外暴露 `powershell` |
 
 `dev__write`/`dev__edit` 的 description 里明写了「路径限定在会话工作区」，与真实约束一致。
@@ -256,12 +256,12 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 ### `dev__delegate`（委派给本机 claude/codex CLI）
 
 把自包含的编码任务交给**本机安装的** `claude` / `codex` CLI 跑（子进程、cwd = 会话工作区、
-最终报告作为工具结果回灌），与 `crates/buzz-agent/src/devtools.rs::run_delegate` 对齐：
+最终报告作为工具结果回灌），与 `参照物 devtools.rs::run_delegate` 对齐：
 
 - 命令行：claude `-p --output-format text --dangerously-skip-permissions -- <task>`；
   codex `exec --skip-git-repo-check --sandbox workspace-write -C <cwd> -- <task>`（`--` 分隔，
   防 task 被当选项/子命令）；
-- 二进制：`BUZZ_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` **覆盖即唯一来源**（指错**不回落** PATH——与参照物
+- 二进制：`ABB_AGENT_DELEGATE_{CLAUDE,CODEX}_BIN` **覆盖即唯一来源**（指错**不回落** PATH——与参照物
   `resolve_delegate_cli` 同取向：运维要的就是确定性）；**空串/纯空白 = 显式禁用**该后端（也不回落）；
   未设覆盖时才查 PATH；找不到时给**可纠偏**错误
   （`available: claude, codex` / `available: none (neither claude nor codex found in PATH)`）；
@@ -291,7 +291,7 @@ rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，拒掉绝�
 ## 工具调用通知（刀 2 第四批）
 
 `session/update` 的 `tool_call` / `tool_call_update`：**字段名、状态取值与 `content` 的嵌套形状**对齐
-被替代组件的四个发射点（`crates/buzz-agent/src/agent.rs::emit_pending/emit_in_progress/
+被替代组件的四个发射点（`参照物 agent.rs::emit_pending/emit_in_progress/
 emit_completed/emit_failed`）。**但不是逐字等价**——下面把可达状态与三处差异一并写清。
 
 | 时机 | 载荷 | 本包是否可达 |
@@ -362,7 +362,7 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 - **openai-chat + 官方 OpenAI 推理模型**可能因字段名被拒：rpi 默认发 `max_tokens`，而被替代的
   fork 对 openai 发 `max_completion_tokens`。**未实测**（无 key/无网络），仅登记为风险。
 
-`BUZZ_AGENT_MAX_ROUNDS` 的护栏代码已就位且**边界与被替代组件对齐**（在 `TurnStart` 即本轮
+`ABB_AGENT_MAX_ROUNDS` 的护栏代码已就位且**边界与被替代组件对齐**（在 `TurnStart` 即本轮
 请求之前按**已完成**的请求数判，做满 `max_rounds` 次就不再开新一轮），但**当前不可达**：
 没有工具时一个回合只会有 1 次模型请求（评审用计数探针实测：3 个回合共 3 次 POST），
 超界分支不会被触发。接上工具后才成为实际护栏。
