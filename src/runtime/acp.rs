@@ -248,7 +248,7 @@ pub struct AcpClient {
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
-    /// Both goose 与旧执行层都会 emit `session_info_update` with this field;
+    /// Both goose and the removed execution layer emit `session_info_update` with
     /// goose emits it whenever it starts or clears an active prompt run
     /// (`crates/goose/src/acp/server.rs:2277` `send_active_run_update`).
     /// Required as `expectedRunId` when calling the non-standard
@@ -256,7 +256,7 @@ pub struct AcpClient {
     /// in-flight turn without cancelling it.
     ///
     /// `None` until the first `session_info_update` arrives, or after the
-    /// run clears (goose 与旧执行层都会在回合结束时发 `activeRunId: null`).
+    /// run clears (goose and the removed layer emit `activeRunId: null`).
     /// Other agents may leave this unset — readers must treat `None` as
     /// "no active run to steer into" and fall back to cancel+merge.
     active_run_id: Option<String>,
@@ -611,7 +611,7 @@ impl AcpClient {
     ///
     /// - `None` — no system-prompt field in the request (legacy framing).
     /// - `Some(SystemPromptTransport::Field(text))` — bare `systemPrompt` field
-    ///   (ACP 协议 v2；旧执行层实现，goose 未用).
+    ///   (ACP protocol v2; implemented by the removed layer, unused by goose).
     /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
     ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
     ///
@@ -750,7 +750,7 @@ impl AcpClient {
     ///
     /// Used for slash-command pass-through: ACP connectors detect commands via
     /// the **first** block's text starting with `/`, so the harness sends
-    /// `["/cmd args", "<上下文>"]` instead of one wrapped block.
+    /// `["/cmd args", "<context>"]` instead of one wrapped block.
     pub async fn session_prompt_blocks_with_idle_timeout(
         &mut self,
         session_id: &str,
@@ -1755,7 +1755,7 @@ impl AcpClient {
                 //
                 // Per the ACP `SessionInfoUpdate` schema, `_meta` is a field
                 // on the update object itself — nested inside `update`, not
-                // alongside it at the params level. goose 与旧执行层都
+                // alongside it at the params level. Both goose and the removed layer
                 // emit it at `params.update._meta.goose.activeRunId`.
                 let meta = msg["params"]["update"]
                     .get("_meta")
@@ -3413,7 +3413,7 @@ mod tests {
     /// Pass `None` to omit the `activeRunId` field entirely.
     ///
     /// `_meta` is nested inside the `update` object (per the ACP
-    /// `SessionInfoUpdate` schema), matching what goose 与旧执行层
+    /// `SessionInfoUpdate` schema), matching what goose and the removed layer
     /// emit on the wire.
     fn session_info_update_msg(active_run_id: Option<serde_json::Value>) -> serde_json::Value {
         let mut goose = serde_json::Map::new();
@@ -3834,7 +3834,7 @@ mod tests {
         );
     }
 
-    /// Test 1b: no `_meta` at all (goose / 旧执行层 / 任何老适配器) must
+    /// Test 1b: no `_meta` at all (goose, the removed layer, any older adapter) must
     /// leave the capability off — this is what keeps a steer off the wire for
     /// agents that never implemented it.
     #[tokio::test]

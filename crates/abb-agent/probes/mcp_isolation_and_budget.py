@@ -123,7 +123,10 @@ else:
           f"{dumped['cwd']} vs {WORKDIR}")
     check("spec.env 生效", env.get("PROBE_SPEC_ENV") == "from-session-new")
     check("供应商 key 未透传", SECRET not in json.dumps(env), "ANTHROPIC_API_KEY 不该出现")
-    leaked = [k for k in env if k.startswith("ANTHROPIC") or k.startswith("BUZZ_AGENT")
+    # 前缀随改名同步（ABB_AGENT_*）——但 ABB_AGENT_CONTEXT 是 child_env 刻意透传给 MCP/shell
+    # 两个消费者的，不算泄漏；不排除它会让断言恒真/假阳性。
+    leaked = [k for k in env if k.startswith("ANTHROPIC")
+              or (k.startswith("ABB_AGENT") and k != "ABB_AGENT_CONTEXT")
               or k.startswith("OPENAI_COMPAT")]
     check("供应商配置整体未透传", not leaked, f"泄漏：{leaked}")
     check("PATH 仍在（工具要能跑）", bool(env.get("PATH")))

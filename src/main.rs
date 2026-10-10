@@ -1040,9 +1040,9 @@ fn resolve_env_bot_key_from(cfg: &config::Config, raw: Option<&str>) -> Result<S
 
 /// 解析「桥注入的当前会话」chat_id（`job add` / `task add` 缺省回创建者会话走这条路）。
 ///
-/// 返回 `AGENT_BRIDGE_CHAT_ID`；为空时回落该 bot 主会话；**形如 历史频道 UUID** 时
+/// 返回 `AGENT_BRIDGE_CHAT_ID`；为空时回落该 bot 主会话；**形如 ABB 频道 UUID** 时
 /// 同样回落主会话并 loud 提示。背景：ACP 架构下 agent 是每 bot 长驻进程，桥无法按频道
-/// 注入 `AGENT_BRIDGE_CHAT_ID`；外部启动器喂进来的可能是 历史频道 UUID——它不是平台
+/// 注入 `AGENT_BRIDGE_CHAT_ID`；外部启动器喂进来的可能是 ABB 频道 UUID——它不是平台
 /// receive_id，直发必被平台拒（飞书 230001 invalid receive_id），不校正则任务
 /// 「跑完但没人看得到」。
 fn resolve_injected_chat(bot_key: &str) -> String {
@@ -1054,7 +1054,7 @@ fn resolve_injected_chat(bot_key: &str) -> String {
     let (chat, fell_back) = deliver::correct_injected_chat(&raw, &primary);
     if fell_back {
         eprintln!(
-            "⚠️ AGENT_BRIDGE_CHAT_ID「{raw}」形如 历史频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）；要在指定群/话题回投，请显式指定真实 chat_id"
+            "⚠️ AGENT_BRIDGE_CHAT_ID「{raw}」形如 ABB 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）；要在指定群/话题回投，请显式指定真实 chat_id"
         );
     }
     chat
@@ -1753,7 +1753,7 @@ fn run_task_cli(args: &[String]) -> i32 {
             // 创建者会话：优先桥注入的 env；手动 CLI 回落该 bot 的主会话（与 job add 同款）。
             // 审查 B2：这里若留空，任务会「跑完但没人看得到」——而 CLI 却印着「结果回创建者会话」。
             // 所以两条路都给不出目标时**直接拒绝登记**，不接受一个永远发不出结果的任务。
-            // 桥注入值若形如 历史频道 UUID（非平台 receive_id），回落主会话并 loud 提示。
+            // 桥注入值若形如 ABB 频道 UUID（非平台 receive_id），回落主会话并 loud 提示。
             let chat_id = resolve_injected_chat(&bot_key);
             if chat_id.is_empty() {
                 eprintln!(
@@ -1867,7 +1867,7 @@ fn parse_task_to(raw: &str) -> (String, String) {
 }
 
 /// `task add --to` 的值解析 + 两道硬闸（纯函数，CLI 与测试共用一条路径）：
-/// ① chat_id 非空（空目标 = 任务跑完没人看得到）；② chat_id 不形如 历史频道 UUID
+/// ① chat_id 非空（空目标 = 任务跑完没人看得到）；② chat_id 不形如 ABB 频道 UUID
 /// （频道 UUID 不是任何平台可用的 receive_id，直发会被平台拒，如飞书 230001）。
 /// `bot_key` 缺省 = 本 bot（空串）。返回 `Err(用户可读文案)`，调用方原样打印后 exit 1。
 fn parse_task_to_target(raw: &str) -> Result<task_store::TaskTarget, String> {
@@ -1877,7 +1877,7 @@ fn parse_task_to_target(raw: &str) -> Result<task_store::TaskTarget, String> {
     }
     if crate::runtime::keys::looks_like_channel_uuid(tchat.trim()) {
         return Err(format!(
-            "--to 的 chat_id「{}」形如 历史频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
+            "--to 的 chat_id「{}」形如 ABB 频道 UUID，不是平台可用的 receive_id（直发会被平台拒，如飞书 230001）；请填真实 chat_id（飞书 oc_…／微信 wxid…／钉钉 cid…）",
             tchat.trim()
         ));
     }
@@ -1939,7 +1939,7 @@ fn resolve_task(
 }
 
 /// parser 已按既有优先级选出最终来源后，再收敛来源 bot；显式 --source-bot 因此可以
-/// 覆盖坏 env，而真正采用 env 时仍在入队前失败。env chat 若形如 buzz UUID，也按
+/// 覆盖坏 env，而真正采用 env 时仍在入队前失败。env chat 若形如 ABB 频道 UUID，也按
 /// 最终来源 bot 的主会话校正（仅当 parser 确实采用了 env chat）。
 fn converge_deliver_source(
     cfg: &config::Config,
@@ -1965,7 +1965,7 @@ fn converge_deliver_source(
         let (chat, fell_back) = deliver::correct_injected_chat(env_chat, &primary);
         if fell_back {
             eprintln!(
-                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat}」形如 历史频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
+                "⚠️ AGENT_BRIDGE_CHAT_ID「{env_chat}」形如 ABB 频道 UUID，不是平台 chat_id，已回落到该 bot 主会话「{chat}」（否则会被平台判定 invalid receive_id，如飞书 230001）"
             );
         }
         item.source_chat = chat.clone();

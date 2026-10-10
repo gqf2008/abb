@@ -2,7 +2,7 @@
 //! 「agent_spawn 需要有进程保护（需要退避机制，不能出现死循环）」）。
 //!
 //! ## 为什么需要它（与既有退避的分工）
-//! buzz/harness.rs 已有**每 agent 回路**的崩溃退避（crash_backoff + respawn_delay）——
+//! runtime/harness.rs 已有**每 agent 回路**的崩溃退避（crash_backoff + respawn_delay）——
 //! 那是「回合失败后，多久再拉一次」的策略。本模块管的是更底层的**spawn 动作本身**，覆盖
 //! **所有**调用方（聊天 harness、oneshot_turn（角色/团队生成、会话归纳、定时任务）、
 //! 以及任何将来的调用点）。它们各自都可能写出「失败就重试」的循环，而它们**不共享**退避账

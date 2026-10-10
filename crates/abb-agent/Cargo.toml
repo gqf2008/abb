@@ -1,12 +1,12 @@
-# abb-agent —— ABB 的 ACP 执行层（rpi 库驱动），用于替换 旧执行层（已删除）。
+# abb-agent —— ABB 的 ACP 执行层（rpi 库驱动），用于替换 旧执行层。
 #
 # 设计依据：walgit 线程 `abb-agent-rpi-acp-20261008`。
 #
-# 为什么是独立包（与 旧执行层（已删除） 同构）：root Cargo.toml 没有 [workspace]，
+# 为什么是独立包（与旧执行层 同构）：root Cargo.toml 没有 [workspace]，
 # 所以本包自带 Cargo.lock，root 的 cargo fmt/clippy/test 不会碰到它；CI 走
 # `--manifest-path`（同现有 fork-lint 任务的做法）。
 #
-# 与 旧执行层的关键差异（产品决策，见线程「已决」）：
+# 与旧执行层的关键差异（产品决策，见线程「已决」）：
 #   - agent **不碰权限**：不实现 OS 沙箱档位，`initialize` 响应**不声明**
 #     `_meta.abbSandbox`（如实声明，不伪装能力）；
 #   - **不发** `session/request_permission`：授权约定由 AGENTS.md 承担；
@@ -63,7 +63,7 @@ async-trait = "0.1"
 # `~/AGENTS.md` 全局层与 `~/.agents/skills`）。
 dirs = "6"
 
-# MCP 客户端（owner 决策：用 rmcp，与被替代的 buzz-agent 同源）。
+# MCP 客户端（owner 决策：用 rmcp，与被替代的旧执行层同源）。
 # 只开 client + 子进程传输：不需要 server 侧与其它传输。
 rmcp = { version = "1", default-features = false, features = [
     "client", "transport-child-process"] }

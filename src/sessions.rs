@@ -600,7 +600,7 @@ impl SessionStore {
     /// 每条消息刷屏——现改为提示一次并把记录覆盖为本轮档位。
     /// `rotate_on_change`：档位变更是否轮换会话（新 sid + started 复位，等价 reset）
     /// ——由调用方按后端语义决定（#198：codex resume 继承首轮沙箱，不轮换新档位
-    /// 不生效；claude 每轮旗标即生效，轮换反而丢上下文；buzz 经 session/new `_meta`
+    /// 不生效；claude 每轮旗标即生效，轮换反而丢上下文；旧执行层经 session/new `_meta`
     /// 下发档位，是否需轮换由 P4.1 接线时定）。rotated=true 时调用方置 rebuilt
     /// 让桥写 pending 标记，下一条消息注入历史一次（上下文接续）。
     ///

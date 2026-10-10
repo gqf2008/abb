@@ -49,7 +49,7 @@ pub fn topic_channel_uuid(bot_key: &str, chat_id: &str, thread_id: &str) -> Stri
     fnv128_uuid(&format!("abb-relay:{bot_key}:{chat_id}:thread:{thread_id}"))
 }
 
-/// 该字符串是否「形如 历史频道 UUID」——即 [`channel_uuid`] 的产物形态（canonical uuid）。
+/// 该字符串是否「形如 ABB 频道 UUID」——即 [`channel_uuid`] 的产物形态（canonical uuid）。
 ///
 /// 用途（投递侧硬闸）：真实平台的会话 id（飞书 `oc_…`/`ou_…`、微信 `wxid…`/`o9cq…`、
 /// 钉钉 `cid…`）**都不是**裸 UUID；而 `AGENT_BRIDGE_CHAT_ID` 这类跨进程注入值在 ACP

@@ -371,7 +371,7 @@ fn required(env: &dyn EnvSource, key: &str) -> Result<String, String> {
     match env.get(key) {
         Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
         _ => Err(format!(
-            "缺少 {key}（abb 在未配置该项时不会注入；被替代的 buzz-agent 同样在此硬失败）"
+            "缺少 {key}（abb 在未配置该项时不会注入；被替代的旧执行层同样在此硬失败）"
         )),
     }
 }

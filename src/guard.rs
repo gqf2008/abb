@@ -708,7 +708,7 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
         // → 属可用性攻击面）。人要停自己在跑的任务走 owner 会话/终端，不受此闸影响。
         //
         // Q8：**agent 不得创建 proc 任务**。这里保留旧 hook/受限路径的显式拒绝；
-        // 真实 ACP shell 的主判据是 buzz-agent 注入的 ABB_AGENT_CONTEXT（CLI 侧检查）。
+        // 真实 ACP shell 的主判据是执行层注入的 ABB_AGENT_CONTEXT（CLI 侧检查）。
         // owner FullAccess 仍可绕开一切 shell 级检查，见 docs/task-model.md D5。
         Some("task") => {
             if rest.get(1).map(|s| s.as_str()) != Some("add") {

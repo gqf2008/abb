@@ -1,13 +1,13 @@
 # abb-agent
 
 ABB 的 **ACP 执行层**，由 [rpi](https://github.com/bigfish1913/pi-rust) 的库实现，用于替代
-`旧执行层（已删除）`（自维护分叉，含 7.9k 行自持 LLM 层与 1.9k 行自持 agent loop）。
+`旧执行层`（自维护分叉，含 7.9k 行自持 LLM 层与 1.9k 行自持 agent loop）。
 
 设计依据与决策记录：walgit 线程 **`abb-agent-rpi-acp-20261008`**。
 
 ## 为什么是独立包
 
-root `Cargo.toml` 没有 `[workspace]`，所以本包与 `旧执行层（已删除）` 同构：自带
+root `Cargo.toml` 没有 `[workspace]`，所以本包与 `旧执行层` 同构：自带
 `Cargo.lock`，root 的 `cargo fmt/clippy/test` 不会碰到它。构建与门禁一律走
 `--manifest-path`：
 
@@ -27,7 +27,7 @@ export TMPDIR=/Volumes/DataExt/tmp
 export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 ```
 
-## 与 旧执行层的语义差异（都是决策，不是遗漏）
+## 与旧执行层的语义差异（都是决策，不是遗漏）
 
 | 面 | 处置 | 理由 |
 | --- | --- | --- |
@@ -107,7 +107,7 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 
 rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 下发的 MCP server 就是
 `abb-events`（= abb 二进制自身 `mcp-events` 子命令，agent 订阅 walgit/任务事件的唯一通道）。
-本包用 **`rmcp`**（与被替代的 `旧执行层（已删除）` 同源）接上它。（原 `wassette`（Wasm 组件
+本包用 **`rmcp`**（与被替代的 `旧执行层` 同源）接上它。（原 `wassette`（Wasm 组件
 工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 
 - 入口是 `session/new` 的 `params.mcpServers`（形状与 `src/runtime/acp.rs` 的 `McpServer` 逐字对应：
@@ -357,7 +357,7 @@ anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**
 **尚未实现（第二刀）**：
 
 - `_session/steering`（现在如实声明为不支持，走 abb 的 cancel+merge 回退）；
-- 逐 token 流式（当前与 buzz-agent 一致：非流式，整条 `agent_message_chunk`）；
+- 逐 token 流式（当前与旧执行层一致：非流式，整条 `agent_message_chunk`）；
 - `StopReason::Length`（截断）目前会被报成 `end_turn`（abb 的 `max_tokens` 分支收不到）。
 - **openai-chat + 官方 OpenAI 推理模型**可能因字段名被拒：rpi 默认发 `max_tokens`，而被替代的
   fork 对 openai 发 `max_completion_tokens`。**未实测**（无 key/无网络），仅登记为风险。

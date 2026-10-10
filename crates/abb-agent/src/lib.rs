@@ -1,7 +1,7 @@
 //! abb-agent —— ABB 的 ACP 执行层，由 [rpi](https://github.com/bigfish1913/pi-rust)
 //! 的库实现。
 //!
-//! 它替代 `旧执行层（已删除）`（自维护分叉，含 7.9k 行自持 LLM 层与 1.9k 行自持
+//! 它替代 `旧执行层`（自维护分叉，含 7.9k 行自持 LLM 层与 1.9k 行自持
 //! agent loop）。本包把那一层交给 rpi：LLM 协议适配用 `rpi-ai`，agent loop 用
 //! `rpi-agent`，内置工具用 `rpi-tools`。
 //!

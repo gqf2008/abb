@@ -80,9 +80,9 @@ fn resolve_acp_command(agent_cmd: Option<&str>) -> String {
 /// 兼容 env（abb_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
 /// 装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
 /// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
-///（P4.1：原 `uses_exec_agent=false` 臂走已删的 `build_injection`——经核对该臂本就
-/// 解析到 abb_provider_env（runtime 臂）殊途同归；`build_injection` 矩阵随 Backend 一并
-/// 删除后，两臂并一为单一路径，`uses_exec_agent` 形参随之摘除。）
+///（P4.1：原先的 `uses_buzz_agent` 两臂（历史形参，取名即「是否走 buzz 承载」）都走已删的
+/// `build_injection`，而两臂最终都解析到同一份 `abb_provider_env` 映射——殊途同归；
+/// `build_injection` 矩阵随 Backend 一并删除后，两臂并一为单一路径，该形参随之摘除。）
 /// Jev 决策门禁的 env 注入（统一迁移刀 4a）：从 config 的 `jev` 段转成 `JEV_*`。
 /// 未配置（api_key 空）时注入空——abb-agent 在受限会话建会话时会 fail-closed 拒答。
 fn jev_env(cfg: &Config) -> Vec<(String, String)> {

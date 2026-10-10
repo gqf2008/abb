@@ -845,7 +845,7 @@ mod tests {
         let env = abb_provider_env(Some(&p)).unwrap().unwrap();
         assert_eq!(env["ABB_AGENT_PROVIDER"], "anthropic");
         assert_eq!(env["ANTHROPIC_API_KEY"], "sk-secret");
-        // buzz-agent 支持自定义 anthropic 网关：base_url 原样透传（区别于 pi 的固定端点）
+        // 执行层支持自定义 anthropic 网关：base_url 原样透传（区别于 pi 的固定端点）
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example.com");
         assert_eq!(env["ANTHROPIC_MODEL"], "some-model");
         assert!(!env.contains_key("OPENAI_COMPAT_API_KEY"));

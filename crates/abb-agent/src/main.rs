@@ -1,6 +1,6 @@
 //! `abb-agent` 可执行入口：stdio 上跑 ACP（行分隔 JSON-RPC 2.0）。
 //!
-//! 进程契约与 `buzz-agent` 一致（abb 的 `src/runtime/acp.rs` 是客户端）：
+//! 进程契约与旧执行层一致（abb 的 `src/runtime/acp.rs` 是客户端）：
 //! stdin 收请求/通知，stdout 出应答/通知。**stdout 只跑协议**——日志一律 stderr，
 //! 否则会直接破坏帧。
 //!

@@ -110,7 +110,7 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
-# buzz-acp 移植测试：暂停时钟（start_paused）与手动推进。仅测试构建编译，
+# 上游 harness 移植测试：暂停时钟（start_paused）与手动推进。仅测试构建编译，
 # 不进发布二进制。
 tokio = { version = "1", features = ["test-util"] }
 # 圆角窗口区域的 oracle：Slint 默认的 femtovg 渲染器就是用它栅格化圆角路径

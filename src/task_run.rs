@@ -687,7 +687,7 @@ async fn finish_task_attempt(
         crate::log!("[task:{bot_key}] {short} 无投递目标（创建者会话为空），结果未发送");
         return;
     };
-    // 存量坏任务自愈：创建者会话若存的是 历史频道 UUID（外部注入的 AGENT_BRIDGE_CHAT_ID），
+    // 存量坏任务自愈：创建者会话若存的是 ABB 频道 UUID（外部注入的 AGENT_BRIDGE_CHAT_ID），
     // 直发必被平台拒（飞书 230001）——回落到该 bot 主会话，loud，让结果真送达。
     let primary = router
         .bots
@@ -697,7 +697,7 @@ async fn finish_task_attempt(
     let (chat, healed) = heal_delivery_chat(&chat_raw, &primary);
     if healed {
         crate::log!(
-            "[task:{bot_key}] {short} 投递目标 chat={chat_raw} 形如 历史频道 UUID（非平台 chat_id），已回落主会话 {chat}"
+            "[task:{bot_key}] {short} 投递目标 chat={chat_raw} 形如 ABB 频道 UUID（非平台 chat_id），已回落主会话 {chat}"
         );
     }
     // 注意：这里没有「已取消」抬头——见上 `if cancelled { return; }` 的说明，
@@ -931,10 +931,10 @@ fn delivery_target(task: &Task, bot_key: &str) -> Option<(String, String)> {
     }
 }
 
-/// 投递目标校正（纯函数，可测）：目标 chat 形如 历史频道 UUID 时回落到该 bot 主会话。
+/// 投递目标校正（纯函数，可测）：目标 chat 形如 ABB 频道 UUID 时回落到该 bot 主会话。
 ///
 /// 背景：ACP 架构下 agent 是每 bot 长驻进程，桥无法按频道注入 `AGENT_BRIDGE_CHAT_ID`；
-/// 外部启动器注入的若是 历史频道 UUID，会经 `task add` 原样存进 `created_by.chat_id`。
+/// 外部启动器注入的若是 ABB 频道 UUID，会经 `task add` 原样存进 `created_by.chat_id`。
 /// 该值不是平台 receive_id，直发必被平台拒（飞书 230001 invalid receive_id）——这里
 /// 回落到 `primary`（真实平台会话），让**存量坏任务**的结果也能真送达。返回
 /// `(生效 chat, 是否发生回落)`；`primary` 为空时原样返回（交由投递侧 loud 失败）。
@@ -3636,7 +3636,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
-    /// 回归锁（本次修复的核心）：创建者会话存的是 历史频道 UUID（历史坏数据）时，
+    /// 回归锁（本次修复的核心）：创建者会话存的是 ABB 频道 UUID（历史坏数据）时，
     /// 投递目标回落到该 bot 主会话——绝不把频道 UUID 当平台 receive_id。
     #[test]
     fn delivery_heals_channel_uuid_to_primary_chat() {
