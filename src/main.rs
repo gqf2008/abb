@@ -27,7 +27,6 @@ mod guard;
 mod history;
 mod install;
 mod larkskills;
-mod mcp_events;
 mod messenger;
 mod msgstore;
 mod outbox;
@@ -389,15 +388,6 @@ fn main() {
     // 启动取证（2026-10-05 实测）：安装器 [Run] 拉起的实例出现过「开了 gui.out 却一行不写就死 / 卡死」
     // ⇒ 零证据无法定位。这里在任何子系统之前先留一行；就算下一行就崩，也留下尸体。
     bootstrap_log(&args);
-
-    // MCP 子进程必须零 stdout 噪声：在任何迁移/配置日志之前分流。
-    if args.get(1).map(String::as_str) == Some("mcp-events") {
-        if args.len() > 2 {
-            eprintln!("用法：agent-bridge mcp-events（不接受额外参数）");
-            std::process::exit(2);
-        }
-        std::process::exit(mcp_events::run_stdio());
-    }
 
     // 改名一次性迁移（feishu-bridge → agent-bridge，~/feishu-bridge → ~/.agent-bridge）。
     // 必须在最顶：args 解析、单实例加锁、job CLI 读 config/jobs 都依赖数据已在新位置。幂等。

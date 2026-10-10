@@ -673,10 +673,7 @@ mod tests {
                 "ABB_AGENT_DELEGATE_CLAUDE_BIN",
                 "/definitely/not/here-claude",
             ),
-            (
-                "ABB_AGENT_DELEGATE_CODEX_BIN",
-                "/definitely/not/here-codex",
-            ),
+            ("ABB_AGENT_DELEGATE_CODEX_BIN", "/definitely/not/here-codex"),
         ]);
         assert_eq!(
             available_backends_desc(&none),

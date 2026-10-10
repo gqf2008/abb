@@ -213,7 +213,7 @@ pub struct AcpClient {
     /// 读 stderr 的后台任务；shutdown 时给一个有界窗口收尾，保证临终输出也进尾巴。
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     /// Windows：本 agent 所在 job 的守卫。Drop 时关闭 job 句柄 ⇒ 内核连带杀掉 agent 的
-    /// **整棵树**（含它为每个 session 起的 MCP 服务 mcp-events）。
+    /// **整棵树**（含它为每个 session 起的外部 MCP server）。
     /// 非 Windows 恒 None（unix 用进程组 kill 表达同一语义）。
     #[allow(dead_code)] // 只为 Drop 持有（关句柄 ⇒ 内核杀掉 agent 整棵树），不需要读
     job: Option<crate::agent_spawn::KillOnCloseJob>,
@@ -456,7 +456,7 @@ impl AcpClient {
 
         let mut child = cmd.spawn()?;
         // 把 agent 放进「句柄关闭即杀」的 job：agent 被杀 / bridge 退出时，它起的 MCP 服务
-        // （mcp-events 等**孙**进程）一起死 —— 否则 Windows 上只杀直接子进程，MCP 会变孤儿
+        // （外部 MCP server 等**孙**进程）一起死 —— 否则 Windows 上只杀直接子进程，MCP 会变孤儿
         // 常驻（2026-09-30 owner 实报「桌上 10 个 MCP 孙进程」）。
         let job = child
             .id()
@@ -2411,22 +2411,30 @@ mod tests {
         assert_eq!(serialized["env"][0]["name"].as_str(), Some("ABB_RELAY_URL"));
     }
 
+    /// 外部 MCP server 必须**逐字**进 `session/new` 载荷（ABB 只声明不解释：
+    /// env 连同 name/command/args 一起透传，不加不减）。
     #[tokio::test]
-    async fn session_new_payload_includes_abb_events_mcp_server() {
-        let expected_command = std::env::current_exe()
-            .expect("current exe")
-            .display()
-            .to_string();
-        let server = crate::runtime::harness::events_mcp_server();
-        assert_eq!(server.name, "abb-events");
-        assert_eq!(server.args, vec!["mcp-events".to_string()]);
-        assert_eq!(server.command, expected_command);
-
+    async fn external_mcp_server_reaches_session_new_payload_verbatim() {
+        let server = McpServer {
+            name: "third-party".to_string(),
+            command: "/usr/local/bin/third-party-mcp".to_string(),
+            args: vec!["--root".to_string(), "/tmp/x".to_string()],
+            env: vec![
+                EnvVar {
+                    name: "THIRD_PARTY_TOKEN".to_string(),
+                    value: "t-123".to_string(),
+                },
+                EnvVar {
+                    name: "AGENT_BRIDGE_HOME".to_string(),
+                    value: "/tmp/abb-home".to_string(),
+                },
+            ],
+        };
         let script = vec![
             ReadLine(2_000),
             Emit(r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#.to_string()),
             ReadLine(2_000),
-            Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_events","_receivedRequest":{captured}}}"#.to_string()),
+            Emit(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_ext","_receivedRequest":{captured}}}"#.to_string()),
             SleepMs(1_000),
         ];
         let mut client = spawn_script(script).await;
@@ -2440,50 +2448,16 @@ mod tests {
             .expect("session_new_full should succeed");
 
         let got = &resp.raw["_receivedRequest"]["params"]["mcpServers"][0];
-        assert_eq!(got["name"], "abb-events");
-        assert_eq!(got["command"], expected_command);
-        assert_eq!(got["args"], serde_json::json!(["mcp-events"]));
-        let env = got["env"].as_array().expect("env array");
-        assert!(env.iter().any(|item| {
-            item["name"] == "AGENT_BRIDGE_HOME"
-                && item["value"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-        }));
-        assert!(env.iter().any(|item| {
-            item["name"] == "ABB_EVENTS_WALGIT_REMOTE" && item["value"] == "origin"
-        }));
-
-        // 夹具必须用**平台绝对路径**：生产侧只在 `repo.is_absolute()` 时才注入
-        // ABB_EVENTS_REPO，mcp-events 侧也只认绝对仓库路径（validate_walgit_repo）。
-        // 写死 unix 风格 `/tmp/...` 在 Windows 上既无盘符也无 UNC 前缀、不是绝对路径，
-        // env 项因此根本不出现——是夹具预期写错，不是生产 bug。用 temp_dir()（两平台
-        // 都返回绝对路径）替代。
-        let repo = std::env::temp_dir().join("abb-events-repo");
-        assert!(
-            repo.is_absolute(),
-            "夹具仓库路径必须是绝对路径：{}",
-            repo.display()
+        assert_eq!(got["name"], "third-party");
+        assert_eq!(got["command"], "/usr/local/bin/third-party-mcp");
+        assert_eq!(got["args"], serde_json::json!(["--root", "/tmp/x"]));
+        assert_eq!(
+            got["env"],
+            serde_json::json!([
+                {"name": "THIRD_PARTY_TOKEN", "value": "t-123"},
+                {"name": "AGENT_BRIDGE_HOME", "value": "/tmp/abb-home"}
+            ])
         );
-        let with_repo = crate::runtime::harness::events_mcp_server_with_repo(Some(repo.clone()));
-        assert!(with_repo.env.iter().any(|item| {
-            item.name == "ABB_EVENTS_REPO" && item.value == repo.display().to_string()
-        }));
-        // 反向断言：非绝对路径不得注入（注入到子进程会被按子进程 cwd 解析、语义漂移）。
-        let relative = crate::runtime::harness::events_mcp_server_with_repo(Some(
-            std::path::PathBuf::from("abb-events-repo"),
-        ));
-        assert!(
-            !relative
-                .env
-                .iter()
-                .any(|item| item.name == "ABB_EVENTS_REPO"),
-            "非绝对路径不得注入 ABB_EVENTS_REPO"
-        );
-        assert!(with_repo
-            .env
-            .iter()
-            .any(|item| item.name == "AGENT_BRIDGE_HOME"));
     }
 
     #[test]

@@ -473,7 +473,7 @@ mod tests {
         let env = FakeEnv::new(&[
             (
                 FAUX_TOOL_ENV,
-                r#"{"name":"abb-events__query","arguments":{"q":1}}"#,
+                r#"{"name":"example-server__query","arguments":{"q":1}}"#,
             ),
             (FAUX_TEXT_ENV, "收尾文本"),
         ]);

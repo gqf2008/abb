@@ -27,9 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::runtime::acp::{
-    AcpClient, AcpError, EnvVar, McpServer, StopReason, SystemPromptTransport,
-};
+use crate::runtime::acp::{AcpClient, AcpError, McpServer, StopReason, SystemPromptTransport};
 use crate::runtime::queue::{CancelReason, DedupMode, FlushBatch, PromptChannelInfo};
 
 /// Window within which agent activity before a hard-cap death qualifies
@@ -712,7 +710,7 @@ const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// treat it as absent.
 const UNKNOWN_CHANNEL_NAME: &str = "unknown";
 
-/// Channel-derived inputs for a new session — `(title_channel, channel_type)`
+/// Channel-derived input for a new session — the channel-qualified title hint.
 /// — from **one** metadata resolve.
 ///
 /// Both new-session consumers need the same lookup: the MCP git-origin env
@@ -725,26 +723,18 @@ const UNKNOWN_CHANNEL_NAME: &str = "unknown";
 /// Renames do not retitle an already-live session; the bridge refreshes the
 /// shared `PromptContext::channels` table on sync, so a later session spawn
 /// uses the current channel name without a harness restart.
-fn resolve_new_session_channel_context(
-    channel_info: Option<&PromptChannelInfo>,
-) -> (Option<String>, Option<String>) {
-    let Some(info) = channel_info else {
-        return (None, None);
-    };
+fn resolve_new_session_channel_context(channel_info: Option<&PromptChannelInfo>) -> Option<String> {
+    let info = channel_info?;
     let is_dm = info.channel_type == "dm";
-    let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then(|| info.name.clone());
-    (title_channel, Some(info.channel_type.clone()))
+    (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then(|| info.name.clone())
 }
 
-/// Channel-derived inputs for a new session (name for the session title,
-/// id + type for the MCP git-origin env).
+/// Channel-derived input for a new session (channel name for the session title).
 ///
 /// On error from `session_new_full()`, returns the `AcpError` — caller handles
 /// error reporting.
 struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
-    id: Option<Uuid>,
-    channel_type: Option<&'a str>,
     /// P0.B：频道工作目录（session/new cwd + <workspace> 段的真值来源）。
     workspace: Option<&'a str>,
 }
@@ -858,12 +848,7 @@ async fn create_session_and_apply_model(
         .session_title
         .as_deref()
         .map(|agent_name| compose_session_title(agent_name, channel.name));
-    let mcp_servers = mcp_servers_with_git_origin(
-        &ctx.mcp_servers,
-        channel.id,
-        channel.channel_type,
-        ctx.session_title.as_deref(),
-    );
+    let mcp_servers = ctx.mcp_servers.clone();
 
     let resp = agent
         .acp
@@ -902,34 +887,6 @@ async fn create_session_and_apply_model(
     }
 
     Ok(resp.session_id)
-}
-
-fn mcp_servers_with_git_origin(
-    servers: &[McpServer],
-    channel_id: Option<Uuid>,
-    channel_type: Option<&str>,
-    agent_name: Option<&str>,
-) -> Vec<McpServer> {
-    let mut servers = servers.to_vec();
-    let origin = match (channel_id, channel_type) {
-        (Some(channel_id), Some("stream")) => Some(EnvVar {
-            name: "ABB_SESSION_CHANNEL_ID".into(),
-            value: channel_id.to_string(),
-        }),
-        (Some(_), _) => agent_name
-            .filter(|name| !name.trim().is_empty())
-            .map(|name| EnvVar {
-                name: "ABB_SESSION_AGENT_NAME".into(),
-                value: name.trim().to_string(),
-            }),
-        (None, _) => None,
-    };
-    if let Some(origin) = origin {
-        for server in &mut servers {
-            server.env.push(origin.clone());
-        }
-    }
-    servers
 }
 
 /// Prepend a legacy agent's standing context to a user-message body.
@@ -1102,16 +1059,12 @@ pub async fn run_prompt_task(
         .ok()
         .and_then(|channels| channels.get(&batch.channel_id).cloned());
 
-    // Channel name and type for a fresh session (title qualification + MCP
-    // git-origin env), derived from the same single metadata resolve. Only
-    // consulted when this channel has no live session yet.
+    // Channel name for a fresh session (title qualification), derived from the
+    // same single metadata resolve. Only consulted when this channel has no
+    // live session yet.
     let mut title_channel: Option<String> = None;
-    let mut origin_channel_type: Option<String> = None;
     if !agent.state.sessions.contains_key(&batch.channel_id) {
-        let (resolved_channel, resolved_channel_type) =
-            resolve_new_session_channel_context(resolved_channel_info.as_ref());
-        title_channel = resolved_channel;
-        origin_channel_type = resolved_channel_type;
+        title_channel = resolve_new_session_channel_context(resolved_channel_info.as_ref());
     }
 
     let (session_id, is_new_session) = {
@@ -1127,8 +1080,6 @@ pub async fn run_prompt_task(
                 &ctx,
                 NewSessionChannelContext {
                     name: title_channel.as_deref(),
-                    id: Some(batch.channel_id),
-                    channel_type: origin_channel_type.as_deref(),
                     workspace: resolved_channel_info
                         .as_ref()
                         .and_then(|i| i.workspace.as_deref()),

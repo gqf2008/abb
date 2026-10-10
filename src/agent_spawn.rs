@@ -58,7 +58,7 @@ impl Drop for KillOnCloseJob {
 ///
 /// **为什么需要**（2026-09-30 owner 实报「桌上堆了 10 个 MCP 孙进程」）：Windows 上杀 agent
 /// 只作用于**直接子进程**（`runtime/acp.rs` 的 `kill_process_group` 在非 unix 是 stub），而
-/// agent 为每个 session 起的 MCP 服务（`mcp-events`）是**孙**进程 —— 于是一次
+/// agent 为每个 session 起的外部 MCP server 是**孙**进程 —— 于是一次
 /// agent 崩溃/被杀就留下一个常驻孤儿。job 成员默认被后代继承，所以套一层就够。
 ///
 /// 失败**不 fail-closed**：少一层「后代连带杀」保证而已，agent 本身照常能跑；记一行日志便于诊断。
@@ -121,7 +121,7 @@ mod tests {
     use super::*;
 
     /// Windows：job 守卫 Drop 后，内核必须**立刻杀掉 job 里的进程** —— 这就是
-    /// 「agent 死 ⇒ 它起的 MCP 服务（mcp-events 等后代）跟着死」的机制本身。
+    /// 「agent 死 ⇒ 它起的 MCP server（外部 server 等后代）跟着死」的机制本身。
     ///
     /// 为什么要真起进程测：这是行为契约（KILL_ON_JOB_CLOSE + AssignProcessToJobObject 的组合
     /// 生效），纯逻辑断言证明不了；而「漏一层」的代价是每个会话留一个常驻孤儿（2026-09-30 实报）。

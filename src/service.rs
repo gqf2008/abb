@@ -179,6 +179,46 @@ fn granted_sandbox_profile(
     }
 }
 
+/// `bots[].mcp_servers` → 会话级 MCP 名单（**形状校验，fail-visible**）。
+///
+/// ABB 只做声明：name/command 非空、name 唯一，其余原样透传；不认识的 server 也能接入，
+/// 干什么由 agent 判断。非法项跳过并留一条日志（不静默降级成"少接一个"）。
+fn bot_mcp_servers(bot: &crate::config::BotConfig) -> Vec<crate::runtime::acp::McpServer> {
+    let mut out: Vec<crate::runtime::acp::McpServer> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for cfg in &bot.mcp_servers {
+        let name = cfg.name.trim();
+        if !cfg.is_usable() {
+            crate::log!(
+                "[mcp] bot={} 的 mcp_servers 有一项 name/command 为空，已跳过",
+                bot.key()
+            );
+            continue;
+        }
+        if !seen.insert(name.to_string()) {
+            crate::log!(
+                "[mcp] bot={} 的 mcp_servers 有重复的 server 名「{name}」，后一项已跳过",
+                bot.key()
+            );
+            continue;
+        }
+        out.push(crate::runtime::acp::McpServer {
+            name: name.to_string(),
+            command: cfg.command.trim().to_string(),
+            args: cfg.args.clone(),
+            env: cfg
+                .env
+                .iter()
+                .map(|e| crate::runtime::acp::EnvVar {
+                    name: e.name.clone(),
+                    value: e.value.clone(),
+                })
+                .collect(),
+        });
+    }
+    out
+}
+
 /// 按 bot 构造 ACP 句柄对（P2.1/P2.2）：normal 与 granted 同命令同 env，差异在
 /// ① env：granted 多 `ABB_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、
 /// ~/.agents/skills 扫盘）发生在 session/new **之前**，per-session `_meta` 管不到，
@@ -204,10 +244,10 @@ fn build_bot_acp_handles(
         .to_string();
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
-    // 会话级 extra MCP：2026-10-10 废弃 wassette 后不再有额外 server（abb-events
-    // 由 RuntimeHandle::new 恒注入）。保留这个变量与参数是为了不破坏接线形状——
-    // granted/oneshot 本来就传空。
-    let extra_mcp: Vec<crate::runtime::acp::McpServer> = Vec::new();
+    // 会话级 MCP 名单：**全部来自该 bot 的用户配置**（`bots[].mcp_servers`）。
+    // ABB 只声明形状、不解释语义；granted/oneshot 路径同样带上它（同一 bot 的会话
+    // 应看到同一份外部 server 名单）。
+    let extra_mcp = bot_mcp_servers(bot);
     // 刀 4b：abb-agent 已声明 `_meta.abbSandbox` 三档并实现受限执行，owner 受限档也走它。
     let normal_command = pick_command_by_sandbox((command, granted_command), normal_meta.is_some());
 
@@ -1817,6 +1857,59 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bots[].mcp_servers` → 会话 MCP 名单：形状校验（跳过 name/command 空、名字重复），
+    /// 其余逐字透传（含 env），顺序保持配置顺序。
+    #[test]
+    fn bot_mcp_servers_shape_and_passthrough() {
+        let bot = crate::config::BotConfig {
+            name: "mcpbot".into(),
+            mcp_servers: vec![
+                crate::config::McpServerConfig {
+                    name: "  notes  ".into(), // 首尾空白：trim 后使用
+                    command: " /opt/notes-mcp ".into(),
+                    args: vec!["--root".into(), "/tmp".into()],
+                    env: vec![crate::config::McpEnvVar {
+                        name: "TOKEN".into(),
+                        value: "t-1".into(),
+                    }],
+                },
+                crate::config::McpServerConfig {
+                    name: String::new(), // 非法：name 空 → 跳过
+                    command: "x".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::config::McpServerConfig {
+                    name: "notes".into(), // 非法：与第一项重名 → 跳过
+                    command: "y".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::config::McpServerConfig {
+                    name: "plain".into(),
+                    command: "true".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let servers = bot_mcp_servers(&bot);
+        assert_eq!(
+            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["notes", "plain"],
+            "非法项跳过、合法项按配置顺序"
+        );
+        assert_eq!(servers[0].command, "/opt/notes-mcp", "command 也 trim");
+        assert_eq!(servers[0].args, vec!["--root", "/tmp"]);
+        assert_eq!(servers[0].env.len(), 1);
+        assert_eq!(servers[0].env[0].name, "TOKEN");
+        assert_eq!(servers[0].env[0].value, "t-1");
+        assert!(servers[1].args.is_empty() && servers[1].env.is_empty());
+        // 空配置 → 空名单（ABB 不再自带任何 server）
+        assert!(bot_mcp_servers(&crate::config::BotConfig::default()).is_empty());
+    }
 
     /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 把 owner 会话（无论档位）
     /// 与 granted 会话都放上 abb-agent 槽（统一迁移刀 4a：abb-agent 已声明 abbSandbox

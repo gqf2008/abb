@@ -1128,12 +1128,12 @@ mod tests {
                 constrained_sampling: None,
             }))
         };
-        let mcp = vec![stub("dev__shell"), stub("abb-events__query")];
+        let mcp = vec![stub("dev__shell"), stub("example-server__query")];
         let builtin = vec!["dev__shell".to_string(), "dev__read".to_string()];
         let (kept, dropped) = drop_mcp_collisions(mcp, &builtin);
         assert_eq!(dropped, vec!["dev__shell".to_string()]);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].schema().name, "abb-events__query");
+        assert_eq!(kept[0].schema().name, "example-server__query");
     }
 
     #[test]
@@ -1324,18 +1324,18 @@ mod tests {
             "cwd": "/ws/bot",
             "systemPrompt": "你是 ABB 的执行层。",
             "mcpServers": [{
-                "name": "abb-events",
+                "name": "example-server",
                 "command": "/Applications/ABB.app/Contents/MacOS/agent-bridge",
-                "args": ["mcp-events"],
-                "env": [{ "name": "ABB_EVENTS_REPO", "value": "/repo" }],
+                "args": ["--serve"],
+                "env": [{ "name": "EXAMPLE_SERVER_TOKEN", "value": "t-1" }],
             }],
         });
         let parsed = SessionNewParams::parse(&params).expect("应能解析");
         assert_eq!(parsed.cwd, "/ws/bot");
         assert_eq!(parsed.system_prompt.as_deref(), Some("你是 ABB 的执行层。"));
         assert_eq!(parsed.mcp_servers.len(), 1);
-        assert_eq!(parsed.mcp_servers[0].name, "abb-events");
-        assert_eq!(parsed.mcp_servers[0].args, vec!["mcp-events"]);
+        assert_eq!(parsed.mcp_servers[0].name, "example-server");
+        assert_eq!(parsed.mcp_servers[0].args, vec!["--serve"]);
     }
 
     /// 三项都是可选的：一个都不给也要能建会话（空 cwd / 默认提示 / 无 server）。

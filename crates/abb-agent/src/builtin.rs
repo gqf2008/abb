@@ -1,6 +1,6 @@
 //! 内置工具（`rpi-tools`）：`read` / `write` / `edit` / `bash` / `grep` / `find` / `ls`。
 //!
-//! 为什么需要：abb-agent 第一刀只有 MCP 工具（abb-events），**没有文件读写与
+//! 为什么需要：abb-agent 第一刀只有 MCP 工具（来自外部 MCP server），**没有文件读写与
 //! shell**；被替代的 `旧执行层` 有 4 个内置 dev 工具（`shell`/`read`/`write`/`ls`，
 //! 挂在 `dev` 伪命名空间下 ⇒ 模型看到的是 `dev__shell`）。本模块把 rpi-tools 的那套工具
 //! 接上，并**沿用 `dev__` 限定名**，避免 owner 约定/技能里写过的工具名静默失效。

@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, EnvVar, McpServer};
+use crate::runtime::acp::{AcpClient, AcpError, McpServer};
 use crate::runtime::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
@@ -339,50 +339,6 @@ pub struct RuntimeHandle {
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
 
-/// ACP session 的标准 MCP server：当前 ABB 可执行文件 + `mcp-events` 子命令。
-pub(crate) fn events_mcp_server() -> McpServer {
-    events_mcp_server_with_repo(crate::config::Config::events_walgit_repo())
-}
-
-/// `events_mcp_server` 的显式仓库注入缝（测试与真实 fork 实验共用）。
-pub(crate) fn events_mcp_server_with_repo(repo: Option<std::path::PathBuf>) -> McpServer {
-    let command = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "agent-bridge".to_string());
-    let mut env = Vec::new();
-    if let Some(repo) = repo {
-        if repo.is_absolute() {
-            env.push(EnvVar {
-                name: "ABB_EVENTS_REPO".to_string(),
-                value: repo.display().to_string(),
-            });
-        }
-    }
-    let bridge_home = crate::bridge_dir();
-    let bridge_home = if bridge_home.is_absolute() {
-        bridge_home
-    } else {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(bridge_home)
-    };
-    env.push(EnvVar {
-        name: "AGENT_BRIDGE_HOME".to_string(),
-        value: bridge_home.display().to_string(),
-    });
-    env.push(EnvVar {
-        // walgit 条目按本地 refs 读取；采集时以 2s 节流 fetch，避免各会话落后。
-        name: "ABB_EVENTS_WALGIT_REMOTE".to_string(),
-        value: "origin".to_string(),
-    });
-    McpServer {
-        name: "abb-events".to_string(),
-        command,
-        args: vec!["mcp-events".to_string()],
-        env,
-    }
-}
-
 impl RuntimeHandle {
     /// 测试访问器：**该句柄实际会 spawn 的执行层命令**。
     ///
@@ -401,7 +357,7 @@ impl RuntimeHandle {
         self.cfg.session_sandbox.as_ref()
     }
 
-    /// 测试访问器：会话级 MCP server 名单（events + extra 注入后的 PromptContext 快照）。
+    /// 测试访问器：会话级 MCP server 名单（装配侧 extra_mcp 的快照）。
     #[cfg(test)]
     pub(crate) fn mcp_server_names(&self) -> Vec<String> {
         self.ctx
@@ -413,16 +369,17 @@ impl RuntimeHandle {
 
     /// 新建句柄。不拉起任何进程——agent 懒启动，首条消息到达才 spawn。
     /// `cwd` = agent 子进程工作目录（ABB 启动时的当前目录）。
-    /// `extra_mcp` = 除 abb-events 外的额外会话级 MCP server（当前 normal handle
-    /// 不再注入任何额外 server；granted/oneshot 亦传空。保留参数供后续按需装配）。
+    /// `extra_mcp` = 该会话要接入的外部 MCP server（bot 配置 `mcp_servers` 的映射；
+    /// granted/oneshot 传空）。ABB 只声明、不解释语义。
     pub fn new(
         cfg: AgentConfig,
         stop: CancellationToken,
         cwd: String,
         extra_mcp: Vec<McpServer>,
     ) -> Arc<Self> {
-        let mut mcp_servers = vec![events_mcp_server()];
-        mcp_servers.extend(extra_mcp);
+        // 会话级 MCP 名单**全部来自装配侧**（bot 配置的外部 server）：ABB 自己不再实现任何
+        // MCP server（原 `abb-events` 已于 2026-10-11 下线，见 card abb-mcp-declarer-only）。
+        let mcp_servers = extra_mcp;
         let ctx = Arc::new(PromptContext {
             mcp_servers,
             initial_message: None,
@@ -1249,10 +1206,10 @@ mod dead_letter_reason_tests {
     fn timeout_carries_stderr_tail() {
         let r = dead_letter_reason(
             &PromptOutcome::Timeout(TimeoutKind::Idle),
-            Some("waiting for mcp server abb-events"),
+            Some("waiting for mcp server third-party-server"),
         );
         assert!(r.contains("回合超时"), "{r}");
-        assert!(r.contains("abb-events"), "{r}");
+        assert!(r.contains("third-party-server"), "{r}");
     }
 
     /// 重生日志：必须带出退避级别与 agent 的 stderr 尾巴 —— 「为什么一直在重启」以前只能靠
@@ -1945,8 +1902,8 @@ fn redact_skill_paths(text: &str) -> String {
 mod spawn_lifecycle_tests {
     use super::*;
 
-    /// extra_mcp 注入句柄后必须与 abb-events 一并出现在会话 MCP 名单；空 extra
-    /// 时名单只有 abb-events（granted/oneshot 的默认形状）。
+    /// extra_mcp（bot 配置的外部 MCP server）必须逐条出现在会话名单；空 extra
+    /// 时名单就是空的（granted/oneshot 的默认形状——ABB 自己不再自带任何 server）。
     #[test]
     fn extra_mcp_attached_to_prompt_context() {
         let mk = |extra: Vec<McpServer>| {
@@ -1969,11 +1926,9 @@ mod spawn_lifecycle_tests {
             args: vec!["--flag".to_string()],
             env: Vec::new(),
         }]);
-        let names = h.mcp_server_names();
-        assert!(names.iter().any(|n| n == "abb-events"));
-        assert!(names.iter().any(|n| n == "extra-dummy"));
-        // 空 extra（granted/oneshot）→ 只有 abb-events
-        assert_eq!(mk(Vec::new()).mcp_server_names(), vec!["abb-events"]);
+        assert_eq!(h.mcp_server_names(), vec!["extra-dummy"]);
+        // 空 extra（granted/oneshot）→ 名单为空（不再自带 abb-events）
+        assert!(mk(Vec::new()).mcp_server_names().is_empty());
     }
 
     /// e2e smoke：extra_mcp 注入的 server 必须出现在真实 ACP session/new 的

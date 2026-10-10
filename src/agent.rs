@@ -175,8 +175,9 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - **开线程** `issue`（`--parent \"\"`）
 - **认领** `comment`（写清 owner/worktree/branch）+ `status: in-progress`
 - **交补丁** `patch`（带 `--base refs/heads/main --head refs/heads/<branch>`）
-- **评审** `review`（带 `decision: approve|needs-changes`、`agent`、`note`）；needs-changes 要退回 in-progress
-- **合并** `merge_result`（先写合并点 oid，再补一条 `merged=true`）
+- **评审** `review`（带 `decision: approve|request_changes`、`agent`、`note`：位置/问题/建议/证据）；
+  **必须是不同于作者的 principal**——作者自己 approve 不算独立评审
+- **合并** `merge_result` **一条**（body 里带 `merged: true` 与合并点 `oid`，它同时把卡片移到 merged）；优先 fast-forward
 - **收尾** `status: closed`；看板卡片只能靠追加 `status` 条目移动，别改看板文件
 
 命令形态（下面的 `$WALGIT` 指**探测到的 walgit 可执行路径**；`--parent` 必须取上一条命令
@@ -186,12 +187,14 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 \"$WALGIT\" --config ~/.walgit/walgit.toml collab entry --kind patch --id <线程> \
     --actor <你的 principal> --parent <上一条 oid> --body \"$(cat body.json)\" \
     --base refs/heads/main --head refs/heads/<branch> \
-  --key ~/.walgit/keys/<principal>.ed25519 --push origin
+  --push origin
+# 身份：每个 worktree 一个 principal（`walgit collab join --principal <proj>-<role>-N --push origin`
+# 生成密钥到该 worktree 的 git dir，不共享、不代签）；有本地身份后 --actor/--key 自动解析。
 ```
 
 **谁签什么**：**实现者**签自己的 `comment`/`patch` 与**实现侧的 `status` 流转**
-（`in-progress` / `needs-review` / `needs-changes` 退回 in-progress）；**审查者**签自己的
-`review`；**集成方**签 `merge_result` ×2 与 `status: closed`。**不要用别人的 key 代签**——
+（`in-progress` / `needs-review` / `request_changes` 退回 in-progress）；**审查者**签自己的
+`review`；**coordinator** 签 `merge_result`（一条）与 `status: closed`。**不要用别人的 key 代签**——
 签名就是为了让审计链能区分「谁做的 / 谁审的 / 谁合的」。新 agent 要 key：`~/.walgit/new-agent-key.sh <principal> --repo <仓库>`
 （生成 key + 注册 principal，幂等）。
 
@@ -1084,7 +1087,9 @@ mod tests {
             assert!(
                 text.contains("走 walgit 记账")
                     && text.contains("必须取上一条命令")
-                    && text.contains("谁签什么"),
+                    && text.contains("谁签什么")
+                    && text.contains("request_changes")
+                    && text.contains("walgit collab join"),
                 "{name} 缺 walgit 协作契约"
             );
             assert!(

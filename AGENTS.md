@@ -106,7 +106,7 @@ tools/check_test_isolation.sh
 
 ## Testing Guidelines
 
-- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package also has two Rust integration tests — `tests/cli_botkey_callsites.rs` and `tests/mcp_events_stdio.rs` — alongside Python mock helpers (e.g. `tests/mock_acp_agent.py`). `crates/abb-agent` carries its own Rust tests (`cargo test --manifest-path crates/abb-agent/Cargo.toml`) plus Python probes under `crates/abb-agent/probes/`; it has no `tests/` directory.
+- Framework: built-in Rust unit tests in `#[cfg(test)]` modules at the end of each `src/*.rs`; the root package also has one Rust integration test — `tests/cli_botkey_callsites.rs` — alongside Python mock helpers (e.g. `tests/mock_acp_agent.py`). `crates/abb-agent` carries its own Rust tests (`cargo test --manifest-path crates/abb-agent/Cargo.toml`) plus Python probes under `crates/abb-agent/probes/`; it has no `tests/` directory.
 - Name tests with `snake_case`, behavior-focused names (e.g., `codex_single_message_no_progress`, `strip_user_mentions`).
 - Add tests alongside the code you change and run `cargo test` before pushing.
 

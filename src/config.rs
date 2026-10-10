@@ -159,6 +159,13 @@ pub struct BotConfig {
     /// 需 owner 在 bot 配置页显式打开。false（默认）不落盘，旧 config 兼容。
     #[serde(default, skip_serializing_if = "tidy_off")]
     pub tidy_enabled: bool,
+    /// 该 bot 的会话要接入的外部 MCP server（空 = 不接入任何）。
+    ///
+    /// ABB 只声明：原样下发给 `session/new` 的 `mcpServers`，由执行层（abb-agent，rmcp
+    /// 客户端）去连接；接进来干什么、要订阅什么资源，由 agent 自己判断。形状校验见
+    /// `service::bot_mcp_servers`（name/command 非空、name 唯一）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerConfig>,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
     /// 缺省（无条目）= 需要 @（默认，向后兼容旧 config）。仅顶层群聊 chat_id 记录；
     /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
@@ -240,6 +247,7 @@ impl Default for BotConfig {
             open_access: false,
             restrict_granted_agent: true,
             tidy_enabled: false,
+            mcp_servers: Vec::new(),
             mention_modes: std::collections::HashMap::new(),
             mention_default: false,
             delete_protect_enabled: true,
@@ -848,17 +856,35 @@ pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
             .unwrap_or(true)
 }
 
-/// MCP 事件订阅配置。空对象不落盘，旧配置无缝兼容。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EventsConfig {
-    /// walgit 仓库绝对路径；空 = 未配置。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub walgit_repo: String,
+/// 会话级外部 MCP server（bot 级配置）。
+///
+/// ABB 只做**声明**：把这里的三元组原样放进 ACP `session/new` 的 `mcpServers`，
+/// 由执行层（abb-agent，rmcp 客户端）去连接。具体 server 干什么、要订阅什么资源，
+/// 由 agent 自己判断——ABB 不解释语义，也不认识任何具体 server（原自带的
+/// `abb-events` 已于 2026-10-11 下线，见 card `abb-mcp-declarer-only-20261011`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    /// server 名（会出现在工具名 `{server}__{tool}` 里；装配侧校验非空且唯一）。
+    pub name: String,
+    /// 可执行文件（与 `PATH` 解析同语义）。
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<McpEnvVar>,
 }
 
-impl EventsConfig {
-    fn is_empty(&self) -> bool {
-        self.walgit_repo.trim().is_empty()
+/// 下发给 MCP 子进程的环境变量（与 `runtime/acp.rs::EnvVar` 逐字对应）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+impl McpServerConfig {
+    /// 形状是否可用（装配侧 `bot_mcp_servers` 用；语义不校验——ABB 不认识 server）。
+    pub fn is_usable(&self) -> bool {
+        !self.name.trim().is_empty() && !self.command.trim().is_empty()
     }
 }
 
@@ -1015,9 +1041,6 @@ pub struct Config {
     /// 与其它字段同走「保存」写盘。#[serde(default)] 兼容旧 config（无此字段）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_roles: Vec<crate::virtualbot::RoleTemplate>,
-    /// MCP 事件订阅的 walgit 仓库等配置。
-    #[serde(default, skip_serializing_if = "EventsConfig::is_empty")]
-    pub events: EventsConfig,
     /// Jev 决策模型（授权者/受限会话工具门禁）。
     #[serde(default, skip_serializing_if = "JevConfig::is_empty")]
     pub jev: JevConfig,
@@ -1058,7 +1081,6 @@ impl Default for Config {
             providers: Vec::new(),
             default_provider: String::new(),
             custom_roles: Vec::new(), // #75 自定义角色模板
-            events: EventsConfig::default(),
             jev: JevConfig::default(),
             app_id: String::new(),
             app_secret: String::new(),
@@ -1163,25 +1185,6 @@ pub enum MentionModeSave {
 impl Config {
     pub fn path() -> PathBuf {
         crate::bridge_dir().join("config.json")
-    }
-
-    /// 读取 `events.walgit_repo` 的纯查询路径：只解析 JSON，不做 legacy migration、
-    /// 不写日志。MCP server 的 stdout 是协议流，不能经 `load()` 混入任何日志。
-    ///
-    /// 返回绝对路径；相对路径按 ABB 进程当前目录展开。空/缺失/坏配置返回 None。
-    pub fn events_walgit_repo() -> Option<PathBuf> {
-        let text = fs::read_to_string(Self::path()).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let raw = value.get("events")?.get("walgit_repo")?.as_str()?.trim();
-        if raw.is_empty() {
-            return None;
-        }
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            Some(path)
-        } else {
-            std::env::current_dir().ok().map(|cwd| cwd.join(path))
-        }
     }
 
     pub fn load() -> Result<Config> {
@@ -2379,6 +2382,66 @@ mod tests {
             !bot.access_allows("ou_unknown"),
             "fail-closed：公开字段不再放行"
         );
+    }
+
+    /// `bots[].mcp_servers` 的 serde 契约：空不落盘、有值 round-trip 逐字保真、
+    /// 旧 config（无此字段）仍可解析。
+    #[test]
+    fn bot_mcp_servers_serde_contract() {
+        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
+        assert!(bot.mcp_servers.is_empty(), "旧 config 无字段 → 空");
+        let s = serde_json::to_string(&bot).unwrap();
+        assert!(
+            !s.contains("mcp_servers"),
+            "空列表不落盘（skip_serializing_if）"
+        );
+
+        let mut with = bot.clone();
+        with.mcp_servers = vec![
+            McpServerConfig {
+                name: "notes".into(),
+                command: "/opt/notes-mcp".into(),
+                args: vec!["--root".into(), "/tmp".into()],
+                env: vec![McpEnvVar {
+                    name: "TOKEN".into(),
+                    value: "t-1".into(),
+                }],
+            },
+            McpServerConfig {
+                name: "empty-extras".into(),
+                command: "true".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+        ];
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(s.contains("\"mcp_servers\""), "非空必须落盘：{s}");
+        let back: BotConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.mcp_servers, with.mcp_servers, "round-trip 逐字保真");
+        // 空 args/env 不落盘（少写盘，语义不变）
+        assert!(!s.contains("\"args\":[]"), "空 args 不落盘：{s}");
+    }
+
+    /// 形状校验谓词：name/command 任一为空即不可用（语义不校验）。
+    #[test]
+    fn mcp_server_config_usability_predicate() {
+        let ok = McpServerConfig {
+            name: "n".into(),
+            command: "c".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+        };
+        assert!(ok.is_usable());
+        assert!(!McpServerConfig {
+            name: "  ".into(),
+            ..ok.clone()
+        }
+        .is_usable());
+        assert!(!McpServerConfig {
+            command: String::new(),
+            ..ok
+        }
+        .is_usable());
     }
 
     /// 废弃 wassette（2026-10-10）后的显式兼容断言：旧落盘 config 里的 `"wassette": false`

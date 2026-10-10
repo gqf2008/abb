@@ -106,7 +106,7 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 ## MCP（刀 1）
 
 rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 下发的 MCP server 就是
-`abb-events`（= abb 二进制自身 `mcp-events` 子命令，agent 订阅 walgit/任务事件的唯一通道）。
+**用户在该 bot 的 `mcp_servers` 里配置的**外部 server（ABB 只声明，不解释语义）。
 本包用 **`rmcp`**（与被替代的 `旧执行层` 同源）接上它。（原 `wassette`（Wasm 组件
 工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 
@@ -231,7 +231,7 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
 ## 内置工具（刀 2 第二批）
 
 用 `rpi-tools`（`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls` + `OsExecutionEnv`）补上被替代组件的
-能力面：第一刀只有 MCP 工具（abb-events），模型**没有文件读写与 shell**。
+能力面：第一刀只有 MCP 工具（外部 server 提供的），模型**没有文件读写与 shell**。
 `OsExecutionEnv::with_cwd(会话 cwd)` → `ExecutionToolContext` → `create_*_tool`，全部以
 **`dev__{name}` 限定名**暴露（沿用被替代组件的 `dev` 伪命名空间，避免 owner 约定/技能里写过的
 工具名静默失效）。

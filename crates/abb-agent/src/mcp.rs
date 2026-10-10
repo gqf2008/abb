@@ -1,7 +1,8 @@
 //! MCP 客户端：把 abb 通过 `session/new` 下发的 `mcpServers` 变成 rpi 的 `AgentTool`。
 //!
 //! 为什么必须有它：rpi **没有 MCP**（全仓零命中，`rpi-mcp` workspace 成员已被删除），
-//! 而 abb 下发的 MCP server 就是 `abb-events`（= abb 二进制自身 `mcp-events` 子命令，
+//! 而 abb 会按会话下发**用户配置的**外部 MCP server（此前还自带一个 `abb-events`，已于
+//! 2026-10-11 下线：ABB 在 MCP 上只做声明者，见 card `abb-mcp-declarer-only-20261011`；
 //! agent 订阅 walgit/任务事件的唯一通道）。不接 MCP 就等于丢掉事件订阅面。
 //! （原 `wassette`（Wasm 组件工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 //!
@@ -224,7 +225,7 @@ async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<Too
     cmd.args(&spec.args);
     // **先清空再白名单**：不经 `env_clear()` 的话，每个 MCP server 默认都能看到
     // abb 注入给 agent 的供应商 API key。
-    // `spec.env` 是 abb 按 server 下发的（`AGENT_BRIDGE_HOME`、`ABB_EVENTS_REPO` 等），
+    // `spec.env` 是 abb 按 server 下发的（如 `AGENT_BRIDGE_HOME` 与该 server 自己的凭据），
     // 最后应用、优先级最高。
     // 白名单在 `child_env`（MCP 子进程与内置工具的 shell 共用同一份）。
     crate::child_env::apply_passthrough_env(&mut cmd);
@@ -682,15 +683,15 @@ mod tests {
     fn server_spec_parses_abb_shape() {
         // 与 src/runtime/acp.rs 的 McpServer 序列化形状逐字对应。
         let raw = serde_json::json!({
-            "name": "abb-events",
+            "name": "example-server",
             "command": "/Applications/ABB.app/Contents/MacOS/agent-bridge",
-            "args": ["mcp-events"],
-            "env": [{ "name": "ABB_EVENTS_REPO", "value": "/repo" }],
+            "args": ["--serve"],
+            "env": [{ "name": "EXAMPLE_SERVER_TOKEN", "value": "t-1" }],
         });
         let spec: McpServerSpec = serde_json::from_value(raw).expect("应能解析");
-        assert_eq!(spec.name, "abb-events");
-        assert_eq!(spec.args, vec!["mcp-events"]);
-        assert_eq!(spec.env[0].name, "ABB_EVENTS_REPO");
+        assert_eq!(spec.name, "example-server");
+        assert_eq!(spec.args, vec!["--serve"]);
+        assert_eq!(spec.env[0].name, "EXAMPLE_SERVER_TOKEN");
     }
 
     #[test]
