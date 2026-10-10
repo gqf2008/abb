@@ -20,7 +20,7 @@ impl Bridge {
         if !self.bot.is_wechat() || text.is_empty() {
             return;
         }
-        // 归一化入队键：任务的 created_by.chat_id 可能是注入的 bot key / buzz 频道 UUID，
+        // 归一化入队键：任务的 created_by.chat_id 可能是注入的 bot key / ABB 频道 UUID，
         // 直接入队会与补发侧的平台 receive_id 键错位（缺陷 abb-wx-outbox-flush-mismatch-20260917）。
         // 入队与补发共用同一归一化函数，保证 store.take 命中。
         let chat_id = crate::outbox::resolve_delivery_chat(&self.bot.key(), chat_id);

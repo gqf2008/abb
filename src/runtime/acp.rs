@@ -249,7 +249,7 @@ pub struct AcpClient {
     /// `session/update` notification of kind `session_info_update`.
     ///
     /// Both goose and the removed execution layer emit `session_info_update` with
-    /// goose emits it whenever it starts or clears an active prompt run
+    /// this field; goose emits it whenever it starts or clears an active prompt run
     /// (`crates/goose/src/acp/server.rs:2277` `send_active_run_update`).
     /// Required as `expectedRunId` when calling the non-standard
     /// `_goose/unstable/session/steer` method to inject a message into an
@@ -302,7 +302,7 @@ pub struct AcpClient {
 
 /// goose's non-standard mid-turn steer method. Requires `expectedRunId`, so it
 /// is only usable once a `session_info_update` has supplied
-/// `_meta.goose.activeRunId`. 仅由 goose 与旧执行层发出。
+/// `_meta.goose.activeRunId`. Emitted by goose and the removed layer only.
 const GOOSE_STEER_METHOD: &str = "_goose/unstable/session/steer";
 
 /// The cross-adapter mid-turn steer method, shipped by claude-agent-acp
@@ -836,7 +836,7 @@ impl AcpClient {
     /// Most recently observed goose `_meta.goose.activeRunId` from a
     /// `session_info_update`, if any.
     ///
-    /// Both goose 与旧执行层都会 emit `session_info_update`; other agents
+    /// Both goose and the removed execution layer emit `session_info_update`; other agents
     /// leave this `None` for the lifetime of the client. Read directly by
     /// `read_until_response_with_idle_timeout`'s
     /// steer arm at write time (see [`crate::runtime::pool::SteerRequest`] for
@@ -1747,7 +1747,7 @@ impl AcpClient {
                 false
             }
             "session_info_update" => {
-                // Both goose 与旧执行层都会 emit `session_info_update` with
+                // Both goose and the removed execution layer emit `session_info_update` with
                 // `_meta.goose.activeRunId`: the id of the currently-active
                 // prompt run, or `null` when the run has cleared. Other agents
                 // don't emit this field; for them `active_run_id` stays `None`
@@ -2010,7 +2010,7 @@ pub struct SessionSandboxMeta {
 ///
 /// The two variants match the two mechanisms supported by current adapters:
 ///
-/// - **`Field`** — bare `systemPrompt` field (ACP protocol v2, 旧执行层实现).
+/// - **`Field`** — bare `systemPrompt` field (ACP protocol v2; implemented by the removed layer).
 /// - **`ClaudeMeta`** — `_meta.systemPrompt: {"append": text}`, used by
 ///   `claude-agent-acp` to append to the adapter's own native system prompt
 ///   while keeping its tool-use preset intact.
