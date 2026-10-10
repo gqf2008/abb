@@ -6135,6 +6135,47 @@ mod tests {
     }
     use super::*;
 
+    /// bot 字段翻转必须翻签名（bot 事件循环在 service 启动时构建，入签名字段不是热读）。
+    ///
+    /// 原用例只钉 `wassette` 一个字段；wassette 移除后改为**逐字段**覆盖 `bots_struct_sig`
+    /// 的全部 9 个 bot 字段——否则以后增删字段时，“字段变了但签名不翻 → service 不重启”
+    /// 这类回归不会被任何测试发现（2026-10-10 独立评审指出）。
+    #[test]
+    fn bots_struct_sig_covers_all_bot_fields() {
+        let base = || {
+            let mut c = Config::default();
+            c.bots = vec![crate::config::BotConfig {
+                name: "bot1".into(),
+                kind: "feishu".into(),
+                ..Default::default()
+            }];
+            c
+        };
+        let s0 = bots_struct_sig(&base());
+        /// 一条字段翻转用例：字段名（失败信息用）+ 就地改写 bot 的闭包。
+        type FieldCase = (&'static str, fn(&mut crate::config::BotConfig));
+        let cases: [FieldCase; 9] = [
+            ("name/key", |b| b.name = "bot2".into()),
+            ("enabled", |b| b.enabled = !b.enabled),
+            ("kind", |b| b.kind = "dingtalk".into()),
+            ("app_id", |b| b.app_id = "cli_x".into()),
+            ("app_secret", |b| b.app_secret = "sec".into()),
+            ("wx_token", |b| b.wx_token = "tok".into()),
+            ("wx_user_id", |b| b.wx_user_id = "wxu".into()),
+            ("ding_user_id", |b| b.ding_user_id = "dingu".into()),
+            ("ding_robot_code", |b| b.ding_robot_code = "rc".into()),
+        ];
+        for (field, mutate) in cases {
+            let mut c = base();
+            mutate(&mut c.bots[0]);
+            assert_ne!(
+                s0,
+                bots_struct_sig(&c),
+                "改 {field} 必须翻签名（触发 svc_restart）"
+            );
+        }
+    }
+
     #[test]
     fn bots_struct_sig_covers_providers() {
         // harness 供应商 env 是启动快照 → 改供应商必须翻签名触发 svc_restart

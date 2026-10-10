@@ -1,7 +1,7 @@
 //! 子进程环境白名单：**先清空、再按表注入**。
 //!
 //! 两个消费者共用这一份：
-//! - MCP server 子进程（`mcp.rs`）——它们是我们 spawn 的第三个组件宿主；
+//! - MCP server 子进程（`mcp.rs`）——abb 按会话下发的 server 可能是第三方代码；
 //! - 内置工具里的 shell（`builtin.rs`，经 `OsExecutionEnv` 的 `inherit_env=false`）。
 //!
 //! 为什么必须清空：abb 把供应商凭据（`ANTHROPIC_API_KEY` / `OPENAI_COMPAT_API_KEY` 等）注入

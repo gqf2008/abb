@@ -18,8 +18,8 @@ jobs:
     # 小文件/preflight 秒过，同一二进制在旧镜像 2.23.62 秒签）。切 macos-15
     # （arm64）绕开该 securityd 回归。
     runs-on: macos-15 # Apple Silicon（arm64），与本地 aarch64 产物一致
-    # 2.23.63 教训：随包工具改为发布机源码构建后本 job 时长曾显著增加（3 核 runner 上
-    # codegen-units=1 单线程代码生成，曾跑 2.5h+ 无进展）。加硬超时让异常快速失败
+    # 2.23.63 教训：本 job 时长下界 = ABB 本体 release 重建（LTO / codegen-units=1）+ 随包
+    # jq 从官方源码构建 + 签名/公证；当时曾跑 2.5h+ 无进展。加硬超时让异常快速失败
     # （正常应在 ~60min 内），而不是烧到 GitHub 默认 6h。
     timeout-minutes: 120
     steps:
@@ -126,7 +126,9 @@ jobs:
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
           # abb-agent 也会 spawn shell / MCP 子进程并可能触发 TCC（#251）。
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-agent
-          for tool in rg jq uv gh; do
+          # 随包工具清单从 tools/tool-lock.tsv 生成（唯一事实源）——不再另手抄一份枚举，
+          # 否则加/删工具时会静默漏签（`--require-bundled-tools` 只查 PATH 解析、不查签名）。
+          for tool in $(awk -F'\t' '$3=="macos-arm64" && $1!="tool" {print $8}' tools/tool-lock.tsv); do
             sign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
           done
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app

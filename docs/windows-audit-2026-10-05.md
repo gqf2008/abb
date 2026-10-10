@@ -22,7 +22,7 @@
    修法：唯一入口 tools/win-build-installer.ps1，各自默认 target 目录 + 新鲜度断言
 7. status() 只按 pid 判活、不校验身份（PID 复用被当 service：假运行 + 误杀无辜进程）
    证据：gui.out 23:43 记 running=true pid=12012，taskkill 同一 pid 报 not found，此后 30 分钟挡住启动
-   修法：status() = 存活 且 镜像名为 agent-bridge.exe（复用 orphan_mcp::image_path）；配判别力测试 + 接线守卫
+   修法：status() = 存活 且 镜像名为 agent-bridge.exe（复用 `install::image_path`——模块 `orphan_mcp` 已随 2026-10-10「废弃 wassette」删除，该函数随之迁入 `src/install.rs`）；配判别力测试 + 接线守卫
 8. 发版资产名无断言（产物名错位时客户端把旧版当新版装，形成降级循环）
    修法：CI 断言 app-assets/Output/ABB-Setup-<版本>.exe 必须存在
 
