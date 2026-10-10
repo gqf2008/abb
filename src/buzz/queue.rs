@@ -7,7 +7,7 @@
 //! channel is independent.
 //!
 //! Ported from upstream buzz-acp `queue.rs` @ c3132c3 and trimmed to ABB's
-//! transport (docs/buzz-port-sync.md): upstream queued signed `nostr::Event`s
+//! transport: upstream queued signed `nostr::Event`s
 //! and had the agent publish replies with the `buzz` CLI; ABB queues plain
 //! chat messages ([`InboundMsg`]) and delivers the agent's turn text
 //! synchronously at turn end. The queue state machine itself (dedup modes,
@@ -58,7 +58,7 @@ const DEFAULT_IN_FLIGHT_DEADLINE_SECS: u64 = 7300;
 
 /// A chat message delivered by the ABB bridge for agent processing.
 ///
-/// Replaces upstream's signed `nostr::Event` (docs/buzz-port-sync.md, 案 1):
+/// Replaces upstream's signed `nostr::Event`:
 /// ABB has no nostr identity world, so the harness keys on the bot-local
 /// message id and carries only what prompt framing needs.
 #[derive(Debug, Clone)]
@@ -936,7 +936,7 @@ pub struct PromptChannelInfo {
     pub description: Option<String>,
     /// 该频道的 agent 工作目录（P0.B：虚拟 Bot 群=vb/<uuid>，其余=bot 工作区）。
     /// None = 桥没提供 → 会话回落到 PromptContext.cwd（进程启动目录，旧行为）。
-    /// ABB 侧扩展字段（docs/buzz-port-sync.md 处置表有记）。
+    /// ABB 侧扩展字段（非上游字段）。
     pub workspace: Option<String>,
 }
 

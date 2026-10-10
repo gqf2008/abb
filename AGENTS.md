@@ -9,9 +9,9 @@ Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that b
 - `app-assets/` — macOS bundle assets (`Info.plist`, `AppIcon.icns`, tray icons).
 - `scripts/` — macOS helpers: `build.sh` (bundle + sign + install), `sign.sh` (re-sign), `make-certs.sh` (dev cert).
 - `reference/` — protocol references (e.g., `feishu_ws_protocol.py`).
-- `crates/abb-agent/` — **唯一执行层**（owner 与授权者会话都走它；由 rpi 库驱动；MCP / 约定链 / 内置工具 / 技能 / 工具通知已对齐被替代组件）。独立包（自带 manifest + lock，root 的 fmt/clippy/test 不碰它），CI 有 `abb-agent-lint`（macOS）与 `abb-agent-windows` 两个任务；命令用 `--manifest-path crates/abb-agent/Cargo.toml`。角色不再决定执行层：`src/service.rs::pick_command_by_sandbox` 已退化为恒选 `abb-agent`，`_meta.abbSandbox` 三档由 abb-agent 自己实现并声明；原用于回滚的执行层覆盖开关（fork 时代的 config 字段）已一并删除。
+- `crates/abb-agent/` — **唯一执行层**（owner 与授权者会话都走它；由 rpi 库驱动；MCP / 约定链 / 内置工具 / 技能 / 工具通知已对齐被替代组件）。独立包（自带 manifest + lock，root 的 fmt/clippy/test 不碰它）；**GitHub Actions** 里有 `abb-agent-lint`（macOS）与 `abb-agent-windows` 两个 job（`.walgit/ci.toml` 只有 `abb-agent-lint` 一条，不等同于覆盖 Windows）；命令用 `--manifest-path crates/abb-agent/Cargo.toml`。角色不再决定执行层：`src/service.rs::pick_command_by_sandbox` 已退化为恒选 **owner 槽**（两槽已同一；随包 `abb-agent` 缺失时两槽同回落 PATH `pi-acp`），`_meta.abbSandbox` 三档由 abb-agent 自己实现并声明；原用于回滚的执行层覆盖开关（fork 时代的 config 字段）已一并删除。
 - `third_party/i-slint-core/` — vendored `i-slint-core` wired via `[patch.crates-io]`. The only local patch is the Windows tray window (message-only → top-level hidden; see `Cargo.toml` comment). Its published tree does not ship everything upstream's repo has — `benches/string.rs` and a font its lib tests `include_bytes!` are missing, so standalone `--all-targets` / `--lib --tests` builds fail for reasons unrelated to the patch; compile coverage of the patch comes from root CI building it as a dependency on windows-latest.
-- `src/buzz/**` — 从 buzz harness 移植的桥/会话层。移植已完成：当年的自维护 fork（独立包）与它的处置台账已在 0685e66 一并删除。此处改动按普通代码改动对待——在提交信息与 walgit patch 说明里写清动机与影响面即可，没有额外的台账文件。
+- `src/buzz/**` — 从 buzz harness 移植的桥/会话层。移植已完成：当年的自维护 fork（独立包）与它的处置台账已在 0685e66 一并删除；`src/buzz/mod.rs` 头部保留的上游 pin 只是**历史出处标注**（不要据此把 ABB 定制反推为上游行为，也不要重开 rsync 流程）。此处改动按普通代码改动对待——在提交信息与 walgit patch 说明里写清动机与影响面即可，没有额外的台账文件。
 
 Runtime data lives in `~/.agent-bridge/` (the non-empty `AGENT_BRIDGE_HOME` env var overrides the
 entire runtime directory; empty means default); per-bot workspaces under
@@ -24,13 +24,28 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **All work tracking lives in walgit**: create/update issues, patches, reviews,
   merge results and status transitions with `walgit collab` entries under
   `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
-- **Entry contract**: `issue` starts a thread; `comment` + `status: in-progress`
-  records owner/worktree/branch; `patch` uses `--base refs/heads/main --head
-  refs/heads/<branch>`; `review` uses `decision` (`approve` / `needs-changes`),
-  `agent`, and `note`; `needs-changes` returns to `status: in-progress`; approve
-  keeps `status: needs-review` until merge; after pushing the local merge, append
-  `merge_result` with the merged oid and then a second `merge_result` with
-  `merged=true`; finish with `status: closed`.
+- **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`http://walgit.localhost:8081/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
+- **Identity first (§0/§0a)**: one principal per collaborator, one Ed25519 key, materialized **per worktree** by
+  `walgit collab join --principal <proj>-<role>-N --push origin` (the seed lands in that worktree's git dir;
+  never share a key, never sign an entry for someone else). This project's convention is
+  `abb-worker-N` (author) / `abb-reviewer-N` (acceptance) / `abb-coordinator` (merge & close) — take the
+  next free index after the highest registered one. Do the §0a routine before filing or claiming: fetch
+  `refs/collab/inbox/*` + `refs/collab/meta/*`, read `walgit collab board`, then claim.
+- **Entry contract**: `issue` opens a thread (objective, owner, **machine-checkable acceptance**);
+  `comment` + `status: in-progress` records the claim (`owner` / `worktree` / `branch` / `work`);
+  `status` values are `in-progress` / `needs-review` / `blocked` / `needs-human` / `done` / `closed`
+  (`needs-human` only for what genuinely needs the human); `patch` uses `--base refs/heads/main
+  --head refs/heads/<branch>`; `review` uses `decision` (**`approve`** / **`request_changes`**),
+  `agent` and `note` (full findings: location / problem / suggestion / evidence). Every entry's
+  `--parent` is the previous entry's **real oid**. Reference other threads with
+  `--related <oid>` / `--depends-on <oid>`.
+- **Independent review is structural (§0b/§4)**: the reviewer must be a **different principal** from
+  the patch author (and, for the final review, from the merger). An author's own `approve` never
+  satisfies the gate; several roles signing with one shared key destroys the audit trail.
+- **Merge & close (§5)**: the coordinator merges locally (**fast-forward preferred**), pushes to
+  `origin`, records **one** `merge_result {"merged":true,"oid":"<sha>","result":"merged"}` (that entry
+  moves the card to `merged`), then `status: closed`; afterwards remove the card's worktree and branch
+  and verify with `git worktree list`.
 - **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
@@ -40,13 +55,11 @@ entire runtime directory; empty means default); per-bot workspaces under
   `export TMPDIR=/Volumes/DataExt/tmp` for anything that makes temp trees. Falling back
   to the default `target/` or `$TMPDIR` fills the boot volume and manifests as an
   `errno=28 (No space left on device)` link failure — not as a code failure.
-- **Walgit CI runner**: `ci.toml` is only a declaration; the server does not execute
-  it. Start/supervise the local runner with `tools/run_ci_runner.sh` from the stable
-  main checkout — it sets `TMPDIR=/Volumes/DataExt/tmp` and
-  `CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-ci-target` (required, see above). Run
-  **exactly one** runner per host (two runners race to claim the same run's tasks).
-  Check results with `walgit ci status --repo .`; a missing runner or zero runs is not
-  a pass.
+- **CI**: merge gate = the local gate set below (fmt / clippy / build / `tools/check_test_isolation.sh`)
+  + independent review. This repo intentionally keeps **no local walgit CI runner** — do not start
+  `tools/run_ci_runner.sh`; `walgit ci` results are simply absent here, and that is not a pass. GitHub
+  Actions covers `ci.yml` at PR/mirror level and `release.yml` at tag/release time (the release path is
+  where the full build/sign/notarize happens).
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.

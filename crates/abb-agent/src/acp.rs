@@ -12,11 +12,15 @@
 //! 「30s drain 超时 → 杀进程重拉」。所以这里把**只有回合**派到独立任务里跑，
 //! 读循环保持可读；`initialize`/`session/new`/`session/cancel` 仍在读循环内同步处理。
 //!
+//! ### 已反转的历史取舍（别把旧注释当现状）
+//!
+//! - **`_meta.abbSandbox`**：旧版**不声明**（当时本包不实现任何沙箱档位，abb 侧
+//!   `parse_abb_sandbox_modes` 得到 `None` → `SandboxSupport::Unsupported`）。**统一迁移刀 2 起已反转**：
+//!   本包实现受限档（Jev 门禁 + 文件域闸 + 档位工具面，见 `GuardedTool`），并在 `initialize`
+//!   如实声明三档——abb 对带 `session_sandbox` 的会话是 fail-closed，不声明会被 `pool.rs` 拒建。
+//!
 //! ### 刻意不做的事（都是决策，不是遗漏）
 //!
-//! - **不声明 `_meta.abbSandbox`**：本 agent 不实现任何 OS 沙箱档位。abb 侧
-//!   `parse_abb_sandbox_modes` 因此得到 `None` → `SandboxSupport::Unsupported`。
-//!   这是**如实声明**：声明支持却不执行，正是 abb 注释里点名的事故形态。
 //! - **不发 `session/request_permission`**：授权约定由 AGENTS.md 承担。
 //! - **发 `tool_call` / `tool_call_update`**（刀 2 第四批）：工具调用要可见，
 //!   载荷与参照物的四个发射点对齐，见 [`tool_updates`] 的边界说明。
