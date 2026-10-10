@@ -433,7 +433,7 @@ impl AcpClient {
         // ABB 侧差异（相对上游）：extra_env 为**无条件覆盖**（上游仅缺失时注入）。
         // service 用它对子进程 PATH 做全量接管（composed_path）——launchd/GUI 进程
         // 的 PATH 极简（/usr/bin:/bin），"缺失才注入"会让 agent 永远找不到 npm 全局
-        // 安装（见 AgentConfig 文档与 docs/buzz-port-sync.md）。
+        // 安装（见 AgentConfig 文档）。
         for (key, value) in extra_env {
             cmd.env(key, value);
         }

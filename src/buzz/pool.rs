@@ -218,7 +218,7 @@ pub struct PromptResult {
     /// Agent text captured during the completed turn (`AcpClient::take_turn_text`),
     /// trimmed of surrounding whitespace. `Some` only when the turn completed
     /// successfully with non-empty output — this is what the bridge delivers
-    /// synchronously to the chat (docs/buzz-port-sync.md). Timeout, requeue and
+    /// synchronously to the chat. Timeout, requeue and
     /// cancel paths drop the text (`None`); an empty `Ok` turn (tool-only,
     /// silent) is also `None` and is not delivered.
     pub final_text: Option<String>,
@@ -413,7 +413,7 @@ pub enum PromptOutcome {
 /// into every task. `channels` is the one mutable member: the bridge
 /// refreshes it on channel sync, and prompt turns read metadata from it for
 /// framing — no per-turn REST fetch exists in this port (upstream's
-/// `ChannelInfoResolver` relay refresh was trimmed, docs/buzz-port-sync.md).
+/// `ChannelInfoResolver` relay refresh was trimmed).
 pub struct PromptContext {
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
@@ -1091,7 +1091,7 @@ pub async fn run_prompt_task(
 
     // Resolve channel metadata for prompt framing from the shared channel table
     // (refreshed by the bridge on sync — no per-turn relay fetch in this port,
-    // docs/buzz-port-sync.md). Unknown channels fail open: `format_prompt`
+    // Unknown channels fail open: `format_prompt`
     // identifies the channel by UUID alone and the session title falls back to
     // the bare agent name.
     let resolved_channel_info = ctx
@@ -1371,7 +1371,7 @@ pub async fn run_prompt_task(
     // Begin capturing this turn's agent text: everything the agent outputs
     // from here on (including native-steer follow-up text on the same session)
     // accumulates in `AcpClient::turn_text`, taken out at successful completion
-    // and delivered synchronously by the bridge (docs/buzz-port-sync.md).
+    // and delivered synchronously by the bridge.
     agent.acp.begin_turn();
 
     // log reads as start/stop pairs. Purely observational: an unpaired start is

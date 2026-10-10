@@ -2,9 +2,10 @@
 //! ported into the ABB process and trimmed for single-process use.
 //!
 //! Source pinned at `buzz-acp-port-c3132c3` (upstream commit c3132c3); Apache-2.0,
-//! license text in [`UPSTREAM-LICENSE.txt`]; per-file provenance and sync rules
-//! in `docs/buzz-port-sync.md` — rsync the six sync-listed files from upstream,
-//! never copy ABB-local changes back.
+//! license text in [`UPSTREAM-LICENSE.txt`]. The per-file sync ledger that used to record this
+//! provenance（连同 rsync 规则）was removed together with the buzz-agent fork (0685e66), so the
+//! pin is **historical provenance only** — never infer upstream behaviour from ABB-local
+//! changes, and do not re-open a sync/rsync process from this comment.
 //!
 //! Trim port's shape: only `acp`, `pool`, `queue`, `prompt_framing` and the
 //! ABB-side `harness` carry production logic. Everything relay/config/

@@ -2,7 +2,7 @@
 //!
 //! 上游 buzz-acp（`crates/buzz-acp` @ c3132c3）的 relay 形态整个被替换为进程内
 //! 消息总线：ABB 桥把聊天消息 `push` 进来，harness 排队 → 投给唯一一个 pi-acp
-//! 子进程 → 回合结束时把捕获的 agent 文本同步投回聊天（docs/buzz-port-sync.md）。
+//! 子进程 → 回合结束时把捕获的 agent 文本同步投回聊天。
 //!
 //! 裁剪对照（相对上游 lib.rs 主循环）：
 //! - **懒池**：单 slot，首条消息才拉起 agent 子进程；崩溃后指数退避自动重拉
@@ -102,8 +102,8 @@ impl ChannelMeta {
 pub struct AgentConfig {
     pub command: String,
     pub args: Vec<String>,
-    /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同，
-    /// 见 docs/buzz-port-sync.md）。
+    /// 无条件覆盖的环境变量（ABB 合成 PATH；与上游「缺失才注入」语义不同：
+    /// service 用它对子进程 PATH 做全量接管）。
     pub extra_env: Vec<(String, String)>,
     /// ABB 后端标识（单后端化后恒 "buzz"）。P4.3 删除回复尾部「── 后端：X」
     /// 标注后暂无消费方——字段保留作配置透传（service → handle）与将来日志
@@ -330,8 +330,7 @@ pub struct BuzzHandle {
     turn_tx: mpsc::UnboundedSender<TurnOutput>,
     /// 同步回合等待表（job/oneshot 路径）：channel_id → 结局回传。Ok = 回合文本
     ///（turn consumer 消费 TurnOutput 时旁路）；Err = 终态失败原因（notify_channel
-    /// 死信/失败告示时旁路——否则 agent 错误对同步等待者只表现为「挂到超时」，
-    /// 见 docs/buzz-port-sync.md 与 oneshot.rs）。
+    /// 死信/失败告示时旁路——否则 agent 错误对同步等待者只表现为「挂到超时」，见 oneshot.rs）。
     sync_waiters: std::sync::Mutex<
         std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SyncWaitMsg>>,
     >,
