@@ -26,6 +26,7 @@ mod feishu;
 mod guard;
 mod history;
 mod install;
+mod lark_user;
 mod larkskills;
 mod messenger;
 mod msgstore;
@@ -537,6 +538,8 @@ fn main() {
     // 跨会话投递 CLI：供 claude 用 Bash 调用（也可人用）。
     //   agent-bridge deliver --text "内容" [--file <路径>]…
     //     （不给目标 = 缺省发回创建者会话，等价 --to-current；见 parse_deliver_args）
+    //   agent-bridge deliver --as user --bot <飞书bot key> --chat <chat_id> --text "内容"
+    //     （以**你本人**身份发出；委派本机 lark-cli，失败显式报错、绝不回落 bot；仅飞书 + 纯文本）
     //   agent-bridge deliver --bot <目标bot key> --chat <目标chat_id> --text "内容"
     //   [--source-bot <来源bot key> --source-chat <来源chat_id>]（缺省取桥注入的 env）
     // 总开关：Config.cross_delivery_enabled（设置 → 「跨会话投递」勾选），关闭时拒绝。
@@ -1996,7 +1999,7 @@ fn run_deliver_cli(args: &[String]) -> i32 {
         Ok(i) => i,
         Err(e) => {
             eprintln!(
-                "{e}\n用法：agent-bridge deliver --text \"内容\" [--file <本地路径>]…（缺省发回创建者会话）\n      agent-bridge deliver --to-current --text \"内容\" …（同上，显式写法）\n      agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…（跨会话）"
+                "{e}\n用法：agent-bridge deliver --text \"内容\" [--file <本地路径>]…（缺省发回创建者会话）\n      agent-bridge deliver --to-current --text \"内容\" …（同上，显式写法）\n      agent-bridge deliver --bot <目标bot key> --chat <目标chat_id|@角色名> --text \"内容\" [--file <本地路径>]…（跨会话）\n      agent-bridge deliver --as user --bot <飞书bot key> --chat <chat_id> --text \"内容\"（以你本人身份发，需本机 lark-cli 已授权；仅飞书+纯文本，失败不回落 bot）"
             );
             return 1;
         }

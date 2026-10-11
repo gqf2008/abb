@@ -164,6 +164,13 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
     能力有差异：飞书全类型；微信图片/文件/视频（音频按文件发）；**钉钉支持图片与常见文档/压缩包（单聊/群聊）**。
     不支持的类型会明确报错，不会静默降级。
 - 投递是异步的：CLI 只入队，service 侧实际发送；失败会回源到当前会话报错，不会静默丢。
+- **以用户本人身份发**（卡 abb-deliver-send-as-user-20260929；**仅 owner 会话**——受限会话会被 guard 拒绝）：
+  `\"$ABB_BIN\" deliver --as user --bot <飞书bot key> --chat <chat_id> --text \"内容\"`
+  - 只支持**飞书**目标 + **纯文本**（带 `--file` 或不给正文在解析期就报错，不进队列）。
+  - 依赖本机 `lark-cli` 已授权本人账号（`lark-cli auth status`）。没装 / 没授权 / token 失效 / 超时都会
+    **显式报错**，**不会改用 bot 身份代发**——所以别先跟用户说\"已经用你的名义发出去了\"，先看命令输出；
+    失败会同时回源提示当前会话。
+  - 缺省（不给 `--as`）仍是 bot 身份，行为与以前完全一致。
 - 开关关闭时 CLI 会直接报错——提示用户先去设置打开，不要反复重试。
 - **防循环**：不要把收到的跨会话消息再原样转发回去（同一来源/目标/内容 10 分钟内会被 service 抑制并回源提示）。
 
@@ -1050,6 +1057,21 @@ mod tests {
             assert!(
                 text.contains("task --help"),
                 "{name} 应给出可执行的帮助命令（`task --help` 已是真命令）"
+            );
+            // `--as user`（以用户本人身份发，卡 abb-deliver-send-as-user-20260929）：指引必须写明
+            // ①有这条通路 ②能力边界（仅飞书+纯文本）③失败**不回落 bot**——否则 agent 会向用户
+            // 承诺"已经用你的名义发出去了"，而实际可能是 bot 发的（该卡要消灭的最坏失败模式）。
+            assert!(
+                text.contains("--as user"),
+                "{name} 应写明 deliver --as user"
+            );
+            assert!(
+                text.contains("不会改用 bot 身份代发"),
+                "{name} 应写明 --as user 失败不回落 bot 身份"
+            );
+            assert!(
+                text.contains("仅 owner 会话") && text.contains("只支持**飞书**目标"),
+                "{name} 应写明 --as user 的可用面（仅 owner 会话、仅飞书）"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

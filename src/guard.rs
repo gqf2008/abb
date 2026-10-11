@@ -738,6 +738,18 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
                         ));
                     }
                     i += 2;
+                } else if a == "--as" {
+                    // `--as user` = 以**用户本人**身份发消息（`src/lark_user.rs`）：消息看起来是
+                    // 人发的，权限面比 bot 身份大得多（可代表本人对外发声）⇒ **受限（授权者）会话一律不许**，
+                    // 只有 owner 会话/人工终端能用。与 CLI 同构：CLI 只认空格分隔的 `--as user`，
+                    // `--as=user` 会被 CLI 当未知参数拒绝 ⇒ guard 不需要额外形态。
+                    if rest.get(i + 1).map(|s| s.as_str()) == Some("user") {
+                        return Decision::Deny(
+                            "deliver --as user（以用户本人身份发）仅限 owner 会话；受限会话请用缺省的 bot 身份"
+                                .into(),
+                        );
+                    }
+                    i += 2;
                 } else {
                     i += 1;
                 }
@@ -1587,6 +1599,16 @@ mod tests {
         );
         assert_ne!(
             decide(r#"$ABB_BIN deliver --file /tmp/secret.txt --bot feishu --chat oc_1"#),
+            Decision::Allow
+        );
+        // `--as user`（以用户本人身份发）是身份升级 ⇒ 受限会话必须拒；`--as bot`/缺省放行。
+        // 判别力：把 `--as` 分支删掉 ⇒ 第一条断言红（受限会话将能以本人名义对外发声）。
+        match decide(r#"$ABB_BIN deliver --as user --bot feishu --chat oc_1 --text hi"#) {
+            Decision::Deny(why) => assert!(why.contains("仅限 owner"), "{why}"),
+            other => panic!("--as user 应被拒绝，实际 {other:?}"),
+        }
+        assert_eq!(
+            decide(r#"$ABB_BIN deliver --as bot --bot feishu --chat oc_1 --text hi"#),
             Decision::Allow
         );
         assert_ne!(decide(r#"$ABB_BIN session nuke"#), Decision::Allow);
