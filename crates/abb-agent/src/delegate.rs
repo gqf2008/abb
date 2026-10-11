@@ -563,8 +563,12 @@ mod tests {
     /// 判据是「本平台可执行」，因此同一个用例能在两个平台上**都真跑**；
     /// 整条 `#[cfg(unix)]` 掉会把 Windows 的行为覆盖留成空洞（本卡要消的就是这个）。
     ///
-    /// 签名里两条腿都在：非 unix 平台用不到 `unix_body`（反之亦然），故按平台放行未用变量。
-    #[cfg_attr(not(unix), allow(unused_variables))]
+    /// 签名里两条腿都在：**两个平台各有一个参数用不到**（unix 不用 `windows_body`，非 unix 不用
+    /// `unix_body`）⇒ 放行必须是**无条件**的。此前写成 `#[cfg_attr(not(unix), allow(unused_variables))]`
+    /// 极性正好反了：只在非 unix 放行，于是 unix 上（CI 主平台）`windows_body` 报 `unused variable`，
+    /// 在 `-D warnings` 下就是 error —— 连带 `ci.toml` 的 `abb-agent-lint` 与 GitHub Actions 的
+    /// macOS `abb-agent-lint` job 一起变红（卡 `abb-agent-lint-macos-red-20261011`）。
+    #[allow(unused_variables)] // 两条腿各用一个参数，见上：谁先被 cfg 掉都不该变成编译失败
     fn write_fake_cli(dir: &Path, stem: &str, unix_body: &str, windows_body: &str) -> PathBuf {
         #[cfg(unix)]
         let (name, body) = (stem.to_string(), unix_body.to_string());
