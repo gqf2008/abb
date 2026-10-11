@@ -294,8 +294,26 @@ fn reap_idle_agents(l: &mut Loop) {
 /// 63s 内 11890 条带标记 prompt，确认放大真实存在。
 ///
 /// 取值 10s：IM 场景下"同一资源 10s 内的多次变化"合并成一次提醒几乎无损；低于 5s 则高频资源
-/// （日志/状态文件）仍能自激。阈值变更按 `RULE_阈值变更.md` 单独提交并附证据。
+/// （日志/状态文件）仍能自激。阈值变更按 `RULE_阈值变更.md` 单独提交并附证据——
+/// 本文件的 `resource_event_min_interval_is_pinned` 会把当前值钉住，改动即测试红。
 const RESOURCE_EVENT_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 单个 `(channel, server)` 每窗口最多放行的资源更新条数。
+///
+/// 为什么需要（评审 F2）：判定键含 uri ⇒「每次事件都换 uri」就能**完全绕开**逐资源窗口
+/// （每次都是"首次"）。对这类话痨 server，逐资源节流等于没有节流。本上限把单 server 的
+/// 回合数上界从"无限"压到 3 条/窗口（约 0.3 回合/s）。
+///
+/// 取值 3：一个 server 上常见资源数量很小（模板/记忆/状态各一），3 条足以覆盖正常并发；
+/// 阈值变更同样按 `RULE_阈值变更.md` 单独提交（`resource_event_per_server_cap_blocks_uri_rotation` 会红）。
+const RESOURCE_EVENT_MAX_PER_SERVER: u32 = 3;
+
+/// 节流日志的**每窗口即时行预算**（超出只计数，由汇总行报告）。
+///
+/// 为什么需要：丢弃必须可观测（本卡 AC1），但放大速率实测约 190 事件/s——每 key 一条即时行，
+/// 在多 key 反复更新时仍能刷爆 `bridge.out`（轮转上限 8 MiB，不限频约 5 分钟就挤掉其他诊断）。
+/// 预算 20 行/窗口 + 每窗口至多 1 条汇总 ⇒ 日志上界约 2.1 行/s，**与负载无关**。
+const RESOURCE_THROTTLE_LOG_BUDGET: u32 = 20;
 
 /// 频道登记表（桥线程与主循环共用；ctx.channels 提示元数据同锁更新）。
 #[derive(Default)]
@@ -614,10 +632,11 @@ struct Loop {
     /// 发送端带 **agent 槽位**：执行层会话号是进程内的，必须连同 agent 身份一起上报，
     /// 否则多 agent 并发时归属会串（评审 F1）。
     resource_tx: mpsc::UnboundedSender<(usize, ResourceUpdate)>,
-    /// `(channel, server, uri)` → 上次投递时刻（节流用，见 [`RESOURCE_EVENT_MIN_INTERVAL`]）。
-    resource_last_sent: std::collections::HashMap<(Uuid, String, String), Instant>,
-    /// 节流窗口：生产 = [`RESOURCE_EVENT_MIN_INTERVAL`]；测试注入更短的值以免真等 10s。
-    resource_min_interval: Duration,
+    /// 资源事件节流器（判定 + 记账 + 限频日志，见 [`ResourceThrottle`]）。
+    ///
+    /// 窗口恒为 [`RESOURCE_EVENT_MIN_INTERVAL`]（**不提供测试注入**：评审 F4 指出原字段从无
+    /// 赋值点，而阳性对照用例就是靠真等一个窗口来证明窗口真的生效——注入点会让那条证明失真）。
+    resource_throttle: ResourceThrottle,
 }
 
 impl Loop {
@@ -645,8 +664,7 @@ impl Loop {
             registry: crate::runtime::pool::SessionRegistry::default(),
             resource_rx,
             resource_tx,
-            resource_last_sent: std::collections::HashMap::new(),
-            resource_min_interval: RESOURCE_EVENT_MIN_INTERVAL,
+            resource_throttle: ResourceThrottle::new(Instant::now()),
         };
         (l, steer_ack_rx)
     }
@@ -694,7 +712,10 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
             break;
         };
         match evt {
-            Evt::Cmd(cmd) => handle_cmd(&mut l, &handle, cmd),
+            Evt::Cmd(cmd) => {
+                // 返回值只对资源事件节流有意义（见 handle_cmd 文档），主循环忽略。
+                let _ = handle_cmd(&mut l, &handle, cmd);
+            }
             Evt::Result(result) => handle_prompt_result(&mut l, &handle, *result),
             Evt::Panic(join_error) => recover_panicked_agent(&mut l, &handle, join_error),
             Evt::SteerAck(ack) => handle_steer_ack(&mut l, ack),
@@ -724,7 +745,9 @@ enum Evt {
 
 // ── Cmd 处理 ─────────────────────────────────────────────────────────────────
 
-fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
+/// 处理一条命令。返回值表示**消息是否真的进了队列**（仅 `Cmd::Message` 有语义，其余恒 `true`）：
+/// 资源事件节流要靠它决定是否记账（评审 F3），故不能再无条件返回 `()`。
+fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) -> bool {
     match cmd {
         Cmd::Message { channel_id, msg } => {
             let accepted = l.queue.push(QueuedEvent {
@@ -733,8 +756,9 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
                 received_at: Instant::now(),
             });
             if !accepted {
-                tracing::warn!(%channel_id, "message dropped by queue policy");
-                return;
+                // 同上：本仓生产进程没有 tracing subscriber，这里也走 stdout。
+                crate::log!("[queue] 消息被队列策略丢弃（channel={channel_id}），未投递");
+                return false;
             }
             // 已入队。频道在跑 → 固定 Steer 模式门：先试非取消 ACP steer
             // 分叉，失败（pi-acp 无扩展，恒失败）走 cancel+merge 回退信号。
@@ -752,6 +776,7 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
             }
             // 会话级隔离：按「队列里有多少待跑会话」保证槽位与热 agent（上限内）。
             ensure_agent_capacity(l, handle);
+            true // 已入队（资源事件节流据此记账，见 F3）
         }
         Cmd::Cancel { channel_id, reply } => {
             let fired = signal_in_flight_task(&mut l.pool, channel_id, ControlSignal::Cancel);
@@ -767,6 +792,7 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
                 l.cancel_requested.insert(channel_id);
             }
             let _ = reply.send(fired);
+            true
         }
         Cmd::DropQueuedJobs { channel_id, reply } => {
             let dropped = l
@@ -778,6 +804,7 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
                 let _ = deliver_sync_wait_msg(handle, channel_id, SyncWaitMsg::Cancelled);
             }
             let _ = reply.send(dropped.len());
+            true
         }
         Cmd::SyncRoots(roots) => {
             // diff：对比登记表里 thread_id == None 的根频道。
@@ -838,7 +865,11 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
                 if let Ok(mut ctx_w) = handle.ctx.channels.write() {
                     ctx_w.remove(&uuid);
                 }
+                // 评审 F2：频道没了，它的节流状态也一并清掉（否则残留到 GC 下限期，
+                // 且 uuid 若被复用会把新频道的首次更新误判成"窗口内"）。
+                l.resource_throttle.forget_channel(uuid);
             }
+            true
         }
     }
 }
@@ -852,10 +883,243 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
 /// 节流判定（纯函数，便于单测）：距上次投递不足 `min` 则**丢弃**。
 ///
 /// 判定键是 `(channel, server, uri)`：同一资源的连续变化在窗口内合并；不同资源互不影响。
+///
+/// 语义：**"过期" 与 "不存在" 等价**（都放行）⇒ 定期 `retain` 过期条目不改变任何行为，只把状态变有界。
 fn resource_event_allowed(last: Option<Instant>, now: Instant, min: Duration) -> bool {
     match last {
         Some(prev) => now.saturating_duration_since(prev) >= min,
         None => true,
+    }
+}
+
+/// 节流判定结果（日志文案与测试都要能区分"为什么被丢"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResourceDecision {
+    Allow,
+    /// 同一 `(channel, server, uri)` 在窗口内已有过投递。
+    DropByKey,
+    /// 同一 `(channel, server)` 本窗口已放行 [`RESOURCE_EVENT_MAX_PER_SERVER`] 条（防 uri 轮换绕过）。
+    DropByServer,
+}
+
+/// 资源事件节流器：状态 + 判定 + **日志行生成**（纯内存，不直接写 stdout，便于单测）。
+///
+/// 为什么把日志也放进来（评审 F1）：原实现用 `tracing::warn!`，而根二进制**没有安装 tracing
+/// subscriber**（`tracing` 只是空壳，见本文件 985/1390 两处同因注释）⇒ 丢弃路径实际是**静默**的，
+/// 与卡上 AC1「不得静默」不符。现在改为产出字符串、由生产侧用 [`crate::log!`] 写 stdout
+/// （与全仓约定一致），并且**限频**（即时行预算 + 每窗口一条汇总），既不静默也不刷爆日志。
+pub(crate) struct ResourceThrottle {
+    /// `(channel, server, uri)` → 上次**成功入队**时刻。F3：只有真入队才记账
+    /// （否则"被队列策略拒"的事件会白占一个窗口，把下一条真实更新误杀）。
+    last_sent: HashMap<(Uuid, String, String), Instant>,
+    /// `(channel, server)` → (窗口起点, 本窗口已放行条数)：防 uri 轮换绕过（F2）。
+    per_server: HashMap<(Uuid, String), (Instant, u32)>,
+    /// 本窗口内按 key 的丢弃计数（汇总行的明细，每窗口清空 ⇒ 有界）。
+    dropped_detail: HashMap<(Uuid, String, String), u32>,
+    /// 距上次汇总已放行/已丢弃条数（放行数只在 [`Self::mark_delivered`] 累加 = 真入队才算）。
+    allowed_since_summary: u32,
+    dropped_since_summary: u32,
+    /// 本窗口内"找不到对应频道"的孤儿更新条数（同样会静默，故纳入汇总）。
+    orphans_since_summary: u32,
+    /// 本窗口即时行已用预算与因预算被压掉的条数。
+    log_lines_used: u32,
+    logs_suppressed: u32,
+    last_summary: Instant,
+    last_gc: Instant,
+}
+
+impl ResourceThrottle {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_sent: HashMap::new(),
+            per_server: HashMap::new(),
+            dropped_detail: HashMap::new(),
+            allowed_since_summary: 0,
+            dropped_since_summary: 0,
+            orphans_since_summary: 0,
+            log_lines_used: 0,
+            logs_suppressed: 0,
+            last_summary: now,
+            last_gc: now,
+        }
+    }
+
+    /// 过期清理（评审 F2：原实现只 insert 从不删 ⇒ 长驻服务数天即百 MB 级，且 uri 每次都变时
+    /// 表随事件数无界增长）。因为"过期 == 不存在"语义等价，清理**不改变任何判定结果**。
+    fn gc(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_gc) < RESOURCE_EVENT_MIN_INTERVAL {
+            return;
+        }
+        self.last_gc = now;
+        let min = RESOURCE_EVENT_MIN_INTERVAL;
+        self.last_sent
+            .retain(|_, t| now.saturating_duration_since(*t) < min);
+        self.per_server
+            .retain(|_, (start, _)| now.saturating_duration_since(*start) < min);
+    }
+
+    /// 频道被移除时清掉它的全部状态（评审 F2 的后半）：否则该频道的键会残留到 GC 之下限期间，
+    /// 且（若 uuid 被复用）可能把新频道的首次更新误判为"窗口内"。
+    fn forget_channel(&mut self, channel: Uuid) {
+        self.last_sent.retain(|(ch, _, _), _| *ch != channel);
+        self.per_server.retain(|(ch, _), _| *ch != channel);
+        self.dropped_detail.retain(|(ch, _, _), _| *ch != channel);
+    }
+
+    /// 判定一条事件（**不记账**；记账见 [`Self::mark_delivered`]），返回决定与要写的日志行（0..=2）。
+    fn on_event(
+        &mut self,
+        channel: Uuid,
+        server: &str,
+        uri: &str,
+        now: Instant,
+    ) -> (ResourceDecision, Vec<String>) {
+        let mut lines = Vec::new();
+        self.gc(now);
+        if let Some(line) = self.flush_summary(now) {
+            lines.push(line);
+        }
+        let key = (channel, server.to_string(), uri.to_string());
+        let by_key = resource_event_allowed(
+            self.last_sent.get(&key).copied(),
+            now,
+            RESOURCE_EVENT_MIN_INTERVAL,
+        );
+        let srv = (channel, server.to_string());
+        let (win_start, count) = self.per_server.get(&srv).copied().unwrap_or((now, 0));
+        let in_same_window = now.saturating_duration_since(win_start) < RESOURCE_EVENT_MIN_INTERVAL;
+        let by_server = !in_same_window || count < RESOURCE_EVENT_MAX_PER_SERVER;
+        if by_key && by_server {
+            return (ResourceDecision::Allow, lines);
+        }
+        let decision = if !by_key {
+            ResourceDecision::DropByKey
+        } else {
+            ResourceDecision::DropByServer
+        };
+        self.dropped_since_summary += 1;
+        *self.dropped_detail.entry(key).or_insert(0) += 1;
+        if let Some(line) = self.drop_log_line(channel, server, uri, decision, count) {
+            lines.push(line);
+        }
+        (decision, lines)
+    }
+
+    /// "资源更新找不到对应频道"（会话/频道已失效）——**同样不得静默**（评审 F1 的同一条规则：
+    /// 本函数原本也走 `tracing::warn!`，在生产里等于没有）。受同一日志预算约束，防话痨 server 刷屏。
+    fn on_orphan(&mut self, now: Instant, server: &str, uri: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        self.gc(now);
+        if let Some(line) = self.flush_summary(now) {
+            lines.push(line);
+        }
+        self.dropped_since_summary += 1;
+        self.orphans_since_summary += 1;
+        if self.log_lines_used >= RESOURCE_THROTTLE_LOG_BUDGET {
+            self.logs_suppressed += 1;
+            return lines;
+        }
+        self.log_lines_used += 1;
+        lines.push(format!(
+            "[resource] 丢弃资源更新：找不到对应频道（会话已失效）server={server} uri={uri}"
+        ));
+        lines
+    }
+
+    /// 一条事件**真的进了回合队列**后调用：这才是窗口的起点（F3）。
+    fn mark_delivered(&mut self, channel: Uuid, server: &str, uri: &str, now: Instant) {
+        self.allowed_since_summary += 1;
+        self.last_sent
+            .insert((channel, server.to_string(), uri.to_string()), now);
+        let srv = (channel, server.to_string());
+        let (win_start, count) = self.per_server.get(&srv).copied().unwrap_or((now, 0));
+        let in_same_window = now.saturating_duration_since(win_start) < RESOURCE_EVENT_MIN_INTERVAL;
+        self.per_server.insert(
+            srv,
+            if in_same_window {
+                (win_start, count + 1)
+            } else {
+                (now, 1)
+            },
+        );
+    }
+
+    /// 即时丢弃行（受每窗口预算约束；超预算只计数，由汇总行报告）。
+    fn drop_log_line(
+        &mut self,
+        channel: Uuid,
+        server: &str,
+        uri: &str,
+        decision: ResourceDecision,
+        allowed_in_window: u32,
+    ) -> Option<String> {
+        if self.log_lines_used >= RESOURCE_THROTTLE_LOG_BUDGET {
+            self.logs_suppressed += 1;
+            return None;
+        }
+        self.log_lines_used += 1;
+        let line = format!(
+            "[resource] 节流丢弃（{}s 窗口）：channel={} server={} uri={} 原因={}（同 server 本窗口已放行 {} 条，上限 {}）",
+            RESOURCE_EVENT_MIN_INTERVAL.as_secs(),
+            channel,
+            server,
+            uri,
+            match decision {
+                ResourceDecision::DropByKey => "同 (channel,server,uri) 窗口内已投递",
+                ResourceDecision::DropByServer => "同 (channel,server) 窗口内放行数达上限",
+                ResourceDecision::Allow => "（不应出现）",
+            },
+            allowed_in_window,
+            RESOURCE_EVENT_MAX_PER_SERVER
+        );
+        Some(line)
+    }
+
+    /// 每窗口至多一条汇总（**与负载无关的日志上界**）；有丢弃时必出，故不静默。
+    fn flush_summary(&mut self, now: Instant) -> Option<String> {
+        if now.saturating_duration_since(self.last_summary) < RESOURCE_EVENT_MIN_INTERVAL {
+            return None;
+        }
+        self.last_summary = now;
+        let allowed = std::mem::take(&mut self.allowed_since_summary);
+        let dropped = std::mem::take(&mut self.dropped_since_summary);
+        let suppressed = std::mem::take(&mut self.logs_suppressed);
+        let orphans = std::mem::take(&mut self.orphans_since_summary);
+        self.log_lines_used = 0;
+        let detail: Vec<_> = self.dropped_detail.drain().collect();
+        if allowed == 0 && dropped == 0 && suppressed == 0 && orphans == 0 {
+            return None;
+        }
+        // 按丢弃条数降序（Reverse 让 sort_by_key 得到降序）
+        let mut top: Vec<((Uuid, String, String), u32)> = detail;
+        top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+
+        let top: Vec<String> = top
+            .iter()
+            .take(3)
+            .map(|((_, server, uri), n)| format!("{server}/{uri}×{n}"))
+            .collect();
+        let line = format!(
+            "[resource] 资源事件窗口汇总（{}s）：放行 {} 条回合，丢弃 {} 条{}；丢弃最多的键（前 3）：{}",
+            RESOURCE_EVENT_MIN_INTERVAL.as_secs(),
+            allowed,
+            dropped,
+            if suppressed > 0 {
+                format!("（另有 {suppressed} 条丢弃因日志预算未逐条打印）")
+            } else {
+                String::new()
+            },
+            if top.is_empty() {
+                "（无）".to_string()
+            } else {
+                top.join("、")
+            }
+        );
+        Some(if orphans > 0 {
+            format!("{line}；另有 {orphans} 条更新因找不到频道被丢弃")
+        } else {
+            line
+        })
     }
 }
 
@@ -866,36 +1130,36 @@ fn handle_resource_update(
     update: ResourceUpdate,
 ) {
     let Some(channel_id) = l.registry.channel_for(agent_index, &update.session_id) else {
-        tracing::warn!(
-            "资源更新找不到对应频道（可能会话已失效）：agent={agent_index} session={} server={} uri={}",
-            update.session_id,
-            update.server,
-            update.uri
-        );
+        // 不得退回 tracing（生产静默，评审 F1）；本路径与丢弃共用日志预算，防刷屏。
+        for line in &l
+            .resource_throttle
+            .on_orphan(Instant::now(), &update.server, &update.uri)
+        {
+            crate::log!("{line}");
+        }
         return;
     };
-    // 节流：同一 `(channel, server, uri)` 在窗口内只放行一次（内容变了也算同一资源，避免自激循环）。
+    // 节流：同一 `(channel, server, uri)` 在窗口内只放行一次（内容变了也算同一资源，避免自激循环），
+    // 且同一 `(channel, server)` 每窗口至多 `RESOURCE_EVENT_MAX_PER_SERVER` 条（防 uri 轮换绕过）。
     let now = Instant::now();
-    let key = (channel_id, update.server.clone(), update.uri.clone());
-    let last = l.resource_last_sent.get(&key).copied();
-    if !resource_event_allowed(last, now, l.resource_min_interval) {
-        tracing::warn!(
-            "资源更新被节流丢弃（{}s 窗口内已投递过）：channel={channel_id} server={} uri={}",
-            l.resource_min_interval.as_secs_f32(),
-            update.server,
-            update.uri
-        );
+    let (decision, lines) =
+        l.resource_throttle
+            .on_event(channel_id, &update.server, &update.uri, now);
+    // 丢弃与汇总日志一律走 `crate::log!`（stdout）——**不要退回 tracing**：根二进制没有
+    // tracing subscriber（见本文件 985/1390 的同因注释），那条路在线上是静默的（评审 F1）。
+    for line in &lines {
+        crate::log!("{line}");
+    }
+    if decision != ResourceDecision::Allow {
         return;
     }
-    l.resource_last_sent.insert(key, now);
     let msg = resource_update_message(&update);
-    tracing::info!(
-        "资源更新入队：channel={channel_id} server={} uri={}（{} 字节）",
-        update.server,
-        update.uri,
-        update.text.len()
-    );
-    handle_cmd(l, handle, Cmd::Message { channel_id, msg });
+    // 记账只认"真的进了回合队列"（评审 F3）：队列策略拒绝时不占用本窗口，
+    // 否则一条没投出去的更新会把随后一条真实更新误杀 10s。
+    if handle_cmd(l, handle, Cmd::Message { channel_id, msg }) {
+        l.resource_throttle
+            .mark_delivered(channel_id, &update.server, &update.uri, now);
+    }
 }
 
 /// 资源更新 → `InboundMsg`（纯函数，便于单测钉形状）。
@@ -2187,6 +2451,273 @@ mod resource_event_tests {
             "资源更新必须回到原会话并出现在 prompt 里；实际记录：\n{log}"
         );
         let _ = std::fs::remove_file(&rec);
+    }
+
+    /// **接线守卫**（评审 F1 的阻塞项）：资源事件路径的丢弃/汇总/孤儿日志必须走 `crate::log!`（stdout），
+    /// **不得**走 `tracing::*`——根二进制没有安装 tracing subscriber（见本文件两处同因注释），
+    /// 那条路在线上是完全静默的，正是本轮评审判「AC1 不得静默」不成立的原因。
+    ///
+    /// 为什么用源码断言：**单测抓不到接线本身**。实测（M6）把 `crate::log!(...)` 换回
+    /// `tracing::info!(...)`，12 条资源事件用例**照样全绿**（它们只测行生成，不测谁来写）。
+    /// 在没有日志注入点的前提下，把"接线方式"作为契约钉住是唯一能防悄悄回归的手段。
+    #[test]
+    fn resource_event_logs_wire_to_stdout_not_tracing() {
+        let src = include_str!("harness.rs");
+        let start = src
+            .find("fn handle_resource_update")
+            .expect("handle_resource_update 必须存在");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("函数体以顶格 } 结束");
+        let body = &rest[..end];
+        assert!(
+            body.contains("crate::log!("),
+            "资源事件路径必须用 crate::log! 写 stdout（生产可见），不得换成 tracing"
+        );
+        assert!(
+            !body.contains("tracing::"),
+            "资源事件路径不得使用 tracing::*：根二进制没有 subscriber，日志会静默丢掉（评审 F1）"
+        );
+    }
+
+    /// "找不到频道"的孤儿更新也不得静默（评审 F1 的同一条规则的另一处）：受同一日志预算约束。
+    #[test]
+    fn resource_throttle_logs_orphan_updates_within_budget() {
+        let now = Instant::now();
+        let mut t = ResourceThrottle::new(now);
+        let lines = t.on_orphan(now, "notes", "a.md");
+        assert_eq!(lines.len(), 1, "孤儿更新必须留一行: {lines:?}");
+        assert!(lines[0].contains("找不到对应频道"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("notes") && lines[0].contains("a.md"),
+            "{}",
+            lines[0]
+        );
+        // 预算用尽后只计数（由汇总行报告）
+        let mut eager = 1;
+        for i in 0..RESOURCE_THROTTLE_LOG_BUDGET * 2 {
+            eager += t.on_orphan(now, &format!("s{i}"), "a.md").len();
+        }
+        assert_eq!(
+            eager, RESOURCE_THROTTLE_LOG_BUDGET as usize,
+            "即时行不得超预算"
+        );
+        let later = now + RESOURCE_EVENT_MIN_INTERVAL;
+        let lines = t.on_orphan(later, "notes", "b.md");
+        let summary = lines
+            .iter()
+            .find(|l| l.contains("窗口汇总"))
+            .expect("应有汇总");
+        assert!(
+            summary.contains("找不到频道"),
+            "汇总应报告孤儿条数: {summary}"
+        );
+    }
+
+    /// **阈值被钉住**（评审 F5，引 `RULE_阈值变更.md` 第 3 条「无验证的阈值等于摆设」）：
+    /// 原实现里没有任何断言守住 10s——变异成 60s 后阳性对照用例照样绿（因为它是从常量自缩放的）。
+    /// 这条直接断言当前值：改阈值必须让本用例红，从而在 review 里显式可见（并按规则单独提交）。
+    #[test]
+    fn resource_event_min_interval_is_pinned() {
+        assert_eq!(
+            RESOURCE_EVENT_MIN_INTERVAL,
+            Duration::from_secs(10),
+            "阈值为 10s（card abb-mcp-resource-throttle-20261011 的依据写在常量注释里）；             要改它必须按 RULE_阈值变更.md 单独提交并附证据，并同步改这条断言"
+        );
+        assert_eq!(
+            RESOURCE_EVENT_MAX_PER_SERVER, 3,
+            "单 server 每窗口上限（防 uri 轮换绕过，评审 F2 的整改）；变更同上"
+        );
+        assert_eq!(
+            RESOURCE_THROTTLE_LOG_BUDGET, 20,
+            "节流日志每窗口即时行预算（防刷爆 bridge.out）；变更同上"
+        );
+    }
+
+    /// 判定键含 uri 与 channel（评审 F6：原实现里把 uri 从键里去掉，6 条用例**全绿** ⇒ 键没被钉住）。
+    #[test]
+    fn resource_throttle_key_includes_uri_and_channel() {
+        let now = Instant::now();
+        let ch1 = Uuid::new_v4();
+        let ch2 = Uuid::new_v4();
+        let mut t = ResourceThrottle::new(now);
+        // 同一 (channel, server) 下不同 uri：各自放行（互不影响）
+        for uri in ["a.md", "b.md", "c.md"] {
+            let (d, _) = t.on_event(ch1, "notes", uri, now);
+            assert_eq!(d, ResourceDecision::Allow, "{uri} 首次应放行");
+            t.mark_delivered(ch1, "notes", uri, now);
+        }
+        // 同一 uri 在窗口内的第二次：丢
+        assert_eq!(
+            t.on_event(ch1, "notes", "a.md", now).0,
+            ResourceDecision::DropByKey
+        );
+        // 不同 channel 的同一 (server,uri)：不受 ch1 的窗口影响
+        assert_eq!(
+            t.on_event(ch2, "notes", "a.md", now).0,
+            ResourceDecision::Allow,
+            "channel 不同 ⇒ 互不影响（键含 channel）"
+        );
+    }
+
+    /// 单 server 每窗口上限：**uri 每次都变也绕不过**（评审 F2 的核心攻击面）。
+    /// 判别力：去掉 `by_server` 判定 ⇒ 第 4 条变成 Allow，本用例红。
+    #[test]
+    fn resource_event_per_server_cap_blocks_uri_rotation() {
+        let now = Instant::now();
+        let ch = Uuid::new_v4();
+        let mut t = ResourceThrottle::new(now);
+        for i in 0..RESOURCE_EVENT_MAX_PER_SERVER {
+            let uri = format!("rotating-{i}.md");
+            assert_eq!(
+                t.on_event(ch, "chatty", &uri, now).0,
+                ResourceDecision::Allow,
+                "第 {i} 条（不同 uri）应放行"
+            );
+            t.mark_delivered(ch, "chatty", &uri, now);
+        }
+        assert_eq!(
+            t.on_event(ch, "chatty", "rotating-99.md", now).0,
+            ResourceDecision::DropByServer,
+            "同一 server 第 {RESOURCE_EVENT_MAX_PER_SERVER}+1 个 uri 必须按 server 上限丢弃（防轮换绕过）"
+        );
+        // 另一个 server 不受影响
+        assert_eq!(
+            t.on_event(ch, "other", "x.md", now).0,
+            ResourceDecision::Allow
+        );
+        // 窗口过去后恢复
+        let later = now + RESOURCE_EVENT_MIN_INTERVAL;
+        assert_eq!(
+            t.on_event(ch, "chatty", "rotating-100.md", later).0,
+            ResourceDecision::Allow,
+            "新窗口应放行"
+        );
+    }
+
+    /// 丢弃**必须可观测**（评审 F1 阻塞项）：即时行带上 key/原因/窗口值；窗口过后出汇总；
+    /// 即时行受预算约束（超出只计数并在汇总里报告）⇒ 日志量与负载无关。
+    /// 判别力：把即时行改回 `tracing::*`/删掉 ⇒ 本条红（`crate::log!` 才是生产可见路径）。
+    #[test]
+    fn resource_throttle_logs_first_drop_and_window_summary() {
+        let now = Instant::now();
+        let ch = Uuid::new_v4();
+        let mut t = ResourceThrottle::new(now);
+        // 建立窗口：第一条放行并记账，随后同键丢弃 ⇒ 必须给一行可读日志
+        assert_eq!(
+            t.on_event(ch, "notes", "a.md", now).0,
+            ResourceDecision::Allow
+        );
+        t.mark_delivered(ch, "notes", "a.md", now);
+        let (d, lines) = t.on_event(ch, "notes", "a.md", now);
+        assert_eq!(d, ResourceDecision::DropByKey);
+        assert_eq!(
+            lines.len(),
+            1,
+            "首次丢弃必须输出一行（不得静默）: {lines:?}"
+        );
+        let line = &lines[0];
+        for needle in ["节流丢弃", "notes", "a.md", "10s"] {
+            assert!(line.contains(needle), "丢弃行缺 {needle}: {line}");
+        }
+        // 预算：制造大量"不同 key（不同 server）"的丢弃，即时行不得超预算
+        let mut eager = 1usize; // 上面已用掉 1 行
+        for i in 0..RESOURCE_THROTTLE_LOG_BUDGET * 2 {
+            let server = format!("s{i}");
+            assert_eq!(
+                t.on_event(ch, &server, "a.md", now).0,
+                ResourceDecision::Allow
+            );
+            t.mark_delivered(ch, &server, "a.md", now);
+            let (_, l2) = t.on_event(ch, &server, "a.md", now);
+            eager += l2.len();
+        }
+        assert_eq!(
+            eager, RESOURCE_THROTTLE_LOG_BUDGET as usize,
+            "即时行必须恰好用满预算后停止（不随负载增长）"
+        );
+        // 窗口过后：一条汇总，含放行/丢弃总数与"被预算压掉"的计数
+        let later = now + RESOURCE_EVENT_MIN_INTERVAL;
+        let (_, lines) = t.on_event(ch, "fresh", "z.md", later);
+        assert_eq!(lines.len(), 1, "窗口过后应有且仅有一条汇总: {lines:?}");
+        let summary = &lines[0];
+        for needle in ["窗口汇总", "放行", "丢弃", "因日志预算未逐条打印"] {
+            assert!(summary.contains(needle), "汇总行缺 {needle}: {summary}");
+        }
+        // 无事件的下一个窗口：不再刷空汇总
+        let (_, lines) = t.on_event(ch, "fresh", "z.md", later + RESOURCE_EVENT_MIN_INTERVAL);
+        assert!(
+            lines.is_empty(),
+            "窗口内没有丢弃/放行时不该刷空汇总: {lines:?}"
+        );
+    }
+
+    /// 状态**有界**（评审 F2）：过期条目被 GC 掉（语义等价 ⇒ 判定不变），频道移除时整频道清空。
+    #[test]
+    fn resource_throttle_state_is_bounded_and_forgets_channel() {
+        let now = Instant::now();
+        let ch = Uuid::new_v4();
+        let mut t = ResourceThrottle::new(now);
+        for i in 0..50 {
+            let uri = format!("u{i}.md");
+            // 每个 uri 单独一个 server，避免撞上 per-server 上限
+            let server = format!("s{i}");
+            assert_eq!(
+                t.on_event(ch, &server, &uri, now).0,
+                ResourceDecision::Allow
+            );
+            t.mark_delivered(ch, &server, &uri, now);
+        }
+        assert_eq!(t.last_sent.len(), 50);
+        assert_eq!(t.per_server.len(), 50);
+        // GC：窗口过后全部清掉（"过期 == 不存在"，故判定语义不变）
+        t.gc(now + RESOURCE_EVENT_MIN_INTERVAL);
+        assert!(
+            t.last_sent.is_empty(),
+            "过期条目必须被清掉（否则长驻服务无界增长）"
+        );
+        assert!(t.per_server.is_empty());
+        assert_eq!(
+            t.on_event(ch, "s0", "u0.md", now + RESOURCE_EVENT_MIN_INTERVAL)
+                .0,
+            ResourceDecision::Allow,
+            "GC 后同一键应重新放行（窗口本就过期）"
+        );
+        t.mark_delivered(ch, "s0", "u0.md", now + RESOURCE_EVENT_MIN_INTERVAL);
+        // 频道移除：该频道状态清空，别的频道不受影响
+        let other = Uuid::new_v4();
+        t.mark_delivered(other, "s0", "u0.md", now + RESOURCE_EVENT_MIN_INTERVAL);
+        t.forget_channel(ch);
+        assert!(
+            t.last_sent.iter().all(|((c, _, _), _)| *c != ch),
+            "频道移除后不得残留该频道状态"
+        );
+        assert!(
+            t.last_sent.iter().any(|((c, _, _), _)| *c == other),
+            "别的频道状态不得被误清"
+        );
+    }
+
+    /// 记账只在**真入队之后**（评审 F3）：`on_event` 单独调用不占用窗口。
+    /// 判别力：把 `mark_delivered` 里的记账搬回 `on_event` ⇒ 第一条断言红。
+    #[test]
+    fn resource_throttle_arms_window_only_after_delivered() {
+        let now = Instant::now();
+        let ch = Uuid::new_v4();
+        let mut t = ResourceThrottle::new(now);
+        for _ in 0..5 {
+            assert_eq!(
+                t.on_event(ch, "notes", "a.md", now).0,
+                ResourceDecision::Allow,
+                "未 mark_delivered（= 队列策略拒收）时不得占用窗口"
+            );
+        }
+        assert!(t.last_sent.is_empty(), "未入队不得写 last_sent");
+        t.mark_delivered(ch, "notes", "a.md", now);
+        assert_eq!(
+            t.on_event(ch, "notes", "a.md", now).0,
+            ResourceDecision::DropByKey,
+            "入队后才开始占用窗口"
+        );
     }
 
     /// 节流判定（纯函数）：首次放行；窗口内丢弃；窗口边界起放行。
