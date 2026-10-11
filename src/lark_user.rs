@@ -376,20 +376,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 超时后**必须真把子进程杀掉**：否则 lark-cli 会继续跑并可能真把消息发出去——
+    /// "报错说没发成功、实际发出去了"是本仓点名的最难排查的一类不一致（见本文件生产代码注释）。
+    ///
+    /// 判据：脚本 `sleep 1; echo yes > <marker>`、超时 100ms、**返回后等 2s（长于脚本自身 1s）**
+    /// ⇒ marker 不得出现。判别力：把 `.kill_on_drop(true)` 改 `false` ⇒ 子进程活过 1s 写下 marker ⇒ 本用例红。
+    ///
+    /// **前提（评审 N1 第 2 轮的实测，必须写明）**：观测窗**必须长于脚本自身时长**。
+    /// 本用例第一版（脚本 sleep 5、超时后只等 300ms）踩了这个坑 ⇒ 断言恒真；我当时据此得出并写进
+    /// 注释的"标记法区分不出 kill 是否生效"是**错误论断**（已在本次更正）——评审判定该面**可测**。
+    /// 一并记下真因（供后来者别再踩）：我的"变异后仍绿"是在**陈旧的测试二进制**上得到的——
+    /// 本仓在外置 ExFAT 卷上，mtime 粒度约 2s，cargo 会漏编；改完代码需 `sleep 2 && touch <file>`
+    /// 或确认构建输出真的出现 `Compiling`。强制新鲜构建后：`kill_on_drop(false)` ⇒ 本用例红（5/5），
+    /// `kill_on_drop(true)` ⇒ 绿（3/3）。
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
+    async fn killed_cli_does_not_write_its_marker() {
+        let _g = env_guard();
+        let dir = std::env::temp_dir().join(format!("abb-lark-kill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("sent.txt");
+        let cli = write_fake_cli(
+            &dir,
+            &format!("#!/bin/sh\nsleep 1\necho yes > {}\n", marker.display()),
+        );
+        std::env::set_var(LARK_CLI_ENV, cli.to_str().unwrap());
+        let r = send_text_as_user_with_timeout("oc_t", "x", Duration::from_millis(100)).await;
+        std::env::remove_var(LARK_CLI_ENV);
+        assert!(format!("{:#}", r.unwrap_err()).contains("超时"));
+        // 观测窗 2s > 脚本自身 1s：这是判据成立的前提，别改短（改了就是恒真断言）。
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !marker.exists(),
+            "超时后子进程必须被 kill：脚本写完的标记文件不该出现（否则消息可能已真发出）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 卡死的 CLI **不得挂住投递**：超时后必须立刻返回超时错误，而不是等子进程自己跑完
     /// （投递消费循环是串行的，卡住会堵住整条队列）。
     ///
     /// 评审 N1 指出上一版**不可证伪**：脚本 `sleep 5` 而超时后只等 300ms 就断言"标记文件不存在"
-    /// ——那一刻它无论如何都不存在（恒真）；且实测把 `.kill_on_drop(true)` 改成 `false`，旧用例
-    /// 照样绿。进一步实测（本次探针，`probe` 一次性代码，未入库）：**本 builder（`stdin(null)` +
-    /// piped stdout/stderr）下，无论 `kill_on_drop` 真假，子进程都会在句柄 drop 后终止**（脚本写
-    /// 标记的变体一律不出现）⇒ 用"标记文件"根本区分不出 kill 是否生效。
-    /// 因此这里改为断言**可证伪**的属性：脚本 `sleep 3`、超时 200ms，断言①返回的是超时错误、
-    /// ②整段耗时 < 2s（远小于脚本自身的 3s）。
-    /// 判别力：把 `tokio::time::timeout(…)` 去掉（直接等子进程）⇒ 3s 后才返回且不再报超时 ⇒ 两条断言都红。
-    ///
-    /// 未在此断言（如实登记）：`kill_on_drop` 是否真的杀到进程。它由评审的独立探针与
-    /// “句柄 drop ⇒ 子进程终止”的实测共同支持；本用例只能证明"我们不会等它跑完"。
+    /// ——那一刻它无论如何都不存在（恒真）。
+    /// 本用例只钉"**不挂住投递**"这一半：脚本 `sleep 3`、超时 200ms ⇒ 断言①错误为超时
+    /// ②整段耗时 < 2s（远小于脚本自身 3s）。判别力：去掉 `tokio::time::timeout(…)` 包装
+    /// ⇒ 3s 后才返回且不再报超时 ⇒ 两条断言都红。
+    /// "**真把子进程杀掉**"那一半由 `killed_cli_does_not_write_its_marker` 钉住（需要长于脚本
+    /// 自身时长的观测窗，故与这里的短窗脚本分开写）。
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
