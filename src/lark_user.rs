@@ -376,28 +376,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 卡死 ⇒ 超时报错（且 kill_on_drop 生效：脚本写的标记文件不该出现）。
+    /// 卡死的 CLI **不得挂住投递**：超时后必须立刻返回超时错误，而不是等子进程自己跑完
+    /// （投递消费循环是串行的，卡住会堵住整条队列）。
+    ///
+    /// 评审 N1 指出上一版**不可证伪**：脚本 `sleep 5` 而超时后只等 300ms 就断言"标记文件不存在"
+    /// ——那一刻它无论如何都不存在（恒真）；且实测把 `.kill_on_drop(true)` 改成 `false`，旧用例
+    /// 照样绿。进一步实测（本次探针，`probe` 一次性代码，未入库）：**本 builder（`stdin(null)` +
+    /// piped stdout/stderr）下，无论 `kill_on_drop` 真假，子进程都会在句柄 drop 后终止**（脚本写
+    /// 标记的变体一律不出现）⇒ 用"标记文件"根本区分不出 kill 是否生效。
+    /// 因此这里改为断言**可证伪**的属性：脚本 `sleep 3`、超时 200ms，断言①返回的是超时错误、
+    /// ②整段耗时 < 2s（远小于脚本自身的 3s）。
+    /// 判别力：把 `tokio::time::timeout(…)` 去掉（直接等子进程）⇒ 3s 后才返回且不再报超时 ⇒ 两条断言都红。
+    ///
+    /// 未在此断言（如实登记）：`kill_on_drop` 是否真的杀到进程。它由评审的独立探针与
+    /// “句柄 drop ⇒ 子进程终止”的实测共同支持；本用例只能证明"我们不会等它跑完"。
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
-    async fn hanging_cli_times_out_and_is_killed() {
+    async fn hanging_cli_times_out_instead_of_blocking_delivery() {
         let _g = env_guard(); // ABB_LARK_CLI 是本进程全局，串行化
         let dir = std::env::temp_dir().join(format!("abb-lark-hang-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let marker = dir.join("sent.txt");
-        let cli = write_fake_cli(
-            &dir,
-            &format!("#!/bin/sh\nsleep 5\necho done > {}\n", marker.display()),
-        );
+        // 脚本自己跑完需要 3s；断言只看"我们没等它"。（不写"已启动"标记再断言它存在：
+        // 那是个竞态——200ms 内 shell 未必已经执行到那里，且错误串含"超时"本身已证明子进程起过。）
+        let cli = write_fake_cli(&dir, "#!/bin/sh\nsleep 3\n");
         std::env::set_var(LARK_CLI_ENV, cli.to_str().unwrap());
+        let t0 = std::time::Instant::now();
         let r = send_text_as_user_with_timeout("oc_t", "x", Duration::from_millis(200)).await;
+        let elapsed = t0.elapsed();
         std::env::remove_var(LARK_CLI_ENV);
         let e = format!("{:#}", r.unwrap_err());
         assert!(e.contains("超时"), "应报超时: {e}");
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            !marker.exists(),
-            "超时后子进程必须被 kill（否则消息可能已真发出）"
+            elapsed < Duration::from_secs(2),
+            "超时必须立刻返回（实测 {elapsed:?}）；等子进程跑完就是挂住投递队列"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -739,15 +739,27 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
                     }
                     i += 2;
                 } else if a == "--as" {
-                    // `--as user` = 以**用户本人**身份发消息（`src/lark_user.rs`）：消息看起来是
-                    // 人发的，权限面比 bot 身份大得多（可代表本人对外发声）⇒ **受限（授权者）会话一律不许**，
-                    // 只有 owner 会话/人工终端能用。与 CLI 同构：CLI 只认空格分隔的 `--as user`，
-                    // `--as=user` 会被 CLI 当未知参数拒绝 ⇒ guard 不需要额外形态。
-                    if rest.get(i + 1).map(|s| s.as_str()) == Some("user") {
-                        return Decision::Deny(
-                            "deliver --as user（以用户本人身份发）仅限 owner 会话；受限会话请用缺省的 bot 身份"
-                                .into(),
-                        );
+                    // `--as user` = 以**用户本人**身份发消息（`src/lark_user.rs`）：消息看起来是人发的，
+                    // 权限面比 bot 身份大得多（可代表本人对外发声）⇒ 受限（授权者）会话一律不许。
+                    //
+                    // **判据必须 fail-closed**（评审 B1）：只要取到的值**不是字面量 `bot`** 就拒绝，
+                    // 而不是"等于 user 才拒绝"。原因是本函数吃的是**原始 command 文本**，
+                    // `split_shell` 只做 POSIX 引号去壳、不认 ANSI-C 引号 `$'...'`——
+                    // `--as $'user'` 去壳后是 `$user`（≠ user ⇒ 原来的"等于才拒"会放行），
+                    // 而真 shell 展开后 CLI 收到的正是 `user`。反向判据让 `$user`/`$ID`/`${…}`/缺值
+                    // 一律落拒绝侧，不依赖 tokenizer 把引号归一化（根治见评审 B1 附注：可在
+                    // `split_shell` 里补 `$'...'` 归一，属独立问题）。
+                    // `--as=user` 形态：guard 不认这个 token（不是 `--as`），但 CLI 也会把它当未知参数
+                    // 直接报错 ⇒ 到不了"以用户身份发出"那一步（fail-closed 由 CLI 保证）。
+                    let v = rest.get(i + 1).map(|s| s.as_str());
+                    if v != Some("bot") {
+                        return Decision::Deny(format!(
+                            "deliver {}：受限会话只允许 `--as bot`（= 缺省行为）。`--as user` 以用户本人身份发声，仅限 owner 会话/人工终端",
+                            match v {
+                                Some(v) => format!("--as {v}"),
+                                None => "--as（缺值）".to_string(),
+                            }
+                        ));
                     }
                     i += 2;
                 } else {
@@ -1611,6 +1623,24 @@ mod tests {
             decide(r#"$ABB_BIN deliver --as bot --bot feishu --chat oc_1 --text hi"#),
             Decision::Allow
         );
+        // fail-closed（评审 B1）：**只要不是字面量 `bot` 就必须拒**——含 ANSI-C 引号变形
+        // `$'user'`（guard 侧去壳后是 `$user`，但真 shell 展开成 user，会到 CLI 变成用户身份）。
+        // 判别力：把判据改回"等于 user 才拒" ⇒ `$'user'` 那条会变 Allow，本组断言红。
+        for bad in [
+            r#"$ABB_BIN deliver --as user --bot feishu --chat oc_1 --text hi"#,
+            r#"$ABB_BIN deliver --as $'user' --bot feishu --chat oc_1 --text hi"#,
+            r#"$ABB_BIN deliver --as "$ID" --bot feishu --chat oc_1 --text hi"#,
+            r#"$ABB_BIN deliver --as --bot feishu --chat oc_1 --text hi"#,
+            r#"$ABB_BIN deliver --as admin --bot feishu --chat oc_1 --text hi"#,
+        ] {
+            match decide(bad) {
+                Decision::Deny(why) => assert!(
+                    why.contains("只允许 `--as bot`"),
+                    "拒绝原因应说明只允许 --as bot: {why}"
+                ),
+                other => panic!("{bad} 必须拒绝（fail-closed），实际 {other:?}"),
+            }
+        }
         assert_ne!(decide(r#"$ABB_BIN session nuke"#), Decision::Allow);
         // git 只读：状态/差异放行；历史读（log/show/blame，可读已删文件旧版本）拒绝
         assert_eq!(decide("git status"), Decision::Allow);
