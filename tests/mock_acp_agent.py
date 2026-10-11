@@ -67,6 +67,17 @@ for line in sys.stdin:
         if _prompt_delay_ms > 0:
             time.sleep(_prompt_delay_ms / 1000.0)
         sid = params.get("sessionId")
+        # 可选：回合进行中由 agent **主动**发一条资源更新（模拟常驻 MCP 客户端读到
+        # notifications/resources/updated 后的上报）。用途：验证 ABB 在回合内读到它、
+        # 落成同一会话的一条入站消息（steer/下一回合），而不是丢掉。
+        if os.environ.get("MOCK_RESOURCE_UPDATE"):
+            record({"event": "resource_notify_sent", "sessionId": sid})
+            send({"jsonrpc": "2.0", "method": "_abb/unstable/resource/updated", "params": {
+                "sessionId": sid,
+                "server": os.environ.get("MOCK_RESOURCE_SERVER", "mockmcp"),
+                "uri": os.environ.get("MOCK_RESOURCE_URI", "mock://res"),
+                "text": os.environ["MOCK_RESOURCE_UPDATE"],
+            }})
         if os.environ.get("MOCK_HANG_PROMPT"):
             # P3.1 oneshot Timeout 路径：只记录不应答（session/cancel 照收，
             # 排水宽限由 ABB 侧兜底）。

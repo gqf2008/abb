@@ -587,6 +587,9 @@ struct Loop {
     /// 而结局可能是 Cancelled / CancelDrainTimeout / AgentExited / Error / Timeout
     /// 中的任意一种——所以不能只在 Cancelled 分支处理，必须在该轮真实结局处统一消费。
     cancel_requested: HashSet<Uuid>,
+    /// 会话登记表（session_id → channel_id）：由 `run_prompt_task` 在**建会话成功处**写入，
+    /// 供 agent 主动上报的事件反查归属频道（回合进行中 agent 不在池里，池查不到）。
+    registry: crate::runtime::pool::SessionRegistry,
     /// agent 主动上报的事件（MCP 资源更新）：接收端在本循环 select 里，发送端按槽位挂到
     /// 该槽位的 `AcpClient`（每次新拉起都重挂，见 `handle_spawn_outcome`）。
     resource_rx: mpsc::UnboundedReceiver<ResourceUpdate>,
@@ -616,6 +619,7 @@ impl Loop {
             idle_since: std::collections::HashMap::new(),
             last_activity: Instant::now(),
             cancel_requested: HashSet::new(),
+            registry: crate::runtime::pool::SessionRegistry::default(),
             resource_rx,
             resource_tx,
         };
@@ -821,7 +825,7 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
 /// 刻意走与用户消息**完全相同**的入队路径（`Cmd::Message`）：去重、排队、steer、空闲墙、
 /// 交付全部由既有机制统一管——不新开第二条回合通道（这正是"交付单点归 abb"的落地方式）。
 fn handle_resource_update(l: &mut Loop, handle: &Arc<RuntimeHandle>, update: ResourceUpdate) {
-    let Some(channel_id) = l.pool.channel_for_session(&update.session_id) else {
+    let Some(channel_id) = l.registry.channel_for(&update.session_id) else {
         tracing::warn!(
             "资源更新找不到对应频道（可能会话已失效）：session={} server={} uri={}",
             update.session_id,
@@ -1105,13 +1109,21 @@ fn dispatch_one(l: &mut Loop) -> bool {
 
     // 每轮次安装 steer 接收端（读循环在写时刻自选传输；pi-acp 无扩展 →
     // ExpectedRunIdMissing → 主循环 cancel+merge 回退）。
+    let registry = l.registry.clone();
     let (steer_tx, steer_rx) = mpsc::channel::<SteerRequest>(1);
     agent.acp.install_steer_rx(steer_rx);
     let (control_tx, control_rx) = oneshot::channel::<ControlSignal>();
 
     let abort_handle = l.pool.join_set.spawn(async move {
-        crate::runtime::pool::run_prompt_task(agent, batch, ctx_clone, result_tx, Some(control_rx))
-            .await;
+        crate::runtime::pool::run_prompt_task(
+            agent,
+            batch,
+            ctx_clone,
+            result_tx,
+            Some(control_rx),
+            registry.clone(),
+        )
+        .await;
     });
     l.pool.task_map_mut().insert(
         abort_handle.id(),
@@ -2008,6 +2020,105 @@ mod resource_event_tests {
             .id_hex,
             "uri 变了 → 新 id"
         );
+    }
+
+    /// **本卡核心端到端**：回合进行中 agent 主动上报资源更新 ⇒ ABB 在**同一次读**里读到它
+    /// （无需常驻读循环），落成**原会话**的一条入站消息并最终出现在该会话的 prompt 里。
+    ///
+    /// 判据不靠内部状态，靠假 agent 的记录文件：它收到的某次 prompt 文本里必须带上
+    /// `[MCP 资源更新]`（说明事件真的回到原会话并被交付）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn agent_reported_resource_update_lands_in_origin_session() {
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let rec = std::env::temp_dir().join(format!("mock-res-{}.jsonl", Uuid::new_v4()));
+        let stop = CancellationToken::new();
+        let handle = RuntimeHandle::new(
+            AgentConfig {
+                command: python3,
+                args: vec![script.display().to_string()],
+                extra_env: vec![
+                    ("PATH".to_string(), crate::deps::composed_path()),
+                    ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+                    (
+                        "MOCK_RESOURCE_UPDATE".to_string(),
+                        "资源正文-HELLO".to_string(),
+                    ),
+                    ("MOCK_RESOURCE_SERVER".to_string(), "mockmcp".to_string()),
+                    ("MOCK_RESOURCE_URI".to_string(), "mock://res".to_string()),
+                ],
+                backend: "mock".to_string(),
+                session_sandbox: None,
+            },
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            Vec::new(),
+        );
+        let run = tokio::spawn(run_loop(handle.clone()));
+        let cid = Uuid::new_v4();
+        handle.upsert_channel(
+            cid,
+            ChannelMeta {
+                bot_key: "res2".to_string(),
+                chat_id: "oc_res2".to_string(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: "event".to_string(),
+                anchor_mid: None,
+                adhoc: true,
+                workspace: None,
+            },
+        );
+        // 首轮只用来"驱动 agent 起来并让它发出通知"：事件在回合内到达会走 steer/排队语义，
+        // 首轮结局因此可能是 Ok，也可能是被 steer 打断的形态——**这里不断言它**（判据是下面那句
+        // "标记是否出现在该会话的某次 prompt 里"，那才是本卡要证的事；全量套件下时序会漂移，
+        // 断言首轮结局会让用例变成偶发红）。
+        let _ = handle
+            .wait_turn_outcome(
+                cid,
+                InboundMsg {
+                    id_hex: "u-1".to_string(),
+                    author_role: "user".to_string(),
+                    text: "先跑一轮".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        // 给事件回合一点时间落盘（它可能与首轮合并成 steer，也可能排到下一轮）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut landed = false;
+        while std::time::Instant::now() < deadline && !landed {
+            if let Ok(log) = std::fs::read_to_string(&rec) {
+                landed = log.lines().any(|line| {
+                    line.contains("[MCP 资源更新]")
+                        && line.contains("mockmcp")
+                        && line.contains("资源正文-HELLO")
+                });
+            }
+            if !landed {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        stop.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
+        let log = std::fs::read_to_string(&rec).unwrap_or_default();
+        assert!(
+            landed,
+            "资源更新必须回到原会话并出现在 prompt 里；实际记录：\n{log}"
+        );
+        let _ = std::fs::remove_file(&rec);
     }
 
     /// 事件消息必须能像用户消息一样驱动一个完整回合（走同一条入队路径 ⇒ 语义由构造保证一致）。

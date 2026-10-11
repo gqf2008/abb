@@ -202,6 +202,37 @@ impl OwnedAgent {
 /// Agents are either idle (sitting in `agents[i]`) or checked out
 /// (running inside a spawned task). The `task_map` tracks in-flight
 /// tasks for panic recovery.
+/// 会话登记表：`session_id → channel_id`。
+///
+/// 为什么不能只查 `OwnedAgent::state.sessions`：回合进行中 agent 被借出池子，
+/// 而此时恰是 agent 主动上报事件（MCP 资源更新等）最常见的时机。登记点与会话创建点同一处
+/// （`run_prompt_task` 建会话成功处），失效由 `forget` 清理。
+#[derive(Clone, Default)]
+pub struct SessionRegistry {
+    inner: Arc<std::sync::Mutex<HashMap<String, Uuid>>>,
+}
+
+impl SessionRegistry {
+    pub fn register(&self, session_id: &str, channel_id: Uuid) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(session_id.to_string(), channel_id);
+        }
+    }
+
+    /// 忘记这些会话（agent 退出/会话作废时调用，避免把事件投给死会话）。
+    pub fn forget(&self, session_ids: impl IntoIterator<Item = String>) {
+        if let Ok(mut map) = self.inner.lock() {
+            for sid in session_ids {
+                map.remove(&sid);
+            }
+        }
+    }
+
+    pub fn channel_for(&self, session_id: &str) -> Option<Uuid> {
+        self.inner.lock().ok()?.get(session_id).copied()
+    }
+}
+
 pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
@@ -552,17 +583,6 @@ impl AgentPool {
 
     /// Whether any idle agent already has a session for `channel_id`.
     /// Used to compute `affinity_hit` before calling `try_claim`.
-    /// 反查：某个 agent 会话 id 属于哪个频道。
-    ///
-    /// 用途：agent 主动上报的事件（如 MCP 资源更新）只带 `sessionId`，要落成"哪个会话的一条
-    /// 入站消息"就得反查。会话表很小（每 bot 几个频道），线性扫可接受。
-    pub fn channel_for_session(&self, session_id: &str) -> Option<Uuid> {
-        self.agents
-            .iter()
-            .flatten()
-            .find_map(|agent| channel_for_session_in(&agent.state.sessions, session_id))
-    }
-
     pub fn has_session_for(&self, channel_id: Uuid) -> bool {
         self.agents.iter().any(|slot| {
             slot.as_ref()
@@ -749,18 +769,6 @@ struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
     /// P0.B：频道工作目录（session/new cwd + <workspace> 段的真值来源）。
     workspace: Option<&'a str>,
-}
-
-/// 反查的纯函数部分（`(channel_id, session_id)` 表里找 session）：便于单测钉逻辑，
-/// 不必构造整个 `OwnedAgent`。
-fn channel_for_session_in(
-    sessions: &std::collections::HashMap<Uuid, String>,
-    session_id: &str,
-) -> Option<Uuid> {
-    sessions
-        .iter()
-        .find(|(_, sid)| sid.as_str() == session_id)
-        .map(|(channel_id, _)| *channel_id)
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1069,6 +1077,9 @@ pub async fn run_prompt_task(
     ctx: Arc<PromptContext>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
+    // registry：会话登记表（session_id → channel_id）。**会话建立的同一处**写入，
+    // 让"按 sessionId 反查频道"在**回合进行中**也能用（agent 此时不在池里）。
+    registry: SessionRegistry,
 ) {
     let source = PromptSource::Channel(batch.channel_id);
 
@@ -1118,6 +1129,7 @@ pub async fn run_prompt_task(
                         batch.channel_id
                     );
                     agent.state.sessions.insert(batch.channel_id, sid.clone());
+                    registry.register(&sid, batch.channel_id);
                     agent
                         .state
                         .deliveries
@@ -1125,6 +1137,7 @@ pub async fn run_prompt_task(
                     (sid, true)
                 }
                 Err(AcpError::AgentExited) => {
+                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1210,6 +1223,7 @@ pub async fn run_prompt_task(
                     }
                 }
                 Err(AcpError::AgentExited) => {
+                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1237,6 +1251,8 @@ pub async fn run_prompt_task(
                             agent.state.invalidate(&source);
                         }
                         Err(AcpError::AgentExited) => {
+                            registry
+                                .forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
                             agent.state.invalidate_all();
                             send_prompt_result(
                                 &result_tx,
@@ -1274,6 +1290,7 @@ pub async fn run_prompt_task(
                         ctx.max_turn_duration.as_secs(),
                         batch.channel_id
                     );
+                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1423,6 +1440,7 @@ pub async fn run_prompt_task(
                                     batch,
                                 );
                                 if failure.invalidate_all {
+                                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
                                     agent.state.invalidate_all();
                                 } else {
                                     agent.state.invalidate(&source);
@@ -1529,6 +1547,7 @@ pub async fn run_prompt_task(
         }
         Err(AcpError::AgentExited) => {
             tracing::error!(target: "pool::prompt", "agent {} exited during prompt", agent.index);
+            registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
             agent.state.invalidate_all();
             send_prompt_result(
                 &result_tx,
@@ -1569,6 +1588,7 @@ pub async fn run_prompt_task(
                         "agent {} exited during cancel_with_cleanup",
                         agent.index
                     );
+                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1603,6 +1623,7 @@ pub async fn run_prompt_task(
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
                 ctx.max_turn_duration.as_secs()
             );
+            registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
             agent.state.invalidate_all();
             send_prompt_result(
                 &result_tx,
@@ -1751,27 +1772,24 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
 mod resource_lookup_tests {
     use super::*;
 
-    /// session → channel 反查：命中唯一；不存在的 session 返回 None（不得猜一个频道）。
+    /// 会话登记表：登记后按 session 精确命中；`forget` 后不再命中（防把事件投给死会话）；
+    /// 未登记的 session 返回 None（不得猜一个频道）。
     #[test]
-    fn channel_for_session_finds_exact_match_only() {
+    fn session_registry_register_lookup_forget() {
+        let reg = SessionRegistry::default();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        let mut sessions = std::collections::HashMap::new();
-        sessions.insert(a, "abb-1".to_string());
-        sessions.insert(b, "abb-2".to_string());
+        reg.register("abb-1", a);
+        reg.register("abb-2", b);
 
-        assert_eq!(channel_for_session_in(&sessions, "abb-2"), Some(b));
-        assert_eq!(channel_for_session_in(&sessions, "abb-1"), Some(a));
-        assert_eq!(
-            channel_for_session_in(&sessions, "abb-12"),
-            None,
-            "不得前缀匹配"
-        );
-        assert_eq!(channel_for_session_in(&sessions, ""), None);
-        assert_eq!(
-            channel_for_session_in(&std::collections::HashMap::new(), "abb-1"),
-            None
-        );
+        assert_eq!(reg.channel_for("abb-2"), Some(b));
+        assert_eq!(reg.channel_for("abb-1"), Some(a));
+        assert_eq!(reg.channel_for("abb-12"), None, "不得前缀匹配");
+        assert_eq!(reg.channel_for(""), None);
+
+        reg.forget(vec!["abb-1".to_string()]);
+        assert_eq!(reg.channel_for("abb-1"), None, "forget 之后必须查不到");
+        assert_eq!(reg.channel_for("abb-2"), Some(b), "forget 只影响指定会话");
     }
 }
 
