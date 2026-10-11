@@ -63,6 +63,10 @@ entire runtime directory; empty means default); per-bot workspaces under
   GitHub Actions covers `ci.yml` at PR/mirror level (six jobs) and `release.yml` at tag/release time
   (`anti-spam.yml` / `release-on-acceptance.yml` cover their own narrow paths); the full
   build/sign/notarize path lives in `release.yml`.
+  `ci.toml` 的任务**假定 POSIX shell**：每条 `command` 都套了 `sh -c '...'`，目的是把
+  "Windows runner 经 `cmd /C` 执行 ⇒ 记 exit 0 且日志为空（**签假绿**）"变成"**响亮的红**"
+  （cmd 不认 POSIX 语义、也没有 `sh`）。因此**不要把 Windows 主机指到这些任务上**——Windows 的
+  门禁覆盖走 GitHub Actions `ci.yml` 的 windows job。背景与实测见卡 `abb-ci-coverage-win-20261007`。
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.
