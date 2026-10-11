@@ -310,7 +310,7 @@ impl Server {
             &parsed.mcp_servers,
             &parsed.cwd,
             images_deliverable,
-            Some(resource_tx),
+            resource_tx,
         )
         .await;
         let tools = mcp.tools();

@@ -592,9 +592,11 @@ struct Loop {
     registry: crate::runtime::pool::SessionRegistry,
     /// agent 主动上报的事件（MCP 资源更新）：接收端在本循环 select 里，发送端按槽位挂到
     /// 该槽位的 `AcpClient`（每次新拉起都重挂，见 `handle_spawn_outcome`）。
-    resource_rx: mpsc::UnboundedReceiver<ResourceUpdate>,
+    resource_rx: mpsc::UnboundedReceiver<(usize, ResourceUpdate)>,
     /// 同上：留给"给新拉起的 agent 挂 sink"用的发送端克隆。
-    resource_tx: mpsc::UnboundedSender<ResourceUpdate>,
+    /// 发送端带 **agent 槽位**：执行层会话号是进程内的，必须连同 agent 身份一起上报，
+    /// 否则多 agent 并发时归属会串（评审 F1）。
+    resource_tx: mpsc::UnboundedSender<(usize, ResourceUpdate)>,
 }
 
 impl Loop {
@@ -607,7 +609,7 @@ impl Loop {
         let (steer_ack_tx, steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
         // agent 主动上报的事件通道（MCP 资源更新）：接收端进本循环 select，发送端挂到各槽位的 AcpClient。
         let (resource_tx, resource_rx) =
-            mpsc::unbounded_channel::<crate::runtime::acp::ResourceUpdate>();
+            mpsc::unbounded_channel::<(usize, crate::runtime::acp::ResourceUpdate)>();
         let l = Self {
             ctx,
             pool,
@@ -661,7 +663,7 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
                 r = result_rx.recv() => r.map(|pr| Evt::Result(Box::new(pr))),
                 j = join_set.join_next(), if !join_set.is_empty() => j.map(Evt::Panic),                a = steer_ack_rx.recv() => a.map(Evt::SteerAck),
                 life = life_rx.recv() => life.map(Evt::Life),
-                r = l.resource_rx.recv() => r.map(Evt::Resource),
+                r = l.resource_rx.recv() => r.map(|(i, u)| Evt::Resource(i, u)),
             }
         };
         let Some(evt) = evt else {
@@ -674,7 +676,7 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
             Evt::Panic(join_error) => recover_panicked_agent(&mut l, &handle, join_error),
             Evt::SteerAck(ack) => handle_steer_ack(&mut l, ack),
             Evt::Life(outcome) => handle_spawn_outcome(&mut l, &handle, outcome),
-            Evt::Resource(update) => handle_resource_update(&mut l, &handle, update),
+            Evt::Resource(index, update) => handle_resource_update(&mut l, &handle, index, update),
             Evt::Reap => reap_idle_agents(&mut l),
         }
         dispatch_pending(&mut l);
@@ -694,7 +696,7 @@ enum Evt {
     Life(SpawnOutcome),
     /// 回收巡检节拍：把闲置的额外 agent 收掉（保留 0 号热实例）。
     Reap,
-    Resource(ResourceUpdate),
+    Resource(usize, ResourceUpdate),
 }
 
 // ── Cmd 处理 ─────────────────────────────────────────────────────────────────
@@ -824,10 +826,15 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
 ///
 /// 刻意走与用户消息**完全相同**的入队路径（`Cmd::Message`）：去重、排队、steer、空闲墙、
 /// 交付全部由既有机制统一管——不新开第二条回合通道（这正是"交付单点归 abb"的落地方式）。
-fn handle_resource_update(l: &mut Loop, handle: &Arc<RuntimeHandle>, update: ResourceUpdate) {
-    let Some(channel_id) = l.registry.channel_for(&update.session_id) else {
+fn handle_resource_update(
+    l: &mut Loop,
+    handle: &Arc<RuntimeHandle>,
+    agent_index: usize,
+    update: ResourceUpdate,
+) {
+    let Some(channel_id) = l.registry.channel_for(agent_index, &update.session_id) else {
         tracing::warn!(
-            "资源更新找不到对应频道（可能会话已失效）：session={} server={} uri={}",
+            "资源更新找不到对应频道（可能会话已失效）：agent={agent_index} session={} server={} uri={}",
             update.session_id,
             update.server,
             update.uri
@@ -891,7 +898,19 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &RuntimeHandle, outcome: SpawnOutc
             l.idle_since.insert(agent.index, Instant::now());
             let mut agent = agent;
             // 事件路径随槽位走：新拉起的 agent 必须重挂 sink（旧进程的 AcpClient 已 drop）。
-            agent.acp.set_resource_sink(l.resource_tx.clone());
+            // 这一层把 **agent 槽位** 贴到每条事件上（AcpClient 自己不知道槽位号），
+            // 归属键因此是 (槽位, session_id)——多 agent 并发时不会串（评审 F1）。
+            let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<ResourceUpdate>();
+            let tagged_tx = l.resource_tx.clone();
+            let slot = agent.index;
+            tokio::spawn(async move {
+                while let Some(update) = raw_rx.recv().await {
+                    if tagged_tx.send((slot, update)).is_err() {
+                        break;
+                    }
+                }
+            });
+            agent.acp.set_resource_sink(raw_tx);
             l.pool.return_agent(agent);
             // 起来了就清掉旧失败原因：否则用户会拿着上一次的旧原因排查现在的故障。
             handle.set_last_start_error(None);
@@ -2083,8 +2102,10 @@ mod resource_event_tests {
         // 首轮结局因此可能是 Ok，也可能是被 steer 打断的形态——**这里不断言它**（判据是下面那句
         // "标记是否出现在该会话的某次 prompt 里"，那才是本卡要证的事；全量套件下时序会漂移，
         // 断言首轮结局会让用例变成偶发红）。
-        let _ = handle
-            .wait_turn_outcome(
+        // 与真实聊天同形：**fire-and-forget** 推一条用户消息（不等同步结局）。
+        // 事件在回合内到达会走 steer/排队语义，首轮结局不是本用例的断言对象。
+        assert!(
+            handle.push_message(
                 cid,
                 InboundMsg {
                     id_hex: "u-1".to_string(),
@@ -2093,9 +2114,9 @@ mod resource_event_tests {
                     ts_secs: 0,
                     prompt_tag: "test".to_string(),
                 },
-                std::time::Duration::from_secs(60),
-            )
-            .await;
+            ),
+            "句柄应在跑（push_message 返回 true）"
+        );
         // 给事件回合一点时间落盘（它可能与首轮合并成 steer，也可能排到下一轮）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut landed = false;

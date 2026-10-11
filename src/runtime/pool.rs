@@ -209,27 +209,45 @@ impl OwnedAgent {
 /// （`run_prompt_task` 建会话成功处），失效由 `forget` 清理。
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
-    inner: Arc<std::sync::Mutex<HashMap<String, Uuid>>>,
+    inner: Arc<std::sync::Mutex<HashMap<(usize, String), Uuid>>>,
 }
 
 impl SessionRegistry {
-    pub fn register(&self, session_id: &str, channel_id: Uuid) {
+    /// 登记：键是 **`(agent 槽位, session_id)`**，不是单键 `session_id`。
+    ///
+    /// 为什么必须带 agent 身份：执行层的会话号是**进程内**计数器
+    /// （`crates/abb-agent/src/acp.rs` 的 `seq`，两个 `abb-agent` 进程的第一个会话都叫 `abb-1`），
+    /// 而 ABB 允许多 agent 并发 ⇒ 单键登记表会被后来者**静默覆盖**，事件就投到别人的聊天里
+    /// （2026-10-11 独立评审用两进程探针实测复现，见 card `abb-agent-mcp-resources-20261011` F1）。
+    pub fn register(&self, agent_index: usize, session_id: &str, channel_id: Uuid) {
         if let Ok(mut map) = self.inner.lock() {
-            map.insert(session_id.to_string(), channel_id);
+            map.insert((agent_index, session_id.to_string()), channel_id);
         }
     }
 
     /// 忘记这些会话（agent 退出/会话作废时调用，避免把事件投给死会话）。
-    pub fn forget(&self, session_ids: impl IntoIterator<Item = String>) {
+    pub fn forget(&self, agent_index: usize, session_ids: impl IntoIterator<Item = String>) {
         if let Ok(mut map) = self.inner.lock() {
             for sid in session_ids {
-                map.remove(&sid);
+                map.remove(&(agent_index, sid));
             }
         }
     }
 
-    pub fn channel_for(&self, session_id: &str) -> Option<Uuid> {
-        self.inner.lock().ok()?.get(session_id).copied()
+    /// 按频道遗忘（单频道会话失效 `invalidate(&source)` 时调用）：
+    /// 否则登记表会留下永不回收的陈旧条目（评审 F1 附带项）。
+    pub fn forget_channel(&self, agent_index: usize, channel_id: Uuid) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.retain(|(idx, _), cid| !(*idx == agent_index && *cid == channel_id));
+        }
+    }
+
+    pub fn channel_for(&self, agent_index: usize, session_id: &str) -> Option<Uuid> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(&(agent_index, session_id.to_string()))
+            .copied()
     }
 }
 
@@ -1129,7 +1147,7 @@ pub async fn run_prompt_task(
                         batch.channel_id
                     );
                     agent.state.sessions.insert(batch.channel_id, sid.clone());
-                    registry.register(&sid, batch.channel_id);
+                    registry.register(agent.index, &sid, batch.channel_id);
                     agent
                         .state
                         .deliveries
@@ -1137,7 +1155,10 @@ pub async fn run_prompt_task(
                     (sid, true)
                 }
                 Err(AcpError::AgentExited) => {
-                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+                    registry.forget(
+                        agent.index,
+                        agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+                    );
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1223,7 +1244,10 @@ pub async fn run_prompt_task(
                     }
                 }
                 Err(AcpError::AgentExited) => {
-                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+                    registry.forget(
+                        agent.index,
+                        agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+                    );
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1248,11 +1272,17 @@ pub async fn run_prompt_task(
                         .await
                     {
                         Ok(_) => {
+                            // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                            if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                                registry.forget_channel(agent.index, *cid);
+                            }
                             agent.state.invalidate(&source);
                         }
                         Err(AcpError::AgentExited) => {
-                            registry
-                                .forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+                            registry.forget(
+                                agent.index,
+                                agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+                            );
                             agent.state.invalidate_all();
                             send_prompt_result(
                                 &result_tx,
@@ -1269,6 +1299,10 @@ pub async fn run_prompt_task(
                                 target: "pool::session",
                                 "cancel_with_cleanup failed during initial_message timeout: {e}"
                             );
+                            // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                            if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                                registry.forget_channel(agent.index, *cid);
+                            }
                             agent.state.invalidate(&source);
                         }
                     }
@@ -1290,7 +1324,10 @@ pub async fn run_prompt_task(
                         ctx.max_turn_duration.as_secs(),
                         batch.channel_id
                     );
-                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+                    registry.forget(
+                        agent.index,
+                        agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+                    );
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1308,6 +1345,10 @@ pub async fn run_prompt_task(
                         "initial_message failed for channel {}: {e} — invalidating session",
                         batch.channel_id
                     );
+                    // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                    if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                        registry.forget_channel(agent.index, *cid);
+                    }
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
@@ -1416,6 +1457,10 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
+                                // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                                if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                                    registry.forget_channel(agent.index, *cid);
+                                }
                                 agent.state.invalidate(&source);
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
@@ -1440,9 +1485,13 @@ pub async fn run_prompt_task(
                                     batch,
                                 );
                                 if failure.invalidate_all {
-                                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+                                    registry.forget(agent.index, agent.state.sessions.values().cloned().collect::<Vec<_>>());
                                     agent.state.invalidate_all();
                                 } else {
+                                    // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                                    if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                                        registry.forget_channel(agent.index, *cid);
+                                    }
                                     agent.state.invalidate(&source);
                                 }
                                 send_prompt_result(
@@ -1532,6 +1581,10 @@ pub async fn run_prompt_task(
                     target: "pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
+                // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                    registry.forget_channel(agent.index, *cid);
+                }
                 agent.state.invalidate(&source);
             }
 
@@ -1547,7 +1600,10 @@ pub async fn run_prompt_task(
         }
         Err(AcpError::AgentExited) => {
             tracing::error!(target: "pool::prompt", "agent {} exited during prompt", agent.index);
-            registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+            registry.forget(
+                agent.index,
+                agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+            );
             agent.state.invalidate_all();
             send_prompt_result(
                 &result_tx,
@@ -1588,7 +1644,10 @@ pub async fn run_prompt_task(
                         "agent {} exited during cancel_with_cleanup",
                         agent.index
                     );
-                    registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+                    registry.forget(
+                        agent.index,
+                        agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+                    );
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -1604,6 +1663,10 @@ pub async fn run_prompt_task(
                         target: "pool::prompt",
                         "cancel_with_cleanup error: {e} — invalidating session"
                     );
+                    // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                    if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                        registry.forget_channel(agent.index, *cid);
+                    }
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
@@ -1623,7 +1686,10 @@ pub async fn run_prompt_task(
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
                 ctx.max_turn_duration.as_secs()
             );
-            registry.forget(agent.state.sessions.values().cloned().collect::<Vec<_>>());
+            registry.forget(
+                agent.index,
+                agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+            );
             agent.state.invalidate_all();
             send_prompt_result(
                 &result_tx,
@@ -1640,6 +1706,10 @@ pub async fn run_prompt_task(
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
             if !matches!(e, AcpError::AgentError { .. }) {
+                // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
+                if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
+                    registry.forget_channel(agent.index, *cid);
+                }
                 agent.state.invalidate(&source);
             }
             send_prompt_result(
@@ -1772,24 +1842,45 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
 mod resource_lookup_tests {
     use super::*;
 
-    /// 会话登记表：登记后按 session 精确命中；`forget` 后不再命中（防把事件投给死会话）；
-    /// 未登记的 session 返回 None（不得猜一个频道）。
+    /// 会话登记表：键是 **(agent 槽位, session_id)**。
+    ///
+    /// **本用例钉的就是评审 F1 那个真缺陷**：执行层会话号是**进程内**计数器
+    /// （两个 abb-agent 进程的第一个会话都叫 `abb-1`），单键登记表会被后来者覆盖 ⇒
+    /// 事件投到别人的聊天。带槽位后两个 agent 的同名会话各自命中自己的频道。
     #[test]
-    fn session_registry_register_lookup_forget() {
+    fn session_registry_is_keyed_by_agent_and_session() {
         let reg = SessionRegistry::default();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        reg.register("abb-1", a);
-        reg.register("abb-2", b);
+        // 两个 agent（槽位 0/1）各有自己的 `abb-1`
+        reg.register(0, "abb-1", a);
+        reg.register(1, "abb-1", b);
 
-        assert_eq!(reg.channel_for("abb-2"), Some(b));
-        assert_eq!(reg.channel_for("abb-1"), Some(a));
-        assert_eq!(reg.channel_for("abb-12"), None, "不得前缀匹配");
-        assert_eq!(reg.channel_for(""), None);
+        assert_eq!(
+            reg.channel_for(0, "abb-1"),
+            Some(a),
+            "槽位 0 必须命中自己的频道"
+        );
+        assert_eq!(
+            reg.channel_for(1, "abb-1"),
+            Some(b),
+            "槽位 1 必须命中自己的频道"
+        );
+        assert_eq!(reg.channel_for(2, "abb-1"), None, "未登记的槽位不得命中");
+        assert_eq!(reg.channel_for(0, "abb-12"), None, "不得前缀匹配");
 
-        reg.forget(vec!["abb-1".to_string()]);
-        assert_eq!(reg.channel_for("abb-1"), None, "forget 之后必须查不到");
-        assert_eq!(reg.channel_for("abb-2"), Some(b), "forget 只影响指定会话");
+        // 忘记：只影响指定槽位
+        reg.forget(0, vec!["abb-1".to_string()]);
+        assert_eq!(reg.channel_for(0, "abb-1"), None);
+        assert_eq!(reg.channel_for(1, "abb-1"), Some(b), "不得连带忘掉别的槽位");
+
+        // 单频道失效：按 (槽位, 频道) 收窄，不留陈旧条目
+        reg.forget_channel(1, b);
+        assert_eq!(
+            reg.channel_for(1, "abb-1"),
+            None,
+            "forget_channel 必须清掉该频道的登记"
+        );
     }
 }
 

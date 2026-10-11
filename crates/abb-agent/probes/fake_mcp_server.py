@@ -52,6 +52,7 @@ def main():
     image_data = None
     hang_init = False
     resource_text = "resource-body-from-fake-server"
+    resource_uri = RESOURCE_URI
     argv = sys.argv[1:]
     for i, item in enumerate(argv):
         if item == "--record" and i + 1 < len(argv):
@@ -64,6 +65,8 @@ def main():
             hang_init = True
         elif item == "--resource":
             resource_text = argv[i + 1] if i + 1 < len(argv) else resource_text
+        elif item == "--resource-uri":
+            resource_uri = argv[i + 1] if i + 1 < len(argv) else resource_uri
 
     dump_env(dump_path)
 
@@ -131,7 +134,7 @@ def main():
                 "result": {
                     "resources": [
                         {
-                            "uri": RESOURCE_URI,
+                            "uri": resource_uri,
                             "name": "fake-resource",
                             "mimeType": "text/plain",
                         }
@@ -146,7 +149,7 @@ def main():
                 "id": msg_id,
                 "result": {
                     "contents": [
-                        {"uri": params.get("uri") or RESOURCE_URI,
+                        {"uri": params.get("uri") or resource_uri,
                          "mimeType": "text/plain", "text": resource_text}
                     ]
                 },
@@ -173,7 +176,7 @@ def main():
             note = {
                 "jsonrpc": "2.0",
                 "method": "notifications/resources/updated",
-                "params": {"uri": RESOURCE_URI},
+                "params": {"uri": resource_uri},
             }
             sys.stdout.write(json.dumps(note, ensure_ascii=False) + "\n")
             sys.stdout.flush()

@@ -51,6 +51,12 @@ use tokio_util::sync::CancellationToken;
 /// 限定名分隔符。与被替代组件一致（它同样用 `__`，且拒绝 bare 名含 `__` 的工具）。
 const SEP: &str = "__";
 
+/// 单 server 的资源面预算：`resources/list` + `subscribe` 的**独立**上界。
+///
+/// 与 [`CONNECT_BUDGET_PER_SERVER`] 分开是评审 F5 的结论：资源面慢/挂住不该把该 server 的
+/// **工具**一起拖下水（那是本功能的主要价值面）。
+const RESOURCE_BUDGET_PER_SERVER: Duration = Duration::from_secs(3);
+
 /// 单 server 每个会话最多订阅的资源数（防某个 server 列上千条资源把会话拖死）。
 const MAX_SUBSCRIPTIONS_PER_SERVER: usize = 32;
 
@@ -245,15 +251,15 @@ impl McpSession {
     /// 两个上界同时生效：单 server [`CONNECT_BUDGET_PER_SERVER`]、全体
     /// [`CONNECT_BUDGET_TOTAL`]（取小者）。`cwd` 是会话工作区，透传给子进程。
     ///
-    /// `resource_sink`（可选）= 资源更新的上报通道：给了就为每个 server 起一条
-    /// 「订阅 → 收通知 → `resources/read` → 上报」的链路；没给就只列工具（呼叫方
-    /// 不需要事件时不必白付订阅成本）。**资源面全程 best-effort**：server 不支持
-    /// `resources/*` 是合法的（很多 server 只有 tools），失败只记日志。
+    /// `resource_sink` = 资源更新的上报通道：为每个 server 起一条
+    /// 「订阅 → 收通知 → `resources/read` → 上报」的链路。
+    /// **资源面全程 best-effort**：server 不支持 `resources/*` 是合法的（很多 server 只有 tools），
+    /// 失败只记日志，且**不占用工具面的装配预算**（见 `RESOURCE_BUDGET_PER_SERVER`）。
     pub async fn connect_all(
         specs: &[McpServerSpec],
         cwd: &str,
         images_deliverable: bool,
-        resource_sink: Option<tokio::sync::mpsc::UnboundedSender<ResourceEvent>>,
+        resource_sink: tokio::sync::mpsc::UnboundedSender<ResourceEvent>,
     ) -> McpSession {
         let mut servers = Vec::new();
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
@@ -279,24 +285,17 @@ impl McpSession {
             }
             // 每个 server 一条独立通知通道：订阅/通知互不串（多 server 归属清晰）。
             let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            match tokio::time::timeout(
-                budget,
-                connect_one(spec, cwd, &notif_tx, resource_sink.is_some()),
-            )
-            .await
-            {
+            match tokio::time::timeout(budget, connect_one(spec, cwd, &notif_tx)).await {
                 Ok(Ok((client, defs, subscribed))) => {
-                    if let Some(sink) = &resource_sink {
-                        for uri in &subscribed {
-                            subscriptions.push((spec.name.clone(), uri.clone()));
-                        }
-                        reader_tasks.push(spawn_resource_reader(
-                            spec.name.clone(),
-                            client.peer().clone(),
-                            notif_rx,
-                            sink.clone(),
-                        ));
+                    for uri in &subscribed {
+                        subscriptions.push((spec.name.clone(), uri.clone()));
                     }
+                    reader_tasks.push(spawn_resource_reader(
+                        spec.name.clone(),
+                        client.peer().clone(),
+                        notif_rx,
+                        resource_sink.clone(),
+                    ));
                     let client = Arc::new(client);
                     let mut accepted = Vec::new();
                     for def in defs {
@@ -391,7 +390,6 @@ async fn connect_one(
     spec: &McpServerSpec,
     cwd: &str,
     notif_tx: &tokio::sync::mpsc::UnboundedSender<String>,
-    want_resources: bool,
 ) -> Result<(Client, Vec<ToolDef>, Vec<String>), String> {
     let mut cmd = tokio::process::Command::new(&spec.command);
     cmd.args(&spec.args);
@@ -492,17 +490,34 @@ async fn connect_one(
             },
         });
     }
-    // 资源面：best-effort 订阅（server 不支持 `resources/*` 是合法的）。
-    let subscribed = if want_resources {
-        subscribe_all_resources(&client, &spec.name).await
-    } else {
-        Vec::new()
+    // 资源面：best-effort 订阅（server 不支持 `resources/*` 是合法的），**单独预算**——
+    // 与 initialize/tools/list 共用装配预算会让"慢而不报错"的 `resources/list` 把整个
+    // server（连同它的工具）一起判成装配超时丢掉（评审 F5）。
+    let subscribed = match tokio::time::timeout(
+        RESOURCE_BUDGET_PER_SERVER,
+        subscribe_all_resources(&client, &spec.name),
+    )
+    .await
+    {
+        Ok(subscribed) => subscribed,
+        Err(_) => {
+            tracing::warn!(
+                "server={} 资源订阅超预算（{}s）已放弃；该 server 的工具不受影响",
+                spec.name,
+                RESOURCE_BUDGET_PER_SERVER.as_secs()
+            );
+            Vec::new()
+        }
     };
 
     Ok((client, defs, subscribed))
 }
 
 /// 列出并订阅该 server 的全部资源（上限 [`MAX_SUBSCRIPTIONS_PER_SERVER`]）。
+///
+/// **不做 `resources/unsubscribe`**（评审 F2 要求留痕）：MCP 连接是**会话级**的——会话结束
+/// 即 drop `RunningService`/子进程，订阅随连接消失；没有"先退订再复用同一连接"的路径。
+/// 将来若引入跨会话复用的常驻 MCP 连接，必须同时补 unsubscribe（否则订阅会沿连接泄漏）。
 ///
 /// 任何一步失败都只记日志并返回已成功的部分：资源面是增值能力。`resources/list`
 /// 在同一 server 上分页（`list_all_resources` 内部翻页）。
