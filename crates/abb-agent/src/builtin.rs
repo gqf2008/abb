@@ -957,12 +957,13 @@ mod tests {
             .await
             .expect("工作区内相对路径应可读");
         assert!(inside.starts_with(&canon), "{inside:?}");
-        let absolute_inside = confine_read_path(
-            &workspace,
-            &format!("{}/inside.txt", canon.to_string_lossy()),
-        )
-        .await
-        .expect("工作区内绝对路径应可读");
+        // 绝对路径用 `Path::join` 造：Windows 上 `canonicalize` 返回 verbatim 前缀
+        // （`\\?\C:\…`），字符串拼 `/` 会得到 verbatim 路径不接受的形态
+        // （os error 123「文件名、目录名或卷标语法不正确」）——那是用例装置问题，不是读域闸。
+        let absolute_raw = canon.join("inside.txt");
+        let absolute_inside = confine_read_path(&workspace, &absolute_raw.to_string_lossy())
+            .await
+            .expect("工作区内绝对路径应可读");
         assert!(absolute_inside.starts_with(&canon));
 
         let escape = confine_read_path(&workspace, "../escape.txt").await;

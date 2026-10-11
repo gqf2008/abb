@@ -66,8 +66,12 @@ jobs:
         run: cargo test --locked --manifest-path crates/abb-agent/Cargo.toml
 
   # abb-agent 已是 **Windows 的 owner 默认执行层**，而它此前只在 release tag 时被
-  # Windows 编译到（tag 才跑 release.yml）⇒ PR 级必须补一次 Windows 编译覆盖。
+  # Windows 编译到（tag 才跑 release.yml）⇒ PR 级必须补一次 Windows 覆盖。
   # cfg(windows) 分支在 macOS 上根本不编译（既有盲区）。
+  # **测试在这里真跑**（原来只 `--no-run`）：本包的用例是它唯一的行为断言，
+  # 「编译绿当行为绿」会把 Windows 侧（verbatim 路径 / 路径分隔符 / 子进程语义）的
+  # 回归整个放过去。两条腿的假 CLI 已按平台改写（unix = sh 脚本，Windows = .cmd），
+  # 所以这里不需要 `--no-run` 也能跑。
   abb-agent-windows:
     runs-on: windows-latest
     steps:
@@ -87,8 +91,8 @@ jobs:
       - name: clippy（abb-agent，Windows）
         run: cargo clippy --locked --manifest-path crates/abb-agent/Cargo.toml --all-targets -- -D warnings
 
-      - name: test 编译（abb-agent，Windows，--no-run）
-        run: cargo test --locked --manifest-path crates/abb-agent/Cargo.toml --no-run
+      - name: test（abb-agent，Windows，真跑）
+        run: cargo test --locked --manifest-path crates/abb-agent/Cargo.toml
 
   test:
     runs-on: windows-latest

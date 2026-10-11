@@ -543,6 +543,45 @@ mod tests {
         )
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "abb-delegate-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("建目录");
+        dir
+    }
+
+    /// 造一个**本平台真能执行**的假 CLI。
+    ///
+    /// Windows 上 POSIX 脚本无法直接执行（`os error 193`），所以这里按平台各写一条腿：
+    /// unix 写 `sh` 脚本并 `chmod 0755`，Windows 写 `.cmd` 批处理（显式 CRLF）。
+    /// 判据是「本平台可执行」，因此同一个用例能在两个平台上**都真跑**；
+    /// 整条 `#[cfg(unix)]` 掉会把 Windows 的行为覆盖留成空洞（本卡要消的就是这个）。
+    ///
+    /// 签名里两条腿都在：非 unix 平台用不到 `unix_body`（反之亦然），故按平台放行未用变量。
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn write_fake_cli(dir: &Path, stem: &str, unix_body: &str, windows_body: &str) -> PathBuf {
+        #[cfg(unix)]
+        let (name, body) = (stem.to_string(), unix_body.to_string());
+        #[cfg(not(unix))]
+        let (name, body) = (format!("{stem}.cmd"), windows_body.replace('\n', "\r\n"));
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("写假 CLI");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+        }
+        path
+    }
+
     #[test]
     fn backend_and_timeout_parsing_matches_the_replaced_component() {
         assert_eq!(
@@ -703,21 +742,13 @@ mod tests {
     /// 用假 CLI 真跑一次：报告与退出码都要回到工具结果里。
     #[tokio::test]
     async fn runs_a_fake_cli_and_returns_its_report() {
-        let dir = std::env::temp_dir().join(format!("abb-delegate-run-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("建目录");
-        let fake = dir.join("fake-cli");
-        std::fs::write(
-            &fake,
-            b"#!/bin/sh\necho \"DELEGATE-REPORT-MARKER\"\necho \"args: $*\" 1>&2\nexit 0\n",
-        )
-        .expect("写假 CLI");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake, perms).expect("chmod");
-        }
+        let dir = temp_dir("run");
+        let fake = write_fake_cli(
+            &dir,
+            "fake-cli",
+            "#!/bin/sh\necho \"DELEGATE-REPORT-MARKER\"\necho \"args: $*\" 1>&2\nexit 0\n",
+            "@echo off\necho DELEGATE-REPORT-MARKER\necho args: %* 1>&2\nexit /b 0\n",
+        );
 
         let text = run_with_bin(
             &fake,
@@ -738,22 +769,13 @@ mod tests {
     /// 非零退出必须是**错误结果**（rpi 按 Ok/Err 推 `is_error`；否则委派失败被当成功回灌）。
     #[tokio::test]
     async fn non_zero_exit_is_an_error_result() {
-        let dir = std::env::temp_dir().join(format!("abb-delegate-fail-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("建目录");
-        let fake = dir.join("failing-cli");
-        std::fs::write(
-            &fake,
-            b"#!/bin/sh
-echo \"BOOM-REPORT\"\nexit 3\n",
-        )
-        .expect("写假 CLI");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake, perms).expect("chmod");
-        }
+        let dir = temp_dir("fail");
+        let fake = write_fake_cli(
+            &dir,
+            "failing-cli",
+            "#!/bin/sh\necho \"BOOM-REPORT\"\nexit 3\n",
+            "@echo off\necho BOOM-REPORT\nexit /b 3\n",
+        );
         let error = run_with_bin(
             &fake,
             DelegateBackend::Claude,
@@ -774,29 +796,25 @@ echo \"BOOM-REPORT\"\nexit 3\n",
 
     /// **抽干有上界**：孙进程攥着管道时，工具必须在宽限（5s）后返回并**如实标注输出不完整**，
     /// 而不是把整个回合挂死（评审 F1 实测：cancel 后 20s 都没有 stopReason）。
+    ///
+    /// 两个平台各造本平台真能命中的形状：unix 用 `sleep 30 &` 并记下孙进程 PID（收尾按 PID 杀，
+    /// 不连坐别人的进程）；Windows 用 `start /b cmd /c ping -n 9`（孙进程继承管道句柄，
+    /// 约 8s 后自行退出）——**不重定向 stdout**，否则孙进程不会攥住管道，用例就成了空转。
     #[tokio::test]
     async fn grandchild_holding_the_pipe_does_not_hang_the_call() {
-        let dir = std::env::temp_dir().join(format!("abb-delegate-linger-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("建目录");
-        let fake = dir.join("linger-cli");
+        let dir = temp_dir("linger");
         // 后台 sleep 继承 stdout ⇒ 父进程退出后管道仍被攥着。**把孙进程 PID 写下来**，
         // 收尾按 PID 杀（`pkill -f 'sleep 30'` 会连坐别人的进程——评审 g6）。
         let pid_file = dir.join("grandchild.pid");
-        std::fs::write(
-            &fake,
-            format!(
+        let fake = write_fake_cli(
+            &dir,
+            "linger-cli",
+            &format!(
                 "#!/bin/sh\nsleep 30 &\necho $! > {}\necho \"parent done\"\nexit 0\n",
                 pid_file.display()
             ),
-        )
-        .expect("写假 CLI");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake, perms).expect("chmod");
-        }
+            "@echo off\nstart \"\" /b cmd /c ping -n 9 127.0.0.1\necho parent done\nexit /b 0\n",
+        );
         let started = std::time::Instant::now();
         let text = run_with_bin(
             &fake,
@@ -818,6 +836,8 @@ echo \"BOOM-REPORT\"\nexit 3\n",
             "攥着管道时要如实标注输出不完整：{text}"
         );
         // 按记录的 PID 收掉孙进程（收尾纪律：别留挂死进程，也别连坐别人的）。
+        // Windows 腿没有 PID 可记：孙进程是 `ping -n 9`，管道读端关掉后它自己会很快退出。
+        #[cfg(unix)]
         if let Ok(raw) = std::fs::read_to_string(&pid_file) {
             if let Ok(pid) = raw.trim().parse::<i32>() {
                 let _ = std::process::Command::new("kill")
@@ -831,17 +851,15 @@ echo \"BOOM-REPORT\"\nexit 3\n",
     /// 超时必须真的杀掉子进程（用一个 sleep 的假 CLI）。
     #[tokio::test]
     async fn timeout_kills_the_child() {
-        let dir = std::env::temp_dir().join(format!("abb-delegate-timeout-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("建目录");
-        let fake = dir.join("slow-cli");
-        std::fs::write(&fake, b"#!/bin/sh\nsleep 30\n").expect("写假 CLI");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake).expect("stat").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake, perms).expect("chmod");
-        }
+        let dir = temp_dir("timeout");
+        // Windows 腿**不让 cmd 去等一个孙子进程**（那会把「杀子进程=管道立刻关」变成
+        // 「等孙子的宽限」）：批处理自己空转，杀 cmd.exe 就是全部。
+        let fake = write_fake_cli(
+            &dir,
+            "slow-cli",
+            "#!/bin/sh\nsleep 30\n",
+            "@echo off\n:spin\ngoto spin\n",
+        );
         let started = std::time::Instant::now();
         let error = run_with_bin(
             &fake,

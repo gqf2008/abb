@@ -376,17 +376,22 @@ mod tests {
 
         let skills = discover_with_home(&cwd, None);
         assert_eq!(skills.len(), 1, "嵌套技能不该被当作支持文件来源");
-        let rels: Vec<String> = skills[0]
+        // 断言用 `Path` 而不是拼 `/` 的字符串：Windows 的分隔符是 `\`，
+        // 把相对路径 `to_string_lossy()` 后跟 `"references/foo.md"` 比会在 Windows 上假红。
+        let rels: Vec<PathBuf> = skills[0]
             .supporting_files
             .iter()
             .map(|file| {
                 file.strip_prefix(&skill_dir)
                     .expect("相对路径")
-                    .to_string_lossy()
-                    .into_owned()
+                    .to_path_buf()
             })
             .collect();
-        assert_eq!(rels, vec!["references/foo.md"], "{rels:?}");
+        assert_eq!(
+            rels,
+            vec![PathBuf::from("references").join("foo.md")],
+            "{rels:?}"
+        );
     }
 
     #[test]
