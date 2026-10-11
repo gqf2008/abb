@@ -9,6 +9,10 @@
 
 用法：`python3 fake_mcp_server.py --record /tmp/mcp-calls.jsonl`
 
+资源面（2026-10-11 加）：支持 `resources/list` / `resources/read` / `resources/subscribe`，
+并在收到 subscribe 应答后**主动发一条** `notifications/resources/updated`（探针据此验证
+「订阅 → 收通知 → 读资源 → 上报 abb」整条链）。
+
 另有两个给「环境/工作目录隔离」与「装配预算」探针用的开关：
 
 - `--dump-env <path>`：启动时把自己的 **cwd 与全量环境** 写成 JSON，供探针断言
@@ -23,6 +27,7 @@ import os
 import sys
 import time
 
+RESOURCE_URI = "file:///fake/resource.txt"
 TOOL_NAME = "echo_query"
 
 
@@ -46,6 +51,7 @@ def main():
     dump_path = None
     image_data = None
     hang_init = False
+    resource_text = "resource-body-from-fake-server"
     argv = sys.argv[1:]
     for i, item in enumerate(argv):
         if item == "--record" and i + 1 < len(argv):
@@ -56,6 +62,8 @@ def main():
             image_data = argv[i + 1]
         elif item == "--hang-init":
             hang_init = True
+        elif item == "--resource":
+            resource_text = argv[i + 1] if i + 1 < len(argv) else resource_text
 
     dump_env(dump_path)
 
@@ -80,7 +88,7 @@ def main():
                 "id": msg_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {"subscribe": True, "listChanged": False}},
                     "serverInfo": {"name": "fake-mcp", "version": "0.1.0"},
                 },
             }
@@ -116,6 +124,37 @@ def main():
                 "id": msg_id,
                 "result": {"content": content, "isError": False},
             }
+        elif method == "resources/list":
+            reply = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": RESOURCE_URI,
+                            "name": "fake-resource",
+                            "mimeType": "text/plain",
+                        }
+                    ]
+                },
+            }
+        elif method == "resources/read":
+            params = msg.get("params") or {}
+            record(record_path, {"resource_read": params.get("uri")})
+            reply = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "contents": [
+                        {"uri": params.get("uri") or RESOURCE_URI,
+                         "mimeType": "text/plain", "text": resource_text}
+                    ]
+                },
+            }
+        elif method == "resources/subscribe":
+            params = msg.get("params") or {}
+            record(record_path, {"subscribed": params.get("uri")})
+            reply = {"jsonrpc": "2.0", "id": msg_id, "result": {}}
         elif method and method.startswith("notifications/"):
             continue  # 通知无需应答
         else:
@@ -127,6 +166,17 @@ def main():
 
         sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+        if method == "resources/subscribe":
+            # 订阅成功后主动推一次更新：探针要证的是「通知 → 读 → 上报」的链路本身，
+            # 所以不依赖外部触发（确定性）。
+            time.sleep(0.2)
+            note = {
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {"uri": RESOURCE_URI},
+            }
+            sys.stdout.write(json.dumps(note, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":

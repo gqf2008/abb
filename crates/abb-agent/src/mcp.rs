@@ -30,8 +30,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::{PeerRequestOptions, RoleClient, RunningService};
+use rmcp::handler::client::ClientHandler;
+use rmcp::model::{
+    CallToolRequestParams, ReadResourceRequestParams, ResourceUpdatedNotificationParam,
+    SubscribeRequestParams,
+};
+use rmcp::service::{
+    MaybeSendFuture, NotificationContext, PeerRequestOptions, RoleClient, RunningService,
+};
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 use rpi_agent::agent_tool::AgentTool;
@@ -44,6 +50,12 @@ use tokio_util::sync::CancellationToken;
 
 /// 限定名分隔符。与被替代组件一致（它同样用 `__`，且拒绝 bare 名含 `__` 的工具）。
 const SEP: &str = "__";
+
+/// 单 server 每个会话最多订阅的资源数（防某个 server 列上千条资源把会话拖死）。
+const MAX_SUBSCRIPTIONS_PER_SERVER: usize = 32;
+
+/// 单条资源正文回灌给模型的上限（与工具结果同源取舍：截断而不是整条丢掉）。
+const MAX_RESOURCE_TEXT_BYTES: usize = 16 * 1024;
 
 /// 单个 server 的装配预算（`initialize` 与 `tools/list` **合计**共用这一个上界）。
 const CONNECT_BUDGET_PER_SERVER: Duration = Duration::from_secs(20);
@@ -101,12 +113,127 @@ struct Connected {
     client: Arc<Client>,
 }
 
-type Client = RunningService<RoleClient, ()>;
+/// 接上来的 MCP 客户端：handler 固定为 [`ResourceUpdateHandler`]（它承载
+/// `notifications/resources/updated`）。不需要资源面时只是不订阅、不起 reader 任务，
+/// 类型仍是同一个，避免为"要不要 handler"引入两套连接类型。
+type Client = RunningService<RoleClient, ResourceUpdateHandler>;
 
 /// 一次会话里连上的全部 MCP server + 展开后的工具。
+/// 资源更新事件：**执行层 → ABB** 的上报载荷（ABB 侧据此开一个事件回合）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceEvent {
+    /// 哪个 MCP server 报的（多 server 时用来归属）。
+    pub server: String,
+    /// 资源 URI（`resources/read` 的入参）。
+    pub uri: String,
+    /// 读取到的正文（已按 [`MAX_RESOURCE_TEXT_BYTES`] 截断）。
+    pub text: String,
+}
+
+/// 单 server 的资源通知处理：把 `notifications/resources/updated` 转成通道消息。
+///
+/// 读资源是异步的、要 `Peer`，所以 handler 只做"收下 URI 就返回"（rmcp 回调本就要求
+/// 别在回调里做长活），真正的 `resources/read` 在 [`spawn_resource_reader`] 的任务里。
+struct ResourceUpdateHandler {
+    server: String,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl ResourceUpdateHandler {
+    /// handler 的写入路径（单测直接调它，不必构造 `NotificationContext`）。
+    fn report(&self, uri: &str) {
+        tracing::debug!("资源更新通知 server={} uri={uri}", self.server);
+        let _ = self.tx.send(uri.to_string());
+    }
+}
+
+impl ClientHandler for ResourceUpdateHandler {
+    fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + MaybeSendFuture + '_ {
+        self.report(&params.uri);
+        std::future::ready(())
+    }
+}
+
+/// 从 `resources/read` 的结果里抽正文（文本拼接；blob 记一行占位，不做 base64 解码）。
+///
+/// 用 serde 取值而不是直接匹配枚举：rmcp 的 `ResourceContents` 字段类型随版本变动过
+/// （与 `tools/list` 同一条理由），JSON 形状是协议的一部分、稳定。
+fn extract_resource_text(value: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(items) = value.get("contents").and_then(Value::as_array) {
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
+                parts.push(format!("[二进制资源，{} 字节 base64]", blob.len()));
+            }
+        }
+    }
+    elide_middle(&parts.join("\n---\n"), MAX_RESOURCE_TEXT_BYTES)
+}
+
+/// 为单个 server 起「通知 → 读资源 → 上报」任务。
+///
+/// 读失败只记日志：资源面是增值能力，不能反过来拖垮工具面。
+fn spawn_resource_reader(
+    server: String,
+    peer: rmcp::service::Peer<RoleClient>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    sink: tokio::sync::mpsc::UnboundedSender<ResourceEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(uri) = rx.recv().await {
+            match peer
+                .read_resource(ReadResourceRequestParams::new(uri.clone()))
+                .await
+            {
+                Ok(result) => {
+                    let value = match serde_json::to_value(&result) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!("资源结果序列化失败 server={server} uri={uri}：{error}");
+                            continue;
+                        }
+                    };
+                    let text = extract_resource_text(&value);
+                    if sink
+                        .send(ResourceEvent {
+                            server: server.clone(),
+                            uri,
+                            text,
+                        })
+                        .is_err()
+                    {
+                        break; // 接收端已退出（会话结束）
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("资源读取失败 server={server} uri={uri}：{error}");
+                }
+            }
+        }
+    })
+}
+
 pub struct McpSession {
     servers: Vec<Connected>,
     tools: Vec<Arc<dyn AgentTool>>,
+    /// 已订阅的 `(server, uri)`：多 server 时按 server 归属，便于测试与日志核对。
+    subscriptions: Vec<(String, String)>,
+    /// 每个 server 的「通知 → 读资源 → 上报」任务；会话 drop 时一起收掉。
+    reader_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for McpSession {
+    fn drop(&mut self) {
+        for task in &self.reader_tasks {
+            task.abort();
+        }
+    }
 }
 
 impl McpSession {
@@ -117,14 +244,22 @@ impl McpSession {
     ///
     /// 两个上界同时生效：单 server [`CONNECT_BUDGET_PER_SERVER`]、全体
     /// [`CONNECT_BUDGET_TOTAL`]（取小者）。`cwd` 是会话工作区，透传给子进程。
+    ///
+    /// `resource_sink`（可选）= 资源更新的上报通道：给了就为每个 server 起一条
+    /// 「订阅 → 收通知 → `resources/read` → 上报」的链路；没给就只列工具（呼叫方
+    /// 不需要事件时不必白付订阅成本）。**资源面全程 best-effort**：server 不支持
+    /// `resources/*` 是合法的（很多 server 只有 tools），失败只记日志。
     pub async fn connect_all(
         specs: &[McpServerSpec],
         cwd: &str,
         images_deliverable: bool,
+        resource_sink: Option<tokio::sync::mpsc::UnboundedSender<ResourceEvent>>,
     ) -> McpSession {
         let mut servers = Vec::new();
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
         let mut seen_qnames: Vec<String> = Vec::new();
+        let mut subscriptions: Vec<(String, String)> = Vec::new();
+        let mut reader_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let deadline = tokio::time::Instant::now() + CONNECT_BUDGET_TOTAL;
         for spec in specs {
             // 非法 server 名会在限定名里制造歧义，而且 rpi 侧无法把它们和合法名区分开。
@@ -142,8 +277,26 @@ impl McpSession {
                 );
                 continue;
             }
-            match tokio::time::timeout(budget, connect_one(spec, cwd)).await {
-                Ok(Ok((client, defs))) => {
+            // 每个 server 一条独立通知通道：订阅/通知互不串（多 server 归属清晰）。
+            let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            match tokio::time::timeout(
+                budget,
+                connect_one(spec, cwd, &notif_tx, resource_sink.is_some()),
+            )
+            .await
+            {
+                Ok(Ok((client, defs, subscribed))) => {
+                    if let Some(sink) = &resource_sink {
+                        for uri in &subscribed {
+                            subscriptions.push((spec.name.clone(), uri.clone()));
+                        }
+                        reader_tasks.push(spawn_resource_reader(
+                            spec.name.clone(),
+                            client.peer().clone(),
+                            notif_rx,
+                            sink.clone(),
+                        ));
+                    }
                     let client = Arc::new(client);
                     let mut accepted = Vec::new();
                     for def in defs {
@@ -200,7 +353,21 @@ impl McpSession {
                 ),
             }
         }
-        McpSession { servers, tools }
+        if !subscriptions.is_empty() {
+            // 订阅清单进日志：多 server 场景下"谁订了什么"是排障第一现场。
+            tracing::info!("MCP 资源订阅 {} 条：{subscriptions:?}", subscriptions.len());
+        }
+        McpSession {
+            servers,
+            tools,
+            subscriptions,
+            reader_tasks,
+        }
+    }
+
+    /// 已订阅资源清单（`(server, uri)`）：供日志与测试核对多 server 归属。
+    pub(crate) fn subscribed(&self) -> Vec<(String, String)> {
+        self.subscriptions.clone()
     }
 
     /// 展开出来的工具（直接喂给 `AgentBuilder::tools`）。
@@ -220,7 +387,12 @@ struct ToolDef {
     schema: Tool,
 }
 
-async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<ToolDef>), String> {
+async fn connect_one(
+    spec: &McpServerSpec,
+    cwd: &str,
+    notif_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    want_resources: bool,
+) -> Result<(Client, Vec<ToolDef>, Vec<String>), String> {
     let mut cmd = tokio::process::Command::new(&spec.command);
     cmd.args(&spec.args);
     // **先清空再白名单**：不经 `env_clear()` 的话，每个 MCP server 默认都能看到
@@ -254,7 +426,14 @@ async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<Too
         .map_err(|error| format!("spawn {} (cwd={cwd}): {error}", spec.command))?;
     // 超时不在这里做：调用方用 [`CONNECT_BUDGET_PER_SERVER`] 包住整个装配，
     // 这样 initialize 花掉的时间会从 tools/list 的额度里扣——「每 server 20s」才是真话。
-    let client: Client = ().serve(transport).await.map_err(|error| format!("initialize: {error}"))?;
+    let handler = ResourceUpdateHandler {
+        server: spec.name.clone(),
+        tx: notif_tx.clone(),
+    };
+    let client: Client = handler
+        .serve(transport)
+        .await
+        .map_err(|error| format!("initialize: {error}"))?;
 
     let listed = client
         .peer()
@@ -313,7 +492,59 @@ async fn connect_one(spec: &McpServerSpec, cwd: &str) -> Result<(Client, Vec<Too
             },
         });
     }
-    Ok((client, defs))
+    // 资源面：best-effort 订阅（server 不支持 `resources/*` 是合法的）。
+    let subscribed = if want_resources {
+        subscribe_all_resources(&client, &spec.name).await
+    } else {
+        Vec::new()
+    };
+
+    Ok((client, defs, subscribed))
+}
+
+/// 列出并订阅该 server 的全部资源（上限 [`MAX_SUBSCRIPTIONS_PER_SERVER`]）。
+///
+/// 任何一步失败都只记日志并返回已成功的部分：资源面是增值能力。`resources/list`
+/// 在同一 server 上分页（`list_all_resources` 内部翻页）。
+async fn subscribe_all_resources(client: &Client, server: &str) -> Vec<String> {
+    let resources = match client.peer().list_all_resources().await {
+        Ok(resources) => resources,
+        Err(error) => {
+            tracing::debug!("server={server} 不支持 resources/list（合法）：{error}");
+            return Vec::new();
+        }
+    };
+    if resources.len() > MAX_SUBSCRIPTIONS_PER_SERVER {
+        tracing::warn!(
+            "server={server} 列出 {} 条资源，只订阅前 {MAX_SUBSCRIPTIONS_PER_SERVER} 条",
+            resources.len()
+        );
+    }
+    let mut subscribed = Vec::new();
+    for resource in resources.iter().take(MAX_SUBSCRIPTIONS_PER_SERVER) {
+        // 用 serde 取 uri：`Resource` 字段类型随版本变动过（同 tools/list 的理由）。
+        let uri = serde_json::to_value(resource)
+            .ok()
+            .and_then(|value| value.get("uri").and_then(Value::as_str).map(str::to_string));
+        let Some(uri) = uri else {
+            tracing::warn!("server={server} 有一条资源没有 uri 字段，已跳过");
+            continue;
+        };
+        match client
+            .peer()
+            .subscribe(SubscribeRequestParams::new(uri.clone()))
+            .await
+        {
+            Ok(()) => {
+                tracing::info!("已订阅资源 server={server} uri={uri}");
+                subscribed.push(uri);
+            }
+            Err(error) => {
+                tracing::warn!("资源订阅失败 server={server} uri={uri}：{error}");
+            }
+        }
+    }
+    subscribed
 }
 
 /// 一个 MCP 工具在 rpi 里的适配器。
@@ -672,6 +903,62 @@ fn type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod resource_surface_tests {
+    use super::*;
+
+    /// handler 的写入路径必须把 uri 原样送进通道（通知 → reader 任务的唯一接口）。
+    #[test]
+    fn resource_handler_reports_uri_verbatim() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let handler = ResourceUpdateHandler {
+            server: "srv".to_string(),
+            tx,
+        };
+        handler.report("file:///a b/c.json"); // 含空格的 uri 也不得被改写
+        assert_eq!(rx.try_recv().ok().as_deref(), Some("file:///a b/c.json"));
+    }
+
+    /// `resources/read` 结果 → 正文：文本拼接、blob 记占位、超长截断（而不是整条丢）。
+    #[test]
+    fn extract_resource_text_shapes() {
+        let two_texts = serde_json::json!({
+            "contents": [
+                {"uri": "a", "text": "第一段"},
+                {"uri": "b", "text": "第二段"}
+            ]
+        });
+        assert_eq!(extract_resource_text(&two_texts), "第一段\n---\n第二段");
+
+        let blob_only = serde_json::json!({
+            "contents": [{"uri": "a", "blob": "QUJD"}]
+        });
+        assert_eq!(
+            extract_resource_text(&blob_only),
+            "[二进制资源，4 字节 base64]"
+        );
+
+        // 空 contents（半截结果）不得 panic，返回空串
+        assert_eq!(
+            extract_resource_text(&serde_json::json!({"contents": []})),
+            ""
+        );
+
+        // 超长按上限截断且保两端（elide_middle 语义）
+        let long = "x".repeat(MAX_RESOURCE_TEXT_BYTES * 2);
+        let huge = serde_json::json!({"contents": [{"uri": "a", "text": long}]});
+        let out = extract_resource_text(&huge);
+        assert!(
+            out.len() <= MAX_RESOURCE_TEXT_BYTES,
+            "截断到上限：{}",
+            out.len()
+        );
+        assert!(
+            out.contains('…') || out.contains("elided") || out.len() < MAX_RESOURCE_TEXT_BYTES + 64
+        );
     }
 }
 

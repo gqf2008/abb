@@ -280,13 +280,45 @@ impl Server {
             .as_ref()
             .map(|backend| backend.delivers_tool_result_images())
             .unwrap_or(false);
-        let mcp =
-            McpSession::connect_all(&parsed.mcp_servers, &parsed.cwd, images_deliverable).await;
+        // 资源面：会话建立时就把 sink 接上——订阅发生在 connect_all 内部，
+        // 通知到达后由这里投影成一条 ACP 通知（`_abb/unstable/resource/updated`）交给 abb，
+        // 由 abb 决定是否开一个回合（本包不自己起回合：交付单点归 abb）。
+        let (resource_tx, mut resource_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::mcp::ResourceEvent>();
+        let resource_writer = self.writer.clone();
+        let resource_session = session_id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = resource_rx.recv().await {
+                if let Err(error) = resource_writer
+                    .notify(
+                        "_abb/unstable/resource/updated",
+                        json!({
+                            "sessionId": resource_session,
+                            "server": event.server,
+                            "uri": event.uri,
+                            "text": event.text,
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!("resource/updated 写出失败，已忽略：{error}");
+                    break;
+                }
+            }
+        });
+        let mcp = McpSession::connect_all(
+            &parsed.mcp_servers,
+            &parsed.cwd,
+            images_deliverable,
+            Some(resource_tx),
+        )
+        .await;
         let tools = mcp.tools();
         tracing::info!(
-            "会话 {session_id}：mcp server {:?}，工具 {} 个，systemPrompt={}，cwd={}",
+            "会话 {session_id}：mcp server {:?}，工具 {} 个，资源订阅 {:?}，systemPrompt={}，cwd={}",
             mcp.server_names(),
             tools.len(),
+            mcp.subscribed(),
             if parsed.system_prompt.is_some() {
                 "abb 下发"
             } else {
