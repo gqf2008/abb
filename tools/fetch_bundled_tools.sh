@@ -92,7 +92,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       fi
       cp "$src" "$DEST/bin/$output_name"
       ;;
-    multicall-tar-gz|multicall-tar-xz|multicall-zip)
+    multicall-raw|multicall-tar-gz|multicall-tar-xz|multicall-zip)
       # 多调包（uutils coreutils / diffutils）：
       #  - macOS 资产是**单个多调二进制** ⇒ 解到 bin/<provider>，再按清单建硬链接
       #    （同卷免权限；硬链接失败回落复制并告警——绝不静默少一个工具）；
@@ -101,26 +101,36 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       provider="$tool"
       # 注意：本脚本是 zsh，**未加引号的标量参数不会被词分割**（只有命令替换会）。
       # 所以这里一律用内联 `$(awk ...)`，不要先赋值再 `for name in $var`（那样只迭代一次）。
-      [ -n "$(awk -F'\t' -v p="$provider" '$2==p {print $1}' tools/bundled-cli-tools.tsv)" ] || {
+      [ -n "$(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv)" ] || {
         echo "$provider 在 tools/bundled-cli-tools.tsv 里没有任何名字" >&2; exit 1;
       }
       case "$package" in
+        multicall-raw) cp "$file" "$tmp/extract/$tool/$tool" ;;
         multicall-tar-gz) tar -xzf "$file" -C "$tmp/extract/$tool" ;;
         multicall-tar-xz) tar -xJf "$file" -C "$tmp/extract/$tool" ;;
         multicall-zip) unzip -q "$file" -d "$tmp/extract/$tool" ;;
       esac
       if [ "$PLATFORM" = "windows-x64" ]; then
-        for name in $(awk -F'\t' -v p="$provider" '$2==p {print $1}' tools/bundled-cli-tools.tsv); do
-          per="$(find "$tmp/extract/$tool" -name "$name.exe" | head -1)"
+        # 原生 Windows 资产：包内若本来就按工具名分文件（如 uutils coreutils），取件即可；
+        # 否则（多调 exe，如 busybox-w32）先把多调本体放到 bin/$output_name，再按名单建硬链接。
+        for name in $(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
+          per="$(find "$tmp/extract/$tool" -name "$name.exe" 2>/dev/null | head -1)"
           [ -n "$per" ] || { echo "$provider 包里没有 $name.exe" >&2; exit 1; }
           cp "$per" "$DEST/bin/$name.exe"
         done
+        if [ ! -f "$DEST/bin/${output_name%.exe}.exe" ] && [ -f "$tmp/extract/$tool/$tool" ]; then
+          cp "$tmp/extract/$tool/$tool" "$DEST/bin/$output_name"
+          for name in $(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
+            [ -f "$DEST/bin/$name.exe" ] && continue
+            ln -f "$DEST/bin/$output_name" "$DEST/bin/$name.exe" 2>/dev/null || cp "$DEST/bin/$output_name" "$DEST/bin/$name.exe"
+          done
+        fi
       else
         src="$(find "$tmp/extract/$tool" -type f -name "$provider" | head -1)"
         [ -n "$src" ] || { echo "$provider 包里没有多调二进制 $provider" >&2; exit 1; }
         cp "$src" "$DEST/bin/$provider"
         chmod 0755 "$DEST/bin/$provider"
-        for name in $(awk -F'\t' -v p="$provider" '$2==p {print $1}' tools/bundled-cli-tools.tsv); do
+        for name in $(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
           ln -f "$DEST/bin/$provider" "$DEST/bin/$name" 2>/dev/null || {
             echo "  [tools] 硬链接 $name -> $provider 失败，回落复制" >&2
             cp "$DEST/bin/$provider" "$DEST/bin/$name"
@@ -154,7 +164,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
     multicall-*)
       # 多调包：**逐个名字**验活（这同时验证了硬链接/按名取件都对）。
       # 注意不能拿包名当工具名跑（`diffutils --version` 会得到 "utility not supported"）。
-      for name in $(awk -F'\t' -v p="$tool" '$2==p {print $1}' tools/bundled-cli-tools.tsv); do
+      for name in $(awk -F'\t' -v p="$tool" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
         # 验活：**不能依赖 `--version`/`--help`**——uutils diffutils 对两者都报
         # "Unknown option"（与 GNU diff 行为有差异）。只要求"能执行"：
         # 无参跑一次，退出码 126/127（不可执行/找不到，POSIX 约定）才算失败。

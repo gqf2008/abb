@@ -13,3 +13,4 @@ diffutils	0.5.0	macos-arm64	multicall-tar-xz	https://github.com/uutils/diffutils
 diffutils	0.5.0	windows-x64	multicall-zip	https://github.com/uutils/diffutils/releases/download/v0.5.0/diffutils-x86_64-pc-windows-msvc.zip	36c900a06060ee31621fcdecb9bf223b40dd23d45e91ba98101b5d3aa5c70d18	-	diffutils.exe
 goawk	1.32.0	macos-arm64	tar.gz	https://github.com/benhoyt/goawk/releases/download/v1.32.0/goawk_v1.32.0_darwin_arm64.tar.gz	ca430af69900f20b6efb34471d31bea3fc16e301d05eab5ba2e97a4385fc5329	goawk	awk
 goawk	1.32.0	windows-x64	zip	https://github.com/benhoyt/goawk/releases/download/v1.32.0/goawk_v1.32.0_windows_amd64.zip	2cebd8d64a8eaf84b2787edec8c0274760166e077bc2bdbb69d41537b56cf32c	goawk.exe	awk.exe
+busybox	FRP-6075-g169694ebd	windows-x64	multicall-raw	https://frippery.org/files/busybox/busybox-w64-FRP-6075-g169694ebd.exe	07bb1e5b095b00d68a695481f9240879f33c5724b40aa2308f999d54ed78f075	-	busybox.exe

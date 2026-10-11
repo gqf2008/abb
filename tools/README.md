@@ -9,6 +9,7 @@ ABB 安装包内置这些固定版本的工具（一包一名的 + 多调包提�
 | `uv` | 0.12.13 | Python 环境/依赖管理 | MIT / Apache-2.0 |
 | `gh` | 2.100.0 | GitHub CLI | MIT |
 | `goawk` | 1.32.0 | POSIX awk（以 `awk` 名暴露） | MIT |
+| `busybox` | FRP-6075-g169694ebd | busybox-w32（**仅 Windows**）多调 exe：提供 `ps`/`watch`/`wget`/`usleep`/`unix2dos`/`sed`/`echo`/`printf`/`id`/`hexdump`/`md5sum`/`sha1sum`/`sha256sum` | **GPL-2.0**（见 `licenses/busybox-COPYING-GPL2.txt`；源码 <https://github.com/rmyorston/busybox-w32>） |
 | `coreutils` | 0.12.0 | uutils coreutils（**多调二进制**，本仓按 `tools/bundled-cli-tools.tsv` 暴露 `tail`/`sleep`/`head`） | MIT |
 | `diffutils` | 0.5.0 | uutils diffutils（多调二进制，暴露 `diff`/`cmp`） | MIT / Apache-2.0 |
 
@@ -30,13 +31,15 @@ ABB 安装包内置这些固定版本的工具（一包一名的 + 多调包提�
 按名单取件即可；`diffutils` 仍是多调 → 同样走硬链接。验活不依赖 `--version`（uutils diffutils 没有），
 只要求无参可执行（rc≠126/127）。
 
-**未随包的工具与原因**（2026-10-11 实核，别按"常用"再问一遍）：
+**未随包 / 仅 Windows 随包的工具**（2026-10-11 实核，含 2026-10-11 owner 追加的 busybox 一批）：
 
 | 工具 | 结论 | 判据 |
 |---|---|---|
-| `ps` | 不随包 | uutils coreutils 0.12.0 的 106 个工具里没有 `ps`（`./coreutils --list` 无命中）；macOS/Linux 宿主自带；Windows 用 `tasklist`/PowerShell |
-| `watch` | 不随包 | 无官方预编译且 CLI 语义与 GNU `watch` 一致的资产（watchexec 有官方预编译但语义不同，以 `watch` 名义随包会误导）；等价写法：`while true; do <cmd>; sleep N; done` |
-| `wget` | 不随包 | GNU wget 官方无预编译；社区复打包不接受（供应链）。用 `curl`（macOS 自带；Windows 10+ 自带 `curl.exe`） |
+| `ps` | **Windows 随包**（busybox）；macOS/Linux 用宿主自带 | uutils coreutils 0.12.0 的 106 个工具里没有 `ps`（`./coreutils --list` 无命中）⇒ macOS 不重复提供；Windows 由 busybox-w32 提供 |
+| `watch` | **Windows 随包**（busybox）；macOS 不随包 | macOS 无官方预编译且 CLI 语义一致的资产（watchexec 有官方预编译但语义不同）⇒ 等价写法 `while true; do <cmd>; sleep N; done`；Windows 由 busybox-w32 提供 |
+| `wget` | **Windows 随包**（busybox）；macOS 不随包 | macOS 上 GNU wget 官方无预编译、社区复打包不接受（供应链）⇒ 用 `curl`；Windows 由 busybox-w32 提供 |
+| `md5sum` / `sha1sum` / `sha256sum` | **两平台随包** | macOS 宿主没有这三个名字（只有 `md5`/`shasum`）⇒ 由 coreutils 提供；Windows 由 busybox 提供 |
+| `sed` / `echo` / `printf` / `id` / `hexdump` | **仅 Windows 随包** | macOS/Linux 宿主自带等价物（且 `echo`/`printf` 多为 shell 内建），**不覆盖**以免行为漂移；Windows 由 busybox-w32 提供 |
 
 macOS 的 `jq 1.8.2` 不使用官方预编译包（其 minOS 为 14），而是从官方源码以
 `MACOSX_DEPLOYMENT_TARGET=12.0` 静态构建，保持 ABB 当前 `LSMinimumSystemVersion=12.0`。
