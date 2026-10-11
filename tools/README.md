@@ -44,6 +44,24 @@ ABB 安装包内置这些固定版本的工具（一包一名的 + 多调包提�
 macOS 的 `jq 1.8.2` 不使用官方预编译包（其 minOS 为 14），而是从官方源码以
 `MACOSX_DEPLOYMENT_TARGET=12.0` 静态构建，保持 ABB 当前 `LSMinimumSystemVersion=12.0`。
 
+## 取件形态与自检
+
+多调包（`coreutils`/`diffutils`/`busybox`）的落地规则（两个 fetch 脚本**同构**实现）：
+1. 先把**包产物** `output_name` 放进 `bin/`（裸 exe 就是它自己；归档里按名字递归找——uutils 的
+   Windows zip 带一层目录前缀）；
+2. 再按 `tools/bundled-cli-tools.tsv` 为每个名字落文件：优先用包内**同名文件**（coreutils 的
+   Windows zip 是每工具一个 exe），否则**硬链接**到包产物（diffutils/busybox 是多调），
+   硬链接失败回落复制；
+3. 两者都拿不到即报错（绝不静默少一个工具）。
+
+**自检入口**：`tools/check_bundled_tools.sh --platform <macos-arm64|windows-x64> --bin-dir <目录>/bin`
+断言"期望集合（包产物 ∪ 该平台多调名字）== 目录实际文件"，接在 `release.yml`（两平台）与
+`ci.yml` 的 `abb-agent-windows`（PR 级 Windows 证据）。本机（macOS）也可以用
+`fetch_bundled_tools.sh --platform windows-x64` 做**取件链路干跑**（PE 产物不执行，只断言非空）。
+
+busybox 的许可与出处见 `licenses/busybox-COPYING-GPL2.txt` + `licenses/busybox-SOURCE-NOTICE.txt`
+（仓库、构建标识、sha256；GPL-2.0 分发要求随二进制提供）。
+
 ## 布局
 
 构建时由 `fetch_bundled_tools.sh` / `fetch_bundled_tools.ps1` 按

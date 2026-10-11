@@ -26,6 +26,8 @@ case "$PLATFORM" in
   macos-arm64|windows-x64) ;;
   *) echo "--platform 只能是 macos-arm64 / windows-x64" >&2; exit 2 ;;
 esac
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/abb-check-tools.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$BIN"
 
 # Windows 侧产物带 .exe 后缀。
@@ -54,16 +56,21 @@ while IFS=$'\t' read -r name provider platform; do
   fi
 done < tools/bundled-cli-tools.tsv
 
-# 3) 本平台应能解析到的名字全集，与 src/deps.rs 的名字表对齐（防"清单加了名字、deps 没加"）
-expected=0
-while IFS=$'\t' read -r name provider platform; do
-  [ "$name" = "name" ] && continue
-  [ "$platform" = "all" ] || [ "$platform" = "$PLATFORM" ] || continue
-  expected=$((expected+1))
-done < tools/bundled-cli-tools.tsv
-echo "  [check] ${PLATFORM}：包产物 + $expected 个多调名字已校验"
+# 3) **集合相等**：期望集合（包产物 ∪ 该平台多调名字）必须与目录里实际文件逐一相等。
+#    为什么：前两步只查"期望的都在"，查不出"目录里多了不该有的"；而多调包的按名落地很容易
+#    漏一个或多一个（评审 F3 也指出旧注释夸大了这一步做的事）。
+awk -F'\t' '$3=="'"$PLATFORM"'" && $1!="tool" {print $8}' tools/tool-lock.tsv > "$TMP/expect.txt"
+awk -F'\t' -v plat="$PLATFORM" 'NR>1 && $1!="" && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv \
+  | while read -r n; do printf '%s%s\n' "$n" "$suffix"; done >> "$TMP/expect.txt"
+sort -u -o "$TMP/expect.txt" "$TMP/expect.txt"
+ls "$BIN" | grep -v '^\.' | sort -u > "$TMP/actual.txt"
+if ! diff -u "$TMP/expect.txt" "$TMP/actual.txt"; then
+  echo "❌ 随包工具集合不等于期望集合（${PLATFORM}）：上面是期望/实际的差异" >&2
+  missing=$((missing+1))
+fi
+echo "  [check] ${PLATFORM}：期望集合 $(wc -l < "$TMP/expect.txt" | tr -d ' ') 项已比对"
 if [ "$missing" -ne 0 ]; then
-  echo "❌ 随包工具不齐：$missing 项缺失（${PLATFORM}）" >&2
+  echo "❌ 随包工具不齐：$missing 项不符（${PLATFORM}）" >&2
   exit 1
 fi
 echo "✅ 随包工具齐全（${PLATFORM}）"

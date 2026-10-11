@@ -36,6 +36,16 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$DEST/bin" "$DEST/licenses"
 cp tools/licenses/* "$DEST/licenses/"
 
+# 宿主判定：Windows 产物在非 Windows 宿主上**不能执行**（PE），只能断言"存在且非空"。
+# 本脚本允许在 macOS/Linux 上用 --platform windows-x64 做"取件链路"的干跑（CI 之外的自证路径）。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) host_windows=1 ;;
+  *) host_windows=0 ;;
+esac
+
+# Windows 产物带 .exe 后缀；多调包按名落文件与验活都用它。
+if [ "$PLATFORM" = "windows-x64" ]; then suffix=".exe"; else suffix=""; fi
+
 found=0
 while IFS=$'\t' read -r tool version platform package url sha256 inner_path output_name; do
   [ "$tool" = "tool" ] && continue
@@ -93,50 +103,49 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       cp "$src" "$DEST/bin/$output_name"
       ;;
     multicall-raw|multicall-tar-gz|multicall-tar-xz|multicall-zip)
-      # 多调包（uutils coreutils / diffutils）：
-      #  - macOS 资产是**单个多调二进制** ⇒ 解到 bin/<provider>，再按清单建硬链接
-      #    （同卷免权限；硬链接失败回落复制并告警——绝不静默少一个工具）；
-      #  - Windows 的 coreutils 资产是**每工具一个 exe** ⇒ 直接取 <name>.exe，不需要链接；
-      #    diffutils 仍是多调 ⇒ 走硬链接分支。
+      # 多调包（uutils coreutils / diffutils / busybox-w32）：一个包暴露多个工具名，三种形态：
+      #   ① 单个裸二进制（busybox-w32，multicall-raw）——asset 本身就是多调 exe；
+      #   ② 归档里一个多调二进制（uutils diffutils）；
+      #   ③ 归档里"每工具一个 exe"（uutils coreutils 的 Windows zip）+ 一个 coreutils.exe 多调本体。
+      # 统一流程：先把**包产物**（output_name）落到 bin/，再按清单为每个名字取"包内同名文件"或
+      # 硬链接到包产物；两者都拿不到就报错（绝不静默少一个工具）。
+      # 注意：本脚本是 zsh，**未加引号的标量参数不会被词分割**（只有命令替换会）——
+      # 所以一律内联 `$(awk …)`，不要先赋值再 `for name in $var`（那样只迭代一次）。
       provider="$tool"
-      # 注意：本脚本是 zsh，**未加引号的标量参数不会被词分割**（只有命令替换会）。
-      # 所以这里一律用内联 `$(awk ...)`，不要先赋值再 `for name in $var`（那样只迭代一次）。
-      [ -n "$(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv)" ] || {
-        echo "$provider 在 tools/bundled-cli-tools.tsv 里没有任何名字" >&2; exit 1;
+      names_for_platform() {
+        awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv
       }
+      [ -n "$(names_for_platform)" ] || {
+        echo "$provider 在 tools/bundled-cli-tools.tsv 里没有任何名字（$PLATFORM）" >&2; exit 1;
+      }
+      mkdir -p "$tmp/extract/$tool"
       case "$package" in
-        multicall-raw) cp "$file" "$tmp/extract/$tool/$tool" ;;
+        multicall-raw) cp "$file" "$tmp/extract/$tool/$output_name" ;;  # 裸 exe：产物名就是 output_name（含 .exe）
         multicall-tar-gz) tar -xzf "$file" -C "$tmp/extract/$tool" ;;
         multicall-tar-xz) tar -xJf "$file" -C "$tmp/extract/$tool" ;;
         multicall-zip) unzip -q "$file" -d "$tmp/extract/$tool" ;;
       esac
-      if [ "$PLATFORM" = "windows-x64" ]; then
-        # 原生 Windows 资产：包内若本来就按工具名分文件（如 uutils coreutils），取件即可；
-        # 否则（多调 exe，如 busybox-w32）先把多调本体放到 bin/$output_name，再按名单建硬链接。
-        for name in $(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
-          per="$(find "$tmp/extract/$tool" -name "$name.exe" 2>/dev/null | head -1)"
-          [ -n "$per" ] || { echo "$provider 包里没有 $name.exe" >&2; exit 1; }
-          cp "$per" "$DEST/bin/$name.exe"
-        done
-        if [ ! -f "$DEST/bin/${output_name%.exe}.exe" ] && [ -f "$tmp/extract/$tool/$tool" ]; then
-          cp "$tmp/extract/$tool/$tool" "$DEST/bin/$output_name"
-          for name in $(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
-            [ -f "$DEST/bin/$name.exe" ] && continue
-            ln -f "$DEST/bin/$output_name" "$DEST/bin/$name.exe" 2>/dev/null || cp "$DEST/bin/$output_name" "$DEST/bin/$name.exe"
-          done
+      # 1) 包产物：归档里按 output_name 找（可能在带目录的前缀下）；裸 exe 就是它自己。
+      product="$tmp/extract/$tool/$output_name"
+      [ -f "$product" ] || product="$(find "$tmp/extract/$tool" -type f -name "$output_name" | head -1)"
+      [ -n "$product" ] && [ -f "$product" ] || {
+        echo "$provider 包里找不到包产物 $output_name" >&2; exit 1;
+      }
+      cp "$product" "$DEST/bin/$output_name"
+      chmod 0755 "$DEST/bin/$output_name" 2>/dev/null || true
+      # 2) 按清单为每个名字落文件：优先"包内同名文件"，否则硬链接（失败回落复制）。
+      for name in $(names_for_platform); do
+        target="$DEST/bin/$name$suffix"
+        [ -f "$target" ] && continue
+        per="$(find "$tmp/extract/$tool" -type f -name "$name$suffix" | head -1)"
+        if [ -n "$per" ]; then
+          cp "$per" "$target"
+        else
+          ln -f "$DEST/bin/$output_name" "$target" 2>/dev/null || cp "$DEST/bin/$output_name" "$target"
         fi
-      else
-        src="$(find "$tmp/extract/$tool" -type f -name "$provider" | head -1)"
-        [ -n "$src" ] || { echo "$provider 包里没有多调二进制 $provider" >&2; exit 1; }
-        cp "$src" "$DEST/bin/$provider"
-        chmod 0755 "$DEST/bin/$provider"
-        for name in $(awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
-          ln -f "$DEST/bin/$provider" "$DEST/bin/$name" 2>/dev/null || {
-            echo "  [tools] 硬链接 $name -> $provider 失败，回落复制" >&2
-            cp "$DEST/bin/$provider" "$DEST/bin/$name"
-          }
-        done
-      fi
+      done
+      # 3) 验活：Windows 产物在非 Windows 宿主上只断言"存在且非空"（不能执行 PE）；
+      #    Windows 宿主（MSYS/MinGW/Cygwin 的 bash）与 macOS 一样做真执行检查（下面统一做）。
       ;;
     *)
       echo "不支持的 package 类型：$package（$tool）" >&2
@@ -160,25 +169,34 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       exit 1
     fi
   fi
-  case "$package" in
-    multicall-*)
-      # 多调包：**逐个名字**验活（这同时验证了硬链接/按名取件都对）。
-      # 注意不能拿包名当工具名跑（`diffutils --version` 会得到 "utility not supported"）。
-      for name in $(awk -F'\t' -v p="$tool" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv); do
-        # 验活：**不能依赖 `--version`/`--help`**——uutils diffutils 对两者都报
-        # "Unknown option"（与 GNU diff 行为有差异）。只要求"能执行"：
-        # 无参跑一次，退出码 126/127（不可执行/找不到，POSIX 约定）才算失败。
-        rc=0
-        "$DEST/bin/$name" </dev/null >/dev/null 2>&1 || rc=$?
-        if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
-          echo "$name 不可执行（rc=$rc，多调包 $tool 的按名调用不通）" >&2; exit 1
-        fi
-      done
-      ;;
-    *)
-      "$DEST/bin/$output_name" --version >/dev/null
-      ;;
-  esac
+  # 注意（第二次踩到同一个坑）：本脚本是 zsh，**标量参数不词分割**——
+  # `check_names="$(awk …)"; for name in $check_names` 只会迭代一次（整个多行串当一个名字）。
+  # 所以这里按类型直接内联命令替换。
+  for name in $(case "$package" in
+      multicall-*) awk -F'\t' -v p="$tool" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv ;;
+      *) echo "$output_name" ;;
+    esac); do
+    # 非多调包的 output_name 可能**已含** .exe（rg.exe/coreutils.exe…）⇒ 不能无脑再拼后缀
+    #（Windows 干跑实测：拼出 rg.exe.exe 报"缺产物"）。
+    case "$name" in
+      *"$suffix") target="$DEST/bin/$name" ;;
+      *) target="$DEST/bin/$name$suffix" ;;
+    esac
+    [ -f "$target" ] || { echo "缺产物：$target" >&2; exit 1; }
+    if [ "$PLATFORM" = "windows-x64" ] && [ "$host_windows" != "1" ]; then
+      # 非 Windows 宿主上的 Windows 产物：不能执行（PE），断言非空即可（真正的执行检查在 Windows CI）。
+      [ -s "$target" ] || { echo "$target 为空文件" >&2; exit 1; }
+      continue
+    fi
+    # 真执行验活：**不能依赖 `--version`/`--help`**——uutils diffutils 对两者都报
+    # "Unknown option"（与 GNU diff 有差异）。只要求"能执行"：无参跑一次，
+    # 退出码 126/127（不可执行/找不到，POSIX 约定）才算失败。
+    rc=0
+    "$target" </dev/null >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+      echo "$name 不可执行（rc=$rc）" >&2; exit 1
+    fi
+  done
 done < tools/tool-lock.tsv
 
 # 计数 = lock 里该平台的**包**数（多调包一个包提供多个工具名，故不再与工具名数相等）。

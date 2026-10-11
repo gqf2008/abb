@@ -54,26 +54,41 @@ try {
                 finally { $zip.Dispose() }
             }
             { $_ -like "multicall-*" } {
-                # 多调包（uutils coreutils / diffutils）：
-                #  - Windows 的 coreutils 资产是**每工具一个 exe** ⇒ 按名单取件；
-                #  - diffutils 仍是多调 ⇒ 解出多调二进制后建**硬链接**（同卷免权限）；
-                #    硬链接失败回落复制（体积换正确性，并告警）。
-                $names = @($manifest | Where-Object { $_.provider -eq $row.tool } | ForEach-Object { $_.name })
-                if ($names.Count -eq 0) { throw "$($row.tool) 在 bundled-cli-tools.tsv 里没有任何名字" }
-                $raw = Join-Path $Tmp ("extract" + $row.tool)
+                # 多调包（uutils coreutils / diffutils / busybox-w32）——与 fetch_bundled_tools.sh 的
+                # 分支**同构**（两处逻辑必须一致，否则一个平台绿一个平台红）：
+                #   ① 先把**包产物** output_name 落到 bin/（裸 exe 就是它自己；归档里按名字找，
+                #      可能在带目录的前缀下——uutils 的 zip 就是这样）；
+                #   ② 再按清单为每个名字落文件：优先"包内同名文件"（coreutils 的 Windows zip 是
+                #      每工具一个 exe），否则硬链接到包产物（diffutils/busybox 是多调），
+                #      硬链接失败回落复制；
+                #   ③ 两者都拿不到就报错（绝不静默少一个工具）。
+                $names = @($manifest | Where-Object {
+                    $_.provider -eq $row.tool -and ($_.platform -eq "all" -or $_.platform -eq $Platform)
+                } | ForEach-Object { $_.name })
+                if ($names.Count -eq 0) { throw "$($row.tool) 在 bundled-cli-tools.tsv 里没有任何名字（$Platform）" }
+                $raw = Join-Path $Tmp ("extract\" + $row.tool)
                 New-Item -ItemType Directory -Force -Path $raw | Out-Null
-                Add-Type -AssemblyName System.IO.Compression.FileSystem
-                [IO.Compression.ZipFile]::ExtractToDirectory($file, $raw, $true)
-                $provider = Join-Path $raw $row.output_name
+                if ($row.package -eq "multicall-raw") {
+                    Copy-Item $file (Join-Path $raw $row.output_name) -Force
+                } else {
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                    [IO.Compression.ZipFile]::ExtractToDirectory($file, $raw, $true)
+                }
+                $product = Get-ChildItem -Path $raw -Recurse -File -Filter $row.output_name | Select-Object -First 1
+                if (-not $product) { throw "$($row.tool) 包里找不到包产物 $($row.output_name)" }
+                Copy-Item $product.FullName (Join-Path $BinDir $row.output_name) -Force
                 foreach ($name in $names) {
-                    $per = Get-ChildItem -Path $raw -Recurse -Filter "$name.exe" | Select-Object -First 1
                     $target = Join-Path $BinDir "$name.exe"
+                    if (Test-Path $target) { continue }
+                    $per = Get-ChildItem -Path $raw -Recurse -File -Filter "$name.exe" | Select-Object -First 1
                     if ($per) {
                         Copy-Item $per.FullName $target -Force
-                    } elseif (Test-Path $provider) {
-                        New-Item -ItemType HardLink -Path $target -Target $provider -Force | Out-Null
                     } else {
-                        throw "$($row.tool) 包里既没有 $name.exe 也没有多调二进制 $($row.output_name)"
+                        try {
+                            New-Item -ItemType HardLink -Path $target -Target (Join-Path $BinDir $row.output_name) -Force | Out-Null
+                        } catch {
+                            Copy-Item (Join-Path $BinDir $row.output_name) $target -Force
+                        }
                     }
                 }
             }
@@ -81,13 +96,19 @@ try {
         }
         & $out --version | Out-Null
         if ($row.package -like "multicall-*") {
-            foreach ($name in ($manifest | Where-Object { $_.provider -eq $row.tool } | ForEach-Object { $_.name })) {
-                & (Join-Path $BinDir "$name.exe") --version *> $null
-                # 不依赖退出码为 0（uutils diffutils 不实现 --version）；只要求"能启动"：
-                # PowerShell 找不到可执行文件会抛 CommandNotFoundException，上面那行会直接终止。
+            foreach ($name in ($manifest | Where-Object {
+                $_.provider -eq $row.tool -and ($_.platform -eq "all" -or $_.platform -eq $Platform)
+            } | ForEach-Object { $_.name })) {
+                $exe = Join-Path $BinDir "$name.exe"
+                if (-not (Test-Path $exe)) { throw "缺产物：$exe" }
+                # 只要求"能启动"：不依赖退出码（uutils diffutils 不实现 --version）。
+                & $exe --version *> $null
             }
-        } elseif ($LASTEXITCODE -ne 0) {
-            throw "$($row.output_name) --version 退出码 $LASTEXITCODE"
+        } else {
+            $out = Join-Path $BinDir $row.output_name
+            if (-not (Test-Path $out)) { throw "缺产物：$out" }
+            & $out --version *> $null
+            if ($LASTEXITCODE -ne 0) { throw "$($row.output_name) --version 退出码 $LASTEXITCODE" }
         }
     }
 }
