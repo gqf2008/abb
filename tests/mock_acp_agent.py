@@ -71,13 +71,18 @@ for line in sys.stdin:
         # notifications/resources/updated 后的上报）。用途：验证 ABB 在回合内读到它、
         # 落成同一会话的一条入站消息（steer/下一回合），而不是丢掉。
         if os.environ.get("MOCK_RESOURCE_UPDATE"):
-            record({"event": "resource_notify_sent", "sessionId": sid})
-            send({"jsonrpc": "2.0", "method": "_abb/unstable/resource/updated", "params": {
-                "sessionId": sid,
-                "server": os.environ.get("MOCK_RESOURCE_SERVER", "mockmcp"),
-                "uri": os.environ.get("MOCK_RESOURCE_URI", "mock://res"),
-                "text": os.environ["MOCK_RESOURCE_UPDATE"],
-            }})
+            # `MOCK_RESOURCE_BURST=N`：同一回合内连发 N 条（内容各异，故不会被内容哈希去重）——
+            # 用来验证 ABB 侧的 `(channel,server,uri)` 节流确实把窗口内的后续更新丢掉。
+            burst = int(os.environ.get("MOCK_RESOURCE_BURST", "1") or "1")
+            for i in range(burst):
+                text = os.environ["MOCK_RESOURCE_UPDATE"] + (f"#{i}" if burst > 1 else "")
+                record({"event": "resource_notify_sent", "sessionId": sid, "text": text})
+                send({"jsonrpc": "2.0", "method": "_abb/unstable/resource/updated", "params": {
+                    "sessionId": sid,
+                    "server": os.environ.get("MOCK_RESOURCE_SERVER", "mockmcp"),
+                    "uri": os.environ.get("MOCK_RESOURCE_URI", "mock://res"),
+                    "text": text,
+                }})
         if os.environ.get("MOCK_HANG_PROMPT"):
             # P3.1 oneshot Timeout 路径：只记录不应答（session/cancel 照收，
             # 排水宽限由 ABB 侧兜底）。

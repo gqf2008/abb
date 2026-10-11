@@ -286,6 +286,17 @@ fn reap_idle_agents(l: &mut Loop) {
     }
 }
 
+/// 资源事件的最小投递间隔（按 `(channel, server, uri)` 计）。
+///
+/// 为什么需要（card `abb-mcp-resource-throttle-20261011`，评审实测）：MCP 资源更新会**直接开一个回合**，
+/// 同内容靠 `(server,uri,text)` 哈希去重，而**内容一变化就是新回合**。若某 server 在每次工具调用后都更新
+/// 同一资源，就形成「回合 → 更新 → 回合」的自激循环（真实模型花费 + 刷屏）；评审在变异 run 里实测
+/// 63s 内 11890 条带标记 prompt，确认放大真实存在。
+///
+/// 取值 10s：IM 场景下"同一资源 10s 内的多次变化"合并成一次提醒几乎无损；低于 5s 则高频资源
+/// （日志/状态文件）仍能自激。阈值变更按 `RULE_阈值变更.md` 单独提交并附证据。
+const RESOURCE_EVENT_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 频道登记表（桥线程与主循环共用；ctx.channels 提示元数据同锁更新）。
 #[derive(Default)]
 struct Registry {
@@ -603,6 +614,10 @@ struct Loop {
     /// 发送端带 **agent 槽位**：执行层会话号是进程内的，必须连同 agent 身份一起上报，
     /// 否则多 agent 并发时归属会串（评审 F1）。
     resource_tx: mpsc::UnboundedSender<(usize, ResourceUpdate)>,
+    /// `(channel, server, uri)` → 上次投递时刻（节流用，见 [`RESOURCE_EVENT_MIN_INTERVAL`]）。
+    resource_last_sent: std::collections::HashMap<(Uuid, String, String), Instant>,
+    /// 节流窗口：生产 = [`RESOURCE_EVENT_MIN_INTERVAL`]；测试注入更短的值以免真等 10s。
+    resource_min_interval: Duration,
 }
 
 impl Loop {
@@ -630,6 +645,8 @@ impl Loop {
             registry: crate::runtime::pool::SessionRegistry::default(),
             resource_rx,
             resource_tx,
+            resource_last_sent: std::collections::HashMap::new(),
+            resource_min_interval: RESOURCE_EVENT_MIN_INTERVAL,
         };
         (l, steer_ack_rx)
     }
@@ -832,6 +849,16 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
 ///
 /// 刻意走与用户消息**完全相同**的入队路径（`Cmd::Message`）：去重、排队、steer、空闲墙、
 /// 交付全部由既有机制统一管——不新开第二条回合通道（这正是"交付单点归 abb"的落地方式）。
+/// 节流判定（纯函数，便于单测）：距上次投递不足 `min` 则**丢弃**。
+///
+/// 判定键是 `(channel, server, uri)`：同一资源的连续变化在窗口内合并；不同资源互不影响。
+fn resource_event_allowed(last: Option<Instant>, now: Instant, min: Duration) -> bool {
+    match last {
+        Some(prev) => now.saturating_duration_since(prev) >= min,
+        None => true,
+    }
+}
+
 fn handle_resource_update(
     l: &mut Loop,
     handle: &Arc<RuntimeHandle>,
@@ -847,6 +874,20 @@ fn handle_resource_update(
         );
         return;
     };
+    // 节流：同一 `(channel, server, uri)` 在窗口内只放行一次（内容变了也算同一资源，避免自激循环）。
+    let now = Instant::now();
+    let key = (channel_id, update.server.clone(), update.uri.clone());
+    let last = l.resource_last_sent.get(&key).copied();
+    if !resource_event_allowed(last, now, l.resource_min_interval) {
+        tracing::warn!(
+            "资源更新被节流丢弃（{}s 窗口内已投递过）：channel={channel_id} server={} uri={}",
+            l.resource_min_interval.as_secs_f32(),
+            update.server,
+            update.uri
+        );
+        return;
+    }
+    l.resource_last_sent.insert(key, now);
     let msg = resource_update_message(&update);
     tracing::info!(
         "资源更新入队：channel={channel_id} server={} uri={}（{} 字节）",
@@ -2144,6 +2185,229 @@ mod resource_event_tests {
         assert!(
             landed,
             "资源更新必须回到原会话并出现在 prompt 里；实际记录：\n{log}"
+        );
+        let _ = std::fs::remove_file(&rec);
+    }
+
+    /// 节流判定（纯函数）：首次放行；窗口内丢弃；窗口边界起放行。
+    #[test]
+    fn resource_event_allowed_window_semantics() {
+        let now = Instant::now();
+        let min = Duration::from_secs(10);
+        assert!(resource_event_allowed(None, now, min), "首次必须放行");
+        assert!(
+            !resource_event_allowed(Some(now - Duration::from_millis(9_999)), now, min),
+            "窗口内必须丢弃"
+        );
+        assert!(
+            resource_event_allowed(Some(now - min), now, min),
+            "到窗口即放行（边界含等号）"
+        );
+        assert!(resource_event_allowed(
+            Some(now - min - Duration::from_secs(1)),
+            now,
+            min
+        ));
+    }
+
+    /// **阳性对照**：窗口之外的更新仍要开回合（节流不得把真实变化误杀）。
+    ///
+    /// 用**真实窗口**（10s）跑：第一轮投递一条 → 等过一个窗口 → 第二条必须再投递一次。
+    /// 这条与 `resource_event_burst_collapses_to_one_turn` 一起钉住"窗口内合并、窗口外放行"。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn resource_event_allows_again_after_window() {
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let rec = std::env::temp_dir().join(format!("mock-throttle2-{}.jsonl", Uuid::new_v4()));
+        let stop = CancellationToken::new();
+        let handle = RuntimeHandle::new(
+            AgentConfig {
+                command: python3,
+                args: vec![script.display().to_string()],
+                extra_env: vec![
+                    ("PATH".to_string(), crate::deps::composed_path()),
+                    ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+                    ("MOCK_RESOURCE_UPDATE".to_string(), "slow-body".to_string()),
+                    ("MOCK_RESOURCE_SERVER".to_string(), "slowmcp".to_string()),
+                    ("MOCK_RESOURCE_URI".to_string(), "mock://slow".to_string()),
+                ],
+                backend: "mock".to_string(),
+                session_sandbox: None,
+            },
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            Vec::new(),
+        );
+        let run = tokio::spawn(run_loop(handle.clone()));
+        let cid = Uuid::new_v4();
+        handle.upsert_channel(
+            cid,
+            ChannelMeta {
+                bot_key: "throttle2".to_string(),
+                chat_id: "oc_throttle2".to_string(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: "throttle2".to_string(),
+                anchor_mid: None,
+                adhoc: true,
+                workspace: None,
+            },
+        );
+        let count_delivered = |rec: &std::path::Path| {
+            std::fs::read_to_string(rec)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("\"event\": \"prompt\"") && l.contains("[MCP 资源更新]"))
+                .count()
+        };
+        assert!(handle.push_message(
+            cid,
+            InboundMsg {
+                id_hex: "s-1".to_string(),
+                author_role: "user".to_string(),
+                text: "第一轮".to_string(),
+                ts_secs: 0,
+                prompt_tag: "test".to_string(),
+            },
+        ));
+        // 等第一条投递
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && count_delivered(&rec) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(count_delivered(&rec) >= 1, "第一轮必须先投递一条");
+        // 等过一个节流窗口（生产 10s）+ 余量，再推第二轮
+        tokio::time::sleep(RESOURCE_EVENT_MIN_INTERVAL + Duration::from_secs(1)).await;
+        assert!(handle.push_message(
+            cid,
+            InboundMsg {
+                id_hex: "s-2".to_string(),
+                author_role: "user".to_string(),
+                text: "第二轮".to_string(),
+                ts_secs: 0,
+                prompt_tag: "test".to_string(),
+            },
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && count_delivered(&rec) < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+        let delivered = count_delivered(&rec);
+        assert!(
+            delivered >= 2,
+            "窗口之外的更新必须再投递（否则节流把真实变化误杀）；实际 {delivered}"
+        );
+        let _ = std::fs::remove_file(&rec);
+    }
+
+    /// **节流的核心判据**（card `abb-mcp-resource-throttle-20261011`）：同一 `(channel,server,uri)`
+    /// 在一个回合内连发 3 条**内容各异**的更新 ⇒ 只有第一条开回合，其余 2 条被丢弃并留日志。
+    ///
+    /// 为什么判据落在假 agent 的记录上：它逐次 prompt 都记 `resource_notify_sent`（发了 3 条），
+    /// 而"带标记的 prompt 条数"只能来自 ABB 的投递 —— 只数这一侧才能区分"发得多"与"投得少"。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn resource_event_burst_collapses_to_one_turn() {
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let rec = std::env::temp_dir().join(format!("mock-throttle-{}.jsonl", Uuid::new_v4()));
+        let stop = CancellationToken::new();
+        let handle = RuntimeHandle::new(
+            AgentConfig {
+                command: python3,
+                args: vec![script.display().to_string()],
+                extra_env: vec![
+                    ("PATH".to_string(), crate::deps::composed_path()),
+                    ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+                    ("MOCK_RESOURCE_UPDATE".to_string(), "burst-body".to_string()),
+                    ("MOCK_RESOURCE_BURST".to_string(), "3".to_string()),
+                    (
+                        "MOCK_RESOURCE_SERVER".to_string(),
+                        "throttlemcp".to_string(),
+                    ),
+                    (
+                        "MOCK_RESOURCE_URI".to_string(),
+                        "mock://throttle".to_string(),
+                    ),
+                ],
+                backend: "mock".to_string(),
+                session_sandbox: None,
+            },
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            Vec::new(),
+        );
+        let run = tokio::spawn(run_loop(handle.clone()));
+        let cid = Uuid::new_v4();
+        handle.upsert_channel(
+            cid,
+            ChannelMeta {
+                bot_key: "throttle".to_string(),
+                chat_id: "oc_throttle".to_string(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: "throttle".to_string(),
+                anchor_mid: None,
+                adhoc: true,
+                workspace: None,
+            },
+        );
+        assert!(handle.push_message(
+            cid,
+            InboundMsg {
+                id_hex: "t-1".to_string(),
+                author_role: "user".to_string(),
+                text: "跑一轮".to_string(),
+                ts_secs: 0,
+                prompt_tag: "test".to_string(),
+            },
+        ));
+        // 等 3 条通知都发出去（假 agent 侧记录），再给 ABB 一点投递时间
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut sent = 0usize;
+        while Instant::now() < deadline {
+            let log = std::fs::read_to_string(&rec).unwrap_or_default();
+            sent = log.matches("resource_notify_sent").count();
+            if sent >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // 注意：夹具是"每个 prompt 都发一轮 burst"，而本轮至少有两个 prompt（用户消息 + 资源事件回合）
+        // ⇒ sent 会是 3 的倍数。这里只要求"至少发过一轮"，真正的判据是下面 delivered==1。
+        assert!(sent >= 3, "夹具应至少发出 3 条资源更新，实际 {sent}");
+        tokio::time::sleep(Duration::from_millis(800)).await; // 让被放行的那条完成入队/开回合
+        stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+        let log = std::fs::read_to_string(&rec).unwrap_or_default();
+        let delivered = log
+            .lines()
+            .filter(|l| l.contains("\"event\": \"prompt\"") && l.contains("[MCP 资源更新]"))
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "3 条同资源更新在节流窗口内只应投递 1 条；实际 {delivered}。记录：\n{log}"
         );
         let _ = std::fs::remove_file(&rec);
     }
