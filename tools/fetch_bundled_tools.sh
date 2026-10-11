@@ -169,13 +169,18 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       exit 1
     fi
   fi
-  # 注意（第二次踩到同一个坑）：本脚本是 zsh，**标量参数不词分割**——
-  # `check_names="$(awk …)"; for name in $check_names` 只会迭代一次（整个多行串当一个名字）。
-  # 所以这里按类型直接内联命令替换。
-  for name in $(case "$package" in
-      multicall-*) awk -F'\t' -v p="$tool" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv ;;
-      *) echo "$output_name" ;;
-    esac); do
+  # 词分割/解析双坑（两次踩到，第三次改写法）：
+  #  ① zsh **不对标量参数词分割**（`for x in $var` 只迭代一次），而 bash 会 —— 两边行为不同；
+  #  ② `$(case … *) … ;; esac)` 在 **bash** 里会把模式后的 `)` 当成 `$( )` 的收尾 ⇒ 语法错
+  #     （评审 F4 实测：`bash tools/fetch_bundled_tools.sh` 起不来，而 release.yml 正是用 bash 调它）。
+  # 所以统一改成"把名字写进临时文件 + while read"，两种 shell 行为一致。
+  if [ "$package" != "${package#multicall-}" ]; then
+    awk -F'\t' -v p="$tool" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' \
+      tools/bundled-cli-tools.tsv > "$tmp/check-names.txt"
+  else
+    echo "$output_name" > "$tmp/check-names.txt"
+  fi
+  while IFS= read -r name; do
     # 非多调包的 output_name 可能**已含** .exe（rg.exe/coreutils.exe…）⇒ 不能无脑再拼后缀
     #（Windows 干跑实测：拼出 rg.exe.exe 报"缺产物"）。
     case "$name" in
@@ -196,7 +201,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
     if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
       echo "$name 不可执行（rc=$rc）" >&2; exit 1
     fi
-  done
+  done < "$tmp/check-names.txt"
 done < tools/tool-lock.tsv
 
 # 计数 = lock 里该平台的**包**数（多调包一个包提供多个工具名，故不再与工具名数相等）。
