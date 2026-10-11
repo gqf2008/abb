@@ -5,8 +5,10 @@
 # 为什么每条 command 都套一层 `sh -c '...'`：walgit 本地 runner 在 Windows 上经 `cmd /C`
 # 执行任务，而 cmd **不认** POSIX 语义——abb-win 实测 `cmd /C tools/check_test_isolation.sh`
 # 会**记 exit 0 且日志为空**（"签假绿"：没有任何断言跑过却显示通过），这是最危险的失败形态。
-# 套 `sh -c` 后：POSIX 主机照常工作（外层 sh 再套一层 sh）；cmd 主机上 `sh` 不存在或收到
-# 带单引号的畸形 argv ⇒ **立刻非零退出**，把"假绿"变成"响亮的红"。
+# 套 `sh -c` 后：POSIX 主机照常工作（外层 sh 再套一层 sh，实机验证过嵌套引号可用）；cmd 主机上
+# `sh` 不存在**或**收到带单引号的畸形 argv ⇒ **立刻非零退出**，把"假绿"变成"响亮的红"。
+# ⚠️ cmd 侧这条结论**未经 Windows 实机验证**（当前仓库无 Windows 主机）= 机制推断；将来若启用
+# Windows runner，必须先用 `walgit ci validate` + 实跑一条任务确认它是"红"而不是"绿"。
 # 结论：本文件的任务**只能**在 POSIX 主机（macOS/Linux）上跑；Windows 的门禁覆盖走
 # `.github/workflows/ci.yml` 的 windows job（clippy -D warnings + 全量 cargo test + CRT 断言）。
 version = 1
