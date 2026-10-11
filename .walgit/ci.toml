@@ -1,5 +1,16 @@
 # walgit decentralized CI task declaration. The runner executes these commands
 # from the commit under test; local GitHub Actions remain the release mirror.
+#
+# ── 这些任务假定 **POSIX shell**（卡 `abb-ci-coverage-win-20261007`）────────────────────────
+# 为什么每条 command 都套一层 `sh -c '...'`：walgit 本地 runner 在 Windows 上经 `cmd /C`
+# 执行任务，而 cmd **不认** POSIX 语义——abb-win 实测 `cmd /C tools/check_test_isolation.sh`
+# 会**记 exit 0 且日志为空**（"签假绿"：没有任何断言跑过却显示通过），这是最危险的失败形态。
+# 套 `sh -c` 后：POSIX 主机照常工作（外层 sh 再套一层 sh，实机验证过嵌套引号可用）；cmd 主机上
+# `sh` 不存在**或**收到带单引号的畸形 argv ⇒ **立刻非零退出**，把"假绿"变成"响亮的红"。
+# ⚠️ cmd 侧这条结论**未经 Windows 实机验证**（当前仓库无 Windows 主机）= 机制推断；将来若启用
+# Windows runner，必须先用 `walgit ci validate` + 实跑一条任务确认它是"红"而不是"绿"。
+# 结论：本文件的任务**只能**在 POSIX 主机（macOS/Linux）上跑；Windows 的门禁覆盖走
+# `.github/workflows/ci.yml` 的 windows job（clippy -D warnings + 全量 cargo test + CRT 断言）。
 version = 1
 
 claim_ttl = "75m"
@@ -9,14 +20,14 @@ max_attempts = 1
 [[task]]
 name = "fmt"
 refs = ["refs/heads/*", "refs/tags/v*"]
-command = "cargo fmt --check"
+command = "sh -c 'cargo fmt --check'"
 timeout = "10m"
 env_allow = ["CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER", "CARGO_TARGET_DIR"]
 
 [[task]]
 name = "clippy"
 refs = ["refs/heads/*", "refs/tags/v*"]
-command = "cargo clippy --all-targets -- -D warnings"
+command = "sh -c 'cargo clippy --all-targets -- -D warnings'"
 timeout = "30m"
 env_allow = [
   "CARGO_HOME",
@@ -29,7 +40,7 @@ env_allow = [
 [[task]]
 name = "build"
 refs = ["refs/heads/*", "refs/tags/v*"]
-command = "cargo build --locked"
+command = "sh -c 'cargo build --locked'"
 timeout = "30m"
 env_allow = [
   "CARGO_HOME",
@@ -42,7 +53,7 @@ env_allow = [
 [[task]]
 name = "test"
 refs = ["refs/heads/*", "refs/tags/v*"]
-command = "tools/check_test_isolation.sh"
+command = "sh -c 'tools/check_test_isolation.sh'"
 timeout = "45m"
 env_allow = [
   "CARGO_HOME",
@@ -59,7 +70,7 @@ env_allow = [
 [[task]]
 name = "abb-agent-lint"
 refs = ["refs/heads/*", "refs/tags/v*"]
-command = "cargo fmt --manifest-path crates/abb-agent/Cargo.toml -- --check && cargo clippy --manifest-path crates/abb-agent/Cargo.toml --all-targets --locked -- -D warnings && cargo test --manifest-path crates/abb-agent/Cargo.toml --locked"
+command = "sh -c 'cargo fmt --manifest-path crates/abb-agent/Cargo.toml -- --check && cargo clippy --manifest-path crates/abb-agent/Cargo.toml --all-targets --locked -- -D warnings && cargo test --manifest-path crates/abb-agent/Cargo.toml --locked'"
 timeout = "45m"
 env_allow = [
   "CARGO_HOME",
