@@ -70,11 +70,27 @@ entire runtime directory; empty means default); per-bot workspaces under
 ## Build, Test, and Development Commands
 
 Every cargo command below **must** carry the build-intermediate env prefix (user policy:
-build output never lands on the 228 GiB boot volume):
+build output never lands on the 228 GiB boot volume; on Windows the same rule applies to the
+checkout — there `/Volumes` does not exist and intermediates were landing in `target/`):
 
 ```sh
+# macOS
 export TMPDIR=/Volumes/DataExt/tmp
 export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
+
+# Windows（Git Bash；E: 是数据卷）
+export TMPDIR=/e/tmp
+export CARGO_TARGET_DIR=/e/tmp/abb-target
+```
+
+`tools/gates.sh` sets these two for the current platform and then runs the four gates below;
+it **refuses a base inside the checkout** (`ABB_BUILD_TMP` overrides the platform default,
+`--print-env` shows what it resolved, `ABB_GATES_OS=darwin` reproduces the macOS values on any
+host). Prefer it over typing the exports by hand — that is what keeps the policy machine-checkable:
+
+```sh
+bash tools/gates.sh            # 四条门禁，中间产物外置
+bash tools/gates.sh --print-env
 ```
 
 - `cargo build` — debug build.
@@ -88,7 +104,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 - `scripts/build.sh` — build the release macOS bundle into `~/Applications/ABB.app`.
 - `scripts/sign.sh` — re-sign with the `agent-bridge-dev` certificate so TCC privacy grants survive rebuilds.
 
-With the two exports above in the shell, the four gate commands are verbatim:
+With the two exports above in the shell（或直接 `bash tools/gates.sh`）, the four gate commands are verbatim:
 
 ```sh
 cargo fmt --check
