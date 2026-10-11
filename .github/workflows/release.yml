@@ -95,6 +95,8 @@ jobs:
           # 随包工具：版本/URL/SHA256 锁在 tools/tool-lock.tsv；不含 git/bun/sed/find。
           bash tools/fetch_bundled_tools.sh --platform macos-arm64 \
             --dest ABB.app/Contents/Resources/tools
+          bash tools/check_bundled_tools.sh --platform macos-arm64 \
+            --bin-dir ABB.app/Contents/Resources/tools/bin
           # 2026-09-22：GitHub runner 出网到 Apple 时间戳服务器偶发挂起，codesign
           # --timestamp 无界重试（实测挂 96 分钟烧穿 job；诊断确认：坏宿主机连接被拒
           # 后 codesign 内部无界重试，约半数宿主机受影响）。给每次签名加 180s 看门狗
@@ -237,6 +239,11 @@ jobs:
       - name: Fetch bundled tools
         shell: pwsh
         run: ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist
+
+      # 随包工具齐不齐由**同一份** checker 断言（多调包一个包暴露多个名字，只看包产物查不出来）。
+      - name: Check bundled CLI tools (windows-x64)
+        shell: bash
+        run: bash tools/check_bundled_tools.sh --platform windows-x64 --bin-dir tools-dist/bin
 
       - name: Install Inno Setup
         shell: pwsh

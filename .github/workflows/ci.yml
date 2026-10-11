@@ -90,6 +90,15 @@ jobs:
       - name: test 编译（abb-agent，Windows，--no-run）
         run: cargo test --locked --manifest-path crates/abb-agent/Cargo.toml --no-run
 
+      # 随包 CLI 工具在 **Windows** 上真的能取到并落地（owner 2026-10-11 要求这批工具支持 Windows）：
+      # 取件 + 同一份 checker 断言"包产物 + 多调包暴露的名字"都在。本机（macOS）无法跑 ps1，
+      # 这条 CI 步骤是 Windows 侧唯一的机器判据。
+      - name: 随包 CLI 工具取件 + 校验（Windows）
+        shell: pwsh
+        run: |
+          ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist
+          bash tools/check_bundled_tools.sh --platform windows-x64 --bin-dir tools-dist/bin
+
   test:
     runs-on: windows-latest
     steps:
