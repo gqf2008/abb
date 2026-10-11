@@ -202,6 +202,19 @@ fn parse_abb_sandbox_modes(result: &serde_json::Value) -> Option<Vec<String>> {
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
 /// same client via repeated calls to [`session_new`](AcpClient::session_new).
+/// agent 主动上报的一次资源更新（`_abb/unstable/resource/updated`）。
+///
+/// 执行层（abb-agent）在收到 MCP `notifications/resources/updated` 并 `resources/read` 之后
+/// 发来；ABB 只负责把它变成该会话的一条入站消息（**不自带回合语义**——回合由既有的频道
+/// 队列/去重/空闲墙统一管）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceUpdate {
+    pub session_id: String,
+    pub server: String,
+    pub uri: String,
+    pub text: String,
+}
+
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     /// 进程内双工传输（测试 [`Self::connect`]）时为 `None`——无进程可杀，
@@ -224,6 +237,8 @@ pub struct AcpClient {
     /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
     /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
     reader: FramedRead<Box<dyn tokio::io::AsyncRead + Unpin + Send>, LinesCodec>,
+    /// 资源更新上报通道（可选）：未接时只记日志（事件路径是增值能力，不拖垮协议层）。
+    resource_events: Option<tokio::sync::mpsc::UnboundedSender<ResourceUpdate>>,
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
@@ -411,6 +426,11 @@ impl AcpClient {
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
     ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
+    /// 接上资源更新通道（会话级事件路径）。未接时协议层只记日志。
+    pub fn set_resource_sink(&mut self, tx: tokio::sync::mpsc::UnboundedSender<ResourceUpdate>) {
+        self.resource_events = Some(tx);
+    }
+
     pub async fn spawn(
         command: &str,
         args: &[String],
@@ -513,6 +533,7 @@ impl AcpClient {
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
+            resource_events: None,
             pending_permission_id: None,
             permission_responded: false,
             last_prompt_id: None,
@@ -1198,6 +1219,9 @@ impl AcpClient {
                     "session/request_permission" => {
                         self.handle_permission_request(&msg).await?;
                     }
+                    "_abb/unstable/resource/updated" => {
+                        self.handle_resource_update(&msg);
+                    }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
                         // Silence would cause the agent to hang waiting for a response.
@@ -1640,6 +1664,9 @@ impl AcpClient {
                             "session/request_permission" => {
                                 self.handle_permission_request(&msg).await?;
                             }
+                            "_abb/unstable/resource/updated" => {
+                                self.handle_resource_update(&msg);
+                            }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
                                 // Silence would cause the agent to hang waiting for a response.
@@ -1677,6 +1704,38 @@ impl AcpClient {
     /// correct run. Agents that never emit it (claude-agent-acp, codex-acp)
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
+    /// 处理 agent 上报的资源更新（`_abb/unstable/resource/updated`）。
+    ///
+    /// 只做"收下并转交"：字段缺失记 warn 丢弃；没有 sink（会话级事件路径未接）也记 warn——
+    /// 静默丢事件会让"订阅了却没反应"变成无法定位的哑故障。
+    fn handle_resource_update(&self, msg: &serde_json::Value) {
+        let params = &msg["params"];
+        let (Some(session_id), Some(server), Some(uri)) = (
+            params["sessionId"].as_str(),
+            params["server"].as_str(),
+            params["uri"].as_str(),
+        ) else {
+            tracing::warn!("资源更新缺字段（sessionId/server/uri），已忽略：{msg}");
+            return;
+        };
+        let update = ResourceUpdate {
+            session_id: session_id.to_string(),
+            server: server.to_string(),
+            uri: uri.to_string(),
+            text: params["text"].as_str().unwrap_or_default().to_string(),
+        };
+        match &self.resource_events {
+            Some(tx) => {
+                if tx.send(update).is_err() {
+                    tracing::warn!("资源更新通道已关闭（会话已结束？）：server={server} uri={uri}");
+                }
+            }
+            None => {
+                tracing::warn!("收到资源更新但没有接入事件通道，已忽略：server={server} uri={uri}")
+            }
+        }
+    }
+
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
         let update = &msg["params"]["update"];
         let update_type = update

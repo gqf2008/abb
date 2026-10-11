@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, McpServer};
+use crate::runtime::acp::{AcpClient, AcpError, McpServer, ResourceUpdate};
 use crate::runtime::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
@@ -587,6 +587,11 @@ struct Loop {
     /// 而结局可能是 Cancelled / CancelDrainTimeout / AgentExited / Error / Timeout
     /// 中的任意一种——所以不能只在 Cancelled 分支处理，必须在该轮真实结局处统一消费。
     cancel_requested: HashSet<Uuid>,
+    /// agent 主动上报的事件（MCP 资源更新）：接收端在本循环 select 里，发送端按槽位挂到
+    /// 该槽位的 `AcpClient`（每次新拉起都重挂，见 `handle_spawn_outcome`）。
+    resource_rx: mpsc::UnboundedReceiver<ResourceUpdate>,
+    /// 同上：留给"给新拉起的 agent 挂 sink"用的发送端克隆。
+    resource_tx: mpsc::UnboundedSender<ResourceUpdate>,
 }
 
 impl Loop {
@@ -597,6 +602,9 @@ impl Loop {
         let queue =
             EventQueue::new(DedupMode::Queue).with_in_flight_deadline(MAX_TURN_DURATION.as_secs());
         let (steer_ack_tx, steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
+        // agent 主动上报的事件通道（MCP 资源更新）：接收端进本循环 select，发送端挂到各槽位的 AcpClient。
+        let (resource_tx, resource_rx) =
+            mpsc::unbounded_channel::<crate::runtime::acp::ResourceUpdate>();
         let l = Self {
             ctx,
             pool,
@@ -608,6 +616,8 @@ impl Loop {
             idle_since: std::collections::HashMap::new(),
             last_activity: Instant::now(),
             cancel_requested: HashSet::new(),
+            resource_rx,
+            resource_tx,
         };
         (l, steer_ack_rx)
     }
@@ -647,6 +657,7 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
                 r = result_rx.recv() => r.map(|pr| Evt::Result(Box::new(pr))),
                 j = join_set.join_next(), if !join_set.is_empty() => j.map(Evt::Panic),                a = steer_ack_rx.recv() => a.map(Evt::SteerAck),
                 life = life_rx.recv() => life.map(Evt::Life),
+                r = l.resource_rx.recv() => r.map(Evt::Resource),
             }
         };
         let Some(evt) = evt else {
@@ -659,6 +670,7 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
             Evt::Panic(join_error) => recover_panicked_agent(&mut l, &handle, join_error),
             Evt::SteerAck(ack) => handle_steer_ack(&mut l, ack),
             Evt::Life(outcome) => handle_spawn_outcome(&mut l, &handle, outcome),
+            Evt::Resource(update) => handle_resource_update(&mut l, &handle, update),
             Evt::Reap => reap_idle_agents(&mut l),
         }
         dispatch_pending(&mut l);
@@ -678,6 +690,7 @@ enum Evt {
     Life(SpawnOutcome),
     /// 回收巡检节拍：把闲置的额外 agent 收掉（保留 0 号热实例）。
     Reap,
+    Resource(ResourceUpdate),
 }
 
 // ── Cmd 处理 ─────────────────────────────────────────────────────────────────
@@ -803,6 +816,54 @@ fn handle_cmd(l: &mut Loop, handle: &RuntimeHandle, cmd: Cmd) {
 
 // ── agent 生命周期 ───────────────────────────────────────────────────────────
 
+/// agent 上报的资源更新 → 该会话频道队列里的**一条入站消息**。
+///
+/// 刻意走与用户消息**完全相同**的入队路径（`Cmd::Message`）：去重、排队、steer、空闲墙、
+/// 交付全部由既有机制统一管——不新开第二条回合通道（这正是"交付单点归 abb"的落地方式）。
+fn handle_resource_update(l: &mut Loop, handle: &Arc<RuntimeHandle>, update: ResourceUpdate) {
+    let Some(channel_id) = l.pool.channel_for_session(&update.session_id) else {
+        tracing::warn!(
+            "资源更新找不到对应频道（可能会话已失效）：session={} server={} uri={}",
+            update.session_id,
+            update.server,
+            update.uri
+        );
+        return;
+    };
+    let msg = resource_update_message(&update);
+    tracing::info!(
+        "资源更新入队：channel={channel_id} server={} uri={}（{} 字节）",
+        update.server,
+        update.uri,
+        update.text.len()
+    );
+    handle_cmd(l, handle, Cmd::Message { channel_id, msg });
+}
+
+/// 资源更新 → `InboundMsg`（纯函数，便于单测钉形状）。
+///
+/// - `author_role = "event"`：事件块里如实标注"不是人说的"；
+/// - `prompt_tag = "mcp:resource"`：日志与排障可追；
+/// - `id_hex` = `(server, uri, text)` 的内容哈希：**同一条通知重复到达会被队列去重**，
+///   内容变了则是新消息（避免把真正的变化当重复丢掉）。
+fn resource_update_message(update: &ResourceUpdate) -> InboundMsg {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    update.server.hash(&mut hasher);
+    update.uri.hash(&mut hasher);
+    update.text.hash(&mut hasher);
+    InboundMsg {
+        id_hex: format!("mcp-{:016x}", hasher.finish()),
+        author_role: "event".to_string(),
+        text: format!(
+            "[MCP 资源更新] server={} uri={}\n\n{}",
+            update.server, update.uri, update.text
+        ),
+        ts_secs: chrono::Utc::now().timestamp(),
+        prompt_tag: "mcp:resource".to_string(),
+    }
+}
+
 fn handle_spawn_outcome(l: &mut Loop, handle: &RuntimeHandle, outcome: SpawnOutcome) {
     let index = match &outcome {
         SpawnOutcome::Ok { index, .. } | SpawnOutcome::Err { index, .. } => *index,
@@ -824,6 +885,9 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &RuntimeHandle, outcome: SpawnOutc
                 Ordering::Relaxed,
             );
             l.idle_since.insert(agent.index, Instant::now());
+            let mut agent = agent;
+            // 事件路径随槽位走：新拉起的 agent 必须重挂 sink（旧进程的 AcpClient 已 drop）。
+            agent.acp.set_resource_sink(l.resource_tx.clone());
             l.pool.return_agent(agent);
             // 起来了就清掉旧失败原因：否则用户会拿着上一次的旧原因排查现在的故障。
             handle.set_last_start_error(None);
@@ -1896,6 +1960,113 @@ fn redact_skill_paths(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod resource_event_tests {
+    use super::*;
+
+    fn update(text: &str) -> ResourceUpdate {
+        ResourceUpdate {
+            session_id: "abb-1".to_string(),
+            server: "notes".to_string(),
+            uri: "file:///n.md".to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    /// 事件消息的形状 + 去重键：来源如实标注；同内容同 id（去重）、内容/uri 变了就是新消息。
+    #[test]
+    fn resource_update_message_shape_and_dedup_key() {
+        let m = resource_update_message(&update("正文"));
+        assert_eq!(m.author_role, "event", "事件不是人说的，必须如实标注");
+        assert_eq!(m.prompt_tag, "mcp:resource");
+        assert!(m.text.contains("server=notes"), "正文要带来源：{}", m.text);
+        assert!(
+            m.text.contains("uri=file:///n.md"),
+            "正文要带 uri：{}",
+            m.text
+        );
+        assert!(m.text.ends_with("正文"));
+
+        assert_eq!(
+            m.id_hex,
+            resource_update_message(&update("正文")).id_hex,
+            "同内容 → 同 id（队列据此去重）"
+        );
+        assert_ne!(
+            m.id_hex,
+            resource_update_message(&update("内容变了")).id_hex,
+            "内容变了 → 新 id（真变化不能被当重复丢掉）"
+        );
+        assert_ne!(
+            m.id_hex,
+            resource_update_message(&ResourceUpdate {
+                uri: "file:///other.md".to_string(),
+                ..update("正文")
+            })
+            .id_hex,
+            "uri 变了 → 新 id"
+        );
+    }
+
+    /// 事件消息必须能像用户消息一样驱动一个完整回合（走同一条入队路径 ⇒ 语义由构造保证一致）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn resource_event_message_runs_a_turn() {
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let stop = CancellationToken::new();
+        let handle = RuntimeHandle::new(
+            AgentConfig {
+                command: python3,
+                args: vec![script.display().to_string()],
+                extra_env: vec![("PATH".to_string(), crate::deps::composed_path())],
+                backend: "mock".to_string(),
+                session_sandbox: None,
+            },
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            Vec::new(),
+        );
+        let run = tokio::spawn(run_loop(handle.clone()));
+        let cid = Uuid::new_v4();
+        handle.upsert_channel(
+            cid,
+            ChannelMeta {
+                bot_key: "res".to_string(),
+                chat_id: "oc_res".to_string(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: "event".to_string(),
+                anchor_mid: None,
+                adhoc: true,
+                workspace: None,
+            },
+        );
+        let outcome = handle
+            .wait_turn_outcome(
+                cid,
+                resource_update_message(&update("资源内容")),
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        stop.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
+        assert!(
+            matches!(outcome, SyncTurnOutcome::Ok(_)),
+            "事件回合应收尾 Ok，实际 {outcome:?}"
+        );
+    }
 }
 
 #[cfg(test)]

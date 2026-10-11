@@ -552,6 +552,17 @@ impl AgentPool {
 
     /// Whether any idle agent already has a session for `channel_id`.
     /// Used to compute `affinity_hit` before calling `try_claim`.
+    /// 反查：某个 agent 会话 id 属于哪个频道。
+    ///
+    /// 用途：agent 主动上报的事件（如 MCP 资源更新）只带 `sessionId`，要落成"哪个会话的一条
+    /// 入站消息"就得反查。会话表很小（每 bot 几个频道），线性扫可接受。
+    pub fn channel_for_session(&self, session_id: &str) -> Option<Uuid> {
+        self.agents
+            .iter()
+            .flatten()
+            .find_map(|agent| channel_for_session_in(&agent.state.sessions, session_id))
+    }
+
     pub fn has_session_for(&self, channel_id: Uuid) -> bool {
         self.agents.iter().any(|slot| {
             slot.as_ref()
@@ -738,6 +749,18 @@ struct NewSessionChannelContext<'a> {
     name: Option<&'a str>,
     /// P0.B：频道工作目录（session/new cwd + <workspace> 段的真值来源）。
     workspace: Option<&'a str>,
+}
+
+/// 反查的纯函数部分（`(channel_id, session_id)` 表里找 session）：便于单测钉逻辑，
+/// 不必构造整个 `OwnedAgent`。
+fn channel_for_session_in(
+    sessions: &std::collections::HashMap<Uuid, String>,
+    session_id: &str,
+) -> Option<Uuid> {
+    sessions
+        .iter()
+        .find(|(_, sid)| sid.as_str() == session_id)
+        .map(|(channel_id, _)| *channel_id)
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1721,6 +1744,34 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
         StopReason::Refusal => {
             tracing::warn!(target: "pool::prompt", "turn refused for {label}");
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_lookup_tests {
+    use super::*;
+
+    /// session → channel 反查：命中唯一；不存在的 session 返回 None（不得猜一个频道）。
+    #[test]
+    fn channel_for_session_finds_exact_match_only() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(a, "abb-1".to_string());
+        sessions.insert(b, "abb-2".to_string());
+
+        assert_eq!(channel_for_session_in(&sessions, "abb-2"), Some(b));
+        assert_eq!(channel_for_session_in(&sessions, "abb-1"), Some(a));
+        assert_eq!(
+            channel_for_session_in(&sessions, "abb-12"),
+            None,
+            "不得前缀匹配"
+        );
+        assert_eq!(channel_for_session_in(&sessions, ""), None);
+        assert_eq!(
+            channel_for_session_in(&std::collections::HashMap::new(), "abb-1"),
+            None
+        );
     }
 }
 
