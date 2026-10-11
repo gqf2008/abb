@@ -266,6 +266,12 @@ fn reap_idle_agents(l: &mut Loop) {
             continue;
         };
         l.idle_since.remove(&idx);
+        // 登记表同步清理：该槽位被回收后它的 (slot, sid) 条目不再有意义（评审 N1；
+        // 不清理不会串台——新会话登记会覆盖——但会永久留陈旧项）。
+        l.registry.forget(
+            idx,
+            agent.state.sessions.values().cloned().collect::<Vec<_>>(),
+        );
         reaped += 1;
         tokio::spawn(async move {
             let mut agent = agent;

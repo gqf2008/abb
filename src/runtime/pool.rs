@@ -251,6 +251,17 @@ impl SessionRegistry {
     }
 }
 
+/// 单频道失效时同步收窄登记表。
+///
+/// 用 `match` 而不是 `if let`：`PromptSource` 目前只有一个变体，`if let` 是**不可反驳模式**
+/// （clippy `irrefutable_let_patterns` 报 error；2026-10-11 独立评审 F1′ 实测）。
+/// 将来给 `PromptSource` 加变体时，这里的穷尽性检查会强制处理新情形。
+fn forget_source(registry: &SessionRegistry, agent_index: usize, source: &PromptSource) {
+    match source {
+        PromptSource::Channel(cid) => registry.forget_channel(agent_index, *cid),
+    }
+}
+
 pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
@@ -1273,9 +1284,7 @@ pub async fn run_prompt_task(
                     {
                         Ok(_) => {
                             // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                            if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                                registry.forget_channel(agent.index, *cid);
-                            }
+                            forget_source(&registry, agent.index, &source);
                             agent.state.invalidate(&source);
                         }
                         Err(AcpError::AgentExited) => {
@@ -1300,9 +1309,7 @@ pub async fn run_prompt_task(
                                 "cancel_with_cleanup failed during initial_message timeout: {e}"
                             );
                             // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                            if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                                registry.forget_channel(agent.index, *cid);
-                            }
+                            forget_source(&registry, agent.index, &source);
                             agent.state.invalidate(&source);
                         }
                     }
@@ -1346,9 +1353,7 @@ pub async fn run_prompt_task(
                         batch.channel_id
                     );
                     // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                    if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                        registry.forget_channel(agent.index, *cid);
-                    }
+                    forget_source(&registry, agent.index, &source);
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
@@ -1458,9 +1463,7 @@ pub async fn run_prompt_task(
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
                                 // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                                if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                                    registry.forget_channel(agent.index, *cid);
-                                }
+                                forget_source(&registry, agent.index, &source);
                                 agent.state.invalidate(&source);
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
@@ -1489,9 +1492,7 @@ pub async fn run_prompt_task(
                                     agent.state.invalidate_all();
                                 } else {
                                     // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                                    if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                                        registry.forget_channel(agent.index, *cid);
-                                    }
+                                    forget_source(&registry, agent.index, &source);
                                     agent.state.invalidate(&source);
                                 }
                                 send_prompt_result(
@@ -1582,9 +1583,7 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                    registry.forget_channel(agent.index, *cid);
-                }
+                forget_source(&registry, agent.index, &source);
                 agent.state.invalidate(&source);
             }
 
@@ -1664,9 +1663,7 @@ pub async fn run_prompt_task(
                         "cancel_with_cleanup error: {e} — invalidating session"
                     );
                     // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                    if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                        registry.forget_channel(agent.index, *cid);
-                    }
+                    forget_source(&registry, agent.index, &source);
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
@@ -1707,9 +1704,7 @@ pub async fn run_prompt_task(
             // don't invalidate it. Other errors may have corrupted state.
             if !matches!(e, AcpError::AgentError { .. }) {
                 // 登记表同步收窄（单频道失效）：否则陈旧 sid 会永久留在表里（评审 F1 附带项）。
-                if let crate::runtime::pool::PromptSource::Channel(cid) = &source {
-                    registry.forget_channel(agent.index, *cid);
-                }
+                forget_source(&registry, agent.index, &source);
                 agent.state.invalidate(&source);
             }
             send_prompt_result(

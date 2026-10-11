@@ -202,6 +202,41 @@ fn parse_abb_sandbox_modes(result: &serde_json::Value) -> Option<Vec<String>> {
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
 /// same client via repeated calls to [`session_new`](AcpClient::session_new).
+/// 把一条 `_abb/unstable/resource/updated` 载荷转成事件并投进 sink（无 sink 只记日志）。
+///
+/// 抽成自由函数是为了**可直测**：畸形载荷不得 panic；未接 sink 时走 warn 分支（fail-visible）。
+/// 静默丢事件会让"订阅了却没反应"变成无法定位的哑故障。
+fn dispatch_resource_update(
+    sink: &Option<tokio::sync::mpsc::UnboundedSender<ResourceUpdate>>,
+    msg: &serde_json::Value,
+) {
+    let params = &msg["params"];
+    let (Some(session_id), Some(server), Some(uri)) = (
+        params["sessionId"].as_str(),
+        params["server"].as_str(),
+        params["uri"].as_str(),
+    ) else {
+        tracing::warn!("资源更新缺字段（sessionId/server/uri），已忽略：{msg}");
+        return;
+    };
+    let update = ResourceUpdate {
+        session_id: session_id.to_string(),
+        server: server.to_string(),
+        uri: uri.to_string(),
+        text: params["text"].as_str().unwrap_or_default().to_string(),
+    };
+    match sink {
+        Some(tx) => {
+            if tx.send(update).is_err() {
+                tracing::warn!("资源更新通道已关闭（会话已结束？）：server={server} uri={uri}");
+            }
+        }
+        None => {
+            tracing::warn!("收到资源更新但没有接入事件通道，已忽略：server={server} uri={uri}")
+        }
+    }
+}
+
 /// agent 主动上报的一次资源更新（`_abb/unstable/resource/updated`）。
 ///
 /// 执行层（abb-agent）在收到 MCP `notifications/resources/updated` 并 `resources/read` 之后
@@ -1706,34 +1741,10 @@ impl AcpClient {
     /// needs no run id.
     /// 处理 agent 上报的资源更新（`_abb/unstable/resource/updated`）。
     ///
-    /// 只做"收下并转交"：字段缺失记 warn 丢弃；没有 sink（会话级事件路径未接）也记 warn——
-    /// 静默丢事件会让"订阅了却没反应"变成无法定位的哑故障。
+    /// 逻辑在自由函数 [`dispatch_resource_update`] 里（便于直测"畸形载荷 / 未接 sink"两条路径），
+    /// 这里只做委托。
     fn handle_resource_update(&self, msg: &serde_json::Value) {
-        let params = &msg["params"];
-        let (Some(session_id), Some(server), Some(uri)) = (
-            params["sessionId"].as_str(),
-            params["server"].as_str(),
-            params["uri"].as_str(),
-        ) else {
-            tracing::warn!("资源更新缺字段（sessionId/server/uri），已忽略：{msg}");
-            return;
-        };
-        let update = ResourceUpdate {
-            session_id: session_id.to_string(),
-            server: server.to_string(),
-            uri: uri.to_string(),
-            text: params["text"].as_str().unwrap_or_default().to_string(),
-        };
-        match &self.resource_events {
-            Some(tx) => {
-                if tx.send(update).is_err() {
-                    tracing::warn!("资源更新通道已关闭（会话已结束？）：server={server} uri={uri}");
-                }
-            }
-            None => {
-                tracing::warn!("收到资源更新但没有接入事件通道，已忽略：server={server} uri={uri}")
-            }
-        }
+        dispatch_resource_update(&self.resource_events, msg);
     }
 
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
@@ -2126,6 +2137,60 @@ fn kill_process_group(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) -> bool {
     false
+}
+
+#[cfg(test)]
+mod resource_update_tests {
+    use super::*;
+
+    fn payload(server: &str, uri: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"method": "_abb/unstable/resource/updated",
+            "params": {"sessionId": "abb-1", "server": server, "uri": uri, "text": text}})
+    }
+
+    /// 接了 sink：事件的四个字段**逐字**投进通道（这是 ABB 侧唯一的上报入口）。
+    #[test]
+    fn dispatch_forwards_fields_verbatim() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ResourceUpdate>();
+        dispatch_resource_update(&Some(tx), &payload("srv", "file:///a b", "正文"));
+        let got = rx.try_recv().expect("应有事件");
+        assert_eq!(got.session_id, "abb-1");
+        assert_eq!(got.server, "srv");
+        assert_eq!(got.uri, "file:///a b");
+        assert_eq!(got.text, "正文");
+    }
+
+    /// 未接 sink：不得 panic（走 warn 分支，fail-visible）。
+    #[test]
+    fn dispatch_without_sink_does_not_panic() {
+        dispatch_resource_update(&None, &payload("srv", "uri", "正文"));
+    }
+
+    /// 畸形载荷（缺 server/uri 等）：不得 panic、不得投递（字段检查挡下）。
+    #[test]
+    fn dispatch_malformed_payload_is_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ResourceUpdate>();
+        for bad in [
+            serde_json::json!({"params": {}}),
+            serde_json::json!({"params": {"sessionId": "abb-1"}}),
+            serde_json::json!({"params": {"server": "s", "uri": "u"}}),
+            serde_json::json!({}),
+        ] {
+            dispatch_resource_update(&Some(tx.clone()), &bad);
+        }
+        assert!(rx.try_recv().is_err(), "畸形载荷不得投递");
+    }
+
+    /// text 缺失时按空串处理（server/uri/sessionId 齐全即视为有效事件）。
+    #[test]
+    fn dispatch_missing_text_becomes_empty() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ResourceUpdate>();
+        dispatch_resource_update(
+            &Some(tx),
+            &serde_json::json!({"params": {"sessionId": "abb-1", "server": "s", "uri": "u"}}),
+        );
+        assert_eq!(rx.try_recv().expect("应有事件").text, "");
+    }
 }
 
 #[cfg(test)]
