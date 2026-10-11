@@ -2533,6 +2533,7 @@ mod legacy_files_guard_tests {
 ///
 /// 刻意用**精确相等**判定：只有恰好是 `<LOCALAPPDATA>\Programs\ABB` 才动手 —— 宁可漏删，
 /// 也绝不误删别人的卸载项（这是注册表删键，出错代价高）。
+#[cfg(target_os = "windows")] // 只被 retire_legacy_uninstall_keys（Windows）调用
 pub fn is_legacy_per_user_install(install_location: &str, local_appdata: &str) -> bool {
     if install_location.trim().is_empty() {
         return false;
@@ -2600,6 +2601,7 @@ mod legacy_uninstall_guard_tests {
     ///
     /// 判别力（审计 #12b）：把判定改成 `contains("ABB")` 之类 ⇒ 第二、三条断言红。
     #[test]
+    #[cfg(target_os = "windows")] // 被测函数只被 Windows 路径调用
     fn only_exact_legacy_dir_is_flagged() {
         let local = r"C:\Users\u\AppData\Local";
         assert!(crate::platform::is_legacy_per_user_install(
@@ -2628,6 +2630,7 @@ mod legacy_uninstall_guard_tests {
 ///
 /// 为什么需要它：2026-10-05 实测安装器 `[Run]` 拉起的实例**连 main() 都没到**（boot.log 无记录），
 /// 升级时那个一次性 .cmd 也可能静默放弃 ⇒ 必须有常驻自愈兜底，最坏 5 分钟内把托盘拉回来。
+#[cfg(target_os = "windows")] // 只被 ensure_running_task（Windows）调用
 pub fn ensure_tray_cmd(exe: &std::path::Path, log: &std::path::Path) -> String {
     let lines: [&str; 12] = [
         "@echo off",
@@ -2698,6 +2701,7 @@ mod ensure_tray_guard_tests {
     ///
     /// 判别力：把 `--service` 排除去掉 ⇒ 第一条断言红（2026-10-05 实测事故就是这个）。
     #[test]
+    #[cfg(target_os = "windows")] // 同上
     fn ensure_tray_cmd_is_precise_and_self_healing() {
         let s = crate::platform::ensure_tray_cmd(
             std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),

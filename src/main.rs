@@ -172,15 +172,18 @@ pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Re
 /// - `file_type == FILE_TYPE_CHAR`（控制台 / NUL 设备）⇒ 不可用：Windows 上 NUL 是
 ///   **有效句柄**，只看句柄真假会让「被 `Stdio::null()` 拉起」的进程把日志写进 NUL
 ///   而 attach 提前返回 ⇒ 日志全丢（2026-10-05 审计 #13）。
+#[cfg(target_os = "windows")] // 只被 attach_log_file（Windows）调用：cfg 对称（card abb-macos-clippy-gate-20261011）
 fn stdout_handle_usable(raw: isize, file_type: u32) -> bool {
     const FILE_TYPE_CHAR: u32 = 0x0002;
     raw != 0 && raw != -1 && file_type != FILE_TYPE_CHAR
 }
 
 /// 日志轮转上限（8 MiB）：超过就换成 `.1`，磁盘占用封在约 16 MiB。
+#[cfg(target_os = "windows")] // 只被 attach_log_file（Windows）使用：cfg 对称
 const LOG_ROTATE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 超上限是否需要轮转（纯函数）。`cap == 0` 视为关闭轮转。
+#[cfg(target_os = "windows")] // 只被 rotate_log_if_large → attach_log_file（Windows）调用
 fn rotation_needed(len: u64, cap: u64) -> bool {
     cap > 0 && len > cap
 }
@@ -190,6 +193,7 @@ fn rotation_needed(len: u64, cap: u64) -> bool {
 ///
 /// 为什么需要（2026-10-05 审计 #16）：本机 `bridge.out` 已 17.5MB / 78275 行、从不轮转
 /// （服务进程长期持有句柄，外部脚本也没法安全 rot）。
+#[cfg(target_os = "windows")] // 只被 attach_log_file（Windows）调用
 fn rotate_log_if_large(path: &std::path::Path, cap: u64) {
     let Ok(meta) = std::fs::metadata(path) else {
         return;
@@ -3059,7 +3063,10 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// 本模块只测 `LOG_ROTATE_CAP_BYTES` / `rotation_needed` / `rotate_log_if_large`，
+// 而三者只被 `attach_log_file`（`#[cfg(target_os = "windows")]`）调用 ⇒ 模块级 cfg 对称
+// （card abb-macos-clippy-gate-20261011）。
+#[cfg(all(test, target_os = "windows"))]
 mod log_rotation_tests {
     /// 轮转判据（纯函数）：恰好到上限不轮转；cap=0 视为关闭。
     ///
@@ -3093,7 +3100,8 @@ mod log_rotation_tests {
     }
 }
 
-#[cfg(test)]
+// 只测 `stdout_handle_usable`（只被 `attach_log_file`（Windows）调用）⇒ 模块级 cfg 对称。
+#[cfg(all(test, target_os = "windows"))]
 mod stdout_handle_guard_tests {
     /// NUL 句柄（FILE_TYPE_CHAR）不得被当成可用的日志目的地。
     ///

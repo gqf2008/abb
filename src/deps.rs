@@ -239,6 +239,7 @@ pub fn composed_path() -> String {
 /// 导致 macOS 构建报 `cannot find function split_path_value`（2026-10-05 发版实测）。
 ///
 /// **不做任何编码转换**：值本身已是 Unicode（见 `registry_string_value` 为何绕开控制台）。
+#[cfg(windows)] // 只被 windows_registry_paths 调用（同文件已有注释说明这条对称性）
 fn split_path_value(value: &str) -> Vec<String> {
     value
         .split(';')
@@ -1943,6 +1944,7 @@ mod registry_path_guard_tests {
     ///
     /// 判别力：改用 `from_utf8_lossy` 之类先解码再切的写法 ⇒ 中文目录会被毁成 U+FFFD，断言红。
     #[test]
+    #[cfg(windows)] // 被测函数 split_path_value 已按调用点 cfg 门控
     fn split_keeps_non_ascii_dirs_verbatim() {
         let v = crate::deps::split_path_value(r"C:\a;D:\软件\bin ; ;E:\b");
         assert_eq!(v.len(), 3, "空段要丢掉：{v:?}");

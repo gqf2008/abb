@@ -97,7 +97,9 @@ bash tools/gates.sh --print-env
 - `cargo run` — run the tray app; `cargo run -- --service` runs the headless daemon.
 - `cargo test` — run all unit tests (**do not** run this directly on a live machine: it
   writes the real `~/.agent-bridge`; use `tools/check_test_isolation.sh` instead).
-- `cargo clippy --all-targets -- -D warnings` — lint.
+- `cargo clippy --all-targets -- -D warnings` — lint（**macOS 与 Windows 两侧都可作门禁**：
+  平台门控死代码已按调用点 cfg 对称清掉，见 card `abb-macos-clippy-gate-20261011`；Windows 侧由
+  `ci.yml` 的 windows job 覆盖）。
 - `cargo fmt --check` — verify formatting.
 - `tools/check_test_isolation.sh` — the full-test gate (isolated HOME; never substitute
   a bare `cargo test`).
