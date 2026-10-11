@@ -94,7 +94,6 @@ try {
             }
             default { throw "不支持的 package 类型：$($row.package)（$($row.tool)）" }
         }
-        & $out --version | Out-Null
         if ($row.package -like "multicall-*") {
             foreach ($name in ($manifest | Where-Object {
                 $_.provider -eq $row.tool -and ($_.platform -eq "all" -or $_.platform -eq $Platform)
