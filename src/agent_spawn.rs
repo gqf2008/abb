@@ -116,7 +116,8 @@ pub fn assign_kill_on_close_job(_pid: u32) -> Option<KillOnCloseJob> {
     None
 }
 
-#[cfg(test)]
+// 本模块唯一用例是 `#[cfg(windows)]` 的 job 守卫测试 ⇒ 模块级 cfg 对称（否则 macOS 上 `use super::*` 空转）。
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

@@ -676,6 +676,7 @@ fn windows_silent_args() -> Vec<&'static str> {
 /// 这个脚本**、而安装器 `[Run]` 在静默安装下从没成功过 —— 也就是说每次升级都要用户白等
 /// 一分半，且整个恢复只押在这个固定睡眠上（睡醒时安装器还没装完就彻底没人管）。
 /// 现在改为「安装器一退出就立刻拉起」，把空窗从 90 秒压到十几秒，并保留硬上界。
+#[cfg(target_os = "windows")] // 只被 windows_install（Windows）调用
 pub(crate) fn post_update_relaunch_script(exe: &Path, log_path: &Path) -> String {
     format!(
         "@echo off\r\n\
@@ -780,6 +781,7 @@ mod tests {
     ///   - 删掉循环上界 ⇒ 变成无限等；
     ///   - 删掉留痕 ⇒ 下次再出问题又只能靠猜。
     #[test]
+    #[cfg(target_os = "windows")] // 被测函数只被 windows_install 调用
     fn post_update_relaunch_polls_fast_and_only_starts_when_installer_done() {
         let s = post_update_relaunch_script(
             Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
@@ -1003,8 +1005,14 @@ mod tests {
         assert_eq!(tag_from_location("").as_deref(), None);
     }
 
+    /// macOS 资产挑选：优先精确 `ABB-<版本>.dmg`，否则退后缀 `.dmg`，都没有则 None。
+    ///
+    /// 说明：本函数此前只有 `#[cfg(target_os = "macos")]` 而**丢了 `#[test]`**，于是在 macOS 上
+    /// 既是"从未运行"又是"dead code"（clippy 报 `pick_asset_macos is never used`）。本次把它恢复成
+    /// 真用例（card `abb-macos-clippy-gate-20261011`）。
     #[cfg(target_os = "macos")]
-    fn pick_asset_macos() {
+    #[test]
+    fn pick_asset_prefers_dmg_on_macos() {
         let names = vec![
             "ABB-2.15.0.dmg".to_string(),
             "ABB-Setup-2.15.0.exe".to_string(),
@@ -1051,6 +1059,7 @@ mod relaunch_watchdog_guard_tests {
     ///
     /// 判别力：把静默放弃（探到托盘直接 goto :done）改回去 ⇒ 第三条断言红。
     #[test]
+    #[cfg(target_os = "windows")] // 被测函数只被 windows_install 调用
     fn fallback_watchdog_logs_every_branch_and_debounces() {
         let s = crate::updater::post_update_relaunch_script(
             std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
@@ -1072,6 +1081,7 @@ mod tray_probe_guard_tests {
     /// 判活必须排除 `--service`（常驻服务不是托盘）：
     /// 否则兜底看门狗会误以为「托盘已在跑」而放弃拉起（2026-10-05 实测发现）。
     #[test]
+    #[cfg(target_os = "windows")] // 同上
     fn fallback_probe_excludes_service_only() {
         let s = crate::updater::post_update_relaunch_script(
             std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),

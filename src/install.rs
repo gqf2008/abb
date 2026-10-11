@@ -214,6 +214,7 @@ fn image_path(pid: u32) -> Option<String> {
 ///
 /// 抽成纯函数是为了能单测：这条路径踩过「把已经消失的进程当成停失败」的坑，
 /// 而它一旦被判成失败，会顺着 `svc_start` 把「启动服务」整个挡死（2026-10-05 事故）。
+#[cfg(not(unix))] // 只被 terminate_with_grace 的 #[cfg(not(unix))] 分支调用
 fn taskkill_reports_missing(taskkill_stderr: &str) -> bool {
     let s = taskkill_stderr.to_ascii_lowercase();
     s.contains("not found") || s.contains("不存在") || s.contains("没有找到")
@@ -630,6 +631,7 @@ mod loop_guard_tests {
     /// 升级后服务起不来的根因之一：`taskkill` 报「进程不存在」被判成停失败。
     /// 判别力：把 `taskkill_reports_missing` 改成恒 false，这条必红。
     #[test]
+    #[cfg(not(unix))] // 被测函数在 #[cfg(not(unix))] 分支里
     fn taskkill_missing_process_is_not_a_stop_failure() {
         assert!(taskkill_reports_missing(
             "ERROR: The process \"12012\" not found."
