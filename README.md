@@ -50,7 +50,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
 | 随包执行层 | 内置 `abb-agent`（**唯一**执行层：owner 与授权者会话同用，受限档由它自己实现并声明 `_meta.abbSandbox`），零安装；模型走 Anthropic 原生 / OpenAI 兼容供应商（设置里自助添加）。旧执行层及其 `config.buzz_agent_exe` 回滚开关已随 0685e66 删除 |
 | 模型供应商 | 设置 →「供应商」里可选并预置：`anthropic`（原生）、`openai-chat`（任意 OpenAI 兼容端点，含本地 Ollama / 自建网关）、`openai-responses`、`openrouter`（免填 `https://openrouter.ai/api/v1`）、`deepseek`（免填 `https://api.deepseek.com/v1`）；预置端点留空即用官方，填了以你填的为准（代理/网关） |
-| 内置开发工具 | 安装包随带固定版本 `rg` / `jq` / `uv` / `gh`，仅注入 agent 子进程 PATH；`git` / `bun` / `sed` / `find` 仍使用系统或用户环境 |
+| 内置开发工具 | 安装包随带固定版本 `rg` / `jq` / `uv` / `gh`，以及**常用 CLI 工具** `awk`（goawk）与 `tail` / `sleep` / `head` / `diff` / `cmp`（来自 uutils `coreutils` / `diffutils`，macOS 侧是多调二进制 + 硬链接、Windows 侧取每工具 exe），仅注入 agent 子进程 PATH；`git` / `bun` / `sed` / `find` 仍使用系统或用户环境。`ps`（macOS/Linux 宿主自带）、`watch`、`wget` 未随包，原因与替代见 `tools/README.md` |
 | 外部 MCP server | 每个 bot 可在 `config.json` 的 `bots[].mcp_servers` 里声明任意 **stdio MCP server**（`name` / `command` / `args` / `env`，形状校验：名字非空且唯一、command 非空），随 **owner（普通）会话**注入；ABB 只声明不解释语义——接入后干什么、要订阅什么资源由 agent 判断。授权者受限会话与内部 oneshot 任务**不注入**（外部 server 的工具面会绕过受限档沙箱）。留空 = 不接入 |
 | 多轮会话 | 每个 bot 独立记忆，不会串味；任务进行中发 `/cancel`（或「停止」等自然词）立即取消，无任务时发 `/cancel` 会给明确提示；聊天发 `/new` 立即新建会话（清空上下文，无需重启） |
 | 引用/回复上下文 | 引用一条消息再 @ bot 时，自动读取被引用消息内容（飞书按 parent_id 拉取、微信 ref_msg、钉钉 repliedMsg）带进 agent，回复不会脱离上文 |
@@ -146,7 +146,7 @@ ABB 本体采用 **MIT**，全文见 [LICENSE](LICENSE)。
 
 - `ABB-LICENSE.txt` — ABB 本体（MIT）
 - `crates/abb-agent` 为 MIT（与 ABB 本体同一许可，附 `ABB-LICENSE.txt`）
-- `tools/licenses/` — 随包工具 `rg` / `jq` / `uv` / `gh` 及其传递依赖
+- `tools/licenses/` — 随包工具 `rg` / `jq` / `uv` / `gh` / `coreutils` / `diffutils` / `goawk` 及其传递依赖
 
 **只在源码树里**（不出现在安装包中）：
 

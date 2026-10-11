@@ -1,0 +1,6 @@
+name	provider
+tail	coreutils
+sleep	coreutils
+head	coreutils
+diff	diffutils
+cmp	diffutils

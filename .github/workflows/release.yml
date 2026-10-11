@@ -128,7 +128,11 @@ jobs:
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-agent
           # 随包工具清单从 tools/tool-lock.tsv 生成（唯一事实源）——不再另手抄一份枚举，
           # 否则加/删工具时会静默漏签（`--require-bundled-tools` 只查 PATH 解析、不查签名）。
-          for tool in $(awk -F'\t' '$3=="macos-arm64" && $1!="tool" {print $8}' tools/tool-lock.tsv); do
+          # 签名清单 = tool-lock 的包产物名 **∪** 多调包按名暴露的工具名
+          # （多调包在 macOS 是硬链接：同 inode，签一次即覆盖两者，但显式列出更直观，
+          #  也避免将来换成"复制"形态时漏签）。
+          for tool in $(awk -F'\t' '$3=="macos-arm64" && $1!="tool" {print $8}' tools/tool-lock.tsv) \
+                      $(awk -F'\t' 'NR>1 && $1!="" {print $1}' tools/bundled-cli-tools.tsv); do
             sign --force --options runtime --timestamp --sign "$IDENTITY" "ABB.app/Contents/Resources/tools/bin/$tool"
           done
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app

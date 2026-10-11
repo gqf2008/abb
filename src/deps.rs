@@ -13,9 +13,16 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-/// 安装包内置、优先于宿主 PATH 的四个工具。这里故意不含 git/bun/sed/find：
+/// 安装包内置、优先于宿主 PATH 的工具名。这里故意不含 git/bun/sed/find：
 /// git 仍为宿主依赖；sed/find 用系统版；bun 不随包。
-pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh"];
+///
+/// 名字与「包」是两回事：`rg`/`jq`/`uv`/`gh` 一包一名；`tail`/`sleep`/`head`/`diff`/`cmp`
+/// 来自两个**多调包**（`coreutils` / `diffutils`，见 `tools/tool-lock.tsv` 的包行与
+/// `tools/bundled-cli-tools.tsv` 的名字清单）——macOS 侧是多调二进制 + 硬链接，
+/// Windows 侧 coreutils 包里本来就是每工具一个 exe。
+pub const BUNDLED_TOOLS: &[&str] = &[
+    "rg", "jq", "uv", "gh", "tail", "sleep", "head", "diff", "cmp",
+];
 
 /// 根据主程序路径推导随包工具 bin（不检查存在性，便于单测）。
 fn bundled_tools_dir_for(exe: &std::path::Path) -> Option<PathBuf> {
@@ -1467,11 +1474,13 @@ mod tests {
             .skip(1)
             .filter(|l| !l.trim().is_empty())
             .collect();
-        assert_eq!(
-            rows.len(),
-            BUNDLED_TOOLS.len() * 2,
-            "每个工具应有两个平台资产"
-        );
+        // 包 ≠ 工具名：多调包一个包提供多个工具名，故这里校验"每包两平台"，
+        // 工具名与包的对应关系由 tools/bundled-cli-tools.tsv + 本文件的名字表共同锁定。
+        let packages: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|row| row.split('\t').next().unwrap_or_default())
+            .collect();
+        assert_eq!(rows.len(), packages.len() * 2, "每个包应恰好有两个平台资产");
         for banned in ["git", "bun", "sed", "find"] {
             assert!(
                 !rows
@@ -1503,8 +1512,49 @@ mod tests {
             ("uv", "windows-x64", "uv.exe"),
             ("gh", "macos-arm64", "gh"),
             ("gh", "windows-x64", "gh.exe"),
+            ("coreutils", "macos-arm64", "coreutils"),
+            ("coreutils", "windows-x64", "coreutils.exe"),
+            ("diffutils", "macos-arm64", "diffutils"),
+            ("diffutils", "windows-x64", "diffutils.exe"),
+            ("goawk", "macos-arm64", "awk"),
+            ("goawk", "windows-x64", "awk.exe"),
         ]);
         assert_eq!(matrix, expected, "随包工具矩阵必须精确锁定");
+
+        // 多调包的"名字清单"必须与包对应，且每个名字都真的在 BUNDLED_TOOLS 里
+        // （否则 `--dump-tools --require-bundled-tools` 会在装好的包里找不到它）。
+        let manifest = include_str!("../tools/bundled-cli-tools.tsv");
+        let names: Vec<(&str, &str)> = manifest
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|row| {
+                let mut cols = row.split('\t');
+                Some((cols.next()?, cols.next()?))
+            })
+            .collect();
+        assert!(!names.is_empty(), "多调包名字清单不得为空");
+        for (name, provider) in &names {
+            assert!(
+                packages.contains(*provider),
+                "清单里的 provider「{provider}」不在 tool-lock 的包里"
+            );
+            assert!(
+                BUNDLED_TOOLS.contains(name),
+                "清单里的工具「{name}」必须同时在 BUNDLED_TOOLS 里"
+            );
+        }
+        // 反向：BUNDLED_TOOLS 里非一包一名的工具必须能在清单里找到（防止只在一边加名字）。
+        let one_to_one = ["rg", "jq", "uv", "gh", "awk"];
+        for tool in BUNDLED_TOOLS {
+            if one_to_one.contains(tool) {
+                continue;
+            }
+            assert!(
+                names.iter().any(|(n, _)| n == tool),
+                "BUNDLED_TOOLS 里的「{tool}」不在多调包名字清单里"
+            );
+        }
     }
 
     #[test]

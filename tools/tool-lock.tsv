@@ -7,3 +7,9 @@ uv	0.12.13	macos-arm64	tar.gz	https://github.com/astral-sh/uv/releases/download/
 uv	0.12.13	windows-x64	zip	https://github.com/astral-sh/uv/releases/download/0.12.13/uv-x86_64-pc-windows-msvc.zip	a86c9dc7bad9b03f388583b7187c05fe9951c2e0d392217e8fd43d97787f6ec2	uv.exe	uv.exe
 gh	2.100.0	macos-arm64	zip	https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_macOS_arm64.zip	45f9a62da2f6e641a7fad57e2ce39656dfd7ef331372d80a2a2aed65abb01642	bin/gh	gh
 gh	2.100.0	windows-x64	zip	https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_windows_amd64.zip	227e35230b25db3fa1b997bab7cf4d67df0470a3b75b99e4ee66bce1a7cd4e72	bin/gh.exe	gh.exe
+coreutils	0.12.0	macos-arm64	multicall-tar-gz	https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-aarch64-apple-darwin.tar.gz	7caea447564405b3eb50cce2a89d314df07d1b7a67090dc4cc7c82eba7014052	-	coreutils
+coreutils	0.12.0	windows-x64	multicall-zip	https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-x86_64-pc-windows-msvc.zip	45d6760c136ef42cdba1e2dbb492b0858be98099d6c7fb3e300a3adcfbc54cfe	-	coreutils.exe
+diffutils	0.5.0	macos-arm64	multicall-tar-xz	https://github.com/uutils/diffutils/releases/download/v0.5.0/diffutils-aarch64-apple-darwin.tar.xz	0c164e83d59fbbc23b93003d446ff7de228b8f81c64f08b1ef1f5ad1cee1b347	-	diffutils
+diffutils	0.5.0	windows-x64	multicall-zip	https://github.com/uutils/diffutils/releases/download/v0.5.0/diffutils-x86_64-pc-windows-msvc.zip	36c900a06060ee31621fcdecb9bf223b40dd23d45e91ba98101b5d3aa5c70d18	-	diffutils.exe
+goawk	1.32.0	macos-arm64	tar.gz	https://github.com/benhoyt/goawk/releases/download/v1.32.0/goawk_v1.32.0_darwin_arm64.tar.gz	ca430af69900f20b6efb34471d31bea3fc16e301d05eab5ba2e97a4385fc5329	goawk	awk
+goawk	1.32.0	windows-x64	zip	https://github.com/benhoyt/goawk/releases/download/v1.32.0/goawk_v1.32.0_windows_amd64.zip	2cebd8d64a8eaf84b2787edec8c0274760166e077bc2bdbb69d41537b56cf32c	goawk.exe	awk.exe

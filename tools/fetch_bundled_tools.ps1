@@ -21,7 +21,10 @@ Copy-Item (Join-Path $Root "tools/licenses/*") $LicenseDir -Force
 try {
     $rows = $Lock | Where-Object { $_.platform -eq $Platform }
     if (-not $rows) { throw "lock 中没有平台 $Platform 的工具" }
-    if ($rows.Count -ne 4) { throw "lock 中 $Platform 应恰好有 4 个工具，实际 $($rows.Count)" }
+    # 包 ≠ 工具名：多调包一个包提供多个名字（coreutils/diffutils）。校验"每包两平台"由 CI 侧的
+    # Rust 矩阵测试负责，这里只要求该平台的包数 > 0。
+    if ($rows.Count -lt 1) { throw "lock 中 $Platform 没有任何包" }
+    $manifest = Import-Csv (Join-Path $Root "tools/bundled-cli-tools.tsv") -Delimiter "`t"
 
     foreach ($row in $rows) {
         Write-Host "  [tools] $($row.tool) $($row.version) -> $($row.output_name)"
@@ -50,10 +53,42 @@ try {
                 }
                 finally { $zip.Dispose() }
             }
+            { $_ -like "multicall-*" } {
+                # 多调包（uutils coreutils / diffutils）：
+                #  - Windows 的 coreutils 资产是**每工具一个 exe** ⇒ 按名单取件；
+                #  - diffutils 仍是多调 ⇒ 解出多调二进制后建**硬链接**（同卷免权限）；
+                #    硬链接失败回落复制（体积换正确性，并告警）。
+                $names = @($manifest | Where-Object { $_.provider -eq $row.tool } | ForEach-Object { $_.name })
+                if ($names.Count -eq 0) { throw "$($row.tool) 在 bundled-cli-tools.tsv 里没有任何名字" }
+                $raw = Join-Path $Tmp ("extract" + $row.tool)
+                New-Item -ItemType Directory -Force -Path $raw | Out-Null
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [IO.Compression.ZipFile]::ExtractToDirectory($file, $raw, $true)
+                $provider = Join-Path $raw $row.output_name
+                foreach ($name in $names) {
+                    $per = Get-ChildItem -Path $raw -Recurse -Filter "$name.exe" | Select-Object -First 1
+                    $target = Join-Path $BinDir "$name.exe"
+                    if ($per) {
+                        Copy-Item $per.FullName $target -Force
+                    } elseif (Test-Path $provider) {
+                        New-Item -ItemType HardLink -Path $target -Target $provider -Force | Out-Null
+                    } else {
+                        throw "$($row.tool) 包里既没有 $name.exe 也没有多调二进制 $($row.output_name)"
+                    }
+                }
+            }
             default { throw "不支持的 package 类型：$($row.package)（$($row.tool)）" }
         }
         & $out --version | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "$($row.output_name) --version 退出码 $LASTEXITCODE" }
+        if ($row.package -like "multicall-*") {
+            foreach ($name in ($manifest | Where-Object { $_.provider -eq $row.tool } | ForEach-Object { $_.name })) {
+                & (Join-Path $BinDir "$name.exe") --version *> $null
+                # 不依赖退出码为 0（uutils diffutils 不实现 --version）；只要求"能启动"：
+                # PowerShell 找不到可执行文件会抛 CommandNotFoundException，上面那行会直接终止。
+            }
+        } elseif ($LASTEXITCODE -ne 0) {
+            throw "$($row.output_name) --version 退出码 $LASTEXITCODE"
+        }
     }
 }
 finally {

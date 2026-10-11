@@ -12,7 +12,8 @@ usage() {
   cat <<'EOF'
 用法: tools/fetch_bundled_tools.sh --platform <macos-arm64> --dest <目录>
 
-下载 rg/jq/uv/gh 到 <目录>/bin，并复制许可证到 <目录>/licenses。
+下载 rg/jq/uv/gh 与随包 CLI 工具（coreutils/diffutils 的多调二进制，见
+tools/bundled-cli-tools.tsv）到 <目录>/bin，并复制许可证到 <目录>/licenses。
 版本、URL、SHA256、包内路径全部来自 tools/tool-lock.tsv。
 EOF
 }
@@ -91,6 +92,42 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       fi
       cp "$src" "$DEST/bin/$output_name"
       ;;
+    multicall-tar-gz|multicall-tar-xz|multicall-zip)
+      # 多调包（uutils coreutils / diffutils）：
+      #  - macOS 资产是**单个多调二进制** ⇒ 解到 bin/<provider>，再按清单建硬链接
+      #    （同卷免权限；硬链接失败回落复制并告警——绝不静默少一个工具）；
+      #  - Windows 的 coreutils 资产是**每工具一个 exe** ⇒ 直接取 <name>.exe，不需要链接；
+      #    diffutils 仍是多调 ⇒ 走硬链接分支。
+      provider="$tool"
+      # 注意：本脚本是 zsh，**未加引号的标量参数不会被词分割**（只有命令替换会）。
+      # 所以这里一律用内联 `$(awk ...)`，不要先赋值再 `for name in $var`（那样只迭代一次）。
+      [ -n "$(awk -F'\t' -v p="$provider" '$2==p {print $1}' tools/bundled-cli-tools.tsv)" ] || {
+        echo "$provider 在 tools/bundled-cli-tools.tsv 里没有任何名字" >&2; exit 1;
+      }
+      case "$package" in
+        multicall-tar-gz) tar -xzf "$file" -C "$tmp/extract/$tool" ;;
+        multicall-tar-xz) tar -xJf "$file" -C "$tmp/extract/$tool" ;;
+        multicall-zip) unzip -q "$file" -d "$tmp/extract/$tool" ;;
+      esac
+      if [ "$PLATFORM" = "windows-x64" ]; then
+        for name in $(awk -F'\t' -v p="$provider" '$2==p {print $1}' tools/bundled-cli-tools.tsv); do
+          per="$(find "$tmp/extract/$tool" -name "$name.exe" | head -1)"
+          [ -n "$per" ] || { echo "$provider 包里没有 $name.exe" >&2; exit 1; }
+          cp "$per" "$DEST/bin/$name.exe"
+        done
+      else
+        src="$(find "$tmp/extract/$tool" -type f -name "$provider" | head -1)"
+        [ -n "$src" ] || { echo "$provider 包里没有多调二进制 $provider" >&2; exit 1; }
+        cp "$src" "$DEST/bin/$provider"
+        chmod 0755 "$DEST/bin/$provider"
+        for name in $(awk -F'\t' -v p="$provider" '$2==p {print $1}' tools/bundled-cli-tools.tsv); do
+          ln -f "$DEST/bin/$provider" "$DEST/bin/$name" 2>/dev/null || {
+            echo "  [tools] 硬链接 $name -> $provider 失败，回落复制" >&2
+            cp "$DEST/bin/$provider" "$DEST/bin/$name"
+          }
+        done
+      fi
+      ;;
     *)
       echo "不支持的 package 类型：$package（$tool）" >&2
       exit 1
@@ -113,8 +150,29 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       exit 1
     fi
   fi
-  "$DEST/bin/$output_name" --version >/dev/null
+  case "$package" in
+    multicall-*)
+      # 多调包：**逐个名字**验活（这同时验证了硬链接/按名取件都对）。
+      # 注意不能拿包名当工具名跑（`diffutils --version` 会得到 "utility not supported"）。
+      for name in $(awk -F'\t' -v p="$tool" '$2==p {print $1}' tools/bundled-cli-tools.tsv); do
+        # 验活：**不能依赖 `--version`/`--help`**——uutils diffutils 对两者都报
+        # "Unknown option"（与 GNU diff 行为有差异）。只要求"能执行"：
+        # 无参跑一次，退出码 126/127（不可执行/找不到，POSIX 约定）才算失败。
+        rc=0
+        "$DEST/bin/$name" </dev/null >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+          echo "$name 不可执行（rc=$rc，多调包 $tool 的按名调用不通）" >&2; exit 1
+        fi
+      done
+      ;;
+    *)
+      "$DEST/bin/$output_name" --version >/dev/null
+      ;;
+  esac
 done < tools/tool-lock.tsv
 
-[ "$found" -eq 4 ] || { echo "lock 中 $PLATFORM 应恰好有 4 个工具，实际 $found" >&2; exit 1; }
+# 计数 = lock 里该平台的**包**数（多调包一个包提供多个工具名，故不再与工具名数相等）。
+[ "$found" -eq "$(awk -F'\t' -v p="$PLATFORM" 'NR>1 && $3==p {n++} END {print n}' tools/tool-lock.tsv)" ] || {
+  echo "lock 中 $PLATFORM 的包数不符（found=$found）" >&2; exit 1;
+}
 echo "  [tools] 已准备 $found 个工具到 $DEST"

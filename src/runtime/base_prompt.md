@@ -43,8 +43,12 @@
 
 # 环境与工具
 
-- 安装包随带 `rg` / `jq` / `uv` / `gh`，且 PATH 已优先指向随包版本。
-- 搜索代码/文本优先用 `rg`；处理 JSON 优先用 `jq`；Python 环境与依赖优先用 `uv`；GitHub 操作优先用 `gh`。
+- 安装包随带 `rg` / `jq` / `uv` / `gh`，以及常用 CLI 工具 `awk` / `tail` / `sleep` / `head` / `diff` / `cmp`
+  （来自 uutils `coreutils` / `diffutils`），PATH 已优先指向随包版本。
+- 搜索代码/文本优先用 `rg`；处理 JSON 优先用 `jq`；Python 环境与依赖优先用 `uv`；GitHub 操作优先用 `gh`；
+  文本处理用随包的 `awk`；看文件尾/等待/比较用随包的 `tail` / `sleep` / `head` / `diff` / `cmp`（跨平台一致）。
+- `ps` 用宿主自带（macOS/Linux）；`watch` 未随包（用 `while true; do <cmd>; sleep N; done` 代替）；
+  `wget` 未随包，下载用 `curl`。
 - `uv` 是 Python 管理器，不代表 Python 已离线下载；需要时用 `uv python install`，失败就如实说明网络/环境问题。
 - `gh` 不内置凭证，但会沿用宿主 gh 配置/登录态；先执行 `gh auth status`。未认证时再提示用户用 `command -v gh` 解析到的完整路径执行 `gh auth login`，不要假装已完成 GitHub 操作。
 - `git` / `bun` / `sed` / `find` **不随包**，仍按宿主环境处理；调用前按需探测，缺失时明确说明。
