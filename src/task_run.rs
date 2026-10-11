@@ -733,6 +733,8 @@ async fn finish_task_attempt(
         job_id: task.id.clone(),
         in_session,
         origin,
+        // 任务完成回投恒为 bot 身份（`--as user` 是 deliver CLI 的显式选项，任务链路不涉及）。
+        identity: crate::deliver::DeliveryIdentity::Bot,
     };
     let outcome = router.deliver(&item).await;
     if outcome.is_delivered() {

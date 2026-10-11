@@ -90,8 +90,11 @@ ABB 现有三类「任务」，但**真正决定行为的三件事是分开的**
 **E. 投递目标与自环保护**
 
 - `job.targets`（`src/schedule.rs:24`，`bot_key` 空 = 本 bot）
-- `deliver --bot/--chat`（`src/deliver.rs:531` 附近解析）、`--to-current`（`:542-557` 校验来源确实等于目标）
-- 自环判据是 `item.in_session && is_self_loop(item)`（`src/deliver.rs:231-236`），且 Router **专门防 `deliveries.json` 伪造 `in_session: true`**（`:252-256`、`:269-271`）
+- `deliver --bot/--chat`（`src/deliver.rs` 的 `parse_deliver_args`）、`--to-current`（同一函数里校验来源确实等于目标）
+- `deliver --as bot|user`（`DeliveryItem.identity`）：`user` = 以**用户本人**身份发，委派本机
+  `lark-cli im +messages-send --as user`（`src/lark_user.rs`；ABB 不碰 user token——lark-cli 的凭据是
+  keychain 加密的）。**失败绝不回落 bot**；受限会话被 guard 拒（`src/guard.rs` 的 `--as` 分支）
+- 自环判据是 `item.in_session && is_self_loop(item)`（`src/deliver.rs` 的 `is_self_loop`），且 Router **专门防 `deliveries.json` 伪造 `in_session: true`**（同文件 `Router::deliver` 的 `in_session_ok` 判据与自环分支）
 
 **F. 权限面是两份，不是一份**
 

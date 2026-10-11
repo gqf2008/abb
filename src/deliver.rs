@@ -38,6 +38,29 @@ pub enum DeliveryOrigin {
     TaskCompletion,
 }
 
+/// 投递的**发送身份**（卡 `abb-deliver-send-as-user-20260929`）：`bot` 恒为既有行为，
+/// `user` = 以**用户本人**身份发出（`deliver --as user`，委派 `lark-cli`，见 [`crate::lark_user`]）。
+///
+/// 缺省 `Bot`：存量 `deliveries.json` 条目没有这个字段 ⇒ 反序列化回落 `Bot`，
+/// 老队列的行为一字节不变（`#[serde(default)]`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryIdentity {
+    #[default]
+    Bot,
+    User,
+}
+
+impl DeliveryIdentity {
+    /// CLI/日志口径的名字（`--as <name>`）。
+    pub fn name(self) -> &'static str {
+        match self {
+            DeliveryIdentity::Bot => "bot",
+            DeliveryIdentity::User => "user",
+        }
+    }
+}
+
 /// 一条待投递消息。来源（source_bot/source_chat）用于投递失败时回源报错，不静默丢失。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryItem {
@@ -86,6 +109,11 @@ pub struct DeliveryItem {
     /// 存量条目与显式来源纳入同一口径。
     #[serde(default)]
     pub origin: DeliveryOrigin,
+    /// 发送身份（缺省 `Bot`）。`User` = 以用户本人身份发（`--as user`）——**只在飞书**且**仅纯文本**
+    /// 支持；其余平台/带附件在 Router 里 fail loud（见 `Router::deliver` 的 User 分支），
+    /// 失败**绝不回落 bot**（那会让用户以为消息是本人发的）。
+    #[serde(default)]
+    pub identity: DeliveryIdentity,
 }
 
 impl DeliveryItem {
@@ -430,6 +458,68 @@ impl Router {
         // 吞掉后面的附件（审查 #254：真发送引入了多种新失败模式——超大/格式
         // 不支持/能力边界，旧「首败即 return」会把一次投递里其余本可送达的
         // 附件连坐丢弃）。全部成功才进防循环登记（见 mark_delivered）。
+        // `--as user`：以**用户本人**身份发出（委派 lark-cli）——与 bot 通道完全分开，
+        // 且**任何失败都不回落 bot**（回落 = 用户以为本人发的、实际是机器人，本卡要消灭的失败模式）。
+        if item.identity == DeliveryIdentity::User {
+            let kind = self
+                .bots
+                .get(&item.target_bot)
+                .map(|b| b.kind.as_str())
+                .unwrap_or_default();
+            if kind != "feishu" {
+                let msg = format!(
+                    "⚠️ 投递失败：`--as user` 目前只支持飞书目标（目标 bot「{}」的平台是 `{}`）。请改用缺省的 bot 身份，或选一个飞书目标。",
+                    item.target_bot,
+                    if kind.is_empty() { "未知" } else { kind }
+                );
+                crate::log!(
+                    "[deliver] 拒绝投递：--as user 不支持平台 {}（bot={} id={}）",
+                    kind,
+                    tb,
+                    tid
+                );
+                self.notify_source(item, &msg).await;
+                return DeliveryOutcome::NotDelivered("非飞书目标不支持 --as user".to_string());
+            }
+            if !item.attachments.is_empty() {
+                // CLI 已在解析期拒绝（parse_deliver_args），这里是防手改队列的兜底。
+                self.notify_source(
+                    item,
+                    "⚠️ 投递失败：`--as user` 暂不支持附件（只开放纯文本）。",
+                )
+                .await;
+                return DeliveryOutcome::NotDelivered("--as user 不支持附件".to_string());
+            }
+            if item.text.is_empty() {
+                self.notify_source(item, "⚠️ 投递失败：`--as user` 需要正文（纯文本）。")
+                    .await;
+                return DeliveryOutcome::NotDelivered("--as user 缺正文".to_string());
+            }
+            // 一致性自检（只告警不拦）：lark-cli 配的 app 应与目标 bot 的 app 相同，
+            // 否则消息是由另一个 app 顶着本人名义发出的（语义不同，要留痕）。
+            crate::lark_user::check_app_consistency(
+                self.bots
+                    .get(&item.target_bot)
+                    .map(|b| b.app_id.as_str())
+                    .unwrap_or_default(),
+            );
+            if let Err(e) = crate::lark_user::send_text_as_user(&item.target_chat, &item.text).await
+            {
+                // 复用 bot 通道的失败上报（回源提示 + 日志），错误文案里已含"不会回落 bot"。
+                self.fail_text(item, &e).await;
+                return DeliveryOutcome::NotDelivered(format!("用户身份发送失败：{e:#}"));
+            }
+            crate::log!(
+                "[deliver] 已以 `{}` 身份投递（--as {}）bot={} chat={} id={}",
+                item.identity.name(),
+                item.identity.name(),
+                tb,
+                tc,
+                tid
+            );
+            self.mark_delivered(item);
+            return DeliveryOutcome::Delivered;
+        }
         if !item.text.is_empty() {
             if let Err(e) = msgr.send_text(&item.target_chat, &item.text).await {
                 self.fail_text(item, &e).await;
@@ -655,6 +745,7 @@ pub fn parse_deliver_args(
     let mut source_chat: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
     let mut in_session = false;
+    let mut identity = DeliveryIdentity::Bot;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -667,6 +758,21 @@ pub fn parse_deliver_args(
         match flag {
             // 无值开关：把目标钉在当前会话（= 桥注入的来源），见 DeliveryItem.in_session。
             "--to-current" => in_session = true,
+            // 发送身份：`--as bot`（缺省，既有行为）/ `--as user`（以本人身份发，委派 lark-cli）。
+            // 取值严格校验——打错字（如 `--as User`/`--as me`）必须当场报错，绝不能当缺省 bot 静默继续：
+            // 那正是本卡要消灭的失败模式（用户以为以本人身份发出去了）。
+            "--as" => {
+                let v = val(&mut i)?;
+                identity = match v.as_str() {
+                    "bot" => DeliveryIdentity::Bot,
+                    "user" => DeliveryIdentity::User,
+                    other => {
+                        return Err(format!(
+                            "--as 只接受 `bot` 或 `user`（收到 `{other}`）：bot = 以 ABB 机器人身份发（缺省），user = 以你本人身份发（需本机 lark-cli 已授权）"
+                        ))
+                    }
+                };
+            }
             "--bot" => target_bot = Some(val(&mut i)?),
             "--chat" => target_chat = Some(val(&mut i)?),
             "--text" => text = Some(val(&mut i)?),
@@ -723,6 +829,20 @@ pub fn parse_deliver_args(
     if target_chat.is_empty() {
         return Err("--chat 不能为空".to_string());
     }
+    // `--as user` 的能力边界（**当场拒绝，不进队列**）：用户身份发送走 `lark-cli im +messages-send`，
+    // 本批只开放纯文本；附件（`--file`）与空正文都不支持。在这里报错是为了**不让一条注定投不出去的
+    // 条目落盘**（否则消费循环里才失败，用户要等一轮才发现）。
+    if identity == DeliveryIdentity::User {
+        if !files.is_empty() {
+            return Err(
+                "--as user 暂不支持附件（--file）：用户身份发送走 lark-cli，本批只开放纯文本；请去掉 --file，或改用缺省的 --as bot"
+                    .to_string(),
+            );
+        }
+        if text.trim().is_empty() {
+            return Err("--as user 需要 --text 正文（用户身份发送本批只支持纯文本）".to_string());
+        }
+    }
     if text.trim().is_empty() && files.is_empty() {
         return Err("--text 和 --file 至少给一个".to_string());
     }
@@ -760,6 +880,7 @@ pub fn parse_deliver_args(
         } else {
             DeliveryOrigin::Manual
         },
+        identity,
     })
 }
 
@@ -871,6 +992,8 @@ pub fn job_target_items(
             attachments: Vec::new(),
             job_id: job_id.to_string(),
             in_session: false,
+            // 定时任务恒为 bot 身份（`--as user` 只由 deliver CLI 显式指定）。
+            identity: DeliveryIdentity::Bot,
             // #21 定时任务投递：显式 Scheduled（豁免自环+去重，不豁免开关）。
             origin: DeliveryOrigin::Scheduled,
         })
@@ -915,6 +1038,7 @@ mod tests {
             job_id: String::new(),
             in_session: false,
             origin: DeliveryOrigin::Manual,
+            identity: DeliveryIdentity::Bot,
         }
     }
 
@@ -2221,5 +2345,221 @@ mod tests {
             4,
             "Scheduled 豁免去重（2+2）"
         );
+    }
+
+    // ---------- `--as user`（卡 abb-deliver-send-as-user-20260929）----------
+
+    /// 缺省身份必须是 bot（存量行为一字节不变），`--as user` 才切到用户身份。
+    #[test]
+    fn parse_identity_defaults_to_bot_and_accepts_user() {
+        let d = parse_deliver_args(
+            &["--bot", "b", "--chat", "oc_1", "--text", "x"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(d.identity, DeliveryIdentity::Bot, "缺省必须是 bot");
+        let u = parse_deliver_args(
+            &[
+                "--bot", "b", "--chat", "oc_1", "--text", "x", "--as", "user",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(u.identity, DeliveryIdentity::User);
+        // 显式 --as bot 与缺省等价
+        let b = parse_deliver_args(
+            &["--bot", "b", "--chat", "oc_1", "--text", "x", "--as", "bot"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(b.identity, DeliveryIdentity::Bot);
+    }
+
+    /// 取值打错必须当场报错，**绝不能**当缺省 bot 静默继续（那会让用户以为消息是本人发的）。
+    #[test]
+    fn parse_identity_rejects_unknown_value_loudly() {
+        for bad in ["User", "me", ""] {
+            let r = parse_deliver_args(
+                &["--bot", "b", "--chat", "oc_1", "--text", "x", "--as", bad]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+                "",
+                "",
+            );
+            let e = r.expect_err(&format!("--as {bad} 必须报错"));
+            assert!(e.contains("只接受 `bot` 或 `user`"), "{bad}: {e}");
+        }
+        // 缺值
+        let r = parse_deliver_args(
+            &["--bot", "b", "--chat", "oc_1", "--text", "x", "--as"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "",
+            "",
+        );
+        assert!(r.expect_err("缺值必须报错").contains("缺少值"));
+    }
+
+    /// `--as user` 的能力边界在**解析期**就拒绝：附件/空正文不进队列（否则用户要等一轮才看到失败）。
+    #[test]
+    fn parse_as_user_rejects_attachments_and_empty_text() {
+        let with_file = parse_deliver_args(
+            &[
+                "--bot",
+                "b",
+                "--chat",
+                "oc_1",
+                "--file",
+                "/tmp/nope.bin",
+                "--as",
+                "user",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+            "",
+            "",
+        );
+        let e = with_file.expect_err("--as user 带 --file 必须报错");
+        assert!(e.contains("暂不支持附件"), "{e}");
+        let no_text = parse_deliver_args(
+            &[
+                "--bot", "b", "--chat", "oc_1", "--text", "   ", "--as", "user",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+            "",
+            "",
+        );
+        assert!(no_text.expect_err("空正文必须报错").contains("需要 --text"));
+    }
+
+    /// 只装一个目标 messenger 的路由（bot=key "t"，平台由 `kind` 决定）。
+    fn user_router(kind: &str) -> (Router, Arc<FakeMsgr>) {
+        let msgr = Arc::new(FakeMsgr::new());
+        let mut bots = HashMap::new();
+        bots.insert(
+            "t".to_string(),
+            BotConfig {
+                name: "t".into(),
+                kind: kind.into(),
+                app_id: "cli_test_app".into(),
+                ..Default::default()
+            },
+        );
+        let router = Router::new(
+            true,
+            HashMap::from([("t".to_string(), msgr.clone() as Arc<dyn Messenger>)]),
+            bots,
+            None,
+        );
+        (router, msgr)
+    }
+
+    fn user_identity_item(text: &str) -> DeliveryItem {
+        let mut it = item("id-u", "t", "oc_target", text);
+        it.identity = DeliveryIdentity::User;
+        it
+    }
+
+    /// 非飞书目标：显式拒绝（不静默）；且目标 messenger 一条都没发。
+    #[tokio::test]
+    async fn router_user_identity_rejects_non_feishu_target() {
+        let (router, msgr) = user_router("wechat");
+        let out = router.deliver(&user_identity_item("x")).await;
+        let DeliveryOutcome::NotDelivered(why) = out else {
+            panic!("非飞书目标必须拒绝");
+        };
+        assert!(why.contains("非飞书"), "{why}");
+        assert!(msgr.sent.lock().unwrap().is_empty(), "不得回落 bot 发送");
+    }
+
+    /// **本卡最关键的判据**：没有可用 lark-cli（等价"没授权/没有 user token"）⇒ 失败 + 提示可操作，
+    /// **且一条都没有以 bot 身份发出**（回落是这张卡要消灭的最坏失败模式）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 串行锁必须横跨「设 env → 投递」全程（env 是进程全局），与 src/service.rs 同款处理
+    async fn router_user_identity_without_cli_fails_and_never_falls_back_to_bot() {
+        let (router, msgr) = user_router("feishu");
+        let _g = crate::lark_user::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(crate::lark_user::LARK_CLI_ENV, "/nonexistent/lark-cli");
+        let out = router.deliver(&user_identity_item("正文")).await;
+        std::env::remove_var(crate::lark_user::LARK_CLI_ENV);
+        let DeliveryOutcome::NotDelivered(why) = out else {
+            panic!("缺 CLI 必须算未送达");
+        };
+        assert!(why.contains("用户身份发送失败"), "{why}");
+        assert!(msgr.sent.lock().unwrap().is_empty(), "绝不回落 bot 发送");
+    }
+
+    /// 手改队列塞 `--as user` + 附件 ⇒ Router 兜底拒绝（CLI 已拦，队列侧不能开口子）。
+    #[tokio::test]
+    async fn router_user_identity_rejects_attachments_defensively() {
+        let (router, msgr) = user_router("feishu");
+        let mut it = user_identity_item("正文");
+        it.attachments = vec![attach("a.bin")];
+        let out = router.deliver(&it).await;
+        let DeliveryOutcome::NotDelivered(why) = out else {
+            panic!("--as user 带附件必须拒绝");
+        };
+        assert!(why.contains("不支持附件"), "{why}");
+        assert!(msgr.sent.lock().unwrap().is_empty());
+    }
+
+    /// 阳性对照：假 lark-cli 存在且成功 ⇒ **Delivered**，并且目标 messenger 一条都没发
+    /// （证明这条消息确实走了 lark-cli 的用户身份通道，而不是 bot 通道——把 User 分支删掉本条即红）。
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 串行锁必须横跨「设 env → 投递」全程（env 是进程全局），与 src/service.rs 同款处理
+    async fn router_user_identity_sends_through_lark_cli_not_bot() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("abb-deliv-user-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = dir.join("argv.txt");
+        let cli = dir.join("lark-cli");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                rec.display()
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&cli).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&cli, perm).unwrap();
+        let (router, msgr) = user_router("feishu");
+        let _g = crate::lark_user::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(crate::lark_user::LARK_CLI_ENV, cli.to_str().unwrap());
+        let out = router.deliver(&user_identity_item("本人发的正文")).await;
+        std::env::remove_var(crate::lark_user::LARK_CLI_ENV);
+        assert!(out.is_delivered(), "假 CLI 成功应 Delivered: {out:?}");
+        assert!(
+            msgr.sent.lock().unwrap().is_empty(),
+            "走 lark-cli 时不得再经 bot 通道发一遍"
+        );
+        let got = std::fs::read_to_string(&rec).unwrap();
+        assert!(got.contains("--as\nuser"), "argv 应带 --as user: {got}");
+        assert!(got.contains("oc_target"), "argv 应带目标: {got}");
+        assert!(got.contains("本人发的正文"), "argv 应带正文: {got}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
