@@ -9,11 +9,15 @@
 #
 # 用法：
 #   tools/gates.sh                 # 跑四条门禁（fmt / clippy / build --locked / 隔离全量测试）
-#   tools/gates.sh --print-env     # 只打印解析结果（平台、TMPDIR、CARGO_TARGET_DIR、repo）
-#   ABB_BUILD_TMP=/e/tmp tools/gates.sh   # 覆盖 base（默认按平台取数据卷）
+#   tools/gates.sh --print-env     # 只打印解析结果（os、TMPDIR、TMP、TEMP、CARGO_TARGET_DIR、repo）
+#   ABB_BUILD_TMP=/e/tmp tools/gates.sh   # 覆盖 base（默认按平台取数据卷；**必须已存在**）
 #   ABB_GATES_OS=darwin tools/gates.sh --print-env   # 覆盖平台探测（用于在本机核 macOS 口径）
 #
-# 退出码：0=门禁全绿；1=base 落在 checkout 内（政策违规）；其它=cargo/测试自身的失败码。
+# 两条硬保证（都有阳性对照，见 RULE_可执行性）：
+#   1. base 落在 checkout 内 ⇒ 直接失败；
+#   2. base 不存在 ⇒ 直接失败（不代建，避免把产物静默写到启动卷/系统盘）。
+#
+# 退出码：0=门禁全绿；1=政策违规（base 在 checkout 内 / base 不存在）；其它=cargo/测试自身的失败码。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,6 +62,14 @@ esac
 
 export TMPDIR="$base"
 export CARGO_TARGET_DIR="$base/abb-target"
+# Windows 原生进程（rustc/link、cmd）**不认 `TMPDIR`**（那是 POSIX 约定），只看 `TMP`/`TEMP`：
+# 不补这两个，link/rustc 的 scratch 仍留在系统盘 C: 的 `%TEMP%`。cygpath 只在 MSYS/Cygwin 存在，
+# 正好当平台判据，并把 `/e/tmp` 转成原生 `E:\tmp`。
+if command -v cygpath >/dev/null 2>&1; then
+  native_base="$(cygpath -w "$base")"
+  export TMP="$native_base"
+  export TEMP="$native_base"
+fi
 
 repo_real="$(cd "$repo_root" && pwd -P)"
 case "$base" in
@@ -72,12 +84,25 @@ esac
 if [ "$print_only" = 1 ]; then
   echo "os=$os"
   echo "TMPDIR=$TMPDIR"
+  echo "TMP=${TMP:-<unset>}"
+  echo "TEMP=${TEMP:-<unset>}"
   echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
   echo "repo=$repo_real"
   exit 0
 fi
 
-# 只在真跑门禁时建目录：`--print-env`（含 macOS 口径探测）不该在磁盘上留下任何东西。
+# **base 必须已存在**：数据卷挂载点/临时根目录是运维先备好的，不由本脚本代建。
+# 代建会把产物静默写到启动卷/系统盘上（`/Volumes/DataExt` 没挂载时，`mkdir -p` 会在
+# 启动卷上建出一个同名目录，然后照常构建）——那正是这条政策要禁的形态。
+if [ ! -d "$base" ]; then
+  echo "❌ base 目录不存在：$base" >&2
+  echo "   数据卷没挂载？本脚本不会替你创建，以免产物静默落到启动卷/系统盘。" >&2
+  echo "   先准备好该目录（macOS: mkdir -p /Volumes/DataExt/tmp；Windows: mkdir -p /e/tmp），" >&2
+  echo "   或用 ABB_BUILD_TMP 指到一个已存在的 checkout 外目录。" >&2
+  exit 1
+fi
+
+# 只在真跑门禁时建产物子目录：`--print-env`（含 macOS 口径探测）不写磁盘。
 mkdir -p "$CARGO_TARGET_DIR"
 
 cd "$repo_root"
