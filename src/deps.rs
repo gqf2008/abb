@@ -13,9 +13,50 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-/// 安装包内置、优先于宿主 PATH 的四个工具。这里故意不含 git/bun/sed/find：
+/// 安装包内置、优先于宿主 PATH 的工具名。这里故意不含 git/bun/sed/find：
 /// git 仍为宿主依赖；sed/find 用系统版；bun 不随包。
-pub const BUNDLED_TOOLS: &[&str] = &["rg", "jq", "uv", "gh"];
+///
+/// 名字与「包」是两回事：`rg`/`jq`/`uv`/`gh` 一包一名；`tail`/`sleep`/`head`/`diff`/`cmp`
+/// 来自两个**多调包**（`coreutils` / `diffutils`，见 `tools/tool-lock.tsv` 的包行与
+/// `tools/bundled-cli-tools.tsv` 的名字清单）——macOS 侧是多调二进制 + 硬链接，
+/// Windows 侧 coreutils 包里本来就是每工具一个 exe。
+pub const BUNDLED_TOOLS: &[&str] = &[
+    "rg",
+    "jq",
+    "uv",
+    "gh",
+    "awk",
+    "tail",
+    "sleep",
+    "head",
+    "diff",
+    "cmp",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+];
+
+/// **只在 Windows 随包**的工具名：Windows 没有这批 Unix 工具，由 `busybox-w32` 提供
+/// （`tools/bundled-cli-tools.tsv` 里 platform=windows-x64 那批）。
+/// macOS/Linux 宿主自带等价物（`ps`/`sed`/`id`/`echo`/`printf`/`hexdump`）；
+/// `watch`/`wget`/`usleep`/`unix2dos` 在 macOS 未随包（取舍见 `tools/README.md`）。
+#[cfg(windows)]
+pub const BUNDLED_TOOLS_WINDOWS_ONLY: &[&str] = &[
+    "ps", "watch", "wget", "usleep", "unix2dos", "sed", "echo", "printf", "id", "hexdump",
+];
+
+/// 非 Windows：无"仅本平台"的随包工具。
+#[cfg(not(windows))]
+pub const BUNDLED_TOOLS_WINDOWS_ONLY: &[&str] = &[];
+
+/// **本平台**应能解析到的随包工具名全集（`--dump-tools --require-bundled-tools` 用它）。
+pub fn bundled_tool_names() -> Vec<&'static str> {
+    BUNDLED_TOOLS
+        .iter()
+        .chain(BUNDLED_TOOLS_WINDOWS_ONLY.iter())
+        .copied()
+        .collect()
+}
 
 /// 根据主程序路径推导随包工具 bin（不检查存在性，便于单测）。
 fn bundled_tools_dir_for(exe: &std::path::Path) -> Option<PathBuf> {
@@ -1467,10 +1508,29 @@ mod tests {
             .skip(1)
             .filter(|l| !l.trim().is_empty())
             .collect();
+        // 包 ≠ 工具名：多调包一个包提供多个工具名，故这里校验"每包两平台"，
+        // 工具名与包的对应关系由 tools/bundled-cli-tools.tsv + 本文件的名字表共同锁定。
+        let packages: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|row| row.split('\t').next().unwrap_or_default())
+            .collect();
+        // 包 ≠ 平台数：busybox-w32 是 **Windows 专属**（只有一行），其余包两平台。
+        let two_platform = packages
+            .iter()
+            .filter(|name| {
+                rows.iter()
+                    .filter(|row| row.split('\t').next() == Some(**name))
+                    .count()
+                    == 2
+            })
+            .count();
+        let one_platform = packages.len() - two_platform;
         assert_eq!(
             rows.len(),
-            BUNDLED_TOOLS.len() * 2,
-            "每个工具应有两个平台资产"
+            two_platform * 2 + one_platform,
+            "包与平台行数不匹配（packages={}, rows={}）",
+            packages.len(),
+            rows.len()
         );
         for banned in ["git", "bun", "sed", "find"] {
             assert!(
@@ -1503,8 +1563,56 @@ mod tests {
             ("uv", "windows-x64", "uv.exe"),
             ("gh", "macos-arm64", "gh"),
             ("gh", "windows-x64", "gh.exe"),
+            ("coreutils", "macos-arm64", "coreutils"),
+            ("coreutils", "windows-x64", "coreutils.exe"),
+            ("diffutils", "macos-arm64", "diffutils"),
+            ("diffutils", "windows-x64", "diffutils.exe"),
+            ("goawk", "macos-arm64", "awk"),
+            ("goawk", "windows-x64", "awk.exe"),
+            ("busybox", "windows-x64", "busybox.exe"), // Windows 专属：一批 Unix 工具
         ]);
         assert_eq!(matrix, expected, "随包工具矩阵必须精确锁定");
+
+        // 多调包的"名字清单"必须与包对应，且每个名字都真的在 BUNDLED_TOOLS 里
+        // （否则 `--dump-tools --require-bundled-tools` 会在装好的包里找不到它）。
+        let manifest = include_str!("../tools/bundled-cli-tools.tsv");
+        let platform = if cfg!(target_os = "windows") {
+            "windows-x64"
+        } else {
+            "macos-arm64"
+        };
+        let names: Vec<(&str, &str, &str)> = manifest
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|row| {
+                let mut cols = row.split('\t');
+                Some((cols.next()?, cols.next()?, cols.next()?))
+            })
+            .filter(|(_, _, plat)| *plat == "all" || *plat == platform)
+            .collect();
+        assert!(!names.is_empty(), "多调包名字清单不得为空");
+        for (name, provider, _) in &names {
+            assert!(
+                packages.contains(*provider),
+                "清单里的 provider「{provider}」不在 tool-lock 的包里"
+            );
+            assert!(
+                bundled_tool_names().contains(name),
+                "清单里的工具「{name}」（{platform}）必须在本平台名字表里"
+            );
+        }
+        // 反向：BUNDLED_TOOLS 里非一包一名的工具必须能在清单里找到（防止只在一边加名字）。
+        let one_to_one = ["rg", "jq", "uv", "gh", "goawk"];
+        for tool in bundled_tool_names() {
+            if one_to_one.contains(&tool) {
+                continue;
+            }
+            assert!(
+                names.iter().any(|(n, _, _)| *n == tool),
+                "本平台名字表里的「{tool}」不在多调包名字清单里"
+            );
+        }
     }
 
     #[test]

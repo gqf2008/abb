@@ -436,7 +436,7 @@ pub async fn run() {
     for p in crate::deps::detect_permissions() {
         crate::log!("[perm] 检测 {}: {:?}", p.id, p.state);
     }
-    for tool in crate::deps::BUNDLED_TOOLS {
+    for tool in crate::deps::bundled_tool_names() {
         let (source, path) = crate::deps::bundled_tool_status(tool);
         crate::log!(
             "[tools] {tool} -> {source} {}",

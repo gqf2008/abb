@@ -451,7 +451,7 @@ fn main() {
     if args.iter().any(|a| a == "--dump-tools") {
         let strict = args.iter().any(|a| a == "--require-bundled-tools");
         let mut not_bundled = false;
-        for tool in deps::BUNDLED_TOOLS {
+        for tool in deps::bundled_tool_names() {
             let (source, path) = deps::bundled_tool_status(tool);
             if source != "bundled" {
                 not_bundled = true;

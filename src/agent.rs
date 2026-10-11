@@ -215,9 +215,10 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 
 ## 其它
 
-- **随包工具优先**：安装包内置 `rg` / `jq` / `uv` / `gh`，PATH 已优先指向它们。
+- **随包工具优先**：安装包内置 `rg` / `jq` / `uv` / `gh`，以及常用 CLI 工具 `awk` / `tail` / `sleep` / `head` / `diff` / `cmp`，PATH 已优先指向它们。
   - 搜索优先 `rg`，JSON 优先 `jq`，Python 环境优先 `uv`，GitHub 操作优先 `gh`。
   - `uv` 只管 Python 环境/依赖，不保证 Python 已下载；`gh` 会沿用宿主登录态，先查 `gh auth status`，未认证时给出 `command -v gh` 解析到的完整路径让用户执行 `gh auth login`。
+  - `ps` 用宿主自带；`watch` / `wget` **未随包**（`watch` 用 `while true; do <cmd>; sleep N; done`；`wget` 用 `curl`）。
   - `git` / `bun` / `sed` / `find` **不随包**，仍按宿主环境处理，缺失时明确说明。
 - 任务完成（产出最终回复）后**立即退出**，不要持续运行或等待。
 - 普通问答、查资料、改文件等直接做即可，做完输出结论。
@@ -941,7 +942,16 @@ mod tests {
                 text.contains("## 后台子代理 → 长任务丢后台，别堵会话"),
                 "{name} 缺 v7 的后台子代理小节"
             );
-            for needle in ["随包工具优先", "rg", "jq", "uv", "gh"] {
+            for needle in [
+                "随包工具优先",
+                "rg",
+                "jq",
+                "uv",
+                "gh",
+                "awk",
+                "tail",
+                "diff",
+            ] {
                 assert!(text.contains(needle), "{name} 应写明随包工具 {needle}");
             }
             assert!(
