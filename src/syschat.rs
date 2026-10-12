@@ -1,12 +1,15 @@
-//! 系统级对话（全局锚点气泡 / 无头 CLI 共用）：直接与随包 `abb-agent` 对话的后端。
+//! 系统级对话（全局锚点气泡 → AI 对话框）：直接与随包 `abb-agent` 对话的后端。
+//!
+//! ## 定位
+//!
+//! 这是**系统级 Owner Bot**：owner 身份、整机全权限，不经任何 IM 渠道。入口是托盘进程里的
+//! 全局锚点气泡（`AnchorBubble`）与它打开的 `SystemChatWindow`——**GUI 专属**：ABB 无头运行
+//! （`--service`）时不实例化任何窗口，那时与 ABB 对话只能走 IM bot（产品里本就如此）。
 //!
 //! ## 为什么单独成模块（不塞进 `ui.rs`）
 //!
-//! ABB 可以**无头运行**（`--service`，见 AGENTS.md）：系统级对话必须不依赖托盘 GUI
-//! 进程才能工作，气泡只是它的一个前端。故回合逻辑收在此处，由两处共用：
-//!
-//! - GUI：`AnchorBubble` 点击 → `SystemChatWindow` → [`turn`]（跑在 GUI 的后台 tokio 线程）；
-//! - CLI：`agent-bridge chat …` → [`run_chat_cli`]（无头/脚本可用，不需任何窗口）。
+//! 回合装配/历史上界/跨回合串行化是**可独立单测**的逻辑（mock agent 可驱动全链路），
+//! 与 Slint 窗口接线解耦；将来若要新增前端（或改由 service 托管）也只动这一个模块。
 //!
 //! ## 多轮语义
 //!
@@ -15,8 +18,8 @@
 //! 每轮的 prompt，历史落盘 `~/.agent-bridge/syschat/history.jsonl`，跨重启保留。
 //!
 //! 这**不是**服务端会话态，只是上下文重放——因此有明确上界（[`HISTORY_KEEP_TURNS`]），
-//! 免得每轮 token 成本线性增长。历史文件也可能被 GUI 与 CLI 同时写，故读写都在
-//! `history.lock` 独占锁内完成（fs2：Unix flock / Windows LockFileEx）。
+//! 免得每轮 token 成本线性增长。历史读写都在 `history.lock` 独占锁内完成（fs2：
+//! Unix flock / Windows LockFileEx），防止多线程/多窗口下的丢更新。
 
 use crate::config::Config;
 use crate::runtime::harness::{AgentConfig, SyncTurnOutcome};
@@ -169,7 +172,7 @@ fn append_turns(turns: &[Turn]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 清空历史（`agent-bridge chat --reset` / 对话窗「清空」）。
+/// 清空历史（对话窗「清空」）。
 pub fn clear_history() -> std::io::Result<()> {
     let _guard = HistoryLock::acquire()?;
     match std::fs::remove_file(history_path()) {
@@ -336,132 +339,6 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     Ok(reply)
 }
 
-/// `agent-bridge chat` 的已解析参数（纯数据，单测直接断言）。
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ChatArgs {
-    reset: bool,
-    json: bool,
-    help: bool,
-    /// 文本（多个位置参数用空格拼接）；None = 未给（走 stdin）。
-    text: Option<String>,
-}
-
-/// 解析 `chat` 子命令参数。未知 `--` 参数报错（不静默吞：脚本拼错参数却“成功”最坑）。
-fn parse_chat_args(args: &[String]) -> Result<ChatArgs, String> {
-    let mut out = ChatArgs::default();
-    let mut parts: Vec<String> = Vec::new();
-    for a in args {
-        match a.as_str() {
-            "--reset" => out.reset = true,
-            "--json" => out.json = true,
-            "--help" | "-h" => out.help = true,
-            other if other.starts_with("--") => return Err(format!("未知参数：{other}")),
-            other => parts.push(other.to_string()),
-        }
-    }
-    if !parts.is_empty() {
-        out.text = Some(parts.join(" "));
-    }
-    Ok(out)
-}
-
-/// `agent-bridge chat` 的入口（无头可用）。返回进程退出码。
-///
-/// 用法：
-///   agent-bridge chat [--reset] [--json] [文本]
-///   文本缺省时从 stdin 读（管道/脚本用）；读到空 → 用法错误。
-pub fn run_chat_cli(args: &[String]) -> i32 {
-    let parsed = match parse_chat_args(args) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            print_chat_usage();
-            return 2;
-        }
-    };
-    if parsed.help {
-        print_chat_usage();
-        return 0;
-    }
-
-    if parsed.reset {
-        match clear_history() {
-            Ok(()) => {
-                if parsed.json {
-                    println!("{{\"reset\":true}}");
-                } else {
-                    println!("已清空系统对话历史。");
-                }
-                return 0;
-            }
-            Err(e) => {
-                eprintln!("清空历史失败：{e}");
-                return 1;
-            }
-        }
-    }
-
-    let text = match parsed.text {
-        Some(t) => t,
-        None => {
-            use std::io::Read as _;
-            let mut buf = String::new();
-            if std::io::stdin().read_to_string(&mut buf).is_err() {
-                eprintln!("读取 stdin 失败。");
-                return 1;
-            }
-            buf
-        }
-    };
-    if text.trim().is_empty() {
-        eprintln!("没有要发送的内容。");
-        print_chat_usage();
-        return 2;
-    }
-
-    let cfg = match Config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("读取配置失败：{e:#}");
-            return 1;
-        }
-    };
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("初始化运行时失败：{e}");
-            return 1;
-        }
-    };
-    match rt.block_on(turn(&cfg, &text)) {
-        Ok(reply) => {
-            if parsed.json {
-                let v = serde_json::json!({ "reply": reply });
-                println!("{v}");
-            } else {
-                println!("{reply}");
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("对话失败：{e}");
-            1
-        }
-    }
-}
-
-fn print_chat_usage() {
-    eprintln!(
-        "用法：agent-bridge chat [--reset] [--json] [文本]\n\
-         \n\
-         与系统级 AI 助手（ABB 自带的 abb-agent）直接对话，不经任何 IM 渠道。\n\
-         不给文本时从 stdin 读取；--reset 清空历史；--json 以 JSON 输出回复。"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,39 +414,6 @@ mod tests {
         assert_eq!(back, t);
     }
 
-    // ── CLI 参数解析（纯函数，不碰文件/网络）──
-
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn parse_chat_args_plain_text_is_joined() {
-        let p = parse_chat_args(&args(&["帮我", "看看磁盘"])).unwrap();
-        assert!(!p.reset && !p.json && !p.help);
-        assert_eq!(p.text.as_deref(), Some("帮我 看看磁盘"));
-    }
-
-    #[test]
-    fn parse_chat_args_flags() {
-        let p = parse_chat_args(&args(&["--reset"])).unwrap();
-        assert!(p.reset && !p.json);
-        assert_eq!(p.text, None);
-        let p = parse_chat_args(&args(&["--json", "hi"])).unwrap();
-        assert!(p.json);
-        assert_eq!(p.text.as_deref(), Some("hi"));
-        assert!(parse_chat_args(&args(&["-h"])).unwrap().help);
-    }
-
-    #[test]
-    fn parse_chat_args_unknown_flag_is_error() {
-        let e = parse_chat_args(&args(&["--bogus"])).expect_err("未知 -- 参数应报错");
-        assert!(e.contains("未知参数"), "错误文案：{e}");
-        // 单破折号不是长参数，当文本处理（兼容负数/短横线开头的内容）
-        let p = parse_chat_args(&args(&["-v"])).unwrap();
-        assert_eq!(p.text.as_deref(), Some("-v"));
-    }
-
     #[test]
     fn agent_command_available_checks_path_and_existence() {
         // 空命令
@@ -617,7 +461,7 @@ mod tests {
             .collect()
     }
 
-    /// 无头路径的核心断言：装配好的 prompt 真送到 agent，回程文本原样返回。
+    /// GUI 路径的核心断言：装配好的 prompt 真送到 agent，回程文本原样返回。
     /// （echo 臂：mock 把 prompt 原文 echo 回来，据此证明"历史确实进了 prompt"。）
     #[tokio::test]
     #[cfg_attr(

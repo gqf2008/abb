@@ -984,8 +984,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub workspace_git_enabled: bool,
     /// 全局锚点气泡总开关（系统级对话入口）：true = 屏幕上常驻 ABB 悬浮球（点击打开
-    /// AI 对话框）。默认 true（owner 决策 2026-10-12）；关掉后仍可用 `agent-bridge chat`
-    /// （无头/CLI）或稍后从托盘菜单重新打开。
+    /// AI 对话框）。默认 true（owner 决策 2026-10-12）；关掉后可从托盘菜单重新打开。
     #[serde(default = "default_true")]
     pub syschat_bubble: bool,
     /// 「启动 / 停止 / 重启服务」的管理密码（2026-10-04 owner 要求：统一由 ABB 管理密码控制）。

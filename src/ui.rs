@@ -1766,9 +1766,10 @@ pub fn run_gui() -> Result<()> {
 
     use slint::ComponentHandle;
 
-    // ── 系统级对话：全局锚点气泡 + AI 对话框 ─────────────────────────────────
-    // ABB 无头运行（`--service`）时不实例化 GUI；那时同一能力走 `agent-bridge chat`
-    // （同一模块 syschat），气泡只是 GUI 前端。
+    // ── 系统级对话：全局锚点气泡 + AI 对话框（GUI 专属）───────────────────────
+    // 这是「系统级 Owner Bot」：owner 身份、整机全权限，不经任何 IM 渠道。
+    // 气泡只在托盘进程运行时存在——ABB 无头（`--service`）时不实例化任何窗口，
+    // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
     let syschat_model: Rc<slint::VecModel<SysChatMsgRow>> = Rc::new(slint::VecModel::default());

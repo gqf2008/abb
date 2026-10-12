@@ -328,10 +328,10 @@ fn oneshot_agent_config_inner(
     }
 }
 
-/// 系统级对话（全局锚点气泡 / 无头 `agent-bridge chat`）的 agent 配置。
+/// 系统级对话（全局锚点气泡 → AI 对话框）的 agent 配置。
 ///
 /// 与 [`oneshot_agent_config`]（按 bot 装配）的区别：系统级对话**不属于任何渠道 bot**——
-/// 没有 bot 配置、甚至无头运行（`--service`）时也必须能跑。
+/// 不依赖 bot 配置（无 bot 也能跑），角色是「系统级 Owner Bot」。
 ///
 /// 装配口径（owner 决策，2026-10-12）：
 /// - 供应商：全局默认（合成 bot 的 `provider` 留空 → `effective_provider` 回落 `default_provider`）；
@@ -2101,7 +2101,7 @@ mod tests {
         );
     }
 
-    /// 系统级对话装配（全局气泡 / 无头 `agent-bridge chat`）：
+    /// 系统级对话装配（全局锚点气泡）：
     /// 全局默认供应商 + **无沙箱（整机全权限）**，且不依赖任何 bot 配置。
     #[test]
     fn oneshot_agent_config_system_uses_default_provider_and_full_access() {
@@ -2115,7 +2115,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.providers = vec![prov];
         cfg.default_provider = "sys-default".into();
-        // 关键：没有 bots（无头/未接渠道也得能跑）。
+        // 关键：没有 bots（系统级对话不依赖任何渠道 bot）。
         assert!(cfg.bots.is_empty());
 
         let c = oneshot_agent_config_system(&cfg);
