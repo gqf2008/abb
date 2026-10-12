@@ -2556,7 +2556,7 @@ mod resource_event_tests {
         // 折行后留下一个空格，而 `handle_cmd(` 之后没有）。
         let needle = "if accepted { l.resource_throttle .mark_delivered(";
         assert!(
-            flat.contains(&needle),
+            flat.contains(needle),
             "记账必须落在 `if accepted`（= 真的入队）之内：{flat}"
         );
         assert!(

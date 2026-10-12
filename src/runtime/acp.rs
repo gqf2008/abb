@@ -258,7 +258,7 @@ fn log_resource_drop(site: usize, make: impl FnOnce(u64) -> String) {
 
 /// 首次 + 每 100 次（纯函数，便于单测钉住语义）。
 fn should_log_drop(n: u64) -> bool {
-    n == 1 || n % 100 == 0
+    n == 1 || n.is_multiple_of(100)
 }
 
 /// 三个告警点各自的累计计数（用 1-based 计数喂 `should_log_drop`）。
