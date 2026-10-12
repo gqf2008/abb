@@ -39,14 +39,14 @@ path = "src/main.rs"
 [dependencies]
 # rpi 库（library-first）：agent loop / LLM 协议适配 / 内置工具。
 # 版本与 crates.io 上的发布保持一致；本地锁文件固定实际解析结果。
-rpi-agent = "0.3.16"
+rpi-agent = "0.3.21"
 # 真实 HTTP provider（anthropic 等）在 rpi-ai 里**默认不编**，gated 在 `providers`
 # feature 后面——那是它「测试不可能悄悄依赖网络」的设计。本包需要真 LLM，故显式打开；
 # faux provider 不受影响（它不在该 feature 下），所以离线 smoke 仍然不联网。
-rpi-ai = { version = "0.3.16", features = ["providers"] }
+rpi-ai = { version = "0.3.21", features = ["providers"] }
 # 内置工具（read/write/edit/bash/grep/find/ls）+ 执行环境（OsExecutionEnv）。
 # 被替代组件把这些写在自持的 devtools.rs 里（4 个工具）；这里用 rpi 的移植版。
-rpi-tools = "0.3.16"
+rpi-tools = "0.3.21"
 
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "time", "sync", "io-util", "io-std", "process"] }
