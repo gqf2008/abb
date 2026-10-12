@@ -133,10 +133,15 @@ pub fn dev_tools_enabled(env: &dyn EnvSource) -> Result<bool, String> {
 /// （granted 会话能写工作区、有 shell——shell 的**内容**由 Jev 门禁判断），但**摘除
 /// `delegate`**（对齐参照物 `delegate_def_visible` 的 `shell != Restricted` 腿：委派 CLI
 /// 天生不受域闸约束，给了 = 白名单白做）。
+///
+/// `read_roots`（2026-10-12）：受限档的**附加只读根**（`_meta.readRoots`，如 bot 级
+/// `attachments/`）。会话 cwd 变成渠道目录后，用户发给 bot 的附件在 cwd 之外——
+/// 不给只读根的话受限会话就真读不到附件（能力回退）。只放宽**读**；写入仍限会话工作区。
 pub fn dev_tools(
     workspace: &Path,
     mode: SandboxMode,
     shell_restricted: bool,
+    read_roots: &[std::path::PathBuf],
 ) -> Vec<Arc<dyn AgentTool>> {
     let env: Arc<OsExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(workspace.to_path_buf()));
     let read_env: Arc<dyn ExecutionEnv> = env.clone();
@@ -157,7 +162,7 @@ pub fn dev_tools(
     };
 
     let read_guard = if mode.restrict_read() {
-        Guard::ReadPath
+        Guard::ReadPath(read_roots.to_vec())
     } else {
         Guard::None
     };
@@ -174,7 +179,7 @@ pub fn dev_tools(
     tools.push(exposed(
         create_read_tool(&context, Some(read_tool_options())),
         "read",
-        read_guard,
+        read_guard.clone(),
         workspace,
     ));
     if mode.allow_write() {
@@ -194,13 +199,13 @@ pub fn dev_tools(
     tools.push(exposed(
         create_ls_tool(&context, None),
         "ls",
-        read_guard,
+        read_guard.clone(),
         workspace,
     ));
     tools.push(exposed(
         create_grep_tool(&context, None),
         "grep",
-        read_guard,
+        read_guard.clone(),
         workspace,
     ));
     // rpi 的 `find` 入参就是 glob 模式（`pattern` + `path` + `limit`）⇒ 暴露成参照物的
@@ -208,7 +213,7 @@ pub fn dev_tools(
     tools.push(exposed(
         create_find_tool(&context, None),
         "glob",
-        read_guard,
+        read_guard.clone(),
         workspace,
     ));
     // 委派给本机 claude/codex CLI（参照物有、rpi 没有 ⇒ 本包自己实现，见 `delegate` 模块）。
@@ -231,15 +236,16 @@ pub fn dev_tools(
 }
 
 /// 工具执行前要做的那点额外事。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Guard {
     /// 原样委托。
     None,
     /// 写类工具：把 `path` 限定到会话工作区内（见 [`confine_write_path`]）。
     WritePath,
-    /// 读类工具：把 `path` 限定到会话工作区内（见 [`confine_read_path`]）。
+    /// 读类工具：把 `path` 限定到**会话工作区或附加只读根**内（见 [`confine_read_path`]）。
     /// 仅受限会话套用；owner 全权限用 `None`（对齐参照物 FullAccess 读任意路径）。
-    ReadPath,
+    /// 括号里是附加只读根（如 bot 级 `attachments/`）——它们是**读**域，仍不能写。
+    ReadPath(Vec<PathBuf>),
     /// shell：把 schema 的 `timeout_secs` 翻回 rpi 的 `timeout`。
     ShellTimeout,
 }
@@ -328,9 +334,10 @@ fn exposed(
              (absolute paths outside the workspace, `..` traversal, symlinks) are rejected.",
         );
     }
-    if guard == Guard::ReadPath {
+    if matches!(guard, Guard::ReadPath(_)) {
         description.push_str(
-            "\n\nPath is confined to the session workspace: paths outside it \
+            "\n\nPath is confined to the session workspace (plus a few read-only roots \
+             outside it, e.g. the bot-level attachments directory): paths outside them \
              (absolute paths, `..` traversal, symlinks) are rejected.",
         );
     }
@@ -410,10 +417,10 @@ impl AgentTool for Exposed {
         signal: CancellationToken,
         on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError> {
-        let params = match self.guard {
+        let params = match &self.guard {
             Guard::None => params,
             Guard::WritePath => self.confine(&params).await?,
-            Guard::ReadPath => self.confine_read(&params).await?,
+            Guard::ReadPath(roots) => self.confine_read(&params, roots).await?,
             Guard::ShellTimeout => rename_timeout_param(params),
         };
         self.inner
@@ -446,12 +453,16 @@ impl Exposed {
     ///
     /// 读类工具（read/ls/grep/find）的 `path` 是**可选**的：缺省 = 工作区（安全，原样委托），
     /// 给了才做 canonicalize + 前缀校验（与参照物受限档 `read_roots` 同语义）。
-    async fn confine_read(&self, params: &Value) -> Result<Value, AgentError> {
+    async fn confine_read(
+        &self,
+        params: &Value,
+        extra_roots: &[PathBuf],
+    ) -> Result<Value, AgentError> {
         let Some(raw) = params.get("path").and_then(Value::as_str) else {
             // 缺省 path（ls/grep/find 都不必填）= 工作区本身，无需拦。
             return Ok(params.clone());
         };
-        let target = confine_read_path(&self.workspace, raw)
+        let target = confine_read_path(&self.workspace, extra_roots, raw)
             .await
             .map_err(AgentError::Tool)?;
         let mut params = params.clone();
@@ -540,10 +551,21 @@ async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, Stri
 /// 分支同语义：相对路径按工作区为基准解、绝对路径原样，都 canonicalize 后再前缀比对。
 /// 符号链接同样被解掉（canonicalize 还原真实路径）——所以「工作区内指向工作区外的链接」
 /// 也读不到。与写域闸不同：读不创建父目录、不拒绝对路径（只要落在工作区内就放行）。
-async fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
+async fn confine_read_path(
+    workspace: &Path,
+    extra_roots: &[PathBuf],
+    raw: &str,
+) -> Result<PathBuf, String> {
     let base = tokio::fs::canonicalize(workspace)
         .await
         .map_err(|error| format!("会话工作区不可访问：{}（{error}）", workspace.display()))?;
+    // 附加只读根（如 bot 级 attachments/）：canonicalize 失败的根忽略（不存在就不算可读面）。
+    let mut roots: Vec<PathBuf> = vec![base.clone()];
+    for root in extra_roots {
+        if let Ok(canon) = tokio::fs::canonicalize(root).await {
+            roots.push(canon);
+        }
+    }
     let path = Path::new(raw);
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -553,9 +575,9 @@ async fn confine_read_path(workspace: &Path, raw: &str) -> Result<PathBuf, Strin
     let canon = tokio::fs::canonicalize(&candidate)
         .await
         .map_err(|error| format!("路径不可访问：{raw}（{error}）"))?;
-    if !canon.starts_with(&base) {
+    if !roots.iter().any(|root| canon.starts_with(root)) {
         return Err(format!(
-            "拒绝读取会话工作区之外：{raw}（工作区 {}）",
+            "拒绝读取会话工作区与只读根之外：{raw}（工作区 {}）",
             base.display()
         ));
     }
@@ -680,7 +702,12 @@ mod tests {
     #[test]
     fn tools_are_exposed_under_dev_namespace_with_replaced_component_shapes() {
         let workspace = temp_workspace("names");
-        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
+        let tools = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::FullAccess,
+            false,
+            &[],
+        );
         let names: Vec<String> = tools.iter().map(|t| t.schema().name.clone()).collect();
         for expected in [
             "dev__shell",
@@ -726,7 +753,12 @@ mod tests {
     fn tool_surface_follows_sandbox_mode() {
         let workspace = temp_workspace("mode");
 
-        let read_only = dev_tools(&workspace, crate::builtin::SandboxMode::ReadOnly, false);
+        let read_only = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::ReadOnly,
+            false,
+            &[],
+        );
         let ro_names: Vec<String> = read_only.iter().map(|t| t.schema().name.clone()).collect();
         for absent in ["dev__shell", "dev__write", "dev__edit", "dev__delegate"] {
             assert!(
@@ -745,6 +777,7 @@ mod tests {
             &workspace,
             crate::builtin::SandboxMode::WorkspaceWrite,
             false,
+            &[],
         );
         let ww_names: Vec<String> = ww.iter().map(|t| t.schema().name.clone()).collect();
         for present in ["dev__shell", "dev__write", "dev__edit", "dev__read"] {
@@ -754,7 +787,12 @@ mod tests {
             );
         }
 
-        let full = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
+        let full = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::FullAccess,
+            false,
+            &[],
+        );
         let full_names: Vec<String> = full.iter().map(|t| t.schema().name.clone()).collect();
         assert!(full_names.contains(&"dev__shell".to_string()));
 
@@ -764,6 +802,7 @@ mod tests {
             &workspace,
             crate::builtin::SandboxMode::WorkspaceWrite,
             true,
+            &[],
         );
         let granted_names: Vec<String> = granted.iter().map(|t| t.schema().name.clone()).collect();
         assert!(
@@ -807,7 +846,12 @@ mod tests {
     #[test]
     fn exposed_schemas_match_real_behavior() {
         let workspace = temp_workspace("docs");
-        let tools = dev_tools(&workspace, crate::builtin::SandboxMode::FullAccess, false);
+        let tools = dev_tools(
+            &workspace,
+            crate::builtin::SandboxMode::FullAccess,
+            false,
+            &[],
+        );
         let by_name = |name: &str| -> Arc<dyn AgentTool> {
             tools
                 .iter()
@@ -994,6 +1038,39 @@ mod tests {
         assert!(attempt.is_err(), "符号链接逃逸必须被拒：{attempt:?}");
     }
 
+    /// 附加只读根（`_meta.readRoots`，如 bot 级 `attachments/`）：受限会话可读它，
+    /// 但**根之外仍拒**（不能因为给了根就放宽成任意读）。卡 abb-channel-mcp-followups-20261012。
+    #[tokio::test]
+    async fn read_confinement_allows_extra_read_root_only() {
+        let workspace = temp_workspace("read-roots-ws");
+        let attachments = temp_workspace("read-roots-bot");
+        std::fs::write(workspace.join("inside.txt"), "IN").expect("建工作区内文件");
+        std::fs::write(attachments.join("a.png"), "IMG").expect("建附件");
+        let roots = vec![attachments.clone()];
+
+        let got = confine_read_path(
+            &workspace,
+            &roots,
+            &attachments.join("a.png").to_string_lossy(),
+        )
+        .await
+        .expect("只读根内的文件应可读");
+        assert!(got.ends_with("a.png"), "{got:?}");
+        confine_read_path(&workspace, &roots, "inside.txt")
+            .await
+            .expect("工作区仍可读");
+        let outside = confine_read_path(&workspace, &roots, "/etc/passwd").await;
+        assert!(outside.is_err(), "只读根之外的路径必须仍被拒：{outside:?}");
+        // 根不存在（已删/未建）时忽略该根，不 panic、也不放宽
+        let gone = vec![workspace.join("nope")];
+        assert!(confine_read_path(&workspace, &gone, "inside.txt")
+            .await
+            .is_ok());
+        assert!(confine_read_path(&workspace, &gone, "/etc/passwd")
+            .await
+            .is_err());
+    }
+
     /// 读域闸（统一迁移刀 3）：工作区内可读、`..` 与工作区外绝对路径被拒。
     #[tokio::test]
     async fn read_confinement_rejects_escapes() {
@@ -1001,7 +1078,7 @@ mod tests {
         std::fs::write(workspace.join("inside.txt"), "IN").expect("建工作区内文件");
         let canon = tokio::fs::canonicalize(&workspace).await.expect("canon");
 
-        let inside = confine_read_path(&workspace, "inside.txt")
+        let inside = confine_read_path(&workspace, &[], "inside.txt")
             .await
             .expect("工作区内相对路径应可读");
         assert!(inside.starts_with(&canon), "{inside:?}");
@@ -1009,14 +1086,14 @@ mod tests {
         // （`\\?\C:\…`），字符串拼 `/` 会得到 verbatim 路径不接受的形态
         // （os error 123「文件名、目录名或卷标语法不正确」）——那是用例装置问题，不是读域闸。
         let absolute_raw = canon.join("inside.txt");
-        let absolute_inside = confine_read_path(&workspace, &absolute_raw.to_string_lossy())
+        let absolute_inside = confine_read_path(&workspace, &[], &absolute_raw.to_string_lossy())
             .await
             .expect("工作区内绝对路径应可读");
         assert!(absolute_inside.starts_with(&canon));
 
-        let escape = confine_read_path(&workspace, "../escape.txt").await;
+        let escape = confine_read_path(&workspace, &[], "../escape.txt").await;
         assert!(escape.is_err(), "`..` 逃逸必须被拒：{escape:?}");
-        let outside = confine_read_path(&workspace, "/etc/passwd").await;
+        let outside = confine_read_path(&workspace, &[], "/etc/passwd").await;
         assert!(outside.is_err(), "工作区外绝对路径必须被拒：{outside:?}");
     }
 
@@ -1029,7 +1106,7 @@ mod tests {
         std::fs::write(outside.join("secret.txt"), "SECRET").expect("建工作区外文件");
         let link = workspace.join("link.txt");
         std::os::unix::fs::symlink(outside.join("secret.txt"), &link).expect("建符号链接");
-        let attempt = confine_read_path(&workspace, "link.txt").await;
+        let attempt = confine_read_path(&workspace, &[], "link.txt").await;
         assert!(
             attempt.is_err(),
             "指向工作区外的符号链接必须被拒：{attempt:?}"
@@ -1084,7 +1161,7 @@ mod tests {
             .expect("编码 PNG");
         std::fs::write(workspace.join("big.png"), png.into_inner()).expect("写测试图");
 
-        let tools = dev_tools(&workspace, SandboxMode::FullAccess, false);
+        let tools = dev_tools(&workspace, SandboxMode::FullAccess, false, &[]);
         let read = tools
             .iter()
             .find(|t| t.schema().name == "dev__read")

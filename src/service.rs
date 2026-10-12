@@ -141,6 +141,7 @@ fn resolve_sandbox_meta(
         crate::config::SandboxMode::ReadOnly => Some(crate::runtime::acp::SessionSandboxMeta {
             sandbox: Some("read-only".to_string()),
             writable_roots: Some(vec![root]),
+            read_roots: None,
             shell: None,
             abb_bin: None,
         }),
@@ -148,6 +149,7 @@ fn resolve_sandbox_meta(
             Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec![root]),
+                read_roots: None,
                 shell: None,
                 abb_bin: None,
             })
@@ -187,6 +189,7 @@ fn granted_sandbox_profile(
     crate::runtime::acp::SessionSandboxMeta {
         sandbox: Some("workspace-write".to_string()),
         writable_roots: Some(vec![root]),
+        read_roots: None,
         shell: Some("restricted".to_string()),
         abb_bin: (!abb_bin.is_empty()).then_some(abb_bin),
     }

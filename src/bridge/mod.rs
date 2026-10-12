@@ -4792,6 +4792,7 @@ mod tests {
             Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec!["/tmp/abb-granted-ws".to_string()]),
+                read_roots: None,
                 shell: Some("restricted".to_string()),
                 abb_bin: Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string()),
             }),
@@ -4849,6 +4850,8 @@ mod tests {
             gm["writableRoots"],
             serde_json::json!([granted_ws.display().to_string()])
         );
+        // 写域跟着渠道目录，**原 bot 工作区降级为只读根**（附件可读；卡 abb-channel-mcp-followups-20261012）
+        assert_eq!(gm["readRoots"], serde_json::json!(["/tmp/abb-granted-ws"]));
         assert_eq!(gm["shell"], "restricted");
         assert_eq!(
             gm["abbBin"],
@@ -4885,6 +4888,7 @@ mod tests {
             Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
+                read_roots: None,
                 shell: Some("restricted".to_string()),
                 abb_bin: None,
             }),
@@ -4955,6 +4959,7 @@ mod tests {
             Some(crate::runtime::acp::SessionSandboxMeta {
                 sandbox: Some("workspace-write".to_string()),
                 writable_roots: Some(vec!["/tmp/abb-ws".to_string()]),
+                read_roots: None,
                 shell: Some("restricted".to_string()),
                 abb_bin: None,
             }),

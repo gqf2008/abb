@@ -358,6 +358,11 @@ impl Server {
                 &workspace,
                 parsed.sandbox_mode(),
                 parsed.shell.as_deref() == Some("restricted"),
+                &parsed
+                    .read_roots
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>(),
             );
             tracing::info!(
                 "会话 {session_id}：内置工具 {} 个：{:?}",
@@ -720,6 +725,9 @@ struct SessionNewParams {
     sandbox: Option<String>,
     /// `_meta.shell`："restricted" = argv 白名单（granted 承诺语义）；缺省 = Full。
     shell: Option<String>,
+    /// `_meta.readRoots`：受限档的**附加只读根**（会话 cwd 之外可读的绝对路径，
+    /// 如 bot 级 `attachments/`）。空 = 只读会话工作区。
+    read_roots: Vec<String>,
 }
 
 impl SessionNewParams {
@@ -752,12 +760,27 @@ impl SessionNewParams {
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|value| !value.trim().is_empty());
+        // 只读根：形状不对（非数组/含空串）就忽略那一项，不静默丢掉整张名单。
+        let read_roots = meta
+            .and_then(|m| m.get("readRoots"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Ok(Self {
             cwd,
             system_prompt,
             mcp_servers,
             sandbox,
             shell,
+            read_roots,
         })
     }
 

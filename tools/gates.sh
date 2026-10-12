@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
 done
 
 # 平台默认 base：macOS = 数据卷 /Volumes/DataExt/tmp（2026-09-17 政策）；
-# Windows（Git Bash/MSYS）本机数据卷是 E:，统一放 E:\tmp；其它平台退回 $TMPDIR。
+# Windows（Git Bash/MSYS）本机数据卷是 E:，统一放 E:\tmp；其它平台退回 ${TMPDIR}。
 os="$(printf '%s' "${ABB_GATES_OS:-$(uname -s)}" | tr '[:upper:]' '[:lower:]')"
 case "$os" in
   darwin*) default_base=/Volumes/DataExt/tmp ;;
@@ -74,7 +74,7 @@ fi
 repo_real="$(cd "$repo_root" && pwd -P)"
 case "$base" in
   "$repo_real" | "$repo_real"/*)
-    echo "❌ 构建中间产物不许落在 checkout 内：base=$base（repo=$repo_real）" >&2
+    echo "❌ 构建中间产物不许落在 checkout 内：base=${base}（repo=${repo_real}）" >&2
     echo "   macOS: ABB_BUILD_TMP=/Volumes/DataExt/tmp；Windows: ABB_BUILD_TMP=/e/tmp" >&2
     echo "   详见 AGENTS.md 的 Build/Test 段与线程 abb-build-tmp-windows-20261011。" >&2
     exit 1
@@ -106,9 +106,9 @@ fi
 mkdir -p "$CARGO_TARGET_DIR"
 
 cd "$repo_root"
-echo "== ABB 门禁（中间产物外置于 $CARGO_TARGET_DIR）=="
+echo "== ABB 门禁（中间产物外置于 ${CARGO_TARGET_DIR}）=="
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo build --locked
 tools/check_test_isolation.sh
-echo "✅ 四条门禁全绿；checkout 内未产生 target/（中间产物在 $CARGO_TARGET_DIR）"
+echo "✅ 四条门禁全绿；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR}）"

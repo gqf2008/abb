@@ -751,18 +751,7 @@ impl AcpClient {
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
         if let Some(m) = sandbox_meta {
-            if let Some(s) = &m.sandbox {
-                params["_meta"]["sandbox"] = serde_json::Value::String(s.clone());
-            }
-            if let Some(roots) = &m.writable_roots {
-                params["_meta"]["writableRoots"] = serde_json::json!(roots);
-            }
-            if let Some(sh) = &m.shell {
-                params["_meta"]["shell"] = serde_json::Value::String(sh.clone());
-            }
-            if let Some(bin) = &m.abb_bin {
-                params["_meta"]["abbBin"] = serde_json::Value::String(bin.clone());
-            }
+            apply_sandbox_meta(&mut params, m);
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -2102,6 +2091,9 @@ pub struct SessionNewResponse {
 pub struct SessionSandboxMeta {
     pub sandbox: Option<String>,
     pub writable_roots: Option<Vec<String>>,
+    /// 附加**只读**根（`_meta.readRoots`）：会话 cwd 之外可读、但不可写的绝对路径。
+    /// 现用于 bot 级 `attachments/`（P1 把会话 cwd 改成渠道目录后，附件落在 cwd 外）。
+    pub read_roots: Option<Vec<String>>,
     pub shell: Option<String>,
     pub abb_bin: Option<String>,
 }
@@ -2118,9 +2110,40 @@ impl SessionSandboxMeta {
     pub fn retarget_writable_root(&self, root: &str) -> Self {
         let mut next = self.clone();
         if next.writable_roots.is_some() {
+            // 原 writable_roots（= bot 工作区）降级为**只读根**：会话 cwd/写域变成渠道目录后，
+            // 用户发给 bot 的 `attachments/` 等仍在 bot 工作区，受限会话得能读（否则能力回退）；
+            // 写只留在渠道目录，比 P1 之前（整个 bot 工作区可写）更紧。
+            if next.read_roots.is_none() {
+                next.read_roots = next.writable_roots.clone();
+            }
             next.writable_roots = Some(vec![root.to_string()]);
         }
         next
+    }
+}
+
+/// 把执行档位载荷合并进 `session/new` 的 `params._meta`（键名 camelCase，None ⇒ 成员缺省）。
+///
+/// 抽成纯函数是为了让"键名/缺省语义"的测试**真跑生产代码**——此前那份测试把这段逻辑
+/// 复制了一份，改生产不改副本也照样绿（等于没测）。
+fn apply_sandbox_meta(params: &mut serde_json::Value, m: &SessionSandboxMeta) {
+    if let Some(s) = &m.sandbox {
+        params["_meta"]["sandbox"] = serde_json::Value::String(s.clone());
+    }
+    if let Some(roots) = &m.writable_roots {
+        params["_meta"]["writableRoots"] = serde_json::json!(roots);
+    }
+    // 受限档的**附加只读根**（会话 cwd 之外可读的绝对路径，2026-10-12）：会话 cwd 变成
+    // 渠道目录后，bot 级 `attachments/` 等落在 cwd 外——不给这个，受限会话就真读不到
+    // 用户发来的附件（能力回退）。写域仍只有 `writableRoots`。
+    if let Some(roots) = &m.read_roots {
+        params["_meta"]["readRoots"] = serde_json::json!(roots);
+    }
+    if let Some(sh) = &m.shell {
+        params["_meta"]["shell"] = serde_json::Value::String(sh.clone());
+    }
+    if let Some(bin) = &m.abb_bin {
+        params["_meta"]["abbBin"] = serde_json::Value::String(bin.clone());
     }
 }
 
@@ -2318,6 +2341,38 @@ mod tests {
         assert!(!client.abb_sandbox_supports("workspace-write"));
     }
 
+    /// 会话 cwd 切到渠道目录时（P1）：写域 = 渠道目录，**原 bot 工作区降级为只读根**
+    /// （这样受限会话仍能读 bot 级 `attachments/`，见卡 abb-channel-mcp-followups-20261012）。
+    #[test]
+    fn retarget_keeps_bot_workspace_as_read_root() {
+        let m = SessionSandboxMeta {
+            sandbox: Some("workspace-write".to_string()),
+            writable_roots: Some(vec!["/bot/ws".to_string()]),
+            read_roots: None,
+            shell: None,
+            abb_bin: None,
+        };
+        let n = m.retarget_writable_root("/bot/ws/oc_x");
+        assert_eq!(n.writable_roots, Some(vec!["/bot/ws/oc_x".to_string()]));
+        assert_eq!(
+            n.read_roots,
+            Some(vec!["/bot/ws".to_string()]),
+            "原 bot 工作区必须变成只读根"
+        );
+        // 已显式配了 read_roots 就不覆盖
+        let explicit = SessionSandboxMeta {
+            read_roots: Some(vec!["/ro".to_string()]),
+            ..m.clone()
+        };
+        assert_eq!(
+            explicit.retarget_writable_root("/x").read_roots,
+            Some(vec!["/ro".to_string()])
+        );
+        // FullAccess（None）不动
+        let full = SessionSandboxMeta::default().retarget_writable_root("/x");
+        assert!(full.writable_roots.is_none() && full.read_roots.is_none());
+    }
+
     /// SessionSandboxMeta 的 camelCase 键名必须逐字节等于执行层 `SessionNewMeta`
     ///（`rename_all = "camelCase"`）——sandbox /
     /// writableRoots / shell / abbBin。任一字段 None ⇒ 该 `_meta` 成员整体缺省
@@ -2328,26 +2383,25 @@ mod tests {
         let m = SessionSandboxMeta {
             sandbox: Some("workspace-write".to_string()),
             writable_roots: Some(vec!["/ws/a".to_string()]),
+            read_roots: Some(vec!["/bot/attachments".to_string()]),
             shell: Some("restricted".to_string()),
             abb_bin: Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string()),
         };
         let mut params = serde_json::json!({ "cwd": "/ws/a", "mcpServers": [] });
-        if let Some(s) = &m.sandbox {
-            params["_meta"]["sandbox"] = serde_json::Value::String(s.clone());
-        }
-        if let Some(roots) = &m.writable_roots {
-            params["_meta"]["writableRoots"] = serde_json::json!(roots);
-        }
-        if let Some(sh) = &m.shell {
-            params["_meta"]["shell"] = serde_json::Value::String(sh.clone());
-        }
-        if let Some(bin) = &m.abb_bin {
-            params["_meta"]["abbBin"] = serde_json::Value::String(bin.clone());
-        }
+        // 跑**生产**函数（不是复制一份逻辑——复制版会掩盖生产侧漏改）
+        apply_sandbox_meta(&mut params, &m);
         assert_eq!(params["_meta"]["sandbox"], "workspace-write");
         assert_eq!(
             params["_meta"]["writableRoots"],
             serde_json::json!(["/ws/a"])
+        );
+        assert_eq!(
+            params["_meta"]["readRoots"],
+            serde_json::json!(["/bot/attachments"])
+        );
+        assert!(
+            params["_meta"].get("read_roots").is_none(),
+            "键名必须 camelCase"
         );
         assert_eq!(params["_meta"]["shell"], "restricted");
         assert_eq!(
@@ -2362,6 +2416,7 @@ mod tests {
         let ro = SessionSandboxMeta {
             sandbox: Some("read-only".to_string()),
             writable_roots: Some(vec!["/ws/a".to_string()]),
+            read_roots: None,
             shell: None,
             abb_bin: None,
         };
