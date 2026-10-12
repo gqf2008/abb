@@ -457,6 +457,11 @@ fn is_bridge_state_path(p: &str) -> bool {
                 | "claude.md"
                 | "agents.md"
                 | ".mcp.json"
+                // 渠道级 MCP 配置（卡 abb-channel-mcp-config-20261012）：与 `.mcp.json` 同类——
+                // 声明一个 server = 它会被 abb-agent **以用户身份、无沙箱**起（白名单 env 含 HOME/$ABB_BIN）。
+                // 受限会话若能写它，下一条 **owner** 消息重建会话时就会执行它 ⇒ 受限→owner 的提权链
+                // （卡 abb-channel-mcp-write-escalation-20261012）。
+                | "mcp.json"
         ) || name.starts_with("jobs.json.migrated")
             || name.ends_with(".agents.md")
             || name.ends_with(".claude.md")
@@ -1954,6 +1959,24 @@ mod tests {
             check_file_paths("Write", &serde_json::json!({"file_path": ".mcp.json"}), &ws),
             Decision::Allow
         );
+        // 渠道 mcp.json：同一类（abb-agent 会**无沙箱**起它声明的 server）——受限会话不得改写，
+        // 否则下一条 owner 消息重建会话即执行（卡 abb-channel-mcp-write-escalation-20261012）。
+        // 变体一起测：大小写、尾随点/空格（APFS/NTFS 会剥离）、子目录与穿越形态。
+        for p in [
+            "mcp.json",
+            "MCP.JSON",
+            "mcp.json.",
+            "sub/mcp.json",
+            "sub/../mcp.json",
+        ] {
+            match check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws) {
+                Decision::Deny(why) => assert!(
+                    why.contains("桥状态"),
+                    "{p} 应因桥状态文件被拒，实际原因：{why}"
+                ),
+                other => panic!("{p} 必须被拒（mcp.json 是提权通道），实际 {other:?}"),
+            }
+        }
         // .claude/**：settings/hooks 全权限执行；组件级匹配（含子目录与穿越形态）
         for p in [
             ".claude/settings.json",
