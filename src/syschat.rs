@@ -79,11 +79,34 @@ pub fn workspace() -> PathBuf {
     crate::workspace_dir(SYSCHAT_KEY)
 }
 
-/// 气泡位置（逻辑像素）。持久化在 `bubble.json`。
+/// 气泡位置（**逻辑像素**）。持久化在 `bubble.json`。
+///
+/// 全链路统一逻辑像素：恢复用 `LogicalPosition`、首次默认位按逻辑屏宽算、拖拽保存也
+/// 换算成逻辑后再存（见 [`BubblePos::from_physical`]）。混用物理/逻辑会在 Retina(2x)
+/// 上让位置每次重启翻倍（评审 R3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BubblePos {
     pub x: i32,
     pub y: i32,
+}
+
+impl BubblePos {
+    /// 把 winit `WindowEvent::Moved` 的**物理**像素换算成**逻辑**像素后存盘。
+    ///
+    /// 为什么需要：winit 的 `Moved` 给的是物理像素（macOS 侧显式
+    /// `LogicalPosition::to_physical(scale_factor)`），而本类型存的是逻辑像素。
+    /// scale_factor ≤ 0（异常/拿不到）时按 1 处理，避免除零产生 inf → 饱和成 i32::MAX。
+    pub fn from_physical(x: i32, y: i32, scale_factor: f32) -> Self {
+        let s = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        Self {
+            x: (x as f32 / s).round() as i32,
+            y: (y as f32 / s).round() as i32,
+        }
+    }
 }
 
 /// 读气泡位置；文件缺失/损坏返回 None（调用方用默认位）。
@@ -431,6 +454,30 @@ mod tests {
         assert!(!line.contains('\n'), "JSONL 单行化：{line}");
         let back: Turn = serde_json::from_str(&line).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn bubble_pos_from_physical_normalizes_retina() {
+        // Retina 2x：物理 (200,100) → 逻辑 (100,50)
+        assert_eq!(
+            BubblePos::from_physical(200, 100, 2.0),
+            BubblePos { x: 100, y: 50 }
+        );
+        // 1x：原样
+        assert_eq!(
+            BubblePos::from_physical(100, 50, 1.0),
+            BubblePos { x: 100, y: 50 }
+        );
+        // scale ≤ 0（异常）：按 1 处理，不产生 NaN/inf
+        assert_eq!(
+            BubblePos::from_physical(10, 20, 0.0),
+            BubblePos { x: 10, y: 20 }
+        );
+        // 负坐标（副屏在主屏左侧）也按同一换算
+        assert_eq!(
+            BubblePos::from_physical(-300, 40, 2.0),
+            BubblePos { x: -150, y: 20 }
+        );
     }
 
     #[test]

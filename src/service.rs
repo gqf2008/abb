@@ -2133,9 +2133,9 @@ mod tests {
             env.get("OPENAI_COMPAT_BASE_URL").map(String::as_str),
             Some("https://sys.example.com/v1")
         );
-        // 命令槽：无档位（整车全权限）⇒ 走无沙箱槽（pick_command_by_sandbox(_, false)）。
-        // （两个命令槽当前都解析到 abb-agent，本断言主要锁「传下去的 sandboxed 谓词是 false」；
-        //  非空断言单独保留，防两边同时解析成空。）
+        // 命令槽：当前 `pick_command_by_sandbox` **忽略第二个入参**（恒返回 owner 槽，见其注释），
+        // 故本断言实际只锁「c.command == owner 槽」，对「是否传了 false」**不具区分度**；
+        // 非空断言单独保留，防两边同时解析成空。等该函数恢复按档位选槽后本断言才真正承重。
         let (owner_cmd, granted_cmd) = resolve_acp_commands();
         assert_eq!(
             c.command,

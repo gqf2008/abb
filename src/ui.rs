@@ -5217,13 +5217,19 @@ pub fn run_gui() -> Result<()> {
 
     // ── 系统级对话：气泡点击 → 对话框；发消息 → 后台 syschat 回合 ──────────────
     // 气泡拖动位置持久化：拖动会产生成串 Moved 事件，400ms 去抖后才写盘（避免每帧写文件）。
-    let bubble_pos_pending: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
+    // **坐标系**：winit 的 `Moved` 给**物理**像素，而 BubblePos/set_position 全用**逻辑**像素
+    // （Retina 2x 下不换算会让存盘位置每次重启翻倍——评审 R3）。故这里先换逻辑再缓存。
+    let bubble_pos_pending: Rc<Cell<Option<crate::syschat::BubblePos>>> = Rc::new(Cell::new(None));
     {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
         let pending = bubble_pos_pending.clone();
-        bubble.window().on_winit_window_event(move |_w, ev| {
+        bubble.window().on_winit_window_event(move |w, ev| {
             if let WindowEvent::Moved(pos) = ev {
-                pending.set(Some((pos.x, pos.y)));
+                pending.set(Some(crate::syschat::BubblePos::from_physical(
+                    pos.x,
+                    pos.y,
+                    w.scale_factor(),
+                )));
             }
             EventResult::Propagate
         });
@@ -5233,8 +5239,8 @@ pub fn run_gui() -> Result<()> {
             slint::TimerMode::Repeated,
             Duration::from_millis(400),
             move || {
-                if let Some((x, y)) = pending.take() {
-                    crate::syschat::save_bubble_pos(crate::syschat::BubblePos { x, y });
+                if let Some(pos) = pending.take() {
+                    crate::syschat::save_bubble_pos(pos);
                 }
             },
         );
