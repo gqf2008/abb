@@ -1,0 +1,8 @@
+# 取件/校验链路的数据文件与脚本必须保持 LF（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：
+# Windows 检出若走 core.autocrlf=true（GitHub runner 默认），tsv 会变 CRLF ⇒ bash 侧逐行解析的最后字段
+# 带 `\r`，`case "$out" in *"$suffix")` 对 `.exe` 行永不匹配（空 suffix 却匹配一切，所以只有 windows 行报错）。
+# v2.23.115 的 CI 就是"8 行 windows 行全不符"。这里从源头钉住 EOL，脚本侧另有 strip_cr 双保险。
+tools/tool-lock.tsv -text
+tools/bundled-cli-tools.tsv -text
+tools/*.sh text eol=lf
+tools/*.ps1 text eol=crlf

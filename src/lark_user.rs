@@ -212,6 +212,13 @@ mod tests {
     use super::*;
 
     /// 取锁（被 panic 毒化也照用：毒化只说明别的用例失败过，与本用例无关）。
+    ///
+    /// `#[cfg(unix)]` 是**cfg 对称**（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：
+    /// 只有 `unix` 上那几条"假 CLI 脚本"用例用它；不加门控时 Windows 上它是 dead code，
+    /// 而 CI 的 `cargo clippy --all-targets -- -D warnings` 会把 `dead_code` 当 error
+    /// （实测：Windows job 在 `src/lark_user.rs:215` 报 `fn env_guard is never used`）。
+    /// 不要再"为了统一"把它放开：跨平台的并发用例用 `ENV_LOCK` 本身，不需要这个 helper。
+    #[cfg(unix)]
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }

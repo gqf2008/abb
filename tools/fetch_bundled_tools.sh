@@ -47,6 +47,10 @@ esac
 if [ "$PLATFORM" = "windows-x64" ]; then suffix=".exe"; else suffix=""; fi
 
 found=0
+# 剥 CR（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：Windows 检出（core.autocrlf=true）
+# 会把 tsv 变 CRLF ⇒ 逐行读到的最后字段带 `\r`，按名/后缀判定全错。仓库根另有 .gitattributes 钉 EOL。
+strip_cr() { tr -d '\r'; }
+
 while IFS=$'\t' read -r tool version platform package url sha256 inner_path output_name; do
   [ "$tool" = "tool" ] && continue
   [ "$platform" = "$PLATFORM" ] || continue
@@ -202,7 +206,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       echo "$name 不可执行（rc=$rc）" >&2; exit 1
     fi
   done < "$tmp/check-names.txt"
-done < tools/tool-lock.tsv
+done < <(strip_cr < tools/tool-lock.tsv)
 
 # 计数 = lock 里该平台的**包**数（多调包一个包提供多个工具名，故不再与工具名数相等）。
 [ "$found" -eq "$(awk -F'\t' -v p="$PLATFORM" 'NR>1 && $3==p {n++} END {print n}' tools/tool-lock.tsv)" ] || {
