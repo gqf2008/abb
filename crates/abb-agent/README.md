@@ -147,6 +147,20 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
     ⇒ 本包自己降级成**如实**的一行文本
     （`[image 未传给模型：…]`），并把 `input` 保持为 `[Text]`。声明 `Image` 反而更差：那会把「如实
     说明被省略」换成「指着一张不存在的图」。上游修好后把 `delivers_tool_result_images` 翻真即可。
+- **`read` 工具的图片处理（本卡新增）**：注入了 rpi-tools 自带的 `InlineImageProcessor`
+  （`read_tool_options()`），于是把图片读给模型时是「解码 → 按 EXIF 摆正 → 缩到
+  `INLINE_IMAGE_MAX_SIDE`=2000 → 必要时转码（BMP/超大图 → PNG/JPEG）」，而不是"原字节 inline、不缩放"。
+  rpi 的默认是 **不注入**（`image_processor: None`）——那种默认下**支持的格式原字节 inline、不缩放**，
+  只有 BMP 给一行"已省略"；**像素上限本身不会丢图**（不装处理器时它是原样回来的）。装上处理器后 read 侧
+  真实的丢弃口径是 rpi `tools/read.rs`「`process` 返 `Err` ⇒ 图不进 content、改回一段纯文本错误」——
+  这条路**本卡接线才引入**。（本仓那个 8 MiB 字节预算只看 **MCP 工具结果**，内置 `dev__read` 不经过它，
+  别混为一谈。）
+  判据分两层：**端到端**走真实 `dev__read` 工具（2500×100 PNG ⇒ 返回 `Image` part 且 2000×80、比例保持）
+  ——不装处理器/换成不缩放的实现都会红；**库层**另有三条用例（选项接线 / 等比缩小 / BMP 转 PNG），其中只有
+  "选项接线"那条有阴性对照——**它钉的是 helper 的两个字段**（`image_processor` 置 `None`、或
+  `auto_resize_images` 置 `false`，都会让它红——评审变异 D 实测），而把**构造点**改回 `None` 不会让它红
+  （那由上面那条端到端用例负责），另两条只覆盖 rpi 库行为、不覆盖本仓接线。
+
   单个工具结果受预算约束：**文本 + 图片合计** 8 MiB、**整条结果的文本** 50 KiB（两个额度都
   **累计**，与 fork 的 `used`/`text_used` 同义），超限中间省略；超预算的图片降级成一行说明；
   音频等 rpi 侧无对应 part 的类型同样留一行痕迹，不静默吞。

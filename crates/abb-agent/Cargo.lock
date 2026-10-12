@@ -7,7 +7,9 @@ name = "abb-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "dirs 6.0.0",
+ "image",
  "reqwest",
  "rmcp",
  "rpi-agent",

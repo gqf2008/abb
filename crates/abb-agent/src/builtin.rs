@@ -34,7 +34,7 @@ use rpi_ai::types::{Schema, Tool};
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
     create_read_tool, create_write_tool, BashToolOptions, ExecutionEnv, ExecutionToolContext,
-    MutatingEnv, OsExecutionEnv,
+    MutatingEnv, OsExecutionEnv, ReadToolOptions,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -172,7 +172,7 @@ pub fn dev_tools(
         ));
     }
     tools.push(exposed(
-        create_read_tool(&context, None),
+        create_read_tool(&context, Some(read_tool_options())),
         "read",
         read_guard,
         workspace,
@@ -250,6 +250,54 @@ struct Exposed {
     inner: Arc<dyn AgentTool>,
     guard: Guard,
     workspace: PathBuf,
+}
+
+/// `read` 工具的选项：接上 rpi-tools 自带的 `InlineImageProcessor`。
+///
+/// 为什么（卡 `abb-agent-image-processor-wiring-20261012`）：rpi-tools 从 0.3.16 起就有
+/// `ReadImageProcessor` seam，但**默认不注入实现**——那种默认下，`read` 对支持的图片格式
+/// （PNG/JPEG/GIF/WebP）是**原字节 inline、不缩放**（`rpi-tools/src/tools/read.rs` 的 None 分支），
+/// 只有 BMP 会给一行"已省略"提示。接上 0.3.21 的实现后，`read` 会把图片
+/// **解码 → 按 EXIF 摆正 → 缩到 `INLINE_IMAGE_MAX_SIDE` → 需要时转码**（BMP/超大图 → PNG/JPEG）。
+///
+/// **别把"丢图"归到像素上限**（评审第 2 轮 F5、第 3 轮更正）：像素上限**不会**导致图片被丢——
+/// 不装处理器时它是原样回来的。装上处理器后，`read` 侧**真实的**丢弃口径是 rpi 的
+/// `tools/read.rs`「`process` 返 `Err` ⇒ 该图不进 content，改回一段纯文本错误」（**本卡接线才引入**这条路：
+/// `image_processor: None` 时压根不调 `process`）。
+///
+/// 另注：本仓的 `TOOL_RESULT_TOTAL_BYTES = 8 MiB`（`src/mcp.rs`）只看 **MCP 工具结果**（`McpTool::execute`
+/// → `tool_result_content`），**内置 `dev__read` 不经过它**——别把它写成 read 的预算（第 3 轮评审实测的机制错配）。
+/// 接上处理器的收益是"超大图**缩放后仍能进模型**"，而不是"从丢掉变成不丢"。
+///
+/// `auto_resize_images: true` 是 rpi 的默认值，这里显式写出，表示我们**要**这个行为而不是碰巧继承它。
+/// 注意边界：这只影响 **read 工具**里的图片；`Content::Image` 到了 anthropic 的**工具结果**序列化层
+/// 仍会被换成占位文本（上游 TODO，见 README）。
+fn read_tool_options() -> ReadToolOptions {
+    ReadToolOptions {
+        auto_resize_images: true,
+        image_processor: image_processor_from(std::env::var(IMAGE_PROCESSOR_ENV).ok().as_deref()),
+    }
+}
+
+/// 图片处理器开关的**环境变量名**（与 `ABB_AGENT_DEV_TOOLS` 同惯例：默认开、值 `0` 关）。
+pub const IMAGE_PROCESSOR_ENV: &str = "ABB_AGENT_IMAGE_PROCESSOR";
+
+/// 从环境值判定是否装处理器（**可注入版本**，单测不改进程全局 env）。
+///
+/// 语义（对齐 `dev_tools_enabled_from`）：
+/// - 缺省（未设置）或任意非 `0` 值 ⇒ **装**（默认开：这是"读图别把大图丢掉"的能力，默认关会让用户
+///   看到"图片被省略"却不知道为什么）；
+/// - `"0"` ⇒ 不装（退回 rpi 默认：原样 inline 或省略提示）——给排障/回退留一条路；
+/// - 读不懂（非数字）⇒ 也**装**（这里不是安全闸，容忍非法值比"悄悄关掉能力"更符合预期，且与
+///   `dev_tools_enabled_from` 的"响亮失败"动机不同：那条是配置错误可见性，这条没有安全含义）。
+pub fn image_processor_from(
+    value: Option<&str>,
+) -> Option<std::sync::Arc<dyn rpi_tools::ReadImageProcessor>> {
+    let enabled = !matches!(value.map(str::trim), Some("0"));
+    enabled.then(|| {
+        std::sync::Arc::new(rpi_tools::image_processing::InlineImageProcessor)
+            as std::sync::Arc<dyn rpi_tools::ReadImageProcessor>
+    })
 }
 
 fn exposed(
@@ -986,5 +1034,201 @@ mod tests {
             attempt.is_err(),
             "指向工作区外的符号链接必须被拒：{attempt:?}"
         );
+    }
+    /// 接线判据（卡 `abb-agent-image-processor-wiring-20261012`）：`read` 工具的选项**必须**装了
+    /// 图片处理器、且显式打开自动缩放——rpi 的默认是 `image_processor: None`，那时支持的格式
+    /// **原字节 inline、不缩放**（仅 BMP 给"已省略"）；**像素上限本身不会丢图**（不装处理器时图是原样回来的）。
+    ///
+    /// 判别力（**按评审第 2 轮 F4 更正**）：**在 helper 里把 `image_processor` 置 None ⇒ 本用例红**（实测）。
+    /// 而"把 `:175` 的构造点改回 `None`"**不会**让本用例红（本用例只观察 helper 的返回值）——那一层由
+    /// `read_tool_is_constructed_with_processor_options`（文本守卫）与端到端用例各自认领。
+    /// 判定用 rpi 自己的 `Debug`（把该字段渲染成 `image_processor: true/false`），不靠源码文本。
+    #[test]
+    fn read_tool_options_install_inline_image_processor() {
+        let opts = read_tool_options();
+        assert!(
+            opts.auto_resize_images,
+            "必须显式打开自动缩放（否则超限图等于被丢）"
+        );
+        assert!(
+            opts.image_processor.is_some(),
+            "read 工具必须注入 ReadImageProcessor 实现（rpi 默认 None）"
+        );
+        let rendered = format!("{opts:?}");
+        assert!(
+            rendered.contains("image_processor: true"),
+            "rpi 的 Debug 应报告处理器已装：{rendered}"
+        );
+    }
+
+    /// **端到端判据（评审 F1 的整改）**：走**真实的 `dev__read` 工具**（`dev_tools` → `OsExecutionEnv`），
+    /// 断言返回的 content part 里有一张 `Image`、且**真实像素尺寸**已被缩到上限内、比例保持。
+    ///
+    /// 为什么必须有这条：上面两条行为用例是**直接调 rpi 库**的，钉的是"rpi 会缩放"，不是"本仓的 read
+    /// 装了处理器"——评审实测：把生产接线改回 `None`（变异 A）或把 helper 的处理器置空（变异 B）或换成
+    /// 不缩放的实现（变异 C），那两条**照样绿**。这条对三者都会红（不装 ⇒ 尺寸仍是 2500×100）。
+    ///
+    /// 不需要假 ExecutionEnv：`dev_tools` 自己建 `OsExecutionEnv::with_cwd(workspace)`（评审实测口径）。
+    #[tokio::test]
+    async fn read_tool_returns_resized_image_part_end_to_end() {
+        use base64::Engine as _;
+        let workspace = temp_workspace("img-e2e");
+        // 2500×100 红色 PNG（超过 INLINE_IMAGE_MAX_SIDE=2000）
+        let mut img = image::RgbImage::new(2500, 100);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([200, 30, 30]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("编码 PNG");
+        std::fs::write(workspace.join("big.png"), png.into_inner()).expect("写测试图");
+
+        let tools = dev_tools(&workspace, SandboxMode::FullAccess, false);
+        let read = tools
+            .iter()
+            .find(|t| t.schema().name == "dev__read")
+            .expect("read 工具必须存在")
+            .clone();
+        let out = read
+            .execute(
+                "call",
+                serde_json::json!({ "path": "big.png" }),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("读图应成功");
+
+        // 从 content part 里取图（不是文本提示）——"仍拿得到图"这一点必须由 part 类型证明。
+        let (mime, bytes) = out
+            .content
+            .iter()
+            .find_map(|part| match part {
+                rpi_agent::types::TextContentOrImage::Image(img) => Some((
+                    img.mime_type.clone(),
+                    base64::engine::general_purpose::STANDARD
+                        .decode(img.data.as_bytes())
+                        .expect("图片 part 应是 base64"),
+                )),
+                _ => None,
+            })
+            .expect("read 应返回 Image part（而不是一行省略提示）");
+        assert_eq!(mime, "image/png", "处理后的 mime");
+        let decoded = image::load_from_memory(&bytes).expect("解码 part");
+        assert!(
+            decoded.width() <= rpi_tools::image_processing::INLINE_IMAGE_MAX_SIDE,
+            "端到端：超限图必须被缩到上限内，实际 {}×{}",
+            decoded.width(),
+            decoded.height()
+        );
+        let ratio = decoded.width() as f64 / decoded.height() as f64;
+        assert!(
+            (ratio - 25.0).abs() < 0.5,
+            "端到端：应等比缩放（原比 25.0，实际 {ratio:.2}：{}×{}）",
+            decoded.width(),
+            decoded.height()
+        );
+    }
+
+    /// 开关语义（评审 O3：AC1 的"可配置"这一腿）：默认开；`"0"` 关；非法值按**开**处理（这里不是安全闸）。
+    #[test]
+    fn image_processor_switch_defaults_on_and_zero_disables() {
+        assert!(image_processor_from(None).is_some(), "未设置 ⇒ 默认开");
+        assert!(image_processor_from(Some("1")).is_some());
+        assert!(image_processor_from(Some("0")).is_none(), "值为 0 ⇒ 关");
+        assert!(
+            image_processor_from(Some(" 0 ")).is_none(),
+            "两侧空白应被容忍"
+        );
+        assert!(
+            image_processor_from(Some("yes")).is_some(),
+            "非法值按开处理（本开关无安全含义，不该悄悄关掉能力）"
+        );
+    }
+
+    /// **接线判据**：`read` 工具必须**真的用** `read_tool_options()` 构造（只测 helper 不够——
+    /// 把 `Some(read_tool_options())` 改回 `None`，helper 用例照样绿；这条就是为那次变异补的）。
+    ///
+    /// 手法：源码文本断言 + **运行期拼针**。为什么拼针：字面量会出现在本测试自身源码里，而
+    /// `include_str!` 把测试一起读进来 ⇒ 直接写 `contains("…")` 会恒真（我在 harness 那边踩过一次。
+    /// 边界（**按评审实测更正**）：这是源码级判据，边界是词法范围而非调用图——评审给出过一条实测绕过：
+    /// 把生产接线改回 `None`、同时把 needle 原文留在尾注释里，本用例仍绿。**真正的行为级判据见下面
+    /// `read_tool_returns_resized_image_part_end_to_end`**（走真实 `dev__read` 工具），本条只当"接线还在"的快速提示。
+    ///
+    /// 我原先在这里写过"要行为级判据得给 `build_tools` 注入假 ExecutionEnv，属更大改造"——**两句都不实**：
+    /// ①全仓没有 `build_tools` 这个符号（真实是 `dev_tools`）；②**不需要假 env**：`dev_tools` 自己就
+    /// `OsExecutionEnv::with_cwd(workspace)`，给个真实临时目录即可（评审用 ~45 行探针跑通并给了实测数据）。
+    #[test]
+    fn read_tool_is_constructed_with_processor_options() {
+        let src = include_str!("builtin.rs").replace("\r\n", "\n");
+        let needle = format!(
+            "create_read_tool(&context, Some({}()))",
+            "read_tool_options"
+        );
+        assert!(
+            src.contains(&needle),
+            "read 工具必须用 read_tool_options() 构造（否则图片处理不会被接上）"
+        );
+    }
+
+    /// 行为判据：接上的处理器真的会把**超大图**缩到上限内（`INLINE_IMAGE_MAX_SIDE` = 2000）。
+    /// 用 `image` 合成 2500×100 的 PNG 后过一遍处理器，再解码回来量尺寸——
+    /// 断言"仍能拿到图（不是一行省略提示）且宽 ≤ 上限"。
+    /// 判别力（**按评审实测更正**）：本条只覆盖**被调的库实现**——换掉处理器实现/不装处理器时它**不会**红
+    /// （实测：变异 B/C 下它绿）。本仓接线由端到端用例 `read_tool_returns_resized_image_part_end_to_end` 覆盖。
+    #[test]
+    fn inline_image_processor_resizes_oversized_image() {
+        use base64::Engine as _;
+        use rpi_tools::ReadImageProcessor as _;
+        // 造一张 2500×100 的红色 PNG（超过 2000 边长上限）
+        let mut img = image::RgbImage::new(2500, 100);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([200, 30, 30]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("编码 PNG");
+        let raw = png.into_inner();
+
+        let out = rpi_tools::image_processing::InlineImageProcessor
+            .process(&raw, "image/png", true)
+            .expect("处理器应成功处理 PNG");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(out.data.as_bytes())
+            .expect("返回的应是 base64");
+        let decoded = image::load_from_memory(&bytes).expect("解码处理后的图");
+        assert!(
+            decoded.width() <= rpi_tools::image_processing::INLINE_IMAGE_MAX_SIDE,
+            "超限图必须被缩到上限内，实际宽 {}",
+            decoded.width()
+        );
+        // 等比：原图 2500×100（比 25.0），缩放后宽被压到 2000 ⇒ 高应约 80，比例保持。
+        let ratio = decoded.width() as f64 / decoded.height() as f64;
+        assert!(
+            (ratio - 25.0).abs() < 0.5,
+            "应等比缩放（原比 25.0，实际 {ratio:.2}：{}×{}）",
+            decoded.width(),
+            decoded.height()
+        );
+    }
+
+    /// 行为判据：BMP 不再"已省略"，而是被转成可 inline 的格式（PNG）。
+    #[test]
+    fn inline_image_processor_converts_bmp_to_png() {
+        use rpi_tools::ReadImageProcessor as _;
+        let mut img = image::RgbImage::new(8, 8);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([10, 200, 10]);
+        }
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut bmp, image::ImageFormat::Bmp)
+            .expect("编码 BMP");
+        let out = rpi_tools::image_processing::InlineImageProcessor
+            .process(&bmp.into_inner(), "image/bmp", true)
+            .expect("处理器应能转码 BMP");
+        assert_eq!(out.mime_type, "image/png", "BMP 应被转成 PNG（而不是省略）");
     }
 }
