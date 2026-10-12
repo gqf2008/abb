@@ -581,13 +581,17 @@ pub async fn run() {
                     }
                     by_bot.entry(vb.bot_key.clone()).or_default().push(
                         crate::runtime::harness::ChannelMeta {
-                            // vb 群的 agent 工作目录 = 其独立工作区（P0.B，与退役
-                            // CLI 路径的 ensure_vb_dir 语义对齐）
+                            // vb 群的 agent 工作目录 = 该渠道目录（2026-10-12 起所有
+                            // 渠道统一为 `workspaces/<bot>/<dir_name(chat_id)>/`）
                             workspace: Some(
-                                crate::virtualbot::ensure_vb_dir(&vb.bot_key, &vb.chat_id)
-                                    .unwrap_or_else(|| crate::workspace_dir(&vb.bot_key))
-                                    .display()
-                                    .to_string(),
+                                crate::channel_dir::ensure_channel_dir(
+                                    &vb.bot_key,
+                                    &vb.chat_id,
+                                    "group",
+                                    None,
+                                )
+                                .display()
+                                .to_string(),
                             ),
                             bot_key: vb.bot_key,
                             chat_id: vb.chat_id,
@@ -857,10 +861,9 @@ async fn run_bot(
         bot.kind,
         bot.bot_name
     );
-    // P4.4：bot 级工作区是非虚拟群会话的 agent cwd（`Bridge::workspace_for` 的回落
-    // 分支）。启动即写工作区指引，保证首条消息前指引已就位——fork 经 hints 读 cwd
-    // 的 AGENTS.md 才知道用 `$ABB_BIN` 建定时任务/跨会话投递（幂等 marker 判定；
-    // 写失败静默：指引缺失只影响可发现性，不挡 bot 启动）。
+    // P4.4：bot 级工作区仍是“渠道目录的父目录”，会话 cwd 现在按渠道取
+    // `<workspaces>/<bot>/<dir_name(chat_id)>/`（`Bridge::workspace_for`）。
+    // bot 级指引仍要写：它是 bot 目录的入口说明（且存量会话/工具看得到）。
     // 注意：全新 bot 的 `workspaces/<key>/` 此时**还不存在**（要到下面 Bridge::new
     // 的 SessionStore 才建），所以目录由 `ensure_workspace_guide` 自建——它不自建
     // 的话这次写入会 NotFound 被静默吞掉（审查 P2-1，回归测试在 agent.rs）。
@@ -1718,12 +1721,16 @@ async fn run_job(
                     h.upsert_channel(
                         channel_id,
                         crate::runtime::harness::ChannelMeta {
-                            // job 频道工作区 = 该 chat 的工作区（vb 群用其目录）
+                            // job 频道工作区 = 该渠道目录（与消息路径同一套规则）
                             workspace: Some(
-                                crate::virtualbot::ensure_vb_dir(&bot_key, &job.chat_id)
-                                    .unwrap_or_else(|| crate::workspace_dir(&bot_key))
-                                    .display()
-                                    .to_string(),
+                                crate::channel_dir::ensure_channel_dir(
+                                    &bot_key,
+                                    &job.chat_id,
+                                    "p2p",
+                                    None,
+                                )
+                                .display()
+                                .to_string(),
                             ),
                             bot_key: bot_key.clone(),
                             chat_id: job.chat_id.clone(),

@@ -154,7 +154,11 @@ impl Bridge {
                 chat_id: ev.chat_id.clone(),
                 chat_type: "group".to_string(),
                 thread_id: None,
-                workspace: Some(self.workspace_for(&ev.chat_id).display().to_string()),
+                workspace: Some(
+                    self.workspace_for(&ev.chat_id, "group")
+                        .display()
+                        .to_string(),
+                ),
                 name: group_name.to_string(),
                 anchor_mid: None,
                 adhoc: true,
@@ -181,7 +185,7 @@ impl Bridge {
                 chat_id: ev.chat_id.clone(),
                 chat_type: "p2p".to_string(),
                 thread_id: None,
-                workspace: Some(self.workspace_for(&ev.chat_id).display().to_string()),
+                workspace: Some(self.workspace_for(&ev.chat_id, "p2p").display().to_string()),
                 name: peer_name.to_string(),
                 anchor_mid: None,
                 adhoc: true,
@@ -210,7 +214,11 @@ impl Bridge {
                 chat_id: ev.chat_id.clone(),
                 chat_type: "group".to_string(),
                 thread_id: Some(ev.thread_id.clone()),
-                workspace: Some(self.workspace_for(&ev.chat_id).display().to_string()),
+                workspace: Some(
+                    self.workspace_for(&ev.chat_id, "group")
+                        .display()
+                        .to_string(),
+                ),
                 name: group_name.to_string(),
                 anchor_mid: Some(ev.mid.clone()),
                 adhoc: false,
@@ -1213,13 +1221,10 @@ impl Bridge {
     /// P4.4：该路径就是 agent 会话 cwd（fork 经 hints 读它的 AGENTS.md 拿 `$ABB_BIN`
     /// 用法），故返回前确保工作区指引就位——vb 分支已在 `ensure_vb_dir` 内写过，
     /// 这里只补 bot 级分支（幂等，marker 判定）。
-    fn workspace_for(&self, chat_id: &str) -> std::path::PathBuf {
-        if let Some(dir) = crate::virtualbot::ensure_vb_dir(&self.bot.key(), chat_id) {
-            return dir;
-        }
-        let dir = crate::workspace_dir(&self.bot.key());
-        crate::agent::ensure_workspace_guide(&dir);
-        dir
+    fn workspace_for(&self, chat_id: &str, chat_type: &str) -> std::path::PathBuf {
+        // 所有渠道（group / p2p / 话题）各自一个工作目录（卡 abb-channel-mcp-config-20261012）：
+        // 目录名 = sanitize(chat_id)，里面放 chat.json / mcp.json / 工作区指引。
+        crate::channel_dir::ensure_channel_dir(&self.bot.key(), chat_id, chat_type, None)
     }
 
     /// #309 PR-A2：把停止词交给桥的 job 轮次路由（实现见
@@ -1569,13 +1574,13 @@ mod tests {
         ))
     }
 
-    /// P4.4 回归：`workspace_for` 是会话 cwd 的唯一真值来源，bot 级（非虚拟群）
-    /// 会话解析后工作区指引必须已就位——修复前该路径不写任何指引，fork 经 hints
-    /// 读 cwd AGENTS.md 拿不到 `$ABB_BIN` job/deliver 用法（agent 自造 sleep 循环）。
+    /// P4.4 回归（2026-10-12 改口径）：`workspace_for` 是会话 cwd 的唯一真值来源。
+    /// 现在**每个渠道**都有自己的目录 `<workspaces>/<bot>/<dir_name(chat_id)>/`，
+    /// 解析后目录与工作区指引都必须就位。
     #[test]
-    fn workspace_for_writes_guide_for_bot_level_chat() {
+    fn workspace_for_writes_guide_into_channel_dir() {
         let bridge = test_bridge();
-        let ws = crate::workspace_dir(&bridge.bot.key());
+        let ws = crate::channel_dir::channel_dir(&bridge.bot.key(), "oc_p2p_not_registered");
         // Drop 守卫：断言失败（panic）时也要清掉把 ~/.agent-bridge/workspaces/<uuid>/
         // 删干净——函数末尾那行在 panic 路径上不会执行（审查 P3-2）。
         struct Cleanup(std::path::PathBuf);
@@ -1586,8 +1591,19 @@ mod tests {
         }
         let _cleanup = Cleanup(ws.clone());
 
-        let got = bridge.workspace_for("oc_p2p_not_registered");
-        assert_eq!(got, ws, "非虚拟群会话 cwd = bot 级工作区");
+        let got = bridge.workspace_for("oc_p2p_not_registered", "p2p");
+        assert_eq!(got, ws, "渠道会话 cwd = 该渠道自己的工作目录");
+        // 目录名可与 chat_id 对上（不是派生 uuid），chat.json 记原始 id。
+        assert_eq!(
+            ws.file_name().unwrap().to_string_lossy(),
+            "oc_p2p_not_registered"
+        );
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ws.join("chat.json")).expect("chat.json"),
+        )
+        .unwrap();
+        assert_eq!(meta["chat_id"], "oc_p2p_not_registered");
+        assert_eq!(meta["chat_type"], "p2p");
         for name in ["AGENTS.md", "CLAUDE.md"] {
             let text = std::fs::read_to_string(ws.join(name))
                 .unwrap_or_else(|e| panic!("{name} 应由 workspace_for 写出: {e}"));

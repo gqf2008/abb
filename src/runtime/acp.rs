@@ -2076,6 +2076,20 @@ pub struct SessionSandboxMeta {
     pub abb_bin: Option<String>,
 }
 
+impl SessionSandboxMeta {
+    /// 把域根换成**本次会话的 cwd**（2026-10-12 卡 `abb-channel-mcp-config-20261012`）：
+    /// handle 级 meta 里的 `writable_roots` 原本写死 bot 工作区，而会话 cwd 现在
+    /// 是渠道目录 `workspaces/<bot>/<dir_name(chat_id)>/`；不跟着走的话 agent 连自己的
+    /// cwd 都写不了（域闸比 cwd 窄）。显式配了 roots 才改；FullAccess（None）保持。
+    pub fn retarget_writable_root(&self, root: &str) -> Self {
+        let mut next = self.clone();
+        if next.writable_roots.is_some() {
+            next.writable_roots = Some(vec![root.to_string()]);
+        }
+        next
+    }
+}
+
 /// How to deliver a system prompt on `session/new`.
 ///
 /// The two variants match the two mechanisms supported by current adapters:

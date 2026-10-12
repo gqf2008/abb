@@ -1100,7 +1100,7 @@ pub(crate) fn sanitize(s: &str) -> String {
         .collect::<String>()
 }
 
-fn is_windows_reserved_component(value: &str) -> bool {
+pub(crate) fn is_windows_reserved_component(value: &str) -> bool {
     let stem = value.split('.').next().unwrap_or(value);
     matches!(
         stem.to_ascii_uppercase().as_str(),

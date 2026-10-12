@@ -4840,9 +4840,14 @@ mod tests {
         // granted：受限剖面 + camelCase 键名
         let gm = &granted_metas[0];
         assert_eq!(gm["sandbox"], "workspace-write");
+        // 2026-10-12（卡 abb-channel-mcp-config-20261012）：域根不再照抄 handle 级
+        // 的 `writable_roots`，而是**跟随本次会话 cwd = 该渠道目录**——否则受限会话
+        // 连自己的 cwd 都写不了。
+        let granted_ws = crate::channel_dir::channel_dir(&bridge.bot.key(), "oc_route_granted");
+        let granted_ws = std::fs::canonicalize(&granted_ws).unwrap_or(granted_ws);
         assert_eq!(
             gm["writableRoots"],
-            serde_json::json!(["/tmp/abb-granted-ws"])
+            serde_json::json!([granted_ws.display().to_string()])
         );
         assert_eq!(gm["shell"], "restricted");
         assert_eq!(

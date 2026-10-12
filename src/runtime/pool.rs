@@ -896,10 +896,16 @@ async fn create_session_and_apply_model(
     // Goose receives it through the custom request below. Legacy agents receive
     // the same content as user-message sections via `format_prompt`.
     let is_goose = agent.agent_name == "goose";
-    // P0.B：会话工作目录优先取频道登记带的 workspace（vb 群=vb/<uuid>、
-    // 普通会话=bot 工作区），与退役 CLI 路径的 ensure_vb_dir/workspace_dir
-    // 语义对齐；缺省回落 handle 级 cwd（进程启动目录，旧行为）。
+    // P0.B / 2026-10-12：会话工作目录 = 渠道目录（`workspaces/<bot>/<dir_name(chat_id)>/`，
+    // 由 `ChannelMeta.workspace` 带入）。域闸根必须跟到同一个目录，否则受限档的会话
+    // 写自己的 cwd 会被拒（handle 级 meta 里的 roots 还是 bot 目录）。
     let session_cwd = channel.workspace.unwrap_or(ctx.cwd.as_str());
+    let sandbox_root = std::fs::canonicalize(session_cwd)
+        .unwrap_or_else(|_| std::path::PathBuf::from(session_cwd));
+    let session_sandbox = agent
+        .session_sandbox
+        .as_ref()
+        .map(|meta| meta.retarget_writable_root(&sandbox_root.display().to_string()));
     let combined_system_prompt = with_team(
         framed_system_prompt(session_cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
         ctx.team_instructions.as_deref(),
@@ -923,7 +929,7 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
-            agent.session_sandbox.as_ref(),
+            session_sandbox.as_ref(),
         )
         .await?;
 
