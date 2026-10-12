@@ -252,7 +252,9 @@ fn dispatch_resource_update(
 fn log_resource_drop(site: usize, make: impl FnOnce(u64) -> String) {
     let n = RESOURCE_DROP_COUNTS[site].fetch_add(1, Ordering::Relaxed) + 1;
     if should_log_drop(n) {
-        crate::log!("{}", make(n));
+        // 与 harness 的资源事件日志**共用同一个出口**（评审 N3：此前 acp 侧无接线判据，
+        // 把这里换回 `tracing::warn!` 全量用例仍绿）。
+        crate::runtime::log_out::resource_line(&make(n));
     }
 }
 

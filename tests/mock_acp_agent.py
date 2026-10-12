@@ -71,7 +71,8 @@ for line in sys.stdin:
         # notifications/resources/updated 后的上报）。用途：验证 ABB 在回合内读到它、
         # 落成同一会话的一条入站消息（steer/下一回合），而不是丢掉。
         if os.environ.get("MOCK_RESOURCE_UPDATE"):
-            # `MOCK_RESOURCE_BURST=N`：同一回合内连发 N 条（内容各异，故不会被内容哈希去重）——
+            # `MOCK_RESOURCE_BURST=N`：同一回合内连发 N 条（内容各异 ⇒ 同内容 -> 同 id 的 id 语义不适用；
+# 真正合并它们的是 ABB 侧 (channel, server, uri) 的 10s 节流窗口，队列本身不按 id 去重）——
             # 用来验证 ABB 侧的 `(channel,server,uri)` 节流确实把窗口内的后续更新丢掉。
             burst = int(os.environ.get("MOCK_RESOURCE_BURST", "1") or "1")
             for i in range(burst):
