@@ -2494,16 +2494,20 @@ mod resource_event_tests {
     /// ①`handle_resource_update` 词法范围内：不含 `tracing::`，且经唯一出口 `log_resource_lines(`；
     /// ②**出口函数** `log_resource_lines` 本身：用 `crate::log!` 且不含 `tracing::`
     ///   ——加这条是为了堵"把出口体内的宏换掉"（评审实测：换掉即红）；
-    ///   **实测边界（评审两轮复测后的准确版）**：
-    ///   - **红**：换掉出口体内的宏 / 把**两处**出口调用都换成 tracing 间接层 / handler 内直接写 `tracing::` /
-    ///     把**丢弃-汇总**那一处单独换走（③b 专为它加的针）/ 把孤儿那处换走（③）/ handler 绕过单点接线自行入队记账；
-    ///   - **仍绿（已知盲区，如实登记）**：在 handler 内**并行再加一条**走函数体外 helper 的日志调用
-    ///     （出口调用仍在 ⇒ ①②③ 全满足）。要闭合它需要行为级判据（writer 注入 / `log_to!`），本卡不做。
-    /// ③O1 的两处**接线**（此前"对象层有判据、集成层没判据"，变异 M7/M10 都能全绿）：
-    ///   `l.resource_throttle.mark_delivered(` 必须出现在 `if handle_cmd(` 之内（入队后才记账）；
-    ///   `l.resource_throttle.forget_channel(` 必须存在（频道移除时清状态）。
-    ///   边界：断言的是"这两行还在、且 mark_delivered 在入队判定之内"，拦的是**删除/移出判据**这类回归，
-    ///   不保证语义等价（真要做行为判据需要给 `Loop` 注入假 handle，属更大改造）。
+    /// **实测边界（评审两轮复测后的准确版）**：
+    ///
+    /// - **红**：换掉出口体内的宏 / 把**两处**出口调用都换成 tracing 间接层 / handler 内直接写 `tracing::` /
+    ///   把**丢弃-汇总**那一处单独换走（③b 专为它加的针）/ 把孤儿那处换走（③）/ handler 绕过单点接线自行入队记账；
+    /// - **仍绿（已知盲区，如实登记）**：在 handler 内**并行再加一条**走函数体外 helper 的日志调用
+    ///   （出口调用仍在 ⇒ ①②③ 全满足）。要闭合它需要行为级判据（writer 注入 / `log_to!`），本卡不做。
+    ///
+    /// ③ O1 的两处**接线**（此前"对象层有判据、集成层没判据"，变异 M7/M10 都能全绿）：
+    ///
+    /// - `l.resource_throttle.mark_delivered(` 必须出现在 `if handle_cmd(` 之内（入队后才记账）；
+    /// - `l.resource_throttle.forget_channel(` 必须存在（频道移除时清状态）。
+    ///
+    /// 边界：断言的是"这两行还在、且 mark_delivered 在入队判定之内"，拦的是**删除/移出判据**这类回归，
+    /// 不保证语义等价（真要做行为判据需要给 `Loop` 注入假 handle，属更大改造）。
     #[test]
     fn resource_event_logs_wire_to_stdout_not_tracing() {
         // **先归一化 EOL**（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：
