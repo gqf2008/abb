@@ -914,7 +914,8 @@ pub(crate) enum ResourceDecision {
 /// 资源事件节流器：状态 + 判定 + **日志行生成**（纯内存，不直接写 stdout，便于单测）。
 ///
 /// 为什么把日志也放进来（评审 F1）：原实现用 `tracing::warn!`，而根二进制**没有安装 tracing
-/// subscriber**（`tracing` 只是空壳，见本文件 985/1390 两处同因注释）⇒ 丢弃路径实际是**静默**的，
+/// subscriber**（`tracing` 只是空壳；同因注释见 `emit_agent_start_failure` 与 `respawn_log_line`）
+/// ⇒ 丢弃路径实际是**静默**的，
 /// 与卡上 AC1「不得静默」不符。现在改为产出字符串、由生产侧用 [`crate::log!`] 写 stdout
 /// （与全仓约定一致），并且**限频**（即时行预算 + 每窗口一条汇总），既不静默也不刷爆日志。
 pub(crate) struct ResourceThrottle {
@@ -1132,6 +1133,18 @@ impl ResourceThrottle {
     }
 }
 
+/// 资源事件日志的**唯一出口**（丢弃 / 窗口汇总 / 孤儿更新都经此）：写 stdout。
+///
+/// 为什么单独抽出来（评审 O2）：生产可见路径是 `crate::log!`（stdout），而根二进制**没有** tracing
+/// subscriber——`tracing::*` 在线上等于没有日志。把出口收敛成一个薄函数后，"接线"就能被一条**有边界**的
+/// 源码守卫钉住（见 `resource_event_logs_wire_to_stdout_not_tracing`），而不是只扫 `handle_resource_update`
+/// 的词法范围（那样把 tracing 藏进函数体外定义的 helper 就绕过了）。
+fn log_resource_lines(lines: &[String]) {
+    for line in lines {
+        crate::runtime::log_out::resource_line(line);
+    }
+}
+
 fn handle_resource_update(
     l: &mut Loop,
     handle: &Arc<RuntimeHandle>,
@@ -1140,12 +1153,11 @@ fn handle_resource_update(
 ) {
     let Some(channel_id) = l.registry.channel_for(agent_index, &update.session_id) else {
         // 不得退回 tracing（生产静默，评审 F1）；本路径与丢弃共用日志预算，防刷屏。
-        for line in &l
-            .resource_throttle
-            .on_orphan(Instant::now(), &update.server, &update.uri)
-        {
-            crate::log!("{line}");
-        }
+        log_resource_lines(&l.resource_throttle.on_orphan(
+            Instant::now(),
+            &update.server,
+            &update.uri,
+        ));
         return;
     };
     // 节流：同一 `(channel, server, uri)` 在窗口内只放行一次（内容变了也算同一资源，避免自激循环），
@@ -1154,18 +1166,36 @@ fn handle_resource_update(
     let (decision, lines) =
         l.resource_throttle
             .on_event(channel_id, &update.server, &update.uri, now);
-    // 丢弃与汇总日志一律走 `crate::log!`（stdout）——**不要退回 tracing**：根二进制没有
-    // tracing subscriber（见本文件 985/1390 的同因注释），那条路在线上是静默的（评审 F1）。
-    for line in &lines {
-        crate::log!("{line}");
-    }
+    // 丢弃与汇总日志一律走**唯一出口** `log_resource_lines`（内部 `crate::log!` ⇒ stdout）。
+    // 为什么收敛成一个出口：`crate::log!` 才是生产可见路径（根二进制没有 tracing subscriber），
+    // 而"接线"没法用行为判据钉住（`Loop` 需要真 handle），故把它做成**一个可被源码守卫覆盖的薄函数**
+    // ——守卫同时断言"handler 不含 tracing、且经该出口"与"出口本身用 crate::log!"，
+    // 这样"在 handler 里加个 helper 偷偷用 tracing"这种绕过（评审 O2）也会红。
+    log_resource_lines(&lines);
     if decision != ResourceDecision::Allow {
         return;
     }
     let msg = resource_update_message(&update);
-    // 记账只认"真的进了回合队列"（评审 F3）：队列策略拒绝时不占用本窗口，
-    // 否则一条没投出去的更新会把随后一条真实更新误杀 10s。
-    if handle_cmd(l, handle, Cmd::Message { channel_id, msg }) {
+    enqueue_and_arm(l, handle, channel_id, &update, msg, now);
+}
+
+/// **单点接线**：把资源更新投进回合队列，并且**只在真的入队之后**才占用节流窗口
+/// （评审 F3：队列策略拒收时不记账，否则一条没投出去的更新会把随后一条真实更新误杀 10s）。
+///
+/// 为什么抽成一个函数：这条"入队才记账"是不变式，散在调用点里时**没有任何判据**能钉住它
+/// （变异"把记账挪到 if 之外"曾让 14 条用例全绿，见卡 `abb-resource-throttle-observations-20261011`）。
+/// 收成单点后，`resource_event_logs_wire_to_stdout_not_tracing` 只需断言"这里有一行
+/// `if accepted { … mark_delivered(…) }`"，把调用点挪出判据即红；调用点也被断言不得绕过它。
+fn enqueue_and_arm(
+    l: &mut Loop,
+    handle: &RuntimeHandle,
+    channel_id: Uuid,
+    update: &ResourceUpdate,
+    msg: InboundMsg,
+    now: Instant,
+) {
+    let accepted = handle_cmd(l, handle, Cmd::Message { channel_id, msg });
+    if accepted {
         l.resource_throttle
             .mark_delivered(channel_id, &update.server, &update.uri, now);
     }
@@ -1175,7 +1205,10 @@ fn handle_resource_update(
 ///
 /// - `author_role = "event"`：事件块里如实标注"不是人说的"；
 /// - `prompt_tag = "mcp:resource"`：日志与排障可追；
-/// - `id_hex` = `(server, uri, text)` 的内容哈希：**同一条通知重复到达会被队列去重**，
+/// - `id_hex` = `(server, uri, text)` 的内容哈希：**给排障定位用**（日志/steer 认这个 id）。
+///   **不要**把它读成"队列会按 id 去重"——`EventQueue::push` 只看 `DedupMode`（本仓**显式**取 `Queue`；
+///   注意 `DedupMode` 自身的 `#[default]` 是 `Drop`，只在飞时丢弃），**不比较 id**（2026-10-12 评审 O3 更正）；重复到达的同内容
+///   通知是靠 `(channel, server, uri)` 的 10s 节流窗口合并的。
 ///   内容变了则是新消息（避免把真正的变化当重复丢掉）。
 fn resource_update_message(update: &ResourceUpdate) -> InboundMsg {
     use std::hash::{Hash, Hasher};
@@ -2326,7 +2359,8 @@ mod resource_event_tests {
         }
     }
 
-    /// 事件消息的形状 + 去重键：来源如实标注；同内容同 id（去重）、内容/uri 变了就是新消息。
+    /// 事件消息的形状 + id 语义：来源如实标注；同内容同 id（**供排障定位/steer 认 id**，队列并不按它去重；
+    /// 重复同内容通知由 `(channel, server, uri)` 的 10s 节流窗口合并）、内容/uri 变了就是新消息。
     #[test]
     fn resource_update_message_shape_and_dedup_key() {
         let m = resource_update_message(&update("正文"));
@@ -2343,7 +2377,7 @@ mod resource_event_tests {
         assert_eq!(
             m.id_hex,
             resource_update_message(&update("正文")).id_hex,
-            "同内容 → 同 id（队列据此去重）"
+            "同内容 → 同 id（供排障定位/steer 认 id，非队列去重）"
         );
         assert_ne!(
             m.id_hex,
@@ -2462,34 +2496,136 @@ mod resource_event_tests {
         let _ = std::fs::remove_file(&rec);
     }
 
-    /// **接线守卫**（评审 F1 的阻塞项）：资源事件路径的丢弃/汇总/孤儿日志必须走 `crate::log!`（stdout），
-    /// **不得**走 `tracing::*`——根二进制没有安装 tracing subscriber（见本文件两处同因注释），
-    /// 那条路在线上是完全静默的，正是本轮评审判「AC1 不得静默」不成立的原因。
+    /// **接线守卫**（评审 F1 阻塞项 + O1/O2 收口）：资源事件日志必须走 `crate::log!`（stdout），
+    /// **不得**走 `tracing::*`（根二进制没有 subscriber ⇒ 线上静默）。
     ///
-    /// 为什么用源码断言：**单测抓不到接线本身**。实测（M6）把 `crate::log!(...)` 换回
-    /// `tracing::info!(...)`，12 条资源事件用例**照样全绿**（它们只测行生成，不测谁来写）。
-    /// 在没有日志注入点的前提下，把"接线方式"作为契约钉住是唯一能防悄悄回归的手段。
+    /// 三条断言各自的边界（**如实写明**，别把它读成万能）：
+    /// ①`handle_resource_update` 词法范围内：不含 `tracing::`，且经唯一出口 `log_resource_lines(`；
+    /// ②**出口函数** `log_resource_lines` 本身：用 `crate::log!` 且不含 `tracing::`
+    ///   ——加这条是为了堵"把出口体内的宏换掉"（评审实测：换掉即红）；
+    /// **实测边界（评审两轮复测后的准确版）**：
+    ///
+    /// - **红**：换掉出口体内的宏 / 把**两处**出口调用都换成 tracing 间接层 / handler 内直接写 `tracing::` /
+    ///   把**丢弃-汇总**那一处单独换走（③b 专为它加的针）/ 把孤儿那处换走（③）/ handler 绕过单点接线自行入队记账；
+    /// - **仍绿（已知盲区，如实登记）**：在 handler 内**并行再加一条**走函数体外 helper 的日志调用
+    ///   （出口调用仍在 ⇒ ①②③ 全满足）。要闭合它需要行为级判据（writer 注入 / `log_to!`），本卡不做。
+    ///
+    /// ③ O1 的两处**接线**（此前"对象层有判据、集成层没判据"，变异 M7/M10 都能全绿）：
+    ///
+    /// - `l.resource_throttle.mark_delivered(` 必须出现在 `if handle_cmd(` 之内（入队后才记账）；
+    /// - `l.resource_throttle.forget_channel(` 必须存在（频道移除时清状态）。
+    ///
+    /// 边界：断言的是"这两行还在、且 mark_delivered 在入队判定之内"，拦的是**删除/移出判据**这类回归，
+    /// 不保证语义等价（真要做行为判据需要给 `Loop` 注入假 handle，属更大改造）。
     #[test]
     fn resource_event_logs_wire_to_stdout_not_tracing() {
         // **先归一化 EOL**（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：
         // 这是**源码文本断言**，而 Windows 检出（`core.autocrlf=true`）给的 harness.rs 是 CRLF——
         // `rest.find("\n}\n")` 会找不到"顶格 }"，测试在 Windows 上 panic（CI 实证：
-        // `panicked at src\runtime\harness.rs:2470`，即下面那个 `.expect`）。归一化后两平台一致；
+        // `panicked at src\runtime\harness.rs:2470`）。归一化后两平台一致；
         // 仓库根 .gitattributes 也钉了 `*.rs text eol=lf`（双保险）。
         let src = include_str!("harness.rs").replace("\r\n", "\n");
-        let start = src
-            .find("fn handle_resource_update")
-            .expect("handle_resource_update 必须存在");
-        let rest = &src[start..];
-        let end = rest.find("\n}\n").expect("函数体以顶格 } 结束");
-        let body = &rest[..end];
+        let body_of = |fname: &str| -> String {
+            let start = src
+                .find(&format!("fn {fname}"))
+                .unwrap_or_else(|| panic!("找不到函数 {fname}"));
+            let rest = &src[start..];
+            let end = rest.find("\n}\n").expect("函数体以顶格 } 结束");
+            rest[..end].to_string()
+        };
+        // ① handler
+        let handler = body_of("handle_resource_update");
         assert!(
-            body.contains("crate::log!("),
-            "资源事件路径必须用 crate::log! 写 stdout（生产可见），不得换成 tracing"
+            handler.contains("log_resource_lines("),
+            "资源事件日志必须经唯一出口 log_resource_lines（否则守卫的边界会退回词法范围）"
         );
         assert!(
-            !body.contains("tracing::"),
+            !handler.contains("tracing::"),
             "资源事件路径不得使用 tracing::*：根二进制没有 subscriber，日志会静默丢掉（评审 F1）"
+        );
+        // ② 出口本身：harness 侧这层必须**转发到全仓唯一出口** `log_out::resource_line`
+        //    （`crate::log!` 的断言由下面 ④ 对 `log_out.rs` 本体做）。
+        let seam = body_of("log_resource_lines");
+        assert!(
+            seam.contains("log_out::resource_line("),
+            "harness 日志出口必须转发到 log_out::resource_line"
+        );
+        assert!(
+            !seam.contains("tracing::"),
+            "出口不得用 tracing::*（评审 O2）"
+        );
+        // ③ O1 的接线判据（单点接线 + 频道清理）
+        // handler **不得绕过单点接线**（自己直接调 handle_cmd / mark_delivered 就会绕过"入队才记账"）。
+        assert!(
+            handler.contains("enqueue_and_arm("),
+            "资源事件必须经单点接线 enqueue_and_arm（否则 F3 的判据无处可钉）"
+        );
+        assert!(
+            !handler.contains("handle_cmd(") && !handler.contains(".mark_delivered("),
+            "handler 不得绕过单点接线直接入队/记账"
+        );
+        // 单点接线内部：按**展平后的结构**断言"记账在 if accepted 之内"。
+        // 为什么展平：源码里的换行/缩进由 rustfmt 决定，按原始排版断会假红；展平后只剩结构。
+        let flat: String = body_of("enqueue_and_arm")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // 针按**展平后**的真实形态写（相邻 token 间是否有空格由源码决定：`l.resource_throttle`
+        // 折行后留下一个空格，而 `handle_cmd(` 之后没有）。
+        let needle = "if accepted { l.resource_throttle .mark_delivered(";
+        assert!(
+            flat.contains(needle),
+            "记账必须落在 `if accepted`（= 真的入队）之内：{flat}"
+        );
+        assert!(
+            flat.contains("let accepted = handle_cmd("),
+            "入队判定必须是 `let accepted = handle_cmd(…)`（改语义即红）"
+        );
+        // 出口收敛（评审 N3）：`log_out::resource_line` 必须用 `crate::log!` 且不含 `tracing::`，
+        // 且 acp 侧的 drop 路径必须经它——否则又回到"harness 有守卫、acp 没有"的不对称（实测那种不对称下
+        // 把 acp 的 `crate::log!` 换回 `tracing::warn!`，全量用例仍绿）。
+        let outlet = include_str!("log_out.rs").replace("\r\n", "\n");
+        let outlet_body = &outlet[outlet.find("fn resource_line").expect("出口存在")..];
+        assert!(
+            outlet_body.contains("crate::log!("),
+            "出口 log_out::resource_line 必须用 crate::log! 写 stdout"
+        );
+        assert!(
+            !outlet_body.contains("tracing::"),
+            "出口不得用 tracing::*（根二进制没有 subscriber）"
+        );
+        // ③ 孤儿更新也必须经出口（评审 N1：原先"唯一出口（含孤儿）"的枚举是假的——孤儿路径
+        //   直接 `crate::log!`）。断言按**展平后**形态做，避免被 rustfmt 折行影响。
+        let flat_handler: String = handler.split_whitespace().collect::<Vec<_>>().join(" ");
+        let orphan_needle = format!("{}(&l.resource_throttle.on_orphan(", "log_resource_lines");
+        assert!(
+            flat_handler.contains(&orphan_needle),
+            "孤儿更新也必须经唯一出口（否则 N1 的枚举又变成假的）"
+        );
+        // ③b **丢弃/汇总**那处调用点也必须单独钉住（评审第 2 轮 B1 实测）：
+        //    把孤儿收进出口后 handler 里有**两处** `log_resource_lines(`，只做 `contains` 会被任意一处满足
+        //    ⇒ "只把丢弃/汇总那一处换成 tracing 间接层"（= 让 AC1"不得静默"整条静默回退）逃得掉（实测绿）。
+        //    这里的针也**运行期拼**（同一自我指涉理由）。
+        let summary_needle = format!("{}(&{})", "log_resource_lines", "lines");
+        assert!(
+            flat_handler.contains(&summary_needle),
+            "丢弃/汇总的日志调用点必须经出口（否则'不得静默'这条能被静默回退）"
+        );
+        let acp_src = include_str!("acp.rs").replace("\r\n", "\n");
+        let drop_needle = format!("{}(&make(n))", "resource_line");
+        assert!(
+            acp_src.contains(&drop_needle),
+            "acp 的 drop 日志必须经同一出口（评审 N3；拼针避免自我指涉）"
+        );
+
+        // **运行期拼针**：直接写 `src.contains("l.resource_throttle.forget_channel(")` 会**自我指涉**——
+        // 那个字面量就出现在本测试源码里，而 `include_str!` 会把测试本身也读进来 ⇒ 断言恒真
+        // （我第一版就是这么写的，删掉接线后守卫照样绿；实测记录见卡 abb-resource-throttle-observations-20261011）。
+        // 拼出来之后，"断言里的字面量"与"被断言的针"不再相同，删除接线即红。
+        let forget_needle = format!("l.resource_throttle.{}(uuid)", "forget_channel");
+        assert!(
+            src.contains(&forget_needle),
+            "频道移除路径必须清节流状态（删掉即回归 F2 后半；变异 M10）"
         );
     }
 

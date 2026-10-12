@@ -17,6 +17,7 @@
 pub mod acp;
 pub mod harness;
 pub mod keys;
+pub mod log_out;
 pub mod oneshot;
 pub mod pool;
 pub mod prompt_framing;

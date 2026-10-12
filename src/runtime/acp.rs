@@ -9,6 +9,7 @@
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
 use futures_util::StreamExt;
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -216,7 +217,9 @@ fn dispatch_resource_update(
         params["server"].as_str(),
         params["uri"].as_str(),
     ) else {
-        tracing::warn!("资源更新缺字段（sessionId/server/uri），已忽略：{msg}");
+        log_resource_drop(0, |n| {
+            format!("资源更新缺字段（sessionId/server/uri），已忽略（第 {n} 次）：{msg}")
+        });
         return;
     };
     let update = ResourceUpdate {
@@ -228,14 +231,41 @@ fn dispatch_resource_update(
     match sink {
         Some(tx) => {
             if tx.send(update).is_err() {
-                tracing::warn!("资源更新通道已关闭（会话已结束？）：server={server} uri={uri}");
+                log_resource_drop(1, |n| {
+                    format!("资源更新通道已关闭（会话已结束？）（第 {n} 次）：server={server} uri={uri}")
+                });
             }
         }
-        None => {
-            tracing::warn!("收到资源更新但没有接入事件通道，已忽略：server={server} uri={uri}")
-        }
+        None => log_resource_drop(2, |n| {
+            format!(
+                "收到资源更新但没有接入事件通道，已忽略（第 {n} 次）：server={server} uri={uri}"
+            )
+        }),
     }
 }
+
+/// 资源更新路径上"丢了 / 没接上"的告警：**首次必打，之后每 100 次打一条**（计数器递增，故"第 n 次"可读）。
+///
+/// 为什么不用 `tracing::*`（评审 F1/O5）：根二进制**没有安装 tracing subscriber** ⇒ 那条路在线上
+/// 等于没有日志，静默丢掉"资源更新被丢弃"这种必须可见的事实。为什么限频：这类路径可能被话痨 server
+/// 反复触发（每个更新一条），而 `bridge.out` 轮转上限 8 MiB。
+fn log_resource_drop(site: usize, make: impl FnOnce(u64) -> String) {
+    let n = RESOURCE_DROP_COUNTS[site].fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_drop(n) {
+        // 与 harness 的资源事件日志**共用同一个出口**（评审 N3：此前 acp 侧无接线判据，
+        // 把这里换回 `tracing::warn!` 全量用例仍绿）。
+        crate::runtime::log_out::resource_line(&make(n));
+    }
+}
+
+/// 首次 + 每 100 次（纯函数，便于单测钉住语义）。
+fn should_log_drop(n: u64) -> bool {
+    n == 1 || n.is_multiple_of(100)
+}
+
+/// 三个告警点各自的累计计数（用 1-based 计数喂 `should_log_drop`）。
+static RESOURCE_DROP_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// agent 主动上报的一次资源更新（`_abb/unstable/resource/updated`）。
 ///
@@ -4265,5 +4295,22 @@ mod tests {
             }
             other => panic!("expected AgentError, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_log_tests {
+    use super::should_log_drop;
+
+    /// 限频语义：首次必打，之后每 100 次一条（**这条是"丢弃必须可见但又不能刷屏"的判据**）。
+    #[test]
+    fn drop_log_rate_limit_semantics() {
+        assert!(should_log_drop(1), "首次必须打（否则又是静默）");
+        for n in 2..100u64 {
+            assert!(!should_log_drop(n), "第 {n} 次不该打");
+        }
+        assert!(should_log_drop(100));
+        assert!(!should_log_drop(101));
+        assert!(should_log_drop(200));
     }
 }
