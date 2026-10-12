@@ -160,6 +160,22 @@ fn resolve_sandbox_meta(
 /// 无论 bot 配的 `sandbox_mode` 是什么，授权者会话恒走 workspace-write 域闸 +
 /// argv 白名单 shell + `$ABB_BIN`。同群 owner/granted 混合频道的档位只能绑进程，
 /// 不能绑会话（角色 per-event，计划决策 4），故 granted 独立实例强制最严剖面。
+/// `$ABB_BIN` = ABB 主程序绝对路径，**注入给 agent 进程**的 env。
+///
+/// 为什么（卡 `abb-mcp-orchestrator-p0-20261012` 的前置项，同时修一个"承诺落空"）：
+/// 提示词与 README 一直写"桥注入的 `$ABB_BIN`"（agent 用它调 `task`/`job`/`deliver`，
+/// 受限会话的白名单也按这个字面量放行），但**此前没有任何一处把它写进 agent 的 env**
+/// ——`rg -nF 'ABB_BIN' src/` 只命中 guard/文档/测试；`env_for_bot()` 只注入供应商凭据。
+/// 于是 agent（及其 shell / MCP 子进程）里 `"$ABB_BIN" task add …` 会展开成空。
+/// ABB 侧在此注入，abb-agent 侧由 `child_env::PASSTHROUGH_ENV` 往下透传。
+///
+/// 单一真相源：`granted_sandbox_profile` 的 `_meta.abbBin` 与这里都取自本函数。
+fn abb_bin_env() -> Option<(String, String)> {
+    std::env::current_exe()
+        .ok()
+        .map(|p| ("ABB_BIN".to_string(), p.display().to_string()))
+}
+
 /// `abb_bin` = ABB 主程序路径（`$ABB_BIN` 白名单展开实体，让 agent 可 `job`/`deliver`）。
 fn granted_sandbox_profile(
     bot: &crate::config::BotConfig,
@@ -167,10 +183,7 @@ fn granted_sandbox_profile(
     let root = crate::workspace_dir(&bot.key());
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let root = root.display().to_string();
-    let abb_bin = std::env::current_exe()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let abb_bin = abb_bin_env().map(|(_, v)| v).unwrap_or_default();
     crate::runtime::acp::SessionSandboxMeta {
         sandbox: Some("workspace-write".to_string()),
         writable_roots: Some(vec![root]),
@@ -264,6 +277,8 @@ fn build_bot_acp_handles(
                 extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
                     .into_iter()
                     .chain(extra_env)
+                    // `$ABB_BIN`（提示词/白名单都按它工作）：此前从未注入，agent 侧展开为空。
+                    .chain(abb_bin_env())
                     .collect(),
                 backend: "buzz".to_string(),
                 session_sandbox,
@@ -338,6 +353,7 @@ fn oneshot_agent_config_inner(
     let mut extra_env: Vec<(String, String)> =
         vec![("PATH".to_string(), crate::deps::composed_path())];
     extra_env.extend(env);
+    extra_env.extend(abb_bin_env());
     if sandbox.is_some() {
         extra_env.extend(jev_env(cfg));
     }
@@ -2113,6 +2129,18 @@ mod tests {
             pick_command_by_sandbox((&owner_cmd, &old_cmd), true),
             "带档位的 oneshot 走 owner 槽（abb-agent）"
         );
+        // `$ABB_BIN` 必须在这条生产路径的 env 里（卡 abb-mcp-orchestrator-p0-20261012）：
+        // 提示词与白名单都按它工作，此前**从未注入** ⇒ agent 的 shell/MCP 子进程里展开为空。
+        let abb_bin = c
+            .extra_env
+            .iter()
+            .find(|(k, _)| k == "ABB_BIN")
+            .map(|(_, v)| v.clone())
+            .expect("oneshot 任务的 agent env 必须带 ABB_BIN");
+        assert!(
+            std::path::Path::new(&abb_bin).is_absolute(),
+            "ABB_BIN 必须是绝对路径（agent 的 cwd 不可预知），实际 {abb_bin}"
+        );
     }
 
     /// 随包仅认 abb-agent（刀 4b 后无回滚槽）。
@@ -2175,6 +2203,25 @@ mod tests {
     /// 回归（P2.1 结构消灭的串台）：旧 service 级共享句柄集的 env_for 取**第一个
     /// enabled bot** 的供应商装配全部后端——多 bot 各配各供应商时全体串台。
     /// per-bot 化后：每个 bot 的 env 必须只来自自己的供应商。
+    /// `$ABB_BIN` 注入（卡 abb-mcp-orchestrator-p0-20261012）：helper 必须给本进程绝对路径，
+    /// 且**两条生产路径**（聊天 `mk` 闭包 / oneshot 任务）都把它带进 extra_env。
+    ///
+    /// 判别力：把 `abb_bin_env()` 从任一条路径去掉 ⇒ 对应断言红；helper 改名/改值 ⇒ 第一条红。
+    #[test]
+    fn abb_bin_env_is_injected_into_agent_env() {
+        let (k, v) = super::abb_bin_env().expect("current_exe 应可得");
+        assert_eq!(k, "ABB_BIN");
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        assert_eq!(
+            v, exe,
+            "值必须是本程序绝对路径（提示词按它调 task/job/deliver）"
+        );
+        assert!(
+            std::path::Path::new(&v).is_absolute(),
+            "必须是绝对路径，agent 的 cwd 不可预知"
+        );
+    }
+
     #[test]
     fn env_for_bot_uses_own_bot_provider() {
         let mk_prov = |name: &str, key: &str| crate::config::ProviderConfig {

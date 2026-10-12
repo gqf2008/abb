@@ -164,6 +164,13 @@ pub struct BotConfig {
     /// ABB 只声明：原样下发给 `session/new` 的 `mcpServers`，由执行层（abb-agent，rmcp
     /// 客户端）去连接；接进来干什么、要订阅什么资源，由 agent 自己判断。形状校验见
     /// `service::bot_mcp_servers`（name/command 非空、name 唯一）。
+    ///
+    /// **信任口径（2026-10-12 补，卡 abb-mcp-orchestrator-p0-20261012）**：声明一个 MCP server
+    /// 等于**授权它以 agent 的身份运行**——它会拿到 agent 子进程的白名单 env，其中包括
+    /// `$ABB_BIN`（本程序绝对路径），因此**可以驱动 ABB CLI**（`task add/status/logs/cancel`、
+    /// `deliver` 等）。这仍然受既有闸约束：Q8（`--proc` 载荷对 agent 一律拒绝，MCP 子进程带
+    /// `ABB_AGENT_CONTEXT=1`）、角色剖面（受限会话走受限档）、`cross_delivery_enabled`（跨会话
+    /// 投递总开关）。所以：**只声明你信任的 server**；server 自己声明的 `env` 会叠加在白名单之上。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerConfig>,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；

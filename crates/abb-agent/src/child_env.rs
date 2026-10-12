@@ -25,6 +25,10 @@ pub const AGENT_CONTEXT_ENV: &str = "ABB_AGENT_CONTEXT";
 
 /// 传给子进程的环境变量白名单。
 pub const PASSTHROUGH_ENV: &[&str] = &[
+    // 桥自身：提示词/白名单都按 `$ABB_BIN` 工作（agent 用它调 task/job/deliver，编排器 MCP server
+    // 也要用它驱动 CLI）。值由 abb 注入 agent 进程（`service.rs::abb_bin_env`），这里负责**往下透传**
+    // 到 shell 工具与 MCP 子进程——缺这一项时它们在线上展开成空（卡 abb-mcp-orchestrator-p0-20261012）。
+    "ABB_BIN",
     // 基础
     "PATH",
     "HOME",
@@ -119,8 +123,35 @@ mod tests {
 
     #[test]
     fn whitelist_keeps_what_tools_need() {
-        for key in ["PATH", "HOME", "TMPDIR", "SSH_AUTH_SOCK", "HTTPS_PROXY"] {
+        for key in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "SSH_AUTH_SOCK",
+            "HTTPS_PROXY",
+            // `$ABB_BIN`：agent 的 shell 与 MCP 子进程都要用它调桥（此前漏了 ⇒ 线上展开为空）
+            "ABB_BIN",
+        ] {
             assert!(PASSTHROUGH_ENV.contains(&key), "缺 {key}：工具会瞎");
+        }
+    }
+
+    /// `$ABB_BIN` 必须**真的被透传**（不只是白名单里有个名字）：
+    /// 进程里存在时进 map；不存在时不进（不伪造空值）。
+    #[test]
+    fn abb_bin_is_passed_through_when_present() {
+        let key = "ABB_BIN";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, "/opt/abb/agent-bridge");
+        assert_eq!(
+            passthrough_map().get(key),
+            Some(&"/opt/abb/agent-bridge".to_string()),
+            "设置了就必须透传（否则 agent 的 shell 里仍是空）"
+        );
+        std::env::remove_var(key);
+        assert!(!passthrough_map().contains_key(key), "未设置时不得伪造");
+        if let Some(v) = old {
+            std::env::set_var(key, v);
         }
     }
 
