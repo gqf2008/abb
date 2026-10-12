@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, McpServer, ResourceUpdate};
+use crate::runtime::acp::{AcpClient, AcpError, ResourceUpdate};
 use crate::runtime::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
@@ -401,31 +401,28 @@ impl RuntimeHandle {
         self.cfg.session_sandbox.as_ref()
     }
 
-    /// 测试访问器：会话级 MCP server 名单（装配侧 extra_mcp 的快照）。
+    /// 测试访问器：该句柄是否按**渠道**读 MCP 配置（normal = true，granted/oneshot = false）。
     #[cfg(test)]
-    pub(crate) fn mcp_server_names(&self) -> Vec<String> {
-        self.ctx
-            .mcp_servers
-            .iter()
-            .map(|s| s.name.clone())
-            .collect()
+    pub(crate) fn mcp_from_channel(&self) -> bool {
+        self.ctx.mcp_from_channel
     }
 
     /// 新建句柄。不拉起任何进程——agent 懒启动，首条消息到达才 spawn。
     /// `cwd` = agent 子进程工作目录（ABB 启动时的当前目录）。
-    /// `extra_mcp` = 该会话要接入的外部 MCP server（bot 配置 `mcp_servers` 的映射；
-    /// granted/oneshot 传空）。ABB 只声明、不解释语义。
+    /// `mcp_from_channel` = 该句柄的会话是否按渠道读 MCP 配置
+    /// （`<渠道工作目录>/mcp.json`；normal = true，granted/oneshot = false——
+    /// 外部 server 的工具面会绕过受限档沙箱，宁可少给能力也不给绕闸路径）。
     pub fn new(
         cfg: AgentConfig,
         stop: CancellationToken,
         cwd: String,
-        extra_mcp: Vec<McpServer>,
+        mcp_from_channel: bool,
     ) -> Arc<Self> {
-        // 会话级 MCP 名单**全部来自装配侧**（bot 配置的外部 server）：ABB 自己不再实现任何
-        // MCP server（原 `abb-events` 已于 2026-10-11 下线，见 card abb-mcp-declarer-only）。
-        let mcp_servers = extra_mcp;
+        // 渠道级 MCP：名单在 `session/new` 前按会话 cwd 现读（`channel_mcp::load`），
+        // 这里只带一个开关。ABB 自己不再实现任何 MCP server（原 `abb-events` 已于
+        // 2026-10-11 下线，见 card abb-mcp-declarer-only）。
         let ctx = Arc::new(PromptContext {
-            mcp_servers,
+            mcp_from_channel,
             initial_message: None,
             idle_timeout: IDLE_TIMEOUT,
             max_turn_duration: MAX_TURN_DURATION,
@@ -2435,7 +2432,7 @@ mod resource_event_tests {
                 .unwrap_or_default()
                 .display()
                 .to_string(),
-            Vec::new(),
+            false,
         );
         let run = tokio::spawn(run_loop(handle.clone()));
         let cid = Uuid::new_v4();
@@ -2927,7 +2924,7 @@ mod resource_event_tests {
                 .unwrap_or_default()
                 .display()
                 .to_string(),
-            Vec::new(),
+            false,
         );
         let run = tokio::spawn(run_loop(handle.clone()));
         let cid = Uuid::new_v4();
@@ -3037,7 +3034,7 @@ mod resource_event_tests {
                 .unwrap_or_default()
                 .display()
                 .to_string(),
-            Vec::new(),
+            false,
         );
         let run = tokio::spawn(run_loop(handle.clone()));
         let cid = Uuid::new_v4();
@@ -3119,7 +3116,7 @@ mod resource_event_tests {
                 .unwrap_or_default()
                 .display()
                 .to_string(),
-            Vec::new(),
+            false,
         );
         let run = tokio::spawn(run_loop(handle.clone()));
         let cid = Uuid::new_v4();
@@ -3156,11 +3153,11 @@ mod resource_event_tests {
 mod spawn_lifecycle_tests {
     use super::*;
 
-    /// extra_mcp（bot 配置的外部 MCP server）必须逐条出现在会话名单；空 extra
-    /// 时名单就是空的（granted/oneshot 的默认形状——ABB 自己不再自带任何 server）。
+    /// `mcp_from_channel` 开关必须真的进 `PromptContext`（normal=true / granted=false）。
+    /// 名单本身不在句柄上——它在会话建立时按渠道目录现读（下面这条 e2e）。
     #[test]
-    fn extra_mcp_attached_to_prompt_context() {
-        let mk = |extra: Vec<McpServer>| {
+    fn mcp_from_channel_flag_reaches_prompt_context() {
+        let mk = |flag: bool| {
             RuntimeHandle::new(
                 AgentConfig {
                     command: "true".to_string(),
@@ -3171,35 +3168,34 @@ mod spawn_lifecycle_tests {
                 },
                 CancellationToken::new(),
                 ".".to_string(),
-                extra,
+                flag,
             )
         };
-        let h = mk(vec![McpServer {
-            name: "extra-dummy".to_string(),
-            command: "/opt/dummy".to_string(),
-            args: vec!["--flag".to_string()],
-            env: Vec::new(),
-        }]);
-        assert_eq!(h.mcp_server_names(), vec!["extra-dummy"]);
-        // 空 extra（granted/oneshot）→ 名单为空（不再自带 abb-events）
-        assert!(mk(Vec::new()).mcp_server_names().is_empty());
+        assert!(mk(true).mcp_from_channel());
+        assert!(!mk(false).mcp_from_channel());
     }
 
-    /// e2e smoke：extra_mcp 注入的 server 必须出现在真实 ACP session/new 的
-    /// mcpServers 载荷里。用固定夹具（不依赖随包二进制），任何环境都会真跑。
+    /// e2e smoke：**渠道目录里的 `mcp.json`** 必须出现在真实 ACP session/new 的
+    /// mcpServers 载荷里（卡 abb-channel-mcp-config-20261012 的核心接线）。
+    /// 用固定夹具（不依赖随包二进制），任何环境都会真跑。
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
         ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
     )]
-    async fn extra_mcp_reaches_session_new_payload() {
-        let srv = McpServer {
-            name: "extra-dummy".to_string(),
-            command: "true".to_string(),
-            args: vec!["--flag".to_string()],
-            env: Vec::new(),
-        };
-        let rec = std::env::temp_dir().join(format!("abb-extra-mcp-e2e-{}.jsonl", Uuid::new_v4()));
+    async fn channel_mcp_json_reaches_session_new_payload() {
+        // 渠道工作目录 + 其中的 mcp.json（就是用户在会话里让 bot 写的那份）。
+        let channel_dir =
+            std::env::temp_dir().join(format!("abb-channel-mcp-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&channel_dir).unwrap();
+        std::fs::write(
+            channel_dir.join("mcp.json"),
+            r#"[{"name":"extra-dummy","command":"true","args":["--flag"]}]"#,
+        )
+        .unwrap();
+
+        let rec =
+            std::env::temp_dir().join(format!("abb-channel-mcp-rec-{}.jsonl", Uuid::new_v4()));
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
@@ -3222,7 +3218,7 @@ mod spawn_lifecycle_tests {
                 .unwrap_or_default()
                 .display()
                 .to_string(),
-            vec![srv],
+            true,
         );
         let run = tokio::spawn(super::run_loop(handle.clone()));
         let cid = Uuid::new_v4();
@@ -3236,7 +3232,8 @@ mod spawn_lifecycle_tests {
                 name: "e2e".to_string(),
                 anchor_mid: None,
                 adhoc: true,
-                workspace: None,
+                // 会话 cwd = 该渠道目录 ⇒ mcp.json 就从这里读。
+                workspace: Some(channel_dir.display().to_string()),
             },
         );
         let outcome = handle
@@ -3254,7 +3251,6 @@ mod spawn_lifecycle_tests {
             .await;
         stop.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
-        // mock agent 会把整段 prompt 原样回显，只断言回合成功收尾（text 内容非断言点）
         assert!(
             matches!(outcome, SyncTurnOutcome::Ok(_)),
             "回合应收尾 Ok，实际 {outcome:?}"
@@ -3265,15 +3261,161 @@ mod spawn_lifecycle_tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["event"] == "session_new")
             .expect("必须有一次 session/new");
+        // 会话 cwd 必须就是渠道目录（e2e 顺带钉住 P1 的 cwd 语义）
+        assert_eq!(
+            session_new["cwd"].as_str(),
+            Some(channel_dir.display().to_string().as_str())
+        );
         let servers = session_new["mcpServers"]
             .as_array()
             .expect("mcpServers 为数组");
         let extra = servers
             .iter()
             .find(|s| s["name"] == "extra-dummy")
-            .expect("mcpServers 必须含 extra-dummy");
+            .expect("mcpServers 必须含渠道 mcp.json 里的 extra-dummy");
         assert_eq!(extra["args"], serde_json::json!(["--flag"]));
         let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&channel_dir);
+    }
+
+    /// e2e：改渠道目录里的 `mcp.json` → **该渠道**会话必须重建（下一次消息重新
+    /// `session/new`，把新名单发出去），且**不影响其它渠道**会话（卡 AC5）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn channel_mcp_change_rebuilds_only_that_channel() {
+        let mk_dir = |tag: &str, server: &str| {
+            let dir =
+                std::env::temp_dir().join(format!("abb-channel-mcp-{tag}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("mcp.json"),
+                format!(r#"[{{"name":"{server}","command":"true"}}]"#),
+            )
+            .unwrap();
+            dir
+        };
+        let dir_a = mk_dir("rebuild-a", "first-server");
+        let dir_b = mk_dir("rebuild-b", "other-server");
+        let rec =
+            std::env::temp_dir().join(format!("abb-chmcp-rebuild-rec-{}.jsonl", Uuid::new_v4()));
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let stop = CancellationToken::new();
+        let handle = RuntimeHandle::new(
+            AgentConfig {
+                command: python3,
+                args: vec![script.display().to_string()],
+                extra_env: vec![
+                    ("PATH".to_string(), crate::deps::composed_path()),
+                    ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+                ],
+                backend: "mock".to_string(),
+                session_sandbox: None,
+            },
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            true,
+        );
+        let run = tokio::spawn(super::run_loop(handle.clone()));
+        let channel_a = Uuid::new_v4();
+        let channel_b = Uuid::new_v4();
+        for (cid, chat, ws) in [
+            (channel_a, "oc_rebuild_a", &dir_a),
+            (channel_b, "oc_rebuild_b", &dir_b),
+        ] {
+            handle.upsert_channel(
+                cid,
+                ChannelMeta {
+                    bot_key: "wst".to_string(),
+                    chat_id: chat.to_string(),
+                    chat_type: "p2p".to_string(),
+                    thread_id: None,
+                    name: "e2e".to_string(),
+                    anchor_mid: None,
+                    adhoc: true,
+                    workspace: Some(ws.display().to_string()),
+                },
+            );
+        }
+        let turn = |cid: Uuid, id: &str| {
+            handle.wait_turn_outcome(
+                cid,
+                crate::runtime::queue::InboundMsg {
+                    id_hex: id.to_string(),
+                    author_role: "owner".to_string(),
+                    text: "hi".to_string(),
+                    ts_secs: 0,
+                    prompt_tag: "test".to_string(),
+                },
+                std::time::Duration::from_secs(30),
+            )
+        };
+        assert!(matches!(
+            turn(channel_a, "a1").await,
+            SyncTurnOutcome::Ok(_)
+        ));
+        assert!(matches!(
+            turn(channel_b, "b1").await,
+            SyncTurnOutcome::Ok(_)
+        ));
+
+        // 只改 A 的配置
+        std::fs::write(
+            dir_a.join("mcp.json"),
+            r#"[{"name":"second-server","command":"true"}]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            turn(channel_a, "a2").await,
+            SyncTurnOutcome::Ok(_)
+        ));
+        stop.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
+
+        let news: Vec<serde_json::Value> = std::fs::read_to_string(&rec)
+            .expect("record file 可读")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "session_new")
+            .collect();
+        let count_for = |dir: &std::path::Path| {
+            let want = serde_json::json!(dir.display().to_string());
+            news.iter().filter(|v| v["cwd"] == want).count()
+        };
+        assert!(
+            count_for(&dir_a) >= 2,
+            "A 改了配置必须重建（≥2 次 session/new），实际 {}",
+            count_for(&dir_a)
+        );
+        assert_eq!(
+            count_for(&dir_b),
+            1,
+            "B 的配置没动，不得被重建（变更只影响对应渠道）"
+        );
+        let want_a = serde_json::json!(dir_a.display().to_string());
+        let last_a = news.iter().rev().find(|v| v["cwd"] == want_a).unwrap();
+        let names: Vec<String> = last_a["mcpServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            names.contains(&"second-server".to_string()),
+            "重建后的会话必须带新名单，实际 {names:?}"
+        );
+        let _ = std::fs::remove_file(&rec);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[test]
@@ -3334,7 +3476,7 @@ mod channel_info_tests {
             },
             CancellationToken::new(),
             ".".to_string(),
-            Vec::new(),
+            false,
         );
         // 模拟 run_loop 曾取走接收端后退出（生产上 Closed 只在此情形发生）。
         drop(handle.take_cmd_rx());
@@ -3369,7 +3511,7 @@ mod channel_info_tests {
             },
             CancellationToken::new(),
             ".".to_string(),
-            Vec::new(),
+            false,
         );
         let _cmd_rx = handle.take_cmd_rx();
         let channel_id = Uuid::new_v4();
@@ -3479,7 +3621,7 @@ mod channel_info_tests {
             },
             CancellationToken::new(),
             ".".to_string(),
-            Vec::new(),
+            false,
         );
         let channel_id = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncWaitMsg>();

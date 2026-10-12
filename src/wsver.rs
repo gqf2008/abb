@@ -36,6 +36,10 @@ const ABB_EMAIL: &str = "abb@agent-bridge.local";
 /// agent-pids.json / .abb-*-last / *.tmp 等）防高频变更击穿「无变更不空 commit」
 /// 快路径。
 ///
+/// 渠道级文件（2026-10-12，卡 abb-channel-mcp-config-20261012）：渠道目录现在挂在
+/// bot 工作区下（`workspaces/<bot>/<dir_name>/`），其中的 `mcp.json` 可含明文 env
+/// 凭据、`chat.json` 含 chat 身份信息——同样绝不能进 git 历史。
+///
 /// 注意：ignore 只对未跟踪文件生效——存量 tidy 仓库若曾把上述文件提交过，需
 /// `git rm --cached` 去 track（#209 批次 3 tidy 迁移时一并处理）。
 pub(crate) const GITIGNORE: &str = "\
@@ -56,6 +60,8 @@ buzz-reply-ledger.json
 .DS_Store
 GRANTED.md
 attachments/
+mcp.json
+chat.json
 .trash/
 .abb-tidy-last
 .abb-session-gc-last

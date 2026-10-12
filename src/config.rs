@@ -159,26 +159,11 @@ pub struct BotConfig {
     /// 需 owner 在 bot 配置页显式打开。false（默认）不落盘，旧 config 兼容。
     #[serde(default, skip_serializing_if = "tidy_off")]
     pub tidy_enabled: bool,
-    /// 该 bot 的会话要接入的外部 MCP server（空 = 不接入任何）。
-    ///
-    /// ABB 只声明：原样下发给 `session/new` 的 `mcpServers`，由执行层（abb-agent，rmcp
-    /// 客户端）去连接；接进来干什么、要订阅什么资源，由 agent 自己判断。形状校验见
-    /// `service::bot_mcp_servers`（name/command 非空、name 唯一）。
-    ///
-    /// **信任口径（2026-10-12 补，卡 abb-mcp-orchestrator-p0-20261012；评审 R3 更正后）**：
-    ///
-    /// 1. **名单只进 owner/普通会话**：granted（授权者）会话与 oneshot（任务执行）的名单**恒为空**
-    ///    （`service.rs` 的 `build_bot_acp_handles`/`oneshot_agent_config`），理由是外部 server 的工具面
-    ///    会**绕过受限档的沙箱**——所以本字段**不能**被读成"受会话档位约束"。
-    /// 2. **声明即授权**：MCP 子进程**不按会话档位运行**（它不是 agent 的 shell，`_meta.abbSandbox` 管不到它）。
-    ///    它继承 agent 进程的白名单 env（含 `$ABB_BIN` = 本程序绝对路径）、cwd 为会话工作区，因此
-    ///    **等于给它在工作区上的执行权 + 驱动 ABB CLI 的能力**（`task add/status/logs/cancel`、`deliver` 等）；
-    ///    server 自己声明的 `env` 会**叠加在白名单之上**（可覆盖）。
-    ///
-    /// 仍然生效的闸：Q8（`--proc` 载荷对 agent 一律拒绝——MCP 子进程带 `ABB_AGENT_CONTEXT=1`）、
-    /// `cross_delivery_enabled`（**跨会话**投递总开关；会话内投递不受它约束）。⇒ **只声明你信任的 server**。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mcp_servers: Vec<McpServerConfig>,
+
+    /// 该 bot 的会话要接入的外部 MCP server —— 2026-10-12 起改为**渠道级**：
+    /// 配置在每个渠道自己的工作目录 `<workspaces>/<bot>/<dir_name(chat_id)>/mcp.json`
+    /// （卡 `abb-channel-mcp-config-20261012`），不再有 bot 级字段。
+
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；
     /// 缺省（无条目）= 需要 @（默认，向后兼容旧 config）。仅顶层群聊 chat_id 记录；
     /// 私聊/话题不适用（本就无需 @）。值合法性只认 "off"，其余按需要 @ 处理。
@@ -260,7 +245,6 @@ impl Default for BotConfig {
             open_access: false,
             restrict_granted_agent: true,
             tidy_enabled: false,
-            mcp_servers: Vec::new(),
             mention_modes: std::collections::HashMap::new(),
             mention_default: false,
             delete_protect_enabled: true,
@@ -869,38 +853,6 @@ pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
             .unwrap_or(true)
 }
 
-/// 会话级外部 MCP server（bot 级配置）。
-///
-/// ABB 只做**声明**：把这里的三元组原样放进 ACP `session/new` 的 `mcpServers`，
-/// 由执行层（abb-agent，rmcp 客户端）去连接。具体 server 干什么、要订阅什么资源，
-/// 由 agent 自己判断——ABB 不解释语义，也不认识任何具体 server（原自带的
-/// `abb-events` 已于 2026-10-11 下线，见 card `abb-mcp-declarer-only-20261011`）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpServerConfig {
-    /// server 名（会出现在工具名 `{server}__{tool}` 里；装配侧校验非空且唯一）。
-    pub name: String,
-    /// 可执行文件（与 `PATH` 解析同语义）。
-    pub command: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<McpEnvVar>,
-}
-
-/// 下发给 MCP 子进程的环境变量（与 `runtime/acp.rs::EnvVar` 逐字对应）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct McpEnvVar {
-    pub name: String,
-    pub value: String,
-}
-
-impl McpServerConfig {
-    /// 形状是否可用（装配侧 `bot_mcp_servers` 用；语义不校验——ABB 不认识 server）。
-    pub fn is_usable(&self) -> bool {
-        !self.name.trim().is_empty() && !self.command.trim().is_empty()
-    }
-}
-
 /// Jev 决策模型配置（统一迁移刀 4a）：授权者/受限会话的工具调用门禁。
 ///
 /// 与 [`ProviderConfig`]（主 LLM）分开：Jev 不是聊天模型，是 Typesafe 的 System One
@@ -1113,7 +1065,7 @@ pub(crate) fn sanitize(s: &str) -> String {
         .collect::<String>()
 }
 
-fn is_windows_reserved_component(value: &str) -> bool {
+pub(crate) fn is_windows_reserved_component(value: &str) -> bool {
     let stem = value.split('.').next().unwrap_or(value);
     matches!(
         stem.to_ascii_uppercase().as_str(),
@@ -2395,66 +2347,6 @@ mod tests {
             !bot.access_allows("ou_unknown"),
             "fail-closed：公开字段不再放行"
         );
-    }
-
-    /// `bots[].mcp_servers` 的 serde 契约：空不落盘、有值 round-trip 逐字保真、
-    /// 旧 config（无此字段）仍可解析。
-    #[test]
-    fn bot_mcp_servers_serde_contract() {
-        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
-        assert!(bot.mcp_servers.is_empty(), "旧 config 无字段 → 空");
-        let s = serde_json::to_string(&bot).unwrap();
-        assert!(
-            !s.contains("mcp_servers"),
-            "空列表不落盘（skip_serializing_if）"
-        );
-
-        let mut with = bot.clone();
-        with.mcp_servers = vec![
-            McpServerConfig {
-                name: "notes".into(),
-                command: "/opt/notes-mcp".into(),
-                args: vec!["--root".into(), "/tmp".into()],
-                env: vec![McpEnvVar {
-                    name: "TOKEN".into(),
-                    value: "t-1".into(),
-                }],
-            },
-            McpServerConfig {
-                name: "empty-extras".into(),
-                command: "true".into(),
-                args: Vec::new(),
-                env: Vec::new(),
-            },
-        ];
-        let s = serde_json::to_string(&with).unwrap();
-        assert!(s.contains("\"mcp_servers\""), "非空必须落盘：{s}");
-        let back: BotConfig = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.mcp_servers, with.mcp_servers, "round-trip 逐字保真");
-        // 空 args/env 不落盘（少写盘，语义不变）
-        assert!(!s.contains("\"args\":[]"), "空 args 不落盘：{s}");
-    }
-
-    /// 形状校验谓词：name/command 任一为空即不可用（语义不校验）。
-    #[test]
-    fn mcp_server_config_usability_predicate() {
-        let ok = McpServerConfig {
-            name: "n".into(),
-            command: "c".into(),
-            args: Vec::new(),
-            env: Vec::new(),
-        };
-        assert!(ok.is_usable());
-        assert!(!McpServerConfig {
-            name: "  ".into(),
-            ..ok.clone()
-        }
-        .is_usable());
-        assert!(!McpServerConfig {
-            command: String::new(),
-            ..ok
-        }
-        .is_usable());
     }
 
     /// 废弃 wassette（2026-10-10）后的显式兼容断言：旧落盘 config 里的 `"wassette": false`

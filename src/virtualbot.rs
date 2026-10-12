@@ -278,13 +278,13 @@ pub fn vb_uuid(bot_key: &str, chat_id: &str) -> String {
 }
 
 /// chat 的虚拟 Bot 独立工作目录（只解析不落盘）。None = 非虚拟 Bot 群。
+///
+/// 2026-10-12 起所有渠道的目录规则统一为 `<workspaces>/<bot>/<dir_name(chat_id)>/`
+/// （见 `channel_dir`），vb 群不再单独用 `vb/<fnv_uuid>/`；旧路径由
+/// `migrate_legacy_vb_location` 一次性迁过来。
 pub fn vb_dir_for(bot_key: &str, chat_id: &str) -> Option<PathBuf> {
     if VirtualBotStore::new().is_registered(bot_key, chat_id) {
-        Some(
-            crate::workspace_dir(bot_key)
-                .join("vb")
-                .join(vb_uuid(bot_key, chat_id)),
-        )
+        Some(crate::channel_dir::channel_dir(bot_key, chat_id))
     } else {
         None
     }
@@ -315,9 +315,13 @@ pub(crate) fn ensure_vb_dir_at(
     bot_key: &str,
     chat_id: &str,
 ) {
+    // 旧目录 `vb/<fnv_uuid>/` → 新渠道目录的搬家在 `channel_dir::ensure_channel_dir_at`
+    // 里做（那里是唯一物化点，且对“目标已存在”幂等）——不能放这里，否则先经巡检/job
+    // 路径物化过的新目录会让搬家早退。
     let _ = std::fs::create_dir_all(dir);
+    // chat.json + 工作区指引与其它渠道同一条收口（避免两个物化点漂移）。
+    crate::channel_dir::ensure_channel_dir_at(dir, bot_key, chat_id, "group", None);
     migrate_legacy_vb_data(base, bot_key, chat_id, dir);
-    crate::agent::ensure_workspace_guide(dir);
 }
 
 /// 存量迁移（#194）：bot 级会话槽位 + 前缀匹配的历史文件搬入 vb 目录。幂等。

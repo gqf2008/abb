@@ -83,7 +83,28 @@ key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
   微信 `item.ref_msg`（title + message_item）、钉钉 `text.isReplyMsg/repliedMsg` 随事件直接携带。
   `Ev.quoted` 随 pending.json 持久化，重启恢复不丢引用上下文。
 
-## 6. 相关代码索引
+## 6. 渠道工作目录（2026-10-12 起）
+
+会话 key 早就是渠道级（chat_id / chat_id:thread_id），但**工作目录**此前只有虚拟 Bot 群独立；
+普通群/频道/DM 共用 bot 目录 `workspaces/<bot>/`。2026-10-12 起统一为：
+
+```
+~/.agent-bridge/workspaces/<bot_key>/<dir_name(chat_id)>/
+   chat.json     # 原始 chat_id / bot_key / chat_type / thread_id（sanitize 不可逆，反查用）
+   mcp.json      # 该渠道的 MCP 配置（卡 abb-channel-mcp-config-20261012；LLM 自己读写）
+   AGENTS.md     # 工作区指引（ensure_workspace_guide）
+```
+
+- 目录名 = `sanitize(chat_id)`；被改写/为空/Windows 保留名时追加 `-<8hex>`（`src/channel_dir.rs`）。
+  不用派生 uuid：`(bot_key, chat_id)` 唯一性由父目录提供，可读性更重要。
+- 会话 cwd = 该目录（`ChannelMeta.workspace` 的三个登记点：群/p2p/话题 都走它）；
+  受限档（read-only / workspace-write）的 `writable_roots` 随会话 cwd（`pool.rs` 建会话时
+  用 `SessionSandboxMeta::retarget_writable_root` 换成渠道目录）——否则受限会话写不了自己的 cwd。
+- 旧 vb 目录 `workspaces/<bot>/vb/<fnv_uuid>/` 一次性改名迁到新路径
+  （`virtualbot.rs::migrate_legacy_vb_location`，失败保留旧目录并留日志）。
+- **会话文件（`sessions.json`）仍在 bot 级**：owner 明确会话文件不必进渠道目录。
+
+## 7. 相关代码索引
 
 - 会话持久化：`src/sessions.rs`（chat_id 单维度、单槽；老四槽/旧扁平 load 时折叠迁移）
 - 并发/打断：`src/bridge.rs`（`chat_lock` / `cancel_flags` / `handle`）
