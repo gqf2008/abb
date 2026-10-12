@@ -179,46 +179,6 @@ fn granted_sandbox_profile(
     }
 }
 
-/// `bots[].mcp_servers` → 会话级 MCP 名单（**形状校验，fail-visible**）。
-///
-/// ABB 只做声明：name/command 非空、name 唯一，其余原样透传；不认识的 server 也能接入，
-/// 干什么由 agent 判断。非法项跳过并留一条日志（不静默降级成"少接一个"）。
-fn bot_mcp_servers(bot: &crate::config::BotConfig) -> Vec<crate::runtime::acp::McpServer> {
-    let mut out: Vec<crate::runtime::acp::McpServer> = Vec::new();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for cfg in &bot.mcp_servers {
-        let name = cfg.name.trim();
-        if !cfg.is_usable() {
-            crate::log!(
-                "[mcp] bot={} 的 mcp_servers 有一项 name/command 为空，已跳过",
-                bot.key()
-            );
-            continue;
-        }
-        if !seen.insert(name.to_string()) {
-            crate::log!(
-                "[mcp] bot={} 的 mcp_servers 有重复的 server 名「{name}」，后一项已跳过",
-                bot.key()
-            );
-            continue;
-        }
-        out.push(crate::runtime::acp::McpServer {
-            name: name.to_string(),
-            command: cfg.command.trim().to_string(),
-            args: cfg.args.clone(),
-            env: cfg
-                .env
-                .iter()
-                .map(|e| crate::runtime::acp::EnvVar {
-                    name: e.name.clone(),
-                    value: e.value.clone(),
-                })
-                .collect(),
-        });
-    }
-    out
-}
-
 /// 按 bot 构造 ACP 句柄对（P2.1/P2.2）：normal 与 granted 同命令同 env，差异在
 /// ① env：granted 多 `ABB_AGENT_NO_HINTS=1`——fork 的 hints（~/AGENTS.md、
 /// ~/.agents/skills 扫盘）发生在 session/new **之前**，per-session `_meta` 管不到，
@@ -244,19 +204,18 @@ fn build_bot_acp_handles(
         .to_string();
     let normal_meta = resolve_sandbox_meta(bot);
     let granted_meta = granted_sandbox_profile(bot);
-    // 会话级 MCP 名单：来自该 bot 的用户配置（`bots[].mcp_servers`），ABB 只声明不解释语义。
-    //
-    // **只进 normal（owner/普通）会话**：外部 MCP server 提供的工具面会绕过受限档的沙箱，
-    // 与当初 wassette 的口径一致（限制档会话经组件宿主可读工作区/放行网络）——所以
-    // granted 与 oneshot 保持空名单，宁可少给能力也不给绕闸路径。
-    let extra_mcp = bot_mcp_servers(bot);
+    // 渠道级 MCP（卡 abb-channel-mcp-config-20261012）：名单不在句柄上，而是会话建立时
+    // 按渠道目录现读 `<渠道目录>/mcp.json`。这里只决定**哪些句柄允许读**：
+    // **只给 normal（owner/普通）**——外部 MCP server 提供的工具面会绕过受限档的沙箱，
+    // 所以 granted 与 oneshot 保持关闭，宁可少给能力也不给绕闸路径。
+    let mcp_from_channel = true;
     // 刀 4b：abb-agent 已声明 `_meta.abbSandbox` 三档并实现受限执行，owner 受限档也走它。
     let normal_command = pick_command_by_sandbox((command, granted_command), normal_meta.is_some());
 
     let mk = |command: &str,
               extra_env: Vec<(String, String)>,
               session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
-              extra_mcp: Vec<crate::runtime::acp::McpServer>| {
+              mcp_from_channel: bool| {
         crate::runtime::harness::RuntimeHandle::new(
             crate::runtime::harness::AgentConfig {
                 command: command.to_string(),
@@ -270,7 +229,7 @@ fn build_bot_acp_handles(
             },
             stop.clone(),
             cwd.clone(),
-            extra_mcp,
+            mcp_from_channel,
         )
     };
     // granted 实例：NO_HINTS + Jev 门禁 env（受限会话的工具调用要先问 Jev）。
@@ -282,7 +241,7 @@ fn build_bot_acp_handles(
         normal_command,
         env.clone().into_iter().chain(jev.clone()).collect(),
         normal_meta,
-        extra_mcp,
+        mcp_from_channel,
     );
     let granted = mk(
         granted_command,
@@ -291,7 +250,7 @@ fn build_bot_acp_handles(
             .chain(jev)
             .collect(),
         Some(granted_meta),
-        Vec::new(),
+        false,
     );
     crate::log!(
         "[acp] harness 装配 bot={} cmd(normal)={normal_command} cmd(granted)={granted_command}",
@@ -1867,85 +1826,15 @@ async fn run_job(
 mod tests {
     use super::*;
 
-    /// `bots[].mcp_servers` → 会话 MCP 名单：形状校验（跳过 name/command 空、名字重复），
-    /// 其余逐字透传（含 env），顺序保持配置顺序。
-    #[test]
-    fn bot_mcp_servers_shape_and_passthrough() {
-        let bot = crate::config::BotConfig {
-            name: "mcpbot".into(),
-            mcp_servers: vec![
-                crate::config::McpServerConfig {
-                    name: "  notes  ".into(), // 首尾空白：trim 后使用
-                    command: " /opt/notes-mcp ".into(),
-                    args: vec!["--root".into(), "/tmp".into()],
-                    env: vec![crate::config::McpEnvVar {
-                        name: "TOKEN".into(),
-                        value: "t-1".into(),
-                    }],
-                },
-                crate::config::McpServerConfig {
-                    name: String::new(), // 非法：name 空 → 跳过
-                    command: "x".into(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                },
-                crate::config::McpServerConfig {
-                    name: "notes".into(), // 非法：与第一项重名 → 跳过
-                    command: "y".into(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                },
-                crate::config::McpServerConfig {
-                    name: "plain".into(),
-                    command: "true".into(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                },
-            ],
-            ..Default::default()
-        };
-        let servers = bot_mcp_servers(&bot);
-        assert_eq!(
-            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["notes", "plain"],
-            "非法项跳过、合法项按配置顺序"
-        );
-        assert_eq!(servers[0].command, "/opt/notes-mcp", "command 也 trim");
-        assert_eq!(servers[0].args, vec!["--root", "/tmp"]);
-        assert_eq!(servers[0].env.len(), 1);
-        assert_eq!(servers[0].env[0].name, "TOKEN");
-        assert_eq!(servers[0].env[0].value, "t-1");
-        assert!(servers[1].args.is_empty() && servers[1].env.is_empty());
-        // 空配置 → 空名单（ABB 不再自带任何 server）
-        assert!(bot_mcp_servers(&crate::config::BotConfig::default()).is_empty());
-    }
-
-    /// **接线测试**：`build_bot_acp_handles` 必须把 `bots[].mcp_servers` 接到 **normal** 句柄
-    /// 的 MCP 名单上（granted 保持空：外部 server 的工具面会绕过受限档沙箱，见该函数注释）。
+    /// **接线测试**：`build_bot_acp_handles` 只给 **normal** 句柄开“按渠道读 MCP 配置”，
+    /// granted 关闭（外部 MCP server 的工具面会绕过受限档沙箱，见 `build_bot_acp_handles` 注释）。
     ///
-    /// 判别力：把 `service.rs` 里的 `let extra_mcp = bot_mcp_servers(bot);` 换回 `Vec::new()`
-    /// （= 接了又丢）⇒ 本用例红；此前这类改动全仓 1006 条用例仍全绿（评审实测）。
+    /// 判别力：把 `let mcp_from_channel = true;` 改成 `false` ⇒ normal 断言红；
+    /// 把 `granted` 那支的 `false` 改成 `true` ⇒ granted 断言红。
     #[test]
-    fn chat_handles_carry_bot_mcp_servers_to_normal_only() {
+    fn channel_mcp_enabled_for_normal_only() {
         let bot = crate::config::BotConfig {
             name: "mcpwire".into(),
-            mcp_servers: vec![
-                crate::config::McpServerConfig {
-                    name: "notes".into(),
-                    command: "/opt/notes-mcp".into(),
-                    args: vec!["--root".into(), "/tmp".into()],
-                    env: vec![crate::config::McpEnvVar {
-                        name: "TOKEN".into(),
-                        value: "t-1".into(),
-                    }],
-                },
-                crate::config::McpServerConfig {
-                    name: "second".into(),
-                    command: "true".into(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                },
-            ],
             ..Default::default()
         };
         let cfg = Config::default();
@@ -1955,14 +1844,13 @@ mod tests {
             ("/bin/abb-agent", "/bin/abb-agent"),
             tokio_util::sync::CancellationToken::new(),
         );
-        assert_eq!(
-            handles.normal.mcp_server_names(),
-            vec!["notes".to_string(), "second".to_string()],
-            "normal 句柄必须带上 bot 配置的外部 MCP server（顺序保持）"
+        assert!(
+            handles.normal.mcp_from_channel(),
+            "normal 句柄必须允许按渠道读 <渠道目录>/mcp.json"
         );
         assert!(
-            handles.granted.mcp_server_names().is_empty(),
-            "granted 句柄不得带外部 MCP server（否则可绕过受限档沙箱）"
+            !handles.granted.mcp_from_channel(),
+            "granted 句柄不得读渠道 MCP 配置（否则可绕过受限档沙箱）"
         );
     }
 

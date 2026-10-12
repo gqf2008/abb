@@ -1547,7 +1547,7 @@ mod tests {
                     .unwrap_or_default()
                     .display()
                     .to_string(),
-                Vec::new(),
+                false,
             )
         };
         let rt = mk();
@@ -3800,7 +3800,7 @@ mod tests {
             },
             tokio_util::sync::CancellationToken::new(),
             ".".to_string(),
-            Vec::new(),
+            false,
         )
     }
 

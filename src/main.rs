@@ -19,6 +19,7 @@ mod attachments;
 mod botstatus;
 mod bridge;
 mod channel_dir;
+mod channel_mcp;
 mod config;
 mod deliver;
 mod deps;

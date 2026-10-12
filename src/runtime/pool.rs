@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, McpServer, StopReason, SystemPromptTransport};
+use crate::runtime::acp::{AcpClient, AcpError, StopReason, SystemPromptTransport};
 use crate::runtime::queue::{CancelReason, DedupMode, FlushBatch, PromptChannelInfo};
 
 /// Window within which agent activity before a hard-cap death qualifies
@@ -93,6 +93,11 @@ pub struct SessionState {
     /// Per-channel successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<Uuid, ChannelDeliveryState>,
+    /// 建会话时读到的渠道 `mcp.json` 内容指纹（卡 `abb-channel-mcp-config-20261012`）。
+    /// 与 `sessions` 同生共死：指纹变了就说明用户（在会话里驱动 bot）改了 MCP 配置，
+    /// 该渠道会话必须失效重建——下一次 `session/new` 才会重连新的 MCP 子进程。
+    /// `None` = 建会话时该渠道没有 `mcp.json`。
+    pub mcp_stamp: HashMap<Uuid, Option<u64>>,
 }
 
 impl SessionState {
@@ -110,6 +115,7 @@ impl SessionState {
     pub fn invalidate_channel(&mut self, channel_id: &Uuid) -> bool {
         self.turn_counts.remove(channel_id);
         self.deliveries.remove(channel_id);
+        self.mcp_stamp.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -118,6 +124,7 @@ impl SessionState {
         self.sessions.clear();
         self.turn_counts.clear();
         self.deliveries.clear();
+        self.mcp_stamp.clear();
     }
 
     pub(crate) fn mark_channel_delivery_success(
@@ -475,7 +482,11 @@ pub enum PromptOutcome {
 /// framing — no per-turn REST fetch exists in this port (upstream's
 /// `ChannelInfoResolver` relay refresh was trimmed).
 pub struct PromptContext {
-    pub mcp_servers: Vec<McpServer>,
+    /// 该句柄的会话是否按**渠道**读 MCP 配置（`<渠道工作目录>/mcp.json`）。
+    ///
+    /// normal（owner/普通）会话 = true；granted（受限授权者）/ oneshot = false
+    /// （外部 MCP server 的工具面会绕过受限档沙箱，宁可少给能力也不给绕闸路径）。
+    pub mcp_from_channel: bool,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
     pub max_turn_duration: Duration,
@@ -915,7 +926,10 @@ async fn create_session_and_apply_model(
         .session_title
         .as_deref()
         .map(|agent_name| compose_session_title(agent_name, channel.name));
-    let mcp_servers = ctx.mcp_servers.clone();
+    let mcp_servers = crate::channel_mcp::load_for_session(
+        ctx.mcp_from_channel,
+        std::path::Path::new(session_cwd),
+    );
 
     let resp = agent
         .acp
@@ -1137,6 +1151,36 @@ pub async fn run_prompt_task(
         title_channel = resolve_new_session_channel_context(resolved_channel_info.as_ref());
     }
 
+    // 渠道 MCP 配置变更检测（卡 abb-channel-mcp-config-20261012）：渠道 `mcp.json` 的
+    // mtime 与建会话时记下的不同 ⇒ 用户在会话里改过配置 ⇒ 失效该渠道会话，让下面
+    // 走 `session/new` 按新名单重连 MCP 子进程（旧会话 drop 顺带关掉旧子进程）。
+    // granted/oneshot（`mcp_from_channel=false`）不参与：它们恒空名单。
+    let channel_mcp_stamp = if ctx.mcp_from_channel {
+        let ws = resolved_channel_info
+            .as_ref()
+            .and_then(|info| info.workspace.clone())
+            .unwrap_or_else(|| ctx.cwd.clone());
+        let stamp = crate::channel_mcp::stamp(std::path::Path::new(&ws));
+        if agent.state.sessions.contains_key(&batch.channel_id)
+            && agent
+                .state
+                .mcp_stamp
+                .get(&batch.channel_id)
+                .copied()
+                .flatten()
+                != stamp
+        {
+            crate::log!(
+                "[mcp] 渠道 MCP 配置已变更，失效会话重建 channel={} dir={ws}",
+                batch.channel_id
+            );
+            agent.state.invalidate_channel(&batch.channel_id);
+        }
+        Some(stamp)
+    } else {
+        None
+    };
+
     let (session_id, is_new_session) = {
         if let Some(sid) = agent.state.sessions.get(&batch.channel_id) {
             (sid.clone(), false)
@@ -1202,6 +1246,11 @@ pub async fn run_prompt_task(
             }
         }
     };
+
+    // 记下本会话用的 `mcp.json` 时间戳（下次比对；与 `sessions` 同生共死）。
+    if let Some(stamp) = channel_mcp_stamp {
+        agent.state.mcp_stamp.insert(batch.channel_id, stamp);
+    }
 
     // Standing context is fixed for the life of a session. Agents with
     // systemPrompt support already hold it from session/new; legacy agents
