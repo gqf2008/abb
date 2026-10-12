@@ -47,6 +47,10 @@ esac
 if [ "$PLATFORM" = "windows-x64" ]; then suffix=".exe"; else suffix=""; fi
 
 found=0
+# 剥 CR（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：Windows 检出（core.autocrlf=true）
+# 会把 tsv 变 CRLF ⇒ 逐行读到的最后字段带 `\r`，按名/后缀判定全错。仓库根另有 .gitattributes 钉 EOL。
+strip_cr() { tr -d '\r'; }
+
 while IFS=$'\t' read -r tool version platform package url sha256 inner_path output_name; do
   [ "$tool" = "tool" ] && continue
   [ "$platform" = "$PLATFORM" ] || continue
@@ -202,10 +206,15 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       echo "$name 不可执行（rc=$rc）" >&2; exit 1
     fi
   done < "$tmp/check-names.txt"
-done < tools/tool-lock.tsv
+done < <(strip_cr < tools/tool-lock.tsv)
 
 # 计数 = lock 里该平台的**包**数（多调包一个包提供多个工具名，故不再与工具名数相等）。
 [ "$found" -eq "$(awk -F'\t' -v p="$PLATFORM" 'NR>1 && $3==p {n++} END {print n}' tools/tool-lock.tsv)" ] || {
   echo "lock 中 $PLATFORM 的包数不符（found=$found）" >&2; exit 1;
 }
 echo "  [tools] 已准备 $found 个工具到 $DEST"
+
+# 显式以 0 退出（对称加固，卡 abb-windows-ps1-exit-code-leak-20261012）：现在末尾是 `echo`（内建，返回 0）
+# 所以不出问题；但若将来把多调包 smoke 循环挪到末尾，最后一条**原生命令**的非 0 退出码会变成脚本退出码
+# （PowerShell 版就是因为这个在 CI 里挂了）。出错路径仍由 `exit 1` 负责。
+exit 0

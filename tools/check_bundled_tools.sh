@@ -33,6 +33,13 @@ mkdir -p "$BIN"
 # Windows 侧产物带 .exe 后缀。
 if [ "$PLATFORM" = "windows-x64" ]; then suffix=".exe"; else suffix=""; fi
 
+# **剥离 CR**（2026-10-12 修，卡 abb-windows-ps1-exit-code-leak-20261012）：
+# Windows 检出若 `core.autocrlf=true`（GH runner 默认如此，本仓原先没有 .gitattributes），
+# `tools/*.tsv` 会变成 CRLF ⇒ 逐行读到的最后字段带 `\r`，`case ... in *"$suffix")` 对
+# `.exe` 行永远不匹配（而 suffix 为空时 `*""` 匹配一切，所以**只有 windows 行**报错——
+# v2.23.115 的 CI 正是"8 行全不符"）。这里主动剥 CR，配合仓库根的 .gitattributes 双保险。
+strip_cr() { tr -d '\r'; }
+
 # 1) 一包一名：tool-lock 的行（包产物名 == 工具名，goawk 除外——它输出名是 awk）
 missing=0
 while IFS=$'\t' read -r tool version platform package url sha256 inner out; do
@@ -45,7 +52,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner out; do
   if [ ! -x "$BIN/$out" ] && [ ! -f "$BIN/$out" ]; then
     echo "  ❌ 缺包产物：$BIN/${out}（包 ${tool}）" >&2; missing=$((missing+1))
   fi
-done < tools/tool-lock.tsv
+done < <(strip_cr < tools/tool-lock.tsv)
 
 # 2) 多调包暴露的工具名（按平台过滤）
 while IFS=$'\t' read -r name provider platform; do
@@ -54,7 +61,7 @@ while IFS=$'\t' read -r name provider platform; do
   if [ ! -f "$BIN/$name$suffix" ]; then
     echo "  ❌ 缺工具名：$BIN/$name${suffix}（provider=${provider}）" >&2; missing=$((missing+1))
   fi
-done < tools/bundled-cli-tools.tsv
+done < <(strip_cr < tools/bundled-cli-tools.tsv)
 
 # 3) **集合相等**：期望集合（包产物 ∪ 该平台多调名字）必须与目录里实际文件逐一相等。
 #    为什么：前两步只查"期望的都在"，查不出"目录里多了不该有的"；而多调包的按名落地很容易
