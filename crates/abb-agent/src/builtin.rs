@@ -186,13 +186,17 @@ pub fn dev_tools(
         tools.push(exposed(
             create_write_tool(&context),
             "write",
-            Guard::WritePath,
+            Guard::WritePath {
+                deny_channel_mcp: shell_restricted,
+            },
             workspace,
         ));
         tools.push(exposed(
             create_edit_tool(&context),
             "edit",
-            Guard::WritePath,
+            Guard::WritePath {
+                deny_channel_mcp: shell_restricted,
+            },
             workspace,
         ));
     }
@@ -241,7 +245,13 @@ enum Guard {
     /// 原样委托。
     None,
     /// 写类工具：把 `path` 限定到会话工作区内（见 [`confine_write_path`]）。
-    WritePath,
+    ///
+    /// `deny_channel_mcp` = **受限（授权者）会话**专用的加码：拒写渠道级 MCP 配置 `mcp.json`。
+    /// 为什么（卡 `abb-channel-mcp-write-escalation-20261012`）：该文件声明的是"abb-agent 要起的
+    /// MCP 子进程"，而子进程**不按会话档位沙箱运行**（白名单 env 含 `HOME`/`$ABB_BIN`）⇒ 受限会话
+    /// 若能写它，下一条 **owner** 消息重建会话时就会以用户身份无沙箱执行 ⇒ 受限→owner 提权。
+    /// owner 会话**不受此限**：那份配置本来就该由 owner 会话/人工维护。
+    WritePath { deny_channel_mcp: bool },
     /// 读类工具：把 `path` 限定到**会话工作区或附加只读根**内（见 [`confine_read_path`]）。
     /// 仅受限会话套用；owner 全权限用 `None`（对齐参照物 FullAccess 读任意路径）。
     /// 括号里是附加只读根（如 bot 级 `attachments/`）——它们是**读**域，仍不能写。
@@ -326,7 +336,7 @@ fn exposed(
         description = description.replace("Optionally provide a timeout in seconds.", &hint);
         describe_timeout_bounds(&mut parameters);
     }
-    if guard == Guard::WritePath {
+    if matches!(guard, Guard::WritePath { .. }) {
         // 参照物的 description 里写明「只能写工作区内」——工具的说明与真实约束一致，
         // 模型才不会白试几次（本包的约束与参照物同款，见 [`confine_write_path`]）。
         description.push_str(
@@ -419,7 +429,12 @@ impl AgentTool for Exposed {
     ) -> Result<AgentToolResult, AgentError> {
         let params = match &self.guard {
             Guard::None => params,
-            Guard::WritePath => self.confine(&params).await?,
+            Guard::WritePath { deny_channel_mcp } => {
+                if *deny_channel_mcp {
+                    deny_channel_mcp_config(&params)?;
+                }
+                self.confine(&params).await?
+            }
             Guard::ReadPath(roots) => self.confine_read(&params, roots).await?,
             Guard::ShellTimeout => rename_timeout_param(params),
         };
@@ -502,6 +517,31 @@ fn rename_timeout_param(params: Value) -> Value {
 /// 与参照物的一处**有意更紧**：本包允许**落在工作区内的**绝对路径（参照物一律拒绝绝对
 /// 路径），因为 rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，不给它绝对路径反而
 /// 会破坏正常写入——「不得出工作区」这条本身没有放宽。
+/// 受限会话不得改写渠道级 MCP 配置（`mcp.json`）——见 [`Guard::WritePath`] 的字段说明。
+///
+/// 判定按**最终文件名**（大小写不敏感、并剥离尾随 `.`/空格——APFS/NTFS 会剥离它们，
+/// 与 `src/guard.rs::is_bridge_state_path` 同款口径）；`sub/../mcp.json` 这类穿越的最终
+/// 组件同样是 `mcp.json`，自然被覆盖。
+fn deny_channel_mcp_config(params: &Value) -> Result<(), AgentError> {
+    let Some(raw) = params.get("path").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let name = std::path::Path::new(raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let name = name.trim_end_matches(['.', ' ', '\t', '\r']).to_string();
+    if name == "mcp.json" {
+        return Err(AgentError::Tool(
+            "受限会话不能改写渠道的 MCP 配置（mcp.json）：它声明的是以 agent 身份、**无沙箱**运行的 \
+             MCP server（白名单 env 含 HOME/$ABB_BIN），写它等于把代码塞进下一条 owner 会话执行。\
+             请让 owner 会话或人工维护该文件（卡 abb-channel-mcp-write-escalation-20261012）。"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
     let base = tokio::fs::canonicalize(workspace)
         .await
@@ -1072,6 +1112,62 @@ mod tests {
     }
 
     /// 读域闸（统一迁移刀 3）：工作区内可读、`..` 与工作区外绝对路径被拒。
+    /// **受限会话不得改写渠道 `mcp.json`**（卡 `abb-channel-mcp-write-escalation-20261012`）：
+    /// 它声明的是会被 abb-agent **无沙箱**起的 MCP 子进程 ⇒ 受限写它 = 把代码塞进下一条 owner 会话执行。
+    ///
+    /// 三组判据：①受限（`shell_restricted=true`）写 `mcp.json` ⇒ **拒**（含大小写/尾随点/子目录变体）；
+    /// ②同文件在 **owner**（`shell_restricted=false`）下 ⇒ **允许**（设计上就该由 owner 维护，别顺手堵死）；
+    /// ③普通文件名（`note.txt`）在两档下都允许（证明拒绝不是"把所有写都拦了"）。
+    #[tokio::test]
+    async fn restricted_session_cannot_write_channel_mcp_json() {
+        let workspace = temp_workspace("mcp-deny");
+        let write_tool = |restricted: bool| -> Arc<dyn AgentTool> {
+            dev_tools(&workspace, SandboxMode::WorkspaceWrite, restricted, &[])
+                .into_iter()
+                .find(|t| t.schema().name == "dev__write")
+                .expect("dev__write 存在（WorkspaceWrite 档）")
+        };
+        let call = |tool: Arc<dyn AgentTool>, path: &str| {
+            let path = path.to_string();
+            async move {
+                tool.execute(
+                    "call",
+                    serde_json::json!({ "path": path, "content": "[]" }),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                )
+                .await
+            }
+        };
+
+        for bad in [
+            "mcp.json",
+            "MCP.JSON",
+            "mcp.json.",
+            "sub/mcp.json",
+            "sub/../mcp.json",
+        ] {
+            let err = call(write_tool(true), bad)
+                .await
+                .expect_err(&format!("受限会话写 {bad} 必须被拒"));
+            assert!(
+                err.to_string().contains("MCP 配置"),
+                "{bad} 的拒绝理由应说明是 MCP 配置：{err}"
+            );
+        }
+
+        // owner 档：同一文件可写（负向对照）
+        call(write_tool(false), "mcp.json")
+            .await
+            .expect("owner 会话应仍可维护渠道 mcp.json");
+        assert!(workspace.join("mcp.json").exists(), "owner 写入应真的落盘");
+
+        // 普通文件不受影响（负向对照：别把受限会话的写全拦了）
+        call(write_tool(true), "note.txt")
+            .await
+            .expect("受限会话写普通文件应仍允许");
+    }
+
     #[tokio::test]
     async fn read_confinement_rejects_escapes() {
         let workspace = temp_workspace("read-conf");
