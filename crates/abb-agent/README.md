@@ -147,6 +147,13 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
     ⇒ 本包自己降级成**如实**的一行文本
     （`[image 未传给模型：…]`），并把 `input` 保持为 `[Text]`。声明 `Image` 反而更差：那会把「如实
     说明被省略」换成「指着一张不存在的图」。上游修好后把 `delivers_tool_result_images` 翻真即可。
+- **`read` 工具的图片处理（本卡新增）**：注入了 rpi-tools 自带的 `InlineImageProcessor`
+  （`read_tool_options()`），于是把图片读给模型时是「解码 → 按 EXIF 摆正 → 缩到
+  `INLINE_IMAGE_MAX_SIDE`=2000 → 必要时转码（BMP/超大图 → PNG/JPEG）」，而不是"原样 inline 或整张丢掉"。
+  rpi 的默认是 **不注入**（`image_processor: None`）——那种默认下超限图只留一行提示、BMP 直接"已省略"。
+  判据见 `builtin.rs` 的三条用例（选项接线 / 超大图等比缩小 / BMP 转 PNG），且都有阴性对照
+  （把接线改回 `None` ⇒ 接线用例红）。
+
   单个工具结果受预算约束：**文本 + 图片合计** 8 MiB、**整条结果的文本** 50 KiB（两个额度都
   **累计**，与 fork 的 `used`/`text_used` 同义），超限中间省略；超预算的图片降级成一行说明；
   音频等 rpi 侧无对应 part 的类型同样留一行痕迹，不静默吞。

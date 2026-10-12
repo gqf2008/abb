@@ -72,4 +72,8 @@ rmcp = { version = "1", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
+# 仅测试用：合成"超大图"喂给 read 工具的图片处理路径（卡 abb-agent-image-processor-wiring-20261012）。
+# 版本与 lock 里 rpi-tools 传递依赖的 image 同一线，避免多版本共存。
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
+base64 = "0.22"
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }
