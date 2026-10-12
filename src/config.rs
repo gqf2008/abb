@@ -1745,6 +1745,28 @@ impl Config {
         }
     }
 
+    /// 全局锚点气泡开关：与 save_primary_chat 同款的「写锁 + load + set + 变化才落盘」。
+    /// 返回 true = 已落盘（或值未变化）；false = 加载/保存失败（调用方应把气泡可见性
+    /// 回滚为 config 真值，否则 2s tick 的菜单回显会与可见性自相矛盾）。
+    pub fn set_syschat_bubble(on: bool) -> bool {
+        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
+        let Ok(mut c) = Config::load() else {
+            crate::log!("[config] 加载 config 失败，无法保存 syschat_bubble");
+            return false;
+        };
+        if c.syschat_bubble == on {
+            return true;
+        }
+        c.syschat_bubble = on;
+        match c.save() {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log!("[config] 保存 syschat_bubble 失败: {e:#}");
+                false
+            }
+        }
+    }
+
     /// 读某 bot 的主会话 chat_id（可能为空：还没收到过私聊）。
     pub fn primary_chat(bot_key: &str) -> String {
         Config::load()

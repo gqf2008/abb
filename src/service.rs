@@ -2133,7 +2133,22 @@ mod tests {
             env.get("OPENAI_COMPAT_BASE_URL").map(String::as_str),
             Some("https://sys.example.com/v1")
         );
+        // 命令槽：无档位（整车全权限）⇒ 走无沙箱槽（pick_command_by_sandbox(_, false)）。
+        // （两个命令槽当前都解析到 abb-agent，本断言主要锁「传下去的 sandboxed 谓词是 false」；
+        //  非空断言单独保留，防两边同时解析成空。）
+        let (owner_cmd, granted_cmd) = resolve_acp_commands();
+        assert_eq!(
+            c.command,
+            pick_command_by_sandbox((&owner_cmd, &granted_cmd), false),
+            "系统级对话不得走带档位的命令槽"
+        );
         assert!(!c.command.is_empty(), "命令槽必被解析");
+        // 专用工作区：workspaces/syschat（不与任何 bot 隔离键同名）
+        assert!(
+            crate::syschat::workspace().ends_with("syschat"),
+            "系统级对话工作区应为 workspaces/syschat：{:?}",
+            crate::syschat::workspace()
+        );
         // Jev 门禁 env 不该出现（无档位=不套门禁，多变一个凭证只扩大暴露面）。
         assert!(!env.contains_key("JEV_API_KEY"));
     }

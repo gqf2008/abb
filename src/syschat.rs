@@ -45,7 +45,7 @@ const TURN_BUDGET: Duration = Duration::from_secs(600);
 /// 系统级会话的 system 前言。ABB 的 `base_prompt.md` 已提供底座人格，这里只补
 /// 「系统级、全权限、直接执行」的定位——不重复 base_prompt 已写的内容。
 const SYSTEM_PREAMBLE: &str = "\
-[系统级对话] 你正通过 ABB 的全局气泡 / 命令行与用户直接对话（非任何 IM 渠道）。\n\
+[系统级对话] 你正通过 ABB 的全局气泡与用户直接对话（非任何 IM 渠道）。\n\
 你运行在用户本机上，拥有整机读写与执行权限。请直接、简洁地回应；\n\
 需要操作本机时直接用工具执行，不要只描述步骤。";
 
@@ -102,8 +102,11 @@ pub fn save_bubble_pos(pos: BubblePos) {
     }
 }
 
-/// 历史独占锁：拿锁 → 读改写 → 释放。持有期间 GUI/CLI 的其它回合会排队，
-/// 避免「两个回合各自基于同一份旧历史拼 prompt」的丢更新。
+/// 历史独占锁：只在「读历史/写一轮」的短临界区里持有，避免并发写坏历史。
+/// 用 `try_lock`（非阻塞）：本锁的所有使用者都在同一进程（GUI 主线程的清空、
+/// 后台回合的读写），阻塞拿锁会把 Slint 主线程挂住。持不到 = 已有历史读写在进行，
+/// 直接返回可重试错误；不静默降级（与 deliver 的降级取向不同：对话宁可报错重试，
+/// 也不并发写坏历史）。
 struct HistoryLock {
     file: std::fs::File,
 }
@@ -123,10 +126,17 @@ impl HistoryLock {
             let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
         }
         use fs2::FileExt;
-        // 拿不到锁不静默降级（与 deliver 的降级取向不同：那是"宁偶发竞态不丢请求"，
-        // 这里是对话，宁可报错让用户重试，也不并发写坏历史）。阻塞拿锁即可。
-        file.lock_exclusive()?;
-        Ok(Self { file })
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { file }),
+            Err(e) => {
+                let msg = if e.kind() == std::io::ErrorKind::WouldBlock {
+                    "另一个系统对话操作正在进行".to_string()
+                } else {
+                    e.to_string()
+                };
+                Err(std::io::Error::new(e.kind(), msg))
+            }
+        }
     }
 }
 
@@ -298,8 +308,9 @@ pub async fn turn_with(
 
 /// 跑一轮系统级对话：读历史 → 拼 prompt → 落用户轮 → 跑回合 → 落助手轮。
 ///
-/// 全程持有历史独占锁（跨 GUI/CLI 进程）。回合本身在锁内跑：宁可让并发回合排队，
-/// 也不能让两个回合各自基于同一份旧历史拼 prompt（那会丢更新、乱序）。
+/// 历史锁只包住两段短临界区（读史+落用户轮 / 落助手轮），**回合在锁外跑**：
+/// 回合最长 10 分钟，持锁跨回合会阻塞 GUI 主线程的清空/重开（同一个 `history.lock`）。
+/// 并发回合由前端保证不出现（对话框 `busy` 期间发送/清空都禁用）。
 pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     let text = user_text.trim();
     if text.is_empty() {
@@ -317,25 +328,33 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     std::fs::create_dir_all(&ws)
         .map_err(|e| format!("创建系统对话工作区失败（{}）：{e}", ws.display()))?;
 
-    let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
-    let history = load_history();
-    let prompt = build_prompt(&history, text);
-    // 先落用户轮：即使回合失败，用户说过的话也不该丢（下次重启仍能看到自己的提问）。
-    append_turns(&[Turn {
-        role: "user".to_string(),
-        text: text.to_string(),
-        ts: crate::chrono_lite::unix_secs() as i64,
-    }])
-    .map_err(|e| format!("写入对话历史失败：{e}"))?;
+    // 临界区 1：读历史拼 prompt + 落用户轮。先落用户轮是为了：即使回合失败，
+    // 用户说过的话也不该丢（下次重开对话框仍能看到自己的提问）。
+    let prompt = {
+        let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
+        let history = load_history();
+        let prompt = build_prompt(&history, text);
+        append_turns(&[Turn {
+            role: "user".to_string(),
+            text: text.to_string(),
+            ts: crate::chrono_lite::unix_secs() as i64,
+        }])
+        .map_err(|e| format!("写入对话历史失败：{e}"))?;
+        prompt
+    };
 
     let reply = turn_with(agent_cfg, ws, prompt).await?;
 
-    append_turns(&[Turn {
-        role: "assistant".to_string(),
-        text: reply.clone(),
-        ts: crate::chrono_lite::unix_secs() as i64,
-    }])
-    .map_err(|e| format!("写入对话历史失败：{e}"))?;
+    // 临界区 2：落助手轮。
+    {
+        let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
+        append_turns(&[Turn {
+            role: "assistant".to_string(),
+            text: reply.clone(),
+            ts: crate::chrono_lite::unix_secs() as i64,
+        }])
+        .map_err(|e| format!("写入对话历史失败：{e}"))?;
+    }
     Ok(reply)
 }
 

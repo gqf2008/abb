@@ -1785,29 +1785,21 @@ pub fn run_gui() -> Result<()> {
             })
             .collect();
         model.set_vec(rows);
-        // 贴底：Flickable 会把超大值钳到最大滚动位。
-        win.set_scroll_y(1_000_000.0);
+        // 请求滞底：递增 epoch，由 .slint 的 changed 处理器把 content-y 设成越界值、
+        // 交给 Flickable 的 in-bound 夹取（不能直接给 content-y 绑值，见 app.slint 注释）。
+        win.set_scroll_epoch(win.get_scroll_epoch().wrapping_add(1));
     }
     load_syschat_into(&syschat_win, &syschat_model);
     let bubble = AnchorBubble::new()?;
-    // 气泡位置：恢复上次拖动位置；首次落主屏右上（菜单栏下方）。
-    {
-        use slint::winit_030::WinitWindowAccessor;
-        let screen_w = bubble
-            .window()
-            .with_winit_window(|w| {
-                w.primary_monitor()
-                    .map(|m| m.size().width as i32)
-                    .unwrap_or(1920)
-            })
-            .unwrap_or(1920);
-        let pos = crate::syschat::load_bubble_pos().unwrap_or(crate::syschat::BubblePos {
-            x: screen_w - 56 - 16,
-            y: 120,
-        });
+    // 气泡位置：恢复上次拖动位置（场景 0）；首次默认位在首个 tick 里算（那时 winit 事件
+    // 循环已活跃，才能拿到主屏尺寸；之前调 with_winit_window 会返回 None）。
+    // 坐标统一用**逻辑像素**：.slint 里气泡宽 56 是逻辑量，而 winit 的 `MonitorHandle::size()`
+    // 是物理像素（Retina 2x 下差 2 倍，混用会把默认位算错/推到屏外）。
+    let bubble_pos_need_default = Rc::new(Cell::new(crate::syschat::load_bubble_pos().is_none()));
+    if let Some(pos) = crate::syschat::load_bubble_pos() {
         bubble
             .window()
-            .set_position(slint::PhysicalPosition::new(pos.x, pos.y));
+            .set_position(slint::LogicalPosition::new(pos.x as f32, pos.y as f32));
     }
     // 气泡显示/隐藏：由 config.syschat_bubble 决定（托盘菜单可切换）。默认 true。
     let bubble_on = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
@@ -3347,18 +3339,15 @@ pub fn run_gui() -> Result<()> {
         tray.on_toggle_bubble({
             let bw = bubble.as_weak();
             move |on| {
-                // 写 config.json（GUI 是配置的一个写方；该字段不参与 service 启动，无需重启）。
-                match Config::load() {
-                    Ok(mut c) => {
-                        c.syschat_bubble = on;
-                        if let Err(e) = c.save() {
-                            crate::log!("[ui] ⚠️ 全局气泡开关保存失败（本次仅生效不落盘）: {e:#}");
-                        }
-                    }
-                    Err(e) => crate::log!("[ui] ⚠️ 读配置失败（全局气泡开关）: {e:#}"),
-                }
+                // 走 config 的写锁 RMW（与其它写方同口径）；失败则把可见性对齐 config 真值。
+                let ok = Config::set_syschat_bubble(on);
+                let effective = if ok {
+                    on
+                } else {
+                    Config::load().map(|c| c.syschat_bubble).unwrap_or(on)
+                };
                 if let Some(b) = bw.upgrade() {
-                    if on {
+                    if effective {
                         let _ = b.show();
                     } else {
                         let _ = b.hide();
@@ -3428,6 +3417,10 @@ pub fn run_gui() -> Result<()> {
             }
         }
         show_window_and_focus(&settings);
+    }
+    // --show-syschat 调试参数：启动即弹出系统对话窗（UI 改动的截图取证，同 --show-settings）。
+    if std::env::args().any(|a| a == "--show-syschat") {
+        show_window_and_focus(&syschat_win);
     }
     {
         let sw = settings.as_weak();
@@ -5282,7 +5275,7 @@ pub fn run_gui() -> Result<()> {
             w.set_busy(true);
             w.set_status_is_error(false);
             w.set_status_line("ABB 正在处理…".into());
-            w.set_scroll_y(1_000_000.0);
+            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
             if let Some(b) = bw.upgrade() {
                 b.set_busy(true);
             }
@@ -5385,6 +5378,8 @@ pub fn run_gui() -> Result<()> {
         let bubble_weak = bubble.as_weak();
         let syschat_model_t = syschat_model.clone();
         let syschat_rx_t = syschat_rx;
+        // 气泡首次默认位待算标记（见启动处注释）
+        let bubble_pos_need_default_t = bubble_pos_need_default.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -5892,7 +5887,7 @@ pub fn run_gui() -> Result<()> {
                                 w.set_busy(false);
                                 w.set_status_is_error(false);
                                 w.set_status_line("与 ABB 直接对话（系统级 · 整机权限）".into());
-                                w.set_scroll_y(1_000_000.0);
+                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
                             }
                             if let Some(b) = bubble_weak.upgrade() {
                                 b.set_busy(false);
@@ -5906,6 +5901,33 @@ pub fn run_gui() -> Result<()> {
                             }
                             if let Some(b) = bubble_weak.upgrade() {
                                 b.set_busy(false);
+                            }
+                        }
+                    }
+                }
+                // 气泡首次默认位：事件循环活跃后才能拿到主屏尺寸，按**逻辑像素**算（右上角）。
+                if bubble_pos_need_default_t.get() {
+                    if let Some(b) = bubble_weak.upgrade() {
+                        if b.window().is_visible() {
+                            use slint::winit_030::WinitWindowAccessor;
+                            let pos = b
+                                .window()
+                                .with_winit_window(|w| {
+                                    w.primary_monitor().map(|m| {
+                                        let sz = m.size().to_logical::<f32>(m.scale_factor());
+                                        crate::syschat::BubblePos {
+                                            x: sz.width as i32 - 56 - 16,
+                                            y: 120,
+                                        }
+                                    })
+                                })
+                                .flatten();
+                            if let Some(p) = pos {
+                                b.window().set_position(slint::LogicalPosition::new(
+                                    p.x as f32,
+                                    p.y as f32,
+                                ));
+                                bubble_pos_need_default_t.set(false);
                             }
                         }
                     }

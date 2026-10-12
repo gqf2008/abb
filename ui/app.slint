@@ -3073,8 +3073,10 @@ export component SystemChatWindow inherits Window {
     in property <bool> busy: false;
     in property <string> status-line: "与 ABB 直接对话（系统级 · 整机权限）";
     in property <bool> status-is-error: false;
-    // 消息区滚动位置：Rust 每追加一条就设成一个大数 → 贴底（Flickable 会钳制到最大）
-    in-out property <length> scroll-y: 0px;
+    // 请求滞底：Rust 每追加一条消息 / 打开对话框时递增它（处理见本组件末尾的 changed 处理器）。
+    // **不能**改成给 content-y 绑一个「超大值」属性：绑了值后 Slint 就不再夹取
+    //（flickable.rs:113-119 带 `!y.has_binding()`），越界值原样生效 ⇒ 消息区空白。
+    in-out property <int> scroll-epoch: 0;
     // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
     in-out property <string> draft: "";
 
@@ -3127,9 +3129,9 @@ export component SystemChatWindow inherits Window {
             }
 
             // 消息区：贴底滚动；空态给一句引导
-            PixelScrollPanel {
+            flick := Flickable {
                 vertical-stretch: 1;
-                initial-scroll-y: root.scroll-y;
+                content-width: self.width;
                 VerticalBox {
                     width: 100%;
                     padding: 10px;
@@ -3199,5 +3201,14 @@ export component SystemChatWindow inherits Window {
                 }
             }
         }
+    }
+
+    // 请求滞底：Rust 递增 scroll-epoch（追加消息/打开对话框）→ 把 content-y 设成**越界**负值。
+    // Flickable 的 in-bound change tracker 会把它延迟夹取到真实底部（flickable.rs:80-120），
+    // 且该 tracker 依赖 content-height：内容随后变高时会再夹一次，故新消息总能滚进视野。
+    // ⚠️ content-y 必须保持**无绑定**（本组件不绑它，也不用 ScrollView/ScrollBar——
+    //    它们会给 content-y 加绑定）。一旦有绑定，`!y.has_binding()` 为假 ⇒ 夹取被跳过。
+    changed scroll-epoch => {
+        flick.content-y = -999999px;
     }
 }
