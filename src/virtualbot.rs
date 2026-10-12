@@ -315,45 +315,13 @@ pub(crate) fn ensure_vb_dir_at(
     bot_key: &str,
     chat_id: &str,
 ) {
-    // 旧目录 `vb/<fnv_uuid>/` → 新渠道目录（一次性；重名/跨设备失败时保留旧目录并留日志）。
-    migrate_legacy_vb_location(base, bot_key, chat_id, dir);
+    // 旧目录 `vb/<fnv_uuid>/` → 新渠道目录的搬家在 `channel_dir::ensure_channel_dir_at`
+    // 里做（那里是唯一物化点，且对“目标已存在”幂等）——不能放这里，否则先经巡检/job
+    // 路径物化过的新目录会让搬家早退。
     let _ = std::fs::create_dir_all(dir);
     // chat.json + 工作区指引与其它渠道同一条收口（避免两个物化点漂移）。
     crate::channel_dir::ensure_channel_dir_at(dir, bot_key, chat_id, "group", None);
     migrate_legacy_vb_data(base, bot_key, chat_id, dir);
-}
-
-/// vb 目录改名迁移：`workspaces/<bot>/vb/<vb_uuid>/` → `workspaces/<bot>/<dir_name>/`。
-/// 幂等：新目录已存在或旧目录不存在都是 no-op。
-fn migrate_legacy_vb_location(
-    base: &std::path::Path,
-    bot_key: &str,
-    chat_id: &str,
-    new_dir: &std::path::Path,
-) {
-    let old = base
-        .join("workspaces")
-        .join(bot_key)
-        .join("vb")
-        .join(vb_uuid(bot_key, chat_id));
-    if !old.is_dir() || new_dir.exists() {
-        return;
-    }
-    if let Some(parent) = new_dir.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::rename(&old, new_dir) {
-        Ok(()) => crate::log!(
-            "[virtualbot] 工作区目录已迁移：vb/{} → {}",
-            vb_uuid(bot_key, chat_id),
-            new_dir.display()
-        ),
-        // 失败不静默：旧目录保留（数据不丢），但目录规则未生效，需要人工看。
-        Err(error) => crate::log!(
-            "[virtualbot] 工作区目录迁移失败（保留旧目录 vb/{}）：{error}",
-            vb_uuid(bot_key, chat_id)
-        ),
-    }
 }
 
 /// 存量迁移（#194）：bot 级会话槽位 + 前缀匹配的历史文件搬入 vb 目录。幂等。

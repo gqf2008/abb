@@ -3133,26 +3133,29 @@ mod spawn_lifecycle_tests {
         let _ = std::fs::remove_dir_all(&channel_dir);
     }
 
-    /// e2e：改渠道目录里的 `mcp.json` → **该渠道会话必须重建**（下一次消息重新
-    /// `session/new`，把新名单发出去）。这是“bot 改完配置就生效”的机器判据。
+    /// e2e：改渠道目录里的 `mcp.json` → **该渠道**会话必须重建（下一次消息重新
+    /// `session/new`，把新名单发出去），且**不影响其它渠道**会话（卡 AC5）。
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
         ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
     )]
-    async fn channel_mcp_change_rebuilds_session() {
-        let channel_dir =
-            std::env::temp_dir().join(format!("abb-channel-mcp-rebuild-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&channel_dir).unwrap();
-        std::fs::write(
-            channel_dir.join("mcp.json"),
-            r#"[{"name":"first-server","command":"true"}]"#,
-        )
-        .unwrap();
-        let rec = std::env::temp_dir().join(format!(
-            "abb-channel-mcp-rebuild-rec-{}.jsonl",
-            Uuid::new_v4()
-        ));
+    async fn channel_mcp_change_rebuilds_only_that_channel() {
+        let mk_dir = |tag: &str, server: &str| {
+            let dir =
+                std::env::temp_dir().join(format!("abb-channel-mcp-{tag}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("mcp.json"),
+                format!(r#"[{{"name":"{server}","command":"true"}}]"#),
+            )
+            .unwrap();
+            dir
+        };
+        let dir_a = mk_dir("rebuild-a", "first-server");
+        let dir_b = mk_dir("rebuild-b", "other-server");
+        let rec =
+            std::env::temp_dir().join(format!("abb-chmcp-rebuild-rec-{}.jsonl", Uuid::new_v4()));
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
         let python3 = crate::deps::find_in_path("python3")
@@ -3178,21 +3181,27 @@ mod spawn_lifecycle_tests {
             true,
         );
         let run = tokio::spawn(super::run_loop(handle.clone()));
-        let cid = Uuid::new_v4();
-        handle.upsert_channel(
-            cid,
-            ChannelMeta {
-                bot_key: "wst".to_string(),
-                chat_id: "oc_rebuild".to_string(),
-                chat_type: "p2p".to_string(),
-                thread_id: None,
-                name: "e2e".to_string(),
-                anchor_mid: None,
-                adhoc: true,
-                workspace: Some(channel_dir.display().to_string()),
-            },
-        );
-        let turn = |id: &str| {
+        let channel_a = Uuid::new_v4();
+        let channel_b = Uuid::new_v4();
+        for (cid, chat, ws) in [
+            (channel_a, "oc_rebuild_a", &dir_a),
+            (channel_b, "oc_rebuild_b", &dir_b),
+        ] {
+            handle.upsert_channel(
+                cid,
+                ChannelMeta {
+                    bot_key: "wst".to_string(),
+                    chat_id: chat.to_string(),
+                    chat_type: "p2p".to_string(),
+                    thread_id: None,
+                    name: "e2e".to_string(),
+                    anchor_mid: None,
+                    adhoc: true,
+                    workspace: Some(ws.display().to_string()),
+                },
+            );
+        }
+        let turn = |cid: Uuid, id: &str| {
             handle.wait_turn_outcome(
                 cid,
                 crate::runtime::queue::InboundMsg {
@@ -3205,37 +3214,51 @@ mod spawn_lifecycle_tests {
                 std::time::Duration::from_secs(30),
             )
         };
-        assert!(
-            matches!(turn("m1").await, SyncTurnOutcome::Ok(_)),
-            "首回合应 Ok"
-        );
+        assert!(matches!(
+            turn(channel_a, "a1").await,
+            SyncTurnOutcome::Ok(_)
+        ));
+        assert!(matches!(
+            turn(channel_b, "b1").await,
+            SyncTurnOutcome::Ok(_)
+        ));
 
-        // 模拟 bot 改写渠道配置（内容变了；不依赖 mtime 粒度）。
+        // 只改 A 的配置
         std::fs::write(
-            channel_dir.join("mcp.json"),
+            dir_a.join("mcp.json"),
             r#"[{"name":"second-server","command":"true"}]"#,
         )
         .unwrap();
-
-        assert!(
-            matches!(turn("m2").await, SyncTurnOutcome::Ok(_)),
-            "次回合应 Ok"
-        );
+        assert!(matches!(
+            turn(channel_a, "a2").await,
+            SyncTurnOutcome::Ok(_)
+        ));
         stop.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
 
-        let log = std::fs::read_to_string(&rec).expect("record file 可读");
-        let news: Vec<serde_json::Value> = log
+        let news: Vec<serde_json::Value> = std::fs::read_to_string(&rec)
+            .expect("record file 可读")
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|v| v["event"] == "session_new")
             .collect();
+        let count_for = |dir: &std::path::Path| {
+            let want = serde_json::json!(dir.display().to_string());
+            news.iter().filter(|v| v["cwd"] == want).count()
+        };
         assert!(
-            news.len() >= 2,
-            "配置变更后必须重建会话（≥2 次 session/new），实际 {} 次",
-            news.len()
+            count_for(&dir_a) >= 2,
+            "A 改了配置必须重建（≥2 次 session/new），实际 {}",
+            count_for(&dir_a)
         );
-        let names: Vec<String> = news.last().unwrap()["mcpServers"]
+        assert_eq!(
+            count_for(&dir_b),
+            1,
+            "B 的配置没动，不得被重建（变更只影响对应渠道）"
+        );
+        let want_a = serde_json::json!(dir_a.display().to_string());
+        let last_a = news.iter().rev().find(|v| v["cwd"] == want_a).unwrap();
+        let names: Vec<String> = last_a["mcpServers"]
             .as_array()
             .unwrap()
             .iter()
@@ -3246,7 +3269,8 @@ mod spawn_lifecycle_tests {
             "重建后的会话必须带新名单，实际 {names:?}"
         );
         let _ = std::fs::remove_file(&rec);
-        let _ = std::fs::remove_dir_all(&channel_dir);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[test]

@@ -908,8 +908,9 @@ async fn create_session_and_apply_model(
     // the same content as user-message sections via `format_prompt`.
     let is_goose = agent.agent_name == "goose";
     // P0.B / 2026-10-12：会话工作目录 = 渠道目录（`workspaces/<bot>/<dir_name(chat_id)>/`，
-    // 由 `ChannelMeta.workspace` 带入）。域闸根必须跟到同一个目录，否则受限档的会话
-    // 写自己的 cwd 会被拒（handle 级 meta 里的 roots 还是 bot 目录）。
+    // 由 `ChannelMeta.workspace` 带入）。域闸载荷的 roots 也跟到同一目录（保持载荷与
+    // 会话语境一致；注：随包 abb-agent 今天不读 `writableRoots`，它靠**会话 cwd** +
+    // `_meta.sandbox` 收口——但旧执行层/将来可能消费该字段，不能让它指向另一个目录）。
     let session_cwd = channel.workspace.unwrap_or(ctx.cwd.as_str());
     let sandbox_root = std::fs::canonicalize(session_cwd)
         .unwrap_or_else(|_| std::path::PathBuf::from(session_cwd));
@@ -1152,7 +1153,7 @@ pub async fn run_prompt_task(
     }
 
     // 渠道 MCP 配置变更检测（卡 abb-channel-mcp-config-20261012）：渠道 `mcp.json` 的
-    // mtime 与建会话时记下的不同 ⇒ 用户在会话里改过配置 ⇒ 失效该渠道会话，让下面
+    // **内容指纹**与建会话时记下的不同 ⇒ 用户在会话里改过配置 ⇒ 失效该渠道会话，让下面
     // 走 `session/new` 按新名单重连 MCP 子进程（旧会话 drop 顺带关掉旧子进程）。
     // granted/oneshot（`mcp_from_channel=false`）不参与：它们恒空名单。
     let channel_mcp_stamp = if ctx.mcp_from_channel {

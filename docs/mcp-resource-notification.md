@@ -32,12 +32,12 @@
                                                                 ▼
                                                  ┌──────────────────────────────┐
                                                  │   MCP server（孙进程）        │
-                                                 │ 来自 bot 配置 mcp_servers     │
+                                                 │ 来自渠道目录 mcp.json         │
                                                  └──────────────────────────────┘
 ```
 
 - ABB 侧只在 `session/new` 的 `mcpServers` 里**声明** server（`src/config.rs` 的
-  `BotConfig::mcp_servers` → `src/service.rs::bot_mcp_servers`）；语义不解释。
+  `~/.agent-bridge/workspaces/<bot>/<chat_id>/mcp.json`，ABB 建会话时现读）；语义不解释。
 - `abb-agent` 用 `rmcp` 连接（`crates/abb-agent/src/mcp.rs`），
   `TokioChildProcess` 起 stdio 子进程，会话内长挂（`RunningService` 被
   `Connected.client` 持有，drop 即关连接），**不做跨会话复用**（因此也不做 `unsubscribe`）。

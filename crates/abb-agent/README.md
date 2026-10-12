@@ -106,7 +106,9 @@ abb 的预置端点是**带版本前缀**的（`openrouter` → `https://openrou
 ## MCP（刀 1）
 
 rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除），而 abb 下发的 MCP server 就是
-**用户在该 bot 的 `mcp_servers` 里配置的**外部 server（ABB 只声明，不解释语义）。
+**渠道工作目录里的 `mcp.json` 配置的**外部 server（卡 `abb-channel-mcp-config-20261012`：
+名单按渠道落在 `~/.agent-bridge/workspaces/<bot>/<chat_id>/mcp.json`；ABB 只在建会话时读它、
+原样下发 `session/new`，不解释语义。改文件后该渠道会话自动重建生效）。
 本包用 **`rmcp`**（与被替代的 `旧执行层` 同源）接上它。（原 `wassette`（Wasm 组件
 工具宿主）已随 2026-10-10「废弃 wassette」移除。）
 
