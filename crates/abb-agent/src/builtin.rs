@@ -254,11 +254,16 @@ struct Exposed {
 
 /// `read` 工具的选项：接上 rpi-tools 自带的 `InlineImageProcessor`。
 ///
-/// 为什么（卡 `abb-agent-image-processor-wiring-20261012`）：rpi-tools 0.3.16 起就有
-/// `ReadImageProcessor` seam，但**默认不注入实现**——那意味着图片只能"原样 inline 或被省略"：
-/// 超过 inline 上限的大图会被**丢掉**（只留一行提示），BMP 直接给"已省略"。
-/// 接上 0.3.21 里的实现后，`read` 会把图片**解码 → 摆正 → 缩放到上限 → 需要时转码**（PNG/JPEG），
-/// 于是"大图看不见"变成"缩略图仍能看"。
+/// 为什么（卡 `abb-agent-image-processor-wiring-20261012`）：rpi-tools 从 0.3.16 起就有
+/// `ReadImageProcessor` seam，但**默认不注入实现**——那种默认下，`read` 对支持的图片格式
+/// （PNG/JPEG/GIF/WebP）是**原字节 inline、不缩放**（`rpi-tools/src/tools/read.rs` 的 None 分支），
+/// 只有 BMP 会给一行"已省略"提示。接上 0.3.21 的实现后，`read` 会把图片
+/// **解码 → 按 EXIF 摆正 → 缩到 `INLINE_IMAGE_MAX_SIDE` → 需要时转码**（BMP/超大图 → PNG/JPEG）。
+///
+/// **别把"丢图"记在这里**（评审第 2 轮 F5 更正）：像素上限**不会**导致图片被丢——不装处理器时它是原样回来的；
+/// 唯一会丢图的是本仓的**字节预算**（`src/mcp.rs` 的 `TOOL_RESULT_TOTAL_BYTES = 8 MiB` ⇒
+/// `[image 已省略：…超出工具结果预算]`）。接上处理器的收益是"超大图**缩放后仍能进模型**"，
+/// 而不是"从丢掉变成不丢"。
 ///
 /// `auto_resize_images: true` 是 rpi 的默认值，这里显式写出，表示我们**要**这个行为而不是碰巧继承它。
 /// 注意边界：这只影响 **read 工具**里的图片；`Content::Image` 到了 anthropic 的**工具结果**序列化层
@@ -1026,12 +1031,14 @@ mod tests {
             "指向工作区外的符号链接必须被拒：{attempt:?}"
         );
     }
-    /// 接线判据（卡 abb-agent-image-processor-wiring-20261012）：`read` 工具的选项**必须**装了
-    /// 图片处理器，且显式打开自动缩放——否则 rpi 默认 `image_processor: None`，
-    /// 超限大图会被丢掉（只留一行提示）、BMP 直接"已省略"。
+    /// 接线判据（卡 `abb-agent-image-processor-wiring-20261012`）：`read` 工具的选项**必须**装了
+    /// 图片处理器、且显式打开自动缩放——rpi 的默认是 `image_processor: None`（那时支持的格式
+    /// **原字节 inline、不缩放**，仅 BMP 给"已省略"；丢图只由本仓 8 MiB 字节预算触发，与像素上限无关）。
     ///
-    /// 判别力：把 `Some(read_tool_options())` 改回 `None`（或在 helper 里把 `image_processor` 置 None），
-    /// 本用例红。用 rpi 自己的 `Debug`（它把该字段渲染成 `image_processor: true/false`）来判，不靠源码文本。
+    /// 判别力（**按评审第 2 轮 F4 更正**）：**在 helper 里把 `image_processor` 置 None ⇒ 本用例红**（实测）。
+    /// 而"把 `:175` 的构造点改回 `None`"**不会**让本用例红（本用例只观察 helper 的返回值）——那一层由
+    /// `read_tool_is_constructed_with_processor_options`（文本守卫）与端到端用例各自认领。
+    /// 判定用 rpi 自己的 `Debug`（把该字段渲染成 `image_processor: true/false`），不靠源码文本。
     #[test]
     fn read_tool_options_install_inline_image_processor() {
         let opts = read_tool_options();

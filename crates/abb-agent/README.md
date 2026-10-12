@@ -149,8 +149,10 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
     说明被省略」换成「指着一张不存在的图」。上游修好后把 `delivers_tool_result_images` 翻真即可。
 - **`read` 工具的图片处理（本卡新增）**：注入了 rpi-tools 自带的 `InlineImageProcessor`
   （`read_tool_options()`），于是把图片读给模型时是「解码 → 按 EXIF 摆正 → 缩到
-  `INLINE_IMAGE_MAX_SIDE`=2000 → 必要时转码（BMP/超大图 → PNG/JPEG）」，而不是"原样 inline 或整张丢掉"。
-  rpi 的默认是 **不注入**（`image_processor: None`）——那种默认下超限图只留一行提示、BMP 直接"已省略"。
+  `INLINE_IMAGE_MAX_SIDE`=2000 → 必要时转码（BMP/超大图 → PNG/JPEG）」，而不是"原字节 inline、不缩放"。
+  rpi 的默认是 **不注入**（`image_processor: None`）——那种默认下**支持的格式原字节 inline、不缩放**，
+  只有 BMP 给一行"已省略"；**丢图与本卡无关**：它由本仓的 8 MiB 工具结果字节预算触发（`src/mcp.rs`），
+  像素上限不会丢图。
   判据分两层：**端到端**走真实 `dev__read` 工具（2500×100 PNG ⇒ 返回 `Image` part 且 2000×80、比例保持）
   ——不装处理器/换成不缩放的实现都会红；**库层**另有三条用例（选项接线 / 等比缩小 / BMP 转 PNG），其中只有
   "选项接线"那条有阴性对照（改回 `None` ⇒ 红），另两条只覆盖 rpi 库行为、不覆盖本仓接线。
