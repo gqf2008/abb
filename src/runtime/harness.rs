@@ -2462,7 +2462,12 @@ mod resource_event_tests {
     /// 在没有日志注入点的前提下，把"接线方式"作为契约钉住是唯一能防悄悄回归的手段。
     #[test]
     fn resource_event_logs_wire_to_stdout_not_tracing() {
-        let src = include_str!("harness.rs");
+        // **先归一化 EOL**（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：
+        // 这是**源码文本断言**，而 Windows 检出（`core.autocrlf=true`）给的 harness.rs 是 CRLF——
+        // `rest.find("\n}\n")` 会找不到"顶格 }"，测试在 Windows 上 panic（CI 实证：
+        // `panicked at src\runtime\harness.rs:2470`，即下面那个 `.expect`）。归一化后两平台一致；
+        // 仓库根 .gitattributes 也钉了 `*.rs text eol=lf`（双保险）。
+        let src = include_str!("harness.rs").replace("\r\n", "\n");
         let start = src
             .find("fn handle_resource_update")
             .expect("handle_resource_update 必须存在");

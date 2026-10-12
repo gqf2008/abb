@@ -6,3 +6,6 @@ tools/tool-lock.tsv -text
 tools/bundled-cli-tools.tsv -text
 tools/*.sh text eol=lf
 tools/*.ps1 text eol=crlf
+# Rust 源码必须 LF：仓库里存在**源码文本断言**（如 harness.rs 的接线守卫用 include_str! 切片函数体），
+# Windows 检出若转 CRLF 会让 `find("\n}\n")` 之类失效（CI 实证：windows test job 因此红）。
+*.rs text eol=lf
