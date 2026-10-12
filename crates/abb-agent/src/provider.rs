@@ -137,7 +137,7 @@ impl std::fmt::Debug for Backend {
 impl Backend {
     /// 本后端的 agent 层能否**真的**把工具结果里的图片交给模型。
     ///
-    /// 不能只看 `Model.input`：rpi-ai 0.3.16 的 anthropic 序列化层把 `Content::Image`
+    /// 不能只看 `Model.input`：rpi-ai 的 anthropic 序列化层把 `Content::Image`
     /// **硬编码**成 `Text("(see attached image)")`（该枚举只有 `Text`/`ToolReference` 两个
     /// 变体，上游注释写明 emit image block 仍是 TODO）——于是声明了
     /// `InputModality::Image` 反而会把「如实说明被省略」换成「指着一张不存在的图」。
@@ -509,7 +509,8 @@ mod tests {
     ///
     /// 两者错配的后果不同，所以不能一刀切：
     /// - openai 家族：不声明 `Image` ⇒ 图片被换成 `(see attached image)` 占位（图真丢了）；
-    /// - anthropic：声明了也发不出去（rpi-ai 0.3.16 把 `Content::Image` 硬编码成占位文本），
+    /// - anthropic：声明了也发不出去（rpi-ai 的 anthropic 序列化层把 `Content::Image` 硬编码成占位文本；
+    ///   截至 0.3.21 仍未修），
     ///   只会把「如实说明被省略」换成「指着一张不存在的图」⇒ 必须保持 `[Text]`。
     #[test]
     fn image_modality_follows_what_the_backend_can_actually_deliver() {

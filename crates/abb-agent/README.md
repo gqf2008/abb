@@ -35,7 +35,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 | `session/request_permission` | **不发问** | 授权约定由 `AGENTS.md` 承担 |
 | `_meta.steering` | **声明 `supported: false`** | 本刀未实现 `_session/steering`；abb 那边该标志是写该方法的唯一闸门，报 true 只会让「回合中追加消息」多一次无效往返 |
 | LLM 层 / agent loop | 交给 rpi（`rpi-ai` / `rpi-agent`） | 不自持 7.9k 行 `llm.rs` |
-| 内置工具 | 第二刀已接 `rpi-tools`（`dev__*`，见下节） | `rpi-tools = "0.3.16"`，与参照物同源 |
+| 内置工具 | 第二刀已接 `rpi-tools`（`dev__*`，见下节） | `rpi-tools = "0.3.21"`，与参照物同源 |
 | 输出上限 | 默认 **65_536**，认 `ABB_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
 
 `initialize` 因此**不含** `_meta.abbSandbox`：abb 侧 `parse_abb_sandbox_modes` 得到
@@ -141,8 +141,10 @@ rpi **没有 MCP**（全仓零命中、`rpi-mcp` workspace 成员已被删除）
   - **openai 家族**（chat / responses）：真发图（chat 已端到端抓包；responses 仅有源码依据，**未端到端验**）。
     这要求模型的 `input` 声明 `Image`（`provider.rs` 的 `custom_model` 已声明）——rpi 按 `Model::input`
     门控，不声明就被换成 `(see attached image)` 占位。
-  - **anthropic**：目前**发不出去**（rpi-ai 0.3.16 把 `Content::Image` 硬编码成 `Text("(see attached
-    image)")`，上游注释写明 emit image block 仍是 TODO）⇒ 本包自己降级成**如实**的一行文本
+  - **anthropic**：目前**发不出去**（rpi-ai 的 anthropic 序列化层把 `Content::Image` 硬编码成
+    `Text("(see attached image)")`，上游注释写明 emit image block 仍是 TODO——**截至 0.3.21 仍未修**，
+    见 `rpi-ai-0.3.21/src/providers/anthropic/build_params.rs` 里 `convert_content_blocks` 的 TODO）
+    ⇒ 本包自己降级成**如实**的一行文本
     （`[image 未传给模型：…]`），并把 `input` 保持为 `[Text]`。声明 `Image` 反而更差：那会把「如实
     说明被省略」换成「指着一张不存在的图」。上游修好后把 `delivers_tool_result_images` 翻真即可。
   单个工具结果受预算约束：**文本 + 图片合计** 8 MiB、**整条结果的文本** 50 KiB（两个额度都

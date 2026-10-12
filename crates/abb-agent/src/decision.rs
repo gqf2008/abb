@@ -212,7 +212,7 @@ impl JevClient {
 
 /// 决策模型门禁包装：把 Jev 的 allow/deny 强加到**任意** `AgentTool` 外面。
 ///
-/// 为什么是包装器而不是 rpi 的 `before_tool_call` hook：rpi-agent 0.3.16 的
+/// 为什么是包装器而不是 rpi 的 `before_tool_call` hook：rpi-agent 的
 /// `AgentBuilder` **没有暴露** `before_tool_call` setter（`build_config` 里硬编码
 /// `None`）。而包装器把同样的拦截放在 `execute` 入口，每个工具调用都会过——语义等价、
 /// 不碰 rpi 库，且天然覆盖 MCP 工具 / 内置工具 / `load_skill`（都是 `Arc<dyn AgentTool>`）。
