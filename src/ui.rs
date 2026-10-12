@@ -5309,19 +5309,43 @@ pub fn run_gui() -> Result<()> {
         });
     }
     // 关闭对话框 = 隐藏（托盘应用惯例；气泡仍在，随时可再打开）。
+    // 打开时 show_window_and_focus 会把进程提升为 regular（显 dock）；关闭时若设置窗
+    // 也没开，就降回 accessory（与 hide_notifications_window 同款收尾，避免留一个“孤儿”dock 图标）。
     {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
         let cw = syschat_win.as_weak();
+        let sw = settings.as_weak();
         syschat_win.on_close_window(move || {
             if let Some(w) = cw.upgrade() {
                 let _ = w.hide();
             }
+            #[cfg(target_os = "macos")]
+            {
+                let settings_open = sw
+                    .upgrade()
+                    .map(|s| s.window().is_visible())
+                    .unwrap_or(false);
+                if !settings_open {
+                    platform::hide_dock();
+                }
+            }
         });
         let cw2 = syschat_win.as_weak();
+        let sw2 = settings.as_weak();
         syschat_win.window().on_winit_window_event(move |_w, ev| {
             if matches!(ev, WindowEvent::CloseRequested) {
                 if let Some(w) = cw2.upgrade() {
                     let _ = w.hide();
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let settings_open = sw2
+                        .upgrade()
+                        .map(|s| s.window().is_visible())
+                        .unwrap_or(false);
+                    if !settings_open {
+                        platform::hide_dock();
+                    }
                 }
             }
             EventResult::Propagate
