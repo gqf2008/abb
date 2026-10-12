@@ -85,6 +85,8 @@ export component Tray inherits SystemTrayIcon {
     in-out property <bool> service-running: false;
     in-out property <bool> configured: false;
     in-out property <bool> autostart: false;
+    // 全局锚点气泡开关（系统级对话入口）：结构性 if 重建菜单项（同 autostart 的坑）
+    in-out property <bool> bubble-enabled: true;
     in-out property <string> version: "";          // 当前版本号（Rust 启动时注入，菜单里常驻显示）
     // 版本升级：0=未查 1=检查中 2=已最新 3=有新版本 4=下载安装中 5=下载/安装失败 6=检查失败
     // （结构性 if 重建菜单，见文件头注释：enabled 绑定不可靠）
@@ -100,6 +102,7 @@ export component Tray inherits SystemTrayIcon {
     callback open-logs();
     callback open-folder();
     callback toggle-autostart(bool);
+    callback toggle-bubble(bool);   // 全局锚点气泡显示/隐藏
     callback check-update();     // 手动检查更新（托盘菜单）
     callback install-update();   // 点「升级」：下载+安装+重启
     callback quit-app();
@@ -124,6 +127,9 @@ export component Tray inherits SystemTrayIcon {
         // 开机自启：结构性 if（同启停，enabled/checkbox 绑定不可靠），点一下切换
         if !root.autostart: MenuItem { title: "开机自动启动：关"; activated => { root.toggle-autostart(true); } }
         if root.autostart: MenuItem { title: "开机自动启动：开"; activated => { root.toggle-autostart(false); } }
+        // 全局锚点气泡（系统级对话入口）：结构性 if
+        if !root.bubble-enabled: MenuItem { title: "全局气泡：关"; activated => { root.toggle-bubble(true); } }
+        if root.bubble-enabled: MenuItem { title: "全局气泡：开"; activated => { root.toggle-bubble(false); } }
         MenuSeparator {}
         // ── 版本升级：永远只一项，标题常驻当前版本；可点的态点击即动作（结构性 if 重建，见文件头注释）──
         if root.update-state == 0: MenuItem { title: "版本 v" + root.version + " · 检查更新…"; activated => { root.check-update(); } }
@@ -2990,4 +2996,208 @@ export component SettingsWindow inherits Window {
             begin-resize(dir) => { root.begin-resize(dir); }
         }
     }   // 关闭根 Rectangle（外层纯黑圆角填充 + 包内容防塌缩）
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 系统级对话：全局锚点气泡 + AI 对话框
+// ═══════════════════════════════════════════════════════════════════════════
+// 与「渠道对话」的区别：这里不经任何飞书/微信/钉钉 bot，直接与随包 abb-agent 对话
+// （owner 全权限、专用工作区 syschat、历史落盘）。ABB 无头运行时同一能力走
+// `agent-bridge chat`，气泡只是它的 GUI 前端。
+
+// 系统级对话消息行。与历史页的 ChatMsgRow 分开：那是「渠道消息流水」（带平台/发送者），
+// 这里是「一问一答」，不要复用同一结构（语义不同，将来字段必然分化）。
+export struct SysChatMsgRow {
+    role: string,        // "user" | "assistant"
+    text: string,
+}
+
+// 全局锚点气泡：常驻屏幕的系统级对话入口。
+// 透明 + 无边框 + always-on-top；WindowMoveArea 负责拖动（带阈值：单击不移动），
+// 单纯单击落到下层 TouchArea → open-chat。位置由 Rust 持久化（syschat/bubble.json）。
+export component AnchorBubble inherits Window {
+    title: "ABB";
+    width: 56px;
+    height: 56px;
+    preferred-width: 56px;
+    preferred-height: 56px;
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    in property <bool> busy: false;   // 回合进行中（气泡显示省略号）
+    callback open-chat();
+
+    WindowMoveArea {
+        // 底层全窗点击热区：WindowMoveArea 只处理「按住拖动超过阈值」的移动，
+        // 普通单击仍会落到这里的 clicked（对齐 slint-pixel PixelTitleBar 的 native-move 语义）。
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            mouse-cursor: pointer;
+            clicked => { root.open-chat(); }
+        }
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: self.width / 2;
+            background: PixelTheme.accent;
+            border-width: PixelTheme.border-width;
+            border-color: PixelTheme.edge;
+            Text {
+                text: root.busy ? "…" : "ABB";
+                color: PixelTheme.on-accent;
+                font-size: 14px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// 系统级 AI 对话框：气泡点击后打开；关闭 = 隐藏（托盘应用惯例）。
+export component SystemChatWindow inherits Window {
+    // 与 SettingsWindow 同款主题预设（幂等；SettingsWindow 通常已设过一次，这里兜底）
+    init => { PixelPresets.soft(); }
+
+    title: "ABB 系统对话";
+    no-frame: true;
+    preferred-width: 460px;
+    preferred-height: 560px;
+    min-width: 340px;
+    min-height: 380px;
+    background: PixelTheme.bg;
+
+    in property <[SysChatMsgRow]> messages: [];
+    in property <bool> busy: false;
+    in property <string> status-line: "与 ABB 直接对话（系统级 · 整机权限）";
+    in property <bool> status-is-error: false;
+    // 消息区滚动位置：Rust 每追加一条就设成一个大数 → 贴底（Flickable 会钳制到最大）
+    in-out property <length> scroll-y: 0px;
+    // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
+    in-out property <string> draft: "";
+
+    callback send(string);
+    callback reset-history();
+    callback close-window();
+    // slint-pixel 标题栏契约（impl_title_bar_ui! 要求这四个回调存在）
+    callback drag-start();
+    callback minimize();
+    callback toggle-maximize();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: PixelTheme.bg;
+
+        VerticalLayout {
+            // 自绘标题栏：native-move（平台拖动，宿主无需 drag-start 接线）+ 隐藏最大化
+            // （固定尺寸窗，set_maximized 会与尺寸绑定冲突）。
+            PixelTitleBar {
+                title: "ABB · 系统对话";
+                has-logo: true;
+                logo: @image-url("../app-assets/icon-1024.png");
+                native-move: true;
+                show-maximize: false;
+                close-window => { root.close-window(); }
+            }
+
+            // 状态行：默认提示 / 进行中 / 错误
+            Rectangle {
+                height: 26px;
+                background: PixelTheme.panel;
+                Text {
+                    x: 12px;
+                    width: parent.width - 24px;
+                    height: parent.height;
+                    text: root.status-line;
+                    font-size: 11px;
+                    color: root.status-is-error ? UiTokens.error : UiTokens.text-dim;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                // 底部分隔线（Rectangle 无 border-bottom-* 属性，用 1px 子矩形代替）
+                Rectangle {
+                    y: parent.height - 1px;
+                    width: 100%;
+                    height: 1px;
+                    background: PixelTheme.edge;
+                }
+            }
+
+            // 消息区：贴底滚动；空态给一句引导
+            PixelScrollPanel {
+                vertical-stretch: 1;
+                initial-scroll-y: root.scroll-y;
+                VerticalBox {
+                    width: 100%;
+                    padding: 10px;
+                    spacing: 8px;
+                    if root.messages.length == 0: Text {
+                        text: "有什么可以帮你？我运行在本机，能直接读写文件、执行命令。";
+                        font-size: 12px;
+                        color: PixelTheme.text.with-alpha(0.55);
+                        wrap: word-wrap;
+                        width: 100%;
+                    }
+                    for m in root.messages: Rectangle {
+                        width: 100%;
+                        border-radius: PixelTheme.radius;
+                        background: m.role == "user" ? PixelTheme.hover : transparent;
+                        border-width: m.role == "user" ? 0px : 2px;
+                        border-color: PixelTheme.edge;
+                        VerticalBox {
+                            padding: 8px;
+                            spacing: 3px;
+                            Text {
+                                text: m.role == "user" ? "你" : "ABB";
+                                font-size: 11px;
+                                font-weight: 700;
+                                color: PixelTheme.text.with-alpha(0.55);
+                            }
+                            Text {
+                                text: m.text;
+                                font-size: 13px;
+                                color: PixelTheme.text;
+                                wrap: word-wrap;
+                                width: 100%;
+                            }
+                        }
+                    }
+                    if root.busy: Text {
+                        text: "ABB 正在处理…";
+                        font-size: 12px;
+                        color: UiTokens.text-dim;
+                    }
+                }
+            }
+
+            // 输入区：输入框 + 发送 + 清空
+            HorizontalBox {
+                padding: 10px;
+                spacing: 8px;
+                PixelTextInput {
+                    horizontal-stretch: 1;
+                    text <=> root.draft;
+                    placeholder: root.busy ? "等待回复…" : "给 ABB 发消息，回车发送";
+                    enabled: !root.busy;
+                    accepted => {
+                        if root.draft != "" && !root.busy { root.send(root.draft); }
+                    }
+                }
+                PixelButton {
+                    text: "发送";
+                    variant: "primary";
+                    enabled: !root.busy && root.draft != "";
+                    clicked => { root.send(root.draft); }
+                }
+                PixelButton {
+                    text: "清空";
+                    enabled: !root.busy;
+                    clicked => { root.reset-history(); }
+                }
+            }
+        }
+    }
 }

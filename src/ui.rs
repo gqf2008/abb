@@ -30,6 +30,9 @@ slint::include_modules!();
 // 关闭 = 隐藏窗口不退出（托盘应用惯例，install_title_bar_controls_no_quit）。
 slint_pixel::impl_title_bar_ui!(SettingsWindow);
 
+// 系统级对话窗也用像素自绘标题栏（native-move + 关闭→隐藏）。
+slint_pixel::impl_title_bar_ui!(SystemChatWindow);
+
 enum UiCmd {
     Start,
     Stop,
@@ -155,6 +158,11 @@ enum UiCmd {
         bot_key: String,
         team_name: String,
     },
+    /// 系统级对话：跑一轮与 abb-agent 的直接对话（syschat::turn），
+    /// 结果经 syschat_rx 回主线程（气泡/对话框共用）。
+    SysChatSend {
+        text: String,
+    },
 }
 
 /// #141 一键创建团队结果（后台 → 主线程）。
@@ -181,6 +189,16 @@ enum WxEvt {
     Confirmed(i32, crate::wechat::WeixinLogin),
     /// 失败/过期。
     Failed(String),
+}
+
+/// 系统级对话事件（后台 → 主线程）：气泡与对话框共用一条通道。
+/// 回合跑在后台 tokio 线程（GUI 主线程不能阻塞），结果经 std mpsc 回主线程，
+/// 由 2s 定时器轮询上屏（与 dep_rx/prov_rx/vb_rx 同模式）。
+enum SysChatEvt {
+    /// 回合成功：助手回复文本。
+    Reply(String),
+    /// 回合失败：用户可读原因。
+    Error(String),
 }
 
 /// 虚拟 Bot 操作结果（#75，后台 → 主线程）：创建/编辑/登记/解散统一形状。
@@ -343,6 +361,8 @@ fn push_status(tray: &Tray, st: &install::ServiceStatus) {
     tray.set_bots_menu(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
     tray.set_configured(configured_cached());
     tray.set_autostart(platform::autostart_enabled());
+    // 全局气泡开关的回显（真值在 config.json；托盘菜单是结构性 if 重建，必须每 tick 回写）。
+    tray.set_bubble_enabled(Config::load().map(|c| c.syschat_bubble).unwrap_or(true));
 
     // 托盘图标整体状态：所有启用 bot 在线=绿；有在连/重连=黄；有离线/会话过期=红；
     // 未跑服务、无 bot 或全部停用=原灰（不显红吓人）。
@@ -1746,6 +1766,54 @@ pub fn run_gui() -> Result<()> {
 
     use slint::ComponentHandle;
 
+    // ── 系统级对话：全局锚点气泡 + AI 对话框 ─────────────────────────────────
+    // ABB 无头运行（`--service`）时不实例化 GUI；那时同一能力走 `agent-bridge chat`
+    // （同一模块 syschat），气泡只是 GUI 前端。
+    let syschat_win = SystemChatWindow::new()?;
+    slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
+    let syschat_model: Rc<slint::VecModel<SysChatMsgRow>> = Rc::new(slint::VecModel::default());
+    syschat_win.set_messages(slint::ModelRc::from(syschat_model.clone()));
+    // 打开对话框时把落盘历史灌进 model（跨重启保留的可见证据）。
+    fn load_syschat_into(win: &SystemChatWindow, model: &slint::VecModel<SysChatMsgRow>) {
+        let turns = crate::syschat::load_history();
+        let rows: Vec<SysChatMsgRow> = turns
+            .iter()
+            .map(|t| SysChatMsgRow {
+                role: t.role.clone().into(),
+                text: t.text.clone().into(),
+            })
+            .collect();
+        model.set_vec(rows);
+        // 贴底：Flickable 会把超大值钳到最大滚动位。
+        win.set_scroll_y(1_000_000.0);
+    }
+    load_syschat_into(&syschat_win, &syschat_model);
+    let bubble = AnchorBubble::new()?;
+    // 气泡位置：恢复上次拖动位置；首次落主屏右上（菜单栏下方）。
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        let screen_w = bubble
+            .window()
+            .with_winit_window(|w| {
+                w.primary_monitor()
+                    .map(|m| m.size().width as i32)
+                    .unwrap_or(1920)
+            })
+            .unwrap_or(1920);
+        let pos = crate::syschat::load_bubble_pos().unwrap_or(crate::syschat::BubblePos {
+            x: screen_w - 56 - 16,
+            y: 120,
+        });
+        bubble
+            .window()
+            .set_position(slint::PhysicalPosition::new(pos.x, pos.y));
+    }
+    // 气泡显示/隐藏：由 config.syschat_bubble 决定（托盘菜单可切换）。默认 true。
+    let bubble_on = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
+    if bubble_on {
+        let _ = bubble.show();
+    }
+
     // 点窗口红点（traffic-light）关闭 → 有未保存修改先弹确认，否则降回 accessory / 直接隐藏。
     // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦：CloseRequested 返回
     //  PreventDefault 可阻止 Slint 默认 hide，跨平台生效）
@@ -1834,6 +1902,8 @@ pub fn run_gui() -> Result<()> {
     let (vb_tx, vb_rx) = std_mpsc::channel::<VirtualBotEvt>();
     // #141 一键创建团队结果（生成/建群）
     let (team_tx, team_rx) = std_mpsc::channel::<TeamEvt>();
+    // 系统级对话回合结果（后台 → 主线程；气泡与对话框共用）
+    let (syschat_tx, syschat_rx) = std_mpsc::channel::<SysChatEvt>();
     // #141 团队弹窗上下文：打开时记录 (bot 下标, bot_key)；生成/建群按下标从工作副本取最新 bot。
     let team_ctx: Rc<RefCell<Option<(i32, String)>>> = Rc::new(RefCell::new(None));
     // #147 任命弹窗上下文：打开时记录 (bot_key, 团队名, 角色名)；确认时按它写团队登记表。
@@ -2081,6 +2151,8 @@ pub fn run_gui() -> Result<()> {
     let svc_toast: std::sync::Arc<std::sync::Mutex<Option<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let svc_toast_bg = svc_toast.clone();
+    // 系统级对话回合结果发送端（气泡/对话框共用）
+    let syschat_tx_bg = syschat_tx.clone();
     // 版本升级：最近一次检查发现的可用新版本（CheckUpdate 写，InstallUpdate 读）
     let latest_rel =
         std::sync::Arc::new(std::sync::Mutex::new(None::<crate::updater::LatestRelease>));
@@ -3091,6 +3163,21 @@ pub fn run_gui() -> Result<()> {
                             let _ = team_tx.send(TeamEvt::Manage { result: r });
                         });
                     }
+                    // 系统级对话（气泡/对话框）：无需管理密码（它不是服务动作，且执行层
+                    // 已是 owner 全权限——与其它 GUI 内部一次性回合同权限）。
+                    UiCmd::SysChatSend { text } => {
+                        let etx = syschat_tx_bg.clone();
+                        tokio::spawn(async move {
+                            let evt = match Config::load() {
+                                Ok(cfg) => match crate::syschat::turn(&cfg, &text).await {
+                                    Ok(reply) => SysChatEvt::Reply(reply),
+                                    Err(e) => SysChatEvt::Error(e),
+                                },
+                                Err(e) => SysChatEvt::Error(format!("读取配置失败：{e:#}")),
+                            };
+                            let _ = etx.send(evt);
+                        });
+                    }
                 }
             }
         });
@@ -3254,6 +3341,28 @@ pub fn run_gui() -> Result<()> {
                     "[ui] ⚠️ 开机自启设置失败（想设为{}）: {e:#}",
                     if on { "开" } else { "关" }
                 );
+            }
+        });
+        tray.on_toggle_bubble({
+            let bw = bubble.as_weak();
+            move |on| {
+                // 写 config.json（GUI 是配置的一个写方；该字段不参与 service 启动，无需重启）。
+                match Config::load() {
+                    Ok(mut c) => {
+                        c.syschat_bubble = on;
+                        if let Err(e) = c.save() {
+                            crate::log!("[ui] ⚠️ 全局气泡开关保存失败（本次仅生效不落盘）: {e:#}");
+                        }
+                    }
+                    Err(e) => crate::log!("[ui] ⚠️ 读配置失败（全局气泡开关）: {e:#}"),
+                }
+                if let Some(b) = bw.upgrade() {
+                    if on {
+                        let _ = b.show();
+                    } else {
+                        let _ = b.hide();
+                    }
+                }
             }
         });
         tray.on_check_update({
@@ -5112,6 +5221,113 @@ pub fn run_gui() -> Result<()> {
         show_window_and_focus(&settings);
     }
 
+    // ── 系统级对话：气泡点击 → 对话框；发消息 → 后台 syschat 回合 ──────────────
+    // 气泡拖动位置持久化：拖动会产生成串 Moved 事件，400ms 去抖后才写盘（避免每帧写文件）。
+    let bubble_pos_pending: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
+    {
+        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        let pending = bubble_pos_pending.clone();
+        bubble.window().on_winit_window_event(move |_w, ev| {
+            if let WindowEvent::Moved(pos) = ev {
+                pending.set(Some((pos.x, pos.y)));
+            }
+            EventResult::Propagate
+        });
+        let pending = bubble_pos_pending.clone();
+        let saver = slint::Timer::default();
+        saver.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(400),
+            move || {
+                if let Some((x, y)) = pending.take() {
+                    crate::syschat::save_bubble_pos(crate::syschat::BubblePos { x, y });
+                }
+            },
+        );
+        // Timer 需保活到事件循环结束（drop 会取消；与 show_window_and_focus 同款泄漏处理）。
+        std::mem::forget(saver);
+    }
+    // 点气泡 → 装载历史 + 置前打开对话框。
+    {
+        let cw = syschat_win.as_weak();
+        let model = syschat_model.clone();
+        bubble.on_open_chat(move || {
+            if let Some(w) = cw.upgrade() {
+                load_syschat_into(&w, &model);
+                show_window_and_focus(&w);
+            }
+        });
+    }
+    // 发送：用户消息立即上屏 + busy + 后台回合（结果经 syschat_rx 回）。
+    {
+        let cw = syschat_win.as_weak();
+        let model = syschat_model.clone();
+        let bw = bubble.as_weak();
+        let tx = tx.clone();
+        syschat_win.on_send(move |text| {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            let Some(w) = cw.upgrade() else { return };
+            if w.get_busy() {
+                return; // 防重复发送（busy 期间按钮/回车已禁用，这里是双保险）
+            }
+            model.push(SysChatMsgRow {
+                role: "user".into(),
+                text: text.clone().into(),
+            });
+            w.set_draft("".into());
+            w.set_busy(true);
+            w.set_status_is_error(false);
+            w.set_status_line("ABB 正在处理…".into());
+            w.set_scroll_y(1_000_000.0);
+            if let Some(b) = bw.upgrade() {
+                b.set_busy(true);
+            }
+            let _ = tx.send(UiCmd::SysChatSend { text });
+        });
+    }
+    // 清空历史（对话框按钮）。
+    {
+        let cw = syschat_win.as_weak();
+        let model = syschat_model.clone();
+        syschat_win.on_reset_history(move || match crate::syschat::clear_history() {
+            Ok(()) => {
+                model.set_vec(Vec::new());
+                if let Some(w) = cw.upgrade() {
+                    w.set_status_is_error(false);
+                    w.set_status_line("已清空对话历史。".into());
+                }
+            }
+            Err(e) => {
+                if let Some(w) = cw.upgrade() {
+                    w.set_status_is_error(true);
+                    w.set_status_line(format!("清空失败：{e}").into());
+                }
+            }
+        });
+    }
+    // 关闭对话框 = 隐藏（托盘应用惯例；气泡仍在，随时可再打开）。
+    {
+        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        let cw = syschat_win.as_weak();
+        syschat_win.on_close_window(move || {
+            if let Some(w) = cw.upgrade() {
+                let _ = w.hide();
+            }
+        });
+        let cw2 = syschat_win.as_weak();
+        syschat_win.window().on_winit_window_event(move |_w, ev| {
+            if matches!(ev, WindowEvent::CloseRequested) {
+                if let Some(w) = cw2.upgrade() {
+                    let _ = w.hide();
+                }
+            }
+            EventResult::Propagate
+        });
+    }
+
     // ── 主线程定时器：① 看门 ② 刷新托盘 ③ 抽 bot_rx/wx_rx 回填 ──
     let timer = slint::Timer::default();
     {
@@ -5139,6 +5355,11 @@ pub fn run_gui() -> Result<()> {
         let history_sessions = sessions_model.clone();
         let history_msgs = msgs_model.clone();
         let history_selected = selected_chat.clone();
+        // 系统级对话：气泡/对话框 weak + model + 回合结果接收端
+        let syschat_weak = syschat_win.as_weak();
+        let bubble_weak = bubble.as_weak();
+        let syschat_model_t = syschat_model.clone();
+        let syschat_rx_t = syschat_rx;
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -5630,6 +5851,36 @@ pub fn run_gui() -> Result<()> {
                             }
                             if let Some(w) = settings_weak.upgrade() {
                                 w.set_status_line(format!("微信登录失败：{e}").into());
+                            }
+                        }
+                    }
+                }
+                // 系统级对话回合结果：reply/error 上屏，busy 收尾（气泡同步）。
+                while let Ok(evt) = syschat_rx_t.try_recv() {
+                    match evt {
+                        SysChatEvt::Reply(text) => {
+                            syschat_model_t.push(SysChatMsgRow {
+                                role: "assistant".into(),
+                                text: text.into(),
+                            });
+                            if let Some(w) = syschat_weak.upgrade() {
+                                w.set_busy(false);
+                                w.set_status_is_error(false);
+                                w.set_status_line("与 ABB 直接对话（系统级 · 整机权限）".into());
+                                w.set_scroll_y(1_000_000.0);
+                            }
+                            if let Some(b) = bubble_weak.upgrade() {
+                                b.set_busy(false);
+                            }
+                        }
+                        SysChatEvt::Error(e) => {
+                            if let Some(w) = syschat_weak.upgrade() {
+                                w.set_busy(false);
+                                w.set_status_is_error(true);
+                                w.set_status_line(format!("失败：{e}").into());
+                            }
+                            if let Some(b) = bubble_weak.upgrade() {
+                                b.set_busy(false);
                             }
                         }
                     }

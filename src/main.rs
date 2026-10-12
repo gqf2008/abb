@@ -51,6 +51,7 @@ mod single_instance;
 mod spawn;
 mod spawn_guard;
 mod svc_tasks;
+mod syschat;
 mod task_identity;
 mod task_migrate;
 mod task_proc;
@@ -547,6 +548,13 @@ fn main() {
     // 总开关：Config.cross_delivery_enabled（设置 → 「跨会话投递」勾选），关闭时拒绝。
     if args.len() >= 2 && args[1] == "deliver" {
         std::process::exit(run_deliver_cli(&args[2..]));
+    }
+
+    // 系统级对话 CLI（全局气泡的**无头对等入口**）：ABB 以 `--service` 无头运行时
+    // 也能与自带的 abb-agent 直接对话，不依赖任何 GUI/渠道。
+    //   agent-bridge chat [--reset] [--json] [文本|stdin]
+    if args.len() >= 2 && args[1] == "chat" {
+        std::process::exit(syschat::run_chat_cli(&args[2..]));
     }
 
     // 会话管理 CLI（#23）：供 claude 用 Bash 调用（也可人用）。

@@ -983,6 +983,11 @@ pub struct Config {
     /// 关闭 = ABB 完全不 init、不快照（工作区已有仓库也不写入，由用户自主管理）。
     #[serde(default = "default_true")]
     pub workspace_git_enabled: bool,
+    /// 全局锚点气泡总开关（系统级对话入口）：true = 屏幕上常驻 ABB 悬浮球（点击打开
+    /// AI 对话框）。默认 true（owner 决策 2026-10-12）；关掉后仍可用 `agent-bridge chat`
+    /// （无头/CLI）或稍后从托盘菜单重新打开。
+    #[serde(default = "default_true")]
+    pub syschat_bubble: bool,
     /// 「启动 / 停止 / 重启服务」的管理密码（2026-10-04 owner 要求：统一由 ABB 管理密码控制）。
     ///
     /// 存加盐迭代 SHA-256 记录（`sha256$<iters>$<salt_hex>$<hash_hex>`，见 `admin_pass`），
@@ -1034,6 +1039,7 @@ impl Default for Config {
             task_workers: TaskWorkers::default(),
             cross_delivery_enabled: false,
             workspace_git_enabled: true,    // #209 工作区版本管理默认开
+            syschat_bubble: true,           // 全局锚点气泡默认常驻（系统级对话入口）
             admin_password: String::new(),  // 未设置（首次服务动作时由 UI 引导设置）
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
@@ -2811,6 +2817,24 @@ mod tests {
         let back2: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back2.history_retention_days, 90);
         assert!(!back2.notify_enabled);
+    }
+
+    #[test]
+    fn syschat_bubble_defaults_true_and_roundtrip() {
+        // 全局锚点气泡：默认开（owner 决策）；旧 config 无字段按默认开。
+        assert!(Config::default().syschat_bubble);
+        let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
+        let back: Config = serde_json::from_str(old).unwrap();
+        assert!(back.syschat_bubble, "旧文件兼容缺省 = 开");
+        // 关掉后往返不丢
+        let c = Config {
+            syschat_bubble: false,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains("\"syschat_bubble\":false"), "{s}");
+        let back2: Config = serde_json::from_str(&s).unwrap();
+        assert!(!back2.syschat_bubble);
     }
 
     #[test]

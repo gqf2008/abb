@@ -328,6 +328,27 @@ fn oneshot_agent_config_inner(
     }
 }
 
+/// 系统级对话（全局锚点气泡 / 无头 `agent-bridge chat`）的 agent 配置。
+///
+/// 与 [`oneshot_agent_config`]（按 bot 装配）的区别：系统级对话**不属于任何渠道 bot**——
+/// 没有 bot 配置、甚至无头运行（`--service`）时也必须能跑。
+///
+/// 装配口径（owner 决策，2026-10-12）：
+/// - 供应商：全局默认（合成 bot 的 `provider` 留空 → `effective_provider` 回落 `default_provider`）；
+/// - 档位：**整机全权限**（`sandbox = None`，不带任何 workspace 白名单/证据；这是「系统级」的定义）；
+/// - 工作区：`workspaces/syschat/`（见 [`crate::syschat::workspace`]）。
+///
+/// 合成 bot 只用于复用「按 bot 解析供应商 + 命令槽」的既有链路，不写盘、不登记。
+pub(crate) fn oneshot_agent_config_system(cfg: &Config) -> crate::runtime::harness::AgentConfig {
+    let bot = crate::config::BotConfig {
+        name: crate::syschat::SYSCHAT_KEY.to_string(),
+        ..Default::default()
+    };
+    // sandbox 显式传 None = 全权限（与 `resolve_sandbox_meta(&bot)` 对默认档位的结果一致，
+    // 但这里写成常量、不随 BotConfig 默认档位漂移）。
+    oneshot_agent_config_inner(&bot, cfg, resolve_acp_commands(), None)
+}
+
 /// 一次性同步回合的 agent 配置（**按角色**选剖面）——task 执行专用。
 ///
 /// 与 [`oneshot_agent_config`] 的关键差别：那个是**内部维护任务**（owner 语义：
@@ -2078,6 +2099,43 @@ mod tests {
             std::path::Path::new(&abb_bin).is_absolute(),
             "ABB_BIN 必须是绝对路径（agent 的 cwd 不可预知），实际 {abb_bin}"
         );
+    }
+
+    /// 系统级对话装配（全局气泡 / 无头 `agent-bridge chat`）：
+    /// 全局默认供应商 + **无沙箱（整机全权限）**，且不依赖任何 bot 配置。
+    #[test]
+    fn oneshot_agent_config_system_uses_default_provider_and_full_access() {
+        let prov = crate::config::ProviderConfig {
+            name: "sys-default".into(),
+            kind: "openai-chat".into(),
+            base_url: "https://sys.example.com/v1".into(),
+            api_key: "sk-sys".into(),
+            model: "sys-model".into(),
+        };
+        let mut cfg = Config::default();
+        cfg.providers = vec![prov];
+        cfg.default_provider = "sys-default".into();
+        // 关键：没有 bots（无头/未接渠道也得能跑）。
+        assert!(cfg.bots.is_empty());
+
+        let c = oneshot_agent_config_system(&cfg);
+        assert!(
+            c.session_sandbox.is_none(),
+            "系统级对话 = 整机全权限，不得带沙箱档位"
+        );
+        let env: std::collections::HashMap<_, _> = c.extra_env.iter().cloned().collect();
+        assert_eq!(
+            env.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
+            Some("sk-sys"),
+            "系统级对话必须用全局默认供应商（不依赖任何 bot）"
+        );
+        assert_eq!(
+            env.get("OPENAI_COMPAT_BASE_URL").map(String::as_str),
+            Some("https://sys.example.com/v1")
+        );
+        assert!(!c.command.is_empty(), "命令槽必被解析");
+        // Jev 门禁 env 不该出现（无档位=不套门禁，多变一个凭证只扩大暴露面）。
+        assert!(!env.contains_key("JEV_API_KEY"));
     }
 
     /// 随包仅认 abb-agent（刀 4b 后无回滚槽）。
