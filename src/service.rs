@@ -1975,6 +1975,45 @@ mod tests {
         );
     }
 
+    /// `$ABB_BIN` 在**聊天句柄路径**上也必须被注入（评审 R1，卡 `abb-mcp-orchestrator-p0-20261012`）。
+    ///
+    /// 为什么单列：此前只有 oneshot 那条有断言，只删掉 `mk` 闭包里的 `.chain(abb_bin_env())`
+    /// 全量隔离套件**仍全绿**（评审实测）。这里在**真句柄**上断言（`RuntimeHandle` 存的 `AgentConfig`），
+    /// 不依赖 spawn，也不再是"只测 helper"。
+    ///
+    /// 判别力：删掉 `mk` 里的 `.chain(abb_bin_env())` ⇒ 本用例红。
+    #[test]
+    fn chat_handles_extra_env_carries_abb_bin() {
+        let cmds = ("/bin/abb-agent", "/bin/abb-agent");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let cfg = Config::default();
+        for mode in [
+            crate::config::SandboxMode::FullAccess,
+            crate::config::SandboxMode::ReadOnly,
+        ] {
+            let bot = crate::config::BotConfig {
+                name: "abb-bin".into(),
+                sandbox_mode: mode,
+                ..crate::config::BotConfig::default()
+            };
+            let handles = build_bot_acp_handles(&bot, &cfg, cmds, stop.clone());
+            for (label, handle) in [("normal", &handles.normal), ("granted", &handles.granted)] {
+                let env = handle.extra_env_for_test();
+                let abb_bin = env
+                    .iter()
+                    .find(|(k, _)| k == "ABB_BIN")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| {
+                        panic!("{label} 句柄缺 ABB_BIN（档位 {mode:?}）：agent 的 `$ABB_BIN` 会展开为空")
+                    });
+                assert!(
+                    std::path::Path::new(&abb_bin).is_absolute(),
+                    "{label} 的 ABB_BIN 必须是绝对路径，实际 {abb_bin}"
+                );
+            }
+        }
+    }
+
     /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 把 owner 会话（无论档位）
     /// 与 granted 会话都放上 abb-agent 槽（统一迁移刀 4a：abb-agent 已声明 abbSandbox
     /// 三档 + Jev 门禁 + 读域闸，受限会话也能走）。旧层只作回滚。

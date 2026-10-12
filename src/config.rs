@@ -165,12 +165,18 @@ pub struct BotConfig {
     /// 客户端）去连接；接进来干什么、要订阅什么资源，由 agent 自己判断。形状校验见
     /// `service::bot_mcp_servers`（name/command 非空、name 唯一）。
     ///
-    /// **信任口径（2026-10-12 补，卡 abb-mcp-orchestrator-p0-20261012）**：声明一个 MCP server
-    /// 等于**授权它以 agent 的身份运行**——它会拿到 agent 子进程的白名单 env，其中包括
-    /// `$ABB_BIN`（本程序绝对路径），因此**可以驱动 ABB CLI**（`task add/status/logs/cancel`、
-    /// `deliver` 等）。这仍然受既有闸约束：Q8（`--proc` 载荷对 agent 一律拒绝，MCP 子进程带
-    /// `ABB_AGENT_CONTEXT=1`）、角色剖面（受限会话走受限档）、`cross_delivery_enabled`（跨会话
-    /// 投递总开关）。所以：**只声明你信任的 server**；server 自己声明的 `env` 会叠加在白名单之上。
+    /// **信任口径（2026-10-12 补，卡 abb-mcp-orchestrator-p0-20261012；评审 R3 更正后）**：
+    ///
+    /// 1. **名单只进 owner/普通会话**：granted（授权者）会话与 oneshot（任务执行）的名单**恒为空**
+    ///    （`service.rs` 的 `build_bot_acp_handles`/`oneshot_agent_config`），理由是外部 server 的工具面
+    ///    会**绕过受限档的沙箱**——所以本字段**不能**被读成"受会话档位约束"。
+    /// 2. **声明即授权**：MCP 子进程**不按会话档位运行**（它不是 agent 的 shell，`_meta.abbSandbox` 管不到它）。
+    ///    它继承 agent 进程的白名单 env（含 `$ABB_BIN` = 本程序绝对路径）、cwd 为会话工作区，因此
+    ///    **等于给它在工作区上的执行权 + 驱动 ABB CLI 的能力**（`task add/status/logs/cancel`、`deliver` 等）；
+    ///    server 自己声明的 `env` 会**叠加在白名单之上**（可覆盖）。
+    ///
+    /// 仍然生效的闸：Q8（`--proc` 载荷对 agent 一律拒绝——MCP 子进程带 `ABB_AGENT_CONTEXT=1`）、
+    /// `cross_delivery_enabled`（**跨会话**投递总开关；会话内投递不受它约束）。⇒ **只声明你信任的 server**。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerConfig>,
     /// #51 免 @ 群聊开关：chat_id → "on"/"off"。off = 该群顶层消息免 @ 直接进 agent；

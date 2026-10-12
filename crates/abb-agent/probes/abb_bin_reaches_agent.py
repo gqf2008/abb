@@ -183,6 +183,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", default=os.environ.get("ABB_AGENT_BIN", "target/debug/abb-agent"))
     ap.add_argument(
+        "--abb-bin",
+        default=None,
+        help="用**真实**的 agent-bridge 路径：除透传外，还断言 `\"$ABB_BIN\" --help` 真能执行（exit 0）",
+    )
+    ap.add_argument(
         "--negative-control",
         action="store_true",
         help="子进程 env 里去掉 ABB_BIN（探针必须失败，否则它没在验证这条链）",
@@ -192,11 +197,16 @@ def main() -> int:
         print(f"❌ 找不到 abb-agent：{args.agent}（先 cargo build，或用 --agent 指定）")
         return 2
 
-    expected = os.path.abspath("/tmp/fake-abb-bin-for-probe")
+    real_mode = bool(args.abb_bin)
+    expected = os.path.abspath(args.abb_bin) if real_mode else "/tmp/fake-abb-bin-for-probe"
     env = dict(os.environ)
     env["ABB_AGENT_FAUX_TEXT"] = "probe-done"
+    command = "printenv ABB_BIN"
+    if real_mode:
+        # 真实模式：不仅看变量在不在，还要证明它**能被当作程序执行**（卡 AC1② 的后半句）。
+        command = f'printenv ABB_BIN; "$ABB_BIN" --help >/dev/null 2>&1; echo ABB_BIN_EXEC_EXIT=$?'
     env["ABB_AGENT_FAUX_TOOL"] = json.dumps(
-        {"name": "dev__shell", "arguments": {"command": "printenv ABB_BIN"}}
+        {"name": "dev__shell", "arguments": {"command": command}}
     )
     if args.negative_control:
         env.pop("ABB_BIN", None)
@@ -235,7 +245,16 @@ def main() -> int:
             f"   期望输出含：{expected}\n   实际工具输出：{text!r}"
         )
         return 1
-    print(f"✅ `$ABB_BIN` 到达 agent 的 shell：{expected}")
+    if real_mode and "ABB_BIN_EXEC_EXIT=0" not in text:
+        print(
+            "❌ 真实模式失败：`\"$ABB_BIN\" --help` 没能成功执行（期望 ABB_BIN_EXEC_EXIT=0）\n"
+            f"   实际工具输出：{text!r}"
+        )
+        return 1
+    print(
+        f"✅ `$ABB_BIN` 到达 agent 的 shell：{expected}"
+        + ("（真实路径：`\"$ABB_BIN\" --help` exit 0）" if real_mode else "")
+    )
     return 0
 
 

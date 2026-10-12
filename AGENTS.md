@@ -157,5 +157,11 @@ tools/check_test_isolation.sh
   —— 后者用 `--deep --force` 重签，不传就把授权签没 —— 并在重签后跑
   `tools/check_entitlements.sh` 断言最终产物。CI 的 release.yml 同样已接入该守卫。
 - `config.json` (contains App Secret) and `*.secret` are gitignored — never commit credentials.
+- **`bots[].mcp_servers` 是授权面**：声明一个 MCP server = 授权它以 agent 身份运行——它不受会话档位沙箱约束，
+  继承 agent 的白名单 env（含 `$ABB_BIN` = 桥本体绝对路径，agent 用它调 `task`/`job`/`deliver`）并以会话工作区为 cwd，
+  因此等于给它在工作区的执行权 + 驱动 CLI 的能力；仍受 Q8（`--proc` 拒）与 `cross_delivery_enabled` 约束。只声明可信 server。
+- **`$ABB_BIN` 由 ABB 注入 agent 进程**（`service.rs::abb_bin_env`，两条 spawn 路径都带），并由
+  `crates/abb-agent` 的 `child_env::PASSTHROUGH_ENV` 透传给 shell 工具与 MCP 子进程；断言见
+  `chat_handles_extra_env_carries_abb_bin`、`public_oneshot_wrapper_*` 与探针 `probes/abb_bin_reaches_agent.py`。
 - Don't commit `logs/`, `target/`, or generated `.app` bundles.
 - Before touching signing, read `scripts/sign.sh`: usage-description entitlements on the bare binary can cause a startup `SIGKILL`.

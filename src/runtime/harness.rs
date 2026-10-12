@@ -375,6 +375,15 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    /// 测试用：暴露构造该句柄时**实际要下发给 agent 的 env**。
+    ///
+    /// 为什么需要（评审 R1，卡 `abb-mcp-orchestrator-p0-20261012`）：聊天路径（`build_bot_acp_handles`
+    /// 的 `mk` 闭包）的 `$ABB_BIN` 注入此前**无人看守**——只删掉那处 `.chain(abb_bin_env())`，
+    /// 全量隔离套件仍全绿。有了这个访问器，测试就能在**真句柄**上断言，而不是只测 helper。
+    #[cfg(test)]
+    pub(crate) fn extra_env_for_test(&self) -> &[(String, String)] {
+        &self.cfg.extra_env
+    }
     /// 测试访问器：**该句柄实际会 spawn 的执行层命令**。
     ///
     /// 为什么需要它：执行层按角色 + 档位分流（`service::pick_command_by_sandbox`），

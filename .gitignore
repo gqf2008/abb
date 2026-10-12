@@ -39,3 +39,7 @@ tools-dist/
 .rpi/extensions/.dev/
 # rpi-todo 扩展写的每会话待办（项目级运行期数据，同 sessions/）。
 .rpi/todos/
+
+# Python 生成物（探针/夹具；2026-10-12 误提交过一次，见卡 abb-mcp-orchestrator-p0-20261012 R2）
+__pycache__/
+*.pyc

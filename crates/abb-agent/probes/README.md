@@ -85,4 +85,15 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   会话完全同形（本该被区分）。探针自带隔离的 `HOME`/`USERPROFILE`，不会读跑测机器的真实
   `~/AGENTS.md`。
 
+- `abb_bin_reaches_agent.py`：`$ABB_BIN` 是否真的到达 agent 的 shell（卡 `abb-mcp-orchestrator-p0-20261012`）。
+  起点是 agent 进程 env（ABB 侧由 `service.rs::abb_bin_env` 注入），经 `child_env::PASSTHROUGH_ENV`
+  透传到 shell 工具，探针走 `dev__shell` 跑 `printenv ABB_BIN` 断言值。三种档：
+  ①默认（假路径）只看**透传**；②`--negative-control` 不设 `ABB_BIN` ⇒ 必须看不到（防探针空转）；
+  ③`--abb-bin <真实 agent-bridge 路径>` 额外断言 `"$ABB_BIN" --help` **真能执行**（exit 0）。
+  判据（同步方式）**不依赖 sleep**：按 JSON-RPC id 逐步等待，字节级非阻塞 IO + `ABB_PROBE_DEADLINE`
+  （缺省 60s）收口；`--agent` 指向不存在的程序或永久挂起的进程都会在有界时间内以可读错误退出。
+  **修前表现**：`ABB_BIN` 从未被注入 ⇒ shell 里展开为空，`printenv` 无输出、`"$ABB_BIN" …` 必然失败；
+  变异（把 `ABB_BIN` 从 `PASSTHROUGH_ENV` 删掉）会让本探针转红。
+  注意：它把 `session/new` 的 cwd 设为**当前工作目录**，故从仓库根运行、且不写仓库文件（临时图/落盘都在 `/tmp`）。
+
 全部只在 `/tmp` 与本地回环上活动，不访问外网、不写仓库文件。
