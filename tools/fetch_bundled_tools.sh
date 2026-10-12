@@ -209,3 +209,8 @@ done < tools/tool-lock.tsv
   echo "lock 中 $PLATFORM 的包数不符（found=$found）" >&2; exit 1;
 }
 echo "  [tools] 已准备 $found 个工具到 $DEST"
+
+# 显式以 0 退出（对称加固，卡 abb-windows-ps1-exit-code-leak-20261012）：现在末尾是 `echo`（内建，返回 0）
+# 所以不出问题；但若将来把多调包 smoke 循环挪到末尾，最后一条**原生命令**的非 0 退出码会变成脚本退出码
+# （PowerShell 版就是因为这个在 CI 里挂了）。出错路径仍由 `exit 1` 负责。
+exit 0

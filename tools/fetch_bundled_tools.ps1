@@ -116,3 +116,12 @@ finally {
 }
 
 Write-Host "  [tools] 已准备 $($rows.Count) 个工具到 $Dest"
+
+# 显式以 0 退出（2026-10-12 修，卡 abb-windows-ps1-exit-code-leak-20261012）：
+# `pwsh -File script.ps1` 结束时，若最后一条**原生命令**留下了非 0 的 `$LASTEXITCODE`，进程退出码就是它。
+# 而本脚本倒数第二个动作是多调包 smoke（`& $exe --version`，**故意容忍非 0**：uutils diffutils 不实现
+# `--version`，busybox 的多数 applet 也不认它），`Write-Host` 是 cmdlet 不会重置该变量 ⇒ 脚本"成功"却以 1
+# 退出，CI 步骤失败、release job 被跳过（v2.23.115 的 windows job 就是这样挂的）。
+# POSIX 侧 `fetch_bundled_tools.sh` 末尾是同义的 `echo`（内建，返回 0）故不中招——别再把"两脚本同构"当等价。
+# 出错路径不受影响：仍由 throw / `exit 1` 负责（`$ErrorActionPreference = "Stop"`）。
+exit 0
