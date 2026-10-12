@@ -2494,9 +2494,11 @@ mod resource_event_tests {
     /// ①`handle_resource_update` 词法范围内：不含 `tracing::`，且经唯一出口 `log_resource_lines(`；
     /// ②**出口函数** `log_resource_lines` 本身：用 `crate::log!` 且不含 `tracing::`
     ///   ——加这条是为了堵"把出口体内的宏换掉"（评审实测：换掉即红）；
-    ///   **实测边界（评审第 2 轮复测，我第一版写反了）**：真盲区是"在 handler 内**并行**再加一条走函数体外
-    ///   helper 的日志调用"（①只要求 handler **包含**出口调用且不含 `tracing::` 字面量，两条都满足 ⇒ 绿）；
-    ///   而"把出口调用**替换**成别处定义的 tracing 间接层"其实会被①拦住（红）——我原先把它记成盲区，记反了。
+    ///   **实测边界（评审两轮复测后的准确版）**：
+    ///   - **红**：换掉出口体内的宏 / 把**两处**出口调用都换成 tracing 间接层 / handler 内直接写 `tracing::` /
+    ///     把**丢弃-汇总**那一处单独换走（③b 专为它加的针）/ 把孤儿那处换走（③）/ handler 绕过单点接线自行入队记账；
+    ///   - **仍绿（已知盲区，如实登记）**：在 handler 内**并行再加一条**走函数体外 helper 的日志调用
+    ///     （出口调用仍在 ⇒ ①②③ 全满足）。要闭合它需要行为级判据（writer 注入 / `log_to!`），本卡不做。
     /// ③O1 的两处**接线**（此前"对象层有判据、集成层没判据"，变异 M7/M10 都能全绿）：
     ///   `l.resource_throttle.mark_delivered(` 必须出现在 `if handle_cmd(` 之内（入队后才记账）；
     ///   `l.resource_throttle.forget_channel(` 必须存在（频道移除时清状态）。
@@ -2586,6 +2588,15 @@ mod resource_event_tests {
         assert!(
             flat_handler.contains(&orphan_needle),
             "孤儿更新也必须经唯一出口（否则 N1 的枚举又变成假的）"
+        );
+        // ③b **丢弃/汇总**那处调用点也必须单独钉住（评审第 2 轮 B1 实测）：
+        //    把孤儿收进出口后 handler 里有**两处** `log_resource_lines(`，只做 `contains` 会被任意一处满足
+        //    ⇒ "只把丢弃/汇总那一处换成 tracing 间接层"（= 让 AC1"不得静默"整条静默回退）逃得掉（实测绿）。
+        //    这里的针也**运行期拼**（同一自我指涉理由）。
+        let summary_needle = format!("{}(&{})", "log_resource_lines", "lines");
+        assert!(
+            flat_handler.contains(&summary_needle),
+            "丢弃/汇总的日志调用点必须经出口（否则'不得静默'这条能被静默回退）"
         );
         let acp_src = include_str!("acp.rs").replace("\r\n", "\n");
         let drop_needle = format!("{}(&make(n))", "resource_line");
