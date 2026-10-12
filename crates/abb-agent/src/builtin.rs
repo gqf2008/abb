@@ -266,10 +266,29 @@ struct Exposed {
 fn read_tool_options() -> ReadToolOptions {
     ReadToolOptions {
         auto_resize_images: true,
-        image_processor: Some(std::sync::Arc::new(
-            rpi_tools::image_processing::InlineImageProcessor,
-        )),
+        image_processor: image_processor_from(std::env::var(IMAGE_PROCESSOR_ENV).ok().as_deref()),
     }
+}
+
+/// 图片处理器开关的**环境变量名**（与 `ABB_AGENT_DEV_TOOLS` 同惯例：默认开、值 `0` 关）。
+pub const IMAGE_PROCESSOR_ENV: &str = "ABB_AGENT_IMAGE_PROCESSOR";
+
+/// 从环境值判定是否装处理器（**可注入版本**，单测不改进程全局 env）。
+///
+/// 语义（对齐 `dev_tools_enabled_from`）：
+/// - 缺省（未设置）或任意非 `0` 值 ⇒ **装**（默认开：这是"读图别把大图丢掉"的能力，默认关会让用户
+///   看到"图片被省略"却不知道为什么）；
+/// - `"0"` ⇒ 不装（退回 rpi 默认：原样 inline 或省略提示）——给排障/回退留一条路；
+/// - 读不懂（非数字）⇒ 也**装**（这里不是安全闸，容忍非法值比"悄悄关掉能力"更符合预期，且与
+///   `dev_tools_enabled_from` 的"响亮失败"动机不同：那条是配置错误可见性，这条没有安全含义）。
+pub fn image_processor_from(
+    value: Option<&str>,
+) -> Option<std::sync::Arc<dyn rpi_tools::ReadImageProcessor>> {
+    let enabled = !matches!(value.map(str::trim), Some("0"));
+    enabled.then(|| {
+        std::sync::Arc::new(rpi_tools::image_processing::InlineImageProcessor)
+            as std::sync::Arc<dyn rpi_tools::ReadImageProcessor>
+    })
 }
 
 fn exposed(
@@ -1031,13 +1050,104 @@ mod tests {
         );
     }
 
+    /// **端到端判据（评审 F1 的整改）**：走**真实的 `dev__read` 工具**（`dev_tools` → `OsExecutionEnv`），
+    /// 断言返回的 content part 里有一张 `Image`、且**真实像素尺寸**已被缩到上限内、比例保持。
+    ///
+    /// 为什么必须有这条：上面两条行为用例是**直接调 rpi 库**的，钉的是"rpi 会缩放"，不是"本仓的 read
+    /// 装了处理器"——评审实测：把生产接线改回 `None`（变异 A）或把 helper 的处理器置空（变异 B）或换成
+    /// 不缩放的实现（变异 C），那两条**照样绿**。这条对三者都会红（不装 ⇒ 尺寸仍是 2500×100）。
+    ///
+    /// 不需要假 ExecutionEnv：`dev_tools` 自己建 `OsExecutionEnv::with_cwd(workspace)`（评审实测口径）。
+    #[tokio::test]
+    async fn read_tool_returns_resized_image_part_end_to_end() {
+        use base64::Engine as _;
+        let workspace = temp_workspace("img-e2e");
+        // 2500×100 红色 PNG（超过 INLINE_IMAGE_MAX_SIDE=2000）
+        let mut img = image::RgbImage::new(2500, 100);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([200, 30, 30]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("编码 PNG");
+        std::fs::write(workspace.join("big.png"), png.into_inner()).expect("写测试图");
+
+        let tools = dev_tools(&workspace, SandboxMode::FullAccess, false);
+        let read = tools
+            .iter()
+            .find(|t| t.schema().name == "dev__read")
+            .expect("read 工具必须存在")
+            .clone();
+        let out = read
+            .execute(
+                "call",
+                serde_json::json!({ "path": "big.png" }),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("读图应成功");
+
+        // 从 content part 里取图（不是文本提示）——"仍拿得到图"这一点必须由 part 类型证明。
+        let (mime, bytes) = out
+            .content
+            .iter()
+            .find_map(|part| match part {
+                rpi_agent::types::TextContentOrImage::Image(img) => Some((
+                    img.mime_type.clone(),
+                    base64::engine::general_purpose::STANDARD
+                        .decode(img.data.as_bytes())
+                        .expect("图片 part 应是 base64"),
+                )),
+                _ => None,
+            })
+            .expect("read 应返回 Image part（而不是一行省略提示）");
+        assert_eq!(mime, "image/png", "处理后的 mime");
+        let decoded = image::load_from_memory(&bytes).expect("解码 part");
+        assert!(
+            decoded.width() <= rpi_tools::image_processing::INLINE_IMAGE_MAX_SIDE,
+            "端到端：超限图必须被缩到上限内，实际 {}×{}",
+            decoded.width(),
+            decoded.height()
+        );
+        let ratio = decoded.width() as f64 / decoded.height() as f64;
+        assert!(
+            (ratio - 25.0).abs() < 0.5,
+            "端到端：应等比缩放（原比 25.0，实际 {ratio:.2}：{}×{}）",
+            decoded.width(),
+            decoded.height()
+        );
+    }
+
+    /// 开关语义（评审 O3：AC1 的"可配置"这一腿）：默认开；`"0"` 关；非法值按**开**处理（这里不是安全闸）。
+    #[test]
+    fn image_processor_switch_defaults_on_and_zero_disables() {
+        assert!(image_processor_from(None).is_some(), "未设置 ⇒ 默认开");
+        assert!(image_processor_from(Some("1")).is_some());
+        assert!(image_processor_from(Some("0")).is_none(), "值为 0 ⇒ 关");
+        assert!(
+            image_processor_from(Some(" 0 ")).is_none(),
+            "两侧空白应被容忍"
+        );
+        assert!(
+            image_processor_from(Some("yes")).is_some(),
+            "非法值按开处理（本开关无安全含义，不该悄悄关掉能力）"
+        );
+    }
+
     /// **接线判据**：`read` 工具必须**真的用** `read_tool_options()` 构造（只测 helper 不够——
     /// 把 `Some(read_tool_options())` 改回 `None`，helper 用例照样绿；这条就是为那次变异补的）。
     ///
     /// 手法：源码文本断言 + **运行期拼针**。为什么拼针：字面量会出现在本测试自身源码里，而
     /// `include_str!` 把测试一起读进来 ⇒ 直接写 `contains("…")` 会恒真（我在 harness 那边踩过一次。
-    /// 边界（如实写明）：这是**源码级**判据，拦的是"把接线删掉/改回 None"；要行为级判据需要给
-    /// `build_tools` 注入假 ExecutionEnv，属更大改造（本卡不做）。
+    /// 边界（**按评审实测更正**）：这是源码级判据，边界是词法范围而非调用图——评审给出过一条实测绕过：
+    /// 把生产接线改回 `None`、同时把 needle 原文留在尾注释里，本用例仍绿。**真正的行为级判据见下面
+    /// `read_tool_returns_resized_image_part_end_to_end`**（走真实 `dev__read` 工具），本条只当"接线还在"的快速提示。
+    ///
+    /// 我原先在这里写过"要行为级判据得给 `build_tools` 注入假 ExecutionEnv，属更大改造"——**两句都不实**：
+    /// ①全仓没有 `build_tools` 这个符号（真实是 `dev_tools`）；②**不需要假 env**：`dev_tools` 自己就
+    /// `OsExecutionEnv::with_cwd(workspace)`，给个真实临时目录即可（评审用 ~45 行探针跑通并给了实测数据）。
     #[test]
     fn read_tool_is_constructed_with_processor_options() {
         let src = include_str!("builtin.rs").replace("\r\n", "\n");
@@ -1054,7 +1164,8 @@ mod tests {
     /// 行为判据：接上的处理器真的会把**超大图**缩到上限内（`INLINE_IMAGE_MAX_SIDE` = 2000）。
     /// 用 `image` 合成 2500×100 的 PNG 后过一遍处理器，再解码回来量尺寸——
     /// 断言"仍能拿到图（不是一行省略提示）且宽 ≤ 上限"。
-    /// 判别力：把处理器实现换回"原样返回"（或助手不装处理器）时，尺寸会是 2500 ⇒ 红。
+    /// 判别力（**按评审实测更正**）：本条只覆盖**被调的库实现**——换掉处理器实现/不装处理器时它**不会**红
+    /// （实测：变异 B/C 下它绿）。本仓接线由端到端用例 `read_tool_returns_resized_image_part_end_to_end` 覆盖。
     #[test]
     fn inline_image_processor_resizes_oversized_image() {
         use base64::Engine as _;
