@@ -3017,15 +3017,16 @@ export struct SysChatMsgRow {
 // 单纯单击落到下层 TouchArea → open-chat。位置由 Rust 持久化（syschat/bubble.json）。
 export component AnchorBubble inherits Window {
     title: "ABB";
-    width: 56px;
-    height: 56px;
-    preferred-width: 56px;
-    preferred-height: 56px;
+    // 尺寸：36px（owner 反馈 56 → 44 仍偏大，2026-10-13）。
+    width: 36px;
+    height: 36px;
+    preferred-width: 36px;
+    preferred-height: 36px;
     no-frame: true;
     always-on-top: true;
     background: transparent;
 
-    in property <bool> busy: false;   // 回合进行中（气泡显示省略号）
+    in property <bool> busy: false;   // 回合进行中（透明反馈）
     callback open-chat();
 
     WindowMoveArea {
@@ -3037,21 +3038,14 @@ export component AnchorBubble inherits Window {
             mouse-cursor: pointer;
             clicked => { root.open-chat(); }
         }
-        Rectangle {
+        // 直接用**应用图标**当气泡（蓝色品牌色圆角方块，自带圆角与品牌色），
+        // 不用主题 accent 填色——之前暖黄 accent 与蓝色图标撞色（owner 2026-10-13）。
+        Image {
             width: 100%;
             height: 100%;
-            border-radius: self.width / 2;
-            background: PixelTheme.accent;
-            border-width: PixelTheme.border-width;
-            border-color: PixelTheme.edge;
-            Text {
-                text: root.busy ? "…" : "ABB";
-                color: PixelTheme.on-accent;
-                font-size: 14px;
-                font-weight: 700;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+            source: @image-url("../app-assets/icon-1024.png");
+            image-fit: fill;
+            opacity: root.busy ? 0.6 : 1.0;   // 回合进行中的轻反馈
         }
     }
 }
@@ -3067,7 +3061,8 @@ export component SystemChatWindow inherits Window {
     preferred-height: 560px;
     min-width: 340px;
     min-height: 380px;
-    background: PixelTheme.bg;
+    // 圆角靠根 Rectangle 的两层填充画（外层黑 + 内层面板）；窗口本身透明，否则四角会露白。
+    background: transparent;
 
     in property <[SysChatMsgRow]> messages: [];
     in property <bool> busy: false;
@@ -3091,9 +3086,25 @@ export component SystemChatWindow inherits Window {
     Rectangle {
         width: 100%;
         height: 100%;
-        background: PixelTheme.bg;
+        // 与设置窗同款「外黑 10px 圆角 + 内面板 8px 圆角（内缩 2px）」两层填充 = 2px 描边且贴边
+        //（设置窗注释：border-* 在 Windows 上不跟 border-radius 走，故用两层圆角填充）。
+        // Windows 的角用 Rust 侧 apply_round_window_region 硬裁剪；半径必须同值（WINDOW_CORNER_RADIUS=10）。
+        background: UiTokens.window-frame;
+        border-radius: 10px;
+
+        // 内层面板：内缩 2px、圆角 8px（= 10 − 2）
+        Rectangle {
+            x: 2px;
+            y: 2px;
+            width: parent.width - 4px;
+            height: parent.height - 4px;
+            background: PixelTheme.panel;
+            border-radius: 8px;
+        }
 
         VerticalLayout {
+            // 留 2px 让外层黑描边露出四周（铺满的子元素会把描边盖掉，同设置窗）
+            padding: 2px;
             // 自绘标题栏：native-move（平台拖动，宿主无需 drag-start 接线）+ 隐藏最大化
             // （固定尺寸窗，set_maximized 会与尺寸绑定冲突）。
             PixelTitleBar {
@@ -3102,6 +3113,9 @@ export component SystemChatWindow inherits Window {
                 logo: @image-url("../app-assets/icon-1024.png");
                 native-move: true;
                 show-maximize: false;
+                // 标题栏是贴窗口上边的子元素，直角会盖掉根圆角 → 补等值内圈圆角（10 − 2 = 8）
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
                 close-window => { root.close-window(); }
             }
 
@@ -3129,48 +3143,55 @@ export component SystemChatWindow inherits Window {
             }
 
             // 消息区：贴底滚动；空态给一句引导
+            // 对话内容：**单一内容区**（不是「一轮一个 box」），整体可滚动、新消息滞底。
+            // 用裸 Flickable：ScrollView/PixelScrollPanel/ScrollBar 会给 content-y 加绑定，
+            // 使 Slint 的「越界延迟夹取」失效（见本组件末尾 changed scroll-epoch 的注释）。
+            // content-height 显式取内层列的自然高：不设时 Flickable 会把内容高当成视口高，
+            // 超出一屏的内容被裁且滑不动（owner 2026-10-13「滚动不对」）。
             flick := Flickable {
                 vertical-stretch: 1;
                 content-width: self.width;
-                VerticalBox {
+                content-height: col.preferred-height;
+                col := VerticalBox {
                     width: 100%;
-                    padding: 10px;
-                    spacing: 8px;
+                    padding: 12px;
+                    spacing: 14px;
+                    // 内容不足一屏时靠上排，不把消息拉高。
+                    alignment: start;
                     if root.messages.length == 0: Text {
                         text: "有什么可以帮你？我运行在本机，能直接读写文件、执行命令。";
                         font-size: 12px;
-                        color: PixelTheme.text.with-alpha(0.55);
+                        color: PixelTheme.text.with-alpha(0.5);
                         wrap: word-wrap;
                         width: 100%;
+                        vertical-stretch: 0;
                     }
-                    for m in root.messages: Rectangle {
+                    // 一轮 = 角色名 + 正文（无外框、无底色）——整个对话是一个内容区。
+                    for m in root.messages: VerticalBox {
                         width: 100%;
-                        border-radius: PixelTheme.radius;
-                        background: m.role == "user" ? PixelTheme.hover : transparent;
-                        border-width: m.role == "user" ? 0px : 2px;
-                        border-color: PixelTheme.edge;
-                        VerticalBox {
-                            padding: 8px;
-                            spacing: 3px;
-                            Text {
-                                text: m.role == "user" ? "你" : "ABB";
-                                font-size: 11px;
-                                font-weight: 700;
-                                color: PixelTheme.text.with-alpha(0.55);
-                            }
-                            Text {
-                                text: m.text;
-                                font-size: 13px;
-                                color: PixelTheme.text;
-                                wrap: word-wrap;
-                                width: 100%;
-                            }
+                        vertical-stretch: 0;
+                        spacing: 4px;
+                        Text {
+                            text: m.role == "user" ? "你" : "ABB";
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: m.role == "user"
+                                ? PixelTheme.text.with-alpha(0.5)
+                                : UiTokens.info;
+                        }
+                        Text {
+                            text: m.text;
+                            font-size: 13px;
+                            color: PixelTheme.text;
+                            wrap: word-wrap;
+                            width: 100%;
                         }
                     }
                     if root.busy: Text {
                         text: "ABB 正在处理…";
                         font-size: 12px;
-                        color: UiTokens.text-dim;
+                        color: PixelTheme.dim;
+                        vertical-stretch: 0;
                     }
                 }
             }

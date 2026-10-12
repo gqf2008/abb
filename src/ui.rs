@@ -1791,16 +1791,10 @@ pub fn run_gui() -> Result<()> {
     }
     load_syschat_into(&syschat_win, &syschat_model);
     let bubble = AnchorBubble::new()?;
-    // 气泡位置：恢复上次拖动位置（场景 0）；首次默认位在首个 tick 里算（那时 winit 事件
-    // 循环已活跃，才能拿到主屏尺寸；之前调 with_winit_window 会返回 None）。
-    // 坐标统一用**逻辑像素**：.slint 里气泡宽 56 是逻辑量，而 winit 的 `MonitorHandle::size()`
-    // 是物理像素（Retina 2x 下差 2 倍，混用会把默认位算错/推到屏外）。
-    let bubble_pos_need_default = Rc::new(Cell::new(crate::syschat::load_bubble_pos().is_none()));
-    if let Some(pos) = crate::syschat::load_bubble_pos() {
-        bubble
-            .window()
-            .set_position(slint::LogicalPosition::new(pos.x as f32, pos.y as f32));
-    }
+    // 气泡位置：统一在**事件循环活跃后的首个 tick** 里施加（见 tick）——启动前 set_position 会被
+    // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
+    // 坐标统一用**逻辑像素**（winit 的 MonitorHandle::size() 是物理像素，Retina 下差 2 倍）。
+    let bubble_pos_apply = Rc::new(Cell::new(true));
     // 气泡显示/隐藏：由 config.syschat_bubble 决定（托盘菜单可切换）。默认 true。
     let bubble_on = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
     if bubble_on {
@@ -5231,6 +5225,8 @@ pub fn run_gui() -> Result<()> {
                     w.scale_factor(),
                 )));
             }
+            // Windows：圆角需要 SetWindowRgn 硬裁剪（与设置窗同一半径）；其它平台是空操作。
+            handle_platform_window_event(w, ev);
             EventResult::Propagate
         });
         let pending = bubble_pos_pending.clone();
@@ -5332,7 +5328,7 @@ pub fn run_gui() -> Result<()> {
         });
         let cw2 = syschat_win.as_weak();
         let sw2 = settings.as_weak();
-        syschat_win.window().on_winit_window_event(move |_w, ev| {
+        syschat_win.window().on_winit_window_event(move |w, ev| {
             if matches!(ev, WindowEvent::CloseRequested) {
                 if let Some(w) = cw2.upgrade() {
                     let _ = w.hide();
@@ -5348,6 +5344,8 @@ pub fn run_gui() -> Result<()> {
                     }
                 }
             }
+            // Windows：圆角 SetWindowRgn 硬裁剪（与设置窗同半径）；其它平台空操作。
+            handle_platform_window_event(w, ev);
             EventResult::Propagate
         });
     }
@@ -5384,8 +5382,8 @@ pub fn run_gui() -> Result<()> {
         let bubble_weak = bubble.as_weak();
         let syschat_model_t = syschat_model.clone();
         let syschat_rx_t = syschat_rx;
-        // 气泡首次默认位待算标记（见启动处注释）
-        let bubble_pos_need_default_t = bubble_pos_need_default.clone();
+        // 气泡位置待施加标记（见启动处注释）
+        let bubble_pos_apply_t = bubble_pos_apply.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -5912,28 +5910,31 @@ pub fn run_gui() -> Result<()> {
                     }
                 }
                 // 气泡首次默认位：事件循环活跃后才能拿到主屏尺寸，按**逻辑像素**算（右上角）。
-                if bubble_pos_need_default_t.get() {
+                // 气泡位置（首个 tick，事件循环活跃后）：优先进上次保存的位置，没有则按**逻辑屏宽**算
+                // 右上默认位。启动前 set_position 会被 macOS 窗口级联覆盖，所以放到这里统一施加。
+                if bubble_pos_apply_t.get() {
                     if let Some(b) = bubble_weak.upgrade() {
                         if b.window().is_visible() {
                             use slint::winit_030::WinitWindowAccessor;
-                            let pos = b
-                                .window()
-                                .with_winit_window(|w| {
-                                    w.primary_monitor().map(|m| {
-                                        let sz = m.size().to_logical::<f32>(m.scale_factor());
-                                        crate::syschat::BubblePos {
-                                            x: sz.width as i32 - 56 - 16,
-                                            y: 120,
-                                        }
+                            let pos = crate::syschat::load_bubble_pos().or_else(|| {
+                                b.window()
+                                    .with_winit_window(|w| {
+                                        w.primary_monitor().map(|m| {
+                                            let sz = m.size().to_logical::<f32>(m.scale_factor());
+                                            crate::syschat::BubblePos {
+                                                x: sz.width as i32 - 36 - 16,
+                                                y: 120,
+                                            }
+                                        })
                                     })
-                                })
-                                .flatten();
+                                    .flatten()
+                            });
                             if let Some(p) = pos {
                                 b.window().set_position(slint::LogicalPosition::new(
                                     p.x as f32,
                                     p.y as f32,
                                 ));
-                                bubble_pos_need_default_t.set(false);
+                                bubble_pos_apply_t.set(false);
                             }
                         }
                     }
