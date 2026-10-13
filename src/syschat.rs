@@ -224,6 +224,12 @@ impl SessionStore {
             .map(|s| s.provider)
             .unwrap_or_default()
     }
+
+    /// 历史独占锁（路径 = `base/history.lock`，故测试用临时 base 不会碰真实数据目录）。
+    fn lock(&self) -> Result<HistoryLock, String> {
+        HistoryLock::acquire(&self.base.join("history.lock"))
+            .map_err(|e| format!("锁定对话历史失败：{e}"))
+    }
 }
 
 /// 会话 id 白名单：`[A-Za-z0-9_-]`、非空、≤ 64 字节（与 [`new_session_id`] 生成口径一致）。
@@ -257,21 +263,26 @@ fn derive_title(text: &str) -> String {
 
 /// 当前会话 id（必要时创建会话并迁移旧历史）。GUI 发消息前调一次即可。
 pub fn current_session() -> String {
-    let _g = HistoryLock::acquire().ok();
-    SessionStore::production().list().1
+    let store = SessionStore::production();
+    let _g = store.lock().ok();
+    store.list().1
 }
 
 /// 会话列表（`updated_at` 倒序）+ 当前会话 id。
+///
+/// 注意：这是**读**入口，锁为尽力而为（拿不到就按当前快照返回）；真正的写入口
+/// （[`new_session`] / [`switch_session`] / [`set_session_provider`] / [`turn`]）一律严格锁。
 pub fn session_list() -> (Vec<SessionMeta>, String) {
-    let _g = HistoryLock::acquire().ok();
-    SessionStore::production().list()
+    let store = SessionStore::production();
+    let _g = store.lock().ok();
+    store.list()
 }
 
 /// 新建会话并置为当前；`provider` 为空时沿用当前会话的模型选择。
 /// 返回新会话 id（拿不到历史锁时返回可重试错误——不静默降级）。
 pub fn new_session(provider: Option<&str>) -> Result<String, String> {
-    let _g = lock_strict()?;
     let store = SessionStore::production();
+    let _g = store.lock()?;
     let mut state = store.load();
     store.ensure_current(&mut state);
     let provider = match provider {
@@ -301,8 +312,8 @@ pub fn new_session(provider: Option<&str>) -> Result<String, String> {
 
 /// 切到指定会话（不存在则忽略）。
 pub fn switch_session(id: &str) -> Result<(), String> {
-    let _g = lock_strict()?;
     let store = SessionStore::production();
+    let _g = store.lock()?;
     let mut state = store.load();
     store.ensure_current(&mut state);
     if state.sessions.iter().any(|s| s.id == id) {
@@ -316,8 +327,8 @@ pub fn switch_session(id: &str) -> Result<(), String> {
 
 /// 设置某会话使用的供应商（「模型选择」落盘）。
 pub fn set_session_provider(id: &str, provider: &str) -> Result<(), String> {
-    let _g = lock_strict()?;
     let store = SessionStore::production();
+    let _g = store.lock()?;
     let mut state = store.load();
     store.ensure_current(&mut state);
     if let Some(s) = state.sessions.iter_mut().find(|s| s.id == id) {
@@ -395,18 +406,21 @@ struct HistoryLock {
 }
 
 impl HistoryLock {
-    fn acquire() -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir())?;
-        let lock_path = dir().join("history.lock");
+    /// `lock_path` 由调用方给（= store 的 base 下的 `history.lock`）：生产走 `~/.agent-bridge/syschat/`，
+    /// 测试走临时 base ⇒ 单测不会把锁文件写进隔离 HOME（否则 `tools/check_test_isolation.sh` 会红）。
+    fn acquire(lock_path: &std::path::Path) -> std::io::Result<Self> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(&lock_path)?;
+            .open(lock_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600));
         }
         use fs2::FileExt;
         match file.try_lock_exclusive() {
@@ -430,12 +444,6 @@ impl Drop for HistoryLock {
     }
 }
 
-/// 严格拿历史独占锁：拿不到就返回可重试错误，**不静默降级**（见 [`HistoryLock`] 文档）。
-/// 所有对 sessions.json 的读-改-写入口都必须经它。
-fn lock_strict() -> Result<HistoryLock, String> {
-    HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))
-}
-
 /// 读**当前会话**的历史（GUI 用）。
 pub fn load_history() -> Vec<Turn> {
     let id = current_session();
@@ -450,8 +458,11 @@ pub fn clear_history() -> std::io::Result<()> {
 
 /// 清空指定会话的历史。
 pub fn clear_session(id: &str) -> std::io::Result<()> {
-    let _guard = HistoryLock::acquire()?;
-    match std::fs::remove_file(SessionStore::production().history_path(id)) {
+    let store = SessionStore::production();
+    let _guard = store
+        .lock()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    match std::fs::remove_file(store.history_path(id)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -584,7 +595,7 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     // 解析当前会话 + 该会话的模型选择（短临界区）。首次建库**立即落盘**——否则临界区
     // 重新 load 时 state 为空、标题更新落空，本轮会落在孤立的 sessions/<id>.jsonl（评审 N1）。
     let (session_id, provider) = {
-        let _g = lock_strict()?;
+        let _g = store.lock()?;
         let mut state = store.load();
         if store.ensure_current(&mut state) {
             store
@@ -627,7 +638,7 @@ async fn turn_core(
     // 临界区 1：读该会话历史拼 prompt + 落用户轮 + 刷新标题/时间。先落用户轮是为了：
     // 即使回合失败，用户说过的话也不该丢（下次重开对话框仍能看到自己的提问）。
     let prompt = {
-        let _g = lock_strict()?;
+        let _g = store.lock()?;
         let history = store.read_history(session_id);
         let prompt = build_prompt(&history, text);
         let now = crate::chrono_lite::unix_secs() as i64;
@@ -656,7 +667,7 @@ async fn turn_core(
 
     // 临界区 2：落助手轮 + 刷新会话时间。
     {
-        let _g = lock_strict()?;
+        let _g = store.lock()?;
         let now = crate::chrono_lite::unix_secs() as i64;
         store
             .append_turns(
@@ -1024,6 +1035,43 @@ mod tests {
             list.iter().find(|s| s.id == s1).unwrap().title,
             "probe-one",
             "会话标题应取首条用户消息"
+        );
+
+        // **读路径承重**：再各问一轮 → prompt 里必须带**自己**的历史、不带对方的（
+        // 否则 `read_history` 按固定 id / 错会话拿到历史也能让上面的断言全绿）。
+        let r1b = turn_core(
+            &store,
+            &s1,
+            mock_agent_cfg(&rec("abb-sc-t3")),
+            ws.clone(),
+            "again-one",
+        )
+        .await
+        .unwrap();
+        assert!(
+            r1b.contains("probe-one"),
+            "s1 第二轮须读到自己第一轮的历史：{r1b}"
+        );
+        assert!(
+            !r1b.contains("probe-two"),
+            "s1 第二轮不得读到 s2 的历史：{r1b}"
+        );
+        let r2b = turn_core(
+            &store,
+            &s2,
+            mock_agent_cfg(&rec("abb-sc-t4")),
+            ws.clone(),
+            "again-two",
+        )
+        .await
+        .unwrap();
+        assert!(
+            r2b.contains("probe-two"),
+            "s2 第二轮须读到自己第一轮的历史：{r2b}"
+        );
+        assert!(
+            !r2b.contains("probe-one"),
+            "s2 第二轮不得读到 s1 的历史：{r2b}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
