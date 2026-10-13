@@ -303,6 +303,14 @@ fn read_csv(path: &Path, base: &Path, what: &str) -> Result<Table, RenderError> 
 /// **实现约束**：`starts_with` 的两侧**都必须是 `canonicalize` 的产物**（`/etc` → `/private/etc`
 /// 这类挂载映射、软链、`..` 都在这一步归一到真实路径）。谁把某一边换成未 canonicalize 的路径，
 /// 这个前缀判定立刻失效。
+///
+/// **已知平台限制（Windows，未实测）**：`std::fs::canonicalize` 在 Windows 上对**长路径**返回
+/// verbatim 形态（`\\?\C:\…`）。本函数的前提是 `base` 由调用方（主程序）**规范化过一次**再传进来
+/// （`--spec` 的目录同理），此时两侧形态一致；若出现「同一目录、一侧带前缀一侧不带」，比较会
+/// **不再相等（拒绝，方向是安全的 fail-closed）**，代价是可能误拒一个合法路径。
+/// 这与本仓既有做法一致（`src/task_store.rs` 挡 symlink 逃逸用的也是朴素 `canonicalize` +
+/// `starts_with`，全仓没有引入 `dunce` 之类的路径规范化依赖），且新增的 `abb-chart-windows`
+/// CI job 就是暴露这条差异的机器判据（本机 macOS 无法复现 verbatim 形态）。
 /// 需要用别处的数据时走**命令行 `--data`**（它在命令行上、闸门看得见；受限会话里工作区外的
 /// 绝对路径会被 guard 拒绝，owner 不受限）——即「能力没被拿掉，只是换了个闸门看得见的位置」。
 pub fn resolve_in_dir(raw: &str, base: &Path, what: &str) -> Result<PathBuf, RenderError> {
