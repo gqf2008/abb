@@ -777,6 +777,214 @@ pub fn save_bubble_pos(pos: BubblePos) {
     }
 }
 
+// ──────────────── D2 批：标题栏控件条（稿 ①②③）的落位几何（纯函数）───────────────
+//
+// 稿把 ①会话下拉 / ②模型下拉 / ③⚙设置 放在**标题栏**里；而 slint-pixel 的 `PixelTitleBar`
+// 是封闭组件（不能塞子元素），所以这三件套改为在根 Rectangle 里、VerticalLayout **之后**
+// 叠一条 HorizontalBox（后画 = 上层），靠右贴窗口按钮组左侧。本组函数只算「摆在哪、多宽、
+// 放不下时换哪一档」，画由 `ui/app.slint` 负责——这样算术可单测、观感可截图核对。
+
+/// 系统对话窗的初始逻辑宽（= `ui/app.slint` 的 `preferred-width`）。
+/// 用途：窗口还没 realize（`Window::size()` 给 0）时算计划的兜底宽度。
+pub const SYSCHAT_PREFERRED_WIDTH: f32 = 460.0;
+
+/// 消息区正文块的可用宽相对**窗宽**要扣掉的全部内边距（D2「消息区底部文字重叠」修复用）。
+///
+/// 构成：根 Rectangle 的 layout padding 4（2×2）+ `col` 的 padding 24（12×2）+ 每个块自己的
+/// layout padding 16（std-widgets 的 HorizontalBox/VerticalBox 默认 8×2，见
+/// `LESSON_...默认 padding 挤爆行高`）。运行时由 [`crate::ui::apply_syschat_layout`] 写进
+/// `SystemChatWindow.convo-text-width`；`.slint` 里各处在这个基准上再扣自己的额外内边距。
+pub const CONVO_BLOCK_TEXT_INSET: f32 = 44.0;
+
+/// `convo-text-width` 的下限：窗口被压到极窄时也别把正文宽度算成 0（宽度 0 会让所有文本各占一行，
+/// 估高变成天文数字）。
+pub const CONVO_TEXT_WIDTH_MIN: f32 = 120.0;
+
+/// 窗口按钮**单颗**宽（slint-pixel 0.3.0 `ui/pixel_painter_widget.slint` 的 `TitleButton`）。
+const TB_BTN_W: f32 = 30.0;
+/// 窗口按钮之间的间距（同上）。
+const TB_BTN_GAP: f32 = 6.0;
+/// 窗口按钮组右缘到窗口右缘的距离（同上，`HorizontalLayout` 宽 102px 贴 `parent.width - 106px`）。
+const TB_BTN_RIGHT_PAD: f32 = 4.0;
+/// 本窗实际画的窗口按钮数：`show-maximize: false` ⇒ 只有 min 与 close。
+/// **改这里必须同时改那条 `show-maximize`**（单测 `titlebar_plan_reserves_room_for_all_buttons`
+/// 用 3 颗按钮的形态锁住「换回最大化也得让位」的口径）。
+const TB_BTN_COUNT: f32 = 2.0;
+/// 控件条右缘与最左侧那颗窗口按钮之间的最小间隔（不许贴脸）。
+const TB_STRIP_GAP: f32 = 8.0;
+/// 标题文字右缘估算：`PixelTitleBar` 里标题 `x: 40px`，"ABB · 系统对话" 13px 粗体 ≈ 92px。
+const TB_TITLE_END: f32 = 132.0;
+/// 控件条左缘与标题文字之间的最小间隔。
+const TB_TITLE_GAP: f32 = 8.0;
+/// 会话 chip 宽：PixelMenu 内部 `Text { x: 10px; width: parent.width - 36px }` ⇒
+/// 84px 给文案 48px（13px 字号 ≈ 3 个全宽字 = "新会话" 刚好放全）。
+const TB_SESSION_W: f32 = 84.0;
+/// 模型 chip 理想宽：112px 给文案 76px（≈ 11 个半宽字符，"deepseek-chat" 需 13 个 ⇒ 末尾省略）。
+/// 参照稿本身：`chipbtn` 是 `max-width:150px` + `text-overflow:ellipsis`，且稿的 478px 标题栏
+/// 里两个 chip 被 flex 压到 ~117px——即稿也承认这两个 chip 会省略号，不是「必须全显」。
+const TB_MODEL_W: f32 = 112.0;
+/// 模型 chip 下限：再窄连 6 个半宽字符都放不下，不如让位（见 `titlebar_plan` 的换档）。
+const TB_MODEL_W_MIN: f32 = 88.0;
+/// ③ ⚙ 方钮（26×26，同稿 `.tb-btn`）。
+const TB_SETTINGS_W: f32 = 26.0;
+/// 控件条内各项间距（同稿 `.titlebar` 的 `gap: 6px`）。
+const TB_ITEM_GAP: f32 = 6.0;
+
+/// chip 内文案可用宽 = chip 宽 − 内边距（PixelMenu：左 10px + 右侧箭头区 26px）。
+const TB_CHIP_TEXT_INSET: f32 = 36.0;
+/// 13px 粗体（PixelMenu 的 `button-text`）下单个**半宽**字符的估宽（全宽字符按 2 倍算）。
+/// 取整偏保守（真值约 6.3–6.9），宁可早一个字符加省略号也不要溢出 chip。
+const TB_HALF_CHAR_W: f32 = 7.0;
+
+/// 标题栏控件条的落位计划（逻辑像素，相对窗口左上角）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TitlebarPlan {
+    /// 整条左缘；**< 0 = 空档塞不下任何一项，整条不画**。
+    pub x: f32,
+    /// ①会话 chip 宽（0 = 不画）。
+    pub session_w: f32,
+    /// ②模型 chip 宽（0 = 不画；模型列表为空时调用方也传 `has_model=false`）。
+    pub model_w: f32,
+    /// ③⚙ 方钮宽（0 = 不画）。
+    pub settings_w: f32,
+}
+
+/// 算出标题栏控件条该摆在哪、各项多宽（纯函数，口径钉在单测里）。
+///
+/// 空档 = 窗口宽 − 右侧「窗口按钮组 + 间隔」− 左侧「标题文字 + 间隔」。
+/// 换档顺序按「能力可替代性」：会话下拉**只有**这一个入口（输入区 `＋` 只新建）⇒ 最后才让位；
+/// ⚙设置 在托盘菜单里有等价入口 ⇒ 第一个让位；模型下拉居中（稿里的高亮项，尽量留）。
+/// 具体：①三件套（模型理想宽）→ ②压缩模型宽（下限 `TB_MODEL_W_MIN`）→ ③让出 ⚙ →
+/// ④只留会话 chip → ⑤什么都不画（`x = -1`）。
+pub fn titlebar_plan(window_w: f32, has_model: bool) -> TitlebarPlan {
+    let buttons_left =
+        window_w - TB_BTN_RIGHT_PAD - TB_BTN_COUNT * TB_BTN_W - (TB_BTN_COUNT - 1.0) * TB_BTN_GAP;
+    let right_limit = buttons_left - TB_STRIP_GAP;
+    let left_limit = TB_TITLE_END + TB_TITLE_GAP;
+    let avail = right_limit - left_limit;
+
+    let none = TitlebarPlan {
+        x: -1.0,
+        session_w: 0.0,
+        model_w: 0.0,
+        settings_w: 0.0,
+    };
+    // 只留会话 chip（⚙ 与模型都放不下时的兜底；会话切换没有第二个入口）。
+    if avail < TB_SESSION_W {
+        return none;
+    }
+    let model_room = |w: f32| -> Option<f32> {
+        // 用模型上限去夹：下限都放不下就返回 None（调用方换下一档）。
+        (w >= TB_MODEL_W_MIN).then(|| w.min(TB_MODEL_W))
+    };
+    // 三件套（含 ⚙）。
+    let with_all = avail - TB_SESSION_W - TB_SETTINGS_W - 2.0 * TB_ITEM_GAP;
+    if has_model {
+        if let Some(model_w) = model_room(with_all) {
+            return TitlebarPlan {
+                x: right_limit - (TB_SESSION_W + model_w + TB_SETTINGS_W + 2.0 * TB_ITEM_GAP),
+                session_w: TB_SESSION_W,
+                model_w,
+                settings_w: TB_SETTINGS_W,
+            };
+        }
+    }
+    // 让出 ⚙（托盘菜单里有「设置…」等价入口）；模型仍留。
+    let without_settings = avail - TB_SESSION_W - TB_ITEM_GAP;
+    if has_model {
+        if let Some(model_w) = model_room(without_settings) {
+            return TitlebarPlan {
+                x: right_limit - (TB_SESSION_W + model_w + TB_ITEM_GAP),
+                session_w: TB_SESSION_W,
+                model_w,
+                settings_w: 0.0,
+            };
+        }
+    }
+    // 只剩会话 chip（+ 有地方就再塞 ⚙，两者都放不下时以会话为先）。
+    let with_settings = TB_SESSION_W + TB_ITEM_GAP + TB_SETTINGS_W;
+    let settings_w = if with_settings <= avail {
+        TB_SETTINGS_W
+    } else {
+        0.0
+    };
+    let total = TB_SESSION_W
+        + if settings_w > 0.0 {
+            TB_ITEM_GAP + settings_w
+        } else {
+            0.0
+        };
+    TitlebarPlan {
+        x: right_limit - total,
+        session_w: TB_SESSION_W,
+        model_w: 0.0,
+        settings_w,
+    }
+}
+
+/// 把 chip 文案按可用宽截断（放不下时末尾加 `…`）。
+///
+/// 为什么在 Rust 侧截断而不是靠 Slint 的 `overflow: elide`：`PixelMenu` 的内部 Text 是**上游组件
+/// 的私有实现**（没有 elide 绑定），长会话标题（`derive_title` 可到 24 字）会直接画出 chip 外、
+/// 压到隔壁控件——正是本轮要修的「互相压住」。全宽/半宽按 `TB_HALF_CHAR_W` 估算：
+/// 只是**显示**截断，宁短勿长。
+pub fn fit_chip_label(label: &str, chip_w: f32) -> String {
+    let budget = chip_w - TB_CHIP_TEXT_INSET - 2.0; // 再留 2px 让描边不顶字
+    if budget <= 0.0 {
+        return String::new();
+    }
+    // 连省略号那一格都放不下：宁可空着，也不要截出一个比可用宽还长的「…」
+    // （本仓教训：截断类函数的输出必须真的落在预算内，见单测里的逐档估宽断言）。
+    if budget < TB_HALF_CHAR_W {
+        return String::new();
+    }
+    let width = |c: char| -> f32 {
+        // CJK/全角标点等按 2 个半宽算；其余（含 ASCII、拉丁字母）按 1 个。（`char::width` 需要
+        // 额外 crate，这里用「是否是宽字符」的保守判据：CJK 区段 + 全角形式。）
+        if is_wide_char(c) {
+            TB_HALF_CHAR_W * 2.0
+        } else {
+            TB_HALF_CHAR_W
+        }
+    };
+    let total: f32 = label.chars().map(width).sum();
+    if total <= budget {
+        return label.to_string();
+    }
+    // 省略号自身也占一格；逐字累加到放不下为止。
+    let mut out = String::new();
+    let mut used = 0.0;
+    for c in label.chars() {
+        let w = width(c);
+        if used + w > budget - TB_HALF_CHAR_W {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// 宽字符判据（CJK 与全角形式区）。只用于**估宽**，不要求覆盖 Unicode 全部宽字符：
+/// 漏判只是把某个字符估窄了 7px（可能少截一个字），不会越界画出去——保守方向由
+/// `budget` 里的 2px 余量与「宁短勿长」的截断口径兜住。
+fn is_wide_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F        // 韩文字母
+        | 0x2E80..=0x303E      // CJK 部首 / 标点
+        | 0x3041..=0x33FF      // 日文假名 / CJK 兼容
+        | 0x3400..=0x4DBF      // CJK 扩展 A
+        | 0x4E00..=0x9FFF      // CJK 基本区
+        | 0xA000..=0xA4CF      // 彝文
+        | 0xAC00..=0xD7A3      // 韩文音节
+        | 0xF900..=0xFAFF      // CJK 兼容表意
+        | 0xFE30..=0xFE6F      // CJK 兼容形式
+        | 0xFF00..=0xFF60      // 全角形式
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD) // CJK 扩展 B+
+}
+
 // ─────────────────── D 批：对话框锚定气泡的几何（纯函数）───────────────────
 
 /// 气泡与对话框之间的间距（逻辑像素，稿 `.gap` = 10px）。
@@ -2333,5 +2541,240 @@ mod tests {
         assert_eq!(x, -100 - BUBBLE_GAP - 460, "左侧放得下就用左侧");
         assert_eq!((-100) - (x + 460), BUBBLE_GAP);
         assert_eq!(y, 100);
+    }
+
+    // ─────────── D2：标题栏控件条（稿 ①②③）的落位 ───────────
+
+    /// 控件条右缘必须停在**最左侧那颗真实窗口按钮**左边 ≥8px，且这条断言真的在盯按钮组几何。
+    ///
+    /// 判别力（负向，两个方向）：
+    /// 1. 把 `TB_STRIP_GAP` / 控件宽度改成别的值 ⇒ 期望值不变 ⇒ 必红；
+    /// 2. 把 `TB_BTN_COUNT` 当成 3（= 打开最大化）去验 ⇒ **当前计划必须不够**，
+    ///    这正是「换回最大化就得同步改 `TB_BTN_COUNT`」的机器化表述；配对的源码守卫见
+    ///    [`Self::titlebar_plan_button_count_matches_show_maximize`]。
+    #[test]
+    fn titlebar_plan_reserves_room_for_all_buttons() {
+        let plan = titlebar_plan(460.0, true);
+        let total = plan.session_w
+            + plan.model_w
+            + plan.settings_w
+            + if plan.model_w > 0.0 { TB_ITEM_GAP } else { 0.0 }
+            + if plan.settings_w > 0.0 && plan.session_w > 0.0 {
+                TB_ITEM_GAP
+            } else {
+                0.0
+            };
+        let strip_right = plan.x + total;
+        // 窗口按钮组几何（slint-pixel 写死、不引用被验常量）：单颗 30、间距 6、右边距 4
+        let buttons_left = 460.0 - 4.0 - TB_BTN_COUNT * 30.0 - (TB_BTN_COUNT - 1.0) * 6.0;
+        assert!(
+            strip_right <= buttons_left - 8.0 + 0.01,
+            "控件条右缘 {strip_right} 越过按钮组左侧 {buttons_left}（间隔应 ≥8）"
+        );
+        // 反向哨兵：三颗按钮（最大化可见）时窗口按钮更靠左，当前计划必须不够——若这里过了，
+        // 说明 `strip_right`/`buttons_left` 算错了，上面那条断言也就没在盯按钮组。
+        let three_left = 460.0 - 4.0 - 3.0 * 30.0 - 2.0 * 6.0;
+        assert!(
+            strip_right > three_left - 8.0,
+            "反向哨兵失败：三颗按钮时也不越界 ⇒ 本断言的几何算错了"
+        );
+        assert!(buttons_left >= 0.0 && plan.x >= 0.0);
+    }
+
+    /// `TB_BTN_COUNT` 必须与 `ui/app.slint` 里 `SystemChatWindow` 的 `show-maximize` 一致
+    /// （跨文件不变量；源码扫描，同 `ui::tests::app_theme_applies_slint_pixel_soft_preset` 手法）。
+    /// 一旦有人打开最大化：窗口按钮组多一颗 30px 按钮，`TB_BTN_COUNT` 必须跟着改成 3，否则
+    /// 控件条会压到最大化按钮上。PixelTitleBar 的默认值是 `true`（三颗）。
+    #[test]
+    fn titlebar_plan_button_count_matches_show_maximize() {
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let start = raw
+            .find("export component SystemChatWindow")
+            .expect("ui/app.slint 里找不到 SystemChatWindow");
+        let tail = &raw[start..];
+        let end = tail
+            .find("export component")
+            .map(|i| {
+                if i == 0 {
+                    tail[1..]
+                        .find("export component")
+                        .map(|j| j + 1)
+                        .unwrap_or(tail.len())
+                } else {
+                    i
+                }
+            })
+            .unwrap_or(tail.len());
+        let win = &tail[..end];
+        assert!(
+            win.contains("PixelTitleBar"),
+            "SystemChatWindow 应画自绘标题栏"
+        );
+        let maximize_off = win.lines().any(|l| {
+            let code = l.split("//").next().unwrap_or(l);
+            code.contains("show-maximize: false")
+        });
+        let expected = if maximize_off { 2.0 } else { 3.0 };
+        assert_eq!(
+            TB_BTN_COUNT, expected,
+            "TB_BTN_COUNT 与 ui/app.slint 的 show-maximize 不一致（最大化关闭时 2 颗、打开时 3 颗）"
+        );
+    }
+
+    /// 460px（默认窗宽）下三件套全上，且总宽正好吃掉空档里的可用宽度。
+    #[test]
+    fn titlebar_plan_fits_all_three_at_default_width() {
+        let p = titlebar_plan(SYSCHAT_PREFERRED_WIDTH, true);
+        assert_eq!(
+            (p.session_w, p.model_w, p.settings_w),
+            (TB_SESSION_W, TB_MODEL_W, TB_SETTINGS_W)
+        );
+        // 左缘必须在标题文字预留（132 + 8）右边。
+        assert!(
+            p.x >= TB_TITLE_END + TB_TITLE_GAP,
+            "x={} 会压到标题文字",
+            p.x
+        );
+        // 右缘正好贴「按钮组左侧 − 8」：期望值用字面量算（不引用 TB_*），
+        // 这样改 `TB_STRIP_GAP` / 控件宽度都会被本用例抳住。
+        let buttons_left = 460.0 - 4.0 - 2.0 * 30.0 - 6.0;
+        assert_eq!(
+            p.x + TB_SESSION_W + TB_ITEM_GAP + TB_MODEL_W + TB_ITEM_GAP + TB_SETTINGS_W,
+            buttons_left - 8.0
+        );
+    }
+
+    /// 窗口变窄时按「能力可替代性」换档：先压模型、再让 ⚙、最后只剩会话 chip；
+    /// **任何一档都不许把三项摆到标题文字或窗口按钮上**（逐档校验不重叠）。
+    #[test]
+    fn titlebar_plan_degrades_without_overlapping() {
+        // 每个宽度上：各档都不得越界，且宽度单调不减。
+        let mut prev_total = f32::MAX;
+        for w in [
+            460.0, 440.0, 420.0, 400.0, 380.0, 360.0, 340.0, 300.0, 240.0, 200.0, 100.0,
+        ] {
+            let p = titlebar_plan(w, true);
+            let total = if p.x < 0.0 {
+                0.0
+            } else {
+                p.session_w
+                    + p.model_w
+                    + p.settings_w
+                    + if p.model_w > 0.0 { TB_ITEM_GAP } else { 0.0 }
+                    + if p.settings_w > 0.0 && (p.session_w > 0.0 || p.model_w > 0.0) {
+                        TB_ITEM_GAP
+                    } else {
+                        0.0
+                    }
+            };
+            assert!(
+                total <= prev_total + 0.01,
+                "w={w}: 档位宽度应随窗宽变窄而非变宽（{total} > {prev_total}）"
+            );
+            prev_total = total;
+            if p.x < 0.0 {
+                assert_eq!(total, 0.0, "w={w}: x<0 即整条不画");
+                continue;
+            }
+            let buttons_left = w - TB_BTN_RIGHT_PAD - 2.0 * TB_BTN_W - TB_BTN_GAP;
+            assert!(
+                p.x + total <= buttons_left - TB_STRIP_GAP + 0.01,
+                "w={w}: 压到窗口按钮"
+            );
+            assert!(
+                p.x >= TB_TITLE_END + TB_TITLE_GAP - 0.01,
+                "w={w}: 压到标题文字"
+            );
+            if p.model_w > 0.0 {
+                // 字面量上下界（不引用被验常量）：模型 chip 宽必须落在 88..=112
+                assert!(
+                    (88.0..=112.0).contains(&p.model_w),
+                    "w={w}: 模型 chip 宽越界 {}",
+                    p.model_w
+                );
+            }
+            // 会话 chip 宽是固定档（字面量 84），不随窗宽伸缩
+            assert!(
+                p.session_w == 0.0 || p.session_w == 84.0,
+                "w={w}: 会话 chip 只按整档开合，实测 {}",
+                p.session_w
+            );
+        }
+    }
+
+    /// 会话 chip 是**最后**才让位的（输入区 `＋` 只新建、托盘菜单也不给会话切换 ⇒ 没有等价入口）。
+    /// 在「三件套放不下、会话单独放得下」的窄窗上，会话 chip 必须在。
+    #[test]
+    fn titlebar_plan_keeps_session_chip_longest() {
+        // 380px 窗：空档 162px ⇒ 三件套放不下，会话 + ⚙（116px）放得下；模型连 88px 都挤不出。
+        let p = titlebar_plan(380.0, true);
+        assert_eq!(p.session_w, TB_SESSION_W, "会话 chip 不该先让位");
+        assert_eq!((p.model_w, p.settings_w), (0.0, TB_SETTINGS_W));
+        // 320px 窗：空档 102px ⇒ 连 ⚙ 也放不下，会话 chip 佐在。
+        let q = titlebar_plan(320.0, true);
+        assert_eq!(
+            (q.session_w, q.model_w, q.settings_w),
+            (TB_SESSION_W, 0.0, 0.0)
+        );
+        // 连会话 chip 都放不下的极窄窗：整条不画（x < 0）。
+        let tiny = titlebar_plan(300.0, true);
+        assert!(
+            tiny.x < 0.0 && tiny.session_w == 0.0 && tiny.model_w == 0.0 && tiny.settings_w == 0.0
+        );
+    }
+
+    /// 没配任何「供应商 → 模型」（下拉无可选项）时，模型 chip 不占位，其余照摆。
+    #[test]
+    fn titlebar_plan_without_models_leaves_no_gap_for_model_chip() {
+        let p = titlebar_plan(SYSCHAT_PREFERRED_WIDTH, false);
+        assert_eq!(
+            (p.session_w, p.model_w, p.settings_w),
+            (TB_SESSION_W, 0.0, TB_SETTINGS_W)
+        );
+        let buttons_left = SYSCHAT_PREFERRED_WIDTH - TB_BTN_RIGHT_PAD - 2.0 * TB_BTN_W - TB_BTN_GAP;
+        assert_eq!(
+            p.x + TB_SESSION_W + TB_ITEM_GAP + TB_SETTINGS_W,
+            buttons_left - TB_STRIP_GAP
+        );
+    }
+
+    /// 文案截断：放得下原样返回；放不下以省略号收尾且**绝不超过 chip 内可用宽**。
+    #[test]
+    fn fit_chip_label_truncates_within_budget() {
+        // 3 个全宽字（新会话）在 84px chip 里放得下（可用 46px ≥ 42）。
+        assert_eq!(fit_chip_label("新会话", 84.0), "新会话");
+        // 24 字标题（derive_title 上限）必被截断，且带省略号。
+        let long = "把架构图做成网页并配上说明文档再打包发给同事";
+        let cut = fit_chip_label(long, 84.0);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.chars().count() < long.chars().count());
+        // 逐档校验：截断结果的估算宽 ≤ 预算（保守：宁少一个字）。
+        for w in [84.0_f32, 112.0, 60.0, 40.0] {
+            let s = fit_chip_label(long, w);
+            let est: f32 = s
+                .chars()
+                .map(|c| if is_wide_char(c) { 14.0 } else { 7.0 })
+                .sum();
+            assert!(
+                est <= (w - 36.0).max(0.0),
+                "w={w}: 截断后 {s:?} 估宽 {est} 超出可用空档"
+            );
+        }
+        // 连一个字符都放不下：返回空串（上层 chip 宽为 0 时本就不画，这里是防御）。
+        assert_eq!(fit_chip_label("新会话", 30.0), "");
+        // ASCII："deepseek-chat"（13 半宽 = 91px）在 112px chip（可用 74px）里被截断。
+        let m = fit_chip_label("deepseek-chat", 112.0);
+        assert!(m.ends_with('…') && m.len() < "deepseek-chat".len(), "{m}");
+    }
+
+    /// 宽字符判据的边界：CJK/全角算宽，ASCII/拉丁/希腊算窄（用于估宽方向正确性）。
+    #[test]
+    fn is_wide_char_covers_cjk_and_fullwidth() {
+        for c in ['新', '会', '话', '，', '：', '（', 'あ', '한'] {
+            assert!(is_wide_char(c), "{c} 应算全宽");
+        }
+        for c in ['A', 'z', '0', '-', '…', 'é'] {
+            assert!(!is_wide_char(c), "{c} 应算半宽");
+        }
     }
 }

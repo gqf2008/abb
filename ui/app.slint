@@ -8,7 +8,7 @@
 import { LineEdit, ComboBox, Button, CheckBox, ScrollView, VerticalBox, HorizontalBox, GridBox, ListView, Palette } from "std-widgets.slint";
 // 视觉改造（像素风）：slint-pixel 组件库。试点从环境配置页开始（PixelButton/
 // PixelScrollPanel），推广后逐步移除 std 控件。
-import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelPresets, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
+import { PixelBadge, PixelButton, PixelCard, PixelCheckBox, PixelComboBox, PixelMenu, PixelPresets, PixelScrollPanel, PixelSelect, PixelTabs, PixelTextArea, PixelTextInput, PixelTheme, PixelTitleBar, PixelWindowResize } from "@slint_pixel";
 
 // 托盘菜单里逐 bot 状态行：文字 + 状态小圆点图标（后端会转成 muda::IconMenuItem）。
 // ═══════════ 设计令牌（UI/UX 审查）：语义色集中定义，替换全部硬编码彩色 ═══════════
@@ -3107,8 +3107,65 @@ export component AnchorBubble inherits Window {
     }
 }
 
+// 齿轮字形（Path 手绘；见 `TitlebarIconButton` 的注释为什么不用 SVG/字形）
+component GearGlyph inherits Rectangle {
+    in property <brush> tint: PixelTheme.text;
+    width: 16px;
+    height: 16px;
+    Path {
+        width: 100%;
+        height: 100%;
+        stroke: root.tint;
+        stroke-width: 1.4px;
+        fill: transparent;
+        // 两段半弧拼成整圆（8,4.8)→(8,11.2) 右半 + 回程左半；3.2 = 半径。
+        commands: "M 8 4.8 A 3.2 3.2 0 0 1 8 11.2 A 3.2 3.2 0 0 1 8 4.8 Z";
+    }
+    Path {
+        width: 100%;
+        height: 100%;
+        stroke: root.tint;
+        stroke-width: 1.5px;
+        fill: transparent;
+        commands: "M 8 0.8 L 8 3.4 M 8 12.6 L 8 15.2 M 0.8 8 L 3.4 8 M 12.6 8 L 15.2 8 M 2.9 2.9 L 4.7 4.7 M 11.3 11.3 L 13.1 13.1 M 13.1 2.9 L 11.3 4.7 M 4.7 11.3 L 2.9 13.1";
+    }
+}
+
+
+// 标题栏图标钮（D2 稿 ③ ⚙设置 / `.tb-btn`）：26×26、2px 墨黑描边、hover 暖底。
+// 图标为什么是 **Path** 而不是 `ImageIcon` + SVG：① 字形（`icon: string`）在本机字体对 ⚙ 这类
+// 符号覆盖不可靠（排版审计 4656a34 踩过「⚠️ 渲染成空心方框」）；② SVG 靠图片解码器，
+// Slint 的软件渲染后端（`SLINT_BACKEND=winit-software` 兜底排查路径）没有 SVG 解码器，
+// 会把 0×0 图像喂给 `draw_image_impl` 直接 panic（本批无头渲染台实测：`Rect<f32>::cast::<i32>`
+// 遇 NaN 直接 `unwrap()` 崩）——而 Path 是渲染器无关的。
+component TitlebarIconButton inherits Rectangle {
+    in property <string> tip: "";
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 26px;
+    height: 26px;
+    opacity: root.enabled ? 1.0 : 0.5;
+    background: hit.pressed ? PixelTheme.hover : (hit.has-hover ? PixelTheme.hover : PixelTheme.panel);
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+    border-radius: 6px;
+    // 齿轮：中心圆环（两段半弧）+ 8 根辐条（轴 4 + 对角 4），16×16 居中。
+    GearGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    // `Tooltip.text` 是 styled-text：必须用 @markdown，插值要带反斜杠（同 ComposerIcon）。
+    Tooltip { text: @markdown("\{root.tip}"); }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // D 批：输入区左竖排图标按钮（稿 `.ib`）：32×32、2px 描边、7px 圆角；hover 变底、按下下沉 1px；
 // 图标文案不显示在按钮上，而是作为 tooltip（owner 口径：图标 + 文案作 tooltip）。
+// D 批：输入区左竖排图标（＋ 新建会话 / 📎 多选附件）
 component ComposerIcon inherits Rectangle {
     in property <string> icon: "";
     in property <string> tip: "";
@@ -3217,6 +3274,33 @@ export component SystemChatWindow inherits Window {
     in-out property <int> session-index: -1;
     in-out property <int> model-index: -1;
 
+    // ── D2 稿 ①②③：标题栏内联控件（会话 / 模型 / ⚙设置）──────────────────────
+    // `PixelTitleBar` 是 slint-pixel 的封闭组件（不能塞子元素），所以三件套改成在根 Rectangle
+    // 里、VerticalLayout **之后**叠一条 HorizontalBox（后画 = 上层），靠右贴窗口按钮组左侧。
+    // 位置/可见性/宽度由 Rust 计划算出后写进下面这几个属性（`crate::syschat::titlebar_plan`，
+    // 纯函数带单测）；这里只负责画。**不要在 .slint 里重算**：那套「放不下就换档」的阶梯算术
+    // 需要可负向验证的单测，而 GUI 观感无法自动断言。
+    in property <length> titlebar-strip-x: -1px; // < 0 = 空档不够，整条不画
+    in property <length> titlebar-session-w: 0px;   // 0 = 该项不画
+    in property <length> titlebar-model-w: 0px;
+    in property <length> titlebar-settings-w: 0px;
+    // chip 显示文案（Rust 按 chip 宽截断；PixelMenu 内部 Text 不会 elide，长标题会画出框外）
+    in property <string> titlebar-session-text: "";
+    in property <string> titlebar-model-text: "";
+    // 消息区正文块的**可用宽**（= 窗宽 − 根 padding 4 − col padding 24 − 块内 padding 16）。
+    // **由 Rust 写**（`apply_syschat_layout`，同窗口宽变化一起更新），默认值仅供资源未就绪时兜底。
+    // ⚠️ 为什么不让各文本直接绑 `root.width - …`：实测 Slint 编译器会报
+    //    「binding loop: root.layoutinfo-h -> width -> … -> flick.max-width -> root.layoutinfo-h」
+    //    （Window 的 width 与整窗布局信息互为一体）——**允许但已弃用、运行时可能 panic**。
+    //    由 Rust 写成一个普通值就完全断开这个环，同时保留「估高不依赖横轴约束」这个关键点。
+    in property <length> convo-text-width: 416px;
+    // 窗口宽变化（首帧 realize / 缩放 / DPI 变化）→ 通知 Rust 重算计划。
+    callback titlebar-width-changed(length);
+    // 监视 root.width：`changed` 处理器在**值变化时**触发（含绑定重算导致的变化），
+    // 所以首帧拿到真实宽度后一定能回调一次。Rust 侧对 width <= 0 会回落到 preferred-width。
+    property <length> titlebar-watch: root.width;
+    changed titlebar-watch => { root.titlebar-width-changed(titlebar-watch); }
+
     callback new-session();
     callback session-pick(int);
     callback model-pick(int);
@@ -3229,6 +3313,16 @@ export component SystemChatWindow inherits Window {
     callback pending-toggle();     // 展开/收起 +N
     callback reset-history();
     callback close-window();
+    callback open-settings();   // ③ ⚙设置：唤起既有设置窗（D2 稿需求 #3）
+    // 消息区几何的**只读观测面**（D2「底部文字重叠」定性的直接证据）：
+    // 「内容高是否小于真实渲染高」在像素上量不出来（溢出部分被裁掉了），只能由窗口自报。
+    // 消费者是`cargo test` 里的无头渲染台（`src/ui_headless_render_test.rs`，用软件渲染后端把本窗
+    // 画到位图后断言）；**只读、无副作用**，不改生产行为。
+    out property <length> dbg-flick-y: flick.y;
+    out property <length> dbg-flick-h: flick.height;
+    out property <length> dbg-content-h: flick.content-height;
+    out property <length> dbg-content-y: flick.content-y;
+    out property <length> dbg-col-h: col.height;
     callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
     callback open-link(string);    // 图片 http 失败/普通链接：用浏览器打开
     // slint-pixel 标题栏契约（impl_title_bar_ui! 要求这四个回调存在）
@@ -3274,41 +3368,28 @@ export component SystemChatWindow inherits Window {
                 close-window => { root.close-window(); }
             }
 
-            // 工具行：会话 / 模型选择 + 状态文案（A 批）
+            // 状态行（D2 稿 `.status`）：**独立一行**，只放状态文案（+ 右端「清空对话」）。
+            // 稿高 26px。D2 之前是「工具行」：会话/模型两个下拉 + 状态文案 + 清空按钮 挤在同一行，
+            // 460px 下状态文案被压成省略号、控件互相压住（owner 真机截图第 2 条）。现在两个下拉
+            // 上移到标题栏（稿 ①②），这一行只剩文案与本行右端的次要动作。
             Rectangle {
-                height: 30px;
+                height: 26px;
                 background: PixelTheme.bg;
                 HorizontalBox {
-                    padding-left: 10px;
-                    padding-right: 10px;
+                    padding-left: 12px;
+                    padding-right: 8px;
                     spacing: 8px;
-                    ComboBox {
-                        width: 132px;
-                        enabled: !root.busy;
-                        model: root.session-labels;
-                        // 必须**双向**绑定：ComboBox 内部点选/changed model 会给自己赋 current-index，
-                        // 单向绑定会被 remove_binding 断掉，此后 Rust 回写不再驱动显示（评审 B1）。
-                        current-index <=> root.session-index;
-                        selected => { root.session-pick(self.current-index); }
-                    }
-                    if root.model-labels.length > 0: ComboBox {
-                        width: 150px;
-                        enabled: !root.busy;
-                        model: root.model-labels;
-                        current-index <=> root.model-index;
-                        selected => { root.model-pick(self.current-index); }
-                    }
                     Text {
                         text: root.status-line;
                         font-size: 11px;
-                        color: root.status-is-error ? UiTokens.error : UiTokens.text-dim;
+                        color: root.status-line != "" && root.status-is-error ? UiTokens.error : UiTokens.ok;
                         vertical-alignment: center;
                         overflow: elide;
                         horizontal-stretch: 1;
                     }
-                    // 对话历史清空：D 批把输入区收口为「2 图标 + 文本区 + 发送」后，
-                    // 元位置不再容纳它；为**不静默丢掉这个能力**，暂放到状态行右端（稿子未给入口，
-                    // 已作为口径偏离写进卡内）。
+                    // 对话历史清空：稿子未给入口（需求清单里没有它）。D 批一度把它挂在工具行右端，
+                    // D2 起改为本行右端的**小号文字按钮**（与稿 `.status` 同高不抢位）——不静默丢掉
+                    // 这个能力，也不与状态文案抢横向空间。
                     PixelButton {
                         text: "清空对话";
                         size: "small";
@@ -3331,6 +3412,19 @@ export component SystemChatWindow inherits Window {
             // 使 Slint 的「越界延迟夹取」失效（见本组件末尾 changed scroll-epoch 的注释）。
             // content-height 显式取内层列的自然高：不设时 Flickable 会把内容高当成视口高，
             // 超出一屏的内容被裁且滑不动（owner 2026-10-13「滚动不对」）。
+            //
+            // ⚠️ **消息区里每一个会换行的文本都必须带 px 宽绑定**（下面各处绑 `convo-text-width`）。
+            // 为什么（D2 实测，两条证据）：
+            //   1. `for b in root.blocks` 的每个子组件是被 `layout_item_info(Vertical, None)` 查询的
+            //     （生成代码里就是 `None` —— 无横轴约束），无约束时换行文本按「整段一行」估高；
+            //   2. `content-height: col.preferred-height` 就来自这条估计，于是内容高偏小 ⇒
+            //      滞底夹取算不到底（最后几行掉到视口下方、被输入区盖住）+ 块间被挤压重叠。
+            // 实测（无头渲染台，460 宽、13px 字号）：一个长段落估 96px / 真实 ~174px。
+            // 给了 px 宽后估计不依赖约束，实测 96 → 174（= 真实），回归守卫见
+            // `ui::headless_render::convo_bottom_not_clipped_by_composer`。
+            // **同一坑的姊妹案例**：6871680（历史记录页「拉不到底」）就是同一机制。
+            // 下面各处的减数 = 各级 padding 之和（块内基准 416 已在 Rust 里扣掉根+col padding），
+            // 宁可略窄（估高偏大 ⇒ 最多底部多留空白），**不能偏宽**（偏宽就回到估高不足）。
             flick := Flickable {
                 vertical-stretch: 1;
                 content-width: self.width;
@@ -3346,7 +3440,7 @@ export component SystemChatWindow inherits Window {
                         font-size: 12px;
                         color: PixelTheme.text.with-alpha(0.5);
                         wrap: word-wrap;
-                        width: 100%;
+                        width: root.convo-text-width + 16px;   // col 内（块外）= 块内可用宽 + 块内 padding 16
                         vertical-stretch: 0;
                     }
                     // 一块一元素（B 批：完整 markdown 渲染）。整个对话是一个内容区，
@@ -3362,6 +3456,7 @@ export component SystemChatWindow inherits Window {
                             color: b.text == "怹" ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
                         }
                         if b.kind == "h1": StyledText {
+                            width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 18px;
                             default-color: PixelTheme.text;
@@ -3369,6 +3464,7 @@ export component SystemChatWindow inherits Window {
                             link-clicked(link) => { root.open-link(link); }
                         }
                         if b.kind == "h2": StyledText {
+                            width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 16px;
                             default-color: PixelTheme.text;
@@ -3376,6 +3472,7 @@ export component SystemChatWindow inherits Window {
                             link-clicked(link) => { root.open-link(link); }
                         }
                         if b.kind == "h3": StyledText {
+                            width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 14px;
                             default-color: PixelTheme.text;
@@ -3399,7 +3496,8 @@ export component SystemChatWindow inherits Window {
                                     color: #f6efe1;
                                     font-family: "ui-monospace, Menlo, Consolas, monospace";
                                     wrap: word-wrap;
-                                    width: 100%;
+                                    // 可用宽 = 块内 416 − 代码框内层 VerticalBox 的左右 padding 16
+                                    width: root.convo-text-width - 16px;
                                 }
                             }
                         }
@@ -3412,7 +3510,8 @@ export component SystemChatWindow inherits Window {
                                 spacing: 0px;
                                 Rectangle { width: 4px; background: PixelTheme.accent; }
                                 StyledText {
-                                    horizontal-stretch: 1;
+                                    // 可用宽 = 块内 416 − 左 padding 10 − 强调条 4 − 右 padding 8
+                                    width: root.convo-text-width - 22px;
                                     text: b.styled;
                                     default-font-size: 13px;
                                     default-color: UiTokens.text-dim;
@@ -3430,7 +3529,8 @@ export component SystemChatWindow inherits Window {
                                 color: PixelTheme.text;
                             }
                             StyledText {
-                                horizontal-stretch: 1;
+                                // 可用宽 = 块内 416 − 缩进 level×16 − 间距 6 − 右 padding 8 − 标记位（≤20，取保守）
+                                width: root.convo-text-width - b.level * 16px - 34px;
                                 text: b.styled;
                                 default-font-size: 13px;
                                 default-color: PixelTheme.text;
@@ -3452,7 +3552,8 @@ export component SystemChatWindow inherits Window {
                                     font-size: 12px;
                                     color: PixelTheme.text;
                                     wrap: word-wrap;
-                                    width: 100%;
+                                    // 每格可用宽 = （块内 416 − TableBox 左右 padding 16 − 两侧 1px 描边）/ 列数
+                                    width: (root.convo-text-width - 16px) / b.cells.length;
                                 }
                             }
                         }
@@ -3482,6 +3583,8 @@ export component SystemChatWindow inherits Window {
                                     font-size: 12px;
                                     color: UiTokens.text-dim;
                                     wrap: word-wrap;
+                                    // 可用宽 = 块内 416 − 行内 padding 16 − 间距 8 − 「打开」按钮（≤90，取保守）
+                                    width: root.convo-text-width - 90px;
                                 }
                                 PixelButton {
                                     text: "打开";
@@ -3520,6 +3623,7 @@ export component SystemChatWindow inherits Window {
                             }
                         }
                         if b.kind == "p": StyledText {
+                            width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 13px;
                             default-color: PixelTheme.text;
@@ -3832,6 +3936,49 @@ export component SystemChatWindow inherits Window {
                         }
                     }
                 }
+            }
+        }
+
+        // ── D2 稿 ①②③：标题栏内联控件条（会话 / 模型 / ⚙设置）──────────────────
+        // 它在根 Rectangle 里、VerticalLayout **之后** ⇒ 画在标题栏上层，但不占布局高度。
+        // `y: 6px` / `height: 26px` = 与 `PixelTitleBar` 内部那一排窗口按钮同一条基线
+        //（titlebar 顶在根 padding 2px 处，内部按钮 `y: 4px`、高 26px ⇒ 绝对 6..32）。
+        // x 由 Rust 计划给（右缘停在最左那颗窗口按钮左侧 8px；会不会压到标题文字也由它保证）。
+        // 仅当 `show-maximize: false` 时按钮组靠右排、左侧才有这条空档；换回三颗按钮时
+        // Rust 计划的 `TB_BTN_COUNT` 必须同步改（见 `syschat::titlebar_plan` 注释）。
+        if root.titlebar-strip-x >= 0px: HorizontalBox {
+            x: root.titlebar-strip-x;
+            y: 6px;
+            height: 26px;
+            spacing: 6px;
+            // ①会话下拉（稿 `.chipbtn.mark[data-m="1"]`）：chip 显示当前会话标题，
+            // 点开列历史会话（需求 #7）。用 PixelMenu 而不是 std ComboBox：std ComboBox
+            // 的 `min-width: max(160px, …)` 硬下限吃不下这条空档（两个就是 320px+），
+            // 且它的 `model` 同时驱动 chip 文案（无法单独截断，长标题会画出框外）。
+            if root.titlebar-session-w > 0px: PixelMenu {
+                width: root.titlebar-session-w;
+                height: 26px;
+                items: root.session-labels;
+                index <=> root.session-index;
+                button-text: root.titlebar-session-text;
+                enabled: !root.busy;
+                selected(i) => { root.session-pick(i); }
+            }
+            // ②模型下拉（稿是 accent 高亮 chip；PixelMenu 无 accent 面，配色偏离已记卡）
+            if root.titlebar-model-w > 0px: PixelMenu {
+                width: root.titlebar-model-w;
+                height: 26px;
+                items: root.model-labels;
+                index <=> root.model-index;
+                button-text: root.titlebar-model-text;
+                enabled: !root.busy;
+                selected(i) => { root.model-pick(i); }
+            }
+            // ③⚙设置（稿 `.tb-btn[data-m="3"]`）——唤起既有设置窗（需求 #3）
+            if root.titlebar-settings-w > 0px: TitlebarIconButton {
+                tip: "打开设置";
+                enabled: !root.busy;
+                clicked => { root.open-settings(); }
             }
         }
     }

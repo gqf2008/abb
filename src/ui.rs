@@ -497,6 +497,70 @@ fn refresh_bubble_visibility(bubble: &AnchorBubble, dialog_visible: bool) {
     }
 }
 
+/// 系统对话窗的**当前逻辑宽度**（标题栏计划要用）；窗口还没 realize（`size()` 为 0）时返回 0，
+/// 调用方回落到 `syschat::SYSCHAT_PREFERRED_WIDTH`。
+///
+/// `Window::size()` 是物理像素，必须除 scale factor——Retina 2x 下不换算会让计划按两倍窗宽算，
+/// 控件条直接摆到窗外（同 [`anchored_dialog_pos`] 里踩过的那个坑）。
+fn syschat_logical_width(win: &SystemChatWindow) -> f32 {
+    let sf = win.window().scale_factor();
+    if sf <= 0.0 {
+        return 0.0;
+    }
+    win.window().size().width as f32 / sf
+}
+
+/// D2（稿 ①②③）：把标题栏控件条的**落位计划**与消息区正文宽一起写进窗口（两者都是
+/// 「按窗宽算好、由 Rust 写成普通值」的东西，合并在一个入口避免两处分别跟窗宽变化）。
+///
+/// 算术全在 [`crate::syschat::titlebar_plan`]（纯函数 + 单测），这里只做两件接线活：
+/// 1. 把计划里的长度写进 `titlebar-*-w` / `titlebar-strip-x`（0 / 负值 ⇒ `.slint` 不画该项）；
+/// 2. 把 chip 文案按各自宽度截断（`PixelMenu` 内部 Text 不会 elide，长标题会画出框外）；
+/// 3. 把消息区正文可用宽写进 `convo-text-width`（见 `.slint` 里那条属性的注释：
+///    文本必须带 px 宽绑定，但又不能在 `.slint` 里绑 `root.width`——那是 Slint 的 binding loop）。
+///
+/// `window_w <= 0`（窗口未 realize）时回落到 `preferred-width`：否则首帧会按 0 宽算出「整条不画」，
+/// 窗口真宽到位后即使能重算，也会白闪一下。
+fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
+    use slint::Model as _;
+    let w = if window_w > 0.0 {
+        window_w
+    } else {
+        crate::syschat::SYSCHAT_PREFERRED_WIDTH
+    };
+    // 消息区正文宽：窗宽 − 根 padding 4 − col padding 24 − 块内 padding 16（
+    // `crate::syschat::CONVO_BLOCK_TEXT_INSET` 一处说了算，改布局时只动那一个常量）。
+    win.set_convo_text_width(
+        (w - crate::syschat::CONVO_BLOCK_TEXT_INSET).max(crate::syschat::CONVO_TEXT_WIDTH_MIN),
+    );
+    // 没配「设置 → 供应商」时模型下拉无可选项 ⇒ 该项不占位（D2 前是 `if model-labels.length > 0`）。
+    let has_model = win.get_model_labels().row_count() > 0;
+    let plan = crate::syschat::titlebar_plan(w, has_model);
+    win.set_titlebar_strip_x(plan.x);
+    win.set_titlebar_session_w(plan.session_w);
+    win.set_titlebar_model_w(plan.model_w);
+    win.set_titlebar_settings_w(plan.settings_w);
+    let chip_text = |labels: slint::ModelRc<slint::SharedString>, idx: i32, chip_w: f32| {
+        if chip_w <= 0.0 {
+            return slint::SharedString::default();
+        }
+        labels
+            .row_data(idx.max(0) as usize)
+            .map(|s| crate::syschat::fit_chip_label(&s, chip_w).into())
+            .unwrap_or_default()
+    };
+    win.set_titlebar_session_text(chip_text(
+        win.get_session_labels(),
+        win.get_session_index(),
+        plan.session_w,
+    ));
+    win.set_titlebar_model_text(chip_text(
+        win.get_model_labels(),
+        win.get_model_index(),
+        plan.model_w,
+    ));
+}
+
 /// 计算对话框应处的左上角（逻辑像素）：把窗口锚在气泡**可视区**旁，靠屏边自动翻边（口径见
 /// [`crate::syschat::anchor_window_pos`]）。
 ///
@@ -1844,6 +1908,20 @@ pub fn run_gui() -> Result<()> {
     // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
+    // D2（稿 ①②③）：标题栏控件条的落位计划。
+    // 初次用 preferred-width 兜底（此时窗口尚未 realize，`size()` 可能是 0），
+    // 之后改由窗口宽变化驱动：`.slint` 里的 `changed titlebar-watch => titlebar-width-changed(root.width)`
+    // （首帧拿到真宽、缩放、DPI 变化都会触发）。为什么不用 winit `Resized`：同一件事，
+    // Slint 侧的宽度就是布局真正用的值，不用再做物理→逻辑换算。
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_titlebar_width_changed(move |w| {
+            if let Some(win) = cw.upgrade() {
+                apply_syschat_layout(&win, w);
+            }
+        });
+    }
+    apply_syschat_layout(&syschat_win, syschat_logical_width(&syschat_win));
     let syschat_model: Rc<slint::VecModel<SysChatBlockRow>> = Rc::new(slint::VecModel::default());
     syschat_win.set_blocks(slint::ModelRc::from(syschat_model.clone()));
 
@@ -2037,6 +2115,8 @@ pub fn run_gui() -> Result<()> {
         win.set_model_index(midx.unwrap_or(-1));
         *sessions.borrow_mut() = list;
         *models.borrow_mut() = ms;
+        // D2：会话/模型 chip 的显示文案随列表与选中项变（按当前窗口宽重新截断）。
+        apply_syschat_layout(win, syschat_logical_width(win));
     }
     refresh_syschat_sel(&syschat_win, &sc_sessions, &sc_models);
 
@@ -5900,6 +5980,24 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // ③ ⚙设置（D2 稿需求 #3）：唤起**既有**设置窗。照托盘「设置…」的同一条路径写：
+    // 先 `load_with_draft`（草稿比正式配置新时静默恢复为工作底稿）→ 刷新状态行 → show+聚焦。
+    // 不自己写一套显示逻辑：草稿恢复/置前/圆角都在这条路上有既有口径。
+    {
+        let sw = settings.as_weak();
+        let work = work.clone();
+        let dirty = dirty.clone();
+        let model = bots_model.clone();
+        let pmodel = providers_model.clone();
+        let wk = wk.clone();
+        syschat_win.on_open_settings(move || {
+            if let Some(w) = sw.upgrade() {
+                load_with_draft(&w, &dirty, &work, &model, &pmodel, &wk);
+                push_settings_status(&w, &install::status());
+                show_window_and_focus(&w);
+            }
+        });
+    }
     // 音视频媒体卡：用系统默认播放器打开（Slint 无内嵌播放器）；链接用浏览器。
     syschat_win.on_open_media(|src| {
         let s = src.as_str();
@@ -6926,6 +7024,11 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
         let _ = tx.send(WxEvt::Failed(e));
     }
 }
+
+// D2：无头渲染举证台（纯测试模块，`#[path]` 指到单独的 .rs，避免把 ui.rs 再撑长）
+#[cfg(test)]
+#[path = "ui_headless_render_test.rs"]
+mod headless_render;
 
 #[cfg(test)]
 mod tests {
