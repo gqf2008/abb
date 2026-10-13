@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::acp::TurnChunk;
 use super::harness::{AgentConfig, ChannelMeta, RuntimeHandle, SyncTurnOutcome};
 use super::queue::InboundMsg;
 
@@ -65,6 +66,25 @@ pub async fn oneshot_turn(
     budget: Duration,
     external_cancel: Option<CancellationToken>,
 ) -> SyncTurnOutcome {
+    oneshot_turn_streaming(cfg, workspace, msg, budget, external_cancel, None).await
+}
+
+/// [`oneshot_turn`] 的流式变体（E1）：额外把一个正文分片 sink 透传到适配层，
+/// 回合进行中实时回传 `agent_message_chunk` 的 delta（供打字机渲染）。
+///
+/// - `chunk_tx = None` 时**逐字节等价** `oneshot_turn`（既有调用方零改动：
+///   `oneshot_turn` 就是本函数的 `None` 薄封装）；
+/// - sink 装在**自建 RuntimeHandle 的该 channel 键**上，回合收尾（含取消）时摘除；
+/// - 适配层侧（`AcpClient::chunk_events`）的安装与重装归 harness，见
+///   `harness::handle_spawn_outcome`（每次拉起 agent 都重挂，respawn 后不断流）。
+pub async fn oneshot_turn_streaming(
+    cfg: AgentConfig,
+    workspace: Option<String>,
+    msg: InboundMsg,
+    budget: Duration,
+    external_cancel: Option<CancellationToken>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
+) -> SyncTurnOutcome {
     let stop = CancellationToken::new();
     let cwd = std::env::current_dir()
         .unwrap_or_default()
@@ -87,6 +107,11 @@ pub async fn oneshot_turn(
             workspace,
         },
     );
+    // E1：等回合之前装入流式 sink（必须在 push 消息前——首个 chunk 可能在
+    // wait_turn_outcome 注册等待者之前就到达）。
+    if let Some(tx) = chunk_tx {
+        handle.set_turn_chunk_sink(channel_id, tx);
+    }
 
     // 外部联动取消与同步等待竞速：外部触发 = Cancelled（区别于预算 Timeout）。
     let outcome = {
@@ -120,6 +145,8 @@ pub async fn oneshot_turn(
     }
 
     stop.cancel();
+    // E1：摘掉流式 sink（回合已终态，迟发分片不应再进已收尾的 GUI 气泡）。
+    handle.remove_turn_chunk_sink(channel_id);
     if tokio::time::timeout(TEARDOWN_BUDGET, &mut run_task)
         .await
         .is_err()
@@ -149,6 +176,7 @@ fn strip_backend_suffix(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::acp::ChunkKind;
     use crate::runtime::harness::MAX_TURN_DURATION;
 
     /// 与 bridge/mod.rs make_test_harness 同款的 mock 装配，但完全自含
@@ -251,6 +279,44 @@ mod tests {
                     .contains("oneshot-echo-probe")),
             "prompt 记录: {events:?}"
         );
+    }
+
+    /// E1 流式：正文分片经 sink 实时回传，回合结局仍为 Ok；两者内容一致。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn oneshot_streaming_forwards_chunks_and_ok() {
+        let rec = record_file("stream");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        let outcome = oneshot_turn_streaming(
+            mock_cfg(&rec, Vec::new()),
+            None,
+            msg("oneshot-stream-probe"),
+            Duration::from_secs(60),
+            None,
+            Some(tx),
+        )
+        .await;
+        let SyncTurnOutcome::Ok(text) = outcome else {
+            panic!("expected Ok, got {outcome:?}");
+        };
+        // 回合已收尾 ⇒ sink 已摘除，缓冲区里的分片不会再有新增。
+        let mut streamed = String::new();
+        let mut kinds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            assert_eq!(c.kind, ChunkKind::Text, "E1 只回传正文");
+            kinds.push(c.kind);
+            streamed.push_str(&c.text);
+        }
+        assert!(!kinds.is_empty(), "mock 至少发一个正文分片");
+        assert!(
+            streamed.contains("oneshot-stream-probe"),
+            "分片内容: {streamed}"
+        );
+        // 去重口径前提：流式拼接与最终文本一致（mock 单分片场景下逐字节相等）。
+        assert_eq!(streamed, text, "流式拼接应等于最终文本");
     }
 
     /// agent 终态失败（401 认证，不可重试）：Failed(原因) 且远早于预算——

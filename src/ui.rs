@@ -161,9 +161,11 @@ enum UiCmd {
     /// 系统级对话：跑一轮与 abb-agent 的直接对话（syschat::turn），
     /// 结果经 syschat_rx 回主线程（气泡/对话框共用）。
     /// `atts` = 本批已落盘的待发附件（路径进 prompt，见 `syschat::prompt_with_attachments`）。
+    /// `cancel` = ⏹ 停止用的外部取消令牌（用户点停止时由 UI 线程直接 `.cancel()`）。
     SysChatSend {
         text: String,
         atts: Vec<crate::syschat::Attachment>,
+        cancel: tokio_util::sync::CancellationToken,
     },
     /// 后台下载一个 http(s) 媒体到本地缓存（图片内联 / 音视频可打开）。
     FetchMedia {
@@ -199,10 +201,15 @@ enum WxEvt {
 
 /// 系统级对话事件（后台 → 主线程）：气泡与对话框共用一条通道。
 /// 回合跑在后台 tokio 线程（GUI 主线程不能阻塞），结果经 std mpsc 回主线程，
-/// 由 2s 定时器轮询上屏（与 dep_rx/prov_rx/vb_rx 同模式）。
+/// 由专用的 50ms 流式定时器轮询上屏（E1；与 dep_rx/prov_rx/vb_rx 的 2s 轮询同模式，
+/// 只是节拍更快以保证打字机手感）。
 enum SysChatEvt {
-    /// 回合成功：助手回复文本。
+    /// 流式正文 delta（E1）：追加到当前助手气泡（打字机）。
+    Delta(String),
+    /// 回合成功：助手回复文本（以它为准收尾流式气泡，见去重口径）。
     Reply(String),
+    /// 用户停止：保留已生成文本，提示「已停止」。
+    Stopped,
     /// 回合失败：用户可读原因。
     Error(String),
     /// 后台已把一个 http(s) 媒体下到缓存：重载当前会话让图片内联显示。
@@ -1931,6 +1938,19 @@ pub fn run_gui() -> Result<()> {
         }
         rows
     }
+    /// 用当前累积文本重建「流式气泡」的行：从 `start` 起到末尾全替换。
+    ///
+    /// 为什么整段重建：增量改行需要知道 markdown 分块边界，而 `mdblocks::parse`
+    /// 随文本增长会重新分块；整段替换是唯一不会留残行/重复角色的做法。
+    /// 去重口径：回合结束时调用方用 `final_text` 重建同一段——不保留旧拼接、不追加第二条。
+    fn sync_stream_rows(model: &slint::VecModel<SysChatBlockRow>, start: usize, text: &str) {
+        while model.row_count() > start {
+            model.remove(model.row_count() - 1);
+        }
+        for r in rows_for("assistant", text) {
+            model.push(r);
+        }
+    }
     // 当前会话里还没缓存的 http(s) 媒体（图片/音视频）——交给后台下载。
     fn pending_http_media() -> Vec<String> {
         let mut v = Vec::new();
@@ -2026,6 +2046,13 @@ pub fn run_gui() -> Result<()> {
     // 到工作区附件目录并上屏，发送时路径随消息文本一起进 prompt（见
     // `syschat::prompt_with_attachments`）——二进制不进 prompt。
     let sc_atts: Rc<RefCell<Vec<crate::syschat::Attachment>>> = Rc::new(RefCell::new(Vec::new()));
+    // E1 流式状态：累积器 + 流式气泡在 model 里的起始行（`usize::MAX` = 当前没有流式气泡）
+    // + 在途回合的外部取消令牌（⏹ 停止）。三者都是 UI 线程本地状态，不上跨线程。
+    let sc_stream: Rc<RefCell<crate::syschat::StreamingBubble>> =
+        Rc::new(RefCell::new(crate::syschat::StreamingBubble::default()));
+    let sc_stream_start: Rc<Cell<usize>> = Rc::new(Cell::new(usize::MAX));
+    let sc_cancel: Rc<RefCell<Option<tokio_util::sync::CancellationToken>>> =
+        Rc::new(RefCell::new(None));
     // D 批 3+N：展开/折叠态。纯逻辑在 `syschat::PendingState`（可单测），这里只存状态。
     let sc_pending: Rc<Cell<crate::syschat::PendingState>> =
         Rc::new(Cell::new(crate::syschat::PendingState::new()));
@@ -3527,20 +3554,42 @@ pub fn run_gui() -> Result<()> {
                     }
                     // 系统级对话（气泡/对话框）：无需管理密码（它不是服务动作，且执行层
                     // 已是 owner 全权限——与其它 GUI 内部一次性回合同权限）。
-                    UiCmd::SysChatSend { text, atts } => {
+                    UiCmd::SysChatSend { text, atts, cancel } => {
                         let etx = syschat_tx_bg.clone();
                         tokio::spawn(async move {
                             let evt = match Config::load() {
                                 Ok(cfg) => {
-                                    // 无附件走既有的 `turn`（这条路经本身不变；两者共用 `turn_core`）。
-                                    let r = if atts.is_empty() {
-                                        crate::syschat::turn(&cfg, &text).await
-                                    } else {
-                                        crate::syschat::turn_with_attachments(&cfg, &text, &atts)
-                                            .await
-                                    };
-                                    match r {
-                                        Ok(reply) => SysChatEvt::Reply(reply),
+                                    // E1：统一走流式入口；delta 先经转发任务回主线程（`Delta`），
+                                    // 回合结局再给 Reply/Stopped/Error。附件为空时语义与旧 `turn` 一致。
+                                    let (delta_tx, mut delta_rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<
+                                            crate::runtime::acp::TurnChunk,
+                                        >();
+                                    let etx_delta = etx.clone();
+                                    let forwarder = tokio::spawn(async move {
+                                        while let Some(chunk) = delta_rx.recv().await {
+                                            if chunk.kind
+                                                == crate::runtime::acp::ChunkKind::Text
+                                            {
+                                                let _ = etx_delta
+                                                    .send(SysChatEvt::Delta(chunk.text));
+                                            }
+                                        }
+                                    });
+                                    let end = crate::syschat::turn_streaming(
+                                        &cfg, &text, &atts, delta_tx, cancel,
+                                    )
+                                    .await;
+                                    // 回合已收尾 ⇒ sink 已摘除；等转发任务冲完缓冲分片，
+                                    // 保证所有 `Delta` 排在 `Reply`/`Stopped` 之前。
+                                    let _ = forwarder.await;
+                                    match end {
+                                        Ok(crate::syschat::TurnEnd::Done(reply)) => {
+                                            SysChatEvt::Reply(reply)
+                                        }
+                                        Ok(crate::syschat::TurnEnd::Stopped) => {
+                                            SysChatEvt::Stopped
+                                        }
                                         Err(e) => SysChatEvt::Error(e),
                                     }
                                 }
@@ -5777,6 +5826,9 @@ pub fn run_gui() -> Result<()> {
         let tx = tx.clone();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
+        let cancel_slot = sc_cancel.clone();
+        let stream = sc_stream.clone();
+        let stream_start = sc_stream_start.clone();
         syschat_win.on_send(move |text| {
             let text = text.trim().to_string();
             if text.is_empty() {
@@ -5807,10 +5859,25 @@ pub fn run_gui() -> Result<()> {
             }
             atts.borrow_mut().clear();
             refresh_syschat_atts(&w, &atts, &pending);
+            // E1：为本轮建外部取消令牌（⏹ 停止直接 `.cancel()`），并重置流式累积/气泡起点。
+            let token = tokio_util::sync::CancellationToken::new();
+            *cancel_slot.borrow_mut() = Some(token.clone());
+            *stream.borrow_mut() = crate::syschat::StreamingBubble::start();
+            stream_start.set(usize::MAX);
             let _ = tx.send(UiCmd::SysChatSend {
                 text,
                 atts: atts_now,
+                cancel: token,
             });
+        });
+    }
+    // ⏹ 停止：取消在途回合（UI 线程直接触发外部取消令牌；回合收尾由 Stopped 事件处理）。
+    {
+        let cancel_slot = sc_cancel.clone();
+        syschat_win.on_stop_streaming(move || {
+            if let Some(t) = cancel_slot.borrow().as_ref() {
+                t.cancel();
+            }
         });
     }
     // 清空历史（对话框按钮）。
@@ -5976,6 +6043,115 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
+    // ── 系统级对话流式事件：专用 50ms 定时器（E1）──
+    //
+    // 为什么不用 2s 主定时器：打字机需要 delta 尽快上屏，2s 一拍只能看到「一跳一跳」；
+    // 50ms 的 `try_recv` 几乎无开销（空轮询就是一次原子检查），且不再是回复延迟的瓶颈。
+    // delta 只做「整段重建流式气泡」，Reply/Stopped 收尾并回到空闲。
+    {
+        let syschat_model_t = syschat_model.clone();
+        let win_w = syschat_win.as_weak();
+        let bubble_w = bubble.as_weak();
+        let rm = request_media.clone();
+        let stream_state = sc_stream.clone();
+        let stream_start = sc_stream_start.clone();
+        let cancel_slot = sc_cancel.clone();
+        let syschat_timer = slint::Timer::default();
+        syschat_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(50),
+            move || {
+                while let Ok(evt) = syschat_rx.try_recv() {
+                    match evt {
+                        SysChatEvt::Delta(delta) => {
+                            let mut b = stream_state.borrow_mut();
+                            if !b.push(&delta) {
+                                continue; // 空 delta：无变化，不重渲染
+                            }
+                            let text = b.shown().to_string();
+                            drop(b);
+                            if stream_start.get() == usize::MAX {
+                                stream_start.set(syschat_model_t.row_count());
+                            }
+                            sync_stream_rows(&syschat_model_t, stream_start.get(), &text);
+                            if let Some(w) = win_w.upgrade() {
+                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                            }
+                        }
+                        SysChatEvt::Reply(text) => {
+                            // 去重口径：以最终文本为准整段重建同一段气泡——不保留旧拼接、不追加第二条。
+                            stream_state.borrow_mut().finish(&text);
+                            let s0 = stream_start.get();
+                            if s0 != usize::MAX {
+                                sync_stream_rows(&syschat_model_t, s0, &text);
+                            } else {
+                                for r in rows_for("assistant", &text) {
+                                    syschat_model_t.push(r);
+                                }
+                            }
+                            stream_start.set(usize::MAX);
+                            *cancel_slot.borrow_mut() = None;
+                            rm();
+                            if let Some(w) = win_w.upgrade() {
+                                w.set_busy(false);
+                                w.set_status_is_error(false);
+                                w.set_status_line("与 ABB 直接对话（系统级 · 整机权限）".into());
+                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                            }
+                            if let Some(b) = bubble_w.upgrade() {
+                                b.set_busy(false);
+                            }
+                        }
+                        SysChatEvt::Stopped => {
+                            // 停止：保留已生成文本（不清 model 行），只收起「正在输入」并提示。
+                            let mut b = stream_state.borrow_mut();
+                            b.stop();
+                            let text = b.shown().to_string();
+                            drop(b);
+                            let s0 = stream_start.get();
+                            if s0 != usize::MAX && !text.is_empty() {
+                                sync_stream_rows(&syschat_model_t, s0, &text);
+                            }
+                            stream_start.set(usize::MAX);
+                            *cancel_slot.borrow_mut() = None;
+                            rm();
+                            if let Some(w) = win_w.upgrade() {
+                                w.set_busy(false);
+                                w.set_status_is_error(false);
+                                w.set_status_line("已停止。".into());
+                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                            }
+                            if let Some(b) = bubble_w.upgrade() {
+                                b.set_busy(false);
+                            }
+                        }
+                        SysChatEvt::Error(e) => {
+                            // 失败：已生成文本保留在气泡里（若有），只报错并收 busy。
+                            stream_start.set(usize::MAX);
+                            *cancel_slot.borrow_mut() = None;
+                            if let Some(w) = win_w.upgrade() {
+                                w.set_busy(false);
+                                w.set_status_is_error(true);
+                                w.set_status_line(format!("失败：{e}").into());
+                            }
+                            if let Some(b) = bubble_w.upgrade() {
+                                b.set_busy(false);
+                            }
+                        }
+                        SysChatEvt::MediaReady => {
+                            // 后台下好一个 http(s) 媒体：重载当前会话，图片即可内联显示。
+                            if let Some(w) = win_w.upgrade() {
+                                load_syschat_into(&w, &syschat_model_t);
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        // Timer 需保活到事件循环结束（drop 会取消；与主定时器同款泄漏处理）。
+        std::mem::forget(syschat_timer);
+    }
+
     // ── 主线程定时器：① 看门 ② 刷新托盘 ③ 抽 bot_rx/wx_rx 回填 ──
     let timer = slint::Timer::default();
     {
@@ -6003,13 +6179,8 @@ pub fn run_gui() -> Result<()> {
         let history_sessions = sessions_model.clone();
         let history_msgs = msgs_model.clone();
         let history_selected = selected_chat.clone();
-        // 系统级对话：气泡/对话框 weak + model + 回合结果接收端
-        let syschat_weak = syschat_win.as_weak();
+        // 气泡 weak（气泡位置/忙态回填）
         let bubble_weak = bubble.as_weak();
-        let syschat_model_t = syschat_model.clone();
-        let syschat_rx_t = syschat_rx;
-        // 回复里可能带新的 http(s) 媒体图：让后台下载后重载
-        let rm_t = request_media.clone();
         // 气泡位置待施加标记（见启动处注释）
         let bubble_pos_apply_t = bubble_pos_apply.clone();
         timer.start(
@@ -6503,43 +6674,6 @@ pub fn run_gui() -> Result<()> {
                             }
                             if let Some(w) = settings_weak.upgrade() {
                                 w.set_status_line(format!("微信登录失败：{e}").into());
-                            }
-                        }
-                    }
-                }
-                // 系统级对话回合结果：reply/error 上屏，busy 收尾（气泡同步）。
-                while let Ok(evt) = syschat_rx_t.try_recv() {
-                    match evt {
-                        SysChatEvt::Reply(text) => {
-                            // 后台下载完的媒体图重载一行（不追加）——见 MediaReady
-                            for r in rows_for("assistant", &text) {
-                                syschat_model_t.push(r);
-                            }
-                            rm_t();
-                            if let Some(w) = syschat_weak.upgrade() {
-                                w.set_busy(false);
-                                w.set_status_is_error(false);
-                                w.set_status_line("与 ABB 直接对话（系统级 · 整机权限）".into());
-                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-                            }
-                            if let Some(b) = bubble_weak.upgrade() {
-                                b.set_busy(false);
-                            }
-                        }
-                        SysChatEvt::Error(e) => {
-                            if let Some(w) = syschat_weak.upgrade() {
-                                w.set_busy(false);
-                                w.set_status_is_error(true);
-                                w.set_status_line(format!("失败：{e}").into());
-                            }
-                            if let Some(b) = bubble_weak.upgrade() {
-                                b.set_busy(false);
-                            }
-                        }
-                        SysChatEvt::MediaReady => {
-                            // 后台下好一个 http(s) 媒体：重载当前会话，图片即可内联显示。
-                            if let Some(w) = syschat_weak.upgrade() {
-                                load_syschat_into(&w, &syschat_model_t);
                             }
                         }
                     }

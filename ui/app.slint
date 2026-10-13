@@ -3222,6 +3222,7 @@ export component SystemChatWindow inherits Window {
     callback model-pick(int);
 
     callback send(string);
+    callback stop-streaming();   // ⏹ 停止：取消在途回合（Rust 侧发 external_cancel）
     callback attach-pick();
     callback attach-clear();       // 清空待发列表（只清内存，不删已落盘文件）
     callback attach-remove(int);   // 按完整列表下标移除单个待发附件（✕）
@@ -3526,11 +3527,48 @@ export component SystemChatWindow inherits Window {
                             link-clicked(link) => { root.open-link(link); }
                         }
                     }
-                    if root.busy: Text {
-                        text: "ABB 正在处理…";
-                        font-size: 12px;
-                        color: PixelTheme.dim;
+                    if root.busy: HorizontalBox {
+                        // 「正在输入」+ 闪烁光标 + ⏹ 停止（稿 `.tbar` / `.caret-t` / `.stopbtn`）
+                        spacing: 8px;
                         vertical-stretch: 0;
+                        Text {
+                            text: "正在输入";
+                            font-size: 11.5px;
+                            font-weight: 700;
+                            color: UiTokens.info;
+                            vertical-alignment: center;
+                        }
+                        // 光标：条目不断追加本身已构成打字机感，光标用静态蓝块（Slint
+                        // 无内置无限闪烁动画，不为了动效引入定时器）。
+                        Rectangle {
+                            width: 8px;
+                            height: 15px;
+                            background: UiTokens.info;
+                            border-radius: 1px;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        stopbtn := Rectangle {
+                            height: 24px;
+                            width: stopbtn-label.preferred-width + 20px;
+                            background: PixelTheme.panel;
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            border-radius: 6px;
+                            stopbtn-label := Text {
+                                width: 100%;
+                                height: 100%;
+                                text: "⏹ 停止";
+                                font-size: 11.5px;
+                                font-weight: 700;
+                                color: PixelTheme.text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.stop-streaming(); }
+                            }
+                        }
                     }
                 }
             }

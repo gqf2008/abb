@@ -267,6 +267,53 @@ fn should_log_drop(n: u64) -> bool {
 static RESOURCE_DROP_COUNTS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// 流式分片的类别（E1 只回传正文；`Thought` 先留出区分能力——
+/// 免得 E2 要把 sink 的类型签名从裸 `String` 改一遍、改到所有调用点）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkKind {
+    /// `agent_message_chunk`：助手正文 delta。
+    Text,
+    /// `agent_thought_chunk`：思考 delta（E2 才回传，当前只保留接口）。
+    #[allow(dead_code)] // E2 之前不会构造；保留接口避免将来改 sink 类型签名
+    Thought,
+}
+
+/// agent 在回合进行中实时产出的一个文本分片（E1 流式回传）。
+///
+/// 与 [`ResourceUpdate`] 一样自带 `session_id`：执行层的会话号是进程内的，多 agent
+/// 并发时必须连同 agent 身份一起上报，消费端才能正确归属频道。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnChunk {
+    pub session_id: String,
+    pub kind: ChunkKind,
+    pub text: String,
+}
+
+/// 把一个文本分片投进 per-turn sink。
+///
+/// 与 [`dispatch_resource_update`] 同款「抽成自由函数便于直测」：
+/// - 空分片直接丢弃（`agent_message_chunk` 可以带空 delta），不得 panic；
+/// - 未接 sink 时**静默返回**——非系统对话回合没有消费者，若在这里打日志，
+///   话痨 agent 会把 `bridge.out` 刷爆（与资源事件的限频日志不同，分片是逐字级的）。
+///   因此「未接 sink」路径的行为与接线前逐字节一致。
+fn dispatch_turn_chunk(
+    sink: &Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
+    session_id: &str,
+    kind: ChunkKind,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(tx) = sink {
+        let _ = tx.send(TurnChunk {
+            session_id: session_id.to_string(),
+            kind,
+            text: text.to_string(),
+        });
+    }
+}
+
 /// agent 主动上报的一次资源更新（`_abb/unstable/resource/updated`）。
 ///
 /// 执行层（abb-agent）在收到 MCP `notifications/resources/updated` 并 `resources/read` 之后
@@ -304,6 +351,9 @@ pub struct AcpClient {
     reader: FramedRead<Box<dyn tokio::io::AsyncRead + Unpin + Send>, LinesCodec>,
     /// 资源更新上报通道（可选）：未接时只记日志（事件路径是增值能力，不拖垮协议层）。
     resource_events: Option<tokio::sync::mpsc::UnboundedSender<ResourceUpdate>>,
+    /// 流式分片回传通道（可选，E1）：未接时静默丢弃（见 [`dispatch_turn_chunk`]）。
+    /// 由 harness 在**每次拉起 agent** 时重挂（`handle_spawn_outcome`），respawn 后不会静默断流。
+    chunk_events: Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
@@ -496,6 +546,11 @@ impl AcpClient {
         self.resource_events = Some(tx);
     }
 
+    /// 接上流式分片通道（E1）。未接时静默丢弃、行为与接线前一致。
+    pub fn set_chunk_sink(&mut self, tx: tokio::sync::mpsc::UnboundedSender<TurnChunk>) {
+        self.chunk_events = Some(tx);
+    }
+
     pub async fn spawn(
         command: &str,
         args: &[String],
@@ -599,6 +654,7 @@ impl AcpClient {
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
             resource_events: None,
+            chunk_events: None,
             pending_permission_id: None,
             permission_responded: false,
             last_prompt_id: None,
@@ -1785,6 +1841,16 @@ impl AcpClient {
                 if let Some(text) = update["content"]["text"].as_str() {
                     if msg["params"]["sessionId"].as_str() == self.turn_session.as_deref() {
                         self.turn_text.push_str(text);
+                        // E1：同一 `turn_session` 过滤条件下把正文 delta 实时回传
+                        //（sink 未接 = 静默 no-op，行为与接线前逐字节一致）。
+                        if let Some(session_id) = self.turn_session.as_deref() {
+                            dispatch_turn_chunk(
+                                &self.chunk_events,
+                                session_id,
+                                ChunkKind::Text,
+                                text,
+                            );
+                        }
                     }
                 }
                 false
@@ -2261,6 +2327,51 @@ mod resource_update_tests {
             &serde_json::json!({"params": {"sessionId": "abb-1", "server": "s", "uri": "u"}}),
         );
         assert_eq!(rx.try_recv().expect("应有事件").text, "");
+    }
+}
+
+#[cfg(test)]
+mod turn_chunk_tests {
+    use super::*;
+
+    /// 接了 sink：正文分片的三个字段逐字投进通道，kind 保留区分能力。
+    #[test]
+    fn dispatch_forwards_text_chunk_verbatim() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        dispatch_turn_chunk(&Some(tx), "abb-7", ChunkKind::Text, "你好");
+        let got = rx.try_recv().expect("应有分片");
+        assert_eq!(got.session_id, "abb-7");
+        assert_eq!(got.kind, ChunkKind::Text);
+        assert_eq!(got.text, "你好");
+    }
+
+    /// 空 delta：不投递、不 panic（agent 可以发空 chunk）。
+    #[test]
+    fn empty_delta_is_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        dispatch_turn_chunk(&Some(tx), "abb-7", ChunkKind::Text, "");
+        assert!(rx.try_recv().is_err(), "空分片不得投递");
+    }
+
+    /// 未接 sink：静默不 panic（非流式回合的常态）。
+    #[test]
+    fn without_sink_does_not_panic() {
+        dispatch_turn_chunk(&None, "abb-7", ChunkKind::Text, "正文");
+        dispatch_turn_chunk(&None, "abb-7", ChunkKind::Thought, "思考");
+    }
+
+    /// 多字节字符分片（中文/emoji）逐个透传，拼接后不丢字节。
+    #[test]
+    fn multibyte_chunks_roundtrip() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        for part in ["打", "字", "机", "🟦"] {
+            dispatch_turn_chunk(&Some(tx.clone()), "abb-7", ChunkKind::Text, part);
+        }
+        let mut out = String::new();
+        while let Ok(c) = rx.try_recv() {
+            out.push_str(&c.text);
+        }
+        assert_eq!(out, "打字机🟦");
     }
 }
 

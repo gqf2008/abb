@@ -23,6 +23,7 @@
 //! Unix flock / Windows LockFileEx），防止多线程/多窗口下的丢更新。
 
 use crate::config::Config;
+use crate::runtime::acp::{ChunkKind, TurnChunk};
 use crate::runtime::harness::{AgentConfig, SyncTurnOutcome};
 use crate::runtime::queue::InboundMsg;
 use std::io::{BufRead, BufReader, Write};
@@ -960,6 +961,75 @@ pub fn prompt_with_attachments(history: &[Turn], user_text: &str, atts: &[Attach
     s
 }
 
+/// 一轮对话的结局（E1 流式）：「正常完成」携带最终文本；「用户停止」不再带文本
+///（已生成部分已随 [`StreamEvent`] 逐字流出，且由 [`turn_core`] 落进历史）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEnd {
+    Done(String),
+    Stopped,
+}
+
+/// 流式正文累积器（纯逻辑，E1）：按到达顺序拼接 delta，供
+/// ① GUI 打字机 ② 「停止」时把已生成文本落历史 共用。
+///
+/// 设计取舍：**不做增量解析**，只维护一个字符串；markdown 解析留给渲染层
+///（`mdblocks::parse`）在每次渲染时做，这样累积器本身可无依赖单测。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamingBubble {
+    shown: String,
+    active: bool,
+    stopped: bool,
+}
+
+impl StreamingBubble {
+    /// 新建一个进行中的流式气泡（`active = true`）。
+    pub fn start() -> Self {
+        Self {
+            shown: String::new(),
+            active: true,
+            stopped: false,
+        }
+    }
+
+    /// 追加一段正文 delta。空段忽略（agent 可以发空 chunk）。
+    /// 返回 `true` 表示显示文本发生变化（GUI 需重渲染）。
+    pub fn push(&mut self, delta: &str) -> bool {
+        if delta.is_empty() {
+            return false;
+        }
+        self.shown.push_str(delta);
+        true
+    }
+
+    /// ⏹ 停止：保留已生成文本，标记不再活跃（「正在输入」收起、显示「已停止」）。
+    pub fn stop(&mut self) {
+        self.stopped = true;
+        self.active = false;
+    }
+
+    /// 收尾去重：回合结束时以 `final_text` 为**唯一权威**替换显示文本
+    ///（流式拼接与最终文本不一致时——漏片/重发/后端规范化——以最终为准，
+    /// 且只渲染这一条，不会再追加第二条）。
+    pub fn finish(&mut self, final_text: &str) -> &str {
+        self.shown = final_text.to_string();
+        self.active = false;
+        &self.shown
+    }
+
+    pub fn shown(&self) -> &str {
+        &self.shown
+    }
+}
+
+/// 流式回合的接线（E1）：正文分片 sink + ⏹ 停止用的外部取消令牌。
+///
+/// `cancel` 直接作为 `oneshot_turn_streaming` 的 `external_cancel`——
+/// **不新造取消机制**（触发走既有的 Timeout 同款 teardown，返回 `Cancelled`）。
+struct StreamWiring {
+    chunks: tokio::sync::mpsc::UnboundedSender<TurnChunk>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
 /// 系统级 agent 配置：**指定供应商**（空 = 全局默认）+ owner 全权限档（无沙箱）+ 专用工作区。
 pub fn agent_config(cfg: &Config, provider: &str) -> AgentConfig {
     crate::service::oneshot_agent_config_system(cfg, provider)
@@ -987,11 +1057,31 @@ fn agent_command_available(cmd: &str) -> bool {
 ///
 /// 生产路径见 [`turn`]；测试注入 mock agent（与 `teambuilder` / `runtime::oneshot`
 /// 同款 `tests/mock_acp_agent.py` 装置）。
+///
+/// E1 起本函数是 [`turn_with_stream`] 的无 sink 薄封装（签名/语义不变：既有测试与调用方零改动）。
 pub async fn turn_with(
     agent_cfg: AgentConfig,
     workspace: PathBuf,
     prompt: String,
 ) -> Result<String, String> {
+    match turn_with_stream(agent_cfg, workspace, prompt, None).await? {
+        TurnEnd::Done(text) => Ok(text),
+        TurnEnd::Stopped => Err("对话已中断。".to_string()),
+    }
+}
+
+/// 流式版内层回合（E1）：与 [`turn_with`] 同一装配，额外把正文 delta 经 sink
+/// 实时回传，并把外部取消令牌交给 oneshot（⏹ 停止）。
+///
+/// 去重口径：本函数**不去重**，只把「流式拼接」与「最终文本」两条都交给调用方；
+/// 以谁为准由渲染方决定（GUI 侧口径：回合结束时以 `final_text` 为准重建气泡，
+/// 见 `StreamingBubble::finish`）。
+async fn turn_with_stream(
+    agent_cfg: AgentConfig,
+    workspace: PathBuf,
+    prompt: String,
+    stream: Option<StreamWiring>,
+) -> Result<TurnEnd, String> {
     let msg = InboundMsg {
         id_hex: uuid::Uuid::new_v4().to_string(),
         author_role: crate::config::SenderRole::Owner.as_str().to_string(),
@@ -999,12 +1089,17 @@ pub async fn turn_with(
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "syschat".to_string(),
     };
-    let outcome = crate::runtime::oneshot::oneshot_turn(
+    let (chunk_tx, cancel) = match stream {
+        Some(w) => (Some(w.chunks), Some(w.cancel)),
+        None => (None, None),
+    };
+    let outcome = crate::runtime::oneshot::oneshot_turn_streaming(
         agent_cfg,
         Some(workspace.display().to_string()),
         msg,
         TURN_BUDGET,
-        None,
+        cancel,
+        chunk_tx,
     )
     .await;
     match outcome {
@@ -1012,7 +1107,7 @@ pub async fn turn_with(
             if text.trim().is_empty() {
                 Err("模型返回了空回复。".to_string())
             } else {
-                Ok(text)
+                Ok(TurnEnd::Done(text))
             }
         }
         SyncTurnOutcome::Timeout => Err(format!(
@@ -1021,26 +1116,18 @@ pub async fn turn_with(
         )),
         SyncTurnOutcome::Closed => Err("agent 不可用（会话未建起）。".to_string()),
         SyncTurnOutcome::Failed(reason) => Err(reason),
-        SyncTurnOutcome::Cancelled => Err("对话已中断。".to_string()),
+        // E1：停止不是错误——已生成文本另存，GUI 保留已显示内容并提示「已停止」。
+        SyncTurnOutcome::Cancelled => Ok(TurnEnd::Stopped),
     }
 }
 
-/// 跑一轮系统级对话（生产入口）：按**当前会话**（与其模型选择）装配 agent，再交给
-/// [`turn_core`] 跑会话/历史逻辑。模型选择在**本轮开头**解析一次 ⇒「切换从下一条消息起生效」。
-pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
-    turn_with_attachments(cfg, user_text, &[]).await
-}
-
-/// 带待发附件的一轮系统级对话（C 批：📎 / ⌘V）。
+/// 会话/agent 配置/工作区装配（[`turn_with_attachments`] 与 [`turn_streaming`] 共用）。
 ///
-/// 附件只以**本地路径**进 prompt（见 [`prompt_with_attachments`]），落盘与去重已在
-/// [`land_attachments`] 完成；历史仍只记用户输入的文本——后续回合重放的是对话，不是
-/// 附件清单（同一条附件不会因为历史重放而被反复描述）。
-pub async fn turn_with_attachments(
+/// 返回 `(store, session_id, agent_cfg, ws, trimmed_text)`。
+fn prepare_turn(
     cfg: &Config,
     user_text: &str,
-    atts: &[Attachment],
-) -> Result<String, String> {
+) -> Result<(SessionStore, String, AgentConfig, PathBuf, String), String> {
     let text = user_text.trim();
     if text.is_empty() {
         return Err("消息为空。".to_string());
@@ -1073,8 +1160,59 @@ pub async fn turn_with_attachments(
     let ws = workspace();
     std::fs::create_dir_all(&ws)
         .map_err(|e| format!("创建系统对话工作区失败（{}）：{e}", ws.display()))?;
+    Ok((store, session_id, agent_cfg, ws, text.to_string()))
+}
 
-    turn_core(&store, &session_id, agent_cfg, ws, text, atts).await
+/// 跑一轮系统级对话（非流式，保留的非流式入口）：按**当前会话**（与其模型选择）
+/// 装配 agent，再交给 [`turn_core`] 跑会话/历史逻辑。模型选择在**本轮开头**解析一次
+/// ⇒「切换从下一条消息起生效」。
+///
+/// GUI 生产路径已统一走流式 [`turn_streaming`]（打字机 + ⏹）；本函数与
+/// [`turn_with_attachments`] 保留给无打字机需求的调用方（headless / 将来入口）。
+#[allow(dead_code)] // 保留的非流式 API；当前 bin 内无调用点
+pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
+    turn_with_attachments(cfg, user_text, &[]).await
+}
+
+/// 带待发附件的一轮系统级对话（C 批：📎 / ⌘V，非流式）。
+///
+/// 附件只以**本地路径**进 prompt（见 [`prompt_with_attachments`]），落盘与去重已在
+/// [`land_attachments`] 完成；历史仍只记用户输入的文本——后续回合重放的是对话，不是
+/// 附件清单（同一条附件不会因为历史重放而被反复描述）。
+pub async fn turn_with_attachments(
+    cfg: &Config,
+    user_text: &str,
+    atts: &[Attachment],
+) -> Result<String, String> {
+    let (store, session_id, agent_cfg, ws, text) = prepare_turn(cfg, user_text)?;
+    match turn_core(&store, &session_id, agent_cfg, ws, &text, atts, None).await? {
+        TurnEnd::Done(reply) => Ok(reply),
+        TurnEnd::Stopped => Err("对话已中断。".to_string()),
+    }
+}
+
+/// 带待发附件的**流式**系统级回合（E1，GUI 打字机 + ⏹ 停止的生产入口）。
+///
+/// 与 [`turn_with_attachments`] 共用会话/历史逻辑，额外把正文 delta 经 `chunks` 实时
+/// 回传；`cancel` 触发时返回 [`TurnEnd::Stopped`]，已生成部分已随分片流出并被落进历史。
+pub async fn turn_streaming(
+    cfg: &Config,
+    user_text: &str,
+    atts: &[Attachment],
+    chunks: tokio::sync::mpsc::UnboundedSender<TurnChunk>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<TurnEnd, String> {
+    let (store, session_id, agent_cfg, ws, text) = prepare_turn(cfg, user_text)?;
+    turn_core(
+        &store,
+        &session_id,
+        agent_cfg,
+        ws,
+        &text,
+        atts,
+        Some(StreamWiring { chunks, cancel }),
+    )
+    .await
 }
 
 /// 可测核心：会话 store / agent 配置 / 工作区都由调用方注入（测试用临时目录 + mock agent，
@@ -1082,6 +1220,9 @@ pub async fn turn_with_attachments(
 ///
 /// 历史锁只包住两段短临界区（读史+落用户轮 / 落助手轮），**回合在锁外跑**：
 /// 回合最长 10 分钟，持锁跨回合会阻塞 GUI 主线程的清空/重开（同一个 `history.lock`）。
+///
+/// `stream = Some` 时接线 E1 流式：delta 一边喂 GUI（`chunks`）、一边在本地累积——
+/// 用户「停止」时把已生成文本落进历史（否则重开对话框那段回复就消失了，与「保留已生成文本」相悖）。
 async fn turn_core(
     store: &SessionStore,
     session_id: &str,
@@ -1089,7 +1230,8 @@ async fn turn_core(
     ws: PathBuf,
     user_text: &str,
     atts: &[Attachment],
-) -> Result<String, String> {
+    stream: Option<StreamWiring>,
+) -> Result<TurnEnd, String> {
     let text = user_text.trim();
     // 临界区 1：读该会话历史拼 prompt + 落用户轮 + 刷新标题/时间。先落用户轮是为了：
     // 即使回合失败，用户说过的话也不该丢（下次重开对话框仍能看到自己的提问）。
@@ -1119,10 +1261,61 @@ async fn turn_core(
         prompt
     };
 
-    let reply = turn_with(agent_cfg, ws, prompt).await?;
+    // 回合在锁外跑。返回 `(要落历史的助手文本, 是否用户停止)`：
+    // - 正常完成 → 最终文本就是 `final_text`（去重口径的权威侧）；
+    // - 用户停止 → 用本地累积的已生成文本（GUI 侧已有同一份，不重复发）。
+    let (reply, stopped) = match stream {
+        None => {
+            // 非流式：cancel 恒 None ⇒ 不会 Stopped；turn_with 直接给最终文本。
+            let reply = turn_with(agent_cfg, ws, prompt).await?;
+            (Some(reply), false)
+        }
+        Some(w) => {
+            // 中间层：sink 的每条分片既累积（停止时用）又转发给 GUI（`w.chunks`）。
+            let acc = std::sync::Arc::new(std::sync::Mutex::new(StreamingBubble::start()));
+            let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+            let gui = w.chunks.clone();
+            let acc2 = acc.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(chunk) = inner_rx.recv().await {
+                    if chunk.kind == ChunkKind::Text {
+                        if let Ok(mut b) = acc2.lock() {
+                            b.push(&chunk.text);
+                        }
+                    }
+                    // GUI 侧收端若提前消失（窗口关了），不必中断回合——只是不再累积之外的多余投递。
+                    let _ = gui.send(chunk);
+                }
+            });
+            let res = turn_with_stream(
+                agent_cfg,
+                ws,
+                prompt,
+                Some(StreamWiring {
+                    chunks: inner_tx,
+                    cancel: w.cancel,
+                }),
+            )
+            .await;
+            // 回合已收尾 ⇒ sink 已摘除，转发任务随之结束；等它把缓冲分片冲完再决定停止态文本。
+            let _ = forwarder.await;
+            match res? {
+                TurnEnd::Done(reply) => (Some(reply), false),
+                TurnEnd::Stopped => {
+                    let partial = acc
+                        .lock()
+                        .map(|b| b.shown().to_string())
+                        .unwrap_or_default();
+                    // 一个分片都没流出（极早停止）：不落空的助手轮。
+                    let partial = (!partial.trim().is_empty()).then_some(partial);
+                    (partial, true)
+                }
+            }
+        }
+    };
 
-    // 临界区 2：落助手轮 + 刷新会话时间。
-    {
+    // 临界区 2：落助手轮 + 刷新会话时间（停止时落的是已生成部分）。
+    if let Some(reply) = &reply {
         let _g = store.lock()?;
         let now = crate::chrono_lite::unix_secs() as i64;
         store
@@ -1141,12 +1334,17 @@ async fn turn_core(
         }
         let _ = store.save(&state);
     }
-    Ok(reply)
+    Ok(if stopped {
+        TurnEnd::Stopped
+    } else {
+        TurnEnd::Done(reply.unwrap_or_default())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     fn turn_of(role: &str, text: &str) -> Turn {
         Turn {
@@ -1386,6 +1584,105 @@ mod tests {
         );
     }
 
+    /// E1 流式全链路（隔离夹具）：sink 真的转发正文 delta，回合结局 Ok，
+    /// 历史里助手轮与最终文本一致（去重口径的数据侧前提）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn turn_core_streaming_forwards_deltas_and_records_history() {
+        let rec =
+            std::env::temp_dir().join(format!("abb-syschat-srec-{}.jsonl", uuid::Uuid::new_v4()));
+        let (store, base) = tmp_store("stream");
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st));
+        store.save(&st).unwrap();
+        let id = st.current.clone();
+        let ws = std::env::temp_dir().join(format!("abb-syschat-sws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        let end = turn_core(
+            &store,
+            &id,
+            mock_agent_cfg(&rec),
+            ws,
+            "syschat-stream-marker",
+            &[],
+            Some(StreamWiring {
+                chunks: tx,
+                cancel: CancellationToken::new(),
+            }),
+        )
+        .await
+        .expect("mock echo 回合应 Done");
+        let TurnEnd::Done(text) = end else {
+            panic!("未取消的回合应为 Done，实际 {end:?}");
+        };
+        assert!(text.contains("syschat-stream-marker"), "最终文本: {text}");
+
+        // 回合已收尾 ⇒ sink 已摘除；缓冲区里的分片不会再增长。
+        let mut streamed = String::new();
+        while let Ok(c) = rx.try_recv() {
+            streamed.push_str(&c.text);
+        }
+        assert!(
+            streamed.contains("syschat-stream-marker"),
+            "sink 应转发正文 delta: {streamed}"
+        );
+        // 去重口径前提：mock 单分片场景下流式拼接与最终文本逐字节相等。
+        assert_eq!(streamed, text, "流式拼接应等于最终文本");
+
+        // 历史：user + assistant 两条，助手轮 = 最终文本。
+        let hist = store.read_history(&id);
+        assert_eq!(hist.len(), 2, "历史应含 user + assistant: {hist:?}");
+        assert_eq!(hist[1].role, "assistant");
+        assert_eq!(hist[1].text, text);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── E1 流式累积/去重/停止态（纯逻辑，GUI 与历史共用）──
+
+    #[test]
+    fn streaming_bubble_accumulates_in_order() {
+        let mut b = StreamingBubble::start();
+        assert!(b.push("打"));
+        assert!(b.push("字"));
+        assert!(!b.push(""), "空 delta 不算变化");
+        assert_eq!(b.shown(), "打字");
+        assert!(b.active);
+        assert!(!b.stopped);
+    }
+
+    /// 去重口径：回合结束时以最终文本为唯一权威替换显示文本（不一致时不拼接、不重复）。
+    #[test]
+    fn streaming_bubble_finish_replaces_with_final_text() {
+        let mut b = StreamingBubble::start();
+        b.push("已流出的一部分");
+        assert_eq!(b.finish("最终完整文本"), "最终完整文本");
+        assert_eq!(b.shown(), "最终完整文本", "不得保留旧拼接");
+        assert!(!b.active);
+    }
+
+    #[test]
+    fn streaming_bubble_finish_identical_is_stable() {
+        let mut b = StreamingBubble::start();
+        b.push("一样");
+        assert_eq!(b.finish("一样"), "一样");
+        assert_eq!(b.shown(), "一样");
+    }
+
+    #[test]
+    fn streaming_bubble_stop_keeps_generated_text() {
+        let mut b = StreamingBubble::start();
+        b.push("生成到一半");
+        b.stop();
+        assert_eq!(b.shown(), "生成到一半", "停止必须保留已生成文本");
+        assert!(b.stopped);
+        assert!(!b.active);
+    }
+
     // ── A 批：会话 store（用临时 base，不碰真实 ~/.agent-bridge）──
 
     #[test]
@@ -1481,6 +1778,13 @@ mod tests {
         assert!(!is_valid_session_id(&"x".repeat(65)));
     }
 
+    fn done_text(end: TurnEnd) -> String {
+        match end {
+            TurnEnd::Done(t) => t,
+            TurnEnd::Stopped => panic!("非取消回合不应是 Stopped"),
+        }
+    }
+
     /// `turn_core` 级两会话隔离：按会话读史→拼 prompt→落各会话，互不串。
     #[tokio::test]
     #[cfg_attr(
@@ -1506,27 +1810,33 @@ mod tests {
         let rec =
             |tag: &str| std::env::temp_dir().join(format!("{tag}-{}.jsonl", uuid::Uuid::new_v4()));
 
-        let r1 = turn_core(
-            &store,
-            &s1,
-            mock_agent_cfg(&rec("abb-sc-t1")),
-            ws.clone(),
-            "probe-one",
-            &[],
-        )
-        .await
-        .unwrap();
+        let r1 = done_text(
+            turn_core(
+                &store,
+                &s1,
+                mock_agent_cfg(&rec("abb-sc-t1")),
+                ws.clone(),
+                "probe-one",
+                &[],
+                None,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(r1.contains("probe-one"));
-        let r2 = turn_core(
-            &store,
-            &s2,
-            mock_agent_cfg(&rec("abb-sc-t2")),
-            ws.clone(),
-            "probe-two",
-            &[],
-        )
-        .await
-        .unwrap();
+        let r2 = done_text(
+            turn_core(
+                &store,
+                &s2,
+                mock_agent_cfg(&rec("abb-sc-t2")),
+                ws.clone(),
+                "probe-two",
+                &[],
+                None,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(r2.contains("probe-two"));
 
         let h1 = store.read_history(&s1);
@@ -1553,16 +1863,19 @@ mod tests {
 
         // **读路径承重**：再各问一轮 → prompt 里必须带**自己**的历史、不带对方的（
         // 否则 `read_history` 按固定 id / 错会话拿到历史也能让上面的断言全绿）。
-        let r1b = turn_core(
-            &store,
-            &s1,
-            mock_agent_cfg(&rec("abb-sc-t3")),
-            ws.clone(),
-            "again-one",
-            &[],
-        )
-        .await
-        .unwrap();
+        let r1b = done_text(
+            turn_core(
+                &store,
+                &s1,
+                mock_agent_cfg(&rec("abb-sc-t3")),
+                ws.clone(),
+                "again-one",
+                &[],
+                None,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(
             r1b.contains("probe-one"),
             "s1 第二轮须读到自己第一轮的历史：{r1b}"
@@ -1571,16 +1884,19 @@ mod tests {
             !r1b.contains("probe-two"),
             "s1 第二轮不得读到 s2 的历史：{r1b}"
         );
-        let r2b = turn_core(
-            &store,
-            &s2,
-            mock_agent_cfg(&rec("abb-sc-t4")),
-            ws.clone(),
-            "again-two",
-            &[],
-        )
-        .await
-        .unwrap();
+        let r2b = done_text(
+            turn_core(
+                &store,
+                &s2,
+                mock_agent_cfg(&rec("abb-sc-t4")),
+                ws.clone(),
+                "again-two",
+                &[],
+                None,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(
             r2b.contains("probe-two"),
             "s2 第二轮须读到自己第一轮的历史：{r2b}"
@@ -1784,16 +2100,19 @@ mod tests {
             path: PathBuf::from("/tmp/att-marker/shot.png"),
             bytes: 3,
         };
-        let reply = turn_core(
-            &store,
-            &sid,
-            mock_agent_cfg(&rec),
-            ws.clone(),
-            "看这张",
-            std::slice::from_ref(&att),
-        )
-        .await
-        .unwrap();
+        let reply = done_text(
+            turn_core(
+                &store,
+                &sid,
+                mock_agent_cfg(&rec),
+                ws.clone(),
+                "看这张",
+                std::slice::from_ref(&att),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(
             reply.contains("/tmp/att-marker/shot.png"),
             "附件路径必须进 prompt 并被 echo：{reply}"

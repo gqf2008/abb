@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, ResourceUpdate};
+use crate::runtime::acp::{AcpClient, AcpError, ResourceUpdate, TurnChunk};
 use crate::runtime::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
@@ -371,6 +371,12 @@ pub struct RuntimeHandle {
     sync_waiters: std::sync::Mutex<
         std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SyncWaitMsg>>,
     >,
+    /// 流式分片 sink（E1）：channel_id → 分片回传通道。调用方（`oneshot_turn_streaming`）
+    /// 在等回合之前装入，回合收尾时移除；未装（非流式回合）时分片被丢弃（行为同接线前）。
+    /// 与 `sync_waiters` 同键：一个 in-flight 频道至多一个流式消费者。
+    chunk_sinks: std::sync::Mutex<
+        std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
+    >,
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
 
@@ -457,6 +463,7 @@ impl RuntimeHandle {
             turn_tx,
             turn_rx: std::sync::Mutex::new(Some(turn_rx)),
             sync_waiters: std::sync::Mutex::new(std::collections::HashMap::new()),
+            chunk_sinks: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -530,6 +537,31 @@ impl RuntimeHandle {
     /// 清表防条目泄漏（迟到的回合文本/死信 send 进已 drop 的 rx 静默丢弃）。
     pub fn remove_sync_waiter(&self, channel_id: Uuid) {
         self.sync_waiters.lock().unwrap().remove(&channel_id);
+    }
+
+    /// 装入/替换某频道的流式分片 sink（E1）。调用方在等回合前装入；
+    /// 未装时 `send_turn_chunk` 静默丢弃（非流式回合的常态）。
+    pub fn set_turn_chunk_sink(
+        &self,
+        channel_id: Uuid,
+        tx: tokio::sync::mpsc::UnboundedSender<TurnChunk>,
+    ) {
+        self.chunk_sinks.lock().unwrap().insert(channel_id, tx);
+    }
+
+    /// 移除某频道的流式 sink（回合结束/取消后收尾；不摘掉会让已 drop 的
+    /// 接收端对应的 sender 一直占表，迟发分片也无人消费）。
+    pub fn remove_turn_chunk_sink(&self, channel_id: Uuid) {
+        self.chunk_sinks.lock().unwrap().remove(&channel_id);
+    }
+
+    /// 把一条流式分片投给该频道的 sink（未装/接收端已 drop 则丢弃）。
+    /// 主循环的 [`handle_turn_chunk`] 路由到这里。
+    fn send_turn_chunk(&self, channel_id: Uuid, chunk: TurnChunk) {
+        let g = self.chunk_sinks.lock().unwrap();
+        if let Some(tx) = g.get(&channel_id) {
+            let _ = tx.send(chunk);
+        }
     }
 
     /// `!cancel`：取消该频道在跑回合。`Ok(true)` = 已向在跑任务发 Cancel 信号；
@@ -638,6 +670,10 @@ struct Loop {
     /// 发送端带 **agent 槽位**：执行层会话号是进程内的，必须连同 agent 身份一起上报，
     /// 否则多 agent 并发时归属会串（评审 F1）。
     resource_tx: mpsc::UnboundedSender<(usize, ResourceUpdate)>,
+    /// 流式正文分片（E1）：接收端在本循环 select 里，发送端按槽位挂到该槽位的 `AcpClient`
+    /// （与 resource 同款：每次新拉起都重挂，respawn 后不会静默断流）。
+    chunk_rx: mpsc::UnboundedReceiver<(usize, TurnChunk)>,
+    chunk_tx: mpsc::UnboundedSender<(usize, TurnChunk)>,
     /// 资源事件节流器（判定 + 记账 + 限频日志，见 [`ResourceThrottle`]）。
     ///
     /// 窗口恒为 [`RESOURCE_EVENT_MIN_INTERVAL`]（**不提供测试注入**：评审 F4 指出原字段从无
@@ -656,6 +692,8 @@ impl Loop {
         // agent 主动上报的事件通道（MCP 资源更新）：接收端进本循环 select，发送端挂到各槽位的 AcpClient。
         let (resource_tx, resource_rx) =
             mpsc::unbounded_channel::<(usize, crate::runtime::acp::ResourceUpdate)>();
+        // 流式正文分片通道（E1）：与 resource 同款，槽位随事件上报。
+        let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<(usize, TurnChunk)>();
         let l = Self {
             ctx,
             pool,
@@ -670,6 +708,8 @@ impl Loop {
             registry: crate::runtime::pool::SessionRegistry::default(),
             resource_rx,
             resource_tx,
+            chunk_rx,
+            chunk_tx,
             resource_throttle: ResourceThrottle::new(Instant::now()),
         };
         (l, steer_ack_rx)
@@ -711,6 +751,7 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
                 j = join_set.join_next(), if !join_set.is_empty() => j.map(Evt::Panic),                a = steer_ack_rx.recv() => a.map(Evt::SteerAck),
                 life = life_rx.recv() => life.map(Evt::Life),
                 r = l.resource_rx.recv() => r.map(|(i, u)| Evt::Resource(i, u)),
+                c = l.chunk_rx.recv() => c.map(|(i, c)| Evt::Chunk(i, c)),
             }
         };
         let Some(evt) = evt else {
@@ -727,6 +768,7 @@ pub async fn run_loop(handle: Arc<RuntimeHandle>) {
             Evt::SteerAck(ack) => handle_steer_ack(&mut l, ack),
             Evt::Life(outcome) => handle_spawn_outcome(&mut l, &handle, outcome),
             Evt::Resource(index, update) => handle_resource_update(&mut l, &handle, index, update),
+            Evt::Chunk(index, chunk) => handle_turn_chunk(&l, &handle, index, chunk),
             Evt::Reap => reap_idle_agents(&mut l),
         }
         dispatch_pending(&mut l);
@@ -747,6 +789,8 @@ enum Evt {
     /// 回收巡检节拍：把闲置的额外 agent 收掉（保留 0 号热实例）。
     Reap,
     Resource(usize, ResourceUpdate),
+    /// agent 在途回合上报的正文/思考分片（E1）：槽位号 + 分片本体。
+    Chunk(usize, TurnChunk),
 }
 
 // ── Cmd 处理 ─────────────────────────────────────────────────────────────────
@@ -1142,6 +1186,17 @@ fn log_resource_lines(lines: &[String]) {
     }
 }
 
+/// 流式正文分片 → 频道：按 `(槽位, session_id)` 反查频道，再投给该频道的 sink。
+///
+/// 反查不到时静默丢弃（会话已失效 / 取消后被重拉的迟到分片）——这里不能像资源事件那样
+/// 落成入站消息：分片不是独立回合语义，只是当前回合的实时投影。
+fn handle_turn_chunk(l: &Loop, handle: &Arc<RuntimeHandle>, agent_index: usize, chunk: TurnChunk) {
+    let Some(channel_id) = l.registry.channel_for(agent_index, &chunk.session_id) else {
+        return;
+    };
+    handle.send_turn_chunk(channel_id, chunk);
+}
+
 fn handle_resource_update(
     l: &mut Loop,
     handle: &Arc<RuntimeHandle>,
@@ -1261,6 +1316,19 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &RuntimeHandle, outcome: SpawnOutc
                 }
             });
             agent.acp.set_resource_sink(raw_tx);
+            // E1：流式正文分片同款——每次拉起都重挂 sink，respawn 后流式不会静默断掉。
+            // 旧 AcpClient 随进程一起 drop，它的 sink 自然失效（不会重复投递）。
+            let (chunk_raw_tx, mut chunk_raw_rx) = mpsc::unbounded_channel::<TurnChunk>();
+            let chunk_tagged_tx = l.chunk_tx.clone();
+            let chunk_slot = agent.index;
+            tokio::spawn(async move {
+                while let Some(chunk) = chunk_raw_rx.recv().await {
+                    if chunk_tagged_tx.send((chunk_slot, chunk)).is_err() {
+                        break;
+                    }
+                }
+            });
+            agent.acp.set_chunk_sink(chunk_raw_tx);
             l.pool.return_agent(agent);
             // 起来了就清掉旧失败原因：否则用户会拿着上一次的旧原因排查现在的故障。
             handle.set_last_start_error(None);
