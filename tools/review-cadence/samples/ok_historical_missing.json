@@ -1,0 +1,33 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "x",
+        "body": "y"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-1",
+      "ts": 999999,
+      "body": {
+        "decision": "request_changes",
+        "agent": "abb-reviewer-1",
+        "note": "历史评审，无契约行"
+      }
+    },
+    "oid": "h1",
+    "principal": "abb-reviewer-1",
+    "verified": true
+  }
+]

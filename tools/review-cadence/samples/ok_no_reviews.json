@@ -1,0 +1,17 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "x",
+        "body": "y"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  }
+]

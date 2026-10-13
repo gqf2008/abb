@@ -46,7 +46,10 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **Merge & close (§5)**: the coordinator merges locally (**fast-forward preferred**), pushes to
   `origin`, records **one** `merge_result {"merged":true,"oid":"<sha>","result":"merged"}` (that entry
   moves the card to `merged`), then `status: closed`; afterwards remove the card's worktree and branch
-  and verify with `git worktree list`.
+  and verify with `git worktree list`. **Before writing `merge_result`, run
+  `tools/check_review_cadence.sh <thread-id>` — red means do not merge** (contract + blocking-round
+  guard, see `docs/review-findings-contract.md`; its sample self-test runs in `.walgit/ci.toml` as
+  `review-cadence-selftest`).
 - **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
