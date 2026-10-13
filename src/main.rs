@@ -557,6 +557,20 @@ fn main() {
         std::process::exit(run_session_cli(&args[2..]));
     }
 
+    // 图形生成 CLI（卡 abb-chart-cli-20261013）：`agent-bridge chart render --spec a.json --out a.png`。
+    //
+    // 为什么是**子命令转发**而不是自己渲染：出图要 charton（edition 2024 ⇒ rustc ≥1.85），
+    // 而本 crate 的依赖树与签名产物都不该为此变动；渲染 panic 也不该砸掉托盘进程。
+    // 转发到同目录随包 `abb-chart`（与 `abb-agent` 同一分发形态），缺失时**显式报错、
+    // 不静默降级**——静默降级会变成「模型以为画好了，用户什么也没收到」。
+    //
+    // 为什么值得走 `$ABB_BIN` 而不是让 agent 直接调 `abb-chart`：受限（授权者）会话的
+    // shell 白名单只放行 `$ABB_BIN` 的子命令（见 guard::check_abb_bin），第三方二进制
+    // 本来就在拒绝之列。挂在 `$ABB_BIN` 下，授权面就是一处、可审、可单测。
+    if args.len() >= 2 && args[1] == "chart" {
+        std::process::exit(run_chart_cli(&args[2..]));
+    }
+
     // 删除保护回收站 CLI（#88）：供 owner 手动恢复/清理（也可被桥 /trash 指令调用）。
     //   agent-bridge trash list [--bot <key>] [--pending]
     //   agent-bridge trash restore <id> [--bot <key>]
@@ -2292,6 +2306,71 @@ fn session_reset_chat_id(args: &[String], env_chat: &str) -> Result<String, Stri
 
 /// 工作区版本管理 CLI（#209 批次 4/5）：快照历史 / 按快照恢复 / 保护状态一览。
 /// bot 缺省从 AGENT_BRIDGE_BOT_KEY env 解析（同 trash）。
+/// 随包图形生成 CLI 的文件名（两平台同名；Windows 的 `.exe` 由
+/// [`bundled_chart_path_in`] 按 `EXE_SUFFIX` 拼）。
+pub const BUNDLED_CHART: &str = "abb-chart";
+
+/// 在「给定目录（缺省 = 主程序所在目录）」里找随包 `abb-chart`。
+///
+/// 抽成可注入目录的纯函数是为了能单测「同目录有 / 没有」两条路径——`current_exe` 在
+/// 测试里指向 cargo 的测试二进制，不可依赖。
+pub fn bundled_chart_path_in(exe_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let dir = match exe_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_exe().ok()?.parent()?.to_path_buf(),
+    };
+    let candidate = dir.join(format!("{BUNDLED_CHART}{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
+}
+
+/// `chart` 子命令：用法自解释，其余参数**原样转发**给随包 `abb-chart`，退出码透传。
+///
+/// 退出码语义由 `abb-chart` 定义（0 成功 / 1 渲染失败 / 2 用法错）；调用方是模型写的
+/// shell 命令，靠退出码决定要不要改参数重试，所以这里不做任何"归一化"（那只会丢信息）。
+fn run_chart_cli(args: &[String]) -> i32 {
+    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
+        // 本层只报「桥的这条命令怎么用」；图规格怎么写由 `chart render --help` 回答——
+        // 把两层帮助混成一份会更难看懂哪层是哪个。
+        println!(
+            "用法：agent-bridge chart <abb-chart 的参数>\n\n\
+             agent-bridge chart 是随包图形生成 CLI（abb-chart）的入口，参数原样转发。\n\
+             最常用：`agent-bridge chart render --spec spec.json --out chart.png`\n\
+             完整说明（图规格字段、字体、尺寸）：`agent-bridge chart render --help`\n\n\
+             出图后用 deliver 发回当前会话：\n\
+             \x20 agent-bridge deliver --to-current --file chart.png --text \"图好了\""
+        );
+        return 0;
+    }
+
+    let Some(exe) = bundled_chart_path_in(None) else {
+        // 显式报错、不静默降级：找不到渲染器时静默"成功"会让模型以为图已画好，
+        // 而用户什么也收不到——那是最坏的失败模式。
+        let me = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "agent-bridge".to_string());
+        eprintln!(
+            "找不到随包的图形生成程序 `{BUNDLED_CHART}`（应与 {me} 同目录）。\n\
+             开发构建请先：cargo build --manifest-path crates/abb-chart/Cargo.toml，\n\
+             并把产物放到主程序同目录。安装包出现这条 = 打包漏了该产物（请报 bug）。"
+        );
+        return 1;
+    };
+
+    match std::process::Command::new(&exe)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+    {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("启动 {} 失败：{e}", exe.display());
+            1
+        }
+    }
+}
+
 fn run_wsver_cli(args: &[String]) -> i32 {
     let Some(sub) = args.first().map(|s| s.as_str()) else {
         eprintln!("用法：agent-bridge wsver log|restore <commit> <path>|status [--bot <key>]");
@@ -2668,6 +2747,71 @@ mod tests {
         describe_trigger, job_cli_to_task_args, parse_task_to, parse_task_to_target,
         read_task_logs, session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
     };
+
+    /// `chart` 子命令转发器找到随包 `abb-chart`（同目录存在即命中，并按平台拼 `.exe`）。
+    ///
+    /// 判别力：把 `EXE_SUFFIX` 去掉 ⇒ Windows 上这条红（找不到 `abb-chart.exe`）。
+    #[test]
+    fn bundled_chart_is_found_next_to_the_main_binary() {
+        // 本 crate 没有 `tempfile` 依赖（走仓库既有约定：temp_dir + uuid 子目录）。
+        let dir = std::env::temp_dir().join(format!("abb-chart-lookup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("abb-chart{}", std::env::consts::EXE_SUFFIX);
+        let fake = dir.join(&name);
+        std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
+        assert_eq!(super::bundled_chart_path_in(Some(&dir)), Some(fake.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同目录没有 `abb-chart` ⇒ `None`（调用方据此**显式报错**，不静默降级）。
+    #[test]
+    fn bundled_chart_missing_yields_none() {
+        let dir = std::env::temp_dir().join(format!("abb-chart-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::bundled_chart_path_in(Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同名**目录**不算命中（`is_file` 而不是 `exists`）：否则建个目录就能让转发器把
+    /// `Command::new(<目录>)` 拷进去报一堆看不懂的错。
+    #[test]
+    fn a_directory_named_like_the_binary_is_not_a_hit() {
+        let dir = std::env::temp_dir().join(format!("abb-chart-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("abb-chart")).unwrap();
+        assert_eq!(super::bundled_chart_path_in(Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无参调用 `chart` 输出用法（含完整的「出图 → 发回会话」两句），且退出码 0——
+    /// 调用方是模型，它经常先无参跑一次看该怎么用。
+    #[test]
+    fn chart_with_no_args_prints_usage_and_succeeds() {
+        assert_eq!(super::run_chart_cli(&[]), 0);
+    }
+
+    /// `--help` 同样走用法分支（不要在帮助时真去启动子进程）。
+    #[test]
+    fn chart_help_does_not_spawn_the_child() {
+        assert_eq!(super::run_chart_cli(&["--help".to_string()]), 0);
+        assert_eq!(super::run_chart_cli(&["render".into(), "-h".into()]), 0);
+    }
+
+    /// 缺随包 `abb-chart` 时**响亮失败**（退出码 1）：静默“成功”会让模型以为图已画好，
+    /// 而用户什么也收不到——那是最坏的失败模式。
+    ///
+    /// 注意：这条依赖“测试二进制的同目录里没有 abb-chart”，在 cargo 的测试目录下成立。
+    /// 若将来把 abb-chart 复制到测试目录旁边，这条会恒红——那正是提醒你要换个判据。
+    #[test]
+    fn chart_forwarding_fails_loudly_without_the_bundled_renderer() {
+        if super::bundled_chart_path_in(None).is_some() {
+            eprintln!("测试二进制旁边存在 abb-chart，跳过（本机布局不适用）");
+            return;
+        }
+        assert_eq!(
+            super::run_chart_cli(&["render".into(), "--spec".into(), "a.json".into()]),
+            1
+        );
+    }
 
     /// 升级路径拿不到 gui 锁时，**不允许留下没人管的频道**。
     ///

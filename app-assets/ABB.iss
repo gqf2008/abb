@@ -67,6 +67,9 @@ Source: "ABB.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; abb-agent（单一执行层；刀 4b 已删旧执行层）：运行时按 current_exe 同目录解析。
 ; 下面两处 taskkill 的 buzz-agent.exe 是**历史产物名**，只为升级/卸载时收掉残留进程。
 Source: "..\crates\abb-agent\target\release\abb-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+; abb-chart（图形生成，卡 abb-chart-cli-20261013）：由 `agent-bridge chart` 转发调用，
+; 同样按 current_exe 同目录解析——必须落在 {app} 根，不能放子目录。
+Source: "..\crates\abb-chart\target\release\abb-chart.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; ABB 本体 MIT：再分发需附副本。
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "ABB-LICENSE.txt"; Flags: ignoreversion
 ; 随包工具：rg/jq/uv/gh；git/bun/sed/find 明确不随包。
@@ -97,6 +100,9 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM agent-bridge.exe"; Flags: runhidden; RunOnceId: "AbbKillBridge"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM buzz-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillBuzz"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-agent.exe"; Flags: runhidden; RunOnceId: "AbbKillNewAgent"
+; abb-chart 是一次性进程（渲染完即退），但升级瞬间可能正在渲染：它锁着 {app}\abb-chart.exe，
+; 不结束就会让覆盖写失败（与上面同一类问题，只是窗口更小）。
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-chart.exe"; Flags: runhidden; RunOnceId: "AbbKillChart"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ABB /f"; Flags: runhidden; RunOnceId: "AbbDelRunKey"
 
 [Run]
@@ -136,6 +142,9 @@ begin
   Exec('taskkill.exe', '/F /T /IM buzz-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   // abb-agent（新执行层）也要收：它可能正跑着工具/shell 子进程。
   Exec('taskkill.exe', '/F /T /IM abb-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
+  // abb-chart（图形生成）：一次性进程，但升级瞬间可能正在渲染——它锁着 {app}\abb-chart.exe，
+  // 不结束的话覆盖写会失败（同 RestartManager 关不掉的那类问题，只是窗口更小）。
+  Exec('taskkill.exe', '/F /T /IM abb-chart.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Sleep(1200);
 end;
 

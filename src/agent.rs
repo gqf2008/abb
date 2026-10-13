@@ -37,7 +37,9 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// mac/win 的 agent 环境都调不到）自动覆盖升级；已含标记的文件不动（幂等）。
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v13";
+// v14：加「## 画图」一节（chart 子命令 = 随包 abb-chart 的转发入口，卡 abb-chart-cli-20261013）。
+// 必须升版本号：老工作区里 v13 的指引不含画图一节，不提版本就永远补不上（幂等靠 marker）。
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v14";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -137,6 +139,51 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - 用户取消（`task cancel <id>`）后不再投递结果。
 - 受限（授权者）会话里只放行 `task add`——`list` / `status` / `logs` / `cancel` / `rm` 会被闸
   拒绝（它们能暴露或删改别的任务）。需要查状态或取消时，让用户在自己的终端/owner 会话里做。
+
+## 画图（图形生成必须走这条）
+
+用户要「画个图 / 出个图表 / 把这组数据可视化」时，用 **`\"$ABB_BIN\" chart`**（随包图形生成 CLI，
+参数原样转发给 `abb-chart`）。owner 会话与受限（授权者）会话**都可用**：受限会话只放行
+`chart render`，且所有路径参数（`--spec`/`--data`/`--out`）必须在会话工作区内。
+
+**两步走**（不要只做第一步就说「画好了」——附件不会自动发出去，见下一节）：
+
+1. 先写图规格 JSON（字段：`mark` / `x` / `y` / `title` / `data` 或 `rows` / `types` …）：
+
+   ```
+   cat > chart_spec.json <<'EOF'
+   {{
+     \"title\": \"季度销售额\",
+     \"mark\": \"bar\",
+     \"x\": \"季度\",
+     \"y\": \"销售额\",
+     \"data\": \"sales.csv\",
+     \"types\": {{ \"季度\": \"category\" }},
+     \"width\": 1000,
+     \"height\": 600
+   }}
+   EOF
+   \"$ABB_BIN\" chart render --spec chart_spec.json --out chart.png
+   \"$ABB_BIN\" deliver --to-current --file chart.png --text \"图好了\"
+   ```
+
+2. 细节看它的帮助（不要背参数，随时可查）：
+   `\"$ABB_BIN\" chart --help`；完整的规格字段说明与例子：`\"$ABB_BIN\" chart render --help`。
+
+**规则（都对成败有直接影响）**：
+
+- **只出 PNG**（`--out xx.png`）。三个聊天平台的图片通道只认 png/jpg/jpeg/gif/bmp，svg 会被降级成
+  文件卡片；`--debug-svg` 只供本地排查，不要拿它交付。
+- **`mark` 可选**：`point`（散点）/`line`（折线）/`bar`（柱状）/`area`/`hist`（直方图）/
+  `density`（密度）/`box`/`violin`/`errorbar`/`rule`（参考线）/`text`；也认 `scatter`/`column` 这类别名。
+- **数据源**：CSV 文件（`\"data\": \"x.csv\"`，相对路径按规格文件所在目录解析）或内联
+  `\"rows\": [{{\"列\": 值}}, …]`；也可以命令行给 `--data x.csv`。列类型自动推断（非空值全是数字 = 数值列）。
+- **名义型数字要用柱状图时必须声明分类**：年份/月份/编号这类「看着是数字、实际是分类」的列，写
+  `\"types\": {{\"年份\": \"category\"}}`。不写的话柱状图会以「分组轴必须是分类轴」报错（错误里也会提醒这条）。
+- **中文不用特殊处理**（字体自动挑：macOS 用 `Hiragino Sans GB`）；`--font` 可换字体，但本机不存在的
+  族名会被**拒绝**（不存在的字体渲染时会静默变成方框，所以宁可报错）。
+- **受限会话别用管道**：`--spec` 收**文件路径**（受限档禁管道/重定向，`--spec -` 读 stdin 到不了那里）。
+- 渲染失败时把命令输出里的那句话**原样**告诉用户（它写明了缺什么、怎么写），不要自己编原因，也不要反复重试同一命令。
 
 ## 把文件发到当前会话（附件必须走这条）
 
@@ -944,6 +991,16 @@ mod tests {
                 text.contains("--to-current"),
                 "{name} 必须写明把附件发到当前会话的用法"
             );
+            // v14：画图小节（chart 子命令）必须在，且要写清「出图 → deliver 发回」两步。
+            // 只写出图不写投递 = agent 画完本地文件却告诉用户「画好了」（真实失败模式）。
+            assert!(text.contains("## 画图"), "{name} 缺 v14 的画图小节");
+            for needle in [
+                "\"$ABB_BIN\" chart render --spec",
+                "chart render --help",
+                "chart.png",
+            ] {
+                assert!(text.contains(needle), "{name} 画图小节缺「{needle}」");
+            }
             // #312：v7 新增的「后台子代理」小节必须在，且要写清委派决策规则。
             assert!(
                 text.contains("## 后台子代理 → 长任务丢后台，别堵会话"),
@@ -1091,7 +1148,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应升到最新 marker");
             assert!(!text.contains("abb-guide-v6"), "{name} 不应留 v6 marker");
             assert!(!text.contains("旧 v6 正文"), "{name} 旧正文应被整体替换");
             assert!(text.contains("## 后台子代理"), "{name} 应含子代理小节");
@@ -1147,7 +1204,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应从 v8 升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v8 升到最新");
             assert!(!text.contains("abb-guide-v8"), "{name} 不应留 v8 marker");
             assert!(!text.contains("旧 v8 正文"), "{name} 旧正文应被整体替换");
         }
@@ -1161,7 +1218,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应从 v7 升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v7 升到最新");
             assert!(!text.contains("abb-guide-v7"), "{name} 不应留 v7 marker");
             assert!(!text.contains("旧 v7 正文"), "{name} 旧正文应被整体替换");
         }
@@ -1177,7 +1234,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应从 v9 升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v9 升到最新");
             assert!(!text.contains("abb-guide-v9"), "{name} 不应留 v9 marker");
             assert!(!text.contains("旧 v9 正文"), "{name} 旧正文应被整体替换");
             assert!(
@@ -1200,7 +1257,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应从 v10 升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v10 升到最新");
             assert!(!text.contains("abb-guide-v10"), "{name} 不应留 v10 marker");
             assert!(
                 !text.contains("同一 bot 的任务串行排队执行"),
@@ -1224,7 +1281,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应从 v11 升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v11 升到最新");
             assert!(!text.contains("abb-guide-v11"), "{name} 不应留 v11 marker");
             assert!(
                 !text.contains("一次只跑一条"),
@@ -1247,7 +1304,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(text.contains("abb-guide-v13"), "{name} 应从 v12 升到 v13");
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v12 升到最新");
             assert!(!text.contains("abb-guide-v12"), "{name} 不应留 v12 marker");
             assert!(
                 !text.contains("wassette"),
