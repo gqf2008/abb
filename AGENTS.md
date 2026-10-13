@@ -131,6 +131,7 @@ tools/check_test_isolation.sh
 - Use `//!` module docs and `///` doc comments; explain *why* in comments. Existing comments are often in Chinese — match the language of the file you edit.
 - String handling must be UTF-8/char aware (e.g., `agent::truncate` truncates by chars, not bytes).
 - Keep `.slint` changes in `ui/app.slint`, consistent with existing component naming.
+- 面向用户的文案遵循 [`docs/wording-and-naming.md`](docs/wording-and-naming.md)：ABB 里那个 AI 助理的称呼是「怹」。
 
 ## Testing Guidelines
 

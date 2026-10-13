@@ -1860,7 +1860,7 @@ pub fn run_gui() -> Result<()> {
         }
     }
     fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
-        let label = if role == "assistant" { "ABB" } else { "你" };
+        let label = if role == "assistant" { "怹" } else { "你" };
         let mut rows = vec![role_row(label)];
         for b in crate::mdblocks::parse(text) {
             rows.push(block_row(b));
@@ -5642,7 +5642,7 @@ pub fn run_gui() -> Result<()> {
             w.set_draft("".into());
             w.set_busy(true);
             w.set_status_is_error(false);
-            w.set_status_line(format!("ABB 正在处理{att_note}…").into());
+            w.set_status_line(format!("怹正在思考{att_note}……").into());
             w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
             if let Some(b) = bw.upgrade() {
                 b.set_busy(true);
@@ -6351,7 +6351,7 @@ pub fn run_gui() -> Result<()> {
                             if let Some(w) = syschat_weak.upgrade() {
                                 w.set_busy(false);
                                 w.set_status_is_error(false);
-                                w.set_status_line("与 ABB 直接对话（系统级 · 整机权限）".into());
+                                w.set_status_line("与怹直接对话（系统级 · 整机权限）".into());
                                 w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
                             }
                             if let Some(b) = bubble_weak.upgrade() {
