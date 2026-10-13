@@ -48,13 +48,21 @@ abb-chart render --spec spec.json [--out chart.png] [--data d.csv]
   `errorbar` / `rule` / `text`（也认 `scatter` / `column` / `histogram` / `kde` / `boxplot` /
   `hline` 等别名）。
 - 数据来源三选一：规格里的 `data`（CSV）、规格里的 `rows`（内联 JSON 数组）、命令行的 `--data`。
-- **路径束缚（安全边界，改动前请读）**：相对路径**不许跑出它的基准目录**——
-  规格内的 `data` 以**规格文件所在目录**为基准，命令行的 `--data` 以**CWD** 为基准。
-  越界（含经由符号链接）一律拒绝；**绝对路径照常可用**（受限会话的工作区外绝对路径由
-  `guard` 把关）。原因：受限（授权者）会话的 guard 只能看到命令行，看不到规格文件**内容**，
-  没有这条束缚时工作区内的 `spec.json` 写 `"data": "../secret.csv"` 就能把工作区外的文件
-  内容画进图里（实测过的洞，见 `spec.rs::resolve_confined` 与 e2e
-  `spec_data_cannot_escape_its_directory`）。
+- **路径安全边界（改动前必读，这里踩过两个阻塞级洞）**：
+  | 入口 | 规则 |
+  |---|---|
+  | 规格内容里的 `data` | **只能读规格文件所在目录内的文件**（相对、绝对都要落在该目录里；含符号链接） |
+  | 命令行 `--data` | 相对路径按 **CWD** 解析且不得跑出；**绝对路径可用**（闸门看得见命令行） |
+  | `--spec` / `--out` / `--debug-svg` | 闸门（`guard`）直接校验命令行参数 |
+  
+  为什么规格内容连绝对路径都不许：受限（授权者）会话的闸门**只能看到命令行**，看不到规格文件
+  **内容**，所以「规格里的路径」是闸门的盲区，只能由解析它的这一方收口。两个实测过的洞：
+  ① `"data": "../secret.csv"`；② 只堵 `..` 之后仍成立的 `"data": "/abs/secret.csv"`
+  （「绝对路径交给 guard」这句话不成立——guard 看不到该字段）。规则因此取**局部可证**的形式：
+  「规格只能读它自己所在目录里的数据」，于是「规格在工作区内 ⇒ 它读的数据也在工作区内」不依赖
+  任何环境变量或 CWD。需要读别处数据时用 `--data`（换到闸门看得见的通道）。
+  实现见 `spec.rs::resolve_in_dir` / `resolve_arg`，e2e 钉子
+  `spec_data_cannot_escape_its_directory`、`spec_data_absolute_path_outside_its_directory_is_rejected`。
 - 列类型自动推断（非空值全是数字 ⇒ 数值列）；`types` 可显式覆盖。
 - 入口文件名 `abb-chart` 保持中性（不叫 `chart`：PATH 上太泛），由桥转发时补上语义。
 

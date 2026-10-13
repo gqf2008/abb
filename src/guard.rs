@@ -798,9 +798,12 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
 /// 也不该为了它去解析 JSON（那会引入 schema 双份真相）。这个洞曾真实存在：工作区内的
 /// `spec.json` 写 `"data": "../secret.csv"` 就能读到工作区外文件并把内容画进图里
 /// （card `abb-chart-cli-20261013` 评审发现）。
-/// 收口在**解析路径的那一方**：`abb-chart` 现在要求相对路径不得跑出基准目录
-/// （规格内 `data` 的基准 = 规格所在目录；符号链接逃逸也拦），见
-/// `crates/abb-chart/src/spec.rs::resolve_confined`。绝对路径仍放行给本函数的判据处理。
+/// 收口在**解析路径的那一方**：`abb-chart` 要求**规格内容里的 `data` 只能读规格文件所在目录内
+/// 的文件**——相对与绝对都必须在其中（这个字段在本函数里看不见，所以「绝对路径交给 guard 把关」
+/// 那句话对它**不成立**；独立评审实测过 `"data": "/abs/secret.csv"` 的外泄，见卡内记录）。
+/// 命令行侧的 `--data` 则是「相对限 CWD、绝对放行」，因为它走的是**闸门看得见**的通道
+/// （工作区外的绝对路径由本函数拒绝）。实现见 `crates/abb-chart/src/spec.rs::resolve_in_dir`
+/// 与 `resolve_arg`。
 ///
 /// 判据与 `deliver --file` 一致：用 [`canonical_in_workspace`]（`~`/`$` 展开形态一律拒，
 /// 防越过校验；不存在的输出文件按父目录校验）。

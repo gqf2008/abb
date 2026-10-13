@@ -269,11 +269,64 @@ fn spec_data_cannot_escape_its_directory() {
     ]);
     assert_eq!(r.code, 1, "必须拒绝，stderr={}", r.stderr);
     assert!(
-        r.stderr.contains("基准目录之外") || r.stderr.contains("解析失败"),
+        r.stderr.contains("规格文件所在目录之外") || r.stderr.contains("解析失败"),
         "要说明是路径越界/解析失败：{}",
         r.stderr
     );
     assert!(!out.exists(), "越界时不该产出任何文件");
+}
+
+/// **安全回归钉子（第二个阻塞级洞，端到端）**：规格内容里的**绝对** `data` 也必须被拒。
+///
+/// 只堵 `..` 不够——独立评审实测发现 `"data": "/abs/outside.csv"` 同样能把工作区外文件
+/// 的内容画进图里（闸门看不到规格内容这个字段，「绝对路径交给 guard」不成立）。
+#[test]
+fn spec_data_absolute_path_outside_its_directory_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let secret = root.path().join("secret.csv");
+    std::fs::write(&secret, "k,v\nS3CR3T,1\n").unwrap();
+
+    let spec = ws.join("spec.json");
+    std::fs::write(
+        &spec,
+        format!(
+            r#"{{"mark":"bar","x":"k","y":"v","data":"{}","types":{{"k":"category"}}}}"#,
+            secret.display()
+        ),
+    )
+    .unwrap();
+    let out = ws.join("leak.png");
+    let r = run(&[
+        "render",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(r.code, 1, "必须拒绝，stderr={}", r.stderr);
+    assert!(!out.exists(), "越界时不该产出任何文件");
+
+    // 同一份数据走命令行 `--data`（闸门可见的通道）应当可用 —— 能力没有被拿掉。
+    let spec2 = ws.join("spec2.json");
+    std::fs::write(
+        &spec2,
+        r#"{"mark":"bar","x":"k","y":"v","types":{"k":"category"}}"#,
+    )
+    .unwrap();
+    let out2 = ws.join("ok.png");
+    let r2 = run(&[
+        "render",
+        "--spec",
+        spec2.to_str().unwrap(),
+        "--data",
+        secret.to_str().unwrap(),
+        "--out",
+        out2.to_str().unwrap(),
+    ]);
+    assert_eq!(r2.code, 0, "绝对路径经 --data 应可用：{}", r2.stderr);
+    assert!(out2.is_file());
 }
 
 /// 同一目录内的相对路径仍然正常（别把合法用法一起拒了）。
