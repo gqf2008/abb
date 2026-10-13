@@ -38,8 +38,11 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 // P4.4：写指引已接回 harness 路径（service 启动写 bot 级工作区；`Bridge::workspace_for`
 // 与 `virtualbot::ensure_vb_dir` 两条 cwd 收口各写一次）——marker 判定保证幂等。
 // v14：加「## 画图」一节（chart 子命令 = 随包 abb-chart 的转发入口，卡 abb-chart-cli-20261013）。
-// 必须升版本号：老工作区里 v13 的指引不含画图一节，不提版本就永远补不上（幂等靠 marker）。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v14";
+// v15：改掉那一节里的示例——原先写的是 `cat > spec.json <<'EOF' …`（heredoc + 重定向 + 多行），
+//   而受限（授权者）会话的 guard 对 `>`/`<`/`|`/换行一律拒绝（`split_shell` 的硬拒绝表），
+//   照抄那段在受限会话里 100% 失败；改为「用写文件工具写 spec + 两条单行命令」。
+// 内容变了就必须升版本号：存量工作区的指引不会被覆盖（幂等判据是「不含当前 marker」）。
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v15";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -148,10 +151,17 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 
 **两步走**（不要只做第一步就说「画好了」——附件不会自动发出去，见下一节）：
 
-1. 先写图规格 JSON（字段：`mark` / `x` / `y` / `title` / `data` 或 `rows` / `types` …）：
+1. **先用你的文件写入工具**（`dev__write`）把一个 `chart_spec.json` 写到工作区里，内容是一段
+   JSON。然后再跑渲染与投递两条**单行**命令：
 
    ```
-   cat > chart_spec.json <<'EOF'
+   \"$ABB_BIN\" chart render --spec chart_spec.json --out chart.png
+   \"$ABB_BIN\" deliver --to-current --file chart.png --text \"图好了\"
+   ```
+
+   `chart_spec.json` 的样子（写成一个文件，不要拼进 shell 命令）：
+
+   ```json
    {{
      \"title\": \"季度销售额\",
      \"mark\": \"bar\",
@@ -162,10 +172,11 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
      \"width\": 1000,
      \"height\": 600
    }}
-   EOF
-   \"$ABB_BIN\" chart render --spec chart_spec.json --out chart.png
-   \"$ABB_BIN\" deliver --to-current --file chart.png --text \"图好了\"
    ```
+
+   **别用 heredoc、重定向或多行命令去写它**（即：不要用 `cat` 配合 `EOF` 标记把 JSON
+   塞进 shell）。受限（授权者）会话的闸门按安全口径**拒绝** `>`、`<`、`|`、换行与命令替换，
+   那套写法在那里会直接被拒；用文件写入工具，两种会话下都稳。
 
 2. 细节看它的帮助（不要背参数，随时可查）：
    `\"$ABB_BIN\" chart --help`；完整的规格字段说明与例子：`\"$ABB_BIN\" chart render --help`。
@@ -174,6 +185,8 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 
 - **只出 PNG**（`--out xx.png`）。三个聊天平台的图片通道只认 png/jpg/jpeg/gif/bmp，svg 会被降级成
   文件卡片；`--debug-svg` 只供本地排查，不要拿它交付。
+- **尺寸别开太大**：`--width`/`--height` 就是最终像素数，默认 1000×600 够聊天看图；
+  上千像素见方的大图在三平台上都可能撞图片体积上限（飞书图片 10MB）而发送失败。
 - **`mark` 可选**：`point`（散点）/`line`（折线）/`bar`（柱状）/`area`/`hist`（直方图）/
   `density`（密度）/`box`/`violin`/`errorbar`/`rule`（参考线）/`text`；也认 `scatter`/`column` 这类别名。
 - **数据源**：CSV 文件（`\"data\": \"x.csv\"`，相对路径按规格文件所在目录解析）或内联
@@ -993,14 +1006,31 @@ mod tests {
             );
             // v14：画图小节（chart 子命令）必须在，且要写清「出图 → deliver 发回」两步。
             // 只写出图不写投递 = agent 画完本地文件却告诉用户「画好了」（真实失败模式）。
-            assert!(text.contains("## 画图"), "{name} 缺 v14 的画图小节");
+            assert!(text.contains("## 画图"), "{name} 缺画图小节");
             for needle in [
                 "\"$ABB_BIN\" chart render --spec",
                 "chart render --help",
                 "chart.png",
+                "deliver --to-current --file chart.png",
             ] {
                 assert!(text.contains(needle), "{name} 画图小节缺「{needle}」");
             }
+            // v15：画图示例**不得**教 agent 用 heredoc/重定向——受限会话的 guard 拒绝它们
+            //（`split_shell` 对 `>`/`<`/`|`/换行硬拒），教了就是「照抄必失败」。
+            // 判别力：把示例改回 `cat > file <<'EOF'` ⇒ 本断言红。
+            assert!(
+                !text.contains("<<'EOF'") && !text.contains("cat > "),
+                "{name} 画图示例不得使用 heredoc/重定向（受限会话会被拒）"
+            );
+            assert!(
+                text.contains("dev__write"),
+                "{name} 画图小节必须指引用写文件工具落 spec"
+            );
+            // 图太大发不出去（平台图片体积上限）也要提一句。
+            assert!(
+                text.contains("尺寸别开太大"),
+                "{name} 画图小节应给出尺寸建议（否则会撞平台图片上限）"
+            );
             // #312：v7 新增的「后台子代理」小节必须在，且要写清委派决策规则。
             assert!(
                 text.contains("## 后台子代理 → 长任务丢后台，别堵会话"),
@@ -1309,6 +1339,25 @@ mod tests {
             assert!(
                 !text.contains("wassette"),
                 "{name} 升级后不得再提 wassette（该工具已废弃）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // v14 是本功能第一版指引（画图小节用 heredoc 示例）。v15 换掉了那段示例——
+        // 存量 v14 必须被覆盖升级，否则已部署会话会一直照着「受限会话必失败」的写法干活。
+        let dir = std::env::temp_dir().join(format!("abb-guide-v14-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v14 = "# ABB 工作区（abb-guide-v14）\n\n## 画图\n\n   cat > chart_spec.json <<'EOF'\n   {}\n   EOF\n";
+        std::fs::write(dir.join("CLAUDE.md"), v14).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), v14).unwrap();
+        ensure_workspace_guide(&dir);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(text.contains(GUIDE_MARKER), "{name} 应从 v14 升到最新");
+            assert!(!text.contains("abb-guide-v14"), "{name} 不应留 v14 marker");
+            assert!(
+                !text.contains("<<'EOF'"),
+                "{name} 存量 v14 的 heredoc 示例必须被替换掉"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
