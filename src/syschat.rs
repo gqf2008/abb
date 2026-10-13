@@ -350,6 +350,178 @@ pub fn workspace() -> PathBuf {
     crate::workspace_dir(SYSCHAT_KEY)
 }
 
+// ─────────────────────────── C 批：待发附件（📎 多选 / ⌘V 粘贴）───────────────────────────
+
+/// 一个已落盘的待发附件。
+///
+/// `name` 是**工作区内的文件名**（带时间戳前缀、已清洗、已去重），`path` 是它的绝对路径
+/// ——路径进 prompt（agent 自己按需读取），二进制绝不进 prompt（见 `docs/design/README.md`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// 落盘后的文件名（`<unix-ts>-<sanitized>[-N]`）。
+    pub name: String,
+    /// 落盘后的**绝对**路径（进 prompt 用）。
+    pub path: PathBuf,
+    /// 字节数（用 `fs::copy` 的实际写入量，便于展示/排查）。
+    pub bytes: u64,
+}
+
+/// 单条文件名（含扩展名）允许的最大字符数：超长按字符截断但**保留扩展名**
+///（后缀是 agent 判类型/选解析器的依据，截掉等于换个文件）。
+const MAX_ATTACH_NAME_CHARS: usize = 80;
+
+/// 系统对话附件的落盘目录：`~/.agent-bridge/workspaces/syschat/attachments/`。
+pub fn attachments_dir() -> PathBuf {
+    workspace().join("attachments")
+}
+
+/// 把一批本地文件复制进 [`attachments_dir`] 并返回记录。
+///
+/// 任一文件不可读/落地失败即整体返回 `Err`（带可读原因），**并回滚本次已复制成功的文件**：
+/// 调用方（GUI）据此把整批都视为失败，避免「部分附件静默缺失」。取消选择（空输入）是
+/// `Ok(vec![])` 而不是错误。
+pub fn land_attachments(paths: &[PathBuf]) -> Result<Vec<Attachment>, String> {
+    land_attachments_in(&attachments_dir(), paths)
+}
+
+/// [`land_attachments`] 的可注入目录版：单测传临时目录，**绝不写真实 `~/.agent-bridge`**
+/// （隔离门禁 `tools/check_test_isolation.sh` 会把落点抓出来）。
+fn land_attachments_in(
+    dir: &std::path::Path,
+    paths: &[PathBuf],
+) -> Result<Vec<Attachment>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("创建附件目录失败（{}）：{e}", dir.display()))?;
+    // 同一批共用一个时间戳前缀：文件名成组、便于一眼看出「这批是一起附的」。
+    let ts = crate::chrono_lite::unix_secs();
+    let mut landed: Vec<Attachment> = Vec::with_capacity(paths.len());
+    for src in paths {
+        match land_one(dir, src, ts) {
+            Ok(a) => landed.push(a),
+            Err(e) => {
+                // 回滚：调用方不会展示这批里的任何一个，留着没人引用的副本只会积垃圾。
+                for a in &landed {
+                    let _ = std::fs::remove_file(&a.path);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(landed)
+}
+
+/// 复制单个文件到 `dir`（失败返回可读原因）。
+fn land_one(dir: &std::path::Path, src: &std::path::Path, ts: u64) -> Result<Attachment, String> {
+    let meta =
+        std::fs::metadata(src).map_err(|e| format!("读取附件失败（{}）：{e}", src.display()))?;
+    if meta.is_dir() {
+        return Err(format!("不支持目录（{}）", src.display()));
+    }
+    let raw = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment");
+    let base = sanitize_attachment_name(raw);
+    let target = unique_attachment_path(dir, &base, ts);
+    let bytes = std::fs::copy(src, &target).map_err(|e| {
+        format!(
+            "复制附件失败（{} → {}）：{e}",
+            src.display(),
+            target.display()
+        )
+    })?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or(base);
+    Ok(Attachment {
+        name,
+        path: target,
+        bytes,
+    })
+}
+
+/// 目标路径 `<ts>-<base>`；同名冲突加 `-2`/`-3`…（含本批内先落盘的那些，因为它们已在盘上）。
+fn unique_attachment_path(dir: &std::path::Path, base: &str, ts: u64) -> PathBuf {
+    let (stem, ext) = split_attachment_ext(base);
+    let mut n: u32 = 1;
+    loop {
+        let name = if n == 1 {
+            format!("{ts}-{stem}{ext}")
+        } else {
+            format!("{ts}-{stem}-{n}{ext}")
+        };
+        let p = dir.join(&name);
+        if !p.exists() {
+            return p;
+        }
+        n += 1;
+        // 上界只是防疯跑（同一秒撞 1000 次同名），真撞上就用 UUID 兜底而不是死循环。
+        if n > 1000 {
+            return dir.join(format!(
+                "{ts}-{stem}-{}{ext}",
+                uuid::Uuid::new_v4().simple()
+            ));
+        }
+    }
+}
+
+/// 拆「主名 / 扩展名」：扩展名含点、最多 16 字符（`'.' + ≤16`）；隐藏文件（`.gitignore`）
+/// 与「点后无内容」不算扩展名。
+fn split_attachment_ext(name: &str) -> (String, String) {
+    if let Some(i) = name.rfind('.') {
+        if i > 0 && i + 1 < name.len() {
+            let ext = &name[i..];
+            if ext.chars().count() <= 17 {
+                return (name[..i].to_string(), ext.to_string());
+            }
+        }
+    }
+    (name.to_string(), String::new())
+}
+
+/// 文件名清洗：把路径分隔/控制字符/文件系统禁用字符换成 `_`，去首尾空白与前导点，
+/// 超长按字符截断且保留扩展名。
+///
+/// 为什么必须清洗：`file_name()` 虽已是末段，但仍可能含换行（会破坏 prompt 里
+/// `- <路径>` 的行结构）与 Windows 非法字符；用户也可能选到超长/隐藏/纯点的名字。
+fn sanitize_attachment_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        let bad =
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+        out.push(if bad { '_' } else { c });
+    }
+    let out = out.trim().trim_start_matches('.').to_string();
+    let out = if out.chars().all(|c| c == '.') {
+        // 空串 / 纯点（`.`、`..`）都不能当文件名。
+        "attachment".to_string()
+    } else {
+        out
+    };
+    truncate_attachment_name(&out, MAX_ATTACH_NAME_CHARS)
+}
+
+/// 超长截断（按字符，UTF-8 安全）且保留扩展名。
+fn truncate_attachment_name(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    let (stem, ext) = split_attachment_ext(name);
+    let ext_len = ext.chars().count();
+    // 扩展名自己就把预算占满时不再保留（否则截出来只剩后缀，反而丢信息）。
+    if ext_len > 0 && ext_len < max {
+        let budget = max - ext_len;
+        let stem: String = stem.chars().take(budget).collect();
+        format!("{stem}{ext}")
+    } else {
+        name.chars().take(max).collect()
+    }
+}
+
 /// http(s) 媒体的本地缓存文件路（无论是否存在）：`syschat/media-cache/<sha256(url)>`。
 /// 用内容哈希做文件名：同 URL 同名、不同 URL 不撞，且无需维护索引。
 pub fn media_cache_file(url: &str) -> PathBuf {
@@ -562,6 +734,24 @@ pub fn build_prompt(history: &[Turn], user_text: &str) -> String {
     s
 }
 
+/// 拼本轮 prompt，并在末尾附上待发附件的**本地路径**（agent 自行读取，不塞二进制）。
+///
+/// `atts` 为空时必须与 [`build_prompt`] **逐字节一致**（无附件路径不改变既有语义，
+/// 既有测试与已有的对话格式都不动）。
+pub fn prompt_with_attachments(history: &[Turn], user_text: &str, atts: &[Attachment]) -> String {
+    let mut s = build_prompt(history, user_text);
+    if atts.is_empty() {
+        return s;
+    }
+    s.push_str("\n\n## 附件（本地路径，自行读取）\n");
+    for a in atts {
+        s.push_str("- ");
+        s.push_str(&a.path.display().to_string());
+        s.push('\n');
+    }
+    s
+}
+
 /// 系统级 agent 配置：**指定供应商**（空 = 全局默认）+ owner 全权限档（无沙箱）+ 专用工作区。
 pub fn agent_config(cfg: &Config, provider: &str) -> AgentConfig {
     crate::service::oneshot_agent_config_system(cfg, provider)
@@ -630,6 +820,19 @@ pub async fn turn_with(
 /// 跑一轮系统级对话（生产入口）：按**当前会话**（与其模型选择）装配 agent，再交给
 /// [`turn_core`] 跑会话/历史逻辑。模型选择在**本轮开头**解析一次 ⇒「切换从下一条消息起生效」。
 pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
+    turn_with_attachments(cfg, user_text, &[]).await
+}
+
+/// 带待发附件的一轮系统级对话（C 批：📎 / ⌘V）。
+///
+/// 附件只以**本地路径**进 prompt（见 [`prompt_with_attachments`]），落盘与去重已在
+/// [`land_attachments`] 完成；历史仍只记用户输入的文本——后续回合重放的是对话，不是
+/// 附件清单（同一条附件不会因为历史重放而被反复描述）。
+pub async fn turn_with_attachments(
+    cfg: &Config,
+    user_text: &str,
+    atts: &[Attachment],
+) -> Result<String, String> {
     let text = user_text.trim();
     if text.is_empty() {
         return Err("消息为空。".to_string());
@@ -663,7 +866,7 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     std::fs::create_dir_all(&ws)
         .map_err(|e| format!("创建系统对话工作区失败（{}）：{e}", ws.display()))?;
 
-    turn_core(&store, &session_id, agent_cfg, ws, text).await
+    turn_core(&store, &session_id, agent_cfg, ws, text, atts).await
 }
 
 /// 可测核心：会话 store / agent 配置 / 工作区都由调用方注入（测试用临时目录 + mock agent，
@@ -677,6 +880,7 @@ async fn turn_core(
     agent_cfg: AgentConfig,
     ws: PathBuf,
     user_text: &str,
+    atts: &[Attachment],
 ) -> Result<String, String> {
     let text = user_text.trim();
     // 临界区 1：读该会话历史拼 prompt + 落用户轮 + 刷新标题/时间。先落用户轮是为了：
@@ -684,7 +888,7 @@ async fn turn_core(
     let prompt = {
         let _g = store.lock()?;
         let history = store.read_history(session_id);
-        let prompt = build_prompt(&history, text);
+        let prompt = prompt_with_attachments(&history, text, atts);
         let now = crate::chrono_lite::unix_secs() as i64;
         store
             .append_turns(
@@ -1044,6 +1248,7 @@ mod tests {
             mock_agent_cfg(&rec("abb-sc-t1")),
             ws.clone(),
             "probe-one",
+            &[],
         )
         .await
         .unwrap();
@@ -1054,6 +1259,7 @@ mod tests {
             mock_agent_cfg(&rec("abb-sc-t2")),
             ws.clone(),
             "probe-two",
+            &[],
         )
         .await
         .unwrap();
@@ -1089,6 +1295,7 @@ mod tests {
             mock_agent_cfg(&rec("abb-sc-t3")),
             ws.clone(),
             "again-one",
+            &[],
         )
         .await
         .unwrap();
@@ -1106,6 +1313,7 @@ mod tests {
             mock_agent_cfg(&rec("abb-sc-t4")),
             ws.clone(),
             "again-two",
+            &[],
         )
         .await
         .unwrap();
@@ -1118,6 +1326,219 @@ mod tests {
             "s2 第二轮不得读到 s1 的历史：{r2b}"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ── C 批：附件（落盘/清洗/去重 + prompt 注入）──
+
+    /// 临时源目录 + 附件目标目录（全部在系统临时目录，不碰真实 `~/.agent-bridge`）。
+    fn tmp_attach_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "abb-sc-att-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        (src, dst)
+    }
+
+    fn write_src(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn land_attachments_copies_with_ts_prefix_and_bytes() {
+        let (src, dst) = tmp_attach_dirs("copy");
+        let a = write_src(&src, "报告 v2.pdf", "hello-attachment");
+        let landed = land_attachments_in(&dst, &[a]).expect("应落地成功");
+        assert_eq!(landed.len(), 1);
+        let att = &landed[0];
+        assert!(att.path.is_absolute(), "进 prompt 的必须是绝对路径");
+        assert_eq!(att.path.parent().unwrap(), dst.as_path());
+        // 文件名 = <unix-ts>-<sanitized>，且是同一次调用拿到的同一时间戳前缀
+        let (ts_str, rest) = att.name.split_once('-').expect("应有时间戳前缀");
+        let ts: u64 = ts_str.parse().expect("前缀应为 unix 秒");
+        assert!(ts > 0);
+        assert_eq!(rest, "报告 v2.pdf", "干净名字应原样保留");
+        assert_eq!(att.bytes, "hello-attachment".len() as u64);
+        assert_eq!(
+            std::fs::read_to_string(&att.path).unwrap(),
+            "hello-attachment"
+        );
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn land_attachments_dedups_same_name_with_dash_n() {
+        let (src, dst) = tmp_attach_dirs("dedup");
+        // 三个不同目录里的同名文件（内容各异）——模拟「一次多选里挑了几份同名文件」。
+        let a = write_src(&src.join("one"), "dup.png", "one");
+        let b = write_src(&src.join("two"), "dup.png", "two");
+        let c = write_src(&src.join("three"), "dup.png", "three");
+        let landed = land_attachments_in(&dst, &[a, b, c]).expect("应落地成功");
+        let names: Vec<&str> = landed.iter().map(|a| a.name.as_str()).collect();
+        let stripped: Vec<String> = names
+            .iter()
+            .map(|n| n.split_once('-').unwrap().1.to_string())
+            .collect();
+        assert_eq!(stripped, vec!["dup.png", "dup-2.png", "dup-3.png"]);
+        // 内容各自独立（不得互相覆盖）
+        assert_eq!(std::fs::read_to_string(&landed[0].path).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&landed[1].path).unwrap(), "two");
+        assert_eq!(std::fs::read_to_string(&landed[2].path).unwrap(), "three");
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn land_attachments_sanitizes_name_and_keeps_extension() {
+        let (src, dst) = tmp_attach_dirs("sanitize");
+        // 换行/冒号/引号在 macOS 上可作文件名，但会被 prompt 的 `- <路径>` 行结构与
+        // Windows 落盘弄坏；控制字符同理，统一改成 `_`。
+        let a = write_src(&src, "we\nird:na*me\".png", "x");
+        let long_stem = "头".repeat(200);
+        let b = write_src(&src, &format!("{long_stem}.mov"), "y");
+        let landed = land_attachments_in(&dst, &[a, b]).expect("应落地成功");
+        let n0 = landed[0].name.split_once('-').unwrap().1;
+        assert_eq!(n0, "we_ird_na_me_.png", "非法字符应换成下划线");
+        let n1 = landed[1].name.split_once('-').unwrap().1;
+        assert!(n1.ends_with(".mov"), "超长截断必须保留扩展名：{n1}");
+        assert!(
+            n1.chars().count() <= MAX_ATTACH_NAME_CHARS,
+            "截断后应在上限内：{n1}（{} 字）",
+            n1.chars().count()
+        );
+        assert!(!n1.contains('\n'));
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn sanitize_attachment_name_edge_cases() {
+        assert_eq!(sanitize_attachment_name("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_attachment_name("  hi.txt  "), "hi.txt");
+        assert_eq!(sanitize_attachment_name(".hidden"), "hidden");
+        assert_eq!(sanitize_attachment_name(".."), "attachment");
+        assert_eq!(sanitize_attachment_name(""), "attachment");
+        assert_eq!(sanitize_attachment_name("...."), "attachment");
+        // 无扩展名的超长名也要截（不得整体保留）
+        let long = "a".repeat(MAX_ATTACH_NAME_CHARS + 50);
+        assert_eq!(
+            sanitize_attachment_name(&long).chars().count(),
+            MAX_ATTACH_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn land_attachments_errors_on_missing_source_and_rolls_back() {
+        let (src, dst) = tmp_attach_dirs("rollback");
+        let good = write_src(&src, "good.txt", "ok");
+        let missing = src.join("no-such-file.bin");
+        let err = land_attachments_in(&dst, &[good, missing]).expect_err("缺文件必须报错");
+        assert!(err.contains("no-such-file.bin"), "错误应带可读原因：{err}");
+        // 回滚：坏文件导致整批失败 ⇒ 之前复制成功的那个不得留下
+        let left: Vec<_> = std::fs::read_dir(&dst)
+            .map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "整批失败应回滚已落盘文件：{left:?}");
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    #[test]
+    fn land_attachments_rejects_directory_and_empty_input_is_ok() {
+        let (src, dst) = tmp_attach_dirs("dir");
+        let err = land_attachments_in(&dst, std::slice::from_ref(&src)).expect_err("目录必须报错");
+        assert!(err.contains("不支持目录"), "{err}");
+        assert!(
+            land_attachments_in(&dst, &[]).unwrap().is_empty(),
+            "取消（空输入）是 Ok 空向量，不是错误"
+        );
+        let _ = std::fs::remove_dir_all(dst.parent().unwrap());
+    }
+
+    /// 无附件时必须**逐字节**等于既有 `build_prompt`（C 批不得改变既有语义）。
+    #[test]
+    fn prompt_without_attachments_is_byte_identical_to_build_prompt() {
+        let h = vec![
+            turn_of("user", "你好"),
+            turn_of("assistant", "你好，有什么可以帮你？"),
+        ];
+        assert_eq!(
+            prompt_with_attachments(&h, "帮我看看磁盘", &[]),
+            build_prompt(&h, "帮我看看磁盘")
+        );
+        assert_eq!(
+            prompt_with_attachments(&[], "第一条", &[]),
+            build_prompt(&[], "第一条")
+        );
+    }
+
+    #[test]
+    fn prompt_with_attachments_appends_absolute_paths() {
+        let atts = vec![
+            Attachment {
+                name: "1-a.png".into(),
+                path: PathBuf::from("/tmp/x/1-a.png"),
+                bytes: 1,
+            },
+            Attachment {
+                name: "1-b.mov".into(),
+                path: PathBuf::from("/tmp/x/1-b.mov"),
+                bytes: 2,
+            },
+        ];
+        let p = prompt_with_attachments(&[], "看这两个", &atts);
+        assert!(p.contains("## 附件（本地路径，自行读取）"), "缺附件段：{p}");
+        assert!(p.contains("\n- /tmp/x/1-a.png\n"), "缺第一条路径：{p}");
+        assert!(p.contains("\n- /tmp/x/1-b.mov\n"), "缺第二条路径：{p}");
+        // 附件段必须在用户消息之后（逐行 `- <绝对路径>`）
+        assert!(p.find("看这两个").unwrap() < p.find("- /tmp/x/1-a.png").unwrap());
+        // 无附件时不得出现该段（负向：把空分支写错就会红）
+        assert!(!prompt_with_attachments(&[], "看这两个", &[]).contains("## 附件"));
+    }
+
+    /// 全链路：附件路径真的随 prompt 进 agent（mock 把 prompt 原样 echo 回来）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn turn_core_sends_attachment_paths_in_prompt() {
+        let (store, base) = tmp_store("att");
+        let mut st = store.load();
+        store.ensure_current(&mut st);
+        let sid = st.current.clone();
+        store.save(&st).unwrap();
+        let ws = std::env::temp_dir().join(format!("abb-sc-att-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let rec = std::env::temp_dir().join(format!("abb-sc-att-{}.jsonl", uuid::Uuid::new_v4()));
+        let att = Attachment {
+            name: "7-shot.png".into(),
+            path: PathBuf::from("/tmp/att-marker/shot.png"),
+            bytes: 3,
+        };
+        let reply = turn_core(
+            &store,
+            &sid,
+            mock_agent_cfg(&rec),
+            ws.clone(),
+            "看这张",
+            std::slice::from_ref(&att),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reply.contains("/tmp/att-marker/shot.png"),
+            "附件路径必须进 prompt 并被 echo：{reply}"
+        );
+        // 历史仍只记用户输入的文本（附件不进历史重放）
+        let hist = store.read_history(&sid);
+        let user_turn = hist.iter().find(|t| t.role == "user").unwrap();
+        assert_eq!(user_turn.text, "看这张");
+        assert!(!user_turn.text.contains("shot.png"));
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&ws);
     }

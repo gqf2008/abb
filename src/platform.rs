@@ -439,6 +439,221 @@ pub fn set_dock_visible(_visible: bool) {}
 #[cfg(not(target_os = "macos"))]
 pub fn hide_dock() {}
 
+// ───────────── macOS：文件选择 / 剪贴板（零依赖 AppKit FFI）─────────────
+//
+// C 批（系统对话附件）要用到的两个原生原语。两个都**必须在主线程调**——AppKit 非线程
+// 安全（同 `set_dock_visible`/`set_app_icon` 的约束）；调用点在 `ui.rs` 的 Slint 回调
+// （UI 线程），**不能**走 `UiCmd`（那条通道由后台 tokio 线程消费）。
+
+/// 原生**多选**文件对话框（系统对话输入行的 📎）。返回选中文件的绝对路径；取消返回空 vec。
+///
+/// 为什么手写 FFI：本仓 macOS 侧坚持零依赖（同 `set_dock_visible`），不为一个文件面板
+/// 引入 `rfd`（会带进 objc2 / dispatch / block2 等一串依赖）。
+/// **主线程**：`runModal` 会起嵌套 run loop，只能从 UI 线程调。非 macOS 返回空 vec
+/// （Windows CI 只需能编译）。
+#[cfg(target_os = "macos")]
+pub fn pick_files_multi() -> Vec<PathBuf> {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> Id;
+        fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    // 选择器只解析一次（ObjC selector 是进程内全局常量地址，缓存安全；同 set_app_icon）。
+    type Sels = (usize, usize, usize, usize, usize, usize);
+    static SELS: OnceLock<Sels> = OnceLock::new();
+    let (open_panel, set_multi, choose_files, choose_dirs, run_modal, urls) =
+        *SELS.get_or_init(|| unsafe {
+            (
+                sel_registerName(c"openPanel".as_ptr()) as usize,
+                sel_registerName(c"setAllowsMultipleSelection:".as_ptr()) as usize,
+                sel_registerName(c"setCanChooseFiles:".as_ptr()) as usize,
+                sel_registerName(c"setCanChooseDirectories:".as_ptr()) as usize,
+                sel_registerName(c"runModal".as_ptr()) as usize,
+                sel_registerName(c"URLs".as_ptr()) as usize,
+            )
+        });
+    let (open_panel, set_multi, choose_files, choose_dirs, run_modal, urls) = (
+        open_panel as Sel,
+        set_multi as Sel,
+        choose_files as Sel,
+        choose_dirs as Sel,
+        run_modal as Sel,
+        urls as Sel,
+    );
+
+    unsafe {
+        let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg_bool: unsafe extern "C" fn(Id, Sel, bool) =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg_isize: unsafe extern "C" fn(Id, Sel) -> isize =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let panel = msg0(objc_getClass(c"NSOpenPanel".as_ptr()), open_panel);
+        if panel.is_null() {
+            return Vec::new();
+        }
+        msg_bool(panel, set_multi, true);
+        msg_bool(panel, choose_files, true);
+        msg_bool(panel, choose_dirs, false);
+        // NSModalResponseOK = 1（取消/无响应 ⇒ 空，不报错）
+        if msg_isize(panel, run_modal) != 1 {
+            return Vec::new();
+        }
+        nsurls_to_paths(msg0(panel, urls))
+    }
+}
+
+/// 非 macOS：无原生文件面板，返回空（Windows 托盘 GUI 走后续批次另议）。
+#[cfg(not(target_os = "macos"))]
+pub fn pick_files_multi() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// 读系统剪贴板里的**文件**（`NSPasteboard.generalPasteboard` 的 `NSURL` 对象）。
+/// 剪贴板是文本/图片/空时返回空 vec（不 panic、不报错）。
+///
+/// 为什么不用 `NSFilenamesPboardType`：那是废弃的旧类型；现代 Finder 把文件 URL 放进
+/// `public.file-url`，`readObjectsForClasses:@[NSURL.class]` 一次拿全（截图等纯位图
+/// 没有文件 URL，自然落回文本粘贴路径）。**主线程**调。
+#[cfg(target_os = "macos")]
+pub fn pasteboard_file_paths() -> Vec<PathBuf> {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> Id;
+        fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    type Sels = (usize, usize, usize);
+    static SELS: OnceLock<Sels> = OnceLock::new();
+    let (general, array_with_object, read_objects) = *SELS.get_or_init(|| unsafe {
+        (
+            sel_registerName(c"generalPasteboard".as_ptr()) as usize,
+            sel_registerName(c"arrayWithObject:".as_ptr()) as usize,
+            sel_registerName(c"readObjectsForClasses:options:".as_ptr()) as usize,
+        )
+    });
+    let (general, array_with_object, read_objects) = (
+        general as Sel,
+        array_with_object as Sel,
+        read_objects as Sel,
+    );
+
+    unsafe {
+        let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg1: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg2: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let pb = msg0(objc_getClass(c"NSPasteboard".as_ptr()), general);
+        if pb.is_null() {
+            return Vec::new();
+        }
+        // 只认 NSURL 类；`[NSURL class]` 就是 objc_getClass("NSURL") 返回的类对象。
+        let nsurl_cls = objc_getClass(c"NSURL".as_ptr());
+        let classes = msg1(
+            objc_getClass(c"NSArray".as_ptr()),
+            array_with_object,
+            nsurl_cls,
+        );
+        if classes.is_null() {
+            return Vec::new();
+        }
+        // options 传 nil = 用默认读取选项。
+        nsurls_to_paths(msg2(pb, read_objects, classes, std::ptr::null_mut()))
+    }
+}
+
+/// 非 macOS：剪贴板文件读取未实现，返回空（文本粘贴仍由 Slint TextInput 自己处理）。
+#[cfg(not(target_os = "macos"))]
+pub fn pasteboard_file_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// `NSArray<NSURL*>` → `Vec<PathBuf>`：只取 `isFileURL` 的（http(s) 链接不算附件），
+/// 拿不到 UTF-8 路径的跳过。传 nil 返回空。
+#[cfg(target_os = "macos")]
+unsafe fn nsurls_to_paths(urls: *mut std::ffi::c_void) -> Vec<PathBuf> {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    unsafe extern "C" {
+        fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    type Sels = (usize, usize, usize, usize, usize);
+    static SELS: OnceLock<Sels> = OnceLock::new();
+    let (count, at, is_file_url, path, utf8) = *SELS.get_or_init(|| unsafe {
+        (
+            sel_registerName(c"count".as_ptr()) as usize,
+            sel_registerName(c"objectAtIndex:".as_ptr()) as usize,
+            sel_registerName(c"isFileURL".as_ptr()) as usize,
+            sel_registerName(c"path".as_ptr()) as usize,
+            sel_registerName(c"UTF8String".as_ptr()) as usize,
+        )
+    });
+    let (count, at, is_file_url, path, utf8) = (
+        count as Sel,
+        at as Sel,
+        is_file_url as Sel,
+        path as Sel,
+        utf8 as Sel,
+    );
+
+    if urls.is_null() {
+        return Vec::new();
+    }
+    let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let msg_usize: unsafe extern "C" fn(Id, Sel) -> usize =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let msg_idx: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let msg_flag: unsafe extern "C" fn(Id, Sel) -> bool =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let msg_chars: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+    let n = msg_usize(urls, count);
+    let mut out = Vec::new();
+    for i in 0..n {
+        let url = msg_idx(urls, at, i);
+        if url.is_null() || !msg_flag(url, is_file_url) {
+            continue;
+        }
+        let p = msg0(url, path);
+        if p.is_null() {
+            continue;
+        }
+        let chars = msg_chars(p, utf8);
+        if chars.is_null() {
+            continue;
+        }
+        if let Ok(s) = std::ffi::CStr::from_ptr(chars).to_str() {
+            if !s.is_empty() {
+                out.push(PathBuf::from(s));
+            }
+        }
+    }
+    out
+}
+
 // ─────────────────────────── macOS：登录项自启 ───────────────────────────
 
 /// LaunchAgent 标签（同时是 plist 文件名）。launchd 按标签记账，改这个字符串会让

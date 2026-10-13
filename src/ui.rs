@@ -160,8 +160,10 @@ enum UiCmd {
     },
     /// 系统级对话：跑一轮与 abb-agent 的直接对话（syschat::turn），
     /// 结果经 syschat_rx 回主线程（气泡/对话框共用）。
+    /// `atts` = 本批已落盘的待发附件（路径进 prompt，见 `syschat::prompt_with_attachments`）。
     SysChatSend {
         text: String,
+        atts: Vec<crate::syschat::Attachment>,
     },
     /// 后台下载一个 http(s) 媒体到本地缓存（图片内联 / 音视频可打开）。
     FetchMedia {
@@ -1954,6 +1956,87 @@ pub fn run_gui() -> Result<()> {
     }
     refresh_syschat_sel(&syschat_win, &sc_sessions, &sc_models);
 
+    // ── C1 批：待发附件（📎 多选 / ⌘V 粘贴）──────────────────────────────────
+    //
+    // 待发附件只在 **UI 主线程**维护（Slint 窗口与 Rc 都非 Send）；选取/粘贴后立即落地
+    // 到工作区附件目录并上屏，发送时路径随消息文本一起进 prompt（见
+    // `syschat::prompt_with_attachments`）——二进制不进 prompt。
+    let sc_atts: Rc<RefCell<Vec<crate::syschat::Attachment>>> = Rc::new(RefCell::new(Vec::new()));
+
+    /// 刷新对话窗的待发附件简行（C1 临时形态：`📎 N 个：a.png, b.mov` + 「清空」；
+    /// D 批再改成输入框内 3+N 折叠 chips）。
+    fn refresh_syschat_atts(
+        win: &SystemChatWindow,
+        atts: &Rc<RefCell<Vec<crate::syschat::Attachment>>>,
+    ) {
+        let v = atts.borrow();
+        win.set_attach_count(v.len() as i32);
+        let summary = if v.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<&str> = v.iter().map(|a| a.name.as_str()).collect();
+            format!("📎 {} 个：{}", names.len(), names.join("，"))
+        };
+        win.set_attach_summary(summary.into());
+    }
+    refresh_syschat_atts(&syschat_win, &sc_atts);
+
+    // 把一批本地路径落地进工作区附件目录并并入待发列表。失败 ⇒ 对话框状态行显示可读原因
+    // （复用既有错误展示通道），**不静默丢弃**；成功时才把落盘记录并入待发。
+    let land_into_pending: Rc<dyn Fn(Vec<std::path::PathBuf>)> = {
+        let cw = syschat_win.as_weak();
+        let atts = sc_atts.clone();
+        Rc::new(move |paths: Vec<std::path::PathBuf>| {
+            if paths.is_empty() {
+                return; // 取消选择 / 剪贴板无文件：不算失败，什么都不做
+            }
+            let Some(w) = cw.upgrade() else { return };
+            match crate::syschat::land_attachments(&paths) {
+                Ok(landed) => {
+                    let n = landed.len();
+                    atts.borrow_mut().extend(landed);
+                    refresh_syschat_atts(&w, &atts);
+                    w.set_status_is_error(false);
+                    w.set_status_line(format!("已附加 {n} 个文件（随下一条消息发送）").into());
+                }
+                Err(e) => {
+                    // land_attachments 整批回滚：不改待发列表，只报错。
+                    w.set_status_is_error(true);
+                    w.set_status_line(format!("附件落地失败：{e}").into());
+                }
+            }
+        })
+    };
+
+    // 📎 多选文件：原生 `NSOpenPanel`（零依赖手写 FFI，见 platform 注释）。
+    // **为什么在 Slint 回调里直接调**：AppKit 要求主线程，而 Slint 回调本就在 UI 主线程；
+    // `UiCmd` 那条通道由后台 tokio 线程消费（见 `std::thread::spawn` 处的 `rx.recv()`），
+    // 把 NSOpenPanel 塞过去就是在后台线程摸 AppKit——不要这么做。
+    {
+        let cw = syschat_win.as_weak();
+        let land = land_into_pending.clone();
+        syschat_win.on_attach_pick(move || {
+            if cw.upgrade().is_none() {
+                return; // 窗口已销毁（托盘退出中）：不再弹面板
+            }
+            bring_app_to_front(); // 面板要置于前台（先激活再弹，同 show_window_and_focus 的理由）
+            land(crate::platform::pick_files_multi());
+        });
+    }
+    // 「清空」：只清待发列表，**不删**已落盘文件（它们可能已被已发出的消息引用）。
+    {
+        let cw = syschat_win.as_weak();
+        let atts = sc_atts.clone();
+        syschat_win.on_attach_clear(move || {
+            atts.borrow_mut().clear();
+            if let Some(w) = cw.upgrade() {
+                refresh_syschat_atts(&w, &atts);
+                w.set_status_is_error(false);
+                w.set_status_line("已清空待发附件（已落盘的文件保留）".into());
+            }
+        });
+    }
+
     let bubble = AnchorBubble::new()?;
     // 气泡位置：统一在**事件循环活跃后的首个 tick** 里施加（见 tick）——启动前 set_position 会被
     // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
@@ -3316,14 +3399,23 @@ pub fn run_gui() -> Result<()> {
                     }
                     // 系统级对话（气泡/对话框）：无需管理密码（它不是服务动作，且执行层
                     // 已是 owner 全权限——与其它 GUI 内部一次性回合同权限）。
-                    UiCmd::SysChatSend { text } => {
+                    UiCmd::SysChatSend { text, atts } => {
                         let etx = syschat_tx_bg.clone();
                         tokio::spawn(async move {
                             let evt = match Config::load() {
-                                Ok(cfg) => match crate::syschat::turn(&cfg, &text).await {
-                                    Ok(reply) => SysChatEvt::Reply(reply),
-                                    Err(e) => SysChatEvt::Error(e),
-                                },
+                                Ok(cfg) => {
+                                    // 无附件走既有的 `turn`（这条路经本身不变；两者共用 `turn_core`）。
+                                    let r = if atts.is_empty() {
+                                        crate::syschat::turn(&cfg, &text).await
+                                    } else {
+                                        crate::syschat::turn_with_attachments(&cfg, &text, &atts)
+                                            .await
+                                    };
+                                    match r {
+                                        Ok(reply) => SysChatEvt::Reply(reply),
+                                        Err(e) => SysChatEvt::Error(e),
+                                    }
+                                }
                                 Err(e) => SysChatEvt::Error(format!("读取配置失败：{e:#}")),
                             };
                             let _ = etx.send(evt);
@@ -5526,27 +5618,41 @@ pub fn run_gui() -> Result<()> {
         let model = syschat_model.clone();
         let bw = bubble.as_weak();
         let tx = tx.clone();
+        let atts = sc_atts.clone();
         syschat_win.on_send(move |text| {
             let text = text.trim().to_string();
             if text.is_empty() {
-                return;
+                return; // 附件不单独发（产品口径）：纯附件不能发，必须带消息文本
             }
             let Some(w) = cw.upgrade() else { return };
             if w.get_busy() {
                 return; // 防重复发送（busy 期间按钮/回车已禁用，这里是双保险）
             }
+            // 本轮的待发附件（路径随 prompt 进 agent）；发送后清空待发列表——
+            // 不删已落盘文件（同一附件可再次附加，且已发出的消息可能已引用它）。
+            let atts_now: Vec<crate::syschat::Attachment> = atts.borrow().clone();
+            let att_note = if atts_now.is_empty() {
+                String::new()
+            } else {
+                format!("（附 {} 个文件）", atts_now.len())
+            };
             for r in rows_for("user", &text) {
                 model.push(r);
             }
             w.set_draft("".into());
             w.set_busy(true);
             w.set_status_is_error(false);
-            w.set_status_line("ABB 正在处理…".into());
+            w.set_status_line(format!("ABB 正在处理{att_note}…").into());
             w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
             if let Some(b) = bw.upgrade() {
                 b.set_busy(true);
             }
-            let _ = tx.send(UiCmd::SysChatSend { text });
+            atts.borrow_mut().clear();
+            refresh_syschat_atts(&w, &atts);
+            let _ = tx.send(UiCmd::SysChatSend {
+                text,
+                atts: atts_now,
+            });
         });
     }
     // 清空历史（对话框按钮）。
@@ -5586,7 +5692,10 @@ pub fn run_gui() -> Result<()> {
     // 打开时 show_window_and_focus 会把进程提升为 regular（显 dock）；关闭时若设置窗
     // 也没开，就降回 accessory（与 hide_notifications_window 同款收尾，避免留一个“孤儿”dock 图标）。
     {
-        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        use slint::winit_030::{
+            winit::{event::ElementState, event::WindowEvent, keyboard::Key},
+            EventResult, WinitWindowAccessor,
+        };
         let cw = syschat_win.as_weak();
         let sw = settings.as_weak();
         syschat_win.on_close_window(move || {
@@ -5606,7 +5715,38 @@ pub fn run_gui() -> Result<()> {
         });
         let cw2 = syschat_win.as_weak();
         let sw2 = settings.as_weak();
+        // C1：⌘V —— 剪贴板里是**文件**时拦截为附件，否则原样放行（文本粘贴仍交 TextInput）。
+        //
+        // 为什么走 winit 事件过滤器而不是 Slint 的 `key-pressed`：
+        // ① 判定必须**同步**问 `NSPasteboard`（Rust 侧）。Slint 侧要拦截得新增一个带返回值的
+        //    跨语言回调，且拦截元素必须位于输入框的祖先链上（要改输入区布局）；
+        // ② winit 过滤器在 Slint 的按键路由**之前**执行，`PreventDefault` 干净吞掉这一次按键，
+        //    `Propagate` 则完全不影响既有行为（TextInput 的 ⌘V 文本粘贴由此保留）；
+        // ③ 本就在 UI 主线程（AppKit 前置条件）。
+        // winit 0.30 的 `KeyEvent` 自身不带修饰键 ⇒ 用 `ModifiersChanged` 跟踪 ⌘/Ctrl 的按下态。
+        let super_held = Rc::new(Cell::new(false));
+        let land_paste = land_into_pending.clone();
         syschat_win.window().on_winit_window_event(move |w, ev| {
+            if let WindowEvent::ModifiersChanged(m) = ev {
+                super_held.set(m.state().super_key());
+            }
+            if let WindowEvent::KeyboardInput { event, .. } = ev {
+                if super_held.get()
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
+                    && cw2.upgrade().map(|w| !w.get_busy()).unwrap_or(false)
+                {
+                    let paths = platform::pasteboard_file_paths();
+                    if !paths.is_empty() {
+                        // 落地在 UI 线程同步完成（否则待发列表要跨线程共享）；典型附件很小，
+                        // 大可接受（若将来出现「粘大文件卡 UI」的反馈，再改成队列 + 单发定时器）。
+                        land_paste(paths);
+                        return EventResult::PreventDefault; // 不落给 TextInput ⇒ 不会粘文本
+                    }
+                    // 剪贴板无文件：继续往下，文本粘贴仍由 Slint TextInput 处理。
+                }
+            }
             if matches!(ev, WindowEvent::CloseRequested) {
                 if let Some(w) = cw2.upgrade() {
                     let _ = w.hide();

@@ -3089,6 +3089,11 @@ export component SystemChatWindow inherits Window {
     // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
     in-out property <string> draft: "";
 
+    // C1 待发附件（📎 多选 / ⌘V 粘贴）：`attach-count` 控制附件简行显隐，
+    // `attach-summary` 由 Rust 拼好（`📎 N 个：a.png, b.mov`）——D 批再改成输入框内 3+N chips。
+    in property <int> attach-count: 0;
+    in property <string> attach-summary: "";
+
     // 会话 / 模型选择（A 批）：labels 给 ComboBox，选中索引由 Rust 回写；
     // 「模型选择」按**会话**生效，候选只来自「设置 → 供应商」。
     in property <[string]> session-labels: [];
@@ -3101,6 +3106,8 @@ export component SystemChatWindow inherits Window {
     callback model-pick(int);
 
     callback send(string);
+    callback attach-pick();
+    callback attach-clear();
     callback reset-history();
     callback close-window();
     callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
@@ -3399,7 +3406,33 @@ export component SystemChatWindow inherits Window {
                 }
             }
 
-            // 输入区：新建会话 + 输入框 + 发送 + 清空
+            // 待发附件简行（C1 临时形态；D 批改成输入框内 3+N 折叠 chips）：
+            // `📎 N 个：a.png, b.mov` + 「清空」。「清空」只清待发列表，**不删**已落盘文件。
+            if root.attach-count > 0: Rectangle {
+                height: 26px;
+                background: PixelTheme.bg;
+                HorizontalBox {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    Text {
+                        text: root.attach-summary;
+                        font-size: 11px;
+                        color: PixelTheme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    PixelButton {
+                        text: "清空";
+                        size: "small";
+                        enabled: !root.busy;
+                        clicked => { root.attach-clear(); }
+                    }
+                }
+            }
+
+            // 输入区：新建会话 + 附件 + 输入框 + 发送 + 清空
             HorizontalBox {
                 padding: 10px;
                 spacing: 8px;
@@ -3408,6 +3441,28 @@ export component SystemChatWindow inherits Window {
                     text: "＋";
                     enabled: !root.busy;
                     clicked => { root.new-session(); }
+                }
+                // 📎 多选附件（C1）。系统对话输入行空间紧，用轻量 TouchArea 图标按钮。
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    border-radius: PixelTheme.radius;
+                    border-width: PixelTheme.border-width;
+                    border-color: attach-hit.pressed ? PixelTheme.accent : PixelTheme.edge;
+                    background: attach-hit.pressed ? PixelTheme.bg : transparent;
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        text: "📎";
+                        font-size: 15px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    attach-hit := TouchArea {
+                        enabled: !root.busy;
+                        mouse-cursor: pointer;
+                        clicked => { root.attach-pick(); }
+                    }
                 }
                 PixelTextInput {
                     horizontal-stretch: 1;
