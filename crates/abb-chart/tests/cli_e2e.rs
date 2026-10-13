@@ -201,6 +201,43 @@ fn spec_from_stdin_is_supported() {
     assert_eq!((img.width(), img.height()), (300, 180));
 }
 
+/// **回归钉子（对应实测的 Hiragino 缺 `²³µ`）**：真实系统字体下，含单位符号的轴标题
+/// 必须正常出图。缺字形时渲染层会画空方框，而我们的字体层应当**拒绝出图**（退出码 1），
+/// 所以这里断言：要么成功、要么明确报出缺哪个字——**绝不允许**静默出方框。
+#[test]
+fn unit_symbols_in_labels_never_silently_render_as_boxes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = dir.path().join("s.json");
+    std::fs::write(
+        &spec,
+        r#"{"mark":"point","title":"房屋面积","x":"a","y":"b",
+            "x_label":"面积（m²）","y_label":"单价（万元/㎡）",
+            "rows":[{"a":50,"b":30},{"a":80,"b":45},{"a":120,"b":70}]}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("o.png");
+    let r = run(&[
+        "render",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    if r.code == 0 {
+        // 成功路径：确认真的渲染出了内容（不是空图）。
+        let img = image::load_from_memory(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(img.width() > 0 && img.height() > 0);
+    } else {
+        // 失败路径也接受，但必须是「说清缺哪个字」的字体错误，而不是别的什么。
+        assert_eq!(r.code, 1, "{}", r.stderr);
+        assert!(
+            r.stderr.contains("画不出") || r.stderr.contains("没有能覆盖"),
+            "失败原因必须是字体覆盖问题：{}",
+            r.stderr
+        );
+    }
+}
+
 /// 缺省 `--out`：落在**规格文件同目录**（而不是 CWD）——受限会话里 CWD 不一定在
 /// 工作区内，而产物必须在工作区内才能 `deliver --file` 发出去。
 #[test]

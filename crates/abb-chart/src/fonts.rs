@@ -1,25 +1,27 @@
 //! 字体族解析：把「用哪个字体出图」变成一件**可见**的事。
 //!
-//! 为什么需要这一层（四条都是实测出来的，不是推测）：
+//! charton 的 PNG 后端只用**一份**字体渲染全图（`get_raster_font(&config.font_family)`），
+//! 且**没有逐字回退**：字符在这份字体里没有字形时，画出来就是一个空方框。所以「选对字体」
+//! 不是审美问题，而是出图正确性的前提。本模块把这件事收口成一个判据：
 //!
-//! 1. **charton 的默认主题在 raster 路径下中文必出豆腐块。** 主题里的 family 是 CSS 栈
-//!    字符串（`"Inter, -apple-system, …, 'PingFang SC', 'Microsoft YaHei', …, sans-serif"`），
-//!    而 raster 后端的 `get_raster_font` 把**整串**当**一个族名**丢给
-//!    `fontdb::Family::Name(...)` ⇒ 永远匹配不上 ⇒ 回落内置 Inter（只有拉丁字形）。
-//!    对策：把主题的 `title_family` / `label_family` / `tick_label_family` /
-//!    `legend_label_family` 四个字段都设成**单个真实族名**（PNG 后端全图只取一份字体，
-//!    所以四个都要设，少一个那条通道就还是豆腐）。
+//! **选中的字体必须画得出图里出现的每一个字符；画不出就以非零退出，并说明缺哪些字。**
 //!
-//! 2. **不存在的族名静默回落 Inter。** 实测：`--font NoSuchFontXYZ123` 的输出与默认主题
-//!    **逐字节相同**（sha256 一致）。所以「给了族名」不等于「字出来了」。
+//! ## 为什么必须自己查，不能信任渲染层
 //!
-//! 3. **存在但没有中文字形的族名，同样是静默豆腐。** 实测：`--font Helvetica`（本机有、
-//!    无 CJK 字形）⇒ 出一排空心宽框。这是比第 2 条更容易踩的坑：族名是真实存在的，
-//!    一切看着都对。所以判据不能是「字体存在」，必须是**「这份字体有这些字的字形」**。
+//! 三条都是实测出来的：
 //!
-//! 4. **`PingFang SC` 会吞小数点。** 实测：x 轴刻度 `2.0`/`2.5` 在该字体下渲染成 `20`/`25`
-//!    （同一张图其余刻度正常；`Hiragino Sans GB` / `Heiti SC` 正常）。SVG 后端 dump 出的
-//!    标签字符串是正确的 `2.5`，故问题在 raster 字形层。故 macOS 候选序**排除**它。
+//! 1. **不存在的族名静默回落内置 Inter。** 实测 `--font NoSuchFontXYZ123` 的输出与默认主题
+//!    **逐字节相同**（sha256 一致）——「给了族名」完全不能证明「字出来了」。
+//! 2. **存在但没有中文字形的族名，静默出方框。** 实测 `--font Helvetica`（本机有、无 CJK 字形）
+//!    ⇒ 一排空心宽框。判据因此不能是「字体存在」，必须是「这份字体有这些字的字形」。
+//! 3. **存在且覆盖中文的族名，也可能缺个别符号。** 实测 `Hiragino Sans GB`（macOS 自带中文
+//!    主力字体）缺 `²` `³` `µ`——`销售额（m²）` 这种再普通不过的轴标题就会出一个方框，
+//!    而同一张图其余文字完全正常（所以只看「有没有中文」也抓不到）。这条正是本模块最后
+//!    演化成「逐字符校验」的直接原因。
+//!
+//! 另一条与「吞字」相邻的坑：**`PingFang SC` 会吞小数点**（实测 `2.0`/`2.5` 渲染成 `20`/`25`，
+//! 同图其余刻度正常，SVG 后端 dump 出的标签字符串也是正确的 `2.5`，故问题在 raster 字形层）。
+//! 故 macOS 候选序**排除** PingFang，并有像素级回归测试钉住。
 
 use std::sync::OnceLock;
 
@@ -39,22 +41,33 @@ pub struct FontChoice {
 pub trait FontProbe {
     /// 系统里是否存在该族名。
     fn exists(&self, family: &str) -> bool;
-    /// 该族名的字体**是否有这个字符的字形**（无该族名或取不到字形数据 ⇒ false）。
-    fn covers(&self, family: &str, sample: char) -> bool;
+    /// 这些字符里，该族**画不出**的（族不存在 ⇒ 全部算缺失）。
+    ///
+    /// 按输入顺序、去重返回，便于直接把缺失字符写进错误信息。
+    fn missing(&self, family: &str, chars: &[char]) -> Vec<char>;
+
+    /// 该族是否覆盖全部字符（`missing` 的便捷包装）。
+    fn covers_all(&self, family: &str, chars: &[char]) -> bool {
+        self.missing(family, chars).is_empty()
+    }
 }
 
 /// 平台默认候选序（**按优先级**，前面优先）。
 ///
-/// macOS 侧 `PingFang SC` 被**故意排除**：它在本仓库依赖的 charton raster 路径下会吞小数点
-/// （见模块文档第 4 条）。`Hiragino Sans GB` 是 macOS 自带、覆盖简体中文、且实测小数点正常。
+/// macOS 侧两点取舍：
+/// - **`PingFang SC` 被排除**：它在 raster 路径下会吞小数点（见模块文档）。
+/// - **`Heiti SC` 排在 `Hiragino Sans GB` 前面**：实测两者都覆盖中文，但 Hiragino
+///   **缺 `²` `³` `µ`**（`m²` / `µm` 这类轴标题会出方框），Heiti 全覆盖。
+///   注意候选序只是**优先级**：真正的判据是下面的逐字符覆盖校验，谁能覆盖全图文字就用谁
+///   ——所以机器上装了哪些字体不同，也不会出现「顺序猜错就出方框」。
 pub fn default_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
         &[
-            "Hiragino Sans GB",
             "Heiti SC",
             "Songti SC",
             "Arial Unicode MS",
+            "Hiragino Sans GB",
             "Noto Sans CJK SC",
         ]
     }
@@ -79,7 +92,11 @@ pub fn default_candidates() -> &'static [&'static str] {
     }
 }
 
-/// 无 CJK 字体可用时的拉丁兜底（图里没有中文时才会用到它）。
+/// 无合适系统字体时的拉丁兜底——**这是 charton 内置的字体**（不是系统字体）：
+/// 它保证 ASCII/CJK 之外的基本符号可读，但没有中文字形。
+///
+/// 由于它不在系统字体库里，`FontProbe` 查不到它；本模块只在「图里全是 ASCII」时才敢用它
+/// （ASCII 是任何真实字体都覆盖的）。
 pub const LATIN_FALLBACK: &str = "Inter";
 
 /// 真实系统字体库（扫描一次，常驻）。
@@ -96,7 +113,7 @@ pub fn system_probe() -> &'static SystemFonts {
     })
 }
 
-/// 基于 fontdb 的真实实现。
+/// 基于 fontdb + ttf-parser 的真实实现。
 pub struct SystemFonts {
     db: Database,
 }
@@ -132,53 +149,87 @@ impl FontProbe for SystemFonts {
         self.face_of(family).is_some()
     }
 
-    /// 真查字形：`glyph_index` 为 `None` ⇒ 这份字体画不出这个字（渲染器会画成方框）。
+    /// 真查字形：`glyph_index` 为 `None` ⇒ 这份字体画不出这个字（渲染器会给一个空方框）。
     ///
-    /// 只用 ttf-parser 解析一次、只看一个字符，成本可忽略；换来的是「不会静默出豆腐」。
-    fn covers(&self, family: &str, sample: char) -> bool {
+    /// 整张图的文字只解析**一次** face，再逐字符查——系统字体查表是内存操作，成本可忽略。
+    fn missing(&self, family: &str, chars: &[char]) -> Vec<char> {
         let Some(id) = self.face_of(family) else {
-            return false;
+            return dedup(chars);
         };
         self.db
             .with_face_data(id, |data, index| {
                 let Ok(face) = ttf_parser::Face::parse(data, index) else {
-                    return false;
+                    return dedup(chars);
                 };
-                face.glyph_index(sample).is_some()
+                let mut out = Vec::new();
+                for c in dedup(chars) {
+                    if face.glyph_index(c).is_none() {
+                        out.push(c);
+                    }
+                }
+                out
             })
-            .unwrap_or(false)
+            .unwrap_or_else(|| dedup(chars))
     }
+}
+
+/// 去重但保持首次出现顺序（错误信息里按图的文字顺序列缺失字符更像人话）。
+fn dedup(chars: &[char]) -> Vec<char> {
+    let mut seen = Vec::new();
+    for c in chars {
+        if !seen.contains(c) {
+            seen.push(*c);
+        }
+    }
+    seen
+}
+
+/// 视觉上等同空白的字符：不需要任何字体支持，校验时忽略。
+///
+/// 严格说 Tab/换行不该出现在图表文字里，但把它们当「缺失」报错只会让人困惑。
+pub fn is_blank(c: char) -> bool {
+    c.is_whitespace() || c == '\u{200b}'
 }
 
 /// 解析最终字体族。
 ///
 /// 优先级：`explicit`（`--font`）> `spec_font`（规格里的 `font`）> 平台候选序 > 拉丁兜底。
 ///
-/// 三类硬失败（都对应用户可见的、值得拒绝出图的错误）：
-/// - 显式给的族名**不存在**（上游会静默换成 Inter）；
-/// - 需要中文、显式给的族名**存在但画不出中文**（上游会静默出方框）；
-/// - 需要中文、候选序里**没有任何**既存在又能画中文的字体。
+/// **判据只有一个：选中的字体必须画得出 `required` 里的每个字符。** 三类失败都对应
+/// 用户可见的、值得拒绝出图的情况：
+/// - 显式给的族名不存在（上游会静默换成 Inter）；
+/// - 显式给的族名存在，但缺其中某些字符（上游会静默画方框）；
+/// - 候选序里没有任何一个能覆盖全图文字（此时给出「谁差哪几个字」）。
 ///
-/// `sample`：需要验证的中文字符（`None` = 图里没有中文，无需中文能力）。
+/// `required`：图中会出现的全部字符（轴标题/图例项/分类值都算）。为空（纯图形/无文字）
+/// 时只要求族存在。
 pub fn resolve(
     explicit: Option<&str>,
     spec_font: Option<&str>,
     candidates: &[&str],
-    sample: Option<char>,
+    required: &[char],
     probe: &dyn FontProbe,
 ) -> Result<FontChoice, String> {
-    // 候选序里第一个「该有的能力都有」的字体（列出来给用户做建议）。
+    let required = dedup(
+        &required
+            .iter()
+            .copied()
+            .filter(|c| !is_blank(*c))
+            .collect::<Vec<_>>(),
+    );
+
+    // 可用的候选（存在且覆盖全图文字）——显式失败时用它给建议。
     let usable: Vec<&str> = candidates
         .iter()
         .copied()
-        .filter(|c| probe.exists(c) && sample.is_none_or(|ch| probe.covers(c, ch)))
+        .filter(|c| probe.exists(c) && probe.covers_all(c, &required))
         .collect();
     let suggestion = || {
         if usable.is_empty() {
-            "本机候选序里也没有可用的中文字体；请安装一个中文字体后用 `--font <族名>` 指定"
+            "本机候选序里也没有能覆盖这些字的字体；可安装一个更全的中文字体后用 `--font <族名>` 指定"
                 .to_string()
         } else {
-            format!("本机可用：{}", usable.join("`、`"))
+            format!("本机可用：`{}`", usable.join("`、`"))
         }
     };
 
@@ -190,19 +241,19 @@ pub fn resolve(
         if !probe.exists(requested) {
             return Err(format!(
                 "字体族「{requested}」在本机不存在。请用系统里真实存在的族名，或去掉该参数让我们\
-                 按平台默认挑选。注意：不存在的族名在渲染层会被**静默**换成内置的西文字体\
+                 按图的文字自动挑。注意：不存在的族名在渲染层会被**静默**换成内置的西文字体\
                  （中文会变成方框），所以这里直接拒绝。{}",
                 suggestion()
             ));
         }
-        if let Some(ch) = sample {
-            if !probe.covers(requested, ch) {
-                return Err(format!(
-                    "字体族「{requested}」在本机存在，但**没有中文字形**（用它渲染「{ch}」会得到方框）。\
-                     请换成含中文字形的字体。{}",
-                    suggestion()
-                ));
-            }
+        let missing = probe.missing(requested, &required);
+        if !missing.is_empty() {
+            return Err(format!(
+                "字体族「{requested}」在本机存在，但画不出这些字符：{}（渲染出来会是空方框）。\
+                 请换一个覆盖它们的字体，或把这些字符从标题/图例里去掉。{}",
+                quote_chars(&missing),
+                suggestion()
+            ));
         }
         return Ok(FontChoice {
             family: requested.to_string(),
@@ -213,51 +264,70 @@ pub fn resolve(
     if let Some(name) = usable.first() {
         return Ok(FontChoice {
             family: (*name).to_string(),
-            reason: "平台默认候选序命中",
+            reason: "平台默认候选序命中（已按图的文字逐字校验覆盖）",
         });
     }
 
-    if sample.is_some() {
-        return Err(format!(
-            "图里含中日韩文字，但本机没有找到任何**能画出这些字**的字体（已按序试过：{}；\
-             逐个查过字形，光「字体存在」不算）。请安装一个中文字体，或用 `--font <族名>` \
-             显式指定。此处**拒绝出图**：继续渲染只会得到一排方框，而用户要到聊天里看到图\
-             才会发现。",
-            candidates.join("`、`")
-        ));
+    // 没有任何系统候选能覆盖全图文字。唯一的兜底是 charton 内置的 Inter——
+    // 它不在系统字体库里（查不到），但它一定覆盖 ASCII；所以只有「图里全是 ASCII」
+    // 才敢用它。否则如实报错，把「谁差哪几个字」写清楚。
+    if required.iter().all(|c| c.is_ascii()) {
+        return Ok(FontChoice {
+            family: LATIN_FALLBACK.to_string(),
+            reason: "图内只有 ASCII，用内置拉丁字体",
+        });
     }
 
-    // 无中文需求：直接用拉丁兜底（charton 内置 Inter）。
-    Ok(FontChoice {
-        family: LATIN_FALLBACK.to_string(),
-        reason: "图内无中日韩文字，用拉丁兜底",
-    })
+    let detail: Vec<String> = candidates
+        .iter()
+        .filter(|c| probe.exists(c))
+        .map(|c| {
+            let missing = probe.missing(c, &required);
+            format!("{}（缺 {}）", c, quote_chars(&missing))
+        })
+        .collect();
+    let installed = if detail.is_empty() {
+        "（本机一个候选字体都没装）".to_string()
+    } else {
+        format!("已装的候选字体各缺：{}", detail.join("；"))
+    };
+    Err(format!(
+        "图里含自定义字体画不出的字符，且本机没有能覆盖它们的字体。缺的是：{}。{installed}。\
+         请安装覆盖这些字符的字体（或用 `--font <族名>` 指定一个更全的），或把这些字符\
+         从标题/图例/轴标题里去掉。此处**拒绝出图**：继续渲染只会得到若干空方框，\
+         而用户要到聊天里看到图才会发现。",
+        quote_chars(&required)
+    ))
+}
+
+/// 把字符列表写成便于阅读的形态（带上码点，方框/近似字形不至于看混）。
+fn quote_chars(chars: &[char]) -> String {
+    chars
+        .iter()
+        .map(|c| format!("`{c}`(U+{:04X})", *c as u32))
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 /// 平台默认解析（生产路径）。
 pub fn resolve_default(
     explicit: Option<&str>,
     spec_font: Option<&str>,
-    sample: Option<char>,
+    required: &[char],
 ) -> Result<FontChoice, String> {
     resolve(
         explicit,
         spec_font,
         default_candidates(),
-        sample,
+        required,
         system_probe(),
     )
 }
 
-/// 文本里第一个 CJK（中日韩）字符——用它当「这份字体能不能画中文」的样本。
+/// 该字符是否属于 CJK（中日韩）区段。
 ///
-/// 只取一个字符做探针：同一份中文字体对汉字的覆盖是整体的，逐字验证只会白花时间。
-/// 覆盖范围：CJK 统一表意（含扩展 A）、CJK 标点、假名、谚文、全角形式。
-pub fn first_cjk(text: &str) -> Option<char> {
-    text.chars().find(|c| is_cjk(*c))
-}
-
-/// 该字符是否属于 CJK 区段。
+/// 用于「图里只有 ASCII」这个兜底判据与其他调用方：CJK 字符**不可能**来自内置 Inter，
+/// 所以有 CJK 就不允许走拉丁兜底。
 pub fn is_cjk(c: char) -> bool {
     let cp = c as u32;
     matches!(cp,
@@ -276,7 +346,7 @@ pub fn is_cjk(c: char) -> bool {
 
 /// 文本里是否含 CJK 字符。
 pub fn contains_cjk(text: &str) -> bool {
-    first_cjk(text).is_some()
+    text.chars().any(is_cjk)
 }
 
 #[cfg(test)]
@@ -284,7 +354,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// 假字体库：`族名 → 能画出的字符集合`。空集合 = 存在但什么都画不出。
+    /// 假字体库：`族名 → 能画出的字符集合`（未列出的字符一律算缺失）。
     struct Fake(HashMap<&'static str, Vec<char>>);
 
     impl Fake {
@@ -301,67 +371,119 @@ mod tests {
         fn exists(&self, family: &str) -> bool {
             self.0.contains_key(family)
         }
-        fn covers(&self, family: &str, sample: char) -> bool {
-            self.0
-                .get(family)
-                .is_some_and(|chars| chars.contains(&sample))
+        fn missing(&self, family: &str, chars: &[char]) -> Vec<char> {
+            let Some(covers) = self.0.get(family) else {
+                return dedup(chars);
+            };
+            dedup(chars)
+                .into_iter()
+                .filter(|c| !covers.contains(c))
+                .collect()
         }
+    }
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
     }
 
     /// 显式指定的族名不存在 ⇒ 必须报错（上游是静默回落 Inter，实测 `--font NoSuchFontXYZ123`
     /// 与默认输出逐字节相同）。这条测试就是那个实测的回归钉子。
     #[test]
     fn explicit_missing_family_is_an_error_not_a_silent_fallback() {
-        let probe = Fake::new(&[("Hiragino Sans GB", "中")]);
+        let probe = Fake::new(&[("Heiti SC", "中文")]);
         let err = resolve(
             Some("NoSuchFontXYZ123"),
             None,
-            &["Hiragino Sans GB"],
-            Some('中'),
+            &["Heiti SC"],
+            &chars("中文"),
             &probe,
         )
         .unwrap_err();
         assert!(err.contains("NoSuchFontXYZ123"), "{err}");
         assert!(err.contains("不存在"), "{err}");
         // 报错要顺带告诉对方能用什么，否则模型只能瞎猜。
-        assert!(err.contains("Hiragino Sans GB"), "要给出可用建议：{err}");
+        assert!(err.contains("Heiti SC"), "要给出可用建议：{err}");
     }
 
     /// **回归钉子**：族名存在但没有中文字形（实测 Helvetica）⇒ 必须报错。
-    /// 否则输出的是一排「看着像占位符」的方框，而用户要到聊天里看到图才发现。
     #[test]
     fn existing_font_without_cjk_glyphs_is_rejected() {
-        let probe = Fake::new(&[("Helvetica", "abc"), ("Heiti SC", "中")]);
-        let err = resolve(Some("Helvetica"), None, &["Heiti SC"], Some('中'), &probe).unwrap_err();
-        assert!(err.contains("没有中文字形"), "{err}");
-        assert!(err.contains("Heiti SC"), "要建议一个能画中文的：{err}");
+        let probe = Fake::new(&[("Helvetica", "abc"), ("Heiti SC", "中文")]);
+        let err = resolve(
+            Some("Helvetica"),
+            None,
+            &["Heiti SC"],
+            &chars("中文"),
+            &probe,
+        )
+        .unwrap_err();
+        assert!(err.contains("画不出"), "{err}");
+        assert!(err.contains("中"), "要说清缺哪个字：{err}");
     }
 
-    /// 但同一个 Helvetica，在**图里没有中文**时是合法选择（不该被拦）。
+    /// **回归钉子（本模块的起因）**：字体覆盖中文但缺个别符号。
+    /// 实测 `Hiragino Sans GB` 缺 `²` `³` `µ`——`销售额（m²）` 会出一个方框，
+    /// 而图里其余中文完全正常，所以「有没有中文字体」这种粗判据抓不到它。
     #[test]
-    fn existing_font_without_cjk_is_fine_when_no_cjk_needed() {
-        let probe = Fake::new(&[("Helvetica", "abc")]);
-        let choice = resolve(Some("Helvetica"), None, &[], None, &probe).unwrap();
-        assert_eq!(choice.family, "Helvetica");
+    fn font_covering_cjk_but_missing_a_symbol_is_rejected() {
+        // Hiragino 覆盖中文但不覆盖 ²（与实测一致）；Heiti 全覆盖。
+        let probe = Fake::new(&[
+            ("Hiragino Sans GB", "销售额m（）"),
+            ("Heiti SC", "销售额m（）²"),
+        ]);
+        let err = resolve(
+            None,
+            None,
+            &["Hiragino Sans GB", "Heiti SC"],
+            &chars("销售额（m²）"),
+            &probe,
+        )
+        .unwrap();
+        // 关键是**候选序不该选中 Hiragino**：它缺 ²，而 Heiti 覆盖全部。
+        assert_eq!(err.family, "Heiti SC");
+
+        // 显式指定 Hiragino 时，必须报错到「缺 ²」这一级，而不是默默画方框。
+        let err = resolve(
+            Some("Hiragino Sans GB"),
+            None,
+            &["Heiti SC"],
+            &chars("销售额（m²）"),
+            &probe,
+        )
+        .unwrap_err();
+        assert!(err.contains("²"), "{err}");
+        assert!(
+            err.contains("U+00B2"),
+            "要带码点，避免方框与近似字形看混：{err}"
+        );
+    }
+
+    /// **允许的组合**：唯一的候选缺某个字符，但图里并没有用那个字符 ⇒ 正常出图。
+    /// （判据必须是「图里实际用到的字符」，不是「字体够不够全」。）
+    #[test]
+    fn a_font_missing_unused_chars_is_fine() {
+        let probe = Fake::new(&[("Hiragino Sans GB", "销售额m（）²")]);
+        let choice = resolve(None, None, &["Hiragino Sans GB"], &chars("销售额"), &probe).unwrap();
+        assert_eq!(choice.family, "Hiragino Sans GB");
     }
 
     /// 规格里的 `font` 与 `--font` 同等对待（都不许静默回落）。
     #[test]
     fn spec_font_is_validated_too() {
         let probe = Fake::new(&[]);
-        let err = resolve(None, Some("Bogus"), &[], None, &probe).unwrap_err();
+        let err = resolve(None, Some("Bogus"), &[], &chars("x"), &probe).unwrap_err();
         assert!(err.contains("Bogus"), "{err}");
     }
 
     /// `--font` 覆盖规格里的 `font`。
     #[test]
     fn explicit_font_beats_spec_font() {
-        let probe = Fake::new(&[("Heiti SC", "中"), ("Hiragino Sans GB", "中")]);
+        let probe = Fake::new(&[("Heiti SC", "中文"), ("Songti SC", "中文")]);
         let choice = resolve(
             Some("Heiti SC"),
-            Some("Hiragino Sans GB"),
+            Some("Songti SC"),
             &[],
-            Some('中'),
+            &chars("中文"),
             &probe,
         )
         .unwrap();
@@ -369,40 +491,32 @@ mod tests {
         assert_eq!(choice.reason, "显式指定");
     }
 
-    /// 候选序按优先级取第一个存在的。
+    /// 候选序按优先级取第一个覆盖全图文字的。
     #[test]
-    fn first_existing_candidate_wins() {
-        let probe = Fake::new(&[("Heiti SC", "中")]);
+    fn first_covering_candidate_wins() {
+        let probe = Fake::new(&[("Heiti SC", "中文")]);
         let choice = resolve(
             None,
             None,
             &["Hiragino Sans GB", "Heiti SC"],
-            Some('中'),
+            &chars("中文"),
             &probe,
         )
         .unwrap();
         assert_eq!(choice.family, "Heiti SC");
     }
 
-    /// 候选序里「存在但画不出中文」的字体必须被**跳过**（换下一个能画的），
-    /// 而不是因为「它存在」就选它 —— 正是 Helvetica 那一类坑。
+    /// 空白字符不要求有字形（否则「标题末尾有个空格」会变成字体错误）。
     #[test]
-    fn candidate_without_cjk_glyphs_is_skipped() {
-        let probe = Fake::new(&[("Malgun Gothic", "abc"), ("Microsoft YaHei", "中")]);
-        let choice = resolve(
-            None,
-            None,
-            &["Malgun Gothic", "Microsoft YaHei"],
-            Some('中'),
-            &probe,
-        )
-        .unwrap();
-        assert_eq!(choice.family, "Microsoft YaHei");
+    fn blank_characters_are_not_required() {
+        let probe = Fake::new(&[("Heiti SC", "中文")]);
+        let choice = resolve(None, None, &["Heiti SC"], &chars("中文 \n\t"), &probe).unwrap();
+        assert_eq!(choice.family, "Heiti SC");
     }
 
     /// **macOS 候选序必须排除 `PingFang SC`**：它在本仓库依赖的 charton raster 路径下会吞小数点
-    /// （实测 `2.0`/`2.5` 渲染成 `20`/`25`）。这条断言防的是「有人觉得 PingFang 更漂亮就把
-    /// 它加回候选序」——那会让所有小数刻度静默出错别字。
+    /// （实测 `2.0`/`2.5` 渲染成 `20`/`25`）。这条断言防的是「有人觉得 PingFang 更漂亮就把它
+    /// 加回候选序」——那会让所有小数刻度静默出错别字。
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_candidates_never_include_pingfang() {
@@ -417,23 +531,47 @@ mod tests {
     #[test]
     fn cjk_text_without_any_cjk_capable_font_is_an_error() {
         let probe = Fake::new(&[("SomeLatin", "abc")]);
-        let err = resolve(None, None, &["SomeLatin"], Some('中'), &probe).unwrap_err();
+        let err = resolve(None, None, &["SomeLatin"], &chars("中文"), &probe).unwrap_err();
         assert!(err.contains("方框"), "错误信息要说清后果：{err}");
+        assert!(err.contains("SomeLatin"), "要说清候选都缺什么：{err}");
     }
 
-    /// 纯英文图找不到中文字体时**不该**失败——回落到拉丁字体正常出图。
+    /// 纯 ASCII 图在没有任何中文字体时**不该**失败——回落到内置拉丁字体正常出图。
     #[test]
-    fn latin_only_spec_falls_back_instead_of_failing() {
+    fn ascii_only_spec_falls_back_instead_of_failing() {
         let probe = Fake::new(&[]);
-        let choice = resolve(None, None, &["NoSuchCJK"], None, &probe).unwrap();
+        let choice = resolve(
+            None,
+            None,
+            &["NoSuchCJK"],
+            &chars("Sales 2024 (Q1) 12.5%"),
+            &probe,
+        )
+        .unwrap();
         assert_eq!(choice.family, LATIN_FALLBACK);
+    }
+
+    /// 但含非 ASCII（如 `²`）时，哪怕没有中文也不许回落到 Inter（它不一定有该字形）。
+    #[test]
+    fn non_ascii_without_covering_font_is_rejected_even_without_cjk() {
+        let probe = Fake::new(&[]);
+        let err = resolve(None, None, &["NoSuchCJK"], &chars("m²"), &probe).unwrap_err();
+        assert!(err.contains("²"), "{err}");
     }
 
     /// 空/纯空白参数按「没给」处理，不要当成一个叫 "" 的族名去查。
     #[test]
     fn blank_font_is_treated_as_absent() {
-        let probe = Fake::new(&[("Heiti SC", "中")]);
-        let choice = resolve(Some("   "), Some(""), &["Heiti SC"], Some('中'), &probe).unwrap();
+        let probe = Fake::new(&[("Heiti SC", "中文")]);
+        let choice = resolve(Some("   "), Some(""), &["Heiti SC"], &chars("中文"), &probe).unwrap();
+        assert_eq!(choice.family, "Heiti SC");
+    }
+
+    /// 没有文字要渲染（纯图形）时，只要族存在即可。
+    #[test]
+    fn empty_requirement_only_needs_existence() {
+        let probe = Fake::new(&[("Heiti SC", "")]);
+        let choice = resolve(None, None, &["Heiti SC"], &[], &probe).unwrap();
         assert_eq!(choice.family, "Heiti SC");
     }
 
@@ -442,29 +580,41 @@ mod tests {
         for text in ["销售额", "趋势（月）", "売上", "매출", "，", "。"] {
             assert!(contains_cjk(text), "{text} 应判为 CJK");
         }
-        for text in ["Sales", "2.5", "café", "a-b_c", ""] {
+        for text in ["Sales", "2.5", "café", "a-b_c", "²", ""] {
             assert!(!contains_cjk(text), "{text} 不应判为 CJK");
         }
     }
 
-    /// 取出的样本必须是第一个 CJK 字符（探针要拿它去问字体）。
+    /// 码点标注只在报错时出现，形态要稳定（否则测试与用户都要重读）。
     #[test]
-    fn first_cjk_returns_the_first_cjk_char() {
-        assert_eq!(first_cjk("Q1 销售额"), Some('销'));
-        assert_eq!(first_cjk("Sales"), None);
+    fn quote_chars_includes_codepoint() {
+        assert_eq!(quote_chars(&['²']), "`²`(U+00B2)");
+        assert_eq!(quote_chars(&['中', 'µ']), "`中`(U+4E2D)、`µ`(U+00B5)");
     }
 
-    /// 真实系统探针的自检：本机至少有一个平台候选能画中文，且它确实被 `resolve` 选中。
+    /// **真实系统自检（唯一依赖本机字体的测试）**：默认候选必须能覆盖一张真实图表里
+    /// 会出现的文字（中文 + 数字 + 小数 + 常见单位/排版符号）。
     ///
-    /// 这条是**唯一**依赖真实系统字体的测试；它的作用是把「候选表在真机上真的可用」
-    /// 钉住——上面那些假探针测试保证不了这一点。
+    /// 这条是「Hiragino 缺 `²³µ`」那个坑的守门人：候选序改回把 Hiragino 放第一时，
+    /// 若本机没有更全的候选可用，这条会红。
     #[test]
-    fn real_system_has_a_usable_cjk_candidate() {
+    fn real_system_default_covers_a_realistic_chart_text_set() {
         let probe = system_probe();
-        let choice = resolve(None, None, default_candidates(), Some('中'), probe);
-        assert!(
-            choice.is_ok(),
-            "本机候选序里没有任何能画中文的字体：{choice:?}（macOS 预期 Hiragino Sans GB）"
+        let required = chars(
+            "销售额（万元） 2024 上半年区域对比 华东华北华南 月份 Q1 12.5% -3.2 m² µg ㎡ ℃ ≈ ≤ ≥ → — “引号”",
         );
+        match resolve(None, None, default_candidates(), &required, probe) {
+            Ok(choice) => {
+                // 选中者必须真的覆盖（explain 一下缺什么，便于排查机器差异）。
+                let missing = probe.missing(&choice.family, &required);
+                assert!(
+                    missing.is_empty(),
+                    "选中的 {} 缺 {}",
+                    choice.family,
+                    quote_chars(&missing)
+                );
+            }
+            Err(e) => panic!("本机默认候选无法覆盖真实图表文字：{e}"),
+        }
     }
 }

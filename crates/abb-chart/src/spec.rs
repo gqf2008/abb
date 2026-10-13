@@ -141,10 +141,10 @@ pub fn render_to_png(
     let table = load_table(&spec, opts, spec_dir)?;
     let ds = table_to_dataset(&table, &spec.types)?;
 
-    // 字体：先解析（可能直接失败），再把四个 family 字段都设成这个单个族名。
-    // 探针样本取「第一个中文字符」：`None` 表示图里没有中文，也就不要求中文能力。
-    let sample = spec_cjk_sample(&spec, &table);
-    let choice = fonts::resolve_default(opts.font.as_deref(), spec.font.as_deref(), sample)?;
+    // 字体：先把「图上会出现的全部字符」收集起来，再让字体层逐个校验覆盖
+    //（raster 路径没有逐字回退，缺一个字形就是一个空方框）。
+    let required = spec_required_chars(&spec, &table);
+    let choice = fonts::resolve_default(opts.font.as_deref(), spec.font.as_deref(), &required)?;
 
     let mut lc = render::build(&spec, ds, (width, height))?;
     lc = apply_theme(lc, opts.theme.as_deref().or(spec.theme.as_deref()))?;
@@ -245,26 +245,44 @@ pub fn resolve_data_path(data: &str, spec_dir: Option<&Path>) -> PathBuf {
     }
 }
 
-/// 取一个中文字符当字体探针样本（`None` = 图里没有中文，不要求中文能力）。
-fn spec_cjk_sample(spec: &Spec, table: &Table) -> Option<char> {
-    let texts = [
+/// 图上会出现的**全部字符**（去重，保持出现顺序）。
+///
+/// 覆盖范围要完整，漏一处就会出现方框：
+/// - 规格里的可见文字：标题、轴标题；
+/// - **列名**：柱状图/箱线图的分组轴刻度与图例名就是列名（或分类值）；
+/// - **分类值**：图例项与轴刻度实际画的是它们；
+/// - 数值列不用管：刻度由渲染器按字体本该有的数字生成（且 `²` 这类单位通常在轴标题里，
+///   已经包含在上面）。
+///
+/// 去重后通常只有几十个字符，逐字查字体开销可忽略。
+fn spec_required_chars(spec: &Spec, table: &Table) -> Vec<char> {
+    let mut out: Vec<char> = Vec::new();
+    let mut push = |text: &str| {
+        for c in text.chars() {
+            if !fonts::is_blank(c) && !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    };
+    for text in [
         spec.title.as_deref(),
         spec.x_label.as_deref(),
         spec.y_label.as_deref(),
-        spec.x.as_deref(),
-        spec.y.as_deref(),
-        spec.color.as_deref(),
-    ];
-    if let Some(ch) = texts.into_iter().flatten().find_map(fonts::first_cjk) {
-        return Some(ch);
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push(text);
     }
-    if let Some(ch) = table.columns.iter().find_map(|c| fonts::first_cjk(c)) {
-        return Some(ch);
+    for name in &table.columns {
+        push(name);
     }
-    table.rows.iter().flatten().find_map(|cell| match cell {
-        crate::data::Cell::Text(t) => fonts::first_cjk(t),
-        _ => None,
-    })
+    for cell in table.rows.iter().flatten() {
+        if let crate::data::Cell::Text(t) = cell {
+            push(t);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -352,39 +370,63 @@ mod tests {
         assert_eq!(abs, PathBuf::from("/tmp/d.csv"));
     }
 
-    /// 数据里的中文（图例项）也要参与样本选取，否则会漏判成「用拉丁字体就行」。
+    /// 图上会出现的字符要**收全**：标题、轴标题、列名、分类值。
+    /// 漏掉分类值就会漏掉图例里那些字（「标题英文、图例中文」是最常见的组合）。
     #[test]
-    fn cjk_sample_covers_data_values_not_just_titles() {
+    fn required_chars_collect_titles_columns_and_category_values() {
         let spec = Spec {
-            mark: "point".into(),
+            mark: "bar".into(),
             title: Some("Sales".into()),
+            x_label: Some("季度".into()),
             ..Default::default()
         };
-        let table = table_from_json_rows(&serde_json::json!([{"k":"华东","v":1}])).unwrap();
-        assert_eq!(spec_cjk_sample(&spec, &table), Some('华'));
+        let table =
+            table_from_json_rows(&serde_json::json!([{"k":"华东","v":1},{"k":"华南","v":2}]))
+                .unwrap();
+        let got: String = spec_required_chars(&spec, &table).into_iter().collect();
+        // 标题是 "Sales"，所以要求里不该出现「销」——这条断言同时钉住「别把不该有的塞进来」。
+        for needle in ['S', 'a', '季', '度', 'k', 'v', '华', '东', '南'] {
+            assert!(got.contains(needle), "缺字符 {needle}（得到 {got}）");
+        }
+        assert!(!got.contains('销'), "标题里没有「销」，不该被要求：{got}");
     }
 
+    /// 去重：同一个字出现多次只查一次（否则每个分类值都重复查）。
     #[test]
-    fn all_latin_spec_has_no_cjk_sample() {
+    fn required_chars_are_deduplicated() {
+        let spec = Spec {
+            mark: "bar".into(),
+            title: Some("中中中".into()),
+            ..Default::default()
+        };
+        let table = table_from_json_rows(&serde_json::json!([{"中":"中","v":1}])).unwrap();
+        assert_eq!(spec_required_chars(&spec, &table), vec!['中', 'v']);
+    }
+
+    /// 纯英文图不该被要求中文字体（也不会因为「没有中文字体」而失败）。
+    #[test]
+    fn all_latin_spec_requires_no_cjk() {
         let spec = Spec {
             mark: "point".into(),
             title: Some("Sales".into()),
             ..Default::default()
         };
         let table = table_from_json_rows(&serde_json::json!([{"k":"east","v":1}])).unwrap();
-        assert_eq!(spec_cjk_sample(&spec, &table), None);
+        let chars = spec_required_chars(&spec, &table);
+        assert!(!chars.iter().any(|c| fonts::is_cjk(*c)));
     }
 
-    /// 标题里的中文优先当样本（它一定被画在图上）。
+    /// 空白不算「图上出现的字符」（否则标题末尾一个空格就能让字体校验失败）。
     #[test]
-    fn title_cjk_wins_as_sample() {
+    fn required_chars_skip_blank() {
         let spec = Spec {
             mark: "point".into(),
-            title: Some("季度趋势".into()),
+            title: Some("a b".into()),
             ..Default::default()
         };
-        let table = table_from_json_rows(&serde_json::json!([{"k":"east","v":1}])).unwrap();
-        assert_eq!(spec_cjk_sample(&spec, &table), Some('季'));
+        let table = table_from_json_rows(&serde_json::json!([{"k":"e","v":1}])).unwrap();
+        let chars = spec_required_chars(&spec, &table);
+        assert!(!chars.contains(&' '));
     }
 
     /// 端到端：内联数据 → PNG，且尺寸 = 参数（不被 scale_factor 放大）。
