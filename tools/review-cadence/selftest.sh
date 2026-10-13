@@ -41,14 +41,14 @@ expect_rc() {
 echo "── check_review_cadence 自测（contract-ts=${ts}）"
 
 # ── 合规样本（rc=0）─────────────────────────────────────────────────────────
-for s in ok_basic ok_comment_exempt ok_no_reviews ok_merge_resolved ok_historical_missing; do
+for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts"
 done
 
 # ── 违规样本（rc=1）─────────────────────────────────────────────────────────
 for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch \
          bad_clean_but_request_changes bad_blocking_but_approve bad_three_rounds \
-         bad_merge_unresolved; do
+         bad_merge_unresolved bad_premerge_unresolved; do
   expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts"
 done
 
@@ -58,6 +58,14 @@ expect_rc "JSON 非法" 2 "$check" --json "$samples/bad_invalid_json.json" --con
 expect_rc "无参数" 2 "$check"
 expect_rc "同时给 thread-id 与 --json" 2 "$check" some-thread --json "$samples/ok_basic.json"
 expect_rc "非整数阈值" 2 "$check" --json "$samples/ok_basic.json" --contract-ts abc
+expect_rc "顶层非数组（异常应 rc=2，不得漏成 0/5）" 2 "$check" --json "$samples/bad_nonarray_object.json" --contract-ts "$ts"
+
+# thread 取不到（真实 walgit 路径）——用假 walgit 触发非零退出，不依赖真实 walgit/网络
+shim="$(mktemp -d)"
+printf '#!/bin/sh\nexit 1\n' > "$shim/walgit"
+chmod +x "$shim/walgit"
+expect_rc "thread 取不到（walgit 非零 ⇒ rc=2）" 2 env PATH="$shim:$PATH" "$check" some-nonexistent-thread
+rm -rf "$shim"
 
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

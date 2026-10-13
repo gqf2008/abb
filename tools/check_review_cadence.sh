@@ -33,8 +33,9 @@
 set -euo pipefail
 
 # 契约落地时间（epoch 秒）。此日期之前的 review 视为历史，缺契约行跳过。
-# 2026-10-13（本卡落地日）。改动本常量须同步 README/卡的说明并重跑自测的时间阈值邻域用例。
-CONTRACT_TS_DEFAULT=1791880800
+# = 「现存 review 最大 ts」+ 1（落地前扫全部 thread 得出，保证不误判历史）；**不得调低**，
+# 否则会把契约前的历史条目当成契约后而误红。改动本常量须重跑自测的时间阈值邻域用例。
+CONTRACT_TS_DEFAULT=1791876192
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 jq_program="$script_dir/review-cadence/check.jq"
@@ -92,11 +93,18 @@ else
 fi
 
 if ! jq empty "$tmp" >/dev/null 2>&1; then
-  echo "❌ 输入不是合法 JSON（thread 条目应为一个数组）" >&2
+  echo "❌ 输入不是合法 JSON" >&2
+  exit 2
+fi
+if ! jq -e 'type == "array"' "$tmp" >/dev/null 2>&1; then
+  echo "❌ 输入顶层不是数组（thread 条目应为一个数组）" >&2
   exit 2
 fi
 
-result="$(jq -f "$jq_program" --argjson contract_ts "$contract_ts" "$tmp")"
+if ! result="$(jq -f "$jq_program" --argjson contract_ts "$contract_ts" "$tmp")"; then
+  echo "❌ jq 守卫执行失败（见上方错误）" >&2
+  exit 2
+fi
 
 echo "── review cadence：${thread_id:-<json>}（契约阈值 ts=${contract_ts}）"
 echo "$result" | jq -r '

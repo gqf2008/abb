@@ -42,8 +42,9 @@ findings: blocking=1 non-blocking=2
    若另有逐条标签，标签计数须等于契约行数字。
 2. **blocking 轮数 ≤ 2**：同一 thread 里契约行 `blocking>0` 的 review 条数不超过 2
    （第 2 轮仍未决 ⇒ 升级为架构问题，不再开第 3、4 轮）。
-3. **合并前收口**：存在 `merge_result{"merged":true}` 时，其前最后一次 blocking 轮之后
-   必须有一个 `blocking=0` 的 `approve`。
+3. **可合并**：thread 内最后一条（`ts` ≥ 契约阈值）判决类 review 必须是 `blocking=0` 的
+   `approve`；否则判红。该判据在**写 `merge_result` 之前**就能跑（不依赖是否已有
+   `merge_result`）——这正是「不得带未决 blocking 合并」的机器判据。
 
 `decision=="comment"` 的 review 不参与上述判定（既不要求契约行，也不计 blocking 轮）。
 
@@ -52,7 +53,8 @@ findings: blocking=1 non-blocking=2
 契约自本文件落地之日生效。**不改写历史 review 条目**（append-only）：
 `ts` 小于契约阈值的 review 视为历史，缺契约行时**跳过并计数、不判红**。
 
-阈值常量在 `tools/check_review_cadence.sh` 的 `CONTRACT_TS_DEFAULT`，
+阈值常量在 `tools/check_review_cadence.sh` 的 `CONTRACT_TS_DEFAULT`
+（= 落地时「现存 review 最大 `ts`」+ 1，保证不误判历史；**不得调低**），
 可用 `--contract-ts <epoch>` 或 `ABB_REVIEW_CONTRACT_TS` 覆盖（自测即用它把样本放在阈值前后）。
 
 ## 怎么跑
@@ -67,7 +69,7 @@ tools/check_review_cadence.sh --json tools/review-cadence/samples/ok_basic.json 
 
 退出码：`0` 通过；`1` 违规；`2` 用法/工具错误（缺 jq、thread 取不到、JSON 非法）。
 
-守卫自身的自测（合规 + 违规 + 守卫失效模式，共 17 例）随仓提交，并在
+守卫自身的自测（合规 + 违规 + 守卫失效模式，共 21 例）随仓提交，并在
 `.walgit/ci.toml` 的 `review-cadence-selftest` 任务里执行：
 
 ```sh

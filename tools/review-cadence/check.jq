@@ -7,9 +7,9 @@
 #         blocking>0 ⇒ request_changes；blocking=0 ⇒ approve；
 #       若 note 里同时用了逐条 `[blocking]` / `[non-blocking]` 标签，标签计数必须与契约行相等；
 #       ts < contract_ts 的历史条目缺契约行 ⇒ 跳过并计数（不判红）；ts ≥ contract_ts 缺 ⇒ 判红。
-#   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的 review 条数）≤ 2。
-#   (c) 存在 merge_result{merged:true} 时，其前最后一次 blocking 轮之后必须有一个
-#       blocking=0 的 approve（即 blocking 已收口），否则判红。
+#   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的**判决类** review 条数）≤ 2。
+#   (c) thread 内最后一条（ts ≥ contract_ts）判决类 review 必须是 blocking=0 的 approve；
+#       否则判红。该判据在**合并前**即可判定（不依赖是否已有 merge_result）。
 #   `decision=="comment"` 的 review 不参与上述判定（既不被要求带契约行、也不计 blocking 轮）。
 #
 # 输出：{violations:[...], summary:{...}, reviews:[...]}
@@ -46,10 +46,9 @@ def label_counts:
         contract: ((.e.body.note // "") | contract_of),
         labels: ((.e.body.note // "") | label_counts) } ] as $reviews
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | .idx ] as $merges
-| ($reviews | map(select(.contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
+| ($reviews | map(select(.decision != "comment" and .contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
 | ($reviews | map(select((.decision == "approve" or .decision == "request_changes")
                          and .contract == null and .ts < $contract_ts)) | length) as $skipped
-| (if ($merges | length) > 0 then ($merges | max) else null end) as $merge_idx
 | (
     [
       # (a) 判决类 review 的契约一致性
@@ -76,21 +75,18 @@ def label_counts:
           "thread blocking 轮数 \($blocking_rounds) > 2（应升级为架构问题，不再开第 3 轮）"
         else empty end ),
 
-      # (c) 合并前 blocking 已收口
-      ( if ($merge_idx != null) then
-          ($reviews | map(select(.idx < $merge_idx))) as $pre
-          | ($pre | map(select(.contract != null and .contract.blocking > 0) | .idx)) as $b_idx
-          | ( if ($b_idx | length) > 0 then
-                ($b_idx | max) as $lastb
-                | ( if (($pre | map(select(.idx > $lastb
-                                          and (.decision == "approve")
-                                          and .contract != null
-                                          and .contract.blocking == 0)) | length)) > 0
-                    then empty
-                    else "merge_result(idx=\($merge_idx)) 前最后一次 blocking 轮未收口（其后无 blocking=0 的 approve）"
-                    end )
-              else empty end )
-        else empty end )
+      # (c) 可合并：thread 内最后一条（ts ≥ 契约阈值）判决类 review 必须是 blocking=0 的 approve。
+      #     必须在**合并前**就能判（旧写法以「已有 merge_result」为前置 ⇒ 活卡恒绿，评审 blocking 项）。
+      ( ( $reviews
+          | map(select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes"))) ) as $post
+        | if ($post | length) > 0 then
+            ($post[-1]) as $v
+            | if ($v.decision != "approve"
+                  or ($v.contract != null and $v.contract.blocking > 0)) then
+                "thread 最后一条判决类 review（\($v.oid)）不是 blocking=0 的 approve（decision=\($v.decision)）⇒ 不得合并"
+              else empty end
+          else empty end )
     ]
   ) as $violations
 | { violations: $violations,
