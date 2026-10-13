@@ -365,6 +365,26 @@ pub fn resolve_arg(raw: &str, base: &Path, what: &str) -> Result<PathBuf, Render
     }
 }
 
+/// **渲染器一定会画**的字符（数值刻度、以及被当作分类渲染的数值单元格）。
+///
+/// 为什么必须单独列出来（实测过的判据缺口）：刻度文字**不来自规格里的可见文字**，而是由
+/// 渲染器/`fmt_number` 现算的。只收集「标题/轴标题/列名/文本单元格」会漏掉它们——
+/// 实测一张标题为 `ABC`、列为 `cat`/`delta` 的柱状图，图上实际画了 `1` `2` `3` `-` `0` `5`；
+/// 一张含 1e20 量级的散点图，轴上出现了 `1.0E20` 这样的文字（`E` 也是现算的）。
+/// 漏收集的后果与前几轮的方框坑同类：字体缺某个数字字形时会静默变方框。
+///
+/// 内容取「默认路径**能**产出的字符」：
+/// - 数字与小数点、负号：`2024.0`、`-10`；
+/// - 科学计数法的指数符号：`1.0E20`（实测）。
+///
+/// **故意不含** `µ`/`k`/`M`/`B`/`T`：那些只在 charton 的 `Abbreviation::Compact` 下才出现，
+/// 而本 CLI 没有暴露任何数值格式选项（`Spec` 里没有 formatter 字段），默认路径产不出它们。
+/// 把它们加进来只会让 `Hiragino Sans GB`（实测缺 `µ`）在**每张图**上都被判不合格——那是
+/// 过度收紧，不是更安全。将来若给 CLI 加上格式选项，必须同步把对应字符加进这份表。
+pub const RENDERER_TEXT_BUDGET: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '-', '+', 'e', 'E',
+];
+
 /// 图上会出现的**全部字符**（去重，保持出现顺序）。
 ///
 /// 覆盖范围要完整，漏一处就会出现方框：
@@ -376,7 +396,8 @@ pub fn resolve_arg(raw: &str, base: &Path, what: &str) -> Result<PathBuf, Render
 ///
 /// 去重后通常只有几十个字符，逐字查字体开销可忽略。
 fn spec_required_chars(spec: &Spec, table: &Table) -> Vec<char> {
-    let mut out: Vec<char> = Vec::new();
+    // 先放渲染器必画的字符（数值刻度现算，不来自规格文字），再收规格里的可见文字。
+    let mut out: Vec<char> = RENDERER_TEXT_BUDGET.to_vec();
     let mut push = |text: &str| {
         for c in text.chars() {
             if !fonts::is_blank(c) && !out.contains(&c) {
@@ -661,6 +682,42 @@ mod tests {
         assert!(!got.contains('销'), "标题里没有「销」，不该被要求：{got}");
     }
 
+    /// **回归钉子（本轮自查发现的判据缺口）**：数值刻度的字符是渲染器现算的，
+    /// 规格文字里可能一个数字都没有，但它们照样会被画上去，必须参与字体校验。
+    ///
+    /// 实测反例（缺口存在时）：标题 `ABC` + 列 `cat`/`delta` 的柱状图，图上画了
+    /// `1` `2` `3` `-` `0` `5`，而旧实现收集到的集合里**一个数字都没有**。
+    /// 判别力：把 `RENDERER_TEXT_BUDGET` 从收集里去掉 ⇒ 本测试红。
+    #[test]
+    fn renderer_generated_numeric_labels_are_always_required() {
+        let spec = Spec {
+            mark: "bar".into(),
+            title: Some("ABC".into()),
+            ..Default::default()
+        };
+        let table = table_from_json_rows(&serde_json::json!([{"cat":1,"delta":-3.2}])).unwrap();
+        let chars = spec_required_chars(&spec, &table);
+        for c in ['0', '3', '9', '-', '.'] {
+            assert!(
+                chars.contains(&c),
+                "数字/符号 {c} 必须在校验集合里：{:?}",
+                chars
+            );
+        }
+    }
+
+    /// 这份底线**不得**包含只在 `Abbreviation::Compact` 下才出现的字符（`µ`/`k`/`M`）：
+    /// 本 CLI 没有数值格式选项，包含它们会让「实测缺 `µ` 的 Hiragino」在每张图上都被误判。
+    #[test]
+    fn renderer_budget_excludes_chars_we_cannot_emit() {
+        for c in ['µ', 'k', 'M', 'B', 'T'] {
+            assert!(
+                !RENDERER_TEXT_BUDGET.contains(&c),
+                "{c} 不在默认路径的产出里，加进来会造成误判"
+            );
+        }
+    }
+
     /// 去重：同一个字出现多次只查一次（否则每个分类值都重复查）。
     #[test]
     fn required_chars_are_deduplicated() {
@@ -670,7 +727,14 @@ mod tests {
             ..Default::default()
         };
         let table = table_from_json_rows(&serde_json::json!([{"中":"中","v":1}])).unwrap();
-        assert_eq!(spec_required_chars(&spec, &table), vec!['中', 'v']);
+        let chars = spec_required_chars(&spec, &table);
+        // 规格文字里的字各出现一次（底线字符在集合开头，这里只看规格那部分）。
+        let from_spec: Vec<char> = chars
+            .iter()
+            .copied()
+            .filter(|c| !RENDERER_TEXT_BUDGET.contains(c))
+            .collect();
+        assert_eq!(from_spec, vec!['中', 'v']);
     }
 
     /// 纯英文图不该被要求中文字体（也不会因为「没有中文字体」而失败）。
