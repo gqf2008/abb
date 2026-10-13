@@ -48,6 +48,7 @@ abb-chart render --spec spec.json [--out chart.png] [--data d.csv]
   `errorbar` / `rule` / `text`（也认 `scatter` / `column` / `histogram` / `kde` / `boxplot` /
   `hline` 等别名）。
 - 数据来源三选一：规格里的 `data`（CSV）、规格里的 `rows`（内联 JSON 数组）、命令行的 `--data`。
+  三者优先级：`--data` > `data` > `rows`；**`data` 与 `rows` 同时给出是硬错**（不静默挑一个）。
 - **路径安全边界（改动前必读，这里踩过两个阻塞级洞）**：
   | 入口 | 规则 |
   |---|---|

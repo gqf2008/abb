@@ -194,8 +194,13 @@ fn apply_theme(
 /// 给了它就该压过规格里写死的任何数据源（与 `--font` 压过 `font` 同一口径）。
 ///
 /// 两者的**基准目录不同**（也是有意）：
-/// - 命令行 `--data` 是「你现在在哪」，基准 = **CWD**（与 `--out` 同口径，也与受限会话
-///   的 guard 用工作区作基准一致）；
+/// - 命令行 `--data` 是「你现在在哪」，基准 = **CWD**（与 `--out` 同口径）。
+///   **前提（不是代码保证）**：shell 的 CWD == 会话工作区 —— 受限会话的 guard 用**工作区**
+///   作基准，两者只有在这个前提下才重合。当前该前提由 agent 的 shell 工具不提供 `cwd` 参数
+///   （进程 CWD = 会话 cwd = 工作区，见 `crates/abb-agent/src/builtin.rs::dev_tools` 的
+///   `OsExecutionEnv::with_cwd(workspace)`）维持，评审核对过。若将来后端允许按命令传 cwd，
+///   这里要改成从可信来源取基准（否则 `--data a.csv` 会读到 CWD 的文件而 guard 以为在工作区）。
+///   规格内容里的 `data` 不受这个前提影响（它绑规格文件目录，见 [`resolve_in_dir`]）。
 /// - 规格内的 `data` 是「这个规格自己的配套数据」，基准 = **规格文件所在目录**。
 fn load_table(
     spec: &Spec,
@@ -210,6 +215,23 @@ fn load_table(
         .filter(|s| !s.is_empty())
     {
         return table_from_csv_arg(data, &cwd);
+    }
+    // `rows` 与 `data` 同时给出 ⇒ **硬错**，不静默挑一个。本仓的既定口径是「歧义输入不静默
+    // 忽略」（对照 render.rs 里 hist 的 y 给了别的列名就报错）。这里尤其重要：`data` 有值却
+    // 因 `rows` 存在而被跳过时，那个字段**连路径校验都不走**——将来谁调换了两者的优先级，
+    // 它就立刻变成一个可用的读入口（评审 O2 指出的耦合）。
+    if spec.rows.is_some()
+        && spec
+            .data
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|d| !d.is_empty())
+    {
+        return Err(RenderError(
+            "规格里同时给了 `data` 和 `rows`；请二选一（`data` = CSV 文件路径，`rows` = 内联数组）。\n\
+             写死一个、忽略另一个会让“我明明写了 data 却没生效”变成静默行为，所以这里直接报错。"
+                .into(),
+        ));
     }
     if let Some(rows) = &spec.rows {
         return table_from_json_rows(rows).map_err(RenderError);
@@ -273,6 +295,10 @@ fn read_csv(path: &Path, base: &Path, what: &str) -> Result<Table, RenderError> 
 ///
 /// 这样「规格在工作区内 ⇒ 它读到的数据也在工作区内」是纯局部推理，不依赖任何环境变量、
 /// 不依赖 CWD、也不依赖调用者是 owner 还是受限会话。
+///
+/// **实现约束**：`starts_with` 的两侧**都必须是 `canonicalize` 的产物**（`/etc` → `/private/etc`
+/// 这类挂载映射、软链、`..` 都在这一步归一到真实路径）。谁把某一边换成未 canonicalize 的路径，
+/// 这个前缀判定立刻失效。
 /// 需要用别处的数据时走**命令行 `--data`**（它在命令行上、闸门看得见；受限会话里工作区外的
 /// 绝对路径会被 guard 拒绝，owner 不受限）——即「能力没被拿掉，只是换了个闸门看得见的位置」。
 pub fn resolve_in_dir(raw: &str, base: &Path, what: &str) -> Result<PathBuf, RenderError> {
@@ -311,7 +337,13 @@ pub fn resolve_in_dir(raw: &str, base: &Path, what: &str) -> Result<PathBuf, Ren
 pub fn resolve_arg(raw: &str, base: &Path, what: &str) -> Result<PathBuf, RenderError> {
     let p = Path::new(raw);
     if p.is_absolute() {
-        return Ok(p.to_path_buf());
+        // 放行绝对路径，但**照样展开软链**：读的是 canonical 目标、报错里也是真实路径。
+        // 为什么（评审 O1）：不展开的话 `--data <工作区内某个指向外部的软链>` 会被 abb-chart
+        // 直接读出去——受限会话有 guard 兜（它会 canonicalize argv），但 abb-chart 自己就
+        // 一点防御都没有，任何不带 guard 的调用者（owner 直跑、将来新调用方）都会跟着走。
+        // 展开不改变「绝对路径放行」的语义，只是不再把软链当不透明字符串。
+        // 目标不存在时 canonicalize 会失败 ⇒ 原样返回，让读取阶段去报「文件不存在」。
+        return Ok(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
     }
     let base_real = std::fs::canonicalize(base)
         .map_err(|e| RenderError(format!("基准目录不可用（{}）：{e}", base.display())))?;
@@ -517,6 +549,54 @@ mod tests {
         // 相对路径跑出去 ⇒ 拒
         let err = resolve_arg("../outside.csv", &cwd, "--data").unwrap_err();
         assert!(err.0.contains("基准目录之外"), "{err}");
+    }
+
+    /// **回归钉子（评审 O1）**：`--data` 的绝对路径也要展开软链。
+    ///
+    /// 不展开的话 `--data <工作区内指向外部的软链>` 会被直接读出去——受限会话有 guard 兜，
+    /// 但 abb-chart 自己毫无防御。判别力：把 `resolve_arg` 的绝对分支改回 `return Ok(p.to_path_buf())`
+    /// ⇒ 本测试红。
+    #[cfg(unix)]
+    #[test]
+    fn cli_absolute_data_expands_symlinks() {
+        let root = std::env::temp_dir().join(format!("abb-chart-argsym-{}", std::process::id()));
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(root.join("secret.csv"), "a\n1\n").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.csv"), ws.join("link.csv")).unwrap();
+
+        let got = resolve_arg(ws.join("link.csv").to_str().unwrap(), &ws, "--data").unwrap();
+        let want = std::fs::canonicalize(root.join("secret.csv")).unwrap();
+        assert_eq!(got, want, "绝对路径也要展开成真实路径（否则跟着软链走）");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **回归钉子（评审 O2）**：`data` 与 `rows` 同时给出必须硬错，不静默挑一个。
+    ///
+    /// 尤其重要：`rows` 存在时 `data` 会被**跳过**（连路径校验都不走），
+    /// 将来谁调换两者优先级，它就立刻变成可用的读入口。判别力：删掉那条冲突检查 ⇒ 本测试红。
+    #[test]
+    fn data_and_rows_together_is_a_hard_error() {
+        let dir = std::env::temp_dir().join(format!("abb-chart-both-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("d.csv"), "a\n1\n").unwrap();
+
+        let spec_text = r#"{"mark":"bar","x":"a","y":"a","data":"d.csv","rows":[{"a":1}]}"#;
+        let err = render_to_png(
+            spec_text,
+            Some(&dir),
+            &RenderOptions {
+                out: dir.join("o.png"),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.0.contains("二选一"), "{err}");
+
+        // 只给 rows 则正常（用 point：bar 要求分类 x，与本测试无关，别把两条规则混在一起）。
+        let only_rows = r#"{"mark":"point","x":"a","y":"b","rows":[{"a":1,"b":2},{"a":2,"b":3}]}"#;
+        assert!(render_to_png(only_rows, Some(&dir), &RenderOptions::default()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 用**符号链接**逃逸同样要被拦住（字符串前缀比较拦不住这种，故实现用 canonicalize）。
