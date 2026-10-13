@@ -350,6 +350,50 @@ pub fn workspace() -> PathBuf {
     crate::workspace_dir(SYSCHAT_KEY)
 }
 
+/// http(s) 媒体的本地缓存文件路（无论是否存在）：`syschat/media-cache/<sha256(url)>`。
+/// 用内容哈希做文件名：同 URL 同名、不同 URL 不撞，且无需维护索引。
+pub fn media_cache_file(url: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    dir().join("media-cache").join(hex)
+}
+
+/// 已缓存的 http(s) 媒体路径（未缓存返回 None）。
+pub fn media_cache_path(url: &str) -> Option<PathBuf> {
+    let p = media_cache_file(url);
+    p.is_file().then_some(p)
+}
+
+/// 下载 http(s) 媒体到本地缓存（已在缓存则直接返回）。
+/// 供 GUI 后台线程调用；失败返回可读原因（GUI 显示为链接回退，不崩）。
+pub async fn fetch_media(url: &str) -> Result<PathBuf, String> {
+    let path = media_cache_file(url);
+    if path.is_file() {
+        return Ok(path);
+    }
+    let parent = path
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| "缓存目录非法".to_string())?;
+    std::fs::create_dir_all(&parent).map_err(|e| format!("创建缓存目录失败：{e}"))?;
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("下载失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载失败：HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取响应失败：{e}"))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入缓存失败：{e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("落盘缓存失败：{e}"))?;
+    Ok(path)
+}
+
 /// 气泡位置（**逻辑像素**）。持久化在 `bubble.json`。
 ///
 /// 全链路统一逻辑像素：恢复用 `LogicalPosition`、首次默认位按逻辑屏宽算、拖拽保存也

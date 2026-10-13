@@ -163,6 +163,10 @@ enum UiCmd {
     SysChatSend {
         text: String,
     },
+    /// 后台下载一个 http(s) 媒体到本地缓存（图片内联 / 音视频可打开）。
+    FetchMedia {
+        url: String,
+    },
 }
 
 /// #141 一键创建团队结果（后台 → 主线程）。
@@ -199,6 +203,8 @@ enum SysChatEvt {
     Reply(String),
     /// 回合失败：用户可读原因。
     Error(String),
+    /// 后台已把一个 http(s) 媒体下到缓存：重载当前会话让图片内联显示。
+    MediaReady,
 }
 
 /// 虚拟 Bot 操作结果（#75，后台 → 主线程）：创建/编辑/登记/解散统一形状。
@@ -1772,18 +1778,112 @@ pub fn run_gui() -> Result<()> {
     // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
-    let syschat_model: Rc<slint::VecModel<SysChatMsgRow>> = Rc::new(slint::VecModel::default());
-    syschat_win.set_messages(slint::ModelRc::from(syschat_model.clone()));
+    let syschat_model: Rc<slint::VecModel<SysChatBlockRow>> = Rc::new(slint::VecModel::default());
+    syschat_win.set_blocks(slint::ModelRc::from(syschat_model.clone()));
+
+    // 一段消息 → 渲染行：角色行 + 若干内容块（B 批：完整 markdown）。
+    fn role_row(label: &str) -> SysChatBlockRow {
+        SysChatBlockRow {
+            kind: "role".into(),
+            text: label.into(),
+            level: 0,
+            order: 0,
+            checked: false,
+            marker: "".into(),
+            lang: "".into(),
+            cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                Vec::<slint::SharedString>::new(),
+            ))),
+            header: false,
+            src: "".into(),
+            alt: "".into(),
+            img: slint::Image::default(),
+            img_ok: false,
+        }
+    }
+    /// 加载块图片：本地路径直读；http(s) 读本地缓存（未缓存则先空，由后台下载后重载）。
+    fn load_block_image(src: &str) -> (slint::Image, bool) {
+        if src.is_empty() {
+            return (slint::Image::default(), false);
+        }
+        let path: Option<std::path::PathBuf> =
+            if src.starts_with("http://") || src.starts_with("https://") {
+                crate::syschat::media_cache_path(src)
+            } else {
+                let p = std::path::PathBuf::from(src);
+                p.is_file().then_some(p)
+            };
+        match path.and_then(|p| slint::Image::load_from_path(&p).ok()) {
+            Some(img) => (img, true),
+            None => (slint::Image::default(), false),
+        }
+    }
+    fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
+        let (img, img_ok) = load_block_image(&b.src);
+        // 列表标记在 Rust 侧算好（Slint 里 int→string 拼接不可靠）
+        let marker: String = match b.kind.as_str() {
+            "task" => {
+                if b.checked {
+                    "☑".to_string()
+                } else {
+                    "☐".to_string()
+                }
+            }
+            "list" if b.order > 0 => format!("{}. ", b.order),
+            "list" => "•".to_string(),
+            _ => String::new(),
+        };
+        SysChatBlockRow {
+            kind: b.kind.into(),
+            text: b.text.into(),
+            level: b.level,
+            order: b.order,
+            checked: b.checked,
+            marker: marker.into(),
+            lang: b.lang.into(),
+            cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                b.cells
+                    .into_iter()
+                    .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            ))),
+            header: b.header,
+            src: b.src.into(),
+            alt: b.alt.into(),
+            img,
+            img_ok,
+        }
+    }
+    fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
+        let label = if role == "assistant" { "ABB" } else { "你" };
+        let mut rows = vec![role_row(label)];
+        for b in crate::mdblocks::parse(text) {
+            rows.push(block_row(b));
+        }
+        rows
+    }
+    // 当前会话里还没缓存的 http(s) 媒体（图片/音视频）——交给后台下载。
+    fn pending_http_media() -> Vec<String> {
+        let mut v = Vec::new();
+        for t in crate::syschat::load_history() {
+            for b in crate::mdblocks::parse(&t.text) {
+                if matches!(b.kind.as_str(), "image" | "audio" | "video")
+                    && (b.src.starts_with("http://") || b.src.starts_with("https://"))
+                    && crate::syschat::media_cache_path(&b.src).is_none()
+                {
+                    v.push(b.src);
+                }
+            }
+        }
+        v
+    }
     // 打开对话框时把落盘历史灌进 model（跨重启保留的可见证据）。
-    fn load_syschat_into(win: &SystemChatWindow, model: &slint::VecModel<SysChatMsgRow>) {
+    fn load_syschat_into(win: &SystemChatWindow, model: &slint::VecModel<SysChatBlockRow>) {
         let turns = crate::syschat::load_history();
-        let rows: Vec<SysChatMsgRow> = turns
-            .iter()
-            .map(|t| SysChatMsgRow {
-                role: t.role.clone().into(),
-                text: t.text.clone().into(),
-            })
-            .collect();
+        let mut rows: Vec<SysChatBlockRow> = Vec::new();
+        for t in &turns {
+            rows.extend(rows_for(&t.role, &t.text));
+        }
         model.set_vec(rows);
         // 请求滞底：递增 epoch，由 .slint 的 changed 处理器把 content-y 设成越界值、
         // 交给 Flickable 的 in-bound 夹取（不能直接给 content-y 绑值，见 app.slint 注释）。
@@ -3224,6 +3324,15 @@ pub fn run_gui() -> Result<()> {
                                 Err(e) => SysChatEvt::Error(format!("读取配置失败：{e:#}")),
                             };
                             let _ = etx.send(evt);
+                        });
+                    }
+                    // 后台下载 http(s) 媒体到本地缓存；下完发 MediaReady 让 GUI 重载
+                    UiCmd::FetchMedia { url } => {
+                        let etx = syschat_tx_bg.clone();
+                        tokio::spawn(async move {
+                            if crate::syschat::fetch_media(&url).await.is_ok() {
+                                let _ = etx.send(SysChatEvt::MediaReady);
+                            }
                         });
                     }
                 }
@@ -5304,17 +5413,28 @@ pub fn run_gui() -> Result<()> {
         // Timer 需保活到事件循环结束（drop 会取消；与 show_window_and_focus 同款泄漏处理）。
         std::mem::forget(saver);
     }
+    // 请求后台下载当前会话里未缓存的 http(s) 媒体（图片/音视频）。
+    let request_media = {
+        let tx = tx.clone();
+        move || {
+            for u in pending_http_media() {
+                let _ = tx.send(UiCmd::FetchMedia { url: u });
+            }
+        }
+    };
     // 点气泡 → 装载历史 + 刷新下拉 + 置前打开对话框。
     {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
+        let rm = request_media.clone();
         bubble.on_open_chat(move || {
             if let Some(w) = cw.upgrade() {
                 load_syschat_into(&w, &model);
                 refresh_syschat_sel(&w, &sessions, &models);
                 show_window_and_focus(&w);
+                rm();
             }
         });
     }
@@ -5346,6 +5466,7 @@ pub fn run_gui() -> Result<()> {
         let model = syschat_model.clone();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
+        let rm = request_media.clone();
         syschat_win.on_session_pick(move |idx| {
             if idx < 0 {
                 return;
@@ -5357,6 +5478,7 @@ pub fn run_gui() -> Result<()> {
                     Ok(()) => {
                         refresh_syschat_sel(&w, &sessions, &models);
                         load_syschat_into(&w, &model);
+                        rm();
                     }
                     Err(e) => {
                         w.set_status_is_error(true);
@@ -5410,10 +5532,9 @@ pub fn run_gui() -> Result<()> {
             if w.get_busy() {
                 return; // 防重复发送（busy 期间按钮/回车已禁用，这里是双保险）
             }
-            model.push(SysChatMsgRow {
-                role: "user".into(),
-                text: text.clone().into(),
-            });
+            for r in rows_for("user", &text) {
+                model.push(r);
+            }
             w.set_draft("".into());
             w.set_busy(true);
             w.set_status_is_error(false);
@@ -5445,6 +5566,19 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // 音视频媒体卡：用系统默认播放器打开（Slint 无内嵌播放器）；链接用浏览器。
+    syschat_win.on_open_media(|src| {
+        let s = src.as_str();
+        if s.starts_with("http://") || s.starts_with("https://") {
+            platform::open_url(s);
+        } else {
+            platform::open_path(std::path::Path::new(s));
+        }
+    });
+    // 普通链接 / 图片回退：用浏览器打开。
+    syschat_win.on_open_link(|url| {
+        platform::open_url(url.as_str());
+    });
     // 关闭对话框 = 隐藏（托盘应用惯例；气泡仍在，随时可再打开）。
     // 打开时 show_window_and_focus 会把进程提升为 regular（显 dock）；关闭时若设置窗
     // 也没开，就降回 accessory（与 hide_notifications_window 同款收尾，避免留一个“孤儿”dock 图标）。
@@ -5523,6 +5657,8 @@ pub fn run_gui() -> Result<()> {
         let bubble_weak = bubble.as_weak();
         let syschat_model_t = syschat_model.clone();
         let syschat_rx_t = syschat_rx;
+        // 回复里可能带新的 http(s) 媒体图：让后台下载后重载
+        let rm_t = request_media.clone();
         // 气泡位置待施加标记（见启动处注释）
         let bubble_pos_apply_t = bubble_pos_apply.clone();
         timer.start(
@@ -6024,10 +6160,11 @@ pub fn run_gui() -> Result<()> {
                 while let Ok(evt) = syschat_rx_t.try_recv() {
                     match evt {
                         SysChatEvt::Reply(text) => {
-                            syschat_model_t.push(SysChatMsgRow {
-                                role: "assistant".into(),
-                                text: text.into(),
-                            });
+                            // 后台下载完的媒体图重载一行（不追加）——见 MediaReady
+                            for r in rows_for("assistant", &text) {
+                                syschat_model_t.push(r);
+                            }
+                            rm_t();
                             if let Some(w) = syschat_weak.upgrade() {
                                 w.set_busy(false);
                                 w.set_status_is_error(false);
@@ -6046,6 +6183,12 @@ pub fn run_gui() -> Result<()> {
                             }
                             if let Some(b) = bubble_weak.upgrade() {
                                 b.set_busy(false);
+                            }
+                        }
+                        SysChatEvt::MediaReady => {
+                            // 后台下好一个 http(s) 媒体：重载当前会话，图片即可内联显示。
+                            if let Some(w) = syschat_weak.upgrade() {
+                                load_syschat_into(&w, &syschat_model_t);
                             }
                         }
                     }

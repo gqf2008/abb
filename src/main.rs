@@ -30,6 +30,7 @@ mod history;
 mod install;
 mod lark_user;
 mod larkskills;
+mod mdblocks;
 mod messenger;
 mod msgstore;
 mod outbox;
