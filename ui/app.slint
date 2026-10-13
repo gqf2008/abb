@@ -3075,6 +3075,17 @@ export component SystemChatWindow inherits Window {
     // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
     in-out property <string> draft: "";
 
+    // 会话 / 模型选择（A 批）：labels 给 ComboBox，选中索引由 Rust 回写；
+    // 「模型选择」按**会话**生效，候选只来自「设置 → 供应商」。
+    in property <[string]> session-labels: [];
+    in property <[string]> model-labels: [];
+    in-out property <int> session-index: -1;
+    in-out property <int> model-index: -1;
+
+    callback new-session();
+    callback session-pick(int);
+    callback model-pick(int);
+
     callback send(string);
     callback reset-history();
     callback close-window();
@@ -3119,19 +3130,34 @@ export component SystemChatWindow inherits Window {
                 close-window => { root.close-window(); }
             }
 
-            // 状态行：默认提示 / 进行中 / 错误
+            // 工具行：会话 / 模型选择 + 状态文案（A 批）
             Rectangle {
-                height: 26px;
-                background: PixelTheme.panel;
-                Text {
-                    x: 12px;
-                    width: parent.width - 24px;
-                    height: parent.height;
-                    text: root.status-line;
-                    font-size: 11px;
-                    color: root.status-is-error ? UiTokens.error : UiTokens.text-dim;
-                    vertical-alignment: center;
-                    overflow: elide;
+                height: 30px;
+                background: PixelTheme.bg;
+                HorizontalBox {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    ComboBox {
+                        width: 132px;
+                        model: root.session-labels;
+                        current-index: root.session-index;
+                        selected => { root.session-pick(self.current-index); }
+                    }
+                    ComboBox {
+                        width: 150px;
+                        model: root.model-labels;
+                        current-index: root.model-index;
+                        selected => { root.model-pick(self.current-index); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.status-line;
+                        font-size: 11px;
+                        color: root.status-is-error ? UiTokens.error : UiTokens.text-dim;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                 }
                 // 底部分隔线（Rectangle 无 border-bottom-* 属性，用 1px 子矩形代替）
                 Rectangle {
@@ -3196,10 +3222,16 @@ export component SystemChatWindow inherits Window {
                 }
             }
 
-            // 输入区：输入框 + 发送 + 清空
+            // 输入区：新建会话 + 输入框 + 发送 + 清空
             HorizontalBox {
                 padding: 10px;
                 spacing: 8px;
+                // 新建会话（A 批先放这里；D 批改成输入区左侧竖排图标 + tooltip）
+                PixelButton {
+                    text: "＋";
+                    enabled: !root.busy;
+                    clicked => { root.new-session(); }
+                }
                 PixelTextInput {
                     horizontal-stretch: 1;
                     text <=> root.draft;

@@ -339,9 +339,15 @@ fn oneshot_agent_config_inner(
 /// - 工作区：`workspaces/syschat/`（见 [`crate::syschat::workspace`]）。
 ///
 /// 合成 bot 只用于复用「按 bot 解析供应商 + 命令槽」的既有链路，不写盘、不登记。
-pub(crate) fn oneshot_agent_config_system(cfg: &Config) -> crate::runtime::harness::AgentConfig {
+///
+/// `provider` = 本会话选的供应商名（「模型选择」）；空串 = 跟随全局默认。
+pub(crate) fn oneshot_agent_config_system(
+    cfg: &Config,
+    provider: &str,
+) -> crate::runtime::harness::AgentConfig {
     let bot = crate::config::BotConfig {
         name: crate::syschat::SYSCHAT_KEY.to_string(),
+        provider: provider.to_string(),
         ..Default::default()
     };
     // sandbox 显式传 None = 全权限（与 `resolve_sandbox_meta(&bot)` 对默认档位的结果一致，
@@ -2118,7 +2124,7 @@ mod tests {
         // 关键：没有 bots（系统级对话不依赖任何渠道 bot）。
         assert!(cfg.bots.is_empty());
 
-        let c = oneshot_agent_config_system(&cfg);
+        let c = oneshot_agent_config_system(&cfg, "");
         assert!(
             c.session_sandbox.is_none(),
             "系统级对话 = 整机全权限，不得带沙箱档位"

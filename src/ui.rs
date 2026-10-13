@@ -1790,6 +1790,67 @@ pub fn run_gui() -> Result<()> {
         win.set_scroll_epoch(win.get_scroll_epoch().wrapping_add(1));
     }
     load_syschat_into(&syschat_win, &syschat_model);
+
+    // 系统对话 A 批：会话 / 模型选择的下拉状态工作副本。
+    let sc_sessions: Rc<RefCell<Vec<crate::syschat::SessionMeta>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    // (供应商 name, 下拉展示 label)
+    let sc_models: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    /// 刷新会话/模型两个下拉：模型候选只来自「设置 → 供应商」；会话按 updated_at 倒序。
+    fn refresh_syschat_sel(
+        win: &SystemChatWindow,
+        sessions: &Rc<RefCell<Vec<crate::syschat::SessionMeta>>>,
+        models: &Rc<RefCell<Vec<(String, String)>>>,
+    ) {
+        let cfg = Config::load().unwrap_or_default();
+        let ms: Vec<(String, String)> = cfg
+            .providers
+            .iter()
+            .map(|p| {
+                let label = if p.model.trim().is_empty() {
+                    p.name.clone()
+                } else {
+                    p.model.clone()
+                };
+                (p.name.clone(), label)
+            })
+            .collect();
+        let (list, current) = crate::syschat::session_list();
+        let labels: Vec<slint::SharedString> =
+            list.iter().map(|s| s.title.clone().into()).collect();
+        let sidx = list
+            .iter()
+            .position(|s| s.id == current)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+        // 会话 provider 为空 = 跟随全局默认 → 下拉回显全局默认那一项
+        let cur = list
+            .iter()
+            .find(|s| s.id == current)
+            .map(|s| s.provider.clone())
+            .unwrap_or_default();
+        let effective = if cur.is_empty() {
+            cfg.default_provider.clone()
+        } else {
+            cur
+        };
+        let midx = ms
+            .iter()
+            .position(|(n, _)| *n == effective)
+            .map(|i| i as i32);
+        win.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(labels))));
+        let mlabels: Vec<slint::SharedString> = ms.iter().map(|(_, l)| l.clone().into()).collect();
+        win.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            mlabels,
+        ))));
+        win.set_session_index(sidx);
+        win.set_model_index(midx.unwrap_or(-1));
+        *sessions.borrow_mut() = list;
+        *models.borrow_mut() = ms;
+    }
+    refresh_syschat_sel(&syschat_win, &sc_sessions, &sc_models);
+
     let bubble = AnchorBubble::new()?;
     // 气泡位置：统一在**事件循环活跃后的首个 tick** 里施加（见 tick）——启动前 set_position 会被
     // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
@@ -5243,14 +5304,76 @@ pub fn run_gui() -> Result<()> {
         // Timer 需保活到事件循环结束（drop 会取消；与 show_window_and_focus 同款泄漏处理）。
         std::mem::forget(saver);
     }
-    // 点气泡 → 装载历史 + 置前打开对话框。
+    // 点气泡 → 装载历史 + 刷新下拉 + 置前打开对话框。
     {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
         bubble.on_open_chat(move || {
             if let Some(w) = cw.upgrade() {
                 load_syschat_into(&w, &model);
+                refresh_syschat_sel(&w, &sessions, &models);
                 show_window_and_focus(&w);
+            }
+        });
+    }
+    // 新建会话（保留历史，旧会话可在「会话」下拉里切回）。
+    {
+        let cw = syschat_win.as_weak();
+        let model = syschat_model.clone();
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
+        syschat_win.on_new_session(move || {
+            crate::syschat::new_session(None);
+            if let Some(w) = cw.upgrade() {
+                refresh_syschat_sel(&w, &sessions, &models);
+                load_syschat_into(&w, &model);
+                w.set_status_is_error(false);
+                w.set_status_line("已新建会话（旧会话在「会话」下拉里可切回）。".into());
+            }
+        });
+    }
+    // 切换会话（历史保留）。
+    {
+        let cw = syschat_win.as_weak();
+        let model = syschat_model.clone();
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
+        syschat_win.on_session_pick(move |idx| {
+            if idx < 0 {
+                return;
+            }
+            let id = sessions.borrow().get(idx as usize).map(|s| s.id.clone());
+            if let Some(id) = id {
+                crate::syschat::switch_session(&id);
+                if let Some(w) = cw.upgrade() {
+                    refresh_syschat_sel(&w, &sessions, &models);
+                    load_syschat_into(&w, &model);
+                }
+            }
+        });
+    }
+    // 切换模型（**按会话**；从下一条消息起生效，不改历史）。
+    {
+        let cw = syschat_win.as_weak();
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
+        syschat_win.on_model_pick(move |idx| {
+            if idx < 0 {
+                return;
+            }
+            let name = models.borrow().get(idx as usize).map(|(n, _)| n.clone());
+            if let Some(name) = name {
+                let cur = crate::syschat::current_session();
+                crate::syschat::set_session_provider(&cur, &name);
+                if let Some(w) = cw.upgrade() {
+                    refresh_syschat_sel(&w, &sessions, &models);
+                    w.set_status_is_error(false);
+                    w.set_status_line(
+                        format!("本会话模型已切到「{name}」（从下一条消息起生效）").into(),
+                    );
+                }
             }
         });
     }

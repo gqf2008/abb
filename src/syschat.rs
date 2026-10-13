@@ -64,9 +64,243 @@ pub fn dir() -> PathBuf {
     crate::bridge_dir().join("syschat")
 }
 
-/// 历史文件路径。
-pub fn history_path() -> PathBuf {
-    dir().join("history.jsonl")
+/// 会话元数据（`sessions.json` 条目）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    /// 展示标题：首条用户消息截断（空会话 = 「新会话」）。
+    pub title: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// 本会话用的供应商名（"" = 跟随全局默认）。**「模型选择」就落在这一项上**。
+    pub provider: String,
+}
+
+/// `sessions.json` 落盘结构。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SessionState {
+    #[serde(default)]
+    current: String,
+    #[serde(default)]
+    sessions: Vec<SessionMeta>,
+}
+
+/// 会话存储（可注入 base 目录，便于单测不碰真实 `~/.agent-bridge`）。
+///
+/// 结构：
+/// - `<base>/sessions.json`：`{current, sessions:[{id,title,created_at,updated_at,provider}]}`
+/// - `<base>/sessions/<id>.jsonl`：该会话的逐轮历史
+/// - `<base>/history.jsonl`：旧版单会话历史（首次自动迁入默认会话）
+struct SessionStore {
+    base: PathBuf,
+}
+
+impl SessionStore {
+    fn production() -> Self {
+        Self::new_at(dir())
+    }
+    fn new_at(base: PathBuf) -> Self {
+        Self { base }
+    }
+    fn state_path(&self) -> PathBuf {
+        self.base.join("sessions.json")
+    }
+    fn history_path(&self, id: &str) -> PathBuf {
+        self.base.join("sessions").join(format!("{id}.jsonl"))
+    }
+    fn legacy_path(&self) -> PathBuf {
+        self.base.join("history.jsonl")
+    }
+
+    fn load(&self) -> SessionState {
+        std::fs::read_to_string(self.state_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, state: &SessionState) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.base)?;
+        let tmp = self.state_path().with_extension("json.tmp");
+        std::fs::write(
+            &tmp,
+            serde_json::to_string_pretty(state).unwrap_or_default(),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, self.state_path())?;
+        Ok(())
+    }
+
+    /// 保证「至少一个会话、current 有效」；改动过返回 true。首次还把旧版单会话历史迁入默认会话。
+    fn ensure_current(&self, state: &mut SessionState) -> bool {
+        if !state.sessions.is_empty() {
+            if state.current.is_empty() || !state.sessions.iter().any(|s| s.id == state.current) {
+                state.current = state.sessions[0].id.clone();
+                return true;
+            }
+            return false;
+        }
+        let id = new_session_id();
+        let now = crate::chrono_lite::unix_secs() as i64;
+        state.sessions.push(SessionMeta {
+            id: id.clone(),
+            title: "新会话".to_string(),
+            created_at: now,
+            updated_at: now,
+            provider: String::new(),
+        });
+        state.current = id.clone();
+        if self.legacy_path().exists() {
+            let _ = std::fs::create_dir_all(self.base.join("sessions"));
+            let dest = self.history_path(&id);
+            if std::fs::rename(self.legacy_path(), &dest).is_err() {
+                let _ = std::fs::copy(self.legacy_path(), &dest);
+            }
+        }
+        true
+    }
+
+    fn read_history(&self, id: &str) -> Vec<Turn> {
+        let Ok(file) = std::fs::File::open(self.history_path(id)) else {
+            return Vec::new();
+        };
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Turn>(&l).ok())
+            .collect()
+    }
+
+    fn append_turns(&self, id: &str, turns: &[Turn]) -> std::io::Result<()> {
+        if turns.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.base.join("sessions"))?;
+        let path = self.history_path(id);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        for t in turns {
+            writeln!(file, "{}", serde_json::to_string(t).unwrap_or_default())?;
+        }
+        Ok(())
+    }
+
+    /// 取会话列表（`updated_at` 倒序）与当前会话 id。
+    fn list(&self) -> (Vec<SessionMeta>, String) {
+        let mut state = self.load();
+        if self.ensure_current(&mut state) {
+            let _ = self.save(&state);
+        }
+        let mut list = state.sessions.clone();
+        list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        (list, state.current)
+    }
+
+    fn provider_of(&self, id: &str) -> String {
+        self.load()
+            .sessions
+            .into_iter()
+            .find(|s| s.id == id)
+            .map(|s| s.provider)
+            .unwrap_or_default()
+    }
+}
+
+/// 新建会话 id：`s<时间戳>-<短随机>`（可排序、不撞；只含 `[A-Za-z0-9_-]`，无路径穿越）。
+fn new_session_id() -> String {
+    format!(
+        "s{}-{}",
+        crate::chrono_lite::unix_secs(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// 首条用户消息 → 会话标题（截断）。
+fn derive_title(text: &str) -> String {
+    let t = text.trim().replace('\n', " ");
+    let cut: String = t.chars().take(24).collect();
+    if cut.is_empty() {
+        "新会话".to_string()
+    } else {
+        cut
+    }
+}
+
+/// 当前会话 id（必要时创建会话并迁移旧历史）。GUI 发消息前调一次即可。
+pub fn current_session() -> String {
+    let _g = HistoryLock::acquire().ok();
+    SessionStore::production().list().1
+}
+
+/// 会话列表（`updated_at` 倒序）+ 当前会话 id。
+pub fn session_list() -> (Vec<SessionMeta>, String) {
+    let _g = HistoryLock::acquire().ok();
+    SessionStore::production().list()
+}
+
+/// 新建会话并置为当前；`provider` 为空时沿用当前会话的模型选择。
+pub fn new_session(provider: Option<&str>) -> String {
+    let _g = HistoryLock::acquire().ok();
+    let store = SessionStore::production();
+    let mut state = store.load();
+    store.ensure_current(&mut state);
+    let provider = match provider {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => state
+            .sessions
+            .iter()
+            .find(|s| s.id == state.current)
+            .map(|s| s.provider.clone())
+            .unwrap_or_default(),
+    };
+    let id = new_session_id();
+    let now = crate::chrono_lite::unix_secs() as i64;
+    state.sessions.push(SessionMeta {
+        id: id.clone(),
+        title: "新会话".to_string(),
+        created_at: now,
+        updated_at: now,
+        provider,
+    });
+    state.current = id.clone();
+    let _ = store.save(&state);
+    id
+}
+
+/// 切到指定会话（不存在则忽略）。
+pub fn switch_session(id: &str) {
+    let _g = HistoryLock::acquire().ok();
+    let store = SessionStore::production();
+    let mut state = store.load();
+    store.ensure_current(&mut state);
+    if state.sessions.iter().any(|s| s.id == id) {
+        state.current = id.to_string();
+        let _ = store.save(&state);
+    }
+}
+
+/// 设置某会话使用的供应商（「模型选择」落盘）。
+pub fn set_session_provider(id: &str, provider: &str) {
+    let _g = HistoryLock::acquire().ok();
+    let store = SessionStore::production();
+    let mut state = store.load();
+    store.ensure_current(&mut state);
+    if let Some(s) = state.sessions.iter_mut().find(|s| s.id == id) {
+        s.provider = provider.to_string();
+        let _ = store.save(&state);
+    }
 }
 
 /// 气泡位置文件（GUI 专用；后端不读）。
@@ -170,45 +404,22 @@ impl Drop for HistoryLock {
     }
 }
 
-/// 读全部历史（坏行跳过，不让一条脏数据废掉整个会话）。
+/// 读**当前会话**的历史（GUI 用）。
 pub fn load_history() -> Vec<Turn> {
-    let Ok(file) = std::fs::File::open(history_path()) else {
-        return Vec::new();
-    };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Turn>(&l).ok())
-        .collect()
+    let id = current_session();
+    SessionStore::production().read_history(&id)
 }
 
-/// 追加若干轮到历史文件（open append + 逐行 JSON）。
-fn append_turns(turns: &[Turn]) -> std::io::Result<()> {
-    if turns.is_empty() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dir())?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(history_path(), std::fs::Permissions::from_mode(0o600));
-    }
-    for t in turns {
-        let line = serde_json::to_string(t).unwrap_or_default();
-        writeln!(file, "{line}")?;
-    }
-    Ok(())
-}
-
-/// 清空历史（对话窗「清空」）。
+/// 清空**当前会话**的历史（对话窗「清空」）。
 pub fn clear_history() -> std::io::Result<()> {
+    let id = current_session();
+    clear_session(&id)
+}
+
+/// 清空指定会话的历史。
+pub fn clear_session(id: &str) -> std::io::Result<()> {
     let _guard = HistoryLock::acquire()?;
-    match std::fs::remove_file(history_path()) {
+    match std::fs::remove_file(SessionStore::production().history_path(id)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -264,9 +475,9 @@ pub fn build_prompt(history: &[Turn], user_text: &str) -> String {
     s
 }
 
-/// 系统级 agent 配置：全局默认供应商 + owner 全权限档（无沙箱）+ 专用工作区。
-pub fn agent_config(cfg: &Config) -> AgentConfig {
-    crate::service::oneshot_agent_config_system(cfg)
+/// 系统级 agent 配置：**指定供应商**（空 = 全局默认）+ owner 全权限档（无沙箱）+ 专用工作区。
+pub fn agent_config(cfg: &Config, provider: &str) -> AgentConfig {
+    crate::service::oneshot_agent_config_system(cfg, provider)
 }
 
 /// 执行层命令是否可用（fail-fast 预检）。
@@ -329,7 +540,8 @@ pub async fn turn_with(
     }
 }
 
-/// 跑一轮系统级对话：读历史 → 拼 prompt → 落用户轮 → 跑回合 → 落助手轮。
+/// 跑一轮系统级对话：按**当前会话**（与其模型选择）→ 读该会话历史 → 拼 prompt →
+/// 落用户轮 → 跑回合 → 落助手轮/刷新会话时间。
 ///
 /// 历史锁只包住两段短临界区（读史+落用户轮 / 落助手轮），**回合在锁外跑**：
 /// 回合最长 10 分钟，持锁跨回合会阻塞 GUI 主线程的清空/重开（同一个 `history.lock`）。
@@ -339,7 +551,19 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     if text.is_empty() {
         return Err("消息为空。".to_string());
     }
-    let agent_cfg = agent_config(cfg);
+
+    // 解析当前会话 + 该会话的模型选择（短临界区）。
+    let (session_id, provider) = {
+        let _g = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
+        let store = SessionStore::production();
+        let mut state = store.load();
+        store.ensure_current(&mut state);
+        let id = state.current.clone();
+        let provider = store.provider_of(&id);
+        (id, provider)
+    };
+
+    let agent_cfg = agent_config(cfg, &provider);
     // fail-fast：缺执行层时不要挂满整轮预算（见 agent_command_available 文档）。
     if !agent_command_available(&agent_cfg.command) {
         return Err(format!(
@@ -351,32 +575,57 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     std::fs::create_dir_all(&ws)
         .map_err(|e| format!("创建系统对话工作区失败（{}）：{e}", ws.display()))?;
 
-    // 临界区 1：读历史拼 prompt + 落用户轮。先落用户轮是为了：即使回合失败，
-    // 用户说过的话也不该丢（下次重开对话框仍能看到自己的提问）。
+    // 临界区 1：读该会话历史拼 prompt + 落用户轮 + 刷新标题/时间。先落用户轮是为了：
+    // 即使回合失败，用户说过的话也不该丢（下次重开对话框仍能看到自己的提问）。
     let prompt = {
         let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
-        let history = load_history();
+        let store = SessionStore::production();
+        let history = store.read_history(&session_id);
         let prompt = build_prompt(&history, text);
-        append_turns(&[Turn {
-            role: "user".to_string(),
-            text: text.to_string(),
-            ts: crate::chrono_lite::unix_secs() as i64,
-        }])
-        .map_err(|e| format!("写入对话历史失败：{e}"))?;
+        let now = crate::chrono_lite::unix_secs() as i64;
+        store
+            .append_turns(
+                &session_id,
+                &[Turn {
+                    role: "user".to_string(),
+                    text: text.to_string(),
+                    ts: now,
+                }],
+            )
+            .map_err(|e| format!("写入对话历史失败：{e}"))?;
+        let mut state = store.load();
+        if let Some(s) = state.sessions.iter_mut().find(|s| s.id == session_id) {
+            if s.title.is_empty() || s.title == "新会话" {
+                s.title = derive_title(text);
+            }
+            s.updated_at = now;
+        }
+        let _ = store.save(&state);
         prompt
     };
 
     let reply = turn_with(agent_cfg, ws, prompt).await?;
 
-    // 临界区 2：落助手轮。
+    // 临界区 2：落助手轮 + 刷新会话时间。
     {
         let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
-        append_turns(&[Turn {
-            role: "assistant".to_string(),
-            text: reply.clone(),
-            ts: crate::chrono_lite::unix_secs() as i64,
-        }])
-        .map_err(|e| format!("写入对话历史失败：{e}"))?;
+        let store = SessionStore::production();
+        let now = crate::chrono_lite::unix_secs() as i64;
+        store
+            .append_turns(
+                &session_id,
+                &[Turn {
+                    role: "assistant".to_string(),
+                    text: reply.clone(),
+                    ts: now,
+                }],
+            )
+            .map_err(|e| format!("写入对话历史失败：{e}"))?;
+        let mut state = store.load();
+        if let Some(s) = state.sessions.iter_mut().find(|s| s.id == session_id) {
+            s.updated_at = now;
+        }
+        let _ = store.save(&state);
     }
     Ok(reply)
 }
@@ -565,5 +814,91 @@ mod tests {
                     .contains("[系统级对话]")),
             "prompt 记录应带系统前言：{events:?}"
         );
+    }
+
+    // ── A 批：会话 store（用临时 base，不碰真实 ~/.agent-bridge）──
+
+    #[test]
+    fn derive_title_truncates_and_falls_back() {
+        assert_eq!(derive_title("  hello\nworld  "), "hello world");
+        assert_eq!(derive_title("   "), "新会话");
+        assert_eq!(derive_title(&"字".repeat(40)).chars().count(), 24);
+    }
+
+    fn tmp_store(tag: &str) -> (SessionStore, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("abb-syschat-store-{tag}-{}", uuid::Uuid::new_v4()));
+        (SessionStore::new_at(base.clone()), base)
+    }
+
+    #[test]
+    fn session_store_new_list_switch_and_isolation() {
+        let (store, base) = tmp_store("iso");
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st), "首个会话应被创建");
+        assert_eq!(st.sessions.len(), 1);
+        let id1 = st.current.clone();
+        assert_eq!(st.sessions[0].title, "新会话");
+        store.save(&st).unwrap();
+
+        // 追加一轮 → 只落在 id1
+        store
+            .append_turns(&id1, &[turn_of("user", "hi"), turn_of("assistant", "yo")])
+            .unwrap();
+        assert_eq!(store.read_history(&id1).len(), 2);
+
+        // 第二个会话：历史互不串
+        let id2 = "s2-test".to_string();
+        st.sessions.push(SessionMeta {
+            id: id2.clone(),
+            title: "第二个".into(),
+            created_at: 1,
+            updated_at: 1,
+            provider: "prov-b".into(),
+        });
+        st.current = id2.clone();
+        st.sessions[0].updated_at = 2; // 让 id1 更「新」，校验排序
+        store.save(&st).unwrap();
+        store
+            .append_turns(&id2, &[turn_of("user", "second")])
+            .unwrap();
+        assert_eq!(store.read_history(&id1).len(), 2, "新会话不得串到旧会话");
+        assert_eq!(store.read_history(&id2).len(), 1);
+
+        // 列表：updated_at 倒序 + provider_of
+        let (list, cur) = store.list();
+        assert_eq!(cur, id2);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, id1, "updated_at 更大的排在前");
+        assert_eq!(store.provider_of(&id2), "prov-b");
+        assert_eq!(
+            store.provider_of("nope"),
+            "",
+            "未知会话返回空（= 跟全局默认）"
+        );
+
+        // 清空只清该会话
+        std::fs::remove_file(store.history_path(&id1)).unwrap();
+        assert_eq!(store.read_history(&id1).len(), 0);
+        assert_eq!(store.read_history(&id2).len(), 1, "清空不得殃及别的会话");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn session_store_migrates_legacy_history() {
+        let (store, base) = tmp_store("mig");
+        std::fs::create_dir_all(&base).unwrap();
+        let legacy = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&turn_of("user", "旧")).unwrap(),
+            serde_json::to_string(&turn_of("assistant", "回复")).unwrap()
+        );
+        std::fs::write(store.legacy_path(), legacy).unwrap();
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st), "旧库应迁入默认会话");
+        assert!(!store.legacy_path().exists(), "旧 history.jsonl 应被移走");
+        assert_eq!(store.read_history(&st.current).len(), 2, "旧对话不得丢");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
