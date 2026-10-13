@@ -3140,14 +3140,18 @@ export component SystemChatWindow inherits Window {
                     spacing: 8px;
                     ComboBox {
                         width: 132px;
+                        enabled: !root.busy;
                         model: root.session-labels;
-                        current-index: root.session-index;
+                        // 必须**双向**绑定：ComboBox 内部点选/changed model 会给自己赋 current-index，
+                        // 单向绑定会被 remove_binding 断掉，此后 Rust 回写不再驱动显示（评审 B1）。
+                        current-index <=> root.session-index;
                         selected => { root.session-pick(self.current-index); }
                     }
-                    ComboBox {
+                    if root.model-labels.length > 0: ComboBox {
                         width: 150px;
+                        enabled: !root.busy;
                         model: root.model-labels;
-                        current-index: root.model-index;
+                        current-index <=> root.model-index;
                         selected => { root.model-pick(self.current-index); }
                     }
                     Rectangle { horizontal-stretch: 1; }

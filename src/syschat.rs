@@ -15,7 +15,8 @@
 //!
 //! [`crate::runtime::oneshot::oneshot_turn`] 每次都是**新 ACP 会话**（用完即拆栈），
 //! 进程间也没有可借的常驻句柄。于是「记忆」由本模块自己维护：把最近若干轮历史拼进
-//! 每轮的 prompt，历史落盘 `~/.agent-bridge/syschat/history.jsonl`，跨重启保留。
+//! 每轮的 prompt，历史落盘 `~/.agent-bridge/syschat/sessions/<id>.jsonl`（会话索引
+//! `sessions.json`；旧版单文件 `history.jsonl` 首次自动迁入默认会话），跨重启保留。
 //!
 //! 这**不是**服务端会话态，只是上下文重放——因此有明确上界（[`HISTORY_KEEP_TURNS`]），
 //! 免得每轮 token 成本线性增长。历史读写都在 `history.lock` 独占锁内完成（fs2：
@@ -106,7 +107,14 @@ impl SessionStore {
         self.base.join("sessions.json")
     }
     fn history_path(&self, id: &str) -> PathBuf {
-        self.base.join("sessions").join(format!("{id}.jsonl"))
+        // id 来自 sessions.json / 公共 API；白名单外的 id 退化为一个不可用名字，
+        // 绝不越出 sessions/（避免损坏/恶意的 sessions.json 把 append/clear 引到目录外）——评审 N3。
+        let safe: String = if is_valid_session_id(id) {
+            id.to_string()
+        } else {
+            "_invalid".to_string()
+        };
+        self.base.join("sessions").join(format!("{safe}.jsonl"))
     }
     fn legacy_path(&self) -> PathBuf {
         self.base.join("history.jsonl")
@@ -218,6 +226,15 @@ impl SessionStore {
     }
 }
 
+/// 会话 id 白名单：`[A-Za-z0-9_-]`、非空、≤ 64 字节（与 [`new_session_id`] 生成口径一致）。
+fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// 新建会话 id：`s<时间戳>-<短随机>`（可排序、不撞；只含 `[A-Za-z0-9_-]`，无路径穿越）。
 fn new_session_id() -> String {
     format!(
@@ -251,8 +268,9 @@ pub fn session_list() -> (Vec<SessionMeta>, String) {
 }
 
 /// 新建会话并置为当前；`provider` 为空时沿用当前会话的模型选择。
-pub fn new_session(provider: Option<&str>) -> String {
-    let _g = HistoryLock::acquire().ok();
+/// 返回新会话 id（拿不到历史锁时返回可重试错误——不静默降级）。
+pub fn new_session(provider: Option<&str>) -> Result<String, String> {
+    let _g = lock_strict()?;
     let store = SessionStore::production();
     let mut state = store.load();
     store.ensure_current(&mut state);
@@ -275,32 +293,40 @@ pub fn new_session(provider: Option<&str>) -> String {
         provider,
     });
     state.current = id.clone();
-    let _ = store.save(&state);
-    id
+    store
+        .save(&state)
+        .map_err(|e| format!("写入会话索引失败：{e}"))?;
+    Ok(id)
 }
 
 /// 切到指定会话（不存在则忽略）。
-pub fn switch_session(id: &str) {
-    let _g = HistoryLock::acquire().ok();
+pub fn switch_session(id: &str) -> Result<(), String> {
+    let _g = lock_strict()?;
     let store = SessionStore::production();
     let mut state = store.load();
     store.ensure_current(&mut state);
     if state.sessions.iter().any(|s| s.id == id) {
         state.current = id.to_string();
-        let _ = store.save(&state);
+        store
+            .save(&state)
+            .map_err(|e| format!("写入会话索引失败：{e}"))?;
     }
+    Ok(())
 }
 
 /// 设置某会话使用的供应商（「模型选择」落盘）。
-pub fn set_session_provider(id: &str, provider: &str) {
-    let _g = HistoryLock::acquire().ok();
+pub fn set_session_provider(id: &str, provider: &str) -> Result<(), String> {
+    let _g = lock_strict()?;
     let store = SessionStore::production();
     let mut state = store.load();
     store.ensure_current(&mut state);
     if let Some(s) = state.sessions.iter_mut().find(|s| s.id == id) {
         s.provider = provider.to_string();
-        let _ = store.save(&state);
+        store
+            .save(&state)
+            .map_err(|e| format!("写入会话索引失败：{e}"))?;
     }
+    Ok(())
 }
 
 /// 气泡位置文件（GUI 专用；后端不读）。
@@ -402,6 +428,12 @@ impl Drop for HistoryLock {
         // 显式限定到 fs2（std 1.89 也提供 File::unlock，混用会让“用了哪套”变得不清楚）。
         let _ = fs2::FileExt::unlock(&self.file);
     }
+}
+
+/// 严格拿历史独占锁：拿不到就返回可重试错误，**不静默降级**（见 [`HistoryLock`] 文档）。
+/// 所有对 sessions.json 的读-改-写入口都必须经它。
+fn lock_strict() -> Result<HistoryLock, String> {
+    HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))
 }
 
 /// 读**当前会话**的历史（GUI 用）。
@@ -540,24 +572,25 @@ pub async fn turn_with(
     }
 }
 
-/// 跑一轮系统级对话：按**当前会话**（与其模型选择）→ 读该会话历史 → 拼 prompt →
-/// 落用户轮 → 跑回合 → 落助手轮/刷新会话时间。
-///
-/// 历史锁只包住两段短临界区（读史+落用户轮 / 落助手轮），**回合在锁外跑**：
-/// 回合最长 10 分钟，持锁跨回合会阻塞 GUI 主线程的清空/重开（同一个 `history.lock`）。
-/// 并发回合由前端保证不出现（对话框 `busy` 期间发送/清空都禁用）。
+/// 跑一轮系统级对话（生产入口）：按**当前会话**（与其模型选择）装配 agent，再交给
+/// [`turn_core`] 跑会话/历史逻辑。模型选择在**本轮开头**解析一次 ⇒「切换从下一条消息起生效」。
 pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     let text = user_text.trim();
     if text.is_empty() {
         return Err("消息为空。".to_string());
     }
 
-    // 解析当前会话 + 该会话的模型选择（短临界区）。
+    let store = SessionStore::production();
+    // 解析当前会话 + 该会话的模型选择（短临界区）。首次建库**立即落盘**——否则临界区
+    // 重新 load 时 state 为空、标题更新落空，本轮会落在孤立的 sessions/<id>.jsonl（评审 N1）。
     let (session_id, provider) = {
-        let _g = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
-        let store = SessionStore::production();
+        let _g = lock_strict()?;
         let mut state = store.load();
-        store.ensure_current(&mut state);
+        if store.ensure_current(&mut state) {
+            store
+                .save(&state)
+                .map_err(|e| format!("写入会话索引失败：{e}"))?;
+        }
         let id = state.current.clone();
         let provider = store.provider_of(&id);
         (id, provider)
@@ -575,17 +608,32 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
     std::fs::create_dir_all(&ws)
         .map_err(|e| format!("创建系统对话工作区失败（{}）：{e}", ws.display()))?;
 
+    turn_core(&store, &session_id, agent_cfg, ws, text).await
+}
+
+/// 可测核心：会话 store / agent 配置 / 工作区都由调用方注入（测试用临时目录 + mock agent，
+/// 不碰真实数据目录，满足隔离门禁）。
+///
+/// 历史锁只包住两段短临界区（读史+落用户轮 / 落助手轮），**回合在锁外跑**：
+/// 回合最长 10 分钟，持锁跨回合会阻塞 GUI 主线程的清空/重开（同一个 `history.lock`）。
+async fn turn_core(
+    store: &SessionStore,
+    session_id: &str,
+    agent_cfg: AgentConfig,
+    ws: PathBuf,
+    user_text: &str,
+) -> Result<String, String> {
+    let text = user_text.trim();
     // 临界区 1：读该会话历史拼 prompt + 落用户轮 + 刷新标题/时间。先落用户轮是为了：
     // 即使回合失败，用户说过的话也不该丢（下次重开对话框仍能看到自己的提问）。
     let prompt = {
-        let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
-        let store = SessionStore::production();
-        let history = store.read_history(&session_id);
+        let _g = lock_strict()?;
+        let history = store.read_history(session_id);
         let prompt = build_prompt(&history, text);
         let now = crate::chrono_lite::unix_secs() as i64;
         store
             .append_turns(
-                &session_id,
+                session_id,
                 &[Turn {
                     role: "user".to_string(),
                     text: text.to_string(),
@@ -608,12 +656,11 @@ pub async fn turn(cfg: &Config, user_text: &str) -> Result<String, String> {
 
     // 临界区 2：落助手轮 + 刷新会话时间。
     {
-        let _guard = HistoryLock::acquire().map_err(|e| format!("锁定对话历史失败：{e}"))?;
-        let store = SessionStore::production();
+        let _g = lock_strict()?;
         let now = crate::chrono_lite::unix_secs() as i64;
         store
             .append_turns(
-                &session_id,
+                session_id,
                 &[Turn {
                     role: "assistant".to_string(),
                     text: reply.clone(),
@@ -900,5 +947,86 @@ mod tests {
         assert!(!store.legacy_path().exists(), "旧 history.jsonl 应被移走");
         assert_eq!(store.read_history(&st.current).len(), 2, "旧对话不得丢");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn session_id_whitelist() {
+        assert!(is_valid_session_id("s123-abc_DEF"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("../etc/passwd"));
+        assert!(!is_valid_session_id("a/b"));
+        assert!(!is_valid_session_id(&"x".repeat(65)));
+    }
+
+    /// `turn_core` 级两会话隔离：按会话读史→拼 prompt→落各会话，互不串。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn turn_core_isolates_sessions() {
+        let (store, base) = tmp_store("turn");
+        let mut st = store.load();
+        store.ensure_current(&mut st);
+        let s1 = st.current.clone();
+        let s2 = "s2-turn".to_string();
+        st.sessions.push(SessionMeta {
+            id: s2.clone(),
+            title: "b".into(),
+            created_at: 1,
+            updated_at: 1,
+            provider: String::new(),
+        });
+        store.save(&st).unwrap();
+        let ws = std::env::temp_dir().join(format!("abb-sc-turn-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let rec =
+            |tag: &str| std::env::temp_dir().join(format!("{tag}-{}.jsonl", uuid::Uuid::new_v4()));
+
+        let r1 = turn_core(
+            &store,
+            &s1,
+            mock_agent_cfg(&rec("abb-sc-t1")),
+            ws.clone(),
+            "probe-one",
+        )
+        .await
+        .unwrap();
+        assert!(r1.contains("probe-one"));
+        let r2 = turn_core(
+            &store,
+            &s2,
+            mock_agent_cfg(&rec("abb-sc-t2")),
+            ws.clone(),
+            "probe-two",
+        )
+        .await
+        .unwrap();
+        assert!(r2.contains("probe-two"));
+
+        let h1 = store.read_history(&s1);
+        let h2 = store.read_history(&s2);
+        assert_eq!(h1.len(), 2, "会话1 应有一问一答");
+        assert_eq!(h2.len(), 2, "会话2 应有一问一答");
+        assert!(h1.iter().any(|t| t.text.contains("probe-one")));
+        assert!(
+            !h1.iter().any(|t| t.text.contains("probe-two")),
+            "会话1 不得串到会话2：{h1:?}"
+        );
+        assert!(h2.iter().any(|t| t.text.contains("probe-two")));
+        assert!(
+            !h2.iter().any(|t| t.text.contains("probe-one")),
+            "会话2 不得串到会话1：{h2:?}"
+        );
+        // 标题取首条用户消息
+        let (list, _) = store.list();
+        assert_eq!(
+            list.iter().find(|s| s.id == s1).unwrap().title,
+            "probe-one",
+            "会话标题应取首条用户消息"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

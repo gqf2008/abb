@@ -334,7 +334,9 @@ fn oneshot_agent_config_inner(
 /// 不依赖 bot 配置（无 bot 也能跑），角色是「系统级 Owner Bot」。
 ///
 /// 装配口径（owner 决策，2026-10-12）：
-/// - 供应商：全局默认（合成 bot 的 `provider` 留空 → `effective_provider` 回落 `default_provider`）；
+/// - 供应商：**本会话所选**（`provider` 形参，即「模型选择」）；空串 → 合成 bot 的 `provider`
+///   留空 → `effective_provider` 回落 `default_provider`；名字不在 `providers` 里时不注入
+///   半截 env（按未配置处理）；
 /// - 档位：**整机全权限**（`sandbox = None`，不带任何 workspace 白名单/证据；这是「系统级」的定义）；
 /// - 工作区：`workspaces/syschat/`（见 [`crate::syschat::workspace`]）。
 ///
@@ -2157,6 +2159,44 @@ mod tests {
         );
         // Jev 门禁 env 不该出现（无档位=不套门禁，多变一个凭证只扩大暴露面）。
         assert!(!env.contains_key("JEV_API_KEY"));
+    }
+
+    /// A 批（卡 abb-syschat-a-model-session-20261013）：「模型选择」= 按会话的 provider。
+    /// 三态：显式命中 / 空串回落全局默认 / 名字不存在不注入半截 env（按未配置处理）。
+    #[test]
+    fn oneshot_agent_config_system_honours_explicit_provider() {
+        let mk = |name: &str, key: &str| crate::config::ProviderConfig {
+            name: name.into(),
+            kind: "openai-chat".into(),
+            base_url: format!("https://{name}.example.com"),
+            api_key: key.into(),
+            model: format!("{name}-model"),
+        };
+        let mut cfg = Config::default();
+        cfg.providers = vec![mk("prov-a", "sk-a"), mk("prov-b", "sk-b")];
+        cfg.default_provider = "prov-a".into();
+        let env_of = |sess: &str| -> std::collections::HashMap<String, String> {
+            oneshot_agent_config_system(&cfg, sess)
+                .extra_env
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            env_of("prov-b")
+                .get("OPENAI_COMPAT_API_KEY")
+                .map(String::as_str),
+            Some("sk-b"),
+            "显式 provider 必须命中（会话级模型选择）"
+        );
+        assert_eq!(
+            env_of("").get("OPENAI_COMPAT_API_KEY").map(String::as_str),
+            Some("sk-a"),
+            "空串 = 回落全局默认"
+        );
+        assert!(
+            !env_of("ghost").contains_key("OPENAI_COMPAT_API_KEY"),
+            "名字不在 providers 里 ⇒ 不注入半截 env（按未配置处理）"
+        );
     }
 
     /// 随包仅认 abb-agent（刀 4b 后无回滚槽）。

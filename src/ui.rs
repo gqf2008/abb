@@ -5325,12 +5325,18 @@ pub fn run_gui() -> Result<()> {
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
         syschat_win.on_new_session(move || {
-            crate::syschat::new_session(None);
-            if let Some(w) = cw.upgrade() {
-                refresh_syschat_sel(&w, &sessions, &models);
-                load_syschat_into(&w, &model);
-                w.set_status_is_error(false);
-                w.set_status_line("已新建会话（旧会话在「会话」下拉里可切回）。".into());
+            let Some(w) = cw.upgrade() else { return };
+            match crate::syschat::new_session(None) {
+                Ok(_) => {
+                    refresh_syschat_sel(&w, &sessions, &models);
+                    load_syschat_into(&w, &model);
+                    w.set_status_is_error(false);
+                    w.set_status_line("已新建会话（旧会话在「会话」下拉里可切回）。".into());
+                }
+                Err(e) => {
+                    w.set_status_is_error(true);
+                    w.set_status_line(format!("新建会话失败：{e}").into());
+                }
             }
         });
     }
@@ -5346,10 +5352,16 @@ pub fn run_gui() -> Result<()> {
             }
             let id = sessions.borrow().get(idx as usize).map(|s| s.id.clone());
             if let Some(id) = id {
-                crate::syschat::switch_session(&id);
-                if let Some(w) = cw.upgrade() {
-                    refresh_syschat_sel(&w, &sessions, &models);
-                    load_syschat_into(&w, &model);
+                let Some(w) = cw.upgrade() else { return };
+                match crate::syschat::switch_session(&id) {
+                    Ok(()) => {
+                        refresh_syschat_sel(&w, &sessions, &models);
+                        load_syschat_into(&w, &model);
+                    }
+                    Err(e) => {
+                        w.set_status_is_error(true);
+                        w.set_status_line(format!("切换会话失败：{e}").into());
+                    }
                 }
             }
         });
@@ -5365,14 +5377,20 @@ pub fn run_gui() -> Result<()> {
             }
             let name = models.borrow().get(idx as usize).map(|(n, _)| n.clone());
             if let Some(name) = name {
+                let Some(w) = cw.upgrade() else { return };
                 let cur = crate::syschat::current_session();
-                crate::syschat::set_session_provider(&cur, &name);
-                if let Some(w) = cw.upgrade() {
-                    refresh_syschat_sel(&w, &sessions, &models);
-                    w.set_status_is_error(false);
-                    w.set_status_line(
-                        format!("本会话模型已切到「{name}」（从下一条消息起生效）").into(),
-                    );
+                match crate::syschat::set_session_provider(&cur, &name) {
+                    Ok(()) => {
+                        refresh_syschat_sel(&w, &sessions, &models);
+                        w.set_status_is_error(false);
+                        w.set_status_line(
+                            format!("本会话模型已切到「{name}」（从下一条消息起生效）").into(),
+                        );
+                    }
+                    Err(e) => {
+                        w.set_status_is_error(true);
+                        w.set_status_line(format!("切换模型失败：{e}").into());
+                    }
                 }
             }
         });
