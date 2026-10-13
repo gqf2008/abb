@@ -3028,41 +3028,148 @@ export struct SysChatBlockRow {
     img-ok: bool,        // 图片是否已成功加载（否则显示链接回退）
 }
 
+// 待发附件 chip（D 批 3+N）：`index` 是它在**完整待发列表**里的下标——✕ 按它精确移除。
+// Rust 侧已按折叠态裁好可见行，这里只负责画（图片缩略图 / 文件 chip）。
+export struct PendingAttachRow {
+    index: int,
+    name: string,
+    is-image: bool,
+    thumb: image,        // 图片缩略图（未加载/失败时为空，走 thumb-ok=false 的字形回落）
+    thumb-ok: bool,
+    ext: string,         // 类型角标（PNG / PDF / ...）
+}
+
 // 全局锚点气泡：常驻屏幕的系统级对话入口。
 // 透明 + 无边框 + always-on-top；WindowMoveArea 负责拖动（带阈值：单击不移动），
 // 单纯单击落到下层 TouchArea → open-chat。位置由 Rust 持久化（syschat/bubble.json）。
 export component AnchorBubble inherits Window {
     title: "ABB";
-    // 尺寸：36px（owner 反馈 56 → 44 仍偏大，2026-10-13）。
-    width: 36px;
-    height: 36px;
-    preferred-width: 36px;
-    preferred-height: 36px;
+    // 窗口 = **36px 可视气泡 + 四周各 4px 透明边距**（D 批）。
+    // 留边距的原因：稿 `.bub` 悬停放大到 1.06（≈38.2px）、按下缩到 0.9 并加墨黑描边；
+    // 窗口级裁剪关不掉，36px 窗口会把放大后的圆角裁平。位置记忆存的是**窗口**左上角，
+    // 几何换算见 Rust `BUBBLE_INSET`（可视气泡 = 窗口内缩 4px）。
+    width: 44px;
+    height: 44px;
+    preferred-width: 44px;
+    preferred-height: 44px;
     no-frame: true;
     always-on-top: true;
     background: transparent;
 
     in property <bool> busy: false;   // 回合进行中（透明反馈）
+    // 按下态：由 `TouchArea.pointer-event` 驱动；窗口开始移动（`Moved`）时由 Rust 清掉——
+    // 原生移动会吞掉 release，否则按下态会残留在气泡上（卡内明确要求）。
+    in-out property <bool> pressed: false;
     callback open-chat();
 
     WindowMoveArea {
         // 底层全窗点击热区：WindowMoveArea 只处理「按住拖动超过阈值」的移动，
         // 普通单击仍会落到这里的 clicked（对齐 slint-pixel PixelTitleBar 的 native-move 语义）。
-        TouchArea {
+        touch := TouchArea {
             width: 100%;
             height: 100%;
             mouse-cursor: pointer;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) { root.pressed = true; }
+                if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                    root.pressed = false;
+                }
+            }
             clicked => { root.open-chat(); }
+        }
+        // 按下态的墨黑描边（稿 `.bub:active` 的 `box-shadow: 0 0 0 2px edge`）：
+        // 画在 36px 可视框上；图片缩到 0.9 后描边即露出。
+        Rectangle {
+            visible: root.pressed;
+            x: 4px;
+            y: 4px;
+            width: 36px;
+            height: 36px;
+            background: transparent;
+            border-width: 2px;
+            border-color: #1c1a17;
+            border-radius: 8px;
         }
         // 直接用**应用图标**当气泡（蓝色品牌色圆角方块，自带圆角与品牌色），
         // 不用主题 accent 填色——之前暖黄 accent 与蓝色图标撞色（owner 2026-10-13）。
+        // 悬停放大 1.06 / 按下缩到 0.9（稿 `.bub:hover` / `.bub:active`）：用宽高缩放而不是
+        // transform，避开子元素变换原点/裁剪的不确定性。
         Image {
-            width: 100%;
-            height: 100%;
+            property <float> sc: root.pressed ? 0.9 : (touch.has-hover ? 1.06 : 1.0);
+            width: 36px * self.sc;
+            height: 36px * self.sc;
+            x: 4px + (36px - self.width) / 2;
+            y: 4px + (36px - self.height) / 2;
             source: @image-url("../app-assets/icon-1024.png");
             image-fit: fill;
             opacity: root.busy ? 0.6 : 1.0;   // 回合进行中的轻反馈
         }
+    }
+}
+
+// D 批：输入区左竖排图标按钮（稿 `.ib`）：32×32、2px 描边、7px 圆角；hover 变底、按下下沉 1px；
+// 图标文案不显示在按钮上，而是作为 tooltip（owner 口径：图标 + 文案作 tooltip）。
+component ComposerIcon inherits Rectangle {
+    in property <string> icon: "";
+    in property <string> tip: "";
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 32px;
+    height: 32px;
+    background: transparent;
+    opacity: root.enabled ? 1.0 : 0.5;
+    face := Rectangle {
+        x: hit.pressed ? 1px : 0px;
+        y: hit.pressed ? 1px : 0px;
+        width: parent.width;
+        height: parent.height;
+        background: hit.has-hover ? PixelTheme.hover : PixelTheme.panel;
+        border-width: 2px;
+        border-color: PixelTheme.edge;
+        border-radius: 7px;
+        Text {
+            width: 100%;
+            height: 100%;
+            text: root.icon;
+            font-size: 15px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        // `Tooltip.text` 是 styled-text：必须用 @markdown，插值要带反斜杠（Slint 语法），
+        // 且插值实参按**纯文本**注入（不会被当 markdown 解析）。
+        Tooltip { text: @markdown("\{root.tip}"); }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// D 批：待发附件右上角 ✕（稿 `.x`）——**只从待发列表移除，不删已落盘文件**。
+component PendingRemoveBadge inherits Rectangle {
+    callback remove();
+    width: 17px;
+    height: 17px;
+    background: UiTokens.error;
+    border-width: 2px;
+    border-color: #ffffff;
+    border-radius: 9px;
+    Text {
+        width: 100%;
+        height: 100%;
+        text: "✕";
+        font-size: 9px;
+        font-weight: 800;
+        color: #ffffff;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => { root.remove(); }
     }
 }
 
@@ -3091,10 +3198,13 @@ export component SystemChatWindow inherits Window {
     // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
     in-out property <string> draft: "";
 
-    // C1 待发附件（📎 多选 / ⌘V 粘贴）：`attach-count` 控制附件简行显隐，
-    // `attach-summary` 由 Rust 拼好（`📎 N 个：a.png, b.mov`）——D 批再改成输入框内 3+N chips。
+    // D 批待发附件（3+N chips，稿 `.pending`）：`attach-count` = 完整待发数（>0 才渲染附件行），
+    // `pending-rows` = Rust 按折叠态裁好的**可见**行（≤3 或展开后全部），`pending-more` = 折叠数 N。
     in property <int> attach-count: 0;
-    in property <string> attach-summary: "";
+    in property <[PendingAttachRow]> pending-rows: [];
+    in property <int> pending-more: 0;
+    in property <string> pending-more-text: "";   // `+N` 文案由 Rust 拼（Slint int→string 拼接不可靠）
+    in property <bool> pending-expanded: false;
     // C2 拖入高亮：由 Rust 从 winit 的 `HoveredFile` / `HoveredFileCancelled` 驱动。
     // 注意：成功 drop 后 winit **不发** `HoveredFileCancelled`（它只发 `concludeDragOperation:`，
     // 而 winit 那个方法不下发事件），所以「何时收起高亮」由 Rust 侧自己收尾（见 syschat::DropTracker）。
@@ -3113,7 +3223,9 @@ export component SystemChatWindow inherits Window {
 
     callback send(string);
     callback attach-pick();
-    callback attach-clear();
+    callback attach-clear();       // 清空待发列表（只清内存，不删已落盘文件）
+    callback attach-remove(int);   // 按完整列表下标移除单个待发附件（✕）
+    callback pending-toggle();     // 展开/收起 +N
     callback reset-history();
     callback close-window();
     callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
@@ -3185,13 +3297,22 @@ export component SystemChatWindow inherits Window {
                         current-index <=> root.model-index;
                         selected => { root.model-pick(self.current-index); }
                     }
-                    Rectangle { horizontal-stretch: 1; }
                     Text {
                         text: root.status-line;
                         font-size: 11px;
                         color: root.status-is-error ? UiTokens.error : UiTokens.text-dim;
                         vertical-alignment: center;
                         overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    // 对话历史清空：D 批把输入区收口为「2 图标 + 文本区 + 发送」后，
+                    // 元位置不再容纳它；为**不静默丢掉这个能力**，暂放到状态行右端（稿子未给入口，
+                    // 已作为口径偏离写进卡内）。
+                    PixelButton {
+                        text: "清空对话";
+                        size: "small";
+                        enabled: !root.busy;
+                        clicked => { root.reset-history(); }
                     }
                 }
                 // 底部分隔线（Rectangle 无 border-bottom-* 属性，用 1px 子矩形代替）
@@ -3414,83 +3535,264 @@ export component SystemChatWindow inherits Window {
                 }
             }
 
-            // 待发附件简行（C1 临时形态；D 批改成输入框内 3+N 折叠 chips）：
-            // `📎 N 个：a.png, b.mov` + 「清空」。「清空」只清待发列表，**不删**已落盘文件。
-            if root.attach-count > 0: Rectangle {
-                height: 26px;
+            // ── D 批输入区（稿 `.composer-zone` / `.composer` / `.pending` / `.prow` / `.stack`）──
+            // 一个整体框：2px 墨黑描边 + 8px 圆角 + panel 底 + 8px 内边距/间距；
+            // 框内自上而下 = 待发附件行 →（左竖排图标列 | 文本区 | 发送按钮）。
+            // 稿第 288 行要求删掉的「长提示文案」不再渲染；状态行（错误通道）保留在工具行。
+            Rectangle {
+                vertical-stretch: 0;
                 background: PixelTheme.bg;
-                HorizontalBox {
-                    padding-left: 10px;
-                    padding-right: 10px;
-                    spacing: 8px;
-                    Text {
-                        text: root.attach-summary;
-                        font-size: 11px;
-                        color: PixelTheme.text;
-                        vertical-alignment: center;
-                        overflow: elide;
-                        horizontal-stretch: 1;
-                    }
-                    PixelButton {
-                        text: "清空";
-                        size: "small";
-                        enabled: !root.busy;
-                        clicked => { root.attach-clear(); }
-                    }
-                }
-            }
+                VerticalBox {
+                    // `.composer-zone` 顶部分隔线（Slint 的 Rectangle 无单边 border，用 2px 子矩形）
+                    Rectangle { height: 2px; background: PixelTheme.edge; }
+                    VerticalBox {
+                        padding: 10px;
+                        composer := Rectangle {
+                            width: 100%;
+                            background: PixelTheme.panel;
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            border-radius: 8px;
+                            VerticalBox {
+                                padding: 8px;
+                                spacing: 8px;
 
-            // 输入区：新建会话 + 附件 + 输入框 + 发送 + 清空
-            HorizontalBox {
-                padding: 10px;
-                spacing: 8px;
-                // 新建会话（A 批先放这里；D 批改成输入区左侧竖排图标 + tooltip）
-                PixelButton {
-                    text: "＋";
-                    enabled: !root.busy;
-                    clicked => { root.new-session(); }
-                }
-                // 📎 多选附件（C1）。系统对话输入行空间紧，用轻量 TouchArea 图标按钮。
-                Rectangle {
-                    width: 32px;
-                    height: 32px;
-                    border-radius: PixelTheme.radius;
-                    border-width: PixelTheme.border-width;
-                    border-color: attach-hit.pressed ? PixelTheme.accent : PixelTheme.edge;
-                    background: attach-hit.pressed ? PixelTheme.bg : transparent;
-                    Text {
-                        width: 100%;
-                        height: 100%;
-                        text: "📎";
-                        font-size: 15px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                                // 待发附件行（框内顶部）：最多 3 个，其余折叠为 `+N`；点开看全部。
+                                // 用横向 Flickable 兜底「附件多到一行放不下」（Slint 无 flex-wrap）。
+                                if root.attach-count > 0: Flickable {
+                                    height: 68px;
+                                    vertical-stretch: 0;
+                                    content-width: pending-row.preferred-width;
+                                    content-height: self.height;
+                                    pending-row := HorizontalBox {
+                                        padding: 8px;
+                                        spacing: 8px;
+                                        // 图片：52×52 缩略图（左下角类型徽标；加载失败回落字形）。
+                                        // 图片/文件分两个 `for` —— 布局里 `visible: false` 不占位，
+                                        // 比「每行套一层 Rectangle + if」的隐式尺寸更可预测。
+                                        for r in root.pending-rows: Rectangle {
+                                            visible: r.is-image;
+                                            width: 52px;
+                                            height: 52px;
+                                            background: PixelTheme.hover;
+                                            border-width: 2px;
+                                            border-color: PixelTheme.edge;
+                                            border-radius: 6px;
+                                            if r.thumb-ok: Image {
+                                                width: 100%;
+                                                height: 100%;
+                                                source: r.thumb;
+                                                image-fit: cover;
+                                            }
+                                            if !r.thumb-ok: Text {
+                                                width: 100%;
+                                                height: 100%;
+                                                text: "🖼";
+                                                font-size: 18px;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                            // 左下角名称/类型徽标（稿 `.pthumb .badge`）
+                                            Rectangle {
+                                                x: 3px;
+                                                y: parent.height - self.height - 3px;
+                                                width: badge.preferred-width + 8px;
+                                                height: 14px;
+                                                background: #1c1a17c4;
+                                                border-radius: 3px;
+                                                badge := Text {
+                                                    text: r.ext;
+                                                    font-size: 9px;
+                                                    font-weight: 700;
+                                                    color: #ffffff;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            PendingRemoveBadge {
+                                                x: parent.width - 10px;
+                                                y: -7px;
+                                                remove => { root.attach-remove(r.index); }
+                                            }
+                                        }
+                                        // 非图片：文件 chip（图标 + 名称 elide）
+                                        for r in root.pending-rows: Rectangle {
+                                            visible: !r.is-image;
+                                            height: 52px;
+                                            width: min(file-row.preferred-width, 180px);
+                                            background: PixelTheme.bg;
+                                            border-width: 2px;
+                                            border-color: PixelTheme.edge;
+                                            border-radius: 6px;
+                                            file-row := HorizontalBox {
+                                                padding: 6px;
+                                                spacing: 7px;
+                                                Rectangle {
+                                                    width: 22px;
+                                                    height: 22px;
+                                                    background: PixelTheme.accent;
+                                                    border-width: 2px;
+                                                    border-color: PixelTheme.edge;
+                                                    border-radius: 4px;
+                                                    Text {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        text: r.ext;
+                                                        font-size: 8px;
+                                                        font-weight: 800;
+                                                        color: PixelTheme.on-accent;
+                                                        horizontal-alignment: center;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: r.name;
+                                                    font-size: 11px;
+                                                    font-weight: 700;
+                                                    color: PixelTheme.text;
+                                                    vertical-alignment: center;
+                                                    overflow: elide;
+                                                    horizontal-stretch: 1;
+                                                }
+                                            }
+                                            PendingRemoveBadge {
+                                                x: parent.width - 10px;
+                                                y: -7px;
+                                                remove => { root.attach-remove(r.index); }
+                                            }
+                                        }
+                                        // 折叠指示 `+N`（N==0 不渲染）；点它展开全部。
+                                        if !root.pending-expanded && root.pending-more > 0: Rectangle {
+                                            width: 52px;
+                                            height: 52px;
+                                            background: PixelTheme.hover;
+                                            border-width: 2px;
+                                            border-color: PixelTheme.edge;
+                                            border-radius: 6px;
+                                            Text {
+                                                width: 100%;
+                                                height: 100%;
+                                                text: root.pending-more-text;
+                                                font-size: 13px;
+                                                font-weight: 800;
+                                                color: PixelTheme.text;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                            TouchArea {
+                                                enabled: !root.busy;
+                                                mouse-cursor: pointer;
+                                                clicked => { root.pending-toggle(); }
+                                            }
+                                        }
+                                        // 展开态下的收起入口（稿未画；无折叠则无需收起）
+                                        if root.pending-expanded && root.attach-count > 3: Rectangle {
+                                            width: 52px;
+                                            height: 52px;
+                                            background: PixelTheme.hover;
+                                            border-width: 2px;
+                                            border-color: PixelTheme.edge;
+                                            border-radius: 6px;
+                                            Text {
+                                                width: 100%;
+                                                height: 100%;
+                                                text: "收起";
+                                                font-size: 11px;
+                                                font-weight: 700;
+                                                color: PixelTheme.text;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                            TouchArea {
+                                                enabled: !root.busy;
+                                                mouse-cursor: pointer;
+                                                clicked => { root.pending-toggle(); }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 输入行：左竖排图标列 | 文本区 | 发送按钮（底对齐）
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    // 左竖排图标列（只有两个：＋ 新建会话 / 📎 多选附件；文案作 tooltip）
+                                    VerticalBox {
+                                        width: 32px;
+                                        spacing: 6px;
+                                        alignment: start;
+                                        ComposerIcon {
+                                            icon: "＋";
+                                            tip: "新建会话";
+                                            enabled: !root.busy;
+                                            clicked => { root.new-session(); }
+                                        }
+                                        ComposerIcon {
+                                            icon: "📎";
+                                            tip: "添加附件";
+                                            enabled: !root.busy;
+                                            clicked => { root.attach-pick(); }
+                                        }
+                                    }
+                                    // 文本区（`.area`）：无自绘边框（描边归整体框），回车发送
+                                    area := Rectangle {
+                                        horizontal-stretch: 1;
+                                        min-height: 66px;
+                                        background: transparent;
+                                        area-input := TextInput {
+                                            x: 2px;
+                                            y: 4px;
+                                            width: parent.width - 4px;
+                                            height: parent.height - 8px;
+                                            text <=> root.draft;
+                                            font-size: 13px;
+                                            color: PixelTheme.text;
+                                            single-line: true;
+                                            vertical-alignment: top;
+                                            enabled: !root.busy;
+                                            accepted => {
+                                                if root.draft != "" && !root.busy { root.send(root.draft); }
+                                            }
+                                        }
+                                        if root.draft == "" && !area-input.has-focus: Text {
+                                            x: 4px;
+                                            y: 6px;
+                                            text: root.busy ? "等待回复…" : "给 ABB 发消息，回车发送";
+                                            font-size: 13px;
+                                            color: PixelTheme.dim;
+                                        }
+                                    }
+                                    // 发送按钮（`.send`）：36px 高、2px 描边、7px 圆角、accent 底、底对齐
+                                    VerticalBox {
+                                        alignment: end;
+                                        send-btn := Rectangle {
+                                            width: send-text.preferred-width + 36px;
+                                            height: 36px;
+                                            background: PixelTheme.accent;
+                                            border-width: 2px;
+                                            border-color: PixelTheme.edge;
+                                            border-radius: 7px;
+                                            opacity: (!root.busy && root.draft != "") ? 1.0 : 0.5;
+                                            send-text := Text {
+                                                width: 100%;
+                                                height: 100%;
+                                                text: "发送";
+                                                font-size: 13px;
+                                                font-weight: 800;
+                                                color: PixelTheme.on-accent;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                            TouchArea {
+                                                enabled: !root.busy && root.draft != "";
+                                                mouse-cursor: pointer;
+                                                clicked => { root.send(root.draft); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    attach-hit := TouchArea {
-                        enabled: !root.busy;
-                        mouse-cursor: pointer;
-                        clicked => { root.attach-pick(); }
-                    }
-                }
-                PixelTextInput {
-                    horizontal-stretch: 1;
-                    text <=> root.draft;
-                    placeholder: root.busy ? "等待回复…" : "给 ABB 发消息，回车发送";
-                    enabled: !root.busy;
-                    accepted => {
-                        if root.draft != "" && !root.busy { root.send(root.draft); }
-                    }
-                }
-                PixelButton {
-                    text: "发送";
-                    variant: "primary";
-                    enabled: !root.busy && root.draft != "";
-                    clicked => { root.send(root.draft); }
-                }
-                PixelButton {
-                    text: "清空";
-                    enabled: !root.busy;
-                    clicked => { root.reset-history(); }
                 }
             }
         }

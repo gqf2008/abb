@@ -468,6 +468,63 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     w.window().request_redraw();
 }
 
+// D 批：气泡窗口 = 36px 可视气泡 + 四周各 4px 透明边距（给悬停放大 1.06 / 按下描边留空间，
+// 见 `ui/app.slint` 的 AnchorBubble 注释）。位置记忆存的是**窗口**左上角，几何换算时要内缩。
+const BUBBLE_VISUAL_SIZE: i32 = 36;
+const BUBBLE_INSET: i32 = 4;
+
+/// 气泡显隐的**唯一收口**（#13）。
+///
+/// 可见 ⟺ `config.syschat_bubble == true` **且**对话框当前不可见：
+/// - 点气泡开窗 → 隐藏气泡；关窗 → 气泡重新出现；
+/// - 托盘里把气泡关掉过（`config.syschat_bubble == false`）的用户，关窗**不得**把气泡弄出来。
+///
+/// 托盘 `on_toggle_bubble`、气泡点击、两种关窗路径（✕ 按钮 / 红点 `CloseRequested`）都只调它，
+/// 禁止各写一份——否则显隐口径迟早分叉。
+fn refresh_bubble_visibility(bubble: &AnchorBubble, dialog_visible: bool) {
+    let enabled = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
+    if enabled && !dialog_visible {
+        let _ = bubble.show();
+    } else {
+        let _ = bubble.hide();
+    }
+}
+
+/// 计算对话框应处的左上角（逻辑像素）：把窗口锚在气泡**可视区**旁，靠屏边自动翻边（口径见
+/// [`crate::syschat::anchor_window_pos`]）。
+///
+/// 工作区口径（**替代说明，已写进卡内**）：Slint/winit 都没有「工作区（去掉菜单栏/Dock）」API，
+/// 故取气泡所在**显示器的完整边界**（物理坐标按 scale 换逻辑）作为工作区。夹取能保证不出屏；
+/// 菜单栏/Dock 区域是否遮挡属平台行为，本批不做。
+fn anchored_dialog_pos(
+    bubble_win: &slint::Window,
+    dialog_win: &slint::Window,
+) -> Option<(i32, i32)> {
+    use slint::winit_030::WinitWindowAccessor;
+    let win_pos = bubble_win.with_winit_window(|w| w.outer_position().ok())??;
+    let b =
+        crate::syschat::BubblePos::from_physical(win_pos.x, win_pos.y, bubble_win.scale_factor());
+    // 可视气泡 = 气泡窗口左上角 + 内缩（窗口比图标大）。
+    let bubble = (b.x + BUBBLE_INSET, b.y + BUBBLE_INSET);
+    // `Window::size()` 是**物理**像素，锚定数学全用逻辑像素（Retina 2x 下不换算差一倍）。
+    let dsz = dialog_win.size().to_logical(dialog_win.scale_factor());
+    let work = bubble_win
+        .with_winit_window(|w| {
+            w.current_monitor().map(|m| {
+                let p = m.position().to_logical::<f32>(m.scale_factor());
+                let s = m.size().to_logical::<f32>(m.scale_factor());
+                (p.x as i32, p.y as i32, s.width as i32, s.height as i32)
+            })
+        })
+        .flatten()?;
+    Some(crate::syschat::anchor_window_pos(
+        bubble,
+        (BUBBLE_VISUAL_SIZE, BUBBLE_VISUAL_SIZE),
+        (dsz.width as i32, dsz.height as i32),
+        work,
+    ))
+}
+
 /// 设置窗工作副本聚合（#80 减重）：除 bots 外的全部 work 副本装进一个 Rc，
 /// load/snapshot 签名不再随字段增长；新增设置字段只改这里 + 声明处。
 /// bots 副本（`work`）单独保留——它在多个 handler 里被复用为其它字段的别名
@@ -1821,6 +1878,13 @@ pub fn run_gui() -> Result<()> {
             None => (slint::Image::default(), false),
         }
     }
+    /// 加载待发附件缩略图（本地文件）。失败回落 `thumb-ok=false`（UI 显示字形，不空白）。
+    fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
+        match slint::Image::load_from_path(path) {
+            Ok(img) => (img, true),
+            Err(_) => (slint::Image::default(), false),
+        }
+    }
     fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
         let (img, img_ok) = load_block_image(&b.src);
         // 列表标记在 Rust 侧算好（Slint 里 int→string 拼接不可靠）
@@ -1962,30 +2026,65 @@ pub fn run_gui() -> Result<()> {
     // 到工作区附件目录并上屏，发送时路径随消息文本一起进 prompt（见
     // `syschat::prompt_with_attachments`）——二进制不进 prompt。
     let sc_atts: Rc<RefCell<Vec<crate::syschat::Attachment>>> = Rc::new(RefCell::new(Vec::new()));
+    // D 批 3+N：展开/折叠态。纯逻辑在 `syschat::PendingState`（可单测），这里只存状态。
+    let sc_pending: Rc<Cell<crate::syschat::PendingState>> =
+        Rc::new(Cell::new(crate::syschat::PendingState::new()));
 
-    /// 刷新对话窗的待发附件简行（C1 临时形态：`📎 N 个：a.png, b.mov` + 「清空」；
-    /// D 批再改成输入框内 3+N 折叠 chips）。
+    /// 刷新对话窗的待发附件行（D 批：框内 3+N chips，替换 C1 的 `📎 N 个：…` 简行）。
+    /// `attach-count` 控制整行显隐；`pending-rows` = 按折叠态裁好的可见行；`pending-more` = 折叠数 N。
+    /// 列表清空时把展开态复位——否则发完一批后残留「展开」，下一批一上来就全展开（非预期）。
     fn refresh_syschat_atts(
         win: &SystemChatWindow,
         atts: &Rc<RefCell<Vec<crate::syschat::Attachment>>>,
+        pending: &Rc<Cell<crate::syschat::PendingState>>,
     ) {
         let v = atts.borrow();
+        if v.is_empty() {
+            pending.set(crate::syschat::PendingState::new());
+        }
+        let state = pending.get();
+        let view = state.view(v.len());
+        let rows: Vec<PendingAttachRow> = v
+            .iter()
+            .take(view.shown)
+            .enumerate()
+            .map(|(i, a)| {
+                let is_image = crate::syschat::is_image_attachment(&a.name);
+                let (thumb, thumb_ok) = if is_image {
+                    load_thumb(&a.path)
+                } else {
+                    (slint::Image::default(), false)
+                };
+                PendingAttachRow {
+                    index: i as i32,
+                    name: a.name.clone().into(),
+                    is_image,
+                    thumb,
+                    thumb_ok,
+                    ext: crate::syschat::attachment_kind_label(&a.name).into(),
+                }
+            })
+            .collect();
         win.set_attach_count(v.len() as i32);
-        let summary = if v.is_empty() {
-            String::new()
+        win.set_pending_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+        // `N == 0` ⇒ 不渲染 `+N`（由 Slint 的 `pending-more > 0` 控制）。
+        win.set_pending_more(if view.has_more() {
+            view.hidden as i32
         } else {
-            let names: Vec<&str> = v.iter().map(|a| a.name.as_str()).collect();
-            format!("📎 {} 个：{}", names.len(), names.join("，"))
-        };
-        win.set_attach_summary(summary.into());
+            0
+        });
+        // `+N` 文案在 Rust 侧拼（Slint 的 int→string 拼接不可靠，见 `.slint` 的列表标记注释）。
+        win.set_pending_more_text(format!("+{}", view.hidden).into());
+        win.set_pending_expanded(state.is_expanded());
     }
-    refresh_syschat_atts(&syschat_win, &sc_atts);
+    refresh_syschat_atts(&syschat_win, &sc_atts, &sc_pending);
 
     // 把一批本地路径落地进工作区附件目录并并入待发列表。失败 ⇒ 对话框状态行显示可读原因
     // （复用既有错误展示通道），**不静默丢弃**；成功时才把落盘记录并入待发。
     let land_into_pending: Rc<dyn Fn(Vec<std::path::PathBuf>)> = {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
+        let pending = sc_pending.clone();
         Rc::new(move |paths: Vec<std::path::PathBuf>| {
             if paths.is_empty() {
                 return; // 取消选择 / 剪贴板无文件：不算失败，什么都不做
@@ -1995,7 +2094,7 @@ pub fn run_gui() -> Result<()> {
                 Ok(landed) => {
                     let n = landed.len();
                     atts.borrow_mut().extend(landed);
-                    refresh_syschat_atts(&w, &atts);
+                    refresh_syschat_atts(&w, &atts, &pending);
                     w.set_status_is_error(false);
                     w.set_status_line(format!("已附加 {n} 个文件（随下一条消息发送）").into());
                 }
@@ -2027,12 +2126,44 @@ pub fn run_gui() -> Result<()> {
     {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
+        let pending = sc_pending.clone();
         syschat_win.on_attach_clear(move || {
             atts.borrow_mut().clear();
             if let Some(w) = cw.upgrade() {
-                refresh_syschat_atts(&w, &atts);
+                refresh_syschat_atts(&w, &atts, &pending);
                 w.set_status_is_error(false);
                 w.set_status_line("已清空待发附件（已落盘的文件保留）".into());
+            }
+        });
+    }
+    // D 批：单个 ✕ —— 按**完整列表下标**移除；只动待发列表，**不删**已落盘文件，移除后重新分组。
+    {
+        let cw = syschat_win.as_weak();
+        let atts = sc_atts.clone();
+        let pending = sc_pending.clone();
+        syschat_win.on_attach_remove(move |idx| {
+            let new_len =
+                crate::syschat::remove_pending_at(&mut atts.borrow_mut(), idx.max(0) as usize);
+            if let Some(w) = cw.upgrade() {
+                refresh_syschat_atts(&w, &atts, &pending);
+                w.set_status_is_error(false);
+                w.set_status_line(
+                    format!("已移出 1 个待发附件（现 {new_len} 个；已落盘文件保留）").into(),
+                );
+            }
+        });
+    }
+    // D 批：点 `+N` 展开全部 / 再点收起（`PendingState` 纯逻辑，见 syschat 单测）。
+    {
+        let cw = syschat_win.as_weak();
+        let atts = sc_atts.clone();
+        let pending = sc_pending.clone();
+        syschat_win.on_pending_toggle(move || {
+            let mut st = pending.get();
+            st.toggle();
+            pending.set(st);
+            if let Some(w) = cw.upgrade() {
+                refresh_syschat_atts(&w, &atts, &pending);
             }
         });
     }
@@ -2042,11 +2173,8 @@ pub fn run_gui() -> Result<()> {
     // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
     // 坐标统一用**逻辑像素**（winit 的 MonitorHandle::size() 是物理像素，Retina 下差 2 倍）。
     let bubble_pos_apply = Rc::new(Cell::new(true));
-    // 气泡显示/隐藏：由 config.syschat_bubble 决定（托盘菜单可切换）。默认 true。
-    let bubble_on = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
-    if bubble_on {
-        let _ = bubble.show();
-    }
+    // 气泡显示/隐藏统一走 refresh_bubble_visibility（#13）：启动时对话框尚未打开。
+    refresh_bubble_visibility(&bubble, false);
 
     // 点窗口红点（traffic-light）关闭 → 有未保存修改先弹确认，否则降回 accessory / 直接隐藏。
     // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦：CloseRequested 返回
@@ -3597,20 +3725,25 @@ pub fn run_gui() -> Result<()> {
         });
         tray.on_toggle_bubble({
             let bw = bubble.as_weak();
+            let tw = tray.as_weak();
+            let sw = syschat_win.as_weak();
             move |on| {
-                // 走 config 的写锁 RMW（与其它写方同口径）；失败则把可见性对齐 config 真值。
-                let ok = Config::set_syschat_bubble(on);
-                let effective = if ok {
-                    on
-                } else {
-                    Config::load().map(|c| c.syschat_bubble).unwrap_or(on)
-                };
+                // 走 config 的写锁 RMW（与其它写方同口径）；失败只记日志，可见性仍按 config 真值。
+                if !Config::set_syschat_bubble(on) {
+                    crate::log!("[ui] ⚠️ 气泡开关写入 config 失败，可见性按 config 真值对齐");
+                }
+                // 菜单回显：此前只在启动时 set_bubble_enabled，切菜单后不重建（陈旧）。
+                if let Some(tw) = tw.upgrade() {
+                    tw.set_bubble_enabled(Config::load().map(|c| c.syschat_bubble).unwrap_or(on));
+                }
+                // 可见性**统一**由 refresh_bubble_visibility 按 config + 对话框可见性决定：
+                // 对话框开着时即使托盘把气泡打开也保持隐藏（关窗后再出现），两路不打架。
+                let dialog_visible = sw
+                    .upgrade()
+                    .map(|w| w.window().is_visible())
+                    .unwrap_or(false);
                 if let Some(b) = bw.upgrade() {
-                    if effective {
-                        let _ = b.show();
-                    } else {
-                        let _ = b.hide();
-                    }
+                    refresh_bubble_visibility(&b, dialog_visible);
                 }
             }
         });
@@ -5482,6 +5615,10 @@ pub fn run_gui() -> Result<()> {
     {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
         let pending = bubble_pos_pending.clone();
+        // D 批：拖动气泡时已打开的对话框要**跟着动**（#9）；并清掉气泡按下态
+        // （原生移动会吞掉 release，否则 #8 的按下反馈会残留在气泡上）。
+        let bw = bubble.as_weak();
+        let cw = syschat_win.as_weak();
         bubble.window().on_winit_window_event(move |w, ev| {
             if let WindowEvent::Moved(pos) = ev {
                 pending.set(Some(crate::syschat::BubblePos::from_physical(
@@ -5489,6 +5626,17 @@ pub fn run_gui() -> Result<()> {
                     pos.y,
                     w.scale_factor(),
                 )));
+                if let Some(b) = bw.upgrade() {
+                    b.set_pressed(false);
+                    if let Some(d) = cw.upgrade() {
+                        if d.window().is_visible() {
+                            if let Some((x, y)) = anchored_dialog_pos(b.window(), d.window()) {
+                                d.window()
+                                    .set_position(slint::LogicalPosition::new(x as f32, y as f32));
+                            }
+                        }
+                    }
+                }
             }
             // Windows：圆角需要 SetWindowRgn 硬裁剪（与设置窗同一半径）；其它平台是空操作。
             handle_platform_window_event(w, ev);
@@ -5524,13 +5672,22 @@ pub fn run_gui() -> Result<()> {
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
         let rm = request_media.clone();
+        let bw = bubble.as_weak();
         bubble.on_open_chat(move || {
-            if let Some(w) = cw.upgrade() {
-                load_syschat_into(&w, &model);
-                refresh_syschat_sel(&w, &sessions, &models);
-                show_window_and_focus(&w);
-                rm();
+            let Some(w) = cw.upgrade() else { return };
+            load_syschat_into(&w, &model);
+            refresh_syschat_sel(&w, &sessions, &models);
+            show_window_and_focus(&w);
+            if let Some(b) = bw.upgrade() {
+                // #9：把对话框锚到气泡旁（间距 10px，靠屏边翻边）。
+                if let Some((x, y)) = anchored_dialog_pos(b.window(), w.window()) {
+                    w.window()
+                        .set_position(slint::LogicalPosition::new(x as f32, y as f32));
+                }
+                // #13：点气泡 → 弹窗并隐藏气泡（显隐统一收口按 config + 对话框可见性决定）。
+                refresh_bubble_visibility(&b, true);
             }
+            rm();
         });
     }
     // 新建会话（保留历史，旧会话可在「会话」下拉里切回）。
@@ -5619,6 +5776,7 @@ pub fn run_gui() -> Result<()> {
         let bw = bubble.as_weak();
         let tx = tx.clone();
         let atts = sc_atts.clone();
+        let pending = sc_pending.clone();
         syschat_win.on_send(move |text| {
             let text = text.trim().to_string();
             if text.is_empty() {
@@ -5648,7 +5806,7 @@ pub fn run_gui() -> Result<()> {
                 b.set_busy(true);
             }
             atts.borrow_mut().clear();
-            refresh_syschat_atts(&w, &atts);
+            refresh_syschat_atts(&w, &atts, &pending);
             let _ = tx.send(UiCmd::SysChatSend {
                 text,
                 atts: atts_now,
@@ -5698,9 +5856,14 @@ pub fn run_gui() -> Result<()> {
         };
         let cw = syschat_win.as_weak();
         let sw = settings.as_weak();
+        let bw_close = bubble.as_weak();
         syschat_win.on_close_window(move || {
             if let Some(w) = cw.upgrade() {
                 let _ = w.hide();
+            }
+            // #13：关窗 → 气泡重新出现；显隐统一按 config（托盘关过气泡的不冒出来）。
+            if let Some(b) = bw_close.upgrade() {
+                refresh_bubble_visibility(&b, false);
             }
             #[cfg(target_os = "macos")]
             {
@@ -5715,6 +5878,7 @@ pub fn run_gui() -> Result<()> {
         });
         let cw2 = syschat_win.as_weak();
         let sw2 = settings.as_weak();
+        let bw_close2 = bubble.as_weak();
         // C1：⌘V —— 剪贴板里是**文件**时拦截为附件，否则原样放行（文本粘贴仍交 TextInput）。
         //
         // 为什么走 winit 事件过滤器而不是 Slint 的 `key-pressed`：
@@ -5790,6 +5954,10 @@ pub fn run_gui() -> Result<()> {
             if matches!(ev, WindowEvent::CloseRequested) {
                 if let Some(w) = cw2.upgrade() {
                     let _ = w.hide();
+                }
+                // #13：红点关闭同 ✕ —— 气泡按 config 重新出现（统一收口）。
+                if let Some(b) = bw_close2.upgrade() {
+                    refresh_bubble_visibility(&b, false);
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -6388,9 +6556,14 @@ pub fn run_gui() -> Result<()> {
                                     .with_winit_window(|w| {
                                         w.primary_monitor().map(|m| {
                                             let sz = m.size().to_logical::<f32>(m.scale_factor());
+                                            // 默认位锚「可视气泡右上角」：窗口比图标大
+                                            // （内缩 BUBBLE_INSET），换算时要扣掉。
                                             crate::syschat::BubblePos {
-                                                x: sz.width as i32 - 36 - 16,
-                                                y: 120,
+                                                x: sz.width as i32
+                                                    - 16
+                                                    - BUBBLE_VISUAL_SIZE
+                                                    - BUBBLE_INSET,
+                                                y: 120 - BUBBLE_INSET,
                                             }
                                         })
                                     })

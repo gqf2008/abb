@@ -573,6 +573,103 @@ fn truncate_attachment_name(name: &str, max: usize) -> String {
     }
 }
 
+// ─────────────────────────── D 批：待发附件 3+N 折叠（纯逻辑）───────────────────────────
+
+/// 折叠态最多展示的附件数（稿 `.pending`：最多 3 个，其余折叠成 `+N`）。
+pub const PENDING_MAX_SHOWN: usize = 3;
+
+/// 某一时刻待发附件在输入框内的可见切分。
+///
+/// `shown` 个可见 + `hidden` 个折叠；`hidden == 0` 时**不渲染** `+N`（见 [`Self::has_more`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingView {
+    pub shown: usize,
+    pub hidden: usize,
+}
+
+impl PendingView {
+    /// 是否有折叠项（`N > 0` ⇒ 渲染 `+N`；`N == 0` 不渲染）。
+    pub fn has_more(&self) -> bool {
+        self.hidden > 0
+    }
+}
+
+/// 待发附件行的**展开/折叠状态**（纯逻辑，Slint 侧只读 [`Self::view`] 的结果）。
+///
+/// 抽成纯结构的原因：Slint 事件循环没法单测，而「前 3 / 余 N、展开后可再收起、按索引移除后
+/// 重新分组」是可独立验证的口径（对齐稿 `.pending` / `.more`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingState {
+    expanded: bool,
+}
+
+impl PendingState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// 点 `+N` 展开 / 再点收起。
+    pub fn toggle(&mut self) {
+        self.expanded = !self.expanded;
+    }
+
+    /// 按当前折叠态给出 `(可见数, 折叠数)`。
+    ///
+    /// 展开态：全部可见、`hidden == 0`；折叠态：`min(len, PENDING_MAX_SHOWN)` 可见，其余折叠。
+    pub fn view(&self, len: usize) -> PendingView {
+        let shown = if self.expanded {
+            len
+        } else {
+            len.min(PENDING_MAX_SHOWN)
+        };
+        PendingView {
+            shown,
+            hidden: len - shown,
+        }
+    }
+}
+
+/// 按索引从**待发列表**移除一项；返回移除后的新长度。越界是 no-op。
+///
+/// **只动内存里的待发列表，不删已落盘文件**（C1 口径：落盘副本可能已被已发出的消息引用，
+/// 且同一附件可再次附加）。移除后调用方用 [`PendingState::view`] 按新长度重新分组。
+pub fn remove_pending_at<T>(list: &mut Vec<T>, idx: usize) -> usize {
+    if idx < list.len() {
+        list.remove(idx);
+    }
+    list.len()
+}
+
+/// 附件是否按**图片缩略图**（`.pthumb`）渲染；否则按文件 chip（`.pfile`）。
+///
+/// 只认常见图片扩展名——音视频按稿子的 `.pfile`/类型角标呈现（不内嵌播放器缩略图）。
+pub fn is_image_attachment(name: &str) -> bool {
+    matches!(
+        attachment_ext_lower(name).as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "avif" | "svg"
+    )
+}
+
+/// 文件 chip / 缩略图角标上的类型文案：扩展名大写（最多 4 字），无扩展名回落 `FILE`。
+pub fn attachment_kind_label(name: &str) -> String {
+    let ext = attachment_ext_lower(name);
+    if ext.is_empty() {
+        "FILE".to_string()
+    } else {
+        ext.to_uppercase().chars().take(4).collect()
+    }
+}
+
+/// 取小写扩展名（不含点）；无扩展名返回空串。
+fn attachment_ext_lower(name: &str) -> String {
+    let (_, ext) = split_attachment_ext(name);
+    ext.trim_start_matches('.').to_ascii_lowercase()
+}
+
 /// http(s) 媒体的本地缓存文件路（无论是否存在）：`syschat/media-cache/<sha256(url)>`。
 /// 用内容哈希做文件名：同 URL 同名、不同 URL 不撞，且无需维护索引。
 pub fn media_cache_file(url: &str) -> PathBuf {
@@ -661,6 +758,66 @@ pub fn save_bubble_pos(pos: BubblePos) {
     if let Ok(text) = serde_json::to_string(&pos) {
         let _ = std::fs::write(bubble_pos_path(), text);
     }
+}
+
+// ─────────────────── D 批：对话框锚定气泡的几何（纯函数）───────────────────
+
+/// 气泡与对话框之间的间距（逻辑像素，稿 `.gap` = 10px）。
+pub const BUBBLE_GAP: i32 = 10;
+
+/// 计算对话框应处的左上角（逻辑像素）：把窗口锚在气泡旁，靠屏边自动翻边、并夹进屏幕。
+///
+/// 输入（全为逻辑像素）：
+/// - `bubble` / `bubble_size`：**气泡可视区**左上角与宽高（不是气泡窗口——窗口可能比图标大）；
+/// - `window_size`：对话框宽高；
+/// - `work`：屏幕工作区 `(x, y, w, h)`。
+///
+/// 口径（钉在单测里）：
+/// 1. **首选左侧**（稿子场景：气泡在右上，窗口翻到左），此时 `bubble.x - (win.x + win.w) == BUBBLE_GAP`；
+/// 2. 左侧放不下（`win.x < work.x`）就**翻到右侧**，此时 `win.x - (bubble.x + bubble.w) == BUBBLE_GAP`。
+///    取等号（窗口左缘恰在工作区左界）算「放得下」⇒ **不翻**；
+/// 3. 两侧都放不下（窗口比可用空间还宽）或右侧仍越界 → 夹进工作区；此时牺牲 10px 间距，
+///    **不出屏优先**；
+/// 4. 垂直与气泡顶对齐后同样夹进工作区。
+///
+/// 纯函数：GUI 侧只负责取坐标/尺寸/工作区，翻转与夹取的口径全在这里，可独立单测。
+pub fn anchor_window_pos(
+    bubble: (i32, i32),
+    bubble_size: (i32, i32),
+    window_size: (i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (bx, by) = bubble;
+    let (bw, _bh) = bubble_size;
+    let (ww, wh) = window_size;
+    let (wx, wy, ww_area, wh_area) = work;
+
+    // 首选左侧：气泡左缘 = 窗口右缘 + 间距。左侧放得下（含取等号）就不翻。
+    let left_x = bx - BUBBLE_GAP - ww;
+    let mut x = if left_x >= wx {
+        left_x
+    } else {
+        bx + bw + BUBBLE_GAP // 翻到右侧
+    };
+    // 右侧也越界（或窗口比工作区还宽）→ 夹进工作区，保证不出屏。
+    let max_x = wx + ww_area - ww;
+    if x > max_x {
+        x = max_x;
+    }
+    if x < wx {
+        x = wx;
+    }
+
+    // 垂直：与气泡顶对齐（气泡在哪，窗口就从哪往下展开），再夹进工作区。
+    let mut y = by;
+    let max_y = wy + wh_area - wh;
+    if y > max_y {
+        y = max_y;
+    }
+    if y < wy {
+        y = wy;
+    }
+    (x, y)
 }
 
 /// 历史独占锁：只在「读历史/写一轮」的短临界区里持有，避免并发写坏历史。
@@ -1648,5 +1805,179 @@ mod tests {
         assert!(!user_turn.text.contains("shot.png"));
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ── D 批：待发附件 3+N 折叠（纯逻辑）──
+
+    /// 分组口径：折叠态最多 3 个、其余为 `+N`；`N == 0` 不渲染 `+N`。
+    #[test]
+    fn pending_view_folds_to_three_and_reports_remainder() {
+        let s = PendingState::new();
+        // 0 个：都不渲染，N=0
+        let v0 = s.view(0);
+        assert_eq!((v0.shown, v0.hidden), (0, 0));
+        assert!(!v0.has_more());
+        // 恰好 3 个：全展示，N=0（**不得**渲染 +N）
+        let v3 = s.view(3);
+        assert_eq!((v3.shown, v3.hidden), (3, 0));
+        assert!(!v3.has_more(), "N==0 不得渲染 +N");
+        // 5 个：前 3 + 余 2
+        let v5 = s.view(5);
+        assert_eq!((v5.shown, v5.hidden), (3, 2));
+        assert!(v5.has_more());
+        // 2 个：全展示，N=0
+        assert_eq!((s.view(2).shown, s.view(2).hidden), (2, 0));
+    }
+
+    /// 展开看全部、可再收起。
+    #[test]
+    fn pending_expand_shows_all_then_collapses_back() {
+        let mut s = PendingState::new();
+        assert!(!s.is_expanded());
+        assert_eq!(
+            s.view(7),
+            PendingView {
+                shown: 3,
+                hidden: 4
+            }
+        );
+        s.toggle();
+        assert!(s.is_expanded());
+        assert_eq!(
+            s.view(7),
+            PendingView {
+                shown: 7,
+                hidden: 0
+            },
+            "展开后全部可见（+N 消失）"
+        );
+        s.toggle();
+        assert!(!s.is_expanded());
+        assert_eq!(
+            s.view(7),
+            PendingView {
+                shown: 3,
+                hidden: 4
+            },
+            "收起后回到折叠态"
+        );
+    }
+
+    /// 按索引移除（越界 no-op）后按**新长度**重新分组。
+    #[test]
+    fn remove_pending_at_regroups_after_removal() {
+        let mut list = vec!["a", "b", "c", "d", "e"];
+        let s = PendingState::new();
+        assert_eq!(remove_pending_at(&mut list, 1), 4);
+        assert_eq!(list, vec!["a", "c", "d", "e"]);
+        assert_eq!(
+            s.view(list.len()),
+            PendingView {
+                shown: 3,
+                hidden: 1
+            }
+        );
+        // 越界 no-op
+        assert_eq!(remove_pending_at(&mut list, 99), 4);
+        assert_eq!(list.len(), 4);
+        // 删到剩 3 个 ⇒ N=0
+        remove_pending_at(&mut list, 0);
+        assert_eq!(
+            s.view(list.len()),
+            PendingView {
+                shown: 3,
+                hidden: 0
+            }
+        );
+        assert!(!s.view(list.len()).has_more());
+        // 展开态下移除后仍全部可见
+        let mut s2 = PendingState::new();
+        s2.toggle();
+        let mut l2 = vec![1, 2, 3, 4];
+        remove_pending_at(&mut l2, 0);
+        assert_eq!(
+            s2.view(l2.len()),
+            PendingView {
+                shown: 3,
+                hidden: 0
+            }
+        );
+    }
+
+    /// 图片判定与类型角标。
+    #[test]
+    fn attachment_kind_detection() {
+        assert!(is_image_attachment("123-shot.PNG"), "大小写不敏感");
+        assert!(is_image_attachment("a.jpeg"));
+        assert!(!is_image_attachment("doc.pdf"));
+        assert!(!is_image_attachment("movie.mp4"), "音视频走文件 chip");
+        assert!(!is_image_attachment("noext"));
+        assert_eq!(attachment_kind_label("123-设计规范.pdf"), "PDF");
+        assert_eq!(attachment_kind_label("clip.mp4"), "MP4");
+        assert_eq!(attachment_kind_label("noext"), "FILE");
+        assert_eq!(attachment_kind_label(".hidden"), "FILE");
+    }
+
+    // ── D 批：对话框锚定/翻转几何（纯函数）──
+
+    /// 默认首选左侧，且间距恰为 `BUBBLE_GAP`。
+    #[test]
+    fn anchor_prefers_left_with_exact_gap() {
+        let bubble = (1000, 120);
+        let bs = (36, 36);
+        let ws = (460, 560);
+        let work = (0, 0, 1440, 900);
+        let (x, y) = anchor_window_pos(bubble, bs, ws, work);
+        assert_eq!(x, 1000 - BUBBLE_GAP - 460);
+        assert_eq!(y, 120);
+        assert_eq!(bubble.0 - (x + ws.0), BUBBLE_GAP, "间距恰 10px");
+    }
+
+    /// 左缘**取等号**（窗口恰贴工作区左界）仍用左侧、不翻；再越一点就翻右侧且间距仍为 10。
+    #[test]
+    fn anchor_flip_boundary_takes_equality_as_fits() {
+        let bs = (36, 36);
+        let ws = (460, 560);
+        let work = (0, 0, 1440, 900);
+        let bx = BUBBLE_GAP + 460; // left_x == 0（取等号）
+        let (x, _) = anchor_window_pos((bx, 0), bs, ws, work);
+        assert_eq!(x, 0, "取等号算放得下，不翻");
+        assert_eq!(bx - (x + ws.0), BUBBLE_GAP);
+        // 再左一像素：放不下 ⇒ 翻到右侧
+        let (x2, _) = anchor_window_pos((bx - 1, 0), bs, ws, work);
+        assert_eq!(x2, (bx - 1) + bs.0 + BUBBLE_GAP);
+        assert_eq!(x2 - ((bx - 1) + bs.0), BUBBLE_GAP, "翻边后间距仍 10");
+    }
+
+    /// 垂直：与气泡顶对齐，但不得越出工作区上下界。
+    #[test]
+    fn anchor_clamps_vertically_into_work_area() {
+        let bs = (36, 36);
+        let ws = (460, 560);
+        let work = (0, 0, 1440, 900);
+        // 气泡在底部：窗口下缘越界 ⇒ 上移贴底
+        let (_, y) = anchor_window_pos((1000, 850), bs, ws, work);
+        assert_eq!(y, 900 - 560);
+        // 气泡在顶部之外（负 y）⇒ 夹到工作区上界
+        let (_, y2) = anchor_window_pos((1000, -30), bs, ws, work);
+        assert_eq!(y2, 0);
+    }
+
+    /// 两侧都放不下（窗口比可用空间还宽）时，宁可牺牲间距也必须不出屏。
+    #[test]
+    fn anchor_keeps_window_on_screen_when_both_sides_overflow() {
+        let (x, _) = anchor_window_pos((500, 10), (36, 36), (1400, 300), (0, 0, 1440, 900));
+        assert_eq!(x, 1440 - 1400);
+        assert!(x >= 0 && x + 1400 <= 1440, "必须夹在工作区内：x={x}");
+    }
+
+    /// 工作区坐标可带偏移（副屏在主屏左侧时 x 为负）。
+    #[test]
+    fn anchor_respects_offset_work_area() {
+        let work = (-1920, 0, 1920, 1080);
+        let (x, y) = anchor_window_pos((-100, 100), (36, 36), (460, 560), work);
+        assert_eq!(x, -100 - BUBBLE_GAP - 460, "左侧放得下就用左侧");
+        assert_eq!((-100) - (x + 460), BUBBLE_GAP);
+        assert_eq!(y, 100);
     }
 }
