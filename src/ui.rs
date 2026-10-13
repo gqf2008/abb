@@ -549,15 +549,28 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
             .map(|s| crate::syschat::fit_chip_label(&s, chip_w).into())
             .unwrap_or_default()
     };
+    // D2 回退位：标题栏放不下的项会落到状态行（`.slint` 里的 `titlebar-*-w <= 0` 分支），
+    // 那里 chip 用的是**固定宽**（会话 84、模型 112）——所以文案也得按那个宽度截，
+    // 不能因为「标题栏没要」就把文案置空（否则回落位里是个空菜单壳）。
+    let row_session_w = if plan.session_w > 0.0 {
+        plan.session_w
+    } else {
+        crate::syschat::TB_SESSION_W
+    };
+    let row_model_w = if plan.model_w > 0.0 {
+        plan.model_w
+    } else {
+        crate::syschat::TB_MODEL_W
+    };
     win.set_titlebar_session_text(chip_text(
         win.get_session_labels(),
         win.get_session_index(),
-        plan.session_w,
+        row_session_w,
     ));
     win.set_titlebar_model_text(chip_text(
         win.get_model_labels(),
         win.get_model_index(),
-        plan.model_w,
+        row_model_w,
     ));
 }
 

@@ -3387,6 +3387,34 @@ export component SystemChatWindow inherits Window {
                         overflow: elide;
                         horizontal-stretch: 1;
                     }
+                    // D2 回退位（窄窗才出现）：标题栏控件条放不下的项落在这里——
+                    // 不静默丢功能，也绝不可能与窗口按钮重叠。
+                    // 为什么要有它：标题栏控件条按**整个 106px 按钮区**让位（`TB_BTN_ZONE_W`），
+                    // 460px 下 ①会话+②模型 就吃满空档、③⚙ 让位；340px 下连会话 chip 都放不下、
+                    // 整条不画 ⇒ 三项全部由本行承接。
+                    if root.titlebar-strip-x < 0px && root.session-labels.length > 0: PixelMenu {
+                        width: 84px;
+                        height: 22px;
+                        items: root.session-labels;
+                        index <=> root.session-index;
+                        button-text: root.titlebar-session-text;
+                        enabled: !root.busy;
+                        selected(i) => { root.session-pick(i); }
+                    }
+                    if root.titlebar-model-w <= 0px && root.model-labels.length > 0: PixelMenu {
+                        width: 112px;
+                        height: 22px;
+                        items: root.model-labels;
+                        index <=> root.model-index;
+                        button-text: root.titlebar-model-text;
+                        enabled: !root.busy;
+                        selected(i) => { root.model-pick(i); }
+                    }
+                    if root.titlebar-settings-w <= 0px: TitlebarIconButton {
+                        tip: "打开设置";
+                        enabled: !root.busy;
+                        clicked => { root.open-settings(); }
+                    }
                     // 对话历史清空：稿子未给入口（需求清单里没有它）。D 批一度把它挂在工具行右端，
                     // D2 起改为本行右端的**小号文字按钮**（与稿 `.status` 同高不抢位）——不静默丢掉
                     // 这个能力，也不与状态文案抢横向空间。

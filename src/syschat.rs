@@ -800,16 +800,15 @@ pub const CONVO_BLOCK_TEXT_INSET: f32 = 44.0;
 /// 估高变成天文数字）。
 pub const CONVO_TEXT_WIDTH_MIN: f32 = 120.0;
 
-/// 窗口按钮**单颗**宽（slint-pixel 0.3.0 `ui/pixel_painter_widget.slint` 的 `TitleButton`）。
-const TB_BTN_W: f32 = 30.0;
-/// 窗口按钮之间的间距（同上）。
-const TB_BTN_GAP: f32 = 6.0;
-/// 窗口按钮组右缘到窗口右缘的距离（同上，`HorizontalLayout` 宽 102px 贴 `parent.width - 106px`）。
-const TB_BTN_RIGHT_PAD: f32 = 4.0;
-/// 本窗实际画的窗口按钮数：`show-maximize: false` ⇒ 只有 min 与 close。
-/// **改这里必须同时改那条 `show-maximize`**（单测 `titlebar_plan_reserves_room_for_all_buttons`
-/// 用 3 颗按钮的形态锁住「换回最大化也得让位」的口径）。
-const TB_BTN_COUNT: f32 = 2.0;
+/// 窗口按钮**整区**宽（slint-pixel 0.3.0 `ui/pixel_painter_widget.slint`：按钮组
+/// `x: parent.width - 106px; width: 102px`，内居 3×30 + 2×6）。
+///
+/// **必须按「整区」让位，不能按「当前可见了几颗按钮」算**（D2 复查 2026-10-13 真机实测的教训）：
+/// 之前用 `w - 70`（= 2 颗按钮 + 间隙 + 边距）当按钮区左缘，340px 窄窗下 ③⚙ 实测**压在
+/// 最小化按钮的浅色按钮底上**——那个浅色底是主题给的 `face`，宽度不受 30px 图标盒约束，
+/// 按几何常数精算只会把「差几像素」变成偶发重叠。留整个 106px 区 + `TB_STRIP_GAP` 才与
+/// 主题无关地安全。
+const TB_BTN_ZONE_W: f32 = 106.0;
 /// 控件条右缘与最左侧那颗窗口按钮之间的最小间隔（不许贴脸）。
 const TB_STRIP_GAP: f32 = 8.0;
 /// 标题文字右缘估算：`PixelTitleBar` 里标题 `x: 40px`，"ABB · 系统对话" 13px 粗体 ≈ 92px。
@@ -818,11 +817,11 @@ const TB_TITLE_END: f32 = 132.0;
 const TB_TITLE_GAP: f32 = 8.0;
 /// 会话 chip 宽：PixelMenu 内部 `Text { x: 10px; width: parent.width - 36px }` ⇒
 /// 84px 给文案 48px（13px 字号 ≈ 3 个全宽字 = "新会话" 刚好放全）。
-const TB_SESSION_W: f32 = 84.0;
+pub const TB_SESSION_W: f32 = 84.0;
 /// 模型 chip 理想宽：112px 给文案 76px（≈ 11 个半宽字符，"deepseek-chat" 需 13 个 ⇒ 末尾省略）。
 /// 参照稿本身：`chipbtn` 是 `max-width:150px` + `text-overflow:ellipsis`，且稿的 478px 标题栏
 /// 里两个 chip 被 flex 压到 ~117px——即稿也承认这两个 chip 会省略号，不是「必须全显」。
-const TB_MODEL_W: f32 = 112.0;
+pub const TB_MODEL_W: f32 = 112.0;
 /// 模型 chip 下限：再窄连 6 个半宽字符都放不下，不如让位（见 `titlebar_plan` 的换档）。
 const TB_MODEL_W_MIN: f32 = 88.0;
 /// ③ ⚙ 方钮（26×26，同稿 `.tb-btn`）。
@@ -857,8 +856,8 @@ pub struct TitlebarPlan {
 /// 具体：①三件套（模型理想宽）→ ②压缩模型宽（下限 `TB_MODEL_W_MIN`）→ ③让出 ⚙ →
 /// ④只留会话 chip → ⑤什么都不画（`x = -1`）。
 pub fn titlebar_plan(window_w: f32, has_model: bool) -> TitlebarPlan {
-    let buttons_left =
-        window_w - TB_BTN_RIGHT_PAD - TB_BTN_COUNT * TB_BTN_W - (TB_BTN_COUNT - 1.0) * TB_BTN_GAP;
+    // 按**整区**让位（见 `TB_BTN_ZONE_W` 的注释：按可见按钮数精算在 340px 窄窗下会压到按钮底）。
+    let buttons_left = window_w - 4.0 - TB_BTN_ZONE_W;
     let right_limit = buttons_left - TB_STRIP_GAP;
     let left_limit = TB_TITLE_END + TB_TITLE_GAP;
     let avail = right_limit - left_limit;
@@ -2565,20 +2564,20 @@ mod tests {
                 0.0
             };
         let strip_right = plan.x + total;
-        // 窗口按钮组几何（slint-pixel 写死、不引用被验常量）：单颗 30、间距 6、右边距 4
-        let buttons_left = 460.0 - 4.0 - TB_BTN_COUNT * 30.0 - (TB_BTN_COUNT - 1.0) * 6.0;
+        // 预留的是**整个按钮区**（字面量 106 + 右边距 4），不按「当前可见几颗按钮」精算：
+        // 真机 340px 实测过按可见按钮数算会把 ③⚙ 压到最小化按钮的浅色按钮底上。
+        let zone_left = 460.0 - 4.0 - 106.0;
         assert!(
-            strip_right <= buttons_left - 8.0 + 0.01,
-            "控件条右缘 {strip_right} 越过按钮组左侧 {buttons_left}（间隔应 ≥8）"
+            strip_right <= zone_left - 8.0 + 0.01,
+            "控件条右缘 {strip_right} 越过按钮区左侧 {zone_left}（间隔应 ≥8）"
         );
-        // 反向哨兵：三颗按钮（最大化可见）时窗口按钮更靠左，当前计划必须不够——若这里过了，
-        // 说明 `strip_right`/`buttons_left` 算错了，上面那条断言也就没在盯按钮组。
-        let three_left = 460.0 - 4.0 - 3.0 * 30.0 - 2.0 * 6.0;
+        // 该区必须**装得下三颗按钮**（有人在 .slint 打开最大化也不用回来改常数）。
+        let three = 3.0 * 30.0 + 2.0 * 6.0 + 4.0;
         assert!(
-            strip_right > three_left - 8.0,
-            "反向哨兵失败：三颗按钮时也不越界 ⇒ 本断言的几何算错了"
+            TB_BTN_ZONE_W >= three,
+            "预留区 {TB_BTN_ZONE_W} 装不下三颗按钮（需 ≥{three}）"
         );
-        assert!(buttons_left >= 0.0 && plan.x >= 0.0);
+        assert!(zone_left >= 0.0 && plan.x >= 0.0);
     }
 
     /// `TB_BTN_COUNT` 必须与 `ui/app.slint` 里 `SystemChatWindow` 的 `show-maximize` 一致
@@ -2610,21 +2609,25 @@ mod tests {
             win.contains("PixelTitleBar"),
             "SystemChatWindow 应画自绘标题栏"
         );
+        // 本窗 `show-maximize: false`（只画 min + close）。因为预留的是**整区**，
+        // 以后有人打开最大化也只需 ≤ 3 颗 ⇒ 用「三颗」上限锁住即可，不必再同步计数。
         let maximize_off = win.lines().any(|l| {
             let code = l.split("//").next().unwrap_or(l);
             code.contains("show-maximize: false")
         });
-        let expected = if maximize_off { 2.0 } else { 3.0 };
-        assert_eq!(
-            TB_BTN_COUNT, expected,
-            "TB_BTN_COUNT 与 ui/app.slint 的 show-maximize 不一致（最大化关闭时 2 颗、打开时 3 颗）"
+        assert!(maximize_off, "本窗应关掉最大化（固定尺寸窗）");
+        let three = 3.0 * 30.0 + 2.0 * 6.0 + 4.0;
+        assert!(
+            TB_BTN_ZONE_W >= three,
+            "预留区必须按「最大化也打开」的 3 颗按钮留（{TB_BTN_ZONE_W} < {three}）"
         );
     }
 
-    /// 460px（默认窗宽）下三件套全上，且总宽正好吃掉空档里的可用宽度。
+    /// 500px 下三件套全上；**460px（默认窗宽）会让出 ⚙**（整区预留 106px 的代价，
+    /// 让出的 ⚙ 由状态行承接，见 `ui/app.slint` 的 D2 回退位）——两条口径一起钉住。
     #[test]
-    fn titlebar_plan_fits_all_three_at_default_width() {
-        let p = titlebar_plan(SYSCHAT_PREFERRED_WIDTH, true);
+    fn titlebar_plan_fits_all_three_when_wide_enough() {
+        let p = titlebar_plan(500.0, true);
         assert_eq!(
             (p.session_w, p.model_w, p.settings_w),
             (TB_SESSION_W, TB_MODEL_W, TB_SETTINGS_W)
@@ -2637,11 +2640,14 @@ mod tests {
         );
         // 右缘正好贴「按钮组左侧 − 8」：期望值用字面量算（不引用 TB_*），
         // 这样改 `TB_STRIP_GAP` / 控件宽度都会被本用例抳住。
-        let buttons_left = 460.0 - 4.0 - 2.0 * 30.0 - 6.0;
-        assert_eq!(
-            p.x + TB_SESSION_W + TB_ITEM_GAP + TB_MODEL_W + TB_ITEM_GAP + TB_SETTINGS_W,
-            buttons_left - 8.0
+        let zone_left = 500.0 - 4.0 - 106.0;
+        assert!(
+            p.x + TB_SESSION_W + TB_ITEM_GAP + TB_MODEL_W + TB_ITEM_GAP + TB_SETTINGS_W
+                <= zone_left - 8.0 + 0.01
         );
+        // 默认窗宽下 ⚙ 必须让位（否则就是踩进了按钮区）——这条是把上面的取舍机器化。
+        let def = titlebar_plan(SYSCHAT_PREFERRED_WIDTH, true);
+        assert_eq!(def.settings_w, 0.0, "460px 下 ⚙ 必须让位给按钮区");
     }
 
     /// 窗口变窄时按「能力可替代性」换档：先压模型、再让 ⚙、最后只剩会话 chip；
@@ -2676,10 +2682,10 @@ mod tests {
                 assert_eq!(total, 0.0, "w={w}: x<0 即整条不画");
                 continue;
             }
-            let buttons_left = w - TB_BTN_RIGHT_PAD - 2.0 * TB_BTN_W - TB_BTN_GAP;
+            let zone_left = w - 4.0 - TB_BTN_ZONE_W;
             assert!(
-                p.x + total <= buttons_left - TB_STRIP_GAP + 0.01,
-                "w={w}: 压到窗口按钮"
+                p.x + total <= zone_left - TB_STRIP_GAP + 0.01,
+                "w={w}: 压到窗口按钮区"
             );
             assert!(
                 p.x >= TB_TITLE_END + TB_TITLE_GAP - 0.01,
@@ -2706,18 +2712,19 @@ mod tests {
     /// 在「三件套放不下、会话单独放得下」的窄窗上，会话 chip 必须在。
     #[test]
     fn titlebar_plan_keeps_session_chip_longest() {
-        // 380px 窗：空档 162px ⇒ 三件套放不下，会话 + ⚙（116px）放得下；模型连 88px 都挤不出。
-        let p = titlebar_plan(380.0, true);
+        // 440px 窗：空档 182px ⇒ 三件套放不下，先让 ⚙；会话 + 模型（92px）放得下。
+        let p = titlebar_plan(440.0, true);
         assert_eq!(p.session_w, TB_SESSION_W, "会话 chip 不该先让位");
-        assert_eq!((p.model_w, p.settings_w), (0.0, TB_SETTINGS_W));
-        // 320px 窗：空档 102px ⇒ 连 ⚙ 也放不下，会话 chip 佐在。
-        let q = titlebar_plan(320.0, true);
+        assert!(p.model_w > 0.0 && p.settings_w == 0.0);
+        // 380px 窗：空档 122px ⇒ 模型连 88px 都挤不出，会话 + ⚙（116px）放得下。
+        let q = titlebar_plan(380.0, true);
         assert_eq!(
             (q.session_w, q.model_w, q.settings_w),
-            (TB_SESSION_W, 0.0, 0.0)
+            (TB_SESSION_W, 0.0, TB_SETTINGS_W)
         );
-        // 连会话 chip 都放不下的极窄窗：整条不画（x < 0）。
-        let tiny = titlebar_plan(300.0, true);
+        // 连会话 chip 都放不下的极窄窗（340px：空档 82 < 84）：整条不画（x < 0）——
+        // 会话/模型/⚙ 三项全部转到状态行（`.slint` 的 D2 回退位）。
+        let tiny = titlebar_plan(340.0, true);
         assert!(
             tiny.x < 0.0 && tiny.session_w == 0.0 && tiny.model_w == 0.0 && tiny.settings_w == 0.0
         );
@@ -2731,10 +2738,10 @@ mod tests {
             (p.session_w, p.model_w, p.settings_w),
             (TB_SESSION_W, 0.0, TB_SETTINGS_W)
         );
-        let buttons_left = SYSCHAT_PREFERRED_WIDTH - TB_BTN_RIGHT_PAD - 2.0 * TB_BTN_W - TB_BTN_GAP;
+        let zone_left = SYSCHAT_PREFERRED_WIDTH - 4.0 - TB_BTN_ZONE_W;
         assert_eq!(
             p.x + TB_SESSION_W + TB_ITEM_GAP + TB_SETTINGS_W,
-            buttons_left - TB_STRIP_GAP
+            zone_left - TB_STRIP_GAP
         );
     }
 

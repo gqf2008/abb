@@ -276,20 +276,210 @@ fn titlebar_strip_does_not_overlap_title_or_buttons() {
         "控件条左缘 {strip_x} 与标题文字右缘 {title_right} 只隔 {}px：压到标题了",
         strip_x - title_right
     );
-    // 控件条整体不越过最左那颗窗口按钮（x = W - 4 - 30 - 6 - 30 = 390）
-    let strip_right = strip_x
+    // 控件条右缘：按**实际画出来的**项宽 + 项间距算（D2 起 460px 下 ③⚙ 会让位到状态行，
+    // 所以不能再用「三项都在」的固定 +12 去量）。
+    let items: Vec<(f32, &str)> = [
+        (ui.get_titlebar_session_w(), "①会话"),
+        (ui.get_titlebar_model_w(), "②模型"),
+        (ui.get_titlebar_settings_w(), "③⚙"),
+    ]
+    .into_iter()
+    .filter(|(w, _)| *w > 0.0)
+    .collect();
+    let strip_right = items.iter().map(|(w, _)| *w).sum::<f32>().round() as u32
+        + strip_x
+        + 6 * (items.len().saturating_sub(1)) as u32;
+    // 右侧边界 = **整个按钮区**左缘（W − 4 − 106）− 8
+    let zone_left = W - 4 - 106;
+    assert!(
+        strip_right <= zone_left - 8 + 2,
+        "控件条右缘 {strip_right} 越过了按钮区左侧（应 ≤ {}）",
+        zone_left - 8
+    );
+    // 正面控制：**每一个画出来的**项都得有墨迹（少画一个就是空壳）。
+    let mut cursor = strip_x;
+    for (w, name) in &items {
+        let w = w.round() as u32;
+        let ink = (cursor..cursor + w).any(|x| (6..32).any(|y| is_dark(f.px(x, y))));
+        assert!(ink, "{name}（{w}px 格）里没有任何墨迹 ⇒ 空壳");
+        cursor += w + 6;
+    }
+}
+
+/// 宽到三件套都放得下时（500px），③⚙ 必须**在标题栏里**且真有墨迹（Path 手绘齿轮）。
+/// 460px（默认）下它让位到状态行 —— 两条一起把「让位口径」与「齿轮画得出来」都钉住。
+#[test]
+fn titlebar_gear_renders_when_it_fits() {
+    const WIDE: u32 = 500;
+    let (ui, win, _) = setup(vec![row("p", "占位")], SHORT_H);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-chat"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(WIDE, SHORT_H));
+    super::apply_syschat_layout(&ui, WIDE as f32);
+    assert!(
+        ui.get_titlebar_settings_w() > 0.0,
+        "500px 下 ③⚙ 应留在标题栏（settings_w={}）",
+        ui.get_titlebar_settings_w()
+    );
+    slint::platform::update_timers_and_animations();
+    let mut buf = vec![PremultipliedRgbaColor::default(); (WIDE * SHORT_H) as usize];
+    win.request_redraw();
+    win.draw_if_needed(|r| {
+        r.render(&mut buf, WIDE as usize);
+    });
+    let f = Frame {
+        buf,
+        w: WIDE,
+        h: SHORT_H,
+    };
+    let right = ui.get_titlebar_strip_x().round() as u32
         + ui.get_titlebar_session_w().round() as u32
         + ui.get_titlebar_model_w().round() as u32
         + ui.get_titlebar_settings_w().round() as u32
-        + 12; // 两项间距 6px ×2（三项都在时）
+        + 12;
+    let gear_left = right - ui.get_titlebar_settings_w().round() as u32;
     assert!(
-        strip_right <= W - 4 - 30 - 6 - 30 - 8 + 2,
-        "控件条右缘 {strip_right} 越过了窗口按钮组左侧（应 ≤ {}）",
-        W - 4 - 30 - 6 - 30 - 8
+        (gear_left..right).any(|x| (6..32).any(|y| is_dark(f.px(x, y)))),
+        "③⚙ 那一格没有墨迹（齿轮没画出来）"
     );
-    // 正面控制：③⚙ 那一格必须真有墨迹（Path 手绘的齿轮画出来了；渲染后端没有 path 支持时
-    // 这里会红——那样 ⚙ 在真机上也看不见，是必须先解决的问题而不是放行）。
-    let gear_left = strip_right - ui.get_titlebar_settings_w().round() as u32;
-    let gear_ink = (gear_left..strip_right).any(|x| (6..32).any(|y| is_dark(f.px(x, y))));
-    assert!(gear_ink, "③⚙ 按钮那一格没有任何墨迹（齿轮没画出来）");
+}
+
+/// **对稿/评审出图**（默认 `#[ignore]`：不进四门禁的常规轮）。
+///
+/// 为什么需要它：对稿如果只靠真机截图，同一份代码在不同窗口位置/缩放/滚动相位下会出不同的图，
+/// 没法当基准；这里用无头软件渲染把**真实的** `SystemChatWindow` 渲成 PNG，同样输入 ⇒ 同样像素。
+/// 出图落在 `/Volumes/DataExt/tmp/syschat-shots/`（**不写**工作区，也不碰真实 `~/Library`）。
+///
+/// 跑法：`bash tools/check_test_isolation.sh --bin agent-bridge -- --ignored dump_frames`
+#[test]
+#[ignore = "出图用；默认不跑（不进四门禁的常规轮）"]
+fn dump_frames_for_review() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+
+    let (ui, win, _model) = setup(fixture(), SHORT_H);
+    // 标题栏 ①②③ 只在有候选时才渲染 ⇒ 出图必须把候选灌上，否则量不到真实落位。
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+        slint::SharedString::from("上周的排查"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-chat"),
+        slint::SharedString::from("claude-sonnet-4.6"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    // 标题栏落位是 Rust 侧算出来再写属性的（`apply_syschat_layout`）——出图必须走同一条路，
+    // 否则 `titlebar-strip-x` 停在初值、①②③ 一个都不渲染（这正是「无头出图保真」的意义）。
+    apply_syschat_layout(&ui, W as f32);
+    let f = settle(&ui, &win, SHORT_H);
+    write_png(&f, &dir.join("short.png"));
+    // 滚到底（滞底）——owner 截图里出问题的那种状态。
+    ui.set_scroll_epoch(1);
+    let f = settle(&ui, &win, SHORT_H);
+    write_png(&f, &dir.join("bottom.png"));
+
+    // 「正在输入 + ⏹ 停止」这一行（E1）也要能对稿。
+    ui.set_busy(true);
+    let f = settle(&ui, &win, SHORT_H);
+    write_png(&f, &dir.join("busy.png"));
+
+    // 附件行（3+N chips，D 批）：四条待发 ⇒ 只显示 3 个 + `+1`。
+    ui.set_pending_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        PendingAttachRow {
+            index: 0,
+            name: "构思图.png".into(),
+            is_image: true,
+            thumb: slint::Image::default(),
+            thumb_ok: false,
+            ext: "PNG".into(),
+        },
+        PendingAttachRow {
+            index: 1,
+            name: "演示.mov".into(),
+            is_image: false,
+            thumb: slint::Image::default(),
+            thumb_ok: false,
+            ext: "MOV".into(),
+        },
+        PendingAttachRow {
+            index: 2,
+            name: "设计规范.pdf".into(),
+            is_image: false,
+            thumb: slint::Image::default(),
+            thumb_ok: false,
+            ext: "PDF".into(),
+        },
+    ]))));
+    ui.set_attach_count(4);
+    ui.set_pending_more(1);
+    ui.set_pending_more_text("+1".into());
+    let f = settle(&ui, &win, SHORT_H);
+    write_png(&f, &dir.join("attachments.png"));
+}
+
+/// 预乘 RGBA → 直通 RGBA8 并补白底（窗口本身透明：`rgb + (255 - a)` 等价于铺白）。
+fn write_png(f: &Frame, path: &std::path::Path) {
+    let mut img = image::RgbaImage::new(f.w, f.h);
+    for y in 0..f.h {
+        for x in 0..f.w {
+            let p = f.px(x, y);
+            let add = 255u32 - p.alpha as u32;
+            img.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (p.red as u32 + add).min(255) as u8,
+                    (p.green as u32 + add).min(255) as u8,
+                    (p.blue as u32 + add).min(255) as u8,
+                    255,
+                ]),
+            );
+        }
+    }
+    img.save(path).expect("写 PNG 失败");
+}
+
+/// 窄窗（340px，最小宽）出图：验「①②③ 不与窗口按钮相撞、且不放空壳」——
+/// 这是真机 340px 实测出问题的那个宽度。出 `narrow340.png`。
+#[test]
+#[ignore = "出图用；默认不跑"]
+fn dump_narrow_for_review() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    const NW: u32 = 340;
+    let (ui, win, _m) = setup(fixture(), 500);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+        slint::SharedString::from("上周的排查"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-chat"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(NW, 500));
+    apply_syschat_layout(&ui, NW as f32);
+    slint::platform::update_timers_and_animations();
+    let mut buf = vec![PremultipliedRgbaColor::default(); (NW * 500) as usize];
+    win.request_redraw();
+    win.draw_if_needed(|r| {
+        r.render(&mut buf, NW as usize);
+    });
+    let f = Frame { buf, w: NW, h: 500 };
+    write_png(&f, &dir.join("narrow340.png"));
+    println!(
+        "340px: strip_x={} session={} model={} settings={}",
+        ui.get_titlebar_strip_x(),
+        ui.get_titlebar_session_w(),
+        ui.get_titlebar_model_w(),
+        ui.get_titlebar_settings_w()
+    );
 }
