@@ -79,3 +79,13 @@ env_allow = [
   "RUSTC_WRAPPER",
   "CARGO_TARGET_DIR",
 ]
+
+# 「审查收敛」守卫的自测：自带样本、不依赖 walgit/网络。守卫本身也会失效，必须能在故意
+# 违规的样本上变红（tools/review-cadence/samples/bad_*.json）。契约与判据见
+# docs/review-findings-contract.md；合并前的逐 thread 检查由协调者跑 tools/check_review_cadence.sh <thread-id>。
+[[task]]
+name = "review-cadence-selftest"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "sh -c 'tools/review-cadence/selftest.sh'"
+timeout = "5m"
+env_allow = []

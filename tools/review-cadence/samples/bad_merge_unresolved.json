@@ -1,0 +1,49 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "x",
+        "body": "y"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-1",
+      "ts": 1000001,
+      "body": {
+        "decision": "request_changes",
+        "agent": "abb-reviewer-1",
+        "note": "findings: blocking=1 non-blocking=1\n\n- [blocking] 空指针\n- [non-blocking] 命名"
+      }
+    },
+    "oid": "r1",
+    "principal": "abb-reviewer-1",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "merge_result",
+      "id": "t",
+      "actor": "abb-coordinator",
+      "ts": 1000002,
+      "body": {
+        "merged": true,
+        "oid": "abc",
+        "result": "merged"
+      }
+    },
+    "oid": "m1",
+    "principal": "abb-coordinator",
+    "verified": true
+  }
+]

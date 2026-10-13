@@ -1,0 +1,33 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "x",
+        "body": "y"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-1",
+      "ts": 1000001,
+      "body": {
+        "decision": "approve",
+        "agent": "abb-reviewer-1",
+        "note": "findings: blocking=1 non-blocking=0\n\n- [blocking] 空指针"
+      }
+    },
+    "oid": "r1",
+    "principal": "abb-reviewer-1",
+    "verified": true
+  }
+]
