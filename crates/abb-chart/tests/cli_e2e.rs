@@ -238,6 +238,67 @@ fn unit_symbols_in_labels_never_silently_render_as_boxes() {
     }
 }
 
+/// **安全回归钉子（阻塞级，端到端）**：规格文件里的相对 `data` 不得跑出规格所在目录。
+///
+/// 攻击形态（受限/授权者会话可达）：guard 只校验 `--spec` 这个**文件本身**在工作区内，
+/// 看不到规格**内容**。于是工作区内的 `spec.json` 写 `"data": "../secret.csv"`
+/// 就能读到工作区外的文件并把内容画进图里——实测确实成立（图里张榜着外部文件的内容）。
+/// 本测试就是那条攻击的钉子。
+#[test]
+fn spec_data_cannot_escape_its_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = root.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    // 工作区外的“秘密”文件
+    std::fs::write(root.path().join("secret.csv"), "k,v\nS3CR3T,1\n").unwrap();
+    // 工作区内的规格，试图穿越出去
+    let spec = ws.join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"mark":"bar","x":"k","y":"v","data":"../secret.csv","types":{"k":"category"}}"#,
+    )
+    .unwrap();
+
+    let out = ws.join("leak.png");
+    let r = run(&[
+        "render",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(r.code, 1, "必须拒绝，stderr={}", r.stderr);
+    assert!(
+        r.stderr.contains("基准目录之外") || r.stderr.contains("解析失败"),
+        "要说明是路径越界/解析失败：{}",
+        r.stderr
+    );
+    assert!(!out.exists(), "越界时不该产出任何文件");
+}
+
+/// 同一目录内的相对路径仍然正常（别把合法用法一起拒了）。
+#[test]
+fn spec_data_within_its_directory_is_still_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("d.csv"), "k,v\na,1\nb,2\n").unwrap();
+    let spec = dir.path().join("s.json");
+    std::fs::write(
+        &spec,
+        r#"{"mark":"bar","x":"k","y":"v","data":"d.csv","types":{"k":"category"}}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("o.png");
+    let r = run(&[
+        "render",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(out.is_file());
+}
+
 /// 缺省 `--out`：落在**规格文件同目录**（而不是 CWD）——受限会话里 CWD 不一定在
 /// 工作区内，而产物必须在工作区内才能 `deliver --file` 发出去。
 #[test]

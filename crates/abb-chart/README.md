@@ -47,8 +47,14 @@ abb-chart render --spec spec.json [--out chart.png] [--data d.csv]
 - `mark`：`point` / `line` / `bar` / `area` / `hist` / `density` / `box` / `violin` /
   `errorbar` / `rule` / `text`（也认 `scatter` / `column` / `histogram` / `kde` / `boxplot` /
   `hline` 等别名）。
-- 数据来源三选一：规格里的 `data`（CSV，相对路径按规格文件所在目录解析）、规格里的 `rows`
-  （内联 JSON 数组）、命令行的 `--data`。
+- 数据来源三选一：规格里的 `data`（CSV）、规格里的 `rows`（内联 JSON 数组）、命令行的 `--data`。
+- **路径束缚（安全边界，改动前请读）**：相对路径**不许跑出它的基准目录**——
+  规格内的 `data` 以**规格文件所在目录**为基准，命令行的 `--data` 以**CWD** 为基准。
+  越界（含经由符号链接）一律拒绝；**绝对路径照常可用**（受限会话的工作区外绝对路径由
+  `guard` 把关）。原因：受限（授权者）会话的 guard 只能看到命令行，看不到规格文件**内容**，
+  没有这条束缚时工作区内的 `spec.json` 写 `"data": "../secret.csv"` 就能把工作区外的文件
+  内容画进图里（实测过的洞，见 `spec.rs::resolve_confined` 与 e2e
+  `spec_data_cannot_escape_its_directory`）。
 - 列类型自动推断（非空值全是数字 ⇒ 数值列）；`types` 可显式覆盖。
 - 入口文件名 `abb-chart` 保持中性（不叫 `chart`：PATH 上太泛），由桥转发时补上语义。
 

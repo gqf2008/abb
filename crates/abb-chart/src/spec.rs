@@ -192,18 +192,24 @@ fn apply_theme(
 ///
 /// `--data` 放在 `rows` 之前是有意的：命令行参数是「更晚、更明确」的意图，
 /// 给了它就该压过规格里写死的任何数据源（与 `--font` 压过 `font` 同一口径）。
+///
+/// 两者的**基准目录不同**（也是有意）：
+/// - 命令行 `--data` 是「你现在在哪」，基准 = **CWD**（与 `--out` 同口径，也与受限会话
+///   的 guard 用工作区作基准一致）；
+/// - 规格内的 `data` 是「这个规格自己的配套数据」，基准 = **规格文件所在目录**。
 fn load_table(
     spec: &Spec,
     opts: &RenderOptions,
     spec_dir: Option<&Path>,
 ) -> Result<Table, RenderError> {
+    let cwd = std::env::current_dir().map_err(|e| RenderError(format!("取当前目录失败：{e}")))?;
     if let Some(data) = opts
         .data_override
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return table_from_csv_file(data, spec_dir);
+        return table_from_csv_file(data, &cwd, "--data");
     }
     if let Some(rows) = &spec.rows {
         return table_from_json_rows(rows).map_err(RenderError);
@@ -218,30 +224,70 @@ fn load_table(
             "规格里没有数据：给 `data`（CSV 文件路径）或 `rows`（内联数组）之一".into(),
         ));
     };
-    table_from_csv_file(data, spec_dir)
+    // stdin 输入时没有规格文件目录 ⇒ 退到 CWD（此时 `--spec -` 本身就意味着「用管道」，
+    // 而受限会话到不了这里，见 guard 对 `split_shell` 的拒绝）。
+    let base = spec_dir.map(Path::to_path_buf).unwrap_or(cwd);
+    table_from_csv_file(data, &base, "data")
 }
 
-/// 读一个 CSV 文件并装载（相对路径按规格文件目录解析）。
-fn table_from_csv_file(data: &str, spec_dir: Option<&Path>) -> Result<Table, RenderError> {
-    let path = resolve_data_path(data, spec_dir);
+/// 读一个 CSV 文件并装载。`base` 是相对路径的基准目录；相对路径**不许跑出 `base`**。
+fn table_from_csv_file(data: &str, base: &Path, what: &str) -> Result<Table, RenderError> {
+    let path = resolve_confined(data, base, what)?;
     let text = std::fs::read_to_string(&path).map_err(|e| {
         RenderError(format!(
-            "数据文件读取失败：{}（{e}）。`data`/`--data` 的相对路径按规格文件所在目录解析。",
-            path.display()
+            "数据文件读取失败：{}（{e}）。`{what}` 的相对路径以 {} 为基准。",
+            path.display(),
+            base.display()
         ))
     })?;
     table_from_csv(&text).map_err(RenderError)
 }
 
-/// `data` 路径解析：绝对路径原样用；相对路径先相对规格文件目录（stdin 时相对 CWD）。
-pub fn resolve_data_path(data: &str, spec_dir: Option<&Path>) -> PathBuf {
-    let p = Path::new(data);
+/// 相对路径的解析 + **束缚**：相对路径不许跑出它的基准目录。
+///
+/// ## 为什么必须束缚（安全洞，实测过，不要在没读到这段的情况下放宽）
+///
+/// 受限（授权者）会话的守卫只能看到**命令行**：它校验 `--spec` 这个**文件本身**在工作区内，
+/// 但看不到规格文件**内容**里写的 `data`。之前的实现把 `data` 相对规格文件目录解析、
+/// 且不禁止 `..`，于是工作区内的 `spec.json` 写 `"data": "../secret.csv"` 就能
+/// **读到工作区外的文件并把内容画进图里**——实测：受限会话用这条路径拿到了一张图，
+/// 图里张榜着工作区外文件的内容（分类轴刻度就是那些内容）。
+/// 这与 `deliver --file` 是同一类边界（#254）：必须由**解析路径的这一方**兜住，
+/// 因为闸门看不到文件内容。
+///
+/// ## 规则（一条，好解释）
+///
+/// **相对路径不许跑出基准目录**；**绝对路径原样放行**，交给上层闸门——受限会话的 guard
+/// 会拒绝工作区外的绝对路径，而 owner 本就有全权限（“从 /data 读一份公共数据集”
+/// 这种需求仍然能写绝对路径完成，没有被拿掉任何能力）。
+///
+/// 判定用 `canonicalize` 而不是字符串比较：**符号链接也拦得住**（工作区内建一个指向外部的
+/// 软链同样不能读）。文件不存在时 `canonicalize` 会失败，此时按读取错误上报（不静默）。
+pub fn resolve_confined(raw: &str, base: &Path, what: &str) -> Result<PathBuf, RenderError> {
+    let p = Path::new(raw);
     if p.is_absolute() {
-        return p.to_path_buf();
+        return Ok(p.to_path_buf());
     }
-    match spec_dir {
-        Some(dir) => dir.join(p),
-        None => p.to_path_buf(),
+    let base_real = std::fs::canonicalize(base)
+        .map_err(|e| RenderError(format!("基准目录不可用（{}）：{e}", base.display())))?;
+    let joined = base_real.join(p);
+    match std::fs::canonicalize(&joined) {
+        // 存在且在自己的基准目录里 ⇒ 放行。
+        Ok(real) if real.starts_with(&base_real) => Ok(real),
+        // 存在但跑出去了 ⇒ 拒绝（含经由符号链接的逃逸）。
+        Ok(real) => Err(RenderError(format!(
+            "`{what}` 指向基准目录之外（已拒绝）：{raw} ⇒ {}（基准：{}）。\
+             相对路径不得跑出基准目录；确实要读别处的数据，请写**绝对路径**\
+             （受限会话只允许工作区内的绝对路径）。",
+            real.display(),
+            base_real.display()
+        ))),
+        // 不存在：按文件读取错误上报（不静默、也不把它当成“不在基准内”误导排查）。
+        Err(e) => Err(RenderError(format!(
+            "`{what}` 解析失败：{}（{e}）。相对路径以 {} 为基准，且不得跑出该目录。",
+            joined.display(),
+            base_real.display()
+        ))),
     }
 }
 
@@ -362,12 +408,78 @@ mod tests {
         assert!(err.0.contains("neon"), "{err}");
     }
 
+    /// 相对路径以基准目录解析（正常路径正常放行）。
     #[test]
-    fn data_path_resolution_prefers_spec_dir() {
-        let p = resolve_data_path("d.csv", Some(Path::new("/spec/dir")));
-        assert_eq!(p, PathBuf::from("/spec/dir/d.csv"));
-        let abs = resolve_data_path("/tmp/d.csv", Some(Path::new("/spec/dir")));
-        assert_eq!(abs, PathBuf::from("/tmp/d.csv"));
+    fn relative_path_is_resolved_against_the_base() {
+        let dir = std::env::temp_dir().join(format!("abb-chart-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("d.csv"), "a,b\n1,2\n").unwrap();
+        let got = resolve_confined("d.csv", &dir, "--data").unwrap();
+        assert_eq!(got, std::fs::canonicalize(dir.join("d.csv")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **安全回归钉子（阻塞级）**：相对路径跑出基准目录必须被拒。
+    ///
+    /// 实测过的洞：受限（授权者）会话的守卫只看命令行、看不到规格文件**内容**，
+    /// 于是工作区内的 `spec.json` 写 `"data": "../secret.csv"` 就能读到工作区外的文件
+    /// 并把内容画进图里（实测图里张榜着外部文件的内容）。这条断言就是那个洞的钉子。
+    /// 判别力：把 `resolve_confined` 里的 `starts_with` 校验删掉 ⇒ 本测试红。
+    #[test]
+    fn relative_path_escaping_the_base_is_rejected() {
+        let root = std::env::temp_dir().join(format!("abb-chart-esc-{}", std::process::id()));
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(root.join("secret.csv"), "a\n1\n").unwrap();
+
+        let err = resolve_confined("../secret.csv", &ws, "data").unwrap_err();
+        assert!(err.0.contains("基准目录之外"), "{err}");
+        assert!(err.0.contains("../secret.csv"), "要说清是哪个值：{err}");
+    }
+
+    /// 绝对路径原样放行（能力没被拿掉：owner 仍可读别处的数据；
+    /// 受限会话的绝对路径由 guard 把关）。
+    #[test]
+    fn absolute_path_passes_through() {
+        let got = resolve_confined("/etc/hosts", Path::new("/tmp"), "data").unwrap();
+        assert_eq!(got, PathBuf::from("/etc/hosts"));
+    }
+
+    /// 用**符号链接**逃逸同样要被拦住（字符串前缀比较拦不住这种，故实现用 canonicalize）。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_the_base_is_rejected() {
+        let root = std::env::temp_dir().join(format!("abb-chart-link-{}", std::process::id()));
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(root.join("secret.csv"), "a\n1\n").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.csv"), ws.join("link.csv")).unwrap();
+
+        let err = resolve_confined("link.csv", &ws, "data").unwrap_err();
+        assert!(err.0.contains("基准目录之外"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `a/../b` 这种**没跑出去**的相对路径要正常放行（别把合法写法一起拒了）。
+    #[test]
+    fn relative_path_with_inner_dotdot_is_allowed_when_it_stays_inside() {
+        let dir = std::env::temp_dir().join(format!("abb-chart-inner-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("d.csv"), "a,b\n1,2\n").unwrap();
+        let got = resolve_confined("sub/../d.csv", &dir, "data").unwrap();
+        assert!(got.ends_with("d.csv"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件不存在时给的是「读取/解析失败」，不是「跑出基准目录」——别把排查方向指错。
+    #[test]
+    fn missing_file_reports_resolution_failure_not_escape() {
+        let dir = std::env::temp_dir().join(format!("abb-chart-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = resolve_confined("nope.csv", &dir, "data").unwrap_err();
+        assert!(err.0.contains("解析失败"), "{err}");
+        assert!(!err.0.contains("基准目录之外"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 图上会出现的字符要**收全**：标题、轴标题、列名、分类值。

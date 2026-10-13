@@ -792,6 +792,16 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
 /// 参数都查**，而 `abb-chart` 对未知参数是硬错（exit 2）——于是不存在「用我们没查的参数
 /// 去读写文件」的路子。
 ///
+/// ## 本函数**管不到**的那一半：规格文件内容里的路径（已由 abb-chart 兜住）
+///
+/// 本函数只能看到**命令行**。规格 JSON 里的 `data` 是一个**文件内容中的路径**——这里读不到、
+/// 也不该为了它去解析 JSON（那会引入 schema 双份真相）。这个洞曾真实存在：工作区内的
+/// `spec.json` 写 `"data": "../secret.csv"` 就能读到工作区外文件并把内容画进图里
+/// （card `abb-chart-cli-20261013` 评审发现）。
+/// 收口在**解析路径的那一方**：`abb-chart` 现在要求相对路径不得跑出基准目录
+/// （规格内 `data` 的基准 = 规格所在目录；符号链接逃逸也拦），见
+/// `crates/abb-chart/src/spec.rs::resolve_confined`。绝对路径仍放行给本函数的判据处理。
+///
 /// 判据与 `deliver --file` 一致：用 [`canonical_in_workspace`]（`~`/`$` 展开形态一律拒，
 /// 防越过校验；不存在的输出文件按父目录校验）。
 fn check_chart_args(rest: &[String], workspace: &Path) -> Decision {
@@ -1739,6 +1749,15 @@ mod tests {
         // 的管道拒绝（见 bash_whitelist 的 split_shell 组）。此处只钉住判据本身。
         assert_eq!(
             decide(r#"$ABB_BIN chart render --spec - --out chart.png"#),
+            Decision::Allow
+        );
+
+        // **本闸的已知边界**（不是缺陷，是分工）：规格**文件内容**里的相对路径这里看不到，
+        // 由 abb-chart 自己兜（`spec.rs::resolve_confined`：相对路径不得跑出基准目录）。
+        // 这条断言把「我们不会再为此扩权」的意图钉住：工作区内的 spec 一律放行，
+        // 越界与否交给 abb-chart 的解析层——否则两边会各有一套 JSON 解析规则。
+        assert_eq!(
+            decide(r#"$ABB_BIN chart render --spec spec.json --out chart.png"#),
             Decision::Allow
         );
         // git 只读：状态/差异放行；历史读（log/show/blame，可读已删文件旧版本）拒绝
