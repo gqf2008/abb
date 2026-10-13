@@ -102,6 +102,8 @@ abb-chart render —— 渲染一张图
   title   图标题
   x / y   列名（hist/density 只需 x；rule 只需 y）
   color   分组着色列名
+  y2      区间上界列名（`errorbar` 必填；只给 y 会只画一个点、没有误差棒）
+  text    标注文字列名（`text` mark 必填；不给会画出空标签）
   data    CSV 文件路径（相对规格文件所在目录）；或改用 rows 给内联数据
   rows    内联数据：[{\"列名\": 值}, …]
   types   列类型覆盖：{\"列名\": \"number\"|\"category\"}。名义型数字（年份/月份/编号）

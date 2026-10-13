@@ -41,8 +41,9 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 // v15：改掉那一节里的示例——原先写的是 `cat > spec.json <<'EOF' …`（heredoc + 重定向 + 多行），
 //   而受限（授权者）会话的 guard 对 `>`/`<`/`|`/换行一律拒绝（`split_shell` 的硬拒绝表），
 //   照抄那段在受限会话里 100% 失败；改为「用写文件工具写 spec + 两条单行命令」。
+// v16：`mark` 速查补上 errorbar 要 `y2`、text 要 `text` 两条硬约束（缺了会报错）。
 // 内容变了就必须升版本号：存量工作区的指引不会被覆盖（幂等判据是「不含当前 marker」）。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v15";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v16";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -188,7 +189,8 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - **尺寸别开太大**：`--width`/`--height` 就是最终像素数，默认 1000×600 够聊天看图；
   上千像素见方的大图在三平台上都可能撞图片体积上限（飞书图片 10MB）而发送失败。
 - **`mark` 可选**：`point`（散点）/`line`（折线）/`bar`（柱状）/`area`/`hist`（直方图）/
-  `density`（密度）/`box`/`violin`/`errorbar`/`rule`（参考线）/`text`；也认 `scatter`/`column` 这类别名。
+  `density`（密度）/`box`/`violin`/`errorbar`（误差棒）/`rule`（参考线）/`text`（数据标注）；也认 `scatter`/`column` 这类别名。
+  `errorbar` 要另给 `\"y2\"`（区间上界列）、`text` 要另给 `\"text\"`（标注列名）——缺了会直接报错，不会给你一张错图。
 - **数据源**：CSV 文件（`\"data\": \"x.csv\"`，相对路径按规格文件所在目录解析）或内联
   `\"rows\": [{{\"列\": 值}}, …]`；也可以命令行给 `--data x.csv`。列类型自动推断（非空值全是数字 = 数值列）。
 - **名义型数字要用柱状图时必须声明分类**：年份/月份/编号这类「看着是数字、实际是分类」的列，写

@@ -46,7 +46,8 @@ abb-chart render --spec spec.json [--out chart.png] [--data d.csv]
 
 - `mark`：`point` / `line` / `bar` / `area` / `hist` / `density` / `box` / `violin` /
   `errorbar` / `rule` / `text`（也认 `scatter` / `column` / `histogram` / `kde` / `boxplot` /
-  `hline` 等别名）。
+  `hline` 等别名）。后两个需要额外通道（`y2` / `text`），见上表——**缺了会硬错**，因为
+  「能画出来但内容没意义」（没有误差棒的 errorbar、空标签的 text）是最坏的失败模式。
 - 数据来源三选一：规格里的 `data`（CSV）、规格里的 `rows`（内联 JSON 数组）、命令行的 `--data`。
   三者优先级：`--data` > `data` > `rows`；**`data` 与 `rows` 同时给出是硬错**（不静默挑一个）。
 - **路径安全边界（改动前必读，这里踩过两个阻塞级洞）**：
@@ -74,7 +75,9 @@ abb-chart render --spec spec.json [--out chart.png] [--data d.csv]
 | `hist` | `x` = 要统计的列；`y` 由渲染器生成（固定叫 `count`，**数据里没有这一列**） |
 | `density` | 只要 `x`（密度生成到 y） |
 | `violin` | 只要 `y`（x 由 recipe 生成） |
-| `box` / `rule` / `errorbar` | `x` 与 `y` 都要 |
+| `box` / `rule` | `x` 与 `y` 都要 |
+| `errorbar` | `x`、`y` **与 `y2`**（区间上界；只给 `y` 会只画一个点、没有误差棒 ⇒ 硬错） |
+| `text` | `x`、`y` 与 **`text`**（要标注的那一列；不给会画出空标签 ⇒ 硬错） |
 | 其余（`point`/`line`/`bar`/`area`/`text`） | `x` 与 `y` 都要 |
 
 `box`/`violin`/`bar` 的 `x` 是**分组轴**，必须是分类列：名义型数字（年份/月份/编号）要用

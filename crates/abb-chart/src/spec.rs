@@ -61,6 +61,10 @@ pub struct Spec {
     pub y: Option<String>,
     /// 分组/着色列名。
     pub color: Option<String>,
+    /// 区间上界列名（`errorbar` / 蜡烛图类 mark 用它给出范围；缺了会静默只画一个点）。
+    pub y2: Option<String>,
+    /// 标注文字列名（`text` mark 画的就是这一列的值；缺了会画出空标签）。
+    pub text: Option<String>,
     /// 外部数据文件（CSV）；相对规格文件所在目录解析。
     pub data: Option<String>,
     /// 内联数据：`[{"列名": 值}, …]`。
@@ -414,6 +418,15 @@ fn spec_required_chars(spec: &Spec, table: &Table) -> Vec<char> {
     .flatten()
     {
         push(text);
+    }
+    // `text` mark 画的是该列**值**（已在下面按单元格收集），
+    // `y2`/`text` 的**列名**本身也会作为轴/图例文字出现吗？不会——但列名可能是默认轴标题，
+    // 保险起见一并收集（多收集只会让判据更严，不会漏方框）。
+    for name in [spec.y2.as_deref(), spec.text.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        push(name);
     }
     for name in &table.columns {
         push(name);

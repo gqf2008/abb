@@ -119,6 +119,31 @@ pub fn build(spec: &Spec, ds: Dataset, size: (u32, u32)) -> Result<LayeredChart,
         }
     }
 
+    // `errorbar` 只给 `y` 会**静默只画一个点**（实测：没有任何误差棒，图看着像坏了）；
+    // `text` 不给文字列会画出**空标签**（实测：三个空串）。这两种「画得出来但没意义」的
+    // 组合必须硬错——本功能最容易的失败模式就是“出了张图，内容是错的”。
+    if mark == "errorbar" && spec.y2.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        return Err(
+            "mark `errorbar` 需要 `y2`（区间上界列）：只给 `y` 会只画一个点、没有误差棒。\n\
+             例如数据有 `均值`/`下界`/`上界` 三列时写 \"y\": \"均值\", \"y2\": \"上界\"；\n\
+             若下界与上界是两列（没有单个上界列），请改用 `rule` 或先把区间整理成 y/y2 两列。"
+                .into(),
+        );
+    }
+    if mark == "text"
+        && spec
+            .text
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        return Err(
+            "mark `text` 需要 `text`（要标注的那一列列名）：不给会画出空标签。\n\
+             例如 \"text\": \"名称\" 会把该列的值写在 (x, y) 位置上。"
+                .into(),
+        );
+    }
+
     // 分组轴必须是离散列的图种：提前给出可操作的提示，别把 charton 的原文
     // （"expects [Discrete] scale for channel X, but found Linear"）抛给模型——
     // 它不知道「离散」对应规格里的哪个开关。
@@ -163,6 +188,24 @@ pub fn build(spec: &Spec, ds: Dataset, size: (u32, u32)) -> Result<LayeredChart,
             .map_err(|e| format!("编码失败（y/{y_col}）：{e}"))?,
         (None, None, _) => return Err("规格既没有 x 也没有 y，没有可画的通道".into()),
     };
+
+    // `y2` / `text` 用**链式 encode** 补上（charton 的 `IntoEncoding::apply` 是合并语义：
+    // 每次只设自己的通道，所以多次调用可以叠加，不必把它们塞进巨大的元组组合里）。
+    if let Some(y2) = spec.y2.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        base = base
+            .encode((alt::y2(y2),))
+            .map_err(|e| format!("编码失败（y2/{y2}）：{e}"))?;
+    }
+    if let Some(text) = spec
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        base = base
+            .encode((alt::text(text),))
+            .map_err(|e| format!("编码失败（text/{text}）：{e}"))?;
+    }
 
     // mark：每个分支返回不同的 `Chart<Mark…>`，各自立刻收敛成 `LayeredChart` 以便统一。
     let title = spec.title.clone().unwrap_or_default();
@@ -345,6 +388,34 @@ mod tests {
         let ds = crate::data::table_to_dataset(&t, &Default::default()).unwrap();
         if let Err(e) = build_sized(&spec("violin", None, Some("v")), ds) {
             panic!("violin 只需 y，却失败：{e}");
+        }
+    }
+
+    /// **实测过的两个「画得出来但没意义」的组合必须硬错**：
+    /// `errorbar` 缺 `y2` ⇒ 只画一个点、没有误差棒；`text` 缺文字列 ⇒ 三个空标签。
+    /// 判别力：删掉对应检查 ⇒ 这两条红。
+    #[test]
+    fn errorbar_without_range_and_text_without_column_are_hard_errors() {
+        let t = crate::data::table_from_csv("k,v,l\na,1,甲\nb,2,乙\n").unwrap();
+        let ds = || crate::data::table_to_dataset(&t, &Default::default()).unwrap();
+
+        let err = err_of(build_sized(&spec("errorbar", Some("k"), Some("v")), ds()));
+        assert!(err.contains("y2"), "errorbar 缺 y2 要指明：{err}");
+
+        // 给了 y2 就能建图
+        let mut with_y2 = spec("errorbar", Some("k"), Some("v"));
+        with_y2.y2 = Some("v".into());
+        if let Err(e) = build_sized(&with_y2, ds()) {
+            panic!("errorbar 给全 y/y2 应能建图：{e}");
+        }
+
+        let err = err_of(build_sized(&spec("text", Some("k"), Some("v")), ds()));
+        assert!(err.contains("text"), "text mark 缺文字列要指明：{err}");
+
+        let mut with_text = spec("text", Some("k"), Some("v"));
+        with_text.text = Some("l".into());
+        if let Err(e) = build_sized(&with_text, ds()) {
+            panic!("text mark 给全通道应能建图：{e}");
         }
     }
 
