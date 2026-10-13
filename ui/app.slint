@@ -34,6 +34,8 @@ export global UiTokens {
     in property <color> warn-bg: PixelTheme.scheme == "dark" ? #33280a : #fff8e6;    // 待处理卡底色
     in property <color> banner-bg: PixelTheme.scheme == "dark" ? #332b0a : #fff3cd;  // 环境横幅底色
     in property <color> error-bg: PixelTheme.scheme == "dark" ? #3a1212 : #fff1f0;   // 安装失败详情底色
+    // C2 拖入高亮底色（winit 的 HoveredFile；非 macOS 也能用同一条路径）
+    in property <color> drop-bg: PixelTheme.scheme == "dark" ? #10233a : #e8f1fd;
     // 窗口描边（no-frame 自绘窗）：**纯黑**（用户明确要求，不用灰）。
     // 已知代价（审查实测，别当成已解决）：纯黑只在浅底上成立——白底对比 21:1，但压在
     // #1a1a1a 深色桌面上只有 1.21:1，纯黑桌面则为 1:1（描边与底色重合时**加粗不会**产生
@@ -3093,6 +3095,10 @@ export component SystemChatWindow inherits Window {
     // `attach-summary` 由 Rust 拼好（`📎 N 个：a.png, b.mov`）——D 批再改成输入框内 3+N chips。
     in property <int> attach-count: 0;
     in property <string> attach-summary: "";
+    // C2 拖入高亮：由 Rust 从 winit 的 `HoveredFile` / `HoveredFileCancelled` 驱动。
+    // 注意：成功 drop 后 winit **不发** `HoveredFileCancelled`（它只发 `concludeDragOperation:`，
+    // 而 winit 那个方法不下发事件），所以「何时收起高亮」由 Rust 侧自己收尾（见 syschat::DropTracker）。
+    in property <bool> drag-hover: false;
 
     // 会话 / 模型选择（A 批）：labels 给 ComboBox，选中索引由 Rust 回写；
     // 「模型选择」按**会话**生效，候选只来自「设置 → 供应商」。
@@ -3126,13 +3132,15 @@ export component SystemChatWindow inherits Window {
         background: UiTokens.window-frame;
         border-radius: 10px;
 
-        // 内层面板：内缩 2px、圆角 8px（= 10 − 2）
+        // 内层面板：内缩 2px、圆角 8px（= 10 − 2）。
+        // 拖入时换底色（C2 拖放反馈）：只换内层面板色，不叠叠加层——叠加层会盖住内容且
+        // 多一层命中面；面板色在暗/亮两套主题下都有定义（UiTokens.drop-bg）。
         Rectangle {
             x: 2px;
             y: 2px;
             width: parent.width - 4px;
             height: parent.height - 4px;
-            background: PixelTheme.panel;
+            background: root.drag-hover ? UiTokens.drop-bg : PixelTheme.panel;
             border-radius: 8px;
         }
 

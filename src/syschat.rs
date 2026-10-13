@@ -375,6 +375,57 @@ pub fn attachments_dir() -> PathBuf {
     workspace().join("attachments")
 }
 
+/// 拖放（C2）的状态机。
+///
+/// **为什么单独抽成纯结构**：winit 的拖放事件**没有「一次拖放结束」的显式信号**——成功 drop 后
+/// 它逐文件发 `DroppedFile`（`performDragOperation:`），而 `concludeDragOperation:` 不下发任何事件
+/// （也就没有对应的取消事件）。所以「高亮何时收起」「同一路径会不会被落地两次」必须由我们自己
+/// 定义口径；GUI 事件循环没法单测，把口径抽成纯结构才能用单测钉住。
+///
+/// 事件口径（winit 0.30 macOS 实现，`window_delegate.rs:367-429`）：
+/// - `draggingEntered:` **一次性**把拖入的全部文件名各发一条 `HoveredFile`；
+/// - `performDragOperation:` 逐文件发 `DroppedFile`；
+/// - 只有「拖出窗口 / 取消」才发 `HoveredFileCancelled`。
+#[derive(Default)]
+pub struct DropTracker {
+    hovering: bool,
+    landed: std::collections::HashSet<PathBuf>,
+}
+
+impl DropTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `HoveredFile`：进入/继续悬停。
+    /// 新一轮拖放的判定：悬停开始时若上一轮已结束（`hovering == false`）则清空去重集——
+    /// 否则「把同一个文件拖两次」的第二次会被当成重复而静默丢掉。
+    pub fn hovered(&mut self) {
+        if !self.hovering {
+            self.hovering = true;
+            self.landed.clear();
+        }
+    }
+
+    /// `DroppedFile(path)`：返回**是否应当落地**这个路径（本次拖放里首次出现）。
+    /// 同时收起高亮并标记本轮结束（供下一次 [`Self::hovered`] 重置去重集）。
+    pub fn dropped(&mut self, path: &std::path::Path) -> bool {
+        self.hovering = false;
+        self.landed.insert(path.to_path_buf())
+    }
+
+    /// `HoveredFileCancelled`：拖出/取消 ⇒ 收高亮 + 清去重集。
+    pub fn cancelled(&mut self) {
+        self.hovering = false;
+        self.landed.clear();
+    }
+
+    /// 当前是否应显示拖入高亮。
+    pub fn hovering(&self) -> bool {
+        self.hovering
+    }
+}
+
 /// 把一批本地文件复制进 [`attachments_dir`] 并返回记录。
 ///
 /// 任一文件不可读/落地失败即整体返回 `Err`（带可读原因），**并回滚本次已复制成功的文件**：
@@ -946,6 +997,62 @@ mod tests {
             text: text.to_string(),
             ts: 0,
         }
+    }
+
+    // ── C2 拖放状态机（winit 事件没法单测，口径钉在这里）──
+
+    /// 同一轮拖放里，同一路径只落一次（winit `draggingEntered:` 会把全部文件名各发一条
+    /// `HoveredFile`，而逐文件又发 `DroppedFile`，不去重就会重复落地）。
+    #[test]
+    fn drop_tracker_dedups_within_one_drag() {
+        let mut t = DropTracker::new();
+        t.hovered();
+        assert!(t.dropped(std::path::Path::new("/tmp/a.png")), "首次应落地");
+        assert!(
+            !t.dropped(std::path::Path::new("/tmp/a.png")),
+            "同一轮重复不应再落"
+        );
+        assert!(
+            !t.hovering(),
+            "drop 后应收起高亮（winit 不发 cancel，由我们收尾）"
+        );
+    }
+
+    /// **新的一轮**拖放必须把去重集清掉——否则「把同一个文件拖两次」的第二次会被静默丢掉。
+    /// 变异点：删掉 `hovered()` 里 `if !self.hovering` 的清空分支，本测即红。
+    #[test]
+    fn drop_tracker_new_drag_resets_dedupe() {
+        let mut t = DropTracker::new();
+        t.hovered();
+        assert!(t.dropped(std::path::Path::new("/tmp/a.png")));
+        t.hovered(); // 第二次拖入同一个文件
+        assert!(t.hovering());
+        assert!(
+            t.dropped(std::path::Path::new("/tmp/a.png")),
+            "新一轮应重新落地"
+        );
+    }
+
+    /// 一次拖入多文件：每个都应落地各自一次。
+    #[test]
+    fn drop_tracker_multi_file_drop_lands_each_once() {
+        let mut t = DropTracker::new();
+        t.hovered();
+        assert!(t.dropped(std::path::Path::new("/tmp/a.png")));
+        assert!(t.dropped(std::path::Path::new("/tmp/b.mov")));
+        assert!(t.dropped(std::path::Path::new("/tmp/c.pdf")));
+        assert!(!t.dropped(std::path::Path::new("/tmp/a.png")));
+    }
+
+    /// 拖出/取消：收高亮 + 清去重集（下一轮重新可落）。
+    #[test]
+    fn drop_tracker_cancel_resets() {
+        let mut t = DropTracker::new();
+        t.hovered();
+        t.cancelled();
+        assert!(!t.hovering());
+        t.hovered();
+        assert!(t.dropped(std::path::Path::new("/tmp/a.png")));
     }
 
     #[test]

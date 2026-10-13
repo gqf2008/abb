@@ -5725,8 +5725,48 @@ pub fn run_gui() -> Result<()> {
         // ③ 本就在 UI 主线程（AppKit 前置条件）。
         // winit 0.30 的 `KeyEvent` 自身不带修饰键 ⇒ 用 `ModifiersChanged` 跟踪 ⌘/Ctrl 的按下态。
         let super_held = Rc::new(Cell::new(false));
+        // C2 拖放状态机（去重口径 / 高亮收尾见 `syschat::DropTracker`）：**同一个闭包**里处理，
+        // 不得另起一个 `on_winit_window_event`——那是单槽 `set`，会把这条整个顶掉。
+        let drop_tracker = Rc::new(RefCell::new(crate::syschat::DropTracker::new()));
         let land_paste = land_into_pending.clone();
+        let land_drop = land_into_pending.clone();
+        let drop_ev = drop_tracker.clone();
         syschat_win.window().on_winit_window_event(move |w, ev| {
+            // C2 拖放（Finder → 对话窗）：**不需要任何 AppKit 手写代码**——winit 0.30 的 macOS
+            // 实现自己就是 `NSDraggingDestination`（`window_delegate.rs:367`），已把系统拖放翻译成
+            // `HoveredFile` / `DroppedFile` / `HoveredFileCancelled`（注册见 `:667`）。
+            match ev {
+                WindowEvent::HoveredFile(_) => {
+                    let h = {
+                        let mut t = drop_ev.borrow_mut();
+                        t.hovered();
+                        t.hovering()
+                    };
+                    if let Some(win) = cw2.upgrade() {
+                        win.set_drag_hover(h);
+                    }
+                    return EventResult::Propagate;
+                }
+                WindowEvent::HoveredFileCancelled => {
+                    drop_ev.borrow_mut().cancelled();
+                    if let Some(win) = cw2.upgrade() {
+                        win.set_drag_hover(false);
+                    }
+                    return EventResult::Propagate;
+                }
+                WindowEvent::DroppedFile(path) => {
+                    // 成功 drop 后 winit **不发** `HoveredFileCancelled`，高亮在这里自己收。
+                    let should_land = drop_ev.borrow_mut().dropped(path);
+                    if let Some(win) = cw2.upgrade() {
+                        win.set_drag_hover(false);
+                    }
+                    if should_land {
+                        land_drop(vec![path.clone()]);
+                    }
+                    return EventResult::Propagate;
+                }
+                _ => {}
+            }
             if let WindowEvent::ModifiersChanged(m) = ev {
                 super_held.set(m.state().super_key());
             }
