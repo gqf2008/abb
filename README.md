@@ -49,6 +49,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 |---|---|
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
 | 随包执行层 | 内置 `abb-agent`（**唯一**执行层：owner 与授权者会话同用，受限档由它自己实现并声明 `_meta.abbSandbox`），零安装；模型走 Anthropic 原生 / OpenAI 兼容供应商（设置里自助添加）。旧执行层及其 `config.buzz_agent_exe` 回滚开关已随 0685e66 删除 |
+| 图形生成 | 在聊天里说「把销售额画个图」即可出图：agent 用 `"$ABB_BIN" chart render --spec … --out chart.png` 渲染 PNG，再用 `deliver --to-current --file` 发回会话（**owner 与授权者会话都可用**）。`mark` 支持散点/折线/柱状/面积/直方图/密度/箱线/小提琴/误差棒/参考线/文字标注；数据可来自 CSV 或内联 JSON；中文标题与轴标签开箱即用（中文字体自动挑选）。由随包 `abb-chart`（charton 0.8，独立包与独立产物）实现，硬指标见 `crates/abb-chart/README.md` |
 | 模型供应商 | 设置 →「供应商」里可选并预置：`anthropic`（原生）、`openai-chat`（任意 OpenAI 兼容端点，含本地 Ollama / 自建网关）、`openai-responses`、`openrouter`（免填 `https://openrouter.ai/api/v1`）、`deepseek`（免填 `https://api.deepseek.com/v1`）；预置端点留空即用官方，填了以你填的为准（代理/网关） |
 | 内置开发工具 | 安装包随带固定版本 `rg` / `jq` / `uv` / `gh`，以及**常用 CLI 工具** `awk`（goawk）、`tail` / `sleep` / `head` / `diff` / `cmp` / `md5sum` / `sha1sum` / `sha256sum`（来自 uutils `coreutils` / `diffutils`），Windows 上另有 busybox-w32 提供的 `ps` / `watch` / `wget` / `sed` / `id` / `hexdump` 等（**GPL-2.0**，许可与源码见 `tools/licenses/`）macOS 侧是多调二进制 + 硬链接、Windows 侧取每工具 exe），仅注入 agent 子进程 PATH；`git` / `bun` / `sed` / `find` 仍使用系统或用户环境。；macOS 侧 `ps` 用宿主自带、`watch` / `wget` 不随包（原因与替代见 `tools/README.md`） |
 

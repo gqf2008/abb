@@ -692,6 +692,7 @@ fn is_path_arg(arg: &str) -> bool {
 /// deliver（--file 必须工作区内——堵「把任意文件哈希+路径投递到其它会话」外泄通道）。
 fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
     match rest.first().map(|s| s.as_str()) {
+        Some("chart") => check_chart_args(&rest[1..], workspace),
         Some("job") => {
             if rest.get(1).map(|s| s.as_str()) == Some("add") {
                 Decision::Allow
@@ -775,6 +776,66 @@ fn check_abb_bin(rest: &[String], workspace: &Path) -> Decision {
         }
         other => Decision::Deny(format!("$ABB_BIN 子命令不在白名单：{other:?}")),
     }
+}
+
+/// `chart` 的授权判据（与 `deliver` 同构：**只查文件系统参数，其余交给 CLI 自己的严格解析器**）。
+///
+/// 只放行 `render`：这是 `abb-chart` 目前唯一的子命令（别的值在 CLI 侧就是 exit 2、什么也不做）。
+///
+/// 查哪些参数：`abb-chart` **全部**的文件系统入口——
+/// `--spec` / `--data` / `--out` / `--debug-svg`（规格文件内的相对 `data` 也由 `--spec` 所在
+/// 目录解析得到，故已被 `--spec` 那一条覆盖）。其余旗标（`--width/--height/--theme/--font`）
+/// 只当数字/字符串用，不碰文件，故不查。
+///
+/// 为什么不把每个旗标都枚举成「白名单、未知即拒」：那会与 `abb-chart` 的参数表形成双份真相，
+/// 加一个旗标就得同步改两边（漏改就是「合法功能被拦」）。这里的边界是：**凡能定位到文件的
+/// 参数都查**，而 `abb-chart` 对未知参数是硬错（exit 2）——于是不存在「用我们没查的参数
+/// 去读写文件」的路子。
+///
+/// ## 本函数**管不到**的那一半：规格文件内容里的路径（已由 abb-chart 兜住）
+///
+/// 本函数只能看到**命令行**。规格 JSON 里的 `data` 是一个**文件内容中的路径**——这里读不到、
+/// 也不该为了它去解析 JSON（那会引入 schema 双份真相）。这个洞曾真实存在：工作区内的
+/// `spec.json` 写 `"data": "../secret.csv"` 就能读到工作区外文件并把内容画进图里
+/// （card `abb-chart-cli-20261013` 评审发现）。
+/// 收口在**解析路径的那一方**：`abb-chart` 要求**规格内容里的 `data` 只能读规格文件所在目录内
+/// 的文件**——相对与绝对都必须在其中（这个字段在本函数里看不见，所以「绝对路径交给 guard 把关」
+/// 那句话对它**不成立**；独立评审实测过 `"data": "/abs/secret.csv"` 的外泄，见卡内记录）。
+/// 命令行侧的 `--data` 则是「相对限 CWD、绝对放行」，因为它走的是**闸门看得见**的通道
+/// （工作区外的绝对路径由本函数拒绝）。实现见 `crates/abb-chart/src/spec.rs::resolve_in_dir`
+/// 与 `resolve_arg`。
+///
+/// 判据与 `deliver --file` 一致：用 [`canonical_in_workspace`]（`~`/`$` 展开形态一律拒，
+/// 防越过校验；不存在的输出文件按父目录校验）。
+fn check_chart_args(rest: &[String], workspace: &Path) -> Decision {
+    if rest.first().map(|s| s.as_str()) != Some("render") {
+        return Decision::Deny(format!(
+            "chart 仅允许 render（收到 {:?}）",
+            rest.first().map(|s| s.as_str())
+        ));
+    }
+    // 取值型旗标 → 是否路径。写成表是为了让「新增文件参数忘了加校验」在同一处暴露。
+    const PATH_FLAGS: &[&str] = &["--spec", "--data", "--out", "--debug-svg"];
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = rest[i].as_str();
+        if PATH_FLAGS.contains(&arg) {
+            let Some(value) = rest.get(i + 1) else {
+                return Decision::Deny(format!("chart {arg} 缺路径"));
+            };
+            // `--spec -` = 从标准输入读规格：它**不解文件**（只读 stdin），不构成路径逃逸；
+            // 而且受限档的 guard 已先一步拒掉管道/重定向（`split_shell`），到不了这里。
+            if value != "-" && !canonical_in_workspace(value, workspace) {
+                return Decision::Deny(format!(
+                    "chart {arg} 指向工作区外（已拒绝：{value}）——出图与取数据都限在会话工作区内"
+                ));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Decision::Allow
 }
 
 /// proc 入口的同一道拒绝逻辑：受限路径与 owner 路径共用，避免 owner 分支再次漏掉 Q8。
@@ -1647,6 +1708,61 @@ mod tests {
             }
         }
         assert_ne!(decide(r#"$ABB_BIN session nuke"#), Decision::Allow);
+
+        // 图形生成（卡 abb-chart-cli-20261013）：owner 决策 = 画图是基本工具，
+        // **授权者（受限）会话也要能用**。放行的是 `chart render`，且路径参数限工作区。
+        // 判别力：把 `Some("chart")` 那行删掉 ⇒ 本组会落到 `子命令不在白名单` ⇒ 全红。
+        assert_eq!(
+            decide(r#"$ABB_BIN chart render --spec spec.json --out chart.png"#),
+            Decision::Allow
+        );
+        // 工作区内的绝对路径也放行（agent 常用 `$PWD/...` 之外的写法）。
+        let abs_ok = format!(
+            r#"$ABB_BIN chart render --spec {}/spec.json --out {}/chart.png"#,
+            ws.display(),
+            ws.display()
+        );
+        assert_eq!(decide(&abs_ok), Decision::Allow);
+        // 子命令只放行 render；其它值（含缺子命令）一律拒。
+        for bad in [
+            r#"$ABB_BIN chart"#,
+            r#"$ABB_BIN chart export --spec a.json"#,
+            r#"$ABB_BIN chart render --out"#,
+        ] {
+            assert_ne!(decide(bad), Decision::Allow, "{bad} 必须拒绝");
+        }
+        // **路径参数不得跑出工作区**（与 `deliver --file` 同一条边界）：
+        // 读写工作区外 = 越权，无论它是不是“只是输出一个 png”。
+        for bad in [
+            r#"$ABB_BIN chart render --spec /etc/passwd --out chart.png"#,
+            r#"$ABB_BIN chart render --spec spec.json --out /tmp/escaped.png"#,
+            r#"$ABB_BIN chart render --spec spec.json --data /etc/hosts --out c.png"#,
+            r#"$ABB_BIN chart render --spec spec.json --debug-svg /tmp/x.svg --out c.png"#,
+            r#"$ABB_BIN chart render --spec spec.json --out ../../escape.png"#,
+            r#"$ABB_BIN chart render --spec "$HOME/secret.json" --out c.png"#,
+        ] {
+            match decide(bad) {
+                Decision::Deny(why) => {
+                    assert!(why.contains("工作区"), "拒绝原因应指向工作区边界: {why}")
+                }
+                other => panic!("{bad} 必须拒绝（路径越界），实际 {other:?}"),
+            }
+        }
+        // `--spec -`（stdin）不放文件，故不算路径越界；但要能到这一步必须绕过 split_shell
+        // 的管道拒绝（见 bash_whitelist 的 split_shell 组）。此处只钉住判据本身。
+        assert_eq!(
+            decide(r#"$ABB_BIN chart render --spec - --out chart.png"#),
+            Decision::Allow
+        );
+
+        // **本闸的已知边界**（不是缺陷，是分工）：规格**文件内容**里的相对路径这里看不到，
+        // 由 abb-chart 自己兜（`spec.rs::resolve_confined`：相对路径不得跑出基准目录）。
+        // 这条断言把「我们不会再为此扩权」的意图钉住：工作区内的 spec 一律放行，
+        // 越界与否交给 abb-chart 的解析层——否则两边会各有一套 JSON 解析规则。
+        assert_eq!(
+            decide(r#"$ABB_BIN chart render --spec spec.json --out chart.png"#),
+            Decision::Allow
+        );
         // git 只读：状态/差异放行；历史读（log/show/blame，可读已删文件旧版本）拒绝
         assert_eq!(decide("git status"), Decision::Allow);
         assert_eq!(decide("git diff --stat"), Decision::Allow);
