@@ -103,6 +103,58 @@ jobs:
           ./tools/fetch_bundled_tools.ps1 -Platform windows-x64 -Dest tools-dist
           bash tools/check_bundled_tools.sh --platform windows-x64 --bin-dir tools-dist/bin
 
+  # abb-chart 也是独立包（自有 manifest + lock，root 的 fmt/clippy/test 覆盖不到它）。
+  # 与 abb-agent 同构：PR 级补 macOS 门禁。
+  # 为什么必须有：它的 84 个用例（含「字体缺字形必须拒绝出图」「规格内容不得穿越目录」
+  # 这类真实缺陷的钉子）此前只在开发机上跑过；没有这个 job，CI 上**永远不执行**。
+  abb-chart-lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/abb-chart
+
+      - name: fmt（abb-chart）
+        run: cargo fmt --check --manifest-path crates/abb-chart/Cargo.toml
+
+      - name: clippy（abb-chart，-D warnings 门禁）
+        run: cargo clippy --locked --manifest-path crates/abb-chart/Cargo.toml --all-targets -- -D warnings
+
+      - name: test（abb-chart，真跑）
+        run: cargo test --locked --manifest-path crates/abb-chart/Cargo.toml
+
+  # abb-chart 要**随 Windows 安装包分发**（`agent-bridge chart` 按同目录解析它），
+  # 而在此之前它只在 release tag 时才被 Windows 编译到 ⇒ PR 级必须补一次。
+  # 另：它依赖的 charton（tiny-skia / ab_glyph / fontdb）在 Windows 上能否编译、字体探针
+  # 在 Windows 上是否可用（`Microsoft YaHei` 等候选），都只能在这里得到机器判据。
+  abb-chart-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/abb-chart
+
+      - name: build（abb-chart，Windows）
+        run: cargo build --locked --manifest-path crates/abb-chart/Cargo.toml
+
+      - name: clippy（abb-chart，Windows）
+        run: cargo clippy --locked --manifest-path crates/abb-chart/Cargo.toml --all-targets -- -D warnings
+
+      - name: test（abb-chart，Windows，真跑）
+        run: cargo test --locked --manifest-path crates/abb-chart/Cargo.toml
+
   test:
     runs-on: windows-latest
     steps:

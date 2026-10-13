@@ -34,6 +34,8 @@ if ($env:CARGO_TARGET_DIR) {
 $rootExe = Join-Path $repo 'target\release\agent-bridge.exe'
 # 单一执行层（刀 4b 后旧执行层 abb 侧已删）。
 $abbAgentExe = Join-Path $repo 'crates\abb-agent\target\release\abb-agent.exe'
+# 图形生成 CLI（卡 abb-chart-cli-20261013）：`agent-bridge chart` 按同目录解析它。
+$abbChartExe = Join-Path $repo 'crates\abb-chart\target\release\abb-chart.exe'
 
 if (-not $SkipBuild) {
   Say '构建根程序（release）…'
@@ -43,6 +45,10 @@ if (-not $SkipBuild) {
   Say '构建 abb-agent（release，用本包自己的 target 目录）…'
   & cargo build --release --manifest-path crates/abb-agent/Cargo.toml | Out-Host
   if ($LASTEXITCODE -ne 0) { Fail 'abb-agent 构建失败' }
+
+  Say '构建 abb-chart（release，用本包自己的 target 目录）…'
+  & cargo build --release --manifest-path crates/abb-chart/Cargo.toml | Out-Host
+  if ($LASTEXITCODE -ne 0) { Fail 'abb-chart 构建失败' }
 }
 
 # ② 新鲜度断言：产物必须比各自源码新（源码改了却取到旧产物 = 打错包）
@@ -60,6 +66,7 @@ function Assert-Fresh($exe, $srcDir, $label) {
 }
 Assert-Fresh $rootExe (Join-Path $repo 'src') '根程序'
 Assert-Fresh $abbAgentExe (Join-Path $repo 'crates\abb-agent\src') 'abb-agent'
+Assert-Fresh $abbChartExe (Join-Path $repo 'crates\abb-chart\src') 'abb-chart'
 
 # 运行期同目录解析：确保 .iss 取到的就是这两份
 $version = [regex]::Match((Get-Content (Join-Path $repo 'Cargo.toml') -Raw), 'version = "([^"]+)"').Groups[1].Value

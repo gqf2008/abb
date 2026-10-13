@@ -1,0 +1,57 @@
+# abb-chart —— ABB 的图形生成 CLI（出 PNG，供 agent 用 `$ABB_BIN chart` 调用后 deliver 发回聊天）。
+#
+# 为什么是独立包（与被替代思路的关键差异）：
+#   - 不放进 `crates/abb-agent` 当内置工具：charton 0.8 是 edition 2024 ⇒ 需要 rustc ≥1.85，
+#     而 abb-agent 锁 `rust-version = "1.78"`（与 rpi 对齐）；且渲染 panic 会砸掉会话进程；
+#     更关键的是会逼 `dev_tools()` 为 read-only 档开特例，违背「agent 不碰权限」的设计。
+#   - 不放进 `tools/bin` 当随包第三方工具：`tools/tool-lock.tsv` 要求外部可取件的 url+sha256
+#     （自产 CLI 会鸡生蛋），且 `src/deps.rs` 的单测断言 tsv 里每个名字的 provider 必须在
+#     lock 的包里；再叠 release.yml 的「签名清单 == tools/bin 实际文件」断言。代价更高。
+#   - 本包自带 manifest + lock（与 abb-agent 同构），root 的 fmt/clippy/test 不碰它。
+#
+# 构建：cargo build --release --manifest-path crates/abb-chart/Cargo.toml
+[package]
+name = "abb-chart"
+version = "0.1.0"
+edition = "2021"
+# charton 0.8 用 edition 2024，其 MSRV 是 1.85 —— 本包如实声明，不假装能更低。
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/gqf2008/abb"
+description = "ABB 的图形生成 CLI：把 JSON 图规格 + CSV/JSON 数据渲染成 PNG（供 agent 发回聊天）"
+readme = "README.md"
+keywords = ["chart", "plot", "png", "abb", "cli"]
+categories = ["command-line-utilities", "visualization"]
+
+[lib]
+name = "abb_chart"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abb-chart"
+path = "src/main.rs"
+
+[dependencies]
+# 声明式绘图库（Altair 风格）。只开 `png`（= raster = tiny-skia + ab_glyph + fontdb）：
+# 纯 CPU 光栅、无系统依赖、无需 GPU/窗口——这正是服务端出图要的形态。
+# `wgpu` 后端明确不开：它要 GPU 上下文，而本 CLI 是 agent 子进程里跑的无窗口进程。
+charton = { version = "0.8.4", default-features = false, features = ["png"] }
+# 字体族存在性探测。**版本必须跟 charton 一致（0.23）**：我们只做查询，探测结果直接交给
+# charton 去取字体；与它不同版本会得到两套系统字体库，出现「我们查到有、它取不到」的错判。
+fontdb = "0.23"
+# 字形覆盖探测：光「字体存在」不够，还要问「这份字体画得出这个汉字吗」——实测
+# Helvetica 存在但无 CJK 字形，渲染出来是一排方框。版本与 tree 里 fontdb/ab_glyph
+# 用的那条线一致（0.25），不引入新的编译单元。
+ttf-parser = "0.25"
+serde = { version = "1", features = ["derive"] }
+# `preserve_order`：内联 `rows` 的列序按**规格里书写的顺序**保留。
+# 不打开时 serde_json 的 Map 是 BTreeMap（键名字典序），列序会和规格里写的不一样——
+# 虽然列是按名字引用的、不影响对错，但「写 A 得到 B 的顺序」在排查时很费解。
+serde_json = { version = "1", features = ["preserve_order"] }
+# CSV 装载。手写解析在引号/内嵌逗号/BOM 上错不起（图表数据常来自导出表格）。
+csv = "1"
+
+[dev-dependencies]
+# 解码 PNG 做像素级断言（小数点回归测试、尺寸断言）。只开 png。
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3"

@@ -77,6 +77,11 @@ jobs:
       - name: Build abb-agent (aarch64)
         run: cargo build --release --manifest-path crates/abb-agent/Cargo.toml --target aarch64-apple-darwin
 
+      # abb-chart（图形生成）：agent 用 `"$ABB_BIN" chart render …` 出图后 deliver 发回聊天。
+      # 独立包/独立产物（charton 要 rustc≥1.85，且渲染 panic 不该砸托盘进程）。
+      - name: Build abb-chart (aarch64)
+        run: cargo build --release --manifest-path crates/abb-chart/Cargo.toml --target aarch64-apple-darwin
+
       - name: Assemble ABB.app and sign (hardened runtime + timestamp)
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
@@ -89,6 +94,9 @@ jobs:
           # 这里不再拷贝它（旧写法是在这一步 cp 一个已不存在的产物，CI 直接失败）。
           # abb-agent（单一执行层，刀 4b 后 buzz-agent 已删）。
           cp crates/abb-agent/target/aarch64-apple-darwin/release/abb-agent ABB.app/Contents/MacOS/
+          # abb-chart（图形生成，卡 abb-chart-cli-20261013）：与 abb-agent 同目录随包，
+          # 由 `agent-bridge chart` 转发调用（同目录查找见 src/main.rs::bundled_chart_path_in）。
+          cp crates/abb-chart/target/aarch64-apple-darwin/release/abb-chart ABB.app/Contents/MacOS/
           cp LICENSE ABB.app/Contents/Resources/ABB-LICENSE.txt
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
@@ -128,6 +136,10 @@ jobs:
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/agent-bridge
           # abb-agent 也会 spawn shell / MCP 子进程并可能触发 TCC（#251）。
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-agent
+          # abb-chart 不 spawn 子进程、不碰 TCC，但必须签名：hardened runtime 下未签名的
+          # 内部可执行会被 Gatekeeper 拦（`agent-bridge chart` 转发直接失败）。带上 entitlements
+          # 与其它内部可执行保持一致（多签不影响，少签才是静默失败）。
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-chart
           # 随包工具清单从 tools/tool-lock.tsv 生成（唯一事实源）——不再另手抄一份枚举，
           # 否则加/删工具时会静默漏签（`--require-bundled-tools` 只查 PATH 解析、不查签名）。
           # 签名清单 = tool-lock 的包产物名 **∪** 多调包按名暴露的工具名，**按平台过滤**
@@ -224,23 +236,29 @@ jobs:
       - name: Build abb-agent
         run: cargo build --release --manifest-path crates/abb-agent/Cargo.toml
 
+      # abb-chart（图形生成，卡 abb-chart-cli-20261013）：`agent-bridge chart` 转发调用它。
+      - name: Build abb-chart
+        run: cargo build --release --manifest-path crates/abb-chart/Cargo.toml
+
       # #331 守卫：**分发的产物**不许依赖 VC++ Redistributable。
       # 背景：用户首次安装即报「找不到 VCRUNTIME140.dll」——MSVC 默认动态 CRT，
       # 而这两个 DLL 来自 Redist，干净 Windows 上没有。修法见 .cargo/config.toml
-      # 的 +crt-static；这条守卫保证「修完不许回退」。**两个 exe 都要查**：
-      # abb-agent.exe 由 agent-bridge 派生运行，缺 DLL 会在第一次跑 agent 时才炸。
+      # 的 +crt-static；这条守卫保证「修完不许回退」。**三个 exe 都要查**：
+      # abb-agent.exe 由 agent-bridge 派生运行，abb-chart.exe 由 `agent-bridge chart` 转发运行
+      # ——两者都缺 DLL 的话，会在第一次真用到时才炸（装完第一次聊天看不出问题）。
       # 守卫本身已用「坏样本/好样本」在本机验过会红/会绿（tools/check_dynamic_crt.sh）。
       - name: Assert no dynamic CRT dependency (#331)
         shell: bash
         run: |
           bash tools/check_dynamic_crt.sh \
             target/release/agent-bridge.exe \
-            crates/abb-agent/target/release/abb-agent.exe
+            crates/abb-agent/target/release/abb-agent.exe \
+            crates/abb-chart/target/release/abb-chart.exe
           # 可见性：把真实导入表打出来（llvm-objdump 随 rustup，取不到就跳过，不阻塞）
           if rustup component add llvm-tools-preview >/dev/null 2>&1; then
             OBJDUMP=$(find "$(rustc --print sysroot)" -type f -name 'llvm-objdump*' 2>/dev/null | head -1)
             if [ -n "$OBJDUMP" ]; then
-              for f in target/release/agent-bridge.exe crates/abb-agent/target/release/abb-agent.exe; do
+              for f in target/release/agent-bridge.exe crates/abb-agent/target/release/abb-agent.exe crates/abb-chart/target/release/abb-chart.exe; do
                 echo "── $f 的导入表："
                 "$OBJDUMP" -p "$f" | grep -i "DLL Name" || true
               done

@@ -1,0 +1,11 @@
+{
+  "title": "季度销售额趋势",
+  "mark": "bar",
+  "x": "季度",
+  "y": "销售额",
+  "x_label": "季度",
+  "y_label": "销售额（万元）",
+  "width": 900,
+  "height": 520,
+  "data": "cjk_bar.csv"
+}

@@ -1,0 +1,12 @@
+charton —— ABB 的图形生成 CLI（crates/abb-chart）使用的声明式绘图库
+仓库：https://github.com/wangjiawen2013/charton
+版本：0.8.4（Cargo.lock 锁定）
+许可：Apache License 2.0（全文见本目录 charton-LICENSE-APACHE2.txt）
+
+用途：`crates/abb-chart` 依赖它把 JSON 图规格渲染为 PNG，由 `"$ABB_BIN" chart` 转发调用。
+随包形态：**静态链接进 abb-chart 可执行**（不是随包的独立二进制），因此按 Apache-2.0 §4
+随包提供许可全文与本出处说明。
+
+传递依赖许可（同由本包的二进制静态链接）：charton 的 `png` feature 链路为
+tiny-skia（BSD-3-Clause）/ ab_glyph（MIT/Apache-2.0）/ fontdb（MIT）/ ttf-parser（MIT/Apache-2.0）。
+若将来改为随包独立二进制或新增加密/字体资产，应在此处与 tools/README.md 同步补记。
