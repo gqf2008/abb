@@ -1497,7 +1497,7 @@ export component SettingsWindow inherits Window {
                                     }
                                     Text {
                                         text: root.service-running
-                                            ? "飞书 / 微信 / 钉钉消息自动转给随包 AI agent 处理（零安装）"
+                                            ? "飞书 / 微信 / 钉钉消息自动转给怹处理（随包执行层 abb-agent，零安装）"
                                             : "点右侧「启动服务」，或在托盘菜单点「启动」";
                                         font-size: 13px;
                                         color: PixelTheme.on-accent.with-alpha(0.75);
@@ -1609,7 +1609,7 @@ export component SettingsWindow inherits Window {
                                         checked: root.cross-delivery-enabled;
                                         toggled => { root.set-cross-delivery(self.checked); }
                                     }
-                                    Text { text: "允许 agent 把结果投递到其它 bot"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: no-wrap; overflow: elide; }
+                                    Text { text: "允许怹把结果投递到其它 bot"; font-size: 12px; color: PixelTheme.text.with-alpha(0.55); wrap: no-wrap; overflow: elide; }
                                 }
                             }
                         }
@@ -3189,7 +3189,7 @@ export component SystemChatWindow inherits Window {
 
     in property <[SysChatBlockRow]> blocks: [];
     in property <bool> busy: false;
-    in property <string> status-line: "与 ABB 直接对话（系统级 · 整机权限）";
+    in property <string> status-line: "与怹直接对话（系统级 · 整机权限）";
     in property <bool> status-is-error: false;
     // 请求滞底：Rust 每追加一条消息 / 打开对话框时递增它（处理见本组件末尾的 changed 处理器）。
     // **不能**改成给 content-y 绑一个「超大值」属性：绑了值后 Slint 就不再夹取
@@ -3342,7 +3342,7 @@ export component SystemChatWindow inherits Window {
                     // 内容不足一屏时靠上排，不把消息拉高。
                     alignment: start;
                     if root.blocks.length == 0: Text {
-                        text: "有什么可以帮你？我运行在本机，能直接读写文件、执行命令。";
+                        text: "怹在这里，有什么可以帮你？\n\n怹（tān）：ABB 对 AI agent 的专称，表示非人对话主体，不表示怹有意识或人格。怹运行在本机，能直接读写文件、执行命令。";
                         font-size: 12px;
                         color: PixelTheme.text.with-alpha(0.5);
                         wrap: word-wrap;
@@ -3359,7 +3359,7 @@ export component SystemChatWindow inherits Window {
                             text: b.text;
                             font-size: 11px;
                             font-weight: 700;
-                            color: b.text == "ABB" ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
+                            color: b.text == "怹" ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
                         }
                         if b.kind == "h1": StyledText {
                             text: b.styled;
@@ -3794,7 +3794,7 @@ export component SystemChatWindow inherits Window {
                                         if root.draft == "" && !area-input.has-focus: Text {
                                             x: 4px;
                                             y: 6px;
-                                            text: root.busy ? "等待回复…" : "给 ABB 发消息，回车发送";
+                                            text: root.busy ? "等待回复…" : "给怹发消息，回车发送";
                                             font-size: 13px;
                                             color: PixelTheme.dim;
                                         }
