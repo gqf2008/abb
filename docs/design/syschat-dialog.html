@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABB 系统对话 · 设计稿 v6</title>
+<style>
+  :root{
+    --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
+    --edge:#1c1a17; --text:#1c1a17; --dim:#7a7263;
+    --accent:#ffc61a; --info:#2aa9c4; --danger:#d13438;
+    --code-bg:#f4ebd9; --brand:#2f6bfa; --link:#0a6fc2;
+  }
+  *{box-sizing:border-box;-webkit-font-smoothing:antialiased}
+  html,body{margin:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    background:#ded7c8;color:var(--text);display:flex;gap:24px;padding:24px;align-items:flex-start;min-height:100vh}
+  .col{display:flex;flex-direction:column;gap:20px}
+  h3{margin:0 0 12px;font-size:13px}
+  .card{background:#fffdf7;border:2px solid var(--edge);border-radius:10px;padding:14px 16px}
+
+  /* ---------- 气泡态 ---------- */
+  .bubbles{display:flex;gap:26px;align-items:flex-end}
+  .bstate{display:flex;flex-direction:column;align-items:center;gap:8px;font-size:11.5px;color:var(--dim)}
+  .bub{
+    width:36px;height:36px;border-radius:10px;cursor:pointer;
+    box-shadow:0 2px 6px rgba(28,26,23,.28);
+    transition:transform .06s ease, filter .06s ease, box-shadow .06s ease;
+    display:block;
+  }
+  .bub svg{width:100%;height:100%;display:block;border-radius:10px}
+  .bub:hover{transform:scale(1.06)}
+  .bub:active,.bub.press{transform:scale(.9);filter:brightness(.9);
+    box-shadow:0 0 0 2px var(--edge), 0 1px 2px rgba(28,26,23,.35)}
+  .tip-mini{font-size:10.5px;color:var(--dim)}
+
+  /* ---------- 窗口跟随气泡 ---------- */
+  .desk{position:relative;height:230px;border:2px dashed #cbbfa6;border-radius:10px;
+    background:linear-gradient(135deg,#efe7d6,#e3d9c3);overflow:hidden}
+  .desk .mini{
+    position:absolute;top:14px;right:78px;width:250px;height:196px;background:var(--panel);
+    border:2px solid var(--edge);border-radius:8px;box-shadow:0 8px 20px rgba(28,26,23,.22);
+    padding:10px;display:flex;flex-direction:column;gap:8px
+  }
+  .mini .barrow{display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:2px solid var(--edge)}
+  .mini .barrow .dot{width:14px;height:14px;border-radius:4px;background:var(--brand)}
+  .mini .barrow .t{font-size:11px;font-weight:700}
+  .mini .line{height:8px;border-radius:4px;background:var(--hover)}
+  .mini .line.s{width:60%}
+  .desk .anchor{position:absolute;top:16px;right:24px}
+  .desk .gap{position:absolute;top:30px;right:62px;height:12px;width:14px;border-left:2px solid var(--edge);border-right:2px solid var(--edge)}
+  .desk .cap{position:absolute;left:12px;bottom:10px;font-size:11px;color:#5a5344;max-width:60%}
+  .flip{position:absolute;left:12px;top:12px;font-size:11px;color:#5a5344;background:#fffdf7;border:1px solid #cbbfa6;border-radius:5px;padding:2px 6px}
+
+  /* ---------- 对话框 ---------- */
+  .win{width:478px;background:var(--edge);border-radius:10px;padding:2px;box-shadow:0 10px 30px rgba(28,26,23,.25)}
+  .win-body{background:var(--panel);border-radius:8px;overflow:hidden;display:flex;flex-direction:column;height:640px}
+  .titlebar{height:38px;background:var(--bg);border-bottom:2px solid var(--edge);display:flex;align-items:center;gap:6px;padding:0 10px;flex:0 0 auto}
+  .logo{width:20px;height:20px;flex:0 0 auto;border-radius:5px;display:block}
+  .title{font-size:13px;font-weight:700;white-space:nowrap}
+  .tb-spacer{flex:1}
+  .tb-btn{height:26px;min-width:26px;padding:0 8px;border:2px solid var(--edge);background:var(--panel);border-radius:6px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;cursor:pointer}
+  .tb-btn:hover{background:var(--hover)}
+  .tb-btn.danger:hover{background:var(--danger);color:#fff;border-color:var(--danger)}
+  .chipbtn{height:26px;display:inline-flex;align-items:center;gap:6px;border:2px solid var(--edge);border-radius:6px;padding:0 8px;font-size:12px;font-weight:700;cursor:pointer;position:relative;background:var(--panel);max-width:150px}
+  .chipbtn:hover{background:var(--hover)}
+  .chipbtn.accent{background:var(--accent)}
+  .chipbtn .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .caret{font-size:9px;transform:translateY(1px)}
+  .menu{position:absolute;top:30px;right:0;z-index:30;width:250px;background:var(--panel);border:2px solid var(--edge);border-radius:8px;box-shadow:0 8px 22px rgba(28,26,23,.28);overflow:hidden}
+  .menu.left{right:auto;left:0}
+  .menu h6{margin:0;padding:8px 10px;font-size:10px;color:var(--dim);border-bottom:2px solid var(--edge);background:var(--bg)}
+  .menu .item{display:flex;align-items:center;gap:8px;padding:8px 10px;font-size:12px;cursor:pointer}
+  .menu .item:hover{background:var(--hover)}
+  .menu .item.on{background:var(--accent)}
+  .menu .item .tick{margin-left:auto;font-weight:800}
+  .menu .item .tag{margin-left:auto;font-size:10px;color:var(--dim)}
+  .menu .foot{padding:6px 10px;font-size:10px;color:var(--dim);border-top:2px solid var(--edge);background:var(--bg)}
+  .status{height:26px;background:var(--bg);border-bottom:2px solid var(--edge);display:flex;align-items:center;gap:8px;padding:0 12px;font-size:11px;color:var(--dim)}
+  .status .grow{flex:1}
+  .tok{white-space:nowrap}
+  .tok b{color:var(--text);font-weight:700}
+  .meter{width:56px;height:9px;border:2px solid var(--edge);border-radius:3px;background:var(--panel);overflow:hidden;flex:0 0 auto}
+  .meter i{display:block;height:100%;background:var(--accent)}
+  .meter.warn i{background:#b86f00}
+  .meter.hot i{background:var(--danger)}
+  .convo{flex:1;overflow-y:auto;background:var(--panel);padding:12px;display:flex;flex-direction:column;gap:14px}
+  .turn{display:flex;flex-direction:column;gap:5px}
+  .who{font-size:11px;font-weight:700;color:var(--dim)}
+  .who.ab{color:var(--info)}
+  .tx{font-size:13px;line-height:1.55}
+  .md h2{margin:6px 0 4px;font-size:15px}
+  .md p{margin:6px 0}
+  .md ul{margin:6px 0 6px 18px;padding:0}
+  .md code{background:var(--code-bg);border:1px solid #d9cdb4;border-radius:4px;padding:0 4px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  .md pre{margin:8px 0;background:#1c1a17;color:#f6efe1;border-radius:6px;padding:10px 12px;overflow-x:auto;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  .md pre code{background:none;border:0;color:inherit;padding:0}
+  .md blockquote{margin:8px 0;padding:6px 10px;border-left:4px solid var(--accent);background:var(--bg);border-radius:0 6px 6px 0}
+  .md a{color:var(--link);text-decoration:underline}
+  .media{border:2px solid var(--edge);border-radius:6px;overflow:hidden;margin:8px 0;background:var(--bg);max-width:100%}
+  .media img,.media video{display:block;width:100%;height:auto}
+  .media .cap{font-size:11px;color:var(--dim);padding:4px 8px;border-top:2px solid var(--edge);background:var(--panel)}
+  audio{width:100%}
+  .thumbs{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0}
+  .thumb{width:64px;height:64px;border:2px solid var(--edge);border-radius:6px;overflow:hidden;background:var(--hover)}
+
+  /* 输入区（一个整体框；待发附件在框内 3+N；左竖排图标） */
+  .composer-zone{background:var(--bg);border-top:2px solid var(--edge);padding:10px}
+  .composer{border:2px solid var(--edge);border-radius:8px;background:var(--panel);padding:8px;display:flex;flex-direction:column;gap:8px}
+  .pending{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .pthumb{position:relative;width:52px;height:52px;border:2px solid var(--edge);border-radius:6px;overflow:hidden;background:var(--hover);flex:0 0 auto}
+  .pthumb .badge{position:absolute;left:3px;bottom:3px;background:rgba(28,26,23,.78);color:#fff;font-size:9px;padding:0 4px;border-radius:3px;font-weight:700}
+  .pthumb .x,.pfile .x{position:absolute;top:-7px;right:-7px;width:17px;height:17px;border-radius:50%;background:var(--danger);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;border:2px solid #fff;cursor:pointer}
+  .pfile{position:relative;display:flex;align-items:center;gap:7px;border:2px solid var(--edge);border-radius:6px;padding:5px 9px;background:var(--bg);max-width:180px;flex:0 0 auto}
+  .pfile .ic{width:22px;height:22px;border-radius:4px;background:var(--accent);border:2px solid var(--edge);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;flex:0 0 auto}
+  .pfile .n{font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .more{height:52px;min-width:52px;border:2px dashed var(--edge);border-radius:6px;background:var(--hover);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;cursor:pointer}
+  .prow{display:flex;gap:10px;align-items:stretch}
+  .stack{display:flex;flex-direction:column;gap:6px;flex:0 0 auto}
+  .ib{width:32px;height:32px;border:2px solid var(--edge);border-radius:7px;background:var(--panel);display:flex;align-items:center;justify-content:center;font-size:15px;cursor:pointer}
+  .ib:hover{background:var(--hover)}
+  .ib:active{transform:translateY(1px)}
+  .area{flex:1;min-height:66px;max-height:130px;font-size:13px;line-height:1.5;color:var(--dim);outline:none;padding:4px 2px}
+  .area .caret{display:inline-block;width:1px;height:15px;background:var(--text);vertical-align:-3px;margin-left:1px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .send{align-self:flex-end;height:36px;padding:0 18px;border:2px solid var(--edge);border-radius:7px;background:var(--accent);font-weight:800;font-size:13px;cursor:pointer;flex:0 0 auto}
+  .send:active{transform:translateY(1px)}
+
+  /* 思考区（默认折叠，展开看推理） */
+  details.think{border:2px solid #d9cdb4;border-radius:6px;background:var(--bg);margin:4px 0;overflow:hidden}
+  details.think > summary{list-style:none;cursor:pointer;padding:6px 10px;font-size:11.5px;color:var(--dim);display:flex;align-items:center;gap:6px;font-weight:700}
+  details.think > summary::-webkit-details-marker{display:none}
+  details.think > summary .chev{transition:transform .12s;display:inline-block}
+  details.think[open] > summary .chev{transform:rotate(90deg)}
+  details.think .body{border-top:2px dashed #e2d7bf;padding:8px 10px;font-size:12px;color:#5a5344;line-height:1.55;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap}
+  /* 流式：打字机光标 + 生成中 + 停止 */
+  .caret-t{display:inline-block;width:8px;height:15px;background:var(--brand);vertical-align:-3px;margin-left:2px;animation:blink 1s steps(1) infinite}
+  .tbar{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--info);font-weight:700;margin:2px 0}
+  .stopbtn{margin-left:auto;height:24px;padding:0 10px;border:2px solid var(--edge);border-radius:6px;background:var(--panel);font-size:11.5px;font-weight:700;cursor:pointer}
+  .stopbtn:hover{background:var(--hover)}
+
+  .mark{position:relative}
+  .mark::after{content:attr(data-m);position:absolute;top:-9px;left:-9px;width:19px;height:19px;border-radius:50%;background:var(--brand);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+  aside{width:370px;background:#fffdf7;border:2px solid var(--edge);border-radius:10px;padding:16px 18px}
+  aside h1{font-size:16px;margin:0 0 4px}
+  aside .sub{font-size:12px;color:var(--dim);margin-bottom:12px}
+  aside ol{margin:0;padding-left:20px}
+  aside li{font-size:12.5px;line-height:1.6;margin:8px 0}
+  aside li b{color:var(--brand)}
+  aside .note{margin-top:14px;font-size:11.5px;color:var(--dim);border-top:2px dashed #cbbfa6;padding-top:10px}
+</style>
+</head>
+<body>
+
+<!-- 左列：气泡态 + 跟随示意 + 对话框 -->
+<div class="col">
+
+  <div class="card">
+    <h3>气泡：点击有反馈（可在此直接点/按住试）</h3>
+    <div class="bubbles">
+      <div class="bstate">
+        <span class="bub"><svg viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg></span>
+        常态
+      </div>
+      <div class="bstate">
+        <span class="bub" style="transform:scale(1.06)"><svg viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg></span>
+        悬停（放大 1.06）
+      </div>
+      <div class="bstate">
+        <span class="bub press"><svg viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg></span>
+        按下（缩 0.9 + 墨黑描边）
+      </div>
+      <div class="tip-mini">单击＝打开/收起对话框；按住拖动＝移动（位置记忆）</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>窗口跟随气泡</h3>
+    <div class="desk">
+      <div class="flip">气泡靠右 → 窗口自动翻到左侧，始终不出屏</div>
+      <div class="mini">
+        <div class="barrow"><span class="dot"></span><span class="t">ABB · 系统对话</span></div>
+        <div class="line"></div><div class="line s"></div><div class="line"></div><div class="line s"></div>
+      </div>
+      <div class="gap"></div>
+      <div class="anchor bub"><svg viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg></div>
+      <div class="cap">对话框锚定在气泡旁（间距 10px）；拖动气泡，对话框随之移动；收起/展开状态都记住。</div>
+    </div>
+  </div>
+
+  <!-- 对话框 -->
+  <div class="win">
+   <div class="win-body">
+    <div class="titlebar">
+      <svg class="logo" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg>
+      <span class="title">ABB · 系统对话</span>
+      <span class="tb-spacer"></span>
+      <div class="chipbtn mark" data-m="1">🗂 新会话<span class="caret">▾</span>
+        <div class="menu left">
+          <h6>会话（历史保留，可随时切回）</h6>
+          <div class="item on"><span>新会话</span><span class="tag">当前</span></div>
+          <div class="item"><span>把架构图做成网页</span><span class="tag">今天 00:40</span></div>
+          <div class="item"><span>排查 deepseek 端点</span><span class="tag">昨天 23:12</span></div>
+          <div class="foot">点一条即切回该会话继续聊</div>
+        </div>
+      </div>
+      <div class="chipbtn accent mark" data-m="2">deepseek-chat<span class="caret">▾</span>
+        <div class="menu">
+          <h6>选择模型（本会话生效）</h6>
+          <div class="item on"><span>deepseek-chat</span><span class="tick">✓</span></div>
+          <div class="item"><span>claude-sonnet-4.6</span><span class="tag">anthropic</span></div>
+          <div class="item"><span>gpt-5.1</span><span class="tag">openai</span></div>
+          <div class="foot">仅列出「设置 → 供应商」里已配置的模型</div>
+        </div>
+      </div>
+      <button class="tb-btn mark" data-m="3" title="打开设置">⚙</button>
+      <button class="tb-btn">—</button>
+      <button class="tb-btn danger">✕</button>
+    </div>
+    <div class="status" title="本会话累计 12,432 tokens；模型最大上下文 128,000">
+      <span>与 ABB 直接对话（系统级 · 整机权限） · deepseek-chat · 新会话</span>
+      <span class="grow"></span>
+      <span class="tok">上下文 <b>12.4K</b>/128K · <b>9.7%</b></span>
+      <span class="meter"><i style="width:9.7%"></i></span>
+    </div>
+    <div class="convo">
+      <div class="turn">
+        <div class="who">你</div>
+        <div class="tx">帮我把这张架构图存成文件，再配上说明，做成一个 HTML 页面。</div>
+        <div class="thumbs"><div class="thumb"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#f4ebd9"/><rect x="8" y="10" width="48" height="34" rx="3" fill="#fff" stroke="#1c1a17" stroke-width="3"/><path d="M8 36l14-12 10 9 8-7 16 14" fill="none" stroke="#2f6bfa" stroke-width="3"/></svg></div></div>
+      </div>
+      <div class="turn md">
+        <div class="who ab">ABB</div>
+        <!-- 思考过程：默认折叠；展开可看推理，与正文分离 -->
+        <details class="think">
+          <summary><span class="chev">▸</span> 思考过程 · 3.2s</summary>
+          <div class="body">用户要把架构图做成 HTML 页面。需要：① 把图存成文件 ② 配说明 ③ 单文件即开即用。先读工作区里的图片与说明，再套一个自适应模板…</div>
+        </details>
+        <h2>好的，已生成页面</h2>
+        <p>要点：</p>
+        <ul><li>图片走 <code>&lt;figure&gt;</code>、自适应宽度</li><li>说明区用<b>等宽字体</b></li></ul>
+        <blockquote>单文件即开即用。</blockquote>
+        <div class="media"><img alt="图片" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='430' height='110'><rect width='430' height='110' fill='%23f4ebd9'/><rect x='18' y='16' width='150' height='78' rx='6' fill='%23fff' stroke='%231c1a17' stroke-width='4'/><rect x='196' y='16' width='214' height='34' rx='6' fill='%23ffc61a' stroke='%231c1a17' stroke-width='4'/><rect x='196' y='60' width='214' height='34' rx='6' fill='%23e6f6fb' stroke='%231c1a17' stroke-width='4'/></svg>"><div class="cap">image · 本地路径 或 http(s)</div></div>
+        <div class="media"><video controls poster="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='430' height='120'><rect width='430' height='120' fill='%231c1a17'/><circle cx='215' cy='60' r='22' fill='%23ffc61a'/><path d='M208 50l18 10-18 10z' fill='%231c1a17'/></svg>"></video><div class="cap">video · 本地文件 或 http(s)</div></div>
+      </div>
+
+      <!-- 正在流式生成（打字机）：思考区展开示例，正文带光标 -->
+      <div class="turn md">
+        <div class="who ab">ABB</div>
+        <details class="think" open>
+          <summary><span class="chev">▸</span> 思考过程 · 生成中…</summary>
+          <div class="body">先确认目标目录，再写 index.html；顺便把下载入口补上…</div>
+        </details>
+        <div class="tbar">正在输入<span class="caret-t"></span><button class="stopbtn">⏹ 停止</button></div>
+        <p style="margin:4px 0">页面主体已写好，接下来把说明区换成等宽字体<span class="caret-t"></span></p>
+      </div>
+    </div>
+
+    <div class="composer-zone">
+      <div class="composer">
+        <div class="pending">
+          <div class="pthumb"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#f4ebd9"/><rect x="8" y="10" width="48" height="34" rx="3" fill="#fff" stroke="#1c1a17" stroke-width="3"/><path d="M8 36l14-12 10 9 8-7 16 14" fill="none" stroke="#2f6bfa" stroke-width="3"/></svg><span class="badge">IMG</span><span class="x">✕</span></div>
+          <div class="pthumb"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#1c1a17"/><circle cx="32" cy="32" r="12" fill="#ffc61a"/><path d="M28 26l10 6-10 6z" fill="#1c1a17"/></svg><span class="badge">VID</span><span class="x">✕</span></div>
+          <div class="pfile"><span class="ic">PDF</span><span class="n">设计规范.pdf</span><span class="x">✕</span></div>
+          <div class="more mark" data-m="6">+2</div>
+        </div>
+        <div class="prow">
+          <div class="stack">
+            <div class="ib mark" data-m="4" title="新建会话（历史保留）">＋</div>
+            <div class="ib mark" data-m="5" title="选择文件（可多选）">📎</div>
+          </div>
+          <div class="area"><span>就按这三份素材做，说明放第二节…</span><span class="caret"></span></div>
+          <button class="send">发送</button>
+        </div>
+      </div>
+      <!-- 提示文案已按 owner 要求移除（不显示在界面上） -->
+    </div>
+   </div>
+  </div>
+</div>
+
+<aside>
+  <h1>ABB 系统对话 · 设计稿 v6</h1>
+  <div class="sub">本轮新增：状态行显示 token 占用</div>
+  <ol>
+    <li><b>气泡点击反馈</b>：常态 / 悬停放大 1.06 / <b>按下缩到 0.9 + 墨黑描边</b>（上方可亲手点）；单击＝开/收对话框，按住拖＝移动。</li>
+    <li><b>窗口跟随气泡</b>：对话框<b>锚定在气泡旁（间距 10px）</b>，拖动气泡窗口一起移动；气泡靠屏边时窗口自动翻到另一侧，保证不出屏。</li>
+    <li><b>删掉输入区那段长提示文案</b>（不再显示）。</li>
+    <li><b>流式输出（打字机）</b>：回复逐字出现，带蓝色光标与「正在输入 / ⏹ 停止」。</li>
+    <li><b>思考区与正文分离</b>：推理过程单独一块、<b>默认折叠</b>（标题显耗时），点开看推理；正文另起、正常渲染 markdown。</li>
+    <li><b>Token 占用（状态行）</b>：显示本会话累计 <b>已用/上限</b>（如 12.4K/128K）+ <b>百分比</b> + 小进度条；百分比越高变色（正常暖黄 → ≥70% 橙 → ≥90% 红），悬停看精确值。</li>
+  </ol>
+  <div class="note">
+    沿用 v3：模型按<b>会话</b>且只列设置里已配置的模型；<b>＋新建会话 / 📎多选</b> 在输入区<b>左侧竖排</b>（图标，文案作 tooltip）；待发附件在输入框内、<b>最多 3 个其余折叠 +N</b>；<b>⌘V 粘贴 / 拖拽</b> 支持图片·音视频·文件，随消息一起发；<b>历史会话</b>在标题栏可切换；Markdown + 媒体（本地路径与 http(s)）内嵌渲染；对话区单一内容区、滚动贴底。
+  </div>
+</aside>
+
+</body>
+</html>
