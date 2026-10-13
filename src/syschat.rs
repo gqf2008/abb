@@ -671,6 +671,22 @@ fn attachment_ext_lower(name: &str) -> String {
     ext.trim_start_matches('.').to_ascii_lowercase()
 }
 
+/// 流式气泡的**锚点是否已失效**：模型被整体重载（`load_syschat_into` 里的 `set_vec`）后，
+/// 记下的行号起点已不再指向那个流式气泡。
+///
+/// **为什么必须有这条判据（E1 评审 B1）**：`SysChatEvt::MediaReady` 会在**不受 `busy` 门控**的
+/// 情况下触发整段重载历史（异步 http 媒体下载完成后），所以慢的媒体 URL 会让「重载」落在
+/// **下一轮流式进行中**。此时陈旧的 `start` 已指向无效区间：若 `start > row_count`，
+/// `sync_stream_rows` 删不到行，随后每个 delta 都把累积全文**整段重推**（重复气泡）；
+/// 若 `start < row_count` 但区间已串位，Reply 收尾时会删错行（把真实历史行删掉）。
+/// 故用「起点是否越出当前行数」作为失效信号，失效则复位为 `usize::MAX`（下一次 delta 会以
+/// 累积全文重新锚一条新气泡，自愈）。
+///
+/// `usize::MAX` = 尚未锚定（正常状态），恒不失效。
+pub fn stream_anchor_stale(start: usize, row_count: usize) -> bool {
+    start != usize::MAX && start > row_count
+}
+
 /// http(s) 媒体的本地缓存文件路（无论是否存在）：`syschat/media-cache/<sha256(url)>`。
 /// 用内容哈希做文件名：同 URL 同名、不同 URL 不撞，且无需维护索引。
 pub fn media_cache_file(url: &str) -> PathBuf {
@@ -1663,6 +1679,25 @@ mod tests {
         assert_eq!(b.finish("最终完整文本"), "最终完整文本");
         assert_eq!(b.shown(), "最终完整文本", "不得保留旧拼接");
         assert!(!b.active);
+    }
+
+    /// E1 评审 B1 的回归：模型被整体重载（行数缩到比锚点小）后，锚点必须判为**失效**，
+    /// 否则 `sync_stream_rows` 删不到行，随后每个 delta 会把累积全文整段重推（重复气泡）。
+    /// 变异点：把 `>` 改成 `>=`，`stream_anchor_valid_at_exact_boundary` 即红。
+    #[test]
+    fn stream_anchor_stale_detects_reload_shrink() {
+        assert!(
+            stream_anchor_stale(10, 3),
+            "起点越出当前行数 ⇒ 失效（模型被重载过）"
+        );
+        assert!(!stream_anchor_stale(usize::MAX, 3), "未锚定不是失效");
+        assert!(!stream_anchor_stale(10, 12), "起点仍在行数内 ⇒ 未失效");
+    }
+
+    /// 边界：起点**恰等于**行数（空流式气泡刚好在末尾）是**合法**的，不是失效。
+    #[test]
+    fn stream_anchor_valid_at_exact_boundary() {
+        assert!(!stream_anchor_stale(5, 5));
     }
 
     #[test]

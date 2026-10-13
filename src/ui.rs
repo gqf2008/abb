@@ -6070,6 +6070,14 @@ pub fn run_gui() -> Result<()> {
                             }
                             let text = b.shown().to_string();
                             drop(b);
+                            // 评审 B1：模型可能在本轮流式期间被整体重载（MediaReady 不受 busy 门控），
+                            // 陈旧行号会让本轮每个 delta 重推累积全文 ⇒ 重复气泡。失效则重新锚定。
+                            if crate::syschat::stream_anchor_stale(
+                                stream_start.get(),
+                                syschat_model_t.row_count(),
+                            ) {
+                                stream_start.set(usize::MAX);
+                            }
                             if stream_start.get() == usize::MAX {
                                 stream_start.set(syschat_model_t.row_count());
                             }
@@ -6081,6 +6089,13 @@ pub fn run_gui() -> Result<()> {
                         SysChatEvt::Reply(text) => {
                             // 去重口径：以最终文本为准整段重建同一段气泡——不保留旧拼接、不追加第二条。
                             stream_state.borrow_mut().finish(&text);
+                            // 评审 B1：先判锚点失效，否则会用陈旧起点**删掉真实历史行**（串位）。
+                            if crate::syschat::stream_anchor_stale(
+                                stream_start.get(),
+                                syschat_model_t.row_count(),
+                            ) {
+                                stream_start.set(usize::MAX);
+                            }
                             let s0 = stream_start.get();
                             if s0 != usize::MAX {
                                 sync_stream_rows(&syschat_model_t, s0, &text);
@@ -6095,7 +6110,7 @@ pub fn run_gui() -> Result<()> {
                             if let Some(w) = win_w.upgrade() {
                                 w.set_busy(false);
                                 w.set_status_is_error(false);
-                                w.set_status_line("与 ABB 直接对话（系统级 · 整机权限）".into());
+                                w.set_status_line("与怹直接对话（系统级 · 整机权限）".into());
                                 w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
                             }
                             if let Some(b) = bubble_w.upgrade() {
@@ -6108,6 +6123,13 @@ pub fn run_gui() -> Result<()> {
                             b.stop();
                             let text = b.shown().to_string();
                             drop(b);
+                            // 评审 B1：停止路径同样不得用陈旧锚点（会删错行）。
+                            if crate::syschat::stream_anchor_stale(
+                                stream_start.get(),
+                                syschat_model_t.row_count(),
+                            ) {
+                                stream_start.set(usize::MAX);
+                            }
                             let s0 = stream_start.get();
                             if s0 != usize::MAX && !text.is_empty() {
                                 sync_stream_rows(&syschat_model_t, s0, &text);
@@ -6142,6 +6164,10 @@ pub fn run_gui() -> Result<()> {
                             // 后台下好一个 http(s) 媒体：重载当前会话，图片即可内联显示。
                             if let Some(w) = win_w.upgrade() {
                                 load_syschat_into(&w, &syschat_model_t);
+                                // 评审 B1：整体重载 model 后流式气泡的行区间**必须**复位——本事件
+                                // 不受 busy 门控，可能正好落在下一轮流式进行中（陈旧起点 ⇒ 重复气泡）。
+                                // 复位后下一次 delta 会以累积全文重新锚一条，自愈。
+                                stream_start.set(usize::MAX);
                             }
                         }
                     }
