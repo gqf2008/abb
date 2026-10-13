@@ -562,6 +562,14 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
     } else {
         crate::syschat::TB_MODEL_W
     };
+    win.set_titlebar_title(
+        if crate::syschat::titlebar_title_visible(&plan) {
+            "ABB · 系统对话"
+        } else {
+            ""
+        }
+        .into(),
+    );
     win.set_titlebar_session_text(chip_text(
         win.get_session_labels(),
         win.get_session_index(),
@@ -1650,6 +1658,8 @@ fn configure_backend() -> Result<()> {
 // 实现 `on_begin_resize`，再由 `install_window_resize` 接到 winit 的 drag_resize_window。
 // 宏必须在模块作用域调用（impl 块）。
 slint_pixel::impl_resize_ui!(SettingsWindow);
+// 对话窗也要能缩放（owner 2026-10-13）。
+slint_pixel::impl_resize_ui!(SystemChatWindow);
 
 // ── Windows：圆角窗口区域（SetWindowRgn） ─────────────────────────────────────
 // 现象（用户实测）：`ui/app.slint` 根 Rectangle 已经画了 10px 圆角、圆角外 alpha=0，
@@ -1920,6 +1930,14 @@ pub fn run_gui() -> Result<()> {
     // 气泡只在托盘进程运行时存在——ABB 无头（`--service`）时不实例化任何窗口，
     // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
+    // 缩放：接 winit 的 drag_resize_window（`impl_resize_ui!` 提供回调实现）。
+    slint_pixel::install_window_resize(&syschat_win);
+    syschat_win.set_resize_hit_areas(true);
+    // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-width`（开出来是 min 宽 340，
+    // 于是 ①②③ 挤不进标题栏）。显式给一次 520×560（= 稿的落位宽度），此后由用户自己缩。
+    syschat_win
+        .window()
+        .set_size(slint::LogicalSize::new(520.0, 560.0));
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
     // D2（稿 ①②③）：标题栏控件条的落位计划。
     // 初次用 preferred-width 兜底（此时窗口尚未 realize，`size()` 可能是 0），

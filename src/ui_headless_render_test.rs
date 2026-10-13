@@ -153,6 +153,25 @@ fn settle(ui: &SystemChatWindow, window: &Rc<MinimalSoftwareWindow>, h: u32) -> 
     draw(W, h, window)
 }
 
+/// 同 [`settle`]，但帧宽可指定（默认 `settle` 固定用 `W`；出图要按真实窗宽渲）。
+fn settle_w(window: &Rc<MinimalSoftwareWindow>, w: u32, h: u32) -> Frame {
+    for _ in 0..3 {
+        slint::platform::update_timers_and_animations();
+        let mut buf = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+        window.request_redraw();
+        window.draw_if_needed(|r| {
+            r.render(&mut buf, w as usize);
+        });
+    }
+    slint::platform::update_timers_and_animations();
+    let mut buf = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+    window.request_redraw();
+    window.draw_if_needed(|r| {
+        r.render(&mut buf, w as usize);
+    });
+    Frame { buf, w, h }
+}
+
 /// 一段会换行的长中文正文（约 6 行）。
 const LONG: &str = "这是一段会换行的长正文，用来把消息区撑高：怹在本机读写文件、执行命令，\
 并把结果贴回这个对话框里，供你继续追问；重复若干次以制造多行高度。";
@@ -378,17 +397,19 @@ fn dump_frames_for_review() {
     ui.set_model_index(0);
     // 标题栏落位是 Rust 侧算出来再写属性的（`apply_syschat_layout`）——出图必须走同一条路，
     // 否则 `titlebar-strip-x` 停在初值、①②③ 一个都不渲染（这正是「无头出图保真」的意义）。
-    apply_syschat_layout(&ui, W as f32);
-    let f = settle(&ui, &win, SHORT_H);
+    // 默认已改成 520×560（见 `run_gui` 的显式 set_size）——出图按真实默认宽度来。
+    ui.window().set_size(slint::PhysicalSize::new(520, SHORT_H));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, SHORT_H);
     write_png(&f, &dir.join("short.png"));
     // 滚到底（滞底）——owner 截图里出问题的那种状态。
     ui.set_scroll_epoch(1);
-    let f = settle(&ui, &win, SHORT_H);
+    let f = settle_w(&win, 520, SHORT_H);
     write_png(&f, &dir.join("bottom.png"));
 
     // 「正在输入 + ⏹ 停止」这一行（E1）也要能对稿。
     ui.set_busy(true);
-    let f = settle(&ui, &win, SHORT_H);
+    let f = settle_w(&win, 520, SHORT_H);
     write_png(&f, &dir.join("busy.png"));
 
     // 附件行（3+N chips，D 批）：四条待发 ⇒ 只显示 3 个 + `+1`。
@@ -421,7 +442,7 @@ fn dump_frames_for_review() {
     ui.set_attach_count(4);
     ui.set_pending_more(1);
     ui.set_pending_more_text("+1".into());
-    let f = settle(&ui, &win, SHORT_H);
+    let f = settle_w(&win, 520, SHORT_H);
     write_png(&f, &dir.join("attachments.png"));
 }
 
@@ -482,4 +503,25 @@ fn dump_narrow_for_review() {
         ui.get_titlebar_model_w(),
         ui.get_titlebar_settings_w()
     );
+}
+
+/// 整窗出图（520×820，含完整输入区与底部圆角），供对稿判读。
+#[test]
+#[ignore = "出图用；默认不跑"]
+fn dump_full_window() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let (ui, win, _m) = setup(fixture(), 820);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-chat"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 820));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 820);
+    write_png(&f, &dir.join("full.png"));
 }

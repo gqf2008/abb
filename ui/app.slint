@@ -3171,8 +3171,9 @@ component ComposerIcon inherits Rectangle {
     in property <string> tip: "";
     in property <bool> enabled: true;
     callback clicked();
-    width: 32px;
-    height: 32px;
+    // 26px（owner 口径 2026-10-13：图标列要**更小**且放到输入框**外面**）。
+    width: 24px;
+    height: 24px;
     background: transparent;
     opacity: root.enabled ? 1.0 : 0.5;
     face := Rectangle {
@@ -3183,12 +3184,12 @@ component ComposerIcon inherits Rectangle {
         background: hit.has-hover ? PixelTheme.hover : PixelTheme.panel;
         border-width: 2px;
         border-color: PixelTheme.edge;
-        border-radius: 7px;
+        border-radius: 6px;
         Text {
             width: 100%;
             height: 100%;
             text: root.icon;
-            font-size: 15px;
+            font-size: 12px;
             horizontal-alignment: center;
             vertical-alignment: center;
         }
@@ -3237,7 +3238,7 @@ export component SystemChatWindow inherits Window {
 
     title: "ABB 系统对话";
     no-frame: true;
-    preferred-width: 460px;
+    preferred-width: 520px;
     preferred-height: 560px;
     min-width: 340px;
     min-height: 380px;
@@ -3281,6 +3282,8 @@ export component SystemChatWindow inherits Window {
     // 纯函数带单测）；这里只负责画。**不要在 .slint 里重算**：那套「放不下就换档」的阶梯算术
     // 需要可负向验证的单测，而 GUI 观感无法自动断言。
     in property <length> titlebar-strip-x: -1px; // < 0 = 空档不够，整条不画
+    // 标题文字（Rust 在窄窗时置空——控件让位优先于标题，见 `titlebar_plan`）。
+    in property <string> titlebar-title: "ABB · 系统对话";
     in property <length> titlebar-session-w: 0px;   // 0 = 该项不画
     in property <length> titlebar-model-w: 0px;
     in property <length> titlebar-settings-w: 0px;
@@ -3314,6 +3317,10 @@ export component SystemChatWindow inherits Window {
     callback reset-history();
     callback close-window();
     callback open-settings();   // ③ ⚙设置：唤起既有设置窗（D2 稿需求 #3）
+    // 无边框窗口缩放（同 SettingsWindow：`impl_resize_ui!` + `install_window_resize`）。
+    // owner 2026-10-13：「窗口不能缩放的吗？」——此前对话窗没接缩放契约。
+    callback begin-resize(string);
+    in-out property <bool> resize-hit-areas: false;
     // 消息区几何的**只读观测面**（D2「底部文字重叠」定性的直接证据）：
     // 「内容高是否小于真实渲染高」在像素上量不出来（溢出部分被裁掉了），只能由窗口自报。
     // 消费者是`cargo test` 里的无头渲染台（`src/ui_headless_render_test.rs`，用软件渲染后端把本窗
@@ -3357,7 +3364,9 @@ export component SystemChatWindow inherits Window {
             // 自绘标题栏：native-move（平台拖动，宿主无需 drag-start 接线）+ 隐藏最大化
             // （固定尺寸窗，set_maximized 会与尺寸绑定冲突）。
             PixelTitleBar {
-                title: "ABB · 系统对话";
+                // 标题可用 Rust 置空（窄窗时给 ①②③ 让位——控件比标题重要，且它们必须与
+                // 最小化/关闭按钮同在标题栏这一行）。
+                title: root.titlebar-title;
                 has-logo: true;
                 logo: @image-url("../app-assets/icon-1024.png");
                 native-move: true;
@@ -3415,15 +3424,7 @@ export component SystemChatWindow inherits Window {
                         enabled: !root.busy;
                         clicked => { root.open-settings(); }
                     }
-                    // 对话历史清空：稿子未给入口（需求清单里没有它）。D 批一度把它挂在工具行右端，
-                    // D2 起改为本行右端的**小号文字按钮**（与稿 `.status` 同高不抢位）——不静默丢掉
-                    // 这个能力，也不与状态文案抢横向空间。
-                    PixelButton {
-                        text: "清空对话";
-                        size: "small";
-                        enabled: !root.busy;
-                        clicked => { root.reset-history(); }
-                    }
+                    // 注：`清空对话` 已搬到输入框**左侧图标列**（owner：「清空对话在顶部的吗？」）。
                 }
                 // 底部分隔线（Rectangle 无 border-bottom-* 属性，用 1px 子矩形代替）
                 Rectangle {
@@ -3712,11 +3713,42 @@ export component SystemChatWindow inherits Window {
             Rectangle {
                 vertical-stretch: 0;
                 background: PixelTheme.bg;
+                // 底部两角跟窗口内面板同半径（owner：「底部还不圆角」）——输入区是最后一层，
+                // 不补这两个角就会把根 Rectangle 的圆角盖成直角。
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
                 VerticalBox {
                     // `.composer-zone` 顶部分隔线（Slint 的 Rectangle 无单边 border，用 2px 子矩形）
                     Rectangle { height: 2px; background: PixelTheme.edge; }
-                    VerticalBox {
+                    HorizontalBox {
                         padding: 10px;
+                        spacing: 8px;
+                        // 左竖排图标列**在输入框外面**（owner 2026-10-13：「新建会话和附件放到输入框
+                        // 外面而且要再小一点」）；三枚：＋ 新建会话 / 📎 附件 / 🗑 清空对话
+                        // （清空对话从顶部状态行搬下来——owner 质疑「清空对话在顶部的吗？」）。
+                        VerticalBox {
+                            width: 24px;
+                            spacing: 4px;
+                            alignment: end;
+                            ComposerIcon {
+                                icon: "＋";
+                                tip: "新建会话";
+                                enabled: !root.busy;
+                                clicked => { root.new-session(); }
+                            }
+                            ComposerIcon {
+                                icon: "📎";
+                                tip: "添加附件";
+                                enabled: !root.busy;
+                                clicked => { root.attach-pick(); }
+                            }
+                            ComposerIcon {
+                                icon: "🗑";
+                                tip: "清空对话";
+                                enabled: !root.busy;
+                                clicked => { root.reset-history(); }
+                            }
+                        }
                         composer := Rectangle {
                             width: 100%;
                             background: PixelTheme.panel;
@@ -3882,31 +3914,14 @@ export component SystemChatWindow inherits Window {
                                     }
                                 }
 
-                                // 输入行：左竖排图标列 | 文本区 | 发送按钮（底对齐）
+                                // 输入行：文本区 | 发送按钮（底对齐）——图标列已移到**框外**（见上）
                                 HorizontalBox {
                                     spacing: 10px;
-                                    // 左竖排图标列（只有两个：＋ 新建会话 / 📎 多选附件；文案作 tooltip）
-                                    VerticalBox {
-                                        width: 32px;
-                                        spacing: 6px;
-                                        alignment: start;
-                                        ComposerIcon {
-                                            icon: "＋";
-                                            tip: "新建会话";
-                                            enabled: !root.busy;
-                                            clicked => { root.new-session(); }
-                                        }
-                                        ComposerIcon {
-                                            icon: "📎";
-                                            tip: "添加附件";
-                                            enabled: !root.busy;
-                                            clicked => { root.attach-pick(); }
-                                        }
-                                    }
                                     // 文本区（`.area`）：无自绘边框（描边归整体框），回车发送
                                     area := Rectangle {
                                         horizontal-stretch: 1;
-                                        min-height: 66px;
+                                        // ≥ 图标列（3×24 + 2×4 = 80）——否则图标列会顶出输入框底边
+                                        min-height: 80px;
                                         background: transparent;
                                         area-input := TextInput {
                                             x: 2px;
@@ -4008,6 +4023,17 @@ export component SystemChatWindow inherits Window {
                 enabled: !root.busy;
                 clicked => { root.open-settings(); }
             }
+        }
+
+        // 无边框窗口缩放热区（同 SettingsWindow）。owner 2026-10-13：「窗口不能缩放的吗？」
+        // —— 对话窗此前没接缩放。这里**裸平台也开**（与设置窗不同：设置窗 macOS 靠系统自带，
+        // 但对话窗实测系统缩放拿不到，故统一自绘）。放在 VerticalLayout 之后 = 更上层。
+        if root.resize-hit-areas : PixelWindowResize {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            begin-resize(dir) => { root.begin-resize(dir); }
         }
     }
 

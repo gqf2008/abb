@@ -829,6 +829,13 @@ const TB_SETTINGS_W: f32 = 26.0;
 /// 控件条内各项间距（同稿 `.titlebar` 的 `gap: 6px`）。
 const TB_ITEM_GAP: f32 = 6.0;
 
+/// 标题文字是否还画得下：整条左缘越过「标题右缘 + 间隔」就说明没压标题。
+/// 窄窗时调用方**先牺牲标题**（置空），把位置让给 ①②③——owner 口径：三项必须与
+/// 最小化/关闭同在标题栏那一行，标题只是装饰。
+pub fn titlebar_title_visible(plan: &TitlebarPlan) -> bool {
+    plan.x >= TB_TITLE_END + TB_TITLE_GAP
+}
+
 /// chip 内文案可用宽 = chip 宽 − 内边距（PixelMenu：左 10px + 右侧箭头区 26px）。
 const TB_CHIP_TEXT_INSET: f32 = 36.0;
 /// 13px 粗体（PixelMenu 的 `button-text`）下单个**半宽**字符的估宽（全宽字符按 2 倍算）。
