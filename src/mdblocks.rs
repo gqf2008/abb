@@ -90,6 +90,18 @@ fn push_escaped(t: &str, out: &mut String) {
     }
 }
 
+/// 行内 markdown → Slint `StyledText`（**Rust 侧**解析）。
+///
+/// 为什么不在 `.slint` 里用 `@markdown("{x}")`（卡 abb-syschat-b-markdown 评审 B1/B2，2026-10-13）：
+/// Slint 的插值模板要求字面量以 `\{` 起，`"{x}"` 会被当**编译期常量 markdown**
+/// （生成代码里是 `parse_markdown("{b.text}", &[])`），渲染成字面量；即便写成 `\{x}`，
+/// 插值实参也只按**纯文本**注入（`StringToStyledText`），行内样式仍不生效。
+/// 所以必须在这里把真实值解析成 StyledText，GUI 直绑 `text: b.styled`。
+pub fn styled(text: &str) -> slint::StyledText {
+    slint::StyledText::from_markdown(text)
+        .unwrap_or_else(|_| slint::StyledText::from_plain_text(text))
+}
+
 /// 反解转义（媒体 alt/src 展示用）。
 fn unescape(s: &str) -> String {
     s.replace("\\*", "*")
@@ -234,27 +246,28 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     cells.clear();
                 }
                 Tag::TableCell => cell.clear(),
-                Tag::Emphasis => {
+                Tag::Emphasis if !in_table => {
                     ensure_cur!();
                     cur.as_mut().unwrap().text.push('*');
                     closes.push("*".into());
                 }
-                Tag::Strong => {
+                Tag::Strong if !in_table => {
                     ensure_cur!();
                     cur.as_mut().unwrap().text.push_str("**");
                     closes.push("**".into());
                 }
-                Tag::Strikethrough => {
+                Tag::Strikethrough if !in_table => {
                     ensure_cur!();
                     cur.as_mut().unwrap().text.push_str("~~");
                     closes.push("~~".into());
                 }
-                Tag::Link { dest_url, .. } => {
+                Tag::Link { dest_url, .. } if !in_table => {
                     ensure_cur!();
                     cur.as_mut().unwrap().text.push('[');
                     closes.push(format!("]({dest_url})"));
                 }
-                Tag::Image { dest_url, .. } => {
+                // 表格内的图片：降级为单元格里的 alt 文字（否则会打断表格，评审 N2）
+                Tag::Image { dest_url, .. } if !in_table => {
                     flush_cur(&mut blocks, &mut cur);
                     image = Some((dest_url.to_string(), String::new()));
                 }
@@ -318,7 +331,9 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     cells.push(cell.trim().to_string());
                     cell.clear();
                 }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link
+                    if !in_table =>
+                {
                     if let Some(c) = closes.pop() {
                         ensure_cur!();
                         cur.as_mut().unwrap().text.push_str(&c);
@@ -346,7 +361,8 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                 } else if let Some((_, alt)) = image.as_mut() {
                     alt.push_str(&t);
                 } else if in_table {
-                    push_escaped(&t, &mut cell);
+                    // 表格单元格按**纯文本**渲染（GUI 用 Text），故不过行内 markdown、不转义
+                    cell.push_str(&t);
                 } else {
                     ensure_cur!();
                     push_escaped_block(&t, cur.as_mut().unwrap());
@@ -355,9 +371,7 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
             Event::Code(c) => {
                 if code.is_none() {
                     if in_table {
-                        cell.push('`');
-                        push_escaped(&c, &mut cell);
-                        cell.push('`');
+                        cell.push_str(&c);
                     } else {
                         ensure_cur!();
                         let t = &mut cur.as_mut().unwrap().text;
@@ -446,8 +460,14 @@ fn push_table_row(blocks: &mut Vec<MdBlock>, cells: &mut Vec<String>, header: bo
 }
 
 /// 去掉链接目标里的 title 部分（`url "title"` → `url`）。
+///
+/// **不能**用 `split_whitespace().next()`：pulldown-cmark 已把 `<...>` 角括号剥掉，
+/// 带空格的文件名（macOS 截图常见）会被当成 title 切掉（评审 N1）。只切「空格 + 引号」。
 fn dest_strip_title(dest: &str) -> String {
-    dest.split_whitespace().next().unwrap_or(dest).to_string()
+    match dest.find(" \"") {
+        Some(i) => dest[..i].to_string(),
+        None => dest.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -608,5 +628,40 @@ mod tests {
         assert_eq!(media_kind_for("a/b.mp4?x=1"), Some("video"));
         assert_eq!(media_kind_for("a.m4a#t=3"), Some("audio"));
         assert_eq!(media_kind_for("a.txt"), None);
+    }
+
+    /// 评审 B1/B2 的负向守卫：行内 markdown 必须在 **Rust 侧**真解析，
+    /// 不得退化成把模板串/纯文本交给 Slint。
+    #[test]
+    fn styled_parses_markdown_not_template() {
+        let s = styled("**粗** 与 `码`");
+        assert_ne!(
+            s,
+            slint::StyledText::from_plain_text("**粗** 与 `码`"),
+            "行内样式未生效（与纯文本相同）"
+        );
+        assert_ne!(
+            s,
+            slint::StyledText::from_markdown("{b.text}").unwrap(),
+            "不得退化成编译期模板串"
+        );
+    }
+
+    #[test]
+    fn path_with_spaces_not_truncated() {
+        let b = parse("![截图](<my file.png>)");
+        assert_eq!(kinds(&b), vec!["image"]);
+        assert_eq!(b[0].src, "my file.png", "带空格路径不得被 title 规则截断");
+        // title 仍要剥掉
+        let b = parse("![图](a.png \"标题\")");
+        assert_eq!(b[0].src, "a.png");
+    }
+
+    #[test]
+    fn image_in_table_degrades_to_alt_text() {
+        let b = parse("| 图 |\n|---|\n| ![alt](a.png) |\n");
+        let rows: Vec<&MdBlock> = b.iter().filter(|x| x.kind == "table").collect();
+        assert_eq!(rows.len(), 2, "表格不应被图片打断：{:?}", kinds(&b));
+        assert_eq!(rows[1].cells, vec!["alt"], "表内图片降级为 alt 文本");
     }
 }

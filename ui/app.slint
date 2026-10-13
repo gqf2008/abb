@@ -3006,10 +3006,13 @@ export component SettingsWindow inherits Window {
 // 入口是托盘进程里的全局锚点气泡，**GUI 专属**；ABB 无头时不实例化任何窗口。
 
 // 系统级对话的渲染块（B 批，与 `src/mdblocks.rs` 的 `MdBlock` 对应）。
-// 行内 markdown 由 Rust 侧重组好，GUI 用 StyledText + @markdown("{...}") 渲染。
+// 行内 markdown 由 Rust 侧解析成 Slint `styled-text`（`src/mdblocks.rs::styled`）；
+// GUI 直绑 `text: b.styled`。**不要**在 .slint 里写 `@markdown("{b.text}")`——那不是插值
+// 模板，会被当编译期常量渲染成字面量（评审 B1/B2，2026-10-13）。
 export struct SysChatBlockRow {
     kind: string,        // role|h1|h2|h3|p|list|task|code|quote|table|hr|image|audio|video
-    text: string,        // 行内 markdown / 代码原文 / 角色名
+    text: string,        // 纯文本（code 原文 / 角色名 / 表格单元格）
+    styled: styled-text, // 行内 markdown 解析结果（h*/p/list/task/quote 用）
     level: int,
     order: int,
     checked: bool,
@@ -3222,21 +3225,21 @@ export component SystemChatWindow inherits Window {
                             color: b.text == "ABB" ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
                         }
                         if b.kind == "h1": StyledText {
-                            text: @markdown("{b.text}");
+                            text: b.styled;
                             default-font-size: 18px;
                             default-color: PixelTheme.text;
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
                         }
                         if b.kind == "h2": StyledText {
-                            text: @markdown("{b.text}");
+                            text: b.styled;
                             default-font-size: 16px;
                             default-color: PixelTheme.text;
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
                         }
                         if b.kind == "h3": StyledText {
-                            text: @markdown("{b.text}");
+                            text: b.styled;
                             default-font-size: 14px;
                             default-color: PixelTheme.text;
                             link-color: UiTokens.info;
@@ -3273,7 +3276,7 @@ export component SystemChatWindow inherits Window {
                                 Rectangle { width: 4px; background: PixelTheme.accent; }
                                 StyledText {
                                     horizontal-stretch: 1;
-                                    text: @markdown("{b.text}");
+                                    text: b.styled;
                                     default-font-size: 13px;
                                     default-color: UiTokens.text-dim;
                                     link-color: UiTokens.info;
@@ -3291,7 +3294,7 @@ export component SystemChatWindow inherits Window {
                             }
                             StyledText {
                                 horizontal-stretch: 1;
-                                text: @markdown("{b.text}");
+                                text: b.styled;
                                 default-font-size: 13px;
                                 default-color: PixelTheme.text;
                                 link-color: UiTokens.info;
@@ -3306,12 +3309,13 @@ export component SystemChatWindow inherits Window {
                                 background: b.header ? PixelTheme.bg : transparent;
                                 border-width: 1px;
                                 border-color: PixelTheme.edge;
-                                StyledText {
-                                    text: @markdown("{c}");
-                                    default-font-size: 12px;
-                                    default-color: PixelTheme.text;
-                                    link-color: UiTokens.info;
-                                    link-clicked(link) => { root.open-link(link); }
+                                // 表格单元格按纯文本渲染（行内样式在表内不保证，见 mdblocks 注释）
+                                Text {
+                                    text: c;
+                                    font-size: 12px;
+                                    color: PixelTheme.text;
+                                    wrap: word-wrap;
+                                    width: 100%;
                                 }
                             }
                         }
@@ -3379,7 +3383,7 @@ export component SystemChatWindow inherits Window {
                             }
                         }
                         if b.kind == "p": StyledText {
-                            text: @markdown("{b.text}");
+                            text: b.styled;
                             default-font-size: 13px;
                             default-color: PixelTheme.text;
                             link-color: UiTokens.info;

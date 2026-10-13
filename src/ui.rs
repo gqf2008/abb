@@ -1786,6 +1786,7 @@ pub fn run_gui() -> Result<()> {
         SysChatBlockRow {
             kind: "role".into(),
             text: label.into(),
+            styled: slint::StyledText::default(),
             level: 0,
             order: 0,
             checked: false,
@@ -1835,6 +1836,8 @@ pub fn run_gui() -> Result<()> {
         };
         SysChatBlockRow {
             kind: b.kind.into(),
+            // styled 必须在 text 之前算（text 会 move b.text）
+            styled: crate::mdblocks::styled(&b.text),
             text: b.text.into(),
             level: b.level,
             order: b.order,
