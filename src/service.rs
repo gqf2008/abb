@@ -697,9 +697,12 @@ pub async fn run() {
             // 句柄只构造一次、按通道 clone：两条通道必须共享同一对 store/states。
             let handles = crate::task_run::TaskHandles::new(&bot_key);
             crate::log!(
-                "[task:{bot_key}] 通道容量：schedule={}（固定池）/ manual=按需派发（并发闸门 {}，Config.task_workers，0 按 1 兜底）",
+                "[task:{bot_key}] 通道容量：schedule={}（固定池）/ manual=按需派发（并发闸门：{}，Config.task_workers；manual 的 0 = 不节流）",
                 cfg.task_workers.schedule_workers(),
-                cfg.task_workers.manual_cap()
+                match cfg.task_workers.manual_cap() {
+                    None => "不节流".to_string(),
+                    Some(n) => n.to_string(),
+                }
             );
             // Q7 的「上限可配」（`Config::task_workers`）：定时档起 N 个 worker；手动档恒 1 条
             // poller（自己按需 spawn 执行体）。认领是单锁 check-and-set，所以**同一条任务不会

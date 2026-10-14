@@ -49,8 +49,10 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 // v19：手动档改**按需派发**（认领到就起执行体，容量不再由池子大小决定，见 `config::TaskWorkers`
 //   与 `task_run` 模块头）。指引里那句「并发额度有限……超出就排队——它不是不限量的池子」是旧口径，
 //   必须一起改：它会把「你登记的任务都会跑」说成「排不上队」，正是这条配置面被反复抱怨的措辞来源。
+// v20：手动档默认值 128 → **0（不节流）**（阈值变更，独立 commit）：上一版把默认值写成上限，
+//   读起来仍像「最多 N 条」，而 0 才是「不挡」。指引那行默认值与说明随之改。
 // 内容变了就必须升版本号：存量工作区的指引不会被覆盖（幂等判据是「不含当前 marker」）。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v19";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v20";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -72,7 +74,8 @@ pub(crate) fn ensure_workspace_guide(workspace: &std::path::Path) {
     // 指引里的数字随代码默认值走（v17 之前是手抄的字面量，改了一边忘另一边就会明说错数）。
     let default_workers = crate::config::TaskWorkers::default();
     let tw_schedule = default_workers.schedule_workers();
-    let tw_manual = default_workers.manual_cap();
+    // 手动档默认 = 0（不节流），指引里那行 JSON 印的就是这个 0，紧随其后的正文解释了它的含义。
+    let tw_manual = default_workers.manual;
     let guide = format!(
         "# ABB 工作区（{GUIDE_MARKER}）
 
@@ -138,9 +141,10 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
 - 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
   用户可以继续聊别的。
-- **提交的任务都会开跑**（`config.json#task_workers`，默认 `{{\"schedule\":{tw_schedule},\"manual\":{tw_manual}}}`，0 按 1 兜底）：
-  定时档（`once`/`cron`/`interval`）按 `schedule` 条并行、到点即执行；手动档（`now`/`keepalive`）
-  **认领到就起执行体**——登记多少条就并行多少条（`keepalive` 常驻各自占一条执行体，不会把 `now` 饿死）；
+- **提交的任务都会开跑**（`config.json#task_workers`，默认 `{{\"schedule\":{tw_schedule},\"manual\":{tw_manual}}}`，其中 `manual` 的 **0 = 不节流**）：
+  定时档（`once`/`cron`/`interval`）按 `schedule` 条并行、到点即执行（写 0 按 1 兜底）；
+  手动档（`now`/`keepalive`）**认领到就起执行体**——登记多少条就并行多少条（`keepalive` 常驻各自占一条
+  执行体，不会把 `now` 饿死；写正数 N 则把同时在跑的手动档执行体限制在 N 条）；
   两条通道各有自己的队列，跨通道互不阻塞；
   **同一条任务永远不会自我重叠**（认领是单锁 check-and-set，跑到一半不会被再拉起）。
 - 子代理在后台跑完一轮 agent，**不产生中间可见回复**——用户只在完成时收到一条结果。
@@ -1090,7 +1094,7 @@ mod tests {
         ensure_workspace_guide(&dir);
         let d = crate::config::TaskWorkers::default();
         let schedule = d.schedule_workers();
-        let manual = d.manual_cap();
+        let manual = d.manual; // 0（不节流）：指引里印的就是配置默认值本身
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             for needle in [

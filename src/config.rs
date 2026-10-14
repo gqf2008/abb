@@ -906,11 +906,13 @@ impl JevConfig {
 ///   所以固定池下**任何**有限 N（含「默认 = 上限」）都是节流阀：多出来的常驻任务与 `now`
 ///   子代理只会静默排队（状态是「已登记」，用户以为在跑）。而「该起几条」只有配置的人知道，
 ///   代码猜不出来 ⇒ 手动档不再猜。
-///   `manual` 因此退化成**可选并发上限**：`N ≥ 1` = 同时在跑的手动档执行体上限 N。
-/// - 取值演进（手动档）：1（接线时）→ 4（2026-10-15 首次放宽）→ 上限值（同日第二次）：
-///   数字再大也还是闸门/池子，换层（按需派发）才对——本参数这才第一次真正表达出
-///   「不要挡我登记的任务」。
-/// - 0 → 1 兜底（写 0 不会把通道关掉）。
+///   `manual` 因此退化成**可选并发闸门**：`0`（默认）= **不节流**，`N ≥ 1` = 同时在跑的
+///   手动档执行体上限 N。
+/// - 取值演进（手动档）：1（接线时）→ 4（2026-10-15 首次放宽）→ 上限值（同日第二次）
+///   → `0`（同日第三次）。前两次都在改数字（数字再大也还是闸门），第三次才换层：手动档改
+///   按需派发，这个参数的默认值这才真正表达出「不要挡我登记的任务」。
+/// - 0 → 1 兜底**只对 `schedule` 成立**（写 0 不会把定时档关掉）；手动档的 0 是「不节流」，
+///   写 0 同样不会关掉任何东西（按需派发的 poller 始终在跑）。
 /// - 离谱的大值按 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警（不静默）。
 /// - 「不节流」不是免费，代价如实列：
 ///   - 同 bot 同时跑的真模型回合变多（token 成本随**用户登记的条数**上升，不再有池子上限兜住）；
@@ -925,26 +927,30 @@ pub struct TaskWorkers {
     pub manual: usize,
 }
 
-/// 每通道 worker 数的**上限**：防止手写 `{"schedule":100000}` 起出十万个轮询任务。
-/// 超过按上限生效并告警（不静默）。
+/// 每通道容量的**上限**：防止手写 `{"schedule":100000}` 起出十万个轮询任务、或
+/// `{"manual":100000}` 一次放行十万条并发。超过按上限生效并告警（不静默）。
 ///
 /// 2026-10-15：**8 → 128**。旧值把「手动档按 bot 真实承载能力配置」卡死——本机
 /// abb-agent 进程同时跑 100 条手动任务是常态，而写在 `config.json` 里的 100 会被
 /// 截断成 8（虽有告警，但配置表达不出意图）。上限的本意是挡住手滑写出的天文数字，
 /// 128 仍然守住这个用途。
 ///
-/// 同日手动档**默认值**也提到这个上限（见 [`DEFAULT_TASK_WORKERS_MANUAL`]）：默认不节流。
-/// 两者是**有意相等**的（默认不该挡任何东西），但值各写一份、由
-/// `task_workers_defaults_floor_and_partial_json` 钉住相等——再动上限而没重新掂量默认值 ⇒ 红。
+/// ⚠️ 它**只**约束「写进配置的显式数字」，不再与手动档默认值有任何关系：默认值是 `0`
+/// （不节流），不经 clamp（见 [`DEFAULT_TASK_WORKERS_MANUAL`]）。
 pub const MAX_TASK_WORKERS_PER_CHANNEL: usize = 128;
 
-/// 手动档（`now`/`keepalive`）worker 的**默认**条数：等于当时的每通道上限，即**默认不节流**。
+/// 手动档（`now`/`keepalive`）的**默认**并发闸门：`0` = **不节流**（默认）。
 ///
-/// 写死数字而**不是**引用 [`MAX_TASK_WORKERS_PER_CHANNEL`]：这两个值有意相等，但「相等」本身
-/// 才是要被守卫钉住的判断（`task_workers_defaults_floor_and_partial_json` 断言 `default == MAX`）。
-/// 若让默认值直接引用上限，改上限会**静默**改掉默认节流档位（例如上限 128→512 时默认起 512 个
-/// 轮询任务），没有任何一步会提醒你重新掂量——那是本文件最不想要的那种漂移。
-pub const DEFAULT_TASK_WORKERS_MANUAL: usize = 128;
+/// 为什么默认是「不节流」而不是某个数字：手动档的容量该由「用户登记了多少条任务」决定，
+/// 任何写死的数字都是猜（`keepalive` 常驻会让猜小的那些任务静默排队），而「该起几条」只有
+/// 配置的人知道 ⇒ 代码不猜。2026-10-15 的取值演进：1 → 4 → 128 → **0（不节流）**：前三次
+/// 都在改这个数字，第四次才认识到「闸门/池子本身就是节流阀」（卡
+/// `abb-task-workers-manual-not-a-pool-20261015`）。
+///
+/// 与 [`MAX_TASK_WORKERS_PER_CHANNEL`] 的关系：显式写正数仍按上限截断；默认的 `0` 不经 clamp。
+/// **旧的不变式（默认 == 上限）已作废**：它当初的作用是「改上限必须重新掂量默认值」，而现在
+/// 「不节流」根本不是一个可比较的数字 —— 于是守卫改成直接钉住「默认 == 0」与「0 ⇒ None」。
+pub const DEFAULT_TASK_WORKERS_MANUAL: usize = 0;
 
 impl TaskWorkers {
     /// 定时档 worker **池**大小：0 → 1 兜底；超过 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警。
@@ -953,10 +959,14 @@ impl TaskWorkers {
         clamp_workers("schedule", self.schedule)
     }
 
-    /// 手动档的**并发上限**：0 → 1 兜底；超过上限截断并告警。
+    /// 手动档的**并发闸门**：`None` = 不节流（`manual == 0`，默认）；`Some(n)` = 同时在跑的
+    /// 手动档执行体上限 n（超 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警）。
     /// 手动档是**按需派发**（认领到就起执行体），所以这个值只是闸门、不是池子大小。
-    pub fn manual_cap(&self) -> usize {
-        clamp_workers("manual", self.manual)
+    pub fn manual_cap(&self) -> Option<usize> {
+        if self.manual == 0 {
+            return None; // 不节流：登记多少条就并行多少条
+        }
+        Some(clamp_workers("manual", self.manual))
     }
 }
 
@@ -2014,8 +2024,8 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual = 每通道上限，0 按 1 兜底，
-    /// 且老的 config.json（缺字段 / 只给一半）都能正常解析。
+    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual 不节流（0），
+    /// 定时档 0 按 1 兜底，且老的 config.json（缺字段 / 只给一半）都能正常解析。
     #[test]
     fn task_workers_defaults_floor_and_partial_json() {
         let d = TaskWorkers::default();
@@ -2024,32 +2034,36 @@ mod tests {
             2,
             "定时档默认并行 2：到点即执行，不再被同档长任务排队"
         );
-        // 手动档默认 = 每通道上限。判据不是「想要更多并发」，而是任何**固定的**小默认值
+        // 手动档默认 = 不节流（0）。判据不是「想要更多并发」，而是任何**固定的**小默认值
         // 在默认配置下都可能**错**：keepalive 是常驻进程，认领它的执行体一直 await 到进程
         // 退出、永不还位 ⇒ 默认值低于「常驻任务条数」时，多出来的常驻任务与 `now` 子代理
         // 都只会排队排到天荒地老（用户看到的是「已登记」而不是「排不上」）。
-        // 这条断言同时把「默认 = 上限」钉住：改上限而没重新掂量默认值 ⇒ 红。
+        // 这条断言钉住「默认 = 0（不节流）」：默认值不该跟着上限漂。
         assert_eq!(
             d.manual_cap(),
-            MAX_TASK_WORKERS_PER_CHANNEL,
-            "手动档（now/keepalive）默认不节流 = 每通道上限"
+            None,
+            "手动档（now/keepalive）默认不节流（0 = 不节流，不是「上限档」）"
         );
         assert_eq!(
             d.manual, DEFAULT_TASK_WORKERS_MANUAL,
             "默认值本身就是「不节流」档（不是靠 clamp 兜的）——它会被序列化进 config.json"
         );
         assert_eq!(
-            DEFAULT_TASK_WORKERS_MANUAL, MAX_TASK_WORKERS_PER_CHANNEL,
-            "默认 = 每通道上限（默认不节流）：两个常量各写一份，就是为了让「再动上限」红一次，\
-             逼你重新掂量默认值（而不是让默认值跟着上限静默漂移）"
+            DEFAULT_TASK_WORKERS_MANUAL, 0,
+            "默认 = 0（不节流）：钉住「不节流不是一个数字」。旧守卫是「默认 == 上限」（逼改上限时\
+             重新掂量默认值），现在默认不再随上限变，于是改成直接盯着 0"
         );
 
         let zero = TaskWorkers {
             schedule: 0,
             manual: 0,
         };
-        assert_eq!(zero.schedule_workers(), 1);
-        assert_eq!(zero.manual_cap(), 1);
+        assert_eq!(zero.schedule_workers(), 1, "定时档的 0 才是 1 兜底");
+        assert_eq!(
+            zero.manual_cap(),
+            None,
+            "手动档的 0 = 不节流（写 0 不会关掉通道）"
+        );
 
         // 2026-10-15（上限 8 → 128）的阳性对照：100 是 abb-agent 的实际配置，
         // 必须原样生效而不是被截断成 8。这条断言钉住「上限不再挡住真实配置」。
@@ -2059,7 +2073,7 @@ mod tests {
         };
         assert_eq!(
             hundred.manual_cap(),
-            100,
+            Some(100),
             "manual=100 必须原样生效（旧上限 8 会把它截断）"
         );
 
@@ -2068,7 +2082,7 @@ mod tests {
             manual: 3,
         };
         assert_eq!(wide.schedule_workers(), 4);
-        assert_eq!(wide.manual_cap(), 3);
+        assert_eq!(wide.manual_cap(), Some(3));
 
         // 上限：离谱的大值按 MAX 生效（不静默按原值起 N 个轮询任务 / 放行 N 条并发）。
         // manual 用 100_000 而不是贴着旧上限的 99：上限 8→128 后，99 已是合法值、
@@ -2078,14 +2092,14 @@ mod tests {
             manual: 100_000,
         };
         assert_eq!(huge.schedule_workers(), MAX_TASK_WORKERS_PER_CHANNEL);
-        assert_eq!(huge.manual_cap(), MAX_TASK_WORKERS_PER_CHANNEL);
+        assert_eq!(huge.manual_cap(), Some(MAX_TASK_WORKERS_PER_CHANNEL));
 
         // 空 JSON（老 config.json）→ 全部走默认
         let cfg: Config = serde_json::from_str("{}").expect("空 JSON 应能用默认值构造");
         assert_eq!(cfg.task_workers.schedule_workers(), 2);
         assert_eq!(
             cfg.task_workers.manual_cap(),
-            MAX_TASK_WORKERS_PER_CHANNEL,
+            None,
             "空 JSON（老 config.json）也走新默认（= 不节流）"
         );
 
@@ -2097,7 +2111,7 @@ mod tests {
             2,
             "未给出的字段仍走默认"
         );
-        assert_eq!(cfg.task_workers.manual_cap(), 3);
+        assert_eq!(cfg.task_workers.manual_cap(), Some(3));
     }
 
     #[test]

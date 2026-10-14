@@ -41,7 +41,8 @@
 //! - 手动档＝**按需派发**：只起**一条** poller，认领到任务就 `spawn` 一个执行体并立刻回去看
 //!   下一条。手动档里的 `keepalive` 常驻**永不还位**，固定池下**任何**有限 N 都是节流阀
 //!   （多出来的常驻任务与 `now` 子代理静默排队）；容量该由「用户登记了多少条」决定，
-//!   不该由启动时写死的池子决定。`task_workers.manual` 退化为**可选并发闸门**。
+//!   不该由启动时写死的池子决定。`task_workers.manual` 退化为**可选并发闸门**：
+//!   `0`（默认）= 不节流，`N ≥ 1` = 上限 N。
 //!
 //! 拆的理由是：`now` 的后台子代理与 keepalive 常驻进程都是长任务，共用一条队列时
 //! 定时触发会被饿死（cron 落在被占用分钟点上的那次会整次消失）。两条通道共享同一对
@@ -293,7 +294,7 @@ async fn task_worker_with_stores(
     // 手动档在跑的**执行体**句柄：既是并发闸门的账本（还在跑的条数），也是关停时的
     // 收尾名单。定时档恒为空（固定池：worker 就地 await 跑完）。
     let mut manual_runs: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    // 手动档并发闸门（`task_workers.manual`；0 → 1 兜底）。
+    // 手动档并发闸门（`task_workers.manual`）：`None` = 不节流（0/缺失，默认）。
     let manual_cap = cfg.task_workers.manual_cap();
 
     loop {
@@ -338,7 +339,12 @@ async fn task_worker_with_stores(
                 // 为同一条任务反复起执行体（锁里输掉的那些立刻退出）——那就是 D5' 那个忙循环的
                 // 变体。先认领 ⇒ 状态已 Running ⇒ 下一轮候选里没有它。
                 Channel::Manual => {
-                    if manual_runs.len() < manual_cap {
+                    // 闸门：`None` = 不节流（登记多少条就并行多少条）；`Some(n)` = 上限 n。
+                    let under_cap = match manual_cap {
+                        None => true,
+                        Some(cap) => manual_runs.len() < cap,
+                    };
+                    if under_cap {
                         if let Some(_due) = claim_task(&bot_key, &states, &task, now) {
                             let bot = bot.clone();
                             let cfg = Arc::clone(&cfg);
