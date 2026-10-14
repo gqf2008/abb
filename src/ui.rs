@@ -2913,10 +2913,18 @@ fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
         "list" => "•".to_string(),
         _ => String::new(),
     };
+    // `kind`/`text` 都会被 move 进下面那个结构体 ⇒ 在这里先算好。
+    // **只有行内 markdown 块**渲染会读 `styled`（B 批 O3）：`code` 用 `text` 原文、
+    // `table|hr|image|audio|video` 都不读 ⇒ 白算一遍的代价在大代码块上是整块 `from_markdown`
+    // 解析。集合与 `mdblocks::selectable_plain` 同源（都在 `inline_markdown_kind` 里定义）。
+    let styled = if crate::mdblocks::inline_markdown_kind(&b.kind) {
+        crate::mdblocks::styled(&b.text)
+    } else {
+        slint::StyledText::default()
+    };
     SysChatBlockRow {
         kind: b.kind.into(),
-        // styled 必须在 text 之前算（text 会 move b.text）
-        styled: crate::mdblocks::styled(&b.text),
+        styled,
         text: b.text.into(),
         level: b.level,
         order: b.order,
@@ -3055,6 +3063,41 @@ fn stream_rows(
         }
     }
     rows
+}
+
+/// ⌘V（macOS `/` Ctrl+V）在**已经确认按下 ⌘+V**时的落点（纯函数，判据在单测里）。
+///
+/// 为什么要单独一支：剪贴板里有**文件**时绝不能把这次按键交给 `TextInput`——它会把
+/// 文件路径当**文本**粘进输入框（窗口很窄，一眼可见）。三条口径：
+/// - 不是「⌘ + V 按下」或剪贴板没文件 ⇒ `Ignore`（文本粘贴照旧由 `TextInput` 处理）；
+/// - 有文件、首拍 ⇒ `Land`（落进待发）；
+/// - 有文件、长按 repeat ⇒ `Swallow`（只吞不落：重复落会得到 `-1`/`-2` 重复附件）。
+///
+/// **`busy` 不参与判断**（C 批 O3）：待发列表与「有没有在生成」无关，落进去只是等下一次
+/// 发送；旧口径在 busy 时放行 ⇒ 文件路径文本漏进输入框。这条接线由源码守卫
+/// `cmd_v_file_interception_is_not_gated_on_busy` 钉住（事件层行为无法单测）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CmdVAction {
+    Ignore,
+    Land,
+    Swallow,
+}
+
+fn cmd_v_action(
+    super_held: bool,
+    pressed: bool,
+    repeat: bool,
+    is_v: bool,
+    has_files: bool,
+) -> CmdVAction {
+    if !(super_held && pressed && is_v && has_files) {
+        return CmdVAction::Ignore;
+    }
+    if repeat {
+        CmdVAction::Swallow
+    } else {
+        CmdVAction::Land
+    }
 }
 
 pub fn run_gui() -> Result<()> {
@@ -8090,9 +8133,15 @@ pub fn run_gui() -> Result<()> {
             });
         }
         syschat_win.window().on_winit_window_event(move |w, ev| {
-            // C2 拖放（Finder → 对话窗）：**不需要任何 AppKit 手写代码**——winit 0.30 的 macOS
-            // 实现自己就是 `NSDraggingDestination`（`window_delegate.rs:367`），已把系统拖放翻译成
-            // `HoveredFile` / `DroppedFile` / `HoveredFileCancelled`（注册见 `:667`）。
+            // C2 拖放（Finder → 对话窗）：**不需要任何 AppKit 手写代码**——winit 0.30.13 的
+            // macOS 实现自己就是 `NSDraggingDestination`（`window_delegate.rs:367`），把系统拖放
+            // 翻译成 `HoveredFile`（`draggingEntered:`，`:369`，拖入时**逐文件**发一次）/
+            // `DroppedFile`（`performDragOperation:`，`:398`，同样逐文件）/
+            // `HoveredFileCancelled`（`draggingExited:`，`:426`）。
+            // ⚠️ 上游边界（已实核源码，行为后果**未在本机实测**）：它注册的只有
+            // `NSFilenamesPboardType`（`:666-669`），取不到就 `return false`（`:376` / `:405`）
+            // ⇒ 只提供其它类型（如 `public.file-url`）的拖放源**不会产生任何事件**；
+            // 从浏览器直拖图片属于这一类（待 owner 真机复验后定口径）。
             match ev {
                 WindowEvent::HoveredFile(_) => {
                     let h = {
@@ -8129,20 +8178,25 @@ pub fn run_gui() -> Result<()> {
                 super_held.set(m.state().super_key());
             }
             if let WindowEvent::KeyboardInput { event, .. } = ev {
-                if super_held.get()
-                    && event.state == ElementState::Pressed
-                    && !event.repeat
-                    && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
-                    && cw2.upgrade().map(|w| !w.get_busy()).unwrap_or(false)
-                {
+                let is_v =
+                    matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v"));
+                let pressed = event.state == ElementState::Pressed;
+                // 只在「可能被我们接管的键」上探剪贴板（探一次是一次 ObjC 往返）。
+                if super_held.get() && pressed && is_v {
                     let paths = platform::pasteboard_file_paths();
-                    if !paths.is_empty() {
-                        // 落地在 UI 线程同步完成（否则待发列表要跨线程共享）；典型附件很小，
-                        // 大可接受（若将来出现「粘大文件卡 UI」的反馈，再改成队列 + 单发定时器）。
-                        land_paste(paths, "已附加");
-                        return EventResult::PreventDefault; // 不落给 TextInput ⇒ 不会粘文本
+                    match cmd_v_action(true, pressed, event.repeat, is_v, !paths.is_empty()) {
+                        CmdVAction::Land => {
+                            // 落地在 UI 线程同步完成（否则待发列表要跨线程共享）；典型附件很小，
+                            // 大可接受（若将来出现「粘大文件卡 UI」的反馈，再改成队列 + 单发定时器）。
+                            land_paste(paths, "已附加");
+                            return EventResult::PreventDefault; // 不落给 TextInput ⇒ 不会粘文本
+                        }
+                        // 长按 repeat：**吞掉但不重复落地**（每次 repeat 都落会得到 `-1`/`-2`
+                        // 的重复附件；放行则 TextInput 会把文件路径当文本粘进输入框）。
+                        CmdVAction::Swallow => return EventResult::PreventDefault,
+                        // 剪贴板无文件：继续往下，文本粘贴仍由 Slint TextInput 处理。
+                        CmdVAction::Ignore => {}
                     }
-                    // 剪贴板无文件：继续往下，文本粘贴仍由 Slint TextInput 处理。
                 }
             }
             if matches!(ev, WindowEvent::CloseRequested) {
@@ -9194,6 +9248,94 @@ mod headless_render;
 
 #[cfg(test)]
 mod tests {
+
+    // ── B 批 O3 / C 批 O3：块渲染与 ⌘V 的纯逻辑 ─────────────────────────────
+
+    /// B 批 O3：`block_row` 只对**行内 markdown** kind 算 `StyledText`。
+    ///
+    /// 变异点：把 `crate::mdblocks::inline_markdown_kind` 改成恒 `true` ⇒ 第二段红
+    /// （`code`/`table` 等也被算了一遍 `from_markdown`，大代码块就是整块白解析）；
+    /// 改成恒 `false` ⇒ 第一段红（行内样式块不再有样式）。
+    #[test]
+    fn block_row_computes_styled_only_for_inline_markdown_kinds() {
+        for kind in ["p", "h1", "h2", "h3", "list", "task", "quote"] {
+            let mut b = crate::mdblocks::MdBlock::new(kind);
+            b.text = "**粗** 与普通字".into();
+            let row = block_row(b);
+            assert!(!row.selectable, "{kind} 有行内样式 ⇒ 走 StyledText");
+            assert_ne!(
+                row.styled,
+                slint::StyledText::default(),
+                "{kind} 必须算 styled（GUI 这一支就读它）"
+            );
+        }
+        for kind in ["code", "hr", "image", "audio", "video", "table"] {
+            let mut b = crate::mdblocks::MdBlock::new(kind);
+            b.text = "**不是标记** 的原文".into();
+            let row = block_row(b);
+            assert_eq!(
+                row.styled,
+                slint::StyledText::default(),
+                "{kind} 不读 styled ⇒ 不该白算（大代码块会整块解析一遍）"
+            );
+        }
+    }
+
+    /// C 批 O3：⌘V 的落点判据。变异点：`repeat` 不看 ⇒ `Swallow` 那条变 `Land`（红）；
+    /// `has_files` 不看 ⇒ 无文件也落地（红）；`pressed`/`is_v` 不看 ⇒ `Ignore` 那批红。
+    #[test]
+    fn cmd_v_action_swallows_repeat_and_lands_files_once() {
+        use CmdVAction::*;
+        // 不是「⌘ + V 按下」或剪贴板没文件 ⇒ 交给 TextInput 粘文本
+        assert_eq!(
+            cmd_v_action(false, true, false, true, true),
+            Ignore,
+            "没按 ⌘"
+        );
+        assert_eq!(
+            cmd_v_action(true, false, false, true, true),
+            Ignore,
+            "不是按下态"
+        );
+        assert_eq!(
+            cmd_v_action(true, true, false, false, true),
+            Ignore,
+            "不是 V"
+        );
+        assert_eq!(
+            cmd_v_action(true, true, false, true, false),
+            Ignore,
+            "无文件"
+        );
+        // 有文件：首拍落地；长按 repeat 只吞不落（否则重复附件 + 路径漏成文本）
+        assert_eq!(cmd_v_action(true, true, false, true, true), Land);
+        assert_eq!(cmd_v_action(true, true, true, true, true), Swallow);
+    }
+
+    /// C 批 O3：拦截条件不得再被 `busy` 关掉（关掉 ⇒ busy 期间 ⌘V 把文件路径粘成文本）。
+    /// 事件层行为要真 winit 事件才能测，故按本仓既有做法用**源码守卫**钉住接线；
+    /// 落点语义由 `cmd_v_action_swallows_repeat_and_lands_files_once` 覆盖。
+    ///
+    /// 变异点：在拦截条件里加回 `&& !w.get_busy()` ⇒ 本用例红。
+    #[test]
+    fn cmd_v_file_interception_is_not_gated_on_busy() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        // 定位**调用点**（不是上面的 `fn cmd_v_action(` 定义）：调用点带实参 `true`。
+        let call = prod.rfind("cmd_v_action(true").expect("⌘V 决策应被调用");
+        let start = prod[..call]
+            .rfind("if let WindowEvent::KeyboardInput")
+            .expect("应能定位 ⌘V 所在的按键分支");
+        let region = &prod[start..call];
+        assert!(
+            !region.contains("get_busy"),
+            "⌘V 的拦截不得再按 busy 放行（会把文件路径漏成文本）：{region}"
+        );
+        assert!(
+            region.contains("pasteboard_file_paths"),
+            "⌘V 仍须探测剪贴板里的文件：{region}"
+        );
+    }
 
     // ── A（卡 `abb-v11-bubble-follow-lag`）：跟随泵的纯逻辑 ──────────────────
 

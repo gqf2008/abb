@@ -4825,9 +4825,13 @@ export component SystemChatWindow inherits Window {
                                     }
                                     // 📎 附件：接既有 attach-pick（可多选）；生成中也可用
                                     // （卡的待发附件会随本轮发送/排队项一起带上）。
+                                    // 提示里带上另外两条**同样可用**的入口（C2 批 C）：Finder 拖进窗口、
+                                    // Finder 里 ⌘C 后 ⌘V。⚠️ 别在这里写死「浏览器里的图拖不进来」——
+                                    // 那是上游 winit 只认 `NSFilenamesPboardType` 推出来的**待验**后果
+                                    // （源码已实核，行为未实测，见 `src/ui.rs` 拖放钩子上的注释与交接文档 §6）。
                                     ComposerIcon {
                                         icon: "📎";
-                                        tip: "添加附件（可多选）";
+                                        tip: "添加附件（可多选，也可拖入窗口或 ⌘V 粘贴）";
                                         clicked => { root.attach-pick(); }
                                     }
                                     ComposerIcon {

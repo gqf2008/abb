@@ -38,7 +38,8 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 pub struct MdBlock {
     /// `h1|h2|h3|p|list|task|code|quote|table|hr|image|audio|video`
     pub kind: String,
-    /// 行内 markdown 文本（h*/p/list/task/quote/table 用）；`code` 为代码原文。
+    /// 行内 markdown 文本（[`inline_markdown_kind`] 那些 kind 用）；`code` 为代码原文；
+    /// 结构化/媒体块（`table|hr|image|audio|video`）不用它（表格正文在 `cells`）。
     pub text: String,
     /// 列表缩进层级（0 起）；非列表为 0。
     pub level: i32,
@@ -48,7 +49,7 @@ pub struct MdBlock {
     pub checked: bool,
     /// 代码块语言标注。
     pub lang: String,
-    /// 表格行单元格（行内 markdown）。
+    /// 表格行单元格（**纯文本**：表内不过行内 markdown，见 [`parse`] 的 `in_table` 分支）。
     pub cells: Vec<String>,
     /// 表格该行是否表头。
     pub header: bool,
@@ -58,7 +59,7 @@ pub struct MdBlock {
 }
 
 impl MdBlock {
-    fn new(kind: &str) -> Self {
+    pub(crate) fn new(kind: &str) -> Self {
         Self {
             kind: kind.to_string(),
             text: String::new(),
@@ -156,6 +157,16 @@ fn plain(escaped: &str) -> String {
     out
 }
 
+/// 该 kind 的正文是**行内 markdown**：字面量元字符已被 [`push_escaped`] 转义，渲染走
+/// [`styled`]（`ui::block_row` 只为这些 kind 算 `StyledText`——`code` 走原文、
+/// `table|hr|image|audio|video` 不读它，见该处注释）。
+///
+/// 只在此处定义一次：判「要不要换成只读 `TextInput`」的 [`selectable_plain`] 与判
+/// 「要不要算 `styled`」的 `ui::block_row` 必须同集合，否则要么白算要么白丢样式。
+pub fn inline_markdown_kind(kind: &str) -> bool {
+    matches!(kind, "h1" | "h2" | "h3" | "p" | "list" | "task" | "quote")
+}
+
 /// 该块的正文能否**换成只读 `TextInput` 渲染**（卡 `abb-v11-message-actions`；Slint 1.18
 /// 的 `read-only` 仍可拖选并 ⌘C），返回可选的**展示文本**。
 ///
@@ -172,16 +183,16 @@ fn plain(escaped: &str) -> String {
 ///   这是复制/朗读最要紧的一类块（`ls *.rs`、`C:\Users\x`），既不能按元字符判样式，
 ///   也不能反解转义。
 pub fn selectable_plain(kind: &str, text: &str) -> Option<String> {
-    match kind {
-        "code" => Some(text.to_string()),
-        "h1" | "h2" | "h3" | "p" | "list" | "task" | "quote" => {
-            if has_inline_markup(text) {
-                None
-            } else {
-                Some(plain(text))
-            }
-        }
-        _ => None,
+    if kind == "code" {
+        return Some(text.to_string());
+    }
+    if !inline_markdown_kind(kind) {
+        return None;
+    }
+    if has_inline_markup(text) {
+        None
+    } else {
+        Some(plain(text))
     }
 }
 
@@ -636,7 +647,10 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                 if let Some((_, buf)) = code.as_mut() {
                     buf.push_str(&h);
                 } else if in_table {
-                    push_escaped(&h, &mut cell);
+                    // 表内**一律不转义**（与上面 `Event::Text`/`Event::Code` 的 in_table 分支同口径）：
+                    // 单元格由 GUI 用纯 `Text` 渲染，转义出来的反斜杠会**可见**地画进格子里
+                    // （`| <b>x</b> |` 曾显示成 `\<b\>x\</b\>`）。
+                    cell.push_str(&h);
                 } else if let Some(m) = media_from_html(&h) {
                     // 与 markdown 图片同口径：切块前先落盘当前段落，保证块序正确
                     flush_cur(&mut blocks, &mut cur);
@@ -693,6 +707,15 @@ fn push_table_row(blocks: &mut Vec<MdBlock>, cells: &mut Vec<String>, header: bo
 }
 
 /// 去掉链接目标里的 title 部分（`url "title"` → `url`）。
+///
+/// **现状（2026-10-15 实核）**：这条分支在当前调用链上**取不到输入**——两个调用点拿到的
+/// 都是 pulldown-cmark 的 `dest_url`（`Tag::Link`/`Tag::Image` 的字段）或由它重建的
+/// `](dest_url)` 文本，而 0.13.4 的 `dest_url` **不含** title（title 在同一个 tag 的独立
+/// `title` 字段里）。把整个函数换成 `dest.to_string()` 后没有任何行为用例变红。
+/// 留着它是**防御性**的：成本近乎零，而上游哪天把 title 塞回 `dest_url`，
+/// 「带空格的文件名」这类路径就会开始带上 `"标题"`。它的契约钉在单测
+/// `dest_strip_title_pins_title_contract`（直接喂带 title 的串）——**不要**拿集成用例
+/// `path_with_spaces_not_truncated` 充当它的判据（那里 title 早就被 pulldown 自己剥掉了）。
 ///
 /// **不能**用 `split_whitespace().next()`：pulldown-cmark 已把 `<...>` 角括号剥掉，
 /// 带空格的文件名（macOS 截图常见）会被当成 title 切掉（评审 N1）。只切「空格 + 引号」。
@@ -885,9 +908,20 @@ mod tests {
         let b = parse("![截图](<my file.png>)");
         assert_eq!(kinds(&b), vec!["image"]);
         assert_eq!(b[0].src, "my file.png", "带空格路径不得被 title 规则截断");
-        // title 仍要剥掉
+        // title 不得进 src：这条钉的是**整条解析链路**（title 由 pulldown 自己剥掉，
+        // 见 `dest_strip_title` 注释），不是那个函数的判据。
         let b = parse("![图](a.png \"标题\")");
         assert_eq!(b[0].src, "a.png");
+    }
+
+    /// `dest_strip_title` 的**契约**（防御性分支，见函数注释）：调用链上取不到带 title 的输入，
+    /// 所以直接喂串。变异点：删掉「空格 + 引号」那一支（`dest.find(\" \\\"\")` 恒 None）⇒ 本用例红。
+    #[test]
+    fn dest_strip_title_pins_title_contract() {
+        assert_eq!(dest_strip_title("a.png \"标题\""), "a.png");
+        // 不带引号的空格**不能**切（N1：macOS 截图名里带空格）
+        assert_eq!(dest_strip_title("my file.png"), "my file.png");
+        assert_eq!(dest_strip_title(""), "");
     }
 
     #[test]
@@ -1003,6 +1037,26 @@ mod tests {
             rows[1].cells
         );
     }
+
+    /// B 批 O1：表内 HTML 与表内文本同口径——**不转义**（单元格由 GUI 用纯 `Text` 画，
+    /// 转义出来的反斜杠会**可见**）。变异点：把 in_table 的 HTML 分支改回 `push_escaped`
+    /// ⇒ 下面的 `!contains('\\')` 红。
+    #[test]
+    fn html_in_table_is_not_escaped() {
+        let b = parse("| a |\n|---|\n| <b>x</b> |\n");
+        let rows: Vec<&MdBlock> = b.iter().filter(|x| x.kind == "table").collect();
+        assert_eq!(rows[1].cells, vec!["<b>x</b>"], "表内 HTML 应原样进单元格");
+        assert!(
+            !rows[1].cells.iter().any(|c| c.contains('\\')),
+            "表内文本不得带转义反斜杠：{:?}",
+            rows[1].cells
+        );
+        // 行内 HTML（`<b>` 是 Event::InlineHtml）与块级同口径
+        assert_eq!(
+            parse("| a |\n|---|\n| x <br> y |\n")[1].cells,
+            vec!["x <br> y"]
+        );
+    }
     /// 卡 `abb-v11-message-actions`：只读 `TextInput` 只对**无行内样式**的块做替换，
     /// 判据必须精确——否则要么白丢样式（回退 B 批），要么白丢可选中能力。
     #[test]
@@ -1065,10 +1119,24 @@ mod tests {
     ///
     /// 漏掉 `~` 时的实测后果（独立评审）：`~~删~~` 被判成「无行内样式」⇒ 走只读 `TextInput`
     /// ⇒ 用户看到字面量 `~~删~~`（删除线没了），两分支差异 920 像素。
+    ///
+    /// **`~a~`（单波浪成对）为什么也画删除线**（B 批 O4，2026-10-15 实核）：解析器
+    /// `pulldown-cmark-0.13.4/src/parse.rs` 的 `MaybeEmphasis` 分支里，`~` 成对时若没开
+    /// `ENABLE_SUBSCRIPT` 就归 `Strikethrough`；我们只开了 `ENABLE_STRIKETHROUGH`
+    /// ⇒ `~a~` 与 `~~a~~` 解析后**同形**（都重发成 `~~a~~`）。这是解析器的口径，不是本仓取舍；
+    /// 字面量波浪号则不受影响——`~` 要贴着非空白字符才成对，`~/a`、`a ~ b` 都不成对。
     #[test]
     fn tilde_is_escaped_when_literal_and_detected_when_a_style() {
         // 字面量波浪号：解析后已被转义 ⇒ 可选中，且展示文本逐字等于原文
-        for src in ["约 3~4 元", "~/bin/abb", "a~b"] {
+        for src in [
+            "约 3~4 元",
+            "~/bin/abb",
+            "a~b",
+            "好的~",
+            "see ~/x now",
+            "a ~ b ~ c",
+            "把文件放到 ~/a 和 ~/b",
+        ] {
             let b = parse(src);
             assert_eq!(b.len(), 1, "{src:?}");
             assert!(
@@ -1094,6 +1162,8 @@ mod tests {
             );
             assert_eq!(selectable_plain(&b[0].kind, &b[0].text), None, "{src:?}");
         }
+        // 单波浪与双波浪**同形**（逐字钉住，免得后人以为两者渲染不同）
+        assert_eq!(parse("~a~")[0].text, parse("~~a~~")[0].text);
         // 混合：有样式 + 字面量波浪号 ⇒ 走 StyledText，但文本里的 `~` 已转义（Slint 认 `\~`）
         let b = parse("**粗** 与 3~4");
         assert_eq!(selectable_plain(&b[0].kind, &b[0].text), None);

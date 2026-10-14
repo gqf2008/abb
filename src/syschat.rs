@@ -791,10 +791,17 @@ pub fn attachments_dir() -> PathBuf {
 /// （也就没有对应的取消事件）。所以「高亮何时收起」「同一路径会不会被落地两次」必须由我们自己
 /// 定义口径；GUI 事件循环没法单测，把口径抽成纯结构才能用单测钉住。
 ///
-/// 事件口径（winit 0.30 macOS 实现，`window_delegate.rs:367-429`）：
-/// - `draggingEntered:` **一次性**把拖入的全部文件名各发一条 `HoveredFile`；
-/// - `performDragOperation:` 逐文件发 `DroppedFile`；
-/// - 只有「拖出窗口 / 取消」才发 `HoveredFileCancelled`。
+/// 事件口径（winit 0.30.13 macOS 实现 `platform_impl/macos/window_delegate.rs`，逐行实核）：
+/// - `draggingEntered:`（`:369`，取 `NSFilenamesPboardType` `:376`）把拖入的全部文件名**各**发一条
+///   `HoveredFile`——拖 N 个文件就是 N 条；
+/// - `performDragOperation:`（`:398`/`fn` `:399`，同样读 `:405`）逐文件发 `DroppedFile`；
+/// - `draggingExited:`（`:426`）发 `HoveredFileCancelled`（拖出窗口/取消）；
+/// - `concludeDragOperation:`（`:420`）**什么都不发**；
+/// - 该版本**没有** `draggingUpdated:`（`:369`–`:429` 内只有上面四个方法）。
+///
+/// 上游边界（**源码已实核，行为后果未在本机实测**）：winit 只注册 `NSFilenamesPboardType`
+/// （`:666-669`），其它类型取不到即 `return false`（`:376`/`:405`）⇒ 拖放源只提供别的类型时
+/// **一个事件都不会有**（浏览器直拖图片可能属于这一类；锁屏期无法做真机拖放验证，待复验）。
 #[derive(Default)]
 pub struct DropTracker {
     hovering: bool,
@@ -824,6 +831,12 @@ impl DropTracker {
     }
 
     /// `HoveredFileCancelled`：拖出/取消 ⇒ 收高亮 + 清去重集。
+    ///
+    /// 清去重集是**防御性**的（C2 批 A）：现实中每次拖入都会重新 `draggingEntered:`
+    /// ⇒ 重新 [`Self::hovered`]，而那里在 `hovering` false→true 时必清。所以这条清空
+    /// 在 winit 0.30.13 的事件序下取不到输入（变异掉它，既有用例全绿）。留着是因为代价为零，
+    /// 而万一上游真的发来「取消后紧跟同一路径的 drop」（没有新的 hover），不清就会**静默吞掉**
+    /// 这次落地。这条契约由 `drop_tracker_cancel_resets` 钉住。
     pub fn cancelled(&mut self) {
         self.hovering = false;
         self.landed.clear();
@@ -886,13 +899,27 @@ fn land_one(dir: &std::path::Path, src: &std::path::Path, ts: u64) -> Result<Att
         .unwrap_or("attachment");
     let base = sanitize_attachment_name(raw);
     let target = unique_attachment_path(dir, &base, ts);
-    let bytes = std::fs::copy(src, &target).map_err(|e| {
-        format!(
-            "复制附件失败（{} → {}）：{e}",
-            src.display(),
-            target.display()
-        )
-    })?;
+    let bytes = match std::fs::copy(src, &target) {
+        Ok(n) => n,
+        Err(e) => {
+            // 半截目标：`copy` 是「先建目标再写」，写到一半失败（ENOSPC/EIO）会留下一个
+            // 看起来像附件、内容却不完整的文件——`land_attachments_in` 的回滚只清**成功项**
+            // （`landed`），碰不到它，于是它会默默积在附件目录里（C 批 O1）。
+            // 这里 best-effort 删掉；删不掉也不叠加错误（已经在错误路径上）。
+            //
+            // 如实记：这条分支在测试里**无法确定性触发**——std 的 `fs::copy` 先 `open` 源并校验
+            // 「regular file」，再 `open` 目标；所有能诱导的失败（缺文件/目录/超长名/不可写目录）
+            // 都在目标的 `open` 上就失败 ⇒ 目标要么压根没建、要么是早已存在的那个文件
+            // （`unique_attachment_path` 保证不撞名）。「已建、写到一半」只可能来自**写中途失败**
+            // （ENOSPC/EIO），造不出来。故此处只保证行为，不声称有判据。
+            let _ = std::fs::remove_file(&target);
+            return Err(format!(
+                "复制附件失败（{} → {}）：{e}",
+                src.display(),
+                target.display()
+            ));
+        }
+    };
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -3305,14 +3332,28 @@ mod tests {
     }
 
     /// 拖出/取消：收高亮 + 清去重集（下一轮重新可落）。
+    ///
+    /// 变异点：删掉 `cancelled()` 里的 `landed.clear()` ⇒ 中间那条断言红。**只有它咬得住**：
+    /// `hovered()` 自己在 `hovering` false→true 时也会清（见上一条），所以「取消 → 重新 hover
+    /// → drop」这条路删掉清空照样绿（winit 0.30.13 每次拖入都重发 `draggingEntered:`）。
     #[test]
     fn drop_tracker_cancel_resets() {
+        let p = std::path::Path::new("/tmp/a.png");
         let mut t = DropTracker::new();
         t.hovered();
+        assert!(
+            t.dropped(p),
+            "第一轮应落地（不先落一次，下面那条断言就不承重）"
+        );
         t.cancelled();
         assert!(!t.hovering());
+        // 取消后**没有**新的 hover 就直接 drop（winit 0.30.13 不发这种序，属防御）：仍应落地
+        assert!(
+            t.dropped(p),
+            "取消后同一路径不得被当成「本轮已落过」而静默吞掉"
+        );
         t.hovered();
-        assert!(t.dropped(std::path::Path::new("/tmp/a.png")));
+        assert!(t.dropped(p));
     }
 
     #[test]

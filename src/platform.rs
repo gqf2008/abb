@@ -217,7 +217,6 @@ pub fn activate_app() {}
 /// 须在主线程调（同 [`activate_app`]）。
 #[cfg(target_os = "macos")]
 pub fn app_is_active() -> bool {
-    #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -273,7 +272,6 @@ pub fn app_is_active() -> bool {
 pub fn visible_work_area(
     win: &slint::winit_030::winit::window::Window,
 ) -> Option<(f32, f32, f32, f32)> {
-    #![allow(non_snake_case)]
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::ffi::c_void;
     use std::sync::OnceLock;
@@ -518,7 +516,6 @@ pub fn hide_dock() {}
 /// 挂到 NSApplication，reopen 时调用注册的回调（Rust 侧显示设置窗）。
 #[cfg(target_os = "macos")]
 pub fn install_dock_reopen(on_reopen: Box<dyn Fn()>) {
-    #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -619,7 +616,6 @@ pub fn install_dock_reopen(_on_reopen: Box<dyn Fn()>) {}
 
 #[cfg(target_os = "macos")]
 fn macos_activate(front: bool) {
-    #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -683,7 +679,6 @@ fn macos_activate(front: bool) {
 /// （Windows CI 只需能编译）。
 #[cfg(target_os = "macos")]
 pub fn pick_files_multi() -> Vec<PathBuf> {
-    #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -754,7 +749,6 @@ pub fn pick_files_multi() -> Vec<PathBuf> {
 /// 没有文件 URL，自然落回文本粘贴路径）。**主线程**调。
 #[cfg(target_os = "macos")]
 pub fn pasteboard_file_paths() -> Vec<PathBuf> {
-    #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
@@ -817,7 +811,6 @@ pub fn pasteboard_file_paths() -> Vec<PathBuf> {
 /// 拿不到 UTF-8 路径的跳过。传 nil 返回空。
 #[cfg(target_os = "macos")]
 unsafe fn nsurls_to_paths(urls: *mut std::ffi::c_void) -> Vec<PathBuf> {
-    #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
