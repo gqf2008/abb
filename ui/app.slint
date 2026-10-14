@@ -3055,6 +3055,17 @@ export struct PendingAttachRow {
     ext: string,         // 类型角标（PNG / PDF / ...）
 }
 
+// v11（卡 `abb-v11-popup-anchor`）：输入区功能钮在**窗口坐标**下的矩形。
+// 为什么要让 Slint 报给 Rust：`crow` 整体右对齐，功能区左缘 = 输入框右缘 − 发送钮宽，而发送钮
+// 宽随文案/字体变 ⇒ Rust 侧复算不出来；而面板落位的**算术**（贴按钮上方、靠窗边内移）必须可
+// 单测 ⇒ 几何由这里给，算术留在 `syschat::pop_anchor`（纯函数）。
+export struct PopBtnRect {
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+}
+
 // 全局锚点气泡：常驻屏幕的系统级对话入口。
 // 透明 + 无边框 + always-on-top；WindowMoveArea 负责拖动（带阈值：单击不移动），
 // 单纯单击落到下层 TouchArea → open-chat。位置由 Rust 持久化（syschat/bubble.json）。
@@ -3623,6 +3634,42 @@ export component SystemChatWindow inherits Window {
     in-out property <bool> emoji-open: false;
     in-out property <bool> more-open: false;
 
+    // ── v11（卡 `abb-v11-popup-anchor`）：`.pop` 面板的锚点 ─────────────────────
+    // 稿 v11 第 1 条：「表情 / 更多 的面板必须**紧贴对应按钮上方**弹出」（此前锚在输入框顶边，
+    // 底边离按钮有「待发附件行 + 文本区」那么高）。锚点算术在 `syschat::pop_anchor`（纯函数带
+    // 单测，含「靠窗边整体内移、不出窗」）；这里只报几何、只画。
+    // 输入（Slint → Rust）：两个功能钮的**窗口坐标矩形**（`crow` 整体右对齐 ⇒ Rust 算不出来）。
+    // `changed` 只认单值属性 ⇒ 用一个几何指纹（`pop-watch`）触发回调，真矩形在实参里传。
+    property <PopBtnRect> emoji-btn-rect: {
+        x: emoji-btn.absolute-position.x,
+        y: emoji-btn.absolute-position.y,
+        w: emoji-btn.width,
+        h: emoji-btn.height,
+    };
+    property <PopBtnRect> more-btn-rect: {
+        x: more-btn.absolute-position.x,
+        y: more-btn.absolute-position.y,
+        w: more-btn.width,
+        h: more-btn.height,
+    };
+    property <length> pop-watch: emoji-btn-rect.x + emoji-btn-rect.y + emoji-btn-rect.w
+        + emoji-btn-rect.h + more-btn-rect.x + more-btn-rect.y + more-btn-rect.w
+        + more-btn-rect.h + root.width + root.height + root.sched-count * 1px;
+    changed pop-watch => {
+        root.pop-anchor-changed(emoji-btn-rect, more-btn-rect, root.width, root.height);
+    };
+    callback pop-anchor-changed(PopBtnRect, PopBtnRect, length, length);
+    // 输出（Rust → Slint）：面板的落位与尺寸（全由 Rust 写 ⇒ 与锚点算术同源；面板高随待发条数变，
+    // 也由 `syschat::more_pop_h` 算）。
+    in property <length> emoji-pop-x: 0px;
+    in property <length> emoji-pop-y: 0px;
+    in property <length> emoji-pop-w: 300px;
+    in property <length> emoji-pop-h: 220px;
+    in property <length> more-pop-x: 0px;
+    in property <length> more-pop-y: 0px;
+    in property <length> more-pop-w: 250px;
+    in property <length> more-pop-h: 122px;
+
     // 表情面板：分组/分页的**状态与内容都由 Rust 算**（`emoji.rs` 纯函数带单测），这里只画。
     // `emoji-cells` = 当前页的格子（≤ 32 个，8 列 × 4 行）。
     in property <[string]> emoji-cats: [];
@@ -3678,6 +3725,22 @@ export component SystemChatWindow inherits Window {
     out property <length> dbg-send-y: send-btn.y;
     out property <length> dbg-send-w: send-btn.width;
     out property <length> dbg-send-h: send-btn.height;
+    // v11（卡 `abb-v11-popup-anchor`）：面板锚点用的**按钮矩形**观测面（无头出图台对稿用；
+    // 同 dbg-* 口径：只读、无副作用）。面板自己的 x/y/w/h 是 in 属性，测试直接用 getter 读。
+    out property <length> dbg-emoji-btn-x: root.emoji-btn-rect.x;
+    out property <length> dbg-emoji-btn-y: root.emoji-btn-rect.y;
+    out property <length> dbg-emoji-btn-w: root.emoji-btn-rect.w;
+    out property <length> dbg-more-btn-x: root.more-btn-rect.x;
+    out property <length> dbg-more-btn-y: root.more-btn-rect.y;
+    out property <length> dbg-more-btn-w: root.more-btn-rect.w;
+    // v11（卡 `abb-v11-resizable-split`）：分割条与两区的真实几何（同 dbg-* 口径）。
+    // 「对稿」要量的东西：分割条夹在消息区与输入区**之间**、拖动改的是两区高度、输入区不被
+    // 压到内容以下（待发附件行变高时消息区让位）。
+    out property <length> dbg-split-y: split-bar.y;
+    out property <length> dbg-split-h: split-bar.height;
+    out property <length> dbg-convo-zone-y: composer-zone.y;
+    out property <length> dbg-convo-zone-h: composer-zone.height;
+    out property <length> dbg-flick-bottom: flick.y + flick.height;
     // v11（卡 `abb-v11-panels-align`）：面板与用量条的几何观测面（无头出图台对稿用；
     // 同 dbg-* 口径：只读、无副作用）。面板的 `x/width` 在**未展开**时取不到（元素不存在），
     // 所以这里报的是**算好的锚点值与常量宽**（面板宽 250 在 Rust 侧也有一份）。
@@ -3893,7 +3956,10 @@ export component SystemChatWindow inherits Window {
             // 下面各处的减数 = 各级 padding 之和（块内基准 416 已在 Rust 里扣掉根+col padding），
             // 宁可略窄（估高偏大 ⇒ 最多底部多留空白），**不能偏宽**（偏宽就回到估高不足）。
             flick := Flickable {
-                vertical-stretch: 1;
+                // 消息区高由 Rust 按分割条比例写（`syschat::split_convo_h`）；**不**用
+                // `vertical-stretch: 1` —— 否则它会吃掉全部剩余高度，分割条拖动就没意义了。
+                height: root.convo-h;
+                vertical-stretch: 0;
                 content-width: self.width;
                 content-height: col.preferred-height;
                 col := VerticalBox {
@@ -4184,318 +4250,382 @@ export component SystemChatWindow inherits Window {
                 }
             }
 
-            // ── 输入区（稿 v10 `.composer-zone` / `.composer` / `.crow` / `.fnbar` / `.ib` / `.send`）──
+            // ── v11（卡 `abb-v11-resizable-split`）：内容区 ↔ 输入区之间的分割条（稿 `.split`）──
+            // 位置就在这两区**之间**（稿 v11.1 的修正）——不是窗口底边的系统缩放，也不是输入框内部。
+            //
+            // 拖动回调把**指针相对消息区顶边的 y** 原样交给 Rust（策略/夹取都在
+            // `syschat::SplitDrag`）：
+            //   `split-bar.absolute-position.y + hit.mouse-y - flick.absolute-position.y`
+            // 前两项相加 = 指针的**窗口坐标 y**（`mouse-y` 是相对本元素的坐标，由 slint-core 在
+            // 每次事件分发时刷新，grab 期间也刷新——`input.rs::handle_mouse_grab` 会走
+            // `input_event_filter_before_children`）；再减去消息区顶边（拖动期间它**不动**，固定
+            // 构件之上）就得到「divider 该在哪」。这样拖动是**绝对定位**、不累加增量 ⇒ 不可能漂。
+            split-bar := Rectangle {
+                height: root.split-h;
+                vertical-stretch: 0;
+                background: (split-hit.has-hover || root.split-dragging) ? PixelTheme.hover : PixelTheme.panel;
+                // 稿 `.split{border-top:2px}`：把分割条与消息区隔开的那条线。
+                Rectangle { y: 0px; width: 100%; height: 2px; background: PixelTheme.edge; }
+                // 抓手（稿 `.split i{width:38px;height:2px}`）：水平+垂直居中。
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 38px;
+                    height: 2px;
+                    background: PixelTheme.edge;
+                    border-radius: 2px;
+                }
+                split-hit := TouchArea {
+                    mouse-cursor: ns-resize;
+                    // 按下即设 dragging，直到松手/取消；悬停时的 move 不动。
+                    pointer-event(ev) => {
+                        if ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left {
+                            root.split-dragging = true;
+                            root.split-drag-to(split-bar.absolute-position.y + self.mouse-y - flick.absolute-position.y);
+                        } else if ev.kind == PointerEventKind.move && root.split-dragging {
+                            root.split-drag-to(split-bar.absolute-position.y + self.mouse-y - flick.absolute-position.y);
+                        } else if ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel {
+                            // 松开/取消（比如窗口失焦）都算一次拖动结束：比例待落盘。
+                            if root.split-dragging {
+                                root.split-dragging = false;
+                                root.split-drag-end();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 输入区（稿 v10 `.composer-zone` / `.composer` / `.crow` / `.fnbar` / `.ib` / `.send`）──
             // 稿 v9 第 2 条要求：**取消框外图标列**，输入区只有一个整体框
             //（`.composer-zone` padding 10px），框内自上而下 = 待发附件行 → 文本区 → 功能区一行。
             // 功能区**整体靠右**：`[😊][📎][✂][🗑][⋯]` + `发送`（稿 v10：🗑 并入功能区、
             // 发送收小到 30px）。稿第 288 行要求删掉的「长提示文案」不再渲染。
-            Rectangle {
-                vertical-stretch: 0;
+            composer-zone := Rectangle {
+                // v11：输入区高由 Rust 按比例写（`composer-h` = 可分配带 − 分割条 − 消息区高，
+                // 且不小于 `syschat::split_composer_min_h`）。
+                // ⚠️ 用 `min-height` 而不是 `height`：Slint 不许同一元素同时写两个（编译期报错），
+                // 而 `min-height` 同时还能当**硬下限**——内容（待发附件行）比它高时布局会把输入区
+                // 撑着、让**消息区**先让位，而不是把输入框压扁。`LayoutInfo::preferred_bounded`
+                // 会把 preferred 抬到不低于 min ⇒ 没有剩余空间时输入区正好是这个高。
+                min-height: root.composer-h;
                 background: PixelTheme.bg;
                 // 底部两角跟窗口内面板同半径（owner：「底部还不圆角」）——输入区是最后一层，
                 // 不补这两个角就会把根 Rectangle 的圆角盖成直角。
                 border-bottom-left-radius: 8px;
                 border-bottom-right-radius: 8px;
+                // 顶端分隔线：铺满输入区宽度，**绝对定位贴 zone 顶边**——拖动把输入区拉高时
+                // 它不该跟着内容往下跑。
+                // **不要**在这里写 `x: -2px; width: parent.width + 4px` 去「盖住窗口黑描边」：
+                // 实测会触发 Slint 的 width ←→ layoutinfo 绑定循环（编译器警告明确写「可能运行时
+                // panic」）。两端那 2px 就是窗口黑描边本身。
+                Rectangle { y: 0px; width: 100%; height: 2px; background: PixelTheme.edge; }
+                // ⚠️ 必须是 `composer-zone :=`（分割条的可分配带 = 三块真实几何之和要用它的高）。
                 // 同状态行：用现代 Layout（旧 Box 自带 8px padding，会把 zone 的 10px 内边距
                 // 撑成 18px、顶部分隔线也内缩，破坏稿 `.composer-zone{padding:10px}`）。
                 VerticalLayout {
-                    // `.composer-zone` 顶部分隔线（Slint 的 Rectangle 无单边 border，用 2px 子矩形）
-                    // 顶端分隔线：铺满输入区宽度。**不要**在这里写 `x: -2px; width: parent.width + 4px`
-                    // 去「盖住窗口黑描边」——实测会触发 Slint 的 width ←→ layoutinfo 绑定循环
-                    // （编译器警告明确写「可能运行时 panic」）。两端那 2px 就是窗口黑描边本身。
-                    Rectangle { height: 2px; background: PixelTheme.edge; }
-                    // `.composer-zone{padding:10px}`：框外只剩这 10px 内边距（左右一致——
-                    // v9 第 3 条就是修「去掉框外图标列后右侧边距偏大」）。
-                    HorizontalLayout {
-                        padding: 10px;
-                        composer := Rectangle {
-                            width: 100%;
-                            background: PixelTheme.panel;
-                            border-width: 2px;
-                            border-color: PixelTheme.edge;
-                            border-radius: 8px;
-                            VerticalLayout {
-                                // 稿 `.composer{padding:8px;border:2px}`（全局 `box-sizing:border-box`）⇒
-                                // 内容距**外沿** 10px。Slint 的 `border-width` **不占布局**（边框画在
-                                // 内边距之上，不算尺寸），所以要让内容也距外沿 10px，这里得写 10px：
-                                // 写成 8px 时整个输入框矮 4px、内容贴边 2px（实测）。
-                                padding: 10px;
-                                spacing: 8px;
+                    // `.composer-zone{padding:10px}` + 上面那条 2px 分隔线：内容距 zone 顶边 12px、
+                    // 左/右/下各 10px（与加分割条之前**逐像素一致**：2 + 10 = 12）。
+                    padding-top: 12px;
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-bottom: 10px;
+                    // 不给 `alignment`：它会让布局**只按 preferred 摆**（实测：写了 end 之后
+                    // 下一条的 `vertical-stretch: 1` 被忽略、输入框不吃多出来的高度）。
+                    composer := Rectangle {
+                        width: 100%;
+                        // 拖动分割条把输入区拉高 ⇒ 多出来的高度归**文本区**（见 `area` 的 `area-h`），
+                        // 而不是在分隔线与输入框之间留一块空白（那看起来像「拖了没反应」）。
+                        // 这里是 `width: 100%` 的普通子元素：高度由内容决定，正好等于
+                        // `composer-h − 22`（zone 的上下 padding）——不留剩余空间。
+                        background: PixelTheme.panel;
+                        border-width: 2px;
+                        border-color: PixelTheme.edge;
+                        border-radius: 8px;
+                        VerticalLayout {
+                            // 稿 `.composer{padding:8px;border:2px}`（全局 `box-sizing:border-box`）⇒
+                            // 内容距**外沿** 10px。Slint 的 `border-width` **不占布局**（边框画在
+                            // 内边距之上，不算尺寸），所以要让内容也距外沿 10px，这里得写 10px：
+                            // 写成 8px 时整个输入框矮 4px、内容贴边 2px（实测）。
+                            padding: 10px;
+                            spacing: 8px;
 
-                                // 待发附件行（框内顶部）：最多 3 个，其余折叠为 `+N`；点开看全部。
-                                // 用横向 Flickable 兜底「附件多到一行放不下」（Slint 无 flex-wrap）。
-                                if root.attach-count > 0: Flickable {
-                                    height: 68px;
-                                    vertical-stretch: 0;
-                                    content-width: pending-row.preferred-width;
-                                    content-height: self.height;
-                                    pending-row := HorizontalBox {
-                                        padding: 8px;
-                                        spacing: 8px;
-                                        // 图片：52×52 缩略图（左下角类型徽标；加载失败回落字形）。
-                                        // 图片/文件分两个 `for` —— 布局里 `visible: false` 不占位，
-                                        // 比「每行套一层 Rectangle + if」的隐式尺寸更可预测。
-                                        for r in root.pending-rows: Rectangle {
-                                            visible: r.is-image;
-                                            width: 52px;
-                                            height: 52px;
-                                            background: PixelTheme.hover;
-                                            border-width: 2px;
-                                            border-color: PixelTheme.edge;
-                                            border-radius: 6px;
-                                            if r.thumb-ok: Image {
-                                                width: 100%;
-                                                height: 100%;
-                                                source: r.thumb;
-                                                image-fit: cover;
-                                            }
-                                            if !r.thumb-ok: Text {
-                                                width: 100%;
-                                                height: 100%;
-                                                text: "🖼";
-                                                font-size: 18px;
+                            // 待发附件行（框内顶部）：最多 3 个，其余折叠为 `+N`；点开看全部。
+                            // 用横向 Flickable 兜底「附件多到一行放不下」（Slint 无 flex-wrap）。
+                            if root.attach-count > 0: Flickable {
+                                height: 68px;
+                                vertical-stretch: 0;
+                                content-width: pending-row.preferred-width;
+                                content-height: self.height;
+                                pending-row := HorizontalBox {
+                                    padding: 8px;
+                                    spacing: 8px;
+                                    // 图片：52×52 缩略图（左下角类型徽标；加载失败回落字形）。
+                                    // 图片/文件分两个 `for` —— 布局里 `visible: false` 不占位，
+                                    // 比「每行套一层 Rectangle + if」的隐式尺寸更可预测。
+                                    for r in root.pending-rows: Rectangle {
+                                        visible: r.is-image;
+                                        width: 52px;
+                                        height: 52px;
+                                        background: PixelTheme.hover;
+                                        border-width: 2px;
+                                        border-color: PixelTheme.edge;
+                                        border-radius: 6px;
+                                        if r.thumb-ok: Image {
+                                            width: 100%;
+                                            height: 100%;
+                                            source: r.thumb;
+                                            image-fit: cover;
+                                        }
+                                        if !r.thumb-ok: Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "🖼";
+                                            font-size: 18px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        // 左下角名称/类型徽标（稿 `.pthumb .badge`）
+                                        Rectangle {
+                                            x: 3px;
+                                            y: parent.height - self.height - 3px;
+                                            width: badge.preferred-width + 8px;
+                                            height: 14px;
+                                            background: #1c1a17c4;
+                                            border-radius: 3px;
+                                            badge := Text {
+                                                text: r.ext;
+                                                font-size: 9px;
+                                                font-weight: 700;
+                                                color: #ffffff;
                                                 horizontal-alignment: center;
                                                 vertical-alignment: center;
                                             }
-                                            // 左下角名称/类型徽标（稿 `.pthumb .badge`）
+                                        }
+                                        PendingRemoveBadge {
+                                            x: parent.width - 10px;
+                                            y: -7px;
+                                            remove => { root.attach-remove(r.index); }
+                                        }
+                                    }
+                                    // 非图片：文件 chip（图标 + 名称 elide）
+                                    for r in root.pending-rows: Rectangle {
+                                        visible: !r.is-image;
+                                        height: 52px;
+                                        width: min(file-row.preferred-width, 180px);
+                                        background: PixelTheme.bg;
+                                        border-width: 2px;
+                                        border-color: PixelTheme.edge;
+                                        border-radius: 6px;
+                                        file-row := HorizontalBox {
+                                            padding: 6px;
+                                            spacing: 7px;
                                             Rectangle {
-                                                x: 3px;
-                                                y: parent.height - self.height - 3px;
-                                                width: badge.preferred-width + 8px;
-                                                height: 14px;
-                                                background: #1c1a17c4;
-                                                border-radius: 3px;
-                                                badge := Text {
+                                                width: 22px;
+                                                height: 22px;
+                                                background: PixelTheme.accent;
+                                                border-width: 2px;
+                                                border-color: PixelTheme.edge;
+                                                border-radius: 4px;
+                                                Text {
+                                                    width: 100%;
+                                                    height: 100%;
                                                     text: r.ext;
-                                                    font-size: 9px;
-                                                    font-weight: 700;
-                                                    color: #ffffff;
+                                                    font-size: 8px;
+                                                    font-weight: 800;
+                                                    color: PixelTheme.on-accent;
                                                     horizontal-alignment: center;
                                                     vertical-alignment: center;
                                                 }
                                             }
-                                            PendingRemoveBadge {
-                                                x: parent.width - 10px;
-                                                y: -7px;
-                                                remove => { root.attach-remove(r.index); }
-                                            }
-                                        }
-                                        // 非图片：文件 chip（图标 + 名称 elide）
-                                        for r in root.pending-rows: Rectangle {
-                                            visible: !r.is-image;
-                                            height: 52px;
-                                            width: min(file-row.preferred-width, 180px);
-                                            background: PixelTheme.bg;
-                                            border-width: 2px;
-                                            border-color: PixelTheme.edge;
-                                            border-radius: 6px;
-                                            file-row := HorizontalBox {
-                                                padding: 6px;
-                                                spacing: 7px;
-                                                Rectangle {
-                                                    width: 22px;
-                                                    height: 22px;
-                                                    background: PixelTheme.accent;
-                                                    border-width: 2px;
-                                                    border-color: PixelTheme.edge;
-                                                    border-radius: 4px;
-                                                    Text {
-                                                        width: 100%;
-                                                        height: 100%;
-                                                        text: r.ext;
-                                                        font-size: 8px;
-                                                        font-weight: 800;
-                                                        color: PixelTheme.on-accent;
-                                                        horizontal-alignment: center;
-                                                        vertical-alignment: center;
-                                                    }
-                                                }
-                                                Text {
-                                                    text: r.name;
-                                                    font-size: 11px;
-                                                    font-weight: 700;
-                                                    color: PixelTheme.text;
-                                                    vertical-alignment: center;
-                                                    overflow: elide;
-                                                    horizontal-stretch: 1;
-                                                }
-                                            }
-                                            PendingRemoveBadge {
-                                                x: parent.width - 10px;
-                                                y: -7px;
-                                                remove => { root.attach-remove(r.index); }
-                                            }
-                                        }
-                                        // 折叠指示 `+N`（N==0 不渲染）；点它展开全部。
-                                        if !root.pending-expanded && root.pending-more > 0: Rectangle {
-                                            width: 52px;
-                                            height: 52px;
-                                            background: PixelTheme.hover;
-                                            border-width: 2px;
-                                            border-color: PixelTheme.edge;
-                                            border-radius: 6px;
                                             Text {
-                                                width: 100%;
-                                                height: 100%;
-                                                text: root.pending-more-text;
-                                                font-size: 13px;
-                                                font-weight: 800;
-                                                color: PixelTheme.text;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
-                                            }
-                                            TouchArea {
-                                                enabled: !root.busy;
-                                                mouse-cursor: pointer;
-                                                clicked => { root.pending-toggle(); }
-                                            }
-                                        }
-                                        // 展开态下的收起入口（稿未画；无折叠则无需收起）
-                                        if root.pending-expanded && root.attach-count > 3: Rectangle {
-                                            width: 52px;
-                                            height: 52px;
-                                            background: PixelTheme.hover;
-                                            border-width: 2px;
-                                            border-color: PixelTheme.edge;
-                                            border-radius: 6px;
-                                            Text {
-                                                width: 100%;
-                                                height: 100%;
-                                                text: "收起";
+                                                text: r.name;
                                                 font-size: 11px;
                                                 font-weight: 700;
                                                 color: PixelTheme.text;
-                                                horizontal-alignment: center;
                                                 vertical-alignment: center;
-                                            }
-                                            TouchArea {
-                                                enabled: !root.busy;
-                                                mouse-cursor: pointer;
-                                                clicked => { root.pending-toggle(); }
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
                                             }
                                         }
-                                    }
-                                }
-
-                                // 文本区（稿 `.area`）：无自绘边框（描边归整体框），回车发送。
-                                // 稿 `.area{min-height:66px;max-height:130px}`；本实现是**单行**
-                                // 输入框（既有行为，不在本卡改动面），高度取稿的下限 66px。
-                                // ⚠️ 写 `height`（不是 `min-height`）：只写 min-height 时，Slint 布局按
-                                // 子项的 **preferred**（Rectangle = 0）算父布局的 preferred，实测这个区
-                                // 只能拿到 62px（少了 4px，整个输入框跟着矮 4px）。
-                                area := Rectangle {
-                                    height: 66px;
-                                    background: transparent;
-                                    area-input := TextInput {
-                                        x: 2px;
-                                        y: 4px;
-                                        width: parent.width - 4px;
-                                        height: parent.height - 8px;
-                                        text <=> root.draft;
-                                        font-size: 13px;
-                                        color: PixelTheme.text;
-                                        single-line: true;
-                                        vertical-alignment: top;
-                                        // 卡 d10：生成中**保持可编辑**（owner 口径：输入要支持插入/打断）。
-                                        // 落点是插入还是排队由 Rust 侧 `syschat::SendPump` 判定，
-                                        // 状态行显示「已插入」/「已排队」。
-                                        accepted => {
-                                            if root.draft != "" { root.send(root.draft); }
+                                        PendingRemoveBadge {
+                                            x: parent.width - 10px;
+                                            y: -7px;
+                                            remove => { root.attach-remove(r.index); }
                                         }
                                     }
-                                    if root.draft == "" && !area-input.has-focus: Text {
-                                        x: 4px;
-                                        y: 6px;
-                                        // 卡 d10：生成中不再是“等待回复…”（输入框已可用）。
-                                        text: root.busy ? "生成中也可继续发（回车插入本轮或排队）" : "给怹发消息，回车发送";
-                                        font-size: 13px;
-                                        color: PixelTheme.dim;
-                                    }
-                                }
-
-                                // 功能区（稿 `.crow{display:flex;align-items:center;gap:8px}`）：
-                                // **整体靠右** = 左侧一个占空的伸缩块 + `.fnbar` + 发送。
-                                // 顺序照稿 v10：`[😊 表情][📎 附件][✂ 截图][🗑 清空][⋯ 更多]` + `发送`。
-                                // `cross-axis-alignment: center` = 稿的 `align-items:center`：
-                                // 发送 30px、图标 24px，居中后同一水平线（不能靠默认的 stretch）。
-                                // （旧 `HorizontalBox` 自带 8px padding，会把发送钮顶离输入框底边，
-                                // 故这里也用现代 Layout。）
-                                crow := HorizontalLayout {
-                                    spacing: 8px;
-                                    cross-axis-alignment: center;
-                                    // 左端占空：把功能区推向右端（稿里的 `<span class="grow">`）。
-                                    // 只给 `horizontal-stretch`——**不能**再写 `width: 0px`：显式宽度会
-                                    // 被当成固定尺寸，伸缩因子失效（实测功能区会被顶到最左边）。
-                                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                                    // `.fnbar{display:flex;gap:4px}`：五枚 24×24 图标钮，间距 4px。
-                                    fnbar := HorizontalLayout {
-                                        spacing: 4px;
-                                        // 😊 表情：打开内置 emoji 面板（分组 + 翻页，插入到草稿末尾）。
-                                        ComposerIcon {
-                                            icon: "😊";
-                                            tip: "表情";
-                                            clicked => {
-                                                root.more-open = false;
-                                                root.emoji-open = true;
-                                                root.emoji-opened();
-                                            }
-                                        }
-                                        // 📎 附件：接既有 attach-pick（可多选）；生成中也可用
-                                        // （卡的待发附件会随本轮发送/排队项一起带上）。
-                                        ComposerIcon {
-                                            icon: "📎";
-                                            tip: "添加附件（可多选）";
-                                            clicked => { root.attach-pick(); }
-                                        }
-                                        ComposerIcon {
-                                            icon: "✂";
-                                            // 本卡只留占位：macOS 屏幕采集需屏幕录制 TCC 授权 + 原生 API，另立卡。
-                                            tip: "截图（另立卡：需屏幕录制授权）";
-                                            clicked => { root.composer-todo("截图"); }
-                                        }
-                                        // 🗑 清空当前会话：v10 从「发送右侧」搬进功能区（稿 v10 第 1 条）。
-                                        ComposerIcon {
-                                            icon: "🗑";
-                                            tip: "清空当前会话";
-                                            enabled: !root.busy;
-                                            clicked => { root.reset-history(); }
-                                        }
-                                        ComposerIcon {
-                                            icon: "⋯";
-                                            tip: "更多（含定时发送）";
-                                            clicked => {
-                                                root.emoji-open = false;
-                                                root.more-open = true;
-                                                root.more-opened();
-                                            }
-                                        }
-                                    }
-                                    // 发送按钮（稿 v10 `.send{height:30px;padding:0 14px;font-size:12px;
-                                    // border-radius:6px}`）：内边距 14×2 ⇒ 宽 = 文案宽 + 28。
-                                    send-btn := Rectangle {
-                                        width: send-text.preferred-width + 28px;
-                                        height: 30px;
-                                        background: PixelTheme.accent;
+                                    // 折叠指示 `+N`（N==0 不渲染）；点它展开全部。
+                                    if !root.pending-expanded && root.pending-more > 0: Rectangle {
+                                        width: 52px;
+                                        height: 52px;
+                                        background: PixelTheme.hover;
                                         border-width: 2px;
                                         border-color: PixelTheme.edge;
                                         border-radius: 6px;
-                                        // 卡 d10：生成中也可发送（内容非空即可）——落点由 Rust 判定。
-                                        opacity: root.draft != "" ? 1.0 : 0.5;
-                                        send-text := Text {
+                                        Text {
                                             width: 100%;
                                             height: 100%;
-                                            text: "发送";
-                                            font-size: 12px;
+                                            text: root.pending-more-text;
+                                            font-size: 13px;
                                             font-weight: 800;
-                                            color: PixelTheme.on-accent;
+                                            color: PixelTheme.text;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
                                         }
                                         TouchArea {
-                                            enabled: root.draft != "";
+                                            enabled: !root.busy;
                                             mouse-cursor: pointer;
-                                            clicked => { root.send(root.draft); }
+                                            clicked => { root.pending-toggle(); }
                                         }
+                                    }
+                                    // 展开态下的收起入口（稿未画；无折叠则无需收起）
+                                    if root.pending-expanded && root.attach-count > 3: Rectangle {
+                                        width: 52px;
+                                        height: 52px;
+                                        background: PixelTheme.hover;
+                                        border-width: 2px;
+                                        border-color: PixelTheme.edge;
+                                        border-radius: 6px;
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "收起";
+                                            font-size: 11px;
+                                            font-weight: 700;
+                                            color: PixelTheme.text;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        TouchArea {
+                                            enabled: !root.busy;
+                                            mouse-cursor: pointer;
+                                            clicked => { root.pending-toggle(); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 文本区（稿 `.area`）：无自绘边框（描边归整体框），回车发送。
+                            // 稿 `.area{min-height:66px;max-height:130px}`；本实现是**单行**
+                            // 输入框（既有行为，不在本卡改动面），默认高取稿的下限 66px。
+                            // v11：**高由 Rust 写**（`area-h` = 66 + 输入区拉高后的富余）——于是
+                            // 「输入区变高」在屏幕上是**文本区/输入框变高**（而不是留一块空白）。
+                            // 为什么不用 `vertical-stretch`：实测这个 Rectangle（及其父 `composer`）
+                            // 上的 stretch 不生效（多出来的高度被布局丢在下面），显式高才可靠。
+                            // ⚠️ 写 `height`（不是 `min-height`）：只写 min-height 时，Slint 布局按
+                            // 子项的 **preferred**（Rectangle = 0）算父布局的 preferred，实测这个区
+                            // 只能拿到 62px（少了 4px，整个输入框跟着矮 4px）。
+                            area := Rectangle {
+                                height: root.area-h;
+                                background: transparent;
+                                area-input := TextInput {
+                                    x: 2px;
+                                    y: 4px;
+                                    width: parent.width - 4px;
+                                    height: parent.height - 8px;
+                                    text <=> root.draft;
+                                    font-size: 13px;
+                                    color: PixelTheme.text;
+                                    single-line: true;
+                                    vertical-alignment: top;
+                                    // 卡 d10：生成中**保持可编辑**（owner 口径：输入要支持插入/打断）。
+                                    // 落点是插入还是排队由 Rust 侧 `syschat::SendPump` 判定，
+                                    // 状态行显示「已插入」/「已排队」。
+                                    accepted => {
+                                        if root.draft != "" { root.send(root.draft); }
+                                    }
+                                }
+                                if root.draft == "" && !area-input.has-focus: Text {
+                                    x: 4px;
+                                    y: 6px;
+                                    // 卡 d10：生成中不再是“等待回复…”（输入框已可用）。
+                                    text: root.busy ? "生成中也可继续发（回车插入本轮或排队）" : "给怹发消息，回车发送";
+                                    font-size: 13px;
+                                    color: PixelTheme.dim;
+                                }
+                            }
+
+                            // 功能区（稿 `.crow{display:flex;align-items:center;gap:8px}`）：
+                            // **整体靠右** = 左侧一个占空的伸缩块 + `.fnbar` + 发送。
+                            // 顺序照稿 v10：`[😊 表情][📎 附件][✂ 截图][🗑 清空][⋯ 更多]` + `发送`。
+                            // `cross-axis-alignment: center` = 稿的 `align-items:center`：
+                            // 发送 30px、图标 24px，居中后同一水平线（不能靠默认的 stretch）。
+                            // （旧 `HorizontalBox` 自带 8px padding，会把发送钮顶离输入框底边，
+                            // 故这里也用现代 Layout。）
+                            crow := HorizontalLayout {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                // 左端占空：把功能区推向右端（稿里的 `<span class="grow">`）。
+                                // 只给 `horizontal-stretch`——**不能**再写 `width: 0px`：显式宽度会
+                                // 被当成固定尺寸，伸缩因子失效（实测功能区会被顶到最左边）。
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                // `.fnbar{display:flex;gap:4px}`：五枚 24×24 图标钮，间距 4px。
+                                fnbar := HorizontalLayout {
+                                    spacing: 4px;
+                                    // 😊 表情：打开内置 emoji 面板（分组 + 翻页，插入到草稿末尾）。
+                                    emoji-btn := ComposerIcon {
+                                        icon: "😊";
+                                        tip: "表情";
+                                        clicked => {
+                                            root.more-open = false;
+                                            root.emoji-open = true;
+                                            root.emoji-opened();
+                                        }
+                                    }
+                                    // 📎 附件：接既有 attach-pick（可多选）；生成中也可用
+                                    // （卡的待发附件会随本轮发送/排队项一起带上）。
+                                    ComposerIcon {
+                                        icon: "📎";
+                                        tip: "添加附件（可多选）";
+                                        clicked => { root.attach-pick(); }
+                                    }
+                                    ComposerIcon {
+                                        icon: "✂";
+                                        // 本卡只留占位：macOS 屏幕采集需屏幕录制 TCC 授权 + 原生 API，另立卡。
+                                        tip: "截图（另立卡：需屏幕录制授权）";
+                                        clicked => { root.composer-todo("截图"); }
+                                    }
+                                    // 🗑 清空当前会话：v10 从「发送右侧」搬进功能区（稿 v10 第 1 条）。
+                                    ComposerIcon {
+                                        icon: "🗑";
+                                        tip: "清空当前会话";
+                                        enabled: !root.busy;
+                                        clicked => { root.reset-history(); }
+                                    }
+                                    more-btn := ComposerIcon {
+                                        icon: "⋯";
+                                        tip: "更多（含定时发送）";
+                                        clicked => {
+                                            root.emoji-open = false;
+                                            root.more-open = true;
+                                            root.more-opened();
+                                        }
+                                    }
+                                }
+                                // 发送按钮（稿 v10 `.send{height:30px;padding:0 14px;font-size:12px;
+                                // border-radius:6px}`）：内边距 14×2 ⇒ 宽 = 文案宽 + 28。
+                                send-btn := Rectangle {
+                                    width: send-text.preferred-width + 28px;
+                                    height: 30px;
+                                    background: PixelTheme.accent;
+                                    border-width: 2px;
+                                    border-color: PixelTheme.edge;
+                                    border-radius: 6px;
+                                    // 卡 d10：生成中也可发送（内容非空即可）——落点由 Rust 判定。
+                                    opacity: root.draft != "" ? 1.0 : 0.5;
+                                    send-text := Text {
+                                        width: 100%;
+                                        height: 100%;
+                                        text: "发送";
+                                        font-size: 12px;
+                                        font-weight: 800;
+                                        color: PixelTheme.on-accent;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        enabled: root.draft != "";
+                                        mouse-cursor: pointer;
+                                        clicked => { root.send(root.draft); }
                                     }
                                 }
                             }
@@ -4582,16 +4712,19 @@ export component SystemChatWindow inherits Window {
             begin-resize(dir) => { root.begin-resize(dir); }
         }
 
-        // ── 卡 d9：表情面板 /「更多（定时）」菜单（根级 overlay，画在输入框正上方）──────
+        // ── 卡 d9：表情面板 /「更多（定时）」菜单（根级 overlay，画在功能钮**上方**）──────
+        //
+        // v11（卡 `abb-v11-popup-anchor`）：锚点从「输入框顶边」改为「**对应按钮**的矩形」——
+        // 旧写法（`y: composer.absolute-position.y - h - 6`）让面板底边离按钮还有「待发附件行 +
+        // 文本区」那么高（默认布局 100+ px），就是 owner 说的「飘太远」。现在四个值（x/y/w/h）
+        // 全由 Rust 写：`syschat::pop_anchor`（右缘与按钮右缘对齐、底边在按钮顶边上方 6px、
+        // 靠窗边整体内移不出窗）+ `emoji_pop_*` / `more_pop_h`（面板尺寸）。
         //
         // 为什么不用 PopupWindow：它的 `close-policy: close-on-click-outside` 在**按下**就关
         //（slint-core `window.rs` 的 `CloseOnClickOutside` 判 `pressed_event`），而按钮的
         // `clicked` 在**松开**才到 → 「再点按钮」永远只会重开、收不起来（实测语义，不是猜）。
         // 改成「面板 + 一层整窗透明 TouchArea」：点面板外（含按钮本身）→ 关；再点按钮时
         // 已无遮挡 → 正常打开。两面板互斥由按钮处理器保证。
-        //
-        // 位置锚在输入框（`composer`）的**绝对坐标**上（随窗口缩放跟随）：面板底边贴在
-        // 输入框顶边之上 6px，右缘与输入框右缘齐平（`max(6px, …)` 防窄窗跑出左边界）。
         if root.emoji-open || root.more-open || root.session-menu-open || root.model-menu-open: Rectangle {
             x: 0px;
             y: 0px;
@@ -4647,10 +4780,10 @@ export component SystemChatWindow inherits Window {
         }
 
         if root.emoji-open: Rectangle {
-            x: max(6px, composer.absolute-position.x + composer.width - 300px);
-            y: composer.absolute-position.y - self.height - 6px;
-            width: 300px;
-            height: 220px;
+            x: root.emoji-pop-x;
+            y: root.emoji-pop-y;
+            width: root.emoji-pop-w;
+            height: root.emoji-pop-h;
             background: PixelTheme.panel;
             border-width: 2px;
             border-color: PixelTheme.edge;
@@ -4740,11 +4873,12 @@ export component SystemChatWindow inherits Window {
         }
 
         if root.more-open: Rectangle {
-            x: max(6px, composer.absolute-position.x + composer.width - 250px);
-            y: composer.absolute-position.y - self.height - 6px;
-            width: 250px;
-            // 基础 = padding 12 + 头 20 + 三个档位 3×26 + 档位间距；再按待发条数增高。
-            height: 122px + root.sched-count * 26px + (root.sched-count > 0 ? 20px : 0px) + (root.sched-count > 1 ? 26px : 0px);
+            x: root.more-pop-x;
+            y: root.more-pop-y;
+            width: root.more-pop-w;
+            // 高度由 Rust 给（`syschat::more_pop_h(sched-count)`，与锚点算术同源）——
+            // 否则「面板底边贴按钮上方」里的面板高只能靠 Slint 反向回报，多一条反馈。
+            height: root.more-pop-h;
             background: PixelTheme.panel;
             border-width: 2px;
             border-color: PixelTheme.edge;
@@ -4817,6 +4951,39 @@ export component SystemChatWindow inherits Window {
         }
     }
 
+    // ── v11（卡 `abb-v11-resizable-split`）：内容区 ↔ 输入区的分割条 ─────────────
+    // 稿 v11.1 的 `.split`：夹在 `.convo` 与 `.composer-zone` **之间**（不是窗口底边的系统缩放，
+    // 也不是输入框内部）。拖动改两区高度比例，比例持久化。
+    //
+    // 分工：「比例 → 两区高度」的算术全在 Rust（`syschat::split_convo_h` / `split_clamp_convo_h`，
+    // 纯函数带单测）；这里只画 + 把「可分配带」与「指针位置」报给 Rust。
+    // **可分配带**（= 窗高 − 标题栏/状态行等固定构件 − 分割条）= 三块的真实几何之和（下面
+    // `split-band-watch`）：不在这里镜像布局常量，布局改了自动跟上。
+    // 两区高**都由 Rust 写**（比例 ↔ 像素在 `syschat::split_convo_h` / `split_composer_h`，
+    // 纯函数带单测）：`convo-h` 给消息区、`composer-h` 给输入区。默认值是**默认窗（520×560）的
+    // 那一档**（可分配带 482 = 326 + 10 + 146），这样窗口在拿到第一次回调前也不会错位。
+    in property <length> convo-h: 326px;
+    in property <length> composer-h: 146px;
+    in property <length> split-h: 10px;           // 由 Rust 写（= `syschat::SPLIT_HANDLE_H`，稿 `.split{height:10px}`）
+    // 文本区高（稿 `.area{min-height:66px}` 起）：由 Rust 写 —— 输入区被拉高时富余高度进这里，
+    // 于是「两区比例变了」在屏幕上是**文本区变高**（详见 `syschat::split_area_h`）。
+    in property <length> area-h: 66px;
+    // 拖动中（TouchArea 的 hover 也可能发 move ⇒ 用这个标志把「悬停」与「拖动」分开）
+    in-out property <bool> split-dragging: false;
+    callback split-band-changed(length);   // 可分配带变化 ⇒ Rust 按比例重算两区高
+    callback split-drag-to(length);        // 参数 = 指针相对**消息区顶边**的 y（Rust 侧只管夹取）
+    callback split-drag-end();             // 松手：比例待落盘（去抖）
+    // **可分配带** = 消息区 + 分割条 + 输入区 = 窗高 − 固定构件（根 layout padding 上下各 2 +
+    // 标题栏 34（上游 `PixelTitleBar` 固定高）+ 标题栏底分隔线 2 + 状态行 38（= 上面那条
+    // `min-height: 38px`））。
+    // 为什么写成「窗高 − 固定构件」、而不是「三块高度之和」：三块里有**两块的 min-height 是
+    // Rust 按这个带算出来的** ⇒ 自指，换窗高时分母永远分不到新高度（实测：820 高窗下带高恒为
+    // 482）。这里只依赖 `root.height` 与几个字面量 ⇒ **第一次求值就是对的**，不会先报一个错值
+    // 再纠正（那会闪一帧）。字面量就是上面那几行的构件，改它们时由无头渲染台的三块之和断言兜住。
+    property <length> split-band-watch: root.height - 4px - 34px - 2px - 38px;
+    changed split-band-watch => {
+        root.split-band-changed(split-band-watch);
+    };
     // 请求滞底：Rust 递增 scroll-epoch（追加消息/打开对话框）→ 把 content-y 设成**越界**负值。
     // Flickable 的 in-bound change tracker 会把它延迟夹取到真实底部（flickable.rs:80-120），
     // 且该 tracker 依赖 content-height：内容随后变高时会再夹一次，故新消息总能滚进视野。

@@ -736,6 +736,162 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
     }
 }
 
+/// v11（卡 `abb-v11-popup-anchor`）：把两个 `.pop` 面板（表情 / 「更多」）的落位与尺寸写进窗口。
+///
+/// 算术全在纯函数里：`syschat::pop_anchor`（贴对应按钮上方 + 靠窗边整体内移不出窗）与
+/// `syschat::more_pop_h`（面板高随待发条数变，与锚点同源）。这里只做接线。
+///
+/// 几何（两个功能钮的窗口坐标矩形、窗口尺寸）由 `.slint` 的 `pop-anchor-changed` 报来：`crow`
+/// 整体右对齐，功能区左缘取决于「发送」文案宽，Rust 侧复算不出来。
+fn apply_pop_anchors(
+    win: &SystemChatWindow,
+    emoji_btn: PopBtnRect,
+    more_btn: PopBtnRect,
+    win_w: f32,
+    win_h: f32,
+) {
+    // 窗口还没 realize（几何为 0）：等下一次几何变化再算，别把面板摆到 (0,0)。
+    if win_w <= 0.0 || win_h <= 0.0 {
+        return;
+    }
+    let as_rect = |r: PopBtnRect| {
+        (
+            r.x.round() as i32,
+            r.y.round() as i32,
+            r.w.round() as i32,
+            r.h.round() as i32,
+        )
+    };
+    let win_size = (win_w.round() as i32, win_h.round() as i32);
+
+    let ew = crate::syschat::EMOJI_POP_W;
+    let eh = crate::syschat::EMOJI_POP_H;
+    let (ex, ey) = crate::syschat::pop_anchor(as_rect(emoji_btn), (ew, eh), win_size);
+    win.set_emoji_pop_x(ex as f32);
+    win.set_emoji_pop_y(ey as f32);
+    win.set_emoji_pop_w(ew as f32);
+    win.set_emoji_pop_h(eh as f32);
+
+    let mw = crate::syschat::MORE_POP_W;
+    let mh = crate::syschat::more_pop_h(win.get_sched_count());
+    let (mx, my) = crate::syschat::pop_anchor(as_rect(more_btn), (mw, mh), win_size);
+    win.set_more_pop_x(mx as f32);
+    win.set_more_pop_y(my as f32);
+    win.set_more_pop_w(mw as f32);
+    win.set_more_pop_h(mh as f32);
+}
+
+/// v11（卡 `abb-v11-resizable-split`）：分割条的接线状态。
+///
+/// 三个回调（带变化 / 拖动 / 松手）都只改这里，再统一把结果写进窗口。抽成结构体是为了让
+/// **无头渲染台**能驱动同一条链子（`run()` 里的窗口构造不可测）：纯函数单测只覆盖算术，
+/// 这里覆盖「Slint 报来的值 → 写回 `convo-h` → 松手后待落盘」的接线。
+struct SplitWiring {
+    drag: std::cell::RefCell<crate::syschat::SplitDrag>,
+    /// 可分配带（`.slint` 报来；0 = 还没布局）。
+    band: std::cell::Cell<f32>,
+    /// 输入区最小高（= 待发附件行出现/消失时会变；也是比例上限的同一口径）。
+    composer_min: std::cell::Cell<f32>,
+    /// 已写进窗口的内容区高（判断本次拖动有没有真的改变比例，免得白写盘）。
+    convo_h: std::cell::Cell<f32>,
+    /// 已写进窗口的输入区高（只在变化时才写）。
+    composer_h: std::cell::Cell<f32>,
+    /// 已写进窗口的文本区高（同上）。
+    area_h: std::cell::Cell<f32>,
+    /// 本次拖动是否真的改过比例（决定松手时要落盘）。
+    dirty: std::cell::Cell<bool>,
+    /// 待落盘的比例（去抖：由 400ms 定时器取走写盘）。
+    pending: std::cell::Cell<Option<f32>>,
+}
+
+impl SplitWiring {
+    /// 从 `~/.agent-bridge/split.json` 读比例（文件缺失/损坏 ⇒ 默认值；后端不读它）。
+    fn new() -> Self {
+        Self {
+            drag: std::cell::RefCell::new(crate::syschat::SplitDrag::new(
+                crate::syschat::load_split_ratio(),
+            )),
+            band: std::cell::Cell::new(0.0),
+            composer_min: std::cell::Cell::new(crate::syschat::SPLIT_COMPOSER_MIN_H),
+            convo_h: std::cell::Cell::new(0.0),
+            composer_h: std::cell::Cell::new(0.0),
+            area_h: std::cell::Cell::new(0.0),
+            dirty: std::cell::Cell::new(false),
+            pending: std::cell::Cell::new(None),
+        }
+    }
+
+    /// 输入区下限变了（待发附件行出现/消失）：**先**换下限再按比例重分配两区高。
+    /// `.slint` 里没有单独的 `composer-min-h` 属性：输入区的 `min-height` 直接吃 `composer-h`
+    /// （Slint 不许同一元素同时写 `height` 与 `min-height`），所以下限通过这里参与结果。
+    fn set_composer_min(&self, win: &SystemChatWindow, min_h: f32) {
+        self.composer_min.set(min_h);
+        self.apply(win);
+    }
+
+    /// 布局报来可分配带 ⇒ 按比例算内容区高并写进窗口（窗高/DPI 变化、状态行变高都会走到）。
+    fn on_band(&self, win: &SystemChatWindow, band_h: f32) {
+        self.band.set(band_h);
+        self.apply(win);
+    }
+
+    /// 按当前比例与当前带重算两区高并写进窗口（比例不变 ⇒ 不算「脏」，不触发落盘）。
+    ///
+    /// 输入区高再 `.max(composer_min)`：拖动/换窗的夹取已经保证它不低于下限，这里只是让
+    /// 「附件行出现」那条路径有一道显式兜底（见 [`Self::set_composer_min`]）。
+    fn apply(&self, win: &SystemChatWindow) {
+        let (h, c) = self
+            .drag
+            .borrow_mut()
+            .on_band(self.band.get(), self.composer_min.get());
+        self.write(win, h, c.max(self.composer_min.get()));
+    }
+
+    /// 把两区高 + 文本区高写进窗口（各自只在变化 ≥0.5px 时才写，避免无谓的重新布局）。
+    fn write(&self, win: &SystemChatWindow, convo_h: f32, composer_h: f32) {
+        if (convo_h - self.convo_h.get()).abs() >= 0.5 {
+            self.convo_h.set(convo_h);
+            win.set_convo_h(convo_h);
+        }
+        if (composer_h - self.composer_h.get()).abs() >= 0.5 {
+            self.composer_h.set(composer_h);
+            win.set_composer_h(composer_h);
+        }
+        // 输入区拿到的富余高度给文本区（见 `syschat::split_area_h`）。
+        let area_h = crate::syschat::split_area_h(composer_h, self.composer_min.get());
+        if (area_h - self.area_h.get()).abs() >= 0.5 {
+            self.area_h.set(area_h);
+            win.set_area_h(area_h);
+        }
+    }
+
+    /// 拖动：`pointer_rel` = 指针相对**消息区顶边**的 y（由 `.slint` 算好；那种坐标不随拖动
+    /// 漂移，所以拖动是绝对定位而不是累加增量）。
+    fn drag_to(&self, win: &SystemChatWindow, pointer_rel: f32) {
+        if self.band.get() <= 0.0 {
+            return; // 还没布局（理论上拖动前必已布局）⇒ 不动，别把消息区设成 0
+        }
+        let (h, c) = self.drag.borrow_mut().drag_to(pointer_rel);
+        let c = c.max(self.composer_min.get());
+        if (h - self.convo_h.get()).abs() >= 0.5 {
+            self.dirty.set(true);
+        }
+        self.write(win, h, c);
+    }
+
+    /// 松手/取消：本次拖动真的改过比例 ⇒ 登记待落盘（等去抖定时器收）。
+    fn drag_end(&self) {
+        if self.dirty.replace(false) {
+            self.pending.set(Some(self.drag.borrow().ratio()));
+        }
+    }
+
+    /// 取走待落盘比例（去抖定时器每次 take 一次；没有就返回 `None`）。
+    fn take_pending(&self) -> Option<f32> {
+        self.pending.take()
+    }
+}
+
 /// v11（卡 `abb-v11-panels-align`）：状态栏右侧的上下文用量。
 ///
 /// 数据源接缝在 [`crate::syschat::context_usage`]（**E3 卡**）：当前如实为空 ⇒
@@ -2417,11 +2573,19 @@ pub fn run_gui() -> Result<()> {
     // 热区只吃按压不干活），也是 D6「抓标题栏拖不动窗口」的一个来源。
     slint_pixel::install_window_resize(&syschat_win);
     syschat_win.set_resize_hit_areas(resize_hit_areas_enabled());
-    // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-width`（开出来是 min 宽 340，
-    // 于是 ①②③ 挤不进标题栏）。显式给一次 520×560（= 稿的落位宽度），此后由用户自己缩。
-    syschat_win
-        .window()
-        .set_size(slint::LogicalSize::new(520.0, 560.0));
+    // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-*`（开出来是最小尺寸 340×380，于是
+    // ①②③ 挤不进标题栏）。开窗前显式给一次默认尺寸（= `.slint` 的 `preferred-width`/`height`），
+    // 此后由用户自己缩——**不是**固定尺寸：`.slint` 的 `min-*`（340×380）交给系统做缩放下界，
+    // `min != max` ⇒ 窗口可缩放（卡 `abb-v11-resizable-split` ①；常量与 `.slint` 的同值由
+    // `syschat::tests::syschat_window_size_constants_match_slint` 钉住）。
+    syschat_win.window().set_size(slint::LogicalSize::new(
+        crate::syschat::SYSCHAT_PREFERRED_WIDTH,
+        crate::syschat::SYSCHAT_DEFAULT_H,
+    ));
+    // 不变式：默认尺寸不得小于最小尺寸（`.slint` 的 `min-*`；同值由单测钉住）。破了它，系统会把
+    // 开窗尺寸夹到 min，而标题栏控件条的首帧是按默认宽算的（D 批那个坑）。仅断言，不参与逻辑。
+    debug_assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
+    debug_assert!(crate::syschat::SYSCHAT_DEFAULT_H >= crate::syschat::SYSCHAT_MIN_H);
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
     // D2（稿 ①②③）：标题栏控件条的落位计划。
     // 初次用 preferred-width 兜底（此时窗口尚未 realize，`size()` 可能是 0），
@@ -2433,6 +2597,57 @@ pub fn run_gui() -> Result<()> {
         syschat_win.on_titlebar_width_changed(move |w| {
             if let Some(win) = cw.upgrade() {
                 apply_syschat_layout(&win, w);
+            }
+        });
+    }
+    // ── v11（卡 `abb-v11-resizable-split`）：分割条接线 ────────────────────────
+    // 可分配带 / 拖动指针位置由 `.slint` 报来（布局几何只有它知道），比例 ↔ 像素与上下限夹取
+    // 全在 `syschat::SplitDrag`（纯函数带单测）；比例落盘走**去抖**（同 `BubblePos`，400ms
+    // 取走一次待落盘值）。
+    let sc_split: Rc<SplitWiring> = Rc::new(SplitWiring::new());
+    {
+        let sw = sc_split.clone();
+        let cw = syschat_win.as_weak();
+        syschat_win.on_split_band_changed(move |band| {
+            if let Some(w) = cw.upgrade() {
+                sw.on_band(&w, band);
+            }
+        });
+        let sw = sc_split.clone();
+        let cw = syschat_win.as_weak();
+        syschat_win.on_split_drag_to(move |pointer_rel| {
+            if let Some(w) = cw.upgrade() {
+                sw.drag_to(&w, pointer_rel);
+            }
+        });
+        let sw = sc_split.clone();
+        syschat_win.on_split_drag_end(move || {
+            sw.drag_end();
+        });
+        let sw = sc_split.clone();
+        let saver = slint::Timer::default();
+        saver.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(400),
+            move || {
+                if let Some(ratio) = sw.take_pending() {
+                    crate::syschat::save_split_ratio(ratio);
+                }
+            },
+        );
+        // Timer 需保活到事件循环结束（drop 会取消；与 `BubblePos` 的 saver 同款泄漏处理）。
+        std::mem::forget(saver);
+    }
+    // ── v11（卡 `abb-v11-popup-anchor`）：表情 /「更多」面板的锚点接线 ──────────
+    // 几何（两个功能钮的**窗口坐标矩形** + 窗口尺寸）由 `.slint` 报来（`crow` 整体右对齐 ⇒
+    // 功能区左缘在 Rust 侧算不出来），落位/尺寸全在 `syschat::pop_anchor` / `more_pop_h`（纯
+    // 函数带单测）。`sched-count` 也在 `.slint` 的触发指纹里 —— 待发条数变了面板会变高，
+    // 得重算 y（不用把几何再存一份）。
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_pop_anchor_changed(move |emoji_btn, more_btn, win_w, win_h| {
+            if let Some(w) = cw.upgrade() {
+                apply_pop_anchors(&w, emoji_btn, more_btn, win_w, win_h);
             }
         });
     }
@@ -2778,6 +2993,7 @@ pub fn run_gui() -> Result<()> {
         win: &SystemChatWindow,
         atts: &Rc<RefCell<Vec<crate::syschat::Attachment>>>,
         pending: &Rc<Cell<crate::syschat::PendingState>>,
+        split: &Rc<SplitWiring>,
     ) {
         let v = atts.borrow();
         if v.is_empty() {
@@ -2817,8 +3033,11 @@ pub fn run_gui() -> Result<()> {
         // `+N` 文案在 Rust 侧拼（Slint 的 int→string 拼接不可靠，见 `.slint` 的列表标记注释）。
         win.set_pending_more_text(format!("+{}", view.hidden).into());
         win.set_pending_expanded(state.is_expanded());
+        // v11（卡 `abb-v11-resizable-split`）：输入区的**布局下限**随待发附件行变（多一行 76px）；
+        // 同一口径也是分割条比例的上限（有待发附件时消息区要让位，而不是把附件行压扁）。
+        split.set_composer_min(win, crate::syschat::split_composer_min_h(v.len() as i32));
     }
-    refresh_syschat_atts(&syschat_win, &sc_atts, &sc_pending);
+    refresh_syschat_atts(&syschat_win, &sc_atts, &sc_pending, &sc_split);
 
     // ── 卡 d9：表情面板 /「更多（定时）」菜单的 UI 线程状态 ──────────────────
     //
@@ -2881,6 +3100,7 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
+        let split = sc_split.clone();
         Rc::new(move |paths: Vec<std::path::PathBuf>| {
             if paths.is_empty() {
                 return; // 取消选择 / 剪贴板无文件：不算失败，什么都不做
@@ -2890,7 +3110,7 @@ pub fn run_gui() -> Result<()> {
                 Ok(landed) => {
                     let n = landed.len();
                     atts.borrow_mut().extend(landed);
-                    refresh_syschat_atts(&w, &atts, &pending);
+                    refresh_syschat_atts(&w, &atts, &pending, &split);
                     w.set_status_is_error(false);
                     w.set_status_line(format!("已附加 {n} 个文件（随下一条消息发送）").into());
                 }
@@ -2923,10 +3143,11 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
+        let split = sc_split.clone();
         syschat_win.on_attach_clear(move || {
             atts.borrow_mut().clear();
             if let Some(w) = cw.upgrade() {
-                refresh_syschat_atts(&w, &atts, &pending);
+                refresh_syschat_atts(&w, &atts, &pending, &split);
                 w.set_status_is_error(false);
                 w.set_status_line("已清空待发附件（已落盘的文件保留）".into());
             }
@@ -2937,11 +3158,12 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
+        let split = sc_split.clone();
         syschat_win.on_attach_remove(move |idx| {
             let new_len =
                 crate::syschat::remove_pending_at(&mut atts.borrow_mut(), idx.max(0) as usize);
             if let Some(w) = cw.upgrade() {
-                refresh_syschat_atts(&w, &atts, &pending);
+                refresh_syschat_atts(&w, &atts, &pending, &split);
                 w.set_status_is_error(false);
                 w.set_status_line(
                     format!("已移出 1 个待发附件（现 {new_len} 个；已落盘文件保留）").into(),
@@ -2954,12 +3176,13 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
+        let split = sc_split.clone();
         syschat_win.on_pending_toggle(move || {
             let mut st = pending.get();
             st.toggle();
             pending.set(st);
             if let Some(w) = cw.upgrade() {
-                refresh_syschat_atts(&w, &atts, &pending);
+                refresh_syschat_atts(&w, &atts, &pending, &split);
             }
         });
     }
@@ -6628,11 +6851,17 @@ pub fn run_gui() -> Result<()> {
             // 卡 d10：排队项属于旧会话，换会话不得跟着过去。
             pump.borrow_mut().clear();
             match crate::syschat::new_session(None) {
-                Ok(_) => {
+                Ok(r) => {
                     refresh_syschat_sel(&w, &sessions, &models);
                     load_syschat_into(&w, &model);
                     w.set_status_is_error(false);
-                    w.set_status_line("已新建会话（旧会话在「会话」下拉里可切回）。".into());
+                    // 卡 `abb-v11-new-session-dedupe`：当前会话为空时是**复用**，不是新建 ——
+                    // 状态行得如实说（说假话比不说更糟）。
+                    w.set_status_line(if r.created {
+                        "已新建会话（旧会话在「会话」下拉里可切回）。".into()
+                    } else {
+                        "当前会话还是空的，已复用（未新建）。".into()
+                    });
                 }
                 Err(e) => {
                     w.set_status_is_error(true);
@@ -6717,6 +6946,7 @@ pub fn run_gui() -> Result<()> {
         let model = syschat_model.clone();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
+        let split = sc_split.clone();
         let pump = sc_pump.clone();
         let inject = sc_inject.clone();
         let start_turn = start_sc_turn.clone();
@@ -6735,7 +6965,7 @@ pub fn run_gui() -> Result<()> {
             }
             w.set_draft("".into());
             atts.borrow_mut().clear();
-            refresh_syschat_atts(&w, &atts, &pending);
+            refresh_syschat_atts(&w, &atts, &pending, &split);
             match route {
                 crate::syschat::SendRoute::Immediate => {
                     start_turn(text, atts_now);

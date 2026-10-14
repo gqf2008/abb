@@ -286,13 +286,65 @@ pub fn session_list() -> (Vec<SessionMeta>, String) {
     store.list()
 }
 
+/// 会话是否为空（**「新建会话」去重的唯一判据**，卡 `abb-v11-new-session-dedupe`）。
+///
+/// 口径：历史里**没有任何带内容的轮**。逐条对齐卡里的边界——
+/// - **有附件但无消息**：待发附件只存在于 GUI 内存（`attach-count`），**不落历史** ⇒ 历史里
+///   没有轮 ⇒ 空（点了 📎 再点新建会话不该因此多出一个空会话）；
+/// - **只有思考无正文**：`turn_core` 在「正文空、思考非空」时**照样落盘**助手轮（见那里的
+///   注释：停了也不丢推理）⇒ 已有内容 ⇒ 非空；
+/// - 用户轮**一律算有内容**：那是用户真说出口的话（哪怕正文空、只带了附件），不能因为
+///   「正文空白」就被「新建会话」当成空会话吞掉。
+///
+/// 纯函数（不碰 IO/锁）⇒ 单测可穷举边界。
+pub fn is_empty_session(turns: &[Turn]) -> bool {
+    turns
+        .iter()
+        .all(|t| t.role != "user" && t.text.trim().is_empty() && t.thought.trim().is_empty())
+}
+
+/// 「新建会话」的结果。
+///
+/// 为什么要 `created`：本卡之后点「新建会话」**不一定**真新建（当前会话为空就复用），状态行
+/// 得如实说，不能一律报「已新建会话」（说假话比不说更糟）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSession {
+    pub id: String,
+    /// `false` = 复用了当前空会话（会话列表没有增长）。
+    pub created: bool,
+}
+
 /// 新建会话并置为当前；`provider` 为空时沿用当前会话的模型选择。
-/// 返回新会话 id（拿不到历史锁时返回可重试错误——不静默降级）。
-pub fn new_session(provider: Option<&str>) -> Result<String, String> {
+///
+/// **去重**（卡 `abb-v11-new-session-dedupe`）：当前会话为空（[`is_empty_session`]）时**复用**它
+/// —— 否则连点几下「新建会话」就会在列表里堆一串空会话。
+/// 拿不到历史锁时返回可重试错误——不静默降级。
+pub fn new_session(provider: Option<&str>) -> Result<NewSession, String> {
     let store = SessionStore::production();
     let _g = store.lock()?;
+    new_session_locked(&store, provider)
+}
+
+/// [`new_session`] 的实现：**调用方必须已持历史锁**。
+///
+/// 单测用临时 base 直接驱动它（`SessionStore::new_at`）——`SessionStore::production()` 会写真实
+/// `~/.agent-bridge`，单测不能走那条路。
+fn new_session_locked(store: &SessionStore, provider: Option<&str>) -> Result<NewSession, String> {
     let mut state = store.load();
-    store.ensure_current(&mut state);
+    let index_changed = store.ensure_current(&mut state);
+    // 复用一个空会话：**仍要落盘** —— `ensure_current` 可能刚建出它、或刚把旧版单会话历史
+    // 迁进来（那时 `state` 只在内存里，不落盘就会「返回了一个索引里没有的 id」）。
+    if is_empty_session(&store.read_history(&state.current)) {
+        if index_changed {
+            store
+                .save(&state)
+                .map_err(|e| format!("写入会话索引失败：{e}"))?;
+        }
+        return Ok(NewSession {
+            id: state.current.clone(),
+            created: false,
+        });
+    }
     let provider = match provider {
         Some(p) if !p.is_empty() => p.to_string(),
         _ => state
@@ -315,7 +367,7 @@ pub fn new_session(provider: Option<&str>) -> Result<String, String> {
     store
         .save(&state)
         .map_err(|e| format!("写入会话索引失败：{e}"))?;
-    Ok(id)
+    Ok(NewSession { id, created: true })
 }
 
 /// 切到指定会话（不存在则忽略）。
@@ -351,6 +403,56 @@ pub fn set_session_provider(id: &str, provider: &str) -> Result<(), String> {
 /// 气泡位置文件（GUI 专用；后端不读）。
 pub fn bubble_pos_path() -> PathBuf {
     dir().join("bubble.json")
+}
+
+/// 分割比例文件（GUI 专用；后端不读）：`~/.agent-bridge/split.json`，内容形如
+/// `{"ratio":0.68}`。**文件缺失/损坏/越界 ⇒ [`SPLIT_RATIO_DEFAULT`]**（不报错：记不住比例
+/// 只影响观感，不该拦着开窗）。
+pub fn split_path() -> PathBuf {
+    dir().join("split.json")
+}
+
+/// 分割比例（落盘形状）。用结构体而不是裸浮点：将来加字段（比如每屏一份比例）不用改格式。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SplitRatio {
+    pub ratio: f32,
+}
+
+/// 读分割比例；文件缺失/损坏/越界 ⇒ [`SPLIT_RATIO_DEFAULT`]。
+pub fn load_split_ratio() -> f32 {
+    load_split_ratio_from(&split_path()).unwrap_or(SPLIT_RATIO_DEFAULT)
+}
+
+/// 从指定路径读（单测用临时文件；生产走 [`split_path`]）。
+pub fn load_split_ratio_from(path: &std::path::Path) -> Option<f32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: SplitRatio = serde_json::from_str(&text).ok()?;
+    // 越界/非有限都当「没有」（`clamp` 会把脏值变成一个看似合法的比例，宁可回默认值）。
+    (v.ratio.is_finite() && (0.0..=1.0).contains(&v.ratio)).then_some(v.ratio)
+}
+
+/// 写分割比例（失败静默：同 [`save_bubble_pos`]，记不住比例不影响功能）。
+pub fn save_split_ratio(ratio: f32) {
+    save_split_ratio_to(&split_path(), ratio)
+}
+
+/// 写到指定路径（单测用临时文件；生产走 [`save_split_ratio`]）。
+pub fn save_split_ratio_to(path: &std::path::Path, ratio: f32) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let v = SplitRatio {
+        ratio: if ratio.is_finite() {
+            ratio.clamp(0.0, 1.0)
+        } else {
+            SPLIT_RATIO_DEFAULT
+        },
+    };
+    if let Ok(text) = serde_json::to_string(&v) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 /// 系统级会话的工作区：`~/.agent-bridge/workspaces/syschat/`。
@@ -843,10 +945,19 @@ pub fn save_bubble_pos(pos: BubblePos) {
 // 按钮组左侧。本组函数只算「摆在哪、多宽、放不下时换哪一档」，画由 `ui/app.slint` 负责
 // ——这样算术可单测、观感可截图核对。
 
-/// 系统对话窗的初始逻辑宽（= `ui/app.slint` 的 `preferred-width`，src 里已显式
-/// `set_size(520, 560)`）。用途：窗口还没 realize（`Window::size()` 给 0）时算计划的兜底宽度。
-/// 与 `.slint` 的一致性由 [`tests::syschat_preferred_width_matches_slint`] 守着。
+/// 系统对话窗的初始逻辑宽（= `ui/app.slint` 的 `preferred-width`，src 里显式 `set_size` 一次）。
+/// 用途：窗口还没 realize（`Window::size()` 给 0）时算计划的兜底宽度。
+/// 与 `.slint` 的一致性由 [`tests::syschat_window_size_constants_match_slint`] 守着。
 pub const SYSCHAT_PREFERRED_WIDTH: f32 = 520.0;
+
+/// 系统对话窗的**初始**逻辑高（= `.slint` 的 `preferred-height`）：`no-frame` 窗在 macOS 上
+/// 吃不到 `preferred-*`（D 批实测开出来是最小尺寸），故开窗前显式 `set_size` 一次。
+pub const SYSCHAT_DEFAULT_H: f32 = 560.0;
+/// 系统对话窗的**最小**尺寸（= `.slint` 的 `min-width` / `min-height`）：交回系统做缩放下界。
+/// **不是**固定尺寸：`min != max` ⇒ Slint 的 winit 后端把窗口标为可缩放
+/// （`i-slint-backend-winit` 的 `window_is_resizable`）。
+pub const SYSCHAT_MIN_W: f32 = 340.0;
+pub const SYSCHAT_MIN_H: f32 = 380.0;
 
 /// 消息区正文块的可用宽相对**窗宽**要扣掉的全部内边距（D2「消息区底部文字重叠」修复用）。
 ///
@@ -1236,6 +1347,236 @@ pub fn menu_anchor(
         x = 6;
     }
     (x, btn_bottom + 6)
+}
+
+// ─────────── v11：输入区上方的功能面板（`.pop`）锚点（卡 `abb-v11-popup-anchor`）───────────
+//
+// 稿 v11 第 1 条：「`表情` / `更多` 的面板必须**紧贴对应按钮上方**弹出（此前飘太远）」。
+// 旧实现把面板锚在**输入框（`composer`）的顶边**上（`y: composer.absolute-position.y - h - 6`），
+// 而按钮在输入框**底部**的功能区里 ⇒ 面板底边离按钮还有「待发附件行 + 文本区」那么高
+// （默认布局下 100+ px，这就是 owner 说的「飘太远」）。现在锚到**按钮自己**的矩形上。
+//
+// 算术留在 Rust（这里）、画在 `.slint`：按钮矩形由 Slint 报给 Rust（`crow` 整体右对齐，功能区
+// 左缘 = 输入框右缘 − 发送钮宽，而发送钮宽随文案/字体变，Rust 侧复算不出来），面板的
+// `x/y/w/h` 全由 Rust 写回（`emoji-pop-*` / `more-pop-*`）。
+
+/// `.pop` 底边与按钮顶边之间的间距（卡里写 6–8px；取 6 —— 与标题栏 [`menu_anchor`] 同一个数）。
+pub const POP_GAP: i32 = 6;
+/// `.pop` 与窗口四周的最小留白（靠窗边整体内移时用）。
+pub const POP_MARGIN: i32 = 6;
+/// 表情面板宽高（原 `ui/app.slint` 里的 300×220 字面量 ⇒ 搬来与锚点算术同源）。
+pub const EMOJI_POP_W: i32 = 300;
+pub const EMOJI_POP_H: i32 = 220;
+/// 「更多（定时）」面板宽（原 `.slint` 里的 250px 字面量）。
+pub const MORE_POP_W: i32 = 250;
+
+/// 「更多」面板的高度：**逐字搬自** `ui/app.slint` 原来的表达式
+/// `122 + N×26 + (N>0 ? 20 : 0) + (N>1 ? 26 : 0)`（padding 6×2 + 头 20 + 三档 3×26 + 档间距 + 待发行）。
+///
+/// 搬进 Rust 的理由：`y = 按钮顶 − 6 − 面板高`，面板高必须与锚点**同源**；也让「待发条目多 ⇒
+/// 面板变高 ⇒ 仍不出窗」能被单测钉住。搬的是原表达式（含原式对条目间距的**富余**，见
+/// `more_pop_h_is_the_slint_expression` 的注释），不改观感。
+pub fn more_pop_h(sched_count: i32) -> i32 {
+    let n = sched_count.max(0);
+    122 + n * 26 + if n > 0 { 20 } else { 0 } + if n > 1 { 26 } else { 0 }
+}
+
+/// 面板落位（窗口坐标，逻辑像素；纯函数）。
+///
+/// 输入：`btn = (x, y, w, h)` = **对应按钮**在窗口坐标下的矩形；`panel = (w, h)`；`win = (w, h)`。
+/// 口径（单测逐条钉住）：
+/// 1. 横向 `x = btn.x + btn.w - panel.w`：**面板右缘与按钮右缘对齐**（卡里的验收条）；
+/// 2. 纵向 `y = btn.y - POP_GAP - panel.h`：**底边贴在按钮顶边上方 6px**（稿「贴着按钮上方」）；
+/// 3. 靠窗边**整体内移**（`POP_MARGIN` 留白，先压上界再压下界——同 [`clamp_bubble_pos`] /
+///    [`menu_anchor`] 的取向）。窗口比面板还小时最终落在左上角留白处：**任何输入都不出窗**
+///    （「不出窗」优先于「贴按钮」）。
+pub fn pop_anchor(btn: (i32, i32, i32, i32), panel: (i32, i32), win: (i32, i32)) -> (i32, i32) {
+    let (bx, by, bw, _bh) = btn;
+    let (pw, ph) = panel;
+    let (ww, wh) = win;
+    let mut x = bx + bw - pw;
+    let max_x = ww - pw - POP_MARGIN;
+    if x > max_x {
+        x = max_x;
+    }
+    if x < POP_MARGIN {
+        x = POP_MARGIN;
+    }
+    let mut y = by - POP_GAP - ph;
+    let max_y = wh - ph - POP_MARGIN;
+    if y > max_y {
+        y = max_y;
+    }
+    if y < POP_MARGIN {
+        y = POP_MARGIN;
+    }
+    (x, y)
+}
+
+// ─────────── v11：内容区 ↔ 输入区的分割条（卡 `abb-v11-resizable-split`）───────────
+//
+// 稿 v11.1 的 `.split`：夹在 `.convo`（消息区）与 `.composer-zone`（输入区）**之间**的一条 10px
+// 把手 —— **不是窗口底边的系统缩放**、**不是输入框内部**（v11 初版把位置画错，v11.1 已修正；
+// 本卡按修正后的位置实现）。拖动改两区高度比例，比例持久化。
+//
+// 「比例」的分母是**可分配带**：窗高减去标题栏/状态栏等固定构件与分割条本身。这个值不在这里
+// 镜像布局常量，而是由 `ui/app.slint` 用三块（消息区/把手/输入区）的**真实几何**合成后回报
+// （`split-band-changed`）——布局改了自动跟上。
+
+/// 分割条（`.split`）高：设计稿 `docs/design/syschat-dialog.html`（v11.1）的 `.split{height:10px}`。
+///
+/// 注：卡正文按稿写成「8px 拖拉把手」，稿里其实是 10px；以稿为准（`README` 的版本口径：
+/// 「最新口径一律以 `syschat-dialog.html` 为准」）。与 `.slint` 的一致性由
+/// [`tests::split_handle_h_matches_design`] 直接读稿子钉住。
+pub const SPLIT_HANDLE_H: f32 = 10.0;
+/// 内容区最小高（再拖也不许把消息区压没）。
+pub const SPLIT_CONVO_MIN_H: f32 = 96.0;
+/// 输入区最小高。
+///
+/// 口径：**输入区在无待发附件时的自然高**（分隔线 2 + 上下 padding 12/10 + 输入框 66 +
+/// 间距 8 + 功能区 30 = 146）——即「分割条紧贴输入区上沿」这个稿里的默认观感。
+/// 无头渲染台直接量这个值（`split_default_puts_divider_on_composer_top`），漂移时红。
+pub const SPLIT_COMPOSER_MIN_H: f32 = 146.0;
+/// 比例默认值（没有 `split.json` / 文件损坏时）。
+///
+/// **1.0 是个好用的哨兵**：它被 [`split_clamp_convo_h`] 的上限夹成 `(band − 10 − 146)/band`，
+/// 而那个上限的含义正好是「输入区取最小高」—— 也就是稿里的默认观感，且在**任何窗高下**都成立
+/// （不必把「默认窗高」这个数字搬进比例）。用户拖过之后落盘的就是真实比例（< 1）。
+pub const SPLIT_RATIO_DEFAULT: f32 = 1.0;
+
+/// 把「想要的内容区高」夹进上下限（纯函数）。
+///
+/// `composer_min_h` = 输入区下限（无待发附件时就是 [`SPLIT_COMPOSER_MIN_H`]；有待发附件行时
+/// 再加上那一行的高——由 [`split_composer_min_h`] 算）。**它同时是 `.slint` 的 `min-height`
+/// 与这里的上限口径**：两边同一个数，拖动才不会出现「拖到某处布局又把它挤回去」的错位。
+///
+/// - `band_h <= 0`（窗口还没 realize / 退化输入）⇒ 0：由 `.slint` 的默认值兜底，不写负高；
+/// - 上界 `= 可分配带 − 分割条 − 输入区下限`；上界低于下界时**保内容区最小高**（宁可输入区
+///   被挤到它的 `min-height`，也不把消息区压成 0 —— 消息区没高度时一行正文都看不见）；
+/// - `NaN` ⇒ 下界（脏值不得进布局）；±inf 交给 `clamp` 夹到各自边界。
+pub fn split_clamp_convo_h(band_h: f32, want: f32, composer_min_h: f32) -> f32 {
+    let usable = band_h - SPLIT_HANDLE_H;
+    if usable <= 0.0 {
+        return 0.0;
+    }
+    let lo = SPLIT_CONVO_MIN_H.min(usable);
+    let hi = (usable - composer_min_h).max(lo);
+    if want.is_nan() {
+        return lo;
+    }
+    want.clamp(lo, hi)
+}
+
+/// 输入区下限：无待发附件时的自然高 + 有待发附件时那一行（缩略图/文件 chip 行 68 + 间距 8）。
+///
+/// 两个消费者必须同口径：`.slint` 的 `composer-min-h`（布局硬约束）与分割条比例的上限
+/// （[`split_clamp_convo_h`]）——否则「拖到最上」时布局会把消息区又挤回去。
+pub fn split_composer_min_h(attach_count: i32) -> f32 {
+    SPLIT_COMPOSER_MIN_H + if attach_count > 0 { 76.0 } else { 0.0 }
+}
+
+/// 文本区（`.area`）的**自然下限**高：稿 `.area{min-height:66px}`。
+pub const SPLIT_AREA_MIN_H: f32 = 66.0;
+
+/// 文本区高：自然下限 + 「输入区拿到的富余高度」。
+///
+/// - `composer_h` = 输入区高（[`split_composer_h`] 算出的）；
+/// - `composer_natural_h` = 输入区的自然高（= [`split_composer_min_h`]：含待发附件行）。
+///
+/// 富余（`composer_h − 自然高`）**全部**给文本区：拖动分割条把输入区拉高时，用户看到的是
+/// **输入框/文本区变高**，而不是「分隔线移了、中间多一块空白」。两区高与文本区高都由
+/// Rust 写进 `.slint`（实测容器上的 `vertical-stretch` 会被忽略、多出来的空间被丢掉）。
+pub fn split_area_h(composer_h: f32, composer_natural_h: f32) -> f32 {
+    if !composer_h.is_finite() || !composer_natural_h.is_finite() {
+        return SPLIT_AREA_MIN_H;
+    }
+    SPLIT_AREA_MIN_H + (composer_h - composer_natural_h).max(0.0)
+}
+
+/// 比例 → 内容区高（比例先夹进 `[0, 1]`，再按上下限夹取）。
+pub fn split_convo_h(band_h: f32, ratio: f32, composer_min_h: f32) -> f32 {
+    split_clamp_convo_h(band_h, band_h * ratio.clamp(0.0, 1.0), composer_min_h)
+}
+
+/// 内容区高 → **输入区高**（两者拼满可分配带：`输入区 = 带 − 分割条 − 内容区`）。
+///
+/// 显式给出两区高（而不是让布局去分剩余空间）有两个好处：① 布局里没有「剩余给谁」的歧义
+/// （不依赖 stretch 在容器上的语义）；② `.slint` 报给 Rust 的「带」不必从这两个值反推 ——
+/// 否则就是自指（换窗高时分母永远分不到新高度）。退化/脏输入 ⇒ 0（不写负高）。
+pub fn split_composer_h(band_h: f32, convo_h: f32) -> f32 {
+    if !band_h.is_finite() || !convo_h.is_finite() {
+        return 0.0;
+    }
+    (band_h - SPLIT_HANDLE_H - convo_h).max(0.0)
+}
+
+/// 内容区高 → 比例（落盘口径）。`band_h <= 0` / 非有限输入 ⇒ [`SPLIT_RATIO_DEFAULT`]
+/// （绝不把 `NaN`/`inf` 写进 `split.json`）。
+pub fn split_ratio(band_h: f32, convo_h: f32) -> f32 {
+    if !(band_h > 0.0) || !convo_h.is_finite() {
+        return SPLIT_RATIO_DEFAULT;
+    }
+    (convo_h / band_h).clamp(0.0, 1.0)
+}
+
+/// 分割条拖动/分配状态（纯数据 + 纯算术：不碰 IO、不碰 Slint ⇒ 可单测）。
+///
+/// 拖动用「**指针相对消息区顶边的 y**」直接定 divider 位置（而不是「按下时的基线 + 逐帧增量」）：
+/// 消息区顶边在拖动期间**不动**（它在标题栏/状态行之下，固定），所以这个坐标本身就是「divider
+/// 该在哪」，既不会累加取整误差，也不需要在按下时采样当前高度 —— 窗口/输入区尺寸中途变化
+/// （待发附件行出现）也不会让它跳。
+#[derive(Debug, Clone, Copy)]
+pub struct SplitDrag {
+    ratio: f32,
+    band_h: f32,
+    composer_min_h: f32,
+}
+
+impl SplitDrag {
+    /// 用落盘比例建状态（脏值/缺失 ⇒ 默认比例）。
+    pub fn new(ratio: f32) -> Self {
+        Self {
+            ratio: if ratio.is_finite() {
+                ratio.clamp(0.0, 1.0)
+            } else {
+                SPLIT_RATIO_DEFAULT
+            },
+            band_h: 0.0,
+            composer_min_h: SPLIT_COMPOSER_MIN_H,
+        }
+    }
+
+    /// 当前比例（落盘用）。
+    pub fn ratio(&self) -> f32 {
+        self.ratio
+    }
+
+    /// 布局报来「可分配带」与「输入区下限」（窗高/DPI/待发附件变化）⇒ 按比例算两区高。
+    pub fn on_band(&mut self, band_h: f32, composer_min_h: f32) -> (f32, f32) {
+        self.band_h = band_h;
+        self.composer_min_h = composer_min_h;
+        self.current()
+    }
+
+    /// 拖到「指针相对消息区顶边的 y」：返回新的内容区高，并把比例更新为**夹取后**的值
+    /// （夹取过的比例会落盘 ⇒ 下次按窗口重新分配时与屏幕上看到的一致）。
+    ///
+    /// 返回 `(内容区高, 输入区高)`：两区高一起给，调用方一次写进窗口（见 [`split_composer_h`]）。
+    /// 脏输入（NaN/inf）不得传播；带还没报来（未布局）时不动。
+    pub fn drag_to(&mut self, pointer_rel: f32) -> (f32, f32) {
+        if !pointer_rel.is_finite() || self.band_h <= 0.0 {
+            return self.current();
+        }
+        let h = split_clamp_convo_h(self.band_h, pointer_rel, self.composer_min_h);
+        self.ratio = split_ratio(self.band_h, h);
+        (h, split_composer_h(self.band_h, h))
+    }
+
+    /// 当前比例下的两区高 `(内容区, 输入区)`（不改任何状态）。
+    pub fn current(&self) -> (f32, f32) {
+        let h = split_convo_h(self.band_h, self.ratio, self.composer_min_h);
+        (h, split_composer_h(self.band_h, h))
+    }
 }
 
 // ─────────────────── D 批：对话框锚定气泡的几何（纯函数）───────────────────
@@ -4008,8 +4349,52 @@ mod tests {
         );
     }
 
+    /// 默认窗口尺寸与**最小尺寸**常量必须等于 `ui/app.slint` 的四个布局约束（跨文件不变量）。
+    ///
+    /// - 窗口还没 realize（`size()` 为 0）时计划按默认宽算，漂移会让首帧按另一个尺寸落位；
+    /// - `min-*` 是「自由缩放的下界」，也是「窗口不是固定尺寸」的证据：Slint 的 winit 后端把
+    ///   `min` 交给系统（`set_min_inner_size`），若 `min == max` 反而会变成不可缩放
+    ///   （`i-slint-backend-winit` 的 `window_is_resizable`）。
+    ///
+    /// 判别力：改任一常量、或改 `.slint` 里对应的那一行 ⇒ 本用例红。
+    #[test]
+    fn syschat_window_size_constants_match_slint() {
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let head = &raw[raw
+            .find("export component SystemChatWindow")
+            .expect("ui/app.slint 里找不到 SystemChatWindow")..];
+        // 只取该组件头部的约束行（第一个 `in property` 之前就是全部布局约束）。
+        let head: String = head
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("in property"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pick = |key: &str| -> f32 {
+            let line = head
+                .lines()
+                .find(|l| l.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("SystemChatWindow 缺少 {key}：\n{head}"));
+            let code = line.split("//").next().unwrap_or(line).trim();
+            code.trim_start_matches(key)
+                .trim()
+                .trim_end_matches(';')
+                .trim_end_matches("px")
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("解析 {key} 失败：{code:?}"))
+        };
+        assert_eq!(pick("preferred-width:"), SYSCHAT_PREFERRED_WIDTH);
+        assert_eq!(pick("preferred-height:"), SYSCHAT_DEFAULT_H);
+        assert_eq!(pick("min-width:"), SYSCHAT_MIN_W);
+        assert_eq!(pick("min-height:"), SYSCHAT_MIN_H);
+        // 最小尺寸必须严格小于默认尺寸，否则窗口会退化成「固定尺寸」（拖不动）。
+        assert!(SYSCHAT_MIN_W < SYSCHAT_PREFERRED_WIDTH);
+        assert!(SYSCHAT_MIN_H < SYSCHAT_DEFAULT_H);
+    }
+
     /// `SYSCHAT_PREFERRED_WIDTH` 必须等于 `ui/app.slint` 的 `preferred-width`
     /// （跨文件不变量；窗口未 realize 时计划就按它算，漂移会让首帧按另一个宽度落位）。
+    /// 四个约束的统一口径见 [`syschat_window_size_constants_match_slint`]。
     #[test]
     fn syschat_preferred_width_matches_slint() {
         let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
@@ -4664,5 +5049,366 @@ mod tests {
     /// 测试用临时工作区目录。
     fn ws2() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("abb-syschat-ws2-{}", uuid::Uuid::new_v4()))
+    }
+
+    // ── v11（卡 `abb-v11-new-session-dedupe`）：「新建会话」去重 ──
+
+    /// 空会话判据的边界（每条对应卡里的一个口径）。
+    ///
+    /// 判别力：把 `is_empty_session` 改成恒 `true`/恒 `false`、或去掉任一条子句 ⇒ 本用例必红。
+    #[test]
+    fn is_empty_session_boundaries() {
+        // ① 全新会话：历史里一条轮都没有（「有附件但无消息」也落在这里：附件不落历史）
+        assert!(is_empty_session(&[]), "没有任何轮 ⇒ 空");
+        // ② 用户轮（哪怕正文空白，比如只带了附件）⇒ 不算空（不能把它吞掉）
+        assert!(!is_empty_session(&[turn_of("user", "")]), "用户轮算有内容");
+        assert!(
+            !is_empty_session(&[turn_of("user", "嗨")]),
+            "用户轮算有内容"
+        );
+        // ③ 助手正文 ⇒ 非空
+        assert!(
+            !is_empty_session(&[turn_of("assistant", "你好")]),
+            "有正文的助手轮 ⇒ 非空"
+        );
+        // ④ 只有思考无正文 ⇒ 非空（`turn_core` 照样落盘这条轮）
+        let mut think_only = turn_of("assistant", "");
+        think_only.thought = "推理过程…".to_string();
+        assert!(
+            !is_empty_session(&[think_only]),
+            "只有思考 ⇒ 非空（停了也不丢推理）"
+        );
+        // ⑤ 空壳助手轮（正文/思考都空）⇒ 不算内容（防御：理论上不该落盘，见 turn_core 的守卫）
+        assert!(
+            is_empty_session(&[turn_of("assistant", "  ")]),
+            "全空白的助手轮不算内容"
+        );
+        assert!(
+            is_empty_session(&[turn_of("assistant", ""), turn_of("assistant", "\n")]),
+            "全是空壳轮 ⇒ 空"
+        );
+    }
+
+    /// 端到端去重（临时 base，不碰真实数据目录）：
+    /// 空会话连点「新建会话」⇒ 只能有一个会话；有内容后再点 ⇒ 才真新建。
+    #[test]
+    fn new_session_reuses_current_when_empty() {
+        let (store, base) = tmp_store("dedupe");
+        // 空库首次调用：`ensure_current` 先建出首个（空）会话 ⇒ 本函数复用它，列表只有 1 条。
+        let first = new_session_locked(&store, None).unwrap();
+        assert_eq!(store.list().0.len(), 1, "空库调用后只应有一个会话");
+
+        // 连点两次：都是复用，且列表长度不增长。
+        for _ in 0..2 {
+            let again = new_session_locked(&store, None).unwrap();
+            assert!(!again.created, "当前会话为空 ⇒ 复用，不新建");
+            assert_eq!(again.id, first.id, "复用的就是当前那个空会话");
+            assert_eq!(store.list().0.len(), 1, "列表不得增长");
+        }
+
+        // 写进一条用户轮 ⇒ 再点就真新建（旧会话保留在列表里）。
+        store
+            .append_turns(&first.id, &[turn_of("user", "说一句话")])
+            .unwrap();
+        let third = new_session_locked(&store, None).unwrap();
+        assert!(third.created, "有内容后应真新建");
+        assert_ne!(third.id, first.id);
+        let (list, cur) = store.list();
+        assert_eq!(list.len(), 2, "旧会话必须保留（稿 v10 第 7 条）");
+        assert_eq!(cur, third.id);
+        // 新建的会话自己也是空的 ⇒ 再点仍复用（不堆空会话）。
+        let fourth = new_session_locked(&store, None).unwrap();
+        assert!(!fourth.created && fourth.id == third.id);
+        assert_eq!(store.list().0.len(), 2, "空会话不被堆出来");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 去重不得弄坏「旧版单会话历史迁移」：迁移后默认会话**非空** ⇒ 点新建会话应真新建
+    /// （而不是按空会话复用）。
+    #[test]
+    fn new_session_after_legacy_migration_creates_new() {
+        let (store, base) = tmp_store("dedupe-legacy");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            store.legacy_path(),
+            format!(
+                "{}\n",
+                serde_json::to_string(&turn_of("user", "旧话")).unwrap()
+            ),
+        )
+        .unwrap();
+        let a = new_session_locked(&store, None).unwrap();
+        let (list, _) = store.list();
+        assert_eq!(list.len(), 2, "旧会话（含迁移历史）必须保留");
+        assert!(store.read_history(&a.id).is_empty(), "新会话不得带上旧历史");
+        assert!(
+            list.iter().any(|s| store.read_history(&s.id).len() == 1),
+            "迁移进来的那一条轮应在某个会话里（没丢）"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── v11（卡 `abb-v11-popup-anchor`）：`.pop` 面板锚点 ──
+
+    /// 落位三条口径逐条钉住（右对齐、上贴、靠边内移），并逐点扫「不出窗」。
+    #[test]
+    fn pop_anchor_policies() {
+        // ① 右缘与按钮右缘对齐 + 底边在按钮顶边上方 6px。（按钮取得够靠右，免得先被窗边夹住。）
+        let btn = (300, 500, 24, 24);
+        let panel = (300, 220);
+        let win = (520, 560);
+        let (x, y) = pop_anchor(btn, panel, win);
+        assert_eq!(x, btn.0 + btn.2 - panel.0, "面板右缘应与按钮右缘对齐");
+        assert_eq!(x + panel.0, btn.0 + btn.2);
+        assert_eq!(btn.1 - (y + panel.1), POP_GAP, "底边距按钮顶边应恰为 6px");
+
+        // ② 靠左窗边：右对齐会跑出左边 ⇒ 内移到留白处，仍不出窗。
+        let left = pop_anchor((10, 500, 24, 24), panel, win);
+        assert_eq!(left.0, POP_MARGIN, "靠左窗边应内移到留白处");
+        // ③ 靠右窗边：右对齐会跑出右边 ⇒ 夹回右留白。
+        let right = pop_anchor((500, 500, 24, 24), panel, win);
+        assert_eq!(right.0 + 300, 520 - POP_MARGIN, "靠右窗边应夹回右留白");
+        // ④ 面板高过按钮上方空间（窗口很矮）⇒ 顶边内移（不出窗优先）。
+        let tall = pop_anchor((200, 100, 24, 24), panel, (520, 380));
+        assert_eq!(tall.1, POP_MARGIN, "上边放不下时顶边夹到留白处");
+        // ⑤ 窗口比面板还小：任何输入都不出窗（最终落在左上留白处）。
+        assert_eq!(
+            pop_anchor((200, 500, 24, 24), panel, (200, 150)),
+            (POP_MARGIN, POP_MARGIN)
+        );
+        // ⑥ 逐点扫：任何按钮位置/窗口尺寸下都落在窗内。
+        for bw in [0, 10, 24, 137] {
+            for bx in [-40, 0, 6, 200, 500, 900] {
+                for by in [-30, 6, 120, 500, 1200] {
+                    for (ww, wh) in [(340, 380), (520, 560), (1200, 900)] {
+                        let (x, y) = pop_anchor((bx, by, bw, 24), panel, (ww, wh));
+                        assert!(
+                            x >= POP_MARGIN
+                                && y >= POP_MARGIN
+                                && x + 300 <= ww - POP_MARGIN
+                                && y + 220 <= wh - POP_MARGIN,
+                            "出窗了：btn=({bx},{by},{bw}) win=({ww},{wh}) ⇒ ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 「更多」面板高：搬自 `.slint` 原表达式（逐值对表；改任一分支必红）。
+    #[test]
+    fn more_pop_h_is_the_slint_expression() {
+        assert_eq!(more_pop_h(0), 122);
+        assert_eq!(more_pop_h(1), 122 + 26 + 20);
+        assert_eq!(more_pop_h(2), 122 + 52 + 20 + 26);
+        assert_eq!(more_pop_h(5), 122 + 130 + 20 + 26);
+        assert_eq!(more_pop_h(-3), 122, "负数不该产生负高");
+        assert!(more_pop_h(3) > more_pop_h(0), "条目变多 ⇒ 面板变高");
+    }
+
+    // ── v11（卡 `abb-v11-resizable-split`）：分割条比例 ↔ 像素 ──
+
+    /// 比例 ↔ 像素：不碰上下限时是纯换算，碰上下限就夹住。
+    #[test]
+    fn split_ratio_pixel_roundtrip_and_clamps() {
+        let band = 482.0; // 560 高窗的可分配带（560 − 78）
+        let cmin = SPLIT_COMPOSER_MIN_H;
+        // 中间比例：往返一致（范围 = [96/482, (482−10−146)/482] ≈ [0.199, 0.676]）。
+        for r in [0.25_f32, 0.4, 0.5, 0.65] {
+            let h = split_convo_h(band, r, cmin);
+            assert_eq!(split_ratio(band, h), r, "比例往返不得漂（{r}）");
+        }
+        // 上限：输入区下限优先（内容区不得把输入区压到下限之下）
+        let h_hi = split_convo_h(band, 0.99, cmin);
+        assert_eq!(
+            h_hi,
+            band - SPLIT_HANDLE_H - cmin,
+            "比例 0.99 应被输入区下限夹住"
+        );
+        // 待发附件行出现 ⇒ 输入区下限抬高一行 ⇒ 上限跟着下移（同一口径喂给两处）
+        let cmin2 = split_composer_min_h(2);
+        assert_eq!(cmin2, cmin + 76.0);
+        assert_eq!(
+            split_convo_h(band, 0.99, cmin2),
+            h_hi - 76.0,
+            "有待发附件时上限应下移一行高（消息区让位）"
+        );
+        assert_eq!(split_composer_min_h(0), cmin, "无待发附件时就是自然高");
+        // 默认比例（哨兵 1.0）就是「输入区取下限」那一档
+        assert_eq!(split_convo_h(band, SPLIT_RATIO_DEFAULT, cmin), h_hi);
+        // 下限：内容区最小高
+        assert_eq!(split_convo_h(band, 0.01, cmin), SPLIT_CONVO_MIN_H);
+        assert_eq!(
+            split_convo_h(band, -3.0, cmin),
+            SPLIT_CONVO_MIN_H,
+            "脏比例夹回下限"
+        );
+        assert_eq!(split_convo_h(band, 9.0, cmin), h_hi, "脏比例夹回上限");
+        // 窗口还没布局（带 = 0）⇒ 0，不写负高
+        assert_eq!(split_convo_h(0.0, 0.6, cmin), 0.0);
+        assert_eq!(split_clamp_convo_h(0.0, 100.0, cmin), 0.0);
+        // 退化：带比分割条还矮 ⇒ 0
+        assert_eq!(split_convo_h(6.0, 0.6, cmin), 0.0);
+        // 极窄（两区最小高之和 > 可分配带）⇒ 保内容区最小高
+        let usable = 200.0;
+        assert_eq!(
+            split_clamp_convo_h(usable + SPLIT_HANDLE_H, 999.0, cmin),
+            SPLIT_CONVO_MIN_H.min(usable),
+            "两区最小高打架时保内容区"
+        );
+        // NaN / inf：既不 panic 也不把脏值传播出去
+        assert_eq!(split_clamp_convo_h(band, f32::NAN, cmin), SPLIT_CONVO_MIN_H);
+        assert_eq!(split_clamp_convo_h(band, f32::INFINITY, cmin), h_hi);
+        assert_eq!(split_ratio(0.0, 300.0), SPLIT_RATIO_DEFAULT);
+        assert_eq!(split_ratio(band, f32::NAN), SPLIT_RATIO_DEFAULT);
+    }
+
+    /// 拖动 = 「divider 跟指针」：指针相对消息区顶边的 y 直接就是内容区高（夹取后），
+    /// 比例同步成夹取后的值；换窗高后按**比例**重新分配（不是记住像素高）。
+    #[test]
+    fn split_drag_follows_pointer_and_clamps() {
+        let band = 482.0;
+        let cmin = SPLIT_COMPOSER_MIN_H;
+        let start_ratio = 0.5_f32;
+        let mut d = SplitDrag::new(start_ratio);
+        let (h0, c0) = d.on_band(band, cmin);
+        assert_eq!(h0, split_convo_h(band, start_ratio, cmin));
+        // 两区高正好拼满可分配带（分割条夹在中间）：布局里没有「剩余空间给谁」的歧义
+        assert_eq!(h0 + SPLIT_HANDLE_H + c0, band, "两区 + 分割条 = 带");
+        assert_eq!(c0, split_composer_h(band, h0));
+
+        // 指针在 300（相对消息区顶）⇒ 高就是 300（区间内不加任何额外偏移）
+        let (h1, c1) = d.drag_to(300.0);
+        assert_eq!(h1, 300.0, "divider 应跟手");
+        assert_eq!(h1 + SPLIT_HANDLE_H + c1, band, "两区 + 分割条 = 带");
+        assert_eq!(d.ratio(), split_ratio(band, 300.0));
+
+        // 拖到上限/下限：夹住，且比例写回夹取后的值（松手存的就是屏幕上看到的）
+        let (h_max, c_min) = d.drag_to(9999.0);
+        assert_eq!(h_max, band - SPLIT_HANDLE_H - cmin);
+        assert_eq!(c_min, cmin, "输入区正好被夹在下限上");
+        assert_eq!(
+            d.ratio(),
+            split_ratio(band, h_max),
+            "比例应同步为夹取后的值"
+        );
+        assert_eq!(
+            d.drag_to(-9999.0).0,
+            SPLIT_CONVO_MIN_H,
+            "往上拖被内容区下限夹住"
+        );
+        assert_eq!(d.ratio(), split_ratio(band, SPLIT_CONVO_MIN_H));
+
+        // 回到区间中间：与之前同一个指针位置必须得到同一个高（不累加、不漂）
+        assert_eq!(d.drag_to(300.0).0, 300.0);
+        // 逐帧来回抖也不会漂（每一步都是绝对定位）
+        for y in [320.0, 280.0, 300.0, 260.0, 300.0] {
+            d.drag_to(y);
+        }
+        assert_eq!(d.drag_to(300.0).0, 300.0, "来回拖动不得累积误差");
+
+        // 待发附件行出现（输入区下限抬高）⇒ 同一指针位置得到的高不变，但上限下移
+        let cmin2 = split_composer_min_h(1);
+        assert_eq!(
+            d.on_band(band, cmin2).0,
+            split_convo_h(band, d.ratio(), cmin2)
+        );
+        let (h_max2, c_min2) = d.drag_to(9999.0);
+        assert_eq!(h_max2, band - SPLIT_HANDLE_H - cmin2);
+        assert_eq!(c_min2, cmin2, "附件行出现后输入区下限也跟着抬高");
+        assert_eq!(h_max2 + SPLIT_HANDLE_H + c_min2, band, "两区 + 分割条 = 带");
+
+        // 窗口变大后按**比例**重新分配（不是记住像素高）
+        let band2 = 700.0;
+        let (h_new, c_new) = d.on_band(band2, cmin);
+        assert_eq!(h_new, split_convo_h(band2, d.ratio(), cmin));
+        assert_eq!(h_new + SPLIT_HANDLE_H + c_new, band2, "换窗高后仍拼满");
+        let back = split_ratio(band2, h_new);
+        assert!(
+            (back - d.ratio()).abs() < 1e-6,
+            "换窗高后比例应保持（{} vs {}）",
+            back,
+            d.ratio()
+        );
+    }
+
+    /// 脏输入与「还没布局」：`SplitDrag` 不得把 NaN/inf 放进比例（它会被写进 split.json），
+    /// 也不得在带未知时算出高度；`split_composer_h` 在退化输入下给 0（不写负高）。
+    #[test]
+    fn split_drag_rejects_dirty_input() {
+        let mut d = SplitDrag::new(f32::NAN);
+        assert_eq!(d.ratio(), SPLIT_RATIO_DEFAULT);
+        // 还没报带（band = 0）⇒ 两区高都是 0、比例不动（调用方据此不做任何写窗口动作）
+        assert_eq!(d.on_band(0.0, SPLIT_COMPOSER_MIN_H), (0.0, 0.0));
+        assert_eq!(d.drag_to(300.0), (0.0, 0.0), "未布局时拖动不得凭空算出高度");
+        assert_eq!(d.ratio(), SPLIT_RATIO_DEFAULT);
+        d.on_band(482.0, SPLIT_COMPOSER_MIN_H);
+        assert!(d.drag_to(f32::NAN).0.is_finite(), "脏指针位置不得传播");
+        assert_eq!(d.ratio(), SPLIT_RATIO_DEFAULT);
+        // inf 同样当「没有有效指针位置」：空操作（绝不写进比例）
+        assert!(d.drag_to(f32::INFINITY).1.is_finite(), "inf 也不得传播");
+        assert_eq!(d.ratio(), SPLIT_RATIO_DEFAULT, "脏指针位置不得改比例");
+        // 两区高与「带」的关系：退化带 ⇒ 0；内容区超界 ⇒ 输入区不小于 0；NaN ⇒ 0
+        assert_eq!(split_composer_h(0.0, 100.0), 0.0);
+        assert_eq!(split_composer_h(6.0, 100.0), 0.0, "带比分割条还矮 ⇒ 0");
+        assert_eq!(
+            split_composer_h(482.0, 9999.0),
+            0.0,
+            "内容区超界 ⇒ 输入区不小于 0"
+        );
+        assert_eq!(split_composer_h(f32::NAN, 100.0), 0.0);
+        assert_eq!(split_composer_h(482.0, f32::NAN), 0.0);
+    }
+
+    /// 比例落盘：写入 ⇒ 读回一致；**文件缺失/损坏/越界 ⇒ 默认值**。
+    ///
+    /// 生产路径是 `~/.agent-bridge/split.json`（同 `bubble.json` 那一套）；单测走临时文件
+    /// （不碰真实数据目录 —— `tools/check_test_isolation.sh` 会红）。
+    #[test]
+    fn split_ratio_persists_and_falls_back() {
+        let dir = std::env::temp_dir().join(format!("abb-split-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("split.json");
+        // 文件缺失 ⇒ None（调用方用默认值）
+        assert_eq!(load_split_ratio_from(&path), None, "缺失时不给值");
+        // 写入 ⇒ 读回
+        save_split_ratio_to(&path, 0.42);
+        assert_eq!(load_split_ratio_from(&path), Some(0.42));
+        // 父目录不存在也能写（自建目录）
+        let deep = dir.join("a").join("b").join("split.json");
+        save_split_ratio_to(&deep, 0.5);
+        assert_eq!(load_split_ratio_from(&deep), Some(0.5));
+        // 损坏 / 越界 ⇒ 当「没有」（不得把脏值喂给布局）
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(load_split_ratio_from(&path), None);
+        std::fs::write(&path, r#"{"ratio":7.5}"#).unwrap();
+        assert_eq!(load_split_ratio_from(&path), None, "越界比例不给值");
+        std::fs::write(&path, r#"{"ratio":-1}"#).unwrap();
+        assert_eq!(load_split_ratio_from(&path), None);
+        // 脏值写盘时被夹回默认值（文件里不出现 NaN）
+        save_split_ratio_to(&path, f32::NAN);
+        assert_eq!(load_split_ratio_from(&path), Some(SPLIT_RATIO_DEFAULT));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分割条高度与**设计稿**一致（读 `docs/design/syschat-dialog.html` 的 `.split{…height:Npx…}`）。
+    ///
+    /// 为什么直接读稿：卡正文写的是 8px，稿里是 10px，而设计目录的版本口径是「最新口径一律以
+    /// `syschat-dialog.html` 为准」。漂移时本用例红。
+    #[test]
+    fn split_handle_h_matches_design() {
+        let raw = crate::platform::src_lf(include_str!("../docs/design/syschat-dialog.html"));
+        let line = raw
+            .lines()
+            .find(|l| l.trim_start().starts_with(".split{"))
+            .expect("设计稿里找不到 .split 规则");
+        let seg = line.split("height:").nth(1).expect(".split 应有 height");
+        let num: f32 = seg
+            .split(['p', ';'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("解析 .split 高度失败：{line:?}"));
+        assert_eq!(num, SPLIT_HANDLE_H, "分割条高度与设计稿漂移了");
     }
 }

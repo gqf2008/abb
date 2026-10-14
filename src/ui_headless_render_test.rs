@@ -21,6 +21,17 @@ const W: u32 = 460;
 const SHORT_H: u32 = 620; // 消息区放不下一整段 ⇒ 走滚动路径
 const TALL_H: u32 = 2600; // 放得下整段内容 ⇒ 量「真实渲染高度」
 
+/// 把 `.pop` 面板的锚点回调接上（生产 `run()` 里同一套）：几何（两个功能钮的窗口坐标矩形 +
+/// 窗口尺寸）由 `.slint` 报来，落位/尺寸全在 `syschat::pop_anchor` / `more_pop_h`。
+fn wire_pop(ui: &SystemChatWindow) {
+    let cw = ui.as_weak();
+    ui.on_pop_anchor_changed(move |emoji_btn, more_btn, win_w, win_h| {
+        if let Some(w) = cw.upgrade() {
+            apply_pop_anchors(&w, emoji_btn, more_btn, win_w, win_h);
+        }
+    });
+}
+
 /// 每次建窗都发一个新的 `MinimalSoftwareWindow`：一个测试里要按不同窗高量两次。
 struct HeadlessPlatform {
     windows: Rc<RefCell<Vec<Rc<MinimalSoftwareWindow>>>>,
@@ -39,6 +50,9 @@ thread_local! {
 }
 
 /// 装后端 + 建窗 + 灌消息 + 定尺寸；返回窗口、平台句柄与 model（供追加/替换）。
+///
+/// v11：这里顺带接上**分割条接线**（生产 `run()` 里同一套）：不接的话 `convo-h` 会停在
+/// `.slint` 的默认值，量出来的几何就不是生产布局（输入区会被撑到剩余的全高）。
 fn setup(
     rows: Vec<SysChatBlockRow>,
     h: u32,
@@ -54,10 +68,37 @@ fn setup(
     let ui = SystemChatWindow::new().expect("SystemChatWindow 建窗失败");
     let model: Rc<slint::VecModel<SysChatBlockRow>> = Rc::new(slint::VecModel::from(rows));
     ui.set_blocks(slint::ModelRc::from(model.clone()));
+    let _ = wire_split(&ui);
+    wire_pop(&ui);
     ui.show().expect("show 失败");
     ui.window().set_size(slint::PhysicalSize::new(W, h));
     let win = windows.borrow().last().expect("平台没发窗口").clone();
     (ui, win, model)
+}
+
+/// 把分割条的四个回调接到一个新建的 [`SplitWiring`] 上（与生产 `run()` 同一套接线），
+/// 返回句柄供测试驱动/断言。
+fn wire_split(ui: &SystemChatWindow) -> Rc<SplitWiring> {
+    let split = Rc::new(SplitWiring::new());
+    let sw = split.clone();
+    let cw = ui.as_weak();
+    ui.on_split_band_changed(move |band| {
+        if let Some(w) = cw.upgrade() {
+            sw.on_band(&w, band);
+        }
+    });
+    let sw = split.clone();
+    let cw = ui.as_weak();
+    ui.on_split_drag_to(move |pointer_rel| {
+        if let Some(w) = cw.upgrade() {
+            sw.drag_to(&w, pointer_rel);
+        }
+    });
+    let sw = split.clone();
+    ui.on_split_drag_end(move || {
+        sw.drag_end();
+    });
+    split
 }
 
 /// 一行消息块：与生产 `ui.rs::block_row` 同口径的最小构造（kind 驱动渲染分支）。
@@ -627,12 +668,24 @@ fn v10_metrics_match_design() {
         38,
         "状态栏高度应为 38px（稿 .status{{min-height:38px}}）；被布局压缩会变小"
     );
+    // v11（卡 `abb-v11-resizable-split`）：消息区与输入区**之间**多一条 10px 分割条（稿 .split）：
+    // 它的顶边线（g[3]）与输入区顶边线（g[4]）相差 10px。
     assert_eq!(
         g.get(3).copied(),
+        Some((662, 663)),
+        "分割条顶边线（稿 .split{{border-top:2px}}）；它就在消息区底边下"
+    );
+    assert_eq!(
+        g.get(4).copied(),
         Some((672, 673)),
         "输入区顶部分隔线（稿 .composer-zone{{border-top:2px}}）——也锁住输入框总高：\
          818 − 10（zone 下 padding）− 124（框内：10 + 文本区 66 + 间距 8 + 功能区 30 + 10）\
          − 10（zone 上 padding）− 2（顶部分隔线）= 672"
+    );
+    assert_eq!(
+        g[4].0 - g[3].0,
+        10,
+        "分割条高应为 10px（稿 .split{{height:10px}}）"
     );
 
     // ── 3. 输入区：zone padding 10px（左右一致）──
@@ -665,7 +718,7 @@ fn v10_metrics_match_design() {
     );
     // 绝对位置交叉验证（像素）：composer 左边框落在 x=12（根 padding 2 + zone 10）。
     // accent 在消息区也有（引用块强调条 / 图片卡），所以只在 composer 区域内找发送钮。
-    let zone_top = g[3].0;
+    let zone_top = g[4].0;
     let send_a =
         bbox(&f, 0, zone_top, MW, MH, is_accent).expect("找不到发送按钮的 accent 底（正面控制）");
     let send_cy = (send_a.1 + send_a.3) / 2;
@@ -1534,6 +1587,525 @@ fn v11_menu_panels_open_and_close_on_outside_or_second_click() {
     );
     press_release(&win, mx, my);
     assert!(ui.get_model_menu_open(), "再点模型 chip 才展开模型面板");
+}
+
+/// v11（卡 `abb-v11-resizable-split`）：分割条的**位置/拖动/夹取/待落盘**。
+///
+/// 判据分三层（自报值 → 布局真值 → 像素）：
+/// 1. **位置**：分割条夹在消息区底边与输入区顶边**之间**（三者首尾相接），高 = 稿的 10px；
+///    默认比例（哨兵 1.0）下输入区正好取下限 ⇒ 输入框贴着窗口底部、消息区拿满剩余；
+/// 2. **拖动**：按住分割条往上拖 ⇒ 指针到哪 divider 就到哪（divider 顶边 = 指针 y）、
+///    两区高度按比例重分、松手后**待落盘比例**正好是屏幕上那一份，且不会重复写盘；
+/// 3. **夹取**：往上/往下拖过头分别被内容区下限（96）与输入区下限夹住；待发附件行出现
+///    （输入区下限 +76）时消息区让位，输入框仍贴底。
+#[test]
+fn v11_split_draggable_between_convo_and_composer() {
+    const W520: u32 = 520;
+    const H: u32 = 820;
+    let (ui, win, _m) = setup(fixture(), H);
+    let split = wire_split(&ui); // 重新接一遍：本用例要拿句柄断言「待落盘比例」
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+    let _ = settle_w(&win, W520, H);
+
+    let band = (H - 2) as f32 - ui.get_dbg_flick_y();
+    println!(
+        "split: flick y={} h={} split y={} h={} zone y={} h={} band={band}",
+        ui.get_dbg_flick_y(),
+        ui.get_dbg_flick_h(),
+        ui.get_dbg_split_y(),
+        ui.get_dbg_split_h(),
+        ui.get_dbg_convo_zone_y(),
+        ui.get_dbg_convo_zone_h(),
+    );
+    // ── 1. 位置：三块首尾相接、分割条 10px、默认比例下输入区在下限 ──
+    assert_eq!(
+        ui.get_dbg_flick_bottom(),
+        ui.get_dbg_split_y(),
+        "分割条顶边应紧贴消息区底边"
+    );
+    assert_eq!(
+        ui.get_dbg_split_h(),
+        crate::syschat::SPLIT_HANDLE_H,
+        "分割条高 = 稿的 10px"
+    );
+    assert_eq!(
+        ui.get_dbg_split_y() + ui.get_dbg_split_h(),
+        ui.get_dbg_convo_zone_y(),
+        "输入区顶边应紧贴分割条底边"
+    );
+    assert_eq!(
+        ui.get_dbg_flick_h() + ui.get_dbg_split_h() + ui.get_dbg_convo_zone_h(),
+        band,
+        "三块之和 = 可分配带（消息区 + 分割条 + 输入区 没有第四块）"
+    );
+    assert_eq!(
+        ui.get_dbg_convo_zone_h(),
+        crate::syschat::SPLIT_COMPOSER_MIN_H,
+        "默认比例（哨兵 1.0）= 输入区取下限 ⇒ 分割条紧贴输入区上沿（与稿的默认观感一致）"
+    );
+    // 输入框贴底：zone 内 padding-bottom 10 ⇒ 框底 = zone 底 − 10（拖动前后都必须成立）
+    assert_eq!(
+        ui.get_dbg_composer_y() + ui.get_dbg_composer_h(),
+        ui.get_dbg_convo_zone_h() - 10.0,
+        "输入框应贴着输入区底边（拖动变大时它的底边不动）"
+    );
+    // 默认比例下输入框/文本区就是它们的自然高（稿 `.area{min-height:66px}`）
+    assert_eq!(ui.get_dbg_area_h(), 66.0);
+    assert_eq!(ui.get_dbg_composer_h(), 124.0);
+    assert_eq!(
+        ui.get_convo_h(),
+        ui.get_dbg_flick_h(),
+        "Rust 写的 convo-h 必须就是布局实际用的高（没被布局改写）"
+    );
+
+    // 像素侧：分割条里那条 38×2 的抓手真的画出来了（稿 `.split i`）。
+    let f = settle_w(&win, W520, H);
+    let grip_y = (ui.get_dbg_split_y() + 5.0) as u32;
+    let segs = groups(&f.ink_cols(grip_y, 6, W520 - 6)); // 6..W-6：排除窗口自己的 2px 黑描边
+    assert_eq!(
+        segs.len(),
+        1,
+        "分割条中间那行应只有抓手一段墨迹（y={grip_y}，实际 {segs:?}）"
+    );
+    let (left, right) = segs[0];
+    assert!(
+        (36..=38).contains(&(right - left + 1)),
+        "抓手宽 ≈38px（稿 .split i{{width:38px}}；带 2px 圆角时中间行量到 36）实际 {}",
+        right - left + 1
+    );
+    let center = (left + right) as f32 / 2.0 + 0.5;
+    assert!(
+        (center - W520 as f32 / 2.0).abs() <= 1.0,
+        "抓手应水平居中（center={center}）"
+    );
+
+    // ── 2. 拖动：divider 跟手（顶边 = 指针 y）──
+    let sy = ui.get_dbg_split_y() + 5.0; // 分割条中间那一点的 y
+    let cx = W520 as f32 / 2.0;
+    // 2a. 按下即松（没移动）：比例不变 ⇒ 不许产生待落盘（不然每次点一下都写盘）
+    press(&win, cx, sy);
+    release(&win, cx, sy);
+    assert_eq!(ui.get_convo_h(), ui.get_dbg_flick_h());
+    assert_eq!(split.take_pending(), None, "没改比例就不该登记落盘");
+
+    // 2b. 按住往上拖 62px（-62）⇒ divider 顶边落在指针处
+    let target = sy - 62.0;
+    press(&win, cx, sy);
+    move_to(&win, cx, target);
+    release(&win, cx, target);
+    let expect_h = target - ui.get_dbg_flick_y();
+    assert_eq!(
+        ui.get_convo_h(),
+        expect_h,
+        "divider 应跟手：指针相对消息区顶边的 y 就是新的内容区高"
+    );
+    assert_eq!(ui.get_dbg_split_y(), target, "分割条顶边应落在指针处");
+    assert_eq!(ui.get_dbg_flick_h(), expect_h, "布局必须用上新的内容区高");
+    assert_eq!(
+        ui.get_dbg_composer_y() + ui.get_dbg_composer_h(),
+        ui.get_dbg_convo_zone_h() - 10.0,
+        "拖动后输入框仍贴底"
+    );
+    // 「输入区变高」在屏幕上必须是**输入框本身变高**（不只是分割条移位）：多出来的高度归
+    // 输入框 + 文本区，这样拖动看得见效果。
+    assert!(
+        ui.get_dbg_area_h() > 66.0 && ui.get_dbg_composer_h() > 124.0,
+        "拖动后输入框/文本区应变高（area={} composer={}）",
+        ui.get_dbg_area_h(),
+        ui.get_dbg_composer_h()
+    );
+    // 待落盘比例 = 屏幕上这一份（去抖定时器取走一次；再取就没有了）
+    let want = crate::syschat::split_ratio(band, expect_h);
+    let got = split.take_pending().expect("拖动改过比例 ⇒ 应有待落盘");
+    assert!(
+        (got - want).abs() < 1e-6,
+        "待落盘比例应与所见一致（{got} vs {want}）"
+    );
+    assert_eq!(split.take_pending(), None, "取走一次后不应再有待落盘");
+
+    // ── 3. 夹取：两头拖过头都被下限夹住 ──
+    // 往下拖过头 ⇒ 输入区下限（消息区给到最大）
+    let sy2 = ui.get_dbg_split_y() + 5.0;
+    press(&win, cx, sy2);
+    move_to(&win, cx, 5000.0);
+    release(&win, cx, 5000.0);
+    let band = (H - 2) as f32 - ui.get_dbg_flick_y();
+    assert_eq!(
+        ui.get_convo_h(),
+        band - crate::syschat::SPLIT_HANDLE_H - crate::syschat::SPLIT_COMPOSER_MIN_H,
+        "往下拖过头应被输入区下限夹住"
+    );
+    assert_eq!(
+        ui.get_dbg_convo_zone_h(),
+        crate::syschat::SPLIT_COMPOSER_MIN_H,
+        "输入区到下限就不许再小"
+    );
+    // 往上拖过头 ⇒ 内容区下限
+    let sy3 = ui.get_dbg_split_y() + 5.0;
+    press(&win, cx, sy3);
+    move_to(&win, cx, 0.0);
+    release(&win, cx, 0.0);
+    assert_eq!(
+        ui.get_convo_h(),
+        crate::syschat::SPLIT_CONVO_MIN_H,
+        "往上拖过头应被内容区下限夹住"
+    );
+    assert!(
+        ui.get_dbg_convo_zone_h() >= crate::syschat::SPLIT_COMPOSER_MIN_H,
+        "输入区不得低于下限（消息区先让位）"
+    );
+
+    // ── 4. 悬停（没按下）的指针移动不得改任何东西 ──
+    let before = ui.get_convo_h();
+    let sy4 = ui.get_dbg_split_y() + 5.0;
+    move_to(&win, cx, sy4 + 40.0);
+    assert_eq!(ui.get_convo_h(), before, "悬停不是拖动，不许动 divider");
+
+    // ── 5. 待发附件行出现（输入区下限 +76）⇒ 消息区让位、输入框仍贴底 ──
+    ui.set_attach_count(3);
+    split.set_composer_min(&ui, crate::syschat::split_composer_min_h(3));
+    let _ = settle_w(&win, W520, H);
+    let cmin = crate::syschat::split_composer_min_h(3);
+    assert_eq!(cmin, crate::syschat::SPLIT_COMPOSER_MIN_H + 76.0);
+    assert!(
+        ui.get_composer_h() >= cmin,
+        "输入区高应不低于（随附件行抬高的）下限（composer_h={} cmin={cmin}）",
+        ui.get_composer_h()
+    );
+    assert!(
+        ui.get_dbg_convo_zone_h() >= cmin,
+        "待发附件行不许被压扁（输入区至少 {}，实际 {}）",
+        cmin,
+        ui.get_dbg_convo_zone_h()
+    );
+    assert!(
+        ui.get_convo_h() <= band - crate::syschat::SPLIT_HANDLE_H - cmin + 0.5,
+        "输入区下限抬高后消息区应让位（convo={}，上限={}）",
+        ui.get_convo_h(),
+        band - crate::syschat::SPLIT_HANDLE_H - cmin
+    );
+    assert_eq!(
+        ui.get_dbg_composer_y() + ui.get_dbg_composer_h(),
+        ui.get_dbg_convo_zone_h() - 10.0,
+        "有待发附件时输入框仍贴底"
+    );
+    assert_eq!(
+        ui.get_dbg_flick_h() + ui.get_dbg_split_h() + ui.get_dbg_convo_zone_h(),
+        band,
+        "三块之和仍等于可分配带（没有溢出/重叠）"
+    );
+
+    // ── 6. 最小窗（340×380，此时状态行会多出回落位的 chip）也必须自洽 ──
+    // 这一档专门盯「可分配带」的算式：它由窗高减去固定构件得出，窄窗/矮窗下若有构件长高
+    // （状态行回落行、标题栏换档）就会露馅——三块之和必须仍等于真实带高。
+    const W340: u32 = 340;
+    const H_MIN: u32 = 380;
+    ui.set_attach_count(0);
+    split.set_composer_min(&ui, crate::syschat::split_composer_min_h(0));
+    ui.window().set_size(slint::PhysicalSize::new(W340, H_MIN));
+    apply_syschat_layout(&ui, W340 as f32);
+    let _ = settle_w(&win, W340, H_MIN);
+    let band_min = (H_MIN - 2) as f32 - ui.get_dbg_flick_y();
+    assert_eq!(
+        ui.get_dbg_flick_h() + ui.get_dbg_split_h() + ui.get_dbg_convo_zone_h(),
+        band_min,
+        "340×380 下三块之和应等于可分配带（band_min={band_min}）"
+    );
+    assert!(
+        ui.get_dbg_convo_zone_h() >= crate::syschat::SPLIT_COMPOSER_MIN_H,
+        "最小窗下输入区也不得低于下限（zone={}）",
+        ui.get_dbg_convo_zone_h()
+    );
+    assert!(
+        ui.get_dbg_flick_h() >= crate::syschat::SPLIT_CONVO_MIN_H,
+        "最小窗下消息区也不得低于下限（flick={}）",
+        ui.get_dbg_flick_h()
+    );
+}
+
+/// v11（卡 `abb-v11-popup-anchor`）：表情 /「更多」面板**贴着对应按钮上方**（而不是旧实现的
+/// 「锚在输入框顶边」⇒ 底边离按钮 100+px）。三层判据：
+/// 1. 自报值：`面板右缘 == 按钮右缘`、`按钮顶边 − 面板底边 == 6px`、两个面板各贴自己的按钮；
+/// 2. 像素：开/关两帧的差异包围盒**整个落在按钮上方**、右缘与按钮右缘同列；
+/// 3. 靠窗边（340 宽）时整体内移，仍不出窗。
+///
+/// 判别力（负向）：把 `pop_anchor` 的 x 改成左对齐、或 y 改回「输入框顶边 − h − 6」⇒ 1/2 红。
+#[test]
+fn v11_pop_panels_anchor_above_their_buttons() {
+    // 差异包围盒（x0,y0,x1,y1），`None` = 两帧一样。宽高取**帧自己的**（本用例按窗宽渲两档：
+    // 520 / 340，不能拿模块常量 `W`）。
+    fn diff_bbox(a: &Frame, b: &Frame) -> Option<(u32, u32, u32, u32)> {
+        let mut acc: Option<(u32, u32, u32, u32)> = None;
+        for y in 0..a.h {
+            for x in 0..a.w {
+                let (p, q) = (a.px(x, y), b.px(x, y));
+                if (p.red, p.green, p.blue, p.alpha) != (q.red, q.green, q.blue, q.alpha) {
+                    acc = Some(match acc {
+                        None => (x, y, x, y),
+                        Some((a, b2, c, d)) => (a.min(x), b2.min(y), c.max(x), d.max(y)),
+                    });
+                }
+            }
+        }
+        acc
+    }
+
+    for (window_w, tag) in [(520_u32, "520"), (340_u32, "340")] {
+        let (ui, win, _m) = setup(vec![row("role", "怹"), row("p", "面板锚点")], SHORT_H);
+        ui.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+            slint::SharedString::from("常用"),
+        ]))));
+        ui.set_emoji_cells(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            crate::emoji::page_cells(0, 0)
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_emoji_page_label("1/1".into());
+        ui.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+            slint::SharedString::from("5 分钟后"),
+            slint::SharedString::from("30 分钟后"),
+            slint::SharedString::from("今天 18:00"),
+        ]))));
+        ui.window()
+            .set_size(slint::PhysicalSize::new(window_w, SHORT_H));
+        apply_syschat_layout(&ui, window_w as f32);
+        let closed = settle_w(&win, window_w, SHORT_H);
+
+        for (which, btn_x, btn_y, btn_w, pop_x, pop_y, pop_w, pop_h) in [
+            (
+                "表情",
+                ui.get_dbg_emoji_btn_x(),
+                ui.get_dbg_emoji_btn_y(),
+                ui.get_dbg_emoji_btn_w(),
+                ui.get_emoji_pop_x(),
+                ui.get_emoji_pop_y(),
+                ui.get_emoji_pop_w(),
+                ui.get_emoji_pop_h(),
+            ),
+            (
+                "更多",
+                ui.get_dbg_more_btn_x(),
+                ui.get_dbg_more_btn_y(),
+                ui.get_dbg_more_btn_w(),
+                ui.get_more_pop_x(),
+                ui.get_more_pop_y(),
+                ui.get_more_pop_w(),
+                ui.get_more_pop_h(),
+            ),
+        ] {
+            println!(
+                "{tag} 宽 / {which}：btn=({btn_x},{btn_y},{btn_w}) pop=({pop_x},{pop_y},{pop_w},{pop_h})"
+            );
+            // 有空间 ⇒ 右对齐；靠窗边放不下 ⇒ 整体内移（两种口径都要能过）
+            let right_aligned = btn_x + btn_w - pop_w >= crate::syschat::POP_MARGIN as f32;
+            // ① 落位 = 纯函数 `syschat::pop_anchor` 逐字算出（接线不许自己改算术）
+            assert_eq!(
+                (pop_x, pop_y),
+                {
+                    let (x, y) = crate::syschat::pop_anchor(
+                        (btn_x as i32, btn_y as i32, btn_w as i32, 24),
+                        (pop_w as i32, pop_h as i32),
+                        (window_w as i32, SHORT_H as i32),
+                    );
+                    (x as f32, y as f32)
+                },
+                "{tag}/{which}：面板落位与 pop_anchor 不一致"
+            );
+            // ② 右缘与按钮右缘对齐；只有**靠窗边放不下**时才整体内移到留白处
+            let want_right = btn_x + btn_w;
+            if right_aligned {
+                assert_eq!(
+                    pop_x + pop_w,
+                    want_right,
+                    "{tag}/{which}：有空间时面板右缘应与按钮右缘对齐"
+                );
+            } else {
+                assert_eq!(
+                    pop_x,
+                    crate::syschat::POP_MARGIN as f32,
+                    "{tag}/{which}：靠窗边放不下 ⇒ 应整体内移到留白处"
+                );
+                // 内移后的实际效果：面板整体落在窗内（靠窗边也不许出窗）
+                assert!(
+                    pop_x + pop_w <= window_w as f32 - crate::syschat::POP_MARGIN as f32,
+                    "{tag}/{which}：内移后仍出窗（右缘 {}）",
+                    pop_x + pop_w
+                );
+            }
+            // ③ 底边距按钮顶边 6px（上方空间够时；不够时才让位给「不出窗」）
+            if pop_y > crate::syschat::POP_MARGIN as f32 {
+                assert_eq!(
+                    btn_y - (pop_y + pop_h),
+                    crate::syschat::POP_GAP as f32,
+                    "{tag}/{which}：面板底边距按钮顶边应为 6px"
+                );
+            }
+            // ② 不出窗（6px 留白）
+            assert!(
+                pop_x >= crate::syschat::POP_MARGIN as f32
+                    && pop_y >= crate::syschat::POP_MARGIN as f32
+                    && pop_x + pop_w <= window_w as f32 - crate::syschat::POP_MARGIN as f32
+                    && pop_y + pop_h <= SHORT_H as f32 - crate::syschat::POP_MARGIN as f32,
+                "{tag}/{which}：面板出窗了 pop=({pop_x},{pop_y},{pop_w},{pop_h})"
+            );
+            // ③ 像素：开面板后差异区整个在按钮上方、右缘与按钮右缘同列
+            if which == "表情" {
+                ui.set_emoji_open(true);
+            } else {
+                ui.set_more_open(true);
+            }
+            let open = settle_w(&win, window_w, SHORT_H);
+            if which == "更多" {
+                // 「更多」面板 y 随待发条数变：置 0 条时默认高由 Rust 给（`more_pop_h(0)`）。
+                assert_eq!(pop_h, crate::syschat::more_pop_h(0) as f32);
+            }
+            let bb = diff_bbox(&closed, &open)
+                .unwrap_or_else(|| panic!("{tag}/{which}：面板没渲染出来（两帧一样）"));
+            assert!(
+                (bb.3 as f32) < btn_y,
+                "{tag}/{which}：面板底边（像素 {}) 压到按钮顶边（{btn_y}）了",
+                bb.3
+            );
+            // 像素上的面板右缘 = 锚点算出的右缘（接线/布局/渲染三方一致）
+            assert!(
+                (bb.2 as f32 + 1.0 - (pop_x + pop_w)).abs() <= 2.0,
+                "{tag}/{which}：像素右缘 {} 与锚点右缘 {} 不一致",
+                bb.2 + 1,
+                pop_x + pop_w
+            );
+            // 有空间的那一档：像素右缘还必须与**按钮右缘**对齐（负向判据就落在这条上）
+            if right_aligned {
+                assert!(
+                    (bb.2 as f32 + 1.0 - (btn_x + btn_w)).abs() <= 2.0,
+                    "{tag}/{which}：像素右缘 {} 与按钮右缘 {} 不对齐",
+                    bb.2 + 1,
+                    btn_x + btn_w
+                );
+            }
+            if which == "表情" {
+                ui.set_emoji_open(false);
+            } else {
+                ui.set_more_open(false);
+            }
+            let _ = settle_w(&win, window_w, SHORT_H);
+        }
+    }
+}
+
+/// v11（卡 `abb-v11-popup-anchor`）：表情 /「更多」面板的**开合**——点按钮展开、点面板外收起、
+/// **再点按钮也收起**（稿 v11 第 1 条；`PopupWindow` 的 close-on-click-outside 在按下就关，
+/// 做不到「再点收起」，见 `.slint` 里那段注释）。两个面板**互斥**。
+#[test]
+fn v11_pop_panels_open_and_close_on_button_and_outside() {
+    const W520: u32 = 520;
+    let (ui, win, _m) = setup(vec![row("p", "占位")], SHORT_H);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(W520, SHORT_H));
+    apply_syschat_layout(&ui, W520 as f32);
+    let _ = settle_w(&win, W520, SHORT_H);
+    // 两个功能钮的命中中心（24×24，由 `.slint` 报来）
+    let emoji = (
+        ui.get_dbg_emoji_btn_x() + ui.get_dbg_emoji_btn_w() / 2.0,
+        ui.get_dbg_emoji_btn_y() + 12.0,
+    );
+    let more = (
+        ui.get_dbg_more_btn_x() + ui.get_dbg_more_btn_w() / 2.0,
+        ui.get_dbg_more_btn_y() + 12.0,
+    );
+
+    // 表情：开 → 再点收起 → 再点开 → 点外部收起
+    press_release(&win, emoji.0, emoji.1);
+    assert!(ui.get_emoji_open(), "点 😊 应展开表情面板");
+    press_release(&win, emoji.0, emoji.1);
+    assert!(!ui.get_emoji_open(), "再点 😊 应收起（不是只重开）");
+    press_release(&win, emoji.0, emoji.1);
+    assert!(ui.get_emoji_open(), "第三次点应再次展开");
+    press_release(&win, 200.0, 200.0);
+    assert!(!ui.get_emoji_open(), "点面板外应收起");
+
+    // 更多：同理；且两者互斥（面板开着时点另一个按钮 ⇒ 先收起，再点才展开）
+    press_release(&win, more.0, more.1);
+    assert!(ui.get_more_open(), "点 ⋯ 应展开「更多」面板");
+    press_release(&win, more.0, more.1);
+    assert!(!ui.get_more_open(), "再点 ⋯ 应收起");
+    press_release(&win, emoji.0, emoji.1);
+    assert!(ui.get_emoji_open(), "展开表情面板");
+    press_release(&win, more.0, more.1);
+    assert!(
+        !ui.get_emoji_open() && !ui.get_more_open(),
+        "面板开着时点另一个按钮应先收起（整窗 backdrop 吃掉那一下）"
+    );
+    press_release(&win, more.0, more.1);
+    assert!(ui.get_more_open(), "再点 ⋯ 才展开「更多」");
+    assert!(!ui.get_emoji_open(), "两面板互斥");
+}
+
+/// v11 出图（对稿判读用；默认不跑）：分割条的两种比例 + 表情/「更多」面板贴按钮。
+#[test]
+#[ignore = "出图用；默认不跑"]
+fn dump_v11_split_and_pops_for_review() {
+    const W520: u32 = 520;
+    const H: u32 = 820;
+    let dir = std::path::Path::new(SHOTS);
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let (ui, win, _m) = setup(fixture(), H);
+    let split = wire_split(&ui);
+    seed_panels(&ui);
+    ui.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("常用"),
+        slint::SharedString::from("手势"),
+    ]))));
+    ui.set_emoji_cells(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        crate::emoji::page_cells(0, 0)
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_emoji_page_label("1/2".into());
+    ui.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("5 分钟后"),
+        slint::SharedString::from("30 分钟后"),
+        slint::SharedString::from("今天 18:00"),
+    ]))));
+    ui.set_draft("就按这三份素材做，说明放第二节…".into());
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+    let _ = settle_w(&win, W520, H);
+
+    // ① 默认比例（输入区在下限）：分割条紧贴输入区上沿。
+    let f = settle_w(&win, W520, H);
+    write_png(&f, &dir.join("v11-split-default.png"));
+    // ② 拖动（往上拖 160px ⇒ 输入区变高）：输入框仍贴底。
+    let cx = W520 as f32 / 2.0;
+    let sy = ui.get_dbg_split_y() + 5.0;
+    press(&win, cx, sy);
+    move_to(&win, cx, sy - 160.0);
+    release(&win, cx, sy - 160.0);
+    let _ = settle_w(&win, W520, H);
+    let f2 = settle_w(&win, W520, H);
+    write_png(&f2, &dir.join("v11-split-dragged.png"));
+    // ③ 表情面板（贴 😊 按钮上方）+ 「更多」面板（贴 ⋯ 按钮上方）。
+    ui.set_emoji_open(true);
+    let f3 = settle_w(&win, W520, H);
+    write_png(&f3, &dir.join("v11-pop-emoji.png"));
+    ui.set_emoji_open(false);
+    ui.set_sched_count(1);
+    ui.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("10-14 18:00 · 待发测试"),
+    ]))));
+    ui.set_more_open(true);
+    let f4 = settle_w(&win, W520, H);
+    write_png(&f4, &dir.join("v11-pop-more.png"));
+    // 只切输入区那一带（放大看分割条/抓手/输入框贴底）。
+    let band = crop(&f2, 0, (H - 420) as u32, W520, 420);
+    write_png(&band, &dir.join("v11-split-zone.png"));
+    println!(
+        "v11 出图完成：v11-split-default.png / v11-split-dragged.png / v11-pop-emoji.png / \n         v11-pop-more.png / v11-split-zone.png（convo_h={} ratio={}）",
+        ui.get_convo_h(),
+        split.drag.borrow().ratio()
+    );
 }
 
 /// v11 出图：会话面板 / 模型面板 / 状态区（对稿判读用；默认不跑）。
