@@ -33,7 +33,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
 | --- | --- | --- |
 | OS 沙箱档位 | **不实现、不声明** `_meta.abbSandbox` | 权限是操作系统的事，agent 不碰 |
 | `session/request_permission` | **不发问** | 授权约定由 `AGENTS.md` 承担 |
-| `_meta.steering` | **声明 `supported: false`** | 本刀未实现 `_session/steering`；abb 那边该标志是写该方法的唯一闸门，报 true 只会让「回合中追加消息」多一次无效往返 |
+| `_meta.steering` | **声明 `supported: true` 并实现 `_session/steering`** | 生成中追加的消息经 rpi 的 steering 队列**插入在途回合**（不另起一轮），见下节「插入（steer）」；abb 那边该标志是写该方法的唯一闸门 ⇒ 声明与实现必须同真 |
 | LLM 层 / agent loop | 交给 rpi（`rpi-ai` / `rpi-agent`） | 不自持 7.9k 行 `llm.rs` |
 | 内置工具 | 第二刀已接 `rpi-tools`（`dev__*`，见下节） | `rpi-tools = "0.3.21"`，与参照物同源 |
 | 输出上限 | 默认 **65_536**，认 `ABB_AGENT_MAX_OUTPUT_TOKENS` | 与 fork 默认值一致；写小了会变成**静默截断**（见下） |
@@ -364,6 +364,24 @@ provider 的 reasoning 增量（DeepSeek 系 `reasoning_content`；另两个别�
 发出超过 40ms」合并后 flush，**没有定时器**——最后一片靠回合边界 flush。所以短输入会被合成一片；探针
 用「首片 > 64 B 立刻发 + 次片 300 ms 后到」逼出真两片（`probes/thinking_chunks_reach_client.py`）。
 
+## 插入（steer）：`_session/steering`
+
+ACP 跨适配层扩展：`initialize` 声明 `_meta.steering.supported=true`，abb 在**生成中**发
+`_session/steering`（`{sessionId, prompt:[{type:"text",text}]}`，**无** run id）把这条消息**插进
+在途回合**；本包回 `{"outcome":"injected"}`——abb 只认 `injected` / `startedNewTurn`（后者意味着
+另起了一轮，本包不产生），**别的取值（含空 `{}`）都算拒收**，它会释放扣住的事件走 cancel+merge 回退。
+
+- **接线**：转成 rpi 的 `AgentMessage::User` 入 `Agent::steer()` 队列；rpi 在回合内的抽干点
+  （模型调用/工具批次收尾之后，见上游 `agent_loop.rs::run_loop`）把它插进上下文并**再叫一次模型**。
+  所以「插入」与「另起一轮」的判据是：**模型被多叫了一次，但 `session/prompt` 仍只有一条应答**。
+- **只在真有在途回合时收**（`TurnState::in_flight`）：没有在途回合时如实回 `-32600`。收下的代价是
+  消息只会在**下一轮**开始处冒出来（用户看到「插话跑到下一条消息前面去了」）——那比静默错位更糟，
+  所以宁可回错、让 abb 走它已有的 cancel+merge 回退。未知会话回 `-32001`，prompt 无文本回 `-32602`。
+- **能力一致性**：声明 `true` 而方法回 `-32601` 是本包的历史缺陷（评审反证），现在是**双向**钉住——
+  单测既要求声明为 `true`、又要求方法**不得**回 `-32601`（无在途回合必须回 `-32600`）。
+- 端到端见 `probes/steering_inserts_into_in_flight_turn.py`（假网关在第 1 跳吐字后卡住等探针
+  写完「steer 已回执」的握手标记，再收尾；断言第 2 跳请求体里真的带着插入的文本）。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -384,13 +402,13 @@ provider 的 reasoning 增量（DeepSeek 系 `reasoning_content`；另两个别�
 ## 当前进度
 
 **已实现并验证**：`initialize`、`session/new`、`session/prompt`（回文本）、`session/cancel`
-（回合中可用，含同 burst）、`session/update` 的 `agent_message_chunk` 与 `agent_thought_chunk`（思考增量投影）、provider 失败如实报错、
+（回合中可用，含同 burst）、`session/update` 的 `agent_message_chunk` 与 `agent_thought_chunk`（思考增量投影）、
+**`_session/steering`（插入在途回合）**、provider 失败如实报错、
 anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**`session/new` 的三项契约
 （`cwd` / `systemPrompt` / `mcpServers`）**、**MCP 客户端（工具经 MCP 真执行并回灌）**。
 
 **尚未实现（第二刀）**：
 
-- `_session/steering`（现在如实声明为不支持，走 abb 的 cancel+merge 回退）；
 - 逐 token 流式（当前与旧执行层一致：非流式，整条 `agent_message_chunk`）；
 - `StopReason::Length`（截断）目前会被报成 `end_turn`（abb 的 `max_tokens` 分支收不到）。
 - **openai-chat + 官方 OpenAI 推理模型**可能因字段名被拒：rpi 默认发 `max_tokens`，而被替代的
@@ -416,7 +434,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 } | ABB_AGENT_FAUX_TEXT="来自 faux provider 的回复" "$BIN"
 ```
 
-期望输出（顺序敏感，共 4 行）：`initialize` 应答（`steering.supported=false`、无
+期望输出（顺序敏感，共 4 行）：`initialize` 应答（`steering.supported=true`、无
 `abbSandbox`）→ `sessionId` → `session/update`（`agent_message_chunk`）→
 `stopReason: "end_turn"`。
 

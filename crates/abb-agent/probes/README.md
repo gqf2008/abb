@@ -37,6 +37,15 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   **修前表现**：`event_updates` 没有 `MessageUpdate` 分支 ⇒ provider 的 reasoning 增量被整段丢弃，
   GUI 的折叠思考块永远是空的。变异（把 `ThinkingDelta` 分支删掉 / 改成投影 `TextDelta`）会让本探针转红。
 
+- `steering_inserts_into_in_flight_turn.py`：插入（`_session/steering`）的端到端验收（卡
+  `abb-agent-project-steering-20261015`）。假网关第 1 跳吐一片正文后**卡住**（等探针写的握手标记，
+  ≤10s）再收尾；探针在「模型正在吐字」这个真实现场发 `_session/steering`。断言 ①回执是
+  `{"outcome":"injected"}`；②**同一回合里模型被再叫了一次**（网关共 2 跳，且第 2 跳请求体里带着插入
+  的文本——这才是「插入」与「另起一轮」的分水岭）；③只有 **1 条**回合应答（`end_turn`）、两段正文都
+  流出；④反面：无在途回合时必须回 `-32600` 且**一个模型请求都不发**。
+  **修前表现**：`initialize` 声明 `supported=false`（abb 侧直接走排队，永远插不进去）；
+  变异（删掉 `agent.steer(...)` 调用 / 把回执 outcome 换成别的取值）都会让本探针转红。
+
 - `mcp_tool_round_trip.py`（配 `fake_mcp_server.py`）：刀 1 的核心验收。按 `session/new` 的
   `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
   工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分

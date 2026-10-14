@@ -2,7 +2,11 @@
 //!
 //! 第一刀的范围（见 walgit 线程 `abb-agent-rpi-acp-20261008`「第一刀」）：
 //! `initialize` / `session/new` / `session/prompt` / `session/cancel`，以及逐条
-//! `session/update` 的 `agent_message_chunk` 回文本。
+//! `session/update` 的 `agent_message_chunk` / `agent_thought_chunk` 回文本。
+//!
+//! 另有 ACP 跨适配层扩展 `_session/steering`（生成中把消息**插入在途回合**，
+//! 见 [`Server::steer`]）——它在 `initialize` 里以 `_meta.steering.supported` 声明，
+//! 两者必须同时成立。
 //!
 //! ### 并发形状（修的是评审反证 (b)）
 //!
@@ -51,6 +55,11 @@ use crate::wire::{Inbound, WireError, Writer};
 /// （`<agent_dir>/AGENTS.md` + `~/.rpi/agent/skills`），否则既有用户的约定会静默失效。
 /// 这句话原本写在这里的注释里，第三轮被一句话连注释一起删掉了——在此补回。
 const DEFAULT_SYSTEM_PROMPT: &str = "你是 ABB（agent-bridge）的执行层 agent，在用户本机上运行。";
+
+/// `_session/steering` 成功回执的 `outcome`：abb 侧认的取值之一（另一个是
+/// `startedNewTurn`，本包不产生——那意味着另起了一轮）。逐字对齐 abb 的
+/// `runtime::acp::STEER_OUTCOME_INJECTED`。
+const STEER_OUTCOME_INJECTED: &str = "injected";
 
 pub struct Server {
     writer: Writer,
@@ -213,6 +222,10 @@ impl Server {
                         Ok(())
                     }
                 },
+                // ACP 跨适配层 steer 扩展：生成中追加的消息**插入在途回合**，不另起一轮。
+                // 声明在 `initialize`（`_meta.steering.supported`），abb 那边它是写本方法的
+                // **唯一闸门**（该方法不可探测）⇒ 标志与本分支必须同批存在，单测钉住。
+                "_session/steering" => self.steer(id, &params).await,
                 // -32601 = method not found（JSON-RPC 约定）。
                 other => {
                     self.writer
@@ -233,11 +246,11 @@ impl Server {
 
     /// `initialize`：报协议版本与能力。
     ///
-    /// **`_meta.steering.supported = false`（主动声明不支持）**：abb 那边这个标志是
-    /// 写 `_session/steering` 的**唯一闸门**（该方法不可探测，见其注释「The capability
-    /// flag is the ONLY gate on writing ACP_STEER_METHOD」）。本刀还没实现 steer，
-    /// 若声称 ``true`` ⇒ 每次「回合中追加消息」都会先吃一个 `-32601` 才落到 abb 的
-    /// cancel+merge 回退。如实报 `false` 让它直接走回退；等实现 steer 时再翻真。
+    /// **`_meta.steering.supported = true`**：abb 那边这个标志是写 `_session/steering`
+    /// 的**唯一闸门**（该方法不可探测，见其注释「The capability flag is the ONLY gate on
+    /// writing ACP_STEER_METHOD」）。本包现在真的实现了它（见 [`Server::steer`]）——
+    /// 声明与实现必须同真：声称 `true` 而方法回 `-32601` 是历史缺陷（评审反证），
+    /// 声称 `false` 又实现则是让 abb 永远走 cancel+merge 回退（白做）。
     ///
     /// **`_meta.abbSandbox` 声明三档**（统一迁移刀 2）：abb 对带 `session_sandbox`
     /// 的会话是 fail-closed——不声明这词表，受限会话会被 `pool.rs` 拒建，永远到不了
@@ -251,7 +264,7 @@ impl Server {
                     "protocolVersion": 2,
                     "agentCapabilities": { "loadSession": false },
                     "_meta": {
-                        "steering": { "supported": false },
+                        "steering": { "supported": true },
                         "abbSandbox": ["read-only", "workspace-write", "full-access"],
                     },
                 }),
@@ -640,6 +653,58 @@ impl Server {
             }
             None => tracing::warn!("取消未知会话 {session_id}"),
         }
+    }
+
+    /// `_session/steering`：把一条用户消息**插入在途回合**（不另起一轮）。
+    ///
+    /// 参数形状 `{sessionId, prompt:[{type:"text",text}]}`（与 `session/prompt` 的 prompt 同形，
+    /// 复用 [`prompt_text`]）；回执 `{"outcome":"injected"}`——abb 只认
+    /// `injected` / `startedNewTurn` 两个取值，别的（含空 `{}`）都算**拒收**，会释放它扣住的
+    /// 事件走 cancel+merge 回退，所以**绝不能用「成功但空体」糊过去**。
+    ///
+    /// **只在真有在途回合时收**：rpi 的 steering 队列只在回合内的抽干点被取用（回合开始、
+    /// 以及每个模型调用/工具批次收尾之后，见 rpi `agent_loop.rs::run_loop`）。没有在途回合
+    /// 时收下，这条消息只会在**下一轮**开始处冒出来（用户看到「插话跑到下一条消息前面去了」）
+    /// ⇒ 如实回 `-32600` 让 abb 走它已有的 cancel+merge 回退，比静默错位好。
+    async fn steer(&self, id: Value, params: &Value) -> Result<(), WireError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = prompt_text(params);
+        if text.trim().is_empty() {
+            return self
+                .writer
+                .fail(id, -32602, "steer 的 prompt 里没有文本".to_string())
+                .await;
+        }
+        let session = self.state.lock().await.sessions.get(session_id).cloned();
+        let Some(session) = session else {
+            return self
+                .writer
+                .fail(id, -32001, format!("未知会话：{session_id}"))
+                .await;
+        };
+        if !session.turn.in_flight.load(Ordering::SeqCst) {
+            return self
+                .writer
+                .fail(
+                    id,
+                    -32600,
+                    format!(
+                        "会话 {session_id} 没有在途回合：_session/steering 只插入在途回合（当前实现不新起回合）"
+                    ),
+                )
+                .await;
+        }
+        // 入 rpi 的 steering 队列：下一个抽干点（当前模型调用/工具批次收尾之后）把它插进上下文。
+        session
+            .agent
+            .steer(AgentMessage::User(rpi_ai::types::UserMessage::new(text, 0)));
+        tracing::info!("会话 {session_id} 收到 steer，已插入在途回合");
+        self.writer
+            .respond(id, json!({ "outcome": STEER_OUTCOME_INJECTED }))
+            .await
     }
 
     fn build_agent(
@@ -1364,23 +1429,27 @@ mod tests {
             json!(["read-only", "workspace-write", "full-access"]),
             "必须声明 abbSandbox 三档（否则受限会话 fail-closed）：{value}"
         );
-        // steering 必须如实报 false：本刀未实现 `_session/steering`，而 abb 那边这个
-        // 标志是写该方法的唯一闸门 ⇒ 报 true 会让每次「回合中追加消息」多一次无效往返。
+        // steering 现在如实报 true：`_session/steering` 真的实现了（下面的
+        // `steering_flag_matches_reality` 钉住「声明 == 实现」这对不变量）。
         assert_eq!(
-            value["result"]["_meta"]["steering"]["supported"], false,
-            "未实现 _session/steering 就不得声称支持：{value}"
+            value["result"]["_meta"]["steering"]["supported"], true,
+            "已实现 _session/steering 就该声明支持（否则 abb 永远走 cancel+merge 回退）：{value}"
         );
     }
 
-    /// **一致性锁**：能力声明必须与实现一致。
+    /// **一致性锁（声明 == 实现）**：`initialize` 声称支持 steering，就必须真的实现
+    /// `_session/steering`。
     ///
-    /// 这条正是本轮评审的反证之一：`initialize` 曾声称 `steering.supported=true`，
-    /// 而 `_session/steering` 实际回 `-32601`。两件事实现在都钉住：标志为 false、
-    /// 方法未实现（`-32601`）。将来实现 steer 时必须同时把标志翻真，否则此测试会失败。
+    /// 这条的前身正是评审的反证：旧版声称 `supported=true` 而方法回 `-32601`。现在反过来
+    /// 钉住另一半——**不许**再回 `-32601`；没有在途回合时也必须**响亮**回错（`-32600`），
+    /// 而不是回一个 abb 会当「已投递」的空 `{}`（那会静默丢事件）。
     #[tokio::test]
     async fn steering_flag_matches_reality() {
         let (writer, mut captured) = crate::testing::capture_writer();
-        let server = Arc::new(Server::new(writer));
+        let server = Arc::new(Server::with_backend(
+            writer,
+            Ok(faux_backend(&["不会被叫到"])),
+        ));
 
         server
             .dispatch(Inbound::Request {
@@ -1391,18 +1460,169 @@ mod tests {
             .await
             .expect("initialize 应成功");
         let init: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
-        assert_eq!(init["result"]["_meta"]["steering"]["supported"], false);
+        assert_eq!(init["result"]["_meta"]["steering"]["supported"], true);
 
+        // 真实会话，但**没有**在途回合：必须回错误（不新起回合、也不假装投递）。
         server
             .dispatch(Inbound::Request {
                 id: json!(2),
+                method: "session/new".into(),
+                params: json!({}),
+            })
+            .await
+            .expect("session/new 应成功");
+        let created: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
+        let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+
+        server
+            .dispatch(Inbound::Request {
+                id: json!(3),
                 method: "_session/steering".into(),
-                params: json!({ "sessionId": "abb-1", "prompt": [] }),
+                params: json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": "插一句" }],
+                }),
             })
             .await
             .expect("分派本身应成功");
         let steering: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
-        assert_eq!(steering["error"]["code"], -32601);
+        assert_ne!(
+            steering["error"]["code"], -32601,
+            "已声明支持就不得回方法未实现：{steering}"
+        );
+        assert_eq!(
+            steering["error"]["code"], -32600,
+            "无在途回合时必须响亮回错（abb 据此走 cancel+merge 回退）：{steering}"
+        );
+        assert!(
+            steering["result"].is_null(),
+            "拒绝时不得带 result（abb 只把 result 当投递成功）：{steering}"
+        );
+    }
+
+    /// **插入真的插进在途回合**：faux 后端按 `with_tokens_per_second` 慢速流，第一段还在
+    /// 流的时候送 `_session/steering` ⇒ ①回执是 `{"outcome":"injected"}`；②同一回合里模型
+    /// **被再叫了一次**（脚本的第二段真的发出来了）——这就把「插入」与「另起一轮」区分开：
+    /// 全程只有 **1 条** `session/prompt` 应答。
+    ///
+    /// 判据不看内部队列（那会与实现同构、把接线错误放过去）：看的是**出站行**——
+    /// 第二段文本只有在 rpi 于回合内抽干 steering 队列、把消息塞进上下文再请求模型时才可能出现。
+    ///
+    /// `flavor = "multi_thread"` 是硬要求：本包的 provider 桥用 `block_in_place`（见
+    /// `provider.rs::make_stream_fn`），current-thread runtime 上会直接 panic。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn steering_inserts_into_in_flight_turn() {
+        // 第一段 ≈40 字（10 token），tps=4 ⇒ 约 2.5s 的流式窗口；第二段是插入之后那次调用的回复。
+        let first = "第一段：我正在慢慢想这个问题，先把已知条件列清楚再回答。";
+        let second = "第二段：收到你的插话，我改一下方向。";
+        let script = FauxScript::new()
+            .with_text(first)
+            .with_text(second)
+            .with_tokens_per_second(4.0);
+        let provider = FauxProvider::new(script);
+        let model = provider.models().first().cloned().expect("faux 有模型");
+        let (writer, mut captured) = crate::testing::capture_writer();
+        let server = Arc::new(Server::with_backend(
+            writer,
+            Ok(Backend::Faux { provider, model }),
+        ));
+        server
+            .dispatch(Inbound::Request {
+                id: json!(1),
+                method: "session/new".into(),
+                params: json!({}),
+            })
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
+        let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // 同步点用**内部事件**而不是出站正文：本包的正文投影是「整条 agent_message_chunk」
+        // （见 `event_updates`），出站第一片正文出现时消息**已经流完**了——那时 rpi 刚抽干过
+        // steering 队列，插入会退化成「下一轮才看见」。所以这里订阅 `AgentEvent`，等模型
+        // **开始吐 token**（`TextDelta`）再插。
+        let session = server
+            .state
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .expect("会话应已建好");
+        let mut events = session.agent.subscribe();
+
+        server
+            .dispatch(prompt_request(2, &session_id))
+            .await
+            .expect("回合应派出");
+
+        let streaming = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match events.recv().await {
+                    Ok(AgentEvent::MessageUpdate {
+                        assistant_message_event:
+                            rpi_ai::types::AssistantMessageEvent::TextDelta { .. },
+                        ..
+                    }) => return,
+                    Ok(_) => continue,
+                    Err(error) => panic!("事件订阅断了：{error}"),
+                }
+            }
+        })
+        .await;
+        assert!(streaming.is_ok(), "模型应在 20s 内开始吐字");
+        server
+            .dispatch(Inbound::Request {
+                id: json!(3),
+                method: "_session/steering".into(),
+                params: json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": "插一句话" }],
+                }),
+            })
+            .await
+            .expect("steer 分派应成功");
+
+        let mut texts = String::new();
+        let mut steer_ack = None;
+        let mut prompt_ack = None;
+        let deadline = std::time::Duration::from_secs(30);
+        let collected = tokio::time::timeout(deadline, async {
+            loop {
+                let line = captured.recv().await.expect("应有出站行");
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value.get("method").is_some() {
+                    let update = &value["params"]["update"];
+                    if update["sessionUpdate"] == "agent_message_chunk" {
+                        texts.push_str(update["content"]["text"].as_str().unwrap_or_default());
+                    }
+                    continue;
+                }
+                match value["id"].as_i64() {
+                    Some(3) => steer_ack = Some(value),
+                    Some(2) => {
+                        prompt_ack = Some(value);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(collected.is_ok(), "回合必须在 30s 内收尾");
+
+        let steer_ack = steer_ack.expect("应收到 steer 回执");
+        assert_eq!(
+            steer_ack["result"]["outcome"], "injected",
+            "在途回合里 steer 必须回 injected：{steer_ack}"
+        );
+        let prompt_ack = prompt_ack.expect("应收到回合应答");
+        assert_eq!(prompt_ack["result"]["stopReason"], "end_turn");
+        assert!(texts.contains(first), "第一段应流出：{texts:?}");
+        assert!(
+            texts.contains(second),
+            "插入之后模型必须在**同一回合**里再被叫一次（第二段没出现 ⇒ steering 没插进上下文）：{texts:?}"
+        );
     }
 
     /// `session/cancel` 与 `session/prompt` **同 burst** 到达时，取消不得被丢弃。

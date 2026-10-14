@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""思考块可见性的端到端验收（卡 abb-syschat-thinking-visible-20261015）。
+"""思考块可见性的端到端验收（卡 abb-agent-project-thinking-20261014）。
 
 判据不是「代码里有 thinking_updates」，而是**真二进制真的把 provider 的 reasoning 增量
 发成 `agent_thought_chunk` 通知**：假 OpenAI 网关按 SSE 先流 `reasoning_content` 增量、
