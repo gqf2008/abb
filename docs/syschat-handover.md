@@ -1,15 +1,15 @@
 # 系统级对话（syschat）交接文档
 
 > 面向**下一个接手的人**（或新会话）。目标：读完这一份就能继续干，不用重新踩坑。
-> 写于 `main = 7b8eea5`（2026-10-14 深夜）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
+> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
 
 ---
 
 ## 0. 30 秒现状
 
 - 功能主体**已经可用**：气泡（常驻置顶）+ 对话框（标题栏一行 / 状态栏两行 / 输入区功能区）+ 流式打字机 + 附件/拖拽 + Markdown（含 HTML 媒体）+ 定时发送 + 插入/打断（排队）。
-- **最痛的一条没修完**：**对话窗不能缩放**。根因已用自查口证明是 `winit is_resizable=false`（见 §5.1），修法已写进代码但**未验证**（见 §5.2）。
-- 还没做：**截屏**、**消息动作（复制/重新生成/朗读）**、**历史会话归档**、**Token 真实用量**、**思考块真机可见**（卡在 `abb-agent`）、**设置窗缩放**。
+- **对话窗缩放已修**（卡 `abb-syschat-resize-macos-20261015`）：根因**更正为「透明的无边框窗在 macOS 没有系统边角缩放」**（上一版写的 `winit is_resizable=false` 是「未 realize」的误读，见 §5.1）⇒ 对话窗**恒画热区 + macOS 自管缩放**。剩**owner 真机复验**（手拖边角的手感；锁屏时合成点击打不进 app）。
+- 还没做：**截屏**、**消息动作（复制/重新生成/朗读）**、**历史会话归档**、**Token 真实用量**、**思考块真机可见**（卡在 `abb-agent`）、**设置窗在 macOS 缩放**（§5.2，根因同 §5.1）。
 
 ---
 
@@ -24,12 +24,15 @@ BIN=$CARGO_TARGET_DIR/debug/agent-bridge
 mkdir -p /Volumes/DataExt/tmp/abb-verify-home
 HOME=/Volumes/DataExt/tmp/abb-verify-home ABB_VERIFY_OPEN=1 "$BIN" > /tmp/verify.log 2>&1 &
 sleep 12
-grep -a '\[verify\]\|\[resize\]' /tmp/verify.log          # 窗口底层事实（is_resizable 等）
+swift /Volumes/DataExt/tmp/abb-verify/session.swift        # 先查是否锁屏（见下方注意）
+grep -a '\[verify\]\|\[selfresize\]' /tmp/verify.log       # 窗口底层事实（is_resizable 等）
 swift /tmp/winid.swift | awk -F'\t' '$2=="ABB"'            # 列出 ABB 窗口（拿 window id）
 screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不需要辅助功能权限）
 ```
 
 - `ABB_VERIFY_OPEN=1`：**直接打开对话窗**并打印窗口事实。**必须配隔离 HOME**（否则会触发 `platform::heal_autostart()` 改写用户真实 `~/Library/LaunchAgents/`）。
+  探针按 **400ms 一档打 5 拍**，并**显式区分** `winit=None`（还没 realize）与 `Some{is_resizable,…}`：`t=400ms` 常是 `None`（`show()` 不同步建窗），`t=800ms` 才有原生窗事实——**别把 `None` 读成 `is_resizable=false`**（§5.1 的坑）。
+- ⚠️ **锁屏时合成点击打不进 app**：`CGSSessionScreenIsLocked=1` 时 `CGEvent` 落在 `loginwindow`，`ABB 系统对话` 收不到按下（拖拽/缩放/点按钮类验证必须先解锁）。查锁屏态：`swift /Volumes/DataExt/tmp/abb-verify/session.swift`。
 - `swift /tmp/winid.swift`：一个 8 行的 CoreGraphics 枚举脚本（若 `/tmp` 被清掉，见 §7 附录脚本）。
 - 无头出图台（**不需要真窗口**）：`src/ui_headless_render_test.rs`，`#[ignore]` 用例，例如
   `bash tools/check_test_isolation.sh --bin agent-bridge -- --ignored dump_frames`；
@@ -89,20 +92,17 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 
 ## 5. 卡住的 / 未完成的（含硬证据）
 
-### 5.1 对话窗不能缩放（**优先修这条**）
-**已证实的根因链**（都自己跑出来过，不是猜）：
-1. `ABB_VERIFY_OPEN=1` 打印：`winit is_resizable=false is_decorated=false size=0x0`
-   ⇒ 窗口在**窗口管理器层面就是不可缩放的**（拖边角永远没反应）。这解释「设置窗能缩、对话窗不能」——两者唯一的差别就在这一位。
-2. 建窗时 `with_winit_window` 返 `None`、尺寸 `0x0` ⇒ **Slint 是首次 `show()` 才建原生窗**，所以「建窗后立刻 `set_resizable(true)`」是**无效时机**。
-3. 属性钩子里的 `.with_resizable(true)` **会被 Slint 随后写入的 `attributes.resizable` 覆盖**（Slint `winitwindowadapter.rs:266`）。
-4. 相关的三条**背景事实**：winit macOS 无边框窗样式位含 `Resizable`（`window_delegate.rs:542-544`）；`drag_resize_window` 在 macOS **返回 `NotSupported`**（`:1179`）；**自绘缩放热区会抢掉系统自带的无边框窗边角缩放**（所以 macOS 上**不要画**热区——设置窗就是这么做的，这也是「设置窗能缩」的原因）。
+### 5.1 对话窗不能缩放（**已修**：卡 `abb-syschat-resize-macos-20261015`，剩 owner 真机复验）
+**根因（2026-10-15 实测更正——上一版的「`winit is_resizable=false`」结论作废）**：决定项是**透明度**，不是 `is_resizable`。
+1. 那个 `false` 是**误读**：来自 `with_winit_window(..).unwrap_or((false, false))` 在窗口**未 realize** 时顶的默认值。`show()` **不同步建原生窗**（`set_visible` 只把 `visible` 存进 attributes、把窗口登记为 inactive window），自查口 400ms 一档实测：`t=400ms ⇒ winit=None`，`t=800ms ⇒ Some is_resizable=true is_decorated=false`（`/private/tmp/verify-a1.log`、`verify-a2.log`）。⇒ **`is_resizable` 既不是假、也不是「能不能拖边角」的判据。**
+2. **透明的无边框窗在 macOS 拿不到系统边角缩放**：同参数 A/B（最小复现件 `/private/tmp/minwin` + `/private/tmp/probe_min2.swift`：`CGEvent` 拖右缘（若干 inset）+ `CGWindowListCopyWindowInfo` 量宽）——`with_transparent(true)`：**0/2** 次；只差「不透明」的同参数窗：**2/2** 次；两者 `is_resizable` 都读到 `true`。该 A/B 由上一轮会话跑出、**结果未落盘**，本卡亦未独立复现（锁屏期点击打不进 app，见 §1 注意）。
+3. ABB 两个窗都是 Slint `no-frame` ⇒ winit 后端一律 `with_transparent(true)`（`wants_transparent`，圆角靠它）⇒「交给系统缩放」在本仓**根本不存在**。于是 `360069f`(v11c) → `ecc627d` → `7b8eea5` 那条「macOS 关掉热区、交给系统」是**死路**：关掉热区 = 完全不能缩放。
+4. 仍成立但**不解释拖不动**的三条背景事实：winit macOS 无边框窗样式位含 `Resizable`（`window_delegate.rs:542-544`）；`drag_resize_window` 在 macOS 返回 `NotSupported`（`:1179`）；属性钩子里的 `.with_resizable(true)` 会被 Slint 随后写入的 `attributes.resizable` 覆盖（`winitwindowadapter.rs:266`）。
 
-**已写但未验证的修法**：把 `set_resizable(true)` 放到 `show_window_and_focus()` 的 `show()` **之后**（`main` 里已有此代码）。
-**未验证的原因**：隔离 HOME 下自查口跑时 `[resize]` 日志没出现、窗口也没真正出现（`ABB_VERIFY_OPEN` 分支现在的顺序：打印事实 → 设尺寸 → show；疑似 show 路径没走到，或窗口创建时机仍在更晚）。
-**下一步（建议）**：
-- 用 §1 的流程在**真机**跑一次，看 `[resize]` 是否出现、窗口是否出来、拖边角是否可缩；
-- 若 `with_winit_window` 在 `show()` 后仍是 `None`，就在**首个 UI tick 后**再置一次（或挂 `WindowEvent::Resized/Moved` 首次到达时置一次）；
-- macOS 上**保持热区关闭**（`resize_hit_areas_enabled() = !macos`），让它走系统缩放；**最大化**因为没有系统绿点，仍需自管（`toggle_syschat_maximize`）。
+**修法（已落地）**：对话窗**恒画热区**（`syschat_resize_hit_areas_enabled()` → `true`），macOS 走**自管缩放**（`syschat_resize_self_managed()` → `cfg!(target_os = "macos")` + `SelfResize`/`ResizeSession`：按屏幕坐标跟指针算尺寸，先尺寸后位置）；设置窗仍只在 Windows/Linux 画（`settings_resize_hit_areas_enabled()`——它的热区接 `drag_resize_window`，macOS 上是死区）；`show_window_and_focus()` 里「show 之后补 `set_resizable(true)`」整段删掉（无效时机，且 Slint 建窗时按 `min != max` 自己定 resizable）。
+**守卫**：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：对话窗恒画 / 两窗口径分开 / 自管 = macOS）+ 无头几何 `ui_headless_render_test::{self_managed_hit_zones_route_press_with_pointer_coords, v11c_resize_zones_hit_all_edges_and_corners, resize_hot_zone_eats_titlebar_top_band}`。
+**证据（`/private/tmp` 会被清，脚本可按 §1 重建）**：`verify-a1.log`/`verify-a2.log`（Some/None + `is_resizable`）、`verify-0120.log`/`verify-0245.log`（`[selfresize] begin dir=east` + `ret=true` + 其后数百次 `cursor_moved`）、`syschat-shots/verify-isresizable.png`（对话窗真开出来）。
+**未验证（owner 项）**：真机手拖边角「窗口真的变大变小 + 手感/发不发飘」，以及自管缩放与最大化（`toggle_syschat_maximize`）的互动。合成点击**必须先解锁屏**。
 
 ### 5.2 其余未做
 | 项 | 状态 | 下一步 |
@@ -113,7 +113,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 | **Token 真实用量** | 状态栏进度条**结构已就位**，值是占位 | 卡 `abb-syschat-e3-tokens-20261013`；**`acp.rs` 没有任何 usage 来源**（goose 注释明说不报）⇒ 首选 ACP 响应里的真实 usage，退路 `chars/4` **并标注为估算**；`providers[].model` 无 `context_window` ⇒ 内置常见模型表 + 设置可覆盖 |
 | **思考块真机可见** | GUI 全就绪（折叠块 + 耗时 + 打字机），**执行层不发** | 卡 `abb-agent-project-thinking-20261014`：`crates/abb-agent` 的 `event_updates` 未映射 rpi 的 `ThinkingDelta`，且 `thinking_level` 默认 `Off`（打开会改模型请求参数，建议默认关 + 设置项） |
 | **插入（steer）** | GUI + 发送端已就绪；**生产恒走排队** | `abb-agent` 如实上报 `steering.supported=false`（`_session/steering` 回 `-32601`）⇒ 要真插入得换声明支持该扩展的适配器，或改 `abb-agent` |
-| **设置窗在 macOS 缩放** | 未做 | 与 §5.1 同因（`is_resizable`）；同一修法可一并覆盖 |
+| **设置窗在 macOS 缩放** | 未做 | 它的热区接 `drag_resize_window`（macOS `NotSupported`）= 死区 ⇒ 要可缩放得给它也接自管循环（`SelfResize` 现在只绑在对话窗的 `on_self_resize_begin` 上）；§5.1 的更正说明同样适用 |
 | 跟进卡 | — | `abb-syschat-b-followups` / `abb-syschat-c-followups`（B/C 批评审的非阻塞项） |
 
 ---
@@ -130,8 +130,9 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 - 无头出图台里的字体可能缺 emoji/符号字形（真机用系统字体），**布局可信、字形别下结论**。
 
 **macOS 窗口**
-- `no-frame: true` + winit macOS：样式位 `Borderless | Resizable | Miniaturizable`；**系统边角缩放本来就有**，前提是 (a) `resizable` 为真、(b) **没有自绘热区去抢**。
-- `drag_resize_window` 在 macOS **`NotSupported`**（所以「自绘热区 + 它」那条路在 macOS 是死的）。
+- `no-frame: true` + winit macOS：样式位 `Borderless | Resizable | Miniaturizable`，但**系统边角缩放不是自动就有**——决定项是**透明度**：winit 对 Slint `no-frame` 窗恒 `with_transparent(true)`，而**透明的无边框窗没有系统边角缩放**（同参数 A/B：透明 0/2、不透明 2/2，见 §5.1）。`is_resizable=true` **推不出**「能拖边角」。
+- 要能拖就只能**自绘热区 + 自管缩放**（`SelfResize`/`ResizeSession`：屏幕坐标跟指针算尺寸、先尺寸后位置）；`drag_resize_window` 在 macOS **`NotSupported`**，接它等于画个死区。
+- **锁屏时合成点击（`CGEvent`）落 `loginwindow`**：任何「点按钮/拖边角」类验证前先查 `CGSSessionScreenIsLocked`（§1）。
 - **窗口是首次 `show()` 才创建**（`with_winit_window` 之前返回 `None`、尺寸 0×0）。
 - **拖拽/缩放期间 winit 不交窗口事件**（系统进 event-tracking 模式）⇒ 「跟手」类需求必须挂 **common-modes 时钟**（D4 的跟手修复）。
 - 失焦判定**不能用「窗口是否还是 key」**：`windowDidResignKey:` 早于 app 失活 ⇒ 要延后 + 查 `NSApp isActive`（D5）。
@@ -190,6 +191,6 @@ rm -rf /Applications/ABB.app; ditto "$B" /Applications/ABB.app; open /Applicatio
 
 ### 7.3 接手第一小时建议
 1. 读 §1，自己开窗抓一张图，建立「我能自己验收」的闭环（这一步能省掉后面所有「让用户截图」的往返）。
-2. 修 §5.1 缩放（先取证再改，别猜）。
+2. §5.1 缩放**已修**（卡 `abb-syschat-resize-macos-20261015`：对话窗恒画热区 + macOS 自管缩放），剩**真机手感**复验；**别再拿 `is_resizable` 取证**（它既不假也不是判据，见 §5.1）。
 3. 按 §5.2 从上往下做（建议顺序：缩放 → 消息动作 → 归档 → 用量(E3) → 截屏；思考/steer 要动 `abb-agent`，可最后做）。
 4. 每做完 2–3 条，**批量**跑四门禁 + 独立评审 + 打包安装一次（owner 已同意这条降档口径）。
