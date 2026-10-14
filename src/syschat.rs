@@ -1140,6 +1140,142 @@ pub fn anchor_window_pos(
     (x, y)
 }
 
+// ─────────── D4：气泡跟随对话窗四角（卡 `abb-syschat-d4-bubble-follow`，纯函数）───────────
+
+/// 气泡要吸附的**窗口四角**。
+///
+/// 枚举顺序即「并列时的优先级」：[`nearest_corner`] 取距离最小者，距离相等时取本顺序里靠前的，
+/// 这样即使输入完全对称（气泡正中、窗口比屏还大），「四角择优」也是确定性的而非随实现漂移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BubbleCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl BubbleCorner {
+    /// 固定顺序（并列优先级 + 单测遍历用）。
+    pub const ALL: [BubbleCorner; 4] = [
+        BubbleCorner::TopLeft,
+        BubbleCorner::TopRight,
+        BubbleCorner::BottomLeft,
+        BubbleCorner::BottomRight,
+    ];
+}
+
+/// 某个角的**气泡目标位**（气泡**可视区**左上角，逻辑像素；全部输入输出同 [`anchor_window_pos`]）。
+///
+/// 「角外侧 10px」的口径（与 [`anchor_window_pos`] 的间距口径一致 —— 那里就是**横向** 10px 间隔）：
+/// - 横向：左角把气泡放到窗口左缘外 [`BUBBLE_GAP`]（`window.x - BUBBLE_GAP - bw`），
+///   右角放到窗口右缘外 [`BUBBLE_GAP`]（`window.right + BUBBLE_GAP`）；
+/// - 纵向：**与角所在的那条边对齐** —— 上角对齐窗口上缘（`window.y`），下角对齐窗口下缘
+///   （`window.bottom - bh`）。
+///
+/// 为什么纵向是「对齐边」而不是「再往外 10px」：开窗时 [`anchor_window_pos`] 正是把窗口
+/// **顶边对齐气泡顶边**、横向留 10px（见其口径 1/2）。若这里改成对角各外推 10px，开窗那一刻
+/// 气泡会被重算到「窗口上缘再往上 `bh + 10`」，于是**每次开窗都向上飘一个气泡高**，反复开关
+/// 必然飘出屏。现在的定义让 `anchor_window_pos` 的落点成为本函数的不动点（单测
+/// `snap_is_fixed_point_of_open_anchor`），开窗不跳、反复开关不漂移。
+pub fn corner_bubble_pos(
+    corner: BubbleCorner,
+    window: (i32, i32, i32, i32),
+    bubble_size: (i32, i32),
+) -> (i32, i32) {
+    let (wx, wy, ww, wh) = window;
+    let (bw, bh) = bubble_size;
+    let x = match corner {
+        BubbleCorner::TopLeft | BubbleCorner::BottomLeft => wx - BUBBLE_GAP - bw,
+        BubbleCorner::TopRight | BubbleCorner::BottomRight => wx + ww + BUBBLE_GAP,
+    };
+    let y = match corner {
+        BubbleCorner::TopLeft | BubbleCorner::TopRight => wy,
+        BubbleCorner::BottomLeft | BubbleCorner::BottomRight => wy + wh - bh,
+    };
+    (x, y)
+}
+
+/// 四角择优：选**目标位**离气泡当前位置（可视区左上角）最近的角；距离相等时取
+/// [`BubbleCorner::ALL`] 里靠前的那个（确定性）。
+///
+/// 比的是「目标位」而不是「角的顶点」：目标位才是气泡真要落下去的地方，而且比较前先**夹进工作区**
+/// （[`clamp_bubble_pos`]）—— 这样「落到 P ⇒ P 到自己的距离为 0 ⇒ 再算仍是 P」恒成立，
+/// 即 [`snap_bubble_to_window`] 的**幂等**。这是防「窗动 → 气泡动 → 再判 → 振荡/翻角」的关键性质
+/// （单测 `snap_is_idempotent`）。若不先夹取，窗口贴屏幕边时第一次夹取会把气泡挪回窗内区块，
+/// 第二次再判就可能翻到另一个角、位置跟着跳。
+///
+/// 距离用 `i64` 平方欧氏：屏幕逻辑坐标可以到 ±30000 量级，`i32` 平方会溢出成负 → 择优反了。
+pub fn nearest_corner(
+    window: (i32, i32, i32, i32),
+    bubble: (i32, i32),
+    bubble_size: (i32, i32),
+    work: (i32, i32, i32, i32),
+) -> BubbleCorner {
+    let mut best = BubbleCorner::TopLeft;
+    let mut best_d = i64::MAX;
+    for c in BubbleCorner::ALL {
+        let p = clamp_bubble_pos(corner_bubble_pos(c, window, bubble_size), bubble_size, work);
+        let dx = i64::from(p.0) - i64::from(bubble.0);
+        let dy = i64::from(p.1) - i64::from(bubble.1);
+        let d = dx * dx + dy * dy;
+        // 严格小于：并列时保留 `ALL` 里靠前的那个（确定性）。
+        if d < best_d {
+            best_d = d;
+            best = c;
+        }
+    }
+    best
+}
+
+/// 把气泡可视区左上角夹进工作区（**不出屏优先**：夹取时会牺牲 10px 间距，与 [`anchor_window_pos`]
+/// 同取向）。夹取顺序与其逐字一致：先压上界再压下界；窗口比屏还大时 `max < lo`，
+/// 最终落在 lo（贴住工作区左/上缘），任何输入都不会产出越界坐标。
+pub fn clamp_bubble_pos(
+    bubble: (i32, i32),
+    bubble_size: (i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (bw, bh) = bubble_size;
+    let (wx, wy, ww, wh) = work;
+    let mut x = bubble.0;
+    let max_x = wx + ww - bw;
+    if x > max_x {
+        x = max_x;
+    }
+    if x < wx {
+        x = wx;
+    }
+    let mut y = bubble.1;
+    let max_y = wy + wh - bh;
+    if y > max_y {
+        y = max_y;
+    }
+    if y < wy {
+        y = wy;
+    }
+    (x, y)
+}
+
+/// 把气泡吸附到「离它最近的窗口角」的目标位，并夹进工作区。返回 `(选中的角, 气泡可视区左上角)`。
+///
+/// **单一事实源（卡 `abb-syschat-d4-bubble-follow`）**：连续几何只此一条 —— 「窗口矩形 ⇒ 气泡位置」。
+/// 反方向的 [`anchor_window_pos`]（气泡 ⇒ 窗口）只在**开窗那一刻**用一次，之后不再参与；
+/// 绝不把本函数的结果再拿去反推窗口，否则就是 `A 动→B 动→A 动` 的死循环。
+pub fn snap_bubble_to_window(
+    window: (i32, i32, i32, i32),
+    bubble: (i32, i32),
+    bubble_size: (i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (BubbleCorner, (i32, i32)) {
+    let corner = nearest_corner(window, bubble, bubble_size, work);
+    let pos = clamp_bubble_pos(
+        corner_bubble_pos(corner, window, bubble_size),
+        bubble_size,
+        work,
+    );
+    (corner, pos)
+}
+
 /// 历史独占锁：只在「读历史/写一轮」的短临界区里持有，避免并发写坏历史。
 /// 用 `try_lock`（非阻塞）：本锁的所有使用者都在同一进程（GUI 主线程的清空、
 /// 后台回合的读写），阻塞拿锁会把 Slint 主线程挂住。持不到 = 已有历史读写在进行，
@@ -2636,6 +2772,208 @@ mod tests {
         assert_eq!(x, -100 - BUBBLE_GAP - 460, "左侧放得下就用左侧");
         assert_eq!((-100) - (x + 460), BUBBLE_GAP);
         assert_eq!(y, 100);
+    }
+
+    // ── D4：气泡吸附窗口四角（卡 abb-syschat-d4-bubble-follow）──
+
+    const BS: (i32, i32) = (36, 36);
+    const WORK: (i32, i32, i32, i32) = (0, 0, 1440, 900);
+
+    /// 每个角的目标位：左/右角与窗口**横向**间隔恰为 `BUBBLE_GAP`；上/下角与对应边对齐。
+    #[test]
+    fn corner_targets_have_exact_gap_and_edge_alignment() {
+        let win = (400, 200, 520, 560);
+        let (x, y) = corner_bubble_pos(BubbleCorner::TopLeft, win, BS);
+        assert_eq!(x, 400 - BUBBLE_GAP - BS.0, "左角在窗口左缘外 10px");
+        assert_eq!(y, 200, "上角对齐窗口上缘");
+        let (x, y) = corner_bubble_pos(BubbleCorner::TopRight, win, BS);
+        assert_eq!(x, 400 + 520 + BUBBLE_GAP, "右角在窗口右缘外 10px");
+        assert_eq!(y, 200);
+        let (x, y) = corner_bubble_pos(BubbleCorner::BottomLeft, win, BS);
+        assert_eq!(x, 400 - BUBBLE_GAP - BS.0);
+        assert_eq!(
+            y,
+            200 + 560 - BS.1,
+            "下角对齐窗口下缘（气泡下边齐窗口下边）"
+        );
+        let (x, y) = corner_bubble_pos(BubbleCorner::BottomRight, win, BS);
+        assert_eq!(x, 400 + 520 + BUBBLE_GAP);
+        assert_eq!(y, 200 + 560 - BS.1);
+    }
+
+    /// 四角择优：气泡贴哪一角，就选哪一角（四个方向各测一次，证不是恒选一个角）。
+    #[test]
+    fn nearest_corner_picks_each_corner_it_is_closest_to() {
+        let win = (400, 200, 520, 560);
+        // 目标位：TL=(354,200) TR=(930,200) BL=(354,724) BR=(930,724)
+        assert_eq!(
+            nearest_corner(win, (354, 200), BS, WORK),
+            BubbleCorner::TopLeft
+        );
+        assert_eq!(
+            nearest_corner(win, (930, 200), BS, WORK),
+            BubbleCorner::TopRight
+        );
+        assert_eq!(
+            nearest_corner(win, (354, 724), BS, WORK),
+            BubbleCorner::BottomLeft
+        );
+        assert_eq!(
+            nearest_corner(win, (930, 724), BS, WORK),
+            BubbleCorner::BottomRight
+        );
+    }
+
+    /// 并列时取 `ALL` 里靠前的角（确定性）：TL 与 TR 目标位的垂直中分线上取 TL；
+    /// 竖直方向同理取 TL 而不是 BL。
+    ///
+    /// 判别力：把 `nearest_corner` 的比较从 `d < best_d` 改成 `d <= best_d` ⇒ 本用例红
+    /// （后者取 `ALL` 里靠后的角）。
+    #[test]
+    fn nearest_corner_breaks_ties_by_declared_order() {
+        // 目标位 TL=(-46,0) TR=(110,0)，x=(−46+110)/2 = 32 时两者等距。
+        let win = (0, 0, 100, 100);
+        assert_eq!(
+            nearest_corner(win, (32, 0), BS, WORK),
+            BubbleCorner::TopLeft
+        );
+        // 竖直方向同理：TL=(-46,0) BL=(-46,64)，y=(0+64)/2 = 32 时等距 ⇒ 取更靠前的 TL。
+        assert_eq!(
+            nearest_corner(win, (-46, 32), BS, WORK),
+            BubbleCorner::TopLeft
+        );
+    }
+
+    /// 吸附落位：确实选最近角，且横向恰为 10px 间距（贴着角、不出屏时）。
+    #[test]
+    fn snap_places_bubble_outside_the_nearest_corner() {
+        let win = (400, 200, 520, 560);
+        // 气泡在窗口右下外侧 ⇒ 选 BR。
+        let (corner, (x, y)) = snap_bubble_to_window(win, (930, 724), BS, WORK);
+        assert_eq!(corner, BubbleCorner::BottomRight);
+        assert_eq!(x, 400 + 520 + BUBBLE_GAP);
+        assert_eq!(y, 724);
+        assert_eq!(x - (400 + 520), BUBBLE_GAP, "间距恰 10px");
+        // 气泡在窗口左上外侧 ⇒ 选 TL，间距同样恰 10px。
+        let (corner, (x, _)) = snap_bubble_to_window(win, (354, 200), BS, WORK);
+        assert_eq!(corner, BubbleCorner::TopLeft);
+        assert_eq!((400) - (x + BS.0), BUBBLE_GAP);
+    }
+
+    /// **幂等**（防振荡的关键）：对同一窗口/工作区，把吸附结果再喂回去，结果与角都不变。
+    ///
+    /// 覆盖：贴角正常位、被夹到屏幕角/边、窗口比屏还大。
+    /// 判别力：若把 `nearest_corner` 改成按「角顶点」比距离，窗口极窄等退化输入下会翻角 ⇒ 本用例红。
+    #[test]
+    fn snap_is_idempotent() {
+        let cases: &[((i32, i32, i32, i32), (i32, i32), (i32, i32, i32, i32))] = &[
+            ((400, 200, 520, 560), (930, 724), WORK),
+            ((400, 200, 520, 560), (354, 200), WORK),
+            ((0, 0, 520, 560), (-20, -20), WORK),
+            ((1000, 800, 520, 560), (1500, 1400), WORK),
+            ((0, 0, 2000, 900), (700, 700), WORK), // 窗口比屏宽
+            ((-1700, 200, 520, 560), (-1230, 200), (-1920, 0, 1920, 1080)), // 副屏（负原点）
+        ];
+        for &(win, b, work) in cases {
+            let (c1, p1) = snap_bubble_to_window(win, b, BS, work);
+            let (c2, p2) = snap_bubble_to_window(win, p1, BS, work);
+            // 位置必须是**严格不动点**（防振荡的承重性质）。
+            assert_eq!(
+                p1, p2,
+                "吸附结果必须是不动点：win={win:?} b={b:?} work={work:?}"
+            );
+            // 夹取先于择优 ⇒ 第二次也不翻角（判别力：把夹取移到 `nearest_corner` 之后 ⇒
+            // 「窗口贴屏边」的用例会翻角，本断言红）。
+            assert_eq!(c1, c2, "吸附后角不许翻：win={win:?} b={b:?}");
+        }
+        // 确定性：同一输入重复调用总得到同一结果（分两个变量，避开 clippy::eq_op 的同式比较）。
+        for &(win, b, work) in cases {
+            let first = snap_bubble_to_window(win, b, BS, work);
+            let second = snap_bubble_to_window(win, b, BS, work);
+            assert_eq!(first, second, "同一输入必须稳定：win={win:?} b={b:?}");
+        }
+    }
+
+    /// **开窗位的不动点**（防反复开关漂移）：`anchor_window_pos`（气泡 ⇒ 窗口）算出的窗口，
+    /// 再用 `snap_bubble_to_window`（窗口 ⇒ 气泡）反算，气泡留在原地。
+    ///
+    /// 两个分支都测：首选左侧 + 左缘放不下翻右侧。
+    /// 判别力：把 `corner_bubble_pos` 的纵向改成「再外推 10px」（对角偏移）⇒ 本用例红，
+    /// 且真机上表现为每次开关对话窗气泡向上飘一个气泡高。
+    #[test]
+    fn snap_is_fixed_point_of_open_anchor() {
+        let ws = (460, 560);
+        // 分支 1：窗口在气泡左侧。
+        let bubble = (1000, 120);
+        let (wx, wy) = anchor_window_pos(bubble, BS, ws, WORK);
+        let (_, back) = snap_bubble_to_window((wx, wy, ws.0, ws.1), bubble, BS, WORK);
+        assert_eq!(back, bubble, "开窗位不被吸附改动（窗口在左）");
+        assert_eq!(
+            nearest_corner((wx, wy, ws.0, ws.1), bubble, BS, WORK),
+            BubbleCorner::TopRight
+        );
+        // 分支 2：气泡贴左缘 ⇒ 窗口翻到气泡右侧。
+        let bubble2 = (0, 120);
+        let (wx2, wy2) = anchor_window_pos(bubble2, BS, ws, WORK);
+        assert_eq!(wx2, 0 + BS.0 + BUBBLE_GAP, "前提：确实翻了右侧");
+        let (_, back2) = snap_bubble_to_window((wx2, wy2, ws.0, ws.1), bubble2, BS, WORK);
+        assert_eq!(back2, bubble2, "开窗位不被吸附改动（窗口在右）");
+        assert_eq!(
+            nearest_corner((wx2, wy2, ws.0, ws.1), bubble2, BS, WORK),
+            BubbleCorner::TopLeft
+        );
+    }
+
+    /// 屏幕夹取：目标位越出工作区时，夹回区内（不出屏优先，牺牲 10px 间距）。
+    ///
+    /// 判别力：去掉 `snap_bubble_to_window` 里任一 `if x > max_x` / `if x < wx` / 同款 y 分支
+    /// ⇒ 对应断言红。
+    #[test]
+    fn snap_clamps_bubble_into_work_area() {
+        let win = (0, 0, 520, 560);
+        // 气泡在最右下外侧 ⇒ BR 目标位 (530, 524) 仍在屏内，取原值。
+        let (_, (x, y)) = snap_bubble_to_window(win, (530, 524), BS, WORK);
+        assert_eq!((x, y), (530, 524));
+        // 窗口贴右/下缘时目标位出屏 ⇒ 夹回工作区内。
+        let win2 = (1000, 400, 520, 560); // 右缘 1520 > 1440；下缘 960 > 900
+        let (_, (x2, y2)) = snap_bubble_to_window(win2, (1510, 950), BS, WORK);
+        assert!(x2 <= 1440 - BS.0 && x2 >= 0, "x 必须在屏内：{x2}");
+        assert!(y2 <= 900 - BS.1 && y2 >= 0, "y 必须在屏内：{y2}");
+        assert_eq!(x2, 1440 - BS.0);
+        assert_eq!(y2, 900 - BS.1);
+    }
+
+    /// 窗口比屏还大（最大化/超大窗）：仍返回工作区内的坐标，绝不越界，也不 panic。
+    #[test]
+    fn snap_keeps_bubble_on_screen_when_window_bigger_than_screen() {
+        let win = (-300, -300, 3000, 2000);
+        for b in [(0, 0), (1440, 900), (700, 700), (-500, -500)] {
+            let (_, (x, y)) = snap_bubble_to_window(win, b, BS, WORK);
+            assert!(
+                x >= WORK.0 && x + BS.0 <= WORK.0 + WORK.2,
+                "x 越界：b={b:?} -> {x}"
+            );
+            assert!(
+                y >= WORK.1 && y + BS.1 <= WORK.1 + WORK.3,
+                "y 越界：b={b:?} -> {y}"
+            );
+        }
+    }
+
+    /// 工作区带偏移（副屏在主屏左侧）：目标位与夹取都按工作区自身坐标系算。
+    #[test]
+    fn snap_respects_offset_work_area() {
+        let work = (-1920, 0, 1920, 1080);
+        let win = (-1700, 200, 520, 560);
+        // 气泡在窗口右侧 ⇒ 右角目标位 = -1700+520+10 = -1170，未越界。
+        let (corner, (x, y)) = snap_bubble_to_window(win, (-1230, 200), BS, work);
+        assert_eq!(corner, BubbleCorner::TopRight);
+        assert_eq!(x, -1170);
+        assert_eq!(y, 200);
+        // 气泡在窗口左侧 ⇒ 左角目标位 = -1700-10-36 = -1746。
+        let (corner, (x, _)) = snap_bubble_to_window(win, (-1746, 300), BS, work);
+        assert_eq!(corner, BubbleCorner::TopLeft);
+        assert_eq!(x, -1746);
     }
 
     // ─────────── D2：标题栏控件条（稿 ①②③④）的落位 ───────────

@@ -704,6 +704,44 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
     ));
 }
 
+/// D4：读某窗口的**逻辑**外框 `(x, y, w, h)`。
+///
+/// `outer_position()` / `inner_size()` 都是**物理**像素，锚定与吸附的数学全用逻辑像素
+/// （Retina 2x 下不换算差一倍 —— 同 [`anchored_dialog_pos`] 里踩过的坑）。拿不到 winit 窗口
+/// （未 realize / 无头平台）返回 None，调用方据此跳过本次跟随。
+fn logical_window_rect(win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    use slint::winit_030::WinitWindowAccessor;
+    let sf = win.scale_factor();
+    let sf = if sf > 0.0 { sf } else { 1.0 };
+    win.with_winit_window(|w| {
+        let pos = w.outer_position().ok()?;
+        let size = w.inner_size();
+        Some((
+            (pos.x as f32 / sf).round() as i32,
+            (pos.y as f32 / sf).round() as i32,
+            (size.width as f32 / sf).round() as i32,
+            (size.height as f32 / sf).round() as i32,
+        ))
+    })
+    .flatten()
+}
+
+/// D4：某窗口所在显示器的**完整边界**（逻辑像素）当工作区。
+///
+/// Slint/winit 都没有「去掉菜单栏/Dock 的工作区」API，与 [`anchored_dialog_pos`] 同口径
+/// （夹取保证不出屏；菜单栏/Dock 遮挡属平台行为，本批不做）。拿不到显示器返回 None。
+fn monitor_work_area(win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    use slint::winit_030::WinitWindowAccessor;
+    win.with_winit_window(|w| {
+        w.current_monitor().map(|m| {
+            let p = m.position().to_logical::<f32>(m.scale_factor());
+            let s = m.size().to_logical::<f32>(m.scale_factor());
+            (p.x as i32, p.y as i32, s.width as i32, s.height as i32)
+        })
+    })
+    .flatten()
+}
+
 /// 计算对话框应处的左上角（逻辑像素）：把窗口锚在气泡**可视区**旁，靠屏边自动翻边（口径见
 /// [`crate::syschat::anchor_window_pos`]）。
 ///
@@ -722,21 +760,78 @@ fn anchored_dialog_pos(
     let bubble = (b.x + BUBBLE_INSET, b.y + BUBBLE_INSET);
     // `Window::size()` 是**物理**像素，锚定数学全用逻辑像素（Retina 2x 下不换算差一倍）。
     let dsz = dialog_win.size().to_logical(dialog_win.scale_factor());
-    let work = bubble_win
-        .with_winit_window(|w| {
-            w.current_monitor().map(|m| {
-                let p = m.position().to_logical::<f32>(m.scale_factor());
-                let s = m.size().to_logical::<f32>(m.scale_factor());
-                (p.x as i32, p.y as i32, s.width as i32, s.height as i32)
-            })
-        })
-        .flatten()?;
+    let work = monitor_work_area(bubble_win)?;
     Some(crate::syschat::anchor_window_pos(
         bubble,
         (BUBBLE_VISUAL_SIZE, BUBBLE_VISUAL_SIZE),
         (dsz.width as i32, dsz.height as i32),
         work,
     ))
+}
+
+/// D4：气泡跟随的**唯一落位入口**（开窗 / 对话窗 `Moved`·`Resized` / 拖气泡后的去抖存盘共用：
+/// 同一套几何不写第二份）。
+///
+/// **单一事实源（卡 `abb-syschat-d4-bubble-follow`）= 对话窗矩形**：连续约束只有
+/// 「对话窗 ⇒ 气泡」这一条方向；反向的 [`anchored_dialog_pos`]（气泡 ⇒ 窗口）**只在开窗那一刻**
+/// 用一次，之后不再参与。所以本函数移动气泡**不会**让对话窗再动（对话窗只由用户/系统移动），
+/// 也就不存在 `A 动→B 动→A 动` 的反馈环。几何本身（四角择优 + 夹取）在
+/// [`crate::syschat::snap_bubble_to_window`]，并**幂等**（再算一次结果不变），两道合起来就是防环措施。
+///
+/// 返回是否真的移动了（供排障；生产不依赖返回值）。
+fn snap_bubble_to_dialog(bubble: &AnchorBubble, dialog: &SystemChatWindow) -> bool {
+    if !dialog.window().is_visible() {
+        return false; // 窗没开时气泡自由摆放，不吸附
+    }
+    let Some(win_rect) = logical_window_rect(&dialog.window()) else {
+        return false; // 对话窗还没 realize：没有可依附的矩形
+    };
+    let Some(bubble_rect) = logical_window_rect(&bubble.window()) else {
+        return false;
+    };
+    // 气泡几何用**可视区**（窗口比图标大 BUBBLE_INSET，见常量注释），换回窗口位要减掉。
+    let visual = (bubble_rect.0 + BUBBLE_INSET, bubble_rect.1 + BUBBLE_INSET);
+    // 工作区取自**对话窗所在显示器**（窗口是事实源，气泡跟着它跨屏）；拿不到再退回气泡所在显示器。
+    let Some(work) =
+        monitor_work_area(&dialog.window()).or_else(|| monitor_work_area(&bubble.window()))
+    else {
+        return false;
+    };
+    let (_, (tx, ty)) = crate::syschat::snap_bubble_to_window(
+        win_rect,
+        visual,
+        (BUBBLE_VISUAL_SIZE, BUBBLE_VISUAL_SIZE),
+        work,
+    );
+    let target = (tx - BUBBLE_INSET, ty - BUBBLE_INSET);
+    if target == (bubble_rect.0, bubble_rect.1) {
+        return false; // 已就位：不调 set_position，连多余的 `Moved` 都不产生
+    }
+    bubble.window().set_position(slint::LogicalPosition::new(
+        target.0 as f32,
+        target.1 as f32,
+    ));
+    true
+}
+
+/// D4：对话窗 `Moved` / `Resized` → 气泡贴到最近的角（跟随窗口移动/缩放/最大化）。
+///
+/// 这是「跟随」**唯一的事件源**：只有对话窗自己的几何事件会触发吸附 —— 气泡自己的 `Moved`
+/// 绝不反向驱动对话窗（那条在 D4 已拆除，见 [`snap_bubble_to_dialog`] 的防环说明）。
+/// 返回 true 表示该事件属于几何跟随面。
+fn handle_syschat_geometry_event(
+    ev: &slint::winit_030::winit::event::WindowEvent,
+    bubble: &slint::Weak<AnchorBubble>,
+    dialog: &slint::Weak<SystemChatWindow>,
+) -> bool {
+    use slint::winit_030::winit::event::WindowEvent;
+    if !matches!(ev, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+        return false;
+    }
+    if let (Some(b), Some(d)) = (bubble.upgrade(), dialog.upgrade()) {
+        snap_bubble_to_dialog(&b, &d);
+    }
+    true
 }
 
 /// 设置窗工作副本聚合（#80 减重）：除 bots 外的全部 work 副本装进一个 Rc，
@@ -5873,10 +5968,14 @@ pub fn run_gui() -> Result<()> {
     {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
         let pending = bubble_pos_pending.clone();
-        // D 批：拖动气泡时已打开的对话框要**跟着动**（#9）；并清掉气泡按下态
-        // （原生移动会吞掉 release，否则 #8 的按下反馈会残留在气泡上）。
+        // D4（卡 abb-syschat-d4-bubble-follow）：气泡自己的 `Moved` **只**做两件事 ——
+        // ① 清按下态（原生移动会吞掉 release，否则 #8 的按下反馈会残留在气泡上）；
+        // ② 记下位置待去抖存盘。
+        //
+        // 它**不再**反向驱动对话窗：D 批 #9 的「拖气泡 ⇒ 对话窗跟着动」已作废（owner 口径改为
+        // 气泡始终贴对话窗四角），改由下面的去抖存盘把气泡吸回对话窗最近角。
+        // 若保留旧写法，就会出现「气泡 Moved → 窗动 → 窗 Moved → 气泡动」的反馈环。
         let bw = bubble.as_weak();
-        let cw = syschat_win.as_weak();
         bubble.window().on_winit_window_event(move |w, ev| {
             if let WindowEvent::Moved(pos) = ev {
                 pending.set(Some(crate::syschat::BubblePos::from_physical(
@@ -5886,14 +5985,6 @@ pub fn run_gui() -> Result<()> {
                 )));
                 if let Some(b) = bw.upgrade() {
                     b.set_pressed(false);
-                    if let Some(d) = cw.upgrade() {
-                        if d.window().is_visible() {
-                            if let Some((x, y)) = anchored_dialog_pos(b.window(), d.window()) {
-                                d.window()
-                                    .set_position(slint::LogicalPosition::new(x as f32, y as f32));
-                            }
-                        }
-                    }
                 }
             }
             // Windows：圆角需要 SetWindowRgn 硬裁剪（与设置窗同一半径）；其它平台是空操作。
@@ -5901,14 +5992,27 @@ pub fn run_gui() -> Result<()> {
             EventResult::Propagate
         });
         let pending = bubble_pos_pending.clone();
+        let saver_bw = bubble.as_weak();
+        let saver_cw = syschat_win.as_weak();
         let saver = slint::Timer::default();
         saver.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(400),
             move || {
-                if let Some(pos) = pending.take() {
-                    crate::syschat::save_bubble_pos(pos);
+                let Some(raw) = pending.take() else { return };
+                // D4：落盘前先把气泡吸到对话窗最近角 —— 这就是「拖气泡也吸附」的落点：
+                // 拖动期间**不**吸附（否则与原生拖动抢窗口位置），松手后 Moved 流停止 ⇒
+                // 本轮去抖到期 ⇒ 吸附 + 存盘（存的是吸附后的位置，下次开窗就锚在它旁边）。
+                let mut to_save = raw;
+                if let (Some(b), Some(d)) = (saver_bw.upgrade(), saver_cw.upgrade()) {
+                    if d.window().is_visible() {
+                        snap_bubble_to_dialog(&b, &d);
+                        if let Some(r) = logical_window_rect(&b.window()) {
+                            to_save = crate::syschat::BubblePos { x: r.0, y: r.1 };
+                        }
+                    }
                 }
+                crate::syschat::save_bubble_pos(to_save);
             },
         );
         // Timer 需保活到事件循环结束（drop 会取消；与 show_window_and_focus 同款泄漏处理）。
@@ -5940,11 +6044,15 @@ pub fn run_gui() -> Result<()> {
             refresh_syschat_sel(&w, &sessions, &models);
             show_window_and_focus(&w);
             if let Some(b) = bw.upgrade() {
-                // #9：把对话框锚到气泡旁（间距 10px，靠屏边翻边）。
+                // 开窗锚定：把对话窗摆到气泡旁（间距 10px，靠屏边翻边）。**只此一次** ——
+                // 之后连续几何只剩「对话窗 ⇒ 气泡」（单一事实源见 `snap_bubble_to_dialog`）。
                 if let Some((x, y)) = anchored_dialog_pos(b.window(), w.window()) {
                     w.window()
                         .set_position(slint::LogicalPosition::new(x as f32, y as f32));
                 }
+                // 开窗也校准一次气泡（贴到对话窗最近角）。若上面的 set_position 已经触发了
+                // `Moved`，两次吸附都是幂等的（`snap_is_fixed_point_of_open_anchor` 守着开窗不动点）。
+                snap_bubble_to_dialog(&b, &w);
                 // v10（稿 v8 第 1 条）：气泡**常驻置顶**——开窗不再藏气泡。
                 // 旧 #13（「开窗 ⇒ 藏气泡」）已作废；这里保留一次收口调用只是让开窗也把气泡
                 // 拉回 config 真值（比如启动时窗口还没 realize 的帧）。
@@ -6215,6 +6323,8 @@ pub fn run_gui() -> Result<()> {
         let land_paste = land_into_pending.clone();
         let land_drop = land_into_pending.clone();
         let drop_ev = drop_tracker.clone();
+        // D4：气泡跟随用的弱引用（对话窗 Moved/Resized → 气泡贴角）。
+        let follow_bubble = bubble.as_weak();
         syschat_win.window().on_winit_window_event(move |w, ev| {
             // C2 拖放（Finder → 对话窗）：**不需要任何 AppKit 手写代码**——winit 0.30 的 macOS
             // 实现自己就是 `NSDraggingDestination`（`window_delegate.rs:367`），已把系统拖放翻译成
@@ -6276,6 +6386,11 @@ pub fn run_gui() -> Result<()> {
                     hide_syschat(&w, &bw_close2, &sw2);
                 }
             }
+            // D4：对话窗 `Moved` / `Resized`（含最大化、手动缩放）→ 气泡贴到最近的角。
+            // 与 ⌘V / 拖放 / 红点关闭 / 失焦隐藏共用一个钩子（`on_winit_window_event` 是单槽 set）。
+            // 这是「跟随」**唯一的事件源**（气泡自己的 Moved 不反向驱动对话窗，详见
+            // `handle_syschat_geometry_event` / `snap_bubble_to_dialog` 的防环说明）。
+            handle_syschat_geometry_event(ev, &follow_bubble, &cw2);
             // D5：**失焦即隐藏**（接线在 [`handle_syschat_focus_event`]，那里有判据/延时的完整理由）。
             // ⚠️ 必须挂在这个**已有**的钩子上：`on_winit_window_event` 是单槽 `set`，
             // 另起一个会把 ⌘V / Finder 拖放 / 红点关闭整条顶掉（且不会报错）。
@@ -7314,6 +7429,40 @@ mod tests {
                 "should_hide_on_blur(w.window().is_visible(), platform::app_is_active())"
             ),
             "失焦隐藏应走判据函数（`should_hide_on_blur`）而不是就地写条件"
+        );
+    }
+
+    /// D4（卡 `abb-syschat-d4-bubble-follow`）：连续几何只允许「对话窗 ⇒ 气泡」一个方向。
+    ///
+    /// `anchored_dialog_pos`（气泡 ⇒ 窗口）只允许在**开窗**那一处调用一次；气泡自己的 `Moved`
+    /// 绝不能再反推窗口位置 —— 否则「气泡 Moved → 窗动 → 窗 Moved → 气泡动」成环（防环措施
+    /// 见 `snap_bubble_to_dialog` 注释）。
+    ///
+    /// 判别力：把 `anchored_dialog_pos(...)` 再放回气泡的 `Moved` 钩子（旧 #9 写法）⇒ 计数变 3（红）；
+    /// 把对话窗钩子里的跟随调用删掉 ⇒ 第二条断言红。
+    #[test]
+    fn bubble_follow_is_wired_one_way_only() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        // 1 处定义 `fn anchored_dialog_pos(` + 1 处调用 = 2。
+        assert_eq!(
+            prod.matches("anchored_dialog_pos(").count(),
+            2,
+            "反方向锚定（气泡 ⇒ 窗口）只允许开窗时调用一次，否则跟随成环"
+        );
+        assert!(
+            prod.contains("anchored_dialog_pos(b.window(), w.window())"),
+            "开窗锚定必须保留（气泡 ⇒ 窗口的唯一一次）"
+        );
+        // 跟随只挂在对话窗的几何事件上（唯一事件源）。
+        assert!(
+            prod.contains("handle_syschat_geometry_event(ev, &follow_bubble, &cw2)"),
+            "对话窗 Moved/Resized 必须跟随气泡"
+        );
+        // 气泡钩子不得再移动对话窗（旧写法用的是 `d.window()` 这个绑定名）。
+        assert!(
+            !prod.contains("anchored_dialog_pos(b.window(), d.window())"),
+            "气泡 Moved 钩子不得再反推对话窗（旧 #9 口径，D4 已作废）"
         );
     }
 
