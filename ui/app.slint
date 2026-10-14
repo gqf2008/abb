@@ -3322,6 +3322,29 @@ component ComposerIcon inherits Rectangle {
     }
 }
 
+// 卡 d9：「更多」菜单里的一行（定时档位 / 取消全部）。左对齐、hover 变色，点击即触发。
+component MenuRow inherits Rectangle {
+    in property <string> text: "";
+    callback clicked();
+    height: 26px;
+    background: hit.has-hover ? PixelTheme.hover : transparent;
+    border-radius: 4px;
+    Text {
+        x: 8px;
+        width: parent.width - 16px;
+        height: 100%;
+        text: root.text;
+        font-size: 12px;
+        color: PixelTheme.text;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // D 批：待发附件右上角 ✕（稿 `.x`）——**只从待发列表移除，不删已落盘文件**。
 component PendingRemoveBadge inherits Rectangle {
     callback remove();
@@ -3436,10 +3459,41 @@ export component SystemChatWindow inherits Window {
     callback reset-history();
     callback close-window();
     callback open-settings();   // ③ ⚙设置：唤起既有设置窗（D2 稿需求 #3）
-    // 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多（含定时发送），稿 v9 第 2 条）：
-    // 这几个功能还没做，但**不做成死按钮**——按下走既有状态行通道给一句「尚未实现」。
-    // 参数 = 功能名（Rust 侧拼「「表情」尚未实现（占位按钮）。」）。
+    // 输入区占位按钮（稿 v9 第 2 条）：只剩 ✂ 截图仍是「有反馈的占位」——按下走既有
+    // 状态行通道给一句「尚未实现」，不做成死按钮。参数 = 功能名。
+    // （😊 表情与 ⋯ 更多在卡 d9 已做成真功能，见下面的属性/回调；截图需 macOS 屏幕录制
+    //  TCC 授权 + 原生采集，另立卡，本卡只留占位。）
     callback composer-todo(string);
+
+    // ── 卡 d9：表情面板 /「更多（定时）」菜单 ────────────────────────────────
+    // 两个面板都是**窗口内 overlay**（根级、绝对定位在输入框上方，见本组件末尾），由这对
+    // `in-out` 开关控制显隐。收起路径 = 面板外那层整窗透明 TouchArea（所以「点外部」与
+    // 「再点按钮」都会收起——`PopupWindow` 的 close-on-click-outside 做不到，见末尾注释）。
+    in-out property <bool> emoji-open: false;
+    in-out property <bool> more-open: false;
+
+    // 表情面板：分组/分页的**状态与内容都由 Rust 算**（`emoji.rs` 纯函数带单测），这里只画。
+    // `emoji-cells` = 当前页的格子（≤ 32 个，8 列 × 4 行）。
+    in property <[string]> emoji-cats: [];
+    in property <[string]> emoji-cells: [];
+    in property <int> emoji-cat-index: 0;
+    in property <string> emoji-page-label: "";
+    in property <bool> emoji-prev-enabled: false;
+    in property <bool> emoji-next-enabled: false;
+    callback emoji-opened();   // 打开时让 Rust 重置分组/页码并刷新（文案随日期也不旧）
+    callback emoji-cat(int);
+    callback emoji-page(int);  // 参数 = 翻页方向（-1 / +1），由 Rust 夹取
+    callback emoji-pick(string);
+
+    // 「更多（⋯）」菜单：固定档位定时发送 + 待发列表（可逐条取消 / 全部取消）。
+    in property <[string]> sched-preset-labels: [];
+    in property <[string]> sched-items: [];
+    in property <int> sched-count: 0;
+    in property <string> sched-cancel-all-label: "";
+    callback more-opened();
+    callback sched-preset(int);
+    callback sched-cancel(int);
+    callback sched-cancel-all();
     // 无边框窗口缩放（同 SettingsWindow：`impl_resize_ui!` + `install_window_resize`）。
     // owner 2026-10-13：「窗口不能缩放的吗？」——此前对话窗没接缩放契约。
     callback begin-resize(string);
@@ -4183,12 +4237,15 @@ export component SystemChatWindow inherits Window {
                                     // `.fnbar{display:flex;gap:4px}`：五枚 24×24 图标钮，间距 4px。
                                     fnbar := HorizontalLayout {
                                         spacing: 4px;
-                                        // 😊 表情 / ✂ 截图 / ⋯ 更多（含定时发送）：**占位**——按下走
-                                        // 既有状态行通道给一句「尚未实现」，不做成死按钮。
+                                        // 😊 表情：打开内置 emoji 面板（分组 + 翻页，插入到草稿末尾）。
                                         ComposerIcon {
                                             icon: "😊";
-                                            tip: "表情（尚未实现）";
-                                            clicked => { root.composer-todo("表情"); }
+                                            tip: "表情";
+                                            clicked => {
+                                                root.more-open = false;
+                                                root.emoji-open = true;
+                                                root.emoji-opened();
+                                            }
                                         }
                                         // 📎 附件：接既有 attach-pick（可多选）；生成中也可用
                                         // （卡的待发附件会随本轮发送/排队项一起带上）。
@@ -4199,7 +4256,8 @@ export component SystemChatWindow inherits Window {
                                         }
                                         ComposerIcon {
                                             icon: "✂";
-                                            tip: "截图（尚未实现）";
+                                            // 本卡只留占位：macOS 屏幕采集需屏幕录制 TCC 授权 + 原生 API，另立卡。
+                                            tip: "截图（另立卡：需屏幕录制授权）";
                                             clicked => { root.composer-todo("截图"); }
                                         }
                                         // 🗑 清空当前会话：v10 从「发送右侧」搬进功能区（稿 v10 第 1 条）。
@@ -4211,8 +4269,12 @@ export component SystemChatWindow inherits Window {
                                         }
                                         ComposerIcon {
                                             icon: "⋯";
-                                            tip: "更多（含定时发送，尚未实现）";
-                                            clicked => { root.composer-todo("更多（含定时发送）"); }
+                                            tip: "更多（含定时发送）";
+                                            clicked => {
+                                                root.emoji-open = false;
+                                                root.more-open = true;
+                                                root.more-opened();
+                                            }
                                         }
                                     }
                                     // 发送按钮（稿 v10 `.send{height:30px;padding:0 14px;font-size:12px;
@@ -4319,6 +4381,199 @@ export component SystemChatWindow inherits Window {
             width: 100%;
             height: 100%;
             begin-resize(dir) => { root.begin-resize(dir); }
+        }
+
+        // ── 卡 d9：表情面板 /「更多（定时）」菜单（根级 overlay，画在输入框正上方）──────
+        //
+        // 为什么不用 PopupWindow：它的 `close-policy: close-on-click-outside` 在**按下**就关
+        //（slint-core `window.rs` 的 `CloseOnClickOutside` 判 `pressed_event`），而按钮的
+        // `clicked` 在**松开**才到 → 「再点按钮」永远只会重开、收不起来（实测语义，不是猜）。
+        // 改成「面板 + 一层整窗透明 TouchArea」：点面板外（含按钮本身）→ 关；再点按钮时
+        // 已无遮挡 → 正常打开。两面板互斥由按钮处理器保证。
+        //
+        // 位置锚在输入框（`composer`）的**绝对坐标**上（随窗口缩放跟随）：面板底边贴在
+        // 输入框顶边之上 6px，右缘与输入框右缘齐平（`max(6px, …)` 防窄窗跑出左边界）。
+        if root.emoji-open || root.more-open: Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            background: transparent;
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.emoji-open = false; root.more-open = false; }
+            }
+        }
+
+        if root.emoji-open: Rectangle {
+            x: max(6px, composer.absolute-position.x + composer.width - 300px);
+            y: composer.absolute-position.y - self.height - 6px;
+            width: 300px;
+            height: 220px;
+            background: PixelTheme.panel;
+            border-width: 2px;
+            border-color: PixelTheme.edge;
+            border-radius: 8px;
+            // 吃掉面板空白处的点击，别让它穿到后面的整窗 backdrop 上把面板关了。
+            TouchArea { width: 100%; height: 100%; }
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                // 分组 tab（顺序/名称由 Rust 给，点一个换一组）
+                HorizontalLayout {
+                    height: 24px;
+                    spacing: 4px;
+                    for c[idx] in root.emoji-cats: Rectangle {
+                        horizontal-stretch: 1;
+                        height: 24px;
+                        background: idx == root.emoji-cat-index ? PixelTheme.accent : (tab-hit.has-hover ? PixelTheme.hover : PixelTheme.bg);
+                        border-width: 2px;
+                        border-color: PixelTheme.edge;
+                        border-radius: 4px;
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            text: c;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            color: idx == root.emoji-cat-index ? PixelTheme.on-accent : PixelTheme.text;
+                        }
+                        tab-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.emoji-cat(idx); }
+                        }
+                    }
+                }
+                // 8 列 × 4 行（与 `emoji.rs` 的 GRID_COLS / GRID_ROWS 及 PAGE_SIZE 一致）。
+                GridLayout {
+                    spacing: 2px;
+                    for e[idx] in root.emoji-cells: Rectangle {
+                        row: idx / 8;
+                        col: Math.mod(idx, 8);
+                        width: 34px;
+                        height: 34px;
+                        background: cell-hit.has-hover ? PixelTheme.hover : transparent;
+                        border-radius: 4px;
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            text: e;
+                            font-size: 18px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        cell-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.emoji-pick(e); }
+                        }
+                    }
+                }
+                // 翻页（页数与可用性由 Rust 算：`emoji.rs` 纯函数）
+                HorizontalLayout {
+                    height: 24px;
+                    spacing: 6px;
+                    ComposerIcon {
+                        icon: "◀";
+                        tip: "上一页";
+                        enabled: root.emoji-prev-enabled;
+                        clicked => { root.emoji-page(-1); }
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        height: 100%;
+                        text: root.emoji-page-label;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        color: PixelTheme.dim;
+                    }
+                    ComposerIcon {
+                        icon: "▶";
+                        tip: "下一页";
+                        enabled: root.emoji-next-enabled;
+                        clicked => { root.emoji-page(1); }
+                    }
+                }
+            }
+        }
+
+        if root.more-open: Rectangle {
+            x: max(6px, composer.absolute-position.x + composer.width - 250px);
+            y: composer.absolute-position.y - self.height - 6px;
+            width: 250px;
+            // 基础 = padding 12 + 头 20 + 三个档位 3×26 + 档位间距；再按待发条数增高。
+            height: 122px + root.sched-count * 26px + (root.sched-count > 0 ? 20px : 0px) + (root.sched-count > 1 ? 26px : 0px);
+            background: PixelTheme.panel;
+            border-width: 2px;
+            border-color: PixelTheme.edge;
+            border-radius: 8px;
+            TouchArea { width: 100%; height: 100%; }
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                Text {
+                    height: 20px;
+                    text: "定时发送（到点自动发出）";
+                    font-size: 10px;
+                    color: PixelTheme.dim;
+                    vertical-alignment: center;
+                }
+                for p[idx] in root.sched-preset-labels: MenuRow {
+                    text: p;
+                    clicked => { root.sched-preset(idx); }
+                }
+                if root.sched-count > 0: Text {
+                    height: 18px;
+                    text: "待发（点 ✕ 取消）";
+                    font-size: 10px;
+                    color: PixelTheme.dim;
+                    vertical-alignment: center;
+                }
+                for it[idx] in root.sched-items: Rectangle {
+                    height: 26px;
+                    background: transparent;
+                    border-radius: 4px;
+                    Text {
+                        x: 6px;
+                        width: parent.width - 34px;
+                        height: 100%;
+                        text: it;
+                        font-size: 11px;
+                        color: PixelTheme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle {
+                        x: parent.width - 26px;
+                        y: 3px;
+                        width: 20px;
+                        height: 20px;
+                        background: rm-hit.has-hover ? PixelTheme.hover : PixelTheme.bg;
+                        border-width: 2px;
+                        border-color: PixelTheme.edge;
+                        border-radius: 4px;
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            text: "✕";
+                            font-size: 10px;
+                            color: PixelTheme.text;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        rm-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.sched-cancel(idx); }
+                        }
+                    }
+                }
+                if root.sched-count > 1: MenuRow {
+                    text: root.sched-cancel-all-label;
+                    clicked => { root.sched-cancel-all(); }
+                }
+            }
         }
     }
 

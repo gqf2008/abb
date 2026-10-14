@@ -333,6 +333,84 @@ fn think_block_collapsed_by_default_and_expands() {
     );
 }
 
+/// 卡 d9 回归守卫：表情面板 /「更多」菜单**能真的渲染出来**，且锚点
+/// （`composer.absolute-position`）不会触发绑定环 / 运行时 panic。
+///
+/// 判据：开/关两帧的**差异像素**必须存在，且差异区的最上一行在输入区**上方**
+/// （面板确实画在输入框上方，不是把输入框改了）。两个面板各验一次。
+///
+/// 判别力（负向）：把 `.slint` 里的 `if root.emoji-open:` 写成恒假（或删掉面板）⇒ 差异为 0 ⇒ 红。
+#[test]
+fn emoji_and_more_panels_render_above_composer() {
+    // 差异像素数 + 最上一行差异的差异区（`None` = 两帧完全一样）。
+    fn frame_diff_top(a: &Frame, b: &Frame, h: u32) -> (usize, Option<u32>) {
+        let mut n = 0usize;
+        let mut top: Option<u32> = None;
+        for y in 0..h {
+            for x in 0..W {
+                let (p, q) = (a.px(x, y), b.px(x, y));
+                if (p.red, p.green, p.blue, p.alpha) != (q.red, q.green, q.blue, q.alpha) {
+                    n += 1;
+                    top = top.or(Some(y));
+                }
+            }
+        }
+        (n, top)
+    }
+
+    let (ui, win, _) = setup(vec![row("role", "怹"), row("p", "面板渲染守卫")], SHORT_H);
+    // 按生产 `refresh_emoji_panel` 的口径灌内容（分类 + 一整页格子）。
+    ui.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("常用"),
+        slint::SharedString::from("手势"),
+    ]))));
+    ui.set_emoji_cells(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        crate::emoji::page_cells(0, 0)
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_emoji_cat_index(0);
+    ui.set_emoji_page_label("1/2".into());
+    let closed = settle(&ui, &win, SHORT_H);
+
+    ui.set_emoji_open(true);
+    let emoji_open = settle(&ui, &win, SHORT_H);
+    let (n_emoji, top_emoji) = frame_diff_top(&closed, &emoji_open, SHORT_H);
+    assert!(
+        n_emoji > 500,
+        "打开表情面板没有画出差异像素（{n_emoji}）：面板没渲染出来"
+    );
+    let top_emoji = top_emoji.expect("差异区应有最上一行");
+    assert!(
+        top_emoji < SHORT_H - 150,
+        "表情面板的最上一行在 y={top_emoji}（窗口高 {SHORT_H}）——面板没画在输入框上方"
+    );
+    ui.set_emoji_open(false);
+
+    // 「更多」菜单：同样灌上档位与一条待发。
+    ui.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("5 分钟后"),
+        slint::SharedString::from("30 分钟后"),
+        slint::SharedString::from("今天 18:00"),
+    ]))));
+    ui.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("10-14 18:00 · 待发测试"),
+    ]))));
+    ui.set_sched_count(1);
+    ui.set_sched_cancel_all_label("取消全部定时（1）".into());
+    let before_more = settle(&ui, &win, SHORT_H);
+    ui.set_more_open(true);
+    let more_open = settle(&ui, &win, SHORT_H);
+    let (n_more, top_more) = frame_diff_top(&before_more, &more_open, SHORT_H);
+    assert!(n_more > 500, "打开「更多」菜单没有画出差异像素（{n_more}）");
+    let top_more = top_more.expect("差异区应有最上一行");
+    assert!(
+        top_more < SHORT_H - 150,
+        "「更多」菜单的最上一行在 y={top_more}（窗口高 {SHORT_H}）——没画在输入框上方"
+    );
+}
+
 /// #1 回归守卫：标题栏控件条与标题文字之间必须有间隔（不许压字），且整条不越过窗口按钮。
 ///
 /// 依赖 Rust 侧已经把计划写进窗口（`titlebar-strip-x` 等）。本用例直接调

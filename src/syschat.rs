@@ -2435,6 +2435,70 @@ mod tests {
         );
     }
 
+    /// 卡 d9 定时发送「到点真的会发」的全链路（mock 端到端，不碰 GUI）：
+    /// 排一条已到点 + 一条未到点 → `take_due` 只吐已到点那条并**同时从存储揭除** → 该文本
+    /// 再走手动发送同一条执行链（`turn_with` + mock agent）→ mock 记录里真的看到它。
+    ///
+    /// 判别力（负向）：把 [`crate::syschat_sched::is_due`] 的比较反成 `t.to_unix() > now` ⇒
+    /// due 集合变空（或拿到未到点那条），本测红。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn scheduled_message_fires_through_mock_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "abb-syschat-sched-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = crate::syschat_sched::SchedStore::at(dir.join("scheduled.json"));
+        let now = crate::schedule::DateTime::now();
+        let past = crate::schedule::DateTime::from_unix(now.to_unix() - 60);
+        let future = crate::schedule::DateTime::from_unix(now.to_unix() + 3600);
+        store
+            .add(
+                "syschat-scheduled-marker",
+                &crate::syschat_sched::format_at(&past),
+            )
+            .unwrap();
+        store
+            .add(
+                "syschat-future-marker",
+                &crate::syschat_sched::format_at(&future),
+            )
+            .unwrap();
+
+        // 到点那一拍：只拿到已到点的，且已从存储揭除（不会重复发）。
+        let due = store.take_due(now);
+        assert_eq!(due.len(), 1, "应只触发已到点的那一条：{due:?}");
+        assert!(due[0].text.contains("syschat-scheduled-marker"));
+        assert!(store.take_due(now).is_empty(), "同一分钟后不得重复触发");
+        assert_eq!(store.list()[0].text, "syschat-future-marker");
+
+        // 真正发出的那一段：与手动发送共用 `turn_with`（scheduler 到点后调的就是 `submit_sc`，
+        // 后者内部起的是同一条 `turn_streaming`/`turn_core` 链）。
+        let rec =
+            std::env::temp_dir().join(format!("abb-syschat-srec-{}.jsonl", uuid::Uuid::new_v4()));
+        let ws = std::env::temp_dir().join(format!("abb-syschat-sws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let reply = turn_with(mock_agent_cfg(&rec), ws, due[0].text.clone())
+            .await
+            .expect("mock echo 回合应 Ok");
+        assert!(
+            reply.contains("syschat-scheduled-marker"),
+            "定时文本没到 agent（echo 应包含它）：{reply}"
+        );
+        let events = read_records(&rec);
+        assert!(
+            events.iter().any(|e| e["event"] == "prompt"
+                && e["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("syschat-scheduled-marker")),
+            "agent 侧记录里应有定时文本：{events:?}"
+        );
+    }
+
     /// E1 流式全链路（隔离夹具）：sink 真的转发正文 delta，回合结局 Ok，
     /// 历史里助手轮与最终文本一致（去重口径的数据侧前提）。
     #[tokio::test]
@@ -3740,26 +3804,59 @@ mod tests {
         );
     }
 
-    /// 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多）必须是「有反馈的占位」，**不能是死按钮**：
-    /// 三个图标都要接 `composer-todo(...)`，且 Rust 侧要注册 `on_composer_todo`（写状态行）。
-    /// 源码扫描守卫（同 `titlebar_plan_button_count_matches_show_maximize` 的手法）：
-    /// 按下没反应属于「做了个空壳」，外部观测不到，只能把接线钉在源码上。
+    /// 输入区功能区的接线守卫：✂ 截图仍是「有反馈的占位」，😊 表情 / ⋯ 更多（卡 d9）已是真功能。
     ///
-    /// 判别力（负向）：去掉任一 `composer-todo(...)` 接线（改成空实现 / 删掉）⇒ 本用例红。
+    /// 源码扫描守卫（同 `titlebar_plan_button_count_matches_show_maximize` 的手法）：按下没反应 /
+    /// 接了空实现属于「做了个空壳」，外部观测不到，只能把接线钉在源码上。
+    ///
+    /// 判别力（负向）：把任一接线改成空实现 / 删掉（例如去掉 `root.emoji-opened()`）⇒ 本用例红。
     #[test]
-    fn composer_placeholder_buttons_wire_todo_callback() {
+    fn composer_function_bar_wiring() {
         let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
-        for label in ["表情", "截图", "更多（含定时发送）"] {
-            assert!(
-                raw.contains(&format!("root.composer-todo(\"{label}\")")),
-                "占位按钮「{label}」没接 composer-todo（会变成点了没反应的死按钮）"
-            );
-        }
-        // Rust 侧的接线（把占位提示写进既有状态行通道）。
-        let rust = crate::platform::src_lf(include_str!("ui.rs"));
+        // ✂ 截图：仍是占位（有反馈，不是死按钮）
         assert!(
-            rust.contains("on_composer_todo"),
-            "Rust 侧没注册 on_composer_todo —— 占位按钮的状态行提示发不出来"
+            raw.contains("root.composer-todo(\"截图\")"),
+            "✂ 截图没接 composer-todo（会变成点了没反应的死按钮）"
+        );
+        // 😊 表情：打开面板 + 通知 Rust 重置/刷新（两者缺一都是空壳）
+        assert!(
+            raw.contains("root.emoji-open = true;"),
+            "😊 表情没打开 emoji 面板"
+        );
+        assert!(
+            raw.contains("root.emoji-opened();"),
+            "😊 表情没通知 Rust 初始化面板内容（面板会是空的）"
+        );
+        // ⋯ 更多：打开菜单 + 通知 Rust 刷新档位/待发
+        assert!(raw.contains("root.more-open = true;"), "⋯ 更多没打开菜单");
+        assert!(
+            raw.contains("root.more-opened();"),
+            "⋯ 更多没通知 Rust 刷新档位/待发列表"
+        );
+        // Rust 侧的全部接线。
+        let rust = crate::platform::src_lf(include_str!("ui.rs"));
+        for hook in [
+            "on_composer_todo",
+            "on_emoji_opened",
+            "on_emoji_cat",
+            "on_emoji_page",
+            "on_emoji_pick",
+            "on_more_opened",
+            "on_sched_preset",
+            "on_sched_cancel",
+            "on_sched_cancel_all",
+        ] {
+            assert!(rust.contains(hook), "Rust 侧没注册 {hook} —— 功能发不出来");
+        }
+        // 表情插入口径：Slint 的 TextInput 无光标 API ⇒ 追加到草稿**末尾**（本卡口径）。
+        assert!(
+            rust.contains("draft.push_str(e.as_str())"),
+            "表情插入必须追加到草稿末尾（TextInput 无光标 API）"
+        );
+        // 定时发送复用既有主定时器：到点从存储取出并走与手动发送同一个 submit_sc。
+        assert!(
+            rust.contains("take_due(crate::schedule::DateTime::now())"),
+            "定时到点没有接主定时器（take_due）"
         );
     }
 

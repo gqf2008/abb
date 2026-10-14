@@ -2540,6 +2540,61 @@ pub fn run_gui() -> Result<()> {
     }
     refresh_syschat_atts(&syschat_win, &sc_atts, &sc_pending);
 
+    // ── 卡 d9：表情面板 /「更多（定时）」菜单的 UI 线程状态 ──────────────────
+    //
+    // - `sc_emoji_cat` / `sc_emoji_page`：面板的分组/页码（内容由 `emoji.rs` 纯函数算）；
+    // - `sc_sched`：定时发送队列（`syschat_sched`，落盘 `~/.agent-bridge/syschat/scheduled.json`），
+    //   到点由下方 2s 主定时器取出并走**与手动发送同一个提交入口**（`submit_sc`）。
+    let sc_emoji_cat: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let sc_emoji_page: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let sc_sched: Rc<crate::syschat_sched::SchedStore> =
+        Rc::new(crate::syschat_sched::SchedStore::load());
+
+    /// 把 `emoji.rs` 算出的当前页/分组写进窗口（分类 tab、格子、页码、翻页可用性）。
+    fn refresh_emoji_panel(win: &SystemChatWindow, cat: &Rc<Cell<usize>>, page: &Rc<Cell<usize>>) {
+        let c = cat.get();
+        let p = crate::emoji::clamp_page(c, page.get() as i32);
+        page.set(p);
+        let cells: Vec<slint::SharedString> = crate::emoji::page_cells(c, p)
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect();
+        win.set_emoji_cells(slint::ModelRc::from(Rc::new(slint::VecModel::from(cells))));
+        win.set_emoji_cat_index(c as i32);
+        win.set_emoji_page_label(crate::emoji::page_label(c, p).into());
+        win.set_emoji_prev_enabled(p > 0);
+        win.set_emoji_next_enabled(p + 1 < crate::emoji::page_count(c));
+    }
+
+    /// 把定时档位文案 + 待发列表写进「更多」菜单（每次打开/增删后调）。
+    fn refresh_sched_menu(win: &SystemChatWindow, store: &Rc<crate::syschat_sched::SchedStore>) {
+        let now = crate::schedule::DateTime::now();
+        let labels: Vec<slint::SharedString> = crate::syschat_sched::preset_labels(now)
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect();
+        win.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(labels))));
+        let items = store.list();
+        let count = items.len() as i32;
+        let rows: Vec<slint::SharedString> = items
+            .iter()
+            .map(|m| slint::SharedString::from(crate::syschat_sched::menu_row(m)))
+            .collect();
+        win.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+        win.set_sched_count(count);
+        win.set_sched_cancel_all_label(format!("取消全部定时（{count}）").into());
+    }
+
+    // 分类 tab 是常量，初始化就写一次（之后面板打开不必重设）。
+    {
+        let cats: Vec<slint::SharedString> = crate::emoji::category_names()
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect();
+        syschat_win.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(cats))));
+        refresh_emoji_panel(&syschat_win, &sc_emoji_cat, &sc_emoji_page);
+    }
+
     // 把一批本地路径落地进工作区附件目录并并入待发列表。失败 ⇒ 对话框状态行显示可读原因
     // （复用既有错误展示通道），**不静默丢弃**；成功时才把落盘记录并入待发。
     let land_into_pending: Rc<dyn Fn(Vec<std::path::PathBuf>)> = {
@@ -6335,7 +6390,11 @@ pub fn run_gui() -> Result<()> {
     // （见 ui/app.slint 的 enabled/accepted），所以这里**不再 busy 直接 return**：
     // 空消息与纯附件由 `submit` 拒绝（防误发），防连点由“发送后清 draft”保证同一文本
     // 不会因一次击键被提交两次。
-    {
+    //
+    // 卡 d9：把这段主体提成 `submit_sc`——它是**唯一**的提交入口，手动发送（`on_send`）
+    // 与定时到点（下方 2s 主定时器）共用，避免两条路径行为漂移（定时那条也走完整的
+    // “上屏 + 落点判定 + 状态行”）。
+    let submit_sc: Rc<dyn Fn(String)> = {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
         let atts = sc_atts.clone();
@@ -6343,7 +6402,7 @@ pub fn run_gui() -> Result<()> {
         let pump = sc_pump.clone();
         let inject = sc_inject.clone();
         let start_turn = start_sc_turn.clone();
-        syschat_win.on_send(move |text| {
+        Rc::new(move |text: String| {
             let text = text.trim().to_string();
             let Some(w) = cw.upgrade() else { return };
             // 本轮的待发附件（路径随 prompt 进 agent）；发送后清空待发列表——
@@ -6389,7 +6448,11 @@ pub fn run_gui() -> Result<()> {
                 }
             }
             w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-        });
+        })
+    };
+    {
+        let submit = submit_sc.clone();
+        syschat_win.on_send(move |text| submit(text.to_string()));
     }
     // ⏹ 停止：取消在途回合（UI 线程直接触发外部取消令牌；回合收尾由 Stopped 事件处理）。
     {
@@ -6445,14 +6508,152 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多）：**不做成死按钮**——按下走既有状态行通道
-    // 给一句「尚未实现」。画在 `ui/app.slint` 的 `.fnbar` 里，回调只带一个功能名。
+    // 输入区占位按钮（只剩 ✂ 截图）：**不做成死按钮**——按下走既有状态行通道给一句「尚未实现」。
+    // 画在 `ui/app.slint` 的 `.fnbar` 里，回调只带一个功能名。（😊 表情与 ⋯ 更多在卡 d9 已接
+    // 真功能，见下方两段；截图需 macOS 屏幕录制 TCC 授权 + 原生采集，另立卡。）
     {
         let cw = syschat_win.as_weak();
         syschat_win.on_composer_todo(move |name| {
             if let Some(w) = cw.upgrade() {
                 w.set_status_is_error(false);
                 w.set_status_line(format!("「{name}」尚未实现（占位按钮）。").into());
+            }
+        });
+    }
+    // ── 卡 d9：😊 表情面板 ──────────────────────────────────────────────
+    // 分组/翻页内容全在 `crate::emoji`（纯函数带单测）；这里只把结果写进窗口。
+    // 插入口径：Slint 的 `TextInput` **没有光标 API**（只有 `text` 整串），所以选一个 emoji
+    // 一律**追加到草稿末尾**（本卡口径）；选完**不关面板**，方便连续插多个。
+    {
+        let cw = syschat_win.as_weak();
+        let cat = sc_emoji_cat.clone();
+        let page = sc_emoji_page.clone();
+        syschat_win.on_emoji_opened(move || {
+            // 每次打开回到默认分组首页（避免上次翻到末页后再次打开是空的）。
+            cat.set(0);
+            page.set(0);
+            if let Some(w) = cw.upgrade() {
+                refresh_emoji_panel(&w, &cat, &page);
+            }
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        let cat = sc_emoji_cat.clone();
+        let page = sc_emoji_page.clone();
+        syschat_win.on_emoji_cat(move |i| {
+            cat.set(crate::emoji::clamp_cat(i));
+            page.set(0);
+            if let Some(w) = cw.upgrade() {
+                refresh_emoji_panel(&w, &cat, &page);
+            }
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        let cat = sc_emoji_cat.clone();
+        let page = sc_emoji_page.clone();
+        syschat_win.on_emoji_page(move |delta| {
+            let c = cat.get();
+            page.set(crate::emoji::clamp_page(c, page.get() as i32 + delta));
+            if let Some(w) = cw.upgrade() {
+                refresh_emoji_panel(&w, &cat, &page);
+            }
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_emoji_pick(move |e| {
+            if let Some(w) = cw.upgrade() {
+                let mut draft = w.get_draft().to_string();
+                draft.push_str(e.as_str());
+                w.set_draft(draft.into());
+            }
+        });
+    }
+    // ── 卡 d9：⋯ 「更多（定时）」菜单 ────────────────────────────────────
+    // 菜单打开时刷新（档位文案要按当前钟点决定「今天/明天 18:00」，待发列表也可能被
+    // 上次的到点触发改过）。
+    {
+        let cw = syschat_win.as_weak();
+        let store = sc_sched.clone();
+        syschat_win.on_more_opened(move || {
+            if let Some(w) = cw.upgrade() {
+                refresh_sched_menu(&w, &store);
+            }
+        });
+    }
+    // 档位 → 排程。口径：
+    // - 只排**文本**（草稿）；带待发附件时**拒排**并给可见原因，绝不默默丢掉附件；
+    // - 排成功后清空输入框（与「发送」同观感：消息已被接收，只是晚点发）；
+    // - 失败（空草稿 / 时间解析失败）写状态行，不静默。
+    {
+        let cw = syschat_win.as_weak();
+        let store = sc_sched.clone();
+        let atts = sc_atts.clone();
+        syschat_win.on_sched_preset(move |i| {
+            let Some(w) = cw.upgrade() else { return };
+            let Some(preset) = crate::syschat_sched::Preset::from_index(i) else {
+                return;
+            };
+            let draft = w.get_draft().to_string();
+            if draft.trim().is_empty() {
+                w.set_status_is_error(true);
+                w.set_status_line("定时发送失败：输入框为空。".into());
+                return;
+            }
+            if !atts.borrow().is_empty() {
+                w.set_status_is_error(true);
+                w.set_status_line("定时发送暂不支持附件：请先移除待发附件，或直接发送。".into());
+                return;
+            }
+            let at = preset.resolve(crate::schedule::DateTime::now());
+            match store.add(&draft, &at) {
+                Ok(m) => {
+                    w.set_draft("".into());
+                    w.set_status_is_error(false);
+                    w.set_status_line(
+                        format!(
+                            "已定时发送：{}（{}）",
+                            m.at,
+                            crate::agent::truncate(&m.text, 20)
+                        )
+                        .into(),
+                    );
+                    refresh_sched_menu(&w, &store);
+                }
+                Err(e) => {
+                    w.set_status_is_error(true);
+                    w.set_status_line(format!("定时发送失败：{e}").into());
+                }
+            }
+        });
+    }
+    // 取消单条（菜单里每条右侧的 ✕）：按 index 在当前列表中定位 id；取不到就是 no-op。
+    {
+        let cw = syschat_win.as_weak();
+        let store = sc_sched.clone();
+        syschat_win.on_sched_cancel(move |idx| {
+            let Some(w) = cw.upgrade() else { return };
+            let list = store.list();
+            if let Some(m) = list.get(idx.max(0) as usize) {
+                store.remove(&m.id);
+                w.set_status_is_error(false);
+                w.set_status_line(format!("已取消定时发送：{}。", m.at).into());
+            }
+            refresh_sched_menu(&w, &store);
+        });
+    }
+    // 取消全部。
+    {
+        let cw = syschat_win.as_weak();
+        let store = sc_sched.clone();
+        syschat_win.on_sched_cancel_all(move || {
+            if let Some(w) = cw.upgrade() {
+                let n = store.remove_all();
+                w.set_status_is_error(false);
+                w.set_status_line(format!("已取消全部定时发送（{n} 条）。").into());
+                refresh_sched_menu(&w, &store);
             }
         });
     }
@@ -6862,6 +7063,11 @@ pub fn run_gui() -> Result<()> {
         let bubble_weak = bubble.as_weak();
         // 气泡位置待施加标记（见启动处注释）
         let bubble_pos_apply_t = bubble_pos_apply.clone();
+        // 卡 d9：定时发送到点——复用托盘进程**既有的** 2s 主定时器（不新增线程/不新增依赖）。
+        // 到点项由 `take_due` 取出并**同时揭除**（防重复触发），再走与手动发送同一个
+        // `submit_sc` 入口（上屏 + 落点判定 + 状态行）；发出失败由 submit_sc 自身的状态行可见。
+        let sched_t = sc_sched.clone();
+        let submit_t = submit_sc.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -6869,6 +7075,11 @@ pub fn run_gui() -> Result<()> {
                 let wk = wk.clone();
                 move || {
                     let _keep = &tray_hold;
+                    // 卡 d9：先把到点的定时消息发出去（分钟粒度；2s 一拍 = 最多晚 2s）。
+                    for m in sched_t.take_due(crate::schedule::DateTime::now()) {
+                        crate::log!("[syschat] 定时发送触发：{}（{} 字）", m.at, m.text.chars().count());
+                        submit_t(m.text);
+                    }
                     // P8c：启动/停止/重启服务失败 → 弹一次可见提示（与未读提醒同一套 toast + 5s 收起）
                     let pending_toast = svc_toast.lock().ok().and_then(|mut s| s.take());
                     if let Some(msg) = pending_toast {
