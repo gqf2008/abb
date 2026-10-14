@@ -2488,6 +2488,13 @@ fn configure_backend() -> Result<()> {
                     .with_titlebar_transparent(true)
                     .with_title_hidden(true)
                     .with_fullsize_content_view(true)
+                    // **显式要求可缩放**：winit 的 macOS 无边框窗样式位是
+                    // `Borderless | Resizable | Miniaturizable`（`window_delegate.rs:542-544`），
+                    // 前提是 `resizable` 为真；Slint 会按窗口属性设置这一位
+                    // （`winitwindowadapter.rs:266` `attributes.resizable = resizable`）。
+                    // owner 实测「设置窗能缩、对话窗不能」——两者 `.slint` 里都有 `no-frame: true`，
+                    // 差别只能在这一位上，故这里**一律显式要求 true**（对设置窗无副作用）。
+                    .with_resizable(true)
             })
             .select()?;
     }
