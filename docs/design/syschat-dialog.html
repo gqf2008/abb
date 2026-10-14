@@ -60,7 +60,10 @@
   .acts{display:flex;gap:6px;margin:6px 0 0}
   .acts .a{height:22px;padding:0 8px;border:2px solid var(--edge);border-radius:6px;background:var(--bg);font-size:10.5px;font-weight:700;display:inline-flex;align-items:center;gap:4px;cursor:pointer}
   .acts .a:hover{background:var(--hover)}
-  .split{height:8px;background:var(--bg);border-top:2px solid var(--edge);border-bottom:2px solid var(--edge);cursor:ns-resize;display:flex;align-items:center;justify-content:center}
+  /* 分割把手：贴在内容区底边的一条 8px 热区，只有**一条** 2px 线 + 中间抓手，
+     拖动改内容区/输入区高度比例（不是窗口缩放，也不是输入框内部）。 */
+  .split{height:10px;background:var(--panel);border-top:2px solid var(--edge);cursor:ns-resize;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .split:hover{background:var(--hover)}
   .split i{width:38px;height:2px;background:var(--edge);border-radius:2px;display:block}
   .win{width:478px;background:var(--edge);border-radius:10px;padding:2px;box-shadow:0 10px 30px rgba(28,26,23,.25)}
   .win-body{background:var(--panel);border-radius:8px;overflow:hidden;display:flex;flex-direction:column;height:640px}
@@ -287,6 +290,10 @@
       </div>
     </div>
 
+    <!-- v11：**内容区 ↔ 输入区**之间的分割把手（不是窗口底边，也不是输入框内部）。
+         拖动改两区高度比例；上下各 2px 描边 + 中间一小段抓手。 -->
+    <div class="split" title="拖动调整内容区与输入区的高度"><i></i></div>
+
     <div class="composer-zone">
       <div class="composer">
         <div class="pending">
@@ -309,8 +316,6 @@
           <button class="send">发送</button>
         </div>
       </div>
-      <!-- v11：内容区与输入区之间可**拖拉改高度**（把手 8px，上下 2px 描边） -->
-      <div class="split"><i></i></div>
       <!-- v11：表情面板**贴着功能区按钮上方**弹出（此前飘太远）；「更多」同款 -->
       <div class="pop" style="right:12px;bottom:56px">
         <div class="e">😀</div><div class="e">😄</div><div class="e">😅</div><div class="e">🤣</div><div class="e">🙂</div><div class="e">😉</div><div class="e">😍</div><div class="e">🤔</div>
@@ -331,7 +336,7 @@
     <li><b>面板位置</b>：<code>表情</code> / <code>更多</code> 的面板必须**紧贴对应按钮上方**弹出（此前飘太远）；点外部或再点按钮收起。</li>
     <li><b>截屏</b>：<code>✂</code> 实现真正的截屏（选区/全窗）并作为附件送进对话（需 macOS 屏幕录制 TCC 权限，登记为独立卡）。</li>
     <li><b>上下文用量</b>：状态栏右侧显示 <code>已用/上限</code> + <b>百分比</b> + <b>进度条</b>（≥70% 橙 / ≥90% 红），悬停看精确值。</li>
-    <li><b>窗口与区域可拉升</b>：窗口**不是固定宽度**（默认 520、最小 340×380，可自由缩放）；<b>内容区与输入区之间可拖拉改高度</b>（上图 <code>.split</code> 把手，拖动即改两区比例，比例要记住）。</li>
+    <li><b>窗口与区域可拉升</b>：窗口**不是固定宽度**（默认 520、最小 340×380，可自由缩放）；<b>内容区 ↔ 输入区之间的分割条可拖拉</b>：拖动上图 `<code>.split</code>`（在 <code>.convo</code> 与 <code>.composer-zone</code> **之间**，不是窗口底边、也不是输入框内部）即改两区高度比例（各有上下限），比例要记住。</li>
     <li><b>消息动作</b>：内容区**可选中复制**；助手轮下方给 <code>⧉ 复制</code> / <code>⟳ 重新生成</code> / <code>🔊 朗读</code>。</li>
     <li><b>历史会话归档</b>：会话菜单里可 <code>🗄 归档</code>，归档后从列表隐藏、可在「已归档」找回（不删除数据）。</li>
     <li><b>新建会话去重</b>：当前会话为空时，再点「新建会话」**不得**再建一个空会话（复用当前空会话即可）。</li>
