@@ -76,7 +76,11 @@
   .menu .item .tick{margin-left:auto;font-weight:800}
   .menu .item .tag{margin-left:auto;font-size:10px;color:var(--dim)}
   .menu .foot{padding:6px 10px;font-size:10px;color:var(--dim);border-top:2px solid var(--edge);background:var(--bg)}
-  .status{height:26px;background:var(--bg);border-bottom:2px solid var(--edge);display:flex;align-items:center;gap:8px;padding:0 12px;font-size:11px;color:var(--dim)}
+  /* v7：状态栏**两行**（状态文案 + 模型 · 状态），右侧仍是 token 占用 */
+  .status{min-height:38px;background:var(--bg);border-bottom:2px solid var(--edge);display:flex;align-items:center;gap:8px;padding:4px 12px;font-size:11px;color:var(--dim)}
+  .st2{display:flex;flex-direction:column;gap:1px}
+  .st2 .l1{color:var(--ok,#0b8a3e)}
+  .st2 .l2{font-size:10px;color:var(--dim)}
   .status .grow{flex:1}
   .tok{white-space:nowrap}
   .tok b{color:var(--text);font-weight:700}
@@ -116,8 +120,11 @@
   .pfile .n{font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .more{height:52px;min-width:52px;border:2px dashed var(--edge);border-radius:6px;background:var(--hover);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;cursor:pointer}
   .prow{display:flex;gap:10px;align-items:stretch}
-  .stack{display:flex;flex-direction:column;gap:6px;flex:0 0 auto}
-  .ib{width:32px;height:32px;border:2px solid var(--edge);border-radius:7px;background:var(--panel);display:flex;align-items:center;justify-content:center;font-size:15px;cursor:pointer}
+  /* v7：图标列移到输入框**外面**（owner 口径），更小、贴底与发送按钮对齐 */
+  .composer-row{display:flex;gap:8px;align-items:stretch}
+  .stack{display:flex;flex-direction:column;gap:4px;flex:0 0 auto;justify-content:flex-end}
+  .sendrow{display:flex;align-items:flex-end;gap:8px;flex:0 0 auto}
+  .ib{width:24px;height:24px;border:2px solid var(--edge);border-radius:6px;background:var(--panel);display:flex;align-items:center;justify-content:center;font-size:12px;cursor:pointer}
   .ib:hover{background:var(--hover)}
   .ib:active{transform:translateY(1px)}
   .area{flex:1;min-height:66px;max-height:130px;font-size:13px;line-height:1.5;color:var(--dim);outline:none;padding:4px 2px}
@@ -218,7 +225,10 @@
       <button class="tb-btn danger">✕</button>
     </div>
     <div class="status" title="本会话累计 12,432 tokens；模型最大上下文 128,000">
-      <span>与怹直接对话（系统级 · 整机权限） · deepseek-chat · 新会话</span>
+      <div class="st2">
+        <div class="l1">与怹直接对话（系统级 · 整机权限）</div>
+        <div class="l2">deepseek-chat · 就绪</div>
+      </div>
       <span class="grow"></span>
       <span class="tok">上下文 <b>12.4K</b>/128K · <b>9.7%</b></span>
       <span class="meter"><i style="width:9.7%"></i></span>
@@ -257,6 +267,12 @@
     </div>
 
     <div class="composer-zone">
+     <div class="composer-row">
+      <!-- v7：图标列在输入框**外面**（owner）；只有 ＋ / 📎，24px -->
+      <div class="stack">
+        <div class="ib mark" data-m="4" title="新建会话（历史保留）">＋</div>
+        <div class="ib mark" data-m="5" title="选择文件（可多选）">📎</div>
+      </div>
       <div class="composer">
         <div class="pending">
           <div class="pthumb"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#f4ebd9"/><rect x="8" y="10" width="48" height="34" rx="3" fill="#fff" stroke="#1c1a17" stroke-width="3"/><path d="M8 36l14-12 10 9 8-7 16 14" fill="none" stroke="#2f6bfa" stroke-width="3"/></svg><span class="badge">IMG</span><span class="x">✕</span></div>
@@ -265,14 +281,15 @@
           <div class="more mark" data-m="6">+2</div>
         </div>
         <div class="prow">
-          <div class="stack">
-            <div class="ib mark" data-m="4" title="新建会话（历史保留）">＋</div>
-            <div class="ib mark" data-m="5" title="选择文件（可多选）">📎</div>
-          </div>
           <div class="area"><span>就按这三份素材做，说明放第二节…</span><span class="caret"></span></div>
-          <button class="send">发送</button>
+          <!-- v7：清空当前会话在**发送按钮右侧**（owner 口径） -->
+          <div class="sendrow">
+            <button class="send">发送</button>
+            <div class="ib mark" data-m="7" title="清空当前会话">🗑</div>
+          </div>
         </div>
       </div>
+     </div>
       <!-- 提示文案已按 owner 要求移除（不显示在界面上） -->
     </div>
    </div>
@@ -280,8 +297,17 @@
 </div>
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v6</h1>
-  <div class="sub">本轮新增：状态行显示 token 占用</div>
+  <h1>ABB 系统对话 · 设计稿 v7</h1>
+  <div class="sub">本轮：按 owner 真机复查收口布局（标题栏一行对齐 / 状态栏两行 / 图标列移到框外 / 清空在发送右侧）</div>
+  <div class="sub" style="color:var(--info)"><b>v7 相对 v6 的改动</b>（实现以本稿为准）</div>
+  <ol>
+    <li><b>标题栏一行对齐</b>：<code>新会话</code> / <code>模型</code> / <code>⚙</code> / <code>—</code> / <code>✕</code> <b>同一行、同高 26px、垂直居中</b>（v6 只画了位置、没钉高度）；窗口默认可缩放，最小 340×380。</li>
+    <li><b>状态栏两行</b>：第一行状态文案，第二行 <code>模型 · 状态</code>；右侧 token 占用（E3 批实现）。</li>
+    <li><b>图标列移到输入框外面</b>：<code>＋ 新建会话</code> / <code>📎 附件</code>，尺寸 32 → <b>24</b>，贴底与发送按钮对齐。</li>
+    <li><b>清空当前会话</b>：从顶部状态行搬到<b>发送按钮右侧</b>。</li>
+    <li><b>底部圆角</b>：输入区是最后一层，必须自己补底部两角 8px，否则把窗口圆角盖成直角。</li>
+    <li><b>分割线</b>：铺满输入区宽度即可——两端那 2px 是窗口黑描边本身（不许用负 margin 外扩：会触发 Slint 绑定循环）。</li>
+  </ol>
   <ol>
     <li><b>气泡点击反馈</b>：常态 / 悬停放大 1.06 / <b>按下缩到 0.9 + 墨黑描边</b>（上方可亲手点）；单击＝开/收对话框，按住拖＝移动。</li>
     <li><b>窗口跟随气泡</b>：对话框<b>锚定在气泡旁（间距 10px）</b>，拖动气泡窗口一起移动；气泡靠屏边时窗口自动翻到另一侧，保证不出屏。</li>
