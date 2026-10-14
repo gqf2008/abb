@@ -42,8 +42,10 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 //   而受限（授权者）会话的 guard 对 `>`/`<`/`|`/换行一律拒绝（`split_shell` 的硬拒绝表），
 //   照抄那段在受限会话里 100% 失败；改为「用写文件工具写 spec + 两条单行命令」。
 // v16：`mark` 速查补上 errorbar 要 `y2`、text 要 `text` 两条硬约束（缺了会报错）。
+// v17：手动档 worker 默认 1 → 4（`TaskWorkers::default()`；keepalive 常驻会永久占住一条
+//   worker ⇒ 默认 1 时 `now` 子代理排不上），指引里那行默认值随之更正。
 // 内容变了就必须升版本号：存量工作区的指引不会被覆盖（幂等判据是「不含当前 marker」）。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v16";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v17";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -1064,6 +1066,31 @@ mod tests {
         assert_eq!(before, (m("CLAUDE.md"), m("AGENTS.md")));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 指引里写的 `task_workers` 默认值必须与代码默认值同源（`TaskWorkers::default()`）：
+    /// 两边各写一份数字，改了一边忘另一边就是「工作区里写着错的默认值」。判别力：把
+    /// `default_task_workers_manual` 改回 1（不动指引文本）⇒ 本断言红。
+    #[test]
+    fn workspace_guide_task_worker_defaults_match_config() {
+        let dir = std::env::temp_dir().join(format!("abb-guide-tw-{}", uuid::Uuid::new_v4()));
+        ensure_workspace_guide(&dir);
+        let d = crate::config::TaskWorkers::default();
+        let schedule = d.for_channel(crate::task_run::Channel::Schedule);
+        let manual = d.for_channel(crate::task_run::Channel::Manual);
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            for needle in [
+                format!("\"schedule\":{schedule}"),
+                format!("\"manual\":{manual}"),
+            ] {
+                assert!(
+                    text.contains(&needle),
+                    "{name} 里的「{needle}」与 TaskWorkers::default() 不一致"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #312 验收①：指引里的 CLI 与 `"$ABB_BIN" task --help` **逐字一致**——靠
