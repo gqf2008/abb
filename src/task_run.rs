@@ -32,8 +32,10 @@
 //!
 //! Q7 的容量方案落地成**两条通道**（[`Channel`]）：定时档（`once`/`cron`/`interval`）与
 //! 手动档（`now`/`keepalive`）；每条通道按 `Config::task_workers` 起 N 个 worker
-//! （默认 schedule 2 / manual 4，0 按 1 兜底），通道内排队、跨通道互不阻塞，同一条任务
-//! 永不自我重叠（认领是单锁 check-and-set）。
+//! （默认 schedule 2 / manual **不节流**——手动档里常驻的 keepalive 会永久占住 slot，
+//! 任何固定的小默认值都可能把任务排成「永远不跑」，见 `Config::task_workers` 的文档；
+//! 0 按 1 兜底），通道内排队、跨通道互不阻塞，同一条任务永不自我重叠（认领是单锁
+//! check-and-set）。
 //! 拆的理由是：`now` 的后台子代理与 keepalive 常驻进程都是长任务，共用一条队列时
 //! 定时触发会被饿死（cron 落在被占用分钟点上的那次会整次消失）。两条通道共享同一对
 //! store/state 实例，认领走 [`claim_if_due`] 的单锁 check-and-set（多线程 runtime 下
@@ -207,7 +209,7 @@ pub fn worker_specs(cfg: &crate::config::Config, bot_key: &str) -> Vec<(String, 
 
 /// 一条通道的 worker：`channel` 决定它认领哪一档触发，`worker_index` 是它在同通道内的序号。
 ///
-/// 同一通道可以有多个 worker（`Config::task_workers`，默认 Schedule 2 / Manual 4）：它们
+/// 同一通道可以有多个 worker（`Config::task_workers`，默认 Schedule 2 / Manual 不节流）：它们
 /// 共享同一对 store/states，认领是单锁 check-and-set，所以**同一条任务不会双跑**；多出来的
 /// 并发只让**不同任务**能在同一档同时执行。
 pub async fn task_worker(
@@ -2226,7 +2228,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 接线层（service 起几个 worker）的单测：默认 schedule 2 + manual 4，顺序与命名稳定；
+    /// 接线层（service 起几个 worker）的单测：默认 schedule 2 + manual 不节流，顺序与命名稳定；
     /// 配置成 1/0/超大值时的行为也在这里锁住（评审 D4）。
     #[test]
     fn worker_specs_follow_config() {
@@ -2236,17 +2238,23 @@ mod tests {
             .iter()
             .map(|(name, w)| (name.clone(), w.channel, w.index))
             .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("task:schedule:0:b".to_string(), Channel::Schedule, 0),
-                ("task:schedule:1:b".to_string(), Channel::Schedule, 1),
-                ("task:manual:0:b".to_string(), Channel::Manual, 0),
-                ("task:manual:1:b".to_string(), Channel::Manual, 1),
-                ("task:manual:2:b".to_string(), Channel::Manual, 2),
-                ("task:manual:3:b".to_string(), Channel::Manual, 3),
-            ],
-            "默认：定时档 2 条并行、手动档 4 条"
+        // 期望值从配置默认值推出来（不写死条数）：默认值变（例如手动档 4 → 不节流）时
+        // 这条断言测的仍是「顺序 + 命名」，而不是又一次手抄数字。
+        let defaults = crate::config::TaskWorkers::default();
+        let expect_named = |channel: Channel, n: usize| {
+            (0..n)
+                .map(move |i| (format!("task:{}:{i}:{bot}", channel.label()), channel, i))
+                .collect::<Vec<_>>()
+        };
+        let mut expected = expect_named(Channel::Schedule, defaults.for_channel(Channel::Schedule));
+        expected.extend(expect_named(
+            Channel::Manual,
+            defaults.for_channel(Channel::Manual),
+        ));
+        assert_eq!(got, expected, "顺序：定时档 0..N 再手动档 0..M，命名稳定");
+        assert!(
+            got.iter().filter(|(_, c, _)| *c == Channel::Manual).count() > 1,
+            "手动档默认不止 1 条（常驻 keepalive 会占住 slot，1 条会把 now 饿死）"
         );
 
         let mut cfg = crate::config::Config::default();
@@ -2678,7 +2686,7 @@ mod tests {
         );
 
         // —— 手动档 **1 号** worker：与调度档一样不得做维护动作 ——
-        // 通道可配多 worker（默认 schedule 2 / manual 4，可调大），所以判据必须带序号：
+        // 通道可配多 worker（默认 schedule 2 / manual 不节流），所以判据必须带序号：
         // 手动档的维护动作只归 0 号，1 号只是个普通认领者。
         run_channel_once(
             &root,

@@ -404,7 +404,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 > - **定时档（`Schedule`）**：`once` / `cron` / `interval`；
 > - **手动档（`Manual`）**：`now`（后台子代理）与 `keepalive`（常驻进程天然是长任务，与 now 同档）。
 >
-> 每条通道按 `Config::task_workers` 起 **N 个 worker**（默认 schedule 2 / manual 4），
+> 每条通道按 `Config::task_workers` 起 **N 个 worker**（默认 schedule 2 / manual 不节流），
 > **通道内**超限排队（Q7 的「排队、不拒绝」按通道成立）、**跨通道互不阻塞**：now 档的长任务
 > 不再饿死定时档，反之亦然；同一条任务**永不自我重叠**（认领是单锁 check-and-set）。
 > 三条实现约束：
@@ -417,7 +417,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 >    整表级动作（`Channel::owns_housekeeping`），否则会被做两遍。
 >
 > **同通道多 worker（2026-09-26 同批接线，Q7 的「上限可配」）**：`config.json#task_workers`
-> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":4}`；每通道 1–128，0 按 1 兜底、
+> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":128}`；每通道 1–128，0 按 1 兜底、
 > 超过上限按 `MAX_TASK_WORKERS_PER_CHANNEL` 截断并在日志告警）。要点：
 > - 同一通道的多个 worker **共享同一对 store/states**，认领是单锁 check-and-set →
 >   **同一条任务不会双跑**；多出来的并发只让**不同任务**能同档同时执行（定时档默认 2 条：
@@ -429,7 +429,15 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 >   想回到「每通道 1 条」把 `task_workers` 写成 `{"schedule":1,"manual":1}` 即可（与拆通道前
 >   的两通道行为逐条等价）——**但手动档 ≤1 时有 keepalive 就必然饿死 `now`**：常驻进程认领
 >   worker 后一直不还（`run_one` 的 keepalive 分支 await 到进程退出），此时 `now` 子代理永远
->   排不上。要串行又要留 `now` 的位置，手动档至少给 2（默认 4 就是这个余量）。
+>   排不上。要串行又要留 `now` 的位置，手动档至少给 2。
+>
+> **手动档默认值不再节流（2026-10-15，同日第二次放宽：1 → 4 → 上限）**：手动档的
+> 「保守默认」本身就是缺陷——`keepalive` 常驻、认领它的 worker 永不还位，所以**任何小于
+> 「常驻任务条数」的默认值**都会把多出来的常驻任务与 `now` 子代理静默排成「已登记但永远
+> 不跑」（4 相对「本机常态 100 条手动任务」也只是个挡板）。而「该起几条」只有配置的人知道，
+> 代码猜不出来 ⇒ 手动档默认 = 每通道上限（`128`），**默认什么都不挡**，要节流请显式写
+> `{"manual":N}`；上限继续挡住手滑写出的天文数字。代价如实列：并发高时同时跑的真模型回合
+> 变多（token 成本上升），且空闲 worker 的空转开销 ≈ `worker 数 × 任务条数` 次 stat/2s。
 
 > **agent 载荷不开放 `keepalive`**（2026-09-24 决议；`src/task_store.rs::validate` 拒绝，
 > `task add --keepalive --prompt …` CLI 非 0 退出）。
@@ -486,7 +494,7 @@ interval 必须合法且 ≥5 秒——否则当场拒绝，不留「永远不�
 | # | 问题 | 结论 |
 |---|---|---|
 | Q1 | CLI 命名 | **`abb task`**；`job` 保留为兼容别名；内部 `src/tasks.rs` → `src/svc_tasks.rs` 让出命名 |
-| Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）。**2026-09-26 修订：每 bot 两条执行通道**——定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`），**通道内**超限排队（同档可配 N 个 worker 并发跑**不同**任务）、**跨通道互不阻塞**（否则 now 档的长任务会把定时触发饿死）；**同通道 worker 数可配**（`config.json#task_workers`，默认 `schedule: 2 / manual: 4`，0 按 1 兜底）——定时档默认并行 2 条，到点即执行；**同一条任务永不自我重叠**（认领是单锁 check-and-set），并发只作用于**不同**任务；**2026-10-15 修订：手动档默认 1 → 4**（`keepalive` 常驻会永久占住一条 worker，默认 ≤1 时「有常驻 keepalive 就跑不了 `now` 子代理」） |
+| Q7 | **执行容量**：每 bot 几个 task worker？task 与聊天谁优先？超限排队还是拒绝？ | **B1：task 用独立 handle/pool**（不与聊天共用单 slot）→ task 与聊天互不阻塞。B2（harness 多 slot）暂不做，留作后续扩容路径。**超限排队**（不拒绝）。**2026-09-26 修订：每 bot 两条执行通道**——定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`），**通道内**超限排队（同档可配 N 个 worker 并发跑**不同**任务）、**跨通道互不阻塞**（否则 now 档的长任务会把定时触发饿死）；**同通道 worker 数可配**（`config.json#task_workers`，默认 `schedule: 2 / manual: 不节流（= 上限 128）`，0 按 1 兜底）——定时档默认并行 2 条，到点即执行；**同一条任务永不自我重叠**（认领是单锁 check-and-set），并发只作用于**不同**任务；**2026-10-15 修订：手动档默认 1 → 4 → 上限（不节流）**（`keepalive` 常驻会永久占住一条 worker；任何固定的「保守默认」都会把多出来的常驻任务与 `now` 子代理静默排成「已登记但永远不跑」，而「该起几条」只有配置的人知道 ⇒ 手动档默认改成每通道上限 128，要节流请显式写 `{"manual":N}`） |
 | Q8 | **`proc` 权限边界**：owner-only？还是允许 granted 在 OS sandbox 内？ | **禁止 agent 创建 `proc`**（只允许 GUI / 人类入口）；受限会话完全不进白名单。真实 ACP shell 由 buzz-agent 注入 `ABB_AGENT_CONTEXT=1` 作为 CLI 主判据，旧 Claude hook 的 owner guard 仅作纵深。⚠️ owner FullAccess agent 仍可清除环境或直接改 `tasks.json`，因此这是纵深防御/合规闸，不是安全边界（见 D5） |
 | Q9 | **「自己创建的」身份粒度** | **owner-only 管理**，不引入 capability token；后续确有跨用户需求再议 |
 

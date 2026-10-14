@@ -684,7 +684,7 @@ pub async fn run() {
         let router = router.clone();
         // 任务执行 worker（#326 P2b / #306 / Q7「上限可配」）：每 bot **两条通道**——定时档
         // （once/cron/interval）与手动档（now/keepalive）；每条通道按 `Config::task_workers`
-        // 起 N 个 worker（默认 schedule 2 / manual 4，0 按 1 兜底）。同通道内超限排队（Q7 的
+        // 起 N 个 worker（默认 schedule 2 / manual 不节流，0 按 1 兜底）。同通道内超限排队（Q7 的
         // 「排队、不拒绝」），跨通道互不阻塞（否则 now 档的长任务会把定时触发饿死）；
         // 同一条任务**永不自我重叠**（认领是单锁 check-and-set），并发只作用于不同任务。
         // 执行层是 `runtime::oneshot`（自起 handle）——Q7 拍板的 B1「task 独立 handle」，

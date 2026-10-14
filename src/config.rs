@@ -895,14 +895,21 @@ impl JevConfig {
 ///
 /// - `schedule`（`once`/`cron`/`interval`）默认 **2**：定时任务到点即执行，不再因为同档
 ///   另一条长任务而排队（同一条任务**不会**自我重叠——认领是单锁 check-and-set）。
-/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）默认 **4**：手动档里的 `keepalive` 是
-///   **常驻**进程，认领它的 worker 会一直 `await` 到进程退出（`run_one` 的 keepalive 分支），
-///   所以「默认 1」等于「有一个常驻 keepalive 时，所有 `now` 子代理永远排不上」——这是默认
-///   配置下的实缺陷，不是一个保守但安全的取舍（2026-10-15 由 1 放宽到 4：容得下常驻的
-///   标称占用，再留几条并行 `now`）。
+///   这条排队是**暂时**的：定时任务跑完就还位，所以 2 是「不互相挤兑」的容量取舍，不是节流。
+/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）默认**不节流**（当前 = 每通道上限，
+///   见 [`DEFAULT_TASK_WORKERS_MANUAL`]）：手动档里的 `keepalive` 是**常驻**进程，认领它的
+///   worker 会一直 `await` 到进程退出（`run_one` 的 keepalive 分支），**永不还位**——于是
+///   任何小于「常驻任务条数」的默认值都等于「多出来的常驻任务永远不启动，`now` 还要跟常驻
+///   抢那几条」。而「该起几条」只有配置的人知道，代码猜不出来，所以默认值不再猜：
+///   **默认什么都不挡**，要节流请显式写 `{"manual":N}`。
+///   取值演进：1（接线时）→ 4（2026-10-15 首次放宽：容得下常驻的标称占用再留几条 `now`）
+///   → 上限值（2026-10-15 同日再次放宽：手动档的「保守值」本身就是缺陷——静默排队等于
+///   用户以为在跑、实际永远不跑，且 4 对「跑 100 条手动任务」的实际负载仍然是个挡板）。
 /// - 0 按 1 兜底（写 0 不会把通道关掉）。
-/// - 调大的代价：同 bot 同时跑的真模型回合变多（token 成本随并发上升），且并发任务在
-///   未显式指定 `workspace` 时**共用同一个 bot 工作区**（旧 job 循环时代就承认的风险）。
+/// - 调大（含「默认就不节流」）的代价，如实列：
+///   - 同 bot 同时跑的真模型回合变多（token 成本随并发上升；天文数字仍由 [`MAX_TASK_WORKERS_PER_CHANNEL`] 兜住）；
+///   - **空闲** worker 不是零成本：每个 worker 每 `POLL_INTERVAL` 轮询一次（定义表按 mtime 缓存，但每条任务一次取消请求文件的存在性检查），空转开销约 `O(worker 数 × 任务条数)` 次 stat/2s——这是「默认不节流」的实价；
+///   - 未显式指定 `workspace` 的并发任务**共用同一个 bot 工作区**（旧 job 循环时代就承认的风险）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskWorkers {
     #[serde(default = "default_task_workers_schedule")]
@@ -918,7 +925,19 @@ pub struct TaskWorkers {
 /// abb-agent 进程同时跑 100 条手动任务是常态，而写在 `config.json` 里的 100 会被
 /// 截断成 8（虽有告警，但配置表达不出意图）。上限的本意是挡住手滑写出的天文数字，
 /// 128 仍然守住这个用途。
+///
+/// 同日手动档**默认值**也提到这个上限（见 [`DEFAULT_TASK_WORKERS_MANUAL`]）：默认不节流。
+/// 两者是**有意相等**的（默认不该挡任何东西），但值各写一份、由
+/// `task_workers_defaults_floor_and_partial_json` 钉住相等——再动上限而没重新掂量默认值 ⇒ 红。
 pub const MAX_TASK_WORKERS_PER_CHANNEL: usize = 128;
+
+/// 手动档（`now`/`keepalive`）worker 的**默认**条数：等于当时的每通道上限，即**默认不节流**。
+///
+/// 写死数字而**不是**引用 [`MAX_TASK_WORKERS_PER_CHANNEL`]：这两个值有意相等，但「相等」本身
+/// 才是要被守卫钉住的判断（`task_workers_defaults_floor_and_partial_json` 断言 `default == MAX`）。
+/// 若让默认值直接引用上限，改上限会**静默**改掉默认节流档位（例如上限 128→512 时默认起 512 个
+/// 轮询任务），没有任何一步会提醒你重新掂量——那是本文件最不想要的那种漂移。
+pub const DEFAULT_TASK_WORKERS_MANUAL: usize = 128;
 
 impl TaskWorkers {
     /// 该通道生效的 worker 数：0 → 1 兜底；超过 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警。
@@ -952,7 +971,8 @@ fn default_task_workers_schedule() -> usize {
 }
 
 fn default_task_workers_manual() -> usize {
-    4
+    // 默认不节流（理由见 `TaskWorkers` / `DEFAULT_TASK_WORKERS_MANUAL`）。
+    DEFAULT_TASK_WORKERS_MANUAL
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1980,8 +2000,8 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual 4，0 按 1 兜底，
-    /// 且老的 config.json（缺字段 / 只给一半）都能正常解析。
+    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual = 每通道上限（**不节流**），
+    /// 0 按 1 兜底，且老的 config.json（缺字段 / 只给一半）都能正常解析。
     #[test]
     fn task_workers_defaults_floor_and_partial_json() {
         let d = TaskWorkers::default();
@@ -1990,14 +2010,25 @@ mod tests {
             2,
             "定时档默认并行 2：到点即执行，不再被同档长任务排队"
         );
-        // 手动档默认 2026-10-15 由 1 放宽到 4。判据不是「想要更多并发」，而是 1 在默认配置
-        // 下就**错**：keepalive 是常驻进程，认领它的 worker 会一直 await 到进程退出
-        // （`run_one` 的 keepalive 分支），手动档 ≤1 就等于「有一个常驻 keepalive 时，所有
-        // now 子代理永远排不上」。4 = 容得下常驻的标称占用再留几条并行 now。
+        // 手动档默认 = 每通道上限（2026-10-15：1 → 4 → 上限，理由见 `TaskWorkers` 文档）。
+        // 判据不是「想要更多并发」，而是任何**固定的**小默认值在默认配置下都可能**错**：
+        // keepalive 是常驻进程，认领它的 worker 一直 await 到进程退出（`run_one` 的
+        // keepalive 分支），永不还位 ⇒ 默认值低于「常驻任务条数」时，多出来的常驻任务
+        // 与 `now` 子代理都只会排队排到天荒地老（用户看到的是「已登记」而不是「排不上」）。
+        // 这条断言同时把「默认 = 上限」钉住：改上限而没重新掂量默认值 ⇒ 红。
         assert_eq!(
             d.for_channel(crate::task_run::Channel::Manual),
-            4,
-            "手动档（now/keepalive）默认 4 条（2026-10-15 由 1 放宽）"
+            MAX_TASK_WORKERS_PER_CHANNEL,
+            "手动档（now/keepalive）默认不节流 = 每通道上限"
+        );
+        assert_eq!(
+            d.manual, DEFAULT_TASK_WORKERS_MANUAL,
+            "默认值本身就是「不节流」档（不是靠 clamp 兜的）——它会被序列化进 config.json"
+        );
+        assert_eq!(
+            DEFAULT_TASK_WORKERS_MANUAL, MAX_TASK_WORKERS_PER_CHANNEL,
+            "默认 = 每通道上限（默认不节流）：两个常量各写一份，就是为了让「再动上限」红一次，\
+             逼你重新掂量默认值（而不是让默认值跟着上限静默漂移）"
         );
 
         let zero = TaskWorkers {
@@ -2052,8 +2083,8 @@ mod tests {
         assert_eq!(
             cfg.task_workers
                 .for_channel(crate::task_run::Channel::Manual),
-            4,
-            "空 JSON（老 config.json）也走新默认"
+            MAX_TASK_WORKERS_PER_CHANNEL,
+            "空 JSON（老 config.json）也走新默认（= 不节流）"
         );
 
         // 只给一半 → 另一半走默认（serde 字段级 default）

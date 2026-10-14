@@ -44,8 +44,10 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 // v16：`mark` 速查补上 errorbar 要 `y2`、text 要 `text` 两条硬约束（缺了会报错）。
 // v17：手动档 worker 默认 1 → 4（`TaskWorkers::default()`；keepalive 常驻会永久占住一条
 //   worker ⇒ 默认 1 时 `now` 子代理排不上），指引里那行默认值随之更正。
+// v18：手动档 worker 默认 4 → **不节流**（= 每通道上限，见 `config::TaskWorkers`）。同一处
+//   再改一次 ⇒ 那行默认值**不再手抄**，改为从 `TaskWorkers::default()` 插值（守卫测试留着当回归网）。
 // 内容变了就必须升版本号：存量工作区的指引不会被覆盖（幂等判据是「不含当前 marker」）。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v17";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v18";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -63,6 +65,11 @@ pub(crate) fn ensure_workspace_guide(workspace: &std::path::Path) {
     let _ = std::fs::create_dir_all(workspace);
     // `task_help` 直接内嵌 CLI 的单一真源（`crate::TASK_CLI_HELP`）——#312 的验收要求
     // 「指引里的 CLI 与 `task --help` 逐字一致」，靠内嵌而不是手抄来保证。
+    // 同一手法用在并发默认值上：`tw_schedule` / `tw_manual` 取自 `TaskWorkers::default()`，
+    // 指引里的数字随代码默认值走（v17 之前是手抄的字面量，改了一边忘另一边就会明说错数）。
+    let default_workers = crate::config::TaskWorkers::default();
+    let tw_schedule = default_workers.for_channel(crate::task_run::Channel::Schedule);
+    let tw_manual = default_workers.for_channel(crate::task_run::Channel::Manual);
     let guide = format!(
         "# ABB 工作区（{GUIDE_MARKER}）
 
@@ -128,7 +135,7 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
 - 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
   用户可以继续聊别的。
-- **同一通道默认并行 N 条**（`config.json#task_workers`，默认 `{{\"schedule\":2,\"manual\":4}}`，0 按 1 兜底）：
+- **同一通道默认并行 N 条**（`config.json#task_workers`，默认 `{{\"schedule\":{tw_schedule},\"manual\":{tw_manual}}}`，0 按 1 兜底）：
   定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`）各有自己的队列，跨通道互不阻塞；
   **同一条任务永远不会自我重叠**（认领是单锁 check-and-set，跑到一半不会被再拉起）。
   并发额度有限：一次丢十条仍只会按该档的 worker 数排队，超出就排队——它不是不限量的池子。
@@ -1069,9 +1076,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 指引里写的 `task_workers` 默认值必须与代码默认值同源（`TaskWorkers::default()`）：
-    /// 两边各写一份数字，改了一边忘另一边就是「工作区里写着错的默认值」。判别力：把
-    /// `default_task_workers_manual` 改回 1（不动指引文本）⇒ 本断言红。
+    /// 指引里写的 `task_workers` 默认值必须与代码默认值同源（`TaskWorkers::default()`）。
+    /// v18 起指引那行是**插值**的（不是手抄字面量），本断言从「防漂移」退化成「锁住插值
+    /// 没被退回手抄」的回归网：把 `default_task_workers_manual` 改成别的值，指引文本若不再
+    /// 跟着变（例如有人把它硬写回数字）⇒ 本断言红。
     #[test]
     fn workspace_guide_task_worker_defaults_match_config() {
         let dir = std::env::temp_dir().join(format!("abb-guide-tw-{}", uuid::Uuid::new_v4()));
@@ -1124,7 +1132,7 @@ mod tests {
     /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺。
     /// 2026-09-26 两批修订后的真实口径：每个 bot 两条通道（定时档 once/cron/interval、
     /// 手动档 now/keepalive），**同通道默认并行 N 条**（`task_workers`，默认 schedule 2 /
-    /// manual 4）、跨通道互不阻塞、**同一条任务永远不自我重叠**；并发额度有限，不得写成
+    /// manual 不节流）、跨通道互不阻塞、**同一条任务永远不自我重叠**；并发额度有限，不得写成
     /// 「无限并发」。`--proc` 虽写入 CLI 帮助，但须明确标注 agent 侧拒绝。
     #[test]
     fn workspace_guide_does_not_overpromise_task_semantics() {
