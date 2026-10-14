@@ -1,7 +1,7 @@
 # 系统级对话（syschat）交接文档
 
 > 面向**下一个接手的人**（或新会话）。目标：读完这一份就能继续干，不用重新踩坑。
-> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-v11-screenshot` 更新 §0/§5.2/§6/§7.3**（✂ 截屏落地）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）；**同日随卡 `abb-settings-window-resize-macos-20261015` 更新 §0/§5.1/§5.2/§6/§7.3**（设置窗在 macOS 也能缩放；顺带修掉「设置窗/弹窗里的 `ImageIcon` 图标**画不出来**」——组件根 `Image` 缺整图裁剪，见 §6）。**2026-10-15 05:44 批量安装**（owner 同意的口径：每做完 2–3 条，批量跑门禁 + 打包安装一次）：`/Applications/ABB.app` 已换成 `main = 2571240` 的 release 构建（marker `abb-guide-v20`），旧 bundle 备份在 `/Volumes/DataExt/tmp/ABB.app.prev-20261015-054438`；四条门禁在**整棵树**上跑过（fmt / clippy 对基线零新增 / `build --locked` / 隔离全量 lib 2 + bin 1272 + 集成 19），**没有独立评审**（本 worktree 只有一个身份，且 owner 已把仪式降档）——照实记在这里，别当成「审过了」。**同日 05:53 再装一次**（思考分片投影落 `main = 525a8d9`）：`/Applications/ABB.app` 换成该 head 的 release 构建（主二进制 `Contents/MacOS/abb-agent` 从此含 `agent_thought_chunk`；旧 bundle 备份 `/Volumes/DataExt/tmp/ABB.app.prev-20261015-055344`），启动日志 harness 装配走新 `abb-agent`、bot 庆小丰 在线、`manual=按需派发（并发闸门：不节流）`。**同日 06:01 第三次装机**（插入 steer 落 `main = 0dce2b6`）：`/Applications/ABB.app` 又换一次 release 构建（主二进制 `abb-agent` 从此含 `_session/steering`；旧 bundle 备份 `/Volumes/DataExt/tmp/ABB.app.prev-20261015-060642`），启动日志 harness 走新 `abb-agent`、bot 庆小丰 在线。⇒ **§5.2 的功能清单至此全部落地**（剩下都是 owner 真机复验 + 两张跟进卡）。**同日再一批（2026-10-15）**：两张跟进卡的非阻塞项逐条处置（表内 HTML 不再转义、`styled` 只对行内 markdown 块算、⌘V 拦截不看 `busy`、拖放去重补真判据、`~` 口径与 winit 拖放边界如实记录），**已落 main（1d26dcf）并重装 bundle**（表内文本与 📎 tooltip 是用户可见改动）：06:24 装机，/Applications/ABB.app = 1d26dcf 的 release 构建（装机核过新 tooltip 串在二进制里），旧 bundle 备份 /Volumes/DataExt/tmp/ABB.app.prev-20261015-062423，启动日志 harness 装配走新 abb-agent、bot 庆小丰 在线；四条门禁全绿 + 8 处变异自验；**三处 owner 待拍**（`~a~` 是否 GFM 严格 / 关窗是否清待发附件 / 多文件拖入的状态行计数）见 §5.2 与 §6。**同日深夜再一轮（main = ea0429a）**：①角色块「是不是助手」改成显式字段 `role-assistant`（不再按角色名文案判，见 §6），**无用户可见变化 ⇒ 未重装 bundle**；②卡 `abb-syschat-e2-thought-20261013`（E2 思考/正文分离）**审计后 closed**：六条验收 4 ✅ + 2 ◐（块序列不保留「思考→正文→思考」交替、标题文案与稿不同，见 §6）；③卡 `abb-gates-sh-locale-unbound-var-20261012`（`tools/gates.sh` 在 UTF-8 locale 下 `set -u` 失败）**实核为已修（f88a606）后 closed**，并补了机制阳性对照（UTF-8 下 bash 3.2.57 报 unbound variable / exit 127；`LC_ALL=C` 反而 exit 0 —— 按 C locale 复核会漏）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
+> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-v11-screenshot` 更新 §0/§5.2/§6/§7.3**（✂ 截屏落地）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）；**同日随卡 `abb-settings-window-resize-macos-20261015` 更新 §0/§5.1/§5.2/§6/§7.3**（设置窗在 macOS 也能缩放；顺带修掉「设置窗/弹窗里的 `ImageIcon` 图标**画不出来**」——组件根 `Image` 缺整图裁剪，见 §6）。**2026-10-15 05:44 批量安装**（owner 同意的口径：每做完 2–3 条，批量跑门禁 + 打包安装一次）：`/Applications/ABB.app` 已换成 `main = 2571240` 的 release 构建（marker `abb-guide-v20`），旧 bundle 备份在 `/Volumes/DataExt/tmp/ABB.app.prev-20261015-054438`；四条门禁在**整棵树**上跑过（fmt / clippy 对基线零新增 / `build --locked` / 隔离全量 lib 2 + bin 1272 + 集成 19），**没有独立评审**（本 worktree 只有一个身份，且 owner 已把仪式降档）——照实记在这里，别当成「审过了」。**同日 05:53 再装一次**（思考分片投影落 `main = 525a8d9`）：`/Applications/ABB.app` 换成该 head 的 release 构建（主二进制 `Contents/MacOS/abb-agent` 从此含 `agent_thought_chunk`；旧 bundle 备份 `/Volumes/DataExt/tmp/ABB.app.prev-20261015-055344`），启动日志 harness 装配走新 `abb-agent`、bot 庆小丰 在线、`manual=按需派发（并发闸门：不节流）`。**同日 06:01 第三次装机**（插入 steer 落 `main = 0dce2b6`）：`/Applications/ABB.app` 又换一次 release 构建（主二进制 `abb-agent` 从此含 `_session/steering`；旧 bundle 备份 `/Volumes/DataExt/tmp/ABB.app.prev-20261015-060642`），启动日志 harness 走新 `abb-agent`、bot 庆小丰 在线。⇒ **§5.2 的功能清单至此全部落地**（剩下都是 owner 真机复验 + 两张跟进卡）。**同日再一批（2026-10-15）**：两张跟进卡的非阻塞项逐条处置（表内 HTML 不再转义、`styled` 只对行内 markdown 块算、⌘V 拦截不看 `busy`、拖放去重补真判据、`~` 口径与 winit 拖放边界如实记录），**已落 main（1d26dcf）并重装 bundle**（表内文本与 📎 tooltip 是用户可见改动）：06:24 装机，/Applications/ABB.app = 1d26dcf 的 release 构建（装机核过新 tooltip 串在二进制里），旧 bundle 备份 /Volumes/DataExt/tmp/ABB.app.prev-20261015-062423，启动日志 harness 装配走新 abb-agent、bot 庆小丰 在线；四条门禁全绿 + 8 处变异自验；**三处 owner 待拍**（`~a~` 是否 GFM 严格 / 关窗是否清待发附件 / 多文件拖入的状态行计数）见 §5.2 与 §6。**同日深夜再一轮（main = ea0429a）**：①角色块「是不是助手」改成显式字段 `role-assistant`（不再按角色名文案判，见 §6），**无用户可见变化 ⇒ 未重装 bundle**；②卡 `abb-syschat-e2-thought-20261013`（E2 思考/正文分离）**审计后 closed**：六条验收 4 ✅ + 2 ◐（块序列不保留「思考→正文→思考」交替、标题文案与稿不同，见 §6）；③卡 `abb-gates-sh-locale-unbound-var-20261012`（`tools/gates.sh` 在 UTF-8 locale 下 `set -u` 失败）**实核为已修（f88a606）后 closed**，并补了机制阳性对照（UTF-8 下 bash 3.2.57 报 unbound variable / exit 127；`LC_ALL=C` 反而 exit 0 —— 按 C locale 复核会漏）。**同日第 3 轮（文档自审，main = 4a91f81 + 本次）**：逐条核了本文里的提交号（30 个全在）、`file:line` 引用、被点名的文件（15 个全在）与 41 个下划线标识符；查出并修掉两类**文档自身的坑**：①`src/ui.rs:8126` 这类**行号引用会随提交漂移**（该处真实行号已到 `:8139`，`:8134@2dfef7a`）⇒ §2 新增「引用用字面量/符号，不用行号」一条；②「`verify-isresizable.png` 已失效」是**查错路径**（截图在数据卷 `/Volumes/DataExt/tmp/syschat-shots/`，`/private/tmp` 只放探针日志）⇒ §5.1 逐字纠偏。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
 
 ---
 
@@ -35,13 +35,33 @@ grep -a '\[verify\]\|\[selfresize\]' /tmp/verify.log       # 窗口底层事实�
 swift /tmp/winid.swift | awk -F'\t' '$2=="ABB"'            # 列出 ABB 窗口（拿 window id）
 screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不需要辅助功能权限）
 ```
+**当前 head 的实测读数**（06:47，debug，**锁屏下也能跑**；留档 `/private/tmp/verify-head-0646.log` 6 行）：
+`pre-show` 与 `t=400ms` 都是 `winit=None`（后者已 `slint_size=520×560` ⇒ Slint 侧建好了、原生窗还没 realize）⇒
+`t=800ms…2000ms` 稳定为 `winit=Some is_resizable=true is_decorated=false inner=1040×1120 hit_areas=true self_managed=true`；
+同期 `CGWindowListCopyWindowInfo` 报 `(475,124,520,560)`（逻辑点 = inner 的一半，2× 缩放）
+⇒ **「窗口建起来了、热区开着」这条不需要解锁**；要解锁的只有「拖它 / 点它」。
 
 - `ABB_VERIFY_OPEN=1`：**直接打开对话窗**并打印窗口事实。**必须配隔离 HOME**（否则会触发 `platform::heal_autostart()` 改写用户真实 `~/Library/LaunchAgents/`）。
   探针按 **400ms 一档打 5 拍**，并**显式区分** `winit=None`（还没 realize）与 `Some{is_resizable,…}`：`t=400ms` 常是 `None`（`show()` 不同步建窗），`t=800ms` 才有原生窗事实——**别把 `None` 读成 `is_resizable=false`**（§5.1 的坑）。
-- ⚠️ **锁屏时合成点击打不进 app**：`CGSSessionScreenIsLocked=1` 时 `CGEvent` 落在 `loginwindow`，`ABB 系统对话` 收不到按下（拖拽/缩放/点按钮类验证必须先解锁）。查锁屏态：`swift /Volumes/DataExt/tmp/abb-verify/session.swift`。
+- ⚠️ **锁屏时合成点击打不进 app**（拖拽/缩放/点按钮类验证必须先解锁）。查锁屏态：`swift /Volumes/DataExt/tmp/abb-verify/session.swift`。
+  **2026-10-15 实核（当前 head，两个负向读数）**：① 全局 `CGEvent`（`cghidEventTap`）与
+  ② **直达进程的 `CGEventPostToPid(pid,…)`** 都无效——两者各发一次「移到右缘 → 按下 → 拖 10 拍 → 松手」后，
+  探针日志**行数不变**（无 `[selfresize] begin`）、`CGWindowListCopyWindowInfo` 复读的矩形**一像素没动**（`X=475 Y=124 W=520 H=560`）。
+  ⇒ 「打不进 app」不是某一种投递方式的锅，**别指望换 API 绕过**。
+  ③ **更快的判定（先跑这个，别先做实验）**：AX 命中测试把**任意**坐标都解析成登录窗——
+  `AXUIElementCopyElementAtPosition(syswide, x, y)` ⇒ `pid=173 role=AXWindow title=登录`（锁屏期）。
+  即锁屏期**命中面整体**属于 loginwindow，合成输入不可能落到应用上；这条判据本身就是「现在能不能做界面自动化」的答案，
+  不依赖任何应用日志（本机 `AXIsProcessTrusted=true`，所以**不是**辅助功能权限造成的假阴性）。
+- ⚠️ **同一份隔离 HOME 只能跑一个探针实例**：单实例是 `flock`，锁文件 = `$HOME/.agent-bridge/.gui.lock`。
+  上一轮留下的探针还在跑时，新实例只打一行
+  `[single-instance] 已有一个 agent-bridge「gui」实例在运行（flock 拿不到锁…）。本实例退出。` 然后 **exit 0**
+  （不报错、不开窗）——看着像「探针坏了」。先收干净：`ps -axo pid,command | grep 'abb-target-.*/debug/agent-bridge'` → `kill <pid>`（或换一个 HOME）；
+  跑完**自己收掉**，别留给下一个人踩。
 - **解锁后怎么验「手脚」（缩放/最大化/选中复制/say）**——三件都要真窗口：
-  ① 先让窗口**被点过**（激活）：实测**只有 app 已被点过，合成事件才落在它身上**（锁屏或未激活时 `CGEvent` 只落在 `loginwindow`/别的 app，
-  日志里 `[selfresize] begin` 与 `cursor_moved` 会**双双为 0 条**，别把这读成「缩放没接线」）；
+  ① **先让窗口被点过**（人手点一次，把 app 带到前台）：这是**经验做法**，不是已分离的结论——
+  本轮实测到「0 条 `begin`」时**两个因子同时在**（会话锁屏 **且** app 没被点过），两者**没有**单独分离过
+  （锁屏那一侧现在有 AX 命中测试作硬判据；「解锁但未激活」这一侧待补测）。无论哪一因子，现象都一样：
+  日志里 `[selfresize] begin` 与 `cursor_moved` **双双 0 条**——**别把这读成「缩放没接线」**；
   ② 已知窗口矩形（`swift /tmp/listwin2.swift` 列 `(x,y,w,h)`）后发一次合成拖拽：
   本机现成脚本：`swift /private/tmp/drag_once.swift 992 127 -140`（参数 x y dx，10 拍、每拍 30ms），
   随后 `grep -a '\[selfresize\] begin' /tmp/verify.log` **应出现一条** `begin dir=<east|north-east|…> at (x,y)`（日志点在 `src/ui.rs` 的 `SelfResize` 入口；
@@ -61,11 +81,16 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 2. **不要跑裸 `cargo test`**（会写真实 `~/.agent-bridge`）⇒ 用 `bash tools/check_test_isolation.sh`（支持过滤参数）。
 3. **不要直接跑 dev GUI**（会改真实 LaunchAgents）⇒ 跑隔离 HOME（§1）。
 4. **共用热 target 目录**（`abb-target-d`）能省 20 分钟/轮的冷编译——这是本会话前半段最大时间浪费来源。
-5. **walgit 协作**：卡 = `walgit collab entry`；`--parent` **必须是上一条条目的真实 oid**（拿 issue oid 当 parent 会造分叉）。
-6. **提交信息不要用反引号**（bash 会当命令替换执行）⇒ 用 `git commit -F <file>`。
-7. **owner 已把单条开发的门禁+评审降档**：单条只跑 `cargo build` + 定向隔离测试；**批量交付/上线前**再统一跑四门禁（fmt / clippy `-D warnings` / `build --locked` / 隔离门禁）与独立评审。
-8. **本机 clippy 基线本已红**（rustc/clippy 1.99）：只保证**零新增 lint**（与 base 比对 lint 多重集）。
-9. **发版/安装**（`scripts/build.sh` 硬编码 `target/`，会落到启动卷 ⇒ 用手动组装）：
+5. **引用仓内代码用「字面量 / 符号」，不要用行号**：本仓改动频繁，`file:line` 一两个提交就漂
+   （§5.1 里那句 `[selfresize] begin …` 就漂过两次：`:8126` → `:8134` → `:8139`）。写文档/注释时给
+   **引号里的串**或函数名（`grep -n '<串>' <file>` 一次定位）；确实要写行号时必须**同时**写
+   「写于哪个 commit」，否则下一个读者会照着错行号去读别的代码。上游 crate（winit / i-slint-*）
+   的行号可留：它们按版本锁定，不随本仓漂。
+6. **walgit 协作**：卡 = `walgit collab entry`；`--parent` **必须是上一条条目的真实 oid**（拿 issue oid 当 parent 会造分叉）。
+7. **提交信息不要用反引号**（bash 会当命令替换执行）⇒ 用 `git commit -F <file>`。
+8. **owner 已把单条开发的门禁+评审降档**：单条只跑 `cargo build` + 定向隔离测试；**批量交付/上线前**再统一跑四门禁（fmt / clippy `-D warnings` / `build --locked` / 隔离门禁）与独立评审。
+9. **本机 clippy 基线本已红**（rustc/clippy 1.99）：只保证**零新增 lint**（与 base 比对 lint 多重集）。
+10. **发版/安装**（`scripts/build.sh` 硬编码 `target/`，会落到启动卷 ⇒ 用手动组装）：
    见 §7 附录的安装命令（release 构建 → 组 bundle → `agent-bridge-dev` 签名 + `app-assets/abb.entitlements` → `tools/check_entitlements.sh` → 装 `/Applications/ABB.app`）。
 
 ---
@@ -120,8 +145,9 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 **守卫**：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：两个窗都恒画 / 两窗各有自管接线与自己的下界 / 自管 = macOS / 设置窗钩子必须跟 `CursorMoved` + 三条收尾）+ 无头几何 `ui_headless_render_test::{self_managed_hit_zones_route_press_with_pointer_coords, settings_self_managed_hit_zones_route_press_with_pointer_coords, v11c_resize_zones_hit_all_edges_and_corners, resize_hot_zone_eats_titlebar_top_band}` + 跨文件常量 `syschat::tests::settings_window_min_constants_match_slint`。
 **证据（`/private/tmp` 会被清，脚本可按 §1 重建；每份都注明产它的构建）**：
 - **可复算（当前 head，debug）**：`verify-80dca07.log`（7 行）与 `verify-80dca07-drag.log`（同样 7 行 + 一次合成拖拽）——前者 `pre-show`=`None` → `t=400ms`=`None` → `t=800ms…2000ms`=`Some is_resizable=true is_decorated=false inner=1040×1120 hit_areas=true self_managed=true`；后者 `t=400ms` 已是 `Some`（同一份代码两次跑，说明**那一档本来就不稳定**），且**拖拽后日志里 `begin`/`cursor_moved` 各 0 条**——06:27 实测：窗口 `(475,124,520,560)`、`swift /private/tmp/drag_once.swift 992 127 -140` ⇒ **锁屏期合成事件打不进 app**（这是当前唯一障碍）。
-- **中间构建（不可按当前 head 复算）**：`verify-a1.log`/`verify-a2.log`（各 8 行，01:07 的 A/B：含「试验：set_resizable(false)」探针 ⇒ 其后 `is_resizable=false`；当前 head **没有**这条探针）；`verify-0120.log`（334 行：`t=400…2000` + **323 条** `[selfresize] cursor_moved (…)`）；`verify-0245.log`（**11 行**：`t=400…2000` + **恰好一条** `[selfresize] begin dir=north-east at (508,11)`，**无** `cursor_moved`、**无** `ret=`）。⚠️ 上一版把 `verify-0245.log` 描述成「`begin dir=east` + `ret=true` + 其后数百次 `cursor_moved`」——**逐项与文件不符**，且 `ret=` / `cursor_moved` 这两个日志点在当前 head 上**不存在**（当前 head 唯一相关日志点是 `[selfresize] begin dir={dir} at ({x},{y})`，`src/ui.rs:8126`）⇒ 它们只能证明「当时（中间构建、00:10/00:31）合成拖拽确实能让自管会话开起来」，**不能**作为当前 head 的复现。
-- `syschat-shots/verify-isresizable.png`：**该目录在盘上已不存在**（`ls /private/tmp/syschat-shots` 空）⇒ 这条截图证据**已失效**，要重出图按 §1 重建。
+- **中间构建（不可按当前 head 复算）**：`verify-a1.log`/`verify-a2.log`（各 8 行，01:07 的 A/B：含「试验：set_resizable(false)」探针 ⇒ 其后 `is_resizable=false`；当前 head **没有**这条探针）；`verify-0120.log`（334 行：`t=400…2000` + **323 条** `[selfresize] cursor_moved (…)`）；`verify-0245.log`（**11 行**：`t=400…2000` + **恰好一条** `[selfresize] begin dir=north-east at (508,11)`，**无** `cursor_moved`、**无** `ret=`）。⚠️ 上一版把 `verify-0245.log` 描述成「`begin dir=east` + `ret=true` + 其后数百次 `cursor_moved`」——**逐项与文件不符**，且 `ret=` / `cursor_moved` 这两个日志点在当前 head 上**不存在**（当前 head 唯一相关日志点是 `[selfresize] begin dir={dir} at ({x},{y})`，写在 `src/ui.rs` 自管缩放的按键分支里；**别按行号找**——本节原写 `:8126`，到 `2dfef7a` 已是 `:8134`、到 `ea0429a` 是 `:8139`，行号每两次提交就漂）⇒ 它们只能证明「当时（中间构建、00:10/00:31）合成拖拽确实能让自管会话开起来」，**不能**作为当前 head 的复现。
+- `syschat-shots/verify-isresizable.png`：**在盘上**——`/Volumes/DataExt/tmp/syschat-shots/verify-isresizable.png`（107 KB，00:02 产出），画面就是当时代码画出来的对话窗（无边框、标题栏三钮、状态行、空态文案、输入区）。
+  ⚠️ **纠偏（2026-10-15 实核）**：上一版写「该目录在盘上已不存在（`ls /private/tmp/syschat-shots` 空）⇒ 证据已失效」——**查错了路径**：出图目录恒在**数据卷**（`src/ui_headless_render_test.rs::SHOTS = /Volumes/DataExt/tmp/syschat-shots`，§1 同）；`/private/tmp` 只是**探针日志**（`verify-*.log`）的落点。⇒ 这张图**没失效**，但它的证据范围要收窄：它产自 **00:02 的中间构建**，只能证明「那天窗真开出来了」，**不能**证明当前 head 的缩放/最大化可用；要当前 head 的等价画面，按 §1 跑无头出图（同目录 `short.png` 等，同输入同像素）。
 **未验证（owner 项）**：真机手拖边角「窗口真的变大变小 + 手感/发不发飘」，以及自管缩放与最大化（`toggle_syschat_maximize`）的互动。合成点击**必须先解锁屏**。
 
 ### 5.2 其余未做

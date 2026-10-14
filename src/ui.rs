@@ -486,7 +486,9 @@ fn bring_app_to_front() {
 ///
 /// 结论：对话窗恒画热区，并在 macOS 让它走**自管缩放**（[`syschat_resize_self_managed`] +
 /// [`SelfResize`]）——这是当前**唯一**能拖动的实现。当前 head 的自查口日志点只有一个：
-/// `[selfresize] begin dir={dir} at ({x},{y})`（`:8126`，即热区按下、会话真开起来）。
+/// `[selfresize] begin dir={dir} at ({x},{y})`（印在本文件自管缩放的按键分支里，即热区按下、
+/// 会话真开起来）。**按这串字面量搜**，别引行号：这条注释原先写 `:8126`，两次提交后就漂到 8139
+/// 了——行号是写注释那一刻的**读数**，串才是判据。
 /// 「合成拖拽能开出会话」的**历史**记录在 `/private/tmp/verify-0245.log`（11 行，唯一一条
 /// `begin dir=north-east`）与 `verify-0120.log`（334 行、323 条 `cursor_moved`）——**两者产自
 /// 中间构建**（当时的探针会打 `ret=`/`cursor_moved`，当前 head 没有这两个日志点）⇒ 不可按当前
