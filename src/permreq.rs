@@ -132,6 +132,25 @@ fn request_one(sym: &std::ffi::CStr, name: &str) {
     }
 }
 
+/// 屏幕录制**是否已授权**（`CGPreflightScreenCaptureAccess`，**只探不弹**）。
+///
+/// 与 [`request_screen_recording`] 分开的原因：那个是「批量请求权限」的入口（未决定时就弹框）；
+/// 而截屏按钮每次按下都要先问一句「现在能不能截」——问的时候**不能**弹框/打开设置项
+/// （用户只是点了下截图，不该被系统弹窗打断）。
+pub fn screen_recording_granted() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    std::panic::catch_unwind(|| unsafe { CGPreflightScreenCaptureAccess() }).unwrap_or(false)
+}
+
+/// 触发屏幕录制授权请求（未决定时弹框 / 已拒绝时亮出设置项）。
+/// 截屏路径与「批量请求权限」路径共用这一个入口，避免两处各写一遍。
+pub fn request_screen_recording() {
+    request_screen();
+}
+
 /// 触发屏幕录制请求（CGRequestScreenCaptureAccess，未决定时弹框）。
 fn request_screen() {
     #[link(name = "CoreGraphics", kind = "framework")]

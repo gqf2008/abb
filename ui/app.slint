@@ -4803,8 +4803,10 @@ export component SystemChatWindow inherits Window {
                                     }
                                     ComposerIcon {
                                         icon: "✂";
-                                        // 本卡只留占位：macOS 屏幕采集需屏幕录制 TCC 授权 + 原生 API，另立卡。
-                                        tip: "截图（另立卡：需屏幕录制授权）";
+                                        // 卡 `abb-v11-screenshot`：真截屏（选区/选窗）——走 composer-todo
+                                        // 交 Rust 采集（`screenshot::capture`，macOS `screencapture -i`），
+                                        // 落进待发附件。缺「屏幕录制」授权时状态行给可读引导。
+                                        tip: "截图（选区/选窗，进待发附件）";
                                         clicked => { root.composer-todo("截图"); }
                                     }
                                     // 🗑 清空当前会话：v10 从「发送右侧」搬进功能区（稿 v10 第 1 条）。

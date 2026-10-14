@@ -1,7 +1,7 @@
 # 系统级对话（syschat）交接文档
 
 > 面向**下一个接手的人**（或新会话）。目标：读完这一份就能继续干，不用重新踩坑。
-> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
+> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-v11-screenshot` 更新 §0/§5.2/§6/§7.3**（✂ 截屏落地）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
 
 ---
 
@@ -11,7 +11,8 @@
 - **对话窗缩放已修**（卡 `abb-syschat-resize-macos-20261015`）：根因**更正为「透明的无边框窗在 macOS 没有系统边角缩放」**（上一版写的 `winit is_resizable=false` 是「未 realize」的误读，见 §5.1）⇒ 对话窗**恒画热区 + macOS 自管缩放**。剩**owner 真机复验**（手拖边角的手感；锁屏时合成点击打不进 app）。
 - **历史会话归档已做**（卡 `abb-v11-session-archive`）：会话菜单「🗄 归档…」归档当前会话（从列表隐藏）、「🗄 已归档（N）…」进归档视图（点一条 = 取消归档并切回）；**不删任何历史文件**。剩 **owner 真机复验**（点开面板 → 归档 → 已归档 → 找回；锁屏时合成点击打不进 app）。
 - **Token 真实用量已做**（卡 `abb-syschat-e3-tokens-20261013`）：状态栏「已用/上限 · 百分比」+ 进度条（≥70% 橙 / ≥90% 红），悬停给精确 token 数**和口径**；值是**真实计数**（执行层从 provider 响应上报的 prompt tokens），不是 `chars/4` 估算。上限来源：设置里 `context_window` 覆盖 > 内置常见模型表 > `—`（不知道就不印数）。
-- 还没做：**截屏**、**思考块真机可见**（卡在 `abb-agent`）、**设置窗在 macOS 缩放**（§5.2，根因同 §5.1）。
+- **截屏已做**（卡 `abb-v11-screenshot`）：功能区 ✂ → 选区/选窗（`screencapture -i`）→ 落进待发附件（与 📎/⌘V 同一条落地路径）。缺「屏幕录制」授权时**先探权限、不拍**，状态行给三要素引导（哪项权限 / 去哪儿开 / 开完要重启）。
+- 还没做：**思考块真机可见**（卡在 `abb-agent`）、**设置窗在 macOS 缩放**（§5.2，根因同 §5.1）。
 
 ---
 
@@ -109,7 +110,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 ### 5.2 其余未做
 | 项 | 状态 | 下一步 |
 |---|---|---|
-| **截屏 `✂`** | 只有占位（按下写「尚未实现」） | 卡 `abb-v11-screenshot`；做原生截屏需 **macOS 屏幕录制 TCC 权限**，要先探权限 + 被拒给可读引导；`screencapture` 子进程是可行退路 |
+| **截屏 `✂`** | **已做**（卡 `abb-v11-screenshot`，2026-10-15 落 main） | 口径＝**系统工具 + 先探权限**：`.slint` 的 ✂ → `composer-todo("截图")` → `screenshot::capture()`。采集交给 `/usr/sbin/screencapture -i -x <tmp.png>`（交互式：拖框选区 / 空格切窗口 / Esc 取消），产物落系统临时目录 → `syschat::land_attachments` 复制进工作区附件目录并进待发 → 删临时文件。**未授权不拍**：`CGPreflightScreenCaptureAccess`（只探不弹）为假就 `CGRequestScreenCaptureAccess` 触发授权，并直接回「需要权限」+ 引导文案（静默拍出来的是缺窗口的错图，比报错更难发现）。结局四态都有回话（截到 / 取消 / 缺权限 / 失败），**取消不算错误**。判据＝纯函数（参数拼装 / 结局判定 / PNG 头 / 引导文案 / 临时文件名）+ 跨文件接线守卫（Slint 功能名与 `screenshot::ACTION_NAME` 逐字一致、Rust 分支真调 `capture()`、未知功能名仍有占位回话）。**为什么用子进程而不是原生 API**：卡里把原生（手写 objc_msgSend）列首选、子进程列退路；交互式选区/选窗是子进程的内建能力，原生路径要么只能拍全屏、要么得自写一套覆盖全屏的选区 UI，TCC 归属则是同一条责任链（子进程的「责任进程」= 派它的 app）。将来若要「无交互直拍全屏/单窗」，正路才是原生 `CGWindowListCreateImage` + ImageIO。剩 **owner 真机复验**：点 ✂ 拖框截一张 → 看它进待发并发出；以及未授权时那句引导 |
 | **消息动作**（可选中复制 / 复制 / 重新生成 / 朗读） | **已做**（卡 `abb-v11-message-actions`，2026-10-15 合入 main） | 口径＝**分层**：无行内样式的文本块换只读 `TextInput`（可选中 + ⌘C），助手轮整轮 `⧉ 复制` 兜底；**含行内样式的块**（表格/媒体/粗体/行内码/链接/`~~` 删除线）**仍不可选**——`TextInput` 渲染不了样式，宁可不选也不回退 B 批的样式。动作行只带**真实历史下标**、点击时才由 `syschat::action_target` 解析（**不许用「负值＝最后一条助手轮」哨兵**：第二轮收尾后模型里有两条同值哨兵，会一起解析到同一轮 ⇒ 点第一轮操作了第二轮，评审判 Critical）。剩 **owner 真机复验三项**：① 真机剪贴板端到端（⌘V 粘出）；② 真机拖选高亮 + ⌘C；③ 真机 `say` 出声与 ⏹ 停止（锁屏期合成点击打不进 app；`say` 这条单测走 `/bin/sleep` 替身，只证「隐藏路径会停进程」） |
 | **历史会话归档** | **已做**（卡 `abb-v11-session-archive`，2026-10-15 落 main） | 口径＝**隐藏 + 可找回，不删数据**：`SessionMeta.archived`（`#[serde(default)]` ⇒ 旧 `sessions.json` 缺字段按未归档）；`SessionStore::list()` 过滤归档、`archived()` 只列归档；归档**当前**会话时 `ensure_current` 把 current 落到最近活动的未归档会话（一条不剩则起一条新的、沿用模型选择，**不擅自取消归档**）；`set_archived` 幂等（同值/未知 id 不落盘）。UI：第一行两义（普通「🗄 归档…」/ 归档视图「← 返回会话列表」）、第二行「🗄 已归档（N）…」；文案与「哪份列表 + 清空当前项」的判据都在 Rust 纯函数里（`session_panel_text` / `session_menu_view`）。单测 5 条（归档过滤/找回/不删文件、current 迁移、幂等不落盘、旧 JSON 兼容、两视图文案）+ ui 行判据 + 无头「第二行真的画出来」+ 出图。剩 **owner 真机复验**（三项点击路径；锁屏期合成点击打不进 app） |
 | **Token 真实用量** | **已做**（卡 `abb-syschat-e3-tokens-20261013`，2026-10-15 落 main） | 口径＝**真实计数，不是估算**：`crates/abb-agent`（rpi 驱动）本来就从 provider 响应里解出 `AssistantMessage.usage`，只是**没往外报** ⇒ 现在随 `session/prompt` 结果 `_meta.usage`（camelCase `input/output/cacheRead/cacheWrite/total`）上报，根侧 `runtime::acp::parse_usage` 收下（缺字段/全零 ⇒ `None`，绝不编数），经 `pool::PromptResult::final_usage` → harness 旁路表 → `oneshot` → `syschat::TurnEnd::Done{usage}` → 写 `SessionMeta.context_tokens`（**prompt 侧** `input＋cacheRead＋cacheWrite`，不含 output）。上限：`providers[].context_window`（`#[serde(default)]`，旧 config 兼容）**覆盖**内置常见模型表（子串匹配、长键在前；匹配不到 ⇒ `None` ⇒ 印 `—`）。UI 文案/档位/提示全是纯函数（`context_usage_text` / `usage_level` / `context_usage_tip`），渲染半是无盘注入（`ui::apply_syschat_usage`）⇒ 无头台可断言任意档位。剩 **owner 真机复验**：真机跑一轮看数字随回合变化 + 设置窗「上下文窗口」填/清（`0` = 用内置表）|
@@ -121,6 +122,14 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 ---
 
 ## 6. 关键技术结论（**别再重走弯路**）
+
+**截屏（v11 ✂）**
+- **GUI 进程的 `PATH` 不含 `/usr/sbin`**（launchd 给的环境）⇒ 调 `screencapture` 必须写绝对路径 `/usr/sbin/screencapture`；写命令名就是「命令找不到」，而且**只在用户点下去时才暴露**。
+- **没有「屏幕录制」授权时不要拍**：macOS 会静默把窗口内容从图里去掉（或直接拒绝），用户拿到一张错图却看不出错。先 `CGPreflightScreenCaptureAccess()`（只探不弹）⇒ 假就 `CGRequestScreenCaptureAccess()`（唯一的授权入口）+ 状态行给引导。
+- 引导必须讲三件事：**哪项权限**（屏幕录制）、**去哪儿开**（系统设置 → 隐私与安全性 → 屏幕录制 → 勾 ABB）、**开完要重启 ABB**（TCC 对已运行进程不是立刻生效——「我明明勾了」多半缺的就是这句）。
+- 结局判定：**没有 PNG 文件就不许说成功**。取消 = 没文件 + 没 stderr ⇒ 报「已取消」（不是失败）；文件在但不是 PNG（半张图）⇒ 失败，别让它进待发。
+- 截屏产物与 📎/⌘V 走**同一条落地路径**（`syschat::land_attachments` → 工作区附件目录 → 待发列表）：另开一条会让「文件名唯一化 / 落地失败回滚 / 待发行 UI」三处各漂一份。
+- **未验**：真机点 ✂ 实际截一张（本会话屏幕锁着，合成点击打不进 app，见 §1）。
 
 **用量（E3）**
 - 上一版写「`acp.rs` 没有任何 usage 来源（goose 注释明说不报）」是**针对旧适配器的过时结论**：本仓执行层是 `crates/abb-agent`（rpi 驱动），rpi 的 provider mapper 会把 `usage` 填进 `AssistantMessage`（anthropic 填 `input/cache_read/cache_write`，openai/faux 同类），**只是没往外转发**。⇒ 别退到 `chars/4` 估算，真值就在手边。
@@ -200,5 +209,5 @@ rm -rf /Applications/ABB.app; ditto "$B" /Applications/ABB.app; open /Applicatio
 ### 7.3 接手第一小时建议
 1. 读 §1，自己开窗抓一张图，建立「我能自己验收」的闭环（这一步能省掉后面所有「让用户截图」的往返）。
 2. §5.1 缩放**已修**（卡 `abb-syschat-resize-macos-20261015`：对话窗恒画热区 + macOS 自管缩放），剩**真机手感**复验；**别再拿 `is_resizable` 取证**（它既不假也不是判据，见 §5.1）。
-3. 按 §5.2 从上往下做（**缩放 ✅ / 消息动作 ✅ / 归档 ✅ / 用量(E3) ✅ 已完成**；剩：截屏 → 设置窗缩放；思考/steer 要动 `abb-agent`，可最后做）。
+3. 按 §5.2 从上往下做（**缩放 ✅ / 消息动作 ✅ / 归档 ✅ / 用量(E3) ✅ / 截屏 ✅ 已完成**；剩：设置窗缩放；思考/steer 要动 `abb-agent`，可最后做）。
 4. 每做完 2–3 条，**批量**跑四门禁 + 独立评审 + 打包安装一次（owner 已同意这条降档口径）。

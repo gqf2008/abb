@@ -43,6 +43,7 @@ mod proto;
 mod redact;
 mod runtime;
 mod schedule;
+mod screenshot;
 mod service;
 mod session_gc;
 mod session_import;

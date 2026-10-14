@@ -3564,12 +3564,14 @@ pub fn run_gui() -> Result<()> {
 
     // 把一批本地路径落地进工作区附件目录并并入待发列表。失败 ⇒ 对话框状态行显示可读原因
     // （复用既有错误展示通道），**不静默丢弃**；成功时才把落盘记录并入待发。
-    let land_into_pending: Rc<dyn Fn(Vec<std::path::PathBuf>)> = {
+    // `label` 是状态行那句成功文案的前缀：选文件是「已附加」，截屏是「已截屏并附加」——
+    // 同一句话糊到两种来源上，用户点一次 ✂ 看到「已附加 1 个文件」会不知道图进没进来。
+    let land_into_pending: Rc<dyn Fn(Vec<std::path::PathBuf>, &'static str)> = {
         let cw = syschat_win.as_weak();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
         let split = sc_split.clone();
-        Rc::new(move |paths: Vec<std::path::PathBuf>| {
+        Rc::new(move |paths: Vec<std::path::PathBuf>, label: &'static str| {
             if paths.is_empty() {
                 return; // 取消选择 / 剪贴板无文件：不算失败，什么都不做
             }
@@ -3580,7 +3582,7 @@ pub fn run_gui() -> Result<()> {
                     atts.borrow_mut().extend(landed);
                     refresh_syschat_atts(&w, &atts, &pending, &split);
                     w.set_status_is_error(false);
-                    w.set_status_line(format!("已附加 {n} 个文件（随下一条消息发送）").into());
+                    w.set_status_line(format!("{label} {n} 个文件（随下一条消息发送）").into());
                 }
                 Err(e) => {
                     // land_attachments 整批回滚：不改待发列表，只报错。
@@ -3603,7 +3605,7 @@ pub fn run_gui() -> Result<()> {
                 return; // 窗口已销毁（托盘退出中）：不再弹面板
             }
             bring_app_to_front(); // 面板要置于前台（先激活再弹，同 show_window_and_focus 的理由）
-            land(crate::platform::pick_files_multi());
+            land(crate::platform::pick_files_multi(), "已附加");
         });
     }
     // 「清空」：只清待发列表，**不删**已落盘文件（它们可能已被已发出的消息引用）。
@@ -7660,15 +7662,43 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 输入区占位按钮（只剩 ✂ 截图）：**不做成死按钮**——按下走既有状态行通道给一句「尚未实现」。
-    // 画在 `ui/app.slint` 的 `.fnbar` 里，回调只带一个功能名。（😊 表情与 ⋯ 更多在卡 d9 已接
-    // 真功能，见下方两段；截图需 macOS 屏幕录制 TCC 授权 + 原生采集，另立卡。）
+    // 功能区里「不是直接回调」的那颗钮走这一个通道（回调参数 = 功能名，画在
+    // `ui/app.slint` 的 `.fnbar`）。目前只有 ✂ 截图，卡 `abb-v11-screenshot` 起它是**真功能**：
+    // 选区/选窗截一张 → 落进待发附件（与 📎/⌘V 同一条落地路径，见上面的 `land_into_pending`）。
+    // 保留「按功能名分派 + 未知名字给有反馈的占位语」这层结构：将来再加占位钮时不会变成死按钮。
     {
         let cw = syschat_win.as_weak();
+        let land = land_into_pending.clone();
         syschat_win.on_composer_todo(move |name| {
-            if let Some(w) = cw.upgrade() {
+            let Some(w) = cw.upgrade() else { return };
+            if name.as_str() != crate::screenshot::ACTION_NAME {
+                // 未接的功能名：**有反馈**的占位（外部观测不到空实现，所以宁可说一句）。
                 w.set_status_is_error(false);
                 w.set_status_line(format!("「{name}」尚未实现（占位按钮）。").into());
+                return;
+            }
+            // ✂ 截屏。四种结局都要有回话，**尤其**缺权限那条：静默失败会让用户以为按钮坏了。
+            match crate::screenshot::capture() {
+                crate::screenshot::Outcome::Captured(tmp) => {
+                    // 复用与 📎/⌘V 同一条落地路径（复制进工作区附件目录 + 并入待发 + 报错）。
+                    // 它是**同步**的：返回时副本要么已经落地、要么状态行已经写了失败原因，
+                    // 两种情况都不再需要临时文件 ⇒ 随后清理（留着只会攒垃圾）。
+                    land(vec![tmp.clone()], "已截屏并附加");
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                crate::screenshot::Outcome::Cancelled => {
+                    w.set_status_is_error(false);
+                    w.set_status_line("已取消截屏。".into());
+                }
+                crate::screenshot::Outcome::NeedsPermission => {
+                    // 已顺手触发过系统授权请求；这里给三要素引导（哪项/去哪/重启）。
+                    w.set_status_is_error(true);
+                    w.set_status_line(crate::screenshot::permission_guidance().into());
+                }
+                crate::screenshot::Outcome::Failed(e) => {
+                    w.set_status_is_error(true);
+                    w.set_status_line(format!("截屏失败：{e}").into());
+                }
             }
         });
     }
@@ -8023,7 +8053,7 @@ pub fn run_gui() -> Result<()> {
                         win.set_drag_hover(false);
                     }
                     if should_land {
-                        land_drop(vec![path.clone()]);
+                        land_drop(vec![path.clone()], "已附加");
                     }
                     return EventResult::Propagate;
                 }
@@ -8043,7 +8073,7 @@ pub fn run_gui() -> Result<()> {
                     if !paths.is_empty() {
                         // 落地在 UI 线程同步完成（否则待发列表要跨线程共享）；典型附件很小，
                         // 大可接受（若将来出现「粘大文件卡 UI」的反馈，再改成队列 + 单发定时器）。
-                        land_paste(paths);
+                        land_paste(paths, "已附加");
                         return EventResult::PreventDefault; // 不落给 TextInput ⇒ 不会粘文本
                     }
                     // 剪贴板无文件：继续往下，文本粘贴仍由 Slint TextInput 处理。

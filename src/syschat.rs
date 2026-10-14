@@ -4865,7 +4865,8 @@ mod tests {
         );
     }
 
-    /// 输入区功能区的接线守卫：✂ 截图仍是「有反馈的占位」，😊 表情 / ⋯ 更多（卡 d9）已是真功能。
+    /// 输入区功能区的接线守卫：✂ 截图（卡 `abb-v11-screenshot` 起是真功能）/ 😊 表情 / ⋯ 更多
+    /// （卡 d9）都接到 Rust。
     ///
     /// 源码扫描守卫（同 `titlebar_plan_button_count_matches_show_maximize` 的手法）：按下没反应 /
     /// 接了空实现属于「做了个空壳」，外部观测不到，只能把接线钉在源码上。
@@ -4874,10 +4875,25 @@ mod tests {
     #[test]
     fn composer_function_bar_wiring() {
         let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
-        // ✂ 截图：仍是占位（有反馈，不是死按钮）
+        // ✂ 截图：接 composer-todo 把采集交给 Rust。**两个名字必须逐字对上**——
+        // 一个是 Slint 传的功能名、一个是 Rust 用来分派的常量；漂了就静默落进「占位」分支
+        // （按钮看着正常，点了只回一句「尚未实现」）。
         assert!(
             raw.contains("root.composer-todo(\"截图\")"),
             "✂ 截图没接 composer-todo（会变成点了没反应的死按钮）"
+        );
+        assert!(
+            raw.contains(&format!(
+                "root.composer-todo(\"{}\")",
+                crate::screenshot::ACTION_NAME
+            )),
+            "Slint 传的功能名与 `screenshot::ACTION_NAME` 不一致 ⇒ 截屏永远落进占位分支"
+        );
+        // Rust 侧真去调采集（而不是把名字分派完就没了）。
+        let ui_src = crate::platform::src_lf(include_str!("ui.rs"));
+        assert!(
+            ui_src.contains("crate::screenshot::capture()"),
+            "✂ 截图的 Rust 分支没调 `screenshot::capture()`"
         );
         // 😊 表情：打开面板 + 通知 Rust 重置/刷新（两者缺一都是空壳）
         assert!(
