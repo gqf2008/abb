@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v7</title>
+<title>ABB 系统对话 · 设计稿 v8</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -122,7 +122,7 @@
   .prow{display:flex;gap:10px;align-items:stretch}
   /* v7：图标列移到输入框**外面**（owner 口径），更小、贴底与发送按钮对齐 */
   .composer-row{display:flex;gap:8px;align-items:stretch}
-  .stack{display:flex;flex-direction:column;gap:4px;flex:0 0 auto;justify-content:flex-end}
+  .stack{display:flex;flex-direction:column;gap:4px;flex:0 0 auto;justify-content:flex-end;padding-bottom:8px}
   .sendrow{display:flex;align-items:flex-end;gap:8px;flex:0 0 auto}
   .ib{width:24px;height:24px;border:2px solid var(--edge);border-radius:6px;background:var(--panel);display:flex;align-items:center;justify-content:center;font-size:12px;cursor:pointer}
   .ib:hover{background:var(--hover)}
@@ -177,7 +177,7 @@
         <span class="bub press"><svg viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg></span>
         按下（缩 0.9 + 墨黑描边）
       </div>
-      <div class="tip-mini">单击＝打开/收起对话框；按住拖动＝移动（位置记忆）</div>
+      <div class="tip-mini">单击＝打开对话框（<b>气泡不消失，永久置顶</b>）；按住拖动＝移动（位置记忆）</div>
     </div>
   </div>
 
@@ -202,7 +202,8 @@
       <svg class="logo" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg>
       <span class="title">ABB · 系统对话</span>
       <span class="tb-spacer"></span>
-      <div class="chipbtn mark" data-m="1">🗂 新会话<span class="caret">▾</span>
+      <button class="tb-btn mark" data-m="1" title="新建会话（历史保留）">＋</button>
+      <div class="tb-btn mark" data-m="2" title="历史会话（可切回继续聊）">🗂
         <div class="menu left">
           <h6>会话（历史保留，可随时切回）</h6>
           <div class="item on"><span>新会话</span><span class="tag">当前</span></div>
@@ -211,7 +212,7 @@
           <div class="foot">点一条即切回该会话继续聊</div>
         </div>
       </div>
-      <div class="chipbtn accent mark" data-m="2">deepseek-chat<span class="caret">▾</span>
+      <div class="chipbtn accent mark" data-m="3">deepseek-chat<span class="caret">▾</span>
         <div class="menu">
           <h6>选择模型（本会话生效）</h6>
           <div class="item on"><span>deepseek-chat</span><span class="tick">✓</span></div>
@@ -220,9 +221,10 @@
           <div class="foot">仅列出「设置 → 供应商」里已配置的模型</div>
         </div>
       </div>
-      <button class="tb-btn mark" data-m="3" title="打开设置">⚙</button>
-      <button class="tb-btn">—</button>
-      <button class="tb-btn danger">✕</button>
+      <button class="tb-btn mark" data-m="4" title="打开设置">⚙</button>
+      <button class="tb-btn" title="最小化">—</button>
+      <button class="tb-btn" title="最大化">⤢</button>
+      <button class="tb-btn danger" title="关闭">✕</button>
     </div>
     <div class="status" title="本会话累计 12,432 tokens；模型最大上下文 128,000">
       <div class="st2">
@@ -268,9 +270,9 @@
 
     <div class="composer-zone">
      <div class="composer-row">
-      <!-- v7：图标列在输入框**外面**（owner）；只有 ＋ / 📎，24px -->
+      <!-- v8：图标列在输入框**外面**，只剩 📎（新建会话已移到标题栏）；
+           与右侧「发送 / 清空」**底部同一条水平线**（`.stack` 补 padding-bottom = 盒内边距） -->
       <div class="stack">
-        <div class="ib mark" data-m="4" title="新建会话（历史保留）">＋</div>
         <div class="ib mark" data-m="5" title="选择文件（可多选）">📎</div>
       </div>
       <div class="composer">
@@ -297,8 +299,16 @@
 </div>
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v7</h1>
-  <div class="sub">本轮：按 owner 真机复查收口布局（标题栏一行对齐 / 状态栏两行 / 图标列移到框外 / 清空在发送右侧）</div>
+  <h1>ABB 系统对话 · 设计稿 v8</h1>
+  <div class="sub">本轮：气泡常驻置顶 / 标题栏图标化 + 可最大化 / Dock 点击只开对话窗 / 输入区三钮同线</div>
+  <div class="sub" style="color:var(--info)"><b>v8 相对 v7 的改动</b>（实现以本稿为准）</div>
+  <ol>
+    <li><b>气泡常驻置顶</b>：点气泡开窗后<b>气泡不再消失</b>（v7/老需求 #13「气泡随窗隐藏」<b>作废</b>）；气泡永久置顶，窗口始终锚在气泡旁。</li>
+    <li><b>标题栏图标化</b>：<code>＋</code> 新建会话（图标）在<b>历史会话 <code>🗂</code>（图标）左边</b>——两个都只要图标、不要文字；模型仍是带文案的 chip。</li>
+    <li><b>窗口可最大化</b>：标题栏恢复 <code>⤢</code>，三钮 <code>— ⤢ ✕</code>（最小尺寸仍 340×380）。</li>
+    <li><b>Dock 点击</b>：只弹<b>对话窗</b>，不再弹设置窗。</li>
+    <li><b>输入区三钮同线</b>：框外 <code>📎</code> 与框内 <code>发送</code> / <code>🗑 清空</code> <b>底部水平对齐</b>；新建会话已上移到标题栏，输入区不再有 <code>＋</code>。</li>
+  </ol>
   <div class="sub" style="color:var(--info)"><b>v7 相对 v6 的改动</b>（实现以本稿为准）</div>
   <ol>
     <li><b>标题栏一行对齐</b>：<code>新会话</code> / <code>模型</code> / <code>⚙</code> / <code>—</code> / <code>✕</code> <b>同一行、同高 26px、垂直居中</b>（v6 只画了位置、没钉高度）；窗口默认可缩放，最小 340×380。</li>
@@ -309,7 +319,7 @@
     <li><b>分割线</b>：铺满输入区宽度即可——两端那 2px 是窗口黑描边本身（不许用负 margin 外扩：会触发 Slint 绑定循环）。</li>
   </ol>
   <ol>
-    <li><b>气泡点击反馈</b>：常态 / 悬停放大 1.06 / <b>按下缩到 0.9 + 墨黑描边</b>（上方可亲手点）；单击＝开/收对话框，按住拖＝移动。</li>
+    <li><b>气泡点击反馈</b>：常态 / 悬停放大 1.06 / <b>按下缩到 0.9 + 墨黑描边</b>（上方可亲手点）；单击＝开窗（<b>气泡不消失、永久置顶</b>），按住拖＝移动。</li>
     <li><b>窗口跟随气泡</b>：对话框<b>锚定在气泡旁（间距 10px）</b>，拖动气泡窗口一起移动；气泡靠屏边时窗口自动翻到另一侧，保证不出屏。</li>
     <li><b>删掉输入区那段长提示文案</b>（不再显示）。</li>
     <li><b>流式输出（打字机）</b>：回复逐字出现，带蓝色光标与「正在输入 / ⏹ 停止」。</li>
