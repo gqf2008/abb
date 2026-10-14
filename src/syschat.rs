@@ -57,6 +57,11 @@ pub struct Turn {
     /// "user" | "assistant"
     pub role: String,
     pub text: String,
+    /// 本轮的**思考过程**（E2 基本形态）：`agent_thought_chunk` 累积文本。
+    /// 空串 = 该轮没有思考（或旧记录）。`#[serde(default)]` 让 E2 之前落的 jsonl
+    /// 行照常反序列化（缺字段 ⇒ 空串），**不破坏既有历史文件**。
+    #[serde(default)]
+    pub thought: String,
     /// Unix 秒（展示/排序用）。
     pub ts: i64,
 }
@@ -1417,21 +1422,40 @@ pub fn prompt_with_attachments(history: &[Turn], user_text: &str, atts: &[Attach
 }
 
 /// 一轮对话的结局（E1 流式）：「正常完成」携带最终文本；「用户停止」不再带文本
-///（已生成部分已随 [`StreamEvent`] 逐字流出，且由 [`turn_core`] 落进历史）。
+///（已生成部分已随 `ChunkKind` 分片流出，且由 [`turn_core`] 落进历史）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEnd {
     Done(String),
     Stopped,
 }
 
-/// 流式正文累积器（纯逻辑，E1）：按到达顺序拼接 delta，供
-/// ① GUI 打字机 ② 「停止」时把已生成文本落历史 共用。
+/// 流式回合里的一个连续分段：**同类分片并进同一段，换类时开新段**。
 ///
-/// 设计取舍：**不做增量解析**，只维护一个字符串；markdown 解析留给渲染层
+/// `started` / `last` 是调用方注入的单调秒数（此处不读时钟，便于单测钉住耗时）；
+/// `last - started` 即该段耗时——思考块标题「3.2s」的来源。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamSegment {
+    pub kind: ChunkKind,
+    pub text: String,
+    pub started: f64,
+    pub last: f64,
+}
+
+impl StreamSegment {
+    /// 本段耗时（秒，非负）。
+    pub fn elapsed(&self) -> f64 {
+        (self.last - self.started).max(0.0)
+    }
+}
+
+/// 流式分片累积器（E1 正文 / E2 思考共用同一条 sink）：按到达顺序累积分段，供
+/// ① GUI 打字机 ② 「停止」时把已生成部分落历史 ③ 回合结束区分思考与正文 共用。
+///
+/// 设计取舍：**不做增量解析**，只维护分段文本；markdown 解析留给渲染层
 ///（`mdblocks::parse`）在每次渲染时做，这样累积器本身可无依赖单测。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamingBubble {
-    shown: String,
+    segments: Vec<StreamSegment>,
     active: bool,
     stopped: bool,
 }
@@ -1440,39 +1464,208 @@ impl StreamingBubble {
     /// 新建一个进行中的流式气泡（`active = true`）。
     pub fn start() -> Self {
         Self {
-            shown: String::new(),
+            segments: Vec::new(),
             active: true,
             stopped: false,
         }
     }
 
-    /// 追加一段正文 delta。空段忽略（agent 可以发空 chunk）。
-    /// 返回 `true` 表示显示文本发生变化（GUI 需重渲染）。
-    pub fn push(&mut self, delta: &str) -> bool {
+    /// 追加一段分片。空段忽略（agent 可以发空 chunk）。
+    /// 同类接上一段，异类**新开一段**（段序 = 上屏顺序）。
+    /// 返回 `true` 表示内容发生变化（GUI 需重渲染）。
+    pub fn push(&mut self, kind: ChunkKind, delta: &str, now: f64) -> bool {
         if delta.is_empty() {
             return false;
         }
-        self.shown.push_str(delta);
+        match self.segments.last_mut() {
+            Some(seg) if seg.kind == kind => {
+                seg.text.push_str(delta);
+                seg.last = now;
+            }
+            _ => self.segments.push(StreamSegment {
+                kind,
+                text: delta.to_string(),
+                started: now,
+                last: now,
+            }),
+        }
         true
     }
 
-    /// ⏹ 停止：保留已生成文本，标记不再活跃（「正在输入」收起、显示「已停止」）。
+    /// ⏹ 停止：保留已生成部分，标记不再活跃（「正在输入」收起、显示「已停止」）。
     pub fn stop(&mut self) {
         self.stopped = true;
         self.active = false;
     }
 
-    /// 收尾去重：回合结束时以 `final_text` 为**唯一权威**替换显示文本
+    /// 收尾去重：回合结束时以 `final_text` 为**唯一权威**重建正文段
     ///（流式拼接与最终文本不一致时——漏片/重发/后端规范化——以最终为准，
-    /// 且只渲染这一条，不会再追加第二条）。
-    pub fn finish(&mut self, final_text: &str) -> &str {
-        self.shown = final_text.to_string();
+    /// 且只渲染这一条，不会再追加第二条）。**思考段原样保留**（最终文本里没有思考）。
+    /// 返回 `true` 表示正文发生变化。
+    pub fn finish(&mut self, final_text: &str, now: f64) -> bool {
+        let before = self.shown();
+        self.segments.retain(|s| s.kind != ChunkKind::Text);
+        if !final_text.is_empty() {
+            self.segments.push(StreamSegment {
+                kind: ChunkKind::Text,
+                text: final_text.to_string(),
+                started: now,
+                last: now,
+            });
+        }
         self.active = false;
-        &self.shown
+        before != self.shown()
+    }
+
+    /// 已显示的**正文**（正文段按顺序拼接；思考段不计入）。
+    pub fn shown(&self) -> String {
+        self.text_of(ChunkKind::Text)
+    }
+
+    /// 已生成的**思考过程**（思考段按顺序拼接）。
+    pub fn thought(&self) -> String {
+        self.text_of(ChunkKind::Thought)
+    }
+
+    pub fn has_thought(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| s.kind == ChunkKind::Thought && !s.text.is_empty())
+    }
+
+    fn text_of(&self, kind: ChunkKind) -> String {
+        let mut out = String::new();
+        for s in self.segments.iter().filter(|s| s.kind == kind) {
+            out.push_str(&s.text);
+        }
+        out
+    }
+
+    /// 分段快照（顺序即到达顺序，供渲染/历史区分思考与正文）。
+    pub fn segments(&self) -> &[StreamSegment] {
+        &self.segments
+    }
+
+    /// 思考累计耗时（秒）。`now` 只用于**仍在进行**的最后一段
+    ///（其余段用它们自己的 `last`，否则会把前面几段的耗时按 `now` 重复放大）。
+    pub fn thought_secs(&self, now: f64) -> f64 {
+        let last = self.segments.len().saturating_sub(1);
+        self.segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == ChunkKind::Thought)
+            .map(|(i, s)| {
+                if self.active && i == last {
+                    (now.max(s.last) - s.started).max(0.0)
+                } else {
+                    s.elapsed()
+                }
+            })
+            .sum()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
+/// 思考耗时文案（稿：`▸ 思考过程 · 3.2s`）。
+///
+/// 口径：< 60s 用秒（一位小数）；≥ 60s 用分（一位小数）——长思考按秒读太累。
+/// 纯函数（单测钉住格式化与边界）。
+pub fn format_elapsed(secs: f64) -> String {
+    let secs = secs.max(0.0);
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{:.1}m", secs / 60.0)
+    }
+}
+
+/// 客户端打字机（E1/E2 共用，纯逻辑）：后端一次吐一大段时，按拍把文本**逐段**推进上屏。
+///
+/// 为什么需要它（**实测口径**）：ABB 随包执行层 `abb-agent` 在 `MessageEnd` **整条**
+/// 发正文 chunk（见 `crates/abb-agent/src/acp.rs` 的注释），一个回合常常只有 1～2 片；
+/// 直接渲染就是「一次性蹦出」。打字机维护 `target`（已收到的权威文本）与 `shown`
+///（已显示的**字符边界前缀**），保证：
+/// ① `shown` 恒为 `target` 的前缀 ⇒ 永不丢字/乱序（多字节字符按 char 推进）；
+/// ② 拍速自适应（积压越多每拍推进越多，约**减半**追赶）⇒ 大段也能在十来拍内追平，
+///    小段（≤3 字）仍是逐字；
+/// ③ 停止/收尾时 `flush` 把已生成的都显示出来 ⇒ 不留「收到了但没上屏」的字。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Typewriter {
+    target: String,
+    shown: String,
+}
+
+impl Typewriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 每拍最多推进的字符数：积压越多推进越快（约减半追赶），已追平取 0。
+    /// `max(1, pending / 2)` ⇒ 小段逐字、大段十来拍收口。
+    pub fn step_for(pending: usize) -> usize {
+        (pending / 2).max(1)
+    }
+
+    /// 追加已到手的文本（权威侧，只增不减）。空段忽略。
+    pub fn push(&mut self, delta: &str) {
+        if !delta.is_empty() {
+            self.target.push_str(delta);
+        }
+    }
+
+    /// 用权威全文替换目标（回合结束去重：以 `final_text` 为准）。
+    /// 已显示部分若仍是新目标的前缀则保留，否则清空（不得显示不属于目标的字节）。
+    pub fn set_target(&mut self, full: &str) {
+        if !full.starts_with(&self.shown) {
+            self.shown.clear();
+        }
+        self.target = full.to_string();
+    }
+
+    /// 推进一拍。返回 `true` 表示显示文本发生变化。
+    pub fn tick(&mut self) -> bool {
+        let pending = self
+            .target
+            .chars()
+            .count()
+            .saturating_sub(self.shown.chars().count());
+        if pending == 0 {
+            return false;
+        }
+        let step = Self::step_for(pending);
+        // `shown` 恒为 `target` 的前缀 ⇒ 字节偏移必落在 char 边界上。
+        let take: String = self.target[self.shown.len()..].chars().take(step).collect();
+        if take.is_empty() {
+            return false;
+        }
+        self.shown.push_str(&take);
+        true
+    }
+
+    /// 立即推到目标末尾（停止 / 收尾：不留未显示的已生成文本）。
+    /// 返回 `true` 表示发生变化。
+    pub fn flush(&mut self) -> bool {
+        if self.shown == self.target {
+            return false;
+        }
+        self.shown = self.target.clone();
+        true
     }
 
     pub fn shown(&self) -> &str {
         &self.shown
+    }
+
+    /// 已显示到目标末尾（可立即收尾，不必再等下一拍）。
+    pub fn done(&self) -> bool {
+        self.shown.len() == self.target.len()
     }
 }
 
@@ -1701,6 +1894,7 @@ async fn turn_core(
                 &[Turn {
                     role: "user".to_string(),
                     text: text.to_string(),
+                    thought: String::new(),
                     ts: now,
                 }],
             )
@@ -1716,27 +1910,27 @@ async fn turn_core(
         prompt
     };
 
-    // 回合在锁外跑。返回 `(要落历史的助手文本, 是否用户停止)`：
-    // - 正常完成 → 最终文本就是 `final_text`（去重口径的权威侧）；
-    // - 用户停止 → 用本地累积的已生成文本（GUI 侧已有同一份，不重复发）。
-    let (reply, stopped) = match stream {
+    // 回合在锁外跑。返回 `(要落历史的助手正文, 要落历史的思考过程, 是否用户停止)`：
+    // - 正常完成 → 正文取 `final_text`（去重口径的权威侧），思考取累积器里的思考段；
+    // - 用户停止 → 正文与思考都用本地累积的已生成部分（GUI 侧已有同一份，不重复发）。
+    let (reply, thought, stopped) = match stream {
         None => {
             // 非流式：cancel 恒 None ⇒ 不会 Stopped；turn_with 直接给最终文本。
             let reply = turn_with(agent_cfg, ws, prompt).await?;
-            (Some(reply), false)
+            (Some(reply), String::new(), false)
         }
         Some(w) => {
-            // 中间层：sink 的每条分片既累积（停止时用）又转发给 GUI（`w.chunks`）。
+            // 中间层：sink 的每条分片既累积（停止/思考分离用）又转发给 GUI（`w.chunks`）。
+            // 累积器与 GUI 共用同一条 `ChunkKind` 语义——不新造第二条通道。
             let acc = std::sync::Arc::new(std::sync::Mutex::new(StreamingBubble::start()));
             let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
             let gui = w.chunks.clone();
             let acc2 = acc.clone();
             let forwarder = tokio::spawn(async move {
                 while let Some(chunk) = inner_rx.recv().await {
-                    if chunk.kind == ChunkKind::Text {
-                        if let Ok(mut b) = acc2.lock() {
-                            b.push(&chunk.text);
-                        }
+                    if let Ok(mut b) = acc2.lock() {
+                        // 此处不需要耗时（GUI 自己按墙钟算）：`now = 0.0` 只占位。
+                        b.push(chunk.kind, &chunk.text, 0.0);
                     }
                     // GUI 侧收端若提前消失（窗口关了），不必中断回合——只是不再累积之外的多余投递。
                     let _ = gui.send(chunk);
@@ -1755,22 +1949,27 @@ async fn turn_core(
             // 回合已收尾 ⇒ sink 已摘除，转发任务随之结束；等它把缓冲分片冲完再决定停止态文本。
             let _ = forwarder.await;
             match res? {
-                TurnEnd::Done(reply) => (Some(reply), false),
+                TurnEnd::Done(reply) => {
+                    let thought = acc.lock().map(|b| b.thought()).unwrap_or_default();
+                    (Some(reply), thought, false)
+                }
                 TurnEnd::Stopped => {
-                    let partial = acc
+                    let (partial, thought) = acc
                         .lock()
-                        .map(|b| b.shown().to_string())
+                        .map(|b| (b.shown(), b.thought()))
                         .unwrap_or_default();
-                    // 一个分片都没流出（极早停止）：不落空的助手轮。
+                    // 一个分片都没流出（极早停止）：不落空的助手轮；
+                    // 只有思考、还没出正文时仍要落（思考也是「已生成部分」）。
                     let partial = (!partial.trim().is_empty()).then_some(partial);
-                    (partial, true)
+                    (partial, thought, true)
                 }
             }
         }
     };
 
-    // 临界区 2：落助手轮 + 刷新会话时间（停止时落的是已生成部分）。
-    if let Some(reply) = &reply {
+    // 临界区 2：落助手轮（含思考）+ 刷新会话时间（停止时落的是已生成部分）。
+    // 正文空但思考非空（停在思考阶段）也要落盘，否则重开对话框思考块就消失了。
+    if reply.is_some() || !thought.is_empty() {
         let _g = store.lock()?;
         let now = crate::chrono_lite::unix_secs() as i64;
         store
@@ -1778,7 +1977,8 @@ async fn turn_core(
                 session_id,
                 &[Turn {
                     role: "assistant".to_string(),
-                    text: reply.clone(),
+                    text: reply.clone().unwrap_or_default(),
+                    thought: thought.clone(),
                     ts: now,
                 }],
             )
@@ -1805,6 +2005,7 @@ mod tests {
         Turn {
             role: role.to_string(),
             text: text.to_string(),
+            thought: String::new(),
             ts: 0,
         }
     }
@@ -1999,6 +2200,17 @@ mod tests {
             .collect()
     }
 
+    /// 同 [`mock_agent_cfg`]，额外注入夹具环境变量（E2：多片思考/正文）。
+    fn mock_agent_cfg_with(
+        record_file: &std::path::Path,
+        extra: &[(&str, &str)],
+    ) -> crate::runtime::harness::AgentConfig {
+        let mut cfg = mock_agent_cfg(record_file);
+        cfg.extra_env
+            .extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        cfg
+    }
+
     /// GUI 路径的核心断言：装配好的 prompt 真送到 agent，回程文本原样返回。
     /// （echo 臂：mock 把 prompt 原文 echo 回来，据此证明"历史确实进了 prompt"。）
     #[tokio::test]
@@ -2097,27 +2309,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ── E1 流式累积/去重/停止态（纯逻辑，GUI 与历史共用）──
+    /// E2 流式全链路（隔离夹具）：mock 发 3 片思考 + 2 片正文 ⇒ **同一条 sink** 上按到达
+    /// 顺序拿到 Thought×3、Text×2；历史里助手轮**分别**存下思考与正文（不丢任一侧）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn turn_core_streams_thought_and_text_into_history() {
+        let rec = std::env::temp_dir()
+            .join(format!("abb-syschat-trec-{}.jsonl", uuid::Uuid::new_v4()));
+        let (store, base) = tmp_store("thought");
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st));
+        store.save(&st).unwrap();
+        let id = st.current.clone();
+        let ws = std::env::temp_dir().join(format!("abb-syschat-tws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        let end = turn_core(
+            &store,
+            &id,
+            mock_agent_cfg_with(
+                &rec,
+                &[
+                    ("MOCK_THOUGHT_TEXT", "先想A再想B再想C"),
+                    ("MOCK_THOUGHT_CHUNKS", "3"),
+                    ("MOCK_TEXT_TEXT", "正文一号正文二号"),
+                    ("MOCK_TEXT_CHUNKS", "2"),
+                ],
+            ),
+            ws,
+            "syschat-thought-marker",
+            &[],
+            Some(StreamWiring {
+                chunks: tx,
+                cancel: CancellationToken::new(),
+            }),
+        )
+        .await
+        .expect("mock 思考+正文回合应 Done");
+        let TurnEnd::Done(text) = end else {
+            panic!("未取消的回合应为 Done，实际 {end:?}");
+        };
+        assert_eq!(text, "正文一号正文二号", "最终文本只有正文");
+
+        // 同一条 sink：kind 与顺序都必须对（思考片在前，正文片在后）。
+        let mut kinds = Vec::new();
+        let mut thought = String::new();
+        let mut body = String::new();
+        while let Ok(c) = rx.try_recv() {
+            kinds.push(c.kind);
+            match c.kind {
+                ChunkKind::Thought => thought.push_str(&c.text),
+                ChunkKind::Text => body.push_str(&c.text),
+            }
+        }
+        assert_eq!(thought, "先想A再想B再想C", "思考分片拼接应无损");
+        assert_eq!(body, "正文一号正文二号", "正文分片拼接应无损");
+        assert_eq!(
+            kinds,
+            vec![
+                ChunkKind::Thought,
+                ChunkKind::Thought,
+                ChunkKind::Thought,
+                ChunkKind::Text,
+                ChunkKind::Text,
+            ],
+            "同一条通道按到达顺序转发，kind 不得串"
+        );
+
+        // 历史：助手轮分别存下正文与思考（思考进 `Turn.thought`）。
+        let hist = store.read_history(&id);
+        assert_eq!(hist.len(), 2, "历史应含 user + assistant: {hist:?}");
+        assert_eq!(hist[1].text, "正文一号正文二号");
+        assert_eq!(hist[1].thought, "先想A再想B再想C");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── E1/E2 流式累积/分段/去重/停止态（纯逻辑，GUI 与历史共用）──
 
     #[test]
     fn streaming_bubble_accumulates_in_order() {
         let mut b = StreamingBubble::start();
-        assert!(b.push("打"));
-        assert!(b.push("字"));
-        assert!(!b.push(""), "空 delta 不算变化");
+        assert!(b.push(ChunkKind::Text, "打", 1.0));
+        assert!(b.push(ChunkKind::Text, "字", 1.1));
+        assert!(!b.push(ChunkKind::Text, "", 1.2), "空 delta 不算变化");
         assert_eq!(b.shown(), "打字");
-        assert!(b.active);
-        assert!(!b.stopped);
+        assert!(b.is_active());
+        assert!(!b.is_stopped());
     }
 
-    /// 去重口径：回合结束时以最终文本为唯一权威替换显示文本（不一致时不拼接、不重复）。
+    /// E2：思考与正文分段互不混入，且段序 = 到达顺序（同类并段、换类开新段）。
     #[test]
-    fn streaming_bubble_finish_replaces_with_final_text() {
+    fn streaming_bubble_segments_thought_and_text_by_arrival_order() {
         let mut b = StreamingBubble::start();
-        b.push("已流出的一部分");
-        assert_eq!(b.finish("最终完整文本"), "最终完整文本");
-        assert_eq!(b.shown(), "最终完整文本", "不得保留旧拼接");
-        assert!(!b.active);
+        b.push(ChunkKind::Thought, "先想", 0.0);
+        b.push(ChunkKind::Thought, "再想", 1.5);
+        b.push(ChunkKind::Text, "正文", 2.0);
+        b.push(ChunkKind::Thought, "补充", 3.0);
+        b.push(ChunkKind::Text, "续写", 4.0);
+
+        assert_eq!(b.thought(), "先想再想补充", "思考段按顺序拼接");
+        assert_eq!(b.shown(), "正文续写", "正文不得掺进思考");
+        assert!(b.has_thought());
+
+        let kinds: Vec<ChunkKind> = b.segments().iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ChunkKind::Thought,
+                ChunkKind::Text,
+                ChunkKind::Thought,
+                ChunkKind::Text
+            ],
+            "换类必须开新段，顺序即上屏顺序"
+        );
+        let texts: Vec<&str> = b.segments().iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["先想再想", "正文", "补充", "续写"]);
+    }
+
+    /// 思考耗时累计：在进行的最后一段用 `now`，更早的段用自身 `last`（不得被 now 重复放大）。
+    #[test]
+    fn streaming_bubble_thought_secs_accumulates() {
+        let mut b = StreamingBubble::start();
+        b.push(ChunkKind::Thought, "第一段", 0.0);
+        b.push(ChunkKind::Thought, "…", 2.0); // 第一段 0.0→2.0
+        b.push(ChunkKind::Text, "正文", 3.0);
+        b.push(ChunkKind::Thought, "第二段", 10.0); // 进行中
+        assert!(
+            (b.thought_secs(12.5) - 4.5).abs() < 1e-9,
+            "2.0 + 2.5 = 4.5"
+        );
+        b.stop();
+        assert!(
+            (b.thought_secs(99.0) - 2.0).abs() < 1e-9,
+            "停止后不再按 now 增长"
+        );
+    }
+
+    /// 耗时文案：<60s 用秒，≥60s 用分；负值夹到 0。
+    #[test]
+    fn format_elapsed_seconds_and_minutes() {
+        assert_eq!(format_elapsed(0.0), "0.0s");
+        assert_eq!(format_elapsed(3.24), "3.2s");
+        assert_eq!(format_elapsed(12.0), "12.0s");
+        assert_eq!(format_elapsed(59.9), "59.9s");
+        assert_eq!(format_elapsed(60.0), "1.0m");
+        assert_eq!(format_elapsed(95.0), "1.6m");
+        assert_eq!(format_elapsed(-1.0), "0.0s");
     }
 
     /// E1 评审 B1 的回归：模型被整体重载（行数缩到比锚点小）后，锚点必须判为**失效**，
@@ -2142,19 +2483,103 @@ mod tests {
     #[test]
     fn streaming_bubble_finish_identical_is_stable() {
         let mut b = StreamingBubble::start();
-        b.push("一样");
-        assert_eq!(b.finish("一样"), "一样");
+        b.push(ChunkKind::Text, "一样", 1.0);
+        assert!(!b.finish("一样", 2.0), "文本未变 ⇒ 不必重渲染");
         assert_eq!(b.shown(), "一样");
+    }
+
+    /// 去重口径：回合结束时以最终文本为唯一权威**重建正文**（不一致时不拼接、不重复），
+    /// 但**思考段原样保留**（最终文本里没有思考，不能顺手删掉）。
+    #[test]
+    fn streaming_bubble_finish_replaces_text_and_keeps_thought() {
+        let mut b = StreamingBubble::start();
+        b.push(ChunkKind::Thought, "想了一半", 0.0);
+        b.push(ChunkKind::Text, "已流出的一部分", 1.0);
+        assert!(b.finish("最终完整文本", 2.0));
+        assert_eq!(b.shown(), "最终完整文本", "正文不得保留旧拼接");
+        assert_eq!(b.thought(), "想了一半", "思考段必须保留");
+        assert!(!b.is_active());
     }
 
     #[test]
     fn streaming_bubble_stop_keeps_generated_text() {
         let mut b = StreamingBubble::start();
-        b.push("生成到一半");
+        b.push(ChunkKind::Thought, "想到一半", 0.0);
+        b.push(ChunkKind::Text, "生成到一半", 1.0);
         b.stop();
-        assert_eq!(b.shown(), "生成到一半", "停止必须保留已生成文本");
-        assert!(b.stopped);
-        assert!(!b.active);
+        assert_eq!(b.shown(), "生成到一半", "停止必须保留已生成正文");
+        assert_eq!(b.thought(), "想到一半", "停止必须保留已生成思考");
+        assert!(b.is_stopped());
+        assert!(!b.is_active());
+    }
+
+    // ── E2 客户端打字机（后端整条吐文本时的补字口径）──
+
+    /// 逐字推进：`shown` 恒为 `target` 的前缀；推到末尾即 done（推完立即收尾，再拍不变化）。
+    #[test]
+    fn typewriter_reveals_prefix_then_finishes() {
+        let mut tw = Typewriter::new();
+        tw.push("打字机");
+        assert_eq!(tw.shown(), "", "未拍时不上屏");
+        assert!(!tw.done());
+        // pending=3 ⇒ step=1（max(1, 3/2) = 1），逐字。
+        assert!(tw.tick());
+        assert_eq!(tw.shown(), "打");
+        assert!(tw.tick());
+        assert!(tw.tick());
+        assert_eq!(tw.shown(), "打字机");
+        assert!(tw.done(), "推完即到收尾点");
+        assert!(!tw.tick(), "收尾后不再变化");
+    }
+
+    /// 大段自适应追赶：积压越多每拍推进越多，十来拍收口（不是逐字拖几秒）。
+    #[test]
+    fn typewriter_catches_up_big_chunks_within_few_ticks() {
+        let mut tw = Typewriter::new();
+        tw.push(&"字".repeat(200));
+        let mut ticks = 0;
+        while !tw.done() && ticks < 100 {
+            tw.tick();
+            ticks += 1;
+        }
+        assert!(tw.done());
+        assert!(ticks <= 12, "200 字应在 ≤12 拍内追平，实际 {ticks}");
+        assert_eq!(tw.shown().chars().count(), 200);
+    }
+
+    /// 停止/收尾用 `flush` 一次性显示已生成的全部文本 ⇒ 不丢字。
+    #[test]
+    fn typewriter_flush_reveals_everything() {
+        let mut tw = Typewriter::new();
+        tw.push("生成到一半的回复");
+        tw.tick();
+        assert!(tw.flush());
+        assert_eq!(tw.shown(), "生成到一半的回复");
+        assert!(tw.done());
+        assert!(!tw.flush(), "已追平再 flush 无变化");
+    }
+
+    /// 收尾去重：以权威全文 `set_target`；旧显示是前缀则保留，不是则清空（不显示错位字节）。
+    #[test]
+    fn typewriter_set_target_is_authoritative() {
+        let mut tw = Typewriter::new();
+        tw.push("前缀");
+        tw.tick();
+        assert_eq!(tw.shown(), "前");
+        tw.set_target("前缀被规范化后的全文");
+        assert_eq!(tw.shown(), "前", "旧显示仍为新目标前缀 ⇒ 保留");
+        // 完全不搭界的新目标：旧显示必须清空。
+        tw.set_target("完全不同的文本");
+        assert_eq!(tw.shown(), "", "非前缀必须清零，避免显示不属于目标的字");
+    }
+
+    /// 多字节：逐字推进按 char 切，不产生 UTF-8 半个字符（不 panic、不丢字）。
+    #[test]
+    fn typewriter_multibyte_boundaries() {
+        let mut tw = Typewriter::new();
+        tw.push("怹🟦好");
+        while tw.tick() {}
+        assert_eq!(tw.shown(), "怹🟦好");
     }
 
     // ── A 批：会话 store（用临时 base，不碰真实 ~/.agent-bridge）──

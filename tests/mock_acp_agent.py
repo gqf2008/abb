@@ -22,6 +22,22 @@ def send(msg):
     sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
+def emit_chunks(sid, session_update, body, n):
+    """把 body 近似均分成 n 片，逐片发同 kind 的 session/update。
+
+    E2 夹具：一个回合可以同时有**多片思考**与**多片正文**（验证 ABB 侧的同一条
+    sink 按 kind 分段 + 客户端打字机补字）。n <= 1 时只发一片，与旧单条发送逐字节一致。
+    """
+    if not body:
+        return
+    n = max(1, int(n))
+    step = max(1, (len(body) + n - 1) // n)
+    for i in range(0, len(body), step):
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": sid,
+            "update": {"sessionUpdate": session_update,
+                       "content": {"type": "text", "text": body[i:i + step]}}}})
+
 session_counter = 0
 
 for line in sys.stdin:
@@ -106,9 +122,18 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": rid,
                   "result": {"stopReason": "end_turn"}})
             continue
-        send({"jsonrpc": "2.0", "method": "session/update", "params": {
-            "sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk",
-                                          "content": {"type": "text", "text": f"echo: {text}"}}}})
+        # E2 端到端夹具：可选发多片思考（MOCK_THOUGHT_TEXT / MOCK_THOUGHT_CHUNKS）
+        # 与多片正文（MOCK_TEXT_TEXT / MOCK_TEXT_CHUNKS）。默认不发思考、正文单片，
+        # 与既有用例逐字节一致。
+        if os.environ.get("MOCK_THOUGHT_TEXT") is not None:
+            record({"event": "thought_sent", "sessionId": sid,
+                    "text": os.environ["MOCK_THOUGHT_TEXT"]})
+            emit_chunks(sid, "agent_thought_chunk",
+                        os.environ["MOCK_THOUGHT_TEXT"],
+                        os.environ.get("MOCK_THOUGHT_CHUNKS", "1"))
+        body = os.environ.get("MOCK_TEXT_TEXT") or f"echo: {text}"
+        emit_chunks(sid, "agent_message_chunk", body,
+                    os.environ.get("MOCK_TEXT_CHUNKS", "1"))
         send({"jsonrpc": "2.0", "id": rid,
               "result": {"stopReason": "end_turn"}})
     elif method == "session/cancel":

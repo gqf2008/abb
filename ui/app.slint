@@ -3027,6 +3027,11 @@ export struct SysChatBlockRow {
     alt: string,
     img: image,          // 已加载的图片（本地/已缓存）；未加载时为空
     img-ok: bool,        // 图片是否已成功加载（否则显示链接回退）
+    // 思考块（E2 需求 #11：`kind == "think"`）专用字段。默认**折叠**；`think-live` = 思考仍在
+    // 进行（流式展开让打字机可见，进正文/收尾即收起）；`think-elapsed` 由 Rust 格式化（如 3.2s）。
+    think-expanded: bool,
+    think-live: bool,
+    think-elapsed: string,
 }
 
 // 待发附件 chip（D 批 3+N）：`index` 是它在**完整待发列表**里的下标——✕ 按它精确移除。
@@ -3423,6 +3428,7 @@ export component SystemChatWindow inherits Window {
 
     callback send(string);
     callback stop-streaming();   // ⏹ 停止：取消在途回合（Rust 侧发 external_cancel）
+    callback toggle-think(int);  // 思考块展开/收起（E2）：参数是该块在 `blocks` 里的下标
     callback attach-pick();
     callback attach-clear();       // 清空待发列表（只清内存，不删已落盘文件）
     callback attach-remove(int);   // 按完整列表下标移除单个待发附件（✕）
@@ -3659,7 +3665,7 @@ export component SystemChatWindow inherits Window {
                     }
                     // 一块一元素（B 批：完整 markdown 渲染）。整个对话是一个内容区，
                     // 一轮 = 角色名块 + 若干内容块（无外框、无底色）。
-                    for b in root.blocks: VerticalBox {
+                    for b[i] in root.blocks: VerticalBox {
                         width: 100%;
                         vertical-stretch: 0;
                         spacing: 2px;
@@ -3668,6 +3674,46 @@ export component SystemChatWindow inherits Window {
                             font-size: 11px;
                             font-weight: 700;
                             color: b.text == "怹" ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
+                        }
+                        // 思考块（E2 需求 #11）：独立成块、默认折叠，标题显示耗时；展开看推理
+                        //（等宽、保留换行）。进行中的思考块自动展开（让打字机可见）。
+                        if b.kind == "think": Rectangle {
+                            width: 100%;
+                            background: PixelTheme.bg;
+                            border-width: 1px;
+                            border-color: PixelTheme.edge;
+                            border-radius: 6px;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 4px;
+                                Rectangle {
+                                    width: 100%;
+                                    height: 18px;
+                                    background: transparent;
+                                    Text {
+                                        text: (b.think-expanded ? "▾ " : "▸ ")
+                                            + (b.think-live ? "思考中" : "思考过程")
+                                            + (b.think-elapsed == "" ? "" : " · " + b.think-elapsed);
+                                        font-size: 11.5px;
+                                        font-weight: 600;
+                                        color: UiTokens.text-dim;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.toggle-think(i); }
+                                    }
+                                }
+                                if b.think-expanded: Text {
+                                    text: b.text;
+                                    font-size: 12px;
+                                    color: UiTokens.text-dim;
+                                    font-family: "ui-monospace, Menlo, Consolas, monospace";
+                                    wrap: word-wrap;
+                                    // 可用宽 = 块内 416 − 内层 VerticalBox 的左右 padding 12
+                                    width: root.convo-text-width - 12px;
+                                }
+                            }
                         }
                         if b.kind == "h1": StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释

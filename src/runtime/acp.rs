@@ -273,8 +273,7 @@ static RESOURCE_DROP_COUNTS: [std::sync::atomic::AtomicU64; 3] =
 pub enum ChunkKind {
     /// `agent_message_chunk`：助手正文 delta。
     Text,
-    /// `agent_thought_chunk`：思考 delta（E2 才回传，当前只保留接口）。
-    #[allow(dead_code)] // E2 之前不会构造；保留接口避免将来改 sink 类型签名
+    /// `agent_thought_chunk`：思考 delta（E2：与正文共用同一条 sink，由消费端区分渲染）。
     Thought,
 }
 
@@ -1881,8 +1880,21 @@ impl AcpClient {
                 false
             }
             "agent_thought_chunk" => {
+                // E2：与正文同一条 sink + 同一个 `turn_session` 过滤口径——
+                // 不新造第二条通道（消费端按 `ChunkKind` 分段渲染；取消/respawn 后的
+                // 跨会话残片同样被挡在这道过滤外）。
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::debug!(target: "acp::thought", "{text}");
+                    if msg["params"]["sessionId"].as_str() == self.turn_session.as_deref() {
+                        if let Some(session_id) = self.turn_session.as_deref() {
+                            dispatch_turn_chunk(
+                                &self.chunk_events,
+                                session_id,
+                                ChunkKind::Thought,
+                                text,
+                            );
+                        }
+                    }
                 }
                 false
             }
@@ -2372,6 +2384,20 @@ mod turn_chunk_tests {
             out.push_str(&c.text);
         }
         assert_eq!(out, "打字机🟦");
+    }
+
+    /// 接入的 sink 对思考分片与正文分片**同构**（字段与 kind 一致）；两者走同一个通道。
+    #[test]
+    fn thought_chunk_shares_the_same_sink() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        dispatch_turn_chunk(&Some(tx.clone()), "abb-7", ChunkKind::Thought, "思考吧");
+        dispatch_turn_chunk(&Some(tx), "abb-7", ChunkKind::Text, "正文");
+        let th = rx.try_recv().expect("思考分片应投递");
+        assert_eq!((th.session_id.as_str(), th.kind), ("abb-7", ChunkKind::Thought));
+        assert_eq!(th.text, "思考吧");
+        let tx2 = rx.try_recv().expect("正文分片应投递");
+        assert_eq!(tx2.kind, ChunkKind::Text);
+        assert_eq!(tx2.text, "正文");
     }
 }
 
@@ -3772,6 +3798,43 @@ mod tests {
         assert!(
             client.active_run_id().is_none(),
             "explicit null must clear active_run_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn thought_chunks_gated_by_turn_session_on_the_live_parser() {
+        // 驱动**生产解析路径**（`handle_session_update`），不是复刻表达式：
+        // E2 要求思考分片走与正文同一条 sink、同一个 `turn_session` 过滤口径。
+        let mut client = spawn_inert_client().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        client.chunk_events = Some(tx);
+        client.turn_session = Some("s1".to_string());
+
+        let msg = |sid: &str, text: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": { "text": text },
+                    },
+                }
+            })
+        };
+
+        client.handle_session_update(&msg("s1", "想一下"));
+        let got = rx.try_recv().expect("本会话思考分片应回传");
+        assert_eq!(got.session_id, "s1");
+        assert_eq!(got.kind, ChunkKind::Thought);
+        assert_eq!(got.text, "想一下");
+
+        // 替代会话的残片（cancel/respawn 后晚到）不得混入本回合——与正文同一道闸。
+        client.handle_session_update(&msg("other", "杂音"));
+        assert!(
+            rx.try_recv().is_err(),
+            "跨会话思考分片必须被 turn_session 过滤掉"
         );
     }
 

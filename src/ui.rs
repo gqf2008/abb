@@ -204,8 +204,11 @@ enum WxEvt {
 /// 由专用的 50ms 流式定时器轮询上屏（E1；与 dep_rx/prov_rx/vb_rx 的 2s 轮询同模式，
 /// 只是节拍更快以保证打字机手感）。
 enum SysChatEvt {
-    /// 流式正文 delta（E1）：追加到当前助手气泡（打字机）。
-    Delta(String),
+    /// 流式分片（E1 正文 / E2 思考）：按 kind 分段累积，分别喂两路打字机。
+    Delta {
+        kind: crate::runtime::acp::ChunkKind,
+        text: String,
+    },
     /// 回合成功：助手回复文本（以它为准收尾流式气泡，见去重口径）。
     Reply(String),
     /// 用户停止：保留已生成文本，提示「已停止」。
@@ -214,6 +217,14 @@ enum SysChatEvt {
     Error(String),
     /// 后台已把一个 http(s) 媒体下到缓存：重载当前会话让图片内联显示。
     MediaReady,
+}
+
+/// 流式回合的**结局态**（GUI 侧）：Reply 要等打字机把已收到文本推完再收尾
+///（否则大段 chunk 会一次性蹦出），Stopped 已经 `flush` 过、当拍即可收尾。
+#[derive(Clone, PartialEq, Eq)]
+enum StreamEnd {
+    Reply(String),
+    Stopped,
 }
 
 /// 虚拟 Bot 操作结果（#75，后台 → 主线程）：创建/编辑/登记/解散统一形状。
@@ -2196,6 +2207,9 @@ pub fn run_gui() -> Result<()> {
             alt: "".into(),
             img: slint::Image::default(),
             img_ok: false,
+            think_expanded: false,
+            think_live: false,
+            think_elapsed: "".into(),
         }
     }
     /// 加载块图片：本地路径直读；http(s) 读本地缓存（未缓存则先空，由后台下载后重载）。
@@ -2260,6 +2274,35 @@ pub fn run_gui() -> Result<()> {
             alt: b.alt.into(),
             img,
             img_ok,
+            think_expanded: false,
+            think_live: false,
+            think_elapsed: "".into(),
+        }
+    }
+    /// 思考块行（E2）：内容放 `text`，展开态/进行态/耗时放专用字段；
+    /// 默认**折叠**（`expanded=false`）；`live` = 思考仍在进行（流式展开让打字机可见，
+    /// 一旦进入正文或收尾就自动收起）。
+    fn think_row(text: &str, elapsed: &str, expanded: bool, live: bool) -> SysChatBlockRow {
+        SysChatBlockRow {
+            kind: "think".into(),
+            text: text.into(),
+            styled: slint::StyledText::default(),
+            level: 0,
+            order: 0,
+            checked: false,
+            marker: "".into(),
+            lang: "".into(),
+            cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                Vec::<slint::SharedString>::new(),
+            ))),
+            header: false,
+            src: "".into(),
+            alt: "".into(),
+            img: slint::Image::default(),
+            img_ok: false,
+            think_expanded: expanded,
+            think_live: live,
+            think_elapsed: elapsed.into(),
         }
     }
     fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
@@ -2270,16 +2313,50 @@ pub fn run_gui() -> Result<()> {
         }
         rows
     }
+    /// 一轮历史 → 渲染行：角色行 +（有思考则）思考块 + 正文 markdown 块。
+    fn rows_for_turn(t: &crate::syschat::Turn) -> Vec<SysChatBlockRow> {
+        let mut rows = rows_for(&t.role, &t.text);
+        if !t.thought.is_empty() {
+            // 历史里的思考块**默认折叠**（需求 #11），耗时历史未存 ⇒ 不显示数字。
+            rows.insert(1, think_row(&t.thought, "", false, false));
+        }
+        rows
+    }
+    /// 流式状态的当前快照 → 渲染行：角色行 +（有思考则）思考块 + 正文块。
+    /// `expanded` 由 `live` 决定（进行中展开以显示打字机，结束/进正文即收起）。
+    fn stream_rows(
+        revealed_text: &str,
+        has_thought: bool,
+        thought_text: &str,
+        elapsed: &str,
+        live: bool,
+    ) -> Vec<SysChatBlockRow> {
+        let mut rows = vec![role_row("怹")];
+        if has_thought {
+            rows.push(think_row(thought_text, elapsed, live, live));
+        }
+        for b in crate::mdblocks::parse(revealed_text) {
+            rows.push(block_row(b));
+        }
+        rows
+    }
     /// 用当前累积文本重建「流式气泡」的行：从 `start` 起到末尾全替换。
     ///
     /// 为什么整段重建：增量改行需要知道 markdown 分块边界，而 `mdblocks::parse`
     /// 随文本增长会重新分块；整段替换是唯一不会留残行/重复角色的做法。
     /// 去重口径：回合结束时调用方用 `final_text` 重建同一段——不保留旧拼接、不追加第二条。
-    fn sync_stream_rows(model: &slint::VecModel<SysChatBlockRow>, start: usize, text: &str) {
+    ///
+    /// 已知边界（E2）：流式期间手动展开的**已完成**思考块会在下一次重建时恢复默认折叠
+    ///（重建按内容重算行，不跨重建携带用户点开的态）；回合收尾后的点击则不会被重建覆盖。
+    fn sync_stream_rows(
+        model: &slint::VecModel<SysChatBlockRow>,
+        start: usize,
+        rows: Vec<SysChatBlockRow>,
+    ) {
         while model.row_count() > start {
             model.remove(model.row_count() - 1);
         }
-        for r in rows_for("assistant", text) {
+        for r in rows {
             model.push(r);
         }
     }
@@ -2303,7 +2380,7 @@ pub fn run_gui() -> Result<()> {
         let turns = crate::syschat::load_history();
         let mut rows: Vec<SysChatBlockRow> = Vec::new();
         for t in &turns {
-            rows.extend(rows_for(&t.role, &t.text));
+            rows.extend(rows_for_turn(t));
         }
         model.set_vec(rows);
         // 请求滞底：递增 epoch，由 .slint 的 changed 处理器把 content-y 设成越界值、
@@ -2380,10 +2457,17 @@ pub fn run_gui() -> Result<()> {
     // 到工作区附件目录并上屏，发送时路径随消息文本一起进 prompt（见
     // `syschat::prompt_with_attachments`）——二进制不进 prompt。
     let sc_atts: Rc<RefCell<Vec<crate::syschat::Attachment>>> = Rc::new(RefCell::new(Vec::new()));
-    // E1 流式状态：累积器 + 流式气泡在 model 里的起始行（`usize::MAX` = 当前没有流式气泡）
-    // + 在途回合的外部取消令牌（⏹ 停止）。三者都是 UI 线程本地状态，不上跨线程。
+    // E1/E2 流式状态：分段累积器 + 两路客户端打字机（正文 / 思考）+ 气泡在 model 里的
+    // 起始行（`usize::MAX` = 当前没有流式气泡）+ 在途回合的外部取消令牌（⏹ 停止）
+    // + 回合结局（Reply 要等打字机推完再收尾；Stopped 立即收）。都是 UI 线程本地状态。
     let sc_stream: Rc<RefCell<crate::syschat::StreamingBubble>> =
         Rc::new(RefCell::new(crate::syschat::StreamingBubble::default()));
+    // 两路打字机：后端一次吐一大段时（实测 abb-agent 就是），按拍把文本逐段推上屏。
+    let sc_tw_text: Rc<RefCell<crate::syschat::Typewriter>> =
+        Rc::new(RefCell::new(crate::syschat::Typewriter::new()));
+    let sc_tw_think: Rc<RefCell<crate::syschat::Typewriter>> =
+        Rc::new(RefCell::new(crate::syschat::Typewriter::new()));
+    let sc_stream_end: Rc<RefCell<Option<StreamEnd>>> = Rc::new(RefCell::new(None));
     let sc_stream_start: Rc<Cell<usize>> = Rc::new(Cell::new(usize::MAX));
     let sc_cancel: Rc<RefCell<Option<tokio_util::sync::CancellationToken>>> =
         Rc::new(RefCell::new(None));
@@ -3893,8 +3977,9 @@ pub fn run_gui() -> Result<()> {
                         tokio::spawn(async move {
                             let evt = match Config::load() {
                                 Ok(cfg) => {
-                                    // E1：统一走流式入口；delta 先经转发任务回主线程（`Delta`），
-                                    // 回合结局再给 Reply/Stopped/Error。附件为空时语义与旧 `turn` 一致。
+                                    // E1/E2：统一走流式入口；分片（正文与思考都带 kind）先经转发任务
+                                    // 回主线程（`Delta`），回合结局再给 Reply/Stopped/Error。
+                                    // **不新造第二条通道**：思考与正文共用同一个 sink，只是 kind 不同。
                                     let (delta_tx, mut delta_rx) =
                                         tokio::sync::mpsc::unbounded_channel::<
                                             crate::runtime::acp::TurnChunk,
@@ -3902,12 +3987,10 @@ pub fn run_gui() -> Result<()> {
                                     let etx_delta = etx.clone();
                                     let forwarder = tokio::spawn(async move {
                                         while let Some(chunk) = delta_rx.recv().await {
-                                            if chunk.kind
-                                                == crate::runtime::acp::ChunkKind::Text
-                                            {
-                                                let _ = etx_delta
-                                                    .send(SysChatEvt::Delta(chunk.text));
-                                            }
+                                            let _ = etx_delta.send(SysChatEvt::Delta {
+                                                kind: chunk.kind,
+                                                text: chunk.text,
+                                            });
                                         }
                                     });
                                     let end = crate::syschat::turn_streaming(
@@ -6164,6 +6247,9 @@ pub fn run_gui() -> Result<()> {
         let cancel_slot = sc_cancel.clone();
         let stream = sc_stream.clone();
         let stream_start = sc_stream_start.clone();
+        let stream_end = sc_stream_end.clone();
+        let tw_text = sc_tw_text.clone();
+        let tw_think = sc_tw_think.clone();
         syschat_win.on_send(move |text| {
             let text = text.trim().to_string();
             if text.is_empty() {
@@ -6194,10 +6280,13 @@ pub fn run_gui() -> Result<()> {
             }
             atts.borrow_mut().clear();
             refresh_syschat_atts(&w, &atts, &pending);
-            // E1：为本轮建外部取消令牌（⏹ 停止直接 `.cancel()`），并重置流式累积/气泡起点。
+            // E1/E2：为本轮建外部取消令牌（⏹ 停止直接 `.cancel()`），并重置流式累积/打字机/结局态。
             let token = tokio_util::sync::CancellationToken::new();
             *cancel_slot.borrow_mut() = Some(token.clone());
             *stream.borrow_mut() = crate::syschat::StreamingBubble::start();
+            *tw_text.borrow_mut() = crate::syschat::Typewriter::new();
+            *tw_think.borrow_mut() = crate::syschat::Typewriter::new();
+            *stream_end.borrow_mut() = None;
             stream_start.set(usize::MAX);
             let _ = tx.send(UiCmd::SysChatSend {
                 text,
@@ -6212,6 +6301,26 @@ pub fn run_gui() -> Result<()> {
         syschat_win.on_stop_streaming(move || {
             if let Some(t) = cancel_slot.borrow().as_ref() {
                 t.cancel();
+            }
+        });
+    }
+    // 思考块展开/收起（E2 需求 #11）：点标题切换该行 `think_expanded` 并重设该行。
+    // 默认折叠；**流式进行中**的思考块由 `live` 驱动展开（打字机可见），进正文/收尾后
+    // 由下一次重建按 `live=false` 收起（重建会重算行，不跨重建携带手动态——已在
+    // `sync_stream_rows` 注释里写明这个已知边界）。
+    {
+        let model = syschat_model.clone();
+        let cw = syschat_win.as_weak();
+        syschat_win.on_toggle_think(move |idx| {
+            let i = idx.max(0) as usize;
+            if let Some(mut r) = model.row_data(i) {
+                if r.kind == "think" {
+                    r.think_expanded = !r.think_expanded;
+                    model.set_row_data(i, r);
+                    if let Some(w) = cw.upgrade() {
+                        w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                    }
+                }
             }
         });
     }
@@ -6401,11 +6510,18 @@ pub fn run_gui() -> Result<()> {
         });
     }
 
-    // ── 系统级对话流式事件：专用 50ms 定时器（E1）──
+    // ── 系统级对话流式事件：专用 50ms 定时器（E1/E2）──
     //
-    // 为什么不用 2s 主定时器：打字机需要 delta 尽快上屏，2s 一拍只能看到「一跳一跳」；
-    // 50ms 的 `try_recv` 几乎无开销（空轮询就是一次原子检查），且不再是回复延迟的瓶颈。
-    // delta 只做「整段重建流式气泡」，Reply/Stopped 收尾并回到空闲。
+    // 为什么不用 2s 主定时器：打字机需要分片尽快上屏，2s 一拍只能看到「一跳一跳」；
+    // 50ms 的 `try_recv` 几乎无开销（空轮询就是一次原子检查）。
+    //
+    // E1/E2 口径：
+    // - 分片（正文 `Text` / 思考 `Thought`）都进同一个分段累积器，按 kind 分段；
+    // - **客户端打字机**（`syschat::Typewriter`）每拍把已收到的文本逐段推上屏——
+    //   实测 `abb-agent` 在 `MessageEnd` 整条发正文（一个回合常常只有 1～2 片），
+    //   不做这层补字就会「一次性蹦出」；
+    // - `Reply` 不立刻收尾：先让打字机把已收到文本推完（`StreamEnd::Reply`）
+    //   再整段重建（以 `final_text` 为唯一权威）；`Stopped` 已 `flush`，当拍收尾。
     {
         let syschat_model_t = syschat_model.clone();
         let win_w = syschat_win.as_weak();
@@ -6413,101 +6529,61 @@ pub fn run_gui() -> Result<()> {
         let rm = request_media.clone();
         let stream_state = sc_stream.clone();
         let stream_start = sc_stream_start.clone();
+        let stream_end = sc_stream_end.clone();
+        let tw_text = sc_tw_text.clone();
+        let tw_think = sc_tw_think.clone();
         let cancel_slot = sc_cancel.clone();
+        let clock = std::time::Instant::now();
         let syschat_timer = slint::Timer::default();
         syschat_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(50),
             move || {
+                let now = clock.elapsed().as_secs_f64();
+                let mut dirty = false;
                 while let Ok(evt) = syschat_rx.try_recv() {
                     match evt {
-                        SysChatEvt::Delta(delta) => {
+                        SysChatEvt::Delta { kind, text } => {
                             let mut b = stream_state.borrow_mut();
-                            if !b.push(&delta) {
+                            let changed = b.push(kind, &text, now);
+                            drop(b);
+                            if !changed {
                                 continue; // 空 delta：无变化，不重渲染
                             }
-                            let text = b.shown().to_string();
-                            drop(b);
-                            // 评审 B1：模型可能在本轮流式期间被整体重载（MediaReady 不受 busy 门控），
-                            // 陈旧行号会让本轮每个 delta 重推累积全文 ⇒ 重复气泡。失效则重新锚定。
-                            if crate::syschat::stream_anchor_stale(
-                                stream_start.get(),
-                                syschat_model_t.row_count(),
-                            ) {
-                                stream_start.set(usize::MAX);
-                            }
-                            if stream_start.get() == usize::MAX {
-                                stream_start.set(syschat_model_t.row_count());
-                            }
-                            sync_stream_rows(&syschat_model_t, stream_start.get(), &text);
-                            if let Some(w) = win_w.upgrade() {
-                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-                            }
-                        }
-                        SysChatEvt::Reply(text) => {
-                            // 去重口径：以最终文本为准整段重建同一段气泡——不保留旧拼接、不追加第二条。
-                            stream_state.borrow_mut().finish(&text);
-                            // 评审 B1：先判锚点失效，否则会用陈旧起点**删掉真实历史行**（串位）。
-                            if crate::syschat::stream_anchor_stale(
-                                stream_start.get(),
-                                syschat_model_t.row_count(),
-                            ) {
-                                stream_start.set(usize::MAX);
-                            }
-                            let s0 = stream_start.get();
-                            if s0 != usize::MAX {
-                                sync_stream_rows(&syschat_model_t, s0, &text);
-                            } else {
-                                for r in rows_for("assistant", &text) {
-                                    syschat_model_t.push(r);
+                            match kind {
+                                crate::runtime::acp::ChunkKind::Text => {
+                                    tw_text.borrow_mut().push(&text)
+                                }
+                                crate::runtime::acp::ChunkKind::Thought => {
+                                    tw_think.borrow_mut().push(&text)
                                 }
                             }
-                            stream_start.set(usize::MAX);
-                            *cancel_slot.borrow_mut() = None;
-                            rm();
-                            if let Some(w) = win_w.upgrade() {
-                                w.set_busy(false);
-                                w.set_status_is_error(false);
-                                w.set_status_line("与怹直接对话（系统级 · 整机权限）".into());
-                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-                            }
-                            if let Some(b) = bubble_w.upgrade() {
-                                b.set_busy(false);
-                            }
+                            dirty = true;
+                        }
+                        SysChatEvt::Reply(text) => {
+                            // 去重口径的权威侧：先把累积器正文换成最终文本（思考段保留），
+                            // 打字机目标同换；收尾等它推完（本拍末尾判定）。
+                            let mut b = stream_state.borrow_mut();
+                            b.finish(&text, now);
+                            drop(b);
+                            tw_text.borrow_mut().set_target(&text);
+                            *stream_end.borrow_mut() = Some(StreamEnd::Reply(text));
                         }
                         SysChatEvt::Stopped => {
-                            // 停止：保留已生成文本（不清 model 行），只收起「正在输入」并提示。
-                            let mut b = stream_state.borrow_mut();
-                            b.stop();
-                            let text = b.shown().to_string();
-                            drop(b);
-                            // 评审 B1：停止路径同样不得用陈旧锚点（会删错行）。
-                            if crate::syschat::stream_anchor_stale(
-                                stream_start.get(),
-                                syschat_model_t.row_count(),
-                            ) {
-                                stream_start.set(usize::MAX);
-                            }
-                            let s0 = stream_start.get();
-                            if s0 != usize::MAX && !text.is_empty() {
-                                sync_stream_rows(&syschat_model_t, s0, &text);
-                            }
-                            stream_start.set(usize::MAX);
-                            *cancel_slot.borrow_mut() = None;
-                            rm();
-                            if let Some(w) = win_w.upgrade() {
-                                w.set_busy(false);
-                                w.set_status_is_error(false);
-                                w.set_status_line("已停止。".into());
-                                w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-                            }
-                            if let Some(b) = bubble_w.upgrade() {
-                                b.set_busy(false);
-                            }
+                            // 停止：保留已生成部分（思考与正文各自保留）——`flush` 把已收到的都显示出来，
+                            // 不留「收到了但没上屏」的字；随后当拍收尾。
+                            stream_state.borrow_mut().stop();
+                            tw_text.borrow_mut().flush();
+                            tw_think.borrow_mut().flush();
+                            *stream_end.borrow_mut() = Some(StreamEnd::Stopped);
+                            dirty = true;
                         }
                         SysChatEvt::Error(e) => {
-                            // 失败：已生成文本保留在气泡里（若有），只报错并收 busy。
-                            stream_start.set(usize::MAX);
+                            // 失败：已生成部分保留（打字机 `flush` 收口；**不动锚点**，免得带内容的下一次
+                            // 重建在末尾重复锚出一条），只报错并收 busy。
+                            tw_text.borrow_mut().flush();
+                            tw_think.borrow_mut().flush();
+                            *stream_end.borrow_mut() = None;
                             *cancel_slot.borrow_mut() = None;
                             if let Some(w) = win_w.upgrade() {
                                 w.set_busy(false);
@@ -6528,6 +6604,104 @@ pub fn run_gui() -> Result<()> {
                                 stream_start.set(usize::MAX);
                             }
                         }
+                    }
+                }
+                // 每拍都推进打字机（不依赖是否有新分片）：这是「逐段上屏」的动力。
+                if tw_text.borrow_mut().tick() {
+                    dirty = true;
+                }
+                if tw_think.borrow_mut().tick() {
+                    dirty = true;
+                }
+                // 结局判定：Reply 等两路打字机都推完；Stopped 已 flush，立即收尾。
+                let end = stream_end.borrow().clone();
+                if let Some(end) = end {
+                    let drained = tw_text.borrow().done() && tw_think.borrow().done();
+                    if drained || end == StreamEnd::Stopped {
+                        // 收尾：以最终文本（Reply）或已 flush 的显示文本（Stopped）重建同一段。
+                        let final_text = match &end {
+                            StreamEnd::Reply(t) => t.clone(),
+                            StreamEnd::Stopped => tw_text.borrow().shown().to_string(),
+                        };
+                        // 停止态由累积器记录（`stop()` 已设）：决定状态行文案与无锚点补行口径。
+                        let stopped = stream_state.borrow().is_stopped();
+                        // 评审 B1：先判锚点失效，否则会用陈旧起点**删掉真实历史行**（串位）。
+                        if crate::syschat::stream_anchor_stale(
+                            stream_start.get(),
+                            syschat_model_t.row_count(),
+                        ) {
+                            stream_start.set(usize::MAX);
+                        }
+                        let s0 = stream_start.get();
+                        let (has_thought, elapsed) = {
+                            let b = stream_state.borrow();
+                            (
+                                b.has_thought(),
+                                crate::syschat::format_elapsed(b.thought_secs(now)),
+                            )
+                        };
+                        let thought = tw_think.borrow().shown().to_string();
+                        let rows =
+                            stream_rows(&final_text, has_thought, &thought, &elapsed, false);
+                        if s0 != usize::MAX {
+                            sync_stream_rows(&syschat_model_t, s0, rows);
+                        } else if !stopped && (!final_text.is_empty() || has_thought) {
+                            // 回合没有任何已锚定分片就结束（极端）：直接补一条，别丢回复。
+                            for r in rows {
+                                syschat_model_t.push(r);
+                            }
+                        }
+                        stream_start.set(usize::MAX);
+                        *stream_end.borrow_mut() = None;
+                        *cancel_slot.borrow_mut() = None;
+                        rm();
+                        if let Some(w) = win_w.upgrade() {
+                            w.set_busy(false);
+                            w.set_status_is_error(false);
+                            if !stopped {
+                                w.set_status_line("与怹直接对话（系统级 · 整机权限）".into());
+                            } else {
+                                w.set_status_line("已停止。".into());
+                            }
+                            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                        }
+                        if let Some(b) = bubble_w.upgrade() {
+                            b.set_busy(false);
+                        }
+                        dirty = false;
+                    } else {
+                        // 还没推完：本拍仍要按打字机已显示的前缀重建。
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    // 流式进行中：重建已显示前缀（含思考块/正文块）。
+                    if crate::syschat::stream_anchor_stale(
+                        stream_start.get(),
+                        syschat_model_t.row_count(),
+                    ) {
+                        stream_start.set(usize::MAX);
+                    }
+                    if stream_start.get() == usize::MAX {
+                        stream_start.set(syschat_model_t.row_count());
+                    }
+                    let (has_thought, elapsed, live) = {
+                        let b = stream_state.borrow();
+                        let live = b.is_active()
+                            && b.segments().last().map(|s| s.kind)
+                                == Some(crate::runtime::acp::ChunkKind::Thought);
+                        (
+                            b.has_thought(),
+                            crate::syschat::format_elapsed(b.thought_secs(now)),
+                            live,
+                        )
+                    };
+                    let thought = tw_think.borrow().shown().to_string();
+                    let text = tw_text.borrow().shown().to_string();
+                    let rows = stream_rows(&text, has_thought, &thought, &elapsed, live);
+                    sync_stream_rows(&syschat_model_t, stream_start.get(), rows);
+                    if let Some(w) = win_w.upgrade() {
+                        w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
                     }
                 }
             },

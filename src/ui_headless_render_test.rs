@@ -87,6 +87,9 @@ fn row(kind: &str, text: &str) -> SysChatBlockRow {
         alt: "".into(),
         img: slint::Image::default(),
         img_ok: false,
+        think_expanded: false,
+        think_live: false,
+        think_elapsed: "".into(),
     }
 }
 
@@ -302,6 +305,31 @@ fn convo_bottom_not_clipped_by_composer() {
         clearance >= 6,
         "滚到底后最后一行只剩 {clearance}px 余量（内容 {fy2}..{bottom}，最底墨迹 {last2}）：\
          行被输入区切掉了。content-height 偏小 ⇒ 滞底夹取没到底（底部 12px 内边距应是空白的）"
+    );
+}
+
+/// E2 回归守卫：思考块**默认折叠**，展开后内容变高——证明 `.slint` 的 `kind == "think"`
+/// 分支真的参与布局（不是只编译过），且 `think-expanded` 字段驱动它。
+#[test]
+fn think_block_collapsed_by_default_and_expands() {
+    let long = "推理过程：".to_string() + &"先看输入再查文档最后定结论。".repeat(24);
+    let mut think = row("think", &long);
+    think.think_elapsed = "3.2s".into();
+    let collapsed = vec![row("role", "怹"), think.clone(), row("p", "正文")];
+    let (ui, win, model) = setup(collapsed, TALL_H);
+    let _ = settle(&ui, &win, TALL_H);
+    let h_collapsed = ui.get_dbg_content_h();
+
+    // 默认必须折叠：折叠高度不得包含正文推理（至少比展开矮一截）。
+    let mut expanded = think;
+    expanded.think_expanded = true;
+    model.set_row_data(1, expanded);
+    let _ = settle(&ui, &win, TALL_H);
+    let h_expanded = ui.get_dbg_content_h();
+    assert!(
+        h_expanded > h_collapsed + 20.0,
+        "展开后的思考块必须占更多高度（折叠 {h_collapsed} vs 展开 {h_expanded}）：\
+         折叠态不应渲染推理正文"
     );
 }
 
