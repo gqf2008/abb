@@ -1792,6 +1792,18 @@ const SHOTS: &str = "/Volumes/DataExt/tmp/syschat-shots";
 /// 三个会话（含 tag）+ 两个模型（当前项 ✓ / 其它项 provider），灌进窗口。
 /// 与生产 `ui::refresh_syschat_sel` 同口径的数据形状（tag 由 `syschat::session_tag` 生成）。
 fn seed_panels(ui: &SystemChatWindow) {
+    // v11（卡 `abb-v11-session-archive`）：面板文案（标题/footer/两行额外项）由 Rust 写。
+    // 这里用**生产同一个纯函数**（`syschat::session_panel_text`）算，而不是另抄一份字面量——
+    // 抄一份就会与生产漂移，出图也证明不了生产面板长什么样。
+    let copy = crate::syschat::session_panel_text(false, 0);
+    ui.set_session_panel_copy(SessionPanelCopy {
+        heading: copy.heading.into(),
+        foot: copy.foot.into(),
+        extra_text: copy.extra_text.into(),
+        extra_tag: copy.extra_tag.into(),
+        extra2_text: copy.extra2_text.into(),
+        extra2_tag: copy.extra2_tag.into(),
+    });
     ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
         slint::SharedString::from("新会话"),
         slint::SharedString::from("把架构图做成网页"),
@@ -2054,6 +2066,47 @@ fn v11_menu_panels_open_and_close_on_outside_or_second_click() {
     );
     press_release(&win, mx, my);
     assert!(ui.get_model_menu_open(), "再点模型 chip 才展开模型面板");
+}
+
+/// 卡 `abb-v11-session-archive`：会话面板的**第二行**（「🗄 已归档（N）…」）真的画出来了。
+///
+/// 判据用高度差（同数据下把 `extra2_text` 置空 ⇒ 面板正好矮一行 30px）。这是无头台能自动断言
+/// 的那一半——点击路径（点开面板 → 点「已归档」→ 原地换成归档列表）走的是 Rust 回调，
+/// 而无头台不接生产回调，那部分由 `syschat`/`ui` 的纯逻辑单测钉住（见
+/// `session_panel_text_normal_and_archive_views`、`session_menu_rows_mark_current_only_when_current_passed`）。
+///
+/// 判别力（负向）：把 `MenuPanel` 里那段 `if root.extra-text2 != ""` 删掉 ⇒ 高度差为 0，本条红。
+#[test]
+fn v11_session_panel_renders_archive_entry_row() {
+    const W520: u32 = 520;
+    let (ui, win, _m) = setup(vec![row("p", "占位")], SHORT_H);
+    seed_panels(&ui);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(W520, SHORT_H));
+    apply_syschat_layout(&ui, W520 as f32);
+    ui.set_session_menu_open(true);
+    let _ = settle_w(&win, W520, SHORT_H);
+    let with_row = ui.get_dbg_session_menu_h();
+    assert!(with_row > 0.0, "面板几何不可用：{with_row}");
+
+    // 只摘掉第二行，其余字段照抄生产纯函数的结果。
+    let mut copy = crate::syschat::session_panel_text(false, 0);
+    copy.extra2_text = String::new();
+    ui.set_session_panel_copy(SessionPanelCopy {
+        heading: copy.heading.into(),
+        foot: copy.foot.into(),
+        extra_text: copy.extra_text.into(),
+        extra_tag: copy.extra_tag.into(),
+        extra2_text: copy.extra2_text.into(),
+        extra2_tag: copy.extra2_tag.into(),
+    });
+    let _ = settle_w(&win, W520, SHORT_H);
+    let without_row = ui.get_dbg_session_menu_h();
+    assert_eq!(
+        with_row - without_row,
+        30.0,
+        "「🗄 已归档（N）…」那一行没画出来（{with_row} → {without_row}）；行高应为 30px"
+    );
 }
 
 /// v11（卡 `abb-v11-resizable-split`）：分割条的**位置/拖动/夹取/待落盘**。
@@ -2869,6 +2922,34 @@ fn dump_v11_panels_for_review() {
     write_png(&f, &dir.join("v11-session-menu.png"));
     let session_accent = bbox(&f, 0, 40, 300, 300, is_accent);
     println!("session panel frame: dbg={f_dbg:?} accent(panel)={session_accent:?}");
+    // 卡 `abb-v11-session-archive`：**归档视图**——同一面板原地换成归档列表，第一行变
+    // 「← 返回会话列表」、不再画第二行（标题/footer 由 `syschat::session_panel_text` 给）。
+    ui.set_session_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        SysChatMenuRow {
+            text: "把架构图做成网页".into(),
+            tag: "昨天 23:12".into(),
+            tick: false,
+        },
+        SysChatMenuRow {
+            text: "排查 deepseek 端点".into(),
+            tag: "今天 00:40".into(),
+            tick: false,
+        },
+    ]))));
+    let copy = crate::syschat::session_panel_text(true, 2);
+    ui.set_session_panel_copy(SessionPanelCopy {
+        heading: copy.heading.into(),
+        foot: copy.foot.into(),
+        extra_text: copy.extra_text.into(),
+        extra_tag: copy.extra_tag.into(),
+        extra2_text: copy.extra2_text.into(),
+        extra2_tag: copy.extra2_tag.into(),
+    });
+    let f = settle_w(&win, W520, H);
+    write_png(&f, &dir.join("v11-session-menu-archived.png"));
+    println!("archived view frame: h={}", ui.get_dbg_session_menu_h());
+    // 复位成普通视图（后面的模型面板那帧与本帧无关，但保持出图口径一致）。
+    seed_panels(&ui);
     ui.set_session_menu_open(false);
     ui.set_model_menu_open(true);
     let f2 = settle_w(&win, W520, H);
@@ -2886,7 +2967,7 @@ fn dump_v11_panels_for_review() {
     let top = crop(&f, 0, 0, W520, 260);
     write_png(&top, &dir.join("v11-titlebar-status.png"));
     println!(
-        "v11 出图完成：v11-session-menu.png / v11-model-menu.png / v11-status.png / \
+        "v11 出图完成：v11-session-menu.png / v11-session-menu-archived.png / v11-model-menu.png / v11-status.png / \
          v11-titlebar-status.png（session_menu=({},{}), model_menu=({},{})）",
         ui.get_session_menu_x(),
         ui.get_session_menu_y(),

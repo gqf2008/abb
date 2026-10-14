@@ -138,6 +138,14 @@ pub struct SessionMeta {
     pub updated_at: i64,
     /// 本会话用的供应商名（"" = 跟随全局默认）。**「模型选择」就落在这一项上**。
     pub provider: String,
+    /// 已归档（卡 `abb-v11-session-archive`）：归档后从会话列表里隐藏，但**不删任何数据**
+    /// （`sessions/<id>.jsonl` 原样保留，取消归档即找回）。
+    ///
+    /// `#[serde(default)]` 就是**旧 `sessions.json` 的向后兼容**：老文件里根本没有这个键，
+    /// 缺字段一律按「未归档」读入。序列化方向不做跳过：让这一位在文件里显式可见，
+    /// 便于人工核对（旧版本 ABB 读新文件时 serde 默认忽略未知字段，不会因此读坏）。
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// `sessions.json` 落盘结构。
@@ -149,10 +157,22 @@ struct SessionState {
     sessions: Vec<SessionMeta>,
 }
 
+/// 最近活动的**未归档**会话（`updated_at` 最大；并列时取先插入的那条——与 [`SessionStore::list`]
+/// 的稳定排序同口径）。
+///
+/// 抽成自由函数是为了让「current 该落到哪一条」这条判据只有一处实现。
+fn newest_visible(state: &SessionState) -> Option<&SessionMeta> {
+    state
+        .sessions
+        .iter()
+        .filter(|s| !s.archived)
+        .max_by_key(|s| s.updated_at)
+}
+
 /// 会话存储（可注入 base 目录，便于单测不碰真实 `~/.agent-bridge`）。
 ///
 /// 结构：
-/// - `<base>/sessions.json`：`{current, sessions:[{id,title,created_at,updated_at,provider}]}`
+/// - `<base>/sessions.json`：`{current, sessions:[{id,title,created_at,updated_at,provider,archived}]}`
 /// - `<base>/sessions/<id>.jsonl`：该会话的逐轮历史
 /// - `<base>/history.jsonl`：旧版单会话历史（首次自动迁入默认会话）
 struct SessionStore {
@@ -209,11 +229,42 @@ impl SessionStore {
     /// 保证「至少一个会话、current 有效」；改动过返回 true。首次还把旧版单会话历史迁入默认会话。
     fn ensure_current(&self, state: &mut SessionState) -> bool {
         if !state.sessions.is_empty() {
-            if state.current.is_empty() || !state.sessions.iter().any(|s| s.id == state.current) {
-                state.current = state.sessions[0].id.clone();
-                return true;
+            // 不变量：`current` 必须是**未归档**的既有会话。归档会把会话从列表里藏起来，
+            // 若 current 还指着它，用户接下来发的消息就会写进一个列表里看不见的会话
+            // （卡 `abb-v11-session-archive`）。这一段同时覆盖「current 为空 / 已不存在」的老情况。
+            if state
+                .sessions
+                .iter()
+                .any(|s| s.id == state.current && !s.archived)
+            {
+                return false;
             }
-            return false;
+            match newest_visible(state) {
+                Some(s) => state.current = s.id.clone(),
+                None => {
+                    // 全部会话都已归档 ⇒ 起一条新的空会话。**不去改用户已归档的那些**
+                    // （归档是用户的意图，静默取消归档等于替用户反悔）。模型选择沿用刚离开
+                    // 那条会话的，别因为归档把用户的模型选择丢掉。
+                    let provider = state
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == state.current)
+                        .map(|s| s.provider.clone())
+                        .unwrap_or_default();
+                    let id = new_session_id();
+                    let now = crate::chrono_lite::unix_secs() as i64;
+                    state.sessions.push(SessionMeta {
+                        id: id.clone(),
+                        title: "新会话".to_string(),
+                        created_at: now,
+                        updated_at: now,
+                        provider,
+                        archived: false,
+                    });
+                    state.current = id;
+                }
+            }
+            return true;
         }
         let id = new_session_id();
         let now = crate::chrono_lite::unix_secs() as i64;
@@ -223,6 +274,7 @@ impl SessionStore {
             created_at: now,
             updated_at: now,
             provider: String::new(),
+            archived: false,
         });
         state.current = id.clone();
         if self.legacy_path().exists() {
@@ -268,15 +320,58 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 取会话列表（`updated_at` 倒序）与当前会话 id。
+    /// 取**未归档**会话列表（`updated_at` 倒序）与当前会话 id。
+    ///
+    /// 归档的会话不出现在这里（卡 `abb-v11-session-archive`）；要列归档的用 [`Self::archived`]。
     fn list(&self) -> (Vec<SessionMeta>, String) {
         let mut state = self.load();
         if self.ensure_current(&mut state) {
             let _ = self.save(&state);
         }
-        let mut list = state.sessions.clone();
+        let mut list: Vec<SessionMeta> = state
+            .sessions
+            .iter()
+            .filter(|s| !s.archived)
+            .cloned()
+            .collect();
         list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         (list, state.current)
+    }
+
+    /// 已归档会话（`updated_at` 倒序，最近用过的在前）。纯**读**：不修不变量、不落盘。
+    fn archived(&self) -> Vec<SessionMeta> {
+        let mut list: Vec<SessionMeta> = self
+            .load()
+            .sessions
+            .into_iter()
+            .filter(|s| s.archived)
+            .collect();
+        list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        list
+    }
+
+    /// 置位/清位某会话的 `archived`（**调用方须已持历史锁**）。
+    ///
+    /// - id 不存在 ⇒ 幂等忽略（与 [`switch_session`] 同口径：不报错、不改任何东西）；
+    /// - 值本来就是这个 ⇒ 不落盘（幂等，避免无意义的写盘与 mtime 抖动）；
+    /// - 归档**当前**会话 ⇒ `current` 换到最近活动的未归档会话；一条不剩就起一条新的
+    ///   （不变量与理由见 [`Self::ensure_current`]）。
+    ///
+    /// 只动索引里的这一位：`sessions/<id>.jsonl` 与任何历史文件都不碰（卡要求「不删数据」）。
+    fn set_archived(&self, id: &str, archived: bool) -> Result<(), String> {
+        let mut state = self.load();
+        self.ensure_current(&mut state);
+        let Some(index) = state.sessions.iter().position(|s| s.id == id) else {
+            return Ok(());
+        };
+        if state.sessions[index].archived == archived {
+            return Ok(());
+        }
+        state.sessions[index].archived = archived;
+        // 归档掉当前会话时，current 的落位交给同一套判据（不在这里自己挑，避免两份实现漂移）。
+        let _ = self.ensure_current(&mut state);
+        self.save(&state)
+            .map_err(|e| format!("写入会话索引失败：{e}"))
     }
 
     fn provider_of(&self, id: &str) -> String {
@@ -339,6 +434,91 @@ pub fn session_list() -> (Vec<SessionMeta>, String) {
     let store = SessionStore::production();
     let _g = store.lock().ok();
     store.list()
+}
+
+/// 已归档会话列表（`updated_at` 倒序）。纯读入口，锁为尽力而为（同 [`session_list`]）。
+pub fn archived_session_list() -> Vec<SessionMeta> {
+    let store = SessionStore::production();
+    let _g = store.lock().ok();
+    store.archived()
+}
+
+/// 归档某会话（卡 `abb-v11-session-archive`）：归档后从 [`session_list`] 里隐藏，
+/// **不删任何数据**（`sessions/<id>.jsonl` 原样保留，[`unarchive_session`] 即找回）。
+///
+/// 归档的是**当前**会话时，`current` 会自动换到最近活动的未归档会话（一条不剩则起一条新的）
+/// ——不变量：当前会话永远出现在列表里，否则消息会写进用户看不见的会话。
+pub fn archive_session(id: &str) -> Result<(), String> {
+    let store = SessionStore::production();
+    let _g = store.lock()?;
+    store.set_archived(id, true)
+}
+
+/// 取消归档（找回）。同样只动索引里的这一位，历史文件不碰。
+pub fn unarchive_session(id: &str) -> Result<(), String> {
+    let store = SessionStore::production();
+    let _g = store.lock()?;
+    store.set_archived(id, false)
+}
+
+/// 会话面板该列的 **(列表, 当前项 id)**（卡 `abb-v11-session-archive`）。
+///
+/// 普通视图 = 未归档列表 + 真实当前项；归档视图 = 已归档列表 + **空当前项**。
+///
+/// 为什么归档视图必须清掉当前项：当前会话一定在未归档列表里（[`SessionStore::ensure_current`]
+/// 的不变量），归档列表里那一项若还带着「当前」tag，用户就会以为「当前会话已经归档了」。
+/// 判据放在这里（而不是写在 `ui.rs` 的回调里）就是为了能单测。
+pub fn session_menu_view(
+    archive_view: bool,
+    visible: (Vec<SessionMeta>, String),
+    archived: Vec<SessionMeta>,
+) -> (Vec<SessionMeta>, String) {
+    if archive_view {
+        (archived, String::new())
+    } else {
+        visible
+    }
+}
+
+/// 会话面板（`ui/app.slint` 的 `MenuPanel`）在两种视图下的**文案**。
+///
+/// 为什么抽成纯函数而不是写死在 `.slint` 里：文案要能单测（卡 `abb-v11-session-archive`
+/// 要求「列表过滤」可负向验证），且「已归档（N）」的 N 必须与列表同源——写死在 `.slint`
+/// 就只能靠人眼比对。`.slint` 只负责把这里的字符串画出来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPanelText {
+    pub heading: String,
+    pub foot: String,
+    /// 面板里第一行「额外项」：普通视图 = 归档当前会话；归档视图 = 返回会话列表。
+    /// **同一行两义**——判据只在 Rust 一处（`ui.rs::on_session_extra`），`.slint` 不判。
+    pub extra_text: String,
+    pub extra_tag: String,
+    /// 第二行：普通视图 = 进「已归档」；归档视图 = 空（不画——那一行的位置已被「返回」占了）。
+    pub extra2_text: String,
+    pub extra2_tag: String,
+}
+
+/// 见 [`SessionPanelText`]。`n_archived` 是归档条数（两种视图都用它；归档视图的 N 就是列表长度）。
+pub fn session_panel_text(archive_view: bool, n_archived: usize) -> SessionPanelText {
+    if archive_view {
+        SessionPanelText {
+            heading: format!("已归档（{n_archived} 条，点一条即找回）"),
+            foot: "点一条 = 取消归档并切回继续聊；历史文件一直保留，不做任何删除".to_string(),
+            extra_text: "← 返回会话列表".to_string(),
+            extra_tag: String::new(),
+            extra2_text: String::new(),
+            extra2_tag: String::new(),
+        }
+    } else {
+        SessionPanelText {
+            heading: "会话（历史保留，可随时切回）".to_string(),
+            foot: "点一条即切回该会话继续聊；归档后从列表隐藏、可在「已归档」里找回".to_string(),
+            extra_text: "🗄 归档…".to_string(),
+            extra_tag: "当前会话".to_string(),
+            extra2_text: format!("🗄 已归档（{n_archived}）…"),
+            extra2_tag: String::new(),
+        }
+    }
 }
 
 /// 会话是否为空（**「新建会话」去重的唯一判据**，卡 `abb-v11-new-session-dedupe`）。
@@ -417,6 +597,7 @@ fn new_session_locked(store: &SessionStore, provider: Option<&str>) -> Result<Ne
         created_at: now,
         updated_at: now,
         provider,
+        archived: false,
     });
     state.current = id.clone();
     store
@@ -3612,6 +3793,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             provider: "prov-b".into(),
+            archived: false,
         });
         st.current = id2.clone();
         st.sessions[0].updated_at = 2; // 让 id1 更「新」，校验排序
@@ -3693,6 +3875,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             provider: String::new(),
+            archived: false,
         });
         store.save(&st).unwrap();
         let ws = std::env::temp_dir().join(format!("abb-sc-turn-ws-{}", uuid::Uuid::new_v4()));
@@ -5925,5 +6108,244 @@ mod tests {
         let a = action_target(&h, idx).expect("应可解析");
         assert_eq!(a.text, "答复二");
         assert_eq!(a.index, 3);
+    }
+
+    // ───────── 卡 `abb-v11-session-archive`：历史会话归档（隐藏 + 可找回，不删数据） ─────────
+
+    /// 会话面板的 (列表, 当前项) 判据：归档视图必须换成已归档列表**且当前项清空**。
+    ///
+    /// 判别力（负向）：把 `session_menu_view` 的归档分支改回 `visible` ⇒ 本条红
+    /// ——那正是「当前会话被标成已归档」的写法。
+    #[test]
+    fn session_menu_view_swaps_list_and_clears_current_in_archive_view() {
+        let m = |id: &str| SessionMeta {
+            id: id.to_string(),
+            title: id.to_string(),
+            created_at: 1,
+            updated_at: 2,
+            provider: String::new(),
+            archived: id == "arch",
+        };
+        let visible = (vec![m("live")], "live".to_string());
+        let archived = vec![m("arch")];
+
+        let (list, current) = session_menu_view(false, visible.clone(), archived.clone());
+        assert_eq!(
+            list.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["live"]
+        );
+        assert_eq!(current, "live", "普通视图要带真实当前项");
+
+        let (list, current) = session_menu_view(true, visible, archived);
+        assert_eq!(
+            list.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["arch"]
+        );
+        assert!(
+            current.is_empty(),
+            "归档视图必须清掉当前项（否则归档列表里那一项会被标成「当前」，看起来像「当前会话已归档」）"
+        );
+    }
+
+    /// 面板两种视图的文案（纯函数）：普通视图给「归档当前会话」+「已归档（N）」，归档视图第一行
+    /// 变义成「返回」且不再画第二行。
+    ///
+    /// 判别力（负向）：把归档视图的 `extra_text` 改回「🗄 归档…」⇒ 末段断言红（同名两义的行
+    /// 会让人点错：以为在归档，其实是在返回）。
+    #[test]
+    fn session_panel_text_normal_and_archive_views() {
+        let n = session_panel_text(false, 3);
+        assert_eq!(n.heading, "会话（历史保留，可随时切回）");
+        assert_eq!(n.extra_text, "🗄 归档…");
+        assert_eq!(n.extra_tag, "当前会话");
+        assert_eq!(n.extra2_text, "🗄 已归档（3）…", "条数必须来自实参");
+        assert!(n.extra2_tag.is_empty());
+        assert!(n.foot.contains("已归档"), "footer 要写清去哪儿找回");
+
+        let a = session_panel_text(true, 3);
+        assert!(
+            a.heading.contains("3 条"),
+            "归档视图要显示条数：{}",
+            a.heading
+        );
+        assert_eq!(a.extra_text, "← 返回会话列表");
+        assert!(
+            !a.extra_text.contains("归档…") && a.extra2_text.is_empty(),
+            "归档视图必须把「🗄 归档…」换成「返回」，并且不画第二行"
+        );
+        assert!(a.foot.contains("不做任何删除"), "footer 要如实说数据不删");
+    }
+
+    /// 归档 ⇒ 从可见列表隐藏；取消归档 ⇒ 回到列表；**历史文件原样**（卡要求「不删数据」）。
+    #[test]
+    fn archive_hides_from_list_unarchive_restores_and_keeps_history_files() {
+        let (store, base) = tmp_store("arch-hide");
+        let mut st = store.load();
+        store.ensure_current(&mut st);
+        let a = st.current.clone();
+        for (id, title, updated) in [("b", "乙", 20i64), ("c", "丙", 30)] {
+            st.sessions.push(SessionMeta {
+                id: id.to_string(),
+                title: title.to_string(),
+                created_at: 1,
+                updated_at: updated,
+                provider: String::new(),
+                archived: false,
+            });
+        }
+        store.save(&st).unwrap();
+        store
+            .append_turns("b", &[turn_of("user", "只有乙有历史")])
+            .unwrap();
+        let hist = base.join("sessions").join("b.jsonl");
+        let before = std::fs::read(&hist).expect("乙的历史必须已落盘");
+
+        store.set_archived("b", true).unwrap();
+        store.set_archived("c", true).unwrap();
+
+        let (visible, current) = store.list();
+        assert_eq!(
+            visible.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec![a.as_str()],
+            "归档后可见列表只剩未归档的那条"
+        );
+        assert_eq!(current, a, "当前会话不是被归档的那条 ⇒ 不变");
+        assert_eq!(
+            store
+                .archived()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "b"],
+            "归档列表按 updated_at 倒序（最近用过的在前）"
+        );
+        assert!(hist.exists(), "归档不得删除历史文件");
+        assert_eq!(
+            std::fs::read(&hist).unwrap(),
+            before,
+            "历史内容必须逐字节原样"
+        );
+
+        // 取消归档 ⇒ 回到可见列表
+        store.set_archived("c", false).unwrap();
+        assert!(store.archived().iter().all(|s| s.id != "c"));
+        assert!(store.list().0.iter().any(|s| s.id == "c"));
+    }
+
+    /// 归档**当前**会话：current 落回最近活动的未归档会话；全归档 ⇒ 起一条新的空会话
+    /// （**不擅自取消归档**用户已归档的会话），并沿用刚离开那条的模型选择。
+    #[test]
+    fn archiving_current_moves_current_then_all_archived_creates_new() {
+        let (store, _base) = tmp_store("arch-current");
+        let mut st = store.load();
+        st.sessions = vec![
+            SessionMeta {
+                id: "a".to_string(),
+                title: "甲".to_string(),
+                created_at: 1,
+                updated_at: 10,
+                provider: String::new(),
+                archived: false,
+            },
+            SessionMeta {
+                id: "b".to_string(),
+                title: "乙".to_string(),
+                created_at: 2,
+                updated_at: 20,
+                provider: "deepseek".to_string(),
+                archived: false,
+            },
+        ];
+        st.current = "a".to_string();
+        store.save(&st).unwrap();
+
+        store.set_archived("a", true).unwrap();
+        let (visible, current) = store.list();
+        assert_eq!(
+            current, "b",
+            "归档当前会话 ⇒ current 落到最近活动的未归档会话"
+        );
+        assert_eq!(
+            visible.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+
+        // 再归档 b ⇒ 一条不剩。**不得**为了腾地方把用户的归档反悔掉，只能新起一条。
+        store.set_archived("b", true).unwrap();
+        let (visible, current) = store.list();
+        assert_eq!(
+            visible.len(),
+            1,
+            "全归档后必须有一条新会话，否则消息写进看不见的会话"
+        );
+        assert!(current != "a" && current != "b", "current 必须是新起的那条");
+        assert_eq!(
+            visible[0].provider, "deepseek",
+            "新会话要沿用刚离开那条的模型选择（别因归档丢掉用户的选择）"
+        );
+        assert_eq!(
+            store.archived().len(),
+            2,
+            "两条用户会话都还在归档里（不得擅自取消归档）"
+        );
+    }
+
+    /// 「值本来就是它 / id 不存在」⇒ `set_archived` **不落盘**。
+    ///
+    /// 判据做成手写格式的索引文件：若它偷偷 `save`，文件会被 serde 重排（pretty），断言即红；
+    /// 反向（真的改值）必须落盘——否则上面那条是空判据。
+    #[test]
+    fn same_value_set_archived_does_not_write_index() {
+        let (store, base) = tmp_store("arch-noop");
+        std::fs::create_dir_all(&base).unwrap();
+        let hand = r#"{"current":"b","sessions":[{"id":"b","title":"乙","created_at":1,"updated_at":2,"provider":"","archived":true}]}"#;
+        std::fs::write(base.join("sessions.json"), hand).unwrap();
+
+        store.set_archived("b", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("sessions.json")).unwrap(),
+            hand,
+            "同值 set_archived 不得写盘"
+        );
+        store.set_archived("没有这个 id", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("sessions.json")).unwrap(),
+            hand,
+            "id 不存在 ⇒ 幂等忽略（不写盘、不报错）"
+        );
+
+        // 阳性对照：改值一定会落盘（重排成 serde pretty ⇒ 与手写格式不同）
+        store.set_archived("b", false).unwrap();
+        assert_ne!(
+            std::fs::read_to_string(base.join("sessions.json")).unwrap(),
+            hand,
+            "改值必须落盘（否则上面两条断言都验不到东西）"
+        );
+    }
+
+    /// 旧 `sessions.json`（没有 `archived` 键）按未归档读入；写回时该位显式落盘
+    /// （serde 不 skip ⇒ 人工可核对；旧版 ABB 读新文件时忽略未知字段，不会读坏）。
+    #[test]
+    fn old_sessions_json_without_archived_loads_unarchived() {
+        let (store, base) = tmp_store("arch-legacy");
+        std::fs::create_dir_all(&base).unwrap();
+        let legacy = r#"{"current":"s1","sessions":[{"id":"s1","title":"老会话","created_at":1,"updated_at":2,"provider":""}]}"#;
+        std::fs::write(base.join("sessions.json"), legacy).unwrap();
+
+        let (list, current) = store.list();
+        assert_eq!(current, "s1");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].archived, "缺 archived 字段 ⇒ 未归档（向后兼容）");
+
+        store.set_archived("s1", true).unwrap();
+        let txt = std::fs::read_to_string(base.join("sessions.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).expect("索引必须是合法 JSON");
+        let arr = v["sessions"].as_array().expect("sessions 必须是数组");
+        assert_eq!(
+            arr.iter().find(|s| s["id"] == "s1").unwrap()["archived"],
+            serde_json::Value::Bool(true),
+            "写回必须带 archived 这一位：{txt}"
+        );
+        assert_eq!(arr.len(), 2, "唯一会话被归档 ⇒ 索引里新起一条：{txt}");
     }
 }

@@ -990,6 +990,30 @@ fn refresh_syschat_usage(win: &SystemChatWindow) {
     win.set_usage_level(level);
 }
 
+/// v11（卡 `abb-v11-session-archive`）：会话面板的行（标题 + 右侧 tag）。
+///
+/// 抽成纯函数：`.slint` 只负责画，判据要能单测——**归档视图的行不带「当前」标记**靠的正是
+/// 「归档视图传空 `current`」这一条，写进 GUI 回调里就只能靠人眼比。
+fn session_menu_rows(
+    list: &[crate::syschat::SessionMeta],
+    current: &str,
+    now: u64,
+) -> Vec<SysChatMenuRow> {
+    list.iter()
+        .map(|s| SysChatMenuRow {
+            text: s.title.clone().into(),
+            // 空 `current`（归档视图 / 无当前项）⇒ 一行都不带「当前」。
+            tag: crate::syschat::session_tag(
+                s.updated_at,
+                now,
+                !current.is_empty() && s.id == current,
+            )
+            .into(),
+            tick: false,
+        })
+        .collect()
+}
+
 /// D4：读某窗口的**逻辑**外框 `(x, y, w, h)`。
 ///
 /// `outer_position()` / `inner_size()` 都是**物理**像素，锚定与吸附的数学全用逻辑像素
@@ -3266,6 +3290,10 @@ pub fn run_gui() -> Result<()> {
     // 系统对话 A 批：会话 / 模型选择的下拉状态工作副本。
     let sc_sessions: Rc<RefCell<Vec<crate::syschat::SessionMeta>>> =
         Rc::new(RefCell::new(Vec::new()));
+    // v11（卡 `abb-v11-session-archive`）：会话面板是否停在「已归档」视图。UI 线程本地状态
+    // ——面板收起/复位不碰盘上数据；每次**点开**面板时 Rust 把它复位成普通视图（见
+    // `on_session_menu_opened`）。
+    let sc_archive_view: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     // (供应商 name, 下拉展示 label)
     let sc_models: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -3274,6 +3302,7 @@ pub fn run_gui() -> Result<()> {
         win: &SystemChatWindow,
         sessions: &Rc<RefCell<Vec<crate::syschat::SessionMeta>>>,
         models: &Rc<RefCell<Vec<(String, String)>>>,
+        archive_view: &Rc<Cell<bool>>,
     ) {
         let cfg = Config::load().unwrap_or_default();
         // v11：模型行要同时拿到 label 与 **provider kind**（稿：非当前项右侧写 anthropic/openai），
@@ -3290,7 +3319,15 @@ pub fn run_gui() -> Result<()> {
                 (p.name.clone(), label, p.kind.clone())
             })
             .collect();
-        let (list, current) = crate::syschat::session_list();
+        // 两份列表都读出来：已归档那份既给「🗄 已归档（N）…」提供 N，也是归档视图的数据源。
+        // 哪一份上屏 + 归档视图**不标当前项**的判据在 `syschat::session_menu_view`（带单测）。
+        let archived = crate::syschat::archived_session_list();
+        let n_archived = archived.len();
+        let (list, current) = crate::syschat::session_menu_view(
+            archive_view.get(),
+            crate::syschat::session_list(),
+            archived,
+        );
         let labels: Vec<slint::SharedString> =
             list.iter().map(|s| s.title.clone().into()).collect();
         let sidx = list
@@ -3324,15 +3361,19 @@ pub fn run_gui() -> Result<()> {
         // v11（卡 `abb-v11-panels-align`）：两个面板的行数据（标题 + 右侧 tag/✓）。
         // 与 labels 同一次刷新写入 ⇒ 面板与 chip 不会看到一个新列表一个旧列表。
         let now = crate::chrono_lite::unix_secs();
-        let srows: Vec<SysChatMenuRow> = list
-            .iter()
-            .map(|s| SysChatMenuRow {
-                text: s.title.clone().into(),
-                tag: crate::syschat::session_tag(s.updated_at, now, s.id == current).into(),
-                tick: false,
-            })
-            .collect();
+        let srows = session_menu_rows(&list, &current, now);
         win.set_session_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(srows))));
+        // 面板文案（含「已归档（N）」，与上面那次列表读盘同源）。判据全在
+        // `syschat::session_panel_text`（纯函数带单测）——`.slint` 只负责画。
+        let t = crate::syschat::session_panel_text(archive_view.get(), n_archived);
+        win.set_session_panel_copy(SessionPanelCopy {
+            heading: t.heading.into(),
+            foot: t.foot.into(),
+            extra_text: t.extra_text.into(),
+            extra_tag: t.extra_tag.into(),
+            extra2_text: t.extra2_text.into(),
+            extra2_tag: t.extra2_tag.into(),
+        });
         let mrows: Vec<SysChatMenuRow> = ms
             .iter()
             .enumerate()
@@ -3355,7 +3396,7 @@ pub fn run_gui() -> Result<()> {
         apply_syschat_layout(win, syschat_logical_width(win));
     }
 
-    refresh_syschat_sel(&syschat_win, &sc_sessions, &sc_models);
+    refresh_syschat_sel(&syschat_win, &sc_sessions, &sc_models, &sc_archive_view);
 
     // ── C1 批：待发附件（📎 多选 / ⌘V 粘贴）──────────────────────────────────
     //
@@ -7208,12 +7249,15 @@ pub fn run_gui() -> Result<()> {
         let model = syschat_model.clone();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
+        let archive_view = sc_archive_view.clone();
         let rm = request_media.clone();
         let bw = bubble.as_weak();
         Rc::new(move || {
             let Some(w) = cw.upgrade() else { return };
+            // 每次开窗都从**普通视图**开始（上次可能停在「已归档」）。
+            archive_view.set(false);
             load_syschat_into(&w, &model);
-            refresh_syschat_sel(&w, &sessions, &models);
+            refresh_syschat_sel(&w, &sessions, &models, &archive_view);
             show_window_and_focus(&w);
             if let Some(b) = bw.upgrade() {
                 // 开窗锚定：把对话窗摆到气泡旁（间距 10px，靠屏边翻边）。**只此一次** ——
@@ -7252,14 +7296,17 @@ pub fn run_gui() -> Result<()> {
         let model = syschat_model.clone();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
+        let archive_view = sc_archive_view.clone();
         let pump = sc_pump.clone();
         syschat_win.on_new_session(move || {
             let Some(w) = cw.upgrade() else { return };
             // 卡 d10：排队项属于旧会话，换会话不得跟着过去。
             pump.borrow_mut().clear();
+            // 新建会话后回到普通视图（否则行列表里看不到刚建的那条）。
+            archive_view.set(false);
             match crate::syschat::new_session(None) {
                 Ok(r) => {
-                    refresh_syschat_sel(&w, &sessions, &models);
+                    refresh_syschat_sel(&w, &sessions, &models, &archive_view);
                     load_syschat_into(&w, &model);
                     w.set_status_is_error(false);
                     // 卡 `abb-v11-new-session-dedupe`：当前会话为空时是**复用**，不是新建 ——
@@ -7284,6 +7331,7 @@ pub fn run_gui() -> Result<()> {
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
         let rm = request_media.clone();
+        let archive_view = sc_archive_view.clone();
         let pump = sc_pump.clone();
         syschat_win.on_session_pick(move |idx| {
             if idx < 0 {
@@ -7294,9 +7342,19 @@ pub fn run_gui() -> Result<()> {
                 let Some(w) = cw.upgrade() else { return };
                 // 卡 d10：排队项属于旧会话，切会话不得跟着过去。
                 pump.borrow_mut().clear();
+                // 卡 `abb-v11-session-archive`：归档视图里点一条 = **找回**——先取消归档
+                // （一步做完；否则用户点了还停在归档列表上，得再点一次才切过去），再切回它。
+                if archive_view.get() {
+                    if let Err(e) = crate::syschat::unarchive_session(&id) {
+                        w.set_status_is_error(true);
+                        w.set_status_line(format!("取消归档失败：{e}").into());
+                        return;
+                    }
+                    archive_view.set(false);
+                }
                 match crate::syschat::switch_session(&id) {
                     Ok(()) => {
-                        refresh_syschat_sel(&w, &sessions, &models);
+                        refresh_syschat_sel(&w, &sessions, &models, &archive_view);
                         load_syschat_into(&w, &model);
                         rm();
                     }
@@ -7313,6 +7371,7 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
+        let archive_view = sc_archive_view.clone();
         syschat_win.on_model_pick(move |idx| {
             if idx < 0 {
                 return;
@@ -7323,7 +7382,7 @@ pub fn run_gui() -> Result<()> {
                 let cur = crate::syschat::current_session();
                 match crate::syschat::set_session_provider(&cur, &name) {
                     Ok(()) => {
-                        refresh_syschat_sel(&w, &sessions, &models);
+                        refresh_syschat_sel(&w, &sessions, &models, &archive_view);
                         w.set_status_is_error(false);
                         w.set_status_line(
                             format!("本会话模型已切到「{name}」（从下一条消息起生效）").into(),
@@ -7584,17 +7643,87 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // v11（卡 `abb-v11-panels-align`）：会话面板里的「🗄 归档…」。本卡只要求**面板里有这一项
-    // 且可点**；归档本体是另一张卡（`abb-v11-session-archive`）——这里如实回一句状态，
-    // 不做假动作（不假装已归档、也不删任何文件）。
+    // v11（卡 `abb-v11-session-archive`）：会话面板的「🗄 归档…」/「🗄 已归档（N）…」两行。
+    // 第一行**同一行两义**（普通视图 = 归档当前会话 / 已归档视图 = 返回列表），判据只在这里
+    // 一处；面板关不关也由这里定（归档要收起、返回要保持开着）。
     {
         let cw = syschat_win.as_weak();
-        syschat_win.on_session_archive(move || {
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
+        let archive_view = sc_archive_view.clone();
+        let model = syschat_model.clone();
+        let rm = request_media.clone();
+        let pump = sc_pump.clone();
+        syschat_win.on_session_extra(move || {
+            let Some(w) = cw.upgrade() else { return };
+            if archive_view.get() {
+                // 返回会话列表：面板**保持开着**（用户下一眼要看的就是列表）。
+                archive_view.set(false);
+                refresh_syschat_sel(&w, &sessions, &models, &archive_view);
+                w.set_session_menu_open(true);
+                return;
+            }
+            // 归档**当前会话**（那一行的 tag 就写着「当前会话」）。
+            let (_list, current) = crate::syschat::session_list();
+            if current.is_empty() {
+                w.set_status_is_error(true);
+                w.set_status_line("没有可归档的会话（当前会话为空）。".into());
+                return;
+            }
+            let title = sessions
+                .borrow()
+                .iter()
+                .find(|s| s.id == current)
+                .map(|s| s.title.clone())
+                .unwrap_or_default();
+            match crate::syschat::archive_session(&current) {
+                Ok(()) => {
+                    // 归档当前会话 ⇒ current 换到别的会话（见 `ensure_current`）：
+                    // 排队项属于旧会话（同切会话口径）、对话区要重载。
+                    pump.borrow_mut().clear();
+                    archive_view.set(false);
+                    refresh_syschat_sel(&w, &sessions, &models, &archive_view);
+                    load_syschat_into(&w, &model);
+                    rm();
+                    w.set_session_menu_open(false);
+                    w.set_status_is_error(false);
+                    w.set_status_line(
+                        format!(
+                            "已归档「{title}」——历史文件未删，可在会话菜单的「已归档」里找回。"
+                        )
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    w.set_status_is_error(true);
+                    w.set_status_line(format!("归档失败：{e}").into());
+                }
+            }
+        });
+    }
+    // 进「已归档」视图：面板保持开着，内容原地换成归档列表（标题/footer 由 Rust 一并换）。
+    {
+        let cw = syschat_win.as_weak();
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
+        let archive_view = sc_archive_view.clone();
+        syschat_win.on_session_extra2(move || {
+            let Some(w) = cw.upgrade() else { return };
+            archive_view.set(true);
+            refresh_syschat_sel(&w, &sessions, &models, &archive_view);
+            w.set_session_menu_open(true);
+        });
+    }
+    // 面板被点开 ⇒ 复位到普通视图并刷新一次行（面板关着时列表可能变了：新建/归档/切回）。
+    {
+        let cw = syschat_win.as_weak();
+        let sessions = sc_sessions.clone();
+        let models = sc_models.clone();
+        let archive_view = sc_archive_view.clone();
+        syschat_win.on_session_menu_opened(move || {
+            archive_view.set(false);
             if let Some(w) = cw.upgrade() {
-                w.set_status_is_error(false);
-                w.set_status_line(
-                    "「归档」尚未实现（归档本体见卡 abb-v11-session-archive）。".into(),
-                );
+                refresh_syschat_sel(&w, &sessions, &models, &archive_view);
             }
         });
     }
@@ -10029,6 +10158,42 @@ mod tests {
             resolved,
             vec![String::from("答复一"), String::from("答复二")],
             "第一条动作行必须指向第一轮（哨兵写法下两条都会指到「答复二」）"
+        );
+    }
+
+    /// 卡 `abb-v11-session-archive`：归档视图的行**不带**「当前」标记。
+    ///
+    /// 判据落在 `current` 这一个入参上（归档视图传空）：当前会话必在未归档列表里，
+    /// 归档列表里那一项若被标成「当前」，用户会以为「当前会话已归档」。
+    ///
+    /// 判别力（负向）：把 `refresh_syschat_sel` 里归档视图的 `current` 从 `""` 改回真实 id
+    /// ⇒ 第 2 段断言立刻红（这正是「忘了清空」的写法）。
+    #[test]
+    fn session_menu_rows_mark_current_only_when_current_passed() {
+        let meta = |id: &str, title: &str, updated: i64| crate::syschat::SessionMeta {
+            id: id.to_string(),
+            title: title.to_string(),
+            created_at: 1,
+            updated_at: updated,
+            provider: String::new(),
+            archived: false,
+        };
+        let metas = vec![meta("a", "甲", 10), meta("b", "乙", 20)];
+
+        // 普通视图（传真实 current）：当前项带「当前」，另一项带时间。
+        let normal = session_menu_rows(&metas, "b", 1_792_296_000);
+        assert_eq!(normal.len(), 2);
+        assert_eq!(normal[0].text.as_str(), "甲");
+        assert_eq!(normal[1].text.as_str(), "乙");
+        assert_eq!(normal[1].tag.as_str(), "当前", "当前项要标「当前」");
+        assert_ne!(normal[0].tag.as_str(), "当前", "非当前项不许标「当前」");
+
+        // 归档视图（传空 current）：一行都不许带「当前」。
+        let archived = session_menu_rows(&metas, "", 1_792_296_000);
+        assert!(
+            archived.iter().all(|r| r.tag.as_str() != "当前"),
+            "归档视图不许有任何一项被标成「当前」：{:?}",
+            archived.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>()
         );
     }
 }

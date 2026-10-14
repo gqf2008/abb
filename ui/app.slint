@@ -3094,6 +3094,18 @@ export struct SysChatMenuRow {
     tick: bool,
 }
 
+// v11（卡 `abb-v11-session-archive`）：会话面板的**文案**（普通视图 / 已归档视图两种）。
+// 由 Rust 的 `syschat::session_panel_text` 算好写进来——文案里有「已归档（N）」这种**与列表
+// 同源**的数字，写死在 `.slint` 就没法单测，也没法保证与列表一致。
+export struct SessionPanelCopy {
+    heading: string,
+    foot: string,
+    extra_text: string,
+    extra_tag: string,
+    extra2_text: string,
+    extra2_tag: string,
+}
+
 // 待发附件 chip（D 批 3+N）：`index` 是它在**完整待发列表**里的下标——✕ 按它精确移除。
 // Rust 侧已按折叠态裁好可见行，这里只负责画（图片缩略图 / 文件 chip）。
 export struct PendingAttachRow {
@@ -3403,12 +3415,16 @@ component MenuPanel inherits Rectangle {
     in property <string> foot: "";
     in property <[SysChatMenuRow]> rows: [];
     in property <int> current: -1;
-    // 额外一行（历史会话面板的「🗄 归档…」）；text 为空 = 不画。
+    // 额外行（历史会话面板用）：第 1 行随视图变义（普通 = 「🗄 归档…」/ 已归档 = 「← 返回」），
+    // 第 2 行只普通视图有（「🗄 已归档（N）…」）。text 为空 = 不画。语义判据在 Rust。
     in property <string> extra-text: "";
     in property <string> extra-tag: "";
+    in property <string> extra-text2: "";
+    in property <string> extra-tag2: "";
     in property <bool> enabled: true;
     callback picked(int);
     callback extra-clicked();
+    callback extra-clicked2();
     width: 250px;
     // 高度按内容自然高（`Window` 的直属子元素不写 height 会铺满整窗——实测 820 高）。
     height: self.preferred-height;
@@ -3457,6 +3473,12 @@ component MenuPanel inherits Rectangle {
             tag: root.extra-tag;
             enabled: root.enabled;
             clicked => { root.extra-clicked(); }
+        }
+        if root.extra-text2 != "": MenuChoiceRow {
+            text: root.extra-text2;
+            tag: root.extra-tag2;
+            enabled: root.enabled;
+            clicked => { root.extra-clicked2(); }
         }
         // footer（稿 `.foot{padding:6px 10px;font-size:10px;border-top:2px}`）
         if root.foot != "": Rectangle {
@@ -3680,8 +3702,14 @@ export component SystemChatWindow inherits Window {
     in property <string> usage-tip: "";
     in property <length> usage-meter-fill: 0px;
     in property <int> usage-level: 0;
-    // 「🗄 归档…」：归档功能本体是另一张卡（`abb-v11-session-archive`），本卡只要面板有此项且可点。
-    callback session-archive();
+    // v11（卡 `abb-v11-session-archive`）：会话面板的三处动作。
+    // `session-extra` = 面板第 1 额外行——**同一行两义**（普通视图「🗄 归档…」= 归档当前会话 /
+    // 已归档视图「← 返回会话列表」），判据只在 Rust 一处；`session-extra2` = 「🗄 已归档（N）…」；
+    // `session-menu-opened` = 面板被点开（Rust 复位到普通视图并刷新行）。
+    in property <SessionPanelCopy> session-panel-copy: { heading: "", foot: "", extra_text: "", extra_tag: "", extra2_text: "", extra2_tag: "" };
+    callback session-extra();
+    callback session-extra2();
+    callback session-menu-opened();
     in-out property <int> session-index: -1;
     in-out property <int> model-index: -1;
 
@@ -4853,6 +4881,9 @@ export component SystemChatWindow inherits Window {
                     root.emoji-open = false;
                     root.more-open = false;
                     root.session-menu-open = !root.session-menu-open;
+                    // 点开时通知 Rust：复位到普通视图 + 刷新行（面板关着时列表可能变了：
+                    // 新会话 / 归档 / 切回）。收起不需要通知。
+                    if root.session-menu-open { root.session-menu-opened(); }
                 }
             }
             // ③模型 chip（稿 `.chipbtn.accent`）：v11 换成自绘 `ModelChip` + `MenuPanel`
@@ -4944,15 +4975,20 @@ export component SystemChatWindow inherits Window {
             visible: root.session-menu-open;
             x: root.session-menu-x;
             y: root.session-menu-y;
-            heading: "会话（历史保留，可随时切回）";
-            foot: "点一条即切回该会话继续聊；归档后从列表隐藏、可在「已归档」里找回";
+            // 文案（含「已归档（N）」的条数）由 Rust 算：`syschat::session_panel_text`（纯函数带单测）。
+            heading: root.session-panel-copy.heading;
+            foot: root.session-panel-copy.foot;
             rows: root.session-rows;
             current: root.session-index;
-            extra-text: "🗄 归档…";
-            extra-tag: "当前会话";
+            extra-text: root.session-panel-copy.extra_text;
+            extra-tag: root.session-panel-copy.extra_tag;
+            extra-text2: root.session-panel-copy.extra2_text;
+            extra-tag2: root.session-panel-copy.extra2_tag;
             enabled: !root.busy;
             picked(i) => { root.session-menu-open = false; root.session-pick(i); }
-            extra-clicked => { root.session-menu-open = false; root.session-archive(); }
+            // 归档/返回都不在这里关面板：归档要收起（列表变了），返回要保持开着——由 Rust 判。
+            extra-clicked => { root.session-extra(); }
+            extra-clicked2 => { root.session-extra2(); }
         }
         model-panel := MenuPanel {
             visible: root.model-menu-open;
