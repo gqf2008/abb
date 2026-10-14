@@ -901,7 +901,12 @@ pub struct TaskWorkers {
 
 /// 每通道 worker 数的**上限**：防止手写 `{"schedule":100000}` 起出十万个轮询任务。
 /// 超过按上限生效并告警（不静默）。
-pub const MAX_TASK_WORKERS_PER_CHANNEL: usize = 8;
+///
+/// 2026-10-15：**8 → 128**。旧值把「手动档按 bot 真实承载能力配置」卡死——本机
+/// abb-agent 进程同时跑 100 条手动任务是常态，而写在 `config.json` 里的 100 会被
+/// 截断成 8（虽有告警，但配置表达不出意图）。上限的本意是挡住手滑写出的天文数字，
+/// 128 仍然守住这个用途。
+pub const MAX_TASK_WORKERS_PER_CHANNEL: usize = 128;
 
 impl TaskWorkers {
     /// 该通道生效的 worker 数：0 → 1 兜底；超过 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警。
@@ -1986,6 +1991,18 @@ mod tests {
         assert_eq!(zero.for_channel(crate::task_run::Channel::Schedule), 1);
         assert_eq!(zero.for_channel(crate::task_run::Channel::Manual), 1);
 
+        // 2026-10-15（上限 8 → 128）的阳性对照：100 是 abb-agent 的实际配置，
+        // 必须原样生效而不是被截断成 8。这条断言钉住「上限不再挡住真实配置」。
+        let hundred = TaskWorkers {
+            schedule: 2,
+            manual: 100,
+        };
+        assert_eq!(
+            hundred.for_channel(crate::task_run::Channel::Manual),
+            100,
+            "manual=100 必须原样生效（旧上限 8 会把它截断）"
+        );
+
         let wide = TaskWorkers {
             schedule: 4,
             manual: 3,
@@ -1993,10 +2010,12 @@ mod tests {
         assert_eq!(wide.for_channel(crate::task_run::Channel::Schedule), 4);
         assert_eq!(wide.for_channel(crate::task_run::Channel::Manual), 3);
 
-        // 上限：离谱的大值按 MAX 生效（不静默按原值起 N 个轮询任务）
+        // 上限：离谱的大值按 MAX 生效（不静默按原值起 N 个轮询任务）。
+        // manual 用 100_000 而不是贴着旧上限的 99：上限 8→128 后，99 已是合法值、
+        // 不再被截断，case 必须真的高于新上限才能验到「截断」这条路径。
         let huge = TaskWorkers {
             schedule: 100_000,
-            manual: 99,
+            manual: 100_000,
         };
         assert_eq!(
             huge.for_channel(crate::task_run::Channel::Schedule),

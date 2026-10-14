@@ -417,7 +417,7 @@ v1 只写「独立 session key」是**不够的**。三件事必须分开定：
 >    整表级动作（`Channel::owns_housekeeping`），否则会被做两遍。
 >
 > **同通道多 worker（2026-09-26 同批接线，Q7 的「上限可配」）**：`config.json#task_workers`
-> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":1}`；每通道 1–8，0 按 1 兜底、
+> 决定每通道起几个 worker（默认 `{"schedule":2,"manual":1}`；每通道 1–128，0 按 1 兜底、
 > 超过上限按 `MAX_TASK_WORKERS_PER_CHANNEL` 截断并在日志告警）。要点：
 > - 同一通道的多个 worker **共享同一对 store/states**，认领是单锁 check-and-set →
 >   **同一条任务不会双跑**；多出来的并发只让**不同任务**能同档同时执行（定时档默认 2 条：
