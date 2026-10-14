@@ -2678,6 +2678,67 @@ mod tests {
         );
     }
 
+    /// **每一个** `PixelTitleBar` 实例都必须把全部窗口控制回调转发到自己的根组件。
+    ///
+    /// D6 真机 bug（2026-10-14）：`SystemChatWindow` 的标题栏三钮里只接了
+    /// `close-window => { root.close-window(); }`，`—`/`⤢` 两条**一条都没接** ——
+    /// `PixelTitleBar` 是上游封闭组件，它只回调自己的 `minimize`/`toggle-maximize`，不会自动冒泡；
+    /// 于是按钮画得出、按得下（`TouchArea` 的 grab 与按下态都正常），`root.minimize()` 却永远不被调用
+    /// —— 用户看到的就是「布局在、点了没反应」。这类缺陷在源码扫描下就是「少了一行」，
+    /// 在像素/几何里完全看不出来。
+    ///
+    /// 扫描面**故意取全文件**（两个窗口的每一条 `PixelTitleBar`）而不是只看系统对话窗：
+    /// 修 D6 的过程中就真的顺手删错了一行（删 `minimize` 时删到了设置窗那一条，而当时只在
+    /// SystemChatWindow 上盯着），所以覆盖范围必须按「谁用了这个组件」而不是按「谁在出 bug」。
+    ///
+    /// 判别力（负向）：删掉任一条转发（任一窗口的 `drag-start`/`minimize`/`toggle-maximize`/
+    /// `close-window`）⇒ 本用例红。行为侧由
+    /// `ui_headless_render_test::titlebar_window_buttons_receive_clicks`
+    /// （事件注入到三颗按钮的真实坐标）守着 —— 两条一起才能证明「画出来的按钮 = 能用的按钮」。
+    #[test]
+    fn every_title_bar_forwards_all_window_callbacks() {
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let raw = raw.as_ref(); // Cow → &str（下面要在它上面切块）
+        let cb = ["drag-start", "minimize", "toggle-maximize", "close-window"];
+        let mut seen = 0usize;
+        let mut rest: &str = raw;
+        while let Some(i) = rest.find("PixelTitleBar {") {
+            let block_src = &rest[i..];
+            // 只取这个 PixelTitleBar 块（花括号配对），免得把后面别处的接线算进来。
+            let mut depth = 0i32;
+            let mut end = block_src.len();
+            for (j, c) in block_src.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = j;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let block = &block_src[..end];
+            for name in cb {
+                let expect = format!("{name} => {{ root.{name}(); }}");
+                assert!(
+                    block.contains(&expect),
+                    "第 {} 个 PixelTitleBar 没转发 `{name}`（应写 `{expect}`）：\n\
+                     上游组件不会自动冒泡，漏一条就是一颗「点了没反应」的窗口按钮",
+                    seen + 1
+                );
+            }
+            seen += 1;
+            rest = &block_src[end..];
+        }
+        assert_eq!(
+            seen, 2,
+            "ui/app.slint 里应有 2 条 PixelTitleBar（设置窗 + 系统对话窗）"
+        );
+    }
+
     /// 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多）必须是「有反馈的占位」，**不能是死按钮**：
     /// 三个图标都要接 `composer-todo(...)`，且 Rust 侧要注册 `on_composer_todo`（写状态行）。
     /// 源码扫描守卫（同 `titlebar_plan_button_count_matches_show_maximize` 的手法）：

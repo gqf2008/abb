@@ -1161,10 +1161,11 @@ export component SettingsWindow inherits Window {
 
     // 像素风自绘窗口：无系统边框/红绿灯，PixelTitleBar 自绘标题栏（拖拽/最小化/最大化/关闭）
     no-frame: true;
-    // 打开时由 Rust 侧提升为 regular 策略（带 dock 图标 + 置前聚焦），关掉降回 accessory。
+    // D5 起：macOS 也在 accessory 策略下跑（**不进 Dock**），打开时只由 Rust 激活抢前台聚焦。
     // 不用 always-on-top：那会浮在别的 app 之上却没焦点，别扭。标题带实时 bot 数。
     title: root.window-title;
-    // 窗口 + Dock 图标（提升为 regular 后 Dock 用）。1024px 源，macOS 自动缩放。
+    // 窗口 + 图标（Windows 任务栏/Dock 曾用；D5 起 macOS 不进 Dock，这里留给 Windows）。
+    // 1024px 源，系统自动缩放。
     icon: @image-url("../app-assets/icon-1024.png");
     // 可缩放窗口（8-20 用户实测决策）：不设固定 width/height 绑定——固定尺寸与
     // set_maximized 冲突（最大化后被 size 拉回，视觉"越点越小"）。preferred-* 定初始
@@ -3518,7 +3519,20 @@ export component SystemChatWindow inherits Window {
                 // 标题栏是贴窗口上边的子元素，直角会盖掉根圆角 → 补等值内圈圆角（10 − 2 = 8）
                 border-top-left-radius: 8px;
                 border-top-right-radius: 8px;
+                // ⚠️ 三颗窗口按钮的回调**必须逐个转发**：`PixelTitleBar` 是上游封闭组件，
+                // 它只负责「画出按钮并回调自己的 minimize/toggle-maximize/close-window」，
+                // **不会**自动冒泡到宿主组件。D6 真机 bug 就是这个：三钮里只有 close-window
+                // 接了线，`—`/`⤢` 看起来在（布局在、墨迹在、点击也被吃掉成按下态）但点了没反应。
+                // 守卫：`ui_headless_render_test::titlebar_window_buttons_receive_clicks`
+                // （事件注入，按坐标点三颗按钮，断言各自回调都触发）+
+                // `ui::tests::systemchat_forwards_every_title_bar_callback`（结构：四个都不许漏）。
+                minimize => { root.minimize(); }
+                toggle-maximize => { root.toggle-maximize(); }
                 close-window => { root.close-window(); }
+                // `drag-start` 在 `native-move: true` 时**由上游刻意不发**（移动交给平台，避免同一次
+                // 拖动发起两遍）；这里仍接线，是为了「native-move 一旦关掉」时拖动不会静默失效
+                // （SettingsWindow 就是这条路径：Rust `on_drag_start` → winit `drag_window()`）。
+                drag-start => { root.drag-start(); }
             }
 
             // 标题栏底部分隔线（稿 `.titlebar{border-bottom:2px solid var(--edge)}`）：
@@ -4242,8 +4256,13 @@ export component SystemChatWindow inherits Window {
         }
 
         // 无边框窗口缩放热区（同 SettingsWindow）。owner 2026-10-13：「窗口不能缩放的吗？」
-        // —— 对话窗此前没接缩放。这里**裸平台也开**（与设置窗不同：设置窗 macOS 靠系统自带，
-        // 但对话窗实测系统缩放拿不到，故统一自绘）。放在 VerticalLayout 之后 = 更上层。
+        // —— 对话窗此前没接缩放。
+        // ⚠️ 是否渲染由 Rust 按**平台**给（`resize_hit_areas`）：D6 真机复查发现「裸平台也开」
+        // 在 macOS 上是错的——`install_window_resize` 接的 `winit drag_resize_window` 在 macOS
+        // 直接返回 `NotSupported`（winit 0.30.13 `platform_impl/macos/window_delegate.rs:1179`），
+        // 热区于是变成「吃掉按压、什么都不做」的死区，而它是整窗 overlay（north 条 y 0..6、
+        // 左右 6px 整高、四角 14×14）——正好压在标题栏顶部/两端与窗口按钮的角上，
+        // 「抓标题栏拖窗口」会静默失效。放在 VerticalLayout 之后 = 更上层。
         if root.resize-hit-areas : PixelWindowResize {
             x: 0px;
             y: 0px;

@@ -105,54 +105,49 @@ pub fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("拿不到当前可执行文件路径")
 }
 
-// ─────────────────────────── macOS：激活策略（dock 图标 + 置前）───────────────────────────
+// ────────────────────── macOS：激活策略（置前聚焦；**不落 Dock 图标**）──────────────────────
 
-/// 打开窗口前调用：accessory → regular（dock 出图标），并 activate 抢前台聚焦。
-/// 这是「点托盘设置 → dock 有图标、窗口置前可输入」的关键。accessory 进程的窗口既不置前也没 dock 图标。
+/// 打开窗口前调用：激活本进程，让刚 `show` 的窗口成为 **key window**（可输入）。
+///
+/// **不改变激活策略**：ABB 的 `Info.plist` 就是 `LSUIElement=true`（accessory），而 Apple 对
+/// accessory 的契约正是「不出现在 Dock、没有菜单栏，**但可以被程序激活，或被点击它的窗口激活**」
+/// ——键盘焦点不需要 Regular。旧实现（accessory → Regular + activate）的代价是：窗口开着的那段
+/// 时间整个进程会凭空多出一个 Dock 图标（关闭时再靠 [`hide_dock`] 降回去，其间图标一直在）。
+/// owner D5（2026-10-14）明确「全程只有托盘，不进 Dock」，所以这里只保留 activate。
+///
+/// 焦点仍拿得到（两重保险）：
+/// 1. 本函数 `[NSApp activateIgnoringOtherApps:YES]`；
+/// 2. `show()` 之后 winit 会 `makeKeyAndOrderFront:`（macOS `set_visible`，见 winit 0.30.13
+///    `src/platform_impl/macos/window_delegate.rs:906`）——这正是 winit 自己 `focus_window()`
+///    的两步（`activateIgnoringOtherApps` + `makeKeyAndOrderFront`，同文件 `:1573`）。
+/// 另外 winit 的视图 `acceptsFirstMouse:` 默认为 true（`window_delegate.rs:73`），即使进程当时
+/// 不是激活态，点窗口那一下也会**同时**激活进程并把点击递给控件。
+///
+/// 随本改动一并删掉了 `set_app_icon`：它唯一的存在理由就是「提升为 Regular 后 Dock 图标是
+/// 终端占位图，得显式换成应用图标」（见 213d0f2 之前的注释）。不进 Dock 之后它没有任何消费者。
+///
 /// 实现：直接调 AppKit（项目零依赖原则，手写 objc_msgSend FFI，不引 objc crate）。
 /// 须在 Slint/winit 事件循环线程（即主线程）调——NSApplication 非线程安全。
 #[cfg(target_os = "macos")]
-pub fn set_dock_visible(visible: bool) {
-    macos_activate(visible);
-    if visible {
-        // 提升为 regular 后，Dock 图标默认是「终端/控制台」占位图（裸二进制无 bundle 图标）。
-        // 显式把 AppIcon 设到 NSApplication，让 Dock 显示应用图标（debug 裸跑也对；
-        // 打包成 .app 后 CFBundleIconFile 本就生效，这里是无害的双保险）。
-        set_app_icon();
-    }
+pub fn activate_app() {
+    macos_activate(true);
 }
 
-/// 把应用图标设到 NSApplication.applicationIconImage。
-/// 图标来源：优先 .app bundle 的 Resources/AppIcon.icns（打包后）；否则 app-assets/icon-1024.png（debug 源码树）。
-/// 手写 objc_msgSend FFI（零依赖原则，同 macos_activate）。须在主线程调。
+/// 非 macOS：没有「进程激活策略」这个概念（窗口焦点由系统窗口管理器给），留空即可。
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app() {}
+
+/// 进程当前是否**处于激活态**（`[NSApp isActive]`）。
+///
+/// 用途：D5「对话窗失焦即隐藏」的判据 —— 只有焦点**离开本进程**才隐藏。同一进程里
+/// 气泡/设置窗/原生文件面板抢走 key 时进程仍然 active，那些情况不该把对话窗藏掉
+/// （否则点/拖气泡时对话框会消失，「📎 选文件」时窗口会在面板背后被藏掉）。
+/// 须在主线程调（同 [`activate_app`]）。
 #[cfg(target_os = "macos")]
-fn set_app_icon() {
+pub fn app_is_active() -> bool {
     #![allow(non_snake_case)]
     use std::ffi::c_void;
     use std::sync::OnceLock;
-
-    // 解析图标文件路径（只需一次）。优先 .icns（内含多尺寸，系统自挑档 + 套 macOS 圆角模板）；
-    // 找不到才退回 PNG（需手动设 size，否则按像素尺寸当点尺寸画 → Dock 图标巨大）。
-    static ICON_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    let path = ICON_PATH.get_or_init(|| {
-        let exe = std::env::current_exe().ok();
-        let profile = exe.as_ref().and_then(|e| e.parent()); // …/Contents/MacOS 或 …/target/{debug,release}
-        let candidates = [
-            // .app bundle（打包后）
-            profile.map(|p| p.join("../Resources/AppIcon.icns")),
-            // debug：源码树 app-assets（先 icns 后 png）
-            profile.map(|p| p.join("../../app-assets/AppIcon.icns")),
-            profile.map(|p| p.join("../../app-assets/icon-1024.png")),
-        ];
-        for c in candidates.into_iter().flatten() {
-            if let Some(p) = c.canonicalize().ok().filter(|p| p.exists()) {
-                return Some(p);
-            }
-        }
-        None
-    });
-    let Some(path) = path else { return };
-    let is_icns = path.extension().is_some_and(|e| e == "icns");
 
     type Id = *mut c_void;
     type Sel = *mut c_void;
@@ -161,123 +156,47 @@ fn set_app_icon() {
         fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
         fn objc_msgSend();
     }
-    // objc selector 缓存（usize 存储，原始指针非 Send/Sync；进程内全局常量地址，缓存安全）。
-    type Sels = (usize, usize, usize, usize, usize, usize, usize, usize);
-    static SELS: OnceLock<Sels> = OnceLock::new();
-    let (
-        shared_app,
-        alloc,
-        init_with_data,
-        data_with_file,
-        init_with_file,
-        set_size,
-        set_app_icon,
-        release,
-    ) = *SELS.get_or_init(|| unsafe {
+    static SELS: OnceLock<(usize, usize)> = OnceLock::new();
+    let (shared_app, is_active) = *SELS.get_or_init(|| unsafe {
         (
             sel_registerName(c"sharedApplication".as_ptr()) as usize,
-            sel_registerName(c"alloc".as_ptr()) as usize,
-            sel_registerName(c"initWithData:".as_ptr()) as usize,
-            sel_registerName(c"dataWithContentsOfFile:".as_ptr()) as usize,
-            sel_registerName(c"initWithContentsOfFile:".as_ptr()) as usize,
-            sel_registerName(c"setSize:".as_ptr()) as usize,
-            sel_registerName(c"setApplicationIconImage:".as_ptr()) as usize,
-            sel_registerName(c"release".as_ptr()) as usize,
+            sel_registerName(c"isActive".as_ptr()) as usize,
         )
     });
-    let (
-        shared_app,
-        alloc,
-        init_with_data,
-        data_with_file,
-        init_with_file,
-        set_size,
-        set_app_icon,
-        release,
-    ) = (
-        shared_app as Sel,
-        alloc as Sel,
-        init_with_data as Sel,
-        data_with_file as Sel,
-        init_with_file as Sel,
-        set_size as Sel,
-        set_app_icon as Sel,
-        release as Sel,
-    );
-
-    // NSSize 是 {f64, f64} 值类型；objc_msgSend 按位传。
-    #[repr(C)]
-    struct NSSize {
-        width: f64,
-        height: f64,
-    }
-
+    let (shared_app, is_active) = (shared_app as Sel, is_active as Sel);
     unsafe {
-        let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+        let shared_app_fn: unsafe extern "C" fn(Id, Sel) -> Id =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let msg1: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+        let app = shared_app_fn(objc_getClass(c"NSApplication".as_ptr()), shared_app);
+        if app.is_null() {
+            // 拿不到 NSApplication：按「还激活着」处理 ⇒ 不隐藏（宁可少藏，不要误藏）。
+            return true;
+        }
+        let is_active_fn: unsafe extern "C" fn(Id, Sel) -> bool =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let msg_size: unsafe extern "C" fn(Id, Sel, NSSize) =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-
-        // NSString *pathStr = [NSString stringWithUTF8String:cpath]
-        let cpath = match std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let nsstring_cls = objc_getClass(c"NSString".as_ptr());
-        let path_str = msg1(
-            nsstring_cls,
-            sel_registerName(c"stringWithUTF8String:".as_ptr()),
-            cpath.as_ptr() as Id,
-        );
-        if path_str.is_null() {
-            return;
-        }
-        let nsimage_cls = objc_getClass(c"NSImage".as_ptr());
-        let img = if is_icns {
-            // icns：initWithContentsOfFile 直接读（内含多尺寸，系统自挑档 + 套圆角模板）
-            msg1(msg0(nsimage_cls, alloc), init_with_file, path_str)
-        } else {
-            // PNG：initWithContentsOfFile 常返回 nil（只认 icns），改走 NSData + initWithData
-            let nsdata_cls = objc_getClass(c"NSData".as_ptr());
-            let data = msg1(nsdata_cls, data_with_file, path_str);
-            if data.is_null() {
-                crate::log!("[platform] ⚠️ NSData nil: {}", path.display());
-                return;
-            }
-            let img = msg1(msg0(nsimage_cls, alloc), init_with_data, data);
-            if !img.is_null() {
-                // 不设 size 会按 PNG 像素(1024)当点尺寸画 → Dock 图标巨大。设成 Dock 标准点尺寸。
-                msg_size(
-                    img,
-                    set_size,
-                    NSSize {
-                        width: 512.0,
-                        height: 512.0,
-                    },
-                );
-            }
-            img
-        };
-        if img.is_null() {
-            crate::log!("[platform] ⚠️ NSImage 加载 nil: {}", path.display());
-            return;
-        }
-        // [[NSApplication sharedApplication] setApplicationIconImage:img]
-        let app = msg0(objc_getClass(c"NSApplication".as_ptr()), shared_app);
-        if !app.is_null() {
-            msg1(app, set_app_icon, img);
-        }
-        msg0(img, release);
+        is_active_fn(app, is_active)
     }
 }
 
-/// 窗口全关后调用：降回 accessory（dock 图标消失，回到纯托盘态）。
+/// 非 macOS：Windows 的焦点概念落在**窗口**上，没有「进程激活态」；恒 `true` ⇒ 调用方的失焦
+/// 隐藏永不触发（D5 是 macOS 焦点/Dock 语义的需求，不在 Windows 引入新行为）。
+#[cfg(not(target_os = "macos"))]
+pub fn app_is_active() -> bool {
+    true
+}
+
+/// 确保回到 accessory（幂等）。
+///
+/// [`activate_app`] 之后进程**不再**会被提升为 Regular，所以这一支现在只是把不变式重新钉一遍
+/// （万一将来又有人在别处切 Regular）；调用点保留在「窗口都关了」的收尾路径上。
 #[cfg(target_os = "macos")]
 pub fn hide_dock() {
     macos_activate(false);
 }
+
+/// 非 macOS 无 dock 概念，留空调用即可。
+#[cfg(not(target_os = "macos"))]
+pub fn hide_dock() {}
 
 /// Dock 图标点击（applicationShouldHandleReopen）回调：重新显示主窗口。
 /// no-frame 自绘窗口后，系统标题栏窗口的「Dock 点击自动恢复」默认行为失效——
@@ -418,36 +337,34 @@ fn macos_activate(front: bool) {
         if app.is_null() {
             return;
         }
-        // NSApplicationActivationPolicy: Regular=0, Accessory=1
-        let policy: isize = if front { 0 } else { 1 };
         let set_policy_fn: unsafe extern "C" fn(Id, Sel, isize) =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        set_policy_fn(app, set_policy, policy);
         if front {
-            // 提到前台并获得焦点（让刚 show 的窗口成为 key window）
+            // 提到前台并获得焦点（让刚 show 的窗口成为 key window）。
+            // 用 `activateIgnoringOtherApps:` 而不是 `activate`：本仓零依赖手写 FFI，
+            // 只绑这一个稳定的老 selector（winit 自己的 `focus_window()` 也是调它）。
             let activate_fn: unsafe extern "C" fn(Id, Sel, bool) =
                 std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
             activate_fn(app, activate, true);
+        } else {
+            // `hide_dock`：**确保**回到 accessory（幂等）。
+            // D5（owner：「全程只有托盘，不进 Dock」）后进程**不再**会被提升为 Regular，
+            // 所以这一支现在只是把不变式重新钉一遍（万一将来又有人在别处切 Regular）。
+            // NSApplicationActivationPolicy: Regular=0, Accessory=1
+            set_policy_fn(app, set_policy, 1);
         }
     }
 }
 
-/// 非 macOS 无 dock 概念，留空调用即可。
-#[cfg(not(target_os = "macos"))]
-pub fn set_dock_visible(_visible: bool) {}
-/// 非 macOS 无 dock 概念，留空调用即可。
-#[cfg(not(target_os = "macos"))]
-pub fn hide_dock() {}
-
 // ───────────── macOS：文件选择 / 剪贴板（零依赖 AppKit FFI）─────────────
 //
 // C 批（系统对话附件）要用到的两个原生原语。两个都**必须在主线程调**——AppKit 非线程
-// 安全（同 `set_dock_visible`/`set_app_icon` 的约束）；调用点在 `ui.rs` 的 Slint 回调
+// 安全（同 `activate_app`/`app_is_active` 的约束）；调用点在 `ui.rs` 的 Slint 回调
 // （UI 线程），**不能**走 `UiCmd`（那条通道由后台 tokio 线程消费）。
 
 /// 原生**多选**文件对话框（系统对话输入行的 📎）。返回选中文件的绝对路径；取消返回空 vec。
 ///
-/// 为什么手写 FFI：本仓 macOS 侧坚持零依赖（同 `set_dock_visible`），不为一个文件面板
+/// 为什么手写 FFI：本仓 macOS 侧坚持零依赖（同 `activate_app`），不为一个文件面板
 /// 引入 `rfd`（会带进 objc2 / dispatch / block2 等一串依赖）。
 /// **主线程**：`runModal` 会起嵌套 run loop，只能从 UI 线程调。非 macOS 返回空 vec
 /// （Windows CI 只需能编译）。
@@ -464,7 +381,7 @@ pub fn pick_files_multi() -> Vec<PathBuf> {
         fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
         fn objc_msgSend();
     }
-    // 选择器只解析一次（ObjC selector 是进程内全局常量地址，缓存安全；同 set_app_icon）。
+    // 选择器只解析一次（ObjC selector 是进程内全局常量地址，缓存安全；同 macos_activate）。
     type Sels = (usize, usize, usize, usize, usize, usize);
     static SELS: OnceLock<Sels> = OnceLock::new();
     let (open_panel, set_multi, choose_files, choose_dirs, run_modal, urls) =

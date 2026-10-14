@@ -857,3 +857,335 @@ fn dump_full_window() {
         ui.get_titlebar_settings_w()
     );
 }
+
+// ─────────────────── D6：标题栏（三颗窗口按钮 / 拖动 / 控件条）的**命中路由**守卫 ───────────────────
+//
+// 「布局在、点了没反应」必须先把责任切开：是 **Slint 命中路由**没把按下送到按钮（
+// `titlebar_window_buttons_receive_clicks` 等），还是送到了、而**平台动作**
+// （miniaturize / zoom / drag_window）在无边框窗上是空操作（拖动那条只能给间接判据，见
+// `titlebar_drag_is_not_counted_as_click`）。手段：事件注入
+// （`Window::dispatch_event_with_result`，同 slint-pixel 的 `tests/title_bar_native_move.rs`）。
+
+/// 标题栏三颗窗口按钮的**命中中心**（绝对窗口坐标，逻辑 px）。
+///
+/// 几何来源（不是估算）：根 `VerticalLayout` padding 2px ⇒ `PixelTitleBar` 占
+/// x 2..w−2、y 2..36；其内部按钮组是 `x: parent.width − 106px; y: 4px; width: 102px;
+/// height: 26px` ⇒ 绝对 y 6..32，绝对左缘 = 2 + (w − 4 − 106) = w − 108。
+/// 3×30px 按钮 + 2×6px 间隔 = 102px 恰好铺满，`alignment: end` 无余量。
+fn titlebar_button_centers(w: u32) -> [(&'static str, f32, f32); 3] {
+    let left = (w - 108) as f32;
+    let y = 19.0; // 6 + 26/2
+    [
+        ("min", left + 15.0, y),
+        ("max", left + 30.0 + 6.0 + 15.0, y),
+        ("close", left + 2.0 * (30.0 + 6.0) + 15.0, y),
+    ]
+}
+
+fn press(win: &Rc<MinimalSoftwareWindow>, x: f32, y: f32) {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    win.window()
+        .dispatch_event_with_result(WindowEvent::PointerPressed {
+            position: slint::LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        })
+        .expect("派发 PointerPressed");
+}
+
+fn release(win: &Rc<MinimalSoftwareWindow>, x: f32, y: f32) {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    win.window()
+        .dispatch_event_with_result(WindowEvent::PointerReleased {
+            position: slint::LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        })
+        .expect("派发 PointerReleased");
+}
+
+fn press_release(win: &Rc<MinimalSoftwareWindow>, x: f32, y: f32) {
+    press(win, x, y);
+    release(win, x, y);
+}
+
+/// 建一个 520 宽的对话窗，把四个标题栏回调接到计数器上。
+fn setup_with_click_counters() -> (
+    SystemChatWindow,
+    Rc<MinimalSoftwareWindow>,
+    Rc<std::cell::RefCell<Vec<&'static str>>>,
+) {
+    const CW: u32 = 520;
+    let (ui, win, _) = setup(vec![row("p", "占位")], SHORT_H);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-chat"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(CW, SHORT_H));
+    super::apply_syschat_layout(&ui, CW as f32);
+    let log: Rc<std::cell::RefCell<Vec<&'static str>>> = Rc::new(std::cell::RefCell::new(vec![]));
+    {
+        let l = log.clone();
+        ui.on_minimize(move || l.borrow_mut().push("min"));
+    }
+    {
+        let l = log.clone();
+        ui.on_toggle_maximize(move || l.borrow_mut().push("max"));
+    }
+    {
+        let l = log.clone();
+        ui.on_close_window(move || l.borrow_mut().push("close"));
+    }
+    {
+        let l = log.clone();
+        ui.on_drag_start(move || l.borrow_mut().push("drag"));
+    }
+    // 画一帧，确保布局/属性都已落地（事件注入前窗口必须已 realize）。
+    let _ = settle_w(&win, CW, SHORT_H);
+    (ui, win, log)
+}
+
+/// D6 主判据：标题栏三颗窗口按钮**必须收到点击**（Slint 命中路由层）。
+#[test]
+fn titlebar_window_buttons_receive_clicks() {
+    let (_ui, win, log) = setup_with_click_counters();
+    for (name, x, y) in titlebar_button_centers(520) {
+        press_release(&win, x, y);
+        assert_eq!(
+            log.borrow().last().copied(),
+            Some(name),
+            "点 {name} 按钮（{x},{y}）没有触发对应回调，log={:?}",
+            log.borrow()
+        );
+    }
+    assert_eq!(
+        log.borrow().len(),
+        3,
+        "三颗按钮应各触发一次，实际 {:?}",
+        log.borrow()
+    );
+}
+
+/// 对照：标题栏空白处（`WindowMoveArea` 覆盖区）按下**不应**触发 drag-start
+/// （native-move 打开时上游刻意不发它，避免与平台移动重复）；这条同时说明空白处没有被
+/// 控件条/缩放热区之类的东西吃掉成别的回调。
+#[test]
+fn titlebar_blank_area_is_window_move_area() {
+    let (_ui, win, log) = setup_with_click_counters();
+    // 标题文字右侧、控件条左侧的空白：520 宽下 strip_x≈194，取 x=170（避开 logo/标题墨迹与控件）。
+    press_release(&win, 170.0, 19.0);
+    assert_eq!(
+        log.borrow().last().copied(),
+        None,
+        "标题栏空白处不该触发任何窗口控制回调（native-move 由平台处理），实际 {:?}",
+        log.borrow()
+    );
+}
+
+/// 控件条（①②③④）压在标题栏上层，它的命中面**不许**吃掉三颗窗口按钮的点击。
+///
+/// 判据（双向）：点窗口按钮 ⇒ 控件条回调**一次都不许响**；点 ①新建会话 ⇒ 它必须响。
+/// 只看几何（`titlebar_strip_does_not_overlap_title_or_buttons`）会漏掉「条本身比画的宽
+/// （例如旧别名 `HorizontalBox` 自带 8px padding）」这类**看不见的命中面**外扩。
+#[test]
+fn titlebar_strip_does_not_steal_window_button_clicks() {
+    let (ui, win, log) = setup_with_click_counters();
+    let news = Rc::new(std::cell::Cell::new(0usize));
+    {
+        let n = news.clone();
+        ui.on_new_session(move || n.set(n.get() + 1));
+    }
+    // ① 点三颗窗口按钮：`new-session` 不许被顺带触发。
+    for (name, x, y) in titlebar_button_centers(520) {
+        press_release(&win, x, y);
+        assert_eq!(
+            news.get(),
+            0,
+            "点 {name} 按钮时控件条（①新建会话）也被触发了：命中面外扩到窗口按钮区了"
+        );
+    }
+    // ② 正面控制：点 ①新建会话必须真的触发（否则「没被吃」只是因为条本身没命中面）。
+    let strip_x = ui.get_titlebar_strip_x().round() as f32;
+    assert!(strip_x > 0.0, "控件条没摆上（strip_x={strip_x}）");
+    press_release(&win, strip_x + crate::syschat::TB_NEW_W / 2.0, 19.0);
+    assert_eq!(
+        news.get(),
+        1,
+        "点 ①新建会话 没触发 new-session（控件条自己不可点）"
+    );
+    assert_eq!(
+        log.borrow().len(),
+        3,
+        "点控件条不该触发窗口控制回调，实际 {:?}",
+        log.borrow()
+    );
+}
+
+fn move_to(win: &Rc<MinimalSoftwareWindow>, x: f32, y: f32) {
+    use slint::platform::WindowEvent;
+    win.window()
+        .dispatch_event_with_result(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(x, y),
+        })
+        .expect("派发 PointerMoved");
+}
+
+/// D6 拖动判据：标题栏空白处「按住拖过阈值」必须由**窗口移动**这条路吃掉，不许退化成点击。
+///
+/// 判据是一对（单看一半没有判别力）：
+/// - **对照 F**：同一位置两次普通点击 ⇒ `double-clicked` 恰好触发一次 `toggle-maximize`
+///   （证明这个坐标上的按下**真的**进了 `PixelTitleBar` 的子树 —— 没有别的面把按压吃掉）；
+/// - **手势 D**：两次「按下 → 拖过阈值（20px > 8px）→ 拖回原位 → 松开」⇒ `toggle-maximize`
+///   **一次都不许响**。拖着走还被算成点击，就是「拖动没被平台移动层拦下」。
+///
+/// 为什么需要它：`PixelTitleBar` 的拖拽在 `native-move: true` 下走
+/// `WindowMoveArea` → `WindowAdapterInternal::start_window_move` → winit `drag_window()`，
+/// 而这条链在无头环境里没有可断言的出口（`TestingWindow::window_move_request_count()` 需要
+/// `i-slint-backend-testing` 的 `internal` feature，本仓不引该依赖）。但 `WindowMoveArea`
+/// 越阈值时返回 `Intercept` 会给已持有 grab 的子 `TouchArea` 发 `Exit`（子 `pressed` 被清）
+/// ⇒ 这次手势不再计入点击序列 —— 这正是上游 `slint-pixel` 用的间接判据。
+///
+/// 判别力实测（2026-10-14，本用例在两种配置下各跑一次）：
+/// - 生产配置（`native-move: true`）：D → `[]`（点击被拦下）、F → `["max"]`；
+/// - 变异 `native-move: false`：D → `["drag","drag","max"]` **报红**（点击没被拦下）。
+/// 反向也成立：把 `PixelWindowResize` 热区挪到标题栏上（或让控件条盖住空白区），
+/// 对照 F 会先红（按压根本没进标题栏）。
+#[test]
+fn titlebar_drag_is_not_counted_as_click() {
+    let (_ui, win, log) = setup_with_click_counters();
+    let blank_x = 170.0f32; // 标题文字右侧、控件条左侧的空白（标题栏内、非按钮、非控件条）
+    let y = 19.0f32;
+
+    // 手势 D：按下 → 越阈值 → 拖回 → 松在原位（松开点落在标题栏内 ⇒ 没被拦下就是一"点击"）。
+    // ⚠️ 四步必须是**独立的四次派发**：按下即松开只是普通点击，量不到任何东西。
+    for _ in 0..2 {
+        press(&win, blank_x, y);
+        move_to(&win, blank_x + 20.0, y);
+        move_to(&win, blank_x, y);
+        release(&win, blank_x, y);
+    }
+    assert!(
+        !log.borrow().contains(&"max"),
+        "两次「按住拖动」被算成了点击（双击 ⇒ toggle-maximize 响了）：窗口移动没有被发起。\
+         log={:?}",
+        log.borrow()
+    );
+    assert!(
+        log.borrow().is_empty(),
+        "标题栏空白处的拖动不该触发任何窗口控制回调（native-move 由平台处理），实际 {:?}",
+        log.borrow()
+    );
+
+    // 对照 F：同一位置的两次普通点击必须触发一次 toggle-maximize
+    // —— 否则「拖动没被算成点击」只是因为按压压根没进标题栏（假绿）。
+    press_release(&win, blank_x, y);
+    press_release(&win, blank_x, y);
+    assert_eq!(
+        log.borrow().iter().filter(|k| **k == "max").count(),
+        1,
+        "对照失败：同位置两次普通点击应恰好触发一次 toggle-maximize，实际 log={:?}",
+        log.borrow()
+    );
+}
+
+/// D6 旁证：`PixelWindowResize` 的命中面**确实会吃掉标题栏顶部那一条**（因此 macOS 必须关掉它）。
+///
+/// 几何：热区是绝对 y 0..6 的整宽条（`height: 6px`），而标题栏占 y 2..36 ⇒ 标题栏顶 4px
+/// 归热区；左右两条 6px 整高条同理压在标题栏两端。热区按下即 `begin-resize(dir)` 并 grab，
+/// 内容再也拿不到这次按压。
+///
+/// 为什么这是 D6 的 bug：macOS 上 `install_window_resize` 接的
+/// `winit::Window::drag_resize_window` **直接返回 `NotSupported`**
+///（winit 0.30.13 `src/platform_impl/macos/window_delegate.rs:1179`），
+/// 于是这些热区在 macOS 上「吃按压 + 什么都不做」——`app.slint` 里设置窗那条注释
+/// （"macOS 刻意不加：系统对 no-frame 窗口自带边角缩放，自绘热区会抢掉它"）说的就是这个。
+/// Rust 侧口径由 `ui::tests::resize_hit_areas_follow_platform_rule` 守着。
+#[test]
+fn resize_hot_zone_eats_titlebar_top_band() {
+    let (ui, win, _log) = setup_with_click_counters();
+    let dirs = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    {
+        let d = dirs.clone();
+        ui.on_begin_resize(move |dir| d.borrow_mut().push(dir.to_string()));
+    }
+    ui.set_resize_hit_areas(true);
+    let _ = settle_w(&win, 520, SHORT_H);
+    // 标题栏绝对 y 2..36；y=4 落在热区的 north 条（0..6）里。
+    press(&win, 170.0, 4.0);
+    release(&win, 170.0, 4.0);
+    assert_eq!(
+        dirs.borrow().as_slice(),
+        ["north"],
+        "标题栏顶部那条没有落到 north 缩放热区上（{dirs:?}）——本用例的几何前提变了，         请重新核对标题栏与热区的落位"
+    );
+}
+
+/// D5 端到端：`Focused(false)` → 延时 → 判定「焦点已离开本进程」→ 窗口真的被隐藏。
+///
+/// 为什么能在无头环境里跑整条链：本进程（`cargo test` 的测试二进制）不是一个激活态的 App，
+/// `platform::app_is_active()` 会返回 `false`（实测：`[NSApp isActive]` 在测试进程里为 false，
+/// 且调用安全——`sharedApplication` 只取单例，不起 UI），所以「失焦 ⇒ 应隐藏」这一支在测试里
+/// 就是**正面路径**；反面（焦点还在本进程 ⇒ 不隐藏）由 `ui::tests::blur_hide_*` 的纯函数用例覆盖。
+///
+/// 依赖真实墙钟：延时常量 `BLUR_HIDE_DELAY_MS` 变了本用例自动跟随（多睡 3 倍再判定），
+/// 不用固定 sleep 去猜实现细节（同 `LESSON_节流类测试断言须随真实墙钟缩放`）。
+#[test]
+fn blur_hides_dialog_window_end_to_end() {
+    // 注意：`Focused` 是 **winit** 的事件（Slint 的事件枚举里没有它）——
+    // 失焦隐藏接的是 winit 的窗口事件钩子（`Window::on_winit_window_event`）。
+    use slint::winit_030::winit::event::WindowEvent;
+    let (ui, win, _) = setup(vec![row("p", "占位")], SHORT_H);
+    assert!(ui.window().is_visible(), "前置控制失败：窗口没 show 上");
+
+    let timer = slint::Timer::default();
+    let empty_bubble: slint::Weak<AnchorBubble> = slint::Weak::default();
+    let empty_settings: slint::Weak<SettingsWindow> = slint::Weak::default();
+    let cw = ui.as_weak();
+    assert!(
+        super::handle_syschat_focus_event(
+            &WindowEvent::Focused(false),
+            &timer,
+            &cw,
+            &empty_bubble,
+            &empty_settings,
+        ),
+        "Focused(false) 应被失焦隐藏接线消费"
+    );
+
+    // 焦点又回来：待执行的隐藏必须被取消（否则「点一下别处再点回来」会把窗口藏掉）。
+    super::handle_syschat_focus_event(
+        &WindowEvent::Focused(true),
+        &timer,
+        &cw,
+        &empty_bubble,
+        &empty_settings,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(
+        super::BLUR_HIDE_DELAY_MS * 3,
+    ));
+    slint::platform::update_timers_and_animations();
+    assert!(
+        ui.window().is_visible(),
+        "Focused(true) 之后待执行的隐藏没被取消：窗口被藏掉了"
+    );
+
+    // 再失焦：这次必须真的隐藏。
+    super::handle_syschat_focus_event(
+        &WindowEvent::Focused(false),
+        &timer,
+        &cw,
+        &empty_bubble,
+        &empty_settings,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(
+        super::BLUR_HIDE_DELAY_MS * 3,
+    ));
+    slint::platform::update_timers_and_animations();
+    assert!(
+        !ui.window().is_visible(),
+        "失焦（且焦点离开本进程）后窗口没有隐藏：D5 的延时/判定链断了"
+    );
+    let _ = win;
+}

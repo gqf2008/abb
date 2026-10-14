@@ -446,9 +446,31 @@ fn push_settings_status(settings: &SettingsWindow, st: &install::ServiceStatus) 
     settings.set_running_line(line.into());
 }
 
-/// 提升进程为 regular（显示 dock 图标 + 激活抢前台），用于打开设置/扫码窗。
+/// 打开窗口前调用：**激活本进程**，让刚 `show` 的窗口成为 key window（可输入）。
+///
+/// D5（owner 2026-10-14）：**不再**提升为 Regular —— 那会给整机凭空加一个 Dock 图标。
+/// ABB 永远是 accessory（`Info.plist` 的 `LSUIElement=true`），见 [`platform::activate_app`]。
 fn bring_app_to_front() {
-    platform::set_dock_visible(true);
+    platform::activate_app();
+}
+
+/// 是否启用**自绘**无边框窗口缩放热区（`PixelWindowResize`）。
+///
+/// 口径：只有 Windows/Linux 需要自绘（它们没有系统缩放边框）；**macOS 一律关掉**。
+///
+/// 为什么 macOS 必须关（D6，2026-10-14）：`slint_pixel::install_window_resize` 把热区回调接到
+/// `winit::Window::drag_resize_window`，而 winit 0.30.13 的 macOS 实现**直接返回
+/// `Err(NotSupported)`**（`src/platform_impl/macos/window_delegate.rs:1179`）——热区于是变成
+/// 「按下就被 grab 吃掉、然后什么都不做」的死区。它不是无害的：热区是整窗 overlay（north 条
+/// 绝对 y 0..6、左右条 6px 整高、四角 14×14），压在标题栏（y 2..36）与窗口按钮的角上，
+/// 「抓住标题栏顶部拖窗口」这类操作会静默失效。`ui/app.slint` 里设置窗那条注释
+/// （“macOS 刻意不加：系统对 no-frame 窗口自带边角缩放，自绘热区会抢掉它”）说的就是这个口径，
+/// 对话窗（D 批「裸平台也开」）当时背离了它。
+///
+/// 守卫：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：两个窗口都不许写死 `true`）+ 无头几何取证
+/// `ui_headless_render_test::resize_hot_zone_eats_titlebar_top_band`。
+fn resize_hit_areas_enabled() -> bool {
+    !cfg!(target_os = "macos")
 }
 
 /// 从回调里首次显示一个「创建后一直隐藏」的窗口。顺序很关键（macOS 实测坑）：
@@ -457,10 +479,10 @@ fn bring_app_to_front() {
 ///    窗口 **map 之前**、surface 尚未就绪 → 首帧画空。而 macOS 又不像 iOS（同文件 ~1154 行的
 ///    guard）那样对「晚 show 的窗口」自动补一次 redraw，于是**内容区永久透明、只剩系统标题栏**。
 ///    显式 `request_redraw` 等于把 iOS 那条 guard 移植到 macOS，让窗口 map 后补画一帧。
-/// ② **激活要在 show 之前**：`bring_app_to_front` 把策略从 accessory 切 Regular 会**重排窗口**。
-///    若窗口已可见（先 show 后激活），重排会瞬间清掉刚画好的 Metal 内容、再由 redraw 补回 →
-///    肉眼可见「先出标题栏、后出内容」的闪烁。先激活（窗口此时还藏着，重排不闪）再 show，
-///    就不会扰动一个已可见的窗口。
+/// ② **激活在 show 之前**：与 winit 自己 `focus_window()` 的两步同序
+///    （`activateIgnoringOtherApps` → `makeKeyAndOrderFront`，而 winit 的 `set_visible(true)`
+///    就是 `makeKeyAndOrderFront`）。D5 之前这里还有一条「先激活」的理由（策略切 Regular 会
+///    重排窗口、把已可见窗口刚画好的内容闪一下）—— 不再切策略后那条已不存在，顺序照旧。
 /// 综上顺序：`bring_app_to_front` → `show` → `request_redraw`。`QrDialog`/`SettingsWindow` 都走这个。
 fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     // 窗口位置完全交给系统默认（macOS 级联位），代码不做任何移动：
@@ -498,6 +520,98 @@ fn refresh_bubble_visibility(bubble: &AnchorBubble) {
     } else {
         let _ = bubble.hide();
     }
+}
+
+/// 隐藏系统对话窗的**唯一收口**（✕ 按钮 / 红点 `CloseRequested` / D5 失焦隐藏 三条路径共用）。
+///
+/// - 气泡不动（v10「常驻置顶」口径）：只调一次 [`refresh_bubble_visibility`] 把显隐拉回 config 真值；
+/// - `hide_dock`：D5 之后进程永不为 Regular（见 [`bring_app_to_front`]），这句只是把
+///   「ABB 恒 accessory」这条不变式在「窗口都关了」的收尾点重新钉一遍（非 macOS 是空实现）。
+fn hide_syschat(
+    win: &SystemChatWindow,
+    bubble: &slint::Weak<AnchorBubble>,
+    settings: &slint::Weak<SettingsWindow>,
+) {
+    let _ = win.hide();
+    if let Some(b) = bubble.upgrade() {
+        refresh_bubble_visibility(&b);
+    }
+    let settings_open = settings
+        .upgrade()
+        .map(|s| s.window().is_visible())
+        .unwrap_or(false);
+    if !settings_open {
+        platform::hide_dock();
+    }
+}
+
+/// D5 失焦隐藏的**判据**（纯函数，口径钉在单测里）。
+///
+/// `visible` = 对话窗当前是否可见；`app_active` = **进程**当前是否仍处于激活态
+/// （[`platform::app_is_active`]，macOS 上是 `[NSApp isActive]`）。
+///
+/// 只有「窗口可见 **且** 焦点离开了**整个进程**」才隐藏：
+/// - 同一进程里气泡 / 设置窗 / 原生文件面板抢走 key 时 `app_active` 仍为 true ⇒ **不隐藏** ——
+///   否则「点/拖气泡时对话框跟着动」（D 批 #9）会在鼠标按下那一刻先把窗口藏掉，
+///   「📎 选文件」也会把窗口藏在面板背后（选完的文件就落进一个看不见的窗口）；
+/// - 窗口本来就藏着（刚被 ✕ 关掉，又收到一次 `Focused(false)`）⇒ 不重复处理。
+///
+/// 判别力（负向）：把判据改成 `visible`（只看窗口焦点）⇒ `blur_hide_ignores_focus_that_stays_in_process`
+/// 必红；改成 `!app_active`（不看可见性）⇒ `blur_hide_skips_hidden_window` 必红。
+fn should_hide_on_blur(visible: bool, app_active: bool) -> bool {
+    visible && !app_active
+}
+
+/// 失焦隐藏的**判定延迟**（ms）。
+///
+/// 不是节流/动画，而是**事件顺序**：winit 的 `WindowEvent::Focused(false)` 来自
+/// `windowDidResignKey:`，而 `[NSApp isActive]` 要到 `applicationDidResignActive:` 才转 false
+/// —— 在 blur 回调里**同步**查会永远为真（隐藏永远不触发）。延后一拍后跑在后续的 runloop
+/// 迭代上，那两个 AppKit 回调都已发完。
+/// 120ms：远低于「点别处 ⇒ 窗口消失」的感知阈值，又远大于一次 runloop 周转。
+const BLUR_HIDE_DELAY_MS: u64 = 120;
+
+/// D5：处理对话窗的 `Focused` 事件（失焦 ⇒ 隐藏）。返回 `true` 表示该事件已由本函数消费。
+///
+/// 为什么单独成函数（而不是就地写在事件钩子里）：
+/// 1. 它必须挂在**已有的那个** winit 事件钩子上（`Window::on_winit_window_event` 是单槽 `set`，
+///    见 `ui::tests::syschat_has_exactly_one_winit_event_hook`）——钩子体里只留一行转发；
+/// 2. 「事件 → 延时 → 判定 → 隐藏」整条链要能被无头测试直接驱动
+///    （`ui_headless_render_test::blur_hides_dialog_window_end_to_end`），不必跑 `run_gui`
+///    （跑 `run_gui` 会触发自启自愈、改用户真实的 `~/Library/LaunchAgents/`）。
+///
+/// `timer` 由调用方持有并保活（drop 即取消）；单槽：`start` 会覆盖上一次待执行的隐藏。
+fn handle_syschat_focus_event(
+    ev: &slint::winit_030::winit::event::WindowEvent,
+    timer: &slint::Timer,
+    win: &slint::Weak<SystemChatWindow>,
+    bubble: &slint::Weak<AnchorBubble>,
+    settings: &slint::Weak<SettingsWindow>,
+) -> bool {
+    let slint::winit_030::winit::event::WindowEvent::Focused(focused) = ev else {
+        return false;
+    };
+    if *focused {
+        // 焦点又回来了（例如点了窗口内部 / 刚 show 完）：取消待执行的隐藏。
+        timer.stop();
+        return true;
+    }
+    let Some(w) = win.upgrade() else { return true };
+    if !w.window().is_visible() {
+        return true; // 本来就藏着（✕ 关掉之后又收到一次失焦）：不用排隐藏
+    }
+    let (cwp, bwp, swp) = (win.clone(), bubble.clone(), settings.clone());
+    timer.start(
+        slint::TimerMode::SingleShot,
+        Duration::from_millis(BLUR_HIDE_DELAY_MS),
+        move || {
+            let Some(w) = cwp.upgrade() else { return };
+            if should_hide_on_blur(w.window().is_visible(), platform::app_is_active()) {
+                hide_syschat(&w, &bwp, &swp);
+            }
+        },
+    );
+    true
 }
 
 /// 气泡显隐的**唯一判据**（纯函数，口径钉在单测里）。
@@ -1323,9 +1437,9 @@ fn notify_rows(items: &[crate::unread::UnreadItem], cfg: &Config) -> Vec<NotifyR
 
 /// #74 显示提醒弹窗（toast）：显式定位屏幕右上角——与设置窗「位置零干预」的记忆决策
 /// 不冲突：那是主窗的日常摆放，toast 若走系统默认级联位会落在屏幕随机位置，违背 toast
-/// 的角落锚定语义（此处是唯一例外，注释留痕）。顺序同 show_window_and_focus：先激活
-/// （dock 图标）再 show——避免「先 show 后激活」的策略重排闪烁；show 后 set_position
-/// 发生在 macOS 窗口 map 之前（同步路径），无可见跳动。
+/// 的角落锚定语义（此处是唯一例外，注释留痕）。顺序同 show_window_and_focus：先激活再
+/// show（与 winit `focus_window()` 的两步同序）；show 后 set_position 发生在 macOS 窗口
+/// map 之前（同步路径），无可见跳动。
 fn show_notifications_window(w: &NotificationsWindow) {
     use slint::winit_030::WinitWindowAccessor;
     bring_app_to_front();
@@ -1346,8 +1460,8 @@ fn show_notifications_window(w: &NotificationsWindow) {
 }
 
 /// #74 收起提醒弹窗（5s 自动 / 点「知道了」/ 点条目跳转后共用）：
-/// 设置窗还开着（点条目跳历史页）时不动 dock——激活策略已归设置窗；
-/// 否则弹窗收起即降回 accessory（hide 先于 hide_dock，同 QrDialog 显隐时序，避免闪烁）。
+/// 设置窗还开着（点条目跳历史页）时不动 dock；否则弹窗收起即调一次 `hide_dock`
+/// （D5 后它只是把「ABB 恒 accessory」重新钉一遍，避免闪烁的「先 hide 后 hide_dock」顺序照旧）。
 fn hide_notifications_window(
     notif: &slint::Weak<NotificationsWindow>,
     settings: &slint::Weak<SettingsWindow>,
@@ -1895,7 +2009,8 @@ pub fn run_gui() -> Result<()> {
     slint_pixel::install_window_resize(&settings);
     // 缩放热区开关：**按目标平台显式给**（Windows/Linux 无系统缩放边框 → 自绘；
     // macOS 交给系统）。不用 `platform` 属性门控，避免依赖权限回填路径。
-    settings.set_resize_hit_areas(!cfg!(target_os = "macos"));
+    // 口径收口在 [`resize_hit_areas_enabled`]（两个窗口共用一份，见那里的 macOS 取证）。
+    settings.set_resize_hit_areas(resize_hit_areas_enabled());
     // 版本号随编译注入（Cargo.toml 单一事实源），侧栏底部展示
     settings.set_version(env!("CARGO_PKG_VERSION").into());
     // 托盘菜单的版本项也常驻当前版本（updater::CURRENT 同源）
@@ -1939,8 +2054,11 @@ pub fn run_gui() -> Result<()> {
     // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
     // 缩放：接 winit 的 drag_resize_window（`impl_resize_ui!` 提供回调实现）。
+    // ⚠️ 热区**按平台**给（同设置窗，见 [`resize_hit_areas_enabled`]）：D 批「裸平台也开」在
+    // macOS 上把标题栏顶部/两端变成了死区（`drag_resize_window` 在 macOS 返回 NotSupported，
+    // 热区只吃按压不干活），也是 D6「抓标题栏拖不动窗口」的一个来源。
     slint_pixel::install_window_resize(&syschat_win);
-    syschat_win.set_resize_hit_areas(true);
+    syschat_win.set_resize_hit_areas(resize_hit_areas_enabled());
     // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-width`（开出来是 min 宽 340，
     // 于是 ①②③ 挤不进标题栏）。显式给一次 520×560（= 稿的落位宽度），此后由用户自己缩。
     syschat_win
@@ -5280,7 +5398,7 @@ pub fn run_gui() -> Result<()> {
                 show_window_and_focus(&w);
             }
             // 弹窗内容即已读（展示时已落 msg-read.command）：这里只收起，不 hide_dock
-            // ——设置窗已打开（dock 激活策略归它管）
+            // ——设置窗已打开（收尾的 dock 不变式归它）
             hide_notifications_window(&nw, &sw, &showing);
         });
         notifications.on_dismiss({
@@ -5805,6 +5923,8 @@ pub fn run_gui() -> Result<()> {
     };
     // 「打开系统对话窗」的唯一收口：装载历史 + 刷新下拉 + 置前显示 + 锚到气泡旁 + 拉媒体。
     // **两个入口共用**：点气泡、点 Dock（v10 稿 v8 第 4 条：Dock 点击只开对话窗，不再弹设置窗）。
+    // 注：D5（不进 Dock）之后进程永远不落 Dock 图标 ⇒ 「点 Dock」这个入口实际不可达；
+    // 接线留着不删（一旦重新引入 Dock 图标就又是对的，且它本身无害）。
     let open_syschat: Rc<dyn Fn()> = {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
@@ -6048,8 +6168,7 @@ pub fn run_gui() -> Result<()> {
         platform::open_url(url.as_str());
     });
     // 关闭对话框 = 隐藏（托盘应用惯例；气泡仍在，随时可再打开）。
-    // 打开时 show_window_and_focus 会把进程提升为 regular（显 dock）；关闭时若设置窗
-    // 也没开，就降回 accessory（与 hide_notifications_window 同款收尾，避免留一个“孤儿”dock 图标）。
+    // 隐藏路径收口在 [`hide_syschat`]（✕ / 红点 / D5 失焦三条路径共用）。
     {
         use slint::winit_030::{
             winit::{event::ElementState, event::WindowEvent, keyboard::Key},
@@ -6060,22 +6179,7 @@ pub fn run_gui() -> Result<()> {
         let bw_close = bubble.as_weak();
         syschat_win.on_close_window(move || {
             if let Some(w) = cw.upgrade() {
-                let _ = w.hide();
-            }
-            // v10：关窗**不动**气泡（气泡常驻置顶，旧 #13「关窗才把气泡弄回来」已作废）；
-            // 这里仍调一次收口，保证显隐与 config 真值一致。
-            if let Some(b) = bw_close.upgrade() {
-                refresh_bubble_visibility(&b);
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let settings_open = sw
-                    .upgrade()
-                    .map(|s| s.window().is_visible())
-                    .unwrap_or(false);
-                if !settings_open {
-                    platform::hide_dock();
-                }
+                hide_syschat(&w, &bw_close, &sw);
             }
         });
         let cw2 = syschat_win.as_weak();
@@ -6094,6 +6198,9 @@ pub fn run_gui() -> Result<()> {
         // C2 拖放状态机（去重口径 / 高亮收尾见 `syschat::DropTracker`）：**同一个闭包**里处理，
         // 不得另起一个 `on_winit_window_event`——那是单槽 `set`，会把这条整个顶掉。
         let drop_tracker = Rc::new(RefCell::new(crate::syschat::DropTracker::new()));
+        // D5：失焦隐藏的延时器（单槽：start 会覆盖上一次待执行的隐藏）。
+        // 它被闭包持有 ⇒ 与窗口同生命周期（不能在闭包外 drop，否则回调立即取消）。
+        let blur_timer = slint::Timer::default();
         let land_paste = land_into_pending.clone();
         let land_drop = land_into_pending.clone();
         let drop_ev = drop_tracker.clone();
@@ -6155,23 +6262,13 @@ pub fn run_gui() -> Result<()> {
             }
             if matches!(ev, WindowEvent::CloseRequested) {
                 if let Some(w) = cw2.upgrade() {
-                    let _ = w.hide();
-                }
-                // v10：红点关闭同 ✕——气泡不动（统一收口按 config）。
-                if let Some(b) = bw_close2.upgrade() {
-                    refresh_bubble_visibility(&b);
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    let settings_open = sw2
-                        .upgrade()
-                        .map(|s| s.window().is_visible())
-                        .unwrap_or(false);
-                    if !settings_open {
-                        platform::hide_dock();
-                    }
+                    hide_syschat(&w, &bw_close2, &sw2);
                 }
             }
+            // D5：**失焦即隐藏**（接线在 [`handle_syschat_focus_event`]，那里有判据/延时的完整理由）。
+            // ⚠️ 必须挂在这个**已有**的钩子上：`on_winit_window_event` 是单槽 `set`，
+            // 另起一个会把 ⌘V / Finder 拖放 / 红点关闭整条顶掉（且不会报错）。
+            handle_syschat_focus_event(ev, &blur_timer, &cw2, &bw_close2, &sw2);
             // Windows：圆角 SetWindowRgn 硬裁剪（与设置窗同半径）；其它平台空操作。
             handle_platform_window_event(w, ev);
             EventResult::Propagate
@@ -7094,6 +7191,94 @@ mod tests {
         assert!(
             !prod.contains("dialog_visible") && !prod.contains("dialog-visibility"),
             "生产代码里还残留「对话框可见性」这条判据"
+        );
+    }
+
+    /// D5 失焦隐藏的判据（行为侧）：**只有「窗口可见 + 焦点离开整个进程」才隐藏**。
+    ///
+    /// 判别力（负向，两个输入各管一条）：
+    /// - 把判据退化成 `visible`（只看窗口焦点，不看进程）⇒ `..._ignores_focus_that_stays_in_process` 红；
+    /// - 退化成 `!app_active`（不看可见性）⇒ `..._skips_hidden_window` 红。
+    #[test]
+    fn blur_hide_ignores_focus_that_stays_in_process() {
+        // 焦点还在本进程（气泡/设置窗/原生文件面板抢走 key）：不隐藏。
+        assert!(!should_hide_on_blur(true, true));
+        // 焦点离开进程（点了别的 app / Cmd+Tab）：隐藏。
+        assert!(should_hide_on_blur(true, false));
+    }
+
+    #[test]
+    fn blur_hide_skips_hidden_window() {
+        // 窗口本来就藏着：不再重复处理（避免「已关窗又收到一次 Focused(false)」时白跑一条隐藏路径）。
+        assert!(!should_hide_on_blur(false, false));
+        assert!(!should_hide_on_blur(false, true));
+    }
+
+    /// D5：「不进 Dock」必须是**结构上**的——`activate_app` 不得再改激活策略，
+    /// 且两个窗口都不许把自绘缩放热区写死成 `true`。
+    ///
+    /// 判别力（负向）：
+    /// - 把 `macos_activate(true)` 改回 `setActivationPolicy:Regular(0)` ⇒ 本用例红；
+    /// - 把任一个 `set_resize_hit_areas(resize_hit_areas_enabled())` 改回 `set_resize_hit_areas(true)`
+    ///   ⇒ 本用例红（D6 真机：开着热区的 macOS 上标题栏顶部/两端变成死区）。
+    #[test]
+    fn resize_hit_areas_follow_platform_rule() {
+        let plat = crate::platform::src_lf(include_str!("platform.rs"));
+        let act_start = plat
+            .find("pub fn activate_app()")
+            .expect("platform.rs 应有 activate_app");
+        let activate_branch = &plat[act_start
+            ..plat
+                .find("pub fn app_is_active()")
+                .expect("platform.rs 应有 app_is_active")];
+        assert!(
+            activate_branch.contains("macos_activate(true)"),
+            "activate_app 应只做「激活」（macos_activate(true)）"
+        );
+        // 激活那条分支里不许出现策略切换：一旦切 Regular，Dock 图标就回来了。
+        let body = &activate_branch[..activate_branch
+            .find("\n}\n")
+            .expect("activate_app 应有函数体")];
+        assert!(
+            !body.contains("set_policy_fn("),
+            "activate_app 不应再改激活策略（D5：ABB 永远是 accessory，不进 Dock）"
+        );
+        // 自绘缩放热区：两个窗口都按平台口径给。
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        assert!(
+            !prod.contains("set_resize_hit_areas(true)"),
+            "有窗口把自绘缩放热区写死了 true：macOS 上 drag_resize_window 返回 NotSupported，\
+             热区只吃按压不干活（标题栏顶部/两端变死区）"
+        );
+        assert_eq!(
+            prod.matches("set_resize_hit_areas(resize_hit_areas_enabled())")
+                .count(),
+            2,
+            "设置窗与对话窗都应走 resize_hit_areas_enabled()"
+        );
+    }
+
+    /// D5：失焦隐藏接在**已有的那个** `on_winit_window_event` 里。
+    ///
+    /// `Window::on_winit_window_event` 是**单槽 `set`**（见该处注释与 `syschat` C1/C2 的教训）：
+    /// 另起一个会把前一条（⌘V / Finder 拖放 / 红点关闭）整个顶掉，而且**没有任何报错**。
+    /// 判别力：再加一个 `syschat_win.window().on_winit_window_event(` ⇒ 本用例红。
+    #[test]
+    fn syschat_has_exactly_one_winit_event_hook() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        assert_eq!(
+            prod.matches("syschat_win.window().on_winit_window_event(")
+                .count(),
+            1,
+            "对话窗的 winit 事件钩子是单槽 set：只能有一个（D5 的失焦隐藏必须并进那一个）"
+        );
+        assert!(
+            prod.contains(
+                "should_hide_on_blur(w.window().is_visible(), platform::app_is_active())"
+            ),
+            "失焦隐藏应走判据函数（`should_hide_on_blur`）而不是就地写条件"
         );
     }
 
