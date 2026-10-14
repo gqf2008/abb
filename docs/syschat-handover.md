@@ -39,6 +39,15 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 - `ABB_VERIFY_OPEN=1`：**直接打开对话窗**并打印窗口事实。**必须配隔离 HOME**（否则会触发 `platform::heal_autostart()` 改写用户真实 `~/Library/LaunchAgents/`）。
   探针按 **400ms 一档打 5 拍**，并**显式区分** `winit=None`（还没 realize）与 `Some{is_resizable,…}`：`t=400ms` 常是 `None`（`show()` 不同步建窗），`t=800ms` 才有原生窗事实——**别把 `None` 读成 `is_resizable=false`**（§5.1 的坑）。
 - ⚠️ **锁屏时合成点击打不进 app**：`CGSSessionScreenIsLocked=1` 时 `CGEvent` 落在 `loginwindow`，`ABB 系统对话` 收不到按下（拖拽/缩放/点按钮类验证必须先解锁）。查锁屏态：`swift /Volumes/DataExt/tmp/abb-verify/session.swift`。
+- **解锁后怎么验「手脚」（缩放/最大化/选中复制/say）**——三件都要真窗口：
+  ① 先让窗口**被点过**（激活）：实测**只有 app 已被点过，合成事件才落在它身上**（锁屏或未激活时 `CGEvent` 只落在 `loginwindow`/别的 app，
+  日志里 `[selfresize] begin` 与 `cursor_moved` 会**双双为 0 条**，别把这读成「缩放没接线」）；
+  ② 已知窗口矩形（`swift /tmp/listwin2.swift` 列 `(x,y,w,h)`）后发一次合成拖拽：
+  `swift /private/tmp/drag`\<无\> —— 本机现成脚本是 `swift /private/tmp/drag_once.swift 992 127 -140`（x y dx，10 拍带 30ms 间隔），
+  随后 `grep -a '\[selfresize\] begin' /tmp/verify.log` **应出现一条** `begin dir=<east|north-east|…> at (x,y)`（日志点在 `src/ui.rs` 的 `SelfResize` 入口；
+  **注意**：这条字符串在当前 head 的 release 二进制里也在，但 GUI 进程的 stdout 不落 `~/.agent-bridge/logs/gui.out`（那份停在 10-12）⇒ 要留证就用 §1 的 debug 探针 + `> /tmp/verify.log`）；
+  ③ 再用 `listwin2.swift` 复读一次矩形：**w/h 应变大**（这才叫「端到端生效」；只有单测几何=没验到手），
+  最大化同理（点三钮的 ⤢ 后工作区尺寸应等于 AppKit `visibleFrame`）。
 - `swift /tmp/winid.swift`：一个 8 行的 CoreGraphics 枚举脚本（若 `/tmp` 被清掉，见 §7 附录脚本）。
 - 无头出图台（**不需要真窗口**）：`src/ui_headless_render_test.rs`，`#[ignore]` 用例，例如
   `bash tools/check_test_isolation.sh --bin agent-bridge -- --ignored dump_frames`；
