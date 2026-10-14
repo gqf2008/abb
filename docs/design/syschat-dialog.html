@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v9</title>
+<title>ABB 系统对话 · 设计稿 v10</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -133,7 +133,7 @@
   .area{flex:1;min-height:66px;max-height:130px;font-size:13px;line-height:1.5;color:var(--dim);outline:none;padding:4px 2px}
   .area .caret{display:inline-block;width:1px;height:15px;background:var(--text);vertical-align:-3px;margin-left:1px;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
-  .send{align-self:flex-end;height:36px;padding:0 18px;border:2px solid var(--edge);border-radius:7px;background:var(--accent);font-weight:800;font-size:13px;cursor:pointer;flex:0 0 auto}
+  .send{height:30px;padding:0 14px;border:2px solid var(--edge);border-radius:6px;background:var(--accent);font-weight:800;font-size:12px;cursor:pointer;flex:0 0 auto}
   .send:active{transform:translateY(1px)}
 
   /* 思考区（默认折叠，展开看推理） */
@@ -287,10 +287,10 @@
             <div class="ib" title="表情">😊</div>
             <div class="ib mark" data-m="5" title="添加附件（可多选）">📎</div>
             <div class="ib" title="截图">✂</div>
+            <div class="ib mark" data-m="7" title="清空当前会话">🗑</div>
             <div class="ib" title="更多（含定时发送）">⋯</div>
           </div>
           <button class="send">发送</button>
-          <div class="ib mark" data-m="7" title="清空当前会话">🗑</div>
         </div>
       </div>
       <!-- 提示文案已按 owner 要求移除（不显示在界面上） -->
@@ -301,8 +301,13 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v9</h1>
-  <div class="sub">本轮：新建会话用对话气泡图标 / 附件移进输入框内靠右 / 输入区左右边距一致</div>
+  <h1>ABB 系统对话 · 设计稿 v10</h1>
+  <div class="sub">本轮：清空并入功能区 / 发送按钮收小</div>
+  <div class="sub" style="color:var(--info)"><b>v10 相对 v9 的改动</b>（实现以本稿为准）</div>
+  <ol>
+    <li><b>清空当前会话并进功能区</b>：从「发送右侧」移入功能区那一排，顺序 <code>[😊 表情] [📎 附件] [✂ 截图] [🗑 清空] [⋯ 更多(定时)]</code>，其后只跟一个 <code>发送</code>。</li>
+    <li><b>发送按钮收小</b>：高 36 → <b>30</b>、内边距 0 18 → <b>0 14</b>、字号 13 → <b>12</b>、圆角 7 → 6（与功能区图标同高一行）。</li>
+  </ol>
   <div class="sub" style="color:var(--info)"><b>v9 相对 v8 的改动</b>（实现以本稿为准）</div>
   <ol>
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
