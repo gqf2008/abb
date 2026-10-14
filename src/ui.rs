@@ -6957,8 +6957,7 @@ pub fn run_gui() -> Result<()> {
                             )
                         };
                         let thought = tw_think.borrow().shown().to_string();
-                        let rows =
-                            stream_rows(&final_text, has_thought, &thought, &elapsed, false);
+                        let rows = stream_rows(&final_text, has_thought, &thought, &elapsed, false);
                         if s0 != usize::MAX {
                             sync_stream_rows(&syschat_model_t, s0, rows);
                         } else if !stopped && (!final_text.is_empty() || has_thought) {

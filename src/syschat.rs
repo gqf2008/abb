@@ -2566,8 +2566,8 @@ mod tests {
         ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
     )]
     async fn turn_core_streams_thought_and_text_into_history() {
-        let rec = std::env::temp_dir()
-            .join(format!("abb-syschat-trec-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec =
+            std::env::temp_dir().join(format!("abb-syschat-trec-{}.jsonl", uuid::Uuid::new_v4()));
         let (store, base) = tmp_store("thought");
         let mut st = store.load();
         assert!(store.ensure_current(&mut st));
@@ -2688,10 +2688,7 @@ mod tests {
         b.push(ChunkKind::Thought, "…", 2.0); // 第一段 0.0→2.0
         b.push(ChunkKind::Text, "正文", 3.0);
         b.push(ChunkKind::Thought, "第二段", 10.0); // 进行中
-        assert!(
-            (b.thought_secs(12.5) - 4.5).abs() < 1e-9,
-            "2.0 + 2.5 = 4.5"
-        );
+        assert!((b.thought_secs(12.5) - 4.5).abs() < 1e-9, "2.0 + 2.5 = 4.5");
         b.stop();
         assert!(
             (b.thought_secs(99.0) - 2.0).abs() < 1e-9,

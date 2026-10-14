@@ -2394,7 +2394,10 @@ mod turn_chunk_tests {
         dispatch_turn_chunk(&Some(tx.clone()), "abb-7", ChunkKind::Thought, "思考吧");
         dispatch_turn_chunk(&Some(tx), "abb-7", ChunkKind::Text, "正文");
         let th = rx.try_recv().expect("思考分片应投递");
-        assert_eq!((th.session_id.as_str(), th.kind), ("abb-7", ChunkKind::Thought));
+        assert_eq!(
+            (th.session_id.as_str(), th.kind),
+            ("abb-7", ChunkKind::Thought)
+        );
         assert_eq!(th.text, "思考吧");
         let tx2 = rx.try_recv().expect("正文分片应投递");
         assert_eq!(tx2.kind, ChunkKind::Text);
