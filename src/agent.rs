@@ -905,6 +905,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-secret".into(),
             model: "some-model".into(),
+            context_window: 0,
         }
     }
 

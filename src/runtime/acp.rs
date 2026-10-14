@@ -96,6 +96,60 @@ impl StopReason {
     }
 }
 
+/// Token usage the agent reported for a completed turn
+/// (`session/prompt` response `_meta.usage`).
+///
+/// Reported by `abb-agent` from the provider's own counts (rpi's
+/// `AssistantMessage.usage`) — **real numbers, not an estimate**. An agent that
+/// does not send the key yields `None` (older adapters, goose); callers must
+/// label that case instead of printing a fabricated figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    /// Prompt tokens billed for this request (uncached input).
+    pub input: u64,
+    /// Completion tokens produced by this request.
+    pub output: u64,
+    /// Prompt tokens served from the provider's prompt cache.
+    pub cache_read: u64,
+    /// Prompt tokens written to the provider's prompt cache.
+    pub cache_write: u64,
+    /// Provider-reported total (`input + output + cache_read + cache_write`).
+    pub total: u64,
+}
+
+impl TokenUsage {
+    /// Context occupancy this turn implies: the whole prompt the provider saw,
+    /// i.e. cached and uncached prompt tokens — **not** the completion.
+    ///
+    /// Same formula as rpi's own cache accounting
+    /// (`rpi-harness/src/cache_stats.rs`), so the number matches what the
+    /// executor thinks the prompt cost.
+    pub fn context_tokens(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+}
+
+/// Parse `_meta.usage` out of a `session/prompt` result.
+///
+/// Tolerant on purpose: a missing `_meta`, a missing `usage`, or a non-numeric
+/// field all yield `None` rather than a protocol error — usage is an extension,
+/// and an agent that omits it must still be usable. A well-formed object whose
+/// counters are all zero is treated as **absent**: providers that report a zero
+/// prompt can only be reporting "nothing", and showing `0/128K` for a turn that
+/// really consumed context would be worse than showing the unknown placeholder.
+pub fn parse_usage(result: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = result.pointer("/_meta/usage")?;
+    let num = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    let parsed = TokenUsage {
+        input: num("input")?,
+        output: num("output").unwrap_or(0),
+        cache_read: num("cacheRead").unwrap_or(0),
+        cache_write: num("cacheWrite").unwrap_or(0),
+        total: num("total").unwrap_or(0),
+    };
+    (parsed.input + parsed.output + parsed.cache_read + parsed.cache_write > 0).then_some(parsed)
+}
+
 /// Errors that can occur in the ACP client.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
@@ -422,6 +476,13 @@ pub struct AcpClient {
     /// by [`AcpClient::take_turn_text`] at turn completion. A turn with no text
     /// (pure tool turn / silent refusal) yields an empty string.
     turn_text: String,
+    /// Token usage reported by the agent for the **most recently completed**
+    /// turn (`session/prompt` response `_meta.usage`, see [`TokenUsage`]).
+    ///
+    /// `None` means the agent did not report usage for that turn — an older
+    /// adapter, a cancelled turn, or a provider that omits it. Callers must
+    /// treat `None` as "unknown", never as zero.
+    turn_usage: Option<TokenUsage>,
     /// Session id of the in-flight prompt, used to attribute
     /// `agent_message_chunk` deltas to this turn. Steer turns keep the same
     /// session and keep accumulating; a straggler from another session must
@@ -663,6 +724,7 @@ impl AcpClient {
             abb_sandbox_modes: None,
             steer_rx: None,
             turn_text: String::new(),
+            turn_usage: None,
             turn_session: None,
         }
     }
@@ -689,12 +751,24 @@ impl AcpClient {
     /// dispatch path once per prompt task, before the first prompt of the turn.
     pub fn begin_turn(&mut self) {
         self.turn_text.clear();
+        // E3：上一回合的 usage 不得泄漏到本回合（本回合若不上报 usage，读者必须
+        // 看到 `None` 而不是**上一条消息的**旧数字）。
+        self.turn_usage = None;
         self.turn_session = None;
     }
 
     /// Drain the turn's accumulated agent text (the reply to deliver).
     pub fn take_turn_text(&mut self) -> String {
         std::mem::take(&mut self.turn_text)
+    }
+
+    /// Take the token usage reported for the most recently completed turn.
+    ///
+    /// Same take-once discipline as [`take_turn_text`](Self::take_turn_text):
+    /// the value is consumed so a later turn with no reported usage cannot
+    /// inherit the previous turn's numbers.
+    pub fn take_turn_usage(&mut self) -> Option<TokenUsage> {
+        self.turn_usage.take()
     }
 
     /// Send the `initialize` request and return the agent's response result value.
@@ -2049,6 +2123,9 @@ impl AcpClient {
         &mut self,
         result: &serde_json::Value,
     ) -> Result<StopReason, AcpError> {
+        // E3：真实 usage 与 `stopReason` 同一次响应里带回来，就地记账（赋值而非合并：
+        // 没带 usage 的回合必须把值置空，不能让上一回合的数留下来）。
+        self.turn_usage = parse_usage(result);
         self.parse_stop_reason(result)
     }
 
@@ -2621,6 +2698,72 @@ mod tests {
             Some(StopReason::MaxTurnRequests)
         );
         assert_eq!(StopReason::from_str("Refusal"), Some(StopReason::Refusal));
+    }
+
+    /// E3（卡 `abb-syschat-e3-tokens-20261013`）：`session/prompt` 响应里的真实 usage
+    /// 要按 **abb 的线格式**读出来（`abb-agent` 发的就是这套键名，见该包 `usage_wire`）。
+    ///
+    /// 判别力（负向）：把 `parse_usage` 的 `cacheRead` 键改成 `cache_read` ⇒ 第 2 段红
+    /// （缓存读计不进去 ⇒ 「已用」偏小）；去掉末尾的「全零 ⇒ None」判据 ⇒ 第 4 段红。
+    #[test]
+    fn parse_usage_reads_the_wire_shape_and_rejects_zero() {
+        // ① 完整对象：五个键全读出来，且 `context_tokens` 只算 prompt 侧
+        //    （input + cacheRead + cacheWrite），**不含** output。
+        let full = serde_json::json!({
+            "stopReason": "end_turn",
+            "_meta": { "usage": {
+                "input": 1200, "output": 30, "cacheRead": 1000, "cacheWrite": 0, "total": 2230
+            }},
+        });
+        let u = parse_usage(&full).expect("完整 usage 要能解析");
+        assert_eq!(
+            u,
+            TokenUsage {
+                input: 1200,
+                output: 30,
+                cache_read: 1000,
+                cache_write: 0,
+                total: 2230
+            }
+        );
+        assert_eq!(
+            u.context_tokens(),
+            2200,
+            "上下文占用 = prompt 侧（input + cacheRead + cacheWrite），不含 output"
+        );
+
+        // ② 只有必填 input：可选键缺省为 0（不是解析失败）。
+        let only_input = serde_json::json!({ "_meta": { "usage": { "input": 7 } } });
+        assert_eq!(
+            parse_usage(&only_input),
+            Some(TokenUsage {
+                input: 7,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                total: 0
+            })
+        );
+
+        // ③ 三种「没有」：缺 `_meta`、缺 `usage`、缺 `input` —— 都是 `None` 而不是报错
+        //    （usage 是扩展；不报它的适配器必须照常可用）。
+        assert_eq!(
+            parse_usage(&serde_json::json!({ "stopReason": "end_turn" })),
+            None
+        );
+        assert_eq!(parse_usage(&serde_json::json!({ "_meta": {} })), None);
+        assert_eq!(
+            parse_usage(&serde_json::json!({ "_meta": { "usage": { "output": 5 } } })),
+            None
+        );
+
+        // ④ 全零 = 「没上报」：显示 0/128K 会比显示未知更误导（真的占了上下文却说 0）。
+        let zeros = serde_json::json!({
+            "_meta": { "usage": {
+                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0
+            }},
+        });
+        assert_eq!(parse_usage(&zeros), None, "全零必须按「未知」处理");
     }
 
     #[test]

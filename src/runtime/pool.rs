@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, StopReason, SystemPromptTransport};
+use crate::runtime::acp::{AcpClient, AcpError, StopReason, SystemPromptTransport, TokenUsage};
 use crate::runtime::queue::{CancelReason, DedupMode, FlushBatch, PromptChannelInfo};
 
 /// Window within which agent activity before a hard-cap death qualifies
@@ -289,6 +289,14 @@ pub struct PromptResult {
     /// cancel paths drop the text (`None`); an empty `Ok` turn (tool-only,
     /// silent) is also `None` and is not delivered.
     pub final_text: Option<String>,
+    /// Real token usage the agent reported for this turn
+    /// (`AcpClient::take_turn_usage` → `session/prompt` response `_meta.usage`).
+    ///
+    /// `None` = the agent reported nothing for this turn (older adapter, goose,
+    /// cancelled/failed turn). Consumers must label that case as unknown rather
+    /// than substituting a number. Only the synchronous-waiter path (oneshot)
+    /// consumes it today; the chat path ignores it.
+    pub final_usage: Option<TokenUsage>,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
 }
@@ -1091,11 +1099,16 @@ fn send_prompt_result(
     final_text: Option<String>,
 ) {
     agent.acp.clear_steer_rx();
+    // E3：本回合的真实 usage（`None` = 执行层没上报）。**在这里取而不是加一个形参**：
+    // 文本与 usage 都是「本回合已发生的事实」，而失败/重排队/取消路径有十几条，
+    // 加形参等于让每条都写一次 `None`——任何一条漏传都会静默丢掉数字。
+    let final_usage = agent.acp.take_turn_usage();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         outcome,
         final_text,
+        final_usage,
         batch,
     });
 }

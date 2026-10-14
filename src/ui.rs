@@ -965,17 +965,30 @@ impl SplitWiring {
     }
 }
 
-/// v11（卡 `abb-v11-panels-align`）：状态栏右侧的上下文用量。
+/// v11（卡 `abb-v11-panels-align`）：状态栏右侧的上下文用量——**读源那一半**。
 ///
-/// 数据源接缝在 [`crate::syschat::context_usage`]（**E3 卡**）：当前如实为空 ⇒
-/// 文案 `上下文 —/— · —`、进度条 0 宽；百分比/档位/文案格式化全在纯函数里（带单测），
-/// E3 落地时只改那一个函数（本函数是**唯一**消费点）。
+/// 数据源接缝在 [`crate::syschat::context_usage`]（E3 卡起给**真实值**：最近一轮的
+/// prompt tokens + 该供应商的窗口），本函数是它在 GUI 里的**唯一**消费点；
+/// 「把一对数画上去」那一半在 [`apply_syschat_usage`]（无盘访问，可单测注入）。
+///
+/// 为什么拆两半：只读源那一半是**非确定**的（读真实 `~/.agent-bridge` + `config.json`），
+/// 把它和渲染混在一起会让无头渲染台的断言随开发机的真实状态变红——
+/// E3 落地时踩过：同一个断言在隔离 HOME 下绿、在真实 HOME 下红。
 fn refresh_syschat_usage(win: &SystemChatWindow) {
     let (used, limit) = crate::syschat::context_usage();
+    apply_syschat_usage(win, used, limit);
+}
+
+/// 把一对用量数**套到窗口**上（文案 / 悬停提示 / 内条宽 / 档位）。
+///
+/// 纯注入（不读盘不读配置），所以无头渲染台可以钉住任意档位：两个 `None` = 空档
+/// （文案 `上下文 —/— · —`、内条 0 宽），有数 = 按 [`crate::syschat::usage_percent`]
+/// 换算内条与 [`crate::syschat::usage_level`] 档位。
+fn apply_syschat_usage(win: &SystemChatWindow, used: Option<u64>, limit: Option<u64>) {
     win.set_usage_text(crate::syschat::context_usage_text(used, limit).into());
-    win.set_usage_tip(
-        "本会话上下文占用（数据来源待 E3 卡：上游不上报 usage，不显示估算值）".into(),
-    );
+    // E3：口径写进悬停提示（卡验收 3：悬停/点击看**精确值**）。文案是纯函数，
+    // 有单测——口径这种会被用户当真的东西不能只活在 GUI 闭包里。
+    win.set_usage_tip(crate::syschat::context_usage_tip(used, limit).into());
     let (fill, level) = match (used, limit) {
         (Some(u), Some(l)) if l > 0 => {
             let pct = crate::syschat::usage_percent(u, l);
@@ -2002,6 +2015,13 @@ fn provider_to_row(p: &ProviderConfig, default_name: &str) -> ProviderRow {
         api_key: "".into(), // 安全：密钥不回显
         model: p.model.clone().into(),
         is_default: !p.name.is_empty() && p.name == default_name,
+        // E3：0（没设）显示成空串——否则用户会以为「窗口 = 0」，而它其实是「走内置表」。
+        context_window: if p.context_window > 0 {
+            p.context_window.to_string()
+        } else {
+            String::new()
+        }
+        .into(),
     }
 }
 
@@ -5093,7 +5113,7 @@ pub fn run_gui() -> Result<()> {
                                     // 保证所有 `Delta` 排在 `Reply`/`Stopped` 之前。
                                     let _ = forwarder.await;
                                     match end {
-                                        Ok(crate::syschat::TurnEnd::Done(reply)) => {
+                                        Ok(crate::syschat::TurnEnd::Done { text: reply, .. }) => {
                                             SysChatEvt::Reply(reply)
                                         }
                                         Ok(crate::syschat::TurnEnd::Stopped) => {
@@ -6996,6 +7016,15 @@ pub fn run_gui() -> Result<()> {
                     "base_url" => p.base_url = value.trim().to_string(),
                     "api_key" => p.api_key = value.to_string(), // 密钥不 trim（可能含有意空白）
                     "model" => p.model = value.trim().to_string(),
+                    // E3：上下文窗口。非数字/空 ⇒ 0 = 没设（走内置兜底表）——
+                    // 宁可回落到「未知」也不猜一个数（卡验收 4）。
+                    "context_window" => {
+                        p.context_window = value
+                            .trim()
+                            .replace([' ', ',', '_'], "")
+                            .parse()
+                            .unwrap_or(0)
+                    }
                     _ => {}
                 }
             }
@@ -8232,6 +8261,9 @@ pub fn run_gui() -> Result<()> {
                                 w.set_status_line("已停止。".into());
                             }
                             w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                            // E3：回合结束 ⇒ 重算用量条（`turn_core` 刚把本轮的
+                            // `context_tokens` 落进会话索引；不刷新的话要等下次切会话才更新）。
+                            refresh_syschat_usage(&w);
                         }
                         if let Some(b) = bubble_w.upgrade() {
                             b.set_busy(false);
@@ -9756,6 +9788,7 @@ mod tests {
             base_url: "https://api.deepseek.com".into(),
             api_key: "sk-a".into(),
             model: "deepseek-chat".into(),
+            context_window: 0,
         }];
         let s1 = bots_struct_sig(&c);
         // ① 改 key → 翻签名
@@ -10177,6 +10210,7 @@ mod tests {
             updated_at: updated,
             provider: String::new(),
             archived: false,
+            context_tokens: 0,
         };
         let metas = vec![meta("a", "甲", 10), meta("b", "乙", 20)];
 

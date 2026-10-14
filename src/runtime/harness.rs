@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::runtime::acp::{AcpClient, AcpError, ResourceUpdate, TurnChunk};
+use crate::runtime::acp::{AcpClient, AcpError, ResourceUpdate, TokenUsage, TurnChunk};
 use crate::runtime::pool::{
     AgentPool, ControlSignal, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
     SteerAck, SteerError, SteerRequest, TimeoutKind,
@@ -402,6 +402,14 @@ pub struct RuntimeHandle {
     chunk_sinks: std::sync::Mutex<
         std::collections::HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
     >,
+    /// 同步等待者（oneshot 路径）该读的**本回合真实 usage**（E3）：
+    /// 主循环在该频道的 `Done` 回执之前落位，`oneshot` 收到回执后取走。
+    ///
+    /// 为什么不塞进 [`SyncWaitMsg`] / [`SyncTurnOutcome`]：那两个是**结局分类**，
+    /// 六个模块按分类匹配；usage 只是系统对话（GUI）要的一个量。这里与
+    /// `chunk_sinks` 同款——按频道挂的「本回合边车」，谁要谁取（take 一次即空，
+    /// 因此不会把上一回合的数留给下一回合）。
+    turn_usage: std::sync::Mutex<std::collections::HashMap<Uuid, TokenUsage>>,
     turn_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<TurnOutput>>>,
 }
 
@@ -492,6 +500,7 @@ impl RuntimeHandle {
             turn_rx: std::sync::Mutex::new(Some(turn_rx)),
             sync_waiters: std::sync::Mutex::new(std::collections::HashMap::new()),
             chunk_sinks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            turn_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -589,6 +598,14 @@ impl RuntimeHandle {
     /// 接收端对应的 sender 一直占表，迟发分片也无人消费）。
     pub fn remove_turn_chunk_sink(&self, channel_id: Uuid) {
         self.chunk_sinks.lock().unwrap().remove(&channel_id);
+    }
+
+    /// 取走某频道本回合上报的 usage（E3；oneshot 在收到 `Done` 回执后调用）。
+    ///
+    /// take 语义：取一次就空——同一频道上后一个回合没上报 usage 时，调用方
+    /// 必须看到 `None`，而不是上一个回合的旧数字。
+    pub fn take_turn_usage(&self, channel_id: Uuid) -> Option<TokenUsage> {
+        self.turn_usage.lock().unwrap().remove(&channel_id)
     }
 
     /// 把一条流式分片投给该频道的 sink（未装/接收端已 drop 则丢弃）。
@@ -2044,6 +2061,12 @@ fn handle_prompt_result(l: &mut Loop, handle: &RuntimeHandle, mut result: Prompt
                 tracing::info!(%channel_id, text_chars = text.chars().count(), "turn text captured — delivering");
                 // 同步等待者（job/oneshot 路径）旁路：文本直接回传，不产生 chat 投递
                 if let Some(tx) = handle.sync_waiters.lock().unwrap().remove(channel_id) {
+                    // E3：本回合的真实 usage 与文本**同一处、同一时刻**落位，
+                    // 供 oneshot 收到回执后取走（见 `RuntimeHandle::turn_usage`）。
+                    // 只挂在同步等待路径上：chat 投递路径没有消费方，挂了就是白占表。
+                    if let Some(usage) = result.final_usage.take() {
+                        handle.turn_usage.lock().unwrap().insert(*channel_id, usage);
+                    }
                     let _ = tx.send(SyncWaitMsg::Done(Ok(text)));
                 } else {
                     let _ = handle.turn_tx.send(TurnOutput {

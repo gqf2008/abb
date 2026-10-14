@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::acp::TurnChunk;
+use super::acp::{TokenUsage, TurnChunk};
 use super::harness::{AgentConfig, ChannelMeta, RuntimeHandle, SteerSupport, SyncTurnOutcome};
 use super::queue::InboundMsg;
 
@@ -105,8 +105,10 @@ pub async fn oneshot_turn_streaming(
     external_cancel: Option<CancellationToken>,
     chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
 ) -> SyncTurnOutcome {
+    // 只关心结局：usage 的消费方是系统对话（它直接用 steerable 变体）。
     oneshot_turn_streaming_steerable(cfg, workspace, msg, budget, external_cancel, chunk_tx, None)
         .await
+        .0
 }
 
 /// [`oneshot_turn_streaming`] 的「可插入」变体（卡 `abb-syschat-d10-insert-interrupt`）：
@@ -120,7 +122,7 @@ pub async fn oneshot_turn_streaming_steerable(
     external_cancel: Option<CancellationToken>,
     chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
     steer: Option<SteerWiring>,
-) -> SyncTurnOutcome {
+) -> (SyncTurnOutcome, Option<TokenUsage>) {
     let stop = CancellationToken::new();
     let cwd = std::env::current_dir()
         .unwrap_or_default()
@@ -212,6 +214,11 @@ pub async fn oneshot_turn_streaming_steerable(
         let _ = tokio::time::timeout(CANCEL_CMD_BUDGET, handle.cancel(channel_id)).await;
     }
 
+    // E3：取走本回合的真实 usage（执行层上报才有，`None` = 没报）。必须**在拆栈之前**
+    // 取——handle 一 drop，按频道挂的边车就没了。文本与 usage 在同一条回执上落位
+    // （见 `RuntimeHandle::take_turn_usage`），所以这里不会早于写入。
+    let usage = handle.take_turn_usage(channel_id);
+
     stop.cancel();
     // 本卡：摘掉 steer 转接（回合终态后不得再能力广播/注入）。
     if let Some((cap_task, inject_task)) = steer_tasks {
@@ -226,10 +233,17 @@ pub async fn oneshot_turn_streaming_steerable(
     {
         tracing::warn!("oneshot teardown exceeded budget — detached (shutdown grace reaps)");
     }
-    match outcome {
+    let outcome = match outcome {
         SyncTurnOutcome::Ok(text) => SyncTurnOutcome::Ok(strip_backend_suffix(&text)),
         other => other,
-    }
+    };
+    // usage 只跟**成功**回合走：取消/超时/关闭下那个数要么没有、要么不完整，
+    // 报给 UI 会让「已用」看起来像刚清空过（卡 abb-syschat-e3-tokens-20261013）。
+    let usage = match outcome {
+        SyncTurnOutcome::Ok(_) => usage,
+        _ => None,
+    };
+    (outcome, usage)
 }
 
 /// 剥除回合文本尾部的后端标识后缀（`── 后端：X`）。P4.3 起 harness Ok 臂已

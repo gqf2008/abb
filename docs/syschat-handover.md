@@ -1,7 +1,7 @@
 # 系统级对话（syschat）交接文档
 
 > 面向**下一个接手的人**（或新会话）。目标：读完这一份就能继续干，不用重新踩坑。
-> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
+> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
 
 ---
 
@@ -10,7 +10,8 @@
 - 功能主体**已经可用**：气泡（常驻置顶）+ 对话框（标题栏一行 / 状态栏两行 / 输入区功能区）+ 流式打字机 + 附件/拖拽 + Markdown（含 HTML 媒体）+ 定时发送 + 插入/打断（排队）+ **消息动作**（纯文本块可选中复制；助手轮 ⧉ 复制 / ⟳ 重新生成 / 🔊 朗读）。
 - **对话窗缩放已修**（卡 `abb-syschat-resize-macos-20261015`）：根因**更正为「透明的无边框窗在 macOS 没有系统边角缩放」**（上一版写的 `winit is_resizable=false` 是「未 realize」的误读，见 §5.1）⇒ 对话窗**恒画热区 + macOS 自管缩放**。剩**owner 真机复验**（手拖边角的手感；锁屏时合成点击打不进 app）。
 - **历史会话归档已做**（卡 `abb-v11-session-archive`）：会话菜单「🗄 归档…」归档当前会话（从列表隐藏）、「🗄 已归档（N）…」进归档视图（点一条 = 取消归档并切回）；**不删任何历史文件**。剩 **owner 真机复验**（点开面板 → 归档 → 已归档 → 找回；锁屏时合成点击打不进 app）。
-- 还没做：**截屏**、**Token 真实用量**、**思考块真机可见**（卡在 `abb-agent`）、**设置窗在 macOS 缩放**（§5.2，根因同 §5.1）。
+- **Token 真实用量已做**（卡 `abb-syschat-e3-tokens-20261013`）：状态栏「已用/上限 · 百分比」+ 进度条（≥70% 橙 / ≥90% 红），悬停给精确 token 数**和口径**；值是**真实计数**（执行层从 provider 响应上报的 prompt tokens），不是 `chars/4` 估算。上限来源：设置里 `context_window` 覆盖 > 内置常见模型表 > `—`（不知道就不印数）。
+- 还没做：**截屏**、**思考块真机可见**（卡在 `abb-agent`）、**设置窗在 macOS 缩放**（§5.2，根因同 §5.1）。
 
 ---
 
@@ -111,7 +112,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 | **截屏 `✂`** | 只有占位（按下写「尚未实现」） | 卡 `abb-v11-screenshot`；做原生截屏需 **macOS 屏幕录制 TCC 权限**，要先探权限 + 被拒给可读引导；`screencapture` 子进程是可行退路 |
 | **消息动作**（可选中复制 / 复制 / 重新生成 / 朗读） | **已做**（卡 `abb-v11-message-actions`，2026-10-15 合入 main） | 口径＝**分层**：无行内样式的文本块换只读 `TextInput`（可选中 + ⌘C），助手轮整轮 `⧉ 复制` 兜底；**含行内样式的块**（表格/媒体/粗体/行内码/链接/`~~` 删除线）**仍不可选**——`TextInput` 渲染不了样式，宁可不选也不回退 B 批的样式。动作行只带**真实历史下标**、点击时才由 `syschat::action_target` 解析（**不许用「负值＝最后一条助手轮」哨兵**：第二轮收尾后模型里有两条同值哨兵，会一起解析到同一轮 ⇒ 点第一轮操作了第二轮，评审判 Critical）。剩 **owner 真机复验三项**：① 真机剪贴板端到端（⌘V 粘出）；② 真机拖选高亮 + ⌘C；③ 真机 `say` 出声与 ⏹ 停止（锁屏期合成点击打不进 app；`say` 这条单测走 `/bin/sleep` 替身，只证「隐藏路径会停进程」） |
 | **历史会话归档** | **已做**（卡 `abb-v11-session-archive`，2026-10-15 落 main） | 口径＝**隐藏 + 可找回，不删数据**：`SessionMeta.archived`（`#[serde(default)]` ⇒ 旧 `sessions.json` 缺字段按未归档）；`SessionStore::list()` 过滤归档、`archived()` 只列归档；归档**当前**会话时 `ensure_current` 把 current 落到最近活动的未归档会话（一条不剩则起一条新的、沿用模型选择，**不擅自取消归档**）；`set_archived` 幂等（同值/未知 id 不落盘）。UI：第一行两义（普通「🗄 归档…」/ 归档视图「← 返回会话列表」）、第二行「🗄 已归档（N）…」；文案与「哪份列表 + 清空当前项」的判据都在 Rust 纯函数里（`session_panel_text` / `session_menu_view`）。单测 5 条（归档过滤/找回/不删文件、current 迁移、幂等不落盘、旧 JSON 兼容、两视图文案）+ ui 行判据 + 无头「第二行真的画出来」+ 出图。剩 **owner 真机复验**（三项点击路径；锁屏期合成点击打不进 app） |
-| **Token 真实用量** | 状态栏进度条**结构已就位**，值是占位 | 卡 `abb-syschat-e3-tokens-20261013`；**`acp.rs` 没有任何 usage 来源**（goose 注释明说不报）⇒ 首选 ACP 响应里的真实 usage，退路 `chars/4` **并标注为估算**；`providers[].model` 无 `context_window` ⇒ 内置常见模型表 + 设置可覆盖 |
+| **Token 真实用量** | **已做**（卡 `abb-syschat-e3-tokens-20261013`，2026-10-15 落 main） | 口径＝**真实计数，不是估算**：`crates/abb-agent`（rpi 驱动）本来就从 provider 响应里解出 `AssistantMessage.usage`，只是**没往外报** ⇒ 现在随 `session/prompt` 结果 `_meta.usage`（camelCase `input/output/cacheRead/cacheWrite/total`）上报，根侧 `runtime::acp::parse_usage` 收下（缺字段/全零 ⇒ `None`，绝不编数），经 `pool::PromptResult::final_usage` → harness 旁路表 → `oneshot` → `syschat::TurnEnd::Done{usage}` → 写 `SessionMeta.context_tokens`（**prompt 侧** `input＋cacheRead＋cacheWrite`，不含 output）。上限：`providers[].context_window`（`#[serde(default)]`，旧 config 兼容）**覆盖**内置常见模型表（子串匹配、长键在前；匹配不到 ⇒ `None` ⇒ 印 `—`）。UI 文案/档位/提示全是纯函数（`context_usage_text` / `usage_level` / `context_usage_tip`），渲染半是无盘注入（`ui::apply_syschat_usage`）⇒ 无头台可断言任意档位。剩 **owner 真机复验**：真机跑一轮看数字随回合变化 + 设置窗「上下文窗口」填/清（`0` = 用内置表）|
 | **思考块真机可见** | GUI 全就绪（折叠块 + 耗时 + 打字机），**执行层不发** | 卡 `abb-agent-project-thinking-20261014`：`crates/abb-agent` 的 `event_updates` 未映射 rpi 的 `ThinkingDelta`，且 `thinking_level` 默认 `Off`（打开会改模型请求参数，建议默认关 + 设置项） |
 | **插入（steer）** | GUI + 发送端已就绪；**生产恒走排队** | `abb-agent` 如实上报 `steering.supported=false`（`_session/steering` 回 `-32601`）⇒ 要真插入得换声明支持该扩展的适配器，或改 `abb-agent` |
 | **设置窗在 macOS 缩放** | 未做 | 它的热区接 `drag_resize_window`（macOS `NotSupported`）= 死区 ⇒ 要可缩放得给它也接自管循环（`SelfResize` 现在只绑在对话窗的 `on_self_resize_begin` 上）；§5.1 的更正说明同样适用 |
@@ -120,6 +121,12 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 ---
 
 ## 6. 关键技术结论（**别再重走弯路**）
+
+**用量（E3）**
+- 上一版写「`acp.rs` 没有任何 usage 来源（goose 注释明说不报）」是**针对旧适配器的过时结论**：本仓执行层是 `crates/abb-agent`（rpi 驱动），rpi 的 provider mapper 会把 `usage` 填进 `AssistantMessage`（anthropic 填 `input/cache_read/cache_write`，openai/faux 同类），**只是没往外转发**。⇒ 别退到 `chars/4` 估算，真值就在手边。
+- 口径：**prompt 侧** `input + cacheRead + cacheWrite`（与 rpi 自己的 `cache_stats.rs` 同口径），**不含 output**——「上下文占用」问的是「这一轮请求送进去多少」，不是「产出多少」。
+- 「缺」与「0」不同义：`used = None`（还没报过）≠ 占用 0；`limit` 的 `0`（旧配置「没设」）归一成未知。任何一格缺就印 `—`，**不许填数**。
+- 这个接缝的读半（`syschat::context_usage`）会读真实 `~/.agent-bridge` + `config.json` ⇒ **纯读**：状态文件不存在就直接返回 `(None, None)`，目录/锁文件都不建（不然全量单测门禁会红在「隔离 HOME 下多出 `syschat/history.lock`」）。渲染半**必须**是注入式（`ui::apply_syschat_usage`），否则无头渲染台的断言会随开发机真实会话变红。
 
 **Slint / slint-pixel**
 - `@markdown("{x}")` **不是插值模板**（要以 `\{` 起），且即便插值也只按**纯文本**注入 ⇒ 行内样式必须在 **Rust 侧** 用 `StyledText::from_markdown`（B 批评审 B1/B2；`src/mdblocks.rs::styled`）。
@@ -193,5 +200,5 @@ rm -rf /Applications/ABB.app; ditto "$B" /Applications/ABB.app; open /Applicatio
 ### 7.3 接手第一小时建议
 1. 读 §1，自己开窗抓一张图，建立「我能自己验收」的闭环（这一步能省掉后面所有「让用户截图」的往返）。
 2. §5.1 缩放**已修**（卡 `abb-syschat-resize-macos-20261015`：对话窗恒画热区 + macOS 自管缩放），剩**真机手感**复验；**别再拿 `is_resizable` 取证**（它既不假也不是判据，见 §5.1）。
-3. 按 §5.2 从上往下做（**缩放 ✅ / 消息动作 ✅ / 归档 ✅ 已完成**；剩：用量(E3) → 截屏 → 设置窗缩放；思考/steer 要动 `abb-agent`，可最后做）。
+3. 按 §5.2 从上往下做（**缩放 ✅ / 消息动作 ✅ / 归档 ✅ / 用量(E3) ✅ 已完成**；剩：截屏 → 设置窗缩放；思考/steer 要动 `abb-agent`，可最后做）。
 4. 每做完 2–3 条，**批量**跑四门禁 + 独立评审 + 打包安装一次（owner 已同意这条降档口径）。

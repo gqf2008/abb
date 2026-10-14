@@ -146,6 +146,14 @@ pub struct SessionMeta {
     /// 便于人工核对（旧版本 ABB 读新文件时 serde 默认忽略未知字段，不会因此读坏）。
     #[serde(default)]
     pub archived: bool,
+    /// 本会话最近一轮请求**执行层上报的真实**上下文占用（prompt tokens =
+    /// input + cacheRead + cacheWrite，见 `runtime::acp::TokenUsage::context_tokens`）。
+    ///
+    /// `0` = **还没有一轮报过 usage**（新建会话、改动前的老会话、不上报的适配器）
+    /// ——读者必须按「未知」显示，别把它当成「占用为 0」；`context_usage()` 就是这么分的。
+    /// `#[serde(default)]` 是旧 `sessions.json` 的向后兼容（缺字段按「未知」读入）。
+    #[serde(default)]
+    pub context_tokens: u64,
 }
 
 /// `sessions.json` 落盘结构。
@@ -260,6 +268,7 @@ impl SessionStore {
                         updated_at: now,
                         provider,
                         archived: false,
+                        context_tokens: 0,
                     });
                     state.current = id;
                 }
@@ -275,6 +284,7 @@ impl SessionStore {
             updated_at: now,
             provider: String::new(),
             archived: false,
+            context_tokens: 0,
         });
         state.current = id.clone();
         if self.legacy_path().exists() {
@@ -598,6 +608,7 @@ fn new_session_locked(store: &SessionStore, provider: Option<&str>) -> Result<Ne
         updated_at: now,
         provider,
         archived: false,
+        context_tokens: 0,
     });
     state.current = id.clone();
     store
@@ -1536,27 +1547,138 @@ pub fn usage_level(pct: f32) -> i32 {
 
 /// 状态栏右侧的上下文用量文案（稿 v11：`上下文 12.4K/128K · 9.7%`）。
 ///
-/// `None` = **数据源未就绪**（E3 卡之前没有 usage 上报，见 `abb-syschat-e3-tokens-20261013`
-/// 的实核结论）：显示 `—/— · —` 的空档结构，**不伪造精确值也不冒充估算值**。
+/// 两个 `None` 是**两种不同的缺**，分别显示成对应的 `—`：
+/// - `used = None`：还没有一轮上报过用量（新建会话 / 改动前的老会话 / 不上报的执行层）；
+/// - `limit = None`（含 `Some(0)`）：不知道这个模型的窗口多大。
+///
+/// **任何一格缺失都不许填数**：`0` 是「占用为零」的意思，不是「不知道」
+/// （卡 `abb-syschat-e3-tokens-20261013` 验收 4：表里没有的模型要给可读回落，不能显示 0/负值）。
 pub fn context_usage_text(used: Option<u64>, limit: Option<u64>) -> String {
+    // 0 上限无法算百分比（`usage_percent` 会返回 0，但那会让「上限未知」看起来像「占用 0%」）
+    // ⇒ 归一到「不知道」。
+    let limit = limit.filter(|l| *l > 0);
+    let used_str = used.map(token_short).unwrap_or_else(|| "—".to_string());
+    let limit_str = limit.map(token_short).unwrap_or_else(|| "—".to_string());
+    let pct = match (used, limit) {
+        (Some(u), Some(l)) => format!(" · {:.1}%", usage_percent(u, l)),
+        _ => " · —".to_string(),
+    };
+    format!("上下文 {used_str}/{limit_str}{pct}")
+}
+
+/// 状态栏用量条的**悬停提示**（稿：悬停/点击看精确值；卡验收 3）。
+///
+/// 除了精确 token 数，这里还必须说清**口径**（卡验收 2）：已用是「最近一轮请求的
+/// prompt tokens」（= 这一轮 provider 看到的整个上下文），不是「所有往返累加」，
+/// 也不是估算。缺哪一项就说缺哪一项——不留一句含糊的「数据来源待定」。
+pub fn context_usage_tip(used: Option<u64>, limit: Option<u64>) -> String {
+    let limit = limit.filter(|l| *l > 0);
+    let how = "已用 = 本会话最近一轮请求的上下文（prompt tokens），由执行层从模型响应上报";
     match (used, limit) {
-        (Some(u), Some(l)) if l > 0 => format!(
-            "上下文 {}/{} · {:.1}%",
-            token_short(u),
-            token_short(l),
+        (Some(u), Some(l)) => format!(
+            "本会话上下文：{u} / {l} tokens（{:.1}%）。{how}——真实计数，不是估算。",
             usage_percent(u, l)
         ),
-        _ => "上下文 —/— · —".to_string(),
+        (None, Some(l)) => format!(
+            "本会话上下文：{l} tokens 上限；还没有收到过用量上报（执行层未上报，或本会话还没跑过回合）。{how}。"
+        ),
+        (Some(u), None) => format!(
+            "本会话上下文：已用 {u} tokens；这个模型的上限未知（内置表里没有它，可在「设置 → 供应商」填 context_window 补上）。"
+        ),
+        (None, None) => "本会话上下文：用量与上限都未知（执行层未上报用量；内置表里也没有这个模型，可在「设置 → 供应商」填 context_window）。"
+            .to_string(),
     }
 }
 
-/// 本会话上下文用量的**唯一数据源接缝**（E3 卡落地时只改这里）。
+/// 本会话上下文用量的**唯一数据源接缝**。
 ///
-/// 实核结论（E3 卡）：`src/runtime/acp.rs` 里**没有任何 usage 来源**（全仓只有一句注释
-/// 说明 goose 不上报 usage）⇒ 当前如实返回 `None`；UI 因此显示空档结构而不是数字。
-/// 悬停提示附上口径说明（「数据来源待 E3」），不让人误以为这是精确值。
+/// E3（卡 `abb-syschat-e3-tokens-20261013`）起这里是**真实值**，不是估算：
+/// - 已用 = 本会话最近一轮请求的 prompt tokens（[`SessionMeta::context_tokens`]，由
+///   [`turn_core`] 在执行层上报 `_meta.usage` 时写入）；
+/// - 上限 = 该会话所选供应商的模型窗口（[`context_window`]：设置可覆盖，否则内置表）。
+///
+/// 两项**都可能缺**，而且缺与 0 不同义：`used = None` = 还没有一轮报过（新建会话 /
+/// 改动前的老会话 / 不上报的执行层）；`limit = None` = 不知道这个模型多大。
+/// `session_list` 同为纯读入口，锁按尽力而为处理。
 pub fn context_usage() -> (Option<u64>, Option<u64>) {
-    (None, None)
+    let store = SessionStore::production();
+    // **纯读：不存在就什么都不建**（目录、锁文件都不建）。GUI 每拍刷新都会走到这里，
+    // 而「看一眼用量」在用户机器上不该有副作用；测试隔离门禁也是把它当硬约束的
+    // （改动前这条接缝是常量 `(None, None)`，所以从没碰过盘——E3 落地时踩到：
+    // 隔离 HOME 里凭空多出 `syschat/history.lock`，门禁直接红）。
+    if !store.state_path().exists() {
+        return (None, None);
+    }
+    let _g = store.lock().ok();
+    let state = store.load();
+    let current = state.sessions.iter().find(|s| s.id == state.current);
+    let used = current.map(|s| s.context_tokens).filter(|t| *t > 0);
+    let provider = current.map(|s| s.provider.as_str()).unwrap_or_default();
+    (used, context_window(provider))
+}
+
+/// 本会话所选供应商的上下文窗口（token）。`provider = ""` = 跟随全局默认
+/// （与 `agent_config` / [`crate::config::Config::resolve_provider`] 同口径）。
+///
+/// **不知道就返回 `None`**：供应商没配 / 找不到、或模型名匹配不到内置表——UI 显示 `—`，
+/// 不许拿一个编造的数冒充上限。
+fn context_window(provider: &str) -> Option<u64> {
+    context_window_in(&Config::load().unwrap_or_default(), provider)
+}
+
+/// [`context_window`] 的可测内层：配置**注入**进来（不然单测只能去读真实 `config.json`，
+/// 而隔离门禁下那是临时 HOME —— 会变成「测了个寂寞」）。
+fn context_window_in(cfg: &Config, provider: &str) -> Option<u64> {
+    let name = if provider.is_empty() {
+        cfg.default_provider.as_str()
+    } else {
+        provider
+    };
+    let p = cfg.providers.iter().find(|p| p.name == name)?;
+    if p.context_window > 0 {
+        return Some(p.context_window);
+    }
+    builtin_context_window(&p.model)
+}
+
+/// 内置「常见模型 → 上下文窗口」兜底表（token）。**匹配不到返回 `None`，不猜。**
+///
+/// 为什么需要这张表：`providers[].model` 只是一个名字，ACP 协议里**没有**上下文长度
+/// 字段（卡 `abb-syschat-e3-tokens-20261013` 的实核结论），而「已用/上限」缺了上限
+/// 就只剩半句话。
+///
+/// 匹配口径：**子串**、取**首个命中**，所以表里**长的键必须排在短的前面**
+/// （`gpt-4-turbo` 在 `gpt-4` 之前）。模型名带日期/版本后缀是常态
+/// （`claude-3-5-sonnet-20241022`、`deepseek-chat`），精确相等会大面积落空。
+///
+/// 表里是各家**公开文档的默认窗口**，**不把 beta 长上下文档算进来**（Claude 的 1M、
+/// Gemini 的更大档都要显式申请才生效）。数值随上游版本会变 ⇒ 这是**兜底**不是权威：
+/// 用户可在「设置 → 供应商」里用 `context_window` 覆盖（`0` = 没设，走本表）。
+fn builtin_context_window(model: &str) -> Option<u64> {
+    let m = model.to_ascii_lowercase();
+    const TABLE: &[(&str, u64)] = &[
+        // OpenAI（长键在前：gpt-4-turbo 必须先于 gpt-4o 之外的其他 gpt-4 命中）
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4o", 128_000),
+        ("gpt-4.1", 1_047_576),
+        ("gpt-4", 8_192),
+        // Anthropic（Claude 3 起默认 200K）
+        ("claude-2", 100_000),
+        ("claude-3", 200_000),
+        ("claude-sonnet-4", 200_000),
+        ("claude-opus-4", 200_000),
+        ("claude-haiku-4", 200_000),
+        ("claude", 200_000),
+        // DeepSeek（V3/R1 公开窗口 64K）
+        ("deepseek", 64_000),
+        // Google
+        ("gemini", 1_048_576),
+        // 推理系列（短键，放最后；`o1` 这种两字符键只在这之后才可能误命中）
+        ("o3", 200_000),
+        ("o4", 200_000),
+        ("o1", 200_000),
+    ];
+    TABLE.iter().find(|(k, _)| m.contains(k)).map(|(_, v)| *v)
 }
 
 /// 面板（自绘 `.menu`）的**锚点**（纯函数，单测钉住）：
@@ -2352,7 +2474,15 @@ pub fn prompt_with_attachments(history: &[Turn], user_text: &str, atts: &[Attach
 ///（已生成部分已随 `ChunkKind` 分片流出，且由 [`turn_core`] 落进历史）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEnd {
-    Done(String),
+    /// 回合正常完成。`usage` = 执行层为**本轮**上报的真实 token 计数
+    /// （`session/prompt` 响应的 `_meta.usage`）。
+    ///
+    /// `None` = 执行层没上报（旧适配器 / goose / 取消与失败），**不是 0**：读者必须
+    /// 按「未知」处理，不许把缺数据印成 `0/128K`（卡 `abb-syschat-e3-tokens-20261013`）。
+    Done {
+        text: String,
+        usage: Option<crate::runtime::acp::TokenUsage>,
+    },
     Stopped,
 }
 
@@ -2765,25 +2895,11 @@ fn agent_command_available(cmd: &str) -> bool {
     }
 }
 
-/// 可测内层：给定已装配好的 agent 配置 / 工作区 / prompt，跑一轮 oneshot。
+/// 内层回合（E1）：给定已装配好的 agent 配置 / 工作区 / prompt 跑一轮 oneshot，
+/// 把正文 delta 经 sink 实时回传，并把外部取消令牌交给 oneshot（⏹ 停止）。
 ///
-/// 生产路径见 [`turn`]；测试注入 mock agent（与 `teambuilder` / `runtime::oneshot`
-/// 同款 `tests/mock_acp_agent.py` 装置）。
-///
-/// E1 起本函数是 [`turn_with_stream`] 的无 sink 薄封装（签名/语义不变：既有测试与调用方零改动）。
-pub async fn turn_with(
-    agent_cfg: AgentConfig,
-    workspace: PathBuf,
-    prompt: String,
-) -> Result<String, String> {
-    match turn_with_stream(agent_cfg, workspace, prompt, None).await? {
-        TurnEnd::Done(text) => Ok(text),
-        TurnEnd::Stopped => Err("对话已中断。".to_string()),
-    }
-}
-
-/// 流式版内层回合（E1）：与 [`turn_with`] 同一装配，额外把正文 delta 经 sink
-/// 实时回传，并把外部取消令牌交给 oneshot（⏹ 停止）。
+/// `stream = None` 即「非流式」入口（原来由 `turn_with` 薄封装承担；E3 起直接调用本
+/// 函数，好让**两条路径都在同一处**拿到并落盘 usage）。
 ///
 /// 去重口径：本函数**不去重**，只把「流式拼接」与「最终文本」两条都交给调用方；
 /// 以谁为准由渲染方决定（GUI 侧口径：回合结束时以 `final_text` 为准重建气泡，
@@ -2805,7 +2921,7 @@ async fn turn_with_stream(
         Some(w) => (Some(w.chunks), Some(w.cancel), w.steer),
         None => (None, None, None),
     };
-    let outcome = crate::runtime::oneshot::oneshot_turn_streaming_steerable(
+    let (outcome, usage) = crate::runtime::oneshot::oneshot_turn_streaming_steerable(
         agent_cfg,
         Some(workspace.display().to_string()),
         msg,
@@ -2820,7 +2936,7 @@ async fn turn_with_stream(
             if text.trim().is_empty() {
                 Err("模型返回了空回复。".to_string())
             } else {
-                Ok(TurnEnd::Done(text))
+                Ok(TurnEnd::Done { text, usage })
             }
         }
         SyncTurnOutcome::Timeout => Err(format!(
@@ -2899,7 +3015,7 @@ pub async fn turn_with_attachments(
 ) -> Result<String, String> {
     let (store, session_id, agent_cfg, ws, text) = prepare_turn(cfg, user_text)?;
     match turn_core(&store, &session_id, agent_cfg, ws, &text, atts, None).await? {
-        TurnEnd::Done(reply) => Ok(reply),
+        TurnEnd::Done { text, .. } => Ok(text),
         TurnEnd::Stopped => Err("对话已中断。".to_string()),
     }
 }
@@ -2986,11 +3102,15 @@ async fn turn_core(
     // 回合在锁外跑。返回 `(要落历史的助手正文, 要落历史的思考过程, 是否用户停止)`：
     // - 正常完成 → 正文取 `final_text`（去重口径的权威侧），思考取累积器里的思考段；
     // - 用户停止 → 正文与思考都用本地累积的已生成部分（GUI 侧已有同一份，不重复发）。
-    let (reply, thought, stopped) = match stream {
+    let (reply, thought, stopped, usage) = match stream {
         None => {
-            // 非流式：cancel 恒 None ⇒ 不会 Stopped；turn_with 直接给最终文本。
-            let reply = turn_with(agent_cfg, ws, prompt).await?;
-            (Some(reply), String::new(), false)
+            // 非流式：cancel 恒 None ⇒ 不会 Stopped。直接走底层（而不是 [`turn_with`]）是
+            // 为了**同一处**拿到 usage：两条路径都落「本会话上下文占用」，否则非流式入口
+            // 聊出来的会话会永远显示未知（`turn_with` 只是本函数的无 sink 薄封装）。
+            match turn_with_stream(agent_cfg, ws, prompt, None).await? {
+                TurnEnd::Done { text, usage } => (Some(text), String::new(), false, usage),
+                TurnEnd::Stopped => (None, String::new(), true, None),
+            }
         }
         Some(w) => {
             // 中间层：sink 的每条分片既累积（停止/思考分离用）又转发给 GUI（`w.chunks`）。
@@ -3058,9 +3178,9 @@ async fn turn_core(
             // 回合已收尾 ⇒ sink 已摘除，转发任务随之结束；等它把缓冲分片冲完再决定停止态文本。
             let _ = forwarder.await;
             match res? {
-                TurnEnd::Done(reply) => {
+                TurnEnd::Done { text, usage } => {
                     let thought = acc.lock().map(|b| b.thought()).unwrap_or_default();
-                    (Some(reply), thought, false)
+                    (Some(text), thought, false, usage)
                 }
                 TurnEnd::Stopped => {
                     let (partial, thought) = acc
@@ -3070,7 +3190,9 @@ async fn turn_core(
                     // 一个分片都没流出（极早停止）：不落空的助手轮；
                     // 只有思考、还没出正文时仍要落（思考也是「已生成部分」）。
                     let partial = (!partial.trim().is_empty()).then_some(partial);
-                    (partial, thought, true)
+                    // 停止的回合不落 usage：执行层在取消出口根本不带它，
+                    // 硬留上一轮的旧数会让「已用」看着像刚降下来。
+                    (partial, thought, true, None)
                 }
             }
         }
@@ -3095,13 +3217,22 @@ async fn turn_core(
         let mut state = store.load();
         if let Some(s) = state.sessions.iter_mut().find(|s| s.id == session_id) {
             s.updated_at = now;
+            // E3：本轮上报了真实 usage ⇒ 记「本会话上下文占用」= 该轮 provider 看到的
+            // 全部 prompt tokens（`context_tokens()`，含缓存命中部分）。这是**真实值**
+            // 而不是估算：来源是执行层从 provider 响应里解出来的计数。
+            if let Some(usage) = usage {
+                s.context_tokens = usage.context_tokens();
+            }
         }
         let _ = store.save(&state);
     }
     Ok(if stopped {
         TurnEnd::Stopped
     } else {
-        TurnEnd::Done(reply.unwrap_or_default())
+        TurnEnd::Done {
+            text: reply.unwrap_or_default(),
+            usage,
+        }
     })
 }
 
@@ -3337,9 +3468,11 @@ mod tests {
             turn_of("assistant", "收到"),
         ];
         let prompt = build_prompt(&history, "syschat-current-marker");
-        let reply = turn_with(mock_agent_cfg(&rec), ws, prompt)
-            .await
-            .expect("mock echo 回合应 Ok");
+        let reply = done_text(
+            turn_with_stream(mock_agent_cfg(&rec), ws, prompt, None)
+                .await
+                .expect("mock echo 回合应 Ok"),
+        );
         assert!(reply.contains("echo:"), "echo 文本：{reply}");
         assert!(
             reply.contains("syschat-history-marker"),
@@ -3400,15 +3533,17 @@ mod tests {
         assert!(store.take_due(now).is_empty(), "同一分钟后不得重复触发");
         assert_eq!(store.list()[0].text, "syschat-future-marker");
 
-        // 真正发出的那一段：与手动发送共用 `turn_with`（scheduler 到点后调的就是 `submit_sc`，
-        // 后者内部起的是同一条 `turn_streaming`/`turn_core` 链）。
+        // 真正发出的那一段：与手动发送共用同一条内层回合（scheduler 到点后调的就是
+        // `submit_sc`，后者内部起的是同一条 `turn_streaming`/`turn_core` 链）。
         let rec =
             std::env::temp_dir().join(format!("abb-syschat-srec-{}.jsonl", uuid::Uuid::new_v4()));
         let ws = std::env::temp_dir().join(format!("abb-syschat-sws-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&ws).unwrap();
-        let reply = turn_with(mock_agent_cfg(&rec), ws, due[0].text.clone())
-            .await
-            .expect("mock echo 回合应 Ok");
+        let reply = done_text(
+            turn_with_stream(mock_agent_cfg(&rec), ws, due[0].text.clone(), None)
+                .await
+                .expect("mock echo 回合应 Ok"),
+        );
         assert!(
             reply.contains("syschat-scheduled-marker"),
             "定时文本没到 agent（echo 应包含它）：{reply}"
@@ -3458,7 +3593,7 @@ mod tests {
         )
         .await
         .expect("mock echo 回合应 Done");
-        let TurnEnd::Done(text) = end else {
+        let TurnEnd::Done { text, .. } = end else {
             panic!("未取消的回合应为 Done，实际 {end:?}");
         };
         assert!(text.contains("syschat-stream-marker"), "最终文本: {text}");
@@ -3525,7 +3660,7 @@ mod tests {
         )
         .await
         .expect("mock 思考+正文回合应 Done");
-        let TurnEnd::Done(text) = end else {
+        let TurnEnd::Done { text, .. } = end else {
             panic!("未取消的回合应为 Done，实际 {end:?}");
         };
         assert_eq!(text, "正文一号正文二号", "最终文本只有正文");
@@ -3794,6 +3929,7 @@ mod tests {
             updated_at: 1,
             provider: "prov-b".into(),
             archived: false,
+            context_tokens: 0,
         });
         st.current = id2.clone();
         st.sessions[0].updated_at = 2; // 让 id1 更「新」，校验排序
@@ -3852,7 +3988,7 @@ mod tests {
 
     fn done_text(end: TurnEnd) -> String {
         match end {
-            TurnEnd::Done(t) => t,
+            TurnEnd::Done { text, .. } => text,
             TurnEnd::Stopped => panic!("非取消回合不应是 Stopped"),
         }
     }
@@ -3876,6 +4012,7 @@ mod tests {
             updated_at: 1,
             provider: String::new(),
             archived: false,
+            context_tokens: 0,
         });
         store.save(&st).unwrap();
         let ws = std::env::temp_dir().join(format!("abb-sc-turn-ws-{}", uuid::Uuid::new_v4()));
@@ -5033,10 +5170,11 @@ mod tests {
         assert_eq!(session_tag(0, now, false), "");
     }
 
-    /// v11：token 紧凑写法 / 百分比 / 档位 / 文案（含**无数据源**的空档）。
+    /// v11：token 紧凑写法 / 百分比 / 档位 / 文案（含**两种不同的缺**的空档）。
     ///
     /// 判别力：把 [`usage_level`] 的 90 改回 70（两档合并）⇒ 本用例红；
-    /// 把 [`context_usage_text`] 的 `_ =>` 分支改成“估算数字” ⇒ `..._placeholder` 红。
+    /// 把 [`context_usage_text`] 里 `limit.filter(|l| *l > 0)` 去掉 ⇒ 本用例红
+    /// （0 上限会被印成 `0.0%`，看着像「占用为零」）。
     #[test]
     fn usage_text_percent_and_level_follow_design() {
         assert_eq!(token_short(0), "0");
@@ -5058,10 +5196,115 @@ mod tests {
             context_usage_text(Some(12_432), Some(128_000)),
             "上下文 12.4K/128K · 9.7%"
         );
-        // E3 之前没有数据源：空档结构，不伪造数字
+        // 两种「不知道」分别显示成各自的 `—`（E3：缺与 0 不同义）。
         assert_eq!(context_usage_text(None, None), "上下文 —/— · —");
-        assert_eq!(context_usage_text(Some(1), Some(0)), "上下文 —/— · —");
-        assert_eq!(context_usage(), (None, None), "E3 卡之前如实无数据源");
+        assert_eq!(
+            context_usage_text(None, Some(128_000)),
+            "上下文 —/128K · —",
+            "上限知道、用量未知：只隐去不知道的那一半"
+        );
+        assert_eq!(
+            context_usage_text(Some(1_200), None),
+            "上下文 1.2K/— · —",
+            "用量知道、上限未知：同上"
+        );
+        // 上限为 0（旧配置的「没设」）等同于未知：不许印成 0% ——那会被读成「快满了/空着」。
+        assert_eq!(
+            context_usage_text(Some(1_200), Some(0)),
+            "上下文 1.2K/— · —"
+        );
+    }
+
+    /// E3（验收 4）：上限来源有优先级——**供应商覆盖 > 内置表**；两处都不知道就是 `None`。
+    ///
+    /// 判别力（负向）：把 `context_window_in` 里的 `if p.context_window > 0` 分支删掉 ⇒
+    /// 第 2 段红（用户的覆盖会被内置表盖回去，等于设置项没生效）。
+    #[test]
+    fn context_window_prefers_provider_override_then_builtin_table() {
+        let mk = |name: &str, model: &str, cw: u64| crate::config::ProviderConfig {
+            name: name.into(),
+            kind: "openai-chat".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: model.into(),
+            context_window: cw,
+        };
+        // `Config` 有私有字段 ⇒ 不能用结构体更新语法，逐项赋值。
+        let mut cfg = Config::default();
+        cfg.providers = vec![mk("a", "gpt-4o", 0), mk("b", "gpt-4o", 999_999)];
+        cfg.default_provider = "a".into();
+        // ① 没配（0）⇒ 内置表（**不改配置的老用户行为不变**）。
+        assert_eq!(context_window_in(&cfg, "a"), Some(128_000));
+        // ② 配了 ⇒ 覆盖内置表（自建/新模型的真窗口只有用户知道）。
+        assert_eq!(context_window_in(&cfg, "b"), Some(999_999));
+        // ③ `""` = 跟随全局默认（与 `agent_config` / `resolve_provider` 同口径）。
+        assert_eq!(context_window_in(&cfg, ""), Some(128_000));
+        // ④ 供应商不在配置里 ⇒ None（不猜）。
+        assert_eq!(context_window_in(&cfg, "查无此商"), None);
+
+        let mut cfg2 = Config::default();
+        cfg2.providers = vec![mk("c", "my-own-llm", 0)];
+        cfg2.default_provider = "c".into();
+        // ⑤ 表里没有、也没配 ⇒ None（UI 显示 `—`，不编窗口大小）。
+        assert_eq!(context_window_in(&cfg2, "c"), None);
+    }
+
+    /// E3：内置兜底表的**取值与顺序**。顺序是承重件——匹配取**首个命中**的子串。
+    ///
+    /// 判别力（负向）：把 `("gpt-4-turbo", 128_000)` 挪到 `("gpt-4", 8_192)` 之后 ⇒
+    /// 第 1 段红；把 `contains` 改成 `==` ⇒ 带日期后缀的那两段红。
+    #[test]
+    fn builtin_context_window_matches_substrings_longest_key_first() {
+        assert_eq!(
+            builtin_context_window("gpt-4-turbo-2024-04-09"),
+            Some(128_000),
+            "长键必须先命中，不能被更短的 gpt-4 抢走"
+        );
+        assert_eq!(builtin_context_window("gpt-4o"), Some(128_000));
+        assert_eq!(builtin_context_window("gpt-4.1-mini"), Some(1_047_576));
+        assert_eq!(builtin_context_window("gpt-4"), Some(8_192));
+        // 带日期/版本后缀是常态：精确相等会大面积落空。
+        assert_eq!(
+            builtin_context_window("claude-3-5-sonnet-20241022"),
+            Some(200_000)
+        );
+        assert_eq!(builtin_context_window("claude-sonnet-4-5"), Some(200_000));
+        assert_eq!(builtin_context_window("deepseek-chat"), Some(64_000));
+        // 大小写不敏感。
+        assert_eq!(builtin_context_window("Claude-3-Opus"), Some(200_000));
+        // 表里没有 ⇒ None（**不猜一个数**）。
+        assert_eq!(builtin_context_window("my-own-llm-v1"), None);
+        assert_eq!(builtin_context_window(""), None);
+    }
+
+    /// E3（验收 2/3）：悬停提示要把**口径**说清，并且带上精确 token 数。
+    ///
+    /// 判别力（负向）：把 `context_usage_tip` 里 (None, Some) 与 (Some, None) 两臂合并成
+    /// 一句含糊的「数据不足」⇒ 本用例红——那正是「让人不知道缺的是哪一半」的写法。
+    #[test]
+    fn context_usage_tip_states_scope_and_exact_numbers() {
+        let both = context_usage_tip(Some(12_432), Some(128_000));
+        assert!(both.contains("12432 / 128000"), "要带精确值：{both}");
+        assert!(both.contains("9.7%"), "要带百分比：{both}");
+        assert!(both.contains("最近一轮请求"), "口径要写在提示里：{both}");
+        assert!(both.contains("不是估算"), "真实/估算必须标清：{both}");
+
+        let no_used = context_usage_tip(None, Some(128_000));
+        assert!(no_used.contains("128000"), "{no_used}");
+        assert!(no_used.contains("还没有收到过用量上报"), "{no_used}");
+        assert!(!no_used.contains("0 /"), "缺用量不许印成 0：{no_used}");
+
+        let no_limit = context_usage_tip(Some(12_432), None);
+        assert!(no_limit.contains("12432"), "{no_limit}");
+        assert!(no_limit.contains("上限未知"), "{no_limit}");
+        assert!(
+            no_limit.contains("context_window"),
+            "要给可操作的出路（设置项名）：{no_limit}"
+        );
+
+        let neither = context_usage_tip(None, None);
+        assert!(neither.contains("都未知"), "{neither}");
+        assert!(!neither.contains("0 /"), "什么都不许印成 0：{neither}");
     }
 
     /// v11：面板锚点 —— 右缘跟按钮右缘对齐、顶边在按钮下缘 6px、靠边整体内移（不出窗）。
@@ -5276,6 +5519,76 @@ mod tests {
         *rx.borrow()
     }
 
+    /// E3 端到端（卡 `abb-syschat-e3-tokens-20261013`）：执行层上报的 usage 要**一路落到
+    /// 会话索引**——状态栏的「已用」是这条链的产物，不是另找地方猜的。
+    ///
+    /// 口径：`context_tokens = input + cacheRead + cacheWrite`（**prompt 侧**，不含 output）。
+    ///
+    /// 判别力（负向，实测会红）：① 删掉 `turn_core` 临界区 2 里写 `s.context_tokens` 的
+    /// 两行 ⇒ 第 2 段红；② 把 `usage.context_tokens()` 换成 `usage.total` ⇒ 第 2 段红
+    /// （2200 会变成 2230）；③ 把 mock 的 `_meta.usage` 关掉 ⇒ 第 1 段红（阴性对照那半）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn turn_records_real_context_tokens_from_agent_usage() {
+        let rec =
+            std::env::temp_dir().join(format!("abb-syschat-usage-{}.jsonl", uuid::Uuid::new_v4()));
+        let (store, _base) = tmp_store("usage-e3");
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st));
+        store.save(&st).unwrap();
+        let id = st.current.clone();
+        let ws =
+            std::env::temp_dir().join(format!("abb-syschat-usage-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let ctx_tokens = |store: &SessionStore, id: &str| {
+            store
+                .load()
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.context_tokens)
+                .unwrap_or_else(|| panic!("会话 {id} 应在索引里"))
+        };
+
+        // ① 阴性对照：执行层**不报** usage ⇒ 值保持 0（= 未知），不许编一个数出来。
+        turn_core(
+            &store,
+            &id,
+            mock_agent_cfg(&rec),
+            ws.clone(),
+            "第一句",
+            &[],
+            None,
+        )
+        .await
+        .expect("第一回合应完成");
+        assert_eq!(
+            ctx_tokens(&store, &id),
+            0,
+            "没上报 usage ⇒ 索引里保持 0（未知），不是被猜出来的数"
+        );
+
+        // ② 正例：报 1200/30/1000/0/2230 ⇒ 期望 2200（prompt 侧 = input + cacheRead + cacheWrite）。
+        let cfg = mock_agent_cfg_with(
+            &rec,
+            &[(
+                "MOCK_USAGE_JSON",
+                r#"{"input":1200,"output":30,"cacheRead":1000,"cacheWrite":0,"total":2230}"#,
+            )],
+        );
+        turn_core(&store, &id, cfg, ws, "第二句", &[], None)
+            .await
+            .expect("第二回合应完成");
+        assert_eq!(
+            ctx_tokens(&store, &id),
+            2200,
+            "执行层上报的真实 usage 必须落进会话索引（prompt 侧，不含 output）"
+        );
+    }
+
     /// **支持 steer 的路径**：生成中投一条消息 ⇒ 真写进在途回合（mock 收到
     /// `_session/steering`），**不另起一轮**（只 1 条 `session/prompt`），
     /// 且插入的消息进历史（下一轮上下文不丢）。
@@ -5337,7 +5650,7 @@ mod tests {
             .expect("注入通道应可写");
 
         let end = turn.await.expect("回合任务不应 panic");
-        let TurnEnd::Done(text) = end.expect("回合应正常完成") else {
+        let TurnEnd::Done { text, .. } = end.expect("回合应正常完成") else {
             panic!("未取消的回合应为 Done");
         };
         assert!(text.contains("steer-turn-A"));
@@ -5433,7 +5746,7 @@ mod tests {
         );
 
         let end = turn.await.expect("回合任务不应 panic");
-        assert!(matches!(end, Ok(TurnEnd::Done(_))));
+        assert!(matches!(end, Ok(TurnEnd::Done { .. })));
 
         // 本轮结束 ⇒ 依次开排队项（串行化的唯一出处）。
         let next = pump.finish().expect("队列应有下一轮");
@@ -5450,7 +5763,7 @@ mod tests {
         )
         .await
         .expect("第二个回合应完成");
-        assert!(matches!(end2, TurnEnd::Done(_)));
+        assert!(matches!(end2, TurnEnd::Done { .. }));
 
         let events = read_records(&rec);
         let prompt_texts: Vec<String> = events
@@ -6125,6 +6438,7 @@ mod tests {
             updated_at: 2,
             provider: String::new(),
             archived: id == "arch",
+            context_tokens: 0,
         };
         let visible = (vec![m("live")], "live".to_string());
         let archived = vec![m("arch")];
@@ -6191,6 +6505,7 @@ mod tests {
                 updated_at: updated,
                 provider: String::new(),
                 archived: false,
+                context_tokens: 0,
             });
         }
         store.save(&st).unwrap();
@@ -6246,6 +6561,7 @@ mod tests {
                 updated_at: 10,
                 provider: String::new(),
                 archived: false,
+                context_tokens: 0,
             },
             SessionMeta {
                 id: "b".to_string(),
@@ -6254,6 +6570,7 @@ mod tests {
                 updated_at: 20,
                 provider: "deepseek".to_string(),
                 archived: false,
+                context_tokens: 0,
             },
         ];
         st.current = "a".to_string();

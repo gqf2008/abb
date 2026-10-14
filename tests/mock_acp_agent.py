@@ -22,6 +22,16 @@ def send(msg):
     sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
+def prompt_result():
+    """`session/prompt` 的成功结果。`MOCK_USAGE_JSON` 设了就带上 `_meta.usage`
+    （E3 夹具：ABB 侧要断「真实 usage 一路落到会话索引的 context_tokens」）。
+    未设时与改动前**逐字节一致**（只有 stopReason）。"""
+    result = {"stopReason": "end_turn"}
+    usage = os.environ.get("MOCK_USAGE_JSON")
+    if usage:
+        result["_meta"] = {"usage": json.loads(usage)}
+    return result
+
 def emit_chunks(sid, session_update, body, n):
     """把 body 近似均分成 n 片，逐片发同 kind 的 session/update。
 
@@ -184,8 +194,7 @@ while True:
             send({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk",
                                               "content": {"type": "text", "text": respond}}}})
-            send({"jsonrpc": "2.0", "id": rid,
-                  "result": {"stopReason": "end_turn"}})
+            send({"jsonrpc": "2.0", "id": rid, "result": prompt_result()})
             continue
         # E2 端到端夹具：可选发多片思考（MOCK_THOUGHT_TEXT / MOCK_THOUGHT_CHUNKS）
         # 与多片正文（MOCK_TEXT_TEXT / MOCK_TEXT_CHUNKS）。默认不发思考、正文单片，
@@ -200,7 +209,7 @@ while True:
         emit_chunks(sid, "agent_message_chunk", body,
                     os.environ.get("MOCK_TEXT_CHUNKS", "1"))
         send({"jsonrpc": "2.0", "id": rid,
-              "result": {"stopReason": "end_turn"}})
+              "result": prompt_result()})
     elif method == "_session/steering":
         # 卡 d10：生成中插入在途回合（不在 prompt 延迟窗口内的正常到达路径）。
         handle_steer(req)

@@ -198,6 +198,9 @@ export struct ProviderRow {
     api-key: string,     // 密码框、加载后留空（编辑时重输=覆盖，留空=保留旧值）
     model: string,
     is-default: bool,    // 是否为全局默认供应商
+    // E3：该模型的上下文窗口（token；空串 = 没设 ⇒ 走内置兜底表）。
+    // 用字符串而不是数字：「没设」与「0」在 UI 上要能区分（数字框里 0 是有效输入）。
+    context-window: string,
 }
 
 // 虚拟 Bot 登记行（#75，与 Rust 侧 VirtualBotRow 对应）
@@ -2661,6 +2664,17 @@ export component SettingsWindow inherits Window {
                                                         edited => { root.provider-field-edited(root.provider-selected, "model", self.text); }
                                                     }
                                                 }
+                                                // E3：上下文窗口（状态栏「已用/上限」的分母）。
+                                                // 留空 = 走内置兜底表；表里没有的模型才需要填。
+                                                if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
+                                                    Text { text: "上下文窗口"; width: 96px; vertical-alignment: center; }
+                                                    PixelTextInput {
+                                                        text: root.providers[root.provider-selected].context-window;
+                                                        placeholder: "如 200000；留空 = 按内置表（状态栏上限）";
+                                                        horizontal-stretch: 1;
+                                                        edited => { root.provider-field-edited(root.provider-selected, "context_window", self.text); }
+                                                    }
+                                                }
                                                 if root.provider-selected >= 0 && root.provider-selected < root.providers.length: Row {
                                                     Rectangle { width: 96px; }
                                                     HorizontalBox {
@@ -2677,7 +2691,7 @@ export component SettingsWindow inherits Window {
                                             if root.provider-selected < 0: Text { text: "← 选择或添加一个供应商"; color: UiTokens.text-dim; }
 
                                             Text {
-                                                text: "随包 agent 支持 Anthropic 原生与 OpenAI 兼容（chat / responses 两种接口）供应商，按供应商类型填对应 key。桥内配置优先于 CC Switch。";
+                                                text: "随包 agent 支持 Anthropic 原生与 OpenAI 兼容（chat / responses 两种接口）供应商，按供应商类型填对应 key。桥内配置优先于 CC Switch。「上下文窗口」只作状态栏「已用/上限」的分母：留空按内置表（只覆盖常见模型名），表里没有的模型可在这里填。";
                                                 font-size: 12px;
                                                 color: UiTokens.text-dim;
                                                 wrap: word-wrap;

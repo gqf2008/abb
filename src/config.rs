@@ -727,6 +727,14 @@ pub struct ProviderConfig {
     /// 模型名（空 = 后端默认模型）。
     #[serde(default)]
     pub model: String,
+    /// 这个模型的上下文窗口（token）。`0` = 没设 ⇒ 走内置兜底表
+    /// （`syschat::builtin_context_window`）。
+    ///
+    /// 为什么要有：ACP 协议里模型**没有**长度字段，内置表只能覆盖常见名字、还会随上游
+    /// 版本漂；自建/新模型的真实窗口只有用户知道（卡 `abb-syschat-e3-tokens-20261013`
+    /// 验收 4）。`#[serde(default)]` ⇒ 旧 `config.json` 缺这个键照旧按 0 读，行为不变。
+    #[serde(default)]
+    pub context_window: u64,
 }
 
 impl Default for ProviderConfig {
@@ -737,6 +745,7 @@ impl Default for ProviderConfig {
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
+            context_window: 0,
         }
     }
 }
@@ -2742,6 +2751,29 @@ mod tests {
         assert_eq!(named.key(), "mybot一号"); // 无 app_id → name 兜底（去空白/斜杠）
     }
 
+    /// E3（卡 `abb-syschat-e3-tokens-20261013` 验收 4）：`ProviderConfig.context_window`
+    /// 是**后加**的字段——旧 `config.json` 里没有它，必须按 `0`（= 没设 ⇒ 走内置表）读入，
+    /// 而不是解析失败、也不是一个「窗口 = 0」的假设置（那会让状态栏显示 0% 上限）。
+    #[test]
+    fn provider_context_window_defaults_to_zero_for_old_config() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"default_provider":"old","providers":[{"name":"old","kind":"anthropic",
+                "base_url":"","api_key":"k","model":"claude-3-5-sonnet"}]}"#,
+        )
+        .expect("旧 config.json（无 context_window 键）必须能解析");
+        assert_eq!(
+            cfg.providers[0].context_window, 0,
+            "缺字段 ⇒ 0 = 没设（走内置表）；**不改配置的老用户行为不变**"
+        );
+
+        // 只给这一项也要能解析（它是可选覆盖，不是必填）。
+        let cfg2: Config =
+            serde_json::from_str(r#"{"providers":[{"name":"x","context_window":200000}]}"#)
+                .expect("只给覆盖项应可解析");
+        assert_eq!(cfg2.providers[0].context_window, 200_000);
+        assert_eq!(cfg2.providers[0].model, "", "同一条里的其他字段走各自默认");
+    }
+
     #[test]
     fn provider_resolution() {
         let prov = |name: &str, kind: &str| ProviderConfig {
@@ -2750,6 +2782,7 @@ mod tests {
             base_url: "https://x".into(),
             api_key: "k".into(),
             model: "m".into(),
+            context_window: 0,
         };
         // 全局默认：bot.provider 空 → 跟随 default_provider
         let c = Config {

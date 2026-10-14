@@ -1865,7 +1865,10 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     const W520: u32 = 520;
     let (ui, win, _m) = setup(vec![row("p", "占位")], H);
     seed_panels(&ui);
-    super::refresh_syschat_usage(&ui);
+    // **注入**用量（空档）：`apply_syschat_usage` 不读盘，所以这条断言与开发机的真实
+    // `~/.agent-bridge` / `config.json` 无关（E3 落地时踩过：读源那半会把断言的期望值
+    // 变成「取决于本机有没有会话 / 有没有这个供应商」）。
+    super::apply_syschat_usage(&ui, None, None);
     ui.window().set_size(slint::PhysicalSize::new(W520, H));
     apply_syschat_layout(&ui, W520 as f32);
 
@@ -1981,6 +1984,32 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     );
     assert_eq!(ui.get_usage_text(), "上下文 —/— · —");
     assert_eq!(ui.get_usage_level(), 0);
+
+    // ④c **有数时的几何与档位**（E3 起的真实值接缝）：内条宽 = 52px × 百分比，
+    // 档位按 70/90 阈值换色。这里量的是**渲染出来的属性**，不是 Rust 算式——
+    // 算式本身另有 `usage_text_percent_and_level_follow_design` 单测钉住。
+    // 75% ⇒ 内条 39px、橙档；93.75% ⇒ 红档；越限夹到满宽。
+    super::apply_syschat_usage(&ui, Some(96_000), Some(128_000));
+    assert_eq!(ui.get_usage_text(), "上下文 96K/128K · 75.0%");
+    assert_eq!(ui.get_usage_level(), 1, "75% 应是橙档");
+    assert_eq!(ui.get_usage_meter_fill(), 39.0, "52px × 75% = 39px");
+    super::apply_syschat_usage(&ui, Some(120_000), Some(128_000));
+    assert_eq!(ui.get_usage_level(), 2, "93.75% 应是红档");
+    assert_eq!(ui.get_usage_meter_fill(), 48.75, "52px × 93.75% = 48.75px");
+    super::apply_syschat_usage(&ui, Some(300_000), Some(128_000));
+    assert_eq!(
+        ui.get_usage_meter_fill(),
+        52.0,
+        "越限时内条夹在内容盒宽（百分比本身也夹在 100）"
+    );
+    // 只知上限、不知用量：还要给「上限知道」的那半句话，但**不许**画出内条（不伪造 0% 之外的进度）。
+    super::apply_syschat_usage(&ui, None, Some(128_000));
+    assert_eq!(ui.get_usage_text(), "上下文 —/128K · —");
+    assert_eq!(ui.get_usage_meter_fill(), 0.0);
+    assert_eq!(ui.get_usage_level(), 0);
+    // 复位成空档，下面的像素断言与出图口径不变。
+    super::apply_syschat_usage(&ui, None, None);
+
     // ② 第二行「模型 · 状态」仍在（稿 `.status .st2 .l2`）。
     assert!(ui.get_dbg_status_second_line(), "状态行第二行丢了");
 
@@ -2755,7 +2784,7 @@ fn dump_v11c_fixes_for_review() {
     std::fs::create_dir_all(dir).expect("建出图目录失败");
     let (ui, win, _m) = setup(fixture(), H);
     seed_panels(&ui);
-    super::refresh_syschat_usage(&ui);
+    super::apply_syschat_usage(&ui, None, None);
     ui.set_draft("就按这三份素材做，说明放第二节…".into());
     ui.set_resize_hit_areas(true);
     ui.window().set_size(slint::PhysicalSize::new(W520, H));
@@ -2793,6 +2822,17 @@ fn dump_v11c_fixes_for_review() {
     write_png(
         &crop(&f3, 0, 30, W520, 56),
         &dir.join("v11c-status-meter.png"),
+    );
+    // ③b E3：**有数据**时的用量条（75% ⇒ 橙档；出图给 owner 看档位换色，非断言）。
+    // 注：注入值（不读盘）——出图可复现，不随开发机真实会话变。
+    ui.set_usage_text("上下文 96K/128K · 75.0%".into());
+    ui.set_usage_tip(crate::syschat::context_usage_tip(Some(96_000), Some(128_000)).into());
+    ui.set_usage_meter_fill(crate::syschat::USAGE_METER_INNER_W * 0.75);
+    ui.set_usage_level(1);
+    let f3b = settle_w(&win, W520, H);
+    write_png(
+        &crop(&f3b, 0, 30, W520, 56),
+        &dir.join("v11c-status-meter-warn.png"),
     );
 
     // ④ 缩放热区示意：把 8 个热区（6px 边 + 14px 角）用紫线描在原图上。
@@ -2906,7 +2946,7 @@ fn dump_v11_panels_for_review() {
     std::fs::create_dir_all(dir).expect("建出图目录失败");
     let (ui, win, _m) = setup(fixture(), H);
     seed_panels(&ui);
-    super::refresh_syschat_usage(&ui);
+    super::apply_syschat_usage(&ui, None, None);
     ui.set_draft("就按这三份素材做，说明放第二节…".into());
     ui.window().set_size(slint::PhysicalSize::new(W520, H));
     apply_syschat_layout(&ui, W520 as f32);
