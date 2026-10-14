@@ -19,10 +19,17 @@
 //! - 任务列表 → `task`（`checked`）；
 //! - 表格 → 每行一个 `table` 块（`cells` 为单元格的行内 markdown，`header` 标表头行）；
 //! - 分隔线 → `hr`；
-//! - 图片/媒体（`![..](src)` 或 `[..](src)` 且扩展名是媒体）→ `image`/`audio`/`video`，
-//!   恒为**独立块**（Slint 无法把图片排进文字流），切成块后其前后的文字各自成段。
+//! - 图片/媒体 → `image`/`audio`/`video`，恒为**独立块**（Slint 无法把图片排进文字流），
+//!   切成块后其前后的文字各自成段。识别三种写法：
+//!   1. markdown 图片/链接：`![alt](src)`、`[alt](src)`（src 扩展名是媒体）；
+//!   2. **HTML 媒体标签**：`<img src=…>`、`<audio src=…>`、`<video src=…>`（含
+//!      `<video><source src=…></video>` 的子元素形态）——D7 卡里 agent 正用这种形态；
+//!   3. **裸媒体地址**：整段只有一个不含空白的 token 且扩展名是媒体（`https://…/a.mov`、
+//!      `./assets/a.mp4`）。
 //!
-//! 未知/不支持的节点（HTML、脚注、数学）退化为文本，**绝不吞内容**。
+//! 未知/不支持的节点（其它 HTML、脚注、数学）退化为文本，**绝不吞内容**；但被识别为媒体
+//! 标签的**开/闭标签本身**不再作为字面文本漏出（否则 `<audio …>` 成块后 `</audio>` 会
+//! 显示成一行转义文本）。
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -129,8 +136,41 @@ fn flush_cur(blocks: &mut Vec<MdBlock>, cur: &mut Option<MdBlock>) {
     }
 }
 
-/// 「整段只是一条媒体」→ 媒体块：`![alt](src)`（图片）或 `[alt](src)` 且 src 扩展名是媒体。
+/// 媒体块的默认替代文本（无 `alt` 属性 / 空链接文字时）。
+fn default_alt(kind: &str) -> String {
+    match kind {
+        "audio" => "音频",
+        "video" => "视频",
+        _ => "图片",
+    }
+    .to_string()
+}
+
+/// 「整段只是一条媒体」→ 媒体块：markdown 图片/链接，或**裸媒体地址**。
 fn media_from_text(text: &str) -> Option<MdBlock> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(m) = media_from_markdown(t) {
+        return Some(m);
+    }
+    // 裸媒体地址：整段**只有一个不含空白的 token**，且它的扩展名是媒体。
+    // 含空格的句子（`见 ./assets/a.mp4 文件`）是普通文本，不转块（避免吞正文）。
+    if t.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // 文本块里的 `_`/`*` 等被 `push_escaped` 加了反斜杠，判类型/取值前先反解。
+    let src = unescape(t);
+    let kind = media_kind_for(&src)?;
+    let mut b = MdBlock::new(kind);
+    b.src = src;
+    b.alt = default_alt(kind);
+    Some(b)
+}
+
+/// markdown 图片/链接 → 媒体块：`![alt](src)`（图片）或 `[alt](src)` 且 src 扩展名是媒体。
+fn media_from_markdown(text: &str) -> Option<MdBlock> {
     let t = text.trim();
     let (alt, src, forced_image) = if let Some(rest) = t.strip_prefix("![") {
         let i = rest.find("](")?;
@@ -149,11 +189,120 @@ fn media_from_text(text: &str) -> Option<MdBlock> {
     b.src = dest_strip_title(src);
     let alt = unescape(alt.trim());
     b.alt = if alt.is_empty() {
-        "image".to_string()
+        default_alt(kind)
     } else {
         alt
     };
     Some(b)
+}
+
+/// HTML 属性取值：从标签片段里取 `attr` 的值（双/单引号、无引号都认）。
+///
+/// 不用正则（不引依赖）；匹配时要求属性名左侧不是名字字符（避免 `data-src` 命中 `src`）。
+fn html_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(attr) {
+        let i = from + rel;
+        let left_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let after = bytes.get(i + attr.len()).copied();
+        if left_ok
+            && matches!(
+                after,
+                Some(b'=') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'/')
+            )
+        {
+            let rest = tag[i + attr.len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim_start();
+                let val = if let Some(r) = rest.strip_prefix('"') {
+                    r.split('"').next().unwrap_or("")
+                } else if let Some(r) = rest.strip_prefix('\'') {
+                    r.split('\'').next().unwrap_or("")
+                } else {
+                    rest.split(|c: char| c.is_whitespace() || c == '>')
+                        .next()
+                        .unwrap_or("")
+                };
+                return Some(val.to_string());
+            }
+        }
+        from = i + attr.len();
+    }
+    None
+}
+
+/// 该 HTML 片段是否是**媒体元素**的标签（含闭标签）。
+///
+/// 用于丢弃「成块后被消费掉的开/闭标签」——`<video …>` 成媒体块后，紧随的 `</video>`
+/// 如果还走「HTML 退化为文本」就会在气泡里多出一行字面量。
+fn is_media_html_tag(h: &str) -> bool {
+    let t = h.trim_start();
+    let t = t
+        .strip_prefix("</")
+        .or_else(|| t.strip_prefix('<'))
+        .unwrap_or(t);
+    let name: String = t
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(name.as_str(), "img" | "audio" | "video" | "source")
+}
+
+/// HTML 片段 → 媒体块：`<img src>`→image、`<audio src>`→audio、`<video src>`→video；
+/// `<video><source src></video>` 的 `<source>` 子元素按外层标签（或扩展名）定型。
+///
+/// 只认**带 `src` 的**媒体标签；找不到返回 `None`（调用方决定退回转义文本还是跳过）。
+fn media_from_html(h: &str) -> Option<MdBlock> {
+    let lower = h.to_ascii_lowercase();
+    let wrap_video = lower.contains("<video");
+    let wrap_audio = lower.contains("<audio");
+    for tag in ["img", "audio", "video", "source"] {
+        let needle = format!("<{tag}");
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(&needle) {
+            let i = from + rel;
+            let after = lower.as_bytes().get(i + needle.len()).copied();
+            // 必须紧跟空白/`>`/`/`（排除 `<imgs>` 之类）
+            if matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == b'-') {
+                from = i + needle.len();
+                continue;
+            }
+            let end = lower[i..]
+                .find('>')
+                .map(|o| i + o + 1)
+                .unwrap_or(lower.len());
+            let tagstr = &h[i..end];
+            if let Some(src) = html_attr(tagstr, "src") {
+                let src = src.trim().to_string();
+                if !src.is_empty() {
+                    let kind = match tag {
+                        "img" => "image",
+                        "audio" => "audio",
+                        "video" => "video",
+                        _ if wrap_video => "video",
+                        _ if wrap_audio => "audio",
+                        _ => media_kind_for(&src).unwrap_or("video"),
+                    };
+                    let mut m = MdBlock::new(kind);
+                    m.src = src;
+                    let alt = html_attr(tagstr, "alt")
+                        .map(|a| a.trim().to_string())
+                        .unwrap_or_default();
+                    m.alt = if alt.is_empty() {
+                        default_alt(kind)
+                    } else {
+                        alt
+                    };
+                    return Some(m);
+                }
+            }
+            from = end.max(i + 1);
+        }
+    }
+    None
 }
 
 /// 解析 markdown 为渲染块序列。**绝不返回 Err**：异常一律退化为文本块。
@@ -345,7 +494,7 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                         let mut m = MdBlock::new(kind);
                         let alt = unescape(alt.trim());
                         m.alt = if alt.is_empty() {
-                            "image".to_string()
+                            default_alt(kind)
                         } else {
                             alt
                         };
@@ -404,12 +553,20 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     c.checked = done;
                 }
             }
-            // HTML / 脚注 / 数学：退化为文本（绝不吞）
+            // HTML 媒体标签（`<img>/<audio>/<video>` 含 `<source>`）成独立媒体块
+            // （D7 卡根因①：原先 HTML 一律转义 ⇒ agent 输出 `<img>`/`<audio>`/`<video>`
+            // 永远成不了 image/audio/video 块）；其余 HTML / 脚注 / 数学退化为文本（绝不吞）。
             Event::Html(h) | Event::InlineHtml(h) => {
                 if let Some((_, buf)) = code.as_mut() {
                     buf.push_str(&h);
                 } else if in_table {
                     push_escaped(&h, &mut cell);
+                } else if let Some(m) = media_from_html(&h) {
+                    // 与 markdown 图片同口径：切块前先落盘当前段落，保证块序正确
+                    flush_cur(&mut blocks, &mut cur);
+                    blocks.push(m);
+                } else if is_media_html_tag(&h) {
+                    // 被消费掉的媒体开/闭标签（如成块后的 `</video>`）不再漏成文本
                 } else {
                     ensure_cur!();
                     push_escaped_block(&h, cur.as_mut().unwrap());
@@ -663,5 +820,111 @@ mod tests {
         let rows: Vec<&MdBlock> = b.iter().filter(|x| x.kind == "table").collect();
         assert_eq!(rows.len(), 2, "表格不应被图片打断：{:?}", kinds(&b));
         assert_eq!(rows[1].cells, vec!["alt"], "表内图片降级为 alt 文本");
+    }
+
+    // ── D7：HTML 媒体标签 + 裸媒体地址（根因①）──
+
+    /// `<img src>`（含相对路径）必须成 `image` 块，且 `alt`/`width` 属性正确分流。
+    /// 变异点：把 `Event::Html` 分支的 `media_from_html` 判断去掉 ⇒ 本测红（退化成 `p`）。
+    #[test]
+    fn html_img_becomes_image_block() {
+        let b = parse("<img src=\"./assets/cover.png\" alt=\"封面\" width=\"480\">");
+        assert_eq!(kinds(&b), vec!["image"], "{:?}", kinds(&b));
+        assert_eq!(b[0].src, "./assets/cover.png");
+        assert_eq!(b[0].alt, "封面", "width 不得混进 alt/src");
+        // 不带 alt 时回落默认替代文本
+        let b = parse("<img src='a.png'>");
+        assert_eq!(kinds(&b), vec!["image"]);
+        assert_eq!(b[0].src, "a.png");
+        assert_eq!(b[0].alt, "图片");
+    }
+
+    /// HTML 音视频必须成 `audio`/`video` 块（属性顺序无关，`controls` 不干扰）。
+    #[test]
+    fn html_audio_video_become_media_blocks() {
+        let b = parse("<audio controls src=\"./assets/tone.mp3\"></audio>");
+        assert_eq!(kinds(&b), vec!["audio"], "{:?}", kinds(&b));
+        assert_eq!(b[0].src, "./assets/tone.mp3");
+        assert_eq!(b[0].alt, "音频");
+
+        let b = parse("<video width=\"640\" controls src=\"./assets/clip.mp4\"></video>");
+        assert_eq!(kinds(&b), vec!["video"], "{:?}", kinds(&b));
+        assert_eq!(b[0].src, "./assets/clip.mp4");
+        assert_eq!(b[0].alt, "视频");
+    }
+
+    /// `<video><source src=…></video>` 子元素形态：`<source>` 按外层 `<video>` 定成 video。
+    #[test]
+    fn html_video_source_child_resolves_to_video() {
+        let b = parse("<video controls><source src=\"a.mp4\" type=\"video/mp4\"></video>");
+        let media: Vec<&MdBlock> = b
+            .iter()
+            .filter(|x| matches!(x.kind.as_str(), "audio" | "video" | "image"))
+            .collect();
+        assert_eq!(media.len(), 1, "恰好一个媒体块：{:?}", kinds(&b));
+        assert_eq!(media[0].kind, "video");
+        assert_eq!(media[0].src, "a.mp4");
+        // 闭标签不得漏成字面文本块
+        assert!(
+            !b.iter().any(|x| x.text.contains("</video>")),
+            "闭标签漏成文本：{:?}",
+            b.iter().map(|x| &x.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// 媒体开/闭标签本身不得作为字面文本漏出（`</audio>` 不能显示成一行）。
+    #[test]
+    fn html_media_closing_tags_are_not_leaked() {
+        let b = parse("<audio src=\"a.mp3\"></audio>");
+        assert_eq!(kinds(&b), vec!["audio"], "{:?}", kinds(&b));
+        let b = parse("<video controls><source src=\"a.mp4\"></video>\n\n后文");
+        assert_eq!(kinds(&b), vec!["video", "p"], "{:?}", kinds(&b));
+        assert_eq!(b[1].text, "后文");
+    }
+
+    /// 裸媒体地址（无 markdown 语法）：整段只有一个不含空白的 token 时成块。
+    #[test]
+    fn bare_media_links_become_blocks() {
+        assert_eq!(kinds(&parse("https://x.y/a.mp4")), vec!["video"]);
+        assert_eq!(kinds(&parse("https://x.y/a.mov?x=1")), vec!["video"]);
+        assert_eq!(kinds(&parse("./assets/a.mp4")), vec!["video"]);
+        assert_eq!(kinds(&parse("a.mp3")), vec!["audio"]);
+        let b = parse("./assets/a.png");
+        assert_eq!(kinds(&b), vec!["image"]);
+        assert_eq!(b[0].src, "./assets/a.png", "裸地址 src 不得被转义");
+        // 含空格的句子是正文，不得被吞成媒体块
+        assert_eq!(kinds(&parse("见 ./assets/a.mp4 文件")), vec!["p"]);
+        // 非媒体扩展名仍是段落
+        assert_eq!(kinds(&parse("https://x.y/readme")), vec!["p"]);
+    }
+
+    /// 非媒体 HTML（`<div>` 等）仍走「退化为转义文本」路径，绝不吞内容。
+    #[test]
+    fn non_media_html_still_degrades_to_text() {
+        let b = parse("<div>甲</div>");
+        assert_eq!(kinds(&b), vec!["p"], "{:?}", kinds(&b));
+        assert!(b[0].text.contains("div"), "HTML 不得被吞：{}", b[0].text);
+    }
+
+    /// 行内 HTML 媒体与 markdown 图片同口径：切出独立块，前后文字各自成段。
+    #[test]
+    fn html_media_inside_paragraph_splits_blocks() {
+        let b = parse("前文 <img src=\"a.png\"> 后文");
+        assert_eq!(kinds(&b), vec!["p", "image", "p"], "{:?}", kinds(&b));
+        assert_eq!(b[0].text, "前文");
+        assert_eq!(b[2].text, "后文");
+    }
+
+    /// HTML 媒体在表格内仍降级为单元格文本（不得打断表格布局）。
+    #[test]
+    fn html_media_in_table_degrades_to_cell_text() {
+        let b = parse("| 图 |\n|---|\n| <img src=\"a.png\"> |\n");
+        let rows: Vec<&MdBlock> = b.iter().filter(|x| x.kind == "table").collect();
+        assert_eq!(rows.len(), 2, "表格不应被 HTML 图片打断：{:?}", kinds(&b));
+        assert!(
+            rows[1].cells[0].contains("img"),
+            "单元格应保留 HTML 文本：{:?}",
+            rows[1].cells
+        );
     }
 }

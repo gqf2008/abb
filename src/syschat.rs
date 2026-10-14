@@ -351,6 +351,58 @@ pub fn workspace() -> PathBuf {
     crate::workspace_dir(SYSCHAT_KEY)
 }
 
+/// markdown 里媒体/文件地址解析的**唯一基准**：syschat 工作区。
+///
+/// agent 进程的 cwd 就是 [`workspace`]，它回复里的相对路径（`./assets/a.png`、
+/// `assets/a.mp4`）都是相对工作区；ABB 托盘进程的 cwd 与它**不是同一个**，所以绝不能用
+/// 进程 CWD 解析——那是 D7 卡里「相对路径图片看不到图 / 打不开」的直接原因。
+/// 图片内联（`ui::load_block_image`）、媒体卡「用播放器打开」与普通「打开」/链接点击
+/// （`ui::on_open_media` / `ui::on_open_link`）三处**必须共用本函数**，不得各写一份。
+pub fn resolve_media_path(src: &str) -> PathBuf {
+    resolve_media_path_in(&workspace(), src)
+}
+
+/// [`resolve_media_path`] 的可注入基准版本（供单测；不做 IO、不查存在性）。
+///
+/// - `file://` URL → 绝对路径（`file:///a/b.png` → `/a/b.png`；`%20` 百分号解码；
+///   `file://localhost/a` 的 host 部分剥掉）；
+/// - 绝对路径 → 原样；
+/// - 其它（相对路径）→ `base.join(src)`。
+pub fn resolve_media_path_in(base: &std::path::Path, src: &str) -> PathBuf {
+    if let Some(rest) = src.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        return PathBuf::from(percent_decode(rest));
+    }
+    let p = std::path::Path::new(src);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// `%XX` 百分号解码（`file://` URL 用；非法/不完整转义原样保留）。手写避免为一条 URL 引入依赖。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(v) = hex {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 // ─────────────────────────── C 批：待发附件（📎 多选 / ⌘V 粘贴）───────────────────────────
 
 /// 一个已落盘的待发附件。
@@ -2952,5 +3004,62 @@ mod tests {
         for c in ['A', 'z', '0', '-', '…', 'é'] {
             assert!(!is_wide_char(c), "{c} 应算半宽");
         }
+    }
+
+    // ── D7：媒体路径解析基准（唯一口径 = syschat 工作区）──
+
+    /// 相对路径必须相对**传入基准**（真实调用点传 `workspace()`），不得相对进程 CWD。
+    /// 变异点：把相对分支改成 `PathBuf::from(src)`（即进程 CWD）⇒ 本测红。
+    #[test]
+    fn resolve_media_path_relative_uses_base_not_cwd() {
+        let base = std::path::Path::new("/tmp/abb-ws-probe");
+        assert_eq!(
+            resolve_media_path_in(base, "./assets/a.png"),
+            std::path::PathBuf::from("/tmp/abb-ws-probe/assets/a.png")
+        );
+        assert_eq!(
+            resolve_media_path_in(base, "assets/a.mp4"),
+            std::path::PathBuf::from("/tmp/abb-ws-probe/assets/a.mp4")
+        );
+        // 基准里本来就存在的相对子目录同样适用
+        assert_eq!(
+            resolve_media_path_in(base, "attachments/1-a.mp3"),
+            std::path::PathBuf::from("/tmp/abb-ws-probe/attachments/1-a.mp3")
+        );
+    }
+
+    /// 绝对路径原样返回，不受基准影响。
+    #[test]
+    fn resolve_media_path_absolute_is_untouched() {
+        let base = std::path::Path::new("/tmp/abb-ws-probe");
+        assert_eq!(
+            resolve_media_path_in(base, "/Users/x/a.png"),
+            std::path::PathBuf::from("/Users/x/a.png")
+        );
+    }
+
+    /// `file://` URL 按绝对路径处理（含 `%20` 解码与 `localhost` host 剥离）。
+    /// 变异点：删掉 `strip_prefix("file://")` 分支 ⇒ `file:///tmp/a.png` 会被当成
+    /// 相对路径拼到基准下，本测红。
+    #[test]
+    fn resolve_media_path_handles_file_url() {
+        let base = std::path::Path::new("/tmp/abb-ws-probe");
+        assert_eq!(
+            resolve_media_path_in(base, "file:///tmp/a.png"),
+            std::path::PathBuf::from("/tmp/a.png")
+        );
+        assert_eq!(
+            resolve_media_path_in(base, "file:///tmp/a%20b.png"),
+            std::path::PathBuf::from("/tmp/a b.png")
+        );
+        assert_eq!(
+            resolve_media_path_in(base, "file://localhost/tmp/c.mp4"),
+            std::path::PathBuf::from("/tmp/c.mp4")
+        );
+        // 非法转义原样保留，不 panic
+        assert_eq!(
+            resolve_media_path_in(base, "file:///tmp/a%zz.png"),
+            std::path::PathBuf::from("/tmp/a%zz.png")
+        );
     }
 }

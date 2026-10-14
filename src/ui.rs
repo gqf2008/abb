@@ -2104,6 +2104,7 @@ pub fn run_gui() -> Result<()> {
         }
     }
     /// 加载块图片：本地路径直读；http(s) 读本地缓存（未缓存则先空，由后台下载后重载）。
+    /// 本地路径统一按 **syschat 工作区**基准解析（[`crate::syschat::resolve_media_path`]）。
     fn load_block_image(src: &str) -> (slint::Image, bool) {
         if src.is_empty() {
             return (slint::Image::default(), false);
@@ -2112,7 +2113,8 @@ pub fn run_gui() -> Result<()> {
             if src.starts_with("http://") || src.starts_with("https://") {
                 crate::syschat::media_cache_path(src)
             } else {
-                let p = std::path::PathBuf::from(src);
+                // 不能用进程 CWD：agent 输出的相对路径是相对它的工作区（= syschat 工作区）
+                let p = crate::syschat::resolve_media_path(src);
                 p.is_file().then_some(p)
             };
         match path.and_then(|p| slint::Image::load_from_path(&p).ok()) {
@@ -6154,18 +6156,27 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 音视频媒体卡：用系统默认播放器打开（Slint 无内嵌播放器）；链接用浏览器。
+    // 音视频媒体卡 / 图片回退「打开」：本地文件用系统默认播放器打开，链接用浏览器。
+    // 本地路径与图片内联、普通「打开」共用同一基准（[`crate::syschat::resolve_media_path`]）。
     syschat_win.on_open_media(|src| {
         let s = src.as_str();
         if s.starts_with("http://") || s.starts_with("https://") {
             platform::open_url(s);
         } else {
-            platform::open_path(std::path::Path::new(s));
+            platform::open_path(&crate::syschat::resolve_media_path(s));
         }
     });
-    // 普通链接 / 图片回退：用浏览器打开。
+    // 普通链接 / 图片回退：http(s)/mailto 等交浏览器；`file://` 与无 scheme 的本地路径
+    // 按同一工作区基准解析后用系统「打开」（否则相对路径链接必打不开）。
     syschat_win.on_open_link(|url| {
-        platform::open_url(url.as_str());
+        let s = url.as_str();
+        let external = !s.starts_with("file://")
+            && (s.contains("://") || s.starts_with("mailto:") || s.starts_with("tel:"));
+        if external {
+            platform::open_url(s);
+        } else {
+            platform::open_path(&crate::syschat::resolve_media_path(s));
+        }
     });
     // 关闭对话框 = 隐藏（托盘应用惯例；气泡仍在，随时可再打开）。
     // 隐藏路径收口在 [`hide_syschat`]（✕ / 红点 / D5 失焦三条路径共用）。
@@ -7166,6 +7177,30 @@ mod headless_render;
 
 #[cfg(test)]
 mod tests {
+
+    /// D7：媒体/文件路径的**唯一基准** —— 图片内联、媒体卡打开、普通「打开」/链接点击
+    /// 三处都必须调用 `crate::syschat::resolve_media_path`，不得各写一份（尤其不得回退到
+    /// 进程 CWD：`PathBuf::from(src)` / `Path::new(s)`）。
+    ///
+    /// 变异点：把任一处改回 `std::path::PathBuf::from(src)` ⇒ 计数不足 / 断言红。
+    #[test]
+    fn media_paths_share_single_workspace_base() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        let calls = prod.matches("crate::syschat::resolve_media_path(").count();
+        assert!(
+            calls >= 3,
+            "图片加载/媒体卡/普通打开 三处应共用 resolve_media_path，实际 {calls} 处"
+        );
+        assert!(
+            !prod.contains("PathBuf::from(src)"),
+            "load_block_image 不得再按进程 CWD 解析相对路径"
+        );
+        assert!(
+            !prod.contains("open_path(std::path::Path::new(s))"),
+            "媒体打开不得再按进程 CWD 解析相对路径"
+        );
+    }
 
     /// v10（稿 v8 第 1 条）「气泡常驻置顶」：显隐只看托盘开关，**不再看对话框是否可见**。
     ///
