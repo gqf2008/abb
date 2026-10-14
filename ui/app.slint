@@ -3032,6 +3032,55 @@ export struct SysChatBlockRow {
     think-expanded: bool,
     think-live: bool,
     think-elapsed: string,
+    // 卡 `abb-v11-message-actions`：**无行内样式**的块用只读 `TextInput` 渲染 ⇒ 可拖选 + ⌘C。
+    // `plain` 是这个块的**展示文本**（由 `mdblocks::selectable_plain` 一并判定与产出）；
+    // `selectable` 为 false 时继续走 `styled`（有行内样式，`TextInput` 渲染不了 ⇒ 不做视觉回退）。
+    selectable: bool,
+    plain: string,
+    // 动作行（`kind == "acts"`）对应的助手轮序号：`-1` = 当前会话**最后一条**助手轮
+    //（刚跑完那条，历史索引由 Rust 在点击时解析），其它 kind 恒 `-1`。
+    turn: int,
+}
+
+// 卡 `abb-v11-message-actions`：**无行内样式**的消息文本用只读 `TextInput` 渲染。
+//
+// 为什么可行（实核，不是外推）：Slint 1.18 的 `TextInput.read-only` 文档原文是
+// 「text editing via keyboard and mouse is disabled but **selecting text is still enabled**」
+//（`i-slint-compiler-1.18.0/builtin_elements.rs:2320`）；且 `⌘C` / `⌘A` 在
+// `i-slint-core/items/text.rs:1089`（`SelectAll`）/ `:1093`（`Copy`）两分支上**没有**
+// `read_only` 守卫，紧随其后的 `Paste`（:1097）/ `Cut`（:1101）/ `Undo`/`Redo` 才有
+// ——即 `read-only: true` 正是「可选不可改」。
+//
+// 观感零变化的前提：该块的 `StyledText` 本来就与纯文本逐字等价——由
+// `mdblocks::selectable_plain` 判定（块内行内文本的字面量元字符都已转义 ⇒ 未转义元字符 =
+// 真有样式；代码块原文不转义，单独按原样取用）。
+component ConvoSelectableText inherits TextInput {
+    in property <string> body;
+    in property <length> avail: 100px;
+    in property <length> size: 13px;
+    in property <brush> tone: PixelTheme.text;
+    read-only: true;
+    // `single-line` 在 Slint 里**不管换行**（换行由下面的 `wrap` 决定）：它只改
+    // 「多行文本按单行做垂直对齐」的 `baseline_y` 与省略号的判据
+    //（`i-slint-core/textlayout.rs:233` / `:254`）。默认 `vertical-alignment: top` 下
+    // 它与 `false` 逐像素一致（无头台实测 4 类块差异为 0），这里显式写 `false`
+    // 只为表明意图：这是一个**多行**文本域（哪天改成居中对齐就不至于踩空）。
+    single-line: false;
+    // ⚠️ **这一行才是载荷**：`TextInput.wrap` 的默认值是 `no-wrap`，漏掉它长段落与
+    // 多行代码块都会被压成一行（无头台 `selectable_blocks_render_same_height_as_legacy_element`
+    // 会立刻红——这条做过负向实测）。
+    wrap: word-wrap;
+    text: root.body;
+    font-size: root.size;
+    color: root.tone;
+    width: root.avail;
+    selection-background-color: PixelTheme.accent;
+    selection-foreground-color: PixelTheme.text;
+}
+
+// 等宽变体（代码块 / 思考块）：只多一行 `font-family`——不给非等宽块写空族名。
+component ConvoSelectableMonoText inherits ConvoSelectableText {
+    font-family: "ui-monospace, Menlo, Consolas, monospace";
 }
 
 // v11（卡 `abb-v11-panels-align`）：历史会话 / 模型列表面板的一行。
@@ -3671,6 +3720,17 @@ export component SystemChatWindow inherits Window {
     callback send(string);
     callback stop-streaming();   // ⏹ 停止：取消在途回合（Rust 侧发 external_cancel）
     callback toggle-think(int);  // 思考块展开/收起（E2）：参数是该块在 `blocks` 里的下标
+    // 卡 `abb-v11-message-actions`：助手轮动作行（稿 v11.1 `.acts`）。
+    // 参数是该助手轮的**历史序号**（`-1` = 当前会话最后一条助手轮）——文本/提示词由 Rust
+    // 在点击时按序号解析（`syschat::action_target`），这样 Slint 侧不必搬整段正文。
+    callback copy-turn(int);     // ⧉ 复制（整轮正文 → 系统剪贴板）
+    callback regen-turn(int);    // ⟳ 重新生成（用该轮的用户提示重跑，落历史、可停止）
+    callback speak-turn(int);    // 🔊/⏹ 朗读（macOS `say`；再点一次 = 停止）
+    // 正在朗读的助手轮序号：`-2` = 没有朗读在跑（`-1` 是合法值「最后一条助手轮」，
+    // 所以初值必须用 -2，否则一进窗就显示成「⏹ 停止朗读」）。由 Rust 写。
+    // 名字不能叫 `speak-turn`：Slint 不允许 callback 与属性同名（`callback speak-turn(int)`
+    // 会直接编译失败），所以属性用 `speaking-turn` 与回调区分开。
+    in-out property <int> speaking-turn: -2;
     callback attach-pick();
     callback attach-clear();       // 清空待发列表（只清内存，不删已落盘文件）
     callback attach-remove(int);   // 按完整列表下标移除单个待发附件（✕）
@@ -4089,18 +4149,26 @@ export component SystemChatWindow inherits Window {
                                         clicked => { root.toggle-think(i); }
                                     }
                                 }
-                                if b.think-expanded: Text {
+                                // 思考文本是纯文本（不是 markdown）⇒ 恒可选中。
+                                // 可用宽 = 块内 416 − 内层 VerticalBox 的左右 padding 12
+                                if b.think-expanded && b.selectable: ConvoSelectableMonoText {
+                                    body: b.plain;  avail: root.convo-text-width - 12px;
+                                    size: 12px;  tone: UiTokens.text-dim;
+                                }
+                                if b.think-expanded && !b.selectable: Text {
                                     text: b.text;
                                     font-size: 12px;
                                     color: UiTokens.text-dim;
                                     font-family: "ui-monospace, Menlo, Consolas, monospace";
                                     wrap: word-wrap;
-                                    // 可用宽 = 块内 416 − 内层 VerticalBox 的左右 padding 12
                                     width: root.convo-text-width - 12px;
                                 }
                             }
                         }
-                        if b.kind == "h1": StyledText {
+                        if b.kind == "h1" && b.selectable: ConvoSelectableText {
+                            body: b.plain;  avail: root.convo-text-width;  size: 18px;
+                        }
+                        if b.kind == "h1" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 18px;
@@ -4108,7 +4176,10 @@ export component SystemChatWindow inherits Window {
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
                         }
-                        if b.kind == "h2": StyledText {
+                        if b.kind == "h2" && b.selectable: ConvoSelectableText {
+                            body: b.plain;  avail: root.convo-text-width;  size: 16px;
+                        }
+                        if b.kind == "h2" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 16px;
@@ -4116,7 +4187,10 @@ export component SystemChatWindow inherits Window {
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
                         }
-                        if b.kind == "h3": StyledText {
+                        if b.kind == "h3" && b.selectable: ConvoSelectableText {
+                            body: b.plain;  avail: root.convo-text-width;  size: 14px;
+                        }
+                        if b.kind == "h3" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 14px;
@@ -4135,13 +4209,18 @@ export component SystemChatWindow inherits Window {
                                     font-size: 10px;
                                     color: #b9ae97;
                                 }
-                                Text {
+                                // 代码块永远是纯文本（没有行内样式）⇒ 恒可选中。
+                                // 可用宽 = 块内 416 − 代码框内层 VerticalBox 的左右 padding 16
+                                if b.selectable: ConvoSelectableMonoText {
+                                    body: b.plain;  avail: root.convo-text-width - 16px;
+                                    size: 12px;  tone: #f6efe1;
+                                }
+                                if !b.selectable: Text {
                                     text: b.text;
                                     font-size: 12px;
                                     color: #f6efe1;
                                     font-family: "ui-monospace, Menlo, Consolas, monospace";
                                     wrap: word-wrap;
-                                    // 可用宽 = 块内 416 − 代码框内层 VerticalBox 的左右 padding 16
                                     width: root.convo-text-width - 16px;
                                 }
                             }
@@ -4154,8 +4233,12 @@ export component SystemChatWindow inherits Window {
                                 padding-left: 10px;
                                 spacing: 0px;
                                 Rectangle { width: 4px; background: PixelTheme.accent; }
-                                StyledText {
-                                    // 可用宽 = 块内 416 − 左 padding 10 − 强调条 4 − 右 padding 8
+                                // 可用宽 = 块内 416 − 左 padding 10 − 强调条 4 − 右 padding 8
+                                if b.selectable: ConvoSelectableText {
+                                    body: b.plain;  avail: root.convo-text-width - 22px;
+                                    size: 13px;  tone: UiTokens.text-dim;
+                                }
+                                if !b.selectable: StyledText {
                                     width: root.convo-text-width - 22px;
                                     text: b.styled;
                                     default-font-size: 13px;
@@ -4173,8 +4256,13 @@ export component SystemChatWindow inherits Window {
                                 font-size: 13px;
                                 color: PixelTheme.text;
                             }
-                            StyledText {
-                                // 可用宽 = 块内 416 − 缩进 level×16 − 间距 6 − 右 padding 8 − 标记位（≤20，取保守）
+                            // 可用宽 = 块内 416 − 缩进 level×16 − 间距 6 − 右 padding 8 − 标记位（≤20，取保守）
+                            if b.selectable: ConvoSelectableText {
+                                body: b.plain;
+                                avail: root.convo-text-width - b.level * 16px - 34px;
+                                size: 13px;
+                            }
+                            if !b.selectable: StyledText {
                                 width: root.convo-text-width - b.level * 16px - 34px;
                                 text: b.styled;
                                 default-font-size: 13px;
@@ -4267,13 +4355,38 @@ export component SystemChatWindow inherits Window {
                                 }
                             }
                         }
-                        if b.kind == "p": StyledText {
+                        if b.kind == "p" && b.selectable: ConvoSelectableText {
+                            body: b.plain;  avail: root.convo-text-width;  size: 13px;
+                        }
+                        if b.kind == "p" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
                             default-font-size: 13px;
                             default-color: PixelTheme.text;
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
+                        }
+                        // 助手轮动作行（稿 v11.1 `.acts`，卡 `abb-v11-message-actions`）：
+                        // `⧉ 复制` / `⟳ 重新生成` / `🔊 朗读`；朗读进行中该行的按钮变 `⏹ 停止朗读`。
+                        if b.kind == "acts": HorizontalLayout {
+                            width: 100%;
+                            spacing: 6px;
+                            // 稿 `.acts{margin:6px 0 0}`：上间距 6px（用 padding-top 表达）
+                            padding-top: 6px;
+                            alignment: start;
+                            PixelButton {
+                                text: "⧉ 复制";  size: "small";
+                                clicked => { root.copy_turn(b.turn); }
+                            }
+                            PixelButton {
+                                text: "⟳ 重新生成";  size: "small";
+                                clicked => { root.regen_turn(b.turn); }
+                            }
+                            PixelButton {
+                                text: b.turn == root.speaking-turn ? "⏹ 停止朗读" : "🔊 朗读";
+                                size: "small";
+                                clicked => { root.speak_turn(b.turn); }
+                            }
                         }
                     }
                     if root.busy: HorizontalBox {

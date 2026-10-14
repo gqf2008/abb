@@ -101,8 +101,19 @@ fn wire_split(ui: &SystemChatWindow) -> Rc<SplitWiring> {
     split
 }
 
-/// 一行消息块：与生产 `ui.rs::block_row` 同口径的最小构造（kind 驱动渲染分支）。
+/// 一行消息块：与生产 `ui.rs::block_row` / `ui.rs::think_row` 同口径的最小构造
+///（kind 驱动渲染分支）。
+///
+/// 卡 `abb-v11-message-actions`：`selectable` / `plain` 必须与生产**同一判据**
+///（`mdblocks::selectable_plain`）——这块头上量的是布局，判据抄错就等于量了另一条分支。
 fn row(kind: &str, text: &str) -> SysChatBlockRow {
+    // 思考块在生产里走 `think_row`：正文是**纯文本**（不是 markdown）⇒ 恒可选中、无样式可言。
+    // `selectable_plain` 不管 `think`（GUI 自有的 kind），所以这里显式对齐生产。
+    let plain = if kind == "think" {
+        Some(text.to_string())
+    } else {
+        crate::mdblocks::selectable_plain(kind, text)
+    };
     SysChatBlockRow {
         kind: kind.into(),
         text: text.into(),
@@ -131,7 +142,18 @@ fn row(kind: &str, text: &str) -> SysChatBlockRow {
         think_expanded: false,
         think_live: false,
         think_elapsed: "".into(),
+        selectable: plain.is_some(),
+        plain: plain.unwrap_or_default().into(),
+        turn: -1,
     }
+}
+
+/// 助手轮动作行（与生产 `ui.rs::acts_row` 同口径）：只带轮序号，正文空。
+/// `turn < 0` = 「刚跑完的那一轮」（历史下标由 Rust 在点击时解析）。
+fn acts_row(turn: i32) -> SysChatBlockRow {
+    let mut r = row("acts", "");
+    r.turn = turn;
+    r
 }
 
 fn table_row(cells: &[&str]) -> SysChatBlockRow {
@@ -173,6 +195,15 @@ impl Frame {
         (y0..y1)
             .rev()
             .find(|&y| !self.ink_cols(y, x0, x1).is_empty())
+    }
+    /// 与另一帧的差异像素数（`PremultipliedRgbaColor` 没有 `PartialEq`，只能逐通道比）。
+    fn diff_px(&self, other: &Frame) -> usize {
+        assert_eq!((self.w, self.h), (other.w, other.h), "两帧尺寸必须一致");
+        self.buf
+            .iter()
+            .zip(other.buf.iter())
+            .filter(|(p, q)| (p.red, p.green, p.blue, p.alpha) != (q.red, q.green, q.blue, q.alpha))
+            .count()
     }
 }
 
@@ -374,6 +405,219 @@ fn think_block_collapsed_by_default_and_expands() {
     );
 }
 
+// ───────── 卡 `abb-v11-message-actions`：消息可选中 + 助手轮动作行的无头守卫 ─────────
+
+/// 生产口径的正文块（无行内样式 ⇒ 走只读 `TextInput`，可拖选 + ⌘C）。
+fn selectable_p(text: &str) -> SysChatBlockRow {
+    let r = row("p", text);
+    assert!(
+        r.selectable,
+        "这段文本无行内样式，生产必须判定为可选中：{text:?}"
+    );
+    r
+}
+
+/// 换渲染元素**不改版式**：同一块内容分别走「可选中」分支（只读 `TextInput`）与旧分支
+/// （`p`/`h2`/`list` → `StyledText`，`code` → `Text`），**高度与最底墨迹必须一致**。
+///
+/// 为什么必须量：换元素是本卡的核心动作。若两者排版规则不同（行高、内边距、换行宽度、
+/// 竖排对齐），用户看到的是「消息整体变形」，而不是「白得可选中」。
+///
+/// 判别力（负向，已实测）：删掉 `ConvoSelectableText` 的 `wrap: word-wrap`
+/// （`TextInput.wrap` 的默认值是 `no-wrap`）⇒ 长段落不换行 ⇒ 本测试立刻红。
+/// 对照组里必须留**多行代码块**：它的换行是真的靠 `\n` 断行，最容易被「压成一行」写错。
+#[test]
+fn selectable_blocks_render_same_height_as_legacy_element() {
+    let long = format!("{LONG}{LONG}");
+    let code = (0..12)
+        .map(|i| {
+            format!("echo \"第 {i} 行：一条比较长的命令行，用来制造代码块内的换行与多行高度\"")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // `min_h` = 该块的**正面控制**：内容必须真的多行（否则「两边一样高」是空的）。
+    let cases: [(&str, String, f32); 4] = [
+        ("p", long.clone(), 100.0),
+        ("h2", long.clone(), 100.0),
+        ("list", long.clone(), 100.0),
+        ("code", code, 180.0),
+    ];
+    // 量一条分支：`true` = 生产口径（可选中），`false` = 旧分支（`selectable` 关掉）。
+    let measure = |kind: &str, text: &str, selectable: bool| {
+        let mut r = row(kind, text);
+        if selectable {
+            assert!(r.selectable, "{kind} 无行内样式，生产必须判定为可选中");
+        } else {
+            r.selectable = false;
+        }
+        let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
+        let f = settle(&ui, &win, TALL_H);
+        let h = ui.get_dbg_content_h();
+        let bottom = f
+            .lowest_ink_row(4, TALL_H - 4, 4, W - 4)
+            .expect("两条分支都该画得出墨迹");
+        (h, bottom, f)
+    };
+    for (kind, text, min_h) in cases {
+        let (h_new, bottom_new, f_new) = measure(kind, &text, true);
+        let (h_old, bottom_old, f_old) = measure(kind, &text, false);
+        let diff = f_new.diff_px(&f_old);
+        println!("{kind}: 可选中 content.h={h_new} 最底墨迹={bottom_new} / 旧分支 {h_old} / {bottom_old} / 差异像素 {diff}");
+        assert!(
+            (h_new - h_old).abs() <= 1.0,
+            "{kind} 换渲染元素不该改高度：TextInput={h_new} vs 旧分支={h_old}"
+        );
+        assert!(
+            bottom_new.abs_diff(bottom_old) <= 1,
+            "{kind} 真实渲染的最底墨迹也必须一致：TextInput={bottom_new} vs 旧分支={bottom_old}"
+        );
+        assert_eq!(
+            diff, 0,
+            "{kind} 换渲染元素必须**逐像素**一致（差异 {diff} 像素）：这是「观感零变化」的直接证据"
+        );
+        assert!(
+            h_new >= min_h,
+            "{kind} 正面控制：内容应真的多行（量到 {h_new}，期望 ≥ {min_h}）"
+        );
+    }
+}
+
+/// 有行内样式的块**必须继续走 `StyledText`**（`TextInput` 渲染不了粗体/链接/行内码）——
+/// 这是 B 批已交付能力的回归守卫：宁可不可选中，也不许把样式画没。
+#[test]
+fn styled_paragraph_stays_on_styled_path_and_still_renders() {
+    let md = "这段有 **粗体**、`行内码` 与 [链接](https://example.com)。";
+    let r = row("p", md);
+    assert!(
+        !r.selectable,
+        "含行内样式的段落必须继续走 StyledText（否则样式会被 TextInput 画掉）"
+    );
+    let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
+    let f = settle(&ui, &win, TALL_H);
+    assert!(
+        f.lowest_ink_row(4, TALL_H - 4, 4, W - 4).is_some(),
+        "走 StyledText 的段落仍必须画出来（不能被新的 if 分支吞掉）"
+    );
+}
+
+/// 代码块恒可选中，且正文**逐字**保留——复制代码是本卡第一场景，
+/// 而代码原文在解析时**不转义**（拿元字符判样式会误判，反解转义会吃掉反斜杠）。
+#[test]
+fn code_block_row_is_selectable_and_keeps_text_verbatim() {
+    let code = "ls *.rs | grep _tmp\nC:\\Users\\x\\a.txt\necho `<b>[x]</b>`";
+    let r = row("code", code);
+    assert!(r.selectable, "代码块必须可选中");
+    assert_eq!(
+        r.plain.as_str(),
+        code,
+        "代码正文必须逐字保留（不掉反斜杠/不吞星号）"
+    );
+}
+
+/// 动作行（`kind == "acts"`）真的参与布局（撑出高度），且「朗读」按钮的字面
+/// 由 `speaking-turn` 驱动：命中本行 ⇒ 「⏹ 停止朗读」，否则 「🔊 朗读」。
+///
+/// 判别力（负向）：`.slint` 里把 `if b.kind == "acts"` 写成恒假 ⇒ 高度不增 ⇒ 红；
+/// 把三元里的 `root.speaking-turn` 写成常量 ⇒ 两种情况像素相同 ⇒ 红。
+#[test]
+fn acts_row_draws_and_its_speak_label_tracks_speaking_turn() {
+    const ASSISTANT_TURN: i32 = 1;
+    let text = "一条短的助手回答。";
+    let without = vec![row("role", "怹"), selectable_p(text)];
+    let with = vec![
+        row("role", "怹"),
+        selectable_p(text),
+        acts_row(ASSISTANT_TURN),
+    ];
+
+    let (ui0, win0, _) = setup(without, TALL_H);
+    let _ = settle(&ui0, &win0, TALL_H);
+    let h_without = ui0.get_dbg_content_h();
+
+    let (ui, win, _) = setup(with, TALL_H);
+    let f_idle = settle(&ui, &win, TALL_H);
+    let h_with = ui.get_dbg_content_h();
+    assert!(
+        h_with > h_without + 20.0,
+        "动作行必须真的占位（无动作行 {h_without} vs 有 {h_with}）"
+    );
+
+    // 「朗读」态：本行的轮号 = 正在朗读的轮号。
+    ui.set_speaking_turn(ASSISTANT_TURN);
+    let f_speaking = settle(&ui, &win, TALL_H);
+    // 别的轮在朗读 ⇒ 本行仍是「🔊 朗读」（按钮不该全窗一起变）。
+    ui.set_speaking_turn(ASSISTANT_TURN + 1);
+    let f_other = settle(&ui, &win, TALL_H);
+    ui.set_speaking_turn(-2);
+    let f_back = settle(&ui, &win, TALL_H);
+
+    assert!(
+        f_idle.diff_px(&f_speaking) > 0,
+        "朗读态必须改变这一行的像素（按钮字面变「⏹ 停止朗读」）"
+    );
+    assert!(
+        f_idle.diff_px(&f_other) == 0,
+        "别轮在朗读时本行不该变（否则说明三元没按轮号区分）"
+    );
+    assert!(
+        f_idle.diff_px(&f_back) == 0,
+        "停止朗读后必须回到原样（-2 = 没有朗读在跑）"
+    );
+}
+
+/// 三个动作按钮真的**收得到点击**，且把**本行的轮序号**带出来（`copy_turn(1)`）。
+///
+/// 判据不靠坐标表：从像素上取动作行**第一个按钮的下边框**（它的墨迹宽度 = 按钮整宽），
+/// 在它上方 4px 处按下/抬起 —— 无头台没有「用户点到哪儿」之外的输入方式，
+/// 所以这条同时验证了 `.slint` 的命中路由与 `b.turn` 的传参。
+///
+/// 判别力（负向）：把按钮里的 `root.copy_turn(b.turn)` 改成常量（如 `-1`）⇒ 断言收到的轮号失败。
+#[test]
+fn acts_buttons_route_clicks_with_their_turn() {
+    const ASSISTANT_TURN: i32 = 1;
+    let rows = vec![
+        row("role", "怹"),
+        selectable_p("一条短的助手回答。"),
+        acts_row(ASSISTANT_TURN),
+    ];
+    let (ui, win, _) = setup(rows, TALL_H);
+    let hits: Rc<RefCell<Vec<(String, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let h = hits.clone();
+        ui.on_copy_turn(move |t| h.borrow_mut().push(("copy".into(), t)));
+    }
+    {
+        let h = hits.clone();
+        ui.on_regen_turn(move |t| h.borrow_mut().push(("regen".into(), t)));
+    }
+    {
+        let h = hits.clone();
+        ui.on_speak_turn(move |t| h.borrow_mut().push(("speak".into(), t)));
+    }
+
+    let f = settle(&ui, &win, TALL_H);
+    let fy = ui.get_dbg_flick_y().round() as u32;
+    let fh = ui.get_dbg_flick_h().round() as u32;
+    // 动作行是内容最底部 ⇒ 整窗最底一行的墨迹就是第一个按钮的下边框。
+    let y_border = f
+        .lowest_ink_row(fy, fy + fh, 4, W - 4)
+        .expect("正面控制失败：看不到动作行");
+    let cols = groups(&f.ink_cols(y_border, 4, W - 4));
+    let (bx0, bx1) = cols.first().copied().expect("下边框行应有墨迹列");
+    assert!(
+        bx1 - bx0 > 20,
+        "判据构造失败：第一个按钮的下边框应有一条横向墨迹（量到 {}px）",
+        bx1 - bx0
+    );
+    press_release(&win, ((bx0 + bx1) / 2) as f32, (y_border - 4) as f32);
+
+    let got = hits.borrow().clone();
+    assert_eq!(
+        got,
+        vec![("copy".to_string(), ASSISTANT_TURN)],
+        "第一个按钮（⧉ 复制）必须把本行轮号带出来"
+    );
+}
 /// 卡 d9 回归守卫：表情面板 /「更多」菜单**能真的渲染出来**，且锚点
 /// （`composer.absolute-position`）不会触发绑定环 / 运行时 panic。
 ///
@@ -936,6 +1180,27 @@ fn dump_frames_for_review() {
     ui.set_pending_more_text("+1".into());
     let f = settle_w(&win, 520, SHORT_H);
     write_png(&f, &dir.join("attachments.png"));
+
+    // 卡 `abb-v11-message-actions`：助手轮动作行（`⧉ 复制 / ⟳ 重新生成 / 🔊 朗读`）
+    // 与朗读态（该行按钮变 `⏹ 停止朗读`）。用**生产口径的行构成**（助手轮正文 + 动作行）。
+    let (ui, win, _m) = setup(
+        vec![
+            row("role", "你"),
+            selectable_p("帮我把导出脚本改成按天分片。"),
+            row("role", "怹"),
+            selectable_p("改好了：按日期切分文件名，并在失败时留一份日志。"),
+            row("code", "for d in $(seq 1 7); do\n  echo \"$d\"\ndone"),
+            acts_row(-1),
+        ],
+        SHORT_H,
+    );
+    ui.window().set_size(slint::PhysicalSize::new(520, SHORT_H));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, SHORT_H);
+    write_png(&f, &dir.join("acts-idle.png"));
+    ui.set_speaking_turn(-1);
+    let f = settle_w(&win, 520, SHORT_H);
+    write_png(&f, &dir.join("acts-speaking.png"));
 }
 
 /// 预乘 RGBA → 直通 RGBA8 并补白底（窗口本身透明：`rgb + (255 - a)` 等价于铺白）。

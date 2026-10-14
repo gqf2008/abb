@@ -2753,6 +2753,226 @@ fn handle_platform_window_event(
     }
 }
 
+// ── 对话消息 → 渲染行的**纯构成层**（卡 `abb-v11-message-actions` 起提到模块级）─────────
+//
+// 为什么在模块级而不是 `run_gui()` 里：这一层只做「数据 → 行」的映射，不碰任何窗口/模型，
+// 却是**策略**所在（哪一轮末尾挂动作行、哪个块走可选中渲染）。策略必须能单测，
+// 内嵌在八千行的 `run_gui()` 里就只能靠肉眼评审。
+//
+// 模块级口径：入参全是值，出的行由调用方灌进 model。
+// 一段消息 → 渲染行：角色行 + 若干内容块（B 批：完整 markdown）。
+fn role_row(label: &str) -> SysChatBlockRow {
+    SysChatBlockRow {
+        kind: "role".into(),
+        text: label.into(),
+        styled: slint::StyledText::default(),
+        level: 0,
+        order: 0,
+        checked: false,
+        marker: "".into(),
+        lang: "".into(),
+        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            Vec::<slint::SharedString>::new(),
+        ))),
+        header: false,
+        src: "".into(),
+        alt: "".into(),
+        img: slint::Image::default(),
+        img_ok: false,
+        think_expanded: false,
+        think_live: false,
+        think_elapsed: "".into(),
+        selectable: false,
+        plain: "".into(),
+        turn: -1,
+    }
+}
+/// 加载块图片：本地路径直读；http(s) 读本地缓存（未缓存则先空，由后台下载后重载）。
+/// 本地路径统一按 **syschat 工作区**基准解析（[`crate::syschat::resolve_media_path`]）。
+fn load_block_image(src: &str) -> (slint::Image, bool) {
+    if src.is_empty() {
+        return (slint::Image::default(), false);
+    }
+    let path: Option<std::path::PathBuf> =
+        if src.starts_with("http://") || src.starts_with("https://") {
+            crate::syschat::media_cache_path(src)
+        } else {
+            // 不能用进程 CWD：agent 输出的相对路径是相对它的工作区（= syschat 工作区）
+            let p = crate::syschat::resolve_media_path(src);
+            p.is_file().then_some(p)
+        };
+    match path.and_then(|p| slint::Image::load_from_path(&p).ok()) {
+        Some(img) => (img, true),
+        None => (slint::Image::default(), false),
+    }
+}
+/// 加载待发附件缩略图（本地文件）。失败回落 `thumb-ok=false`（UI 显示字形，不空白）。
+fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
+    match slint::Image::load_from_path(path) {
+        Ok(img) => (img, true),
+        Err(_) => (slint::Image::default(), false),
+    }
+}
+fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
+    let (img, img_ok) = load_block_image(&b.src);
+    // 卡 `abb-v11-message-actions`：**无行内样式**的块其 `StyledText` 与纯文本逐字等价
+    // ⇒ 换成只读 `TextInput` 后观感不变，白得「可拖选 + ⌘C」。判定与「展示文本」都收敛在
+    // `mdblocks::selectable_plain`（`None` = 这块不参与替换：结构化/媒体块、或有行内样式
+    // ⇒ 继续走原渲染分支；`code` 的原文不被转义，那里单独处理）。
+    let plain = crate::mdblocks::selectable_plain(&b.kind, &b.text);
+    let selectable = plain.is_some();
+    let plain = plain.unwrap_or_default();
+    // 列表标记在 Rust 侧算好（Slint 里 int→string 拼接不可靠）
+    let marker: String = match b.kind.as_str() {
+        "task" => {
+            if b.checked {
+                "☑".to_string()
+            } else {
+                "☐".to_string()
+            }
+        }
+        "list" if b.order > 0 => format!("{}. ", b.order),
+        "list" => "•".to_string(),
+        _ => String::new(),
+    };
+    SysChatBlockRow {
+        kind: b.kind.into(),
+        // styled 必须在 text 之前算（text 会 move b.text）
+        styled: crate::mdblocks::styled(&b.text),
+        text: b.text.into(),
+        level: b.level,
+        order: b.order,
+        checked: b.checked,
+        marker: marker.into(),
+        lang: b.lang.into(),
+        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            b.cells
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        ))),
+        header: b.header,
+        src: b.src.into(),
+        alt: b.alt.into(),
+        img,
+        img_ok,
+        think_expanded: false,
+        think_live: false,
+        think_elapsed: "".into(),
+        selectable,
+        plain: plain.into(),
+        turn: -1,
+    }
+}
+/// 助手轮动作行（卡 `abb-v11-message-actions`，稿 v11.1 `.acts`）。
+///
+/// 只放**序号**，正文与提示词由点击时按序号解析（[`crate::syschat::action_target`]）：
+/// Slint 侧不必搬整段正文，历史也只在一处被解读。`turn < 0` = 刚跑完的那条（历史下标未知）。
+fn acts_row(turn: i32) -> SysChatBlockRow {
+    SysChatBlockRow {
+        kind: "acts".into(),
+        text: "".into(),
+        styled: slint::StyledText::default(),
+        level: 0,
+        order: 0,
+        checked: false,
+        marker: "".into(),
+        lang: "".into(),
+        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            Vec::<slint::SharedString>::new(),
+        ))),
+        header: false,
+        src: "".into(),
+        alt: "".into(),
+        img: slint::Image::default(),
+        img_ok: false,
+        think_expanded: false,
+        think_live: false,
+        think_elapsed: "".into(),
+        selectable: false,
+        plain: "".into(),
+        turn,
+    }
+}
+/// 思考块行（E2）：内容放 `text`，展开态/进行态/耗时放专用字段；
+/// 默认**折叠**（`expanded=false`）；`live` = 思考仍在进行（流式展开让打字机可见，
+/// 一旦进入正文或收尾就自动收起）。
+fn think_row(text: &str, elapsed: &str, expanded: bool, live: bool) -> SysChatBlockRow {
+    SysChatBlockRow {
+        kind: "think".into(),
+        text: text.into(),
+        styled: slint::StyledText::default(),
+        level: 0,
+        order: 0,
+        checked: false,
+        marker: "".into(),
+        lang: "".into(),
+        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            Vec::<slint::SharedString>::new(),
+        ))),
+        header: false,
+        src: "".into(),
+        alt: "".into(),
+        img: slint::Image::default(),
+        img_ok: false,
+        think_expanded: expanded,
+        think_live: live,
+        think_elapsed: elapsed.into(),
+        // 思考文本是**纯文本**（不是 markdown）⇒ 恒可选中，且无样式可言。
+        selectable: true,
+        plain: text.into(),
+        turn: -1,
+    }
+}
+fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
+    let label = if role == "assistant" { "怹" } else { "你" };
+    let mut rows = vec![role_row(label)];
+    for b in crate::mdblocks::parse(text) {
+        rows.push(block_row(b));
+    }
+    rows
+}
+/// 一轮历史 → 渲染行：角色行 +（有思考则）思考块 + 正文 markdown 块 +
+///（助手轮）末尾的动作行（卡 `abb-v11-message-actions`）。
+///
+/// `index` 是这一轮在**本会话历史里的下标**——动作行只带序号，点击时再按序号解析
+/// 正文/提示词（见 [`acts_row`] 的注释）。
+fn rows_for_turn(t: &crate::syschat::Turn, index: usize) -> Vec<SysChatBlockRow> {
+    let mut rows = rows_for(&t.role, &t.text);
+    if !t.thought.is_empty() {
+        // 历史里的思考块**默认折叠**（需求 #11），耗时历史未存 ⇒ 不显示数字。
+        rows.insert(1, think_row(&t.thought, "", false, false));
+    }
+    if t.role == "assistant" {
+        rows.push(acts_row(index as i32));
+    }
+    rows
+}
+/// 流式状态的当前快照 → 渲染行：角色行 +（有思考则）思考块 + 正文块。
+/// `expanded` 由 `live` 决定（进行中展开以显示打字机，结束/进正文即收起）。
+/// `finished` = 本回合已收尾（`Reply`/`Stopped`）⇒ 末尾挂动作行（`turn = -1`：刚跑完那条）。
+/// 流式**进行中**不挂动作行（此轮历史还没落盘，按序号也解析不到）。
+fn stream_rows(
+    revealed_text: &str,
+    has_thought: bool,
+    thought_text: &str,
+    elapsed: &str,
+    live: bool,
+    finished: bool,
+) -> Vec<SysChatBlockRow> {
+    let mut rows = vec![role_row("怹")];
+    if has_thought {
+        rows.push(think_row(thought_text, elapsed, live, live));
+    }
+    for b in crate::mdblocks::parse(revealed_text) {
+        rows.push(block_row(b));
+    }
+    if finished && (!revealed_text.is_empty() || has_thought) {
+        rows.push(acts_row(-1));
+    }
+    rows
+}
+
 pub fn run_gui() -> Result<()> {
     configure_backend()?;
 
@@ -2978,158 +3198,6 @@ pub fn run_gui() -> Result<()> {
     let syschat_model: Rc<slint::VecModel<SysChatBlockRow>> = Rc::new(slint::VecModel::default());
     syschat_win.set_blocks(slint::ModelRc::from(syschat_model.clone()));
 
-    // 一段消息 → 渲染行：角色行 + 若干内容块（B 批：完整 markdown）。
-    fn role_row(label: &str) -> SysChatBlockRow {
-        SysChatBlockRow {
-            kind: "role".into(),
-            text: label.into(),
-            styled: slint::StyledText::default(),
-            level: 0,
-            order: 0,
-            checked: false,
-            marker: "".into(),
-            lang: "".into(),
-            cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-                Vec::<slint::SharedString>::new(),
-            ))),
-            header: false,
-            src: "".into(),
-            alt: "".into(),
-            img: slint::Image::default(),
-            img_ok: false,
-            think_expanded: false,
-            think_live: false,
-            think_elapsed: "".into(),
-        }
-    }
-    /// 加载块图片：本地路径直读；http(s) 读本地缓存（未缓存则先空，由后台下载后重载）。
-    /// 本地路径统一按 **syschat 工作区**基准解析（[`crate::syschat::resolve_media_path`]）。
-    fn load_block_image(src: &str) -> (slint::Image, bool) {
-        if src.is_empty() {
-            return (slint::Image::default(), false);
-        }
-        let path: Option<std::path::PathBuf> =
-            if src.starts_with("http://") || src.starts_with("https://") {
-                crate::syschat::media_cache_path(src)
-            } else {
-                // 不能用进程 CWD：agent 输出的相对路径是相对它的工作区（= syschat 工作区）
-                let p = crate::syschat::resolve_media_path(src);
-                p.is_file().then_some(p)
-            };
-        match path.and_then(|p| slint::Image::load_from_path(&p).ok()) {
-            Some(img) => (img, true),
-            None => (slint::Image::default(), false),
-        }
-    }
-    /// 加载待发附件缩略图（本地文件）。失败回落 `thumb-ok=false`（UI 显示字形，不空白）。
-    fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
-        match slint::Image::load_from_path(path) {
-            Ok(img) => (img, true),
-            Err(_) => (slint::Image::default(), false),
-        }
-    }
-    fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
-        let (img, img_ok) = load_block_image(&b.src);
-        // 列表标记在 Rust 侧算好（Slint 里 int→string 拼接不可靠）
-        let marker: String = match b.kind.as_str() {
-            "task" => {
-                if b.checked {
-                    "☑".to_string()
-                } else {
-                    "☐".to_string()
-                }
-            }
-            "list" if b.order > 0 => format!("{}. ", b.order),
-            "list" => "•".to_string(),
-            _ => String::new(),
-        };
-        SysChatBlockRow {
-            kind: b.kind.into(),
-            // styled 必须在 text 之前算（text 会 move b.text）
-            styled: crate::mdblocks::styled(&b.text),
-            text: b.text.into(),
-            level: b.level,
-            order: b.order,
-            checked: b.checked,
-            marker: marker.into(),
-            lang: b.lang.into(),
-            cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-                b.cells
-                    .into_iter()
-                    .map(slint::SharedString::from)
-                    .collect::<Vec<_>>(),
-            ))),
-            header: b.header,
-            src: b.src.into(),
-            alt: b.alt.into(),
-            img,
-            img_ok,
-            think_expanded: false,
-            think_live: false,
-            think_elapsed: "".into(),
-        }
-    }
-    /// 思考块行（E2）：内容放 `text`，展开态/进行态/耗时放专用字段；
-    /// 默认**折叠**（`expanded=false`）；`live` = 思考仍在进行（流式展开让打字机可见，
-    /// 一旦进入正文或收尾就自动收起）。
-    fn think_row(text: &str, elapsed: &str, expanded: bool, live: bool) -> SysChatBlockRow {
-        SysChatBlockRow {
-            kind: "think".into(),
-            text: text.into(),
-            styled: slint::StyledText::default(),
-            level: 0,
-            order: 0,
-            checked: false,
-            marker: "".into(),
-            lang: "".into(),
-            cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-                Vec::<slint::SharedString>::new(),
-            ))),
-            header: false,
-            src: "".into(),
-            alt: "".into(),
-            img: slint::Image::default(),
-            img_ok: false,
-            think_expanded: expanded,
-            think_live: live,
-            think_elapsed: elapsed.into(),
-        }
-    }
-    fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
-        let label = if role == "assistant" { "怹" } else { "你" };
-        let mut rows = vec![role_row(label)];
-        for b in crate::mdblocks::parse(text) {
-            rows.push(block_row(b));
-        }
-        rows
-    }
-    /// 一轮历史 → 渲染行：角色行 +（有思考则）思考块 + 正文 markdown 块。
-    fn rows_for_turn(t: &crate::syschat::Turn) -> Vec<SysChatBlockRow> {
-        let mut rows = rows_for(&t.role, &t.text);
-        if !t.thought.is_empty() {
-            // 历史里的思考块**默认折叠**（需求 #11），耗时历史未存 ⇒ 不显示数字。
-            rows.insert(1, think_row(&t.thought, "", false, false));
-        }
-        rows
-    }
-    /// 流式状态的当前快照 → 渲染行：角色行 +（有思考则）思考块 + 正文块。
-    /// `expanded` 由 `live` 决定（进行中展开以显示打字机，结束/进正文即收起）。
-    fn stream_rows(
-        revealed_text: &str,
-        has_thought: bool,
-        thought_text: &str,
-        elapsed: &str,
-        live: bool,
-    ) -> Vec<SysChatBlockRow> {
-        let mut rows = vec![role_row("怹")];
-        if has_thought {
-            rows.push(think_row(thought_text, elapsed, live, live));
-        }
-        for b in crate::mdblocks::parse(revealed_text) {
-            rows.push(block_row(b));
-        }
-        rows
-    }
     /// 用当前累积文本重建「流式气泡」的行：从 `start` 起到末尾全替换。
     ///
     /// 为什么整段重建：增量改行需要知道 markdown 分块边界，而 `mdblocks::parse`
@@ -3169,8 +3237,8 @@ pub fn run_gui() -> Result<()> {
     fn load_syschat_into(win: &SystemChatWindow, model: &slint::VecModel<SysChatBlockRow>) {
         let turns = crate::syschat::load_history();
         let mut rows: Vec<SysChatBlockRow> = Vec::new();
-        for t in &turns {
-            rows.extend(rows_for_turn(t));
+        for (i, t) in turns.iter().enumerate() {
+            rows.extend(rows_for_turn(t, i));
         }
         model.set_vec(rows);
         // 请求滞底：递增 epoch，由 .slint 的 changed 处理器把 content-y 设成越界值、
@@ -7354,6 +7422,115 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // 助手轮动作行（卡 `abb-v11-message-actions`，稿 v11.1 `.acts`）：⧉ 复制 / ⟳ 重新生成 / 🔊 朗读。
+    //
+    // 三者的目标都只带**序号**（`turn`），点击时才读历史解析（`syschat::action_target`）：
+    // Slint 侧不搬整段正文；`turn < 0` = 「刚跑完那条」，解析成当前会话最后一条助手轮。
+    // 失败一律**可见**（状态行置红），不静默吞掉。
+    // 「正在朗读」的提示语：对账（见 2s 定时器）要用它判断状态行是否还停在这一句上。
+    const SPEAKING_HINT: &str = "正在朗读（再点一次可停止）。";
+    let sc_speaker: Rc<RefCell<crate::platform::Speaker>> =
+        Rc::new(RefCell::new(crate::platform::Speaker::new()));
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_copy_turn(move |turn| {
+            let Some(w) = cw.upgrade() else { return };
+            match crate::syschat::action_target(&crate::syschat::load_history(), turn) {
+                None => {
+                    w.set_status_is_error(true);
+                    w.set_status_line("复制失败：找不到这一轮（历史可能已变）。".into());
+                }
+                Some(t) => {
+                    if crate::platform::copy_to_clipboard(&t.text) {
+                        w.set_status_is_error(false);
+                        w.set_status_line(
+                            format!("已复制这一轮（{} 字）。", t.text.chars().count()).into(),
+                        );
+                    } else {
+                        w.set_status_is_error(true);
+                        w.set_status_line("复制失败：没能写入系统剪贴板。".into());
+                    }
+                }
+            }
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        // 重新生成**复用唯一提交入口** `submit_sc`（同上屏/落点判定/状态行与手动发送完全一致），
+        // 避免两条发送路径漂移。语义：把该轮用过的**用户提问**再发一次（追加在会话末尾）。
+        let submit = submit_sc.clone();
+        syschat_win.on_regen_turn(move |turn| {
+            let Some(w) = cw.upgrade() else { return };
+            match crate::syschat::action_target(&crate::syschat::load_history(), turn) {
+                None => {
+                    w.set_status_is_error(true);
+                    w.set_status_line("重新生成失败：找不到这一轮（历史可能已变）。".into());
+                }
+                Some(t) => match t.prompt {
+                    None => {
+                        w.set_status_is_error(true);
+                        w.set_status_line("重新生成失败：这一轮之前没有用户消息。".into());
+                    }
+                    Some(prompt) => {
+                        w.set_status_is_error(false);
+                        w.set_status_line("重新生成中：把这一轮的提问再发一次。".into());
+                        submit(prompt);
+                    }
+                },
+            }
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        let speaker = sc_speaker.clone();
+        syschat_win.on_speak_turn(move |turn| {
+            let Some(w) = cw.upgrade() else { return };
+            // 再点同一条 = 停止（按钮文案由 `speak-turn` 决定，见 ui/app.slint 的 `.acts`）。
+            if w.get_speaking_turn() == turn {
+                let stopped = speaker.borrow_mut().stop();
+                w.set_speaking_turn(-2);
+                w.set_status_is_error(false);
+                w.set_status_line(if stopped {
+                    "已停止朗读。".into()
+                } else {
+                    "朗读已结束。".into()
+                });
+                return;
+            }
+            // 换一条 = 先停旧的，再起新的（同一时刻只允许一段朗读）。
+            speaker.borrow_mut().stop();
+            match crate::syschat::action_target(&crate::syschat::load_history(), turn) {
+                None => {
+                    w.set_speaking_turn(-2);
+                    w.set_status_is_error(true);
+                    w.set_status_line("朗读失败：找不到这一轮（历史可能已变）。".into());
+                }
+                Some(t) if t.text.trim().is_empty() => {
+                    w.set_speaking_turn(-2);
+                    w.set_status_is_error(true);
+                    w.set_status_line("朗读失败：这一轮没有正文。".into());
+                }
+                Some(t) => {
+                    if speaker.borrow_mut().speak(&t.text) {
+                        w.set_speaking_turn(turn);
+                        w.set_status_is_error(false);
+                        w.set_status_line(SPEAKING_HINT.into());
+                    } else {
+                        w.set_speaking_turn(-2);
+                        w.set_status_is_error(true);
+                        w.set_status_line(
+                            if cfg!(target_os = "macos") {
+                                "朗读失败：没能启动系统 say。"
+                            } else {
+                                "朗读不可用：本平台没有内置朗读命令（当前仅 macOS 支持）。"
+                            }
+                            .into(),
+                        );
+                    }
+                }
+            }
+        });
+    }
     // 清空历史（对话框按钮）。
     {
         let cw = syschat_win.as_weak();
@@ -7592,8 +7769,12 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         let sw = settings.as_weak();
         let bw_close = bubble.as_weak();
+        let sp_close = sc_speaker.clone();
         syschat_win.on_close_window(move || {
+            // 关窗即停朗读：否则窗口没了、声音还在放（而且再也点不到「停止」）。
+            sp_close.borrow_mut().stop();
             if let Some(w) = cw.upgrade() {
+                w.set_speaking_turn(-2);
                 hide_syschat(&w, &bw_close, &sw);
             }
         });
@@ -7880,7 +8061,8 @@ pub fn run_gui() -> Result<()> {
                             )
                         };
                         let thought = tw_think.borrow().shown().to_string();
-                        let rows = stream_rows(&final_text, has_thought, &thought, &elapsed, false);
+                        let rows =
+                            stream_rows(&final_text, has_thought, &thought, &elapsed, false, true);
                         if s0 != usize::MAX {
                             sync_stream_rows(&syschat_model_t, s0, rows);
                         } else if !stopped && (!final_text.is_empty() || has_thought) {
@@ -7942,7 +8124,7 @@ pub fn run_gui() -> Result<()> {
                     };
                     let thought = tw_think.borrow().shown().to_string();
                     let text = tw_text.borrow().shown().to_string();
-                    let rows = stream_rows(&text, has_thought, &thought, &elapsed, live);
+                    let rows = stream_rows(&text, has_thought, &thought, &elapsed, live, false);
                     sync_stream_rows(&syschat_model_t, stream_start.get(), rows);
                     if let Some(w) = win_w.upgrade() {
                         w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
@@ -7990,6 +8172,10 @@ pub fn run_gui() -> Result<()> {
         // `submit_sc` 入口（上屏 + 落点判定 + 状态行）；发出失败由 submit_sc 自身的状态行可见。
         let sched_t = sc_sched.clone();
         let submit_t = submit_sc.clone();
+        // 卡 `abb-v11-message-actions`：`say` 播完会自己退出 ⇒ 每拍对一次账，把按钮位从
+        // 「⏹ 停止朗读」复位成「🔊 朗读」（不靠用户再点一次才恢复）。
+        let speaker_t = sc_speaker.clone();
+        let syschat_weak_tts = syschat_win.as_weak();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -8001,6 +8187,18 @@ pub fn run_gui() -> Result<()> {
                     for m in sched_t.take_due(crate::schedule::DateTime::now()) {
                         crate::log!("[syschat] 定时发送触发：{}（{} 字）", m.at, m.text.chars().count());
                         submit_t(m.text);
+                    }
+                    // 朗读结束对账（见上面 `speaker_t` 注释）。
+                    if let Some(w) = syschat_weak_tts.upgrade() {
+                        if w.get_speaking_turn() != -2 && !speaker_t.borrow_mut().is_speaking() {
+                            w.set_speaking_turn(-2);
+                            // 只在状态行还停在那句「正在朗读」时收尾：朗读期间用户可能已经
+                            // 干了别的事（发送/复制…），那之后的状态提示**不该**被这一拍盖掉。
+                            if w.get_status_line() == SPEAKING_HINT {
+                                w.set_status_is_error(false);
+                                w.set_status_line("朗读结束。".into());
+                            }
+                        }
                     }
                     // P8c：启动/停止/重启服务失败 → 弹一次可见提示（与未读提醒同一套 toast + 5s 收起）
                     let pending_toast = svc_toast.lock().ok().and_then(|mut s| s.take());
@@ -9668,5 +9866,83 @@ mod tests {
         let (n, p) = vb_edit_apply_fetched(&mut s, "", "desc", None);
         assert_eq!(n, None);
         assert_eq!(p.as_deref(), Some("desc"));
+    }
+
+    // ── 卡 `abb-v11-message-actions`：消息行的**构成策略**（动作行挂在哪一轮/哪一刻）──
+
+    fn t(role: &str, text: &str) -> crate::syschat::Turn {
+        crate::syschat::Turn {
+            role: role.into(),
+            text: text.into(),
+            thought: String::new(),
+            ts: 0,
+        }
+    }
+
+    /// 动作行只挂在**助手轮**末尾，带**本轮的历史下标**，且必在正文之下。
+    ///
+    /// 判别力（负向）：去掉 `t.role == "assistant"` 判断 ⇒ 用户轮也挂（点「复制」会解析不到
+    /// 这一轮、只留一句报错）⇒ 红；把 `index as i32` 写成常量 `-1` ⇒ 红。
+    #[test]
+    fn rows_for_turn_appends_acts_only_to_assistant_turns_with_its_index() {
+        let user = t("user", "问题");
+        assert!(
+            rows_for_turn(&user, 0).iter().all(|r| r.kind != "acts"),
+            "用户轮不该有动作行（复制/重跑的对象是助手轮）"
+        );
+
+        let asst = t("assistant", "回答");
+        let rows = rows_for_turn(&asst, 3);
+        let acts: Vec<&SysChatBlockRow> = rows.iter().filter(|r| r.kind == "acts").collect();
+        assert_eq!(acts.len(), 1, "助手轮末尾应恰好一条动作行");
+        assert_eq!(acts[0].turn, 3, "动作行必须带**本轮**的历史下标");
+        assert_eq!(
+            rows.last().map(|r| r.kind.as_str()),
+            Some("acts"),
+            "动作行必须在正文之下（最后一行）"
+        );
+
+        // 有思考块时动作行仍必须在最后（思考块插在正文之前）。
+        let mut with_thought = t("assistant", "回答");
+        with_thought.thought = "先想了想".into();
+        let rows = rows_for_turn(&with_thought, 7);
+        assert_eq!(rows[1].kind, "think", "思考块插在角色行之后");
+        assert_eq!(rows.last().map(|r| r.kind.as_str()), Some("acts"));
+        assert_eq!(rows.last().map(|r| r.turn), Some(7));
+    }
+
+    /// 动作行只在流式回合**收尾后**出现，且用 `-1`（= 最后一条助手轮）：
+    /// 进行中不挂——这一轮还没落历史，按序号解析只会报「找不到这一轮」。
+    ///
+    /// 判别力（负向）：把 `finished &&` 去掉 ⇒ 打字过程中就冒出动作行 ⇒ 红；
+    /// 把空回合的 `!revealed_text.is_empty() || has_thought` 去掉 ⇒ 无内容的回合也挂 ⇒ 红。
+    #[test]
+    fn stream_rows_appends_acts_only_when_finished_with_content() {
+        let live = stream_rows("正文", false, "", "", true, false);
+        assert!(
+            live.iter().all(|r| r.kind != "acts"),
+            "流式进行中不该挂动作行（历史尚未落盘）"
+        );
+
+        let done = stream_rows("正文", false, "", "", false, true);
+        assert_eq!(done.last().map(|r| r.kind.as_str()), Some("acts"));
+        assert_eq!(
+            done.last().map(|r| r.turn),
+            Some(-1),
+            "收尾轮用 -1（解析成最后一条助手轮），因为渲染时还不知道历史下标"
+        );
+
+        let empty = stream_rows("", false, "", "", false, true);
+        assert!(
+            empty.iter().all(|r| r.kind != "acts"),
+            "空回合（无正文也无思考）不该挂动作行：会指向一条不存在的答复"
+        );
+
+        let thought_only = stream_rows("", true, "想了下", "", false, true);
+        assert_eq!(
+            thought_only.last().map(|r| r.kind.as_str()),
+            Some("acts"),
+            "只有思考、没有正文的回合仍是真实的助手轮 ⇒ 该挂"
+        );
     }
 }

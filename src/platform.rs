@@ -43,6 +43,78 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// 朗读器（卡 `abb-v11-message-actions` 的 `🔊 朗读`）：持有**朗读子进程**以便停止。
+///
+/// 平台口径：**只有 macOS** 用系统 `say`（零依赖、无需联网）。其它平台 `speak()` 直接返回
+/// `false`，由调用方给**可见提示**（不静默假装成功，也不假装「已朗读」）。
+///
+/// 为什么自己持子进程而不是 fire-and-forget：需求要求「能停止」——`say` 是前台阻塞进程，
+/// 杀它就是唯一可靠的停止方式；`SpeechSynthesis` 之类自绘 TTS 不在本期范围。
+#[derive(Default)]
+pub struct Speaker {
+    child: Option<std::process::Child>,
+}
+
+impl Speaker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 开始朗读（先把上一段停掉）。返回 `false` = 本平台没有可用朗读命令（或起进程失败）。
+    pub fn speak(&mut self, text: &str) -> bool {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        self.spawn_with("say", text)
+    }
+
+    /// 起朗读子进程的共用实现。抽出来是为了让**单测注入真命令**（如 `/bin/sleep 5`）验证
+    /// 「起得来 / 停得掉」，而**不会真的出声**（CI 与开发机上都不该有声音）。
+    pub(crate) fn spawn_with(&mut self, program: &str, arg: &str) -> bool {
+        self.stop();
+        match std::process::Command::new(program)
+            .arg(arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => {
+                self.child = Some(c);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// 停止当前朗读。`true` = 确实杀掉了一个在跑的子进程（调用方可据此区分「本来就没事」）。
+    pub fn stop(&mut self) -> bool {
+        match self.child.take() {
+            Some(mut c) => {
+                let _ = c.kill();
+                let _ = c.wait(); // 回收，避免僵尸
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 还在朗读吗？顺带回收**已自行退出**的子进程（`say` 播完就退）。
+    pub fn is_speaking(&mut self) -> bool {
+        if let Some(c) = self.child.as_mut() {
+            match c.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    self.child = None;
+                    false
+                }
+                Ok(None) => true,
+            }
+        } else {
+            false
+        }
+    }
+}
+
 /// 复制文本到系统剪贴板（授权码等）。pbcopy / clip / wl-copy+xclip 尽力而为；失败返回 false。
 /// 命令失败（如无头环境无 xclip）只回 false 不 panic，调用方给用户提示。
 /// 注意：写完 stdin 必须关闭（drop）让子进程读到 EOF 才结束，否则 wait() 会死锁。
@@ -3082,5 +3154,53 @@ mod ensure_tray_guard_tests {
         );
         assert!(s.contains("--service"), "判活必须排除 --service");
         assert!(s.contains("自愈拉起"), "未在跑必须拉起并留痕");
+    }
+}
+
+#[cfg(test)]
+mod tts_speaker_tests {
+    use super::*;
+
+    /// 卡 `abb-v11-message-actions`：朗读子进程「起得来、停得掉、播完能自愈」。
+    /// 用 `/bin/sleep` 当替身命令 ⇒ **不真出声**（单测里不该有声音），但走的是同一条
+    /// spawn/try_wait/kill 路径。
+    #[cfg(unix)]
+    #[test]
+    fn speaker_spawns_stops_and_reaps_finished_child() {
+        let mut sp = Speaker::new();
+        assert!(!sp.is_speaking(), "新建的朗读器不该在朗读");
+        assert!(sp.spawn_with("/bin/sleep", "5"), "应能起 /bin/sleep 5");
+        assert!(sp.is_speaking(), "起了子进程就该报在朗读");
+        assert!(sp.stop(), "停一次应确实杀掉子进程");
+        assert!(!sp.stop(), "已停过再停应返回 false（区分「本来就没事」）");
+        assert!(!sp.is_speaking(), "停完不该再在朗读");
+
+        // 播完自己退出 ⇒ is_speaking 顺带回收到 false（不残留僵尸）
+        assert!(sp.spawn_with("/bin/sleep", "0"));
+        for _ in 0..200 {
+            if !sp.is_speaking() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!sp.is_speaking(), "子进程自行退出后应被回收为「不在朗读」");
+    }
+
+    /// 起不来的命令要返回 false（调用方据此给可见提示），而不是 panic。
+    #[cfg(unix)]
+    #[test]
+    fn speaker_reports_failure_for_missing_program() {
+        let mut sp = Speaker::new();
+        assert!(!sp.spawn_with("/nonexistent-abb-tts-probe", "x"));
+        assert!(!sp.is_speaking());
+    }
+
+    /// 非 macOS 平台必须**如实**说不支持（`speak()` 不静默假装成功）。
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn speaker_is_unsupported_off_macos() {
+        let mut sp = Speaker::new();
+        assert!(!sp.speak("不该出声"));
+        assert!(!sp.is_speaking());
     }
 }

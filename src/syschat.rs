@@ -68,6 +68,46 @@ pub struct Turn {
     pub ts: i64,
 }
 
+/// 「重新生成」/「复制」/「朗读」的目标轮解析结果（卡 `abb-v11-message-actions`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionTarget {
+    /// 该助手轮在历史里的下标。
+    pub index: usize,
+    /// 该轮**正文**（`⧉ 复制` 与 `🔊 朗读` 的内容；不含思考）。
+    pub text: String,
+    /// `⟳ 重新生成` 要重跑的**用户提示词**：该轮之前最近的一条用户轮。
+    /// 该轮之前没有用户轮（异常历史）⇒ `None`，调用方给可见提示而不是发空消息。
+    pub prompt: Option<String>,
+}
+
+/// 解析助手轮动作行的目标（纯函数，单测钉住）。
+///
+/// `turn < 0` = 当前会话**最后一条助手轮**（刚跑完那条：渲染它时还不知道历史下标）。
+/// `turn >= 0` = 历史下标，且**必须真的是助手轮**——指到用户轮/越界一律 `None`
+///（宁可报「找不到这一轮」也不猜）。
+pub fn action_target(turns: &[Turn], turn: i32) -> Option<ActionTarget> {
+    let index = if turn < 0 {
+        turns.iter().rposition(|t| t.role == "assistant")?
+    } else {
+        let i = usize::try_from(turn).ok()?;
+        if turns.get(i)?.role != "assistant" {
+            return None;
+        }
+        i
+    };
+    let text = turns[index].text.clone();
+    let prompt = turns[..index]
+        .iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.text.clone());
+    Some(ActionTarget {
+        index,
+        text,
+        prompt,
+    })
+}
+
 /// 系统级对话的数据目录：`~/.agent-bridge/syschat/`。
 pub fn dir() -> PathBuf {
     crate::bridge_dir().join("syschat")
@@ -5756,5 +5796,61 @@ mod tests {
         assert!(st.is_maximized(almost, work), "±1px 内应算同一个");
         let off = WinRect::new(0.0, 25.0, 1430.0, 875.0);
         assert!(!st.is_maximized(off, work), "差 10px 不算");
+    }
+    /// 卡 `abb-v11-message-actions`：动作行的目标解析。
+    fn t(role: &str, text: &str) -> Turn {
+        Turn {
+            role: role.into(),
+            text: text.into(),
+            thought: String::new(),
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn action_target_resolves_last_assistant_turn_and_its_prompt() {
+        let h = vec![
+            t("user", "你好"),
+            t("assistant", "你好呀"),
+            t("user", "说个笑话"),
+            t("assistant", "笑话 X"),
+        ];
+        // -1 = 最后一条助手轮
+        let a = action_target(&h, -1).expect("应解析到最后一条助手轮");
+        assert_eq!(a.index, 3);
+        assert_eq!(a.text, "笑话 X");
+        assert_eq!(
+            a.prompt.as_deref(),
+            Some("说个笑话"),
+            "提示词取该轮之前最近的用户轮"
+        );
+        // 显式下标
+        let b = action_target(&h, 1).expect("应解析到下标 1");
+        assert_eq!(b.index, 1);
+        assert_eq!(b.text, "你好呀");
+        assert_eq!(
+            b.prompt.as_deref(),
+            Some("你好"),
+            "跨过中间轮只取最近的一条用户轮"
+        );
+    }
+
+    #[test]
+    fn action_target_rejects_user_turn_out_of_range_and_empty_history() {
+        let h = vec![t("user", "只有用户轮")];
+        assert!(action_target(&h, 0).is_none(), "指到用户轮必须拒绝（不猜）");
+        assert!(action_target(&h, 7).is_none(), "越界必须拒绝");
+        assert!(action_target(&h, -1).is_none(), "没有助手轮时 -1 必须拒绝");
+        assert!(action_target(&[], -1).is_none(), "空历史必须拒绝");
+        assert!(action_target(&[], 0).is_none(), "空历史 + 下标必须拒绝");
+    }
+
+    #[test]
+    fn action_target_without_preceding_user_turn_has_no_prompt() {
+        let h = vec![t("assistant", "凭空一句")];
+        let a = action_target(&h, -1).expect("助手轮本身应可解析");
+        assert_eq!(a.index, 0);
+        assert_eq!(a.text, "凭空一句");
+        assert!(a.prompt.is_none(), "前面没有用户轮 ⇒ 没有可重跑的提示词");
     }
 }

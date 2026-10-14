@@ -109,6 +109,76 @@ pub fn styled(text: &str) -> slint::StyledText {
         .unwrap_or_else(|_| slint::StyledText::from_plain_text(text))
 }
 
+/// 该块的行内文本里**是否真有行内样式标记**（粗体/斜体/行内码/链接/原义 HTML）。
+///
+/// `push_escaped` 保证块内行内文本里**字面量元字符都已转义**（`\\` / `` \` `` / `\*` …），
+/// 所以「出现**未被转义**的元字符」精确等价于「这段文本真有 markdown 行内样式」。
+/// **只对「行内 markdown」形态的文本成立**（见 [`selectable_plain`]）；`code` 的正文不转义，
+/// 拿它判样式会把 `ls *.rs` 误判成有样式。
+fn has_inline_markup(escaped: &str) -> bool {
+    let mut it = escaped.chars();
+    while let Some(c) = it.next() {
+        // 转义序列：整对跳过（`\*` 是字面星号，不是样式）
+        if c == '\\' {
+            let _ = it.next();
+            continue;
+        }
+        if matches!(c, '`' | '*' | '_' | '[' | ']' | '<' | '>') {
+            return true;
+        }
+    }
+    false
+}
+
+/// 无行内样式块的**展示文本**（`push_escaped` 的逆运算：去掉转义用的反斜杠）。
+///
+/// **仅**对「行内 markdown」形态的文本成立——有样式时反斜杠里混着 markdown 标记的转义，
+/// 直接反解会留下标记字符；对 `code` 的原文反解会吃掉代码里的反斜杠。调用点由
+/// [`selectable_plain`] 前置条件保证。
+fn plain(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let mut it = escaped.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            if let Some(n) = it.next() {
+                out.push(n);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 该块的正文能否**换成只读 `TextInput` 渲染**（卡 `abb-v11-message-actions`；Slint 1.18
+/// 的 `read-only` 仍可拖选并 ⌘C），返回可选的**展示文本**。
+///
+/// `None` = 保持原渲染分支。两条分支各有各的理由：
+/// - `table`/`hr`/`image`/`audio`/`video` 是**结构化/媒体**块（多元素拼装或卡片），
+///   换成单个 `TextInput` 只会把结构弄坏；GUI 自有的 `role`/`acts`/`think` 同理不由这里管。
+/// - 有行内样式的块（`**粗体**`/`` `码` ``/链接）`TextInput` 渲染不了 ⇒ 继续走 `StyledText`，
+///   不做视觉回退（B 批的行内样式是已交付能力）。
+///
+/// 文本形态有**两种**，混淆会真出错，故收敛在此处一处判定：
+/// - **行内 markdown**（`h1`/`h2`/`h3`/`p`/`list`/`task`/`quote`）：字面量元字符已被
+///   `push_escaped` 转义 ⇒「有未转义元字符」精确等价于「真有样式」；展示文本 = 反解转义。
+/// - **原样文本**（`code`）：代码原文**不**转义 ⇒ 恒无行内样式，展示文本就是原文。
+///   这是复制/朗读最要紧的一类块（`ls *.rs`、`C:\Users\x`），既不能按元字符判样式，
+///   也不能反解转义。
+pub fn selectable_plain(kind: &str, text: &str) -> Option<String> {
+    match kind {
+        "code" => Some(text.to_string()),
+        "h1" | "h2" | "h3" | "p" | "list" | "task" | "quote" => {
+            if has_inline_markup(text) {
+                None
+            } else {
+                Some(plain(text))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 反解转义（媒体 alt/src 展示用）。
 fn unescape(s: &str) -> String {
     s.replace("\\*", "*")
@@ -926,5 +996,113 @@ mod tests {
             "单元格应保留 HTML 文本：{:?}",
             rows[1].cells
         );
+    }
+    /// 卡 `abb-v11-message-actions`：只读 `TextInput` 只对**无行内样式**的块做替换，
+    /// 判据必须精确——否则要么白丢样式（回退 B 批），要么白丢可选中能力。
+    #[test]
+    fn has_inline_markup_distinguishes_literal_metachars_from_real_styles() {
+        // 纯文本：无标记
+        assert!(!has_inline_markup("普通中文文本，含标点。"));
+        // 字面量元字符（`push_escaped` 已转义）⇒ 不是样式
+        assert!(!has_inline_markup(r"价格是 3 \* 4 元"));
+        assert!(!has_inline_markup(r"下划线 a\_b 与反引号 \`x\`"));
+        assert!(!has_inline_markup(r"尖括号 \<b\> 与方括号 \[x\]"));
+        // 结尾一个转义的反斜杠：转义对消费掉后半，不应越界 panic
+        assert!(!has_inline_markup(r"路径 C:\\"));
+        // 真行内样式：未被转义的元字符
+        assert!(has_inline_markup("这是 **粗体** 字"));
+        assert!(has_inline_markup("行内码 `x = 1`"));
+        assert!(has_inline_markup("_斜体_"));
+        assert!(has_inline_markup("[链接](https://example.com)"));
+        assert!(has_inline_markup("原义 <b>html</b>"));
+        // 边界：转义的反斜杠 + 真星号 ⇒ 星号是**样式**（不是字面量）
+        assert!(has_inline_markup(r"反斜杠 \\* 之后是斜体起点"));
+    }
+
+    /// `plain` 是 `push_escaped` 的逆运算（仅对无样式文本用）。
+    #[test]
+    fn plain_unescapes_literal_metachars_and_roundtrips_through_parse() {
+        assert_eq!(plain(r"价格是 3 \* 4 元"), "价格是 3 * 4 元");
+        assert_eq!(plain(r"路径 C:\\Users\\x"), r"路径 C:\Users\x");
+        assert_eq!(plain("普通文本"), "普通文本");
+        // 端到端往返：parse 把行内文本转义 ⇒ plain 解回来必须逐字等于原文
+        // 只含**不构成 markdown 语法**的孤立元字符（孤立 `*` / 词内 `_` / 无链接的方括号）
+        let src = "价格是 3 * 4 元；下划线 a_b；方括号 [x]";
+        let b = parse(src);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].kind, "p");
+        assert!(
+            !has_inline_markup(&b[0].text),
+            "纯文本段落的行内文本不应含未转义元字符（否则会白丢可选中）：{:?}",
+            b[0].text
+        );
+        assert_eq!(plain(&b[0].text), src, "反解必须逐字回到原文");
+    }
+
+    /// 有样式的段落必须被判成「有样式」（GUI 继续走 StyledText，不做视觉回退）。
+    #[test]
+    fn parse_marks_styled_paragraph_as_having_inline_markup() {
+        let b = parse("这是 **粗体** 与 [链接](https://example.com)。");
+        assert_eq!(b.len(), 1);
+        assert!(
+            has_inline_markup(&b[0].text),
+            "含粗体/链接的段落必须判为有行内样式：{:?}",
+            b[0].text
+        );
+    }
+
+    /// 卡 `abb-v11-message-actions`：`code` 的正文是**代码原文**（解析时不转义），
+    /// 所以它既不能被元字符判样式（`ls *.rs` 会被误判），也不能被反解（`C:\Users` 会掉反斜杠）。
+    /// 这是「复制代码」这个最要紧的场景，必须是绿的。
+    #[test]
+    fn selectable_plain_keeps_code_verbatim() {
+        // 逐字保留：星号、反斜杠、反引号、尖括号、方括号都不动
+        for src in [
+            "ls *.rs | grep _tmp",
+            r"C:\Users\x\a.txt",
+            "printf '%s\\n' \"a\"",
+            "echo `<b>[x]</b>`",
+        ] {
+            assert_eq!(
+                selectable_plain("code", src).as_deref(),
+                Some(src),
+                "代码原文必须逐字保留（不判样式、不反解）：{src:?}"
+            );
+        }
+        // 端到端：围栏代码块走一遍 `parse`，块内文本仍是原文
+        let md = "```sh\nls *.rs | grep _tmp\n```";
+        let b = parse(md);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].kind, "code");
+        assert_eq!(b[0].text, "ls *.rs | grep _tmp", "代码块正文不该被转义");
+        assert_eq!(
+            selectable_plain(&b[0].kind, &b[0].text).as_deref(),
+            Some("ls *.rs | grep _tmp")
+        );
+    }
+
+    /// 结构化/媒体块**不能**换成单个只读 `TextInput`（会把结构弄坏）⇒ 恒 `None`；
+    /// 无样式的行内文本块恒 `Some`；有样式恒 `None`。三档都在一张表里钉住。
+    #[test]
+    fn selectable_plain_gates_by_kind_and_inline_style() {
+        assert_eq!(selectable_plain("table", "a"), None);
+        assert_eq!(selectable_plain("hr", ""), None);
+        assert_eq!(selectable_plain("image", "a.png"), None);
+        assert_eq!(selectable_plain("audio", "a.mp3"), None);
+        assert_eq!(selectable_plain("video", "a.mp4"), None);
+        // GUI 自有 kind（`parse` 不会产出）也一律不接管
+        assert_eq!(selectable_plain("role", "你"), None);
+        assert_eq!(selectable_plain("acts", ""), None);
+        assert_eq!(selectable_plain("think", "想了一下"), None);
+        // 无样式 ⇒ 可选中，且展示文本已反解
+        assert_eq!(
+            selectable_plain("p", r"价格 3 \* 4").as_deref(),
+            Some("价格 3 * 4")
+        );
+        assert_eq!(selectable_plain("quote", "引用").as_deref(), Some("引用"));
+        assert_eq!(selectable_plain("list", "项").as_deref(), Some("项"));
+        // 有样式 ⇒ 保持 StyledText
+        assert_eq!(selectable_plain("p", "这是 **粗体**"), None);
+        assert_eq!(selectable_plain("h2", "看 `code`"), None);
     }
 }
