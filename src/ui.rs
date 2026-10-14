@@ -723,12 +723,14 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
     let btn_bottom = (crate::syschat::TB_BTN_Y + crate::syschat::TB_BTN_H) as i32;
     let panel_w = crate::syschat::MENU_PANEL_W as i32;
     if let Some((bx, bw)) = crate::syschat::titlebar_session_btn(&plan) {
-        let (mx, my) = crate::syschat::menu_anchor(bx as i32, bw as i32, btn_bottom, panel_w, w as i32);
+        let (mx, my) =
+            crate::syschat::menu_anchor(bx as i32, bw as i32, btn_bottom, panel_w, w as i32);
         win.set_session_menu_x(mx as f32);
         win.set_session_menu_y(my as f32);
     }
     if let Some((bx, bw)) = crate::syschat::titlebar_model_btn(&plan) {
-        let (mx, my) = crate::syschat::menu_anchor(bx as i32, bw as i32, btn_bottom, panel_w, w as i32);
+        let (mx, my) =
+            crate::syschat::menu_anchor(bx as i32, bw as i32, btn_bottom, panel_w, w as i32);
         win.set_model_menu_x(mx as f32);
         win.set_model_menu_y(my as f32);
     }
@@ -742,7 +744,9 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
 fn refresh_syschat_usage(win: &SystemChatWindow) {
     let (used, limit) = crate::syschat::context_usage();
     win.set_usage_text(crate::syschat::context_usage_text(used, limit).into());
-    win.set_usage_tip("本会话上下文占用（数据来源待 E3 卡：上游不上报 usage，不显示估算值）".into());
+    win.set_usage_tip(
+        "本会话上下文占用（数据来源待 E3 卡：上游不上报 usage，不显示估算值）".into(),
+    );
     let (fill, level) = match (used, limit) {
         (Some(u), Some(l)) if l > 0 => {
             let pct = crate::syschat::usage_percent(u, l);
@@ -947,7 +951,11 @@ struct FollowState {
 
 impl FollowState {
     /// 取工作区：缓存仍命中就沿用，否则用 `resolve` 重算并刷新缓存。
-    fn work_area(&mut self, dialog_rect: Rect, resolve: impl FnOnce() -> Option<Rect>) -> Option<Rect> {
+    fn work_area(
+        &mut self,
+        dialog_rect: Rect,
+        resolve: impl FnOnce() -> Option<Rect>,
+    ) -> Option<Rect> {
         if let Some((cached, _)) = self.work {
             if work_area_cache_hit(cached, dialog_rect) {
                 return Some(cached);
@@ -1037,10 +1045,11 @@ impl FollowPump {
         let Some(target) = bubble_follow_target(dialog_rect, bubble_rect, work) else {
             return false;
         };
-        h.bubble.set_outer_position(slint::winit_030::winit::dpi::LogicalPosition::new(
-            target.0 as f32,
-            target.1 as f32,
-        ));
+        h.bubble
+            .set_outer_position(slint::winit_030::winit::dpi::LogicalPosition::new(
+                target.0 as f32,
+                target.1 as f32,
+            ));
         true
     }
 
@@ -2683,7 +2692,8 @@ pub fn run_gui() -> Result<()> {
             .position(|(n, _, _)| *n == effective)
             .map(|i| i as i32);
         win.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(labels))));
-        let mlabels: Vec<slint::SharedString> = ms.iter().map(|(_, l, _)| l.clone().into()).collect();
+        let mlabels: Vec<slint::SharedString> =
+            ms.iter().map(|(_, l, _)| l.clone().into()).collect();
         win.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             mlabels,
         ))));
@@ -6836,7 +6846,9 @@ pub fn run_gui() -> Result<()> {
         syschat_win.on_session_archive(move || {
             if let Some(w) = cw.upgrade() {
                 w.set_status_is_error(false);
-                w.set_status_line("「归档」尚未实现（归档本体见卡 abb-v11-session-archive）。".into());
+                w.set_status_line(
+                    "「归档」尚未实现（归档本体见卡 abb-v11-session-archive）。".into(),
+                );
             }
         });
     }
@@ -8367,7 +8379,9 @@ mod tests {
         // 跟随只挂在对话窗的几何事件上（唯一事件源），并交给跟随泵（它内部再按
         // 「句柄就绪走句柄版 / 否则退回 Slint 版」分派，A 卡）。
         assert!(
-            prod.contains("handle_syschat_geometry_event(ev, &follow_pump_ev, &follow_bubble, &cw2)"),
+            prod.contains(
+                "handle_syschat_geometry_event(ev, &follow_pump_ev, &follow_bubble, &cw2)"
+            ),
             "对话窗 Moved/Resized 必须跟随气泡"
         );
         // A（卡 `abb-v11-bubble-follow-lag`）：macOS 拖动期间 winit 不交事件，必须有一条

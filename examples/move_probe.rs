@@ -214,7 +214,9 @@ mod real {
                 .with_visible(true)
                 .with_inner_size(PhysicalSize::new(64, 48))
                 .with_position(PhysicalPosition::new(40, 40));
-            self.dialog = Some(Arc::new(event_loop.create_window(attrs.clone()).expect("dialog")));
+            self.dialog = Some(Arc::new(
+                event_loop.create_window(attrs.clone()).expect("dialog"),
+            ));
             self.bubble = Some(Arc::new(
                 event_loop
                     .create_window(attrs.with_position(PhysicalPosition::new(400, 40)))

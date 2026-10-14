@@ -1220,7 +1220,13 @@ pub fn context_usage() -> (Option<u64>, Option<u64>) {
 ///
 /// 注：标题栏按钮在**窗口顶部**，面板只能向下展开（向上会跑出窗）；
 /// 「贴按钮上方」那条口径只适用于输入框上方的 `.pop`（另一张卡）。
-pub fn menu_anchor(btn_x: i32, btn_w: i32, btn_bottom: i32, panel_w: i32, win_w: i32) -> (i32, i32) {
+pub fn menu_anchor(
+    btn_x: i32,
+    btn_w: i32,
+    btn_bottom: i32,
+    panel_w: i32,
+    win_w: i32,
+) -> (i32, i32) {
     let max_x = win_w - panel_w - 6;
     let mut x = btn_x + btn_w - panel_w;
     if x > max_x {
@@ -4191,7 +4197,11 @@ mod tests {
     fn session_tag_writes_current_today_yesterday_and_old_date() {
         // 2026-10-18 12:00 本地（UTC+8）（= 2026-10-18 04:00 UTC）
         let now = 1_792_296_000u64;
-        assert_eq!(session_tag(now as i64, now, true), "当前", "当前会话不写时间");
+        assert_eq!(
+            session_tag(now as i64, now, true),
+            "当前",
+            "当前会话不写时间"
+        );
         // 本地 09:10 → 今天 09:10
         assert_eq!(session_tag(1_792_285_800, now, false), "今天 09:10");
         // 本地前一天 23:12 → 昨天 23:12

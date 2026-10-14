@@ -1379,11 +1379,18 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     let myy = ui.get_model_menu_y();
     // 会话钮在 520 宽下已靠窗右侧（右缘 252）⇒ 右对齐会把面板推出窗（x=2 < 6），
     // 于是被夹到 6px 起（稿 `.menu` 的「靠边内移」；纯函数用例覆盖未夹取的右对齐）。
-    assert_eq!(sx, (bx + bw - 250.0).max(6.0), "会话面板应右对齐（靠窗边则夹到 6px）");
+    assert_eq!(
+        sx,
+        (bx + bw - 250.0).max(6.0),
+        "会话面板应右对齐（靠窗边则夹到 6px）"
+    );
     assert_eq!(mxx + 250.0, mbx + mbw, "模型面板右缘应与模型 chip 右缘对齐");
     assert_eq!(sy, 38.0, "面板顶边 = 钮下缘(6+26) + 6");
     assert_eq!(myy, 38.0, "两个面板同一行锚定");
-    assert!(sx >= 6.0 && sx + 250.0 <= W520 as f32 - 6.0, "面板不许出窗：x={sx}");
+    assert!(
+        sx >= 6.0 && sx + 250.0 <= W520 as f32 - 6.0,
+        "面板不许出窗：x={sx}"
+    );
 
     // ② 会话面板：展开后量真实几何（自报值 + 像素上的 accent 行交叉校验）。
     ui.set_session_menu_open(true);
@@ -1393,15 +1400,31 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     assert!((150.0..400.0).contains(&h), "面板高度不合理：{h}");
     // 当前行（index=1）在像素上是 accent 底：面板内容盒宽 250−4=246、行高 30、
     // 位置 = 锚点 y + padding 2 + 标题 28 + 第 1 行 30。
-    let acc = bbox(&f, 0, 40, 300, 300, is_accent).expect("当前会话项没有 accent 底（稿 .item.on）");
-    assert_eq!(acc.0, sx as u32 + 2, "accent 行左缘应贴内容盒（面板描边内侧 2px）");
+    let acc =
+        bbox(&f, 0, 40, 300, 300, is_accent).expect("当前会话项没有 accent 底（稿 .item.on）");
+    assert_eq!(
+        acc.0,
+        sx as u32 + 2,
+        "accent 行左缘应贴内容盒（面板描边内侧 2px）"
+    );
     assert_eq!(acc.2 - acc.0 + 1, 246, "accent 行宽 = 面板宽 − 左右描边");
-    assert_eq!(acc.1, sy as u32 + 60, "accent 行 y = 锚点 + padding2 + 标题28 + 1 行30");
+    assert_eq!(
+        acc.1,
+        sy as u32 + 60,
+        "accent 行 y = 锚点 + padding2 + 标题28 + 1 行30"
+    );
     assert_eq!(acc.3 - acc.1 + 1, 30, "行高 30px");
     // footer 文案（第 3 行 + 归档行之后再有一段墨迹）——防止「面板把 footer 切掉」。
     assert!(
-        bbox(&f, sx as u32, sy as u32 + 150, sx as u32 + 250, sy as u32 + h.ceil() as u32, is_dark)
-            .is_some(),
+        bbox(
+            &f,
+            sx as u32,
+            sy as u32 + 150,
+            sx as u32 + 250,
+            sy as u32 + h.ceil() as u32,
+            is_dark
+        )
+        .is_some(),
         "面板下半部没有 footer 墨迹（footer 缺失或被切）"
     );
     // 行数变少 ⇒ 面板变矮（高度真的跟内容走，不是写死的）。
@@ -1427,11 +1450,22 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     let macc = bbox(&f2, 0, 40, 520, 300, is_accent).expect("当前模型项没有 accent 底");
     assert_eq!(macc.0, mxx as u32 + 2, "模型面板 accent 行左缘");
     assert_eq!(macc.2 - macc.0 + 1, 246, "模型面板 accent 行宽");
-    assert_eq!(macc.1, myy as u32 + 30, "模型面板 accent 行 = 锚点 + padding2 + 标题28（第 1 行）");
+    assert_eq!(
+        macc.1,
+        myy as u32 + 30,
+        "模型面板 accent 行 = 锚点 + padding2 + 标题28（第 1 行）"
+    );
     // 当前模型行**不再有右侧 provider**（右侧留给 ✓）——✓ 是墨色，故该行右侧应有墨迹。
     assert!(
-        bbox(&f2, mxx as u32 + 200, myy as u32 + 30, mxx as u32 + 248, myy as u32 + 60, is_dark)
-            .is_some(),
+        bbox(
+            &f2,
+            mxx as u32 + 200,
+            myy as u32 + 30,
+            mxx as u32 + 248,
+            myy as u32 + 60,
+            is_dark
+        )
+        .is_some(),
         "当前项右侧没有 ✓（或右侧 tag 未清空）"
     );
 
@@ -1440,7 +1474,11 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     let _ = settle_w(&win, W520, H);
     assert_eq!(ui.get_dbg_usage_meter_w(), 56.0, "进度条宽 = 稿的 56px");
     assert_eq!(ui.get_dbg_usage_meter_h(), 9.0, "进度条高 = 稿的 9px");
-    assert_eq!(ui.get_dbg_usage_fill_w(), 0.0, "无数据源时内条为 0（不伪造）");
+    assert_eq!(
+        ui.get_dbg_usage_fill_w(),
+        0.0,
+        "无数据源时内条为 0（不伪造）"
+    );
     assert_eq!(ui.get_usage_text(), "上下文 —/— · —");
     assert_eq!(ui.get_usage_level(), 0);
     // 第二行「模型 · 状态」仍在（稿 `.status .st2 .l2`）。
@@ -1454,12 +1492,16 @@ fn v11_menu_panels_open_and_close_on_outside_or_second_click() {
     const W520: u32 = 520;
     let (ui, win, _m) = setup(vec![row("p", "占位")], SHORT_H);
     seed_panels(&ui);
-    ui.window().set_size(slint::PhysicalSize::new(W520, SHORT_H));
+    ui.window()
+        .set_size(slint::PhysicalSize::new(W520, SHORT_H));
     apply_syschat_layout(&ui, W520 as f32);
     let _ = settle_w(&win, W520, SHORT_H);
     let plan = crate::syschat::titlebar_plan(W520 as f32, true);
     let (bx, bw) = crate::syschat::titlebar_session_btn(&plan).expect("会话钮");
-    let (sx, sy) = (bx + bw / 2.0, crate::syschat::TB_BTN_Y + crate::syschat::TB_BTN_H / 2.0);
+    let (sx, sy) = (
+        bx + bw / 2.0,
+        crate::syschat::TB_BTN_Y + crate::syschat::TB_BTN_H / 2.0,
+    );
     let (mbx, mbw) = crate::syschat::titlebar_model_btn(&plan).expect("模型 chip");
     let (mx, my) = (mbx + mbw / 2.0, sy);
 
@@ -1467,7 +1509,10 @@ fn v11_menu_panels_open_and_close_on_outside_or_second_click() {
     press_release(&win, sx, sy);
     assert!(ui.get_session_menu_open(), "点 🗂 应展开会话面板");
     press_release(&win, sx, sy);
-    assert!(!ui.get_session_menu_open(), "再点 🗂 应收起面板（不是只重开）");
+    assert!(
+        !ui.get_session_menu_open(),
+        "再点 🗂 应收起面板（不是只重开）"
+    );
     press_release(&win, sx, sy);
     assert!(ui.get_session_menu_open(), "第三次点应再次展开");
     press_release(&win, 300.0, 400.0);
