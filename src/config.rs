@@ -886,8 +886,11 @@ impl JevConfig {
 ///
 /// - `schedule`（`once`/`cron`/`interval`）默认 **2**：定时任务到点即执行，不再因为同档
 ///   另一条长任务而排队（同一条任务**不会**自我重叠——认领是单锁 check-and-set）。
-/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）默认 **1**：这两类都是长任务且由人类或
-///   模型主动发起，保持串行更可控。
+/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）默认 **4**：手动档里的 `keepalive` 是
+///   **常驻**进程，认领它的 worker 会一直 `await` 到进程退出（`run_one` 的 keepalive 分支），
+///   所以「默认 1」等于「有一个常驻 keepalive 时，所有 `now` 子代理永远排不上」——这是默认
+///   配置下的实缺陷，不是一个保守但安全的取舍（2026-10-15 由 1 放宽到 4：容得下常驻的
+///   标称占用，再留几条并行 `now`）。
 /// - 0 按 1 兜底（写 0 不会把通道关掉）。
 /// - 调大的代价：同 bot 同时跑的真模型回合变多（token 成本随并发上升），且并发任务在
 ///   未显式指定 `workspace` 时**共用同一个 bot 工作区**（旧 job 循环时代就承认的风险）。
@@ -940,7 +943,7 @@ fn default_task_workers_schedule() -> usize {
 }
 
 fn default_task_workers_manual() -> usize {
-    1
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1968,7 +1971,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual 1，0 按 1 兜底，
+    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual 4，0 按 1 兜底，
     /// 且老的 config.json（缺字段 / 只给一半）都能正常解析。
     #[test]
     fn task_workers_defaults_floor_and_partial_json() {
@@ -1978,10 +1981,14 @@ mod tests {
             2,
             "定时档默认并行 2：到点即执行，不再被同档长任务排队"
         );
+        // 手动档默认 2026-10-15 由 1 放宽到 4。判据不是「想要更多并发」，而是 1 在默认配置
+        // 下就**错**：keepalive 是常驻进程，认领它的 worker 会一直 await 到进程退出
+        // （`run_one` 的 keepalive 分支），手动档 ≤1 就等于「有一个常驻 keepalive 时，所有
+        // now 子代理永远排不上」。4 = 容得下常驻的标称占用再留几条并行 now。
         assert_eq!(
             d.for_channel(crate::task_run::Channel::Manual),
-            1,
-            "手动档（now/keepalive）默认串行"
+            4,
+            "手动档（now/keepalive）默认 4 条（2026-10-15 由 1 放宽）"
         );
 
         let zero = TaskWorkers {
@@ -2036,7 +2043,8 @@ mod tests {
         assert_eq!(
             cfg.task_workers
                 .for_channel(crate::task_run::Channel::Manual),
-            1
+            4,
+            "空 JSON（老 config.json）也走新默认"
         );
 
         // 只给一半 → 另一半走默认（serde 字段级 default）

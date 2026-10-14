@@ -126,7 +126,7 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
 - 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
   用户可以继续聊别的。
-- **同一通道默认并行 N 条**（`config.json#task_workers`，默认 `{{\"schedule\":2,\"manual\":1}}`，0 按 1 兜底）：
+- **同一通道默认并行 N 条**（`config.json#task_workers`，默认 `{{\"schedule\":2,\"manual\":4}}`，0 按 1 兜底）：
   定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`）各有自己的队列，跨通道互不阻塞；
   **同一条任务永远不会自我重叠**（认领是单锁 check-and-set，跑到一半不会被再拉起）。
   并发额度有限：一次丢十条仍只会按该档的 worker 数排队，超出就排队——它不是不限量的池子。
@@ -1096,7 +1096,7 @@ mod tests {
     /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺。
     /// 2026-09-26 两批修订后的真实口径：每个 bot 两条通道（定时档 once/cron/interval、
     /// 手动档 now/keepalive），**同通道默认并行 N 条**（`task_workers`，默认 schedule 2 /
-    /// manual 1）、跨通道互不阻塞、**同一条任务永远不自我重叠**；并发额度有限，不得写成
+    /// manual 4）、跨通道互不阻塞、**同一条任务永远不自我重叠**；并发额度有限，不得写成
     /// 「无限并发」。`--proc` 虽写入 CLI 帮助，但须明确标注 agent 侧拒绝。
     #[test]
     fn workspace_guide_does_not_overpromise_task_semantics() {
