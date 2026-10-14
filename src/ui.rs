@@ -476,18 +476,24 @@ fn bring_app_to_front() {
 /// 量尺寸）：
 ///   - `with_transparent(true)` 的无边框 winit 窗：拖边角**不缩**（0/2 次）；
 ///   - 只差「不透明」的同参数窗：**能缩**（2/2 次）；
-///   - 两者 `is_resizable` 都读到 `true`（macOS `styleMask` 都含 `NSWindowStyleMask::Resizable`）。
+///   - 两者的 `is_resizable` 都读到 `true`（macOS `styleMask` 都含 `NSWindowStyleMask::Resizable`）
+///     ⇒ 该属性**恒为真、与能否拖边角无关**。这份 A/B 的结果**未落盘**，本会话也没复现（复现要解锁屏）。
 ///
-/// 所以「`is_resizable=true` ⇒ 能拖边角」是错的，**透明**才是决定项。ABB 两个窗口都是 Slint
-/// `no-frame` ⇒ winit 后端一律 `with_transparent(true)`（圆角靠它，见 `wants_transparent`）
-/// ⇒ 「交给系统缩放」在本仓**根本不存在**（ecc627d→7b8eea5 走的正是这条死路，透明窗上系统
-/// 从来没给过边角缩放，也就谈不上「被热区抢掉」）。
+/// 所以**透明**才是决定项，`is_resizable` 不是判据。ABB 两个窗口都是 Slint `no-frame` ⇒
+/// winit 后端一律 `with_transparent(true)`（圆角靠它，见 `wants_transparent`）⇒ 「交给系统缩放」
+/// 在本仓**根本不存在**：ecc627d→7b8eea5 走的正是这条死路——透明无边框窗上系统从来没给过边角
+/// 缩放，所以「画热区会不会顶掉系统缩放」这个担心本身不成立。
 ///
 /// 结论：对话窗恒画热区，并在 macOS 让它走**自管缩放**（[`syschat_resize_self_managed`] +
-/// [`SelfResize`]）——这是当前**唯一**能拖动的实现。合成拖拽实测能**打开自管会话**：
-/// `[selfresize] begin dir=east`（`ret=true`，即窗口已 realize、会话真开起来）之后跟着数百次
-/// `cursor_moved`，走的就是 `set_size` 那条分支；但**像素级复验**（真机手拖之后窗口真的变大）
-/// 仍未做——它是 owner 未确认项，见 `docs/syschat-handover.md` §5.1。
+/// [`SelfResize`]）——这是当前**唯一**能拖动的实现。当前 head 的自查口日志点只有一个：
+/// `[selfresize] begin dir={dir} at ({x},{y})`（`:8126`，即热区按下、会话真开起来）。
+/// 「合成拖拽能开出会话」的**历史**记录在 `/private/tmp/verify-0245.log`（11 行，唯一一条
+/// `begin dir=north-east`）与 `verify-0120.log`（334 行、323 条 `cursor_moved`）——**两者产自
+/// 中间构建**（当时的探针会打 `ret=`/`cursor_moved`，当前 head 没有这两个日志点）⇒ 不可按当前
+/// head 复算。**像素级复验**（真机手拖之后窗口真的变大）与「锁屏期合成拖拽」都仍未做，后者
+/// 06:27 实测过：窗口 `(475,124,520,560)` + `swift /private/tmp/drag_once.swift 992 127 -140`
+/// ⇒ 日志里 `begin`/`cursor_moved` **各 0 条**（锁屏期事件打不进 app）。属 owner 未确认项，
+/// 见 `docs/syschat-handover.md` §5.1。
 fn syschat_resize_hit_areas_enabled() -> bool {
     true
 }
@@ -550,12 +556,14 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     // 那既是无效时机、也没有必要：
     //   1. `show()` **不同步建原生窗**。`set_visible` 发现 `winit_window()` 还是 `None` 时，只把
     //      `visible` 存进 window attributes、把窗口登记为 inactive window；真正建窗要等事件循环
-    //      转到能建它的那一轮。所以「show 之后立刻 `with_winit_window`」一律拿到 `None`
-    //      （自查口实测：`t=400ms` 仍是 `None`，`t=800ms` 才 `Some`）。
+    //      转到能建它的那一轮。所以「show 之后立刻 `with_winit_window`」一律拿到 `None`；
+    //      自查口实测（`/private/tmp/verify-80dca07*.log`，两次）：`pre-show` 恒 `None`，
+    //      `t=400ms` 一档**不稳定**（一次 `None`、一次已 `Some`——别把它当定论），`t=800ms` 起恒 `Some`。
     //   2. Slint 建窗时自己就把 `resizable` 定好了：`window_is_resizable(min, max)` = `min != max`
-    //      （`i-slint-backend-winit` 的 `set_constraints`）。本仓所有窗口都没写 `max-*` ⇒ 恒可缩放；
-    //      自查口实测要显示的窗口 `is_resizable=true is_decorated=false`
-    //      （macOS styleMask = Borderless|Resizable|Miniaturizable）⇒ 系统边角缩放可用。
+    //      （`i-slint-backend-winit` 的 `set_constraints`）。本仓所有窗口都没写 `max-*` ⇒ 这个属性
+    //      恒为真（自查口实测要显示的窗口 `is_resizable=true is_decorated=false`，macOS styleMask =
+    //      Borderless|Resizable|Miniaturizable）。⚠️ 它**只说明属性为真、与窗口能否拖边角无关**
+    //      （决定项是透明度，见 [`syschat_resize_hit_areas_enabled`] 与交接文档 §5.1）。
     // 历史上这里曾按「自查口读到 `is_resizable=false`」的结论补过 `set_resizable(true)`：那个
     // `false` 是 `with_winit_window(..).unwrap_or((false, false))` 在**未 realize** 时顶的默认值，
     // 不是窗口属性（见 `verify_probe_syschat` 显式区分 `Some/None`）。
