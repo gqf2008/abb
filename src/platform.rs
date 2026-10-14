@@ -185,6 +185,141 @@ pub fn app_is_active() -> bool {
     true
 }
 
+/// macOS：窗口所在显示器的**可见工作区**（`NSScreen.visibleFrame`）——即扣掉菜单栏与 Dock 之后
+/// 真正可以铺满的那块（逻辑像素；坐标口径与 winit 一致：左上为原点、y 向下、相对主显示器）。
+///
+/// 为什么必须走 AppKit（卡 `abb-v11-resize-maximize-macos`）：Slint/winit 只提供显示器的**整幅**
+/// 边界（`MonitorHandle::position/size`，见 `ui.rs::monitor_work_area`）——拿它当「最大化目标」
+/// 会让窗口顶边压到菜单栏底下、底边被 Dock 盖住。
+///
+/// 取不到（窗口还没 realize / 非 AppKit 句柄 / 无屏幕）⇒ `None`，调用方自己回落到整幅显示器。
+/// 须在主线程调（AppKit 非线程安全）。
+///
+/// 只提供 macOS 实现（否则就是一段从未被调用的死代码）：唯一调用方 `ui::toggle_syschat_maximize`
+/// 本身就是 macOS 专有的（`set_maximized` 在无边框窗上不可靠，见该处注释）。
+#[cfg(target_os = "macos")]
+pub fn visible_work_area(
+    win: &slint::winit_030::winit::window::Window,
+) -> Option<(f32, f32, f32, f32)> {
+    #![allow(non_snake_case)]
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+
+    /// AppKit/CG 的 `NSRect`（= `CGRect`）：64 位上四个字段都是 `f64`。
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NsRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> Id;
+        fn sel_registerName(name: *const std::ffi::c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    // 返回**结构体**的消息在 x86_64 上由 `objc_msgSend_stret` 走隐藏返回缓冲；arm64 没有这条
+    // 变体（AAPCS 直接在寄存器里返回）。签名不同 ⇒ 必须按架构选符号，不能图省事都用 objc_msgSend
+    //（x86_64 上会把接收者当返回缓冲，直接崩）。
+    #[cfg(target_arch = "x86_64")]
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend_stret"]
+        fn objc_msgSend_stret();
+    }
+
+    /// 发一条返回 `NSRect` 的消息。
+    ///
+    /// SAFETY: 调用方保证 `receiver` 非空、`sel` 是 `receiver` 真的会响应的取矩形选择器。
+    unsafe fn rect_msg(receiver: Id, sel: Sel) -> NsRect {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let f: unsafe extern "C" fn(*mut NsRect, Id, Sel) -> *mut NsRect =
+                std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+            let mut out = NsRect::default();
+            f(&mut out, receiver, sel);
+            out
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let f: unsafe extern "C" fn(Id, Sel) -> NsRect =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            f(receiver, sel)
+        }
+    }
+
+    /// 选择器表：`window`/`screen`/`mainScreen`/`visibleFrame`/`screens`/`firstObject`/`frame`。
+    /// 存 `usize` 而不是指针（裸指针不是 `Send + Sync`，进不了 `OnceLock`）。
+    static SELS: OnceLock<[usize; 7]> = OnceLock::new();
+
+    let sels: [Sel; 7] = SELS
+        .get_or_init(|| unsafe {
+            [
+                sel_registerName(c"window".as_ptr()) as usize,
+                sel_registerName(c"screen".as_ptr()) as usize,
+                sel_registerName(c"mainScreen".as_ptr()) as usize,
+                sel_registerName(c"visibleFrame".as_ptr()) as usize,
+                sel_registerName(c"screens".as_ptr()) as usize,
+                sel_registerName(c"firstObject".as_ptr()) as usize,
+                sel_registerName(c"frame".as_ptr()) as usize,
+            ]
+        })
+        .map(|s| s as Sel);
+
+    let handle = win.window_handle().ok()?;
+    let ns_view = match handle.as_raw() {
+        RawWindowHandle::AppKit(h) => h.ns_view.as_ptr(),
+        _ => return None,
+    };
+    if ns_view.is_null() {
+        return None;
+    }
+    // SAFETY: 全部是 AppKit 的只读取属性消息；接收者取自 winit 的实时句柄（主线程）。
+    unsafe {
+        let msg_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let ns_window = msg_id(ns_view, sels[0]); // [view window]
+        if ns_window.is_null() {
+            return None;
+        }
+        // 优先用**窗口所在**屏幕（多显示器）；窗口还没上屏时回落到 mainScreen。
+        let mut screen = msg_id(ns_window, sels[1]);
+        if screen.is_null() {
+            screen = msg_id(objc_getClass(c"NSScreen".as_ptr()), sels[2]);
+        }
+        if screen.is_null() {
+            return None;
+        }
+        let visible = rect_msg(screen, sels[3]); // visibleFrame：y 向上、原点在主屏左下
+                                                 // 主屏（菜单栏所在那块 = `screens[0]`）的高度：winit 的 y 从**主屏顶边**向下数，
+                                                 // 换算必须用它——这也是 winit 自己 `flip_window_screen_coordinates` 的口径
+                                                 //（那里取 `CGDisplay::main()`，与 `screens[0]` 同一块屏）。
+        let screens = msg_id(objc_getClass(c"NSScreen".as_ptr()), sels[4]);
+        if screens.is_null() {
+            return None;
+        }
+        let first = msg_id(screens, sels[5]);
+        if first.is_null() {
+            return None;
+        }
+        let main = rect_msg(first, sels[6]);
+        if visible.w <= 0.0 || visible.h <= 0.0 || main.h <= 0.0 {
+            return None;
+        }
+        Some((
+            visible.x as f32,
+            (main.h - (visible.y + visible.h)) as f32,
+            visible.w as f32,
+            visible.h as f32,
+        ))
+    }
+}
+
 /// macOS：挂在主 run loop **common modes**（`kCFRunLoopCommonModes`）上的重复定时器。
 ///
 /// 存在的唯一理由（卡 `abb-v11-bubble-follow-lag` 的实核结论）：**拖动/缩放窗口期间**

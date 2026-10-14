@@ -3296,6 +3296,55 @@ component MenuChoiceRow inherits Rectangle {
     }
 }
 
+// ── v11c（卡 `abb-v11-resize-maximize-macos`）：无边框窗缩放热区 ─────────────
+// 8 个 6px 边条 + 14px 角块（几何与 slint-pixel 的 `PixelWindowResize` **逐像素一致**，
+// 只是它是封闭组件、只回调方向）。
+// 为什么不用 `PixelWindowResize`：macOS 上系统路径（`winit drag_resize_window`）直接
+// `NotSupported`，自管缩放需要**按下时的指针位置**当锚点——只报方向的话只能等第一次
+// `CursorMoved` 再补锚，快甩手时窗口边会**恒定**落后指针十几像素（不是抖动，是不跟手）。
+//
+// 两条路径由 `self-managed` 选一条（Rust 按平台写）：
+//   - `false`（Windows/Linux）：`begin-resize(dir)` → `slint_pixel::install_window_resize`
+//     → 系统级 `drag_resize_window` 缩放循环（既有行为，不动）；
+//   - `true`（macOS）：`self-resize-begin(dir, x, y)` → Rust 自管缩放会话
+//     （`ui::SelfResize`：屏坐标跟指针算尺寸 + `Window::set_size/set_position`）。
+component ResizeZone inherits TouchArea {
+    in property <string> dir: "";
+    in property <bool> self-managed: false;
+    callback begin(string);
+    callback begin-at(string, length, length);
+    // 只认左键按下（右键/中键不缩放），与 `PixelWindowResize` 同口径。
+    pointer-event(ev) => {
+        if ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left {
+            if root.self-managed {
+                // 热区自己是窗边上的条/块 ⇒ 它的绝对位置随窗口尺寸变；但 `mouse-x` 就是按
+                // **当前**绝对位置算出来的（slint-core 每次事件分发都刷新几何）
+                // ⇒ 两者相加恒等于「指针的窗口坐标」，与布局是否已跟上无关。
+                root.begin-at(root.dir, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            } else {
+                root.begin(root.dir);
+            }
+        }
+    }
+}
+
+component WindowResizeZones inherits Rectangle {
+    in property <bool> self-managed: false;
+    callback begin-resize(string);
+    callback self-resize-begin(string, length, length);
+    width: 100%;
+    height: 100%;
+    // 顺序照 `PixelWindowResize`：四角声明在四边**之后**（重叠处角赢）。
+    ResizeZone { x: 0px; y: 0px; width: parent.width; height: 6px; dir: "north"; mouse-cursor: ns-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: 0px; y: parent.height - 6px; width: parent.width; height: 6px; dir: "south"; mouse-cursor: ns-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: 0px; y: 0px; width: 6px; height: parent.height; dir: "west"; mouse-cursor: ew-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: parent.width - 6px; y: 0px; width: 6px; height: parent.height; dir: "east"; mouse-cursor: ew-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: 0px; y: 0px; width: 14px; height: 14px; dir: "north-west"; mouse-cursor: nwse-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: parent.width - 14px; y: 0px; width: 14px; height: 14px; dir: "north-east"; mouse-cursor: nesw-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: 0px; y: parent.height - 14px; width: 14px; height: 14px; dir: "south-west"; mouse-cursor: nesw-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+    ResizeZone { x: parent.width - 14px; y: parent.height - 14px; width: 14px; height: 14px; dir: "south-east"; mouse-cursor: nwse-resize; self-managed: root.self-managed; begin(d) => { root.begin-resize(d); } begin-at(d, x, y) => { root.self-resize-begin(d, x, y); } }
+}
+
 // v11（稿 `.menu`）：自绘面板 —— 标题（`h6`）+ 若干行 + 可选「🗄 归档…」行 + footer（`.foot`）。
 // 宽 250px、2px 描边、8px 圆角、面板底/描边同主题；**高度由内容自然决定**（不写死，
 // 否则行数变了会多出空白）。定位由调用方给（`x`/`y`，由 Rust 按 `menu_anchor` 算）。
@@ -3328,6 +3377,11 @@ component MenuPanel inherits Rectangle {
         Rectangle {
             height: 28px;
             background: PixelTheme.bg;
+            // v11c：上两角必须跟**面板内圈**同半径（8 − 2 = 6）。
+            // 为什么：`border-radius` 只裁面板自己的背景/描边，**不裁子元素**——标题这块不透明的
+            // `--bg` 面是方形，正好盖掉面板上角的弧（描边被吃、看起来就是「圆角变方」）。
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
             Text {
                 x: 10px;
                 width: parent.width - 20px;
@@ -3361,6 +3415,9 @@ component MenuPanel inherits Rectangle {
             // 底边切掉一行）。
             height: foot-text.height + 12px;
             background: PixelTheme.bg;
+            // v11c：下两角同标题（面板内圈半径 6），理由见上面标题那条注释。
+            border-bottom-left-radius: 6px;
+            border-bottom-right-radius: 6px;
             Rectangle { y: 0px; width: 100%; height: 2px; background: PixelTheme.edge; }
             foot-text := Text {
                 x: 10px;
@@ -3695,7 +3752,12 @@ export component SystemChatWindow inherits Window {
     // 无边框窗口缩放（同 SettingsWindow：`impl_resize_ui!` + `install_window_resize`）。
     // owner 2026-10-13：「窗口不能缩放的吗？」——此前对话窗没接缩放契约。
     callback begin-resize(string);
+    // v11c：macOS 自管缩放的按下事件（热区给出**方向 + 指针的窗口坐标**，见 `ResizeZone`）。
+    callback self-resize-begin(string, length, length);
     in-out property <bool> resize-hit-areas: false;
+    // v11c：热区走哪条路径。`true` = macOS 自管（不用系统的 `drag_resize_window`），
+    // `false` = Windows/Linux 的既有系统路径。由 Rust 按平台写。
+    in property <bool> resize-self-managed: false;
     // 消息区几何的**只读观测面**（D2「底部文字重叠」定性的直接证据）：
     // 「内容高是否小于真实渲染高」在像素上量不出来（溢出部分被裁掉了），只能由窗口自报。
     // 消费者是`cargo test` 里的无头渲染台（`src/ui_headless_render_test.rs`，用软件渲染后端把本窗
@@ -3751,6 +3813,9 @@ export component SystemChatWindow inherits Window {
     // 展开时的真实几何（未展开时为 0）——面板“高度由内容决定”这类事只能展开后量。
     out property <length> dbg-session-menu-w: root.session-menu-open && session-panel.width > 0px ? session-panel.width : 0px;
     out property <length> dbg-session-menu-h: root.session-menu-open && session-panel.height > 0px ? session-panel.height : 0px;
+    // v11c：模型面板同样的观测面（面板高度跟内容走：行数/页脚行数不同 ⇒ 高度不同，
+    // 不能拿会话面板的高去量它——角部像素判据要的是**自己的**高）。
+    out property <length> dbg-model-menu-h: root.model-menu-open && model-panel.height > 0px ? model-panel.height : 0px;
     out property <length> dbg-usage-meter-w: usage-meter.width;
     out property <length> dbg-usage-meter-h: usage-meter.height;
     out property <length> dbg-usage-fill-w: usage-fill.width;
@@ -3880,6 +3945,13 @@ export component SystemChatWindow inherits Window {
                     usage-meter := Rectangle {
                         width: 56px;
                         height: 9px;
+                        // v11c（owner 真机复查）：用量条要与相邻文字（两行状态 + `.tok`）**垂直居中**。
+                        // 为什么原来不居中：`HorizontalLayout` 的横轴对齐默认是 `stretch`，而本元素
+                        // 有固定 `height: 9px` ⇒ `solve_box_layout_ortho` 给它的位置是**容器顶边**
+                        // （`CrossAxisAlignment::Stretch => data.padding.begin`），于是它贴在 38px
+                        // 状态行的最顶上（实测条身 y 38..46、行中心 57，偏上 ~14px）。
+                        // 逐项覆盖即可（不动整行的 `cross-axis-alignment`，免得回退位的 chip 跟着变）。
+                        cross-axis-self-alignment: center;
                         background: PixelTheme.panel;
                         border-width: 2px;
                         border-color: PixelTheme.edge;
@@ -4265,16 +4337,11 @@ export component SystemChatWindow inherits Window {
                 vertical-stretch: 0;
                 background: (split-hit.has-hover || root.split-dragging) ? PixelTheme.hover : PixelTheme.panel;
                 // 稿 `.split{border-top:2px}`：把分割条与消息区隔开的那条线。
+                // v11c（owner 真机复查）：「内容区 ↔ 输入区」那条把手原来看起来有**三**条线——
+                // ①这条顶边 ②中间的 38×2 抓手 ③输入区自己的顶边（下面那条已删）。口径改成
+                // **只有一条线**：只留这条顶边（2px），中间抓手不再画自己的线，10px 仍整个是热区
+                // （`split-hit` 不变，hover 变色 / ns-resize 光标 / 拖动都照旧）。
                 Rectangle { y: 0px; width: 100%; height: 2px; background: PixelTheme.edge; }
-                // 抓手（稿 `.split i{width:38px;height:2px}`）：水平+垂直居中。
-                Rectangle {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 38px;
-                    height: 2px;
-                    background: PixelTheme.edge;
-                    border-radius: 2px;
-                }
                 split-hit := TouchArea {
                     mouse-cursor: ns-resize;
                     // 按下即设 dragging，直到松手/取消；悬停时的 move 不动。
@@ -4313,12 +4380,12 @@ export component SystemChatWindow inherits Window {
                 // 不补这两个角就会把根 Rectangle 的圆角盖成直角。
                 border-bottom-left-radius: 8px;
                 border-bottom-right-radius: 8px;
-                // 顶端分隔线：铺满输入区宽度，**绝对定位贴 zone 顶边**——拖动把输入区拉高时
-                // 它不该跟着内容往下跑。
-                // **不要**在这里写 `x: -2px; width: parent.width + 4px` 去「盖住窗口黑描边」：
-                // 实测会触发 Slint 的 width ←→ layoutinfo 绑定循环（编译器警告明确写「可能运行时
-                // panic」）。两端那 2px 就是窗口黑描边本身。
-                Rectangle { y: 0px; width: 100%; height: 2px; background: PixelTheme.edge; }
+                // v11c（owner 真机复查）：输入区**不再画自己的顶边**。原来它与上面分割条的顶边 +
+                // 中间的抓手叠成三条线（这就是「分割条看起来有 3 条线」的来源之一），现只保留
+                // 分割条顶上那 2px。
+                // ⚠️ 将来若要把它加回来：**不要**写 `x: -2px; width: parent.width + 4px` 去「盖住
+                // 窗口黑描边」——实测会触发 Slint 的 width ←→ layoutinfo 绑定循环（编译器警告明确
+                // 写「可能运行时 panic」）。两端那 2px 就是窗口黑描边本身。
                 // ⚠️ 必须是 `composer-zone :=`（分割条的可分配带 = 三块真实几何之和要用它的高）。
                 // 同状态行：用现代 Layout（旧 Box 自带 8px padding，会把 zone 的 10px 内边距
                 // 撑成 18px、顶部分隔线也内缩，破坏稿 `.composer-zone{padding:10px}`）。
@@ -4696,20 +4763,26 @@ export component SystemChatWindow inherits Window {
             }
         }
 
-        // 无边框窗口缩放热区（同 SettingsWindow）。owner 2026-10-13：「窗口不能缩放的吗？」
-        // —— 对话窗此前没接缩放。
-        // ⚠️ 是否渲染由 Rust 按**平台**给（`resize_hit_areas`）：D6 真机复查发现「裸平台也开」
-        // 在 macOS 上是错的——`install_window_resize` 接的 `winit drag_resize_window` 在 macOS
-        // 直接返回 `NotSupported`（winit 0.30.13 `platform_impl/macos/window_delegate.rs:1179`），
-        // 热区于是变成「吃掉按压、什么都不做」的死区，而它是整窗 overlay（north 条 y 0..6、
-        // 左右 6px 整高、四角 14×14）——正好压在标题栏顶部/两端与窗口按钮的角上，
-        // 「抓标题栏拖窗口」会静默失效。放在 VerticalLayout 之后 = 更上层。
-        if root.resize-hit-areas : PixelWindowResize {
+        // 无边框窗口缩放热区。owner 2026-10-13：「窗口不能缩放的吗？」——对话窗此前没接缩放。
+        //
+        // v11c（owner 真机复查：「窗口还是不能缩放，最大化也没实现」）——这条已废：
+        //   - D6 实核的结论仍成立：macOS 的 `winit drag_resize_window` 直接 `NotSupported`
+        //     （winit 0.30.13 `platform_impl/macos/window_delegate.rs:1179`），所以 D6 选择了
+        //     「macOS 一律不画热区」；代价是**完全不能缩放**（`no-frame` 窗系统也不给边角手柄）。
+        //   - 现在改成：热区**全平台都画**，macOS 走 `self-managed: true` 的**自管缩放**
+        //     （`ui::SelfResize` 跟指针算尺寸，见 `ResizeZone`）。
+        // 热区是整窗 overlay（north 条 y 0..6、左右条 6px 整高、四角 14×14）——在 macOS 上它
+        // 确实压在标题栏顶部/两端；这是「能缩放」的代价，也是 macOS 窗口的常规语义
+        // （三颗窗口钮的点击中心在 y≈19，不在 14px 角块里，由无头事件注入用例钉住）。
+        // 放在 VerticalLayout 之后 = 更上层。
+        if root.resize-hit-areas : WindowResizeZones {
             x: 0px;
             y: 0px;
             width: 100%;
             height: 100%;
+            self-managed: root.resize-self-managed;
             begin-resize(dir) => { root.begin-resize(dir); }
+            self-resize-begin(dir, x, y) => { root.self-resize-begin(dir, x, y); }
         }
 
         // ── 卡 d9：表情面板 /「更多（定时）」菜单（根级 overlay，画在功能钮**上方**）──────

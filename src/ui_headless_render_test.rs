@@ -668,24 +668,33 @@ fn v10_metrics_match_design() {
         38,
         "状态栏高度应为 38px（稿 .status{{min-height:38px}}）；被布局压缩会变小"
     );
-    // v11（卡 `abb-v11-resizable-split`）：消息区与输入区**之间**多一条 10px 分割条（稿 .split）：
-    // 它的顶边线（g[3]）与输入区顶边线（g[4]）相差 10px。
+    // v11（卡 `abb-v11-resizable-split`）：消息区与输入区**之间**多一条 10px 分割条（稿 .split）。
+    // v11c（owner 真机复查）：这一带只能有**一条**线——原来是
+    // ① 分割条顶边 ② 中间 38×2 抓手 ③ 输入区自己的 border-top，三条叠在 10px 里。
+    // 现在只留 ①（分割条顶边），所以 662 之后下一个整宽暗行**直接是窗口底边**。
     assert_eq!(
         g.get(3).copied(),
         Some((662, 663)),
-        "分割条顶边线（稿 .split{{border-top:2px}}）；它就在消息区底边下"
+        "分割条顶边线（稿 .split{{border-top:2px}}）；它就在消息区底边下，\
+         且是本带唯一的一条线"
     );
     assert_eq!(
         g.get(4).copied(),
-        Some((672, 673)),
-        "输入区顶部分隔线（稿 .composer-zone{{border-top:2px}}）——也锁住输入框总高：\
-         818 − 10（zone 下 padding）− 124（框内：10 + 文本区 66 + 间距 8 + 功能区 30 + 10）\
-         − 10（zone 上 padding）− 2（顶部分隔线）= 672"
+        Some((818, 819)),
+        "输入区不许再画自己的顶边（v11c 单线口径）：662 之后下一个整宽暗行应是窗口底边。\
+         输入区总高仍由 zone 自己的 padding 锁定：input zone 从 672 起，框内 10 + 文本区 66 \
+         + 间距 8 + 功能区 30 + 10 = 124"
     );
     assert_eq!(
-        g[4].0 - g[3].0,
-        10,
-        "分割条高应为 10px（稿 .split{{height:10px}}）"
+        g.len(),
+        5,
+        "整窗只应有 5 条整宽暗行（顶边框/标题栏底/状态栏底/分割条顶边/底边框），\
+         多出来的就是「分割条又多画了线」；实际 {g:?}"
+    );
+    // 带里除了那条顶边、**一行黑描边都不能有**（抓手已不再画；输入区顶边也已删）。
+    assert!(
+        bbox(&f, 6, 664, MW - 6, 674, is_dark).is_none(),
+        "10px 分割条带里除顶边线外还有墨迹（v11c 口径：只保留那一条线）"
     );
 
     // ── 3. 输入区：zone padding 10px（左右一致）──
@@ -718,7 +727,9 @@ fn v10_metrics_match_design() {
     );
     // 绝对位置交叉验证（像素）：composer 左边框落在 x=12（根 padding 2 + zone 10）。
     // accent 在消息区也有（引用块强调条 / 图片卡），所以只在 composer 区域内找发送钮。
-    let zone_top = g[4].0;
+    // v11c：输入区顶边线已删 ⇒ 不能再拿「整宽暗行」定位输入区（`g` 里已经在 662 之后直接到
+    // 窗口底边），改用窗口自报的 `dbg-convo-zone-y`。
+    let zone_top = ui.get_dbg_convo_zone_y().round() as u32;
     let send_a =
         bbox(&f, 0, zone_top, MW, MH, is_accent).expect("找不到发送按钮的 accent 底（正面控制）");
     let send_cy = (send_a.1 + send_a.3) / 2;
@@ -1524,7 +1535,7 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
 
     // ④ 用量条结构（稿 `.tok` + `.meter`）：56×9；E3 之前无数据源 ⇒ 内条 0 宽。
     ui.set_model_menu_open(false);
-    let _ = settle_w(&win, W520, H);
+    let f = settle_w(&win, W520, H);
     assert_eq!(ui.get_dbg_usage_meter_w(), 56.0, "进度条宽 = 稿的 56px");
     assert_eq!(ui.get_dbg_usage_meter_h(), 9.0, "进度条高 = 稿的 9px");
     assert_eq!(
@@ -1534,8 +1545,40 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     );
     assert_eq!(ui.get_usage_text(), "上下文 —/— · —");
     assert_eq!(ui.get_usage_level(), 0);
-    // 第二行「模型 · 状态」仍在（稿 `.status .st2 .l2`）。
+    // ② 第二行「模型 · 状态」仍在（稿 `.status .st2 .l2`）。
     assert!(ui.get_dbg_status_second_line(), "状态行第二行丢了");
+
+    // ④b **垂直居中**（v11c，owner 真机复查）。
+    // 现象：用量条贴在 38px 状态行的最顶上（实测条身 y 38..46，而行中心是 57，偏上 ~14px）。
+    // 根因：`HorizontalLayout` 的横轴对齐默认 `stretch`，而本元素有固定 `height: 9px`
+    // ⇒ `solve_box_layout_ortho` 把不伸缩的元素放在**容器顶边**（`padding.begin`）；
+    // 旁边的两行文本各自 `vertical-alignment: center` 且铺满行高，所以看着就是「条子偏上」。
+    // 修法：该元素 `cross-axis-self-alignment: center`（不动整行的对齐，免得回退位 chip 跟着变）。
+    // 判据：像素上量**条子的真实几何**（暗描边包围盒）与状态行的中心对齐。不依赖自报 y
+    // （`dbg-usage-meter-*` 只有宽高）。
+    let full_rows: Vec<u32> = (0..H)
+        .filter(|&y| (10..W520 - 10).all(|x| is_dark(f.px(x, y))))
+        .collect();
+    let g = groups(&full_rows);
+    let status_top = g[1].1 + 1; // 标题栏底分隔线的下一行
+    let status_bottom = g[2].1 + 1; // 状态行底分隔线的下一行（开区间）
+    let (mx0, mx1) = (W520 - 70, W520 - 10); // 右边距 12 + 条宽 56（含描边）⇒ 只有条子
+                                             // y 上界取**状态行底分隔线的首行**（`g[2].0`）：那条线是整宽的，把它算进来包围盒就会
+                                             // 变成 60×23（描边盒不再成立）。
+    let meter = bbox(&f, mx0, status_top, mx1, g[2].0, is_dark)
+        .expect("状态行右侧没找到用量条的描边（位置判据失效）");
+    assert_eq!(
+        meter.2 - meter.0 + 1,
+        56,
+        "用量条宽 = 56px（描边盒）；实际 {:?}",
+        meter
+    );
+    let meter_center = (meter.1 + meter.3 + 1) as f32 / 2.0;
+    let row_center = (status_top + status_bottom) as f32 / 2.0;
+    assert!(
+        (meter_center - row_center).abs() <= 1.5,
+        "用量条应垂直居中：条中心 {meter_center}，状态行中心 {row_center}\n         （条实量 {meter:?}，行 {status_top}..{status_bottom}）"
+    );
 }
 
 /// v11 行为：两面板的**开合**——点钮展开、点面板外收起、**再点钮也收起**
@@ -1659,25 +1702,20 @@ fn v11_split_draggable_between_convo_and_composer() {
         "Rust 写的 convo-h 必须就是布局实际用的高（没被布局改写）"
     );
 
-    // 像素侧：分割条里那条 38×2 的抓手真的画出来了（稿 `.split i`）。
+    // 像素侧（v11c 单线口径，owner 真机复查）：分割条这一带**只有一条线**——顶上那 2px 的
+    // 整宽线。中间不再画抓手（旧稿 `.split i`），输入区也不再画自己的顶边（两条都删了）。
     let f = settle_w(&win, W520, H);
-    let grip_y = (ui.get_dbg_split_y() + 5.0) as u32;
-    let segs = groups(&f.ink_cols(grip_y, 6, W520 - 6)); // 6..W-6：排除窗口自己的 2px 黑描边
-    assert_eq!(
-        segs.len(),
-        1,
-        "分割条中间那行应只有抓手一段墨迹（y={grip_y}，实际 {segs:?}）"
-    );
-    let (left, right) = segs[0];
+    let split_y = ui.get_dbg_split_y() as u32;
+    for y in [split_y, split_y + 1] {
+        assert_eq!(
+            f.ink_cols(y, 6, W520 - 6).len(),
+            (W520 - 12) as usize,
+            "分割条顶边线应逐列铺满（y={y}）"
+        );
+    }
     assert!(
-        (36..=38).contains(&(right - left + 1)),
-        "抓手宽 ≈38px（稿 .split i{{width:38px}}；带 2px 圆角时中间行量到 36）实际 {}",
-        right - left + 1
-    );
-    let center = (left + right) as f32 / 2.0 + 0.5;
-    assert!(
-        (center - W520 as f32 / 2.0).abs() <= 1.0,
-        "抓手应水平居中（center={center}）"
+        bbox(&f, 6, split_y + 2, W520 - 6, split_y + 12, is_dark).is_none(),
+        "分割条带里除顶上那 2px 外还有墨迹（抓手/输入区顶边都要去掉）"
     );
 
     // ── 2. 拖动：divider 跟手（顶边 = 指针 y）──
@@ -2040,6 +2078,279 @@ fn v11_pop_panels_open_and_close_on_button_and_outside() {
     press_release(&win, more.0, more.1);
     assert!(ui.get_more_open(), "再点 ⋯ 才展开「更多」");
     assert!(!ui.get_emoji_open(), "两面板互斥");
+}
+
+/// v11c（卡 `abb-v11-resize-maximize-macos`）：无边框窗的 8 个缩放热区 + 自管缩放入口。
+///
+/// 两件事一起钉：
+/// 1. **几何**：6px 边条 + 14px 角块的命中面都在（macOS 上这是**唯一**能缩放的入口），
+///    且三颗窗口钮的**点击中心**都不在热区里（否则「— ⤢ ✕ 都要真能用」会被热区吃掉）；
+/// 2. **分路**：`resize-self-managed: true` 时按下报 `self-resize-begin(dir, x, y)`，其中
+///    `(x, y)` 必须是**窗口坐标**（Rust 拿它当缩放锚点；报相对热区的坐标会让窗口越拖越飘）；
+///    `false` 时仍报 `begin-resize(dir)`（Windows/Linux 的系统 `drag_resize_window` 路径不变）。
+///
+/// 判别力（负向）：把角块尺寸改成 30×30（或把环存顺序改成先角后边）⇒ 三钮中心断言红；
+/// 把 `begin-at` 的参数改成 `self.mouse-x`（漏掉绝对位置）⇒ 坐标断言红。
+#[test]
+fn v11c_resize_zones_hit_all_edges_and_corners() {
+    const W520: u32 = 520;
+    let h = SHORT_H;
+    let (ui, win, _) = setup(vec![row("p", "占位")], h);
+    ui.set_resize_hit_areas(true);
+    ui.window().set_size(slint::PhysicalSize::new(W520, h));
+    super::apply_syschat_layout(&ui, W520 as f32);
+    let sys: Rc<std::cell::RefCell<Vec<String>>> = Rc::new(std::cell::RefCell::new(vec![]));
+    {
+        let s = sys.clone();
+        ui.on_begin_resize(move |d| s.borrow_mut().push(d.to_string()));
+    }
+    let own: Rc<std::cell::RefCell<Vec<(String, f32, f32)>>> =
+        Rc::new(std::cell::RefCell::new(vec![]));
+    {
+        let o = own.clone();
+        ui.on_self_resize_begin(move |d, x, y| o.borrow_mut().push((d.to_string(), x, y)));
+    }
+    let _ = settle_w(&win, W520, h);
+
+    // 8 个方向各按一次（取各自最靠边的一条/一角）。
+    let cases: [(&str, f32, f32); 8] = [
+        ("north", 170.0, 2.0),
+        ("south", 170.0, h as f32 - 3.0),
+        ("west", 2.0, 200.0),
+        ("east", W520 as f32 - 3.0, 200.0),
+        ("north-west", 2.0, 2.0),
+        ("north-east", W520 as f32 - 3.0, 2.0),
+        ("south-west", 2.0, h as f32 - 3.0),
+        ("south-east", W520 as f32 - 3.0, h as f32 - 3.0),
+    ];
+    let want: Vec<&str> = cases.iter().map(|c| c.0).collect();
+
+    // ⓪ 三颗窗口钮的点击中心不得落进热区（热区是整窗 overlay，压在标题栏两端）。
+    for (name, bx, by) in titlebar_button_centers(W520) {
+        let in_zone = (bx < 14.0 || bx > W520 as f32 - 14.0) && by < 14.0;
+        assert!(
+            !in_zone,
+            "{name} 钮的点击中心 ({bx},{by}) 落在缩放热区里：三钮会点不动"
+        );
+    }
+
+    // ① 系统路径（默认 `resize-self-managed: false`）：只报方向。
+    for (_, x, y) in cases {
+        press_release(&win, x, y);
+    }
+    assert_eq!(
+        sys.borrow().as_slice(),
+        want.as_slice(),
+        "系统路径的方向报错"
+    );
+    assert!(
+        own.borrow().is_empty(),
+        "系统路径不许触发自管缩放：{:?}",
+        own.borrow()
+    );
+
+    // ② 自管路径（macOS）：报方向 + 指针的**窗口坐标**。
+    sys.borrow_mut().clear();
+    ui.set_resize_self_managed(true);
+    let _ = settle_w(&win, W520, h);
+    for (_, x, y) in cases {
+        press_release(&win, x, y);
+    }
+    let got = own.borrow().clone();
+    assert_eq!(
+        got.len(),
+        8,
+        "自管路径应报 8 次（八个热区都不能丢）：{got:?}"
+    );
+    for (i, (dir, x, y)) in cases.iter().enumerate() {
+        let (d, gx, gy) = &got[i];
+        assert_eq!(d, dir, "第 {i} 个热区方向错：{got:?}");
+        assert!(
+            (gx - x).abs() <= 1.0 && (gy - y).abs() <= 1.0,
+            "热区报来的指针坐标应是**窗口坐标**：期望 ({x},{y})，实际 ({gx},{gy})"
+        );
+    }
+    assert!(
+        sys.borrow().is_empty(),
+        "自管路径不许再触发系统路径：{:?}",
+        sys.borrow()
+    );
+}
+
+/// v11c（owner 真机复查）：历史会话 / 模型列表两个面板的**圆角被方形不透明底盖掉**。
+///
+/// 根因：`Rectangle` 的 `border-radius` 只裁**自己**的背景/描边，**不裁子元素**；而标题
+/// （稿 `.menu h6`，`--bg` 底）与 footer（`.foot`，`--bg` 底）是铺满内容盒的方形 ⇒ 把面板
+/// 上/下两角的弧（连同 2px 描边）盖住 ⇒ 观感就是「圆角变方」。
+/// 修法：给这两块补上与面板**内圈**同半径的角（8 − 2 = 6，弧心重合）。
+///
+/// 判据（像素、可机读）：面板四个角上、**弧的笔迹所在**那个像素必须比同层不透明底的底色
+/// **明显暗**（那就是描边没被遮住）；修前这四个点与底色逐位相同。
+/// 底色不硬编码：从同一块里挑一个**没有字**的位置采样（换主题不会假红）。
+///
+/// 判别力（负向）：把标题或 footer 的 `border-*-radius: 6px` 删掉 ⇒ 本用例红（已逐条实测）。
+#[test]
+fn v11c_menu_panels_keep_rounded_corners() {
+    const H: u32 = 820;
+    const W520: u32 = 520;
+    fn luma(p: PremultipliedRgbaColor) -> u32 {
+        p.red as u32 + p.green as u32 + p.blue as u32
+    }
+    let (ui, win, _m) = setup(vec![row("p", "占位")], H);
+    seed_panels(&ui);
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+
+    let mut checked = 0;
+    for (name, open_session) in [("会话面板", true), ("模型面板", false)] {
+        if open_session {
+            ui.set_session_menu_open(true);
+        } else {
+            ui.set_session_menu_open(false);
+            ui.set_model_menu_open(true);
+        }
+        let f = settle_w(&win, W520, H);
+        let px = (if open_session {
+            ui.get_session_menu_x()
+        } else {
+            ui.get_model_menu_x()
+        }) as u32;
+        let py = (if open_session {
+            ui.get_session_menu_y()
+        } else {
+            ui.get_model_menu_y()
+        }) as u32;
+        let w = 250u32;
+        let h = (if open_session {
+            ui.get_dbg_session_menu_h()
+        } else {
+            ui.get_dbg_model_menu_h()
+        }) as u32;
+        assert!(
+            h > 0 && px + w < W520,
+            "{name} 几何不可用：({px},{py},w={w},h={h})"
+        );
+
+        // 底色采样点：标题条 / footer 的**右侧空白处**（文字宽 = 面板宽 − 22）。
+        let head_bg = f.px(px + w - 6, py + 14);
+        let foot_bg = f.px(px + w - 6, py + h - 8);
+        assert!(
+            luma(head_bg) > 600 && luma(foot_bg) > 600,
+            "{name} 底色采样点不在（浅色）底上：head={head_bg:?} foot={foot_bg:?}"
+        );
+
+        // 四个角：笔迹像素必须明显暗于同层底色。
+        let probes = [
+            ("左上", px + 3, py + 2, head_bg),
+            ("右上", px + w - 4, py + 2, head_bg),
+            ("左下", px + 3, py + h - 4, foot_bg),
+            ("右下", px + w - 4, py + h - 4, foot_bg),
+        ];
+        for (what, cx, cy, bg) in probes {
+            let got = f.px(cx, cy);
+            assert!(
+                luma(got) + 60 < luma(bg),
+                "{name}{what}角 ({cx},{cy}) 的圆角弧被方形不透明底盖住了：\
+                 该点应是描边笔迹，实量 {got:?}（同层底色 {bg:?}）"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 8, "两个面板 x 四角 = 8 个采样点都得跑到");
+}
+
+/// v11c 出图（owner 真机复查四条的对稿判读用；默认不跑）：
+/// `v11c-full.png` / `v11c-split-single-line.png` / `v11c-panel-corners.png` /
+/// `v11c-panel-corner-tl.png` / `v11c-panel-corner-bl.png` / `v11c-status-meter.png` /
+/// `v11c-resize-zones.png`（把 8 个热区用紫线描出来，看“三钮是不是被吃了”）。
+#[test]
+#[ignore = "出图用；默认不跑"]
+fn dump_v11c_fixes_for_review() {
+    const W520: u32 = 520;
+    const H: u32 = 820;
+    const MAGENTA: PremultipliedRgbaColor = PremultipliedRgbaColor {
+        red: 255,
+        green: 0,
+        blue: 255,
+        alpha: 255,
+    };
+    let dir = std::path::Path::new(SHOTS);
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let (ui, win, _m) = setup(fixture(), H);
+    seed_panels(&ui);
+    super::refresh_syschat_usage(&ui);
+    ui.set_draft("就按这三份素材做，说明放第二节…".into());
+    ui.set_resize_hit_areas(true);
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+    let _ = settle_w(&win, W520, H);
+
+    // ① 分割条：整窗 + 放大那条带（只应看到**一条**线）。
+    let f = settle_w(&win, W520, H);
+    write_png(&f, &dir.join("v11c-full.png"));
+    let sy = ui.get_dbg_split_y() as u32;
+    let band = crop(&f, 0, sy.saturating_sub(14), W520, 44);
+    write_png(&band, &dir.join("v11c-split-single-line.png"));
+
+    // ② 面板圆角：整面板 + 左上/左下角放大（能直接看出弧线是否完整）。
+    ui.set_session_menu_open(true);
+    let f2 = settle_w(&win, W520, H);
+    write_png(&f2, &dir.join("v11c-panel-corners.png"));
+    let (px, py) = (
+        ui.get_session_menu_x() as u32,
+        ui.get_session_menu_y() as u32,
+    );
+    let ph = ui.get_dbg_session_menu_h() as u32;
+    write_png(
+        &crop(&f2, px.saturating_sub(4), py.saturating_sub(4), 44, 44),
+        &dir.join("v11c-panel-corner-tl.png"),
+    );
+    write_png(
+        &crop(&f2, px.saturating_sub(4), py + ph - 40, 44, 44),
+        &dir.join("v11c-panel-corner-bl.png"),
+    );
+    ui.set_session_menu_open(false);
+
+    // ③ 状态行：用量条是否与两行文字同轴居中。
+    let f3 = settle_w(&win, W520, H);
+    write_png(
+        &crop(&f3, 0, 30, W520, 56),
+        &dir.join("v11c-status-meter.png"),
+    );
+
+    // ④ 缩放热区示意：把 8 个热区（6px 边 + 14px 角）用紫线描在原图上。
+    // 几何与 `.slint` 的 `WindowResizeZones` 同源；命中面本身由 `v11c_resize_zones_hit_all_edges_and_corners`
+    // 断言（这里只是给 owner 看的示意）。
+    let mut f4 = settle_w(&win, W520, H);
+    let zones: [(u32, u32, u32, u32); 8] = [
+        (0, 0, W520, 6),
+        (0, H - 6, W520, 6),
+        (0, 0, 6, H),
+        (W520 - 6, 0, 6, H),
+        (0, 0, 14, 14),
+        (W520 - 14, 0, 14, 14),
+        (0, H - 14, 14, 14),
+        (W520 - 14, H - 14, 14, 14),
+    ];
+    for (zx, zy, zw, zh) in zones {
+        let (x1, y1) = ((zx + zw - 1).min(W520 - 1), (zy + zh - 1).min(H - 1));
+        for x in zx..=x1 {
+            for y in [zy, y1] {
+                f4.buf[(y * W520 + x) as usize] = MAGENTA;
+            }
+        }
+        for y in zy..=y1 {
+            for x in [zx, x1] {
+                f4.buf[(y * W520 + x) as usize] = MAGENTA;
+            }
+        }
+    }
+    write_png(&f4, &dir.join("v11c-resize-zones.png"));
+    println!(
+        "v11c 出图完成：v11c-full.png / v11c-split-single-line.png / v11c-panel-corners.png / \
+         v11c-panel-corner-tl.png / v11c-panel-corner-bl.png / v11c-status-meter.png / \
+         v11c-resize-zones.png（split_y={sy} panel=({px},{py},h={ph})）"
+    );
 }
 
 /// v11 出图（对稿判读用；默认不跑）：分割条的两种比例 + 表情/「更多」面板贴按钮。

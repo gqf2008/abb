@@ -471,21 +471,31 @@ fn bring_app_to_front() {
 
 /// 是否启用**自绘**无边框窗口缩放热区（`PixelWindowResize`）。
 ///
-/// 口径：只有 Windows/Linux 需要自绘（它们没有系统缩放边框）；**macOS 一律关掉**。
+/// 口径（**设置窗**；对话窗另有自己的口径，见 [`syschat_resize_self_managed`]）：只有
+/// Windows/Linux 需要自绘（它们没有系统缩放边框）；macOS 的设置窗仍不留热区。
 ///
-/// 为什么 macOS 必须关（D6，2026-10-14）：`slint_pixel::install_window_resize` 把热区回调接到
+/// 为什么 macOS 设置窗必须关（D6，2026-10-14）：`slint_pixel::install_window_resize` 把热区回调接到
 /// `winit::Window::drag_resize_window`，而 winit 0.30.13 的 macOS 实现**直接返回
 /// `Err(NotSupported)`**（`src/platform_impl/macos/window_delegate.rs:1179`）——热区于是变成
 /// 「按下就被 grab 吃掉、然后什么都不做」的死区。它不是无害的：热区是整窗 overlay（north 条
 /// 绝对 y 0..6、左右条 6px 整高、四角 14×14），压在标题栏（y 2..36）与窗口按钮的角上，
-/// 「抓住标题栏顶部拖窗口」这类操作会静默失效。`ui/app.slint` 里设置窗那条注释
-/// （“macOS 刻意不加：系统对 no-frame 窗口自带边角缩放，自绘热区会抢掉它”）说的就是这个口径，
-/// 对话窗（D 批「裸平台也开」）当时背离了它。
+/// 「抓住标题栏顶部拖窗口」这类操作会静默失效。设置窗没有自管缩放的实现，因此仍然一关到底。
 ///
-/// 守卫：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：两个窗口都不许写死 `true`）+ 无头几何取证
+/// 守卫：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：设置窗不许写死 `true`，且对话窗
+/// 的 `true` 必须同时存在自管缩放的接线）+ 无头几何取证
 /// `ui_headless_render_test::resize_hot_zone_eats_titlebar_top_band`。
 fn resize_hit_areas_enabled() -> bool {
     !cfg!(target_os = "macos")
+}
+
+/// 对话窗的自绘缩放热区走**哪条路**（v11c，卡 `abb-v11-resize-maximize-macos`）。
+///
+/// - `true`（macOS）：`drag_resize_window` 在 macOS 返回 `NotSupported`，而 `no-frame` 窗系统也
+///   不给边角手柄 —— 所以热区改接**自管缩放**（[`SelfResize`]：跟指针算尺寸 + `set_size`）。
+///   热区**必须画**（否则就是「完全不能缩放」那条老路），故对话窗的 `resize-hit-areas` 恒 `true`。
+/// - `false`（Windows/Linux）：不变，仍走系统的 `drag_resize_window` 缩放循环。
+fn syschat_resize_self_managed() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// 从回调里首次显示一个「创建后一直隐藏」的窗口。顺序很关键（macOS 实测坑）：
@@ -1165,14 +1175,28 @@ mod follow_macos {
 #[derive(Default)]
 struct FollowPump {
     state: RefCell<FollowState>,
+    /// v11c：自管缩放进行中 ⇒ 暂不跟随。
+    ///
+    /// 为什么要有这个开关：自管缩放每拍都在改窗口尺寸，而**四条角的“最近角”会在拖动途中换人**
+    /// （窗口一变宽/变高，气泡当前那个角就可能不再是最近的）——逐帧跟会看到气泡在两角之间被甩。
+    /// 改成「拖动期间不跟、松手后补一次」（`ui::handle_syschat_geometry_event` 和自管缩放的收尾）。
+    paused: Cell<bool>,
     #[cfg(target_os = "macos")]
     handles: RefCell<Option<follow_macos::Handles>>,
 }
 
 impl FollowPump {
+    /// 自管缩放开始/结束（幂等）。
+    fn set_paused(&self, paused: bool) {
+        self.paused.set(paused);
+    }
+
     /// 定时器路径（仅 macOS）：**绝不碰 Slint 的 window adapter**（拖动期间它被借出）。
     #[cfg(target_os = "macos")]
     fn tick_handles(&self) -> bool {
+        if self.paused.get() {
+            return false;
+        }
         let handles = self.handles.borrow();
         let Some(h) = handles.as_ref() else {
             return false;
@@ -1219,6 +1243,9 @@ impl FollowPump {
         bubble: &slint::Weak<AnchorBubble>,
         dialog: &slint::Weak<SystemChatWindow>,
     ) -> bool {
+        if self.paused.get() {
+            return false;
+        }
         #[cfg(target_os = "macos")]
         if self.handles.borrow().is_some() {
             return self.tick_handles();
@@ -1228,6 +1255,178 @@ impl FollowPump {
         };
         snap_bubble_to_dialog(&b, &d)
     }
+}
+
+// ─────────── v11c（卡 `abb-v11-resize-maximize-macos`）：macOS 自管缩放 ───────────
+//
+// 背景（D6 已实核，仍然成立）：macOS 的 `winit::Window::drag_resize_window` 直接返回
+// `Err(NotSupported)`（winit 0.30.13 `platform_impl/macos/window_delegate.rs:1179`），而
+// `no-frame: true` 的窗系统也不给边角手柄 ⇒ D6 把自绘热区全关之后，**完全不能缩放**。
+// 这里把这条路自己补上：
+//
+//   按下热区（`.slint` 报「方向 + 指针的窗口坐标」）
+//     → 记锚点（指针与窗口外框，均**屏幕坐标**，逻辑像素）
+//     → 每次 `WindowEvent::CursorMoved` 按 `syschat::ResizeSession` 算新矩形（含 340×380 下限）
+//     → `Window::set_size` + `Window::set_position`
+//     → `MouseInput(Released)` / 失焦 结束会话。
+//
+// 为何指针走 winit 的 `CursorMoved` 而不是 `.slint` 的 `pointer-event`：热区本身贴在窗边上、
+// 窗口一改尺寸它的绝对位置就变，而 Slint 的 `mouse-x` 是**相对热区**的 ⇒ 「热区绝对位置 + mouse-x」
+// 在布局追上之前会拿到自相矛盾的组合（窗口越拖越飘）。`CursorMoved.position` 是**窗口坐标**
+// （winit `view.rs::mouse_motion` 由 `event.locationInWindow()` 得），配 `outer_position` 直接得
+// 屏幕坐标，与 Slint 布局无关。按下那一刻的指针仍取 `.slint` 报的值（那一拍布局必然是最新的，
+// 否则热区根本命中不到）⇒ 锚点精确，不用等第一次 move 去「补锚」（那会让快甩手恒定落后十几像素）。
+//
+// 为何用屏幕坐标而不是窗口坐标：窗口自身会被拖着重定位，用窗口坐标会自我引用
+// （`x_new` 又决定下一拍的 `dx`）——实测会来回振荡；屏幕坐标下锚点是常量，天然收敛。
+// 详见 [`crate::syschat::ResizeSession`] 的注释。
+
+/// 自管缩放会话的共享状态（`Rc`：按下回调 / winit 事件钩子两处都要看它）。
+#[derive(Default)]
+struct SelfResize {
+    /// 逻辑像素的会话（`None` = 没有在拖）。
+    session: RefCell<Option<crate::syschat::ResizeSession>>,
+}
+
+/// 窗口的**实时**逻辑外框（`f32`，不取整）。
+///
+/// 与 [`logical_window_rect`] 的区别：那个为「锚定/吸附」取整成 `i32`，而缩放要跟指针做减法，
+/// 取整会在每帧引入 ±0.5px 的取整误差（锚点是常量所以只偏不累，但没必要引入）。
+/// 位置取 `outer_position`、尺寸取 `inner_size`（与 [`logical_window_rect`] 同口径）：本窗是
+/// `no-frame: true` ⇒ 内外同框；另外 winit 的 `CursorMoved.position` 也是相对**视图**的
+/// （`event.locationInWindow()`），所以两者相加才是同一个坐标系的屏幕坐标。
+fn live_window_rect(win: &slint::Window) -> Option<crate::syschat::WinRect> {
+    use slint::winit_030::WinitWindowAccessor;
+    let sf = win.scale_factor();
+    let sf = if sf > 0.0 { sf } else { 1.0 };
+    win.with_winit_window(|w| {
+        let pos = w.outer_position().ok()?;
+        let size = w.inner_size();
+        Some(crate::syschat::WinRect::new(
+            pos.x as f32 / sf,
+            pos.y as f32 / sf,
+            size.width as f32 / sf,
+            size.height as f32 / sf,
+        ))
+    })
+    .flatten()
+}
+
+/// 缩放的上限（逻辑像素）：当前显示器的**整幅**大小。
+///
+/// 取整幅而不是工作区：最大化把窗口铺到工作区（比整幅小），上限就不能比它还小，否则
+/// 「最大化后手动拖边」会把窗口瞬间缩回去。拿不到显示器 ⇒ 不设上限（`INFINITY` 会被
+/// [`crate::syschat::ResizeSession`] 的夹取函数当作「无上限」）。
+fn self_resize_max(win: &slint::Window) -> (f32, f32) {
+    use slint::winit_030::WinitWindowAccessor;
+    win.with_winit_window(|w| {
+        w.current_monitor().map(|m| {
+            let s = m.size().to_logical::<f32>(m.scale_factor());
+            (s.width, s.height)
+        })
+    })
+    .flatten()
+    .unwrap_or((f32::INFINITY, f32::INFINITY))
+}
+
+impl SelfResize {
+    /// 按下热区：记锚点并开会话。`pointer` = 指针的**窗口坐标**（`.slint` 报来，逻辑像素）。
+    /// 返回 `true` 仅当会话真的开起来了（脏方向 / 窗口还没 realize ⇒ `false`，调用方不暂停跟随）。
+    fn begin(&self, dir: &str, win: &slint::Window, pointer: (f32, f32)) -> bool {
+        let Some(dir) = crate::syschat::ResizeDir::parse(dir) else {
+            return false;
+        };
+        if !pointer.0.is_finite() || !pointer.1.is_finite() {
+            return false;
+        }
+        let Some(rect) = live_window_rect(win) else {
+            return false;
+        };
+        // 屏幕坐标 = 窗口左上角（屏幕坐标）+ 指针的窗口坐标。
+        let anchor_pointer = (rect.x + pointer.0, rect.y + pointer.1);
+        *self.session.borrow_mut() = Some(crate::syschat::ResizeSession::new(
+            dir,
+            anchor_pointer,
+            rect,
+        ));
+        true
+    }
+
+    /// 指针移动：重算尺寸/位置并写回窗口。返回 `true` = 本拍确实属于一次自管缩放。
+    fn on_cursor_moved(&self, win: &slint::Window, cursor: (f64, f64)) -> bool {
+        let session = match *self.session.borrow() {
+            Some(s) => s,
+            None => return false,
+        };
+        let sf = win.scale_factor();
+        let sf = if sf > 0.0 { sf } else { 1.0 };
+        let Some(rect_now) = live_window_rect(win) else {
+            return true; // 拿不到几何（窗口正被销毁）：会话留着，下次再试
+        };
+        if !cursor.0.is_finite() || !cursor.1.is_finite() {
+            return true;
+        }
+        // 屏幕坐标 = 当前窗口左上角 + 指针的窗口坐标（*当前* 原点，因此窗口被自己拖着跑
+        // 也不会自我引用——两者是同一拍读的）。
+        let ptr = (
+            rect_now.x + cursor.0 as f32 / sf,
+            rect_now.y + cursor.1 as f32 / sf,
+        );
+        let next = session.update(
+            ptr,
+            (crate::syschat::SYSCHAT_MIN_W, crate::syschat::SYSCHAT_MIN_H),
+            self_resize_max(win),
+        );
+        // 没变就不写：`set_size`/`set_position` 各会发一串事件（含气泡跟随的事件路径），
+        // 窗口尺寸已在下限/上限时指针继续走不应该再产生任何窗口改动。
+        let same = (next.x - rect_now.x).abs() < 0.5
+            && (next.y - rect_now.y).abs() < 0.5
+            && (next.w - rect_now.w).abs() < 0.5
+            && (next.h - rect_now.h).abs() < 0.5;
+        if same {
+            return true;
+        }
+        // 顺序：**先尺寸后位置**。`set_outer_position` 在 macOS 上按「当时的窗口高」翻 y 轴
+        //（winit `flip_window_screen_coordinates` 用 `self.window().frame().size`），先改尺寸才
+        // 能让 y 换算落在最终高度上（反序会整体偏移新高度减旧高度那么多）。
+        win.set_size(slint::LogicalSize::new(next.w, next.h));
+        win.set_position(slint::LogicalPosition::new(next.x, next.y));
+        true
+    }
+
+    /// 结束会话（松手 / 失焦 / 关窗）。返回 `true` = 本拍真的结束了一个活会话
+    /// （调用方据此放开气泡跟随并补一次）。
+    fn end(&self) -> bool {
+        self.session.borrow_mut().take().is_some()
+    }
+}
+
+/// macOS：「最大化 = 铺满当前显示器工作区，再点还原」（口径见 [`crate::syschat::MaximizeState`]）。
+#[cfg(target_os = "macos")]
+fn toggle_syschat_maximize(win: &SystemChatWindow, state: &RefCell<crate::syschat::MaximizeState>) {
+    use slint::winit_030::WinitWindowAccessor;
+    let w = win.window();
+    let Some(cur) = live_window_rect(w) else {
+        return;
+    };
+    // 工作区优先用 AppKit 的 `visibleFrame`（真扣掉菜单栏/Dock）；拿不到就回落到显示器整幅
+    //（同 D4 的 `monitor_work_area` 口径）——宁可最大化得不够准，也不要整个按钮没反应。
+    let work = w
+        .with_winit_window(platform::visible_work_area)
+        .flatten()
+        .map(|(x, y, ww, hh)| crate::syschat::WinRect::new(x, y, ww, hh))
+        .or_else(|| {
+            monitor_work_area(w).map(|(x, y, ww, hh)| {
+                crate::syschat::WinRect::new(x as f32, y as f32, ww as f32, hh as f32)
+            })
+        });
+    let Some(work) = work else {
+        return;
+    };
+    let next = state.borrow_mut().toggle(cur, work);
+    // 顺序同上（先尺寸后位置：macOS 的 y 轴翻转换算要用最终高度）。
+    w.set_size(slint::LogicalSize::new(next.w, next.h));
+    w.set_position(slint::LogicalPosition::new(next.x, next.y));
 }
 
 /// A：泵的 16ms 节拍（稿/卡口径：16ms 合并，约一帧）。
@@ -2567,12 +2766,15 @@ pub fn run_gui() -> Result<()> {
     // 气泡只在托盘进程运行时存在——ABB 无头（`--service`）时不实例化任何窗口，
     // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
-    // 缩放：接 winit 的 drag_resize_window（`impl_resize_ui!` 提供回调实现）。
-    // ⚠️ 热区**按平台**给（同设置窗，见 [`resize_hit_areas_enabled`]）：D 批「裸平台也开」在
-    // macOS 上把标题栏顶部/两端变成了死区（`drag_resize_window` 在 macOS 返回 NotSupported，
-    // 热区只吃按压不干活），也是 D6「抓标题栏拖不动窗口」的一个来源。
+    // 缩放：Windows/Linux 仍接 winit 的 `drag_resize_window`（`impl_resize_ui!` 提供回调实现）；
+    // macOS 上那条路是死的（返回 `NotSupported`），改走**自管缩放**（见 [`SelfResize`]）。
+    // 两边都要接：`on_begin_resize` 是单槽回调，`install_window_resize` 在 macOS 上装上也无害
+    // （`.slint` 侧 `self-managed: true` 时压根不会发 `begin-resize`）。
     slint_pixel::install_window_resize(&syschat_win);
-    syschat_win.set_resize_hit_areas(resize_hit_areas_enabled());
+    // 热区**全平台都画**（v11c）：D6 「macOS 一律不画」的代价是**完全不能缩放**。
+    // 设置窗没有自管实现，仍按平台给（见 [`resize_hit_areas_enabled`]）。
+    syschat_win.set_resize_hit_areas(true);
+    syschat_win.set_resize_self_managed(syschat_resize_self_managed());
     // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-*`（开出来是最小尺寸 340×380，于是
     // ①②③ 挤不进标题栏）。开窗前显式给一次默认尺寸（= `.slint` 的 `preferred-width`/`height`），
     // 此后由用户自己缩——**不是**固定尺寸：`.slint` 的 `min-*`（340×380）交给系统做缩放下界，
@@ -2587,6 +2789,21 @@ pub fn run_gui() -> Result<()> {
     debug_assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
     debug_assert!(crate::syschat::SYSCHAT_DEFAULT_H >= crate::syschat::SYSCHAT_MIN_H);
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
+    // v11c：`⤢` 在 macOS 上**自己实现**（`set_maximized` 对 no-frame 窗不可靠：「最大化后被
+    // size 拉回」、`is_maximized()` 也跟不上自管尺寸，见 [`toggle_syschat_maximize`]）。
+    // `install_title_bar_controls_no_quit` 已经把 `on_toggle_maximize` 接成 `set_maximized`，
+    // 这里**覆盖**那一条（Slint 的回调是单槽 `set`，后设的赢；`—`/`✕`/`drag-start` 不受影响）。
+    // 非 macOS 不覆盖，保持系统最大化。
+    #[cfg(target_os = "macos")]
+    {
+        let state = Rc::new(RefCell::new(crate::syschat::MaximizeState::default()));
+        let cw = syschat_win.as_weak();
+        syschat_win.on_toggle_maximize(move || {
+            if let Some(win) = cw.upgrade() {
+                toggle_syschat_maximize(&win, &state);
+            }
+        });
+    }
     // D2（稿 ①②③）：标题栏控件条的落位计划。
     // 初次用 preferred-width 兜底（此时窗口尚未 realize，`size()` 可能是 0），
     // 之后改由窗口宽变化驱动：`.slint` 里的 `changed titlebar-watch => titlebar-width-changed(root.width)`
@@ -7299,6 +7516,22 @@ pub fn run_gui() -> Result<()> {
         // D4：气泡跟随用的弱引用（对话窗 Moved/Resized → 气泡贴角）。
         let follow_bubble = bubble.as_weak();
         let follow_pump_ev = follow_pump.clone();
+        // v11c：macOS 自管缩放的会话状态（按下回调与事件钩子共享，见 [`SelfResize`]）。
+        let mac_resize = Rc::new(SelfResize::default());
+        {
+            let state = mac_resize.clone();
+            let pump = follow_pump.clone();
+            let cw = syschat_win.as_weak();
+            syschat_win.on_self_resize_begin(move |dir, x, y| {
+                if let Some(win) = cw.upgrade() {
+                    // 会话一开就**暂停气泡跟随**（口径见 [`FollowPump::paused`]）：
+                    // 暂停发生在真的开成功之后（脏方向/窗口还没 realize ⇒ 不暂停）。
+                    if state.begin(dir.as_str(), win.window(), (x, y)) {
+                        pump.set_paused(true);
+                    }
+                }
+            });
+        }
         syschat_win.window().on_winit_window_event(move |w, ev| {
             // C2 拖放（Finder → 对话窗）：**不需要任何 AppKit 手写代码**——winit 0.30 的 macOS
             // 实现自己就是 `NSDraggingDestination`（`window_delegate.rs:367`），已把系统拖放翻译成
@@ -7359,6 +7592,26 @@ pub fn run_gui() -> Result<()> {
                 if let Some(w) = cw2.upgrade() {
                     hide_syschat(&w, &bw_close2, &sw2);
                 }
+            }
+            // v11c（卡 `abb-v11-resize-maximize-macos`）：自管缩放的指针跟踪 / 收尾。
+            // 为何用 winit 的 `CursorMoved`（而不是 `.slint` 的 `pointer-event`）见 [`SelfResize`]。
+            // 收尾三条：抾手 / 失焦 / 关窗——漏一条会话就会悬着，气泡跟随会一直暂停。
+            if let WindowEvent::CursorMoved { position, .. } = ev {
+                let _ = mac_resize.on_cursor_moved(w, (position.x, position.y));
+            }
+            if matches!(
+                ev,
+                WindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    ..
+                } | WindowEvent::Focused(false)
+                    | WindowEvent::CloseRequested
+            ) && mac_resize.end()
+            {
+                // 会话结束：放开跟随并**补一次**（拖动期间窗框一直在变，松手这一拍把气泡
+                // 贴回最近的角；`FollowState` 的去重会吸收紧随其后的 Moved/Resized 队列）。
+                follow_pump_ev.set_paused(false);
+                follow_pump_ev.tick(&follow_bubble, &cw2);
             }
             // D4：对话窗 `Moved` / `Resized`（含最大化、手动缩放）→ 气泡贴到最近的角。
             // 与 ⌘V / 拖放 / 红点关闭 / 失焦隐藏共用一个钩子（`on_winit_window_event` 是单槽 set）。
@@ -8516,13 +8769,15 @@ mod tests {
         assert!(!should_hide_on_blur(false, true));
     }
 
-    /// D5：「不进 Dock」必须是**结构上**的——`activate_app` 不得再改激活策略，
-    /// 且两个窗口都不许把自绘缩放热区写死成 `true`。
+    /// D5：「不进 Dock」必须是**结构上**的——`activate_app` 不得再改激活策略；
+    /// 自绘缩放热区则必须**与实现同在**（v11c 口径，见 [`resize_hit_areas_enabled`] /
+    /// [`syschat_resize_self_managed`]）。
     ///
     /// 判别力（负向）：
     /// - 把 `macos_activate(true)` 改回 `setActivationPolicy:Regular(0)` ⇒ 本用例红；
-    /// - 把任一个 `set_resize_hit_areas(resize_hit_areas_enabled())` 改回 `set_resize_hit_areas(true)`
-    ///   ⇒ 本用例红（D6 真机：开着热区的 macOS 上标题栏顶部/两端变成死区）。
+    /// - 把设置窗的 `set_resize_hit_areas(resize_hit_areas_enabled())` 改回 `set_resize_hit_areas(true)`
+    ///   ⇒ 本用例红（设置窗在 macOS 上没有自管实现，开着就是 D6 的死区）；
+    /// - 把对话窗的 `set_resize_hit_areas(true)` 改成按平台（macOS 关）⇒ 本用例红（回到「完全不能缩放」）。
     #[test]
     fn resize_hit_areas_follow_platform_rule() {
         let plat = crate::platform::src_lf(include_str!("platform.rs"));
@@ -8545,19 +8800,61 @@ mod tests {
             !body.contains("set_policy_fn("),
             "activate_app 不应再改激活策略（D5：ABB 永远是 accessory，不进 Dock）"
         );
-        // 自绘缩放热区：两个窗口都按平台口径给。
+        // 自绘缩放热区（v11c 改口径，卡 `abb-v11-resize-maximize-macos`）：
+        // 设置窗仍按平台（macOS 上没有自管实现 ⇒ 不许画）；对话窗**恒画**（macOS 走自管缩放），
+        // 但恒 `true` 必须**同时**存在自管缩放的接线——否则就退回到 D6 「热区只吃按压不干活」。
         let src = crate::platform::src_lf(include_str!("ui.rs"));
         let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
-        assert!(
-            !prod.contains("set_resize_hit_areas(true)"),
-            "有窗口把自绘缩放热区写死了 true：macOS 上 drag_resize_window 返回 NotSupported，\
-             热区只吃按压不干活（标题栏顶部/两端变死区）"
-        );
         assert_eq!(
             prod.matches("set_resize_hit_areas(resize_hit_areas_enabled())")
                 .count(),
-            2,
-            "设置窗与对话窗都应走 resize_hit_areas_enabled()"
+            1,
+            "设置窗应走 resize_hit_areas_enabled()（对话窗不适用：它要走自管缩放）"
+        );
+        assert_eq!(
+            prod.matches("set_resize_hit_areas(true)").count(),
+            1,
+            "对话窗应恒画自绘热区（v11c：macOS 否则完全不能缩放）"
+        );
+        assert!(
+            prod.contains("set_resize_self_managed(syschat_resize_self_managed())"),
+            "对话窗的热区开关必须与自管缩放线路同步（Rust 按平台写 `resize-self-managed`）"
+        );
+        assert!(
+            prod.contains("on_self_resize_begin("),
+            "对话窗必须有 `on_self_resize_begin` 接线（macOS 自管缩放的按下入口）"
+        );
+        assert!(
+            prod.contains("fn syschat_resize_self_managed()")
+                && prod.contains("cfg!(target_os = \"macos\")"),
+            "`syschat_resize_self_managed` 必须按平台判（macOS = 自管）"
+        );
+    }
+
+    /// v11c：自管缩放期间**气泡跟随必须让路**（口径见 [`FollowPump::paused`]）。
+    ///
+    /// 为何只能结构守卫：真拖一次边角需要真窗口，而无头台（`MinimalSoftwareWindow`）没有 winit
+    /// 窗口 ⇒ `with_winit_window` 拿不到句柄，自管会话压根起不来。所以这里只钉**接线存在**，
+    /// 「拖动时气泡不抖、松手那一拍回角」的观感留给 owner 真机确认。
+    ///
+    /// 判别力（负向）：把任一处 `set_paused(true/false)` 删掉 ⇒ 本用例红（漏了暂停就是拖动期间
+    /// 四条角按最近者来回甩，漏了恢复就是气泡永远不再跟）。
+    #[test]
+    fn self_resize_pauses_and_resumes_bubble_follow() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        assert!(
+            prod.contains("pump.set_paused(true)"),
+            "自管缩放开始时必须暂停气泡跟随（`FollowPump::paused`）"
+        );
+        assert_eq!(
+            prod.matches("follow_pump_ev.set_paused(false)").count(),
+            1,
+            "自管缩放结束时必须恢复跟随（且只有收尾那一处）"
+        );
+        assert!(
+            prod.contains("follow_pump_ev.tick(&follow_bubble, &cw2)"),
+            "恢复跟随的那一拍要补一次跟随（拖动期间窗框一直在变）"
         );
     }
 

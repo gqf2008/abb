@@ -1579,6 +1579,203 @@ impl SplitDrag {
     }
 }
 
+// ───────────── v11c（卡 `abb-v11-resize-maximize-macos`）：自管缩放与最大化 ─────────────
+//
+// 为什么必须有这一套：`no-frame: true` 的窗在 macOS 上**系统不给边角缩放手柄**，而 winit 的
+// `drag_resize_window` 在 macOS 直接返回 `Err(NotSupported)`（winit 0.30.13
+// `platform_impl/macos/window_delegate.rs:1179`）⇒ Windows/Linux 那套「自绘热区 + 系统缩放循环」
+// 在 macOS 上是死的。本模块只放**纯算术**（方向 → 新矩形、最小/上限夹取、最大化↔还原记忆），
+// 取指针/写窗口在 `ui.rs` 的 `mac_resize` 里。
+
+/// 8 向缩放方向（`north-east` 这类角 = 两个分量同时为真）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResizeDir {
+    pub north: bool,
+    pub south: bool,
+    pub east: bool,
+    pub west: bool,
+}
+
+impl ResizeDir {
+    /// 解析 `.slint` 热区报来的方向串（与 `slint_pixel` 的 `PixelWindowResize` 同字面量）。
+    ///
+    /// 用**整串字面量表**而不是按 `-` 拆词：拆词会接受 `north-north` 这类重复分量（它们不是热区
+    /// 会发出的形态，接了就等于把上游的拼写错误静默当成一个合法方向）；表里没有的串一律拒。
+    pub fn parse(s: &str) -> Option<Self> {
+        let (north, south, east, west) = match s {
+            "north" => (true, false, false, false),
+            "south" => (false, true, false, false),
+            "east" => (false, false, true, false),
+            "west" => (false, false, false, true),
+            "north-east" => (true, false, true, false),
+            "north-west" => (true, false, false, true),
+            "south-east" => (false, true, true, false),
+            "south-west" => (false, true, false, true),
+            _ => return None,
+        };
+        Some(Self {
+            north,
+            south,
+            east,
+            west,
+        })
+    }
+}
+
+/// 逻辑像素矩形（窗口外框）。缩放/最大化的全部算术都用它（`ui.rs` 里负责物理↔逻辑换算）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl WinRect {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
+/// 夹取上下限：脏值（NaN）一律不参与；`min > max` 时下限赢（宁可大一点也不把窗口算成 0）。
+///
+/// 单独抽出来的理由：`f32::clamp` 在 `min > max` / 边界为 NaN 时**会 panic**，而这两个值一个来自
+/// 常量（`SYSCHAT_MIN_*`）、一个来自显示器枚举，不能假定它们总是良定义的。
+fn clamp_len(v: f32, min: f32, max: f32) -> f32 {
+    let lo = if min.is_finite() { min.max(0.0) } else { 0.0 };
+    let hi = if max.is_finite() { max } else { f32::INFINITY };
+    if v.is_nan() {
+        return lo;
+    }
+    v.max(lo).min(hi.max(lo))
+}
+
+/// 一次自管缩放的**不可变锚点**（按下那一刻的指针与窗口矩形）+ 方向。
+///
+/// 关键：全部用**屏幕坐标**（不是窗口坐标）。窗口自身会被拖着重定位，用窗口坐标会自我引用
+/// （`x_new` 又决定下一拍的 `dx`）→ 实测会来回振荡；屏幕坐标下锚点是常量，天然收敛。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResizeSession {
+    pub dir: ResizeDir,
+    /// 按下时的指针（屏幕坐标，逻辑像素）。
+    pub anchor_pointer: (f32, f32),
+    /// 按下时的窗口矩形（逻辑像素）。
+    pub anchor: WinRect,
+}
+
+impl ResizeSession {
+    pub fn new(dir: ResizeDir, pointer: (f32, f32), rect: WinRect) -> Self {
+        Self {
+            dir,
+            anchor_pointer: pointer,
+            anchor: rect,
+        }
+    }
+
+    /// 当前指针（屏幕坐标）→ 新的窗口矩形。
+    ///
+    /// 口径：
+    /// - 东/南边不动左上角；西/北边**左上角跟着走**（`x = anchor.right − w`），
+    ///   即被拖的那条边始终在指针处；
+    /// - 尺寸先夹进 `[min, max]`（`min` = `.slint` 的 340×380；`max` = 显示器整幅大小）；
+    ///   夹取发生在**算左上角之前**，所以夹住之后拖动边仍然贴指针、不会和指针脱开；
+    /// - 脏输入（NaN/inf）⇒ 原矩形不动（宁可不缩放，也不把窗口写成 0/NaN）。
+    pub fn update(&self, pointer: (f32, f32), min: (f32, f32), max: (f32, f32)) -> WinRect {
+        let a = self.anchor;
+        if !pointer.0.is_finite()
+            || !pointer.1.is_finite()
+            || !self.anchor_pointer.0.is_finite()
+            || !self.anchor_pointer.1.is_finite()
+            || !a.x.is_finite()
+            || !a.y.is_finite()
+            || !a.w.is_finite()
+            || !a.h.is_finite()
+        {
+            return a;
+        }
+        let dx = pointer.0 - self.anchor_pointer.0;
+        let dy = pointer.1 - self.anchor_pointer.1;
+        let want_w = if self.dir.east {
+            a.w + dx
+        } else if self.dir.west {
+            a.w - dx
+        } else {
+            a.w
+        };
+        let want_h = if self.dir.south {
+            a.h + dy
+        } else if self.dir.north {
+            a.h - dy
+        } else {
+            a.h
+        };
+        let w = clamp_len(want_w, min.0, max.0);
+        let h = clamp_len(want_h, min.1, max.1);
+        WinRect {
+            x: if self.dir.west { a.x + a.w - w } else { a.x },
+            y: if self.dir.north { a.y + a.h - h } else { a.y },
+            w,
+            h,
+        }
+    }
+}
+
+/// 逻辑像素下「两个矩形算同一个」的容差。
+///
+/// 1px 的来源：`set_size`/`set_position` 走 f32 → 物理整数点 → 再读回来的往返（Retina 2x 下
+/// 逻辑半像素会被量化），不能要求逐位相等。
+///
+/// `cfg(any(test, macos))`（同 `ui.rs::round_rect_bands` 的手法）：唯一的生产调用方是 macOS 专有的
+/// `ui::toggle_syschat_maximize`（其它平台 `⤢` 仍交系统 `set_maximized`）——不加这个 cfg 的话
+/// Windows/Linux 构建会把它当死代码报 `-D warnings`（实核：本机把调用点去掉就报
+/// “function `rect_approx_eq` is never used”），而留着 `allow(dead_code)` 又会将来掩盖真死代码。
+#[cfg(any(test, target_os = "macos"))]
+fn rect_approx_eq(a: WinRect, b: WinRect) -> bool {
+    (a.x - b.x).abs() <= 1.0
+        && (a.y - b.y).abs() <= 1.0
+        && (a.w - b.w).abs() <= 1.0
+        && (a.h - b.h).abs() <= 1.0
+}
+
+/// 「⤢」= 铺满当前显示器工作区，再点一次还原到**原尺寸与位置**。
+///
+/// 为什么不直接用系统的 `set_maximized`：macOS 无边框窗上与尺寸绑定/`no-frame` 冲突（D 批已
+/// 记「视觉越点越小」），且「最大化」在无边框窗上没有系统语义可依赖。这里就是一个
+/// 「记住 → 铺满 → 还原」的状态机，纯数据、可单测。
+///
+/// `cfg(any(test, macos))` 的理由同 [`rect_approx_eq`]。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg(any(test, target_os = "macos"))]
+pub struct MaximizeState {
+    /// 有待还原的矩形 ⇔ 至少点过一次最大化。
+    saved: Option<WinRect>,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+impl MaximizeState {
+    /// 点一次 ⤢：
+    /// - 当前**正**铺在工作区上（且有待还原记忆）⇒ 还原到记住的矩形；
+    /// - 否则 ⇒ 记住**当前**矩形并返回工作区。
+    ///
+    /// 「当前是否已最大化」用「矩形 ≈ 工作区」判，而不是另设一个 bool：用户在最大化状态下拖动了
+    /// 窗口（自管缩放或系统移动）后，矩形就不再等于工作区 ⇒ 再点 ⤢ 是**重新最大化**（与 macOS
+    /// 绿点行为一致），不会把用户拖出来的那一份当成新的还原目标……注意这里刻意仍用 `current`
+    /// 覆盖记忆：macOS 同样是「最大化 → 移动 → 再最大化」以新位置为下一次还原点。
+    pub fn toggle(&mut self, current: WinRect, work: WinRect) -> WinRect {
+        if self.is_maximized(current, work) {
+            self.saved.take().unwrap_or(work)
+        } else {
+            self.saved = Some(current);
+            work
+        }
+    }
+
+    /// 当前是否处于「已最大化」态（有待还原的记忆 + 窗口矩形≈工作区）。
+    fn is_maximized(&self, current: WinRect, work: WinRect) -> bool {
+        self.saved.is_some() && rect_approx_eq(current, work)
+    }
+}
+
 // ─────────────────── D 批：对话框锚定气泡的几何（纯函数）───────────────────
 
 /// 气泡与对话框之间的间距（逻辑像素，稿 `.gap` = 10px）。
@@ -5410,5 +5607,154 @@ mod tests {
             .parse()
             .unwrap_or_else(|_| panic!("解析 .split 高度失败：{line:?}"));
         assert_eq!(num, SPLIT_HANDLE_H, "分割条高度与设计稿漂移了");
+    }
+
+    // ───── v11c（卡 `abb-v11-resize-maximize-macos`）：自管缩放与最大化（纯逻辑）─────
+
+    /// 八向解析：合法的 8 个字面量都认，脏输入一律拒（不猜）。
+    #[test]
+    fn resize_dir_parses_eight_and_rejects_junk() {
+        let ok = [
+            ("north", (true, false, false, false)),
+            ("south", (false, true, false, false)),
+            ("east", (false, false, true, false)),
+            ("west", (false, false, false, true)),
+            ("north-east", (true, false, true, false)),
+            ("north-west", (true, false, false, true)),
+            ("south-east", (false, true, true, false)),
+            ("south-west", (false, true, false, true)),
+        ];
+        for (s, want) in ok {
+            let d = ResizeDir::parse(s).unwrap_or_else(|| panic!("{s} 应被接受"));
+            assert_eq!((d.north, d.south, d.east, d.west), want, "{s} 拆解错");
+        }
+        for bad in [
+            "",
+            "-",
+            "north-south",
+            "east-west",
+            "north-north",
+            "up",
+            "north-",
+            "north east",
+        ] {
+            assert!(ResizeDir::parse(bad).is_none(), "{bad:?} 不该被接受");
+        }
+    }
+
+    /// 东/南：左上角**不动**，尺寸跟指针。
+    #[test]
+    fn resize_session_east_south_keep_origin() {
+        let a = WinRect::new(100.0, 100.0, 400.0, 600.0);
+        let s = ResizeSession::new(ResizeDir::parse("south-east").unwrap(), (500.0, 700.0), a);
+        let r = s.update((560.0, 730.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!((r.x, r.y), (100.0, 100.0), "东/南只改尺寸，不动左上角");
+        assert_eq!((r.w, r.h), (460.0, 630.0));
+    }
+
+    /// 西/北：被拖的那条边**贴指针** ⇒ 左上角跟着走，而右/下边不动。
+    #[test]
+    fn resize_session_west_north_move_origin() {
+        let a = WinRect::new(100.0, 100.0, 400.0, 600.0);
+        let s = ResizeSession::new(ResizeDir::parse("north-west").unwrap(), (100.0, 100.0), a);
+        let r = s.update((60.0, 70.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!((r.w, r.h), (440.0, 630.0));
+        assert_eq!((r.x, r.y), (60.0, 70.0), "左/上边应贴指针");
+        assert_eq!(r.x + r.w, 500.0, "右边不动");
+        assert_eq!(r.y + r.h, 700.0, "下边不动");
+        // 单边：另一轴完全不动
+        let e = ResizeSession::new(ResizeDir::parse("east").unwrap(), (500.0, 400.0), a);
+        let re = e.update((600.0, 900.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!((re.w, re.h), (500.0, 600.0), "水平边不许改高（反之亦然）");
+        assert_eq!((re.x, re.y), (100.0, 100.0));
+        let n = ResizeSession::new(ResizeDir::parse("north").unwrap(), (300.0, 100.0), a);
+        let rn = n.update((900.0, 40.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!((rn.w, rn.h), (400.0, 660.0));
+        assert_eq!(rn.y, 40.0);
+        assert_eq!(rn.x, 100.0);
+    }
+
+    /// 上下限：夹到 `.slint` 的 340×380 与显示器上限；夹取后右/下边仍不动，
+    /// 且**脏上下限（min > max）下限赢**（绝不把窗口算成 0）。
+    #[test]
+    fn resize_session_clamps_to_min_and_max() {
+        let a = WinRect::new(100.0, 100.0, 400.0, 600.0);
+        let se = ResizeSession::new(ResizeDir::parse("south-east").unwrap(), (500.0, 700.0), a);
+        let r = se.update((-100.0, -100.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!((r.w, r.h), (340.0, 380.0), "往内拖过下限⇒夹到最小尺寸");
+        assert_eq!((r.x, r.y), (100.0, 100.0));
+        let r2 = se.update((99999.0, 99999.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!((r2.w, r2.h), (2000.0, 1200.0), "往外拖过上限⇒夹到显示器");
+        let sw = ResizeSession::new(ResizeDir::parse("west").unwrap(), (100.0, 100.0), a);
+        let r3 = sw.update((900.0, 100.0), (340.0, 380.0), (2000.0, 1200.0));
+        assert_eq!(r3.w, 340.0, "西边夹到下限");
+        assert_eq!(r3.x + r3.w, 500.0, "夹取后右边仍不动");
+        let r4 = se.update((500.0, 700.0), (800.0, 800.0), (100.0, 100.0));
+        assert_eq!((r4.w, r4.h), (800.0, 800.0), "min > max ⇒ 下限赢");
+    }
+
+    /// 脏输入不传播：NaN/inf（指针/锚点任一项）⇒ 原矩形不动。
+    #[test]
+    fn resize_session_rejects_non_finite() {
+        let a = WinRect::new(100.0, 100.0, 400.0, 600.0);
+        let s = ResizeSession::new(ResizeDir::parse("south-east").unwrap(), (500.0, 700.0), a);
+        for bad in [
+            (f32::NAN, 400.0),
+            (500.0, f32::NAN),
+            (f32::INFINITY, 400.0),
+            (500.0, f32::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                s.update(bad, (340.0, 380.0), (2000.0, 1200.0)),
+                a,
+                "脏指针 {bad:?} 不得改矩形"
+            );
+        }
+        let dirty = ResizeSession::new(ResizeDir::parse("east").unwrap(), (f32::NAN, 0.0), a);
+        assert_eq!(
+            dirty.update((600.0, 400.0), (340.0, 380.0), (2000.0, 1200.0)),
+            a
+        );
+    }
+
+    /// 最大化 ↔ 还原：记住原矩形 → 铺满工作区 → 再点回到原矩形（且能再来一轮）。
+    #[test]
+    fn maximize_toggle_fills_work_area_then_restores() {
+        let cur = WinRect::new(120.0, 90.0, 520.0, 560.0);
+        let work = WinRect::new(0.0, 25.0, 1440.0, 875.0);
+        let mut st = MaximizeState::default();
+        let maxed = st.toggle(cur, work);
+        assert_eq!(maxed, work, "最大化 = 铺满工作区");
+        assert!(st.is_maximized(maxed, work), "这之后应该算已最大化");
+        let back = st.toggle(maxed, work);
+        assert_eq!(back, cur, "再点一次应还原到原尺寸与位置");
+        assert!(!st.is_maximized(back, work));
+        assert_eq!(st.toggle(back, work), work, "还原之后还能再最大化");
+    }
+
+    /// 最大化后又手动改过窗口 ⇒ 再点 `⤢` 是**重新最大化**（与 macOS 绿点同口径），
+    /// 下次还原目标是**重新最大化前**那一份。
+    #[test]
+    fn maximize_after_manual_geometry_change_remaximizes() {
+        let cur = WinRect::new(120.0, 90.0, 520.0, 560.0);
+        let work = WinRect::new(0.0, 25.0, 1440.0, 875.0);
+        let mut st = MaximizeState::default();
+        assert_eq!(st.toggle(cur, work), work, "先铺满工作区");
+        let dragged = WinRect::new(300.0, 200.0, 700.0, 500.0);
+        let again = st.toggle(dragged, work);
+        assert_eq!(again, work, "不在工作区上⇒重新最大化");
+        assert_eq!(st.toggle(again, work), dragged, "还原目标是拖出来那一份");
+    }
+
+    /// 1px 容差：尺寸/位置走 f32 → 物理整数点 → 读回的往返，不能要求逐位相等。
+    #[test]
+    fn maximize_tolerance_is_one_pixel() {
+        let work = WinRect::new(0.0, 25.0, 1440.0, 875.0);
+        let mut st = MaximizeState::default();
+        let _ = st.toggle(WinRect::new(100.0, 100.0, 520.0, 560.0), work);
+        let almost = WinRect::new(0.5, 25.4, 1439.5, 875.0);
+        assert!(st.is_maximized(almost, work), "±1px 内应算同一个");
+        let off = WinRect::new(0.0, 25.0, 1430.0, 875.0);
+        assert!(!st.is_maximized(off, work), "差 10px 不算");
     }
 }
