@@ -527,6 +527,21 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     bring_app_to_front();
     let _ = w.show();
     w.window().request_redraw();
+    // **让窗口真的可缩放**（owner 实测回归的真实根因，2026-10-14 自查口读到
+    // `winit is_resizable=false`）：Slint 是**首次 show 时才建原生窗**（建窗前
+    // `with_winit_window` 返 `None`、尺寸 0×0），而窗口被建成不可缩放 ⇒ 拖边角永远没反应。
+    // 属性钩子里的 `.with_resizable(true)` 会被 Slint 之后写入的 `attributes.resizable` 覆盖，
+    // 所以必须在 show **之后**用 winit 原生 setter 再置一次（macOS 上会带上
+    // `NSWindowStyleMask::Resizable`，无边框窗也支持系统边角缩放）。
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        if let Some(ok) = w.window().with_winit_window(|win| {
+            win.set_resizable(true);
+            win.is_resizable()
+        }) {
+            crate::log!("[resize] 已显式置为可缩放：is_resizable={ok}");
+        }
+    }
 }
 
 // D 批：气泡窗口 = 36px 可视气泡 + 四周各 4px 透明边距（给悬停放大 1.06 / 按下描边留空间，
@@ -2793,6 +2808,22 @@ pub fn run_gui() -> Result<()> {
     syschat_win.set_resize_hit_areas(resize_hit_areas_enabled());
     // 自管循环只在「没有系统缩放」的平台上当承重件（macOS 上热区不画 ⇒ 不会发 `begin-resize`）。
     syschat_win.set_resize_self_managed(syschat_resize_self_managed());
+    // **自查口**（`ABB_VERIFY_OPEN=1`）：直接显示对话窗并把底层的可缩放事实打出来。
+    // 为什么要它：owner 反复实测「对话窗不能缩放」，而终端没有辅助功能权限、点不了气泡，
+    // 所以给一个环境变量开关，让**开发/自查**能把窗口开起来截图 + 读数，不依赖人工点击。
+    // 只在显式设了该变量时生效（生产无副作用）；须配隔离 HOME 运行，免得动真实 LaunchAgents。
+    if std::env::var("ABB_VERIFY_OPEN").is_ok() {
+        use slint::winit_030::{winit::window::Window as WinitWindow, WinitWindowAccessor};
+        let (resizable, decorations) = syschat_win
+            .window()
+            .with_winit_window(|w: &WinitWindow| (w.is_resizable(), w.is_decorated()))
+            .unwrap_or((false, false));
+        crate::log!(
+            "[verify] syschat: winit is_resizable={resizable} is_decorated={decorations} size={:?}",
+            syschat_win.window().size()
+        );
+        show_window_and_focus(&syschat_win);
+    }
     // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-*`（开出来是最小尺寸 340×380，于是
     // ①②③ 挤不进标题栏）。开窗前显式给一次默认尺寸（= `.slint` 的 `preferred-width`/`height`），
     // 此后由用户自己缩——**不是**固定尺寸：`.slint` 的 `min-*`（340×380）交给系统做缩放下界，
@@ -2802,6 +2833,12 @@ pub fn run_gui() -> Result<()> {
         crate::syschat::SYSCHAT_PREFERRED_WIDTH,
         crate::syschat::SYSCHAT_DEFAULT_H,
     ));
+
+    // 自查口：设完尺寸再 show（`show_window_and_focus` 会在 show 之后置 resizable 并打日志）。
+    if std::env::var("ABB_VERIFY_OPEN").is_ok() {
+        show_window_and_focus(&syschat_win);
+    }
+
     // 不变式：默认尺寸不得小于最小尺寸（`.slint` 的 `min-*`；同值由单测钉住）。破了它，系统会把
     // 开窗尺寸夹到 min，而标题栏控件条的首帧是按默认宽算的（D 批那个坑）。仅断言，不参与逻辑。
     debug_assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
