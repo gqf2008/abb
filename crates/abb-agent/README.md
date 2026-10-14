@@ -348,6 +348,22 @@ emit_completed/emit_failed`）。**但不是逐字等价**——下面把可达�
 **未验证**：参照物「**未授权**（permission denied）」形状的条数只有源码依据（它的 `emit_failed`），
 本机没有能触发该形状的客户端；同一「压根不执行」类已由 unknown-tool 形状实测覆盖。
 
+## 思考（reasoning）分片
+
+provider 的 reasoning 增量（DeepSeek 系 `reasoning_content`；另两个别名 `reasoning` / `reasoning_text`
+在 rpi 侧同一分支解析）**不走正文那条通路**：正文由整条 `MessageEnd` 投影，思考则随
+`MessageUpdate.assistant_message_event` 逐片到达。本包把 `ThinkingDelta` 投影成
+`agent_thought_chunk`（`content.type = "text"`）——根侧 `runtime::acp` 认这个形状，映射到
+`ChunkKind::Thought`，再进 syschat 的折叠思考块与思考打字机。
+
+**只投影 `ThinkingDelta`**：`ThinkingStart` / `ThinkingEnd` 不带可累加文本，根侧按 chunk 累加、回合结束
+即收尾，不需要显式起止；空 delta 也丢掉（provider 偶尔回空串，转发只是噪音）。**这不是等价替换**：
+被替代组件并不发这条通知（GUI 的折叠块此前恒为空），属**新增行为**，不要按「同形」理解。
+
+上游批合并的已知形状（不是本包的缺陷，但决定片数）：rpi 把相邻增量按「满 64 字节、或又来一片且距上次
+发出超过 40ms」合并后 flush，**没有定时器**——最后一片靠回合边界 flush。所以短输入会被合成一片；探针
+用「首片 > 64 B 立刻发 + 次片 300 ms 后到」逼出真两片（`probes/thinking_chunks_reach_client.py`）。
+
 ## 失败与取消的语义
 
 - **provider 失败**（401/429/5xx/超时）：回 **JSON-RPC error**（`-32002`，message 带真实原因）。
@@ -368,7 +384,7 @@ emit_completed/emit_failed`）。**但不是逐字等价**——下面把可达�
 ## 当前进度
 
 **已实现并验证**：`initialize`、`session/new`、`session/prompt`（回文本）、`session/cancel`
-（回合中可用，含同 burst）、`session/update` 的 `agent_message_chunk`、provider 失败如实报错、
+（回合中可用，含同 burst）、`session/update` 的 `agent_message_chunk` 与 `agent_thought_chunk`（思考增量投影）、provider 失败如实报错、
 anthropic 与 openai 两个家族（含自定义网关 + 任意模型 id）、**`session/new` 的三项契约
 （`cwd` / `systemPrompt` / `mcpServers`）**、**MCP 客户端（工具经 MCP 真执行并回灌）**。
 
@@ -406,8 +422,8 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 
 ## 端到端探针（`probes/`）
 
-单测用替身，探针跑**真二进制**——两者职责不同。十四条探针各自对应一条被评审反证过的行为
-（计数以 `probes/*.py` 里的 `main` 脚本为准）：
+单测用替身，探针跑**真二进制**——两者职责不同。下表每条探针各自对应一条被评审反证过的行为
+（脚本清单以 `probes/*.py` 为准，`fake_mcp_server.py` 是被复用的替身 server、不在表内）：
 
 | 探针 | 覆盖 |
 | --- | --- |
@@ -415,6 +431,7 @@ BIN="$CARGO_TARGET_DIR/debug/abb-agent"
 | `cancel_same_burst.py` | prompt 与 cancel 在同一次 write（0 间隔）时取消不被丢弃（修前 6/6 丢弃） |
 | `provider_error_is_visible.py` | provider 失败回 JSON-RPC error，而非「成功 + 空文本」 |
 | `openai_family_round_trip.py` | openai 家族端到端：URL 拼法、鉴权头、任意厂商模型 id、文本送达 |
+| `thinking_chunks_reach_client.py` | 思考增量真被发成 `agent_thought_chunk`：逐片拼接逐字一致、先于正文、纯正文回合零误报 |
 | `mcp_tool_round_trip.py` | MCP 工具真被调用（判据是假 server 写下的 `tools/call` 记录）与结果回灌 |
 | `mcp_isolation_and_budget.py` | 子进程 env/cwd 隔离；装配预算（单 20s / 共 30s）与读循环可读 |
 | `mcp_image_result_reaches_model.py` | openai 路径图片真进请求体；anthropic 路径**如实交代**（无与事实不符的占位） |

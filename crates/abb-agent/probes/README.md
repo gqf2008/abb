@@ -29,6 +29,14 @@ python3 crates/abb-agent/probes/provider_error_is_visible.py \
   **任意厂商 id**，且文本被发成 `session/update` 并以 `end_turn` 收尾。这条覆盖的是 abb 把
   `openai-chat`/`openrouter`/`deepseek` 全归并成 `ABB_AGENT_PROVIDER=openai` 的真实路径。
 
+- `thinking_chunks_reach_client.py`：思考块可见性的端到端验收（卡 `abb-syschat-thinking-visible-20261015`）。
+  判据是**真二进制发出的 `agent_thought_chunk` 通知**：假 OpenAI 网关按 SSE 先流 `reasoning_content`
+  再流 `content`（两片之间隔 300ms，> rpi 的 40ms 批窗，逼出真两片而不是边界合并的一片），断言
+  ①各片拼接后与网关 reasoning 逐字一致（守「每片只带新增文本」——不重复、不丢字）；②思考**先于**正文
+  到达（根侧按到达顺序分段）；③反面：只流 `content` 时**一条** thought chunk 都不许有。
+  **修前表现**：`event_updates` 没有 `MessageUpdate` 分支 ⇒ provider 的 reasoning 增量被整段丢弃，
+  GUI 的折叠思考块永远是空的。变异（把 `ThinkingDelta` 分支删掉 / 改成投影 `TextDelta`）会让本探针转红。
+
 - `mcp_tool_round_trip.py`（配 `fake_mcp_server.py`）：刀 1 的核心验收。按 `session/new` 的
   `mcpServers` 起一个真 MCP server（stdio JSON-RPC），用 `ABB_AGENT_FAUX_TOOL` 让模型发一次
   工具调用，**判据是假 server 写下的 `tools/call` 记录**——从 agent 的文本输出无法区分

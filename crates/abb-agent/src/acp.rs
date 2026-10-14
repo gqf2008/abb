@@ -892,6 +892,9 @@ fn usage_wire(usage: &rpi_ai::types::Usage) -> Value {
 /// 整条发与逐字发对它等价；逐 delta 需要再摸一层 `AssistantMessageEvent` 形状。
 ///
 /// 工具调用则**必须**投影（参照物有、abb 侧会解析并记日志）：见 [`tool_updates`]。
+/// 思考（provider 的 reasoning 增量）同样必须投影——它不走 [`assistant_text`] 那条正文
+/// 通路（整条 `MessageEnd`），而是随 `MessageUpdate.assistant_message_event` 逐片到达：
+/// 见 [`thinking_updates`]。
 async fn write_event(writer: &Writer, session_id: &str, event: &AgentEvent) {
     for update in event_updates(event) {
         if let Err(error) = writer
@@ -917,6 +920,14 @@ fn event_updates(event: &AgentEvent) -> Vec<Value> {
                 })]
             })
             .unwrap_or_default(),
+        // 思考分片（provider 的 reasoning 增量）。rpi 已把 `reasoning_content` /
+        // `reasoning` / `reasoning_text` 三个字段解成 `ThinkingDelta`，所以这里**直接用
+        // 事件自带的 delta**，不去 `partial` 里做偏移切片（切片要自己维护游标，且
+        // `ThinkingStart/End` 也会被牵连）。
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => thinking_updates(assistant_message_event),
         AgentEvent::ToolExecutionStart {
             tool_call_id,
             tool_name,
@@ -930,6 +941,24 @@ fn event_updates(event: &AgentEvent) -> Vec<Value> {
         } => tool_updates(tool_call_id, tool_name, None, Some((result, *is_error))),
         // 参照物没有「工具进度」这一发射点（它只有 pending/in_progress/completed/failed 四个），
         // 所以这里**不**投影 `ToolExecutionUpdate`——多发的通知是新行为，不是等价替换。
+        _ => Vec::new(),
+    }
+}
+
+/// 思考分片的 `session/update` 载荷：`agent_thought_chunk`（根侧 `runtime::acp` 早已
+/// 解析这个形状 → `ChunkKind::Thought`，syschat 侧也有折叠思考块与思考打字机）。
+///
+/// **只投影 `ThinkingDelta`**：`ThinkingStart/ThinkingEnd` 不带可累加文本，根侧按 chunk
+/// 累加、回合结束即收尾，不需要显式的起止；多发一种通知是新行为，不是等价替换。
+/// 空 delta 也丢掉（provider 偶尔回空串，转发出去只是噪音）。
+fn thinking_updates(event: &rpi_ai::types::AssistantMessageEvent) -> Vec<Value> {
+    match event {
+        rpi_ai::types::AssistantMessageEvent::ThinkingDelta { delta, .. } if !delta.is_empty() => {
+            vec![json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": delta },
+            })]
+        }
         _ => Vec::new(),
     }
 }
@@ -1181,6 +1210,67 @@ mod tests {
             partial_result: Arc::new(AgentToolResult::text("半截输出")),
         };
         assert!(event_updates(&event).is_empty(), "参照物没有进度发射点");
+    }
+
+    /// 造一条「流式中」的助手消息快照（思考事件的 `partial` 字段只是快照，投影不看它）。
+    fn test_partial() -> rpi_ai::types::AssistantMessage {
+        rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::OpenaiCompletions, "p", "m", 0)
+    }
+
+    /// 思考增量必须投影成 `agent_thought_chunk`（根侧 `runtime::acp` 认这个形状）。
+    /// 判据与正文那条一样：**逐字**取 delta，不加工。
+    #[test]
+    fn thinking_delta_is_projected_as_agent_thought_chunk() {
+        let partial = Arc::new(test_partial());
+        let event = AgentEvent::MessageUpdate {
+            message: Arc::clone(&partial),
+            assistant_message_event: rpi_ai::types::AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "先想一下".to_string(),
+                partial,
+            },
+        };
+        let updates = event_updates(&event);
+        assert_eq!(updates.len(), 1, "一个思考增量 = 一条通知");
+        assert_eq!(updates[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(updates[0]["content"]["type"], "text");
+        assert_eq!(updates[0]["content"]["text"], "先想一下");
+    }
+
+    /// 反面：起止标记与空 delta 都**不**发通知；正文增量也不许伪装成思考。
+    #[test]
+    fn thinking_edges_and_text_delta_are_not_thought_chunks() {
+        let partial = Arc::new(test_partial());
+        let mk = |ev: rpi_ai::types::AssistantMessageEvent| AgentEvent::MessageUpdate {
+            message: Arc::clone(&partial),
+            assistant_message_event: ev,
+        };
+        for ev in [
+            rpi_ai::types::AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: Arc::clone(&partial),
+            },
+            rpi_ai::types::AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                content: "先想一下".to_string(),
+                partial: Arc::clone(&partial),
+            },
+            rpi_ai::types::AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: String::new(),
+                partial: Arc::clone(&partial),
+            },
+            rpi_ai::types::AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "正文".to_string(),
+                partial: Arc::clone(&partial),
+            },
+        ] {
+            assert!(
+                event_updates(&mk(ev)).is_empty(),
+                "起止/空思考/正文增量都不该发 agent_thought_chunk"
+            );
+        }
     }
 
     #[test]
