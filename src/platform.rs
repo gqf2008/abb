@@ -185,6 +185,112 @@ pub fn app_is_active() -> bool {
     true
 }
 
+/// macOS：挂在主 run loop **common modes**（`kCFRunLoopCommonModes`）上的重复定时器。
+///
+/// 存在的唯一理由（卡 `abb-v11-bubble-follow-lag` 的实核结论）：**拖动/缩放窗口期间**
+/// AppKit 把主线程 run loop 切到 `NSEventTrackingRunLoopMode`，而 winit 0.30 的 macOS 事件
+/// 循环把「事件处理器执行中收到的事件」排队到 `kCFRunLoopDefaultMode`（`app_state.rs`
+/// `maybe_queue_event` + `observer.rs::queue_closure`），于是拖动期间 `Moved`/`Resized`
+/// **一个都到不了应用层**；Slint 的 `Timer` 走 winit 的 `ControlFlow`，其 `wakeup`/`cleared`
+/// 在事件处理器占用期间同样直接 return（`app_state.rs`）⇒ 也不触发。
+///
+/// common modes 包含 `NSEventTrackingRunLoopMode`，所以挂在它上面的时钟在拖动期间照常触发
+/// —— 这就是「拖拽期间也能跟随」的唯一可用挂点。
+///
+/// 返回的句柄**必须保活**（drop 即 invalidate 并回收回调）；进程级用法见调用点。
+#[cfg(target_os = "macos")]
+pub struct CommonModeTimer {
+    timer: *mut std::ffi::c_void,
+    /// 回调盒的裸指针（`Box<Box<dyn FnMut()>>`）：timer 的 context 不持有它，由本结构负责回收。
+    info: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CommonModeTimer {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn CFRunLoopTimerInvalidate(timer: *mut std::ffi::c_void);
+            fn CFRelease(cf: *const std::ffi::c_void);
+        }
+        unsafe {
+            // 先 invalidate 再释放：保证回调不会再跑，然后回收我们自己拥有的引用与回调盒。
+            CFRunLoopTimerInvalidate(self.timer);
+            CFRelease(self.timer as *const std::ffi::c_void);
+            drop(Box::from_raw(self.info as *mut Box<dyn FnMut()>));
+        }
+    }
+}
+
+/// 建一个 common-modes 重复定时器（见 [`CommonModeTimer`]）。须在主线程调。
+#[cfg(target_os = "macos")]
+pub fn common_mode_timer(
+    interval: std::time::Duration,
+    cb: impl FnMut() + 'static,
+) -> CommonModeTimer {
+    use std::ffi::c_void;
+
+    type CfIndex = isize;
+    /// `CFRunLoopTimerContext`（CoreFoundation 的结构布局，逐字段对齐）。
+    #[repr(C)]
+    struct TimerContext {
+        version: CfIndex,
+        info: *mut c_void,
+        retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+        release: Option<extern "C" fn(*const c_void)>,
+        copy_description: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    }
+    unsafe extern "C" {
+        fn CFRunLoopGetMain() -> *mut c_void;
+        fn CFRunLoopAddTimer(rl: *mut c_void, timer: *mut c_void, mode: *const c_void);
+        fn CFRunLoopTimerCreate(
+            allocator: *mut c_void,
+            fire_date: f64,
+            interval: f64,
+            flags: u64,
+            order: CfIndex,
+            callout: extern "C" fn(*mut c_void, *mut c_void),
+            context: *mut TimerContext,
+        ) -> *mut c_void;
+        fn CFAbsoluteTimeGetCurrent() -> f64;
+        static kCFRunLoopCommonModes: *const c_void;
+    }
+
+    extern "C" fn callout(_timer: *mut c_void, info: *mut c_void) {
+        // SAFETY: info 由本函数用 `Box::into_raw(Box::new(cb))` 造出（双重 Box：`Box<dyn FnMut()>`
+        // 是胖指针，不能直接当 `*mut c_void` 传），并且只在这里读、只在 `Drop` 里回收；
+        // `Drop` 先 invalidate 定时器，回调不会与回收并发。
+        let f = unsafe { &mut *(info as *mut Box<dyn FnMut()>) };
+        f();
+    }
+
+    let info = Box::into_raw(Box::new(Box::new(cb) as Box<dyn FnMut()>)) as *mut c_void;
+    let mut context = TimerContext {
+        version: 0,
+        info,
+        retain: None,
+        release: None,
+        copy_description: None,
+    };
+    let secs = interval.as_secs_f64();
+    // SAFETY: 全部参数都是本函数自己造的合法值；`kCFRunLoopCommonModes` 是 CoreFoundation
+    // 导出的常量 `CFStringRef`（按 `*const c_void` 读它的值即为该 CFString）。
+    let timer = unsafe {
+        let now = CFAbsoluteTimeGetCurrent();
+        let timer = CFRunLoopTimerCreate(
+            std::ptr::null_mut(),
+            now + secs,
+            secs,
+            0,
+            0,
+            callout,
+            &mut context,
+        );
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        timer
+    };
+    CommonModeTimer { timer, info }
+}
+
 /// 确保回到 accessory（幂等）。
 ///
 /// [`activate_app`] 之后进程**不再**会被提升为 Regular，所以这一支现在只是把不变式重新钉一遍

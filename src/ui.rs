@@ -784,6 +784,33 @@ fn anchored_dialog_pos(
     ))
 }
 
+/// 逻辑像素矩形 `(x, y, w, h)`：跟随相关的几何统一用它（避免裸四元组到处飞）。
+type Rect = (i32, i32, i32, i32);
+
+/// 气泡跟随的**几何落点**（纯函数，单测钉住）：对话窗矩形 + 气泡**窗口**矩形 + 工作区
+/// ⇒ 气泡窗口目标左上角（逻辑像素）。`None` = 已就位（不调 `set_position`，连多余的 `Moved`
+/// 都不产生）。
+///
+/// 为什么单独抽出来：A 卡（`abb-v11-bubble-follow-lag`）之后有**两条**落位通道（事件路径与
+/// 拖动期间的 common-modes 定时器），几何只允许有一份——两条通道都调本函数，
+/// 四角择优与夹取仍在 [`crate::syschat::snap_bubble_to_window`]。
+fn bubble_follow_target(dialog_rect: Rect, bubble_rect: Rect, work: Rect) -> Option<(i32, i32)> {
+    // 气泡几何用**可视区**（窗口比图标大 BUBBLE_INSET，见常量注释），换回窗口位要减掉。
+    let visual = (bubble_rect.0 + BUBBLE_INSET, bubble_rect.1 + BUBBLE_INSET);
+    let (_, (tx, ty)) = crate::syschat::snap_bubble_to_window(
+        dialog_rect,
+        visual,
+        (BUBBLE_VISUAL_SIZE, BUBBLE_VISUAL_SIZE),
+        work,
+    );
+    let target = (tx - BUBBLE_INSET, ty - BUBBLE_INSET);
+    if target == (bubble_rect.0, bubble_rect.1) {
+        None
+    } else {
+        Some(target)
+    }
+}
+
 /// D4：气泡跟随的**唯一落位入口**（开窗 / 对话窗 `Moved`·`Resized` / 拖气泡后的去抖存盘共用：
 /// 同一套几何不写第二份）。
 ///
@@ -804,24 +831,15 @@ fn snap_bubble_to_dialog(bubble: &AnchorBubble, dialog: &SystemChatWindow) -> bo
     let Some(bubble_rect) = logical_window_rect(&bubble.window()) else {
         return false;
     };
-    // 气泡几何用**可视区**（窗口比图标大 BUBBLE_INSET，见常量注释），换回窗口位要减掉。
-    let visual = (bubble_rect.0 + BUBBLE_INSET, bubble_rect.1 + BUBBLE_INSET);
     // 工作区取自**对话窗所在显示器**（窗口是事实源，气泡跟着它跨屏）；拿不到再退回气泡所在显示器。
     let Some(work) =
         monitor_work_area(&dialog.window()).or_else(|| monitor_work_area(&bubble.window()))
     else {
         return false;
     };
-    let (_, (tx, ty)) = crate::syschat::snap_bubble_to_window(
-        win_rect,
-        visual,
-        (BUBBLE_VISUAL_SIZE, BUBBLE_VISUAL_SIZE),
-        work,
-    );
-    let target = (tx - BUBBLE_INSET, ty - BUBBLE_INSET);
-    if target == (bubble_rect.0, bubble_rect.1) {
-        return false; // 已就位：不调 set_position，连多余的 `Moved` 都不产生
-    }
+    let Some(target) = bubble_follow_target(win_rect, bubble_rect, work) else {
+        return false; // 已就位
+    };
     bubble.window().set_position(slint::LogicalPosition::new(
         target.0 as f32,
         target.1 as f32,
@@ -829,13 +847,198 @@ fn snap_bubble_to_dialog(bubble: &AnchorBubble, dialog: &SystemChatWindow) -> bo
     true
 }
 
-/// D4：对话窗 `Moved` / `Resized` → 气泡贴到最近的角（跟随窗口移动/缩放/最大化）。
+// ─────────── A（卡 `abb-v11-bubble-follow-lag`）：跟手跟随 ───────────
+//
+// ## 根因（实核，不靠感觉）
+// owner：「气泡跟随窗口移动不够跟手」。实测链路：
+// 1. `ui/app.slint` 的 `PixelTitleBar { native-move: true }` ⇒ Slint 1.18 `WindowMoveArea`
+//    ⇒ `WindowAdapterInternal::start_window_move` ⇒ `winit_window.drag_window()`
+//    ⇒ macOS `-[NSWindow performWindowDragWithEvent:]`：在
+//    **`NSEventTrackingRunLoopMode`** 的嵌套 run loop 里一直跑到松手。
+// 2. `start_window_move` 是 `if let Some(w) = self.winit_window_or_none.borrow().as_window()`
+//    ——edition 2021 下 `if let` 的临时 `Ref` 活到整个 if-let 结束 ⇒ **拖动全程**
+//    Slint 侧的窗口 RefCell 都是「已借出」。
+// 3. 这期间 AppKit 照发 `windowDidMove:` → winit `emit_move_event()` → `queue_event()`
+//    → `maybe_queue_event()`：此时 `event_handler.in_use()` 为真（我们正卡在它里面），
+//    于是改走 `run_loop.queue_closure(...)`，而 `queue_closure` 明确只用
+//    **`kCFRunLoopDefaultMode`**（winit 自带注释：「Any events that are queued while running
+//    a modal or when live-resizing will instead wait, and be delivered to the application
+//    afterwards.」）。
+// 4. 同一原因，winit 的 `wakeup()` / `cleared()` 在事件处理器占用期间直接 return ⇒
+//    `Slint::Timer` 也**不触发**。
+//
+// 结论：**纯事件方案不可能跟手** —— 拖动期间应用层收不到任何 `Moved`/`Resized`（松手后才
+// 一次性补齐）。所以换机制：往主 run loop 的 **common modes**（含 event-tracking mode）挂一个
+// 16ms 定时器（[`crate::platform::common_mode_timer`]），自己每拍读一次对话窗矩形。
+//
+// ## 为什么用 `Arc<winit::Window>` 而不是 Slint 的 `window()`
+// 见上文第 2 点：拖动期间经 Slint 的窗口访问会 `RefCell` 重入 panic。winit 的 `Window`
+// （`WinitWindowAccessor::winit_window()` 异步取得，只在句柄就绪时用）读写都不碰那个 RefCell。
+//
+// ## 不破 D4 防环
+// 仍然只有「对话窗矩形 ⇒ 气泡位置」一个方向：[`bubble_follow_target`] 只吃对话窗矩形，
+// 泵也**从不**根据气泡位置反推对话窗（反向的 `anchored_dialog_pos` 仍只在开窗用一次）。
+// 另外泵只在「对话窗矩形变了」时才动作 ⇒ 用户拖气泡（对话窗不动）时泵不动手，
+// 不会与原生拖动抢窗口位置。
+
+/// 跟随泵的**动作判据**（纯函数，单测钉住）：只有「对话窗可见」且「对话窗矩形与上次不同」
+/// 才动气泡。
 ///
-/// 这是「跟随」**唯一的事件源**：只有对话窗自己的几何事件会触发吸附 —— 气泡自己的 `Moved`
-/// 绝不反向驱动对话窗（那条在 D4 已拆除，见 [`snap_bubble_to_dialog`] 的防环说明）。
+/// 第二条同时是**防抢位置**的关键：用户拖气泡时对话窗不动 ⇒ 泵不动作。
+fn follow_should_snap(prev_dialog: Option<Rect>, cur_dialog: Rect, visible: bool) -> bool {
+    visible && prev_dialog != Some(cur_dialog)
+}
+
+/// 工作区缓存判据（纯函数）：缓存工作区**包含对话窗中心点** ⇒ 沿用缓存（没跨显示器）。
+///
+/// 显示器互不重叠，所以中心点一跨屏就会落到缓存工作区之外 ⇒ 自动重算；
+/// 缓存命中时省掉 `current_monitor()`（跨 FFI + 显示器枚举，是原实现里最重的一步）。
+fn work_area_cache_hit(cached: Rect, win: Rect) -> bool {
+    let (cx, cy) = (win.0 + win.2 / 2, win.1 + win.3 / 2);
+    cx >= cached.0 && cx < cached.0 + cached.2 && cy >= cached.1 && cy < cached.1 + cached.3
+}
+
+/// A：跟随泵的共享状态（事件路径与定时器路径共用）。
+#[derive(Default)]
+struct FollowState {
+    /// 上一次 tick 看到的对话窗矩形（逻辑像素）——[`follow_should_snap`] 的基线。
+    last_dialog: Option<Rect>,
+    /// 工作区缓存：`(工作区, 命中它的对话窗矩形)`。
+    work: Option<(Rect, Rect)>,
+}
+
+impl FollowState {
+    /// 取工作区：缓存仍命中就沿用，否则用 `resolve` 重算并刷新缓存。
+    fn work_area(&mut self, dialog_rect: Rect, resolve: impl FnOnce() -> Option<Rect>) -> Option<Rect> {
+        if let Some((cached, _)) = self.work {
+            if work_area_cache_hit(cached, dialog_rect) {
+                return Some(cached);
+            }
+        }
+        let w = resolve()?;
+        self.work = Some((w, dialog_rect));
+        Some(w)
+    }
+}
+
+/// macOS：跟随泵的 winit 句柄（拖动期间唯一安全的读写通道，见本节根因）。
+#[cfg(target_os = "macos")]
+mod follow_macos {
+    use std::sync::Arc;
+
+    type WinitWindow = slint::winit_030::winit::window::Window;
+    type Rect = super::Rect;
+
+    /// 一个 winit 窗口的逻辑外框——同 [`logical_window_rect`] 的坐标口径，
+    /// 但**不经过 Slint 的 window adapter**。
+    pub(super) fn rect(w: &WinitWindow) -> Option<Rect> {
+        let sf = w.scale_factor();
+        let sf = if sf > 0.0 { sf } else { 1.0 };
+        let pos = w.outer_position().ok()?;
+        let size = w.inner_size();
+        Some((
+            (pos.x as f64 / sf).round() as i32,
+            (pos.y as f64 / sf).round() as i32,
+            (size.width as f64 / sf).round() as i32,
+            (size.height as f64 / sf).round() as i32,
+        ))
+    }
+
+    /// 某 winit 窗口所在显示器的完整边界（逻辑像素）——同 [`monitor_work_area`] 的口径。
+    pub(super) fn work_area(w: &WinitWindow) -> Option<Rect> {
+        w.current_monitor().map(|m| {
+            let p = m.position().to_logical::<f32>(m.scale_factor());
+            let s = m.size().to_logical::<f32>(m.scale_factor());
+            (p.x as i32, p.y as i32, s.width as i32, s.height as i32)
+        })
+    }
+
+    pub(super) struct Handles {
+        pub(super) dialog: Arc<WinitWindow>,
+        pub(super) bubble: Arc<WinitWindow>,
+    }
+}
+
+/// A：气泡跟随泵。macOS 上句柄就绪后由 common-modes 定时器驱动；其它平台只走事件路径。
+#[derive(Default)]
+struct FollowPump {
+    state: RefCell<FollowState>,
+    #[cfg(target_os = "macos")]
+    handles: RefCell<Option<follow_macos::Handles>>,
+}
+
+impl FollowPump {
+    /// 定时器路径（仅 macOS）：**绝不碰 Slint 的 window adapter**（拖动期间它被借出）。
+    #[cfg(target_os = "macos")]
+    fn tick_handles(&self) -> bool {
+        let handles = self.handles.borrow();
+        let Some(h) = handles.as_ref() else {
+            return false;
+        };
+        // 隐藏时连矩形都不读（托盘常驻，泵 60Hz 跑一整机寿命；这一步省掉 2 次 FFI）。
+        if h.dialog.is_visible() != Some(true) {
+            return false;
+        }
+        let Some(dialog_rect) = follow_macos::rect(&h.dialog) else {
+            return false;
+        };
+        let mut st = self.state.borrow_mut();
+        if !follow_should_snap(st.last_dialog, dialog_rect, true) {
+            return false;
+        }
+        // 基线先推进：气泡/工作区这一拍拿不到时不要每 16ms 重试。
+        st.last_dialog = Some(dialog_rect);
+        let Some(bubble_rect) = follow_macos::rect(&h.bubble) else {
+            return false;
+        };
+        let Some(work) = st.work_area(dialog_rect, || {
+            follow_macos::work_area(&h.dialog).or_else(|| follow_macos::work_area(&h.bubble))
+        }) else {
+            return false;
+        };
+        let Some(target) = bubble_follow_target(dialog_rect, bubble_rect, work) else {
+            return false;
+        };
+        h.bubble.set_outer_position(slint::winit_030::winit::dpi::LogicalPosition::new(
+            target.0 as f32,
+            target.1 as f32,
+        ));
+        true
+    }
+
+    /// 事件路径（对话窗 `Moved`/`Resized`）：句柄就绪走句柄版本（带缓存/去重），
+    /// 未就绪（非 macOS，或 macOS 上 `spawn_local` 还没跑完）退回 Slint 版本。
+    ///
+    /// 为什么退回 Slint 版本在 macOS 上安全：拖动期间 macOS **不会**把 `Moved` 交到应用层
+    /// （本节根因第 3 点），所以这个退路不可能在「RefCell 已被借出」的时机被走到。
+    fn tick(
+        &self,
+        bubble: &slint::Weak<AnchorBubble>,
+        dialog: &slint::Weak<SystemChatWindow>,
+    ) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.handles.borrow().is_some() {
+            return self.tick_handles();
+        }
+        let (Some(b), Some(d)) = (bubble.upgrade(), dialog.upgrade()) else {
+            return false;
+        };
+        snap_bubble_to_dialog(&b, &d)
+    }
+}
+
+/// A：泵的 16ms 节拍（稿/卡口径：16ms 合并，约一帧）。
+const FOLLOW_TICK_MS: u64 = 16;
+
+/// D4/A：对话窗 `Moved` / `Resized` → 气泡贴到最近的角（跟随窗口移动/缩放/最大化）。
+///
+/// 这是「跟随」的**事件源**（另一个源是 macOS 上拖动期间的定时器，见 [`FollowPump`]）：
+/// 只有对话窗自己的几何事件会触发吸附 —— 气泡自己的 `Moved` 绝不反向驱动对话窗
+/// （那条在 D4 已拆除，见 [`snap_bubble_to_dialog`] 的防环说明）。
 /// 返回 true 表示该事件属于几何跟随面。
 fn handle_syschat_geometry_event(
     ev: &slint::winit_030::winit::event::WindowEvent,
+    pump: &FollowPump,
     bubble: &slint::Weak<AnchorBubble>,
     dialog: &slint::Weak<SystemChatWindow>,
 ) -> bool {
@@ -843,9 +1046,7 @@ fn handle_syschat_geometry_event(
     if !matches!(ev, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
         return false;
     }
-    if let (Some(b), Some(d)) = (bubble.upgrade(), dialog.upgrade()) {
-        snap_bubble_to_dialog(&b, &d);
-    }
+    pump.tick(bubble, dialog);
     true
 }
 
@@ -6189,6 +6390,44 @@ pub fn run_gui() -> Result<()> {
     // **坐标系**：winit 的 `Moved` 给**物理**像素，而 BubblePos/set_position 全用**逻辑**像素
     // （Retina 2x 下不换算会让存盘位置每次重启翻倍——评审 R3）。故这里先换逻辑再缓存。
     let bubble_pos_pending: Rc<Cell<Option<crate::syschat::BubblePos>>> = Rc::new(Cell::new(None));
+    // A（卡 `abb-v11-bubble-follow-lag`）：跟随泵。事件路径（对话窗 Moved/Resized）与 macOS
+    // 拖动期间的 16ms common-modes 定时器共用它；句柄在下面用 `spawn_local` 异步取得。
+    let follow_pump: Rc<FollowPump> = Rc::new(FollowPump::default());
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        let p = follow_pump.clone();
+        let dw = syschat_win.as_weak();
+        let bw = bubble.as_weak();
+        // `winit_window()` 是异步的（窗口创建完成才 resolve）；拿到后：
+        // ① 存句柄（事件路径改走句柄版本）；② 起 common-modes 定时器。
+        // 定时器必须保活到进程结束（drop 即 invalidate）——用 `mem::forget`（与既有 `saver`
+        // / 主定时器同款泄漏处理，见那两处注释）。
+        let _ = slint::spawn_local(async move {
+            let (Some(d), Some(b)) = (dw.upgrade(), bw.upgrade()) else {
+                return;
+            };
+            let (Ok(dialog), Ok(bubble_w)) = (
+                d.window().winit_window().await,
+                b.window().winit_window().await,
+            ) else {
+                return; // 非 winit 后端（例如 SLINT_BACKEND=winit-software 以外的测试后端）：
+                        // 保持事件路径的 Slint 版本即可
+            };
+            *p.handles.borrow_mut() = Some(follow_macos::Handles {
+                dialog,
+                bubble: bubble_w,
+            });
+            let p2 = p.clone();
+            let timer = crate::platform::common_mode_timer(
+                Duration::from_millis(FOLLOW_TICK_MS),
+                move || {
+                    let _ = p2.tick_handles();
+                },
+            );
+            std::mem::forget(timer);
+        });
+    }
     {
         use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
         let pending = bubble_pos_pending.clone();
@@ -6736,6 +6975,7 @@ pub fn run_gui() -> Result<()> {
         let drop_ev = drop_tracker.clone();
         // D4：气泡跟随用的弱引用（对话窗 Moved/Resized → 气泡贴角）。
         let follow_bubble = bubble.as_weak();
+        let follow_pump_ev = follow_pump.clone();
         syschat_win.window().on_winit_window_event(move |w, ev| {
             // C2 拖放（Finder → 对话窗）：**不需要任何 AppKit 手写代码**——winit 0.30 的 macOS
             // 实现自己就是 `NSDraggingDestination`（`window_delegate.rs:367`），已把系统拖放翻译成
@@ -6801,7 +7041,7 @@ pub fn run_gui() -> Result<()> {
             // 与 ⌘V / 拖放 / 红点关闭 / 失焦隐藏共用一个钩子（`on_winit_window_event` 是单槽 set）。
             // 这是「跟随」**唯一的事件源**（气泡自己的 Moved 不反向驱动对话窗，详见
             // `handle_syschat_geometry_event` / `snap_bubble_to_dialog` 的防环说明）。
-            handle_syschat_geometry_event(ev, &follow_bubble, &cw2);
+            handle_syschat_geometry_event(ev, &follow_pump_ev, &follow_bubble, &cw2);
             // D5：**失焦即隐藏**（接线在 [`handle_syschat_focus_event`]，那里有判据/延时的完整理由）。
             // ⚠️ 必须挂在这个**已有**的钩子上：`on_winit_window_event` 是单槽 `set`，
             // 另起一个会把 ⌘V / Finder 拖放 / 红点关闭整条顶掉（且不会报错）。
@@ -7798,6 +8038,90 @@ mod headless_render;
 #[cfg(test)]
 mod tests {
 
+    // ── A（卡 `abb-v11-bubble-follow-lag`）：跟随泵的纯逻辑 ──────────────────
+
+    /// 动作判据：只有「可见 + 对话窗矩形变了」才动气泡。
+    ///
+    /// 判别力（两个输入各管一条，变异后必红）：
+    /// - 去掉 `visible &&` ⇒ `..._hidden_never_snaps` 红；
+    /// - 去掉 `prev_dialog != Some(cur_dialog)` ⇒ `..._same_rect_is_noop` 红（泵会每 16ms 把气泡
+    ///   拖回角，用户拖气泡时会被抢走位置）。
+    #[test]
+    fn follow_snaps_only_when_dialog_geometry_changed_and_visible() {
+        let a = (100, 100, 520, 560);
+        let b = (160, 100, 520, 560);
+        assert!(follow_should_snap(Some(a), b, true), "对话窗移动了：应跟随");
+        assert!(follow_should_snap(None, a, true), "首次（无基线）：应跟随");
+        assert!(
+            !follow_should_snap(Some(a), a, true),
+            "对话窗矩形未变：不动作（否则会与「拖气泡」抢窗口位置）"
+        );
+        assert!(
+            !follow_should_snap(None, a, false),
+            "对话窗隐藏：不跟随（气泡自由摆放）"
+        );
+        assert!(
+            !follow_should_snap(Some(a), b, false),
+            "对话窗隐藏：即使矩形变了也不跟随"
+        );
+    }
+
+    /// 工作区缓存判据：中心点仍在缓存工作区内 ⇒ 命中，否则重算（跨屏）。
+    ///
+    /// 判别力：把判据改成「恒 true」⇒ `..._recomputes_when_window_crosses_screen` 红
+    ///（跨屏后一直沿用旧显示器的工作区，气泡被夹到错误边界）。
+    #[test]
+    fn work_area_cache_hits_inside_and_recomputes_across_screen() {
+        let left = (0, 0, 1920, 1080);
+        let right = (1920, 0, 1920, 1080);
+        // 窗在左屏中心附近：缓存命中。
+        assert!(work_area_cache_hit(left, (800, 400, 520, 560)));
+        // 窗口刚跨到右屏（中心已在右屏）：缓存失效 ⇒ 重算。
+        assert!(!work_area_cache_hit(left, (1700, 400, 520, 560)));
+        // 边界：中心点落在缓存右边界上算**不命中**（右屏从该点开始，取新显示器更对）。
+        assert!(!work_area_cache_hit(left, (1660, 400, 520, 560)));
+        assert!(work_area_cache_hit(right, (1700, 400, 520, 560)));
+    }
+
+    /// `FollowState::work_area`：命中不调 `resolve`（省 `current_monitor()`），失效才调一次并刷新缓存。
+    #[test]
+    fn follow_state_reuses_cached_work_area_until_screen_changes() {
+        let left = (0, 0, 1920, 1080);
+        let right = (1920, 0, 1920, 1080);
+        let mut st = FollowState::default();
+        let calls = std::cell::Cell::new(0usize);
+        let bump = |v| {
+            calls.set(calls.get() + 1);
+            Some(v)
+        };
+        let first = st.work_area((800, 400, 520, 560), || bump(left));
+        assert_eq!(first, Some(left));
+        assert_eq!(calls.get(), 1, "首次应重算一次");
+        let again = st.work_area((820, 400, 520, 560), || bump(left));
+        assert_eq!(again, Some(left));
+        assert_eq!(calls.get(), 1, "同一显示器内应走缓存，不再查显示器");
+        let crossed = st.work_area((1700, 400, 520, 560), || bump(right));
+        assert_eq!(crossed, Some(right));
+        assert_eq!(calls.get(), 2, "跨显示器应重算一次");
+    }
+
+    /// 几何落点：已就位返回 `None`（不调 `set_position`），未就位返回目标窗口位。
+    /// 并守住「开窗锚定 → 吸附」的不动点（D4 的 `snap_is_fixed_point_of_open_anchor` 同口径）。
+    #[test]
+    fn bubble_follow_target_is_none_when_already_snapped() {
+        let work = (0, 0, 1920, 1080);
+        let dialog = (800, 400, 520, 560);
+        // 气泡窗口位 = 可视区外侧再减 4px 透明边；上角对齐窗上缘 ⇒ 可视 y = dialog.y、窗口 y = dialog.y − 4。
+        let bubble = (800 - 10 - 36 - 4, 400 - 4, 44, 44);
+        assert_eq!(bubble_follow_target(dialog, bubble, work), None, "已就位");
+        let moved = (900, 400, 520, 560);
+        assert_eq!(
+            bubble_follow_target(moved, bubble, work),
+            Some((900 - 10 - 36 - 4, 400 - 4)),
+            "对话窗右移 100px：气泡也应右移 100px（增量=1:1）"
+        );
+    }
+
     /// D7：媒体/文件路径的**唯一基准** —— 图片内联、媒体卡打开、普通「打开」/链接点击
     /// 三处都必须调用 `crate::syschat::resolve_media_path`，不得各写一份（尤其不得回退到
     /// 进程 CWD：`PathBuf::from(src)` / `Path::new(s)`）。
@@ -7959,10 +8283,18 @@ mod tests {
             prod.contains("anchored_dialog_pos(b.window(), w.window())"),
             "开窗锚定必须保留（气泡 ⇒ 窗口的唯一一次）"
         );
-        // 跟随只挂在对话窗的几何事件上（唯一事件源）。
+        // 跟随只挂在对话窗的几何事件上（唯一事件源），并交给跟随泵（它内部再按
+        // 「句柄就绪走句柄版 / 否则退回 Slint 版」分派，A 卡）。
         assert!(
-            prod.contains("handle_syschat_geometry_event(ev, &follow_bubble, &cw2)"),
+            prod.contains("handle_syschat_geometry_event(ev, &follow_pump_ev, &follow_bubble, &cw2)"),
             "对话窗 Moved/Resized 必须跟随气泡"
+        );
+        // A（卡 `abb-v11-bubble-follow-lag`）：macOS 拖动期间 winit 不交事件，必须有一条
+        // **common-modes 定时器**驱动的跟随通道；否则「拖窗时气泡不动，松手才跳」。
+        assert!(
+            prod.contains("crate::platform::common_mode_timer(")
+                && prod.contains("p2.tick_handles()"),
+            "拖动期间的跟随通道必须存在（common-modes 定时器 → tick_handles）"
         );
         // 气泡钩子不得再移动对话窗（旧写法用的是 `d.window()` 这个绑定名）。
         assert!(
