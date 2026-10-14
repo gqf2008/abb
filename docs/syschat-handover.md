@@ -1,7 +1,7 @@
 # 系统级对话（syschat）交接文档
 
 > 面向**下一个接手的人**（或新会话）。目标：读完这一份就能继续干，不用重新踩坑。
-> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-v11-screenshot` 更新 §0/§5.2/§6/§7.3**（✂ 截屏落地）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
+> 首版写于 `main = 7b8eea5`（2026-10-14 深夜）；**2026-10-15 随卡 `abb-syschat-resize-macos-20261015` 更正 §0/§1/§5.1/§5.2/§6**（`main = d5ddd9e`）；**同日随卡 `abb-v11-message-actions` 更新 §0/§5.2/§7.3**（消息动作从「未做」移到「已做」，评审两条 blocking 的修法见 §5.2）；**同日随卡 `abb-v11-screenshot` 更新 §0/§5.2/§6/§7.3**（✂ 截屏落地）；**同日随卡 `abb-syschat-e3-tokens-20261013` 更新 §0/§5.2/§6/§7.3**（Token 真实用量落地：ACP `_meta.usage` 是真来源，不是估算——上一版「`acp.rs` 没有 usage 来源」的结论是**错的**，见 §6）；**同日随卡 `abb-settings-window-resize-macos-20261015` 更新 §0/§5.1/§5.2/§6/§7.3**（设置窗在 macOS 也能缩放；顺带修掉「设置窗/弹窗里的 `ImageIcon` 图标**画不出来**」——组件根 `Image` 缺整图裁剪，见 §6）。**事实以仓库代码/卡为准，本文只是索引与踩坑记录。**
 
 ---
 
@@ -12,7 +12,8 @@
 - **历史会话归档已做**（卡 `abb-v11-session-archive`）：会话菜单「🗄 归档…」归档当前会话（从列表隐藏）、「🗄 已归档（N）…」进归档视图（点一条 = 取消归档并切回）；**不删任何历史文件**。剩 **owner 真机复验**（点开面板 → 归档 → 已归档 → 找回；锁屏时合成点击打不进 app）。
 - **Token 真实用量已做**（卡 `abb-syschat-e3-tokens-20261013`）：状态栏「已用/上限 · 百分比」+ 进度条（≥70% 橙 / ≥90% 红），悬停给精确 token 数**和口径**；值是**真实计数**（执行层从 provider 响应上报的 prompt tokens），不是 `chars/4` 估算。上限来源：设置里 `context_window` 覆盖 > 内置常见模型表 > `—`（不知道就不印数）。
 - **截屏已做**（卡 `abb-v11-screenshot`）：功能区 ✂ → 选区/选窗（`screencapture -i`）→ 落进待发附件（与 📎/⌘V 同一条落地路径）。缺「屏幕录制」授权时**先探权限、不拍**，状态行给三要素引导（哪项权限 / 去哪儿开 / 开完要重启）。
-- 还没做：**思考块真机可见**（卡在 `abb-agent`）、**设置窗在 macOS 缩放**（§5.2，根因同 §5.1）。
+- **设置窗在 macOS 也能缩放**（卡 `abb-settings-window-resize-macos-20261015`）：与对话窗同一套口径（恒画热区 + macOS 自管缩放，两个窗**各一份** `SelfResize`——下界不同）。顺带修掉一个**一直存在但没人报**的缺陷：设置窗与两个弹窗里的 `ImageIcon` 图标**从来没画出来过**（组件根 `Image` 缺「整图裁剪」⇒ `fit()` 出 NaN，见 §6）；无头台现在是**第一条能渲染设置窗**的用例。剩 **owner 真机复验**（拖设置窗边角 + 看设置窗/弹窗图标是否出来）。
+- 还没做：**思考块真机可见**（卡在 `abb-agent`）、**插入（steer）**（执行层声明不支持，见 §5.2）。
 
 ---
 
@@ -102,8 +103,8 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 3. ABB 两个窗都是 Slint `no-frame` ⇒ winit 后端一律 `with_transparent(true)`（`wants_transparent`，圆角靠它）⇒「交给系统缩放」在本仓**根本不存在**。于是 `360069f`(v11c) → `ecc627d` → `7b8eea5` 那条「macOS 关掉热区、交给系统」是**死路**：关掉热区 = 完全不能缩放。
 4. 仍成立但**不解释拖不动**的三条背景事实：winit macOS 无边框窗样式位含 `Resizable`（`window_delegate.rs:542-544`）；`drag_resize_window` 在 macOS 返回 `NotSupported`（`:1179`）；属性钩子里的 `.with_resizable(true)` 会被 Slint 随后写入的 `attributes.resizable` 覆盖（`winitwindowadapter.rs:266`）。
 
-**修法（已落地）**：对话窗**恒画热区**（`syschat_resize_hit_areas_enabled()` → `true`），macOS 走**自管缩放**（`syschat_resize_self_managed()` → `cfg!(target_os = "macos")` + `SelfResize`/`ResizeSession`：按屏幕坐标跟指针算尺寸，先尺寸后位置）；设置窗仍只在 Windows/Linux 画（`settings_resize_hit_areas_enabled()`——它的热区接 `drag_resize_window`，macOS 上是死区）；`show_window_and_focus()` 里「show 之后补 `set_resizable(true)`」整段删掉（无效时机，且 Slint 建窗时按 `min != max` 自己定 resizable）。
-**守卫**：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：对话窗恒画 / 两窗口径分开 / 自管 = macOS）+ 无头几何 `ui_headless_render_test::{self_managed_hit_zones_route_press_with_pointer_coords, v11c_resize_zones_hit_all_edges_and_corners, resize_hot_zone_eats_titlebar_top_band}`。
+**修法（已落地）**：对话窗**恒画热区**（`syschat_resize_hit_areas_enabled()` → `true`），macOS 走**自管缩放**（`syschat_resize_self_managed()` → `cfg!(target_os = "macos")` + `SelfResize`/`ResizeSession`：按屏幕坐标跟指针算尺寸，先尺寸后位置）；**设置窗同日接上同一条自管线**（`settings_resize_hit_areas_enabled()` → `true`、`settings_resize_self_managed()` → macOS 自管、自己的 `SelfResize::with_min(880, 620)`，卡 `abb-settings-window-resize-macos-20261015`，见 §5.2）；`show_window_and_focus()` 里「show 之后补 `set_resizable(true)`」整段删掉（无效时机，且 Slint 建窗时按 `min != max` 自己定 resizable）。
+**守卫**：`ui::tests::resize_hit_areas_follow_platform_rule`（结构：两个窗都恒画 / 两窗各有自管接线与自己的下界 / 自管 = macOS / 设置窗钩子必须跟 `CursorMoved` + 三条收尾）+ 无头几何 `ui_headless_render_test::{self_managed_hit_zones_route_press_with_pointer_coords, settings_self_managed_hit_zones_route_press_with_pointer_coords, v11c_resize_zones_hit_all_edges_and_corners, resize_hot_zone_eats_titlebar_top_band}` + 跨文件常量 `syschat::tests::settings_window_min_constants_match_slint`。
 **证据（`/private/tmp` 会被清，脚本可按 §1 重建）**：`verify-a1.log`/`verify-a2.log`（Some/None + `is_resizable`）、`verify-0120.log`/`verify-0245.log`（`[selfresize] begin dir=east` + `ret=true` + 其后数百次 `cursor_moved`）、`syschat-shots/verify-isresizable.png`（对话窗真开出来）。
 **未验证（owner 项）**：真机手拖边角「窗口真的变大变小 + 手感/发不发飘」，以及自管缩放与最大化（`toggle_syschat_maximize`）的互动。合成点击**必须先解锁屏**。
 
@@ -116,7 +117,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 | **Token 真实用量** | **已做**（卡 `abb-syschat-e3-tokens-20261013`，2026-10-15 落 main） | 口径＝**真实计数，不是估算**：`crates/abb-agent`（rpi 驱动）本来就从 provider 响应里解出 `AssistantMessage.usage`，只是**没往外报** ⇒ 现在随 `session/prompt` 结果 `_meta.usage`（camelCase `input/output/cacheRead/cacheWrite/total`）上报，根侧 `runtime::acp::parse_usage` 收下（缺字段/全零 ⇒ `None`，绝不编数），经 `pool::PromptResult::final_usage` → harness 旁路表 → `oneshot` → `syschat::TurnEnd::Done{usage}` → 写 `SessionMeta.context_tokens`（**prompt 侧** `input＋cacheRead＋cacheWrite`，不含 output）。上限：`providers[].context_window`（`#[serde(default)]`，旧 config 兼容）**覆盖**内置常见模型表（子串匹配、长键在前；匹配不到 ⇒ `None` ⇒ 印 `—`）。UI 文案/档位/提示全是纯函数（`context_usage_text` / `usage_level` / `context_usage_tip`），渲染半是无盘注入（`ui::apply_syschat_usage`）⇒ 无头台可断言任意档位。剩 **owner 真机复验**：真机跑一轮看数字随回合变化 + 设置窗「上下文窗口」填/清（`0` = 用内置表）|
 | **思考块真机可见** | GUI 全就绪（折叠块 + 耗时 + 打字机），**执行层不发** | 卡 `abb-agent-project-thinking-20261014`：`crates/abb-agent` 的 `event_updates` 未映射 rpi 的 `ThinkingDelta`，且 `thinking_level` 默认 `Off`（打开会改模型请求参数，建议默认关 + 设置项） |
 | **插入（steer）** | GUI + 发送端已就绪；**生产恒走排队** | `abb-agent` 如实上报 `steering.supported=false`（`_session/steering` 回 `-32601`）⇒ 要真插入得换声明支持该扩展的适配器，或改 `abb-agent` |
-| **设置窗在 macOS 缩放** | 未做 | 它的热区接 `drag_resize_window`（macOS `NotSupported`）= 死区 ⇒ 要可缩放得给它也接自管循环（`SelfResize` 现在只绑在对话窗的 `on_self_resize_begin` 上）；§5.1 的更正说明同样适用 |
+| **设置窗在 macOS 缩放** | **已做**（卡 `abb-settings-window-resize-macos-20261015`，2026-10-15 落 main） | 口径＝**与对话窗同一套，但两窗各一份**：`.slint` 里 `WindowResizeZones`（6px 边 / 14px 角 / 只认左键，逐条同 `PixelWindowResize` 几何）恒画，`resize-self-managed: true`（macOS）时热区按下改发 `self-resize-begin(dir, x, y)`；Rust 侧为设置窗单独建一个 `SelfResize::with_min(SETTINGS_MIN_W, SETTINGS_MIN_H)`（下界不同**不能共用**：共用会「拖这个窗动那个窗」），`CursorMoved` 跟指针 + 松手/失焦/关窗三条收尾都挂进**既有**的那个 winit 钩子（单槽 `set`，另起一个会顶掉未保存确认框）。同时修掉**图标空白**：`ImageIcon` 补上整图裁剪（组件根 `Image` 缺 `source-clip-*`，见 §6）。守卫：源码接线（含钩子里的 `CursorMoved`/收尾）+ 无头几何/路由/反向对照 + 跨文件下界常量。剩 **owner 真机复验**：真机拖设置窗边角（手感 + 与最大化/标题栏拖拽的互动）、以及设置窗与两个弹窗的图标是否出来（锁屏期合成点击打不进 app） |
 | 跟进卡 | — | `abb-syschat-b-followups` / `abb-syschat-c-followups`（B/C 批评审的非阻塞项） |
 
 ---
@@ -130,6 +131,18 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 - 结局判定：**没有 PNG 文件就不许说成功**。取消 = 没文件 + 没 stderr ⇒ 报「已取消」（不是失败）；文件在但不是 PNG（半张图）⇒ 失败，别让它进待发。
 - 截屏产物与 📎/⌘V 走**同一条落地路径**（`syschat::land_attachments` → 工作区附件目录 → 待发列表）：另开一条会让「文件名唯一化 / 落地失败回滚 / 待发行 UI」三处各漂一份。
 - **未验**：真机点 ✂ 实际截一张（本会话屏幕锁着，合成点击打不进 app，见 §1）。
+
+**设置窗图标 / Slint 组件根 `Image` 的整图裁剪（2026-10-15 实证，卡 `abb-settings-window-resize-macos-20261015`）**
+- **现象**：设置窗（以及 `TeamDialog`/`VirtualBotDialog`）里所有 `ImageIcon` 图标**画不出来**；拿无头软件渲染器渲设置窗时直接 panic（`euclid-0.22.14/src/size.rs:335` unwrap None）。
+- **根因链**：`ImageIcon` 是「`Image` 当**组件根** + `source: root.icon`（动态属性）」⇒ 编译器把它降成 `ClippedImage`，却**不**合成 `source-clip-width/height` 的默认绑定（上游 `default_geometry::adjust_image_clip_rect` 只在「有绑定或属性被用到」时才补默认值，组件根的依赖分析看不到这层——上游 1.18.1 仍如此）⇒ 运行期裁剪恒 `0×0` ⇒ i-slint-core `fit()` 的 `adjust_for_tiling()` 算 `o.width * (target.width/o.width)` = `0 * inf` = **NaN** ⇒ software 渲染器在 `Rect::cast` 上 unwrap panic；femtovg/skia 按 NaN 几何**画不出**（生产默认 femtovg ⇒ 这些图标一直是空白，**静默**，不报错）。
+- **纠偏**：在 `ImageIcon` 里**显式**写下编译器本该合成的那两条绑定（`source-clip-width: root.icon.width - root.source-clip-x`；判据 = 设置窗的无头渲染用例——裁剪退回 0×0 就 panic）。实测依据：探针打出 40 个 `ClippedImage` 全为 `clip=(0,0,0,0)`。
+- **不适用**：直接 `Image { source: <动态> }`（如 `QrDialog` 的二维码）**不受影响**——它会降成 `ImageItem`，`source_clip()` 返回 `None`（无头实测该窗**零**个 `ClippedImage`）。⇒ 判据是「是不是组件根」，不是「source 动态不动态」。
+- **教训**：这类缺陷**既不报错也不崩 GUI**（只在 software 后端才崩），只能靠「新窗口先无头渲一张」发现。
+
+**Slint 前向引用 + 两窗两份 `SelfResize`（同上卡）**
+- `.slint` **不允许前向引用元素**：`WindowResizeZones`/`ResizeZone` 必须声明在**用到它的两个窗口之前**（放到之后编译直接报 `Unknown element 'WindowResizeZones'`——实测踩过，不是猜的）。
+- 两个窗**各要一份** `SelfResize`：下界不同（对话窗 `340×380` / 设置窗 `880×620`），共用一份会「拖这个窗动那个窗」；下界随窗给（`SelfResize::with_min`），跨文件常量守卫 `syschat::tests::settings_window_min_constants_match_slint`。
+- 自管会话的「接线」**只能靠源码守卫**：会话要真 winit 句柄才起得来（`SelfResize::begin` → `with_winit_window`），无头台没有句柄 ⇒ 拖不出会话（同 `self_resize_pauses_and_resumes_bubble_follow` 的理由）；所以设置窗钩子里的 `CursorMoved`/三条收尾是**结构断言**钉住的。
 
 **用量（E3）**
 - 上一版写「`acp.rs` 没有任何 usage 来源（goose 注释明说不报）」是**针对旧适配器的过时结论**：本仓执行层是 `crates/abb-agent`（rpi 驱动），rpi 的 provider mapper 会把 `usage` 填进 `AssistantMessage`（anthropic 填 `input/cache_read/cache_write`，openai/faux 同类），**只是没往外转发**。⇒ 别退到 `chars/4` 估算，真值就在手边。
@@ -208,6 +221,7 @@ rm -rf /Applications/ABB.app; ditto "$B" /Applications/ABB.app; open /Applicatio
 
 ### 7.3 接手第一小时建议
 1. 读 §1，自己开窗抓一张图，建立「我能自己验收」的闭环（这一步能省掉后面所有「让用户截图」的往返）。
-2. §5.1 缩放**已修**（卡 `abb-syschat-resize-macos-20261015`：对话窗恒画热区 + macOS 自管缩放），剩**真机手感**复验；**别再拿 `is_resizable` 取证**（它既不假也不是判据，见 §5.1）。
-3. 按 §5.2 从上往下做（**缩放 ✅ / 消息动作 ✅ / 归档 ✅ / 用量(E3) ✅ / 截屏 ✅ 已完成**；剩：设置窗缩放；思考/steer 要动 `abb-agent`，可最后做）。
-4. 每做完 2–3 条，**批量**跑四门禁 + 独立评审 + 打包安装一次（owner 已同意这条降档口径）。
+2. §5.1 缩放**已修**（卡 `abb-syschat-resize-macos-20261015`：对话窗恒画热区 + macOS 自管缩放；设置窗同日接上同一套，见 §5.2），剩**真机手感**复验；**别再拿 `is_resizable` 取证**（它既不假也不是判据，见 §5.1）。
+3. 按 §5.2 从上往下做（**缩放 ✅ / 设置窗缩放 ✅ / 消息动作 ✅ / 归档 ✅ / 用量(E3) ✅ / 截屏 ✅ 已完成**；剩：思考块真机可见 + 插入(steer)——**都要动 `abb-agent`**，可最后做）。
+4. **动 `.slint` 里任何窗口/图标之后，先让无头台渲一张**（设置窗那批图标就是「一直画不出来但谁也不报错」，见 §6）；`.slint` 还有两条硬规矩：组件必须声明在使用点**之前**（前向引用直接编译失败）、同一个窗口**只能有一个** `on_winit_window_event` 钩子（单槽 `set`，另起一个会静默顶掉前一个）。
+5. 每做完 2–3 条，**批量**跑四门禁 + 独立评审 + 打包安装一次（owner 已同意这条降档口径）。

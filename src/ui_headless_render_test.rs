@@ -1690,6 +1690,107 @@ fn self_managed_hit_zones_route_press_with_pointer_coords() {
     );
 }
 
+/// **设置窗**的缩放热区（2026-10-15 扩到设置窗）：同一套几何、两条路由由
+/// `resize-self-managed` 二选一，**不得同时触发**。
+///
+/// 为什么设置窗也要有一条（而不只靠源码守卫）：设置窗此前是「macOS 不画热区」——
+/// 换成「恒画 + 自管」以后，最重要的判据是**按下真的落到热区、坐标真的如实上报**
+/// （自管缩放的锚点就取自它；只报方向的老口径要等第一次 `CursorMoved` 才补锚）。
+/// 源码守卫只看得到「接线在」，看不到「几何/路由对不对」。
+///
+/// 与对话窗那条（`self_managed_hit_zones_route_press_with_pointer_coords`）同构；
+/// 窗口尺寸用设置窗自己的（980×680，见 `.slint` 的 `preferred-*`）。
+///
+/// 这也是**本仓第一条能渲染设置窗的用例**，所以它顺带钉住了 `ImageIcon` 的整图裁剪
+/// （`ui/app.slint` 里那两条 `source-clip-*`）：设置窗里的图标全是 `ImageIcon`（`Image` 当
+/// 组件根 + 动态 `source`），裁剪退回 0×0 时 `i-slint-core::fit()` 出 NaN ⇒ 上游 software
+/// 渲染器直接在 `settle_w` 里 panic。判据就是「能不能渲染」本身。
+///
+/// 判别力（负向，变异自验 2026-10-15：逐条单发、每处都编译通过 + 目标用例 FAILED + 失败文本
+/// 指向变异点）：① `ImageIcon` 的两条整图裁剪删掉 ⇒ 本用例红（euclid `size.rs:335` unwrap
+/// panic）；② 设置窗 overlay 换回 `PixelWindowResize` ⇒ 红（`self-resize-begin` 永不触发）；
+/// ③ `self-managed` 写死 `false` ⇒ 红（按下没有实现）；④ `south-east` 角块 14×14 → 4×4
+/// ⇒ 红（(973,673) 不再落块内）。接线类四处打在源码守卫上（`resize_hit_areas_follow_platform_rule`
+/// / `settings_window_min_constants_match_slint`：热区开关回「macOS 不画」、钩子删 `CursorMoved`、
+/// 下界改用对话窗的、`SETTINGS_MIN_W` 漂 10px ⇒ 各自那条红）。
+#[test]
+fn settings_self_managed_hit_zones_route_press_with_pointer_coords() {
+    const SW: u32 = 980;
+    const SH: u32 = 680;
+    let windows = WINDOWS.with(|w| w.clone());
+    let _ = slint::platform::set_platform(Box::new(HeadlessPlatform {
+        windows: windows.clone(),
+    }));
+    let ui = SettingsWindow::new().expect("SettingsWindow 建窗失败");
+    let got = Rc::new(std::cell::RefCell::new(Vec::<(String, f32, f32)>::new()));
+    {
+        let g = got.clone();
+        ui.on_self_resize_begin(move |dir, x, y| g.borrow_mut().push((dir.to_string(), x, y)));
+    }
+    let system = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    {
+        let s = system.clone();
+        ui.on_begin_resize(move |dir| s.borrow_mut().push(dir.to_string()));
+    }
+    ui.set_resize_hit_areas(true);
+    ui.set_resize_self_managed(true);
+    ui.show().expect("设置窗 show 失败");
+    ui.window().set_size(slint::PhysicalSize::new(SW, SH));
+    let win = windows.borrow().last().expect("平台没发窗口").clone();
+    let _ = settle_w(&win, SW, SH);
+
+    // 右下角（`south-east`，14×14：x 966..980 / y 666..680）：按下点原样上报（含窗口坐标）。
+    press(&win, 973.0, 673.0);
+    release(&win, 973.0, 673.0);
+    assert_eq!(
+        got.borrow().as_slice(),
+        [("south-east".to_string(), 973.0, 673.0)],
+        "设置窗右下角按下没有落到自管缩放热区，或坐标没有如实上报（{got:?}）"
+    );
+    assert!(
+        system.borrow().is_empty(),
+        "自管口径下不许再发系统 begin-resize（{system:?}）——两条路由必须二选一"
+    );
+
+    // 左边条（`west`，6px 整高）：中部按按下也不得被吞。
+    press(&win, 2.0, 300.0);
+    release(&win, 2.0, 300.0);
+    assert_eq!(
+        got.borrow().as_slice(),
+        [
+            ("south-east".to_string(), 973.0, 673.0),
+            ("west".to_string(), 2.0, 300.0)
+        ],
+        "设置窗左边条按下没有落到 west 热区（{got:?}）"
+    );
+
+    // 反向对照：内容区中部**不是**热区（否则整窗都被吃掉，各页控件点不动）。
+    press(&win, 500.0, 300.0);
+    release(&win, 500.0, 300.0);
+    assert_eq!(
+        got.borrow().len(),
+        2,
+        "设置窗内容区中部不该被缩放热区吃掉（{got:?}）"
+    );
+
+    // 系统口径（Windows/Linux 那条路）：同一个窗、只把开关翻过去 ⇒ 必须改发 `begin-resize`
+    // 且**不再**发自管回调（否则两个平台的行为会各错一半）。
+    ui.set_resize_self_managed(false);
+    let _ = settle_w(&win, SW, SH);
+    press(&win, 973.0, 673.0);
+    release(&win, 973.0, 673.0);
+    assert_eq!(
+        system.borrow().as_slice(),
+        ["south-east".to_string()],
+        "关掉自管后，右下角必须回到系统 `begin-resize`（{system:?}）"
+    );
+    assert_eq!(
+        got.borrow().len(),
+        2,
+        "关掉自管后不该再出自管回调（{got:?}）"
+    );
+}
+
 /// D5 端到端：`Focused(false)` → 延时 → 判定「焦点已离开本进程」→ 窗口真的被隐藏。
 ///
 /// 为什么能在无头环境里跑整条链：本进程（`cargo test` 的测试二进制）不是一个激活态的 App，

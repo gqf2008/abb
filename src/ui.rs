@@ -492,15 +492,25 @@ fn syschat_resize_hit_areas_enabled() -> bool {
     true
 }
 
-/// **设置窗**的自绘缩放热区该不该画：只有「没有系统缩放边框」的平台（Windows/Linux）画。
+/// **设置窗**的自绘缩放热区该不该画：恒 `true`（2026-10-15 起，与对话窗同口径）。
 ///
-/// 设置窗的 `.slint` 用的是 slint-pixel 的 `PixelWindowResize`（只回调方向），Rust 侧接
-/// `install_window_resize` → winit `drag_resize_window`，后者在 macOS 直接返回 `NotSupported`
-/// ⇒ 在 macOS 上画了也只是**吃掉点击的死区**（这正是 D6 的坑）。它与对话窗的差别就在「有没有
-/// 自管缩放的实现」：对话窗有（[`SelfResize`]），设置窗还没有。
-/// 让设置窗在 macOS 可缩放是**未完成项**（见 `docs/syschat-handover.md` §5.2）。
+/// 旧口径是「只有 Windows/Linux 画」：那时设置窗的热区只接 slint-pixel 的
+/// `PixelWindowResize` → `install_window_resize` → winit `drag_resize_window`，而后者在 macOS
+/// 直接 `NotSupported` ⇒ 在 macOS 画了只是**吃掉点击的死区**（D6 的坑）。对话窗当初能改恒画，
+/// 靠的是它**有自管缩放**（[`SelfResize`]）；设置窗没有，所以留在「macOS 不画」。
+///
+/// 现在设置窗也有了同一条自管线（[`settings_resize_self_managed`] + 自己的 `SelfResize` 会话，
+/// 见 `.slint` 的 `WindowResizeZones`）⇒ 「不画」的唯一理由消失：透明无边框窗在 macOS
+/// **拿不到**系统边角缩放（取证见 [`syschat_resize_hit_areas_enabled`]），不画就等于
+/// **完全不能缩放**——那是缺陷，不是保守取舍。
 fn settings_resize_hit_areas_enabled() -> bool {
-    !cfg!(target_os = "macos")
+    true
+}
+
+/// 设置窗的热区走**哪条路**（同 [`syschat_resize_self_managed`]）：
+/// `true`（macOS）= 热区按下带坐标 → 自管缩放会话；`false` = 交给系统 `drag_resize_window`。
+fn settings_resize_self_managed() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// 对话窗的热区走**哪条路**（卡 `abb-v11-resize-maximize-macos`）。
@@ -1382,10 +1392,20 @@ impl FollowPump {
 // 详见 [`crate::syschat::ResizeSession`] 的注释。
 
 /// 自管缩放会话的共享状态（`Rc`：按下回调 / winit 事件钩子两处都要看它）。
-#[derive(Default)]
+///
+/// 一个窗口一份（对话窗 / 设置窗各一）：**下界不同**（`.slint` 的 `min-width`/`min-height`
+/// 两边不一样），会话也不能共用——共用会「拖这个窗动那个窗」。
 struct SelfResize {
     /// 逻辑像素的会话（`None` = 没有在拖）。
     session: RefCell<Option<crate::syschat::ResizeSession>>,
+    /// 该窗口的最小尺寸（逻辑像素）：会话每拍按它夹取。
+    min: (f32, f32),
+}
+
+impl Default for SelfResize {
+    fn default() -> Self {
+        Self::with_min(crate::syschat::SYSCHAT_MIN_W, crate::syschat::SYSCHAT_MIN_H)
+    }
 }
 
 /// 窗口的**实时**逻辑外框（`f32`，不取整）。
@@ -1430,6 +1450,14 @@ fn self_resize_max(win: &slint::Window) -> (f32, f32) {
 }
 
 impl SelfResize {
+    /// 指定该窗口的下界（`min` 与 `.slint` 的 `min-*` 同值，有跨文件守卫钉住）。
+    fn with_min(w: f32, h: f32) -> Self {
+        Self {
+            session: RefCell::new(None),
+            min: (w, h),
+        }
+    }
+
     /// 按下热区：记锚点并开会话。`pointer` = 指针的**窗口坐标**（`.slint` 报来，逻辑像素）。
     /// 返回 `true` 仅当会话真的开起来了（脏方向 / 窗口还没 realize ⇒ `false`，调用方不暂停跟随）。
     fn begin(&self, dir: &str, win: &slint::Window, pointer: (f32, f32)) -> bool {
@@ -1472,11 +1500,7 @@ impl SelfResize {
             rect_now.x + cursor.0 as f32 / sf,
             rect_now.y + cursor.1 as f32 / sf,
         );
-        let next = session.update(
-            ptr,
-            (crate::syschat::SYSCHAT_MIN_W, crate::syschat::SYSCHAT_MIN_H),
-            self_resize_max(win),
-        );
+        let next = session.update(ptr, self.min, self_resize_max(win));
         // 没变就不写：`set_size`/`set_position` 各会发一串事件（含气泡跟随的事件路径），
         // 窗口尺寸已在下限/上限时指针继续走不应该再产生任何窗口改动。
         let same = (next.x - rect_now.x).abs() < 0.5
@@ -3056,14 +3080,35 @@ pub fn run_gui() -> Result<()> {
     let settings = SettingsWindow::new()?;
     // 像素自绘窗口：PixelTitleBar 窗口控制接线（关闭=隐藏，托盘应用惯例）
     slint_pixel::install_title_bar_controls_no_quit(&settings);
-    // 无边框窗口缩放：把 `PixelWindowResize` 热区的方向回调接到 winit 的
-    // `drag_resize_window`（系统级缩放循环）。macOS 的系统缩放本来就可用，且 .slint 里
-    // 刻意没给 macOS 放热区，所以这里装上也无副作用（回调不会被触发）。
+    // 无边框窗口缩放：把热区的方向回调接到 winit 的 `drag_resize_window`（系统级缩放循环）。
+    // 这条路只有 Windows/Linux 会走到——macOS 上 `resize-self-managed: true`（见下），
+    // `.slint` 压根不发 `begin-resize`；保留接线是为了「同一套热区、两条路由」在 Rust 侧对称，
+    // 也免得平台分支散落两处（`drag_resize_window` 在 macOS 返回 `NotSupported`，接了也不会响）。
     slint_pixel::install_window_resize(&settings);
-    // 缩放热区开关：**按目标平台显式给**（Windows/Linux 无系统缩放边框 → 自绘；
-    // macOS 不画——它的热区接的是 `drag_resize_window`，在 macOS 是死区）。
-    // 口径收口在 [`settings_resize_hit_areas_enabled`]（与对话窗**不共用**：对话窗有自管缩放）。
+    // 缩放：Windows/Linux 仍接 winit 的 `drag_resize_window`（`impl_resize_ui!` 提供回调实现）；
+    // macOS 上那条路是死的（返回 `NotSupported`），改走**自管缩放**（见 [`SelfResize`]）。
+    // 两条都接：`.slint` 侧 `self-managed: true` 时压根不会发 `begin-resize`。
     settings.set_resize_hit_areas(settings_resize_hit_areas_enabled());
+    settings.set_resize_self_managed(settings_resize_self_managed());
+    // 设置窗的自管缩放会话（独立于对话窗那份：两个窗的尺寸/下界/生命周期都不同，
+    // 共用一份会「拖这个窗动那个窗」）。下界 = `.slint` 的 `min-width`/`min-height`。
+    let settings_resize = Rc::new(SelfResize::with_min(
+        crate::syschat::SETTINGS_MIN_W,
+        crate::syschat::SETTINGS_MIN_H,
+    ));
+    {
+        let cw = settings.as_weak();
+        let state = settings_resize.clone();
+        settings.on_self_resize_begin(move |dir, x, y| {
+            if let Some(win) = cw.upgrade() {
+                let w = win.window();
+                // 会话开成功才记日志（脏方向 / 窗口还没 realize ⇒ 不开，调用方无需知情）。
+                if state.begin(dir.as_str(), &w, (x, y)) {
+                    crate::log!("[selfresize:settings] begin dir={dir} at ({x},{y})");
+                }
+            }
+        });
+    }
     // 版本号随编译注入（Cargo.toml 单一事实源），侧栏底部展示
     settings.set_version(env!("CARGO_PKG_VERSION").into());
     // 托盘菜单的版本项也常驻当前版本（updater::CURRENT 同源）
@@ -3669,10 +3714,31 @@ pub fn run_gui() -> Result<()> {
     // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦：CloseRequested 返回
     //  PreventDefault 可阻止 Slint 默认 hide，跨平台生效）
     {
-        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        use slint::winit_030::{
+            winit::{event::ElementState, event::WindowEvent},
+            EventResult, WinitWindowAccessor,
+        };
         let dirty = dirty.clone();
         let dlg = unsaved_dialog.as_weak();
+        // 设置窗的自管缩放（macOS）：与对话窗同一套口径——`CursorMoved` 跟指针算尺寸，
+        // 收尾三条（松手 / 失焦 / 关窗）一条都不能漏，漏了会话就悬着（下次按下前都不动）。
+        // 挂在**这个已有**的钩子上：`on_winit_window_event` 是单槽 `set`，另注册一个会把
+        // `CloseRequested`（未保存修改的确认框）整条顶掉，而且不会报错。
+        let settings_resize_ev = settings_resize.clone();
         settings.window().on_winit_window_event(move |w, ev| {
+            if let WindowEvent::CursorMoved { position, .. } = ev {
+                let _ = settings_resize_ev.on_cursor_moved(w, (position.x, position.y));
+            }
+            if matches!(
+                ev,
+                WindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    ..
+                } | WindowEvent::Focused(false)
+                    | WindowEvent::CloseRequested
+            ) {
+                let _ = settings_resize_ev.end();
+            }
             if matches!(ev, WindowEvent::CloseRequested) {
                 if dirty.get() {
                     if let Some(d) = dlg.upgrade() {
@@ -9290,9 +9356,10 @@ mod tests {
     ///
     /// 判别力（负向）：
     /// - 把 `macos_activate(true)` 改回 `setActivationPolicy:Regular(0)` ⇒ 本用例红；
-    /// - 把设置窗的 `set_resize_hit_areas(resize_hit_areas_enabled())` 改回 `set_resize_hit_areas(true)`
-    ///   ⇒ 本用例红（设置窗在 macOS 上没有自管实现，开着就是 D6 的死区）；
-    /// - 把对话窗的 `set_resize_hit_areas(true)` 改成按平台（macOS 关）⇒ 本用例红（回到「完全不能缩放」）。
+    /// - 把两个窗的 `set_resize_hit_areas(...)` 写死成字面量、或让任一个改回「macOS 不画」
+    ///   ⇒ 本用例红（透明无边框窗在 macOS 没有系统边角缩放，不画＝完全不能缩放）；
+    /// - 把设置窗的自管接线（`set_resize_self_managed` / `on_self_resize_begin`）删掉
+    ///   ⇒ 本用例红（热区还在，但按下去没有任何实现＝D6 那种死区）。
     #[test]
     fn resize_hit_areas_follow_platform_rule() {
         let plat = crate::platform::src_lf(include_str!("platform.rs"));
@@ -9317,32 +9384,36 @@ mod tests {
         );
         // 自绘缩放热区（2026-10-15 实测更正：透明无边框窗在 macOS **没有**系统边角缩放，
         // 「交给系统」是死路；取证见 `docs/syschat-handover.md` §5.1）：
-        //   - 对话窗**恒画**（`syschat_resize_hit_areas_enabled()`），macOS 走自管缩放；
-        //   - 设置窗只在 Windows/Linux 画（`settings_resize_hit_areas_enabled()`）——它的热区
-        //     接的是 `drag_resize_window`，macOS 上是死区。
+        // **两个窗都恒画**——对话窗与设置窗各有自己的自管缩放实现，热区不再按平台关掉
+        // （关掉＝完全不能缩放，那是缺陷不是取舍）。
         let src = crate::platform::src_lf(include_str!("ui.rs"));
         let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
         assert!(
             prod.contains("settings.set_resize_hit_areas(settings_resize_hit_areas_enabled())"),
-            "设置窗的热区开关必须走 settings_resize_hit_areas_enabled()（macOS 不画：热区接的是死路）"
+            "设置窗的热区开关必须走 settings_resize_hit_areas_enabled()（恒画）"
         );
         assert!(
             prod.contains("syschat_win.set_resize_hit_areas(syschat_resize_hit_areas_enabled())"),
             "对话窗的热区开关必须走 syschat_resize_hit_areas_enabled()（恒画）"
         );
         // 对话窗**恒画**：透明窗上系统边角缩放不存在，关掉热区 = 完全不能缩放。
-        let helper = prod
-            .find("fn syschat_resize_hit_areas_enabled()")
-            .map(|i| {
-                let rest = &prod[i..];
-                let end = rest.find("\n}").map(|e| e + 2).unwrap_or(rest.len());
-                &rest[..end]
-            })
-            .expect("应有 syschat_resize_hit_areas_enabled");
-        assert!(
-            helper.contains("true\n"),
-            "对话窗热区必须恒开（`true`）：透明无边框窗在 macOS 拿不到系统边角缩放"
-        );
+        for f in [
+            "syschat_resize_hit_areas_enabled",
+            "settings_resize_hit_areas_enabled",
+        ] {
+            let helper = prod
+                .find(&format!("fn {f}()"))
+                .map(|i| {
+                    let rest = &prod[i..];
+                    let end = rest.find("\n}").map(|e| e + 2).unwrap_or(rest.len());
+                    &rest[..end]
+                })
+                .unwrap_or_else(|| panic!("应有 {f}"));
+            assert!(
+                helper.contains("true\n"),
+                "{f} 必须恒开（`true`）：透明无边框窗在 macOS 拿不到系统边角缩放"
+            );
+        }
         assert!(
             !prod.contains("set_resize_hit_areas(true)"),
             "热区开关要走具名函数（两个窗口径不同，别写死字面量）"
@@ -9352,14 +9423,70 @@ mod tests {
             "对话窗的热区开关必须与自管缩放线路同步（Rust 按平台写 `resize-self-managed`）"
         );
         assert!(
-            prod.contains("on_self_resize_begin("),
-            "对话窗必须有 `on_self_resize_begin` 接线（macOS 自管缩放的按下入口）"
+            prod.contains("set_resize_self_managed(settings_resize_self_managed())"),
+            "设置窗的热区开关同样要与自管缩放线路同步（同一套口径）"
+        );
+        // 两个窗**各有**一个 `on_self_resize_begin` 接线：单看 `contains` 会被「只有对话窗接了」
+        // 蒙过去（设置窗的热区就会变成按下去没实现的死区），所以数出现次数。
+        assert_eq!(
+            prod.matches("on_self_resize_begin(").count(),
+            2,
+            "对话窗与设置窗都必须接 `on_self_resize_begin`（macOS 自管缩放的按下入口）"
         );
         assert!(
-            prod.contains("fn syschat_resize_self_managed()")
-                && prod.contains(r#"cfg!(target_os = "macos")"#),
-            "`syschat_resize_self_managed` 必须是 macOS 自管（系统 `drag_resize_window` 在 macOS 返回 NotSupported）"
+            prod.contains("SelfResize::with_min")
+                && prod.contains("crate::syschat::SETTINGS_MIN_W")
+                && prod.contains("crate::syschat::SETTINGS_MIN_H"),
+            "设置窗的自管会话要用它自己的下界（SETTINGS_MIN_*），不能借用对话窗的"
         );
+        for f in [
+            "syschat_resize_self_managed",
+            "settings_resize_self_managed",
+        ] {
+            assert!(
+                prod.contains(&format!("fn {f}()"))
+                    && prod.contains(r#"cfg!(target_os = "macos")"#),
+                "`{f}` 必须是 macOS 自管（系统 `drag_resize_window` 在 macOS 返回 NotSupported）"
+            );
+        }
+        // 两个窗的下界都必须来自 `.slint` 的同值常量（跨文件守卫在 syschat 侧另有两条）。
+        assert!(
+            prod.contains(
+                "SelfResize::with_min(
+        crate::syschat::SETTINGS_MIN_W,"
+            ),
+            "设置窗自管会话的下界要显式传入 SETTINGS_MIN_W/H"
+        );
+        assert!(
+            prod.contains("session.update(ptr, self.min, self_resize_max(win))"),
+            "每拍夹取必须用**本窗**的下界（`self.min`）；写死 SYSCHAT_MIN_* 会让设置窗用错下界"
+        );
+        // 设置窗的 winit 钩子还必须把 `CursorMoved` 转给自管会话、并在三条收尾事件上关会话。
+        // 为何只能结构守卫：自管会话要真 winit 句柄才起得来（[`SelfResize::begin`] 里
+        // `with_winit_window`），无头台没有句柄 ⇒ 拖不出会话（同 `self_resize_pauses_*` 的理由）。
+        // 判别力：删掉 `CursorMoved` 那半段 ⇒ 会话永远补不了锚（快甩手时窗边恒定落后指针）；
+        // 删掉收尾三条件 ⇒ 会话悬着，松手后再按热区也不动。
+        let hook = prod
+            .find("settings.window().on_winit_window_event(")
+            .map(|i| {
+                let rest = &prod[i..];
+                let end = rest
+                    .find("\n        });")
+                    .map(|e| e + 12)
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .expect("设置窗应有 on_winit_window_event 钩子");
+        for needle in [
+            "WindowEvent::CursorMoved",
+            "settings_resize_ev.on_cursor_moved(",
+            "settings_resize_ev.end()",
+        ] {
+            assert!(
+                hook.contains(needle),
+                "设置窗钩子里缺 `{needle}`：自管缩放要么跟不上指针，要么会话悬着（下次按下前都不动）"
+            );
+        }
     }
 
     /// v11c：自管缩放期间**气泡跟随必须让路**（口径见 [`FollowPump::paused`]）。

@@ -1206,6 +1206,15 @@ pub const SYSCHAT_DEFAULT_H: f32 = 560.0;
 pub const SYSCHAT_MIN_W: f32 = 340.0;
 pub const SYSCHAT_MIN_H: f32 = 380.0;
 
+/// **设置窗**的最小尺寸（= `ui/app.slint` 的 `SettingsWindow` `min-width`/`min-height`）。
+///
+/// 与 [`SYSCHAT_MIN_W`]/[`SYSCHAT_MIN_H`] 同口径但**各管各的窗**：设置窗也有自管缩放
+/// （macOS，卡 `abb-v11-resize-maximize-macos` 的同一套，2026-10-15 扩到设置窗），
+/// 每拍按它夹取下界；两个窗下界不同 ⇒ `SelfResize` 一个窗口一份、下界随窗给。
+/// 跨文件守卫见 `tests::settings_window_min_constants_match_slint`。
+pub const SETTINGS_MIN_W: f32 = 880.0;
+pub const SETTINGS_MIN_H: f32 = 620.0;
+
 /// 消息区正文块的可用宽相对**窗宽**要扣掉的全部内边距（D2「消息区底部文字重叠」修复用）。
 ///
 /// 构成：根 Rectangle 的 layout padding 4（2×2）+ `col` 的 padding 24（12×2）+ 每个块自己的
@@ -4978,6 +4987,48 @@ mod tests {
         // 最小尺寸必须严格小于默认尺寸，否则窗口会退化成「固定尺寸」（拖不动）。
         assert!(SYSCHAT_MIN_W < SYSCHAT_PREFERRED_WIDTH);
         assert!(SYSCHAT_MIN_H < SYSCHAT_DEFAULT_H);
+    }
+
+    /// **设置窗**的最小尺寸常量必须等于 `ui/app.slint` 的 `SettingsWindow` 两行（跨文件不变量）。
+    ///
+    /// 为什么也要钉：设置窗的自管缩放（macOS）每拍用 [`SETTINGS_MIN_W`]/[`SETTINGS_MIN_H`]
+    /// 夹下半界，而**系统**那条路（Windows/Linux）用的是 `.slint` 的 `min-width`/`min-height`
+    /// ⇒ 两处漂了就会出现「同一台机器上，平台不同则最小尺寸不同」这种最难查的差异。
+    ///
+    /// 判别力：改任一边 ⇒ 本用例红。
+    #[test]
+    fn settings_window_min_constants_match_slint() {
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let head = &raw[raw
+            .find("export component SettingsWindow")
+            .expect("ui/app.slint 里找不到 SettingsWindow")..];
+        let pick = |key: &str| -> f32 {
+            let line = head
+                .lines()
+                .find(|l| l.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("SettingsWindow 缺少 {key}"));
+            let code = line.split("//").next().unwrap_or(line).trim();
+            code.trim_start_matches(key)
+                .trim()
+                .trim_end_matches(';')
+                .trim_end_matches("px")
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("解析 {key} 失败：{code:?}"))
+        };
+        assert_eq!(pick("min-width:"), SETTINGS_MIN_W);
+        assert_eq!(pick("min-height:"), SETTINGS_MIN_H);
+        // 与「初始尺寸」相比也必须更小，否则窗口退化成固定尺寸（拖不动）。
+        let preferred_w = pick("preferred-width:");
+        let preferred_h = pick("preferred-height:");
+        assert!(
+            SETTINGS_MIN_W < preferred_w,
+            "min-width 必须 < preferred-width"
+        );
+        assert!(
+            SETTINGS_MIN_H < preferred_h,
+            "min-height 必须 < preferred-height"
+        );
     }
 
     /// `SYSCHAT_PREFERRED_WIDTH` 必须等于 `ui/app.slint` 的 `preferred-width`
