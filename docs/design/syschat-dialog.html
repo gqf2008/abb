@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v8</title>
+<title>ABB 系统对话 · 设计稿 v9</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -59,6 +59,9 @@
   .logo{width:20px;height:20px;flex:0 0 auto;border-radius:5px;display:block}
   .title{font-size:13px;font-weight:700;white-space:nowrap}
   .tb-spacer{flex:1}
+  .tbi{width:14px;height:14px;display:block}
+  .fnbar{display:flex;gap:4px;flex:0 0 auto}
+  .crow{display:flex;align-items:center;gap:8px}
   .tb-btn{height:26px;min-width:26px;padding:0 8px;border:2px solid var(--edge);background:var(--panel);border-radius:6px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;cursor:pointer}
   .tb-btn:hover{background:var(--hover)}
   .tb-btn.danger:hover{background:var(--danger);color:#fff;border-color:var(--danger)}
@@ -202,7 +205,7 @@
       <svg class="logo" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2f6bfa"/><path d="M18 20h28a6 6 0 0 1 6 6v12a6 6 0 0 1-6 6H30l-7 7v-7h-5a6 6 0 0 1-6-6V26a6 6 0 0 1 6-6z" fill="#fff"/><circle cx="26" cy="32" r="3" fill="#2f6bfa"/><circle cx="32" cy="32" r="3" fill="#2f6bfa"/><circle cx="38" cy="32" r="3" fill="#2f6bfa"/></svg>
       <span class="title">ABB · 系统对话</span>
       <span class="tb-spacer"></span>
-      <button class="tb-btn mark" data-m="1" title="新建会话（历史保留）">＋</button>
+      <button class="tb-btn mark" data-m="1" title="新建会话（历史保留）"><svg class="tbi" viewBox="0 0 64 64"><path d="M18 10h28a12 12 0 0 1 12 12v14a12 12 0 0 1-12 12H34L18 60V48h0A12 12 0 0 1 6 36V22A12 12 0 0 1 18 10z" fill="currentColor"/></svg></button>
       <div class="tb-btn mark" data-m="2" title="历史会话（可切回继续聊）">🗂
         <div class="menu left">
           <h6>会话（历史保留，可随时切回）</h6>
@@ -270,11 +273,6 @@
 
     <div class="composer-zone">
      <div class="composer-row">
-      <!-- v8：图标列在输入框**外面**，只剩 📎（新建会话已移到标题栏）；
-           与右侧「发送 / 清空」**底部同一条水平线**（`.stack` 补 padding-bottom = 盒内边距） -->
-      <div class="stack">
-        <div class="ib mark" data-m="5" title="选择文件（可多选）">📎</div>
-      </div>
       <div class="composer">
         <div class="pending">
           <div class="pthumb"><svg viewBox="0 0 64 64"><rect width="64" height="64" fill="#f4ebd9"/><rect x="8" y="10" width="48" height="34" rx="3" fill="#fff" stroke="#1c1a17" stroke-width="3"/><path d="M8 36l14-12 10 9 8-7 16 14" fill="none" stroke="#2f6bfa" stroke-width="3"/></svg><span class="badge">IMG</span><span class="x">✕</span></div>
@@ -282,16 +280,20 @@
           <div class="pfile"><span class="ic">PDF</span><span class="n">设计规范.pdf</span><span class="x">✕</span></div>
           <div class="more mark" data-m="6">+2</div>
         </div>
-        <div class="prow">
-          <div class="area"><span>就按这三份素材做，说明放第二节…</span><span class="caret"></span></div>
-          <!-- v7：清空当前会话在**发送按钮右侧**（owner 口径） -->
-          <div class="sendrow">
-            <button class="send">发送</button>
-            <div class="ib mark" data-m="7" title="清空当前会话">🗑</div>
+        <div class="area"><span>就按这三份素材做，说明放第二节…</span><span class="caret"></span></div>
+        <!-- v9：功能区在**框内**、整体靠右：表情 / 附件 / 截图 / 更多(定时) + 发送（+ 清空） -->
+        <div class="crow">
+          <span class="grow" style="flex:1"></span>
+          <div class="fnbar">
+            <div class="ib" title="表情">😊</div>
+            <div class="ib mark" data-m="5" title="添加附件（可多选）">📎</div>
+            <div class="ib" title="截图">✂</div>
+            <div class="ib" title="更多（含定时发送）">⋯</div>
           </div>
+          <button class="send">发送</button>
+          <div class="ib mark" data-m="7" title="清空当前会话">🗑</div>
         </div>
       </div>
-     </div>
       <!-- 提示文案已按 owner 要求移除（不显示在界面上） -->
     </div>
    </div>
@@ -299,8 +301,14 @@
 </div>
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v8</h1>
-  <div class="sub">本轮：气泡常驻置顶 / 标题栏图标化 + 可最大化 / Dock 点击只开对话窗 / 输入区三钮同线</div>
+  <h1>ABB 系统对话 · 设计稿 v9</h1>
+  <div class="sub">本轮：新建会话用对话气泡图标 / 附件移进输入框内靠右 / 输入区左右边距一致</div>
+  <div class="sub" style="color:var(--info)"><b>v9 相对 v8 的改动</b>（实现以本稿为准）</div>
+  <ol>
+    <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
+    <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
+    <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
   <div class="sub" style="color:var(--info)"><b>v8 相对 v7 的改动</b>（实现以本稿为准）</div>
   <ol>
     <li><b>气泡常驻置顶</b>：点气泡开窗后<b>气泡不再消失</b>（v7/老需求 #13「气泡随窗隐藏」<b>作废</b>）；气泡永久置顶，窗口始终锚在气泡旁。</li>
