@@ -890,25 +890,32 @@ impl JevConfig {
     }
 }
 
-/// 每 bot **每条执行通道**的 task worker 数——Q7「每 bot 默认 1 个 task worker，**上限可配**」
-/// 的接线（2026-09-26 落地；此前只实现了「默认 1」，可配部分没接线）。
+/// 每 bot 的 task 执行容量（Q7「每 bot 默认 1 个 task worker，**上限可配**」的接线，
+/// 2026-09-26 落地；2026-10-15 第五轮把它拆成**两种派发方式**，见下）。
 ///
-/// - `schedule`（`once`/`cron`/`interval`）默认 **2**：定时任务到点即执行，不再因为同档
-///   另一条长任务而排队（同一条任务**不会**自我重叠——认领是单锁 check-and-set）。
-///   这条排队是**暂时**的：定时任务跑完就还位，所以 2 是「不互相挤兑」的容量取舍，不是节流。
-/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）默认**不节流**（当前 = 每通道上限，
-///   见 [`DEFAULT_TASK_WORKERS_MANUAL`]）：手动档里的 `keepalive` 是**常驻**进程，认领它的
-///   worker 会一直 `await` 到进程退出（`run_one` 的 keepalive 分支），**永不还位**——于是
-///   任何小于「常驻任务条数」的默认值都等于「多出来的常驻任务永远不启动，`now` 还要跟常驻
-///   抢那几条」。而「该起几条」只有配置的人知道，代码猜不出来，所以默认值不再猜：
-///   **默认什么都不挡**，要节流请显式写 `{"manual":N}`。
-///   取值演进：1（接线时）→ 4（2026-10-15 首次放宽：容得下常驻的标称占用再留几条 `now`）
-///   → 上限值（2026-10-15 同日再次放宽：手动档的「保守值」本身就是缺陷——静默排队等于
-///   用户以为在跑、实际永远不跑，且 4 对「跑 100 条手动任务」的实际负载仍然是个挡板）。
-/// - 0 按 1 兜底（写 0 不会把通道关掉）。
-/// - 调大（含「默认就不节流」）的代价，如实列：
-///   - 同 bot 同时跑的真模型回合变多（token 成本随并发上升；天文数字仍由 [`MAX_TASK_WORKERS_PER_CHANNEL`] 兜住）；
-///   - **空闲** worker 不是零成本：每个 worker 每 `POLL_INTERVAL` 轮询一次（定义表按 mtime 缓存，但每条任务一次取消请求文件的存在性检查），空转开销约 `O(worker 数 × 任务条数)` 次 stat/2s——这是「默认不节流」的实价；
+/// **两条通道的容量来源不同**——这是本配置面最容易改错的地方（卡
+/// `abb-task-workers-manual-not-a-pool-20261015`：同一句「太保守」被提 4 次，前 3 次都在改数字）：
+///
+/// - `schedule`（`once`/`cron`/`interval`）＝**固定池**：启动时起 `schedule` 条 worker，每条
+///   就地跑完一条再回来。默认 **2**：定时任务短、到点即执行，池子大小就是它的并发上限；
+///   同一条任务**不会**自我重叠（认领是单锁 check-and-set）。
+/// - `manual`（`now` 后台子代理 / `keepalive` 常驻）＝**按需派发**：启动时只起**一条** poller，
+///   认领到任务就起一个执行体（`crate::svc_tasks`）并**立刻**回去看下一条。容量由
+///   「用户登记了多少条」决定，**不再**由启动时写死的池子决定——`keepalive` 是常驻进程，
+///   认领它的 worker 会一直 `await` 到进程退出（`run_one` 的 keepalive 分支）、**永不还位**，
+///   所以固定池下**任何**有限 N（含「默认 = 上限」）都是节流阀：多出来的常驻任务与 `now`
+///   子代理只会静默排队（状态是「已登记」，用户以为在跑）。而「该起几条」只有配置的人知道，
+///   代码猜不出来 ⇒ 手动档不再猜。
+///   `manual` 因此退化成**可选并发上限**：`N ≥ 1` = 同时在跑的手动档执行体上限 N。
+/// - 取值演进（手动档）：1（接线时）→ 4（2026-10-15 首次放宽）→ 上限值（同日第二次）：
+///   数字再大也还是闸门/池子，换层（按需派发）才对——本参数这才第一次真正表达出
+///   「不要挡我登记的任务」。
+/// - 0 → 1 兜底（写 0 不会把通道关掉）。
+/// - 离谱的大值按 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警（不静默）。
+/// - 「不节流」不是免费，代价如实列：
+///   - 同 bot 同时跑的真模型回合变多（token 成本随**用户登记的条数**上升，不再有池子上限兜住）；
+///   - 手动档 poller 只有一条：它每 `POLL_INTERVAL` 轮询一次（定义表按 mtime 缓存，但每条任务
+///     一次取消请求文件的存在性检查），空转开销约 `O(任务条数)` 次 stat/2s；
 ///   - 未显式指定 `workspace` 的并发任务**共用同一个 bot 工作区**（旧 job 循环时代就承认的风险）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskWorkers {
@@ -940,21 +947,28 @@ pub const MAX_TASK_WORKERS_PER_CHANNEL: usize = 128;
 pub const DEFAULT_TASK_WORKERS_MANUAL: usize = 128;
 
 impl TaskWorkers {
-    /// 该通道生效的 worker 数：0 → 1 兜底；超过 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警。
-    pub fn for_channel(&self, channel: crate::task_run::Channel) -> usize {
-        let raw = match channel {
-            crate::task_run::Channel::Schedule => self.schedule,
-            crate::task_run::Channel::Manual => self.manual,
-        };
-        let n = raw.clamp(1, MAX_TASK_WORKERS_PER_CHANNEL);
-        if raw != n {
-            crate::log!(
-                "[task] task_workers.{} = {raw} 超出可用范围 1..={MAX_TASK_WORKERS_PER_CHANNEL}，按 {n} 生效",
-                channel.label()
-            );
-        }
-        n
+    /// 定时档 worker **池**大小：0 → 1 兜底；超过 [`MAX_TASK_WORKERS_PER_CHANNEL`] 截断并告警。
+    /// 定时档仍是固定池——池大小**就是**它的并发上限。
+    pub fn schedule_workers(&self) -> usize {
+        clamp_workers("schedule", self.schedule)
     }
+
+    /// 手动档的**并发上限**：0 → 1 兜底；超过上限截断并告警。
+    /// 手动档是**按需派发**（认领到就起执行体），所以这个值只是闸门、不是池子大小。
+    pub fn manual_cap(&self) -> usize {
+        clamp_workers("manual", self.manual)
+    }
+}
+
+/// 0 → 1 兜底；超上限截断并告警（不静默）。
+fn clamp_workers(field: &str, raw: usize) -> usize {
+    let n = raw.clamp(1, MAX_TASK_WORKERS_PER_CHANNEL);
+    if raw != n {
+        crate::log!(
+            "[task] task_workers.{field} = {raw} 超出可用范围 1..={MAX_TASK_WORKERS_PER_CHANNEL}，按 {n} 生效"
+        );
+    }
+    n
 }
 
 impl Default for TaskWorkers {
@@ -2000,24 +2014,23 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual = 每通道上限（**不节流**），
-    /// 0 按 1 兜底，且老的 config.json（缺字段 / 只给一半）都能正常解析。
+    /// Q7「上限可配」的接线契约：默认 Schedule 2 / Manual = 每通道上限，0 按 1 兜底，
+    /// 且老的 config.json（缺字段 / 只给一半）都能正常解析。
     #[test]
     fn task_workers_defaults_floor_and_partial_json() {
         let d = TaskWorkers::default();
         assert_eq!(
-            d.for_channel(crate::task_run::Channel::Schedule),
+            d.schedule_workers(),
             2,
             "定时档默认并行 2：到点即执行，不再被同档长任务排队"
         );
-        // 手动档默认 = 每通道上限（2026-10-15：1 → 4 → 上限，理由见 `TaskWorkers` 文档）。
-        // 判据不是「想要更多并发」，而是任何**固定的**小默认值在默认配置下都可能**错**：
-        // keepalive 是常驻进程，认领它的 worker 一直 await 到进程退出（`run_one` 的
-        // keepalive 分支），永不还位 ⇒ 默认值低于「常驻任务条数」时，多出来的常驻任务
-        // 与 `now` 子代理都只会排队排到天荒地老（用户看到的是「已登记」而不是「排不上」）。
+        // 手动档默认 = 每通道上限。判据不是「想要更多并发」，而是任何**固定的**小默认值
+        // 在默认配置下都可能**错**：keepalive 是常驻进程，认领它的执行体一直 await 到进程
+        // 退出、永不还位 ⇒ 默认值低于「常驻任务条数」时，多出来的常驻任务与 `now` 子代理
+        // 都只会排队排到天荒地老（用户看到的是「已登记」而不是「排不上」）。
         // 这条断言同时把「默认 = 上限」钉住：改上限而没重新掂量默认值 ⇒ 红。
         assert_eq!(
-            d.for_channel(crate::task_run::Channel::Manual),
+            d.manual_cap(),
             MAX_TASK_WORKERS_PER_CHANNEL,
             "手动档（now/keepalive）默认不节流 = 每通道上限"
         );
@@ -2035,8 +2048,8 @@ mod tests {
             schedule: 0,
             manual: 0,
         };
-        assert_eq!(zero.for_channel(crate::task_run::Channel::Schedule), 1);
-        assert_eq!(zero.for_channel(crate::task_run::Channel::Manual), 1);
+        assert_eq!(zero.schedule_workers(), 1);
+        assert_eq!(zero.manual_cap(), 1);
 
         // 2026-10-15（上限 8 → 128）的阳性对照：100 是 abb-agent 的实际配置，
         // 必须原样生效而不是被截断成 8。这条断言钉住「上限不再挡住真实配置」。
@@ -2045,7 +2058,7 @@ mod tests {
             manual: 100,
         };
         assert_eq!(
-            hundred.for_channel(crate::task_run::Channel::Manual),
+            hundred.manual_cap(),
             100,
             "manual=100 必须原样生效（旧上限 8 会把它截断）"
         );
@@ -2054,35 +2067,24 @@ mod tests {
             schedule: 4,
             manual: 3,
         };
-        assert_eq!(wide.for_channel(crate::task_run::Channel::Schedule), 4);
-        assert_eq!(wide.for_channel(crate::task_run::Channel::Manual), 3);
+        assert_eq!(wide.schedule_workers(), 4);
+        assert_eq!(wide.manual_cap(), 3);
 
-        // 上限：离谱的大值按 MAX 生效（不静默按原值起 N 个轮询任务）。
+        // 上限：离谱的大值按 MAX 生效（不静默按原值起 N 个轮询任务 / 放行 N 条并发）。
         // manual 用 100_000 而不是贴着旧上限的 99：上限 8→128 后，99 已是合法值、
         // 不再被截断，case 必须真的高于新上限才能验到「截断」这条路径。
         let huge = TaskWorkers {
             schedule: 100_000,
             manual: 100_000,
         };
-        assert_eq!(
-            huge.for_channel(crate::task_run::Channel::Schedule),
-            MAX_TASK_WORKERS_PER_CHANNEL
-        );
-        assert_eq!(
-            huge.for_channel(crate::task_run::Channel::Manual),
-            MAX_TASK_WORKERS_PER_CHANNEL
-        );
+        assert_eq!(huge.schedule_workers(), MAX_TASK_WORKERS_PER_CHANNEL);
+        assert_eq!(huge.manual_cap(), MAX_TASK_WORKERS_PER_CHANNEL);
 
         // 空 JSON（老 config.json）→ 全部走默认
         let cfg: Config = serde_json::from_str("{}").expect("空 JSON 应能用默认值构造");
+        assert_eq!(cfg.task_workers.schedule_workers(), 2);
         assert_eq!(
-            cfg.task_workers
-                .for_channel(crate::task_run::Channel::Schedule),
-            2
-        );
-        assert_eq!(
-            cfg.task_workers
-                .for_channel(crate::task_run::Channel::Manual),
+            cfg.task_workers.manual_cap(),
             MAX_TASK_WORKERS_PER_CHANNEL,
             "空 JSON（老 config.json）也走新默认（= 不节流）"
         );
@@ -2091,16 +2093,11 @@ mod tests {
         let cfg: Config =
             serde_json::from_str(r#"{"task_workers":{"manual":3}}"#).expect("部分字段应可解析");
         assert_eq!(
-            cfg.task_workers
-                .for_channel(crate::task_run::Channel::Schedule),
+            cfg.task_workers.schedule_workers(),
             2,
             "未给出的字段仍走默认"
         );
-        assert_eq!(
-            cfg.task_workers
-                .for_channel(crate::task_run::Channel::Manual),
-            3
-        );
+        assert_eq!(cfg.task_workers.manual_cap(), 3);
     }
 
     #[test]

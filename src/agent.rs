@@ -46,8 +46,11 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 //   worker ⇒ 默认 1 时 `now` 子代理排不上），指引里那行默认值随之更正。
 // v18：手动档 worker 默认 4 → **不节流**（= 每通道上限，见 `config::TaskWorkers`）。同一处
 //   再改一次 ⇒ 那行默认值**不再手抄**，改为从 `TaskWorkers::default()` 插值（守卫测试留着当回归网）。
+// v19：手动档改**按需派发**（认领到就起执行体，容量不再由池子大小决定，见 `config::TaskWorkers`
+//   与 `task_run` 模块头）。指引里那句「并发额度有限……超出就排队——它不是不限量的池子」是旧口径，
+//   必须一起改：它会把「你登记的任务都会跑」说成「排不上队」，正是这条配置面被反复抱怨的措辞来源。
 // 内容变了就必须升版本号：存量工作区的指引不会被覆盖（幂等判据是「不含当前 marker」）。
-pub(crate) const GUIDE_MARKER: &str = "abb-guide-v18";
+pub(crate) const GUIDE_MARKER: &str = "abb-guide-v19";
 
 /// 写工作区指引（CLAUDE.md / AGENTS.md 同文）。幂等（marker 判定）。
 /// 调用点（P4.4）：`service::run_bot` 启动时写 bot 级工作区；
@@ -68,8 +71,8 @@ pub(crate) fn ensure_workspace_guide(workspace: &std::path::Path) {
     // 同一手法用在并发默认值上：`tw_schedule` / `tw_manual` 取自 `TaskWorkers::default()`，
     // 指引里的数字随代码默认值走（v17 之前是手抄的字面量，改了一边忘另一边就会明说错数）。
     let default_workers = crate::config::TaskWorkers::default();
-    let tw_schedule = default_workers.for_channel(crate::task_run::Channel::Schedule);
-    let tw_manual = default_workers.for_channel(crate::task_run::Channel::Manual);
+    let tw_schedule = default_workers.schedule_workers();
+    let tw_manual = default_workers.manual_cap();
     let guide = format!(
         "# ABB 工作区（{GUIDE_MARKER}）
 
@@ -135,10 +138,11 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 上面写的是程序名；在本环境里**一律用 `\"$ABB_BIN\"` 调用**（裸 `agent-bridge` 不在 PATH，见上一节）。
 - 提交**立即返回任务 id**：子代理跑在**独立会话**里（不带本聊天上下文），当前会话不被占用，
   用户可以继续聊别的。
-- **同一通道默认并行 N 条**（`config.json#task_workers`，默认 `{{\"schedule\":{tw_schedule},\"manual\":{tw_manual}}}`，0 按 1 兜底）：
-  定时档（`once`/`cron`/`interval`）与手动档（`now`/`keepalive`）各有自己的队列，跨通道互不阻塞；
+- **提交的任务都会开跑**（`config.json#task_workers`，默认 `{{\"schedule\":{tw_schedule},\"manual\":{tw_manual}}}`，0 按 1 兜底）：
+  定时档（`once`/`cron`/`interval`）按 `schedule` 条并行、到点即执行；手动档（`now`/`keepalive`）
+  **认领到就起执行体**——登记多少条就并行多少条（`keepalive` 常驻各自占一条执行体，不会把 `now` 饿死）；
+  两条通道各有自己的队列，跨通道互不阻塞；
   **同一条任务永远不会自我重叠**（认领是单锁 check-and-set，跑到一半不会被再拉起）。
-  并发额度有限：一次丢十条仍只会按该档的 worker 数排队，超出就排队——它不是不限量的池子。
 - 子代理在后台跑完一轮 agent，**不产生中间可见回复**——用户只在完成时收到一条结果。
 - 别在本回合里 sleep/while 等它跑完（那正是要避免的「堵会话」）。
 
@@ -1085,8 +1089,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("abb-guide-tw-{}", uuid::Uuid::new_v4()));
         ensure_workspace_guide(&dir);
         let d = crate::config::TaskWorkers::default();
-        let schedule = d.for_channel(crate::task_run::Channel::Schedule);
-        let manual = d.for_channel(crate::task_run::Channel::Manual);
+        let schedule = d.schedule_workers();
+        let manual = d.manual_cap();
         for name in ["CLAUDE.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             for needle in [
@@ -1130,10 +1134,11 @@ mod tests {
     }
 
     /// #312 验收⑤ / 反面断言：指引**不得**出现能力边界以外的承诺。
-    /// 2026-09-26 两批修订后的真实口径：每个 bot 两条通道（定时档 once/cron/interval、
-    /// 手动档 now/keepalive），**同通道默认并行 N 条**（`task_workers`，默认 schedule 2 /
-    /// manual 不节流）、跨通道互不阻塞、**同一条任务永远不自我重叠**；并发额度有限，不得写成
-    /// 「无限并发」。`--proc` 虽写入 CLI 帮助，但须明确标注 agent 侧拒绝。
+    /// 2026-10-15 第五轮改口径后的真实边界：每个 bot 两条通道（定时档 once/cron/interval、
+    /// 手动档 now/keepalive）；手动档**按需派发**（登记多少条就并行多少条，`now` 不会被常驻的
+    /// `keepalive` 饿死），定时档仍按 `task_workers.schedule` 条并行；跨通道互不阻塞、
+    /// **同一条任务永远不自我重叠**。仍**不得**写成「无限并发」这种笼统承诺（定时档有池子上限，
+    /// 手动档也有显式上限这条闸门），也不得留旧的「一次只跑一条」。
     #[test]
     fn workspace_guide_does_not_overpromise_task_semantics() {
         let dir = std::env::temp_dir().join(format!("abb-guide-neg-{}", uuid::Uuid::new_v4()));
@@ -1145,8 +1150,8 @@ mod tests {
                 "{name} 必须写明 agent 侧不能创建 proc 载荷"
             );
             assert!(
-                text.contains("同一通道默认并行") && text.contains("task_workers"),
-                "{name} 应写明「同通道默认并行 N 条」与配置键（Q7 上限可配已接线）"
+                text.contains("提交的任务都会开跑") && text.contains("task_workers"),
+                "{name} 应写明两条通道的容量口径与配置键（Q7 上限可配已接线）"
             );
             assert!(
                 text.contains("同一条任务永远不会自我重叠"),
@@ -1332,8 +1337,8 @@ mod tests {
                 "{name} 存量 v10 的旧容量模型必须被替换掉"
             );
             assert!(
-                text.contains("同一通道默认并行"),
-                "{name} 应写明「同一通道默认并行 N 条」"
+                text.contains("提交的任务都会开跑"),
+                "{name} 应写明两条通道的容量口径（v19 起不再是「同通道默认并行 N 条」）"
             );
             assert!(text.contains("互不阻塞"), "{name} 应写明「跨通道互不阻塞」");
         }

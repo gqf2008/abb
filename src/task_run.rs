@@ -31,11 +31,18 @@
 //! ## 执行通道（2026-09-26 拆档）
 //!
 //! Q7 的容量方案落地成**两条通道**（[`Channel`]）：定时档（`once`/`cron`/`interval`）与
-//! 手动档（`now`/`keepalive`）；每条通道按 `Config::task_workers` 起 N 个 worker
-//! （默认 schedule 2 / manual **不节流**——手动档里常驻的 keepalive 会永久占住 slot，
-//! 任何固定的小默认值都可能把任务排成「永远不跑」，见 `Config::task_workers` 的文档；
-//! 0 按 1 兜底），通道内排队、跨通道互不阻塞，同一条任务永不自我重叠（认领是单锁
-//! check-and-set）。
+//! 手动档（`now`/`keepalive`）；通道内超额（超出 `task_workers` 那条闸门）排队、跨通道
+//! 互不阻塞，同一条任务永不自我重叠（认领是单锁 check-and-set）。
+//!
+//! **两条通道的派发方式不同**（2026-10-15 第五轮收口，卡 `abb-task-workers-manual-not-a-pool-20261015`）：
+//!
+//! - 定时档＝**固定池**：起 `task_workers.schedule` 条 worker（默认 2），每条就地 `await`
+//!   跑完再回来——池子大小就是并发上限（定时任务短、到点即执行，够用）。
+//! - 手动档＝**按需派发**：只起**一条** poller，认领到任务就 `spawn` 一个执行体并立刻回去看
+//!   下一条。手动档里的 `keepalive` 常驻**永不还位**，固定池下**任何**有限 N 都是节流阀
+//!   （多出来的常驻任务与 `now` 子代理静默排队）；容量该由「用户登记了多少条」决定，
+//!   不该由启动时写死的池子决定。`task_workers.manual` 退化为**可选并发闸门**。
+//!
 //! 拆的理由是：`now` 的后台子代理与 keepalive 常驻进程都是长任务，共用一条队列时
 //! 定时触发会被饿死（cron 落在被占用分钟点上的那次会整次消失）。两条通道共享同一对
 //! store/state 实例，认领走 [`claim_if_due`] 的单锁 check-and-set（多线程 runtime 下
@@ -193,18 +200,38 @@ impl TaskHandles {
 }
 
 /// 按配置算出「这个 bot 要起哪些 worker」：`(线程名, worker 身份)`，顺序为
-/// Schedule#0..N、Manual#0..M。抽成**纯函数**是为了让这层接线有单测（此前只有代码审查）。
+/// Schedule#0..N、Manual#0。抽成**纯函数**是为了让这层接线有单测（此前只有代码审查）。
+///
+/// **手动档恒为一条**：它按需派发（认领到就起执行体），不是固定池——池子大小会变成容量
+/// 上限，而 keepalive 常驻永不还位（见模块头与 `Config::task_workers`）。
+/// `task_workers.manual` 因此**不再**决定起几条 worker，只作并发闸门。
 pub fn worker_specs(cfg: &crate::config::Config, bot_key: &str) -> Vec<(String, WorkerId)> {
     let mut out = Vec::new();
-    for channel in [Channel::Schedule, Channel::Manual] {
-        for index in 0..cfg.task_workers.for_channel(channel) {
-            out.push((
-                format!("task:{}:{index}:{bot_key}", channel.label()),
-                WorkerId::new(channel, index),
-            ));
-        }
+    for index in 0..cfg.task_workers.schedule_workers() {
+        out.push((
+            format!("task:{}:{index}:{bot_key}", Channel::Schedule.label()),
+            WorkerId::new(Channel::Schedule, index),
+        ));
     }
+    out.push((
+        format!("task:{}:0:{bot_key}", Channel::Manual.label()),
+        WorkerId::new(Channel::Manual, 0),
+    ));
     out
+}
+
+/// 手动档**按需派发**的执行体在 [`crate::svc_tasks`] 里的任务名（固定名：
+/// 名字只用于告警定位，具体是哪个任务由 `run_one`/`claim_task` 的日志给出，
+/// 所以不必按任务 id 造 `&'static str` ——那会每跑一条泄漏一个小字符串）。
+const MANUAL_RUN_TASK_NAME: &str = "task:manual:run";
+
+/// 关停时等本通道在跑的手动档执行体收尾（它们各自收到同一个 `stop`，会走 cancel 路径）。
+/// 不等就等于把「还在跑」留给进程消亡：`task status` 会看到孤儿 Running，而且
+/// `keepalive` 的关停终态可能晚于 `finalize_keepalives_on_shutdown`。
+async fn drain_manual_runs(runs: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for handle in runs.drain(..) {
+        let _ = handle.await;
+    }
 }
 
 /// 一条通道的 worker：`channel` 决定它认领哪一档触发，`worker_index` 是它在同通道内的序号。
@@ -263,6 +290,11 @@ async fn task_worker_with_stores(
     }
     // 上次回收时间（0 = 启动后先扫一遍）
     let mut last_gc = 0u64;
+    // 手动档在跑的**执行体**句柄：既是并发闸门的账本（还在跑的条数），也是关停时的
+    // 收尾名单。定时档恒为空（固定池：worker 就地 await 跑完）。
+    let mut manual_runs: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // 手动档并发闸门（`task_workers.manual`；0 → 1 兜底）。
+    let manual_cap = cfg.task_workers.manual_cap();
 
     loop {
         if stop.is_cancelled() {
@@ -271,8 +303,11 @@ async fn task_worker_with_stores(
                 // 否则下次启动会把它们当成待恢复任务重新拉起。
                 finalize_keepalives_on_shutdown(&store, &states);
             }
+            drain_manual_runs(&mut manual_runs).await;
             return;
         }
+        // 摘掉已经跑完的执行体句柄（`is_finished` 只看句柄状态，不阻塞）。
+        manual_runs.retain(|handle| !handle.is_finished());
         if worker.owns_housekeeping() {
             // 取消请求先于认领处理：排队等着的任务被 cancel 掉之后**不该再开跑**
             // （否则用户看到的是「已取消却仍然跑了一轮并投递结果」）。
@@ -290,8 +325,39 @@ async fn task_worker_with_stores(
         // → worker 打满 CPU 的忙循环（评审 D5' 实测：21.5 万次/秒）。两处判据已对齐（见
         // `next_due_task` 对取消请求的过滤），这里的「只有成功才续扫」是第二道保险。
         if let Some(task) = next_due_task(&store, &states, now, worker.channel) {
-            if run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await {
-                continue;
+            match worker.channel {
+                // 定时档：**就地跑**（固定池；`task_workers.schedule` 就是并发上限）。
+                Channel::Schedule => {
+                    if run_one(&bot, &cfg, &router, &states, task, &bot_key, &stop).await {
+                        continue;
+                    }
+                }
+                // 手动档：**先认领、再起执行体**，poller 立刻回去看下一条（不再被长任务占住）。
+                //
+                // ⚠️ 认领必须先于 spawn：候选判据在认领前**恒真**，若先 spawn 再重扫，同一拍会
+                // 为同一条任务反复起执行体（锁里输掉的那些立刻退出）——那就是 D5' 那个忙循环的
+                // 变体。先认领 ⇒ 状态已 Running ⇒ 下一轮候选里没有它。
+                Channel::Manual => {
+                    if manual_runs.len() < manual_cap {
+                        if let Some(_due) = claim_task(&bot_key, &states, &task, now) {
+                            let bot = bot.clone();
+                            let cfg = Arc::clone(&cfg);
+                            let router = Arc::clone(&router);
+                            let states = Arc::clone(&states);
+                            let stop = stop.clone();
+                            let bot_key = bot_key.clone();
+                            let handle =
+                                crate::svc_tasks::tasks().spawn(MANUAL_RUN_TASK_NAME, async move {
+                                    run_claimed(
+                                        &bot, &cfg, &router, &states, task, &bot_key, &stop,
+                                    )
+                                    .await;
+                                });
+                            manual_runs.push(handle);
+                            continue;
+                        }
+                    }
+                }
             }
         }
         tokio::select! {
@@ -300,6 +366,7 @@ async fn task_worker_with_stores(
                 if worker.owns_housekeeping() {
                     finalize_keepalives_on_shutdown(&store, &states);
                 }
+                drain_manual_runs(&mut manual_runs).await;
                 return;
             }
         }
@@ -318,16 +385,27 @@ async fn run_one(
     bot_key: &str,
     stop: &tokio_util::sync::CancellationToken,
 ) -> bool {
-    let id = task.id.clone();
-    let short = id[..id.len().min(12)].to_string();
-
-    let started = crate::chrono_lite::unix_secs();
-    // **原子认领**：判据与写入必须在同一把锁内完成——每 bot 现在有两条通道且 service 跑
-    // 多线程 runtime，「先读后写」会被另一条通道插进来 → 同一任务双跑（Q7 的「同一任务
-    // 不并发」就靠这里）。应到时刻取自**认领前**的运行态（claim 会刷新 last_fired_at）。
-    let Some(due) = claim_if_due(states, &task, started) else {
+    if claim_task(bot_key, states, &task, crate::chrono_lite::unix_secs()).is_none() {
         return false;
-    };
+    }
+    run_claimed(bot, cfg, router, states, task, bot_key, stop).await;
+    true
+}
+
+/// **原子认领**一条任务 + 逾期留痕 + 开跑日志，返回本次认领的应到时刻。
+///
+/// `None` = 没认领到（另一条通道先抢走 / 有未消费的取消请求 / 退避未到 / 判据不成立），
+/// 调用方**不得**当作跑过。
+///
+/// 判据与写入必须在同一把锁内完成——每 bot 有两条通道且 service 跑多线程 runtime，
+/// 「先读后写」会被另一条通道插进来 → 同一任务双跑（Q7 的「同一任务不并发」就靠这里）。
+/// 应到时刻取自**认领前**的运行态（claim 会刷新 `last_fired_at`）。
+///
+/// 与 [`run_claimed`] 拆开是为了手动档的**按需派发**：认领（同步、持锁）必须发生在
+/// 起执行体**之前**（见 `task_worker_with_stores` 里的 ⚠️ 注释）。
+fn claim_task(bot_key: &str, states: &TaskStateStore, task: &Task, started: u64) -> Option<u64> {
+    let short = short_id(&task.id);
+    let due = claim_if_due(states, task, started)?;
     // 逾期认领必须留痕：过去「执行位被长任务占住 → 该分钟点永久消失」是**完全静默**的，
     // 用户看不到「定时任务为什么没跑」。这里如实记一笔应到时刻与迟到秒数。
     let late = started.saturating_sub(due);
@@ -344,9 +422,21 @@ async fn run_one(
     crate::log!(
         "[task:{}:{bot_key}] {short} 开跑（workspace={}）",
         Channel::of(task.trigger.kind).label(),
-        task_workspace(bot_key, &task)
+        task_workspace(bot_key, task)
     );
+    Some(due)
+}
 
+/// 跑一条**已认领**的任务（状态已由 [`claim_task`] 置 Running）。
+async fn run_claimed(
+    bot: &crate::config::BotConfig,
+    cfg: &crate::config::Config,
+    router: &Arc<Router>,
+    states: &TaskStateStore,
+    task: Task,
+    bot_key: &str,
+    stop: &tokio_util::sync::CancellationToken,
+) {
     let workspace = task_workspace(bot_key, &task);
     match task.payload.kind {
         PayloadKind::Agent => {
@@ -368,7 +458,6 @@ async fn run_one(
             finish_task_attempt(bot_key, &task, rt, text, router, states).await;
         }
     }
-    true
 }
 
 /// 在**单把锁内**完成「读运行态 → 判据 → 写 Running」，返回本次认领的应到时刻。
@@ -2228,8 +2317,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 接线层（service 起几个 worker）的单测：默认 schedule 2 + manual 不节流，顺序与命名稳定；
-    /// 配置成 1/0/超大值时的行为也在这里锁住（评审 D4）。
+    /// 接线层（service 起几个 worker）的单测：顺序与命名稳定，且**手动档恒为一条**
+    /// （按需派发：它自己 spawn 执行体，不再是池子——见 `worker_specs` 的文档）。
     #[test]
     fn worker_specs_follow_config() {
         let bot = "b";
@@ -2238,28 +2327,27 @@ mod tests {
             .iter()
             .map(|(name, w)| (name.clone(), w.channel, w.index))
             .collect();
-        // 期望值从配置默认值推出来（不写死条数）：默认值变（例如手动档 4 → 不节流）时
-        // 这条断言测的仍是「顺序 + 命名」，而不是又一次手抄数字。
+        // 期望值从配置默认值推出来（不写死条数）：默认值变时这条断言测的仍是
+        // 「顺序 + 命名 + 手动档恒一条」，而不是又一次手抄数字。
         let defaults = crate::config::TaskWorkers::default();
-        let expect_named = |channel: Channel, n: usize| {
-            (0..n)
-                .map(move |i| (format!("task:{}:{i}:{bot}", channel.label()), channel, i))
-                .collect::<Vec<_>>()
-        };
-        let mut expected = expect_named(Channel::Schedule, defaults.for_channel(Channel::Schedule));
-        expected.extend(expect_named(
-            Channel::Manual,
-            defaults.for_channel(Channel::Manual),
-        ));
-        assert_eq!(got, expected, "顺序：定时档 0..N 再手动档 0..M，命名稳定");
-        assert!(
-            got.iter().filter(|(_, c, _)| *c == Channel::Manual).count() > 1,
-            "手动档默认不止 1 条（常驻 keepalive 会占住 slot，1 条会把 now 饿死）"
+        let mut expected: Vec<(String, Channel, usize)> = (0..defaults.schedule_workers())
+            .map(|i| (format!("task:schedule:{i}:{bot}"), Channel::Schedule, i))
+            .collect();
+        expected.push(("task:manual:0:b".to_string(), Channel::Manual, 0));
+        assert_eq!(
+            got, expected,
+            "顺序：定时档 0..N 再手动档 0；手动档恒一条 poller（按需派发）"
+        );
+        assert_eq!(
+            got.iter().filter(|(_, c, _)| *c == Channel::Manual).count(),
+            1,
+            "手动档只起一条 poller：多出来的并发由它按需 spawn 执行体，不由池子大小决定"
         );
 
+        // 手动档把配置值当**闸门**而不是池子大小：配置怎么变，起的 worker 数都不变。
         let mut cfg = crate::config::Config::default();
         cfg.task_workers.schedule = 1;
-        cfg.task_workers.manual = 0; // 0 → 1 兜底
+        cfg.task_workers.manual = 100;
         let got: Vec<(String, Channel, usize)> = worker_specs(&cfg, bot)
             .iter()
             .map(|(name, w)| (name.clone(), w.channel, w.index))
@@ -2270,8 +2358,184 @@ mod tests {
                 ("task:schedule:0:b".to_string(), Channel::Schedule, 0),
                 ("task:manual:0:b".to_string(), Channel::Manual, 0),
             ],
-            "schedule=1 / manual=0：回到每通道 1 条（manual 的 0 兜底成 1）"
+            "schedule=1 / manual=100：手动档仍是 1 条 poller（100 只是闸门）"
         );
+    }
+
+    /// 起**一条**手动档 poller 跑一小会儿（供下面按需派发/闸门用例驱动真实循环）。
+    #[cfg(unix)]
+    fn spawn_manual_poller(
+        root: &std::path::Path,
+        cfg: crate::config::Config,
+        store: Arc<TaskStore>,
+        states: Arc<TaskStateStore>,
+    ) -> (
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handles = TaskHandles {
+            store,
+            states,
+            process_start: crate::chrono_lite::unix_secs(),
+        };
+        let router = Arc::new(Router::new(
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+        ));
+        let bot = crate::config::BotConfig::default();
+        // 进程载荷的 cwd 默认 = bot 工作区（`task_workspace`）：测试里必须**先建出来**，
+        // 否则 `/bin/sh` 起不来（`进程启动失败：No such file or directory`，实测踩过）。
+        let _ = std::fs::create_dir_all(crate::workspace_dir(&bot.key()));
+        let worker = tokio::spawn({
+            let stop = stop.clone();
+            let _ = root;
+            async move {
+                task_worker_with_poll(
+                    bot,
+                    Arc::new(cfg),
+                    router,
+                    handles,
+                    stop,
+                    WorkerId::new(Channel::Manual, 0),
+                    Duration::from_millis(50),
+                )
+                .await;
+            }
+        });
+        (stop, worker)
+    }
+
+    /// 手动档是**按需派发**（卡 `abb-task-workers-manual-not-a-pool-20261015`）：**一条** poller
+    /// 也能同时把 3 条手动档任务都拉起来。固定池做不到这件事——池子大小就是并发上限，
+    /// 而 keepalive 常驻永不还位（多出来的任务静默排队，用户看到的是「已登记」）。
+    ///
+    /// 判据：每条进程任务先 touch 自己的 start 文件、再等公共 release 文件；固定池 + 单 poller
+    /// 只有第一条能 touch 出来，按需派发时三条都出来。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_channel_dispatches_on_demand_not_as_pool() {
+        let root = tmp_root("manual_ondemand");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = Arc::new(TaskStateStore::new_at(&root, "b"));
+        let release = root.join("release");
+        for i in 0..3 {
+            let mut t = now_task("b", &format!("tk_od_{i}"), "c");
+            t.payload.kind = PayloadKind::Proc;
+            t.payload.prompt.clear();
+            t.payload.cmd = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "touch {root}/start_{i}; while [ ! -f {release} ]; do sleep 0.05; done",
+                    root = root.display(),
+                    release = release.display()
+                ),
+            ];
+            t.limits.timeout_secs = 0;
+            store.add(t).unwrap();
+        }
+        let (stop, worker) = spawn_manual_poller(
+            &root,
+            crate::config::Config::default(),
+            Arc::new(store),
+            Arc::clone(&states),
+        );
+        let mut all_started = false;
+        for _ in 0..100 {
+            if (0..3).all(|i| root.join(format!("start_{i}")).exists()) {
+                all_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // 收尾先做（无论断言是否通过）：放行子进程 + 关停 poller（关停会等执行体收尾）。
+        std::fs::write(&release, b"").unwrap();
+        stop.cancel();
+        let _ = worker.await;
+        assert!(
+            all_started,
+            "一条 poller 必须能把 3 条手动档任务都派发起来（按需派发；固定池下只会起 1 条）"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// `task_workers.manual` 仍是**闸门**（不是池子，也不能是空操作）：显式设 1 时，
+    /// 第二条同通道任务必须等第一条的执行体还位才被派发。这条与上面那条互为对照
+    /// ——一个证「不设闸门时不排队」，一个证「设了闸门时真的排队」。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_cap_gates_inflight_executors() {
+        let root = tmp_root("manual_cap");
+        let paths = crate::task_store::TaskPaths::with_root(&root, "b");
+        let store = TaskStore::new_at(&root, "b");
+        let states = Arc::new(TaskStateStore::new_at(&root, "b"));
+        let release = root.join("release");
+        let mut first = now_task("b", "tk_cap_first", "c");
+        first.payload.kind = PayloadKind::Proc;
+        first.payload.prompt.clear();
+        first.payload.cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "touch {root}/first_start; while [ ! -f {release} ]; do sleep 0.05; done; touch {root}/first_done",
+                root = root.display(),
+                release = release.display()
+            ),
+        ];
+        first.limits.timeout_secs = 0;
+        let mut second = now_task("b", "tk_cap_second", "c");
+        second.payload.kind = PayloadKind::Proc;
+        second.payload.prompt.clear();
+        second.payload.cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("touch {root}/second_start", root = root.display()),
+        ];
+        second.limits.timeout_secs = 0;
+        store.add(first).unwrap();
+        store.add(second).unwrap();
+
+        let mut cfg = crate::config::Config::default();
+        cfg.task_workers.manual = 1; // 闸门 = 1 条在跑
+        let (stop, worker) = spawn_manual_poller(&root, cfg, Arc::new(store), Arc::clone(&states));
+
+        let mut first_started = false;
+        for _ in 0..100 {
+            if root.join("first_start").exists() {
+                first_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // 第一条占着闸门时给 poller 足够多轮（50ms × 多轮）去尝试第二条。
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let second_while_gated = root.join("second_start").exists();
+        std::fs::write(&release, b"").unwrap();
+        // 第一条还位后，第二条必须在几轮内被派发。
+        let mut second_started = false;
+        for _ in 0..100 {
+            if root.join("second_start").exists() {
+                second_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop.cancel();
+        let _ = worker.await;
+        assert!(first_started, "第一条必须被派发（闸门空着）");
+        assert!(
+            !second_while_gated,
+            "闸门=1 时第二条不得与第一条同时在跑（否则闸门没接线）"
+        );
+        assert!(
+            second_started,
+            "第一条还位后第二条必须被派发（闸门不得卡死）"
+        );
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     /// 通道可配多 worker 的核心收益：**不同**任务能在同一档同时被认领（同一条任务仍只认领一次，
