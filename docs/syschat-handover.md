@@ -43,7 +43,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
   ① 先让窗口**被点过**（激活）：实测**只有 app 已被点过，合成事件才落在它身上**（锁屏或未激活时 `CGEvent` 只落在 `loginwindow`/别的 app，
   日志里 `[selfresize] begin` 与 `cursor_moved` 会**双双为 0 条**，别把这读成「缩放没接线」）；
   ② 已知窗口矩形（`swift /tmp/listwin2.swift` 列 `(x,y,w,h)`）后发一次合成拖拽：
-  `swift /private/tmp/drag`\<无\> —— 本机现成脚本是 `swift /private/tmp/drag_once.swift 992 127 -140`（x y dx，10 拍带 30ms 间隔），
+  本机现成脚本：`swift /private/tmp/drag_once.swift 992 127 -140`（参数 x y dx，10 拍、每拍 30ms），
   随后 `grep -a '\[selfresize\] begin' /tmp/verify.log` **应出现一条** `begin dir=<east|north-east|…> at (x,y)`（日志点在 `src/ui.rs` 的 `SelfResize` 入口；
   **注意**：这条字符串在当前 head 的 release 二进制里也在，但 GUI 进程的 stdout 不落 `~/.agent-bridge/logs/gui.out`（那份停在 10-12）⇒ 要留证就用 §1 的 debug 探针 + `> /tmp/verify.log`）；
   ③ 再用 `listwin2.swift` 复读一次矩形：**w/h 应变大**（这才叫「端到端生效」；只有单测几何=没验到手），
