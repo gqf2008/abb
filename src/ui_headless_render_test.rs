@@ -1260,17 +1260,20 @@ fn titlebar_drag_is_not_counted_as_click() {
     );
 }
 
-/// D6 旁证：`PixelWindowResize` 的命中面**确实会吃掉标题栏顶部那一条**（因此 macOS 必须关掉它）。
+/// 热区几何旁证（**非自管口径** = Windows/Linux）：热区确实会吃掉标题栏顶部那一条。
 ///
 /// 几何：热区是绝对 y 0..6 的整宽条（`height: 6px`），而标题栏占 y 2..36 ⇒ 标题栏顶 4px
 /// 归热区；左右两条 6px 整高条同理压在标题栏两端。热区按下即 `begin-resize(dir)` 并 grab，
 /// 内容再也拿不到这次按压。
 ///
-/// 为什么这是 D6 的 bug：macOS 上 `install_window_resize` 接的
+/// 这是一条**取舍**（不是 bug）：无边框窗的边角缩放与标题栏顶部那 4px 只能二选一。改前的
+/// D6 结论是「macOS 别画热区、交给系统」，2026-10-15 实测更正为：**透明**无边框窗在 macOS
+/// 拿不到系统边角缩放（取证见 `docs/syschat-handover.md` §5.1）⇒ 对话窗**恒画**热区、
+/// 走自管缩放（见 `self_managed_hit_zones_route_press_with_pointer_coords`）；
+/// 只有设置窗仍按平台关掉——它的热区接的是
 /// `winit::Window::drag_resize_window` **直接返回 `NotSupported`**
 ///（winit 0.30.13 `src/platform_impl/macos/window_delegate.rs:1179`），
-/// 于是这些热区在 macOS 上「吃按压 + 什么都不做」——`app.slint` 里设置窗那条注释
-/// （"macOS 刻意不加：系统对 no-frame 窗口自带边角缩放，自绘热区会抢掉它"）说的就是这个。
+/// 在 macOS 上「吃按压 + 什么都不做」。
 /// Rust 侧口径由 `ui::tests::resize_hit_areas_follow_platform_rule` 守着。
 #[test]
 fn resize_hot_zone_eats_titlebar_top_band() {
@@ -1289,6 +1292,80 @@ fn resize_hot_zone_eats_titlebar_top_band() {
         dirs.borrow().as_slice(),
         ["north"],
         "标题栏顶部那条没有落到 north 缩放热区上（{dirs:?}）——本用例的几何前提变了，         请重新核对标题栏与热区的落位"
+    );
+}
+
+/// **自管口径**（= 对话窗在 macOS 上的生产口径）必须把「方向 + 按下时的窗口内指针坐标」
+/// 交给 Rust，而不是发系统 `begin-resize`。
+///
+/// 为什么这条必须存在：自管缩放的**锚点**就取自这组坐标——只报方向的老口径会让自管循环
+/// 等第一次 `CursorMoved` 才补锚（快甩手时窗口边恒定落后指针十几像素，不是抖动）。
+/// 它与 `resize_hot_zone_eats_titlebar_top_band`（非自管）互为对照：同一套几何、两条路由，
+/// 由 `resize-self-managed` 二选一，**不得同时触发**。
+///
+/// 无头可跑的理由：热区是 `.slint` 里的 `ResizeZone`，`self.absolute-position + mouse-x/y`
+/// 在最小软件窗适配器里同样成立；needs 真机的那部分（winit 屏幕坐标 + `set_size`）由
+/// `syschat::SelfResize` 的纯逻辑用例覆盖。
+///
+/// 与 `v11c_resize_zones_hit_all_edges_and_corners`（同一套几何、扫 8 个方向）的分工：那条钉
+/// 「八个方向的**路由**（自管/系统二选一）+ ±1 的窗口坐标」；本条钉**精确相等**与**反向对照**
+/// ——内容区中部不得被吞（那条只取 8 个边/角点，扫不到「整窗 overlay」这类回归）。变异自验
+/// （2026-10-15）：①`ResizeZone` 改成一律 `root.begin(dir)` ⇒ 两条都红；②只把 `south-east`
+/// 角块缩到 4×4 并贴到最角上（按下点 (513,613) 不再落块内）⇒ **只有本条红**（那条的角点
+/// (517,617) 仍在块内）——这正是本条不可省的理由。
+#[test]
+fn self_managed_hit_zones_route_press_with_pointer_coords() {
+    const CW: u32 = 520;
+    const CH: u32 = 620;
+    let (ui, win, _log) = setup_with_click_counters();
+    ui.window().set_size(slint::PhysicalSize::new(CW, CH));
+    super::apply_syschat_layout(&ui, CW as f32);
+    let got = Rc::new(std::cell::RefCell::new(Vec::<(String, f32, f32)>::new()));
+    {
+        let g = got.clone();
+        ui.on_self_resize_begin(move |dir, x, y| g.borrow_mut().push((dir.to_string(), x, y)));
+    }
+    let system = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    {
+        let s = system.clone();
+        ui.on_begin_resize(move |dir| s.borrow_mut().push(dir.to_string()));
+    }
+    ui.set_resize_hit_areas(true);
+    ui.set_resize_self_managed(true);
+    let _ = settle_w(&win, CW, CH);
+
+    // 右下角（`south-east`，14×14 块：x 506..520 / y 606..620）：按下点 (513,613) 应原样上报。
+    press(&win, 513.0, 613.0);
+    release(&win, 513.0, 613.0);
+    assert_eq!(
+        got.borrow().as_slice(),
+        [("south-east".to_string(), 513.0, 613.0)],
+        "右下角按下没有落到自管缩放热区，或坐标没有如实上报（{got:?}）"
+    );
+    assert!(
+        system.borrow().is_empty(),
+        "自管口径下不许再发系统 begin-resize（{system:?}）——两条路由必须二选一"
+    );
+
+    // 右边条（`east`，6px 整高：x 514..520）：内容区中部按下也不得被吞。
+    press(&win, 517.0, 300.0);
+    release(&win, 517.0, 300.0);
+    assert_eq!(
+        got.borrow().as_slice(),
+        [
+            ("south-east".to_string(), 513.0, 613.0),
+            ("east".to_string(), 517.0, 300.0)
+        ],
+        "右边条按下没有落到 east 热区（{got:?}）"
+    );
+
+    // 反向对照：内容区中部**不是**热区（否则整窗都被吃掉，输入框点不动）。
+    press(&win, 260.0, 300.0);
+    release(&win, 260.0, 300.0);
+    assert_eq!(
+        got.borrow().len(),
+        2,
+        "内容区中部不该被缩放热区吃掉（{got:?}）"
     );
 }
 
