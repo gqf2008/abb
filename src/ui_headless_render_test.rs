@@ -435,12 +435,29 @@ fn selectable_blocks_render_same_height_as_legacy_element() {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // 波浪号：`row()` 的入参是**解析后的块文本**（= 生产 `block_row` 的入参），所以这里先过一遍
+    // `parse`。`~` 曾被 `push_escaped` 漏掉，解析后应当已被转义成 `\~`（下面断言）。
+    let tilde = {
+        let src = format!("约 3~4 元、~/bin、a~b：{long}");
+        let b = crate::mdblocks::parse(&src);
+        assert_eq!(b.len(), 1, "用例前提：这段应解析成单块");
+        assert_eq!(b[0].kind, "p");
+        assert!(
+            b[0].text.contains(r"\~"),
+            "解析后字面量波浪号该已转义，否则判据之外会静默出错：{:?}",
+            b[0].text
+        );
+        b[0].text.clone()
+    };
     // `min_h` = 该块的**正面控制**：内容必须真的多行（否则「两边一样高」是空的）。
-    let cases: [(&str, String, f32); 4] = [
+    let cases: [(&str, String, f32); 5] = [
         ("p", long.clone(), 100.0),
         ("h2", long.clone(), 100.0),
         ("list", long.clone(), 100.0),
         ("code", code, 180.0),
+        // 波浪号：解析时**转义**成 `\~`，只有 Slint 认这个转义才不会漏出反斜杠
+        //（评审 finding：`~` 曾是 `push_escaped` 的漏网元字符）。
+        ("p", tilde, 100.0),
     ];
     // 量一条分支：`true` = 生产口径（可选中），`false` = 旧分支（`selectable` 关掉）。
     let measure = |kind: &str, text: &str, selectable: bool| {
@@ -452,29 +469,28 @@ fn selectable_blocks_render_same_height_as_legacy_element() {
         }
         let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
         let f = settle(&ui, &win, TALL_H);
-        let h = ui.get_dbg_content_h();
-        let bottom = f
-            .lowest_ink_row(4, TALL_H - 4, 4, W - 4)
-            .expect("两条分支都该画得出墨迹");
-        (h, bottom, f)
+        (ui.get_dbg_content_h(), f)
     };
     for (kind, text, min_h) in cases {
-        let (h_new, bottom_new, f_new) = measure(kind, &text, true);
-        let (h_old, bottom_old, f_old) = measure(kind, &text, false);
+        let (h_new, f_new) = measure(kind, &text, true);
+        let (h_old, f_old) = measure(kind, &text, false);
         let diff = f_new.diff_px(&f_old);
-        println!("{kind}: 可选中 content.h={h_new} 最底墨迹={bottom_new} / 旧分支 {h_old} / {bottom_old} / 差异像素 {diff}");
+        println!(
+            "{kind}: 可选中 content.h={h_new} / 旧分支 {h_old} / 差异像素 {diff} / 帧内墨迹行数 {}",
+            (0..TALL_H)
+                .filter(|&y| !f_new.ink_cols(y, 4, W - 4).is_empty())
+                .count()
+        );
         assert!(
             (h_new - h_old).abs() <= 1.0,
             "{kind} 换渲染元素不该改高度：TextInput={h_new} vs 旧分支={h_old}"
-        );
-        assert!(
-            bottom_new.abs_diff(bottom_old) <= 1,
-            "{kind} 真实渲染的最底墨迹也必须一致：TextInput={bottom_new} vs 旧分支={bottom_old}"
         );
         assert_eq!(
             diff, 0,
             "{kind} 换渲染元素必须**逐像素**一致（差异 {diff} 像素）：这是「观感零变化」的直接证据"
         );
+        // 注：这里**不**拿「最底墨迹行号」当判据——它恒等于窗底 chrome 那一行（两分支都是
+        // 2587），是**恒真**断言（独立评审 finding）。逐帧像素差是严格更强的判据，故用它。
         assert!(
             h_new >= min_h,
             "{kind} 正面控制：内容应真的多行（量到 {h_new}，期望 ≥ {min_h}）"
@@ -482,22 +498,62 @@ fn selectable_blocks_render_same_height_as_legacy_element() {
     }
 }
 
-/// 有行内样式的块**必须继续走 `StyledText`**（`TextInput` 渲染不了粗体/链接/行内码）——
+/// 有行内样式的块**必须继续走 `StyledText`**（`TextInput` 渲染不了粗体/链接/行内码/删除线）——
 /// 这是 B 批已交付能力的回归守卫：宁可不可选中，也不许把样式画没。
+///
+/// 断言口径：入参一律取 `parse` 之后的**块文本**（= 生产 `block_row` 的入参），
+/// 所以这条同时覆盖「解析器的转义 → `styled()` 渲染」这一整段。
+///
+/// 判别力（负向）：让 `selectable_plain` 忽略行内样式（恒 `Some`）⇒ 第一段断言红；
+/// 让它漏认 `~`（评审 finding 的原样）⇒ 删除线那例红（实测两分支差异 920 像素）。
 #[test]
 fn styled_paragraph_stays_on_styled_path_and_still_renders() {
-    let md = "这段有 **粗体**、`行内码` 与 [链接](https://example.com)。";
-    let r = row("p", md);
-    assert!(
-        !r.selectable,
-        "含行内样式的段落必须继续走 StyledText（否则样式会被 TextInput 画掉）"
-    );
-    let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
-    let f = settle(&ui, &win, TALL_H);
-    assert!(
-        f.lowest_ink_row(4, TALL_H - 4, 4, W - 4).is_some(),
-        "走 StyledText 的段落仍必须画出来（不能被新的 if 分支吞掉）"
-    );
+    // 每种样式各一例：粗体/行内码/链接/删除线（单波浪与双波浪都会被解析器重发成 `~~`）。
+    // `bool` = 该例的解析结果是否**必须**与原文不同（含字面量波浪号 ⇒ 应被转义）。
+    // 只有为 true 的例子才能真正验到「转义不许漏出反斜杠」——其余例子的参考帧与生产帧
+    // 是同一份输入，属于「画得出来」的检查。
+    for (md, must_differ_from_source) in [
+        (
+            "这段有 **粗体**、`行内码` 与 [链接](https://example.com)。",
+            false,
+        ),
+        ("这段有 ~~删除线~~。", false),
+        ("这段有 ~单波浪删除线~。", false),
+        ("这段有 **粗体** 与 ~/bin 与 3~4 元。", true),
+    ] {
+        let b = crate::mdblocks::parse(md);
+        assert_eq!(b.len(), 1, "用例前提：单段（{md:?}）");
+        if must_differ_from_source {
+            assert!(
+                b[0].text.contains(r"\~") && b[0].text != md,
+                "该例必须真的把字面量波浪号转义掉（否则下面那次比较是空判据）：{:?}",
+                b[0].text
+            );
+        }
+        let r = row("p", &b[0].text);
+        assert!(
+            !r.selectable,
+            "含行内样式的段落必须继续走 StyledText（否则样式会被 TextInput 画掉）：{md:?} → {:?}",
+            b[0].text
+        );
+        let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
+        let f = settle(&ui, &win, TALL_H);
+        assert!(
+            f.lowest_ink_row(4, TALL_H - 4, 4, W - 4).is_some(),
+            "走 StyledText 的段落仍必须画出来（不能被新的 if 分支吞掉）：{md:?}"
+        );
+        // 与「没有换来换去」的参考帧逐像素一致：参考帧直接喂**未转义**原文给 `StyledText`。
+        // 不一致就说明我们新加进 `push_escaped` 的转义在渲染侧漏了（例如 `\~` 被当成字面量）。
+        let reference = row("p", md);
+        assert!(!reference.selectable, "参考帧也走 StyledText");
+        let (ui_ref, win_ref, _) = setup(vec![row("role", "怹"), reference], TALL_H);
+        let f_ref = settle(&ui_ref, &win_ref, TALL_H);
+        assert_eq!(
+            f.diff_px(&f_ref),
+            0,
+            "解析后的转义文本与原文必须渲染成同一张图（转义不许漏出反斜杠）：{md:?}"
+        );
+    }
 }
 
 /// 代码块恒可选中，且正文**逐字**保留——复制代码是本卡第一场景，
@@ -1655,6 +1711,14 @@ fn blur_hides_dialog_window_end_to_end() {
     let empty_bubble: slint::Weak<AnchorBubble> = slint::Weak::default();
     let empty_settings: slint::Weak<SettingsWindow> = slint::Weak::default();
     let cw = ui.as_weak();
+    // 朗读器：起一个 `/bin/sleep` 当在跑的朗读（不真出声），验「失焦隐藏也把朗读停掉」。
+    let speaker: Rc<RefCell<crate::platform::Speaker>> =
+        Rc::new(RefCell::new(crate::platform::Speaker::new()));
+    assert!(
+        speaker.borrow_mut().spawn_with("/bin/sleep", "30"),
+        "前置控制失败：起不了替身朗读进程"
+    );
+    ui.set_speaking_turn(3);
     assert!(
         super::handle_syschat_focus_event(
             &WindowEvent::Focused(false),
@@ -1662,6 +1726,7 @@ fn blur_hides_dialog_window_end_to_end() {
             &cw,
             &empty_bubble,
             &empty_settings,
+            &speaker,
         ),
         "Focused(false) 应被失焦隐藏接线消费"
     );
@@ -1673,6 +1738,7 @@ fn blur_hides_dialog_window_end_to_end() {
         &cw,
         &empty_bubble,
         &empty_settings,
+        &speaker,
     );
     std::thread::sleep(std::time::Duration::from_millis(
         super::BLUR_HIDE_DELAY_MS * 3,
@@ -1682,6 +1748,10 @@ fn blur_hides_dialog_window_end_to_end() {
         ui.window().is_visible(),
         "Focused(true) 之后待执行的隐藏没被取消：窗口被藏掉了"
     );
+    assert!(
+        speaker.borrow_mut().is_speaking(),
+        "隐藏被取消时朗读不该被停掉（只有真的隐藏才停）"
+    );
 
     // 再失焦：这次必须真的隐藏。
     super::handle_syschat_focus_event(
@@ -1690,6 +1760,7 @@ fn blur_hides_dialog_window_end_to_end() {
         &cw,
         &empty_bubble,
         &empty_settings,
+        &speaker,
     );
     std::thread::sleep(std::time::Duration::from_millis(
         super::BLUR_HIDE_DELAY_MS * 3,
@@ -1698,6 +1769,17 @@ fn blur_hides_dialog_window_end_to_end() {
     assert!(
         !ui.window().is_visible(),
         "失焦（且焦点离开本进程）后窗口没有隐藏：D5 的延时/判定链断了"
+    );
+    // 三条隐藏路径共用 `hide_syschat`：失焦这条也必须停朗读并复位按钮态
+    //（独立评审 finding：原来只有 ✕ 那条停了朗读）。
+    assert!(
+        !speaker.borrow_mut().is_speaking(),
+        "失焦隐藏必须把在跑的朗读停掉（否则窗口没了、声音还在放）"
+    );
+    assert_eq!(
+        ui.get_speaking_turn(),
+        -2,
+        "隐藏后朗读态必须复位（否则下次开窗还显示「⏹ 停止朗读」）"
     );
     let _ = win;
 }

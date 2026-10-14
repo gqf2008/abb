@@ -87,10 +87,16 @@ fn media_kind_for(src: &str) -> Option<&'static str> {
 }
 
 /// 行内文本转义：块内行内 markdown 是**我们自己重建**的，故把元字符转义，
-/// 避免普通文本里的 `*`/`_`/`` ` ``/`[` 被当成样式。
+/// 避免普通文本里的 `*`/`_`/`` ` ``/`[`/`~` 被当成样式。
+///
+/// 覆盖口径：这里必须覆盖**解析器会重发的每一个元字符**——[`has_inline_markup`] 的判据
+///（「未转义元字符 = 真有样式」）就建立在「字面量一定已转义」之上。漏一个就会在判据之外
+/// 静默出错：`~` 曾漏在此列，于是 `~~删~~` 被当成「无样式」，GUI 换成只读 `TextInput`
+/// 后把 `~~删~~` 当字面量画了出来（删除线没了；独立评审实测两分支差异 920 像素）。
+/// 已实核 Slint 的 markdown 认 `\~`：`styled("3\\~4")` 与 `styled("3~4")` 逐像素一致。
 fn push_escaped(t: &str, out: &mut String) {
     for c in t.chars() {
-        if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
+        if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '~') {
             out.push('\\');
         }
         out.push(c);
@@ -123,7 +129,7 @@ fn has_inline_markup(escaped: &str) -> bool {
             let _ = it.next();
             continue;
         }
-        if matches!(c, '`' | '*' | '_' | '[' | ']' | '<' | '>') {
+        if matches!(c, '`' | '*' | '_' | '[' | ']' | '<' | '>' | '~') {
             return true;
         }
     }
@@ -1015,6 +1021,9 @@ mod tests {
         assert!(has_inline_markup("_斜体_"));
         assert!(has_inline_markup("[链接](https://example.com)"));
         assert!(has_inline_markup("原义 <b>html</b>"));
+        // 删除线：解析器把 `~~` 原样重发回 text（单 `~x~` 也会被重发成 `~~x~~`）
+        assert!(has_inline_markup("这是 ~~删除线~~ 字"));
+        assert!(has_inline_markup("~~单波浪也被重发成一对~~"));
         // 边界：转义的反斜杠 + 真星号 ⇒ 星号是**样式**（不是字面量）
         assert!(has_inline_markup(r"反斜杠 \\* 之后是斜体起点"));
     }
@@ -1047,6 +1056,50 @@ mod tests {
         assert!(
             has_inline_markup(&b[0].text),
             "含粗体/链接的段落必须判为有行内样式：{:?}",
+            b[0].text
+        );
+    }
+
+    /// 卡 `abb-v11-message-actions` 评审 Critical 回归：**字面量波浪号**必须可选中、
+    /// **删除线**必须留在 `StyledText`。
+    ///
+    /// 漏掉 `~` 时的实测后果（独立评审）：`~~删~~` 被判成「无行内样式」⇒ 走只读 `TextInput`
+    /// ⇒ 用户看到字面量 `~~删~~`（删除线没了），两分支差异 920 像素。
+    #[test]
+    fn tilde_is_escaped_when_literal_and_detected_when_a_style() {
+        // 字面量波浪号：解析后已被转义 ⇒ 可选中，且展示文本逐字等于原文
+        for src in ["约 3~4 元", "~/bin/abb", "a~b"] {
+            let b = parse(src);
+            assert_eq!(b.len(), 1, "{src:?}");
+            assert!(
+                !has_inline_markup(&b[0].text),
+                "字面量波浪号不该被判成样式（{src:?} → {:?}）",
+                b[0].text
+            );
+            assert_eq!(
+                selectable_plain(&b[0].kind, &b[0].text).as_deref(),
+                Some(src),
+                "必须可选中且逐字保留（{src:?} → {:?}）",
+                b[0].text
+            );
+        }
+        // 删除线（`~~x~~` 与单波浪 `~x~` 都会被解析器重发成 `~~x~~`）⇒ 不可选中，留在 StyledText
+        for src in ["这是 ~~删除线~~ 字", "~单波浪~"] {
+            let b = parse(src);
+            assert_eq!(b.len(), 1, "{src:?}");
+            assert!(
+                has_inline_markup(&b[0].text),
+                "删除线必须判为有行内样式（{src:?} → {:?}）",
+                b[0].text
+            );
+            assert_eq!(selectable_plain(&b[0].kind, &b[0].text), None, "{src:?}");
+        }
+        // 混合：有样式 + 字面量波浪号 ⇒ 走 StyledText，但文本里的 `~` 已转义（Slint 认 `\~`）
+        let b = parse("**粗** 与 3~4");
+        assert_eq!(selectable_plain(&b[0].kind, &b[0].text), None);
+        assert!(
+            b[0].text.contains(r"3\~4"),
+            "字面量波浪号该被转义：{:?}",
             b[0].text
         );
     }

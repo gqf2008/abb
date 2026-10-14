@@ -82,19 +82,18 @@ pub struct ActionTarget {
 
 /// 解析助手轮动作行的目标（纯函数，单测钉住）。
 ///
-/// `turn < 0` = 当前会话**最后一条助手轮**（刚跑完那条：渲染它时还不知道历史下标）。
-/// `turn >= 0` = 历史下标，且**必须真的是助手轮**——指到用户轮/越界一律 `None`
-///（宁可报「找不到这一轮」也不猜）。
+/// `turn` **必须是真实的历史下标**，且 `turns[turn]` 必须真的是助手轮——指到用户轮/越界一律
+/// `None`（宁可报「找不到这一轮」也不猜）。
+///
+/// 为什么**不**接受「负值 = 最后一条助手轮」这类哨兵（原设计如此，独立评审判 Critical）：
+/// 哨兵不是身份。一条已收尾但还没换真实下标的动作行留在模型里，等第二轮收尾时模型里就有
+/// **两条**同值哨兵，两条都解析到最后一条助手轮 ⇒ 点第一条的「复制/朗读」操作的是**别的轮**
+/// 且报成功。所以「刚跑完那一轮」的下标必须在收尾时就算出来（见 [`last_assistant_index`]）。
 pub fn action_target(turns: &[Turn], turn: i32) -> Option<ActionTarget> {
-    let index = if turn < 0 {
-        turns.iter().rposition(|t| t.role == "assistant")?
-    } else {
-        let i = usize::try_from(turn).ok()?;
-        if turns.get(i)?.role != "assistant" {
-            return None;
-        }
-        i
-    };
+    let index = usize::try_from(turn).ok()?;
+    if turns.get(index)?.role != "assistant" {
+        return None;
+    }
     let text = turns[index].text.clone();
     let prompt = turns[..index]
         .iter()
@@ -106,6 +105,22 @@ pub fn action_target(turns: &[Turn], turn: i32) -> Option<ActionTarget> {
         text,
         prompt,
     })
+}
+
+/// 刚收尾那一轮在**落盘历史**里的下标（`None` = 定位不到 ⇒ 调用方**不挂动作行**）。
+///
+/// 为什么定位得到：`turn_core` 的「临界区 2」在回合结局事件（`Reply`/`Stopped`）**之前**就把
+/// 助手轮落进历史（`src/syschat.rs` 的 `turn_core` 尾部），而 GUI 是单线程、同一时刻只有一个
+/// 在途回合（`busy`）——所以 GUI 处理该事件时，历史末条就是这一轮。
+///
+/// 为什么要「末条必须是助手轮」这个条件而不是直接取 `len() - 1`：回合失败（Error 事件）或
+/// 极端停止（正文与思考都空、`turn_core` 不落盘）时末条会是用户轮，此时**不挂**才对——
+/// 挂出来的按钮会指向别的轮，属于「给了假保证」。
+pub fn last_assistant_index(turns: &[Turn]) -> Option<i32> {
+    match turns.last() {
+        Some(t) if t.role == "assistant" => i32::try_from(turns.len() - 1).ok(),
+        _ => None,
+    }
 }
 
 /// 系统级对话的数据目录：`~/.agent-bridge/syschat/`。
@@ -5815,8 +5830,8 @@ mod tests {
             t("user", "说个笑话"),
             t("assistant", "笑话 X"),
         ];
-        // -1 = 最后一条助手轮
-        let a = action_target(&h, -1).expect("应解析到最后一条助手轮");
+        // 显式下标（恒为真实下标，见 `action_target` 的文档）
+        let a = action_target(&h, 3).expect("应解析到最后一条助手轮");
         assert_eq!(a.index, 3);
         assert_eq!(a.text, "笑话 X");
         assert_eq!(
@@ -5840,17 +5855,75 @@ mod tests {
         let h = vec![t("user", "只有用户轮")];
         assert!(action_target(&h, 0).is_none(), "指到用户轮必须拒绝（不猜）");
         assert!(action_target(&h, 7).is_none(), "越界必须拒绝");
-        assert!(action_target(&h, -1).is_none(), "没有助手轮时 -1 必须拒绝");
-        assert!(action_target(&[], -1).is_none(), "空历史必须拒绝");
         assert!(action_target(&[], 0).is_none(), "空历史 + 下标必须拒绝");
+        // 哨兵一律拒绝：**没有**「负值 = 最后一条助手轮」这条约定（评审 Critical 的修法）。
+        //
+        // ⚠️ 判据必须拿**末条真的是助手轮**的历史：只用上面那条「没有助手轮」的历史是**空判据**
+        // ——老哨兵写法在那里也返回 `None`，断言恒绿（实测：把哨兵分支写回去，只有 `h` 的几条
+        // 照样通过，`ends_with_assistant` 这条才是唯一会红的）。评审的复现正是这个形态：
+        // 历史末条是助手轮时，`-1` 会解析**到最后一条助手轮**，于是两条同值哨兵一起指到同一轮。
+        let ends_with_assistant = vec![
+            t("user", "一"),
+            t("assistant", "答复一"),
+            t("user", "二"),
+            t("assistant", "答复二"),
+        ];
+        for sentinel in [-1, -2, i32::MIN] {
+            assert!(
+                action_target(&h, sentinel).is_none(),
+                "哨兵 {sentinel} 必须拒绝（哨兵不是身份：两条同值哨兵会一起解析到同一轮）"
+            );
+            assert!(
+                action_target(&[], sentinel).is_none(),
+                "空历史 + 哨兵必须拒绝"
+            );
+            assert!(
+                action_target(&ends_with_assistant, sentinel).is_none(),
+                "末条是助手轮时也必须拒绝哨兵 {sentinel}——否则第二条动作行会静默操作第一条的答复"
+            );
+        }
     }
 
     #[test]
     fn action_target_without_preceding_user_turn_has_no_prompt() {
         let h = vec![t("assistant", "凭空一句")];
-        let a = action_target(&h, -1).expect("助手轮本身应可解析");
+        let a = action_target(&h, 0).expect("助手轮本身应可解析");
         assert_eq!(a.index, 0);
         assert_eq!(a.text, "凭空一句");
         assert!(a.prompt.is_none(), "前面没有用户轮 ⇒ 没有可重跑的提示词");
+    }
+
+    /// 收尾轮的下标定位：末条是助手轮 ⇒ 它的下标；否则 `None`（调用方据此**不挂**动作行）。
+    ///
+    /// 判别力（负向）：去掉 `role == "assistant"` 条件（直接 `len() - 1`）⇒ 末条是用户轮的
+    /// 两个用例红——那会让动作行指向**上一轮的答复**（评审 Critical 的同族错误）。
+    #[test]
+    fn last_assistant_index_requires_an_assistant_tail() {
+        let h = vec![
+            t("user", "一"),
+            t("assistant", "答复一"),
+            t("user", "二"),
+            t("assistant", "答复二"),
+        ];
+        assert_eq!(last_assistant_index(&h), Some(3));
+        // 刚插入的用户轮还没落助手轮（回合进行中/失败）⇒ 定位不到，不挂动作行
+        let mut h2 = h.clone();
+        h2.push(t("user", "三"));
+        assert_eq!(
+            last_assistant_index(&h2),
+            None,
+            "末条是用户轮 ⇒ 不许硬取 len-1"
+        );
+        assert_eq!(last_assistant_index(&[]), None, "空历史");
+        assert_eq!(
+            last_assistant_index(&[t("user", "只有提问")]),
+            None,
+            "只有用户轮"
+        );
+        // 与 action_target 串起来：定位到的下标必须能解析出**这一条**答复
+        let idx = last_assistant_index(&h).expect("末条是助手轮");
+        let a = action_target(&h, idx).expect("应可解析");
+        assert_eq!(a.text, "答复二");
+        assert_eq!(a.index, 3);
     }
 }

@@ -3037,8 +3037,9 @@ export struct SysChatBlockRow {
     // `selectable` 为 false 时继续走 `styled`（有行内样式，`TextInput` 渲染不了 ⇒ 不做视觉回退）。
     selectable: bool,
     plain: string,
-    // 动作行（`kind == "acts"`）对应的助手轮序号：`-1` = 当前会话**最后一条**助手轮
-    //（刚跑完那条，历史索引由 Rust 在点击时解析），其它 kind 恒 `-1`。
+    // 动作行（`kind == "acts"`）对应的助手轮在**历史里的真实下标**（由 Rust 在收尾时定位，
+    // 见 `syschat::last_assistant_index`）；其它 kind 恒 `-1`（无意义）。**不许**用负值当
+    //「最后一条助手轮」的哨兵：两条同值哨兵会一起解析到同一轮（独立评审判 Critical）。
     turn: int,
 }
 
@@ -3721,13 +3722,13 @@ export component SystemChatWindow inherits Window {
     callback stop-streaming();   // ⏹ 停止：取消在途回合（Rust 侧发 external_cancel）
     callback toggle-think(int);  // 思考块展开/收起（E2）：参数是该块在 `blocks` 里的下标
     // 卡 `abb-v11-message-actions`：助手轮动作行（稿 v11.1 `.acts`）。
-    // 参数是该助手轮的**历史序号**（`-1` = 当前会话最后一条助手轮）——文本/提示词由 Rust
-    // 在点击时按序号解析（`syschat::action_target`），这样 Slint 侧不必搬整段正文。
+    // 参数是该助手轮的**真实历史下标**——文本/提示词由 Rust 在点击时按序号解析
+    //（`syschat::action_target`，它拒绝任何越界/非助手轮/哨兵值），这样 Slint 侧不必搬正文。
     callback copy-turn(int);     // ⧉ 复制（整轮正文 → 系统剪贴板）
     callback regen-turn(int);    // ⟳ 重新生成（用该轮的用户提示重跑，落历史、可停止）
     callback speak-turn(int);    // 🔊/⏹ 朗读（macOS `say`；再点一次 = 停止）
-    // 正在朗读的助手轮序号：`-2` = 没有朗读在跑（`-1` 是合法值「最后一条助手轮」，
-    // 所以初值必须用 -2，否则一进窗就显示成「⏹ 停止朗读」）。由 Rust 写。
+    // 正在朗读的助手轮序号：`-2` = 没有朗读在跑。**UI 状态哨兵**（与动作行的 `turn` 无关：
+    // 真实下标从 0 起，-1 不会被当作合法轮号），由 Rust 写。
     // 名字不能叫 `speak-turn`：Slint 不允许 callback 与属性同名（`callback speak-turn(int)`
     // 会直接编译失败），所以属性用 `speaking-turn` 与回调区分开。
     in-out property <int> speaking-turn: -2;

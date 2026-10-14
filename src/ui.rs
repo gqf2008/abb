@@ -602,6 +602,10 @@ fn refresh_bubble_visibility(bubble: &AnchorBubble) {
 
 /// 隐藏系统对话窗的**唯一收口**（✕ 按钮 / 红点 `CloseRequested` / D5 失焦隐藏 三条路径共用）。
 ///
+/// 关窗即停朗读：三条路径都会走到这里，所以停止放在这里、而不是各自复制一遍
+/// （独立评审：原来只有 ✕ 那条停了朗读，失焦自动隐藏与 `CloseRequested` 两条会把声音
+/// 留在窗口之外放——窗口没了，也就再也点不到「⏹ 停止朗读」）。
+///
 /// - 气泡不动（v10「常驻置顶」口径）：只调一次 [`refresh_bubble_visibility`] 把显隐拉回 config 真值；
 /// - `hide_dock`：D5 之后进程永不为 Regular（见 [`bring_app_to_front`]），这句只是把
 ///   「ABB 恒 accessory」这条不变式在「窗口都关了」的收尾点重新钉一遍（非 macOS 是空实现）。
@@ -609,7 +613,11 @@ fn hide_syschat(
     win: &SystemChatWindow,
     bubble: &slint::Weak<AnchorBubble>,
     settings: &slint::Weak<SettingsWindow>,
+    speaker: &Rc<RefCell<platform::Speaker>>,
 ) {
+    speaker.borrow_mut().stop();
+    // 朗读态一并复位：否则下次开窗该行还显示「⏹ 停止朗读」（而声音早停了）。
+    win.set_speaking_turn(-2);
     let _ = win.hide();
     if let Some(b) = bubble.upgrade() {
         refresh_bubble_visibility(&b);
@@ -665,6 +673,7 @@ fn handle_syschat_focus_event(
     win: &slint::Weak<SystemChatWindow>,
     bubble: &slint::Weak<AnchorBubble>,
     settings: &slint::Weak<SettingsWindow>,
+    speaker: &Rc<RefCell<platform::Speaker>>,
 ) -> bool {
     let slint::winit_030::winit::event::WindowEvent::Focused(focused) = ev else {
         return false;
@@ -679,13 +688,14 @@ fn handle_syschat_focus_event(
         return true; // 本来就藏着（✕ 关掉之后又收到一次失焦）：不用排隐藏
     }
     let (cwp, bwp, swp) = (win.clone(), bubble.clone(), settings.clone());
+    let spp = speaker.clone();
     timer.start(
         slint::TimerMode::SingleShot,
         Duration::from_millis(BLUR_HIDE_DELAY_MS),
         move || {
             let Some(w) = cwp.upgrade() else { return };
             if should_hide_on_blur(w.window().is_visible(), platform::app_is_active()) {
-                hide_syschat(&w, &bwp, &swp);
+                hide_syschat(&w, &bwp, &swp, &spp);
             }
         },
     );
@@ -2950,15 +2960,18 @@ fn rows_for_turn(t: &crate::syschat::Turn, index: usize) -> Vec<SysChatBlockRow>
 }
 /// 流式状态的当前快照 → 渲染行：角色行 +（有思考则）思考块 + 正文块。
 /// `expanded` 由 `live` 决定（进行中展开以显示打字机，结束/进正文即收起）。
-/// `finished` = 本回合已收尾（`Reply`/`Stopped`）⇒ 末尾挂动作行（`turn = -1`：刚跑完那条）。
-/// 流式**进行中**不挂动作行（此轮历史还没落盘，按序号也解析不到）。
+///
+/// `acts_turn` = 末尾动作行要带的**真实历史下标**，`None` = **不挂**动作行。两种 `None`：
+/// ① 流式进行中（此轮还没落盘，按序号也解析不到）；② 已收尾但下标定位不到
+///（见 `syschat::last_assistant_index`）。**不许**用「负值 = 刚跑完那条」这类哨兵当身份：
+/// 两条同值哨兵会一起解析到同一轮（独立评审判 Critical，见 `syschat::action_target` 的文档）。
 fn stream_rows(
     revealed_text: &str,
     has_thought: bool,
     thought_text: &str,
     elapsed: &str,
     live: bool,
-    finished: bool,
+    acts_turn: Option<i32>,
 ) -> Vec<SysChatBlockRow> {
     let mut rows = vec![role_row("怹")];
     if has_thought {
@@ -2967,8 +2980,11 @@ fn stream_rows(
     for b in crate::mdblocks::parse(revealed_text) {
         rows.push(block_row(b));
     }
-    if finished && (!revealed_text.is_empty() || has_thought) {
-        rows.push(acts_row(-1));
+    if let Some(turn) = acts_turn {
+        // 空回合（无正文也无思考）不挂：那会指向一条不存在的答复。
+        if !revealed_text.is_empty() || has_thought {
+            rows.push(acts_row(turn));
+        }
     }
     rows
 }
@@ -7771,16 +7787,15 @@ pub fn run_gui() -> Result<()> {
         let bw_close = bubble.as_weak();
         let sp_close = sc_speaker.clone();
         syschat_win.on_close_window(move || {
-            // 关窗即停朗读：否则窗口没了、声音还在放（而且再也点不到「停止」）。
-            sp_close.borrow_mut().stop();
             if let Some(w) = cw.upgrade() {
-                w.set_speaking_turn(-2);
-                hide_syschat(&w, &bw_close, &sw);
+                // 「关窗即停朗读」与朗读态复位都在 `hide_syschat` 里收口（三条隐藏路径共用）。
+                hide_syschat(&w, &bw_close, &sw, &sp_close);
             }
         });
         let cw2 = syschat_win.as_weak();
         let sw2 = settings.as_weak();
         let bw_close2 = bubble.as_weak();
+        let sp_hook = sc_speaker.clone();
         // C1：⌘V —— 剪贴板里是**文件**时拦截为附件，否则原样放行（文本粘贴仍交 TextInput）。
         //
         // 为什么走 winit 事件过滤器而不是 Slint 的 `key-pressed`：
@@ -7878,7 +7893,7 @@ pub fn run_gui() -> Result<()> {
             }
             if matches!(ev, WindowEvent::CloseRequested) {
                 if let Some(w) = cw2.upgrade() {
-                    hide_syschat(&w, &bw_close2, &sw2);
+                    hide_syschat(&w, &bw_close2, &sw2, &sp_hook);
                 }
             }
             // v11c（卡 `abb-v11-resize-maximize-macos`）：自管缩放的指针跟踪 / 收尾。
@@ -7909,7 +7924,7 @@ pub fn run_gui() -> Result<()> {
             // D5：**失焦即隐藏**（接线在 [`handle_syschat_focus_event`]，那里有判据/延时的完整理由）。
             // ⚠️ 必须挂在这个**已有**的钩子上：`on_winit_window_event` 是单槽 `set`，
             // 另起一个会把 ⌘V / Finder 拖放 / 红点关闭整条顶掉（且不会报错）。
-            handle_syschat_focus_event(ev, &blur_timer, &cw2, &bw_close2, &sw2);
+            handle_syschat_focus_event(ev, &blur_timer, &cw2, &bw_close2, &sw2, &sp_hook);
             // Windows：圆角 SetWindowRgn 硬裁剪（与设置窗同半径）；其它平台空操作。
             handle_platform_window_event(w, ev);
             EventResult::Propagate
@@ -8061,8 +8076,12 @@ pub fn run_gui() -> Result<()> {
                             )
                         };
                         let thought = tw_think.borrow().shown().to_string();
+                        // 收尾轮的下标**现在就定**（历史末条即这一轮，见 `last_assistant_index`）：
+                        // 不然后面第二轮收尾后模型里会同时留下两条「刚跑完那条」的动作行。
+                        let acts =
+                            crate::syschat::last_assistant_index(&crate::syschat::load_history());
                         let rows =
-                            stream_rows(&final_text, has_thought, &thought, &elapsed, false, true);
+                            stream_rows(&final_text, has_thought, &thought, &elapsed, false, acts);
                         if s0 != usize::MAX {
                             sync_stream_rows(&syschat_model_t, s0, rows);
                         } else if !stopped && (!final_text.is_empty() || has_thought) {
@@ -8124,7 +8143,7 @@ pub fn run_gui() -> Result<()> {
                     };
                     let thought = tw_think.borrow().shown().to_string();
                     let text = tw_text.borrow().shown().to_string();
-                    let rows = stream_rows(&text, has_thought, &thought, &elapsed, live, false);
+                    let rows = stream_rows(&text, has_thought, &thought, &elapsed, live, None);
                     sync_stream_rows(&syschat_model_t, stream_start.get(), rows);
                     if let Some(w) = win_w.upgrade() {
                         w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
@@ -9911,38 +9930,105 @@ mod tests {
         assert_eq!(rows.last().map(|r| r.turn), Some(7));
     }
 
-    /// 动作行只在流式回合**收尾后**出现，且用 `-1`（= 最后一条助手轮）：
-    /// 进行中不挂——这一轮还没落历史，按序号解析只会报「找不到这一轮」。
+    /// 动作行只在流式回合**收尾后**出现，且带**收尾时定位到的真实历史下标**：
+    /// 进行中不挂（这一轮还没落历史）；定位不到下标也不挂（`None`，不给假保证）。
     ///
-    /// 判别力（负向）：把 `finished &&` 去掉 ⇒ 打字过程中就冒出动作行 ⇒ 红；
+    /// 判别力（负向）：把 `if let Some(turn)` 换回哨兵写法（`finished && … acts_row(-1)`）
+    /// ⇒ 「下标必须等于传进来的那个」这条断言红（老写法在第二轮之后会有两条同值哨兵，
+    /// 两条都解析到最后一条助手轮，独立评审判 Critical）；去掉 `acts_turn` 的 `None` 分支
+    /// ⇒ 打字过程中就冒出动作行 ⇒ 红；
     /// 把空回合的 `!revealed_text.is_empty() || has_thought` 去掉 ⇒ 无内容的回合也挂 ⇒ 红。
     #[test]
     fn stream_rows_appends_acts_only_when_finished_with_content() {
-        let live = stream_rows("正文", false, "", "", true, false);
+        let live = stream_rows("正文", false, "", "", true, None);
         assert!(
             live.iter().all(|r| r.kind != "acts"),
             "流式进行中不该挂动作行（历史尚未落盘）"
         );
 
-        let done = stream_rows("正文", false, "", "", false, true);
+        let done = stream_rows("正文", false, "", "", false, Some(5));
         assert_eq!(done.last().map(|r| r.kind.as_str()), Some("acts"));
         assert_eq!(
             done.last().map(|r| r.turn),
-            Some(-1),
-            "收尾轮用 -1（解析成最后一条助手轮），因为渲染时还不知道历史下标"
+            Some(5),
+            "动作行必须带收尾时定位到的**真实历史下标**（哨兵不是身份）"
         );
 
-        let empty = stream_rows("", false, "", "", false, true);
+        let empty = stream_rows("", false, "", "", false, Some(5));
         assert!(
             empty.iter().all(|r| r.kind != "acts"),
             "空回合（无正文也无思考）不该挂动作行：会指向一条不存在的答复"
         );
 
-        let thought_only = stream_rows("", true, "想了下", "", false, true);
+        let thought_only = stream_rows("", true, "想了下", "", false, Some(5));
         assert_eq!(
             thought_only.last().map(|r| r.kind.as_str()),
             Some("acts"),
             "只有思考、没有正文的回合仍是真实的助手轮 ⇒ 该挂"
+        );
+        assert_eq!(thought_only.last().map(|r| r.turn), Some(5));
+    }
+
+    /// 评审 Critical 的**端到端回归**（评审原话：补一条「两轮后第一条动作行仍解析到第一轮」）：
+    /// 按生产口径拼出两轮问答的行序列，再逐条走 `syschat::action_target`——这正是用户按下按钮
+    /// 时走的那条路。
+    ///
+    /// 为什么必须端到端拼行、而不是只断言 `stream_rows` 的入参：旧写法（动作行恒 `-1`）在
+    /// **单轮**的纯函数用例里完全正常，只有**两轮之后**才暴露——两条动作行同值 ⇒ 一起解析到
+    /// 最后一轮（评审探针实测 `[(4,-1),(9,-1)]` 两条都 → `index=3 text="答复二"`）。
+    ///
+    /// 判别力（负向）：把 `stream_rows` 的 `acts_turn` 退回哨兵 `-1` ⇒ 本条红
+    /// （第一条动作行解析成「答复二」）。
+    #[test]
+    fn each_acts_row_targets_its_own_turn_after_two_rounds() {
+        let history = vec![
+            t("user", "问题一"),
+            t("assistant", "答复一"),
+            t("user", "问题二"),
+            t("assistant", "答复二"),
+        ];
+        // 生产口径：第一轮收尾时历史末条就是自己（下标 1），第二轮收尾时是 3。
+        let mut rows = rows_for_turn(&history[0], 0);
+        rows.extend(stream_rows(
+            "答复一",
+            false,
+            "",
+            "",
+            false,
+            crate::syschat::last_assistant_index(&history[..2]),
+        ));
+        rows.extend(rows_for_turn(&history[2], 2));
+        rows.extend(stream_rows(
+            "答复二",
+            false,
+            "",
+            "",
+            false,
+            crate::syschat::last_assistant_index(&history),
+        ));
+
+        let turns: Vec<i32> = rows
+            .iter()
+            .filter(|r| r.kind == "acts")
+            .map(|r| r.turn)
+            .collect();
+        assert_eq!(
+            turns,
+            vec![1, 3],
+            "两条动作行必须各带**自己那一轮**的真实下标"
+        );
+        let resolved: Vec<String> = turns
+            .iter()
+            .map(|turn| {
+                crate::syschat::action_target(&history, *turn)
+                    .expect("动作行必须能解析到本轮")
+                    .text
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![String::from("答复一"), String::from("答复二")],
+            "第一条动作行必须指向第一轮（哨兵写法下两条都会指到「答复二」）"
         );
     }
 }
