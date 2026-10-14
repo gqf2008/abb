@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v10</title>
+<title>ABB 系统对话 · 设计稿 v11</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -53,6 +53,15 @@
   .flip{position:absolute;left:12px;top:12px;font-size:11px;color:#5a5344;background:#fffdf7;border:1px solid #cbbfa6;border-radius:5px;padding:2px 6px}
 
   /* ---------- 对话框 ---------- */
+  /* v11：功能面板**贴着按钮上方**弹出（不是飘到很远）；消息动作行；可拉升把手 */
+  .pop{position:absolute;bottom:0;right:0;background:var(--panel);border:2px solid var(--edge);border-radius:8px;padding:8px;display:grid;grid-template-columns:repeat(8,26px);gap:4px;box-shadow:0 6px 18px rgba(28,26,23,.18);z-index:5}
+  .pop .e{width:26px;height:26px;display:flex;align-items:center;justify-content:center;border-radius:5px;font-size:15px;cursor:pointer}
+  .pop .e:hover{background:var(--hover)}
+  .acts{display:flex;gap:6px;margin:6px 0 0}
+  .acts .a{height:22px;padding:0 8px;border:2px solid var(--edge);border-radius:6px;background:var(--bg);font-size:10.5px;font-weight:700;display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+  .acts .a:hover{background:var(--hover)}
+  .split{height:8px;background:var(--bg);border-top:2px solid var(--edge);border-bottom:2px solid var(--edge);cursor:ns-resize;display:flex;align-items:center;justify-content:center}
+  .split i{width:38px;height:2px;background:var(--edge);border-radius:2px;display:block}
   .win{width:478px;background:var(--edge);border-radius:10px;padding:2px;box-shadow:0 10px 30px rgba(28,26,23,.25)}
   .win-body{background:var(--panel);border-radius:8px;overflow:hidden;display:flex;flex-direction:column;height:640px}
   .titlebar{height:38px;background:var(--bg);border-bottom:2px solid var(--edge);display:flex;align-items:center;gap:6px;padding:0 10px;flex:0 0 auto}
@@ -212,7 +221,8 @@
           <div class="item on"><span>新会话</span><span class="tag">当前</span></div>
           <div class="item"><span>把架构图做成网页</span><span class="tag">今天 00:40</span></div>
           <div class="item"><span>排查 deepseek 端点</span><span class="tag">昨天 23:12</span></div>
-          <div class="foot">点一条即切回该会话继续聊</div>
+          <div class="item"><span>🗄 归档…</span><span class="tag">当前会话</span></div>
+          <div class="foot">点一条即切回该会话继续聊；归档后从列表隐藏、可在「已归档」里找回</div>
         </div>
       </div>
       <div class="chipbtn accent mark" data-m="3">deepseek-chat<span class="caret">▾</span>
@@ -268,6 +278,12 @@
         </details>
         <div class="tbar">正在输入<span class="caret-t"></span><button class="stopbtn">⏹ 停止</button></div>
         <p style="margin:4px 0">页面主体已写好，接下来把说明区换成等宽字体<span class="caret-t"></span></p>
+        <!-- v11：消息可选中文复制；助手轮给 复制 / 重新生成 / 朗读 -->
+        <div class="acts">
+          <span class="a">⧉ 复制</span>
+          <span class="a">⟳ 重新生成</span>
+          <span class="a">🔊 朗读</span>
+        </div>
       </div>
     </div>
 
@@ -293,6 +309,13 @@
           <button class="send">发送</button>
         </div>
       </div>
+      <!-- v11：内容区与输入区之间可**拖拉改高度**（把手 8px，上下 2px 描边） -->
+      <div class="split"><i></i></div>
+      <!-- v11：表情面板**贴着功能区按钮上方**弹出（此前飘太远）；「更多」同款 -->
+      <div class="pop" style="right:12px;bottom:56px">
+        <div class="e">😀</div><div class="e">😄</div><div class="e">😅</div><div class="e">🤣</div><div class="e">🙂</div><div class="e">😉</div><div class="e">😍</div><div class="e">🤔</div>
+        <div class="e">👍</div><div class="e">👏</div><div class="e">🙏</div><div class="e">💪</div><div class="e">🎉</div><div class="e">🔥</div><div class="e">✅</div><div class="e">❌</div>
+      </div>
       <!-- 提示文案已按 owner 要求移除（不显示在界面上） -->
    </div>
   </div>
@@ -301,8 +324,18 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v10</h1>
-  <div class="sub">本轮：清空并入功能区 / 发送按钮收小</div>
+  <h1>ABB 系统对话 · 设计稿 v11</h1>
+  <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
+  <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
+  <ol>
+    <li><b>面板位置</b>：<code>表情</code> / <code>更多</code> 的面板必须**紧贴对应按钮上方**弹出（此前飘太远）；点外部或再点按钮收起。</li>
+    <li><b>截屏</b>：<code>✂</code> 实现真正的截屏（选区/全窗）并作为附件送进对话（需 macOS 屏幕录制 TCC 权限，登记为独立卡）。</li>
+    <li><b>上下文用量</b>：状态栏右侧显示 <code>已用/上限</code> + <b>百分比</b> + <b>进度条</b>（≥70% 橙 / ≥90% 红），悬停看精确值。</li>
+    <li><b>窗口与区域可拉升</b>：窗口**不是固定宽度**（默认 520、最小 340×380，可自由缩放）；<b>内容区与输入区之间可拖拉改高度</b>（上图 <code>.split</code> 把手，拖动即改两区比例，比例要记住）。</li>
+    <li><b>消息动作</b>：内容区**可选中复制**；助手轮下方给 <code>⧉ 复制</code> / <code>⟳ 重新生成</code> / <code>🔊 朗读</code>。</li>
+    <li><b>历史会话归档</b>：会话菜单里可 <code>🗄 归档</code>，归档后从列表隐藏、可在「已归档」找回（不删除数据）。</li>
+    <li><b>新建会话去重</b>：当前会话为空时，再点「新建会话」**不得**再建一个空会话（复用当前空会话即可）。</li>
+  </ol>
   <div class="sub" style="color:var(--info)"><b>v10 相对 v9 的改动</b>（实现以本稿为准）</div>
   <ol>
     <li><b>清空当前会话并进功能区</b>：从「发送右侧」移入功能区那一排，顺序 <code>[😊 表情] [📎 附件] [✂ 截图] [🗑 清空] [⋯ 更多(定时)]</code>，其后只跟一个 <code>发送</code>。</li>
