@@ -2847,10 +2847,11 @@ fn handle_platform_window_event(
 //
 // 模块级口径：入参全是值，出的行由调用方灌进 model。
 // 一段消息 → 渲染行：角色行 + 若干内容块（B 批：完整 markdown）。
-fn role_row(label: &str) -> SysChatBlockRow {
+fn role_row(label: &str, assistant: bool) -> SysChatBlockRow {
     SysChatBlockRow {
         kind: "role".into(),
         text: label.into(),
+        role_assistant: assistant,
         styled: slint::StyledText::default(),
         level: 0,
         order: 0,
@@ -2950,6 +2951,7 @@ fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
         alt: b.alt.into(),
         img,
         img_ok,
+        role_assistant: false,
         think_expanded: false,
         think_live: false,
         think_elapsed: "".into(),
@@ -2980,6 +2982,7 @@ fn acts_row(turn: i32) -> SysChatBlockRow {
         alt: "".into(),
         img: slint::Image::default(),
         img_ok: false,
+        role_assistant: false,
         think_expanded: false,
         think_live: false,
         think_elapsed: "".into(),
@@ -3009,6 +3012,7 @@ fn think_row(text: &str, elapsed: &str, expanded: bool, live: bool) -> SysChatBl
         alt: "".into(),
         img: slint::Image::default(),
         img_ok: false,
+        role_assistant: false,
         think_expanded: expanded,
         think_live: live,
         think_elapsed: elapsed.into(),
@@ -3019,8 +3023,9 @@ fn think_row(text: &str, elapsed: &str, expanded: bool, live: bool) -> SysChatBl
     }
 }
 fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
-    let label = if role == "assistant" { "怹" } else { "你" };
-    let mut rows = vec![role_row(label)];
+    let assistant = role == "assistant";
+    let label = if assistant { "怹" } else { "你" };
+    let mut rows = vec![role_row(label, assistant)];
     for b in crate::mdblocks::parse(text) {
         rows.push(block_row(b));
     }
@@ -3057,7 +3062,7 @@ fn stream_rows(
     live: bool,
     acts_turn: Option<i32>,
 ) -> Vec<SysChatBlockRow> {
-    let mut rows = vec![role_row("怹")];
+    let mut rows = vec![role_row("怹", true)];
     if has_thought {
         rows.push(think_row(thought_text, elapsed, live, live));
     }
@@ -10354,6 +10359,58 @@ mod tests {
         let (n, p) = vb_edit_apply_fetched(&mut s, "", "desc", None);
         assert_eq!(n, None);
         assert_eq!(p.as_deref(), Some("desc"));
+    }
+
+    // ── 卡 `abb-wording-role-label-kind-20261013`：角色块的**身份判据**（不是文案）──
+
+    /// 身份来自 `role` 字段，**不是**角色名文案：改名（「ABB」→「怹」）不影响身份。
+    ///
+    /// 判别力（负向）：把 `rows_for` 里的 `assistant` 写死成 `false`（或从 `label` 反推），
+    /// 助手行取不到 info 色 ⇒ 红。
+    #[test]
+    fn role_identity_is_role_field_not_label_text() {
+        // 同名不同身份：文案与身份**解耦**（同一个 label 能取到两种身份）
+        assert!(
+            role_row("任意名", true).role_assistant,
+            "身份由参数给，不看 label"
+        );
+        assert!(!role_row("任意名", false).role_assistant);
+        assert!(
+            !role_row("怹", false).role_assistant,
+            "名字叫「怹」也不等于助手身份"
+        );
+        // 端到端：历史轮/流式快照两条路径都要带上身份
+        assert!(
+            rows_for("assistant", "回答")[0].role_assistant,
+            "助手轮首行是角色行"
+        );
+        assert!(!rows_for("user", "问题")[0].role_assistant);
+        let streamed = stream_rows("回答", false, "", "", true, None);
+        assert!(streamed[0].role_assistant, "流式快照首行同样是助手角色行");
+        assert_eq!(streamed[0].kind, "role");
+    }
+
+    /// 跨文件守卫：`.slint` 的角色着色**不许**用展示文案（角色名）当判据。
+    ///
+    /// 判据（机器可校验，卡的验收①）：`ui/app.slint` 里 `b.text ==` 零命中，且角色分支确实
+    /// 按 `b.role-assistant` 取色——两条同时成立才算过（只看前者会被「删掉整个角色分支」
+    /// 白过＝集合型守卫的漏缺失）。
+    #[test]
+    fn role_colour_keys_on_identity_not_on_text() {
+        let src = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        assert!(
+            !src.contains("b.text =="),
+            "ui/app.slint 不许用展示文案当身份判据（改名会静默失效）"
+        );
+        assert!(
+            src.contains("color: b.role-assistant ? UiTokens.info :"),
+            "角色行的 info 色必须由 b.role-assistant 决定（判据被删/被改都会红）"
+        );
+        // 角色分支本身还在（防「整个分支被删」型漏缺失）
+        assert!(
+            src.contains("if b.kind == \"role\": Text {"),
+            "角色行渲染分支必须在"
+        );
     }
 
     // ── 卡 `abb-v11-message-actions`：消息行的**构成策略**（动作行挂在哪一轮/哪一刻）──

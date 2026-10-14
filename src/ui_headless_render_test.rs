@@ -101,6 +101,9 @@ fn wire_split(ui: &SystemChatWindow) -> Rc<SplitWiring> {
     split
 }
 
+/// 角色行**直接用生产构造点**（卡 `abb-wording-role-label-kind-20261013`）：身份（是否助手）
+/// 是生产里的 `role_assistant` 字段，不是角色名文案 ⇒ 这里也必须按同一口径给，
+/// 否则量到的是另一条渲染分支（角色名与身份在本台里再对不上号）。
 /// 一行消息块：与生产 `ui.rs::block_row` / `ui.rs::think_row` 同口径的最小构造
 ///（kind 驱动渲染分支）。
 ///
@@ -139,6 +142,7 @@ fn row(kind: &str, text: &str) -> SysChatBlockRow {
         alt: "".into(),
         img: slint::Image::default(),
         img_ok: false,
+        role_assistant: false,
         think_expanded: false,
         think_live: false,
         think_elapsed: "".into(),
@@ -307,9 +311,9 @@ fn fixture() -> Vec<SysChatBlockRow> {
         .collect::<Vec<_>>()
         .join("\n");
     vec![
-        row("role", "你"),
+        role_row("你", false),
         row("p", &format!("{LONG}{LONG}")),
-        row("role", "怹"),
+        role_row("怹", true),
         row("h2", "小标题：为什么会长"),
         row("p", &format!("{LONG}{LONG}{LONG}")),
         row("list", "第一项（短）"),
@@ -387,7 +391,7 @@ fn think_block_collapsed_by_default_and_expands() {
     let long = "推理过程：".to_string() + &"先看输入再查文档最后定结论。".repeat(24);
     let mut think = row("think", &long);
     think.think_elapsed = "3.2s".into();
-    let collapsed = vec![row("role", "怹"), think.clone(), row("p", "正文")];
+    let collapsed = vec![role_row("怹", true), think.clone(), row("p", "正文")];
     let (ui, win, model) = setup(collapsed, TALL_H);
     let _ = settle(&ui, &win, TALL_H);
     let h_collapsed = ui.get_dbg_content_h();
@@ -467,7 +471,7 @@ fn selectable_blocks_render_same_height_as_legacy_element() {
         } else {
             r.selectable = false;
         }
-        let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
+        let (ui, win, _) = setup(vec![role_row("怹", true), r], TALL_H);
         let f = settle(&ui, &win, TALL_H);
         (ui.get_dbg_content_h(), f)
     };
@@ -536,7 +540,7 @@ fn styled_paragraph_stays_on_styled_path_and_still_renders() {
             "含行内样式的段落必须继续走 StyledText（否则样式会被 TextInput 画掉）：{md:?} → {:?}",
             b[0].text
         );
-        let (ui, win, _) = setup(vec![row("role", "怹"), r], TALL_H);
+        let (ui, win, _) = setup(vec![role_row("怹", true), r], TALL_H);
         let f = settle(&ui, &win, TALL_H);
         assert!(
             f.lowest_ink_row(4, TALL_H - 4, 4, W - 4).is_some(),
@@ -546,7 +550,7 @@ fn styled_paragraph_stays_on_styled_path_and_still_renders() {
         // 不一致就说明我们新加进 `push_escaped` 的转义在渲染侧漏了（例如 `\~` 被当成字面量）。
         let reference = row("p", md);
         assert!(!reference.selectable, "参考帧也走 StyledText");
-        let (ui_ref, win_ref, _) = setup(vec![row("role", "怹"), reference], TALL_H);
+        let (ui_ref, win_ref, _) = setup(vec![role_row("怹", true), reference], TALL_H);
         let f_ref = settle(&ui_ref, &win_ref, TALL_H);
         assert_eq!(
             f.diff_px(&f_ref),
@@ -579,9 +583,9 @@ fn code_block_row_is_selectable_and_keeps_text_verbatim() {
 fn acts_row_draws_and_its_speak_label_tracks_speaking_turn() {
     const ASSISTANT_TURN: i32 = 1;
     let text = "一条短的助手回答。";
-    let without = vec![row("role", "怹"), selectable_p(text)];
+    let without = vec![role_row("怹", true), selectable_p(text)];
     let with = vec![
-        row("role", "怹"),
+        role_row("怹", true),
         selectable_p(text),
         acts_row(ASSISTANT_TURN),
     ];
@@ -632,7 +636,7 @@ fn acts_row_draws_and_its_speak_label_tracks_speaking_turn() {
 fn acts_buttons_route_clicks_with_their_turn() {
     const ASSISTANT_TURN: i32 = 1;
     let rows = vec![
-        row("role", "怹"),
+        role_row("怹", true),
         selectable_p("一条短的助手回答。"),
         acts_row(ASSISTANT_TURN),
     ];
@@ -699,7 +703,10 @@ fn emoji_and_more_panels_render_above_composer() {
         (n, top)
     }
 
-    let (ui, win, _) = setup(vec![row("role", "怹"), row("p", "面板渲染守卫")], SHORT_H);
+    let (ui, win, _) = setup(
+        vec![role_row("怹", true), row("p", "面板渲染守卫")],
+        SHORT_H,
+    );
     // 按生产 `refresh_emoji_panel` 的口径灌内容（分类 + 一整页格子）。
     ui.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
         slint::SharedString::from("常用"),
@@ -1241,9 +1248,9 @@ fn dump_frames_for_review() {
     // 与朗读态（该行按钮变 `⏹ 停止朗读`）。用**生产口径的行构成**（助手轮正文 + 动作行）。
     let (ui, win, _m) = setup(
         vec![
-            row("role", "你"),
+            role_row("你", false),
             selectable_p("帮我把导出脚本改成按天分片。"),
-            row("role", "怹"),
+            role_row("怹", true),
             selectable_p("改好了：按日期切分文件名，并在失败时留一份日志。"),
             row("code", "for d in $(seq 1 7); do\n  echo \"$d\"\ndone"),
             acts_row(-1),
@@ -2497,7 +2504,7 @@ fn v11_pop_panels_anchor_above_their_buttons() {
     }
 
     for (window_w, tag) in [(520_u32, "520"), (340_u32, "340")] {
-        let (ui, win, _m) = setup(vec![row("role", "怹"), row("p", "面板锚点")], SHORT_H);
+        let (ui, win, _m) = setup(vec![role_row("怹", true), row("p", "面板锚点")], SHORT_H);
         ui.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
             slint::SharedString::from("常用"),
         ]))));

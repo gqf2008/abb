@@ -3107,6 +3107,10 @@ export component SettingsWindow inherits Window {
 export struct SysChatBlockRow {
     kind: string,        // role|h1|h2|h3|p|list|task|code|quote|table|hr|image|audio|video
     text: string,        // 纯文本（code 原文 / 角色名 / 表格单元格）
+    // 角色块的**身份判据**（卡 `abb-wording-role-label-kind-20261013`）：true = 助手轮。
+    // **不要**用 `text == "怹"` 判身份——角色名是展示文案，改名（「ABB」→「怹」那次）会让
+    // 判据恒假、着色静默失效。身份由 Rust 侧 `ui::role_row(label, assistant)` 给。
+    role-assistant: bool,
     styled: styled-text, // 行内 markdown 解析结果（h*/p/list/task/quote 用）
     level: int,
     order: int,
@@ -4190,7 +4194,7 @@ export component SystemChatWindow inherits Window {
                             text: b.text;
                             font-size: 11px;
                             font-weight: 700;
-                            color: b.text == "怹" ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
+                            color: b.role-assistant ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
                         }
                         // 思考块（E2 需求 #11）：独立成块、默认折叠，标题显示耗时；展开看推理
                         //（等宽、保留换行）。进行中的思考块自动展开（让打字机可见）。
