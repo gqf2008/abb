@@ -610,9 +610,14 @@ impl Server {
             tracing::error!("会话 {session_id} 回合失败：{reason}");
             return self.writer.fail(id, -32002, reason).await;
         }
-        self.writer
-            .respond(id, json!({ "stopReason": "end_turn" }))
-            .await
+        // 成功回合带上 `_meta.usage`（真实计数，来源见 `TurnAccum::usage`）。
+        // 另三条出口（cancelled / max_turn_requests / provider 失败）**不带**：
+        // 取消与失败不是「可用来算上下文占用」的完整请求，abb 侧也不消费它们的 usage。
+        let mut result = json!({ "stopReason": "end_turn" });
+        if let Some(usage) = acc.usage.as_ref() {
+            result["_meta"] = json!({ "usage": usage_wire(usage) });
+        }
+        self.writer.respond(id, result).await
     }
 
     async fn session_cancel(&self, params: &Value) {
@@ -820,6 +825,14 @@ struct TurnAccum {
     /// 最后一个 assistant 终态的 `error_message`。每个 `MessageEnd` 都**覆盖**：
     /// 由最后一条 assistant 消息决定本回合有没有 provider 级失败。
     error: Option<String>,
+    /// 本回合**最后一次**模型请求的 usage——rpi 从 provider 响应里解出来的**真实值**
+    /// （见 `rpi-ai` 的 anthropic/openai mapper；**不是估算**）。每个 `MessageEnd` 都
+    /// 覆盖，与 `error` 同口径：回合结束时的**上下文占用**就是最后一次请求的
+    /// prompt tokens（`input + cacheRead + cacheWrite`）。
+    ///
+    /// 为什么由本层发：数据只在这里拿得到（`AssistantMessage.usage`），而 abb 的状态栏
+    /// 要显示真实占用而不是猜（卡 `abb-syschat-e3-tokens-20261013`）。
+    usage: Option<rpi_ai::types::Usage>,
     /// **已完成**的模型请求数（每条 assistant 终态 = 1 次请求）。
     completed_requests: u64,
     /// 是否已超过上界（超了就 abort，让 loop 尽快收尾）。
@@ -849,10 +862,27 @@ impl TurnAccum {
             } => {
                 self.completed_requests += 1;
                 self.error = assistant.error_message.clone();
+                self.usage = Some(assistant.usage.clone());
             }
             _ => {}
         }
     }
+}
+
+/// 回合结果里的 `_meta.usage`（**abb 侧契约**，不是 rpi 的 serde 形状）。
+///
+/// 只带「上下文占用」需要的计数 + 合计，字段名与 abb 的 `runtime::acp::TokenUsage`
+/// 一一对应（camelCase）。**逐字段显式映射**（而不是 `serde_json::to_value(usage)`）：
+/// rpi 的 `Usage` 还带 cost / cache_write_1h / reasoning，把它们写进 ACP 线上等于让
+/// abb 的解析面被上游结构变更牵连；这里只钉我们要的那几个数。
+fn usage_wire(usage: &rpi_ai::types::Usage) -> Value {
+    json!({
+        "input": usage.input,
+        "output": usage.output,
+        "cacheRead": usage.cache_read,
+        "cacheWrite": usage.cache_write,
+        "total": usage.total_tokens,
+    })
 }
 
 /// 把一条事件按需投影成 `session/update`。
@@ -1504,6 +1534,65 @@ mod tests {
         assert!(
             captured.try_recv().is_err(),
             "stopReason 之后不得再有多余出站行"
+        );
+    }
+
+    /// E3（卡 `abb-syschat-e3-tokens-20261013`）：成功回合要把**真实 usage** 随
+    /// `stopReason` 一起回给 abb——状态栏的「已用」要有真数，不靠估。
+    ///
+    /// 判别力（负向，实测会红）：① 拿掉 `session_prompt` 里写 `result["_meta"]` 的两行
+    /// ⇒ 本用例红（`_meta.usage` 变 null）；② 把 `usage_wire` 的 `cacheRead` 键写成
+    /// `cache_read` ⇒ 本用例红（abb 按 camelCase 读，键名漂了就是**静默**丢数据）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prompt_response_carries_real_usage() {
+        let (server, session_id, mut captured) = server_with_session(&["答复"]).await;
+        server
+            .dispatch(prompt_request(2, &session_id))
+            .await
+            .expect("prompt 分派应成功");
+
+        // 第一条出站是正文分片，第二条是回合结论。
+        let _update = captured.recv().await.expect("应有正文分片");
+        let done: Value = serde_json::from_str(&captured.recv().await.unwrap()).unwrap();
+        assert_eq!(done["result"]["stopReason"], "end_turn");
+
+        let usage = &done["result"]["_meta"]["usage"];
+        assert!(
+            !usage.is_null(),
+            "成功回合必须带 _meta.usage（faux 后端会填真实计数）：{done}"
+        );
+        let input = usage["input"].as_i64().expect("input 是整数");
+        let output = usage["output"].as_i64().expect("output 是整数");
+        assert!(input > 0, "prompt tokens 必须 > 0：{usage}");
+        assert!(output > 0, "completion tokens 必须 > 0：{usage}");
+        assert_eq!(usage["cacheRead"], 0, "faux 不报缓存读：{usage}");
+        assert_eq!(usage["cacheWrite"], 0, "faux 不报缓存写：{usage}");
+        assert_eq!(
+            usage["total"].as_i64(),
+            Some(input + output),
+            "total 必须 == input + output：{usage}"
+        );
+    }
+
+    /// 线上字段名是**要被 abb 按名读的契约**：逐字钉住，别让它随上游 `Usage` 的
+    /// serde 形状漂（缓存两键是 camelCase `cacheRead`/`cacheWrite`，不是 snake_case）。
+    #[test]
+    fn usage_wire_pins_the_abb_side_field_names() {
+        let usage = rpi_ai::types::Usage {
+            input: 1200,
+            output: 30,
+            cache_read: 1000,
+            cache_write: 0,
+            cache_write_1h: None,
+            reasoning: None,
+            total_tokens: 1230,
+            cost: rpi_ai::types::UsageCost::default(),
+        };
+        assert_eq!(
+            usage_wire(&usage),
+            json!({
+                "input": 1200, "output": 30, "cacheRead": 1000, "cacheWrite": 0, "total": 1230
+            })
         );
     }
 
