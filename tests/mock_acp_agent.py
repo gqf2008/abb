@@ -2,7 +2,7 @@
 """最小 ACP stdio agent（测试 fixture）：initialize/session/new/session/prompt。
 把收到的 prompt 原文追加记录到 MOCK_RECORD_FILE（测试断言用），并 echo 回复。
 协议：JSON-RPC 2.0 over stdin/stdout，行分隔。"""
-import json, os, sys, time
+import json, os, select, sys, time
 
 rec_file = os.environ.get("MOCK_RECORD_FILE", "/tmp/mock-acp-record.jsonl")
 with open(rec_file, "a") as _f:
@@ -38,9 +38,64 @@ def emit_chunks(sid, session_update, body, n):
             "update": {"sessionUpdate": session_update,
                        "content": {"type": "text", "text": body[i:i + step]}}}})
 
+def handle_steer(req):
+    """处理 ACP 跨适配层 steer 扩展 `_session/steering`（卡 d10 的插入路径）。
+
+    真适配器（claude-agent-acp / codex-acp）在 initialize 里声明
+    `_meta.steering.supported=true`，并回 `{outcome:"injected"}`。夹具照此实现，
+    让 ABB 侧的 `try_native_steer` 拿到 Success（否则会回落到 cancel+merge，
+    测到的就不是“插入”了）。
+    """
+    params = req.get("params", {}) or {}
+    prompt = params.get("prompt", []) or []
+    text = "".join(c.get("text", "") for c in prompt if isinstance(c, dict))
+    record({"event": "steer", "sessionId": params.get("sessionId"), "text": text})
+    if req.get("id") is not None:
+        send({"jsonrpc": "2.0", "id": req.get("id"), "result": {"outcome": "injected"}})
+
+def wait_reading_stdin(ms):
+    """在“等待回合”期间继续读 stdin 并处理 steer/cancel。
+
+    为什么必须这么做：mock 是单线程的。若只 `time.sleep`，`_session/steering` 那行
+    会一直待在管道里、直到 prompt 应答之后才被读到，ABB 侧就永远拿不到 steer ack
+    ——端到端夹具会退化成“插不进去”。用 select 轮询 stdin，边等边把 steer 处理掉。
+    """
+    deadline = time.time() + ms / 1000.0
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        ready, _, _ = select.select([sys.stdin], [], [], remaining)
+        if not ready:
+            return
+        line = sys.stdin.readline()
+        if not line:
+            return
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method = req.get("method", "")
+        if method == "_session/steering":
+            handle_steer(req)
+        elif method == "session/cancel":
+            record({"event": "cancel",
+                    "sessionId": (req.get("params") or {}).get("sessionId")})
+        elif req.get("id") is not None:
+            send({"jsonrpc": "2.0", "id": req.get("id"),
+                  "error": {"code": -32601, "message": "not found"}})
+
+# 主循环用显式 readline（不用 `for line in sys.stdin`）：延迟窗口里的
+# `wait_reading_stdin` 也读同一个文件对象，两种读法交替时绝不能有各自的预读缓冲。
 session_counter = 0
 
-for line in sys.stdin:
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
     line = line.strip()
     if not line:
         continue
@@ -58,11 +113,19 @@ for line in sys.stdin:
         # P2.3 硬闸回归锁用；MOCK_ABB_SANDBOX_MODES 覆盖词表（逗号分隔）——
         # P1-3 词表校验回归锁用。
         result = {"protocolVersion": 1, "agentCapabilities": {}}
+        meta = {}
         if not os.environ.get("MOCK_NO_ABB_SANDBOX"):
             modes = os.environ.get("MOCK_ABB_SANDBOX_MODES")
-            result["_meta"] = {"abbSandbox": (modes.split(",") if modes
-                                              else ["read-only", "workspace-write",
-                                                    "full-access"])}
+            meta["abbSandbox"] = (modes.split(",") if modes
+                                  else ["read-only", "workspace-write",
+                                        "full-access"])
+        # 卡 d10：MOCK_STEER=1 模拟“真支持 _session/steering 的适配器”
+        #（claude-agent-acp / codex-acp）；默认**不声明**，对齐随包 abb-agent
+        #（它如实报 supported=false）⇒ 走排队回落。
+        if os.environ.get("MOCK_STEER"):
+            meta["steering"] = {"supported": True}
+        if meta:
+            result["_meta"] = meta
         send({"jsonrpc": "2.0", "id": rid, "result": result})
     elif method == "session/new":
         session_counter += 1
@@ -81,7 +144,9 @@ for line in sys.stdin:
         # 其它用例）。
         _prompt_delay_ms = int(os.environ.get("MOCK_PROMPT_DELAY_MS", "0") or "0")
         if _prompt_delay_ms > 0:
-            time.sleep(_prompt_delay_ms / 1000.0)
+            # 卡 d10：延迟期间**继续读 stdin**（处理插入在途回合的 `_session/steering`），
+            # 而不是盲睡——否则 steer 行会等到本回合结束才被读到，ABB 侧拿不到 ack。
+            wait_reading_stdin(_prompt_delay_ms)
         sid = params.get("sessionId")
         # 可选：回合进行中由 agent **主动**发一条资源更新（模拟常驻 MCP 客户端读到
         # notifications/resources/updated 后的上报）。用途：验证 ABB 在回合内读到它、
@@ -136,6 +201,9 @@ for line in sys.stdin:
                     os.environ.get("MOCK_TEXT_CHUNKS", "1"))
         send({"jsonrpc": "2.0", "id": rid,
               "result": {"stopReason": "end_turn"}})
+    elif method == "_session/steering":
+        # 卡 d10：生成中插入在途回合（不在 prompt 延迟窗口内的正常到达路径）。
+        handle_steer(req)
     elif method == "session/cancel":
         record({"event": "cancel", "sessionId": params.get("sessionId")})
     elif rid is not None:

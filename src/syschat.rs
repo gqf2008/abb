@@ -24,8 +24,10 @@
 
 use crate::config::Config;
 use crate::runtime::acp::{ChunkKind, TurnChunk};
-use crate::runtime::harness::{AgentConfig, SyncTurnOutcome};
+use crate::runtime::harness::{AgentConfig, SteerSupport, SyncTurnOutcome};
+use crate::runtime::oneshot::SteerWiring;
 use crate::runtime::queue::InboundMsg;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1429,6 +1431,141 @@ pub enum TurnEnd {
     Stopped,
 }
 
+/// 生成中「按发送」的落点（纯逻辑判定，见 [`SendPump::submit`] / [`route_send`]）。
+///
+/// UI 必须把三者区分开显示（卡 AC：「已插入」vs「已排队」）——尤其 `Steer` 与 `Queue`
+/// 对用户是两种不同承诺：前者已进在途回合，后者还没发出去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRoute {
+    /// 当前没有在途回合 ⇒ 直接起一轮。
+    Immediate,
+    /// 有在途回合且后端支持 steer ⇒ 插入在途回合（不进本地队列）。
+    Steer,
+    /// 有在途回合但 steer 不支持/能力不明 ⇒ 入本地队列，等本轮结束后依次发。
+    Queue,
+}
+
+/// 排队中的一轮用户输入（文本 + 该条附带的待发附件）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedTurn {
+    pub text: String,
+    pub atts: Vec<Attachment>,
+}
+
+/// 发送落点判定（纯函数，单测钉住）。
+///
+/// 口径（卡 `abb-syschat-d10-insert-interrupt`）：
+/// - 无在途回合 ⇒ `Immediate`；
+/// - 在途 + `Supported` ⇒ `Steer`；
+/// - 在途 + `Unsupported`/`Unknown` ⇒ `Queue`（**能力不明不得猜成支持**——猜错
+///   就会把消息发成一个必然失败的 steer，甚至被后端当 `{}` 成功而静默吞掉）。
+pub fn route_send(in_flight: bool, support: SteerSupport) -> SendRoute {
+    if !in_flight {
+        SendRoute::Immediate
+    } else if support == SteerSupport::Supported {
+        SendRoute::Steer
+    } else {
+        SendRoute::Queue
+    }
+}
+
+/// 系统对话回合的**串行泵**（纯逻辑，GUI 与单测共用）。
+///
+/// 承重不变量：
+/// 1. **一次只跑一轮**（`in_flight`）——排队项绝不并行开跑；
+/// 2. 在途 + 支持 steer ⇒ 插入（`Steer`，不入队）；否则在途 ⇒ 入队（`Queue`）；
+/// 3. 空闲 ⇒ `Immediate`（本轮结束后由 [`finish`](Self::finish) 弹出队首，
+///    交给调用方开下一轮）；
+/// 4. **打断（⏹）不丢排队项**：`finish()` 是唯一的出队口，打断与自然完成走同一条
+///    ——⏹ 只取消在途那一轮，已承诺「排队等本轮结束后发送」的消息照旧依次发。
+///    （若要在打断时也清队列，应显式调 [`clear`](Self::clear)，不得让 `finish`
+///    的行为随结局分支——那是「执行路径不同结果不同」的隐蔽分支。）
+#[derive(Debug, Default)]
+pub struct SendPump {
+    in_flight: bool,
+    support: SteerSupport,
+    pending: VecDeque<QueuedTurn>,
+}
+
+impl SendPump {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录当前回合 agent 的 steer 能力（由能力 watch 驱动；不明 = 排队）。
+    pub fn set_support(&mut self, support: SteerSupport) {
+        self.support = support;
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 提交一条用户输入，返回落点。
+    ///
+    /// 空文本（trim 后）与「纯附件」拒绝 —— 与既有产品口径一致（附件不单独发），
+    /// 同时把「输入框在生成中可用」后的防连点兜底：空串永远不会被当成一条消息。
+    /// `Queue` 时**已入队**；`Steer`/`Immediate` 时不入队（由调用方直接发出去）。
+    pub fn submit(&mut self, text: &str, atts: Vec<Attachment>) -> Option<SendRoute> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let route = route_send(self.in_flight, self.support);
+        if route == SendRoute::Queue {
+            self.pending.push_back(QueuedTurn {
+                text: trimmed.to_string(),
+                atts,
+            });
+        }
+        Some(route)
+    }
+
+    /// `Steer` 落点失败（注入通道恰好已随上一轮收尾）时的回退：把消息补进队列，
+    /// 避免「判定为插入但实际没送出去」的静默丢失。返回排队后的长度。
+    pub fn enqueue_fallback(&mut self, text: &str, atts: Vec<Attachment>) -> usize {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            self.pending.push_back(QueuedTurn {
+                text: trimmed.to_string(),
+                atts,
+            });
+        }
+        self.pending.len()
+    }
+
+    /// 标记一轮开始（空闲 ⇒ 在途）。幂等。
+    pub fn begin(&mut self) {
+        self.in_flight = true;
+    }
+
+    /// 一轮结束（自然完成 / 停止 / 失败）：置空闲并**弹出队首**作为下一轮。
+    /// 返回 `None` = 队列空、无下一轮。串行化的唯一出处。
+    pub fn finish(&mut self) -> Option<QueuedTurn> {
+        self.in_flight = false;
+        self.pending.pop_front()
+    }
+
+    /// 清空排队项（清空会话历史 / 切换会话 / 新建会话时调用）。
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+}
+
+/// 构造一条系统对话的入站消息（Prompt 文本 + owner 身份 + syschat 标签）。
+///
+/// 生成中插入的消息与起一轮的正常消息**同形**（harness 侧 `try_native_steer` 会按
+/// `prompt_tag` 拼 steer 包装），不新造协议。
+pub fn steer_inbound(text: &str) -> InboundMsg {
+    InboundMsg {
+        id_hex: uuid::Uuid::new_v4().to_string(),
+        author_role: crate::config::SenderRole::Owner.as_str().to_string(),
+        text: text.to_string(),
+        ts_secs: crate::chrono_lite::unix_secs() as i64,
+        prompt_tag: "syschat".to_string(),
+    }
+}
+
 /// 流式回合里的一个连续分段：**同类分片并进同一段，换类时开新段**。
 ///
 /// `started` / `last` 是调用方注入的单调秒数（此处不读时钟，便于单测钉住耗时）；
@@ -1669,13 +1806,15 @@ impl Typewriter {
     }
 }
 
-/// 流式回合的接线（E1）：正文分片 sink + ⏹ 停止用的外部取消令牌。
+/// 流式回合的接线（E1）：正文分片 sink + ⏹ 停止用的外部取消令牌 + 生成中插入（本卡）。
 ///
 /// `cancel` 直接作为 `oneshot_turn_streaming` 的 `external_cancel`——
 /// **不新造取消机制**（触发走既有的 Timeout 同款 teardown，返回 `Cancelled`）。
 struct StreamWiring {
     chunks: tokio::sync::mpsc::UnboundedSender<TurnChunk>,
     cancel: tokio_util::sync::CancellationToken,
+    /// 生成中插入接线（本卡）。`None` = 不接（非 GUI 入口 / 旧调用点，行为不变）。
+    steer: Option<SteerWiring>,
 }
 
 /// 系统级 agent 配置：**指定供应商**（空 = 全局默认）+ owner 全权限档（无沙箱）+ 专用工作区。
@@ -1737,17 +1876,18 @@ async fn turn_with_stream(
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "syschat".to_string(),
     };
-    let (chunk_tx, cancel) = match stream {
-        Some(w) => (Some(w.chunks), Some(w.cancel)),
-        None => (None, None),
+    let (chunk_tx, cancel, steer) = match stream {
+        Some(w) => (Some(w.chunks), Some(w.cancel), w.steer),
+        None => (None, None, None),
     };
-    let outcome = crate::runtime::oneshot::oneshot_turn_streaming(
+    let outcome = crate::runtime::oneshot::oneshot_turn_streaming_steerable(
         agent_cfg,
         Some(workspace.display().to_string()),
         msg,
         TURN_BUDGET,
         cancel,
         chunk_tx,
+        steer,
     )
     .await;
     match outcome {
@@ -1843,12 +1983,16 @@ pub async fn turn_with_attachments(
 ///
 /// 与 [`turn_with_attachments`] 共用会话/历史逻辑，额外把正文 delta 经 `chunks` 实时
 /// 回传；`cancel` 触发时返回 [`TurnEnd::Stopped`]，已生成部分已随分片流出并被落进历史。
+///
+/// 本卡新增 `steer`：接上后，调用方可在本轮进行中把消息**插入在途回合**。
+/// `None` = 不接（行为与改动前逐字节等价）。
 pub async fn turn_streaming(
     cfg: &Config,
     user_text: &str,
     atts: &[Attachment],
     chunks: tokio::sync::mpsc::UnboundedSender<TurnChunk>,
     cancel: tokio_util::sync::CancellationToken,
+    steer: Option<SteerWiring>,
 ) -> Result<TurnEnd, String> {
     let (store, session_id, agent_cfg, ws, text) = prepare_turn(cfg, user_text)?;
     turn_core(
@@ -1858,7 +2002,11 @@ pub async fn turn_streaming(
         ws,
         &text,
         atts,
-        Some(StreamWiring { chunks, cancel }),
+        Some(StreamWiring {
+            chunks,
+            cancel,
+            steer,
+        }),
     )
     .await
 }
@@ -1936,6 +2084,41 @@ async fn turn_core(
                     let _ = gui.send(chunk);
                 }
             });
+            // 本卡：生成中插入（steer）转接。这里做两件事——
+            // ① **落用户轮进历史**（插入的消息是用户真发出来的一句话，下一轮重放
+            //    必须包含它；否则用户自己的话在历史里凭空消失，上下文对不上）；
+            // ② 转给 oneshot 的注入端点（它会 `push_message` 进在途回合 ⇒ harness steer）。
+            // 能力不上报到用不上的地方：`cap_tx` 原样透传。
+            // 注：注入只发生在能力=`Supported` 时（调用方判定），所以这里转发不会
+            // 触发 harness 的 cancel+merge 回退；若真要回退，也不影响本卡口径。
+            let steer = w.steer.map(|sw| {
+                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMsg>();
+                let store2 = SessionStore::new_at(store.base.clone());
+                let sid = session_id.to_string();
+                let mut inject_rx = sw.inject_rx;
+                tokio::spawn(async move {
+                    while let Some(msg) = inject_rx.recv().await {
+                        if let Ok(_g) = store2.lock() {
+                            let _ = store2.append_turns(
+                                &sid,
+                                &[Turn {
+                                    role: "user".to_string(),
+                                    text: msg.text.clone(),
+                                    thought: String::new(),
+                                    ts: crate::chrono_lite::unix_secs() as i64,
+                                }],
+                            );
+                        }
+                        if s_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+                SteerWiring {
+                    cap_tx: sw.cap_tx,
+                    inject_rx: s_rx,
+                }
+            });
             let res = turn_with_stream(
                 agent_cfg,
                 ws,
@@ -1943,6 +2126,7 @@ async fn turn_core(
                 Some(StreamWiring {
                     chunks: inner_tx,
                     cancel: w.cancel,
+                    steer,
                 }),
             )
             .await;
@@ -2280,6 +2464,7 @@ mod tests {
             Some(StreamWiring {
                 chunks: tx,
                 cancel: CancellationToken::new(),
+                steer: None,
             }),
         )
         .await
@@ -2346,6 +2531,7 @@ mod tests {
             Some(StreamWiring {
                 chunks: tx,
                 cancel: CancellationToken::new(),
+                steer: None,
             }),
         )
         .await
@@ -3824,5 +4010,339 @@ mod tests {
             resolve_media_path_in(base, "file:///tmp/a%zz.png"),
             std::path::PathBuf::from("/tmp/a%zz.png")
         );
+    }
+
+    // ── 卡 abb-syschat-d10-insert-interrupt：插入/排队/打断（纯逻辑）──
+
+    /// 发送落点判定：空闲 ⇒ 直接发；在途 + 支持 ⇒ 插入；在途 + 不支持/**能力不明** ⇒ 排队。
+    /// 变异点：把 `Unknown` 归到 `Steer` 分支（“先猜支持”），`unknown_queues` 必红。
+    #[test]
+    fn route_send_matrix() {
+        assert_eq!(
+            route_send(false, SteerSupport::Unknown),
+            SendRoute::Immediate
+        );
+        assert_eq!(
+            route_send(false, SteerSupport::Unsupported),
+            SendRoute::Immediate
+        );
+        assert_eq!(route_send(true, SteerSupport::Supported), SendRoute::Steer);
+        assert_eq!(
+            route_send(true, SteerSupport::Unsupported),
+            SendRoute::Queue
+        );
+        assert_eq!(route_send(true, SteerSupport::Unknown), SendRoute::Queue);
+    }
+
+    /// 空消息（含纯空白）不产生回合——输入框在生成中可用后的最低防线。
+    #[test]
+    fn submit_rejects_empty() {
+        let mut p = SendPump::new();
+        assert_eq!(p.submit("", vec![]), None);
+        assert_eq!(p.submit("   \n\t", vec![]), None);
+        assert_eq!(p.pending_len(), 0);
+        assert_eq!(p.submit("  真实消息  ", vec![]), Some(SendRoute::Immediate));
+    }
+
+    /// 在途 + 不支持 ⇒ 入队且不入 steer；队首顺序 = 提交顺序（串行化的数据侧）。
+    #[test]
+    fn queue_preserves_fifo_order() {
+        let mut p = SendPump::new();
+        p.begin();
+        p.set_support(SteerSupport::Unsupported);
+        assert_eq!(p.submit("一", vec![]), Some(SendRoute::Queue));
+        assert_eq!(p.submit("二", vec![]), Some(SendRoute::Queue));
+        assert_eq!(p.pending_len(), 2);
+        p.begin(); // finish 前再 begin 幂等（两轮之间不会丢态）
+        assert_eq!(p.finish().map(|q| q.text), Some("一".to_string()));
+        assert_eq!(p.finish().map(|q| q.text), Some("二".to_string()));
+        assert_eq!(p.finish(), None);
+        // 队列空 + 空闲 ⇒ 下一条回到 Immediate（finish 真的把 in_flight 降了）。
+        assert_eq!(p.submit("三", vec![]), Some(SendRoute::Immediate));
+    }
+
+    /// **打断口径**：⏹ 只取消在途那一轮，已入队的消息**不因打断而丢**，
+    /// 仍由 `finish()` 依次弹出（与自然完成走同一条出队口）。
+    /// 变异点：把 `finish` 改成“一打断就 `clear()`”，本测红。
+    #[test]
+    fn interrupt_keeps_queued_messages() {
+        let mut p = SendPump::new();
+        p.begin();
+        p.submit("排队甲", vec![]);
+        p.submit("排队乙", vec![]);
+        // 用户按下 ⏹：在途回合被取消，但队列原封不动。
+        let next = p.finish().expect("打断后队列首项仍应开跑");
+        assert_eq!(next.text, "排队甲");
+        assert_eq!(p.pending_len(), 1, "打断不得清队列");
+        assert_eq!(p.finish().map(|q| q.text), Some("排队乙".to_string()));
+    }
+
+    /// `clear()` 是显式清空（清空会话/切会话时用），与“打断”区分开。
+    #[test]
+    fn clear_drops_queue_explicitly() {
+        let mut p = SendPump::new();
+        p.begin();
+        p.submit("将被清", vec![]);
+        assert_eq!(p.pending_len(), 1);
+        p.clear();
+        assert_eq!(p.pending_len(), 0);
+        assert!(p.finish().is_none());
+    }
+
+    /// `Steer` 落点注入失败时的兜底：补进队列，不静默丢用户消息。
+    #[test]
+    fn steer_fallback_enqueues() {
+        let mut p = SendPump::new();
+        p.begin();
+        p.set_support(SteerSupport::Supported);
+        assert_eq!(p.submit("插入", vec![]), Some(SendRoute::Steer));
+        assert_eq!(p.pending_len(), 0, "Steer 不进队");
+        assert_eq!(p.enqueue_fallback("插入", vec![]), 1);
+        assert_eq!(p.finish().map(|q| q.text), Some("插入".to_string()));
+    }
+
+    // ── 卡 abb-syschat-d10-insert-interrupt：两条端到端（mock agent）──
+
+    /// 等 mock 记录到指定事件（有界等待，避免固定 sleep 的时序竞态）。
+    async fn wait_for_record(path: &std::path::Path, event: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if read_records(path).iter().any(|e| e["event"] == event) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// 等能力 watch 落锤到 `want`（超时返回当前值，供调用方给出可读断言）。
+    ///
+    /// 为什么用「查值 + sleep」而不 `timeout_at(deadline, rx.changed())`：实测 tokio
+    /// 1.53 下，当 watch **发送端已 drop** 时，`changed()` 会立即就绪地反复唤醒；
+    /// `timeout_at` 先轮询内层，内层总是 Ready ⇒ 外层 Sleep 永远不会被轮询到，
+    /// 超时形同虚设、整个循环变成 100% CPU 的忙等（本卡实测）。以 sleep 为唯一
+    /// 时间源就不取决于 inner 的就绪性。
+    async fn wait_for_support(
+        rx: &mut tokio::sync::watch::Receiver<SteerSupport>,
+        want: SteerSupport,
+    ) -> SteerSupport {
+        for _ in 0..400 {
+            let cur = *rx.borrow_and_update();
+            if cur == want {
+                return cur;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        *rx.borrow()
+    }
+
+    /// **支持 steer 的路径**：生成中投一条消息 ⇒ 真写进在途回合（mock 收到
+    /// `_session/steering`），**不另起一轮**（只 1 条 `session/prompt`），
+    /// 且插入的消息进历史（下一轮上下文不丢）。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn steer_supported_inserts_into_in_flight_turn() {
+        let rec =
+            std::env::temp_dir().join(format!("abb-syschat-steer-{}.jsonl", uuid::Uuid::new_v4()));
+        let (store, base) = tmp_store("steer");
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st));
+        store.save(&st).unwrap();
+        let id = st.current.clone();
+        let ws = std::env::temp_dir().join(format!("abb-syschat-sws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let (chunks_tx, _chunks_rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        let (cap_tx, mut cap_rx) = tokio::sync::watch::channel(SteerSupport::Unknown);
+        let (inj_tx, inj_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMsg>();
+        // 后端声明支持 steer，并故意把 prompt 应答推迟，造出确定的在途窗口。
+        let cfg = mock_agent_cfg_with(
+            &rec,
+            &[("MOCK_STEER", "1"), ("MOCK_PROMPT_DELAY_MS", "4000")],
+        );
+        let store2 = SessionStore::new_at(base.clone());
+        let id2 = id.clone();
+        let turn = tokio::spawn(async move {
+            turn_core(
+                &store2,
+                &id2,
+                cfg,
+                ws,
+                "steer-turn-A",
+                &[],
+                Some(StreamWiring {
+                    chunks: chunks_tx,
+                    cancel: CancellationToken::new(),
+                    steer: Some(SteerWiring {
+                        cap_tx,
+                        inject_rx: inj_rx,
+                    }),
+                }),
+            )
+            .await
+        });
+
+        assert_eq!(
+            wait_for_support(&mut cap_rx, SteerSupport::Supported).await,
+            SteerSupport::Supported,
+            "宣称支持的面（MOCK_STEER=1）应落锤为 Supported"
+        );
+        assert!(wait_for_record(&rec, "prompt").await, "回合应已派发到 mock");
+        // 生成中“按发送”：交给插入端点（调用方在能力=Supported 时才这么做）。
+        inj_tx
+            .send(steer_inbound("steer-probe-B"))
+            .expect("注入通道应可写");
+
+        let end = turn.await.expect("回合任务不应 panic");
+        let TurnEnd::Done(text) = end.expect("回合应正常完成") else {
+            panic!("未取消的回合应为 Done");
+        };
+        assert!(text.contains("steer-turn-A"));
+
+        assert!(
+            wait_for_record(&rec, "steer").await,
+            "mock 应收到 _session/steering（插入真写进了在途回合）"
+        );
+        let events = read_records(&rec);
+        let steers: Vec<_> = events.iter().filter(|e| e["event"] == "steer").collect();
+        assert_eq!(steers.len(), 1, "应恰好插入一次：{events:?}");
+        assert!(
+            steers[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("steer-probe-B"),
+            "插入内容应原样到达 agent: {steers:?}"
+        );
+        let prompts: Vec<_> = events.iter().filter(|e| e["event"] == "prompt").collect();
+        assert_eq!(prompts.len(), 1, "插入不得另起一轮：{prompts:?}");
+
+        // 历史：user(A) + user(B,插) + assistant —— 插入的消息不得从历史里丢。
+        let hist = SessionStore::new_at(base.clone()).read_history(&id);
+        let texts: Vec<&str> = hist.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            texts.contains(&"steer-probe-B"),
+            "插入的用户轮应落历史: {texts:?}"
+        );
+        assert_eq!(hist.len(), 3, "A + 插入B + 助手：{hist:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **不支持 steer 的回落排队**：能力落锤 `Unsupported`，泵判 `Queue`；
+    /// 本轮结束后 `finish()` 依次开下一轮（串行化），mock 收到的 prompt 顺序 = 提交顺序。
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
+    async fn unsupported_steer_queues_and_serializes() {
+        let rec =
+            std::env::temp_dir().join(format!("abb-syschat-queue-{}.jsonl", uuid::Uuid::new_v4()));
+        let (store, base) = tmp_store("queue");
+        let mut st = store.load();
+        assert!(store.ensure_current(&mut st));
+        store.save(&st).unwrap();
+        let id = st.current.clone();
+        let ws = std::env::temp_dir().join(format!("abb-syschat-qws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let (chunks_tx, _chunks_rx) = tokio::sync::mpsc::unbounded_channel::<TurnChunk>();
+        let (cap_tx, mut cap_rx) = tokio::sync::watch::channel(SteerSupport::Unknown);
+        // 默认 mock 不声明 steering 扩展，且延迟应答以保证“在途”窗口足够长。
+        let cfg = mock_agent_cfg_with(&rec, &[("MOCK_PROMPT_DELAY_MS", "2000")]);
+        let store2 = SessionStore::new_at(base.clone());
+        let id2 = id.clone();
+        let turn = tokio::spawn(async move {
+            turn_core(
+                &store2,
+                &id2,
+                cfg,
+                ws,
+                "queue-turn-A",
+                &[],
+                Some(StreamWiring {
+                    chunks: chunks_tx,
+                    cancel: CancellationToken::new(),
+                    steer: Some(SteerWiring {
+                        cap_tx,
+                        inject_rx: {
+                            // 不支持路径不会用到注入端点；保留接收端防发送端 panic。
+                            let (_keep_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            rx
+                        },
+                    }),
+                }),
+            )
+            .await
+        });
+
+        assert_eq!(
+            wait_for_support(&mut cap_rx, SteerSupport::Unsupported).await,
+            SteerSupport::Unsupported,
+            "默认 mock 未声明 steering ⇒ 能力必须落锤为 Unsupported"
+        );
+        let mut pump = SendPump::new();
+        pump.begin();
+        pump.set_support(SteerSupport::Unsupported);
+        assert_eq!(
+            pump.submit("queue-turn-B", vec![]),
+            Some(SendRoute::Queue),
+            "不支持 steer 时必须排队"
+        );
+
+        let end = turn.await.expect("回合任务不应 panic");
+        assert!(matches!(end, Ok(TurnEnd::Done(_))));
+
+        // 本轮结束 ⇒ 依次开排队项（串行化的唯一出处）。
+        let next = pump.finish().expect("队列应有下一轮");
+        assert_eq!(next.text, "queue-turn-B");
+        let store3 = SessionStore::new_at(base.clone());
+        let end2 = turn_core(
+            &store3,
+            &id,
+            mock_agent_cfg(&rec),
+            ws2(),
+            &next.text,
+            &[],
+            None,
+        )
+        .await
+        .expect("第二个回合应完成");
+        assert!(matches!(end2, TurnEnd::Done(_)));
+
+        let events = read_records(&rec);
+        let prompt_texts: Vec<String> = events
+            .iter()
+            .filter(|e| e["event"] == "prompt")
+            .map(|e| e["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(prompt_texts.len(), 2, "应恰好两轮：{prompt_texts:?}");
+        assert!(
+            prompt_texts[0].contains("queue-turn-A"),
+            "第一轮应是 A: {prompt_texts:?}"
+        );
+        assert!(
+            prompt_texts[1].contains("queue-turn-B"),
+            "排队项应在 A 结束后发（顺序 = 提交顺序）: {prompt_texts:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["event"] == "steer"),
+            "不支持路径绝不发 steer 线: {events:?}"
+        );
+
+        let hist = SessionStore::new_at(base.clone()).read_history(&id);
+        let texts: Vec<&str> = hist.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            texts.contains(&"queue-turn-B"),
+            "排队项最终应进历史: {texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 测试用临时工作区目录。
+    fn ws2() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("abb-syschat-ws2-{}", uuid::Uuid::new_v4()))
     }
 }

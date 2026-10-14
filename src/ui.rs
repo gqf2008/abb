@@ -162,10 +162,14 @@ enum UiCmd {
     /// 结果经 syschat_rx 回主线程（气泡/对话框共用）。
     /// `atts` = 本批已落盘的待发附件（路径进 prompt，见 `syschat::prompt_with_attachments`）。
     /// `cancel` = ⏹ 停止用的外部取消令牌（用户点停止时由 UI 线程直接 `.cancel()`）。
+    /// `inject_rx` / `cap_tx` = 卡 `abb-syschat-d10-insert-interrupt` 的生成中插入接线：
+    /// 后端 steer 能力经 `cap_tx` 上报，用户在生成中发来的消息经 `inject_rx` 插入在途回合。
     SysChatSend {
         text: String,
         atts: Vec<crate::syschat::Attachment>,
         cancel: tokio_util::sync::CancellationToken,
+        inject_rx: tokio::sync::mpsc::UnboundedReceiver<crate::runtime::queue::InboundMsg>,
+        cap_tx: tokio::sync::watch::Sender<crate::runtime::harness::SteerSupport>,
     },
     /// 后台下载一个 http(s) 媒体到本地缓存（图片内联 / 音视频可打开）。
     FetchMedia {
@@ -2471,6 +2475,18 @@ pub fn run_gui() -> Result<()> {
     let sc_stream_start: Rc<Cell<usize>> = Rc::new(Cell::new(usize::MAX));
     let sc_cancel: Rc<RefCell<Option<tokio_util::sync::CancellationToken>>> =
         Rc::new(RefCell::new(None));
+    // 卡 `abb-syschat-d10-insert-interrupt`：发送→回合的串行泵 + 生成中插入端点。
+    // - `sc_pump`：纯逻辑（`syschat::SendPump`，单测钉住）——插入/排队判定 + 队列串行化；
+    // - `sc_inject`：在途回合的注入端（仅能力=Supported 时写入）；
+    // - `sc_cap`：在途回合的 steer 能力 watch（harness initialize 后落锤，UI 每拍同步进泵）。
+    let sc_pump: Rc<RefCell<crate::syschat::SendPump>> =
+        Rc::new(RefCell::new(crate::syschat::SendPump::new()));
+    let sc_inject: Rc<
+        RefCell<Option<tokio::sync::mpsc::UnboundedSender<crate::runtime::queue::InboundMsg>>>,
+    > = Rc::new(RefCell::new(None));
+    let sc_cap: Rc<
+        RefCell<Option<tokio::sync::watch::Receiver<crate::runtime::harness::SteerSupport>>>,
+    > = Rc::new(RefCell::new(None));
     // D 批 3+N：展开/折叠态。纯逻辑在 `syschat::PendingState`（可单测），这里只存状态。
     let sc_pending: Rc<Cell<crate::syschat::PendingState>> =
         Rc::new(Cell::new(crate::syschat::PendingState::new()));
@@ -2699,6 +2715,62 @@ pub fn run_gui() -> Result<()> {
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UiCmd>();
+    // 卡 `abb-syschat-d10-insert-interrupt`：开一轮的**唯一出处**（on_send 的 Immediate
+    // 与回合结束后的队列排空都调它），只负责回合态：取消令牌 / 注入端点 / 能力 watch /
+    // 流式累积器复位 + 发 UiCmd。用户行与待发附件由调用方先处理（排队项提交时已上屏）。
+    let start_sc_turn: Rc<dyn Fn(String, Vec<crate::syschat::Attachment>)> = {
+        let cw = syschat_win.as_weak();
+        let bw = bubble.as_weak();
+        let tx_turn = tx.clone();
+        let cancel_slot = sc_cancel.clone();
+        let inject_slot = sc_inject.clone();
+        let cap_slot = sc_cap.clone();
+        let stream = sc_stream.clone();
+        let stream_start = sc_stream_start.clone();
+        let stream_end = sc_stream_end.clone();
+        let tw_text = sc_tw_text.clone();
+        let tw_think = sc_tw_think.clone();
+        let pump = sc_pump.clone();
+        let f = move |text: String, atts_now: Vec<crate::syschat::Attachment>| {
+            let Some(w) = cw.upgrade() else { return };
+            // 串行泵进“在途”（真源）：之后到达的提交据此判 Queue/Steer。
+            pump.borrow_mut().begin();
+            let att_note = if atts_now.is_empty() {
+                String::new()
+            } else {
+                format!("（附 {} 个文件）", atts_now.len())
+            };
+            w.set_busy(true);
+            w.set_status_is_error(false);
+            w.set_status_line(format!("怹正在思考{att_note}……").into());
+            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+            if let Some(b) = bw.upgrade() {
+                b.set_busy(true);
+            }
+            // E1/E2：为本轮建外部取消令牌（⏹ 停止直接 `.cancel()`），并重置流式累积/打字机/结局态。
+            let token = tokio_util::sync::CancellationToken::new();
+            *cancel_slot.borrow_mut() = Some(token.clone());
+            // 本卡：本轮的生中插入端点与 steer 能力 watch（每轮一套，回合结束即失效）。
+            let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel();
+            *inject_slot.borrow_mut() = Some(inject_tx);
+            let (cap_tx, cap_rx) =
+                tokio::sync::watch::channel(crate::runtime::harness::SteerSupport::Unknown);
+            *cap_slot.borrow_mut() = Some(cap_rx);
+            *stream.borrow_mut() = crate::syschat::StreamingBubble::start();
+            *tw_text.borrow_mut() = crate::syschat::Typewriter::new();
+            *tw_think.borrow_mut() = crate::syschat::Typewriter::new();
+            *stream_end.borrow_mut() = None;
+            stream_start.set(usize::MAX);
+            let _ = tx_turn.send(UiCmd::SysChatSend {
+                text,
+                atts: atts_now,
+                cancel: token,
+                inject_rx,
+                cap_tx,
+            });
+        };
+        Rc::new(f)
+    };
     let (bot_tx, bot_rx) =
         std_mpsc::channel::<(i32, std::result::Result<(String, String), String>)>();
     let (wx_tx, wx_rx) = std_mpsc::channel::<WxEvt>();
@@ -3972,7 +4044,13 @@ pub fn run_gui() -> Result<()> {
                     }
                     // 系统级对话（气泡/对话框）：无需管理密码（它不是服务动作，且执行层
                     // 已是 owner 全权限——与其它 GUI 内部一次性回合同权限）。
-                    UiCmd::SysChatSend { text, atts, cancel } => {
+                    UiCmd::SysChatSend {
+                        text,
+                        atts,
+                        cancel,
+                        inject_rx,
+                        cap_tx,
+                    } => {
                         let etx = syschat_tx_bg.clone();
                         tokio::spawn(async move {
                             let evt = match Config::load() {
@@ -3994,7 +4072,15 @@ pub fn run_gui() -> Result<()> {
                                         }
                                     });
                                     let end = crate::syschat::turn_streaming(
-                                        &cfg, &text, &atts, delta_tx, cancel,
+                                        &cfg,
+                                        &text,
+                                        &atts,
+                                        delta_tx,
+                                        cancel,
+                                        Some(crate::runtime::oneshot::SteerWiring {
+                                            cap_tx,
+                                            inject_rx,
+                                        }),
                                     )
                                     .await;
                                     // 回合已收尾 ⇒ sink 已摘除；等转发任务冲完缓冲分片，
@@ -6163,8 +6249,11 @@ pub fn run_gui() -> Result<()> {
         let model = syschat_model.clone();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
+        let pump = sc_pump.clone();
         syschat_win.on_new_session(move || {
             let Some(w) = cw.upgrade() else { return };
+            // 卡 d10：排队项属于旧会话，换会话不得跟着过去。
+            pump.borrow_mut().clear();
             match crate::syschat::new_session(None) {
                 Ok(_) => {
                     refresh_syschat_sel(&w, &sessions, &models);
@@ -6186,6 +6275,7 @@ pub fn run_gui() -> Result<()> {
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
         let rm = request_media.clone();
+        let pump = sc_pump.clone();
         syschat_win.on_session_pick(move |idx| {
             if idx < 0 {
                 return;
@@ -6193,6 +6283,8 @@ pub fn run_gui() -> Result<()> {
             let id = sessions.borrow().get(idx as usize).map(|s| s.id.clone());
             if let Some(id) = id {
                 let Some(w) = cw.upgrade() else { return };
+                // 卡 d10：排队项属于旧会话，切会话不得跟着过去。
+                pump.borrow_mut().clear();
                 match crate::syschat::switch_session(&id) {
                     Ok(()) => {
                         refresh_syschat_sel(&w, &sessions, &models);
@@ -6236,63 +6328,67 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
-    // 发送：用户消息立即上屏 + busy + 后台回合（结果经 syschat_rx 回）。
+    // 发送：用户消息立即上屏；空闲 ⇒ 起一轮，生成中 ⇒ 插入在途回合或排队（卡 d10）。
+    //
+    // 落点由纯逻辑 [`crate::syschat::SendPump`] 判定（单测钉住），UI 只负责把三种落点
+    // 区分显示（已插入 / 已排队）并驱动对应的实际动作。输入框在生成中**保持可用**
+    // （见 ui/app.slint 的 enabled/accepted），所以这里**不再 busy 直接 return**：
+    // 空消息与纯附件由 `submit` 拒绝（防误发），防连点由“发送后清 draft”保证同一文本
+    // 不会因一次击键被提交两次。
     {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
-        let bw = bubble.as_weak();
-        let tx = tx.clone();
         let atts = sc_atts.clone();
         let pending = sc_pending.clone();
-        let cancel_slot = sc_cancel.clone();
-        let stream = sc_stream.clone();
-        let stream_start = sc_stream_start.clone();
-        let stream_end = sc_stream_end.clone();
-        let tw_text = sc_tw_text.clone();
-        let tw_think = sc_tw_think.clone();
+        let pump = sc_pump.clone();
+        let inject = sc_inject.clone();
+        let start_turn = start_sc_turn.clone();
         syschat_win.on_send(move |text| {
             let text = text.trim().to_string();
-            if text.is_empty() {
-                return; // 附件不单独发（产品口径）：纯附件不能发，必须带消息文本
-            }
             let Some(w) = cw.upgrade() else { return };
-            if w.get_busy() {
-                return; // 防重复发送（busy 期间按钮/回车已禁用，这里是双保险）
-            }
             // 本轮的待发附件（路径随 prompt 进 agent）；发送后清空待发列表——
             // 不删已落盘文件（同一附件可再次附加，且已发出的消息可能已引用它）。
             let atts_now: Vec<crate::syschat::Attachment> = atts.borrow().clone();
-            let att_note = if atts_now.is_empty() {
-                String::new()
-            } else {
-                format!("（附 {} 个文件）", atts_now.len())
+            let Some(route) = pump.borrow_mut().submit(&text, atts_now.clone()) else {
+                return; // 空消息 / 纯附件：产品口径不发
             };
+            // 三种落点都先把用户行上屏 + 清空输入区（用户要知道“我说过了”）。
             for r in rows_for("user", &text) {
                 model.push(r);
             }
             w.set_draft("".into());
-            w.set_busy(true);
-            w.set_status_is_error(false);
-            w.set_status_line(format!("怹正在思考{att_note}……").into());
-            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-            if let Some(b) = bw.upgrade() {
-                b.set_busy(true);
-            }
             atts.borrow_mut().clear();
             refresh_syschat_atts(&w, &atts, &pending);
-            // E1/E2：为本轮建外部取消令牌（⏹ 停止直接 `.cancel()`），并重置流式累积/打字机/结局态。
-            let token = tokio_util::sync::CancellationToken::new();
-            *cancel_slot.borrow_mut() = Some(token.clone());
-            *stream.borrow_mut() = crate::syschat::StreamingBubble::start();
-            *tw_text.borrow_mut() = crate::syschat::Typewriter::new();
-            *tw_think.borrow_mut() = crate::syschat::Typewriter::new();
-            *stream_end.borrow_mut() = None;
-            stream_start.set(usize::MAX);
-            let _ = tx.send(UiCmd::SysChatSend {
-                text,
-                atts: atts_now,
-                cancel: token,
-            });
+            match route {
+                crate::syschat::SendRoute::Immediate => {
+                    start_turn(text, atts_now);
+                }
+                crate::syschat::SendRoute::Steer => {
+                    // 支持 steer：写进在途回合（不进本地队列）。
+                    let ok = inject
+                        .borrow()
+                        .as_ref()
+                        .map(|tx| tx.send(crate::syschat::steer_inbound(&text)).is_ok())
+                        .unwrap_or(false);
+                    if ok {
+                        w.set_status_is_error(false);
+                        w.set_status_line("已插入本轮对话（怹会在本轮里看到）。".into());
+                    } else {
+                        // 竞态：回合刚收尾、注入端点已失效。补进队列防静默丢消息。
+                        let n = pump.borrow_mut().enqueue_fallback(&text, atts_now.clone());
+                        w.set_status_is_error(false);
+                        w.set_status_line(
+                            format!("已排队（本轮刚结束，将随队依次发送）· 队列 {n} 条").into(),
+                        );
+                    }
+                }
+                crate::syschat::SendRoute::Queue => {
+                    let n = pump.borrow().pending_len();
+                    w.set_status_is_error(false);
+                    w.set_status_line(format!("已排队（本轮结束后发送）· 队列 {n} 条").into());
+                }
+            }
+            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
         });
     }
     // ⏹ 停止：取消在途回合（UI 线程直接触发外部取消令牌；回合收尾由 Stopped 事件处理）。
@@ -6328,18 +6424,23 @@ pub fn run_gui() -> Result<()> {
     {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
-        syschat_win.on_reset_history(move || match crate::syschat::clear_history() {
-            Ok(()) => {
-                model.set_vec(Vec::new());
-                if let Some(w) = cw.upgrade() {
-                    w.set_status_is_error(false);
-                    w.set_status_line("已清空对话历史。".into());
+        let pump = sc_pump.clone();
+        syschat_win.on_reset_history(move || {
+            // 卡 d10：清空会话 ⇒ 排队项也一并清（否则会在空会话里冒出旧排队）。
+            pump.borrow_mut().clear();
+            match crate::syschat::clear_history() {
+                Ok(()) => {
+                    model.set_vec(Vec::new());
+                    if let Some(w) = cw.upgrade() {
+                        w.set_status_is_error(false);
+                        w.set_status_line("已清空对话历史。".into());
+                    }
                 }
-            }
-            Err(e) => {
-                if let Some(w) = cw.upgrade() {
-                    w.set_status_is_error(true);
-                    w.set_status_line(format!("清空失败：{e}").into());
+                Err(e) => {
+                    if let Some(w) = cw.upgrade() {
+                        w.set_status_is_error(true);
+                        w.set_status_line(format!("清空失败：{e}").into());
+                    }
                 }
             }
         });
@@ -6533,6 +6634,10 @@ pub fn run_gui() -> Result<()> {
         let tw_text = sc_tw_text.clone();
         let tw_think = sc_tw_think.clone();
         let cancel_slot = sc_cancel.clone();
+        // 卡 d10：能力 watch（每拍同步进泵）+ 串行泵 + 开下一轮的入口。
+        let pump = sc_pump.clone();
+        let cap_slot = sc_cap.clone();
+        let start_turn = start_sc_turn.clone();
         let clock = std::time::Instant::now();
         let syschat_timer = slint::Timer::default();
         syschat_timer.start(
@@ -6540,6 +6645,12 @@ pub fn run_gui() -> Result<()> {
             Duration::from_millis(50),
             move || {
                 let now = clock.elapsed().as_secs_f64();
+                // 卡 d10：把本轮 agent 的 steer 能力同步进泵（initialize 后从 Unknown 落锤）。
+                // 每拍读一次 watch 只是原子读，不引入额外开销。
+                if let Some(rx) = cap_slot.borrow().as_ref() {
+                    let cap = *rx.borrow();
+                    pump.borrow_mut().set_support(cap);
+                }
                 let mut dirty = false;
                 while let Ok(evt) = syschat_rx.try_recv() {
                     match evt {
@@ -6592,6 +6703,10 @@ pub fn run_gui() -> Result<()> {
                             }
                             if let Some(b) = bubble_w.upgrade() {
                                 b.set_busy(false);
+                            }
+                            // 卡 d10：本轮失败 ⇒ 同样排空队列（一次只跑一轮，依次发）。
+                            if let Some(next) = pump.borrow_mut().finish() {
+                                start_turn(next.text, next.atts);
                             }
                         }
                         SysChatEvt::MediaReady => {
@@ -6667,6 +6782,12 @@ pub fn run_gui() -> Result<()> {
                         }
                         if let Some(b) = bubble_w.upgrade() {
                             b.set_busy(false);
+                        }
+                        // 卡 d10：本轮结束（完成/停止）⇒ 排空队列，依次开下一轮。
+                        // 停止也走这里（finish 是唯一出队口）：已入队的消息不因 ⏹ 而丢，
+                        // 与卡口径一致（要清队必须显式 clear，如清空会话时）。
+                        if let Some(next) = pump.borrow_mut().finish() {
+                            start_turn(next.text, next.atts);
                         }
                         dirty = false;
                     } else {

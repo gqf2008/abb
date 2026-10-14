@@ -341,6 +341,27 @@ pub enum SandboxSupport {
     Unsupported = 2,
 }
 
+/// 生成中「插入（steer）」的能力协商结果（卡 `abb-syschat-d10-insert-interrupt`）。
+///
+/// 来源 = `AcpClient::steering_supported`（initialize 顶层 `_meta.steering.supported`），
+/// 由 `handle_spawn_outcome` **每次成功拉起后**写入 `RuntimeHandle`。调用方（系统对话
+/// 的发送判定）据此决定「插入在途回合」还是「排队等本轮结束」——**不得硬编码**：
+/// 随包 `crates/abb-agent` 如实报 `false`（未实现 `_session/steering`），此时唯一正确
+/// 行为是排队，而不是发一个必然 `-32601` 的 steer。
+///
+/// `Unknown` = agent 尚未 initialize（含 goose 这类只认 `expectedRunId`、不报该扩展的
+/// 适配器：在 run id 出现前能力就是「不明」）⇒ 调用方按「不明 = 排队」处理（卡口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SteerSupport {
+    /// agent 未启动/启动中（initialize 前）——能力未知，按排队处理。
+    #[default]
+    Unknown,
+    /// initialize 声明 `_meta.steering.supported = true`——可写 `_session/steering`。
+    Supported,
+    /// initialize 未声明（或显式 false）——不可 steer，必须排队。
+    Unsupported,
+}
+
 pub struct RuntimeHandle {
     cfg: AgentConfig,
     stop: CancellationToken,
@@ -360,6 +381,10 @@ pub struct RuntimeHandle {
     /// 桥侧预检据此对「已知不支持」的 granted 消息提前拒答；**真闸**在
     /// `pool::create_session_and_apply_model`（拒绝创建受限会话，无懒启动竞态）。
     sandbox_supported: std::sync::atomic::AtomicU8,
+    /// steer 能力位（本卡）：initialize 成功后由 handle_spawn_outcome 广播；新一轮
+    /// spawn 发起时用 `send(Unknown)` 复位。用 watch 而非 Atomic：系统对话侧要
+    /// **异步等**这个值从 Unknown 落锤，轮询原子会变成忙等（见 oneshot 的镜像任务）。
+    steering: tokio::sync::watch::Sender<SteerSupport>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Cmd>>>,
     life_tx: mpsc::UnboundedSender<SpawnOutcome>,
@@ -448,6 +473,8 @@ impl RuntimeHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (life_tx, life_rx) = mpsc::unbounded_channel();
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
+        // steer 能力位：初值 Unknown（agent 懒启动，首条消息到达才 spawn）。
+        let (steering_tx, _steering_rx) = tokio::sync::watch::channel(SteerSupport::Unknown);
         Arc::new(Self {
             cfg,
             stop,
@@ -456,6 +483,7 @@ impl RuntimeHandle {
             dead: AtomicBool::new(false),
             last_start_error: std::sync::Mutex::new(None),
             sandbox_supported: std::sync::atomic::AtomicU8::new(SandboxSupport::Unknown as u8),
+            steering: steering_tx,
             cmd_tx,
             cmd_rx: std::sync::Mutex::new(Some(cmd_rx)),
             life_tx,
@@ -524,6 +552,14 @@ impl RuntimeHandle {
             2 => SandboxSupport::Unsupported,
             _ => SandboxSupport::Unknown,
         }
+    }
+
+    /// steer 能力位（本卡）：给系统对话的发送判定用。`Unknown` = initialize 前。
+    ///
+    /// 与 [`sandbox_support`](Self::sandbox_support) 同款：**每次成功拉起后重判**，
+    /// 新一轮 spawn 发起时复位 Unknown。watch 接收端可 `changed().await` 异步等落锤。
+    pub fn steering_watch(&self) -> tokio::sync::watch::Receiver<SteerSupport> {
+        self.steering.subscribe()
     }
 
     /// 入队一条用户消息（桥 dispatch 后调用）。channel 在跑时按 Queue 语义
@@ -1300,6 +1336,15 @@ fn handle_spawn_outcome(l: &mut Loop, handle: &RuntimeHandle, outcome: SpawnOutc
                 },
                 Ordering::Relaxed,
             );
+            // 本卡：steer 能力位同款落锤（initialize 声明 `_meta.steering.supported`）。
+            // 语义边界：goose 的 `_goose/unstable/session/steer` 只认 `expectedRunId`、
+            // 不报这个扩展 ⇒ 这里记为 Unsupported；系统对话据此排队（「能力不明/不支持
+            // 都走排队」是卡定口径，不为了 goose 的 run-id 通道放宽闸门）。
+            let _ = handle.steering.send(if agent.acp.steering_supported() {
+                SteerSupport::Supported
+            } else {
+                SteerSupport::Unsupported
+            });
             l.idle_since.insert(agent.index, Instant::now());
             let mut agent = agent;
             // 事件路径随槽位走：新拉起的 agent 必须重挂 sink（旧进程的 AcpClient 已 drop）。
@@ -1390,6 +1435,8 @@ fn schedule_agent_start(
     handle
         .sandbox_supported
         .store(SandboxSupport::Unknown as u8, Ordering::Relaxed);
+    // 同款复位：initialize 前不得沿用上一次拉起的 steer 能力判定。
+    let _ = handle.steering.send(SteerSupport::Unknown);
     let cfg = handle.cfg.clone();
     let stop = handle.stop.clone();
     let life_tx = handle.life_tx.clone();

@@ -980,9 +980,10 @@ impl AcpClient {
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
     /// `initialize` time (`_meta.steering.supported`).
     ///
-    /// The read loop's steer arm reads the field directly; this accessor exists
-    /// for the supervisor's post-initialize log line.
-    #[cfg(test)]
+    /// Read at steer-write time by the read loop's steer arm (which touches the
+    /// field directly) and by `harness::handle_spawn_outcome` to publish the
+    /// per-handle steer capability used by the system dialog's insert/queue
+    /// decision (card `abb-syschat-d10-insert-interrupt`).
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
     }

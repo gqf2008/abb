@@ -4149,15 +4149,18 @@ export component SystemChatWindow inherits Window {
                                         color: PixelTheme.text;
                                         single-line: true;
                                         vertical-alignment: top;
-                                        enabled: !root.busy;
+                                        // 卡 d10：生成中**保持可编辑**（owner 口径：输入要支持插入/打断）。
+                                        // 落点是插入还是排队由 Rust 侧 `syschat::SendPump` 判定，
+                                        // 状态行显示「已插入」/「已排队」。
                                         accepted => {
-                                            if root.draft != "" && !root.busy { root.send(root.draft); }
+                                            if root.draft != "" { root.send(root.draft); }
                                         }
                                     }
                                     if root.draft == "" && !area-input.has-focus: Text {
                                         x: 4px;
                                         y: 6px;
-                                        text: root.busy ? "等待回复…" : "给怹发消息，回车发送";
+                                        // 卡 d10：生成中不再是“等待回复…”（输入框已可用）。
+                                        text: root.busy ? "生成中也可继续发（回车插入本轮或排队）" : "给怹发消息，回车发送";
                                         font-size: 13px;
                                         color: PixelTheme.dim;
                                     }
@@ -4187,11 +4190,11 @@ export component SystemChatWindow inherits Window {
                                             tip: "表情（尚未实现）";
                                             clicked => { root.composer-todo("表情"); }
                                         }
-                                        // 📎 附件：接既有 attach-pick（可多选）。
+                                        // 📎 附件：接既有 attach-pick（可多选）；生成中也可用
+                                        // （卡的待发附件会随本轮发送/排队项一起带上）。
                                         ComposerIcon {
                                             icon: "📎";
                                             tip: "添加附件（可多选）";
-                                            enabled: !root.busy;
                                             clicked => { root.attach-pick(); }
                                         }
                                         ComposerIcon {
@@ -4221,7 +4224,8 @@ export component SystemChatWindow inherits Window {
                                         border-width: 2px;
                                         border-color: PixelTheme.edge;
                                         border-radius: 6px;
-                                        opacity: (!root.busy && root.draft != "") ? 1.0 : 0.5;
+                                        // 卡 d10：生成中也可发送（内容非空即可）——落点由 Rust 判定。
+                                        opacity: root.draft != "" ? 1.0 : 0.5;
                                         send-text := Text {
                                             width: 100%;
                                             height: 100%;
@@ -4233,7 +4237,7 @@ export component SystemChatWindow inherits Window {
                                             vertical-alignment: center;
                                         }
                                         TouchArea {
-                                            enabled: !root.busy && root.draft != "";
+                                            enabled: root.draft != "";
                                             mouse-cursor: pointer;
                                             clicked => { root.send(root.draft); }
                                         }

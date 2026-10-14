@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::acp::TurnChunk;
-use super::harness::{AgentConfig, ChannelMeta, RuntimeHandle, SyncTurnOutcome};
+use super::harness::{AgentConfig, ChannelMeta, RuntimeHandle, SteerSupport, SyncTurnOutcome};
 use super::queue::InboundMsg;
 
 /// 拆栈预算：正常路径 = 回合已毕、杀空闲 agent 进程组（≤5s）；Timeout 路径 =
@@ -36,6 +36,26 @@ const TEARDOWN_BUDGET: Duration = Duration::from_secs(12);
 
 /// 超时后向主循环发 cancel 的等待上限（主循环活着时即时；防御 wedged）。
 const CANCEL_CMD_BUDGET: Duration = Duration::from_secs(5);
+
+/// 生成中「插入在途回合」的接线（卡 `abb-syschat-d10-insert-interrupt`）。
+///
+/// 两个端点：
+/// - `cap_tx`：把本回合 agent 的 steer 能力（**能力探测**，非硬编码）广播给调用方。
+///   初值 `Unknown`；agent initialize 后变 `Supported`/`Unsupported`（见
+///   `RuntimeHandle::steering_watch`）。调用方据此判定「插入」还是「排队」。
+/// - `inject_rx`：调用方**仅在能力 = `Supported` 时**往里放消息；本层把每条
+///   投进同一个 channel（`RuntimeHandle::push_message`），harness 侧按在途 ⇒
+///   `try_native_steer` 写 `_session/steering`（或 goose 的 run-id 方法）。
+///
+/// 为什么不把「不支持」也塞进来让 harness 的 cancel+merge 兜底：那会**打断并重跑**
+/// 在途回合，而卡的口径是「不支持则排队等本轮结束再发」——落点由调用方（系统对话
+/// 的发送判定）决定，本层只负责在支持时把消息真送进在途回合。
+pub struct SteerWiring {
+    /// 能力上报端点（harness 每次成功拉起后广播）。
+    pub cap_tx: tokio::sync::watch::Sender<SteerSupport>,
+    /// 生成中要插入在途回合的消息（调用方保证只放 `Supported` 的项）。
+    pub inject_rx: tokio::sync::mpsc::UnboundedReceiver<InboundMsg>,
+}
 
 /// 自起句柄跑一轮同步回合并拆栈。
 ///
@@ -85,6 +105,22 @@ pub async fn oneshot_turn_streaming(
     external_cancel: Option<CancellationToken>,
     chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
 ) -> SyncTurnOutcome {
+    oneshot_turn_streaming_steerable(cfg, workspace, msg, budget, external_cancel, chunk_tx, None)
+        .await
+}
+
+/// [`oneshot_turn_streaming`] 的「可插入」变体（卡 `abb-syschat-d10-insert-interrupt`）：
+/// 额外接受 [`SteerWiring`]，把本回合的 steer 能力广播出去、并把调用方在生成中投来的
+/// 消息**真送进在途回合**。`steer = None` 时行为与 [`oneshot_turn_streaming`] 逐字节等价。
+pub async fn oneshot_turn_streaming_steerable(
+    cfg: AgentConfig,
+    workspace: Option<String>,
+    msg: InboundMsg,
+    budget: Duration,
+    external_cancel: Option<CancellationToken>,
+    chunk_tx: Option<tokio::sync::mpsc::UnboundedSender<TurnChunk>>,
+    steer: Option<SteerWiring>,
+) -> SyncTurnOutcome {
     let stop = CancellationToken::new();
     let cwd = std::env::current_dir()
         .unwrap_or_default()
@@ -112,6 +148,38 @@ pub async fn oneshot_turn_streaming(
     if let Some(tx) = chunk_tx {
         handle.set_turn_chunk_sink(channel_id, tx);
     }
+
+    // 本卡：steer 接线。两条后台转发任务：
+    // ① 能力镜像（handle 的 watch → 调用方 cap_tx）：每次拉起后落锤一次；
+    // ② 注入转发（调用方 inject_rx → handle.push_message）：在途 ⇒ harness steer。
+    // 两条都随回合结束 abort（否则 handle 的 Arc 被任务持有、能力值也可能在
+    // 拆栈后写入已 drop 的 cap_tx）。
+    let steer_tasks = steer.map(|w| {
+        let h = handle.clone();
+        let mut cap_rx = handle.steering_watch();
+        let cap_task = tokio::spawn(async move {
+            loop {
+                // 先镜像当前值（初值 Unknown），再等下一次变化。
+                if w.cap_tx.send(*cap_rx.borrow_and_update()).is_err() {
+                    break; // 调用方已 drop（回合收尾）
+                }
+                if cap_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut inject_rx = w.inject_rx;
+        let inject_task = tokio::spawn(async move {
+            while let Some(m) = inject_rx.recv().await {
+                // push_message 走 harness 的 Queue 语义：channel 在途 ⇒
+                // try_native_steer；句柄已关/回合已终 ⇒ false，退出。
+                if !h.push_message(channel_id, m) {
+                    break;
+                }
+            }
+        });
+        (cap_task, inject_task)
+    });
 
     // 外部联动取消与同步等待竞速：外部触发 = Cancelled（区别于预算 Timeout）。
     let outcome = {
@@ -145,6 +213,11 @@ pub async fn oneshot_turn_streaming(
     }
 
     stop.cancel();
+    // 本卡：摘掉 steer 转接（回合终态后不得再能力广播/注入）。
+    if let Some((cap_task, inject_task)) = steer_tasks {
+        cap_task.abort();
+        inject_task.abort();
+    }
     // E1：摘掉流式 sink（回合已终态，迟发分片不应再进已收尾的 GUI 气泡）。
     handle.remove_turn_chunk_sink(channel_id);
     if tokio::time::timeout(TEARDOWN_BUDGET, &mut run_task)
