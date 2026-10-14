@@ -777,16 +777,17 @@ pub fn save_bubble_pos(pos: BubblePos) {
     }
 }
 
-// ──────────────── D2 批：标题栏控件条（稿 ①②③）的落位几何（纯函数）───────────────
+// ──────────── 标题栏控件条（稿 v10：①新建会话 / ②历史会话 / ③模型 / ④⚙）的落位几何 ────────────
 //
-// 稿把 ①会话下拉 / ②模型下拉 / ③⚙设置 放在**标题栏**里；而 slint-pixel 的 `PixelTitleBar`
-// 是封闭组件（不能塞子元素），所以这三件套改为在根 Rectangle 里、VerticalLayout **之后**
-// 叠一条 HorizontalBox（后画 = 上层），靠右贴窗口按钮组左侧。本组函数只算「摆在哪、多宽、
-// 放不下时换哪一档」，画由 `ui/app.slint` 负责——这样算术可单测、观感可截图核对。
+// 稿把这四个控件放在**标题栏**里；而 slint-pixel 的 `PixelTitleBar` 是封闭组件（不能塞子元素），
+// 所以它们改为在根 Rectangle 里、VerticalLayout **之后**叠一条控件条（后画 = 上层），靠右贴窗口
+// 按钮组左侧。本组函数只算「摆在哪、多宽、放不下时换哪一档」，画由 `ui/app.slint` 负责
+// ——这样算术可单测、观感可截图核对。
 
-/// 系统对话窗的初始逻辑宽（= `ui/app.slint` 的 `preferred-width`）。
-/// 用途：窗口还没 realize（`Window::size()` 给 0）时算计划的兜底宽度。
-pub const SYSCHAT_PREFERRED_WIDTH: f32 = 460.0;
+/// 系统对话窗的初始逻辑宽（= `ui/app.slint` 的 `preferred-width`，src 里已显式
+/// `set_size(520, 560)`）。用途：窗口还没 realize（`Window::size()` 给 0）时算计划的兜底宽度。
+/// 与 `.slint` 的一致性由 [`tests::syschat_preferred_width_matches_slint`] 守着。
+pub const SYSCHAT_PREFERRED_WIDTH: f32 = 520.0;
 
 /// 消息区正文块的可用宽相对**窗宽**要扣掉的全部内边距（D2「消息区底部文字重叠」修复用）。
 ///
@@ -815,12 +816,23 @@ const TB_STRIP_GAP: f32 = 8.0;
 const TB_TITLE_END: f32 = 132.0;
 /// 控件条左缘与标题文字之间的最小间隔。
 const TB_TITLE_GAP: f32 = 8.0;
-/// 会话 chip 宽：PixelMenu 内部 `Text { x: 10px; width: parent.width - 36px }` ⇒
-/// 84px 给文案 48px（13px 字号 ≈ 3 个全宽字 = "新会话" 刚好放全）。
-pub const TB_SESSION_W: f32 = 84.0;
+/// 新建会话（气泡图标）方钮宽（稿 v9 `.tb-btn`：26×26）。
+///
+/// **位置约定（v10）**：新建会话**只有这一个入口**（v10 已把输入区左侧的 `＋` 拆掉），
+/// 所以它排在标题栏控件条最左、且是最后才让位的一项（见 `titlebar_plan` 的换档）。
+pub const TB_NEW_W: f32 = 26.0;
+/// 历史会话（🗂 图标）方钮宽（稿 `.tb-btn` 26×26）。
+///
+/// 与旧值的区别：v9 之前它是一个 84px 的带文案 PixelMenu；v10 起标题栏里**只有图标**
+/// （稿 v8 第 2 条「两个都只要图标、不要文字」），点开由弹窗列会话。
+pub const TB_SESSION_W: f32 = 26.0;
+/// 窄窗回退位（状态行）里的会话 PixelMenu 固定宽——那里仍是**带文案**的菜单，需要更宽：
+/// PixelMenu 内部 `Text { x: 10px; width: parent.width - 36px }` ⇒ 84px 给文案 48px
+/// （13px 字号 ≈ 3 个全宽字 = "新会话" 刚好放全）。`ui/app.slint` 的 D2 回退位按此值画。
+pub const TB_SESSION_FALLBACK_W: f32 = 84.0;
 /// 模型 chip 理想宽：112px 给文案 76px（≈ 11 个半宽字符，"deepseek-chat" 需 13 个 ⇒ 末尾省略）。
-/// 参照稿本身：`chipbtn` 是 `max-width:150px` + `text-overflow:ellipsis`，且稿的 478px 标题栏
-/// 里两个 chip 被 flex 压到 ~117px——即稿也承认这两个 chip 会省略号，不是「必须全显」。
+/// 参照稿本身：`chipbtn` 是 `max-width:150px` + `text-overflow:ellipsis`（稿里它也被 flex 压到
+/// ~117px）——即稿也承认 chip 会省略号，不是「必须全显」。
 pub const TB_MODEL_W: f32 = 112.0;
 /// 模型 chip 下限：再窄连 6 个半宽字符都放不下，不如让位（见 `titlebar_plan` 的换档）。
 const TB_MODEL_W_MIN: f32 = 88.0;
@@ -830,8 +842,8 @@ const TB_SETTINGS_W: f32 = 26.0;
 const TB_ITEM_GAP: f32 = 6.0;
 
 /// 标题文字是否还画得下：整条左缘越过「标题右缘 + 间隔」就说明没压标题。
-/// 窄窗时调用方**先牺牲标题**（置空），把位置让给 ①②③——owner 口径：三项必须与
-/// 最小化/关闭同在标题栏那一行，标题只是装饰。
+/// 窄窗时调用方**先牺牲标题**（置空），把位置让给 ①②③④——owner 口径：它们必须与
+/// 最小化/最大化/关闭同在标题栏那一行，标题只是装饰。
 pub fn titlebar_title_visible(plan: &TitlebarPlan) -> bool {
     plan.x >= TB_TITLE_END + TB_TITLE_GAP
 }
@@ -843,25 +855,34 @@ const TB_CHIP_TEXT_INSET: f32 = 36.0;
 const TB_HALF_CHAR_W: f32 = 7.0;
 
 /// 标题栏控件条的落位计划（逻辑像素，相对窗口左上角）。
+///
+/// 顺序（自左向右，v10 稿 `#win` 的 titlebar 段）：
+/// ① 新建会话（气泡图标）/ ② 历史会话（🗂 图标）/ ③ 模型 chip（带文案）/ ④ ⚙设置。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TitlebarPlan {
     /// 整条左缘；**< 0 = 空档塞不下任何一项，整条不画**。
     pub x: f32,
-    /// ①会话 chip 宽（0 = 不画）。
+    /// ①新建会话方钮宽（0 = 不画；`x >= 0` 时按换档约定它必定 > 0）。
+    pub new_w: f32,
+    /// ②历史会话方钮宽（0 = 不画，落到状态行回退位）。
     pub session_w: f32,
-    /// ②模型 chip 宽（0 = 不画；模型列表为空时调用方也传 `has_model=false`）。
+    /// ③模型 chip 宽（0 = 不画；模型列表为空时调用方也传 `has_model=false`）。
     pub model_w: f32,
-    /// ③⚙ 方钮宽（0 = 不画）。
+    /// ④⚙ 方钮宽（0 = 不画）。
     pub settings_w: f32,
 }
 
 /// 算出标题栏控件条该摆在哪、各项多宽（纯函数，口径钉在单测里）。
 ///
 /// 空档 = 窗口宽 − 右侧「窗口按钮组 + 间隔」− 左侧「标题文字 + 间隔」。
-/// 换档顺序按「能力可替代性」：会话下拉**只有**这一个入口（输入区 `＋` 只新建）⇒ 最后才让位；
-/// ⚙设置 在托盘菜单里有等价入口 ⇒ 第一个让位；模型下拉居中（稿里的高亮项，尽量留）。
-/// 具体：①三件套（模型理想宽）→ ②压缩模型宽（下限 `TB_MODEL_W_MIN`）→ ③让出 ⚙ →
-/// ④只留会话 chip → ⑤什么都不画（`x = -1`）。
+/// 换档顺序按「能力可替代性」（v10 重排）：
+/// - **新建会话**没有第二入口（v10 已从输入区移除 `＋`）⇒ 最优先保留，连它都放不下才整条不画；
+/// - ⚙设置 在托盘菜单里有等价入口 ⇒ 第一个让位；
+/// - 模型下拉在状态行回退位里有等价入口（`titlebar-model-w <= 0` 分支）⇒ 其次让位；
+/// - 历史会话在状态行回退位里有等价入口（`titlebar-session-w <= 0` 分支）⇒ 再次。
+///
+/// 具体：①全量（模型理想宽）→ ②压缩模型宽（下限 `TB_MODEL_W_MIN`）→ ③让 ⚙ → ④让模型 →
+/// ⑤只留新建会话 → ⑥整条不画（`x = -1`）。
 pub fn titlebar_plan(window_w: f32, has_model: bool) -> TitlebarPlan {
     // 按**整区**让位（见 `TB_BTN_ZONE_W` 的注释：按可见按钮数精算在 340px 窄窗下会压到按钮底）。
     let buttons_left = window_w - 4.0 - TB_BTN_ZONE_W;
@@ -871,60 +892,76 @@ pub fn titlebar_plan(window_w: f32, has_model: bool) -> TitlebarPlan {
 
     let none = TitlebarPlan {
         x: -1.0,
+        new_w: 0.0,
         session_w: 0.0,
         model_w: 0.0,
         settings_w: 0.0,
     };
-    // 只留会话 chip（⚙ 与模型都放不下时的兜底；会话切换没有第二个入口）。
-    if avail < TB_SESSION_W {
+    // 新建会话是唯一入口（v10 已从输入区移除），连它都放不下才整条不画。
+    if avail < TB_NEW_W {
         return none;
     }
     let model_room = |w: f32| -> Option<f32> {
         // 用模型上限去夹：下限都放不下就返回 None（调用方换下一档）。
         (w >= TB_MODEL_W_MIN).then(|| w.min(TB_MODEL_W))
     };
-    // 三件套（含 ⚙）。
-    let with_all = avail - TB_SESSION_W - TB_SETTINGS_W - 2.0 * TB_ITEM_GAP;
+    // ① 全量：new + session + model(理想) + ⚙。
+    let with_all = avail - TB_NEW_W - TB_SESSION_W - TB_SETTINGS_W - 3.0 * TB_ITEM_GAP;
     if has_model {
         if let Some(model_w) = model_room(with_all) {
+            let total = TB_NEW_W + TB_SESSION_W + model_w + TB_SETTINGS_W + 3.0 * TB_ITEM_GAP;
             return TitlebarPlan {
-                x: right_limit - (TB_SESSION_W + model_w + TB_SETTINGS_W + 2.0 * TB_ITEM_GAP),
+                x: right_limit - total,
+                new_w: TB_NEW_W,
                 session_w: TB_SESSION_W,
                 model_w,
                 settings_w: TB_SETTINGS_W,
             };
         }
     }
-    // 让出 ⚙（托盘菜单里有「设置…」等价入口）；模型仍留。
-    let without_settings = avail - TB_SESSION_W - TB_ITEM_GAP;
+    // ② 让出 ⚙（托盘菜单里有「设置…」等价入口）；模型仍留。
+    let without_settings = avail - TB_NEW_W - TB_SESSION_W - 2.0 * TB_ITEM_GAP;
     if has_model {
         if let Some(model_w) = model_room(without_settings) {
+            let total = TB_NEW_W + TB_SESSION_W + model_w + 2.0 * TB_ITEM_GAP;
             return TitlebarPlan {
-                x: right_limit - (TB_SESSION_W + model_w + TB_ITEM_GAP),
+                x: right_limit - total,
+                new_w: TB_NEW_W,
                 session_w: TB_SESSION_W,
                 model_w,
                 settings_w: 0.0,
             };
         }
     }
-    // 只剩会话 chip（+ 有地方就再塞 ⚙，两者都放不下时以会话为先）。
-    let with_settings = TB_SESSION_W + TB_ITEM_GAP + TB_SETTINGS_W;
-    let settings_w = if with_settings <= avail {
-        TB_SETTINGS_W
-    } else {
-        0.0
-    };
-    let total = TB_SESSION_W
-        + if settings_w > 0.0 {
-            TB_ITEM_GAP + settings_w
-        } else {
-            0.0
+    // ③ 让出模型（状态行回退位接）；会话仍留。
+    let with_gear = TB_NEW_W + TB_SESSION_W + TB_SETTINGS_W + 2.0 * TB_ITEM_GAP;
+    if with_gear <= avail {
+        return TitlebarPlan {
+            x: right_limit - with_gear,
+            new_w: TB_NEW_W,
+            session_w: TB_SESSION_W,
+            model_w: 0.0,
+            settings_w: TB_SETTINGS_W,
         };
+    }
+    // ④ 让出 ⚙ 与模型，只留 new + session（两枚 26px 方钮）。
+    let two = TB_NEW_W + TB_SESSION_W + TB_ITEM_GAP;
+    if two <= avail {
+        return TitlebarPlan {
+            x: right_limit - two,
+            new_w: TB_NEW_W,
+            session_w: TB_SESSION_W,
+            model_w: 0.0,
+            settings_w: 0.0,
+        };
+    }
+    // ⑤ 只留新建会话（历史会话落到状态行回退位）。min-width 340px 下不会走到这里，防御性保留。
     TitlebarPlan {
-        x: right_limit - total,
-        session_w: TB_SESSION_W,
+        x: right_limit - TB_NEW_W,
+        new_w: TB_NEW_W,
+        session_w: 0.0,
         model_w: 0.0,
-        settings_w,
+        settings_w: 0.0,
     }
 }
 
@@ -2549,36 +2586,45 @@ mod tests {
         assert_eq!(y, 100);
     }
 
-    // ─────────── D2：标题栏控件条（稿 ①②③）的落位 ───────────
+    // ─────────── D2：标题栏控件条（稿 ①②③④）的落位 ───────────
+
+    /// 计划里**画出来的项**的总宽（含相邻项之间的 `TB_ITEM_GAP`）；`x < 0`（整条不画）⇒ 0。
+    fn plan_total(p: &TitlebarPlan) -> f32 {
+        if p.x < 0.0 {
+            return 0.0;
+        }
+        let mut total = 0.0;
+        let mut first = true;
+        for w in [p.new_w, p.session_w, p.model_w, p.settings_w] {
+            if w > 0.0 {
+                if !first {
+                    total += TB_ITEM_GAP;
+                }
+                total += w;
+                first = false;
+            }
+        }
+        total
+    }
 
     /// 控件条右缘必须停在**最左侧那颗真实窗口按钮**左边 ≥8px，且这条断言真的在盯按钮组几何。
     ///
     /// 判别力（负向，两个方向）：
-    /// 1. 把 `TB_STRIP_GAP` / 控件宽度改成别的值 ⇒ 期望值不变 ⇒ 必红；
-    /// 2. 把 `TB_BTN_COUNT` 当成 3（= 打开最大化）去验 ⇒ **当前计划必须不够**，
-    ///    这正是「换回最大化就得同步改 `TB_BTN_COUNT`」的机器化表述；配对的源码守卫见
-    ///    [`Self::titlebar_plan_button_count_matches_show_maximize`]。
+    /// 1. 把 `TB_STRIP_GAP` / 任一控件宽度改成别的值 ⇒ 期望值用**字面量**算 ⇒ 必红；
+    /// 2. 把按钮区按 2 颗算（`TB_BTN_ZONE_W` 缩到 70）⇒ 右缘越过按钮区 ⇒ 必红。
     #[test]
     fn titlebar_plan_reserves_room_for_all_buttons() {
-        let plan = titlebar_plan(460.0, true);
-        let total = plan.session_w
-            + plan.model_w
-            + plan.settings_w
-            + if plan.model_w > 0.0 { TB_ITEM_GAP } else { 0.0 }
-            + if plan.settings_w > 0.0 && plan.session_w > 0.0 {
-                TB_ITEM_GAP
-            } else {
-                0.0
-            };
-        let strip_right = plan.x + total;
+        let plan = titlebar_plan(520.0, true);
+        let strip_right = plan.x + plan_total(&plan);
         // 预留的是**整个按钮区**（字面量 106 + 右边距 4），不按「当前可见几颗按钮」精算：
         // 真机 340px 实测过按可见按钮数算会把 ③⚙ 压到最小化按钮的浅色按钮底上。
-        let zone_left = 460.0 - 4.0 - 106.0;
+        let zone_left = 520.0 - 4.0 - 106.0;
         assert!(
             strip_right <= zone_left - 8.0 + 0.01,
             "控件条右缘 {strip_right} 越过按钮区左侧 {zone_left}（间隔应 ≥8）"
         );
-        // 该区必须**装得下三颗按钮**（有人在 .slint 打开最大化也不用回来改常数）。
+        // 该区必须**装得下三颗按钮**（v10 起最大化已打开，见 .slint 的 `show-maximize: true`）：
+        // 30×3 + 6×2 + 右距 4 = 106。
         let three = 3.0 * 30.0 + 2.0 * 6.0 + 4.0;
         assert!(
             TB_BTN_ZONE_W >= three,
@@ -2587,10 +2633,11 @@ mod tests {
         assert!(zone_left >= 0.0 && plan.x >= 0.0);
     }
 
-    /// `TB_BTN_COUNT` 必须与 `ui/app.slint` 里 `SystemChatWindow` 的 `show-maximize` 一致
-    /// （跨文件不变量；源码扫描，同 `ui::tests::app_theme_applies_slint_pixel_soft_preset` 手法）。
-    /// 一旦有人打开最大化：窗口按钮组多一颗 30px 按钮，`TB_BTN_COUNT` 必须跟着改成 3，否则
-    /// 控件条会压到最大化按钮上。PixelTitleBar 的默认值是 `true`（三颗）。
+    /// `show-maximize` 必须与 `TB_BTN_ZONE_W` 的「三颗按钮」预留一致（跨文件不变量；源码扫描，
+    /// 同 `ui::tests::app_theme_applies_slint_pixel_soft_preset` 手法）。
+    ///
+    /// v10（稿 v8 第 3 条）**恢复最大化**：窗口按钮组是 `— ⤢ ✕` 三颗 ⇒ 常量必须按三颗留；
+    /// 反过来，若有人把 `.slint` 改回 `show-maximize: false`，这条也会红（提醒同步口径）。
     #[test]
     fn titlebar_plan_button_count_matches_show_maximize() {
         let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
@@ -2616,13 +2663,14 @@ mod tests {
             win.contains("PixelTitleBar"),
             "SystemChatWindow 应画自绘标题栏"
         );
-        // 本窗 `show-maximize: false`（只画 min + close）。因为预留的是**整区**，
-        // 以后有人打开最大化也只需 ≤ 3 颗 ⇒ 用「三颗」上限锁住即可，不必再同步计数。
-        let maximize_off = win.lines().any(|l| {
+        let maximize_on = win.lines().any(|l| {
             let code = l.split("//").next().unwrap_or(l);
-            code.contains("show-maximize: false")
+            code.contains("show-maximize: true")
         });
-        assert!(maximize_off, "本窗应关掉最大化（固定尺寸窗）");
+        assert!(
+            maximize_on,
+            "v10 起 SystemChatWindow 必须打开最大化（稿 v8 第 3 条：三钮 — ⤢ ✕）"
+        );
         let three = 3.0 * 30.0 + 2.0 * 6.0 + 4.0;
         assert!(
             TB_BTN_ZONE_W >= three,
@@ -2630,14 +2678,63 @@ mod tests {
         );
     }
 
-    /// 500px 下三件套全上；**460px（默认窗宽）会让出 ⚙**（整区预留 106px 的代价，
-    /// 让出的 ⚙ 由状态行承接，见 `ui/app.slint` 的 D2 回退位）——两条口径一起钉住。
+    /// 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多）必须是「有反馈的占位」，**不能是死按钮**：
+    /// 三个图标都要接 `composer-todo(...)`，且 Rust 侧要注册 `on_composer_todo`（写状态行）。
+    /// 源码扫描守卫（同 `titlebar_plan_button_count_matches_show_maximize` 的手法）：
+    /// 按下没反应属于「做了个空壳」，外部观测不到，只能把接线钉在源码上。
+    ///
+    /// 判别力（负向）：去掉任一 `composer-todo(...)` 接线（改成空实现 / 删掉）⇒ 本用例红。
     #[test]
-    fn titlebar_plan_fits_all_three_when_wide_enough() {
-        let p = titlebar_plan(500.0, true);
+    fn composer_placeholder_buttons_wire_todo_callback() {
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        for label in ["表情", "截图", "更多（含定时发送）"] {
+            assert!(
+                raw.contains(&format!("root.composer-todo(\"{label}\")")),
+                "占位按钮「{label}」没接 composer-todo（会变成点了没反应的死按钮）"
+            );
+        }
+        // Rust 侧的接线（把占位提示写进既有状态行通道）。
+        let rust = crate::platform::src_lf(include_str!("ui.rs"));
+        assert!(
+            rust.contains("on_composer_todo"),
+            "Rust 侧没注册 on_composer_todo —— 占位按钮的状态行提示发不出来"
+        );
+    }
+
+    /// `SYSCHAT_PREFERRED_WIDTH` 必须等于 `ui/app.slint` 的 `preferred-width`
+    /// （跨文件不变量；窗口未 realize 时计划就按它算，漂移会让首帧按另一个宽度落位）。
+    #[test]
+    fn syschat_preferred_width_matches_slint() {
+        let raw = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let start = raw
+            .find("export component SystemChatWindow")
+            .expect("ui/app.slint 里找不到 SystemChatWindow");
+        let line = raw[start..]
+            .lines()
+            .find(|l| l.trim_start().starts_with("preferred-width:"))
+            .expect("SystemChatWindow 应有 preferred-width");
+        let code = line.split("//").next().unwrap_or(line).trim();
+        let num: f32 = code
+            .trim_start_matches("preferred-width:")
+            .trim()
+            .trim_end_matches(';')
+            .trim_end_matches("px")
+            .parse()
+            .unwrap_or_else(|_| panic!("解析 preferred-width 失败：{code:?}"));
         assert_eq!(
-            (p.session_w, p.model_w, p.settings_w),
-            (TB_SESSION_W, TB_MODEL_W, TB_SETTINGS_W)
+            num, SYSCHAT_PREFERRED_WIDTH,
+            "SYSCHAT_PREFERRED_WIDTH 与 ui/app.slint 的 preferred-width 漂移了"
+        );
+    }
+
+    /// 默认窗宽（`preferred-width`）下四项全上，右缘正好贴「按钮组左侧 − 8」；
+    /// 兜底宽度 `SYSCHAT_PREFERRED_WIDTH` 下也必须四项都在（它是同一扇窗）。
+    #[test]
+    fn titlebar_plan_fits_all_when_wide_enough() {
+        let p = titlebar_plan(520.0, true);
+        assert_eq!(
+            (p.new_w, p.session_w, p.model_w, p.settings_w),
+            (TB_NEW_W, TB_SESSION_W, TB_MODEL_W, TB_SETTINGS_W)
         );
         // 左缘必须在标题文字预留（132 + 8）右边。
         assert!(
@@ -2647,49 +2744,38 @@ mod tests {
         );
         // 右缘正好贴「按钮组左侧 − 8」：期望值用字面量算（不引用 TB_*），
         // 这样改 `TB_STRIP_GAP` / 控件宽度都会被本用例抳住。
-        let zone_left = 500.0 - 4.0 - 106.0;
-        assert!(
-            p.x + TB_SESSION_W + TB_ITEM_GAP + TB_MODEL_W + TB_ITEM_GAP + TB_SETTINGS_W
-                <= zone_left - 8.0 + 0.01
-        );
-        // 默认窗宽下 ⚙ 必须让位（否则就是踩进了按钮区）——这条是把上面的取舍机器化。
+        let zone_left = 520.0 - 4.0 - 106.0;
+        assert_eq!(p.x + plan_total(&p), zone_left - 8.0);
+        // 兜底宽度下也必须四项都在（前端常量已与 .slint 对齐，见上一条守卫）。
         let def = titlebar_plan(SYSCHAT_PREFERRED_WIDTH, true);
-        assert_eq!(def.settings_w, 0.0, "460px 下 ⚙ 必须让位给按钮区");
+        assert_eq!(def.settings_w, TB_SETTINGS_W, "兜底宽度下 ⚙ 也该在");
     }
 
-    /// 窗口变窄时按「能力可替代性」换档：先压模型、再让 ⚙、最后只剩会话 chip；
-    /// **任何一档都不许把三项摆到标题文字或窗口按钮上**（逐档校验不重叠）。
+    /// 窗口变窄时按「能力可替代性」换档：先压模型 → 让 ⚙ → 让模型 → 让历史会话；
+    /// **新建会话是唯一入口 ⇒ 永远在**（连它都放不下才整条不画），且任何一档都不许把控件
+    /// 摆到标题文字或窗口按钮上（逐档校验不重叠）。
     #[test]
     fn titlebar_plan_degrades_without_overlapping() {
-        // 每个宽度上：各档都不得越界，且宽度单调不减。
+        // 每个宽度上：各档都不得越界，且宽度随窗宽变窄单调不减。
         let mut prev_total = f32::MAX;
         for w in [
-            460.0, 440.0, 420.0, 400.0, 380.0, 360.0, 340.0, 300.0, 240.0, 200.0, 100.0,
+            520.0, 460.0, 440.0, 420.0, 400.0, 380.0, 360.0, 340.0, 300.0, 280.0, 200.0, 100.0,
         ] {
             let p = titlebar_plan(w, true);
-            let total = if p.x < 0.0 {
-                0.0
-            } else {
-                p.session_w
-                    + p.model_w
-                    + p.settings_w
-                    + if p.model_w > 0.0 { TB_ITEM_GAP } else { 0.0 }
-                    + if p.settings_w > 0.0 && (p.session_w > 0.0 || p.model_w > 0.0) {
-                        TB_ITEM_GAP
-                    } else {
-                        0.0
-                    }
-            };
+            let total = plan_total(&p);
             assert!(
                 total <= prev_total + 0.01,
                 "w={w}: 档位宽度应随窗宽变窄而非变宽（{total} > {prev_total}）"
             );
             prev_total = total;
+            let zone_left = w - 4.0 - TB_BTN_ZONE_W;
             if p.x < 0.0 {
                 assert_eq!(total, 0.0, "w={w}: x<0 即整条不画");
+                // 只有连新建会话（26px）都放不下时才允许整条不画。
+                let avail = zone_left - TB_STRIP_GAP - (TB_TITLE_END + TB_TITLE_GAP);
+                assert!(avail < TB_NEW_W, "w={w}: 还有 {avail}px 空档却整条不画");
                 continue;
             }
-            let zone_left = w - 4.0 - TB_BTN_ZONE_W;
             assert!(
                 p.x + total <= zone_left - TB_STRIP_GAP + 0.01,
                 "w={w}: 压到窗口按钮区"
@@ -2698,6 +2784,8 @@ mod tests {
                 p.x >= TB_TITLE_END + TB_TITLE_GAP - 0.01,
                 "w={w}: 压到标题文字"
             );
+            // 新建会话是唯一入口（v10 已从输入区移除 `＋`）⇒ 只要整条画着就必在。
+            assert_eq!(p.new_w, TB_NEW_W, "w={w}: 新建会话不许让位");
             if p.model_w > 0.0 {
                 // 字面量上下界（不引用被验常量）：模型 chip 宽必须落在 88..=112
                 assert!(
@@ -2706,50 +2794,63 @@ mod tests {
                     p.model_w
                 );
             }
-            // 会话 chip 宽是固定档（字面量 84），不随窗宽伸缩
+            // 历史会话图标钮只按整档开合（26px），不随窗宽伸缩。
             assert!(
-                p.session_w == 0.0 || p.session_w == 84.0,
-                "w={w}: 会话 chip 只按整档开合，实测 {}",
+                p.session_w == 0.0 || p.session_w == 26.0,
+                "w={w}: 历史会话钮只按整档开合，实测 {}",
                 p.session_w
             );
         }
     }
 
-    /// 会话 chip 是**最后**才让位的（输入区 `＋` 只新建、托盘菜单也不给会话切换 ⇒ 没有等价入口）。
-    /// 在「三件套放不下、会话单独放得下」的窄窗上，会话 chip 必须在。
+    /// 换档取舍：
+    /// - 380px（空档 122）：只够 new+session+⚙（90）；模型（≥88）放不下 ⇒ 走状态行回退位。
+    /// - 340px（最小宽，空档 82）：连 ⚙ 也让掉 ⇒ 只剩 new+session（58）。
+    /// - 300px（空档 42）：只剩新会话钮 —— 它是唯一入口，**不**整条让位。
+    /// - 280px（空档 22 < 26）：连它都放不下 ⇒ 整条不画（防御性；窗最小宽 340）。
     #[test]
-    fn titlebar_plan_keeps_session_chip_longest() {
-        // 440px 窗：空档 182px ⇒ 三件套放不下，先让 ⚙；会话 + 模型（92px）放得下。
-        let p = titlebar_plan(440.0, true);
-        assert_eq!(p.session_w, TB_SESSION_W, "会话 chip 不该先让位");
-        assert!(p.model_w > 0.0 && p.settings_w == 0.0);
-        // 380px 窗：空档 122px ⇒ 模型连 88px 都挤不出，会话 + ⚙（116px）放得下。
-        let q = titlebar_plan(380.0, true);
+    fn titlebar_plan_keeps_new_session_longest() {
+        let p = titlebar_plan(380.0, true);
         assert_eq!(
-            (q.session_w, q.model_w, q.settings_w),
-            (TB_SESSION_W, 0.0, TB_SETTINGS_W)
+            (p.new_w, p.session_w, p.model_w, p.settings_w),
+            (TB_NEW_W, TB_SESSION_W, 0.0, TB_SETTINGS_W),
+            "380px：模型先让位（状态行回退位接），会话与 ⚙ 留"
         );
-        // 连会话 chip 都放不下的极窄窗（340px：空档 82 < 84）：整条不画（x < 0）——
-        // 会话/模型/⚙ 三项全部转到状态行（`.slint` 的 D2 回退位）。
-        let tiny = titlebar_plan(340.0, true);
+        let q = titlebar_plan(340.0, true);
+        assert_eq!(
+            (q.new_w, q.session_w, q.model_w, q.settings_w),
+            (TB_NEW_W, TB_SESSION_W, 0.0, 0.0),
+            "340px：只剩 new + session"
+        );
+        let one = titlebar_plan(300.0, true);
+        assert_eq!(
+            (one.new_w, one.session_w),
+            (TB_NEW_W, 0.0),
+            "300px：连历史会话都放不下，但新建会话必须在"
+        );
+        assert!(one.x >= TB_TITLE_END + TB_TITLE_GAP);
+        let tiny = titlebar_plan(280.0, true);
         assert!(
-            tiny.x < 0.0 && tiny.session_w == 0.0 && tiny.model_w == 0.0 && tiny.settings_w == 0.0
+            tiny.x < 0.0 && tiny.new_w == 0.0,
+            "280px：空档 < 26 ⇒ 整条不画"
         );
     }
 
-    /// 没配任何「供应商 → 模型」（下拉无可选项）时，模型 chip 不占位，其余照摆。
+    /// 没配任何「供应商 → 模型」（下拉无可选项）时，模型 chip 不占位、**也不留空档**，其余照摆。
     #[test]
     fn titlebar_plan_without_models_leaves_no_gap_for_model_chip() {
         let p = titlebar_plan(SYSCHAT_PREFERRED_WIDTH, false);
         assert_eq!(
-            (p.session_w, p.model_w, p.settings_w),
-            (TB_SESSION_W, 0.0, TB_SETTINGS_W)
+            (p.new_w, p.session_w, p.model_w, p.settings_w),
+            (TB_NEW_W, TB_SESSION_W, 0.0, TB_SETTINGS_W)
         );
         let zone_left = SYSCHAT_PREFERRED_WIDTH - 4.0 - TB_BTN_ZONE_W;
+        // 只有两个间隔（new|session|settings），没有为模型多留那 6px。
         assert_eq!(
-            p.x + TB_SESSION_W + TB_ITEM_GAP + TB_SETTINGS_W,
-            zone_left - TB_STRIP_GAP
+            plan_total(&p),
+            TB_NEW_W + TB_SESSION_W + TB_SETTINGS_W + 2.0 * TB_ITEM_GAP
         );
+        assert_eq!(p.x + plan_total(&p), zone_left - TB_STRIP_GAP);
     }
 
     /// 文案截断：放得下原样返回；放不下以省略号收尾且**绝不超过 chip 内可用宽**。

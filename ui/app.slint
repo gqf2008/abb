@@ -3132,7 +3132,24 @@ component GearGlyph inherits Rectangle {
 }
 
 
-// 标题栏图标钮（D2 稿 ③ ⚙设置 / `.tb-btn`）：26×26、2px 墨黑描边、hover 暖底。
+// 对话气泡字形（稿 v9 第 1 条：新建会话图标，14px、墨黑描边色）——只描边不填色。
+// 与 `GearGlyph` 同口径：手绘 Path（字形/SVG 的不可靠性见 `TitlebarIconButton` 注释）。
+component BubbleGlyph inherits Rectangle {
+    in property <brush> tint: PixelTheme.text;
+    width: 16px;
+    height: 16px;
+    Path {
+        width: 100%;
+        height: 100%;
+        stroke: root.tint;
+        stroke-width: 1.5px;
+        fill: transparent;
+        // 圆角矩形气泡（1..15 × 2..11，圆角 2）+ 左下尾巴（5,11 → 5,13.5 → 7,11）。
+        commands: "M 3 2 L 13 2 A 2 2 0 0 1 15 4 L 15 9 A 2 2 0 0 1 13 11 L 7 11 L 5 13.5 L 5 11 L 3 11 A 2 2 0 0 1 1 9 L 1 4 A 2 2 0 0 1 3 2 Z";
+    }
+}
+
+// 标题栏图标钮（稿 `.tb-btn`）：26×26、2px 墨黑描边、hover 暖底。
 // 图标为什么是 **Path** 而不是 `ImageIcon` + SVG：① 字形（`icon: string`）在本机字体对 ⚙ 这类
 // 符号覆盖不可靠（排版审计 4656a34 踩过「⚠️ 渲染成空心方框」）；② SVG 靠图片解码器，
 // Slint 的软件渲染后端（`SLINT_BACKEND=winit-software` 兜底排查路径）没有 SVG 解码器，
@@ -3141,6 +3158,9 @@ component GearGlyph inherits Rectangle {
 component TitlebarIconButton inherits Rectangle {
     in property <string> tip: "";
     in property <bool> enabled: true;
+    // 图形：false = ⚙设置（稿 `.tb-btn[data-m="4"]`）；true = 新建会话气泡图标
+    //（稿 v9 第 1 条：同 logo 里那个气泡，14px、墨黑描边色）。
+    in property <bool> bubble: false;
     callback clicked();
     width: 26px;
     height: 26px;
@@ -3150,7 +3170,11 @@ component TitlebarIconButton inherits Rectangle {
     border-color: PixelTheme.edge;
     border-radius: 6px;
     // 齿轮：中心圆环（两段半弧）+ 8 根辐条（轴 4 + 对角 4），16×16 居中。
-    GearGlyph {
+    if !root.bubble: GearGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    if root.bubble: BubbleGlyph {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
     }
@@ -3163,15 +3187,103 @@ component TitlebarIconButton inherits Rectangle {
     }
 }
 
-// D 批：输入区左竖排图标按钮（稿 `.ib`）：32×32、2px 描边、7px 圆角；hover 变底、按下下沉 1px；
-// 图标文案不显示在按钮上，而是作为 tooltip（owner 口径：图标 + 文案作 tooltip）。
-// D 批：输入区左竖排图标（＋ 新建会话 / 📎 多选附件）
+// 标题栏「历史会话」图标钮（稿 v10：**只有 🗂 图标**，点开列历史会话、可随时切回继续聊）。
+//
+// 为什么不用 PixelMenu：它把 `button-text` 画在 `x: 10px; width: parent.width - 36px` 的文本格
+// 里、右侧再留 26px 固定箭头格，26px 宽的图标钮根本放不下文案；稿也明确要求这一格「只要图标」。
+// 弹窗列表自己画：`PopupWindow`（相对父元素定位，见 slint-core `window.rs` 的注释）+ 每行一个
+// `TouchArea`，当前会话用 accent 高亮（同稿 `.menu .item.on`）。
+component SessionIconButton inherits Rectangle {
+    in property <[string]> items: [];
+    in-out property <int> index: -1;
+    in property <bool> enabled: true;
+    callback selected(int);
+    width: 26px;
+    height: 26px;
+    opacity: root.enabled ? 1.0 : 0.5;
+    background: popup.is-open ? PixelTheme.hover : (hit.has-hover ? PixelTheme.hover : PixelTheme.panel);
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+    border-radius: 6px;
+    // 🗂 是唯一依赖本机字形的图标（其余图标都是 Path）；它与输入区的 emoji 图标同风险档：
+    // 系统字体有、无头软件渲染的测试字体可能画成 tofu（不影响布局与命中）。
+    Text {
+        width: 100%;
+        height: 100%;
+        text: "🗂";
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    Tooltip { text: @markdown("历史会话（历史保留，可随时切回）"); }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    popup := PopupWindow {
+        // 右对齐到按钮右缘（25px 宽的钮在标题栏右侧，弹窗往左展开才不会出窗）。
+        x: root.width - 236px;
+        y: root.height + 4px;
+        width: 236px;
+        height: root.items.length * 26px + 34px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: PixelTheme.panel;
+            border-width: 2px;
+            border-color: PixelTheme.edge;
+            border-radius: 8px;
+            VerticalBox {
+                padding: 6px;
+                spacing: 0px;
+                Text {
+                    height: 20px;
+                    text: "会话（历史保留，可随时切回）";
+                    font-size: 10px;
+                    color: PixelTheme.dim;
+                    vertical-alignment: center;
+                }
+                for it[i] in root.items: Rectangle {
+                    height: 26px;
+                    background: i == root.index ? PixelTheme.accent : (row-ta.has-hover ? PixelTheme.hover : transparent);
+                    border-radius: 4px;
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: 100%;
+                        text: it;
+                        font-size: 12px;
+                        color: i == root.index ? PixelTheme.on-accent : PixelTheme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    row-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.index = i;
+                            root.selected(i);
+                            popup.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 输入区功能区图标钮（稿 `.ib{width:24px;height:24px;border:2px;border-radius:6px}`）：
+// 24×24、2px 描边、6px 圆角；hover 变底、按下下沉 1px；图标文案不显示在按钮上，
+// 而是作为 tooltip（owner 口径：图标 + 文案作 tooltip）。
+// v10 位置：输入框**内**底部功能区的**一行**（右对齐：😊 📎 ✂ 🗑 ⋯），
+// 不再有框外左竖排图标列（稿 v9 第 2 条）。
 component ComposerIcon inherits Rectangle {
     in property <string> icon: "";
     in property <string> tip: "";
     in property <bool> enabled: true;
     callback clicked();
-    // 26px（owner 口径 2026-10-13：图标列要**更小**且放到输入框**外面**）。
+    // 24px（稿 `.ib`）。
     width: 24px;
     height: 24px;
     background: transparent;
@@ -3275,9 +3387,9 @@ export component SystemChatWindow inherits Window {
     in-out property <int> session-index: -1;
     in-out property <int> model-index: -1;
 
-    // ── D2 稿 ①②③：标题栏内联控件（会话 / 模型 / ⚙设置）──────────────────────
-    // `PixelTitleBar` 是 slint-pixel 的封闭组件（不能塞子元素），所以三件套改成在根 Rectangle
-    // 里、VerticalLayout **之后**叠一条 HorizontalBox（后画 = 上层），靠右贴窗口按钮组左侧。
+    // ── 稿 v10：标题栏内联控件（①新建会话 / ②历史会话 / ③模型 chip / ④⚙设置）──────
+    // `PixelTitleBar` 是 slint-pixel 的封闭组件（不能塞子元素），所以这四件改成在根 Rectangle
+    // 里、VerticalLayout **之后**叠一条控件条（后画 = 上层），靠右贴窗口按钮组左侧。
     // 位置/可见性/宽度由 Rust 计划算出后写进下面这几个属性（`crate::syschat::titlebar_plan`，
     // 纯函数带单测）；这里只负责画。**不要在 .slint 里重算**：那套「放不下就换档」的阶梯算术
     // 需要可负向验证的单测，而 GUI 观感无法自动断言。
@@ -3317,6 +3429,10 @@ export component SystemChatWindow inherits Window {
     callback reset-history();
     callback close-window();
     callback open-settings();   // ③ ⚙设置：唤起既有设置窗（D2 稿需求 #3）
+    // 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多（含定时发送），稿 v9 第 2 条）：
+    // 这几个功能还没做，但**不做成死按钮**——按下走既有状态行通道给一句「尚未实现」。
+    // 参数 = 功能名（Rust 侧拼「「表情」尚未实现（占位按钮）。」）。
+    callback composer-todo(string);
     // 无边框窗口缩放（同 SettingsWindow：`impl_resize_ui!` + `install_window_resize`）。
     // owner 2026-10-13：「窗口不能缩放的吗？」——此前对话窗没接缩放契约。
     callback begin-resize(string);
@@ -3330,6 +3446,26 @@ export component SystemChatWindow inherits Window {
     out property <length> dbg-content-h: flick.content-height;
     out property <length> dbg-content-y: flick.content-y;
     out property <length> dbg-col-h: col.height;
+    // 输入区几何的**只读观测面**（v10 对稿用；同 dbg-flick-* 的口径：只读、无副作用）：
+    // 「zone padding 是不是 10 / 文本区是不是 66 / send 是不是 30 / 功能区是不是靠右同线」
+    // 在像素上能量但受描边与抗锯齿干扰（2px 边框算不算在「盒」里差好几像素），
+    // 布局的**真实值**由窗口自报，`ui_headless_render_test` 直接断言。
+    out property <length> dbg-composer-x: composer.x;
+    out property <length> dbg-composer-y: composer.y;
+    out property <length> dbg-composer-w: composer.width;
+    out property <length> dbg-composer-h: composer.height;
+    out property <length> dbg-area-y: area.y;
+    out property <length> dbg-area-h: area.height;
+    out property <length> dbg-crow-y: crow.y;
+    out property <length> dbg-crow-h: crow.height;
+    out property <length> dbg-fnbar-x: fnbar.x;
+    out property <length> dbg-fnbar-y: fnbar.y;
+    out property <length> dbg-fnbar-w: fnbar.width;
+    out property <length> dbg-fnbar-h: fnbar.height;
+    out property <length> dbg-send-x: send-btn.x;
+    out property <length> dbg-send-y: send-btn.y;
+    out property <length> dbg-send-w: send-btn.width;
+    out property <length> dbg-send-h: send-btn.height;
     callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
     callback open-link(string);    // 图片 http 失败/普通链接：用浏览器打开
     // slint-pixel 标题栏契约（impl_title_bar_ui! 要求这四个回调存在）
@@ -3361,34 +3497,55 @@ export component SystemChatWindow inherits Window {
         VerticalLayout {
             // 留 2px 让外层黑描边露出四周（铺满的子元素会把描边盖掉，同设置窗）
             padding: 2px;
-            // 自绘标题栏：native-move（平台拖动，宿主无需 drag-start 接线）+ 隐藏最大化
-            // （固定尺寸窗，set_maximized 会与尺寸绑定冲突）。
+            // 自绘标题栏：native-move（平台拖动，宿主无需 drag-start 接线）。
+            // **v10（稿 v8 第 3 条）：恢复最大化** —— 三钮 `— ⤢ ✕`；窗口最小 340×380、可缩放，
+            // 不再与尺寸绑定冲突（老口径「固定尺寸窗才关掉最大化」已作废）。
+            // `show-maximize: true` 与 `syschat::TB_BTN_ZONE_W`（按三颗按钮预留 106px）
+            // 的一致性由 `titlebar_plan_button_count_matches_show_maximize` 守着。
+            //
+            // 高度说明：`PixelTitleBar` 是**上游封闭组件**、内部固定 `height: 34px`，且那排窗口
+            // 按钮是绝对定位 `y: 4px; height: 26px`（不随外框高度居中）。强行改成稿子的 38px
+            // 只会让底部多 4px 空白、控件条（y: 6..32）看起来偏上；故保留 34px——标题栏项高
+            // **仍是稿子的 26px**，且与窗口按钮严格同线（绝对 y 6..32）。
             PixelTitleBar {
-                // 标题可用 Rust 置空（窄窗时给 ①②③ 让位——控件比标题重要，且它们必须与
-                // 最小化/关闭按钮同在标题栏这一行）。
+                // 标题可用 Rust 置空（窄窗时给 ①②③④ 让位——控件比标题重要，且它们必须与
+                // 最小化/最大化/关闭同在标题栏这一行）。
                 title: root.titlebar-title;
                 has-logo: true;
                 logo: @image-url("../app-assets/icon-1024.png");
                 native-move: true;
-                show-maximize: false;
+                show-maximize: true;
                 // 标题栏是贴窗口上边的子元素，直角会盖掉根圆角 → 补等值内圈圆角（10 − 2 = 8）
                 border-top-left-radius: 8px;
                 border-top-right-radius: 8px;
                 close-window => { root.close-window(); }
             }
 
-            // 状态行（D2 稿 `.status`）：**独立一行**，只放状态文案（+ 右端「清空对话」）。
-            // 稿高 26px。D2 之前是「工具行」：会话/模型两个下拉 + 状态文案 + 清空按钮 挤在同一行，
-            // 460px 下状态文案被压成省略号、控件互相压住（owner 真机截图第 2 条）。现在两个下拉
-            // 上移到标题栏（稿 ①②），这一行只剩文案与本行右端的次要动作。
+            // 标题栏底部分隔线（稿 `.titlebar{border-bottom:2px solid var(--edge)}`）：
+            // `PixelTitleBar` 是上游封闭组件、自己不带底边，用一条 2px 子矩形补上（同状态行/
+            // 输入区的做法）。放在标题栏与状态行**之间**，宽度由布局铺满（两端 2px 是窗口黑描边）。
+            Rectangle { height: 2px; background: PixelTheme.edge; }
+
+            // 状态行（稿 `.status{min-height:38px;padding:4px 12px}`）：**独立一行**、**两行文本**。
+            // 稿 v7 起就是两行：第一行状态文案（ok 绿）+ 第二行 `<模型> · <就绪|正在回复…>`；
+            // 右侧仍留给 token 占用（E3 批实现）。
+            // 为什么是 `min-height` 而不是 `height`：稿子写的就是 `min-height`。`height` 只是
+            // 布局的 preferred，窗口/内容吃紧时 VerticalLayout 可把它压向 min（min 默认 0）；
+            // `min-height` 才是「不许矮于 38px」这个硬约束（修复前用旧 `HorizontalBox` 时，
+            // 8px 默认 padding 把这一行撑到 52px；换成现代 Layout 后正常高度就是 38px）。
             Rectangle {
-                height: 38px;
+                min-height: 38px;
                 background: PixelTheme.bg;
-                HorizontalBox {
+                // ⚠️ 用 `HorizontalLayout`/`VerticalLayout` 而**不是** `HorizontalBox`/`VerticalBox`：
+                // 后者是 std-widgets 的旧别名，自带 `padding: StyleMetrics.layout-padding`（= 8px）。
+                // 实测：它的 8px 会与显式 `padding-left` **叠加**（稿的 12px 生效成 20px），
+                // 并且把本行撑高到 52px——直接破坏稿 `.status{min-height:38px;padding:4px 12px}`。
+                // 本窗凡是要精确落位的容器一律用现代 Layout（默认 padding 0），边距自己写。
+                HorizontalLayout {
                     padding-left: 12px;
-                    padding-right: 8px;
+                    padding-right: 12px;
                     spacing: 8px;
-                    VerticalBox {
+                    VerticalLayout {
                         horizontal-stretch: 1;
                         alignment: center;
                         spacing: 1px;
@@ -3409,10 +3566,11 @@ export component SystemChatWindow inherits Window {
                     }
                     // D2 回退位（窄窗才出现）：标题栏控件条放不下的项落在这里——
                     // 不静默丢功能，也绝不可能与窗口按钮重叠。
-                    // 为什么要有它：标题栏控件条按**整个 106px 按钮区**让位（`TB_BTN_ZONE_W`），
-                    // 460px 下 ①会话+②模型 就吃满空档、③⚙ 让位；340px 下连会话 chip 都放不下、
-                    // 整条不画 ⇒ 三项全部由本行承接。
-                    if root.titlebar-strip-x < 0px && root.session-labels.length > 0: PixelMenu {
+                    // 为什么要有它：标题栏控件条按**整个 106px 按钮区**让位（`TB_BTN_ZONE_W`）；
+                    // 换档顺序见 `syschat::titlebar_plan`（先让 ⚙ → 再让模型 → 再让历史会话）。
+                    // v10：历史会话在标题栏里只剩 26px 图标钮 ⇒ 让位判据改为 `titlebar-session-w <= 0`
+                    // （旧版是「整条不画」`strip-x < 0`，因为那时会话 chip 是 84px、放不下就整条不画）。
+                    if root.titlebar-session-w <= 0px && root.session-labels.length > 0: PixelMenu {
                         width: 84px;
                         height: 22px;
                         items: root.session-labels;
@@ -3435,13 +3593,15 @@ export component SystemChatWindow inherits Window {
                         enabled: !root.busy;
                         clicked => { root.open-settings(); }
                     }
-                    // 注：`清空对话` 已搬到输入框**左侧图标列**（owner：「清空对话在顶部的吗？」）。
+                    // 注：`清空对话` / `新建会话` / `附件` 都不在本行的回退位里——它们分别在
+                    // 输入框功能区（🗑）与标题栏控件条（①新建会话 / 📎 在功能区），这里只兜底会话/模型/⚙。
                 }
-                // 底部分隔线（Rectangle 无 border-bottom-* 属性，用 1px 子矩形代替）
+                // 底部分隔线（Rectangle 无 border-bottom-* 属性，用 2px 子矩形代替；稿
+                // `.status{border-bottom:2px solid var(--edge)}`）。
                 Rectangle {
-                    y: parent.height - 1px;
+                    y: parent.height - 2px;
                     width: 100%;
-                    height: 1px;
+                    height: 2px;
                     background: PixelTheme.edge;
                 }
             }
@@ -3717,10 +3877,11 @@ export component SystemChatWindow inherits Window {
                 }
             }
 
-            // ── D 批输入区（稿 `.composer-zone` / `.composer` / `.pending` / `.prow` / `.stack`）──
-            // 一个整体框：2px 墨黑描边 + 8px 圆角 + panel 底 + 8px 内边距/间距；
-            // 框内自上而下 = 待发附件行 →（左竖排图标列 | 文本区 | 发送按钮）。
-            // 稿第 288 行要求删掉的「长提示文案」不再渲染；状态行（错误通道）保留在工具行。
+            // ── 输入区（稿 v10 `.composer-zone` / `.composer` / `.crow` / `.fnbar` / `.ib` / `.send`）──
+            // 稿 v9 第 2 条要求：**取消框外图标列**，输入区只有一个整体框
+            //（`.composer-zone` padding 10px），框内自上而下 = 待发附件行 → 文本区 → 功能区一行。
+            // 功能区**整体靠右**：`[😊][📎][✂][🗑][⋯]` + `发送`（稿 v10：🗑 并入功能区、
+            // 发送收小到 30px）。稿第 288 行要求删掉的「长提示文案」不再渲染。
             Rectangle {
                 vertical-stretch: 0;
                 background: PixelTheme.bg;
@@ -3728,43 +3889,30 @@ export component SystemChatWindow inherits Window {
                 // 不补这两个角就会把根 Rectangle 的圆角盖成直角。
                 border-bottom-left-radius: 8px;
                 border-bottom-right-radius: 8px;
-                VerticalBox {
+                // 同状态行：用现代 Layout（旧 Box 自带 8px padding，会把 zone 的 10px 内边距
+                // 撑成 18px、顶部分隔线也内缩，破坏稿 `.composer-zone{padding:10px}`）。
+                VerticalLayout {
                     // `.composer-zone` 顶部分隔线（Slint 的 Rectangle 无单边 border，用 2px 子矩形）
                     // 顶端分隔线：铺满输入区宽度。**不要**在这里写 `x: -2px; width: parent.width + 4px`
                     // 去「盖住窗口黑描边」——实测会触发 Slint 的 width ←→ layoutinfo 绑定循环
                     // （编译器警告明确写「可能运行时 panic」）。两端那 2px 就是窗口黑描边本身。
                     Rectangle { height: 2px; background: PixelTheme.edge; }
-                    HorizontalBox {
+                    // `.composer-zone{padding:10px}`：框外只剩这 10px 内边距（左右一致——
+                    // v9 第 3 条就是修「去掉框外图标列后右侧边距偏大」）。
+                    HorizontalLayout {
                         padding: 10px;
-                        spacing: 8px;
-                        // 左竖排图标列**在输入框外面**（owner 2026-10-13：「新建会话和附件放到输入框
-                        // 外面而且要再小一点」）；三枚：＋ 新建会话 / 📎 附件 / 🗑 清空对话
-                        // （清空对话从顶部状态行搬下来——owner 质疑「清空对话在顶部的吗？」）。
-                        VerticalBox {
-                            width: 24px;
-                            spacing: 4px;
-                            alignment: end;
-                            ComposerIcon {
-                                icon: "＋";
-                                tip: "新建会话";
-                                enabled: !root.busy;
-                                clicked => { root.new-session(); }
-                            }
-                            ComposerIcon {
-                                icon: "📎";
-                                tip: "添加附件";
-                                enabled: !root.busy;
-                                clicked => { root.attach-pick(); }
-                            }
-                        }
                         composer := Rectangle {
                             width: 100%;
                             background: PixelTheme.panel;
                             border-width: 2px;
                             border-color: PixelTheme.edge;
                             border-radius: 8px;
-                            VerticalBox {
-                                padding: 8px;
+                            VerticalLayout {
+                                // 稿 `.composer{padding:8px;border:2px}`（全局 `box-sizing:border-box`）⇒
+                                // 内容距**外沿** 10px。Slint 的 `border-width` **不占布局**（边框画在
+                                // 内边距之上，不算尺寸），所以要让内容也距外沿 10px，这里得写 10px：
+                                // 写成 8px 时整个输入框矮 4px、内容贴边 2px（实测）。
+                                padding: 10px;
                                 spacing: 8px;
 
                                 // 待发附件行（框内顶部）：最多 3 个，其余折叠为 `+N`；点开看全部。
@@ -3922,74 +4070,112 @@ export component SystemChatWindow inherits Window {
                                     }
                                 }
 
-                                // 输入行：文本区 | 发送按钮（底对齐）——图标列已移到**框外**（见上）
-                                HorizontalBox {
-                                    spacing: 10px;
-                                    // 文本区（`.area`）：无自绘边框（描边归整体框），回车发送
-                                    area := Rectangle {
-                                        horizontal-stretch: 1;
-                                        // ≥ 图标列（3×24 + 2×4 = 80）——否则图标列会顶出输入框底边
-                                        min-height: 80px;
-                                        background: transparent;
-                                        area-input := TextInput {
-                                            x: 2px;
-                                            y: 4px;
-                                            width: parent.width - 4px;
-                                            height: parent.height - 8px;
-                                            text <=> root.draft;
-                                            font-size: 13px;
-                                            color: PixelTheme.text;
-                                            single-line: true;
-                                            vertical-alignment: top;
-                                            enabled: !root.busy;
-                                            accepted => {
-                                                if root.draft != "" && !root.busy { root.send(root.draft); }
-                                            }
-                                        }
-                                        if root.draft == "" && !area-input.has-focus: Text {
-                                            x: 4px;
-                                            y: 6px;
-                                            text: root.busy ? "等待回复…" : "给怹发消息，回车发送";
-                                            font-size: 13px;
-                                            color: PixelTheme.dim;
+                                // 文本区（稿 `.area`）：无自绘边框（描边归整体框），回车发送。
+                                // 稿 `.area{min-height:66px;max-height:130px}`；本实现是**单行**
+                                // 输入框（既有行为，不在本卡改动面），高度取稿的下限 66px。
+                                // ⚠️ 写 `height`（不是 `min-height`）：只写 min-height 时，Slint 布局按
+                                // 子项的 **preferred**（Rectangle = 0）算父布局的 preferred，实测这个区
+                                // 只能拿到 62px（少了 4px，整个输入框跟着矮 4px）。
+                                area := Rectangle {
+                                    height: 66px;
+                                    background: transparent;
+                                    area-input := TextInput {
+                                        x: 2px;
+                                        y: 4px;
+                                        width: parent.width - 4px;
+                                        height: parent.height - 8px;
+                                        text <=> root.draft;
+                                        font-size: 13px;
+                                        color: PixelTheme.text;
+                                        single-line: true;
+                                        vertical-alignment: top;
+                                        enabled: !root.busy;
+                                        accepted => {
+                                            if root.draft != "" && !root.busy { root.send(root.draft); }
                                         }
                                     }
-                                    // 发送按钮（`.send`）：36px 高、2px 描边、7px 圆角、accent 底、底对齐
-                                    VerticalBox {
-                                        alignment: end;
-                                        send-btn := Rectangle {
-                                            width: send-text.preferred-width + 36px;
-                                            height: 36px;
-                                            background: PixelTheme.accent;
-                                            border-width: 2px;
-                                            border-color: PixelTheme.edge;
-                                            border-radius: 7px;
-                                            opacity: (!root.busy && root.draft != "") ? 1.0 : 0.5;
-                                            send-text := Text {
-                                                width: 100%;
-                                                height: 100%;
-                                                text: "发送";
-                                                font-size: 13px;
-                                                font-weight: 800;
-                                                color: PixelTheme.on-accent;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
-                                            }
-                                            TouchArea {
-                                                enabled: !root.busy && root.draft != "";
-                                                mouse-cursor: pointer;
-                                                clicked => { root.send(root.draft); }
-                                            }
+                                    if root.draft == "" && !area-input.has-focus: Text {
+                                        x: 4px;
+                                        y: 6px;
+                                        text: root.busy ? "等待回复…" : "给怹发消息，回车发送";
+                                        font-size: 13px;
+                                        color: PixelTheme.dim;
+                                    }
+                                }
+
+                                // 功能区（稿 `.crow{display:flex;align-items:center;gap:8px}`）：
+                                // **整体靠右** = 左侧一个占空的伸缩块 + `.fnbar` + 发送。
+                                // 顺序照稿 v10：`[😊 表情][📎 附件][✂ 截图][🗑 清空][⋯ 更多]` + `发送`。
+                                // `cross-axis-alignment: center` = 稿的 `align-items:center`：
+                                // 发送 30px、图标 24px，居中后同一水平线（不能靠默认的 stretch）。
+                                // （旧 `HorizontalBox` 自带 8px padding，会把发送钮顶离输入框底边，
+                                // 故这里也用现代 Layout。）
+                                crow := HorizontalLayout {
+                                    spacing: 8px;
+                                    cross-axis-alignment: center;
+                                    // 左端占空：把功能区推向右端（稿里的 `<span class="grow">`）。
+                                    // 只给 `horizontal-stretch`——**不能**再写 `width: 0px`：显式宽度会
+                                    // 被当成固定尺寸，伸缩因子失效（实测功能区会被顶到最左边）。
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    // `.fnbar{display:flex;gap:4px}`：五枚 24×24 图标钮，间距 4px。
+                                    fnbar := HorizontalLayout {
+                                        spacing: 4px;
+                                        // 😊 表情 / ✂ 截图 / ⋯ 更多（含定时发送）：**占位**——按下走
+                                        // 既有状态行通道给一句「尚未实现」，不做成死按钮。
+                                        ComposerIcon {
+                                            icon: "😊";
+                                            tip: "表情（尚未实现）";
+                                            clicked => { root.composer-todo("表情"); }
                                         }
-                                        // 清空当前会话：**发送按钮右侧**（owner 口径第二条第 3 点）。
-                                        VerticalBox {
-                                            alignment: end;
-                                            ComposerIcon {
-                                                icon: "🗑";
-                                                tip: "清空当前会话";
-                                                enabled: !root.busy;
-                                                clicked => { root.reset-history(); }
-                                            }
+                                        // 📎 附件：接既有 attach-pick（可多选）。
+                                        ComposerIcon {
+                                            icon: "📎";
+                                            tip: "添加附件（可多选）";
+                                            enabled: !root.busy;
+                                            clicked => { root.attach-pick(); }
+                                        }
+                                        ComposerIcon {
+                                            icon: "✂";
+                                            tip: "截图（尚未实现）";
+                                            clicked => { root.composer-todo("截图"); }
+                                        }
+                                        // 🗑 清空当前会话：v10 从「发送右侧」搬进功能区（稿 v10 第 1 条）。
+                                        ComposerIcon {
+                                            icon: "🗑";
+                                            tip: "清空当前会话";
+                                            enabled: !root.busy;
+                                            clicked => { root.reset-history(); }
+                                        }
+                                        ComposerIcon {
+                                            icon: "⋯";
+                                            tip: "更多（含定时发送，尚未实现）";
+                                            clicked => { root.composer-todo("更多（含定时发送）"); }
+                                        }
+                                    }
+                                    // 发送按钮（稿 v10 `.send{height:30px;padding:0 14px;font-size:12px;
+                                    // border-radius:6px}`）：内边距 14×2 ⇒ 宽 = 文案宽 + 28。
+                                    send-btn := Rectangle {
+                                        width: send-text.preferred-width + 28px;
+                                        height: 30px;
+                                        background: PixelTheme.accent;
+                                        border-width: 2px;
+                                        border-color: PixelTheme.edge;
+                                        border-radius: 6px;
+                                        opacity: (!root.busy && root.draft != "") ? 1.0 : 0.5;
+                                        send-text := Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "发送";
+                                            font-size: 12px;
+                                            font-weight: 800;
+                                            color: PixelTheme.on-accent;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        TouchArea {
+                                            enabled: !root.busy && root.draft != "";
+                                            mouse-cursor: pointer;
+                                            clicked => { root.send(root.draft); }
                                         }
                                     }
                                 }
@@ -4000,32 +4186,44 @@ export component SystemChatWindow inherits Window {
             }
         }
 
-        // ── D2 稿 ①②③：标题栏内联控件条（会话 / 模型 / ⚙设置）──────────────────
+        // ── 稿 v10：标题栏内联控件条（①②③④ 一行）──────────────────
+        // 顺序照稿 `#win` 的 titlebar 段：
+        //   [logo][标题]  ①②③④  [—][⤢][✕]
+        //   ① 新建会话（气泡图标） ② 历史会话（🗂 图标） ③ 模型 chip（仍带文案） ④ ⚙设置
         // 它在根 Rectangle 里、VerticalLayout **之后** ⇒ 画在标题栏上层，但不占布局高度。
-        // `y: 6px` / `height: 26px` = 与 `PixelTitleBar` 内部那一排窗口按钮同一条基线
-        //（titlebar 顶在根 padding 2px 处，内部按钮 `y: 4px`、高 26px ⇒ 绝对 6..32）。
+        // `y: 6px` / `height: 26px` = 稿 `.tb-btn{height:26px}`，且与 `PixelTitleBar` 内部那排
+        // 窗口按钮**同一条基线**（titlebar 顶在根 padding 2px 处，内部按钮 `y: 4px`、高 26px
+        // ⇒ 绝对 6..32）——"一行、同高 26px、垂直居中"的机器化落点。
         // x 由 Rust 计划给（右缘停在最左那颗窗口按钮左侧 8px；会不会压到标题文字也由它保证）。
-        // 仅当 `show-maximize: false` 时按钮组靠右排、左侧才有这条空档；换回三颗按钮时
-        // Rust 计划的 `TB_BTN_COUNT` 必须同步改（见 `syschat::titlebar_plan` 注释）。
-        if root.titlebar-strip-x >= 0px: HorizontalBox {
+        // ⚠️ 必须是 `HorizontalLayout`（现代名）而不是 `HorizontalBox`（旧别名）：旧别名自带
+        // `padding: StyleMetrics.layout-padding`（8px），会把整条控件条内容**右下各推 8px**——
+        // 实测项高虽然仍是 26px，但落在绝对 y 14..40（而不是 6..32）：既与窗口按钮错位，
+        // 又会跨过标题栏底部分隔线。
+        if root.titlebar-strip-x >= 0px: HorizontalLayout {
             x: root.titlebar-strip-x;
             y: 6px;
             height: 26px;
             spacing: 6px;
-            // ①会话下拉（稿 `.chipbtn.mark[data-m="1"]`）：chip 显示当前会话标题，
-            // 点开列历史会话（需求 #7）。用 PixelMenu 而不是 std ComboBox：std ComboBox
-            // 的 `min-width: max(160px, …)` 硬下限吃不下这条空档（两个就是 320px+），
-            // 且它的 `model` 同时驱动 chip 文案（无法单独截断，长标题会画出框外）。
-            if root.titlebar-session-w > 0px: PixelMenu {
+            // ①新建会话（稿 v9 第 1 条：14px 对话气泡图标；v10 稿 v8 第 2 条：只要图标）。
+            // **唯一入口**（v10 已把输入区左侧的 `＋` 拆掉）⇒ 换档时最后才让位（`titlebar_plan`）。
+            TitlebarIconButton {
+                bubble: true;
+                tip: "新建会话（历史保留）";
+                enabled: !root.busy;
+                clicked => { root.new-session(); }
+            }
+            // ②历史会话（稿 v10：只有 🗂 图标；点开列历史会话、可切回继续聊）。
+            // 不再用带文案的 PixelMenu（那是 v9 前的做法；稿要求「两个都只要图标」）。
+            if root.titlebar-session-w > 0px: SessionIconButton {
                 width: root.titlebar-session-w;
-                height: 26px;
                 items: root.session-labels;
                 index <=> root.session-index;
-                button-text: root.titlebar-session-text;
                 enabled: !root.busy;
                 selected(i) => { root.session-pick(i); }
             }
-            // ②模型下拉（稿是 accent 高亮 chip；PixelMenu 无 accent 面，配色偏离已记卡）
+            // ③模型 chip（稿 `.chipbtn.accent`，仍带文案；PixelMenu 无 accent 面，配色偏离已记卡）。
+            // 用 PixelMenu 而不是 std ComboBox：std ComboBox 的 `min-width: max(160px, …)`
+            // 硬下限吃不下这条空档，且它的 `model` 同时驱动 chip 文案（无法单独截断，长标题会画出框外）。
             if root.titlebar-model-w > 0px: PixelMenu {
                 width: root.titlebar-model-w;
                 height: 26px;
@@ -4035,7 +4233,7 @@ export component SystemChatWindow inherits Window {
                 enabled: !root.busy;
                 selected(i) => { root.model-pick(i); }
             }
-            // ③⚙设置（稿 `.tb-btn[data-m="3"]`）——唤起既有设置窗（需求 #3）
+            // ④⚙设置（稿 `.tb-btn[data-m="4"]`）——唤起既有设置窗（需求 #3）
             if root.titlebar-settings-w > 0px: TitlebarIconButton {
                 tip: "打开设置";
                 enabled: !root.busy;

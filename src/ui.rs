@@ -480,21 +480,33 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
 const BUBBLE_VISUAL_SIZE: i32 = 36;
 const BUBBLE_INSET: i32 = 4;
 
-/// 气泡显隐的**唯一收口**（#13）。
+/// 气泡显隐的**唯一收口**。
 ///
-/// 可见 ⟺ `config.syschat_bubble == true` **且**对话框当前不可见：
-/// - 点气泡开窗 → 隐藏气泡；关窗 → 气泡重新出现；
-/// - 托盘里把气泡关掉过（`config.syschat_bubble == false`）的用户，关窗**不得**把气泡弄出来。
+/// 可见 ⟺ `config.syschat_bubble == true`（**只由托盘开关决定**）。
+///
+/// v10（稿 v8 第 1 条「气泡常驻置顶」）：**气泡不再随对话框显隐而隐藏**——点气泡开窗后气泡仍在，
+/// 永久置顶、窗口始终锚在它旁边；老需求 #13（「对话框可见就藏气泡」）**作废**。
+/// 旧实现把「对话框当前是否可见」当第二个判据，于是「开窗 ⇒ 藏气泡 ⇒ 拖窗口的锚点没了」，
+/// 且关窗必须再把气泡弄回来；现在只剩托盘开关这一路输入。
 ///
 /// 托盘 `on_toggle_bubble`、气泡点击、两种关窗路径（✕ 按钮 / 红点 `CloseRequested`）都只调它，
 /// 禁止各写一份——否则显隐口径迟早分叉。
-fn refresh_bubble_visibility(bubble: &AnchorBubble, dialog_visible: bool) {
+fn refresh_bubble_visibility(bubble: &AnchorBubble) {
     let enabled = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
-    if enabled && !dialog_visible {
+    if bubble_visible(enabled) {
         let _ = bubble.show();
     } else {
         let _ = bubble.hide();
     }
+}
+
+/// 气泡显隐的**唯一判据**（纯函数，口径钉在单测里）。
+///
+/// 签名里**故意没有**「对话框可见性」这个入参：v10（稿 v8 第 1 条）把「对话框可见即不显示气泡」
+/// 作废了——气泡常驻置顶。把 dialog 参数加回来就等于把作废的口径请回来，
+/// 守卫见 `ui::tests::bubble_visibility_has_no_dialog_input`。
+fn bubble_visible(enabled: bool) -> bool {
+    enabled
 }
 
 /// 系统对话窗的**当前逻辑宽度**（标题栏计划要用）；窗口还没 realize（`size()` 为 0）时返回 0，
@@ -552,11 +564,7 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
     // D2 回退位：标题栏放不下的项会落到状态行（`.slint` 里的 `titlebar-*-w <= 0` 分支），
     // 那里 chip 用的是**固定宽**（会话 84、模型 112）——所以文案也得按那个宽度截，
     // 不能因为「标题栏没要」就把文案置空（否则回落位里是个空菜单壳）。
-    let row_session_w = if plan.session_w > 0.0 {
-        plan.session_w
-    } else {
-        crate::syschat::TB_SESSION_W
-    };
+    let row_session_w = crate::syschat::TB_SESSION_FALLBACK_W;
     let row_model_w = if plan.model_w > 0.0 {
         plan.model_w
     } else {
@@ -2311,8 +2319,8 @@ pub fn run_gui() -> Result<()> {
     // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
     // 坐标统一用**逻辑像素**（winit 的 MonitorHandle::size() 是物理像素，Retina 下差 2 倍）。
     let bubble_pos_apply = Rc::new(Cell::new(true));
-    // 气泡显示/隐藏统一走 refresh_bubble_visibility（#13）：启动时对话框尚未打开。
-    refresh_bubble_visibility(&bubble, false);
+    // 气泡显示/隐藏统一走 refresh_bubble_visibility（只按托盘开关；v10 起与对话框显隐无关）。
+    refresh_bubble_visibility(&bubble);
 
     // 点窗口红点（traffic-light）关闭 → 有未保存修改先弹确认，否则降回 accessory / 直接隐藏。
     // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦：CloseRequested 返回
@@ -3886,7 +3894,6 @@ pub fn run_gui() -> Result<()> {
         tray.on_toggle_bubble({
             let bw = bubble.as_weak();
             let tw = tray.as_weak();
-            let sw = syschat_win.as_weak();
             move |on| {
                 // 走 config 的写锁 RMW（与其它写方同口径）；失败只记日志，可见性仍按 config 真值。
                 if !Config::set_syschat_bubble(on) {
@@ -3896,14 +3903,10 @@ pub fn run_gui() -> Result<()> {
                 if let Some(tw) = tw.upgrade() {
                     tw.set_bubble_enabled(Config::load().map(|c| c.syschat_bubble).unwrap_or(on));
                 }
-                // 可见性**统一**由 refresh_bubble_visibility 按 config + 对话框可见性决定：
-                // 对话框开着时即使托盘把气泡打开也保持隐藏（关窗后再出现），两路不打架。
-                let dialog_visible = sw
-                    .upgrade()
-                    .map(|w| w.window().is_visible())
-                    .unwrap_or(false);
+                // 可见性**统一**由 refresh_bubble_visibility 按 config 决定（v10：与对话框显隐无关，
+                // 气泡常驻置顶；托盘开关仍管气泡）。
                 if let Some(b) = bw.upgrade() {
-                    refresh_bubble_visibility(&b, dialog_visible);
+                    refresh_bubble_visibility(&b);
                 }
             }
         });
@@ -3980,35 +3983,10 @@ pub fn run_gui() -> Result<()> {
         let model = bots_model.clone();
         let pmodel = providers_model.clone();
         let dirty_open = dirty.clone();
-        // 供托盘「设置…」与 Dock 点击共用的显示逻辑：草稿恢复 + 显示置前。
-        // Dock 图标点击恢复窗口（no-frame 后系统标题栏窗口的默认 reopen 行为失效，
-        // 2026-08-18 回归修复）走同款路径。
+        // 托盘「设置…」的显示逻辑：草稿恢复 + 显示置前。
+        // （v10 稿 v8 第 4 条：Dock 点击已改成**只开对话窗**，不再走这里——接线在系统对话窗那段，
+        //  与气泡点击共用同一个 `open_syschat` 收口。）
         let tray_sw = sw.clone();
-        #[cfg(target_os = "macos")]
-        {
-            let dock_sw = settings.as_weak();
-            let dock_work = work.clone();
-            let dock_model = bots_model.clone();
-            let dock_pmodel = providers_model.clone();
-            let dock_dirty = dirty.clone();
-            crate::platform::install_dock_reopen(Box::new({
-                let wk = wk.clone();
-                move || {
-                    if let Some(w) = dock_sw.upgrade() {
-                        load_with_draft(
-                            &w,
-                            &dock_dirty,
-                            &dock_work,
-                            &dock_model,
-                            &dock_pmodel,
-                            &wk,
-                        );
-                        push_settings_status(&w, &install::status());
-                        show_window_and_focus(&w);
-                    }
-                }
-            }));
-        }
         tray.on_open_settings({
             let wk = wk.clone();
             move || {
@@ -5825,15 +5803,16 @@ pub fn run_gui() -> Result<()> {
             }
         }
     };
-    // 点气泡 → 装载历史 + 刷新下拉 + 置前打开对话框。
-    {
+    // 「打开系统对话窗」的唯一收口：装载历史 + 刷新下拉 + 置前显示 + 锚到气泡旁 + 拉媒体。
+    // **两个入口共用**：点气泡、点 Dock（v10 稿 v8 第 4 条：Dock 点击只开对话窗，不再弹设置窗）。
+    let open_syschat: Rc<dyn Fn()> = {
         let cw = syschat_win.as_weak();
         let model = syschat_model.clone();
         let sessions = sc_sessions.clone();
         let models = sc_models.clone();
         let rm = request_media.clone();
         let bw = bubble.as_weak();
-        bubble.on_open_chat(move || {
+        Rc::new(move || {
             let Some(w) = cw.upgrade() else { return };
             load_syschat_into(&w, &model);
             refresh_syschat_sel(&w, &sessions, &models);
@@ -5844,11 +5823,26 @@ pub fn run_gui() -> Result<()> {
                     w.window()
                         .set_position(slint::LogicalPosition::new(x as f32, y as f32));
                 }
-                // #13：点气泡 → 弹窗并隐藏气泡（显隐统一收口按 config + 对话框可见性决定）。
-                refresh_bubble_visibility(&b, true);
+                // v10（稿 v8 第 1 条）：气泡**常驻置顶**——开窗不再藏气泡。
+                // 旧 #13（「开窗 ⇒ 藏气泡」）已作废；这里保留一次收口调用只是让开窗也把气泡
+                // 拉回 config 真值（比如启动时窗口还没 realize 的帧）。
+                refresh_bubble_visibility(&b);
             }
             rm();
-        });
+        })
+    };
+    // 入口一：点气泡 → 开对话窗。
+    {
+        let open = open_syschat.clone();
+        bubble.on_open_chat(move || open());
+    }
+    // 入口二：点 Dock 图标 → 只开对话窗（v10 稿 v8 第 4 条）。
+    // 背景：no-frame 窗后系统标题栏窗口的默认 reopen 行为失效（2026-08-18 回归修复），
+    // 但当时接到的是设置窗；owner 复查改口径为「只开对话窗」。
+    #[cfg(target_os = "macos")]
+    {
+        let open = open_syschat.clone();
+        crate::platform::install_dock_reopen(Box::new(move || open()));
     }
     // 新建会话（保留历史，旧会话可在「会话」下拉里切回）。
     {
@@ -6011,6 +6005,17 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // 输入区占位按钮（😊 表情 / ✂ 截图 / ⋯ 更多）：**不做成死按钮**——按下走既有状态行通道
+    // 给一句「尚未实现」。画在 `ui/app.slint` 的 `.fnbar` 里，回调只带一个功能名。
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_composer_todo(move |name| {
+            if let Some(w) = cw.upgrade() {
+                w.set_status_is_error(false);
+                w.set_status_line(format!("「{name}」尚未实现（占位按钮）。").into());
+            }
+        });
+    }
     // ③ ⚙设置（D2 稿需求 #3）：唤起**既有**设置窗。照托盘「设置…」的同一条路径写：
     // 先 `load_with_draft`（草稿比正式配置新时静默恢复为工作底稿）→ 刷新状态行 → show+聚焦。
     // 不自己写一套显示逻辑：草稿恢复/置前/圆角都在这条路上有既有口径。
@@ -6057,9 +6062,10 @@ pub fn run_gui() -> Result<()> {
             if let Some(w) = cw.upgrade() {
                 let _ = w.hide();
             }
-            // #13：关窗 → 气泡重新出现；显隐统一按 config（托盘关过气泡的不冒出来）。
+            // v10：关窗**不动**气泡（气泡常驻置顶，旧 #13「关窗才把气泡弄回来」已作废）；
+            // 这里仍调一次收口，保证显隐与 config 真值一致。
             if let Some(b) = bw_close.upgrade() {
-                refresh_bubble_visibility(&b, false);
+                refresh_bubble_visibility(&b);
             }
             #[cfg(target_os = "macos")]
             {
@@ -6151,9 +6157,9 @@ pub fn run_gui() -> Result<()> {
                 if let Some(w) = cw2.upgrade() {
                     let _ = w.hide();
                 }
-                // #13：红点关闭同 ✕ —— 气泡按 config 重新出现（统一收口）。
+                // v10：红点关闭同 ✕——气泡不动（统一收口按 config）。
                 if let Some(b) = bw_close2.upgrade() {
-                    refresh_bubble_visibility(&b, false);
+                    refresh_bubble_visibility(&b);
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -7063,6 +7069,33 @@ mod headless_render;
 
 #[cfg(test)]
 mod tests {
+
+    /// v10（稿 v8 第 1 条）「气泡常驻置顶」：显隐只看托盘开关，**不再看对话框是否可见**。
+    ///
+    /// 判别力（负向）：
+    /// 1. 把 `bubble_visible` 改成 `enabled && !dialog_visible`（旧 #13 口径）⇒ 行为断言必红；
+    /// 2. 把对话框可见性加回收口签名 / 调用点 ⇒ 结构守卫必红。
+    #[test]
+    fn bubble_visibility_has_no_dialog_input() {
+        // 行为：开关开 ⇒ 显示；关 ⇒ 不显示（没有第三个输入）。
+        assert!(bubble_visible(true));
+        assert!(!bubble_visible(false));
+        // 结构：只扫**生产代码**（`mod tests` 之前）——测试自己的字面量不能当证据。
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        assert!(
+            prod.contains("fn refresh_bubble_visibility(bubble: &AnchorBubble)"),
+            "气泡显隐收口应只按 config（签名里不带对话框可见性）"
+        );
+        assert!(
+            !prod.contains("refresh_bubble_visibility(&b, "),
+            "气泡显隐调用点还在传第二个参数（旧 #13 口径）"
+        );
+        assert!(
+            !prod.contains("dialog_visible") && !prod.contains("dialog-visibility"),
+            "生产代码里还残留「对话框可见性」这条判据"
+        );
+    }
 
     /// ABB 的观感固定为 slint-pixel 的 **soft（柔彩）预设**（owner 2026-09-30 指定「主题选 soft」）。
     ///
