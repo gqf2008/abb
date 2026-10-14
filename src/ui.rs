@@ -474,7 +474,12 @@ fn bring_app_to_front() {
 /// 口径（**设置窗**；对话窗另有自己的口径，见 [`syschat_resize_self_managed`]）：只有
 /// Windows/Linux 需要自绘（它们没有系统缩放边框）；macOS 的设置窗仍不留热区。
 ///
-/// 为什么 macOS 设置窗必须关（D6，2026-10-14）：`slint_pixel::install_window_resize` 把热区回调接到
+/// **macOS 必须关**（v11c 更正）：系统对 `no-frame` 窗自带边角缩放，自绘热区会抢掉它——
+/// 判断依据是 **owner 实测「设置窗能缩放、对话窗不能」**，两者唯一差别就是这一行。
+/// （D6 曾据 `drag_resize_window` 在 macOS 返回 `NotSupported` 推断「macOS 不给系统缩放」，
+///  那是**错的**：系统缩放不经过 winit 的 `drag_resize_window`。）
+///
+/// 历史（D6，2026-10-14）：`slint_pixel::install_window_resize` 把热区回调接到
 /// `winit::Window::drag_resize_window`，而 winit 0.30.13 的 macOS 实现**直接返回
 /// `Err(NotSupported)`**（`src/platform_impl/macos/window_delegate.rs:1179`）——热区于是变成
 /// 「按下就被 grab 吃掉、然后什么都不做」的死区。它不是无害的：热区是整窗 overlay（north 条
@@ -495,7 +500,9 @@ fn resize_hit_areas_enabled() -> bool {
 ///   热区**必须画**（否则就是「完全不能缩放」那条老路），故对话窗的 `resize-hit-areas` 恒 `true`。
 /// - `false`（Windows/Linux）：不变，仍走系统的 `drag_resize_window` 缩放循环。
 fn syschat_resize_self_managed() -> bool {
-    cfg!(target_os = "macos")
+    // 与热区同源：**没有系统缩放边框的平台**才需要自管循环。当前即「非 macOS」
+    // （见 [`resize_hit_areas_enabled`] 与它的更正说明）。
+    !resize_hit_areas_enabled()
 }
 
 /// 从回调里首次显示一个「创建后一直隐藏」的窗口。顺序很关键（macOS 实测坑）：
@@ -2771,9 +2778,13 @@ pub fn run_gui() -> Result<()> {
     // 两边都要接：`on_begin_resize` 是单槽回调，`install_window_resize` 在 macOS 上装上也无害
     // （`.slint` 侧 `self-managed: true` 时压根不会发 `begin-resize`）。
     slint_pixel::install_window_resize(&syschat_win);
-    // 热区**全平台都画**（v11c）：D6 「macOS 一律不画」的代价是**完全不能缩放**。
-    // 设置窗没有自管实现，仍按平台给（见 [`resize_hit_areas_enabled`]）。
-    syschat_win.set_resize_hit_areas(true);
+    // 热区按平台给（与设置窗**同一口径**，[`resize_hit_areas_enabled`]）：
+    // macOS **必须不画**——系统对 `no-frame` 窗自带边角缩放，自绘热区会把它抢掉
+    // （owner 实测：设置窗能缩放、对话窗不能，差别就在这里；v11c 曾按 D6 的错误结论
+    //  「macOS 不给系统缩放」全平台硬开热区 + 自管循环，反而把系统缩放彻底堵死）。
+    // Windows/Linux 没有系统缩放边框，才要自绘热区 + `drag_resize_window`。
+    syschat_win.set_resize_hit_areas(resize_hit_areas_enabled());
+    // 自管循环只在「没有系统缩放」的平台上当承重件（macOS 上热区不画 ⇒ 不会发 `begin-resize`）。
     syschat_win.set_resize_self_managed(syschat_resize_self_managed());
     // 初始尺寸：`no-frame` 窗实测没吃到 `preferred-*`（开出来是最小尺寸 340×380，于是
     // ①②③ 挤不进标题栏）。开窗前显式给一次默认尺寸（= `.slint` 的 `preferred-width`/`height`），
@@ -8800,21 +8811,20 @@ mod tests {
             !body.contains("set_policy_fn("),
             "activate_app 不应再改激活策略（D5：ABB 永远是 accessory，不进 Dock）"
         );
-        // 自绘缩放热区（v11c 改口径，卡 `abb-v11-resize-maximize-macos`）：
-        // 设置窗仍按平台（macOS 上没有自管实现 ⇒ 不许画）；对话窗**恒画**（macOS 走自管缩放），
-        // 但恒 `true` 必须**同时**存在自管缩放的接线——否则就退回到 D6 「热区只吃按压不干活」。
+        // 自绘缩放热区（v11c 更正，owner 实测「设置窗能缩放、对话窗不能」）：
+        // **两个窗同一口径** = `resize_hit_areas_enabled()`（macOS 上都不画，让系统自带的无边框窗
+        // 边角缩放生效；自绘热区会抢掉它）。Windows/Linux 才画 + 接 `drag_resize_window`。
         let src = crate::platform::src_lf(include_str!("ui.rs"));
         let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
         assert_eq!(
             prod.matches("set_resize_hit_areas(resize_hit_areas_enabled())")
                 .count(),
-            1,
-            "设置窗应走 resize_hit_areas_enabled()（对话窗不适用：它要走自管缩放）"
+            2,
+            "设置窗与对话窗都应走 resize_hit_areas_enabled()（macOS 不画，交给系统缩放）"
         );
-        assert_eq!(
-            prod.matches("set_resize_hit_areas(true)").count(),
-            1,
-            "对话窗应恒画自绘热区（v11c：macOS 否则完全不能缩放）"
+        assert!(
+            !prod.contains("set_resize_hit_areas(true)"),
+            "不许再硬开热区：那会在 macOS 上把系统自带的无边框窗缩放抢掉（owner 实测回归）"
         );
         assert!(
             prod.contains("set_resize_self_managed(syschat_resize_self_managed())"),
@@ -8826,8 +8836,8 @@ mod tests {
         );
         assert!(
             prod.contains("fn syschat_resize_self_managed()")
-                && prod.contains("cfg!(target_os = \"macos\")"),
-            "`syschat_resize_self_managed` 必须按平台判（macOS = 自管）"
+                && prod.contains("!resize_hit_areas_enabled()"),
+            "`syschat_resize_self_managed` 必须与热区**同源**（没有系统缩放边框的平台才自管）"
         );
     }
 
